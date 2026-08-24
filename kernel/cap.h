@@ -88,6 +88,15 @@
 #define CH_F_REPLY          0x0001
 #define CH_F_NO_REPLY       0x0002
 
+/* Close-reason registry (capability-layer spec §6.2, transport spec §5).
+ * k_chan_close takes one; cap_table_teardown emits CLOSE_PEER_DEAD with
+ * the dead pid as detail. */
+#define CLOSE_PEER        0x0001
+#define CLOSE_PEER_DEAD   0x0002
+#define CLOSE_REVOKED     0x0003
+#define CLOSE_PROTO       0x0004
+#define CLOSE_ADMIN       0x0005
+
 /* Block forever (real kernel) — mirrored from kabi.rs TIMEOUT_NONE. */
 #define CH_TIMEOUT_NONE     0xFFFFFFFFFFFFFFFFULL
 
@@ -101,6 +110,7 @@
 #define CAP_HOLDER_MAX       8192  /* holder-pool nodes (slots + queued caps) */
 #define CAP_CHAN_MAX         64    /* channel objects */
 #define CHAN_QUEUE_DEPTH     16    /* messages per directional queue */
+#define CHAN_WAIT_MAX_CHANS  8     /* endpoints one k_chan_wait may poll/park on */
 
 /* ─── Phase 3 message transport (Polyglot Nexus, docs/AeroSLS-Polyglot-
  * Nexus-Phase3-Design-v0.1.md §2.3) ────────────────────────────────────────
@@ -435,12 +445,17 @@ struct SLSChanRecvOut {
 };
 
 struct SLSChanWaitRequest {
-    uint16_t chans[8];        /* caller's CHAN_R slots to poll */
-    uint16_t n_chans;         /* 1..8 */
+    uint16_t chans[CHAN_WAIT_MAX_CHANS]; /* caller's CHAN_R slots to poll */
+    uint16_t n_chans;                    /* 1..CHAN_WAIT_MAX_CHANS */
     uint8_t  _pad[4];
-    uint64_t timeout_ns;      /* CH_TIMEOUT_NONE = block forever (park
-                               * deferred: today returns CAP_ERR_TIMEOUT
-                               * immediately when nothing is ready) */
+    uint64_t timeout_ns;      /* CH_TIMEOUT_NONE = block forever: the caller
+                               * parks on the listed channels (cap_wait_chans,
+                               * process.c) and a later enqueue/close/death
+                               * wakes it to re-run the wait. A finite timeout
+                               * parks WITH a deadline: the timer ISR wakes it
+                               * when the deadline passes and the re-run then
+                               * returns CAP_ERR_TIMEOUT (granularity = one
+                               * ~10 ms tick, KERNEL_TICK_NS) */
     uint32_t out_idx;         /* [out] index into chans[] */
     uint16_t out_kind;        /* [out] CH_KIND_* of the head entry */
     uint8_t  _pad2[2];
@@ -468,8 +483,15 @@ struct SLSChanSendRequest {
     struct SLSCapDesc caps[CAP_MSG_MAX_CAPS];
     uint16_t n_caps;          /* 0..CAP_MSG_MAX_CAPS */
     uint8_t  _pad4[6];
-    uint64_t timeout_ns;      /* 0 = block until enqueued (park deferred:
-                               * queue-full returns CAP_ERR_TIMEOUT today) */
+    uint64_t timeout_ns;      /* 0 = block until enqueued: a queue-full send
+                               * parks the caller (cap_wait_chans,
+                               * park_syscall = SYS_SLS_CHAN_SEND); a recv
+                               * freeing a slot wakes it to re-run the send.
+                               * Nonzero = block with a deadline: the timer
+                               * ISR wakes the parked sender when the
+                               * deadline passes and the re-run then returns
+                               * CAP_ERR_TIMEOUT (granularity = one ~10 ms
+                               * tick, KERNEL_TICK_NS) */
 };
 
 struct SLSChanCloseRequest {
@@ -568,7 +590,29 @@ uint64_t cap_proc_cr3(uint32_t pid);
  * just-woken process immediately (the receiver runs before the sender's
  * send returns to ring-3). */
 int  cap_wait_chan(uint32_t chan_id, void* recv_req);
+/* Phase 5 wait-aware park: like cap_wait_chan but parks on a LIST of
+ * channels (the k_chan_wait and the blocking k_chan_send paths,
+ * kernel/chan.c). `chan_ids` are cap_channels[] indexes; the wake
+ * (cap_wake_chan on ANY listed channel, or the deadline tick) resumes the
+ * process and re-runs the syscall `park_syscall` (SYS_SLS_CHAN_WAIT or
+ * SYS_SLS_CHAN_SEND) with the saved request pointer. `deadline_ticks` is
+ * the ABSOLUTE kernel tick count by which the park must resolve, or 0 =
+ * block forever (CH_TIMEOUT_NONE / send timeout 0); a finite deadline is
+ * met by cap_park_deadline_tick (timer ISR, ~10 ms granularity) waking the
+ * park, whose re-run then returns CAP_ERR_TIMEOUT. Weak default returns 0
+ * ("could not park") so the caller degrades to CAP_ERR_TIMEOUT exactly
+ * like the Phase-1.5 recv weak default. */
+int  cap_wait_chans(const uint32_t* chan_ids, uint32_t n, void* req,
+                    uint32_t park_syscall, uint64_t deadline_ticks);
 void cap_wake_chan(uint32_t chan_id);
+/* Phase 5 deadline support (see cap.c's weak defaults and process.c's
+ * strong overrides): cap_park_deadline_take() returns the current
+ * process's stored absolute park deadline (0 = none/forever) and CLEARS
+ * it — the resume re-run of a woken wait/send takes the ORIGINAL deadline
+ * so re-parks never extend it. cap_park_deadline_tick() (called from the
+ * timer ISR) wakes every parked process whose deadline has passed. */
+uint64_t cap_park_deadline_take(void);
+void     cap_park_deadline_tick(void);
 void cap_maybe_handoff(void);
 
 /* ─── Arch hooks, overridden per-architecture (arch/x86/user_paging.c).

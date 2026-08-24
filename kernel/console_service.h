@@ -18,7 +18,14 @@
  * non-IRQ kernel context. cap_lock() is a plain spinlock with no
  * interrupt masking, so it must never be acquired from
  * timer_irq_handler(); polling from this loop is the established pattern
- * for lock-taking periodic work (tier_mgr_tick, reconcile_tick). */
+ * for lock-taking periodic work (tier_mgr_tick, reconcile_tick).
+ *
+ * The service is CLOSE-AWARE: a child's explicit k_chan_close or its
+ * death (cap_table_teardown marks close_evt on the kernel end) stops the
+ * drain — the child's last messages are printed, then the kernel end is
+ * revoked (cap_revoke on the slot), freeing the kernel's CHAN_R/CHAN_W
+ * and destroying the channel. A dead child's console channel never
+ * lingers in the kernel context table. */
 
 /* Drain every kernel-context console channel once. Call from
  * microkernel_service_poll(). */

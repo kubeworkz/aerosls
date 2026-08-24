@@ -24,13 +24,20 @@
  *   - k_cap_info introspects one of the caller's own caps.
  *
  * Honest limits (each documented where it bites):
- *   - BLOCKING IS DEFERRED. k_chan_wait and a queue-full k_chan_send
- *     return CAP_ERR_TIMEOUT immediately instead of parking the caller —
- *     the kernel's park machinery (cap_wait_chan in process.c) is
- *     specialized for the single-cap recv path, and the msg transport has
- *     always been non-blocking with SDK-side retry (see the Phase-3
- *     SLSCapRecvMsgRequest comment). A sidecar that needs to block must
- *     poll-and-retry today; a wait-aware park/resume is a follow-up.
+ *   - BLOCKING WAIT, BLOCKING SEND, AND DEADLINES ARE REAL. k_chan_wait
+ *     with CH_TIMEOUT_NONE and a queue-full k_chan_send with timeout_ns ==
+ *     0 park the caller on the listed channels (cap_wait_chans, process.c
+ *     — the same park/resume machinery as the Phase-1.5 blocking recv,
+ *     generalized to a channel LIST via park_syscall); a later enqueue /
+ *     a slot freed by recv / an explicit close / peer-death wakes them to
+ *     re-run the syscall. A FINITE timeout parks WITH a deadline: the
+ *     timer ISR (cap_park_deadline_tick, one call per ~10 ms tick) wakes
+ *     the park when the deadline passes and the re-run then returns
+ *     CAP_ERR_TIMEOUT. Deadline granularity is one tick (KERNEL_TICK_NS,
+ *     ~10 ms, calibration-dependent): a sub-tick timeout is rounded UP, so
+ *     a 1 ns deadline is met within one tick period, not instantaneously
+ *     — the SDK-side retry loop still supplies finer user-visible
+ *     timeouts where it needs them.
  *   - NEW_CHANNEL events (path-4 k_chan_create) are not produced; the
  *     kind constant exists so wait/recv can report it once the dynamic
  *     creation path lands.
@@ -42,6 +49,7 @@
  */
 #include "cap.h"
 #include "kernel_io.h"
+#include "timer.h"   /* Phase 5 deadlines: kernel_tick_counter, KERNEL_TICK_NS */
 #include <stddef.h>
 
 /* ─── Slot → channel resolution ───────────────────────────────────────────── */
@@ -106,22 +114,60 @@ static int chan_map_err(int cap_e) {
     }
 }
 
+/* Convert a RELATIVE deadline (nanoseconds) to an ABSOLUTE deadline in
+ * kernel ticks, rounded UP to whole ~10 ms ticks (KERNEL_TICK_NS) and
+ * saturating at UINT64_MAX (a huge-but-finite timeout becomes a deadline
+ * ~5.8e9 years out — effectively never, but never a wrapped small value;
+ * the wrapping case is a real hazard for the SDK's TIMEOUT_NONE = u64::MAX
+ * constant, see below). CH_TIMEOUT_NONE is handled by the CALLERS before
+ * this (it means block-forever, deadline 0), because adding KERNEL_TICK_NS
+ * to u64::MAX would wrap to ~0 ticks and make a "block forever" send
+ * expire instantly. */
+static uint64_t chan_deadline_from_ns(uint64_t timeout_ns) {
+    uint64_t add = KERNEL_TICK_NS - 1;
+    uint64_t ticks;
+    if (timeout_ns > UINT64_MAX - add)
+        ticks = UINT64_MAX / KERNEL_TICK_NS;   /* saturate */
+    else
+        ticks = (timeout_ns + add) / KERNEL_TICK_NS;
+    uint64_t now = kernel_tick_counter;
+    if (now > UINT64_MAX - ticks) return UINT64_MAX;
+    return now + ticks;
+}
+
 /* ─── k_chan_wait ────────────────────────────────────────────────────────────
  * Poll `chans` (caller's CHAN_R slots) in order; return the index and the
- * head entry's kind of the first ready endpoint. Nothing ready →
- * CAP_ERR_TIMEOUT (blocking park deferred — see the file header). */
+ * head entry's kind of the first ready endpoint. Nothing ready → BLOCK:
+ * park the caller on the resolved channels (cap_wait_chans) and re-run the
+ * wait on wake. CH_TIMEOUT_NONE blocks forever; a finite timeout parks
+ * WITH a deadline — the timer ISR wakes the park when the deadline passes
+ * and this re-run then returns CAP_ERR_TIMEOUT. `req` is the
+ * SLSChanWaitRequest the park's resume re-runs. */
 int k_chan_wait(uint32_t pid, const uint16_t* chans, uint32_t n,
-                uint64_t timeout_ns, uint32_t* out_idx, uint16_t* out_kind) {
-    (void)timeout_ns;   /* blocking park deferred: scan-once semantics */
-    if (!chans || n == 0 || n > 8) return CAP_ERR_PROTO;
+                uint64_t timeout_ns, uint32_t* out_idx, uint16_t* out_kind,
+                void* req) {
+    if (!chans || n == 0 || n > CHAN_WAIT_MAX_CHANS) return CAP_ERR_PROTO;
     if (!out_idx || !out_kind) return CAP_ERR_PROTO;
     *out_idx = 0;
     *out_kind = CH_KIND_NONE;
+
+    /* Deadline bookkeeping. A RE-RUN (woken by an event or the deadline
+     * tick) takes the ORIGINAL absolute deadline from the parked state
+     * (cap_park_deadline_take), so re-parks after spurious wakes never
+     * extend a finite timeout. A fresh call (nothing stored) computes
+     * now + timeout_ns, rounded UP to whole ~10 ms ticks. 0 = block
+     * forever (CH_TIMEOUT_NONE). */
+    uint64_t deadline = cap_park_deadline_take();
+    if (deadline == 0 && timeout_ns != CH_TIMEOUT_NONE)
+        deadline = chan_deadline_from_ns(timeout_ns);
+
+    uint32_t chan_ids[CHAN_WAIT_MAX_CHANS];
     for (uint32_t i = 0; i < n; i++) {
         uint32_t chan_id;
         int dir;
         int r = chan_resolve(pid, chans[i], CAP_TYPE_CHAN_R, &chan_id, &dir);
         if (r != CAP_ERR_OK) return r;   /* every listed handle must be valid */
+        chan_ids[i] = chan_id;
         struct CapChannel* ch = &cap_channels[chan_id];
         cap_lock(&ch->lock);
         int ready = (ch->qdepth[dir] > 0);
@@ -134,7 +180,24 @@ int k_chan_wait(uint32_t pid, const uint16_t* chans, uint32_t n,
             return CAP_ERR_OK;
         }
     }
-    return CAP_ERR_TIMEOUT;
+    /* Nothing ready. Park the caller on the resolved channel ids
+     * (cap_wait_chans — process.c's strong override): a later enqueue
+     * (cap_send_msg's wake), explicit close, peer-death (teardown's
+     * wake), or the deadline tick (cap_park_deadline_tick) resumes the
+     * process, which re-runs THIS syscall and re-polls the same request —
+     * the wake cannot be lost and the wait returns the data/event that
+     * woke it (or CAP_ERR_TIMEOUT when the deadline elapsed with nothing
+     * ready). A deadline that has already passed returns CAP_ERR_TIMEOUT
+     * without re-parking. Single-CPU atomicity makes check-then-park
+     * safe: this syscall does not yield until the park's switch, so
+     * nothing can enqueue between the last poll and the waiting-set
+     * registration. The weak default (host tests) returns 0 →
+     * CAP_ERR_TIMEOUT, preserving scan-once semantics. */
+    if (deadline != 0 && kernel_tick_counter >= deadline)
+        return CAP_ERR_TIMEOUT;   /* deadline elapsed; nothing arrived */
+    cap_wait_chans(chan_ids, n, req, SYS_SLS_CHAN_WAIT, deadline);
+    /* noreturn when it parks */
+    return CAP_ERR_TIMEOUT;   /* could not park: retry */
 }
 
 /* ─── k_chan_recv ────────────────────────────────────────────────────────────
@@ -236,17 +299,35 @@ int k_chan_recv(uint32_t pid, uint16_t chan, void* buf, uint32_t buf_len,
 /* ─── k_chan_send ────────────────────────────────────────────────────────────
  * Send one MSG on `chan` (caller's CHAN_W slot). NO_REPLY + cap arguments
  * is rejected atomically (CAP_ERR_PROTO — moved caps are transient and
- * need a reply window). Queue full → CAP_ERR_TIMEOUT (blocking deferred). */
+ * need a reply window). Queue full → BLOCK: park the sender on the
+ * channel (cap_wait_chans, park_syscall = SYS_SLS_CHAN_SEND); a recv
+ * freeing a slot (cap_recv_msg's wake) resumes it to re-run THIS send,
+ * which now enqueues. timeout_ns == 0 blocks forever; a finite timeout
+ * parks WITH a deadline — the timer ISR wakes the park when the deadline
+ * passes and the re-run then returns CAP_ERR_TIMEOUT. A park that could
+ * not happen (kernel context / nothing runnable) → CAP_ERR_TIMEOUT,
+ * nothing enqueued. `req` is the SLSChanSendRequest the park's resume
+ * re-runs. */
 int k_chan_send(uint32_t pid, uint16_t chan, uint32_t tag, uint16_t flags,
                 const void* payload, uint32_t payload_len,
                 const struct SLSCapDesc* caps, uint16_t n_caps,
-                uint64_t timeout_ns) {
-    (void)timeout_ns;   /* blocking send park deferred: queue-full → TIMEOUT */
+                uint64_t timeout_ns, void* req) {
     if (payload_len > CAP_MSG_MAX_PAYLOAD) return CAP_ERR_RANGE;
     if (n_caps > CAP_MSG_MAX_CAPS) return CAP_ERR_RANGE;
     if (payload_len > 0 && !payload) return CAP_ERR_PROTO;
     if (n_caps > 0 && !caps) return CAP_ERR_PROTO;
     if ((flags & CH_F_NO_REPLY) && n_caps > 0) return CAP_ERR_PROTO;
+
+    /* Deadline bookkeeping (same shape as k_chan_wait): timeout_ns == 0
+     * OR CH_TIMEOUT_NONE blocks until enqueued (deadline 0 = forever — the
+     * SDK passes TIMEOUT_NONE for every blocking send, so u64::MAX must
+     * mean forever here, never a wrapped deadline); any other finite
+     * timeout blocks with a deadline. A re-run takes the ORIGINAL absolute
+     * deadline (never extended); a fresh call computes now + timeout_ns,
+     * rounded UP to whole ~10 ms ticks. */
+    uint64_t deadline = cap_park_deadline_take();
+    if (deadline == 0 && timeout_ns != 0 && timeout_ns != CH_TIMEOUT_NONE)
+        deadline = chan_deadline_from_ns(timeout_ns);
 
     uint32_t chan_id;
     int dir;
@@ -254,15 +335,33 @@ int k_chan_send(uint32_t pid, uint16_t chan, uint32_t tag, uint16_t flags,
     if (r != CAP_ERR_OK) return r;
     struct CapChannel* ch = &cap_channels[chan_id];
     cap_lock(&ch->lock);
-    int self_closed = ch->closed[dir];
+    /* STATE if EITHER side is closed — the fake kernel checks both
+     * (driver_closed || client_closed): an endpoint whose peer closed or
+     * died cannot receive (the close event is the signal to stop). */
+    int closed_side = ch->closed[dir] || ch->closed[1 - dir];
     cap_unlock(&ch->lock);
-    if (self_closed) return CAP_ERR_STATE;
+    if (closed_side) return CAP_ERR_STATE;
 
     /* kabi flags: bit0 REPLY, bit1 NO_REPLY. Transport flags: bit0 = NO_REPLY. */
     uint32_t tflags = (flags & CH_F_NO_REPLY) ? 0x1u : 0u;
     int rr = cap_send_msg(pid, chan, payload, payload_len, caps, n_caps,
                           tag, tflags);
     if (rr == 0) return CAP_ERR_OK;
+    if (rr == CAP_EAGAIN) {
+        /* Queue full → BLOCK: park the caller on this channel (process.c's
+         * strong cap_wait_chans — the resume re-runs SYS_SLS_CHAN_SEND
+         * with the same request, which now finds space; a re-run after the
+         * peer closed/died fails CAP_ERR_STATE instead, so a blocked
+         * sender never hangs on a dead peer; a re-run after the deadline
+         * tick returns CAP_ERR_TIMEOUT here). A deadline that has already
+         * passed returns CAP_ERR_TIMEOUT without re-parking. Noreturn when
+         * it parks; the weak default / no-runnable case falls through to
+         * chan_map_err(CAP_EAGAIN) = CAP_ERR_TIMEOUT below (nothing
+         * enqueued — cap_send_msg failed before mutating anything). */
+        if (deadline != 0 && kernel_tick_counter >= deadline)
+            return CAP_ERR_TIMEOUT;   /* deadline elapsed; still full */
+        cap_wait_chans(&chan_id, 1, req, SYS_SLS_CHAN_SEND, deadline);
+    }
     return chan_map_err(rr);
 }
 
@@ -287,6 +386,14 @@ int k_chan_close(uint32_t pid, uint16_t chan, uint16_t reason, uint32_t detail) 
     ch->close_reason[1 - dir] = reason;
     ch->close_detail[1 - dir] = detail;
     cap_unlock(&ch->lock);
+    /* Wake any process parked in k_chan_wait (TIMEOUT_NONE) on this
+     * channel: the CLOSE event just queued for the peer is exactly what it
+     * is waiting for — same wake-then-handoff pattern as cap_send_msg
+     * after an enqueue (the peer observes the close before the closer's
+     * syscall even returns to ring-3). No-op when nobody is parked; the
+     * idempotent early-return above means the wake fires once per close. */
+    cap_wake_chan(chan_id);
+    cap_maybe_handoff();
     return CAP_ERR_OK;
 }
 
@@ -328,7 +435,8 @@ uint64_t sys_sls_chan_wait(struct SLSChanWaitRequest* req) {
     req->out_idx = 0;
     req->out_kind = CH_KIND_NONE;
     return (uint64_t)k_chan_wait(cap_current_pid(), req->chans, req->n_chans,
-                                 req->timeout_ns, &req->out_idx, &req->out_kind);
+                                 req->timeout_ns, &req->out_idx, &req->out_kind,
+                                 (void*)req);
 }
 
 uint64_t sys_sls_chan_recv(struct SLSChanRecvRequest* req) {
@@ -342,7 +450,8 @@ uint64_t sys_sls_chan_send(struct SLSChanSendRequest* req) {
     if (!req) return CAP_ERR_PROTO;
     return (uint64_t)k_chan_send(cap_current_pid(), req->chan, req->tag,
                                  req->flags, req->payload, req->payload_len,
-                                 req->caps, req->n_caps, req->timeout_ns);
+                                 req->caps, req->n_caps, req->timeout_ns,
+                                 (void*)req);
 }
 
 uint64_t sys_sls_chan_close(struct SLSChanCloseRequest* req) {

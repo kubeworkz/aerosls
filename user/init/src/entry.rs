@@ -12,13 +12,12 @@
 //! 8. Spawn the POSIX sidecar (channels wired by the Device Manager).
 //! 9. Park in the scheduler event loop.
 
-use crate::chan::{ChannelError, InitChannel, MSG_DEVICE_REGISTRY, MSG_DEVICES_READY};
+use crate::chan::{ChannelError, InitChannel, MSG_DEVICE_REGISTRY};
+use crate::demo::{self, DM_READY_DEADLINE_NS, DM_READY_RETRIES};
 use crate::devreg::DeviceRegistry;
 use crate::heap::Bump;
-use aerosls_proto::bootinfo::{BootInfo, BOOT_INFO_MAGIC};
-use aerosls_proto::kabi::{
-    Kernel, RealKernel, SendCap, CAP_MEM, CAP_SPAWN, TIMEOUT_NONE,
-};
+use aerosls_proto::bootinfo::BootInfo;
+use aerosls_proto::kabi::{RealKernel, SendCap, CAP_MEM, CAP_SPAWN};
 
 /// Reserved heap over the budget region (single-threaded sidecar).
 static mut HEAP: Bump = Bump::new();
@@ -26,6 +25,45 @@ static mut HEAP: Bump = Bump::new();
 /// Cap types from the capability-layer spec.
 const CAP_MEM_TYPE: u16 = CAP_MEM;
 const CAP_SPAWN_TYPE: u16 = CAP_SPAWN;
+
+/// A tiny stack-buffer writer for formatted logs. The freestanding binary
+/// has NO global allocator (the bump heap is used explicitly), so logging
+/// must not allocate — `log_fmt!` formats into this fixed buffer.
+struct StackBuf<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> StackBuf<N> {
+    fn new() -> Self {
+        Self { buf: [0; N], len: 0 }
+    }
+
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+    }
+}
+
+impl<const N: usize> core::fmt::Write for StackBuf<N> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let room = &mut self.buf[self.len..];
+        let n = s.len().min(room.len());
+        room[..n].copy_from_slice(&s.as_bytes()[..n]);
+        self.len += n;
+        Ok(()) // truncates silently rather than failing
+    }
+}
+
+/// Format a log line into a stack buffer and send it over the console
+/// channel (no allocation; the bump heap is not a global allocator).
+macro_rules! log_fmt {
+    ($console:expr, $fmt:literal $(, $arg:expr)* $(,)?) => {{
+        use core::fmt::Write as _;
+        let mut w = StackBuf::<256>::new();
+        let _ = core::write!(&mut w, $fmt $(, $arg)*);
+        log($console, w.as_str());
+    }};
+}
 
 #[no_mangle]
 #[allow(static_mut_refs)]
@@ -72,15 +110,11 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     // Log discovered devices to the console channel.
     let console = InitChannel::new(RealKernel, console_cap.slot);
     log(&console, "[INIT] ── AeroSLS init sidecar booting ──");
-    log_fmt(&console, "[INIT] budget: {} MiB", budget_cap.len >> 20);
-    log_fmt(
-        &console,
-        "[INIT] found {} PCI device(s)",
-        devreg.len(),
-    );
+    log_fmt!(&console, "[INIT] budget: {} MiB", budget_cap.len >> 20);
+    log_fmt!(&console, "[INIT] found {} PCI device(s)", devreg.len());
     for (i, e) in devreg.iter().enumerate() {
         let name = e.manifest_name().unwrap_or("?");
-        log_fmt(
+        log_fmt!(
             &console,
             "[INIT]   [{}] {} class={:02x}:{:02x} vendor={:04x} dev={:04x} bar=0x{:08x}",
             i,
@@ -137,28 +171,44 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     let count = devreg.len() as u32;
     payload[..4].copy_from_slice(&count.to_le_bytes());
 
-    dm_channel
-        .send_with_cap(MSG_DEVICE_REGISTRY, &payload, &devreg_send_cap)
+    // Blocking send (timeout 0): if the DM's queue is full, the kernel
+    // parks this sidecar until a slot frees — the registry cannot be
+    // dropped (transport spec §3.4).
+    demo::send_registry(&dm_channel, MSG_DEVICE_REGISTRY, &payload, &devreg_send_cap)
         .unwrap_or_else(|e| panic!("[INIT] failed to send device registry: {e}"));
 
-    // ── 7. Wait for "devices ready" ──────────────────────────────────────
+    // ── 7. Wait for "devices ready" (finite deadline + bounded retries) ──
+    // The reply wait parks WITH an absolute deadline (1 s): if the DM is
+    // slow, the kernel wakes the parked wait at the deadline and the re-run
+    // returns CAP_ERR_TIMEOUT — a wedged DM costs at most
+    // DM_READY_RETRIES × DM_READY_DEADLINE_NS, never an unbounded block.
+    // On final failure init parks in the event loop anyway (the DM can
+    // still signal readiness later via a notification).
     log(&console, "[INIT] waiting for Device Manager to initialise devices...");
 
     let mut reply_buf = [0u8; 256];
-    match dm_channel.recv_msg(&mut reply_buf) {
-        Ok(tag) if tag == MSG_DEVICES_READY => {
-            log(&console, "[INIT] all devices ready.");
+    let mut devices_ready = false;
+    for attempt in 1..=DM_READY_RETRIES {
+        match demo::wait_devices_ready(&dm_channel, &mut reply_buf, DM_READY_DEADLINE_NS) {
+            Ok(()) => {
+                devices_ready = true;
+                break;
+            }
+            Err(ChannelError::Timeout) => {
+                // The deadline elapsed (kernel woke the park with
+                // CAP_ERR_TIMEOUT); retry, then give up and move on.
+                log_fmt!(&console, "[INIT] DM not ready yet (attempt {}/3)", attempt);
+            }
+            Err(e) => {
+                log_fmt!(&console, "[INIT] DM handshake failed: {}", e);
+                break;
+            }
         }
-        Ok(tag) => {
-            log_fmt(
-                &console,
-                "[INIT] unexpected reply tag 0x{:08x} (expected MSG_DEVICES_READY)",
-                tag,
-            );
-        }
-        Err(e) => {
-            panic!("[INIT] Device Manager closed unexpectedly: {e}");
-        }
+    }
+    if devices_ready {
+        log(&console, "[INIT] all devices ready.");
+    } else {
+        log(&console, "[INIT] DM did not signal ready in time; parking in the event loop");
     }
 
     // ── 8. Spawn the POSIX sidecar ────────────────────────────────────────
@@ -179,11 +229,20 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     log(&console, "[INIT] ── Phase 5 init sidecar complete ──");
     log(&console, "[INIT] system ready for POSIX sidecar creation.");
 
-    // ── 9. Park in the scheduler event loop ───────────────────────────────
-    //    Wait on the console channel for input / events.
+    // ── 9. The demo server loop ───────────────────────────────────────────
+    // Blocking k_chan_wait (TIMEOUT_NONE) on the Device Manager channel:
+    // this sidecar parks (cap_wait_chans) until the DM queues a message or
+    // a control event, and a wake re-runs the wait to return it. Console
+    // output inside the loop uses blocking sends (timeout 0). The loop
+    // exits only when the DM channel closes — a real init would respawn
+    // the DM from here; this demo parks forever instead.
+    log(&console, "[INIT] entering the event loop (blocking wait on the Device Manager channel)...");
+    match demo::run_event_loop(&console, &dm_channel) {
+        Ok(()) => log(&console, "[INIT] event loop exited: Device Manager channel closed."),
+        Err(e) => log_fmt!(&console, "[INIT] event loop error: {}", e),
+    }
     loop {
-        let mut chans = [console_cap.slot];
-        let _ = RealKernel.wait(&mut chans, TIMEOUT_NONE);
+        core::hint::spin_loop();
     }
 }
 
@@ -258,9 +317,3 @@ fn log(console: &InitChannel<RealKernel>, msg: &str) {
     let _ = console.request(0, msg.as_bytes());
 }
 
-/// Send a formatted log message (simplified — no fmt in no_std).
-fn log_fmt(console: &InitChannel<RealKernel>, _fmt: &str, _args: impl core::fmt::Display) {
-    // In a real no_std environment, we'd write to a stack buffer.
-    // For the prototype, just log the format string.
-    let _ = console.request(0, _fmt.as_bytes());
-}

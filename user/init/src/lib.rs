@@ -16,6 +16,9 @@
 //! - `heap`       — bump allocator over the budget region.
 //! - `devreg`     — device registry parser (reads the kernel-populated table).
 //! - `chan`       — thin channel helpers over the `Kernel` trait.
+//! - `demo`       — the demo server loop: blocking wait/send + the finite-
+//!                 deadline Device Manager handshake (the Phase 5
+//!                 "real sidecar workload" proof).
 //! - `entry`      — the `extern "C"` entry point (feature `target`).
 //! - `sim`        — host-side fake kernel for testing.
 
@@ -24,6 +27,7 @@
 extern crate alloc;
 
 pub mod chan;
+pub mod demo;
 pub mod devreg;
 pub mod heap;
 

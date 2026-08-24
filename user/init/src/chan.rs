@@ -16,10 +16,16 @@ pub enum ChannelError {
     Kernel(i32),
     /// Peer closed the channel (reason, detail).
     Closed(u16, u32),
+    /// A finite-deadline wait elapsed with nothing ready (the kernel woke
+    /// the parked wait at its deadline and the re-run returned
+    /// `ERR_TIMEOUT`) — the caller retries or moves on.
+    Timeout,
     /// Received a message but the payload was too short for the expected type.
     PayloadTooShort,
     /// Received an unexpected message kind (not MSG).
     UnexpectedKind(u16),
+    /// Received a message with an unexpected tag for the expected protocol.
+    UnexpectedTag(u32),
 }
 
 impl core::fmt::Display for ChannelError {
@@ -29,8 +35,10 @@ impl core::fmt::Display for ChannelError {
             ChannelError::Closed(reason, detail) => {
                 write!(f, "channel closed (reason={reason}, detail={detail})")
             }
+            ChannelError::Timeout => write!(f, "reply deadline elapsed"),
             ChannelError::PayloadTooShort => write!(f, "payload too short"),
             ChannelError::UnexpectedKind(k) => write!(f, "unexpected message kind {k}"),
+            ChannelError::UnexpectedTag(t) => write!(f, "unexpected message tag 0x{t:08x}"),
         }
     }
 }
@@ -47,6 +55,12 @@ impl<K: Kernel> InitChannel<K> {
         Self { k, handle }
     }
 
+    /// The underlying kernel (for callers that need to wait on this
+    /// endpoint directly, e.g. the demo event loop).
+    pub(crate) fn kernel(&self) -> &K {
+        &self.k
+    }
+
     /// Introspect this endpoint's capability.
     pub fn info(&self) -> Result<CapInfo, ChannelError> {
         self.k
@@ -55,13 +69,20 @@ impl<K: Kernel> InitChannel<K> {
     }
 
     /// Send a message with no caps and wait for a reply.
+    ///
+    /// The send is BLOCKING (timeout_ns = 0, transport spec §3.4): if the
+    /// peer's queue is full, the kernel parks this sidecar (cap_wait_chans,
+    /// park_syscall = SYS_SLS_CHAN_SEND) and a recv freeing a slot wakes it
+    /// to re-run the send — a slow peer backpressures init, nothing is
+    /// dropped. Console logs use this path (fire-and-forget, no reply).
     pub fn request(&self, tag: u32, payload: &[u8]) -> Result<(), ChannelError> {
         self.k
-            .send(self.handle, tag, 0, payload, &[], TIMEOUT_NONE)
+            .send(self.handle, tag, 0, payload, &[], 0)
             .map_err(ChannelError::Kernel)
     }
 
     /// Send a message carrying a MEM cap (e.g. device registry snapshot).
+    /// Blocking send, same semantics as `request`.
     pub fn send_with_cap(
         &self,
         tag: u32,
@@ -69,13 +90,14 @@ impl<K: Kernel> InitChannel<K> {
         cap: &SendCap,
     ) -> Result<(), ChannelError> {
         self.k
-            .send(self.handle, tag, 0, payload, core::slice::from_ref(cap), TIMEOUT_NONE)
+            .send(self.handle, tag, 0, payload, core::slice::from_ref(cap), 0)
             .map_err(ChannelError::Kernel)
     }
 
-    /// Wait for a message (blocking).
+    /// Wait for a message (blocking): the inner `k_chan_wait` with
+    /// TIMEOUT_NONE parks this sidecar until a message or control event is
+    /// queued (the demo event loop's blocking park).
     pub fn recv_msg(&self, buf: &mut [u8]) -> Result<u32, ChannelError> {
-        let mut caps = [GrantedCap::default(); 4];
         let mut chans = [self.handle];
         let (idx, kind) = self
             .k
@@ -87,25 +109,71 @@ impl<K: Kernel> InitChannel<K> {
         match kind {
             CH_KIND_MSG => {}
             _ if kind == CH_KIND_CLOSE => {
-                let mut close_buf = [0u8; 8];
-                let _result = self
-                    .k
-                    .recv(self.handle, &mut close_buf, &mut caps)
-                    .map_err(ChannelError::Kernel)?;
-                let reason = u16::from_le_bytes([close_buf[0], close_buf[1]]);
-                let detail = u32::from_le_bytes([close_buf[2], close_buf[3], close_buf[4], close_buf[5]]);
+                let (reason, detail) = self.recv_close()?;
                 return Err(ChannelError::Closed(reason, detail));
             }
             other => return Err(ChannelError::UnexpectedKind(other)),
         }
         let result = self
             .k
-            .recv(self.handle, buf, &mut caps)
+            .recv(self.handle, buf, &mut [GrantedCap::default(); 4])
             .map_err(ChannelError::Kernel)?;
-        if result.len == 0 {
-            return Ok(0);
-        }
+        // The tag is the protocol discriminator and must survive even an
+        // empty payload (e.g. the "devices ready" signal has no body).
         Ok(result.tag)
+    }
+
+    /// Wait for a message with a FINITE deadline: the `k_chan_wait` parks
+    /// with an absolute deadline and the kernel wakes it at the deadline
+    /// (timer ISR) whose re-run returns `ERR_TIMEOUT` — mapped to
+    /// `ChannelError::Timeout`. This is the handshake path: a slow peer is
+    /// handled by the deadline + bounded retries, never unbounded blocking.
+    pub fn recv_msg_deadline(
+        &self,
+        buf: &mut [u8],
+        deadline_ns: u64,
+    ) -> Result<u32, ChannelError> {
+        let mut chans = [self.handle];
+        let (idx, kind) = self
+            .k
+            .wait(&mut chans, deadline_ns)
+            .map_err(|code| {
+                if code == aerosls_proto::kabi::ERR_TIMEOUT {
+                    ChannelError::Timeout
+                } else {
+                    ChannelError::Kernel(code)
+                }
+            })?;
+        if idx != 0 {
+            return Err(ChannelError::Kernel(-1));
+        }
+        match kind {
+            CH_KIND_MSG => {}
+            _ if kind == CH_KIND_CLOSE => {
+                let (reason, detail) = self.recv_close()?;
+                return Err(ChannelError::Closed(reason, detail));
+            }
+            other => return Err(ChannelError::UnexpectedKind(other)),
+        }
+        let result = self
+            .k
+            .recv(self.handle, buf, &mut [GrantedCap::default(); 4])
+            .map_err(ChannelError::Kernel)?;
+        // Same as `recv_msg`: the tag survives an empty payload.
+        Ok(result.tag)
+    }
+
+    /// Drain a queued CLOSE event (the 8-byte body: reason u16 LE, detail
+    /// u32 LE, pad 2) after the peer closed or died.
+    pub fn recv_close(&self) -> Result<(u16, u32), ChannelError> {
+        let mut close_buf = [0u8; 8];
+        let _result = self
+            .k
+            .recv(self.handle, &mut close_buf, &mut [GrantedCap::default(); 4])
+            .map_err(ChannelError::Kernel)?;
+        let reason = u16::from_le_bytes([close_buf[0], close_buf[1]]);
+        let detail = u32::from_le_bytes([close_buf[2], close_buf[3], close_buf[4], close_buf[5]]);
+        Ok((reason, detail))
     }
 
     /// Send a CLOSE event.

@@ -153,9 +153,33 @@ struct ProcessDescriptor {
     // posture). Layout order is load-bearing: [r11, rcx, r15..rbp] match
     // syscall_entry_stub's push order exactly.
     struct CapParkCtx park_ctx;
-    uint64_t   park_req;              // the SLSCapRecvRequest pointer the resume re-runs
-    uint16_t   waiting_chan;          // channel id this process is BLOCKED on, or
-                                       // CAP_NONE (0xFFFF) when not parked
+    uint64_t   park_req;              // the request pointer the resume re-runs
+                                       // (SLSCapRecvRequest for a recv park,
+                                       // SLSChanWaitRequest for a chan-wait park)
+    uint32_t   park_syscall;          // the syscall the resume re-runs — set at park
+                                       // time (SYS_SLS_CAP_RECV or SYS_SLS_CHAN_WAIT)
+                                       // and consumed by cap_recv_resume()'s
+                                       // do_syscall re-entry. Generalizes the resume
+                                       // so ONE entry point serves both the
+                                       // single-channel recv park and the Phase-5
+                                       // multi-channel k_chan_wait park.
+    uint16_t   waiting_chan;          // channel id this process is BLOCKED on (recv
+                                       // park), or CAP_NONE (0xFFFF) when not parked
+    uint16_t   waiting_chans[CHAN_WAIT_MAX_CHANS];  // Phase 5 wait park: the channels
+                                       // a k_chan_wait / k_chan_send process is
+                                       // blocked on — ANY of them waking it resumes
+                                       // the syscall. waiting_nchans == 0 means the
+                                       // single-channel waiting_chan form (recv park).
+    uint8_t    waiting_nchans;        // number of channels in waiting_chans[] (0 =
+                                       // not a multi-channel park)
+    uint64_t   waiting_deadline;      // Phase 5: ABSOLUTE kernel tick count by which
+                                       // the park must resolve, or 0 = block forever.
+                                       // Set by cap_wait_chans; NOT cleared by
+                                       // cap_wake_chan (the resume re-run consumes it
+                                       // via cap_park_deadline_take, so re-parks never
+                                       // extend a finite deadline) and cleared by the
+                                       // deadline tick's wake only in the sense that
+                                       // the re-run takes it. Cleared at slot reuse.
     uint8_t    has_ring3_ctx;         // ring3_ctx holds a valid iretq frame: set at
                                        // async spawn (synthetic) and whenever a timer
                                        // preemption saves real context. kernel_rsp
@@ -281,10 +305,15 @@ void     sys_sls_proc_list(void);
 // stay host-testable without the scheduler). cap_wait_chan() parks the
 // calling process on the channel and switches to the next runnable process;
 // it returns only when it could NOT park (no runnable process — the caller
-// then returns CAP_EAGAIN). cap_wake_chan() marks the parked process
-// runnable again (resume via the kernel path). cap_recv_resume() is the
-// kernel-mode resume entry point (iretq'd to after wake).
+// then returns CAP_EAGAIN). cap_wait_chans() is the Phase-5 analogue for
+// k_chan_wait (TIMEOUT_NONE): same park, but on a LIST of channels — a wake
+// on ANY of them resumes the process to re-run the wait syscall.
+// cap_wake_chan() marks the parked process runnable again (resume via the
+// kernel path). cap_recv_resume() is the kernel-mode resume entry point
+// (iretq'd to after wake); it re-runs whatever syscall park_syscall names.
 int  cap_wait_chan(uint32_t chan_id, void* recv_req);
+int  cap_wait_chans(const uint32_t* chan_ids, uint32_t n, void* req,
+                    uint32_t park_syscall);
 void cap_wake_chan(uint32_t chan_id);
 void cap_recv_resume(struct ProcessDescriptor* pd);   /* noreturn */
 

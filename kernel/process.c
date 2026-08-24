@@ -4,6 +4,7 @@
 #include "loader.h"
 #include "partition.h"
 #include "frame_pool.h"
+#include "timer.h"   /* Phase 5 deadlines: kernel_tick_counter in cap_park_deadline_tick */
 #include "../arch/x86/user_paging.h"
 #include "../user/permissions.h"
 #include "cap.h"   /* Seed Kernel Phase 1: strong cap_current_pid()/cap_proc_cr3() below */
@@ -85,7 +86,10 @@ static void proc_clear_resume_state(struct ProcessDescriptor* pd) {
     for (int i = 0; i < (int)(sizeof(pd->park_ctx) / sizeof(uint64_t)); i++)
         pc[i] = 0;
     pd->park_req       = 0;
+    pd->park_syscall   = 0;
     pd->waiting_chan   = CAP_NONE;
+    pd->waiting_nchans = 0;
+    pd->waiting_deadline = 0;
     pd->has_ring3_ctx  = 0;
     pd->resume_kernel  = 0;
     pd->resume_sysret  = 0;
@@ -1197,25 +1201,23 @@ static void kernel_switch_next(struct ProcessDescriptor* next) {
     __builtin_unreachable();
 }
 
-/* Strong override of cap.c's weak hook. Returns 0 if the process could NOT
- * park (kernel context, or no other runnable process — the caller returns
- * CAP_EAGAIN and the SDK retries); never returns when it parks (the
- * iretq above hands the CPU to another process). */
-int cap_wait_chan(uint32_t chan_id, void* recv_req) {
-    struct ProcessDescriptor* cur = process_find_current();
-    if (!cur) return 0;   /* kernel context: no process to park */
-
-    /* Capture the user state the syscall entry stub pushed onto this
-     * process's syscall stack, plus the user RSP from [gs:0]. cap_recv_resume()
-     * rebuilds a fresh syscall frame from these. The entry frame sits at
-     * [syscall_stack_top-8 .. -64] because entry did `mov rsp,[gs:8]` and
-     * pushed eight qwords before calling do_syscall, in this order (see
-     * arch/x86/syscall.asm): rbp [top-8], rbx, r12, r13, r14, r15, rcx,
-     * r11 [top-64]. The mapping is load-bearing: .syscall_return pops r11,
-     * rcx, r15..rbp and sysret needs rcx=user RIP, r11=user RFLAGS. (A
-     * mirrored capture once shipped here and passed the overlap test only
-     * by luck — the resumed code's rsp/rax/rdi were correct and it never
-     * read the wrong callee-saved values; fixed once the mirror was proven.) */
+/* Shared park capture: snapshot the current process's syscall-entry frame
+ * into park_ctx and stash the resume args — the request pointer the resume
+ * re-runs and the syscall number to re-run (SYS_SLS_CAP_RECV or
+ * SYS_SLS_CHAN_WAIT). The entry frame sits at [syscall_stack_top-8 .. -64]
+ * because entry did `mov rsp,[gs:8]` and pushed eight qwords before
+ * calling do_syscall, in this order (see arch/x86/syscall.asm): rbp
+ * [top-8], rbx, r12, r13, r14, r15, rcx, r11 [top-64]. The mapping is
+ * load-bearing: .syscall_return pops r11, rcx, r15..rbp and sysret needs
+ * rcx=user RIP, r11=user RFLAGS. (A mirrored capture once shipped here and
+ * passed the overlap test only by luck — the resumed code's rsp/rax/rdi
+ * were correct and it never read the wrong callee-saved values; fixed once
+ * the mirror was proven.) park_ctx is consumed by cap_recv_resume(), which
+ * REBUILDS the resume frame from it — the original entry frame is not
+ * guaranteed to survive the park syscall's own chain (GCC may reuse the
+ * region for kernel_switch_next's f[20] array). */
+static void proc_park_capture(struct ProcessDescriptor* cur, void* req,
+                              uint32_t syscall_num) {
     uint64_t* entry = (uint64_t*)cur->syscall_stack_top;
     cur->park_ctx.r11 = entry[-8];   /* user RFLAGS  */
     cur->park_ctx.rcx = entry[-7];   /* user RIP     */
@@ -1227,7 +1229,18 @@ int cap_wait_chan(uint32_t chan_id, void* recv_req) {
     cur->park_ctx.rbp = entry[-1];
     __asm__ volatile("movq %%gs:0, %0" : "=r"(cur->park_ctx.user_rsp)
                      : : "memory");
-    cur->park_req      = (uint64_t)recv_req;
+    cur->park_req      = (uint64_t)req;
+    cur->park_syscall  = syscall_num;
+}
+
+/* Strong override of cap.c's weak hook. Returns 0 if the process could NOT
+ * park (kernel context, or no other runnable process — the caller returns
+ * CAP_EAGAIN and the SDK retries); never returns when it parks (the
+ * iretq above hands the CPU to another process). */
+int cap_wait_chan(uint32_t chan_id, void* recv_req) {
+    struct ProcessDescriptor* cur = process_find_current();
+    if (!cur) return 0;   /* kernel context: no process to park */
+    proc_park_capture(cur, recv_req, SYS_SLS_CAP_RECV);
     cur->waiting_chan  = (uint16_t)chan_id;
     cur->state         = PROC_BLOCKED;
     kernel_serial_printf(
@@ -1251,25 +1264,141 @@ int cap_wait_chan(uint32_t chan_id, void* recv_req) {
     return 1;   /* unreachable */
 }
 
-/* Strong override of cap.c's weak hook: mark the first process parked on
- * chan_id runnable again. The next schedule of it (timer tick, or the
- * current process parking/exiting) iretq's it into cap_recv_resume(). */
+/* Strong override of cap.c's weak hook: the Phase-5 wait-aware park — a
+ * k_chan_wait (TIMEOUT_NONE) or a queue-full k_chan_send (timeout_ns == 0)
+ * blocking on a LIST of channels. Same as cap_wait_chan but the process
+ * blocks on a LIST — a wake on ANY of them (cap_wake_chan) resumes it and
+ * the re-run of `park_syscall` (SYS_SLS_CHAN_WAIT or SYS_SLS_CHAN_SEND)
+ * re-polls / re-attempts with the same user-space request struct. `req`
+ * is that request pointer; `park_syscall` is what the resume re-runs.
+ * Returns 0 when it could NOT park (kernel context, bad list, or no
+ * runnable process — the caller returns CAP_ERR_TIMEOUT and the SDK
+ * retries); never returns when it parks. Single-CPU: the poll-then-park
+ * in k_chan_wait (and the fail-then-park in k_chan_send) is atomic w.r.t.
+ * other processes (the syscall doesn't yield until kernel_switch_next),
+ * so a message enqueued or a slot freed between the check and here can
+ * only happen after waiting_chans[] is registered — no missed-wake race
+ * (same argument as the Phase-1.5 recv park). */
+int cap_wait_chans(const uint32_t* chan_ids, uint32_t n, void* req,
+                   uint32_t park_syscall, uint64_t deadline_ticks) {
+    struct ProcessDescriptor* cur = process_find_current();
+    if (!cur) return 0;   /* kernel context: no process to park */
+    if (!chan_ids || n == 0 || n > CHAN_WAIT_MAX_CHANS) return 0;
+    proc_park_capture(cur, req, park_syscall);
+    for (uint32_t i = 0; i < n; i++)
+        cur->waiting_chans[i] = (uint16_t)chan_ids[i];
+    cur->waiting_nchans  = (uint8_t)n;
+    cur->waiting_deadline = deadline_ticks;   /* 0 = block forever */
+    cur->state           = PROC_BLOCKED;
+    kernel_serial_printf(
+        "[CAP] chan wait: parked PID %u on %u channel(s)%s\n", cur->pid, n,
+        deadline_ticks ? " (with deadline)" : "");
+
+    struct ProcessDescriptor* next = pick_next_runnable();
+    if (!next) {
+        /* Nobody to run — don't park; the caller returns CAP_ERR_TIMEOUT
+         * and the SDK retries (same posture as the recv park's EAGAIN). */
+        cur->state           = PROC_RUNNING;
+        cur->waiting_nchans  = 0;
+        cur->waiting_deadline = 0;
+        kernel_serial_printf(
+            "[CAP] chan wait: no runnable process; returning TIMEOUT\n");
+        return 0;
+    }
+    kernel_serial_printf("[CAP] chan wait: switching to PID %u '%s'\n",
+                         next->pid, next->name);
+    kernel_switch_next(next);   /* noreturn */
+    return 1;   /* unreachable */
+}
+
+/* Strong override of cap.c's weak hook: return the current process's
+ * stored park deadline (absolute ticks, 0 = none/forever) and CLEAR it.
+ * Called at the ENTRY of a resumed k_chan_wait/k_chan_send — the re-run
+ * takes the ORIGINAL deadline (from when the process first parked) so a
+ * re-park after a spurious wake never extends it. A fresh call (nothing
+ * stored) returns 0 and the syscall computes now + timeout. Clearing here
+ * also means a deadline can never leak into a later, unrelated syscall. */
+uint64_t cap_park_deadline_take(void) {
+    struct ProcessDescriptor* cur = process_find_current();
+    if (!cur) return 0;   /* kernel context: never parked */
+    uint64_t d = cur->waiting_deadline;
+    cur->waiting_deadline = 0;
+    return d;
+}
+
+/* Strong override of cap.c's weak hook (called from timer_irq_handler,
+ * BSP-only, ~10 ms per tick, BEFORE schedule_ring3 in the same ISR): wake
+ * every parked process whose deadline has passed, so a finite-deadline
+ * k_chan_wait/k_chan_send returns CAP_ERR_TIMEOUT at its deadline instead
+ * of blocking forever. Pure proc_table state flip (BLOCKED → SUSPENDED +
+ * resume_kernel) — no cap locks, same CPU as the schedule_ring3 that
+ * scans this table, so no lock or cross-CPU hazard. waiting_deadline is
+ * deliberately NOT cleared: the woken process's re-run consumes it via
+ * cap_park_deadline_take() and decides TIMEOUT (deadline passed, still
+ * not ready) vs. re-park (woken early by a spurious event wake). */
+void cap_park_deadline_tick(void) {
+    uint64_t now = kernel_tick_counter;
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct ProcessDescriptor* pd = &proc_table[i];
+        if (!pd->active || pd->state != PROC_BLOCKED) continue;
+        if (pd->waiting_deadline == 0) continue;   /* block forever */
+        if (now < pd->waiting_deadline) continue;
+        pd->state         = PROC_SUSPENDED;
+        pd->resume_kernel = 1;
+        pd->waiting_chan  = CAP_NONE;
+        pd->waiting_nchans = 0;
+        kernel_serial_printf(
+            "[CAP] deadline: PID %u woken at tick %llu (deadline %llu)\n",
+            pd->pid, (unsigned long long)now,
+            (unsigned long long)pd->waiting_deadline);
+    }
+}
+
+/* Is this parked process waiting on chan_id? A Phase-5 wait/send park
+ * (waiting_nchans > 0) matches if ANY listed channel is chan_id; the
+ * Phase-1.5 recv park (waiting_nchans == 0) matches the single
+ * waiting_chan. */
+static int proc_waiting_on(const struct ProcessDescriptor* pd, uint32_t chan_id) {
+    if (pd->waiting_nchans > 0) {
+        for (int i = 0; i < pd->waiting_nchans; i++)
+            if (pd->waiting_chans[i] == (uint16_t)chan_id) return 1;
+        return 0;
+    }
+    return pd->waiting_chan == (uint16_t)chan_id;
+}
+
+/* Strong override of cap.c's weak hook: mark EVERY process parked on
+ * chan_id runnable again (a recv-parked process, a k_chan_wait park on a
+ * list containing chan_id, or a k_chan_send park blocked on a full queue).
+ * Wake-all is deliberate: a channel is point-to-point, so at most one
+ * process can be parked on each DIRECTIONAL queue (a waiter parks only on
+ * an empty queue, a blocked sender only on a full one — mutually
+ * exclusive), but BOTH queues can hold a parked process at once (end0's
+ * waiter on q0 empty while end0's sender waits on q1 full). Waking only
+ * the first match could wake the wrong end and leave the other parked
+ * forever; waking everyone costs each spurious process one re-poll (it
+ * re-runs its syscall, finds its condition still unmet, and re-parks).
+ * The next schedule of each woken process (timer tick, or the current
+ * process parking/exiting) iretq's it into cap_recv_resume(). */
 void cap_wake_chan(uint32_t chan_id) {
     for (int i = 0; i < PROC_MAX; i++) {
         struct ProcessDescriptor* pd = &proc_table[i];
         if (!pd->active || pd->state != PROC_BLOCKED) continue;
-        if (pd->waiting_chan != (uint16_t)chan_id) continue;
+        if (!proc_waiting_on(pd, chan_id)) continue;
         pd->state         = PROC_SUSPENDED;
         pd->resume_kernel = 1;
         pd->waiting_chan  = CAP_NONE;
+        pd->waiting_nchans = 0;
         kernel_serial_printf("[CAP] woken PID %u (channel %u)\n",
                              pd->pid, chan_id);
-        /* Phase 1.5 (immediate wake): remember WHO we woke so the sender's
+        /* Phase 1.5 (immediate wake): remember WHO we woke so the caller's
          * cap_maybe_handoff() can hand the CPU to them right now instead of
-         * letting them wait for the next tick. NULL in kernel context. */
+         * letting them wait for the next tick. NULL in kernel context.
+         * With multiple woken processes the LAST one wins the handoff; the
+         * others run at their next schedule. */
         struct ProcessDescriptor* cur = process_find_current();
         if (cur) cur->handoff_target = pd;
-        return;
+        /* no return: keep waking every process parked on this channel */
     }
 }
 
@@ -1414,13 +1543,17 @@ uint32_t sys_sls_yield(void) {
     __builtin_unreachable();
 }
 
-/* Kernel-mode resume entry point for a woken blocked recv. Runs on the
- * process's own syscall stack with GS_BASE == 0 (see kernel_switch_next and
- * schedule_ring3 — the timer path never swapgs's). We swapgs to the kernel
- * view, rebuild the syscall-entry frame the stub would have pushed, re-run
- * the parked SYS_SLS_CAP_RECV, and jump into the stub's shared return path
- * (.syscall_return) so the process sysrets to ring-3 exactly as if the
- * syscall had simply taken longer. */
+/* Kernel-mode resume entry point for a woken blocked process — a parked
+ * cap_recv (SYS_SLS_CAP_RECV) or a parked k_chan_wait (SYS_SLS_CHAN_WAIT).
+ * Runs on the process's own syscall stack with GS_BASE == 0 (see
+ * kernel_switch_next and schedule_ring3 — the timer path never swapgs's).
+ * We swapgs to the kernel view, rebuild the syscall-entry frame the stub
+ * would have pushed, re-run the parked syscall (pd->park_syscall, set at
+ * park time by cap_wait_chan/cap_wait_chans), and jump into the stub's
+ * shared return path (.syscall_return) so the process sysrets to ring-3
+ * exactly as if the syscall had simply taken longer. The re-run re-polls
+ * the same user-space request, so a woken wait finds the message/event
+ * that woke it. */
 __attribute__((noreturn))
 void cap_recv_resume(struct ProcessDescriptor* pd) {
     uint64_t* p   = (uint64_t*)&pd->park_ctx;
@@ -1460,12 +1593,12 @@ void cap_recv_resume(struct ProcessDescriptor* pd) {
         "pushq 16(%1)\n\t"   /* r15 */
         "pushq 8(%1)\n\t"    /* rcx — user RIP (sysret target) */
         "pushq 0(%1)\n\t"    /* r11 — user RFLAGS */
-        "mov %2, %%rsi\n\t"  /* arg = parked SLSCapRecvRequest */
-        "mov %3, %%edi\n\t"  /* num = SYS_SLS_CAP_RECV */
+        "mov %2, %%rsi\n\t"  /* arg = parked request (recv or chan wait) */
+        "mov %3, %%edi\n\t"  /* num = pd->park_syscall (recv or chan wait) */
         "call do_syscall\n\t"
         "jmp syscall_return_path\n\t"
         :
-        : "r"(top), "r"(p), "r"(req), "i"(SYS_SLS_CAP_RECV)
+        : "r"(top), "r"(p), "r"(req), "r"(pd->park_syscall)
         : "rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11",
           "memory");
     __builtin_unreachable();

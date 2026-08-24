@@ -43,7 +43,43 @@
  *      message NOT consumed), wait timeout on an empty queue, close → the
  *      peer observes a CLOSE event exactly once (then STATE), the
  *      validation/error mapping (TYPE/PROTO/RANGE/STATE), and cap_info
- *      on both a MEM and a CHAN cap.
+ *      on both a MEM and a CHAN cap, and
+ *   9. (section 10) peer-death close events: cap_table_teardown marks every
+ *      channel the dying sidecar was an end of with CLOSE_PEER_DEAD
+ *      (detail = the dead pid) and drops its registry entry, and the
+ *      surviving peer's k_chan_wait/recv observe the death exactly once —
+ *      then a send after the peer died fails STATE, and
+ *  10. (section 11) the kernel console service is close-aware: a live
+ *      child's console channel is drained without revoke, but after the
+ *      child's death the next console_service_tick revokes the kernel end
+ *      (freeing the kernel's CHAN_R/CHAN_W) instead of leaving the
+ *      channel open in the kernel context table forever, and
+ *  11. (section 12) the wait-aware park: k_chan_wait with TIMEOUT_NONE on
+ *      an empty queue requests the park (cap_wait_chans) with the
+ *      RESOLVED channel ids and the request pointer — the real kernel
+ *      (process.c) parks the process there and re-runs the wait on wake.
+ *      The transport half proven here: an enqueue (cap_send_msg's wake),
+ *      an explicit k_chan_close, and a peer-death teardown each fire
+ *      cap_wake_chan with the channel id, and the re-poll after each wake
+ *      returns the MSG / CLOSE event (CLOSE_PEER_DEAD with the dead pid),
+ *      and
+ *  12. (section 13) the blocking k_chan_send: a queue-full send with
+ *      timeout_ns == 0 requests the park (cap_wait_chans) with the
+ *      channel id, the request pointer, and park_syscall =
+ *      SYS_SLS_CHAN_SEND — the real kernel parks the sender there and a
+ *      recv freeing a slot (cap_recv_msg's wake) re-runs it to enqueue.
+ *      The transport half proven here: the park request, that a finite
+ *      timeout skips it, that a dequeue fires cap_wake_chan with the
+ *      channel id and the re-run enqueues, and that a close wakes the
+ *      parked sender whose re-run then fails CAP_ERR_STATE, and
+ *  13. (section 14) finite deadlines: a park carries an ABSOLUTE deadline
+ *      in ticks (rounded up to one ~10 ms KERNEL_TICK_NS tick); a re-run
+ *      takes the ORIGINAL deadline (cap_park_deadline_take) so re-parks
+ *      never extend it, an elapsed deadline returns CAP_ERR_TIMEOUT
+ *      without re-parking, and a ready queue beats an expired deadline.
+ *      The test advances a test-owned kernel_tick_counter to drive the
+ *      real expiry/re-park logic in chan.c (the timer ISR wake that
+ *      triggers the re-run lives in process.c, out of this link set).
  *
  * The transport returns the POSITIVE CAP_ERR_* codes (0 = CAP_ERR_OK)
  * from kernel/cap.h, distinct from the Phase-3 negative CAP_E* codes.
@@ -89,6 +125,11 @@ char _kernel_image_end[1];
 void kernel_serial_print(const char* s) { (void)s; }
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 
+/* kernel/timer.c is not linked; the Phase 5 deadline logic in chan.c reads
+ * kernel_tick_counter directly (timer.h declares it). Test-owned so the
+ * deadline tests can advance time deterministically. */
+volatile uint64_t kernel_tick_counter = 0;
+
 /* Serial capture for the console-service assertions: the kernel console
  * service (kernel/console_service.c) writes sidecar console payloads via
  * kernel_serial_putchar(). Capture those bytes here instead of touching
@@ -103,6 +144,61 @@ void kernel_serial_putchar(char c) {
 /* ─── Strong overrides of cap.c's weak hooks ─────────────────────────────── */
 static uint32_t g_cur_pid = 0;
 uint32_t cap_current_pid(void) { return g_cur_pid; }
+
+/* Phase 5 wait-aware park (sections 12-14): cap.c's weak cap_wait_chans is
+ * overridden so the test can prove k_chan_wait (empty queue) and
+ * k_chan_send (queue full) REQUEST the park with the right data. There is
+ * no scheduler in the host test (process.c is not linked), so the override
+ * records what it was asked to park on — the resolved channel ids, the
+ * request pointer, the syscall the resume would re-run (SYS_SLS_CHAN_WAIT
+ * or SYS_SLS_CHAN_SEND), and the absolute deadline ticks (0 = forever) —
+ * and returns 0 ("could not park"); the caller then degrades to
+ * CAP_ERR_TIMEOUT exactly like the weak default. The real kernel's strong
+ * override (process.c) parks the process on the list and re-runs
+ * `park_syscall` on wake; this recording is the transport-side proof of
+ * the request. */
+static int      g_wait_park_calls = 0;
+static uint32_t g_wait_chans[CHAN_WAIT_MAX_CHANS];
+static uint32_t g_wait_n = 0;
+static void*    g_wait_req = 0;
+static uint32_t g_wait_syscall = 0;
+static uint64_t g_wait_deadline = 0;   /* also the "stored" deadline (see take) */
+int cap_wait_chans(const uint32_t* chan_ids, uint32_t n, void* req,
+                   uint32_t park_syscall, uint64_t deadline_ticks) {
+    g_wait_park_calls++;
+    g_wait_n = n;
+    g_wait_req = req;
+    g_wait_syscall = park_syscall;
+    g_wait_deadline = deadline_ticks;
+    for (uint32_t i = 0; i < n && i < CHAN_WAIT_MAX_CHANS; i++)
+        g_wait_chans[i] = chan_ids[i];
+    return 0;   /* no scheduler in the host test: caller returns CAP_ERR_TIMEOUT */
+}
+
+/* Phase 5 deadline take (sections 12-14): mimics the real kernel's
+ * cap_park_deadline_take (process.c) — return the process's stored park
+ * deadline and clear it. Here the "stored" value is what the last
+ * cap_wait_chans call recorded, so a RE-RUN call (simulating the resume
+ * after a wake) takes the ORIGINAL deadline and the syscall's
+ * expired/re-park logic is exercised for real. Reset g_wait_deadline = 0
+ * before a fresh first call. */
+uint64_t cap_park_deadline_take(void) {
+    uint64_t d = g_wait_deadline;
+    g_wait_deadline = 0;
+    return d;
+}
+
+/* Phase 5 wake triggers (section 12): cap.c's weak no-op is overridden so
+ * the test can assert that an enqueue (cap_send_msg), an explicit
+ * k_chan_close, and a peer-death teardown each fire cap_wake_chan with the
+ * channel id — the real kernel's wake makes a parked k_chan_wait re-run
+ * and observe the message/event. */
+static int      g_wake_calls = 0;
+static uint32_t g_wake_chan = 0;
+void cap_wake_chan(uint32_t chan_id) {
+    g_wake_calls++;
+    g_wake_chan = chan_id;
+}
 
 /* ─── Process-table pieces cap_create_sidecar reaches for ────────────────── */
 /* proc_table/proc_count/alloc_pid normally live in process.c; here they are
@@ -1239,6 +1335,740 @@ int main(void) {
               ireq.out.ty == CAP_TYPE_CHAN_R &&
               ireq.out.base == 0 && ireq.out.len == 0,
               "k_cap_info on the console CHAN cap");
+    }
+
+    /* ── 10. peer-death close events (cap_table_teardown → CLOSE_PEER_DEAD) */
+    /* A FRESH spawn-to-spawn pair — section 9 closed the first pair's
+     * endpoint, so its close was already delivered. Spawn peer2
+     * (drv.ramdisk.1 → 106) and consumer2 (drv.consumer.1 → 107), tear
+     * the peer down through the REAL death path (cap_table_teardown), and
+     * verify the consumer observes the death on the channel transport:
+     * wait reports CLOSE, recv delivers {CLOSE_PEER_DEAD, detail=106}, and
+     * a send after the peer died fails STATE (both sides checked). */
+    {
+        struct Blob peer2_blob, cons2_blob;
+        build_peer_blob(&peer2_blob, image_kaddr, "drv.ramdisk.1");
+        build_consumer_blob(&cons2_blob, image_kaddr, "drv.consumer.1",
+                            "drv.ramdisk.1");
+        uint16_t p2_ch = CAP_NONE, c2_ch = CAP_NONE;
+        CHECK(cap_create_sidecar(100, peer2_blob.data, peer2_blob.len,
+                                 CAP_NONE, CAP_NONE, &p2_ch) == 0,
+              "peer2 (drv.ramdisk.1) spawns through cap_create_sidecar");
+        CHECK(cap_create_sidecar(100, cons2_blob.data, cons2_blob.len,
+                                 CAP_NONE, CAP_NONE, &c2_ch) == 0,
+              "consumer2 spawns with console peer drv.ramdisk.1");
+        CHECK(sidecar_registry_resolve("drv.ramdisk.1") == 106 &&
+              sidecar_registry_resolve("drv.consumer.1") == 107,
+              "the fresh pair is registered (106/107)");
+        CHECK(sidecar_registry_count() == 6,
+              "registry holds 6 names before the teardown");
+
+        /* Consumer2 is the last spawn, so g_pml4 is its clone; re-derive
+         * its console channel (BIB caps 4/5). */
+        struct Bib cb10 = bib_parse(host_ptr(BIB_VADDR));
+        uint16_t c2_r = cb10.caps[4].slot;   /* console CHAN_R in 107 */
+        uint16_t c2_w = cb10.caps[5].slot;   /* console CHAN_W in 107 */
+        uint32_t c2_obj = cap_debug_objid(107, c2_r);
+        CHECK(c2_r != CAP_NONE && c2_w != CAP_NONE &&
+              c2_obj != 0xFFFFFFFFu,
+              "consumer2's console channel re-derived from its BIB");
+
+        /* The death path: cap_table_teardown (what process_exit/kill call). */
+        cap_table_teardown(106);
+        CHECK(sidecar_registry_resolve("drv.ramdisk.1") == 0,
+              "the dead peer stops resolving (registry entry removed)");
+        CHECK(sidecar_registry_count() == 5,
+              "registry drops the dead peer's name");
+
+        /* The consumer observes the death through the chan syscalls. */
+        g_cur_pid = 107;
+        struct SLSChanWaitRequest wreq10;
+        memset(&wreq10, 0, sizeof(wreq10));
+        wreq10.chans[0] = c2_r;
+        wreq10.n_chans = 1;
+        wreq10.timeout_ns = 1000;
+        CHECK(sys_sls_chan_wait(&wreq10) == CAP_ERR_OK &&
+              wreq10.out_idx == 0 && wreq10.out_kind == CH_KIND_CLOSE,
+              "consumer2's wait reports CLOSE after the peer dies");
+
+        char rbuf10[64];
+        struct SLSChanRecvRequest rreq10;
+        memset(&rreq10, 0, sizeof(rreq10));
+        memset(rbuf10, 0, sizeof(rbuf10));
+        rreq10.chan = c2_r;
+        rreq10.buf = rbuf10;
+        rreq10.buf_len = sizeof(rbuf10);
+        rreq10.n_slots = 8;
+        CHECK(sys_sls_chan_recv(&rreq10) == CAP_ERR_OK &&
+              rreq10.out.kind == CH_KIND_CLOSE && rreq10.out.len == 8 &&
+              rbuf10[0] == 0x02 && rbuf10[1] == 0x00 &&   /* CLOSE_PEER_DEAD */
+              rbuf10[2] == 106 && rbuf10[3] == 0 &&
+              rbuf10[4] == 0 && rbuf10[5] == 0,
+              "consumer2 recvs the CLOSE body {CLOSE_PEER_DEAD, pid 106}");
+        CHECK(sys_sls_chan_recv(&rreq10) == CAP_ERR_STATE,
+              "death close event delivered exactly once");
+
+        /* Send after the peer died → STATE (either side closed). */
+        struct SLSChanSendRequest sreq10;
+        memset(&sreq10, 0, sizeof(sreq10));
+        sreq10.chan = c2_w;
+        sreq10.payload = (void*)"ping";
+        sreq10.payload_len = 4;
+        CHECK(sys_sls_chan_send(&sreq10) == CAP_ERR_STATE,
+              "send after peer death → STATE, nothing enqueued");
+    }
+
+    /* ── 11. the console service drops a dead child's kernel end ──────── */
+    /* kernel/console_service.c is close-aware: a child's death (teardown
+     * marks close_evt on the kernel end of its console channel) makes the
+     * next tick print the child's last messages, then REVOKE the kernel's
+     * CHAN_R/CHAN_W instead of leaving the channel open forever. Spawn a
+     * console-wired child (standard blob: console → kernel.debug.console),
+     * drain it live, tear it down, and assert the kernel end is revoked. */
+    {
+        struct Blob cblob;
+        build_valid_blob(&cblob, image_kaddr, 0);
+        uint16_t cb_ch = CAP_NONE;
+        CHECK(cap_create_sidecar(100, cblob.data, cblob.len,
+                                 CAP_NONE, CAP_NONE, &cb_ch) == 0,
+              "a console-wired child (108) spawns");
+        /* Its BIB is the last clone: caps[6]/[7] = console CHAN_R/CHAN_W. */
+        struct Bib cb11 = bib_parse(host_ptr(BIB_VADDR));
+        uint16_t c11_r = cb11.caps[6].slot;
+        uint16_t c11_w = cb11.caps[7].slot;
+        uint32_t c11_obj = cap_debug_objid(108, c11_r);
+        CHECK(c11_r != CAP_NONE && c11_w != CAP_NONE &&
+              c11_obj != 0xFFFFFFFFu,
+              "child 108's console channel re-derived from its BIB");
+
+        /* The kernel's far end: a CHAN_R in table 0 with the same object. */
+        int k11_slot = -1;
+        for (int s = 0; s < CAP_TABLE_ENTRIES; s++) {
+            uint64_t w = cap_tables[0].slots[s].word;
+            if (!slot_valid(w) || slot_type(w) != CAP_TYPE_CHAN_R) continue;
+            uint32_t oid = (uint32_t)((w >> CAP_OBJ_SHIFT) & CAP_OBJ_MASK);
+            if (oid == c11_obj) { k11_slot = s; break; }
+        }
+        CHECK(k11_slot >= 0, "kernel holds the child's console far end");
+
+        /* A LIVE child: the tick drains and does NOT revoke. */
+        const char cmsg[] = "last words before death\n";
+        g_serial_cap_len = 0;
+        CHECK(cap_send_msg(108, c11_w, cmsg, sizeof(cmsg) - 1,
+                           NULL, 0, 0, 0) == 0,
+              "child's console message enqueued");
+        console_service_tick();
+        CHECK(g_serial_cap_len == sizeof(cmsg) - 1 &&
+              memcmp(g_serial_cap, cmsg, sizeof(cmsg) - 1) == 0,
+              "tick drains a live child's console verbatim");
+        CHECK(slot_valid(cap_tables[0].slots[k11_slot].word),
+              "live child's kernel-end cap NOT revoked");
+
+        /* The death: teardown marks close_evt on the kernel end; the next
+         * tick must notice and drop the kernel end entirely. */
+        cap_table_teardown(108);
+        CHECK(sidecar_registry_resolve("drv.child.0") == 0,
+              "the console child stops resolving after teardown");
+        console_service_tick();
+        CHECK(!slot_valid(cap_tables[0].slots[k11_slot].word),
+              "dead child's kernel-end console cap revoked by the next tick");
+    }
+
+    /* ── 12. wait-aware park: k_chan_wait (TIMEOUT_NONE) requests the park;
+     * send / close / peer-death wake it ───────────────────────────────── */
+    /* The real kernel (process.c) parks a TIMEOUT_NONE wait on the listed
+     * channels and re-runs the wait on wake. This section proves the
+     * transport half of that loop with nothing planted: (a) the park hook
+     * receives the RESOLVED channel ids + the request pointer when nothing
+     * is ready (and a finite timeout does NOT park), (b) an enqueue fires
+     * cap_wake_chan with the channel id and the re-poll finds the MSG, (c)
+     * a multi-channel wait parks on BOTH resolved ids, (d) an explicit
+     * k_chan_close fires the wake and the re-poll sees the CLOSE event,
+     * and (e) a peer-death teardown fires the wake and the re-poll sees
+     * CLOSE_PEER_DEAD with the dead pid. */
+    {
+        /* A fresh spawn-to-spawn pair (drv.ramdisk.2 → drv.consumer.2). */
+        struct Blob p3;
+        build_peer_blob(&p3, image_kaddr, "drv.ramdisk.2");
+        uint16_t p3_ch = CAP_NONE;
+        CHECK(cap_create_sidecar(100, p3.data, p3.len, CAP_NONE, CAP_NONE,
+                                 &p3_ch) == 0,
+              "wait-park peer (drv.ramdisk.2) spawns");
+        uint32_t peer3 = sidecar_registry_resolve("drv.ramdisk.2");
+        struct Blob c3;
+        build_consumer_blob(&c3, image_kaddr, "drv.consumer.2", "drv.ramdisk.2");
+        uint16_t c3_ch = CAP_NONE;
+        CHECK(cap_create_sidecar(100, c3.data, c3.len, CAP_NONE, CAP_NONE,
+                                 &c3_ch) == 0,
+              "wait-park consumer (drv.consumer.2) spawns");
+        uint32_t cons3 = sidecar_registry_resolve("drv.consumer.2");
+        CHECK(peer3 != 0 && cons3 != 0 && peer3 != cons3,
+              "wait-park pair resolved via the registry");
+        struct Bib c3bib = bib_parse(host_ptr(BIB_VADDR));
+        uint16_t c3_r = c3bib.caps[4].slot;   /* console CHAN_R in cons3 */
+        uint16_t c3_w = c3bib.caps[5].slot;   /* console CHAN_W in cons3 */
+        uint16_t m3_r = c3bib.caps[0].slot;   /* messenger CHAN_R in cons3 */
+        uint32_t c3_obj = cap_debug_objid(cons3, c3_r);
+        uint32_t c3_chan = (c3_obj != 0xFFFFFFFFu)
+                               ? cap_objects[c3_obj].chan_id : CAP_CHAN_MAX;
+        CHECK(c3_r != CAP_NONE && c3_w != CAP_NONE && c3_obj != 0xFFFFFFFFu &&
+              c3_chan < CAP_CHAN_MAX,
+              "consumer3's console channel re-derived (chan id known)");
+        /* peer3's console CHAN_W: the peer-end slot of the same object. */
+        uint16_t peer3_w = CAP_NONE;
+        {
+            int ti = table_for_pid(peer3);
+            for (int s = 0; s < CAP_TABLE_ENTRIES; s++) {
+                uint64_t w = cap_tables[ti].slots[s].word;
+                if (!slot_valid(w) || slot_type(w) != CAP_TYPE_CHAN_W) continue;
+                uint32_t oid = (uint32_t)((w >> CAP_OBJ_SHIFT) & CAP_OBJ_MASK);
+                if (oid == c3_obj) { peer3_w = (uint16_t)s; break; }
+            }
+        }
+        CHECK(peer3_w != CAP_NONE, "peer3's console CHAN_W found in its table");
+
+        /* 12a. TIMEOUT_NONE + empty queue → the park hook fires with the
+         * resolved channel id and the request pointer; the syscall returns
+         * TIMEOUT when the hook cannot park (host-test posture — the real
+         * kernel parks instead of returning). A finite timeout parks WITH
+         * a deadline (absolute ticks, rounded up to one ~10 ms tick). */
+        g_wait_park_calls = 0;
+        g_wait_deadline = 0;
+        g_wake_calls = 0;
+        g_cur_pid = cons3;
+        struct SLSChanWaitRequest w12;
+        memset(&w12, 0, sizeof(w12));
+        w12.chans[0] = c3_r;
+        w12.n_chans = 1;
+        w12.timeout_ns = CH_TIMEOUT_NONE;
+        CHECK(sys_sls_chan_wait(&w12) == CAP_ERR_TIMEOUT,
+              "12a: TIMEOUT_NONE wait on an empty queue returns TIMEOUT when "
+              "the park hook cannot park");
+        CHECK(g_wait_park_calls == 1 && g_wait_n == 1 &&
+              g_wait_chans[0] == c3_chan && g_wait_req == (void*)&w12 &&
+              g_wait_deadline == 0,
+              "12a: the park hook received the resolved channel id, the "
+              "request pointer, and deadline 0 (block forever)");
+
+        g_wait_park_calls = 0;
+        g_wait_deadline = 0;
+        memset(&w12, 0, sizeof(w12));
+        w12.chans[0] = c3_r;
+        w12.n_chans = 1;
+        w12.timeout_ns = 1000;   /* 1 µs → rounded up to one ~10 ms tick */
+        CHECK(sys_sls_chan_wait(&w12) == CAP_ERR_TIMEOUT &&
+              g_wait_park_calls == 1 &&
+              g_wait_deadline == (uint64_t)kernel_tick_counter + 1,
+              "12a: a finite-timeout wait parks WITH a deadline (absolute "
+              "tick, rounded up)");
+
+        /* 12b. an enqueue wakes: the peer's k_chan_send fires
+         * cap_wake_chan with the channel id (the real kernel's wake makes
+         * a parked waiter re-run the wait), and the consumer's re-poll
+         * finds the MSG. */
+        const char wm[] = "wake me up\n";
+        g_wake_calls = 0;
+        g_cur_pid = peer3;
+        struct SLSChanSendRequest s12;
+        memset(&s12, 0, sizeof(s12));
+        s12.chan = peer3_w;
+        s12.tag = 0x5A5A;
+        s12.payload = (void*)wm;
+        s12.payload_len = sizeof(wm) - 1;
+        s12.timeout_ns = 0;
+        CHECK(sys_sls_chan_send(&s12) == CAP_ERR_OK,
+              "12b: peer's k_chan_send enqueues");
+        CHECK(g_wake_calls == 1 && g_wake_chan == c3_chan,
+              "12b: the enqueue fired cap_wake_chan with the channel id");
+
+        g_cur_pid = cons3;
+        g_wait_park_calls = 0;
+        memset(&w12, 0, sizeof(w12));
+        w12.chans[0] = c3_r;
+        w12.n_chans = 1;
+        w12.timeout_ns = CH_TIMEOUT_NONE;
+        CHECK(sys_sls_chan_wait(&w12) == CAP_ERR_OK &&
+              w12.out_idx == 0 && w12.out_kind == CH_KIND_MSG &&
+              g_wait_park_calls == 0,
+              "12b: the re-poll after the wake finds the MSG (no park needed)");
+        char wbuf[64];
+        struct SLSChanRecvRequest r12;
+        memset(&r12, 0, sizeof(r12));
+        memset(wbuf, 0, sizeof(wbuf));
+        r12.chan = c3_r;
+        r12.buf = wbuf;
+        r12.buf_len = sizeof(wbuf);
+        r12.n_slots = 8;
+        CHECK(sys_sls_chan_recv(&r12) == CAP_ERR_OK &&
+              r12.out.kind == CH_KIND_MSG && r12.out.tag == 0x5A5A &&
+              r12.out.len == sizeof(wm) - 1 &&
+              memcmp(wbuf, wm, sizeof(wm) - 1) == 0,
+              "12b: consumer receives the woken message verbatim");
+
+        /* 12c. multi-channel park: waiting on the console R AND the
+         * messenger R parks on BOTH resolved channel ids. */
+        uint32_t m3_obj = cap_debug_objid(cons3, m3_r);
+        uint32_t m3_chan = (m3_obj != 0xFFFFFFFFu)
+                               ? cap_objects[m3_obj].chan_id : CAP_CHAN_MAX;
+        CHECK(m3_obj != 0xFFFFFFFFu && m3_chan < CAP_CHAN_MAX &&
+              m3_chan != c3_chan,
+              "12c: consumer3's messenger channel re-derived (distinct chan)");
+        g_wait_park_calls = 0;
+        g_cur_pid = cons3;
+        memset(&w12, 0, sizeof(w12));
+        w12.chans[0] = c3_r;
+        w12.chans[1] = m3_r;
+        w12.n_chans = 2;
+        w12.timeout_ns = CH_TIMEOUT_NONE;
+        CHECK(sys_sls_chan_wait(&w12) == CAP_ERR_TIMEOUT,
+              "12c: empty multi-channel wait returns TIMEOUT via the park hook");
+        CHECK(g_wait_park_calls == 1 && g_wait_n == 2 &&
+              g_wait_chans[0] == c3_chan && g_wait_chans[1] == m3_chan,
+              "12c: the park hook received BOTH resolved channel ids");
+
+        /* 12d. an explicit close wakes: the peer's k_chan_close fires
+         * cap_wake_chan; the consumer's re-poll sees the CLOSE event and
+         * recv delivers the close body (reason + detail). */
+        g_wake_calls = 0;
+        g_cur_pid = peer3;
+        struct SLSChanCloseRequest c12;
+        memset(&c12, 0, sizeof(c12));
+        c12.chan = peer3_w;
+        c12.reason = CLOSE_PEER;
+        c12.detail = 0x1234;
+        CHECK(sys_sls_chan_close(&c12) == CAP_ERR_OK,
+              "12d: peer's k_chan_close succeeds");
+        CHECK(g_wake_calls == 1 && g_wake_chan == c3_chan,
+              "12d: the close fired cap_wake_chan with the channel id");
+
+        g_cur_pid = cons3;
+        memset(&w12, 0, sizeof(w12));
+        w12.chans[0] = c3_r;
+        w12.n_chans = 1;
+        w12.timeout_ns = CH_TIMEOUT_NONE;
+        CHECK(sys_sls_chan_wait(&w12) == CAP_ERR_OK &&
+              w12.out_kind == CH_KIND_CLOSE,
+              "12d: the re-poll after the close wake sees the CLOSE event");
+        memset(&r12, 0, sizeof(r12));
+        memset(wbuf, 0, sizeof(wbuf));
+        r12.chan = c3_r;
+        r12.buf = wbuf;
+        r12.buf_len = sizeof(wbuf);
+        r12.n_slots = 8;
+        CHECK(sys_sls_chan_recv(&r12) == CAP_ERR_OK &&
+              r12.out.kind == CH_KIND_CLOSE && r12.out.len == 8 &&
+              wbuf[0] == (uint8_t)(CLOSE_PEER & 0xFF) &&
+              wbuf[1] == (uint8_t)(CLOSE_PEER >> 8) &&
+              wbuf[2] == (uint8_t)(0x1234 & 0xFF) &&
+              wbuf[3] == (uint8_t)(0x1234 >> 8),
+              "12d: recv delivers the CLOSE_PEER body (reason + detail)");
+
+        /* 12e. a peer-death teardown wakes: a FRESH pair; the consumer
+         * parks (hook records), the peer's cap_table_teardown fires
+         * cap_wake_chan, and the consumer's re-poll sees CLOSE_PEER_DEAD
+         * with the dead pid (the teardown scan also wakes the peer's
+         * messenger channel — a no-op there, so the wake count is >= 1). */
+        struct Blob p4;
+        build_peer_blob(&p4, image_kaddr, "drv.ramdisk.3");
+        uint16_t p4_ch = CAP_NONE;
+        CHECK(cap_create_sidecar(100, p4.data, p4.len, CAP_NONE, CAP_NONE,
+                                 &p4_ch) == 0,
+              "death-wake peer (drv.ramdisk.3) spawns");
+        uint32_t peer4 = sidecar_registry_resolve("drv.ramdisk.3");
+        struct Blob c4;
+        build_consumer_blob(&c4, image_kaddr, "drv.consumer.3", "drv.ramdisk.3");
+        uint16_t c4_ch = CAP_NONE;
+        CHECK(cap_create_sidecar(100, c4.data, c4.len, CAP_NONE, CAP_NONE,
+                                 &c4_ch) == 0,
+              "death-wake consumer (drv.consumer.3) spawns");
+        uint32_t cons4 = sidecar_registry_resolve("drv.consumer.3");
+        CHECK(peer4 != 0 && cons4 != 0 && peer4 != cons4,
+              "death-wake pair resolved via the registry");
+        struct Bib c4bib = bib_parse(host_ptr(BIB_VADDR));
+        uint16_t c4_r = c4bib.caps[4].slot;
+        uint32_t c4_obj = cap_debug_objid(cons4, c4_r);
+        uint32_t c4_chan = (c4_obj != 0xFFFFFFFFu)
+                               ? cap_objects[c4_obj].chan_id : CAP_CHAN_MAX;
+        CHECK(c4_r != CAP_NONE && c4_obj != 0xFFFFFFFFu && c4_chan < CAP_CHAN_MAX,
+              "consumer4's console channel re-derived");
+
+        g_wait_park_calls = 0;
+        g_wake_calls = 0;
+        g_cur_pid = cons4;
+        memset(&w12, 0, sizeof(w12));
+        w12.chans[0] = c4_r;
+        w12.n_chans = 1;
+        w12.timeout_ns = CH_TIMEOUT_NONE;
+        CHECK(sys_sls_chan_wait(&w12) == CAP_ERR_TIMEOUT &&
+              g_wait_park_calls == 1 && g_wait_chans[0] == c4_chan,
+              "12e: consumer4 parks on the console channel");
+
+        cap_table_teardown(peer4);
+        CHECK(g_wake_calls >= 1 && g_wake_chan == c4_chan,
+              "12e: the peer's teardown fired cap_wake_chan with the channel id");
+        CHECK(sidecar_registry_resolve("drv.ramdisk.3") == 0,
+              "12e: the dead peer stops resolving");
+
+        memset(&w12, 0, sizeof(w12));
+        w12.chans[0] = c4_r;
+        w12.n_chans = 1;
+        w12.timeout_ns = CH_TIMEOUT_NONE;
+        CHECK(sys_sls_chan_wait(&w12) == CAP_ERR_OK &&
+              w12.out_kind == CH_KIND_CLOSE,
+              "12e: the re-poll after the death wake sees CLOSE");
+        memset(&r12, 0, sizeof(r12));
+        memset(wbuf, 0, sizeof(wbuf));
+        r12.chan = c4_r;
+        r12.buf = wbuf;
+        r12.buf_len = sizeof(wbuf);
+        r12.n_slots = 8;
+        CHECK(sys_sls_chan_recv(&r12) == CAP_ERR_OK &&
+              r12.out.kind == CH_KIND_CLOSE && r12.out.len == 8 &&
+              wbuf[0] == (uint8_t)(CLOSE_PEER_DEAD & 0xFF) &&
+              wbuf[1] == (uint8_t)(CLOSE_PEER_DEAD >> 8) &&
+              wbuf[2] == (uint8_t)(peer4 & 0xFF) &&
+              wbuf[3] == (uint8_t)(peer4 >> 8),
+              "12e: recv delivers the CLOSE_PEER_DEAD body with the dead pid");
+    }
+
+    /* ── 13. blocking k_chan_send: a queue-full send (timeout 0) requests
+     * the park; a recv freeing a slot wakes it; a close unblocks a parked
+     * sender with STATE ──────────────────────────────────────────────── */
+    /* The real kernel parks a queue-full sender (timeout_ns == 0) on the
+     * channel and re-runs the send on wake. This section proves the
+     * transport half: (a) the 17th send against a full 16-deep queue
+     * requests the park with the channel id, the request pointer, and
+     * park_syscall = SYS_SLS_CHAN_SEND, (b) a finite-timeout send skips
+     * the park, (c) a recv freeing a slot fires cap_wake_chan with the
+     * channel id and a fresh send then enqueues (what the woken re-run
+     * does), and (d) closing the peer endpoint fires the wake and the
+     * parked sender's re-run fails CAP_ERR_STATE instead of hanging. */
+    {
+        /* A fresh spawn-to-spawn pair (drv.ramdisk.4 → drv.consumer.4). */
+        struct Blob p5;
+        build_peer_blob(&p5, image_kaddr, "drv.ramdisk.4");
+        uint16_t p5_ch = CAP_NONE;
+        CHECK(cap_create_sidecar(100, p5.data, p5.len, CAP_NONE, CAP_NONE,
+                                 &p5_ch) == 0,
+              "blocking-send peer (drv.ramdisk.4) spawns");
+        uint32_t peer5 = sidecar_registry_resolve("drv.ramdisk.4");
+        struct Blob c5;
+        build_consumer_blob(&c5, image_kaddr, "drv.consumer.4", "drv.ramdisk.4");
+        uint16_t c5_ch = CAP_NONE;
+        CHECK(cap_create_sidecar(100, c5.data, c5.len, CAP_NONE, CAP_NONE,
+                                 &c5_ch) == 0,
+              "blocking-send consumer (drv.consumer.4) spawns");
+        uint32_t cons5 = sidecar_registry_resolve("drv.consumer.4");
+        CHECK(peer5 != 0 && cons5 != 0 && peer5 != cons5,
+              "blocking-send pair resolved via the registry");
+        struct Bib c5bib = bib_parse(host_ptr(BIB_VADDR));
+        uint16_t c5_r = c5bib.caps[4].slot;   /* console CHAN_R in cons5 */
+        uint32_t c5_obj = cap_debug_objid(cons5, c5_r);
+        uint32_t c5_chan = (c5_obj != 0xFFFFFFFFu)
+                               ? cap_objects[c5_obj].chan_id : CAP_CHAN_MAX;
+        CHECK(c5_r != CAP_NONE && c5_obj != 0xFFFFFFFFu &&
+              c5_chan < CAP_CHAN_MAX,
+              "consumer5's console channel re-derived");
+        /* peer5's console CHAN_W: the peer-end slot of the same object. */
+        uint16_t peer5_w = CAP_NONE;
+        {
+            int ti = table_for_pid(peer5);
+            for (int s = 0; s < CAP_TABLE_ENTRIES; s++) {
+                uint64_t w = cap_tables[ti].slots[s].word;
+                if (!slot_valid(w) || slot_type(w) != CAP_TYPE_CHAN_W) continue;
+                uint32_t oid = (uint32_t)((w >> CAP_OBJ_SHIFT) & CAP_OBJ_MASK);
+                if (oid == c5_obj) { peer5_w = (uint16_t)s; break; }
+            }
+        }
+        CHECK(peer5_w != CAP_NONE, "peer5's console CHAN_W found in its table");
+
+        /* Fill the consumer's receive queue: CHAN_QUEUE_DEPTH (16) sends
+         * succeed; the 17th hits the full queue. */
+        const char sfill[] = "filler\n";
+        g_wait_park_calls = 0;
+        g_wake_calls = 0;
+        g_cur_pid = peer5;
+        struct SLSChanSendRequest s13;
+        memset(&s13, 0, sizeof(s13));
+        s13.chan = peer5_w;
+        s13.payload = (void*)sfill;
+        s13.payload_len = sizeof(sfill) - 1;
+        s13.timeout_ns = 0;
+        for (int i = 0; i < CHAN_QUEUE_DEPTH; i++) {
+            s13.tag = (uint32_t)i;
+            CHECK(sys_sls_chan_send(&s13) == CAP_ERR_OK,
+                  "13: queue fill send succeeds (16 total)");
+        }
+        CHECK(g_wait_park_calls == 0 && g_wake_calls == CHAN_QUEUE_DEPTH,
+              "13: filling never parks; each enqueue fires the wake");
+
+        /* 13a. the 17th send parks: the hook receives the channel id, the
+         * request pointer, park_syscall = SYS_SLS_CHAN_SEND, and deadline
+         * 0 (timeout 0 = block until enqueued, forever). */
+        g_wait_park_calls = 0;
+        g_wait_deadline = 0;
+        s13.tag = 0xBAD;
+        CHECK(sys_sls_chan_send(&s13) == CAP_ERR_TIMEOUT,
+              "13a: queue-full send (timeout 0) returns TIMEOUT when the "
+              "park hook cannot park");
+        CHECK(g_wait_park_calls == 1 && g_wait_n == 1 &&
+              g_wait_chans[0] == c5_chan && g_wait_req == (void*)&s13 &&
+              g_wait_syscall == SYS_SLS_CHAN_SEND && g_wait_deadline == 0,
+              "13a: the park hook received the channel id, the request "
+              "pointer, SYS_SLS_CHAN_SEND as the re-run syscall, and "
+              "deadline 0 (block forever)");
+
+        /* 13b. a finite-timeout send parks WITH a deadline (absolute tick,
+         * rounded up): the timer ISR wakes it at the deadline and the
+         * re-run then returns CAP_ERR_TIMEOUT (exercised in section 14). */
+        g_wait_park_calls = 0;
+        g_wait_deadline = 0;
+        s13.timeout_ns = 1000;
+        CHECK(sys_sls_chan_send(&s13) == CAP_ERR_TIMEOUT &&
+              g_wait_park_calls == 1 &&
+              g_wait_deadline == (uint64_t)kernel_tick_counter + 1,
+              "13b: a finite-timeout send parks WITH a deadline");
+        s13.timeout_ns = 0;
+
+        /* 13c. a recv freeing a slot wakes: the consumer drains one message
+         * → cap_wake_chan fires with the channel id (the real kernel's
+         * wake resumes the parked sender); a fresh send now enqueues (what
+         * the woken re-run does). */
+        g_wake_calls = 0;
+        g_cur_pid = cons5;
+        struct SLSChanRecvRequest r13;
+        char rbuf13[64];
+        memset(&r13, 0, sizeof(r13));
+        memset(rbuf13, 0, sizeof(rbuf13));
+        r13.chan = c5_r;
+        r13.buf = rbuf13;
+        r13.buf_len = sizeof(rbuf13);
+        r13.n_slots = 8;
+        CHECK(sys_sls_chan_recv(&r13) == CAP_ERR_OK &&
+              r13.out.len == sizeof(sfill) - 1,
+              "13c: consumer drains one queued message");
+        CHECK(g_wake_calls == 1 && g_wake_chan == c5_chan,
+              "13c: the dequeue fired cap_wake_chan with the channel id");
+
+        g_cur_pid = peer5;
+        s13.tag = 0xCAFE;
+        CHECK(sys_sls_chan_send(&s13) == CAP_ERR_OK,
+              "13c: the sender's re-run now enqueues (a slot was freed)");
+
+        /* 13d. a close unblocks a parked sender with STATE: the queue is
+         * full again after 13c's send, so park the sender, then the
+         * consumer closes its endpoint → the wake fires; the sender's
+         * re-run fails CAP_ERR_STATE instead of hanging on the full queue. */
+        g_wait_park_calls = 0;
+        s13.tag = 0xDEAD;
+        CHECK(sys_sls_chan_send(&s13) == CAP_ERR_TIMEOUT &&
+              g_wait_park_calls == 1 && g_wait_chans[0] == c5_chan,
+              "13d: the sender parks on the re-full queue");
+
+        g_wake_calls = 0;
+        g_cur_pid = cons5;
+        struct SLSChanCloseRequest c13;
+        memset(&c13, 0, sizeof(c13));
+        c13.chan = c5_r;
+        c13.reason = CLOSE_PEER;
+        c13.detail = 0x9;
+        CHECK(sys_sls_chan_close(&c13) == CAP_ERR_OK,
+              "13d: the consumer closes its endpoint");
+        CHECK(g_wake_calls == 1 && g_wake_chan == c5_chan,
+              "13d: the close fired cap_wake_chan with the channel id");
+
+        g_cur_pid = peer5;
+        CHECK(sys_sls_chan_send(&s13) == CAP_ERR_STATE,
+              "13d: the parked sender's re-run after the close → STATE, "
+              "nothing enqueued");
+    }
+
+    /* ── 14. finite deadlines: a park expires at its absolute deadline ── */
+    /* The timer ISR (cap_park_deadline_tick, real kernel) wakes a parked
+     * wait/send whose deadline passed; the re-run then returns
+     * CAP_ERR_TIMEOUT. This section exercises that logic at the transport
+     * level with a test-owned clock: cap_park_deadline_take mimics the
+     * real take (return + clear the stored deadline), so a simulated
+     * re-run call decides expiry vs re-park for real, and a wrong
+     * re-computed deadline is caught. */
+    {
+        /* A fresh pair (drv.ramdisk.5 → drv.consumer.5). */
+        struct Blob p6;
+        build_peer_blob(&p6, image_kaddr, "drv.ramdisk.5");
+        uint16_t p6_ch = CAP_NONE;
+        CHECK(cap_create_sidecar(100, p6.data, p6.len, CAP_NONE, CAP_NONE,
+                                 &p6_ch) == 0,
+              "deadline peer (drv.ramdisk.5) spawns");
+        uint32_t peer6 = sidecar_registry_resolve("drv.ramdisk.5");
+        struct Blob c6;
+        build_consumer_blob(&c6, image_kaddr, "drv.consumer.5", "drv.ramdisk.5");
+        uint16_t c6_ch = CAP_NONE;
+        CHECK(cap_create_sidecar(100, c6.data, c6.len, CAP_NONE, CAP_NONE,
+                                 &c6_ch) == 0,
+              "deadline consumer (drv.consumer.5) spawns");
+        uint32_t cons6 = sidecar_registry_resolve("drv.consumer.5");
+        CHECK(peer6 != 0 && cons6 != 0 && peer6 != cons6,
+              "deadline pair resolved via the registry");
+        struct Bib c6bib = bib_parse(host_ptr(BIB_VADDR));
+        uint16_t c6_r = c6bib.caps[4].slot;   /* console CHAN_R in cons6 */
+        uint32_t c6_obj = cap_debug_objid(cons6, c6_r);
+        uint32_t c6_chan = (c6_obj != 0xFFFFFFFFu)
+                               ? cap_objects[c6_obj].chan_id : CAP_CHAN_MAX;
+        CHECK(c6_r != CAP_NONE && c6_obj != 0xFFFFFFFFu &&
+              c6_chan < CAP_CHAN_MAX,
+              "consumer6's console channel re-derived");
+        uint16_t peer6_w = CAP_NONE;
+        {
+            int ti = table_for_pid(peer6);
+            for (int s = 0; s < CAP_TABLE_ENTRIES; s++) {
+                uint64_t w = cap_tables[ti].slots[s].word;
+                if (!slot_valid(w) || slot_type(w) != CAP_TYPE_CHAN_W) continue;
+                uint32_t oid = (uint32_t)((w >> CAP_OBJ_SHIFT) & CAP_OBJ_MASK);
+                if (oid == c6_obj) { peer6_w = (uint16_t)s; break; }
+            }
+        }
+        CHECK(peer6_w != CAP_NONE, "peer6's console CHAN_W found in its table");
+
+        /* 14a. wait expiry: a 1-tick-deadline wait parks at absolute tick
+         * T+1; advancing the clock past it makes the RE-RUN (the real
+         * kernel's timer ISR wake) return CAP_ERR_TIMEOUT WITHOUT
+         * re-parking. */
+        kernel_tick_counter = 1000;
+        g_wait_park_calls = 0;
+        g_wait_deadline = 0;
+        g_cur_pid = cons6;
+        struct SLSChanWaitRequest w14;
+        memset(&w14, 0, sizeof(w14));
+        w14.chans[0] = c6_r;
+        w14.n_chans = 1;
+        w14.timeout_ns = 1;   /* 1 ns → rounded up to one ~10 ms tick */
+        CHECK(sys_sls_chan_wait(&w14) == CAP_ERR_TIMEOUT &&
+              g_wait_park_calls == 1 && g_wait_deadline == 1001,
+              "14a: a 1-tick-deadline wait parks at absolute tick 1001");
+
+        kernel_tick_counter = 1005;   /* past the deadline */
+        g_wait_park_calls = 0;
+        CHECK(sys_sls_chan_wait(&w14) == CAP_ERR_TIMEOUT &&
+              g_wait_park_calls == 0,
+              "14a: the re-run after the deadline returns TIMEOUT without "
+              "re-parking");
+
+        /* 14b. re-parks never extend the deadline: woken early (before the
+         * deadline) with nothing ready, the re-run re-parks with the SAME
+         * absolute deadline — not now + timeout again. */
+        kernel_tick_counter = 2000;
+        g_wait_park_calls = 0;
+        g_wait_deadline = 0;
+        memset(&w14, 0, sizeof(w14));
+        w14.chans[0] = c6_r;
+        w14.n_chans = 1;
+        w14.timeout_ns = 1000000000ULL;   /* 1 s → 100 ticks */
+        CHECK(sys_sls_chan_wait(&w14) == CAP_ERR_TIMEOUT &&
+              g_wait_park_calls == 1 && g_wait_deadline == 2100,
+              "14b: a 1 s-deadline wait parks at absolute tick 2100");
+
+        kernel_tick_counter = 2050;   /* early wake: 50 ticks to go */
+        g_wait_park_calls = 0;
+        CHECK(sys_sls_chan_wait(&w14) == CAP_ERR_TIMEOUT &&
+              g_wait_park_calls == 1 && g_wait_deadline == 2100,
+              "14b: the early re-run re-parks with the ORIGINAL deadline "
+              "(2100), never extending it");
+
+        /* 14c. send expiry: a full queue + finite deadline → park; the
+         * re-run after the deadline returns CAP_ERR_TIMEOUT (still full). */
+        kernel_tick_counter = 3000;
+        g_wait_park_calls = 0;
+        g_wait_deadline = 0;
+        g_cur_pid = peer6;
+        struct SLSChanSendRequest s14;
+        memset(&s14, 0, sizeof(s14));
+        s14.chan = peer6_w;
+        s14.payload = (void*)"x";
+        s14.payload_len = 1;
+        s14.timeout_ns = 0;
+        for (int i = 0; i < CHAN_QUEUE_DEPTH; i++) {
+            s14.tag = (uint32_t)i;
+            CHECK(sys_sls_chan_send(&s14) == CAP_ERR_OK,
+                  "14c: queue filled (16) for the send-deadline tests");
+        }
+        s14.tag = 0xBEEF;
+        s14.timeout_ns = 1;   /* 1 ns → one tick */
+        CHECK(sys_sls_chan_send(&s14) == CAP_ERR_TIMEOUT &&
+              g_wait_park_calls == 1 && g_wait_deadline == 3001,
+              "14c: a full-queue send with a 1-tick deadline parks at 3001");
+
+        kernel_tick_counter = 3005;
+        g_wait_park_calls = 0;
+        CHECK(sys_sls_chan_send(&s14) == CAP_ERR_TIMEOUT &&
+              g_wait_park_calls == 0,
+              "14c: the send re-run after the deadline returns TIMEOUT "
+              "without re-parking");
+
+        /* 14d. send re-parks never extend either: early wake → re-park
+         * with the original absolute deadline. */
+        s14.timeout_ns = 1000000000ULL;   /* 1 s → 100 ticks */
+        kernel_tick_counter = 4000;
+        g_wait_park_calls = 0;
+        g_wait_deadline = 0;
+        s14.tag = 0xFACE;
+        CHECK(sys_sls_chan_send(&s14) == CAP_ERR_TIMEOUT &&
+              g_wait_park_calls == 1 && g_wait_deadline == 4100,
+              "14d: a full-queue send with a 1 s deadline parks at 4100");
+
+        kernel_tick_counter = 4050;   /* early wake */
+        g_wait_park_calls = 0;
+        CHECK(sys_sls_chan_send(&s14) == CAP_ERR_TIMEOUT &&
+              g_wait_park_calls == 1 && g_wait_deadline == 4100,
+              "14d: the early send re-run re-parks with the ORIGINAL "
+              "deadline (4100)");
+
+        /* 14e. ready beats deadline: a queue with data returns the MSG even
+         * though the deadline has already passed (the poll runs before the
+         * expiry check — a wake that finds its condition met never times
+         * out). */
+        kernel_tick_counter = 5000;
+        g_wait_park_calls = 0;
+        g_wait_deadline = 0;
+        g_cur_pid = cons6;
+        memset(&w14, 0, sizeof(w14));
+        w14.chans[0] = c6_r;
+        w14.n_chans = 1;
+        w14.timeout_ns = 1;
+        /* consumer6's queue holds the 16 messages 14c filled — ready. */
+        CHECK(sys_sls_chan_wait(&w14) == CAP_ERR_OK &&
+              w14.out_kind == CH_KIND_MSG && w14.out_idx == 0 &&
+              g_wait_park_calls == 0,
+              "14e: a ready queue returns the MSG even with an expired "
+              "deadline (ready beats timeout)");
+
+        /* 14f. TIMEOUT_NONE on a send = block forever (deadline 0): the SDK
+         * passes TIMEOUT_NONE (u64::MAX) for every blocking send, so the
+         * kernel must treat it exactly like timeout 0 — never as a
+         * wrapped sub-tick deadline (which would make a full queue expire
+         * instantly). The queue is still full and open from 14c/14d. */
+        g_wait_park_calls = 0;
+        g_wait_deadline = 0;
+        g_cur_pid = peer6;
+        s14.tag = 0xFEED;
+        s14.timeout_ns = CH_TIMEOUT_NONE;
+        CHECK(sys_sls_chan_send(&s14) == CAP_ERR_TIMEOUT &&
+              g_wait_park_calls == 1 && g_wait_deadline == 0,
+              "14f: a TIMEOUT_NONE send on a full queue parks with deadline "
+              "0 (block forever)");
+
+        /* 14g. a huge-but-finite timeout saturates instead of wrapping: a
+         * near-u64::MAX deadline must record as an enormous tick count,
+         * not as now + (wrapped-to-0 ticks) = now, which would expire
+         * instantly. */
+        g_wait_park_calls = 0;
+        g_wait_deadline = 0;
+        s14.tag = 0xBEE2;
+        s14.timeout_ns = UINT64_MAX - 1;   /* just below TIMEOUT_NONE */
+        CHECK(sys_sls_chan_send(&s14) == CAP_ERR_TIMEOUT &&
+              g_wait_park_calls == 1 &&
+              g_wait_deadline > (uint64_t)kernel_tick_counter,
+              "14g: a near-u64::MAX timeout saturates to a huge deadline "
+              "(not a wrapped now+0)");
     }
 
     if (g_fail == 0) printf("\nALL PASS\n");

@@ -28,7 +28,25 @@ void console_service_tick(void) {
      * kernel service adds its own kernel-owned endpoints, this loop must
      * learn to tell them apart (e.g. by channel metadata). */
     for (uint32_t s = 0; s < CAP_TABLE_ENTRIES; s++) {
-        if (!console_is_chan_r(cap_tables[0].slots[s].word)) continue;
+        uint64_t w = cap_tables[0].slots[s].word;
+        if (!console_is_chan_r(w)) continue;
+
+        /* Resolve to the channel so we can tell whether the child's end is
+         * gone. The child's explicit k_chan_close and its death (via
+         * cap_table_teardown's peer-death scan) both set close_evt[0] on
+         * the kernel's dir — that is the signal to stop serving. */
+        struct CapChannel* ch = 0;
+        int kdir = 0;
+        uint32_t obj_id = (uint32_t)((w >> CAP_OBJ_SHIFT) & CAP_OBJ_MASK);
+        if (obj_id < CAP_OBJECT_MAX) {
+            struct CapObject* o = &cap_objects[obj_id];
+            if (o->active && o->kind == CAP_OBJ_KIND_CHAN &&
+                o->chan_id < CAP_CHAN_MAX) {
+                ch = &cap_channels[o->chan_id];
+                kdir = (0 == ch->end0_pid) ? 0 : 1;
+            }
+        }
+
         /* Drain everything queued on this endpoint. cap_recv_msg is
          * non-blocking: CAP_EAGAIN means empty, and a message with caps
          * is fully drained even with max_caps = 0 (cap_recv_msg drops the
@@ -42,6 +60,21 @@ void console_service_tick(void) {
             for (uint32_t i = 0; i < plen; i++)
                 kernel_serial_putchar((char)console_svc_buf[i]);
             console_svc_drained++;
+        }
+
+        /* ...then, if the child's end is gone, drop the kernel end instead
+         * of leaving the channel open forever. cap_revoke is total: it
+         * frees THIS slot and the kernel's CHAN_W for the same object and
+         * destroys the channel at refcount 0 (a dead child's console
+         * channel must not linger in the kernel context table). The drain
+         * above already consumed the child's last messages, so nothing is
+         * lost. */
+        if (ch) {
+            cap_lock(&ch->lock);
+            int peer_gone = ch->close_evt[kdir];
+            cap_unlock(&ch->lock);
+            if (peer_gone)
+                cap_revoke(0, (uint16_t)s);
         }
     }
 }

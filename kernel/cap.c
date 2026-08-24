@@ -69,6 +69,31 @@ int cap_wait_chan(uint32_t chan_id, void* recv_req) {
     return 0;   /* cannot park: caller returns CAP_EAGAIN (Phase-1 behavior) */
 }
 
+/* Phase 5 wait-aware park (k_chan_wait and the blocking k_chan_send,
+ * kernel/chan.c). Weak default: cannot park — the caller returns
+ * CAP_ERR_TIMEOUT, preserving the transport's scan-once semantics in host
+ * tests (the real kernel's strong override in process.c parks the process
+ * on the channel list and re-runs `park_syscall` on wake). */
+__attribute__((weak))
+int cap_wait_chans(const uint32_t* chan_ids, uint32_t n, void* req,
+                   uint32_t park_syscall, uint64_t deadline_ticks) {
+    (void)chan_ids;
+    (void)n;
+    (void)req;
+    (void)park_syscall;
+    (void)deadline_ticks;
+    return 0;
+}
+
+/* Phase 5 deadline support (strong overrides in process.c; the weak
+ * defaults keep cap.c host-testable in isolation and make the timer ISR's
+ * cap_park_deadline_tick() a no-op when process.c is absent). */
+__attribute__((weak))
+uint64_t cap_park_deadline_take(void) { return 0; }
+
+__attribute__((weak))
+void cap_park_deadline_tick(void) { }
+
 __attribute__((weak))
 void cap_wake_chan(uint32_t chan_id) { (void)chan_id; }
 
@@ -1430,6 +1455,19 @@ int cap_recv_msg(uint32_t pid, uint16_t ch_r_idx,
     ch->qdepth[dir]--;
     cap_unlock(&ch->lock);
     cap_unlock(&t->lock);
+
+    /* Phase 5 blocking send: a process may be parked (blocked) on this
+     * channel's WRITE end because its destination queue was full — this
+     * dequeue freed a slot, so make it runnable again. The wake is a
+     * process-table op, deliberately outside the cap locks (the send-side
+     * wake's posture); the woken sender re-runs its k_chan_send, which now
+     * finds space. Phase 1.5 (immediate wake): then hand the CPU to the
+     * woken process RIGHT NOW, mirroring cap_send_msg's enqueue-side wake —
+     * the sender runs (and enqueues) before the receiver's recv returns to
+     * ring-3. No-op in kernel context (the console service) and when
+     * nothing was woken. */
+    cap_wake_chan(cobj->chan_id);
+    cap_maybe_handoff();
     return 0;
 }
 
@@ -1800,6 +1838,39 @@ void cap_table_teardown(uint32_t pid) {
     cap_table_freelist_init((uint32_t)ti);
 
     cap_unlock(&t->lock);
+
+    /* 6. Peer-death close events (Phase 5 transport, spec §5): every
+     *    channel this pid was an end of has its counterpart marked closed,
+     *    so a SURVIVING peer's k_chan_wait/k_chan_recv observes the death
+     *    (CLOSE_PEER_DEAD, detail = the dead pid) once its message queue
+     *    drains — a peer never hangs on a silent queue. Channels whose
+     *    last holder died in steps 1-3 (no survivor) were deactivated
+     *    (ch->active = 0) and are skipped. An already-pending close event
+     *    (peer closed explicitly first) is preserved — the explicit reason
+     *    wins; a cleared event is re-set by the later death. Each survivor
+     *    with a pending event also gets its waiters WOKEN (cap_wake_chan):
+     *    a sidecar parked in k_chan_wait (TIMEOUT_NONE) on this channel
+     *    must not hang — the wake makes it re-run the wait, which now
+     *    observes the CLOSE. Process-table op, deliberately outside the
+     *    channel lock (the cap_send_msg wake's posture); a no-op when
+     *    nobody is parked. */
+    for (uint32_t ci = 0; ci < CAP_CHAN_MAX; ci++) {
+        struct CapChannel* ch = &cap_channels[ci];
+        if (!ch->active) continue;
+        int dying_dir = -1;
+        if (ch->end0_pid == pid) dying_dir = 0;
+        else if (ch->end1_pid == pid) dying_dir = 1;
+        if (dying_dir < 0) continue;
+        cap_lock(&ch->lock);
+        ch->closed[dying_dir] = 1;
+        if (!ch->close_evt[1 - dying_dir]) {
+            ch->close_evt[1 - dying_dir] = 1;
+            ch->close_reason[1 - dying_dir] = CLOSE_PEER_DEAD;
+            ch->close_detail[1 - dying_dir] = pid;
+        }
+        cap_unlock(&ch->lock);
+        cap_wake_chan(ci);
+    }
 
     kernel_serial_printf(
         "[TORE] PID %u teardown: %u cap(s) dropped, %u object(s) destroyed, "
