@@ -1,0 +1,40 @@
+// idl/watchdog.aeroidl — AeroSLS Watchdog interface (Phase 5)
+@version("aeroidl/1.0")
+@namespace("aerosls.watchdog")
+
+enum SidecarState {
+    LIVE     = 0,
+    STALE    = 1,
+    SPAWNING = 2,
+    ATTACHING = 3,
+    DEAD     = 4,
+}
+
+enum RestartPolicy {
+    NEVER     = 0,
+    ALWAYS    = 1,
+    ON_FAILURE = 2,
+}
+
+struct SidecarHealth {
+    name:          string,
+    state:         SidecarState,
+    restart_count: u32,
+    last_heartbeat_ms: u64,
+    pid:           u32,
+}
+
+struct RestartPolicyConfig {
+    max_retries:    u32,
+    backoff_ms:     u32,
+    backoff_max_ms: u32,
+    policy:         RestartPolicy,
+}
+
+interface WatchdogService {
+    heartbeat(name: string) -> Result<(), ()>;
+    get_health(name: string) -> Result<SidecarHealth, ()>;
+    set_restart_policy(name: string, config: RestartPolicyConfig) -> Result<(), ()>;
+    force_restart(name: string) -> Result<(), ()>;
+    list_health() -> SidecarHealth[];
+}

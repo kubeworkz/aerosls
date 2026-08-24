@@ -1,0 +1,26 @@
+// idl/registry.aeroidl — AeroSLS Capability Registry interface (Phase 5)
+@version("aeroidl/1.0")
+@namespace("aerosls.registry")
+
+enum RegistryError {
+    OK           = 0,
+    NOT_FOUND    = 1,
+    FULL         = 2,
+    PERM_DENIED  = 3,
+    ALREADY_EXISTS = 4,
+}
+
+struct ServiceEndpoint {
+    sidecar_id:   u32,
+    channel_slot: u32,
+    rights:       u8,   // channel rights bitmask
+    state:        u8,   // 0=UP, 1=DOWN, 2=UNKNOWN
+}
+
+interface CapabilityRegistry {
+    resolve(name: string) -> Result<ServiceEndpoint, RegistryError>;
+    register(name: string, endpoint: ServiceEndpoint) -> Result<(), RegistryError>;
+    unregister(name: string) -> Result<(), RegistryError>;
+    list() -> ServiceEndpoint[];
+    health(name: string) -> Result<u8, RegistryError>;
+}

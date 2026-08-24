@@ -1,0 +1,43 @@
+// idl/blockdevice.aeroidl — AeroSLS Block Device interface (Phase 5)
+@version("aeroidl/1.0")
+@namespace("aerosls.block")
+
+enum BlockOp {
+    INFO    = 1,
+    READ    = 2,
+    WRITE   = 3,
+    FLUSH   = 4,
+    MAP     = 5,
+}
+
+enum BlockError {
+    OK           = 0,
+    ERR_INVAL    = 1,   // malformed request
+    ERR_RANGE    = 2,   // lba out of bounds
+    ERR_CAP      = 3,   // missing or undersized buffer grant
+    ERR_NOMEM    = 4,   // driver out of memory
+    ERR_IO       = 5,   // backing store failure
+    ERR_RO       = 6,   // write to read-only device
+    ERR_BUSY     = 7,   // device busy
+    ERR_PROTO    = 8,   // protocol violation
+}
+
+struct BlockInfo {
+    sector_size:   u32,
+    total_sectors: u64,
+    flags:         u32,   // bit0 = read-only
+}
+
+struct BlockReply {
+    status: u16,
+    bytes:  u64,
+    tag:    u32,
+}
+
+interface BlockDevice {
+    info() -> BlockInfo;
+    read(lba: u64, count: u32, buf: MemCap @arena) -> Result<u64, BlockError>;
+    write(lba: u64, count: u32, buf: MemCap @arena) -> Result<u64, BlockError>;
+    flush() -> Result<(), BlockError>;
+    map() -> Result<MemCap @owned, BlockError>;
+}

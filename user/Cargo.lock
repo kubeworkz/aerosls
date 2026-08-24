@@ -37,6 +37,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aerosls-init"
+version = "0.1.0"
+dependencies = [
+ "aerosls-kernel-sim",
+ "aerosls-proto",
+]
+
+[[package]]
 name = "aerosls-kernel-sim"
 version = "0.1.0"
 dependencies = [

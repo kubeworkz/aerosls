@@ -1,0 +1,42 @@
+// idl/network.aeroidl — AeroSLS Network Socket interface (Phase 5)
+@version("aeroidl/1.0")
+@namespace("aerosls.socket")
+
+enum SockError {
+    OK              = 0,
+    ERR_CONNRESET   = 1,   // connection reset by peer
+    ERR_TIMEOUT     = 2,   // operation timed out
+    ERR_NOMEM       = 3,   // out of memory
+    ERR_INVAL       = 4,   // invalid argument
+    ERR_NOROUTE     = 5,   // no route to host
+    ERR_REFUSED     = 6,   // connection refused
+    ERR_NOTCONN     = 7,   // socket not connected
+    ERR_BOUND       = 8,   // address already in use
+    ERR_PROTO       = 9,   // protocol error
+}
+
+struct SocketAddr {
+    family:  u16,   // AF_INET = 2
+    port:    u16,   // network byte order
+    addr:    u32,   // IPv4 address, network byte order
+}
+
+struct SocketInfo {
+    fd:     u32,
+    local:  SocketAddr,
+    remote: SocketAddr,
+    state:  u16,   // TCP state: LISTEN, ESTABLISHED, etc.
+}
+
+interface SocketService {
+    create(family: u16, sock_type: u16, proto: u16) -> Result<u32, SockError>;
+    connect(fd: u32, addr: SocketAddr) -> Result<(), SockError>;
+    bind(fd: u32, addr: SocketAddr) -> Result<(), SockError>;
+    listen(fd: u32, backlog: u32) -> Result<(), SockError>;
+    accept(fd: u32) -> Result<u32, SockError>;
+    send(fd: u32, buf: MemCap @arena, count: u32) -> Result<u32, SockError>;
+    recv(fd: u32, buf: MemCap @arena, count: u32) -> Result<u32, SockError>;
+    close(fd: u32) -> Result<(), SockError>;
+    resolve(host: string, service: string) -> Result<SocketAddr, SockError>;
+    info(fd: u32) -> Result<SocketInfo, SockError>;
+}

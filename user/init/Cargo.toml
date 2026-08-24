@@ -1,0 +1,19 @@
+[package]
+name = "aerosls-init"
+version = "0.1.0"
+edition = "2021"
+description = "AeroSLS Phase 5 init sidecar — reads BIB, spawns Device Manager, orchestrates system composition"
+license = "MIT"
+
+[dependencies]
+aerosls-proto = { path = "../proto" }
+
+[dev-dependencies]
+aerosls-kernel-sim = { path = "../kernel-sim" }
+
+[features]
+default = []
+# `target` enables the real kernel ABI (extern "C" syscalls) and the sidecar
+# entry point.  Build the sidecar image with:
+#   cargo build -p aerosls-init --features target --target x86_64-unknown-none
+target = ["aerosls-proto/target"]
