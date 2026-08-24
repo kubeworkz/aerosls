@@ -4,7 +4,7 @@
 //! with in-memory channels, so the init sidecar's bootstrap sequence can be
 //! tested on the host without a real kernel.
 
-use aerosls_proto::kabi::{CapInfo, GrantedCap, Kernel, SendCap};
+use aerosls_proto::kabi::{CapInfo, GrantedCap, Kernel, SendCap, CAP_CHAN};
 use aerosls_proto::{CH_KIND_CLOSE, CH_KIND_NONE};
 use alloc::collections::VecDeque;
 use alloc::rc::Rc;
@@ -17,7 +17,9 @@ const SIM_CHANNELS: usize = 32;
 /// A simulated channel endpoint (interior mutability for queue access).
 struct SimEndpoint {
     queue: UnsafeCell<VecDeque<(u32, Vec<u8>, Vec<GrantedCap>)>>,
-    cap: CapInfo,
+    /// The cap backing this endpoint (interior mutability so
+    /// `Kernel::create_sidecar(&self)` can mint a spawn's endpoint).
+    cap: UnsafeCell<CapInfo>,
     /// Pending CLOSE event (reason, detail) — set by `inject_close` to
     /// model the kernel's close_evt state.
     closed: UnsafeCell<Option<(u16, u32)>>,
@@ -30,15 +32,25 @@ impl SimEndpoint {
     fn new() -> Self {
         SimEndpoint {
             queue: UnsafeCell::new(VecDeque::new()),
-            cap: CapInfo {
+            cap: UnsafeCell::new(CapInfo {
                 ty: 0,
                 rights: 0,
                 flags: 0,
                 base: 0,
                 len: 0,
-            },
+            }),
             closed: UnsafeCell::new(None),
         }
+    }
+
+    fn set_cap(&self, cap: CapInfo) {
+        // SAFETY: single-threaded test harness only.
+        unsafe { *self.cap.get() = cap }
+    }
+
+    fn cap(&self) -> CapInfo {
+        // SAFETY: single-threaded test harness only.
+        unsafe { *self.cap.get() }
     }
 
     fn push(&self, tag: u32, payload: Vec<u8>, caps: Vec<GrantedCap>) {
@@ -85,7 +97,12 @@ impl SimEndpoint {
 /// A simulated kernel that provides in-memory channels.
 pub struct SimKernel {
     endpoints: Vec<SimEndpoint>,
-    next_handle: u32,
+    /// Next handle to hand out (interior mutability so `create_sidecar`
+    /// can mint a spawn's channel through `&self`).
+    next_handle: UnsafeCell<u32>,
+    /// Handles minted by `create_sidecar` (the sim's spawn log — tests
+    /// assert a spawn happened and how often).
+    spawns: UnsafeCell<Vec<u32>>,
 }
 
 impl SimKernel {
@@ -96,15 +113,22 @@ impl SimKernel {
         }
         SimKernel {
             endpoints,
-            next_handle: 1,
+            next_handle: UnsafeCell::new(1),
+            spawns: UnsafeCell::new(Vec::new()),
         }
     }
 
     /// Register a capability on a handle (used by tests to set up initial state).
     pub fn register_cap(&mut self, handle: u32, cap: CapInfo) {
         if (handle as usize) < self.endpoints.len() {
-            self.endpoints[handle as usize].cap = cap;
+            self.endpoints[handle as usize].set_cap(cap);
         }
+    }
+
+    /// Handles minted by `create_sidecar` since construction, in order.
+    pub fn spawn_handles(&self) -> Vec<u32> {
+        // SAFETY: single-threaded test harness only.
+        unsafe { (*self.spawns.get()).clone() }
     }
 
     /// Enqueue a message onto a channel (simulate kernel-to-sidecar delivery).
@@ -143,8 +167,8 @@ impl SimKernel {
 
     /// Allocate the next channel handle.
     pub fn alloc_handle(&mut self) -> u32 {
-        let h = self.next_handle;
-        self.next_handle += 1;
+        let h = unsafe { *self.next_handle.get() };
+        unsafe { *self.next_handle.get() = h + 1 };
         h
     }
 }
@@ -263,7 +287,30 @@ impl Kernel for SimKernel {
         if (handle as usize) >= self.endpoints.len() {
             return Err(-1);
         }
-        Ok(self.endpoints[handle as usize].cap)
+        Ok(self.endpoints[handle as usize].cap())
+    }
+
+    fn create_sidecar(&self, manifest: &[u8]) -> Result<(u32, u32), i32> {
+        // Mint a fresh channel endpoint for the spawned sidecar (the real
+        // kernel creates a process and returns the parent's messenger
+        // ends; the sim has no process model, so the new handle IS the
+        // messenger — both ends, per the sim's single-handle channel).
+        let h = unsafe { *self.next_handle.get() };
+        unsafe { *self.next_handle.get() = h + 1 };
+        if (h as usize) >= self.endpoints.len() {
+            return Err(-1);
+        }
+        self.endpoints[h as usize].set_cap(CapInfo {
+            ty: CAP_CHAN,
+            rights: 0x0003,
+            flags: 0,
+            base: 0,
+            len: 0,
+        });
+        // SAFETY: single-threaded test harness only.
+        unsafe { (*self.spawns.get()).push(h) };
+        let _ = manifest.len(); // the sim trusts the blob (kernel validates it)
+        Ok((h, h))
     }
 }
 
@@ -332,5 +379,9 @@ impl Kernel for SharedKernel {
 
     fn cap_info(&self, handle: u32) -> Result<CapInfo, i32> {
         self.0.cap_info(handle)
+    }
+
+    fn create_sidecar(&self, manifest: &[u8]) -> Result<(u32, u32), i32> {
+        self.0.create_sidecar(manifest)
     }
 }

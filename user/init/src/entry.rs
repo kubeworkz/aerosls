@@ -6,7 +6,7 @@
 //! 2. Parse the BIB; resolve budget, console, device_registry, spawn caps.
 //! 3. Init the heap over the budget region.
 //! 4. Read the device registry from the kernel-populated MEM cap.
-//! 5. Spawn the Device Manager via CAP_SPAWN; receive parent channel.
+//! 5. Spawn the Device Manager via create_sidecar; receive the messenger.
 //! 6. Send the device registry snapshot to the Device Manager.
 //! 7. Wait for "devices ready" signal.
 //! 8. Spawn the POSIX sidecar (channels wired by the Device Manager).
@@ -15,16 +15,39 @@
 use crate::chan::{ChannelError, InitChannel, MSG_DEVICE_REGISTRY};
 use crate::demo::{self, DM_READY_DEADLINE_NS, DM_READY_RETRIES};
 use crate::devreg::DeviceRegistry;
+use crate::dm_manifest::{self, DmImage};
 use crate::heap::Bump;
 use aerosls_proto::bootinfo::BootInfo;
-use aerosls_proto::kabi::{RealKernel, SendCap, CAP_MEM, CAP_SPAWN};
+use aerosls_proto::kabi::{Kernel, RealKernel, SendCap, CAP_CHAN_W, CAP_MEM, CAP_NONE};
 
 /// Reserved heap over the budget region (single-threaded sidecar).
 static mut HEAP: Bump = Bump::new();
 
-/// Cap types from the capability-layer spec.
-const CAP_MEM_TYPE: u16 = CAP_MEM;
-const CAP_SPAWN_TYPE: u16 = CAP_SPAWN;
+/* The budget MEM cap funds the heap; expose it as the crate's GLOBAL
+ * allocator so the sidecar can use `alloc` (build_manifest in
+ * dm_manifest.rs). Only this target build defines it — the host test
+ * harness keeps std's allocator. Bump: alloc returns null on exhaustion,
+ * dealloc is a no-op (the heap is never reclaimed). */
+struct BudgetAlloc;
+
+#[global_allocator]
+static GLOBAL_ALLOC: BudgetAlloc = BudgetAlloc;
+
+#[allow(static_mut_refs)]
+unsafe impl core::alloc::GlobalAlloc for BudgetAlloc {
+    unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
+        // SAFETY: rust_entry initializes HEAP over the budget cap before
+        // any allocation runs; the sidecar is single-threaded.
+        match unsafe { HEAP.alloc(layout.size(), layout.align()) } {
+            Some(p) => p as *mut u8,
+            None => core::ptr::null_mut(),
+        }
+    }
+
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: core::alloc::Layout) {
+        // Bump allocator: no free.
+    }
+}
 
 /// A tiny stack-buffer writer for formatted logs. The freestanding binary
 /// has NO global allocator (the bump heap is used explicitly), so logging
@@ -75,20 +98,27 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     // ── 2. Resolve initial capabilities by name ───────────────────────────
     //    These names match the init sidecar's manifest (Phase 5 §1.4).
     let budget_cap = bib
-        .find_cap(CAP_MEM_TYPE, "budget")
+        .find_cap(CAP_MEM, "budget")
         .expect("[INIT] missing 'budget' MEM cap");
 
-    let console_cap = bib
-        .find_cap(aerosls_proto::kabi::CAP_CHAN, "console")
-        .expect("[INIT] missing 'console' CHAN cap");
+    // A wired channel appears in the BIB as TWO named entries (CHAN_R then
+    // CHAN_W, kernel/cap.c). Init only SENDS to the console, so the W end
+    // is the one it needs — `find_cap(CAP_CHAN, ...)` would return the
+    // (unused) R end.
+    let console_w = bib
+        .find_cap(CAP_CHAN_W, "console")
+        .expect("[INIT] missing console CHAN_W cap");
 
     let devreg_cap = bib
-        .find_cap(CAP_MEM_TYPE, "device_registry")
+        .find_cap(CAP_MEM, "device_registry")
         .expect("[INIT] missing 'device_registry' MEM cap");
 
-    let spawn_cap = bib
-        .find_cap(CAP_SPAWN_TYPE, "spawn.init")
-        .expect("[INIT] missing 'spawn.init' CAP_SPAWN cap");
+    // The boot image (Phase 5 §7) places the Device Manager binary in
+    // memory and grants init a MEM cap to it; k_create_sidecar copies the
+    // image from that physical address.
+    let dm_image_cap = bib
+        .find_cap(CAP_MEM, "dm.image")
+        .expect("[INIT] missing 'dm.image' MEM cap (boot image must place the DM binary)");
 
     // ── 3. Init the heap ──────────────────────────────────────────────────
     unsafe {
@@ -107,8 +137,8 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     }
     .expect("[INIT] bad device registry");
 
-    // Log discovered devices to the console channel.
-    let console = InitChannel::new(RealKernel, console_cap.slot);
+    // Log discovered devices to the console channel (send-only: r = CAP_NONE).
+    let console = InitChannel::new(RealKernel, CAP_NONE as u32, console_w.slot);
     log(&console, "[INIT] ── AeroSLS init sidecar booting ──");
     log_fmt!(&console, "[INIT] budget: {} MiB", budget_cap.len >> 20);
     log_fmt!(&console, "[INIT] found {} PCI device(s)", devreg.len());
@@ -127,30 +157,22 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         );
     }
 
-    // ── 5. Spawn the Device Manager ───────────────────────────────────────
+    // ── 5. Spawn the Device Manager (SYS_SLS_CREATE_SIDECAR) ──────────────
     log(&console, "[INIT] spawning Device Manager...");
 
-    // The Device Manager is created via `create_sidecar` which returns
-    // a parent channel.  We use `CAP_SPAWN` to tell the kernel which
-    // manifest to use.
-    //
-    // In the real kernel ABI, this would be a `k_create_sidecar` syscall
-    // that takes the spawn cap and returns a channel handle.  For now
-    // we use the real kernel's `send` on the spawn cap to trigger the
-    // sidecar creation (the kernel interprets a message on a CAP_SPAWN
-    // endpoint as a create request).
-    //
-    // The returned channel handle is our parent→child control channel.
-    // The Device Manager's end of this channel is in its initial table
-    // (transport spec §2.3, path 3: parent–child).
-
-    // For the prototype, we use a simulated path. In the real kernel,
-    // this would be:
-    //   let dm_channel = k_create_sidecar(spawn_handle, "drv.device_manager.0");
-    //
-    // We'll use `send` on the spawn cap as a trigger (the kernel knows
-    // to create the sidecar from the manifest name stored in the cap).
-    let dm_channel = spawn_device_manager(&console, spawn_cap.slot);
+    // Real kernel path: build the DM's packed manifest (records + the
+    // image_kaddr footer pointing at the boot-loaded binary), hand it to
+    // `create_sidecar`, and get back the parent end of the messenger
+    // channel — CHAN_R (receive the DM's replies) and CHAN_W (send to
+    // the DM). The kernel creates the process, maps the image, builds the
+    // child's initial table from the manifest's caps, and returns both
+    // ends (kernel/cap.c sys_sls_create_sidecar).
+    let dm_image = DmImage {
+        kaddr: dm_image_cap.base,
+        size: dm_image_cap.len as u32,
+        entry: 0, // flat binary: entry at offset 0
+    };
+    let dm_channel = spawn_device_manager(&console, dm_image);
 
     // ── 6. Send the device registry to the Device Manager ─────────────────
     log(&console, "[INIT] sending device registry to Device Manager...");
@@ -215,8 +237,8 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     log(&console, "[INIT] spawning POSIX sidecar...");
 
     // In the full Phase 5 design, the init sidecar would spawn the POSIX
-    // sidecar via a CAP_SPAWN for "aerosls.posix.v1".  For this prototype
-    // we log the intent and park.
+    // sidecar via create_sidecar for "aerosls.posix.v1".  For this
+    // prototype we log the intent and park.
     //
     // The POSIX sidecar's manifest would declare channels to:
     //   - the filesystem sidecar (VFS channel)
@@ -252,7 +274,7 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
             attempt,
             policy.backoff_for(attempt),
         );
-        let dm = spawn_device_manager(&console, spawn_cap.slot);
+        let dm = spawn_device_manager(&console, dm_image);
         // Re-run the registry handshake against the fresh DM: blocking
         // send (timeout 0 — a full queue parks us), then the
         // finite-deadline wait for "devices ready".
@@ -279,62 +301,30 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     }
 }
 
-/// Spawn the Device Manager sidecar and return a channel to it.
-///
-/// In the real kernel ABI, this calls `k_create_sidecar` which:
-/// 1. Validates the CAP_SPAWN cap and the manifest name.
-/// 2. Creates the Device Manager sidecar from the validated manifest.
-/// 3. Returns a parent–child control channel.
-///
-/// For the prototype, we use the kernel's spawn mechanism.
-fn spawn_device_manager(console: &InitChannel<RealKernel>, spawn_handle: u32) -> InitChannel<RealKernel> {
-    // Send a "create" message on the spawn cap.  The kernel interprets
-    // this as a create_sidecar request for the manifest named in the cap.
-    //
-    // The kernel returns the parent channel handle as the send result
-    // (stored in the kernel's sidecar table for this sidecar).
-    //
-    // For the prototype, we use a placeholder approach: the kernel
-    // assigns a channel handle and we wrap it.
-    //
-    // TODO: implement k_create_sidecar in kernel/cap.c
-    log(console, "[INIT]   (create_sidecar: drv.device_manager.0)");
-
-    // Placeholder: in the real implementation, this would be:
-    //   let result = k_create_sidecar(spawn_handle, b"drv.device_manager.0");
-    //   let dm_chan_handle = result.channel_handle;
-    //
-    // For now, we return a channel to a simulated handle.  The real
-    // kernel would mint the channel and return the handle.
-    //
-    // When the kernel implements create_sidecar, this function becomes:
-    //
-    // ```rust
-    // extern "C" {
-    //     fn k_create_sidecar(
-    //         spawn_handle: u32,
-    //         manifest_name: *const u8,
-    //         manifest_len: u32,
-    //         out_chan: *mut u32,
-    //     ) -> i32;
-    // }
-    //
-    // let mut chan_handle: u32 = 0;
-    // let rc = unsafe {
-    //     k_create_sidecar(
-    //         spawn_handle,
-    //         b"drv.device_manager.0".as_ptr(),
-    //         b"drv.device_manager.0".len() as u32,
-    //         &mut chan_handle,
-    //     )
-    // };
-    // assert_eq!(rc, 0, "create_sidecar failed: {rc}");
-    // InitChannel::new(RealKernel, chan_handle)
-    // ```
-
-    // For this prototype, we use a dummy handle.  The tests use the
-    // simulated kernel which provides real channel behavior.
-    InitChannel::new(RealKernel, spawn_handle)
+/// Spawn the Device Manager sidecar through the real kernel path
+/// (`SYS_SLS_CREATE_SIDECAR`): pack the DM's manifest (records + the
+/// image_kaddr footer pointing at the boot-loaded binary), call
+/// `Kernel::create_sidecar`, and wrap the returned parent messenger ends
+/// (CHAN_R for receiving the DM's replies, CHAN_W for sending to it) in
+/// an `InitChannel`. Called both at boot (step 5) and by the watchdog's
+/// respawn closure (step 9) — each call creates a FRESH DM process.
+fn spawn_device_manager(
+    console: &InitChannel<RealKernel>,
+    image: DmImage,
+) -> InitChannel<RealKernel> {
+    log_fmt!(
+        console,
+        "[INIT]   (create_sidecar: {} image @ 0x{:x}, {} bytes)",
+        dm_manifest::DM_MANIFEST_NAME,
+        image.kaddr,
+        image.size,
+    );
+    let manifest = dm_manifest::build_dm_manifest(&image);
+    let (r, w) = RealKernel
+        .create_sidecar(&manifest)
+        .unwrap_or_else(|e| panic!("[INIT] create_sidecar failed: {e}"));
+    log_fmt!(console, "[INIT]   messenger: CHAN_R={r} CHAN_W={w}");
+    InitChannel::new(RealKernel, r, w)
 }
 
 // ── logging helpers ──────────────────────────────────────────────────────────

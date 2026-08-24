@@ -3057,6 +3057,42 @@ int cap_create_sidecar(uint32_t parent_pid,
     return 0;
 }
 
+/* Find the parent's CHAN_W slot for the messenger channel whose CHAN_R
+ * slot is `ch_r` — cap_create_sidecar mints BOTH ends into the parent's
+ * table (cap_chan_create) but returns only the CHAN_R slot; the spawning
+ * sidecar needs the CHAN_W slot too (it SENDS the registry over the
+ * messenger). The scan matches on the underlying channel object
+ * (chan_id), so it is robust to slot layout. The parent is the current
+ * process, whose own table is stable while it runs this syscall — no
+ * cross-process race (same posture as the Phase-3 message syscalls). */
+static uint16_t sidecar_find_parent_ch_w(uint32_t parent_pid, uint16_t ch_r) {
+    if (ch_r == CAP_NONE) return CAP_NONE;
+    int cti = cap_table_index(parent_pid);
+    if (cti < 0) return CAP_NONE;
+    uint16_t want_chan = CAP_NONE;
+    {
+        uint64_t w = cap_tables[cti].slots[ch_r].word;
+        if (!cap_word_valid(w)) return CAP_NONE;
+        if (((w >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK) != CAP_TYPE_CHAN_R)
+            return CAP_NONE;
+        uint32_t oid = (uint32_t)((w >> CAP_OBJ_SHIFT) & CAP_OBJ_MASK);
+        struct CapObject* o = cap_object_get(oid);
+        if (!o || o->kind != CAP_OBJ_KIND_CHAN) return CAP_NONE;
+        want_chan = o->chan_id;
+    }
+    for (int si = 0; si < CAP_TABLE_ENTRIES; si++) {
+        uint64_t w = cap_tables[cti].slots[si].word;
+        if (!cap_word_valid(w)) continue;
+        if (((w >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK) != CAP_TYPE_CHAN_W)
+            continue;
+        uint32_t oid = (uint32_t)((w >> CAP_OBJ_SHIFT) & CAP_OBJ_MASK);
+        struct CapObject* o = cap_object_get(oid);
+        if (o && o->kind == CAP_OBJ_KIND_CHAN && o->chan_id == want_chan)
+            return (uint16_t)si;
+    }
+    return CAP_NONE;
+}
+
 /* ─── sys_sls_create_sidecar ──────────────────────────────────────────────── */
 uint64_t sys_sls_create_sidecar(struct SLSCreateSidecarRequest* req) {
     if (!req) return (uint64_t)(int64_t)CAP_EINVAL;
@@ -3066,5 +3102,7 @@ uint64_t sys_sls_create_sidecar(struct SLSCreateSidecarRequest* req) {
                                req->ch_w_idx, req->console_w_idx,
                                &ch_r);
     if (r < 0) return (uint64_t)(int64_t)r;
+    req->out_ch_r = ch_r;
+    req->out_ch_w = sidecar_find_parent_ch_w(cap_current_pid(), ch_r);
     return (uint64_t)ch_r;
 }

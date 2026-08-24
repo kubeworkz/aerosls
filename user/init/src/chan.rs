@@ -5,7 +5,7 @@
 //! the same pattern as `user/sidecar/src/net_client.rs`.
 
 use aerosls_proto::kabi::{
-    CapInfo, GrantedCap, Kernel, SendCap, TIMEOUT_NONE,
+    CapInfo, GrantedCap, Kernel, SendCap, TIMEOUT_NONE, CAP_NONE,
 };
 use aerosls_proto::{CH_KIND_CLOSE, CH_KIND_MSG, CLOSE_PEER};
 
@@ -50,16 +50,29 @@ impl core::fmt::Display for ChannelError {
     }
 }
 
-/// A channel endpoint with convenience methods.
+/// A channel endpoint with convenience methods. A wired channel is TWO
+/// caps in the sidecar's table (the kernel mints CHAN_R and CHAN_W
+/// separately, kernel/cap.c): `r` is the receive/wait end, `w` is the
+/// send end. The console channel has no receive end from init's side
+/// (`r = CAP_NONE`); the Device Manager messenger has both. In the host
+/// sim, both ends are the same handle (`new_single`).
 pub struct InitChannel<K: Kernel> {
     k: K,
-    /// The kernel handle for this endpoint.
-    pub handle: u32,
+    /// CHAN_R handle: wait / recv / recv_close. `CAP_NONE` when the
+    /// channel is send-only (e.g. the console from init's side).
+    pub r: u32,
+    /// CHAN_W handle: send.
+    pub w: u32,
 }
 
 impl<K: Kernel> InitChannel<K> {
-    pub fn new(k: K, handle: u32) -> Self {
-        Self { k, handle }
+    pub fn new(k: K, r: u32, w: u32) -> Self {
+        Self { k, r, w }
+    }
+
+    /// Both ends are one handle (the host sim's channel model).
+    pub fn new_single(k: K, h: u32) -> Self {
+        Self::new(k, h, h)
     }
 
     /// The underlying kernel (for callers that need to wait on this
@@ -68,11 +81,11 @@ impl<K: Kernel> InitChannel<K> {
         &self.k
     }
 
-    /// Introspect this endpoint's capability.
+    /// Introspect this endpoint's capability (the receive end when
+    /// present, else the send end).
     pub fn info(&self) -> Result<CapInfo, ChannelError> {
-        self.k
-            .cap_info(self.handle)
-            .map_err(ChannelError::Kernel)
+        let h = if self.r != CAP_NONE as u32 { self.r } else { self.w };
+        self.k.cap_info(h).map_err(ChannelError::Kernel)
     }
 
     /// Send a message with no caps and wait for a reply.
@@ -84,7 +97,7 @@ impl<K: Kernel> InitChannel<K> {
     /// dropped. Console logs use this path (fire-and-forget, no reply).
     pub fn request(&self, tag: u32, payload: &[u8]) -> Result<(), ChannelError> {
         self.k
-            .send(self.handle, tag, 0, payload, &[], 0)
+            .send(self.w, tag, 0, payload, &[], 0)
             .map_err(ChannelError::Kernel)
     }
 
@@ -97,7 +110,7 @@ impl<K: Kernel> InitChannel<K> {
         cap: &SendCap,
     ) -> Result<(), ChannelError> {
         self.k
-            .send(self.handle, tag, 0, payload, core::slice::from_ref(cap), 0)
+            .send(self.w, tag, 0, payload, core::slice::from_ref(cap), 0)
             .map_err(ChannelError::Kernel)
     }
 
@@ -105,7 +118,7 @@ impl<K: Kernel> InitChannel<K> {
     /// TIMEOUT_NONE parks this sidecar until a message or control event is
     /// queued (the demo event loop's blocking park).
     pub fn recv_msg(&self, buf: &mut [u8]) -> Result<u32, ChannelError> {
-        let mut chans = [self.handle];
+        let mut chans = [self.r];
         let (idx, kind) = self
             .k
             .wait(&mut chans, TIMEOUT_NONE)
@@ -123,7 +136,7 @@ impl<K: Kernel> InitChannel<K> {
         }
         let result = self
             .k
-            .recv(self.handle, buf, &mut [GrantedCap::default(); 4])
+            .recv(self.r, buf, &mut [GrantedCap::default(); 4])
             .map_err(ChannelError::Kernel)?;
         // The tag is the protocol discriminator and must survive even an
         // empty payload (e.g. the "devices ready" signal has no body).
@@ -140,7 +153,7 @@ impl<K: Kernel> InitChannel<K> {
         buf: &mut [u8],
         deadline_ns: u64,
     ) -> Result<u32, ChannelError> {
-        let mut chans = [self.handle];
+        let mut chans = [self.r];
         let (idx, kind) = self
             .k
             .wait(&mut chans, deadline_ns)
@@ -164,7 +177,7 @@ impl<K: Kernel> InitChannel<K> {
         }
         let result = self
             .k
-            .recv(self.handle, buf, &mut [GrantedCap::default(); 4])
+            .recv(self.r, buf, &mut [GrantedCap::default(); 4])
             .map_err(ChannelError::Kernel)?;
         // Same as `recv_msg`: the tag survives an empty payload.
         Ok(result.tag)
@@ -176,7 +189,7 @@ impl<K: Kernel> InitChannel<K> {
         let mut close_buf = [0u8; 8];
         let _result = self
             .k
-            .recv(self.handle, &mut close_buf, &mut [GrantedCap::default(); 4])
+            .recv(self.r, &mut close_buf, &mut [GrantedCap::default(); 4])
             .map_err(ChannelError::Kernel)?;
         let reason = u16::from_le_bytes([close_buf[0], close_buf[1]]);
         let detail = u32::from_le_bytes([close_buf[2], close_buf[3], close_buf[4], close_buf[5]]);
@@ -186,7 +199,7 @@ impl<K: Kernel> InitChannel<K> {
     /// Send a CLOSE event.
     pub fn close(&self) -> Result<(), ChannelError> {
         self.k
-            .close(self.handle, CLOSE_PEER, 0)
+            .close(self.w, CLOSE_PEER, 0)
             .map_err(ChannelError::Kernel)
     }
 }

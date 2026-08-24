@@ -79,7 +79,15 @@
  *      without re-parking, and a ready queue beats an expired deadline.
  *      The test advances a test-owned kernel_tick_counter to drive the
  *      real expiry/re-park logic in chan.c (the timer ISR wake that
- *      triggers the re-run lives in process.c, out of this link set).
+ *      triggers the re-run lives in process.c, out of this link set), and
+ *  14. (section 15) SYS_SLS_CREATE_SIDECAR (310) through its FULL syscall
+ *      wrapper — the path the init sidecar actually calls (kabi.rs
+ *      k_create_sidecar → RealKernel::create_sidecar): the wrapper fills
+ *      the request's out_ch_r / out_ch_w with the parent's messenger
+ *      CHAN_R and CHAN_W (both valid caps wrapping the same channel
+ *      object), the spawned sidecar registers under its manifest name,
+ *      and the messenger CARRIES DATA — the parent sends over out_ch_w
+ *      and the child receives the payload verbatim on its CHAN_R.
  *
  * The transport returns the POSITIVE CAP_ERR_* codes (0 = CAP_ERR_OK)
  * from kernel/cap.h, distinct from the Phase-3 negative CAP_E* codes.
@@ -2069,6 +2077,112 @@ int main(void) {
               g_wait_deadline > (uint64_t)kernel_tick_counter,
               "14g: a near-u64::MAX timeout saturates to a huge deadline "
               "(not a wrapped now+0)");
+    }
+
+    /* ── 15. SYS_SLS_CREATE_SIDECAR (310): the FULL syscall wrapper — the
+     * path the init sidecar actually calls (kabi.rs k_create_sidecar → this
+     * syscall, via RealKernel::create_sidecar). Unlike the direct
+     * cap_create_sidecar calls above, this drives the wrapper end to end:
+     * it must fill the request's out_ch_r / out_ch_w (the parent's
+     * messenger CHAN_R and CHAN_W), register the sidecar name, and the
+     * messenger must carry data across the spawn. ──────────────────────── */
+    {
+        g_cur_pid = 100;
+        struct Blob sysblob;
+        build_peer_blob(&sysblob, image_kaddr, "drv.syscall.0");
+
+        struct SLSCreateSidecarRequest creq;
+        memset(&creq, 0, sizeof(creq));
+        creq.manifest = sysblob.data;
+        creq.manifest_len = sysblob.len;
+        creq.ch_w_idx = CAP_NONE;
+        creq.console_w_idx = CAP_NONE;
+        creq.out_ch_r = CAP_NONE;
+        creq.out_ch_w = CAP_NONE;
+
+        uint64_t ret = sys_sls_create_sidecar(&creq);
+        CHECK(ret < 0x10000,
+              "syscall returns a slot-sized handle, not a negative error");
+        CHECK(creq.out_ch_r == (uint16_t)ret && creq.out_ch_r != CAP_NONE,
+              "out_ch_r filled with the parent's messenger CHAN_R");
+        CHECK(creq.out_ch_w != CAP_NONE,
+              "out_ch_w filled with the parent's messenger CHAN_W");
+
+        /* Both ends must be valid caps in the parent's (pid 100) table
+         * wrapping the SAME channel object. */
+        int pti = cap_table_index(100);
+        uint64_t wr = cap_tables[pti].slots[creq.out_ch_r].word;
+        uint64_t ww = cap_tables[pti].slots[creq.out_ch_w].word;
+        CHECK(cap_word_valid(wr) &&
+              ((wr >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK) == CAP_TYPE_CHAN_R,
+              "out_ch_r slot is a CHAN_R cap");
+        CHECK(cap_word_valid(ww) &&
+              ((ww >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK) == CAP_TYPE_CHAN_W,
+              "out_ch_w slot is a CHAN_W cap");
+        uint32_t parent_oid = CAP_OBJECT_MAX;
+        if (cap_word_valid(wr) && cap_word_valid(ww)) {
+            uint32_t or_ = (uint32_t)((wr >> CAP_OBJ_SHIFT) & CAP_OBJ_MASK);
+            uint32_t ow = (uint32_t)((ww >> CAP_OBJ_SHIFT) & CAP_OBJ_MASK);
+            parent_oid = or_;
+            CHECK(cap_objects[or_].kind == CAP_OBJ_KIND_CHAN &&
+                  cap_objects[ow].kind == CAP_OBJ_KIND_CHAN &&
+                  cap_objects[or_].chan_id == cap_objects[ow].chan_id,
+                  "both ends wrap the same channel object (the messenger)");
+        }
+
+        /* The spawned sidecar is registered under its manifest name. */
+        uint32_t child_pid = sidecar_registry_resolve("drv.syscall.0");
+        CHECK(child_pid != 0 && child_pid != 100,
+              "syscall-spawned sidecar registered in the sidecar registry");
+
+        /* The messenger is LIVE across the spawn: find the child's CHAN_R
+         * on the same channel, send over the parent's out_ch_w, and have
+         * the CHILD receive it through the chan syscalls. */
+        if (child_pid != 0) {
+            int cti2 = cap_table_index(child_pid);
+            uint16_t child_r = CAP_NONE;
+            if (cti2 >= 0 && parent_oid < CAP_OBJECT_MAX) {
+                for (int s = 0; s < CAP_TABLE_ENTRIES; s++) {
+                    uint64_t w = cap_tables[cti2].slots[s].word;
+                    if (!cap_word_valid(w)) continue;
+                    if (((w >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK) != CAP_TYPE_CHAN_R)
+                        continue;
+                    uint32_t oid = (uint32_t)((w >> CAP_OBJ_SHIFT) & CAP_OBJ_MASK);
+                    if (cap_objects[oid].kind == CAP_OBJ_KIND_CHAN &&
+                        cap_objects[oid].chan_id == cap_objects[parent_oid].chan_id) {
+                        child_r = (uint16_t)s;
+                        break;
+                    }
+                }
+            }
+            CHECK(child_r != CAP_NONE, "child's messenger CHAN_R found");
+
+            g_cur_pid = 100;
+            struct SLSChanSendRequest csr;
+            memset(&csr, 0, sizeof(csr));
+            csr.chan = creq.out_ch_w;
+            csr.tag = 0x5150;
+            csr.flags = 0;
+            csr.payload = (void*)"ping";
+            csr.payload_len = 4;
+            csr.timeout_ns = 0;
+            CHECK(sys_sls_chan_send(&csr) == CAP_ERR_OK,
+                  "parent sends over the syscall-returned messenger CHAN_W");
+
+            g_cur_pid = child_pid;
+            struct SLSChanRecvRequest crr;
+            memset(&crr, 0, sizeof(crr));
+            char cbuf[64];
+            memset(cbuf, 0, sizeof(cbuf));
+            crr.chan = child_r;
+            crr.buf = cbuf;
+            crr.buf_len = sizeof(cbuf);
+            crr.n_slots = 8;
+            CHECK(sys_sls_chan_recv(&crr) == CAP_ERR_OK &&
+                  crr.out.kind == CH_KIND_MSG && crr.out.tag == 0x5150 &&
+                  crr.out.len == 4 && memcmp(cbuf, "ping", 4) == 0,
+                  "the child receives the parent's messenger message");
+        }
     }
 
     if (g_fail == 0) printf("\nALL PASS\n");

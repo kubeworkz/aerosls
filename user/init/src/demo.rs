@@ -99,7 +99,7 @@ pub fn dispatch_event<K: Kernel>(
     // returns "no event" from this call (it blocks); the host fake returns
     // CH_KIND_NONE when nothing is queued so a single-iteration test sees
     // "no event" without hanging.
-    let mut chans = [dm.handle];
+    let mut chans = [dm.r];
     let (idx, kind) = match dm.kernel().wait(&mut chans, TIMEOUT_NONE) {
         Ok(v) => v,
         Err(code) => return EventOutcome::Err(ChannelError::Kernel(code)),
@@ -188,7 +188,9 @@ impl RespawnPolicy {
 /// ERR_TIMEOUT. In the host sim, a finite deadline with nothing ready is
 /// ERR_TIMEOUT immediately, so tests do not actually wait.
 pub fn backoff_sleep<K: Kernel>(dm: &InitChannel<K>, ns: u64) {
-    let _ = dm.kernel().wait(&mut [dm.handle], ns);
+    // Wait on the dead peer's RECEIVE end: the close event was already
+    // consumed, so nothing is ready and the finite deadline is the sleep.
+    let _ = dm.kernel().wait(&mut [dm.r], ns);
 }
 
 /// The watchdog-respawned demo loop — the self-healing path (Phase 5
@@ -259,8 +261,8 @@ mod tests {
         // Two endpoints over ONE kernel instance — the demo sidecar holds
         // both the console channel and the Device Manager channel.
         let k = shared_with_chans(&[1, 2]); // 1 = console, 2 = Device Manager
-        let console = InitChannel::new(k.clone(), 1);
-        let dm = InitChannel::new(k.clone(), 2);
+        let console = InitChannel::new_single(k.clone(), 1);
+        let dm = InitChannel::new_single(k.clone(), 2);
 
         // The real kernel enqueues this message and WAKES the parked wait
         // (cap_send_msg -> cap_wake_chan); the sim models the "already
@@ -282,8 +284,8 @@ mod tests {
     #[test]
     fn peer_death_close_surfaces_and_loop_exits() {
         let k = shared_with_chans(&[1, 2]);
-        let console = InitChannel::new(k.clone(), 1);
-        let dm = InitChannel::new(k.clone(), 2);
+        let console = InitChannel::new_single(k.clone(), 1);
+        let dm = InitChannel::new_single(k.clone(), 2);
 
         // Teardown scan (cap_table_teardown) sets close_evt with
         // CLOSE_PEER_DEAD + the dead pid; the sim models that signal.
@@ -309,7 +311,7 @@ mod tests {
     #[test]
     fn devices_ready_reply_within_deadline() {
         let k = shared_with_chans(&[2]);
-        let dm = InitChannel::new(k.clone(), 2);
+        let dm = InitChannel::new_single(k.clone(), 2);
 
         k.sim().inject_msg(2, MSG_DEVICES_READY, b"");
         let mut buf = [0u8; 128];
@@ -322,7 +324,7 @@ mod tests {
     #[test]
     fn deadline_elapses_with_timeout() {
         let k = shared_with_chans(&[2]);
-        let dm = InitChannel::new(k.clone(), 2);
+        let dm = InitChannel::new_single(k.clone(), 2);
 
         // Nothing queued: the real kernel wakes the parked wait at its
         // absolute deadline (timer ISR -> cap_park_deadline_tick) and the
@@ -338,7 +340,7 @@ mod tests {
     #[test]
     fn blocking_registry_send_lands_on_dm_endpoint() {
         let k = shared_with_chans(&[2]);
-        let dm = InitChannel::new(k.clone(), 2);
+        let dm = InitChannel::new_single(k.clone(), 2);
 
         let cap = SendCap {
             slot: 5,
@@ -365,7 +367,7 @@ mod tests {
     #[test]
     fn wrong_reply_tag_is_rejected() {
         let k = shared_with_chans(&[2]);
-        let dm = InitChannel::new(k.clone(), 2);
+        let dm = InitChannel::new_single(k.clone(), 2);
 
         k.sim().inject_msg(2, 0xDEAD, b"");
         let mut buf = [0u8; 128];
@@ -395,8 +397,8 @@ mod tests {
     fn resilient_loop_respawns_and_serves_new_channel() {
         // ch1 = console, ch2 = DM, ch3 = the respawned DM's channel.
         let k = shared_with_chans(&[1, 2, 3]);
-        let console = InitChannel::new(k.clone(), 1);
-        let dm = InitChannel::new(k.clone(), 2);
+        let console = InitChannel::new_single(k.clone(), 1);
+        let dm = InitChannel::new_single(k.clone(), 2);
 
         // The DM dies (teardown scan emits CLOSE_PEER_DEAD + the dead pid).
         k.sim().inject_close(2, CLOSE_PEER_DEAD, 42);
@@ -415,7 +417,7 @@ mod tests {
             respawns += 1;
             attempts.push(attempt);
             k.sim().inject_msg(3, 0x99, b"alive after respawn");
-            Ok(InitChannel::new(k.clone(), 3))
+            Ok(InitChannel::new_single(k.clone(), 3))
         });
 
         // Exactly one respawn happened, with the 1-based attempt number.
@@ -437,11 +439,60 @@ mod tests {
     }
 
     #[test]
+    fn create_sidecar_spawns_usable_messenger() {
+        // The REAL entry path (entry.rs step 5): pack the DM manifest and
+        // hand it to Kernel::create_sidecar. The sim mints a fresh channel
+        // for the spawned DM and returns both messenger ends.
+        let k = shared_with_chans(&[1]); // 1 = console
+        let console = InitChannel::new_single(k.clone(), 1);
+
+        let image = crate::dm_manifest::DmImage {
+            kaddr: 0x3000_0000,
+            size: 0x4000,
+            entry: 0x1000,
+        };
+        let manifest = crate::dm_manifest::build_dm_manifest(&image);
+        let (r, w) = k.create_sidecar(&manifest).unwrap();
+
+        // A fresh handle was minted for the DM and recorded in the spawn
+        // log; both ends point at it (the sim's single-handle model).
+        assert_eq!(k.sim().spawn_handles(), vec![r]);
+        assert_eq!(w, r);
+
+        // The messenger is usable end to end: send the registry to the DM
+        // (blocking send on w), the DM "replies" with devices-ready on r.
+        let dm = InitChannel::new(k.clone(), r, w);
+        let cap = SendCap {
+            slot: 5,
+            offset: 0,
+            len: 64,
+            rights: 0x01,
+            flags: 0,
+        };
+        send_registry(&dm, MSG_DEVICE_REGISTRY, &1u32.to_le_bytes(), &cap).unwrap();
+        assert_eq!(k.sim().peek_tag(r), Some(MSG_DEVICE_REGISTRY));
+        // The DM reads the registry...
+        let mut buf = [0u8; 4];
+        assert_eq!(dm.recv_msg(&mut buf).unwrap(), MSG_DEVICE_REGISTRY);
+        // ...and sends devices-ready back to init.
+        k.sim().inject_msg(r, MSG_DEVICES_READY, b"");
+        let mut rb = [0u8; 128];
+        assert_eq!(wait_devices_ready(&dm, &mut rb, DM_READY_DEADLINE_NS), Ok(()));
+
+        // The watchdog's respawn closure calls the same path again — a
+        // SECOND spawn mints a second handle (a fresh DM each time).
+        let (r2, w2) = k.create_sidecar(&manifest).unwrap();
+        assert_eq!(k.sim().spawn_handles(), vec![r, r2]);
+        assert_eq!(w2, r2);
+        assert_ne!(r2, r);
+    }
+
+    #[test]
     fn resilient_loop_crash_loop_breaker() {
         // ch1 = console, ch2 = DM, ch3 = respawn target.
         let k = shared_with_chans(&[1, 2, 3]);
-        let console = InitChannel::new(k.clone(), 1);
-        let dm = InitChannel::new(k.clone(), 2);
+        let console = InitChannel::new_single(k.clone(), 1);
+        let dm = InitChannel::new_single(k.clone(), 2);
 
         // DM dies once, respawns to ch3, and the respawned DM ALSO dies
         // immediately (a crash loop) — the restart budget (1) is exhausted
@@ -457,7 +508,7 @@ mod tests {
             respawns += 1;
             assert_eq!(attempt, 1);
             k.sim().inject_close(3, CLOSE_PEER_DEAD, 43);
-            Ok(InitChannel::new(k.clone(), 3))
+            Ok(InitChannel::new_single(k.clone(), 3))
         });
 
         assert_eq!(respawns, 1);

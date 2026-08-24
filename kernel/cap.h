@@ -655,9 +655,11 @@ void cap_unlock(struct CapSpinlock* l);
  * process, maps the sidecar image, builds the initial capability table
  * from the manifest's CAP records, writes a BootInfoBlock at the top of
  * the child's stack, and enters ring-3 at the image entry point. On
- * success the caller receives a CHAN cap to the child (the parent end
- * of the messenger channel). The child's BIB lists the child end as
- * cap #0.
+ * success the caller's messenger caps to the child are returned through
+ * the request's OUT fields (out_ch_r = parent CHAN_R for receiving the
+ * child's replies, out_ch_w = parent CHAN_W for sending to the child; the
+ * syscall's return value is also the CHAN_R slot). The child's BIB lists
+ * the child's ends as caps #0 (CHAN_R) and #1 (CHAN_W).
  *
  * Packed manifest wire format (matches user/proto/src/manifest.rs):
  *   Header (24 bytes):
@@ -809,7 +811,8 @@ struct SLSCreateSidecarRequest {
     uint8_t      _pad[4];
     uint16_t     ch_w_idx;     /* parent's CHAN_W to the child, or CAP_NONE */
     uint16_t     console_w_idx; /* console CHAN_W, or CAP_NONE */
-    uint8_t      _pad2[4];
+    uint16_t     out_ch_r;     /* OUT: parent's messenger CHAN_R slot */
+    uint16_t     out_ch_w;     /* OUT: parent's messenger CHAN_W slot */
 };
 
 int cap_create_sidecar(uint32_t parent_pid,

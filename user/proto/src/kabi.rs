@@ -16,9 +16,16 @@
 //! the crate links cleanly into the test harness.
 
 /// Capability types (capability-layer spec §1.1, respawn decision §2).
+/// `CAP_CHAN` aliases the BIB's CHAN_R entry type (2); `CAP_CHAN_W` is
+/// the CHAN_W entry type (3) — a wired channel appears in the BIB as TWO
+/// named entries (CHAN_R then CHAN_W), so a sidecar that SENDS on a
+/// channel (e.g. the console) must resolve the W end, not the first match.
 pub const CAP_MEM: u16 = 1;
 pub const CAP_CHAN: u16 = 2;
-pub const CAP_SPAWN: u16 = 3;
+pub const CAP_CHAN_W: u16 = 3;
+
+/// `CAP_NONE` — an absent cap slot (the kernel's CAP_NONE).
+pub const CAP_NONE: u16 = 0xFFFF;
 
 /// Kernel error codes (capability-layer spec §7 + transport spec §7).
 pub const ERR_OK: i32 = 0;
@@ -141,6 +148,17 @@ pub trait Kernel {
         let _ = chan;
         Ok(crate::CH_KIND_NONE)
     }
+
+    /// Spawn a sidecar from a packed manifest blob (`SYS_SLS_CREATE_SIDECAR`,
+    /// kernel/cap.c). Returns the parent's messenger channel handles:
+    /// `(CHAN_R, CHAN_W)` — the R end receives the child's replies, the W
+    /// end sends to the child. The blob must carry the 8-byte image_kaddr
+    /// footer (the image the kernel maps lives at that physical address).
+    /// Default: unsupported (`ERR_NOTFOUND`), for fakes that never spawn.
+    fn create_sidecar(&self, manifest: &[u8]) -> Result<(u32, u32), i32> {
+        let _ = manifest;
+        Err(ERR_NOTFOUND)
+    }
 }
 
 // ── Real kernel ABI (feature `target`) ───────────────────────────────────────
@@ -196,6 +214,7 @@ mod abi {
     // right — but note the kernel's codes are the spec's numbers (1..13),
     // which this module's ERR_* constants already are.
 
+    const SYS_CREATE_SIDECAR: u64 = 310;
     const SYS_CHAN_WAIT: u64 = 311;
     const SYS_CHAN_RECV: u64 = 312;
     const SYS_CHAN_SEND: u64 = 313;
@@ -326,6 +345,54 @@ mod abi {
         handle: u16,
         _pad: [u8; 6],
         out: CapInfoOutReq,
+    }
+
+    /// Kernel SLSCreateSidecarRequest (kernel/cap.h): the kernel fills
+    /// out_ch_r / out_ch_w (the parent's messenger ends) on success.
+    #[repr(C)]
+    struct CreateSidecarReq {
+        manifest: *const u8,
+        manifest_len: u32,
+        _pad: [u8; 4],
+        ch_w_idx: u16,
+        console_w_idx: u16,
+        out_ch_r: u16,
+        out_ch_w: u16,
+    }
+
+    /// `k_create_sidecar`: syscall 310. The kernel returns the child's
+    /// parent-end CHAN_R slot as the syscall VALUE on success (errors are
+    /// negative), and fills `out_ch_r`/`out_ch_w` in the request — the
+    /// shim reads both ends from there.
+    #[no_mangle]
+    pub extern "C" fn k_create_sidecar(
+        manifest: *const u8,
+        manifest_len: u32,
+        out_r: *mut u32,
+        out_w: *mut u32,
+    ) -> i32 {
+        let mut req = CreateSidecarReq {
+            manifest,
+            manifest_len,
+            _pad: [0; 4],
+            ch_w_idx: CAP_NONE,
+            console_w_idx: CAP_NONE,
+            out_ch_r: CAP_NONE,
+            out_ch_w: CAP_NONE,
+        };
+        let rc = unsafe {
+            sls_syscall(SYS_CREATE_SIDECAR, &mut req as *mut CreateSidecarReq as u64)
+        } as i64;
+        if rc < 0 {
+            return rc as i32;
+        }
+        if !out_r.is_null() {
+            unsafe { *out_r = req.out_ch_r as u32 };
+        }
+        if !out_w.is_null() {
+            unsafe { *out_w = req.out_ch_w as u32 };
+        }
+        0
     }
 
     #[no_mangle]
@@ -628,6 +695,17 @@ mod abi {
                     base: out.base,
                     len: out.len,
                 })
+            }
+        }
+
+        fn create_sidecar(&self, manifest: &[u8]) -> Result<(u32, u32), i32> {
+            let mut r: u32 = 0;
+            let mut w: u32 = 0;
+            let rc = k_create_sidecar(manifest.as_ptr(), manifest.len() as u32, &mut r, &mut w);
+            if rc != ERR_OK {
+                Err(rc)
+            } else {
+                Ok((r, w))
             }
         }
     }

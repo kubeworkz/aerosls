@@ -69,7 +69,10 @@ pub const TAG_NAME: u16 = 0x000A;
 /// Reserved for Phase 3 signed manifests; ignored by v1.
 pub const TAG_SIGNATURE: u16 = 0x7F00;
 
-const HEADER_LEN: usize = 24;
+/// Packed manifest header size: magic[8] + version u16×2 + record_count
+/// u16 + flags u16 + total_len u32 + body_crc32 u32 = 24 bytes (the
+/// kernel's SIDECAR_MANIFEST_HEADER_LEN).
+pub const HEADER_LEN: usize = 24;
 
 /// Manifest parse failures. All are "this blob is not a manifest we can
 /// load" — the kernel refuses `create_sidecar` on any of them, before any
@@ -114,11 +117,18 @@ impl core::fmt::Display for ManifestErr {
     }
 }
 
-/// The `IMAGE` record (§2.2).
+/// The `IMAGE` record (§2.2). The packed form matches the kernel's
+/// parser (kernel/cap.c SIDECAR_TAG_IMAGE, 24 bytes):
+///   entry_offset u64 (rp+0), blob_offset u32 (rp+8, image offset within
+///   the flat package), image_size u32 (rp+12), image_kaddr u64 (rp+16,
+///   0 here — the runtime packer supplies it via the appended footer).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Image {
+    /// Image offset within the flat image+manifest package (blob_offset).
     pub offset: u32,
+    /// Image size in bytes (image_size).
     pub size: u32,
+    /// Entry point offset within the image (entry_offset).
     pub entry: u64,
 }
 
@@ -300,13 +310,15 @@ pub fn parse_manifest(blob: &[u8]) -> Result<Manifest<'_>, ManifestErr> {
                 m.name = Some(name);
             }
             TAG_IMAGE => {
-                if p.len() != 16 {
+                // Kernel layout (24 bytes, extra tolerated): entry_offset
+                // u64, blob_offset u32, image_size u32, image_kaddr u64.
+                if p.len() < 24 {
                     return Err(ManifestErr::BadRecordLen);
                 }
                 m.image = Some(Image {
-                    offset: le_u32(p, 0),
-                    size: le_u32(p, 4),
-                    entry: le_u64(p, 8),
+                    entry: le_u64(p, 0),
+                    offset: le_u32(p, 8),
+                    size: le_u32(p, 12),
                 });
             }
             TAG_BUDGET => {
@@ -453,10 +465,14 @@ pub fn build_manifest(m: &Manifest<'_>) -> alloc::vec::Vec<u8> {
         recs.push((TAG_PERSONALITY, enc_name(p)));
     }
     if let Some(i) = m.image {
-        let mut p = alloc::vec::Vec::with_capacity(16);
+        // 24-byte record, the kernel's parser layout: entry_offset u64,
+        // blob_offset u32, image_size u32, image_kaddr u64 (= 0; the
+        // runtime packer appends the footer with the real address).
+        let mut p = alloc::vec::Vec::with_capacity(24);
+        p.extend_from_slice(&i.entry.to_le_bytes());
         p.extend_from_slice(&i.offset.to_le_bytes());
         p.extend_from_slice(&i.size.to_le_bytes());
-        p.extend_from_slice(&i.entry.to_le_bytes());
+        p.extend_from_slice(&0u64.to_le_bytes());
         recs.push((TAG_IMAGE, p));
     }
     if let Some(b) = m.budget {
@@ -865,5 +881,67 @@ mod tests {
             assert_eq!(parsed.find_cap("console").unwrap().name, "console");
             assert!(parsed.find_cap("budget").is_some());
         }
+    }
+
+    /// Walk the built blob's TLV records EXACTLY like the kernel's parser
+    /// (kernel/cap.c cap_create_sidecar: header at 0, records from
+    /// HEADER_LEN, each tag u16 + len u16 + payload, then the 8-byte
+    /// image_kaddr footer after the last record). This pins the shared
+    /// wire format so a manifest built here boots on the kernel parser.
+    #[test]
+    fn image_record_matches_kernel_parser_layout() {
+        let mut m = sample();
+        m.image = Some(Image { offset: 0x8000, size: 0x4000, entry: 0x10 });
+        let mut blob = build_manifest(&m);
+
+        // Header fields the kernel reads first.
+        assert_eq!(&blob[..8], &MANIFEST_MAGIC);
+        assert_eq!(u16::from_le_bytes([blob[8], blob[9]]), 1); // version_major
+
+        // Record walk, mirroring the kernel's loop.
+        let mut off = HEADER_LEN;
+        let mut image_payload: Option<&[u8]> = None;
+        let record_count = u16::from_le_bytes([blob[12], blob[13]]);
+        for _ in 0..record_count {
+            assert!(off + 4 <= blob.len());
+            let tag = u16::from_le_bytes([blob[off], blob[off + 1]]);
+            let rlen = u16::from_le_bytes([blob[off + 2], blob[off + 3]]) as usize;
+            assert!(off + 4 + rlen <= blob.len());
+            if tag == TAG_IMAGE {
+                image_payload = Some(&blob[off + 4..off + 4 + rlen]);
+            }
+            off += 4 + rlen;
+        }
+
+        // The kernel requires rlen >= 24; the payload offsets are:
+        //   rp+0  entry_offset u64, rp+8 blob_offset u32,
+        //   rp+12 image_size u32,   rp+16 image_kaddr u64.
+        let p = image_payload.expect("TAG_IMAGE record present");
+        assert_eq!(p.len(), 24, "kernel parser requires a 24-byte IMAGE record");
+        assert_eq!(le_u64(p, 0), 0x10, "entry_offset at rp+0");
+        assert_eq!(le_u32(p, 8), 0x8000, "blob_offset at rp+8");
+        assert_eq!(le_u32(p, 12), 0x4000, "image_size at rp+12");
+        assert_eq!(le_u64(p, 16), 0, "image_kaddr: footer supplies it");
+
+        // Footer: the packer appends image_kaddr after the last record; the
+        // kernel reads it as `blob + footer_off` where footer_off is the
+        // post-record offset. total_len must cover it and the body CRC is
+        // computed over records + footer.
+        let kaddr = 0x2000_0000u64;
+        blob.extend_from_slice(&kaddr.to_le_bytes());
+        let total = blob.len() as u32;
+        blob[16..20].copy_from_slice(&total.to_le_bytes());
+        let crc = crc32(&blob[HEADER_LEN..]);
+        blob[20..24].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(u32::from_le_bytes([blob[16], blob[17], blob[18], blob[19]]), total);
+        assert_eq!(off + 8, blob.len(), "footer sits right after the records");
+        assert_eq!(le_u64(&blob, off), kaddr, "footer image_kaddr");
+        assert_eq!(crc32(&blob[HEADER_LEN..]), crc, "body CRC over records+footer");
+
+        // And the Rust parser still round-trips the same manifest.
+        let parsed = parse_manifest(&blob).unwrap();
+        assert_eq!(parsed.image.unwrap().entry, 0x10);
+        assert_eq!(parsed.image.unwrap().offset, 0x8000);
+        assert_eq!(parsed.image.unwrap().size, 0x4000);
     }
 }
