@@ -273,14 +273,18 @@ impl<K: Kernel> DmServer<K> {
 
     /// Drain the 8-byte close body after a CLOSE event.
     fn recv_close_body(&self, buf: &mut [u8]) -> Result<(u16, u32), DmError> {
-        let result = self
-            .k
-            .recv(self.msg_r, buf, &mut [GrantedCap::default(); 4])
-            .map_err(DmError::Kernel)?;
-        let reason = u16::from_le_bytes([buf[0], buf[1]]);
-        let detail = u32::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]);
-        let _ = result;
-        Ok((reason, detail))
+        match self.k.recv(self.msg_r, buf, &mut [GrantedCap::default(); 4]) {
+            Ok(_result) => {
+                let reason = u16::from_le_bytes([buf[0], buf[1]]);
+                let detail = u32::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]);
+                Ok((reason, detail))
+            }
+            // ERR_STATE (8): empty queue — the close event was queued
+            // but the body wasn't (or was already consumed). Treat as
+            // an ungraceful close with zeroed reason/detail.
+            Err(8) => Ok((0, 0)),
+            Err(e) => Err(DmError::Kernel(e)),
+        }
     }
 
     /// The event loop: serve events until the messenger closes (init died),

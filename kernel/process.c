@@ -1296,19 +1296,16 @@ int cap_wait_chans(const uint32_t* chan_ids, uint32_t n, void* req,
 
     struct ProcessDescriptor* next = pick_next_runnable();
     if (!next) {
-        /* Nobody to run yet — the DM may still be booting (PROC_RUNNING,
-         * not SUSPENDED). Instead of busy-spinning (the SDK retries
-         * immediately), hlt for one tick so the timer ISR fires and the
-         * scheduler eventually picks a newly-runnable peer. Set a
-         * 1-tick deadline so cap_park_deadline_tick wakes us. */
-        uint64_t one_tick = kernel_tick_counter + 1;
-        cur->waiting_deadline = one_tick;
+        /* Nobody to run yet — mark ourselves SUSPENDED so the timer
+         * ISR's schedule_ring3 can find a newly-runnable peer (the DM
+         * booting) instead of re-resuming us. After hlt, restore
+         * PROC_RUNNING and let the caller retry (the queue may now
+         * have a message). */
+        cur->state = PROC_SUSPENDED;
         __asm__ volatile("sti; hlt" ::: "memory");
-        cur->waiting_deadline = 0;
+        cur->state = PROC_RUNNING;
         cur->waiting_nchans  = 0;
-        cur->state           = PROC_RUNNING;
-        kernel_serial_printf(
-            "[CAP] chan wait: hlt woke; returning TIMEOUT\n");
+        cur->waiting_deadline = 0;
         return 0;
     }
     kernel_serial_printf("[CAP] chan wait: switching to PID %u '%s'\n",
@@ -1524,14 +1521,10 @@ uint32_t sys_sls_yield(void) {
      * and spin forever. */
     struct ProcessDescriptor* next = pick_next_runnable();
     if (!next) {
-        /* Nobody else to run — hlt for one tick so the timer ISR fires
-         * and the scheduler picks a newly-runnable peer. Same idle pace
-         * as cap_wait_chans's no-next path. */
-        uint64_t one_tick = kernel_tick_counter + 1;
-        cur->waiting_deadline = one_tick;
-        cur->state = PROC_BLOCKED;
+        /* Nobody else — mark SUSPENDED so the ISR can find a peer,
+         * then hlt and resume. Same mechanism as cap_wait_chans. */
+        cur->state = PROC_SUSPENDED;
         __asm__ volatile("sti; hlt" ::: "memory");
-        cur->waiting_deadline = 0;
         cur->state = PROC_RUNNING;
         return 0;
     }
