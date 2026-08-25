@@ -32,6 +32,7 @@ pub mod chan;
 pub mod demo;
 pub mod dm_manifest;
 pub mod heap;
+pub mod posix_manifest;
 
 #[cfg(feature = "target")]
 mod entry;

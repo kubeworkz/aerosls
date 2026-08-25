@@ -308,17 +308,20 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     // ── 8. Spawn the POSIX sidecar ────────────────────────────────────────
     log(&console, "[INIT] spawning POSIX sidecar...");
 
-    // In the full Phase 5 design, the init sidecar would spawn the POSIX
-    // sidecar via create_sidecar for "aerosls.posix.v1".  For this
-    // prototype we log the intent and park.
-    //
-    // The POSIX sidecar's manifest would declare channels to:
-    //   - the filesystem sidecar (VFS channel)
-    //   - the network stack sidecar (socket channel)
-    //   - the console driver sidecar (console channel)
-    //
-    // These would be wired by the Device Manager via manifest path 2
-    // (transport spec §2.2) when it creates the POSIX sidecar.
+    let posix_image_cap = bib
+        .find_cap(CAP_MEM, "posix.image")
+        .expect("[INIT] missing 'posix.image' MEM cap");
+
+    let posix_heap_cap = bib
+        .find_cap(CAP_MEM, "posix.heap")
+        .expect("[INIT] missing 'posix.heap' MEM cap");
+
+    // The POSIX sidecar's manifest (pre-packed in the CPIO as
+    // boot/posix.manifest) declares budget + console caps. Init calls
+    // k_create_sidecar with a repacked manifest whose budget base points
+    // at posix.heap — the DM wires additional channels (VFS, network)
+    // after the POSIX sidecar is up.
+    spawn_posix_sidecar(&console, posix_image_cap, posix_heap_cap);
 
     log(&console, "[INIT] ── Phase 5 init sidecar complete ──");
     log(&console, "[INIT] system ready for POSIX sidecar creation.");
@@ -397,6 +400,34 @@ fn spawn_device_manager(
         .unwrap_or_else(|e| panic!("[INIT] create_sidecar failed: {e}"));
     log_fmt!(console, "[INIT]   messenger: CHAN_R={r} CHAN_W={w}");
     InitChannel::new(RealKernel, r, w)
+}
+
+/// Spawn the POSIX sidecar through the real kernel path (`SYS_SLS_CREATE_SIDECAR`).
+/// The POSIX binary and budget heap addresses come from the boot image's
+/// pre-packed manifest caps (posix.image, posix.heap). This creates a FRESH
+/// POSIX process with budget + console wired; the Device Manager subsequently
+/// connects VFS/network channels.
+fn spawn_posix_sidecar(
+    console: &InitChannel<RealKernel>,
+    image_cap: &aerosls_proto::bootinfo::BootCap<'_>,
+    heap_cap: &aerosls_proto::bootinfo::BootCap<'_>,
+) {
+    log_fmt!(
+        console,
+        "[INIT]   (create_sidecar: {} image @ 0x{:x}, {} bytes)",
+        posix_manifest::POSIX_MANIFEST_NAME,
+        image_cap.base,
+        image_cap.len,
+    );
+    let manifest = posix_manifest::build_posix_manifest(
+        image_cap.base,
+        image_cap.len as u32,
+        heap_cap.base,
+    );
+    let (r, w) = RealKernel
+        .create_sidecar(&manifest)
+        .unwrap_or_else(|e| panic!("[INIT] POSIX create_sidecar failed: {e}"));
+    log_fmt!(console, "[INIT]   POSIX messenger: CHAN_R={r} CHAN_W={w}");
 }
 
 // ── logging helpers ──────────────────────────────────────────────────────────

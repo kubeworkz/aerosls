@@ -49,6 +49,10 @@ pub const INIT_HEAP_BYTES: u64 = 16 * 1024 * 1024;
 /// in `user/init/src/dm_manifest.rs`.
 pub const DM_HEAP_BYTES: u64 = 256 * 1024;
 
+/// The POSIX sidecar's budget heap — 4 MiB, enough for the VFS caches,
+/// process table, and applet scripts.
+pub const POSIX_HEAP_BYTES: u64 = 4 * 1024 * 1024;
+
 /// The device registry region: `4 + MAX_DEVICES(16) × 64` = 1028 bytes
 /// (devreg.rs), rounded to one page.
 pub const REGISTRY_BYTES: u64 = 4096;
@@ -60,12 +64,16 @@ pub const INIT_MANIFEST_NAME: &str = "aerosls.init.0";
 /// The Device Manager's registry name — must match
 /// `dm_manifest::DM_MANIFEST_NAME` in `user/init/src/dm_manifest.rs`.
 pub const DM_MANIFEST_NAME: &str = "drv.device_manager.0";
+/// The POSIX sidecar's registry name.
+pub const POSIX_MANIFEST_NAME: &str = "aerosls.posix.0";
 
 /// Archive entry paths (the loader walks the CPIO for `INIT_MANIFEST_PATH`).
 pub const INIT_BIN_PATH: &str = "boot/init.bin";
 pub const INIT_MANIFEST_PATH: &str = "boot/init.manifest";
 pub const DM_BIN_PATH: &str = "boot/dm.bin";
 pub const DM_MANIFEST_PATH: &str = "boot/dm.manifest";
+pub const POSIX_BIN_PATH: &str = "boot/posix.bin";
+pub const POSIX_MANIFEST_PATH: &str = "boot/posix.manifest";
 pub const LAYOUT_PATH: &str = "boot/layout";
 
 /// One reserved physical region.
@@ -91,6 +99,8 @@ pub struct BootLayout {
     pub init_heap: Region,
     pub dm_image: Region,
     pub dm_heap: Region,
+    pub posix_image: Region,
+    pub posix_heap: Region,
     pub registry: Region,
 }
 
@@ -103,12 +113,14 @@ impl BootLayout {
 
     /// Every region, in memory order, for iteration in tests and the
     /// `boot/layout` file.
-    pub fn regions(&self) -> [(&'static str, Region); 5] {
+    pub fn regions(&self) -> [(&'static str, Region); 7] {
         [
             ("init.image", self.init_image),
             ("init.heap", self.init_heap),
             ("dm.image", self.dm_image),
             ("dm.heap", self.dm_heap),
+            ("posix.image", self.posix_image),
+            ("posix.heap", self.posix_heap),
             ("registry", self.registry),
         ]
     }
@@ -121,10 +133,14 @@ pub struct BootImageSpec {
     pub init_bin: Vec<u8>,
     /// The Device Manager flat binary (entry at `dm_entry`).
     pub dm_bin: Vec<u8>,
+    /// The POSIX sidecar flat binary.
+    pub posix_bin: Vec<u8>,
     /// Size of init's budget heap region.
     pub init_heap_bytes: u64,
     /// Size of the DM's budget heap region.
     pub dm_heap_bytes: u64,
+    /// Size of the POSIX sidecar's budget heap region.
+    pub posix_heap_bytes: u64,
     /// Size of the device-registry region.
     pub registry_bytes: u64,
     /// Physical base of the whole boot-image region.
@@ -133,20 +149,25 @@ pub struct BootImageSpec {
     pub init_entry: u64,
     /// Entry-point offset within the DM binary.
     pub dm_entry: u64,
+    /// Entry-point offset within the POSIX binary.
+    pub posix_entry: u64,
 }
 
 impl BootImageSpec {
     /// A spec with the documented defaults.
-    pub fn new(init_bin: Vec<u8>, dm_bin: Vec<u8>) -> Self {
+    pub fn new(init_bin: Vec<u8>, dm_bin: Vec<u8>, posix_bin: Vec<u8>) -> Self {
         Self {
             init_bin,
             dm_bin,
+            posix_bin,
             init_heap_bytes: INIT_HEAP_BYTES,
             dm_heap_bytes: DM_HEAP_BYTES,
+            posix_heap_bytes: POSIX_HEAP_BYTES,
             registry_bytes: REGISTRY_BYTES,
             base_phys: BOOT_IMAGE_BASE_PHYS,
             init_entry: 0,
             dm_entry: 0,
+            posix_entry: 0,
         }
     }
 }
@@ -176,6 +197,8 @@ pub fn compute_layout(spec: &BootImageSpec) -> BootLayout {
         init_heap: take(spec.init_heap_bytes),
         dm_image: take(spec.dm_bin.len() as u64),
         dm_heap: take(spec.dm_heap_bytes),
+        posix_image: take(spec.posix_bin.len() as u64),
+        posix_heap: take(spec.posix_heap_bytes),
         registry: take(spec.registry_bytes),
     }
 }
@@ -185,7 +208,7 @@ mod tests {
     use super::*;
 
     fn spec() -> BootImageSpec {
-        BootImageSpec::new(vec![0xAA; 0x2000], vec![0xBB; 0x4000])
+        BootImageSpec::new(vec![0xAA; 0x2000], vec![0xBB; 0x4000], vec![0xCC; 0x8000])
     }
 
     #[test]
@@ -209,10 +232,17 @@ mod tests {
     }
 
     #[test]
+    fn posix_image_sits_after_dm_heap() {
+        let l = compute_layout(&spec());
+        assert!(l.posix_image.phys >= l.dm_heap.end());
+    }
+
+    #[test]
     fn heap_regions_match_the_sidecar_contracts() {
         let l = compute_layout(&spec());
         assert_eq!(l.init_heap.size, INIT_HEAP_BYTES);
         assert_eq!(l.dm_heap.size, DM_HEAP_BYTES);
+        assert_eq!(l.posix_heap.size, POSIX_HEAP_BYTES);
         assert_eq!(l.registry.size, REGISTRY_BYTES);
     }
 

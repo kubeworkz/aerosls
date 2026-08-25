@@ -19,7 +19,7 @@
 //! MEM cap (what init's runtime `create_sidecar` call copies) points at the
 //! same physical address the DM manifest's own footer declares.
 
-use crate::layout::{BootImageSpec, BootLayout, DM_MANIFEST_NAME, INIT_MANIFEST_NAME};
+use crate::layout::{BootImageSpec, BootLayout, DM_MANIFEST_NAME, INIT_MANIFEST_NAME, POSIX_MANIFEST_NAME};
 use crate::newc;
 use aerosls_proto::manifest::{
     Bootstrap, Budget, CapKind, Cpu, Image, Limits, Manifest, ManifestCap, build_manifest, crc32,
@@ -34,11 +34,13 @@ pub const CONSOLE_PEER: &str = "kernel.debug.console";
 /// entry: it is implicit memory the loader reserves and zeroes (devreg.rs
 /// format), and the heap regions are implicit too — the archive carries no
 /// 16 MiB of zeros.
-pub const ENTRY_PATHS: [&str; 5] = [
+pub const ENTRY_PATHS: [&str; 7] = [
     crate::layout::INIT_BIN_PATH,
     crate::layout::INIT_MANIFEST_PATH,
     crate::layout::DM_BIN_PATH,
     crate::layout::DM_MANIFEST_PATH,
+    crate::layout::POSIX_BIN_PATH,
+    crate::layout::POSIX_MANIFEST_PATH,
     crate::layout::LAYOUT_PATH,
 ];
 
@@ -59,7 +61,8 @@ fn pack_with_footer(m: &Manifest<'_>, image_kaddr: u64) -> Vec<u8> {
 /// Build the init sidecar's packed manifest. Caps, in record order:
 /// `budget` (its bump heap), `console` (kernel service), `device_registry`
 /// (kernel-populated, read-only), `dm.image` (the DM binary's physical
-/// address — what entry.rs hands `create_sidecar`).
+/// address — what entry.rs hands `create_sidecar`), `posix.image`
+/// (the POSIX sidecar binary), `posix.heap` (POSIX sidecar budget).
 fn build_init_manifest(spec: &BootImageSpec, layout: &BootLayout, blob_offset: u32) -> Vec<u8> {
     let caps = [
         Some(ManifestCap {
@@ -94,8 +97,22 @@ fn build_init_manifest(spec: &BootImageSpec, layout: &BootLayout, blob_offset: u
                 size: spec.dm_bin.len() as u64,
             },
         }),
-        None,
-        None,
+        Some(ManifestCap {
+            name: "posix.image",
+            rights: 0x1, // R — init reads the POSIX binary out of it
+            kind: CapKind::Mem {
+                base: layout.posix_image.phys,
+                size: spec.posix_bin.len() as u64,
+            },
+        }),
+        Some(ManifestCap {
+            name: "posix.heap",
+            rights: 0x3, // R | W — POSIX sidecar budget
+            kind: CapKind::Mem {
+                base: layout.posix_heap.phys,
+                size: spec.posix_heap_bytes,
+            },
+        }),
         None,
         None,
         None,
@@ -135,7 +152,7 @@ fn build_init_manifest(spec: &BootImageSpec, layout: &BootLayout, blob_offset: u
             chan_queue_depth: 16,
         }),
         caps,
-        n_caps: 4,
+        n_caps: 6,
         bootstrap: Some(Bootstrap {
             console: Some("console"),
             debug: None,
@@ -224,6 +241,82 @@ fn build_dm_manifest(spec: &BootImageSpec, layout: &BootLayout, blob_offset: u32
     pack_with_footer(&m, layout.dm_image.phys)
 }
 
+/// Build the POSIX sidecar's packed manifest — budget + console, mirroring
+/// the POSIX sidecar's expected BIB (budget is the heap region, console is
+/// the kernel serial service).
+fn build_posix_manifest(spec: &BootImageSpec, layout: &BootLayout, blob_offset: u32) -> Vec<u8> {
+    let caps = [
+        Some(ManifestCap {
+            name: "budget",
+            rights: 0x3, // R | W
+            kind: CapKind::Mem {
+                base: layout.posix_heap.phys,
+                size: spec.posix_heap_bytes,
+            },
+        }),
+        Some(ManifestCap {
+            name: "console",
+            rights: 0x7, // R | W | send
+            kind: CapKind::Chan {
+                peer: Some(CONSOLE_PEER),
+                flags: 0,
+            },
+        }),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ];
+    let m = Manifest {
+        version_major: 1,
+        version_minor: 0,
+        flags: 0,
+        name: Some(POSIX_MANIFEST_NAME),
+        personality: Some("aerosls.posix.v1"),
+        image: Some(Image {
+            offset: blob_offset,
+            size: spec.posix_bin.len() as u32,
+            entry: spec.posix_entry,
+        }),
+        budget: Some(Budget {
+            mem_bytes: spec.posix_heap_bytes,
+            stack_bytes: 64 * 1024,
+            heap_initial: 1024 * 1024,
+        }),
+        cpu: Some(Cpu {
+            share: 100,
+            preemptible: true,
+        }),
+        limits: Some(Limits {
+            max_tasks: 64,
+            max_fds: 128,
+            max_channels: 32,
+            max_open_files: 128,
+            chan_queue_depth: 16,
+        }),
+        caps,
+        n_caps: 2,
+        bootstrap: Some(Bootstrap {
+            console: Some("console"),
+            debug: None,
+            log_level: 1,
+        }),
+        flags_value: Some(0),
+        signature: None,
+    };
+    pack_with_footer(&m, layout.posix_image.phys)
+}
+
 /// Byte span of one newc entry (header + padded name + padded data).
 fn entry_span(off: usize, name: &str, data_len: usize) -> (usize, usize) {
     let name_len = name.len() + 1;
@@ -305,8 +398,9 @@ pub fn build_boot_image(spec: &BootImageSpec) -> BootImage {
     // sizes before computing any archive offsets.
     let init_manifest_ph = build_init_manifest(spec, &layout, 0);
     let dm_manifest_ph = build_dm_manifest(spec, &layout, 0);
+    let posix_manifest_ph = build_posix_manifest(spec, &layout, 0);
 
-    // All five entries in order; each entry's span is
+    // All seven entries in order; each entry's span is
     // 110 (header) + padded name + padded data.
     let mut off = 0usize;
     let mut entry_offsets: Vec<(String, usize, usize)> = Vec::new();
@@ -320,24 +414,26 @@ pub fn build_boot_image(spec: &BootImageSpec) -> BootImage {
         place(crate::layout::INIT_MANIFEST_PATH, init_manifest_ph.len(), &mut off);
         place(crate::layout::DM_BIN_PATH, spec.dm_bin.len(), &mut off);
         place(crate::layout::DM_MANIFEST_PATH, dm_manifest_ph.len(), &mut off);
+        place(crate::layout::POSIX_BIN_PATH, spec.posix_bin.len(), &mut off);
+        place(crate::layout::POSIX_MANIFEST_PATH, posix_manifest_ph.len(), &mut off);
         let layout_size = layout_file_size();
         place(crate::layout::LAYOUT_PATH, layout_size, &mut off);
     }
 
-    // Rebuild both manifests with the truthful blob_offset (the image's
-    // archive offset — the same informational field the kernel's
-    // flat-package path documents; the footer kaddr is what it actually
-    // uses). Sizes are unchanged.
+    // Rebuild all manifests with the truthful blob_offset (the image's
+    // archive offset). Sizes are unchanged.
     let init_bin_off = entry_offsets[0].1 as u32;
     let dm_bin_off = entry_offsets[2].1 as u32;
+    let posix_bin_off = entry_offsets[4].1 as u32;
     let init_manifest = build_init_manifest(spec, &layout, init_bin_off);
     let dm_manifest = build_dm_manifest(spec, &layout, dm_bin_off);
+    let posix_manifest = build_posix_manifest(spec, &layout, posix_bin_off);
     debug_assert_eq!(init_manifest.len(), init_manifest_ph.len());
     debug_assert_eq!(dm_manifest.len(), dm_manifest_ph.len());
+    debug_assert_eq!(posix_manifest.len(), posix_manifest_ph.len());
 
     let layout_size = layout_file_size();
-    // All five entries, the layout file LAST: the first four become `file`
-    // lines and the fifth supplies this file's own offset.
+    // All seven entries, the layout file LAST.
     let layout_text = build_layout_file(&layout, &entry_offsets, layout_size);
     debug_assert_eq!(layout_text.len(), layout_size);
 
@@ -347,6 +443,8 @@ pub fn build_boot_image(spec: &BootImageSpec) -> BootImage {
     newc::write_entry(&mut archive, crate::layout::INIT_MANIFEST_PATH, &init_manifest);
     newc::write_entry(&mut archive, crate::layout::DM_BIN_PATH, &spec.dm_bin);
     newc::write_entry(&mut archive, crate::layout::DM_MANIFEST_PATH, &dm_manifest);
+    newc::write_entry(&mut archive, crate::layout::POSIX_BIN_PATH, &spec.posix_bin);
+    newc::write_entry(&mut archive, crate::layout::POSIX_MANIFEST_PATH, &posix_manifest);
     newc::write_entry(&mut archive, crate::layout::LAYOUT_PATH, layout_text.as_bytes());
     newc::finish(&mut archive);
 
@@ -364,7 +462,7 @@ pub fn build_boot_image(spec: &BootImageSpec) -> BootImage {
 fn layout_file_size() -> usize {
     let mut n = "AEROSLS-BOOT-LAYOUT 1\n".len();
     n += "base ".len() + 16 + 1;
-    for name in ["init.image", "init.heap", "dm.image", "dm.heap", "registry"] {
+    for name in ["init.image", "init.heap", "dm.image", "dm.heap", "posix.image", "posix.heap", "registry"] {
         n += "region ".len() + name.len() + 1 + 16 + 1 + 16 + 1;
     }
     for p in ENTRY_PATHS {
@@ -393,7 +491,7 @@ mod tests {
     }
 
     fn spec() -> BootImageSpec {
-        BootImageSpec::new(vec![0xAA; 0x2000], vec![0xBB; 0x4000])
+        BootImageSpec::new(vec![0xAA; 0x2000], vec![0xBB; 0x4000], vec![0xCC; 0x8000])
     }
 
     fn built() -> BootImage {
@@ -455,7 +553,7 @@ mod tests {
         // Manifest + layout entries parse as non-empty text/blobs.
         assert!(es[1].data.len() > 24);
         assert!(es[3].data.len() > 24);
-        assert!(es[4].data.starts_with(b"AEROSLS-BOOT-LAYOUT 1\n"));
+        assert!(es[6].data.starts_with(b"AEROSLS-BOOT-LAYOUT 1\n"));
         // The archive offsets recorded in entry_offsets match the parser's.
         let mut off = 0usize;
         for (i, e) in es.iter().enumerate() {
@@ -584,7 +682,7 @@ mod tests {
     #[test]
     fn layout_file_records_regions_and_files() {
         let b = built();
-        let text = String::from_utf8(b.archive_entry(ENTRY_PATHS[4])).unwrap();
+        let text = String::from_utf8(b.archive_entry(ENTRY_PATHS[6])).unwrap();
         let mut lines = text.lines();
         assert_eq!(lines.next(), Some("AEROSLS-BOOT-LAYOUT 1"));
         assert_eq!(lines.next().unwrap(), format!("base {:016x}", b.layout.base_phys));

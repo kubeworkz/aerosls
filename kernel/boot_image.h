@@ -61,6 +61,9 @@
 /* The DM's budget heap — matches dm_budget_base's 256 KiB in
  * user/init/src/dm_manifest.rs. */
 #define BOOT_DM_HEAP_BYTES          (256u * 1024u)
+/* The POSIX sidecar's budget heap — 4 MiB for VFS caches, process
+ * table, and applet scripts. */
+#define BOOT_POSIX_HEAP_BYTES       (4u * 1024u * 1024u)
 /* The device registry region: 4 + MAX_DEVICES(16) × 64 = 1028 bytes
  * (devreg.rs), rounded to one page. */
 #define BOOT_REGISTRY_BYTES         4096u
@@ -72,6 +75,8 @@
 #define BOOT_INIT_MANIFEST_PATH     "boot/init.manifest"
 #define BOOT_DM_BIN_PATH            "boot/dm.bin"
 #define BOOT_DM_MANIFEST_PATH       "boot/dm.manifest"
+#define BOOT_POSIX_BIN_PATH         "boot/posix.bin"
+#define BOOT_POSIX_MANIFEST_PATH    "boot/posix.manifest"
 #define BOOT_LAYOUT_PATH            "boot/layout"
 
 /* ─── boot/layout text format ───────────────────────────────────────────── */
@@ -81,12 +86,14 @@
  *
  *   AEROSLS-BOOT-LAYOUT 1
  *   base <phys>
- *   region <name> <phys> <size>         5 lines, memory order:
+ *   region <name> <phys> <size>         7 lines, memory order:
  *                                       init.image init.heap dm.image
- *                                       dm.heap registry
+ *                                       dm.heap posix.image posix.heap
+ *                                       registry
  *   file <path> <offset> <size>         one line per archive entry
  *                                       (init.bin init.manifest dm.bin
- *                                       dm.manifest boot/layout)
+ *                                       dm.manifest posix.bin
+ *                                       posix.manifest boot/layout)
  *
  * The loader may walk the CPIO by name instead of parsing this file; the
  * file exists so the loader can verify its region computation and so a

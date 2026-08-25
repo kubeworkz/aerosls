@@ -1,12 +1,12 @@
 //! CLI for the Phase 5 boot-image builder.
 //!
 //! ```text
-//! aerosls-bootimage --init <init.bin> --dm <dm.bin> -o sidecars.cpio
+//! aerosls-bootimage --init <init.bin> --dm <dm.bin> --posix <posix.bin> -o sidecars.cpio
 //! aerosls-bootimage flatten --input <init.elf> --output <init.bin>
 //! ```
 //!
-//! The first form reads the two flat sidecar binaries, computes the
-//! physical layout, packs both manifests, and writes the `newc` initrd
+//! The first form reads the three flat sidecar binaries, computes the
+//! physical layout, packs all manifests, and writes the `newc` initrd
 //! archive. The layout (every image's declared physical address) is
 //! printed to stderr and embedded in the archive as `boot/layout`.
 //!
@@ -21,10 +21,8 @@ use std::path::PathBuf;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: aerosls-bootimage --init <init.bin> --dm <dm.bin> -o sidecars.cpio \
-         [--init-entry <off>] [--dm-entry <off>] [--base-phys <addr>]\n\n\
-         aerosls-bootimage flatten --input <init.elf> --output <init.bin> \
-         [--load-vaddr <hex>]  (default 0x400000000000 = USER_PROC_CODE_BASE)"
+        "usage: aerosls-bootimage --init <init.bin> --dm <dm.bin> --posix <posix.bin> -o sidecars.cpio \\\n         [--init-entry <off>] [--dm-entry <off>] [--posix-entry <off>] [--base-phys <addr>]\n\n\
+         aerosls-bootimage flatten --input <init.elf> --output <init.bin> \n         [--load-vaddr <hex>]  (default 0x400000000000 = USER_PROC_CODE_BASE)"
     );
     std::process::exit(2);
 }
@@ -96,9 +94,11 @@ fn cmd_flatten(mut args: impl Iterator<Item = String>) {
 fn cmd_build(mut args: impl Iterator<Item = String>) {
     let mut init = None;
     let mut dm = None;
+    let mut posix = None;
     let mut out = None;
     let mut init_entry = 0u64;
     let mut dm_entry = 0u64;
+    let mut posix_entry = 0u64;
     let mut base_phys = None;
 
     while let Some(a) = args.next() {
@@ -109,9 +109,11 @@ fn cmd_build(mut args: impl Iterator<Item = String>) {
         match a.as_str() {
             "--init" => init = Some(PathBuf::from(next())),
             "--dm" => dm = Some(PathBuf::from(next())),
+            "--posix" => posix = Some(PathBuf::from(next())),
             "-o" | "--output" => out = Some(PathBuf::from(next())),
             "--init-entry" => init_entry = parse_hex(&next(), &a),
             "--dm-entry" => dm_entry = parse_hex(&next(), &a),
+            "--posix-entry" => posix_entry = parse_hex(&next(), &a),
             "--base-phys" => base_phys = Some(parse_hex(&next(), &a)),
             "-h" | "--help" => usage(),
             other => {
@@ -121,8 +123,8 @@ fn cmd_build(mut args: impl Iterator<Item = String>) {
         }
     }
 
-    let (init_path, dm_path, out_path) = match (init, dm, out) {
-        (Some(i), Some(d), Some(o)) => (i, d, o),
+    let (init_path, dm_path, posix_path, out_path) = match (init, dm, posix, out) {
+        (Some(i), Some(d), Some(p), Some(o)) => (i, d, p, o),
         _ => usage(),
     };
 
@@ -130,10 +132,13 @@ fn cmd_build(mut args: impl Iterator<Item = String>) {
         .unwrap_or_else(|e| panic!("read {}: {e}", init_path.display()));
     let dm_bin = std::fs::read(&dm_path)
         .unwrap_or_else(|e| panic!("read {}: {e}", dm_path.display()));
+    let posix_bin = std::fs::read(&posix_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", posix_path.display()));
 
-    let mut spec = BootImageSpec::new(init_bin, dm_bin);
+    let mut spec = BootImageSpec::new(init_bin, dm_bin, posix_bin);
     spec.init_entry = init_entry;
     spec.dm_entry = dm_entry;
+    spec.posix_entry = posix_entry;
     if let Some(b) = base_phys {
         spec.base_phys = b;
     }
@@ -155,6 +160,7 @@ fn cmd_build(mut args: impl Iterator<Item = String>) {
     );
     eprintln!("[BOOTIMAGE]   init manifest -> boot/init.manifest (image @ 0x{:x})", image.layout.init_image.phys);
     eprintln!("[BOOTIMAGE]   dm   manifest -> boot/dm.manifest   (image @ 0x{:x})", image.layout.dm_image.phys);
+    eprintln!("[BOOTIMAGE]   posix manifest -> boot/posix.manifest (image @ 0x{:x})", image.layout.posix_image.phys);
 }
 
 fn parse_hex(s: &str, arg: &str) -> u64 {

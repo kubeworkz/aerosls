@@ -15,11 +15,16 @@ aerosls-procmgr = { path = "../procmgr" }
 aerosls-kernel-sim = { path = "../kernel-sim" }
 aerosls-ramdisk = { path = "../ramdisk" }
 
-# The `target` feature selects the real kernel ABI (extern "C" syscalls, via
-# aerosls_proto::kabi::RealKernel) and the sidecar entry point. The default
-# (host) build omits them so the crate links cleanly into the test harness.
-# Build the sidecar image with: cargo build -p aerosls-sidecar --features target
+[[bin]]
+name = "posix"
+path = "src/bin/posix.rs"
+required-features = ["target"]
+
 [features]
 default = []
-# `target` also enables the real kernel ABI in aerosls-proto.
+# `target` enables the real kernel ABI (extern "C" syscalls), the sidecar
+# entry point (rust_entry), the crt0 (crt0.S via global_asm!), and the
+# panic handler. Build the sidecar image with:
+#   cargo build -p aerosls-sidecar --features target \
+#       --target x86_64-unknown-none --release --bin posix
 target = ["aerosls-proto/target"]

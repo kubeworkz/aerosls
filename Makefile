@@ -889,19 +889,21 @@ user-programs: $(USER_BINS)
 # independently by the crate's golden tests:
 #   cargo test -p aerosls-bootimage (user/Cargo.toml).
 CARGO            ?= cargo
-SIDECAR_INIT_ELF ?= user/target/x86_64-unknown-none/release/init
-SIDECAR_DM_ELF   ?= user/target/x86_64-unknown-none/release/dm
-SIDECAR_INIT_BIN ?= user/target/x86_64-unknown-none/release/init.bin
-SIDECAR_DM_BIN   ?= user/target/x86_64-unknown-none/release/dm.bin
-SIDECAR_CPIO     ?= sidecars.cpio
+SIDECAR_INIT_ELF   ?= user/target/x86_64-unknown-none/release/init
+SIDECAR_DM_ELF     ?= user/target/x86_64-unknown-none/release/dm
+SIDECAR_POSIX_ELF ?= user/target/x86_64-unknown-none/release/posix
+SIDECAR_INIT_BIN   ?= user/target/x86_64-unknown-none/release/init.bin
+SIDECAR_DM_BIN     ?= user/target/x86_64-unknown-none/release/dm.bin
+SIDECAR_POSIX_BIN ?= user/target/x86_64-unknown-none/release/posix.bin
+SIDECAR_CPIO       ?= sidecars.cpio
 
 .PHONY: selfhost-bootimage
 selfhost-bootimage:
-	@echo "[SELFHOST] building the init + Device Manager sidecars for x86_64-unknown-none..."
-	@$(CARGO) build --manifest-path user/Cargo.toml -p aerosls-init -p aerosls-dm \
+	@echo "[SELFHOST] building the init + Device Manager + POSIX sidecars for x86_64-unknown-none..."
+	@$(CARGO) build --manifest-path user/Cargo.toml -p aerosls-init -p aerosls-dm -p aerosls-sidecar \
 		--features target --target x86_64-unknown-none --release \
-		--bin init --bin dm 2>/dev/null \
-		|| echo "[SELFHOST] warning: x86_64-unknown-none target not installed; using SIDECAR_INIT_BIN/SIDECAR_DM_BIN as-is"
+		--bin init --bin dm --bin posix 2>/dev/null \
+		|| echo "[SELFHOST] warning: x86_64-unknown-none target not installed; using existing binaries"
 	@if [ -s "$(SIDECAR_INIT_ELF)" ]; then \
 		$(CARGO) run --quiet --manifest-path user/Cargo.toml -p aerosls-bootimage -- \
 			flatten --input "$(SIDECAR_INIT_ELF)" --output "$(SIDECAR_INIT_BIN)" \
@@ -912,12 +914,18 @@ selfhost-bootimage:
 			flatten --input "$(SIDECAR_DM_ELF)" --output "$(SIDECAR_DM_BIN)" \
 			--load-vaddr 0x400000000000; \
 	fi
+	@if [ -s "$(SIDECAR_POSIX_ELF)" ]; then \
+		$(CARGO) run --quiet --manifest-path user/Cargo.toml -p aerosls-bootimage -- \
+			flatten --input "$(SIDECAR_POSIX_ELF)" --output "$(SIDECAR_POSIX_BIN)" \
+			--load-vaddr 0x400000000000; \
+	fi
 	@test -s "$(SIDECAR_INIT_BIN)" \
 		|| { echo "[SELFHOST] missing init binary: $(SIDECAR_INIT_BIN)"; echo "           build it with the cross target (see user/README.md) or set SIDECAR_INIT_BIN="; exit 1; }
 	@test -s "$(SIDECAR_DM_BIN)" \
 		|| { echo "[SELFHOST] missing DM binary: $(SIDECAR_DM_BIN)"; echo "           build it with the cross target (see user/README.md) or set SIDECAR_DM_BIN="; exit 1; }
 	$(CARGO) run --quiet --manifest-path user/Cargo.toml -p aerosls-bootimage -- \
-		--init "$(SIDECAR_INIT_BIN)" --dm "$(SIDECAR_DM_BIN)" -o "$(SIDECAR_CPIO)"
+		--init "$(SIDECAR_INIT_BIN)" --dm "$(SIDECAR_DM_BIN)" \
+		--posix "$(SIDECAR_POSIX_BIN)" -o "$(SIDECAR_CPIO)"
 	@echo "[SELFHOST] boot image: $(SIDECAR_CPIO) (load as an initrd at the bootloader's module path)"
 
 # ── SIMI host toolchain ─────────────────────────────────────────────────────
