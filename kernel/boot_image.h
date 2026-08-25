@@ -158,10 +158,12 @@ struct BootDeviceEntry {
 struct BootImageInfo {
     uint64_t init_kaddr, init_size;
     uint64_t dm_kaddr,   dm_size;
+    uint64_t posix_kaddr, posix_size;
     uint64_t reg_kaddr,  reg_size;
     uint64_t boot_base,  boot_total;
     uint32_t init_bin_off, init_bin_len;   /* archive offsets of the images */
     uint32_t dm_bin_off,   dm_bin_len;
+    uint32_t posix_bin_off, posix_bin_len;
 };
 
 /* boot_image.c error codes (returned by the pure core; the glue logs and

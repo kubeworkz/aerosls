@@ -17,6 +17,7 @@ use crate::demo::{self, DM_READY_DEADLINE_NS, DM_READY_RETRIES};
 use crate::devreg::DeviceRegistry;
 use crate::dm_manifest::{self, DmImage};
 use crate::heap::Bump;
+use crate::posix_manifest;
 use aerosls_proto::bootinfo::BootInfo;
 use aerosls_proto::kabi::{Kernel, RealKernel, SendCap, CAP_CHAN_W, CAP_MEM, CAP_NONE};
 

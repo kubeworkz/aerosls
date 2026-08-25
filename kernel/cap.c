@@ -3029,7 +3029,7 @@ int cap_create_sidecar(uint32_t parent_pid,
     if (!bib_paddr) return CAP_ENOMEM;
 
     /* Build the BIB in kernel memory (static, 256 bytes max). */
-    static uint8_t bib_buf[256];
+    static uint8_t bib_buf[512];
     uint32_t bib_off = 0;
 
     /* Header: magic(8) + version(2) + cap_count(2) + budget(8) +

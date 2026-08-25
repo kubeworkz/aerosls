@@ -15,7 +15,12 @@
 #include "../arch/x86/multiboot2.h"
 #include "../arch/x86/user_paging.h"   /* per_cpu_data */
 #include <stdint.h>
-#include <string.h>
+
+/* Freestanding string primitives (implemented in kernel/stubs.c). */
+extern void* memcpy(void* dst, const void* src, unsigned long n);
+extern void* memset(void* dst, int val, unsigned long n);
+extern int   memcmp(const void* a, const void* b, unsigned long n);
+extern unsigned long strlen(const char* s);
 
 /* ═══ PURE CORE ═════════════════════════════════════════════════════════ */
 
@@ -106,6 +111,7 @@ struct BootManifestInfo {
     uint64_t init_kaddr;
     uint32_t init_size;
     uint64_t dm_kaddr, dm_size;
+    uint64_t posix_kaddr, posix_size;
     uint64_t reg_kaddr, reg_size;
 };
 
@@ -149,6 +155,9 @@ static int boot_manifest_read(const uint8_t* blob, uint32_t len,
             if (nlen == 8 && memcmp(n, "dm.image", 8) == 0) {
                 m->dm_kaddr = boot_le64(rp + 2 + nlen);
                 m->dm_size  = boot_le64(rp + 2 + nlen + 8);
+            } else if (nlen == 11 && memcmp(n, "posix.image", 11) == 0) {
+                m->posix_kaddr = boot_le64(rp + 2 + nlen);
+                m->posix_size  = boot_le64(rp + 2 + nlen + 8);
             } else if (nlen == 15 && memcmp(n, "device_registry", 15) == 0) {
                 m->reg_kaddr = boot_le64(rp + 2 + nlen);
                 m->reg_size  = boot_le64(rp + 2 + nlen + 8);
@@ -188,16 +197,18 @@ int boot_image_parse(const uint8_t* archive, uint32_t archive_len,
     r = boot_manifest_read(manifest_out, msize, &mi);
     if (r != 0) return r;
 
-    uint32_t ioff, isize, doff, dsize;
+    uint32_t ioff, isize, doff, dsize, poff, psize;
     r = boot_newc_find(archive, archive_len, BOOT_INIT_BIN_PATH, &ioff, &isize);
     if (r != 0) return BOOT_ERR_NOIMAGE;
     r = boot_newc_find(archive, archive_len, BOOT_DM_BIN_PATH, &doff, &dsize);
+    if (r != 0) return BOOT_ERR_NOIMAGE;
+    r = boot_newc_find(archive, archive_len, BOOT_POSIX_BIN_PATH, &poff, &psize);
     if (r != 0) return BOOT_ERR_NOIMAGE;
 
     /* Cross-checks: the archive's image bytes must be exactly what the
      * manifest declares — a mismatch means a rebuilt sidecar without a
      * rebuilt manifest, which must be refused, not half-applied. */
-    if (mi.init_size != isize || mi.dm_size != dsize) return BOOT_ERR_MISMATCH;
+    if (mi.init_size != isize || mi.dm_size != dsize || mi.posix_size != psize) return BOOT_ERR_MISMATCH;
 
     /* The boot-image span [init kaddr, registry end) must live inside the
      * 4 GiB identity map (cap_create_mem's bound). */
@@ -209,6 +220,8 @@ int boot_image_parse(const uint8_t* archive, uint32_t archive_len,
     info->init_size  = isize;
     info->dm_kaddr   = mi.dm_kaddr;
     info->dm_size    = dsize;
+    info->posix_kaddr = mi.posix_kaddr;
+    info->posix_size  = psize;
     info->reg_kaddr  = mi.reg_kaddr;
     info->reg_size   = mi.reg_size;
     info->boot_base  = mi.init_kaddr;
@@ -217,11 +230,15 @@ int boot_image_parse(const uint8_t* archive, uint32_t archive_len,
     info->init_bin_len = isize;
     info->dm_bin_off   = doff;
     info->dm_bin_len   = dsize;
+    info->posix_bin_off = poff;
+    info->posix_bin_len = psize;
 
     /* Sanity: the DM image and registry sit inside the reserved span
      * (contiguous by the builder's construction). */
     if (info->dm_kaddr < info->boot_base ||
         info->dm_kaddr + info->dm_size > info->boot_base + info->boot_total ||
+        info->posix_kaddr < info->boot_base ||
+        info->posix_kaddr + info->posix_size > info->boot_base + info->boot_total ||
         info->reg_kaddr < info->boot_base ||
         info->reg_kaddr + info->reg_size > info->boot_base + info->boot_total)
         return BOOT_ERR_RANGE;
@@ -346,12 +363,11 @@ void launch_init_sidecar(void) {
     }
     kernel_serial_printf(
         "[SIDECAR] boot image: init @0x%llx (%llu B) dm @0x%llx (%llu B) "
-        "registry @0x%llx (%llu B) — span 0x%llx..0x%llx\n",
+        "posix @0x%llx (%llu B) registry @0x%llx (%llu B)\n",
         (unsigned long long)info.init_kaddr, (unsigned long long)info.init_size,
         (unsigned long long)info.dm_kaddr,   (unsigned long long)info.dm_size,
-        (unsigned long long)info.reg_kaddr,  (unsigned long long)info.reg_size,
-        (unsigned long long)info.boot_base,
-        (unsigned long long)(info.boot_base + info.boot_total));
+        (unsigned long long)info.posix_kaddr, (unsigned long long)info.posix_size,
+        (unsigned long long)info.reg_kaddr,  (unsigned long long)info.reg_size);
 
     /* 1. Reserve the whole boot-image span before anything can allocate it
      *    (the heaps and registry are inside it; cap_create_mem refuses any
@@ -367,6 +383,8 @@ void launch_init_sidecar(void) {
            info.init_bin_len);
     memcpy((void*)(uintptr_t)info.dm_kaddr, archive + info.dm_bin_off,
            info.dm_bin_len);
+    memcpy((void*)(uintptr_t)info.posix_kaddr, archive + info.posix_bin_off,
+           info.posix_bin_len);
 
     /* 3. Build the device registry (devreg.rs wire format) at the address
      *    the init manifest's device_registry cap declares. */
