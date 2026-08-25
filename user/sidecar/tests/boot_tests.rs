@@ -105,7 +105,7 @@ fn boot_mounts_and_runs_init() {
 
     // The sim's client table: no budget/console caps; the ramdisk endpoint
     // is the first wired handle (0).
-    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let caps = BootCaps::new(0, 0, 0, None, Some(0), None);
     let console = Arc::new(CharNode::console());
     let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
         .expect("boot");
@@ -197,7 +197,7 @@ fn boot_runs_an_interactive_shell() {
     let (fake, client) = FakeKernel::new(b.build(), 1);
     let t = boot_driver(fake);
 
-    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let caps = BootCaps::new(0, 0, 0, None, Some(0), None);
     let console = Arc::new(CharNode::console());
     let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
         .expect("boot");
@@ -726,15 +726,13 @@ fn from_bib_resolves_initial_caps() {
     assert_eq!(caps.budget_base, 0x1000_0000);
     assert_eq!(caps.budget_len, 0x100_0000);
     assert_eq!(caps.console_chan, Some(1));
-    assert_eq!(caps.ramdisk_chan, 2);
+    assert_eq!(caps.ramdisk_chan, Some(2));
 
-    // A BIB missing the ramdisk channel must fail loudly.
+    // A BIB missing the ramdisk channel is valid (console-only mode).
     let bib = build_bib(&[("budget", CAP_MEM, 0x3, 0x1000_0000, 0x100_0000, 0)]);
     let info = unsafe { BootInfo::from_raw(bib.as_ptr()) }.unwrap();
-    assert_eq!(
-        BootCaps::from_bib(&info),
-        Err(aerosls_sidecar::BootErr::MissingCap("ramdisk"))
-    );
+    let caps_no_rd = BootCaps::from_bib(&info).unwrap();
+    assert_eq!(caps_no_rd.ramdisk_chan, None);
 }
 
 /// The manifest and the BIB are the same contract in two formats: the
@@ -847,7 +845,7 @@ fn manifest_names_line_up_with_bib_caps() {
     let caps = BootCaps::from_bib(&info).unwrap();
     assert_eq!(caps.budget_slot, 0);
     assert_eq!(caps.console_chan, Some(1));
-    assert_eq!(caps.ramdisk_chan, 2);
+    assert_eq!(caps.ramdisk_chan, Some(2));
     let _ = MAX_MANIFEST_CAPS;
 }
 
@@ -955,7 +953,7 @@ fn nc_applet_exercises_full_lifecycle() {
     let (fake, client) = FakeKernel::new(b.build(), 1);
     let t = boot_driver(fake);
 
-    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let caps = BootCaps::new(0, 0, 0, None, Some(0), None);
     let console = Arc::new(CharNode::console());
     let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
         .expect("boot");
@@ -1079,7 +1077,7 @@ fn nc_listen_mode_exercises_bind_listen_accept() {
     let (fake, client) = FakeKernel::new(b.build(), 1);
     let t = boot_driver(fake);
 
-    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let caps = BootCaps::new(0, 0, 0, None, Some(0), None);
     let console = Arc::new(CharNode::console());
     let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
         .expect("boot");
@@ -1195,7 +1193,7 @@ fn nc_udp_client_exercises_dgram_lifecycle() {
     let (fake, client) = FakeKernel::new(b.build(), 1);
     let t = boot_driver(fake);
 
-    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let caps = BootCaps::new(0, 0, 0, None, Some(0), None);
     let console = Arc::new(CharNode::console());
     let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
         .expect("boot");
@@ -1402,7 +1400,7 @@ fn nc_loopback_client_server() {
         b.add_file("/etc/init.rc", b"/bin/nc -l 9090\n", 0o644);
         let (fake, client) = FakeKernel::new(b.build(), 1);
         let t = boot_driver(fake);
-        let caps = BootCaps::new(0, 0, 0, None, 0, None);
+        let caps = BootCaps::new(0, 0, 0, None, Some(0), None);
         let console = Arc::new(CharNode::console());
         let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
             .expect("server boot");
@@ -1424,7 +1422,7 @@ fn nc_loopback_client_server() {
         b.add_file("/etc/init.rc", b"/bin/nc 127.0.0.1 9090\n", 0o644);
         let (fake, client) = FakeKernel::new(b.build(), 1);
         let t = boot_driver(fake);
-        let caps = BootCaps::new(0, 0, 0, None, 0, None);
+        let caps = BootCaps::new(0, 0, 0, None, Some(0), None);
         let console = Arc::new(CharNode::console());
         let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
             .expect("client boot");
@@ -1469,7 +1467,7 @@ fn cloexec_prevents_pipe_fd_leak_in_pipeline() {
     let (fake, client) = FakeKernel::new(b.build(), 1);
     let t = boot_driver(fake);
 
-    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let caps = BootCaps::new(0, 0, 0, None, Some(0), None);
     let console = Arc::new(CharNode::console());
     let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
         .expect("boot");
@@ -1545,7 +1543,7 @@ fn sh_cd_pwd_changes_working_directory() {
     b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
     let (fake, client) = FakeKernel::new(b.build(), 1);
     let t = boot_driver(fake);
-    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let caps = BootCaps::new(0, 0, 0, None, Some(0), None);
     let console = Arc::new(CharNode::console());
     let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
         .expect("boot");
@@ -1601,7 +1599,7 @@ fn sh_export_persists_env_through_pipeline() {
     b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
     let (fake, client) = FakeKernel::new(b.build(), 1);
     let t = boot_driver(fake);
-    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let caps = BootCaps::new(0, 0, 0, None, Some(0), None);
     let console = Arc::new(CharNode::console());
     let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
         .expect("boot");
@@ -1643,7 +1641,7 @@ fn sh_background_jobs_fg_and_jobs_builtins() {
     b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
     let (fake, client) = FakeKernel::new(b.build(), 1);
     let t = boot_driver(fake);
-    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let caps = BootCaps::new(0, 0, 0, None, Some(0), None);
     let console = Arc::new(CharNode::console());
     let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
         .expect("boot");
@@ -1690,7 +1688,7 @@ fn sh_multiple_background_jobs() {
     b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
     let (fake, client) = FakeKernel::new(b.build(), 1);
     let t = boot_driver(fake);
-    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let caps = BootCaps::new(0, 0, 0, None, Some(0), None);
     let console = Arc::new(CharNode::console());
     let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
         .expect("boot");
@@ -1740,7 +1738,7 @@ fn sh_sleep_background_does_not_block_foreground() {
     b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
     let (fake, client) = FakeKernel::new(b.build(), 1);
     let t = boot_driver(fake);
-    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let caps = BootCaps::new(0, 0, 0, None, Some(0), None);
     let console = Arc::new(CharNode::console());
     let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
         .expect("boot");
@@ -1783,7 +1781,7 @@ fn fg_times_out_on_stuck_background_job() {
     b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
     let (fake, client) = FakeKernel::new(b.build(), 1);
     let t = boot_driver(fake);
-    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let caps = BootCaps::new(0, 0, 0, None, Some(0), None);
     let console = Arc::new(CharNode::console());
     let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
         .expect("boot");
@@ -1826,7 +1824,7 @@ fn sigint_kills_foreground_not_background() {
     b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
     let (fake, client) = FakeKernel::new(b.build(), 1);
     let t = boot_driver(fake);
-    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let caps = BootCaps::new(0, 0, 0, None, Some(0), None);
     let console = Arc::new(CharNode::console());
     let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
         .expect("boot");
@@ -1876,7 +1874,7 @@ fn fg_percent_number_targets_specific_job() {
     b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
     let (fake, client) = FakeKernel::new(b.build(), 1);
     let t = boot_driver(fake);
-    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let caps = BootCaps::new(0, 0, 0, None, Some(0), None);
     let console = Arc::new(CharNode::console());
     let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
         .expect("boot");
@@ -1922,7 +1920,7 @@ fn bg_builtin_lists_background_job() {
     b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
     let (fake, client) = FakeKernel::new(b.build(), 1);
     let t = boot_driver(fake);
-    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let caps = BootCaps::new(0, 0, 0, None, Some(0), None);
     let console = Arc::new(CharNode::console());
     let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
         .expect("boot");
@@ -1978,7 +1976,7 @@ fn timeout_kills_long_command_and_returns_124() {
     b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
     let (fake, client) = FakeKernel::new(b.build(), 1);
     let t = boot_driver(fake);
-    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let caps = BootCaps::new(0, 0, 0, None, Some(0), None);
     let console = Arc::new(CharNode::console());
     let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
         .expect("boot");
@@ -2007,7 +2005,7 @@ fn timeout_succeeds_when_command_finishes_early() {
     b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
     let (fake, client) = FakeKernel::new(b.build(), 1);
     let t = boot_driver(fake);
-    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let caps = BootCaps::new(0, 0, 0, None, Some(0), None);
     let console = Arc::new(CharNode::console());
     let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
         .expect("boot");
@@ -2037,7 +2035,7 @@ fn timeout_no_command_returns_124() {
     b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
     let (fake, client) = FakeKernel::new(b.build(), 1);
     let t = boot_driver(fake);
-    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let caps = BootCaps::new(0, 0, 0, None, Some(0), None);
     let console = Arc::new(CharNode::console());
     let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
         .expect("boot");
@@ -2067,7 +2065,7 @@ fn ctrlz_suspend_and_fg_bg_resume() {
     b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
     let (fake, client) = FakeKernel::new(b.build(), 1);
     let t = boot_driver(fake);
-    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let caps = BootCaps::new(0, 0, 0, None, Some(0), None);
     let console = Arc::new(CharNode::console());
     let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
         .expect("boot");
@@ -2115,7 +2113,7 @@ fn bg_sends_sigcont_to_stopped_job() {
     b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
     let (fake, client) = FakeKernel::new(b.build(), 1);
     let t = boot_driver(fake);
-    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let caps = BootCaps::new(0, 0, 0, None, Some(0), None);
     let console = Arc::new(CharNode::console());
     let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
         .expect("boot");
@@ -2158,7 +2156,7 @@ fn ctrlz_then_bg_resumes_foreground_job() {
     b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
     let (fake, client) = FakeKernel::new(b.build(), 1);
     let t = boot_driver(fake);
-    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let caps = BootCaps::new(0, 0, 0, None, Some(0), None);
     let console = Arc::new(CharNode::console());
     let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
         .expect("boot");
@@ -2230,7 +2228,7 @@ fn timeout_kills_long_sleep() {
     b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
     let (fake, client) = FakeKernel::new(b.build(), 1);
     let t = boot_driver(fake);
-    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let caps = BootCaps::new(0, 0, 0, None, Some(0), None);
     let console = Arc::new(CharNode::console());
     let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
         .expect("boot");
@@ -2265,7 +2263,7 @@ fn timeout_expiry_during_stopped_job() {
     b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
     let (fake, client) = FakeKernel::new(b.build(), 1);
     let t = boot_driver(fake);
-    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let caps = BootCaps::new(0, 0, 0, None, Some(0), None);
     let console = Arc::new(CharNode::console());
     let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
         .expect("boot");
@@ -2308,7 +2306,7 @@ fn ctrlquit_kills_foreground_pipeline() {
     b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
     let (fake, client) = FakeKernel::new(b.build(), 1);
     let t = boot_driver(fake);
-    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let caps = BootCaps::new(0, 0, 0, None, Some(0), None);
     let console = Arc::new(CharNode::console());
     let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
         .expect("boot");
@@ -2355,7 +2353,7 @@ fn sigquit_kills_writer_reader_sees_eof() {
     b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
     let (fake, client) = FakeKernel::new(b.build(), 1);
     let t = boot_driver(fake);
-    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let caps = BootCaps::new(0, 0, 0, None, Some(0), None);
     let console = Arc::new(CharNode::console());
     let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
         .expect("boot");
@@ -2403,7 +2401,7 @@ fn ctrl_c_kills_three_stage_pipeline() {
     b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
     let (fake, client) = FakeKernel::new(b.build(), 1);
     let t = boot_driver(fake);
-    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let caps = BootCaps::new(0, 0, 0, None, Some(0), None);
     let console = Arc::new(CharNode::console());
     let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
         .expect("boot");
@@ -2449,7 +2447,7 @@ fn background_job_survives_ctrl_c() {
     b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
     let (fake, client) = FakeKernel::new(b.build(), 1);
     let t = boot_driver(fake);
-    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let caps = BootCaps::new(0, 0, 0, None, Some(0), None);
     let console = Arc::new(CharNode::console());
     let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
         .expect("boot");
@@ -2500,7 +2498,7 @@ fn last_exit_status_in_dollar_question() {
     b.add_file("/etc/init.rc", b"/bin/sh\n", 0o644);
     let (fake, client) = FakeKernel::new(b.build(), 1);
     let t = boot_driver(fake);
-    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let caps = BootCaps::new(0, 0, 0, None, Some(0), None);
     let console = Arc::new(CharNode::console());
     let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
         .expect("boot");
@@ -2550,7 +2548,7 @@ fn ctrl_c_kills_init_script_line() {
     b.add_file("/etc/init.rc", b"/bin/sleep 999\n/bin/echo done\n", 0o644);
     let (fake, client) = FakeKernel::new(b.build(), 1);
     let t = boot_driver(fake);
-    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let caps = BootCaps::new(0, 0, 0, None, Some(0), None);
     let console = Arc::new(CharNode::console());
     let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
         .expect("boot");
@@ -2583,7 +2581,7 @@ fn shell_works_after_pty_addition() {
     let (fake, client) = FakeKernel::new(b.build(), 1);
     let t = boot_driver(fake);
 
-    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let caps = BootCaps::new(0, 0, 0, None, Some(0), None);
     let console = Arc::new(CharNode::console());
     let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
         .expect("boot");
@@ -2612,7 +2610,7 @@ fn forkpty_child_writes_to_master() {
     let (fake, client) = FakeKernel::new(b.build(), 1);
     let t = boot_driver(fake);
 
-    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let caps = BootCaps::new(0, 0, 0, None, Some(0), None);
     let console = Arc::new(CharNode::console());
     let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
         .expect("boot");
@@ -2642,7 +2640,7 @@ fn unix_socket_echo_roundtrip() {
     let (fake, client) = FakeKernel::new(b.build(), 1);
     let t = boot_driver(fake);
 
-    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let caps = BootCaps::new(0, 0, 0, None, Some(0), None);
     let console = Arc::new(CharNode::console());
     let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
         .expect("boot");
@@ -2678,7 +2676,7 @@ fn coreutils_lifecycle() {
     let (fake, client) = FakeKernel::new(b.build(), 1);
     let t = boot_driver(fake);
 
-    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let caps = BootCaps::new(0, 0, 0, None, Some(0), None);
     let console = Arc::new(CharNode::console());
     let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
         .expect("boot");
@@ -2895,7 +2893,7 @@ fn sshd_handshake_and_pty_relay() {
     let (fake, client) = FakeKernel::new(b.build(), 1);
     let t = boot_driver(fake);
 
-    let caps = BootCaps::new(0, 0, 0, None, 0, None);
+    let caps = BootCaps::new(0, 0, 0, None, Some(0), None);
     let console = Arc::new(CharNode::console());
     let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
         .expect("boot");

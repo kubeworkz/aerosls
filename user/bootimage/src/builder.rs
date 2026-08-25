@@ -105,14 +105,7 @@ fn build_init_manifest(spec: &BootImageSpec, layout: &BootLayout, blob_offset: u
                 size: spec.posix_bin.len() as u64,
             },
         }),
-        Some(ManifestCap {
-            name: "posix.heap",
-            rights: 0x3, // R | W — POSIX sidecar budget
-            kind: CapKind::Mem {
-                base: layout.posix_heap.phys,
-                size: spec.posix_heap_bytes,
-            },
-        }),
+        None, // posix.heap — NOT needed by init; the POSIX sidecar's own manifest provides its budget
         None,
         None,
         None,
@@ -152,7 +145,7 @@ fn build_init_manifest(spec: &BootImageSpec, layout: &BootLayout, blob_offset: u
             chan_queue_depth: 16,
         }),
         caps,
-        n_caps: 6,
+        n_caps: 5,
         bootstrap: Some(Bootstrap {
             console: Some("console"),
             debug: None,

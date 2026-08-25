@@ -313,16 +313,17 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         .find_cap(CAP_MEM, "posix.image")
         .expect("[INIT] missing 'posix.image' MEM cap");
 
-    let posix_heap_cap = bib
-        .find_cap(CAP_MEM, "posix.heap")
-        .expect("[INIT] missing 'posix.heap' MEM cap");
+    // posix.heap is NOT in init's manifest (avoids MEM overlap with
+    // the POSIX sidecar's own budget cap).  Compute its base from the
+    // image cap: heap sits immediately after the image, page-aligned.
+    let posix_heap_base = (posix_image_cap.base + posix_image_cap.len + 4095) & !4095u64;
+    log_fmt!(&console, "[INIT]   posix.heap computed @ 0x{:x}", posix_heap_base);
 
-    // The POSIX sidecar's manifest (pre-packed in the CPIO as
-    // boot/posix.manifest) declares budget + console caps. Init calls
-    // k_create_sidecar with a repacked manifest whose budget base points
-    // at posix.heap — the DM wires additional channels (VFS, network)
-    // after the POSIX sidecar is up.
-    spawn_posix_sidecar(&console, posix_image_cap, posix_heap_cap);
+    // The POSIX sidecar's manifest declares budget + console caps. Init
+    // calls k_create_sidecar with a repacked manifest whose budget base
+    // points at the computed heap — the DM wires additional channels
+    // (VFS, network) after the POSIX sidecar is up.
+    spawn_posix_sidecar(&console, posix_image_cap, posix_heap_base);
 
     log(&console, "[INIT] ── Phase 5 init sidecar complete ──");
     log(&console, "[INIT] system ready for POSIX sidecar creation.");
@@ -404,14 +405,12 @@ fn spawn_device_manager(
 }
 
 /// Spawn the POSIX sidecar through the real kernel path (`SYS_SLS_CREATE_SIDECAR`).
-/// The POSIX binary and budget heap addresses come from the boot image's
-/// pre-packed manifest caps (posix.image, posix.heap). This creates a FRESH
-/// POSIX process with budget + console wired; the Device Manager subsequently
-/// connects VFS/network channels.
+/// The POSIX binary address comes from the boot image's `posix.image` MEM cap;
+/// the budget heap base is computed from the image cap (page-aligned after image).
 fn spawn_posix_sidecar(
     console: &InitChannel<RealKernel>,
     image_cap: &aerosls_proto::bootinfo::BootCap<'_>,
-    heap_cap: &aerosls_proto::bootinfo::BootCap<'_>,
+    heap_base: u64,
 ) {
     log_fmt!(
         console,
@@ -423,7 +422,7 @@ fn spawn_posix_sidecar(
     let manifest = posix_manifest::build_posix_manifest(
         image_cap.base,
         image_cap.len as u32,
-        heap_cap.base,
+        heap_base,
     );
     let (r, w) = RealKernel
         .create_sidecar(&manifest)

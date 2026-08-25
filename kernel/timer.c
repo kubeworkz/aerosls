@@ -3,6 +3,7 @@
 #include "../arch/x86/lapic.h"
 #include "net_event.h"
 #include "cap.h"   /* Phase 5: cap_park_deadline_tick (weak default / process.c override) */
+#include "console_service.h"  /* BSP console drain when AP is offline */
 
 volatile uint64_t kernel_tick_counter = 0;
 
@@ -21,6 +22,11 @@ void timer_irq_handler(void) {
      * there is no cross-CPU race (unlike the AP core's console-service
      * wake, which is pre-existing and separate). */
     cap_park_deadline_tick();
+    /* BSP-side console drain: when the AP core never comes online
+     * (uniprocessor QEMU), microkernel_service_poll() never runs,
+     * so console_service_tick() must fire here to drain sidecars'
+     * wired console channels to serial. */
+    console_service_tick();
     lapic_write(LAPIC_REG_EOI, 0);
 }
 

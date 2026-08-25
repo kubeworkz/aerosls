@@ -53,7 +53,8 @@ pub struct BootCaps {
     /// VFS changing.
     pub console_chan: Option<u32>,
     /// The ramdisk channel (`ramdisk`) — the block cache's endpoint.
-    pub ramdisk_chan: u32,
+    /// `None` when no ramdisk driver is wired (console-only mode).
+    pub ramdisk_chan: Option<u32>,
     /// The network driver channel (`network`), if the manifest declared
     /// one. The POSIX sidecar connects a `NetClient` on this endpoint
     /// for socket I/O.
@@ -66,9 +67,7 @@ impl BootCaps {
         let budget = bib
             .find_cap(CAP_MEM, "budget")
             .ok_or(BootErr::MissingCap("budget"))?;
-        let ramdisk = bib
-            .find_cap(CAP_CHAN, "ramdisk")
-            .ok_or(BootErr::MissingCap("ramdisk"))?;
+        let ramdisk = bib.find_cap(CAP_CHAN, "ramdisk");
         let console = bib.find_cap(CAP_CHAN, "console");
         let network = bib.find_cap(CAP_CHAN, "network");
         Ok(BootCaps {
@@ -76,7 +75,7 @@ impl BootCaps {
             budget_base: budget.base,
             budget_len: budget.len,
             console_chan: console.map(|c| c.slot),
-            ramdisk_chan: ramdisk.slot,
+            ramdisk_chan: ramdisk.map(|r| r.slot),
             net_chan: network.map(|n| n.slot),
         })
     }
@@ -88,7 +87,7 @@ impl BootCaps {
         budget_base: u64,
         budget_len: u64,
         console_chan: Option<u32>,
-        ramdisk_chan: u32,
+        ramdisk_chan: Option<u32>,
         net_chan: Option<u32>,
     ) -> BootCaps {
         BootCaps {
@@ -157,24 +156,30 @@ pub fn boot<K: Kernel, A: BufferAlloc>(
     let k_wrap = KWrap(k_arc.clone());
     let alloc_wrap = AWrap(alloc_arc.clone());
 
-    // 2. Device attach + handshake (RD_INFO). The device geometry is fixed
-    //    here; the driver thread must be serving.
-    let cache = BlockCache::connect(k_wrap, caps.ramdisk_chan, alloc_wrap)
-        .map_err(|e| BootErr::Handshake(handshake_class(&e)))?;
-
-    // 3. Mounts, in order (path resolution is longest-prefix; /dev and /tmp
-    //    shadow the root mount).
+    // 2. Device attach + handshake (RD_INFO) — only when a ramdisk driver
+    //    is wired. Without one the sidecar boots in console-only mode.
     let mut vfs = Vfs::new();
-    vfs.mount_aerofs("/", cache).map_err(BootErr::Mount)?;
+    if let Some(ramdisk_slot) = caps.ramdisk_chan {
+        let cache = BlockCache::connect(k_wrap, ramdisk_slot, alloc_wrap)
+            .map_err(|e| BootErr::Handshake(handshake_class(&e)))?;
+        // 3. Mount the root aerofs image.
+        vfs.mount_aerofs("/", cache).map_err(BootErr::Mount)?;
+    }
     vfs.mount_devfs("/dev", console.clone())
         .map_err(BootErr::Mount)?;
     vfs.mount_ramfs("/tmp").map_err(BootErr::Mount)?;
 
-    // 4. System applets + init (the boot script runner), with console
-    //    stdio on fds 0,1,2. Init's fork children inherit that stdio.
+    // 4. System applets, with console stdio on fds 0,1,2.
     let mut proc = ProcManager::new(vfs);
     applets::register_default_applets(&mut proc);
-    proc.spawn_init(Program::new("init", applets::init));
+    if caps.ramdisk_chan.is_some() {
+        // Full mode: init reads /etc/init.rc and spawns children.
+        proc.spawn_init(Program::new("init", applets::init));
+    } else {
+        // Console-only mode: skip the boot script runner; spawn the
+        // interactive shell directly as PID 0 (the shell becomes init).
+        proc.spawn_init(Program::new("sh", applets::sh));
+    }
     for _ in 0..3 {
         proc.vfs
             .open(0, "/dev/console", O_RDWR, 0)

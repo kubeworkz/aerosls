@@ -2784,6 +2784,7 @@ int cap_create_sidecar(uint32_t parent_pid,
         user_map_page(pml4, image_vbase + (uint64_t)p * 4096, faddr,
                       USER_PTE_PRESENT | USER_PTE_USER | USER_PTE_WRITE
                       | USER_PTE_EXEC);
+
         bytes_left -= chunk;
     }
 
