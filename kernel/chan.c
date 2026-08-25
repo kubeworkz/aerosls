@@ -49,6 +49,7 @@
  */
 #include "cap.h"
 #include "kernel_io.h"
+#include "process.h"  /* process_find_current, ProcessDescriptor for hlt-idle */
 #include "timer.h"   /* Phase 5 deadlines: kernel_tick_counter, KERNEL_TICK_NS */
 #include <stddef.h>
 
@@ -193,11 +194,47 @@ int k_chan_wait(uint32_t pid, const uint16_t* chans, uint32_t n,
      * nothing can enqueue between the last poll and the waiting-set
      * registration. The weak default (host tests) returns 0 →
      * CAP_ERR_TIMEOUT, preserving scan-once semantics. */
-    if (deadline != 0 && kernel_tick_counter >= deadline)
-        return CAP_ERR_TIMEOUT;   /* deadline elapsed; nothing arrived */
-    cap_wait_chans(chan_ids, n, req, SYS_SLS_CHAN_WAIT, deadline);
-    /* noreturn when it parks */
-    return CAP_ERR_TIMEOUT;   /* could not park: retry */
+    /* Park attempt. If cap_wait_chans can't park (no other runnable
+     * process — the peer is still booting), we enter a hlt-idle loop:
+     * sleep one tick, re-check the queue, repeat until a message arrives
+     * or the caller's deadline expires. This avoids the busy-spin (SDK
+     * retry loop) and the one-shot-hlt race where the message arrives
+     * one tick AFTER the re-check. Single-CPU: the hlt+recheck loop is
+     * a cooperative poll — no lock needed between poll iterations. */
+    for (;;) {
+        if (deadline != 0 && kernel_tick_counter >= deadline)
+            return CAP_ERR_TIMEOUT;
+        /* Quick queue check BEFORE parking — message may already be
+         * queued from an earlier enqueue. */
+        for (uint32_t i = 0; i < n; i++) {
+            struct CapChannel* ch = &cap_channels[chan_ids[i]];
+            cap_lock(&ch->lock);
+            int ready = (ch->qdepth[0] > 0);
+            uint16_t kind = CH_KIND_MSG;
+            if (!ready && ch->close_evt[0]) { ready = 1; kind = CH_KIND_CLOSE; }
+            cap_unlock(&ch->lock);
+            if (ready) {
+                *out_idx = i;
+                *out_kind = kind;
+                return CAP_ERR_OK;
+            }
+        }
+        /* Nothing ready. Try to park — if it parks (switches to peer),
+         * we never return (the re-run after wake re-enters this loop
+         * from the top). If it can't park, hlt one tick and retry. */
+        uint64_t one_tick = kernel_tick_counter + 1;
+        struct ProcessDescriptor* cur = process_find_current();
+        if (cur) {
+            cur->waiting_deadline = one_tick;
+            cur->state = PROC_BLOCKED;
+        }
+        __asm__ volatile("sti; hlt" ::: "memory");
+        if (cur) {
+            cur->waiting_deadline = 0;
+            cur->waiting_nchans = 0;
+            cur->state = PROC_RUNNING;
+        }
+    }
 }
 
 /* ─── k_chan_recv ────────────────────────────────────────────────────────────

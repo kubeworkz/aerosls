@@ -1296,13 +1296,19 @@ int cap_wait_chans(const uint32_t* chan_ids, uint32_t n, void* req,
 
     struct ProcessDescriptor* next = pick_next_runnable();
     if (!next) {
-        /* Nobody to run — don't park; the caller returns CAP_ERR_TIMEOUT
-         * and the SDK retries (same posture as the recv park's EAGAIN). */
-        cur->state           = PROC_RUNNING;
-        cur->waiting_nchans  = 0;
+        /* Nobody to run yet — the DM may still be booting (PROC_RUNNING,
+         * not SUSPENDED). Instead of busy-spinning (the SDK retries
+         * immediately), hlt for one tick so the timer ISR fires and the
+         * scheduler eventually picks a newly-runnable peer. Set a
+         * 1-tick deadline so cap_park_deadline_tick wakes us. */
+        uint64_t one_tick = kernel_tick_counter + 1;
+        cur->waiting_deadline = one_tick;
+        __asm__ volatile("sti; hlt" ::: "memory");
         cur->waiting_deadline = 0;
+        cur->waiting_nchans  = 0;
+        cur->state           = PROC_RUNNING;
         kernel_serial_printf(
-            "[CAP] chan wait: no runnable process; returning TIMEOUT\n");
+            "[CAP] chan wait: hlt woke; returning TIMEOUT\n");
         return 0;
     }
     kernel_serial_printf("[CAP] chan wait: switching to PID %u '%s'\n",
@@ -1517,7 +1523,18 @@ uint32_t sys_sls_yield(void) {
      * candidate). Order matters: picking after would let us pick ourselves
      * and spin forever. */
     struct ProcessDescriptor* next = pick_next_runnable();
-    if (!next) return 0;   /* nobody else: continue immediately */
+    if (!next) {
+        /* Nobody else to run — hlt for one tick so the timer ISR fires
+         * and the scheduler picks a newly-runnable peer. Same idle pace
+         * as cap_wait_chans's no-next path. */
+        uint64_t one_tick = kernel_tick_counter + 1;
+        cur->waiting_deadline = one_tick;
+        cur->state = PROC_BLOCKED;
+        __asm__ volatile("sti; hlt" ::: "memory");
+        cur->waiting_deadline = 0;
+        cur->state = PROC_RUNNING;
+        return 0;
+    }
     /* Capture the FULL entry frame (all eight regs + user RSP) into
      * park_ctx, exactly like cap_wait_chan()/cap_maybe_handoff().
      * cap_sysret_resume() REBUILDS the resume frame from these — the
