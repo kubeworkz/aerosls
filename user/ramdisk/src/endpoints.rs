@@ -26,7 +26,8 @@ pub enum EndpointState {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Endpoint {
-    pub handle: u32,
+    pub handle: u32,       // CHAN_R — for recv
+    pub send_handle: u32,  // CHAN_W — for send (reply)
     pub state: EndpointState,
 }
 
@@ -48,14 +49,20 @@ impl EndpointSet {
     /// Adopt a channel as an RD_* endpoint. Idempotent. Returns `false` when
     /// the table is full — the caller should close the channel.
     pub fn adopt(&mut self, handle: u32) -> bool {
-        if self.find(handle).is_some() {
+        self.adopt_pair(handle, handle)
+    }
+
+    /// Adopt a CHAN_R endpoint with its paired CHAN_W send handle.
+    pub fn adopt_pair(&mut self, recv_handle: u32, send_handle: u32) -> bool {
+        if self.find(recv_handle).is_some() {
             return true;
         }
         if self.n >= MAX_RD_ENDPOINTS {
             return false;
         }
         self.eps[self.n] = Some(Endpoint {
-            handle,
+            handle: recv_handle,
+            send_handle,
             state: EndpointState::AwaitingHandshake,
         });
         self.n += 1;
@@ -82,6 +89,21 @@ impl EndpointSet {
         if let Some(ep) = self.by_handle(handle) {
             ep.state = EndpointState::Active;
         }
+    }
+
+    /// The CHAN_W (send) handle paired with a CHAN_R (recv) handle.
+    pub fn send_handle_of(&self, handle: u32) -> u32 {
+        for ep in self.eps[..self.n].iter().flatten() {
+            if ep.handle == handle {
+                return ep.send_handle;
+            }
+        }
+        handle // fallback: assume same handle
+    }
+
+    /// Check if a CHAN_W slot is already paired with an adopted endpoint.
+    pub fn is_paired(&self, send_handle: u32) -> bool {
+        self.eps[..self.n].iter().flatten().any(|e| e.send_handle == send_handle)
     }
 
     pub fn is_console(&self, handle: u32) -> bool {

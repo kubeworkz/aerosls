@@ -95,10 +95,12 @@ fn cmd_build(mut args: impl Iterator<Item = String>) {
     let mut init = None;
     let mut dm = None;
     let mut posix = None;
+    let mut ramdisk = None;
     let mut out = None;
     let mut init_entry = 0u64;
     let mut dm_entry = 0u64;
     let mut posix_entry = 0u64;
+    let mut ramdisk_entry = 0u64;
     let mut base_phys = None;
 
     while let Some(a) = args.next() {
@@ -110,10 +112,12 @@ fn cmd_build(mut args: impl Iterator<Item = String>) {
             "--init" => init = Some(PathBuf::from(next())),
             "--dm" => dm = Some(PathBuf::from(next())),
             "--posix" => posix = Some(PathBuf::from(next())),
+            "--ramdisk" => ramdisk = Some(PathBuf::from(next())),
             "-o" | "--output" => out = Some(PathBuf::from(next())),
             "--init-entry" => init_entry = parse_hex(&next(), &a),
             "--dm-entry" => dm_entry = parse_hex(&next(), &a),
             "--posix-entry" => posix_entry = parse_hex(&next(), &a),
+            "--ramdisk-entry" => ramdisk_entry = parse_hex(&next(), &a),
             "--base-phys" => base_phys = Some(parse_hex(&next(), &a)),
             "-h" | "--help" => usage(),
             other => {
@@ -123,8 +127,8 @@ fn cmd_build(mut args: impl Iterator<Item = String>) {
         }
     }
 
-    let (init_path, dm_path, posix_path, out_path) = match (init, dm, posix, out) {
-        (Some(i), Some(d), Some(p), Some(o)) => (i, d, p, o),
+    let (init_path, dm_path, posix_path, ramdisk_path, out_path) = match (init, dm, posix, ramdisk, out) {
+        (Some(i), Some(d), Some(p), Some(r), Some(o)) => (i, d, p, r, o),
         _ => usage(),
     };
 
@@ -134,11 +138,14 @@ fn cmd_build(mut args: impl Iterator<Item = String>) {
         .unwrap_or_else(|e| panic!("read {}: {e}", dm_path.display()));
     let posix_bin = std::fs::read(&posix_path)
         .unwrap_or_else(|e| panic!("read {}: {e}", posix_path.display()));
+    let ramdisk_bin = std::fs::read(&ramdisk_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", ramdisk_path.display()));
 
-    let mut spec = BootImageSpec::new(init_bin, dm_bin, posix_bin);
+    let mut spec = BootImageSpec::new(init_bin, dm_bin, posix_bin, ramdisk_bin);
     spec.init_entry = init_entry;
     spec.dm_entry = dm_entry;
     spec.posix_entry = posix_entry;
+    spec.ramdisk_entry = ramdisk_entry;
     if let Some(b) = base_phys {
         spec.base_phys = b;
     }

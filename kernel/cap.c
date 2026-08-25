@@ -575,7 +575,13 @@ int cap_create_mem(uint32_t pid, uint64_t phys_base, uint32_t npages,
         const struct CapObject* o = &cap_objects[i];
         if (!o->active || o->kind != CAP_OBJ_KIND_MEM) continue;
         uint64_t oend = o->phys_base + (uint64_t)o->npages * 4096u;
-        if (phys_base < oend && end > o->phys_base) return CAP_ECONFLICT;
+        if (phys_base < oend && end > o->phys_base) {
+            kernel_serial_printf("[CAP] mem overlap: new [0x%llx,0x%llx) vs obj %u [0x%llx,0x%llx) pid=%u\n",
+                (unsigned long long)phys_base, (unsigned long long)end,
+                (unsigned)i, (unsigned long long)o->phys_base, (unsigned long long)oend,
+                (unsigned)pid);
+            return CAP_ECONFLICT;
+        }
     }
 
     int ti = cap_table_index(pid);
@@ -857,9 +863,20 @@ int cap_send(uint32_t pid, uint16_t ch_w_idx, uint16_t cap_idx, uint64_t cookie)
     cap_lock(&t->lock);
 
     uint64_t w = t->slots[ch_w_idx].word;
-    if (!cap_word_valid(w) ||
-        ((w >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK) != CAP_TYPE_CHAN_W ||
-        !((w >> CAP_PERM_SHIFT) & CAP_PERM_SEND)) {
+    if (!cap_word_valid(w)) {
+        cap_unlock(&t->lock);
+        return CAP_EBADF;
+    }
+    uint32_t ty = (uint32_t)((w >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK);
+    /* Accept CHAN_W with SEND permission (normal send) or CHAN_R with RECV
+     * permission (server replying on its receive handle). */
+    if (ty == CAP_TYPE_CHAN_W && !((w >> CAP_PERM_SHIFT) & CAP_PERM_SEND)) {
+        cap_unlock(&t->lock);
+        return CAP_EBADF;
+    } else if (ty == CAP_TYPE_CHAN_R && !((w >> CAP_PERM_SHIFT) & CAP_PERM_RECV)) {
+        cap_unlock(&t->lock);
+        return CAP_EBADF;
+    } else if (ty != CAP_TYPE_CHAN_W && ty != CAP_TYPE_CHAN_R) {
         cap_unlock(&t->lock);
         return CAP_EBADF;
     }
@@ -1179,9 +1196,20 @@ int cap_send_msg(uint32_t pid, uint16_t ch_w_idx, const void* payload,
     cap_lock(&t->lock);
 
     uint64_t w = t->slots[ch_w_idx].word;
-    if (!cap_word_valid(w) ||
-        ((w >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK) != CAP_TYPE_CHAN_W ||
-        !((w >> CAP_PERM_SHIFT) & CAP_PERM_SEND)) {
+    if (!cap_word_valid(w)) {
+        cap_unlock(&t->lock);
+        return CAP_EBADF;
+    }
+    uint32_t ty = (uint32_t)((w >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK);
+    /* Accept CHAN_W with SEND permission (normal send) or CHAN_R with RECV
+     * permission (server replying on its receive handle). */
+    if (ty == CAP_TYPE_CHAN_W && !((w >> CAP_PERM_SHIFT) & CAP_PERM_SEND)) {
+        cap_unlock(&t->lock);
+        return CAP_EBADF;
+    } else if (ty == CAP_TYPE_CHAN_R && !((w >> CAP_PERM_SHIFT) & CAP_PERM_RECV)) {
+        cap_unlock(&t->lock);
+        return CAP_EBADF;
+    } else if (ty != CAP_TYPE_CHAN_W && ty != CAP_TYPE_CHAN_R) {
         cap_unlock(&t->lock);
         return CAP_EBADF;
     }

@@ -61,13 +61,15 @@ static GLOBAL_ALLOC: HeapAlloc = HeapAlloc;
 
 /* Panic handler: write to kernel serial log (SYS_SLS_SERIAL_WRITE = 165). */
 #[cfg(all(feature = "target", target_os = "none"))]
-struct PanicBuf([u8; 256]);
+struct PanicBuf { buf: [u8; 256], pos: usize }
 
 #[cfg(all(feature = "target", target_os = "none"))]
 impl core::fmt::Write for PanicBuf {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let n = s.len().min(255);
-        self.0[..n].copy_from_slice(&s.as_bytes()[..n]);
+        let room = &mut self.buf[self.pos..];
+        let n = s.len().min(room.len());
+        room[..n].copy_from_slice(&s.as_bytes()[..n]);
+        self.pos += n;
         Ok(())
     }
 }
@@ -76,13 +78,13 @@ impl core::fmt::Write for PanicBuf {
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     use core::fmt::Write as _;
-    let mut b = PanicBuf([0; 256]);
+    let mut b = PanicBuf { buf: [0u8; 256], pos: 0 };
     let _ = core::write!(&mut b, "[POSIX PANIC] {info}");
     unsafe {
         core::arch::asm!(
             "syscall",
             inlateout("rax") 165u64 => _,  // SYS_SLS_SERIAL_WRITE
-            in("rdi") b.0.as_ptr(),
+            in("rdi") b.buf.as_ptr(),
             lateout("rcx") _,
             lateout("r11") _,
             options(nostack),

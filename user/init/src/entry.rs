@@ -18,6 +18,7 @@ use crate::devreg::DeviceRegistry;
 use crate::dm_manifest::{self, DmImage};
 use crate::heap::Bump;
 use crate::posix_manifest;
+use crate::ramdisk_manifest;
 use aerosls_proto::bootinfo::BootInfo;
 use aerosls_proto::kabi::{Kernel, RealKernel, SendCap, CAP_CHAN_W, CAP_MEM, CAP_NONE};
 
@@ -62,15 +63,16 @@ static mut HEAP: Bump = Bump::new();
  * host build links with panic=unwind — a custom handler is only valid in
  * the freestanding image. */
 #[cfg(all(feature = "target", target_os = "none"))]
-struct PanicBuf([u8; 256]);
+struct PanicBuf { buf: [u8; 256], pos: usize }
 
 #[cfg(all(feature = "target", target_os = "none"))]
 impl core::fmt::Write for PanicBuf {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        // At most 255 bytes written; byte 255 stays 0 (NUL terminator).
-        let n = s.len().min(255);
-        self.0[..n].copy_from_slice(&s.as_bytes()[..n]);
-        Ok(()) // truncates silently rather than failing
+        let room = &mut self.buf[self.pos..];
+        let n = s.len().min(room.len());
+        room[..n].copy_from_slice(&s.as_bytes()[..n]);
+        self.pos += n;
+        Ok(())
     }
 }
 
@@ -78,13 +80,13 @@ impl core::fmt::Write for PanicBuf {
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     use core::fmt::Write as _;
-    let mut b = PanicBuf([0; 256]);
+    let mut b = PanicBuf { buf: [0u8; 256], pos: 0 };
     let _ = core::write!(&mut b, "[PANIC] {info}");
     unsafe {
         core::arch::asm!(
             "syscall",
             inlateout("rax") 165u64 => _,  // SYS_SLS_SERIAL_WRITE
-            in("rdi") b.0.as_ptr(),
+            in("rdi") b.buf.as_ptr(),
             lateout("rcx") _,
             lateout("r11") _,
             options(nostack),
@@ -306,7 +308,33 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         log(&console, "[INIT] DM did not signal ready in time; parking in the event loop");
     }
 
-    // ── 8. Spawn the POSIX sidecar ────────────────────────────────────────
+    // ── 8. Spawn the ramdisk driver ───────────────────────────────────────
+    log(&console, "[INIT] spawning ramdisk driver...");
+
+    let ramdisk_image_cap = bib
+        .find_cap(CAP_MEM, "ramdisk.image")
+        .expect("[INIT] missing 'ramdisk.image' MEM cap");
+
+    // ramdisk.heap is NOT in init's manifest (avoids cap_create_mem overlap).
+    // Compute the budget and storage addresses from the layout: budget sits
+    // page-aligned after the ramdisk image; storage sits after the budget.
+    let ramdisk_budget_base = (ramdisk_image_cap.base + ramdisk_image_cap.len + 4095) & !4095u64;
+    let ramdisk_budget_size = 256 * 1024; // 256 KiB — matches RAMDISK_HEAP_BYTES
+    let storage_base = (ramdisk_budget_base + ramdisk_budget_size + 4095) & !4095u64;
+    let storage_len = 16 * 1024 * 1024; // 16 MiB — matches STORAGE_BYTES in layout.rs (cap word 12-bit limit)
+    log_fmt!(&console, "[INIT]   ramdisk budget @ 0x{:x}, storage @ 0x{:x} ({} MiB)",
+             ramdisk_budget_base, storage_base, storage_len >> 20);
+
+    spawn_ramdisk_driver(
+        &console,
+        ramdisk_image_cap,
+        ramdisk_budget_base,
+        ramdisk_budget_size,
+        storage_base,
+        storage_len,
+    );
+
+    // ── 9. Spawn the POSIX sidecar ────────────────────────────────────────
     log(&console, "[INIT] spawning POSIX sidecar...");
 
     let posix_image_cap = bib
@@ -319,16 +347,14 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     let posix_heap_base = (posix_image_cap.base + posix_image_cap.len + 4095) & !4095u64;
     log_fmt!(&console, "[INIT]   posix.heap computed @ 0x{:x}", posix_heap_base);
 
-    // The POSIX sidecar's manifest declares budget + console caps. Init
-    // calls k_create_sidecar with a repacked manifest whose budget base
-    // points at the computed heap — the DM wires additional channels
-    // (VFS, network) after the POSIX sidecar is up.
+    // The POSIX sidecar's manifest declares budget + console + ramdisk caps.
+    // The ramdisk CHAN cap is wired by the kernel to drv.ramdisk.0.
     spawn_posix_sidecar(&console, posix_image_cap, posix_heap_base);
 
     log(&console, "[INIT] ── Phase 5 init sidecar complete ──");
     log(&console, "[INIT] system ready for POSIX sidecar creation.");
 
-    // ── 9. The demo server loop (watchdog) ────────────────────────────────
+    // ── 10. The demo server loop (watchdog) ───────────────────────────────
     // Blocking k_chan_wait (TIMEOUT_NONE) on the Device Manager channel:
     // this sidecar parks (cap_wait_chans) until the DM queues a message or
     // a control event, and a wake re-runs the wait to return it. Console
@@ -402,6 +428,37 @@ fn spawn_device_manager(
         .unwrap_or_else(|e| panic!("[INIT] create_sidecar failed: {e}"));
     log_fmt!(console, "[INIT]   messenger: CHAN_R={r} CHAN_W={w}");
     InitChannel::new(RealKernel, r, w)
+}
+
+/// Spawn the ramdisk driver through the real kernel path (`SYS_SLS_CREATE_SIDECAR`).
+/// The ramdisk binary address comes from the boot image's `ramdisk.image` MEM cap;
+/// budget and storage are computed from the layout (not BIB caps).
+fn spawn_ramdisk_driver(
+    console: &InitChannel<RealKernel>,
+    image_cap: &aerosls_proto::bootinfo::BootCap<'_>,
+    budget_base: u64,
+    budget_size: u64,
+    storage_base: u64,
+    storage_len: u64,
+) {
+    log_fmt!(
+        console,
+        "[INIT]   (create_sidecar: {} image @ 0x{:x}, {} bytes)",
+        ramdisk_manifest::RAMDISK_MANIFEST_NAME,
+        image_cap.base,
+        image_cap.len,
+    );
+    let manifest = ramdisk_manifest::build_ramdisk_manifest(
+        image_cap.base,
+        image_cap.len as u32,
+        budget_base,
+        storage_base,
+        storage_len,
+    );
+    let (r, w) = RealKernel
+        .create_sidecar(&manifest)
+        .unwrap_or_else(|e| panic!("[INIT] ramdisk create_sidecar failed: {e}"));
+    log_fmt!(console, "[INIT]   ramdisk messenger: CHAN_R={r} CHAN_W={w}");
 }
 
 /// Spawn the POSIX sidecar through the real kernel path (`SYS_SLS_CREATE_SIDECAR`).

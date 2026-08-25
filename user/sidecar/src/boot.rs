@@ -29,7 +29,7 @@ use alloc::sync::Arc;
 use aerosls_blockcache::{BlockCache, BufferAlloc};
 use aerosls_procmgr::{ProcManager, Program};
 use aerosls_proto::bootinfo::BootInfo;
-use aerosls_proto::kabi::{CAP_CHAN, CAP_MEM, Kernel};
+use aerosls_proto::kabi::{CAP_CHAN, CAP_CHAN_W, CAP_MEM, Kernel};
 use aerosls_proto::kwrap::{AWrap, KWrap};
 use aerosls_vfs::{CharNode, Errno, Vfs, O_RDWR};
 
@@ -54,7 +54,10 @@ pub struct BootCaps {
     pub console_chan: Option<u32>,
     /// The ramdisk channel (`ramdisk`) — the block cache's endpoint.
     /// `None` when no ramdisk driver is wired (console-only mode).
-    pub ramdisk_chan: Option<u32>,
+    /// The ramdisk channel's CHAN_W (send) and CHAN_R (receive) endpoints.
+    /// The kernel enforces CAP_TYPE_CHAN_W for send and CAP_TYPE_CHAN_R for recv.
+    pub ramdisk_chan_w: Option<u32>,
+    pub ramdisk_chan_r: Option<u32>,
     /// The network driver channel (`network`), if the manifest declared
     /// one. The POSIX sidecar connects a `NetClient` on this endpoint
     /// for socket I/O.
@@ -67,7 +70,8 @@ impl BootCaps {
         let budget = bib
             .find_cap(CAP_MEM, "budget")
             .ok_or(BootErr::MissingCap("budget"))?;
-        let ramdisk = bib.find_cap(CAP_CHAN, "ramdisk");
+        let ramdisk_r = bib.find_cap(CAP_CHAN, "ramdisk");
+        let ramdisk_w = bib.find_cap(CAP_CHAN_W, "ramdisk");
         let console = bib.find_cap(CAP_CHAN, "console");
         let network = bib.find_cap(CAP_CHAN, "network");
         Ok(BootCaps {
@@ -75,7 +79,8 @@ impl BootCaps {
             budget_base: budget.base,
             budget_len: budget.len,
             console_chan: console.map(|c| c.slot),
-            ramdisk_chan: ramdisk.map(|r| r.slot),
+            ramdisk_chan_w: ramdisk_w.map(|r| r.slot),
+            ramdisk_chan_r: ramdisk_r.map(|r| r.slot),
             net_chan: network.map(|n| n.slot),
         })
     }
@@ -87,7 +92,8 @@ impl BootCaps {
         budget_base: u64,
         budget_len: u64,
         console_chan: Option<u32>,
-        ramdisk_chan: Option<u32>,
+        ramdisk_chan_w: Option<u32>,
+        ramdisk_chan_r: Option<u32>,
         net_chan: Option<u32>,
     ) -> BootCaps {
         BootCaps {
@@ -95,7 +101,8 @@ impl BootCaps {
             budget_base,
             budget_len,
             console_chan,
-            ramdisk_chan,
+            ramdisk_chan_w,
+            ramdisk_chan_r,
             net_chan,
         }
     }
@@ -159,8 +166,8 @@ pub fn boot<K: Kernel, A: BufferAlloc>(
     // 2. Device attach + handshake (RD_INFO) — only when a ramdisk driver
     //    is wired. Without one the sidecar boots in console-only mode.
     let mut vfs = Vfs::new();
-    if let Some(ramdisk_slot) = caps.ramdisk_chan {
-        let cache = BlockCache::connect(k_wrap, ramdisk_slot, alloc_wrap)
+    if let (Some(ramdisk_w), Some(ramdisk_r)) = (caps.ramdisk_chan_w, caps.ramdisk_chan_r) {
+        let cache = BlockCache::connect(k_wrap, ramdisk_w, ramdisk_r, alloc_wrap)
             .map_err(|e| BootErr::Handshake(handshake_class(&e)))?;
         // 3. Mount the root aerofs image.
         vfs.mount_aerofs("/", cache).map_err(BootErr::Mount)?;
@@ -172,7 +179,7 @@ pub fn boot<K: Kernel, A: BufferAlloc>(
     // 4. System applets, with console stdio on fds 0,1,2.
     let mut proc = ProcManager::new(vfs);
     applets::register_default_applets(&mut proc);
-    if caps.ramdisk_chan.is_some() {
+    if caps.ramdisk_chan_w.is_some() {
         // Full mode: init reads /etc/init.rc and spawns children.
         proc.spawn_init(Program::new("init", applets::init));
     } else {

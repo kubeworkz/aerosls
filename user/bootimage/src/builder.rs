@@ -19,7 +19,7 @@
 //! MEM cap (what init's runtime `create_sidecar` call copies) points at the
 //! same physical address the DM manifest's own footer declares.
 
-use crate::layout::{BootImageSpec, BootLayout, DM_MANIFEST_NAME, INIT_MANIFEST_NAME, POSIX_MANIFEST_NAME};
+use crate::layout::{BootImageSpec, BootLayout, DM_MANIFEST_NAME, INIT_MANIFEST_NAME, POSIX_MANIFEST_NAME, RAMDISK_MANIFEST_NAME};
 use crate::newc;
 use aerosls_proto::manifest::{
     Bootstrap, Budget, CapKind, Cpu, Image, Limits, Manifest, ManifestCap, build_manifest, crc32,
@@ -34,13 +34,15 @@ pub const CONSOLE_PEER: &str = "kernel.debug.console";
 /// entry: it is implicit memory the loader reserves and zeroes (devreg.rs
 /// format), and the heap regions are implicit too — the archive carries no
 /// 16 MiB of zeros.
-pub const ENTRY_PATHS: [&str; 7] = [
+pub const ENTRY_PATHS: [&str; 9] = [
     crate::layout::INIT_BIN_PATH,
     crate::layout::INIT_MANIFEST_PATH,
     crate::layout::DM_BIN_PATH,
     crate::layout::DM_MANIFEST_PATH,
     crate::layout::POSIX_BIN_PATH,
     crate::layout::POSIX_MANIFEST_PATH,
+    crate::layout::RAMDISK_BIN_PATH,
+    crate::layout::RAMDISK_MANIFEST_PATH,
     crate::layout::LAYOUT_PATH,
 ];
 
@@ -105,9 +107,17 @@ fn build_init_manifest(spec: &BootImageSpec, layout: &BootLayout, blob_offset: u
                 size: spec.posix_bin.len() as u64,
             },
         }),
-        None, // posix.heap — NOT needed by init; the POSIX sidecar's own manifest provides its budget
-        None,
-        None,
+        Some(ManifestCap {
+            name: "ramdisk.image",
+            rights: 0x1, // R — init reads the ramdisk binary out of it
+            kind: CapKind::Mem {
+                base: layout.ramdisk_image.phys,
+                size: spec.ramdisk_bin.len() as u64,
+            },
+        }),
+        None, // ramdisk.heap — NOT in init's manifest; the ramdisk driver's own
+              // manifest declares its budget at this address (avoids cap_create_mem overlap)
+        None, // storage — NOT in init's manifest; only ramdisk needs it
         None,
         None,
         None,
@@ -145,7 +155,7 @@ fn build_init_manifest(spec: &BootImageSpec, layout: &BootLayout, blob_offset: u
             chan_queue_depth: 16,
         }),
         caps,
-        n_caps: 5,
+        n_caps: 6,
         bootstrap: Some(Bootstrap {
             console: Some("console"),
             debug: None,
@@ -310,6 +320,87 @@ fn build_posix_manifest(spec: &BootImageSpec, layout: &BootLayout, blob_offset: 
     pack_with_footer(&m, layout.posix_image.phys)
 }
 
+/// Build the ramdisk driver's packed manifest — budget + storage + console.
+fn build_ramdisk_manifest(spec: &BootImageSpec, layout: &BootLayout, blob_offset: u32) -> Vec<u8> {
+    let caps = [
+        Some(ManifestCap {
+            name: "budget",
+            rights: 0x3, // R | W
+            kind: CapKind::Mem {
+                base: layout.ramdisk_heap.phys,
+                size: spec.ramdisk_heap_bytes,
+            },
+        }),
+        Some(ManifestCap {
+            name: "storage",
+            rights: 0x1, // R only — read-only block device
+            kind: CapKind::Mem {
+                base: layout.storage.phys,
+                size: spec.storage_bytes,
+            },
+        }),
+        Some(ManifestCap {
+            name: "console",
+            rights: 0x7, // R | W | send
+            kind: CapKind::Chan {
+                peer: Some(CONSOLE_PEER),
+                flags: 0,
+            },
+        }),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ];
+    let m = Manifest {
+        version_major: 1,
+        version_minor: 0,
+        flags: 0,
+        name: Some(RAMDISK_MANIFEST_NAME),
+        personality: Some("aerosls.ramdisk.v1"),
+        image: Some(Image {
+            offset: blob_offset,
+            size: spec.ramdisk_bin.len() as u32,
+            entry: spec.ramdisk_entry,
+        }),
+        budget: Some(Budget {
+            mem_bytes: spec.ramdisk_heap_bytes,
+            stack_bytes: 16 * 1024,
+            heap_initial: 64 * 1024,
+        }),
+        cpu: Some(Cpu {
+            share: 50,
+            preemptible: true,
+        }),
+        limits: Some(Limits {
+            max_tasks: 1,
+            max_fds: 0,
+            max_channels: 16,
+            max_open_files: 0,
+            chan_queue_depth: 32,
+        }),
+        caps,
+        n_caps: 3,
+        bootstrap: Some(Bootstrap {
+            console: Some("console"),
+            debug: None,
+            log_level: 1,
+        }),
+        flags_value: Some(0),
+        signature: None,
+    };
+    pack_with_footer(&m, layout.ramdisk_image.phys)
+}
+
 /// Byte span of one newc entry (header + padded name + padded data).
 fn entry_span(off: usize, name: &str, data_len: usize) -> (usize, usize) {
     let name_len = name.len() + 1;
@@ -392,8 +483,9 @@ pub fn build_boot_image(spec: &BootImageSpec) -> BootImage {
     let init_manifest_ph = build_init_manifest(spec, &layout, 0);
     let dm_manifest_ph = build_dm_manifest(spec, &layout, 0);
     let posix_manifest_ph = build_posix_manifest(spec, &layout, 0);
+    let ramdisk_manifest_ph = build_ramdisk_manifest(spec, &layout, 0);
 
-    // All seven entries in order; each entry's span is
+    // All nine entries in order; each entry's span is
     // 110 (header) + padded name + padded data.
     let mut off = 0usize;
     let mut entry_offsets: Vec<(String, usize, usize)> = Vec::new();
@@ -409,6 +501,8 @@ pub fn build_boot_image(spec: &BootImageSpec) -> BootImage {
         place(crate::layout::DM_MANIFEST_PATH, dm_manifest_ph.len(), &mut off);
         place(crate::layout::POSIX_BIN_PATH, spec.posix_bin.len(), &mut off);
         place(crate::layout::POSIX_MANIFEST_PATH, posix_manifest_ph.len(), &mut off);
+        place(crate::layout::RAMDISK_BIN_PATH, spec.ramdisk_bin.len(), &mut off);
+        place(crate::layout::RAMDISK_MANIFEST_PATH, ramdisk_manifest_ph.len(), &mut off);
         let layout_size = layout_file_size();
         place(crate::layout::LAYOUT_PATH, layout_size, &mut off);
     }
@@ -418,15 +512,18 @@ pub fn build_boot_image(spec: &BootImageSpec) -> BootImage {
     let init_bin_off = entry_offsets[0].1 as u32;
     let dm_bin_off = entry_offsets[2].1 as u32;
     let posix_bin_off = entry_offsets[4].1 as u32;
+    let ramdisk_bin_off = entry_offsets[6].1 as u32;
     let init_manifest = build_init_manifest(spec, &layout, init_bin_off);
     let dm_manifest = build_dm_manifest(spec, &layout, dm_bin_off);
     let posix_manifest = build_posix_manifest(spec, &layout, posix_bin_off);
+    let ramdisk_manifest = build_ramdisk_manifest(spec, &layout, ramdisk_bin_off);
     debug_assert_eq!(init_manifest.len(), init_manifest_ph.len());
     debug_assert_eq!(dm_manifest.len(), dm_manifest_ph.len());
     debug_assert_eq!(posix_manifest.len(), posix_manifest_ph.len());
+    debug_assert_eq!(ramdisk_manifest.len(), ramdisk_manifest_ph.len());
 
     let layout_size = layout_file_size();
-    // All seven entries, the layout file LAST.
+    // All nine entries, the layout file LAST.
     let layout_text = build_layout_file(&layout, &entry_offsets, layout_size);
     debug_assert_eq!(layout_text.len(), layout_size);
 
@@ -438,6 +535,8 @@ pub fn build_boot_image(spec: &BootImageSpec) -> BootImage {
     newc::write_entry(&mut archive, crate::layout::DM_MANIFEST_PATH, &dm_manifest);
     newc::write_entry(&mut archive, crate::layout::POSIX_BIN_PATH, &spec.posix_bin);
     newc::write_entry(&mut archive, crate::layout::POSIX_MANIFEST_PATH, &posix_manifest);
+    newc::write_entry(&mut archive, crate::layout::RAMDISK_BIN_PATH, &spec.ramdisk_bin);
+    newc::write_entry(&mut archive, crate::layout::RAMDISK_MANIFEST_PATH, &ramdisk_manifest);
     newc::write_entry(&mut archive, crate::layout::LAYOUT_PATH, layout_text.as_bytes());
     newc::finish(&mut archive);
 
@@ -455,7 +554,7 @@ pub fn build_boot_image(spec: &BootImageSpec) -> BootImage {
 fn layout_file_size() -> usize {
     let mut n = "AEROSLS-BOOT-LAYOUT 1\n".len();
     n += "base ".len() + 16 + 1;
-    for name in ["init.image", "init.heap", "dm.image", "dm.heap", "posix.image", "posix.heap", "registry"] {
+    for name in ["init.image", "init.heap", "dm.image", "dm.heap", "posix.image", "posix.heap", "ramdisk.image", "ramdisk.heap", "storage", "registry"] {
         n += "region ".len() + name.len() + 1 + 16 + 1 + 16 + 1;
     }
     for p in ENTRY_PATHS {
@@ -484,7 +583,7 @@ mod tests {
     }
 
     fn spec() -> BootImageSpec {
-        BootImageSpec::new(vec![0xAA; 0x2000], vec![0xBB; 0x4000], vec![0xCC; 0x8000])
+        BootImageSpec::new(vec![0xAA; 0x2000], vec![0xBB; 0x4000], vec![0xCC; 0x8000], vec![0xDD; 0x1000])
     }
 
     fn built() -> BootImage {
@@ -543,10 +642,13 @@ mod tests {
         assert_eq!(paths, ENTRY_PATHS);
         assert_eq!(es[0].data, spec().init_bin);
         assert_eq!(es[2].data, spec().dm_bin);
+        assert_eq!(es[6].data, spec().ramdisk_bin);
         // Manifest + layout entries parse as non-empty text/blobs.
         assert!(es[1].data.len() > 24);
         assert!(es[3].data.len() > 24);
-        assert!(es[6].data.starts_with(b"AEROSLS-BOOT-LAYOUT 1\n"));
+        assert!(es[5].data.len() > 24);
+        assert!(es[7].data.len() > 24);
+        assert!(es[8].data.starts_with(b"AEROSLS-BOOT-LAYOUT 1\n"));
         // The archive offsets recorded in entry_offsets match the parser's.
         let mut off = 0usize;
         for (i, e) in es.iter().enumerate() {
@@ -675,7 +777,7 @@ mod tests {
     #[test]
     fn layout_file_records_regions_and_files() {
         let b = built();
-        let text = String::from_utf8(b.archive_entry(ENTRY_PATHS[6])).unwrap();
+        let text = String::from_utf8(b.archive_entry(ENTRY_PATHS[8])).unwrap();
         let mut lines = text.lines();
         assert_eq!(lines.next(), Some("AEROSLS-BOOT-LAYOUT 1"));
         assert_eq!(lines.next().unwrap(), format!("base {:016x}", b.layout.base_phys));

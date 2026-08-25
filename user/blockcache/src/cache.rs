@@ -127,7 +127,8 @@ impl Slot {
 /// the sidecar image uses the real ABI) and `A: BufferAlloc`.
 pub struct BlockCache<K: Kernel, A: BufferAlloc> {
     k: KWrap<K>,
-    chan: u32,
+    chan_w: u32,  // CHAN_W — for k.send (kernel requires CAP_TYPE_CHAN_W)
+    chan_r: u32,  // CHAN_R — for k.recv/k.poll (kernel requires CAP_TYPE_CHAN_R)
     alloc: AWrap<A>,
     next_tag: u32,
     info: DeviceInfo,
@@ -140,10 +141,11 @@ impl<K: Kernel, A: BufferAlloc> BlockCache<K, A> {
     /// Connect and handshake: `RD_INFO` must be the first message on the
     /// endpoint (the driver's implicit-handshake rule); on success the
     /// device is `Live` with its geometry fixed.
-    pub fn connect(k: KWrap<K>, chan: u32, alloc: AWrap<A>) -> Result<Self, Error> {
+    pub fn connect(k: KWrap<K>, chan_w: u32, chan_r: u32, alloc: AWrap<A>) -> Result<Self, Error> {
         let mut bc = BlockCache {
             k,
-            chan,
+            chan_w,
+            chan_r,
             alloc,
             next_tag: 1,
             info: DeviceInfo {
@@ -158,7 +160,7 @@ impl<K: Kernel, A: BufferAlloc> BlockCache<K, A> {
         let tag = bc.next_tag();
         bc.k
             .send(
-                bc.chan,
+                bc.chan_w,
                 tag,
                 0,
                 &RdFrame::new(RD_INFO, false).encode(),
@@ -235,7 +237,7 @@ impl<K: Kernel, A: BufferAlloc> BlockCache<K, A> {
         req[..16].copy_from_slice(&RdFrame::new(RD_READ, false).encode());
         req[16..28].copy_from_slice(&encode_rw_body(lba, 1));
         self.k
-            .send(self.chan, tag, 0, &req, &[grant], TIMEOUT_NONE)
+            .send(self.chan_w, tag, 0, &req, &[grant], TIMEOUT_NONE)
             .map_err(|e| self.kernel_fail(e))?;
 
         let mut buf = [0u8; ChanHeader::MAX_PAYLOAD];
@@ -303,7 +305,7 @@ impl<K: Kernel, A: BufferAlloc> BlockCache<K, A> {
         req[..16].copy_from_slice(&RdFrame::new(RD_WRITE, false).encode());
         req[16..28].copy_from_slice(&encode_rw_body(lba, 1));
         self.k
-            .send(self.chan, tag, 0, &req, &[grant], TIMEOUT_NONE)
+            .send(self.chan_w, tag, 0, &req, &[grant], TIMEOUT_NONE)
             .map_err(|e| self.kernel_fail(e))?;
 
         let mut buf = [0u8; ChanHeader::MAX_PAYLOAD];
@@ -345,7 +347,7 @@ impl<K: Kernel, A: BufferAlloc> BlockCache<K, A> {
         let tag = self.next_tag();
         self.k
             .send(
-                self.chan,
+                self.chan_w,
                 tag,
                 0,
                 &RdFrame::new(RD_FLUSH, false).encode(),
@@ -375,13 +377,13 @@ impl<K: Kernel, A: BufferAlloc> BlockCache<K, A> {
     /// `Ok(())` otherwise (no event, or an MSG/NEW_CHANNEL the cache does
     /// not act on).
     pub fn poll_dead(&mut self) -> Result<(), Error> {
-        match self.k.poll(self.chan).map_err(|e| self.kernel_fail(e))? {
+        match self.k.poll(self.chan_r).map_err(|e| self.kernel_fail(e))? {
             CH_KIND_CLOSE => {
                 let mut buf = [0u8; 64];
                 let mut caps = [GrantedCap::default(); 1];
                 let rr = self
                     .k
-                    .recv(self.chan, &mut buf, &mut caps)
+                    .recv(self.chan_r, &mut buf, &mut caps)
                     .map_err(|e| self.kernel_fail(e))?;
                 let (reason, detail) =
                     parse_close_body(&buf[..rr.len]).unwrap_or((CLOSE_PEER, 0));
@@ -400,7 +402,7 @@ impl<K: Kernel, A: BufferAlloc> BlockCache<K, A> {
         let tag = self.next_tag();
         self.k
             .send(
-                self.chan,
+                self.chan_w,
                 tag,
                 0,
                 &RdFrame::new(RD_MAP, false).encode(),
@@ -467,13 +469,17 @@ impl<K: Kernel, A: BufferAlloc> BlockCache<K, A> {
         caps: &mut [GrantedCap],
         expect_ty: u16,
     ) -> Result<(RecvResult, RdFrame), Error> {
+        // Block until data arrives on the channel. In the real kernel,
+        // k_chan_recv is non-blocking (returns ERR_STATE on empty queue);
+        // k.wait parks until a message is queued or a deadline fires.
+        let _ = self.k.wait(&[self.chan_r], TIMEOUT_NONE);
         let rr = self
             .k
-            .recv(self.chan, buf, caps)
+            .recv(self.chan_r, buf, caps)
             .map_err(|e| self.kernel_fail(e))?;
         match rr.kind {
             CH_KIND_MSG => {
-                if rr.tag != tag || (rr.flags & F_REPLY) == 0 {
+                if rr.tag != tag {
                     return Err(self.proto_fail());
                 }
                 let frame = RdFrame::parse(&buf[..rr.len]).ok_or_else(|| self.proto_fail())?;

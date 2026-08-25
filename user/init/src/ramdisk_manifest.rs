@@ -1,9 +1,10 @@
-//! POSIX sidecar manifest construction — the real `k_create_sidecar` path
-//! for spawning the POSIX sidecar from init.
+//! Ramdisk driver sidecar manifest construction — the real `k_create_sidecar`
+//! path for spawning the ramdisk driver from init.
 //!
-//! Follows the same pattern as dm_manifest.rs: init reads the POSIX
-//! image's physical address from its `posix.image` MEM cap and the budget
-//! from `posix.heap`, then packs a manifest blob for `Kernel::create_sidecar`.
+//! The ramdisk manifest declares budget (heap), storage (ramdisk data),
+//! and console (kernel serial). The storage cap provides a read-only view
+//! of the ramdisk region; the blockcache client (POSIX sidecar) connects
+//! via a CHAN cap wired by the kernel.
 
 use aerosls_proto::manifest::{
     Bootstrap, Budget, CapKind, Cpu, Image, Limits, Manifest, ManifestCap,
@@ -11,17 +12,23 @@ use aerosls_proto::manifest::{
 };
 use alloc::vec::Vec;
 
-/// The POSIX sidecar's identity — registered in the kernel's sidecar registry.
-pub const POSIX_MANIFEST_NAME: &str = "aerosls.posix.0";
+/// The ramdisk driver's identity — registered in the kernel's sidecar registry.
+pub const RAMDISK_MANIFEST_NAME: &str = "drv.ramdisk.0";
 
-/// Build the packed POSIX manifest blob (header + records + image_kaddr
+/// Build the packed ramdisk manifest blob (header + records + image_kaddr
 /// footer + patched total_len/CRC), ready for `Kernel::create_sidecar`.
 ///
-/// `image_kaddr` is the physical address of the POSIX binary (from the
-/// `posix.image` MEM cap), and `heap_base` is the physical address of
-/// the POSIX budget heap (from the `posix.heap` MEM cap).
-pub fn build_posix_manifest(image_kaddr: u64, image_size: u32, heap_base: u64) -> Vec<u8> {
-    let heap_size = 4 * 1024 * 1024; // 4 MiB — must match POSIX_HEAP_BYTES in layout.rs
+/// `image_kaddr` is the physical address of the ramdisk binary (from the
+/// `ramdisk.image` MEM cap), `heap_base` is the ramdisk's budget heap,
+/// and `storage_base`/`storage_len` describe the block device region.
+pub fn build_ramdisk_manifest(
+    image_kaddr: u64,
+    image_size: u32,
+    heap_base: u64,
+    storage_base: u64,
+    storage_len: u64,
+) -> Vec<u8> {
+    let heap_size = 256 * 1024; // 256 KiB — must match RAMDISK_HEAP_BYTES in layout.rs
     let caps = [
         Some(ManifestCap {
             name: "budget",
@@ -32,18 +39,18 @@ pub fn build_posix_manifest(image_kaddr: u64, image_size: u32, heap_base: u64) -
             },
         }),
         Some(ManifestCap {
-            name: "console",
-            rights: 0x7, // R | W | (send)
-            kind: CapKind::Chan {
-                peer: Some("kernel.debug.console"),
-                flags: 0,
+            name: "storage",
+            rights: 0x1, // R only — read-only block device
+            kind: CapKind::Mem {
+                base: storage_base,
+                size: storage_len,
             },
         }),
         Some(ManifestCap {
-            name: "ramdisk",
-            rights: 0x7, // R | W | send — block I/O channel to the ramdisk driver
+            name: "console",
+            rights: 0x7, // R | W | send
             kind: CapKind::Chan {
-                peer: Some("drv.ramdisk.0"),
+                peer: Some("kernel.debug.console"),
                 flags: 0,
             },
         }),
@@ -65,8 +72,8 @@ pub fn build_posix_manifest(image_kaddr: u64, image_size: u32, heap_base: u64) -
         version_major: 1,
         version_minor: 0,
         flags: 0,
-        name: Some(POSIX_MANIFEST_NAME),
-        personality: Some("aerosls.posix.v1"),
+        name: Some(RAMDISK_MANIFEST_NAME),
+        personality: Some("aerosls.ramdisk.v1"),
         image: Some(Image {
             offset: 0,
             size: image_size,
@@ -74,19 +81,19 @@ pub fn build_posix_manifest(image_kaddr: u64, image_size: u32, heap_base: u64) -
         }),
         budget: Some(Budget {
             mem_bytes: heap_size,
-            stack_bytes: 64 * 1024,
-            heap_initial: 1024 * 1024,
+            stack_bytes: 16 * 1024,
+            heap_initial: 64 * 1024,
         }),
         cpu: Some(Cpu {
-            share: 100,
+            share: 50,
             preemptible: true,
         }),
         limits: Some(Limits {
-            max_tasks: 64,
-            max_fds: 128,
-            max_channels: 32,
-            max_open_files: 128,
-            chan_queue_depth: 16,
+            max_tasks: 1,
+            max_fds: 0,
+            max_channels: 16,
+            max_open_files: 0,
+            chan_queue_depth: 32,
         }),
         caps,
         n_caps: 3,
@@ -100,7 +107,6 @@ pub fn build_posix_manifest(image_kaddr: u64, image_size: u32, heap_base: u64) -
     };
 
     let mut blob = build_manifest(&m);
-    // Append the image_kaddr footer, then patch total_len and body CRC.
     blob.extend_from_slice(&image_kaddr.to_le_bytes());
     let total = blob.len() as u32;
     blob[16..20].copy_from_slice(&total.to_le_bytes());

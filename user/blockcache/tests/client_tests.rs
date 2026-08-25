@@ -90,7 +90,8 @@ fn setup_writable(blocks: usize) -> (FakeKernel, FakeClient, JoinHandle<()>, Vec
 fn connect(client: &FakeClient) -> BlockCache<FakeClient, FakeAlloc> {
     BlockCache::connect(
         KWrap(Arc::new(client.clone())),
-        0,
+        0,  // chan_w
+        0,  // chan_r (fake kernel uses same channel for both)
         AWrap(Arc::new(Mutex::new(FakeAlloc(client.clone())))),
     )
     .unwrap()
@@ -348,7 +349,8 @@ fn in_flight_read_aborts_with_close() {
 
     let mut cache = BlockCache::connect(
         KWrap(Arc::new(client.clone())),
-        0,
+        0,  // chan_w
+        0,  // chan_r
         AWrap(Arc::new(Mutex::new(FakeAlloc(client.clone())))),
     )
     .unwrap();

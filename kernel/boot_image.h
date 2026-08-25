@@ -77,6 +77,8 @@
 #define BOOT_DM_MANIFEST_PATH       "boot/dm.manifest"
 #define BOOT_POSIX_BIN_PATH         "boot/posix.bin"
 #define BOOT_POSIX_MANIFEST_PATH    "boot/posix.manifest"
+#define BOOT_RAMDISK_BIN_PATH       "boot/ramdisk.bin"
+#define BOOT_RAMDISK_MANIFEST_PATH  "boot/ramdisk.manifest"
 #define BOOT_LAYOUT_PATH            "boot/layout"
 
 /* ─── boot/layout text format ───────────────────────────────────────────── */
@@ -159,11 +161,14 @@ struct BootImageInfo {
     uint64_t init_kaddr, init_size;
     uint64_t dm_kaddr,   dm_size;
     uint64_t posix_kaddr, posix_size;
+    uint64_t ramdisk_kaddr, ramdisk_size;
+    uint64_t storage_kaddr, storage_size;
     uint64_t reg_kaddr,  reg_size;
     uint64_t boot_base,  boot_total;
     uint32_t init_bin_off, init_bin_len;   /* archive offsets of the images */
     uint32_t dm_bin_off,   dm_bin_len;
     uint32_t posix_bin_off, posix_bin_len;
+    uint32_t ramdisk_bin_off, ramdisk_bin_len;
 };
 
 /* boot_image.c error codes (returned by the pure core; the glue logs and

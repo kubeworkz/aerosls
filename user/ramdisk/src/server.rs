@@ -53,12 +53,36 @@ pub struct Close {
 /// blocks forever with `TIMEOUT_NONE`; the driver has no timers (backoff and
 /// respawn are the POSIX core's job).
 pub fn run<K: Kernel>(k: &K, eps: &mut EndpointSet, dev: &Device) -> Result<(), i32> {
+    use crate::kapi::{CAP_CHAN, CAP_CHAN_W};
     let mut buf = [0u8; ChanHeader::MAX_PAYLOAD];
     let mut caps = [GrantedCap::default(); ChanHeader::MAX_CAPS];
 
-    loop {
+    loop {        // Re-scan cap table for newly-wired CHAN endpoints (e.g. the POSIX
+        // sidecar's "ramdisk" channel, wired after this sidecar booted).
+        // For each CHAN_R, adopt it — the kernel's CHAN_R send fallback
+        // (cap_send_msg accepts both CHAN_W with SEND and CHAN_R with
+        // RECV) means replies sent on CHAN_R route to the peer's receive
+        // queue on the same channel object, so we don't need to find a
+        // separate CHAN_W slot.
+        for slot in 0u32..16 {
+            if eps.is_console(slot) { continue; }
+            if let Ok(info) = k.cap_info(slot) {
+                if info.ty == CAP_CHAN {
+                    eps.adopt(slot);
+                }
+            }
+        }
+
         let list = eps.wait_list();
-        let (idx, _kind) = k.wait(&list[..eps.wait_len()], kapi::TIMEOUT_NONE)?;
+        // Use a finite deadline so the loop periodically re-scans for
+        // newly-wired channels (e.g. the POSIX sidecar's ramdisk channel,
+        // wired after this sidecar booted). TIMEOUT_NONE would block
+        // forever on the initial endpoints, missing post-boot channels.
+        let poll_ns: u64 = 200_000_000; /* 200 ms */
+        let (idx, _kind) = match k.wait(&list[..eps.wait_len()], poll_ns) {
+            Ok(r) => r,
+            Err(_) => continue, /* timeout: re-scan and retry */
+        };
         let handle = list[idx];
 
         if eps.is_console(handle) {
@@ -82,6 +106,9 @@ pub fn run<K: Kernel>(k: &K, eps: &mut EndpointSet, dev: &Device) -> Result<(), 
                     .by_handle(handle)
                     .map(|e| e.state)
                     .unwrap_or(EndpointState::AwaitingHandshake);
+                // Send replies on the same handle we received on — the
+                // kernel's CHAN_R send fallback routes to the peer's
+                // receive queue on the same channel object.
                 if let Err(close) =
                     dispatch(k, handle, state, rr.tag, dev, &buf[..rr.len], &caps[..rr.n_caps])
                 {

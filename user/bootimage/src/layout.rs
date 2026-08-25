@@ -53,6 +53,16 @@ pub const DM_HEAP_BYTES: u64 = 256 * 1024;
 /// process table, and applet scripts.
 pub const POSIX_HEAP_BYTES: u64 = 4 * 1024 * 1024;
 
+/// The ramdisk driver's budget heap — 256 KiB, same as the DM.
+pub const RAMDISK_HEAP_BYTES: u64 = 256 * 1024;
+
+/// The ramdisk storage region — 32 MiB of block data that the POSIX sidecar
+/// reads via the block cache. In a real deployment this would contain an
+/// aerofs-lite or ext2 rootfs image; for the Phase 5 demo it is zero-filled
+/// (the POSIX shell boots in console-only mode until a real image is placed
+/// here).
+pub const STORAGE_BYTES: u64 = 16 * 1024 * 1024;
+
 /// The device registry region: `4 + MAX_DEVICES(16) × 64` = 1028 bytes
 /// (devreg.rs), rounded to one page.
 pub const REGISTRY_BYTES: u64 = 4096;
@@ -66,6 +76,8 @@ pub const INIT_MANIFEST_NAME: &str = "aerosls.init.0";
 pub const DM_MANIFEST_NAME: &str = "drv.device_manager.0";
 /// The POSIX sidecar's registry name.
 pub const POSIX_MANIFEST_NAME: &str = "aerosls.posix.0";
+/// The ramdisk driver's registry name.
+pub const RAMDISK_MANIFEST_NAME: &str = "drv.ramdisk.0";
 
 /// Archive entry paths (the loader walks the CPIO for `INIT_MANIFEST_PATH`).
 pub const INIT_BIN_PATH: &str = "boot/init.bin";
@@ -74,6 +86,8 @@ pub const DM_BIN_PATH: &str = "boot/dm.bin";
 pub const DM_MANIFEST_PATH: &str = "boot/dm.manifest";
 pub const POSIX_BIN_PATH: &str = "boot/posix.bin";
 pub const POSIX_MANIFEST_PATH: &str = "boot/posix.manifest";
+pub const RAMDISK_BIN_PATH: &str = "boot/ramdisk.bin";
+pub const RAMDISK_MANIFEST_PATH: &str = "boot/ramdisk.manifest";
 pub const LAYOUT_PATH: &str = "boot/layout";
 
 /// One reserved physical region.
@@ -101,6 +115,9 @@ pub struct BootLayout {
     pub dm_heap: Region,
     pub posix_image: Region,
     pub posix_heap: Region,
+    pub ramdisk_image: Region,
+    pub ramdisk_heap: Region,
+    pub storage: Region,
     pub registry: Region,
 }
 
@@ -113,7 +130,7 @@ impl BootLayout {
 
     /// Every region, in memory order, for iteration in tests and the
     /// `boot/layout` file.
-    pub fn regions(&self) -> [(&'static str, Region); 7] {
+    pub fn regions(&self) -> [(&'static str, Region); 10] {
         [
             ("init.image", self.init_image),
             ("init.heap", self.init_heap),
@@ -121,6 +138,9 @@ impl BootLayout {
             ("dm.heap", self.dm_heap),
             ("posix.image", self.posix_image),
             ("posix.heap", self.posix_heap),
+            ("ramdisk.image", self.ramdisk_image),
+            ("ramdisk.heap", self.ramdisk_heap),
+            ("storage", self.storage),
             ("registry", self.registry),
         ]
     }
@@ -135,12 +155,18 @@ pub struct BootImageSpec {
     pub dm_bin: Vec<u8>,
     /// The POSIX sidecar flat binary.
     pub posix_bin: Vec<u8>,
+    /// The ramdisk driver flat binary.
+    pub ramdisk_bin: Vec<u8>,
     /// Size of init's budget heap region.
     pub init_heap_bytes: u64,
     /// Size of the DM's budget heap region.
     pub dm_heap_bytes: u64,
     /// Size of the POSIX sidecar's budget heap region.
     pub posix_heap_bytes: u64,
+    /// Size of the ramdisk driver's budget heap region.
+    pub ramdisk_heap_bytes: u64,
+    /// Size of the ramdisk storage region.
+    pub storage_bytes: u64,
     /// Size of the device-registry region.
     pub registry_bytes: u64,
     /// Physical base of the whole boot-image region.
@@ -151,23 +177,29 @@ pub struct BootImageSpec {
     pub dm_entry: u64,
     /// Entry-point offset within the POSIX binary.
     pub posix_entry: u64,
+    /// Entry-point offset within the ramdisk binary.
+    pub ramdisk_entry: u64,
 }
 
 impl BootImageSpec {
     /// A spec with the documented defaults.
-    pub fn new(init_bin: Vec<u8>, dm_bin: Vec<u8>, posix_bin: Vec<u8>) -> Self {
+    pub fn new(init_bin: Vec<u8>, dm_bin: Vec<u8>, posix_bin: Vec<u8>, ramdisk_bin: Vec<u8>) -> Self {
         Self {
             init_bin,
             dm_bin,
             posix_bin,
+            ramdisk_bin,
             init_heap_bytes: INIT_HEAP_BYTES,
             dm_heap_bytes: DM_HEAP_BYTES,
             posix_heap_bytes: POSIX_HEAP_BYTES,
+            ramdisk_heap_bytes: RAMDISK_HEAP_BYTES,
+            storage_bytes: STORAGE_BYTES,
             registry_bytes: REGISTRY_BYTES,
             base_phys: BOOT_IMAGE_BASE_PHYS,
             init_entry: 0,
             dm_entry: 0,
             posix_entry: 0,
+            ramdisk_entry: 0,
         }
     }
 }
@@ -199,6 +231,9 @@ pub fn compute_layout(spec: &BootImageSpec) -> BootLayout {
         dm_heap: take(spec.dm_heap_bytes),
         posix_image: take(spec.posix_bin.len() as u64),
         posix_heap: take(spec.posix_heap_bytes),
+        ramdisk_image: take(spec.ramdisk_bin.len() as u64),
+        ramdisk_heap: take(spec.ramdisk_heap_bytes),
+        storage: take(spec.storage_bytes),
         registry: take(spec.registry_bytes),
     }
 }
@@ -208,7 +243,7 @@ mod tests {
     use super::*;
 
     fn spec() -> BootImageSpec {
-        BootImageSpec::new(vec![0xAA; 0x2000], vec![0xBB; 0x4000], vec![0xCC; 0x8000])
+        BootImageSpec::new(vec![0xAA; 0x2000], vec![0xBB; 0x4000], vec![0xCC; 0x8000], vec![0xDD; 0x1000])
     }
 
     #[test]
@@ -238,11 +273,19 @@ mod tests {
     }
 
     #[test]
+    fn ramdisk_image_sits_after_posix_heap() {
+        let l = compute_layout(&spec());
+        assert!(l.ramdisk_image.phys >= l.posix_heap.end());
+    }
+
+    #[test]
     fn heap_regions_match_the_sidecar_contracts() {
         let l = compute_layout(&spec());
         assert_eq!(l.init_heap.size, INIT_HEAP_BYTES);
         assert_eq!(l.dm_heap.size, DM_HEAP_BYTES);
         assert_eq!(l.posix_heap.size, POSIX_HEAP_BYTES);
+        assert_eq!(l.ramdisk_heap.size, RAMDISK_HEAP_BYTES);
+        assert_eq!(l.storage.size, STORAGE_BYTES);
         assert_eq!(l.registry.size, REGISTRY_BYTES);
     }
 

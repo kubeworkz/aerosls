@@ -15,6 +15,11 @@ aerosls-kernel-sim = { path = "../kernel-sim" }
 # the sidecar entry point. The default (host) build omits them so the crate
 # links cleanly into the test harness. Build the sidecar image with:
 #   cargo build --features target
+[[bin]]
+name = "ramdisk"
+path = "src/bin/ramdisk.rs"
+required-features = ["target"]
+
 [features]
 default = []
 # `target` also enables the real kernel ABI in aerosls-proto.

@@ -162,12 +162,14 @@ int k_chan_wait(uint32_t pid, const uint16_t* chans, uint32_t n,
         deadline = chan_deadline_from_ns(timeout_ns);
 
     uint32_t chan_ids[CHAN_WAIT_MAX_CHANS];
+    int dirs[CHAN_WAIT_MAX_CHANS];
     for (uint32_t i = 0; i < n; i++) {
         uint32_t chan_id;
         int dir;
         int r = chan_resolve(pid, chans[i], CAP_TYPE_CHAN_R, &chan_id, &dir);
         if (r != CAP_ERR_OK) return r;   /* every listed handle must be valid */
         chan_ids[i] = chan_id;
+        dirs[i] = dir;
         struct CapChannel* ch = &cap_channels[chan_id];
         cap_lock(&ch->lock);
         int ready = (ch->qdepth[dir] > 0);
@@ -198,13 +200,14 @@ int k_chan_wait(uint32_t pid, const uint16_t* chans, uint32_t n,
     cap_wait_chans(chan_ids, n, req, SYS_SLS_CHAN_WAIT, deadline);
     /* noreturn when it parks. If it returned (couldn't park / hlt woke),
      * re-check the queues — the message may have arrived during the hlt.
-     * All CHAN_R handles read from direction 0 (the receive end). */
+     * Use the per-channel dir[] resolved in the first poll loop. */
     for (uint32_t i = 0; i < n; i++) {
         struct CapChannel* ch = &cap_channels[chan_ids[i]];
+        int d = dirs[i];
         cap_lock(&ch->lock);
-        int ready = (ch->qdepth[0] > 0);
+        int ready = (ch->qdepth[d] > 0);
         uint16_t kind = CH_KIND_MSG;
-        if (!ready && ch->close_evt[0]) { ready = 1; kind = CH_KIND_CLOSE; }
+        if (!ready && ch->close_evt[d]) { ready = 1; kind = CH_KIND_CLOSE; }
         cap_unlock(&ch->lock);
         if (ready) {
             *out_idx = i;
@@ -346,7 +349,11 @@ int k_chan_send(uint32_t pid, uint16_t chan, uint32_t tag, uint16_t flags,
 
     uint32_t chan_id;
     int dir;
+    /* Accept both CHAN_W (normal send) and CHAN_R (reply from server on
+     * its receive handle — the kernel routes to the peer's receive queue). */
     int r = chan_resolve(pid, chan, CAP_TYPE_CHAN_W, &chan_id, &dir);
+    if (r == CAP_ERR_TYPE)
+        r = chan_resolve(pid, chan, CAP_TYPE_CHAN_R, &chan_id, &dir);
     if (r != CAP_ERR_OK) return r;
     struct CapChannel* ch = &cap_channels[chan_id];
     cap_lock(&ch->lock);
