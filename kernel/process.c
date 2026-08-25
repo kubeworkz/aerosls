@@ -1296,16 +1296,14 @@ int cap_wait_chans(const uint32_t* chan_ids, uint32_t n, void* req,
 
     struct ProcessDescriptor* next = pick_next_runnable();
     if (!next) {
-        /* Nobody to run yet — mark ourselves SUSPENDED so the timer
-         * ISR's schedule_ring3 can find a newly-runnable peer (the DM
-         * booting) instead of re-resuming us. After hlt, restore
-         * PROC_RUNNING and let the caller retry (the queue may now
-         * have a message). */
-        cur->state = PROC_SUSPENDED;
+        /* Nobody to run yet. Hlt for one tick so the timer ISR fires;
+         * the caller re-checks the queue after we return. */
+        uint64_t one_tick = kernel_tick_counter + 1;
+        cur->waiting_deadline = one_tick;
         __asm__ volatile("sti; hlt" ::: "memory");
-        cur->state = PROC_RUNNING;
-        cur->waiting_nchans  = 0;
         cur->waiting_deadline = 0;
+        cur->waiting_nchans  = 0;
+        cur->state           = PROC_RUNNING;
         return 0;
     }
     kernel_serial_printf("[CAP] chan wait: switching to PID %u '%s'\n",
@@ -1520,14 +1518,7 @@ uint32_t sys_sls_yield(void) {
      * candidate). Order matters: picking after would let us pick ourselves
      * and spin forever. */
     struct ProcessDescriptor* next = pick_next_runnable();
-    if (!next) {
-        /* Nobody else — mark SUSPENDED so the ISR can find a peer,
-         * then hlt and resume. Same mechanism as cap_wait_chans. */
-        cur->state = PROC_SUSPENDED;
-        __asm__ volatile("sti; hlt" ::: "memory");
-        cur->state = PROC_RUNNING;
-        return 0;
-    }
+    if (!next) return 0;   /* nobody else: continue immediately */
     /* Capture the FULL entry frame (all eight regs + user RSP) into
      * park_ctx, exactly like cap_wait_chan()/cap_maybe_handoff().
      * cap_sysret_resume() REBUILDS the resume frame from these — the
