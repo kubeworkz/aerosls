@@ -248,6 +248,12 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     };
     let dm_channel = spawn_device_manager(&console, dm_image);
 
+    // Yield to give the DM time to start and park on its messenger channel
+    // before we send the registry. Without this, init may send before the
+    // DM enters k_chan_wait, and cap_wake_chan finds no parked process — the
+    // message sits in the queue but the DM's first-poll might race.
+    unsafe { k_yield(); }
+
     // ── 6. Send the device registry to the Device Manager ─────────────────
     log(&console, "[INIT] sending device registry to Device Manager...");
 
@@ -333,6 +339,8 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         storage_base,
         storage_len,
     );
+    // Yield to let the ramdisk sidecar start and park.
+    unsafe { k_yield(); }
 
     // ── 9. Spawn the POSIX sidecar ────────────────────────────────────────
     log(&console, "[INIT] spawning POSIX sidecar...");

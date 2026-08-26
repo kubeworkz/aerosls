@@ -472,7 +472,18 @@ impl<K: Kernel, A: BufferAlloc> BlockCache<K, A> {
         // Block until data arrives on the channel. In the real kernel,
         // k_chan_recv is non-blocking (returns ERR_STATE on empty queue);
         // k.wait parks until a message is queued or a deadline fires.
-        let _ = self.k.wait(&[self.chan_r], TIMEOUT_NONE);
+        // When no runnable process exists the kernel returns ERR_TIMEOUT
+        // (couldn't park); yield to let peers run and retry.
+        loop {
+            match self.k.wait(&[self.chan_r], TIMEOUT_NONE) {
+                Ok(_) => break,
+                aerosls_proto::kabi::ERR_TIMEOUT => {
+                    self.k.sched_yield();
+                    continue;
+                }
+                Err(e) => return Err(self.kernel_fail(e)),
+            }
+        }
         let rr = self
             .k
             .recv(self.chan_r, buf, caps)

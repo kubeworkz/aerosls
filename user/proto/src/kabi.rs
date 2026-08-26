@@ -248,6 +248,10 @@ mod abi {
             lateout("r10") _,
             options(nostack),
         );
+        // Full compiler fence: the syscall wrote through an opaque u64
+        // pointer; the compiler cannot prove it aliases the request struct,
+        // so without a fence it may reuse stale cached field values.
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
         ret
     }
 
@@ -396,10 +400,13 @@ mod abi {
             return rc as i32;
         }
         if !out_r.is_null() {
-            unsafe { *out_r = req.out_ch_r as u32 };
+            // SAFETY: read_volatile forces a re-read from memory after the
+            // syscall; the opaque u64 pointer hides the alias from the
+            // optimizer, so without volatile it may reuse the default.
+            unsafe { *out_r = core::ptr::read_volatile(&req.out_ch_r) as u32 };
         }
         if !out_w.is_null() {
-            unsafe { *out_w = req.out_ch_w as u32 };
+            unsafe { *out_w = core::ptr::read_volatile(&req.out_ch_w) as u32 };
         }
         0
     }
@@ -430,8 +437,11 @@ mod abi {
         let rc = unsafe { sls_syscall(SYS_CHAN_WAIT, &req as *const ChanWaitReq as u64) };
         if rc == 0 && !out.is_null() {
             unsafe {
-                (*out).idx = req.out_idx;
-                (*out).kind = req.out_kind;
+                // SAFETY: read_volatile forces a re-read from memory after the
+                // syscall; the opaque u64 pointer hides the alias from the
+                // optimizer, so without volatile it may reuse defaults.
+                (*out).idx = core::ptr::read_volatile(&req.out_idx);
+                (*out).kind = core::ptr::read_volatile(&req.out_kind);
             }
         }
         rc as i32
@@ -458,26 +468,30 @@ mod abi {
         let rc = unsafe { sls_syscall(SYS_CHAN_RECV, &mut req as *mut ChanRecvReq as u64) };
         if rc == 0 {
             if !out.is_null() {
+                // SAFETY: read_volatile forces a re-read from memory after the
+                // syscall; the opaque u64 pointer hides the alias from the
+                // optimizer, so without volatile it may reuse defaults.
                 unsafe {
-                    (*out).kind = req.out.kind;
-                    (*out).flags = req.out.flags;
-                    (*out).tag = req.out.tag;
-                    (*out).len = req.out.len;
-                    (*out).n_caps = req.out.n_caps;
-                    (*out).needed = req.out.needed;
+                    (*out).kind = core::ptr::read_volatile(&req.out.kind);
+                    (*out).flags = core::ptr::read_volatile(&req.out.flags);
+                    (*out).tag = core::ptr::read_volatile(&req.out.tag);
+                    (*out).len = core::ptr::read_volatile(&req.out.len);
+                    (*out).n_caps = core::ptr::read_volatile(&req.out.n_caps);
+                    (*out).needed = core::ptr::read_volatile(&req.out.needed);
                 }
             }
             if !slots.is_null() {
-                let nc = (req.out.n_caps as usize).min(req.n_slots as usize);
+                let nc = (unsafe { core::ptr::read_volatile(&req.out.n_caps) } as usize)
+                    .min(req.n_slots as usize);
                 for i in 0..nc {
                     unsafe {
                         (*slots.add(i)) = CapRefOut {
-                            handle: req.slots[i].handle,
-                            rights: req.slots[i].rights,
-                            flags: req.slots[i].flags,
+                            handle: core::ptr::read_volatile(&req.slots[i].handle),
+                            rights: core::ptr::read_volatile(&req.slots[i].rights),
+                            flags: core::ptr::read_volatile(&req.slots[i].flags),
                             pad: 0,
-                            base: req.slots[i].base,
-                            len: req.slots[i].len,
+                            base: core::ptr::read_volatile(&req.slots[i].base),
+                            len: core::ptr::read_volatile(&req.slots[i].len),
                         };
                     }
                 }
@@ -558,11 +572,14 @@ mod abi {
         let rc = unsafe { sls_syscall(SYS_CAP_INFO, &mut req as *mut CapInfoReq as u64) };
         if rc == 0 && !out.is_null() {
             unsafe {
-                (*out).ty = req.out.ty;
-                (*out).rights = req.out.rights;
-                (*out).flags = req.out.flags;
-                (*out).base = req.out.base;
-                (*out).len = req.out.len;
+                // SAFETY: read_volatile forces a re-read from memory after the
+                // syscall; the opaque u64 pointer hides the alias from the
+                // optimizer, so without volatile it may reuse defaults.
+                (*out).ty = core::ptr::read_volatile(&req.out.ty);
+                (*out).rights = core::ptr::read_volatile(&req.out.rights);
+                (*out).flags = core::ptr::read_volatile(&req.out.flags);
+                (*out).base = core::ptr::read_volatile(&req.out.base);
+                (*out).len = core::ptr::read_volatile(&req.out.len);
             }
         }
         rc as i32
