@@ -79,6 +79,7 @@
 #define BOOT_POSIX_MANIFEST_PATH    "boot/posix.manifest"
 #define BOOT_RAMDISK_BIN_PATH       "boot/ramdisk.bin"
 #define BOOT_RAMDISK_MANIFEST_PATH  "boot/ramdisk.manifest"
+#define BOOT_ROOTFS_BIN_PATH         "boot/rootfs.bin"
 #define BOOT_LAYOUT_PATH            "boot/layout"
 
 /* ─── boot/layout text format ───────────────────────────────────────────── */
@@ -169,6 +170,7 @@ struct BootImageInfo {
     uint32_t dm_bin_off,   dm_bin_len;
     uint32_t posix_bin_off, posix_bin_len;
     uint32_t ramdisk_bin_off, ramdisk_bin_len;
+    uint32_t rootfs_bin_off, rootfs_bin_len;
 };
 
 /* boot_image.c error codes (returned by the pure core; the glue logs and

@@ -25,6 +25,7 @@ pub mod builder;
 pub mod flatten;
 pub mod layout;
 pub mod newc;
+pub mod rootfs;
 
 pub use builder::{BootImage, build_boot_image};
 pub use flatten::{FlattenError, Flattened, flatten_elf};

@@ -11,6 +11,7 @@ license = "MIT"
 # parser and the runtime dm_manifest.rs packer.
 [dependencies]
 aerosls-proto = { path = "../proto" }
+aerosls-vfs = { path = "../vfs" }
 
 [[bin]]
 name = "aerosls-bootimage"

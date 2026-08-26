@@ -33,6 +33,7 @@ name = "aerosls-bootimage"
 version = "0.1.0"
 dependencies = [
  "aerosls-proto",
+ "aerosls-vfs",
 ]
 
 [[package]]

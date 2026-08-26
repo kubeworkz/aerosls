@@ -216,6 +216,10 @@ int boot_image_parse(const uint8_t* archive, uint32_t archive_len,
     /* Ramdisk binary is optional for older images. */
     r = boot_newc_find(archive, archive_len, BOOT_RAMDISK_BIN_PATH, &roff, &rsize);
     if (r != 0) { roff = 0; rsize = 0; }  /* absent: ramdisk_kaddr/size remain 0 */
+    /* Rootfs is optional — older images boot in console-only mode. */
+    uint32_t rootfs_off = 0, rootfs_len = 0;
+    r = boot_newc_find(archive, archive_len, BOOT_ROOTFS_BIN_PATH, &rootfs_off, &rootfs_len);
+    if (r != 0) { rootfs_off = 0; rootfs_len = 0; }
 
     /* Cross-checks: the archive's image bytes must be exactly what the
      * manifest declares — a mismatch means a rebuilt sidecar without a
@@ -251,6 +255,8 @@ int boot_image_parse(const uint8_t* archive, uint32_t archive_len,
     info->posix_bin_len = psize;
     info->ramdisk_bin_off = roff;
     info->ramdisk_bin_len = rsize;
+    info->rootfs_bin_off = rootfs_off;
+    info->rootfs_bin_len = rootfs_len;
 
     /* Sanity: the DM image and registry sit inside the reserved span
      * (contiguous by the builder's construction). */
@@ -410,6 +416,27 @@ void launch_init_sidecar(void) {
            info.posix_bin_len);
     memcpy((void*)(uintptr_t)info.ramdisk_kaddr, archive + info.ramdisk_bin_off,
            info.ramdisk_bin_len);
+
+    /* 2b. Copy the rootfs image to the ramdisk's storage region, if present.
+     *     The storage address comes from the ramdisk manifest's storage cap
+     *     (the init manifest doesn't declare it to avoid cap overlap).
+     *     For the Phase 5 layout the storage region is always contiguous
+     *     after ramdisk.heap: ramdisk_heap_end is the canonical address.
+     *     The region is identity-mapped by cap_create_sidecar. */
+    if (info.rootfs_bin_len != 0) {
+        /* Storage region starts after ramdisk.heap (page-aligned). */
+        uint64_t storage_addr = (info.ramdisk_kaddr + info.ramdisk_size
+                                 + 0x40000u + 4095u) & ~4095ULL;
+        /* Cap the copy to the remaining space below 4 GiB. */
+        uint64_t max_size = 0x100000000ULL - storage_addr;
+        uint32_t copy_len = info.rootfs_bin_len;
+        if ((uint64_t)copy_len > max_size) copy_len = (uint32_t)max_size;
+        memcpy((void*)(uintptr_t)storage_addr, archive + info.rootfs_bin_off,
+               copy_len);
+        kernel_serial_printf("[SIDECAR] rootfs: %u bytes @ 0x%llx\n",
+                             (unsigned)copy_len,
+                             (unsigned long long)storage_addr);
+    }
 
     /* 3. Build the device registry (devreg.rs wire format) at the address
      *    the init manifest's device_registry cap declares. */

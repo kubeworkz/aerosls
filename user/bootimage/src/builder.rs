@@ -37,7 +37,7 @@ pub const RAMDISK_PEER: &str = "drv.ramdisk.0";
 /// entry: it is implicit memory the loader reserves and zeroes (devreg.rs
 /// format), and the heap regions are implicit too — the archive carries no
 /// 16 MiB of zeros.
-pub const ENTRY_PATHS: [&str; 9] = [
+pub const ENTRY_PATHS: [&str; 10] = [
     crate::layout::INIT_BIN_PATH,
     crate::layout::INIT_MANIFEST_PATH,
     crate::layout::DM_BIN_PATH,
@@ -46,6 +46,7 @@ pub const ENTRY_PATHS: [&str; 9] = [
     crate::layout::POSIX_MANIFEST_PATH,
     crate::layout::RAMDISK_BIN_PATH,
     crate::layout::RAMDISK_MANIFEST_PATH,
+    crate::layout::ROOTFS_BIN_PATH,
     crate::layout::LAYOUT_PATH,
 ];
 
@@ -120,7 +121,8 @@ fn build_init_manifest(spec: &BootImageSpec, layout: &BootLayout, blob_offset: u
         }),
         None, // ramdisk.heap — NOT in init's manifest; the ramdisk driver's own
               // manifest declares its budget at this address (avoids cap_create_mem overlap)
-        None, // storage — NOT in init's manifest; only ramdisk needs it
+        None, // storage — NOT in init's manifest; the kernel reads the rootfs into
+              // the storage region directly via launch_init_sidecar
         None,
         None,
         None,
@@ -158,7 +160,7 @@ fn build_init_manifest(spec: &BootImageSpec, layout: &BootLayout, blob_offset: u
             chan_queue_depth: 16,
         }),
         caps,
-        n_caps: 6,
+        n_caps: 7,
         bootstrap: Some(Bootstrap {
             console: Some("console"),
             debug: None,
@@ -495,7 +497,10 @@ pub fn build_boot_image(spec: &BootImageSpec) -> BootImage {
     let posix_manifest_ph = build_posix_manifest(spec, &layout, 0);
     let ramdisk_manifest_ph = build_ramdisk_manifest(spec, &layout, 0);
 
-    // All nine entries in order; each entry's span is
+    // Build the rootfs image (aerofs-lite) for the ramdisk storage region.
+    let rootfs_img = crate::rootfs::build_rootfs();
+
+    // All ten entries in order; each entry's span is
     // 110 (header) + padded name + padded data.
     let mut off = 0usize;
     let mut entry_offsets: Vec<(String, usize, usize)> = Vec::new();
@@ -513,6 +518,7 @@ pub fn build_boot_image(spec: &BootImageSpec) -> BootImage {
         place(crate::layout::POSIX_MANIFEST_PATH, posix_manifest_ph.len(), &mut off);
         place(crate::layout::RAMDISK_BIN_PATH, spec.ramdisk_bin.len(), &mut off);
         place(crate::layout::RAMDISK_MANIFEST_PATH, ramdisk_manifest_ph.len(), &mut off);
+        place(crate::layout::ROOTFS_BIN_PATH, rootfs_img.len(), &mut off);
         let layout_size = layout_file_size();
         place(crate::layout::LAYOUT_PATH, layout_size, &mut off);
     }
@@ -547,6 +553,7 @@ pub fn build_boot_image(spec: &BootImageSpec) -> BootImage {
     newc::write_entry(&mut archive, crate::layout::POSIX_MANIFEST_PATH, &posix_manifest);
     newc::write_entry(&mut archive, crate::layout::RAMDISK_BIN_PATH, &spec.ramdisk_bin);
     newc::write_entry(&mut archive, crate::layout::RAMDISK_MANIFEST_PATH, &ramdisk_manifest);
+    newc::write_entry(&mut archive, crate::layout::ROOTFS_BIN_PATH, &rootfs_img);
     newc::write_entry(&mut archive, crate::layout::LAYOUT_PATH, layout_text.as_bytes());
     newc::finish(&mut archive);
 

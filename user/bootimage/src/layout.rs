@@ -88,6 +88,7 @@ pub const POSIX_BIN_PATH: &str = "boot/posix.bin";
 pub const POSIX_MANIFEST_PATH: &str = "boot/posix.manifest";
 pub const RAMDISK_BIN_PATH: &str = "boot/ramdisk.bin";
 pub const RAMDISK_MANIFEST_PATH: &str = "boot/ramdisk.manifest";
+pub const ROOTFS_BIN_PATH: &str = "boot/rootfs.bin";
 pub const LAYOUT_PATH: &str = "boot/layout";
 
 /// One reserved physical region.
