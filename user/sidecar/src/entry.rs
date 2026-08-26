@@ -108,6 +108,37 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     }
     let alloc = BudgetAlloc::new(caps.budget_slot, caps.budget_base, caps.budget_len);
 
+    // Debug: log ramdisk caps found in BIB.
+    {
+        let rw = caps.ramdisk_chan_w.map_or(0xFFu32, |v| v);
+        let rr = caps.ramdisk_chan_r.map_or(0xFFu32, |v| v);
+        let cw = caps.console_chan.map_or(0xFFu32, |v| v);
+        let mut msg = [0u8; 80];
+        let s = b"[POSIX] boot: rw=";
+        msg[..s.len()].copy_from_slice(s);
+        let mut off = s.len();
+        let hex = b"0123456789ABCDEF";
+        msg[off] = hex[(rw >> 4) as usize & 0xF]; off += 1;
+        msg[off] = hex[(rw & 0xF) as usize]; off += 1;
+        let s2 = b" rr=";
+        msg[off..off+s2.len()].copy_from_slice(s2); off += s2.len();
+        msg[off] = hex[(rr >> 4) as usize & 0xF]; off += 1;
+        msg[off] = hex[(rr & 0xF) as usize]; off += 1;
+        let s3 = b" cw=";
+        msg[off..off+s3.len()].copy_from_slice(s3); off += s3.len();
+        msg[off] = hex[(cw >> 4) as usize & 0xF]; off += 1;
+        msg[off] = hex[(cw & 0xF) as usize]; off += 1;
+        msg[off] = b'\n'; off += 1;
+        unsafe {
+            core::arch::asm!("syscall",
+                inlateout("rax") 165u64 => _,
+                in("rdi") msg.as_ptr(),
+                lateout("rcx") _, lateout("r11") _,
+                options(nostack),
+            );
+        }
+    }
+
     let console = alloc::sync::Arc::new(aerosls_vfs::CharNode::console());
     let mut booted = boot(RealKernel, &caps, console, alloc)
         .unwrap_or_else(|e| panic!("sidecar boot failed: {e:?}"));

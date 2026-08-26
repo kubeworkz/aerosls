@@ -318,7 +318,7 @@ fn build_posix_manifest(spec: &BootImageSpec, layout: &BootLayout, blob_offset: 
             chan_queue_depth: 16,
         }),
         caps,
-        n_caps: 2,
+        n_caps: 3,
         bootstrap: Some(Bootstrap {
             console: Some("console"),
             debug: None,

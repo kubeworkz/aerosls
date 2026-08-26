@@ -43,17 +43,19 @@ impl BudgetAlloc {
 impl aerosls_blockcache::BufferAlloc for BudgetAlloc {
     fn alloc(&mut self, len: usize) -> Result<(SendCap, u64), i32> {
         // 4 KiB-aligned so cache blocks never straddle a page boundary.
-        let off = self.bump.alloc(len, 4096).ok_or(ERR_BUDGET)?;
-        let base = self.base + off as u64;
+        // Bump::alloc returns an absolute address (cursor starts at base),
+        // so compute the sub-offset from the cap's base for the SendCap.
+        let addr = self.bump.alloc(len, 4096).ok_or(ERR_BUDGET)?;
+        let offset = (addr as u64).wrapping_sub(self.base);
         Ok((
             SendCap {
                 slot: self.slot,
-                offset: off as u32,
+                offset: offset as u32,
                 len: len as u32,
                 rights: R | W,
                 flags: 0,
             },
-            base,
+            addr as u64,
         ))
     }
 }
