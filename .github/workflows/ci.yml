@@ -18,6 +18,17 @@ on:
   pull_request:
     branches: [main]
 
+# --- CI ROUTING: SELF-HOSTED (dated exception -- see 0b of
+# docs/AeroSLS-QEMU-SLS-Claim-Verification-v0.1.md) ------------------------
+# All five jobs run on the self-hosted WSL runner (sls-wsl-runner) because
+# GitHub's hosted-runner fleet failed to attach runners on 2026-08-17
+# (runner_id=0 on every job). This is a deliberate, recorded exception:
+# tests/selfhosted_routing_smoke.sh fails unless the runs-on below and the
+# CI-ROUTING marker in the doc agree. Reverting these lines to
+# ubuntu-latest REQUIRES flipping that marker to HOSTED in the same commit
+# -- the two-way lock is the point, so the routing can't stay self-hosted
+# by accident after the fleet recovers.
+
 jobs:
   verify:
     runs-on: [self-hosted, Linux, X64]

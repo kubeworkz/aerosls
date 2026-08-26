@@ -35,6 +35,59 @@ command beside it is a number nobody can re-check.
 
 ---
 
+## 0b. CI routing record — self-hosted runner (guard-read)
+
+This is an **operational** record, not a kernel claim, kept here because it is
+dated, guard-read, and must not rot. The marker line below is read by
+`tests/selfhosted_routing_smoke.sh`, which runs in every CI push and fails if
+this record and the workflow's actual routing disagree. Do not edit the
+marker without editing `.github/workflows/ci.yml` in the same commit.
+
+**`CI-ROUTING: SELF-HOSTED — adopted 2026-08-17 (commit 23366da)`**
+
+**Why:** GitHub's hosted-runner fleet stopped attaching runners to jobs on
+2026-08-17. Every job of every run died 2–6 s in with **zero steps, zero
+logs, and `runner_id = 0`** (no runner was ever attached); a 23-minute queue
+then instant-fail on early attempts, and reruns kept failing through 10+
+attempts across ~3 hours. The status page ([githubstatus.com](https://www.githubstatus.com))
+showed **All Systems Operational** throughout — it lags the fleet — so the
+only reliable recovery signal is a hosted job that actually gets a runner.
+The community thread
+[orgs/community/discussions/186208](https://github.com/orgs/community/discussions/186208)
+describes the same recurring wave ("job was not acquired by Runner of type
+hosted even after multiple attempts").
+
+**What was done:** all five jobs in `.github/workflows/ci.yml` were routed
+from `runs-on: ubuntu-latest` to `runs-on: [self-hosted, Linux, X64]`
+(commit `23366da`), landing on `sls-wsl-runner` — actions/runner v2.336.0
+registered in WSL (Ubuntu 24.04), installed as a systemd service running as
+`kubew` (`actions.runner.kubeworkz-aerosls.sls-wsl-runner.service`, active
+and enabled). Commit `3f75d13` hardened the fake-node startup of the two
+failover smokes after the runner's first full pass caught a cold-start flake.
+Self-hosted runs one job at a time, so a full pass takes ~35–40 min.
+
+**Revert steps (do them together, in one commit):**
+
+1. **Confirm the fleet is actually recovered before reverting** — the status
+   page is not proof. The authoritative probe is a hosted job that completes:
+   temporarily push a branch with one job on `ubuntu-latest` (or use the
+   Actions UI), or check the job object for `runner_id != 0` on a hosted
+   run. Only revert when a hosted job has actually executed.
+2. Revert the five `runs-on: [self-hosted, Linux, X64]` lines in
+   `.github/workflows/ci.yml` to `runs-on: ubuntu-latest`.
+3. In the same commit, flip this marker to
+   **`CI-ROUTING: HOSTED — recovered <date> (commit <sha>)`** — the smoke
+   fails if the flip and the revert land in different commits.
+4. Push. The guard `tests/selfhosted_routing_smoke.sh` then asserts the
+   HOSTED record against the hosted routing and passes.
+
+Optional cleanup after a successful hosted pass: stop the runner service
+(`sudo /home/kubew/actions-runner/svc.sh stop`), remove it
+(`sudo /home/kubew/actions-runner/svc.sh uninstall`), and delete the runner
+registration in the repo's **Settings → Actions → Runners** page.
+
+---
+
 ## 1. Verified — safe to quote
 
 | Claim | Source | Measured | Command |
