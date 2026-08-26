@@ -121,20 +121,29 @@ pub struct DmServer<K: Kernel> {
 
 /// A fixed stack buffer for formatted logs — the freestanding binary has
 /// NO allocator, so `log_fmt!` formats into this instead of allocating.
-struct LogBuf([u8; 256]);
-
-impl core::fmt::Write for LogBuf {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let n = s.len().min(255); // byte 255 stays 0 (NUL terminator)
-        self.0[..n].copy_from_slice(&s.as_bytes()[..n]);
-        Ok(()) // truncates silently rather than failing
-    }
+/// Tracks a write cursor so successive `write_str` calls append.
+struct LogBuf {
+    buf: [u8; 256],
+    pos: usize,
 }
 
 impl LogBuf {
+    fn new() -> Self {
+        Self { buf: [0u8; 256], pos: 0 }
+    }
+
     fn as_str(&self) -> &str {
-        let len = self.0.iter().position(|&b| b == 0).unwrap_or(256);
-        core::str::from_utf8(&self.0[..len]).unwrap_or("")
+        core::str::from_utf8(&self.buf[..self.pos]).unwrap_or("")
+    }
+}
+
+impl core::fmt::Write for LogBuf {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let room = 255usize.saturating_sub(self.pos);
+        let n = s.len().min(room);
+        self.buf[self.pos..self.pos + n].copy_from_slice(&s.as_bytes()[..n]);
+        self.pos += n;
+        Ok(()) // truncates silently rather than failing
     }
 }
 
@@ -162,7 +171,7 @@ impl<K: Kernel> DmServer<K> {
 
     /// Format a log line into the stack buffer and send it (no alloc).
     pub fn log_fmt(&self, args: core::fmt::Arguments<'_>) {
-        let mut b = LogBuf([0; 256]);
+        let mut b = LogBuf::new();
         let _ = core::fmt::write(&mut b, args);
         self.log(b.as_str());
     }

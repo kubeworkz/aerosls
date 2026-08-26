@@ -30,6 +30,9 @@ use aerosls_proto::manifest::{
 /// `kernel.*` peers to the kernel context, pid 0).
 pub const CONSOLE_PEER: &str = "kernel.debug.console";
 
+/// Ramdisk driver peer — the POSIX sidecar's block device endpoint.
+pub const RAMDISK_PEER: &str = "drv.ramdisk.0";
+
 /// The whole archive entry list, in order. The registry region is NOT an
 /// entry: it is implicit memory the loader reserves and zeroes (devreg.rs
 /// format), and the heap regions are implicit too — the archive carries no
@@ -265,7 +268,14 @@ fn build_posix_manifest(spec: &BootImageSpec, layout: &BootLayout, blob_offset: 
                 flags: 0,
             },
         }),
-        None,
+        Some(ManifestCap {
+            name: "ramdisk",
+            rights: 0x7, // R | W | send
+            kind: CapKind::Chan {
+                peer: Some(RAMDISK_PEER),
+                flags: 0,
+            },
+        }),
         None,
         None,
         None,

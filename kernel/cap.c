@@ -1530,8 +1530,14 @@ int cap_recv_msg(uint32_t pid, uint16_t ch_r_idx,
      * the sender runs (and enqueues) before the receiver's recv returns to
      * ring-3. No-op in kernel context (the console service) and when
      * nothing was woken. */
+    /* Phase 5 critical fix: do NOT call cap_maybe_handoff() here.
+     * cap_recv_msg is called from k_chan_recv (kernel/chan.c) which writes
+     * the output fields (out->tag, out->len, etc.) AFTER cap_recv_msg
+     * returns. A handoff here suspends the caller mid-syscall and the
+     * output fields are never written — the receiver resumes with tag=0.
+     * cap_wake_chan stays for flow control (unblocking senders stalled on
+     * a full queue); the woken sender runs on the next scheduler tick. */
     cap_wake_chan(cobj->chan_id);
-    cap_maybe_handoff();
     return 0;
 }
 
@@ -2997,9 +3003,10 @@ int cap_create_sidecar(uint32_t parent_pid,
                 sc->wired_wr = c_wr;
                 kernel_serial_printf(
                     "[SIDECAR] PID %u '%s': wired chan '%s' to sidecar '%s' "
-                    "(PID %u, slots %u/%u)\n",
+                    "(PID %u, slots %u/%u peer_slots %u/%u)\n",
                     pd->pid, pd->name, sc->name, sc->peer_name,
-                    (unsigned)peer_pid, (unsigned)c_rd, (unsigned)c_wr);
+                    (unsigned)peer_pid, (unsigned)c_rd, (unsigned)c_wr,
+                    (unsigned)p_rd, (unsigned)p_wr);
             }
         }
     }
