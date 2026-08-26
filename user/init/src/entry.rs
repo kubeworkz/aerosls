@@ -358,6 +358,12 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     // The POSIX sidecar's manifest declares budget + console + ramdisk caps.
     // The ramdisk CHAN cap is wired by the kernel to drv.ramdisk.0.
     spawn_posix_sidecar(&console, posix_image_cap, posix_heap_base);
+    // Yield multiple times to give the ramdisk sidecar time to
+    // re-scan its cap table, discover the POSIX ramdisk channel,
+    // and be ready to handle RD_INFO before POSIX sends it.
+    for _ in 0..3 {
+        unsafe { k_yield(); }
+    }
 
     log(&console, "[INIT] ── Phase 5 init sidecar complete ──");
     log(&console, "[INIT] system ready for POSIX sidecar creation.");

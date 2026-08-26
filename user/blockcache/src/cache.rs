@@ -477,7 +477,7 @@ impl<K: Kernel, A: BufferAlloc> BlockCache<K, A> {
         loop {
             match self.k.wait(&[self.chan_r], TIMEOUT_NONE) {
                 Ok(_) => break,
-                aerosls_proto::kabi::ERR_TIMEOUT => {
+                Err(aerosls_proto::kabi::ERR_TIMEOUT) => {
                     self.k.sched_yield();
                     continue;
                 }
