@@ -20,6 +20,12 @@ use crate::heap::Bump;
 /// Carve request buffers out of the budget cap. `budget_slot` is the cap's
 /// handle in the sidecar's own table; `budget_base` its mapped address (for
 /// the block cache's copies).
+///
+/// The block cache is strictly window=1 and single-threaded, so a SINGLE
+/// fixed buffer (the region at `budget_base`, offset 0) is all it ever
+/// needs. The transport MOVES a cap when it is sent (capability-layer
+/// move, not mint), so every request must hand out a currently-valid source
+/// cap slot; `reclaim()` re-adopts the slot the peer returns in its reply.
 pub struct BudgetAlloc {
     slot: u32,
     base: u64,
@@ -42,20 +48,24 @@ impl BudgetAlloc {
 
 impl aerosls_blockcache::BufferAlloc for BudgetAlloc {
     fn alloc(&mut self, len: usize) -> Result<(SendCap, u64), i32> {
-        // 4 KiB-aligned so cache blocks never straddle a page boundary.
-        // Bump::alloc returns an absolute address (cursor starts at base),
-        // so compute the sub-offset from the cap's base for the SendCap.
-        let addr = self.bump.alloc(len, 4096).ok_or(ERR_BUDGET)?;
-        let offset = (addr as u64).wrapping_sub(self.base);
+        // Single fixed buffer: offset 0 of the budget cap, base == the
+        // cap's own base. window=1 means one grant is in flight at a time;
+        // it returns via the move-return (`reclaim` sets `self.slot`).
         Ok((
             SendCap {
                 slot: self.slot,
-                offset: offset as u32,
+                offset: 0,
                 len: len as u32,
                 rights: R | W,
                 flags: 0,
             },
-            addr as u64,
+            self.base,
         ))
+    }
+
+    fn reclaim(&mut self, slot: u32) {
+        // The peer returned our grant; it landed at a fresh slot in our
+        // table. Adopt it so the next request sends a VALID source cap.
+        self.slot = slot;
     }
 }

@@ -53,7 +53,7 @@ pub struct Close {
 /// blocks forever with `TIMEOUT_NONE`; the driver has no timers (backoff and
 /// respawn are the POSIX core's job).
 pub fn run<K: Kernel>(k: &K, eps: &mut EndpointSet, dev: &Device) -> Result<(), i32> {
-    use crate::kapi::{CAP_CHAN, CAP_CHAN_W};
+    use crate::kapi::CAP_CHAN;
     let mut buf = [0u8; ChanHeader::MAX_PAYLOAD];
     let mut caps = [GrantedCap::default(); ChanHeader::MAX_CAPS];
 
@@ -84,6 +84,7 @@ pub fn run<K: Kernel>(k: &K, eps: &mut EndpointSet, dev: &Device) -> Result<(), 
                                       * the client's recv_reply timeout. */
         let (idx, _kind) = match k.wait(&list[..eps.wait_len()], poll_ns) {
             Ok(r) => r,
+            Err(kabi::ERR_SHUTDOWN) => return Ok(()),
             Err(_) => continue, /* timeout: re-scan and retry */
         };
         let handle = list[idx];
@@ -198,7 +199,7 @@ fn dispatch<K: Kernel>(
         RD_READ => read_blocks(k, handle, tag, dev, payload, caps),
         RD_WRITE => write_blocks(k, handle, tag, dev, payload, caps),
         RD_FLUSH => {
-            reply_status(k, handle, tag, RD_FLUSH, RD_OK, 0);
+            reply_status(k, handle, tag, RD_FLUSH, RD_OK, 0, None);
             Ok(())
         }
         RD_MAP => reply_map(k, handle, tag, dev),
@@ -227,30 +228,36 @@ fn read_blocks<K: Kernel>(
     payload: &[u8],
     caps: &[GrantedCap],
 ) -> Result<(), Close> {
+    // Bind the client's grant cap up front: it must always travel back in
+    // the reply (move-return), on success AND on every error path, so the
+    // window=1 client's single granted buffer is never stranded here. The
+    // real kernel transport MOVES the cap (no separate mint), so the
+    // client holds no other copy of it once we receive it.
+    let grant = caps.first().copied();
+    let Some(grant) = grant else {
+        reply_status(k, handle, tag, RD_READ, RD_ERR_CAP, 0, None);
+        return Ok(());
+    };
     let Some((lba, count)) = payload.get(16..).and_then(parse_rw_body) else {
-        reply_status(k, handle, tag, RD_READ, RD_ERR_INVAL, 0);
+        reply_status(k, handle, tag, RD_READ, RD_ERR_INVAL, 0, Some(&grant));
         return Ok(());
     };
     if count == 0 || count > MAX_IO {
-        reply_status(k, handle, tag, RD_READ, RD_ERR_INVAL, 0);
+        reply_status(k, handle, tag, RD_READ, RD_ERR_INVAL, 0, Some(&grant));
         return Ok(());
     }
-    let Some(grant) = caps.first() else {
-        reply_status(k, handle, tag, RD_READ, RD_ERR_CAP, 0);
-        return Ok(());
-    };
     // The kernel minted min(held, requested); re-check what actually arrived.
     if grant.rights & W == 0 {
-        reply_status(k, handle, tag, RD_READ, RD_ERR_CAP, 0);
+        reply_status(k, handle, tag, RD_READ, RD_ERR_CAP, 0, Some(&grant));
         return Ok(());
     }
     let bytes = (count as u64 * BLOCK_SIZE as u64) as usize;
     if grant.len < bytes as u64 {
-        reply_status(k, handle, tag, RD_READ, RD_ERR_CAP, 0);
+        reply_status(k, handle, tag, RD_READ, RD_ERR_CAP, 0, Some(&grant));
         return Ok(());
     }
     if lba + count as u64 > dev.blocks() {
-        reply_status(k, handle, tag, RD_READ, RD_ERR_RANGE, 0);
+        reply_status(k, handle, tag, RD_READ, RD_ERR_RANGE, 0, Some(&grant));
         return Ok(());
     }
 
@@ -259,7 +266,7 @@ fn read_blocks<K: Kernel>(
     // Safety: storage range vs our own cap (checked above), grant range vs
     // the kernel-minted len (checked above), bytes <= MAX_IO * 512.
     unsafe { copy::copy_blocks(src, dst, bytes) };
-    reply_status(k, handle, tag, RD_READ, RD_OK, bytes as u64);
+    reply_status(k, handle, tag, RD_READ, RD_OK, bytes as u64, Some(&grant));
     Ok(())
 }
 
@@ -273,51 +280,72 @@ fn write_blocks<K: Kernel>(
 ) -> Result<(), Close> {
     // Structural: the driver's write authority is its storage cap rights
     // (plan §1). With the read-only manifest this always answers RD_ERR_RO.
+    let grant = caps.first().copied();
     if dev.read_only() {
-        reply_status(k, handle, tag, RD_WRITE, RD_ERR_RO, 0);
+        reply_status(k, handle, tag, RD_WRITE, RD_ERR_RO, 0, grant.as_ref());
         return Ok(());
     }
+    let Some(grant) = grant else {
+        reply_status(k, handle, tag, RD_WRITE, RD_ERR_CAP, 0, None);
+        return Ok(());
+    };
     let Some((lba, count)) = payload.get(16..).and_then(parse_rw_body) else {
-        reply_status(k, handle, tag, RD_WRITE, RD_ERR_INVAL, 0);
+        reply_status(k, handle, tag, RD_WRITE, RD_ERR_INVAL, 0, Some(&grant));
         return Ok(());
     };
     if count == 0 || count > MAX_IO {
-        reply_status(k, handle, tag, RD_WRITE, RD_ERR_INVAL, 0);
+        reply_status(k, handle, tag, RD_WRITE, RD_ERR_INVAL, 0, Some(&grant));
         return Ok(());
     }
-    let Some(grant) = caps.first() else {
-        reply_status(k, handle, tag, RD_WRITE, RD_ERR_CAP, 0);
-        return Ok(());
-    };
     // Write buffers are granted R-only (the driver reads from them).
     if grant.rights & R == 0 {
-        reply_status(k, handle, tag, RD_WRITE, RD_ERR_CAP, 0);
+        reply_status(k, handle, tag, RD_WRITE, RD_ERR_CAP, 0, Some(&grant));
         return Ok(());
     }
     let bytes = (count as u64 * BLOCK_SIZE as u64) as usize;
     if grant.len < bytes as u64 {
-        reply_status(k, handle, tag, RD_WRITE, RD_ERR_CAP, 0);
+        reply_status(k, handle, tag, RD_WRITE, RD_ERR_CAP, 0, Some(&grant));
         return Ok(());
     }
     if lba + count as u64 > dev.blocks() {
-        reply_status(k, handle, tag, RD_WRITE, RD_ERR_RANGE, 0);
+        reply_status(k, handle, tag, RD_WRITE, RD_ERR_RANGE, 0, Some(&grant));
         return Ok(());
     }
 
     let src = grant.base as *const u8;
     let dst = (dev.storage_base + lba * BLOCK_SIZE as u64) as *mut u8;
     unsafe { copy::copy_blocks(src, dst, bytes) };
-    reply_status(k, handle, tag, RD_WRITE, RD_OK, bytes as u64);
+    reply_status(k, handle, tag, RD_WRITE, RD_OK, bytes as u64, Some(&grant));
     Ok(())
 }
 
 /// Ramdisk in RAM: flush is a no-op. The handler exists so the protocol
 /// surface is stable for a future cached backend.
-fn reply_status<K: Kernel>(k: &K, handle: u32, tag: u32, ty: u16, status: u16, bytes: u64) {
+/// Status reply for a request that carried a transient grant. The grant is
+/// MOVED back to the client in the reply (move-return), so it can be
+/// re-adopted for the next window=1 request. `grant == None` for replies
+/// that carried no cap (RD_FLUSH).
+fn reply_status<K: Kernel>(
+    k: &K,
+    handle: u32,
+    tag: u32,
+    ty: u16,
+    status: u16,
+    bytes: u64,
+    grant: Option<&GrantedCap>,
+) {
     let mut p = [0u8; 16 + 10];
     p[..16].copy_from_slice(&RdFrame::new(ty, status != RD_OK).encode());
     p[16..].copy_from_slice(&encode_status_body(status, bytes));
-    let _ = k.send(handle, tag, F_REPLY, &p, &[], kapi::TIMEOUT_NONE);
+    let send_cap = [SendCap {
+        slot: grant.map_or(u32::MAX, |g| g.handle),
+        offset: 0,
+        len: BLOCK_SIZE,
+        rights: grant.map_or(0, |g| g.rights),
+        flags: 0,
+    }];
+    let caps: &[SendCap] = grant.map_or(&[], |_| &send_cap);
+    let _ = k.send(handle, tag, F_REPLY, &p, caps, kapi::TIMEOUT_NONE);
 }
 
 /// `RD_MAP`: reply carries a durable view of the whole storage region,

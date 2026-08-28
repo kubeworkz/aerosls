@@ -243,8 +243,12 @@ impl<K: Kernel, A: BufferAlloc> BlockCache<K, A> {
         let mut buf = [0u8; ChanHeader::MAX_PAYLOAD];
         let mut caps = [GrantedCap::default(); 1];
         let (rr, frame) = self.recv_reply(tag, &mut buf, &mut caps, RD_READ)?;
-        if rr.n_caps != 0 {
-            return Err(self.proto_fail());
+        // Re-adopt the returned grant cap: the transport MOVED our transient
+        // buffer cap to the driver, and the driver returns it here (move-
+        // return). Adopting the freshly-installed slot keeps the buffer a
+        // valid source for the next window=1 request.
+        if rr.n_caps >= 1 {
+            self.alloc.reclaim(caps[0].handle);
         }
         let (status, bytes) = self.status_of(&frame, &buf[16..rr.len])?;
         if status != RD_OK {
@@ -311,8 +315,8 @@ impl<K: Kernel, A: BufferAlloc> BlockCache<K, A> {
         let mut buf = [0u8; ChanHeader::MAX_PAYLOAD];
         let mut caps = [GrantedCap::default(); 1];
         let (rr, frame) = self.recv_reply(tag, &mut buf, &mut caps, RD_WRITE)?;
-        if rr.n_caps != 0 {
-            return Err(self.proto_fail());
+        if rr.n_caps >= 1 {
+            self.alloc.reclaim(caps[0].handle);
         }
         let (status, _bytes) = self.status_of(&frame, &buf[16..rr.len])?;
         if status != RD_OK {

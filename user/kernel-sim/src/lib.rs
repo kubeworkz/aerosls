@@ -489,25 +489,40 @@ impl Kernel for FakeKernel {
         }
 
         if flags & F_REPLY != 0 {
-            // Reply: window reopens, transient grants bound to the tag die.
+            // Reply: window reopens. Transient grants bound to the tag
+            // normally die here, BUT if the driver returns a cap in this
+            // reply (move-return for window=1 request buffers), the
+            // transient is re-adopted into the client table instead of
+            // being revoked — the client reuses it for the next request.
             match st.channels[ci].outstanding_tag {
                 Some(t) if t == tag => {}
                 _ => return Err(kabi::ERR_STATE),
             }
+            // Build a set of driver handles being returned in this reply.
+            let returned: std::collections::HashSet<u32> = caps
+                .iter()
+                .map(|c| c.slot)
+                .collect();
             let revoke: Vec<u32> = st.channels[ci]
                 .transients
                 .iter()
-                .filter(|(_, t)| *t == tag)
+                .filter(|(h, t)| *t == tag && !returned.contains(h))
                 .map(|(h, _)| *h)
                 .collect();
             for h in revoke {
                 revoke_entry(&mut st.driver_table, h);
             }
+            // Remove ALL transients for this tag (returned ones will be
+            // re-adopted into the client table by the mint loop below).
             st.channels[ci].transients.retain(|(_, t)| *t != tag);
             st.channels[ci].outstanding_tag = None;
         }
 
         // Mint the driver's caps into the client table (no amplification).
+        // For returned transients, the driver entry is still live (we
+        // skipped revoking it above), so minting it into the client table
+        // re-adopts the cap — the client's source slot gets a fresh
+        // handle pointing at the same memory region.
         let mut grants = Vec::new();
         for c in caps {
             let info = st
@@ -904,13 +919,16 @@ impl Kernel for FakeClient {
     fn wait(&self, chans: &[u32], timeout_ns: u64) -> Result<(usize, u16), i32> {
         let mut st = self.state.lock().unwrap();
         loop {
-            if st.shutdown {
-                return Err(kabi::ERR_SHUTDOWN);
-            }
+            // Check for pending messages before checking shutdown, so
+            // kill_driver's Close event is delivered as CH_KIND_CLOSE
+            // instead of being swallowed as ERR_SHUTDOWN.
             for (i, &h) in chans.iter().enumerate() {
                 if let Some(kind) = client_ready_kind(&st, h) {
                     return Ok((i, kind));
                 }
+            }
+            if st.shutdown {
+                return Err(kabi::ERR_SHUTDOWN);
             }
             if timeout_ns == kabi::TIMEOUT_NONE {
                 st = self.cond.wait(st).unwrap();

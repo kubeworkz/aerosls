@@ -14,6 +14,14 @@ use crate::kabi::{CapInfo, GrantedCap, Kernel, RecvResult, SendCap};
 /// both blockcache and net_client can share the same allocator type.
 pub trait BufferAlloc {
     fn alloc(&mut self, len: usize) -> Result<(SendCap, u64), i32>;
+
+    /// Re-adopt a grant cap the peer returned in a reply (the transport's
+    /// move-return for window=1 request buffers). The returned cap lands at
+    /// a fresh slot in our table; the allocator stores it so the next
+    /// `alloc()` hands out a VALID source cap. Default no-op: allocators
+    /// that mint a fresh region per request (the host fake) don't track a
+    /// reused slot.
+    fn reclaim(&mut self, _slot: u32) {}
 }
 
 /// An `Arc`-wrapped buffer allocator with interior mutability.
@@ -25,6 +33,9 @@ pub struct AWrap<A: BufferAlloc>(pub Arc<Mutex<A>>);
 impl<A: BufferAlloc> BufferAlloc for AWrap<A> {
     fn alloc(&mut self, size: usize) -> Result<(SendCap, u64), i32> {
         self.0.lock().alloc(size)
+    }
+    fn reclaim(&mut self, slot: u32) {
+        self.0.lock().reclaim(slot)
     }
 }
 
