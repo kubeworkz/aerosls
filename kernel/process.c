@@ -1296,15 +1296,20 @@ int cap_wait_chans(const uint32_t* chan_ids, uint32_t n, void* req,
 
     struct ProcessDescriptor* next = pick_next_runnable();
     if (!next) {
-        /* Nobody to run yet. Hlt for one tick so the timer ISR fires;
-         * the caller re-checks the queue after we return. */
+        /* Nobody to run yet. Stay BLOCKED (don't clear park state!) so
+         * cap_wake_chan can find us if a message arrives during the hlt.
+         * The timer ISR fires cap_park_deadline_tick which wakes us via
+         * the normal resume path. If cap_wake_chan fires during the hlt
+         * (from another process's send), it sets us SUSPENDED +
+         * resume_kernel and cap_maybe_handoff switches to us directly. */
         uint64_t one_tick = kernel_tick_counter + 1;
         cur->waiting_deadline = one_tick;
         __asm__ volatile("sti; hlt" ::: "memory");
-        cur->waiting_deadline = 0;
-        cur->waiting_nchans  = 0;
-        cur->state           = PROC_RUNNING;
-        return 0;
+        /* The timer ISR or cap_wake_chan already woke us — state is
+         * PROC_SUSPENDED + resume_kernel. The scheduler will pick us up.
+         * Return non-zero to indicate the park succeeded (the caller
+         * should not re-park; the resume path re-runs the syscall). */
+        return 1;
     }
     kernel_serial_printf("[CAP] chan wait: switching to PID %u '%s'\n",
                          next->pid, next->name);

@@ -4699,7 +4699,7 @@ pub fn ls<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
         Err(_) => return Step::Exit(1),
     };
     for ent in &entries {
-        let line = alloc::format!("{}\n", ent.name);
+        let line = alloc::format!("  {}\n", ent.name);
         let _ = ctx.write_blocking(1, line.as_bytes());
     }
     Step::Done
