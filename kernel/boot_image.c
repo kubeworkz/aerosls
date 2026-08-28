@@ -301,23 +301,62 @@ static uint32_t g_initrd_end   = 0;
 
 void boot_image_capture_mb2(uint32_t mb2_magic, uint32_t mb2_phys) {
     g_initrd_start = g_initrd_end = 0;
-    if (mb2_magic != (uint32_t)MULTIBOOT2_MAGIC || mb2_phys == 0) return;
-    const struct mb2_info* info = (const struct mb2_info*)(uintptr_t)mb2_phys;
-    const struct mb2_tag*  tag  = (const struct mb2_tag*)(info + 1);
-    const struct mb2_tag*  end  = (const struct mb2_tag*)(
-                                  (const uint8_t*)(uintptr_t)mb2_phys + info->total_size);
-    while (tag < end && tag->type != MB2_TAG_END) {
-        if (tag->type == MB2_TAG_MODULE) {
-            const struct mb2_tag_module* m = (const struct mb2_tag_module*)tag;
-            g_initrd_start = m->mod_start;
-            g_initrd_end   = m->mod_end;
+    if (mb2_phys == 0) goto try_appended;
+
+    /* ── Multiboot v1 path ──────────────────────────────────────────────
+     * GRUB 2.12's `module` command only works with `multiboot` (v1), not
+     * `multiboot2` (v2). The Phase 5 grub.cfg uses v1 to pass the initrd.
+     * v1 info: flags at +0, mods_addr at +88, mods_count at +92.
+     * Multiboot v1 magic: GRUB passes 0x2BADB002 (0x1BADB002 | 1). */
+    if (mb2_magic == 0x2BADB002u) {
+        const uint32_t* info1 = (const uint32_t*)(uintptr_t)mb2_phys;
+        uint32_t flags = info1[0];
+        kernel_serial_printf(
+            "[SIDECAR] multiboot v1 detected, flags=0x%x phys=0x%x\n", flags, mb2_phys);
+        if (flags & (1u << 3)) {   /* bit 3 = mods_count/mods_addr valid */
+            uint32_t mods_count = info1[5];  /* byte 20 */
+            uint32_t mods_addr  = info1[6];  /* byte 24 */
             kernel_serial_printf(
-                "[SIDECAR] initrd module at 0x%x..0x%x (%u bytes)\n",
-                g_initrd_start, g_initrd_end, g_initrd_end - g_initrd_start);
-            return;   /* the first module is the initrd */
+                "[SIDECAR] v1 mods_count=%u mods_addr=0x%x\n",
+                mods_count, mods_addr);
+            if (mods_count > 0 && mods_addr != 0) {
+                /* Module entry: mod_start(4) + mod_end(4) + string(4) + pad(4) */
+                const uint32_t* mod = (const uint32_t*)(uintptr_t)mods_addr;
+                g_initrd_start = mod[0];
+                g_initrd_end   = mod[1];
+                kernel_serial_printf(
+                    "[SIDECAR] v1 initrd module at 0x%x..0x%x (%u bytes)\n",
+                    g_initrd_start, g_initrd_end,
+                    g_initrd_end - g_initrd_start);
+                return;
+            }
         }
-        tag = mb2_tag_next(tag);
+        goto try_appended;
     }
+
+    /* ── Multiboot2 path ──────────────────────────────────────────────── */
+    if (mb2_magic == (uint32_t)MULTIBOOT2_MAGIC) {
+        const struct mb2_info* info = (const struct mb2_info*)(uintptr_t)mb2_phys;
+        const struct mb2_tag*  tag  = (const struct mb2_tag*)(info + 1);
+        const struct mb2_tag*  end  = (const struct mb2_tag*)(
+                                      (const uint8_t*)(uintptr_t)mb2_phys + info->total_size);
+        while (tag < end && tag->type != MB2_TAG_END) {
+            if (tag->type == MB2_TAG_MODULE) {
+                const struct mb2_tag_module* m = (const struct mb2_tag_module*)tag;
+                g_initrd_start = m->mod_start;
+                g_initrd_end   = m->mod_end;
+                kernel_serial_printf(
+                    "[SIDECAR] initrd module at 0x%x..0x%x (%u bytes)\n",
+                    g_initrd_start, g_initrd_end, g_initrd_end - g_initrd_start);
+                return;   /* the first module is the initrd */
+            }
+            tag = mb2_tag_next(tag);
+        }
+    }
+
+try_appended:
+    /* No mb1/mb2 module tag found — nothing to do. */
+    kernel_serial_print("[SIDECAR] no initrd module found\n");
 }
 
 /* The real PCI scan for the registry: bus 0, func 0, slots 0..31 — the same

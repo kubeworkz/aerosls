@@ -20,6 +20,17 @@ multiboot_start:
     dd 8                                    ; end tag size
 multiboot_end:
 
+; ─── Multiboot v1 header (allows GRUB `module` command for initrd) ──────────
+; GRUB 2.12's `module` command only works with `multiboot` (v1), not
+; `multiboot2` (v2). Adding a v1 header lets us use `multiboot` +
+; `module` in grub.cfg to pass sidecars.cpio as the initrd.
+align 4
+mb1_start:
+    dd 0x1BADB002                           ; multiboot v1 magic
+    dd 0x00000003                           ; flags: page-align + mem info
+    dd -(0x1BADB002 + 0x00000003)           ; checksum
+mb1_end:
+
 ; ─── Bootstrap stack (64 KiB) ─────────────────────────────────────────────────
 section .bootstrap_stack, nobits
 align 16
@@ -111,10 +122,16 @@ bits 32
 global _start
 
 _start:
-    ; ── 0. Save multiboot2 handoff values (eax=magic, ebx=info ptr) ─────────
-    ;  Do this FIRST before eax is overwritten by the page-table setup below.
+    ; ── 0. Save multiboot handoff values (eax=magic, ebx=info ptr) ──────────
+    ;  Do this FIRST before eax is overwritten by the debug trace or
+    ;  the page-table setup below.
     mov  [mb2_magic_saved], eax
     mov  [mb2_info_saved],  ebx
+
+    ; QEMU debug port trace: 'A' = kernel entry reached (uses ecx, not eax)
+    mov  dx, 0xe9
+    mov  al, 'A'
+    out  dx, al
 
     mov  esp, stack_top
 
@@ -197,6 +214,11 @@ _start:
     or   eax, (1 << 31) | (1 << 0)
     mov  cr0, eax
 
+    ; QEMU debug port trace: 'B' = paging enabled
+    mov  dx, 0xe9
+    mov  al, 'B'
+    out  dx, al
+
     ; ── 6. Load the 64-bit GDT and far-jump into long mode ─────────────────
     lgdt [gdt64.pointer]
     jmp  gdt64.code:_start64
@@ -204,6 +226,11 @@ _start:
 ; ─── 64-bit kernel entry ──────────────────────────────────────────────────────
 bits 64
 _start64:
+    ; QEMU debug port trace: 'C' = 64-bit entry
+    mov  dx, 0xe9
+    mov  al, 'C'
+    out  dx, al
+
     ; Clear segment registers (not used in long mode flat model)
     xor  ax, ax
     mov  ss, ax
@@ -218,6 +245,11 @@ _start64:
     ; Both are identity-mapped (0–4 GiB), so the physical addr = virtual addr.
     mov  edi, dword [mb2_magic_saved]
     mov  esi, dword [mb2_info_saved]
+
+    ; QEMU debug port trace: 'D' = about to call kernel_main
+    mov  dx, 0xe9
+    mov  al, 'D'
+    out  dx, al
 
     extern kernel_main
     call kernel_main

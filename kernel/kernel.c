@@ -77,14 +77,25 @@ extern void sls_shell_loop(void);
 static uint64_t print_hw_info(uint32_t mb2_magic, uint32_t mb2_phys) {
     // 1. Verify magic
     uint64_t top_usable = 0;   /* highest end-of-RAM seen in the mmap */
+
+    /* ── Multiboot v1 path ──────────────────────────────────────────────
+     * GRUB 2.12's `module` command only works with `multiboot` (v1).
+     * v1 passes 0x2BADB002 and the info struct has mem_lower/mem_upper
+     * at fixed offsets (no tag walk needed). */
+    if (mb2_magic == 0x2BADB002u && mb2_phys != 0) {
+        const uint32_t* v1 = (const uint32_t*)(uintptr_t)mb2_phys;
+        uint32_t mem_lower = v1[1];  /* KiB conventional (max 640) */
+        uint32_t mem_upper = v1[2];  /* KiB extended (above 1 MiB) */
+        (void)mem_lower;
+        top_usable = 0x100000ULL + (uint64_t)mem_upper * 1024ULL;
+        kernel_serial_printf("[HW] Multiboot v1: mem_upper=%u KiB, top=0x%llx\n",
+                             mem_upper, (unsigned long long)top_usable);
+        return top_usable;
+    }
+
     if (mb2_magic != (uint32_t)MULTIBOOT2_MAGIC) {
         kernel_serial_printf("[MB2] WARNING: bad magic 0x%x (expected 0x36d76289)\n",
                              mb2_magic);
-        /* Was a bare `return;` in a uint64_t function -- a constraint
-         * violation the build's -w flag hid, handing frame_pool_limit_ram()
-         * an indeterminate value on the one path where the memory map is
-         * unavailable. 0 is the documented "no usable-RAM top reported"
-         * sentinel that function already handles. */
         return 0;
     }
 
