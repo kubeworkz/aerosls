@@ -42,6 +42,12 @@ uint32_t pci_read_config(uint8_t b, uint8_t s, uint8_t f, uint8_t o) {
     return 0xFFFFFFFFu;
 }
 struct ProcessDescriptor proc_table[PROC_MAX];
+void kernel_enter_sidecar(uint64_t* rsp_save, uint64_t* cr3_save,
+                          uint64_t cr3, uint64_t rip, uint64_t rsp,
+                          uint64_t bib_vaddr) {
+    (void)rsp_save; (void)cr3_save; (void)cr3; (void)rip; (void)rsp;
+    (void)bib_vaddr;
+}
 
 /* ─── test harness ─────────────────────────────────────────────────────────── */
 static int g_pass = 0, g_fail = 0;
@@ -63,7 +69,7 @@ static uint32_t crc32(const uint8_t* data, uint32_t len) {
     return crc ^ 0xFFFFFFFFu;
 }
 
-struct Blob { uint8_t data[8192]; uint32_t len; };
+struct Blob { uint8_t data[65536]; uint32_t len; };
 
 static void blob_u16(struct Blob* b, uint16_t v) {
     b->data[b->len++] = (uint8_t)(v & 0xFF);
@@ -101,12 +107,14 @@ static void blob_name_payload(struct Blob* b, const char* s) {
  *   dm.image 0x20102000, dm.heap 0x20106000 (256 KiB),
  *   registry 0x20146000 (4 KiB). */
 enum {
-    IMG_INIT_KADDR = 0x20000000ULL,
-    IMG_DM_KADDR   = 0x20102000ULL,
-    IMG_REG_KADDR  = 0x20146000ULL,
-    IMG_DM_SIZE    = 0x4000u,
-    IMG_REG_SIZE   = 0x1000u,
-    IMG_INIT_SIZE  = 0x2000u,
+    IMG_INIT_KADDR    = 0x20000000ULL,
+    IMG_DM_KADDR      = 0x20102000ULL,
+    IMG_POSIX_KADDR   = 0x20106000ULL,
+    IMG_REG_KADDR     = 0x20116000ULL,
+    IMG_DM_SIZE       = 0x4000u,
+    IMG_POSIX_SIZE    = 0x1000u,
+    IMG_REG_SIZE      = 0x1000u,
+    IMG_INIT_SIZE     = 0x2000u,
 };
 
 static void build_init_manifest(struct Blob* b) {
@@ -123,7 +131,7 @@ static void build_init_manifest(struct Blob* b) {
 
     blob_record(b, 0x0001, 15 + 2); rc++; /* personality (name_len + 15) */
     blob_name_payload(b, "aerosls.init.v1");
-    blob_record(b, SIDECAR_TAG_NAME, 13 + 2); rc++;  /* name_len + 13 */
+    blob_record(b, SIDECAR_TAG_NAME, 14 + 2); rc++;  /* name_len + 14 */
     blob_name_payload(b, "aerosls.init.0");
     blob_record(b, SIDECAR_TAG_IMAGE, 24); rc++;
     blob_u64(b, 0);                       /* entry_offset */
@@ -148,7 +156,7 @@ static void build_init_manifest(struct Blob* b) {
     blob_u64(b, 16u * 1024 * 1024);
     blob_bytes(b, "\x03", 1);
     /* console CHAN cap */
-    blob_record(b, 0x0007, 7 + 19 + 6); rc++;
+    blob_record(b, 0x0007, 7 + 20 + 6); rc++;
     blob_name_payload(b, "console");
     blob_name_payload(b, "kernel.debug.console");
     blob_bytes(b, "\x07\x00", 2);
@@ -163,6 +171,12 @@ static void build_init_manifest(struct Blob* b) {
     blob_name_payload(b, "dm.image");
     blob_u64(b, IMG_DM_KADDR);
     blob_u64(b, IMG_DM_SIZE);
+    blob_bytes(b, "\x01", 1);
+    /* posix.image MEM cap */
+    blob_record(b, SIDECAR_TAG_CAP_MEM, 11 + 19); rc++;
+    blob_name_payload(b, "posix.image");
+    blob_u64(b, IMG_POSIX_KADDR);
+    blob_u64(b, IMG_POSIX_SIZE);
     blob_bytes(b, "\x01", 1);
 
     blob_record(b, 0x0008, 13); rc++;     /* bootstrap: name_len + 7 + 4 */
@@ -205,12 +219,16 @@ static void newc_entry(struct Blob* b, const char* name, const void* data,
     snprintf(hdr + 78, 9, "%08x", 0u);            /* rdevmajor */
     snprintf(hdr + 86, 9, "%08x", 0u);            /* rdevminor */
     snprintf(hdr + 94, 9, "%08x", ns);            /* namesize (incl. NUL) */
-    snprintf(hdr + 102, 9, "%08x", 0u);           /* check */
+    snprintf(hdr + 102, sizeof(hdr) - 102, "%08x", 0u); /* check */
     blob_bytes(b, hdr, sizeof(hdr));
     blob_bytes(b, name, ns);
-    while (b->len & 3) b->data[b->len++] = 0;
+    /* Pad namesize to 4 bytes (matches Rust newc.rs align4). */
+    { uint32_t np = ((4 - (ns & 3)) & 3);
+      for (uint32_t p = 0; p < np; p++) b->data[b->len++] = 0; }
     blob_bytes(b, data, dlen);
-    while (b->len & 3) b->data[b->len++] = 0;
+    /* Pad data to 4 bytes (matches Rust newc.rs align4). */
+    { uint32_t dp = ((4 - (dlen & 3)) & 3);
+      for (uint32_t p = 0; p < dp; p++) b->data[b->len++] = 0; }
 }
 
 static void newc_finish(struct Blob* b) {
@@ -220,13 +238,17 @@ static void newc_finish(struct Blob* b) {
 static void build_archive(struct Blob* out, struct Blob* init_manifest) {
     uint8_t init_bin[IMG_INIT_SIZE];
     uint8_t dm_bin[IMG_DM_SIZE];
+    uint8_t posix_bin[IMG_POSIX_SIZE];
     for (uint32_t i = 0; i < IMG_INIT_SIZE; i++) init_bin[i] = (uint8_t)(0xAA + i);
     for (uint32_t i = 0; i < IMG_DM_SIZE; i++)   dm_bin[i]   = (uint8_t)(0xBB + i);
+    for (uint32_t i = 0; i < IMG_POSIX_SIZE; i++) posix_bin[i] = (uint8_t)(0xCC + i);
     memset(out, 0, sizeof(*out));
     newc_entry(out, BOOT_INIT_BIN_PATH, init_bin, sizeof(init_bin));
     newc_entry(out, BOOT_INIT_MANIFEST_PATH, init_manifest->data, init_manifest->len);
     newc_entry(out, BOOT_DM_BIN_PATH, dm_bin, sizeof(dm_bin));
     newc_entry(out, BOOT_DM_MANIFEST_PATH, "fake", 4);
+    newc_entry(out, BOOT_POSIX_BIN_PATH, posix_bin, sizeof(posix_bin));
+    newc_entry(out, BOOT_POSIX_MANIFEST_PATH, "fake", 4);
     newc_entry(out, BOOT_LAYOUT_PATH, "AEROSLS-BOOT-LAYOUT 1\n", 22);
     newc_finish(out);
 }
@@ -262,15 +284,13 @@ int main(void) {
     struct Blob manifest;
     build_init_manifest(&manifest);
     struct Blob archive;
-    build_archive(&archive, &manifest);
-
-    /* ── 1. boot_newc_find: walk + padding + terminator ─────────────────── */
+    build_archive(&archive, &manifest);    /* ── 1. boot_newc_find: walk + padding + terminator ─────────────────── */
     {
         uint32_t off = 0, size = 0;
         CHECK(boot_newc_find(archive.data, archive.len, BOOT_INIT_BIN_PATH,
                              &off, &size) == 0, "init.bin found");
         CHECK(size == IMG_INIT_SIZE, "init.bin size");
-        CHECK(archive.data[off] == 0xAA && archive.data[off + 1] == 0xAA,
+        CHECK(archive.data[off] == 0xAA && archive.data[off + 1] == 0xAB,
               "init.bin data at the found offset");
         CHECK(boot_newc_find(archive.data, archive.len, BOOT_INIT_MANIFEST_PATH,
                              &off, &size) == 0, "init.manifest found");
@@ -342,7 +362,7 @@ int main(void) {
          * but the find compares only the name bytes, so flip a LETTER
          * instead — 'm' of "manifest" (name is 19 bytes incl. the NUL,
          * padded to 20, so the last letter sits at off-7). */
-        no_manifest.data[off - 7] ^= 0xFF;
+        if (off >= 7) no_manifest.data[off - 7] ^= 0xFF;
         CHECK(boot_image_parse(no_manifest.data, no_manifest.len, manifest_out,
                                sizeof(manifest_out), &mlen, &info) == BOOT_ERR_NOMANIFEST,
               "missing manifest -> NOMANIFEST");
@@ -461,7 +481,7 @@ int main(void) {
             expect++;
             off = data_off + fs + ((4 - (fs & 3)) & 3);
         }
-        CHECK(ok && expect == 5, "parser offsets agree with a raw re-walk");
+        CHECK(ok && expect == 7, "parser offsets agree with a raw re-walk");
     }
 
     printf("%d checks, %d passed, %d failed\n", g_pass + g_fail, g_pass, g_fail);

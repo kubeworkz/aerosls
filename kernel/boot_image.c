@@ -280,6 +280,17 @@ int boot_build_registry(uint8_t* dst, uint32_t cap,
         struct BootDeviceEntry e;
         memset(&e, 0, sizeof(e));
         if (scan(slot, &e) != 0) continue;   /* empty slot */
+        /* Auto-fill the driver manifest from the class/subclass table if the
+         * scan left it empty — so the registry carries the driver name the
+         * init sidecar needs for device-manager dispatch. */
+        if (e.driver_manifest[0] == '\0') {
+            const char* drv = boot_driver_for_class(e.class_code, e.subclass);
+            if (drv && drv[0]) {
+                uint32_t dlen = (uint32_t)strlen(drv);
+                if (dlen >= BOOT_DRIVER_MANIFEST_LEN) dlen = BOOT_DRIVER_MANIFEST_LEN - 1;
+                memcpy(e.driver_manifest, drv, dlen);
+            }
+        }
         if (4u + (count + 1u) * BOOT_DEVICE_ENTRY_SIZE > cap) break;
         memcpy(dst + 4 + count * BOOT_DEVICE_ENTRY_SIZE, &e, sizeof(e));
         count++;
