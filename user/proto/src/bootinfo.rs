@@ -275,4 +275,48 @@ mod tests {
             BootErr::Truncated
         );
     }
+
+    #[test]
+    fn network_sidecar_bib_layout() {
+        // The network sidecar's BIB (kernel/cap.c cap_create_sidecar) has:
+        // Cap 0: messenger CHAN_R (unnamed, slot 6)
+        // Cap 1: messenger CHAN_W (unnamed, slot 7)
+        // Cap 2: budget MEM (named "budget", slot 8)
+        // Cap 3: console CHAN_R (named "console", slot 9)
+        // Cap 4: console CHAN_W (named "console", slot 10)
+        let bib = build_bib(&[
+            ("", 2, 0x2, 0, 0),       // CHAN_R messenger
+            ("", 3, 0x4, 0, 0),       // CHAN_W messenger
+            ("budget", 1, 0x7, 0x2200_0000, 0x100_0000), // MEM budget
+            ("console", 2, 0x2, 0, 0), // CHAN_R console
+            ("console", 3, 0x4, 0, 0), // CHAN_W console
+        ]);
+        let info = unsafe { BootInfo::from_raw(bib.as_ptr()) }.unwrap();
+        assert_eq!(info.n_caps, 5);
+        assert_eq!(info.budget_bytes, 1 << 20);
+
+        // Verify struct layout: n_caps at offset 0x18, caps at offset 0x20
+        assert_eq!(core::mem::offset_of!(BootInfo, n_caps), 0x18);
+        assert_eq!(core::mem::offset_of!(BootInfo, caps), 0x20);
+
+        // Find budget MEM cap
+        let budget = info.find_cap(1, "budget").unwrap();
+        assert_eq!(budget.base, 0x2200_0000);
+        assert_eq!(budget.len, 0x100_0000);
+        assert_eq!(budget.rights, 0x7);
+
+        // Find console CHAN caps
+        let console_r = info.find_cap(2, "console").unwrap();
+        assert_eq!(console_r.rights, 0x2);
+        let console_w = info.find_cap(3, "console").unwrap();
+        assert_eq!(console_w.rights, 0x4);
+
+        // Messenger caps are unnamed — can only find by type
+        let messenger_r = &info.caps()[0];
+        assert_eq!(messenger_r.ty, 2);
+        assert_eq!(messenger_r.name, "");
+        let messenger_w = &info.caps()[1];
+        assert_eq!(messenger_w.ty, 3);
+        assert_eq!(messenger_w.name, "");
+    }
 }
