@@ -170,7 +170,7 @@ static int boot_manifest_read(const uint8_t* blob, uint32_t len,
             } else if (nlen == 7 && memcmp(n, "storage", 7) == 0) {
                 m->storage_kaddr = boot_le64(rp + 2 + nlen);
                 m->storage_size  = boot_le64(rp + 2 + nlen + 8);
-            } else if (nlen == 8 && memcmp(n, "net.image", 8) == 0) {
+            } else if (nlen == 9 && memcmp(n, "net.image", 9) == 0) {
                 m->net_kaddr = boot_le64(rp + 2 + nlen);
                 m->net_size  = boot_le64(rp + 2 + nlen + 8);
             }
@@ -280,7 +280,9 @@ int boot_image_parse(const uint8_t* archive, uint32_t archive_len,
         (info->ramdisk_kaddr != 0 && (info->ramdisk_kaddr < info->boot_base ||
          info->ramdisk_kaddr + info->ramdisk_size > info->boot_base + info->boot_total)) ||
         info->reg_kaddr < info->boot_base ||
-        info->reg_kaddr + info->reg_size > info->boot_base + info->boot_total)
+        info->reg_kaddr + info->reg_size > info->boot_base + info->boot_total ||
+        (info->net_kaddr != 0 && (info->net_kaddr < info->boot_base ||
+         info->net_kaddr + info->net_size > info->boot_base + info->boot_total)))
         return BOOT_ERR_RANGE;
     return 0;
 }
@@ -453,12 +455,13 @@ void launch_init_sidecar(void) {
     }
     kernel_serial_printf(
         "[SIDECAR] boot image: init @0x%llx (%llu B) dm @0x%llx (%llu B) "
-        "posix @0x%llx (%llu B) ramdisk @0x%llx (%llu B) "
+        "posix @0x%llx (%llu B) ramdisk @0x%llx (%llu B) net @0x%llx (%llu B) "
         "registry @0x%llx (%llu B)\n",
         (unsigned long long)info.init_kaddr, (unsigned long long)info.init_size,
         (unsigned long long)info.dm_kaddr,   (unsigned long long)info.dm_size,
         (unsigned long long)info.posix_kaddr, (unsigned long long)info.posix_size,
         (unsigned long long)info.ramdisk_kaddr, (unsigned long long)info.ramdisk_size,
+        (unsigned long long)info.net_kaddr, (unsigned long long)info.net_size,
         (unsigned long long)info.reg_kaddr,  (unsigned long long)info.reg_size);
 
     /* 1. Reserve the whole boot-image span before anything can allocate it

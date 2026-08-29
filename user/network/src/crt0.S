@@ -18,5 +18,5 @@ _start:
 .section .bss
 .balign 4096
 boot_stack:
-    .skip 65536
+    .skip 262144
 boot_stack_top:

@@ -18,17 +18,34 @@ pub struct Close {
     pub detail: u32,
 }
 
+fn serial(msg: &[u8]) {
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") 165u64 => _,
+            in("rdi") msg.as_ptr(),
+            in("rdx") msg.len() as u64,
+        );
+    }
+}
+
 /// Run the server loop until a fatal kernel error.
 pub fn run<K: Kernel>(k: &K, eps: &mut EndpointSet, net: &mut MockNetwork) -> Result<(), i32> {
     let mut buf = [0u8; ChanHeader::MAX_PAYLOAD];
     let mut caps = [GrantedCap::default(); ChanHeader::MAX_CAPS];
 
     loop {
+        serial(b"[NET-SRV] wait_list building\n");
         let list = eps.wait_list();
-        let (idx, _kind) = k.wait(&list[..eps.wait_len()], kapi::TIMEOUT_NONE)?;
+        let wlen = eps.wait_len();
+        serial(b"[NET-SRV] calling k.wait\n");
+        let (idx, _kind) = k.wait(&list[..wlen], kapi::TIMEOUT_NONE)?;
+        serial(b"[NET-SRV] wait returned\n");
         let handle = list[idx];
+        serial(b"[NET-SRV] handle=\n");
 
         if eps.is_console(handle) {
+            serial(b"[NET-SRV] is_console, recv\n");
             handle_console(k, eps, &mut buf, &mut caps)?;
             continue;
         }

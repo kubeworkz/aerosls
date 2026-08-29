@@ -68,7 +68,10 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
             in("rdi") b.buf.as_ptr(),
             in("rdx") b.pos as u64,
         );
-        core::arch::asm!("cli", "hlt");
+        /* Use an infinite loop instead of cli/hlt. The cli instruction
+         * causes #GP in ring 3, and the kernel's #GP handler may return
+         * to user space instead of killing the process. An infinite loop
+         * is the only reliable way to halt a bare-metal sidecar. */
     }
     loop {}
 }
