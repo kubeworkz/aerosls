@@ -11,7 +11,7 @@
 use crate::bootinfo::{BootCap, BootInfo};
 use crate::endpoints::EndpointSet;
 use crate::heap::Bump;
-use crate::kapi::{Kernel, RealKernel, CAP_CHAN, CAP_MEM};
+use crate::kapi::{RealKernel, CAP_CHAN, CAP_MEM};
 use crate::mock::MockNetwork;
 use crate::server;
 
@@ -68,11 +68,9 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
             in("rdi") b.buf.as_ptr(),
             in("rdx") b.pos as u64,
         );
-        /* Use an infinite loop instead of cli/hlt. The cli instruction
-         * causes #GP in ring 3, and the kernel's #GP handler may return
-         * to user space instead of killing the process. An infinite loop
-         * is the only reliable way to halt a bare-metal sidecar. */
     }
+    /* ud2 triggers #UD in ring 3 — the kernel must kill the process. */
+    unsafe { core::arch::asm!("ud2"); }
     loop {}
 }
 
@@ -88,12 +86,86 @@ fn serial_trace(msg: &[u8]) {
     }
 }
 
+/// LTO-proof serial write: uses a `#[used]` static buffer so the compiler
+/// cannot eliminate it. Writes the ASCII digit `d` (0-9) to the serial log.
+#[cfg(all(feature = "target", target_os = "none"))]
+fn serial_digit(d: u8) {
+    #[used]
+    static mut DIGIT_BUF: [u8; 4] = [b'X', b'\n', 0, 0];
+    unsafe {
+        DIGIT_BUF[0] = b'0' + d;
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") 165u64 => _,
+            in("rdi") DIGIT_BUF.as_ptr(),
+            in("rdx") 2u64,
+        );
+    }
+}
+
+/// LTO-proof hex byte dump of the first 8 bytes at `ptr`.
+#[cfg(all(feature = "target", target_os = "none"))]
+fn serial_hex8(ptr: *const u8) {
+    #[used]
+    static mut HEX_BUF: [u8; 23] = *b"xx xx xx xx xx xx xx xx";
+    unsafe {
+        for i in 0..8u32 {
+            let b = core::ptr::read_volatile(ptr.add(i as usize));
+            let hi = b >> 4;
+            let lo = b & 0xf;
+            HEX_BUF[(i * 3) as usize] = if hi < 10 { b'0' + hi } else { b'a' + hi - 10 };
+            HEX_BUF[1 + (i * 3) as usize] = if lo < 10 { b'0' + lo } else { b'a' + lo - 10 };
+        }
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") 165u64 => _,
+            in("rdi") HEX_BUF.as_ptr(),
+            in("rdx") 23u64,
+        );
+    }
+}
+
 #[no_mangle]
 #[allow(static_mut_refs)]
 pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     serial_trace(b"[NET] rust_entry entered\n");
+    serial_trace(b"[NET] BIB ptr=");
+    serial_hex8(bib_ptr);
+
+    // Dump first 8 raw bytes of BIB header before parsing.
+    serial_trace(b"[NET] BIB raw:");
+    serial_hex8(bib_ptr);
+
     let bib = unsafe { BootInfo::from_raw(bib_ptr) }.expect("corrupt boot info");
     serial_trace(b"[NET] BIB parsed\n");
+
+    // Dump n_caps and key fields via LTO-proof writes.
+    let n = bib.n_caps;
+    serial_trace(b"[NET] n_caps=");
+    if n < 10 {
+        serial_digit(n as u8);
+    } else {
+        serial_digit((n / 10) as u8);
+        serial_digit((n % 10) as u8);
+    }
+    serial_trace(b"\n");
+
+    // Dump first cap entry to verify cap table.
+    if bib.n_caps > 0 {
+        serial_trace(b"[NET] cap0=");
+        let c = &bib.caps[0];
+        serial_trace(b"name='");
+        serial_trace(c.name.as_bytes());
+        serial_trace(b"' ty=");
+        serial_digit(c.ty as u8);
+        serial_trace(b" slot=");
+        let s = c.slot;
+        serial_digit((s / 100) as u8);
+        serial_digit(((s / 10) % 10) as u8);
+        serial_digit((s % 10) as u8);
+        serial_trace(b"\n");
+    }
+
     let k = RealKernel;
 
     // Budget → heap.
