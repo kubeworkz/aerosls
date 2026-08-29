@@ -96,11 +96,13 @@ fn cmd_build(mut args: impl Iterator<Item = String>) {
     let mut dm = None;
     let mut posix = None;
     let mut ramdisk = None;
+    let mut net = None;
     let mut out = None;
     let mut init_entry = 0u64;
     let mut dm_entry = 0u64;
     let mut posix_entry = 0u64;
     let mut ramdisk_entry = 0u64;
+    let mut net_entry = 0u64;
     let mut base_phys = None;
 
     while let Some(a) = args.next() {
@@ -113,11 +115,13 @@ fn cmd_build(mut args: impl Iterator<Item = String>) {
             "--dm" => dm = Some(PathBuf::from(next())),
             "--posix" => posix = Some(PathBuf::from(next())),
             "--ramdisk" => ramdisk = Some(PathBuf::from(next())),
+            "--net" => net = Some(PathBuf::from(next())),
             "-o" | "--output" => out = Some(PathBuf::from(next())),
             "--init-entry" => init_entry = parse_hex(&next(), &a),
             "--dm-entry" => dm_entry = parse_hex(&next(), &a),
             "--posix-entry" => posix_entry = parse_hex(&next(), &a),
             "--ramdisk-entry" => ramdisk_entry = parse_hex(&next(), &a),
+            "--net-entry" => net_entry = parse_hex(&next(), &a),
             "--base-phys" => base_phys = Some(parse_hex(&next(), &a)),
             "-h" | "--help" => usage(),
             other => {
@@ -127,8 +131,8 @@ fn cmd_build(mut args: impl Iterator<Item = String>) {
         }
     }
 
-    let (init_path, dm_path, posix_path, ramdisk_path, out_path) = match (init, dm, posix, ramdisk, out) {
-        (Some(i), Some(d), Some(p), Some(r), Some(o)) => (i, d, p, r, o),
+    let (init_path, dm_path, posix_path, ramdisk_path, net_path, out_path) = match (init, dm, posix, ramdisk, net, out) {
+        (Some(i), Some(d), Some(p), Some(r), Some(n), Some(o)) => (i, d, p, r, n, o),
         _ => usage(),
     };
 
@@ -140,12 +144,15 @@ fn cmd_build(mut args: impl Iterator<Item = String>) {
         .unwrap_or_else(|e| panic!("read {}: {e}", posix_path.display()));
     let ramdisk_bin = std::fs::read(&ramdisk_path)
         .unwrap_or_else(|e| panic!("read {}: {e}", ramdisk_path.display()));
+    let net_bin = std::fs::read(&net_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", net_path.display()));
 
-    let mut spec = BootImageSpec::new(init_bin, dm_bin, posix_bin, ramdisk_bin);
+    let mut spec = BootImageSpec::new(init_bin, dm_bin, posix_bin, ramdisk_bin, net_bin);
     spec.init_entry = init_entry;
     spec.dm_entry = dm_entry;
     spec.posix_entry = posix_entry;
     spec.ramdisk_entry = ramdisk_entry;
+    spec.net_entry = net_entry;
     if let Some(b) = base_phys {
         spec.base_phys = b;
     }

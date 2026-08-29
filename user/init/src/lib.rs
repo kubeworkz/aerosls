@@ -34,6 +34,7 @@ pub mod dm_manifest;
 pub mod heap;
 pub mod posix_manifest;
 pub mod ramdisk_manifest;
+pub mod net_manifest;
 
 #[cfg(feature = "target")]
 mod entry;

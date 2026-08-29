@@ -114,6 +114,7 @@ struct BootManifestInfo {
     uint64_t posix_kaddr, posix_size;
     uint64_t ramdisk_kaddr, ramdisk_size;
     uint64_t storage_kaddr, storage_size;
+    uint64_t net_kaddr, net_size;
     uint64_t reg_kaddr, reg_size;
 };
 
@@ -169,6 +170,9 @@ static int boot_manifest_read(const uint8_t* blob, uint32_t len,
             } else if (nlen == 7 && memcmp(n, "storage", 7) == 0) {
                 m->storage_kaddr = boot_le64(rp + 2 + nlen);
                 m->storage_size  = boot_le64(rp + 2 + nlen + 8);
+            } else if (nlen == 8 && memcmp(n, "net.image", 8) == 0) {
+                m->net_kaddr = boot_le64(rp + 2 + nlen);
+                m->net_size  = boot_le64(rp + 2 + nlen + 8);
             }
             break;
         }
@@ -216,6 +220,10 @@ int boot_image_parse(const uint8_t* archive, uint32_t archive_len,
     /* Ramdisk binary is optional for older images. */
     r = boot_newc_find(archive, archive_len, BOOT_RAMDISK_BIN_PATH, &roff, &rsize);
     if (r != 0) { roff = 0; rsize = 0; }  /* absent: ramdisk_kaddr/size remain 0 */
+    /* Network binary is optional for older images. */
+    uint32_t noff = 0, nsize = 0;
+    r = boot_newc_find(archive, archive_len, BOOT_NET_BIN_PATH, &noff, &nsize);
+    if (r != 0) { noff = 0; nsize = 0; }
     /* Rootfs is optional — older images boot in console-only mode. */
     uint32_t rootfs_off = 0, rootfs_len = 0;
     r = boot_newc_find(archive, archive_len, BOOT_ROOTFS_BIN_PATH, &rootfs_off, &rootfs_len);
@@ -226,6 +234,7 @@ int boot_image_parse(const uint8_t* archive, uint32_t archive_len,
      * rebuilt manifest, which must be refused, not half-applied. */
     if (mi.init_size != isize || mi.dm_size != dsize || mi.posix_size != psize) return BOOT_ERR_MISMATCH;
     if (mi.ramdisk_size != 0 && mi.ramdisk_size != rsize) return BOOT_ERR_MISMATCH;
+    if (mi.net_size != 0 && mi.net_size != nsize) return BOOT_ERR_MISMATCH;
 
     /* The boot-image span [init kaddr, registry end) must live inside the
      * 4 GiB identity map (cap_create_mem's bound). */
@@ -243,6 +252,8 @@ int boot_image_parse(const uint8_t* archive, uint32_t archive_len,
     info->ramdisk_size  = mi.ramdisk_size;
     info->storage_kaddr = mi.storage_kaddr;
     info->storage_size  = mi.storage_size;
+    info->net_kaddr = mi.net_kaddr;
+    info->net_size  = mi.net_size;
     info->reg_kaddr  = mi.reg_kaddr;
     info->reg_size   = mi.reg_size;
     info->boot_base  = mi.init_kaddr;
@@ -255,6 +266,8 @@ int boot_image_parse(const uint8_t* archive, uint32_t archive_len,
     info->posix_bin_len = psize;
     info->ramdisk_bin_off = roff;
     info->ramdisk_bin_len = rsize;
+    info->net_bin_off = noff;
+    info->net_bin_len = nsize;
     info->rootfs_bin_off = rootfs_off;
     info->rootfs_bin_len = rootfs_len;
 
@@ -466,6 +479,10 @@ void launch_init_sidecar(void) {
            info.posix_bin_len);
     memcpy((void*)(uintptr_t)info.ramdisk_kaddr, archive + info.ramdisk_bin_off,
            info.ramdisk_bin_len);
+    if (info.net_kaddr != 0 && info.net_bin_len != 0) {
+        memcpy((void*)(uintptr_t)info.net_kaddr, archive + info.net_bin_off,
+               info.net_bin_len);
+    }
 
     /* 2b. Copy the rootfs image to the ramdisk's storage region, if present.
      *     The storage address comes from the ramdisk manifest's storage cap

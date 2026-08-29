@@ -19,6 +19,7 @@ use crate::dm_manifest::{self, DmImage};
 use crate::heap::Bump;
 use crate::posix_manifest;
 use crate::ramdisk_manifest;
+use crate::net_manifest;
 use aerosls_proto::bootinfo::BootInfo;
 use aerosls_proto::kabi::{Kernel, RealKernel, SendCap, CAP_CHAN_W, CAP_MEM, CAP_NONE};
 
@@ -365,6 +366,25 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         unsafe { k_yield(); }
     }
 
+    // ── 9b. Spawn the network driver ──────────────────────────────────────
+    log(&console, "[INIT] spawning network driver...");
+
+    let net_image_cap = bib
+        .find_cap(CAP_MEM, "net.image")
+        .expect("[INIT] missing 'net.image' MEM cap");
+
+    // net.heap is NOT in init's manifest (avoids MEM overlap with
+    // the network sidecar's own budget cap).  Compute its base from the
+    // image cap: heap sits immediately after the image, page-aligned.
+    let net_heap_base = (net_image_cap.base + net_image_cap.len + 4095) & !4095u64;
+    log_fmt!(&console, "[INIT]   net.heap computed @ 0x{:x}", net_heap_base);
+
+    spawn_network_driver(&console, net_image_cap, net_heap_base);
+    // Yield to let the network sidecar start and park.
+    for _ in 0..3 {
+        unsafe { k_yield(); }
+    }
+
     log(&console, "[INIT] ── Phase 5 init sidecar complete ──");
     log(&console, "[INIT] system ready for POSIX sidecar creation.");
 
@@ -499,6 +519,32 @@ fn spawn_posix_sidecar(
         .create_sidecar(&manifest)
         .unwrap_or_else(|e| panic!("[INIT] POSIX create_sidecar failed: {e}"));
     log_fmt!(console, "[INIT]   POSIX messenger: CHAN_R={r} CHAN_W={w}");
+}
+
+/// Spawn the network driver through the real kernel path (`SYS_SLS_CREATE_SIDECAR`).
+/// The network binary address comes from the boot image's `net.image` MEM cap;
+/// the budget heap base is computed from the image cap (page-aligned after image).
+fn spawn_network_driver(
+    console: &InitChannel<RealKernel>,
+    image_cap: &aerosls_proto::bootinfo::BootCap<'_>,
+    heap_base: u64,
+) {
+    log_fmt!(
+        console,
+        "[INIT]   (create_sidecar: {} image @ 0x{:x}, {} bytes)",
+        net_manifest::NET_MANIFEST_NAME,
+        image_cap.base,
+        image_cap.len,
+    );
+    let manifest = net_manifest::build_net_manifest(
+        image_cap.base,
+        image_cap.len as u32,
+        heap_base,
+    );
+    let (r, w) = RealKernel
+        .create_sidecar(&manifest)
+        .unwrap_or_else(|e| panic!("[INIT] network create_sidecar failed: {e}"));
+    log_fmt!(console, "[INIT]   network messenger: CHAN_R={r} CHAN_W={w}");
 }
 
 // ── logging helpers ──────────────────────────────────────────────────────────

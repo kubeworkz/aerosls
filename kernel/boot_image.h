@@ -79,6 +79,9 @@
 #define BOOT_POSIX_MANIFEST_PATH    "boot/posix.manifest"
 #define BOOT_RAMDISK_BIN_PATH       "boot/ramdisk.bin"
 #define BOOT_RAMDISK_MANIFEST_PATH  "boot/ramdisk.manifest"
+#define BOOT_NET_BIN_PATH            "boot/net.bin"
+#define BOOT_NET_MANIFEST_PATH       "boot/net.manifest"
+#define BOOT_NET_HEAP_BYTES          (512u * 1024u)
 #define BOOT_ROOTFS_BIN_PATH         "boot/rootfs.bin"
 #define BOOT_LAYOUT_PATH            "boot/layout"
 
@@ -164,12 +167,14 @@ struct BootImageInfo {
     uint64_t posix_kaddr, posix_size;
     uint64_t ramdisk_kaddr, ramdisk_size;
     uint64_t storage_kaddr, storage_size;
+    uint64_t net_kaddr, net_size;
     uint64_t reg_kaddr,  reg_size;
     uint64_t boot_base,  boot_total;
     uint32_t init_bin_off, init_bin_len;   /* archive offsets of the images */
     uint32_t dm_bin_off,   dm_bin_len;
     uint32_t posix_bin_off, posix_bin_len;
     uint32_t ramdisk_bin_off, ramdisk_bin_len;
+    uint32_t net_bin_off, net_bin_len;
     uint32_t rootfs_bin_off, rootfs_bin_len;
 };
 

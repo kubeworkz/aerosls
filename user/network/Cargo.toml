@@ -14,3 +14,8 @@ aerosls-kernel-sim = { path = "../kernel-sim" }
 [features]
 default = []
 target = ["aerosls-proto/target"]
+
+[[bin]]
+name = "network"
+path = "src/bin/network.rs"
+required-features = ["target"]

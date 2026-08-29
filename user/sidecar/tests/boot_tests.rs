@@ -6,7 +6,7 @@
 use aerosls_blockcache::BufferAlloc;
 use aerosls_kernel_sim::{FakeClient, FakeKernel, DRIVER_CONSOLE, DRIVER_STORAGE};
 use aerosls_proto::bootinfo::BootInfo;
-use aerosls_proto::kabi::{SendCap, CAP_CHAN, CAP_MEM};
+use aerosls_proto::kabi::{SendCap, CAP_CHAN, CAP_CHAN_W, CAP_MEM};
 use aerosls_proto::{R, W};
 use aerosls_ramdisk::endpoints::EndpointSet;
 use aerosls_ramdisk::server::{self, Device};
@@ -715,10 +715,13 @@ fn boot_runs_an_interactive_shell() {
 /// kernel-filled Boot Info Block.
 #[test]
 fn from_bib_resolves_initial_caps() {
+    // The kernel creates both CHAN_R and CHAN_W BIB entries per wired channel.
     let bib = build_bib(&[
         ("budget", CAP_MEM, 0x3, 0x1000_0000, 0x100_0000, 0),
         ("console", CAP_CHAN, 0x7, 0, 0, 1),
-        ("ramdisk", CAP_CHAN, 0x7, 0, 0, 2),
+        ("console", CAP_CHAN_W, 0x7, 0, 0, 2),
+        ("ramdisk", CAP_CHAN, 0x7, 0, 0, 3),
+        ("ramdisk", CAP_CHAN_W, 0x7, 0, 0, 4),
     ]);
     let info = unsafe { BootInfo::from_raw(bib.as_ptr()) }.unwrap();
     let caps = BootCaps::from_bib(&info).unwrap();
@@ -726,7 +729,7 @@ fn from_bib_resolves_initial_caps() {
     assert_eq!(caps.budget_base, 0x1000_0000);
     assert_eq!(caps.budget_len, 0x100_0000);
     assert_eq!(caps.console_chan, Some(1));
-    assert_eq!(caps.ramdisk_chan_w, Some(2));
+    assert_eq!(caps.ramdisk_chan_w, Some(4));
 
     // A BIB missing the ramdisk channel is valid (console-only mode).
     let bib = build_bib(&[("budget", CAP_MEM, 0x3, 0x1000_0000, 0x100_0000, 0)]);
@@ -818,25 +821,30 @@ fn manifest_names_line_up_with_bib_caps() {
 
     // The kernel fills the table in record order; the BIB reports the same
     // order. Build the BIB from the manifest's caps and resolve them back.
-    let slots: Vec<(String, u16, u16, u64, u64, u32)> = parsed
-        .caps()
-        .iter()
-        .enumerate()
-        .map(|(i, c)| {
-            let c = c.unwrap();
-            let (base, len) = match c.kind {
-                CapKind::Mem { base, size } => (base, size),
-                CapKind::Chan { .. } => (0, 0),
-            };
-            let ty = match c.kind {
-                CapKind::Mem { .. } => CAP_MEM,
-                CapKind::Chan { .. } => CAP_CHAN,
-            };
-            (c.name.to_string(), ty, c.rights, base, len, i as u32)
-        })
-        .collect();
+    // Each CHAN cap produces both a CHAN_R and CHAN_W BIB entry.
+    let mut slot = 0u32;
+    let mut bib_slots: Vec<(String, u16, u16, u64, u64, u32)> = Vec::new();
+    for c in parsed.caps().iter() {
+        let c = c.unwrap();
+        let (base, len) = match c.kind {
+            CapKind::Mem { base, size } => (base, size),
+            CapKind::Chan { .. } => (0, 0),
+        };
+        match c.kind {
+            CapKind::Mem { .. } => {
+                bib_slots.push((c.name.to_string(), CAP_MEM, c.rights, base, len, slot));
+                slot += 1;
+            }
+            CapKind::Chan { .. } => {
+                bib_slots.push((c.name.to_string(), CAP_CHAN, c.rights, base, len, slot));
+                slot += 1;
+                bib_slots.push((c.name.to_string(), CAP_CHAN_W, c.rights, base, len, slot));
+                slot += 1;
+            }
+        }
+    }
     let bib = build_bib(
-        &slots
+        &bib_slots
             .iter()
             .map(|(n, ty, r, b, l, s)| (n.as_str(), *ty, *r, *b, *l, *s))
             .collect::<Vec<_>>(),
@@ -845,7 +853,7 @@ fn manifest_names_line_up_with_bib_caps() {
     let caps = BootCaps::from_bib(&info).unwrap();
     assert_eq!(caps.budget_slot, 0);
     assert_eq!(caps.console_chan, Some(1));
-    assert_eq!(caps.ramdisk_chan_w, Some(2));
+    assert_eq!(caps.ramdisk_chan_w, Some(4));
     let _ = MAX_MANIFEST_CAPS;
 }
 
