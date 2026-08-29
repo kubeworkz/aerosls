@@ -29,6 +29,7 @@
  */
 #include "kernel/cap.h"
 #include "tests/process_host_stubs.h"
+
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
@@ -86,6 +87,25 @@ static int g_fail = 0;
     if (!(cond)) { printf("FAIL: %s\n", msg); g_fail++; } \
     else          { printf("ok:   %s\n", msg); } \
 } while (0)
+
+/* Weak stubs for cap.c dependencies */
+struct ProcessDescriptor proc_table[PROC_MAX];
+uint32_t proc_count = 0;
+__attribute__((weak)) uint32_t alloc_pid(void) {
+    for (uint32_t i = 0; i < PROC_MAX; i++)
+        if (!proc_table[i].active) return 100 + i;
+    return 0;
+}
+__attribute__((weak)) uint64_t alloc_proc_syscall_stack(uint32_t pid) {
+    (void)pid; return 0x300000;
+}
+__attribute__((weak)) void user_map_page(uint64_t* p, uint64_t v, uint64_t pa, uint64_t f) {
+    (void)p; (void)v; (void)pa; (void)f;
+}
+__attribute__((weak)) uint64_t user_clone_page_table(void) { return 0; }
+__attribute__((weak)) int user_map_identity(uint64_t* p, uint64_t pa, uint32_t n, uint64_t f) {
+    (void)p; (void)pa; (void)n; (void)f; return 0;
+}
 
 int main(void) {
     cap_init();

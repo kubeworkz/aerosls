@@ -123,6 +123,7 @@
  */
 #include "kernel/cap.h"
 #include "tests/process_host_stubs.h"   /* per_cpu_data (weak), etc. */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -807,17 +808,17 @@ int main(void) {
          * syscall stack — both must be populated for the child to run. */
         CHECK(child->syscall_stack_top == 0x400000007000ULL,
               "child has a dedicated syscall stack (alloc_proc_syscall_stack)");
-        CHECK(child->ring3_ctx[15] == child->user_rip &&
-              child->ring3_ctx[16] == 0x23 &&
-              child->ring3_ctx[17] == 0x202 &&
-              child->ring3_ctx[18] == child->user_rsp &&
-              child->ring3_ctx[19] == 0x1B,
+        CHECK(child->ring3_ctx.rip == child->user_rip &&
+              child->ring3_ctx.cs == 0x23 &&
+              child->ring3_ctx.rflags == 0x202 &&
+              child->ring3_ctx.rsp == child->user_rsp &&
+              child->ring3_ctx.ss == 0x1B,
               "synthetic ring3_ctx carries the entry rip/cs/rflags/rsp/ss");
         /* The sidecar crt0 contract: _start receives the BIB pointer in
          * rdi (TaskContext index 9) and saves it before switching to its
          * own boot stack — without this the child's first instruction
          * would save zero and rust_entry would parse garbage. */
-        CHECK(child->ring3_ctx[9] == BIB_VADDR,
+        CHECK(child->ring3_ctx.rdi == BIB_VADDR,
               "synthetic ring3_ctx carries the BIB pointer in rdi (crt0 contract)");
         CHECK(b.stack_top == BIB_STACK_TOP, "BIB stack_top = RSP at _start + 16");
         /* Entry = name_len u16 + name + slot u16 + ty u8 + rights u8 +

@@ -47,6 +47,7 @@
 #include <stdint.h>
 
 #include "arch/x86/user_paging.h"
+#include "kernel/process.h"   /* PROC_MAX, struct ProcessDescriptor */
 
 /* ─── Seed Kernel Phase 1.5: syscall-stack wiring ───────────────────────── */
 /* process.c writes per_cpu_data[0].kernel_rsp/user_rsp when it sets up a

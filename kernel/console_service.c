@@ -52,7 +52,8 @@ void console_service_tick(void) {
          * is fully drained even with max_caps = 0 (cap_recv_msg drops the
          * queue holders). */
         for (;;) {
-            uint32_t plen = 0, n_caps = 0, tag = 0, flags = 0;
+            uint32_t plen = 0, tag = 0, flags = 0;
+            uint16_t n_caps = 0;
             int r = cap_recv_msg(0, (uint16_t)s,
                                  console_svc_buf, sizeof(console_svc_buf),
                                  &plen, 0, 0, &n_caps, &tag, &flags);

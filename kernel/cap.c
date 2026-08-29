@@ -191,7 +191,7 @@ static uint64_t cap_word_make(uint32_t type, uint32_t obj, uint32_t perms,
 
 /* 1 if the word is a usable capability: real type, VALID state, reserved
  * bits zero (the forgery tag check). */
-static int cap_word_valid(uint64_t w) {
+int cap_word_valid(uint64_t w) {
     uint32_t type = (uint32_t)((w >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK);
     uint32_t state = (uint32_t)((w >> CAP_STATE_SHIFT) & CAP_STATE_MASK);
     if (type == CAP_TYPE_NONE) return 0;
@@ -210,7 +210,7 @@ static uint64_t cap_word_stamp_revoked(uint64_t w) {
 /* Returns the table index for pid, binding lazily. Table 0 is the kernel
  * context (pid 0). -1 on table exhaustion (never, with PROC_MAX processes
  * and CAP_TABLE_MAX == PROC_MAX + kernel slot). */
-static int cap_table_index(uint32_t pid) {
+int cap_table_index(uint32_t pid) {
     if (pid == 0) return 0;
     for (int i = 0; i < CAP_TABLE_MAX; i++)
         if (cap_table_pid[i] == pid) return i;

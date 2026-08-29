@@ -28,7 +28,9 @@ pub fn build_rootfs() -> Vec<u8> {
         b"echo AeroSLS Phase 5 booting\n\
           echo Root filesystem mounted\n\
           ls /\n\
-          echo System ready\n",
+          echo System ready\n\
+          echo\n\
+          sh\n",
         0o644,
     );
 
