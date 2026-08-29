@@ -65,8 +65,10 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         core::arch::asm!(
             "syscall",
             inlateout("rax") 165u64 => _,
-            in("rdi") b.buf.as_ptr(),
-            in("rdx") b.pos as u64,
+            inlateout("rdi") b.buf.as_ptr() => _,
+            inlateout("rdx") b.pos as u64 => _,
+            lateout("rcx") _, lateout("r11") _, lateout("rsi") _, lateout("r8") _, lateout("r9") _, lateout("r10") _,
+            options(nostack),
         );
     }
     /* ud2 triggers #UD in ring 3 — the kernel must kill the process. */
@@ -80,8 +82,10 @@ fn serial_trace(msg: &[u8]) {
         core::arch::asm!(
             "syscall",
             inlateout("rax") 165u64 => _,
-            in("rdi") msg.as_ptr(),
-            in("rdx") msg.len() as u64,
+            inlateout("rdi") msg.as_ptr() => _,
+            inlateout("rdx") msg.len() as u64 => _,
+            lateout("rcx") _, lateout("r11") _, lateout("rsi") _, lateout("r8") _, lateout("r9") _, lateout("r10") _,
+            options(nostack),
         );
     }
 }
@@ -97,8 +101,10 @@ fn serial_digit(d: u8) {
         core::arch::asm!(
             "syscall",
             inlateout("rax") 165u64 => _,
-            in("rdi") DIGIT_BUF.as_ptr(),
-            in("rdx") 2u64,
+            inlateout("rdi") DIGIT_BUF.as_ptr() => _,
+            inlateout("rdx") 2u64 => _,
+            lateout("rcx") _, lateout("r11") _, lateout("rsi") _, lateout("r8") _, lateout("r9") _, lateout("r10") _,
+            options(nostack),
         );
     }
 }
@@ -119,8 +125,10 @@ fn serial_hex8(ptr: *const u8) {
         core::arch::asm!(
             "syscall",
             inlateout("rax") 165u64 => _,
-            in("rdi") HEX_BUF.as_ptr(),
-            in("rdx") 23u64,
+            inlateout("rdi") HEX_BUF.as_ptr() => _,
+            inlateout("rdx") 23u64 => _,
+            lateout("rcx") _, lateout("r11") _, lateout("rsi") _, lateout("r8") _, lateout("r9") _, lateout("r10") _,
+            options(nostack),
         );
     }
 }
