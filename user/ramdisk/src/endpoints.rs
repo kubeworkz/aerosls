@@ -136,6 +136,16 @@ impl EndpointSet {
         self.n > 0
     }
 
+    /// True when at least one endpoint has completed the RD_INFO handshake
+    /// (is Active). Used to decide when to switch from the 200ms discovery
+    /// poll to a blocking wait (TIMEOUT_NONE). A freshly adopted endpoint
+    /// starts as AwaitingHandshake — the console's CHAN_W partner, which
+    /// is adopted at boot but never handshakes, must not suppress the
+    /// discovery poll.
+    pub fn has_active_client(&self) -> bool {
+        self.eps[..self.n].iter().flatten().any(|e| e.state == EndpointState::Active)
+    }
+
     fn find(&self, handle: u32) -> Option<usize> {
         (0..self.n).find(|&i| self.eps[i].map_or(false, |e| e.handle == handle))
     }

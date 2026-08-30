@@ -79,7 +79,7 @@ pub fn run<K: Kernel>(k: &K, eps: &mut EndpointSet, dev: &Device) -> Result<(), 
         // sidecar's ramdisk channel, wired after this sidecar booted).
         // Once a client connects, block with TIMEOUT_NONE to avoid a
         // CPU-burning busy-loop.
-        let poll_ns: u64 = if eps.has_client() {
+        let poll_ns: u64 = if eps.has_active_client() {
             kapi::TIMEOUT_NONE
         } else {
             200_000_000 /* 200 ms — discovery poll */
