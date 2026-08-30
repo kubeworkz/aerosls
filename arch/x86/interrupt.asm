@@ -93,6 +93,8 @@ isr14_stub:
     push r11
     mov  rdi, [rbp + 8]   ; error_code
     mov  rsi, [rbp + 16]  ; faulting RIP (or CS for Ring-0)
+    mov  rdx, [rbp + 40]  ; user RSP (Ring-3 faults only; 0 for Ring-0)
+    mov  rcx, [rsp + 32]  ; fault-time RDI (pushed: rax@0 rcx@8 rdx@16 rsi@24 rdi@32)
     call handle_page_fault
     pop  r11
     pop  r10

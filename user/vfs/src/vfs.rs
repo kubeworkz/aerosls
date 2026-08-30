@@ -1171,6 +1171,28 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
 
     /// The mount table for observability (device half of the respawn state
     /// machine; stale = the underlying device is gone).
+    /// Debug accessor: the root aerofs cache's device state (0 = Live;
+    /// otherwise the stale reason code). Lets the sidecar's event loop
+    /// report why a root-fs open failed EIO without touching the cache
+    /// internals.
+    /// Debug accessor: the root aerofs cache's device state. Low 16 bits = 0
+    /// for Live, or the stale reason code; high 16 bits = the stale detail
+    /// (or u32::MAX >> 16 if Live). Lets the sidecar's event loop report
+    /// why a root-fs open failed EIO without touching the cache internals.
+    pub fn aerofs_state(&self) -> u32 {
+        for m in &self.mounts {
+            if let Fs::Aerofs(fs) = &self.fss[m.fs] {
+                return match fs.cache.state() {
+                    aerosls_blockcache::State::Live => 0,
+                    aerosls_blockcache::State::Stale { reason, detail } => {
+                        (reason as u32) | ((detail & 0xFFFF) << 16)
+                    }
+                };
+            }
+        }
+        u32::MAX
+    }
+
     pub fn mounts(&self) -> Vec<(String, MountState)> {
         self.mounts
             .iter()

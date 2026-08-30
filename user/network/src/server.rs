@@ -26,6 +26,17 @@ pub fn run<K: Kernel>(k: &K, eps: &mut EndpointSet, net: &mut MockNetwork) -> Re
     let mut caps = [GrantedCap::default(); ChanHeader::MAX_CAPS];
 
     loop {
+        // Re-scan cap table for newly-wired CHAN endpoints (e.g. the POSIX
+        // sidecar's "network" channel, wired after this sidecar booted).
+        for slot in 0u32..16 {
+            if eps.is_console(slot) { continue; }
+            if let Ok(info) = k.cap_info(slot) {
+                if info.ty == kapi::CAP_CHAN {
+                    eps.adopt(slot);
+                }
+            }
+        }
+
         let list = eps.wait_list();
         let wlen = eps.wait_len();
         let (idx, _kind) = k.wait(&list[..wlen], kapi::TIMEOUT_NONE)?;

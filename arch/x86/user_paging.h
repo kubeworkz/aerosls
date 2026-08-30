@@ -31,6 +31,19 @@
 struct PerCPUData {
     uint64_t user_rsp;    // offset 0: scratch for saving user RSP on syscall entry
     uint64_t kernel_rsp;  // offset 8: kernel stack pointer loaded on syscall entry
+    // offset 0x10: syscall-entry registers, saved by syscall_entry_stub
+    // right after its pushes — [0x10]=r11, [0x18]=rcx, [0x20]=r15,
+    // [0x28]=r14, [0x30]=r13, [0x38]=r12, [0x40]=rbx, [0x48]=rbp.
+    // Park/resume capture (proc_park_capture, cap_maybe_handoff,
+    // sys_sls_yield) reads THESE instead of the entry frame on the syscall
+    // stack: the -O2 call chain (do_syscall -> k_chan_* -> ...) may reuse
+    // [top-64..top-8] for its own locals before the capture runs, so the
+    // stack copy is not safe to read late (caught live: resumed processes
+    // sysret'd with garbage rbx/rbp/user_rsp and faulted at 0 / wrote to
+    // 0xf000ff53f000ff73). The scratch is per-CPU and overwritten by every
+    // syscall entry; it is only read mid-syscall by the current process,
+    // so the values always describe the CURRENT syscall.
+    uint64_t syscall_regs[8];
 };
 
 extern struct PerCPUData per_cpu_data[4];  // one slot per core

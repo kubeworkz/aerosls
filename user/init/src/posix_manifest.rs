@@ -47,7 +47,14 @@ pub fn build_posix_manifest(image_kaddr: u64, image_size: u32, heap_base: u64) -
                 flags: 0,
             },
         }),
-        None,
+        Some(ManifestCap {
+            name: "network",
+            rights: 0x7, // R | W | send — network socket channel to the network driver
+            kind: CapKind::Chan {
+                peer: Some("drv.network.0"),
+                flags: 0,
+            },
+        }),
         None,
         None,
         None,
@@ -89,7 +96,7 @@ pub fn build_posix_manifest(image_kaddr: u64, image_size: u32, heap_base: u64) -
             chan_queue_depth: 16,
         }),
         caps,
-        n_caps: 3,
+        n_caps: 4,
         bootstrap: Some(Bootstrap {
             console: Some("console"),
             debug: None,

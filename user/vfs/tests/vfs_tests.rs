@@ -103,6 +103,7 @@ fn mount_root(client: &FakeClient) -> Vfs<FakeClient, FakeAlloc> {
     let cache = BlockCache::connect(
         KWrap(Arc::new(client.clone())),
         0,
+        0,
         AWrap(Arc::new(Mutex::new(FakeAlloc(client.clone())))),
     )
     .unwrap();
@@ -330,6 +331,7 @@ fn open_fd_fails_permanently_across_remount() {
     let new_cache = BlockCache::connect(
         KWrap(Arc::new(client2.clone())),
         0,
+        0,
         AWrap(Arc::new(Mutex::new(FakeAlloc(client2.clone())))),
     )
     .unwrap();
@@ -366,6 +368,7 @@ fn remount_revalidation_rejects_different_device() {
     let (_fake2, client2, t2) = boot(other_image());
     let new_cache = BlockCache::connect(
         KWrap(Arc::new(client2.clone())),
+        0,
         0,
         AWrap(Arc::new(Mutex::new(FakeAlloc(client2.clone())))),
     )
@@ -466,6 +469,7 @@ fn mount_table_rejects_duplicates_and_longest_prefix_wins() {
     let cache = BlockCache::connect(
         KWrap(Arc::new(client.clone())),
         0,
+        0,
         AWrap(Arc::new(Mutex::new(FakeAlloc(client.clone())))),
     )
     .unwrap();
@@ -473,6 +477,7 @@ fn mount_table_rejects_duplicates_and_longest_prefix_wins() {
     vfs.mount_aerofs("/", cache).unwrap();
     let cache2 = BlockCache::connect(
         KWrap(Arc::new(client.clone())),
+        0,
         0,
         AWrap(Arc::new(Mutex::new(FakeAlloc(client.clone())))),
     )

@@ -57,7 +57,8 @@ pub struct ClientSocket {
 /// `KWrap<K>`) and `A: BufferAlloc` (shared via `AWrap<A>`).
 pub struct NetClient<K: Kernel, A: BufferAlloc> {
     k: KWrap<K>,
-    chan: u32,
+    chan_w: u32,  // CHAN_W — for send
+    chan_r: u32,  // CHAN_R — for recv
     alloc: AWrap<A>,
     next_tag: u32,
     /// Max sockets and MTU from the NET_INFO handshake.
@@ -83,10 +84,11 @@ pub enum NetError {
 impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
     /// Create a client on the given endpoint. The first send/recv must be
     /// `info()` (the handshake gate).
-    pub fn new(k: KWrap<K>, chan: u32, alloc: AWrap<A>) -> Self {
+    pub fn new(k: KWrap<K>, chan_w: u32, chan_r: u32, alloc: AWrap<A>) -> Self {
         NetClient {
             k,
-            chan,
+            chan_w,
+            chan_r,
             alloc,
             next_tag: 1,
             max_sockets: 0,
@@ -95,10 +97,9 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
         }
     }
 
-    /// The channel endpoint to the network driver.
-    pub fn chan(&self) -> u32 {
-        self.chan
-    }
+    /// The channel endpoints to the network driver.
+    pub fn chan_w(&self) -> u32 { self.chan_w }
+    pub fn chan_r(&self) -> u32 { self.chan_r }
 
     fn next_tag(&mut self) -> u32 {
         let t = self.next_tag;
@@ -113,8 +114,30 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
     pub fn info(&mut self) -> Result<(u32, u32), NetError> {
         let tag = self.next_tag();
         let frame = NetFrame::new(NET_INFO, false);
+        // LTO-proof serial trace: write directly via syscall
+        {
+            let mut msg = [0u8; 32];
+            msg[..14].copy_from_slice(b"[NETC] info ");
+            let hex = b"0123456789ABCDEF";
+            msg[14] = hex[((self.chan_w >> 4) & 0xF) as usize];
+            msg[15] = hex[(self.chan_w & 0xF) as usize];
+            msg[16] = b' ';
+            msg[17] = hex[((self.chan_r >> 4) & 0xF) as usize];
+            msg[18] = hex[(self.chan_r & 0xF) as usize];
+            msg[19] = b'\n';
+            unsafe {
+                core::arch::asm!("syscall",
+                    inlateout("rax") 165u64 => _,
+                    inlateout("rdi") msg.as_ptr() => _,
+                    lateout("rcx") _, lateout("r11") _,
+                    lateout("rsi") _, lateout("rdx") _,
+                    lateout("r8") _, lateout("r9") _, lateout("r10") _,
+                    options(nostack),
+                );
+            }
+        }
         self.k
-            .send(self.chan, tag, 0, &frame.encode(), &[], TIMEOUT_NONE)
+            .send(self.chan_w, tag, 0, &frame.encode(), &[], TIMEOUT_NONE)
             .map_err(NetError::Kernel)?;
 
         let (rr, body) = self.recv_reply_owned(tag)?;
@@ -147,7 +170,7 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
             .copy_from_slice(&encode_net_socket_body(sock_type, 0));
 
         self.k
-            .send(self.chan, tag, 0, &payload, &[], TIMEOUT_NONE)
+            .send(self.chan_w, tag, 0, &payload, &[], TIMEOUT_NONE)
             .map_err(NetError::Kernel)?;
 
         let (_rr, body) = self.recv_reply_owned(tag)?;
@@ -186,7 +209,7 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
         payload[NetFrame::SIZE + 4..].copy_from_slice(&encode_sockaddr(ip, port));
 
         self.k
-            .send(self.chan, tag, 0, &payload, &[], TIMEOUT_NONE)
+            .send(self.chan_w, tag, 0, &payload, &[], TIMEOUT_NONE)
             .map_err(NetError::Kernel)?;
 
         let (_rr, body) = self.recv_reply_owned(tag)?;
@@ -211,7 +234,7 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
         payload[NetFrame::SIZE + 4..].copy_from_slice(&encode_sockaddr(ip, port));
 
         self.k
-            .send(self.chan, tag, 0, &payload, &[], TIMEOUT_NONE)
+            .send(self.chan_w, tag, 0, &payload, &[], TIMEOUT_NONE)
             .map_err(NetError::Kernel)?;
 
         let (_rr, body) = self.recv_reply_owned(tag)?;
@@ -235,7 +258,7 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
         payload[NetFrame::SIZE..].copy_from_slice(&id.to_le_bytes());
 
         self.k
-            .send(self.chan, tag, 0, &payload, &[], TIMEOUT_NONE)
+            .send(self.chan_w, tag, 0, &payload, &[], TIMEOUT_NONE)
             .map_err(NetError::Kernel)?;
 
         let (_rr, body) = self.recv_reply_owned(tag)?;
@@ -258,7 +281,7 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
         payload[NetFrame::SIZE..].copy_from_slice(&id.to_le_bytes());
 
         self.k
-            .send(self.chan, tag, 0, &payload, &[], TIMEOUT_NONE)
+            .send(self.chan_w, tag, 0, &payload, &[], TIMEOUT_NONE)
             .map_err(NetError::Kernel)?;
 
         let (_rr, body) = self.recv_reply_owned(tag)?;
@@ -314,7 +337,7 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
         payload[NetFrame::SIZE..].copy_from_slice(&id.to_le_bytes());
 
         self.k
-            .send(self.chan, tag, 0, &payload, &[send_cap], TIMEOUT_NONE)
+            .send(self.chan_w, tag, 0, &payload, &[send_cap], TIMEOUT_NONE)
             .map_err(NetError::Kernel)?;
 
         let (_rr, body) = self.recv_reply_owned(tag)?;
@@ -349,7 +372,7 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
         payload[NetFrame::SIZE..].copy_from_slice(&id.to_le_bytes());
 
         self.k
-            .send(self.chan, tag, 0, &payload, &[send_cap], TIMEOUT_NONE)
+            .send(self.chan_w, tag, 0, &payload, &[send_cap], TIMEOUT_NONE)
             .map_err(NetError::Kernel)?;
 
         let (_rr, body) = self.recv_reply_owned(tag)?;
@@ -379,7 +402,7 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
         payload[NetFrame::SIZE..].copy_from_slice(&id.to_le_bytes());
 
         self.k
-            .send(self.chan, tag, 0, &payload, &[], TIMEOUT_NONE)
+            .send(self.chan_w, tag, 0, &payload, &[], TIMEOUT_NONE)
             .map_err(NetError::Kernel)?;
 
         let (_rr, body) = self.recv_reply_owned(tag)?;
@@ -405,7 +428,7 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
         payload[NetFrame::SIZE..].copy_from_slice(&encode_net_shutdown_body(id, how));
 
         self.k
-            .send(self.chan, tag, 0, &payload, &[], TIMEOUT_NONE)
+            .send(self.chan_w, tag, 0, &payload, &[], TIMEOUT_NONE)
             .map_err(NetError::Kernel)?;
 
         let (_rr, body) = self.recv_reply_owned(tag)?;
@@ -431,7 +454,7 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
         payload[NetFrame::SIZE..].copy_from_slice(&id.to_le_bytes());
 
         self.k
-            .send(self.chan, tag, 0, &payload, &[], TIMEOUT_NONE)
+            .send(self.chan_w, tag, 0, &payload, &[], TIMEOUT_NONE)
             .map_err(NetError::Kernel)?;
 
         let (_rr, body) = self.recv_reply_owned(tag)?;
@@ -466,7 +489,7 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
         let mut caps = [GrantedCap::default(); ChanHeader::MAX_CAPS];
         let rr = self
             .k
-            .recv(self.chan, &mut buf, &mut caps)
+            .recv(self.chan_r, &mut buf, &mut caps)
             .map_err(|_e| NetError::Closed)?;
         if rr.kind != CH_KIND_MSG {
             return Err(NetError::Closed);
@@ -613,7 +636,7 @@ mod tests {
         use alloc::sync::Arc;
         let k = KWrap(Arc::new(TestKernel));
         let alloc = AWrap(Arc::new(aerosls_proto::Mutex::new(NoAlloc)));
-        let _client: NetClient<TestKernel, NoAlloc> = NetClient::new(k, 7, alloc);
+        let _client: NetClient<TestKernel, NoAlloc> = NetClient::new(k, 7, 8, alloc);
     }
 
     struct NoAlloc;

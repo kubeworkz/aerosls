@@ -343,30 +343,10 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     // Yield to let the ramdisk sidecar start and park.
     unsafe { k_yield(); }
 
-    // ── 9. Spawn the POSIX sidecar ────────────────────────────────────────
-    log(&console, "[INIT] spawning POSIX sidecar...");
-
-    let posix_image_cap = bib
-        .find_cap(CAP_MEM, "posix.image")
-        .expect("[INIT] missing 'posix.image' MEM cap");
-
-    // posix.heap is NOT in init's manifest (avoids MEM overlap with
-    // the POSIX sidecar's own budget cap).  Compute its base from the
-    // image cap: heap sits immediately after the image, page-aligned.
-    let posix_heap_base = (posix_image_cap.base + posix_image_cap.len + 4095) & !4095u64;
-    log_fmt!(&console, "[INIT]   posix.heap computed @ 0x{:x}", posix_heap_base);
-
-    // The POSIX sidecar's manifest declares budget + console + ramdisk caps.
-    // The ramdisk CHAN cap is wired by the kernel to drv.ramdisk.0.
-    spawn_posix_sidecar(&console, posix_image_cap, posix_heap_base);
-    // Yield multiple times to give the ramdisk sidecar time to
-    // re-scan its cap table, discover the POSIX ramdisk channel,
-    // and be ready to handle RD_INFO before POSIX sends it.
-    for _ in 0..3 {
-        unsafe { k_yield(); }
-    }
-
-    // ── 9b. Spawn the network driver ──────────────────────────────────────
+    // ── 9. Spawn the network driver FIRST ────────────────────────────────
+    // The network driver must be registered in the kernel's sidecar
+    // registry before the POSIX sidecar, because the POSIX manifest
+    // declares a 'network' CHAN cap wired to 'drv.network.0'.
     log(&console, "[INIT] spawning network driver...");
 
     let net_image_cap = bib
@@ -381,6 +361,30 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
 
     spawn_network_driver(&console, net_image_cap, net_heap_base);
     // Yield to let the network sidecar start and park.
+    for _ in 0..3 {
+        unsafe { k_yield(); }
+    }
+
+    // ── 10. Spawn the POSIX sidecar ───────────────────────────────────────
+    log(&console, "[INIT] spawning POSIX sidecar...");
+
+    let posix_image_cap = bib
+        .find_cap(CAP_MEM, "posix.image")
+        .expect("[INIT] missing 'posix.image' MEM cap");
+
+    // posix.heap is NOT in init's manifest (avoids MEM overlap with
+    // the POSIX sidecar's own budget cap).  Compute its base from the
+    // image cap: heap sits immediately after the image, page-aligned.
+    let posix_heap_base = (posix_image_cap.base + posix_image_cap.len + 4095) & !4095u64;
+    log_fmt!(&console, "[INIT]   posix.heap computed @ 0x{:x}", posix_heap_base);
+
+    // The POSIX sidecar's manifest declares budget + console + ramdisk + network caps.
+    // The network CHAN cap is wired by the kernel to drv.network.0 (must be registered first).
+    // The ramdisk CHAN cap is wired to drv.ramdisk.0.
+    spawn_posix_sidecar(&console, posix_image_cap, posix_heap_base);
+    // Yield multiple times to give the ramdisk sidecar time to
+    // re-scan its cap table, discover the POSIX ramdisk channel,
+    // and be ready to handle RD_INFO before POSIX sends it.
     for _ in 0..3 {
         unsafe { k_yield(); }
     }

@@ -238,7 +238,14 @@ mod abi {
         core::arch::asm!(
             "syscall",
             inlateout("rax") num => ret,
-            in("rdi") arg,
+            // The kernel's syscall path uses rdi for arg[0] and never
+            // restores it (caller-saved by ABI) — declare it clobbered so
+            // the compiler cannot reuse the pre-syscall value afterward.
+            // Caught live: the POSIX sidecar's klog passed its buffer via
+            // `in("rdi")`, the compiler reused rdi after the syscall for
+            // the buffer tail-zeroing, and the epilogue wrote through the
+            // kernel-left garbage pointer (0x3d4) → #PF at 0x430.
+            inlateout("rdi") arg => _,
             lateout("rcx") _,
             lateout("r11") _,
             lateout("rsi") _,

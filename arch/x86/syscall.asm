@@ -52,6 +52,24 @@ syscall_entry_stub:
     push rcx       ; user RIP (set by CPU on SYSCALL)
     push r11       ; user RFLAGS
 
+    ; Save the entry registers to per-CPU scratch ([gs:0x10..0x50]) right
+    ; away. Park/resume capture reads these (proc_park_capture and the
+    ; handoff/yield captures in process.c) — the copy on the syscall stack
+    ; at [top-64..top-8] is NOT safe to read later: the -O2 call chain
+    ; (do_syscall -> sys_sls_chan_* -> k_chan_* -> ...) may reuse that
+    ; region for its own locals before the capture runs, so a late read can
+    ; capture garbage and the resumed process sysrets with corrupted
+    ; callee-saved regs / user RSP (caught live: resumed processes faulted
+    ; at rip=0 and wrote to 0xf000ff53f000ff73). Must run BEFORE any call.
+    mov [gs:0x10], r11
+    mov [gs:0x18], rcx
+    mov [gs:0x20], r15
+    mov [gs:0x28], r14
+    mov [gs:0x30], r13
+    mov [gs:0x38], r12
+    mov [gs:0x40], rbx
+    mov [gs:0x48], rbp
+
     ; ── Route on syscall number in RAX ───────────────────────────────────────
     cmp rax, 105
     je  .do_sls_allocate

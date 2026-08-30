@@ -627,6 +627,7 @@ void cap_wake_chan(uint32_t chan_id);
  * so re-parks never extend it. cap_park_deadline_tick() (called from the
  * timer ISR) wakes every parked process whose deadline has passed. */
 uint64_t cap_park_deadline_take(void);
+uint64_t cap_park_deadline_peek(void);   /* debug: non-consuming */
 void     cap_park_deadline_tick(void);
 void cap_maybe_handoff(void);
 

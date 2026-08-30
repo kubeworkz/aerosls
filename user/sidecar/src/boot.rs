@@ -60,8 +60,9 @@ pub struct BootCaps {
     pub ramdisk_chan_r: Option<u32>,
     /// The network driver channel (`network`), if the manifest declared
     /// one. The POSIX sidecar connects a `NetClient` on this endpoint
-    /// for socket I/O.
-    pub net_chan: Option<u32>,
+    /// for socket I/O.  CHAN_W (send) and CHAN_R (recv) endpoints.
+    pub net_chan_w: Option<u32>,
+    pub net_chan_r: Option<u32>,
 }
 
 impl BootCaps {
@@ -73,7 +74,8 @@ impl BootCaps {
         let ramdisk_r = bib.find_cap(CAP_CHAN, "ramdisk");
         let ramdisk_w = bib.find_cap(CAP_CHAN_W, "ramdisk");
         let console = bib.find_cap(CAP_CHAN, "console");
-        let network = bib.find_cap(CAP_CHAN, "network");
+        let net_r = bib.find_cap(CAP_CHAN, "network");
+        let net_w = bib.find_cap(CAP_CHAN_W, "network");
         Ok(BootCaps {
             budget_slot: budget.slot,
             budget_base: budget.base,
@@ -81,7 +83,8 @@ impl BootCaps {
             console_chan: console.map(|c| c.slot),
             ramdisk_chan_w: ramdisk_w.map(|r| r.slot),
             ramdisk_chan_r: ramdisk_r.map(|r| r.slot),
-            net_chan: network.map(|n| n.slot),
+            net_chan_w: net_w.map(|n| n.slot),
+            net_chan_r: net_r.map(|n| n.slot),
         })
     }
 
@@ -94,7 +97,8 @@ impl BootCaps {
         console_chan: Option<u32>,
         ramdisk_chan_w: Option<u32>,
         ramdisk_chan_r: Option<u32>,
-        net_chan: Option<u32>,
+        net_chan_w: Option<u32>,
+        net_chan_r: Option<u32>,
     ) -> BootCaps {
         BootCaps {
             budget_slot,
@@ -103,7 +107,8 @@ impl BootCaps {
             console_chan,
             ramdisk_chan_w,
             ramdisk_chan_r,
-            net_chan,
+            net_chan_w,
+            net_chan_r,
         }
     }
 }
@@ -195,12 +200,15 @@ pub fn boot<K: Kernel, A: BufferAlloc>(
 
     // 5. Network client (optional): connect and handshake with the
     //    network driver when a net_chan was declared in the manifest.
-    let net: Option<NetClient<K, A>> = caps.net_chan.map(|chan| {
-        let mut nc = NetClient::new(KWrap(k_arc), chan, AWrap(alloc_arc));
-        // Handshake: NET_INFO must be the first message.
-        let _ = nc.info();
-        nc
-    });
+    let net: Option<NetClient<K, A>> = match (caps.net_chan_w, caps.net_chan_r) {
+        (Some(cw), Some(cr)) => {
+            let nc = NetClient::new(KWrap(k_arc), cw, cr, AWrap(alloc_arc));
+            // NOTE: NET_INFO handshake moved to entry.rs (binary crate)
+            // to survive LTO — library-crate serial_trace calls are stripped.
+            Some(nc)
+        }
+        _ => None,
+    };
 
 
 

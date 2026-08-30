@@ -408,6 +408,30 @@ impl CharNode {
         self.output.borrow().clone()
     }
 
+    /// Take and clear the buffered console output. The console driver in
+    /// the full sidecar drains here (forwarding the bytes to the kernel
+    /// console channel); the sim harness reads it back via `output()`.
+    pub fn drain_output(&self) -> Vec<u8> {
+        let mut o = self.output.borrow_mut();
+        core::mem::take(&mut *o)
+    }
+
+    /// Diagnostic: the `output` RefCell borrow state. 0 = free, 1 =
+    /// shared (`borrow`) outstanding, 2 = mutable (`borrow_mut`)
+    /// outstanding. The pump in `entry.rs` klogs this before draining so a
+    /// "RefCell already borrowed" panic can be traced to its holder.
+    pub fn output_borrow_state(&self) -> u8 {
+        match self.output.try_borrow_mut() {
+            Ok(_) => 0,   // free
+            Err(_) => match self.output.try_borrow() {
+                // borrow_mut fails while a shared borrow is outstanding,
+                // but borrow still succeeds (shared + shared is legal).
+                Ok(_) => 1,   // shared outstanding
+                Err(_) => 2,  // mutable outstanding (borrow fails entirely)
+            },
+        }
+    }
+
     fn read(&self, buf: &mut [u8]) -> Result<usize, Errno> {
         let n = core::cmp::min(buf.len(), self.input.borrow().len());
         if n > 0 {

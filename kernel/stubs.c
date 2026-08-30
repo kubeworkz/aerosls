@@ -67,14 +67,38 @@ int memcmp(const void* a, const void* b, size_t n) {
  * matters on a path that runs when memory access is what failed. */
 extern char stack_bottom[], stack_top[];
 
-void handle_page_fault(unsigned long error_code, unsigned long saved_rip) {
+void handle_page_fault(unsigned long error_code, unsigned long saved_rip,
+                       unsigned long user_rsp, unsigned long saved_rdi) {
     unsigned long faulting_address;
     __asm__ volatile("mov %%cr2, %0" : "=r"(faulting_address));
 
     if (error_code & 0x4) {
         kernel_serial_printf(
-            "[FAULT] Ring-3 #PF  error=0x%lx  addr=0x%016lx  rip=0x%016lx  — killing process.\n",
-            error_code, faulting_address, saved_rip);
+            "[FAULT] Ring-3 #PF  error=0x%lx  addr=0x%016lx  rip=0x%016lx  "
+            "rdi=0x%016lx — killing process.\n",
+            error_code, faulting_address, saved_rip, saved_rdi);
+        /* Dump the user stack: return addresses of the active frames.
+         * Clamped to the current process's mapped stack region so a
+         * garbage rsp can't nested-fault inside the fault handler. */
+        extern struct ProcessDescriptor* process_find_current(void);
+        uint64_t lo = 0, hi = 0;
+        struct ProcessDescriptor* cur = process_find_current();
+        if (cur) {
+            lo = cur->user_stack_vaddr;
+            hi = cur->user_stack_vaddr + 8ULL * 4096ULL;
+        }
+        kernel_serial_printf("[FAULT] user rsp=0x%016lx stack: ", user_rsp);
+        for (int i = -8; i < 64; i++) {
+            unsigned long a = user_rsp + (unsigned long)i * 8;
+            uint64_t q = 0;
+            if (hi && a >= lo && a + 8 <= hi) {
+                q = *(volatile uint64_t*)a;
+            }
+            kernel_serial_printf("%s%02d:0x%016lx ", i < 0 ? "-" : "",
+                                 (i < 0 ? -i : i), (unsigned long)q);
+            if ((i - 3) % 4 == 0) kernel_serial_printf("\n");
+        }
+        kernel_serial_printf("\n");
         process_exit(139);
         process_exit(139);   /* SIGSEGV-equivalent */
         /* process_exit() restores kernel context and does not return here */

@@ -118,6 +118,7 @@ struct ProcessDescriptor {
     uint64_t   cr3;                   // physical address of the process's PML4
     uint64_t   user_rip;              // entry point in user space
     uint64_t   user_rsp;              // current user-space stack pointer
+    uint64_t   user_stack_vaddr;      // vaddr base of the 8-page user stack
     uint64_t   user_stack_phys;       // physical base of the stack allocation
     uint64_t   kernel_rsp;            // saved kernel RSP — restored on exit
     uint64_t   kernel_cr3;            // saved kernel CR3 — restored on exit

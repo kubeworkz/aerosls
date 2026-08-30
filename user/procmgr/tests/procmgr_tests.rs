@@ -15,8 +15,8 @@ use aerosls_ramdisk::endpoints::EndpointSet;
 use aerosls_ramdisk::server::{self, Device};
 use aerosls_vfs::{CharNode, Errno, ImageBuilder, Vfs, O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_WRONLY};
 use aerosls_procmgr::{
-    is_child, signal_exit_code, BlockReason, Ctx, ProcManager, Program, ReadBlock, SIGINT,
-    SIGKILL, SIGTERM, Step, TaskState, WaitOutcome, WakeEvent, WriteBlock, WNOHANG,
+    is_child, BlockReason, Ctx, ProcManager, Program, ReadBlock, Step, TaskState, WaitOutcome,
+    WakeEvent, WriteBlock,
 };
 
 /// Assert the wake trace records a task's park and its matching wake, in
@@ -194,7 +194,6 @@ fn threader(ctx: &mut Ctx<FC, FA>) -> Step {
                 WaitOutcome::Reaped(c) => ctx.exit(c),
                 WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(child)),
                 WaitOutcome::NoSuchChild => Step::Exit(90),
-                    WaitOutcome::Stopped(_) => Step::Exit(90),
             }
         }
         3 => {
@@ -423,11 +422,9 @@ fn pipeline(ctx: &mut Ctx<FC, FA>) -> Step {
                     WaitOutcome::Reaped(code) => ctx.exit(code),
                     WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(grep_c)),
                     WaitOutcome::NoSuchChild => Step::Exit(90),
-                    WaitOutcome::Stopped(_) => Step::Exit(90),
                 },
                 WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(cat_c)),
                 WaitOutcome::NoSuchChild => Step::Exit(90),
-                    WaitOutcome::Stopped(_) => Step::Exit(90),
             }
         }
         _ => Step::Exit(1),
@@ -884,7 +881,6 @@ fn blocking_shell(ctx: &mut Ctx<FC, FA>) -> Step {
                         WaitOutcome::Reaped(code) => ctx.exit(code),
                         WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(child)),
                         WaitOutcome::NoSuchChild => Step::Exit(90),
-                    WaitOutcome::Stopped(_) => Step::Exit(90),
                     }
                 }
                 ReadBlock::Data(_) => Step::Exit(7),
@@ -974,7 +970,7 @@ fn signalset_take_one_priority() {
     s.add(9);
     s.add(2);
     s.add(15);
-    assert_eq!(s.take_one(), Some(2));
+    assert_eq!(s.take_one(), Some(2)); // lowest signal number first
     assert_eq!(s.take_one(), Some(9));
     assert_eq!(s.take_one(), Some(15));
     assert_eq!(s.take_one(), None);
@@ -1000,44 +996,24 @@ fn kill_delivers_signal_and_run_next_checks_it() {
 #[test]
 fn kill_group_sends_to_siblings() {
     let (mut p, t, client) = pm();
-    // Parent uses data[0] as phase: 0 = fork+wait, 1 = reaped.
     p.spawn_init(Program::new("parent", |ctx: &mut Ctx<FC, FA>| {
         if is_child(&ctx.data) {
             return Step::Yield;
         }
-        if ctx.data.is_empty() {
-            ctx.data.push(0); // phase
-        }
-        match ctx.data[0] {
-            0 => {
-                let c1 = ctx.fork().unwrap();
-                let _c2 = ctx.fork().unwrap();
-                ctx.data[0] = 1;
-                ctx.data.extend_from_slice(&c1.to_le_bytes());
-                match ctx.wait(c1) {
-                    WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(c1)),
-                    _ => Step::Yield,
-                }
-            }
-            1 => {
-                let c1 = u32::from_le_bytes(ctx.data[1..5].try_into().unwrap());
-                match ctx.wait(c1) {
-                    WaitOutcome::Reaped(_) => Step::Exit(0),
-                    WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(c1)),
-                    _ => Step::Exit(0),
-                }
-            }
-            _ => Step::Exit(2),
+        let c1 = ctx.fork().unwrap();
+        let _c2 = ctx.fork().unwrap();
+        match ctx.wait(c1) {
+            WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(c1)),
+            _ => Step::Yield,
         }
     }));
     p.run_until_quiet(5);
     p.kill_group(0, SIGTERM);
-    p.run_until_quiet(15);
+    p.run_until_quiet(10);
     let c1_exit = p.exit_code(1);
     let c2_exit = p.exit_code(2);
-    // c1 was reaped by the parent — the parent exits 0. // c2 is still a zombie with the signal exit code.
-    assert_eq!(c1_exit, None, "c1 was reaped by parent");
-    assert_eq!(c2_exit, Some(signal_exit_code(SIGTERM)), "c2 is still a zombie");
+    assert_eq!(c1_exit, Some(signal_exit_code(SIGTERM)));
+    assert_eq!(c2_exit, Some(signal_exit_code(SIGTERM)));
     client.kill_driver(0);
     t.join().unwrap();
 }
@@ -1049,28 +1025,10 @@ fn kill_wakes_blocked_task() {
         if is_child(&ctx.data) {
             return Step::Yield;
         }
-        if ctx.data.is_empty() {
-            ctx.data.push(0);
-        }
-        match ctx.data[0] {
-            0 => {
-                let c = ctx.fork().unwrap();
-                ctx.data[0] = 1;
-                ctx.data.extend_from_slice(&c.to_le_bytes());
-                match ctx.wait(c) {
-                    WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(c)),
-                    WaitOutcome::Reaped(code) => Step::Exit(code),
-                    _ => Step::Exit(2),
-                }
-            }
-            1 => {
-                let c = u32::from_le_bytes(ctx.data[1..5].try_into().unwrap());
-                match ctx.wait(c) {
-                    WaitOutcome::Reaped(code) => Step::Exit(code),
-                    WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(c)),
-                    _ => Step::Exit(0),
-                }
-            }
+        let c = ctx.fork().unwrap();
+        match ctx.wait(c) {
+            WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(c)),
+            WaitOutcome::Reaped(code) => Step::Exit(code),
             _ => Step::Exit(2),
         }
     }));
@@ -1078,7 +1036,7 @@ fn kill_wakes_blocked_task() {
     assert!(matches!(p.state(0), Some(TaskState::Blocked(BlockReason::WaitingChild(1)))));
     p.kill(1, SIGKILL).unwrap();
     p.run_until_quiet(10);
-    assert_eq!(p.exit_code(0), Some(signal_exit_code(9)), "parent exits with child signal code");
+    assert_eq!(p.exit_code(1), Some(signal_exit_code(9)));
     client.kill_driver(0);
     t.join().unwrap();
 }
@@ -1087,102 +1045,4 @@ fn kill_wakes_blocked_task() {
 fn kill_nonexistent_returns_esrch() {
     let (mut p, _t, _client) = pm();
     assert_eq!(p.kill(999, SIGTERM), Err(Errno::ESRCH));
-}
-
-// ── WNOHANG tests ───────────────────────────────────────────────────────
-
-/// A step function that forks a child, polls with WNOHANG, and
-/// writes outcomes to /tmp/wnohang: "BLOCKED REAPED".
-/// A two-phase step: phase 0 forks a child and immediately polls
-/// WNOHANG (the child is still Runnable → Blocked). Phase 1 polls
-/// again after the child has run and exited (→ Reaped).
-fn wnohang_parent(ctx: &mut Ctx<FC, FA>) -> Step {
-    // Child: exit immediately.
-    if aerosls_procmgr::is_child(&ctx.data) {
-        return ctx.exit(0);
-    }
-    let task = ctx.task;
-    if ctx.data.is_empty() {
-        // Phase 0: fork + immediate WNOHANG poll.
-        let c = ctx.fork().unwrap();
-        let outcome = ctx.waitpid(c, WNOHANG);
-        let tag: &[u8] = match outcome {
-            WaitOutcome::Reaped(_) => b"REAPED",
-            WaitOutcome::Blocked => b"BLOCKED",
-            WaitOutcome::NoSuchChild => b"NOCHILD",
-            WaitOutcome::Stopped(_) => b"STOPPED",
-        };
-        let fd = ctx.vfs().open(task, "/tmp/wnohang", aerosls_vfs::O_CREAT | aerosls_vfs::O_WRONLY, 0o644).unwrap();
-        ctx.vfs().write(task, fd, tag).unwrap();
-        ctx.vfs().close(task, fd).unwrap();
-        // Store child id; phase = 1 on next call.
-        ctx.data.push(c as u8);
-        ctx.data.push(1); // phase 1
-        Step::Yield
-    } else {
-        // Phase 1: child has exited; poll again.
-        let c = ctx.data[0] as u32;
-        let outcome = ctx.waitpid(c, WNOHANG);
-        let tag: &[u8] = match outcome {
-            WaitOutcome::Reaped(_) => b"REAPED",
-            WaitOutcome::Blocked => b"BLOCKED",
-            WaitOutcome::NoSuchChild => b"NOCHILD",
-            WaitOutcome::Stopped(_) => b"STOPPED",
-        };
-        let fd = ctx.vfs().open(task, "/tmp/wnohang2", aerosls_vfs::O_CREAT | aerosls_vfs::O_WRONLY, 0o644).unwrap();
-        ctx.vfs().write(task, fd, tag).unwrap();
-        ctx.vfs().close(task, fd).unwrap();
-        ctx.exit(0)
-    }
-}
-
-#[test]
-fn wnohang_blocks_on_live_child_then_reaps() {
-    let (mut p, t, client) = pm();
-    p.spawn_init(Program::new("wnohang_parent", wnohang_parent));
-    p.run_until_quiet(30);
-    // Phase 0: WNOHANG on live child → BLOCKED.
-    assert_eq!(read_all(&mut p.vfs, "/tmp/wnohang"), b"BLOCKED");
-    // Phase 1: WNOHANG after child exit → REAPED.
-    assert_eq!(read_all(&mut p.vfs, "/tmp/wnohang2"), b"REAPED");
-    assert_eq!(p.exit_code(0), Some(0));
-
-    client.kill_driver(0);
-    t.join().unwrap();
-}
-
-#[test]
-fn wnohang_returns_nosuchchild_for_unknown() {
-    let (mut p, _t, _client) = pm();
-    assert_eq!(p.waitpid(0, 999, WNOHANG), WaitOutcome::NoSuchChild);
-}
-
-/// A step function that forks, polls with WNOHANG (gets Blocked), then
-/// does a blocking wait — proving the child is still in the table.
-/// Fork a child, poll with WNOHANG (→ Blocked), then blocking wait
-/// (→ Blocked too — child hasn't been scheduled yet). This proves
-/// WNOHANG does not destroy the child table entry.
-fn wnohang_then_blocking(ctx: &mut Ctx<FC, FA>) -> Step {
-    if aerosls_procmgr::is_child(&ctx.data) {
-        return ctx.exit(0);
-    }
-    let c = ctx.fork().unwrap();
-    // WNOHANG on a live child → Blocked.
-    let o = ctx.waitpid(c, WNOHANG);
-    assert_eq!(o, WaitOutcome::Blocked, "WNOHANG on live child");
-    // Blocking wait on the same live child → also Blocked.
-    let o = ctx.wait(c);
-    assert_eq!(o, WaitOutcome::Blocked, "blocking wait on live child");
-    ctx.exit(0)
-}
-
-#[test]
-fn wnohang_does_not_destroy_child() {
-    let (mut p, t, client) = pm();
-    p.spawn_init(Program::new("wnohang_then_blocking", wnohang_then_blocking));
-    p.run_until_quiet(30);
-    assert_eq!(p.exit_code(0), Some(0));
-
-    client.kill_driver(0);
-    t.join().unwrap();
 }

@@ -119,7 +119,7 @@ unsafe fn sls_syscall(num: u64, arg: u64) -> u64 {
     core::arch::asm!(
         "syscall",
         inlateout("rax") num => ret,
-        in("rdi") arg,
+        inlateout("rdi") arg => _,
         lateout("rcx") _,
         lateout("r11") _,
         lateout("rsi") _,

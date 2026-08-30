@@ -24,6 +24,64 @@ use crate::heap::Bump;
 use aerosls_proto::bootinfo::BootInfo;
 use aerosls_proto::kabi::{CAP_CHAN_W, Kernel, RealKernel, TIMEOUT_NONE};
 
+extern "C" {
+    fn k_chan_send(chan: u32, tag: u32, flags: u16, payload: *const u8,
+                   payload_len: u32, caps: *const core::ffi::c_void,
+                   n_caps: u32, timeout_ns: u64) -> i32;
+    fn k_chan_recv(chan: u32, buf: *mut u8, buf_len: u32,
+                   slots: *mut core::ffi::c_void, n_slots: u32,
+                   out: *mut core::ffi::c_void) -> i32;
+}
+
+/// Result of the NET_INFO handshake, stored here so the linker cannot
+/// eliminate the function call (the write is to a `#[used]` static).
+#[used]
+static mut NET_INFO_RESULT: u32 = 0;
+
+/// NET_INFO handshake — called unconditionally from `rust_entry` via a
+/// `#[no_mangle]` symbol so the compiler cannot prove it dead and
+/// eliminate it.  Pass 0xFF for either handle to skip.
+#[no_mangle]
+pub extern "C" fn posix_net_info_handshake(net_w: u32, net_r: u32) -> u32 {
+    if net_w == 0xFF || net_r == 0xFF {
+        klog(b"[POSIX] NET_INFO skip w=", net_w, b"");
+        return 0;
+    }
+    klog(b"[POSIX] NET_INFO send slot=", net_w, b"\n");
+    // 1. Build NET_INFO payload (NetFrame: magic + version + type + flags)
+    let mut payload = [0u8; 16];
+    payload[0..4].copy_from_slice(b"AERS");
+    payload[4..6].copy_from_slice(&[1, 0]); // version=1
+    payload[6..8].copy_from_slice(&[1, 0]); // type=NET_INFO=1
+    let send_rc = unsafe {
+        k_chan_send(
+            net_w,            // CHAN_W slot
+            1,               // tag=1
+            0,               // flags
+            payload.as_ptr(),
+            16,              // payload_len
+            core::ptr::null(), // no caps
+            0,               // n_caps=0
+            0,               // timeout_ns=0 (TIMEOUT_NONE = block)
+        )
+    };
+    klog(b"[POSIX] NET_INFO rc=", send_rc as u32, b"\n");
+    // 2. Recv reply on chan_r
+    let mut buf = [0u8; 256];
+    let recv_rc = unsafe {
+        k_chan_recv(
+            net_r,            // CHAN_R slot
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+            core::ptr::null_mut(), // no slot caps
+            0,               // n_slots=0
+            core::ptr::null_mut(), // out (we'll read manually)
+        )
+    };
+    klog(b"[POSIX] NET_REPLY rc=", recv_rc as u32, b"\n");
+    send_rc as u32
+}
+
 /* The crt0 (crt0.S) is assembled by rustc's LLVM integrated assembler
  * through global_asm — no external cross-GCC — and linked at address 0 by
  * posix.ld (ENTRY(_start)). It saves rdi (the BIB pointer) and switches
@@ -99,6 +157,20 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 /// as 8 hex digits, then `extra`. NUL-terminated like the kernel's
 /// `kernel_serial_print` expects. Lives in the binary crate so the call
 /// survives release LTO.
+/// LTO-proof: write the last syscall return value here so the
+/// compiler cannot eliminate the preceding asm block.
+/// The read_volatile in `touch_cookie` forces the compiler to
+/// keep the write, and `touch_cookie` is called from rust_entry
+/// so the linker cannot eliminate it.
+#[used]
+static mut SYSCALL_COOKIE: u64 = 0;
+
+/// Force the compiler to keep SYSCALL_COOKIE alive.
+#[inline(never)]
+fn touch_cookie() {
+    unsafe { core::ptr::read_volatile(&SYSCALL_COOKIE); }
+}
+
 fn klog(tag: &[u8], val: u32, extra: &[u8]) {
     let mut msg = [0u8; 96];
     let n = tag.len().min(24);
@@ -116,9 +188,10 @@ fn klog(tag: &[u8], val: u32, extra: &[u8]) {
     off += ne;
     msg[off] = b'\n';
     unsafe {
+        let mut rax: u64;
         core::arch::asm!(
             "syscall",
-            inlateout("rax") 165u64 => _,
+            inlateout("rax") 165u64 => rax,
             inlateout("rdi") msg.as_ptr() => _,
             // The kernel's syscall path uses every caller-saved register
             // (do_syscall's args) and never restores them — declare ALL of
@@ -129,7 +202,9 @@ fn klog(tag: &[u8], val: u32, extra: &[u8]) {
             lateout("rcx") _, lateout("r11") _, lateout("rsi") _, lateout("rdx") _, lateout("r8") _, lateout("r9") _, lateout("r10") _,
             options(nostack),
         );
+        SYSCALL_COOKIE = rax;
     }
+    touch_cookie();
 }
 
 #[no_mangle]
@@ -166,6 +241,7 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         let rw = caps.ramdisk_chan_w.map_or(0xFFu32, |v| v);
         let rr = caps.ramdisk_chan_r.map_or(0xFFu32, |v| v);
         let cw = caps.console_chan.map_or(0xFFu32, |v| v);
+        let nw = caps.net_chan_w.map_or(0xFFu32, |v| v);
         let mut msg = [0u8; 80];
         let s = b"[POSIX] boot: rw=";
         msg[..s.len()].copy_from_slice(s);
@@ -181,6 +257,10 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         msg[off..off+s3.len()].copy_from_slice(s3); off += s3.len();
         msg[off] = hex[(cw >> 4) as usize & 0xF]; off += 1;
         msg[off] = hex[(cw & 0xF) as usize]; off += 1;
+        let s4 = b" nw=";
+        msg[off..off+s4.len()].copy_from_slice(s4); off += s4.len();
+        msg[off] = hex[(nw >> 4) as usize & 0xF]; off += 1;
+        msg[off] = hex[(nw & 0xF) as usize]; off += 1;
         msg[off] = b'\n'; off += 1;
         unsafe {
             core::arch::asm!("syscall",
@@ -195,6 +275,15 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     let console = alloc::sync::Arc::new(aerosls_vfs::CharNode::console());
     let mut booted = boot(RealKernel, &caps, console, alloc)
         .unwrap_or_else(|e| panic!("sidecar boot failed: {e:?}"));
+
+    // NET_INFO handshake: #[no_mangle] function called unconditionally
+    // so the compiler cannot eliminate it.  Pass 0xFF sentinel for absent caps.
+    {
+        let net_w = caps.net_chan_w.map_or(0xFFu32, |v| v);
+        let net_r = caps.net_chan_r.map_or(0xFFu32, |v| v);
+        let rc = unsafe { posix_net_info_handshake(net_w, net_r) };
+        unsafe { NET_INFO_RESULT = rc; }
+    }
 
     // The console channel's WRITE endpoint (CHAN_R is `caps.console_chan`).
     // Applet/init stdout lands in the in-memory console (CharNode); the

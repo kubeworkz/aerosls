@@ -52,6 +52,7 @@ impl core::fmt::Display for BootErr {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[repr(C)]
 pub struct BootCap<'a> {
     pub name: &'a str,
     pub slot: u32,
@@ -62,6 +63,10 @@ pub struct BootCap<'a> {
 }
 
 /// Owns a fixed array of parsed caps (no allocation).
+/// `#[repr(C)]` pins the layout so the in-kernel BIB writer (cap.c)
+/// and the Rust parser agree on field offsets — especially `n_caps`
+/// at offset 0x18 and `caps` at offset 0x20.
+#[repr(C)]
 #[derive(Debug)]
 pub struct BootInfo<'a> {
     pub version: u16,

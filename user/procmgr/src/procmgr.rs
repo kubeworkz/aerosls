@@ -569,22 +569,35 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
         // and other internal descriptors marked cloexec don't leak into
         // the exec'd program.
         self.vfs.close_cloexec(task);
-        let fd = self.vfs.open(task, path, O_RDONLY, 0)?;
-        let mut buf = [0u8; 4096];
-        let n = self.vfs.read(task, fd, &mut buf)?;
-        self.vfs.close(task, fd)?;
-        let name = core::str::from_utf8(&buf[..n])
-            .ok()
-            .and_then(|s| s.lines().next())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or(Errno::ENoexec)?;
-        let step = *self.applets.get(name).ok_or(Errno::ENoexec)?;
+
+        // First check if the path is a registered applet name (e.g.
+        // "echo", "cat", "sh").  Built-in applets don't exist as files
+        // on the aerofs rootfs, so we must resolve them before trying to
+        // open the path as a script.
+        let (name, step) = if let Some(&s) = self.applets.get(path) {
+            // Direct applet match: exec("echo", ...).
+            (path.to_string(), s)
+        } else {
+            // Try opening as a script file (shebang-style: first line is
+            // the program name).
+            let fd = self.vfs.open(task, path, O_RDONLY, 0)?;
+            let mut buf = [0u8; 4096];
+            let n = self.vfs.read(task, fd, &mut buf)?;
+            self.vfs.close(task, fd)?;
+            let script_name = core::str::from_utf8(&buf[..n])
+                .ok()
+                .and_then(|s| s.lines().next())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or(Errno::ENoexec)?;
+            let s = *self.applets.get(script_name).ok_or(Errno::ENoexec)?;
+            (script_name.to_string(), s)
+        };
         let argv = argv.iter().map(|a| a.to_string()).collect::<Vec<_>>();
         if let Some(tc) = self.tasks.get_mut(&task) {
             let gen = tc.program.gen.wrapping_add(1);
             tc.program = Program {
-                name: name.to_string(),
+                name,
                 argv,
                 data: Vec::new(),
                 step,
