@@ -72,9 +72,10 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         core::arch::asm!(
             "syscall",
             inlateout("rax") 165u64 => _,
-            in("rdi") b.buf.as_ptr(),
-            lateout("rcx") _,
-            lateout("r11") _,
+            inlateout("rdi") b.buf.as_ptr() => _,
+            lateout("rcx") _, lateout("r11") _,
+            lateout("rsi") _, lateout("rdx") _,
+            lateout("r8") _, lateout("r9") _, lateout("r10") _,
             options(nostack),
         );
     }
@@ -86,7 +87,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 // target; the lint fires at this use site.
 #[allow(static_mut_refs)]
 pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
-    let bib = unsafe { BootInfo::from_raw(bib_ptr) }.expect("corrupt boot info");
+    let bib = unsafe { BootInfo::from_raw(bib_ptr) }.expect("[RAMDISK] corrupt boot info");
     let k = RealKernel;
 
     // Budget → heap (reserved for future use).

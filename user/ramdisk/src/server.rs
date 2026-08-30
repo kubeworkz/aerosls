@@ -78,10 +78,11 @@ pub fn run<K: Kernel>(k: &K, eps: &mut EndpointSet, dev: &Device) -> Result<(), 
         // newly-wired channels (e.g. the POSIX sidecar's ramdisk channel,
         // wired after this sidecar booted). TIMEOUT_NONE would block
         // forever on the initial endpoints, missing post-boot channels.
-        let poll_ns: u64 = 10_000_000; /* 10 ms — fast enough to discover
-                                      * post-boot channels (e.g. the POSIX
-                                      * sidecar's ramdisk channel) before
-                                      * the client's recv_reply timeout. */
+        // 200 ms is long enough to avoid a CPU-burning busy-loop while
+        // still discovering post-boot channels within the client's
+        // timeout budget.
+        let poll_ns: u64 = 200_000_000; /* 200 ms — balances discovery
+                                        * latency vs CPU usage. */
         let (idx, _kind) = match k.wait(&list[..eps.wait_len()], poll_ns) {
             Ok(r) => r,
             Err(kabi::ERR_SHUTDOWN) => return Ok(()),

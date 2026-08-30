@@ -144,7 +144,14 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     serial_trace(b"[NET] BIB raw:");
     serial_hex8(bib_ptr);
 
-    let bib = unsafe { BootInfo::from_raw(bib_ptr) }.expect("corrupt boot info");
+    let bib = match unsafe { BootInfo::from_raw(bib_ptr) } {
+        Ok(b) => b,
+        Err(_) => {
+            serial_trace(b"[NET!] BIB_PARSE_FAILED\n");
+            unsafe { core::arch::asm!("ud2"); }
+            loop {}
+        }
+    };
     serial_trace(b"[NET] BIB parsed\n");
 
     // Dump n_caps and key fields via LTO-proof writes.

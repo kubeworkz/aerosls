@@ -22,7 +22,7 @@ use crate::allocator::BudgetAlloc;
 use crate::boot::{boot, BootCaps};
 use crate::heap::Bump;
 use aerosls_proto::bootinfo::BootInfo;
-use aerosls_proto::kabi::{Kernel, RealKernel, TIMEOUT_NONE};
+use aerosls_proto::kabi::{CAP_CHAN_W, Kernel, RealKernel, TIMEOUT_NONE};
 
 /* The crt0 (crt0.S) is assembled by rustc's LLVM integrated assembler
  * through global_asm — no external cross-GCC — and linked at address 0 by
@@ -84,13 +84,52 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         core::arch::asm!(
             "syscall",
             inlateout("rax") 165u64 => _,  // SYS_SLS_SERIAL_WRITE
-            in("rdi") b.buf.as_ptr(),
-            lateout("rcx") _,
-            lateout("r11") _,
+            inlateout("rdi") b.buf.as_ptr() => _,
+            // The kernel's syscall path uses every caller-saved register
+            // (do_syscall's args) and never restores them — declare ALL of
+            // them clobbered so the compiler cannot reuse a stale value.
+            lateout("rcx") _, lateout("r11") _, lateout("rsi") _, lateout("rdx") _, lateout("r8") _, lateout("r9") _, lateout("r10") _,
             options(nostack),
         );
     }
     loop { core::hint::spin_loop(); }
+}
+
+/// Kernel-serial log (SYS_SLS_SERIAL_WRITE = 165): `tag`, then the value
+/// as 8 hex digits, then `extra`. NUL-terminated like the kernel's
+/// `kernel_serial_print` expects. Lives in the binary crate so the call
+/// survives release LTO.
+fn klog(tag: &[u8], val: u32, extra: &[u8]) {
+    let mut msg = [0u8; 96];
+    let n = tag.len().min(24);
+    msg[..n].copy_from_slice(&tag[..n]);
+    let mut off = n;
+    let hex = b"0123456789ABCDEF";
+    for i in (0..8).rev() {
+        msg[off] = hex[((val >> (i * 4)) & 0xF) as usize];
+        off += 1;
+    }
+    msg[off] = b' ';
+    off += 1;
+    let ne = extra.len().min(95 - off);
+    msg[off..off + ne].copy_from_slice(&extra[..ne]);
+    off += ne;
+    msg[off] = b'\n';
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") 165u64 => _,
+            inlateout("rdi") msg.as_ptr() => _,
+            // The kernel's syscall path uses every caller-saved register
+            // (do_syscall's args) and never restores them — declare ALL of
+            // them clobbered so the compiler cannot reuse a stale value
+            // after the syscall (caught live: the msg-pointer survived in
+            // rsi, the kernel clobbered rsi, and the post-syscall msg
+            // tail-zeroing wrote through the garbage → #PF at 0x430).
+            lateout("rcx") _, lateout("r11") _, lateout("rsi") _, lateout("rdx") _, lateout("r8") _, lateout("r9") _, lateout("r10") _,
+            options(nostack),
+        );
+    }
 }
 
 #[no_mangle]
@@ -98,15 +137,29 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 // target; the lint fires at this use site.
 #[allow(static_mut_refs)]
 pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
-    let bib = unsafe { BootInfo::from_raw(bib_ptr) }.expect("corrupt boot info");
+    let bib = unsafe { BootInfo::from_raw(bib_ptr) }.expect("[POSIX] corrupt boot info");
     let caps = BootCaps::from_bib(&bib).expect("missing initial caps");
 
-    // Budget → heap (v1 reserves it for the image's real allocator) and
-    // the request-buffer allocator over the same region.
+    // Budget → heap and the request-buffer arena. The budget MEM cap is the
+    // whole region; the main bump heap and BudgetAlloc must NOT both claim
+    // [base, base+len) from the same cursor — the block cache's RD_READ /
+    // RD_WRITE grant buffers (carved by BudgetAlloc, 4 KiB each) would then
+    // alias the heap's first allocations (the console Arc, the VFS), and
+    // the ramdisk driver's reply write would overwrite them. Caught live:
+    // the rootfs superblock reply (block 0, 4096 bytes) landed on the
+    // console CharNode's ConsoleIo, smashing the output RefCell's borrow
+    // field to a nonzero value, and the console pump's first drain panicked
+    // "RefCell already borrowed". Split the region: BudgetAlloc owns the
+    // first MiB (256 x 4 KiB buffers — ample for the mount + demo reads),
+    // the main heap owns the rest.
+    const REQ_BUF_ARENA: u64 = 1024 * 1024;   /* grant-buffer arena within the budget */
     unsafe {
-        HEAP.init(caps.budget_base as usize, caps.budget_len as usize);
+        HEAP.init(
+            (caps.budget_base + REQ_BUF_ARENA) as usize,
+            caps.budget_len.saturating_sub(REQ_BUF_ARENA) as usize,
+        );
     }
-    let alloc = BudgetAlloc::new(caps.budget_slot, caps.budget_base, caps.budget_len);
+    let alloc = BudgetAlloc::new(caps.budget_slot, caps.budget_base, REQ_BUF_ARENA);
 
     // Debug: log ramdisk caps found in BIB.
     {
@@ -132,8 +185,8 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         unsafe {
             core::arch::asm!("syscall",
                 inlateout("rax") 165u64 => _,
-                in("rdi") msg.as_ptr(),
-                lateout("rcx") _, lateout("r11") _,
+                inlateout("rdi") msg.as_ptr() => _,
+                lateout("rcx") _, lateout("r11") _, lateout("rsi") _, lateout("rdx") _, lateout("r8") _, lateout("r9") _, lateout("r10") _,
                 options(nostack),
             );
         }
@@ -143,16 +196,107 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     let mut booted = boot(RealKernel, &caps, console, alloc)
         .unwrap_or_else(|e| panic!("sidecar boot failed: {e:?}"));
 
+    // The console channel's WRITE endpoint (CHAN_R is `caps.console_chan`).
+    // Applet/init stdout lands in the in-memory console (CharNode); the
+    // pump below forwards it here, and the kernel console service
+    // (console_service.c) prints every message it receives to serial — so
+    // the sidecar's output becomes visible in the QEMU log.
+    let console_w = bib.find_cap(CAP_CHAN_W, "console").map(|c| c.slot);
+    klog(b"[POSIX] console_w=", console_w.unwrap_or(u32::MAX), b"");
+    // Probe the console output RefCell state right after boot (before the
+    // pump loop): 0=free 1=shared 2=mutable. A nonzero value here means
+    // `boot()` left a borrow outstanding — the drain would panic on the
+    // first iteration.
+    klog(
+        b"[POSIX] out borrow=",
+        booted.console.console_io().output_borrow_state() as u32,
+        b"",
+    );
+
     loop {
+        // Drain console output to the kernel console channel, chunked
+        // under the transport's payload bound (CAP_MSG_MAX_PAYLOAD). A
+        // send parks while the queue is full; the kernel console service
+        // drains every tick, so this is simple flow control, not a stall.
+        if let Some(cw) = console_w {
+            let st = booted.console.console_io().output_borrow_state();
+            if st != 0 {
+                klog(b"[POSIX] out borrow=", st as u32, b"PRE-DRAIN");
+            }
+            let out = booted.console.console_io().drain_output();
+            if !out.is_empty() {
+                klog(b"[POSIX] console out=", out.len() as u32, b"bytes");
+            }
+            for chunk in out.chunks(1024) {
+                let r = RealKernel.send(cw, 0, 0, chunk, &[], TIMEOUT_NONE);
+                if r.is_err() {
+                    klog(b"[POSIX] console send err=", r.unwrap_err() as u32, b"");
+                }
+            }
+        }
         booted.proc.drain_wakes();
-        if booted.proc.run_next().is_none() {
-            // Quiesced — nothing runnable, nothing blocked. Park on the
-            // console channel until the kernel delivers input (the event
-            // loop). The kernel console channel is the same endpoint the
-            // manifest named; a sidecar without one spins (v1 debug only).
-            // `RealKernel` is a unit struct — a fresh handle is fine.
-            let chan = [caps.console_chan.unwrap_or(u32::MAX)];
-            let _ = RealKernel.wait(&chan, TIMEOUT_NONE);
+        // Diagnostic (klog survives release LTO — it is in this binary
+        // crate): report what task 0 (init) did and how many tasks are
+        // live, so a quiet boot can be told apart from a crashed one.
+        {
+            let code = booted.proc.exit_code(0);
+            let live = booted.proc.task_count() as u32;
+            // Show the exit code if the init task has exited, else
+            // report 0xFEEDFACE as a "still running" sentinel (avoids
+            // the confusing 0xFFFFFFFF from unwrap_or(-1)).
+            let code_u32 = code.map(|c| c as u32).unwrap_or(0xFEEDu32);
+            klog(b"[POSIX] loop exit0=", code_u32, b"");
+            klog(b"[POSIX] loop tasks=", live, b"");
+            // Probe the rootfs directly: open /etc/init.rc through the
+            // VFS and report the errno (0 = ok). If the open succeeds,
+            // report the script length. This isolates a data/transport
+            // problem (corrupted block 0) from an init-applet logic one.
+            match booted.proc.vfs.open(0, "/etc/init.rc", aerosls_vfs::O_RDONLY, 0) {
+                Ok(fd) => {
+                    let mut b = [0u8; 128];
+                    match booted.proc.vfs.read(0, fd, &mut b) {
+                        Ok(n) => klog(b"[POSIX] rc read=", n as u32, b""),
+                        Err(e) => klog(b"[POSIX] rc read err=", e.code() as u32, b""),
+                    }
+                    booted.proc.vfs.close(0, fd).ok();
+                }
+                Err(e) => klog(b"[POSIX] rc open err=", e.code() as u32, b""),
+            }
+            // Report the root aerofs cache's device state (0 = Live;
+            // otherwise the stale-reason code) so an EIO can be attributed
+            // to a stale device vs. a parse failure.
+            klog(b"[POSIX] aero state=", booted.proc.vfs.aerofs_state(), b"");
+        }
+        match booted.proc.run_next() {
+            Some(_) => {}
+            None => {
+                // Quiesced — nothing runnable, nothing blocked. Park until
+                // the kernel delivers work: a wake on ANY wired channel
+                // (the console for typed input, the ramdisk for a blocked
+                // task's device reply). Parking on the console channel
+                // ONLY is wrong: a task blocked on a ramdisk read would
+                // never see its reply — the message sits in the channel
+                // queue while the sidecar sleeps (caught live: init
+                // quiesced with its /etc/init.rc data never delivered).
+                // The kernel wakes the park on any listed channel; a
+                // spurious wake just re-runs the loop (drain_wakes + a
+                // re-poll re-check everything).
+                let mut chans = [u32::MAX; 4];
+                let mut n = 0usize;
+                if let Some(c) = caps.console_chan {
+                    chans[n] = c;
+                    n += 1;
+                }
+                if let Some(r) = caps.ramdisk_chan_r {
+                    chans[n] = r;
+                    n += 1;
+                }
+                if n == 0 {
+                    // No wired channels: spin (v1 debug only).
+                    continue;
+                }
+                let _ = RealKernel.wait(&chans[..n], TIMEOUT_NONE);
+            }
         }
     }
 }
