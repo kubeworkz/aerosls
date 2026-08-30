@@ -74,15 +74,16 @@ pub fn run<K: Kernel>(k: &K, eps: &mut EndpointSet, dev: &Device) -> Result<(), 
         }
 
         let list = eps.wait_list();
-        // Use a finite deadline so the loop periodically re-scans for
-        // newly-wired channels (e.g. the POSIX sidecar's ramdisk channel,
-        // wired after this sidecar booted). TIMEOUT_NONE would block
-        // forever on the initial endpoints, missing post-boot channels.
-        // 200 ms is long enough to avoid a CPU-burning busy-loop while
-        // still discovering post-boot channels within the client's
-        // timeout budget.
-        let poll_ns: u64 = 200_000_000; /* 200 ms — balances discovery
-                                        * latency vs CPU usage. */
+        // When no client has connected yet, use a finite deadline to
+        // periodically re-scan for newly-wired channels (e.g. the POSIX
+        // sidecar's ramdisk channel, wired after this sidecar booted).
+        // Once a client connects, block with TIMEOUT_NONE to avoid a
+        // CPU-burning busy-loop.
+        let poll_ns: u64 = if eps.has_client() {
+            kapi::TIMEOUT_NONE
+        } else {
+            200_000_000 /* 200 ms — discovery poll */
+        };
         let (idx, _kind) = match k.wait(&list[..eps.wait_len()], poll_ns) {
             Ok(r) => r,
             Err(kabi::ERR_SHUTDOWN) => return Ok(()),

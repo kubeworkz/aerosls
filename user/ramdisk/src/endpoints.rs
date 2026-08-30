@@ -131,6 +131,11 @@ impl EndpointSet {
         self.n + 1
     }
 
+    /// True when at least one non-console endpoint has been adopted.
+    pub fn has_client(&self) -> bool {
+        self.n > 0
+    }
+
     fn find(&self, handle: u32) -> Option<usize> {
         (0..self.n).find(|&i| self.eps[i].map_or(false, |e| e.handle == handle))
     }
