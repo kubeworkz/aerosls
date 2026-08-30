@@ -76,14 +76,21 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     loop {}
 }
 
+/// LTO-proof serial write: copies `msg` into a `#[used]` static buffer so
+/// the compiler cannot eliminate or reorder the write.
 #[cfg(all(feature = "target", target_os = "none"))]
 fn serial_trace(msg: &[u8]) {
+    #[used]
+    static mut TRACE_BUF: [u8; 128] = [0u8; 128];
+    let n = msg.len().min(127);
     unsafe {
+        core::ptr::copy_nonoverlapping(msg.as_ptr(), TRACE_BUF.as_mut_ptr(), n);
+        TRACE_BUF[n] = 0;
         core::arch::asm!(
             "syscall",
             inlateout("rax") 165u64 => _,
-            inlateout("rdi") msg.as_ptr() => _,
-            inlateout("rdx") msg.len() as u64 => _,
+            inlateout("rdi") TRACE_BUF.as_ptr() => _,
+            inlateout("rdx") (n as u64) => _,
             lateout("rcx") _, lateout("r11") _, lateout("rsi") _, lateout("r8") _, lateout("r9") _, lateout("r10") _,
             options(nostack),
         );
