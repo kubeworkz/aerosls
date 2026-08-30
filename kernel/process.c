@@ -311,6 +311,7 @@ uint32_t process_create(struct ProcCreateRequest* req) {
     pd->cr3             = new_cr3;
     pd->user_rip        = entry_rip;
     pd->user_rsp        = user_rsp;
+    pd->user_stack_vaddr = stack_vaddr;
     pd->owner_uid       = req->owner_uid;
     pd->parent_pid      = spawner ? spawner->pid : 0;   // Phase 1 two-party
     pd->partition_id    = spawn_partition_id;   // Phase 9, resolved once at Phase 13
@@ -470,6 +471,7 @@ static uint32_t program_spawn_common(const char* object_name, uint32_t owner_uid
     pd->cr3          = new_cr3;
     pd->user_rip     = entry_rip;
     pd->user_rsp     = user_rsp;
+    pd->user_stack_vaddr = stack_base;
     pd->owner_uid    = owner_uid;
     pd->parent_pid   = spawner ? spawner->pid : 0;   // Phase 1 two-party
     pd->partition_id = spawn_partition_id;   // Phase 9, resolved once at Phase 13
@@ -1201,34 +1203,49 @@ static void kernel_switch_next(struct ProcessDescriptor* next) {
     __builtin_unreachable();
 }
 
-/* Shared park capture: snapshot the current process's syscall-entry frame
- * into park_ctx and stash the resume args — the request pointer the resume
- * re-runs and the syscall number to re-run (SYS_SLS_CAP_RECV or
- * SYS_SLS_CHAN_WAIT). The entry frame sits at [syscall_stack_top-8 .. -64]
- * because entry did `mov rsp,[gs:8]` and pushed eight qwords before
- * calling do_syscall, in this order (see arch/x86/syscall.asm): rbp
- * [top-8], rbx, r12, r13, r14, r15, rcx, r11 [top-64]. The mapping is
- * load-bearing: .syscall_return pops r11, rcx, r15..rbp and sysret needs
- * rcx=user RIP, r11=user RFLAGS. (A mirrored capture once shipped here and
- * passed the overlap test only by luck — the resumed code's rsp/rax/rdi
- * were correct and it never read the wrong callee-saved values; fixed once
- * the mirror was proven.) park_ctx is consumed by cap_recv_resume(), which
- * REBUILDS the resume frame from it — the original entry frame is not
- * guaranteed to survive the park syscall's own chain (GCC may reuse the
- * region for kernel_switch_next's f[20] array). */
+/* Capture the current syscall's entry registers into a CapParkCtx. Reads
+ * the per-CPU scratch that syscall_entry_stub saved immediately after its
+ * pushes ([gs:0x10..0x50] — r11, rcx, r15..rbp, in push order) and the
+ * user RSP from [gs:0]. This is the ONLY safe source for the resume
+ * state: the copy of these registers that the stub pushed onto the
+ * syscall stack at [top-64..top-8] may be clobbered by the -O2 call
+ * chain (do_syscall -> k_chan_* -> ...) BEFORE a late capture (e.g. the
+ * handoff capture inside cap_send_msg) runs — the old reads of the stack
+ * copy intermittently captured garbage, and resumed processes sysret'd
+ * with corrupted callee-saved regs / user RSP and faulted at rip=0 or
+ * wrote through a garbage pointer (0xf000ff53f000ff73). The scratch is
+ * overwritten by every syscall entry and only read mid-syscall by the
+ * current process, so it always describes the CURRENT syscall. The
+ * resume rebuild (cap_recv_resume / cap_sysret_resume) pushes these in
+ * exactly the order syscall_entry_stub pushed the originals, so
+ * .syscall_return's pops still land rcx=user RIP, r11=user RFLAGS. */
+static void proc_capture_entry_regs(struct CapParkCtx* ctx) {
+    __asm__ volatile(
+        "movq %%gs:0x10, %0\n\t"
+        "movq %%gs:0x18, %1\n\t"
+        "movq %%gs:0x20, %2\n\t"
+        "movq %%gs:0x28, %3\n\t"
+        "movq %%gs:0x30, %4\n\t"
+        "movq %%gs:0x38, %5\n\t"
+        "movq %%gs:0x40, %6\n\t"
+        "movq %%gs:0x48, %7\n\t"
+        "movq %%gs:0, %8\n\t"
+        : "=r"(ctx->r11), "=r"(ctx->rcx), "=r"(ctx->r15), "=r"(ctx->r14),
+          "=r"(ctx->r13), "=r"(ctx->r12), "=r"(ctx->rbx), "=r"(ctx->rbp),
+          "=r"(ctx->user_rsp)
+        : : "memory");
+}
+
+/* Shared park capture: snapshot the current process's syscall-entry
+ * registers into park_ctx (via the per-CPU scratch — see
+ * proc_capture_entry_regs) and stash the resume args — the request pointer
+ * the resume re-runs and the syscall number to re-run (SYS_SLS_CAP_RECV,
+ * SYS_SLS_CHAN_WAIT, or SYS_SLS_CHAN_SEND). park_ctx is consumed by
+ * cap_recv_resume()/cap_sysret_resume(), which REBUILD the resume frame
+ * from it. */
 static void proc_park_capture(struct ProcessDescriptor* cur, void* req,
                               uint32_t syscall_num) {
-    uint64_t* entry = (uint64_t*)cur->syscall_stack_top;
-    cur->park_ctx.r11 = entry[-8];   /* user RFLAGS  */
-    cur->park_ctx.rcx = entry[-7];   /* user RIP     */
-    cur->park_ctx.r15 = entry[-6];
-    cur->park_ctx.r14 = entry[-5];
-    cur->park_ctx.r13 = entry[-4];
-    cur->park_ctx.r12 = entry[-3];
-    cur->park_ctx.rbx = entry[-2];
-    cur->park_ctx.rbp = entry[-1];
-    __asm__ volatile("movq %%gs:0, %0" : "=r"(cur->park_ctx.user_rsp)
-                     : : "memory");
+    proc_capture_entry_regs(&cur->park_ctx);
     cur->park_req      = (uint64_t)req;
     cur->park_syscall  = syscall_num;
 }
@@ -1332,6 +1349,15 @@ uint64_t cap_park_deadline_take(void) {
     return d;
 }
 
+/* Non-consuming peek (debug only): nonzero iff the current process has a
+ * stored park deadline — i.e. this k_chan_wait/k_chan_send entry is a
+ * RE-RUN after a park wake, not a fresh syscall. */
+uint64_t cap_park_deadline_peek(void) {
+    struct ProcessDescriptor* cur = process_find_current();
+    if (!cur) return 0;
+    return cur->waiting_deadline;
+}
+
 /* Strong override of cap.c's weak hook (called from timer_irq_handler,
  * BSP-only, ~10 ms per tick, BEFORE schedule_ring3 in the same ISR): wake
  * every parked process whose deadline has passed, so a finite-deadline
@@ -1424,27 +1450,11 @@ void cap_maybe_handoff(void) {
     if (!target || target == cur) return;
     if (target->state != PROC_SUSPENDED || !target->resume_kernel) return;
 
-    /* Capture the FULL syscall-entry frame into park_ctx (all eight regs +
-     * user RSP) BEFORE the chain below can reuse the region: cap_sysret_resume()
-     * REBUILDS the resume frame from these, because the original entry frame
-     * at [top-64..top-8] is not guaranteed to survive this syscall's own
-     * execution (GCC may reuse the region for kernel_switch_next's f[20]
-     * array). Historically only user_rsp was captured here and the resume
-     * popped the ORIGINAL frame — the original was found clobbered live
-     * (the resumed process sysret'd to 0), and switching the resume to a
-     * park_ctx rebuild REQUIRES this full capture. The user RSP is still in
-     * [gs:0] (nobody has run since this syscall's entry). */
-    uint64_t* entry = (uint64_t*)cur->syscall_stack_top;
-    cur->park_ctx.r11 = entry[-8];
-    cur->park_ctx.rcx = entry[-7];
-    cur->park_ctx.r15 = entry[-6];
-    cur->park_ctx.r14 = entry[-5];
-    cur->park_ctx.r13 = entry[-4];
-    cur->park_ctx.r12 = entry[-3];
-    cur->park_ctx.rbx = entry[-2];
-    cur->park_ctx.rbp = entry[-1];
-    __asm__ volatile("movq %%gs:0, %0" : "=r"(cur->park_ctx.user_rsp)
-                     : : "memory");
+    /* Capture the FULL syscall-entry register set into park_ctx from the
+     * per-CPU scratch (see proc_capture_entry_regs — the stack copy is not
+     * safe to read this late; the send chain may have reused it). The user
+     * RSP is in the same scratch ([gs:0], set at syscall entry). */
+    proc_capture_entry_regs(&cur->park_ctx);
     cur->state         = PROC_SUSPENDED;
     cur->resume_sysret = 1;
     kernel_serial_printf(
@@ -1480,6 +1490,11 @@ __attribute__((noreturn))
 void cap_sysret_resume(struct ProcessDescriptor* pd) {
     uint64_t* p   = (uint64_t*)&pd->park_ctx;
     uint64_t  top = pd->syscall_stack_top;
+
+    kernel_serial_printf("[SRES] cap_sysret_resume pid=%u rcx=0x%llx rbx=0x%llx rbp=0x%llx rsp=0x%llx\n",
+                         pd->pid, (unsigned long long)p[1],
+                         (unsigned long long)p[6], (unsigned long long)p[7],
+                         (unsigned long long)p[8]);
 
     __asm__ volatile("swapgs" : : : "memory");   /* GS_BASE: 0 -> &per_cpu_data */
     per_cpu_data[0].user_rsp = pd->park_ctx.user_rsp;
@@ -1524,23 +1539,11 @@ uint32_t sys_sls_yield(void) {
      * and spin forever. */
     struct ProcessDescriptor* next = pick_next_runnable();
     if (!next) return 0;   /* nobody else: continue immediately */
-    /* Capture the FULL entry frame (all eight regs + user RSP) into
-     * park_ctx, exactly like cap_wait_chan()/cap_maybe_handoff().
-     * cap_sysret_resume() REBUILDS the resume frame from these — the
-     * original entry frame at [top-64..top-8] is not guaranteed to survive
-     * this syscall's own chain (the compiler may reuse the region for
-     * kernel_switch_next's f[20] array), so it must not be relied on. */
-    uint64_t* entry = (uint64_t*)cur->syscall_stack_top;
-    cur->park_ctx.r11 = entry[-8];
-    cur->park_ctx.rcx = entry[-7];
-    cur->park_ctx.r15 = entry[-6];
-    cur->park_ctx.r14 = entry[-5];
-    cur->park_ctx.r13 = entry[-4];
-    cur->park_ctx.r12 = entry[-3];
-    cur->park_ctx.rbx = entry[-2];
-    cur->park_ctx.rbp = entry[-1];
-    __asm__ volatile("movq %%gs:0, %0" : "=r"(cur->park_ctx.user_rsp)
-                     : : "memory");
+    /* Capture the FULL syscall-entry register set into park_ctx from the
+     * per-CPU scratch (see proc_capture_entry_regs), exactly like
+     * cap_wait_chan()/cap_maybe_handoff(). cap_sysret_resume() REBUILDS
+     * the resume frame from these. */
+    proc_capture_entry_regs(&cur->park_ctx);
     cur->state         = PROC_SUSPENDED;
     cur->resume_sysret = 1;
     kernel_serial_printf("[PROC] PID %u yielded to PID %u\n",
@@ -1565,6 +1568,13 @@ void cap_recv_resume(struct ProcessDescriptor* pd) {
     uint64_t* p   = (uint64_t*)&pd->park_ctx;
     uint64_t  req = pd->park_req;
     uint64_t  top = pd->syscall_stack_top;
+
+    kernel_serial_printf("[RES] cap_recv_resume pid=%u syscall=%u req=0x%llx rcx=0x%llx rbx=0x%llx rbp=0x%llx rsp=0x%llx r12=0x%llx r13=0x%llx\n",
+                         pd->pid, (unsigned)pd->park_syscall,
+                         (unsigned long long)req, (unsigned long long)p[1],
+                         (unsigned long long)p[6], (unsigned long long)p[7],
+                         (unsigned long long)p[8], (unsigned long long)p[5],
+                         (unsigned long long)p[4]);
 
     __asm__ volatile("swapgs" : : : "memory");   /* GS_BASE: 0 -> &per_cpu_data */
 
@@ -1599,6 +1609,33 @@ void cap_recv_resume(struct ProcessDescriptor* pd) {
         "pushq 16(%1)\n\t"   /* r15 */
         "pushq 8(%1)\n\t"    /* rcx — user RIP (sysret target) */
         "pushq 0(%1)\n\t"    /* r11 — user RFLAGS */
+        /* Re-write the per-CPU entry-register scratch ([gs:0x10..0x48])
+         * from park_ctx BEFORE the re-run: the re-run may PARK AGAIN
+         * (a spurious wake — the queue was empty when the wake fired, or
+         * the woken event was consumed by an earlier resume), and the
+         * re-park's proc_park_capture reads that scratch. The resume path
+         * does NOT go through syscall_entry_stub, so the scratch still
+         * holds whatever the LAST syscall entry (possibly another
+         * process's) wrote — captured live: a woken init re-parked with
+         * the DM's register values and its second resume sysret'd to
+         * 0x2dd2, mid-instruction, then #PF'd. The pushed frame above is
+         * the true state; mirror it into the scratch. */
+        "movq 0(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x10\n\t"   /* r11 */
+        "movq 8(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x18\n\t"   /* rcx */
+        "movq 16(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x20\n\t"   /* r15 */
+        "movq 24(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x28\n\t"   /* r14 */
+        "movq 32(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x30\n\t"   /* r13 */
+        "movq 40(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x38\n\t"   /* r12 */
+        "movq 48(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x40\n\t"   /* rbx */
+        "movq 56(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x48\n\t"   /* rbp */
         "mov %2, %%rsi\n\t"  /* arg = parked request (recv or chan wait) */
         "mov %3, %%edi\n\t"  /* num = pd->park_syscall (recv or chan wait) */
         "call do_syscall\n\t"

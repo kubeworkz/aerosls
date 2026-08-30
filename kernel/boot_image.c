@@ -431,6 +431,9 @@ static void boot_plant_parent(uint64_t kernel_stack_top) {
     proc_table[0].owner_uid = 0;
     proc_table[0].syscall_stack_top = kernel_stack_top;  /* the restore point */
     memcpy(proc_table[0].name, "kboot", 6);
+    kernel_serial_printf("[SIDECAR] boot parent planted: slot0 pid=%u active=%d state=%d\n",
+                         proc_table[0].pid, proc_table[0].active,
+                         proc_table[0].state);
 }
 
 void launch_init_sidecar(void) {

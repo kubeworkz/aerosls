@@ -92,6 +92,9 @@ __attribute__((weak))
 uint64_t cap_park_deadline_take(void) { return 0; }
 
 __attribute__((weak))
+uint64_t cap_park_deadline_peek(void) { return 0; }
+
+__attribute__((weak))
 void cap_park_deadline_tick(void) { }
 
 __attribute__((weak))
@@ -2613,12 +2616,22 @@ int cap_create_sidecar(uint32_t parent_pid,
         (const struct SidecarManifestHeader*)blob;
 
     for (int i = 0; i < 8; i++)
-        if (hdr->magic[i] != SIDECAR_MANIFEST_MAGIC[i])
+        if (hdr->magic[i] != SIDECAR_MANIFEST_MAGIC[i]) {
+            kernel_serial_printf("[CS] CAP_EINVAL magic[%d]=0x%02x want 0x%02x\n",
+                                 i, hdr->magic[i], SIDECAR_MANIFEST_MAGIC[i]);
             return CAP_EINVAL;
-    if (hdr->version_major != SIDECAR_MANIFEST_VERSION_MAJOR)
+        }
+    if (hdr->version_major != SIDECAR_MANIFEST_VERSION_MAJOR) {
+        kernel_serial_printf("[CS] CAP_EINVAL version=%u want %u\n",
+                             hdr->version_major,
+                             SIDECAR_MANIFEST_VERSION_MAJOR);
         return CAP_EINVAL;
-    if (hdr->total_len > manifest_len)
+    }
+    if (hdr->total_len > manifest_len) {
+        kernel_serial_printf("[CS] CAP_ERANGE total_len=%u manifest_len=%u\n",
+                             hdr->total_len, manifest_len);
         return CAP_ERANGE;
+    }
 
     /* CRC-32 over the record body (bytes after header, including any
      * appended BlobFooter with image_kaddr). */
@@ -2626,8 +2639,11 @@ int cap_create_sidecar(uint32_t parent_pid,
     if (body_len > 0) {
         uint32_t crc = cap_sidecar_crc32(blob + SIDECAR_MANIFEST_HEADER_LEN,
                                          body_len);
-        if (crc != hdr->body_crc32)
+        if (crc != hdr->body_crc32) {
+            kernel_serial_printf("[CS] CAP_EINVAL crc mismatch: got 0x%08x want 0x%08x len=%u\n",
+                                 crc, hdr->body_crc32, manifest_len);
             return CAP_EINVAL;  /* corrupted manifest */
+        }
     }
 
     /* Caps (≤16) + the fixed records (personality, name, image, budget,
@@ -2755,13 +2771,30 @@ int cap_create_sidecar(uint32_t parent_pid,
     }
 
     /* ── 3. Validate parsed manifest ─────────────────────────────────── */
-    if (m.image_size == 0) return CAP_EINVAL;
+    if (m.image_size == 0) {
+        kernel_serial_printf("[CS] CAP_EINVAL image_size==0 (records=%u)\n",
+                             m.record_count);
+        return CAP_EINVAL;
+    }
     if (m.image_entry >= m.image_size) return CAP_ERANGE;
-    if (m.budget_stack_bytes < 4096) return CAP_EINVAL;
+    if (m.budget_stack_bytes < 4096) {
+        kernel_serial_printf("[CS] CAP_EINVAL budget_stack=%u\n",
+                             m.budget_stack_bytes);
+        return CAP_EINVAL;
+    }
 
     /* ── 4. Look up parent process ───────────────────────────────────── */
     struct ProcessDescriptor* parent = sidecar_find_pid(parent_pid);
-    if (!parent) return CAP_EINVAL;
+    if (!parent) {
+        kernel_serial_printf("[CS] CAP_EINVAL parent pid=%u not found; table:",
+                             parent_pid);
+        for (int _i = 0; _i < PROC_MAX; _i++)
+            if (proc_table[_i].active)
+                kernel_serial_printf(" [%d]pid=%u st=%u", _i,
+                                     proc_table[_i].pid, proc_table[_i].state);
+        kernel_serial_printf("\n");
+        return CAP_EINVAL;
+    }
 
     int pi = -1;
     for (int i = 0; i < PROC_MAX; i++) {

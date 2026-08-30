@@ -606,7 +606,7 @@ x86-iso: $(X86_BIN)
 	# the pre-Phase-5 image and boots exactly as before.
 	@if [ -s "$(SIDECAR_CPIO)" ]; then cp "$(SIDECAR_CPIO)" isodir/boot/; echo "[ISO] including $(SIDECAR_CPIO)"; fi
 	cp grub.cfg isodir/boot/grub/
-	grub-mkrescue --modules="normal multiboot multiboot2 iso9660 gfxterm font serial" \
+	grub-mkrescue --modules="normal multiboot multiboot2 iso9660 gfxterm font serial elf" \
 	              -o $(X86_ISO) isodir
 	rm -rf isodir
 
