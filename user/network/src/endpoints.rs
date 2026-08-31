@@ -101,6 +101,16 @@ impl EndpointSet {
         self.n + 1
     }
 
+    /// True when at least one endpoint has completed the NET_INFO handshake
+    /// (is `Active`).  The server loop uses this to switch from the
+    /// discovery-poll deadline (200 ms) to `TIMEOUT_NONE` (block forever)
+    /// once a real client is connected.
+    pub fn has_active_client(&self) -> bool {
+        self.eps[..self.n]
+            .iter()
+            .any(|e| e.map_or(false, |e| e.state == EndpointState::Active))
+    }
+
     fn find(&self, handle: u32) -> Option<usize> {
         (0..self.n).find(|&i| self.eps[i].map_or(false, |e| e.handle == handle))
     }

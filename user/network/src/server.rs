@@ -39,7 +39,17 @@ pub fn run<K: Kernel>(k: &K, eps: &mut EndpointSet, net: &mut MockNetwork) -> Re
 
         let list = eps.wait_list();
         let wlen = eps.wait_len();
-        let (idx, _kind) = k.wait(&list[..wlen], kapi::TIMEOUT_NONE)?;
+        // Use a 200ms deadline for the discovery poll until at least one
+        // client has completed the NET_INFO handshake.  Without this, the
+        // network sidecar blocks forever before any endpoint is adopted,
+        // so the POSIX sidecar's NET_INFO send queues a message that
+        // nobody receives (caught live: NET_RECV returns CAP_ERR_STATE).
+        let timeout = if eps.has_active_client() {
+            kapi::TIMEOUT_NONE
+        } else {
+            200_000_000 // 200ms
+        };
+        let (idx, _kind) = k.wait(&list[..wlen], timeout)?;
         let handle = list[idx];
 
         if eps.is_console(handle) {

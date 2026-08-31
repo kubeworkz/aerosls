@@ -31,6 +31,7 @@ extern "C" {
     fn k_chan_recv(chan: u32, buf: *mut u8, buf_len: u32,
                    slots: *mut core::ffi::c_void, n_slots: u32,
                    out: *mut core::ffi::c_void) -> i32;
+    fn k_yield();
 }
 
 /// Result of the NET_INFO handshake, stored here so the linker cannot
@@ -41,6 +42,9 @@ static mut NET_INFO_RESULT: u32 = 0;
 /// NET_INFO handshake — called unconditionally from `rust_entry` via a
 /// `#[no_mangle]` symbol so the compiler cannot prove it dead and
 /// eliminate it.  Pass 0xFF for either handle to skip.
+///
+/// Uses a timeout + retry loop to avoid hanging if the network sidecar
+/// hasn't adopted the POSIX channel yet.
 #[no_mangle]
 pub extern "C" fn posix_net_info_handshake(net_w: u32, net_r: u32) -> u32 {
     if net_w == 0xFF || net_r == 0xFF {
@@ -53,33 +57,67 @@ pub extern "C" fn posix_net_info_handshake(net_w: u32, net_r: u32) -> u32 {
     payload[0..4].copy_from_slice(b"AERS");
     payload[4..6].copy_from_slice(&[1, 0]); // version=1
     payload[6..8].copy_from_slice(&[1, 0]); // type=NET_INFO=1
-    let send_rc = unsafe {
-        k_chan_send(
-            net_w,            // CHAN_W slot
-            1,               // tag=1
-            0,               // flags
-            payload.as_ptr(),
-            16,              // payload_len
-            core::ptr::null(), // no caps
-            0,               // n_caps=0
-            0,               // timeout_ns=0 (TIMEOUT_NONE = block)
-        )
-    };
-    klog(b"[POSIX] NET_INFO rc=", send_rc as u32, b"\n");
-    // 2. Recv reply on chan_r
-    let mut buf = [0u8; 256];
-    let recv_rc = unsafe {
-        k_chan_recv(
-            net_r,            // CHAN_R slot
-            buf.as_mut_ptr(),
-            buf.len() as u32,
-            core::ptr::null_mut(), // no slot caps
-            0,               // n_slots=0
-            core::ptr::null_mut(), // out (we'll read manually)
-        )
-    };
-    klog(b"[POSIX] NET_REPLY rc=", recv_rc as u32, b"\n");
-    send_rc as u32
+
+    // Retry loop: send NET_INFO, recv reply with 200ms timeout.
+    // The network sidecar may not have adopted the POSIX channel yet
+    // when we first send, so we retry up to 10 times (2s total).
+    const NET_INFO_TIMEOUT_NS: u64 = 200_000_000; // 200ms
+    const MAX_RETRIES: u32 = 10;
+    for attempt in 0..MAX_RETRIES {
+        let send_rc = unsafe {
+            k_chan_send(
+                net_w,              // CHAN_W slot
+                1,                  // tag=1
+                0,                  // flags
+                payload.as_ptr(),
+                16,                 // payload_len
+                core::ptr::null(),  // no caps
+                0,                  // n_caps=0
+                NET_INFO_TIMEOUT_NS, // timeout_ns (non-zero = finite deadline)
+            )
+        };
+        klog(b"[POSIX] NET_INFO send rc=", send_rc as u32, b"");
+        if send_rc != 0 {
+            // Send failed or timed out — retry
+            unsafe { k_yield(); }
+            continue;
+        }
+        // 2. Recv reply on chan_r with timeout
+        let mut buf = [0u8; 256];
+        #[repr(C)]
+        struct RecvOut {
+            kind: u16,
+            flags: u16,
+            tag: u32,
+            len: u32,
+            n_caps: u16,
+            needed: u16,
+        }
+        let mut out = RecvOut { kind: 0, flags: 0, tag: 0, len: 0, n_caps: 0, needed: 0 };
+        let recv_rc = unsafe {
+            k_chan_recv(
+                net_r,                    // CHAN_R slot
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                core::ptr::null_mut(),    // no slot caps
+                0,                        // n_slots=0
+                &mut out as *mut RecvOut as *mut core::ffi::c_void,
+            )
+        };
+        klog(b"[POSIX] NET_RECV kind=", out.kind as u32, b"");
+        klog(b"[POSIX] NET_RECV tag=", out.tag, b"");
+        klog(b"[POSIX] NET_RECV len=", out.len, b"");
+        klog(b"[POSIX] NET_RECV rc=", recv_rc as u32, b"");
+        if recv_rc == 0 {
+            // Success — received NET_INFO reply
+            klog(b"[POSIX] NET_INFO handshake OK (attempt ", attempt + 1, b")\n");
+            return 1;
+        }
+        // Recv failed or timed out — retry
+        unsafe { k_yield(); }
+    }
+    klog(b"[POSIX] NET_INFO handshake FAILED after ", MAX_RETRIES, b" retries\n");
+    0
 }
 
 /* The crt0 (crt0.S) is assembled by rustc's LLVM integrated assembler
