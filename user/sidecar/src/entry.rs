@@ -303,6 +303,20 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     );
 
     loop {
+        // ── Console input: recv from kernel, push into ConsoleIo ──
+        // The kernel's console_service_tick polls serial input and sends
+        // bytes on the console CHAN_W. We recv from our CHAN_R and push
+        // into the in-memory ConsoleIo buffer for shell stdin.
+        if let Some(cr) = caps.console_chan {
+            let mut input_buf = [0u8; 256];
+            let mut input_caps = [aerosls_proto::kabi::GrantedCap::default(); 1];
+            match RealKernel.recv(cr, &mut input_buf, &mut input_caps) {
+                Ok(rr) if rr.kind == aerosls_proto::CH_KIND_MSG && rr.len > 0 => {
+                    booted.console.console_io().push_input(&input_buf[..rr.len]);
+                }
+                _ => {}
+            }
+        }
         // Drain console output to the kernel console channel, chunked
         // under the transport's payload bound (CAP_MSG_MAX_PAYLOAD). A
         // send parks while the queue is full; the kernel console service
