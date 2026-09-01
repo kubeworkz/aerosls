@@ -586,6 +586,16 @@ struct SLSIrqBindRequest {
     uint8_t  _pad2[6];
 };
 
+/* Driver SDK ABI v0.1 §4.4 — release a bound IRQ vector without dying:
+ * disarms the registry entry (the ISR stops enqueuing), closes the
+ * channel pair (blocked receivers get the existing CLOSE event / wake),
+ * and frees the vector for rebind. Takes the caller's CHAN_R slot from a
+ * prior successful bind. */
+struct SLSIrqUnbindRequest {
+    uint16_t chan_r;          /* caller's CHAN_R slot from k_irq_bind */
+    uint8_t  _pad[6];
+};
+
 /* k_cap_info's out block (kabi CapInfoOut). */
 struct SLSCapInfoOut {
     uint16_t ty;              /* CAP_TYPE_MEM | CAP_TYPE_CHAN_R | ... */
@@ -735,6 +745,7 @@ uint64_t sys_sls_io_in(struct SLSIoInRequest* req);
 uint64_t sys_sls_io_out(struct SLSIoOutRequest* req);
 uint64_t sys_sls_dev_mmap(struct SLSDevMmapRequest* req);
 uint64_t sys_sls_irq_bind(struct SLSIrqBindRequest* req);
+uint64_t sys_sls_irq_unbind(struct SLSIrqUnbindRequest* req);
 
 /* Driver SDK ABI v0.1 §4.2 — kabi-level port I/O (called by the syscall
  * wrappers in chan.c; k_cap_info-style: resolve the caller's slot, check
@@ -747,6 +758,7 @@ int  k_dev_mmap(uint32_t pid, uint16_t slot, uint32_t flags,
                 uint64_t vaddr_hint, uint64_t* out_vaddr);
 int  k_irq_bind(uint32_t pid, uint16_t slot, uint32_t budget,
                 uint16_t* out_chan_r);
+int  k_irq_unbind(uint32_t pid, uint16_t chan_r, uint16_t* out_vector);
 
 /* IRQ registry + ISR path (driver SDK ABI v0.1 §4.3). cap_irq_notify is
  * what the arch ISR stub calls on fire: look up the vector, enqueue a
@@ -829,6 +841,7 @@ void cap_unlock(struct CapSpinlock* l);
 #define SYS_SLS_IO_OUT       308
 #define SYS_SLS_DEV_MMAP     309
 #define SYS_SLS_IRQ_BIND     316
+#define SYS_SLS_IRQ_UNBIND   317
 
 /* Manifest record tags */
 #define SIDECAR_MANIFEST_MAGIC         "AERSLSM1"

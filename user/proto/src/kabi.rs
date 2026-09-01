@@ -233,6 +233,7 @@ mod abi {
     const SYS_IO_OUT: u64 = 308;
     const SYS_DEV_MMAP: u64 = 309;
     const SYS_IRQ_BIND: u64 = 316;
+    const SYS_IRQ_UNBIND: u64 = 317;
     const SYS_YIELD: u64 = 300;
 
     /// The raw syscall instruction (same convention as
@@ -415,6 +416,14 @@ mod abi {
         budget: u32,
         out_chan_r: u16,
         _pad2: [u8; 6],
+    }
+
+    /// Driver SDK ABI v0.1 §4.4 — release a bound vector (kernel/cap.h
+    /// SLSIrqUnbindRequest): the CHAN_R slot from a prior k_irq_bind.
+    #[repr(C)]
+    struct IrqUnbindReq {
+        chan_r: u16,
+        _pad: [u8; 6],
     }
 
     /// Kernel SLSCreateSidecarRequest (kernel/cap.h): the kernel fills
@@ -722,6 +731,18 @@ mod abi {
             }
         }
         rc as i32
+    }
+
+    /// Driver SDK ABI v0.1 §4.4 — release a bound vector: disarms the
+    /// ISR path, closes the notification channel, and frees the vector
+    /// for rebind. Returns the CAP_ERR_* code (0 = CAP_ERR_OK).
+    #[no_mangle]
+    pub extern "C" fn k_irq_unbind(chan_r: u16) -> i32 {
+        let mut req = IrqUnbindReq {
+            chan_r,
+            _pad: [0; 6],
+        };
+        unsafe { sls_syscall(SYS_IRQ_UNBIND, &mut req as *mut IrqUnbindReq as u64) as i32 }
     }
 
     /// The real kernel ABI. Only constructible/usable on the sidecar target.

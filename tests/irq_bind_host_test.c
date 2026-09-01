@@ -27,6 +27,14 @@
  *      CAP_ERR_RANGE
  *   9. syscall wrapper: NULL → CAP_ERR_PROTO; success fills out_chan_r
  *  10. teardown releases the vector: after cap_table_teardown(pid), a
+ *  11. SYS_IRQ_UNBIND (317): bind a vector, unbind it by its CHAN_R slot
+ *      - the registry is disarmed (notify no longer wakes), the driver's
+ *      channel is closed (recv fails CAP_ERR_STATE), and the SAME vector
+ *      binds again with a fresh IRQ cap
+ *  12. unbind errors: bad slot CAP_ERR_RANGE, revoked slot
+ *      CAP_ERR_REVOKED, non-CHAN_R cap CAP_ERR_TYPE, non-IRQ channel
+ *      CAP_ERR_STATE (a plain chan_create channel), double-unbind
+ *      CAP_ERR_STATE once already released, NULL request CAP_ERR_PROTO
  *      fresh IRQ cap on the same vector binds again
  *
  * Build and run:
@@ -95,6 +103,7 @@ void cap_irq_eoi(uint32_t vector) {
 
 /* cap_table_index (kernel/cap.c): not declared in cap.h (internal only). */
 int cap_table_index(uint32_t pid);
+int  k_irq_unbind(uint32_t pid, uint16_t chan_r, uint16_t* out_vector);
 
 /* ─── Cap word construction ──────────────────────────────────────────────── */
 static uint64_t irq_word(uint32_t vector, uint8_t perm) {
@@ -229,6 +238,73 @@ int main(void) {
     CHECK(k_irq_bind(P, rebind, 0, &r12) == CAP_ERR_OK,
           "vector 33 is free for rebind after teardown");
     CHECK(r12 != CAP_NONE, "rebind returned a channel");
+
+    /* ------------------------------------------ 11. SYS_IRQ_UNBIND (317): release without dying */
+    uint16_t ub_irq = 12;
+    mint_word(P, ub_irq, irq_word(40 /* vector for the unbind test */, CAP_PERM_BIND));
+    uint16_t ub_chan = CAP_NONE;
+    CHECK(k_irq_bind(P, ub_irq, 0, &ub_chan) == CAP_ERR_OK, "bind vector 40");
+    CHECK(ub_chan != CAP_NONE, "vector 40 has a CHAN_R slot");
+
+    uint16_t freed_vector = CAP_NONE;
+    CHECK(k_irq_unbind(P, ub_chan, &freed_vector) == CAP_ERR_OK,
+          "unbind by CHAN_R slot succeeds");
+    CHECK(freed_vector == 40, "unbind reports the freed vector");
+
+    /* registry disarmed: notify no longer wakes or enqueues */
+    g_wakes = 0;
+    cap_irq_notify(40);
+    CHECK(g_wakes == 0, "notify after unbind does not wake");
+
+    /* driver's endpoint closed: recv fails CAP_ERR_STATE */
+    struct SLSChanRecvOut out2;
+    memset(&out2, 0, sizeof(out2));
+    CHECK(k_chan_recv(P, ub_chan, buf, sizeof(buf), NULL, 0, &out2) == CAP_ERR_STATE,
+          "driver's recv on the unbound channel is CAP_ERR_STATE");
+
+    /* vector free for rebind with a fresh IRQ cap */
+    uint16_t rebind2 = 13;
+    mint_word(P, rebind2, irq_word(40, CAP_PERM_BIND));
+    uint16_t r13 = CAP_NONE;
+    CHECK(k_irq_bind(P, rebind2, 0, &r13) == CAP_ERR_OK,
+          "vector 40 is free for rebind after unbind");
+    CHECK(r13 != CAP_NONE, "rebind returned a channel");
+
+    /* ------------------------------------------ 12. unbind errors */
+    CHECK(k_irq_unbind(P, 3000, NULL) == CAP_ERR_RANGE,
+          "unbind bad slot is CAP_ERR_RANGE");
+    uint16_t dead2 = 14;
+    cap_tables[cap_table_index(P)].slots[dead2].word = 0;
+    CHECK(k_irq_unbind(P, dead2, NULL) == CAP_ERR_REVOKED,
+          "unbind revoked slot is CAP_ERR_REVOKED");
+    uint16_t mem2 = 15;
+    mint_word(P, mem2, ((uint64_t)CAP_TYPE_MEM << CAP_TYPE_SHIFT) |
+                       ((uint64_t)1 << CAP_OBJ_SHIFT) |
+                       ((uint64_t)CAP_PERM_R << CAP_PERM_SHIFT));
+    CHECK(k_irq_unbind(P, mem2, NULL) == CAP_ERR_TYPE,
+          "unbind on a MEM cap is CAP_ERR_TYPE");
+
+    /* a plain (non-IRQ) channel is CAP_ERR_STATE */
+    uint16_t p_ch_w = CAP_NONE, p_ch_r = CAP_NONE;
+    uint16_t p_fr = CAP_NONE, p_fw = CAP_NONE;
+    CHECK(cap_chan_create(P, 0, &p_ch_r, &p_ch_w, &p_fr, &p_fw) == 0,
+          "create a plain channel pair for the negative test");
+    CHECK(p_ch_r != CAP_NONE, "plain channel's CHAN_R slot exists");
+    CHECK(k_irq_unbind(P, p_ch_r, NULL) == CAP_ERR_STATE,
+          "unbind on a non-IRQ channel is CAP_ERR_STATE");
+
+    /* the already-unbound channel: unbind again */
+    CHECK(k_irq_unbind(P, ub_chan, NULL) == CAP_ERR_STATE,
+          "double-unbind of the same channel is CAP_ERR_STATE");
+    CHECK(sys_sls_irq_unbind(NULL) == CAP_ERR_PROTO,
+          "NULL unbind request is CAP_ERR_PROTO");
+    struct SLSIrqUnbindRequest ureq;
+    memset(&ureq, 0, sizeof(ureq));
+    ureq.chan_r = r13;   /* the vector-40 rebind channel */
+    CHECK(sys_sls_irq_unbind(&ureq) == CAP_ERR_OK,
+          "sys_sls_irq_unbind wrapper ok");
+
+
 
     printf("all irq-bind checks passed\n");
     return 0;

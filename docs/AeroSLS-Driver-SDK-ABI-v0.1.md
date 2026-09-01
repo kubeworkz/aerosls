@@ -179,6 +179,17 @@ rax=317, rdi=chan_r_slot:u16 → rax=0/errno
 ```
 Disarms the ISR stub, closes the channel pair (blocked receivers get the close event per the existing `CH_KIND_CLOSE` semantics), and frees the vector for rebind.
 
+> **Implemented (2026-09-01):** the request is a packed struct
+> `SLSIrqUnbindRequest` (chan_r u16 — the CHAN_R slot from a prior bind).
+> `k_irq_unbind` resolves the slot, verifies the channel is registered in
+> the IRQ table, disarms the registry FIRST (racing ISR enqueues find
+> CAP_NONE), closes the driver's endpoint via the existing close machinery
+> (its recv fails `ERR_STATE`) and marks the kernel end closed, then
+> frees the vector for rebind. A non-IRQ channel is `ERR_STATE`; a bad
+> slot is `ERR_RANGE`. Kernel side: kernel/cap.h + kernel/cap.c +
+> kernel/syscall_dispatch.c; shim in kabi.rs `k_irq_unbind`. SYS_IRQ_MASK
+> (318) remains reserved.
+
 ### 4.5 `SYS_IRQ_MASK = 318` — mask/unmask (optional, later)
 
 ```

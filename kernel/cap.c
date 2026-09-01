@@ -2353,10 +2353,81 @@ int k_irq_bind(uint32_t pid, uint16_t slot, uint32_t budget,
 
 uint64_t sys_sls_irq_bind(struct SLSIrqBindRequest* req) {
     if (!req) return CAP_ERR_PROTO;
-    uint16_t rd = CAP_NONE;
+    uint16_t out_chan_r = CAP_NONE;
     uint64_t r = (uint64_t)k_irq_bind(cap_current_pid(), req->slot,
-                                      req->budget, &rd);
-    req->out_chan_r = rd;
+                                      req->budget, &out_chan_r);
+    req->out_chan_r = out_chan_r;
+    return r;
+}
+
+/* ─── k_irq_unbind (driver SDK ABI v0.1 §4.4) ────────────────────────────────
+ * Release a bound vector without dying. The caller passes the CHAN_R slot
+ * k_irq_bind returned; we resolve its channel, verify it is a registered
+ * IRQ channel, disarm the registry (the ISR path finds CAP_NONE and stops
+ * enqueuing), close BOTH ends using the existing close machinery (the
+ * driver's end is marked closed — further recvs fail — and the peer's
+ * close event + wake run through the same cap_wake_chan path a death
+ * would use), and free the vector for rebind. */
+__attribute__((weak))
+int k_chan_close(uint32_t pid, uint16_t chan, uint16_t reason,
+                 uint32_t detail) {
+    (void)pid; (void)chan; (void)reason; (void)detail;
+    return CAP_ERR_NOTFOUND;   /* chan.c not linked: no close possible */
+}
+
+int k_irq_unbind(uint32_t pid, uint16_t chan_r, uint16_t* out_vector) {
+    if (out_vector) *out_vector = CAP_NONE;
+    int ti = cap_table_index(pid);
+    if (ti < 0) return CAP_ERR_NOTFOUND;
+    if (chan_r >= CAP_TABLE_ENTRIES) return CAP_ERR_RANGE;
+    struct CapTable* t = &cap_tables[ti];
+    uint64_t w = t->slots[chan_r].word;
+    if (!cap_word_valid(w)) return CAP_ERR_REVOKED;
+    uint32_t ty = (uint32_t)((w >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK);
+    if (ty != CAP_TYPE_CHAN_R) return CAP_ERR_TYPE;
+    uint32_t obj_id = (uint32_t)((w >> CAP_OBJ_SHIFT) & CAP_OBJ_MASK);
+    if (obj_id >= CAP_OBJECT_MAX) return CAP_ERR_REVOKED;
+    struct CapObject* o = &cap_objects[obj_id];
+    if (!o->active || o->kind != CAP_OBJ_KIND_CHAN) return CAP_ERR_REVOKED;
+    uint32_t chan_id = o->chan_id;
+    if (chan_id >= CAP_CHAN_MAX) return CAP_ERR_REVOKED;
+
+    /* Find the vector this channel is registered under (the registry is
+     * the kernel's only IRQ-side reference; a non-IRQ channel simply has
+     * no entry). */
+    uint32_t vector = CAP_IRQ_VECTORS;   /* sentinel: not found */
+    for (uint32_t v = 0; v < CAP_IRQ_VECTORS; v++) {
+        if (g_irq_chan[v] == (uint16_t)chan_id) { vector = v; break; }
+    }
+    if (vector >= CAP_IRQ_VECTORS) return CAP_ERR_STATE;  /* not an IRQ channel */
+
+    struct CapChannel* ch = &cap_channels[chan_id];
+    if (!ch->active) return CAP_ERR_STATE;
+
+    /* 1. Disarm FIRST: the ISR path checks the registry under the
+     *    channel lock-free path; once cleared, cap_irq_notify finds
+     *    CAP_NONE and stops enqueuing (no more notifications after this
+     *    point, even racing a firing vector). */
+    g_irq_chan[vector]   = CAP_NONE;
+    g_irq_budget[vector] = 0;
+
+    /* 2. Close both ends through the existing machinery: closes the
+     *    driver's endpoint (its recv now fails CAP_ERR_STATE) and queues
+     *    the peer-side CLOSE event + wake (the kernel end; harmless — it
+     *    is held by the registry, which is now empty). */
+    k_chan_close(pid, chan_r, CLOSE_PEER, (uint32_t)vector);
+    ch->closed[1] = 1;                 /* kernel end closed too */
+    cap_wake_chan((uint32_t)chan_id);
+
+    if (out_vector) *out_vector = (uint16_t)vector;
+    return CAP_ERR_OK;
+}
+
+uint64_t sys_sls_irq_unbind(struct SLSIrqUnbindRequest* req) {
+    if (!req) return CAP_ERR_PROTO;
+    uint16_t vector = CAP_NONE;
+    uint64_t r = (uint64_t)k_irq_unbind(cap_current_pid(), req->chan_r,
+                                        &vector);
     return r;
 }
 

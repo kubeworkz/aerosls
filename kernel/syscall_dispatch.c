@@ -609,6 +609,8 @@ uint64_t do_syscall(uint64_t num, void* arg) {
         return sys_sls_dev_mmap((struct SLSDevMmapRequest*)arg);
     case SYS_SLS_IRQ_BIND:
         return sys_sls_irq_bind((struct SLSIrqBindRequest*)arg);
+    case SYS_SLS_IRQ_UNBIND:
+        return sys_sls_irq_unbind((struct SLSIrqUnbindRequest*)arg);
 
     default:
         return 0;
