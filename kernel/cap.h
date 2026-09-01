@@ -302,6 +302,8 @@ extern struct CapChannel cap_channels[CAP_CHAN_MAX];    /* defined in cap.c */
  * trust, and the CPU supports MPK. See docs/AeroSLS-Polyglot-Nexus-
  * Phase3-Design-v0.1.md §5 for the full rationale. ────────────────── */
 #define CAP_TYPE_TRAMP  4
+#define CAP_TYPE_IO     6   /* driver SDK ABI v0.1 §3.2: I/O port range
+                             * (OBJ = port base, LEN = port count, PERM = R/W) */
 
 struct TrampolineCap {
     uint64_t entry_vaddr;       /* callee's verified entry point */
@@ -517,6 +519,25 @@ struct SLSChanCloseRequest {
     uint32_t detail;
 };
 
+/* Driver SDK ABI v0.1 §4.2 — port I/O request structs. `index` is
+ * relative to the cap's port base (OBJ field); `index + size <= LEN`
+ * (the cap's port count) or CAP_ERR_RANGE. size is 1|2|4. */
+struct SLSIoInRequest {
+    uint16_t slot;            /* caller's CAP_TYPE_IO slot */
+    uint16_t index;           /* port offset relative to base */
+    uint8_t  size;            /* 1 | 2 | 4 */
+    uint8_t  _pad[3];
+    uint32_t value;           /* [out] the value read */
+};
+
+struct SLSIoOutRequest {
+    uint16_t slot;            /* caller's CAP_TYPE_IO slot */
+    uint16_t index;           /* port offset relative to base */
+    uint8_t  size;            /* 1 | 2 | 4 */
+    uint8_t  _pad[3];
+    uint32_t value;           /* the value to write */
+};
+
 /* k_cap_info's out block (kabi CapInfoOut). */
 struct SLSCapInfoOut {
     uint16_t ty;              /* CAP_TYPE_MEM | CAP_TYPE_CHAN_R | ... */
@@ -662,6 +683,21 @@ uint64_t sys_sls_chan_recv(struct SLSChanRecvRequest* req);
 uint64_t sys_sls_chan_send(struct SLSChanSendRequest* req);
 uint64_t sys_sls_chan_close(struct SLSChanCloseRequest* req);
 uint64_t sys_sls_cap_info(struct SLSCapInfoRequest* req);
+uint64_t sys_sls_io_in(struct SLSIoInRequest* req);
+uint64_t sys_sls_io_out(struct SLSIoOutRequest* req);
+
+/* Driver SDK ABI v0.1 §4.2 — kabi-level port I/O (called by the syscall
+ * wrappers in chan.c; k_cap_info-style: resolve the caller's slot, check
+ * type/rights/range, execute the port access). */
+int  k_io_in(uint32_t pid, uint16_t slot, uint16_t index, uint8_t size,
+             uint32_t* out_val);
+int  k_io_out(uint32_t pid, uint16_t slot, uint16_t index, uint8_t size,
+              uint32_t val);
+
+/* Port I/O hooks — weak in cap.c (no-op), strong in arch/x86/user_paging.c
+ * (real in/out instructions); host tests override with a fake port map. */
+uint32_t cap_io_read(uint16_t port, uint8_t size);
+void     cap_io_write(uint16_t port, uint8_t size, uint32_t val);
 
 /* Channel lock (defined in cap.c; chan.c peeks channel queues under it). */
 void cap_lock(struct CapSpinlock* l);
@@ -723,6 +759,12 @@ void cap_unlock(struct CapSpinlock* l);
 #define SYS_SLS_CHAN_SEND     313
 #define SYS_SLS_CHAN_CLOSE    314
 #define SYS_SLS_CAP_INFO      315
+/* driver SDK ABI v0.1 §4.2 — SYS_IO_IN/SYS_IO_OUT. The ABI doc's
+ * originally-proposed 302/303 collided with the Phase-3
+ * SYS_SLS_CAP_SEND_MSG/RECV_MSG, so these take the next free pair
+ * (307/308; 306 is TRAMPOLINE_CALL, 310 is CREATE_SIDECAR). */
+#define SYS_SLS_IO_IN        307
+#define SYS_SLS_IO_OUT       308
 
 /* Manifest record tags */
 #define SIDECAR_MANIFEST_MAGIC         "AERSLSM1"

@@ -601,6 +601,10 @@ uint64_t do_syscall(uint64_t num, void* arg) {
         return sys_sls_chan_close((struct SLSChanCloseRequest*)arg);
     case SYS_SLS_CAP_INFO:
         return sys_sls_cap_info((struct SLSCapInfoRequest*)arg);
+    case SYS_SLS_IO_IN:
+        return sys_sls_io_in((struct SLSIoInRequest*)arg);
+    case SYS_SLS_IO_OUT:
+        return sys_sls_io_out((struct SLSIoOutRequest*)arg);
 
     default:
         return 0;

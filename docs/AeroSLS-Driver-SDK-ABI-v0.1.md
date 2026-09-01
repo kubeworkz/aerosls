@@ -47,7 +47,7 @@ Used types: `NONE=0, MEM=1, CHAN_R=2, CHAN_W=3, TRAMP=4`. **Types 5, 6, 7 are fr
 | 314 | SYS_SLS_CHAN_CLOSE |
 | 315 | SYS_SLS_CAP_INFO |
 
-**Free ranges: 301–309, 316+. This spec takes 301–303 (device block) and 316–318 (IRQ block).** Syscall ABI: number in `rax`, args `rdi, rsi, rdx, r10, r8, r9` (x86-64 syscall convention, already handled in arch/x86/syscall.asm).
+**Free ranges: 307–309, 316+ (301–306 are already taken by PROGRAM_SPAWN_NB_HELD, CAP_SEND_MSG, CAP_RECV_MSG, ARENA_FREE, TRAMPOLINE_CREATE/CALL). This spec takes 307–309 (device block) and 316–318 (IRQ block).** Syscall ABI: number in `rax`, args `rdi, rsi, rdx, r10, r8, r9` (x86-64 syscall convention, already handled in arch/x86/syscall.asm).
 
 ### 2.3 Channel/wake machinery (relevant to IRQ delivery)
 
@@ -106,19 +106,26 @@ Semantics: the right to bind that vector to a notification channel. The binding 
 
 Error returns use the existing errno space (kabi.rs): `ERR_RIGHTS=3, ERR_RANGE=4, ERR_STATE=8, ERR_TYPE=9, ERR_BUSY→ERR_STATE, ERR_NOMEM=11, ERR_TIMEOUT=13`.
 
-### 4.1 `SYS_DEV_MMAP = 301` — map a DEV cap
+### 4.1 `SYS_DEV_MMAP = 309` — map a DEV cap
 
 ```
-rax=301, rdi=dev_cap_slot:u16, rsi=vaddr_hint:u64, rdx=flags:u32 → rax=user_vaddr (0xFFFF… = CAP_NONE on error)
+rax=309, rdi=dev_cap_slot:u16, rsi=vaddr_hint:u64, rdx=flags:u32 → rax=user_vaddr (0xFFFF… = CAP_NONE on error)
 ```
 Flags: bit0 `DEV_MMAP_WC` (write-combining, for framebuffers), bit1 `DEV_MMAP_UNCACHED`. The kernel validates the cap, allocates a window in the caller's address space (hint honored if free), maps the physical range, and marks the cap mapped (a second call returns the same vaddr). Unmapping happens on cap revoke or process exit.
 
-### 4.2 `SYS_IO_IN = 302` / `SYS_IO_OUT = 303` — port I/O
+### 4.2 `SYS_IO_IN = 307` / `SYS_IO_OUT = 308` — port I/O
 
 ```
-SYS_IO_IN:  rax=302, rdi=io_cap_slot:u16, rsi=index:u16, rdx=size:u8 (1|2|4) → rax=value:u32
-SYS_IO_OUT: rax=303, rdi=io_cap_slot:u16, rsi=index:u16, rdx=size:u8, r10=value:u32 → rax=0/errno
+SYS_IO_IN:  rax=307, rdi=io_cap_slot:u16, rsi=index:u16, rdx=size:u8 (1|2|4) → rax=value:u32
+SYS_IO_OUT: rax=308, rdi=io_cap_slot:u16, rsi=index:u16, rdx=size:u8, r10=value:u32 → rax=0/errno
 ```
+
+> **Errata (2026-09-01):** the v0.1 draft proposed 301–303 for this block, but
+> 301–306 were already assigned (PROGRAM_SPAWN_NB_HELD, CAP_SEND_MSG,
+> CAP_RECV_MSG, ARENA_FREE, TRAMPOLINE_CREATE/CALL) before the driver SDK
+> landed. The shipped numbers are 307 (IO_IN), 308 (IO_OUT), 309 (DEV_MMAP),
+> implemented in kernel/cap.h + kernel/chan.c + kernel/syscall_dispatch.c
+> (kabi.rs `k_io_in`/`k_io_out`, host test `tests/io_cap_host_test.c`).
 `index` is relative to the cap's port base; `index + size ≤ LEN` or `ERR_RANGE`. Kernel executes the `in`/`out` with the size requested (R/W rights checked against the cap's PERM).
 
 ### 4.3 `SYS_IRQ_BIND = 316` — bind an IRQ to a notification channel
@@ -172,7 +179,7 @@ The kernel maps each entry to a cap word in the driver's table (slots are determ
 |---|---|
 | kernel/cap.h | add `CAP_TYPE_DEV/IO/IRQ` (5/6/7), word-doc comments |
 | kernel/cap.c | minting in the manifest path; DEV mapping; IO port checks; IRQ table (vector → channel) |
-| kernel/syscall_dispatch.c | case handlers for 301–303, 316–318 |
+| kernel/syscall_dispatch.c | case handlers for 307–309, 316–318 |
 | arch/x86/syscall.asm | add new numbers to the dispatch range checks |
 | arch/x86/interrupt.asm + kernel | device-IRQ stub path (timer path is the template: housekeeping + EOI) — currently only the timer vector is wired |
 | user/proto/src/kabi.rs | syscall constants, wrappers (`dev_mmap`, `io_in/out`, `irq_bind/unbind/mask`) |

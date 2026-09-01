@@ -431,3 +431,43 @@ void qemu_sls_flush_tlb(void) {
     __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
     __asm__ volatile("mov %0, %%cr3" :: "r"(cr3) : "memory");
 }
+
+/* Driver SDK ABI v0.1 §4.2 — strong port-I/O overrides for cap.c's weak
+ * hooks. All port access is mediated by the kernel syscall path
+ * (SYS_IO_IN/SYS_IO_OUT); only these execute privileged in/out. */
+uint32_t cap_io_read(uint16_t port, uint8_t size) {
+    uint32_t v = 0;
+    switch (size) {
+    case 1: {
+        uint8_t b;
+        __asm__ volatile("inb %1, %0" : "=a"(b) : "Nd"(port));
+        v = b;
+        break;
+    }
+    case 2: {
+        uint16_t w;
+        __asm__ volatile("inw %1, %0" : "=a"(w) : "Nd"(port));
+        v = w;
+        break;
+    }
+    default: {
+        __asm__ volatile("inl %1, %0" : "=a"(v) : "Nd"(port));
+        break;
+    }
+    }
+    return v;
+}
+
+void cap_io_write(uint16_t port, uint8_t size, uint32_t val) {
+    switch (size) {
+    case 1:
+        __asm__ volatile("outb %0, %1" : : "a"((uint8_t)val), "Nd"(port));
+        break;
+    case 2:
+        __asm__ volatile("outw %0, %1" : : "a"((uint16_t)val), "Nd"(port));
+        break;
+    default:
+        __asm__ volatile("outl %0, %1" : : "a"(val), "Nd"(port));
+        break;
+    }
+}

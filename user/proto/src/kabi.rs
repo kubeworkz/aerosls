@@ -10,10 +10,11 @@
 //! `kernel/cap.c` per `docs/AeroSLS-Kernel-Capability-Layer-Spec-v0.1.md`
 //! and `docs/AeroSLS-Sidecar-Channels-Transport-Spec-v0.1.md`. Behind the
 //! `target` feature, this module defines the `k_chan_*`/`k_cap_info`
-//! extern "C" symbols as real syscall shims (311-315), so a sidecar image
-//! links them; the kernel dispatches those syscalls to its own
-//! implementations in `kernel/chan.c`. The host build omits the shims so
-//! the crate links cleanly into the test harness.
+//! extern "C" symbols as real syscall shims (311-315) plus the driver-SDK
+//! port I/O shims `k_io_in`/`k_io_out` (307/308, ABI doc v0.1 §4.2), so a
+//! sidecar image links them; the kernel dispatches those syscalls to its
+//! own implementations in `kernel/chan.c`. The host build omits the shims
+//! so the crate links cleanly into the test harness.
 
 /// Capability types (capability-layer spec §1.1, respawn decision §2).
 /// `CAP_CHAN` aliases the BIB's CHAN_R entry type (2); `CAP_CHAN_W` is
@@ -216,8 +217,8 @@ mod abi {
     // ── Syscall shims (the real kernel side is kernel/chan.c) ─────────────
     // The extern "C" symbols RealKernel links against: each builds the
     // request struct the kernel's syscall wrapper unpacks (syscalls
-    // 311-315, layouts mirror kernel/cap.h exactly) and issues the raw
-    // syscall instruction. The kernel returns the transport's positive
+    // 307/308 + 311-315, layouts mirror kernel/cap.h exactly) and issues
+    // the raw syscall instruction. The kernel returns the transport's positive
     // CAP_ERR_* codes (0 = CAP_ERR_OK), so `r != ERR_OK` below is exactly
     // right — but note the kernel's codes are the spec's numbers (1..13),
     // which this module's ERR_* constants already are.
@@ -228,6 +229,8 @@ mod abi {
     const SYS_CHAN_SEND: u64 = 313;
     const SYS_CHAN_CLOSE: u64 = 314;
     const SYS_CAP_INFO: u64 = 315;
+    const SYS_IO_IN: u64 = 307;
+    const SYS_IO_OUT: u64 = 308;
     const SYS_YIELD: u64 = 300;
 
     /// The raw syscall instruction (same convention as
@@ -365,6 +368,27 @@ mod abi {
         handle: u16,
         _pad: [u8; 6],
         out: CapInfoOutReq,
+    }
+
+    /// Driver SDK ABI v0.1 §4.2 — port I/O requests (kernel/cap.h
+    /// SLSIoInRequest/SLSIoOutRequest). `index` is relative to the cap's
+    /// port base; `size` is 1|2|4.
+    #[repr(C)]
+    struct IoInReq {
+        slot: u16,
+        index: u16,
+        size: u8,
+        _pad: [u8; 3],
+        value: u32,
+    }
+
+    #[repr(C)]
+    struct IoOutReq {
+        slot: u16,
+        index: u16,
+        size: u8,
+        _pad: [u8; 3],
+        value: u32,
     }
 
     /// Kernel SLSCreateSidecarRequest (kernel/cap.h): the kernel fills
@@ -590,6 +614,40 @@ mod abi {
             }
         }
         rc as i32
+    }
+
+    /// Driver SDK ABI v0.1 §4.2 — mediated port read. Returns the CAP_ERR_*
+    /// code; on CAP_ERR_OK, `out` receives the value read.
+    #[no_mangle]
+    pub extern "C" fn k_io_in(handle: u32, index: u16, size: u8, out: *mut u32) -> i32 {
+        let mut req = IoInReq {
+            slot: handle as u16,
+            index,
+            size,
+            _pad: [0; 3],
+            value: 0,
+        };
+        let rc = unsafe { sls_syscall(SYS_IO_IN, &mut req as *mut IoInReq as u64) };
+        if rc == 0 && !out.is_null() {
+            unsafe {
+                *out = core::ptr::read_volatile(&req.value);
+            }
+        }
+        rc as i32
+    }
+
+    /// Driver SDK ABI v0.1 §4.2 — mediated port write. Returns the CAP_ERR_*
+    /// code (0 = CAP_ERR_OK).
+    #[no_mangle]
+    pub extern "C" fn k_io_out(handle: u32, index: u16, size: u8, val: u32) -> i32 {
+        let mut req = IoOutReq {
+            slot: handle as u16,
+            index,
+            size,
+            _pad: [0; 3],
+            value: val,
+        };
+        unsafe { sls_syscall(SYS_IO_OUT, &mut req as *mut IoOutReq as u64) as i32 }
     }
 
     /// The real kernel ABI. Only constructible/usable on the sidecar target.

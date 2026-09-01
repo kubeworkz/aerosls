@@ -448,6 +448,52 @@ int k_cap_info(uint32_t pid, uint16_t handle, struct SLSCapInfoOut* out) {
     return CAP_ERR_OK;
 }
 
+/* ─── k_io_in / k_io_out (driver SDK ABI v0.1 §4.2) ─────────────────────────
+ * Resolve the caller's CAP_TYPE_IO slot and execute a mediated port
+ * access. index is relative to the cap's port base (OBJ field); the cap's
+ * LEN field is the port count, so index + size <= LEN or CAP_ERR_RANGE.
+ * R (0x01) is required for in, W (0x02) for out. The actual in/out runs
+ * through the cap_io_read/cap_io_write hooks (weak no-ops in cap.c; real
+ * instructions in arch/x86/user_paging.c; fake port map in host tests). */
+static int io_resolve(uint32_t pid, uint16_t slot, uint8_t want_perm,
+                      uint16_t index, uint8_t size, uint16_t* out_port) {
+    int ti = chan_table_for_pid(pid);
+    if (ti < 0) return CAP_ERR_NOTFOUND;
+    if (slot >= CAP_TABLE_ENTRIES) return CAP_ERR_RANGE;
+    uint64_t w = cap_tables[ti].slots[slot].word;
+    if (!chan_word_valid(w)) return CAP_ERR_REVOKED;
+    if (((w >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK) != CAP_TYPE_IO)
+        return CAP_ERR_TYPE;
+    uint32_t perms = (uint32_t)((w >> CAP_PERM_SHIFT) & CAP_PERM_MASK);
+    if (!(perms & want_perm)) return CAP_ERR_RIGHTS;
+    uint32_t base = (uint32_t)((w >> CAP_OBJ_SHIFT) & CAP_OBJ_MASK);
+    uint32_t count = (uint32_t)((w >> CAP_LEN_SHIFT) & CAP_LEN_MASK);
+    if ((uint32_t)index + (uint32_t)size > count) return CAP_ERR_RANGE;
+    *out_port = (uint16_t)(base + index);
+    return CAP_ERR_OK;
+}
+
+int k_io_in(uint32_t pid, uint16_t slot, uint16_t index, uint8_t size,
+            uint32_t* out_val) {
+    if (!out_val) return CAP_ERR_PROTO;
+    if (size != 1 && size != 2 && size != 4) return CAP_ERR_RANGE;
+    uint16_t port = 0;
+    int r = io_resolve(pid, slot, CAP_PERM_R, index, size, &port);
+    if (r != CAP_ERR_OK) return r;
+    *out_val = cap_io_read(port, size);
+    return CAP_ERR_OK;
+}
+
+int k_io_out(uint32_t pid, uint16_t slot, uint16_t index, uint8_t size,
+             uint32_t val) {
+    if (size != 1 && size != 2 && size != 4) return CAP_ERR_RANGE;
+    uint16_t port = 0;
+    int r = io_resolve(pid, slot, CAP_PERM_W, index, size, &port);
+    if (r != CAP_ERR_OK) return r;
+    cap_io_write(port, size, val);
+    return CAP_ERR_OK;
+}
+
 /* ─── Syscall wrappers (311-315) ─────────────────────────────────────────────
  * Each unpacks the single request pointer (the sidecar's shim builds it)
  * and calls the kabi function above with cap_current_pid() as the caller.
@@ -488,4 +534,19 @@ uint64_t sys_sls_chan_close(struct SLSChanCloseRequest* req) {
 uint64_t sys_sls_cap_info(struct SLSCapInfoRequest* req) {
     if (!req) return CAP_ERR_PROTO;
     return (uint64_t)k_cap_info(cap_current_pid(), req->handle, &req->out);
+}
+
+uint64_t sys_sls_io_in(struct SLSIoInRequest* req) {
+    if (!req) return CAP_ERR_PROTO;
+    uint32_t val = 0;
+    uint64_t r = (uint64_t)k_io_in(cap_current_pid(), req->slot, req->index,
+                                   req->size, &val);
+    req->value = val;
+    return r;
+}
+
+uint64_t sys_sls_io_out(struct SLSIoOutRequest* req) {
+    if (!req) return CAP_ERR_PROTO;
+    return (uint64_t)k_io_out(cap_current_pid(), req->slot, req->index,
+                              req->size, req->value);
 }

@@ -109,6 +109,22 @@ void cap_wake_chan(uint32_t chan_id) { (void)chan_id; }
 __attribute__((weak))
 void cap_maybe_handoff(void) { }
 
+/* Driver SDK ABI v0.1 §4.2 — port I/O hooks (k_io_in/k_io_out in chan.c).
+ * Weak defaults: no-op (return 0 / discard), so cap.c/chan.c stay
+ * host-testable without arch code; the real kernel's strong overrides in
+ * arch/x86/user_paging.c execute actual in/out instructions, and host tests
+ * substitute a fake port map. */
+__attribute__((weak))
+uint32_t cap_io_read(uint16_t port, uint8_t size) {
+    (void)port; (void)size;
+    return 0;
+}
+
+__attribute__((weak))
+void cap_io_write(uint16_t port, uint8_t size, uint32_t val) {
+    (void)port; (void)size; (void)val;
+}
+
 /* ─── Static state ─────────────────────────────────────────────────────────── */
 
 #define CAP_FREELIST_END 0xFFFF
