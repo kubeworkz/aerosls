@@ -1307,9 +1307,6 @@ int cap_wait_chans(const uint32_t* chan_ids, uint32_t n, void* req,
     cur->waiting_nchans  = (uint8_t)n;
     cur->waiting_deadline = deadline_ticks;   /* 0 = block forever */
     cur->state           = PROC_BLOCKED;
-    kernel_serial_printf(
-        "[CAP] chan wait: parked PID %u on %u channel(s)%s\n", cur->pid, n,
-        deadline_ticks ? " (with deadline)" : "");
 
     struct ProcessDescriptor* next = pick_next_runnable();
     if (!next) {
@@ -1346,8 +1343,6 @@ int cap_wait_chans(const uint32_t* chan_ids, uint32_t n, void* req,
         cur->waiting_deadline = 0;
         return 1;
     }
-    kernel_serial_printf("[CAP] chan wait: switching to PID %u '%s'\n",
-                         next->pid, next->name);
     kernel_switch_next(next);   /* noreturn */
     return 1;   /* unreachable */
 }

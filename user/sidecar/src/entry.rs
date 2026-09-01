@@ -419,6 +419,7 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     // above installs the NetClient into the ProcManager so applets
     // can call ctx.net() for socket I/O.
 
+    let mut boot_stats_sent = false;
     loop {
         // ── Console input: recv from kernel, push into ConsoleIo ──
         // The kernel's console_service_tick polls serial input and sends
@@ -455,10 +456,13 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
             }
         }
         booted.proc.drain_wakes();
-        // Diagnostic (klog survives release LTO — it is in this binary
-        // crate): report what task 0 (init) did and how many tasks are
-        // live, so a quiet boot can be told apart from a crashed one.
-        {
+        // One-shot boot diagnostic: report what task 0 (init) did and how
+        // many tasks are live, so a quiet boot can be told apart from a
+        // crashed one. Runs ONCE after boot — the per-iteration repetition
+        // interleaved with the shell prompt and re-read /etc/init.rc on
+        // every idle pass.
+        if !boot_stats_sent {
+            boot_stats_sent = true;
             let code = booted.proc.exit_code(0);
             let live = booted.proc.task_count() as u32;
             // Show the exit code if the init task has exited, else
