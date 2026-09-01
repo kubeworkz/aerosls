@@ -60,6 +60,9 @@
  * them to PTE PWT/PCD). */
 #define CAP_PERM_DEV_WC   0x10
 #define CAP_PERM_DEV_UC   0x20
+#define CAP_PERM_BIND     0x01   /* CAP_TYPE_IRQ: the one right — bind the vector
+                                  * (bit position collides with PERM_R only by
+                                  * naming; an IRQ cap's PERM field MEANS bind) */
 #define CAP_PERM_SEND  0x01
 #define CAP_PERM_RECV  0x02
 
@@ -313,6 +316,8 @@ extern struct CapChannel cap_channels[CAP_CHAN_MAX];    /* defined in cap.c */
                              * LEN = 4 KiB pages, PERM = R/W) */
 #define CAP_TYPE_IO     6   /* driver SDK ABI v0.1 §3.2: I/O port range
                              * (OBJ = port base, LEN = port count, PERM = R/W) */
+#define CAP_TYPE_IRQ    7   /* driver SDK ABI v0.1 §3.3: single-use device
+                             * interrupt (OBJ = vector number, PERM = bind) */
 
 struct TrampolineCap {
     uint64_t entry_vaddr;       /* callee's verified entry point */
@@ -565,6 +570,22 @@ struct SLSDevMmapRequest {
     uint64_t out_vaddr;       /* [out] the mapped window (CAP_NONE on error) */
 };
 
+/* Driver SDK ABI v0.1 §4.3 — bind a CAP_TYPE_IRQ cap to a notification
+ * channel. The kernel creates a channel pair (it holds the CHAN_W end,
+ * the caller receives the CHAN_R end in a new slot), registers the vector
+ * in the kernel IRQ table so the ISR path (cap_irq_notify) can enqueue,
+ * and stamps the IRQ cap REVOKED (single-use). budget = max queued
+ * notifications (0 = CHAN_QUEUE_DEPTH); the ISR drops rather than blocks. */
+#define CAP_IRQ_VECTORS   256
+
+struct SLSIrqBindRequest {
+    uint16_t slot;            /* caller's CAP_TYPE_IRQ slot */
+    uint8_t  _pad[2];
+    uint32_t budget;          /* 0 = default (CHAN_QUEUE_DEPTH) */
+    uint16_t out_chan_r;      /* [out] caller's new CHAN_R slot */
+    uint8_t  _pad2[6];
+};
+
 /* k_cap_info's out block (kabi CapInfoOut). */
 struct SLSCapInfoOut {
     uint16_t ty;              /* CAP_TYPE_MEM | CAP_TYPE_CHAN_R | ... */
@@ -713,6 +734,7 @@ uint64_t sys_sls_cap_info(struct SLSCapInfoRequest* req);
 uint64_t sys_sls_io_in(struct SLSIoInRequest* req);
 uint64_t sys_sls_io_out(struct SLSIoOutRequest* req);
 uint64_t sys_sls_dev_mmap(struct SLSDevMmapRequest* req);
+uint64_t sys_sls_irq_bind(struct SLSIrqBindRequest* req);
 
 /* Driver SDK ABI v0.1 §4.2 — kabi-level port I/O (called by the syscall
  * wrappers in chan.c; k_cap_info-style: resolve the caller's slot, check
@@ -723,6 +745,16 @@ int  k_io_out(uint32_t pid, uint16_t slot, uint16_t index, uint8_t size,
               uint32_t val);
 int  k_dev_mmap(uint32_t pid, uint16_t slot, uint32_t flags,
                 uint64_t vaddr_hint, uint64_t* out_vaddr);
+int  k_irq_bind(uint32_t pid, uint16_t slot, uint32_t budget,
+                uint16_t* out_chan_r);
+
+/* IRQ registry + ISR path (driver SDK ABI v0.1 §4.3). cap_irq_notify is
+ * what the arch ISR stub calls on fire: look up the vector, enqueue a
+ * one-byte notification (payload = vector, tag = vector) on the kernel-
+ * held CHAN_W end, wake, EOI. Weak arch hooks: cap_irq_eoi is a no-op
+ * unless an arch layer overrides it (LAPIC/PIC). */
+void cap_irq_notify(uint32_t vector);
+void cap_irq_eoi(uint32_t vector) __attribute__((weak));
 
 /* Port I/O hooks — weak in cap.c (no-op), strong in arch/x86/user_paging.c
  * (real in/out instructions); host tests override with a fake port map. */
@@ -796,6 +828,7 @@ void cap_unlock(struct CapSpinlock* l);
 #define SYS_SLS_IO_IN        307
 #define SYS_SLS_IO_OUT       308
 #define SYS_SLS_DEV_MMAP     309
+#define SYS_SLS_IRQ_BIND     316
 
 /* Manifest record tags */
 #define SIDECAR_MANIFEST_MAGIC         "AERSLSM1"

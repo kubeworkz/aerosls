@@ -232,6 +232,7 @@ mod abi {
     const SYS_IO_IN: u64 = 307;
     const SYS_IO_OUT: u64 = 308;
     const SYS_DEV_MMAP: u64 = 309;
+    const SYS_IRQ_BIND: u64 = 316;
     const SYS_YIELD: u64 = 300;
 
     /// The raw syscall instruction (same convention as
@@ -402,6 +403,18 @@ mod abi {
         flags: u32,
         vaddr_hint: u64,
         out_vaddr: u64,
+    }
+
+    /// Driver SDK ABI v0.1 §4.3 — bind a CAP_TYPE_IRQ cap (kernel/cap.h
+    /// SLSIrqBindRequest). budget 0 = default queue depth. The IRQ cap is
+    /// single-use: the kernel stamps it REVOKED on a successful bind.
+    #[repr(C)]
+    struct IrqBindReq {
+        slot: u16,
+        _pad: [u8; 2],
+        budget: u32,
+        out_chan_r: u16,
+        _pad2: [u8; 6],
     }
 
     /// Kernel SLSCreateSidecarRequest (kernel/cap.h): the kernel fills
@@ -684,6 +697,28 @@ mod abi {
         if rc == 0 && !out_vaddr.is_null() {
             unsafe {
                 *out_vaddr = core::ptr::read_volatile(&req.out_vaddr);
+            }
+        }
+        rc as i32
+    }
+
+    /// Driver SDK ABI v0.1 §4.3 — bind a single-use IRQ cap to a
+    /// notification channel. Returns the CAP_ERR_* code; on CAP_ERR_OK,
+    /// `out_chan_r` receives the CHAN_R slot to park/recv on. The IRQ cap
+    /// is stamped REVOKED, so a second bind of the same cap fails.
+    #[no_mangle]
+    pub extern "C" fn k_irq_bind(handle: u32, budget: u32, out_chan_r: *mut u16) -> i32 {
+        let mut req = IrqBindReq {
+            slot: handle as u16,
+            _pad: [0; 2],
+            budget,
+            out_chan_r: CAP_NONE,
+            _pad2: [0; 6],
+        };
+        let rc = unsafe { sls_syscall(SYS_IRQ_BIND, &mut req as *mut IrqBindReq as u64) };
+        if rc == 0 && !out_chan_r.is_null() {
+            unsafe {
+                *out_chan_r = core::ptr::read_volatile(&req.out_chan_r);
             }
         }
         rc as i32

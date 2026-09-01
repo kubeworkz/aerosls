@@ -154,6 +154,24 @@ The kernel:
 
 The driver then simply parks with `k_chan_wait(&[chan_r], timeout)` and drains with `k_chan_recv` — identical to any other channel consumer. No new wake semantics, no new park state.
 
+> **Implemented (2026-09-01):** the request is a packed struct
+> `SLSIrqBindRequest` (slot u16, budget u32, out_chan_r u16). `k_irq_bind`
+> creates the channel with end0 = the driver (its CHAN_R is minted into a
+> fresh slot) and end1 = the kernel, installs vector → channel in a
+> 256-entry kernel registry, and stamps the IRQ cap `STATE_REVOKED` in
+> place (single-use — a second bind on the same slot fails, and the second
+> cap on the same vector fails with `ERR_STATE`). The ISR body is
+> `cap_irq_notify(vector)`: it resolves the registry, enqueues a one-byte
+> notification (payload = tag = the vector) on the kernel-held end,
+> `cap_wake_chan`, then the weak `cap_irq_eoi` hook (no-op by default;
+> LAPIC/PIC layers override). Notifications are dropped rather than
+> blocked when the driver's budget is exhausted. `cap_table_teardown`
+> unbinds the dying driver's vectors so they are free for rebind.
+> Kernel side: kernel/cap.h + kernel/cap.c + kernel/syscall_dispatch.c;
+> shim in kabi.rs `k_irq_bind`; host test `tests/irq_bind_host_test.c`.
+> The arch ISR-stub wiring that calls `cap_irq_notify` on a real device
+> vector is M2 (the kernel today dispatches only the timer IRQ0).
+
 ### 4.4 `SYS_IRQ_UNBIND = 317` — release a vector
 
 ```

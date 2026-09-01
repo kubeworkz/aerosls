@@ -1,0 +1,235 @@
+/*
+ * irq_bind_host_test.c — Driver SDK ABI v0.1 §4.3: CAP_TYPE_IRQ with
+ * SYS_IRQ_BIND (316), driven against the REAL kernel/cap.c and
+ * kernel/chan.c (not a reimplementation).
+ *
+ * The test mints single-use IRQ cap words directly into a fake process's
+ * cap table (IRQ caps come from the manifest `devices:` section at
+ * create_sidecar, which is M2 work), then drives k_irq_bind through the
+ * REAL channel creation, holder bookkeeping, registry install, and
+ * single-use stamp. The ISR side is exercised by calling cap_irq_notify
+ * directly (the arch ISR stub's job is simply to invoke it): the test
+ * proves the full enqueue → wake → k_chan_recv path the driver sees.
+ * cap_wake_chan and cap_irq_eoi are overridden to record.
+ *
+ * Scenarios:
+ *   1. bind a vector: returns a CHAN_R slot; k_cap_info shows CHAN_R;
+ *      the IRQ cap word is stamped REVOKED (single-use)
+ *   2. second bind of the same slot → CAP_ERR_REVOKED
+ *   3. second IRQ cap with the SAME vector → CAP_ERR_STATE (already bound)
+ *   4. ISR path: cap_irq_notify(vector) → wake fires; k_chan_recv yields
+ *      tag = vector, payload byte = vector; queue empties after one recv
+ *   5. notify on an unbound vector is a silent no-op (no wake, no crash)
+ *   6. rights: IRQ cap without CAP_PERM_BIND → CAP_ERR_RIGHTS
+ *   7. type: MEM cap in the slot → CAP_ERR_TYPE; revoked slot →
+ *      CAP_ERR_REVOKED; bad slot → CAP_ERR_RANGE
+ *   8. vector out of range (>= 256) → CAP_ERR_RANGE; budget > depth →
+ *      CAP_ERR_RANGE
+ *   9. syscall wrapper: NULL → CAP_ERR_PROTO; success fills out_chan_r
+ *  10. teardown releases the vector: after cap_table_teardown(pid), a
+ *      fresh IRQ cap on the same vector binds again
+ *
+ * Build and run:
+ *   gcc -no-pie -std=c11 -Wall -Wextra -I . -I kernel \
+ *       -o /tmp/irq_bind_host_test \
+ *       tests/irq_bind_host_test.c kernel/cap.c kernel/chan.c kernel/frame_pool.c
+ *   /tmp/irq_bind_host_test
+ */
+#include "kernel/cap.h"
+#include "tests/process_host_stubs.h"   /* stack_bottom/stack_top (frame_pool_init reservation bounds) */
+
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+
+/* ─── Link stubs ──────────────────────────────────────────────────────────── */
+char _kernel_image_end[1];
+void kernel_serial_print(const char* s) { (void)s; }
+void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
+void kernel_serial_putchar(char c) { (void)c; }
+
+volatile uint64_t kernel_tick_counter = 0;
+
+/* Link stubs for cap.c's sidecar-spawn path (not exercised here). */
+struct ProcessDescriptor proc_table[PROC_MAX];
+uint32_t proc_count = 0;
+uint32_t alloc_pid(void) { return 903; }
+uint64_t alloc_proc_syscall_stack(uint32_t partition_id) {
+    (void)partition_id;
+    return 0x400000007000ULL;
+}
+uint64_t user_clone_page_table(void) { return 0x4000; }
+void user_map_page(uint64_t* pml4, uint64_t vaddr, uint64_t paddr, uint64_t flags) {
+    (void)pml4; (void)vaddr; (void)paddr; (void)flags;
+}
+int user_map_identity(uint64_t* pml4, uint64_t phys, uint32_t npages,
+                      uint64_t flags) {
+    (void)pml4; (void)phys; (void)npages; (void)flags;
+    return 0;
+}
+void cap_arch_tlb_flush(void) { }
+int cap_arch_map_page(uint64_t pml4, uint64_t v, uint64_t p, uint32_t perms) {
+    (void)pml4; (void)v; (void)p; (void)perms; return 0;
+}
+int cap_arch_unmap_page(uint64_t pml4, uint64_t v) {
+    (void)pml4; (void)v; return 0;
+}
+
+/* ─── Strong overrides of cap.c's weak hooks ─────────────────────────────── */
+static uint32_t g_cur_pid = 0;
+uint32_t cap_current_pid(void) { return g_cur_pid; }
+
+static int g_wakes = 0;
+static uint32_t g_wake_chan = 0;
+void cap_wake_chan(uint32_t chan_id) {
+    g_wakes++;
+    g_wake_chan = chan_id;
+}
+
+static int g_eois = 0;
+static uint32_t g_eoi_vector = 0;
+void cap_irq_eoi(uint32_t vector) {
+    g_eois++;
+    g_eoi_vector = vector;
+}
+
+/* cap_table_index (kernel/cap.c): not declared in cap.h (internal only). */
+int cap_table_index(uint32_t pid);
+
+/* ─── Cap word construction ──────────────────────────────────────────────── */
+static uint64_t irq_word(uint32_t vector, uint8_t perm) {
+    return ((uint64_t)CAP_TYPE_IRQ << CAP_TYPE_SHIFT) |
+           ((uint64_t)vector     << CAP_OBJ_SHIFT) |
+           ((uint64_t)perm       << CAP_PERM_SHIFT);
+}
+
+static void mint_word(uint32_t pid, uint16_t slot, uint64_t word) {
+    int ti = cap_table_index(pid);
+    if (ti < 0) { fprintf(stderr, "FATAL: no cap table for pid %u\n", pid); }
+    cap_tables[ti].slots[slot].word = word;
+}
+
+#define CHECK(cond, msg) do { \
+    if (!(cond)) { fprintf(stderr, "FAIL: %s\n", msg); return 1; } \
+    printf("ok: %s\n", msg); \
+} while (0)
+
+int main(void) {
+    cap_init();
+    const uint32_t P = 904;
+    g_cur_pid = P;
+    g_wakes = g_eois = 0;
+
+    /* ── 1. bind a vector ─────────────────────────────────────────────── */
+    uint16_t irq1 = 4;                       /* slot 4 holds the IRQ cap */
+    mint_word(P, irq1, irq_word(33 /*vector*/, CAP_PERM_BIND));
+    uint16_t chan_r = CAP_NONE;
+    CHECK(k_irq_bind(P, irq1, 0, &chan_r) == CAP_ERR_OK, "bind vector 33 succeeds");
+    CHECK(chan_r != CAP_NONE && chan_r != irq1, "bind returned a fresh CHAN_R slot");
+
+    struct SLSCapInfoOut info;
+    memset(&info, 0, sizeof(info));
+    CHECK(k_cap_info(P, chan_r, &info) == CAP_ERR_OK, "k_cap_info on the new slot ok");
+    CHECK(info.ty == CAP_TYPE_CHAN_R && (info.rights & CAP_PERM_RECV),
+          "new slot is a CHAN_R with RECV right");
+    CHECK(k_cap_info(P, irq1, &info) == CAP_ERR_REVOKED,
+          "IRQ cap now introspects as REVOKED (single-use stamp)");
+
+    /* ── 2. single-use: the IRQ cap is stamped REVOKED ────────────────── */
+    uint16_t again = CAP_NONE;
+    CHECK(k_irq_bind(P, irq1, 0, &again) == CAP_ERR_REVOKED,
+          "second bind of the same slot is CAP_ERR_REVOKED (single-use)");
+
+    /* ── 3. same vector on a DIFFERENT cap is already bound ───────────── */
+    uint16_t irq2 = 5;
+    mint_word(P, irq2, irq_word(33, CAP_PERM_BIND));
+    uint16_t dup = CAP_NONE;
+    CHECK(k_irq_bind(P, irq2, 0, &dup) == CAP_ERR_STATE,
+          "second cap on the same vector is CAP_ERR_STATE");
+
+    /* ── 4. ISR path: notify → wake → recv ────────────────────────────── */
+    g_wakes = 0;
+    cap_irq_notify(33);
+    CHECK(g_wakes == 1, "notify woke the channel once");
+    CHECK(g_eois == 1 && g_eoi_vector == 33, "EOI ran for the fired vector");
+
+    uint8_t buf[16];
+    struct SLSChanRecvOut out;
+    memset(&out, 0, sizeof(out));
+    CHECK(k_chan_recv(P, chan_r, buf, sizeof(buf), NULL, 0, &out) == CAP_ERR_OK,
+          "k_chan_recv drains the notification");
+    CHECK(out.kind == CH_KIND_MSG, "notification arrives as a message");
+    CHECK(out.tag == 33, "message tag is the vector number");
+    CHECK(out.len == 1 && buf[0] == 33, "payload is the one-byte vector");
+
+    /* a second recv finds nothing (the transport reports the empty state
+     * so the driver parks with k_chan_wait — the documented pattern) */
+    CHECK(k_chan_recv(P, chan_r, buf, sizeof(buf), NULL, 0, &out) == CAP_ERR_STATE,
+          "queue is empty after one recv (CAP_ERR_STATE → driver parks)");
+
+    /* ── 5. notify on an unbound vector is a silent no-op ─────────────── */
+    g_wakes = 0;
+    cap_irq_notify(77);
+    CHECK(g_wakes == 0, "notify on an unbound vector does not wake");
+    CHECK(g_eois == 2, "unbound notify still EOIs (harmless)");
+
+    /* ── 6. rights ────────────────────────────────────────────────────── */
+    uint16_t no_perm = 6;
+    mint_word(P, no_perm, irq_word(34, 0));
+    uint16_t r6 = CAP_NONE;
+    CHECK(k_irq_bind(P, no_perm, 0, &r6) == CAP_ERR_RIGHTS,
+          "IRQ cap without bind perm is CAP_ERR_RIGHTS");
+
+    /* ── 7. type / revoked / slot errors ──────────────────────────────── */
+    uint16_t mem_slot = 7;
+    mint_word(P, mem_slot, ((uint64_t)CAP_TYPE_MEM << CAP_TYPE_SHIFT) |
+                           ((uint64_t)1 << CAP_OBJ_SHIFT) |
+                           ((uint64_t)(CAP_PERM_R | CAP_PERM_W) << CAP_PERM_SHIFT));
+    uint16_t r7 = CAP_NONE;
+    CHECK(k_irq_bind(P, mem_slot, 0, &r7) == CAP_ERR_TYPE,
+          "MEM cap in the slot is CAP_ERR_TYPE");
+    uint16_t dead = 8;
+    cap_tables[cap_table_index(P)].slots[dead].word = 0;
+    uint16_t r8 = CAP_NONE;
+    CHECK(k_irq_bind(P, dead, 0, &r8) == CAP_ERR_REVOKED,
+          "empty (free) slot is CAP_ERR_REVOKED");
+    uint16_t r9 = CAP_NONE;
+    CHECK(k_irq_bind(P, 3000, 0, &r9) == CAP_ERR_RANGE,
+          "slot beyond CAP_TABLE_ENTRIES is CAP_ERR_RANGE");
+    CHECK(k_irq_bind(P, irq1, 0, NULL) == CAP_ERR_PROTO,
+          "NULL out pointer is CAP_ERR_PROTO");
+
+    /* ── 8. vector / budget range ─────────────────────────────────────── */
+    uint16_t far_vec = 9;
+    mint_word(P, far_vec, irq_word(999 /* >= 256 */, CAP_PERM_BIND));
+    uint16_t r10 = CAP_NONE;
+    CHECK(k_irq_bind(P, far_vec, 0, &r10) == CAP_ERR_RANGE,
+          "vector beyond 255 is CAP_ERR_RANGE");
+    uint16_t ok_vec = 10;
+    mint_word(P, ok_vec, irq_word(35, CAP_PERM_BIND));
+    uint16_t r11 = CAP_NONE;
+    CHECK(k_irq_bind(P, ok_vec, CHAN_QUEUE_DEPTH + 1, &r11) == CAP_ERR_RANGE,
+          "budget beyond CHAN_QUEUE_DEPTH is CAP_ERR_RANGE");
+
+    /* ── 9. syscall wrapper ───────────────────────────────────────────── */
+    CHECK(sys_sls_irq_bind(NULL) == CAP_ERR_PROTO, "NULL request is CAP_ERR_PROTO");
+    struct SLSIrqBindRequest req;
+    memset(&req, 0, sizeof(req));
+    req.slot = ok_vec;
+    CHECK(sys_sls_irq_bind(&req) == CAP_ERR_OK, "sys_sls_irq_bind wrapper ok");
+    CHECK(req.out_chan_r != CAP_NONE, "wrapper fills out_chan_r");
+    CHECK(k_cap_info(P, req.out_chan_r, &info) == CAP_ERR_OK &&
+          info.ty == CAP_TYPE_CHAN_R, "wrapper's returned slot is a CHAN_R");
+
+    /* ── 10. teardown releases the vector ─────────────────────────────── */
+    cap_table_teardown(P);
+    uint16_t rebind = 11;
+    mint_word(P, rebind, irq_word(33 /* the first vector again */, CAP_PERM_BIND));
+    uint16_t r12 = CAP_NONE;
+    CHECK(k_irq_bind(P, rebind, 0, &r12) == CAP_ERR_OK,
+          "vector 33 is free for rebind after teardown");
+    CHECK(r12 != CAP_NONE, "rebind returned a channel");
+
+    printf("all irq-bind checks passed\n");
+    return 0;
+}

@@ -125,6 +125,14 @@ void cap_io_write(uint16_t port, uint8_t size, uint32_t val) {
     (void)port; (void)size; (void)val;
 }
 
+/* ─── IRQ registry (driver SDK ABI v0.1 §4.3) ────────────────────────────────
+ * vector -> bound channel id (+ the driver's notification budget). The
+ * ISR path (cap_irq_notify) resolves a fired vector through this table,
+ * so an IRQ cap binds ONCE (the cap is stamped REVOKED) and the channel
+ * is the only receiver. CAP_NONE = vector free. */
+static uint16_t g_irq_chan[CAP_IRQ_VECTORS];
+static uint16_t g_irq_budget[CAP_IRQ_VECTORS];
+
 /* ─── Static state ─────────────────────────────────────────────────────────── */
 
 #define CAP_FREELIST_END 0xFFFF
@@ -539,6 +547,10 @@ int cap_arch_identity_map_user(uint64_t pml4_phys, uint64_t phys,
 /* ─── Init ─────────────────────────────────────────────────────────────────── */
 
 void cap_init(void) {
+    for (int i = 0; i < CAP_IRQ_VECTORS; i++) {
+        g_irq_chan[i]   = CAP_NONE;
+        g_irq_budget[i] = 0;
+    }
     for (int i = 0; i < CAP_TABLE_MAX; i++) {
         cap_lock_init(&cap_tables[i].lock);
         cap_table_pid[i] = 0;
@@ -1977,6 +1989,20 @@ void cap_table_teardown(uint32_t pid) {
         cap_wake_chan(ci);
     }
 
+    /* 7. IRQ registry cleanup (driver SDK ABI v0.1 §4.3): unbind every
+     *    vector whose notification channel this pid held the CHAN_R of, so
+     *    the vector is free for rebind and the ISR stops enqueuing into a
+     *    channel nobody reads. The channel object itself was already torn
+     *    down in steps 1-3 (its only holder was the driver's CHAN_R). */
+    for (uint32_t v = 0; v < CAP_IRQ_VECTORS; v++) {
+        if (g_irq_chan[v] == CAP_NONE) continue;
+        struct CapChannel* ich = &cap_channels[g_irq_chan[v]];
+        if (ich->end0_pid == pid) {
+            g_irq_chan[v]   = CAP_NONE;
+            g_irq_budget[v] = 0;
+        }
+    }
+
     kernel_serial_printf(
         "[TORE] PID %u teardown: %u cap(s) dropped, %u object(s) destroyed, "
         "%u arena frame(s) returned, table %d unbound\n",
@@ -2180,7 +2206,161 @@ void cap_list(void) {
         (unsigned)free_frames, (unsigned)CAP_ARENA_FRAMES);
 }
 
-/* ─── Syscall wrappers (do_syscall ABI: uint64_t return) ───────────────────── */
+/* ─── k_irq_bind / cap_irq_notify (driver SDK ABI v0.1 §4.3) ────────────────
+ * Bind a single-use CAP_TYPE_IRQ cap: create a channel pair whose CHAN_W
+ * end the kernel holds (via the registry — no user slot), mint the CHAN_R
+ * end into the caller's table, and stamp the IRQ cap REVOKED so a second
+ * bind on the same slot fails. The ISR path enqueues through the
+ * kernel-held end, so a driver just parks with k_chan_wait/k_chan_recv. */
+__attribute__((weak))
+void cap_irq_eoi(uint32_t vector) { (void)vector; }
+
+void cap_irq_notify(uint32_t vector) {
+    if (vector >= CAP_IRQ_VECTORS) { cap_irq_eoi(vector); return; }
+    uint16_t chan_id = g_irq_chan[vector];
+    if (chan_id == CAP_NONE) { cap_irq_eoi(vector); return; }
+    struct CapChannel* ch = &cap_channels[chan_id];
+    if (!ch->active) { cap_irq_eoi(vector); return; }
+
+    /* The kernel is end1 (end0 = the bound driver); messages the kernel
+     * enqueues must land in q[0], which the driver's CHAN_R reads. Drop
+     * when the driver's budget is exhausted — an ISR cannot block. */
+    uint16_t budget = g_irq_budget[vector];
+    if (budget == 0) budget = CHAN_QUEUE_DEPTH;
+
+    cap_lock(&ch->lock);
+    if (ch->qdepth[0] >= budget || !ch->active) {
+        cap_unlock(&ch->lock);
+        cap_irq_eoi(vector);
+        return;   /* notification dropped (driver too slow / unbound) */
+    }
+    uint16_t pidx = CAP_NONE;
+    if (cap_msg_payload_alloc(&pidx)) {
+        cap_unlock(&ch->lock);
+        cap_irq_eoi(vector);
+        return;   /* payload pool exhausted — drop, never block in ISR */
+    }
+    cap_msg_payload[pidx][0] = (uint8_t)vector;
+
+    uint32_t entry = ch->qtail[0] % CHAN_QUEUE_DEPTH;
+    struct ChanMsg* m = &ch->q[0][entry];
+    for (int i = 0; i < CAP_MSG_MAX_CAPS; i++) {
+        m->cap_word[i] = 0;
+        m->cap_off[i] = 0;
+        m->cap_len[i] = 0;
+        m->cap_rights[i] = 0;
+        m->cap_flags[i] = 0;
+    }
+    m->n_caps = 0;
+    m->cookie = vector;                 /* tag = the vector number */
+    m->flags = 0;
+    m->payload_len = 1;
+    m->payload_idx = pidx;
+    ch->qtail[0]++;
+    ch->qdepth[0]++;
+    cap_unlock(&ch->lock);
+
+    cap_wake_chan(chan_id);             /* parked k_chan_wait re-runs */
+    cap_irq_eoi(vector);
+}
+
+int k_irq_bind(uint32_t pid, uint16_t slot, uint32_t budget,
+               uint16_t* out_chan_r) {
+    if (!out_chan_r) return CAP_ERR_PROTO;
+    *out_chan_r = CAP_NONE;
+    if (budget > CHAN_QUEUE_DEPTH) return CAP_ERR_RANGE;
+
+    int ti = cap_table_index(pid);
+    if (ti < 0) return CAP_ERR_NOTFOUND;
+    if (slot >= CAP_TABLE_ENTRIES) return CAP_ERR_RANGE;
+    struct CapTable* t = &cap_tables[ti];
+    uint64_t w = t->slots[slot].word;
+    if (!cap_word_valid(w)) return CAP_ERR_REVOKED;
+    if (((w >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK) != CAP_TYPE_IRQ)
+        return CAP_ERR_TYPE;
+    if (!((w >> CAP_PERM_SHIFT) & CAP_PERM_BIND)) return CAP_ERR_RIGHTS;
+    uint32_t vector = (uint32_t)((w >> CAP_OBJ_SHIFT) & CAP_OBJ_MASK);
+    if (vector >= CAP_IRQ_VECTORS) return CAP_ERR_RANGE;
+    if (g_irq_chan[vector] != CAP_NONE) return CAP_ERR_STATE;  /* already bound */
+
+    /* Create the channel pair: end0 = driver (holds CHAN_R), end1 =
+     * kernel (holds CHAN_W through the registry). A dedicated object +
+     * ONE holder (the caller's CHAN_R) — the kernel end needs no slot. */
+    if (cap_chan_next >= CAP_CHAN_MAX) return CAP_ERR_SPACE;
+    uint32_t chan_id = cap_chan_next++;
+    struct CapChannel* ch = &cap_channels[chan_id];
+    cap_lock_init(&ch->lock);
+    ch->end0_pid = (uint16_t)pid;
+    ch->end1_pid = 0;                   /* kernel context */
+    ch->active = 1;
+    for (int d = 0; d < 2; d++) {
+        ch->qhead[d] = 0;
+        ch->qtail[d] = 0;
+        ch->qdepth[d] = 0;
+        ch->closed[d]      = 0;
+        ch->close_evt[d]   = 0;
+        ch->close_reason[d] = 0;
+        ch->close_detail[d] = 0;
+    }
+
+    uint32_t obj_id;
+    if (cap_object_alloc(CAP_OBJ_KIND_CHAN, &obj_id)) {
+        ch->active = 0;
+        return CAP_ERR_NOMEM;
+    }
+    struct CapObject* o = &cap_objects[obj_id];
+    o->chan_id = (uint16_t)chan_id;
+
+    /* Pop the CHAN_R slot and write its word under the caller's table
+     * lock (same posture as cap_chan_create). */
+    uint16_t rd = CAP_NONE;
+    uint16_t hs = CAP_FREELIST_END;
+    cap_lock(&t->lock);
+    if (cap_slot_pop(ti, &rd)) {
+        cap_unlock(&t->lock);
+        cap_object_destroy(obj_id);
+        ch->active = 0;
+        return CAP_ERR_SPACE;
+    }
+    t->slots[rd].word = cap_word_make(CAP_TYPE_CHAN_R, obj_id,
+                                      CAP_PERM_RECV, 0, 1);
+    cap_unlock(&t->lock);
+
+    if (cap_holder_alloc(obj_id, HOLDER_SLOT, (uint16_t)pid, rd, 0, &hs)) {
+        cap_lock(&t->lock);
+        t->slots[rd].word = 0;
+        cap_slot_push(ti, rd);
+        cap_unlock(&t->lock);
+        cap_object_destroy(obj_id);
+        ch->active = 0;
+        return CAP_ERR_NOMEM;
+    }
+    cap_lock(&o->lock);
+    cap_holder_link(hs, o);
+    cap_unlock(&o->lock);
+
+    /* Bind: register + stamp the IRQ cap single-use. */
+    g_irq_chan[vector]   = (uint16_t)chan_id;
+    g_irq_budget[vector] = (uint16_t)budget;
+    cap_lock(&t->lock);
+    t->slots[slot].word = (w & ~(((uint64_t)CAP_STATE_MASK) << CAP_STATE_SHIFT))
+                          | (((uint64_t)CAP_STATE_REVOKED) << CAP_STATE_SHIFT);
+    cap_unlock(&t->lock);
+
+    *out_chan_r = rd;
+    return CAP_ERR_OK;
+}
+
+uint64_t sys_sls_irq_bind(struct SLSIrqBindRequest* req) {
+    if (!req) return CAP_ERR_PROTO;
+    uint16_t rd = CAP_NONE;
+    uint64_t r = (uint64_t)k_irq_bind(cap_current_pid(), req->slot,
+                                      req->budget, &rd);
+    req->out_chan_r = rd;
+    return r;
+}
+
+/* ─── Syscall wrappers (311-315) ───────────────────────────────────────────── */
 
 uint64_t sys_sls_cap_create_mem(struct SLSCapCreateMemRequest* req) {
     if (!req) return (uint64_t)(int64_t)CAP_EINVAL;
