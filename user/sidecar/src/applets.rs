@@ -4924,6 +4924,167 @@ pub fn nettest<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     Step::Exit(0)
 }
 
+/// `irqtest`: Driver SDK ABI v0.1 s4.3/4.4 acceptance demo. The POSIX
+/// manifest declares a CAP_TYPE_IRQ cap ("irq.timer.0", vector 32 — the
+/// LAPIC timer edge), minted by cap_create_sidecar at spawn. irqtest finds
+/// that slot by trial-bind (k_irq_bind returns the type/rights error for
+/// every non-IRQ slot and success on the IRQ cap, stamping it REVOKED),
+/// then parks on the notification channel: the kernel's timer_irq_handler
+/// calls cap_irq_notify(32) every tick (~10 ms), which enqueues one byte
+/// (= 32) on the bound channel, wakes us, and EOIs. 50 delivered edges
+/// proves edge-to-channel delivery on the real target. Bounded (the
+/// init.rc runner waits for children, so an endless park would stall the
+/// boot script); a 1 s per-wait timeout fails fast if the path is broken.
+pub fn irqtest<K: Kernel, A: BufferAlloc>(_ctx: &mut Ctx<'_, K, A>) -> Step {
+    fn swrite(s: &[u8]) {
+        unsafe { irqtest_push_result(s.as_ptr(), s.len() as u32); }
+    }
+
+    swrite(b"[irqtest] looking for the manifest IRQ cap...\n");
+    let mut chan_r: u16 = 0xFFFF;
+    let mut slot = None;
+    for s in 0u32..32u32 {
+        let rc = unsafe { k_irq_bind(s, 0, &mut chan_r) };
+        if rc == 0 {
+            slot = Some(s);
+            break;
+        }
+    }
+    let slot = match slot {
+        Some(s) => s,
+        None => {
+            swrite(b"[irqtest] FAIL: no bindable IRQ cap in table\n");
+            return Step::Exit(1);
+        }
+    };
+    swrite(b"[irqtest] bound IRQ cap: vector 32, notification channel acquired\n");
+
+    let mut buf = [0u8; 8];
+    let mut received: u32 = 0;
+    for _ in 0..50 {
+        let mut wout = IrqWaitOut {
+            idx: 0,
+            kind: 0,
+            pad: 0,
+        };
+        let rc = unsafe { k_chan_wait(&(chan_r as u32), 1, 1_000_000_000, &mut wout) };
+        if rc != 0 {
+            swrite(b"[irqtest] FAIL: k_chan_wait on the notification channel\n");
+            return Step::Exit(1);
+        }
+        let mut rout = IrqRecvOut {
+            kind: 0,
+            flags: 0,
+            tag: 0,
+            len: 0,
+            n_caps: 0,
+            needed: 0,
+        };
+        let rrc = unsafe {
+            k_chan_recv(
+                chan_r as u32,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                core::ptr::null_mut(),
+                0,
+                &mut rout,
+            )
+        };
+        if rrc != 0 {
+            swrite(b"[irqtest] FAIL: k_chan_recv on the notification channel\n");
+            return Step::Exit(1);
+        }
+        // The kernel enqueues tag = payload = the vector number.
+        if rout.tag != 32 || buf[0] != 32 {
+            swrite(b"[irqtest] FAIL: notification payload/tag != vector\n");
+            return Step::Exit(1);
+        }
+        received += 1;
+        match received {
+            10 => swrite(b"[irqtest] tick 10\n"),
+            20 => swrite(b"[irqtest] tick 20\n"),
+            30 => swrite(b"[irqtest] tick 30\n"),
+            40 => swrite(b"[irqtest] tick 40\n"),
+            50 => swrite(b"[irqtest] tick 50\n"),
+            _ => {}
+        }
+    }
+    swrite(b"[irqtest] PASS: 50/50 timer edges delivered over the IRQ channel\n");
+    Step::Exit(0)
+}
+
+/// Wire layouts for the raw transport shims (aerosls_proto ABI module:
+/// k_chan_wait / k_chan_recv).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct IrqWaitOut {
+    idx: u32,
+    kind: u16,
+    pad: u16,
+}
+
+#[repr(C)]
+struct IrqRecvOut {
+    kind: u16,
+    flags: u16,
+    tag: u32,
+    len: u32,
+    n_caps: u32,
+    needed: u32,
+}
+
+/// Real-kernel shims (provided by aerosls-proto, feature `target`). Host
+/// builds get failing stubs below — irqtest only runs on the target.
+#[cfg(feature = "target")]
+extern "C" {
+    fn k_irq_bind(handle: u32, budget: u32, out_chan_r: *mut u16) -> i32;
+    fn k_chan_wait(chans: *const u32, n: u32, timeout_ns: u64, out: *mut IrqWaitOut) -> i32;
+    fn k_chan_recv(
+        chan: u32,
+        buf: *mut u8,
+        buf_len: u32,
+        slots: *mut u8,
+        n_slots: u32,
+        out: *mut IrqRecvOut,
+    ) -> i32;
+    fn irqtest_push_result(data: *const u8, len: u32);
+}
+
+#[cfg(not(feature = "target"))]
+#[no_mangle]
+pub unsafe extern "C" fn k_irq_bind(_h: u32, _b: u32, _o: *mut u16) -> i32 {
+    -1
+}
+#[cfg(not(feature = "target"))]
+#[no_mangle]
+pub unsafe extern "C" fn k_chan_wait(
+    _c: *const u32,
+    _n: u32,
+    _t: u64,
+    _o: *mut IrqWaitOut,
+) -> i32 {
+    -1
+}
+#[cfg(not(feature = "target"))]
+#[no_mangle]
+pub unsafe extern "C" fn k_chan_recv(
+    _c: u32,
+    _b: *mut u8,
+    _l: u32,
+    _s: *mut u8,
+    _n: u32,
+    _o: *mut IrqRecvOut,
+) -> i32 {
+    -1
+}
+
+/// Host/test-only implementation of the irqtest output sink (entry.rs
+/// provides the real one on the target).
+#[cfg(not(feature = "target"))]
+#[no_mangle]
+pub unsafe extern "C" fn irqtest_push_result(_data: *const u8, _len: u32) {}
+
+// (the nettest host sink follows)
 /// Host/test-only implementation of the nettest output sink.  On the target
 /// (`feature = "target"`) this symbol is provided by entry.rs as the
 /// serial-drain buffer; host builds (unit/integration tests) have no serial,
@@ -4955,6 +5116,7 @@ pub fn register_default_applets<K: Kernel, A: BufferAlloc>(pm: &mut ProcManager<
     pm.register_applet("forkpty_test", forkpty_test);
     pm.register_applet("unix_echo", unix_echo);
     pm.register_applet("nettest", nettest);
+    pm.register_applet("irqtest", irqtest);
     pm.register_applet("netcheck", netcheck);
     pm.register_applet("ls", ls);
     pm.register_applet("mkdir", mkdir_applet);

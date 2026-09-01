@@ -24,6 +24,12 @@
 pub const CAP_MEM: u16 = 1;
 pub const CAP_CHAN: u16 = 2;
 pub const CAP_CHAN_W: u16 = 3;
+/// `CAP_TYPE_IRQ` — Driver SDK ABI v0.1 s4.3: a single-use bind cap
+/// for a device vector (OBJ = vector, PERM = CAP_PERM_BIND).
+/// Matches `CAP_TYPE_IRQ 7` in kernel/cap.h.
+pub const CAP_TYPE_IRQ: u16 = 7;
+/// The one right an IRQ cap carries: bind (kernel/cap.h CAP_PERM_BIND).
+pub const CAP_PERM_BIND: u16 = 0x01;
 
 /// `CAP_NONE` — an absent cap slot (the kernel's CAP_NONE).
 pub const CAP_NONE: u16 = 0xFFFF;

@@ -3042,6 +3042,26 @@ int cap_create_sidecar(uint32_t parent_pid,
             m.n_caps++;
             break;
         }
+        case SIDECAR_TAG_CAP_IRQ: {
+            /* Record layout (matches manifest.rs): name_len u16,
+             * name[nlen], vector u32 (LE), perms u16 (LE)
+             * = nlen + 8 bytes. */
+            if (rlen < 2) return CAP_EINVAL;
+            uint16_t nlen = *(const uint16_t*)(rp + 0);
+            if ((int)rlen < (int)nlen + 8) return CAP_EINVAL;
+            if (m.n_caps >= SIDECAR_MANIFEST_MAX_CAPS) return CAP_ERANGE;
+            struct SidecarCap* sc = &m.caps[m.n_caps];
+            sc->kind = SIDECAR_TAG_CAP_IRQ;
+            sc->name_len = nlen;
+            for (uint16_t j = 0; j < nlen && j < SIDECAR_MANIFEST_MAX_NAME - 1; j++)
+                sc->name[j] = (char)rp[2 + j];
+            sc->name[nlen < SIDECAR_MANIFEST_MAX_NAME ? nlen : SIDECAR_MANIFEST_MAX_NAME - 1] = '\0';
+            sc->vector = (uint32_t)(rp[2 + nlen] | (rp[3 + nlen] << 8) |
+                                    (rp[4 + nlen] << 16) | (rp[5 + nlen] << 24));
+            sc->rights = (uint8_t)(rp[6 + nlen] | (rp[7 + nlen] << 8));
+            m.n_caps++;
+            break;
+        }
         case SIDECAR_TAG_BOOTSTRAP:
         case SIDECAR_TAG_FLAGS:
             break;  /* informational */
@@ -3327,6 +3347,34 @@ int cap_create_sidecar(uint32_t parent_pid,
         }
     }
 
+    /* Mint CAP_IRQ records: a single-use bind cap for a device vector.
+     * The cap word carries the vector in OBJ and the manifest's perms
+     * (CAP_PERM_BIND) in PERM — Driver SDK ABI v0.1 s4.3. k_irq_bind
+     * validates the word and stamps it REVOKED at bind time, so the
+     * sidecar gets exactly one chance to bind. Unmintable records
+     * (bad slot, bad vector) are skipped — non-fatal. */
+    for (uint8_t ci = 0; ci < m.n_caps; ci++) {
+        struct SidecarCap* sc = &m.caps[ci];
+        if (sc->kind != SIDECAR_TAG_CAP_IRQ) continue;
+        if (sc->vector >= CAP_IRQ_VECTORS) continue;
+        int iti = cap_table_index(pd->pid);
+        if (iti < 0) continue;
+        struct CapTable* it = &cap_tables[iti];
+        uint16_t irq_idx = CAP_NONE;
+        cap_lock(&it->lock);
+        if (cap_slot_pop(iti, &irq_idx)) {
+            cap_unlock(&it->lock);
+            continue;   /* table full */
+        }
+        it->slots[irq_idx].word = cap_word_make(CAP_TYPE_IRQ, sc->vector,
+                                                sc->rights, 0, 1);
+        cap_unlock(&it->lock);
+        kernel_serial_printf(
+            "[SIDECAR] PID %u '%s': irq cap '%s' vector %u slot %u\n",
+            pd->pid, pd->name, sc->name, (unsigned)sc->vector,
+            (unsigned)irq_idx);
+    }
+
     /* Register the sidecar's identity so later manifests can wire
      * channels to it by name. */
     if (m.name_len > 0) {
@@ -3456,6 +3504,28 @@ int cap_create_sidecar(uint32_t parent_pid,
                                         CAP_TYPE_MEM, (uint8_t)sc->rights,
                                         sc->phys_base, sc->size_bytes);
             if (no == 0) break;   /* BIB buffer full: stop appending */
+            bib_off = no;
+            bib_n_caps++;
+        } else if (sc->kind == SIDECAR_TAG_CAP_IRQ) {
+            /* Find the minted slot by scanning for an IRQ cap with the
+             * same vector; base carries the vector (informational). */
+            uint16_t found_slot = CAP_NONE;
+            for (int si = 0; si < CAP_TABLE_ENTRIES; si++) {
+                uint64_t w = cap_tables[cti].slots[si].word;
+                if (!cap_word_valid(w)) continue;
+                if (((w >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK) != CAP_TYPE_IRQ)
+                    continue;
+                if (((w >> CAP_OBJ_SHIFT) & CAP_OBJ_MASK) == sc->vector) {
+                    found_slot = (uint16_t)si;
+                    break;
+                }
+            }
+            if (found_slot == CAP_NONE) continue;   /* not minted: skip */
+            uint32_t no = bib_put_entry(bib_buf, bib_off, sizeof(bib_buf),
+                                        sc->name, nlen, found_slot,
+                                        CAP_TYPE_IRQ, (uint8_t)sc->rights,
+                                        sc->vector, 0);
+            if (no == 0) break;
             bib_off = no;
             bib_n_caps++;
         } else if (sc->kind == SIDECAR_TAG_CAP_CHAN && sc->wired) {

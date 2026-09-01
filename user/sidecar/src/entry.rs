@@ -46,6 +46,25 @@ static mut NETTEST_RESULT: [u8; 512] = [0u8; 512];
 #[used]
 static mut NETTEST_RESULT_LEN: u32 = 0;
 
+/// irqtest result buffer (Driver SDK: edge-to-channel acceptance demo).
+#[used]
+static mut IRQTEST_RESULT: [u8; 512] = [0u8; 512];
+#[used]
+static mut IRQTEST_RESULT_LEN: u32 = 0;
+
+/// Write a string into the irqtest result buffer (called from lib crate
+/// irqtest).  # Safety: single-threaded, only irqtest writes.
+#[no_mangle]
+pub unsafe extern "C" fn irqtest_push_result(data: *const u8, len: u32) {
+    let n = (len as usize).min(512 - IRQTEST_RESULT_LEN as usize);
+    core::ptr::copy_nonoverlapping(
+        data,
+        IRQTEST_RESULT.as_mut_ptr().add(IRQTEST_RESULT_LEN as usize),
+        n,
+    );
+    IRQTEST_RESULT_LEN += n as u32;
+}
+
 /// Write a string into the nettest result buffer (called from lib crate
 /// nettest).  # Safety: single-threaded, only nettest writes.
 #[no_mangle]
@@ -472,6 +491,11 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                     if len > 0 {
                         serial_write_raw(&NETTEST_RESULT[..len]);
                         NETTEST_RESULT_LEN = 0;
+                    }
+                    let ilen = IRQTEST_RESULT_LEN as usize;
+                    if ilen > 0 {
+                        serial_write_raw(&IRQTEST_RESULT[..ilen]);
+                        IRQTEST_RESULT_LEN = 0;
                     }
                 }
             }

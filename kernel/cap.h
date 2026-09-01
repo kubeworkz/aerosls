@@ -855,6 +855,7 @@ void cap_unlock(struct CapSpinlock* l);
 #define SIDECAR_TAG_LIMITS       0x0005
 #define SIDECAR_TAG_CAP_MEM      0x0006
 #define SIDECAR_TAG_CAP_CHAN     0x0007
+#define SIDECAR_TAG_CAP_IRQ      0x000B
 #define SIDECAR_TAG_BOOTSTRAP    0x0008
 #define SIDECAR_TAG_FLAGS        0x0009
 #define SIDECAR_TAG_NAME         0x000A
@@ -886,12 +887,13 @@ struct SidecarManifestRecord {
 struct SidecarCap {
     char     name[SIDECAR_MANIFEST_MAX_NAME];
     uint16_t name_len;          /* wire: u16 */
-    uint8_t  kind;              /* SIDECAR_TAG_CAP_MEM or SIDECAR_TAG_CAP_CHAN */
+    uint8_t  kind;              /* SIDECAR_TAG_CAP_MEM / CAP_CHAN / CAP_IRQ */
     uint8_t  rights;            /* CAP_PERM_R|W bits */
     uint8_t  flags;             /* CHAN: per-cap flags; MEM: unused */
     uint64_t phys_base;         /* MEM: physical base address */
     uint64_t size_bytes;        /* MEM: size in BYTES (not pages) */
     char     peer_name[SIDECAR_MANIFEST_MAX_NAME]; /* CHAN: peer name */
+    uint32_t vector;           /* IRQ: device vector to bind (0..255) */
     uint16_t peer_name_len;     /* CHAN: length of peer_name (wire: u16) */
     uint8_t  wired;             /* CHAN: channel created (child end minted) */
     uint16_t wired_rd;          /* CHAN: child's CHAN_R slot in its table */

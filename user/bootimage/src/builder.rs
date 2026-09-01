@@ -298,7 +298,17 @@ fn build_posix_manifest(spec: &BootImageSpec, layout: &BootLayout, blob_offset: 
                 flags: 0,
             },
         }),
-        None,
+        // Driver SDK ABI v0.1 s4.3 — single-use bind cap for the LAPIC
+        // timer vector (32). Spawned before irqtest runs, so the sidecar
+        // can bind it and prove edge-to-channel delivery on real hardware.
+        Some(ManifestCap {
+            name: "irq.timer.0",
+            rights: 0x1, // CAP_PERM_BIND
+            kind: CapKind::Irq {
+                vector: 32,
+                perms: 0x1, // CAP_PERM_BIND
+            },
+        }),
         None,
         None,
         None,
@@ -339,7 +349,7 @@ fn build_posix_manifest(spec: &BootImageSpec, layout: &BootLayout, blob_offset: 
             chan_queue_depth: 16,
         }),
         caps,
-        n_caps: 4,
+        n_caps: 5,
         bootstrap: Some(Bootstrap {
             console: Some("console"),
             debug: None,

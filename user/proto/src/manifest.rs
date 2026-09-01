@@ -61,6 +61,7 @@ pub const TAG_CPU: u16 = 0x0004;
 pub const TAG_LIMITS: u16 = 0x0005;
 pub const TAG_CAP_MEM: u16 = 0x0006;
 pub const TAG_CAP_CHAN: u16 = 0x0007;
+pub const TAG_CAP_IRQ: u16 = 0x000B;
 pub const TAG_BOOTSTRAP: u16 = 0x0008;
 pub const TAG_FLAGS: u16 = 0x0009;
 /// Sidecar identity: the instance name other manifests' `CAP_CHAN` peer
@@ -172,6 +173,12 @@ pub enum CapKind<'a> {
     Mem { base: u64, size: u64 },
     /// `CAP_CHAN`: the wired peer's name (opaque to the kernel).
     Chan { peer: Option<&'a str>, flags: u8 },
+    /// `CAP_IRQ` (Driver SDK ABI v0.1 s4.3): a single-use bind cap
+    /// for a device vector. `vector` is the IDT vector the kernel
+    /// routes through `cap_irq_notify`; `perms` carries the bind
+    /// right (`CAP_PERM_BIND`). Minted by `cap_create_sidecar`;
+    /// `k_irq_bind` stamps it REVOKED at bind time.
+    Irq { vector: u32, perms: u16 },
 }
 
 /// The `BOOTSTRAP` record — debug plumbing.
@@ -381,6 +388,20 @@ pub fn parse_manifest(blob: &[u8]) -> Result<Manifest<'_>, ManifestErr> {
                     },
                 })?;
             }
+            TAG_CAP_IRQ => {
+                let (name, rest) = split_name(p).ok_or(ManifestErr::BadRecordLen)?;
+                if rest.len() != 6 {
+                    return Err(ManifestErr::BadRecordLen);
+                }
+                m.push_cap(ManifestCap {
+                    name,
+                    rights: le_u16(rest, 4),
+                    kind: CapKind::Irq {
+                        vector: le_u32(rest, 0),
+                        perms: le_u16(rest, 4),
+                    },
+                })?;
+            }
             TAG_BOOTSTRAP => {
                 let (console, rest) = split_name(p).ok_or(ManifestErr::BadRecordLen)?;
                 let (debug, rest) = split_name(rest).ok_or(ManifestErr::BadRecordLen)?;
@@ -514,6 +535,13 @@ pub fn build_manifest(m: &Manifest<'_>) -> alloc::vec::Vec<u8> {
                 p.push(c.rights as u8);
                 p.push(flags);
                 recs.push((TAG_CAP_CHAN, p));
+            }
+            CapKind::Irq { vector, perms } => {
+                let mut p = alloc::vec::Vec::new();
+                p.extend_from_slice(&enc_name(c.name));
+                p.extend_from_slice(&vector.to_le_bytes());
+                p.extend_from_slice(&perms.to_le_bytes());
+                recs.push((TAG_CAP_IRQ, p));
             }
         }
     }
@@ -771,6 +799,34 @@ mod tests {
         want.push(0x3); // rights
         want.push(0); // flags
         assert_eq!(&blob[28..], &want[..]);
+    }
+
+    /// Same golden pin for CAP_IRQ (Driver SDK ABI v0.1 s4.3):
+    /// `name_len u16, name, vector u32, perms u16`.
+    #[test]
+    fn cap_irq_wire_bytes_golden() {
+        let m = caps_only(None, vec![ManifestCap {
+            name: "irq.timer.0",
+            rights: 0x1,
+            kind: CapKind::Irq { vector: 32, perms: 0x1 },
+        }]);
+        let blob = build_manifest(&m);
+        assert_eq!(&blob[24..26], &TAG_CAP_IRQ.to_le_bytes());
+        assert_eq!(&blob[26..28], &19u16.to_le_bytes()); // 2 + 11 + 4 + 2
+        let mut want = Vec::new();
+        want.extend_from_slice(&11u16.to_le_bytes()); // name_len
+        want.extend_from_slice(b"irq.timer.0");
+        want.extend_from_slice(&32u32.to_le_bytes()); // vector
+        want.extend_from_slice(&1u16.to_le_bytes()); // perms
+        assert_eq!(&blob[28..], &want[..]);
+
+        // Round-trip: parse the packed blob and check the irq cap.
+        let parsed = parse_manifest(&blob).unwrap();
+        let irq = parsed.caps().iter().flatten().find(|c| c.name == "irq.timer.0");
+        assert_eq!(
+            irq.map(|c| c.kind),
+            Some(CapKind::Irq { vector: 32, perms: 0x1 })
+        );
     }
 
     /// Locate the payload of the first record with the given tag in a
