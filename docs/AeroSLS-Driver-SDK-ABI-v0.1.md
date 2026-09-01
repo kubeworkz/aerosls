@@ -113,6 +113,19 @@ rax=309, rdi=dev_cap_slot:u16, rsi=vaddr_hint:u64, rdx=flags:u32 → rax=user_va
 ```
 Flags: bit0 `DEV_MMAP_WC` (write-combining, for framebuffers), bit1 `DEV_MMAP_UNCACHED`. The kernel validates the cap, allocates a window in the caller's address space (hint honored if free), maps the physical range, and marks the cap mapped (a second call returns the same vaddr). Unmapping happens on cap revoke or process exit.
 
+> **Implemented (2026-09-01):** the request is a packed struct
+> `SLSDevMmapRequest` (slot u16, flags u32, vaddr_hint u64, out_vaddr u64)
+> passed through the repo's single-opaque-arg syscall convention; the
+> syscall returns the positive CAP_ERR_* code and fills `out_vaddr`.
+> Window allocation scans upward from 1 MiB when the hint is zero/busy.
+> The DEV cap is object-backed (`CAP_OBJ_KIND_DEV`): the OBJ field names a
+> kernel-allocated region object (phys base + npages), so revoke/teardown
+> reuse the MEM unmap path verbatim. Cache hints travel as `CAP_PERM_DEV_WC`
+> / `CAP_PERM_DEV_UC` bits in the map-perms word and the x86 arch hook
+> turns them into PTE PWT/PCD. `k_cap_info` reports DEV regions like MEM.
+> Kernel side: kernel/cap.h + kernel/chan.c + kernel/syscall_dispatch.c;
+> shims in kabi.rs `k_dev_mmap`; host test `tests/dev_mmap_host_test.c`.
+
 ### 4.2 `SYS_IO_IN = 307` / `SYS_IO_OUT = 308` — port I/O
 
 ```

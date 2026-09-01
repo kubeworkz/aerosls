@@ -55,6 +55,11 @@
 #define CAP_PERM_W     0x02
 #define CAP_PERM_X     0x04
 #define CAP_PERM_MAP   0x08
+/* Cache-hint bits ride the map-perms word into cap_arch_map_page for DEV
+ * mappings only (never stored in a cap word; the arch hook translates
+ * them to PTE PWT/PCD). */
+#define CAP_PERM_DEV_WC   0x10
+#define CAP_PERM_DEV_UC   0x20
 #define CAP_PERM_SEND  0x01
 #define CAP_PERM_RECV  0x02
 
@@ -240,6 +245,7 @@ struct CapObject {
 
 #define CAP_OBJ_KIND_MEM   1
 #define CAP_OBJ_KIND_CHAN  2
+#define CAP_OBJ_KIND_DEV   3   /* device MMIO region (CAP_TYPE_DEV); not arena-backed */
 
 struct CapSlot {
     uint64_t word;            /* the capability word; type NONE == free */
@@ -302,6 +308,9 @@ extern struct CapChannel cap_channels[CAP_CHAN_MAX];    /* defined in cap.c */
  * trust, and the CPU supports MPK. See docs/AeroSLS-Polyglot-Nexus-
  * Phase3-Design-v0.1.md §5 for the full rationale. ────────────────── */
 #define CAP_TYPE_TRAMP  4
+#define CAP_TYPE_DEV    5   /* driver SDK ABI v0.1 §3.1: device MMIO region
+                             * (OBJ = CapObject region id, OFF = byte offset,
+                             * LEN = 4 KiB pages, PERM = R/W) */
 #define CAP_TYPE_IO     6   /* driver SDK ABI v0.1 §3.2: I/O port range
                              * (OBJ = port base, LEN = port count, PERM = R/W) */
 
@@ -538,6 +547,24 @@ struct SLSIoOutRequest {
     uint32_t value;           /* the value to write */
 };
 
+/* Driver SDK ABI v0.1 §4.1 — map a CAP_TYPE_DEV cap into the caller's
+ * address space. The kernel validates the cap, allocates a window (hint
+ * honored if free, else a free window is found), maps the physical range
+ * with the cap's R/W perms, and records the mapping — a second call with
+ * the same cap returns the same vaddr. Unmapping happens on revoke /
+ * teardown (cap_table_unmap_object keys by obj id). flags:
+ * DEV_MMAP_WC (bit0, write-combining), DEV_MMAP_UNCACHED (bit1). */
+#define DEV_MMAP_WC        0x01
+#define DEV_MMAP_UNCACHED  0x02
+
+struct SLSDevMmapRequest {
+    uint16_t slot;            /* caller's CAP_TYPE_DEV slot */
+    uint8_t  _pad[2];
+    uint32_t flags;           /* DEV_MMAP_WC | DEV_MMAP_UNCACHED */
+    uint64_t vaddr_hint;      /* 0 = kernel picks a window */
+    uint64_t out_vaddr;       /* [out] the mapped window (CAP_NONE on error) */
+};
+
 /* k_cap_info's out block (kabi CapInfoOut). */
 struct SLSCapInfoOut {
     uint16_t ty;              /* CAP_TYPE_MEM | CAP_TYPE_CHAN_R | ... */
@@ -685,6 +712,7 @@ uint64_t sys_sls_chan_close(struct SLSChanCloseRequest* req);
 uint64_t sys_sls_cap_info(struct SLSCapInfoRequest* req);
 uint64_t sys_sls_io_in(struct SLSIoInRequest* req);
 uint64_t sys_sls_io_out(struct SLSIoOutRequest* req);
+uint64_t sys_sls_dev_mmap(struct SLSDevMmapRequest* req);
 
 /* Driver SDK ABI v0.1 §4.2 — kabi-level port I/O (called by the syscall
  * wrappers in chan.c; k_cap_info-style: resolve the caller's slot, check
@@ -693,6 +721,8 @@ int  k_io_in(uint32_t pid, uint16_t slot, uint16_t index, uint8_t size,
              uint32_t* out_val);
 int  k_io_out(uint32_t pid, uint16_t slot, uint16_t index, uint8_t size,
               uint32_t val);
+int  k_dev_mmap(uint32_t pid, uint16_t slot, uint32_t flags,
+                uint64_t vaddr_hint, uint64_t* out_vaddr);
 
 /* Port I/O hooks — weak in cap.c (no-op), strong in arch/x86/user_paging.c
  * (real in/out instructions); host tests override with a fake port map. */
@@ -765,6 +795,7 @@ void cap_unlock(struct CapSpinlock* l);
  * (307/308; 306 is TRAMPOLINE_CALL, 310 is CREATE_SIDECAR). */
 #define SYS_SLS_IO_IN        307
 #define SYS_SLS_IO_OUT       308
+#define SYS_SLS_DEV_MMAP     309
 
 /* Manifest record tags */
 #define SIDECAR_MANIFEST_MAGIC         "AERSLSM1"

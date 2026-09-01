@@ -1753,6 +1753,9 @@ static uint32_t cap_object_free_resources(uint32_t obj_id) {
         struct CapChannel* ch = &cap_channels[o->chan_id];
         ch->active = 0;
     }
+    /* CAP_OBJ_KIND_DEV regions are not arena-backed (device MMIO), so
+     * there is nothing to free here; the object's PTEs were already torn
+     * down by cap_table_unmap_object (keyed by obj id) in the same call. */
     return freed;
 }
 

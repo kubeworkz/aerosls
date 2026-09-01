@@ -9,6 +9,8 @@
 #define USER_PTE_USER     (1ULL << 2)   // hardware U/S bit — allows Ring-3 access
 #define USER_PTE_ACCESSED (1ULL << 5)
 #define USER_PTE_DIRTY    (1ULL << 6)
+#define USER_PTE_PWT      (1ULL << 3)  // write-through (device WC)
+#define USER_PTE_PCD      (1ULL << 4)  // cache-disabled (device uncached)
 // NX bit: bit 63. We define EXEC as absence of NX.
 #define USER_PTE_EXEC     0ULL          // no NX bit set = executable
 #define USER_PTE_NOEXEC   (1ULL << 63)  // NX bit set = non-executable

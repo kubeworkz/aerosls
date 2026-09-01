@@ -440,7 +440,9 @@ int k_cap_info(uint32_t pid, uint16_t handle, struct SLSCapInfoOut* out) {
     uint32_t obj_id = (uint32_t)((w >> CAP_OBJ_SHIFT) & CAP_OBJ_MASK);
     if (obj_id < CAP_OBJECT_MAX) {
         struct CapObject* o = &cap_objects[obj_id];
-        if (o->active && out->ty == CAP_TYPE_MEM) {
+        if (o->active && (out->ty == CAP_TYPE_MEM || out->ty == CAP_TYPE_DEV)) {
+            /* MEM: object base/len. DEV: the region's physical base and
+             * size — drivers introspect their MMIO region before mapping. */
             out->base = o->phys_base;
             out->len = (uint64_t)o->npages * 4096u;
         }
@@ -491,6 +493,121 @@ int k_io_out(uint32_t pid, uint16_t slot, uint16_t index, uint8_t size,
     int r = io_resolve(pid, slot, CAP_PERM_W, index, size, &port);
     if (r != CAP_ERR_OK) return r;
     cap_io_write(port, size, val);
+    return CAP_ERR_OK;
+}
+
+/* ─── k_dev_mmap (driver SDK ABI v0.1 §4.1) ────────────────────────────────
+ * Map a CAP_TYPE_DEV cap (an object-backed MMIO region) into the caller's
+ * address space. Window logic mirrors cap_map(): hint honored when
+ * 4-KiB-aligned, free of other mappings, and inside the user half; a
+ * zero/busy hint picks the first free window scanned upward from 1 MiB.
+ * The same cap maps once: an existing map record for the object id
+ * returns the original vaddr. Caching bits (WC/uncached) ride the cap
+ * perms word into cap_arch_map_page, which the strong arch override
+ * translates to PTE PWT/PCD. */
+static int dev_mmaps_overlap(const struct CapTable* t, uint64_t vaddr,
+                             uint32_t npages) {
+    uint64_t lo = vaddr;
+    uint64_t hi = vaddr + (uint64_t)npages * 4096u;
+    for (int i = 0; i < CAP_MAP_MAX; i++) {
+        const struct CapMap* m = &t->maps[i];
+        if (!m->active) continue;
+        uint64_t mlo = m->vaddr;
+        uint64_t mhi = m->vaddr + (uint64_t)m->npages * 4096u;
+        if (lo < mhi && mlo < hi) return 1;
+    }
+    return 0;
+}
+
+#define DEV_MMAP_USER_LIMIT  0x800000000000ULL   /* 47-bit user half */
+
+int k_dev_mmap(uint32_t pid, uint16_t slot, uint32_t flags,
+               uint64_t vaddr_hint, uint64_t* out_vaddr) {
+    if (!out_vaddr) return CAP_ERR_PROTO;
+    *out_vaddr = CAP_NONE;
+    if (flags & ~(DEV_MMAP_WC | DEV_MMAP_UNCACHED)) return CAP_ERR_RANGE;
+
+    int ti = chan_table_for_pid(pid);
+    if (ti < 0) return CAP_ERR_NOTFOUND;
+    if (slot >= CAP_TABLE_ENTRIES) return CAP_ERR_RANGE;
+    struct CapTable* t = &cap_tables[ti];
+    uint64_t w = t->slots[slot].word;
+    if (!chan_word_valid(w)) return CAP_ERR_REVOKED;
+    if (((w >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK) != CAP_TYPE_DEV)
+        return CAP_ERR_TYPE;
+    uint32_t perms = (uint32_t)((w >> CAP_PERM_SHIFT) & CAP_PERM_MASK);
+    if (!(perms & (CAP_PERM_R | CAP_PERM_W))) return CAP_ERR_RIGHTS;
+
+    uint32_t obj_id = (uint32_t)((w >> CAP_OBJ_SHIFT) & CAP_OBJ_MASK);
+    if (obj_id >= CAP_OBJECT_MAX) return CAP_ERR_TYPE;
+    struct CapObject* obj = &cap_objects[obj_id];
+    if (!obj->active || obj->kind != CAP_OBJ_KIND_DEV) return CAP_ERR_TYPE;
+
+    uint32_t off = (uint32_t)((w >> CAP_OFF_SHIFT) & CAP_OFF_MASK);
+    uint32_t len = (uint32_t)((w >> CAP_LEN_SHIFT) & CAP_LEN_MASK);
+    if (len == 0) return CAP_ERR_RANGE;
+    if ((uint64_t)off + (uint64_t)len * 4096u > (uint64_t)obj->npages * 4096u)
+        return CAP_ERR_RANGE;   /* cap window exceeds the region */
+
+    /* Already mapped: the same object id has one live mapping. */
+    for (int i = 0; i < CAP_MAP_MAX; i++) {
+        const struct CapMap* m = &t->maps[i];
+        if (m->active && m->obj_id == obj_id) {
+            *out_vaddr = m->vaddr;
+            return CAP_ERR_OK;
+        }
+    }
+
+    /* Pick the window: hint honored when usable, else scan from 1 MiB. */
+    uint64_t vaddr = 0;
+    if ((vaddr_hint & 0xFFFULL) == 0 && vaddr_hint != 0 &&
+        vaddr_hint + (uint64_t)len * 4096u <= DEV_MMAP_USER_LIMIT &&
+        !dev_mmaps_overlap(t, vaddr_hint, len)) {
+        vaddr = vaddr_hint;
+    } else {
+        for (vaddr = 0x100000ULL; vaddr < DEV_MMAP_USER_LIMIT;
+             vaddr += 0x1000ULL) {
+            if (dev_mmaps_overlap(t, vaddr, len)) continue;
+            if (vaddr + (uint64_t)len * 4096u > DEV_MMAP_USER_LIMIT) break;
+            break;
+        }
+    }
+
+    uint64_t cr3 = cap_proc_cr3(pid);
+    if (cr3 == 0) return CAP_ERR_STATE;   /* kernel context has no user PT */
+
+    /* Map perms: cap R/W become PTE R/W; device memory is never
+     * executable. Cache hints ride bits 4-5 of the perms word so the
+     * strong arch hook can set PWT/PCD. */
+    uint32_t map_perms = perms & (CAP_PERM_R | CAP_PERM_W);
+    if (flags & DEV_MMAP_WC)       map_perms |= CAP_PERM_DEV_WC;
+    if (flags & DEV_MMAP_UNCACHED) map_perms |= CAP_PERM_DEV_UC;
+
+    uint64_t phys = obj->phys_base + off;
+    for (uint32_t i = 0; i < len; i++) {
+        int r = cap_arch_map_page(cr3, vaddr + (uint64_t)i * 4096u,
+                                  phys + (uint64_t)i * 4096u, map_perms);
+        if (r < 0) {
+            for (uint32_t j = 0; j < i; j++)
+                cap_arch_unmap_page(cr3, vaddr + (uint64_t)j * 4096u);
+            cap_arch_tlb_flush();
+            return CAP_ERR_NOMEM;
+        }
+    }
+    cap_arch_tlb_flush();
+
+    int rec = -1;
+    for (int i = 0; i < CAP_MAP_MAX; i++) {
+        if (!t->maps[i].active) { rec = i; break; }
+    }
+    if (rec < 0) return CAP_ERR_SPACE;   /* no map records left */
+    t->maps[rec].obj_id = obj_id;
+    t->maps[rec].cap_slot = slot;
+    t->maps[rec].npages = (uint16_t)len;
+    t->maps[rec].vaddr = vaddr;
+    t->maps[rec].active = 1;
+
+    *out_vaddr = vaddr;
     return CAP_ERR_OK;
 }
 
@@ -549,4 +666,13 @@ uint64_t sys_sls_io_out(struct SLSIoOutRequest* req) {
     if (!req) return CAP_ERR_PROTO;
     return (uint64_t)k_io_out(cap_current_pid(), req->slot, req->index,
                               req->size, req->value);
+}
+
+uint64_t sys_sls_dev_mmap(struct SLSDevMmapRequest* req) {
+    if (!req) return CAP_ERR_PROTO;
+    uint64_t vaddr = CAP_NONE;
+    uint64_t r = (uint64_t)k_dev_mmap(cap_current_pid(), req->slot, req->flags,
+                                      req->vaddr_hint, &vaddr);
+    req->out_vaddr = vaddr;
+    return r;
 }

@@ -402,6 +402,8 @@ int cap_arch_map_page(uint64_t pml4_phys, uint64_t vaddr, uint64_t paddr,
     uint64_t flags = USER_PTE_PRESENT | USER_PTE_USER;
     if (cap_perms & 0x02) flags |= USER_PTE_WRITE;      /* CAP_PERM_W */
     if (!(cap_perms & 0x04)) flags |= USER_PTE_NOEXEC;  /* CAP_PERM_X */
+    if (cap_perms & CAP_PERM_DEV_UC) flags |= USER_PTE_PCD;  /* uncached */
+    if (cap_perms & CAP_PERM_DEV_WC) flags |= USER_PTE_PWT;  /* write-thru */
     user_map_page((uint64_t*)(uintptr_t)pml4_phys, vaddr, paddr, flags);
     return 0;
 }

@@ -231,6 +231,7 @@ mod abi {
     const SYS_CAP_INFO: u64 = 315;
     const SYS_IO_IN: u64 = 307;
     const SYS_IO_OUT: u64 = 308;
+    const SYS_DEV_MMAP: u64 = 309;
     const SYS_YIELD: u64 = 300;
 
     /// The raw syscall instruction (same convention as
@@ -389,6 +390,18 @@ mod abi {
         size: u8,
         _pad: [u8; 3],
         value: u32,
+    }
+
+    /// Driver SDK ABI v0.1 §4.1 — map a CAP_TYPE_DEV cap (kernel/cap.h
+    /// SLSDevMmapRequest). vaddr_hint 0 = kernel picks; flags bit0 WC,
+    /// bit1 uncached.
+    #[repr(C)]
+    struct DevMmapReq {
+        slot: u16,
+        _pad: [u8; 2],
+        flags: u32,
+        vaddr_hint: u64,
+        out_vaddr: u64,
     }
 
     /// Kernel SLSCreateSidecarRequest (kernel/cap.h): the kernel fills
@@ -648,6 +661,32 @@ mod abi {
             value: val,
         };
         unsafe { sls_syscall(SYS_IO_OUT, &mut req as *mut IoOutReq as u64) as i32 }
+    }
+
+    /// Driver SDK ABI v0.1 §4.1 — map a CAP_TYPE_DEV cap. Returns the
+    /// CAP_ERR_* code; on CAP_ERR_OK, `out_vaddr` receives the window
+    /// (a second call with the same cap returns the same address).
+    #[no_mangle]
+    pub extern "C" fn k_dev_mmap(
+        handle: u32,
+        vaddr_hint: u64,
+        flags: u32,
+        out_vaddr: *mut u64,
+    ) -> i32 {
+        let mut req = DevMmapReq {
+            slot: handle as u16,
+            _pad: [0; 2],
+            flags,
+            vaddr_hint,
+            out_vaddr: CAP_NONE as u64,
+        };
+        let rc = unsafe { sls_syscall(SYS_DEV_MMAP, &mut req as *mut DevMmapReq as u64) };
+        if rc == 0 && !out_vaddr.is_null() {
+            unsafe {
+                *out_vaddr = core::ptr::read_volatile(&req.out_vaddr);
+            }
+        }
+        rc as i32
     }
 
     /// The real kernel ABI. Only constructible/usable on the sidecar target.
