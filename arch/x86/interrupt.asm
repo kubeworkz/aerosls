@@ -11,6 +11,7 @@ extern handle_ring3_fault
 extern handle_device_not_available_fault
 extern timer_irq_handler
 extern schedule_ring3
+extern cap_irq_notify
 
 ; ─── Macro: Ring-3 fault stub (exceptions that push an error code) ─────────────
 ; Saves caller-saved regs, passes (error_code, saved_cs) to handle_ring3_fault.
@@ -220,3 +221,48 @@ isr7_stub:
     pop  rax
     pop  rbp
     iretq
+
+
+; --- device-vector stubs, one per vector 33..255 (Driver SDK ABI v0.1
+; section 4.3/4.4). Each stub saves the caller-saved registers, calls
+; cap_irq_notify(vector) -- the cap.c ISR path: registry resolve, enqueue
+; one-byte notification on the bound driver's channel, wake, cap_irq_eoi
+; -- and iretq. No scheduling here: a woken driver becomes runnable at the
+; next timer tick (isr32_stub / schedule_ring3). Ring-3 and ring-0 sources
+; both work; the stub runs on the kernel stack via TSS.
+%assign IRQ_VEC 33
+%rep 224
+isr_irq_%+IRQ_VEC:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    mov  edi, IRQ_VEC
+    call cap_irq_notify
+    pop  r11
+    pop  r10
+    pop  r9
+    pop  r8
+    pop  rdi
+    pop  rsi
+    pop  rdx
+    pop  rcx
+    pop  rax
+    iretq
+%assign IRQ_VEC IRQ_VEC+1
+%endrep
+
+; Stub address table: entry [0] = vector 33 ... [223] = vector 255.
+; arch/x86/device_irq.c installs them via set_idt_gate(33 + i, ...).
+global irq_stub_table
+irq_stub_table:
+%assign IRQ_VEC 33
+%rep 224
+    dq isr_irq_%+IRQ_VEC
+%assign IRQ_VEC IRQ_VEC+1
+%endrep

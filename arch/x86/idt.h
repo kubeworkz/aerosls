@@ -21,5 +21,6 @@ struct IDTPointer {
 } __attribute__((packed));
 
 void init_idt(void);
+void set_idt_gate(uint8_t vector, uint64_t isr_address, uint8_t attributes);
 
 #endif

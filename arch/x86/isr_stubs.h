@@ -24,5 +24,10 @@ extern void isr7_stub(void);    /* Device Not Available (#NM, Exception 7) —
 extern void isr11_stub(void);   /* Segment Not Present (#NP, Exc 11)   */
 extern void isr12_stub(void);   /* Stack-Segment Fault (#SS, Exc 12)   */
 extern void isr13_stub(void);   /* General Protection Fault (#GP, Exc 13) */
+extern void (*irq_stub_table[224])(void); /* vectors 33..255, index = vector-33 */
+
+/* Install IDT gates for every device vector (33..255). Called from
+ * init_idt(); vectors 32 (timer) and below stay on their dedicated stubs. */
+void init_device_irqs(void);
 
 #endif /* ISR_STUBS_H */

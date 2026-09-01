@@ -51,6 +51,10 @@ void init_idt(void) {
     set_idt_gate(13, (uint64_t)isr13_stub, 0x8E);  // #GP General Protection
     set_idt_gate(14, (uint64_t)isr14_stub, 0x8E);  // #PF Page Fault
 
+    // Driver SDK: one generic gate per device vector (33..255), each
+    // delivering to cap_irq_notify (arch/x86/device_irq.c + interrupt.asm).
+    init_device_irqs();
+
     // Remap and silence the legacy 8259A PIC BEFORE enabling interrupts.
     // Without this, IRQ0 fires as INT 0x08 (#DF) → triple fault.
     pic_remap_and_mask();
