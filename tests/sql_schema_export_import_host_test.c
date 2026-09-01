@@ -88,6 +88,13 @@ void kernel_serial_print(const char* s) { (void)s; }
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 void kernel_serial_print_hex64(unsigned long long v) { (void)v; }
 
+/* loader_vfree / loader_vfree_partition: binary-store teardown hooks called
+ * by object_catalog.c. The loader's slot map is not linked here — no-op
+ * stubs keep the link clean (same as the other object_catalog host tests). */
+uint32_t loader_vfree(const char* name) { (void)name; return 0; }
+uint32_t loader_vfree_partition(uint32_t partition_id) { (void)partition_id; return 0; }
+
+
 // ─── tier_mgr.c stand-in ────────────────────────────────────────────────────
 void tier_notify_access(uint64_t object_id) { (void)object_id; }
 

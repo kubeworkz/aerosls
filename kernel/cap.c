@@ -1229,6 +1229,19 @@ int cap_send_msg(uint32_t pid, uint16_t ch_w_idx, const void* payload,
     }
     int dest = (pid == ch->end0_pid) ? 1 : 0;
 
+    /* Early full-queue check (before staging a payload): a full queue must
+     * report EAGAIN — the transport (k_chan_send) parks the sender — no
+     * matter what the payload pool looks like. Staging first would spend a
+     * pool slot and, when the pool happens to be exhausted (e.g. other
+     * full queues still hold their payloads), surface CAP_ENOSPC/NOMEM
+     * instead of the documented BLOCK. This peek is advisory (no lock);
+     * the authoritative check below, under the channel lock, still runs —
+     * a recv freeing a slot between the two just makes the send succeed. */
+    if (ch->qdepth[dest] >= CHAN_QUEUE_DEPTH) {
+        cap_unlock(&t->lock);
+        return CAP_EAGAIN;
+    }
+
     /* Validate every descriptor up front: each names a valid MEM cap in the
      * sender's table. The words are snapshotted here; the holder moves below
      * re-validate under the object lock (revoke race, same as cap_send). */

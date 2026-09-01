@@ -239,8 +239,18 @@ int main(void) {
     g_cur_pid = B;
     CHECK(cap_recv(B, frd1, 1, &cookie, &got) == CAP_EAGAIN,
           "Phase-1 recv is non-blocking: empty queue → EAGAIN (block ignored)");
-    CHECK(cap_send(B, frd1, CAP_NONE, 0) == CAP_EBADF,
-          "a CHAN_R is not a write end (-EBADF)");
+    /* The kernel allows replying on a CHAN_R end: a send on the receive
+     * handle routes to the peer's receive queue (that's how the ramdisk /
+     * network servers reply).  So this succeeds — no EBADF. */
+    CHECK(cap_send(B, frd1, CAP_NONE, 0xCAFE) == 0,
+          "a CHAN_R end accepts a send (server reply path)");
+    {
+        uint64_t ck = 0;
+        uint16_t cp = CAP_NONE;
+        g_cur_pid = A;
+        CHECK(cap_recv(A, rd1, 0, &ck, &cp) == 0 && cp == CAP_NONE,
+              "the CHAN_R send landed in the peer's receive queue");
+    }
     CHECK(cap_send(B, fwr1, first_free_slot(B), 0) == CAP_EINVAL,
           "sending a free slot as payload is refused");
 

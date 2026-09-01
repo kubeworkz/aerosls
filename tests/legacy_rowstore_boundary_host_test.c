@@ -105,6 +105,12 @@ volatile uint64_t kernel_tick_counter = 0;
 
 // ─── kernel_io.h stand-ins ──────────────────────────────────────────────────
 void kernel_serial_print(const char* s) { (void)s; }
+/* loader_vfree / loader_vfree_partition: binary-store teardown hooks called
+ * by object_catalog.c (Phase N). Not exercised by this host test — the
+ * loader's slot map is not linked here — so no-op stubs keep the link clean. */
+uint32_t loader_vfree(const char* name) { (void)name; return 0; }
+uint32_t loader_vfree_partition(uint32_t partition_id) { (void)partition_id; return 0; }
+
 void persist_databases(void) { /* Database Gap Analysis Gap 1 -- database.c now persists after every mutation; no-op here, same as every other persist_* stub in these tests */ }
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 void kernel_serial_print_hex64(unsigned long long v) { (void)v; }

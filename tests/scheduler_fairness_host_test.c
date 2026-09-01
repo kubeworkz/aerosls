@@ -52,6 +52,11 @@ int stream_relocate_partition(uint32_t partition_id, uint32_t dest_node_id) { (v
  * sees 0 sent against a non-zero expectation and aborts every migration.
  * FAITHFUL -- these tests register no streams, so the real function would
  * also return 0. */
+/* Phase 5 channel deadlines: process.c (included below) reads
+ * kernel_tick_counter (timer.h), whose real definition lives in the
+ * kernel's timer/tick source (not linked here) — provide the host stub. */
+volatile uint64_t kernel_tick_counter = 0;
+
 int stream_count_for_partition(uint32_t partition_id) { (void)partition_id; return 0; }
 
 int stream_migrate_send_partition(uint32_t partition_id, uint32_t dest_node_id) { (void)partition_id; (void)dest_node_id; return 0; }  /* Multi-Node Phase 7 addendum (real cross-node data movement) -- not exercised by this test, permissive "nothing to send" stub, sibling of the stream_relocate_partition() stub above (kernel/partition.c now calls whichever of the two applies depending on cluster_local_node_id()) */

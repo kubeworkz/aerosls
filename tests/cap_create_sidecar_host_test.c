@@ -134,6 +134,12 @@ char _kernel_image_end[1];
 void kernel_serial_print(const char* s) { (void)s; }
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 
+/* console_service.c polls serial input via serial_console_poll()
+ * (kernel_io.c, not linked here). Stub it to "nothing ready" so the
+ * service links; the test drives the console via console_service_tick()
+ * with an empty input buffer anyway. */
+int serial_console_poll(char* out, size_t cap) { (void)out; (void)cap; return 0; }
+
 /* kernel/timer.c is not linked; the Phase 5 deadline logic in chan.c reads
  * kernel_tick_counter directly (timer.h declares it). Test-owned so the
  * deadline tests can advance time deterministically. */
@@ -217,6 +223,23 @@ uint32_t proc_count = 0;
 
 /* Mirrors the real alloc_pid(): a fresh pid with no collision against
  * active procs (the parent is 100, so the first child is 101). */
+/* Real death path for this host test: the kernel's process_exit() calls
+ * cap_table_teardown() AND frees the process descriptor slot. cap_table_
+ * teardown() alone (cap.c) drops the cap table and registry entry but
+ * leaves proc_table[i].active set, so a test that spawns more than
+ * PROC_MAX sidecars would hit CAP_ETABLEFULL even after killing some.
+ * Mirror the full death path: teardown, then free the slot. */
+static void kill_sidecar(uint32_t pid) {
+    cap_table_teardown(pid);
+    for (int i = 0; i < PROC_MAX; i++) {
+        if (proc_table[i].active && proc_table[i].pid == pid) {
+            proc_table[i].active = 0;
+            if (proc_count > 0) proc_count--;
+            break;
+        }
+    }
+}
+
 uint32_t alloc_pid(void) {
     uint32_t best = 0;
     for (int i = 0; i < PROC_MAX; i++)
@@ -257,7 +280,7 @@ uint64_t frame_pool_reserve_contiguous(uint64_t nframes, uint64_t align_frames) 
     return (uint64_t)(uintptr_t)arena;
 }
 
-#define FRAME_POOL_MAX 64
+#define FRAME_POOL_MAX 256   /* 6 frames per spawn (2 image + 4 stack); the test spawns 14+ sidecars and never frees */
 static uint8_t* g_frame_pool[FRAME_POOL_MAX];
 static int g_frame_count = 0;
 
@@ -280,17 +303,28 @@ void* allocate_physical_ram_frame_for_partition(uint32_t partition_id) {
  * them to read the child's mapped memory. */
 static uint64_t* g_pml4 = 0;
 
+/* Page-table buffers MUST be 4 KiB-aligned: the kernel stores their
+ * addresses in PTE frame fields and reads them back with
+ * USER_PTE_FRAME_MASK, which zeroes the low 12 bits. calloc() only
+ * guarantees 16-byte alignment, so the unaligned low bits would leak into
+ * the entry as bogus flags and every walk would read from a shifted base
+ * (observed: pml4e flags like 0x2d7, BIB copy landing on garbage). Use the
+ * same manual 4 KiB alignment the frame pool below uses. */
 static uint64_t* pml4_child(uint64_t* parent, size_t idx) {
     if (parent[idx] & USER_PTE_PRESENT)
         return (uint64_t*)(uintptr_t)(parent[idx] & USER_PTE_FRAME_MASK);
-    uint64_t* child = calloc(512, sizeof(uint64_t));
+    uint64_t* child = (uint64_t*)host_align_4096(4096);
+    if (!child) return 0;
+    memset(child, 0, 4096);
     parent[idx] = (uint64_t)(uintptr_t)child
                 | USER_PTE_PRESENT | USER_PTE_WRITE | USER_PTE_USER;
     return child;
 }
 
 uint64_t user_clone_page_table(void) {
-    g_pml4 = calloc(512, sizeof(uint64_t));
+    g_pml4 = (uint64_t*)host_align_4096(4096);
+    if (!g_pml4) return 0;
+    memset(g_pml4, 0, 4096);
     return (uint64_t)(uintptr_t)g_pml4;
 }
 
@@ -422,6 +456,7 @@ static void blob_refinish(struct Blob* b) {
 #define MEM_BUDGET_BASE 0x20000000ULL     /* 512 MiB — above image end (see -no-pie note) */
 #define MEM_BUDGET_PAGES 64u
 #define MEM_DMA_BASE    0x20400000ULL
+
 #define MEM_DMA_PAGES   256u
 /* The CAP_MEM record carries size in BYTES (Phase 2 §2.2); the kernel
  * converts to whole pages when minting. */
@@ -443,6 +478,20 @@ static void blob_refinish(struct Blob* b) {
  * this test shares. IMAGE and BUDGET stay records 0 and 1 so the
  * error-path patchers (rec_off[0]/rec_off[1]) keep working. */
 static void blob_preamble(struct Blob* b) {
+    /* Every spawn gets its OWN budget region: cap_create_mem() treats
+     * physical regions as exclusive, so a manifest referencing a base that
+     * an earlier spawn already claimed would silently skip the mint (and
+     * the BIB would be short). A monotonic counter guarantees uniqueness
+     * no matter how many sidecars the test spawns. */
+    static uint64_t s_mem_off = 0;
+    uint64_t base_off = s_mem_off;
+    s_mem_off += 0x2000000ULL;   /* 32 MiB per spawn */
+    /* The 24-byte manifest header is written by blob_finish() — reserve
+     * its space up front so the TLV records (which the kernel parses from
+     * offset 24, matching user/proto/src/manifest.rs's wire format) start
+     * AFTER the header. Without this the first record's tag/len get
+     * overwritten by the header and the parse loop sees tag 0x0000. */
+    b->len = SIDECAR_MANIFEST_HEADER_LEN;
     blob_record(b, SIDECAR_TAG_IMAGE, 24);
     blob_u64(b, IMAGE_ENTRY);      /* entry offset */
     blob_u32(b, 0);                /* blob_offset (unused in this path) */
@@ -456,18 +505,22 @@ static void blob_preamble(struct Blob* b) {
 
     /* CAP_MEM "budget": name_len u16, name, phys_base u64, size u64
      * (bytes), rights u8 = nlen + 19 bytes — the Phase 2 §2.2 layout the
-     * kernel parser and user/proto/src/manifest.rs share. */
+     * kernel parser and user/proto/src/manifest.rs share. The base is
+     * shifted by `base_off` so every spawned sidecar references its OWN
+     * physical region: cap_create_mem() rejects overlapping MEM objects
+     * (physical regions are exclusive), so reusing the same bases for
+     * several spawns would silently skip the later mints. */
     blob_record(b, SIDECAR_TAG_CAP_MEM, 6 + 19);
     blob_u16(b, 6);
     blob_put(b, "budget", 6);
-    blob_u64(b, MEM_BUDGET_BASE);
+    blob_u64(b, MEM_BUDGET_BASE + base_off);
     blob_u64(b, MEM_BUDGET_BYTES);
     blob_put(b, "\x03", 1);
 
     blob_record(b, SIDECAR_TAG_CAP_MEM, 3 + 19);
     blob_u16(b, 3);
     blob_put(b, "dma", 3);
-    blob_u64(b, MEM_DMA_BASE);
+    blob_u64(b, MEM_DMA_BASE + base_off);
     blob_u64(b, MEM_DMA_BYTES);
     blob_put(b, "\x03", 1);
 }
@@ -750,9 +803,13 @@ int main(void) {
 
     uint64_t img_pte = leaf_pte(IMAGE_VBASE);
     uint64_t stk_pte = leaf_pte(STACK_BASE);
+    /* Flat sidecar images are mapped WRITE+EXEC by design — the crt0's
+     * .bss boot stack lives inside the image's pages, so the first `call`
+     * must be able to push onto them (see the RWX note at the
+     * user_map_page() call in cap_create_sidecar). */
     CHECK((img_pte & (USER_PTE_PRESENT | USER_PTE_USER | USER_PTE_WRITE | USER_PTE_NOEXEC))
-            == (USER_PTE_PRESENT | USER_PTE_USER),
-          "image pages: present+user, no write, executable");
+            == (USER_PTE_PRESENT | USER_PTE_USER | USER_PTE_WRITE),
+          "image pages: present+user+write, executable (RWX flat image)");
     CHECK((stk_pte & (USER_PTE_PRESENT | USER_PTE_USER | USER_PTE_WRITE | USER_PTE_NOEXEC))
             == (USER_PTE_PRESENT | USER_PTE_USER | USER_PTE_WRITE | USER_PTE_NOEXEC),
           "stack pages: present+user+write, non-executable");
@@ -1372,8 +1429,8 @@ int main(void) {
         CHECK(sys_sls_cap_info(&ireq) == CAP_ERR_OK &&
               ireq.out.ty == CAP_TYPE_MEM &&
               (ireq.out.rights & CAP_PERM_R) &&
-              ireq.out.base == MEM_BUDGET_BASE &&
-              ireq.out.len == MEM_BUDGET_BYTES,
+              ireq.out.base == cb9.caps[2].base &&
+              ireq.out.len == cb9.caps[2].len,
               "k_cap_info (315): budget MEM cap base/len/rights");
         memset(&ireq, 0, sizeof(ireq));
         ireq.handle = cb9.caps[4].slot;   /* console CHAN_R */
@@ -1420,7 +1477,7 @@ int main(void) {
               "consumer2's console channel re-derived from its BIB");
 
         /* The death path: cap_table_teardown (what process_exit/kill call). */
-        cap_table_teardown(106);
+        kill_sidecar(106);
         CHECK(sidecar_registry_resolve("drv.ramdisk.1") == 0,
               "the dead peer stops resolving (registry entry removed)");
         CHECK(sidecar_registry_count() == 5,
@@ -1512,7 +1569,7 @@ int main(void) {
 
         /* The death: teardown marks close_evt on the kernel end; the next
          * tick must notice and drop the kernel end entirely. */
-        cap_table_teardown(108);
+        kill_sidecar(108);
         CHECK(sidecar_registry_resolve("drv.child.0") == 0,
               "the console child stops resolving after teardown");
         console_service_tick();
@@ -1749,7 +1806,7 @@ int main(void) {
               g_wait_park_calls == 1 && g_wait_chans[0] == c4_chan,
               "12e: consumer4 parks on the console channel");
 
-        cap_table_teardown(peer4);
+        kill_sidecar(peer4);
         CHECK(g_wake_calls >= 1 && g_wake_chan == c4_chan,
               "12e: the peer's teardown fired cap_wake_chan with the channel id");
         CHECK(sidecar_registry_resolve("drv.ramdisk.3") == 0,
@@ -2126,6 +2183,14 @@ int main(void) {
      * messenger must carry data across the spawn. ──────────────────────── */
     {
         g_cur_pid = 100;
+        /* Only the parent matters for this final section: cap tables are a
+         * fixed pool (CAP_TABLE_MAX == PROC_MAX == 16, kernel table at
+         * index 0 leaves 15 process tables), so free every earlier sidecar
+         * or the syscall spawn below hits CAP_ETABLEFULL. */
+        for (int _k = 0; _k < PROC_MAX; _k++) {
+            if (proc_table[_k].active && proc_table[_k].pid != 100)
+                kill_sidecar(proc_table[_k].pid);
+        }
         struct Blob sysblob;
         build_peer_blob(&sysblob, image_kaddr, "drv.syscall.0");
 

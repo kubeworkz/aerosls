@@ -43,6 +43,26 @@ int simi_frame_is_cached(uint64_t paddr, uint32_t* seen) {
     (void)paddr; (void)seen; return 0;
 }
 
+/* user_paging.c takes the address of the asm syscall stub, clones the
+ * boot p4_table's kernel slots, and checks image-end for frame refusal —
+ * all link-provided symbols in the real kernel; provide inert stand-ins
+ * (their values are never used: the host test drives user_map_page /
+ * user_map_identity directly). */
+void syscall_entry_stub(void) { }
+uint64_t p4_table[512] = { 0 };
+char _kernel_image_end[1];
+
+/* user_paging.c's frame-refusal path consults the cap arena and the frame
+ * pool (kernel/cap.c + frame_pool.c, not linked here). Permissive answers:
+ * nothing is in the arena, every frame is owned by partition 0, and frees
+ * no-op — the host test only exercises the map/unmap arithmetic. */
+int cap_frame_in_arena(uint64_t paddr) { (void)paddr; return 0; }
+uint32_t frame_pool_frame_owner(uint64_t frame_index) { (void)frame_index; return 0; }
+int free_physical_ram_frame_for_partition(void* frame, uint32_t partition_id) {
+    (void)frame; (void)partition_id; return 0;
+}
+
+
 #define FRAME_MASK 0x000FFFFFFFFFF000ULL
 #define HUGEPAGE   (0x83ULL)   /* present | write | PS — supervisor */
 
