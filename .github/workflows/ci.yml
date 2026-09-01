@@ -763,6 +763,18 @@ jobs:
           echo "OK: kernel booted from the ISO and /api/health answered"
         working-directory: aerosls2
 
+      # Phase 5 self-hosted gate: the ISO's serial log must carry the
+      # driver-SDK demo's PASS line ('irqtest] PASS' — LAPIC timer edges at
+      # vector 32, and the serial port's IRQ4 at vector 36 through the
+      # IO-APIC). The health smoke above proves the kernel serves; this
+      # proves the sidecar fabric + Driver SDK IRQ path ran on the real
+      # target. A regression in manifest minting, syscall dispatch, the
+      # IRQ registry, the stub wiring, or the self-mask/re-arm dance
+      # fails here even though the system otherwise boots.
+      - name: Phase 5 boot smoke (irqtest PASS in serial log)
+        run: bash tests/phase5_boot_smoke.sh
+        working-directory: aerosls2
+
   decoder-build:
     # M8 (Step 6.4): the decoder is the DEFAULT build -- this job builds
     # the shipping config (what deploy.sh builds and what runs in
