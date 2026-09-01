@@ -1322,10 +1322,28 @@ int cap_wait_chans(const uint32_t* chan_ids, uint32_t n, void* req,
         uint64_t one_tick = kernel_tick_counter + 1;
         cur->waiting_deadline = one_tick;
         __asm__ volatile("sti; hlt" ::: "memory");
-        /* The timer ISR or cap_wake_chan already woke us — state is
-         * PROC_SUSPENDED + resume_kernel. The scheduler will pick us up.
-         * Return non-zero to indicate the park succeeded (the caller
-         * should not re-park; the resume path re-runs the syscall). */
+        /* The hlt was interrupted by an IRQ — typically the timer ISR's
+         * cap_park_deadline_tick (which flipped us to PROC_SUSPENDED +
+         * resume_kernel), or a wake with no handoff. We are STILL the
+         * running process: the ring-0 timer path in interrupt.asm runs
+         * timer_irq_handler and iretq's straight back to this hlt — it
+         * never calls schedule_ring3, so nobody "picks us up". Leaving
+         * the stale SUSPENDED/resume_kernel state on the descriptor is
+         * fatal: once this syscall returns to ring-3, every later ring-3
+         * timer IRQ enters schedule_ring3, whose "find current" scan
+         * requires PROC_RUNNING, finds nothing, and returns without
+         * scheduling — the whole machine stalls (woken processes like a
+         * deadline-polling driver never resume). A REAL wake with a
+         * handoff switches to us via cap_recv_resume and never returns
+         * here, so arriving at this point means no switch happened:
+         * restore our true state and let the caller re-check the queues
+         * (and re-park if nothing arrived). */
+        cur->state            = PROC_RUNNING;
+        cur->resume_kernel    = 0;
+        cur->resume_sysret    = 0;
+        cur->waiting_chan     = CAP_NONE;
+        cur->waiting_nchans   = 0;
+        cur->waiting_deadline = 0;
         return 1;
     }
     kernel_serial_printf("[CAP] chan wait: switching to PID %u '%s'\n",
@@ -1349,15 +1367,6 @@ uint64_t cap_park_deadline_take(void) {
     return d;
 }
 
-/* Non-consuming peek (debug only): nonzero iff the current process has a
- * stored park deadline — i.e. this k_chan_wait/k_chan_send entry is a
- * RE-RUN after a park wake, not a fresh syscall. */
-uint64_t cap_park_deadline_peek(void) {
-    struct ProcessDescriptor* cur = process_find_current();
-    if (!cur) return 0;
-    return cur->waiting_deadline;
-}
-
 /* Strong override of cap.c's weak hook (called from timer_irq_handler,
  * BSP-only, ~10 ms per tick, BEFORE schedule_ring3 in the same ISR): wake
  * every parked process whose deadline has passed, so a finite-deadline
@@ -1379,10 +1388,6 @@ void cap_park_deadline_tick(void) {
         pd->resume_kernel = 1;
         pd->waiting_chan  = CAP_NONE;
         pd->waiting_nchans = 0;
-        kernel_serial_printf(
-            "[CAP] deadline: PID %u woken at tick %llu (deadline %llu)\n",
-            pd->pid, (unsigned long long)now,
-            (unsigned long long)pd->waiting_deadline);
     }
 }
 
@@ -1421,8 +1426,6 @@ void cap_wake_chan(uint32_t chan_id) {
         pd->resume_kernel = 1;
         pd->waiting_chan  = CAP_NONE;
         pd->waiting_nchans = 0;
-        kernel_serial_printf("[CAP] woken PID %u (channel %u)\n",
-                             pd->pid, chan_id);
         /* Phase 1.5 (immediate wake): remember WHO we woke so the caller's
          * cap_maybe_handoff() can hand the CPU to them right now instead of
          * letting them wait for the next tick. NULL in kernel context.
@@ -1490,11 +1493,6 @@ __attribute__((noreturn))
 void cap_sysret_resume(struct ProcessDescriptor* pd) {
     uint64_t* p   = (uint64_t*)&pd->park_ctx;
     uint64_t  top = pd->syscall_stack_top;
-
-    kernel_serial_printf("[SRES] cap_sysret_resume pid=%u rcx=0x%llx rbx=0x%llx rbp=0x%llx rsp=0x%llx\n",
-                         pd->pid, (unsigned long long)p[1],
-                         (unsigned long long)p[6], (unsigned long long)p[7],
-                         (unsigned long long)p[8]);
 
     __asm__ volatile("swapgs" : : : "memory");   /* GS_BASE: 0 -> &per_cpu_data */
     per_cpu_data[0].user_rsp = pd->park_ctx.user_rsp;
@@ -1568,13 +1566,6 @@ void cap_recv_resume(struct ProcessDescriptor* pd) {
     uint64_t* p   = (uint64_t*)&pd->park_ctx;
     uint64_t  req = pd->park_req;
     uint64_t  top = pd->syscall_stack_top;
-
-    kernel_serial_printf("[RES] cap_recv_resume pid=%u syscall=%u req=0x%llx rcx=0x%llx rbx=0x%llx rbp=0x%llx rsp=0x%llx r12=0x%llx r13=0x%llx\n",
-                         pd->pid, (unsigned)pd->park_syscall,
-                         (unsigned long long)req, (unsigned long long)p[1],
-                         (unsigned long long)p[6], (unsigned long long)p[7],
-                         (unsigned long long)p[8], (unsigned long long)p[5],
-                         (unsigned long long)p[4]);
 
     __asm__ volatile("swapgs" : : : "memory");   /* GS_BASE: 0 -> &per_cpu_data */
 

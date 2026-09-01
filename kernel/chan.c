@@ -157,7 +157,6 @@ int k_chan_wait(uint32_t pid, const uint16_t* chans, uint32_t n,
      * extend a finite timeout. A fresh call (nothing stored) computes
      * now + timeout_ns, rounded UP to whole ~10 ms ticks. 0 = block
      * forever (CH_TIMEOUT_NONE). */
-    int is_rerun = cap_park_deadline_peek() != 0;   /* debug */
     uint64_t deadline = cap_park_deadline_take();
     if (deadline == 0 && timeout_ns != CH_TIMEOUT_NONE)
         deadline = chan_deadline_from_ns(timeout_ns);
@@ -177,11 +176,6 @@ int k_chan_wait(uint32_t pid, const uint16_t* chans, uint32_t n,
         uint16_t kind = CH_KIND_MSG;
         if (!ready && ch->close_evt[dir]) { ready = 1; kind = CH_KIND_CLOSE; }
         cap_unlock(&ch->lock);
-        if ((is_rerun && pid == 102) || pid == 103)
-            kernel_serial_printf("[WTR] PID %u %s ch[%u]=%u dir=%d qd=%d close=%d\n",
-                                 pid, is_rerun ? "rerun" : "fresh",
-                                 i, chan_id, dir, ch->qdepth[dir],
-                                 ch->close_evt[dir]);
         if (ready) {
             *out_idx = i;
             *out_kind = kind;
@@ -260,11 +254,6 @@ int k_chan_recv(uint32_t pid, uint16_t chan, void* buf, uint32_t buf_len,
                 return CAP_ERR_BUFSZ;         /* not consumed */
             }
             ch->close_evt[dir] = 0;           /* delivered exactly once */
-            if (pid == 103)
-                kernel_serial_printf("[C103] recv CLOSE slot=%u chan=%u reason=%u detail=%u\n",
-                                     (unsigned)chan, (unsigned)chan_id,
-                                     (unsigned)ch->close_reason[dir],
-                                     (unsigned)ch->close_detail[dir]);
             cap_unlock(&ch->lock);
             uint8_t* p = (uint8_t*)buf;
             p[0] = (uint8_t)(reason & 0xFF);
@@ -470,24 +459,14 @@ uint64_t sys_sls_chan_wait(struct SLSChanWaitRequest* req) {
     uint64_t r = (uint64_t)k_chan_wait(cap_current_pid(), req->chans, req->n_chans,
                                        req->timeout_ns, &req->out_idx, &req->out_kind,
                                        (void*)req);
-    if (cap_current_pid() == 103)
-        kernel_serial_printf("[W103] wait -> %llu idx=%u kind=%u\n",
-                             (unsigned long long)r, (unsigned)req->out_idx,
-                             (unsigned)req->out_kind);
     return r;
 }
 
 uint64_t sys_sls_chan_recv(struct SLSChanRecvRequest* req) {
     if (!req) return CAP_ERR_PROTO;
-    if (cap_current_pid() == 103)
-        kernel_serial_printf("[R103] recv slot=%u\n", (unsigned)req->chan);
     uint64_t r = (uint64_t)k_chan_recv(cap_current_pid(), req->chan, req->buf,
                                        req->buf_len, req->slots, req->n_slots,
                                        &req->out);
-    if (cap_current_pid() == 103)
-        kernel_serial_printf("[R103] recv -> %llu kind=%u tag=%u len=%u\n",
-                             (unsigned long long)r, (unsigned)req->out.kind,
-                             (unsigned)req->out.tag, (unsigned)req->out.len);
     return r;
 }
 
@@ -497,18 +476,6 @@ uint64_t sys_sls_chan_send(struct SLSChanSendRequest* req) {
                                        req->flags, req->payload, req->payload_len,
                                        req->caps, req->n_caps, req->timeout_ns,
                                        (void*)req);
-    if (cap_current_pid() == 103)
-        kernel_serial_printf("[S103] send slot=%u -> %llu\n", (unsigned)req->chan,
-                             (unsigned long long)r);
-    if (cap_current_pid() == 103 && r != 0) {
-        /* Dump neighbor slots so we can see what the channel caps moved to. */
-        for (unsigned h = 0; h < 16; h++) {
-            struct SLSCapInfoOut o;
-            int ir = k_cap_info(cap_current_pid(), (uint16_t)h, &o);
-            kernel_serial_printf("[S103] slot=%u info r=%d ty=%u\n", h, ir,
-                                 (unsigned)o.ty);
-        }
-    }
     return r;
 }
 
