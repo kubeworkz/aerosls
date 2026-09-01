@@ -112,7 +112,7 @@ pub extern "C" fn posix_net_info_handshake(net_w: u32, net_r: u32) -> u32 {
         )
     };
     if send_rc != 0 {
-        klog(b"[POSIX] NET_INFO send FAILED (rc=", send_rc as u32, b")\n");
+        klog(b"[POSIX] NETBOOT FAILED: NET_INFO send rc=", send_rc as u32, b"\n");
         return 0;
     }
 
@@ -149,7 +149,7 @@ pub extern "C" fn posix_net_info_handshake(net_w: u32, net_r: u32) -> u32 {
         // Yield so the network sidecar can run and process our request.
         unsafe { k_yield(); }
     }
-    klog(b"[POSIX] NET_INFO handshake FAILED after ", MAX_RETRIES, b" recv retries\n");
+    klog(b"[POSIX] NETBOOT FAILED: no NET_INFO reply after ", MAX_RETRIES, b" recv retries\n");
     0
 }
 
