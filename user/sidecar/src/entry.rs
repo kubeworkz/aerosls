@@ -92,37 +92,49 @@ pub extern "C" fn posix_net_info_handshake(net_w: u32, net_r: u32) -> u32 {
     // when we first send, so we retry up to 10 times (2s total).
     const NET_INFO_TIMEOUT_NS: u64 = 200_000_000; // 200ms
     const MAX_RETRIES: u32 = 10;
+
+    // ── IMPORTANT: send NET_INFO exactly ONCE ───────────────────────────
+    // The network server replies to every NET_INFO it receives.  If we
+    // re-sent on each retry (old behavior), the queue would accumulate
+    // stale tag=1 replies, and the NetClient (whose tag counter also
+    // starts at 1) would consume a stale reply for `socket()`, then get
+    // the *socket* reply for `bind()` — a tag mismatch Protocol error.
+    // So: send once, and only retry the RECV (the server processes the
+    // single queued message as soon as it adopts our channel).
+    let send_rc = unsafe {
+        k_chan_send(
+            net_w,              // CHAN_W slot
+            1,                  // tag=1
+            0,                  // flags
+            payload.as_ptr(),
+            16,                 // payload_len
+            core::ptr::null(),  // no caps
+            0,                  // n_caps=0
+            NET_INFO_TIMEOUT_NS, // timeout_ns (non-zero = finite deadline)
+        )
+    };
+    klog(b"[POSIX] NET_INFO send rc=", send_rc as u32, b"");
+    if send_rc != 0 {
+        klog(b"[POSIX] NET_INFO send FAILED (rc=", send_rc as u32, b")\n");
+        return 0;
+    }
+
+    // 2. Recv reply on chan_r — retried (with yield) until it arrives.
+    //    The recv is non-blocking; the server may not have adopted our
+    //    channel yet, so poll until the single reply lands.
+    let mut buf = [0u8; 256];
+    #[repr(C)]
+    struct RecvOut {
+        kind: u16,
+        flags: u16,
+        tag: u32,
+        len: u32,
+        n_caps: u16,
+        needed: u16,
+    }
+    let mut out = RecvOut { kind: 0, flags: 0, tag: 0, len: 0, n_caps: 0, needed: 0 };
     for attempt in 0..MAX_RETRIES {
-        let send_rc = unsafe {
-            k_chan_send(
-                net_w,              // CHAN_W slot
-                1,                  // tag=1
-                0,                  // flags
-                payload.as_ptr(),
-                16,                 // payload_len
-                core::ptr::null(),  // no caps
-                0,                  // n_caps=0
-                NET_INFO_TIMEOUT_NS, // timeout_ns (non-zero = finite deadline)
-            )
-        };
-        klog(b"[POSIX] NET_INFO send rc=", send_rc as u32, b"");
-        if send_rc != 0 {
-            // Send failed or timed out — retry
-            unsafe { k_yield(); }
-            continue;
-        }
-        // 2. Recv reply on chan_r with timeout
-        let mut buf = [0u8; 256];
-        #[repr(C)]
-        struct RecvOut {
-            kind: u16,
-            flags: u16,
-            tag: u32,
-            len: u32,
-            n_caps: u16,
-            needed: u16,
-        }
-        let mut out = RecvOut { kind: 0, flags: 0, tag: 0, len: 0, n_caps: 0, needed: 0 };
+        out = RecvOut { kind: 0, flags: 0, tag: 0, len: 0, n_caps: 0, needed: 0 };
         let recv_rc = unsafe {
             k_chan_recv(
                 net_r,                    // CHAN_R slot
@@ -142,10 +154,11 @@ pub extern "C" fn posix_net_info_handshake(net_w: u32, net_r: u32) -> u32 {
             klog(b"[POSIX] NET_INFO handshake OK (attempt ", attempt + 1, b")\n");
             return 1;
         }
-        // Recv failed or timed out — retry
+        // Recv failed or timed out — the server hasn't replied yet.
+        // Yield so the network sidecar can run and process our request.
         unsafe { k_yield(); }
     }
-    klog(b"[POSIX] NET_INFO handshake FAILED after ", MAX_RETRIES, b" retries\n");
+    klog(b"[POSIX] NET_INFO handshake FAILED after ", MAX_RETRIES, b" recv retries\n");
     0
 }
 
