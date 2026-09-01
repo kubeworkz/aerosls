@@ -154,6 +154,51 @@ fn boot_mounts_and_runs_init() {
     t.join().unwrap();
 }
 
+/// Network sidecar absent: the boot script reaches the `netcheck` gate,
+/// which exits 1 (no NET_INFO handshake ever ran, so NETBOOT_OK is 0),
+/// and the fail-fast runner aborts the script before nettest or the
+/// "System ready" echo. Mirrors the real init.rc's network section.
+#[test]
+fn netcheck_absent_network_aborts_boot_script() {
+    let mut b = ImageBuilder::new();
+    b.add_dir("/etc", 0o755);
+    b.add_file(
+        "/etc/init.rc",
+        b"echo Testing network...\nnetcheck\nnettest 8 7\necho System ready\necho\nsh\n",
+        0o644,
+    );
+    let image = b.build();
+
+    let (fake, client) = FakeKernel::new(image, 1);
+    let t = boot_driver(fake);
+
+    // No network channel wired: the network sidecar never adopted a
+    // channel, so the NET_INFO handshake never ran and NETBOOT_OK is 0.
+    let caps = BootCaps::new(0, 0, 0, None, Some(0), Some(0), None, None);
+    let console = Arc::new(CharNode::console());
+    let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
+        .expect("boot");
+
+    booted.run(200);
+
+    // The script aborted at the netcheck gate: init exits with netcheck's
+    // code (1), and the console shows only the gate's preceding echo —
+    // neither the nettest transcript nor "System ready" ever ran.
+    assert_eq!(
+        booted.proc.exit_code(0),
+        Some(1),
+        "init aborted with netcheck's exit code (network bring-up failed)"
+    );
+    assert_eq!(
+        console.console_io().output(),
+        b"Testing network...\n",
+        "boot script stopped at the netcheck gate, before nettest / System ready"
+    );
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
+
 /// The interactive-shell boot: init runs a script whose last line is
 /// `/bin/sh`; the shell prompts on the console, parks for input, and the
 /// test types commands — a two-stage pipeline, a failing command, and a
