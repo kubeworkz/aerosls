@@ -112,7 +112,16 @@ fn boot_mounts_and_runs_init() {
 
     booted.run(200);
 
-    assert_eq!(booted.proc.exit_code(0), Some(0), "init exited cleanly");
+    // Fail-fast: the script runs the healthy lines, then aborts at the
+    // first failing command (`/bin/nope` → 127). The runner used to
+    // tolerate per-line failures and continue to the end; a nonzero child
+    // exit now stops the boot script (so a failed `netcheck`/`nettest`
+    // aborts a network-less boot instead of limping on).
+    assert_eq!(
+        booted.proc.exit_code(0),
+        Some(127),
+        "init aborted at the first failing command (/bin/nope)"
+    );
     // The script's quoted / escaped echo lines print to console stdout
     // (fd 1), then `/bin/cat < /etc/passwd` carries the rootfs read out
     // through the full chain: cache → driver → storage.
@@ -122,7 +131,7 @@ fn boot_mounts_and_runs_init() {
         "the boot script's quoted/escaped echoes and < redirect reached the console"
     );
     // `/bin/echo booted > /tmp/out`: the script runner's `>` redirect
-    // pointed the child's fd 1 at the ramfs file.
+    // pointed the child's fd 1 at the ramfs file (runs before the abort).
     assert_eq!(read_all(&mut booted.proc.vfs, "/tmp/out"), b"booted\n");
     // The root mount is a real aerofs on the cache, not a shadow.
     assert_eq!(

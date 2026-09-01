@@ -29,6 +29,7 @@ pub fn build_rootfs() -> Vec<u8> {
           echo Root filesystem mounted\n\
           ls /\n\
           echo Testing network...\n\
+          netcheck\n\
           nettest 8 7\n\
           echo System ready\n\
           echo\n\

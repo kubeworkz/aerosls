@@ -7,7 +7,9 @@
 //! applets every POSIX sidecar needs:
 //!
 //! - **`init`** — the boot script runner. Executes `/etc/init.rc` line by
-//!   line, forking one child per command and waiting for it (the design's
+//!   line, forking one child per command and waiting for it; a child that
+//!   exits nonzero aborts the script (fail-fast), so a failed step like
+//!   `netcheck` halts the boot (the design's
 //!   "rc scripts" step). Commands parse through the same word parser as
 //!   `sh` — quotes, backslash escapes, `<`/`>` redirects (`$?` expands to
 //!   0 and `$VAR` to nothing, since init tracks no status and has no
@@ -150,9 +152,12 @@ pub fn init<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
             ctx.data.extend_from_slice(&child.to_le_bytes()); // u32 LE
             match ctx.wait(child) {
                 WaitOutcome::Blocked | WaitOutcome::Stopped(_) => Step::Blocked(BlockReason::WaitingChild(child)),
-                WaitOutcome::Reaped(_) => {
+                WaitOutcome::Reaped(code) => {
                     ctx.data.truncate(ctx.data.len() - 4);
                     ctx.data[0] = 1;
+                    if code != 0 {
+                        return Step::Exit(code);
+                    }
                     Step::Yield
                 }
                 WaitOutcome::NoSuchChild => Step::Exit(2),
@@ -164,9 +169,12 @@ pub fn init<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
             let n = ctx.data.len();
             let child = u32::from_le_bytes(ctx.data[n - 4..n].try_into().unwrap());
             match ctx.wait(child) {
-                WaitOutcome::Reaped(_) => {
+                WaitOutcome::Reaped(code) => {
                     ctx.data.truncate(n - 4);
                     ctx.data[0] = 1;
+                    if code != 0 {
+                        return Step::Exit(code);
+                    }
                     Step::Yield
                 }
                 WaitOutcome::Blocked | WaitOutcome::Stopped(_) => Step::Blocked(BlockReason::WaitingChild(child)),
@@ -184,7 +192,8 @@ pub fn init<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
 /// parsed argv (argv[0] stays a full path, as rc scripts specify). A line
 /// that parses to more than one stage (a `|`) or to nothing fails 127 —
 /// init runs one command per line. On any failure the child exits 127 —
-/// the parent reaps the status and moves on to the next line.
+/// the parent reaps the status and stops the script on a nonzero exit
+/// (fail-fast: a failed `netcheck` aborts the boot).
 fn init_child<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     let cursor = u32::from_le_bytes([ctx.data[1], ctx.data[2], ctx.data[3], ctx.data[4]]) as usize;
     // The fork marker is the last byte; everything after the cursor slot is
@@ -4828,6 +4837,20 @@ pub fn touch<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
 /// All net ops are collected inside a scope that borrows `net`, then
 /// the result is written to stdout after the borrow is released
 /// (avoids E0499: cannot borrow ctx as mutable more than once).
+/// 1 once the NET_INFO handshake has succeeded, 0 otherwise. Declared here
+/// (not in the feature-gated `entry` module) so the host lib build compiles;
+/// `entry::posix_net_info_handshake` sets it to 1 on success.
+#[used]
+pub static mut NETBOOT_OK: u32 = 0;
+
+/// `netcheck`: exits 0 if the NET_INFO handshake succeeded, 1 if it failed
+/// or was skipped. init.rc runs it before `nettest`; the script runner
+/// stops on a nonzero exit, so a failed network bring-up aborts the boot
+/// script instead of just logging.
+pub fn netcheck<K: Kernel, A: BufferAlloc>(_ctx: &mut Ctx<'_, K, A>) -> Step {
+    Step::Exit(if unsafe { NETBOOT_OK } == 1 { 0 } else { 1 })
+}
+
 pub fn nettest<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     extern "C" { fn nettest_push_result(data: *const u8, len: u32); }
     fn swrite(s: &[u8]) {
@@ -4932,6 +4955,7 @@ pub fn register_default_applets<K: Kernel, A: BufferAlloc>(pm: &mut ProcManager<
     pm.register_applet("forkpty_test", forkpty_test);
     pm.register_applet("unix_echo", unix_echo);
     pm.register_applet("nettest", nettest);
+    pm.register_applet("netcheck", netcheck);
     pm.register_applet("ls", ls);
     pm.register_applet("mkdir", mkdir_applet);
     pm.register_applet("rm", rm);

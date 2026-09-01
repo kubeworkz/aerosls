@@ -143,6 +143,7 @@ pub extern "C" fn posix_net_info_handshake(net_w: u32, net_r: u32) -> u32 {
             )
         };
         if recv_rc == 0 {
+            unsafe { crate::applets::NETBOOT_OK = 1; }
             return 1;
         }
         // Recv failed or timed out — the server hasn't replied yet.
