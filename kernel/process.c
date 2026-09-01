@@ -1455,9 +1455,6 @@ void cap_maybe_handoff(void) {
     proc_capture_entry_regs(&cur->park_ctx);
     cur->state         = PROC_SUSPENDED;
     cur->resume_sysret = 1;
-    kernel_serial_printf(
-        "[CAP] send handoff: PID %u yielded to woken PID %u\n",
-        cur->pid, target->pid);
     kernel_switch_next(target);   /* noreturn — target resumes via cap_recv_resume */
     __builtin_unreachable();
 }
@@ -1539,8 +1536,6 @@ uint32_t sys_sls_yield(void) {
     proc_capture_entry_regs(&cur->park_ctx);
     cur->state         = PROC_SUSPENDED;
     cur->resume_sysret = 1;
-    kernel_serial_printf("[PROC] PID %u yielded to PID %u\n",
-                         cur->pid, next->pid);
     kernel_switch_next(next);   /* noreturn */
     __builtin_unreachable();
 }

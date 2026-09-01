@@ -75,10 +75,8 @@ pub static mut NET_R_SLOT: u32 = 0xFF;
 #[no_mangle]
 pub extern "C" fn posix_net_info_handshake(net_w: u32, net_r: u32) -> u32 {
     if net_w == 0xFF || net_r == 0xFF {
-        klog(b"[POSIX] NET_INFO skip w=", net_w, b"");
         return 0;
     }
-    klog(b"[POSIX] NET_INFO send slot=", net_w, b"\n");
     // 1. Build NET_INFO payload (NetFrame: 16-byte header)
     //    magic[8] = "AEROSNT\x01", version=1, ty=NET_INFO=1, flags=0, pad=0
     let mut payload = [0u8; 16];
@@ -113,7 +111,6 @@ pub extern "C" fn posix_net_info_handshake(net_w: u32, net_r: u32) -> u32 {
             NET_INFO_TIMEOUT_NS, // timeout_ns (non-zero = finite deadline)
         )
     };
-    klog(b"[POSIX] NET_INFO send rc=", send_rc as u32, b"");
     if send_rc != 0 {
         klog(b"[POSIX] NET_INFO send FAILED (rc=", send_rc as u32, b")\n");
         return 0;
@@ -133,7 +130,7 @@ pub extern "C" fn posix_net_info_handshake(net_w: u32, net_r: u32) -> u32 {
         needed: u16,
     }
     let mut out = RecvOut { kind: 0, flags: 0, tag: 0, len: 0, n_caps: 0, needed: 0 };
-    for attempt in 0..MAX_RETRIES {
+    for _attempt in 0..MAX_RETRIES {
         out = RecvOut { kind: 0, flags: 0, tag: 0, len: 0, n_caps: 0, needed: 0 };
         let recv_rc = unsafe {
             k_chan_recv(
@@ -145,13 +142,7 @@ pub extern "C" fn posix_net_info_handshake(net_w: u32, net_r: u32) -> u32 {
                 &mut out as *mut RecvOut as *mut core::ffi::c_void,
             )
         };
-        klog(b"[POSIX] NET_RECV kind=", out.kind as u32, b"");
-        klog(b"[POSIX] NET_RECV tag=", out.tag, b"");
-        klog(b"[POSIX] NET_RECV len=", out.len, b"");
-        klog(b"[POSIX] NET_RECV rc=", recv_rc as u32, b"");
         if recv_rc == 0 {
-            // Success — received NET_INFO reply
-            klog(b"[POSIX] NET_INFO handshake OK (attempt ", attempt + 1, b")\n");
             return 1;
         }
         // Recv failed or timed out — the server hasn't replied yet.
@@ -403,16 +394,6 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     // (console_service.c) prints every message it receives to serial — so
     // the sidecar's output becomes visible in the QEMU log.
     let console_w = bib.find_cap(CAP_CHAN_W, "console").map(|c| c.slot);
-    klog(b"[POSIX] console_w=", console_w.unwrap_or(u32::MAX), b"");
-    // Probe the console output RefCell state right after boot (before the
-    // pump loop): 0=free 1=shared 2=mutable. A nonzero value here means
-    // `boot()` left a borrow outstanding — the drain would panic on the
-    // first iteration.
-    klog(
-        b"[POSIX] out borrow=",
-        booted.console.console_io().output_borrow_state() as u32,
-        b"",
-    );
 
     // NOTE: nettest is now run via init.rc (applet ctx.net() path),
     // not via raw syscalls in the event loop.  The set_net() call
@@ -440,19 +421,9 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         // send parks while the queue is full; the kernel console service
         // drains every tick, so this is simple flow control, not a stall.
         if let Some(cw) = console_w {
-            let st = booted.console.console_io().output_borrow_state();
-            if st != 0 {
-                klog(b"[POSIX] out borrow=", st as u32, b"PRE-DRAIN");
-            }
             let out = booted.console.console_io().drain_output();
-            if !out.is_empty() {
-                klog(b"[POSIX] console out=", out.len() as u32, b"bytes");
-            }
             for chunk in out.chunks(1024) {
-                let r = RealKernel.send(cw, 0, 0, chunk, &[], TIMEOUT_NONE);
-                if r.is_err() {
-                    klog(b"[POSIX] console send err=", r.unwrap_err() as u32, b"");
-                }
+                let _ = RealKernel.send(cw, 0, 0, chunk, &[], TIMEOUT_NONE);
             }
         }
         booted.proc.drain_wakes();
