@@ -140,10 +140,7 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
             .send(self.chan_w, tag, 0, &frame.encode(), &[], TIMEOUT_NONE)
             .map_err(NetError::Kernel)?;
 
-        let (rr, body) = self.recv_reply_owned(tag)?;
-        if rr.flags & F_REPLY == 0 {
-            return Err(NetError::Protocol);
-        }
+        let (rr, body) = self.recv_reply_owned(tag, NET_INFO)?;
         let frame = NetFrame::parse(&body).ok_or(NetError::Protocol)?;
         if frame.is_error() {
             let status = parse_status_body(&body[NetFrame::SIZE..])
@@ -173,7 +170,7 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
             .send(self.chan_w, tag, 0, &payload, &[], TIMEOUT_NONE)
             .map_err(NetError::Kernel)?;
 
-        let (_rr, body) = self.recv_reply_owned(tag)?;
+        let (_rr, body) = self.recv_reply_owned(tag, NET_SOCKET)?;
         let frame = NetFrame::parse(&body).ok_or(NetError::Protocol)?;
         if frame.is_error() {
             let status = parse_status_body(&body[NetFrame::SIZE..])
@@ -212,7 +209,7 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
             .send(self.chan_w, tag, 0, &payload, &[], TIMEOUT_NONE)
             .map_err(NetError::Kernel)?;
 
-        let (_rr, body) = self.recv_reply_owned(tag)?;
+        let (_rr, body) = self.recv_reply_owned(tag, NET_BIND)?;
         let status = Self::status_of(&body)?;
         if status == NET_OK {
             if let Some(s) = self.socks.get_mut(&id) {
@@ -237,7 +234,7 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
             .send(self.chan_w, tag, 0, &payload, &[], TIMEOUT_NONE)
             .map_err(NetError::Kernel)?;
 
-        let (_rr, body) = self.recv_reply_owned(tag)?;
+        let (_rr, body) = self.recv_reply_owned(tag, NET_CONNECT)?;
         let status = Self::status_of(&body)?;
         if status == NET_OK {
             if let Some(s) = self.socks.get_mut(&id) {
@@ -261,7 +258,7 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
             .send(self.chan_w, tag, 0, &payload, &[], TIMEOUT_NONE)
             .map_err(NetError::Kernel)?;
 
-        let (_rr, body) = self.recv_reply_owned(tag)?;
+        let (_rr, body) = self.recv_reply_owned(tag, NET_LISTEN)?;
         let status = Self::status_of(&body)?;
         if status == NET_OK {
             if let Some(s) = self.socks.get_mut(&id) {
@@ -284,7 +281,7 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
             .send(self.chan_w, tag, 0, &payload, &[], TIMEOUT_NONE)
             .map_err(NetError::Kernel)?;
 
-        let (_rr, body) = self.recv_reply_owned(tag)?;
+        let (_rr, body) = self.recv_reply_owned(tag, NET_ACCEPT)?;
         let frame = NetFrame::parse(&body).ok_or(NetError::Protocol)?;
         if frame.is_error() {
             let status = parse_status_body(&body[NetFrame::SIZE..])
@@ -340,7 +337,7 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
             .send(self.chan_w, tag, 0, &payload, &[send_cap], TIMEOUT_NONE)
             .map_err(NetError::Kernel)?;
 
-        let (_rr, body) = self.recv_reply_owned(tag)?;
+        let (_rr, body) = self.recv_reply_owned(tag, NET_SEND)?;
         let status = Self::status_of(&body)?;
         if status != NET_OK {
             return Err(NetError::Status(status));
@@ -375,7 +372,7 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
             .send(self.chan_w, tag, 0, &payload, &[send_cap], TIMEOUT_NONE)
             .map_err(NetError::Kernel)?;
 
-        let (_rr, body) = self.recv_reply_owned(tag)?;
+        let (_rr, body) = self.recv_reply_owned(tag, NET_RECV)?;
         let status = Self::status_of(&body)?;
         if status != NET_OK {
             return Err(NetError::Status(status));
@@ -405,7 +402,7 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
             .send(self.chan_w, tag, 0, &payload, &[], TIMEOUT_NONE)
             .map_err(NetError::Kernel)?;
 
-        let (_rr, body) = self.recv_reply_owned(tag)?;
+        let (_rr, body) = self.recv_reply_owned(tag, NET_POLL)?;
         let frame = NetFrame::parse(&body).ok_or(NetError::Protocol)?;
         if frame.is_error() {
             let status = parse_status_body(&body[NetFrame::SIZE..])
@@ -431,7 +428,7 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
             .send(self.chan_w, tag, 0, &payload, &[], TIMEOUT_NONE)
             .map_err(NetError::Kernel)?;
 
-        let (_rr, body) = self.recv_reply_owned(tag)?;
+        let (_rr, body) = self.recv_reply_owned(tag, NET_SHUTDOWN)?;
         let status = Self::status_of(&body)?;
         if status == NET_OK {
             if let Some(s) = self.socks.get_mut(&id) {
@@ -457,7 +454,7 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
             .send(self.chan_w, tag, 0, &payload, &[], TIMEOUT_NONE)
             .map_err(NetError::Kernel)?;
 
-        let (_rr, body) = self.recv_reply_owned(tag)?;
+        let (_rr, body) = self.recv_reply_owned(tag, NET_CLOSE_SOCK)?;
         let _status = Self::status_of(&body)?;
         self.socks.remove(&id);
         Ok(())
@@ -484,23 +481,40 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
 
     /// Receive a reply and return the body bytes (everything after the
     /// NetFrame header) as an owned Vec.
-    fn recv_reply_owned(&mut self, expected_tag: u32) -> Result<(RecvResult, alloc::vec::Vec<u8>), NetError> {
-        let mut buf = [0u8; ChanHeader::MAX_PAYLOAD];
-        let mut caps = [GrantedCap::default(); ChanHeader::MAX_CAPS];
-        let rr = self
-            .k
-            .recv(self.chan_r, &mut buf, &mut caps)
-            .map_err(|_e| NetError::Closed)?;
-        if rr.kind != CH_KIND_MSG {
-            return Err(NetError::Closed);
+    fn recv_reply_owned(&mut self, expected_tag: u32, expected_ty: u16) -> Result<(RecvResult, alloc::vec::Vec<u8>), NetError> {
+        // Retry recv with yield.  A single non-blocking recv often returns
+        // ERR_STATE because the network sidecar hasn't had time to
+        // process the request yet.  yield lets the scheduler run the
+        // net sidecar before we retry.
+        //
+        // NOTE: The kernel's channel transport only propagates F_NO_REPLY
+        // through the flags field -- F_REPLY is never visible to the
+        // receiver.  So we check kind and tag only.
+        extern "C" { fn k_yield(); }
+        for _ in 0..20 {
+            let mut buf = [0u8; ChanHeader::MAX_PAYLOAD];
+            let mut caps = [GrantedCap::default(); ChanHeader::MAX_CAPS];
+            match self.k.recv(self.chan_r, &mut buf, &mut caps) {
+                Ok(rr) => {
+                    if rr.kind == CH_KIND_MSG && rr.tag == expected_tag {
+                        // Verify the reply's frame type matches the request.
+                        // The boot-time NET_INFO handshake retries with the
+                        // same tag, so a stale same-tag reply can sit in the
+                        // queue; type-checking stops us misparsing it (e.g.
+                        // a stray NET_INFO body read as a socket status body
+                        // yields a garbage sock_id and bind() INVAL).
+                        if let Some(f) = NetFrame::parse(&buf[..rr.len]) {
+                            if f.ty == expected_ty {
+                                return Ok((rr, alloc::vec::Vec::from(&buf[..rr.len])));
+                            }
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+            unsafe { k_yield(); }
         }
-        if rr.flags & F_REPLY == 0 {
-            return Err(NetError::Protocol);
-        }
-        if rr.tag != expected_tag {
-            return Err(NetError::Protocol);
-        }
-        Ok((rr, alloc::vec::Vec::from(&buf[..rr.len])))
+        Err(NetError::Closed)
     }
 
     /// Extract the status from a reply body (after the NetFrame header).

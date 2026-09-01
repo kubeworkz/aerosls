@@ -49,7 +49,16 @@ pub fn run<K: Kernel>(k: &K, eps: &mut EndpointSet, net: &mut MockNetwork) -> Re
         } else {
             200_000_000 // 200ms
         };
-        let (idx, _kind) = k.wait(&list[..wlen], timeout)?;
+        let (idx, _kind) = match k.wait(&list[..wlen], timeout) {
+            Ok(r) => r,
+            Err(e) if e == kabi::ERR_TIMEOUT => {
+                // Discovery-poll deadline expired: re-scan the cap table
+                // for newly wired endpoints and try again.  Any other
+                // error (ERR_SHUTDOWN, ...) terminates the loop.
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         let handle = list[idx];
 
         if eps.is_console(handle) {

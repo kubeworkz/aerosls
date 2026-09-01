@@ -39,6 +39,33 @@ extern "C" {
 #[used]
 static mut NET_INFO_RESULT: u32 = 0;
 
+/// Nettest result buffer: the applet writes here; the event loop drains
+/// via serial_write_raw (syscall 165 survives LTO in this binary crate).
+#[used]
+static mut NETTEST_RESULT: [u8; 512] = [0u8; 512];
+#[used]
+static mut NETTEST_RESULT_LEN: u32 = 0;
+
+/// Write a string into the nettest result buffer (called from lib crate
+/// nettest).  # Safety: single-threaded, only nettest writes.
+#[no_mangle]
+pub unsafe extern "C" fn nettest_push_result(data: *const u8, len: u32) {
+    let n = (len as usize).min(512 - NETTEST_RESULT_LEN as usize);
+    core::ptr::copy_nonoverlapping(
+        data,
+        NETTEST_RESULT.as_mut_ptr().add(NETTEST_RESULT_LEN as usize),
+        n,
+    );
+    NETTEST_RESULT_LEN += n as u32;
+}
+
+/// Network channel slot numbers, exported for fork children (nettest applet)
+/// that can't access the BIB.
+#[used]
+pub static mut NET_W_SLOT: u32 = 0xFF;
+#[used]
+pub static mut NET_R_SLOT: u32 = 0xFF;
+
 /// NET_INFO handshake — called unconditionally from `rust_entry` via a
 /// `#[no_mangle]` symbol so the compiler cannot prove it dead and
 /// eliminate it.  Pass 0xFF for either handle to skip.
@@ -52,11 +79,13 @@ pub extern "C" fn posix_net_info_handshake(net_w: u32, net_r: u32) -> u32 {
         return 0;
     }
     klog(b"[POSIX] NET_INFO send slot=", net_w, b"\n");
-    // 1. Build NET_INFO payload (NetFrame: magic + version + type + flags)
+    // 1. Build NET_INFO payload (NetFrame: 16-byte header)
+    //    magic[8] = "AEROSNT\x01", version=1, ty=NET_INFO=1, flags=0, pad=0
     let mut payload = [0u8; 16];
-    payload[0..4].copy_from_slice(b"AERS");
-    payload[4..6].copy_from_slice(&[1, 0]); // version=1
-    payload[6..8].copy_from_slice(&[1, 0]); // type=NET_INFO=1
+    payload[0..8].copy_from_slice(b"AEROSNT\x01");
+    payload[8..10].copy_from_slice(&[1, 0]); // version=1
+    payload[10..12].copy_from_slice(&[1, 0]); // ty=NET_INFO=1
+    payload[12..16].fill(0); // flags=0, pad=0
 
     // Retry loop: send NET_INFO, recv reply with 200ms timeout.
     // The network sidecar may not have adopted the POSIX channel yet
@@ -245,6 +274,28 @@ fn klog(tag: &[u8], val: u32, extra: &[u8]) {
     touch_cookie();
 }
 
+/// Raw serial write: send `data` directly to kernel serial via
+/// SYS_SLS_SERIAL_WRITE (165).  Same syscall as klog but without the
+/// tag/hex/extra framing - just raw bytes.
+fn serial_write_raw(data: &[u8]) {
+    let mut buf = [0u8; 512];
+    let n = data.len().min(512);
+    buf[..n].copy_from_slice(&data[..n]);
+    unsafe {
+        let mut rax: u64;
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") 165u64 => rax,
+            inlateout("rdi") buf.as_ptr() => _,
+            lateout("rcx") _, lateout("r11") _, lateout("rsi") _,
+            lateout("rdx") _, lateout("r8") _, lateout("r9") _, lateout("r10") _,
+            options(nostack),
+        );
+        SYSCALL_COOKIE = rax;
+    }
+    touch_cookie();
+}
+
 #[no_mangle]
 // The `static mut` heap is deliberate on a bare-metal single-threaded
 // target; the lint fires at this use site.
@@ -319,8 +370,18 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     {
         let net_w = caps.net_chan_w.map_or(0xFFu32, |v| v);
         let net_r = caps.net_chan_r.map_or(0xFFu32, |v| v);
+        // Export channel slots for fork children (nettest applet).
+        unsafe {
+            NET_W_SLOT = net_w;
+            NET_R_SLOT = net_r;
+        }
         let rc = unsafe { posix_net_info_handshake(net_w, net_r) };
         unsafe { NET_INFO_RESULT = rc; }
+    }
+    // Install the network client into the ProcManager so applets can
+    // call ctx.net() for socket I/O.
+    if let Some(nc) = booted.net.take() {
+        booted.proc.set_net(alloc::boxed::Box::new(nc));
     }
 
     // The console channel's WRITE endpoint (CHAN_R is `caps.console_chan`).
@@ -339,6 +400,11 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         booted.console.console_io().output_borrow_state() as u32,
         b"",
     );
+
+    // NOTE: nettest is now run via init.rc (applet ctx.net() path),
+    // not via raw syscalls in the event loop.  The set_net() call
+    // above installs the NetClient into the ProcManager so applets
+    // can call ctx.net() for socket I/O.
 
     loop {
         // ── Console input: recv from kernel, push into ConsoleIo ──
@@ -409,7 +475,17 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
             klog(b"[POSIX] aero state=", booted.proc.vfs.aerofs_state(), b"");
         }
         match booted.proc.run_next() {
-            Some(_) => {}
+            Some(_) => {
+                // Drain any nettest result written by the lib-crate applet
+                // into the static buffer (the LTO-proof output path).
+                unsafe {
+                    let len = NETTEST_RESULT_LEN as usize;
+                    if len > 0 {
+                        serial_write_raw(&NETTEST_RESULT[..len]);
+                        NETTEST_RESULT_LEN = 0;
+                    }
+                }
+            }
             None => {
                 // Quiesced — nothing runnable, nothing blocked. Park until
                 // the kernel delivers work: a wake on ANY wired channel

@@ -4820,6 +4820,95 @@ pub fn touch<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     }
 }
 
+/// `nettest`: exercises the POSIX→network RPC path by creating a TCP
+/// socket, binding, listening, and polling to verify the full NET_*
+/// protocol round-trip.  Uses ctx.net() (installed by boot via
+/// proc.set_net) so it works from any task including fork children.
+///
+/// All net ops are collected inside a scope that borrows `net`, then
+/// the result is written to stdout after the borrow is released
+/// (avoids E0499: cannot borrow ctx as mutable more than once).
+pub fn nettest<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
+    extern "C" { fn nettest_push_result(data: *const u8, len: u32); }
+    fn swrite(s: &[u8]) {
+        unsafe { nettest_push_result(s.as_ptr(), s.len() as u32); }
+    }
+    let net = match ctx.net() {
+        Some(n) => n,
+        None => {
+            swrite(b"[nettest] FAIL: no network driver\n");
+            return Step::Exit(1);
+        }
+    };
+
+    // Listener socket: socket -> bind -> listen.
+    swrite(b"[nettest] listener: socket(TCP)\n");
+    let lsn = match net.socket(aerosls_proto::SOCK_STREAM) {
+        Ok(id) => id,
+        Err(e) => {
+            swrite(b"[nettest] FAIL: listener socket()\n");
+            return Step::Exit(1);
+        }
+    };
+    swrite(b"[nettest] listener: bind(9999)\n");
+    if let Err(e) = net.bind(lsn, 0, 9999) {
+        swrite(b"[nettest] FAIL: listener bind()\n");
+        net.close_socket(lsn).ok();
+        return Step::Exit(1);
+    }
+    swrite(b"[nettest] listener: listen()\n");
+    if let Err(e) = net.listen(lsn) {
+        swrite(b"[nettest] FAIL: listener listen()\n");
+        net.close_socket(lsn).ok();
+        return Step::Exit(1);
+    }
+    swrite(b"[nettest] PASS: listener ready on :9999\n");
+
+    // Client socket: socket -> connect to the listener.
+    swrite(b"[nettest] client: socket(TCP)\n");
+    let cln = match net.socket(aerosls_proto::SOCK_STREAM) {
+        Ok(id) => id,
+        Err(e) => {
+            swrite(b"[nettest] FAIL: client socket()\n");
+            net.close_socket(lsn).ok();
+            return Step::Exit(1);
+        }
+    };
+    swrite(b"[nettest] client: connect(127.0.0.1:9999)\n");
+    match net.connect(cln, 0x7F000001, 9999) {
+        Ok(()) => swrite(b"[nettest] PASS: connect(127.0.0.1:9999)\n"),
+        Err(e) => {
+            swrite(b"[nettest] FAIL: connect()\n");
+            net.close_socket(cln).ok();
+            net.close_socket(lsn).ok();
+            return Step::Exit(1);
+        }
+    }
+
+    // Accept the pending connection on the listener.
+    swrite(b"[nettest] listener: accept()\n");
+    match net.accept(lsn) {
+        Ok(_peer) => swrite(b"[nettest] PASS: accept()\n"),
+        Err(e) => {
+            swrite(b"[nettest] FAIL: accept()\n");
+        }
+    }
+
+    net.close_socket(cln).ok();
+    net.close_socket(lsn).ok();
+    swrite(b"[nettest] PASS: shutdown+close\n");
+    swrite(b"[nettest] ALL DONE\n");
+    Step::Exit(0)
+}
+
+/// Host/test-only implementation of the nettest output sink.  On the target
+/// (`feature = "target"`) this symbol is provided by entry.rs as the
+/// serial-drain buffer; host builds (unit/integration tests) have no serial,
+/// so this no-op keeps the `extern "C"` reference in `nettest` linkable.
+#[cfg(not(feature = "target"))]
+#[no_mangle]
+pub unsafe extern "C" fn nettest_push_result(_data: *const u8, _len: u32) {}
+
 pub fn register_default_applets<K: Kernel, A: BufferAlloc>(pm: &mut ProcManager<K, A>) {
     pm.register_applet("init", init);
     pm.register_applet("cat", cat);
@@ -4842,6 +4931,7 @@ pub fn register_default_applets<K: Kernel, A: BufferAlloc>(pm: &mut ProcManager<
     pm.register_applet("timeout", timeout);
     pm.register_applet("forkpty_test", forkpty_test);
     pm.register_applet("unix_echo", unix_echo);
+    pm.register_applet("nettest", nettest);
     pm.register_applet("ls", ls);
     pm.register_applet("mkdir", mkdir_applet);
     pm.register_applet("rm", rm);

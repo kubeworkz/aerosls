@@ -15,8 +15,8 @@ use aerosls_ramdisk::endpoints::EndpointSet;
 use aerosls_ramdisk::server::{self, Device};
 use aerosls_vfs::{CharNode, Errno, ImageBuilder, Vfs, O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_WRONLY};
 use aerosls_procmgr::{
-    is_child, BlockReason, Ctx, ProcManager, Program, ReadBlock, Step, TaskState, WaitOutcome,
-    WakeEvent, WriteBlock,
+    is_child, signal_exit_code, BlockReason, Ctx, ProcManager, Program, ReadBlock, SIGINT,
+    SIGKILL, SIGTERM, Step, TaskState, WaitOutcome, WakeEvent, WriteBlock,
 };
 
 /// Assert the wake trace records a task's park and its matching wake, in
@@ -95,7 +95,8 @@ fn pm() -> (ProcManager<FC, FA>, JoinHandle<()>, FakeClient) {
     let t = boot_driver(fake);
     let cache = BlockCache::connect(
         KWrap(Arc::new(client.clone())),
-        0,
+        0,  // chan_w
+        0,  // chan_r (fake kernel uses the same channel for both)
         AWrap(Arc::new(Mutex::new(FakeAlloc(client.clone())))),
     )
     .unwrap();
@@ -192,7 +193,7 @@ fn threader(ctx: &mut Ctx<FC, FA>) -> Step {
             let child = ctx.data[2] as u32;
             match ctx.wait(child) {
                 WaitOutcome::Reaped(c) => ctx.exit(c),
-                WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(child)),
+                WaitOutcome::Blocked | WaitOutcome::Stopped(_) => Step::Blocked(BlockReason::WaitingChild(child)),
                 WaitOutcome::NoSuchChild => Step::Exit(90),
             }
         }
@@ -420,10 +421,10 @@ fn pipeline(ctx: &mut Ctx<FC, FA>) -> Step {
             match ctx.wait(cat_c) {
                 WaitOutcome::Reaped(_) => match ctx.wait(grep_c) {
                     WaitOutcome::Reaped(code) => ctx.exit(code),
-                    WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(grep_c)),
+                    WaitOutcome::Blocked | WaitOutcome::Stopped(_) => Step::Blocked(BlockReason::WaitingChild(grep_c)),
                     WaitOutcome::NoSuchChild => Step::Exit(90),
                 },
-                WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(cat_c)),
+                WaitOutcome::Blocked | WaitOutcome::Stopped(_) => Step::Blocked(BlockReason::WaitingChild(cat_c)),
                 WaitOutcome::NoSuchChild => Step::Exit(90),
             }
         }
@@ -879,7 +880,7 @@ fn blocking_shell(ctx: &mut Ctx<FC, FA>) -> Step {
                     let child = ctx.data[3] as u32;
                     match ctx.wait(child) {
                         WaitOutcome::Reaped(code) => ctx.exit(code),
-                        WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(child)),
+                        WaitOutcome::Blocked | WaitOutcome::Stopped(_) => Step::Blocked(BlockReason::WaitingChild(child)),
                         WaitOutcome::NoSuchChild => Step::Exit(90),
                     }
                 }
@@ -1003,7 +1004,7 @@ fn kill_group_sends_to_siblings() {
         let c1 = ctx.fork().unwrap();
         let _c2 = ctx.fork().unwrap();
         match ctx.wait(c1) {
-            WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(c1)),
+            WaitOutcome::Blocked | WaitOutcome::Stopped(_) => Step::Blocked(BlockReason::WaitingChild(c1)),
             _ => Step::Yield,
         }
     }));
@@ -1027,7 +1028,7 @@ fn kill_wakes_blocked_task() {
         }
         let c = ctx.fork().unwrap();
         match ctx.wait(c) {
-            WaitOutcome::Blocked => Step::Blocked(BlockReason::WaitingChild(c)),
+            WaitOutcome::Blocked | WaitOutcome::Stopped(_) => Step::Blocked(BlockReason::WaitingChild(c)),
             WaitOutcome::Reaped(code) => Step::Exit(code),
             _ => Step::Exit(2),
         }
