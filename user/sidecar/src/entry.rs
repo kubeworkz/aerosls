@@ -31,7 +31,18 @@ extern "C" {
     fn k_chan_recv(chan: u32, buf: *mut u8, buf_len: u32,
                    slots: *mut core::ffi::c_void, n_slots: u32,
                    out: *mut core::ffi::c_void) -> i32;
+    fn k_chan_wait(chans: *const u32, n: u32, timeout_ns: u64,
+                   out: *mut core::ffi::c_void) -> i32;
     fn k_yield();
+}
+
+/// Mirror of the kernel's SLSChanWaitOut: which channel woke + the head's
+/// kind. Only the error code matters here (recv does the real work).
+#[repr(C)]
+struct WaitOut {
+    idx: u32,
+    kind: u16,
+    pad: u16,
 }
 
 /// Result of the NET_INFO handshake, stored here so the linker cannot
@@ -124,6 +135,7 @@ pub extern "C" fn posix_net_info_handshake(net_w: u32, net_r: u32) -> u32 {
         needed: u16,
     }
     let mut out = RecvOut { kind: 0, flags: 0, tag: 0, len: 0, n_caps: 0, needed: 0 };
+    let mut wo = WaitOut { idx: 0, kind: 0, pad: 0 };
     for _attempt in 0..MAX_RETRIES {
         out = RecvOut { kind: 0, flags: 0, tag: 0, len: 0, n_caps: 0, needed: 0 };
         let recv_rc = unsafe {
@@ -140,9 +152,25 @@ pub extern "C" fn posix_net_info_handshake(net_w: u32, net_r: u32) -> u32 {
             unsafe { crate::applets::NETBOOT_OK = 1; }
             return 1;
         }
-        // Recv failed or timed out — the server hasn't replied yet.
-        // Yield so the network sidecar can run and process our request.
-        unsafe { k_yield(); }
+        // Recv failed or timed out — the server hasn't replied yet.  Park
+        // on the net channel with a finite deadline instead of spinning
+        // k_yield: once this sidecar is the only runnable process (init is
+        // parked in its supervisor loop, the drivers in theirs), k_yield
+        // returns INSTANTLY and the retry loop would give the network
+        // server's 200ms discovery poll zero wall time — NETBOOT FAILED
+        // every boot. A deadline park wakes at the deadline via the timer
+        // ISR (or early when the reply lands), so the server's poll +
+        // adopt + reply happens inside the retry window.
+        wo = WaitOut { idx: 0, kind: 0, pad: 0 };
+        let net_r_handle = net_r;
+        let _ = unsafe {
+            k_chan_wait(
+                &net_r_handle as *const u32,
+                1,
+                NET_INFO_TIMEOUT_NS,
+                &mut wo as *mut WaitOut as *mut core::ffi::c_void,
+            )
+        };
     }
     klog(b"[POSIX] NETBOOT FAILED: no NET_INFO reply after ", MAX_RETRIES, b" recv retries\n");
     0

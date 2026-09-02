@@ -855,6 +855,13 @@ void cap_unlock(struct CapSpinlock* l);
 #define SYS_SLS_IRQ_BIND     316
 #define SYS_SLS_IRQ_UNBIND   317
 #define SYS_SLS_IRQ_MASK     318
+/* Watchdog-respawn introspection: the current process's per-name boot
+ * generation. cap_create_sidecar registers every sidecar under its
+ * manifest NAME; re-registering the same name after a teardown (a
+ * watchdog respawn) bumps the generation, so a sidecar can tell its
+ * first boot (0) from a respawn (1, 2, ...). Returns a u32 generation
+ * directly in rax (no request struct). */
+#define SYS_SLS_BOOT_GEN     319
 
 /* Manifest record tags */
 #define SIDECAR_MANIFEST_MAGIC         "AERSLSM1"

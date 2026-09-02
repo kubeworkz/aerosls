@@ -98,7 +98,21 @@ void handle_page_fault(unsigned long error_code, unsigned long saved_rip,
                                  (i < 0 ? -i : i), (unsigned long)q);
             if ((i - 3) % 4 == 0) kernel_serial_printf("\n");
         }
-        kernel_serial_printf("\n");
+        /* A ring-3 exception enters ring 0 with GS_BASE == 0 (the CPU does
+         * not swapgs on exceptions and the fault stubs never do — ring 3
+         * ran with GS_BASE == 0). Everything the kill path runs from here
+         * — process_exit()'s teardown, cap_wake_chan(), and
+         * kernel_switch_next()'s swapgs before the resume iretq — assumes
+         * the syscall convention (GS_BASE == &per_cpu_data). Without
+         * normalizing to the kernel view first, kernel_switch_next()'s
+         * swapgs flips the WRONG direction, so the woken process's
+         * cap_recv_resume() swapgs's into the user view and
+         * .syscall_return reads [gs:0] from physical address 0 — the
+         * resumed process sysrets with RSP = 0xf000ff53f000ff53 (the stale
+         * real-mode IVT at physical 0) and #PF's. process_exit() never
+         * returns on this path, so we swapgs ONCE here and never swap back.
+         */
+        __asm__ volatile("swapgs" : : : "memory");
         process_exit(139);
         process_exit(139);   /* SIGSEGV-equivalent */
         /* process_exit() restores kernel context and does not return here */
@@ -313,6 +327,21 @@ void handle_ring3_fault(unsigned long error_code, unsigned long saved_cs, unsign
         kernel_serial_printf(
             "[FAULT] Ring-3 fault  cs=0x%lx  error=0x%lx  rip=0x%016lx  — killing process.\n",
             saved_cs, error_code, saved_rip);
+        /* A ring-3 exception enters ring 0 with GS_BASE == 0 (the CPU does
+         * not swapgs on exceptions and the fault stubs never do — ring 3
+         * ran with GS_BASE == 0). Everything the kill path runs from here
+         * — process_exit()'s teardown, cap_wake_chan(), and
+         * kernel_switch_next()'s swapgs before the resume iretq — assumes
+         * the syscall convention (GS_BASE == &per_cpu_data). Without
+         * normalizing to the kernel view first, kernel_switch_next()'s
+         * swapgs flips the WRONG direction, so the woken process's
+         * cap_recv_resume() swapgs's into the user view and
+         * .syscall_return reads [gs:0] from physical address 0 — the
+         * resumed process sysrets with RSP = 0xf000ff53f000ff53 (the stale
+         * real-mode IVT at physical 0) and #PF's. process_exit() never
+         * returns on this path, so we swapgs ONCE here and never swap back.
+         */
+        __asm__ volatile("swapgs" : : : "memory");
         process_exit(134);
     }
     /* ─── The essential facts first, by the path that cannot be swallowed ──

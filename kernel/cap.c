@@ -2240,8 +2240,8 @@ void cap_irq_notify(uint32_t vector) {
      * the device. The LAPIC timer (vector 32) is unaffected — its edges
      * come from the local LAPIC, not the IO-APIC pin. */
     if (vector >= 0x20u) cap_irq_set_mask(vector, 1);
+
     uint16_t chan_id = g_irq_chan[vector];
-    if (chan_id == CAP_NONE) { cap_irq_eoi(vector); return; }
     struct CapChannel* ch = &cap_channels[chan_id];
     if (!ch->active) { cap_irq_eoi(vector); return; }
 
@@ -2858,12 +2858,47 @@ static void sidecar_strcpy(char* d, const char* s, int n) {
 static struct SidecarRegistryEntry {
     char     name[SIDECAR_REGISTRY_NAME_LEN];
     uint32_t pid;
+    /* Boot generation: how many prior instances of this NAME have been
+     * created this kernel session (0 = first). Persistent — the counter
+     * array below is never cleared, so a respawn after teardown reads
+     * back a nonzero generation even though the entry was dropped. */
+    uint32_t gen;
     uint8_t  active;
 } sidecar_registry[SIDECAR_REGISTRY_MAX];
 
+/* Per-name spawn counters, keyed the same way as the registry. NEVER
+ * cleared on teardown: this is what lets a respawned sidecar (e.g. a
+ * watchdog-restarted driver) tell its first boot from a restart. */
+static struct SidecarGenCounter {
+    char     name[SIDECAR_REGISTRY_NAME_LEN];
+    uint32_t seen;   /* instances of this name created so far */
+} sidecar_gen_counters[SIDECAR_REGISTRY_MAX];
+
+/* Returns the generation for a fresh instance of `name` (0-based) and
+ * records it as seen. The counter array is append-only per unique name;
+ * a name that fills a slot keeps bumping forever. */
+static uint32_t sidecar_gen_next(const char* name) {
+    if (!name || !name[0]) return 0;
+    for (int i = 0; i < SIDECAR_REGISTRY_MAX; i++) {
+        if (sidecar_gen_counters[i].seen && sidecar_streq(sidecar_gen_counters[i].name, name)) {
+            return sidecar_gen_counters[i].seen++;
+        }
+    }
+    for (int i = 0; i < SIDECAR_REGISTRY_MAX; i++) {
+        if (sidecar_gen_counters[i].seen) continue;
+        sidecar_strcpy(sidecar_gen_counters[i].name, name, SIDECAR_REGISTRY_NAME_LEN);
+        sidecar_gen_counters[i].seen = 1;
+        return 0;
+    }
+    return 0;   /* table full: report generation 0 rather than stall a spawn */
+}
+
 void sidecar_registry_init(void) {
-    for (int i = 0; i < SIDECAR_REGISTRY_MAX; i++)
+    for (int i = 0; i < SIDECAR_REGISTRY_MAX; i++) {
         sidecar_registry[i].active = 0;
+        sidecar_registry[i].gen = 0;
+        sidecar_gen_counters[i].seen = 0;
+    }
 }
 
 int sidecar_registry_register(const char* name, uint32_t pid) {
@@ -2872,13 +2907,18 @@ int sidecar_registry_register(const char* name, uint32_t pid) {
      * sidecar keeps its identity; later spawns simply re-point the name). */
     for (int i = 0; i < SIDECAR_REGISTRY_MAX; i++) {
         struct SidecarRegistryEntry* e = &sidecar_registry[i];
-        if (e->active && sidecar_streq(e->name, name)) { e->pid = pid; return 0; }
+        if (e->active && sidecar_streq(e->name, name)) {
+            e->pid = pid;
+            e->gen = sidecar_gen_next(name);
+            return 0;
+        }
     }
     for (int i = 0; i < SIDECAR_REGISTRY_MAX; i++) {
         struct SidecarRegistryEntry* e = &sidecar_registry[i];
         if (e->active) continue;
         sidecar_strcpy(e->name, name, SIDECAR_REGISTRY_NAME_LEN);
         e->pid = pid;
+        e->gen = sidecar_gen_next(name);
         e->active = 1;
         return 0;
     }
@@ -2893,6 +2933,24 @@ uint32_t sidecar_registry_resolve(const char* name) {
         if (e->active && sidecar_streq(e->name, name)) return e->pid;
     }
     return 0;   /* not found */
+}
+
+/* Boot generation of the CURRENT instance of `pid` (0 = first boot of
+ * that sidecar's name, 1+ = a watchdog respawn). Non-registered pids
+ * (e.g. kernel context) read 0. */
+uint32_t sidecar_registry_gen_of(uint32_t pid) {
+    if (pid == 0) return 0;
+    for (int i = 0; i < SIDECAR_REGISTRY_MAX; i++) {
+        struct SidecarRegistryEntry* e = &sidecar_registry[i];
+        if (e->active && e->pid == pid) return e->gen;
+    }
+    return 0;
+}
+
+/* SYS_SLS_BOOT_GEN (319): the caller's own boot generation, straight in
+ * rax. No request struct — the dispatch path passes NULL. */
+uint64_t sys_sls_boot_gen(void) {
+    return (uint64_t)sidecar_registry_gen_of(cap_current_pid());
 }
 
 uint32_t sidecar_registry_count(void) {

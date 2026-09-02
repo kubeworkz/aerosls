@@ -77,8 +77,6 @@ pub fn run<K: Kernel>(k: &K, eps: &mut EndpointSet, dev: &Device) -> Result<(), 
         // When no client has connected yet, use a finite deadline to
         // periodically re-scan for newly-wired channels (e.g. the POSIX
         // sidecar's ramdisk channel, wired after this sidecar booted).
-        // Once a client connects, block with TIMEOUT_NONE to avoid a
-        // CPU-burning busy-loop.
         let poll_ns: u64 = if eps.has_active_client() {
             kapi::TIMEOUT_NONE
         } else {

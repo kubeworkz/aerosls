@@ -4966,8 +4966,22 @@ pub fn irqtest<K: Kernel, A: BufferAlloc>(_ctx: &mut Ctx<'_, K, A>) -> Step {
             kind: 0,
             pad: 0,
         };
-        if unsafe { k_chan_wait(&(chan as u32), 1, timeout_ns, &mut wout) } != 0 {
-            return None;
+        // k_chan_wait can return CAP_ERR_TIMEOUT on a *spurious* wake:
+        // any IRQ that interrupts the park hlt re-polls the channel empty
+        // and aborts the wait even though the deadline has NOT elapsed (the
+        // kernel does not re-park across the wake). The edge we need lands
+        // within a tick or two, so retry a few times before giving up.
+        let mut attempt = 0u32;
+        loop {
+            let rc =
+                unsafe { k_chan_wait(&(chan as u32), 1, timeout_ns, &mut wout) };
+            if rc == 0 {
+                break;
+            }
+            attempt += 1;
+            if attempt >= 5 {
+                return None;
+            }
         }
         let mut buf = [0u8; 8];
         let mut rout = IrqRecvOut {
@@ -5067,6 +5081,14 @@ pub fn irqtest<K: Kernel, A: BufferAlloc>(_ctx: &mut Ctx<'_, K, A>) -> Step {
                     swrite(b"\n");
                 }
                 t => {
+                    // Loopback is still ON here; reset so the FAIL text is
+                    // not swallowed (see the post-identify reset comment).
+                    if let Some(u) = uart {
+                        unsafe {
+                            k_io_out(u, 1, 1, 0);
+                            k_io_out(u, 4, 1, 0);
+                        }
+                    }
                     swrite(b"[irqtest] FAIL: unexpected notification tag\n");
                     return Step::Exit(1);
                 }
@@ -5074,10 +5096,25 @@ pub fn irqtest<K: Kernel, A: BufferAlloc>(_ctx: &mut Ctx<'_, K, A>) -> Step {
         }
     }
     if chan32 == 0xFFFF {
+        // Loopback is still ON here (phase 2 reuses it); reset IER/MCR so
+        // the ring-drained FAIL text reaches the wire — a loopbacked THR
+        // write never leaves the chip, so a FAIL would look like a stall.
+        if let Some(u) = uart {
+            unsafe {
+                k_io_out(u, 1, 1, 0); // IER off
+                k_io_out(u, 4, 1, 0); // MCR loopback off
+            }
+        }
         swrite(b"[irqtest] FAIL: timer vector 32 never delivered\n");
         return Step::Exit(1);
     }
     if chan36 == 0xFFFF && n_bound >= 2 {
+        if let Some(u) = uart {
+            unsafe {
+                k_io_out(u, 1, 1, 0); // IER off
+                k_io_out(u, 4, 1, 0); // MCR loopback off
+            }
+        }
         swrite(b"[irqtest] FAIL: serial vector 36 never delivered\n");
         return Step::Exit(1);
     }
@@ -5297,8 +5334,101 @@ pub fn irqtest<K: Kernel, A: BufferAlloc>(_ctx: &mut Ctx<'_, K, A>) -> Step {
                     b"[irqtest] PASS: stuck-driver: 3/3 windows masked clean, 3/3 recoveries\n",
                 );
                 unsafe { k_yield(); }
+                // ── Phase 4: kill the bound driver mid-storm; the
+                //    watchdog (init) respawns this sidecar; the fresh
+                //    process re-binds vector 36 (teardown freed it) and
+                //    re-passes every phase above. The IRQ cap is
+                //    single-use, so a clean re-bind is possible ONLY from
+                //    a fresh process: the driver dies by a deliberate
+                //    user-mode fault (#UD), the kernel tears the process
+                //    down (which frees the vector), and SYS_SLS_BOOT_GEN
+                //    (319) tells the respawned boot (1+) from the first
+                //    (0) so it finishes instead of dying again. All
+                //    output stays on the pending-TX ring so the storm
+                //    prints survive intact.
+                swrite(b"[irqtest] p4: boot gen =");
+                let gen = unsafe { k_boot_gen() };
+                swrite(match gen {
+                    0 => b"0 (first boot)\n",
+                    1 => b"1 (watchdog respawn)\n",
+                    _ => b"2+ (watchdog respawn)\n",
+                });
+                unsafe { k_yield(); }
+                if gen == 0 {
+                    // Storm the serial line: three loopback edges with
+                    // re-arms, printing progress through the ring, then
+                    // die mid-storm.
+                    let mut storm = 0u32;
+                    unsafe {
+                        k_io_out(uart, 4, 1, 0x10); // MCR loopback on
+                        k_io_out(uart, 1, 1, 0x01); // IER received-data intr
+                    }
+                    while storm < 3 {
+                        drain_rbr(uart, 4);
+                        if unsafe { k_irq_mask(chan36, 0) } != 0 {
+                            break; // re-arm failed: FAIL path below
+                        }
+                        unsafe { k_io_out(uart, 0, 1, 0x41); } // 'A' loops back
+                        if let Some(r) = wait_recv(chan36, 1_000_000_000) {
+                            if r.tag == 36 {
+                                drain_rbr(uart, 4);
+                                let rc = unsafe { k_irq_mask(chan36, 0) };
+                                if rc == 0 {
+                                    storm += 1;
+                                }
+                            }
+                        }
+                        swrite(match storm {
+                            1 => b"[irqtest] p4 storm edge 1\n",
+                            2 => b"[irqtest] p4 storm edge 2\n",
+                            _ => b"[irqtest] p4 storm edge 3\n",
+                        });
+                        unsafe { k_yield(); }
+                    }
+                    unsafe {
+                        k_io_out(uart, 1, 1, 0); // IER off
+                        k_io_out(uart, 4, 1, 0); // loopback off
+                    }
+                    if storm == 3 {
+                        swrite(b"[irqtest] p4: storming, killing the driver process now\n");
+                        // The pump only drains the ring when a step
+                        // RETURNS, and we are about to die inside this
+                        // one — flush the ring directly through the 165
+                        // path so every phase line survives the kill.
+                        unsafe {
+                            while crate::applets::IRQTEST_TX_HEAD
+                                != crate::applets::IRQTEST_TX_TAIL
+                            {
+                                let (pp, ll) = crate::applets::IRQTEST_TX_RING
+                                    [crate::applets::IRQTEST_TX_HEAD as usize];
+                                if !pp.is_null() && ll > 0 {
+                                    posix_serial_print(pp, ll);
+                                }
+                                crate::applets::IRQTEST_TX_HEAD =
+                                    (crate::applets::IRQTEST_TX_HEAD + 1) % 256;
+                            }
+                        }
+                        // Deliberate #UD: handle_ring3_fault kills this
+                        // process; teardown frees vector 36; init's
+                        // watchdog respawns the sidecar from the manifest.
+                        unsafe { core::arch::asm!("ud2", options(noreturn)) }
+                    } else {
+                        swrite(b"[irqtest] FAIL: p4 storm incomplete\n");
+                        for _ in 0..8 {
+                            unsafe { k_yield(); }
+                        }
+                        return Step::Exit(1);
+                    }
+                }
+                // Respawned boot (gen >= 1): every phase above already
+                // re-ran and re-passed on the fresh process, so the clean
+                // re-bind of vectors 32 + 36 IS the verification.
                 swrite(
-                    b"[irqtest] ALL PHASES PASS: timer 50/50, serial loopback 10/10, stuck-driver 3/3\n",
+                    b"[irqtest] PASS: watchdog respawn: fresh process re-bound and re-passed all phases\n",
+                );
+                unsafe { k_yield(); }
+                swrite(
+                    b"[irqtest] ALL PHASES PASS: timer 50/50, serial loopback 10/10, stuck-driver 3/3, driver-death respawn OK\n",
                 );
                 for _ in 0..8 {
                     unsafe { k_yield(); }
@@ -5393,6 +5523,7 @@ extern "C" {
     ) -> i32;
     fn k_io_out(handle: u32, index: u16, size: u8, val: u32) -> i32;
     fn k_io_in(handle: u32, index: u16, size: u8, out: *mut u32) -> i32;
+    fn k_boot_gen() -> u64;
     fn k_yield();
     fn posix_serial_print(data: *const u8, len: u32);
 }
@@ -5442,6 +5573,11 @@ pub unsafe extern "C" fn k_io_out(_h: u32, _i: u16, _s: u8, _v: u32) -> i32 {
 #[no_mangle]
 pub unsafe extern "C" fn k_io_in(_h: u32, _i: u16, _s: u8, _o: *mut u32) -> i32 {
     -1
+}
+#[cfg(not(feature = "target"))]
+#[no_mangle]
+pub unsafe extern "C" fn k_boot_gen() -> u64 {
+    0
 }
 
 /// Host/test-only implementation of the applet serial sink (entry.rs

@@ -380,8 +380,15 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
 
     // The POSIX sidecar's manifest declares budget + console + ramdisk + network caps.
     // The network CHAN cap is wired by the kernel to drv.network.0 (must be registered first).
-    // The ramdisk CHAN cap is wired to drv.ramdisk.0.
-    spawn_posix_sidecar(&console, posix_image_cap, posix_heap_base);
+    // The ramdisk CHAN cap is wired to drv.ramdisk.0. We KEEP the
+    // messenger channel: its CLOSE event (on process death) is what the
+    // watchdog below parks on to respawn a crashed POSIX sidecar.
+    let posix_channel = spawn_posix_sidecar(
+        &console,
+        posix_image_cap.base,
+        posix_image_cap.len as u32,
+        posix_heap_base,
+    );
     // Yield multiple times to give the ramdisk sidecar time to
     // re-scan its cap table, discover the POSIX ramdisk channel,
     // and be ready to handle RD_INFO before POSIX sends it.
@@ -407,15 +414,16 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     // bounded — a crash-looping DM makes the loop give up (crash-loop
     // breaker) instead of respawning forever.
     log(&console, "[INIT] entering the event loop (blocking wait + watchdog respawn)...");
-    let policy = demo::RespawnPolicy::default();
-    let respawn = |attempt: u32| -> Result<InitChannel<RealKernel>, ChannelError> {
+    let dm_policy = demo::RespawnPolicy::default();
+    let dm_image_copy = dm_image; // scalars, owned by the closure below
+    let respawn_dm = |attempt: u32| -> Result<InitChannel<RealKernel>, ChannelError> {
         log_fmt!(
             &console,
             "[INIT] Device Manager died; respawning (restart {}, backoff {} ns)...",
             attempt,
-            policy.backoff_for(attempt),
+            dm_policy.backoff_for(attempt),
         );
-        let dm = spawn_device_manager(&console, dm_image);
+        let dm = spawn_device_manager(&console, dm_image_copy);
         // Re-run the registry handshake against the fresh DM: blocking
         // send (timeout 0 — a full queue parks us), then the
         // finite-deadline wait for "devices ready".
@@ -430,12 +438,51 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         }
         Ok(dm)
     };
-    match demo::run_resilient_loop(&console, dm_channel, &policy, respawn) {
-        Ok(()) => log(&console, "[INIT] event loop exited."),
+    // POSIX sidecar watchdog: when irqtest's driver-death phase kills the
+    // process mid-storm, the kernel teardown closes this messenger and
+    // frees the bound vectors; the respawn below creates a FRESH POSIX
+    // process from the same manifest (fresh single-use IRQ caps), which
+    // re-binds vector 36 and re-passes the irqtest phases.
+    let posix_policy = demo::RespawnPolicy {
+        base_backoff_ns: 100_000_000,  // 100 ms
+        max_backoff_ns: 1_000_000_000, // 1 s cap (one restart expected)
+        max_restarts: 3,
+    };
+    let (posix_kaddr, posix_size, posix_heap) = (
+        posix_image_cap.base,
+        posix_image_cap.len as u32,
+        posix_heap_base,
+    );
+    let respawn_posix = |attempt: u32| -> Result<InitChannel<RealKernel>, ChannelError> {
+        log_fmt!(
+            &console,
+            "[INIT] POSIX sidecar died; respawning (restart {}, backoff {} ns)...",
+            attempt,
+            posix_policy.backoff_for(attempt),
+        );
+        let p = spawn_posix_sidecar(&console, posix_kaddr, posix_size, posix_heap);
+        log_fmt!(
+            &console,
+            "[INIT] respawned POSIX messenger: CHAN_R={} CHAN_W={}",
+            p.r,
+            p.w,
+        );
+        Ok(p)
+    };
+    match demo::run_supervisor_loop(
+        &console,
+        dm_channel,
+        &dm_policy,
+        respawn_dm,
+        posix_channel,
+        &posix_policy,
+        respawn_posix,
+    ) {
+        Ok(()) => log(&console, "[INIT] supervisor event loop exited."),
         Err(ChannelError::TooManyRestarts) => {
-            log(&console, "[INIT] Device Manager crash-looped; giving up respawns.")
+            log(&console, "[INIT] a supervised sidecar crash-looped; giving up respawns.")
         }
-        Err(e) => log_fmt!(&console, "[INIT] event loop error: {}", e),
+        Err(e) => log_fmt!(&console, "[INIT] supervisor event loop error: {}", e),
     }
     loop {
         core::hint::spin_loop();
@@ -504,25 +551,23 @@ fn spawn_ramdisk_driver(
 /// the budget heap base is computed from the image cap (page-aligned after image).
 fn spawn_posix_sidecar(
     console: &InitChannel<RealKernel>,
-    image_cap: &aerosls_proto::bootinfo::BootCap<'_>,
+    image_kaddr: u64,
+    image_size: u32,
     heap_base: u64,
-) {
+) -> InitChannel<RealKernel> {
     log_fmt!(
         console,
         "[INIT]   (create_sidecar: {} image @ 0x{:x}, {} bytes)",
         posix_manifest::POSIX_MANIFEST_NAME,
-        image_cap.base,
-        image_cap.len,
+        image_kaddr,
+        image_size,
     );
-    let manifest = posix_manifest::build_posix_manifest(
-        image_cap.base,
-        image_cap.len as u32,
-        heap_base,
-    );
+    let manifest = posix_manifest::build_posix_manifest(image_kaddr, image_size, heap_base);
     let (r, w) = RealKernel
         .create_sidecar(&manifest)
         .unwrap_or_else(|e| panic!("[INIT] POSIX create_sidecar failed: {e}"));
     log_fmt!(console, "[INIT]   POSIX messenger: CHAN_R={r} CHAN_W={w}");
+    InitChannel::new(RealKernel, r, w)
 }
 
 /// Spawn the network driver through the real kernel path (`SYS_SLS_CREATE_SIDECAR`).

@@ -227,6 +227,103 @@ where
     }
 }
 
+/// The watchdog supervisor loop — init's event loop once it supervises
+/// TWO children (the Device Manager and the POSIX sidecar). Blocks
+/// (TIMEOUT_NONE park) on BOTH children's receive ends; whichever queued
+/// an event is handled that iteration:
+///
+/// - **MSG** — a child notification, logged with a blocking console send.
+/// - **CLOSE** — the child died (CLOSE_PEER_DEAD from the teardown scan,
+///   or an explicit close): sleep the bounded backoff (the
+///   deadline-wait-as-sleep trick on the dead endpoint), respawn the
+///   child via its OWN closure, and re-enter the loop on the fresh
+///   channel. Each child keeps its own restart budget; when one exhausts
+///   its budget the loop returns `TooManyRestarts` (crash-loop breaker).
+///
+/// The POSIX sidecar is the driver-death demo's watchdog subject: when
+/// irqtest kills its process mid-storm, the kernel teardown frees the
+/// bound vectors and closes init's messenger endpoint — the CLOSE here is
+/// what triggers the respawn, and the respawned process re-binds the
+/// vectors cleanly (its manifest caps are fresh).
+pub fn run_supervisor_loop<K: Kernel, FA, FB>(
+    console: &InitChannel<K>,
+    mut a: InitChannel<K>,
+    pa: &RespawnPolicy,
+    mut respawn_a: FA,
+    mut b: InitChannel<K>,
+    pb: &RespawnPolicy,
+    mut respawn_b: FB,
+) -> Result<(), ChannelError>
+where
+    FA: FnMut(u32) -> Result<InitChannel<K>, ChannelError>,
+    FB: FnMut(u32) -> Result<InitChannel<K>, ChannelError>,
+{
+    let mut buf = [0u8; 128];
+    let mut restarts_a: u32 = 0;
+    let mut restarts_b: u32 = 0;
+    loop {
+        let mut chans = [a.r, b.r];
+        let (idx, kind) = loop {
+            match console.kernel().wait(&mut chans, TIMEOUT_NONE) {
+                Ok(v) => break v,
+                Err(code) if code == aerosls_proto::kabi::ERR_TIMEOUT => {
+                    // Nothing arrived AND the park could not happen (no
+                    // other process was runnable that tick — chan.c's
+                    // k_chan_wait returns CAP_ERR_TIMEOUT = "retry" for
+                    // that case). Give the scheduler a turn so a woken or
+                    // freshly-spawned child can run, then re-enter the
+                    // wait. Fatal only for genuine errors (revoked
+                    // handles, protocol faults). Without this, a
+                    // momentarily-unparkable wait would kill the
+                    // supervisor loop at boot and the watchdog could never
+                    // respawn a crashed POSIX sidecar.
+                    console.kernel().sched_yield();
+                }
+                Err(code) => return Err(ChannelError::Kernel(code)),
+            }
+        };
+        if idx == 0 {
+            match kind {
+                aerosls_proto::CH_KIND_MSG => match a.recv_msg(&mut buf) {
+                    Ok(_tag) => {
+                        let _ = console.request(0, b"[INIT] Device Manager notification");
+                    }
+                    Err(e) => return Err(e),
+                },
+                CH_KIND_CLOSE => {
+                    let (_reason, _detail) = a.recv_close()?;
+                    if restarts_a >= pa.max_restarts {
+                        return Err(ChannelError::TooManyRestarts);
+                    }
+                    backoff_sleep(&a, pa.backoff_for(restarts_a + 1));
+                    a = respawn_a(restarts_a + 1)?;
+                    restarts_a += 1;
+                }
+                other => return Err(ChannelError::UnexpectedKind(other)),
+            }
+        } else {
+            match kind {
+                aerosls_proto::CH_KIND_MSG => match b.recv_msg(&mut buf) {
+                    Ok(_tag) => {
+                        let _ = console.request(0, b"[INIT] POSIX sidecar notification");
+                    }
+                    Err(e) => return Err(e),
+                },
+                CH_KIND_CLOSE => {
+                    let (_reason, _detail) = b.recv_close()?;
+                    if restarts_b >= pb.max_restarts {
+                        return Err(ChannelError::TooManyRestarts);
+                    }
+                    backoff_sleep(&b, pb.backoff_for(restarts_b + 1));
+                    b = respawn_b(restarts_b + 1)?;
+                    restarts_b += 1;
+                }
+                other => return Err(ChannelError::UnexpectedKind(other)),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,6 +532,61 @@ mod tests {
         // (the real kernel parks). The loop surfaces that as the sim's
         // documented non-blocking outcome — the respawn path itself
         // already succeeded.
+        assert_eq!(result, Err(ChannelError::UnexpectedKind(CH_KIND_NONE)));
+    }
+
+    #[test]
+    fn supervisor_loop_respawns_each_child_independently() {
+        // ch1 = console, ch2 = DM, ch3 = respawned DM,
+        // ch4 = POSIX, ch5 = respawned POSIX.
+        let k = shared_with_chans(&[1, 2, 3, 4, 5]);
+        let console = InitChannel::new_single(k.clone(), 1);
+        let dm = InitChannel::new_single(k.clone(), 2);
+        let posix = InitChannel::new_single(k.clone(), 4);
+
+        // Both children die (teardown scan emits CLOSE_PEER_DEAD + pid).
+        k.sim().inject_close(2, CLOSE_PEER_DEAD, 42);
+        k.sim().inject_close(4, CLOSE_PEER_DEAD, 104);
+
+        let policy = RespawnPolicy {
+            base_backoff_ns: 10,
+            max_backoff_ns: 40,
+            max_restarts: 3,
+        };
+        let mut dm_respawns = 0;
+        let mut posix_respawns = 0;
+        let result = run_supervisor_loop(
+            &console,
+            dm,
+            &policy,
+            |attempt| {
+                dm_respawns += 1;
+                assert_eq!(attempt, 1);
+                k.sim().inject_msg(3, 0x99, b"dm alive after respawn");
+                Ok(InitChannel::new_single(k.clone(), 3))
+            },
+            posix,
+            &policy,
+            |attempt| {
+                posix_respawns += 1;
+                assert_eq!(attempt, 1);
+                k.sim().inject_msg(5, 0x77, b"posix alive after respawn");
+                Ok(InitChannel::new_single(k.clone(), 5))
+            },
+        );
+
+        // Both children died once and were each respawned by their own
+        // closure — the watchdog supervised them independently.
+        assert_eq!(dm_respawns, 1);
+        assert_eq!(posix_respawns, 1);
+
+        // Both respawned children's notifications were dispatched through
+        // the live loop to the console (the blocking send after dispatch).
+        assert_eq!(k.sim().queue_len(1), 2);
+
+        // With nothing else queued the sim's non-blocking TIMEOUT_NONE
+        // wait reports CH_KIND_NONE, which the loop surfaces as an error
+        // exactly like the single-child loop does.
         assert_eq!(result, Err(ChannelError::UnexpectedKind(CH_KIND_NONE)));
     }
 

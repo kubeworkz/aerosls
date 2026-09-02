@@ -89,6 +89,8 @@ uint64_t do_syscall(uint64_t num, void* arg) {
         return sys_sls_irq_unbind((struct SLSIrqUnbindRequest*)arg);
     case SYS_SLS_IRQ_MASK:
         return sys_sls_irq_mask((struct SLSIrqMaskRequest*)arg);
+    case SYS_SLS_BOOT_GEN:
+        return sys_sls_boot_gen();
     default:
         break;
     }

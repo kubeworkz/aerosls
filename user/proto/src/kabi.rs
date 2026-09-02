@@ -241,6 +241,7 @@ mod abi {
     const SYS_IRQ_BIND: u64 = 316;
     const SYS_IRQ_UNBIND: u64 = 317;
     const SYS_IRQ_MASK: u64 = 318;
+    const SYS_BOOT_GEN: u64 = 319;
     const SYS_YIELD: u64 = 300;
 
     /// The raw syscall instruction (same convention as
@@ -774,6 +775,16 @@ mod abi {
             _pad: [0; 5],
         };
         unsafe { sls_syscall(SYS_IRQ_MASK, &mut req as *mut IrqMaskReq as u64) as i32 }
+    }
+
+    /// Watchdog-respawn introspection (SYS_SLS_BOOT_GEN = 319): the
+    /// current process's per-name boot generation — 0 on its first boot,
+    /// 1+ after a watchdog respawn (a fresh process created from the same
+    /// manifest NAME after a teardown). The value comes straight back in
+    /// rax; no request struct.
+    #[no_mangle]
+    pub extern "C" fn k_boot_gen() -> u64 {
+        unsafe { sls_syscall(SYS_BOOT_GEN, 0) }
     }
 
     /// The real kernel ABI. Only constructible/usable on the sidecar target.
