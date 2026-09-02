@@ -59,3 +59,11 @@ int console_feed(char c, char* out, size_t cap) {
      * accepted that will not be in the command. */
     return 0;
 }
+
+/* Drop the partial line (no echo). Used when the UART's loopback mode
+ * clears: any bytes absorbed around the demo's loopback edges are
+ * device-internal traffic, not console input — mixing them with the next
+ * real line silently corrupts the first typed command. */
+void console_reset_line(void) {
+    console_len = 0;
+}

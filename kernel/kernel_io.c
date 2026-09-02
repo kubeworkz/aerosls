@@ -293,6 +293,29 @@ void kernel_serial_printf(const char* fmt, ...) {
                                // on the HTTP loop
 
 int serial_console_poll(char* out, size_t cap) {
+    /* UART loopback (MCR bit 4) is device-internal traffic, not console
+     * input: the irqtest demo drives loopback edges whose bytes race this
+     * poll and would otherwise be absorbed into console_feed's line
+     * editor, then merge with the first real line typed after boot
+     * (caught live: "Acaps" exec'd instead of "caps", silently dropping
+     * the first typed command). While loopback is on, DISCARD the FIFO
+     * (the demo drains what it needs); and when loopback just cleared,
+     * discard any residue and reset the partial line before real input
+     * can mix with it. */
+    static int prev_loopback = 0;
+    if (inb(SERIAL_COM1_BASE + 4) & 0x10) {
+        while (inb(SERIAL_COM1_BASE + 5) & 0x01)
+            (void)inb(SERIAL_COM1_BASE);
+        prev_loopback = 1;
+        return 0;
+    }
+    if (prev_loopback) {
+        while (inb(SERIAL_COM1_BASE + 5) & 0x01)
+            (void)inb(SERIAL_COM1_BASE);
+        console_reset_line();
+        prev_loopback = 0;
+        return 0;
+    }
     for (int n = 0; n < CONSOLE_DRAIN_MAX; n++) {
         if (!(inb(SERIAL_COM1_BASE + 5) & 0x01)) return 0;   /* FIFO empty */
         if (console_feed((char)inb(SERIAL_COM1_BASE), out, cap))

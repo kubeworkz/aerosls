@@ -125,6 +125,7 @@ void smp_uniprocessor_tick(void) { }
 int console_feed(char c, char *out, size_t cap) {
     (void)c; (void)out; (void)cap; return 0;
 }
+void console_reset_line(void) { }
 
 int main(void) {
     printf("kernel_panic_output_host_test\n");

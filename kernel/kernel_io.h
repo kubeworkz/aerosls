@@ -57,6 +57,7 @@ void read_line(char* buf);
  * which is the operator's signal, and a truncated command that ran anyway
  * would be worse than one that visibly did not fit. */
 int console_feed(char c, char* out, size_t cap);
+void console_reset_line(void);
 
 /* Drain whatever the UART has, up to a bounded number of bytes, feeding
  * each to console_feed(). Returns the LENGTH of the completed line in
