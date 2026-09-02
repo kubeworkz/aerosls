@@ -88,6 +88,30 @@ void console_service_tick(void) {
             for (uint32_t s = 0; s < CAP_TABLE_ENTRIES; s++) {
                 uint64_t w = cap_tables[0].slots[s].word;
                 if (!console_is_chan_w(w)) continue;
+                /* Skip consoles whose peer has NOT drained the previous
+                 * line: the non-interactive sidecars (init/dm/ramdisk/
+                 * network) never recv their console input, so every
+                 * forwarded line pins a 4 KiB payload-pool frame until
+                 * the 32-frame pool exhausts (~7 lines), starving the
+                 * interactive shell's console with ENOSPC (caught live:
+                 * typed line 7 of a 20-line soak never executed). The
+                 * interactive consumer drains within a pump iteration,
+                 * so its queue is empty between lines. */
+                uint32_t obj_id =
+                    (uint32_t)((w >> CAP_OBJ_SHIFT) & CAP_OBJ_MASK);
+                int undrained = 0;
+                if (obj_id < CAP_OBJECT_MAX) {
+                    struct CapObject* o = &cap_objects[obj_id];
+                    if (o->active && o->kind == CAP_OBJ_KIND_CHAN &&
+                        o->chan_id < CAP_CHAN_MAX) {
+                        struct CapChannel* ch = &cap_channels[o->chan_id];
+                        int dest = (0 == ch->end0_pid) ? 1 : 0;
+                        cap_lock(&ch->lock);
+                        undrained = (ch->qdepth[dest] > 0);
+                        cap_unlock(&ch->lock);
+                    }
+                }
+                if (undrained) continue;
                 cap_send_msg(0, (uint16_t)s,
                              console_input_buf, (uint32_t)n,
                              0, 0, 0, 0);
