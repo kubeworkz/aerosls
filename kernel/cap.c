@@ -2242,6 +2242,7 @@ void cap_irq_notify(uint32_t vector) {
     if (vector >= 0x20u) cap_irq_set_mask(vector, 1);
 
     uint16_t chan_id = g_irq_chan[vector];
+    if (chan_id == CAP_NONE) { cap_irq_eoi(vector); return; }
     struct CapChannel* ch = &cap_channels[chan_id];
     if (!ch->active) { cap_irq_eoi(vector); return; }
 
