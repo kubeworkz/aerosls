@@ -299,8 +299,8 @@ fn build_posix_manifest(spec: &BootImageSpec, layout: &BootLayout, blob_offset: 
             },
         }),
         // Driver SDK ABI v0.1 s4.3 — single-use bind cap for the LAPIC
-        // timer vector (32). Spawned before irqtest runs, so the sidecar
-        // can bind it and prove edge-to-channel delivery on real hardware.
+        // timer vector (32). irqtest binds it and proves edge-to-channel
+        // delivery on real hardware.
         Some(ManifestCap {
             name: "irq.timer.0",
             rights: 0x1, // CAP_PERM_BIND
@@ -309,8 +309,26 @@ fn build_posix_manifest(spec: &BootImageSpec, layout: &BootLayout, blob_offset: 
                 perms: 0x1, // CAP_PERM_BIND
             },
         }),
-        None,
-        None,
+        // s4.3 — the serial port's IRQ4 (vector 36, IO-APIC pin 4): the
+        // non-timer line irqtest drives in UART loopback.
+        Some(ManifestCap {
+            name: "irq.serial.0",
+            rights: 0x1, // CAP_PERM_BIND
+            kind: CapKind::Irq {
+                vector: 36,
+                perms: 0x1, // CAP_PERM_BIND
+            },
+        }),
+        // s4.2 — COM1's port range (R | W) for the loopback demo.
+        Some(ManifestCap {
+            name: "uart",
+            rights: 0x3, // R | W
+            kind: CapKind::Io {
+                base: 0x3F8,
+                count: 8,
+                perms: 0x3,
+            },
+        }),
         None,
         None,
         None,
@@ -349,7 +367,7 @@ fn build_posix_manifest(spec: &BootImageSpec, layout: &BootLayout, blob_offset: 
             chan_queue_depth: 16,
         }),
         caps,
-        n_caps: 5,
+        n_caps: 7,
         bootstrap: Some(Bootstrap {
             console: Some("console"),
             debug: None,

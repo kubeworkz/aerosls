@@ -62,6 +62,7 @@ pub const TAG_LIMITS: u16 = 0x0005;
 pub const TAG_CAP_MEM: u16 = 0x0006;
 pub const TAG_CAP_CHAN: u16 = 0x0007;
 pub const TAG_CAP_IRQ: u16 = 0x000B;
+pub const TAG_CAP_IO: u16 = 0x000C;
 pub const TAG_BOOTSTRAP: u16 = 0x0008;
 pub const TAG_FLAGS: u16 = 0x0009;
 /// Sidecar identity: the instance name other manifests' `CAP_CHAN` peer
@@ -179,6 +180,11 @@ pub enum CapKind<'a> {
     /// right (`CAP_PERM_BIND`). Minted by `cap_create_sidecar`;
     /// `k_irq_bind` stamps it REVOKED at bind time.
     Irq { vector: u32, perms: u16 },
+    /// `CAP_IO` (Driver SDK ABI v0.1 s4.2): a port-range cap. `base` is the
+    /// first I/O port, `count` the number of ports, `perms` the R/W bits.
+    /// Minted by `cap_create_sidecar`; `k_io_in`/`k_io_out` enforce the
+    /// range (port = base + index, index + size <= count).
+    Io { base: u32, count: u16, perms: u16 },
 }
 
 /// The `BOOTSTRAP` record — debug plumbing.
@@ -402,6 +408,21 @@ pub fn parse_manifest(blob: &[u8]) -> Result<Manifest<'_>, ManifestErr> {
                     },
                 })?;
             }
+            TAG_CAP_IO => {
+                let (name, rest) = split_name(p).ok_or(ManifestErr::BadRecordLen)?;
+                if rest.len() != 8 {
+                    return Err(ManifestErr::BadRecordLen);
+                }
+                m.push_cap(ManifestCap {
+                    name,
+                    rights: le_u16(rest, 6),
+                    kind: CapKind::Io {
+                        base: le_u32(rest, 0),
+                        count: le_u16(rest, 4),
+                        perms: le_u16(rest, 6),
+                    },
+                })?;
+            }
             TAG_BOOTSTRAP => {
                 let (console, rest) = split_name(p).ok_or(ManifestErr::BadRecordLen)?;
                 let (debug, rest) = split_name(rest).ok_or(ManifestErr::BadRecordLen)?;
@@ -542,6 +563,14 @@ pub fn build_manifest(m: &Manifest<'_>) -> alloc::vec::Vec<u8> {
                 p.extend_from_slice(&vector.to_le_bytes());
                 p.extend_from_slice(&perms.to_le_bytes());
                 recs.push((TAG_CAP_IRQ, p));
+            }
+            CapKind::Io { base, count, perms } => {
+                let mut p = alloc::vec::Vec::new();
+                p.extend_from_slice(&enc_name(c.name));
+                p.extend_from_slice(&base.to_le_bytes());
+                p.extend_from_slice(&count.to_le_bytes());
+                p.extend_from_slice(&perms.to_le_bytes());
+                recs.push((TAG_CAP_IO, p));
             }
         }
     }
@@ -826,6 +855,34 @@ mod tests {
         assert_eq!(
             irq.map(|c| c.kind),
             Some(CapKind::Irq { vector: 32, perms: 0x1 })
+        );
+    }
+
+    /// Same golden pin for CAP_IO (Driver SDK ABI v0.1 s4.2):
+    /// `name_len u16, name, base u32, count u16, perms u16`.
+    #[test]
+    fn cap_io_wire_bytes_golden() {
+        let m = caps_only(None, vec![ManifestCap {
+            name: "uart",
+            rights: 0x3,
+            kind: CapKind::Io { base: 0x3F8, count: 8, perms: 0x3 },
+        }]);
+        let blob = build_manifest(&m);
+        assert_eq!(&blob[24..26], &TAG_CAP_IO.to_le_bytes());
+        assert_eq!(&blob[26..28], &14u16.to_le_bytes()); // 2 + 4 + 4 + 2 + 2
+        let mut want = Vec::new();
+        want.extend_from_slice(&4u16.to_le_bytes()); // name_len
+        want.extend_from_slice(b"uart");
+        want.extend_from_slice(&0x3F8u32.to_le_bytes()); // base
+        want.extend_from_slice(&8u16.to_le_bytes()); // count
+        want.extend_from_slice(&3u16.to_le_bytes()); // perms
+        assert_eq!(&blob[28..], &want[..]);
+
+        let parsed = parse_manifest(&blob).unwrap();
+        let io = parsed.caps().iter().flatten().find(|c| c.name == "uart");
+        assert_eq!(
+            io.map(|c| c.kind),
+            Some(CapKind::Io { base: 0x3F8, count: 8, perms: 0x3 })
         );
     }
 

@@ -66,8 +66,29 @@ pub fn build_posix_manifest(image_kaddr: u64, image_size: u32, heap_base: u64) -
                 perms: 0x1, // CAP_PERM_BIND
             },
         }),
-        None,
-        None,
+        // s4.3 — single-use bind cap for the 16550's IRQ4 (IO-APIC pin 4,
+        // remapped to vector 0x24 = 36 by idt.c). k_irq_bind lazily
+        // unmask the RTE; irqtest drives the UART in loopback to prove a
+        // non-timer device edge reaches the channel.
+        Some(ManifestCap {
+            name: "irq.serial.0",
+            rights: 0x1, // CAP_PERM_BIND
+            kind: CapKind::Irq {
+                vector: 36,
+                perms: 0x1, // CAP_PERM_BIND
+            },
+        }),
+        // s4.2 — the 16550's port range (COM1, 8 ports, R | W). irqtest
+        // uses k_io_out/k_io_in to configure loopback + RDA interrupts.
+        Some(ManifestCap {
+            name: "uart",
+            rights: 0x3, // R | W
+            kind: CapKind::Io {
+                base: 0x3F8,
+                count: 8,
+                perms: 0x3,
+            },
+        }),
         None,
         None,
         None,
@@ -106,7 +127,7 @@ pub fn build_posix_manifest(image_kaddr: u64, image_size: u32, heap_base: u64) -
             chan_queue_depth: 16,
         }),
         caps,
-        n_caps: 5,
+        n_caps: 7,
         bootstrap: Some(Bootstrap {
             console: Some("console"),
             debug: None,

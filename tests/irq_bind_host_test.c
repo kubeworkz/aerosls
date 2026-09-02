@@ -104,6 +104,7 @@ void cap_irq_eoi(uint32_t vector) {
 /* cap_table_index (kernel/cap.c): not declared in cap.h (internal only). */
 int cap_table_index(uint32_t pid);
 int  k_irq_unbind(uint32_t pid, uint16_t chan_r, uint16_t* out_vector);
+int  k_irq_mask(uint32_t pid, uint16_t chan_r, uint8_t mask);
 
 /* ─── Cap word construction ──────────────────────────────────────────────── */
 static uint64_t irq_word(uint32_t vector, uint8_t perm) {
@@ -246,6 +247,11 @@ int main(void) {
     CHECK(k_irq_bind(P, ub_irq, 0, &ub_chan) == CAP_ERR_OK, "bind vector 40");
     CHECK(ub_chan != CAP_NONE, "vector 40 has a CHAN_R slot");
 
+    /* SYS_IRQ_MASK (318): arm/disarm a bound vector without unbinding. */
+    CHECK(k_irq_mask(P, ub_chan, 1) == CAP_ERR_OK, "mask a bound vector");
+    CHECK(k_irq_mask(P, ub_chan, 0) == CAP_ERR_OK, "re-arm a bound vector");
+    CHECK(k_irq_mask(P, 0xFFFF, 1) == CAP_ERR_RANGE, "mask: bad slot is RANGE");
+
     uint16_t freed_vector = CAP_NONE;
     CHECK(k_irq_unbind(P, ub_chan, &freed_vector) == CAP_ERR_OK,
           "unbind by CHAN_R slot succeeds");
@@ -292,6 +298,8 @@ int main(void) {
     CHECK(p_ch_r != CAP_NONE, "plain channel's CHAN_R slot exists");
     CHECK(k_irq_unbind(P, p_ch_r, NULL) == CAP_ERR_STATE,
           "unbind on a non-IRQ channel is CAP_ERR_STATE");
+    CHECK(k_irq_mask(P, p_ch_r, 1) == CAP_ERR_STATE,
+          "mask: plain channel is CAP_ERR_STATE");
 
     /* the already-unbound channel: unbind again */
     CHECK(k_irq_unbind(P, ub_chan, NULL) == CAP_ERR_STATE,

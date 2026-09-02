@@ -4940,38 +4940,16 @@ pub fn irqtest<K: Kernel, A: BufferAlloc>(_ctx: &mut Ctx<'_, K, A>) -> Step {
         unsafe { irqtest_push_result(s.as_ptr(), s.len() as u32); }
     }
 
-    swrite(b"[irqtest] looking for the manifest IRQ cap...\n");
-    let mut chan_r: u16 = 0xFFFF;
-    let mut slot = None;
-    for s in 0u32..32u32 {
-        let rc = unsafe { k_irq_bind(s, 0, &mut chan_r) };
-        if rc == 0 {
-            slot = Some(s);
-            break;
-        }
-    }
-    let slot = match slot {
-        Some(s) => s,
-        None => {
-            swrite(b"[irqtest] FAIL: no bindable IRQ cap in table\n");
-            return Step::Exit(1);
-        }
-    };
-    swrite(b"[irqtest] bound IRQ cap: vector 32, notification channel acquired\n");
-
-    let mut buf = [0u8; 8];
-    let mut received: u32 = 0;
-    for _ in 0..50 {
+    fn wait_recv(chan: u16, timeout_ns: u64) -> Option<IrqRecvOut> {
         let mut wout = IrqWaitOut {
             idx: 0,
             kind: 0,
             pad: 0,
         };
-        let rc = unsafe { k_chan_wait(&(chan_r as u32), 1, 1_000_000_000, &mut wout) };
-        if rc != 0 {
-            swrite(b"[irqtest] FAIL: k_chan_wait on the notification channel\n");
-            return Step::Exit(1);
+        if unsafe { k_chan_wait(&(chan as u32), 1, timeout_ns, &mut wout) } != 0 {
+            return None;
         }
+        let mut buf = [0u8; 8];
         let mut rout = IrqRecvOut {
             kind: 0,
             flags: 0,
@@ -4980,24 +4958,119 @@ pub fn irqtest<K: Kernel, A: BufferAlloc>(_ctx: &mut Ctx<'_, K, A>) -> Step {
             n_caps: 0,
             needed: 0,
         };
-        let rrc = unsafe {
+        if unsafe {
             k_chan_recv(
-                chan_r as u32,
+                chan as u32,
                 buf.as_mut_ptr(),
                 buf.len() as u32,
                 core::ptr::null_mut(),
                 0,
                 &mut rout,
             )
-        };
-        if rrc != 0 {
-            swrite(b"[irqtest] FAIL: k_chan_recv on the notification channel\n");
+        } != 0
+        {
+            return None;
+        }
+        Some(rout)
+    }
+
+    // ── Phase 0: bind every manifest IRQ cap (timer 32, serial 36) ─────
+    swrite(b"[irqtest] binding manifest IRQ caps...\n");
+    let mut chans: [u16; 2] = [0xFFFF; 2];
+    let mut n_bound = 0usize;
+    for s in 0u32..32u32 {
+        if n_bound >= 2 {
+            break;
+        }
+        let mut cr: u16 = 0xFFFF;
+        if unsafe { k_irq_bind(s, 0, &mut cr) } == 0 {
+            chans[n_bound] = cr;
+            n_bound += 1;
+        }
+    }
+    if n_bound == 0 {
+        swrite(b"[irqtest] FAIL: no bindable IRQ cap in table\n");
+        return Step::Exit(1);
+    }
+
+    // Find the UART IO cap by trial-scan: k_io_out returns the type error
+    // for every non-IO cap and succeeds on a writable IO cap. Only needed
+    // for the serial phase (a second IRQ cap present).
+    let mut uart: Option<u32> = None;
+    if n_bound >= 2 {
+        for s in 0u32..32u32 {
+            if unsafe { k_io_out(s, 0, 1, 0) } == 0 {
+                uart = Some(s);
+                break;
+            }
+        }
+        if uart.is_none() {
+            swrite(b"[irqtest] FAIL: no UART IO cap in table\n");
             return Step::Exit(1);
         }
-        // The kernel enqueues tag = payload = the vector number.
-        if rout.tag != 32 || buf[0] != 32 {
-            swrite(b"[irqtest] FAIL: notification payload/tag != vector\n");
-            return Step::Exit(1);
+    }
+
+    // Set the serial line up BEFORE identifying channels: the 16550 runs
+    // in LOOPBACK (MCR bit 4) with the received-data interrupt enabled
+    // (IER bit 0). k_irq_bind already programmed the IO-APIC RTE for pin
+    // 4 (vector 36), so each transmitted byte is received by our own
+    // UART and asserts IRQ4 -> cap_irq_notify(36) -> this channel.
+    if let Some(u) = uart {
+        unsafe {
+            k_io_out(u, 4, 1, 0x10); // MCR (offset 4) = loopback on
+            k_io_out(u, 1, 1, 0x01); // IER = received-data interrupt
+            k_io_out(u, 0, 1, 0x41); // THR = 'A': the first edge
+        }
+    }
+
+    // Identify each channel by the tag the kernel stamps (payload and tag
+    // both equal the vector: 32 = LAPIC timer, 36 = serial IRQ4).
+    let mut chan32: u16 = 0xFFFF;
+    let mut chan36: u16 = 0xFFFF;
+    for &c in chans[..n_bound].iter() {
+        if let Some(r) = wait_recv(c, 300_000_000) {
+            match r.tag {
+                32 => chan32 = c,
+                36 => {
+                    chan36 = c;
+                    // Drain RBR so the UART deasserts IRQ4 (edge demotion),
+                    // then re-arm the pin (the ISR self-masks on delivery).
+                    let mut v: u32 = 0;
+                    let _ = unsafe { k_io_in(uart.unwrap(), 0, 1, &mut v) };
+                    swrite(b"[irqtest] id-rearm\n");
+                    let rc = unsafe { k_irq_mask(c, 0) };
+                    swrite(b"[irqtest] id-rearm rc=");
+                    swrite(match rc {
+                        0 => b"0",
+                        _ => b"E",
+                    });
+                    swrite(b"\n");
+                }
+                t => {
+                    swrite(b"[irqtest] FAIL: unexpected notification tag\n");
+                    return Step::Exit(1);
+                }
+            }
+        }
+    }
+    if chan32 == 0xFFFF {
+        swrite(b"[irqtest] FAIL: timer vector 32 never delivered\n");
+        return Step::Exit(1);
+    }
+    if chan36 == 0xFFFF && n_bound >= 2 {
+        swrite(b"[irqtest] FAIL: serial vector 36 never delivered\n");
+        return Step::Exit(1);
+    }
+
+    // ── Phase 1: the LAPIC timer edge (vector 32) ───────────────────────
+    let mut received: u32 = 0;
+    for _ in 0..50 {
+        match wait_recv(chan32, 1_000_000_000) {
+            Some(r) if r.tag == 32 => {}
+            _ => {
+                swrite(b"[irqtest] FAIL: timer tick lost\n");
+                return Step::Exit(1);
+            }
         }
         received += 1;
         match received {
@@ -5009,8 +5082,92 @@ pub fn irqtest<K: Kernel, A: BufferAlloc>(_ctx: &mut Ctx<'_, K, A>) -> Step {
             _ => {}
         }
     }
-    swrite(b"[irqtest] PASS: 50/50 timer edges delivered over the IRQ channel\n");
-    Step::Exit(0)
+    swrite(b"[irqtest] PASS: 50/50 timer edges delivered\n");
+
+    // ── Phase 2: the serial port's IRQ4 (vector 36) ─────────────────────
+    // The 16550 is driven in LOOPBACK (MCR bit 4) with the received-data
+    // interrupt enabled (IER bit 0): each byte we transmit is received by
+    // our own UART, which asserts IRQ4. k_irq_bind lazily programmed the
+    // IO-APIC RTE (pin 4, vector 36), so the edge reaches the channel.
+    if chan36 != 0xFFFF {
+        let uart = uart.unwrap();
+        /* UART state probe: read back MCR/IER (regs 4/1) and the RBR right
+         * after the THR write, before waiting. hex in "uXX" form. */
+        fn hexb(v: u32) -> [u8; 3] {
+            let n = (v & 0xff) as u8;
+            let h = b"0123456789abcdef";
+            [b'u', h[(n >> 4) as usize], h[(n & 0xf) as usize]]
+        }
+        let mut ok = 0u32;
+        /* Print-free inside the loop: every TX byte loops back into our
+         * own RBR (the demo's point), so printing mid-phase re-asserts
+         * IRQ4 with a foreign byte. Drain RBR before each THR write so
+         * the line is low when the byte arrives. */
+        fn drain_rbr(u: u32, n: u32) {
+            let mut v: u32 = 0;
+            for _ in 0..n {
+                let _ = unsafe { k_io_in(u, 0, 1, &mut v) };
+            }
+        }
+        drain_rbr(uart, 4);
+        for _ in 0..10 {
+            drain_rbr(uart, 4);                    // flush stale looped-back bytes
+            unsafe { k_io_out(uart, 0, 1, 0x41); } // THR = 'A' (loops back)
+            let mut rcvd: u32 = 0;
+            if let Some(r) = wait_recv(chan36, 1_000_000_000) {
+                if r.tag == 36 {
+                    rcvd = 1;
+                }
+            }
+            if rcvd == 0 {
+                break;
+            }
+            drain_rbr(uart, 4);                    // own byte + any stragglers
+            let rc = unsafe { k_irq_mask(chan36, 0) };
+            if rc == 0 {
+                ok += 1;
+            }
+        }
+        unsafe {
+            k_io_out(uart, 1, 1, 0); // IER off
+            k_io_out(uart, 4, 1, 0); // loopback off (MCR offset 4)
+        }
+        {
+            let mut mcr: u32 = 0;
+            let mut ier: u32 = 0;
+            let _ = unsafe { k_io_in(uart, 4, 1, &mut mcr) };
+            let _ = unsafe { k_io_in(uart, 1, 1, &mut ier) };
+            swrite(b"[irqtest] p2 MCR ");
+            swrite(&hexb(mcr));
+            swrite(b" IER ");
+            swrite(&hexb(ier));
+            swrite(b"\n");
+        }
+        if ok == 10 {
+            swrite(b"[irqtest] PASS: serial IRQ4 loopback: 10/10 edges delivered\n");
+            Step::Exit(0)
+        } else {
+            swrite(b"[irqtest] FAIL: serial IRQ4 loopback: ");
+            swrite(match ok {
+                0 => b"0",
+                1 => b"1",
+                2 => b"2",
+                3 => b"3",
+                4 => b"4",
+                5 => b"5",
+                6 => b"6",
+                7 => b"7",
+                8 => b"8",
+                9 => b"9",
+                _ => b"?",
+            });
+            swrite(b"/10 edges delivered\n");
+            Step::Exit(1)
+        }
+    } else {
+        swrite(b"[irqtest] PASS: timer demo only (no serial IRQ cap)\n");
+        Step::Exit(0)
+    }
 }
 
 /// Wire layouts for the raw transport shims (aerosls_proto ABI module:
@@ -5038,6 +5195,7 @@ struct IrqRecvOut {
 #[cfg(feature = "target")]
 extern "C" {
     fn k_irq_bind(handle: u32, budget: u32, out_chan_r: *mut u16) -> i32;
+    fn k_irq_mask(chan_r: u16, mask: u8) -> i32;
     fn k_chan_wait(chans: *const u32, n: u32, timeout_ns: u64, out: *mut IrqWaitOut) -> i32;
     fn k_chan_recv(
         chan: u32,
@@ -5047,6 +5205,8 @@ extern "C" {
         n_slots: u32,
         out: *mut IrqRecvOut,
     ) -> i32;
+    fn k_io_out(handle: u32, index: u16, size: u8, val: u32) -> i32;
+    fn k_io_in(handle: u32, index: u16, size: u8, out: *mut u32) -> i32;
     fn irqtest_push_result(data: *const u8, len: u32);
 }
 
@@ -5075,6 +5235,17 @@ pub unsafe extern "C" fn k_chan_recv(
     _n: u32,
     _o: *mut IrqRecvOut,
 ) -> i32 {
+    -1
+}
+
+#[cfg(not(feature = "target"))]
+#[no_mangle]
+pub unsafe extern "C" fn k_io_out(_h: u32, _i: u16, _s: u8, _v: u32) -> i32 {
+    -1
+}
+#[cfg(not(feature = "target"))]
+#[no_mangle]
+pub unsafe extern "C" fn k_io_in(_h: u32, _i: u16, _s: u8, _o: *mut u32) -> i32 {
     -1
 }
 

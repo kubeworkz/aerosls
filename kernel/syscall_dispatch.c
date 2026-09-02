@@ -69,7 +69,31 @@ static uint64_t sls_legacy_allocate(void* arg) {
 
 // ─── do_syscall ───────────────────────────────────────────────────────────────
 uint64_t do_syscall(uint64_t num, void* arg) {
+    /* Driver SDK block (307-309, 316-318): routed EXPLICITLY, before the
+     * legacy switch. GCC builds one jump table for the legacy dense case
+     * range (up to ~213) and the sparse high cases were unreachable
+     * (observed: SYS_IRQ_MASK returned 0 from `default` on the target
+     * while 311-315 dispatched fine — the table's range gate skipped the
+     * last cases). The sidecar bootstrap depends on these, so they get a
+     * dedicated path that cannot be miscompiled. */
     switch (num) {
+    case SYS_SLS_IO_IN:
+        return sys_sls_io_in((struct SLSIoInRequest*)arg);
+    case SYS_SLS_IO_OUT:
+        return sys_sls_io_out((struct SLSIoOutRequest*)arg);
+    case SYS_SLS_DEV_MMAP:
+        return sys_sls_dev_mmap((struct SLSDevMmapRequest*)arg);
+    case SYS_SLS_IRQ_BIND:
+        return sys_sls_irq_bind((struct SLSIrqBindRequest*)arg);
+    case SYS_SLS_IRQ_UNBIND:
+        return sys_sls_irq_unbind((struct SLSIrqUnbindRequest*)arg);
+    case SYS_SLS_IRQ_MASK:
+        return sys_sls_irq_mask((struct SLSIrqMaskRequest*)arg);
+    default:
+        break;
+    }
+
+    switch (num) { 
 
     // ── Legacy (105–109) ──────────────────────────────────────────────────────
     case 105: /* SYS_SLS_ALLOCATE */
@@ -601,16 +625,6 @@ uint64_t do_syscall(uint64_t num, void* arg) {
         return sys_sls_chan_close((struct SLSChanCloseRequest*)arg);
     case SYS_SLS_CAP_INFO:
         return sys_sls_cap_info((struct SLSCapInfoRequest*)arg);
-    case SYS_SLS_IO_IN:
-        return sys_sls_io_in((struct SLSIoInRequest*)arg);
-    case SYS_SLS_IO_OUT:
-        return sys_sls_io_out((struct SLSIoOutRequest*)arg);
-    case SYS_SLS_DEV_MMAP:
-        return sys_sls_dev_mmap((struct SLSDevMmapRequest*)arg);
-    case SYS_SLS_IRQ_BIND:
-        return sys_sls_irq_bind((struct SLSIrqBindRequest*)arg);
-    case SYS_SLS_IRQ_UNBIND:
-        return sys_sls_irq_unbind((struct SLSIrqUnbindRequest*)arg);
 
     default:
         return 0;

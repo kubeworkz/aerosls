@@ -596,6 +596,16 @@ struct SLSIrqUnbindRequest {
     uint8_t  _pad[6];
 };
 
+/* SYS_SLS_IRQ_MASK (318): arm/disarm a bound vector from the driver side.
+ * The ISR self-masks a device pin on delivery (edge-triggered lines stay
+ * latched while the device holds the level, so a naive EOI would re-fire
+ * forever); the driver services the device, then re-arms with mask=0. */
+struct SLSIrqMaskRequest {
+    uint16_t chan_r;          /* caller's CHAN_R slot from k_irq_bind */
+    uint8_t  mask;            /* 0 = re-arm (unmask), 1 = disarm */
+    uint8_t  _pad[5];
+};
+
 /* k_cap_info's out block (kabi CapInfoOut). */
 struct SLSCapInfoOut {
     uint16_t ty;              /* CAP_TYPE_MEM | CAP_TYPE_CHAN_R | ... */
@@ -746,6 +756,7 @@ uint64_t sys_sls_io_out(struct SLSIoOutRequest* req);
 uint64_t sys_sls_dev_mmap(struct SLSDevMmapRequest* req);
 uint64_t sys_sls_irq_bind(struct SLSIrqBindRequest* req);
 uint64_t sys_sls_irq_unbind(struct SLSIrqUnbindRequest* req);
+uint64_t sys_sls_irq_mask(struct SLSIrqMaskRequest* req);
 
 /* Driver SDK ABI v0.1 §4.2 — kabi-level port I/O (called by the syscall
  * wrappers in chan.c; k_cap_info-style: resolve the caller's slot, check
@@ -767,6 +778,7 @@ int  k_irq_unbind(uint32_t pid, uint16_t chan_r, uint16_t* out_vector);
  * unless an arch layer overrides it (LAPIC/PIC). */
 void cap_irq_notify(uint32_t vector);
 void cap_irq_eoi(uint32_t vector) __attribute__((weak));
+void cap_irq_set_mask(uint32_t vector, int masked) __attribute__((weak));
 
 /* Port I/O hooks — weak in cap.c (no-op), strong in arch/x86/user_paging.c
  * (real in/out instructions); host tests override with a fake port map. */
@@ -842,6 +854,7 @@ void cap_unlock(struct CapSpinlock* l);
 #define SYS_SLS_DEV_MMAP     309
 #define SYS_SLS_IRQ_BIND     316
 #define SYS_SLS_IRQ_UNBIND   317
+#define SYS_SLS_IRQ_MASK     318
 
 /* Manifest record tags */
 #define SIDECAR_MANIFEST_MAGIC         "AERSLSM1"
@@ -856,6 +869,7 @@ void cap_unlock(struct CapSpinlock* l);
 #define SIDECAR_TAG_CAP_MEM      0x0006
 #define SIDECAR_TAG_CAP_CHAN     0x0007
 #define SIDECAR_TAG_CAP_IRQ      0x000B
+#define SIDECAR_TAG_CAP_IO       0x000C
 #define SIDECAR_TAG_BOOTSTRAP    0x0008
 #define SIDECAR_TAG_FLAGS        0x0009
 #define SIDECAR_TAG_NAME         0x000A

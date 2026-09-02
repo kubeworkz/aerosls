@@ -2215,8 +2215,31 @@ void cap_list(void) {
 __attribute__((weak))
 void cap_irq_eoi(uint32_t vector) { (void)vector; }
 
+/* Driver SDK ABI v0.1 s4.3: called from k_irq_bind once the vector is
+ * registered - the arch hook wires the device line (IO-APIC RTE for
+ * legacy pins) so a real edge can reach the channel. Weak default: no
+ * wiring (host tests link cap.c alone). */
+__attribute__((weak))
+void cap_irq_unmask(uint32_t vector) { (void)vector; }
+
+/* Arch hook (Driver SDK ABI v0.1 s4.5): arm (masked=0) / disarm (masked=1)
+ * the device line behind a vector. The ISR self-masks on delivery; the
+ * driver re-arms via k_irq_mask. Weak default: no wiring (host tests). */
+__attribute__((weak))
+void cap_irq_set_mask(uint32_t vector, int masked) {
+    (void)vector; (void)masked;
+}
+
 void cap_irq_notify(uint32_t vector) {
     if (vector >= CAP_IRQ_VECTORS) { cap_irq_eoi(vector); return; }
+    /* Self-mask device pins on delivery (Driver SDK ABI v0.1 s4.5): an
+     * edge-triggered RTE whose device line stays asserted re-fires on
+     * every EOI (the emulated IO-APIC latches the level), wedging the
+     * kernel in an ISR storm that starves user code. Mask first, then
+     * enqueue + EOI; the driver re-arms with k_irq_mask after servicing
+     * the device. The LAPIC timer (vector 32) is unaffected — its edges
+     * come from the local LAPIC, not the IO-APIC pin. */
+    if (vector >= 0x20u) cap_irq_set_mask(vector, 1);
     uint16_t chan_id = g_irq_chan[vector];
     if (chan_id == CAP_NONE) { cap_irq_eoi(vector); return; }
     struct CapChannel* ch = &cap_channels[chan_id];
@@ -2342,6 +2365,7 @@ int k_irq_bind(uint32_t pid, uint16_t slot, uint32_t budget,
     /* Bind: register + stamp the IRQ cap single-use. */
     g_irq_chan[vector]   = (uint16_t)chan_id;
     g_irq_budget[vector] = (uint16_t)budget;
+    cap_irq_unmask(vector);   /* arch: wire the device line (IO-APIC RTE) */
     cap_lock(&t->lock);
     t->slots[slot].word = (w & ~(((uint64_t)CAP_STATE_MASK) << CAP_STATE_SHIFT))
                           | (((uint64_t)CAP_STATE_REVOKED) << CAP_STATE_SHIFT);
@@ -2429,6 +2453,43 @@ uint64_t sys_sls_irq_unbind(struct SLSIrqUnbindRequest* req) {
     uint64_t r = (uint64_t)k_irq_unbind(cap_current_pid(), req->chan_r,
                                         &vector);
     return r;
+}
+
+/* ─── k_irq_mask (driver SDK ABI v0.1 §4.5) ─────────────────────────────────
+ * Arm/disarm a bound vector from the driver side. Resolves the CHAN_R slot
+ * k_irq_bind returned (same validation as k_irq_unbind), finds the vector
+ * the channel is registered under, and asks the arch layer to set the
+ * device line's masked bit. The ISR self-masks on every delivery, so a
+ * driver that wants continuous edges re-arms after draining its device. */
+int k_irq_mask(uint32_t pid, uint16_t chan_r, uint8_t mask) {
+    int ti = cap_table_index(pid);
+    if (ti < 0) return CAP_ERR_NOTFOUND;
+    if (chan_r >= CAP_TABLE_ENTRIES) return CAP_ERR_RANGE;
+    struct CapTable* t = &cap_tables[ti];
+    uint64_t w = t->slots[chan_r].word;
+    if (!cap_word_valid(w)) return CAP_ERR_REVOKED;
+    uint32_t ty = (uint32_t)((w >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK);
+    if (ty != CAP_TYPE_CHAN_R) return CAP_ERR_TYPE;
+    uint32_t obj_id = (uint32_t)((w >> CAP_OBJ_SHIFT) & CAP_OBJ_MASK);
+    if (obj_id >= CAP_OBJECT_MAX) return CAP_ERR_REVOKED;
+    struct CapObject* o = &cap_objects[obj_id];
+    if (!o->active || o->kind != CAP_OBJ_KIND_CHAN) return CAP_ERR_REVOKED;
+    uint32_t chan_id = o->chan_id;
+    if (chan_id >= CAP_CHAN_MAX) return CAP_ERR_REVOKED;
+
+    uint32_t vector = CAP_IRQ_VECTORS;   /* sentinel: not found */
+    for (uint32_t v = 0; v < CAP_IRQ_VECTORS; v++) {
+        if (g_irq_chan[v] == (uint16_t)chan_id) { vector = v; break; }
+    }
+    if (vector >= CAP_IRQ_VECTORS) return CAP_ERR_STATE;  /* not an IRQ channel */
+
+    cap_irq_set_mask(vector, mask ? 1 : 0);
+    return CAP_ERR_OK;
+}
+
+uint64_t sys_sls_irq_mask(struct SLSIrqMaskRequest* req) {
+    if (!req) return CAP_ERR_PROTO;
+    return (uint64_t)k_irq_mask(cap_current_pid(), req->chan_r, req->mask);
 }
 
 /* ─── Syscall wrappers (311-315) ───────────────────────────────────────────── */
@@ -3062,6 +3123,27 @@ int cap_create_sidecar(uint32_t parent_pid,
             m.n_caps++;
             break;
         }
+        case SIDECAR_TAG_CAP_IO: {
+            /* Record layout (matches manifest.rs): name_len u16,
+             * name[nlen], base u32 (LE), count u16 (LE), perms u16 (LE)
+             * = nlen + 8 bytes. */
+            if (rlen < 2) return CAP_EINVAL;
+            uint16_t nlen = *(const uint16_t*)(rp + 0);
+            if ((int)rlen < (int)nlen + 8) return CAP_EINVAL;
+            if (m.n_caps >= SIDECAR_MANIFEST_MAX_CAPS) return CAP_ERANGE;
+            struct SidecarCap* sc = &m.caps[m.n_caps];
+            sc->kind = SIDECAR_TAG_CAP_IO;
+            sc->name_len = nlen;
+            for (uint16_t j = 0; j < nlen && j < SIDECAR_MANIFEST_MAX_NAME - 1; j++)
+                sc->name[j] = (char)rp[2 + j];
+            sc->name[nlen < SIDECAR_MANIFEST_MAX_NAME ? nlen : SIDECAR_MANIFEST_MAX_NAME - 1] = '\0';
+            sc->phys_base = (uint32_t)(rp[2 + nlen] | (rp[3 + nlen] << 8) |
+                                       (rp[4 + nlen] << 16) | (rp[5 + nlen] << 24));
+            sc->size_bytes = (uint16_t)(rp[6 + nlen] | (rp[7 + nlen] << 8));
+            sc->rights = (uint8_t)(rp[8 + nlen] | (rp[9 + nlen] << 8));
+            m.n_caps++;
+            break;
+        }
         case SIDECAR_TAG_BOOTSTRAP:
         case SIDECAR_TAG_FLAGS:
             break;  /* informational */
@@ -3375,6 +3457,34 @@ int cap_create_sidecar(uint32_t parent_pid,
             (unsigned)irq_idx);
     }
 
+    /* Mint CAP_IO records: a port-range cap (Driver SDK ABI v0.1 s4.2).
+     * The cap word carries the base port in OBJ and the port count in
+     * LEN; k_io_in / k_io_out enforce type, rights, and index+size <=
+     * count. Range must fit the 16-bit port space. */
+    for (uint8_t ci = 0; ci < m.n_caps; ci++) {
+        struct SidecarCap* sc = &m.caps[ci];
+        if (sc->kind != SIDECAR_TAG_CAP_IO) continue;
+        if (sc->phys_base == 0 || sc->size_bytes == 0) continue;
+        if (sc->phys_base + sc->size_bytes > 0x10000ULL) continue;
+        int ioi = cap_table_index(pd->pid);
+        if (ioi < 0) continue;
+        struct CapTable* iot = &cap_tables[ioi];
+        uint16_t io_idx = CAP_NONE;
+        cap_lock(&iot->lock);
+        if (cap_slot_pop(ioi, &io_idx)) {
+            cap_unlock(&iot->lock);
+            continue;   /* table full */
+        }
+        iot->slots[io_idx].word = cap_word_make(CAP_TYPE_IO, sc->phys_base,
+                                                sc->rights, 0,
+                                                (uint16_t)sc->size_bytes);
+        cap_unlock(&iot->lock);
+        kernel_serial_printf(
+            "[SIDECAR] PID %u '%s': io cap '%s' ports 0x%llx+%llu slot %u\n",
+            pd->pid, pd->name, sc->name, (unsigned long long)sc->phys_base,
+            (unsigned long long)sc->size_bytes, (unsigned)io_idx);
+    }
+
     /* Register the sidecar's identity so later manifests can wire
      * channels to it by name. */
     if (m.name_len > 0) {
@@ -3504,6 +3614,28 @@ int cap_create_sidecar(uint32_t parent_pid,
                                         CAP_TYPE_MEM, (uint8_t)sc->rights,
                                         sc->phys_base, sc->size_bytes);
             if (no == 0) break;   /* BIB buffer full: stop appending */
+            bib_off = no;
+            bib_n_caps++;
+        } else if (sc->kind == SIDECAR_TAG_CAP_IO) {
+            /* Find the minted slot by scanning for an IO cap with the same
+             * base port; base/len carry the port range (informational). */
+            uint16_t found_slot = CAP_NONE;
+            for (int si = 0; si < CAP_TABLE_ENTRIES; si++) {
+                uint64_t w = cap_tables[cti].slots[si].word;
+                if (!cap_word_valid(w)) continue;
+                if (((w >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK) != CAP_TYPE_IO)
+                    continue;
+                if (((w >> CAP_OBJ_SHIFT) & CAP_OBJ_MASK) == sc->phys_base) {
+                    found_slot = (uint16_t)si;
+                    break;
+                }
+            }
+            if (found_slot == CAP_NONE) continue;   /* not minted: skip */
+            uint32_t no = bib_put_entry(bib_buf, bib_off, sizeof(bib_buf),
+                                        sc->name, nlen, found_slot,
+                                        CAP_TYPE_IO, (uint8_t)sc->rights,
+                                        sc->phys_base, sc->size_bytes);
+            if (no == 0) break;
             bib_off = no;
             bib_n_caps++;
         } else if (sc->kind == SIDECAR_TAG_CAP_IRQ) {
