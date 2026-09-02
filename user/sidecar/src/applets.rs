@@ -4852,9 +4852,9 @@ pub fn netcheck<K: Kernel, A: BufferAlloc>(_ctx: &mut Ctx<'_, K, A>) -> Step {
 }
 
 pub fn nettest<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
-    extern "C" { fn nettest_push_result(data: *const u8, len: u32); }
+    extern "C" { fn posix_serial_print(data: *const u8, len: u32); }
     fn swrite(s: &[u8]) {
-        unsafe { nettest_push_result(s.as_ptr(), s.len() as u32); }
+        unsafe { posix_serial_print(s.as_ptr(), s.len() as u32); }
     }
     let net = match ctx.net() {
         Some(n) => n,
@@ -4936,8 +4936,28 @@ pub fn nettest<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
 /// init.rc runner waits for children, so an endless park would stall the
 /// boot script); a 1 s per-wait timeout fails fast if the path is broken.
 pub fn irqtest<K: Kernel, A: BufferAlloc>(_ctx: &mut Ctx<'_, K, A>) -> Step {
+    // Output from this task goes straight to the UART's THR via the IO cap
+    // (k_io_out): 165 syscall prints from the irqtest task are dropped
+    // under the timer/loopback load (observed: every irqtest 165 line in
+    // the phase-1 window vanished while nettest's and the kernel's
+    // survived). Direct port I/O is proven from this exact context (Phase
+    // 2's MCR/IER probes and THR writes). \n -> \r\n like the kernel's
+    // serial print does.
+    // All output goes through a pending ring that the main loop's pump
+    // drains via serial_write_raw (the 165 path): serial calls made from
+    // this task inside the IRQ-delivery windows are dropped on the wire,
+    // while the identical calls from the pump (and from nettest's task)
+    // always survive. The byte-string literals passed here are 'static,
+    // so deferring the pointer+len across a k_yield is safe.
     fn swrite(s: &[u8]) {
-        unsafe { irqtest_push_result(s.as_ptr(), s.len() as u32); }
+        unsafe {
+            let tail = (IRQTEST_TX_TAIL + 1) % 256;
+            if tail != IRQTEST_TX_HEAD {
+                IRQTEST_TX_RING[IRQTEST_TX_TAIL as usize] = (s.as_ptr(), s.len() as u32);
+                IRQTEST_TX_TAIL = tail;
+            }
+        }
+        unsafe { k_yield(); }
     }
 
     fn wait_recv(chan: u16, timeout_ns: u64) -> Option<IrqRecvOut> {
@@ -5145,8 +5165,166 @@ pub fn irqtest<K: Kernel, A: BufferAlloc>(_ctx: &mut Ctx<'_, K, A>) -> Step {
         }
         if ok == 10 {
             swrite(b"[irqtest] PASS: serial IRQ4 loopback: 10/10 edges delivered\n");
-            Step::Exit(0)
-        } else {
+            /* ── Phase 3: stuck-driver probe ─────────────────────────────
+             * A driver that stops re-arming is the classic storm recipe:
+             * the device line stays asserted (RBR unread), and an
+             * unmasked edge-triggered pin would re-fire on every EOI and
+             * starve user code (observed pre-self-mask: 29,824 vectors in
+             * one boot). The contract: while the pin is masked the kernel
+             * must DROP re-fires, keep the timer ticking, and resume
+             * delivery after drain + SYS_IRQ_MASK re-arm.
+             *
+             * Discipline: (1) NO serial output between the RBR drain and
+             * the THR write of a window — every TX byte loops back into
+             * our own RBR, so a stray print re-asserts the line and eats
+             * the edge; (2) output is one merged line per window so the
+             * event-loop drain cannot tear a multi-chunk print; (3) a
+             * k_yield after each merged line and before exiting gives the
+             * drain a slice between append bursts. */
+            unsafe {
+                k_io_out(uart, 4, 1, 0x10); // MCR loopback on
+                k_io_out(uart, 1, 1, 0x01); // IER received-data intr
+            }
+            drain_rbr(uart, 4);
+            {
+                // flush stale timer notifications (the budget-drop path
+                // would otherwise starve the liveliness wait)
+                let mut n32 = 0;
+                while n32 < 24 {
+                    match wait_recv(chan32, 50_000_000) {
+                        Some(r) if r.tag == 32 => n32 += 1,
+                        _ => break,
+                    }
+                }
+            }
+            let mut windows_clean = 0u32;
+            let mut recoveries = 0u32;
+            let mut this_w = 0u32;
+            let mut failed_w = 0u32;
+            let mut fail_ch = 0u8; // 1=edge 2=leak 3=timer 4=rearm 5=recover
+            while this_w < 3 {
+                this_w += 1;
+                // (a) one live edge, delivered unmasked. The previous
+                //     window's delivery left the pin self-masked, so
+                //     re-arm first. The byte stays in RBR afterwards —
+                //     the line is held asserted for the stuck window.
+                drain_rbr(uart, 4);
+                if unsafe { k_irq_mask(chan36, 0) } != 0 {
+                    failed_w = this_w;
+                    fail_ch = 4;
+                    break;
+                }
+                unsafe { k_io_out(uart, 0, 1, 0x41); }
+                match wait_recv(chan36, 1_000_000_000) {
+                    Some(r) if r.tag == 36 => {}
+                    _ => {
+                        failed_w = this_w;
+                        fail_ch = 1;
+                        break;
+                    }
+                }
+                // (b) stuck window: pin self-masked, line high. Bait the
+                //     device with more TX; every wait must time out — a
+                //     leaked re-fire shows up as a delivery here.
+                unsafe { k_io_out(uart, 0, 1, 0x41); } // bait (RBR full)
+                let mut clean = 0u32;
+                for _ in 0..5 {
+                    match wait_recv(chan36, 300_000_000) {
+                        None => clean += 1,
+                        Some(_) => break,
+                    }
+                }
+                if clean != 5 {
+                    failed_w = this_w;
+                    fail_ch = 2;
+                    break;
+                }
+                // liveliness: drain stale ticks, then one fresh tick must
+                // arrive — proof the CPU is not starved by an ISR loop.
+                let mut n32 = 0;
+                while n32 < 24 {
+                    match wait_recv(chan32, 50_000_000) {
+                        Some(r) if r.tag == 32 => n32 += 1,
+                        _ => break,
+                    }
+                }
+                let mut live = false;
+                for _ in 0..30 {
+                    match wait_recv(chan32, 150_000_000) {
+                        Some(r) if r.tag == 32 => {
+                            live = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                if !live {
+                    failed_w = this_w;
+                    fail_ch = 3;
+                    break;
+                }
+                // (c) recover: drop the line, re-arm, expect the next edge
+                drain_rbr(uart, 4);
+                if unsafe { k_irq_mask(chan36, 0) } != 0 {
+                    failed_w = this_w;
+                    fail_ch = 4;
+                    break;
+                }
+                unsafe { k_io_out(uart, 0, 1, 0x41); }
+                match wait_recv(chan36, 1_000_000_000) {
+                    Some(r) if r.tag == 36 => {}
+                    _ => {
+                        failed_w = this_w;
+                        fail_ch = 5;
+                        break;
+                    }
+                }
+                windows_clean += 1;
+                recoveries += 1;
+                swrite(match this_w {
+                    1 => b"[irqtest] s3 w1: edge+masked-clean+tick+recover\n",
+                    2 => b"[irqtest] s3 w2: edge+masked-clean+tick+recover\n",
+                    _ => b"[irqtest] s3 w3: edge+masked-clean+tick+recover\n",
+                });
+                unsafe { k_yield(); }
+            }
+            unsafe {
+                k_io_out(uart, 1, 1, 0); // IER off
+                k_io_out(uart, 4, 1, 0); // loopback off
+            }
+            if windows_clean == 3 && recoveries == 3 {
+                swrite(
+                    b"[irqtest] PASS: stuck-driver: 3/3 windows masked clean, 3/3 recoveries\n",
+                );
+                unsafe { k_yield(); }
+                swrite(
+                    b"[irqtest] ALL PHASES PASS: timer 50/50, serial loopback 10/10, stuck-driver 3/3\n",
+                );
+                for _ in 0..8 {
+                    unsafe { k_yield(); }
+                }
+                Step::Exit(0)
+            } else {
+                swrite(b"[irqtest] FAIL: stuck-driver w=");
+                swrite(match failed_w {
+                    1 => b"1",
+                    2 => b"2",
+                    _ => b"3",
+                });
+                swrite(b" ch=");
+                swrite(match fail_ch {
+                    1 => b"edge",
+                    2 => b"leak",
+                    3 => b"timer",
+                    4 => b"rearm",
+                    _ => b"recover",
+                });
+                swrite(b"\n");
+                for _ in 0..8 {
+                    unsafe { k_yield(); }
+                }
+                Step::Exit(1)
+            }        } else {
             swrite(b"[irqtest] FAIL: serial IRQ4 loopback: ");
             swrite(match ok {
                 0 => b"0",
@@ -5190,6 +5368,14 @@ struct IrqRecvOut {
     needed: u32,
 }
 
+/// Pending irqtest output: the main loop's pump drains this ring via the
+/// proven serial_write_raw path (task-context serial calls get dropped
+/// inside the IRQ-delivery windows). All payloads are 'static byte-string
+/// literals, so storing bare pointers is safe.
+pub(crate) static mut IRQTEST_TX_RING: [(*const u8, u32); 256] = [(core::ptr::null(), 0); 256];
+pub(crate) static mut IRQTEST_TX_HEAD: u32 = 0;
+pub(crate) static mut IRQTEST_TX_TAIL: u32 = 0;
+
 /// Real-kernel shims (provided by aerosls-proto, feature `target`). Host
 /// builds get failing stubs below — irqtest only runs on the target.
 #[cfg(feature = "target")]
@@ -5207,7 +5393,8 @@ extern "C" {
     ) -> i32;
     fn k_io_out(handle: u32, index: u16, size: u8, val: u32) -> i32;
     fn k_io_in(handle: u32, index: u16, size: u8, out: *mut u32) -> i32;
-    fn irqtest_push_result(data: *const u8, len: u32);
+    fn k_yield();
+    fn posix_serial_print(data: *const u8, len: u32);
 }
 
 #[cfg(not(feature = "target"))]
@@ -5240,6 +5427,14 @@ pub unsafe extern "C" fn k_chan_recv(
 
 #[cfg(not(feature = "target"))]
 #[no_mangle]
+pub unsafe extern "C" fn k_irq_mask(_c: u16, _m: u8) -> i32 {
+    -1
+}
+#[cfg(not(feature = "target"))]
+#[no_mangle]
+pub unsafe extern "C" fn k_yield() {}
+#[cfg(not(feature = "target"))]
+#[no_mangle]
 pub unsafe extern "C" fn k_io_out(_h: u32, _i: u16, _s: u8, _v: u32) -> i32 {
     -1
 }
@@ -5249,20 +5444,11 @@ pub unsafe extern "C" fn k_io_in(_h: u32, _i: u16, _s: u8, _o: *mut u32) -> i32 
     -1
 }
 
-/// Host/test-only implementation of the irqtest output sink (entry.rs
+/// Host/test-only implementation of the applet serial sink (entry.rs
 /// provides the real one on the target).
 #[cfg(not(feature = "target"))]
 #[no_mangle]
-pub unsafe extern "C" fn irqtest_push_result(_data: *const u8, _len: u32) {}
-
-// (the nettest host sink follows)
-/// Host/test-only implementation of the nettest output sink.  On the target
-/// (`feature = "target"`) this symbol is provided by entry.rs as the
-/// serial-drain buffer; host builds (unit/integration tests) have no serial,
-/// so this no-op keeps the `extern "C"` reference in `nettest` linkable.
-#[cfg(not(feature = "target"))]
-#[no_mangle]
-pub unsafe extern "C" fn nettest_push_result(_data: *const u8, _len: u32) {}
+pub unsafe extern "C" fn posix_serial_print(_data: *const u8, _len: u32) {}
 
 pub fn register_default_applets<K: Kernel, A: BufferAlloc>(pm: &mut ProcManager<K, A>) {
     pm.register_applet("init", init);

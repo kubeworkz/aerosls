@@ -885,6 +885,7 @@ fn manifest_names_line_up_with_bib_caps() {
         let (base, len) = match c.kind {
             CapKind::Mem { base, size } => (base, size),
             CapKind::Chan { .. } => (0, 0),
+            CapKind::Irq { .. } | CapKind::Io { .. } => (0, 0),
         };
         match c.kind {
             CapKind::Mem { .. } => {
@@ -897,6 +898,7 @@ fn manifest_names_line_up_with_bib_caps() {
                 bib_slots.push((c.name.to_string(), CAP_CHAN_W, c.rights, base, len, slot));
                 slot += 1;
             }
+            CapKind::Irq { .. } | CapKind::Io { .. } => {}
         }
     }
     let bib = build_bib(
