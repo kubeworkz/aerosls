@@ -325,6 +325,10 @@ const char* boot_driver_for_class(uint8_t class_code, uint8_t subclass) {
 static uint32_t g_initrd_start = 0;
 static uint32_t g_initrd_end   = 0;
 
+int boot_image_loaded(void) {
+    return g_initrd_start != 0 && g_initrd_end > g_initrd_start;
+}
+
 void boot_image_capture_mb2(uint32_t mb2_magic, uint32_t mb2_phys) {
     g_initrd_start = g_initrd_end = 0;
     if (mb2_phys == 0) goto try_appended;

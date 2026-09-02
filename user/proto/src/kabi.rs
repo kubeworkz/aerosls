@@ -238,6 +238,7 @@ mod abi {
     const SYS_IO_IN: u64 = 307;
     const SYS_IO_OUT: u64 = 308;
     const SYS_DEV_MMAP: u64 = 309;
+    const SYS_CAP_LIST: u64 = 297;
     const SYS_IRQ_BIND: u64 = 316;
     const SYS_IRQ_UNBIND: u64 = 317;
     const SYS_IRQ_MASK: u64 = 318;
@@ -785,6 +786,14 @@ mod abi {
     #[no_mangle]
     pub extern "C" fn k_boot_gen() -> u64 {
         unsafe { sls_syscall(SYS_BOOT_GEN, 0) }
+    }
+
+    /// Kernel cap-table introspection (SYS_SLS_CAP_LIST = 297): ask the
+    /// kernel to print the live cap tables to serial (the `caps` applet's
+    /// backend). No request struct, no return value.
+    #[no_mangle]
+    pub extern "C" fn k_cap_list() {
+        unsafe { sls_syscall(SYS_CAP_LIST, 0) };
     }
 
     /// The real kernel ABI. Only constructible/usable on the sidecar target.

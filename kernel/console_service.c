@@ -10,6 +10,8 @@ static uint32_t console_svc_drained = 0;
 
 #define CONSOLE_INPUT_BUF 256
 static uint8_t  console_input_buf[CONSOLE_INPUT_BUF];
+/* Single-flight flag for the RX poll (see console_service_tick). */
+static volatile int console_rx_busy = 0;
 
 static int console_is_chan_r(uint64_t w) {
     if (((w >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK) != CAP_TYPE_CHAN_R) return 0;
@@ -63,9 +65,26 @@ void console_service_tick(void) {
         }
     }
 
-    {
+    /* ── Serial RX → sidecar console channels ────────────────────────────
+     * Poll the UART and forward completed lines to every kernel-held
+     * CHAN_W console cap. console_feed() strips the line terminator, so
+     * we re-add '\n' — the sidecar's sh applet completes a line only on
+     * '\n' (the shell is what echoes, not the kernel, once input is
+     * delivered).
+     *
+     * Single-flight: this tick runs on the AP core's service poll AND on
+     * the BSP timer (uniprocessor fallback), and console_feed()'s line
+     * editor is one shared static instance. Two concurrent feeders
+     * corrupt it (caught live: typed input echoed back as "ecoh" with
+     * h/o swapped, and one of two typed lines lost entirely). The
+     * compare-and-swap admits exactly one poller per round; the loser
+     * returns — bytes stay in the UART FIFO for the next tick. */
+    if (__sync_bool_compare_and_swap(&console_rx_busy, 0, 1)) {
         int n = serial_console_poll((char*)console_input_buf, CONSOLE_INPUT_BUF);
         if (n > 0) {
+            /* Line ≤ 255 chars; '\n' at index 255 is the last byte. */
+            if (n < (int)CONSOLE_INPUT_BUF)
+                console_input_buf[n++] = '\n';
             for (uint32_t s = 0; s < CAP_TABLE_ENTRIES; s++) {
                 uint64_t w = cap_tables[0].slots[s].word;
                 if (!console_is_chan_w(w)) continue;
@@ -74,8 +93,10 @@ void console_service_tick(void) {
                              0, 0, 0, 0);
             }
         }
+        console_rx_busy = 0;
     }
 }
+
 
 uint32_t console_service_drained(void) {
     return console_svc_drained;

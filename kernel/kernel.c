@@ -522,6 +522,18 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
         http_server_run();  // does not return — serves REST API on port 3000
     }
 
+    // Phase 5 self-hosted: with an initrd the sidecars own the console —
+    // the AP core's console_service_tick drains their channels to serial
+    // and forwards typed input back. The legacy shell's blocking
+    // read_line() would steal every serial byte from that path (typed
+    // input echoed twice/garbled, or never reaching the sidecar), so the
+    // BSP idles instead of entering it. The LAPIC timer on this core
+    // still fires console_service_tick as the uniprocessor fallback, and
+    // the AP core's service poll handles it on SMP boots.
+    if (boot_image_loaded()) {
+        for (;;) __asm__ volatile("hlt");
+    }
+
     // ── Shell (does not return) ─────────────────────────────────────────────
     sls_shell_loop();
 }

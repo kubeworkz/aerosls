@@ -226,4 +226,9 @@ void boot_image_capture_mb2(uint32_t mb2_magic, uint32_t mb2_phys);
  * sidecar. Non-fatal: with no initrd the kernel boots as today. */
 void launch_init_sidecar(void);
 
+/* True when a Multiboot2 initrd was captured (sidecar subsystem booted).
+ * The BSP kernel shell must NOT run in that mode: its blocking read_line()
+ * would steal serial input from the sidecar console service. */
+int boot_image_loaded(void);
+
 #endif /* BOOT_IMAGE_H */

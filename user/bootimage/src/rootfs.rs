@@ -32,6 +32,7 @@ pub fn build_rootfs() -> Vec<u8> {
           netcheck\n\
           nettest 8 7\n\
           irqtest\n\
+          caps\n\
           echo System ready\n\
           echo\n\
           sh\n",

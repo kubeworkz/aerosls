@@ -1922,6 +1922,17 @@ pub fn do_false<K: Kernel, A: BufferAlloc>(_ctx: &mut Ctx<'_, K, A>) -> Step {
     Step::Exit(1)
 }
 
+/// `caps`: kernel cap-table introspection (SYS_SLS_CAP_LIST = 297). The
+/// kernel prints the live cap tables straight to serial; we note the
+/// invocation on stdout so an interactive shell session shows it ran.
+pub fn caps<K: Kernel, A: BufferAlloc>(_ctx: &mut Ctx<'_, K, A>) -> Step {
+    unsafe { posix_serial_print(b"[caps] dumping cap tables\n".as_ptr(), 26) }
+    // SYS_SLS_CAP_LIST (297): the kernel prints the live cap tables to
+    // serial, then we return 0.
+    unsafe { k_cap_list() }
+    Step::Exit(0)
+}
+
 /// `sleep N`: park the calling task for N scheduler ticks.  The
 /// scheduler's drain-wake loop decrements the counter each step and
 /// requeues the task when it reaches zero.  This is a *cooperative*
@@ -5524,6 +5535,7 @@ extern "C" {
     fn k_io_out(handle: u32, index: u16, size: u8, val: u32) -> i32;
     fn k_io_in(handle: u32, index: u16, size: u8, out: *mut u32) -> i32;
     fn k_boot_gen() -> u64;
+    fn k_cap_list();
     fn k_yield();
     fn posix_serial_print(data: *const u8, len: u32);
 }
@@ -5579,6 +5591,9 @@ pub unsafe extern "C" fn k_io_in(_h: u32, _i: u16, _s: u8, _o: *mut u32) -> i32 
 pub unsafe extern "C" fn k_boot_gen() -> u64 {
     0
 }
+#[cfg(not(feature = "target"))]
+#[no_mangle]
+pub unsafe extern "C" fn k_cap_list() {}
 
 /// Host/test-only implementation of the applet serial sink (entry.rs
 /// provides the real one on the target).
@@ -5604,6 +5619,7 @@ pub fn register_default_applets<K: Kernel, A: BufferAlloc>(pm: &mut ProcManager<
     pm.register_applet("sh", sh);
     pm.register_applet("true", do_true);
     pm.register_applet("false", do_false);
+    pm.register_applet("caps", caps);
     pm.register_applet("sleep", sleep);
     pm.register_applet("timeout", timeout);
     pm.register_applet("forkpty_test", forkpty_test);

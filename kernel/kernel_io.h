@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdarg.h>
+#include <string.h>
 
 // ─── COM1 Serial Port (QEMU: -serial file:...) ────────────────────────────────
 #define SERIAL_COM1_BASE  0x3F8u
@@ -58,10 +59,12 @@ void read_line(char* buf);
 int console_feed(char c, char* out, size_t cap);
 
 /* Drain whatever the UART has, up to a bounded number of bytes, feeding
- * each to console_feed(). Returns 1 as soon as a line completes -- any
- * remaining bytes stay in the FIFO for the next call. The bound matters:
- * without it a paste of a large block would hold the HTTP loop for as long
- * as bytes kept arriving. */
+ * each to console_feed(). Returns the LENGTH of the completed line in
+ * `out` (NUL-terminated by the editor, terminator stripped) as soon as a
+ * line completes -- any remaining bytes stay in the FIFO for the next
+ * call. Returns 0 when the FIFO empties without a line completing. The
+ * bound matters: without it a paste of a large block would hold the HTTP
+ * loop for as long as bytes kept arriving. */
 int serial_console_poll(char* out, size_t cap);
 
 /* ─── Panic-path output ────────────────────────────────────────────────────

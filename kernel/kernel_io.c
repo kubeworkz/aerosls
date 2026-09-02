@@ -295,7 +295,8 @@ void kernel_serial_printf(const char* fmt, ...) {
 int serial_console_poll(char* out, size_t cap) {
     for (int n = 0; n < CONSOLE_DRAIN_MAX; n++) {
         if (!(inb(SERIAL_COM1_BASE + 5) & 0x01)) return 0;   /* FIFO empty */
-        if (console_feed((char)inb(SERIAL_COM1_BASE), out, cap)) return 1;
+        if (console_feed((char)inb(SERIAL_COM1_BASE), out, cap))
+            return (int)strlen(out);   /* line length; the editor NUL-terminates */
     }
     return 0;
 }
