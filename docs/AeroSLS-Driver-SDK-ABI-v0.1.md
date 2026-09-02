@@ -170,7 +170,11 @@ The driver then simply parks with `k_chan_wait(&[chan_r], timeout)` and drains w
 > Kernel side: kernel/cap.h + kernel/cap.c + kernel/syscall_dispatch.c;
 > shim in kabi.rs `k_irq_bind`; host test `tests/irq_bind_host_test.c`.
 > The arch ISR-stub wiring that calls `cap_irq_notify` on a real device
-> vector is M2 (the kernel today dispatches only the timer IRQ0).
+> vector is live: arch/x86/ioapic.c programs IO-APIC redirection-table
+> entries for legacy ISA pins (bind-time unmask), and the IDT stub path
+> (arch/x86/interrupt.asm) reaches `cap_irq_notify` from a genuine
+> non-timer edge — the serial port's IRQ4, remapped to vector 36 — as
+> proven on target by irqtest (§4.5).
 
 ### 4.4 `SYS_IRQ_UNBIND = 317` — release a vector
 
@@ -187,15 +191,35 @@ Disarms the ISR stub, closes the channel pair (blocked receivers get the close e
 > (its recv fails `ERR_STATE`) and marks the kernel end closed, then
 > frees the vector for rebind. A non-IRQ channel is `ERR_STATE`; a bad
 > slot is `ERR_RANGE`. Kernel side: kernel/cap.h + kernel/cap.c +
-> kernel/syscall_dispatch.c; shim in kabi.rs `k_irq_unbind`. SYS_IRQ_MASK
-> (318) remains reserved.
+> kernel/syscall_dispatch.c; shim in kabi.rs `k_irq_unbind`. Mask/unmask
+> (SYS_IRQ_MASK, 318) is §4.5.
 
-### 4.5 `SYS_IRQ_MASK = 318` — mask/unmask (optional, later)
+### 4.5 `SYS_IRQ_MASK = 318` — mask/unmask (implemented, verified on target)
 
 ```
 rax=318, rdi=chan_r_slot:u16, rsi=mask:u8 (0=unmask,1=mask) → rax=0/errno
 ```
-Reserved for level-triggered/shared IRQ handling where the driver must mask in the handler. The v0.1 contract is edge-triggered, auto-EOI (like the LAPIC timer path); this syscall is the escape hatch.
+Driver-side arm/disarm of a bound vector. The ISR self-masks a device pin on delivery: an edge-triggered RTE whose device line stays asserted re-fires on every EOI (the emulated IO-APIC latches the level), wedging the kernel in an ISR storm that starves user code. The driver services the device, drops the line, then re-arms with `mask=0` to keep receiving edges. The LAPIC timer (vector 32) is unaffected — its edges come from the local LAPIC, not the IO-APIC pin.
+
+> **Implemented and verified on target (2026-09-01):** the request is a
+> packed struct `SLSIrqMaskRequest` (chan_r u16, mask u8). `k_irq_mask`
+> resolves the CHAN_R slot (same validation path as `k_irq_unbind`),
+> finds the vector the channel is registered under in the 256-entry IRQ
+> registry, and flips the RTE's masked bit via `cap_irq_set_mask`
+> (weak default in cap.c for host tests; strong override in
+> arch/x86/ioapic.c programs the IO-APIC redirection table with MMIO
+> writes for legacy ISA pins, vectors 0x20–0x2F). `cap_irq_notify`
+> self-masks (mask=1) before enqueuing, so the driver must re-arm after
+> draining its device. **On-target verification:** irqtest drives the
+> 16550 in loopback (MCR bit 4) with received-data interrupts enabled
+> (IER bit 0); each transmitted byte asserts IRQ4, which the IO-APIC
+> routes as vector 36 to the bound channel — **10/10 edges delivered**,
+> each acknowledged by a successful `SYS_IRQ_MASK` re-arm, plus 50/50
+> LAPIC-timer edges. Error paths are covered by
+> `tests/irq_bind_host_test.c` (bad slot ERR_RANGE, revoked ERR_REVOKED,
+> non-IRQ channel ERR_STATE). Kernel side: kernel/cap.h + kernel/cap.c +
+> kernel/syscall_dispatch.c + arch/x86/ioapic.c; shim in kabi.rs
+> `k_irq_mask`.
 
 ---
 
@@ -223,7 +247,7 @@ The kernel maps each entry to a cap word in the driver's table (slots are determ
 | kernel/cap.c | minting in the manifest path; DEV mapping; IO port checks; IRQ table (vector → channel) |
 | kernel/syscall_dispatch.c | case handlers for 307–309, 316–318 |
 | arch/x86/syscall.asm | add new numbers to the dispatch range checks |
-| arch/x86/interrupt.asm + kernel | device-IRQ stub path (timer path is the template: housekeeping + EOI) — currently only the timer vector is wired |
+| arch/x86/interrupt.asm + kernel + arch/x86/ioapic.c | device-IRQ stub path (timer path is the template: housekeeping + EOI); IO-APIC legacy pins wired — serial IRQ4 (vector 36) verified end-to-end by irqtest |
 | user/proto/src/kabi.rs | syscall constants, wrappers (`dev_mmap`, `io_in/out`, `irq_bind/unbind/mask`) |
 | user/ramdisk, user/network | drivers consume the SDK; channel protocols unchanged |
 | user/bootimage/src | manifest `devices` section authoring |
