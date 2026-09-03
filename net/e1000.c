@@ -295,15 +295,17 @@ void e1000_init(int idx, uint64_t mmio_base, uint8_t pci_slot, uint8_t roles) {
     // ── MAC from EEPROM ──────────────────────────────────────────────────────
     // RAL0/RAH0 are loaded from the NIC's EEPROM at power-on (or from the MAC
     // specified on the QEMU command line).  Read them now — before we write
-    // anything to those registers — to populate net_my_mac for the ARP/IP stack.
+    // anything to those registers. The ONLY publisher of the stack-wide
+    // net_my_mac is e1000_nic_set_mac(): it fires for a NIC holding
+    // NIC_ROLE_MGMT and ignores everyone else, so a second (cluster-only or
+    // user-driver) card can never overwrite the node's IP identity. Roles are
+    // assigned BEFORE e1000_init runs (kernel.c step 7), so the gate sees the
+    // real role here. (The direct net_my_mac.b[] stores this block used to
+    // make were a pre-role relic: they bypassed the gate, left b[5] zero, and
+    // let a later card clobber the address.)
     {
         uint32_t ral = *nic_reg(n, E1000_REG_RAL0);
         uint32_t rah = *nic_reg(n, E1000_REG_RAH0);
-        net_my_mac.b[0] = (uint8_t)(ral);
-        net_my_mac.b[1] = (uint8_t)(ral >>  8);
-        net_my_mac.b[2] = (uint8_t)(ral >> 16);
-        net_my_mac.b[3] = (uint8_t)(ral >> 24);
-        net_my_mac.b[4] = (uint8_t)(rah);
         MACAddr eeprom;
         eeprom.b[0] = (uint8_t)(ral);
         eeprom.b[1] = (uint8_t)(ral >>  8);
@@ -344,6 +346,46 @@ void e1000_init(int idx, uint64_t mmio_base, uint8_t pci_slot, uint8_t roles) {
     *nic_reg(n, E1000_REG_RDH)   = 0;
     *nic_reg(n, E1000_REG_RDT)   = E1000_RING_SIZE - 1;
     *nic_reg(n, E1000_REG_RCTL)  = E1000_RCTL_EN | E1000_RCTL_BAM | (1U<<3) | (1U<<4);
+}
+
+uint8_t e1000_nic_roles(int idx) {
+    if (idx < 0 || idx >= E1000_MAX_NICS) return (uint8_t)NIC_ROLE_NONE;
+    return e1000_nics[idx].roles;
+}
+
+/* ─── Driver-ownership handoff ───────────────────────────────────────────────
+ * A NIC whose assigned role is NONE belongs to a user driver sidecar
+ * (drv.e1000.0, spawned by the DM): the kernel enables PCI memory space +
+ * bus mastering and marks the MMIO BAR uncacheable so the driver's DMA
+ * works, then NEVER touches the device again — no CTRL writes, no ring
+ * programming, no RX poll. The driver maps BAR0 via SYS_DEV_MMAP and owns
+ * every register from reset on. kernel/kernel.c calls this after role
+ * assignment (grub passes nic0=both nic1=none; enumeration order is the
+ * fallback) instead of e1000_init() for role-less NICs. */
+void e1000_driver_handoff(int idx, uint64_t mmio_base, uint8_t pci_slot) {
+    if (idx < 0 || idx >= E1000_MAX_NICS) return;
+    struct E1000Nic* n = &e1000_nics[idx];
+    e1000_nic_bind(idx, mmio_base, pci_slot, (uint8_t)NIC_ROLE_NONE, 0);
+
+    /* Enable PCI Memory Space (bit 1) and Bus Master (bit 2) so the user
+     * driver's DMA works — the same pair e1000_init() sets for the
+     * kernel-owned NICs. The role-less NIC is otherwise left completely
+     * alone. */
+    {
+        extern uint32_t pci_read_config(uint8_t, uint8_t, uint8_t, uint8_t);
+        extern void pci_write_config(uint8_t, uint8_t, uint8_t, uint8_t, uint32_t);
+        uint32_t cmd = pci_read_config(0, pci_slot, 0, 0x04);
+        cmd |= (1U << 1) | (1U << 2);
+        pci_write_config(0, pci_slot, 0, 0x04, cmd);
+    }
+
+    /* Same uncacheable marking e1000_init() applies — device MMIO must not
+     * be cached on real hardware. */
+    mtrr_set_uc(mmio_base & ~0xFFFULL, 0x20000ULL);
+
+    kernel_serial_printf(
+        "[E1000] nic%d MMIO 0x%llx handed to user driver (role: none)\n",
+        idx, (unsigned long long)mmio_base);
 }
 
 void e1000_transmit(NicRole role, void* physical_buffer, uint16_t size) {
@@ -391,6 +433,12 @@ void e1000_poll_rx(void) {
     for (int idx = 0; idx < E1000_MAX_NICS; idx++) {
     struct E1000Nic* n = &e1000_nics[idx];
     if (!n->present) continue;
+    /* A user-driver NIC (role: none) has no kernel-programmed rings — the
+     * kernel never polls it, because the driver owns every register.
+     * Polling an unprogrammed ring would read garbage descriptors and
+     * could even race the driver's own ring setup. */
+    if (!(n->roles & ((uint8_t)NIC_ROLE_MGMT | (uint8_t)NIC_ROLE_CLUSTER)))
+        continue;
     for (;;) {
         uint16_t next = (uint16_t)((n->rx_tail + 1) % E1000_RING_SIZE);
         struct E1000RxDesc* desc = &n->rx_ring[next];

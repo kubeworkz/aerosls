@@ -282,6 +282,21 @@ The kernel maps each entry to a cap word in the driver's table (slots are determ
 4. ISR fires → kernel enqueues the vector byte + wakes the driver → driver recvs, drains the ring, forwards frames over the existing NET_* protocol to the POSIX sidecar.
 5. `nettest` runs unchanged — the NetClient never learns the backend changed.
 
+> **NIC ownership prerequisite (2026-09-03):** the kernel's own network
+> stack (mgmt HTTP/ARP/IP + cluster DSPP) drives the first e1000 it finds
+> and polls it on every tick, so a user driver cannot share that card's
+> registers. Ownership is settled by ROLE, not handed out ad hoc: grub.cfg
+> passes `nic0=both nic1=none` on the multiboot line, kernel.c assigns
+> roles BEFORE bring-up, and a role-less NIC is never programmed or polled
+> by the kernel — `e1000_driver_handoff()` (net/e1000.c) only enables PCI
+> bus mastering + marks the BAR uncacheable, then the driver sidecar owns
+> every register from reset on (this is also what lets `devtest` keep
+> probing nic0 read-only). Single-NIC boots are byte-identical: nic0=both
+> is their existing implicit role and `nic1=` is ignored when only one
+> card exists. The sidecar driver that consumes the handed-off NIC
+> (drv.e1000.0, spawned by the DM per §5) is the next composition step;
+> `nettest`/MockNetwork are untouched until that driver serves frames.
+
 ---
 
 ## 8. Open questions

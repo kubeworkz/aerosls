@@ -375,25 +375,17 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
     boot_application_processors(1);
     kernel_serial_print("[BSP] Core 1 online.\n");
 
-    // ── 7. Network stack (PCI scan → e1000 init → gratuitous ARP) ─────────────
+    // ── 7. Network stack (PCI scan → e1000 role assignment → bring-up) ─────────────
     kernel_serial_print("[NET] PCI scanning for e1000...\n");
     {
         extern uint32_t pci_read_config(uint8_t, uint8_t, uint8_t, uint8_t);
         // Scan bus 0 for e1000 (Intel vendor 8086, device 100e/10d3/107c).
-        // Store both the MMIO base and the PCI slot so e1000_init can use
-        // the correct slot for Bus Master Enable without another scan.
-        /* Multi-NIC Phase 3: collect EVERY e1000, not the first. This loop
-         * used to `break` on the first match, which is the whole reason a
-         * second -device e1000 sat dead on the bus.
-         *
-         * Roles by enumeration order for now, and the order is what QEMU's
-         * -device sequence produces: the first card is management, the
-         * second is the cluster segment. With ONE card it takes both, so
-         * every existing single-NIC node is unaffected -- which is every
-         * node today. Phase 4 replaces this with an explicit `nicN=` on the
-         * kernel command line; until then the ordering is a documented
-         * convention, not a discovery. */
+        // Collect EVERY e1000, not the first: with two cards one belongs to
+        // the kernel's mgmt/cluster stack and one can be handed to a user
+        // driver sidecar (drv.e1000.0, Driver SDK ABI v0.1 §7).
         int found = 0;
+        uint64_t nic_base[E1000_MAX_NICS];
+        uint8_t  nic_slot[E1000_MAX_NICS];
         for (int slot = 0; slot < 32 && found < E1000_MAX_NICS; slot++) {
             uint32_t vid_did = pci_read_config(0, (uint8_t)slot, 0, 0x00);
             if (vid_did == 0xFFFFFFFF) continue;
@@ -408,25 +400,41 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
                 if ((bar0 & 0x1) == 0 && base != 0) {
                     kernel_serial_printf("[NET] e1000 #%d at PCI slot %d MMIO 0x%lx\n",
                                          found, slot, base);
-                    e1000_init(found, base, (uint8_t)slot, 0 /* roles set below */);
+                    nic_base[found] = base;
+                    nic_slot[found] = (uint8_t)slot;
                     found++;
                 }
             }
         }
 
         if (found > 0) {
-            /* Assign roles now that the count is known -- a single card has
-             * to hold both, and that cannot be decided mid-scan. */
-            /* Command line first (`nic0=mgmt nic1=cluster`), enumeration
-             * order only when none was given. */
+            /* Assign roles BEFORE bring-up, so the loop below can skip the
+             * NICs that belong to user drivers. Command line first
+             * (`nic0=both nic1=none` — grub.cfg reserves NIC #1 for
+             * drv.e1000.0); enumeration order only when none was given. */
             if (e1000_assign_roles(found, boot_params_cmdline()))
                 kernel_serial_print("[NET] NIC roles taken from the command line.\n");
             else if (found > 1)
                 kernel_serial_print("[NET] NIC roles by enumeration order "
                                     "(no nicN= given): nic0=mgmt nic1=cluster.\n");
-            net_init();   // sends gratuitous ARP
-            dhcp_start(); // DISCOVER → OFFER → REQUEST → ACK; updates net_my_ip
-            kernel_serial_printf("[NET] %d e1000 interface(s) online.\n", found);
+            int up = 0;
+            for (int i = 0; i < found; i++) {
+                if (e1000_nic_roles(i) != (uint8_t)NIC_ROLE_NONE) {
+                    e1000_init(i, nic_base[i], nic_slot[i], e1000_nic_roles(i));
+                    up++;
+                } else {
+                    /* Role-less NIC: never programmed or polled by this
+                     * stack — handed to the user driver sidecar. */
+                    e1000_driver_handoff(i, nic_base[i], nic_slot[i]);
+                }
+            }
+            if (up > 0) {
+                net_init();   // sends gratuitous ARP
+                dhcp_start(); // DISCOVER → OFFER → REQUEST → ACK; updates net_my_ip
+            }
+            kernel_serial_printf(
+                "[NET] %d e1000 interface(s) online, %d reserved for user drivers.\n",
+                up, found - up);
         } else {
             kernel_serial_print("[NET] e1000 not found — network disabled.\n");
         }

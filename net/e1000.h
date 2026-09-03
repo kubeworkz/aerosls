@@ -107,6 +107,19 @@ extern uint64_t e1000_tx_no_route;
 void e1000_nic_bind(int idx, uint64_t mmio_base, uint8_t pci_slot,
                     uint8_t roles, const MACAddr* mac);
 
+/* The role bitmask interface `idx` was assigned (0 = none / unbound).
+ * Pure; the boot path reads it to decide which NICs the kernel brings up
+ * and which it hands to a user driver. */
+uint8_t e1000_nic_roles(int idx);
+
+/* Hand interface `idx` to a USER driver sidecar (drv.e1000.0, spawned by
+ * the DM): bind it with NIC_ROLE_NONE, enable PCI memory space + bus
+ * mastering, and mark the MMIO BAR uncacheable — so the user driver's DMA
+ * works — then never touch the device again. No CTRL writes, no ring
+ * programming, no RX poll: the driver maps BAR0 via SYS_DEV_MMAP (Driver
+ * SDK ABI v0.1 s4.1) and owns every register from reset on. */
+void e1000_driver_handoff(int idx, uint64_t mmio_base, uint8_t pci_slot);
+
 /* How many interfaces are bound. */
 int e1000_nic_count(void);
 
