@@ -16,4 +16,9 @@
 *.iso  binary
 *.img  binary
 *.bin  binary
+# The initrd (sidecars.cpio) is a binary newc archive: its payload images
+# legitimately contain 0x0D bytes, and text=auto must never line-convert it
+# on checkout/commit. Marked binary so script_conventions_check.sh skips the
+# CR-byte scan (same rule as *.png/*.iso above).
+*.cpio binary
 vendor/** -text -diff
