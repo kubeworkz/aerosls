@@ -4,7 +4,10 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdarg.h>
-#include <string.h>
+// No <string.h>: kernel sources build freestanding, and this header is
+// pulled by riscv-built files (frame_pool.c etc.) whose toolchain has no
+// hosted libc include. kernel_io.c (x86-only) includes <string.h>
+// itself for the strlen() it uses in the console line editor.
 
 // ─── COM1 Serial Port (QEMU: -serial file:...) ────────────────────────────────
 #define SERIAL_COM1_BASE  0x3F8u

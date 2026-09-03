@@ -1,3 +1,5 @@
+#include <string.h>  // strlen() for the console line editor (x86-only TU)
+
 #include "kernel_io.h"
 #include "smp.h"
 #include "../arch/x86/vga.h"
