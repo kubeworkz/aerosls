@@ -406,7 +406,12 @@ static int table_for_pid(uint32_t pid) {
 struct Blob {
     uint8_t  data[BLOB_MAX];
     uint32_t len;
-    uint32_t rec_off[8];   /* payload offset of each record (for patching) */
+    /* Enough slots for every manifest this test builds (preamble 4 +
+     * name 1 + chans 2 + DEV 1 = 8, plus the with_unknown tag = 9) —
+     * rec_off[8] was exactly full at 8, so the 9th record's write
+     * overflowed into rec_count and corrupted the header's record_count
+     * (the unknown-tag refusal check silently became an ERANGE). */
+    uint32_t rec_off[16];
     uint16_t rec_count;
     uint32_t footer_off;   /* offset of the image_kaddr footer */
 };
@@ -420,7 +425,8 @@ static void blob_u32(struct Blob* b, uint32_t v) { blob_put(b, &v, 4); }
 static void blob_u64(struct Blob* b, uint64_t v) { blob_put(b, &v, 8); }
 
 static void blob_record(struct Blob* b, uint16_t tag, uint16_t payload_len) {
-    b->rec_off[b->rec_count] = b->len + 4;   /* payload starts after the hdr */
+    if (b->rec_count < sizeof(b->rec_off) / sizeof(b->rec_off[0]))
+        b->rec_off[b->rec_count] = b->len + 4;   /* payload starts after the hdr */
     b->rec_count++;
     blob_u16(b, tag);
     blob_u16(b, payload_len);

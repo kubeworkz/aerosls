@@ -174,7 +174,7 @@ static int boot_manifest_read(const uint8_t* blob, uint32_t len,
             } else if (nlen == 9 && memcmp(n, "net.image", 9) == 0) {
                 m->net_kaddr = boot_le64(rp + 2 + nlen);
                 m->net_size  = boot_le64(rp + 2 + nlen + 8);
-            } else if (nlen == 12 && memcmp(n, "e1000.image", 12) == 0) {
+            } else if (nlen == 11 && memcmp(n, "e1000.image", 11) == 0) {
                 /* The drv.e1000.0 driver binary. Optional for older images
                  * (no DM-spawned driver); present images carry it so the
                  * DM can spawn the driver at runtime. */

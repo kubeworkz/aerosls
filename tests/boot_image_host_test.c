@@ -193,7 +193,7 @@ static void build_init_manifest(struct Blob* b) {
     /* e1000.image MEM cap — the drv.e1000.0 driver binary region, which
      * the loader copies boot/e1000.bin into and init later grants to the
      * DM (which spawns the driver). */
-    blob_record(b, SIDECAR_TAG_CAP_MEM, 12 + 19); rc++;
+    blob_record(b, SIDECAR_TAG_CAP_MEM, 11 + 19); rc++;   /* "e1000.image" is 11 chars */
     blob_name_payload(b, "e1000.image");
     blob_u64(b, IMG_E1000_KADDR);
     blob_u64(b, IMG_E1000_SIZE);
