@@ -28,12 +28,16 @@
  * loader reserves and zeroes them.
  *
  * ─── Memory layout (boot-image region, page-aligned, contiguous) ────────
- *   base_phys                    (BOOT_IMAGE_BASE_PHYS, 0x20000000 = 512 MiB)
- *     init.image                 size = the init binary's size
- *     init.heap                  BOOT_INIT_HEAP_BYTES   (init's budget MEM cap)
- *     dm.image                   size = the DM binary's size
- *     dm.heap                    BOOT_DM_HEAP_BYTES     (the DM's budget cap)
- *     registry                   BOOT_REGISTRY_BYTES    (SidecarDeviceInfo)
+ *   base_phys                    (BOOT_IMAGE_BASE_PHYS, 0x20000000 = 512 MiB) *   init.image                 size = the init binary's size
+ *   init.heap                  BOOT_INIT_HEAP_BYTES   (init's budget MEM cap)
+ *   dm.image                   size = the DM binary's size
+ *   dm.heap                    BOOT_DM_HEAP_BYTES     (the DM's budget cap)
+ *   ... (posix, ramdisk, storage, net regions) ...
+ *   e1000.image                size = the drv.e1000.0 binary's size
+ *   e1000.heap                 BOOT_E1000_HEAP_BYTES  (the driver's budget
+ *                              cap — declared by the DM's driver manifest
+ *                              at spawn, not by init)
+ *   registry                   BOOT_REGISTRY_BYTES    (SidecarDeviceInfo)
  *   The whole span [base_phys, base_phys + total_size) must be reserved
  *   from the frame pool before any sidecar is created (the arena carve in
  *   cap_init runs after the loader, so the reservation must win).
@@ -43,6 +47,15 @@
  * archive's boot/dm.manifest carries — the addresses agree because this
  * builder pinned them to the same layout. The consumer is implemented in
  * kernel/boot_image.c (see the "The loader" section below).
+ *
+ * The e1000 driver is NOT spawned by init: the DM spawns drv.e1000.0 at
+ * runtime when the device registry shows a handed-off (role-less) NIC —
+ * the driver binary's e1000.image region is copied here by the loader, and
+ * init learns its address from the `e1000.image` MEM cap and grants it to
+ * the DM on the registry message (a derived copy of init's own object, so
+ * no second MEM object overlaps the region). The driver manifest is built
+ * by user/dm/src/drv_manifest.rs and declares its budget against the
+ * e1000.heap region.
  */
 
 #ifndef BOOT_IMAGE_H
@@ -82,6 +95,13 @@
 #define BOOT_NET_BIN_PATH            "boot/net.bin"
 #define BOOT_NET_MANIFEST_PATH       "boot/net.manifest"
 #define BOOT_NET_HEAP_BYTES          (512u * 1024u)
+#define BOOT_E1000_BIN_PATH          "boot/e1000.bin"
+#define BOOT_E1000_HEAP_BYTES        (512u * 1024u)
+/* The e1000 driver's registry name (driver_manifest field) — must match
+ * E1000_MANIFEST_NAME in user/bootimage/src/layout.rs and the DM's
+ * drv_manifest.rs. Only HANDED-OFF (role-less) e1000s carry it; kernel-
+ * owned NICs stay driverless in the registry. */
+#define BOOT_E1000_MANIFEST_NAME     "drv.e1000.0"
 #define BOOT_ROOTFS_BIN_PATH         "boot/rootfs.bin"
 #define BOOT_LAYOUT_PATH            "boot/layout"
 
@@ -92,14 +112,17 @@
  *
  *   AEROSLS-BOOT-LAYOUT 1
  *   base <phys>
- *   region <name> <phys> <size>         7 lines, memory order:
+ *   region <name> <phys> <size>         14 lines, memory order:
  *                                       init.image init.heap dm.image
  *                                       dm.heap posix.image posix.heap
- *                                       registry
+ *                                       ramdisk.image ramdisk.heap
+ *                                       storage net.image net.heap
+ *                                       e1000.image e1000.heap registry
  *   file <path> <offset> <size>         one line per archive entry
  *                                       (init.bin init.manifest dm.bin
  *                                       dm.manifest posix.bin
- *                                       posix.manifest boot/layout)
+ *                                       posix.manifest net.bin net.manifest
+ *                                       e1000.bin rootfs.bin boot/layout)
  *
  * The loader may walk the CPIO by name instead of parsing this file; the
  * file exists so the loader can verify its region computation and so a
@@ -168,6 +191,7 @@ struct BootImageInfo {
     uint64_t ramdisk_kaddr, ramdisk_size;
     uint64_t storage_kaddr, storage_size;
     uint64_t net_kaddr, net_size;
+    uint64_t e1000_kaddr, e1000_size;
     uint64_t reg_kaddr,  reg_size;
     uint64_t boot_base,  boot_total;
     uint32_t init_bin_off, init_bin_len;   /* archive offsets of the images */
@@ -175,6 +199,7 @@ struct BootImageInfo {
     uint32_t posix_bin_off, posix_bin_len;
     uint32_t ramdisk_bin_off, ramdisk_bin_len;
     uint32_t net_bin_off, net_bin_len;
+    uint32_t e1000_bin_off, e1000_bin_len;
     uint32_t rootfs_bin_off, rootfs_bin_len;
 };
 

@@ -775,6 +775,17 @@ jobs:
         run: bash tests/phase5_boot_smoke.sh
         working-directory: aerosls2
 
+      # Phase 5 e1000 driver smoke: boots the SAME ISO with a SECOND e1000
+      # (grub nic1=none) so the kernel hands a NIC to the user driver
+      # sidecar, and requires 'e1000] PASS' — the DM-spawned drv.e1000.0's
+      # PHY-loopback round trip over the handed-off card. This is the only
+      # place the whole DM->driver composition path (role-aware registry
+      # marking, image grant, create_sidecar DEV/MEM mints, SYS_DEV_MMAP)
+      # runs on the real target.
+      - name: Phase 5 e1000 driver smoke (DM-spawned drv.e1000.0 PASS)
+        run: bash tests/phase5_e1000_driver_smoke.sh
+        working-directory: aerosls2
+
       # Phase 5 flake guard: the phase-3 serial-IRQ windows were
       # edge-triggered and racy under -accel tcg,thread=multi (~1/6 to ~1/2
       # of boots died at 'ch=recover', or post-ready with no shell). One

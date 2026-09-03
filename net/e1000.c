@@ -99,6 +99,13 @@ int e1000_nic_count(void) {
     return c;
 }
 
+int e1000_nic_idx_for_slot(uint8_t pci_slot) {
+    for (int i = 0; i < E1000_MAX_NICS; i++)
+        if (e1000_nics[i].present && e1000_nics[i].pci_slot == pci_slot)
+            return i;
+    return -1;
+}
+
 const MACAddr* e1000_nic_mac(int idx) {
     if (idx < 0 || idx >= E1000_MAX_NICS || !e1000_nics[idx].present) return 0;
     return &e1000_nics[idx].mac;

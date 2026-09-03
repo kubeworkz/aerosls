@@ -112,6 +112,13 @@ void e1000_nic_bind(int idx, uint64_t mmio_base, uint8_t pci_slot,
  * and which it hands to a user driver. */
 uint8_t e1000_nic_roles(int idx);
 
+/* Index of the bound interface on PCI `pci_slot`, or -1 if none. The boot
+ * device-registry scan (kernel/boot_image.c) uses it to tell a handed-off
+ * (role-less) e1000 from a kernel-owned one: only the former is marked
+ * drv.e1000.0 in the registry, so the DM never spawns a second driver onto
+ * the kernel's own NIC. Pure. */
+int e1000_nic_idx_for_slot(uint8_t pci_slot);
+
 /* Hand interface `idx` to a USER driver sidecar (drv.e1000.0, spawned by
  * the DM): bind it with NIC_ROLE_NONE, enable PCI memory space + bus
  * mastering, and mark the MMIO BAR uncacheable — so the user driver's DMA

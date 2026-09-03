@@ -33,8 +33,17 @@
 //!   ├─ init.heap   init's budget MEM cap (bump heap)   (16 MiB, §1.4)
 //!   ├─ dm.image    the Device Manager flat binary      (size = dm_bin.len)
 //!   ├─ dm.heap     the DM's budget MEM cap             (256 KiB, dm_manifest.rs)
+//!   ├─ ...  (posix, ramdisk, storage, net regions)
+//!   ├─ e1000.image the drv.e1000.0 driver flat binary  (size = e1000_bin.len)
+//!   ├─ e1000.heap  the driver's budget MEM cap         (512 KiB)
 //!   └─ registry    kernel-populated SidecarDeviceInfo  (4 KiB, devreg.rs)
 //! ```
+//!
+//! The e1000 driver is the first DM-spawned sidecar: init never creates it.
+//! The DM spawns it at runtime from the driver image region (learned via a
+//! transient grant on the registry message) with a budget cap over the
+//! e1000.heap region and a DEV cap for the handed-off NIC's BAR0 (from the
+//! device registry) — see `user/dm/src/drv_manifest.rs`.
 
 /// Physical base of the reserved boot-image region (512 MiB). Must satisfy
 /// `cap_create_mem`: ≥ 0x100000, disjoint from the kernel image
@@ -67,6 +76,12 @@ pub const STORAGE_BYTES: u64 = 16 * 1024 * 1024;
 /// backend's socket buffers and the server loop's message buffers.
 pub const NET_HEAP_BYTES: u64 = 512 * 1024;
 
+/// The e1000 driver's budget heap — 512 KiB (the driver's DMA layout needs
+/// ~36 KiB: rings + RX buffers; the rest is headroom). Must match
+/// `E1000_HEAP_BYTES` in `user/dm/src/drv_manifest.rs` (the DM declares the
+/// driver's budget cap against this region at spawn time).
+pub const E1000_HEAP_BYTES: u64 = 512 * 1024;
+
 /// The device registry region: `4 + MAX_DEVICES(16) × 64` = 1028 bytes
 /// (devreg.rs), rounded to one page.
 pub const REGISTRY_BYTES: u64 = 4096;
@@ -84,6 +99,10 @@ pub const POSIX_MANIFEST_NAME: &str = "aerosls.posix.0";
 pub const RAMDISK_MANIFEST_NAME: &str = "drv.ramdisk.0";
 /// The network sidecar's registry name.
 pub const NET_MANIFEST_NAME: &str = "drv.network.0";
+/// The e1000 driver's registry name — the role-less NIC's driver_manifest
+/// field in the device registry, and the name the DM registers when it
+/// spawns this sidecar.
+pub const E1000_MANIFEST_NAME: &str = "drv.e1000.0";
 
 /// Archive entry paths (the loader walks the CPIO for `INIT_MANIFEST_PATH`).
 pub const INIT_BIN_PATH: &str = "boot/init.bin";
@@ -96,8 +115,13 @@ pub const RAMDISK_BIN_PATH: &str = "boot/ramdisk.bin";
 pub const RAMDISK_MANIFEST_PATH: &str = "boot/ramdisk.manifest";
 pub const NET_BIN_PATH: &str = "boot/net.bin";
 pub const NET_MANIFEST_PATH: &str = "boot/net.manifest";
+pub const E1000_BIN_PATH: &str = "boot/e1000.bin";
 pub const ROOTFS_BIN_PATH: &str = "boot/rootfs.bin";
 pub const LAYOUT_PATH: &str = "boot/layout";
+
+/// The driver has NO `boot/e1000.manifest`: its manifest is built at spawn
+/// time by the DM (the handed-off NIC's BAR0 address only exists on the
+/// target), so the archive carries just the binary bytes.
 
 /// One reserved physical region.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,6 +153,8 @@ pub struct BootLayout {
     pub storage: Region,
     pub net_image: Region,
     pub net_heap: Region,
+    pub e1000_image: Region,
+    pub e1000_heap: Region,
     pub registry: Region,
 }
 
@@ -141,7 +167,7 @@ impl BootLayout {
 
     /// Every region, in memory order, for iteration in tests and the
     /// `boot/layout` file.
-    pub fn regions(&self) -> [(&'static str, Region); 12] {
+    pub fn regions(&self) -> [(&'static str, Region); 14] {
         [
             ("init.image", self.init_image),
             ("init.heap", self.init_heap),
@@ -154,6 +180,8 @@ impl BootLayout {
             ("storage", self.storage),
             ("net.image", self.net_image),
             ("net.heap", self.net_heap),
+            ("e1000.image", self.e1000_image),
+            ("e1000.heap", self.e1000_heap),
             ("registry", self.registry),
         ]
     }
@@ -172,6 +200,8 @@ pub struct BootImageSpec {
     pub ramdisk_bin: Vec<u8>,
     /// The network sidecar flat binary.
     pub net_bin: Vec<u8>,
+    /// The drv.e1000.0 driver flat binary (spawned by the DM, not init).
+    pub e1000_bin: Vec<u8>,
     /// Size of init's budget heap region.
     pub init_heap_bytes: u64,
     /// Size of the DM's budget heap region.
@@ -182,6 +212,8 @@ pub struct BootImageSpec {
     pub ramdisk_heap_bytes: u64,
     /// Size of the network sidecar's budget heap region.
     pub net_heap_bytes: u64,
+    /// Size of the e1000 driver's budget heap region.
+    pub e1000_heap_bytes: u64,
     /// Size of the ramdisk storage region.
     pub storage_bytes: u64,
     /// Size of the device-registry region.
@@ -198,22 +230,33 @@ pub struct BootImageSpec {
     pub ramdisk_entry: u64,
     /// Entry-point offset within the network binary.
     pub net_entry: u64,
+    /// Entry-point offset within the e1000 driver binary.
+    pub e1000_entry: u64,
 }
 
 impl BootImageSpec {
     /// A spec with the documented defaults.
-    pub fn new(init_bin: Vec<u8>, dm_bin: Vec<u8>, posix_bin: Vec<u8>, ramdisk_bin: Vec<u8>, net_bin: Vec<u8>) -> Self {
+    pub fn new(
+        init_bin: Vec<u8>,
+        dm_bin: Vec<u8>,
+        posix_bin: Vec<u8>,
+        ramdisk_bin: Vec<u8>,
+        net_bin: Vec<u8>,
+        e1000_bin: Vec<u8>,
+    ) -> Self {
         Self {
             init_bin,
             dm_bin,
             posix_bin,
             ramdisk_bin,
             net_bin,
+            e1000_bin,
             init_heap_bytes: INIT_HEAP_BYTES,
             dm_heap_bytes: DM_HEAP_BYTES,
             posix_heap_bytes: POSIX_HEAP_BYTES,
             ramdisk_heap_bytes: RAMDISK_HEAP_BYTES,
             net_heap_bytes: NET_HEAP_BYTES,
+            e1000_heap_bytes: E1000_HEAP_BYTES,
             storage_bytes: STORAGE_BYTES,
             registry_bytes: REGISTRY_BYTES,
             base_phys: BOOT_IMAGE_BASE_PHYS,
@@ -222,6 +265,7 @@ impl BootImageSpec {
             posix_entry: 0,
             ramdisk_entry: 0,
             net_entry: 0,
+            e1000_entry: 0,
         }
     }
 }
@@ -258,6 +302,8 @@ pub fn compute_layout(spec: &BootImageSpec) -> BootLayout {
         storage: take(spec.storage_bytes),
         net_image: take(spec.net_bin.len() as u64),
         net_heap: take(spec.net_heap_bytes),
+        e1000_image: take(spec.e1000_bin.len() as u64),
+        e1000_heap: take(spec.e1000_heap_bytes),
         registry: take(spec.registry_bytes),
     }
 }
@@ -267,7 +313,7 @@ mod tests {
     use super::*;
 
     fn spec() -> BootImageSpec {
-        BootImageSpec::new(vec![0xAA; 0x2000], vec![0xBB; 0x4000], vec![0xCC; 0x8000], vec![0xDD; 0x1000], vec![0xEE; 0x1000])
+        BootImageSpec::new(vec![0xAA; 0x2000], vec![0xBB; 0x4000], vec![0xCC; 0x8000], vec![0xDD; 0x1000], vec![0xEE; 0x1000], vec![0xEF; 0x2000])
     }
 
     #[test]
@@ -303,6 +349,17 @@ mod tests {
     }
 
     #[test]
+    fn e1000_image_sits_after_net_heap_and_its_heap_follows_immediately() {
+        // The DM computes the driver's budget base as page_align(image
+        // end) — the same rule the POSIX/network spawns use — so the
+        // e1000.heap region must be contiguous right after e1000.image.
+        let l = compute_layout(&spec());
+        assert!(l.e1000_image.phys >= l.net_heap.end());
+        assert_eq!(l.e1000_heap.phys, align_up(l.e1000_image.end(), 4096));
+        assert!(l.registry.phys >= l.e1000_heap.end());
+    }
+
+    #[test]
     fn heap_regions_match_the_sidecar_contracts() {
         let l = compute_layout(&spec());
         assert_eq!(l.init_heap.size, INIT_HEAP_BYTES);
@@ -311,6 +368,7 @@ mod tests {
         assert_eq!(l.ramdisk_heap.size, RAMDISK_HEAP_BYTES);
         assert_eq!(l.storage.size, STORAGE_BYTES);
         assert_eq!(l.net_heap.size, NET_HEAP_BYTES);
+        assert_eq!(l.e1000_heap.size, E1000_HEAP_BYTES);
         assert_eq!(l.registry.size, REGISTRY_BYTES);
     }
 

@@ -20,21 +20,30 @@
 //!
 //! - `server`   — the DM core: the registry handshake + event loop,
 //!   generic over `Kernel` (host-tested against the kernel-sim fake).
+//! - `drv_manifest` — the drv.e1000.0 driver manifest builder + the
+//!   registry-driven spawn decision (pure, host-tested).
 //! - `heap`     — bump allocator over the budget region (the global
 //!   allocator `alloc` needs in the final binary).
 //! - `entry`    — the `extern "C"` entry point (feature `target`), plus
 //!   the crt0 (crt0.S via global_asm!) and the panic handler.
 //!
-//! v1 scope: the DM adopts devices (logs what it would spawn) and replies
-//! ready; spawning the NVMe/e1000 driver sidecars per the registry is the
-//! composition milestone (Phase 5 §2.2) and is deliberately not faked.
+//! v1 scope: the DM adopts devices, replies ready, and spawns the e1000
+//! driver sidecar when the registry shows a NIC the kernel handed off
+//! (role-less, driver_manifest `drv.e1000.0`); NVMe drivers (also
+//! class-marked) remain future spawns — not faked.
 
 #![cfg_attr(not(test), no_std)]
 
+extern crate alloc;
+
+pub mod drv_manifest;
 pub mod heap;
 pub mod server;
 
 #[cfg(feature = "target")]
 mod entry;
 
-pub use server::{DmError, DmOutcome, DmServer, MSG_DEVICE_REGISTRY, MSG_DEVICES_READY};
+pub use drv_manifest::{E1000_MANIFEST_NAME, E1000Spawn, build_e1000_manifest, e1000_budget_base, e1000_spawn_from_registry};
+pub use server::{
+    DmError, DmOutcome, DmServer, DriverOutcome, MSG_DEVICE_REGISTRY, MSG_DEVICES_READY,
+};

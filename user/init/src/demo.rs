@@ -46,13 +46,20 @@ pub const DM_READY_RETRIES: u32 = 3;
 /// BLOCKING send (timeout 0): if the DM's queue is full, the kernel parks
 /// this sidecar until a slot frees — the handshake cannot drop the
 /// registry.
+///
+/// `caps[0]` is the registry table grant (read-only); `caps[1]`, when
+/// present, is the e1000 driver image grant (also read-only) — the
+/// DM needs the driver binary's address+size to spawn drv.e1000.0, and a
+/// grant (a derived copy of init's own cap) is the only way to share a
+/// physical region that is already a MEM object without minting an
+/// overlapping second one.
 pub fn send_registry<K: Kernel>(
     dm: &InitChannel<K>,
     tag: u32,
     payload: &[u8],
-    cap: &SendCap,
+    caps: &[SendCap],
 ) -> Result<(), ChannelError> {
-    dm.send_with_cap(tag, payload, cap)
+    dm.send_with_caps(tag, payload, caps)
 }
 
 /// Wait for the DM's "devices ready" reply with a FINITE deadline. The
@@ -451,7 +458,7 @@ mod tests {
         // Blocking send (timeout 0): a full DM queue would park the sender
         // (SYS_SLS_CHAN_SEND); the sim's queue is never full, so the send
         // lands immediately.
-        send_registry(&dm, MSG_DEVICE_REGISTRY, &payload, &cap).unwrap();
+        send_registry(&dm, MSG_DEVICE_REGISTRY, &payload, &[cap]).unwrap();
         assert_eq!(k.sim().peek_tag(2), Some(MSG_DEVICE_REGISTRY));
 
         // The DM reads it back with the payload intact.
@@ -621,7 +628,7 @@ mod tests {
             rights: 0x01,
             flags: 0,
         };
-        send_registry(&dm, MSG_DEVICE_REGISTRY, &1u32.to_le_bytes(), &cap).unwrap();
+        send_registry(&dm, MSG_DEVICE_REGISTRY, &1u32.to_le_bytes(), &[cap]).unwrap();
         assert_eq!(k.sim().peek_tag(r), Some(MSG_DEVICE_REGISTRY));
         // The DM reads the registry...
         let mut buf = [0u8; 4];

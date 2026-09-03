@@ -894,19 +894,21 @@ SIDECAR_DM_ELF     ?= user/target/x86_64-unknown-none/release/dm
 SIDECAR_POSIX_ELF ?= user/target/x86_64-unknown-none/release/posix
 SIDECAR_RAMDISK_ELF ?= user/target/x86_64-unknown-none/release/ramdisk
 SIDECAR_NET_ELF    ?= user/target/x86_64-unknown-none/release/network
+SIDECAR_E1000_ELF  ?= user/target/x86_64-unknown-none/release/e1000_driver
 SIDECAR_INIT_BIN   ?= user/target/x86_64-unknown-none/release/init.bin
 SIDECAR_DM_BIN     ?= user/target/x86_64-unknown-none/release/dm.bin
 SIDECAR_POSIX_BIN ?= user/target/x86_64-unknown-none/release/posix.bin
 SIDECAR_RAMDISK_BIN ?= user/target/x86_64-unknown-none/release/ramdisk.bin
 SIDECAR_NET_BIN    ?= user/target/x86_64-unknown-none/release/network.bin
+SIDECAR_E1000_BIN  ?= user/target/x86_64-unknown-none/release/e1000_driver.bin
 SIDECAR_CPIO       ?= sidecars.cpio
 
 .PHONY: selfhost-bootimage
 selfhost-bootimage:
-	@echo "[SELFHOST] building the init + Device Manager + POSIX + ramdisk + network sidecars for x86_64-unknown-none..."
-	@$(CARGO) build --manifest-path user/Cargo.toml -p aerosls-init -p aerosls-dm -p aerosls-sidecar -p aerosls-ramdisk -p aerosls-network \
+	@echo "[SELFHOST] building the init + DM + POSIX + ramdisk + network + e1000_driver sidecars for x86_64-unknown-none..."
+	@$(CARGO) build --manifest-path user/Cargo.toml -p aerosls-init -p aerosls-dm -p aerosls-sidecar -p aerosls-ramdisk -p aerosls-network -p aerosls-e1000-driver \
 		--features target --target x86_64-unknown-none --release \
-		--bin init --bin dm --bin posix --bin ramdisk --bin network 2>/dev/null \
+		--bin init --bin dm --bin posix --bin ramdisk --bin network --bin e1000_driver 2>/dev/null \
 		|| echo "[SELFHOST] warning: x86_64-unknown-none target not installed; using existing binaries"
 	@if [ -s "$(SIDECAR_INIT_ELF)" ]; then \
 		$(CARGO) run --quiet --manifest-path user/Cargo.toml -p aerosls-bootimage -- \
@@ -933,6 +935,11 @@ selfhost-bootimage:
 			flatten --input "$(SIDECAR_NET_ELF)" --output "$(SIDECAR_NET_BIN)" \
 			--load-vaddr 0x400000000000; \
 	fi
+	@if [ -s "$(SIDECAR_E1000_ELF)" ]; then \
+		$(CARGO) run --quiet --manifest-path user/Cargo.toml -p aerosls-bootimage -- \
+			flatten --input "$(SIDECAR_E1000_ELF)" --output "$(SIDECAR_E1000_BIN)" \
+			--load-vaddr 0x400000000000; \
+	fi
 	@test -s "$(SIDECAR_INIT_BIN)" \
 		|| { echo "[SELFHOST] missing init binary: $(SIDECAR_INIT_BIN)"; echo "           build it with the cross target (see user/README.md) or set SIDECAR_INIT_BIN="; exit 1; }
 	@test -s "$(SIDECAR_DM_BIN)" \
@@ -941,10 +948,12 @@ selfhost-bootimage:
 		|| { echo "[SELFHOST] missing ramdisk binary: $(SIDECAR_RAMDISK_BIN)"; echo "           build it with the cross target (see user/README.md) or set SIDECAR_RAMDISK_BIN="; exit 1; }
 	@test -s "$(SIDECAR_NET_BIN)" \
 		|| { echo "[SELFHOST] missing network binary: $(SIDECAR_NET_BIN)"; echo "           build it with the cross target (see user/README.md) or set SIDECAR_NET_BIN="; exit 1; }
+	@test -s "$(SIDECAR_E1000_BIN)" \
+		|| { echo "[SELFHOST] missing e1000 driver binary: $(SIDECAR_E1000_BIN)"; echo "           build it with the cross target (see user/README.md) or set SIDECAR_E1000_BIN="; exit 1; }
 	$(CARGO) run --quiet --manifest-path user/Cargo.toml -p aerosls-bootimage -- \
 		--init "$(SIDECAR_INIT_BIN)" --dm "$(SIDECAR_DM_BIN)" \
 		--posix "$(SIDECAR_POSIX_BIN)" --ramdisk "$(SIDECAR_RAMDISK_BIN)" \
-		--net "$(SIDECAR_NET_BIN)" -o "$(SIDECAR_CPIO)"
+		--net "$(SIDECAR_NET_BIN)" --e1000 "$(SIDECAR_E1000_BIN)" -o "$(SIDECAR_CPIO)"
 	@echo "[SELFHOST] boot image: $(SIDECAR_CPIO) (load as an initrd at the bootloader's module path)"
 
 # ── SIMI host toolchain ─────────────────────────────────────────────────────

@@ -115,6 +115,7 @@ struct BootManifestInfo {
     uint64_t ramdisk_kaddr, ramdisk_size;
     uint64_t storage_kaddr, storage_size;
     uint64_t net_kaddr, net_size;
+    uint64_t e1000_kaddr, e1000_size;
     uint64_t reg_kaddr, reg_size;
 };
 
@@ -173,6 +174,12 @@ static int boot_manifest_read(const uint8_t* blob, uint32_t len,
             } else if (nlen == 9 && memcmp(n, "net.image", 9) == 0) {
                 m->net_kaddr = boot_le64(rp + 2 + nlen);
                 m->net_size  = boot_le64(rp + 2 + nlen + 8);
+            } else if (nlen == 12 && memcmp(n, "e1000.image", 12) == 0) {
+                /* The drv.e1000.0 driver binary. Optional for older images
+                 * (no DM-spawned driver); present images carry it so the
+                 * DM can spawn the driver at runtime. */
+                m->e1000_kaddr = boot_le64(rp + 2 + nlen);
+                m->e1000_size  = boot_le64(rp + 2 + nlen + 8);
             }
             break;
         }
@@ -224,6 +231,11 @@ int boot_image_parse(const uint8_t* archive, uint32_t archive_len,
     uint32_t noff = 0, nsize = 0;
     r = boot_newc_find(archive, archive_len, BOOT_NET_BIN_PATH, &noff, &nsize);
     if (r != 0) { noff = 0; nsize = 0; }
+    /* e1000 driver binary is optional for older images (its manifest cap
+     * declaring a size with no archive entry fails the cross-check below). */
+    uint32_t eoff = 0, esize = 0;
+    r = boot_newc_find(archive, archive_len, BOOT_E1000_BIN_PATH, &eoff, &esize);
+    if (r != 0) { eoff = 0; esize = 0; }
     /* Rootfs is optional — older images boot in console-only mode. */
     uint32_t rootfs_off = 0, rootfs_len = 0;
     r = boot_newc_find(archive, archive_len, BOOT_ROOTFS_BIN_PATH, &rootfs_off, &rootfs_len);
@@ -235,6 +247,7 @@ int boot_image_parse(const uint8_t* archive, uint32_t archive_len,
     if (mi.init_size != isize || mi.dm_size != dsize || mi.posix_size != psize) return BOOT_ERR_MISMATCH;
     if (mi.ramdisk_size != 0 && mi.ramdisk_size != rsize) return BOOT_ERR_MISMATCH;
     if (mi.net_size != 0 && mi.net_size != nsize) return BOOT_ERR_MISMATCH;
+    if (mi.e1000_size != 0 && mi.e1000_size != esize) return BOOT_ERR_MISMATCH;
 
     /* The boot-image span [init kaddr, registry end) must live inside the
      * 4 GiB identity map (cap_create_mem's bound). */
@@ -254,6 +267,8 @@ int boot_image_parse(const uint8_t* archive, uint32_t archive_len,
     info->storage_size  = mi.storage_size;
     info->net_kaddr = mi.net_kaddr;
     info->net_size  = mi.net_size;
+    info->e1000_kaddr = mi.e1000_kaddr;
+    info->e1000_size  = mi.e1000_size;
     info->reg_kaddr  = mi.reg_kaddr;
     info->reg_size   = mi.reg_size;
     info->boot_base  = mi.init_kaddr;
@@ -268,6 +283,8 @@ int boot_image_parse(const uint8_t* archive, uint32_t archive_len,
     info->ramdisk_bin_len = rsize;
     info->net_bin_off = noff;
     info->net_bin_len = nsize;
+    info->e1000_bin_off = eoff;
+    info->e1000_bin_len = esize;
     info->rootfs_bin_off = rootfs_off;
     info->rootfs_bin_len = rootfs_len;
 
@@ -282,7 +299,9 @@ int boot_image_parse(const uint8_t* archive, uint32_t archive_len,
         info->reg_kaddr < info->boot_base ||
         info->reg_kaddr + info->reg_size > info->boot_base + info->boot_total ||
         (info->net_kaddr != 0 && (info->net_kaddr < info->boot_base ||
-         info->net_kaddr + info->net_size > info->boot_base + info->boot_total)))
+         info->net_kaddr + info->net_size > info->boot_base + info->boot_total)) ||
+        (info->e1000_kaddr != 0 && (info->e1000_kaddr < info->boot_base ||
+         info->e1000_kaddr + info->e1000_size > info->boot_base + info->boot_total)))
         return BOOT_ERR_RANGE;
     return 0;
 }
@@ -315,8 +334,14 @@ int boot_build_registry(uint8_t* dst, uint32_t cap,
 }
 
 const char* boot_driver_for_class(uint8_t class_code, uint8_t subclass) {
+    /* NVMe is class-mapped. e1000 is deliberately NOT here: whether an
+     * ethernet NIC is driver-owned depends on its role (a NIC the kernel
+     * drives must stay driverless in the registry, or the DM would spawn a
+     * second driver onto the kernel's own card), so boot_pci_scan_slot
+     * decides e1000 entries itself from the NIC's role — the class map
+     * auto-fill must never resurrect a drv.e1000.0 name for a kernel-
+     * owned NIC. */
     if (class_code == 0x01 && subclass == 0x08) return "drv.nvme.0";
-    if (class_code == 0x02 && subclass == 0x00) return "drv.e1000.0";
     return "";
 }
 
@@ -410,10 +435,30 @@ static int boot_pci_scan_slot(int slot, struct BootDeviceEntry* e) {
     e->irq_line     = (uint8_t)(pci_read_config(0, (uint8_t)slot, 0, 0x3C) & 0xFF);
     e->pci_slot     = (uint8_t)slot;
     e->pci_bus      = 0;
-    const char* drv = boot_driver_for_class(e->class_code, e->subclass);
-    size_t dl = strlen(drv);
-    if (dl >= sizeof(e->driver_manifest)) dl = sizeof(e->driver_manifest) - 1;
-    memcpy(e->driver_manifest, drv, dl);
+    e->driver_manifest[0] = '\0';
+    if (e->class_code == 0x02 && e->subclass == 0x00) {
+        /* Ethernet: driver-owned ONLY when the kernel handed the NIC off
+         * (role NONE, grub nicN=none -> e1000_driver_handoff in step 7). A
+         * kernel-owned NIC (mgmt/cluster roles) must stay driverless here
+         * or the DM would spawn drv.e1000.0 onto the kernel's own card and
+         * fight it for the same registers. launch_init_sidecar (step 7d)
+         * runs after the step-7 role assignment, so the role table is
+         * live. NIC_ROLE_NONE == 0 (net/e1000.h). The slot->index lookup
+         * can miss a NIC the kernel scan skipped (BAR quirk): that NIC is
+         * left driverless too — never defaulted to driver-owned. */
+        extern int e1000_nic_idx_for_slot(uint8_t pci_slot);
+        extern uint8_t e1000_nic_roles(int idx);
+        int idx = e1000_nic_idx_for_slot((uint8_t)slot);
+        if (idx >= 0 && e1000_nic_roles(idx) == 0) {
+            static const char drv[] = BOOT_E1000_MANIFEST_NAME;
+            memcpy(e->driver_manifest, drv, sizeof(drv) - 1);
+        }
+    } else {
+        const char* drv = boot_driver_for_class(e->class_code, e->subclass);
+        size_t dl = strlen(drv);
+        if (dl >= sizeof(e->driver_manifest)) dl = sizeof(e->driver_manifest) - 1;
+        memcpy(e->driver_manifest, drv, dl);
+    }
     return 0;
 }
 
@@ -463,12 +508,13 @@ void launch_init_sidecar(void) {
     kernel_serial_printf(
         "[SIDECAR] boot image: init @0x%llx (%llu B) dm @0x%llx (%llu B) "
         "posix @0x%llx (%llu B) ramdisk @0x%llx (%llu B) net @0x%llx (%llu B) "
-        "registry @0x%llx (%llu B)\n",
+        "e1000 @0x%llx (%llu B) registry @0x%llx (%llu B)\n",
         (unsigned long long)info.init_kaddr, (unsigned long long)info.init_size,
         (unsigned long long)info.dm_kaddr,   (unsigned long long)info.dm_size,
         (unsigned long long)info.posix_kaddr, (unsigned long long)info.posix_size,
         (unsigned long long)info.ramdisk_kaddr, (unsigned long long)info.ramdisk_size,
         (unsigned long long)info.net_kaddr, (unsigned long long)info.net_size,
+        (unsigned long long)info.e1000_kaddr, (unsigned long long)info.e1000_size,
         (unsigned long long)info.reg_kaddr,  (unsigned long long)info.reg_size);
 
     /* 1. Reserve the whole boot-image span before anything can allocate it
@@ -492,6 +538,14 @@ void launch_init_sidecar(void) {
     if (info.net_kaddr != 0 && info.net_bin_len != 0) {
         memcpy((void*)(uintptr_t)info.net_kaddr, archive + info.net_bin_off,
                info.net_bin_len);
+    }
+    /* The drv.e1000.0 driver binary — copied like every other image so the
+     * DM's create_sidecar call (footer image_kaddr) finds the bytes at the
+     * declared address. The DM spawns the driver from here; init only
+     * passes the address along (e1000.image cap -> registry-message grant). */
+    if (info.e1000_kaddr != 0 && info.e1000_bin_len != 0) {
+        memcpy((void*)(uintptr_t)info.e1000_kaddr, archive + info.e1000_bin_off,
+               info.e1000_bin_len);
     }
 
     /* 2b. Copy the rootfs image to the ramdisk's storage region, if present.
@@ -526,9 +580,10 @@ void launch_init_sidecar(void) {
     boot_plant_parent(per_cpu_data[0].kernel_rsp);
 
     /* 5. Create the init sidecar from boot/init.manifest. The manifest's
-     *    caps (budget, console, device_registry, dm.image) are minted and
-     *    wired by cap_create_sidecar; the child is released PROC_SUSPENDED
-     *    with a synthetic ring3_ctx (BIB pointer in rdi). */
+     *    caps (budget, console, device_registry, dm.image, posix.image,
+     *    ramdisk.image, net.image, e1000.image) are minted and wired by
+     *    cap_create_sidecar; the child is released PROC_SUSPENDED with a
+     *    synthetic ring3_ctx (BIB pointer in rdi). */
     uint16_t ch_r = CAP_NONE;
     r = cap_create_sidecar(BOOT_PARENT_PID, init_manifest, mlen,
                            CAP_NONE, CAP_NONE, &ch_r);

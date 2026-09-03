@@ -293,9 +293,26 @@ The kernel maps each entry to a cap word in the driver's table (slots are determ
 > every register from reset on (this is also what lets `devtest` keep
 > probing nic0 read-only). Single-NIC boots are byte-identical: nic0=both
 > is their existing implicit role and `nic1=` is ignored when only one
-> card exists. The sidecar driver that consumes the handed-off NIC
-> (drv.e1000.0, spawned by the DM per §5) is the next composition step;
-> `nettest`/MockNetwork are untouched until that driver serves frames.
+> card exists.
+>
+> **DM spawn (2026-09-03):** the device registry marks ownership, and the
+> marking is ROLE-AWARE — `boot_image.c`'s PCI scan consults the NIC's
+> assigned role and writes `drv.e1000.0` into `driver_manifest` ONLY for a
+> handed-off (role-less) NIC; a kernel-owned NIC stays driverless, so the
+> DM can never spawn a second driver onto the kernel's own card (the
+> class map covers NVMe only; ethernet is deliberately not class-mapped).
+> The DM spawns `drv.e1000.0` while serving the registry message from
+> init: it finds the handed-off NIC's entry, takes the driver binary's
+> address from the `e1000.image` grant init attached to the message (a
+> derived copy of init's own cap — never a second mint, which
+> `cap_create_mem` refuses as an overlap), and packs a manifest whose
+> budget MEM cap covers the adjacent e1000.heap region and whose DEV cap
+> `nic0.bar0` carries the NIC's registry BAR0. The driver (user/e1000_driver)
+> maps BAR0 via `SYS_DEV_MMAP`, programs TX/RX rings in its budget, and
+> proves a PHY-loopback round trip: `[e1000] PASS` in the serial log. The
+> two-NIC QEMU gate (tests/phase5_e1000_driver_smoke.sh, run in CI)
+> exercises the whole chain on the real target; MockNetwork and `nettest`
+> are untouched until the driver serves frames.
 
 ---
 

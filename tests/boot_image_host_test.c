@@ -41,6 +41,12 @@ uint32_t pci_read_config(uint8_t b, uint8_t s, uint8_t f, uint8_t o) {
     (void)b; (void)f; (void)o; (void)s;
     return 0xFFFFFFFFu;
 }
+/* Role lookups the boot glue's e1000 driver-marking arm calls. These tests
+ * never exercise that arm (the stub pci_read_config above reports no
+ * devices), but the compiled static function still references the symbols,
+ * so the host link needs them. Real definitions: net/e1000.c. */
+int e1000_nic_idx_for_slot(uint8_t pci_slot) { (void)pci_slot; return -1; }
+uint8_t e1000_nic_roles(int idx) { (void)idx; return 0; }
 struct ProcessDescriptor proc_table[PROC_MAX];
 void kernel_enter_sidecar(uint64_t* rsp_save, uint64_t* cr3_save,
                           uint64_t cr3, uint64_t rip, uint64_t rsp,
@@ -99,20 +105,26 @@ static void blob_name_payload(struct Blob* b, const char* s) {
     blob_bytes(b, s, n);
 }
 
-/* Build the init manifest: header + 12 records + image_kaddr footer, with
+/* Build the init manifest: header + 13 records + image_kaddr footer, with
  * total_len/CRC patched — the exact wire format boot_image.c reads and the
- * kernel's cap_create_sidecar parses. Addresses match the layout the Rust
- * builder assigns for a 0x2000-byte init and 0x4000-byte dm image:
+ * kernel's cap_create_sidecar parses. Addresses follow the Rust builder's
+ * ordering (init, dm, posix, e1000, registry — contiguous, registry last)
+ * for a 0x2000-byte init and 0x4000-byte dm image:
  *   init.image 0x20000000, init.heap 0x20002000 (16 MiB),
  *   dm.image 0x20102000, dm.heap 0x20106000 (256 KiB),
- *   registry 0x20146000 (4 KiB). */
+ *   posix.image 0x20106000, posix.heap 0x20107000,
+ *   e1000.image 0x20107000 (0x2000), registry 0x20109000 (4 KiB).
+ * The heap sizes only matter for the span math: boot_total runs from init
+ * to registry end, and every image must sit inside it. */
 enum {
     IMG_INIT_KADDR    = 0x20000000ULL,
     IMG_DM_KADDR      = 0x20102000ULL,
     IMG_POSIX_KADDR   = 0x20106000ULL,
-    IMG_REG_KADDR     = 0x20116000ULL,
+    IMG_E1000_KADDR   = 0x20107000ULL,
+    IMG_REG_KADDR     = 0x20109000ULL,
     IMG_DM_SIZE       = 0x4000u,
     IMG_POSIX_SIZE    = 0x1000u,
+    IMG_E1000_SIZE    = 0x2000u,
     IMG_REG_SIZE      = 0x1000u,
     IMG_INIT_SIZE     = 0x2000u,
 };
@@ -178,6 +190,14 @@ static void build_init_manifest(struct Blob* b) {
     blob_u64(b, IMG_POSIX_KADDR);
     blob_u64(b, IMG_POSIX_SIZE);
     blob_bytes(b, "\x01", 1);
+    /* e1000.image MEM cap — the drv.e1000.0 driver binary region, which
+     * the loader copies boot/e1000.bin into and init later grants to the
+     * DM (which spawns the driver). */
+    blob_record(b, SIDECAR_TAG_CAP_MEM, 12 + 19); rc++;
+    blob_name_payload(b, "e1000.image");
+    blob_u64(b, IMG_E1000_KADDR);
+    blob_u64(b, IMG_E1000_SIZE);
+    blob_bytes(b, "\x01", 1);
 
     blob_record(b, 0x0008, 13); rc++;     /* bootstrap: name_len + 7 + 4 */
     blob_name_payload(b, "console");
@@ -239,9 +259,11 @@ static void build_archive(struct Blob* out, struct Blob* init_manifest) {
     uint8_t init_bin[IMG_INIT_SIZE];
     uint8_t dm_bin[IMG_DM_SIZE];
     uint8_t posix_bin[IMG_POSIX_SIZE];
+    uint8_t e1000_bin[IMG_E1000_SIZE];
     for (uint32_t i = 0; i < IMG_INIT_SIZE; i++) init_bin[i] = (uint8_t)(0xAA + i);
     for (uint32_t i = 0; i < IMG_DM_SIZE; i++)   dm_bin[i]   = (uint8_t)(0xBB + i);
     for (uint32_t i = 0; i < IMG_POSIX_SIZE; i++) posix_bin[i] = (uint8_t)(0xCC + i);
+    for (uint32_t i = 0; i < IMG_E1000_SIZE; i++) e1000_bin[i] = (uint8_t)(0xEE + i);
     memset(out, 0, sizeof(*out));
     newc_entry(out, BOOT_INIT_BIN_PATH, init_bin, sizeof(init_bin));
     newc_entry(out, BOOT_INIT_MANIFEST_PATH, init_manifest->data, init_manifest->len);
@@ -249,6 +271,7 @@ static void build_archive(struct Blob* out, struct Blob* init_manifest) {
     newc_entry(out, BOOT_DM_MANIFEST_PATH, "fake", 4);
     newc_entry(out, BOOT_POSIX_BIN_PATH, posix_bin, sizeof(posix_bin));
     newc_entry(out, BOOT_POSIX_MANIFEST_PATH, "fake", 4);
+    newc_entry(out, BOOT_E1000_BIN_PATH, e1000_bin, sizeof(e1000_bin));
     newc_entry(out, BOOT_LAYOUT_PATH, "AEROSLS-BOOT-LAYOUT 1\n", 22);
     newc_finish(out);
 }
@@ -322,6 +345,9 @@ int main(void) {
         CHECK(info.init_size == IMG_INIT_SIZE, "init size from IMAGE record");
         CHECK(info.dm_kaddr == IMG_DM_KADDR, "dm kaddr from dm.image cap");
         CHECK(info.dm_size == IMG_DM_SIZE, "dm size from dm.image cap");
+        CHECK(info.e1000_kaddr == IMG_E1000_KADDR, "e1000 kaddr from e1000.image cap");
+        CHECK(info.e1000_size == IMG_E1000_SIZE, "e1000 size from e1000.image cap");
+        CHECK(info.e1000_bin_len == IMG_E1000_SIZE, "e1000 archive image length");
         CHECK(info.reg_kaddr == IMG_REG_KADDR, "registry kaddr from cap");
         CHECK(info.reg_size == IMG_REG_SIZE, "registry size from cap");
         CHECK(info.boot_base == IMG_INIT_KADDR, "boot_base = init kaddr");
@@ -383,7 +409,7 @@ int main(void) {
          * walk to it by tags like the reader does) */
         {
             uint32_t o = SIDECAR_MANIFEST_HEADER_LEN;
-            for (int rec = 0; rec < 12; rec++) {
+            for (int rec = 0; rec < 13; rec++) {
                 uint16_t tag = (uint16_t)(wrong.data[o] | (wrong.data[o + 1] << 8));
                 uint16_t rlen = (uint16_t)(wrong.data[o + 2] | (wrong.data[o + 3] << 8));
                 if (tag == SIDECAR_TAG_IMAGE) {
@@ -424,12 +450,18 @@ int main(void) {
         CHECK(e0[16] == 11 && e0[17] == 1, "irq line + is64bit");
         CHECK(memcmp(e0 + 20, "drv.nvme.0\0", 11) == 0,
               "NVMe driver manifest");
-        /* entry 1: e1000 */
+        /* entry 1: e1000. The class map no longer claims ethernet — whether
+         * a NIC is driver-owned depends on its ROLE, which only the boot
+         * glue scan (boot_pci_scan_slot) knows: a handed-off (role-less)
+         * NIC gets drv.e1000.0 there, a kernel-owned one stays empty. The
+         * pure core's auto-fill therefore leaves this entry driverless,
+         * which is the safe (kernel-owned) default. */
         const uint8_t* e1 = reg + 4 + 64;
         CHECK(e1[0] == 0x02 && e1[1] == 0x00, "e1000 class/subclass");
         CHECK(e1[2] == 0x86 && e1[3] == 0x80, "e1000 vendor LE");
-        CHECK(memcmp(e1 + 20, "drv.e1000.0\0", 12) == 0,
-              "e1000 driver manifest");
+        int e1000_zero = 1;
+        for (int i = 20; i < 64; i++) if (e1[i] != 0) e1000_zero = 0;
+        CHECK(e1000_zero, "kernel-owned e1000: empty driver manifest (role-aware marking lives in the boot glue scan)");
         /* entry 2: VGA — no driver yet, empty manifest name */
         const uint8_t* e2 = reg + 4 + 2 * 64;
         CHECK(e2[0] == 0x03 && e2[1] == 0x00, "VGA class/subclass");
@@ -450,8 +482,11 @@ int main(void) {
         CHECK(boot_driver_for_class(0x01, 0x08) != 0 &&
               strcmp(boot_driver_for_class(0x01, 0x08), "drv.nvme.0") == 0,
               "driver map: NVMe");
-        CHECK(strcmp(boot_driver_for_class(0x02, 0x00), "drv.e1000.0") == 0,
-              "driver map: e1000");
+        /* e1000 is role-decided, not class-decided — the map must NOT
+         * claim ethernet or the auto-fill would resurrect drv.e1000.0 for
+         * the kernel's own NIC. */
+        CHECK(strcmp(boot_driver_for_class(0x02, 0x00), "") == 0,
+              "driver map: e1000 is role-decided (empty class map)");
         CHECK(strcmp(boot_driver_for_class(0x03, 0x00), "") == 0,
               "driver map: unknown -> empty");
     }
@@ -481,7 +516,7 @@ int main(void) {
             expect++;
             off = data_off + fs + ((4 - (fs & 3)) & 3);
         }
-        CHECK(ok && expect == 7, "parser offsets agree with a raw re-walk");
+        CHECK(ok && expect == 8, "parser offsets agree with a raw re-walk");
     }
 
     printf("%d checks, %d passed, %d failed\n", g_pass + g_fail, g_pass, g_fail);

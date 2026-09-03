@@ -15,18 +15,23 @@
 //!    boot and init read to log its devices);
 //! 3. replies `MSG_DEVICES_READY` on the messenger send end — the reply
 //!    init's finite-deadline handshake waits for;
-//! 4. keeps serving the messenger (future messages: `MSG_SPAWN_POSIX`,
+//! 4. serves the registry-driven spawn: when the registry shows a NIC the
+//!    kernel handed off (driver_manifest `drv.e1000.0`), builds the driver
+//!    manifest (drv_manifest.rs) from the image grant init attached to the
+//!    message plus the NIC's BAR0, and calls `Kernel::create_sidecar`;
+//! 5. keeps serving the messenger (future messages: `MSG_SPAWN_POSIX`,
 //!    ...), parking between events, until the channel closes (init death)
 //!    — a respawned DM is a fresh process, so the loop then just ends.
 //!
-//! The grant lifecycle needs no handling here: the devreg cap init granted
-//! stays in the DM's table for the channel's lifetime (transient grants die
-//! with the channel on close), and this sidecar never sends caps itself.
+//! The grant lifecycle needs no handling here: the devreg and e1000-image
+//! caps init granted stay in the DM's table for the channel's lifetime
+//! (transient grants die with the channel on close), and this sidecar never
+//! sends caps itself.
 //!
-//! v1 scope: the DM adopts devices (logs what it would spawn) and replies
-//! ready. Actually spawning the NVMe/e1000 driver sidecars per the registry
-//! is the composition milestone (Phase 5 §2.2 — manifest path 2 channels
-//! wired by the DM) and is future work, deliberately not faked here.
+//! v1 scope: the DM adopts devices, replies ready, and spawns drv.e1000.0
+//! when a NIC was handed off (best-effort — a spawn failure is logged, not
+//! fatal). NVMe drivers (class-marked drv.nvme.0 for future spawns) are
+//! deliberately not spawned by v1.
 
 use aerosls_proto::devreg::{DevRegError, DeviceRegistry};
 use aerosls_proto::kabi::{
@@ -85,12 +90,35 @@ impl core::fmt::Display for DmError {
     }
 }
 
+/// What the DM did about its one v1 spawn target (drv.e1000.0) after
+/// serving a registry message — observable by tests and logged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverOutcome {
+    /// No handed-off NIC (no registry entry with driver_manifest
+    /// `drv.e1000.0`) — nothing to spawn.
+    None,
+    /// A handed-off NIC is registered, but the registry message carried no
+    /// driver-image grant (init always attaches one; a grant-less message
+    /// means a partial/incompatible init).
+    NoImageGrant,
+    /// drv.e1000.0 spawned; the pair is the parent messenger (CHAN_R,
+    /// CHAN_W) to the driver.
+    Spawned(u32, u32),
+    /// The spawn was attempted but the kernel refused it (non-fatal — the
+    /// DM keeps serving; the driver's absence is visible in the log).
+    SpawnError(i32),
+}
+
 /// One server event's outcome — what `serve_one` did, observable by tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DmOutcome {
-    /// The registry handshake was served: `devices` entries adopted and
-    /// `MSG_DEVICES_READY` replied.
-    RegistryServed { devices: usize },
+    /// The registry handshake was served: `devices` entries adopted,
+    /// `MSG_DEVICES_READY` replied, and the registry-driven spawn (v1:
+    /// drv.e1000.0) attempted when the registry called for one.
+    RegistryServed {
+        devices: usize,
+        driver: DriverOutcome,
+    },
     /// A `k_chan_wait` under TIMEOUT_NONE reported the caller could not
     /// park (the real kernel returns CAP_ERR_TIMEOUT when every process is
     /// parked and nothing is runnable to switch to — a boot-time artifact,
@@ -277,7 +305,70 @@ impl<K: Kernel> DmServer<K> {
         }
         self.log_fmt(format_args!("[DM] registry: {} device(s) adopted", reg.len()));
 
-        Ok(DmOutcome::RegistryServed { devices: reg.len() })
+        // ── The registry-driven spawn (v1: drv.e1000.0) ─────────────────
+        // The registry's driver_manifest field tells the DM which driver
+        // owns each device. The kernel marks ONLY handed-off (role-less)
+        // e1000 NICs `drv.e1000.0` — a kernel-owned NIC stays driverless,
+        // so this can never spawn a second driver onto the kernel's own
+        // card. NVMe is class-marked drv.nvme.0 for future spawns and is
+        // deliberately NOT spawned by v1. The driver image grant init
+        // attached to this message is slots[1]; the driver binary lives in
+        // the e1000.image region and its budget in the adjacent e1000.heap
+        // region (both reserved by the boot loader). A spawn failure is
+        // never fatal: log it and keep serving — the driver's absence is
+        // visible in the boot log.
+        let has_driver = reg
+            .iter()
+            .any(|e| e.manifest_name() == Some(crate::drv_manifest::E1000_MANIFEST_NAME));
+        let driver = if !has_driver {
+            DriverOutcome::None
+        } else if n_caps < 2 {
+            self.log("[DM] drv.e1000.0 registered but no driver-image grant on the message");
+            DriverOutcome::NoImageGrant
+        } else {
+            let grant = slots[1];
+            match crate::drv_manifest::e1000_spawn_from_registry(&reg, Some(grant)) {
+                None => {
+                    self.log("[DM] drv.e1000.0 registered but its grant is empty; skipping");
+                    DriverOutcome::None
+                }
+                Some(sp) => {
+                    self.log_fmt(format_args!(
+                        "[DM] spawning {}: image @0x{:x} ({} B) BAR0 0x{:x} budget 0x{:x}",
+                        crate::drv_manifest::E1000_MANIFEST_NAME,
+                        sp.image_kaddr,
+                        sp.image_size,
+                        sp.bar0_phys,
+                        crate::drv_manifest::e1000_budget_base(&sp),
+                    ));
+                    let blob = crate::drv_manifest::build_e1000_manifest(&sp);
+                    match self.k.create_sidecar(&blob) {
+                        Ok((r, w)) => {
+                            self.log_fmt(format_args!(
+                                "[DM] {} spawned (messenger CHAN_R={} CHAN_W={})",
+                                crate::drv_manifest::E1000_MANIFEST_NAME,
+                                r,
+                                w
+                            ));
+                            DriverOutcome::Spawned(r, w)
+                        }
+                        Err(e) => {
+                            self.log_fmt(format_args!(
+                                "[DM] {} spawn failed ({}) — continuing",
+                                crate::drv_manifest::E1000_MANIFEST_NAME,
+                                e
+                            ));
+                            DriverOutcome::SpawnError(e)
+                        }
+                    }
+                }
+            }
+        };
+
+        Ok(DmOutcome::RegistryServed {
+            devices: reg.len(),
+            driver,
+        })
     }
 
     /// Drain the 8-byte close body after a CLOSE event.

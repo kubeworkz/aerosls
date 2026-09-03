@@ -195,6 +195,15 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         .find_cap(CAP_MEM, "dm.image")
         .expect("[INIT] missing 'dm.image' MEM cap (boot image must place the DM binary)");
 
+    // The drv.e1000.0 driver binary region. Init never creates the driver
+    // (the DM does, from the device registry); init holds this cap only to
+    // learn the driver image's address/size so it can GRANT the region to
+    // the DM on the registry message (a derived copy of this object — never
+    // a second mint, which cap_create_mem would refuse as an overlap).
+    let e1000_image_cap = bib
+        .find_cap(CAP_MEM, "e1000.image")
+        .expect("[INIT] missing 'e1000.image' MEM cap (boot image must place the e1000 driver binary)");
+
     // ── 3. Init the heap ──────────────────────────────────────────────────
     unsafe {
         HEAP.init(
@@ -268,6 +277,16 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         rights: 0x01, // R only
         flags: 0x00,  // transient (default)
     };
+    // Second grant: the e1000 driver image (R). The DM does not read it —
+    // it needs the base/size numbers to build drv.e1000.0's manifest
+    // (footer image_kaddr + budget region) when a NIC was handed off.
+    let e1000_send_cap = SendCap {
+        slot: e1000_image_cap.slot,
+        offset: 0,
+        len: e1000_image_cap.len as u32,
+        rights: 0x01, // R only
+        flags: 0x00,  // transient (default)
+    };
 
     // Payload: count of devices (u32 LE).
     let mut payload = [0u8; 4];
@@ -277,8 +296,13 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     // Blocking send (timeout 0): if the DM's queue is full, the kernel
     // parks this sidecar until a slot frees — the registry cannot be
     // dropped (transport spec §3.4).
-    demo::send_registry(&dm_channel, MSG_DEVICE_REGISTRY, &payload, &devreg_send_cap)
-        .unwrap_or_else(|e| panic!("[INIT] failed to send device registry: {e}"));
+    demo::send_registry(
+        &dm_channel,
+        MSG_DEVICE_REGISTRY,
+        &payload,
+        &[devreg_send_cap, e1000_send_cap],
+    )
+    .unwrap_or_else(|e| panic!("[INIT] failed to send device registry: {e}"));
 
     // ── 7. Wait for "devices ready" (finite deadline + bounded retries) ──
     // The reply wait parks WITH an absolute deadline (1 s): if the DM is
@@ -444,7 +468,12 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         // Re-run the registry handshake against the fresh DM: blocking
         // send (timeout 0 — a full queue parks us), then the
         // finite-deadline wait for "devices ready".
-        demo::send_registry(&dm, MSG_DEVICE_REGISTRY, &payload, &devreg_send_cap)?;
+        demo::send_registry(
+            &dm,
+            MSG_DEVICE_REGISTRY,
+            &payload,
+            &[devreg_send_cap, e1000_send_cap],
+        )?;
         let mut rb = [0u8; 256];
         match demo::wait_devices_ready(&dm, &mut rb, DM_READY_DEADLINE_NS) {
             Ok(()) => log(&console, "[INIT] respawned DM signalled ready."),

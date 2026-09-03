@@ -19,7 +19,10 @@
 //! MEM cap (what init's runtime `create_sidecar` call copies) points at the
 //! same physical address the DM manifest's own footer declares.
 
-use crate::layout::{BootImageSpec, BootLayout, DM_MANIFEST_NAME, INIT_MANIFEST_NAME, NET_MANIFEST_NAME, POSIX_MANIFEST_NAME, RAMDISK_MANIFEST_NAME};
+use crate::layout::{
+    BootImageSpec, BootLayout, DM_MANIFEST_NAME, INIT_MANIFEST_NAME,
+    NET_MANIFEST_NAME, POSIX_MANIFEST_NAME, RAMDISK_MANIFEST_NAME,
+};
 use crate::newc;
 use aerosls_proto::manifest::{
     Bootstrap, Budget, CapKind, Cpu, Image, Limits, Manifest, ManifestCap, build_manifest, crc32,
@@ -39,8 +42,11 @@ pub const NET_PEER: &str = "drv.network.0";
 /// The whole archive entry list, in order. The registry region is NOT an
 /// entry: it is implicit memory the loader reserves and zeroes (devreg.rs
 /// format), and the heap regions are implicit too — the archive carries no
-/// 16 MiB of zeros.
-pub const ENTRY_PATHS: [&str; 12] = [
+/// 16 MiB of zeros. The e1000 driver has a binary entry but no manifest
+/// entry: its manifest is built at spawn time by the DM (the handed-off
+/// NIC's BAR0 is only known on the target), so the archive carries just
+/// the bytes.
+pub const ENTRY_PATHS: [&str; 13] = [
     crate::layout::INIT_BIN_PATH,
     crate::layout::INIT_MANIFEST_PATH,
     crate::layout::DM_BIN_PATH,
@@ -51,6 +57,7 @@ pub const ENTRY_PATHS: [&str; 12] = [
     crate::layout::RAMDISK_MANIFEST_PATH,
     crate::layout::NET_BIN_PATH,
     crate::layout::NET_MANIFEST_PATH,
+    crate::layout::E1000_BIN_PATH,
     crate::layout::ROOTFS_BIN_PATH,
     crate::layout::LAYOUT_PATH,
 ];
@@ -71,9 +78,11 @@ fn pack_with_footer(m: &Manifest<'_>, image_kaddr: u64) -> Vec<u8> {
 
 /// Build the init sidecar's packed manifest. Caps, in record order:
 /// `budget` (its bump heap), `console` (kernel service), `device_registry`
-/// (kernel-populated, read-only), `dm.image` (the DM binary's physical
-/// address — what entry.rs hands `create_sidecar`), `posix.image`
-/// (the POSIX sidecar binary), `posix.heap` (POSIX sidecar budget).
+/// (kernel-populated, read-only), `dm.image` (the DM binary — what
+/// entry.rs hands `create_sidecar`), `posix.image`, `ramdisk.image`,
+/// `net.image` (spawned by init at runtime), and `e1000.image` (the
+/// drv.e1000.0 driver binary — init only learns its address to grant it to
+/// the DM; the DM does the spawn).
 fn build_init_manifest(spec: &BootImageSpec, layout: &BootLayout, blob_offset: u32) -> Vec<u8> {
     let caps = [
         Some(ManifestCap {
@@ -132,11 +141,25 @@ fn build_init_manifest(spec: &BootImageSpec, layout: &BootLayout, blob_offset: u
                 size: spec.net_bin.len() as u64,
             },
         }),
+        // e1000.image — the drv.e1000.0 driver binary. Init NEVER creates
+        // the driver (the DM does, from registry data); init holds this cap
+        // only so it can learn the driver image's address and pass it to the
+        // DM as a transient grant on the registry message. It is NOT
+        // re-minted in the DM's manifest (cap_create_mem refuses a second
+        // MEM object over the same region) — the grant is a derived copy of
+        // this object.
+        Some(ManifestCap {
+            name: "e1000.image",
+            rights: 0x1, // R
+            kind: CapKind::Mem {
+                base: layout.e1000_image.phys,
+                size: spec.e1000_bin.len() as u64,
+            },
+        }),
         None, // ramdisk.heap — NOT in init's manifest; the ramdisk driver's own
               // manifest declares its budget at this address (avoids cap_create_mem overlap)
         None, // storage — NOT in init's manifest; the kernel reads the rootfs into
               // the storage region directly via launch_init_sidecar
-        None,
         None,
         None,
         None,
@@ -172,7 +195,7 @@ fn build_init_manifest(spec: &BootImageSpec, layout: &BootLayout, blob_offset: u
             chan_queue_depth: 16,
         }),
         caps,
-        n_caps: 8,
+        n_caps: 9,
         bootstrap: Some(Bootstrap {
             console: Some("console"),
             debug: None,
@@ -622,7 +645,7 @@ pub fn build_boot_image(spec: &BootImageSpec) -> BootImage {
     // Build the rootfs image (aerofs-lite) for the ramdisk storage region.
     let rootfs_img = crate::rootfs::build_rootfs();
 
-    // All ten entries in order; each entry's span is
+    // All entries in order; each entry's span is
     // 110 (header) + padded name + padded data.
     let mut off = 0usize;
     let mut entry_offsets: Vec<(String, usize, usize)> = Vec::new();
@@ -642,6 +665,7 @@ pub fn build_boot_image(spec: &BootImageSpec) -> BootImage {
         place(crate::layout::RAMDISK_MANIFEST_PATH, ramdisk_manifest_ph.len(), &mut off);
         place(crate::layout::NET_BIN_PATH, spec.net_bin.len(), &mut off);
         place(crate::layout::NET_MANIFEST_PATH, net_manifest_ph.len(), &mut off);
+        place(crate::layout::E1000_BIN_PATH, spec.e1000_bin.len(), &mut off);
         place(crate::layout::ROOTFS_BIN_PATH, rootfs_img.len(), &mut off);
         let layout_size = layout_file_size();
         place(crate::layout::LAYOUT_PATH, layout_size, &mut off);
@@ -666,7 +690,7 @@ pub fn build_boot_image(spec: &BootImageSpec) -> BootImage {
     debug_assert_eq!(net_manifest.len(), net_manifest_ph.len());
 
     let layout_size = layout_file_size();
-    // All eleven entries, the layout file LAST.
+    // All thirteen entries, the layout file LAST.
     let layout_text = build_layout_file(&layout, &entry_offsets, layout_size);
     debug_assert_eq!(layout_text.len(), layout_size);
 
@@ -682,6 +706,7 @@ pub fn build_boot_image(spec: &BootImageSpec) -> BootImage {
     newc::write_entry(&mut archive, crate::layout::RAMDISK_MANIFEST_PATH, &ramdisk_manifest);
     newc::write_entry(&mut archive, crate::layout::NET_BIN_PATH, &spec.net_bin);
     newc::write_entry(&mut archive, crate::layout::NET_MANIFEST_PATH, &net_manifest);
+    newc::write_entry(&mut archive, crate::layout::E1000_BIN_PATH, &spec.e1000_bin);
     newc::write_entry(&mut archive, crate::layout::ROOTFS_BIN_PATH, &rootfs_img);
     newc::write_entry(&mut archive, crate::layout::LAYOUT_PATH, layout_text.as_bytes());
     newc::finish(&mut archive);
@@ -693,14 +718,18 @@ pub fn build_boot_image(spec: &BootImageSpec) -> BootImage {
     }
 }
 
-/// The layout entry's total size: the header, base, 5 region lines and 5
+/// The layout entry's total size: the header, base, 14 region lines and 13
 /// file lines — every numeric field is 16 hex chars and every name/path is
 /// a constant, so the size is a constant regardless of the values. Computed
 /// once here and mirrored in `build_layout_file`'s last line.
 fn layout_file_size() -> usize {
     let mut n = "AEROSLS-BOOT-LAYOUT 1\n".len();
     n += "base ".len() + 16 + 1;
-    for name in ["init.image", "init.heap", "dm.image", "dm.heap", "posix.image", "posix.heap", "ramdisk.image", "ramdisk.heap", "storage", "net.image", "net.heap", "registry"] {
+    for name in [
+        "init.image", "init.heap", "dm.image", "dm.heap", "posix.image",
+        "posix.heap", "ramdisk.image", "ramdisk.heap", "storage",
+        "net.image", "net.heap", "e1000.image", "e1000.heap", "registry",
+    ] {
         n += "region ".len() + name.len() + 1 + 16 + 1 + 16 + 1;
     }
     for p in ENTRY_PATHS {
@@ -729,7 +758,7 @@ mod tests {
     }
 
     fn spec() -> BootImageSpec {
-        BootImageSpec::new(vec![0xAA; 0x2000], vec![0xBB; 0x4000], vec![0xCC; 0x8000], vec![0xDD; 0x1000], vec![0xEE; 0x1000])
+        BootImageSpec::new(vec![0xAA; 0x2000], vec![0xBB; 0x4000], vec![0xCC; 0x8000], vec![0xDD; 0x1000], vec![0xEE; 0x1000], vec![0xEF; 0x2000])
     }
 
     fn built() -> BootImage {
@@ -789,14 +818,15 @@ mod tests {
         assert_eq!(es[0].data, spec().init_bin);
         assert_eq!(es[2].data, spec().dm_bin);
         assert_eq!(es[6].data, spec().ramdisk_bin);
+        assert_eq!(es[8].data, spec().net_bin);
+        assert_eq!(es[10].data, spec().e1000_bin);
         // Manifest + layout entries parse as non-empty text/blobs.
         assert!(es[1].data.len() > 24);
         assert!(es[3].data.len() > 24);
         assert!(es[5].data.len() > 24);
         assert!(es[7].data.len() > 24);
-        assert!(es[8].data.len() > 0);  // net.bin
         assert!(es[9].data.len() > 24); // net.manifest
-        assert!(es[11].data.starts_with(b"AEROSLS-BOOT-LAYOUT 1\n"));
+        assert!(es[12].data.starts_with(b"AEROSLS-BOOT-LAYOUT 1\n"));
         // The archive offsets recorded in entry_offsets match the parser's.
         let mut off = 0usize;
         for (i, e) in es.iter().enumerate() {
@@ -852,6 +882,25 @@ mod tests {
         let blob = b.archive_entry(ENTRY_PATHS[3]);
         let m = parse_manifest(&blob).unwrap();
         assert_eq!(m.name.unwrap(), DM_MANIFEST_NAME);
+    }
+
+    #[test]
+    fn e1000_image_cap_points_at_the_driver_region() {
+        // init's e1000.image MEM cap (what it grants the DM so the DM can
+        // spawn the driver) must point at the layout's e1000.image region
+        // with exactly the driver binary's size.
+        let b = built();
+        let blob = b.archive_entry(ENTRY_PATHS[1]);
+        let m = parse_manifest(&blob).unwrap();
+        let cap = m.find_cap("e1000.image").expect("e1000.image cap");
+        let (base, size) = match cap.kind {
+            CapKind::Mem { base, size } => (base, size),
+            _ => panic!("e1000.image must be a MEM cap"),
+        };
+        assert_eq!(base, b.layout.e1000_image.phys);
+        assert_eq!(size, spec().e1000_bin.len() as u64);
+        // And the e1000.bin archive entry holds the driver bytes.
+        assert_eq!(b.archive_entry(ENTRY_PATHS[10]), spec().e1000_bin);
     }
 
     #[test]
@@ -925,7 +974,7 @@ mod tests {
     #[test]
     fn layout_file_records_regions_and_files() {
         let b = built();
-        let text = String::from_utf8(b.archive_entry(ENTRY_PATHS[11])).unwrap();
+        let text = String::from_utf8(b.archive_entry(ENTRY_PATHS[12])).unwrap();
         let mut lines = text.lines();
         assert_eq!(lines.next(), Some("AEROSLS-BOOT-LAYOUT 1"));
         assert_eq!(lines.next().unwrap(), format!("base {:016x}", b.layout.base_phys));

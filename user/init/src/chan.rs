@@ -101,17 +101,29 @@ impl<K: Kernel> InitChannel<K> {
             .map_err(ChannelError::Kernel)
     }
 
-    /// Send a message carrying a MEM cap (e.g. device registry snapshot).
-    /// Blocking send, same semantics as `request`.
+    /// Send a message carrying MEM caps (e.g. the device registry snapshot
+    /// plus the e1000 driver image grant). Blocking send, same semantics as
+    /// `request`.
+    pub fn send_with_caps(
+        &self,
+        tag: u32,
+        payload: &[u8],
+        caps: &[SendCap],
+    ) -> Result<(), ChannelError> {
+        self.k
+            .send(self.w, tag, 0, payload, caps, 0)
+            .map_err(ChannelError::Kernel)
+    }
+
+    /// Send a message carrying one MEM cap. Blocking send, same semantics
+    /// as `request`.
     pub fn send_with_cap(
         &self,
         tag: u32,
         payload: &[u8],
         cap: &SendCap,
     ) -> Result<(), ChannelError> {
-        self.k
-            .send(self.w, tag, 0, payload, core::slice::from_ref(cap), 0)
-            .map_err(ChannelError::Kernel)
+        self.send_with_caps(tag, payload, core::slice::from_ref(cap))
     }
 
     /// Wait for a message (blocking): the inner `k_chan_wait` with

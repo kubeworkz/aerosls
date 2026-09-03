@@ -1,11 +1,13 @@
 //! CLI for the Phase 5 boot-image builder.
 //!
 //! ```text
-//! aerosls-bootimage --init <init.bin> --dm <dm.bin> --posix <posix.bin> -o sidecars.cpio
+//! aerosls-bootimage --init <init.bin> --dm <dm.bin> --posix <posix.bin>
+//!                  --ramdisk <ramdisk.bin> --net <net.bin> --e1000 <e1000.bin>
+//!                  -o sidecars.cpio
 //! aerosls-bootimage flatten --input <init.elf> --output <init.bin>
 //! ```
 //!
-//! The first form reads the three flat sidecar binaries, computes the
+//! The first form reads the flat sidecar binaries, computes the
 //! physical layout, packs all manifests, and writes the `newc` initrd
 //! archive. The layout (every image's declared physical address) is
 //! printed to stderr and embedded in the archive as `boot/layout`.
@@ -21,7 +23,7 @@ use std::path::PathBuf;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: aerosls-bootimage --init <init.bin> --dm <dm.bin> --posix <posix.bin> -o sidecars.cpio \\\n         [--init-entry <off>] [--dm-entry <off>] [--posix-entry <off>] [--base-phys <addr>]\n\n\
+        "usage: aerosls-bootimage --init <init.bin> --dm <dm.bin> --posix <posix.bin> \\\n         --ramdisk <ramdisk.bin> --net <net.bin> --e1000 <e1000.bin> \\\n         -o sidecars.cpio \\\n         [--init-entry <off>] [--dm-entry <off>] [--posix-entry <off>] [--net-entry <off>] \\\n         [--base-phys <addr>]\n\n\
          aerosls-bootimage flatten --input <init.elf> --output <init.bin> \n         [--load-vaddr <hex>]  (default 0x400000000000 = USER_PROC_CODE_BASE)"
     );
     std::process::exit(2);
@@ -97,12 +99,14 @@ fn cmd_build(mut args: impl Iterator<Item = String>) {
     let mut posix = None;
     let mut ramdisk = None;
     let mut net = None;
+    let mut e1000 = None;
     let mut out = None;
     let mut init_entry = 0u64;
     let mut dm_entry = 0u64;
     let mut posix_entry = 0u64;
     let mut ramdisk_entry = 0u64;
     let mut net_entry = 0u64;
+    let mut e1000_entry = 0u64;
     let mut base_phys = None;
 
     while let Some(a) = args.next() {
@@ -116,12 +120,14 @@ fn cmd_build(mut args: impl Iterator<Item = String>) {
             "--posix" => posix = Some(PathBuf::from(next())),
             "--ramdisk" => ramdisk = Some(PathBuf::from(next())),
             "--net" => net = Some(PathBuf::from(next())),
+            "--e1000" => e1000 = Some(PathBuf::from(next())),
             "-o" | "--output" => out = Some(PathBuf::from(next())),
             "--init-entry" => init_entry = parse_hex(&next(), &a),
             "--dm-entry" => dm_entry = parse_hex(&next(), &a),
             "--posix-entry" => posix_entry = parse_hex(&next(), &a),
             "--ramdisk-entry" => ramdisk_entry = parse_hex(&next(), &a),
             "--net-entry" => net_entry = parse_hex(&next(), &a),
+            "--e1000-entry" => e1000_entry = parse_hex(&next(), &a),
             "--base-phys" => base_phys = Some(parse_hex(&next(), &a)),
             "-h" | "--help" => usage(),
             other => {
@@ -131,10 +137,11 @@ fn cmd_build(mut args: impl Iterator<Item = String>) {
         }
     }
 
-    let (init_path, dm_path, posix_path, ramdisk_path, net_path, out_path) = match (init, dm, posix, ramdisk, net, out) {
-        (Some(i), Some(d), Some(p), Some(r), Some(n), Some(o)) => (i, d, p, r, n, o),
-        _ => usage(),
-    };
+    let (init_path, dm_path, posix_path, ramdisk_path, net_path, e1000_path, out_path) =
+        match (init, dm, posix, ramdisk, net, e1000, out) {
+            (Some(i), Some(d), Some(p), Some(r), Some(n), Some(e), Some(o)) => (i, d, p, r, n, e, o),
+            _ => usage(),
+        };
 
     let init_bin = std::fs::read(&init_path)
         .unwrap_or_else(|e| panic!("read {}: {e}", init_path.display()));
@@ -146,13 +153,16 @@ fn cmd_build(mut args: impl Iterator<Item = String>) {
         .unwrap_or_else(|e| panic!("read {}: {e}", ramdisk_path.display()));
     let net_bin = std::fs::read(&net_path)
         .unwrap_or_else(|e| panic!("read {}: {e}", net_path.display()));
+    let e1000_bin = std::fs::read(&e1000_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", e1000_path.display()));
 
-    let mut spec = BootImageSpec::new(init_bin, dm_bin, posix_bin, ramdisk_bin, net_bin);
+    let mut spec = BootImageSpec::new(init_bin, dm_bin, posix_bin, ramdisk_bin, net_bin, e1000_bin);
     spec.init_entry = init_entry;
     spec.dm_entry = dm_entry;
     spec.posix_entry = posix_entry;
     spec.ramdisk_entry = ramdisk_entry;
     spec.net_entry = net_entry;
+    spec.e1000_entry = e1000_entry;
     if let Some(b) = base_phys {
         spec.base_phys = b;
     }
