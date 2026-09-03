@@ -383,11 +383,28 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     // The ramdisk CHAN cap is wired to drv.ramdisk.0. We KEEP the
     // messenger channel: its CLOSE event (on process death) is what the
     // watchdog below parks on to respawn a crashed POSIX sidecar.
+    //
+    // Driver SDK v0.1 s4.1 — mint a CAP_TYPE_DEV cap for the e1000's MMIO
+    // BAR0 from the device registry (the kernel's PCI scan recorded
+    // bar0_phys; no hardcoded address). devtest in the POSIX sidecar
+    // maps it via SYS_DEV_MMAP and reads the device registers — the
+    // on-target proof that CAP_TYPE_DEV works. Boots without an e1000
+    // (no `-device e1000`) simply omit the cap and devtest skips.
+    let e1000_bar0 = devreg.find(0x02, 0x00).map(|e| e.bar0_phys);
+    match e1000_bar0 {
+        Some(base) => log_fmt!(
+            &console,
+            "[INIT] e1000 BAR0 @ 0x{:x} → POSIX manifest DEV cap 'nic0.bar0'",
+            base
+        ),
+        None => log(&console, "[INIT] no e1000 in registry — POSIX manifest omits the DEV cap"),
+    }
     let posix_channel = spawn_posix_sidecar(
         &console,
         posix_image_cap.base,
         posix_image_cap.len as u32,
         posix_heap_base,
+        e1000_bar0,
     );
     // Yield multiple times to give the ramdisk sidecar time to
     // re-scan its cap table, discover the POSIX ramdisk channel,
@@ -460,7 +477,7 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
             attempt,
             posix_policy.backoff_for(attempt),
         );
-        let p = spawn_posix_sidecar(&console, posix_kaddr, posix_size, posix_heap);
+        let p = spawn_posix_sidecar(&console, posix_kaddr, posix_size, posix_heap, e1000_bar0);
         log_fmt!(
             &console,
             "[INIT] respawned POSIX messenger: CHAN_R={} CHAN_W={}",
@@ -554,6 +571,7 @@ fn spawn_posix_sidecar(
     image_kaddr: u64,
     image_size: u32,
     heap_base: u64,
+    e1000_bar0: Option<u64>,
 ) -> InitChannel<RealKernel> {
     log_fmt!(
         console,
@@ -562,7 +580,7 @@ fn spawn_posix_sidecar(
         image_kaddr,
         image_size,
     );
-    let manifest = posix_manifest::build_posix_manifest(image_kaddr, image_size, heap_base);
+    let manifest = posix_manifest::build_posix_manifest(image_kaddr, image_size, heap_base, e1000_bar0);
     let (r, w) = RealKernel
         .create_sidecar(&manifest)
         .unwrap_or_else(|e| panic!("[INIT] POSIX create_sidecar failed: {e}"));

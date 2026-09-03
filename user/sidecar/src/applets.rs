@@ -5623,6 +5623,127 @@ pub fn irqtest<K: Kernel, A: BufferAlloc>(_ctx: &mut Ctx<'_, K, A>) -> Step {
     }
 }
 
+/// `devtest`: Driver SDK ABI v0.1 s4.1 acceptance demo — the on-target
+/// proof that CAP_TYPE_DEV + SYS_DEV_MMAP map real device MMIO. irqtest
+/// proved the IO and IRQ caps on the target; DEV was host-tested only
+/// (tests/dev_mmap_host_test.c). The POSIX manifest declares a
+/// CAP_TYPE_DEV cap ("nic0.bar0") for the e1000's MMIO BAR0, minted by
+/// cap_create_sidecar from the device registry — init reads bar0_phys
+/// from the kernel's PCI scan, so the address is never hardcoded (the
+/// SDK doc §5 "DM generates the manifest" direction, in miniature).
+///
+/// devtest finds the slot by trial-mmap (k_dev_mmap returns the type
+/// error for every non-DEV slot and success on the DEV cap), verifies
+/// the window lands in the user half and that a second call returns the
+/// same address (ABI doc §4.1: "a second call returns the same vaddr"),
+/// then reads the e1000's receive-address registers RAL0/RAH0
+/// (0x5400/0x5404) — the MAC the device loads from its EEPROM at reset
+/// — through the mapping. Reading live device registers is the
+/// acceptance criterion: a broken PTE, wrong phys base, or skipped map
+/// faults or reads ~0 instead of a real MAC. The MAC must be unicast,
+/// nonzero, not broadcast, and carry QEMU's OUI 52:54:00 (every repo
+/// boot config — Makefile x86-run, ci.yml, the boot checks — uses a
+/// 52:54:00 MAC, so the OUI pin is a genuine "the right device
+/// responded" check, not a config guess).
+///
+/// Bounded: no waits, a handful of MMIO reads, exit 0/1. A boot without
+/// `-device e1000` has no DEV cap and SKIPs cleanly (mirrors irqtest's
+/// no-serial-cap path) so the boot script still reaches the shell.
+pub fn devtest<K: Kernel, A: BufferAlloc>(_ctx: &mut Ctx<'_, K, A>) -> Step {
+    extern "C" {
+        fn posix_serial_print(data: *const u8, len: u32);
+    }
+    // Direct 165 path, like nettest: devtest triggers no IRQ storms (it
+    // binds nothing), so task-context serial calls survive.
+    fn p(s: &[u8]) {
+        unsafe { posix_serial_print(s.as_ptr(), s.len() as u32); }
+        unsafe { k_yield(); }
+    }
+
+    // ── Phase 0: find the DEV cap by trial-mmap ─────────────────────────
+    p(b"[devtest] scanning cap table for a DEV cap...\n");
+    let mut dev_slot: Option<u32> = None;
+    let mut vaddr: u64 = 0;
+    for s in 0u32..64u32 {
+        let mut v: u64 = 0;
+        if unsafe { k_dev_mmap(s, 0, 0, &mut v) } == 0 {
+            dev_slot = Some(s);
+            vaddr = v;
+            break;
+        }
+    }
+    let Some(slot) = dev_slot else {
+        p(b"[devtest] no DEV cap in table (no -device e1000 in this config) -- SKIP\n");
+        p(b"[devtest] SKIP: CAP_TYPE_DEV not exercised on this target\n");
+        return Step::Exit(0);
+    };
+
+    // ── Phase 1: the mapping is live and lands in the user half ────────
+    p(b"[devtest] PASS: SYS_DEV_MMAP succeeded\n");
+    if vaddr == 0 || (vaddr & 0xFFF) != 0 || vaddr >= 0x8000_0000_0000 {
+        p(b"[devtest] FAIL: mapped window is not in the user half\n");
+        return Step::Exit(1);
+    }
+
+    // ── Phase 2: idempotent re-map (ABI doc §4.1) ───────────────────────
+    let mut vaddr2: u64 = 0;
+    if unsafe { k_dev_mmap(slot, 0, 0, &mut vaddr2) } != 0 || vaddr2 != vaddr {
+        p(b"[devtest] FAIL: re-map did not return the same window\n");
+        return Step::Exit(1);
+    }
+    p(b"[devtest] PASS: re-map idempotent (same window)\n");
+
+    // ── Phase 3: read the device through the mapping ────────────────────
+    // RAL0/RAH0 (0x5400/0x5404): the e1000 loads its MAC into the
+    // receive-address registers at reset. RAL0 = MAC[3:0] little-endian,
+    // RAH0 = MAC[5:4] in the low 16 bits.
+    let ral = unsafe { core::ptr::read_volatile((vaddr + 0x5400) as *const u32) };
+    let rah = unsafe { core::ptr::read_volatile((vaddr + 0x5404) as *const u32) };
+    let mac = [
+        (ral & 0xff) as u8,
+        ((ral >> 8) & 0xff) as u8,
+        ((ral >> 16) & 0xff) as u8,
+        ((ral >> 24) & 0xff) as u8,
+        (rah & 0xff) as u8,
+        ((rah >> 8) & 0xff) as u8,
+    ];
+
+    let all_zero = mac.iter().all(|&b| b == 0);
+    let all_ff = mac.iter().all(|&b| b == 0xff);
+    let unicast = mac[0] & 0x01 == 0;
+    let qemu_oui = mac[0] == 0x52 && mac[1] == 0x54 && mac[2] == 0x00;
+    if all_zero || all_ff || !unicast {
+        p(b"[devtest] FAIL: RAL0/RAH0 did not yield a valid MAC\n");
+        return Step::Exit(1);
+    }
+    if !qemu_oui {
+        p(b"[devtest] FAIL: MAC OUI is not 52:54:00 (QEMU's OUI)\n");
+        return Step::Exit(1);
+    }
+
+    // Print the MAC in canonical colon-hex form.
+    let hex = b"0123456789abcdef";
+    let mut buf = [0u8; 32];
+    let mut i = 0;
+    for (j, &b) in mac.iter().enumerate() {
+        if j > 0 {
+            buf[i] = b':';
+            i += 1;
+        }
+        buf[i] = hex[(b >> 4) as usize];
+        i += 1;
+        buf[i] = hex[(b & 0xf) as usize];
+        i += 1;
+    }
+    buf[i] = b'\n';
+    i += 1;
+    p(b"[devtest] e1000 MAC: ");
+    unsafe { posix_serial_print(buf.as_ptr(), i as u32); }
+    unsafe { k_yield(); }
+    p(b"[devtest] PASS: CAP_TYPE_DEV + SYS_DEV_MMAP verified on target\n");
+    Step::Exit(0)
+}
+
 /// Wire layouts for the raw transport shims (aerosls_proto ABI module:
 /// k_chan_wait / k_chan_recv).
 #[repr(C)]
@@ -5669,6 +5790,7 @@ extern "C" {
     ) -> i32;
     fn k_io_out(handle: u32, index: u16, size: u8, val: u32) -> i32;
     fn k_io_in(handle: u32, index: u16, size: u8, out: *mut u32) -> i32;
+    fn k_dev_mmap(handle: u32, vaddr_hint: u64, flags: u32, out_vaddr: *mut u64) -> i32;
     fn k_boot_gen() -> u64;
     fn k_cap_list();
     fn k_yield();
@@ -5705,6 +5827,11 @@ pub unsafe extern "C" fn k_chan_recv(
 
 #[cfg(not(feature = "target"))]
 #[no_mangle]
+pub unsafe extern "C" fn k_irq_unbind(_c: u16) -> i32 {
+    -1
+}
+#[cfg(not(feature = "target"))]
+#[no_mangle]
 pub unsafe extern "C" fn k_irq_mask(_c: u16, _m: u8) -> i32 {
     -1
 }
@@ -5719,6 +5846,11 @@ pub unsafe extern "C" fn k_io_out(_h: u32, _i: u16, _s: u8, _v: u32) -> i32 {
 #[cfg(not(feature = "target"))]
 #[no_mangle]
 pub unsafe extern "C" fn k_io_in(_h: u32, _i: u16, _s: u8, _o: *mut u32) -> i32 {
+    -1
+}
+#[cfg(not(feature = "target"))]
+#[no_mangle]
+pub unsafe extern "C" fn k_dev_mmap(_h: u32, _vh: u64, _f: u32, _o: *mut u64) -> i32 {
     -1
 }
 #[cfg(not(feature = "target"))]
@@ -5761,6 +5893,7 @@ pub fn register_default_applets<K: Kernel, A: BufferAlloc>(pm: &mut ProcManager<
     pm.register_applet("unix_echo", unix_echo);
     pm.register_applet("nettest", nettest);
     pm.register_applet("irqtest", irqtest);
+    pm.register_applet("devtest", devtest);
     pm.register_applet("netcheck", netcheck);
     pm.register_applet("ls", ls);
     pm.register_applet("mkdir", mkdir_applet);

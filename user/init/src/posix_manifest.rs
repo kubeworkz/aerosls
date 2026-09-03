@@ -14,13 +14,35 @@ use alloc::vec::Vec;
 /// The POSIX sidecar's identity — registered in the kernel's sidecar registry.
 pub const POSIX_MANIFEST_NAME: &str = "aerosls.posix.0";
 
+/// The e1000 MMIO BAR0 window the devtest applet maps (Driver SDK ABI
+/// v0.1 s4.1 acceptance demo). QEMU's e1000 model registers BAR0 as
+/// 128 KiB (0x20000); every register the applet reads (CTRL at 0x00,
+/// STATUS at 0x08, RAL0/RAH0 at 0x5400) sits well inside it. The BAR0
+/// *address* comes from the kernel's PCI scan via the device registry —
+/// never hardcoded — but the registry carries only the base, so the
+/// size is the device model's known constant (the same way the budget
+/// heap sizes are layout constants).
+pub const E1000_BAR0_BYTES: u64 = 0x20000;
+
 /// Build the packed POSIX manifest blob (header + records + image_kaddr
 /// footer + patched total_len/CRC), ready for `Kernel::create_sidecar`.
 ///
 /// `image_kaddr` is the physical address of the POSIX binary (from the
 /// `posix.image` MEM cap), and `heap_base` is the physical address of
 /// the POSIX budget heap (from the `posix.heap` MEM cap).
-pub fn build_posix_manifest(image_kaddr: u64, image_size: u32, heap_base: u64) -> Vec<u8> {
+///
+/// `e1000_bar0_phys` is the MMIO BAR0 base of the first e1000 NIC from
+/// the device registry (init reads it from the kernel's PCI scan); when
+/// the boot config has no e1000 (e.g. the smoke/guard QEMU invocations
+/// without `-device e1000`), pass `None` and the manifest simply omits
+/// the DEV cap — the devtest applet then skips cleanly instead of
+/// failing the boot script.
+pub fn build_posix_manifest(
+    image_kaddr: u64,
+    image_size: u32,
+    heap_base: u64,
+    e1000_bar0_phys: Option<u64>,
+) -> Vec<u8> {
     let heap_size = 4 * 1024 * 1024; // 4 MiB — must match POSIX_HEAP_BYTES in layout.rs
     let caps = [
         Some(ManifestCap {
@@ -89,7 +111,21 @@ pub fn build_posix_manifest(image_kaddr: u64, image_size: u32, heap_base: u64) -
                 perms: 0x3,
             },
         }),
-        None,
+        // Driver SDK ABI v0.1 s4.1 — the e1000's MMIO BAR0, mapped by the
+        // devtest applet via SYS_DEV_MMAP to read the device registers
+        // (the acceptance proof that CAP_TYPE_DEV works on the real
+        // target). The base comes from the kernel's PCI scan (device
+        // registry), NOT hardcoded — this is the DM-generates-manifest
+        // direction in miniature (SDK doc §5). The DEV cap is
+        // object-backed: k_dev_mmap maps it on demand.
+        e1000_bar0_phys.map(|base| ManifestCap {
+            name: "nic0.bar0",
+            rights: 0x3, // R | W
+            kind: CapKind::Dev {
+                base,
+                size: E1000_BAR0_BYTES,
+            },
+        }),
         None,
         None,
         None,
@@ -127,7 +163,7 @@ pub fn build_posix_manifest(image_kaddr: u64, image_size: u32, heap_base: u64) -
             chan_queue_depth: 16,
         }),
         caps,
-        n_caps: 7,
+        n_caps: if e1000_bar0_phys.is_some() { 8 } else { 7 },
         bootstrap: Some(Bootstrap {
             console: Some("console"),
             debug: None,
@@ -145,4 +181,42 @@ pub fn build_posix_manifest(image_kaddr: u64, image_size: u32, heap_base: u64) -
     let crc = crc32(&blob[HEADER_LEN..]);
     blob[20..24].copy_from_slice(&crc.to_le_bytes());
     blob
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aerosls_proto::manifest::{parse_manifest, CapKind};
+
+    fn build(e1000: Option<u64>) -> Vec<u8> {
+        build_posix_manifest(0x3000_0000, 0x40000, 0x3040_0000, e1000)
+    }
+
+    #[test]
+    fn no_e1000_omits_the_dev_cap() {
+        let blob = build(None);
+        let m = parse_manifest(&blob).unwrap();
+        assert_eq!(m.n_caps, 7);
+        assert!(m.find_cap("nic0.bar0").is_none());
+    }
+
+    #[test]
+    fn e1000_bar0_becomes_a_dev_cap_from_the_registry_base() {
+        // The registry base (e.g. QEMU's assignment for the standard
+        // -device e1000 slot) becomes the DEV cap's physical base — never
+        // a hardcoded address, and the cap round-trips the packed blob.
+        let base = 0xFEBE_0000u64;
+        let blob = build(Some(base));
+        let m = parse_manifest(&blob).unwrap();
+        assert_eq!(m.n_caps, 8);
+        let dev = m.find_cap("nic0.bar0").unwrap();
+        assert_eq!(dev.rights, 0x3); // R | W
+        assert_eq!(
+            dev.kind,
+            CapKind::Dev {
+                base,
+                size: E1000_BAR0_BYTES,
+            }
+        );
+    }
 }

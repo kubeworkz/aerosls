@@ -126,6 +126,26 @@ Flags: bit0 `DEV_MMAP_WC` (write-combining, for framebuffers), bit1 `DEV_MMAP_UN
 > Kernel side: kernel/cap.h + kernel/chan.c + kernel/syscall_dispatch.c;
 > shims in kabi.rs `k_dev_mmap`; host test `tests/dev_mmap_host_test.c`.
 
+> **Manifest minting + on-target verification (2026-09-03):** DEV caps are
+> now minted by `cap_create_sidecar` from a `TAG_CAP_DEV` (0x000D) manifest
+> record — the same wire shape as `CAP_MEM` (`name, phys_base u64, size
+> u64 bytes, rights u8`) — into an object-backed `CAP_OBJ_KIND_DEV` region
+> with a holder inserted under the object lock (so `cap_table_teardown`
+> resolves and frees it exactly like a MEM cap). The init sidecar mints the
+> POSIX manifest's `nic0.bar0` DEV cap from the **device registry's PCI
+> scan** (init reads the e1000's `bar0_phys` — no hardcoded address; the
+> §5 "DM generates the manifest" direction, in miniature) and the devtest
+> applet (user/sidecar/src/applets.rs, run by init.rc) proves the path on
+> target: trial-mmap finds the cap, the window lands in the user half, a
+> re-map returns the same address (§4.1 idempotency), and the e1000's MAC
+> reads back from RAL0/RAH0 (0x5400/0x5404) through the mapping — unicast,
+> nonzero, not broadcast, OUI 52:54:00 (the MAC every repo QEMU config
+> uses). A boot without `-device e1000` has no DEV cap and devtest prints
+> SKIP so the boot script still reaches the shell; `tests/phase5_boot_smoke.sh`
+> boots WITH the e1000 and gates CI on `devtest] PASS` alongside irqtest.
+> Golden wire test: `manifest.rs cap_dev_wire_bytes_golden`; host test for
+> the mint path rides `tests/cap_create_sidecar_host_test.c`.
+
 ### 4.2 `SYS_IO_IN = 307` / `SYS_IO_OUT = 308` — port I/O
 
 ```

@@ -13,14 +13,20 @@
 # (phase5_boot_smoke.sh) can pass 6 times in a row while the flake still
 # ships. This guard boots repeatedly so a one-in-six regression fails CI.
 #
+# The boot carries the same e1000 the Makefile x86-run uses (-netdev user
+# + -device e1000, mac 52:54:00:12:34:01), so the device registry holds an
+# e1000 and the devtest applet's CAP_TYPE_DEV path (SYS_DEV_MMAP of the
+# MMIO BAR0 + MAC read) is exercised on every boot alongside irqtest.
+#
 # Both markers are required, deliberately:
 #   * 'ALL PHASES PASS'  — the full irqtest sequence ran: bind, timer edges
 #     (vector 32), serial IRQ4 loopback (vector 36), stuck-driver window,
 #     watchdog respawn + clean re-bind, and the vector unbind before exit.
 #   * the shell prompt    — init.rc ran to completion (nettest, irqtest,
-#     caps, System ready) and the interactive sh is up. A phase-3 FAIL or a
-#     NETBOOT FAILED aborts init.rc at the netcheck gate, so the prompt is
-#     the end-to-end "the boot script finished" marker.
+#     devtest, caps, System ready) and the interactive sh is up. A phase-3
+#     FAIL, a devtest FAIL, or a NETBOOT FAILED aborts init.rc at its
+#     gate, so the prompt is the end-to-end "the boot script finished"
+#     marker.
 #
 # The prompt check looks for '$ ' PRECEDED BY A NEWLINE (or at log start),
 # not any bare '$ ' substring, so mid-line '$ ' inside applet output cannot
@@ -72,6 +78,8 @@ for b in $(seq 1 "$BOOTS"); do
     start=$(date +%s)
     qemu-system-x86_64 -cdrom "$ISO" -display none -m 4G -smp 4 \
         -accel tcg,thread=multi -boot d -no-reboot \
+        -netdev user,id=net0 \
+        -device e1000,netdev=net0,mac=52:54:00:12:34:01 \
         -serial file:"$LOG" 2>/dev/null &
     QPID=$!
 

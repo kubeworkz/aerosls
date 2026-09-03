@@ -3203,6 +3203,28 @@ int cap_create_sidecar(uint32_t parent_pid,
             m.n_caps++;
             break;
         }
+        case SIDECAR_TAG_CAP_DEV: {
+            /* Record layout (matches manifest.rs): name_len u16,
+             * name[nlen], phys_base u64 (LE), size u64 (LE, bytes),
+             * rights u8 = nlen + 19 bytes — the same shape as CAP_MEM,
+             * so DEV caps and MEM caps are interchangeable in the
+             * manifest wire format (only the type differs). */
+            if (rlen < 2) return CAP_EINVAL;
+            uint16_t nlen = *(const uint16_t*)(rp + 0);
+            if ((int)rlen < (int)nlen + 19) return CAP_EINVAL;
+            if (m.n_caps >= SIDECAR_MANIFEST_MAX_CAPS) return CAP_ERANGE;
+            struct SidecarCap* sc = &m.caps[m.n_caps];
+            sc->kind = SIDECAR_TAG_CAP_DEV;
+            sc->name_len = nlen;
+            for (uint16_t j = 0; j < nlen && j < SIDECAR_MANIFEST_MAX_NAME - 1; j++)
+                sc->name[j] = (char)rp[2 + j];
+            sc->name[nlen < SIDECAR_MANIFEST_MAX_NAME ? nlen : SIDECAR_MANIFEST_MAX_NAME - 1] = '\0';
+            sc->phys_base  = *(const uint64_t*)(rp + 2 + nlen);
+            sc->size_bytes = *(const uint64_t*)(rp + 2 + nlen + 8);
+            sc->rights     = rp[2 + nlen + 16];
+            m.n_caps++;
+            break;
+        }
         case SIDECAR_TAG_BOOTSTRAP:
         case SIDECAR_TAG_FLAGS:
             break;  /* informational */
@@ -3544,6 +3566,57 @@ int cap_create_sidecar(uint32_t parent_pid,
             (unsigned long long)sc->size_bytes, (unsigned)io_idx);
     }
 
+    /* Mint CAP_DEV records: an object-backed device-MMIO region (Driver
+     * SDK ABI v0.1 s4.1). The record's phys_base + size (bytes) become a
+     * fresh CAP_OBJ_KIND_DEV object; the cap word names it (OFF 0, LEN =
+     * pages — the k_dev_mmap window). Unlike MEM caps there is NO
+     * identity map here: device memory is reachable only through
+     * SYS_DEV_MMAP's mediated mapping, which is the point. Mirrors
+     * cap_create_mem's holder discipline (holder inserted under the
+     * object lock before the word is published) so cap_table_teardown's
+     * slot drop resolves and frees the object exactly like a MEM cap. */
+    for (uint8_t ci = 0; ci < m.n_caps; ci++) {
+        struct SidecarCap* sc = &m.caps[ci];
+        if (sc->kind != SIDECAR_TAG_CAP_DEV) continue;
+        if (sc->phys_base == 0 || sc->size_bytes == 0) continue;
+        if ((sc->phys_base & 0xFFFULL) != 0) continue;
+        uint32_t npages = (uint32_t)((sc->size_bytes + 4095u) / 4096u);
+        if (npages == 0 || npages > CAP_LEN_MASK) continue;
+        int dti = cap_table_index(pd->pid);
+        if (dti < 0) continue;
+        uint32_t obj_id;
+        if (cap_object_alloc(CAP_OBJ_KIND_DEV, &obj_id)) continue;
+        struct CapObject* o = &cap_objects[obj_id];
+        o->max_perms = sc->rights;
+        o->phys_base = sc->phys_base;
+        o->npages = npages;
+        struct CapTable* dt = &cap_tables[dti];
+        uint16_t dev_idx = CAP_NONE;
+        cap_lock(&dt->lock);
+        if (cap_slot_pop(dti, &dev_idx)) {
+            cap_unlock(&dt->lock);
+            cap_object_destroy(obj_id);
+            continue;   /* table full */
+        }
+        cap_lock(&o->lock);
+        if (cap_holder_insert(obj_id, HOLDER_SLOT, (uint16_t)pd->pid,
+                              dev_idx, 0)) {
+            cap_slot_push(dti, dev_idx);
+            cap_unlock(&o->lock);
+            cap_unlock(&dt->lock);
+            cap_object_destroy(obj_id);
+            continue;
+        }
+        dt->slots[dev_idx].word = cap_word_make(CAP_TYPE_DEV, obj_id,
+                                                sc->rights, 0, npages);
+        cap_unlock(&o->lock);
+        cap_unlock(&dt->lock);
+        kernel_serial_printf(
+            "[SIDECAR] PID %u '%s': dev cap '%s' phys 0x%llx+%llu slot %u\n",
+            pd->pid, pd->name, sc->name, (unsigned long long)sc->phys_base,
+            (unsigned long long)sc->size_bytes, (unsigned)dev_idx);
+    }
+
     /* Register the sidecar's identity so later manifests can wire
      * channels to it by name. */
     if (m.name_len > 0) {
@@ -3716,6 +3789,32 @@ int cap_create_sidecar(uint32_t parent_pid,
                                         sc->name, nlen, found_slot,
                                         CAP_TYPE_IRQ, (uint8_t)sc->rights,
                                         sc->vector, 0);
+            if (no == 0) break;
+            bib_off = no;
+            bib_n_caps++;
+        } else if (sc->kind == SIDECAR_TAG_CAP_DEV) {
+            /* Find the minted slot by scanning for a DEV cap whose object
+             * covers the same physical region; base/len carry the region
+             * (informational — devtest resolves the cap by trial-mmap). */
+            uint32_t npages = (uint32_t)((sc->size_bytes + 4095u) / 4096u);
+            uint16_t found_slot = CAP_NONE;
+            for (int si = 0; si < CAP_TABLE_ENTRIES; si++) {
+                uint64_t w = cap_tables[cti].slots[si].word;
+                if (!cap_word_valid(w)) continue;
+                if (((w >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK) != CAP_TYPE_DEV)
+                    continue;
+                uint32_t oid = (uint32_t)((w >> CAP_OBJ_SHIFT) & CAP_OBJ_MASK);
+                struct CapObject* o = cap_object_get(oid);
+                if (o && o->phys_base == sc->phys_base && o->npages == npages) {
+                    found_slot = (uint16_t)si;
+                    break;
+                }
+            }
+            if (found_slot == CAP_NONE) continue;   /* not minted: skip */
+            uint32_t no = bib_put_entry(bib_buf, bib_off, sizeof(bib_buf),
+                                        sc->name, nlen, found_slot,
+                                        CAP_TYPE_DEV, (uint8_t)sc->rights,
+                                        sc->phys_base, sc->size_bytes);
             if (no == 0) break;
             bib_off = no;
             bib_n_caps++;

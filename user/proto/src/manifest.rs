@@ -63,6 +63,7 @@ pub const TAG_CAP_MEM: u16 = 0x0006;
 pub const TAG_CAP_CHAN: u16 = 0x0007;
 pub const TAG_CAP_IRQ: u16 = 0x000B;
 pub const TAG_CAP_IO: u16 = 0x000C;
+pub const TAG_CAP_DEV: u16 = 0x000D;
 pub const TAG_BOOTSTRAP: u16 = 0x0008;
 pub const TAG_FLAGS: u16 = 0x0009;
 /// Sidecar identity: the instance name other manifests' `CAP_CHAN` peer
@@ -185,6 +186,13 @@ pub enum CapKind<'a> {
     /// Minted by `cap_create_sidecar`; `k_io_in`/`k_io_out` enforce the
     /// range (port = base + index, index + size <= count).
     Io { base: u32, count: u16, perms: u16 },
+    /// `CAP_DEV` (Driver SDK ABI v0.1 s4.1): a device-MMIO region cap.
+    /// `base` is the physical address of the region, `size` its length in
+    /// bytes (converted to whole pages at mint time). Minted by
+    /// `cap_create_sidecar` as an object-backed `CAP_OBJ_KIND_DEV` region;
+    /// `k_dev_mmap` maps it on demand (no identity map — device memory is
+    /// reachable only through the mediated mapping).
+    Dev { base: u64, size: u64 },
 }
 
 /// The `BOOTSTRAP` record — debug plumbing.
@@ -423,6 +431,23 @@ pub fn parse_manifest(blob: &[u8]) -> Result<Manifest<'_>, ManifestErr> {
                     },
                 })?;
             }
+            TAG_CAP_DEV => {
+                // Same wire shape as CAP_MEM (name, phys_base u64, size
+                // u64 bytes, rights u8): `name_len u16, name, base u64,
+                // size u64, rights u8` = 17 bytes after the name.
+                let (name, rest) = split_name(p).ok_or(ManifestErr::BadRecordLen)?;
+                if rest.len() != 17 {
+                    return Err(ManifestErr::BadRecordLen);
+                }
+                m.push_cap(ManifestCap {
+                    name,
+                    rights: rest[16] as u16,
+                    kind: CapKind::Dev {
+                        base: le_u64(rest, 0),
+                        size: le_u64(rest, 8),
+                    },
+                })?;
+            }
             TAG_BOOTSTRAP => {
                 let (console, rest) = split_name(p).ok_or(ManifestErr::BadRecordLen)?;
                 let (debug, rest) = split_name(rest).ok_or(ManifestErr::BadRecordLen)?;
@@ -571,6 +596,16 @@ pub fn build_manifest(m: &Manifest<'_>) -> alloc::vec::Vec<u8> {
                 p.extend_from_slice(&count.to_le_bytes());
                 p.extend_from_slice(&perms.to_le_bytes());
                 recs.push((TAG_CAP_IO, p));
+            }
+            CapKind::Dev { base, size } => {
+                // Same wire shape as CAP_MEM: name_len u16, name,
+                // phys_base u64, size u64 (bytes), rights u8.
+                let mut p = alloc::vec::Vec::new();
+                p.extend_from_slice(&enc_name(c.name));
+                p.extend_from_slice(&base.to_le_bytes());
+                p.extend_from_slice(&size.to_le_bytes());
+                p.push(c.rights as u8);
+                recs.push((TAG_CAP_DEV, p));
             }
         }
     }
@@ -884,6 +919,46 @@ mod tests {
             io.map(|c| c.kind),
             Some(CapKind::Io { base: 0x3F8, count: 8, perms: 0x3 })
         );
+    }
+
+    /// Same golden pin for CAP_DEV (Driver SDK ABI v0.1 s4.1):
+    /// `name_len u16, name, phys_base u64, size u64 (bytes), rights u8`
+    /// — byte-identical to the CAP_MEM wire shape, so the kernel parser's
+    /// CAP_MEM arm and CAP_DEV arm read the same layout (kernel/cap.c
+    /// SIDECAR_TAG_CAP_DEV).
+    #[test]
+    fn cap_dev_wire_bytes_golden() {
+        let m = caps_only(None, vec![ManifestCap {
+            name: "nic0.bar0",
+            rights: 0x3,
+            kind: CapKind::Dev {
+                base: 0xFEBF0000,
+                size: 0x20000,
+            },
+        }]);
+        let blob = build_manifest(&m);
+        assert_eq!(&blob[24..26], &TAG_CAP_DEV.to_le_bytes());
+        assert_eq!(&blob[26..28], &28u16.to_le_bytes()); // 2 + 9 + 8 + 8 + 1
+        let mut want = Vec::new();
+        want.extend_from_slice(&9u16.to_le_bytes()); // name_len
+        want.extend_from_slice(b"nic0.bar0");
+        want.extend_from_slice(&0xFEBF0000u64.to_le_bytes()); // phys_base
+        want.extend_from_slice(&0x20000u64.to_le_bytes()); // size (bytes)
+        want.push(0x3); // rights
+        assert_eq!(&blob[28..], &want[..]);
+        assert_eq!(blob.len(), 24 + 4 + 28);
+
+        // Round-trip: parse the packed blob and check the dev cap.
+        let parsed = parse_manifest(&blob).unwrap();
+        let dev = parsed.caps().iter().flatten().find(|c| c.name == "nic0.bar0");
+        assert_eq!(
+            dev.map(|c| c.kind),
+            Some(CapKind::Dev {
+                base: 0xFEBF0000,
+                size: 0x20000
+            })
+        );
+        assert_eq!(dev.unwrap().rights, 0x3);
     }
 
     /// Locate the payload of the first record with the given tag in a

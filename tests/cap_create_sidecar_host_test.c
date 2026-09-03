@@ -19,10 +19,11 @@
  *   4. pre-binds the child's capability table and mints a messenger channel
  *      whose far-end CHAN_R/CHAN_W land in the child's table (same object
  *      as the parent's returned CHAN_R),
- *   5. mints the manifest's CAP_MEM records as MEM caps and wires its
- *      CAP_CHAN records into real channels (each peer resolved against the
- *      sidecar registry; "kernel.*" peers connect to the kernel context),
- *      and
+ *   5. mints the manifest's CAP_MEM records as MEM caps, its CAP_DEV
+ *      records as object-backed device-MMIO regions (Driver SDK ABI v0.1
+ *      §4.1 — the same record shape as CAP_MEM), and wires its CAP_CHAN
+ *      records into real channels (each peer resolved against the sidecar
+ *      registry; "kernel.*" peers connect to the kernel context), and
  *   6. writes a BootInfoBlock at the child's stack top whose header and cap
  *      table (messenger caps first, then the named MEM caps and the wired
  *      CHAN_R/CHAN_W pairs with their real slots) are exactly what a
@@ -463,6 +464,16 @@ static void blob_refinish(struct Blob* b) {
 #define MEM_BUDGET_BYTES (MEM_BUDGET_PAGES * 4096u)  /* 262144 */
 #define MEM_DMA_BYTES    (MEM_DMA_PAGES * 4096u)     /* 1048576 */
 
+/* The CAP_DEV record (Driver SDK ABI v0.1 §4.1) the standard manifest
+ * carries for the e1000 NIC: the MMIO BAR0 window devtest maps via
+ * SYS_DEV_MMAP. The base is QEMU's standard assignment for the
+ * -device e1000 slot — it overlaps neither the kernel image (which the
+ * DEV mint does not check against anyway: unlike cap_create_mem, device
+ * MMIO regions are exclusive by construction) nor any MEM object, so the
+ * mint succeeds on every spawn. */
+#define DEV_BAR0_BASE  0xFEBE0000ULL   /* QEMU's e1000 BAR0 */
+#define DEV_BAR0_BYTES 0x20000u        /* 128 KiB — QEMU's e1000 PNPMMIO_SIZE */
+
 /* Derived from cap_create_sidecar's mapping arithmetic (image 2 pages, then
  * a guard page, then 4 stack pages):
  *   stack_base = IMAGE_VBASE + 2*4096 + 4096            = 0x400000003000
@@ -549,6 +560,23 @@ static void blob_chan(struct Blob* b, const char* name, const char* peer) {
     blob_put(b, "\x00", 1);   /* flags */
 }
 
+/* Append one CAP_DEV record (Driver SDK ABI v0.1 §4.1): name_len u16 +
+ * name + phys_base u64 + size u64 (bytes) + rights u8 — byte-identical
+ * to the CAP_MEM wire shape, only the tag differs. The kernel mints it
+ * as an object-backed CAP_OBJ_KIND_DEV region (kernel/cap.c's
+ * SIDECAR_TAG_CAP_DEV arm) and the BIB lists it like any other named
+ * cap. */
+static void blob_dev(struct Blob* b, const char* name, uint64_t phys_base,
+                     uint64_t size_bytes) {
+    uint16_t nl = (uint16_t)strlen(name);
+    blob_record(b, SIDECAR_TAG_CAP_DEV, (uint16_t)(2 + nl + 8 + 8 + 1));
+    blob_u16(b, nl);
+    blob_put(b, name, nl);
+    blob_u64(b, phys_base);
+    blob_u64(b, size_bytes);
+    blob_put(b, "\x03", 1);   /* rights R|W */
+}
+
 /* Footer (image_kaddr) + header — call after all TLV records. The footer
  * is the physical address of the image data the kernel copies into the
  * child's frames (appended after all TLV records; the kernel reads it as
@@ -572,17 +600,19 @@ static void blob_finish(struct Blob* b, uint64_t image_kaddr) {
 /* Build the standard valid manifest: IMAGE + BUDGET + CAP_MEM "budget" +
  * CAP_MEM "dma" + NAME "drv.child.0" + CAP_CHAN "peer0" → "drv.peer.0"
  * (a peer planted in the registry below) + CAP_CHAN "console" →
- * "kernel.debug.console" (a kernel service) + the image_kaddr footer.
- * `image_kaddr` must be a host pointer to IMAGE_SIZE bytes (≥ 1 MiB, so
- * the kernel's validity check passes). When `with_unknown` is set, an
- * extra unknown-tag record is appended before the footer (flags=0, so the
- * parse must refuse it). */
+ * "kernel.debug.console" (a kernel service) + CAP_DEV "nic0.bar0" (the
+ * e1000 MMIO BAR0 — the on-target devtest demo, exercised headlessly
+ * here end to end) + the image_kaddr footer. `image_kaddr` must be a host
+ * pointer to IMAGE_SIZE bytes (≥ 1 MiB, so the kernel's validity check
+ * passes). When `with_unknown` is set, an extra unknown-tag record is
+ * appended before the footer (flags=0, so the parse must refuse it). */
 static void build_valid_blob(struct Blob* b, uint64_t image_kaddr, int with_unknown) {
     memset(b, 0, sizeof(*b));
     blob_preamble(b);
     blob_name(b, "drv.child.0");
     blob_chan(b, "peer0", "drv.peer.0");
     blob_chan(b, "console", "kernel.debug.console");
+    blob_dev(b, "nic0.bar0", DEV_BAR0_BASE, DEV_BAR0_BYTES);
     if (with_unknown) {
         blob_record(b, 0x1234, 1);         /* unknown tag, tolerate flag clear */
         blob_put(b, "\xAB", 1);
@@ -827,6 +857,7 @@ int main(void) {
 
     uint16_t child_rd = CAP_NONE, child_wr = CAP_NONE;
     uint16_t budget_slot = CAP_NONE, dma_slot = CAP_NONE;
+    uint16_t dev_slot = CAP_NONE;
     if (cti >= 0) {
         for (int s = 0; s < CAP_TABLE_ENTRIES; s++) {
             uint64_t w = cap_tables[cti].slots[s].word;
@@ -841,6 +872,8 @@ int main(void) {
                 cap_debug_refcount(oid) == 1 && dma_slot == CAP_NONE &&
                 budget_slot != CAP_NONE && (uint16_t)s != budget_slot)
                 dma_slot = (uint16_t)s;
+            if (slot_type(w) == CAP_TYPE_DEV && dev_slot == CAP_NONE)
+                dev_slot = (uint16_t)s;
         }
     }
     CHECK(child_rd != CAP_NONE && child_wr != CAP_NONE,
@@ -849,6 +882,7 @@ int main(void) {
     CHECK(budget_slot != CAP_NONE && dma_slot != CAP_NONE &&
           budget_slot != dma_slot,
           "manifest MEM caps were minted into the child's table");
+    CHECK(dev_slot != CAP_NONE, "manifest CAP_DEV was minted into the child's table");
 
     /* ── 5. the BootInfoBlock the child's _start would parse ────────────── */
     uint8_t* bib = host_ptr(BIB_VADDR);
@@ -858,7 +892,8 @@ int main(void) {
         b = bib_parse(bib);
         CHECK(memcmp(bib, SIDECAR_BIB_MAGIC, 8) == 0, "BIB magic");
         CHECK(b.version == SIDECAR_BIB_VERSION, "BIB version 1");
-        CHECK(b.cap_count == 8, "BIB lists 8 caps (2 messenger + 2 MEM + 4 wired CHAN)");
+        CHECK(b.cap_count == 9,
+              "BIB lists 9 caps (2 messenger + 2 MEM + 4 wired CHAN + 1 DEV)");
         CHECK(b.budget_bytes == BUDGET_MEM, "BIB budget matches the manifest");
         /* The async child is scheduled by the kernel, which iretq's from
          * the synthetic ring3_ctx and repoints [gs:8] at the child's own
@@ -881,9 +916,9 @@ int main(void) {
         /* Entry = name_len u16 + name + slot u16 + ty u8 + rights u8 +
          * base u64 + len u64: 32 header + 22 (cap0) + 22 (cap1) + 28
          * (cap2 "budget") + 25 (cap3 "dma") + 27+27 (cap4/5 "peer0") +
-         * 29+29 (cap6/7 "console"). */
-        CHECK(b.total_len == 241,
-              "BIB total_len = 32 + 22 + 22 + 28 + 25 + 27 + 27 + 29 + 29");
+         * 29+29 (cap6/7 "console") + 31 (cap8 "nic0.bar0"). */
+        CHECK(b.total_len == 272,
+              "BIB total_len = 32 + 22 + 22 + 28 + 25 + 27 + 27 + 29 + 29 + 31");
 
         CHECK(b.caps[0].name[0] == 0 && b.caps[0].slot == child_rd &&
               b.caps[0].ty == CAP_TYPE_CHAN_R && b.caps[0].rights == CAP_PERM_RECV &&
@@ -917,13 +952,22 @@ int main(void) {
               b.caps[7].ty == CAP_TYPE_CHAN_W && b.caps[7].rights == CAP_PERM_SEND &&
               b.caps[7].base == 0 && b.caps[7].len == 0,
               "BIB cap 7: named CHAN_W 'console'");
-        /* The BIB-reported CHAN slots are live caps in the child's table. */
+        CHECK(strcmp(b.caps[8].name, "nic0.bar0") == 0 &&
+              b.caps[8].slot == dev_slot && b.caps[8].ty == CAP_TYPE_DEV &&
+              b.caps[8].rights == 0x03 && b.caps[8].base == DEV_BAR0_BASE &&
+              b.caps[8].len == DEV_BAR0_BYTES,
+              "BIB cap 8: named DEV 'nic0.bar0' (e1000 BAR0) with its real slot/base/byte size");
+        /* The BIB-reported slots are live caps in the child's table. */
         {
             uint64_t w4 = cap_tables[cti].slots[b.caps[4].slot].word;
             uint64_t w5 = cap_tables[cti].slots[b.caps[5].slot].word;
+            uint64_t w8 = cap_tables[cti].slots[b.caps[8].slot].word;
             CHECK(slot_valid(w4) && slot_type(w4) == CAP_TYPE_CHAN_R &&
                   slot_valid(w5) && slot_type(w5) == CAP_TYPE_CHAN_W,
                   "peer0's BIB slots are live CHAN_R/CHAN_W caps in the child's table");
+            CHECK(slot_valid(w8) && slot_type(w8) == CAP_TYPE_DEV &&
+                  cap_debug_refcount(cap_debug_objid(child->pid, b.caps[8].slot)) == 1,
+                  "nic0.bar0's BIB slot is a live DEV cap with its object holder");
         }
     }
 

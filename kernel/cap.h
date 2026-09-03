@@ -877,6 +877,7 @@ void cap_unlock(struct CapSpinlock* l);
 #define SIDECAR_TAG_CAP_CHAN     0x0007
 #define SIDECAR_TAG_CAP_IRQ      0x000B
 #define SIDECAR_TAG_CAP_IO       0x000C
+#define SIDECAR_TAG_CAP_DEV      0x000D
 #define SIDECAR_TAG_BOOTSTRAP    0x0008
 #define SIDECAR_TAG_FLAGS        0x0009
 #define SIDECAR_TAG_NAME         0x000A
