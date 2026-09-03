@@ -66,9 +66,20 @@ pub fn run<K: Kernel>(k: &K, eps: &mut EndpointSet, dev: &Device) -> Result<(), 
         // separate CHAN_W slot.
         for slot in 0u32..16 {
             if eps.is_console(slot) { continue; }
-            if let Ok(info) = k.cap_info(slot) {
-                if info.ty == CAP_CHAN {
+            match k.cap_info(slot) {
+                Ok(info) if info.ty == CAP_CHAN => {
                     eps.adopt(slot);
+                }
+                _ => {
+                    // The slot is no longer a CHAN cap: an adopted
+                    // endpoint whose client died (teardown revoked this
+                    // sidecar's CHAN_R; the watchdog-respawned client's
+                    // fresh channel may later reuse the slot). Drop the
+                    // stale entry so the fresh channel can be re-adopted
+                    // — otherwise the endpoint (keyed by slot) blocks
+                    // adoption forever and the respawned client's
+                    // requests are never served.
+                    eps.drop_ep(slot);
                 }
             }
         }
@@ -77,11 +88,13 @@ pub fn run<K: Kernel>(k: &K, eps: &mut EndpointSet, dev: &Device) -> Result<(), 
         // When no client has connected yet, use a finite deadline to
         // periodically re-scan for newly-wired channels (e.g. the POSIX
         // sidecar's ramdisk channel, wired after this sidecar booted).
-        let poll_ns: u64 = if eps.has_active_client() {
-            kapi::TIMEOUT_NONE
-        } else {
-            200_000_000 /* 200 ms — discovery poll */
-        };
+        // Always poll with a discovery deadline (never TIMEOUT_NONE): after
+        // a client's teardown revokes an adopted endpoint, the respawned
+        // client's fresh channel is minted LATER, so a prune may find
+        // nothing to re-adopt. Parking forever would miss the new channel
+        // (same race as the network driver). 200ms re-scan cadence bounds
+        // adoption latency and is cheap.
+        let poll_ns: u64 = 200_000_000; /* 200 ms — discovery poll */
         let (idx, _kind) = match k.wait(&list[..eps.wait_len()], poll_ns) {
             Ok(r) => r,
             Err(kabi::ERR_SHUTDOWN) => return Ok(()),

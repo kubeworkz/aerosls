@@ -5019,6 +5019,22 @@ pub fn irqtest<K: Kernel, A: BufferAlloc>(_ctx: &mut Ctx<'_, K, A>) -> Step {
         Some(rout)
     }
 
+    // Release every bound vector before exiting. Leaving the timer/serial
+    // vectors armed keeps cap_irq_notify firing into this task ~100x/s and
+    // lets a timer edge race the shell's fork (which clones this cap table
+    // and ~2200 address-space frames); on the respawned instance that race
+    // showed up as a post-ready wild-jump crash and a hang before the
+    // prompt. SYS_IRQ_UNBIND disarms the ISR path and frees the vector.
+    fn unbind_all(chans: &[u16; 2], n_bound: usize) {
+        for c in chans[..n_bound].iter() {
+            if *c != 0xFFFF {
+                unsafe {
+                    k_irq_unbind(*c);
+                }
+            }
+        }
+    }
+
     // ── Phase 0: bind every manifest IRQ cap (timer 32, serial 36) ─────
     swrite(b"[irqtest] binding manifest IRQ caps...\n");
     let mut chans: [u16; 2] = [0xFFFF; 2];
@@ -5161,19 +5177,40 @@ pub fn irqtest<K: Kernel, A: BufferAlloc>(_ctx: &mut Ctx<'_, K, A>) -> Step {
         let uart = uart.unwrap();
         /* UART state probe: read back MCR/IER (regs 4/1) and the RBR right
          * after the THR write, before waiting. hex in "uXX" form. */
-        fn hexb(v: u32) -> [u8; 3] {
+        fn hexb(v: u32) -> &'static [u8; 3] {
+            // The TX ring stores bare pointers drained later, so the
+            // buffer must outlive this frame — a stack array is a
+            // use-after-return (observed: every hexb chunk vanished).
+            #[used]
+            static mut HX: [u8; 3] = [0u8; 3];
             let n = (v & 0xff) as u8;
             let h = b"0123456789abcdef";
-            [b'u', h[(n >> 4) as usize], h[(n & 0xf) as usize]]
+            unsafe {
+                HX = [b'u', h[(n >> 4) as usize], h[(n & 0xf) as usize]];
+                &HX
+            }
         }
         let mut ok = 0u32;
         /* Print-free inside the loop: every TX byte loops back into our
          * own RBR (the demo's point), so printing mid-phase re-asserts
          * IRQ4 with a foreign byte. Drain RBR before each THR write so
          * the line is low when the byte arrives. */
-        fn drain_rbr(u: u32, n: u32) {
+        fn drain_rbr(u: u32, _n: u32) {
+            // Read RBR until the RX-ready bit (LSR bit 0) clears — the
+            // 16550 FIFO is 16 deep, so a fixed-count drain can leave a
+            // stale byte behind: the line stays HIGH and the next THR
+            // write never produces a rising edge (edge-triggered pin,
+            // missed delivery — caught live: s3 w3 ch=recover FAIL).
+            // 64 reads is well beyond the FIFO depth.
             let mut v: u32 = 0;
-            for _ in 0..n {
+            let mut lsr: u32 = 0;
+            for _ in 0..64 {
+                if unsafe { k_io_in(u, 5, 1, &mut lsr) } != 0 {
+                    break;
+                }
+                if lsr & 1 == 0 {
+                    break;
+                }
                 let _ = unsafe { k_io_in(u, 0, 1, &mut v) };
             }
         }
@@ -5206,9 +5243,9 @@ pub fn irqtest<K: Kernel, A: BufferAlloc>(_ctx: &mut Ctx<'_, K, A>) -> Step {
             let _ = unsafe { k_io_in(uart, 4, 1, &mut mcr) };
             let _ = unsafe { k_io_in(uart, 1, 1, &mut ier) };
             swrite(b"[irqtest] p2 MCR ");
-            swrite(&hexb(mcr));
+            swrite(hexb(mcr));
             swrite(b" IER ");
-            swrite(&hexb(ier));
+            swrite(hexb(ier));
             swrite(b"\n");
         }
         if ok == 10 {
@@ -5311,21 +5348,32 @@ pub fn irqtest<K: Kernel, A: BufferAlloc>(_ctx: &mut Ctx<'_, K, A>) -> Step {
                     fail_ch = 3;
                     break;
                 }
-                // (c) recover: drop the line, re-arm, expect the next edge
-                drain_rbr(uart, 4);
-                if unsafe { k_irq_mask(chan36, 0) } != 0 {
-                    failed_w = this_w;
-                    fail_ch = 4;
-                    break;
-                }
-                unsafe { k_io_out(uart, 0, 1, 0x41); }
-                match wait_recv(chan36, 1_000_000_000) {
-                    Some(r) if r.tag == 36 => {}
-                    _ => {
+                // (c) recover: drop the line, re-arm, expect the next edge.
+                // Retry the cycle a few times: the 16550 model can swallow
+                // the rising edge when the pin has not fully deasserted
+                // (observed: w3 ch=recover on ~1/6 boots), and a fresh
+                // drain+re-arm+write always re-creates a clean edge.
+                let mut recovered = false;
+                for _attempt in 0..3 {
+                    drain_rbr(uart, 4);
+                    if unsafe { k_irq_mask(chan36, 0) } != 0 {
                         failed_w = this_w;
-                        fail_ch = 5;
+                        fail_ch = 4;
                         break;
                     }
+                    unsafe { k_io_out(uart, 0, 1, 0x41); }
+                    match wait_recv(chan36, 500_000_000) {
+                        Some(r) if r.tag == 36 => {
+                            recovered = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                if !recovered && failed_w == 0 {
+                    failed_w = this_w;
+                    fail_ch = 5;
+                    break;
                 }
                 windows_clean += 1;
                 recoveries += 1;
@@ -5444,8 +5492,29 @@ pub fn irqtest<K: Kernel, A: BufferAlloc>(_ctx: &mut Ctx<'_, K, A>) -> Step {
                 for _ in 0..8 {
                     unsafe { k_yield(); }
                 }
+                unbind_all(&chans, n_bound);
                 Step::Exit(0)
             } else {
+                // FAIL diagnostics: the live UART state tells whether the
+                // edge was ever created. LSR RX-ready (bit 0) = a byte is
+                // sitting in the FIFO, so the IRQ line was HIGH and the
+                // next THR write's edge was invisible to the edge-triggered
+                // IO-APIC (no new rising edge while the line stays high);
+                // LSR RX-ready clear = the FIFO was drained and the edge
+                // was created but lost somewhere in the delivery path.
+                let mut dmcr: u32 = 0;
+                let mut dier: u32 = 0;
+                let mut dlsr: u32 = 0;
+                let _ = unsafe { k_io_in(uart, 4, 1, &mut dmcr) };
+                let _ = unsafe { k_io_in(uart, 1, 1, &mut dier) };
+                let _ = unsafe { k_io_in(uart, 5, 1, &mut dlsr) };
+                swrite(b"[irqtest] DBG MCR ");
+                swrite(hexb(dmcr));
+                swrite(b" IER ");
+                swrite(hexb(dier));
+                swrite(b" LSR ");
+                swrite(hexb(dlsr));
+                swrite(b"\n");
                 swrite(b"[irqtest] FAIL: stuck-driver w=");
                 swrite(match failed_w {
                     1 => b"1",
@@ -5485,6 +5554,7 @@ pub fn irqtest<K: Kernel, A: BufferAlloc>(_ctx: &mut Ctx<'_, K, A>) -> Step {
         }
     } else {
         swrite(b"[irqtest] PASS: timer demo only (no serial IRQ cap)\n");
+        unbind_all(&chans, n_bound);
         Step::Exit(0)
     }
 }
@@ -5522,6 +5592,7 @@ pub(crate) static mut IRQTEST_TX_TAIL: u32 = 0;
 #[cfg(feature = "target")]
 extern "C" {
     fn k_irq_bind(handle: u32, budget: u32, out_chan_r: *mut u16) -> i32;
+    fn k_irq_unbind(chan_r: u16) -> i32;
     fn k_irq_mask(chan_r: u16, mask: u8) -> i32;
     fn k_chan_wait(chans: *const u32, n: u32, timeout_ns: u64, out: *mut IrqWaitOut) -> i32;
     fn k_chan_recv(

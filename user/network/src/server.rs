@@ -18,8 +18,6 @@ pub struct Close {
     pub detail: u32,
 }
 
-
-
 /// Run the server loop until a fatal kernel error.
 pub fn run<K: Kernel>(k: &K, eps: &mut EndpointSet, net: &mut MockNetwork) -> Result<(), i32> {
     let mut buf = [0u8; ChanHeader::MAX_PAYLOAD];
@@ -27,12 +25,22 @@ pub fn run<K: Kernel>(k: &K, eps: &mut EndpointSet, net: &mut MockNetwork) -> Re
 
     loop {
         // Re-scan cap table for newly-wired CHAN endpoints (e.g. the POSIX
-        // sidecar's "network" channel, wired after this sidecar booted).
+        // sidecar's "network" channel, wired after this sidecar booted), and
+        // prune endpoints whose channel is gone: when a client sidecar dies,
+        // teardown REVOKES this sidecar's CHAN_R cap, and the watchdog-
+        // respawned client's fresh channel may occupy the same slot. A
+        // stale entry keyed by that slot would block re-adoption (adopt is
+        // idempotent on the slot) and the respawned client's NET_INFO would
+        // never be served — caught live: NETBOOT FAILED (10 recv retries)
+        // after the irqtest driver-death/respawn, boot aborted at netcheck.
         for slot in 0u32..16 {
             if eps.is_console(slot) { continue; }
-            if let Ok(info) = k.cap_info(slot) {
-                if info.ty == kapi::CAP_CHAN {
+            match k.cap_info(slot) {
+                Ok(info) if info.ty == kapi::CAP_CHAN => {
                     eps.adopt(slot);
+                }
+                _ => {
+                    eps.drop_ep(slot);
                 }
             }
         }
@@ -44,11 +52,14 @@ pub fn run<K: Kernel>(k: &K, eps: &mut EndpointSet, net: &mut MockNetwork) -> Re
         // network sidecar blocks forever before any endpoint is adopted,
         // so the POSIX sidecar's NET_INFO send queues a message that
         // nobody receives (caught live: NET_RECV returns CAP_ERR_STATE).
-        let timeout = if eps.has_active_client() {
-            kapi::TIMEOUT_NONE
-        } else {
-            200_000_000 // 200ms
-        };
+        // Always poll with a discovery deadline (never TIMEOUT_NONE): after
+        // a client's teardown revokes an adopted endpoint, the respawned
+        // client's fresh channel is minted LATER (respawn takes ~100ms), so
+        // a prune may find nothing to re-adopt. Parking forever on the
+        // console channel would then miss the new channel forever — caught
+        // live: NETBOOT FAILED (10 recv retries) on the respawned POSIX.
+        // A 200ms re-scan cadence is cheap and bounds adoption latency.
+        let timeout = 200_000_000; // 200ms discovery poll
         let (idx, _kind) = match k.wait(&list[..wlen], timeout) {
             Ok(r) => r,
             Err(e) if e == kabi::ERR_TIMEOUT => {
@@ -57,10 +68,23 @@ pub fn run<K: Kernel>(k: &K, eps: &mut EndpointSet, net: &mut MockNetwork) -> Re
                 // error (ERR_SHUTDOWN, ...) terminates the loop.
                 continue;
             }
+            Err(e) if e == kabi::ERR_REVOKED || e == kabi::ERR_STATE => {
+                // A listed endpoint's channel was revoked/closed out from
+                // under us (its client peer died; teardown). Prune the
+                // dead entries and re-scan — the respawned client's fresh
+                // channel may already occupy the slot. Not fatal: only
+                // ERR_SHUTDOWN ends the loop.
+                for slot in 0u32..16 {
+                    if eps.is_console(slot) { continue; }
+                    if !matches!(k.cap_info(slot), Ok(i) if i.ty == kapi::CAP_CHAN) {
+                        eps.drop_ep(slot);
+                    }
+                }
+                continue;
+            }
             Err(e) => return Err(e),
         };
         let handle = list[idx];
-
         if eps.is_console(handle) {
             handle_console(k, eps, &mut buf, &mut caps)?;
             continue;
