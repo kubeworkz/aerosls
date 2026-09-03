@@ -1,0 +1,29 @@
+[package]
+name = "aerosls-e1000-driver"
+version = "0.1.0"
+edition = "2021"
+description = "AeroSLS e1000 NIC driver sidecar (drv.e1000.0, aerosls.e1000.v1) — Driver SDK ABI v0.1 §7: DEV-mmaps BAR0, programs TX/RX descriptor rings over the budget DMA region, PHY-loopback self-test"
+license = "MIT"
+
+[dependencies]
+aerosls-proto = { path = "../proto" }
+
+[dev-dependencies]
+aerosls-kernel-sim = { path = "../kernel-sim" }
+
+# The `target` feature selects the real kernel ABI (extern "C" syscalls) and
+# the real sidecar entry point over a raw MMIO window (SYS_DEV_MMAP). The
+# default (host) build omits both so `cargo test` links the device core
+# against the in-crate QEMU-faithful e1000 model instead. Build the sidecar
+# image (flat binary with _start at 0) with:
+#   cargo build -p aerosls-e1000-driver --features target \
+#       --target x86_64-unknown-none --release
+[features]
+default = []
+# `target` also enables the real kernel ABI in aerosls-proto.
+target = ["aerosls-proto/target"]
+
+[[bin]]
+name = "e1000_driver"
+path = "src/bin/e1000_driver.rs"
+required-features = ["target"]

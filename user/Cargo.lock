@@ -45,6 +45,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aerosls-e1000-driver"
+version = "0.1.0"
+dependencies = [
+ "aerosls-kernel-sim",
+ "aerosls-proto",
+]
+
+[[package]]
 name = "aerosls-gui"
 version = "0.1.0"
 dependencies = [

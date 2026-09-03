@@ -28,6 +28,11 @@ pub const CAP_CHAN_W: u16 = 3;
 /// for a device vector (OBJ = vector, PERM = CAP_PERM_BIND).
 /// Matches `CAP_TYPE_IRQ 7` in kernel/cap.h.
 pub const CAP_TYPE_IRQ: u16 = 7;
+/// `CAP_TYPE_DEV` — Driver SDK ABI v0.1 s4.1: an object-backed device-MMIO
+/// region cap (OBJ = CapObject region id, OFF = byte offset, LEN = 4 KiB
+/// pages). Matches `CAP_TYPE_DEV 5` in kernel/cap.h. `k_dev_mmap` maps it;
+/// a BIB entry of this type names the region (e.g. `nic0.bar0`).
+pub const CAP_TYPE_DEV: u16 = 5;
 /// The one right an IRQ cap carries: bind (kernel/cap.h CAP_PERM_BIND).
 pub const CAP_PERM_BIND: u16 = 0x01;
 
