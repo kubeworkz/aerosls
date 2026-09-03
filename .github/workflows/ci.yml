@@ -775,6 +775,20 @@ jobs:
         run: bash tests/phase5_boot_smoke.sh
         working-directory: aerosls2
 
+      # Phase 5 flake guard: the phase-3 serial-IRQ windows were
+      # edge-triggered and racy under -accel tcg,thread=multi (~1/6 to ~1/2
+      # of boots died at 'ch=recover', or post-ready with no shell). One
+      # boot passing six times proves nothing about a one-in-six
+      # regression, so this boots the SAME ISO six times and requires
+      # 'ALL PHASES PASS' AND the shell prompt in every single boot. The
+      # single-boot smoke above catches total breakage; this catches
+      # flakiness. Costs ~5-10 minutes of wall time on the self-hosted
+      # runner; boots that finish early are killed as soon as both markers
+      # appear.
+      - name: Phase 5 boot flake guard (6 boots under tcg,thread=multi)
+        run: bash tests/phase5_boot_flake_guard.sh
+        working-directory: aerosls2
+
   decoder-build:
     # M8 (Step 6.4): the decoder is the DEFAULT build -- this job builds
     # the shipping config (what deploy.sh builds and what runs in

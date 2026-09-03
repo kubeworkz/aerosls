@@ -5019,6 +5019,22 @@ pub fn irqtest<K: Kernel, A: BufferAlloc>(_ctx: &mut Ctx<'_, K, A>) -> Step {
         Some(rout)
     }
 
+    // Hexify one byte for FAIL-time diagnostics ("uXX"). Defined at
+    // function scope so the identify-FAIL branch can use it too.
+    fn hexb(v: u32) -> &'static [u8; 3] {
+        // The TX ring stores bare pointers drained later, so the
+        // buffer must outlive this frame — a stack array is a
+        // use-after-return (observed: every hexb chunk vanished).
+        #[used]
+        static mut HX: [u8; 3] = [0u8; 3];
+        let n = (v & 0xff) as u8;
+        let h = b"0123456789abcdef";
+        unsafe {
+            HX = [b'u', h[(n >> 4) as usize], h[(n & 0xf) as usize]];
+            &HX
+        }
+    }
+
     // Release every bound vector before exiting. Leaving the timer/serial
     // vectors armed keeps cap_irq_notify firing into this task ~100x/s and
     // lets a timer edge race the shell's fork (which clones this cap table
@@ -5089,7 +5105,24 @@ pub fn irqtest<K: Kernel, A: BufferAlloc>(_ctx: &mut Ctx<'_, K, A>) -> Step {
     let mut chan32: u16 = 0xFFFF;
     let mut chan36: u16 = 0xFFFF;
     for &c in chans[..n_bound].iter() {
-        if let Some(r) = wait_recv(c, 300_000_000) {
+        // Retry a silent channel with a fresh edge: under
+        // -accel tcg,thread=multi the first loopback edge can be lost
+        // end-to-end (observed once: pin 4 unmasked and THR written, the
+        // identify wait never saw a notification). Drain the FIFO (line
+        // low) and re-write THR for a fresh 0->1 edge; the post-identify
+        // drain removes any duplicates before phase 2's exact-10 count.
+        let mut r = wait_recv(c, 300_000_000);
+        let mut edge_retry = 0u32;
+        while r.is_none() && edge_retry < 2 {
+            if let Some(u) = uart {
+                let mut v: u32 = 0;
+                let _ = unsafe { k_io_in(u, 0, 1, &mut v) };
+                unsafe { k_io_out(u, 0, 1, 0x41) };
+            }
+            r = wait_recv(c, 300_000_000);
+            edge_retry += 1;
+        }
+        if let Some(r) = r {
             match r.tag {
                 32 => chan32 = c,
                 36 => {
@@ -5122,6 +5155,34 @@ pub fn irqtest<K: Kernel, A: BufferAlloc>(_ctx: &mut Ctx<'_, K, A>) -> Step {
             }
         }
     }
+    // Drain extra queued serial notifications left by the identify
+    // edge-retries so phase 2's exact-10 accounting starts clean.
+    if chan36 != 0xFFFF {
+        let mut buf = [0u8; 8];
+        let mut rout = IrqRecvOut {
+            kind: 0,
+            flags: 0,
+            tag: 0,
+            len: 0,
+            n_caps: 0,
+            needed: 0,
+        };
+        for _ in 0..8 {
+            if unsafe {
+                k_chan_recv(
+                    chan36 as u32,
+                    buf.as_mut_ptr(),
+                    buf.len() as u32,
+                    core::ptr::null_mut(),
+                    0,
+                    &mut rout,
+                )
+            } != 0
+            {
+                break;
+            }
+        }
+    }
     if chan32 == 0xFFFF {
         // Loopback is still ON here (phase 2 reuses it); reset IER/MCR so
         // the ring-drained FAIL text reaches the wire — a loopbacked THR
@@ -5138,6 +5199,22 @@ pub fn irqtest<K: Kernel, A: BufferAlloc>(_ctx: &mut Ctx<'_, K, A>) -> Step {
     if chan36 == 0xFFFF && n_bound >= 2 {
         if let Some(u) = uart {
             unsafe {
+                // Read MCR/IER/LSR BEFORE resetting loopback: LSR RX-ready
+                // (bit 0) set = the byte DID loop back and the notify path
+                // dropped it; clear = the edge was never created (TCG loss).
+                let mut dmcr: u32 = 0;
+                let mut dier: u32 = 0;
+                let mut dlsr: u32 = 0;
+                let _ = k_io_in(u, 4, 1, &mut dmcr);
+                let _ = k_io_in(u, 1, 1, &mut dier);
+                let _ = k_io_in(u, 5, 1, &mut dlsr);
+                swrite(b"[irqtest] DBG MCR ");
+                swrite(hexb(dmcr));
+                swrite(b" IER ");
+                swrite(hexb(dier));
+                swrite(b" LSR ");
+                swrite(hexb(dlsr));
+                swrite(b"\n");
                 k_io_out(u, 1, 1, 0); // IER off
                 k_io_out(u, 4, 1, 0); // MCR loopback off
             }
@@ -5177,19 +5254,6 @@ pub fn irqtest<K: Kernel, A: BufferAlloc>(_ctx: &mut Ctx<'_, K, A>) -> Step {
         let uart = uart.unwrap();
         /* UART state probe: read back MCR/IER (regs 4/1) and the RBR right
          * after the THR write, before waiting. hex in "uXX" form. */
-        fn hexb(v: u32) -> &'static [u8; 3] {
-            // The TX ring stores bare pointers drained later, so the
-            // buffer must outlive this frame — a stack array is a
-            // use-after-return (observed: every hexb chunk vanished).
-            #[used]
-            static mut HX: [u8; 3] = [0u8; 3];
-            let n = (v & 0xff) as u8;
-            let h = b"0123456789abcdef";
-            unsafe {
-                HX = [b'u', h[(n >> 4) as usize], h[(n & 0xf) as usize]];
-                &HX
-            }
-        }
         let mut ok = 0u32;
         /* Print-free inside the loop: every TX byte loops back into our
          * own RBR (the demo's point), so printing mid-phase re-asserts
