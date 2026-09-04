@@ -866,25 +866,68 @@ static int pick_next_partition(uint32_t last_partition, uint32_t* out_partition)
         g_partition_turns_remaining = 0;
     }
 
-    for (uint32_t p = 1; p <= PARTITION_MAX; p++) {
-        uint32_t candidate = (last_partition + p) % PARTITION_MAX;
-        // Phase 14 (LPAR): a paused partition is skipped entirely, without
-        // even scanning its processes -- pause is a scheduling exclusion,
-        // not a "nothing runnable" state, so this check comes before the
-        // inner scan rather than folding into its condition.
-        if (partition_is_paused(candidate)) continue;
-        for (int i = 0; i < PROC_MAX; i++) {
-            if (proc_runnable(&proc_table[i]) &&
-                proc_table[i].partition_id == candidate) {
-                *out_partition = candidate;
-                // This turn is turn #1 of candidate's weight-many turns --
-                // it owes (weight - 1) MORE before the next rotation.
-                g_partition_turns_remaining = effective_cpu_weight(candidate) - 1;
-                return 1;
-            }
+    // The rotation scan used to be a nested O(PARTITION_MAX x PROC_MAX)
+    // walk: for every candidate partition in ring order it re-scanned all
+    // 16 proc_table[] slots hunting for one runnable process. With
+    // PARTITION_MAX = 256 and typically one or two live processes that is
+    // ~4,096 proc_runnable() probes per pick -- and schedule_ring3() runs a
+    // pick on EVERY timer tick even when it ends up resuming the same
+    // process (the "only one runnable" fallback still asks first). At slow
+    // TCG speeds that ~40k-instruction walk approached the entire 10 ms
+    // tick period and starved the guest of user time (the phase-5 e1000
+    // driver frozen mid-poll with the vCPU sampled inside this function for
+    // minutes). The replacement is a SINGLE pass over proc_table[]
+    // (PROC_MAX = 16 slots), deduplicated by partition_id, choosing the
+    // ring-minimal non-paused partition that has a runnable process —
+    // exactly what the nested walk returned, for the same reason: the walk
+    // won at the smallest p whose candidate (last_partition + p) had a
+    // runnable process, with last_partition itself reachable only at full
+    // wrap (p == PARTITION_MAX). Cost is now O(PROC_MAX + distinct runnable
+    // partitions) per pick regardless of how many empty partitions sit
+    // between the live ones, with zero cached-count bookkeeping to drift
+    // from the real state transitions. scheduler_fairness_host_test.c
+    // threads consecutive picks and asserts exact turn sequences — the
+    // byte-for-byte safety net for this rewrite.
+    uint32_t best      = PARTITION_MAX;   /* "none yet" — ids are < PARTITION_MAX */
+    /* Distances are 1..PARTITION_MAX (PARTITION_MAX = full wrap back to
+     * last_partition), so PARTITION_MAX + 1 is a sentinel no real distance
+     * can equal — a lone last_partition must be able to win its own wrap
+     * (scenario 6 of scheduler_fairness_host_test.c exercises exactly that). */
+    uint32_t best_dist = PARTITION_MAX + 1;
+    uint32_t seen_partitions[PROC_MAX];
+    int      n_seen    = 0;
+    for (int i = 0; i < PROC_MAX; i++) {
+        if (!proc_runnable(&proc_table[i])) continue;
+        uint32_t q = proc_table[i].partition_id;
+        if (q >= PARTITION_MAX) continue;   /* defensive, fail-closed */
+        // Phase 14 (LPAR): a paused partition is skipped entirely -- pause
+        // is a scheduling exclusion, not a "nothing runnable" state, so
+        // this check applies before any candidate ordering is decided,
+        // exactly as it did when it gated the nested walk's inner scan.
+        if (partition_is_paused(q)) continue;
+        int dup = 0;
+        for (int j = 0; j < n_seen; j++) {
+            if (seen_partitions[j] == q) { dup = 1; break; }
+        }
+        if (dup) continue;   /* one runnable process already claimed q */
+        seen_partitions[n_seen++] = q;
+        // Ring distance from last_partition, 1..PARTITION_MAX, where
+        // PARTITION_MAX means "last_partition itself, reached only at full
+        // wrap" — the exact ordering the nested walk's p = 1..PARTITION_MAX
+        // loop imposed (p = PARTITION_MAX revisited last_partition).
+        uint32_t dist = (q + PARTITION_MAX - last_partition) % PARTITION_MAX;
+        if (dist == 0) dist = PARTITION_MAX;
+        if (dist < best_dist) {
+            best_dist = dist;
+            best      = q;
         }
     }
-    return 0;
+    if (best == PARTITION_MAX) return 0;
+    *out_partition = best;
+    // This turn is turn #1 of best's weight-many turns -- it owes
+    // (weight - 1) MORE before the next rotation.
+    g_partition_turns_remaining = effective_cpu_weight(best) - 1;
+    return 1;
 }
 
 // Per-partition round-robin cursor (declared up top with proc_table[],
