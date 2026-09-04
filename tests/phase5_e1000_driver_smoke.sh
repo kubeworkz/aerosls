@@ -41,15 +41,29 @@ cd "$(dirname "$0")/.."   # repo root
 
 ISO=sls_operating_system.iso
 LOG=/tmp/aerosls_phase5_e1000_smoke.log
-WINDOW_S=120               # generous: the chain (init -> DM -> registry ->
+WINDOW_S=180               # generous: the chain (init -> DM -> registry ->
                            # spawn -> driver bring-up + the ~1 s QEMU RX
-                           # grace settle) takes tens of seconds
+                           # grace settle) takes tens of seconds, and under
+                           # contended TCG the guest can crawl 3-5x slower
+                           # than nominal — a PASS that lands late is still
+                           # a PASS (thread=multi boots that stay healthy
+                           # finish in ~15 s)
 
 [ -f "$ISO" ] || { echo "ABORT: $ISO missing — build it with: make x86-iso (with sidecars.cpio present)" >&2; exit 2; }
 command -v qemu-system-x86_64 >/dev/null 2>&1 || { echo "ABORT: qemu-system-x86_64 not installed" >&2; exit 2; }
 
+# The QEMU RX grace (e1000's 1000 ms post-RCTL flush_queue_timer) must
+# expire in WALL time for a retried TX to land, and QEMU only advances its
+# virtual-clock timers against the real clock when the emulated main loop
+# runs. Under the default single-threaded TCG a spinning guest starves
+# that loop for tens of seconds to minutes, which made this smoke's
+# 120 s window a coin flip. -accel tcg,thread=multi runs the timer
+# iothread in real time (same config the phase-5 boot flake guard uses),
+# so the grace reliably expires ~1 s after RX-enable and the driver's
+# bounded retry ladder lands PASS within seconds.
 rm -f "$LOG"
 qemu-system-x86_64 -cdrom "$ISO" -display none -m 4G -no-reboot \
+    -accel tcg,thread=multi \
     -netdev user,id=net0 \
     -device e1000,netdev=net0,mac=52:54:00:12:34:01 \
     -device e1000,mac=52:54:00:12:34:02 \

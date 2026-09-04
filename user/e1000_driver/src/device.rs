@@ -132,6 +132,24 @@ pub const DMA_REGION_BYTES: u64 = RX_BUF0_OFF + (RING_N as u64 * RX_BUF_BYTES as
 /// hang.
 pub const POLL_LIMIT: u32 = 4_000_000;
 
+/// Outer iterations of the RX wait loop below. Each outer iteration scans
+/// the whole RX ring, burns `RX_WAIT_SPIN` `pause`s, and performs one MMIO
+/// read. The poll exists to catch the loopback frame QEMU delivers for a
+/// TX that lands AFTER its ~1000 ms post-RCTL grace (a TX during the grace
+/// is dropped outright — see `run_selftest_retry`), so a bounded wait per
+/// attempt is all the driver needs: the frame arrives within the first few
+/// outer iterations of the post-grace attempt (the very first DD scan
+/// finds it), and when the attempt is still inside the grace the bound
+/// burns ~1 s of guest time before NoRxFrame lets the retry re-TX. Sized
+/// deliberately small: the retry ladder has 8 attempts and the smoke
+/// window is 180 s, so each dropped attempt must cost only ~1-2 s of
+/// guest time — under TCG a 200k-iteration poll is tens of seconds, which
+/// starves the ladder into a single slow attempt. Small is also what the
+/// host model's `drop_rx` retry tests need to stay fast.
+pub const RX_WAIT_OUTER: u32 = 30_000;
+/// Pause burst per outer iteration (see `RX_WAIT_OUTER`).
+pub const RX_WAIT_SPIN: u32 = 128;
+
 // ─── MMIO access ────────────────────────────────────────────────────────────
 /// 32-bit register access. `rd`/`wr` must be volatile-observable (device
 /// MMIO); the implementor decides how (raw volatile ops on target, model
@@ -378,16 +396,26 @@ impl<M: Mmio> Device<M> {
         Err(E1000Error::Timeout("TX descriptor DD"))
     }
 
-    /// Poll the RX ring for the first completed descriptor. Returns the
-    /// slot index and the completed frame's byte length.
+    /// Wait for the loopback frame to appear on the RX ring. Each outer
+    /// iteration re-scans every descriptor and burns a small pause burst;
+    /// the one MMIO read per outer keeps the wait observable to the device
+    /// model and paces the loop against guest time. Returns the slot index
+    /// and the completed frame's byte length as soon as a DD write-back
+    /// appears, or NoRxFrame when the bound elapses (the caller's retry
+    /// re-transmits after QEMU's RX grace has expired).
     fn rx_poll(&self, dma: &Dma) -> Result<(usize, u16), E1000Error> {
-        for i in 0..RING_N {
-            for _ in 0..POLL_LIMIT {
+        for _ in 0..RX_WAIT_OUTER {
+            for i in 0..RING_N {
                 if dma.rx_desc(i).status & DESC_DD != 0 {
                     return Ok((i, dma.rx_desc(i).length));
                 }
+            }
+            for _ in 0..RX_WAIT_SPIN {
                 spin_loop();
             }
+            // MMIO read: side-effect-free; keeps the poll paced and the
+            // device model engaged while the ring is idle.
+            let _ = self.mmio.rd(REG_STATUS);
         }
         Err(E1000Error::NoRxFrame)
     }
@@ -527,20 +555,27 @@ pub fn run_selftest<M: Mmio>(
     tx_round_trip(dev, dma, mac)
 }
 
-/// QEMU arms a 1000 ms `flush_queue_timer` on every RCTL write and drops
-/// all deliveries while it is pending (e1000_can_receive →
-/// e1000_receive_iov return 0), so a loopback frame sent immediately after
-/// RX-enable is silently lost. The window is self-healing: once the timer
-/// fires (≈1 s of wall time later) deliveries succeed again.
+/// QEMU arms a 1000 ms `flush_queue_timer` on every RCTL write, and while
+/// it is pending every loopback delivery is silently DROPPED (the net
+/// layer's receive path refuses the frame — nothing is queued for later).
+/// So a TX that lands inside the window is lost outright, and the only way
+/// to get a frame onto the RX ring is to transmit again once the window
+/// has expired (≈1 s of QEMU wall time after RX-enable). Under the smoke's
+/// `-accel tcg,thread=multi` QEMU timers fire against real time, so the
+/// grace reliably expires ~1 s after `bring_up_rings` regardless of what
+/// the guest does.
 ///
 /// `run_selftest` is the single-shot attempt and races that window.
 /// `run_selftest_retry` is the on-target entry: `bring_up_rings` exactly
 /// once (so retries never re-arm the window via RCTL), then up to
 /// `SELFTEST_MAX_ATTEMPTS` TX→RX round trips with a caller-supplied
-/// `settle` burn between them to let the window expire. Only `NoRxFrame`
-/// is retried — a `RxMismatch` means the bytes were wrong, which a retry
-/// cannot fix. The host model exercises the retry path deterministically
-/// via its `drop_rx` gate (no wall clock needed in tests).
+/// `settle` burn between them. Each attempt re-transmits — the bounded
+/// `rx_poll` catches a delivery the instant one lands, and a dropped
+/// in-grace attempt costs only its poll bound before the settle paces the
+/// next TX past the window. Only `NoRxFrame` is retried — a `RxMismatch`
+/// means the bytes were wrong, which a retry cannot fix. The host model
+/// exercises the retry path deterministically via its `drop_rx` gate (no
+/// wall clock needed in tests).
 pub const SELFTEST_MAX_ATTEMPTS: u32 = 8;
 
 pub fn run_selftest_retry<M: Mmio>(

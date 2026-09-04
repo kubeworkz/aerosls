@@ -323,19 +323,19 @@ fn idle() -> ! {
     }
 }
 
-/// Burn wall time between loopback retries so QEMU's 1000 ms post-RCTL
-/// RX grace (flush_queue_timer) expires. Every `MMIO_EXIT_PERIOD` spins a
-/// STATUS register read forces a vCPU→main-loop exit, so QEMU evaluates
-/// and fires the timer against wall time even in single-threaded TCG — a
-/// pure guest spin would never let the main loop run.
+/// Pace loopback retries across QEMU's 1000 ms post-RCTL RX grace (a TX
+/// inside the window is dropped; one after it lands). Under the smoke's
+/// `-accel tcg,thread=multi` the grace expires against real time, so this
+/// only needs to burn ~1-2 s of guest time between attempts — bounded so
+/// the full retry ladder stays inside the smoke's 180 s window.
 #[cfg(all(feature = "target", target_os = "none"))]
 fn qemu_rx_grace_settle(dev: &Device<RealMmio>) {
-    const SPINS: u32 = 400_000_000;
+    const SPINS: u32 = 5_000_000;
     const MMIO_EXIT_PERIOD: u32 = 1_000_000;
     let mut i = 0u32;
     while i < SPINS {
         if i % MMIO_EXIT_PERIOD == 0 {
-            // STATUS read: side-effect-free, forces an MMIO exit.
+            // STATUS read: side-effect-free; keeps the settle observable.
             let _ = dev.link_up();
         }
         core::hint::spin_loop();
