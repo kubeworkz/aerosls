@@ -170,6 +170,8 @@ void user_map_page(uint64_t* pml4, uint64_t vaddr, uint64_t paddr, uint64_t flag
 }
 
 static uint64_t* own_table(uint64_t* parent, size_t idx, int copy_existing);
+static int user_map_page_safe(uint64_t* pml4, uint64_t vaddr, uint64_t paddr,
+                              uint64_t flags);
 
 // ─── user_map_identity ────────────────────────────────────────────────────────
 // Map `npages` of physical memory into a process's address space at the SAME
@@ -197,34 +199,7 @@ int user_map_identity(uint64_t* pml4, uint64_t phys, uint32_t npages,
                       uint64_t flags) {
     for (uint32_t p = 0; p < npages; p++) {
         uint64_t va = phys + (uint64_t)p * 4096;
-        uint64_t* pdpt = own_table(pml4, PML4_IDX(va), 1);
-        if (!pdpt) return -1;
-        uint64_t* pd = own_table(pdpt, PDPT_IDX(va), 1);
-        if (!pd) return -1;
-
-        uint64_t pe = pd[PD_IDX(va)];
-        uint64_t* pt;
-        if ((pe & USER_PTE_PRESENT) && (pe & USER_PTE_USER)) {
-            pt = (uint64_t*)(uintptr_t)(pe & USER_PTE_FRAME_MASK); /* ours already */
-        } else {
-            pt = alloc_page_table();
-            if (!pt) return -1;
-            if (pe & USER_PTE_PRESENT) {
-                if (pe & (1ULL << 7)) { /* PS: 2 MiB huge page — replicate at 4 KiB */
-                    uint64_t base = pe & USER_PTE_FRAME_MASK;
-                    uint64_t keep = pe & ~(USER_PTE_FRAME_MASK | (1ULL << 7));
-                    for (int i = 0; i < 512; i++)
-                        pt[i] = (base + (uint64_t)i * 4096) | keep;
-                } else { /* 4 KiB-level table — copy its entries */
-                    const uint64_t* shared =
-                        (const uint64_t*)(uintptr_t)(pe & USER_PTE_FRAME_MASK);
-                    for (int i = 0; i < 512; i++) pt[i] = shared[i];
-                }
-            }
-            pd[PD_IDX(va)] = ((uint64_t)(uintptr_t)pt & USER_PTE_FRAME_MASK)
-                             | USER_PTE_PRESENT | USER_PTE_WRITE | USER_PTE_USER;
-        }
-        pt[PT_IDX(va)] = (phys + (uint64_t)p * 4096) | flags;
+        if (user_map_page_safe(pml4, va, va, flags) < 0) return -1;
     }
     return 0;
 }
@@ -261,6 +236,50 @@ static uint64_t* own_table(uint64_t* parent, size_t idx, int copy_existing) {
     parent[idx] = ((uint64_t)(uintptr_t)fresh & USER_PTE_FRAME_MASK)
                   | USER_PTE_PRESENT | USER_PTE_WRITE | USER_PTE_USER;
     return fresh;
+}
+
+// ─── user_map_page_safe ────────────────────────────────────────────────────────
+// Single-page map into a child PML4 that SHARES the kernel's low identity map
+// by pointer (clone_kernel_slots). Unlike user_map_page(), the walk must not
+// follow the shared supervisor entries: a PRESENT 2 MiB huge-page PD entry
+// (the kernel's 0-4 GiB identity map) is not a table pointer, and writing a
+// leaf through it corrupts the kernel's own frames (observed under QEMU: the
+// DEV-window map at 0x100000 wrote PTEs through phys 0x800.. and the kernel
+// later faulted). Mirrors user_map_identity(): re-point only the child's own
+// copies of the path, replicating a huge page at 4 KiB granularity so the
+// kernel keeps full visibility of the chunk, then install the requested leaf.
+// This is the arch hook behind cap_arch_map_page (DEV mmap and MEM sys_map).
+static int user_map_page_safe(uint64_t* pml4, uint64_t vaddr, uint64_t paddr,
+                              uint64_t flags) {
+    uint64_t* pdpt = own_table(pml4, PML4_IDX(vaddr), 1);
+    if (!pdpt) return -1;
+    uint64_t* pd = own_table(pdpt, PDPT_IDX(vaddr), 1);
+    if (!pd) return -1;
+
+    uint64_t pe = pd[PD_IDX(vaddr)];
+    uint64_t* pt;
+    if ((pe & USER_PTE_PRESENT) && (pe & USER_PTE_USER)) {
+        pt = (uint64_t*)(uintptr_t)(pe & USER_PTE_FRAME_MASK); /* ours already */
+    } else {
+        pt = alloc_page_table();
+        if (!pt) return -1;
+        if (pe & USER_PTE_PRESENT) {
+            if (pe & (1ULL << 7)) { /* PS: 2 MiB huge page — replicate at 4 KiB */
+                uint64_t base = pe & USER_PTE_FRAME_MASK;
+                uint64_t keep = pe & ~(USER_PTE_FRAME_MASK | (1ULL << 7));
+                for (int i = 0; i < 512; i++)
+                    pt[i] = (base + (uint64_t)i * 4096) | keep;
+            } else { /* 4 KiB-level table — copy its entries */
+                const uint64_t* shared =
+                    (const uint64_t*)(uintptr_t)(pe & USER_PTE_FRAME_MASK);
+                for (int i = 0; i < 512; i++) pt[i] = shared[i];
+            }
+        }
+        pd[PD_IDX(vaddr)] = ((uint64_t)(uintptr_t)pt & USER_PTE_FRAME_MASK)
+                            | USER_PTE_PRESENT | USER_PTE_WRITE | USER_PTE_USER;
+    }
+    pt[PT_IDX(vaddr)] = (paddr & USER_PTE_FRAME_MASK) | flags;
+    return 0;
 }
 
 // ─── user_unmap_page ──────────────────────────────────────────────────────────
@@ -404,8 +423,16 @@ int cap_arch_map_page(uint64_t pml4_phys, uint64_t vaddr, uint64_t paddr,
     if (!(cap_perms & 0x04)) flags |= USER_PTE_NOEXEC;  /* CAP_PERM_X */
     if (cap_perms & CAP_PERM_DEV_UC) flags |= USER_PTE_PCD;  /* uncached */
     if (cap_perms & CAP_PERM_DEV_WC) flags |= USER_PTE_PWT;  /* write-thru */
-    user_map_page((uint64_t*)(uintptr_t)pml4_phys, vaddr, paddr, flags);
-    return 0;
+    /* NOT user_map_page(): the child's PML4 shares the kernel's low identity
+     * map by pointer (supervisor 2 MiB huge pages), and get_or_alloc() would
+     * treat a present huge-page PD entry as a table pointer — writing the
+     * leaf PTE through physical memory. The DEV-window scan (k_dev_mmap)
+     * starts at 0x100000, squarely inside that map, so the unsafe walk
+     * corrupted kernel frames and left the window unmapped (user reads
+     * faulted as present+supervisor). Same fix create_sidecar's MEM caps got
+     * via user_map_identity(). */
+    return user_map_page_safe((uint64_t*)(uintptr_t)pml4_phys, vaddr, paddr,
+                              flags);
 }
 
 int cap_arch_unmap_page(uint64_t pml4_phys, uint64_t vaddr) {

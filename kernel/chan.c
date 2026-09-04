@@ -499,8 +499,20 @@ int k_io_out(uint32_t pid, uint16_t slot, uint16_t index, uint8_t size,
 /* ─── k_dev_mmap (driver SDK ABI v0.1 §4.1) ────────────────────────────────
  * Map a CAP_TYPE_DEV cap (an object-backed MMIO region) into the caller's
  * address space. Window logic mirrors cap_map(): hint honored when
- * 4-KiB-aligned, free of other mappings, and inside the user half; a
- * zero/busy hint picks the first free window scanned upward from 1 MiB.
+ * 4-KiB-aligned, free of other mappings, at or above DEV_MMAP_WINDOW_BASE,
+ * and inside the user half; a zero/busy hint picks the first free window
+ * scanned upward from DEV_MMAP_WINDOW_BASE.
+ *
+ * DEV_MMAP_WINDOW_BASE is deliberately ABOVE the kernel's 0-4 GiB identity
+ * map: sidecar syscalls run with the caller's CR3 active, and the user PML4
+ * shares that identity map by pointer (clone_kernel_slots). A window below
+ * 4 GiB replaces a kernel text/data page with the device's MMIO in the
+ * ACTIVE page tables — observed under QEMU: a window at 0x100000 turned the
+ * kernel's first text page into an NX BAR0 mapping and the very next
+ * instruction fetch triple-faulted. Base 0x100000000 (4 GiB) is clear of
+ * the identity map, the kernel stack (~0xe0000000), and the user binaries
+ * at USER_PROC_CODE_BASE (0x400000000000).
+ *
  * The same cap maps once: an existing map record for the object id
  * returns the original vaddr. Caching bits (WC/uncached) ride the cap
  * perms word into cap_arch_map_page, which the strong arch override
@@ -520,6 +532,7 @@ static int dev_mmaps_overlap(const struct CapTable* t, uint64_t vaddr,
 }
 
 #define DEV_MMAP_USER_LIMIT  0x800000000000ULL   /* 47-bit user half */
+#define DEV_MMAP_WINDOW_BASE 0x100000000ULL      /* above the 0-4 GiB identity map */
 
 int k_dev_mmap(uint32_t pid, uint16_t slot, uint32_t flags,
                uint64_t vaddr_hint, uint64_t* out_vaddr) {
@@ -558,14 +571,17 @@ int k_dev_mmap(uint32_t pid, uint16_t slot, uint32_t flags,
         }
     }
 
-    /* Pick the window: hint honored when usable, else scan from 1 MiB. */
+    /* Pick the window: hint honored when usable (and at/above the identity
+     * map — a low hint would alias kernel text/data in the active PML4),
+     * else scan from DEV_MMAP_WINDOW_BASE. */
     uint64_t vaddr = 0;
-    if ((vaddr_hint & 0xFFFULL) == 0 && vaddr_hint != 0 &&
+    if (vaddr_hint >= DEV_MMAP_WINDOW_BASE &&
+        (vaddr_hint & 0xFFFULL) == 0 &&
         vaddr_hint + (uint64_t)len * 4096u <= DEV_MMAP_USER_LIMIT &&
         !dev_mmaps_overlap(t, vaddr_hint, len)) {
         vaddr = vaddr_hint;
     } else {
-        for (vaddr = 0x100000ULL; vaddr < DEV_MMAP_USER_LIMIT;
+        for (vaddr = DEV_MMAP_WINDOW_BASE; vaddr < DEV_MMAP_USER_LIMIT;
              vaddr += 0x1000ULL) {
             if (dev_mmaps_overlap(t, vaddr, len)) continue;
             if (vaddr + (uint64_t)len * 4096u > DEV_MMAP_USER_LIMIT) break;

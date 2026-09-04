@@ -81,7 +81,9 @@ uint64_t cap_proc_cr3(uint32_t pid) { return pid ? g_fake_cr3 : 0; }
 /* ─── Fake page table: one 64-bit entry per (vaddr >> 12) ─────────────────
  * Records (paddr, perms) so the test can assert the kernel's mapping
  * choices. Also counts calls to check rollback/unmap behavior. */
-#define FAKE_PT_ENTRIES (1u << 20)
+/* Windows sit at/above DEV_MMAP_WINDOW_BASE (0x100000000, 4 GiB — above the
+ * kernel's 0-4 GiB identity map), so the fake table must span that range. */
+#define FAKE_PT_ENTRIES (1u << 21)
 static uint64_t g_fake_pt[FAKE_PT_ENTRIES];
 static int g_map_calls = 0;
 static int g_unmap_calls = 0;
@@ -159,23 +161,23 @@ int main(void) {
     uint16_t d = 4;
     mint_dev(P, d, dev_word(dev_obj, 0 /*off*/, 2 /*pages*/, CAP_PERM_R | CAP_PERM_W));
     uint64_t v = 0;
-    CHECK(k_dev_mmap(P, d, 0, 0x40000000ULL, &v) == CAP_ERR_OK,
+    CHECK(k_dev_mmap(P, d, 0, 0x100000000ULL, &v) == CAP_ERR_OK,
           "map with hint succeeds");
-    CHECK(v == 0x40000000ULL, "hint honored");
+    CHECK(v == 0x100000000ULL, "hint honored");
     CHECK(g_map_calls == 2, "two pages mapped");
-    CHECK((g_fake_pt[0x40000] & 0xFFFFFFFFFFF000ULL) == 0xF0000000ULL,
+    CHECK((g_fake_pt[0x100000] & 0xFFFFFFFFFFF000ULL) == 0xF0000000ULL,
           "page 0 maps physical 0xF0000000");
-    CHECK((g_fake_pt[0x40001] & 0xFFFFFFFFFFF000ULL) == 0xF0001000ULL,
+    CHECK((g_fake_pt[0x100001] & 0xFFFFFFFFFFF000ULL) == 0xF0001000ULL,
           "page 1 maps physical 0xF0001000");
-    CHECK((g_fake_pt[0x40000] & (CAP_PERM_R | CAP_PERM_W)) ==
+    CHECK((g_fake_pt[0x100000] & (CAP_PERM_R | CAP_PERM_W)) ==
           (CAP_PERM_R | CAP_PERM_W), "PTE carries R|W perms");
-    CHECK(!(g_fake_pt[0x40000] & CAP_PERM_X), "PTE is not executable");
+    CHECK(!(g_fake_pt[0x100000] & CAP_PERM_X), "PTE is not executable");
 
     /* ── 2. idempotent: same cap maps once ─────────────────────────────── */
     uint64_t v2 = 0;
-    CHECK(k_dev_mmap(P, d, 0, 0x50000000ULL, &v2) == CAP_ERR_OK,
+    CHECK(k_dev_mmap(P, d, 0, 0x100001000ULL, &v2) == CAP_ERR_OK,
           "second call succeeds");
-    CHECK(v2 == 0x40000000ULL, "second call returns the SAME vaddr");
+    CHECK(v2 == 0x100000000ULL, "second call returns the SAME vaddr");
     CHECK(g_map_calls == 2, "no new pages mapped on the second call");
 
     /* ── 3. overlapping hint picks a different window ──────────────────── */
@@ -183,11 +185,11 @@ int main(void) {
     uint16_t d2 = 5;
     mint_dev(P, d2, dev_word(dev2, 0, 2, CAP_PERM_R));
     uint64_t v3 = 0;
-    CHECK(k_dev_mmap(P, d2, 0, 0x40000000ULL, &v3) == CAP_ERR_OK,
+    CHECK(k_dev_mmap(P, d2, 0, 0x100000000ULL, &v3) == CAP_ERR_OK,
           "busy hint still maps");
-    CHECK(v3 != 0x40000000ULL, "busy hint falls back to another window");
-    CHECK((v3 & 0xFFFULL) == 0 && v3 < 0x800000000000ULL,
-          "fallback window is aligned and in the user half");
+    CHECK(v3 != 0x100000000ULL, "busy hint falls back to another window");
+    CHECK((v3 & 0xFFFULL) == 0 && v3 >= 0x100000000ULL && v3 < 0x800000000000ULL,
+          "fallback window is aligned, above the identity map, in the user half");
     CHECK((g_fake_pt[v3 >> 12] & 0xFFFFFFFFFFF000ULL) == 0xE0000000ULL,
           "fallback maps the new region's physical base");
 
@@ -196,17 +198,17 @@ int main(void) {
     uint16_t d3 = 6;
     mint_dev(P, d3, dev_word(dev3, 0, 1, CAP_PERM_R | CAP_PERM_W));
     uint64_t v4 = 0;
-    CHECK(k_dev_mmap(P, d3, DEV_MMAP_WC, 0x60000000ULL, &v4) == CAP_ERR_OK,
+    CHECK(k_dev_mmap(P, d3, DEV_MMAP_WC, 0x100004000ULL, &v4) == CAP_ERR_OK,
           "WC mapping succeeds");
-    CHECK((g_fake_pt[0x60000] & CAP_PERM_DEV_WC) != 0,
+    CHECK((g_fake_pt[0x100004] & CAP_PERM_DEV_WC) != 0,
           "WC flag reaches cap_arch_map_page (→ PWT in the real arch hook)");
     uint32_t dev4 = plant_dev_object(0xC0000000ULL, 4096);
     uint16_t d4 = 7;
     mint_dev(P, d4, dev_word(dev4, 0, 1, CAP_PERM_R | CAP_PERM_W));
     uint64_t v5 = 0;
-    CHECK(k_dev_mmap(P, d4, DEV_MMAP_UNCACHED, 0x61000000ULL, &v5) == CAP_ERR_OK,
+    CHECK(k_dev_mmap(P, d4, DEV_MMAP_UNCACHED, 0x100005000ULL, &v5) == CAP_ERR_OK,
           "uncached mapping succeeds");
-    CHECK((g_fake_pt[0x61000] & CAP_PERM_DEV_UC) != 0,
+    CHECK((g_fake_pt[0x100005] & CAP_PERM_DEV_UC) != 0,
           "uncached flag reaches cap_arch_map_page (→ PCD in the real arch hook)");
 
     /* ── 5. rights ─────────────────────────────────────────────────────── */
@@ -254,9 +256,9 @@ int main(void) {
     struct SLSDevMmapRequest req;
     memset(&req, 0, sizeof(req));
     req.slot = d;
-    req.vaddr_hint = 0x63000000ULL;
+    req.vaddr_hint = 0x100006000ULL;
     CHECK(sys_sls_dev_mmap(&req) == CAP_ERR_OK, "sys_sls_dev_mmap wrapper ok");
-    CHECK(req.out_vaddr == 0x40000000ULL,
+    CHECK(req.out_vaddr == 0x100000000ULL,
           "wrapper reports the already-mapped vaddr (same cap)");
     CHECK(sys_sls_dev_mmap(NULL) == CAP_ERR_PROTO, "NULL request is CAP_ERR_PROTO");
 

@@ -14,6 +14,12 @@ extern void kernel_serial_printf(const char* fmt, ...);
  * rather than widening that header for one constant. */
 #define MB2_TAG_CMDLINE 1
 
+/* Multiboot v1 — the Phase 5 boot path (grub `multiboot`; see the v1 arm
+ * in boot_params_scan_mb2()). GRUB passes 0x2BADB002 (0x1BADB002 | 1) and
+ * the info struct's cmdline field at +16 is valid when flag bit 2 is set. */
+#define MB1_MAGIC        0x2BADB002u
+#define MB1_FLAG_CMDLINE (1u << 2)
+
 static char  bp_cmdline[BOOT_CMDLINE_MAX] = { 0 };
 
 /* ─── local helpers ────────────────────────────────────────────────────────
@@ -99,6 +105,30 @@ int boot_params_find_str(const char* cmdline, const char* key,
 
 void boot_params_scan_mb2(uint32_t mb2_magic, uint32_t mb2_phys) {
     bp_cmdline[0] = '\0';
+
+    /* ── Multiboot v1 path ──────────────────────────────────────────────
+     * The Phase 5 grub.cfg boots with `multiboot` (v1) — GRUB 2.12's
+     * `module` command (the sidecars.cpio initrd) only works with v1, not
+     * `multiboot2` (boot_image.c documents this) — so the boot command
+     * line arrives in the v1 info struct, not the v2 tag list below:
+     * flags at +0, the cmdline pointer at +16, valid when flag bit 2 is
+     * set. Without this arm the line is always empty on real boots and
+     * every assignment silently falls back (observed: a two-NIC smoke
+     * expecting grub `nic0=both nic1=none` got "no nicN= given"). */
+    if (mb2_magic == MB1_MAGIC) {
+        if (mb2_phys == 0) return;
+        const uint32_t* info1 = (const uint32_t*)(uintptr_t)mb2_phys;
+        if (!(info1[0] & MB1_FLAG_CMDLINE)) return;
+        const char* src = (const char*)(uintptr_t)info1[4];
+        if (src == 0) return;
+        uint32_t n = 0;
+        while (n < (uint32_t)(BOOT_CMDLINE_MAX - 1) && src[n] != '\0') {
+            bp_cmdline[n] = src[n];
+            n++;
+        }
+        bp_cmdline[n] = '\0';
+        return;
+    }
 
     if (mb2_magic != (uint32_t)MULTIBOOT2_MAGIC) return;
     if (mb2_phys == 0) return;

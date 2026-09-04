@@ -41,6 +41,11 @@
  * boot_params_find_uint() is pure string handling over a caller-supplied
  * buffer, so it is host-testable without a multiboot2 environment. Only
  * boot_params_scan_mb2() touches the tag structures.
+ *
+ * boot_params_scan_mb2() is named for the v2 tag walk but also handles the
+ * multiboot v1 struct — the Phase 5 grub.cfg boots v1 (GRUB 2.12's
+ * `module` command works only there), and without the v1 arm the command
+ * line was always empty on real boots.
  */
 #ifndef BOOT_PARAMS_H
 #define BOOT_PARAMS_H

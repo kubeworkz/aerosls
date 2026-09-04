@@ -168,6 +168,23 @@ static uint32_t build_mb2(const char* cmdline, uint32_t forced_tag_size) {
     return (uint32_t)(uintptr_t)mb2_buf;
 }
 
+/* ─── a synthetic multiboot v1 info block ─────────────────────────────────
+ * Same MAP_32BIT requirement: the v1 struct's cmdline field (+16) is a
+ * 32-bit pointer into the buffer, so the whole block must sit below 4 GiB.
+ * Real GRUB passes 0x2BADB002 with the cmdline pointer valid when flag
+ * bit 2 is set — mirror exactly that shape. */
+static uint32_t build_mb1(const char* cmdline, int with_flag) {
+    memset(mb2_buf, 0, MB2_BUF_SIZE);
+    uint32_t* info1 = (uint32_t*)mb2_buf;
+    if (cmdline) {
+        char* dst = (char*)mb2_buf + 256;
+        strcpy(dst, cmdline);
+        info1[4] = (uint32_t)(uintptr_t)dst;
+        if (with_flag) info1[0] |= 1u << 2;   /* bit 2: cmdline valid */
+    }
+    return (uint32_t)(uintptr_t)mb2_buf;
+}
+
 int main(void) {
     printf("=== Phase 1: boot-time node identity (CLUSTER_NODE_MAX=%u) ===\n\n",
            (unsigned)CLUSTER_NODE_MAX);
@@ -286,6 +303,32 @@ int main(void) {
         boot_params_scan_mb2((uint32_t)MULTIBOOT2_MAGIC, phys);
         CHECK(boot_params_cmdline()[0] == '\0',
               "a tag list with no cmdline tag yields an empty string, never NULL");
+    }
+
+    /* ═══ 2b: the multiboot v1 struct (the Phase 5 boot path) ════════════ */
+    printf("\n-- 2b: reading the command line out of the v1 info struct --\n");
+    {
+        uint32_t phys = build_mb1("nic0=both nic1=none", 1);
+        boot_params_scan_mb2(0x2BADB002u, phys);
+        CHECK(!strcmp(boot_params_cmdline(), "nic0=both nic1=none"),
+              "the v1 cmdline field is found and copied");
+        char v[32];
+        CHECK(boot_params_find_str(boot_params_cmdline(), "nic0", v, sizeof(v)) &&
+              !strcmp(v, "both"), "...and role keys parse from it (e1000_assign_roles input)");
+
+        phys = build_mb1(NULL, 0);
+        boot_params_scan_mb2(0x2BADB002u, phys);
+        CHECK(boot_params_cmdline()[0] == '\0',
+              "v1 without the cmdline flag bit yields an empty line, never NULL");
+
+        boot_params_scan_mb2(0x2BADB002u, 0);
+        CHECK(boot_params_cmdline()[0] == '\0', "a null v1 info pointer is safe");
+
+        /* The v2 magic must still be rejected on the v1 arm and vice versa: a
+         * stale line from the other boot protocol must not leak through. */
+        boot_params_scan_mb2(0x2BADB002u, build_mb2("node=5 quiet", 0));
+        CHECK(boot_params_cmdline()[0] == '\0',
+              "a v2 tag block under the v1 magic yields no command line");
     }
 
     /* ═══ 3: identity is applied, and only in range ═══════════════════════ */
