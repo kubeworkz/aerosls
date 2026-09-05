@@ -356,8 +356,20 @@ fi
 W="$(mktemp -d)"
 IMG="$W/disk.img"
 LOG="$W/boot.log"
+SER="$W/ser"
 QPID=""
-cleanup() { [ -n "$QPID" ] && kill "$QPID" 2>/dev/null || true; rm -rf "$W"; }
+CATPID=""
+# The serial backend must be BIDIRECTIONAL (a pipe, not a file): this
+# check's guest is the classic kernel HTTP world (grub entry "kernel
+# only"), which the helper selects by sending keys into the serial input
+# fifo before grub's countdown auto-boots the Phase 5 initrd entry (see
+# tests/grub_select_kernel_only.sh). Guest output still lands in $LOG via
+# the cat, exactly like the old -serial file:.
+rm -f "$SER.in" "$SER.out"
+mkfifo "$SER.in" "$SER.out" 2>/dev/null || true
+cat "$SER.out" > "$LOG" &
+CATPID=$!
+cleanup() { [ -n "$QPID" ] && kill "$QPID" 2>/dev/null || true; [ -n "$CATPID" ] && kill "$CATPID" 2>/dev/null || true; rm -rf "$W"; }
 trap cleanup EXIT
 
 qemu-img create -f raw "$IMG" 10G >/dev/null 2>&1
@@ -388,8 +400,17 @@ qemu-system-x86_64 -cdrom "$ISO" \
     -device e1000,netdev=net0,mac=52:54:00:12:34:01 \
     -display none -m 1G -smp 1 -boot d -monitor none \
     $ACCEL \
-    -serial file:"$LOG" 2>/dev/null &
+    -serial pipe:"$SER" 2>/dev/null &
 QPID=$!
+
+# Select grub's "kernel only" entry before the countdown auto-boots the
+# Phase 5 initrd entry (which never starts the HTTP server this check
+# polls — see tests/grub_select_kernel_only.sh).
+bash tests/grub_select_kernel_only.sh "$SER.in" "$LOG" "$QPID" || {
+    echo "FAIL  could not select the 'kernel only' grub entry (QEMU or grub failed)" >&2
+    tail -20 "$LOG" >&2
+    exit 1
+}
 
 wait_health() {   # $1 = label (for the failure message)
     for i in $(seq 1 90); do
@@ -428,9 +449,25 @@ body="$(curl -s -X POST "http://127.0.0.1:$PORT/api/checkpoint" \
 printf '%s' "$body" > "$W/checkpoint.json"
 
 # ─── Reboot. The reset lands mid-response, so the curl "fails" — expected. ─
+# The curl is BACKGROUNDED: the reset tears the connection down whenever
+# the kernel processes the request, and the helper below must already be
+# polling by then — a synchronous curl can block until its 10 s max-time
+# (the reset never completes the response), by which point grub's warm
+# menu has rendered AND its 3 s countdown has auto-booted entry 0, and the
+# helper's stale-offset poll can never catch a menu it never saw.
 curl -s -X POST "http://127.0.0.1:$PORT/api/node/reboot" \
     -H "Authorization: Bearer $TOK" -d '{"confirm":"reboot"}' --max-time 10 \
-    >/dev/null 2>&1 || true
+    >/dev/null 2>&1 &
+
+# The reboot resets the machine in place: grub runs again and its
+# countdown would auto-boot the Phase 5 entry for the warm boot too, so
+# select "kernel only" once more (the helper only matches a menu render
+# newer than its own start, so this cannot hit the first boot's menu).
+bash tests/grub_select_kernel_only.sh "$SER.in" "$LOG" "$QPID" || {
+    echo "FAIL  could not select the 'kernel only' grub entry after reboot" >&2
+    tail -20 "$LOG" >&2
+    exit 1
+}
 
 if ! wait_health "warm boot"; then
     tail -20 "$LOG" >&2

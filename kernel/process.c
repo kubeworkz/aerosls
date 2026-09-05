@@ -1471,6 +1471,10 @@ void cap_wake_chan(uint32_t chan_id) {
          * others run at their next schedule. */
         struct ProcessDescriptor* cur = process_find_current();
         if (cur) cur->handoff_target = pd;
+        /* Wake diagnostics — the aerocap_boot_check guard's overlap phase
+         * greps this exact line to prove the send-side wake ran. */
+        kernel_serial_printf("[CAP] woken PID %u (channel %u)\n",
+                             pd->pid, chan_id);
         /* no return: keep waking every process parked on this channel */
     }
 }
@@ -1498,6 +1502,8 @@ void cap_maybe_handoff(void) {
     proc_capture_entry_regs(&cur->park_ctx);
     cur->state         = PROC_SUSPENDED;
     cur->resume_sysret = 1;
+    kernel_serial_printf("[CAP] send handoff: PID %u -> %u\n",
+                         cur->pid, target->pid);
     kernel_switch_next(target);   /* noreturn — target resumes via cap_recv_resume */
     __builtin_unreachable();
 }
@@ -1579,6 +1585,8 @@ uint32_t sys_sls_yield(void) {
     proc_capture_entry_regs(&cur->park_ctx);
     cur->state         = PROC_SUSPENDED;
     cur->resume_sysret = 1;
+    kernel_serial_printf("[PROC] PID %u yielded to PID %u\n",
+                         cur->pid, next->pid);
     kernel_switch_next(next);   /* noreturn */
     __builtin_unreachable();
 }

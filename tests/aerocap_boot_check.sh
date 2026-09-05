@@ -97,6 +97,16 @@ cleanup() { kill ${QPID:-} 2>/dev/null; kill ${CATPID:-} 2>/dev/null; rm -rf ${W
 trap cleanup EXIT
 trap 'cleanup; exit 1' TERM INT
 
+# Select grub's "kernel only" entry (menu entry 1) before the 3 s
+# countdown auto-boots the Phase 5 self-hosted entry: the initrd boot
+# hands the machine to the init sidecar and never starts the kernel HTTP
+# server this check asserts (see tests/grub_select_kernel_only.sh).
+bash tests/grub_select_kernel_only.sh "$SER.in" boot_aerocap.log "$QPID" || {
+    echo "FAILED: could not select the 'kernel only' grub entry (QEMU or grub failed)" >&2
+    kill "$QPID" 2>/dev/null
+    exit 1
+}
+
 # Wait for the HTTP API to come up (boot log prints the listener line).
 saw_http=0
 for i in $(seq 1 120); do
