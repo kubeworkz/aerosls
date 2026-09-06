@@ -360,6 +360,21 @@ static uint32_t user_free_subtree(uint64_t* tbl, int depth, uint32_t* seen) {
     for (int i = 0; i < 512; i++) {
         uint64_t e = tbl[i];
         if (!(e & USER_PTE_PRESENT)) continue;
+        /* Kernel-half slots are shared by pointer with the kernel
+         * (clone_kernel_slots; own_table(copy_existing=1) also copies kernel
+         * entries into the child's own tables) and are NEVER this process's
+         * property — neither the 2 MiB identity huge pages nor the shared
+         * intermediate tables. The U/S check below is load-bearing: without
+         * it every process exit freed supervisor huge-page frames out of
+         * the shared kernel identity map, handing live RAM (other sidecars'
+         * stacks/images, kernel infrastructure) back to the pool — observed
+         * as the parked network driver's user stack being zeroed by the
+         * respawned process's freshly allocated PML4 and the driver
+         * resuming to a NULL return address. A us=0 leaf inside a
+         * process-owned table (own_table's replicated identity chunk, a
+         * supervisor-flagged DEV map) aliases a frame owned by someone
+         * else; skipping it leaks nothing — its true owner frees it. */
+        if (!(e & USER_PTE_USER)) continue;
         /* Leaf test mirrors clone_user_levels(): PTEs at depth 3 are
          * leaves; at depths 1-2 a set PS bit (bit 7) marks a 1 GiB / 2 MiB
          * large page — also a leaf. (At depth 3 bit 7 is PAT, hence the

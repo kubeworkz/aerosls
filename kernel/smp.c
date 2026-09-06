@@ -3,6 +3,7 @@
 #include "../arch/x86/lapic.h"
 #include "microkernel.h"
 #include "smp.h"
+#include "console_service.h"  /* deferred uniprocessor console drain */
 
 extern void* allocate_physical_ram_frame(void);
 extern void ap_kernel_main(void);
@@ -101,6 +102,12 @@ void smp_uniprocessor_tick(void) {
     flush_daemon_tick();
     microkernel_service_poll();
     qemu_sls_pgo_scan_tick();
+    /* Uniprocessor fallback for the console drain: the timer ISR only
+     * latches console_service_irq_defer()'s pending flag (running the
+     * drain inside the IRQ deadlocks on cap spinlocks — see
+     * console_service.h). This is the process-context consumer; on SMP
+     * boots the AP's microkernel_service_poll already covers the drain. */
+    console_service_deferred_tick();
 }
 
 // Executed concurrently by Core 1 and Core 2 when they leave the trampoline

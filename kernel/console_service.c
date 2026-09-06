@@ -125,3 +125,20 @@ void console_service_tick(void) {
 uint32_t console_service_drained(void) {
     return console_svc_drained;
 }
+
+/* ─── IRQ deferral (see console_service.h) ────────────────────────────────
+ * timer_irq_handler latches this instead of running the drain in interrupt
+ * context; smp_uniprocessor_tick consumes it in process context. On SMP
+ * boots the AP's microkernel_service_poll already drains every 10 ticks, so
+ * a latched-but-unconsumed tick is harmless (one extra drain at most). */
+static volatile int console_tick_pending;
+
+void console_service_irq_defer(void) {
+    console_tick_pending = 1;
+}
+
+void console_service_deferred_tick(void) {
+    if (!__atomic_exchange_n(&console_tick_pending, 0, __ATOMIC_ACQUIRE))
+        return;
+    console_service_tick();
+}
