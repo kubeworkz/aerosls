@@ -62,6 +62,31 @@ void read_line(char* buf);
 int console_feed(char c, char* out, size_t cap);
 void console_reset_line(void);
 
+/* ─── UART loopback ownership (irqtest demo interlock) ──────────────────────
+ * While a ring-3 probe drives COM1 in MCR-loopback mode (the irqtest
+ * serial demo), the RX path IS the experiment: the bytes deliberately
+ * left in RBR hold the IRQ4 line at a known level, and every byte the
+ * kernel injects (TX) or drains (console poll) manufactures or destroys
+ * line transitions the probe is trying to count (caught live: phase 2
+ * 0/10, ch=edge, and the stuck-driver ch=leak FAIL — all caused by the
+ * kernel's loopback-drain eating bait bytes inside QEMU's RX-CTI window
+ * and by kernel banner prints looping back as foreign RX bytes).
+ *
+ * serial_console_poll() sets ownership when it sees the MCR loopback bit
+ * and releases it when the bit reads clear; cap_io_write() sets it the
+ * instant a user-space MCR write turns the bit on and clears it at the
+ * MCR-off write — the probe's post-clear verdict prints are kernel TX
+ * (sidecar output routes through the console service) and must reach the
+ * wire from that instruction onward. While owned, the kernel does NOT
+ * transmit and does NOT touch the RX FIFO. Purely x86-hardware state —
+ * host builds never set the flag. */
+/* Weak declarations: the state lives in kernel_io.c, but arch TUs that
+ * consume the hooks (cap_io_write's MCR hand-off) are also linked by host
+ * tests WITHOUT kernel_io.c — the same host-link pattern cap.c's arch
+ * hooks use. Call sites outside kernel_io.c must null-check. */
+void serial_loopback_ownership_set(int owned) __attribute__((weak));
+int  serial_loopback_ownership(void)          __attribute__((weak));
+
 /* Drain whatever the UART has, up to a bounded number of bytes, feeding
  * each to console_feed(). Returns the LENGTH of the completed line in
  * `out` (NUL-terminated by the editor, terminator stripped) as soon as a

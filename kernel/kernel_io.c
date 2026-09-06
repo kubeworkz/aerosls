@@ -34,7 +34,18 @@ void serial_init(void) {
     outb(SERIAL_COM1_BASE + 4, 0x03); // RTS + DTR asserted
 }
 
-// ─── Output capture (see kernel_io.h's own header comment) ────────────────────
+// ─── UART loopback ownership (irqtest demo interlock) ───────────────────────
+// See kernel_io.h. While a ring-3 probe (the irqtest serial demo) holds
+// COM1 in MCR loopback, the kernel must not transmit (every TX byte loops
+// back as a foreign RX byte) and must not drain the RX FIFO (the bytes the
+// probe deliberately leaves in RBR hold the IRQ4 line at a known level;
+// draining them inside QEMU's RX-CTI window destroys the very edges the
+// demo counts).
+static volatile int g_serial_loopback_owned = 0;
+void serial_loopback_ownership_set(int owned) { g_serial_loopback_owned = owned; }
+int  serial_loopback_ownership(void)          { return g_serial_loopback_owned; }
+
+// ─── Output capture (see kernel_io.h's own header comment) ────────────────
 static char*  capture_buf = 0;
 static size_t capture_len = 0;
 static size_t capture_cap = 0;
@@ -151,6 +162,13 @@ void kernel_panic_dec(uint64_t v) {
 
 // ─── Output primitives ────────────────────────────────────────────────────────
 void kernel_serial_putchar(char c) {
+    /* Loopback ownership: while the probe owns the port, kernel TX is
+     * suppressed entirely — every byte would loop back into the probe's
+     * own RX stream (loopback internalizes TX→RX before the wire, so a
+     * wire print during the demo is both lost AND an interference).
+     * Suppression ends at ownership release (one release poll after the
+     * MCR bit clears, see serial_console_poll below). */
+    if (serial_loopback_ownership()) return;
     if (capture_buf) {
         // Bounds-checked append; leave room for the NUL capture_stop() writes.
         if (capture_len + 1 < capture_cap) capture_buf[capture_len] = c;
@@ -300,22 +318,36 @@ int serial_console_poll(char* out, size_t cap) {
      * poll and would otherwise be absorbed into console_feed's line
      * editor, then merge with the first real line typed after boot
      * (caught live: "Acaps" exec'd instead of "caps", silently dropping
-     * the first typed command). While loopback is on, DISCARD the FIFO
-     * (the demo drains what it needs); and when loopback just cleared,
-     * discard any residue and reset the partial line before real input
-     * can mix with it. */
+     * the first typed command).
+     *
+     * Ownership discipline (see kernel_io.h): while the demo holds the
+     * port, this poll does NOT drain the RX FIFO — the bytes the probe
+     * deliberately leaves in RBR hold the IRQ4 line at a known level, and
+     * draining them inside QEMU's RX-CTI window destroys the very edges
+     * the demo counts (caught live: the old "discard while loopback is
+     * on" rule turned phase 2 into 0/10 and manufactured the phantom
+     * stuck-driver ch=leak FAIL). The MCR bit is re-checked FIRST on
+     * every poll so a phase-2→3 re-entry during the release sequence is
+     * caught; release takes two polls (residue flush, then ring dump +
+     * ownership hand-back) so the probe's own post-clear drain gets a
+     * poll window before kernel TX resumes. */
     static int prev_loopback = 0;
     if (inb(SERIAL_COM1_BASE + 4) & 0x10) {
-        while (inb(SERIAL_COM1_BASE + 5) & 0x01)
-            (void)inb(SERIAL_COM1_BASE);
+        serial_loopback_ownership_set(1);
         prev_loopback = 1;
         return 0;
     }
-    if (prev_loopback) {
+    if (prev_loopback || serial_loopback_ownership()) {
+        /* Either the poll observed the loopback bit clear, or ownership
+         * was left set by a path cap_io_write did not see. cap_io_write
+         * normally clears ownership AT the probe's MCR-off write (the
+         * probe's post-clear verdict prints are kernel TX and must reach
+         * the wire immediately); this branch is the fallback. */
         while (inb(SERIAL_COM1_BASE + 5) & 0x01)
             (void)inb(SERIAL_COM1_BASE);
         console_reset_line();
         prev_loopback = 0;
+        serial_loopback_ownership_set(0);
         return 0;
     }
     for (int n = 0; n < CONSOLE_DRAIN_MAX; n++) {

@@ -488,6 +488,16 @@ uint32_t cap_io_read(uint16_t port, uint8_t size) {
 }
 
 void cap_io_write(uint16_t port, uint8_t size, uint32_t val) {
+    /* IRQ4 ownership hand-off (see kernel_io.h): a ring-3 MCR write to
+     * COM1 transfers the port to/from the probe at the write itself —
+     * ON (bit 4 set): kernel serial TX and the console poll's RX
+     * handling stand down from that instruction onward; OFF: kernel TX
+     * resumes immediately so the probe's post-clear verdict prints
+     * reach the wire. The poll-side branch keeps ownership refreshed and
+     * releases it as a fallback. Byte-size writes only: the probe
+     * programs the 16550 with single outb. */
+    if (size == 1 && port == 0x3FCu && serial_loopback_ownership_set)
+        serial_loopback_ownership_set((val & 0x10u) ? 1 : 0);
     switch (size) {
     case 1:
         __asm__ volatile("outb %0, %1" : : "a"((uint8_t)val), "Nd"(port));
