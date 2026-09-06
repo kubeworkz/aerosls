@@ -28,8 +28,20 @@
  * lingers in the kernel context table. */
 
 /* Drain every kernel-context console channel once. Call from
- * microkernel_service_poll(). */
+ * microkernel_service_poll().
+ *
+ * IRQ DEFERRAL: console_service_tick takes cap spinlocks, and the timer ISR
+ * historically called it directly as the uniprocessor fallback — a plain
+ * spinlock can deadlock when the timer fires on CPU0 while a process-context
+ * cap op holds the same lock (the ISR spins on its own interrupted holder,
+ * IF=0, forever; observed live as the parked machine of the e1000
+ * first-nettest freeze, RIP on cap_recv_msg's xchg retry, RFLAGS=0x2).
+ * timer_irq_handler therefore only LATCHES a pending flag here, and the
+ * actual drain runs in process context from smp_uniprocessor_tick (the same
+ * context the SMP path already uses). */
+void console_service_irq_defer(void);
 void console_service_tick(void);
+void console_service_deferred_tick(void);
 
 /* Total messages drained so far (diagnostics / host tests). */
 uint32_t console_service_drained(void);

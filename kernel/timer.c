@@ -24,9 +24,13 @@ void timer_irq_handler(void) {
     cap_park_deadline_tick();
     /* BSP-side console drain: when the AP core never comes online
      * (uniprocessor QEMU), microkernel_service_poll() never runs,
-     * so console_service_tick() must fire here to drain sidecars'
-     * wired console channels to serial. */
-    console_service_tick();
+     * so the console sidecar channels must still be drained here.
+     * console_service_tick takes cap spinlocks — running it directly in
+     * this IRQ deadlocks when the timer fires while a process-context cap
+     * op holds the same lock (the ISR spins on its own interrupted
+     * holder). Latch a pending flag instead; smp_uniprocessor_tick
+     * consumes it in process context. */
+    console_service_irq_defer();
     /* Driver SDK: the LAPIC timer is a real device edge. When a sidecar
      * has bound vector 32 (k_irq_bind), deliver the tick as a channel
      * notification; unbound, cap_irq_notify is a silent no-op. Woken

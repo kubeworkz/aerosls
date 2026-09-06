@@ -195,8 +195,32 @@ int k_chan_wait(uint32_t pid, const uint16_t* chans, uint32_t n,
      * nothing can enqueue between the last poll and the waiting-set
      * registration. The weak default (host tests) returns 0 →
      * CAP_ERR_TIMEOUT, preserving scan-once semantics. */
-    if (deadline != 0 && kernel_tick_counter >= deadline)
+    if (deadline != 0 && kernel_tick_counter >= deadline) {
+        /* SMP hardening (the e1000 first-nettest tail flake): with sidecars
+         * on multiple cores, a sender can enqueue between our poll above
+         * and this deadline check — its cap_wake_chan then finds nobody
+         * BLOCKED (we are RUNNING mid-syscall) and the wake is lost; the
+         * pre-check would return TIMEOUT stranding an already-sent
+         * message (observed live: NETBOOT FAILED 0xA with the tag=1 reply
+         * still queued in the NET channel). One final locked poll here:
+         * the sender's queue unlock happens-before this lock acquisition,
+         * so any enqueue that completed before we decided is seen. */
+        for (uint32_t i = 0; i < n; i++) {
+            struct CapChannel* ch = &cap_channels[chan_ids[i]];
+            int d = dirs[i];
+            cap_lock(&ch->lock);
+            int ready = (ch->qdepth[d] > 0);
+            uint16_t kind = CH_KIND_MSG;
+            if (!ready && ch->close_evt[d]) { ready = 1; kind = CH_KIND_CLOSE; }
+            cap_unlock(&ch->lock);
+            if (ready) {
+                *out_idx = i;
+                *out_kind = kind;
+                return CAP_ERR_OK;
+            }
+        }
         return CAP_ERR_TIMEOUT;   /* deadline elapsed; nothing arrived */
+    }
     cap_wait_chans(chan_ids, n, req, SYS_SLS_CHAN_WAIT, deadline);
     /* noreturn when it parks. If it returned (couldn't park / hlt woke),
      * re-check the queues — the message may have arrived during the hlt.
