@@ -2237,9 +2237,17 @@ void cap_irq_notify(uint32_t vector) {
      * every EOI (the emulated IO-APIC latches the level), wedging the
      * kernel in an ISR storm that starves user code. Mask first, then
      * enqueue + EOI; the driver re-arms with k_irq_mask after servicing
-     * the device. The LAPIC timer (vector 32) is unaffected — its edges
-     * come from the local LAPIC, not the IO-APIC pin. */
-    if (vector >= 0x20u) cap_irq_set_mask(vector, 1);
+     * the device.
+     *
+     * Vector 32 (the LAPIC timer) is deliberately EXCLUDED: its edges
+     * come from the local LAPIC's LVT timer, not the IO-APIC — masking
+     * RTE 0 here would gate pin 0 (the PIT/IRQ0 line) behind a timer
+     * event and, worse, put a needless IO-APIC RTE write on the
+     * interrupt stack twice per tick, contending with the irqsave RTE
+     * lock and racing genuine device self-masks (the serial pin) that
+     * arrive from the same stack. Self-masking a pin only makes sense
+     * when the RTE actually delivered the edge. */
+    if (vector >= 0x21u) cap_irq_set_mask(vector, 1);
 
     uint16_t chan_id = g_irq_chan[vector];
     if (chan_id == CAP_NONE) { cap_irq_eoi(vector); return; }

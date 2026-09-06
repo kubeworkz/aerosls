@@ -18,6 +18,43 @@
 
 static uint8_t g_ioapic_pins = 0;   /* 0 = unprobed / absent */
 
+/* ─── IO-APIC access lock (irqsave) ─────────────────────────────────────
+ * The IO-APIC register file is addressed by an INDEX register followed by
+ * a DATA write — a two-store pair with no atomicity. RTE reprogramming
+ * happens from three contexts here: task context (k_irq_mask, IF=1), the
+ * serial device ISR (self-mask on delivery), and the AP core's timer
+ * service loop. Without a lock, a timer/serial interrupt in the middle
+ * of a task-context RTE write re-enters ioapic_write for a DIFFERENT
+ * register; the interrupted half of the pair resumes against the wrong
+ * IOREGSEL, and the write is silently lost. Lost self-mask writes are
+ * not cosmetic: the emulated IO-APIC drops edge requests while a pin is
+ * masked, so a driver that observes a delivery inside its masked window
+ * (the irqtest stuck-driver probe's ch=leak FAIL) is direct evidence the
+ * RTE never actually got masked. The lock is irqsave — cli on entry, IF
+ * restored on release — so an ISR caller (already cli'd by the gate)
+ * simply saves/restores a 0 and the lock can never self-deadlock. The
+ * same-DSL inter-core hazard (BSP task write vs AP service write) is
+ * covered by the spin; the local-IF part is what makes the ISR case
+ * safe. x86_64-only TU: this file is not in the riscv/arm64 builds. */
+static volatile unsigned int g_ioapic_lock = 0;
+
+static inline unsigned long ioapic_lock_irqsave(void) {
+    unsigned long flags;
+    __asm__ volatile(
+        "pushfq\n\tpopq %0\n\tcli"
+        : "=r"(flags)
+        :
+        : "memory");
+    while (__atomic_exchange_n(&g_ioapic_lock, 1u, __ATOMIC_ACQUIRE)) { }
+    return flags;
+}
+
+static inline void ioapic_unlock_irqrestore(unsigned long flags) {
+    __atomic_store_n(&g_ioapic_lock, 0u, __ATOMIC_RELEASE);
+    if (flags & 0x200UL)
+        __asm__ volatile("sti" ::: "memory");
+}
+
 static uint32_t ioapic_read(uint8_t reg) {
     volatile uint32_t* base = (volatile uint32_t*)(uintptr_t)IOAPIC_BASE;
     base[IOAPIC_REG_INDEX / 4] = reg;
@@ -28,6 +65,19 @@ static void ioapic_write(uint8_t reg, uint32_t val) {
     volatile uint32_t* base = (volatile uint32_t*)(uintptr_t)IOAPIC_BASE;
     base[IOAPIC_REG_INDEX / 4] = reg;
     base[IOAPIC_REG_DATA / 4] = val;
+}
+
+/* Locked RTE update: the ONLY sanctioned way to touch a redirection
+ * entry. Every ioapic_write(IOAPIC_REDTBL...) caller in this file goes
+ * through here; bare ioapic_write remains for the INDEX/DATA probe in
+ * ioapic_init (reg selection there is never interleaved by an RTE
+ * writer because those paths take this same lock for their RTE work). */
+static void ioapic_rte_write(uint8_t pin, uint32_t low, uint32_t high) {
+    unsigned long flags = ioapic_lock_irqsave();
+    ioapic_write((uint8_t)(IOAPIC_REDTBL + (pin << 1)), low);
+    ioapic_write((uint8_t)(IOAPIC_REDTBL + (pin << 1) + 1), high);
+    ioapic_write((uint8_t)(IOAPIC_REDTBL + (pin << 1)), low);
+    ioapic_unlock_irqrestore(flags);
 }
 
 static void ioapic_init(void) {
@@ -64,9 +114,8 @@ void cap_irq_unmask(uint32_t vector) {
      * edge-triggered: it samples the rising edge once and is immune to
      * the persistent level. Real kernels keep the PIC masked once the
      * IO-APIC is active for exactly this reason. */
-    ioapic_write((uint8_t)(IOAPIC_REDTBL + (pin << 1)), rte_low_masked);
-    ioapic_write((uint8_t)(IOAPIC_REDTBL + (pin << 1) + 1), rte_high);
-    ioapic_write((uint8_t)(IOAPIC_REDTBL + (pin << 1)), rte_low);
+    ioapic_rte_write(pin, rte_low_masked, rte_high);
+    ioapic_rte_write(pin, rte_low, rte_high);
     kernel_serial_printf("[IRQ] unmask vector %u: pin %u rte 0x%08x/%08x\n",
                          (unsigned)vector, (unsigned)pin,
                          (unsigned)rte_low, (unsigned)rte_high);
@@ -88,7 +137,5 @@ void cap_irq_set_mask(uint32_t vector, int masked) {
     uint32_t lapic_id = (lapic_read(LAPIC_REG_ID) >> 24) & 0xFFu;
     uint32_t rte_low  = vector | (masked ? (1u << 16) : 0u);
     uint32_t rte_high = lapic_id << 24;
-    ioapic_write((uint8_t)(IOAPIC_REDTBL + (pin << 1)), rte_low);
-    ioapic_write((uint8_t)(IOAPIC_REDTBL + (pin << 1) + 1), rte_high);
-    ioapic_write((uint8_t)(IOAPIC_REDTBL + (pin << 1)), rte_low);
+    ioapic_rte_write(pin, rte_low, rte_high);
 }

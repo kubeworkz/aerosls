@@ -15,11 +15,18 @@
  * nonexistent command and silently dropped the first typed input after
  * every full irqtest death/respawn boot.
  *
- * The fix has two halves, both asserted here:
- *   1. While loopback is on, the poll DISCARDS the RX FIFO — loopback
- *      bytes are device-internal traffic, never console input.
- *   2. When loopback clears, any residue is discarded AND the partial line
- *      is reset, so the next real input starts a fresh, clean line.
+ * The fix has three halves, all asserted here (the ownership interlock of
+ * kernel_io.h — the demo OWNS the port while MCR bit 4 is set):
+ *   1. While loopback is on, the poll does NOT touch the RX FIFO — the
+ *      bytes the demo deliberately leaves in RBR hold the IRQ4 line at a
+ *      known level, and draining them destroys the edges it counts
+ *      (caught live: the old discard rule turned phase 2 into 0/10 and
+ *      manufactured the phantom stuck-driver ch=leak FAIL).
+ *   2. Kernel TX is suppressed while the demo owns the port — every TX
+ *      byte would loop back as a foreign RX byte (and never reach the
+ *      wire anyway; QEMU internalizes loopback TX before the host chardev).
+ *   3. When the ownership clears, any residue is discarded AND the partial
+ *      line is reset, so the next real input starts a fresh, clean line.
  *
  * The UART model below is deliberately small: an RX queue, the MCR
  * loopback bit, and an LSR that reports data-ready only while the queue is
@@ -143,8 +150,8 @@ int main(void) {
         CHECK(out[0] == '\1', "the out buffer is left untouched");
     }
 
-    /* ═══ 3: loopback discards the FIFO without feeding the editor ═════ */
-    printf("\n-- 3: loopback (MCR bit 4) is device traffic, not input --\n");
+    /* ═══ 3: loopback hands the port to the demo — poll leaves it alone ═ */
+    printf("\n-- 3: loopback (MCR bit 4) is the demo's port, not console input --\n");
     {
         uart_reset();
         g_mcr_loopback = 1;
@@ -153,10 +160,11 @@ int main(void) {
         out[0] = '\1'; out[1] = '\0';
         CHECK(serial_console_poll(out, sizeof(out)) == 0,
               "loopback bytes never complete a line");
-        CHECK(g_rbr_reads == 4,
-              "*** the FIFO is drained, not left for later ***");
+        CHECK(g_rbr_reads == 0,
+              "*** the FIFO is left INTACT for the probe (ownership) ***");
         CHECK(out[0] == '\1', "the out buffer is untouched");
-        cap_stop_expect("", "nothing is echoed to the operator");
+        kernel_serial_putchar('x');
+        cap_stop_expect("", "kernel TX is suppressed while the demo owns the port");
     }
 
     /* ═══ 4: loopback clearing drains residue and resets the editor ════ */
@@ -196,7 +204,7 @@ int main(void) {
         g_mcr_loopback = 1;
         uart_queue("A");
         CHECK(serial_console_poll(out, sizeof(out)) == 0,
-              "loopback bytes are discarded mid-line");
+              "loopback bytes are left to the demo mid-line");
         g_mcr_loopback = 0;
         CHECK(serial_console_poll(out, sizeof(out)) == 0,
               "the transition resets the editor (the partial line is demo-era residue)");
