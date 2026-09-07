@@ -167,7 +167,9 @@ static uint32_t cap_arena_free_count = 0;
 /* Phase 3 message payload staging pool. Fixed-size buffers, chained through
  * a parallel `next` array (the payload bytes themselves are arbitrary data,
  * so the freelist cannot chain through them like the holder pool does).
- * Single CPU, one syscall at a time: a plain static freelist is safe. */
+ * SMP: the kernel's IRQ-drain path (process context) and process-context
+ * cap_send both allocate here, potentially concurrently — so the head is
+ * a CAS-atomic freelist (Treiber-style), not a plain static head. */
 static uint8_t  cap_msg_payload[CAP_MSG_PAYLOAD_POOL][CAP_MSG_MAX_PAYLOAD];
 static uint16_t cap_msg_payload_next[CAP_MSG_PAYLOAD_POOL];
 static uint16_t cap_msg_payload_free_head = CAP_FREELIST_END;
@@ -180,17 +182,25 @@ static void cap_msg_payload_init(void) {
 }
 
 static int cap_msg_payload_alloc(uint16_t* out_idx) {
-    if (cap_msg_payload_free_head == CAP_FREELIST_END) return -1;
-    uint16_t i = cap_msg_payload_free_head;
-    cap_msg_payload_free_head = cap_msg_payload_next[i];
-    *out_idx = i;
-    return 0;
+    for (;;) {
+        uint16_t head = __atomic_load_n(&cap_msg_payload_free_head, __ATOMIC_ACQUIRE);
+        if (head == CAP_FREELIST_END) return -1;
+        uint16_t next = cap_msg_payload_next[head];
+        if (__atomic_compare_exchange_n(&cap_msg_payload_free_head, &head, next,
+                                        0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            *out_idx = head;
+            return 0;
+        }
+    }
 }
 
 static void cap_msg_payload_free(uint16_t idx) {
     if (idx == CAP_NONE || idx >= CAP_MSG_PAYLOAD_POOL) return;
-    cap_msg_payload_next[idx] = cap_msg_payload_free_head;
-    cap_msg_payload_free_head = idx;
+    uint16_t head = __atomic_load_n(&cap_msg_payload_free_head, __ATOMIC_RELAXED);
+    do {
+        cap_msg_payload_next[idx] = head;
+    } while (!__atomic_compare_exchange_n(&cap_msg_payload_free_head, &head, idx,
+                                          0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED));
 }
 
 /* ─── Spinlock ─────────────────────────────────────────────────────────────── */
@@ -2230,47 +2240,78 @@ void cap_irq_set_mask(uint32_t vector, int masked) {
     (void)vector; (void)masked;
 }
 
+/* ISR-safe delivery: the device-ISR path must never take a cap spinlock
+ * (same single-CPU deadlock class the console drain had — see
+ * console_service.h: an ISR interrupting a process-context holder of the
+ * same lock spins forever with IF=0). Instead the ISR only (a) self-masks
+ * the RTE, (b) EOI, and (c) latches the vector into a pending bitmap; a
+ * process-context drainer (the same cadence point that consumes the
+ * deferred console tick) performs the lock-taking enqueue + wake. The
+ * self-mask guarantees no edge is LOST while delivery waits: the driver
+ * re-arms via k_irq_mask after servicing, which re-runs the drain. */
+static volatile uint32_t g_irq_pending[CAP_IRQ_VECTORS / 32 + 1];
+static volatile uint32_t g_irq_draining = 0;
+
+static void cap_irq_notify_locked(uint32_t vector);   /* process-context enqueue */
+
+void cap_irq_drain_pending(void) {
+    /* Single-drainer guard: re-entrancy from another CPU is handled by
+     * re-checking the bitmap under the per-channel locks anyway; the
+     * flag only prevents two CPUs scanning simultaneously (harmless but
+     * wasteful). Test-and-set with release on finish. */
+    uint32_t zero = 0;
+    if (!__atomic_compare_exchange_n(&g_irq_draining, &zero, 1, 0,
+                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+        return;
+    for (uint32_t v = 0; v < CAP_IRQ_VECTORS; v++) {
+        uint32_t bit = 1u << (v & 31);
+        if (!(__atomic_load_n(&g_irq_pending[v >> 5], __ATOMIC_RELAXED) & bit))
+            continue;
+        __atomic_fetch_and(&g_irq_pending[v >> 5], ~bit, __ATOMIC_RELAXED);
+        /* Clear-then-deliver: an edge arriving between the clear and the
+         * enqueue re-latches the bit, so the next drain re-delivers — a
+         * spurious extra notification at worst, never a lost one. */
+        cap_irq_notify_locked(v);
+    }
+    __atomic_store_n(&g_irq_draining, 0, __ATOMIC_RELEASE);
+}
+
 void cap_irq_notify(uint32_t vector) {
+    /* ISR context — no spinlocks here. Self-mask (an edge-triggered RTE
+     * whose device line stays asserted re-fires on every EOI), latch the
+     * pending bit, EOI; the process-context drainer does the rest. Vector
+     * 32 (the LAPIC timer) is deliberately EXCLUDED from self-masking: its
+     * edges come from the local LAPIC's LVT timer, not the IO-APIC. */
     if (vector >= CAP_IRQ_VECTORS) { cap_irq_eoi(vector); return; }
-    /* Self-mask device pins on delivery (Driver SDK ABI v0.1 s4.5): an
-     * edge-triggered RTE whose device line stays asserted re-fires on
-     * every EOI (the emulated IO-APIC latches the level), wedging the
-     * kernel in an ISR storm that starves user code. Mask first, then
-     * enqueue + EOI; the driver re-arms with k_irq_mask after servicing
-     * the device.
-     *
-     * Vector 32 (the LAPIC timer) is deliberately EXCLUDED: its edges
-     * come from the local LAPIC's LVT timer, not the IO-APIC — masking
-     * RTE 0 here would gate pin 0 (the PIT/IRQ0 line) behind a timer
-     * event and, worse, put a needless IO-APIC RTE write on the
-     * interrupt stack twice per tick, contending with the irqsave RTE
-     * lock and racing genuine device self-masks (the serial pin) that
-     * arrive from the same stack. Self-masking a pin only makes sense
-     * when the RTE actually delivered the edge. */
     if (vector >= 0x21u) cap_irq_set_mask(vector, 1);
+    __atomic_fetch_or(&g_irq_pending[vector >> 5], 1u << (vector & 31),
+                      __ATOMIC_RELAXED);
+    cap_irq_eoi(vector);
+}
 
+/* Process-context delivery of one latched vector. Same enqueue semantics
+ * the old ISR path had: drop when the driver's budget is exhausted or the
+ * channel is gone — but now "drop" is safe because the pin stays
+ * self-masked until the driver re-arms via k_irq_mask (which re-runs the
+ * drain), so a dropped edge is re-raiseable, never silently lost. */
+static void cap_irq_notify_locked(uint32_t vector) {
     uint16_t chan_id = g_irq_chan[vector];
-    if (chan_id == CAP_NONE) { cap_irq_eoi(vector); return; }
+    if (chan_id == CAP_NONE) return;
     struct CapChannel* ch = &cap_channels[chan_id];
-    if (!ch->active) { cap_irq_eoi(vector); return; }
+    if (!ch->active) return;
 
-    /* The kernel is end1 (end0 = the bound driver); messages the kernel
-     * enqueues must land in q[0], which the driver's CHAN_R reads. Drop
-     * when the driver's budget is exhausted — an ISR cannot block. */
     uint16_t budget = g_irq_budget[vector];
     if (budget == 0) budget = CHAN_QUEUE_DEPTH;
 
     cap_lock(&ch->lock);
     if (ch->qdepth[0] >= budget || !ch->active) {
         cap_unlock(&ch->lock);
-        cap_irq_eoi(vector);
         return;   /* notification dropped (driver too slow / unbound) */
     }
     uint16_t pidx = CAP_NONE;
     if (cap_msg_payload_alloc(&pidx)) {
         cap_unlock(&ch->lock);
-        cap_irq_eoi(vector);
-        return;   /* payload pool exhausted — drop, never block in ISR */
+        return;   /* payload pool exhausted — drop */
     }
     cap_msg_payload[pidx][0] = (uint8_t)vector;
 
@@ -2293,7 +2334,6 @@ void cap_irq_notify(uint32_t vector) {
     cap_unlock(&ch->lock);
 
     cap_wake_chan(chan_id);             /* parked k_chan_wait re-runs */
-    cap_irq_eoi(vector);
 }
 
 int k_irq_bind(uint32_t pid, uint16_t slot, uint32_t budget,
@@ -2493,6 +2533,12 @@ int k_irq_mask(uint32_t pid, uint16_t chan_r, uint8_t mask) {
     if (vector >= CAP_IRQ_VECTORS) return CAP_ERR_STATE;  /* not an IRQ channel */
 
     cap_irq_set_mask(vector, mask ? 1 : 0);
+    if (!mask) {
+        /* Re-arm: deliver any edge that arrived while the pin was masked
+         * (latched by the ISR, waiting for this drain). Runs here in
+         * process context, so the lock-taking enqueue is legal. */
+        cap_irq_drain_pending();
+    }
     return CAP_ERR_OK;
 }
 

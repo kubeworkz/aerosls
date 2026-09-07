@@ -4,6 +4,7 @@
 #include "microkernel.h"
 #include "smp.h"
 #include "console_service.h"  /* deferred uniprocessor console drain */
+#include "cap.h"             /* cap_irq_drain_pending (ISR → process-context) */
 
 extern void* allocate_physical_ram_frame(void);
 extern void ap_kernel_main(void);
@@ -108,6 +109,10 @@ void smp_uniprocessor_tick(void) {
      * console_service.h). This is the process-context consumer; on SMP
      * boots the AP's microkernel_service_poll already covers the drain. */
     console_service_deferred_tick();
+    /* Device-IRQ delivery: the ISR stubs only latch pending vectors (they
+     * must not take cap spinlocks); this drains them in process context.
+     * Same reasoning as the console deferral above. */
+    cap_irq_drain_pending();
 }
 
 // Executed concurrently by Core 1 and Core 2 when they leave the trampoline
@@ -118,11 +123,20 @@ void ap_kernel_main(void) {
     // Atomically signal the BSP that this core has initialized successfully
     __atomic_store_n(&ap_bootstrap_lock, 1, __ATOMIC_SEQ_CST);
 
-    // Combined loop: dirty-page flush + microkernel service bus poll
+    // Combined loop: dirty-page flush + microkernel service bus poll.
+    // ONE tick per iteration: this loop is the deferred-IRQ drainer, so
+    // its cadence IS the driver-SDK notification latency. At 10 ticks a
+    // tick-bound wait (deadline 1-5 ticks) can expire several times
+    // between refills — the irqtest probe's phase-1/3 waits starved and
+    // the phase-4 storm windows stretched the boot past CI's budget
+    // (caught live: 4/4 boots PASS at 300s but silence-gap "wedges" at
+    // 120s). Every loop body step is a cheap no-op when idle, so the
+    // faster cadence costs nothing but latency where it matters.
     while (1) {
         flush_daemon_tick();
         microkernel_service_poll();
+        cap_irq_drain_pending();
         qemu_sls_pgo_scan_tick();
-        kernel_sleep_ticks(10);
+        kernel_sleep_ticks(1);
     }
 }
