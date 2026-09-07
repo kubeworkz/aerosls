@@ -8,6 +8,7 @@
 #include "../arch/x86/user_paging.h"
 #include "../user/permissions.h"
 #include "cap.h"   /* Seed Kernel Phase 1: strong cap_current_pid()/cap_proc_cr3() below */
+#include "console_service.h"  /* deferred console drain (single-CPU park-wake cadence) */
 #include "syscall_dispatch.h"   /* Seed Kernel Phase 1.5: do_syscall() from cap_recv_resume() */
 
 /* Seed Kernel Phase 1.5: the resume path iretq's into cap_recv_resume(),
@@ -1384,6 +1385,20 @@ int cap_wait_chans(const uint32_t* chan_ids, uint32_t n, void* req,
         cur->waiting_chan     = CAP_NONE;
         cur->waiting_nchans   = 0;
         cur->waiting_deadline = 0;
+        /* Deliver anything the device ISRs latched before the caller
+         * re-checks its queues, and drain the deferred console tick.
+         * On a single-CPU boot this hlt wake is the ONLY process-context
+         * cadence that runs while every process is parked — the AP loop
+         * doesn't exist and smp_uniprocessor_tick only runs from
+         * read_line's poll, which doesn't exist until the shell. Without
+         * these drains the parked process spins park→wake→park forever:
+         * IRQ notifications are never delivered (drivers wait forever) and
+         * sidecar console output is never flushed (the console channel
+         * fills, the sidecar's blocking send parks, the boot wedges at the
+         * first [INIT] print — the phase5 single-CPU smoke's stall).
+         * Process context: taking the cap locks here is legal. */
+        console_service_deferred_tick();
+        cap_irq_drain_pending();
         return 1;
     }
     kernel_switch_next(next);   /* noreturn */
