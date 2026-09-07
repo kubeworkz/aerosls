@@ -69,6 +69,16 @@ static int poll_calls  = 0;
 void flush_daemon_tick(void)        { flush_calls++; }
 void microkernel_service_poll(void) { poll_calls++;  }
 
+/* Process-context consumers smp.c's loops invoke but don't define. The ISR
+ * deferral (console drain, device-IRQ delivery) lives in console_service.c
+ * and cap.c, whose dependency trees this file deliberately does not link
+ * — this test is about WHICH loop calls these and how often, not what the
+ * consumers do. Counting stubs keep "the consumer ran" observable. */
+static int console_defer_calls = 0;
+static int irq_drain_calls     = 0;
+void console_service_deferred_tick(void) { console_defer_calls++; }
+void cap_irq_drain_pending(void)         { irq_drain_calls++;     }
+
 /* Referenced by boot_application_processors()/ap_kernel_main(), neither of
  * which this test calls -- but the symbols must resolve. Real storage for
  * the trampoline bounds so the pointer arithmetic in smp.c stays defined. */
