@@ -777,6 +777,13 @@ int  k_irq_unbind(uint32_t pid, uint16_t chan_r, uint16_t* out_vector);
  * held CHAN_W end, wake, EOI. Weak arch hooks: cap_irq_eoi is a no-op
  * unless an arch layer overrides it (LAPIC/PIC). */
 void cap_irq_notify(uint32_t vector);
+/* Process-context drain of latched device-IRQ notifications. The ISR path
+ * (cap_irq_notify) only self-masks + latches + EOIs — it must never take a
+ * cap spinlock (single-CPU deadlock class, see console_service.h). Call
+ * this from process context: the AP service loop (SMP),
+ * smp_uniprocessor_tick (uni fallback), and after every unmask
+ * (k_irq_mask) so a re-armed pin delivers its pending edge immediately. */
+void cap_irq_drain_pending(void);
 void cap_irq_eoi(uint32_t vector) __attribute__((weak));
 void cap_irq_set_mask(uint32_t vector, int masked) __attribute__((weak));
 

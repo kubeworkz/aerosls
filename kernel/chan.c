@@ -221,25 +221,61 @@ int k_chan_wait(uint32_t pid, const uint16_t* chans, uint32_t n,
         }
         return CAP_ERR_TIMEOUT;   /* deadline elapsed; nothing arrived */
     }
-    cap_wait_chans(chan_ids, n, req, SYS_SLS_CHAN_WAIT, deadline);
-    /* noreturn when it parks. If it returned (couldn't park / hlt woke),
-     * re-check the queues — the message may have arrived during the hlt.
-     * Use the per-channel dir[] resolved in the first poll loop. */
-    for (uint32_t i = 0; i < n; i++) {
-        struct CapChannel* ch = &cap_channels[chan_ids[i]];
-        int d = dirs[i];
-        cap_lock(&ch->lock);
-        int ready = (ch->qdepth[d] > 0);
-        uint16_t kind = CH_KIND_MSG;
-        if (!ready && ch->close_evt[d]) { ready = 1; kind = CH_KIND_CLOSE; }
-        cap_unlock(&ch->lock);
-        if (ready) {
-            *out_idx = i;
-            *out_kind = kind;
-            return CAP_ERR_OK;
+    for (;;) {
+        int parked = cap_wait_chans(chan_ids, n, req, SYS_SLS_CHAN_WAIT, deadline);
+        /* Two ways back: (a) could not park (host-test weak default, or
+         * kernel context with no process) — honor the old scan-once
+         * semantics and return TIMEOUT; (b) the park's 1-tick hlt was
+         * interrupted without a handoff (the timer ISR's
+         * cap_park_deadline_tick marks us resumable but interrupt.asm
+         * irets straight back here — nobody switched to us). In case (b)
+         * we MUST re-park in-kernel until the caller's real deadline:
+         * returning TIMEOUT here strands every wait whose message
+         * cadence exceeds one tick (the deferred IRQ drain refills the
+         * timer channel every ~10 ticks, so a userspace retry loop with
+         * 5 one-tick attempts starved mid-window and the irqtest probe
+         * exited with MCR loopback still on — console TX stayed
+         * suppressed and the boot wedged in a silent blackout). The
+         * deadline is re-checked (with the SMP final poll) at the top of
+         * the loop, so a finite timeout still returns CAP_ERR_TIMEOUT at
+         * the right moment and a real wake still resumes us with the
+         * message in hand. */
+        if (!parked)
+            return CAP_ERR_TIMEOUT;   /* could not park (host/kernel ctx) */
+
+        for (uint32_t i = 0; i < n; i++) {
+            struct CapChannel* ch = &cap_channels[chan_ids[i]];
+            int d = dirs[i];
+            cap_lock(&ch->lock);
+            int ready = (ch->qdepth[d] > 0);
+            uint16_t kind = CH_KIND_MSG;
+            if (!ready && ch->close_evt[d]) { ready = 1; kind = CH_KIND_CLOSE; }
+            cap_unlock(&ch->lock);
+            if (ready) {
+                *out_idx = i;
+                *out_kind = kind;
+                return CAP_ERR_OK;
+            }
         }
+        if (deadline != 0 && kernel_tick_counter >= deadline) {
+            for (uint32_t i = 0; i < n; i++) {
+                struct CapChannel* ch = &cap_channels[chan_ids[i]];
+                int d = dirs[i];
+                cap_lock(&ch->lock);
+                int ready = (ch->qdepth[d] > 0);
+                uint16_t kind = CH_KIND_MSG;
+                if (!ready && ch->close_evt[d]) { ready = 1; kind = CH_KIND_CLOSE; }
+                cap_unlock(&ch->lock);
+                if (ready) {
+                    *out_idx = i;
+                    *out_kind = kind;
+                    return CAP_ERR_OK;
+                }
+            }
+            return CAP_ERR_TIMEOUT;
+        }
+        /* deadline not elapsed: loop and re-park */
     }
-    return CAP_ERR_TIMEOUT;   /* nothing arrived: retry */
 }
 
 /* ─── k_chan_recv ────────────────────────────────────────────────────────────

@@ -102,8 +102,18 @@ void cap_irq_unmask(uint32_t vector) {
     if (pin >= g_ioapic_pins) return;
 
     uint32_t lapic_id = (lapic_read(LAPIC_REG_ID) >> 24) & 0xFFu;
-    uint32_t rte_low  = vector;                    /* fixed, edge, unmasked */
-    uint32_t rte_low_masked = vector | (1u << 16); /* mask first, then live */
+    /* LEVEL-triggered, active-high. The ISA device lines (the 16550's IRQ
+     * is level: asserted until the FIFO is drained) paired with an
+     * edge-triggered RTE lose interrupts whenever the line is already
+     * asserted at unmask time — no rising edge exists to sample (caught
+     * live: the phase-4 storm kills the driver mid-storm with unread RX
+     * bytes; the respawned driver's rebind unmasks into the held-high
+     * line and NO edge ever fires again — the boot wedges silently).
+     * With the ISR's self-mask-on-delivery discipline the level RTE is
+     * bounded (the mask blocks the post-EOI re-fire while the line stays
+     * asserted) and every re-arm/rebind recovers an asserted line. */
+    uint32_t rte_low  = vector | (1u << 15);       /* fixed, LEVEL, unmasked */
+    uint32_t rte_low_masked = rte_low | (1u << 16); /* mask first, then live */
     uint32_t rte_high = lapic_id << 24;
 
     /* Deliberately leave the legacy PIC masked (idt.c masked everything
@@ -135,7 +145,10 @@ void cap_irq_set_mask(uint32_t vector, int masked) {
     if (pin >= g_ioapic_pins) return;
 
     uint32_t lapic_id = (lapic_read(LAPIC_REG_ID) >> 24) & 0xFFu;
-    uint32_t rte_low  = vector | (masked ? (1u << 16) : 0u);
+    /* LEVEL (see cap_irq_unmask): an unmask with the device line still
+     * asserted re-delivers immediately instead of waiting for a rising
+     * edge that may never come. The caller's mask bit still bounds it. */
+    uint32_t rte_low  = vector | (1u << 15) | (masked ? (1u << 16) : 0u);
     uint32_t rte_high = lapic_id << 24;
     ioapic_rte_write(pin, rte_low, rte_high);
 }
