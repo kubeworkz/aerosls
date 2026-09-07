@@ -8,16 +8,21 @@
  * create_sidecar, which is M2 work), then drives k_irq_bind through the
  * REAL channel creation, holder bookkeeping, registry install, and
  * single-use stamp. The ISR side is exercised by calling cap_irq_notify
- * directly (the arch ISR stub's job is simply to invoke it): the test
- * proves the full enqueue → wake → k_chan_recv path the driver sees.
- * cap_wake_chan and cap_irq_eoi are overridden to record.
+ * directly (the arch ISR stub's job is simply to invoke it). Since the ISR
+ * deferral, cap_irq_notify only self-masks + latches the pending bit + EOIs
+ * — it must never take a cap lock. Delivery (the lock-taking enqueue +
+ * wake) happens in process context via cap_irq_drain_pending, so the test
+ * calls the drainer after each notify to prove the full latch → enqueue →
+ * wake → k_chan_recv path the driver sees. cap_wake_chan and cap_irq_eoi
+ * are overridden to record.
  *
  * Scenarios:
  *   1. bind a vector: returns a CHAN_R slot; k_cap_info shows CHAN_R;
  *      the IRQ cap word is stamped REVOKED (single-use)
  *   2. second bind of the same slot → CAP_ERR_REVOKED
  *   3. second IRQ cap with the SAME vector → CAP_ERR_STATE (already bound)
- *   4. ISR path: cap_irq_notify(vector) → wake fires; k_chan_recv yields
+ *   4. ISR path: cap_irq_notify latches, cap_irq_drain_pending delivers;
+ *      k_chan_recv yields
  *      tag = vector, payload byte = vector; queue empties after one recv
  *   5. notify on an unbound vector is a silent no-op (no wake, no crash)
  *   6. rights: IRQ cap without CAP_PERM_BIND → CAP_ERR_RIGHTS
@@ -157,11 +162,13 @@ int main(void) {
     CHECK(k_irq_bind(P, irq2, 0, &dup) == CAP_ERR_STATE,
           "second cap on the same vector is CAP_ERR_STATE");
 
-    /* ── 4. ISR path: notify → wake → recv ────────────────────────────── */
+    /* ── 4. ISR path: notify → latch, drain → wake → recv ─────────────── */
     g_wakes = 0;
     cap_irq_notify(33);
-    CHECK(g_wakes == 1, "notify woke the channel once");
+    CHECK(g_wakes == 0, "notify only latches (no wake from ISR context)");
     CHECK(g_eois == 1 && g_eoi_vector == 33, "EOI ran for the fired vector");
+    cap_irq_drain_pending();
+    CHECK(g_wakes == 1, "drain delivered the latched notify (one wake)");
 
     uint8_t buf[16];
     struct SLSChanRecvOut out;
@@ -180,6 +187,7 @@ int main(void) {
     /* ── 5. notify on an unbound vector is a silent no-op ─────────────── */
     g_wakes = 0;
     cap_irq_notify(77);
+    cap_irq_drain_pending();
     CHECK(g_wakes == 0, "notify on an unbound vector does not wake");
     CHECK(g_eois == 2, "unbound notify still EOIs (harmless)");
 
@@ -260,6 +268,7 @@ int main(void) {
     /* registry disarmed: notify no longer wakes or enqueues */
     g_wakes = 0;
     cap_irq_notify(40);
+    cap_irq_drain_pending();
     CHECK(g_wakes == 0, "notify after unbind does not wake");
 
     /* driver's endpoint closed: recv fails CAP_ERR_STATE */
