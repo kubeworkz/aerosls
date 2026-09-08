@@ -694,7 +694,16 @@ jobs:
         working-directory: aerosls2
 
       - name: Run all guard smokes (every guard proven able to fail)
-        run: bash tests/run_guard_smokes.sh
+        run: |
+          # The smoke set includes two cargo-needing gates (aeroidl_gate,
+          # polyglot_latency_gate). The Rust toolchain step above exports
+          # cargo via $GITHUB_PATH, but a failed/short-circuited run of that
+          # step (or a runner where rustup landed outside PATH) leaves the
+          # smokes aborting with "cargo not available" — a smoke that cannot
+          # run proves nothing, so put the standard rustup location on PATH
+          # for this step explicitly.
+          export PATH="$HOME/.cargo/bin:$PATH"
+          bash tests/run_guard_smokes.sh
         working-directory: aerosls2
 
       - name: Boot the ISO under QEMU and check /api/health (service smoke)
