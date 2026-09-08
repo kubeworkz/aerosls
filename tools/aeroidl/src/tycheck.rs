@@ -99,12 +99,17 @@ struct TyChecker<'a> {
 
 impl<'a> TyChecker<'a> {
     fn new(doc: &'a Document) -> Self {
+        let mut declared_types = HashSet::new();
+        // Well-known IDL types the contracts may reference without
+        // declaring: MemCap is a MEM cap handle (u16 arena slot) the
+        // generators map to the 16-bit cap handle on every target.
+        declared_types.insert("MemCap".to_string());
         Self {
             doc,
             type_sizes: HashMap::new(),
             struct_fields: HashMap::new(),
             enum_variants: HashMap::new(),
-            declared_types: HashSet::new(),
+            declared_types,
             errors: Vec::new(),
         }
     }

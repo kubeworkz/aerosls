@@ -402,6 +402,12 @@ fn check_c(tmp: &Path, c_header: &str) -> bool {
 #define AEROSLS_CAP_FLAG_ARENA_OWNED 0x02
 #define AEROSLS_CAP_NONE 0xFFFF
 #define AEROSLS_CHAN_FLAG_NO_REPLY 0x0001
+/* Well-known IDL type: MEM cap handle (matches the generated header's
+ * typedef guard so a real aerosls_cap.h can define it too). */
+#ifndef AEROSLS_MEMCAP_T
+#define AEROSLS_MEMCAP_T
+typedef uint16_t MemCap;
+#endif
 typedef struct { uint16_t slot; uint32_t offset; uint32_t len; uint8_t rights; uint8_t flags; } aerosls_cap_desc_t;
 static inline int aerosls_chan_send(uint16_t w, uint32_t op, uint32_t id, const void* p, size_t n, const aerosls_cap_desc_t* c, uint16_t nc, uint32_t f) { (void)w;(void)op;(void)id;(void)p;(void)n;(void)c;(void)nc;(void)f; return 0; }
 static inline int aerosls_chan_recv(uint16_t r, void* b, size_t n, uint16_t* cs, uint16_t mx, uint32_t* k, uint32_t* t, size_t* l, uint16_t* nc) { (void)r;(void)b;(void)n;(void)cs;(void)mx;(void)k;(void)t;(void)l;(void)nc; return 0; }

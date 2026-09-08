@@ -39,6 +39,16 @@ pub fn emit_c(ast: &Value) -> String {
     out.push_str("#include <stdint.h>\n");
     out.push_str("#include <stddef.h>\n");
     out.push_str("#include <aerosls_cap.h>\n\n");
+    // Well-known IDL type: a MEM cap handle (u16 slot into the shared
+    // arena). Contracts reference it directly (buf: MemCap @arena); the
+    // typechecker accepts it as built-in and every generator maps it to
+    // the 16-bit cap handle. Guarded so a future aerosls_cap.h that
+    // defines it does not collide.
+    out.push_str("/* Well-known IDL type: MEM cap handle (u16 arena slot). */\n");
+    out.push_str("#ifndef AEROSLS_MEMCAP_T\n");
+    out.push_str("#define AEROSLS_MEMCAP_T\n");
+    out.push_str("typedef uint16_t MemCap;\n");
+    out.push_str("#endif\n\n");
     out.push_str("#ifdef __cplusplus\n");
     out.push_str("extern \"C\" {\n");
     out.push_str("#endif\n\n");
@@ -196,7 +206,7 @@ fn emit_interface(out: &mut String, ast: &Value, iface: &Value, mod_name: &str) 
 
 fn emit_result_wrapper(
     out: &mut String,
-    _ast: &Value,
+    ast: &Value,
     methods: &[Value],
     prefix: &str,
     _iface_name: &str,
@@ -245,6 +255,14 @@ fn emit_result_wrapper(
                     seen_types.push(c_type);
                 }
             }
+            "array" => {
+                // A bare array return (SidecarHealth[]) is delivered as a
+                // MEM cap — same wire shape as an array inside a Result.
+                // The deserializer writes result.val_cap, so the union must
+                // carry the member.
+                let c = "uint16_t val_cap         /* MEM cap handle */".into();
+                if !seen_types.contains(&c) { seen_types.push(c); }
+            }
             "i32" => {
                 let c = "int32_t  val_i32".into();
                 if !seen_types.contains(&c) { seen_types.push(c); }
@@ -271,6 +289,7 @@ fn emit_result_wrapper(
 
     // Collect error types
     let mut err_type_name: Option<String> = None;
+    let mut err_is_enum = false;
     for m in methods {
         let return_type = &m["return_type"];
         if return_type["kind"].as_str() == Some("result") {
@@ -278,7 +297,11 @@ fn emit_result_wrapper(
                 if err_type["kind"].as_str() == Some("named") {
                     let name = err_type["name"].as_str().unwrap_or("Error").to_string();
                     if err_type_name.is_none() {
-                        err_type_name = Some(name);
+                        err_type_name = Some(name.clone());
+                        // An enum error type has no struct fields — the
+                        // discriminant rides in val_raw, not in a struct
+                        // member, so the union must carry val_raw.
+                        err_is_enum = find_struct_fields(ast, &name).is_none();
                     }
                 }
             }
@@ -289,7 +312,15 @@ fn emit_result_wrapper(
         out.push_str(&format!("        {t};\n"));
     }
     if let Some(ref err_name) = err_type_name {
-        out.push_str(&format!("        {err_name} err;\n"));
+        if err_is_enum {
+            // val_raw may already be in the union from a fallback ok-type
+            // (line 243's `_ => uint64_t val_raw`); only add it when absent.
+            if !seen_types.iter().any(|t| t.contains("val_raw")) {
+                out.push_str("        uint64_t val_raw;   /* enum error discriminant */\n");
+            }
+        } else {
+            out.push_str(&format!("        {err_name} err;\n"));
+        }
     }
 
     out.push_str("    };\n");
@@ -526,16 +557,28 @@ fn emit_method_stub(out: &mut String, ast: &Value, m: &Value, prefix: &str, mod_
                     // reply_buf[4]. Assign it to the error struct's first
                     // field (CalcError.kind, LogError.code, ...) so the header
                     // works for any error struct, not just the calculator
-                    // `{Err}Kind` convention.
+                    // `{Err}Kind` convention. An ENUM error type has no
+                    // struct fields — the whole value IS the code, and the
+                    // result union carries it in val_raw.
                     let err_fields = find_struct_fields(ast, err_name);
+                    let is_enum_err = err_fields.is_none() && ast["enums"]
+                        .as_array()
+                        .map(|es| es.iter().any(|e| e["name"].as_str() == Some(err_name)))
+                        .unwrap_or(false);
+                    if is_enum_err {
+                        out.push_str(
+                            "        result.val_raw = *(uint32_t *)(reply_buf + 4); /* enum error code */\n");
+                    }
                     let first_field = err_fields
                         .as_ref()
                         .and_then(|f| f.first())
                         .and_then(|f| f["name"].as_str())
                         .unwrap_or("kind");
-                    out.push_str(&format!(
-                        "        result.err.{first_field} = *(uint32_t *)(reply_buf + 4);\n"
-                    ));
+                    if !is_enum_err {
+                        out.push_str(&format!(
+                            "        result.err.{first_field} = *(uint32_t *)(reply_buf + 4);\n"
+                        ));
+                    }
                     if err_fields
                         .as_ref()
                         .map(|f| f.iter().any(|f| f["name"].as_str() == Some("message")))

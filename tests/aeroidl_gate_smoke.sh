@@ -121,9 +121,16 @@ tooth() {
     local snap; snap="${file}.smoke.bak"
     local out rc
 
-    cp "$file" "$snap" || { bad "$name: cannot snapshot $file"; return; }
+    # cp -p so the snapshot carries the file's ORIGINAL mtime: the restore
+    # below must put the mtime back too, not just the bytes. These teeth
+    # mutate kernel sources (cap.h, syscall_dispatch.c); a restore that left
+    # them newer than the linked kernel would poison every later
+    # staleness-checked guard in the same CI job (stack_frame_budget
+    # aborts with "binary is older than the sources" — seen live when this
+    # smoke ran before it in kernel-guards).
+    cp -p "$file" "$snap" || { bad "$name: cannot snapshot $file"; return; }
     # The trap restores every file even if this script dies mid-tooth.
-    trap "mv -f \"$snap\" \"$file\" 2>/dev/null; rm -f \"$snap\"" EXIT
+    trap "mv -f \"$snap\" \"$file\" 2>/dev/null; case \"$file\" in *.rs) touch \"$file\";; esac; rm -f \"$snap\"" EXIT
 
     if ! sed -i "$mutation" "$file"; then
         bad "$name: sed failed to apply mutation"
@@ -135,8 +142,9 @@ tooth() {
         restore_checked "$name" "$file" "$snap"; return
     fi
     # sed -i rewrites in place and may preserve an mtime cargo already saw;
-    # touch makes the mutation visible to cargo's incremental build (the
-    # same reason restore_checked touches after mv).
+    # touch makes the mutation visible to cargo's incremental build. The
+    # restore side deliberately does NOT touch: mv of the cp -p snapshot
+    # puts the original mtime back, which later staleness guards rely on.
     touch "$file"
     ok "$name: mutation applied"
 
@@ -159,8 +167,20 @@ tooth() {
 # the file is byte-identical to what the run started with.
 restore_checked() {
     local name="$1" file="$2" snap="$3"
+    # mv preserves the snapshot's mtime (the original, thanks to cp -p).
+    # Kernel sources (cap.h, syscall_dispatch.c) must get their ORIGINAL
+    # mtime back: a restore that leaves them newer than the linked kernel
+    # aborts the next staleness-checked guard in this CI job
+    # (stack_frame_budget — seen live when this smoke ran before it).
+    # But the .rs files cargo watches need a touch, or cargo's mtime
+    # comparison sees the restored (older) mtime as "unchanged" and skips
+    # rebuilding the binary the next rebuild() compiles — leaving the
+    # tooth's mutation in the compiled compiler while the tree looks
+    # restored. Touch only .rs; leave kernel sources' mtimes alone.
     mv -f "$snap" "$file"
-    touch "$file"
+    case "$file" in
+        *.rs) touch "$file" ;;
+    esac
     rm -f "$snap"
     trap - EXIT
     if [ -f "$snap" ]; then
@@ -212,8 +232,9 @@ mutate_tooth() {
     local name="$1" file="$2" mutation="$3" check_cmd="$4"
     local snap; snap="${file}.smoke.bak"
 
-    cp "$file" "$snap" || { bad "$name: cannot snapshot $file"; return; }
-    trap "mv -f \"$snap\" \"$file\" 2>/dev/null; rm -f \"$snap\"" EXIT
+    # cp -p: same mtime-preservation contract as tooth() above.
+    cp -p "$file" "$snap" || { bad "$name: cannot snapshot $file"; return; }
+    trap "mv -f \"$snap\" \"$file\" 2>/dev/null; case \"$file\" in *.rs) touch \"$file\";; esac; rm -f \"$snap\"" EXIT
 
     if ! sed -i "$mutation" "$file"; then
         bad "$name: sed failed to apply mutation"
