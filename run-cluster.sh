@@ -175,7 +175,17 @@ if [ "$DO_STOP" -eq 1 ]; then
     # Connects and immediately closes. Used only to WARN after a stop, never to
     # decide what to kill -- the pid file remains the sole authority for that.
     # /dev/tcp is a bash builtin, so this adds no dependency on curl or nc.
-    port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+    #
+    # The connect MUST be bounded. On a host whose loopback connect() to a
+    # closed port does not refuse promptly -- observed on WSL2 with
+    # networkingMode=mirrored, where a connect to a closed port hangs in
+    # SYN retransmission instead of getting ECONNREFUSED -- an unbounded
+    # probe turns --stop into a multi-minute-per-node hang AFTER the stop
+    # has already succeeded. timeout bounds each probe to 2s, far above a
+    # healthy refusal (<1ms); a timeout counts as "not answering".
+    port_open() {
+        timeout 2 bash -c 'exec 3<>"/dev/tcp/127.0.0.1/$1"' _ "$1" 2>/dev/null
+    }
 
     stopped=0; gone=0; killed=0
     survivors=""
