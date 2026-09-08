@@ -78,4 +78,13 @@ __attribute__((weak)) void user_destroy_page_table(uint64_t pml4_phys) { (void)p
 char stack_bottom[16] __attribute__((weak));
 char stack_top[16] __attribute__((weak));
 
+/* ─── the deferred drains cap_wait_chans' hlt wake now runs ──────────────── */
+/* kernel/process.c's cap_wait_chans drains the deferred console tick and
+ * the latched device-IRQ notifications at its post-hlt wake (the only
+ * process-context cadence on a single-CPU boot). Host tests that include
+ * kernel/process.c but not console_service.c/cap.c get counting stubs so
+ * "the drain ran" stays observable and the link stays closed. */
+__attribute__((weak)) void console_service_deferred_tick(void) { }
+__attribute__((weak)) void cap_irq_drain_pending(void)         { }
+
 #endif /* PROCESS_HOST_STUBS_H */

@@ -29,6 +29,11 @@ void sls_i386_guest_pf(uint64_t cr2, uint32_t error_code, uint64_t rip)
 { (void)cr2; (void)error_code; (void)rip; }
 void *object_catalog = 0;
 unsigned long object_catalog_count = 0;
+/* kernel/stubs.c's handle_page_fault calls process_find_current(); the
+ * oracle has no process table, so a NULL current-process is the right
+ * semantics (the fault path bails out). */
+struct ProcessDescriptor;
+struct ProcessDescriptor *process_find_current(void) { return 0; }
 char stack_bottom[1], stack_top[1];
 /* mbedtls_ms_time comes from the real tls_platform.c now. */
 void kernel_serial_print(const char *s);
