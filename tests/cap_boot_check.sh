@@ -13,6 +13,15 @@
 set -u
 cd "$(dirname "$0")/.." || exit 1
 
+# The built ISO is this check's prerequisite. Without it QEMU dies
+# instantly on the missing -cdrom — indistinguishable from a boot
+# failure. Exit 2 so run_checks.sh classifies the runtime guard as a
+# SKIP (kernel-guards builds the ISO and runs this check for real).
+[ -f sls_operating_system.iso ] || {
+    echo "ABORT: sls_operating_system.iso not found — run 'make x86-iso' first." >&2
+    exit 2
+}
+
 SER=/tmp/sls_serial
 rm -f "$SER.in" "$SER.out" boot_cap.log
 mkfifo "$SER.in" "$SER.out" 2>/dev/null || true
