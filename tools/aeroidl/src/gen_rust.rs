@@ -400,6 +400,15 @@ fn emit_serialize_value(out: &mut String, ast: &Value, var_name: &str, ty: &Valu
         }
         "named" => {
             let type_name = ty["name"].as_str().unwrap_or("Unknown");
+            // MemCap is the well-known MEM cap handle: a u16 cap slot on the
+            // wire (the arena bytes travel via the cap descriptor, not the
+            // payload buffer).
+            if type_name == "MemCap" {
+                out.push_str(&format!(
+                    "{indent}payload[{offset}..{offset}+2].copy_from_slice(&({var_name} as u16).to_le_bytes());\n"
+                ));
+                return;
+            }
             let fields = get_struct_field_names(ast, type_name);
             if !fields.is_empty() {
                 let mut inner_offset = offset;
@@ -464,6 +473,17 @@ fn emit_deserialize_reply(out: &mut String, ast: &Value, return_type: &Value, in
                 }
                 "named" => {
                     let type_name = ok_type["name"].as_str().unwrap_or("Unknown");
+                    // MemCap is the well-known MEM cap handle: it arrives in
+                    // cap_slots[0], not serialized into the reply buffer.
+                    if type_name == "MemCap" {
+                        out.push_str(&format!(
+                            "{indent}    let cap = cap_slots.first().copied().unwrap_or(0xFFFF);\n"
+                        ));
+                        out.push_str(&format!("{indent}    Ok(cap)\n"));
+                    }
+                    if type_name == "MemCap" {
+                        // handled above: the cap handle comes from cap_slots
+                    } else {
                     let fields = get_struct_field_names(ast, type_name);
                     if !fields.is_empty() {
                         let mut inner_offset = 8; // after ok byte + padding
@@ -487,7 +507,10 @@ fn emit_deserialize_reply(out: &mut String, ast: &Value, return_type: &Value, in
                                 }
                                 "named" => {
                                     let nested_name = f["ty"]["name"].as_str().unwrap_or("_");
-                                    // Enums deserialize via from_raw; structs keep the TODO.
+                                    // Enums deserialize via from_raw; nested
+                                    // structs read their primitive fields
+                                    // inline (recursion depth 1 covers every
+                                    // contract in idl/).
                                     if is_enum_type(ast, nested_name) {
                                         let first = enum_first_variant(ast, nested_name)
                                             .unwrap_or_else(|| "UNKNOWN".into());
@@ -495,8 +518,30 @@ fn emit_deserialize_reply(out: &mut String, ast: &Value, return_type: &Value, in
                                             "{indent}    let {fname} = {nested_name}::from_raw(u32::from_le_bytes(reply_buf[{inner_offset}..{inner_offset}+4].try_into().unwrap())).unwrap_or({nested_name}::{first});\n"
                                         ));
                                     } else {
+                                        let nested_fields = get_struct_field_names(ast, nested_name);
+                                        let mut nested_exprs: Vec<String> = Vec::new();
+                                        let mut n_off = inner_offset;
+                                        for nf in &nested_fields {
+                                            let nfname = nf["name"].as_str().unwrap_or("_");
+                                            let nk = nf["ty"]["kind"].as_str().unwrap_or("i32");
+                                            let nws = get_wire_size(&nf["ty"]) as usize;
+                                            match nk {
+                                                "i32" | "u32" | "f32" => nested_exprs.push(format!(
+                                                    "{nfname}: u32::from_le_bytes(reply_buf[{n_off}..{n_off}+4].try_into().unwrap())")),
+                                                "i64" | "u64" | "f64" => nested_exprs.push(format!(
+                                                    "{nfname}: u64::from_le_bytes(reply_buf[{n_off}..{n_off}+8].try_into().unwrap())")),
+                                                "i16" | "u16" => nested_exprs.push(format!(
+                                                    "{nfname}: u16::from_le_bytes(reply_buf[{n_off}..{n_off}+2].try_into().unwrap())")),
+                                                "i8" | "u8" | "bool" => nested_exprs.push(format!(
+                                                    "{nfname}: reply_buf[{n_off}] as _")),
+                                                _ => nested_exprs.push(format!(
+                                                    "{nfname}: core::mem::zeroed() /* TODO: {nk} */")),
+                                            }
+                                            n_off += nws;
+                                        }
                                         out.push_str(&format!(
-                                            "{indent}    let {fname} = 0; // TODO: deserialize nested {field_kind}\n"
+                                            "{indent}    let {fname} = {nested_name} {{ {} }};\n",
+                                            nested_exprs.join(", ")
                                         ));
                                     }
                                 }
@@ -537,6 +582,7 @@ fn emit_deserialize_reply(out: &mut String, ast: &Value, return_type: &Value, in
                         ));
                         out.push_str(&format!("{indent}    core::unimplemented!()\n"));
                     }
+                    }   /* end non-MemCap struct branch */
                 }
                 "array" => {
                     out.push_str(&format!(
@@ -599,21 +645,76 @@ fn emit_deserialize_reply(out: &mut String, ast: &Value, return_type: &Value, in
                 let mut inner_offset = 8;
                 for f in &fields {
                     let fname = f["name"].as_str().unwrap_or("_");
-                    emit_serialize_value(
-                        out,
-                        ast,
-                        fname,
-                        &f["ty"],
-                        inner_offset,
-                        indent,
-                    );
-                    inner_offset += get_wire_size(&f["ty"]) as usize;
+                    // Deserialize (not serialize): read the field out of the
+                    // reply buffer, then assemble the struct.
+                    let field_kind = f["ty"]["kind"].as_str().unwrap_or("i32");
+                    let ws = get_wire_size(&f["ty"]) as usize;
+                    match field_kind {
+                        "i32" | "u32" | "f32" => {
+                            out.push_str(&format!(
+                                "{indent}    let {fname} = u32::from_le_bytes(reply_buf[{inner_offset}..{inner_offset}+4].try_into().unwrap());\n"
+                            ));
+                        }
+                        "i64" | "u64" | "f64" => {
+                            out.push_str(&format!(
+                                "{indent}    let {fname} = u64::from_le_bytes(reply_buf[{inner_offset}..{inner_offset}+8].try_into().unwrap());\n"
+                            ));
+                        }
+                        "i8" | "u8" | "bool" => {
+                            out.push_str(&format!(
+                                "{indent}    let {fname} = reply_buf[{inner_offset}];\n"
+                            ));
+                        }
+                        "i16" | "u16" => {
+                            out.push_str(&format!(
+                                "{indent}    let {fname} = u16::from_le_bytes(reply_buf[{inner_offset}..{inner_offset}+2].try_into().unwrap());\n"
+                            ));
+                        }
+                        "named" => {
+                            let nested_name = f["ty"]["name"].as_str().unwrap_or("_");
+                            if is_enum_type(ast, nested_name) {
+                                let first = enum_first_variant(ast, nested_name)
+                                    .unwrap_or_else(|| "UNKNOWN".into());
+                                out.push_str(&format!(
+                                    "{indent}    let {fname} = {nested_name}::from_raw(u32::from_le_bytes(reply_buf[{inner_offset}..{inner_offset}+4].try_into().unwrap())).unwrap_or({nested_name}::{first});\n"
+                                ));
+                            } else {
+                                out.push_str(&format!(
+                                    "{indent}    let {fname} = core::mem::zeroed(); // TODO: deserialize nested {nested_name}\n"
+                                ));
+                            }
+                        }
+                        _ => {
+                            out.push_str(&format!(
+                                "{indent}    let {fname} = core::mem::zeroed(); // TODO: deserialize {field_kind}\n"
+                            ));
+                        }
+                    }
+                    inner_offset += ws;
                 }
+                let field_exprs: Vec<String> = fields
+                    .iter()
+                    .map(|f| {
+                        let fname = f["name"].as_str().unwrap_or("_");
+                        let is_enum = f["ty"]["kind"].as_str() == Some("named")
+                            && is_enum_type(ast, f["ty"]["name"].as_str().unwrap_or("_"));
+                        if is_enum {
+                            format!("{fname}: {fname}")
+                        } else {
+                            format!("{fname}: {fname} as _")
+                        }
+                    })
+                    .collect();
+                out.push_str(&format!(
+                    "{indent}Ok({type_name} {{ {} }})\n",
+                    field_exprs.join(", ")
+                ));
+            } else {
+                out.push_str(&format!(
+                    "{indent}// TODO: deserialize {type_name}\n"
+                ));
+                out.push_str(&format!("{indent}core::unimplemented!()\n"));
             }
-            out.push_str(&format!(
-                "{indent}// TODO: deserialize {type_name}\n"
-            ));
-            out.push_str(&format!("{indent}core::unimplemented!()\n"));
         }
         _ => {
             out.push_str(&format!(
@@ -850,6 +951,11 @@ pub const CHAN_FLAG_NO_REPLY: u16 = 0x0001;
 
 // Capability sentinel
 pub const CAP_NONE: u16 = 0xFFFF;
+
+// Well-known IDL type: a MEM cap handle (u16 slot into the shared arena).
+// Contracts reference it directly (buf: MemCap @arena); the typechecker
+// accepts it as built-in and every generator maps it to the 16-bit handle.
+pub type MemCap = u16;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Sidecar runtime FFI — provided by the sidecar SDK (linked separately)
