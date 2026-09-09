@@ -997,14 +997,33 @@ jobs:
       - name: Boot the decoder ISO and run the Step 6.4/M5 guest fixtures
         run: |
           qemu-img create -f raw sls_storage.img 10G >/dev/null
+          # The default grub entry (0) boots the Phase 5 sidecar initrd,
+          # which hands the machine to the init sidecar and NEVER starts
+          # the kernel HTTP server these fixtures drive — launch_init_sidecar
+          # enters ring 3 and never returns (see the comment in
+          # tests/grub_select_kernel_only.sh; this job predates Phase 5 and
+          # asserts the classic kernel HTTP world). Boot the SAME ISO's
+          # "kernel only" entry instead: a bidirectional serial pipe feeds
+          # grub the Down+Enter that selects entry 1, exactly like every
+          # HTTP-era boot guard (aerocap_boot_check & co).
+          SER=/tmp/sls_serial_decoder
+          rm -f "$SER.in" "$SER.out"
+          mkfifo "$SER.in" "$SER.out"
+          cat "$SER.out" > decoder_boot.log &
+          CATPID=$!
           qemu-system-x86_64 -cdrom sls_operating_system.iso \
               -drive id=disk,file=sls_storage.img,if=none,format=raw \
               -device nvme,drive=disk,serial=slsdev0 \
               -netdev user,id=net0,hostfwd=tcp::3001-:3000 \
               -device e1000,netdev=net0,mac=52:54:00:12:34:01 \
               -display none -m 4G -smp 4 -boot d -no-reboot \
-              -serial file:decoder_boot.log 2>/dev/null &
+              -serial pipe:"$SER" 2>/dev/null &
           QPID=$!
+          bash tests/grub_select_kernel_only.sh "$SER.in" decoder_boot.log "$QPID" || {
+            echo "FAILED: could not select the 'kernel only' grub entry" >&2
+            kill "$QPID" "$CATPID" 2>/dev/null || true
+            exit 1
+          }
           healthy=0
           for i in $(seq 1 75); do
             if curl -sf --max-time 2 http://localhost:3001/api/health >/dev/null 2>&1; then
@@ -1017,7 +1036,7 @@ jobs:
           if [ "$healthy" -ne 1 ]; then
             echo "FAILED: decoder kernel never answered /api/health" >&2
             tail -30 decoder_boot.log >&2
-            kill "$QPID" 2>/dev/null || true
+            kill "$QPID" "$CATPID" 2>/dev/null || true
             exit 1
           fi
           TOK=deadbeef01234567cafebabe76543210   # dave, DB_ADMIN
@@ -1036,7 +1055,7 @@ jobs:
               fail=1
             }
           done
-          kill "$QPID" 2>/dev/null || true
+          kill "$QPID" "$CATPID" 2>/dev/null || true
           wait "$QPID" 2>/dev/null || true
           grep -q "SLS-ELF-TEST] PASS" decoder_boot.log || {
             echo "FAILED: [SLS-ELF-TEST] PASS not in the serial log" >&2
