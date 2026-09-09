@@ -111,6 +111,12 @@ static void test_dot_stub(void) {
 extern uint16_t g_calculator_chan_w;
 extern uint16_t g_calculator_chan_r;
 
+/* The generated header declares the channel handles extern; a real
+ * program defines them during bootstrap. Define them here so this TU
+ * links standalone (test 9 verifies exactly that). */
+uint16_t g_calculator_chan_w = 0;
+uint16_t g_calculator_chan_r = 0;
+
 static void test_channel_handles(void) {
     /* Just verify they compile and link */
     (void)g_calculator_chan_w;
