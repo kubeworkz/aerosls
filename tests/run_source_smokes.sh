@@ -2,12 +2,14 @@
 # tests/run_source_smokes.sh — runs the SOURCE-ONLY guard smokes.
 #
 # ─── Why this exists ───────────────────────────────────────────────────────
-# run_guard_smokes.sh globs tests/*_smoke.sh, but five of the nineteen need
-# the linked kernel or its objects (they synthesize tooth inputs and then
-# restore-check against the real image), so that runner only works on a
-# build host. The other fourteen are source-only: they need only
-# gcc/binutils/python3/openssl and the sources in the tree — nothing built.
-# CI's verify job has no build, so those fourteen can and must run there.
+# run_guard_smokes.sh globs tests/*_smoke.sh, but seven of the
+# thirty-three need the linked kernel, its objects, or the built ISO
+# (they synthesize tooth inputs and then restore-check against the real
+# image, or boot the ISO under QEMU), so that runner only works on a
+# build host. The other twenty-six are source-only: they need only
+# gcc/binutils/python3/openssl/cargo/sbcl and the sources in the tree —
+# nothing built. CI's verify job has no build, so those twenty-six can
+# and must run there.
 #
 # A source-only smoke that runs ONLY on build hosts is a smoke that rots
 # unseen when the build breaks: the build host's job (kernel-guards) dies
@@ -17,8 +19,9 @@
 # the verify job calls, so every source-only smoke's teeth are proven on
 # every push, independent of the kernel build.
 #
-# The five build-needing smokes are excluded by name — the same five
-# guards carry GUARD-KIND: build for run_checks.sh. Everything else that
+# The seven build-needing smokes are excluded by name — five carry
+# GUARD-KIND: build for run_checks.sh, and the two phase5 boot smokes
+# boot the built ISO. Everything else that
 # globs *_smoke.sh runs here, so a NEW source-only smoke is covered
 # automatically; and a smoke that is NOT on the exclusion list but cannot
 # run is a failure, not a skip, so a smoke that stops being source-only
@@ -28,9 +31,12 @@
 set -u
 cd "$(dirname "$0")/.."   # repo root
 
-# The five smokes that need the linked kernel or its objects (the same set
-# as the GUARD-KIND: build markers in run_checks.sh). Keep in step.
-BUILD_SMOKES="code_buffer_budget_smoke.sh kernel_image_end_smoke.sh no_hosted_link_smoke.sh no_tls_relocations_smoke.sh stack_frame_budget_smoke.sh"
+# The seven build-needing smokes — the same set as the GUARD-KIND: build
+# markers in run_checks.sh, plus the two phase5 boot smokes (they boot
+# sls_operating_system.iso under QEMU, which only exists on a build host;
+# kernel-guards runs them for real right after `make x86-iso`). Keep in
+# step with what kernel-guards builds.
+BUILD_SMOKES="code_buffer_budget_smoke.sh kernel_image_end_smoke.sh no_hosted_link_smoke.sh no_tls_relocations_smoke.sh stack_frame_budget_smoke.sh phase5_boot_smoke.sh phase5_e1000_driver_smoke.sh"
 
 shopt -s nullglob
 smokes=(tests/*_smoke.sh)

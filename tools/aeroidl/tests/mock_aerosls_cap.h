@@ -76,9 +76,18 @@ aerosls_chan_recv(uint16_t chan_r,
                   size_t   *out_len,
                   uint16_t *out_n_caps)
 {
-    (void)chan_r; (void)buf; (void)buf_len;
+    (void)chan_r; (void)buf_len;
     (void)cap_slots; (void)max_caps;
     (void)out_kind; (void)out_tag; (void)out_len; (void)out_n_caps;
+    /* A failed/no-op receive must not leave the reply buffer holding
+     * garbage: zero it so generated stubs that read reply_buf[0] as the
+     * ok byte get a deterministic "error" verdict. */
+    if (buf) {
+        uint8_t *b = (uint8_t *)buf;
+        for (size_t i = 0; i < buf_len; i++) {
+            b[i] = 0;
+        }
+    }
     return 0;
 }
 

@@ -63,7 +63,17 @@ PY
 probe_pid=$!
 for _ in $(seq 1 30); do [ -s /tmp/rcs_probe_port ] && break; sleep 0.1; done
 pport="$(cat /tmp/rcs_probe_port 2>/dev/null || true)"
-if [ -n "$pport" ] && (exec 3<>"/dev/tcp/127.0.0.1/$pport") 2>/dev/null; then
+# Bounded probe: on a host where connect() to a closed loopback port hangs
+# (WSL2 mirrored networking does this after its loopback state goes stale),
+# an unbounded /dev/tcp probe hangs --stop's own re-probe AND this check's
+# listener waits. 2s per probe is far above a healthy refusal (<1ms) and
+# keeps the check fast everywhere.
+bash_closed_probe() {
+    local rc=0
+    timeout 2 bash -c 'exec 3<>"/dev/tcp/127.0.0.1/$1"' _ "$1" 2>/dev/null || rc=$?
+    return "$rc"
+}
+if [ -n "$pport" ] && bash_closed_probe "$pport"; then
     probe_supported=1
 fi
 kill "$probe_pid" 2>/dev/null || true; wait "$probe_pid" 2>/dev/null || true
@@ -179,7 +189,7 @@ PY
 listener=$!
 SPAWNED="$SPAWNED $listener"
 for _ in $(seq 1 40); do
-    (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && break
+    bash_closed_probe "$port" && break
     sleep 0.1
 done
 

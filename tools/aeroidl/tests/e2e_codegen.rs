@@ -544,8 +544,10 @@ fn e2e_c_header_balanced_ifdef() {
     let c = generate_c_header();
     let ifndef_count = c.matches("#ifndef").count();
     let endif_count = c.matches("#endif").count();
-    assert_eq!(ifndef_count, 1, "expected 1 #ifndef, got {ifndef_count}");
-    assert_eq!(endif_count, 3, "expected 3 #endif (guard + 2×__cplusplus)");
+    // 2 × #ifndef: the header guard + the AEROSLS_MEMCAP_T typedef guard
+    // (added when MemCap became a well-known IDL type).
+    assert_eq!(ifndef_count, 2, "expected 2 #ifndef, got {ifndef_count}");
+    assert_eq!(endif_count, 4, "expected 4 #endif (2 guards + 2×__cplusplus)");
     assert!(c.contains("#ifdef __cplusplus"));
     assert!(c.contains("extern \"C\" {"));
 }

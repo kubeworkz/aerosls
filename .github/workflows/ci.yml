@@ -205,33 +205,23 @@ jobs:
       # through green. They are *smoke.sh*, not *_check.sh, so
       # run_checks.sh and deploy.sh's guard gate never run them.
       #
-      # run_guard_smokes.sh runs all twenty-four, but five need the linked
-      # kernel or its objects, so that runner needs a build host. The
-      # other twenty-six are source-only — gcc/binutils/python3/openssl and
-      # the sources in the tree, nothing built — so they run HERE, on
-      # every push, independent of the kernel build. That independence is
-      # the point: tls_cert_oracle_smoke.sh failed at link for months,
-      # invisible because the build-host job (kernel-guards) died at its
-      # build step before reaching its smokes. run_source_smokes.sh keeps
-      # the source-only set green on its own, and fails any smoke that
-      # cannot run without being on its build-needed exclusion list.
-      - name: Source-only guard teeth (all 26 smokes that need no build)
-        run: bash tests/run_source_smokes.sh
-        working-directory: aerosls2
-
-      # ─── Rust toolchain for the AeroIDL gate ───────────────────────────
-      # The aeroidl-check gate below needs cargo. This runner is
-      # self-hosted, so the toolchain may or may not be pre-installed;
-      # probe for it rather than assuming either way. rustup is the
-      # standard installer for a modern glibc Linux toolchain (the
-      # distro's rustc is routinely years old and can lag Cargo's
-      # edition/resolver features); it is idempotent, so a runner that
-      # already has it is untouched. `~/.cargo/bin` is added to
+      # ─── Rust toolchain for the AeroIDL gate and the gate smokes ──────
+      # The aeroidl-check gate below needs cargo, and so do two of the
+      # source smokes the step after next runs: aeroidl_gate_smoke.sh and
+      # polyglot_latency_gate_smoke.sh abort (exit 2) without it. A
+      # GITHUB_PATH entry is only visible to *later* steps, so this
+      # toolchain step must come BEFORE the source-smokes step. This
+      # runner is self-hosted, so the toolchain may or may not be
+      # pre-installed; probe for it rather than assuming either way.
+      # rustup is the standard installer for a modern glibc Linux
+      # toolchain (the distro's rustc is routinely years old and can lag
+      # Cargo's edition/resolver features); it is idempotent, so a runner
+      # that already has it is untouched. `~/.cargo/bin` is added to
       # GITHUB_PATH so later steps see cargo even though rustup installs
       # outside the job's initial PATH. No third-party action: the rest
       # of this file uses only actions/checkout, and the fallback logic
       # is two lines.
-      - name: Ensure the Rust toolchain (cargo for aeroidl-check)
+      - name: Ensure the Rust toolchain (cargo for aeroidl-check and the gate smokes)
         run: |
           set -e
           if command -v cargo >/dev/null 2>&1; then
@@ -245,6 +235,20 @@ jobs:
           fi
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           "$HOME/.cargo/bin/cargo" --version
+
+      # run_guard_smokes.sh runs all twenty-four, but five need the linked
+      # kernel or its objects, so that runner needs a build host. The
+      # other smokes are source-only — gcc/binutils/python3/openssl and
+      # the sources in the tree, nothing built — so they run HERE, on
+      # every push, independent of the kernel build. That independence is
+      # the point: tls_cert_oracle_smoke.sh failed at link for months,
+      # invisible because the build-host job (kernel-guards) died at its
+      # build step before reaching its smokes. run_source_smokes.sh keeps
+      # the source-only set green on its own, and fails any smoke that
+      # cannot run without being on its build-needed exclusion list.
+      - name: Source-only guard teeth (all smokes that need no build)
+        run: bash tests/run_source_smokes.sh
+        working-directory: aerosls2
 
       # Print the active toolchain and rustc version so a toolchain
       # mismatch between CI runs is diagnosable from logs alone, without

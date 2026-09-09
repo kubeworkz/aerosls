@@ -396,6 +396,21 @@ fn emit_method_stub(out: &mut String, ast: &Value, m: &Value, prefix: &str, mod_
     } else {
         out.push_str("    uint8_t payload[1]; /* empty payload */\n");
     }
+
+    // Cap-handle placeholder parameters (e.g. `uint16_t /* cap handle */ text`)
+    // never appear in the body: the wire payload carries only scalars, and the
+    // handle itself travels in the caps[] table via the companion `*_cap`
+    // parameter. Silence them explicitly so -Werror builds of the generated
+    // header stay clean (the aeroidl-check gate compiles with -Werror).
+    for p in params {
+        if p["needs_cap"].as_bool().unwrap_or(false) {
+            let pname = p["name"].as_str().unwrap();
+            out.push_str(&format!(
+                "    (void){pname}; /* cap handle travels in the caps[] table */\n"
+            ));
+        }
+    }
+
     out.push('\n');
 
     // Send request
@@ -584,7 +599,12 @@ fn emit_method_stub(out: &mut String, ast: &Value, m: &Value, prefix: &str, mod_
                         .map(|f| f.iter().any(|f| f["name"].as_str() == Some("message")))
                         .unwrap_or(false)
                     {
-                        out.push_str("        result.err.message = NULL;\n");
+                        // Post-MemCap, a `string` field is a uint16_t cap
+                        // handle (an arena slot), not a char* — assign the
+                        // well-known no-cap sentinel rather than NULL.
+                        out.push_str(
+                            "        result.err.message = AEROSLS_CAP_NONE; /* no message cap */\n",
+                        );
                     }
                 }
                 "string" => {
