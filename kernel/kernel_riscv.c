@@ -262,17 +262,19 @@ static struct RvTask* g_rv_current;
 static uint8_t g_rv_preempt_from[RV_PREEMPT_LOG_MAX];
 static uint8_t g_rv_preempt_to[RV_PREEMPT_LOG_MAX];
 static uint64_t g_rv_preempt_n;
+/* Every rotation, uncapped (the log above saturates at
+ * RV_PREEMPT_LOG_MAX; a host-stretched demo rotates past it). */
+static uint64_t g_rv_rotations;
 
 /* The demo's tick cadence and the wall-clock cadence teeth: the mtime
  * at the FIRST preemption (recorded by rv_scheduler_tick, so the
- * pending-arm delay before the first tick is excluded), and the
- * elapsed assert bounds. 16 intervals between the 17 rotations at the
- * 2ms period = 320,000 ticks, plus the last task's tail work — so a
- * correct run lands in [300,000, 500,000): the lower bound proves the
- * cadence was NOT faster than 2ms, the upper bound proves it was NOT
- * 4ms or slower (16 x 40,000 = 640,000 would fail it). */
+ * pending-arm delay before the first tick is excluded), for the
+ * elapsed lower bound, and the SHORTEST gap between the comparator
+ * deadlines of consecutive rotating ticks, for the cadence itself. */
 #define RV_DEMO_TICK_TICKS (SBI_TIMER_TICKS_PER_SEC / 500)   /* 2ms at 10 MHz */
 static uint64_t g_rv_t0;
+static uint64_t g_rv_last_deadline;
+static uint64_t g_rv_min_interval;
 
 /* The preemption guard: 1 while a COOPERATIVE switch is in flight
  * (rv_task_switch_fp's FP save/load + coroutine handoff), so the tick
@@ -450,8 +452,17 @@ void rv_scheduler_tick(void) {
     /* Record the rotation for the driver's batched preempt log — no
      * inline print: at the demo's 2ms cadence a UART print here would
      * steal ~0.15ms from the incoming task's slice. The first rotation
-     * also stamps the wall-clock start of the cadence measurement. */
-    if (g_rv_preempt_n == 0) g_rv_t0 = rv_rdtime();
+     * also stamps the wall-clock start of the cadence measurement; every
+     * later one folds its deadline gap into the minimum (this runs right
+     * after the handler's re-arm, so sbi_next_tick is THIS tick's
+     * now + period). */
+    uint64_t deadline = sbi_next_tick();
+    if (g_rv_rotations++ == 0) {
+        g_rv_t0 = rv_rdtime();
+    } else if (deadline - g_rv_last_deadline < g_rv_min_interval) {
+        g_rv_min_interval = deadline - g_rv_last_deadline;
+    }
+    g_rv_last_deadline = deadline;
     if (g_rv_preempt_n < RV_PREEMPT_LOG_MAX) {
         g_rv_preempt_from[g_rv_preempt_n] = (uint8_t)(cur - g_rv_tasks);
         g_rv_preempt_to[g_rv_preempt_n] = (uint8_t)(next - g_rv_tasks);
@@ -673,6 +684,8 @@ static void rv_fp_round_robin_demo(void) {
     for (uint64_t i = 0; i < RV_TASK_COUNT; i++)
         rv_task_init(&g_rv_tasks[i], rv_fp_task_common, i, g_rv_spec[i].name);
     g_rv_preempt_n = 0;   /* fresh preempt log for this run */
+    g_rv_rotations = 0;
+    g_rv_min_interval = ~0ULL;
     uint64_t lazy_before = g_fp_lazy_count;
     /* 2ms slices for the demo — the sub-print-cost stress: the 10MHz
      * timebase counts 20,000 ticks per 2ms period, so the 15 slice
@@ -708,6 +721,11 @@ static void rv_fp_round_robin_demo(void) {
         rv_boot_print(g_rv_spec[g_rv_preempt_from[i]].name);
         rv_boot_print("->");
         rv_boot_print(g_rv_spec[g_rv_preempt_to[i]].name);
+    }
+    if (g_rv_rotations > g_rv_preempt_n) {
+        rv_boot_print(" ... (+");
+        rv_boot_print_udec64(g_rv_rotations - g_rv_preempt_n);
+        rv_boot_print(" unlogged)");
     }
     rv_boot_print("\n");
     uint64_t lazy_delta = g_fp_lazy_count - lazy_before;
@@ -746,28 +764,30 @@ static void rv_fp_round_robin_demo(void) {
     int acc_ok = (g_rv_tasks[0].lcg_acc == 0xf2dc5340ULL) &&
                  (g_rv_tasks[1].lcg_acc == 0xf2dc5340ULL) &&
                  (g_rv_tasks[2].lcg_acc == 0xf2dc5340ULL);
-    /* The wall-clock cadence teeth, re-aimed for the in_work gate:
-     * elapsed mtime from the FIRST preemption to the queue emptying.
-     * The lower bound (>= RV_TASK_SLICES ticks) proves the cadence was
-     * never faster than 2ms — 15 slice boundaries cannot pass in less
-     * wall time at the set period. The upper bound must be RELATIVE to
-     * the actual rotation count, not a flat constant: work-phase ticks
-     * are now uncounted, so on a slow host the demo's wall time can
-     * stretch arbitrarily (rotations pile up in overruns, the average
-     * interval stays ~2ms) and any flat bound wide enough to absorb
-     * that would also admit a real 4ms cadence. Assert the average
-     * interval instead, below 1.5 ticks: rotations happen only at
-     * ticks, so every interval is exactly the set period and the only
-     * excess is the last task's tail work — a 2ms cadence averages
-     * ~1.1 ticks at most, while a genuine 4ms cadence averages exactly
-     * 2.0 ticks. (Caveat: the preempt log caps at 32 rotations, so an
-     * EXTREME stretch could undercount intervals and false-fail the
-     * bound; observed maxima on WSL2 are ~30 rotations, and native-Linux
-     * CI is faster — the cap does not bind in practice.) */
+    /* The wall-clock cadence teeth, re-aimed for the in_work gate and
+     * for a loaded host. The elapsed lower bound (>= RV_TASK_SLICES
+     * ticks from the FIRST preemption to the queue emptying) proves the
+     * cadence was never faster than 2ms — 15 slice boundaries cannot
+     * pass in less wall time at the set period.
+     *
+     * The upper bound is the SHORTEST deadline gap, not the elapsed
+     * time or its average per rotation. The tick handler always
+     * re-arms at now + period (by the time it runs, now >= the deadline
+     * that fired, so sbi_arm_timer takes its resync branch), which makes
+     * each gap exactly one period plus however late that tick was
+     * delivered. Lateness only ever ADDS: a host that descheduled QEMU
+     * stretches some gaps, never shortens one. An average-based bound
+     * therefore false-fails a correct 2ms cadence on a starved host
+     * (a WSL2 runner swapping behind a synthesis job measured 1.88-1.92
+     * ticks per interval, and the capped preempt log undercounted the
+     * intervals on top), while a genuine 4ms cadence can never produce
+     * a gap under 40,000. So: min gap in [period, 1.5 x period) — the
+     * lower edge is guaranteed by the re-arm arithmetic, the upper edge
+     * needs just one tick in the whole run delivered on time. */
     uint64_t elapsed = rv_rdtime() - g_rv_t0;
-    uint64_t intervals = g_rv_preempt_n > 1 ? g_rv_preempt_n - 1 : 1;
     int mtime_ok = (elapsed >= RV_TASK_SLICES * RV_DEMO_TICK_TICKS) &&
-                   (elapsed * 2 < 3 * intervals * RV_DEMO_TICK_TICKS);
+                   (g_rv_min_interval >= RV_DEMO_TICK_TICKS) &&
+                   (g_rv_min_interval * 2 < 3 * RV_DEMO_TICK_TICKS);
     rv_boot_print("[TASK] fp_save rows: A=");
     rv_boot_print_hex64(phd->fp_save[0][10]);
     rv_boot_print(" B=");
@@ -794,6 +814,11 @@ static void rv_fp_round_robin_demo(void) {
     rv_boot_print("/");
     rv_boot_print_hex64(g_rv_tasks[2].lcg_acc);
     rv_boot_print(acc_ok ? " PASS;" : " FAIL;");
+    rv_boot_print(" rotations: ");
+    rv_boot_print_udec64(g_rv_rotations);
+    rv_boot_print(", min tick gap: ");
+    rv_boot_print_udec64(g_rv_min_interval);
+    rv_boot_print(";");
     rv_boot_print(" mtime: ");
     rv_boot_print_udec64(elapsed);
     rv_boot_print(mtime_ok ? " PASS\n" : " FAIL\n");
