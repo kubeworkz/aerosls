@@ -173,6 +173,10 @@ uint64_t rv_rdtime(void) {
     return t;
 }
 
+uint64_t sbi_next_tick(void) {
+    return g_next_tick;
+}
+
 #if defined(RISCV_MMODE)
 #define CLINT_MTIMECMP 0x02004000UL   /* hart 0's mtimecmp: CLINT base + 0x4000 */
 #endif

@@ -1258,16 +1258,14 @@ jobs:
             tail -30 boot_rv.log >&2
             exit 1
           }
-          # The wall-clock cadence teeth: the kernel checks elapsed mtime
-          # from the first preemption to the queue emptying against the
-          # ACTUAL rotation count (average interval below 1.5 ticks) —
-          # the demo's in_work gate makes the 15/15 accounting exact by
-          # construction, and on a slow host the wall time stretches
-          # while the average interval stays ~2ms, so a flat bound would
-          # flake. The check still fails a genuine 4ms-or-slower cadence
-          # (it averages 2.0 ticks per interval) and a faster-than-2ms
-          # one (the lower bound). The exact value is host-dependent, so
-          # only the shape is pinned here.
+          # The wall-clock cadence teeth: the kernel asserts the SHORTEST
+          # gap between consecutive rotating ticks' timer deadlines is in
+          # [1, 1.5) periods, plus elapsed mtime >= 15 ticks. Every re-arm
+          # is now + period, so host stalls only lengthen gaps: a starved
+          # runner still has one on-time tick (an average-based bound
+          # flaked there), while a genuine 4ms cadence can never produce
+          # a gap under 2 periods. ISA doc Phase 16 follow-up #16. The
+          # exact values are host-dependent, so only the shape is pinned.
           grep -aE "mtime: [0-9]+ PASS" boot_rv.log || {
             echo "FAILED: the demo's measured wall-clock cadence did not match the 2ms tick in S-mode" >&2
             tail -30 boot_rv.log >&2
