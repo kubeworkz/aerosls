@@ -105,14 +105,23 @@ if [ -z "$ACCEL" ]; then
     fi
 fi
 
+# Host port: the first free loopback one, never a fixed number — the deploy
+# gate runs this while live cluster nodes hold 3000+i (the fixed 3003 made
+# QEMU die on "Could not set up host forwarding rule" on 2026-09-13). QEMU's
+# stderr is kept so a failed start names its cause instead of looking like a
+# grub failure.
+PORT=$(bash tests/free_port.sh) || { echo "ABORT: no free port in 3001..3020" >&2; exit 2; }
+BASE="http://127.0.0.1:$PORT"
+qemu_err() { [ -s "$W/qemu.err" ] && sed 's/^/      qemu: /' "$W/qemu.err" >&2; }
+
 qemu-system-x86_64 -cdrom sls_operating_system.iso \
     -drive id=disk,file="$IMG",if=none,format=raw \
     -device nvme,drive=disk,serial=slsdev0 \
-    -netdev user,id=net0,hostfwd=tcp::3003-:3000 \
+    -netdev user,id=net0,hostfwd=tcp:127.0.0.1:$PORT-:3000 \
     -device e1000,netdev=net0,mac=52:54:00:12:34:03 \
     -display none -m 4G -smp 4 -boot d -no-reboot \
     $ACCEL \
-    -serial pipe:"$SER" 2>/dev/null &
+    -serial pipe:"$SER" 2>"$W/qemu.err" &
 QPID=$!
 
 # Cleanup on any exit path (including SIGTERM from run_checks.sh's per-guard
@@ -131,6 +140,7 @@ trap 'cleanup; exit 1' TERM INT
 # server this check asserts (see tests/grub_select_kernel_only.sh).
 bash tests/grub_select_kernel_only.sh "$SER.in" boot_simi.log "$QPID" || {
     echo "FAILED: could not select the 'kernel only' grub entry (QEMU or grub failed)" >&2
+    qemu_err
     kill "$QPID" 2>/dev/null
     exit 1
 }
@@ -145,10 +155,10 @@ for i in $(seq 1 120); do
     if ! kill -0 "$QPID" 2>/dev/null; then break; fi
     sleep 1
 done
-[ "$saw_http" -eq 1 ] || { echo "FAILED: HTTP listener not seen"; kill "$QPID" 2>/dev/null; exit 1; }
+[ "$saw_http" -eq 1 ] || { echo "FAILED: HTTP listener not seen"; qemu_err; kill "$QPID" 2>/dev/null; exit 1; }
 
 sleep 2
-python3 utils/program_upload.py --host http://localhost:3003 \
+python3 utils/program_upload.py --host $BASE \
                                 --file user/examples/simi_recycle.bin \
                                 --name simi_recycle >/dev/null 2>&1 || {
     echo "FAILED: program_upload.py could not upload simi_recycle" >&2
@@ -156,13 +166,13 @@ python3 utils/program_upload.py --host http://localhost:3003 \
 }
 
 metrics_frames() {
-    curl -s --max-time 300 http://localhost:3003/api/metrics \
+    curl -s --max-time 300 $BASE/api/metrics \
          -H "Authorization: Bearer deadbeef01234567cafebabe76543210" \
          2>/dev/null | sed -n 's/.*"ram_allocated_frames":\([0-9]*\).*/\1/p'
 }
 frames_before=$(metrics_frames)
 
-curl -s --max-time 300 -X POST http://localhost:3003/api/program/spawn \
+curl -s --max-time 300 -X POST $BASE/api/program/spawn \
      -H "Content-Type: application/json" \
      -H "Authorization: Bearer deadbeef01234567cafebabe76543210" \
      -d '{"name":"simi_recycle"}' >/dev/null 2>&1 || {
