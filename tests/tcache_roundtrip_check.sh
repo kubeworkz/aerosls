@@ -340,24 +340,10 @@ done
     exit 2
 }
 
-# Port. Default 3001; if it is taken (a live node on a deploy host, a
-# previous boot), step up. A taken port must fail to bind, not silently
-# test the wrong service.
-#
-# Each probe is bounded (timeout 2): on a host where connect() to a closed
-# loopback port hangs instead of refusing -- observed on WSL2 with
-# networkingMode=mirrored after its loopback state goes stale -- an
-# unbounded probe hangs the port scan forever. A healthy refusal is <1ms,
-# so 2s never changes the answer on a well host; a hung probe is treated
-# as free, and a genuinely taken port still makes QEMU's bind fail loudly.
+# Port. The first free one in 3001..3020 (a live node on a deploy host, a
+# previous boot) — see tests/free_port.sh for why and how it probes.
 if [ -z "$PORT" ]; then
-    for p in $(seq 3001 3020); do
-        if ! timeout 2 bash -c 'exec 3<>"/dev/tcp/127.0.0.1/$1"' _ "$p" 2>/dev/null; then
-            PORT=$p
-            break
-        fi
-    done
-    [ -n "$PORT" ] || { echo "ABORT: no free port in 3001..3020" >&2; exit 2; }
+    PORT=$(bash tests/free_port.sh) || { echo "ABORT: no free port in 3001..3020" >&2; exit 2; }
 fi
 
 W="$(mktemp -d)"

@@ -71,14 +71,20 @@ if [ -z "$ACCEL" ]; then
     fi
 fi
 
+# No hostfwd: this check drives the guest over serial only, and a fixed host
+# port can collide with live cluster nodes (3000+i) when the deploy gate runs
+# it — two sibling checks' fixed ports failed that way on 2026-09-13. QEMU's
+# stderr is kept so a failed start names its cause.
+qemu_err() { [ -s "$W/qemu.err" ] && sed 's/^/      qemu: /' "$W/qemu.err" >&2; }
+
 qemu-system-x86_64 -cdrom sls_operating_system.iso \
     -drive id=disk,file="$IMG",if=none,format=raw \
     -device nvme,drive=disk,serial=slsdev0 \
-    -netdev user,id=net0,hostfwd=tcp::3012-:3000 \
+    -netdev user,id=net0 \
     -device e1000,netdev=net0,mac=52:54:00:12:34:01 \
     -display none -m 4G -smp 4 -boot d -no-reboot \
     $ACCEL \
-    -serial pipe:"$SER" 2>/dev/null &
+    -serial pipe:"$SER" 2>"$W/qemu.err" &
 QPID=$!
 
 # Cleanup on any exit path (including SIGTERM from run_checks.sh's per-guard
@@ -101,7 +107,7 @@ for i in $(seq 1 120); do
     if ! kill -0 "$QPID" 2>/dev/null; then break; fi
     sleep 1
 done
-[ "$saw_banner" -eq 1 ] || { echo "FAILED: boot banner not seen"; kill "$QPID" 2>/dev/null; exit 1; }
+[ "$saw_banner" -eq 1 ] || { echo "FAILED: boot banner not seen"; qemu_err; kill "$QPID" 2>/dev/null; exit 1; }
 
 # Wait for the Phase-5 POSIX shell prompt ('$ ') before typing.
 saw_prompt=0
