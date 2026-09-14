@@ -12,8 +12,11 @@
 # working one.
 #
 # Run this ON THE SERVER (aerosls.kubeworkz.io), from inside the aerosls2
-# checkout, where pm2 manages the kernel process (confirmed with Dave --
-# local dev is unaffected, `make x86-run` there is unchanged).
+# checkout, where pm2 manages the live service (confirmed with Dave --
+# local dev is unaffected, `make x86-run` there is unchanged). Since
+# 2026-09-11 that service is the 4-node cluster, pm2 app `run-cluster`
+# (`./run-cluster.sh --nodes 4`, node i on localhost:3000+i); the old
+# single-kernel pm2 app `aerosls-kernel` has been stopped since 2026-07-31.
 #
 # Assumes the kernel's build dependencies (../qemu) are checked out as
 # sibling directories. The webapp bundle does NOT need ../slsos-sim: it is
@@ -22,17 +25,23 @@
 set -u
 
 # Confirm/override with `pm2 list` -- this script doesn't know your actual
-# process name, only that pm2 is what manages it.
-PM2_APP_NAME="${PM2_APP_NAME:-aerosls-kernel}"
+# process name, only that pm2 is what manages it. The default was
+# `aerosls-kernel` until 2026-09-13: with the cluster live, restarting that
+# stopped app starts a lone kernel that cannot bind 3001 (node 1 holds it),
+# so the health wait below fails and the cluster keeps serving the old build.
+PM2_APP_NAME="${PM2_APP_NAME:-run-cluster}"
 # Hits the kernel directly, not through nginx/Cloudflare -- this script is
 # verifying the KERNEL came up correctly, not the whole public chain, which
 # has its own separate failure modes this isn't trying to catch.
 HEALTH_URL="${HEALTH_URL:-http://localhost:3001/api/health}"
-# 30 x 2s = 60s: the window must cover old-process port release PLUS a
+# 150 x 2s = 300s: the window must cover old-process port release PLUS a
 # fresh TCG boot of the new kernel. The pre-fix check "succeeded" in the
 # first poll because it accepted the dying process -- the honest wait is
-# longer than that.
-HEALTH_RETRIES="${HEALTH_RETRIES:-30}"
+# longer than that. A `run-cluster` restart also stops all four nodes,
+# rebuilds four node ISOs and boots all four under TCG (this host has no
+# KVM) before node 1 answers on 3001, so the single-kernel 60s window
+# would fail a healthy cluster deploy.
+HEALTH_RETRIES="${HEALTH_RETRIES:-150}"
 HEALTH_RETRY_DELAY_SECS="${HEALTH_RETRY_DELAY_SECS:-2}"
 
 cd "$(dirname "$0")/.."   # aerosls2 repo root
