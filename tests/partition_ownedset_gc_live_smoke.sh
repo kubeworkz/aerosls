@@ -41,8 +41,9 @@
 # boot counter reached 2.
 #
 # Runs on a port base far from any real cluster and never touches a running
-# one: it refuses to start if cluster/cluster.pids names any live process,
-# and it restores/removes the pid file it writes.
+# one: the guard's pid file lives in a private temp dir (AEROSLS_CLUSTER_DIR),
+# so it runs beside a live cluster, and it asserts at the end that the repo's
+# cluster/cluster.pids is unchanged.
 #
 # Exit: 0 all teeth bit, 1 a tooth failed, 2 prerequisite missing.
 set -u
@@ -51,28 +52,27 @@ cd "$(dirname "$0")/.."
 GUARD=tests/partition_ownedset_gc_live_check.sh
 FAKE=tests/partition_ownedset_gc_smoke_nodes.py
 BASE=59000
-PID_FILE=cluster/cluster.pids
 
 [ -f "$GUARD" ] || { echo "ABORT: $GUARD not found or not executable."; exit 2; }
 [ -f "$FAKE" ]  || { echo "ABORT: $FAKE not found."; exit 2; }
 command -v python3 >/dev/null 2>&1 || { echo "ABORT: python3 needed to stand up fake nodes."; exit 2; }
 command -v curl    >/dev/null 2>&1 || { echo "ABORT: curl not found."; exit 2; }
 
-# A real cluster must not be running: this smoke writes cluster/cluster.pids
-# and the guard kills whatever that file names. Refuse rather than guess.
-if [ -s "$PID_FILE" ]; then
-    while read -r _ pid; do
-        if [ -n "${pid:-}" ] && kill -0 "$pid" 2>/dev/null; then
-            echo "ABORT: $PID_FILE names live pid $pid -- a real cluster is running." >&2
-            echo "       Stop it first (./run-cluster.sh --stop) -- this smoke uses" >&2
-            echo "       fake nodes on port base $BASE and must not touch it." >&2
-            exit 2
-        fi
-    done < "$PID_FILE"
-    echo "note: $PID_FILE was stale (no live pids); removing it." >&2
-    rm -f "$PID_FILE"
-fi
-mkdir -p cluster
+# The guard's cluster dir is a PRIVATE temp dir, never the repo's cluster/.
+# The guard kills and relaunches whatever cluster.pids names, and the deploy
+# gate runs this smoke on the host where the real cluster is live -- with a
+# shared cluster/cluster.pids the only safe move was to refuse, and a smoke
+# that cannot run proves nothing (the 2026-09-13 deploy gate failed on
+# exactly that). AEROSLS_CLUSTER_DIR is exported so EVERY guard call below,
+# the silent no-cluster tooth included, resolves its pid file here and can
+# never read a real cluster's.
+SMOKE_CLUSTER_DIR="$(mktemp -d)" || { echo "ABORT: mktemp -d failed."; exit 2; }
+export AEROSLS_CLUSTER_DIR="$SMOKE_CLUSTER_DIR"
+PID_FILE="$SMOKE_CLUSTER_DIR/cluster.pids"
+# The repo's own cluster/cluster.pids (a live cluster's, on a deploy host)
+# must be unchanged when this smoke ends -- asserted at the bottom.
+real_pids_sum() { if [ -f cluster/cluster.pids ]; then cksum < cluster/cluster.pids; else echo absent; fi; }
+REAL_PIDS_BEFORE="$(real_pids_sum)"
 
 fails=0
 STATE=""
@@ -89,7 +89,7 @@ cleanup_fakes() {
     wait 2>/dev/null
     return 0
 }
-cleanup() { cleanup_fakes; [ -n "$STATE" ] && rm -rf "$STATE"; return 0; }
+cleanup() { cleanup_fakes; [ -n "$STATE" ] && rm -rf "$STATE"; rm -rf "$SMOKE_CLUSTER_DIR"; return 0; }
 trap cleanup EXIT
 
 # $1 = mode, $2 = expected exit, $3 = a phrase the output must contain,
@@ -173,6 +173,15 @@ else
             printf '%s\n' "$out" | sed 's/^/           /'
             fails=$((fails + 1)) ;;
     esac
+fi
+
+# Isolation: every guard call above used the private dir, so the repo's
+# cluster/cluster.pids (a live cluster's, on a deploy host) is untouched.
+if [ "$(real_pids_sum)" = "$REAL_PIDS_BEFORE" ]; then
+    echo "ISOLATION OK   the repo's cluster/cluster.pids is unchanged (pid files lived in $SMOKE_CLUSTER_DIR)"
+else
+    echo "ISOLATION FAIL the repo's cluster/cluster.pids changed during the smoke -- a guard call escaped AEROSLS_CLUSTER_DIR"
+    fails=$((fails + 1))
 fi
 
 echo

@@ -121,6 +121,10 @@
 #   AEROSLS_LOG_DIR               where node<id>.log serial logs live
 #                                (default: cluster/). The smoke points this
 #                                at its scratch state dir.
+#   AEROSLS_CLUSTER_DIR          where cluster.pids lives (default: cluster/,
+#                                run-cluster.sh's). The smoke points this at
+#                                a private temp dir, so it can run beside a
+#                                live cluster without touching its pid file.
 #
 # Exit: 0 pass, 1 fail (the property was violated), 2 abort (missing
 # prerequisite: no cluster, no pid file, < 3 nodes).
@@ -141,7 +145,7 @@ TOKEN="${AEROSLS_TOKEN:-}"
 FAKE="${AEROSLS_FAILOVER_FAKE:-0}"
 FAST="${AEROSLS_FAILOVER_FAST:-0}"
 CTL="tools/aeroslsctl"
-CLUSTER_DIR="cluster"
+CLUSTER_DIR="${AEROSLS_CLUSTER_DIR:-cluster}"
 LOG_DIR="${AEROSLS_LOG_DIR:-$CLUSTER_DIR}"
 PID_FILE="$CLUSTER_DIR/cluster.pids"
 NAME="guard-failover-$$"             # unique per run, so a stale persisted
