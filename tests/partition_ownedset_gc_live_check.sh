@@ -61,6 +61,10 @@
 #                                (default: cluster/). The smoke points this
 #                                at its scratch state dir so the fake nodes'
 #                                logs cannot touch a real cluster's.
+#   AEROSLS_CLUSTER_DIR          where cluster.pids lives (default: cluster/,
+#                                run-cluster.sh's). The smoke points this at
+#                                a private temp dir, so it can run beside a
+#                                live cluster without touching its pid file.
 #
 # Exit: 0 pass, 1 fail (the property was violated), 2 abort (missing
 # prerequisite: no cluster, no pid file, /proc unreadable).
@@ -81,7 +85,7 @@ TOKEN="${AEROSLS_TOKEN:-}"
 FAKE="${AEROSLS_GC_FAKE:-0}"
 FAST="${AEROSLS_GC_FAST:-0}"
 CTL="tools/aeroslsctl"
-CLUSTER_DIR="cluster"
+CLUSTER_DIR="${AEROSLS_CLUSTER_DIR:-cluster}"
 LOG_DIR="${AEROSLS_LOG_DIR:-$CLUSTER_DIR}"
 PID_FILE="$CLUSTER_DIR/cluster.pids"
 NAME="guard-gc-$$"                     # unique per run, so a stale persisted
