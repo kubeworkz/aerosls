@@ -72,9 +72,9 @@ Phase numbers carry an `E` prefix so they cannot be confused with the LPAR roadm
 | E4 | Partition-targeted creation and an environment manager in `init` | E1, E3 | Medium |
 | E5 | Environment lifecycle and teardown | E4 | Medium |
 | E6 | Per-environment terminals and the control-plane surface (HTTP, shell, `aeroslsctl`) | E4 | Low-medium |
-| E7 | Static-binary Linux ABI shim — the binary-compatibility half of PASE | E3 (runs inside an environment) | **High** — its own design pass first |
+| E7 | Static-binary Linux ABI shim — the binary-compatibility half of PASE | E3 (runs inside an environment); environment checkpoint/restore from the v0.2 plan, to pass its gate (§10, §12) | **High** — its own design pass first |
 
-Milestone **M1 — on-demand POSIX environments** is E1–E6. Milestone **M2 — PASE parity** is E7.
+Milestone **M1 — on-demand POSIX environments** is E1–E6. Milestone **M2 — PASE parity** is E7, and it also needs environment checkpoint/restore, which is not an M1 phase (§10, §12).
 
 ## 4. Phase E1 — Unified boot
 
@@ -176,6 +176,8 @@ This document adds only where it runs: **inside an environment**, as a Linux-per
 1. **Syscall routing.** A static binary's `syscall` instruction traps to the kernel. Either the kernel dispatches Linux-personality syscalls itself (the H2 roadmap counts 131 existing `SYS_` handlers as a head start), or it forwards them to the owning POSIX sidecar's core over a channel, keeping POSIX semantics in one place. These have very different security and performance profiles.
 2. **Architecture.** The H2 roadmap targets native ARM64; the sidecar world and the live cluster are x86-64 today.
 
+**A prerequisite outside M1.** The inherited gate requires surviving a checkpoint/restore cycle, and no environment state is checkpointed today. `checkpoint_trigger()` (`kernel/checkpoint_mgr.c`) persists kernel data regions — the catalog, program store, partitions, row and vector stores, services, workloads — but no process or sidecar state: not a sidecar's address space, not its capability table or channels, not its ramdisk contents. E7 therefore cannot pass its gate until environment checkpoint/restore exists. That is the first item of the follow-on plan in §12, and that plan must be written before E7 starts.
+
 ## 11. Capacity for the first cut
 
 | Resource | Per environment (ramdisk-sidecar option) | Per environment (in-process ramfs option) | Kernel limit |
@@ -188,14 +190,29 @@ With the ramdisk option, `PROC_MAX` allows at most seven environments beside `in
 
 ## 12. Not in this plan
 
-- **Networking inside environments.** The NICs stay kernel-owned. A later phase would add kernel-mediated sockets scoped by the existing per-partition connection quotas.
-- **Persistent environment storage.** Environments are RAM-backed; an SLS-backed aerofs that survives reboot is a separate design.
-- **Cluster placement, migration and failover of environments.** Partitions already migrate and fail over; environments following them is future work.
-- **Dynamic linking, and nested environments.** The first is out of scope in the H2 roadmap; the second has no IBM i counterpart (LPAR roadmap §9).
+Each excluded item has a stated destination, so none is silently dropped.
+
+**Closed — not applicable.**
+
+- **Nested environments.** IBM i has no environment-inside-an-environment, for the same structural reason LPAR roadmap §9 closed nested partitions. Closed, not deferred.
+
+**Belongs to E7's design pass.**
+
+- **Dynamic linking.** The H2 roadmap limits the shim to static binaries. If the first user needs dynamic linking, E7's design document decides it; it does not need a plan of its own.
+
+**Deferred to a follow-on plan: POSIX Environments Roadmap v0.2.**
+
+These three are one plan rather than three, because each depends on the one before it:
+
+1. **Persistence first.** Environment checkpoint/restore — a sidecar's address space, capability table, channels and storage — and storage that survives reboot, such as an SLS-backed aerofs in place of RAM-backed ramdisks. It comes first because failover needs it, because E7's gate needs it (§10), and because an environment that survives reboot is the single-level-store property containers do not have.
+2. **Networking second.** Kernel-mediated sockets scoped by the existing per-partition connection quotas, with the NICs staying kernel-owned. It precedes migration because connection identity and addressing have to be settled before an environment can move.
+3. **Cluster placement, migration and failover last,** building on the first two and on the partition migration and failover that already exist.
+
+**When to write v0.2:** after E4 lands and before E7 starts. By then the environment's shape is fixed — ramdisk or in-process ramfs (§14 Q2), how budget memory is allocated (Q3), where the environment manager lives (Q4) — and persistence and networking attach to exactly those choices; writing v0.2 earlier would build on guesses. The one exception: if Q6 shows the first user needs networking during M1, pull networking forward on its own.
 
 ## 13. Suggested execution order
 
-E1 and E2 have no dependency on each other and should start together: E2 is low-risk and host-testable, and E1 is the riskiest phase in the plan, so it should surface its problems early. Then E3, E4, E5 and E6 in order, which completes M1. E7 starts with its own design document once M1's environments exist to run it in.
+E1 and E2 have no dependency on each other and should start together: E2 is low-risk and host-testable, and E1 is the riskiest phase in the plan, so it should surface its problems early. Then E3, E4, E5 and E6 in order, which completes M1. The follow-on POSIX Environments Roadmap v0.2 (§12) is written once E4 has landed. E7 starts with its own design document once M1's environments exist to run it in, and can pass its gate only after v0.2 delivers environment checkpoint/restore.
 
 ## 14. Open questions for review
 
@@ -204,4 +221,4 @@ E1 and E2 have no dependency on each other and should start together: E2 is low-
 3. E3: contiguous MEM regions or frame-list MEM capabilities for environment budgets?
 4. E4: environment manager in `init` (recommended) or in kernel C?
 5. E7: kernel-side Linux-personality dispatch, or forwarding to the POSIX sidecar core? And x86-64 or ARM64 first?
-6. §12: which of networking, persistence and migration is the first user's real blocker after M1?
+6. §12: does the first user need networking during M1? If so, it moves ahead of v0.2's persistence-first order.
