@@ -715,11 +715,11 @@ int main(void) {
      * "peer0" (peer "drv.peer.0") resolves. The peer has no process
      * descriptor — cap_chan_create only needs its cap table, which binds
      * lazily on first use. */
-    CHECK(sidecar_registry_register("drv.peer.0", 777) == 0,
+    CHECK(sidecar_registry_register("drv.peer.0", 777, 0) == 0,
           "peer sidecar registered in the sidecar registry");
-    CHECK(sidecar_registry_resolve("drv.peer.0") == 777,
+    CHECK(sidecar_registry_resolve("drv.peer.0", 0) == 777,
           "registry resolves the planted peer");
-    CHECK(sidecar_registry_resolve("no.such.peer") == 0,
+    CHECK(sidecar_registry_resolve("no.such.peer", 0) == 0,
           "unregistered peer resolves to 0");
 
     /* The sidecar image bytes the manifest points at. */
@@ -757,6 +757,25 @@ int main(void) {
         CHECK(proc_count == 0,
               "E2: the refused create allocated no process");
         proc_table[1].active = 0;   /* free the probe slot for the real spawns */
+    }
+
+    /* ── 0b. E2 tenant capability profile (the tooth) ────────────────────
+     * A sidecar created outside PARTITION_SYSTEM must get no direct hardware
+     * access. The standard manifest carries a CAP_DEV ("nic0.bar0"), so
+     * spawning it from a parent in a non-system partition must be refused
+     * with CAP_EPERM — while the very first standard spawn below, from
+     * partition 0, is accepted with that same DEV cap (the allow side).
+     * Toggle pid 100's partition for the probe, then restore it. */
+    {
+        proc_table[0].partition_id = 5;   /* pretend init is a tenant */
+        uint16_t denied_r = CAP_NONE;
+        int hrc = cap_create_sidecar(100, blob.data, blob.len,
+                                     CAP_NONE, CAP_NONE, &denied_r);
+        CHECK(hrc == CAP_EPERM,
+              "E2: a non-system-partition manifest with a hardware cap is refused (CAP_EPERM)");
+        CHECK(proc_count == 0,
+              "E2: the hardware-cap refusal allocated no process");
+        proc_table[0].partition_id = 0;   /* restore: init is PARTITION_SYSTEM */
     }
 
     /* ── 1. manifest validation error paths ─────────────────────────────── */
@@ -1046,7 +1065,7 @@ int main(void) {
 
     /* The child registered under its manifest NAME; the registry now
      * resolves both it and the planted peer. */
-    CHECK(sidecar_registry_resolve("drv.child.0") == child->pid,
+    CHECK(sidecar_registry_resolve("drv.child.0", 0) == child->pid,
           "child registered under its manifest NAME ('drv.child.0')");
     CHECK(sidecar_registry_count() == 2,   /* drv.peer.0 + drv.child.0 */
           "registry holds the planted peer and the new child");
@@ -1089,7 +1108,7 @@ int main(void) {
     }
     /* Re-registration updates in place: the name now points at the latest
      * child, and the registry does not grow. */
-    CHECK(sidecar_registry_resolve("drv.child.0") == 102,
+    CHECK(sidecar_registry_resolve("drv.child.0", 0) == 102,
           "re-registered NAME now points at the latest child (102)");
     CHECK(sidecar_registry_count() == 2,
           "registry does not grow on re-registration");
@@ -1128,7 +1147,7 @@ int main(void) {
               "the peer sidecar ('drv.ramdisk.0') spawns through cap_create_sidecar");
         CHECK(peer_ch != CAP_NONE, "peer spawn returns its messenger channel");
         CHECK(proc_count == 4, "peer spawn makes four processes total");
-        uint32_t peer_pid = sidecar_registry_resolve("drv.ramdisk.0");
+        uint32_t peer_pid = sidecar_registry_resolve("drv.ramdisk.0", 0);
         CHECK(peer_pid != 0 && peer_pid != 777 && peer_pid != 100,
               "the spawn registered 'drv.ramdisk.0' under a fresh pid — "
               "the name→pid link comes from the NAME record, not a plant");
@@ -1150,7 +1169,7 @@ int main(void) {
             if (proc_table[i].active && proc_table[i].pid > peer_pid)
                 { cons_pid = proc_table[i].pid; break; }
         CHECK(cons_pid == 105, "consumer got pid 105 (alloc_pid = max + 1)");
-        CHECK(sidecar_registry_resolve("drv.consumer.0") == cons_pid,
+        CHECK(sidecar_registry_resolve("drv.consumer.0", 0) == cons_pid,
               "the consumer is registered under its own NAME");
 
         /* The consumer is the last spawn, so g_pml4 is its clone and the
@@ -1303,7 +1322,7 @@ int main(void) {
                       "reply arrived in the consumer's table verbatim");
             }
         }
-        CHECK(sidecar_registry_resolve("drv.ramdisk.0") == peer_pid,
+        CHECK(sidecar_registry_resolve("drv.ramdisk.0", 0) == peer_pid,
               "registry still maps 'drv.ramdisk.0' to the spawned peer");
         CHECK(sidecar_registry_count() == 4,
               "registry holds 4 names (drv.peer.0, drv.child.0, "
@@ -1540,8 +1559,8 @@ int main(void) {
         CHECK(cap_create_sidecar(100, cons2_blob.data, cons2_blob.len,
                                  CAP_NONE, CAP_NONE, &c2_ch) == 0,
               "consumer2 spawns with console peer drv.ramdisk.1");
-        CHECK(sidecar_registry_resolve("drv.ramdisk.1") == 106 &&
-              sidecar_registry_resolve("drv.consumer.1") == 107,
+        CHECK(sidecar_registry_resolve("drv.ramdisk.1", 0) == 106 &&
+              sidecar_registry_resolve("drv.consumer.1", 0) == 107,
               "the fresh pair is registered (106/107)");
         CHECK(sidecar_registry_count() == 6,
               "registry holds 6 names before the teardown");
@@ -1558,7 +1577,7 @@ int main(void) {
 
         /* The death path: cap_table_teardown (what process_exit/kill call). */
         kill_sidecar(106);
-        CHECK(sidecar_registry_resolve("drv.ramdisk.1") == 0,
+        CHECK(sidecar_registry_resolve("drv.ramdisk.1", 0) == 0,
               "the dead peer stops resolving (registry entry removed)");
         CHECK(sidecar_registry_count() == 5,
               "registry drops the dead peer's name");
@@ -1650,7 +1669,7 @@ int main(void) {
         /* The death: teardown marks close_evt on the kernel end; the next
          * tick must notice and drop the kernel end entirely. */
         kill_sidecar(108);
-        CHECK(sidecar_registry_resolve("drv.child.0") == 0,
+        CHECK(sidecar_registry_resolve("drv.child.0", 0) == 0,
               "the console child stops resolving after teardown");
         console_service_tick();
         CHECK(!slot_valid(cap_tables[0].slots[k11_slot].word),
@@ -1677,14 +1696,14 @@ int main(void) {
         CHECK(cap_create_sidecar(100, p3.data, p3.len, CAP_NONE, CAP_NONE,
                                  &p3_ch) == 0,
               "wait-park peer (drv.ramdisk.2) spawns");
-        uint32_t peer3 = sidecar_registry_resolve("drv.ramdisk.2");
+        uint32_t peer3 = sidecar_registry_resolve("drv.ramdisk.2", 0);
         struct Blob c3;
         build_consumer_blob(&c3, image_kaddr, "drv.consumer.2", "drv.ramdisk.2");
         uint16_t c3_ch = CAP_NONE;
         CHECK(cap_create_sidecar(100, c3.data, c3.len, CAP_NONE, CAP_NONE,
                                  &c3_ch) == 0,
               "wait-park consumer (drv.consumer.2) spawns");
-        uint32_t cons3 = sidecar_registry_resolve("drv.consumer.2");
+        uint32_t cons3 = sidecar_registry_resolve("drv.consumer.2", 0);
         CHECK(peer3 != 0 && cons3 != 0 && peer3 != cons3,
               "wait-park pair resolved via the registry");
         struct Bib c3bib = bib_parse(host_ptr(BIB_VADDR));
@@ -1857,14 +1876,14 @@ int main(void) {
         CHECK(cap_create_sidecar(100, p4.data, p4.len, CAP_NONE, CAP_NONE,
                                  &p4_ch) == 0,
               "death-wake peer (drv.ramdisk.3) spawns");
-        uint32_t peer4 = sidecar_registry_resolve("drv.ramdisk.3");
+        uint32_t peer4 = sidecar_registry_resolve("drv.ramdisk.3", 0);
         struct Blob c4;
         build_consumer_blob(&c4, image_kaddr, "drv.consumer.3", "drv.ramdisk.3");
         uint16_t c4_ch = CAP_NONE;
         CHECK(cap_create_sidecar(100, c4.data, c4.len, CAP_NONE, CAP_NONE,
                                  &c4_ch) == 0,
               "death-wake consumer (drv.consumer.3) spawns");
-        uint32_t cons4 = sidecar_registry_resolve("drv.consumer.3");
+        uint32_t cons4 = sidecar_registry_resolve("drv.consumer.3", 0);
         CHECK(peer4 != 0 && cons4 != 0 && peer4 != cons4,
               "death-wake pair resolved via the registry");
         struct Bib c4bib = bib_parse(host_ptr(BIB_VADDR));
@@ -1889,7 +1908,7 @@ int main(void) {
         kill_sidecar(peer4);
         CHECK(g_wake_calls >= 1 && g_wake_chan == c4_chan,
               "12e: the peer's teardown fired cap_wake_chan with the channel id");
-        CHECK(sidecar_registry_resolve("drv.ramdisk.3") == 0,
+        CHECK(sidecar_registry_resolve("drv.ramdisk.3", 0) == 0,
               "12e: the dead peer stops resolving");
 
         memset(&w12, 0, sizeof(w12));
@@ -1934,14 +1953,14 @@ int main(void) {
         CHECK(cap_create_sidecar(100, p5.data, p5.len, CAP_NONE, CAP_NONE,
                                  &p5_ch) == 0,
               "blocking-send peer (drv.ramdisk.4) spawns");
-        uint32_t peer5 = sidecar_registry_resolve("drv.ramdisk.4");
+        uint32_t peer5 = sidecar_registry_resolve("drv.ramdisk.4", 0);
         struct Blob c5;
         build_consumer_blob(&c5, image_kaddr, "drv.consumer.4", "drv.ramdisk.4");
         uint16_t c5_ch = CAP_NONE;
         CHECK(cap_create_sidecar(100, c5.data, c5.len, CAP_NONE, CAP_NONE,
                                  &c5_ch) == 0,
               "blocking-send consumer (drv.consumer.4) spawns");
-        uint32_t cons5 = sidecar_registry_resolve("drv.consumer.4");
+        uint32_t cons5 = sidecar_registry_resolve("drv.consumer.4", 0);
         CHECK(peer5 != 0 && cons5 != 0 && peer5 != cons5,
               "blocking-send pair resolved via the registry");
         struct Bib c5bib = bib_parse(host_ptr(BIB_VADDR));
@@ -2082,14 +2101,14 @@ int main(void) {
         CHECK(cap_create_sidecar(100, p6.data, p6.len, CAP_NONE, CAP_NONE,
                                  &p6_ch) == 0,
               "deadline peer (drv.ramdisk.5) spawns");
-        uint32_t peer6 = sidecar_registry_resolve("drv.ramdisk.5");
+        uint32_t peer6 = sidecar_registry_resolve("drv.ramdisk.5", 0);
         struct Blob c6;
         build_consumer_blob(&c6, image_kaddr, "drv.consumer.5", "drv.ramdisk.5");
         uint16_t c6_ch = CAP_NONE;
         CHECK(cap_create_sidecar(100, c6.data, c6.len, CAP_NONE, CAP_NONE,
                                  &c6_ch) == 0,
               "deadline consumer (drv.consumer.5) spawns");
-        uint32_t cons6 = sidecar_registry_resolve("drv.consumer.5");
+        uint32_t cons6 = sidecar_registry_resolve("drv.consumer.5", 0);
         CHECK(peer6 != 0 && cons6 != 0 && peer6 != cons6,
               "deadline pair resolved via the registry");
         struct Bib c6bib = bib_parse(host_ptr(BIB_VADDR));
@@ -2314,7 +2333,7 @@ int main(void) {
         }
 
         /* The spawned sidecar is registered under its manifest name. */
-        uint32_t child_pid = sidecar_registry_resolve("drv.syscall.0");
+        uint32_t child_pid = sidecar_registry_resolve("drv.syscall.0", 0);
         CHECK(child_pid != 0 && child_pid != 100,
               "syscall-spawned sidecar registered in the sidecar registry");
 
@@ -2366,6 +2385,36 @@ int main(void) {
                   crr.out.len == 4 && memcmp(cbuf, "ping", 4) == 0,
                   "the child receives the parent's messenger message");
         }
+    }
+
+    /* ── 16. E2 partition-scoped registry (the tooth) ────────────────────
+     * Names are scoped to their partition: the SAME name registered by two
+     * different partitions is two coexisting entries, and a resolve only ever
+     * matches within the caller's own partition — the G5 fix. Uses the
+     * registry API directly (no spawn) against a FRESH registry, so it does
+     * not perturb the count assertions above. */
+    {
+        sidecar_registry_init();
+        CHECK(sidecar_registry_register("drv.ramdisk.0", 201, 5) == 0,
+              "E2: register drv.ramdisk.0 in partition 5");
+        CHECK(sidecar_registry_register("drv.ramdisk.0", 202, 7) == 0,
+              "E2: the SAME name registers in partition 7 (coexists, no re-point)");
+        CHECK(sidecar_registry_resolve("drv.ramdisk.0", 5) == 201,
+              "E2: partition 5 resolves its own drv.ramdisk.0 (201)");
+        CHECK(sidecar_registry_resolve("drv.ramdisk.0", 7) == 202,
+              "E2: partition 7 resolves its own drv.ramdisk.0 (202) — not partition 5's");
+        CHECK(sidecar_registry_resolve("drv.ramdisk.0", 9) == 0,
+              "E2: a partition with no such name resolves to 0 (no cross-partition leak)");
+        /* Same-partition re-registration still updates in place (watchdog
+         * restart), and must not disturb the other partition's entry. */
+        CHECK(sidecar_registry_register("drv.ramdisk.0", 203, 5) == 0,
+              "E2: re-register in partition 5 (a restart)");
+        CHECK(sidecar_registry_resolve("drv.ramdisk.0", 5) == 203,
+              "E2: partition 5's entry updated in place to the restarted pid (203)");
+        CHECK(sidecar_registry_resolve("drv.ramdisk.0", 7) == 202,
+              "E2: partition 7's entry is untouched by partition 5's restart");
+        CHECK(sidecar_registry_count() == 2,
+              "E2: two coexisting entries for the same name in two partitions");
     }
 
     if (g_fail == 0) printf("\nALL PASS\n");

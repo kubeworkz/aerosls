@@ -2913,35 +2913,48 @@ static void sidecar_strcpy(char* d, const char* s, int n) {
 static struct SidecarRegistryEntry {
     char     name[SIDECAR_REGISTRY_NAME_LEN];
     uint32_t pid;
-    /* Boot generation: how many prior instances of this NAME have been
-     * created this kernel session (0 = first). Persistent — the counter
-     * array below is never cleared, so a respawn after teardown reads
-     * back a nonzero generation even though the entry was dropped. */
+    /* POSIX-Environments E2: the partition of the sidecar that registered
+     * this name. Names are scoped to their partition — the SAME name in two
+     * different partitions is two coexisting entries for two different
+     * sidecars, and a resolve only ever matches within the caller's own
+     * partition. This is what closes G5 (a colliding name silently
+     * re-pointing another tenant's peer). */
+    uint32_t partition_id;
+    /* Boot generation: how many prior instances of this (partition, NAME)
+     * have been created this kernel session (0 = first). Persistent — the
+     * counter array below is never cleared, so a respawn after teardown
+     * reads back a nonzero generation even though the entry was dropped. */
     uint32_t gen;
     uint8_t  active;
 } sidecar_registry[SIDECAR_REGISTRY_MAX];
 
-/* Per-name spawn counters, keyed the same way as the registry. NEVER
- * cleared on teardown: this is what lets a respawned sidecar (e.g. a
- * watchdog-restarted driver) tell its first boot from a restart. */
+/* Per-(partition, name) spawn counters, keyed the same way as the registry.
+ * NEVER cleared on teardown: this is what lets a respawned sidecar (e.g. a
+ * watchdog-restarted driver) tell its first boot from a restart. Scoped by
+ * partition so two partitions' same-named sidecars keep independent
+ * generations. */
 static struct SidecarGenCounter {
     char     name[SIDECAR_REGISTRY_NAME_LEN];
-    uint32_t seen;   /* instances of this name created so far */
+    uint32_t partition_id;
+    uint32_t seen;   /* instances of this (partition, name) created so far */
 } sidecar_gen_counters[SIDECAR_REGISTRY_MAX];
 
-/* Returns the generation for a fresh instance of `name` (0-based) and
- * records it as seen. The counter array is append-only per unique name;
- * a name that fills a slot keeps bumping forever. */
-static uint32_t sidecar_gen_next(const char* name) {
+/* Returns the generation for a fresh instance of (partition, `name`)
+ * (0-based) and records it as seen. The counter array is append-only per
+ * unique (partition, name); a key that fills a slot keeps bumping forever. */
+static uint32_t sidecar_gen_next(const char* name, uint32_t partition_id) {
     if (!name || !name[0]) return 0;
     for (int i = 0; i < SIDECAR_REGISTRY_MAX; i++) {
-        if (sidecar_gen_counters[i].seen && sidecar_streq(sidecar_gen_counters[i].name, name)) {
+        if (sidecar_gen_counters[i].seen &&
+            sidecar_gen_counters[i].partition_id == partition_id &&
+            sidecar_streq(sidecar_gen_counters[i].name, name)) {
             return sidecar_gen_counters[i].seen++;
         }
     }
     for (int i = 0; i < SIDECAR_REGISTRY_MAX; i++) {
         if (sidecar_gen_counters[i].seen) continue;
         sidecar_strcpy(sidecar_gen_counters[i].name, name, SIDECAR_REGISTRY_NAME_LEN);
+        sidecar_gen_counters[i].partition_id = partition_id;
         sidecar_gen_counters[i].seen = 1;
         return 0;
     }
@@ -2956,15 +2969,20 @@ void sidecar_registry_init(void) {
     }
 }
 
-int sidecar_registry_register(const char* name, uint32_t pid) {
+int sidecar_registry_register(const char* name, uint32_t pid,
+                              uint32_t partition_id) {
     if (!name || !name[0] || pid == 0) return -1;
-    /* Re-registering an existing name UPDATES it in place (a restarted
-     * sidecar keeps its identity; later spawns simply re-point the name). */
+    /* Re-registering an existing (partition, name) UPDATES it in place — a
+     * watchdog-restarted sidecar keeps its identity within its partition
+     * (the respawn path depends on this). A match requires BOTH the name
+     * and the partition: the same name in another partition is a distinct
+     * sidecar and must not be touched here (E2 — the G5 fix). */
     for (int i = 0; i < SIDECAR_REGISTRY_MAX; i++) {
         struct SidecarRegistryEntry* e = &sidecar_registry[i];
-        if (e->active && sidecar_streq(e->name, name)) {
+        if (e->active && e->partition_id == partition_id &&
+            sidecar_streq(e->name, name)) {
             e->pid = pid;
-            e->gen = sidecar_gen_next(name);
+            e->gen = sidecar_gen_next(name, partition_id);
             return 0;
         }
     }
@@ -2973,7 +2991,8 @@ int sidecar_registry_register(const char* name, uint32_t pid) {
         if (e->active) continue;
         sidecar_strcpy(e->name, name, SIDECAR_REGISTRY_NAME_LEN);
         e->pid = pid;
-        e->gen = sidecar_gen_next(name);
+        e->partition_id = partition_id;
+        e->gen = sidecar_gen_next(name, partition_id);
         e->active = 1;
         return 0;
     }
@@ -2981,13 +3000,20 @@ int sidecar_registry_register(const char* name, uint32_t pid) {
     return -1;
 }
 
-uint32_t sidecar_registry_resolve(const char* name) {
+/* Resolve `name` to a pid WITHIN `partition_id` only (E2). A name registered
+ * by another partition is invisible here — that is the isolation: a tenant
+ * can never wire a channel to another tenant's sidecar by guessing its name.
+ * Kernel-owned peers ("kernel.*") do not live in this registry at all; they
+ * are handled by cap_create_sidecar's separate kernel-service branch before
+ * this is ever called. */
+uint32_t sidecar_registry_resolve(const char* name, uint32_t partition_id) {
     if (!name) return 0;
     for (int i = 0; i < SIDECAR_REGISTRY_MAX; i++) {
         struct SidecarRegistryEntry* e = &sidecar_registry[i];
-        if (e->active && sidecar_streq(e->name, name)) return e->pid;
+        if (e->active && e->partition_id == partition_id &&
+            sidecar_streq(e->name, name)) return e->pid;
     }
-    return 0;   /* not found */
+    return 0;   /* not found in this partition */
 }
 
 /* Boot generation of the CURRENT instance of `pid` (0 = first boot of
@@ -3334,6 +3360,33 @@ int cap_create_sidecar(uint32_t parent_pid,
         return CAP_EPERM;
     }
 
+    /* ── 4b. Tenant capability profile (POSIX-Environments E2) ───────────
+     * A sidecar created outside PARTITION_SYSTEM is a tenant environment and
+     * must get NO direct hardware access: reject the whole create — fail
+     * closed, not silently drop — if its manifest carries a port-I/O, IRQ or
+     * device-MMIO capability. The child inherits the parent's partition
+     * (step 7), so the parent's partition is the child's; today every sidecar
+     * is created in PARTITION_SYSTEM (the boot tree inherits init's), so this
+     * is a no-op until E4's partition-targeted creation, exactly the
+     * backward-compatible-by-construction shape the roadmap calls for. MEM
+     * and CHAN caps are always allowed (a tenant needs memory and channels);
+     * only the three hardware kinds are gated. */
+    if (parent->partition_id != PARTITION_SYSTEM) {
+        for (uint8_t ci = 0; ci < m.n_caps; ci++) {
+            uint16_t k = m.caps[ci].kind;
+            if (k == SIDECAR_TAG_CAP_IO || k == SIDECAR_TAG_CAP_IRQ ||
+                k == SIDECAR_TAG_CAP_DEV) {
+                kernel_serial_printf(
+                    "[CS] CAP_EPERM: manifest for partition %u requests a "
+                    "hardware cap '%s' (kind %u) — tenant environments get no "
+                    "direct hardware access\n",
+                    (unsigned)parent->partition_id, m.caps[ci].name,
+                    (unsigned)k);
+                return CAP_EPERM;
+            }
+        }
+    }
+
     int pi = -1;
     for (int i = 0; i < PROC_MAX; i++) {
         if (!proc_table[i].active) { pi = i; break; }
@@ -3561,12 +3614,17 @@ int cap_create_sidecar(uint32_t parent_pid,
                     (unsigned)c_rd, (unsigned)c_wr, (unsigned)k_rd, (unsigned)k_wr);
             }
         } else {
-            uint32_t peer_pid = sidecar_registry_resolve(sc->peer_name);
+            /* E2: resolve the peer only within this sidecar's own partition,
+             * so a manifest cannot wire a channel to another tenant's sidecar
+             * by naming it. */
+            uint32_t peer_pid = sidecar_registry_resolve(sc->peer_name,
+                                                         pd->partition_id);
             if (peer_pid == 0 || peer_pid == pd->pid) {
                 kernel_serial_printf(
                     "[SIDECAR] PID %u '%s': chan '%s' peer '%s' not "
-                    "registered — cap left unwired\n",
-                    pd->pid, pd->name, sc->name, sc->peer_name);
+                    "registered in partition %u — cap left unwired\n",
+                    pd->pid, pd->name, sc->name, sc->peer_name,
+                    (unsigned)pd->partition_id);
                 continue;
             }
             uint16_t p_rd = CAP_NONE, p_wr = CAP_NONE;
@@ -3695,7 +3753,7 @@ int cap_create_sidecar(uint32_t parent_pid,
     /* Register the sidecar's identity so later manifests can wire
      * channels to it by name. */
     if (m.name_len > 0) {
-        if (sidecar_registry_register(m.name, pd->pid) < 0)
+        if (sidecar_registry_register(m.name, pd->pid, pd->partition_id) < 0)
             kernel_serial_printf("[SIDECAR] PID %u '%s': registry registration failed\n",
                                  pd->pid, m.name);
     }
