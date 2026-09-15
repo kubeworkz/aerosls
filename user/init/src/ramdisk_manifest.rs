@@ -12,16 +12,39 @@ use aerosls_proto::manifest::{
 };
 use alloc::vec::Vec;
 
-/// The ramdisk driver's identity — registered in the kernel's sidecar registry.
+/// The ramdisk driver's default identity — registered in the kernel's sidecar
+/// registry. The Phase 5 boot's single ramdisk uses this; POSIX-Environments
+/// E3 gives each additional environment's ramdisk its own name (e.g.
+/// "drv.ramdisk.1") via `build_ramdisk_manifest_named`.
 pub const RAMDISK_MANIFEST_NAME: &str = "drv.ramdisk.0";
 
+/// Build the packed ramdisk manifest blob under the default name
+/// (`RAMDISK_MANIFEST_NAME`). Thin wrapper over `build_ramdisk_manifest_named`
+/// — kept so the Phase 5 boot path and its callers are unchanged.
+pub fn build_ramdisk_manifest(
+    image_kaddr: u64,
+    image_size: u32,
+    heap_base: u64,
+    storage_base: u64,
+    storage_len: u64,
+) -> Vec<u8> {
+    build_ramdisk_manifest_named(
+        RAMDISK_MANIFEST_NAME, image_kaddr, image_size,
+        heap_base, storage_base, storage_len,
+    )
+}
+
 /// Build the packed ramdisk manifest blob (header + records + image_kaddr
-/// footer + patched total_len/CRC), ready for `Kernel::create_sidecar`.
+/// footer + patched total_len/CRC), ready for `Kernel::create_sidecar`, under
+/// an explicit registry `name`. POSIX-Environments E3 spawns one ramdisk per
+/// environment, each with its own name and its own `storage_base` — the image
+/// is shared read-only, the storage is private.
 ///
 /// `image_kaddr` is the physical address of the ramdisk binary (from the
 /// `ramdisk.image` MEM cap), `heap_base` is the ramdisk's budget heap,
 /// and `storage_base`/`storage_len` describe the block device region.
-pub fn build_ramdisk_manifest(
+pub fn build_ramdisk_manifest_named(
+    name: &str,
     image_kaddr: u64,
     image_size: u32,
     heap_base: u64,
@@ -72,7 +95,7 @@ pub fn build_ramdisk_manifest(
         version_major: 1,
         version_minor: 0,
         flags: 0,
-        name: Some(RAMDISK_MANIFEST_NAME),
+        name: Some(name),
         personality: Some("aerosls.ramdisk.v1"),
         image: Some(Image {
             offset: 0,
@@ -113,4 +136,37 @@ pub fn build_ramdisk_manifest(
     let crc = crc32(&blob[HEADER_LEN..]);
     blob[20..24].copy_from_slice(&crc.to_le_bytes());
     blob
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aerosls_proto::manifest::parse_manifest;
+
+    #[test]
+    fn default_builder_uses_the_default_name() {
+        let blob = build_ramdisk_manifest(0x3000_0000, 0x8000, 0x3080_0000,
+                                          0x3090_0000, 16 * 1024 * 1024);
+        let m = parse_manifest(&blob).unwrap();
+        assert_eq!(m.name, Some(RAMDISK_MANIFEST_NAME));
+    }
+
+    #[test]
+    fn named_builder_registers_under_the_given_name_with_its_own_storage() {
+        // E3: a second environment's ramdisk — its own registry name and its
+        // own storage region, distinct from instance 0's.
+        let blob = build_ramdisk_manifest_named(
+            "drv.ramdisk.1", 0x3000_0000, 0x8000,
+            0x4080_0000, 0x4090_0000, 16 * 1024 * 1024);
+        let m = parse_manifest(&blob).unwrap();
+        assert_eq!(m.name, Some("drv.ramdisk.1"));
+        assert_eq!(m.n_caps, 3);
+        // storage cap carries this instance's private base, read-only.
+        let storage = m.find_cap("storage").expect("storage cap present");
+        assert_eq!(storage.rights, 0x1);
+        assert!(matches!(storage.kind,
+            aerosls_proto::manifest::CapKind::Mem { base: 0x4090_0000, .. }));
+        assert!(m.find_cap("budget").is_some());
+        assert!(m.find_cap("console").is_some());
+    }
 }
