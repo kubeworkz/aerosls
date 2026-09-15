@@ -320,6 +320,8 @@ uint32_t process_create(struct ProcCreateRequest* req) {
     pd->priority        = PROC_PRIO_NORMAL;     // Phase 4 (Navigator-Parity): default tier
     pd->active          = 1;
     pd->pending_teardown = 0;   // Phase 2: a reused slot must not inherit a stale flag
+    pd->sidecar_authority = 0;  // E2: an HTTP/shell-spawned program is never a
+                                // sidecar creator; a reused slot must not inherit it
     pd->waiting_chan    = CAP_NONE;  // Phase 1.5: not parked on any channel
 
     // Seed Kernel Phase 1 (two-party): a DEDICATED 8 KiB kernel syscall stack
@@ -479,6 +481,8 @@ static uint32_t program_spawn_common(const char* object_name, uint32_t owner_uid
     pd->state        = PROC_RUNNING;
     pd->priority     = PROC_PRIO_NORMAL;     // Phase 4 (Navigator-Parity): default tier
     pd->active       = 1;
+    pd->sidecar_authority = 0;     // E2: a spawned PROGRAM is never a sidecar
+                                   // creator; a reused slot must not inherit it
     proc_clear_resume_state(pd);   // a reused slot must not inherit the
                                    // previous occupant's resume/teardown state
                                    // (has_ring3_ctx is re-set below for async)

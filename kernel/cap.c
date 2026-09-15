@@ -3316,6 +3316,24 @@ int cap_create_sidecar(uint32_t parent_pid,
         return CAP_EINVAL;
     }
 
+    /* ── 4a. Authority gate (POSIX-Environments E2) ──────────────────────
+     * Only the sidecar creator tree may create sidecars: the boot parent
+     * (BOOT_PARENT_PID) carries sidecar_authority, and every child created
+     * here inherits it (step 7), so the kernel->init->DM->driver tree is
+     * authorised and nothing else is. Without this gate any ring-3 process
+     * (e.g. an uploaded, spawned PROGRAM) could call SYS_SLS_CREATE_SIDECAR
+     * with a crafted manifest that mints a CAP_MEM over kernel physical
+     * memory (the mint path bounds-checks alignment and the 4 GiB ceiling,
+     * but not kernel RAM) and have it identity-mapped R/W into a child —
+     * a capability-confinement break and a process-table DoS. */
+    if (!parent->sidecar_authority) {
+        kernel_serial_printf(
+            "[CS] CAP_EPERM: pid=%u lacks sidecar_authority — "
+            "SYS_SLS_CREATE_SIDECAR is restricted to the sidecar creator tree\n",
+            parent_pid);
+        return CAP_EPERM;
+    }
+
     int pi = -1;
     for (int i = 0; i < PROC_MAX; i++) {
         if (!proc_table[i].active) { pi = i; break; }
@@ -3413,6 +3431,9 @@ int cap_create_sidecar(uint32_t parent_pid,
     pd->owner_uid  = parent->owner_uid;
     pd->parent_pid = parent_pid;
     pd->partition_id = parent->partition_id;
+    pd->sidecar_authority = 1;    /* E2: children of the creator tree are
+                                   * themselves sidecars and may spawn more
+                                   * (init spawns DM; DM spawns drivers). */
     pd->state      = PROC_HELD;   /* HELD: parent provisions before release */
     pd->priority   = PROC_PRIO_NORMAL;
     pd->active     = 1;

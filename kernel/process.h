@@ -220,6 +220,18 @@ struct ProcessDescriptor {
                                        // tick saves its context, runs the full
                                        // Phase-2 teardown, and switches away (see
                                        // schedule_ring3). Reset at spawn/exit.
+    uint8_t    sidecar_authority;     // POSIX-Environments E2: may this process
+                                       // create sidecars (SYS_SLS_CREATE_SIDECAR)?
+                                       // The boot parent (BOOT_PARENT_PID) has it;
+                                       // cap_create_sidecar() propagates it to
+                                       // every child, so the init->DM->driver tree
+                                       // inherits it and nothing else does. An
+                                       // HTTP/shell-spawned PROGRAM never gets it,
+                                       // so it cannot mint sidecars (which would
+                                       // otherwise let any ring-3 program map
+                                       // arbitrary physical memory into a child).
+                                       // Explicitly cleared at every non-sidecar
+                                       // spawn — a reused slot must not inherit it.
     uint8_t    active;
 };
 
