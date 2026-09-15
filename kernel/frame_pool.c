@@ -409,6 +409,64 @@ void *allocate_physical_ram_frame_for_partition(uint32_t partition_id)
     return frame;
 }
 
+uint64_t allocate_contiguous_frames_for_partition(uint32_t partition_id,
+                                                  uint64_t nframes,
+                                                  uint64_t align_frames)
+{
+    // Fail closed on bad args, exactly like the single-frame path and
+    // frame_pool_reserve_contiguous(): out-of-range partition, empty or
+    // impossible run, or a non-power-of-two alignment.
+    if (partition_id >= PARTITION_MAX) return 0;
+    if (nframes == 0 || nframes > TOTAL_FRAMES) return 0;
+    if (align_frames == 0 || (align_frames & (align_frames - 1)) != 0) return 0;
+
+    // Quota is checked against the WHOLE run up front — no partial
+    // allocation, same denial-before-any-side-effect posture as the
+    // single-frame allocator. 0 = unlimited.
+    uint64_t quota = partition_frame_quota[partition_id];
+    if (quota != 0 && partition_frame_usage[partition_id] + nframes > quota)
+        return 0;
+
+    uint64_t sp = fp_current_sp();
+    // Candidate runs start at aligned multiples of align_frames, skipping
+    // frame 0 (address 0x0 == NULL) and any start that would overrun. A
+    // reserved frame (kernel image below reserved_below, absent RAM at/above
+    // reserved_above, the cap-arena contiguous reservation) has its bitmap
+    // bit set, so a free-run scan skips it without any watermark check.
+    for (uint64_t start = align_frames;
+         start + nframes <= TOTAL_FRAMES;
+         start += align_frames) {
+        int free_run = 1;
+        for (uint64_t f = start; f < start + nframes; f++) {
+            if (physical_memory_bitmap[f / 64] & (1ULL << (f % 64))) {
+                free_run = 0;
+                break;
+            }
+            // Last line of defence, same as alloc_raw_frame(): never hand
+            // back the frame the live kernel stack sits in. A run of FREE
+            // frames can only contain it in the boot-reservation-missed
+            // error case that path already shouts about; reject the run.
+            if (fp_frame_contains(f * FRAME_SIZE, sp)) {
+                free_run = 0;
+                break;
+            }
+        }
+        if (!free_run) continue;
+
+        // Commit: mark the run allocated (set bits directly, like
+        // alloc_raw_frame() — frames_reserved counts BOOT reservations, not
+        // runtime allocations), owner-tag every frame to the partition, and
+        // charge the whole run to its usage counter.
+        for (uint64_t f = start; f < start + nframes; f++) {
+            physical_memory_bitmap[f / 64] |= (1ULL << (f % 64));
+            frame_owner[f] = (uint8_t)partition_id;
+        }
+        partition_frame_usage[partition_id] += nframes;
+        return start * FRAME_SIZE;
+    }
+    return 0;   // no contiguous free run of that length
+}
+
 // Gap Remediation Phase F: shared validation + bitmap-clear for both free
 // entry points below. Returns 1 (failure, bitmap untouched) if addr isn't a
 // currently-allocated, in-range, page-aligned, non-zero frame address --
@@ -442,6 +500,32 @@ int free_physical_ram_frame_for_partition(void* frame, uint32_t partition_id) {
     if (partition_id >= PARTITION_MAX) return 1;   // out of range -> fail closed, bitmap untouched
     if (free_raw_frame(frame)) return 1;
     if (partition_frame_usage[partition_id] > 0) partition_frame_usage[partition_id]--;
+    return 0;
+}
+
+int free_contiguous_frames_for_partition(uint64_t base_addr, uint64_t nframes,
+                                         uint32_t partition_id)
+{
+    if (partition_id >= PARTITION_MAX) return 1;                 // fail closed
+    if (base_addr == 0 || (base_addr % FRAME_SIZE) != 0) return 1;  // NULL/misaligned
+    if (nframes == 0) return 1;
+    uint64_t first = base_addr / FRAME_SIZE;
+    if (first == 0 || first + nframes > TOTAL_FRAMES) return 1;  // out of range
+
+    // Free each frame via the shared per-frame validator (clears the bitmap
+    // bit and resets the owner tag). A frame already free is skipped, not
+    // counted — so a partly-freed region does not underflow the counter.
+    uint64_t freed = 0;
+    for (uint64_t i = 0; i < nframes; i++) {
+        if (free_raw_frame((void*)(uintptr_t)((first + i) * FRAME_SIZE)) == 0)
+            freed++;
+    }
+    // Decrement by what was actually freed, floored — same defensive posture
+    // as the single-frame free against an already-inconsistent counter.
+    if (partition_frame_usage[partition_id] >= freed)
+        partition_frame_usage[partition_id] -= freed;
+    else
+        partition_frame_usage[partition_id] = 0;
     return 0;
 }
 

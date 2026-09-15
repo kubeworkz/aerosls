@@ -261,6 +261,66 @@ int main(void) {
     CHECK(partition_get_frame_usage(5) == 0, "scenario 12: partition 5's usage is 0 again after this second reclaim");
     CHECK(partition_reclaim_all_frames(5) == 0, "scenario 12: a THIRD reclaim, now genuinely empty, correctly returns 0 -- no error, no underflow");
 
+    /* ── Scenario 13 (POSIX-Environments E3): the contiguous region
+     * allocator. A run is CONTIGUOUS, aligned, owner-tagged so bulk reclaim
+     * frees it, and the WHOLE run is quota-checked up front. ─────────────── */
+    CHECK(partition_get_frame_usage(10) == 0, "scenario 13: partition 10 starts clean");
+    uint64_t region = allocate_contiguous_frames_for_partition(10, 8, 1);
+    CHECK(region != 0, "scenario 13: an 8-frame contiguous run allocates");
+    CHECK((region % 4096) == 0, "scenario 13: the region base is frame-aligned");
+    uint64_t rstart = region / 4096;
+    int all_marked = 1, all_owned = 1;
+    for (uint64_t i = 0; i < 8; i++) {
+        if (!frame_pool_is_reserved(rstart + i)) all_marked = 0;   /* bit set */
+        if (frame_pool_frame_owner(rstart + i) != 10) all_owned = 0;
+    }
+    CHECK(all_marked, "scenario 13: all 8 frames of the run are marked allocated (contiguous, no gap)");
+    CHECK(all_owned, "scenario 13: all 8 frames are owner-tagged to partition 10");
+    CHECK(partition_get_frame_usage(10) == 8, "scenario 13: the whole run is charged to the partition's usage (8)");
+
+    /* Owner-tagged means bulk reclaim frees the entire region, exactly like
+     * single-frame allocations — the property env destroy relies on. */
+    CHECK(partition_reclaim_all_frames(10) == 8, "scenario 13: partition_reclaim_all_frames frees the whole contiguous region (8)");
+    CHECK(partition_get_frame_usage(10) == 0, "scenario 13: usage is 0 after reclaim");
+    int any_still_reserved = 0;
+    for (uint64_t i = 0; i < 8; i++)
+        if (frame_pool_is_reserved(rstart + i)) any_still_reserved = 1;
+    CHECK(!any_still_reserved, "scenario 13: every frame of the region is genuinely free again after reclaim");
+
+    /* Alignment: a 16-frame-aligned request lands on a 16-frame boundary. */
+    uint64_t aligned = allocate_contiguous_frames_for_partition(10, 4, 16);
+    CHECK(aligned != 0 && (aligned / 4096) % 16 == 0, "scenario 13: a 16-frame-aligned run starts on a 16-frame boundary");
+    free_contiguous_frames_for_partition(aligned, 4, 10);
+
+    /* Whole-run quota check: a run that would exceed the quota is denied
+     * before any allocation — not partially filled up to the quota. */
+    CHECK(partition_set_frame_quota(11, 4) == 0, "scenario 13: partition 11 quota set to 4");
+    CHECK(allocate_contiguous_frames_for_partition(11, 8, 1) == 0, "scenario 13: an 8-frame run is denied under a quota of 4 (whole run checked up front)");
+    CHECK(partition_get_frame_usage(11) == 0, "scenario 13: the denied run allocated NOTHING — usage still 0, no partial fill");
+    uint64_t fit = allocate_contiguous_frames_for_partition(11, 4, 1);
+    CHECK(fit != 0 && partition_get_frame_usage(11) == 4, "scenario 13: a 4-frame run exactly fills the quota");
+    CHECK(allocate_contiguous_frames_for_partition(11, 1, 1) == 0, "scenario 13: a further 1-frame run is denied — quota met");
+    CHECK(partition_set_frame_quota(11, 0) == 0, "scenario 13: partition 11 quota reset to unlimited");
+    free_contiguous_frames_for_partition(fit, 4, 11);
+
+    /* Bad args fail closed with 0. */
+    CHECK(allocate_contiguous_frames_for_partition(999, 4, 1) == 0, "scenario 13: out-of-range partition_id is denied");
+    CHECK(allocate_contiguous_frames_for_partition(10, 0, 1) == 0, "scenario 13: a zero-length run is denied");
+    CHECK(allocate_contiguous_frames_for_partition(10, 4, 3) == 0, "scenario 13: a non-power-of-two alignment is denied");
+
+    /* ── Scenario 14 (E3): free_contiguous_frames_for_partition round-trip —
+     * a real bitmap free, and its argument validation. ─────────────────── */
+    uint64_t reg14 = allocate_contiguous_frames_for_partition(12, 8, 1);
+    CHECK(reg14 != 0 && partition_get_frame_usage(12) == 8, "scenario 14: partition 12 allocates an 8-frame region");
+    CHECK(free_contiguous_frames_for_partition(reg14, 8, 12) == 0, "scenario 14: freeing the whole region succeeds");
+    CHECK(partition_get_frame_usage(12) == 0, "scenario 14: usage drops back to 0 after the region free");
+    uint64_t reg14b = allocate_contiguous_frames_for_partition(12, 8, 1);
+    CHECK(reg14b == reg14, "scenario 14: the next same-size run gets the SAME base back — a real free, not accounting-only");
+    CHECK(free_contiguous_frames_for_partition(reg14b, 8, 12) == 0, "scenario 14: cleanup free");
+    CHECK(free_contiguous_frames_for_partition(0, 4, 12) == 1, "scenario 14: a NULL/zero base is rejected");
+    CHECK(free_contiguous_frames_for_partition(4096, 4, 999) == 1, "scenario 14: an out-of-range partition_id is rejected");
+    CHECK(free_contiguous_frames_for_partition(1, 4, 12) == 1, "scenario 14: a misaligned base is rejected");
+
     printf("\n%s\n", g_fail == 0 ? "ALL CHECKS PASSED" : "SOME CHECKS FAILED");
     return g_fail == 0 ? 0 : 1;
 }
