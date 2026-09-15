@@ -1004,8 +1004,12 @@ uint64_t sys_sls_create_sidecar(struct SLSCreateSidecarRequest* req);
 #define SIDECAR_REGISTRY_NAME_LEN 64
 
 void     sidecar_registry_init(void);
-int      sidecar_registry_register(const char* name, uint32_t pid);
-uint32_t sidecar_registry_resolve(const char* name);  /* pid, or 0 */
+/* E2: registry entries are scoped by partition — register and resolve both
+ * take the partition, and a name resolves only within its own partition. */
+int      sidecar_registry_register(const char* name, uint32_t pid,
+                                   uint32_t partition_id);
+uint32_t sidecar_registry_resolve(const char* name,
+                                   uint32_t partition_id);  /* pid, or 0 */
 uint32_t sidecar_registry_count(void);
 void     sidecar_registry_remove_pid(uint32_t pid);
 
