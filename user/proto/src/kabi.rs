@@ -248,6 +248,7 @@ mod abi {
     const SYS_IRQ_UNBIND: u64 = 317;
     const SYS_IRQ_MASK: u64 = 318;
     const SYS_BOOT_GEN: u64 = 319;
+    const SYS_ALLOC_REGION: u64 = 320;
     const SYS_YIELD: u64 = 300;
 
     /// The raw syscall instruction (same convention as
@@ -296,6 +297,15 @@ mod abi {
         out_idx: u32,
         out_kind: u16,
         _pad2: [u8; 2],
+    }
+
+    /// SLSAllocRegionRequest (kernel/cap.h) — layout mirrors it exactly:
+    /// two u64s, no padding.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct AllocRegionReq {
+        nframes: u64,
+        align_frames: u64,
     }
 
     /// Kernel SLSCapDesc (slot u16 + pad; proto's CapDescriptor is slot
@@ -789,6 +799,16 @@ mod abi {
     /// manifest NAME after a teardown). The value comes straight back in
     /// rax; no request struct.
     #[no_mangle]
+    /// `k_alloc_region`: syscall 320. Allocate a contiguous physical region
+    /// of `nframes` frames, aligned to `align_frames` frames (a power of two;
+    /// 1 = any boundary), charged to the caller's partition. Returns the base
+    /// physical address, or 0 on failure/denial. POSIX-Environments E3.
+    #[no_mangle]
+    pub extern "C" fn k_alloc_region(nframes: u64, align_frames: u64) -> u64 {
+        let req = AllocRegionReq { nframes, align_frames };
+        unsafe { sls_syscall(SYS_ALLOC_REGION, &req as *const AllocRegionReq as u64) }
+    }
+
     pub extern "C" fn k_boot_gen() -> u64 {
         unsafe { sls_syscall(SYS_BOOT_GEN, 0) }
     }

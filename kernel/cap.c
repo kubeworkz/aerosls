@@ -4042,3 +4042,24 @@ uint64_t sys_sls_create_sidecar(struct SLSCreateSidecarRequest* req) {
     req->out_ch_w = sidecar_find_parent_ch_w(cap_current_pid(), ch_r);
     return (uint64_t)ch_r;
 }
+
+/* ─── sys_sls_alloc_region (320) ─────────────────────────────────────────
+ * POSIX-Environments E3: allocate a contiguous physical region charged to
+ * the caller's partition, returning its base physical address (0 on any
+ * failure). Gated to the sidecar creator tree, exactly like
+ * cap_create_sidecar: a process without sidecar_authority (an
+ * HTTP/shell-spawned PROGRAM) must not be able to mint arbitrary physical
+ * memory. Charging to the CALLER's own partition keeps it backward
+ * compatible — a target-partition variant is E4's job. */
+uint64_t sys_sls_alloc_region(struct SLSAllocRegionRequest* req) {
+    if (!req) return 0;
+    struct ProcessDescriptor* caller = sidecar_find_pid(cap_current_pid());
+    if (!caller || !caller->sidecar_authority) {
+        kernel_serial_printf(
+            "[ALLOC_REGION] denied: pid=%u lacks sidecar_authority\n",
+            (unsigned)cap_current_pid());
+        return 0;
+    }
+    return allocate_contiguous_frames_for_partition(
+        caller->partition_id, req->nframes, req->align_frames);
+}
