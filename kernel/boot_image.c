@@ -478,6 +478,10 @@ static void boot_plant_parent(uint64_t kernel_stack_top) {
     proc_table[0].state = PROC_BLOCKED;   /* never runnable */
     proc_table[0].partition_id = 0;       /* PARTITION_SYSTEM */
     proc_table[0].owner_uid = 0;
+    proc_table[0].sidecar_authority = 1;  /* E2: the root of the sidecar creator
+                                           * tree — init inherits this, and every
+                                           * sidecar init/DM spawn inherits it in
+                                           * turn (cap_create_sidecar). */
     proc_table[0].syscall_stack_top = kernel_stack_top;  /* the restore point */
     memcpy(proc_table[0].name, "kboot", 6);
     kernel_serial_printf("[SIDECAR] boot parent planted: slot0 pid=%u active=%d state=%d\n",

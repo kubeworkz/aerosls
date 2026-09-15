@@ -706,6 +706,7 @@ int main(void) {
     proc_table[0].state = PROC_SUSPENDED;
     proc_table[0].partition_id = 0;
     proc_table[0].owner_uid = 0;
+    proc_table[0].sidecar_authority = 1;  /* E2: init is in the creator tree */
     proc_table[0].syscall_stack_top = 0x300000;
     proc_count = 0;
     g_cur_pid = 100;
@@ -728,6 +729,35 @@ int main(void) {
 
     struct Blob blob;
     build_valid_blob(&blob, image_kaddr, 0);
+
+    /* ── 0. E2 authority gate (the tooth) ────────────────────────────────
+     * A process without sidecar_authority — an HTTP/shell-spawned PROGRAM,
+     * as opposed to the init/DM creator tree — must not be able to create a
+     * sidecar, or any ring-3 program could mint a CAP_MEM over kernel
+     * physical memory into a child. Plant such a process in a spare slot,
+     * attempt a spawn from it with an otherwise-VALID blob (so only the
+     * authority gate can reject it), and assert CAP_EPERM with nothing
+     * created. Every spawn below uses pid 100, which HAS authority — the
+     * allow side. */
+    {
+        proc_table[1].pid = 500;
+        proc_table[1].active = 1;
+        proc_table[1].state = PROC_SUSPENDED;
+        proc_table[1].partition_id = 0;
+        proc_table[1].owner_uid = 1000;
+        proc_table[1].sidecar_authority = 0;   /* a plain spawned program */
+        proc_table[1].syscall_stack_top = 0x340000;
+        uint16_t denied_r = CAP_NONE;
+        int arc = cap_create_sidecar(500, blob.data, blob.len,
+                                     CAP_NONE, CAP_NONE, &denied_r);
+        CHECK(arc == CAP_EPERM,
+              "E2: create_sidecar from a non-authority pid is refused (CAP_EPERM)");
+        CHECK(denied_r == CAP_NONE,
+              "E2: the refused create returns no messenger channel");
+        CHECK(proc_count == 0,
+              "E2: the refused create allocated no process");
+        proc_table[1].active = 0;   /* free the probe slot for the real spawns */
+    }
 
     /* ── 1. manifest validation error paths ─────────────────────────────── */
     uint16_t ch_r = CAP_NONE;
