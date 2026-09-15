@@ -1065,6 +1065,45 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
         Ok(())
     }
 
+    /// Mount aerofs at `path`, formatting the backing store first if it holds
+    /// no valid aerofs image. POSIX-Environments E3: a tenant environment's
+    /// ramdisk starts as empty `k_alloc_region` memory (all zeros), which has
+    /// no `AFSL` superblock, so `AerofsFs::mount` would fail `EInval`. This
+    /// detects that — block 0 unreadable or no valid superblock — and writes a
+    /// blank aerofs (root directory only) over the store via the block cache
+    /// before mounting, so each environment gets its own independent, mountable
+    /// root. The pre-seeded SYSTEM ramdisk has a valid superblock, so the
+    /// format branch is skipped and this behaves exactly like `mount_aerofs` —
+    /// keeping the ramdisk driver a dumb block server that never learns the
+    /// filesystem (Phase 2 §5.1). The store must be writable (a tenant
+    /// ramdisk's storage cap is R|W, unlike the system ramdisk's read-only one).
+    pub fn mount_aerofs_or_format(
+        &mut self,
+        path: &str,
+        mut cache: BlockCache<K, A>,
+    ) -> Result<(), Errno> {
+        const BS: usize = aerosls_proto::BLOCK_SIZE as usize;
+        let mut block = [0u8; BS];
+        let needs_format = match cache.read_block(0, &mut block) {
+            Ok(()) => crate::aerofs::parse_superblock(&block).is_none(),
+            Err(_) => true, // unreadable block 0 → treat as unformatted
+        };
+        if needs_format {
+            // A blank aerofs: superblock + inode table + an empty root dir.
+            let img = crate::aerofs::ImageBuilder::new().build();
+            let nblocks = img.len().div_ceil(BS);
+            for b in 0..nblocks {
+                let mut blk = [0u8; BS];
+                let start = b * BS;
+                let end = core::cmp::min(start + BS, img.len());
+                blk[..end - start].copy_from_slice(&img[start..end]);
+                cache.write_block(b as u64, &blk).map_err(|_| Errno::EIo)?;
+            }
+            cache.flush().map_err(|_| Errno::EIo)?;
+        }
+        self.mount_aerofs(path, cache)
+    }
+
     /// Mount an in-memory ramfs at `path` (e.g. `/tmp`). Never stale.
     pub fn mount_ramfs(&mut self, path: &str) -> Result<(), Errno> {
         let comps = mount_comps(path);
