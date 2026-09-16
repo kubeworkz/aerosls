@@ -103,7 +103,7 @@ Milestone **M1 — on-demand POSIX environments** is E1–E6. Milestone **M2 —
 
 **Scope.**
 - Each registry entry records the partition of the process that registered it. Peer resolution matches within the caller's partition, plus an explicit allowlist of kernel-owned names (`kernel.*`, e.g. `kernel.debug.console`).
-- Registering a name held by a **different** partition fails. Re-registering within the same partition keeps today's restart semantics (the watchdog-respawn path depends on them).
+- A registry entry is **scoped to the partition that registered it**, so the same name in two partitions is two separate entries — there is no cross-partition collision to reject; the scoping itself is the isolation. Re-registering within the same partition keeps today's restart semantics (the watchdog-respawn path depends on them).
 - Names may then repeat across partitions: `drv.ramdisk.0` in partition 5 and in partition 7 are different sidecars. This removes most of E3's renaming work.
 - `cap_create_sidecar()` rejects `CAP_IO`, `CAP_IRQ` and `CAP_DEV` records when the target partition is not `PARTITION_SYSTEM`.
 - Revisit `SIDECAR_REGISTRY_MAX` with the sizing in §11.
