@@ -2,6 +2,7 @@
 #include "console_service.h"
 #include "cap.h"
 #include "kernel_io.h"
+#include "env_service.h"
 
 #define CONSOLE_SVC_BUF 4096
 
@@ -31,6 +32,10 @@ void console_service_tick(void) {
     for (uint32_t s = 0; s < CAP_TABLE_ENTRIES; s++) {
         uint64_t w = cap_tables[0].slots[s].word;
         if (!console_is_chan_r(w)) continue;
+        /* POSIX-Environments E4: the environment-manager control channel's
+         * reply CHAN_R also lives in the pid-0 table, but its messages are ENV
+         * replies for env_service_create(), not console text — leave them. */
+        if (env_service_reply_slot((uint16_t)s)) continue;
 
         struct CapChannel* ch = 0;
         int kdir = 0;

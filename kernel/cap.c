@@ -50,6 +50,7 @@
 #include "kernel_io.h"
 #include "frame_pool.h"
 #include "process.h"
+#include "env_service.h"
 #include "../arch/x86/user_paging.h"
 #include <stddef.h>
 
@@ -3679,6 +3680,13 @@ int cap_create_sidecar_in(uint32_t parent_pid,
                     "'%s' (slots %u/%u, kernel end %u/%u)\n",
                     pd->pid, pd->name, sc->name, sc->peer_name,
                     (unsigned)c_rd, (unsigned)c_wr, (unsigned)k_rd, (unsigned)k_wr);
+                /* POSIX-Environments E4: the environment-manager control
+                 * channel. Record the kernel (pid 0) ends so the HTTP control
+                 * plane can round-trip ENV_CREATE to init's env manager, and so
+                 * console_service leaves init's ENV replies for it (not serial). */
+                if (sidecar_prefix(sc->peer_name, "kernel.env.control")) {
+                    env_service_register(k_rd, k_wr);
+                }
             }
         } else {
             /* E2: resolve the peer only within this sidecar's own partition,
