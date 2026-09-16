@@ -180,6 +180,27 @@ void *allocate_physical_ram_frame(void);
  * and increments partition_id's usage counter on success. */
 void *allocate_physical_ram_frame_for_partition(uint32_t partition_id);
 
+/* POSIX-Environments E3: allocate a run of `nframes` CONTIGUOUS physical
+ * frames, charged to `partition_id`, aligned to `align_frames` (a power of
+ * two, in frames; 1 = any boundary). Returns the base PHYSICAL address, or 0
+ * on failure — bad args, a nonzero quota already met/exceeded (the WHOLE run
+ * is quota-checked up front, no partial allocation), or no free run of that
+ * length. On success every frame is bitmap-marked, owner-tagged to
+ * partition_id, and added to its usage counter, so partition_reclaim_all_
+ * frames() frees the entire region on partition destroy exactly like
+ * single-frame allocations.
+ *
+ * This is the runtime, tenant-owned, RECLAIMABLE contiguous allocator, for
+ * handing a sidecar a contiguous MEM region (an environment's heap or its
+ * ramdisk storage) instead of a fixed boot-layout address. It is distinct
+ * from frame_pool_reserve_contiguous() above, which reserves MACHINE-owned
+ * frames (the cap arena) that reclamation must never touch: that one records
+ * a machine-owned watermark range and sets no owner tag; this one sets the
+ * owner tag and touches no watermark, so its frames stay reclaimable. */
+uint64_t allocate_contiguous_frames_for_partition(uint32_t partition_id,
+                                                  uint64_t nframes,
+                                                  uint64_t align_frames);
+
 /* Sets partition_id's frame quota. 0 = unlimited (the default for every
  * partition until this is called). Returns 0 on success, 1 if partition_id
  * is out of range ([0, PARTITION_MAX)). Does not validate that
@@ -228,6 +249,19 @@ uint64_t partition_get_frame_quota(uint32_t partition_id);
  * per-process page-table walker described below. */
 int free_physical_ram_frame(void* frame);
 int free_physical_ram_frame_for_partition(void* frame, uint32_t partition_id);
+
+/* POSIX-Environments E3: free a run of `nframes` contiguous frames starting
+ * at `base_addr`, the counterpart to allocate_contiguous_frames_for_partition().
+ * Frees each frame (bitmap-clear + owner reset) and decrements partition_id's
+ * usage by the number actually freed. Returns 0 on success, 1 if partition_id
+ * is out of range or base_addr is not a page-aligned, in-range, non-zero
+ * address (the bitmap is left untouched on the argument checks; a frame in
+ * the run that was already free is skipped, not counted, matching
+ * free_raw_frame()'s per-frame validation). For freeing an environment's
+ * region on `env destroy` (E5) without destroying the whole partition;
+ * partition destroy still uses partition_reclaim_all_frames(). */
+int free_contiguous_frames_for_partition(uint64_t base_addr, uint64_t nframes,
+                                         uint32_t partition_id);
 
 /* Phase 14 (LPAR): resets partition_id's frame-usage counter to 0.
  * ACCOUNTING-LEVEL RESET ONLY — this does NOT clear any bits in the

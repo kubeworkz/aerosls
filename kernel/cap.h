@@ -994,6 +994,22 @@ int cap_create_sidecar(uint32_t parent_pid,
                        uint16_t* out_ch_r);
 uint64_t sys_sls_create_sidecar(struct SLSCreateSidecarRequest* req);
 
+/* ─── SYS_SLS_ALLOC_REGION (320) — POSIX-Environments E3 ─────────────────
+ * Allocate a contiguous physical MEM region, charged to the CALLER's
+ * partition, and return its base physical address (0 on failure/denial).
+ * The env manager (init) uses it to give each POSIX environment a private
+ * heap and its ramdisk private storage, instead of the fixed boot-layout
+ * addresses init computes today. Restricted to the sidecar creator tree
+ * (the E2 sidecar_authority flag): a plain ring-3 program must not be able
+ * to mint arbitrary physical regions. The whole run is quota-checked, so a
+ * partition cannot exceed its frame quota through this path either. */
+#define SYS_SLS_ALLOC_REGION 320
+struct SLSAllocRegionRequest {
+    uint64_t nframes;       /* region size in 4 KiB frames */
+    uint64_t align_frames;  /* alignment in frames (power of two; 1 = any) */
+};
+uint64_t sys_sls_alloc_region(struct SLSAllocRegionRequest* req);
+
 /* ─── Sidecar registry (Phase 5: name → pid for CAP_CHAN wiring) ────────
  * cap_create_sidecar registers each new sidecar under its manifest's
  * NAME record, and resolves CAP_CHAN peer_names against this table when

@@ -1516,9 +1516,33 @@ int cap_recv_msg(uint32_t pid, uint16_t ch_r_idx,
         uint32_t moved_ty = (uint32_t)((m->cap_word[i] >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK);
         if (moved_ty == CAP_TYPE_MEM) {
             uint64_t recv_cr3 = cap_proc_cr3(pid);
-            if (recv_cr3)
-                cap_arch_identity_map_user(recv_cr3, obj->phys_base,
-                                           obj->npages, (uint32_t)m->cap_rights[i]);
+            if (recv_cr3) {
+                /* Map ONLY the granted sub-region, not the whole object. A
+                 * grant carries a byte-level view (cap_off/cap_len) into the
+                 * object's region: a block-cache request buffer is ONE page
+                 * inside a multi-MiB budget region. Mapping the whole object
+                 * would (a) expose the grantor's unrelated pages to the
+                 * receiver, and (b) on a read-only move-return, re-map every
+                 * page of the region — including the grantor's live heap —
+                 * read-only in the grantor's OWN address space (observed as a
+                 * #PF the instant its allocator lock was next taken, during a
+                 * POSIX-Environments E3 tenant self-format). off/len are
+                 * bytes; len == 0 is a whole-object grant (legacy). */
+                uint64_t region_bytes = (uint64_t)obj->npages * 4096ull;
+                uint64_t off = (uint64_t)m->cap_off[i];
+                uint64_t len = (uint64_t)m->cap_len[i];
+                uint64_t map_phys  = obj->phys_base;
+                uint32_t map_pages = obj->npages;
+                if (len != 0 && off < region_bytes) {
+                    if (off + len > region_bytes) len = region_bytes - off;
+                    uint64_t first = (obj->phys_base + off) & ~0xFFFull;
+                    uint64_t last  = (obj->phys_base + off + len - 1) & ~0xFFFull;
+                    map_phys  = first;
+                    map_pages = (uint32_t)((last - first) / 4096ull + 1);
+                }
+                cap_arch_identity_map_user(recv_cr3, map_phys, map_pages,
+                                           (uint32_t)m->cap_rights[i]);
+            }
         }
         if (out_caps && n_installed < max_caps) {
             out_caps[n_installed].slot = nslot;
@@ -4041,4 +4065,25 @@ uint64_t sys_sls_create_sidecar(struct SLSCreateSidecarRequest* req) {
     req->out_ch_r = ch_r;
     req->out_ch_w = sidecar_find_parent_ch_w(cap_current_pid(), ch_r);
     return (uint64_t)ch_r;
+}
+
+/* ─── sys_sls_alloc_region (320) ─────────────────────────────────────────
+ * POSIX-Environments E3: allocate a contiguous physical region charged to
+ * the caller's partition, returning its base physical address (0 on any
+ * failure). Gated to the sidecar creator tree, exactly like
+ * cap_create_sidecar: a process without sidecar_authority (an
+ * HTTP/shell-spawned PROGRAM) must not be able to mint arbitrary physical
+ * memory. Charging to the CALLER's own partition keeps it backward
+ * compatible — a target-partition variant is E4's job. */
+uint64_t sys_sls_alloc_region(struct SLSAllocRegionRequest* req) {
+    if (!req) return 0;
+    struct ProcessDescriptor* caller = sidecar_find_pid(cap_current_pid());
+    if (!caller || !caller->sidecar_authority) {
+        kernel_serial_printf(
+            "[ALLOC_REGION] denied: pid=%u lacks sidecar_authority\n",
+            (unsigned)cap_current_pid());
+        return 0;
+    }
+    return allocate_contiguous_frames_for_partition(
+        caller->partition_id, req->nframes, req->align_frames);
 }

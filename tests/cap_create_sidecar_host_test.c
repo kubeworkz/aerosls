@@ -296,6 +296,27 @@ void* allocate_physical_ram_frame_for_partition(uint32_t partition_id) {
     return p;
 }
 
+/* Recording stub for the contiguous region allocator (POSIX-Environments
+ * E3). The real one lives in frame_pool.c (not linked here); its allocation
+ * logic — contiguity, quota, owner-tag, reclaim — is tested in
+ * frame_quota_host_test.c. Here it only has to record the args so the
+ * SYS_SLS_ALLOC_REGION test can prove the syscall passes the CALLER's own
+ * partition and the requested size/alignment straight through, and returns a
+ * stable fake base. */
+static uint32_t g_alloc_region_last_part   = 0xFFFFFFFFu;
+static uint64_t g_alloc_region_last_nframes = 0;
+static uint64_t g_alloc_region_last_align   = 0;
+static int      g_alloc_region_calls        = 0;
+uint64_t allocate_contiguous_frames_for_partition(uint32_t partition_id,
+                                                  uint64_t nframes,
+                                                  uint64_t align_frames) {
+    g_alloc_region_last_part    = partition_id;
+    g_alloc_region_last_nframes = nframes;
+    g_alloc_region_last_align   = align_frames;
+    g_alloc_region_calls++;
+    return 0x50000000ULL;   /* fake, stable region base */
+}
+
 /* ─── Fake page table: a real 4-level structure in host memory ─────────────
  * user_clone_page_table() returns a zeroed 512-entry PML4; user_map_page()
  * allocates missing intermediate tables and installs a leaf PTE exactly the
@@ -776,6 +797,42 @@ int main(void) {
         CHECK(proc_count == 0,
               "E2: the hardware-cap refusal allocated no process");
         proc_table[0].partition_id = 0;   /* restore: init is PARTITION_SYSTEM */
+    }
+
+    /* ── 0c. E3 SYS_SLS_ALLOC_REGION: authority gate + caller-partition ──
+     * The region syscall is restricted to the sidecar creator tree and
+     * charges the CALLER's own partition. Prove both: an authority caller
+     * (pid 100, partition 0) reaches the allocator with its partition and
+     * the requested size; a non-authority caller is refused before the
+     * allocator is touched; a NULL request is rejected. */
+    {
+        struct SLSAllocRegionRequest ar = { .nframes = 16, .align_frames = 4 };
+
+        g_cur_pid = 100;                 /* init: has sidecar_authority */
+        g_alloc_region_calls = 0;
+        uint64_t base = sys_sls_alloc_region(&ar);
+        CHECK(base == 0x50000000ULL,
+              "E3: an authority caller gets a region base back");
+        CHECK(g_alloc_region_calls == 1 && g_alloc_region_last_part == 0 &&
+              g_alloc_region_last_nframes == 16 && g_alloc_region_last_align == 4,
+              "E3: the allocator is called with the caller's partition and the requested size/alignment");
+
+        proc_table[1].pid = 500;
+        proc_table[1].active = 1;
+        proc_table[1].state = PROC_SUSPENDED;
+        proc_table[1].partition_id = 5;
+        proc_table[1].sidecar_authority = 0;   /* a plain spawned program */
+        g_cur_pid = 500;
+        g_alloc_region_calls = 0;
+        CHECK(sys_sls_alloc_region(&ar) == 0,
+              "E3: a non-authority caller is denied (returns 0)");
+        CHECK(g_alloc_region_calls == 0,
+              "E3: the denied call never reaches the allocator");
+        proc_table[1].active = 0;
+
+        g_cur_pid = 100;
+        CHECK(sys_sls_alloc_region(NULL) == 0,
+              "E3: a NULL request is rejected");
     }
 
     /* ── 1. manifest validation error paths ─────────────────────────────── */

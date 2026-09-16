@@ -612,6 +612,12 @@ uint64_t do_syscall(uint64_t num, void* arg) {
     case SYS_SLS_CREATE_SIDECAR:
         return sys_sls_create_sidecar((struct SLSCreateSidecarRequest*)arg);
 
+    // ─── POSIX-Environments E3: allocate a contiguous physical region (320)
+    // charged to the caller's partition, for a POSIX environment's private
+    // heap / ramdisk storage. Gated to the sidecar creator tree.
+    case SYS_SLS_ALLOC_REGION:
+        return sys_sls_alloc_region((struct SLSAllocRegionRequest*)arg);
+
     // ─── Phase 5 channel transport (311-315) ───────────────────────────
     // The kabi.rs k_chan_* contract over cap_send_msg/cap_recv_msg
     // (kernel/chan.c, docs/AeroSLS-Sidecar-Channels-Transport-Spec-v0.1.md

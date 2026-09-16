@@ -437,6 +437,19 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         unsafe { k_yield(); }
     }
 
+    // ── 10b. POSIX-Environments E3: tenant environments (feature-gated) ────
+    // Spawn N tenant POSIX environments, each with its own ramdisk and
+    // private storage from the frame pool. Off by default (the shipped Phase
+    // 5 boot is unchanged); the E3 boot check builds with `e3_envs`.
+    #[cfg(feature = "e3_envs")]
+    spawn_e3_tenant_envs(
+        &console,
+        ramdisk_image_cap.base,
+        ramdisk_image_cap.len as u32,
+        posix_image_cap.base,
+        posix_image_cap.len as u32,
+    );
+
     log(&console, "[INIT] ── Phase 5 init sidecar complete ──");
     log(&console, "[INIT] system ready for POSIX sidecar creation.");
 
@@ -615,6 +628,83 @@ fn spawn_posix_sidecar(
         .unwrap_or_else(|e| panic!("[INIT] POSIX create_sidecar failed: {e}"));
     log_fmt!(console, "[INIT]   POSIX messenger: CHAN_R={r} CHAN_W={w}");
     InitChannel::new(RealKernel, r, w)
+}
+
+/// POSIX-Environments E3: spawn 2 tenant POSIX environments, each with its
+/// OWN ramdisk (private R|W storage) and its own budget heap, all allocated
+/// from the frame pool via `SYS_SLS_ALLOC_REGION` (charged to init's
+/// PARTITION_SYSTEM) instead of fixed boot-layout addresses. The POSIX and
+/// ramdisk images are shared read-only (each sidecar gets its own copy of the
+/// code); only heap and storage are per-instance. Each tenant POSIX formats
+/// its empty ramdisk on first mount (vfs `mount_aerofs_or_format`). Names are
+/// partition-scoped by E2, so `drv.ramdisk.1`/`.2` coexist with the system's
+/// `drv.ramdisk.0`. Feature-gated (`e3_envs`) — the default boot never calls
+/// this.
+#[cfg(feature = "e3_envs")]
+fn spawn_e3_tenant_envs(
+    console: &InitChannel<RealKernel>,
+    ramdisk_kaddr: u64,
+    ramdisk_size: u32,
+    posix_kaddr: u64,
+    posix_size: u32,
+) {
+    const POSIX_HEAP_FRAMES: u64 = 1024; // 4 MiB — matches the tenant profile heap
+    const RD_HEAP_FRAMES: u64 = 64; //     256 KiB — matches the ramdisk heap
+    const RD_STORAGE_FRAMES: u64 = 256; // 1 MiB — private per-env block device
+    const RD_STORAGE_BYTES: u64 = RD_STORAGE_FRAMES * 4096;
+
+    log(console, "[INIT] E3: spawning tenant POSIX environments...");
+    for i in 1u32..=2 {
+        let (rd_name, px_name) = match i {
+            1 => ("drv.ramdisk.1", "aerosls.posix.1"),
+            _ => ("drv.ramdisk.2", "aerosls.posix.2"),
+        };
+        // Contiguous, page-aligned regions charged to init's partition.
+        let rd_heap = RealKernel.alloc_region(RD_HEAP_FRAMES, 1);
+        let rd_storage = RealKernel.alloc_region(RD_STORAGE_FRAMES, 1);
+        let px_heap = RealKernel.alloc_region(POSIX_HEAP_FRAMES, 1);
+        if rd_heap == 0 || rd_storage == 0 || px_heap == 0 {
+            log_fmt!(
+                console,
+                "[INIT] E3 env {}: alloc_region FAILED (rd_heap=0x{:x} rd_storage=0x{:x} px_heap=0x{:x})",
+                i, rd_heap, rd_storage, px_heap
+            );
+            continue;
+        }
+        log_fmt!(
+            console,
+            "[INIT] E3 env {}: {} storage @ 0x{:x}, {} heap @ 0x{:x}",
+            i, rd_name, rd_storage, px_name, px_heap
+        );
+
+        // Tenant ramdisk: its own name + private R|W storage (0x3).
+        let rd_manifest = ramdisk_manifest::build_ramdisk_manifest_named(
+            rd_name, ramdisk_kaddr, ramdisk_size, rd_heap, rd_storage, RD_STORAGE_BYTES, 0x3,
+        );
+        match RealKernel.create_sidecar(&rd_manifest) {
+            Ok(_) => log_fmt!(console, "[INIT] E3 env {}: {} spawned", i, rd_name),
+            Err(e) => {
+                log_fmt!(console, "[INIT] E3 env {}: {} spawn FAILED ({})", i, rd_name, e);
+                continue;
+            }
+        }
+        for _ in 0..3 {
+            unsafe { k_yield(); }
+        }
+
+        // Tenant POSIX: tenant profile (no hardware/network), wired to its ramdisk.
+        let px_manifest = posix_manifest::build_posix_manifest_tenant(
+            px_name, rd_name, posix_kaddr, posix_size, px_heap,
+        );
+        match RealKernel.create_sidecar(&px_manifest) {
+            Ok(_) => log_fmt!(console, "[INIT] E3 env {}: {} spawned", i, px_name),
+            Err(e) => log_fmt!(console, "[INIT] E3 env {}: {} spawn FAILED ({})", i, px_name, e),
+        }
+        for _ in 0..3 {
+            unsafe { k_yield(); }
+        }
+    }
+    log(console, "[INIT] E3: tenant environments spawned.");
 }
 
 /// Spawn the network driver through the real kernel path (`SYS_SLS_CREATE_SIDECAR`).
