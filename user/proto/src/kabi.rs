@@ -476,7 +476,10 @@ mod abi {
     struct CreateSidecarReq {
         manifest: *const u8,
         manifest_len: u32,
-        _pad: [u8; 4],
+        /// POSIX-Environments E4 (was a 4-byte pad): 0 = inherit the caller's
+        /// partition. `k_create_sidecar` always sends 0; the env manager uses
+        /// `k_create_sidecar_in` to target a partition.
+        target_partition: u32,
         ch_w_idx: u16,
         console_w_idx: u16,
         out_ch_r: u16,
@@ -497,7 +500,7 @@ mod abi {
         let mut req = CreateSidecarReq {
             manifest,
             manifest_len,
-            _pad: [0; 4],
+            target_partition: 0, // inherit the caller's partition
             ch_w_idx: CAP_NONE,
             console_w_idx: CAP_NONE,
             out_ch_r: CAP_NONE,

@@ -78,6 +78,19 @@ __attribute__((weak)) void user_destroy_page_table(uint64_t pml4_phys) { (void)p
 char stack_bottom[16] __attribute__((weak));
 char stack_top[16] __attribute__((weak));
 
+/* ─── POSIX-Environments E4: partition-state queries ────────────────────────
+ * cap_create_sidecar_in's E4 target-partition gate asks whether a target
+ * partition exists and whether it is paused. The strong definitions live in
+ * partition.c, which no cap.c host test links (its cluster/dspp/persist
+ * dependency chain is irrelevant here), so these weak inert stubs — true only
+ * for PARTITION_SYSTEM (0) — close the link. A test that inherits the caller's
+ * partition (target 0) never reaches the gate, so they stay inert. (The quota
+ * getters are deliberately NOT stubbed here: cap.c's E4 path leaves quota
+ * enforcement to the per-frame allocator, and several tests define their own
+ * partition_get_frame_usage/_quota, which a weak def here would collide with.) */
+__attribute__((weak)) int partition_exists(uint32_t partition_id) { return partition_id == 0; }
+__attribute__((weak)) int partition_is_paused(uint32_t partition_id) { (void)partition_id; return 0; }
+
 /* ─── the deferred drains cap_wait_chans' hlt wake now runs ──────────────── */
 /* kernel/process.c's cap_wait_chans drains the deferred console tick and
  * the latched device-IRQ notifications at its post-hlt wake (the only

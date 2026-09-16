@@ -981,13 +981,26 @@ struct SidecarBibCap {
 struct SLSCreateSidecarRequest {
     const void*  manifest;     /* pointer to packed manifest blob */
     uint32_t     manifest_len; /* blob size in bytes */
-    uint8_t      _pad[4];
+    uint32_t     target_partition; /* POSIX-Environments E4: 0 = inherit the
+                                    * caller's partition (today's behaviour); a
+                                    * nonzero value places the child there —
+                                    * honoured only for a PARTITION_SYSTEM caller
+                                    * targeting a live, unpaused partition. (Was
+                                    * a 4-byte pad; the Rust ABI mirror zeroes it,
+                                    * so old callers still mean "inherit".) */
     uint16_t     ch_w_idx;     /* parent's CHAN_W to the child, or CAP_NONE */
     uint16_t     console_w_idx; /* console CHAN_W, or CAP_NONE */
     uint16_t     out_ch_r;     /* OUT: parent's messenger CHAN_R slot */
     uint16_t     out_ch_w;     /* OUT: parent's messenger CHAN_W slot */
 };
 
+/* Create a sidecar in `target_partition` (0 = inherit the parent's — the boot
+ * tree's behaviour, and every caller before E4). cap_create_sidecar() is the
+ * inherit-only wrapper kept for existing callers. */
+int cap_create_sidecar_in(uint32_t parent_pid,
+                          const void* manifest, uint32_t manifest_len,
+                          uint16_t parent_ch_w, uint16_t console_ch_w,
+                          uint16_t* out_ch_r, uint32_t target_partition);
 int cap_create_sidecar(uint32_t parent_pid,
                        const void* manifest, uint32_t manifest_len,
                        uint16_t parent_ch_w, uint16_t console_ch_w,
