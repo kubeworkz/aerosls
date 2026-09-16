@@ -31,6 +31,7 @@ pub fn build_ramdisk_manifest(
     build_ramdisk_manifest_named(
         RAMDISK_MANIFEST_NAME, image_kaddr, image_size,
         heap_base, storage_base, storage_len,
+        0x1, // R only — the system rootfs is a read-only block device
     )
 }
 
@@ -43,6 +44,10 @@ pub fn build_ramdisk_manifest(
 /// `image_kaddr` is the physical address of the ramdisk binary (from the
 /// `ramdisk.image` MEM cap), `heap_base` is the ramdisk's budget heap,
 /// and `storage_base`/`storage_len` describe the block device region.
+/// `storage_rights` is the storage cap's rights: 0x1 (R) for the read-only
+/// system rootfs, 0x3 (R|W) for a tenant environment's ramdisk so its POSIX
+/// sidecar can format the empty region on first mount (E3 —
+/// mount_aerofs_or_format).
 pub fn build_ramdisk_manifest_named(
     name: &str,
     image_kaddr: u64,
@@ -50,6 +55,7 @@ pub fn build_ramdisk_manifest_named(
     heap_base: u64,
     storage_base: u64,
     storage_len: u64,
+    storage_rights: u16,
 ) -> Vec<u8> {
     let heap_size = 256 * 1024; // 256 KiB — must match RAMDISK_HEAP_BYTES in layout.rs
     let caps = [
@@ -63,7 +69,7 @@ pub fn build_ramdisk_manifest_named(
         }),
         Some(ManifestCap {
             name: "storage",
-            rights: 0x1, // R only — read-only block device
+            rights: storage_rights, // 0x1 R (system rootfs) or 0x3 R|W (tenant)
             kind: CapKind::Mem {
                 base: storage_base,
                 size: storage_len,
@@ -157,13 +163,14 @@ mod tests {
         // own storage region, distinct from instance 0's.
         let blob = build_ramdisk_manifest_named(
             "drv.ramdisk.1", 0x3000_0000, 0x8000,
-            0x4080_0000, 0x4090_0000, 16 * 1024 * 1024);
+            0x4080_0000, 0x4090_0000, 16 * 1024 * 1024, 0x3);
         let m = parse_manifest(&blob).unwrap();
         assert_eq!(m.name, Some("drv.ramdisk.1"));
         assert_eq!(m.n_caps, 3);
-        // storage cap carries this instance's private base, read-only.
+        // storage cap carries this instance's private base, writable (R|W)
+        // so the tenant POSIX can format the empty region on first mount.
         let storage = m.find_cap("storage").expect("storage cap present");
-        assert_eq!(storage.rights, 0x1);
+        assert_eq!(storage.rights, 0x3);
         assert!(matches!(storage.kind,
             aerosls_proto::manifest::CapKind::Mem { base: 0x4090_0000, .. }));
         assert!(m.find_cap("budget").is_some());

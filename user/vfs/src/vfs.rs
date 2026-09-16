@@ -1077,11 +1077,13 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
     /// keeping the ramdisk driver a dumb block server that never learns the
     /// filesystem (Phase 2 §5.1). The store must be writable (a tenant
     /// ramdisk's storage cap is R|W, unlike the system ramdisk's read-only one).
+    /// Returns `true` if the store was empty and got formatted, `false` if it
+    /// already held a valid aerofs and was mounted as-is.
     pub fn mount_aerofs_or_format(
         &mut self,
         path: &str,
         mut cache: BlockCache<K, A>,
-    ) -> Result<(), Errno> {
+    ) -> Result<bool, Errno> {
         const BS: usize = aerosls_proto::BLOCK_SIZE as usize;
         let mut block = [0u8; BS];
         let needs_format = match cache.read_block(0, &mut block) {
@@ -1101,7 +1103,8 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
             }
             cache.flush().map_err(|_| Errno::EIo)?;
         }
-        self.mount_aerofs(path, cache)
+        self.mount_aerofs(path, cache)?;
+        Ok(needs_format)
     }
 
     /// Mount an in-memory ramfs at `path` (e.g. `/tmp`). Never stale.

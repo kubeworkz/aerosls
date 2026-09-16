@@ -6,6 +6,10 @@
 *.elf
 *.so
 *.a
+# POSIX-Environments E3 boot image (init built with e3_envs). The shipped
+# sidecars.cpio is tracked; this tenant-environment variant is a local/CI build
+# artifact only (make x86-iso-e3 -> tests/e3_multi_env_boot_check.sh).
+sidecars_e3.cpio
 
 # Rust sidecar workspace build output
 user/target/

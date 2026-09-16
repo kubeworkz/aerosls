@@ -29,3 +29,9 @@ default = []
 # kernel. The linker script is applied automatically via
 # user/.cargo/config.toml's rustflags for the x86_64-unknown-none target.
 target = ["aerosls-proto/target"]
+# POSIX-Environments E3: also spawn N tenant POSIX environments at boot, each
+# with its own ramdisk (private storage) allocated via SYS_SLS_ALLOC_REGION.
+# Off by default so the shipped Phase 5 boot is byte-for-byte unchanged; the
+# dedicated E3 boot check builds with this on. Implies `target` (it uses the
+# real kernel ABI).
+e3_envs = ["target"]

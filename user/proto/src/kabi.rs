@@ -179,6 +179,16 @@ pub trait Kernel {
         let _ = manifest;
         Err(ERR_NOTFOUND)
     }
+
+    /// Allocate a contiguous physical region of `nframes` frames, aligned to
+    /// `align_frames` frames (a power of two; 1 = any boundary), charged to
+    /// the caller's partition (`SYS_SLS_ALLOC_REGION`). Returns the base
+    /// physical address, or 0 on failure/denial. POSIX-Environments E3.
+    /// Default: 0 (unsupported), for fakes that never allocate.
+    fn alloc_region(&self, nframes: u64, align_frames: u64) -> u64 {
+        let _ = (nframes, align_frames);
+        0
+    }
 }
 
 // ── Real kernel ABI (feature `target`) ───────────────────────────────────────
@@ -793,12 +803,6 @@ mod abi {
         unsafe { sls_syscall(SYS_IRQ_MASK, &mut req as *mut IrqMaskReq as u64) as i32 }
     }
 
-    /// Watchdog-respawn introspection (SYS_SLS_BOOT_GEN = 319): the
-    /// current process's per-name boot generation — 0 on its first boot,
-    /// 1+ after a watchdog respawn (a fresh process created from the same
-    /// manifest NAME after a teardown). The value comes straight back in
-    /// rax; no request struct.
-    #[no_mangle]
     /// `k_alloc_region`: syscall 320. Allocate a contiguous physical region
     /// of `nframes` frames, aligned to `align_frames` frames (a power of two;
     /// 1 = any boundary), charged to the caller's partition. Returns the base
@@ -809,6 +813,12 @@ mod abi {
         unsafe { sls_syscall(SYS_ALLOC_REGION, &req as *const AllocRegionReq as u64) }
     }
 
+    /// Watchdog-respawn introspection (SYS_SLS_BOOT_GEN = 319): the
+    /// current process's per-name boot generation — 0 on its first boot,
+    /// 1+ after a watchdog respawn (a fresh process created from the same
+    /// manifest NAME after a teardown). The value comes straight back in
+    /// rax; no request struct.
+    #[no_mangle]
     pub extern "C" fn k_boot_gen() -> u64 {
         unsafe { sls_syscall(SYS_BOOT_GEN, 0) }
     }
@@ -980,6 +990,10 @@ mod abi {
             } else {
                 Ok((r, w))
             }
+        }
+
+        fn alloc_region(&self, nframes: u64, align_frames: u64) -> u64 {
+            k_alloc_region(nframes, align_frames)
         }
     }
 }

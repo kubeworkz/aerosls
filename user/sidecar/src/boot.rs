@@ -174,8 +174,15 @@ pub fn boot<K: Kernel, A: BufferAlloc>(
     if let (Some(ramdisk_w), Some(ramdisk_r)) = (caps.ramdisk_chan_w, caps.ramdisk_chan_r) {
         let cache = BlockCache::connect(k_wrap, ramdisk_w, ramdisk_r, alloc_wrap)
             .map_err(|e| BootErr::Handshake(handshake_class(&e)))?;
-        // 3. Mount the root aerofs image.
-        vfs.mount_aerofs("/", cache).map_err(BootErr::Mount)?;
+        // 3. Mount the root aerofs image, formatting it first if the store is
+        //    empty (a tenant environment's ramdisk starts as blank
+        //    k_alloc_region memory — E3). The pre-seeded system rootfs has a
+        //    valid superblock, so this is a plain mount there. The returned
+        //    "was formatted" flag is unused for now (E6's per-env terminals
+        //    will surface it); the E3 boot check proves isolation from the
+        //    kernel's per-name sidecar registrations at distinct storage
+        //    addresses instead.
+        let _formatted = vfs.mount_aerofs_or_format("/", cache).map_err(BootErr::Mount)?;
     }
     vfs.mount_devfs("/dev", console.clone())
         .map_err(BootErr::Mount)?;

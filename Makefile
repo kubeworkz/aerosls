@@ -604,7 +604,10 @@ x86-iso: $(X86_BIN)
 	# GRUB menuentry can load it as a Multiboot2 module (build it with
 	# `make selfhost-bootimage`). Without it, the ISO is byte-identical to
 	# the pre-Phase-5 image and boots exactly as before.
-	@if [ -s "$(SIDECAR_CPIO)" ]; then cp "$(SIDECAR_CPIO)" isodir/boot/; echo "[ISO] including $(SIDECAR_CPIO)"; fi
+	# The initrd is always embedded at the canonical name grub.cfg loads
+	# (/boot/sidecars.cpio), whatever $(SIDECAR_CPIO)'s basename is — so the
+	# E3 image (SIDECAR_CPIO=sidecars_e3.cpio) boots the Phase 5 entry too.
+	@if [ -s "$(SIDECAR_CPIO)" ]; then cp "$(SIDECAR_CPIO)" isodir/boot/sidecars.cpio; echo "[ISO] including $(SIDECAR_CPIO) as /boot/sidecars.cpio"; fi
 	cp grub.cfg isodir/boot/grub/
 	grub-mkrescue --modules="normal multiboot multiboot2 iso9660 gfxterm font serial elf" \
 	              -o $(X86_ISO) isodir
@@ -889,6 +892,12 @@ user-programs: $(USER_BINS)
 # independently by the crate's golden tests:
 #   cargo test -p aerosls-bootimage (user/Cargo.toml).
 CARGO            ?= cargo
+# Extra Cargo features for the init sidecar ONLY (init is built in its own
+# cargo invocation below). Empty for the shipped Phase 5 image — that build is
+# byte-for-byte unchanged. The POSIX-Environments E3 image sets this to
+# `e3_envs` (see x86-iso-e3) so init spawns tenant environments; the feature is
+# defined solely in user/init/Cargo.toml, hence init-only.
+INIT_FEATURES    ?=
 SIDECAR_INIT_ELF   ?= user/target/x86_64-unknown-none/release/init
 SIDECAR_DM_ELF     ?= user/target/x86_64-unknown-none/release/dm
 SIDECAR_POSIX_ELF ?= user/target/x86_64-unknown-none/release/posix
@@ -906,10 +915,16 @@ SIDECAR_CPIO       ?= sidecars.cpio
 .PHONY: selfhost-bootimage
 selfhost-bootimage:
 	@echo "[SELFHOST] building the init + DM + POSIX + ramdisk + network + e1000_driver sidecars for x86_64-unknown-none..."
-	@$(CARGO) build --manifest-path user/Cargo.toml -p aerosls-init -p aerosls-dm -p aerosls-sidecar -p aerosls-ramdisk -p aerosls-network -p aerosls-e1000-driver \
+	@$(CARGO) build --manifest-path user/Cargo.toml -p aerosls-dm -p aerosls-sidecar -p aerosls-ramdisk -p aerosls-network -p aerosls-e1000-driver \
 		--features target --target x86_64-unknown-none --release \
-		--bin init --bin dm --bin posix --bin ramdisk --bin network --bin e1000_driver 2>/dev/null \
+		--bin dm --bin posix --bin ramdisk --bin network --bin e1000_driver 2>/dev/null \
 		|| echo "[SELFHOST] warning: x86_64-unknown-none target not installed; using existing binaries"
+	@# init is built separately so INIT_FEATURES can add e3_envs for the E3
+	@# image without applying it to the other packages (which don't define it).
+	@$(CARGO) build --manifest-path user/Cargo.toml -p aerosls-init \
+		--features target $(if $(INIT_FEATURES),--features $(INIT_FEATURES)) --target x86_64-unknown-none --release \
+		--bin init 2>/dev/null \
+		|| echo "[SELFHOST] warning: could not build the init sidecar; using existing binary"
 	@if [ -s "$(SIDECAR_INIT_ELF)" ]; then \
 		$(CARGO) run --quiet --manifest-path user/Cargo.toml -p aerosls-bootimage -- \
 			flatten --input "$(SIDECAR_INIT_ELF)" --output "$(SIDECAR_INIT_BIN)" \
@@ -955,6 +970,30 @@ selfhost-bootimage:
 		--posix "$(SIDECAR_POSIX_BIN)" --ramdisk "$(SIDECAR_RAMDISK_BIN)" \
 		--net "$(SIDECAR_NET_BIN)" --e1000 "$(SIDECAR_E1000_BIN)" -o "$(SIDECAR_CPIO)"
 	@echo "[SELFHOST] boot image: $(SIDECAR_CPIO) (load as an initrd at the bootloader's module path)"
+
+# ── POSIX-Environments E3: the multi-instance-boot image ────────────────────
+# The same six sidecars as `selfhost-bootimage`, except `init` is built with
+# its `e3_envs` feature so that — after standing up the system POSIX — it
+# spawns 2 tenant POSIX environments, each with its own ramdisk driver and a
+# private R|W storage region carved from the frame pool via SYS_SLS_ALLOC_REGION
+# (charged to init's partition). Each tenant POSIX formats its blank ramdisk on
+# first mount (vfs mount_aerofs_or_format), so no init-side mkfs is needed.
+#
+# Everything lands in a SEPARATE cpio and a SEPARATE ISO (via variable
+# overrides on the shared recipes), so the shipped sidecars.cpio /
+# sls_operating_system.iso stay byte-for-byte identical to the Phase 5 image.
+# tests/e3_multi_env_boot_check.sh boots $(X86_E3_ISO) and asserts both tenant
+# environments come up at distinct storage addresses.
+SIDECAR_E3_CPIO ?= sidecars_e3.cpio
+X86_E3_ISO      ?= sls_operating_system_e3.iso
+
+.PHONY: selfhost-bootimage-e3 x86-iso-e3
+selfhost-bootimage-e3:
+	@$(MAKE) selfhost-bootimage INIT_FEATURES=e3_envs SIDECAR_CPIO="$(SIDECAR_E3_CPIO)"
+
+x86-iso-e3: selfhost-bootimage-e3
+	@$(MAKE) x86-iso SIDECAR_CPIO="$(SIDECAR_E3_CPIO)" X86_ISO="$(X86_E3_ISO)"
+	@echo "[ISO-E3] $(X86_E3_ISO) — init built with e3_envs (2 tenant POSIX environments)"
 
 # ── SIMI host toolchain ─────────────────────────────────────────────────────
 # Assembler/interpreter/disassembler/JIT-test for SIMI bytecode (tools/simi/).
