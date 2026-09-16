@@ -278,7 +278,22 @@ static int user_map_page_safe(uint64_t* pml4, uint64_t vaddr, uint64_t paddr,
         pd[PD_IDX(vaddr)] = ((uint64_t)(uintptr_t)pt & USER_PTE_FRAME_MASK)
                             | USER_PTE_PRESENT | USER_PTE_WRITE | USER_PTE_USER;
     }
-    pt[PT_IDX(vaddr)] = (paddr & USER_PTE_FRAME_MASK) | flags;
+    /* A grant that re-maps a page the receiver ALREADY holds as a writable
+     * USER page must never silently drop its write bit. The block-cache
+     * move-return hands a client its own request buffer back with the
+     * grantee's (read-only, for a write request) rights; without this the
+     * client's next refill of that buffer would #PF. Preserve W ONLY when
+     * re-mapping the SAME frame that is already a USER mapping — a fresh
+     * grant sees the replicated kernel huge-page (U/S=0) or an empty slot,
+     * so a read-only grant to a NEW receiver still installs read-only. */
+    {
+        uint64_t prev = pt[PT_IDX(vaddr)];
+        uint64_t keep_w = 0;
+        if ((prev & USER_PTE_PRESENT) && (prev & USER_PTE_USER) &&
+            (prev & USER_PTE_FRAME_MASK) == (paddr & USER_PTE_FRAME_MASK))
+            keep_w = prev & USER_PTE_WRITE;
+        pt[PT_IDX(vaddr)] = (paddr & USER_PTE_FRAME_MASK) | flags | keep_w;
+    }
     return 0;
 }
 
