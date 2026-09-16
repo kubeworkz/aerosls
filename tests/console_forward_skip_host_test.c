@@ -103,6 +103,15 @@ void* allocate_physical_ram_frame_for_partition(uint32_t partition_id) {
     return (void*)(((uintptr_t)raw + 4095u) & ~(uintptr_t)4095u);
 }
 
+/* SYS_SLS_ALLOC_REGION's frame-pool hook (POSIX-Environments E3). This test
+ * never issues that syscall; the inert stub just satisfies the linker. */
+uint64_t allocate_contiguous_frames_for_partition(uint32_t partition_id,
+                                                  uint64_t nframes,
+                                                  uint64_t align_frames) {
+    (void)partition_id; (void)nframes; (void)align_frames;
+    return 0;
+}
+
 /* Page-table hooks are only reached by cap_create_sidecar (not called
  * here); inert stubs that satisfy the linker. */
 uint64_t user_clone_page_table(void) { return 0; }
