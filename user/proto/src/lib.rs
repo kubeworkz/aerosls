@@ -43,6 +43,7 @@ pub use spin::Mutex;
 
 pub mod bootinfo;
 pub mod devreg;
+pub mod env_proto;
 pub mod manifest;
 
 /// ── Channel envelope (Layer 2, transport spec §3.1) ────────────────────────
