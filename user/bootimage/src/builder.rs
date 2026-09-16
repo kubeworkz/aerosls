@@ -32,6 +32,10 @@ use aerosls_proto::manifest::{
 /// Console channel peer — a kernel-owned service (kernel/cap.c wires
 /// `kernel.*` peers to the kernel context, pid 0).
 pub const CONSOLE_PEER: &str = "kernel.debug.console";
+/// POSIX-Environments E4: the peer name of init's environment-manager control
+/// channel. Kernel-owned (the `kernel.` prefix), so its far end is minted into
+/// the kernel context and recorded by env_service (kernel/env_service.c).
+pub const ENV_CONTROL_PEER: &str = "kernel.env.control";
 
 /// Ramdisk driver peer — the POSIX sidecar's block device endpoint.
 pub const RAMDISK_PEER: &str = "drv.ramdisk.0";
@@ -156,11 +160,23 @@ fn build_init_manifest(spec: &BootImageSpec, layout: &BootLayout, blob_offset: u
                 size: spec.e1000_bin.len() as u64,
             },
         }),
+        // POSIX-Environments E4: the environment-manager control channel. Its
+        // peer "kernel.env.control" is a kernel-owned service (like the
+        // console), so cap_create_sidecar mints the far end into the kernel
+        // context (pid 0) and env_service records it; the HTTP control plane
+        // round-trips ENV_CREATE here. init resolves it by the cap name "env".
+        Some(ManifestCap {
+            name: "env",
+            rights: 0x7, // R | W | send
+            kind: CapKind::Chan {
+                peer: Some(ENV_CONTROL_PEER),
+                flags: 0,
+            },
+        }),
         None, // ramdisk.heap — NOT in init's manifest; the ramdisk driver's own
               // manifest declares its budget at this address (avoids cap_create_mem overlap)
         None, // storage — NOT in init's manifest; the kernel reads the rootfs into
               // the storage region directly via launch_init_sidecar
-        None,
         None,
         None,
         None,
@@ -195,7 +211,7 @@ fn build_init_manifest(spec: &BootImageSpec, layout: &BootLayout, blob_offset: u
             chan_queue_depth: 16,
         }),
         caps,
-        n_caps: 9,
+        n_caps: 10,
         bootstrap: Some(Bootstrap {
             console: Some("console"),
             debug: None,
