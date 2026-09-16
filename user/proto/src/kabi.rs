@@ -180,6 +180,15 @@ pub trait Kernel {
         Err(ERR_NOTFOUND)
     }
 
+    /// Like `create_sidecar`, but place the child in `target_partition`
+    /// (0 = inherit the caller's — POSIX-Environments E4). The kernel honours a
+    /// nonzero partition only for a PARTITION_SYSTEM caller. Default: ignore the
+    /// partition and inherit, so fakes that do not model partitions still work.
+    fn create_sidecar_in(&self, manifest: &[u8], target_partition: u32) -> Result<(u32, u32), i32> {
+        let _ = target_partition;
+        self.create_sidecar(manifest)
+    }
+
     /// Allocate a contiguous physical region of `nframes` frames, aligned to
     /// `align_frames` frames (a power of two; 1 = any boundary), charged to
     /// the caller's partition (`SYS_SLS_ALLOC_REGION`). Returns the base
@@ -486,21 +495,23 @@ mod abi {
         out_ch_w: u16,
     }
 
-    /// `k_create_sidecar`: syscall 310. The kernel returns the child's
-    /// parent-end CHAN_R slot as the syscall VALUE on success (errors are
-    /// negative), and fills `out_ch_r`/`out_ch_w` in the request — the
-    /// shim reads both ends from there.
-    #[no_mangle]
-    pub extern "C" fn k_create_sidecar(
+    /// Shared body for `k_create_sidecar` / `k_create_sidecar_in`: syscall 310
+    /// with `target_partition` (0 = inherit the caller's; a nonzero value is a
+    /// POSIX-Environments E4 partition-targeted create, honoured by the kernel
+    /// only for a PARTITION_SYSTEM caller). The kernel fills
+    /// `out_ch_r`/`out_ch_w` in the request; the shim reads both ends from
+    /// there and returns 0 on success (a negative syscall value is an error).
+    fn do_create_sidecar(
         manifest: *const u8,
         manifest_len: u32,
+        target_partition: u32,
         out_r: *mut u32,
         out_w: *mut u32,
     ) -> i32 {
         let mut req = CreateSidecarReq {
             manifest,
             manifest_len,
-            target_partition: 0, // inherit the caller's partition
+            target_partition,
             ch_w_idx: CAP_NONE,
             console_w_idx: CAP_NONE,
             out_ch_r: CAP_NONE,
@@ -522,6 +533,32 @@ mod abi {
             unsafe { *out_w = core::ptr::read_volatile(&req.out_ch_w) as u32 };
         }
         0
+    }
+
+    /// `k_create_sidecar`: syscall 310, inheriting the caller's partition.
+    #[no_mangle]
+    pub extern "C" fn k_create_sidecar(
+        manifest: *const u8,
+        manifest_len: u32,
+        out_r: *mut u32,
+        out_w: *mut u32,
+    ) -> i32 {
+        do_create_sidecar(manifest, manifest_len, 0, out_r, out_w)
+    }
+
+    /// `k_create_sidecar_in`: syscall 310, placing the child in
+    /// `target_partition` (POSIX-Environments E4). The kernel honours a
+    /// nonzero partition only for a PARTITION_SYSTEM caller (the env manager
+    /// in init) into a live, unpaused partition; otherwise it is refused.
+    #[no_mangle]
+    pub extern "C" fn k_create_sidecar_in(
+        manifest: *const u8,
+        manifest_len: u32,
+        target_partition: u32,
+        out_r: *mut u32,
+        out_w: *mut u32,
+    ) -> i32 {
+        do_create_sidecar(manifest, manifest_len, target_partition, out_r, out_w)
     }
 
     #[no_mangle]
@@ -988,6 +1025,18 @@ mod abi {
             let mut r: u32 = 0;
             let mut w: u32 = 0;
             let rc = k_create_sidecar(manifest.as_ptr(), manifest.len() as u32, &mut r, &mut w);
+            if rc != ERR_OK {
+                Err(rc)
+            } else {
+                Ok((r, w))
+            }
+        }
+
+        fn create_sidecar_in(&self, manifest: &[u8], target_partition: u32) -> Result<(u32, u32), i32> {
+            let mut r: u32 = 0;
+            let mut w: u32 = 0;
+            let rc = k_create_sidecar_in(manifest.as_ptr(), manifest.len() as u32,
+                                         target_partition, &mut r, &mut w);
             if rc != ERR_OK {
                 Err(rc)
             } else {
