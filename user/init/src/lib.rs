@@ -31,6 +31,7 @@ extern crate alloc;
 pub mod chan;
 pub mod demo;
 pub mod dm_manifest;
+pub mod env_manager;
 pub mod heap;
 pub mod posix_manifest;
 pub mod ramdisk_manifest;
