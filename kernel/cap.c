@@ -50,6 +50,7 @@
 #include "kernel_io.h"
 #include "frame_pool.h"
 #include "process.h"
+#include "env_service.h"
 #include "../arch/x86/user_paging.h"
 #include <stddef.h>
 
@@ -3108,10 +3109,10 @@ static uint32_t bib_put_entry(uint8_t* buf, uint32_t off, uint32_t buf_cap,
  *   7. Mint CAP_MEM capabilities into the child's table.
  *   8. Restore the parent's kernel_rsp, release the child.
  */
-int cap_create_sidecar(uint32_t parent_pid,
-                       const void* manifest, uint32_t manifest_len,
-                       uint16_t parent_ch_w, uint16_t console_ch_w,
-                       uint16_t* out_ch_r) {
+int cap_create_sidecar_in(uint32_t parent_pid,
+                          const void* manifest, uint32_t manifest_len,
+                          uint16_t parent_ch_w, uint16_t console_ch_w,
+                          uint16_t* out_ch_r, uint32_t target_partition) {
     if (out_ch_r) *out_ch_r = CAP_NONE;
     (void)console_ch_w;  /* reserved: parent sends console cap via messenger */
     if (!manifest || manifest_len < SIDECAR_MANIFEST_HEADER_LEN)
@@ -3384,18 +3385,61 @@ int cap_create_sidecar(uint32_t parent_pid,
         return CAP_EPERM;
     }
 
+    /* ── 4a2. Resolve the child's partition (POSIX-Environments E4) ──────
+     * target_partition == 0 inherits the parent's (the boot tree's, and every
+     * pre-E4 caller). A nonzero target places the child there, but ONLY when
+     * the caller is PARTITION_SYSTEM (the environment manager in init) and the
+     * target is a live, unpaused partition — a tenant cannot fling a sidecar
+     * into another partition, and an absent or paused partition cannot be
+     * populated. From here on child_partition (not the parent's) is what the
+     * hardware-cap gate keys on and what every data frame below is charged to,
+     * so the child and its memory land in — and count against — the target. */
+    uint32_t child_partition;
+    if (target_partition == 0) {
+        child_partition = parent->partition_id;
+    } else {
+        if (parent->partition_id != PARTITION_SYSTEM) {
+            kernel_serial_printf(
+                "[CS] CAP_EPERM: pid=%u (partition %u) may not target partition "
+                "%u — only PARTITION_SYSTEM may place a sidecar into another "
+                "partition\n",
+                parent_pid, (unsigned)parent->partition_id,
+                (unsigned)target_partition);
+            return CAP_EPERM;
+        }
+        if (target_partition >= PARTITION_MAX ||
+            !partition_exists(target_partition)) {
+            kernel_serial_printf(
+                "[CS] CAP_EINVAL: target partition %u is not an active partition\n",
+                (unsigned)target_partition);
+            return CAP_EINVAL;
+        }
+        if (partition_is_paused(target_partition)) {
+            kernel_serial_printf(
+                "[CS] CAP_EPERM: target partition %u is paused — cannot create "
+                "a sidecar in it\n",
+                (unsigned)target_partition);
+            return CAP_EPERM;
+        }
+        /* Frame quota: enforced precisely by the per-frame allocator below,
+         * which is charged to child_partition and denies the frame that would
+         * exceed the target's quota (partial creation then unwinds). No
+         * up-front budget estimate here — the accountable data frames (image,
+         * stack, syscall stack) all pass through that charged path. */
+        child_partition = target_partition;
+    }
+
     /* ── 4b. Tenant capability profile (POSIX-Environments E2) ───────────
      * A sidecar created outside PARTITION_SYSTEM is a tenant environment and
      * must get NO direct hardware access: reject the whole create — fail
      * closed, not silently drop — if its manifest carries a port-I/O, IRQ or
-     * device-MMIO capability. The child inherits the parent's partition
-     * (step 7), so the parent's partition is the child's; today every sidecar
-     * is created in PARTITION_SYSTEM (the boot tree inherits init's), so this
-     * is a no-op until E4's partition-targeted creation, exactly the
-     * backward-compatible-by-construction shape the roadmap calls for. MEM
-     * and CHAN caps are always allowed (a tenant needs memory and channels);
-     * only the three hardware kinds are gated. */
-    if (parent->partition_id != PARTITION_SYSTEM) {
+     * device-MMIO capability. Keyed on the CHILD's partition (E4): with
+     * target_partition == 0 it is the parent's, so the boot tree in
+     * PARTITION_SYSTEM is unaffected; with a real target it is that tenant's,
+     * so a system caller placing a sidecar into partition N still cannot hand
+     * it hardware. MEM and CHAN caps are always allowed (a tenant needs memory
+     * and channels); only the three hardware kinds are gated. */
+    if (child_partition != PARTITION_SYSTEM) {
         for (uint8_t ci = 0; ci < m.n_caps; ci++) {
             uint16_t k = m.caps[ci].kind;
             if (k == SIDECAR_TAG_CAP_IO || k == SIDECAR_TAG_CAP_IRQ ||
@@ -3404,7 +3448,7 @@ int cap_create_sidecar(uint32_t parent_pid,
                     "[CS] CAP_EPERM: manifest for partition %u requests a "
                     "hardware cap '%s' (kind %u) — tenant environments get no "
                     "direct hardware access\n",
-                    (unsigned)parent->partition_id, m.caps[ci].name,
+                    (unsigned)child_partition, m.caps[ci].name,
                     (unsigned)k);
                 return CAP_EPERM;
             }
@@ -3446,7 +3490,7 @@ int cap_create_sidecar(uint32_t parent_pid,
     uint64_t image_vbase = 0x400000000000ULL;  /* USER_PROC_CODE_BASE */
     uint64_t bytes_left  = m.image_size;
     for (uint32_t p = 0; p < n_img_pages; p++) {
-        void* frame = allocate_physical_ram_frame_for_partition(parent->partition_id);
+        void* frame = allocate_physical_ram_frame_for_partition(child_partition);
         if (!frame) {
             kernel_serial_print("[SIDECAR] create: frame alloc failed\n");
             return CAP_ENOMEM;
@@ -3476,7 +3520,7 @@ int cap_create_sidecar(uint32_t parent_pid,
     uint32_t stk_pages = (m.budget_stack_bytes + 4095) / 4096;
     if (stk_pages < 1) stk_pages = 1;
     for (uint32_t p = 0; p < stk_pages; p++) {
-        void* frame = allocate_physical_ram_frame_for_partition(parent->partition_id);
+        void* frame = allocate_physical_ram_frame_for_partition(child_partition);
         if (!frame) {
             kernel_serial_print("[SIDECAR] create: stack frame alloc failed\n");
             return CAP_ENOMEM;
@@ -3507,7 +3551,7 @@ int cap_create_sidecar(uint32_t parent_pid,
     pd->user_rsp   = user_rsp;
     pd->owner_uid  = parent->owner_uid;
     pd->parent_pid = parent_pid;
-    pd->partition_id = parent->partition_id;
+    pd->partition_id = child_partition;
     pd->sidecar_authority = 1;    /* E2: children of the creator tree are
                                    * themselves sidecars and may spawn more
                                    * (init spawns DM; DM spawns drivers). */
@@ -3537,7 +3581,7 @@ int cap_create_sidecar(uint32_t parent_pid,
      * process.c. Without either, the child's first schedule would iretq
      * from a zeroed frame and its first syscall would push onto the
      * kernel's stack. */
-    pd->syscall_stack_top = alloc_proc_syscall_stack(parent->partition_id);
+    pd->syscall_stack_top = alloc_proc_syscall_stack(child_partition);
     if (!pd->syscall_stack_top) {
         kernel_serial_print("[SIDECAR] create: syscall stack allocation failed\n");
         pd->active = 0;
@@ -3636,6 +3680,13 @@ int cap_create_sidecar(uint32_t parent_pid,
                     "'%s' (slots %u/%u, kernel end %u/%u)\n",
                     pd->pid, pd->name, sc->name, sc->peer_name,
                     (unsigned)c_rd, (unsigned)c_wr, (unsigned)k_rd, (unsigned)k_wr);
+                /* POSIX-Environments E4: the environment-manager control
+                 * channel. Record the kernel (pid 0) ends so the HTTP control
+                 * plane can round-trip ENV_CREATE to init's env manager, and so
+                 * console_service leaves init's ENV replies for it (not serial). */
+                if (sidecar_prefix(sc->peer_name, "kernel.env.control")) {
+                    env_service_register(k_rd, k_wr);
+                }
             }
         } else {
             /* E2: resolve the peer only within this sidecar's own partition,
@@ -4017,6 +4068,18 @@ int cap_create_sidecar(uint32_t parent_pid,
     return 0;
 }
 
+/* Inherit-only wrapper: create the child in the parent's own partition (the
+ * boot tree's behaviour, and every caller before E4's partition-targeted
+ * creation). */
+int cap_create_sidecar(uint32_t parent_pid,
+                       const void* manifest, uint32_t manifest_len,
+                       uint16_t parent_ch_w, uint16_t console_ch_w,
+                       uint16_t* out_ch_r) {
+    return cap_create_sidecar_in(parent_pid, manifest, manifest_len,
+                                 parent_ch_w, console_ch_w, out_ch_r,
+                                 0 /* inherit */);
+}
+
 /* Find the parent's CHAN_W slot for the messenger channel whose CHAN_R
  * slot is `ch_r` — cap_create_sidecar mints BOTH ends into the parent's
  * table (cap_chan_create) but returns only the CHAN_R slot; the spawning
@@ -4057,10 +4120,10 @@ static uint16_t sidecar_find_parent_ch_w(uint32_t parent_pid, uint16_t ch_r) {
 uint64_t sys_sls_create_sidecar(struct SLSCreateSidecarRequest* req) {
     if (!req) return (uint64_t)(int64_t)CAP_EINVAL;
     uint16_t ch_r = CAP_NONE;
-    int r = cap_create_sidecar(cap_current_pid(),
-                               req->manifest, req->manifest_len,
-                               req->ch_w_idx, req->console_w_idx,
-                               &ch_r);
+    int r = cap_create_sidecar_in(cap_current_pid(),
+                                  req->manifest, req->manifest_len,
+                                  req->ch_w_idx, req->console_w_idx,
+                                  &ch_r, req->target_partition);
     if (r < 0) return (uint64_t)(int64_t)r;
     req->out_ch_r = ch_r;
     req->out_ch_w = sidecar_find_parent_ch_w(cap_current_pid(), ch_r);

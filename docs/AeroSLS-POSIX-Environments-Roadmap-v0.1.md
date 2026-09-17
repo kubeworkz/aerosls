@@ -140,6 +140,21 @@ Milestone **M1 — on-demand POSIX environments** is E1–E6. Milestone **M2 —
 
 **Verification plan.** `env_create_boot_check.sh` (unified boot): create a partition over HTTP, create an environment, and assert its processes appear with that `partition_id`, its frames are charged to that partition's quota, and a non-system process's `create_sidecar` with `target_partition` set is denied. **Tooth:** remove the `PARTITION_SYSTEM` authorization — the non-system create succeeds and the check fails.
 
+### 7.1 Findings (2026-09-16) — parts 1–3c landed; end-to-end boot check deferred to E1
+
+The E4 build was taken as far as it can go without E1. What landed (branch `feat/e4-partition-targeted-creation`, PR #36):
+
+- **Kernel `target_partition` primitive.** `SLSCreateSidecarRequest` gained `target_partition` (replacing four pad bytes); `cap_create_sidecar_in()` resolves the child partition (0 = inherit the parent's) and, for a nonzero target, requires the caller in `PARTITION_SYSTEM` and the target present and not paused, else `CAP_EPERM`/`CAP_EINVAL`. The child's `partition_id` and its image, stack and syscall-stack frames are all charged to the target; the per-frame partition allocator enforces the quota. `cap_create_sidecar` is now the `target=0` inherit wrapper. Mirrored in `proto/kabi.rs` as `k_create_sidecar_in` and a defaulted `Kernel::create_sidecar_in`.
+- **Environment manager in `init` (Rust).** `user/init/src/env_manager.rs`: `create_environment()` allocates the budget/storage/heap regions, builds the E3 tenant-profile manifests (`drv.ramdisk.<i>` + `aerosls.posix.<i>`) and creates both via `create_sidecar_in(manifest, partition)`; `EnvManager::handle_request` dispatches `ENV_CREATE`/`ENV_DESTROY` and replies. Manifest construction stays in Rust, in `init` (§14 Q4, as recommended).
+- **ENV_* wire protocol.** `user/proto/src/env_proto.rs` with a C mirror `kernel/env_proto.h`, pinned against each other by `tests/env_proto_host_test.c`.
+- **Kernel-held control channel + synchronous kernel→`init` RPC.** `kernel/env_service.c`: the registry wires `kernel.env.control` at boot the way the console service is wired; `env_service_create()` sends `ENV_CREATE` on the kernel end and spins the ring-3 scheduler until `init` replies, bounded by a tick deadline; `console_service_tick` excludes the ENV reply slot so the reply is not drained to serial.
+- **`init` event-loop dispatch.** `run_supervisor_loop` waits on the env channel alongside the Device-Manager channels and routes ENV requests to the manager.
+- **Control plane.** `POST /api/partition/{id}/env` (partition-admin role) parses `{"index":N}`, calls `env_service_create`, and returns JSON.
+
+**Verified now.** All host/unit suites green (kernel `cap.c` host tests, the `env_proto` host test, the env-manager tests, the bootimage tests, the `init` tests). The control channel is **boot-verified as wired** in the Phase-5 self-hosted boot: `[SIDECAR] … wired chan 'env' to kernel service 'kernel.env.control'` and `[ENV] control channel wired: kernel ends rd=2 wr=3`.
+
+**Deferred — `env_create_boot_check.sh` needs E1.** The verification plan above is explicitly "(unified boot)". E1 was sequenced before E4 (§3, §16), but the build order ran E2 → E3 → E4, skipping it. In the current Phase-5 self-hosted boot the e1000 is owned by the user-space driver sidecar and `http_server_run` does not bind port 3000, so there is no HTTP surface to drive `env_service_create` — the kernel control plane and `init` do not yet share one boot. E4's RPC path is therefore built and channel-verified but not exercised end to end. `env_create_boot_check.sh` and its `PARTITION_SYSTEM` tooth move to **after E1 lands**, run against the unified boot; the E4 code is otherwise complete. The shell `env create` surface (§7 scope) likewise attaches once the control plane and `init` share a boot.
+
 ## 8. Phase E5 — Lifecycle and teardown
 
 **Why.** A create path without a leak-free destroy path is worse than no create path (the LPAR roadmap's Phase 14 lesson).

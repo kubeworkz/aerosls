@@ -103,6 +103,16 @@ pub struct SimKernel {
     /// Handles minted by `create_sidecar` (the sim's spawn log — tests
     /// assert a spawn happened and how often).
     spawns: UnsafeCell<Vec<u32>>,
+    /// POSIX-Environments E4: `alloc_region` calls as `(nframes, align)`, and
+    /// the next fake region base to hand out. When `regions_exhausted` is set,
+    /// `alloc_region` returns 0 (the frame pool cannot back the request).
+    regions: UnsafeCell<Vec<(u64, u64)>>,
+    next_region_base: UnsafeCell<u64>,
+    regions_exhausted: UnsafeCell<bool>,
+    /// POSIX-Environments E4: each `create_sidecar_in` as `(manifest bytes,
+    /// target_partition)`, so tests see which partition a spawn targeted and
+    /// what manifest it carried.
+    created: UnsafeCell<Vec<(Vec<u8>, u32)>>,
 }
 
 impl SimKernel {
@@ -115,7 +125,30 @@ impl SimKernel {
             endpoints,
             next_handle: UnsafeCell::new(1),
             spawns: UnsafeCell::new(Vec::new()),
+            regions: UnsafeCell::new(Vec::new()),
+            next_region_base: UnsafeCell::new(0x1000_0000),
+            regions_exhausted: UnsafeCell::new(false),
+            created: UnsafeCell::new(Vec::new()),
         }
+    }
+
+    /// POSIX-Environments E4: the `(nframes, align)` of each `alloc_region`.
+    pub fn regions(&self) -> Vec<(u64, u64)> {
+        // SAFETY: single-threaded test harness only.
+        unsafe { (*self.regions.get()).clone() }
+    }
+
+    /// POSIX-Environments E4: each `create_sidecar_in` as `(manifest, partition)`.
+    pub fn created(&self) -> Vec<(Vec<u8>, u32)> {
+        // SAFETY: single-threaded test harness only.
+        unsafe { (*self.created.get()).clone() }
+    }
+
+    /// POSIX-Environments E4: make `alloc_region` return 0 (frame pool cannot
+    /// back the request), so tests can drive the region-exhaustion path.
+    pub fn set_regions_exhausted(&self, exhausted: bool) {
+        // SAFETY: single-threaded test harness only.
+        unsafe { *self.regions_exhausted.get() = exhausted };
     }
 
     /// Register a capability on a handle (used by tests to set up initial state).
@@ -311,6 +344,25 @@ impl Kernel for SimKernel {
         unsafe { (*self.spawns.get()).push(h) };
         let _ = manifest.len(); // the sim trusts the blob (kernel validates it)
         Ok((h, h))
+    }
+
+    fn alloc_region(&self, nframes: u64, align_frames: u64) -> u64 {
+        // SAFETY: single-threaded test harness only.
+        unsafe { (*self.regions.get()).push((nframes, align_frames)) };
+        if unsafe { *self.regions_exhausted.get() } {
+            return 0;
+        }
+        let base = unsafe { *self.next_region_base.get() };
+        // Advance by the request size so successive regions are distinct and
+        // non-overlapping — the env manager relies on distinct storage bases.
+        unsafe { *self.next_region_base.get() = base + nframes * 4096 };
+        base
+    }
+
+    fn create_sidecar_in(&self, manifest: &[u8], target_partition: u32) -> Result<(u32, u32), i32> {
+        // SAFETY: single-threaded test harness only.
+        unsafe { (*self.created.get()).push((manifest.to_vec(), target_partition)) };
+        self.create_sidecar(manifest)
     }
 }
 

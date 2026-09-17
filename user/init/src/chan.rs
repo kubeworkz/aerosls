@@ -155,6 +155,34 @@ impl<K: Kernel> InitChannel<K> {
         Ok(result.tag)
     }
 
+    /// Like `recv_msg`, but also returns the payload length. The environment
+    /// manager needs both the request bytes (a fixed-layout ENV frame + body)
+    /// and the tag to echo in its reply, so `handle_request` sees exactly the
+    /// received bytes and the reply correlates on the kernel side.
+    pub fn recv_msg_len(&self, buf: &mut [u8]) -> Result<(u32, usize), ChannelError> {
+        let mut chans = [self.r];
+        let (idx, kind) = self
+            .k
+            .wait(&mut chans, TIMEOUT_NONE)
+            .map_err(ChannelError::Kernel)?;
+        if idx != 0 {
+            return Err(ChannelError::Kernel(-1));
+        }
+        match kind {
+            CH_KIND_MSG => {}
+            _ if kind == CH_KIND_CLOSE => {
+                let (reason, detail) = self.recv_close()?;
+                return Err(ChannelError::Closed(reason, detail));
+            }
+            other => return Err(ChannelError::UnexpectedKind(other)),
+        }
+        let result = self
+            .k
+            .recv(self.r, buf, &mut [GrantedCap::default(); 4])
+            .map_err(ChannelError::Kernel)?;
+        Ok((result.tag, result.len))
+    }
+
     /// Wait for a message with a FINITE deadline: the `k_chan_wait` parks
     /// with an absolute deadline and the kernel wakes it at the deadline
     /// (timer ISR) whose re-run returns `ERR_TIMEOUT` — mapped to

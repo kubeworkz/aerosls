@@ -42,6 +42,8 @@
 #include "../kernel/failover.h"     // Step 5 wired live -- liveness tick + leader checkpoint broadcast
 #include "../kernel/frame_pool.h" // Gap Remediation Phase F -- GET /api/partition/quotas, POST /api/partition/quota
 #include "../kernel/storage_quota.h" // Storage Isolation Roadmap Phase 1 -- GET /api/partition/storagequotas, POST /api/partition/storagequota
+#include "../kernel/env_service.h"  // POSIX-Environments E4 -- POST /api/partition/{id}/env
+#include "../kernel/env_proto.h"    // POSIX-Environments E4 -- ENV_* status codes
 #include "../drivers/nvme_admin.h" // Navigator-Parity Gap Roadmap Phase 2 -- nvme_get_capacity_bytes()
 #include "../kernel/security_audit.h" // Navigator-Parity Gap Roadmap Phase 3 -- GET /api/security/audit
 #include "../kernel/group_profile.h"  // Navigator-Parity Gap Roadmap Phase 3 -- GET /api/security/groups
@@ -2991,6 +2993,61 @@ static int api_partition_create_post(const char* body, char* buf, int max, SLSRo
     jb_obj_open(&j,0);
     jb_str(&j, "ok", id != 0xFFFFFFFFu ? "true" : "false"); jb_putc(&j,',');
     jb_uint(&j, "partition_id", (uint32_t)id);
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/partition/{id}/env — POSIX-Environments E4 ──────────────────────
+// Create a POSIX environment in partition {id}. Body: {"index": N} — the
+// environment's identity within the partition (its sidecar names
+// drv.ramdisk.<index>/aerosls.posix.<index> derive from it). This does NOT
+// build the manifests in kernel C: it round-trips ENV_CREATE to init's
+// environment manager (env_service_create), which owns the Rust manifest
+// builders, and relays the result. Same DB_ADMIN+ gate as partition create —
+// placing a tenant environment is a tenancy-administration action.
+static const char* env_status_str(uint16_t s) {
+    switch (s) {
+        case ENV_OK:         return "ok";
+        case ENV_ERR_INVAL:  return "invalid request";
+        case ENV_ERR_NOMEM:  return "frame pool exhausted";
+        case ENV_ERR_PART:   return "partition absent, paused, or placement refused";
+        case ENV_ERR_FULL:   return "environment table full";
+        case ENV_ERR_UNSUPP: return "unsupported";
+        default:             return "unknown";
+    }
+}
+
+static int api_partition_env_create_post(const char* body, char* buf, int max,
+                                         SLSRole req_role, uint32_t partition) {
+    JSONBuf j = { buf, 0, max };
+    if (req_role > ROLE_DB_ADMIN) {
+        jb_obj_open(&j,0); jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","requires DB_ADMIN or higher");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
+    if (!body) {
+        jb_obj_open(&j,0); jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","missing body"); jb_obj_close(&j);
+        j.buf[j.pos]='\0'; return j.pos;
+    }
+    uint32_t index = (uint32_t)json_int(body, "index");
+
+    uint16_t status = ENV_ERR_INVAL;
+    uint32_t env_id = 0;
+    int rc = env_service_create(partition, index, &status, &env_id);
+
+    jb_obj_open(&j,0);
+    if (rc != 0) {
+        jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","environment manager unavailable or timed out");
+    } else if (status == ENV_OK) {
+        jb_str(&j,"ok","true"); jb_putc(&j,',');
+        jb_uint(&j,"env_id", env_id); jb_putc(&j,',');
+        jb_uint(&j,"partition", partition);
+    } else {
+        jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_uint(&j,"status", status); jb_putc(&j,',');
+        jb_str(&j,"error", env_status_str(status));
+    }
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
 
@@ -6171,6 +6228,20 @@ static void http_route(int conn, char* req) {
         if (!strcmp(path, "/api/partitions")) {
             blen = api_partition_create_post(body_ptr, resp_body, (int)sizeof(resp_body), req_role);
             http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // POST /api/partition/{id}/env — POSIX-Environments E4. The {id} is
+        // parsed from the path (digits only), so this never hijacks the exact
+        // /api/partition/assign|destroy|pause|resume routes below (those parse
+        // as zero digits and fall through).
+        if (!strncmp(path, "/api/partition/", 15)) {
+            const char* rest = path + 15;
+            uint32_t pid = 0; const char* p = rest;
+            while (*p >= '0' && *p <= '9') { pid = pid * 10u + (uint32_t)(*p - '0'); p++; }
+            if (p != rest && !strcmp(p, "/env")) {
+                blen = api_partition_env_create_post(body_ptr, resp_body,
+                            (int)sizeof(resp_body), req_role, pid);
+                http_respond(conn, 200, "application/json", resp_body, blen); return;
+            }
         }
         if (!strcmp(path, "/api/partition/assign")) {
             blen = api_partition_assign_post(body_ptr, resp_body, (int)sizeof(resp_body));

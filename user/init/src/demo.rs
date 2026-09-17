@@ -252,7 +252,7 @@ where
 /// bound vectors and closes init's messenger endpoint — the CLOSE here is
 /// what triggers the respawn, and the respawned process re-binds the
 /// vectors cleanly (its manifest caps are fresh).
-pub fn run_supervisor_loop<K: Kernel, FA, FB>(
+pub fn run_supervisor_loop<K: Kernel, FA, FB, FE>(
     console: &InitChannel<K>,
     mut a: InitChannel<K>,
     pa: &RespawnPolicy,
@@ -260,16 +260,22 @@ pub fn run_supervisor_loop<K: Kernel, FA, FB>(
     mut b: InitChannel<K>,
     pb: &RespawnPolicy,
     mut respawn_b: FB,
+    env: InitChannel<K>,
+    mut handle_env: FE,
 ) -> Result<(), ChannelError>
 where
     FA: FnMut(u32) -> Result<InitChannel<K>, ChannelError>,
     FB: FnMut(u32) -> Result<InitChannel<K>, ChannelError>,
+    // POSIX-Environments E4: dispatch an ENV request (its exact bytes) into the
+    // reply buffer, returning the reply length. The caller wires this to the
+    // environment manager (EnvManager::handle_request).
+    FE: FnMut(&[u8], &mut [u8]) -> usize,
 {
     let mut buf = [0u8; 128];
     let mut restarts_a: u32 = 0;
     let mut restarts_b: u32 = 0;
     loop {
-        let mut chans = [a.r, b.r];
+        let mut chans = [a.r, b.r, env.r];
         let (idx, kind) = loop {
             match console.kernel().wait(&mut chans, TIMEOUT_NONE) {
                 Ok(v) => break v,
@@ -308,7 +314,7 @@ where
                 }
                 other => return Err(ChannelError::UnexpectedKind(other)),
             }
-        } else {
+        } else if idx == 1 {
             match kind {
                 aerosls_proto::CH_KIND_MSG => match b.recv_msg(&mut buf) {
                     Ok(_tag) => {
@@ -324,6 +330,29 @@ where
                     backoff_sleep(&b, pb.backoff_for(restarts_b + 1));
                     b = respawn_b(restarts_b + 1)?;
                     restarts_b += 1;
+                }
+                other => return Err(ChannelError::UnexpectedKind(other)),
+            }
+        } else {
+            // idx == 2: the environment-manager control channel — a kernel
+            // service (the kernel context holds the far end), so it never
+            // respawns. Dispatch the request to the env manager and send its
+            // reply back with the SAME tag, so env_service_create() on the
+            // kernel side matches the answer to its request.
+            match kind {
+                aerosls_proto::CH_KIND_MSG => match env.recv_msg_len(&mut buf) {
+                    Ok((tag, len)) => {
+                        let mut reply = [0u8; 64];
+                        let n = handle_env(&buf[..len], &mut reply);
+                        if n > 0 {
+                            let _ = env.request(tag, &reply[..n]);
+                        }
+                    }
+                    Err(e) => return Err(e),
+                },
+                CH_KIND_CLOSE => {
+                    let _ = env.recv_close();
+                    let _ = console.request(0, b"[INIT] env control channel closed");
                 }
                 other => return Err(ChannelError::UnexpectedKind(other)),
             }
@@ -545,11 +574,12 @@ mod tests {
     #[test]
     fn supervisor_loop_respawns_each_child_independently() {
         // ch1 = console, ch2 = DM, ch3 = respawned DM,
-        // ch4 = POSIX, ch5 = respawned POSIX.
-        let k = shared_with_chans(&[1, 2, 3, 4, 5]);
+        // ch4 = POSIX, ch5 = respawned POSIX, ch6 = env control (idle here).
+        let k = shared_with_chans(&[1, 2, 3, 4, 5, 6]);
         let console = InitChannel::new_single(k.clone(), 1);
         let dm = InitChannel::new_single(k.clone(), 2);
         let posix = InitChannel::new_single(k.clone(), 4);
+        let env = InitChannel::new_single(k.clone(), 6);
 
         // Both children die (teardown scan emits CLOSE_PEER_DEAD + pid).
         k.sim().inject_close(2, CLOSE_PEER_DEAD, 42);
@@ -580,6 +610,8 @@ mod tests {
                 k.sim().inject_msg(5, 0x77, b"posix alive after respawn");
                 Ok(InitChannel::new_single(k.clone(), 5))
             },
+            env,
+            |_req: &[u8], _reply: &mut [u8]| 0, // env control not exercised here
         );
 
         // Both children died once and were each respawned by their own
@@ -594,6 +626,53 @@ mod tests {
         // With nothing else queued the sim's non-blocking TIMEOUT_NONE
         // wait reports CH_KIND_NONE, which the loop surfaces as an error
         // exactly like the single-child loop does.
+        assert_eq!(result, Err(ChannelError::UnexpectedKind(CH_KIND_NONE)));
+    }
+
+    #[test]
+    fn supervisor_loop_dispatches_env_request_and_replies() {
+        // POSIX-Environments E4: an ENV request on the env-control channel is
+        // dispatched to the handler, and its reply is sent back with the
+        // request's tag. The env channel uses SEPARATE recv/send handles
+        // (as the real kernel wires CHAN_R/CHAN_W), so the reply does not loop
+        // back into the wait as a new request.
+        // ch1 = console, ch2 = DM, ch3 = POSIX, ch4 = env recv, ch5 = env send.
+        let k = shared_with_chans(&[1, 2, 3, 4, 5]);
+        let console = InitChannel::new_single(k.clone(), 1);
+        let dm = InitChannel::new_single(k.clone(), 2);
+        let posix = InitChannel::new_single(k.clone(), 3);
+        let env = InitChannel::new(k.clone(), 4, 5);
+
+        // The kernel's env_service sends an ENV request on the env channel.
+        k.sim().inject_msg(4, 0xABCD, b"env-create-request-bytes");
+
+        let policy = RespawnPolicy::default();
+        let mut seen: Vec<u8> = Vec::new();
+        let result = run_supervisor_loop(
+            &console,
+            dm,
+            &policy,
+            |_| Ok(InitChannel::new_single(k.clone(), 2)),
+            posix,
+            &policy,
+            |_| Ok(InitChannel::new_single(k.clone(), 3)),
+            env,
+            |req: &[u8], reply: &mut [u8]| {
+                seen.extend_from_slice(req);
+                reply[..5].copy_from_slice(b"REPLY");
+                5
+            },
+        );
+
+        // The handler saw exactly the request bytes...
+        assert_eq!(&seen, b"env-create-request-bytes");
+        // ...and its reply went out on the SEND handle, tagged with the
+        // request's tag so env_service_create() correlates it.
+        assert_eq!(k.sim().queue_len(5), 1);
+        assert_eq!(k.sim().peek_tag(5), Some(0xABCD));
+        // The recv handle is empty afterwards (no loopback), so the loop's next
+        // wait reports the sim's non-blocking CH_KIND_NONE.
+        assert_eq!(k.sim().queue_len(4), 0);
         assert_eq!(result, Err(ChannelError::UnexpectedKind(CH_KIND_NONE)));
     }
 

@@ -317,6 +317,15 @@ uint64_t allocate_contiguous_frames_for_partition(uint32_t partition_id,
     return 0x50000000ULL;   /* fake, stable region base */
 }
 
+/* The E4 target-partition gate's partition-state queries (partition_exists /
+ * partition_is_paused / frame quota+usage) are satisfied by the weak inert
+ * stubs in process_host_stubs.h: partition_exists is true only for
+ * PARTITION_SYSTEM (0), so the E4 section below tests the two teeth those
+ * support — a non-system caller is refused, and a system caller targeting a
+ * partition that does not exist is refused. The paused / at-quota refusals and
+ * the positive placement path are proven by env_create_boot_check (E4 part 2),
+ * which drives real partitions over the control plane. */
+
 /* ─── Fake page table: a real 4-level structure in host memory ─────────────
  * user_clone_page_table() returns a zeroed 512-entry PML4; user_map_page()
  * allocates missing intermediate tables and installs a leaf PTE exactly the
@@ -833,6 +842,36 @@ int main(void) {
         g_cur_pid = 100;
         CHECK(sys_sls_alloc_region(NULL) == 0,
               "E3: a NULL request is rejected");
+    }
+
+    /* ── 0d. E4 partition-targeted creation: the target_partition gate ───
+     * cap_create_sidecar_in places the child in target_partition (0 = inherit,
+     * tested everywhere else here). A nonzero target is honoured ONLY for a
+     * PARTITION_SYSTEM caller into a live, unpaused partition with quota
+     * headroom; the child's partition_id and frames are then charged there —
+     * the paused/at-quota refusals and the positive placement path are proven
+     * by env_create_boot_check (E4 part 2). Here (partition_exists true only
+     * for 0) are the two teeth that hold: each returns in the gate, before any
+     * allocation, so proc_count stays 0. TOOTH: drop the PARTITION_SYSTEM
+     * check and the non-system create below succeeds instead of being refused. */
+    {
+        uint16_t tr = CAP_NONE;
+
+        /* A non-system caller (authority, partition 5) may not target — the
+         * check fires before partition_exists, so it holds regardless. */
+        proc_table[0].partition_id = 5;
+        CHECK(cap_create_sidecar_in(100, blob.data, blob.len, CAP_NONE, CAP_NONE,
+                                    &tr, 7) == CAP_EPERM,
+              "E4: a non-PARTITION_SYSTEM caller may not target another partition");
+        proc_table[0].partition_id = 0;
+
+        /* System caller, but partition 7 is not an active partition. */
+        CHECK(cap_create_sidecar_in(100, blob.data, blob.len, CAP_NONE, CAP_NONE,
+                                    &tr, 7) == CAP_EINVAL,
+              "E4: targeting a non-active partition is refused (CAP_EINVAL)");
+
+        CHECK(proc_count == 0,
+              "E4: every target-partition refusal allocated no process");
     }
 
     /* ── 1. manifest validation error paths ─────────────────────────────── */

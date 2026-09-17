@@ -21,7 +21,7 @@ use crate::posix_manifest;
 use crate::ramdisk_manifest;
 use crate::net_manifest;
 use aerosls_proto::bootinfo::BootInfo;
-use aerosls_proto::kabi::{Kernel, RealKernel, SendCap, CAP_CHAN_W, CAP_MEM, CAP_NONE};
+use aerosls_proto::kabi::{Kernel, RealKernel, SendCap, CAP_CHAN, CAP_CHAN_W, CAP_MEM, CAP_NONE};
 
 extern "C" {
     fn k_yield();
@@ -528,6 +528,37 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         );
         Ok(p)
     };
+    // ── POSIX-Environments E4: the environment manager ────────────────────
+    // init's env-control channel (manifest cap "env", peer
+    // "kernel.env.control"): the kernel minted its CHAN_R (ENV requests arrive)
+    // and CHAN_W (replies go out) into init's table, and recorded the far ends
+    // with env_service. The HTTP control plane round-trips ENV_CREATE here; the
+    // supervisor loop dispatches each request to the environment manager and
+    // sends the reply back with the request's tag.
+    const MAX_ENVIRONMENTS: usize = 8;
+    let env_r = bib
+        .find_cap(CAP_CHAN, "env")
+        .expect("[INIT] missing env-control CHAN_R cap");
+    let env_w = bib
+        .find_cap(CAP_CHAN_W, "env")
+        .expect("[INIT] missing env-control CHAN_W cap");
+    let env_channel = InitChannel::new(RealKernel, env_r.slot, env_w.slot);
+    log_fmt!(
+        &console,
+        "[INIT] env manager on control channel (CHAN_R={} CHAN_W={})",
+        env_r.slot,
+        env_w.slot,
+    );
+    let mut env_mgr = crate::env_manager::EnvManager::new(
+        crate::env_manager::EnvImages {
+            ramdisk_kaddr: ramdisk_image_cap.base,
+            ramdisk_size: ramdisk_image_cap.len as u32,
+            posix_kaddr: posix_image_cap.base,
+            posix_size: posix_image_cap.len as u32,
+        },
+        MAX_ENVIRONMENTS,
+    );
+
     match demo::run_supervisor_loop(
         &console,
         dm_channel,
@@ -536,6 +567,8 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         posix_channel,
         &posix_policy,
         respawn_posix,
+        env_channel,
+        |req: &[u8], reply: &mut [u8]| env_mgr.handle_request(&RealKernel, req, reply),
     ) {
         Ok(()) => log(&console, "[INIT] supervisor event loop exited."),
         Err(ChannelError::TooManyRestarts) => {
