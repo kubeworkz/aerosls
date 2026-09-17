@@ -3,6 +3,8 @@ bits 64
 global enter_user_process
 global kernel_enter_ring3
 global kernel_enter_sidecar
+global kernel_yield_switch
+global kernel_resume_control_plane
 
 section .text
 
@@ -145,3 +147,73 @@ kernel_enter_sidecar:
     xor   rbp, rbp
 
     o64 sysret
+
+; ─── kernel_yield_switch(rsp_save*, cr3, frame*) ─────────────────────────────
+; POSIX-Environments E1 (unified boot): the COOPERATIVE switch from the Ring-0
+; control plane to the next Ring-3 process. Called from
+; kernel_yield_to_ring3() (kernel/process.c), whose caller is the foreground
+; loop (http_server_run / sls_shell_loop) — never from an IRQ or a syscall, so
+; unlike kernel_switch_next() this does NOT swapgs: the Ring-0 control plane
+; runs with GS_BASE == 0 and so does Ring-3, and the kernel-resume entries it
+; can land in (cap_recv_resume / kernel_resume_control_plane) explicitly expect
+; GS_BASE == 0 and swapgs themselves.
+;
+;   rdi = uint64_t* rsp_save  (the control plane's pd->kernel_rsp)
+;   rsi = the target's CR3
+;   rdx = uint64_t* frame     (the 20-qword resume frame process.c built)
+;
+; Saves the Ring-0 continuation — the six SysV callee-saved registers and RSP
+; — into *rsp_save, then loads the frame and iretqs. The continuation resumes
+; in kernel_resume_control_plane (below), which pops those six registers and
+; rets back into kernel_yield_to_ring3's caller: the foreground loop continues
+; as if the yield call had simply taken a while. Interrupts are off from the
+; CR3 switch to the iretq (the frame's RFLAGS re-enables them), the same
+; posture kernel_enter_ring3 takes for its sysret.
+kernel_yield_switch:
+    push  rbx
+    push  rbp
+    push  r12
+    push  r13
+    push  r14
+    push  r15
+
+    mov   [rdi], rsp      ; the control plane's Ring-0 continuation
+    cli
+    mov   cr3, rsi
+
+    mov   rsp, rdx        ; the frame is 15 GPRs + the iretq frame, in the
+                          ; exact order isr32_stub pushes and the switch pops
+    pop   r15
+    pop   r14
+    pop   r13
+    pop   r12
+    pop   r11
+    pop   r10
+    pop   r9
+    pop   r8
+    pop   rbp
+    pop   rdi
+    pop   rsi
+    pop   rdx
+    pop   rcx
+    pop   rbx
+    pop   rax
+    iretq
+
+; ─── kernel_resume_control_plane ──────────────────────────────────────────────
+; The mirror of kernel_yield_switch: reached by the iretq that
+; proc_build_resume_frame()'s resume_control shape builds, with RSP already set
+; to the control plane's saved kernel_rsp and GS_BASE == 0 (the timer's Ring-3
+; path never swapgs's). The saved frame on that stack is exactly what
+; kernel_yield_switch pushed — r15 first, then r14, r13, r12, rbp, rbx, and the
+; return address into kernel_yield_to_ring3 — so popping the six and retting
+; resumes the foreground loop. Same prologue/epilogue pair process_exit() uses
+; to return to a kernel_enter_ring3() continuation.
+kernel_resume_control_plane:
+    pop   r15
+    pop   r14
+    pop   r13
+    pop   r12
+    pop   rbp
+    pop   rbx
+    ret

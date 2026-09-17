@@ -141,6 +141,14 @@ void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
  * with an empty input buffer anyway. */
 int serial_console_poll(char* out, size_t cap) { (void)out; (void)cap; return 0; }
 
+/* console_service.c prints each drained sidecar message under the kernel's
+ * TX serializer (kernel/kernel_io.c, not linked here: no port I/O in a host
+ * process). Nothing else runs concurrently in this test, so the stub is
+ * "always acquired" and the unlock is a no-op -- which is exactly the
+ * kernel's behaviour when the lock is uncontended. */
+int  kernel_serial_tx_lock(void)  { return 1; }
+void kernel_serial_tx_unlock(void) { }
+
 /* kernel/timer.c is not linked; the Phase 5 deadline logic in chan.c reads
  * kernel_tick_counter directly (timer.h declares it). Test-owned so the
  * deadline tests can advance time deterministically. */
@@ -695,6 +703,7 @@ struct Bib {
     uint64_t budget_bytes;
     uint64_t stack_top;
     uint32_t total_len;
+    uint32_t flags;        /* E1 (BIB v2): SIDECAR_BIB_FLAG_UNIFIED */
     struct BibCap caps[SIDECAR_BIB_CAPS_MAX];
 };
 
@@ -706,7 +715,8 @@ static struct Bib bib_parse(const uint8_t* p) {
     b.budget_bytes = le64(p + 12);
     b.stack_top = le64(p + 20);
     b.total_len = le32(p + 28);
-    uint32_t off = 32;
+    b.flags = le32(p + 32);   /* E1: v2 header adds flags(+32) reserved(+36) */
+    uint32_t off = 40;
     for (uint16_t i = 0; i < b.cap_count && i < SIDECAR_BIB_CAPS_MAX; i++) {
         uint16_t nl = le16(p + off);
         off += 2;
@@ -1042,7 +1052,10 @@ int main(void) {
     if (bib) {
         b = bib_parse(bib);
         CHECK(memcmp(bib, SIDECAR_BIB_MAGIC, 8) == 0, "BIB magic");
-        CHECK(b.version == SIDECAR_BIB_VERSION, "BIB version 1");
+        CHECK(b.version == SIDECAR_BIB_VERSION, "BIB version 2");
+        /* E1: a non-unified boot must leave the flag clear — every Phase-5
+         * sidecar's behaviour (and this test's own expectations) rests on it. */
+        CHECK(b.flags == 0, "BIB flags clear on a non-unified boot");
         CHECK(b.cap_count == 9,
               "BIB lists 9 caps (2 messenger + 2 MEM + 4 wired CHAN + 1 DEV)");
         CHECK(b.budget_bytes == BUDGET_MEM, "BIB budget matches the manifest");
@@ -1065,11 +1078,13 @@ int main(void) {
               "synthetic ring3_ctx carries the BIB pointer in rdi (crt0 contract)");
         CHECK(b.stack_top == BIB_STACK_TOP, "BIB stack_top = RSP at _start + 16");
         /* Entry = name_len u16 + name + slot u16 + ty u8 + rights u8 +
-         * base u64 + len u64: 32 header + 22 (cap0) + 22 (cap1) + 28
+         * base u64 + len u64: 40 header + 22 (cap0) + 22 (cap1) + 28
          * (cap2 "budget") + 25 (cap3 "dma") + 27+27 (cap4/5 "peer0") +
-         * 29+29 (cap6/7 "console") + 31 (cap8 "nic0.bar0"). */
-        CHECK(b.total_len == 272,
-              "BIB total_len = 32 + 22 + 22 + 28 + 25 + 27 + 27 + 29 + 29 + 31");
+         * 29+29 (cap6/7 "console") + 31 (cap8 "nic0.bar0").
+         * The header is 40 bytes, not 32: POSIX-Environments E1's BIB v2
+         * added flags u32 + reserved u32 after total_len. */
+        CHECK(b.total_len == 280,
+              "BIB total_len = 40 + 22 + 22 + 28 + 25 + 27 + 27 + 29 + 29 + 31");
 
         CHECK(b.caps[0].name[0] == 0 && b.caps[0].slot == child_rd &&
               b.caps[0].ty == CAP_TYPE_CHAN_R && b.caps[0].rights == CAP_PERM_RECV &&
@@ -1276,8 +1291,8 @@ int main(void) {
             struct Bib cb = bib_parse(c_bib);
             CHECK(cb.cap_count == 6,
                   "consumer BIB lists 6 caps (2 messenger + 2 MEM + 2 wired CHAN)");
-            CHECK(cb.total_len == 187,
-                  "consumer BIB total_len = 32 + 22 + 22 + 28 + 25 + 29 + 29");
+            CHECK(cb.total_len == 195,
+                  "consumer BIB total_len = 40 + 22 + 22 + 28 + 25 + 29 + 29 (v2 header)");
             CHECK(strcmp(cb.caps[4].name, "console") == 0 &&
                   cb.caps[4].ty == CAP_TYPE_CHAN_R &&
                   cb.caps[4].rights == CAP_PERM_RECV,

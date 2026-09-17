@@ -162,6 +162,40 @@ void boot_params_scan_mb2(uint32_t mb2_magic, uint32_t mb2_phys) {
 
 const char* boot_params_cmdline(void) { return bp_cmdline; }
 
+/* POSIX-Environments E1: the unified boot's selector. See boot_params.h. The
+ * parse runs once and is cached: kernel_main asks twice (once to plant the
+ * control plane before the launch, once to choose the foreground loop), and
+ * both answers must be the same one. */
+int boot_params_unified_mode(void) {
+    static int cached = -1;
+    if (cached >= 0) return cached;
+
+    uint32_t v = 0;
+    cached = (bp_cmdline[0] != '\0' &&
+              boot_params_find_uint(bp_cmdline, "unified", &v) && v == 1) ? 1 : 0;
+
+    if (cached)
+        kernel_serial_print(
+            "[BOOT] unified boot requested (unified=1) — the Ring-0 control "
+            "plane and the sidecar world will share this boot.\n");
+    else {
+        /* Distinguish "not asked for" from "asked for badly", exactly as
+         * node= does above: a mistyped flag that silently produced the old
+         * boot is the failure mode worth naming. */
+        for (int i = 0; bp_cmdline[i] != '\0'; i++) {
+            if ((i == 0 || bp_cmdline[i - 1] == ' ') &&
+                bp_key_matches(&bp_cmdline[i], "unified") == 7 &&
+                bp_cmdline[i + 7] == '=') {
+                kernel_serial_print(
+                    "[BOOT] WARNING: 'unified=' present but not exactly '1' — "
+                    "booting the non-unified mode this flag would have replaced.\n");
+                break;
+            }
+        }
+    }
+    return cached;
+}
+
 uint32_t boot_params_apply_node_identity(void) {
     uint32_t node = 0;
 

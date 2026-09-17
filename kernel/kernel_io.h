@@ -19,6 +19,31 @@ void kernel_serial_print(const char* s);
 void kernel_serial_print_hex64(uint64_t v);
 void kernel_serial_printf(const char* fmt, ...);
 
+/* ─── Serial TX serialization (POSIX-Environments E1) ─────────────────────
+ * Until E1 the kernel was the machine's ONLY writer to COM1 after the boot
+ * hand-over, so no line could ever come out interleaved with another's. The
+ * unified boot has two writers by construction: the Ring-0 foreground loop
+ * on the BSP (control plane prints) and the console-service drain, which on
+ * an SMP boot runs on the AP core and prints the Ring-3 sidecars' log lines.
+ * Both bottom out at kernel_serial_putchar(), and two writers inside one
+ * putchar loop emit byte-interleaved text (observed: `[INIT] UNIF<kernel
+ * line>IED boot`). That garbles the boot log for humans and makes every
+ * grep-based boot guard — which reads exactly that log — flaky.
+ *
+ * kernel_serial_print()/printf()/print_hex64() and the sidecar console drain
+ * (kernel/console_service.c) bracket their bytes with this lock, so one line
+ * — or one sidecar console message — is written whole.
+ *
+ * The wait is BOUNDED on purpose: a caller that cannot acquire within
+ * kernel_serial_tx_lock()'s spin limit prints anyway and releases nothing.
+ * That makes a parked core impossible (no cross-core lock cycle can hang the
+ * kernel) and degrades a print from interrupt context, where the same core
+ * may already hold it, to the pre-E1 unlocked behaviour instead of
+ * self-deadlocking. Callers must use the return value: only the acquirer
+ * unlocks. */
+int  kernel_serial_tx_lock(void);   /* 1 = acquired (must unlock), 0 = print anyway */
+void kernel_serial_tx_unlock(void);
+
 // ─── Output capture (Kernel-Side Shell Refactor, docs/AeroSLS-Web-Terminal-
 // Plan-v0.1.md §10.2) ───────────────────────────────────────────────────────
 // kernel_serial_putchar() is the single choke point every kernel_serial_

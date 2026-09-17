@@ -12,6 +12,7 @@
 #include "frame_pool.h"     /* frame_pool_reserve_range */
 #include "kernel_io.h"      /* kernel_serial_print/printf */
 #include "process.h"        /* proc_table, PROC_BLOCKED, ProcessDescriptor */
+#include "boot_params.h"     /* E1: boot_params_unified_mode() */
 #include "../arch/x86/multiboot2.h"
 #include "../arch/x86/user_paging.h"   /* per_cpu_data */
 #include <stdint.h>
@@ -471,6 +472,11 @@ static int boot_pci_scan_slot(int slot, struct BootDeviceEntry* e) {
  * NOT table 0, so the kernel console service (which drains every CHAN_R in
  * table 0) never mistakes the messenger for a console channel. */
 #define BOOT_PARENT_PID 99u
+/* SLOT 0 IS RESERVED FOR THIS DESCRIPTOR — the memset below is not a
+ * "first free slot" search, and any other boot-time planter must stay out of
+ * slot 0. POSIX-Environments E1's control-plane pseudo-process is the one
+ * such planter (proc_control_plane_init, which runs BEFORE this call and
+ * therefore takes the HIGHEST free slot for exactly this reason). */
 static void boot_plant_parent(uint64_t kernel_stack_top) {
     memset(&proc_table[0], 0, sizeof(proc_table[0]));
     proc_table[0].pid = BOOT_PARENT_PID;
@@ -604,11 +610,36 @@ void launch_init_sidecar(void) {
             child_pid = proc_table[i].pid;
             child = &proc_table[i];
         }
+    if (!child) return;
+
+    /* E1: the UNIFIED boot stops here — on purpose.
+     *
+     * cap_create_sidecar() already released the child to PROC_SUSPENDED with
+     * a synthetic ring3_ctx (rip = the sidecar entry, rdi = its BIB virtual
+     * address — cap.c fills ctx[9]), which is byte-for-byte the state the
+     * scheduler's first pick of it needs. So there is nothing to hand-craft:
+     * returning lets boot continue into the Ring-0 control plane below step
+     * 7d (http_server_run, or sls_shell_loop with no NIC), and THAT loop is
+     * what hands the CPU to init — through kernel_yield_to_ring3(), one
+     * budget at a time, until the timer's schedule_ring3 preempts init in
+     * ring 3 and the two worlds round-robin from there.
+     *
+     * The alternative (this function's other path) is the Phase-5 boot: enter
+     * init via kernel_enter_sidecar() and never return, which is why the two
+     * worlds were mutually exclusive before E1 (roadmap G1). */
+    if (boot_params_unified_mode()) {
+        kernel_serial_printf(
+            "[E1] init sidecar created (PID %u, messenger CHAN_R %u) and left "
+            "RUNNABLE — unified boot: control plane and sidecars share this "
+            "boot\n",
+            (unsigned)child_pid, (unsigned)ch_r);
+        return;
+    }
+
     kernel_serial_printf(
         "[SIDECAR] init sidecar created (PID %u, messenger CHAN_R %u) — "
         "entering ring 3\n",
         (unsigned)child_pid, (unsigned)ch_r);
-    if (!child) return;
 
     /* 6. Hand the boot to the init sidecar. At boot nothing is ever in
      *    ring 3 (the shell and HTTP server run in ring 0), so the ring-3

@@ -3,6 +3,7 @@
 #include "../arch/x86/lapic.h"
 #include "net_event.h"
 #include "cap.h"   /* Phase 5: cap_park_deadline_tick (weak default / process.c override) */
+#include "process.h"  /* E1: proc_control_plane_tick (unified-boot yield budget) */
 #include "console_service.h"  /* BSP console drain when AP is offline */
 
 volatile uint64_t kernel_tick_counter = 0;
@@ -22,6 +23,15 @@ void timer_irq_handler(void) {
      * there is no cross-CPU race (unlike the AP core's console-service
      * wake, which is pre-existing and separate). */
     cap_park_deadline_tick();
+    /* POSIX-Environments E1: the same kind of wake for the Ring-0 control
+     * plane. A unified boot's foreground loop yields the CPU to Ring-3 work
+     * (kernel_yield_to_ring3) with a tick budget; this flips the parked
+     * pseudo-process back to runnable once that budget expires, so the
+     * schedule_ring3() call below resumes it. Pure proc_table state flip —
+     * no locks, BSP only, exactly like the park-deadline wake above. On
+     * every boot that is not unified there is no control plane and this is
+     * one NULL-check. */
+    proc_control_plane_tick();
     /* BSP-side console drain: when the AP core never comes online
      * (uniprocessor QEMU), microkernel_service_poll() never runs,
      * so the console sidecar channels must still be drained here.

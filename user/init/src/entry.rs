@@ -367,6 +367,55 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     // Yield to let the ramdisk sidecar start and park.
     unsafe { k_yield(); }
 
+    // ── 8b. POSIX-Environments E1: which boot is this? ────────────────────
+    // The kernel's BIB tells init whether it IS the boot (Phase 5: the
+    // sidecar world owns the machine) or HALF of one (the unified boot: the
+    // kernel keeps the NICs and the serial console and shares the CPU with
+    // its Ring-0 control plane — see docs/AeroSLS-POSIX-Environments-Roadmap-v0.1.md
+    // §4). In the unified boot the hardware half of the Phase-5 spawn chain
+    // is the KERNEL's job, not init's: the network driver and the
+    // system-property POSIX sidecar — whose manifest carries the COM1 port
+    // I/O, the NIC BAR0 DEV cap and the timer/serial IRQ binds — would fight
+    // the kernel for hardware it is actively driving. What init keeps is the
+    // software world it owns: the Device Manager (so the device registry
+    // still has a real consumer, and no e1000 driver is spawned because no
+    // NIC was handed off) and its own ramdisk driver.
+    let unified = bib.is_unified();
+    if unified {
+        log(&console, "[INIT] UNIFIED boot (BIB flag): the kernel owns the NICs and the console; keeping the software-only spawn chain");
+    }
+
+    // Resolved here rather than inside step 10 because BOTH arms need them:
+    // the hardware path spawns the POSIX sidecar from them, and the unified
+    // path's watchdog closure must be able to respawn it if it ever exists.
+    let posix_image_cap = bib
+        .find_cap(CAP_MEM, "posix.image")
+        .expect("[INIT] missing 'posix.image' MEM cap");
+    // posix.heap is NOT in init's manifest (avoids MEM overlap with
+    // the POSIX sidecar's own budget cap).  Compute its base from the
+    // image cap: heap sits immediately after the image, page-aligned.
+    let posix_heap_base = (posix_image_cap.base + posix_image_cap.len + 4095) & !4095u64;
+
+    // Driver SDK v0.1 s4.1 — the e1000's MMIO BAR0 from the device registry
+    // (the kernel's PCI scan recorded bar0_phys; no hardcoded address).
+    // devtest in the POSIX sidecar maps it via SYS_DEV_MMAP and reads the
+    // device registers — the on-target proof that CAP_TYPE_DEV works. Boots
+    // without an e1000 (no `-device e1000`) simply omit the cap and devtest
+    // skips. Only the hardware path consumes it; the unified boot never
+    // mints a DEV cap at all.
+    let e1000_bar0 = devreg.find(0x02, 0x00).map(|e| e.bar0_phys);
+    match e1000_bar0 {
+        Some(base) => log_fmt!(
+            &console,
+            "[INIT] e1000 BAR0 @ 0x{:x} → POSIX manifest DEV cap 'nic0.bar0'",
+            base
+        ),
+        None => log(&console, "[INIT] no e1000 in registry — POSIX manifest omits the DEV cap"),
+    }
+
+    let mut posix_channel: Option<InitChannel<RealKernel>> = None;
+
+    if !unified {
     // ── 9. Spawn the network driver FIRST ────────────────────────────────
     // The network driver must be registered in the kernel's sidecar
     // registry before the POSIX sidecar, because the POSIX manifest
@@ -391,15 +440,6 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
 
     // ── 10. Spawn the POSIX sidecar ───────────────────────────────────────
     log(&console, "[INIT] spawning POSIX sidecar...");
-
-    let posix_image_cap = bib
-        .find_cap(CAP_MEM, "posix.image")
-        .expect("[INIT] missing 'posix.image' MEM cap");
-
-    // posix.heap is NOT in init's manifest (avoids MEM overlap with
-    // the POSIX sidecar's own budget cap).  Compute its base from the
-    // image cap: heap sits immediately after the image, page-aligned.
-    let posix_heap_base = (posix_image_cap.base + posix_image_cap.len + 4095) & !4095u64;
     log_fmt!(&console, "[INIT]   posix.heap computed @ 0x{:x}", posix_heap_base);
 
     // The POSIX sidecar's manifest declares budget + console + ramdisk + network caps.
@@ -408,28 +448,15 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     // messenger channel: its CLOSE event (on process death) is what the
     // watchdog below parks on to respawn a crashed POSIX sidecar.
     //
-    // Driver SDK v0.1 s4.1 — mint a CAP_TYPE_DEV cap for the e1000's MMIO
-    // BAR0 from the device registry (the kernel's PCI scan recorded
-    // bar0_phys; no hardcoded address). devtest in the POSIX sidecar
-    // maps it via SYS_DEV_MMAP and reads the device registers — the
-    // on-target proof that CAP_TYPE_DEV works. Boots without an e1000
-    // (no `-device e1000`) simply omit the cap and devtest skips.
-    let e1000_bar0 = devreg.find(0x02, 0x00).map(|e| e.bar0_phys);
-    match e1000_bar0 {
-        Some(base) => log_fmt!(
-            &console,
-            "[INIT] e1000 BAR0 @ 0x{:x} → POSIX manifest DEV cap 'nic0.bar0'",
-            base
-        ),
-        None => log(&console, "[INIT] no e1000 in registry — POSIX manifest omits the DEV cap"),
-    }
-    let posix_channel = spawn_posix_sidecar(
+    // The e1000 BAR0 DEV cap (minted from the device registry, resolved just
+    // above step 9) is passed here; see that resolution's comment.
+    posix_channel = Some(spawn_posix_sidecar(
         &console,
         posix_image_cap.base,
         posix_image_cap.len as u32,
         posix_heap_base,
         e1000_bar0,
-    );
+    ));
     // Yield multiple times to give the ramdisk sidecar time to
     // re-scan its cap table, discover the POSIX ramdisk channel,
     // and be ready to handle RD_INFO before POSIX sends it.
@@ -449,6 +476,12 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         posix_image_cap.base,
         posix_image_cap.len as u32,
     );
+
+    }   // end of the hardware path (steps 9-10b) — see the E1 note above step 9
+
+    if unified {
+        log(&console, "[INIT] unified boot: the network driver and the system POSIX sidecar stay unspawned (kernel-owned hardware)");
+    }
 
     log(&console, "[INIT] ── Phase 5 init sidecar complete ──");
     log(&console, "[INIT] system ready for POSIX sidecar creation.");
@@ -559,17 +592,35 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         MAX_ENVIRONMENTS,
     );
 
-    match demo::run_supervisor_loop(
-        &console,
-        dm_channel,
-        &dm_policy,
-        respawn_dm,
-        posix_channel,
-        &posix_policy,
-        respawn_posix,
-        env_channel,
-        |req: &[u8], reply: &mut [u8]| env_mgr.handle_request(&RealKernel, req, reply),
-    ) {
+    // POSIX-Environments E1: two loops, one per boot shape. A unified boot
+    // (posix_channel == None, because the hardware path above was skipped) runs
+    // the heartbeat loop; every other boot runs the supervisor loop unchanged.
+    let loop_result = match posix_channel {
+        Some(posix_channel) => demo::run_supervisor_loop(
+            &console,
+            dm_channel,
+            &dm_policy,
+            respawn_dm,
+            posix_channel,
+            &posix_policy,
+            respawn_posix,
+            env_channel,
+            |req: &[u8], reply: &mut [u8]| env_mgr.handle_request(&RealKernel, req, reply),
+        ),
+        None => {
+            log(&console, "[INIT] unified boot: entering the heartbeat loop (DM watchdog + env control, no POSIX subject)");
+            demo::run_unified_loop(
+                &console,
+                dm_channel,
+                &dm_policy,
+                respawn_dm,
+                env_channel,
+                |req: &[u8], reply: &mut [u8]| env_mgr.handle_request(&RealKernel, req, reply),
+            )
+        }
+    };
+
+    match loop_result {
         Ok(()) => log(&console, "[INIT] supervisor event loop exited."),
         Err(ChannelError::TooManyRestarts) => {
             log(&console, "[INIT] a supervised sidecar crash-looped; giving up respawns.")

@@ -115,6 +115,10 @@ void vga_print(const char *s){ (void)s; g_vga_calls++; }
 int  smp_cpu_id(void)        { return 0; }
 int  smp_cpu_count(void)     { return 1; }
 void smp_uniprocessor_tick(void) { }
+/* POSIX-Environments E1: read_line()'s idle point yields the CPU to the unified
+ * boot's Ring-3 work. Nothing to schedule on the host and this test drives the
+ * panic verbs, so the documented no-op is the accurate stub. */
+void kernel_yield_to_ring3(uint32_t budget_ticks) { (void)budget_ticks; }
 
 /* console_feed() lives in kernel/console.c and is not under test here.
  * Stubbed to "no line completed" so serial_console_poll() links; a stub that

@@ -109,6 +109,28 @@ void boot_params_scan_mb2(uint32_t mb2_magic, uint32_t mb2_phys);
 const char* boot_params_cmdline(void);
 
 /*
+ * POSIX-Environments E1: is this the UNIFIED boot?
+ *
+ * `unified=1` on the command line selects the third boot mode: the Ring-0
+ * control plane (HTTP on the management NIC, the shell when no NIC is
+ * present) and the Phase-5 sidecar world run in ONE boot, sharing the CPU
+ * through the cooperative yield (kernel_yield_to_ring3). The init sidecar is
+ * created and left runnable instead of being entered directly, so
+ * launch_init_sidecar() RETURNS and boot continues into the control plane.
+ *
+ * Only an explicit `unified=1` enables it. Every other value (absent,
+ * `unified=0`, a typo) leaves the two long-standing modes untouched: an
+ * initrd boot still hands the machine to the sidecar subsystem
+ * ("the sidecar system IS the boot"), and a boot without one is still the
+ * kernel-only world.
+ *
+ * Returns 1 when unified, 0 otherwise. Reads the command line captured by
+ * boot_params_scan_mb2(); safe to call before or after
+ * boot_params_apply_node_identity().
+ */
+int boot_params_unified_mode(void);
+
+/*
  * Resolve and apply this boot's cluster identity from the command line.
  *
  * Reads `node=<n>`; if present and in [1, CLUSTER_NODE_MAX], calls

@@ -2,8 +2,8 @@
 # tests/run_source_smokes.sh — runs the SOURCE-ONLY guard smokes.
 #
 # ─── Why this exists ───────────────────────────────────────────────────────
-# run_guard_smokes.sh globs tests/*_smoke.sh, but seven of the
-# thirty-three need the linked kernel, its objects, or the built ISO
+# run_guard_smokes.sh globs tests/*_smoke.sh, but eight of the
+# thirty-four need the linked kernel, its objects, or the built ISO
 # (they synthesize tooth inputs and then restore-check against the real
 # image, or boot the ISO under QEMU), so that runner only works on a
 # build host. The other twenty-six are source-only: they need only
@@ -19,9 +19,9 @@
 # the verify job calls, so every source-only smoke's teeth are proven on
 # every push, independent of the kernel build.
 #
-# The seven build-needing smokes are excluded by name — five carry
-# GUARD-KIND: build for run_checks.sh, and the two phase5 boot smokes
-# boot the built ISO. Everything else that
+# The eight build-needing smokes are excluded by name — five carry
+# GUARD-KIND: build for run_checks.sh, and three boot the built ISO (the
+# two phase5 smokes and the E1 unified-boot tooth). Everything else that
 # globs *_smoke.sh runs here, so a NEW source-only smoke is covered
 # automatically; and a smoke that is NOT on the exclusion list but cannot
 # run is a failure, not a skip, so a smoke that stops being source-only
@@ -31,12 +31,12 @@
 set -u
 cd "$(dirname "$0")/.."   # repo root
 
-# The seven build-needing smokes — the same set as the GUARD-KIND: build
-# markers in run_checks.sh, plus the two phase5 boot smokes (they boot
+# The eight build-needing smokes — the same set as the GUARD-KIND: build
+# markers in run_checks.sh, plus the boot smokes (they boot
 # sls_operating_system.iso under QEMU, which only exists on a build host;
 # kernel-guards runs them for real right after `make x86-iso`). Keep in
 # step with what kernel-guards builds.
-BUILD_SMOKES="code_buffer_budget_smoke.sh kernel_image_end_smoke.sh no_hosted_link_smoke.sh no_tls_relocations_smoke.sh stack_frame_budget_smoke.sh phase5_boot_smoke.sh phase5_e1000_driver_smoke.sh"
+BUILD_SMOKES="code_buffer_budget_smoke.sh kernel_image_end_smoke.sh no_hosted_link_smoke.sh no_tls_relocations_smoke.sh stack_frame_budget_smoke.sh phase5_boot_smoke.sh phase5_e1000_driver_smoke.sh unified_boot_check_smoke.sh"
 
 shopt -s nullglob
 smokes=(tests/*_smoke.sh)

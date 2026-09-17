@@ -71,6 +71,18 @@ __attribute__((weak)) uint32_t frame_pool_frame_owner(uint64_t frame_index) { (v
 __attribute__((weak)) void cap_table_teardown(uint32_t pid) { (void)pid; }
 __attribute__((weak)) void user_destroy_page_table(uint64_t pml4_phys) { (void)pml4_phys; }
 
+/* ─── POSIX-Environments E1: the unified-boot yield's asm half ──────────── */
+/* process.c references arch/x86/process_enter.asm's kernel_yield_switch() (the
+ * Ring-0 -> Ring-3 cooperative switch) and kernel_resume_control_plane() (the
+ * mirror the resume frame's rip points at). No host test that drives the
+ * scheduling helpers ever yields, so no-ops that return stand in. Weak, like
+ * every other stub here, so a test may override them if it ever wants to. */
+__attribute__((weak)) void kernel_yield_switch(uint64_t* rsp_save, uint64_t cr3,
+                                               const uint64_t* frame) {
+    (void)rsp_save; (void)cr3; (void)frame;
+}
+__attribute__((weak)) void kernel_resume_control_plane(void) { for (;;) {} }
+
 /* ─── arch/x86/boot.asm's bootstrap-stack bounds ────────────────────────── */
 /* frame_pool_init() reserves [stack_bottom, stack_top) by name instead of
  * trusting _kernel_image_end to cover it, so every host test that links

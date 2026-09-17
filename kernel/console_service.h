@@ -46,4 +46,16 @@ void console_service_deferred_tick(void);
 /* Total messages drained so far (diagnostics / host tests). */
 uint32_t console_service_drained(void);
 
+/* POSIX-Environments E1: hand typed input back to the kernel.
+ *
+ * Default (1, and unchanged for every boot before E1): completed input lines
+ * are forwarded to the sidecars' kernel-held console channels, so an
+ * interactive sidecar (the POSIX shell) receives what was typed.
+ *
+ * The unified boot disables it (0): there the Ring-0 control plane is the
+ * shell/HTTP loop and polls the same UART, so forwarding as well would
+ * deliver each keystroke to both. Output draining is unaffected — sidecar
+ * logs still reach the serial port. */
+void console_service_set_input_forward(int on);
+
 #endif /* CONSOLE_SERVICE_H */

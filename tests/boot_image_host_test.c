@@ -41,6 +41,12 @@ uint32_t pci_read_config(uint8_t b, uint8_t s, uint8_t f, uint8_t o) {
     (void)b; (void)f; (void)o; (void)s;
     return 0xFFFFFFFFu;
 }
+/* POSIX-Environments E1: launch_init_sidecar() consults the unified-boot
+ * selector before deciding whether to enter init or leave it runnable. These
+ * tests drive the loader's PURE core (the newc walk and the manifest reader),
+ * never the launch glue, so the honest stub is the documented default: this is
+ * not a unified boot. */
+int boot_params_unified_mode(void) { return 0; }
 /* Role lookups the boot glue's e1000 driver-marking arm calls. These tests
  * never exercise that arm (the stub pci_read_config above reports no
  * devices), but the compiled static function still references the symbols,
