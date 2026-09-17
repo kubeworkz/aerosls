@@ -91,6 +91,17 @@ char stack_top[16] __attribute__((weak));
 __attribute__((weak)) int partition_exists(uint32_t partition_id) { return partition_id == 0; }
 __attribute__((weak)) int partition_is_paused(uint32_t partition_id) { (void)partition_id; return 0; }
 
+/* ─── POSIX-Environments E4 (part 3b): env-manager control channel ───────────
+ * cap.c's "kernel.*" wiring calls env_service_register() when it wires the
+ * kernel.env.control channel, and console_service_tick() asks
+ * env_service_reply_slot() to skip the env channel's reply slot. The strong
+ * definitions live in env_service.c, which no cap.c/console_service.c host test
+ * links, so these weak inert stubs close the link: register is a no-op (no env
+ * service in host context) and reply_slot returns 0 (no slot is the env reply
+ * slot, so the console tick drains every slot exactly as before E4). */
+__attribute__((weak)) void env_service_register(uint16_t kernel_chan_r, uint16_t kernel_chan_w) { (void)kernel_chan_r; (void)kernel_chan_w; }
+__attribute__((weak)) int env_service_reply_slot(uint16_t slot) { (void)slot; return 0; }
+
 /* ─── the deferred drains cap_wait_chans' hlt wake now runs ──────────────── */
 /* kernel/process.c's cap_wait_chans drains the deferred console tick and
  * the latched device-IRQ notifications at its post-hlt wake (the only
