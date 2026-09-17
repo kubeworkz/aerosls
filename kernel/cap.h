@@ -836,11 +836,15 @@ void cap_unlock(struct CapSpinlock* l);
  *                              can wire CAP_CHAN channels to it)
  *
  * BootInfoBlock wire format (filled by the kernel, read by sidecar _start):
- *   Header (32 bytes):
- *     magic[8]="AERSLSB1", version u16=1, cap_count u16,
- *     budget_bytes u64, stack_top u64, total_len u32
+ *   Header (40 bytes, v2):
+ *     magic[8]="AERSLSB1", version u16=SIDECAR_BIB_VERSION, cap_count u16,
+ *     budget_bytes u64, stack_top u64, total_len u32,
+ *     flags u32 (SIDECAR_BIB_FLAG_*), reserved u32
  *   Cap entries (each): name_len u16, name[], slot u16, ty u8,
  *                       rights u8, base u64, len u64
+ *   v2 (POSIX-Environments E1) added flags + reserved; v1 had neither, so the
+ *   header was 32 bytes. Both sides ship in the same image (cap.c writes,
+ *   user/proto/src/bootinfo.rs parses), so no v1 BIB is ever parsed by v2.
  */
 #define SYS_SLS_CREATE_SIDECAR 310
 
@@ -955,8 +959,16 @@ struct SidecarManifest {
  * Read by sidecar _start (user/proto/src/bootinfo.rs defines the
  * Rust parser for this exact wire format). */
 #define SIDECAR_BIB_MAGIC     "AERSLSB1"
-#define SIDECAR_BIB_VERSION   1
+#define SIDECAR_BIB_VERSION   2   /* POSIX-Environments E1 added flags */
 #define SIDECAR_BIB_CAPS_MAX  16
+
+/* E1: the boot context a sidecar cannot otherwise observe. Today one bit:
+ * the kernel is running the UNIFIED boot (`unified=1`), where it owns the
+ * NICs and the console and shares the CPU with the Ring-0 control plane
+ * instead of handing the machine over. Read by init (which then keeps to the
+ * software-only part of its spawn chain) and by any future sidecar that has
+ * to behave differently when it is not the boot. */
+#define SIDECAR_BIB_FLAG_UNIFIED 0x1u
 
 struct SidecarBib {
     uint8_t  magic[8];
@@ -965,6 +977,8 @@ struct SidecarBib {
     uint64_t budget_bytes;
     uint64_t stack_top;
     uint32_t total_len;
+    uint32_t flags;             /* SIDECAR_BIB_FLAG_* (v2) */
+    uint32_t reserved;          /* = 0; keeps an 8-byte-aligned cap table (v2) */
 } __attribute__((packed));
 
 struct SidecarBibCap {
@@ -1005,6 +1019,14 @@ int cap_create_sidecar(uint32_t parent_pid,
                        const void* manifest, uint32_t manifest_len,
                        uint16_t parent_ch_w, uint16_t console_ch_w,
                        uint16_t* out_ch_r);
+
+/* POSIX-Environments E1: the boot-context flags written into every BIB this
+ * kernel fills (SIDECAR_BIB_FLAG_*). Set once at boot — kernel_main sets
+ * SIDECAR_BIB_FLAG_UNIFIED before the init sidecar is created — and read by
+ * the BIB writer alone. Kept here, next to the writer, rather than reaching
+ * into boot_params.c: the flag is BIB wire data, and cap.c is its only
+ * producer. */
+void cap_set_bib_flags(uint32_t flags);
 uint64_t sys_sls_create_sidecar(struct SLSCreateSidecarRequest* req);
 
 /* ─── SYS_SLS_ALLOC_REGION (320) — POSIX-Environments E3 ─────────────────

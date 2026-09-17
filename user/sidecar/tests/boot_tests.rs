@@ -1573,10 +1573,15 @@ fn cloexec_prevents_pipe_fd_leak_in_pipeline() {
 }
 
 fn build_bib(caps: &[(&str, u16, u16, u64, u64, u32)]) -> Vec<u8> {
-    const HEADER_LEN: usize = 32;
+    // v2 header: 32 bytes through total_len, then flags u32 + reserved u32
+    // (POSIX-Environments E1). The version comes from the PARSER's own
+    // constant, so a future bump cannot leave this builder emitting a header
+    // `BootInfo::from_raw` rejects — which is exactly what a hardcoded `1`
+    // did when E1 bumped the format.
+    const HEADER_LEN: usize = 40;
     let mut b = Vec::new();
     b.extend_from_slice(b"AERSLSB1");
-    b.extend_from_slice(&1u16.to_le_bytes()); // version
+    b.extend_from_slice(&aerosls_proto::bootinfo::BOOT_INFO_VERSION.to_le_bytes());
     b.extend_from_slice(&(caps.len() as u16).to_le_bytes()); // cap_count
     b.extend_from_slice(&(1u64 << 20).to_le_bytes()); // budget_bytes
     b.extend_from_slice(&0x2000_0000u64.to_le_bytes()); // stack_top
@@ -1586,6 +1591,8 @@ fn build_bib(caps: &[(&str, u16, u16, u64, u64, u32)]) -> Vec<u8> {
             .map(|(n, _, _, _, _, _)| 2 + n.len() + 2 + 4 + 16)
             .sum::<usize>();
     b.extend_from_slice(&(total as u32).to_le_bytes()); // total_len
+    b.extend_from_slice(&0u32.to_le_bytes()); // flags (0 = not the unified boot)
+    b.extend_from_slice(&0u32.to_le_bytes()); // reserved
     for (name, ty, rights, base, len, slot) in caps {
         b.extend_from_slice(&(name.len() as u16).to_le_bytes());
         b.extend_from_slice(name.as_bytes());

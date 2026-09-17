@@ -16,6 +16,18 @@
  * return path (`.syscall_return` in arch/x86/syscall.asm, exported here). */
 extern void syscall_return_path(void);
 
+/* POSIX-Environments E1 (arch/x86/process_enter.asm):
+ *  - kernel_yield_switch() saves the Ring-0 control plane's continuation into
+ *    the pseudo-process descriptor, switches CR3 and iretqs into the next
+ *    Ring-3 process's resume frame.
+ *  - kernel_resume_control_plane() is the mirror (it is what the frame's rip
+ *    points at when schedule_ring3/kernel_switch_next resume the control
+ *    plane): it pops the six callee-saved registers kernel_yield_switch
+ *    pushed and rets back into the yield call site. */
+extern void kernel_yield_switch(uint64_t* rsp_save, uint64_t cr3,
+                                const uint64_t* frame);
+extern void kernel_resume_control_plane(void);
+
 struct ProcessDescriptor proc_table[PROC_MAX];
 uint32_t                 proc_count = 0;
 
@@ -96,6 +108,8 @@ static void proc_clear_resume_state(struct ProcessDescriptor* pd) {
     pd->resume_sysret  = 0;
     pd->handoff_target = NULL;
     pd->pending_teardown = 0;
+    pd->resume_control = 0;   /* E1: the control plane's own resume shape */
+    pd->yield_deadline = 0;
 }
 
 // ─── process_init ─────────────────────────────────────────────────────────────
@@ -320,6 +334,9 @@ uint32_t process_create(struct ProcCreateRequest* req) {
     pd->priority        = PROC_PRIO_NORMAL;     // Phase 4 (Navigator-Parity): default tier
     pd->active          = 1;
     pd->pending_teardown = 0;   // Phase 2: a reused slot must not inherit a stale flag
+    pd->is_control_plane  = 0;  // E1: a real process is never the control plane
+    pd->resume_control    = 0;  //      (a reused slot must not inherit either)
+    pd->yield_deadline    = 0;
     pd->sidecar_authority = 0;  // E2: an HTTP/shell-spawned program is never a
                                 // sidecar creator; a reused slot must not inherit it
     pd->waiting_chan    = CAP_NONE;  // Phase 1.5: not parked on any channel
@@ -481,6 +498,9 @@ static uint32_t program_spawn_common(const char* object_name, uint32_t owner_uid
     pd->state        = PROC_RUNNING;
     pd->priority     = PROC_PRIO_NORMAL;     // Phase 4 (Navigator-Parity): default tier
     pd->active       = 1;
+    pd->is_control_plane = 0;      // E1: nor is it the Ring-0 control plane
+    pd->resume_control   = 0;
+    pd->yield_deadline   = 0;
     pd->sidecar_authority = 0;     // E2: a spawned PROGRAM is never a sidecar
                                    // creator; a reused slot must not inherit it
     proc_clear_resume_state(pd);   // a reused slot must not inherit the
@@ -836,7 +856,7 @@ static int proc_runnable(const struct ProcessDescriptor* pd) {
     return pd->active &&
            pd->state == PROC_SUSPENDED &&
            (pd->kernel_rsp != 0 || pd->has_ring3_ctx || pd->resume_kernel ||
-            pd->resume_sysret);
+            pd->resume_sysret || pd->resume_control);
 }
 
 // Finds the next partition (after `last_partition`, wrapping, inclusive of
@@ -998,6 +1018,206 @@ static int pick_next_process_in_partition(uint32_t partition_id, int exclude_idx
     return -1;
 }
 
+// ─── The one resume-frame builder (Seed Kernel Phase 1.5, E1's fourth shape) ─
+// Every "switch the CPU to `next`" path builds the SAME 20-qword frame, and
+// all three consumers — schedule_ring3()'s timer preemption, the park/handoff
+// switch (kernel_switch_next), and E1's kernel_yield_to_ring3() — must agree on
+// it byte for byte. Factored out here when E1 added a fourth resume shape, so
+// the new case cannot drift from the three that were already working:
+//
+//   [0..14]  GPRs in TaskContext order — r15, r14, r13, r12, r11, r10, r9,
+//            r8, rbp, rdi, rsi, rdx, rcx, rbx, rax. Deliberately the order
+//            isr32_stub pushes them in, so the matching pop sequence in the
+//            switch restores the right registers and [9] is rdi (the resume
+//            entry points take their ProcessDescriptor* in rdi).
+//   [15..19] the iretq frame: rip, cs, rflags, rsp, ss.
+//
+// Four shapes:
+//  - resume_sysret=1: iretq to kernel code — cap_sysret_resume(pd) on the
+//    process's own fresh syscall stack, which jumps straight into
+//    .syscall_return: the ORIGINAL entry frame (from the process's send or
+//    yield syscall) is still on its stack, so it sysrets to ring-3 as if
+//    the syscall had taken a while. (Phase 1.5 immediate wake: the sender
+//    of a message that woke a parked receiver hands the CPU to it here.)
+//  - resume_kernel=1: iretq to kernel code — cap_recv_resume(pd) on the
+//    process's own fresh syscall stack (CS=0x08/SS=0x10), which re-runs the
+//    parked recv and then jumps to .syscall_return to sysret to ring-3.
+//  - resume_control=1 (E1): iretq to kernel code —
+//    kernel_resume_control_plane() on the CONTROL PLANE'S OWN saved kernel
+//    stack (pd->kernel_rsp, i.e. the Ring-0 frame kernel_yield_switch pushed
+//    when it yielded). That trampoline pops the six callee-saved registers
+//    and rets back into the yield call site, so the Ring-0 foreground loop
+//    continues exactly where it left off.
+//  - otherwise:        iretq to the process's saved ring-3 context.
+static void proc_build_resume_frame(struct ProcessDescriptor* next, uint64_t* f) {
+    for (int i = 0; i < 15; i++) f[i] = 0;
+    if (next->resume_sysret) {
+        next->resume_sysret = 0;
+        f[9]  = (uint64_t)next;              /* rdi — cap_sysret_resume arg */
+        f[15] = (uint64_t)cap_sysret_resume; /* rip — kernel code */
+        f[16] = 0x08;                        /* cs — kernel code */
+        f[17] = 0x202;                       /* rflags — IF on */
+        f[18] = next->syscall_stack_top;     /* rsp — fresh syscall stack */
+        f[19] = 0x10;                        /* ss — kernel data */
+    } else if (next->resume_kernel) {
+        next->resume_kernel = 0;
+        f[9]  = (uint64_t)next;              /* rdi — cap_recv_resume arg */
+        f[15] = (uint64_t)cap_recv_resume;   /* rip — kernel code */
+        f[16] = 0x08;
+        f[17] = 0x202;
+        f[18] = next->syscall_stack_top;
+        f[19] = 0x10;
+    } else if (next->resume_control) {
+        next->resume_control = 0;
+        f[9]  = (uint64_t)next;              /* rdi — unused by the trampoline
+                                              * (it pops the saved frame), kept
+                                              * for debuggers and invariance */
+        f[15] = (uint64_t)kernel_resume_control_plane;
+        f[16] = 0x08;                        /* cs — kernel code */
+        f[17] = 0x202;                       /* rflags — IF on */
+        f[18] = next->kernel_rsp;            /* rsp — the saved Ring-0 frame */
+        f[19] = 0x10;                        /* ss — kernel data */
+    } else {
+        uint64_t* src = (uint64_t*)&next->ring3_ctx;
+        for (int i = 0; i < 20; i++) f[i] = src[i];
+    }
+}
+
+// ─── POSIX-Environments E1: the unified-boot control plane ──────────────────
+// See process.h for the design. The pieces here are the descriptor lookup,
+// the yield (called from the Ring-0 foreground loops), the deadline hook
+// (called from the timer ISR), and the resume-frame shape that the timer's
+// schedule_ring3() and kernel_switch_next() both honour.
+
+// The one descriptor with is_control_plane set, or NULL on a boot that never
+// planted one (every boot except the unified entry — the check is a scan of
+// the same 16 slots every other scheduler query already walks).
+static struct ProcessDescriptor* control_plane_desc(void) {
+    for (int i = 0; i < PROC_MAX; i++)
+        if (proc_table[i].active && proc_table[i].is_control_plane)
+            return &proc_table[i];
+    return NULL;
+}
+
+int proc_control_plane_enabled(void) {
+    return control_plane_desc() != NULL;
+}
+
+int proc_control_plane_parked(void) {
+    struct ProcessDescriptor* cp = control_plane_desc();
+    return cp && cp->state == PROC_BLOCKED && cp->yield_deadline != 0;
+}
+
+// Plant the pseudo-process. pid 1 is below alloc_pid()'s 100 floor and
+// next_pid's 100 start, so it can never collide with a real sidecar or an
+// HTTP-spawned program; state PROC_BLOCKED keeps it out of every scheduler
+// pick until its first yield; waiting_chan is CAP_NONE so the park/wake
+// matching can never treat it as a channel waiter. It owns no frames, no
+// syscall stack and no cap table — its kernel_rsp/kernel_cr3 are the
+// saved Ring-0 continuation, written by kernel_yield_switch alone.
+int proc_control_plane_init(void) {
+    if (control_plane_desc()) return 1;   /* idempotent */
+    /* Slot 0 is EXCLUDED, and searched from the TOP down, for one reason:
+     * boot_plant_parent() (kernel/boot_image.c) memsets proc_table[0]
+     * unconditionally and plants the kernel-context spawn parent there. This
+     * function runs BEFORE it (kernel_main's step 7d-ante, ahead of
+     * launch_init_sidecar), so a control plane that took "the first free
+     * slot" would be silently erased by the boot parent a few hundred lines
+     * later — the descriptor gone, kernel_yield_to_ring3 a no-op, and the
+     * Ring-3 world never scheduled (observed: `[SIDECAR] boot parent planted:
+     * slot0 ...` landing on top of `[E1] control plane planted as PID 1`).
+     * Taking the highest free slot instead makes that collision impossible
+     * whatever order the two plant. */
+    struct ProcessDescriptor* cp = NULL;
+    for (int i = PROC_MAX - 1; i > 0; i--) {
+        if (!proc_table[i].active) { cp = &proc_table[i]; break; }
+    }
+    if (!cp) {
+        kernel_serial_print(
+            "[E1] control plane: no free process slot — unified boot will not "
+            "share the CPU with Ring-3 work\n");
+        return 0;
+    }
+    memset(cp, 0, sizeof(*cp));
+    cp->pid            = 1;
+    cp->name[0] = 'k'; cp->name[1] = 'p'; cp->name[2] = 'l';
+    cp->name[3] = 'a'; cp->name[4] = 'n'; cp->name[5] = 'e'; cp->name[6] = '\0';
+    cp->owner_uid      = 0;
+    cp->partition_id   = PARTITION_SYSTEM;
+    cp->priority       = PROC_PRIO_NORMAL;
+    cp->state          = PROC_BLOCKED;   /* not a candidate until it yields */
+    cp->waiting_chan   = CAP_NONE;
+    cp->is_control_plane = 1;
+    cp->active         = 1;
+    /* proc_count is deliberately NOT incremented: it counts Ring-3 processes
+     * created through process_create/program_spawn/cap_create_sidecar (the
+     * boot parent planted by boot_image.c does the same). */
+    kernel_serial_printf(
+        "[E1] control plane planted as PID 1 'kplane' in PARTITION_SYSTEM "
+        "(proc slot %u; slot 0 belongs to the boot parent)\n",
+        (unsigned)(cp - proc_table));
+    return 1;
+}
+
+// The budget default lives in process.h (PROC_CONTROL_PLANE_BUDGET_TICKS) so
+// the call sites name the same number this file falls back to.
+
+void kernel_yield_to_ring3(uint32_t budget_ticks) {
+    struct ProcessDescriptor* cp = control_plane_desc();
+    if (!cp) return;                       /* not a unified boot */
+
+    /* Pick BEFORE parking: proc_runnable() requires SUSPENDED, and we are
+     * RUNNING, so we can never pick ourselves. */
+    struct ProcessDescriptor* next = pick_next_runnable();
+    if (!next) return;                     /* nothing Ring-3 to run: keep going */
+
+    cp->state          = PROC_BLOCKED;
+    cp->resume_control = 0;
+    cp->yield_deadline = kernel_tick_counter +
+                         (budget_ticks ? budget_ticks
+                                       : PROC_CONTROL_PLANE_BUDGET_TICKS);
+
+    /* The address space the control plane runs in is the one it must be
+     * resumed into — captured here rather than at plant time so it is true by
+     * construction (the boot's kernel PML4 today, and whatever the foreground
+     * loop is actually running under if that ever changes). Every Ring-3
+     * clone shares the kernel half of the page tables, so a different CR3
+     * could not have been observed; recording the real one costs nothing and
+     * removes the assumption. */
+    uint64_t cp_cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cp_cr3));
+    cp->cr3        = cp_cr3;
+    cp->kernel_cr3 = cp_cr3;
+
+    /* Same bookkeeping kernel_switch_next()/schedule_ring3() do before a
+     * switch: the target's syscalls must land on ITS OWN syscall stack, and
+     * it must read as the running process. */
+    if (next->syscall_stack_top != 0)
+        per_cpu_data[0].kernel_rsp = next->syscall_stack_top;
+    next->state = PROC_RUNNING;
+
+    uint64_t f[20];
+    proc_build_resume_frame(next, f);
+
+    kernel_serial_printf("[E1] yield: control plane -> PID %u '%s' (budget %u ticks)\n",
+                         next->pid, next->name, budget_ticks);
+
+    /* Saves this kernel continuation into cp->kernel_rsp, switches CR3 to
+     * the target and iretqs into its frame (process_enter.asm). Returns here
+     * — via kernel_resume_control_plane — after the budget expires, which is
+     * why nothing after this call may be conditional on it not returning. */
+    kernel_yield_switch(&cp->kernel_rsp, next->cr3, f);
+}
+
+void proc_control_plane_tick(void) {
+    struct ProcessDescriptor* cp = control_plane_desc();
+    if (!cp || cp->state != PROC_BLOCKED || cp->yield_deadline == 0) return;
+    if (kernel_tick_counter < cp->yield_deadline) return;
+    cp->yield_deadline = 0;
+    cp->state          = PROC_SUSPENDED;
+    cp->resume_control = 1;   /* resume via the kernel-context iretq path */
+}
+
 // ─── schedule_ring3 ──────────────────────────────────────────────────────────
 // Called from isr32_stub (Ring-3 timer preemption path).
 // ctx_rsp points to a 20-qword area on the interrupt stack:
@@ -1081,45 +1301,21 @@ uint64_t schedule_ring3(uint64_t ctx_rsp) {
         return ctx_rsp;   /* frame already has correct context */
     }
 
-    if (next->resume_sysret) {
-        // Yielded mid-syscall (immediate-wake handoff, or an explicit
-        // yield): resume via the KERNEL iretq path into cap_sysret_resume,
-        // which jumps straight to .syscall_return — the process's ORIGINAL
-        // entry frame is still on its syscall stack, so it sysrets to
-        // ring-3 right after its (already completed) syscall.
-        next->resume_sysret = 0;
-        for (int i = 0; i < 15; i++) frame[i] = 0;
-        frame[9]  = (uint64_t)next;              /* rdi — cap_sysret_resume arg */
-        frame[15] = (uint64_t)cap_sysret_resume; /* rip — kernel code */
-        frame[16] = 0x08;                        /* cs — kernel code */
-        frame[17] = 0x202;                       /* rflags — IF on */
-        frame[18] = next->syscall_stack_top;     /* rsp — fresh syscall stack */
-        frame[19] = 0x10;                        /* ss — kernel data */
-    } else if (next->resume_kernel) {
-        // Woken from a blocking cap_recv park: resume via the KERNEL iretq
-        // path (cap_recv_resume re-runs the recv, then .syscall_return
-        // sysrets to ring-3). The interrupt stack becomes the resume frame;
-        // rdi carries the descriptor (isr32_stub pops rdi at index 9). GS
-        // here is 0 (we interrupted ring-3), which is exactly the state
-        // cap_recv_resume expects before its own swapgs.
-        next->resume_kernel = 0;
-        for (int i = 0; i < 15; i++) frame[i] = 0;
-        frame[9]  = (uint64_t)next;              /* rdi — cap_recv_resume arg */
-        frame[15] = (uint64_t)cap_recv_resume;   /* rip — kernel code */
-        frame[16] = 0x08;                        /* cs — kernel code */
-        frame[17] = 0x202;                       /* rflags — IF on */
-        frame[18] = next->syscall_stack_top;     /* rsp — fresh syscall stack */
-        frame[19] = 0x10;                        /* ss — kernel data */
-    } else {
-        // Replace interrupt stack with next process's saved ring-3 context
-        uint64_t* src = (uint64_t*)&next->ring3_ctx;
-        for (int i = 0; i < 20; i++) frame[i] = src[i];
-    }
+    // Yielded mid-syscall (immediate-wake handoff, an explicit yield), a
+    // woken blocking park, E1's parked control plane, or a plain Ring-3
+    // context — one builder for all four shapes, see its comment above.
+    // (GS here is 0 — we interrupted Ring-3 — which is exactly the state
+    // cap_recv_resume/kernel_resume_control_plane both expect.)
+    proc_build_resume_frame(next, frame);
     next->state = PROC_RUNNING;
 
     // Phase 1.5: the next process's syscalls must land on ITS OWN syscall
-    // stack — [gs:8] is read by syscall_entry_stub on its next entry.
-    per_cpu_data[0].kernel_rsp = next->syscall_stack_top;
+    // stack — [gs:8] is read by syscall_entry_stub on its next entry. The
+    // control plane has none (it is Ring-0 and only runs with GS_BASE == 0);
+    // leaving [gs:8] alone keeps the last Ring-3 process's value until that
+    // process is scheduled again, which is what its own syscall would need.
+    if (next->syscall_stack_top != 0)
+        per_cpu_data[0].kernel_rsp = next->syscall_stack_top;
 
     // Switch to the next process's page table
     __asm__ volatile("mov %0, %%cr3" : : "r"(next->cr3) : "memory");
@@ -1137,6 +1333,15 @@ uint64_t schedule_ring3(uint64_t ctx_rsp) {
 // ROLE_SYSTEM_KERNEL — always-passes, per catalog_check_access().
 struct ProcessDescriptor* process_find_current(void) {
     for (int i = 0; i < PROC_MAX; i++) {
+        /* E1: the control plane is NOT a Ring-3 process. It is excluded here
+         * deliberately, so every "who is asking?" caller keeps its pre-E1
+         * answer while the Ring-0 foreground loop runs: cap_current_pid()
+         * still returns 0 (the kernel capability table), cap_wait_chan()
+         * still reports "kernel context, cannot park, retry", and
+         * simi_runtime's RESOLVE still sees uid 0. Without this the parked
+         * control plane's saved kernel_rsp would make it look like a running
+         * Ring-3 process the moment its descriptor was in PROC_RUNNING. */
+        if (proc_table[i].is_control_plane) continue;
         if (proc_table[i].active &&
             proc_table[i].state == PROC_RUNNING &&
             (proc_table[i].kernel_rsp != 0 || proc_table[i].has_ring3_ctx)) {
@@ -1212,27 +1417,7 @@ static void kernel_switch_next(struct ProcessDescriptor* next) {
                                      can't resolve it as the current process */
     uint64_t cr3 = next->cr3;
     uint64_t f[20];
-    for (int i = 0; i < 15; i++) f[i] = 0;
-    if (next->resume_sysret) {
-        next->resume_sysret = 0;
-        f[9]  = (uint64_t)next;              /* rdi — cap_sysret_resume arg */
-        f[15] = (uint64_t)cap_sysret_resume; /* rip — kernel code */
-        f[16] = 0x08;                        /* cs — kernel code */
-        f[17] = 0x202;                       /* rflags — IF on */
-        f[18] = next->syscall_stack_top;     /* rsp — fresh syscall stack */
-        f[19] = 0x10;                        /* ss — kernel data */
-    } else if (next->resume_kernel) {
-        next->resume_kernel = 0;
-        f[9]  = (uint64_t)next;              /* rdi — cap_recv_resume arg */
-        f[15] = (uint64_t)cap_recv_resume;   /* rip — kernel code */
-        f[16] = 0x08;                        /* cs — kernel code */
-        f[17] = 0x202;                       /* rflags — IF on */
-        f[18] = next->syscall_stack_top;     /* rsp — fresh syscall stack */
-        f[19] = 0x10;                        /* ss — kernel data */
-    } else {
-        uint64_t* src = (uint64_t*)&next->ring3_ctx;
-        for (int i = 0; i < 20; i++) f[i] = src[i];
-    }
+    proc_build_resume_frame(next, f);
     __asm__ volatile("mov %0, %%cr3" : : "r"(cr3) : "memory");
     /* f lives on the abandoned (parked/exiting) kernel stack — its physical
      * frame stays identity-mapped in both page tables, so the pointer
@@ -1761,6 +1946,13 @@ uint32_t process_kill_partition(uint32_t partition_id) {
     uint32_t pids[PROC_MAX];
     int n = 0;
     for (int i = 0; i < PROC_MAX; i++) {
+        /* E1: the Ring-0 control plane is kernel-owned, not a tenant process,
+         * and it is the context that runs the destroy path itself — killing
+         * it would abandon the boot's foreground loop with nobody to return
+         * to (there is no kernel_enter_ring3 continuation behind it, only
+         * kernel_main). While the unified boot runs it is in
+         * PARTITION_SYSTEM, which no deployed path destroys. */
+        if (proc_table[i].is_control_plane) continue;
         if (proc_table[i].active && proc_table[i].partition_id == partition_id) {
             pids[n++] = proc_table[i].pid;
         }

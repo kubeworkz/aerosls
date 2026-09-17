@@ -3109,6 +3109,14 @@ static uint32_t bib_put_entry(uint8_t* buf, uint32_t off, uint32_t buf_cap,
  *   7. Mint CAP_MEM capabilities into the child's table.
  *   8. Restore the parent's kernel_rsp, release the child.
  */
+/* E1: the BIB's boot-context flags (SIDECAR_BIB_FLAG_*). 0 unless
+ * kernel_main's unified-boot branch sets UNIFIED before the sidecars exist,
+ * so every other boot writes the byte-for-byte BIB it wrote before E1 (with
+ * the v2 header's extra word). */
+static uint32_t bib_flags = 0;
+
+void cap_set_bib_flags(uint32_t flags) { bib_flags = flags; }
+
 int cap_create_sidecar_in(uint32_t parent_pid,
                           const void* manifest, uint32_t manifest_len,
                           uint16_t parent_ch_w, uint16_t console_ch_w,
@@ -3883,7 +3891,7 @@ int cap_create_sidecar_in(uint32_t parent_pid,
     uint32_t bib_off = 0;
 
     /* Header: magic(8) + version(2) + cap_count(2) + budget(8) +
-     * stack_top(8) + total_len(4) = 32 bytes. */
+     * stack_top(8) + total_len(4) + flags(4) + reserved(4) = 40 bytes (v2). */
     for (int i = 0; i < 8; i++) bib_buf[bib_off + i] = SIDECAR_BIB_MAGIC[i];
     bib_off += 8;
     *(uint16_t*)(bib_buf + bib_off) = SIDECAR_BIB_VERSION;  bib_off += 2;
@@ -3893,6 +3901,12 @@ int cap_create_sidecar_in(uint32_t parent_pid,
     *(uint64_t*)(bib_buf + bib_off) = user_rsp + 16;  /* stack_top = RSP at _start */
     bib_off += 8;
     *(uint32_t*)(bib_buf + bib_off) = 0;  bib_off += 4;  /* total_len placeholder */
+    /* E1 (BIB v2): the boot-context flags. UNIFIED is the mode bit init reads
+     * to stay off the hardware — the kernel owns the NICs and the console in
+     * that boot, so the sidecar world must not try to drive either. */
+    *(uint32_t*)(bib_buf + bib_off) = bib_flags;
+    bib_off += 4;
+    *(uint32_t*)(bib_buf + bib_off) = 0;  bib_off += 4;  /* reserved */
 
     /* Cap 0: messenger CHAN_R (the child's read end of the messenger).
      * Entry layout: name_len u16, name, slot u16, ty u8, rights u8,

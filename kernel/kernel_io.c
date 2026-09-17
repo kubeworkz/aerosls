@@ -1,6 +1,7 @@
 #include <string.h>  // strlen() for the console line editor (x86-only TU)
 
 #include "kernel_io.h"
+#include "process.h"   /* E1: kernel_yield_to_ring3 (the shell's idle point) */
 #include "smp.h"
 #include "../arch/x86/vga.h"
 
@@ -160,6 +161,31 @@ void kernel_panic_dec(uint64_t v) {
     while (len-- > 0) kernel_panic_putchar(tmp[len]);
 }
 
+// ─── Serial TX serialization (see kernel_io.h) ────────────────────────────────
+// One global lock, not per-line state: the kernel has exactly one console.
+// 0 = free, 1 = held. A failed acquire is NOT an error -- the caller prints
+// unlocked (see the header): the spin bound is what keeps the kernel from
+// ever parking on a printer, and the CAS is what makes the common case
+// (uncontended, single writer) cost one atomic.
+static volatile int serial_tx_busy = 0;
+/* ~0.5-2 ms of pauses: far longer than a QEMU UART takes to shift out a
+ * console line, and short enough that the pathological caller (interrupt
+ * context on the core that already holds it) wastes a blink instead of a
+ * frame. */
+#define SERIAL_TX_SPIN_LIMIT 200000UL
+
+int kernel_serial_tx_lock(void) {
+    for (unsigned long i = 0; i < SERIAL_TX_SPIN_LIMIT; i++) {
+        if (__sync_bool_compare_and_swap(&serial_tx_busy, 0, 1)) return 1;
+        __asm__ volatile("pause");
+    }
+    return 0;
+}
+
+void kernel_serial_tx_unlock(void) {
+    serial_tx_busy = 0;
+}
+
 // ─── Output primitives ────────────────────────────────────────────────────────
 void kernel_serial_putchar(char c) {
     /* Loopback ownership: while the probe owns the port, kernel TX is
@@ -184,10 +210,12 @@ void kernel_serial_putchar(char c) {
 }
 
 void kernel_serial_print(const char* s) {
+    int held = kernel_serial_tx_lock();
     while (*s) {
         if (*s == '\n') kernel_serial_putchar('\r');
         kernel_serial_putchar(*s++);
     }
+    if (held) kernel_serial_tx_unlock();
 }
 
 void kernel_serial_print_hex64(uint64_t v) {
@@ -238,6 +266,10 @@ static void emit_str(const char* s, int width, int left) {
 void kernel_serial_printf(const char* fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
+    /* One printf is one line of console text: hold the TX lock for all of
+     * it, so a second writer (the AP's sidecar drain in a unified boot)
+     * cannot land between two of its characters. */
+    int held = kernel_serial_tx_lock();
 
     for (; *fmt; fmt++) {
         if (*fmt != '%') { kernel_serial_putchar(*fmt); continue; }
@@ -291,7 +323,13 @@ void kernel_serial_printf(const char* fmt, ...) {
                       16, width, pad, left);
             break;
         case 'p':
-            kernel_serial_print("0x");
+            /* Two putchars, NOT kernel_serial_print("0x"): this printf
+             * already holds the TX lock, and print() would try to take it
+             * again. The lock is bounded rather than reentrant (see
+             * kernel_io.h), so a nested acquisition would spin out its
+             * whole budget before printing. Keep the print family flat. */
+            kernel_serial_putchar('0');
+            kernel_serial_putchar('x');
             emit_uint((uint64_t)(uintptr_t)va_arg(ap, void*), 16, 16, '0', 0);
             break;
         default:
@@ -300,6 +338,7 @@ void kernel_serial_printf(const char* fmt, ...) {
             break;
         }
     }
+    if (held) kernel_serial_tx_unlock();
     va_end(ap);
 }
 
@@ -372,6 +411,12 @@ void read_line(char* buf) {
          * self-rate-limiting either way (kernel/smp.h). */
         while (!(inb(SERIAL_COM1_BASE + 5) & 0x01)) {
             smp_uniprocessor_tick();
+            /* POSIX-Environments E1: the shell's idle point. On a unified
+             * boot the sidecar world runs only while this loop is not
+             * running (the timer's Ring-0 path never schedules), so the wait
+             * for a keystroke is where the CPU is shared. No-op on every
+             * other boot. */
+            kernel_yield_to_ring3(PROC_CONTROL_PLANE_BUDGET_TICKS);
             __asm__ volatile("pause");
         }
 

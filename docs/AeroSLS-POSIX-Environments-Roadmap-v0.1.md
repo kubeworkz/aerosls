@@ -97,6 +97,36 @@ Milestone **M1 — on-demand POSIX environments** is E1–E6. Milestone **M2 —
 
 **Verification plan.** A new boot check, `unified_boot_check.sh`, boots the unified entry and asserts both worlds make progress over the same window: `/api/health` answers repeatedly **and** a ring-3 heartbeat from `init` keeps advancing between requests. **Tooth:** remove the yield call from the HTTP loop — `/api/health` still answers but the heartbeat freezes, and the check fails. The existing kernel-only and Phase 5 boot checks run unchanged, proving the other two modes did not move.
 
+### 4.1 Findings (2026-09-17) — E1 landed; the unified boot is live
+
+Branch `feat/e1-unified-boot`. Option (b) was taken as written: a cooperative yield at the control plane's idle points, no ring-0 preemption.
+
+**What landed.**
+
+- **The boot mode.** `unified=1` on the kernel command line, parsed once and cached by `boot_params_unified_mode()` (with the same "asked for badly" warning `node=` carries, so a typo cannot silently produce the old boot). grub.cfg gained a third menu entry, `AeroSLS — unified (control plane + sidecars)`, deliberately *appended* so entries 1 and 2 stay where every existing boot check expects them; `tests/grub_select_kernel_only.sh` grew an optional 4th argument (the 1-based menu position) to reach it, defaulting to the entry it has always selected.
+- **The pseudo-process.** `proc_control_plane_init()` plants PID 1 `kplane` in `PARTITION_SYSTEM`, `PROC_BLOCKED`, owning no frames, no syscall stack and no cap table. `kernel_yield_to_ring3(budget_ticks)` records the Ring-0 continuation into it and switches to the next runnable Ring-3 process; `proc_control_plane_tick()` (timer ISR, immediately beside `cap_park_deadline_tick`) flips it back to runnable once the budget (2 ticks, ~20 ms) expires, and the next `schedule_ring3()` resumes it through a kernel-context iretq — the fourth resume shape, added to `proc_build_resume_frame()` so it cannot drift from the three that already worked (`resume_sysret`, `resume_kernel`, plain ring-3). The switch itself is `kernel_yield_switch`/`kernel_resume_control_plane` in `arch/x86/process_enter.asm`.
+- **`launch_init_sidecar()` returns** in unified mode, leaving `init` `PROC_SUSPENDED` with the synthetic `ring3_ctx` `cap_create_sidecar()` already built — no hand-crafted context, and the kernel proceeds into `http_server_run()` instead of `kernel_enter_sidecar()`.
+- **"Is this the kernel?" stayed answered the same way.** `process_find_current()` skips the control plane, so `cap_current_pid() == 0`, the park hooks still report "kernel context, cannot park", and a send from the control plane still does *not* hand off the CPU (the woken receiver runs at its next schedule). The control plane is also excluded from `process_kill_partition()`, and `proc_runnable()` learned the new resume flag.
+- **Device ownership.** The kernel keeps the NICs (step 7's roles, unchanged) *and* the console: `console_service_set_input_forward(0)` stops the console service from also delivering typed lines to sidecars, and the BIB (now v2, with a `flags` word) carries `SIDECAR_BIB_FLAG_UNIFIED` so `init` reads `BootInfo::is_unified()` and keeps to the software-only part of its spawn chain — Device Manager and its own ramdisk driver, no network driver and no system POSIX sidecar. `read_line()`'s wait and `http_server_run()`'s sweep tail are the two yield sites.
+
+**Two deviations from §4, both deliberate.**
+
+1. *The tooth is not "remove the yield call".* That remains the sharpest theoretical tooth, but it needs a second ISO built from patched sources. `tests/unified_boot_check_smoke.sh` instead points the *same* guard at grub entry 2 (the kernel-only boot), which has neither a yield nor `init`, requires it to fail, and then runs the guard unmodified and requires it to pass. The guard's own assertions still bite on a yield regression: heartbeats counted *after* yields and yields counted *after* heartbeats are separate assertions, so a control plane that stops yielding freezes both counters (the guard fails at the boot-marker phase) even though `/api/health` keeps answering.
+2. *Two knobs, not one.* §4 asks for the control plane's share of the rotation to ride the existing partition CPU weights. It does — the pseudo-process is an ordinary `PARTITION_SYSTEM` member — but the yield budget itself (`PROC_CONTROL_PLANE_BUDGET_TICKS`) is a separate, smaller knob: it bounds the HTTP latency the control plane can suffer while Ring-3 work is runnable (~20 ms worst case), which the partition weights cannot express.
+
+**The bug the boot found, for the record.** The control plane's first plant took "the first free slot" (0) and `boot_plant_parent()` — which `memset`s `proc_table[0]` unconditionally, by design — erased it a few hundred lines later. The boot log said it plainly (`[SIDECAR] boot parent planted: slot0 pid=99 …` landing on top of `[E1] control plane planted as PID 1`), and the symptom was a boot that looked healthy while `kernel_yield_to_ring3()` silently returned every time (no `[E1] yield` lines, no `[INIT]` output, HTTP serving). `proc_control_plane_init()` now plants into the **highest** free slot and skips slot 0, and both sides carry a comment stating the reservation, so the collision is impossible rather than avoided.
+
+**The bug the guard found, for the record: two writers, one UART.** The unified boot is the first boot with two concurrent console writers — the BSP's Ring-0 control plane and the AP's console-service drain, which prints the Ring-3 sidecars' log lines. Both bottom out at `kernel_serial_putchar()`, and two writers inside that loop emit byte-interleaved text (observed: `[INIT] UNIF<kernel line>IED boot`). It is not cosmetic: the boot guards read exactly that log, and the guard's BIB assertion (`[INIT] UNIFIED boot`) failed in one smoke run purely because its marker had arrived split. The fix is at the writers: `kernel_serial_tx_lock()`/`kernel_serial_tx_unlock()` (`kernel/kernel_io.h`) bracket `kernel_serial_print`/`printf`/`print_hex64` and the console drain (`kernel/console_service.c`), so one line — or one sidecar console message — is written whole. The wait is **bounded** on purpose: a caller that cannot acquire prints anyway and releases nothing, so no core can park on a printer and a print from interrupt context (where the same core may already hold it) degrades to the pre-E1 unlocked behaviour instead of self-deadlocking. The guard's BIB assertion now reads the kernel's own line (`[E1] BIB v2 flags=0x1 (UNIFIED) …`), which is kernel TX and therefore whole; init's *having read* the flag stays asserted from the other side, by Phase 3's requirement that the POSIX sidecar and the network/e1000 drivers be unspawned.
+
+**Verified (2026-09-17, this host).**
+
+- `tests/unified_boot_check.sh` — 17 assertions green on the unified entry, including the two that only a unified boot can satisfy: `/api/health` answered twice across a heartbeat sample (heartbeats advanced 6 → 57 while the control plane served), and a typed `help` answered by the *kernel* shell (the control plane owns the console). Boot-to-verdict ~15 s.
+- `tests/unified_boot_check_smoke.sh` — tooth (kernel-only entry) fails in ~8 s naming the contradiction; restore run passes. ~19 s total.
+- The other two modes did not move: `tests/run_all.sh` 111/0; the boot guards the serial-TX change touches all pass on the same ISO — `phase5_boot_smoke.sh`, `phase5_e1000_driver_smoke.sh` (`[e1000] PASS` present), `aerocap_boot_check.sh`, `cap_boot_check.sh` — and the kernel-only boot still reaches `/api/health` (CI's own decoder-build step).
+- BIB v2's consumers were all updated with it: `user/proto/src/bootinfo.rs` (parser + a `unified_flag` unit test), the sidecar test's BIB builder (now reading the version from the parser's constant so a future bump cannot desynchronise it), `tests/cap_create_sidecar_host_test.c`'s total-length expectations, and the wire-format note in `kernel/cap.h`.
+
+**Not done here.** `env_create_boot_check.sh` (§7.1) was waiting on exactly this surface — the HTTP control plane and `init` in one boot — so it is now unblocked; the shell `env create` surface (§7) attaches with it. `run-cluster.sh` does not yet offer the unified mode: it generates each node's command line, so the flag would be a few lines there, but no cluster scenario exercises the unified boot yet and §4's selector is the grub entry. SMP ring-3 scheduling and the ring-0 preemption audit stay out of scope, as §4 says.
+
 ## 5. Phase E2 — Partition-scoped registry and tenant capability profile
 
 **Why.** G5 is a cross-tenant hazard independent of everything else: peer names resolve globally, and a colliding name silently re-points. It has to be closed before a second environment can exist, and it does not depend on E1.
@@ -125,6 +155,18 @@ Milestone **M1 — on-demand POSIX environments** is E1–E6. Milestone **M2 —
 **Explicitly not in scope.** Networking inside environments; persistent environment storage (§10).
 
 **Verification plan.** In the Phase 5 boot — which does not need E1 — `init` starts two tenant-profile instances in `PARTITION_SYSTEM`, each with its own ramdisk. Each runs a boot script that writes a file and lists the root. Assert both reach `System ready` and each sees only its own file. **Tooth:** point both instances at the same ramdisk — the isolation assertion fails.
+
+### 6.1 Findings (2026-09-17) — `e3_multi_env_boot_check.sh` is red on `main`
+
+Found while validating E1, and **not** an E1 regression: the check fails identically on the pristine tree at `8350ed1` (a detached worktree of `main`, no E1 changes) and on the E1 branch, on the same host, with the same verdict —
+
+```
+FAIL  within 120s: init done-marker or 3 live rootfs never seen (live rootfs: 2/3)
+```
+
+What the boot shows: both tenants ARE spawned (`[INIT] E3 env 1/2: drv.ramdisk.<i> spawned`, `aerosls.posix.<i> spawned`), the boot completes to `System ready` and the shell prompt, but only two `[POSIX] aero state=00000000` (live rootfs) lines ever appear, and init's `[INIT] E3: tenant environments spawned.` marker is missing from the log even though the line is printed unconditionally after the tenant loop (`user/init/src/entry.rs`) — i.e. at least one tenant POSIX instance does not reach a live rootfs inside the window, and the marker line is lost on the shared console. `x86-iso-e3` is built by no CI job (§5's `kernel-guards` builds only `x86-iso`), which is why this has been invisible.
+
+Left as found — it is E3's to close, not E1's — but recorded here because E1's own guard work now depends on reading that same shared console, and because the check's `done_marker` gate is the fragile-grep shape E1's guard had to stop using (see §4.1).
 
 ## 7. Phase E4 — Partition-targeted creation and the environment manager
 

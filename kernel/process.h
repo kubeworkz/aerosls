@@ -220,6 +220,24 @@ struct ProcessDescriptor {
                                        // tick saves its context, runs the full
                                        // Phase-2 teardown, and switches away (see
                                        // schedule_ring3). Reset at spawn/exit.
+    // ── POSIX-Environments E1 (unified boot): the RING-0 control plane ───
+    // A descriptor with is_control_plane set is not a Ring-3 process at all:
+    // it is the kernel's own foreground loop (http_server_run /
+    // sls_shell_loop) recorded as a schedulable context so the cooperative
+    // yield (kernel_yield_to_ring3) can hand the CPU to Ring-3 work and the
+    // timer ISR can hand it back. It lives in PARTITION_SYSTEM, owns no
+    // frames, has no cap table and is skipped by process_find_current() — so
+    // every "am I a process?" question answered from the kernel context
+    // (cap_current_pid() == 0, park hooks returning 0) keeps the same answer
+    // it had before E1.
+    uint8_t    is_control_plane;      // E1: this descriptor is the control plane
+    uint8_t    resume_control;        // E1: the next schedule must resume it into
+                                       // kernel_resume_control_plane() on its own
+                                       // saved kernel stack (kernel_rsp), not via
+                                       // ring3_ctx/park_ctx. Set by the deadline
+                                       // hook, consumed by schedule_ring3().
+    uint64_t   yield_deadline;         // E1: absolute kernel tick by which the parked
+                                       // control plane must be resumed (0 = not parked)
     uint8_t    sidecar_authority;     // POSIX-Environments E2: may this process
                                        // create sidecars (SYS_SLS_CREATE_SIDECAR)?
                                        // The boot parent (BOOT_PARENT_PID) has it;
@@ -453,6 +471,54 @@ void process_exit(uint32_t exit_code);
 struct ProcessDescriptor* process_find_current(void);
 uint32_t sys_sls_getppid(void);
 uint32_t sys_sls_yield(void);   /* SYS_SLS_YIELD (300) — Phase 1.5 immediate-wake handback */
+
+// ─── POSIX-Environments E1: the unified-boot control-plane yield ───────────
+// The unified boot runs the Ring-0 control plane (http_server_run /
+// sls_shell_loop) and Ring-3 sidecars in ONE boot. The timer's Ring-0 path
+// deliberately never schedules, so the two share the CPU by COOPERATION
+// instead of preemption: the control plane calls kernel_yield_to_ring3() at
+// its idle points, which records its own kernel continuation as a
+// schedulable pseudo-process and hands the CPU to the next runnable Ring-3
+// process. When the budget expires the timer hook
+// (proc_control_plane_tick) marks the pseudo-process runnable, and the
+// next schedule_ring3 resumes it through a kernel-context iretq — the same
+// shape cap_recv_resume() uses for a woken park.
+
+// Plant the pseudo-process. Called once, at boot, and only when the unified
+// boot mode is selected (`unified=1` on the kernel command line): with no
+// control plane to record, kernel_yield_to_ring3() is a no-op, so a
+// kernel-only or Phase-5 boot behaves exactly as it did before E1.
+// Returns 1 if planted, 0 if there was no free descriptor slot.
+int  proc_control_plane_init(void);
+
+// True while this boot has a control-plane pseudo-process. The yield call
+// sites use this to stay branch-free on non-unified boots.
+int  proc_control_plane_enabled(void);
+
+// Is the control plane currently parked (yielded, waiting for its budget)?
+// Diagnostics/verification only.
+int  proc_control_plane_parked(void);
+
+// Default yield budget: how many timer ticks Ring-3 work may run before the
+// control plane is resumed (~20 ms at the LAPIC's ~100 Hz — a worst-case HTTP
+// latency of one budget while Ring-3 work is runnable). The Ring-3 world's
+// SHARE of the CPU is not set here: the pseudo-process is an ordinary
+// PARTITION_SYSTEM member, so the existing per-partition CPU weights
+// (SYS_SLS_PARTITION_CPU_WEIGHT_SET) tune it, as the roadmap requires.
+#define PROC_CONTROL_PLANE_BUDGET_TICKS 2u
+
+// Give the CPU to the next runnable Ring-3 process for up to `budget_ticks`
+// timer ticks, then return here. Returns immediately when the unified boot
+// is not active or nothing Ring-3 is runnable. MUST be called from the
+// kernel's foreground loops only (never from an IRQ, a cap lock, or a park
+// path): the switch abandons this kernel stack until the budget expires.
+void kernel_yield_to_ring3(uint32_t budget_ticks);
+
+// Timer-tick hook (timer_irq_handler, BSP, before schedule_ring3 in the
+// same ISR — exactly where cap_park_deadline_tick sits): once a parked
+// control plane's yield budget has expired, mark it runnable so the very
+// next schedule_ring3 picks it. Pure proc_table state flip, no locks.
+void proc_control_plane_tick(void);
 
 // Called from isr32_stub when a Ring-3 timer interrupt fires.
 // Saves the current Ring-3 process context from the interrupt stack,

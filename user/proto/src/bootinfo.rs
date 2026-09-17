@@ -6,15 +6,26 @@
 //! ```text
 //! offset  size  field
 //! 0       8     magic         "AERSLSB1"
-//! 8       2     version       = 1
+//! 8       2     version       = 2
 //! 10      2     cap_count
 //! 12      8     budget_bytes
 //! 20      8     stack_top
 //! 28      4     total_len     (whole BIB, for bounds checking)
-//! 32      n     caps[]        { name_len u16, name UTF-8,
+//! 32      4     flags         (BOOT_INFO_FLAG_*; 0 on a non-unified boot)
+//! 36      4     reserved      (= 0; keeps caps[] 8-byte aligned)
+//! 40      n     caps[]        { name_len u16, name UTF-8,
 //!                               slot u16, ty u8, rights u8,
 //!                               base u64, len u64 }
 //! ```
+//!
+//! `flags` is version 2's addition (POSIX-Environments E1): the boot context
+//! a sidecar cannot otherwise observe — today, whether the kernel is running
+//! the UNIFIED boot, where the kernel owns the NICs and the console and the
+//! sidecar world shares the CPU with the Ring-0 control plane instead of
+//! being the boot (`unified=1`; see the POSIX Environments roadmap §4). The
+//! version was bumped with it rather than appending the field silently, and
+//! both sides (kernel/cap.c writes, this parser reads) ship in the same boot
+//! image, so no version 1 BIB is ever parsed by a version 2 reader.
 //!
 //! `total_len` is a small extension over the Phase 2 doc's illustrative
 //! layout: without it, a malformed `name_len` (u16, unbounded) could make the
@@ -25,8 +36,15 @@
 use core::str;
 
 pub const BOOT_INFO_MAGIC: [u8; 8] = *b"AERSLSB1";
-pub const BOOT_INFO_VERSION: u16 = 1;
+pub const BOOT_INFO_VERSION: u16 = 2;
 pub const MAX_BOOT_CAPS: usize = 16;
+
+/// POSIX-Environments E1: this sidecar was created by the UNIFIED boot. The
+/// kernel owns the NICs and the serial console there, and shares the CPU with
+/// the Ring-0 control plane (kernel/process.c's kernel_yield_to_ring3), so a
+/// sidecar must not assume the Phase-5 posture — where the sidecar world *is*
+/// the boot and owns the hardware capabilities.
+pub const BOOT_INFO_FLAG_UNIFIED: u32 = 1 << 0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BootErr {
@@ -70,13 +88,17 @@ pub struct BootCap<'a> {
 #[derive(Debug)]
 pub struct BootInfo<'a> {
     pub version: u16,
+    /// Wire-format flags (BOOT_INFO_FLAG_*). Placed here, inside what used to
+    /// be the u16-to-u64 padding, so the parsed struct's layout — n_caps at
+    /// 0x18, caps at 0x20, asserted by the layout test below — is unchanged.
+    pub flags: u32,
     pub budget_bytes: u64,
     pub stack_top: u64,
     pub n_caps: usize,
     pub caps: [BootCap<'a>; MAX_BOOT_CAPS],
 }
 
-const HEADER_LEN: usize = 32;
+const HEADER_LEN: usize = 40;
 /// Fixed cap-entry bytes after the name: slot/ty/rights (4) + base/len (16).
 /// (Name length is variable.) Used by the test's BIB builder.
 #[cfg(test)]
@@ -104,6 +126,7 @@ impl<'a> BootInfo<'a> {
         let budget_bytes = le_u64(p, 12);
         let stack_top = le_u64(p, 20);
         let total_len = le_u32(p, 28) as usize;
+        let flags = le_u32(p, 32);
         if total_len < HEADER_LEN {
             return Err(BootErr::TooShort);
         }
@@ -161,6 +184,7 @@ impl<'a> BootInfo<'a> {
 
         Ok(BootInfo {
             version,
+            flags,
             budget_bytes,
             stack_top,
             n_caps: cap_count,
@@ -176,6 +200,14 @@ impl<'a> BootInfo<'a> {
 
     pub fn caps(&self) -> &[BootCap<'a>] {
         &self.caps[..self.n_caps]
+    }
+
+    /// POSIX-Environments E1: was this sidecar created by the unified boot
+    /// (kernel owns the NICs and the console; the Ring-0 control plane and the
+    /// sidecars share the CPU)? False on every other boot, including every
+    /// Phase-5 boot, so a sidecar that does not care behaves as before.
+    pub fn is_unified(&self) -> bool {
+        self.flags & BOOT_INFO_FLAG_UNIFIED != 0
     }
 }
 
@@ -214,6 +246,10 @@ mod tests {
     use std::vec::Vec;
 
     fn build_bib(caps: &[(&str, u16, u16, u64, u64)]) -> Vec<u8> {
+        build_bib_flags(caps, 0)
+    }
+
+    fn build_bib_flags(caps: &[(&str, u16, u16, u64, u64)], flags: u32) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(&BOOT_INFO_MAGIC);
         b.extend_from_slice(&BOOT_INFO_VERSION.to_le_bytes());
@@ -226,6 +262,8 @@ mod tests {
                 .map(|(n, _, _, _, _)| 2 + n.len() + CAP_FIXED)
                 .sum::<usize>();
         b.extend_from_slice(&(total as u32).to_le_bytes());
+        b.extend_from_slice(&flags.to_le_bytes()); // v2: boot-context flags
+        b.extend_from_slice(&0u32.to_le_bytes()); // v2: reserved
         for (name, ty, rights, base, len) in caps {
             b.extend_from_slice(&(name.len() as u16).to_le_bytes());
             b.extend_from_slice(name.as_bytes());
@@ -254,6 +292,24 @@ mod tests {
         assert_eq!(storage.rights, 0x1);
         assert!(info.find_cap(1, "nope").is_none());
         assert!(info.find_cap(2, "console").is_some());
+    }
+
+    #[test]
+    fn unified_flag() {
+        // E1: the flag is what tells a sidecar it shares a boot with the Ring-0
+        // control plane. A non-unified BIB must read false — every Phase-5
+        // sidecar's behaviour depends on that default.
+        let plain = build_bib(&[("console", 2, 0x7, 0, 0)]);
+        let plain = unsafe { BootInfo::from_raw(plain.as_ptr()) }.unwrap();
+        assert_eq!(plain.flags, 0);
+        assert!(!plain.is_unified());
+
+        let uni = build_bib_flags(&[("console", 2, 0x7, 0, 0)], BOOT_INFO_FLAG_UNIFIED);
+        let uni = unsafe { BootInfo::from_raw(uni.as_ptr()) }.unwrap();
+        assert_eq!(uni.flags, BOOT_INFO_FLAG_UNIFIED);
+        assert!(uni.is_unified());
+        // ...and the caps after the new header fields still parse.
+        assert_eq!(uni.find_cap(2, "console").unwrap().rights, 0x7);
     }
 
     #[test]

@@ -24,8 +24,9 @@ int  sls_tls_time_init(void);
 /* sls-launcher.h is in the sibling qemu repo, accessed at build time */
 extern int sls_launch_guest(const void *image, uint32_t len,
                              uint64_t entry_gpa, uint32_t max_insns);
-#include "boot_params.h"   // boot-time cluster identity (node=<n>)
+#include "boot_params.h"   // boot-time cluster identity (node=<n>) + E1's unified=1
 #include "boot_image.h"     // Phase 5: initrd boot image + init sidecar launch
+#include "console_service.h" // E1: console-input ownership in unified mode
 #include "smp.h"           // AP bring-up + the uniprocessor fallback
 #include "failover.h"      // Step 5 -- peer liveness + checkpoint recovery
 #include "partition.h"
@@ -505,12 +506,51 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
     // which denied vector-store/table writes even for dave's DB_ADMIN token.
     auth_seed_default_roles();
 
+    // ── 7d-ante. POSIX-Environments E1: the control-plane pseudo-process ────
+    // A unified boot (`unified=1`) runs the Ring-0 foreground loop below and
+    // the Phase-5 sidecar world in the same boot. That only works if the
+    // foreground loop can hand the CPU to Ring-3 work and get it back, which
+    // needs the loop recorded as a schedulable context BEFORE the init sidecar
+    // is created (launch_init_sidecar leaves init runnable instead of entering
+    // it). No flag, no descriptor: kernel_yield_to_ring3() is then a no-op and
+    // every other boot mode is byte-for-byte unchanged.
+    if (boot_params_unified_mode()) {
+        proc_control_plane_init();
+        /* Tell every sidecar created from here on that the kernel owns the
+         * hardware in this boot (the BIB's UNIFIED flag; init reads it and
+         * keeps to the software-only part of its spawn chain). */
+        cap_set_bib_flags(SIDECAR_BIB_FLAG_UNIFIED);
+        /* Announced here rather than left to the sidecar to confirm: this
+         * line is kernel TX, so it is written whole by the kernel's own
+         * serializer, whereas a sidecar's log line travels through its
+         * console channel to whichever core drains it. The boot guards read
+         * the serial log, so the kernel-side statement of the flag is the
+         * one that can be asserted without racing the sidecar world's
+         * output (tests/unified_boot_check.sh asserts this line; init's
+         * HAVING READ it is asserted there by the hardware half of the
+         * spawn chain staying unspawned). */
+        kernel_serial_printf(
+            "[E1] BIB v%u flags=0x%x (UNIFIED) written into every sidecar's "
+            "boot info block\n",
+            (unsigned)SIDECAR_BIB_VERSION,
+            (unsigned)SIDECAR_BIB_FLAG_UNIFIED);
+        /* Device ownership in unified mode: the kernel keeps the console as
+         * well as the NICs (step 7 assigned the NIC roles), so typed input
+         * belongs to this loop — the console service must stop forwarding it
+         * into sidecars or every keystroke would be delivered twice. */
+        console_service_set_input_forward(0);
+    }
+
     // ── 7d. Sidecar subsystem: boot image + init sidecar launch ─────────────
     // Phase 5 (self-hosted): reserve the boot-image span, copy the init/DM
     // images to their declared addresses, build the device registry, and
     // create the init sidecar (which then spawns the Device Manager at
     // runtime via SYS_SLS_CREATE_SIDECAR). Non-fatal: with no initrd the
     // kernel boots as before.
+    //
+    // E1: in unified mode this RETURNS with init left runnable — the sidecar
+    // world is now the second half of a shared boot rather than the boot
+    // itself. In every other mode it never returns while init runs.
     launch_init_sidecar();
 
     kernel_serial_print(
@@ -538,7 +578,16 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
     // BSP idles instead of entering it. The LAPIC timer on this core
     // still fires console_service_tick as the uniprocessor fallback, and
     // the AP core's service poll handles it on SMP boots.
-    if (boot_image_loaded()) {
+    //
+    // E1: the unified boot is the exception, and the reason it needed a new
+    // mode. There the sidecars do NOT own the console (the control plane
+    // above does), and idling here would park the boot's only Ring-0 context
+    // with nobody left to schedule Ring-3 work: the ring-3 timer path needs
+    // Ring-3 code to interrupt, so with the BSP hlt-ing forever the sidecar
+    // world would never run at all. Falling through keeps the foreground
+    // loop alive — and it is the loop itself that shares the CPU, by
+    // yielding.
+    if (boot_image_loaded() && !boot_params_unified_mode()) {
         for (;;) __asm__ volatile("hlt");
     }
 

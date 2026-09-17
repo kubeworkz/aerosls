@@ -42,6 +42,13 @@ pub const DM_READY_DEADLINE_NS: u64 = 1_000_000_000;
 /// wedged DM costs at most retries × deadline, never an unbounded block.
 pub const DM_READY_RETRIES: u32 = 3;
 
+/// POSIX-Environments E1: the unified boot's heartbeat period — 100 ms, ten
+/// kernel ticks at the documented ~10 ms KERNEL_TICK_NS. Short enough that
+/// `tests/unified_boot_check.sh` sees several heartbeats per second of boot
+/// window, long enough that the loop is not a busy-poller (each iteration
+/// parks the sidecar until the kernel's deadline tick wakes it).
+pub const HEARTBEAT_NS: u64 = 100_000_000;
+
 /// Send the device registry snapshot to the Device Manager with a
 /// BLOCKING send (timeout 0): if the DM's queue is full, the kernel parks
 /// this sidecar until a slot frees — the handshake cannot drop the
@@ -356,6 +363,146 @@ where
                 }
                 other => return Err(ChannelError::UnexpectedKind(other)),
             }
+        }
+    }
+}
+
+/// POSIX-Environments E1 (unified boot): init's event loop when the KERNEL
+/// owns the hardware.
+///
+/// Why a second loop instead of a flag on `run_supervisor_loop`: the unified
+/// boot deliberately has no POSIX subject. The SYSTEM-property POSIX manifest
+/// carries COM1 port I/O, the NIC BAR0 DEV cap and the timer/serial IRQ binds —
+/// all hardware the kernel is actively driving in that boot (it serves HTTP on
+/// the management NIC and owns the console) — so init spawns neither it nor the
+/// network driver, and there is no second guarded channel to wait on. What
+/// remains is the software world init still owns: the Device Manager (and with
+/// no NIC handed off, the DM spawns no e1000 driver) and init's ramdisk.
+///
+/// The heartbeat is the point. Each iteration waits with a FINITE deadline
+/// (`HEARTBEAT_NS`); every deadline that elapses logs `[INIT] heartbeat <n>`.
+/// That counter can only advance while BOTH halves of the unified boot are
+/// working: the kernel's Ring-0 control plane must yield the CPU
+/// (`kernel_yield_to_ring3`) for init to run at all, and the timer's Ring-3
+/// path must preempt init back (`schedule_ring3`) for the next heartbeat to
+/// arrive. Remove the yield and the counter freezes while `/api/health` keeps
+/// answering — which is exactly the assertion `tests/unified_boot_check.sh`
+/// makes, and its sabotage (the roadmap's "tooth").
+///
+/// The DM watchdog semantics of the supervisor loop are preserved: CLOSE →
+/// bounded backoff → respawn → re-handshake, with the same bounded restart
+/// budget. ENV requests are dispatched to the environment manager exactly as
+/// there, so the control plane's environment API keeps its channel.
+/// The heartbeat line itself. Deliberately self-contained (no shared log
+/// macro): this module is compiled on the HOST too, for the sim tests, and on
+/// the host `lib.rs` cfg's `mod entry` out entirely (it needs the `target`
+/// feature) — so `entry.rs`'s `log`/`log_fmt!` do not exist there. Formatting
+/// by hand also keeps the promise that logging never allocates on the target,
+/// where the sidecar's bump heap is not a global allocator.
+fn log_heartbeat<K: Kernel>(console: &InitChannel<K>, n: u64) {
+    const PREFIX: &[u8] = b"[INIT] heartbeat ";
+    let mut buf = [0u8; 32];
+    buf[..PREFIX.len()].copy_from_slice(PREFIX);
+    let mut len = PREFIX.len();
+    let mut digits = [0u8; 20];
+    let mut d = 0usize;
+    let mut v = n;
+    if v == 0 {
+        digits[0] = b'0';
+        d = 1;
+    }
+    while v > 0 && d < digits.len() {
+        digits[d] = b'0' + (v % 10) as u8;
+        v /= 10;
+        d += 1;
+    }
+    while d > 0 && len < buf.len() {
+        d -= 1;
+        buf[len] = digits[d];
+        len += 1;
+    }
+    if let Ok(s) = core::str::from_utf8(&buf[..len]) {
+        let _ = console.request(0, s.as_bytes());
+    }
+}
+
+pub fn run_unified_loop<K: Kernel, FA, FE>(
+    console: &InitChannel<K>,
+    mut dm: InitChannel<K>,
+    pa: &RespawnPolicy,
+    mut respawn_dm: FA,
+    env: InitChannel<K>,
+    mut handle_env: FE,
+) -> Result<(), ChannelError>
+where
+    FA: FnMut(u32) -> Result<InitChannel<K>, ChannelError>,
+    FE: FnMut(&[u8], &mut [u8]) -> usize,
+{
+    let mut buf = [0u8; 128];
+    let mut restarts: u32 = 0;
+    let mut heartbeat: u64 = 0;
+    loop {
+        let mut chans = [dm.r, env.r];
+        match console.kernel().wait(&mut chans, HEARTBEAT_NS) {
+            Ok((idx, kind)) => {
+                if idx == 0 {
+                    match kind {
+                        aerosls_proto::CH_KIND_MSG => match dm.recv_msg(&mut buf) {
+                            Ok(_tag) => {
+                                let _ = console.request(0, b"[INIT] Device Manager notification");
+                            }
+                            Err(e) => return Err(e),
+                        },
+                        CH_KIND_CLOSE => {
+                            let (_reason, _detail) = dm.recv_close()?;
+                            if restarts >= pa.max_restarts {
+                                return Err(ChannelError::TooManyRestarts);
+                            }
+                            backoff_sleep(&dm, pa.backoff_for(restarts + 1));
+                            dm = respawn_dm(restarts + 1)?;
+                            restarts += 1;
+                        }
+                        other => return Err(ChannelError::UnexpectedKind(other)),
+                    }
+                } else {
+                    // idx == 1: the environment-manager control channel — a
+                    // kernel service (the kernel context holds the far end), so
+                    // it never respawns. Reply with the SAME tag, so
+                    // env_service_create() on the kernel side matches the
+                    // answer to its request.
+                    match kind {
+                        aerosls_proto::CH_KIND_MSG => match env.recv_msg_len(&mut buf) {
+                            Ok((tag, len)) => {
+                                let mut reply = [0u8; 64];
+                                let n = handle_env(&buf[..len], &mut reply);
+                                if n > 0 {
+                                    let _ = env.request(tag, &reply[..n]);
+                                }
+                            }
+                            Err(e) => return Err(e),
+                        },
+                        CH_KIND_CLOSE => {
+                            let _ = env.recv_close();
+                            let _ = console.request(0, b"[INIT] env control channel closed");
+                        }
+                        other => return Err(ChannelError::UnexpectedKind(other)),
+                    }
+                }
+            }
+            Err(code) if code == aerosls_proto::kabi::ERR_TIMEOUT => {
+                // Either the heartbeat deadline elapsed (the parked wait was
+                // woken by the kernel's deadline tick and the re-run found
+                // nothing) or the park could not happen that tick because no
+                // other process was runnable ("retry"). Both mean the same
+                // thing here: init is alive and making progress, which is what
+                // the heartbeat reports. Yield once so a woken or freshly
+                // spawned child can run, then re-enter the wait — the
+                // supervisor loop's own ERR_TIMEOUT handling.
+                heartbeat += 1;
+                log_heartbeat(console, heartbeat);
+                console.kernel().sched_yield();
+            }
+            Err(code) => return Err(ChannelError::Kernel(code)),
         }
     }
 }

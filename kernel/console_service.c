@@ -14,6 +14,20 @@ static uint8_t  console_input_buf[CONSOLE_INPUT_BUF];
 /* Single-flight flag for the RX poll (see console_service_tick). */
 static volatile int console_rx_busy = 0;
 
+/* POSIX-Environments E1: who owns typed console input. 1 (the default, and
+ * what every boot before E1 did) forwards completed lines into the sidecars'
+ * console channels. The unified boot sets it to 0: there the Ring-0 control
+ * plane owns the serial port (it is the shell/HTTP loop), and forwarding the
+ * same bytes to a sidecar as well would deliver every keystroke twice. */
+static int console_input_forward = 1;
+
+void console_service_set_input_forward(int on) {
+    console_input_forward = on ? 1 : 0;
+    kernel_serial_printf(
+        "[CONSOLE] sidecar input forwarding %s\n",
+        console_input_forward ? "enabled" : "disabled (kernel owns the console)");
+}
+
 static int console_is_chan_r(uint64_t w) {
     if (((w >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK) != CAP_TYPE_CHAN_R) return 0;
     if (((w >> CAP_STATE_SHIFT) & CAP_STATE_MASK) != CAP_STATE_VALID) return 0;
@@ -56,8 +70,17 @@ void console_service_tick(void) {
                                  console_svc_buf, sizeof(console_svc_buf),
                                  &plen, 0, 0, &n_caps, &tag, &flags);
             if (r != 0) break;
+            /* One sidecar console message is one line of text as far as the
+             * log is concerned: print it under the TX lock (kernel_io.h).
+             * Without it the AP core's drain and the BSP's Ring-0 control
+             * plane (the unified boot's other writer) interleave BYTE by
+             * byte, which is how `[INIT] UNIFIED boot` came out as
+             * `[INIT] UNIF<kernel line>IED boot` — unreadable for an
+             * operator and unfalsifiable for a grep-based boot guard. */
+            int held = kernel_serial_tx_lock();
             for (uint32_t i = 0; i < plen; i++)
                 kernel_serial_putchar((char)console_svc_buf[i]);
+            if (held) kernel_serial_tx_unlock();
             console_svc_drained++;
         }
 
@@ -84,7 +107,8 @@ void console_service_tick(void) {
      * h/o swapped, and one of two typed lines lost entirely). The
      * compare-and-swap admits exactly one poller per round; the loser
      * returns — bytes stay in the UART FIFO for the next tick. */
-    if (__sync_bool_compare_and_swap(&console_rx_busy, 0, 1)) {
+    if (console_input_forward &&
+        __sync_bool_compare_and_swap(&console_rx_busy, 0, 1)) {
         int n = serial_console_poll((char*)console_input_buf, CONSOLE_INPUT_BUF);
         if (n > 0) {
             /* Line ≤ 255 chars; '\n' at index 255 is the last byte. */

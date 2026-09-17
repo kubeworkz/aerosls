@@ -63,6 +63,18 @@ static int checks_failed = 0;
     else      { checks_failed++; printf("FAIL: %s\n", msg); } \
 } while (0)
 
+/* ─── POSIX-Environments E1: the unified-boot yield ─────────────────────── */
+/* kernel/kernel_io.c's read_line() (the shell's idle point) calls the
+ * cooperative yield kernel_yield_to_ring3(), whose real definition lives in
+ * kernel/process.c — a file this test deliberately does not link (it would
+ * drag the whole scheduler in). On a non-unified boot — which is every boot
+ * this test's code models — no control plane is planted, so the real function
+ * returns immediately; the stand-in is therefore behaviourally exact here.
+ * Defined HERE rather than in tests/process_host_stubs.h because process.c
+ * DEFINES the function, and a weak stub in a header that process.c-including
+ * tests pull in would be a redefinition in the same translation unit. */
+void kernel_yield_to_ring3(uint32_t budget_ticks) { (void)budget_ticks; }
+
 /* ─── cap.c link stubs (same set as cap_create_sidecar_host_test.c) ────── */
 char _kernel_image_end[1];
 

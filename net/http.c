@@ -10,6 +10,13 @@
 #include "../kernel/kernel_io.h"
 #include "../kernel/timer.h"
 #include "../kernel/smp.h"       // smp_uniprocessor_tick() -- single-CPU fallback
+#include "../kernel/process.h"   // E1: kernel_yield_to_ring3() -- unified-boot CPU sharing
+
+/* POSIX-Environments E1: even with work never stopping, the HTTP loop yields
+ * to Ring-3 once every this many sweeps, so a saturated control plane cannot
+ * starve the sidecar world. A sweep is cheap, so this is a coarse bound, not a
+ * tuned quantum (the idle path yields on every sweep). */
+#define HTTP_YIELD_EVERY_SWEEPS 256u
 #include "../user/shell.h"      // the console this loop drives between sweeps
 #include "../kernel/net_event.h"  // Architectural Phase 1 -- net_event_hlt_wait() for the multiplexed HTTP loop
 #include "../kernel/object_catalog.h"
@@ -6670,6 +6677,11 @@ void http_server_run(void) {
 
     for (int i = 0; i < TCP_MAX_CONNS; i++) { http_conns[i].in_use = 0; http_conns[i].attributed = 0; http_conns[i].tls = 0; }
 
+    /* E1: sweeps-since-last-yield counter for the busy path (see the bottom
+     * of this loop). Local to the loop, so a second http_server_run() — none
+     * exists today — would keep its own cadence. */
+    unsigned yield_sweeps = 0;
+
     for (;;) {
         int did_work = 0;
 
@@ -6963,6 +6975,19 @@ void http_server_run(void) {
         // Nothing needed attention anywhere this sweep -- halt until the
         // next timer tick instead of busy-spinning (same idiom tcp_accept()/
         // tcp_recv() used before; see kernel/net_event.h).
+        //
+        // POSIX-Environments E1: this is also the unified boot's hand-over
+        // point. The timer's Ring-0 path deliberately never schedules, so the
+        // sidecar world only ever runs while this loop is not — that is the
+        // whole design of the cooperative yield. Also yields every
+        // HTTP_YIELD_EVERY_SWEEPS sweeps even when work never stops arriving,
+        // so a saturated control plane cannot starve Ring-3 indefinitely;
+        // both calls are no-ops on every non-unified boot (no control plane
+        // was planted, so kernel_yield_to_ring3 returns immediately).
+        if (!did_work || ++yield_sweeps >= HTTP_YIELD_EVERY_SWEEPS) {
+            yield_sweeps = 0;
+            kernel_yield_to_ring3(PROC_CONTROL_PLANE_BUDGET_TICKS);
+        }
         if (!did_work) net_event_hlt_wait();
     }
 }

@@ -41,13 +41,21 @@
 # pattern; `-serial file:` is write-only and cannot feed grub input).
 #
 # Usage (from a guard, right after QEMU is started):
-#   bash tests/grub_select_kernel_only.sh "$SER.in" boot_part.log "$QPID"
+#   bash tests/grub_select_kernel_only.sh "$SER.in" boot_part.log "$QPID" [entry]
 #     $1 = the serial INPUT fifo (host writes guest-bound bytes here)
 #     $2 = the serial-capture log (grub's menu render is detected here)
 #     $3 = the QEMU pid (0 to skip the liveness check)
+#     $4 = which menu entry to boot, 1-based MENU POSITION in grub.cfg,
+#          default 2 — the "kernel only" entry, which is what every pre-E1
+#          caller wants. The helper sends (entry - 1) Down keys from grub's
+#          default highlight, so the default sends exactly the one Down its
+#          name has always sent and menu entry 1 (the Phase-5 initrd boot)
+#          sends none. grub.cfg's order is: 1 Phase 5, 2 kernel only,
+#          3 unified (POSIX-Environments E1 — what
+#          tests/unified_boot_check.sh selects), 4 GRUB shell.
 #
-# Exit: 0 once Down+Enter were written; 1 if QEMU died before grub's menu
-# appeared or the menu never rendered within the wait — callers should
+# Exit: 0 once the Down(s)+Enter were written; 1 if QEMU died before grub's
+# menu appeared or the menu never rendered within the wait — callers should
 # treat 1 as a boot failure (their own HTTP/listener wait would fail
 # anyway; failing here just names the cause earlier).
 set -u
@@ -55,6 +63,12 @@ set -u
 SER_IN="$1"
 LOG="$2"
 QPID="${3:-0}"
+ENTRY="${4:-2}"
+case "$ENTRY" in
+    ''|*[!0-9]*|0)
+        echo "FAIL: entry must be a 1-based menu position (got '$ENTRY')" >&2
+        exit 1 ;;
+esac
 
 MENU_MARKER="Use the ^ and v keys"
 WAIT_S=60   # grub renders its menu ~1-2 s after QEMU start even under slow
@@ -87,12 +101,16 @@ if [ "$saw_menu" -eq 0 ]; then
     exit 1
 fi
 
-# ESC [ B = Down arrow (grub aborts its countdown and highlights entry 1);
-# a short pause, then CR = Enter boots the highlighted entry. Written as
-# two separate opens so a partial write can never interleave with another
-# writer; grub holds the countdown open once the Down lands.
-if ! printf '\033[B' > "$SER_IN" 2>/dev/null; then
-    echo "FAIL: could not write the Down key to $SER_IN" >&2
+# ESC [ B = Down arrow (grub aborts its countdown and highlights the next
+# entry); a short pause, then CR = Enter boots the highlighted entry. Written
+# as two separate opens so a partial write can never interleave with another
+# writer; grub holds the countdown open once the first Down lands.
+DOWNS=""
+for _i in $(seq 2 "$ENTRY"); do
+    DOWNS="$DOWNS$(printf '\033[B')"
+done
+if ! printf '%s' "$DOWNS" > "$SER_IN" 2>/dev/null; then
+    echo "FAIL: could not write the Down key(s) to $SER_IN" >&2
     exit 1
 fi
 sleep 0.5

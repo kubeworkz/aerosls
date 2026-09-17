@@ -66,6 +66,11 @@ void vga_print(const char *s)  { (void)s; }
 int  smp_cpu_id(void)          { return 0; }
 int  smp_cpu_count(void)       { return 1; }
 void smp_uniprocessor_tick(void) { }
+/* POSIX-Environments E1: read_line()'s idle point yields the CPU to the unified
+ * boot's Ring-3 work. No control plane exists on the host, and this test drives
+ * the poll seam rather than that loop, so the documented no-op is the accurate
+ * stub (kernel/process.c is the real implementation). */
+void kernel_yield_to_ring3(uint32_t budget_ticks) { (void)budget_ticks; }
 
 /* ─── the UART model (kio_test_* is declared by the force-included seam) ─── */
 static uint8_t  g_rx[16];        /* bytes a host write has queued */
