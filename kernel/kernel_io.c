@@ -164,9 +164,32 @@ void kernel_panic_dec(uint64_t v) {
 // ─── Serial TX serialization (see kernel_io.h) ────────────────────────────────
 // One global lock, not per-line state: the kernel has exactly one console.
 // 0 = free, 1 = held. A failed acquire is NOT an error -- the caller prints
-// unlocked (see the header): the spin bound is what keeps the kernel from
-// ever parking on a printer, and the CAS is what makes the common case
-// (uncontended, single writer) cost one atomic.
+// unlocked (see the header); the spin bound is what keeps the kernel from ever
+// parking on a printer.
+//
+// ─── Why the wait TESTS BEFORE IT SWAPS ───────────────────────────────────────
+// This lock began as a compare-and-swap retry loop: every iteration of the wait
+// issued `lock cmpxchg` on serial_tx_busy, up to SERIAL_TX_SPIN_LIMIT of them per
+// failed acquisition. Under QEMU's multi-threaded TCG each of those is a helper
+// call taking a lock shared with the other vCPU thread's own memory operations,
+// so a writer waiting on a slow console line hammered the mechanism the core it
+// was waiting for needed in order to make progress at all. That is the leading
+// suspect for the E1 boot wedge -- a lost wake with the guest alive, the tick
+// counter advancing and the BSP parked in cap_wait_chans for ever.
+//
+// The wait now reads serial_tx_busy with a PLAIN LOAD and issues the atomic only
+// when that load reports the port free, so a held window contains no atomic
+// read-modify-write at all, while an uncontended acquire still costs exactly
+// one. Both halves of that sentence are asserted by
+// tests/serial_tx_lock_host_test.c through the seam just below.
+//
+// The obvious way to remove the hammering -- give up after a SINGLE attempt (a
+// "try-once" lock, so the waiter never spins) -- was built and measured, and
+// rejected: with the loser printing immediately, two writers interleave BYTE by
+// byte, and its torn-line count over 14 interleaved boots (57) was
+// indistinguishable from an arm whose lock never acquires at all (62).
+// Whole-line output is this lock's entire purpose, so the wait has to keep
+// waiting; only its cost was allowed to change.
 static volatile int serial_tx_busy = 0;
 /* ~0.5-2 ms of pauses: far longer than a QEMU UART takes to shift out a
  * console line, and short enough that the pathological caller (interrupt
@@ -174,9 +197,32 @@ static volatile int serial_tx_busy = 0;
  * frame. */
 #define SERIAL_TX_SPIN_LIMIT 200000UL
 
+/* The lock's one atomic, behind a seam for the same reason outb/inb are (see
+ * the top of this file): the ATOMIC TRAFFIC the wait path generates is the
+ * property this lock was repaired for, and it is invisible to every other kind
+ * of test -- a lock that swaps per iteration and one that swaps once per
+ * acquisition put identical bytes on the wire, return identical codes and
+ * produce identical boot logs. tests/kernel_serial_tx_seam.h substitutes a
+ * counting implementation, so a regression back to a swap-per-iteration wait
+ * fails a host test instead of a QEMU boot. */
+#ifndef kernel_serial_tx_try_acquire
+static inline int kernel_serial_tx_try_acquire(volatile int* busy) {
+    return __sync_bool_compare_and_swap(busy, 0, 1);
+}
+#endif
+
 int kernel_serial_tx_lock(void) {
     for (unsigned long i = 0; i < SERIAL_TX_SPIN_LIMIT; i++) {
-        if (__sync_bool_compare_and_swap(&serial_tx_busy, 0, 1)) return 1;
+        /* Test: a plain load. While another writer holds the port -- the whole
+         * reason to be in this loop -- this is ALL the loop does. */
+        if (serial_tx_busy) {
+            __asm__ volatile("pause");
+            continue;
+        }
+        /* Then test-and-set: claim only what we just observed free. The port
+         * may have been taken in between, and then this is one failed atomic
+         * and the loop goes back to plain loads. */
+        if (kernel_serial_tx_try_acquire(&serial_tx_busy)) return 1;
         __asm__ volatile("pause");
     }
     return 0;

@@ -34,6 +34,15 @@ void kernel_serial_printf(const char* fmt, ...);
  * (kernel/console_service.c) bracket their bytes with this lock, so one line
  * — or one sidecar console message — is written whole.
  *
+ * The wait costs NO atomic read-modify-write while another writer holds the
+ * port: it spins on a plain load and issues a single compare-and-swap only
+ * when the load reports the port free, so an uncontended acquire still costs
+ * exactly one. A swap per waiting iteration — what this began as — hammers a
+ * lock the other vCPU's TCG thread needs in order to make progress at all,
+ * which is the leading suspect for the E1 boot wedge; kernel/kernel_io.c has
+ * the measurement, including why the cheaper "give up after one attempt"
+ * shape is NOT an acceptable substitute (it tears lines as badly as no lock).
+ *
  * The wait is BOUNDED on purpose: a caller that cannot acquire within
  * kernel_serial_tx_lock()'s spin limit prints anyway and releases nothing.
  * That makes a parked core impossible (no cross-core lock cycle can hang the
