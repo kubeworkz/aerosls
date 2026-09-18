@@ -23,4 +23,18 @@ struct IDTPointer {
 void init_idt(void);
 void set_idt_gate(uint8_t vector, uint64_t isr_address, uint8_t attributes);
 
+/* Load the already-built table into THIS core's IDTR.
+ *
+ * Every core needs this, not just the BSP. A core that leaves the trampoline
+ * still carries the RESET IDTR (base 0, limit 0xFFFF) -- the trampoline `cli`s
+ * and init_idt()'s `lidt` ran on the BSP only -- so the first exception, or the
+ * first maskable interrupt routed to that core, reads its "gate" out of
+ * physical address 0. Those bytes are boot/real-mode code, not descriptors, so
+ * the resulting #NP/#DF chain ends in a triple fault: a silent machine reset, a
+ * QEMU exit under -no-reboot, and NOTHING in the log. Measured on the AP while
+ * it ran kernel/smp.c's service loop with interrupts enabled:
+ * `IDT= 0000000000000000 0000ffff` against the BSP's `IDT= ... 00000fff`.
+ * See kernel/smp.c ap_kernel_main() for the call site and why it is first. */
+void idt_load_this_cpu(void);
+
 #endif

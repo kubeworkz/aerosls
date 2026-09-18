@@ -11,6 +11,12 @@
  */
 
 extern void isr14_stub(void);   /* Page Fault (Exception 14)          */
+extern void isr8_stub(void);    /* Double Fault (#DF, Exception 8) — the
+                                  * gate whose absence is silently fatal:
+                                  * without it, a fault raised while another
+                                  * fault is being delivered triple-faults
+                                  * (a reset, i.e. a QEMU exit under
+                                  * -no-reboot) with no output at all. */
 extern void isr32_stub(void);   /* Timer IRQ0 — LAPIC / PIT (Vector 32) */
 extern void isr6_stub(void);    /* Invalid Opcode (#UD, Exception  6)  */
 extern void isr7_stub(void);    /* Device Not Available (#NM, Exception 7) —

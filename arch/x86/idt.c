@@ -20,7 +20,7 @@ __attribute__((aligned(0x10)))
 static struct IDTEntry idt[256];
 static struct IDTPointer idt_ptr;
 
-// External reference to the assembly wrapper for the page fault handler
+// External reference to the assembly wrappers for the fault/IRQ handlers
 #include "isr_stubs.h"
 
 void set_idt_gate(uint8_t vector, uint64_t isr_address, uint8_t attributes) {
@@ -38,6 +38,19 @@ void init_idt(void) {
     idt_ptr.base  = (uint64_t)&idt;
 
     // 0x8E: Present, Ring 0, 64-bit Interrupt Gate
+    //
+    // #DF is the gate whose ABSENCE is silently fatal. Any fault raised while
+    // another fault is being delivered escalates to #DF; with no gate for it
+    // the CPU cannot deliver that either and triple-faults, which is a reset --
+    // and under -no-reboot a QEMU exit with no [FAULT] line, no panic and no
+    // trace of where it happened. With the gate in place the same event prints a
+    // report through handle_ring3_fault()'s panic path and halts.
+    //
+    // Caveat, stated because it is not fixed here: this gate has ist=0 (see
+    // set_idt_gate), so a #DF caused by a damaged/kernel-invalid RSP still
+    // cannot run -- the handler's first pushes fault again. Catching THAT case
+    // needs a dedicated IST stack, which is a larger change than this one.
+    set_idt_gate( 8, (uint64_t)isr8_stub,  0x8E);  // #DF Double Fault
     set_idt_gate( 6, (uint64_t)isr6_stub,  0x8E);  // #UD Invalid Opcode
     // #NM Device Not Available — Gap Remediation SIMI Phase 10. Before this,
     // any SSE/AVX instruction (kernel or, going forward, SIMI-JIT-emitted
@@ -59,7 +72,15 @@ void init_idt(void) {
     // Without this, IRQ0 fires as INT 0x08 (#DF) → triple fault.
     pic_remap_and_mask();
 
-    // Load table pointer directly into the processor
-    __asm__ volatile("lidt %0" : : "m"(idt_ptr));
+    // Load table pointer directly into the processor (this core's IDTR)
+    idt_load_this_cpu();
     __asm__ volatile("sti"); // Re-enable interrupts globally
+}
+
+/* See idt.h. Split out of init_idt() because it is the half an application
+ * processor needs: the table itself is built once, is shared read-only, and
+ * lives in the identity-mapped kernel image, so an AP loads the SAME table --
+ * it must simply load it, which is what nothing did before. */
+void idt_load_this_cpu(void) {
+    __asm__ volatile("lidt %0" : : "m"(idt_ptr));
 }
