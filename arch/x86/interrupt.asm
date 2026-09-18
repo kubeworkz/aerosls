@@ -1,6 +1,7 @@
 bits 64
 global isr14_stub
 global isr32_stub
+global isr8_stub
 global isr6_stub
 global isr7_stub
 global isr11_stub
@@ -79,6 +80,16 @@ extern cap_irq_notify
 %endmacro
 
 section .text
+
+; ─── isr8_stub — Double Fault (#DF) ─────────────────────────────────────────
+; Deliberately has a gate of its own (idt.c installs it). #DF is what any
+; fault escalates to when it recurs inside fault delivery, and while it had NO
+; gate the CPU had nowhere to go: it triple-faults, which resets the machine --
+; and under -no-reboot that is a QEMU exit with no output at all, the failure
+; mode this kernel hit twice at the same serial-log byte. #DF pushes an error
+; code (always 0), so it takes the error-code stub shape -- the same macro
+; every other fault stub uses, so the frame layout cannot drift from theirs.
+FAULT_STUB_EC isr8_stub
 
 isr14_stub:
     push rbp

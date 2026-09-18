@@ -87,6 +87,13 @@ uint8_t  trampoline_end[1];
 uint64_t gdt_ptr = 0;
 void* allocate_physical_ram_frame(void) { return NULL; }
 void  init_local_apic_registers(void) { }
+/* ap_kernel_main() calls this first -- an AP must load the IDT before
+ * init_local_apic_registers() enables interrupts on it (arch/x86/gdt.c's one
+ * global TSS aside, the BSP's `lidt` was the only one in the tree). idt.c is
+ * not linked here, so the symbol needs a definition the same way
+ * init_local_apic_registers does above; that the call is FIRST is what
+ * arch/x86/gdt.c's rsp0 and the boot experiment pin, not this test. */
+void  idt_load_this_cpu(void) { }
 void  lapic_write(uint32_t reg, uint32_t value) { (void)reg; (void)value; }
 void  kernel_sleep_ticks(uint32_t ticks) { kernel_tick_counter += ticks; }
 void  kernel_serial_print(const char* s) { (void)s; }

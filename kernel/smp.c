@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "../arch/x86/lapic.h"
+#include "../arch/x86/idt.h"   /* idt_load_this_cpu: an AP must load the IDT */
 #include "microkernel.h"
 #include "smp.h"
 #include "console_service.h"  /* deferred uniprocessor console drain */
@@ -117,6 +118,29 @@ void smp_uniprocessor_tick(void) {
 
 // Executed concurrently by Core 1 and Core 2 when they leave the trampoline
 void ap_kernel_main(void) {
+    /* ─── FIRST, before anything can fault or be interrupted ─────────────
+     * A core leaving the trampoline still carries the RESET IDTR (base 0,
+     * limit 0xFFFF): the trampoline `cli`s, and the only `lidt` in the tree is
+     * init_idt()'s, which ran on the BSP. init_local_apic_registers() below
+     * then ends with `sti`. So this core would run kernel code with interrupts
+     * enabled and NO interrupt table -- and the first exception, or the first
+     * maskable interrupt routed here, fetches its "gate" out of physical
+     * address 0 (boot/real-mode code, not descriptors), so the #NP/#DF chain
+     * ends in a triple fault.
+     *
+     * A triple fault is a machine reset: with -no-reboot QEMU EXITS, printing
+     * nothing, and the serial log simply stops -- no [FAULT], no panic. That is
+     * the shape of the boot failure this call was added for (log ending at
+     * `[IRQ] unmask vector 36: pin 4`, QEMU gone before the prompt). Confirmed
+     * against the running guest before the fix: the QEMU monitor read the AP's
+     * IDTR as `0000000000000000 0000ffff` while it was executing this very
+     * loop with IF=1 (RFLAGS=0x297), against the BSP's `... 00000fff`, and a
+     * single IPI aimed at that core has been shown to kill the machine.
+     *
+     * The table is shared and read-only in the identity-mapped kernel image, so
+     * loading it here costs one instruction and needs no per-core copy. */
+    idt_load_this_cpu();
+
     // Reload local core segment references
     init_local_apic_registers();
 
