@@ -11,8 +11,11 @@ static uint32_t console_svc_drained = 0;
 
 #define CONSOLE_INPUT_BUF 256
 static uint8_t  console_input_buf[CONSOLE_INPUT_BUF];
-/* Single-flight flag for the RX poll (see console_service_tick). */
+/* Single-flight flags (see console_service_tick). console_rx_busy guards the
+ * shared line editor on the RX side; console_tx_busy guards the shared drain
+ * buffer on the TX side. Both exist because the tick runs on TWO cores. */
 static volatile int console_rx_busy = 0;
+static volatile int console_tx_busy = 0;
 
 /* POSIX-Environments E1: who owns typed console input. 1 (the default, and
  * what every boot before E1 did) forwards completed lines into the sidecars'
@@ -43,7 +46,25 @@ static int console_is_chan_w(uint64_t w) {
 }
 
 void console_service_tick(void) {
-    for (uint32_t s = 0; s < CAP_TABLE_ENTRIES; s++) {
+    /* ── Single-flight: the TX drain owns one shared buffer ───────────────
+     * console_svc_buf below is a single static, and printing a message out
+     * of it pins the bytes for as long as the UART takes to shift them: a
+     * 4 KiB message at 115200 baud is ~356 ms. Two drainers -- this tick
+     * runs on the AP's service poll AND on the BSP's deferred timer tick
+     * (console_service_deferred_tick) -- therefore cannot share it: the
+     * second one refills the buffer while the first is still printing, so
+     * the first emits the OTHER message's bytes, and bytes at the seam are
+     * lost or duplicated. Observed in the boot log as a dropped byte
+     * ('System ready' arrived as 'ystem ready' in 27 of 158 logs) and as
+     * the shell's two prompts arriving as "$$ " instead of "$ $ ".
+     *
+     * This is the same defect the RX forward below was already fixed for
+     * (typed input came back as "ecoh" and one of two typed lines was lost
+     * outright); the compare-and-swap there is why it cannot recur, and the
+     * TX half needs it for the same reason. The loser returns without
+     * touching the buffer -- the message stays queued for the next tick. */
+    int tx_mine = __sync_bool_compare_and_swap(&console_tx_busy, 0, 1);
+    for (uint32_t s = 0; tx_mine && s < CAP_TABLE_ENTRIES; s++) {
         uint64_t w = cap_tables[0].slots[s].word;
         if (!console_is_chan_r(w)) continue;
         /* POSIX-Environments E4: the environment-manager control channel's
@@ -92,6 +113,12 @@ void console_service_tick(void) {
                 cap_revoke(0, (uint16_t)s);
         }
     }
+
+    /* Released only after the whole scan, so every message printed in this
+     * tick came out of a buffer no other core was refilling. No path above
+     * returns early -- the skips are `continue`s -- so the flag cannot be
+     * stranded. The RX half below runs regardless of who won the drain. */
+    if (tx_mine) console_tx_busy = 0;
 
     /* ── Serial RX → sidecar console channels ────────────────────────────
      * Poll the UART and forward completed lines to every kernel-held
