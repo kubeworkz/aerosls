@@ -829,6 +829,20 @@ jobs:
       # flakiness. Costs ~5-10 minutes of wall time on the self-hosted
       # runner; boots that finish early are killed as soon as both markers
       # appear.
+      #
+      # Both markers are judged by tests/phase5_boot_markers.py, not by
+      # literal greps: the serial log is measurably not byte-faithful, so
+      # the prompt counts in each of the three orders it arrives in (10 of
+      # 130 recorded logs ended glued, 'System ready\n$$ ', which is the
+      # shell running — the guard used to fail those boots) and each marker
+      # tolerates one damaged byte. 'System ready' is reported but not
+      # required; see the script header. The mangling that made this
+      # necessary had a real cause — two cores draining one console buffer —
+      # fixed in kernel/console_service.c, with the tolerance kept as
+      # defence in depth. Failure reports carry the host's PSI/reclaim
+      # counters so a runner thrashing under the guest is visible. A boot
+      # that really did stop early still fails: its phase marker or prompt
+      # is absent.
       - name: Phase 5 boot flake guard (6 boots under tcg,thread=multi)
         run: bash tests/phase5_boot_flake_guard.sh
         working-directory: aerosls2
