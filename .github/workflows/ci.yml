@@ -797,14 +797,28 @@ jobs:
         working-directory: aerosls2
 
       # Phase 5 self-hosted gate: the ISO's serial log must carry the
-      # driver-SDK demo's PASS line ('irqtest] PASS' — LAPIC timer edges at
+      # driver-SDK demos' PASS lines ('irqtest] PASS' — LAPIC timer edges at
       # vector 32, and the serial port's IRQ4 at vector 36 through the
-      # IO-APIC). The health smoke above proves the kernel serves; this
-      # proves the sidecar fabric + Driver SDK IRQ path ran on the real
+      # IO-APIC — and 'devtest] PASS' for the CAP_TYPE_DEV / SYS_DEV_MMAP
+      # path). The health smoke above proves the kernel serves; this proves
+      # the sidecar fabric + Driver SDK IRQ and DEV paths ran on the real
       # target. A regression in manifest minting, syscall dispatch, the
-      # IRQ registry, the stub wiring, or the self-mask/re-arm dance
-      # fails here even though the system otherwise boots.
-      - name: Phase 5 boot smoke (irqtest PASS in serial log)
+      # IRQ registry, the stub wiring, or the self-mask/re-arm dance fails
+      # here even though the system otherwise boots.
+      #
+      # Both markers are judged by tests/phase5_boot_markers.py with
+      # --preset demos (the same classifier the flake guard below uses), not
+      # by a literal grep: the serial log is measurably not byte-faithful, so
+      # a healthy PASS line that arrived one byte short used to read as "the
+      # demo never ran", and each marker now tolerates one damaged byte and
+      # reports that it did. The failure report names the marker and the
+      # stage, captures QEMU's stderr so a host launch failure is not read as
+      # a regression, and retries such a boot once (never a guest reset,
+      # which leaves stderr empty). The window is 150s because a healthy
+      # single-core boot on the reference host writes both PASS lines at
+      # ~100s — the old 90s window failed healthy boots on timing alone.
+      # See the script header for the measured numbers.
+      - name: Phase 5 boot smoke (irqtest PASS + devtest PASS in serial log)
         run: bash tests/phase5_boot_smoke.sh
         working-directory: aerosls2
 
