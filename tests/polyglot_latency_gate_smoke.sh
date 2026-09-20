@@ -5,13 +5,30 @@
 # ─── Why this exists ───────────────────────────────────────────────────────
 # The polyglot e2e (user/polyglot/tests/e2e_two_process.rs) enforces a
 # latency regression gate: the wasm-sidecar times wasm->lisp->wasm round
-# trips with rdtsc and the test fails if either bench leg's median exceeds
-# POLYGLOT_BENCH_MEDIAN_NS (default 5ms). A gate whose teeth are never shown
-# to bite can go blind: a regression that inflates latency without breaking
-# a functional assert would sail through green, silently degrading the
-# transport. This smoke plants the exact regression the gate was built to
+# trips with rdtsc, splits each into compute (Lisp-side work, timed on the
+# Lisp side and carried in the reply) + transport (total - compute), and the
+# test fails if either bench leg's TRANSPORT component exceeds
+# POLYGLOT_BENCH_TRANSPORT_NS (default 5ms). A gate whose teeth are never
+# shown to bite can go blind: a regression that inflates latency without
+# breaking a functional assert would sail through green, silently degrading
+# the transport. This smoke plants the exact regression the gate was built to
 # catch and requires the e2e to FAIL, then restores the sources
 # byte-identically and requires the e2e to PASS again.
+#
+# The gate bounds the transport component, not the total round trip. A
+# transport regression inflates the total *by* inflating the transport, so
+# every regression the old total-based gate caught still trips; what no
+# longer trips is compute-side inflation (a deskcheduled Lisp side, whose
+# timed compute dominates the shm legs' totals).
+#
+# The latency teeth below (Nagle split, stalled ring) require a mutated
+# transport to FAIL the build and report WHICH check caught it — not
+# necessarily the latency gate, since a severe mutation starves the marker
+# budgets or a baseline leg first (the teeth's own `gate_caught` note says
+# which). The field-level assertion that the threshold is applied to the
+# transport component is the nineteenth tooth, which needs no mutation at
+# all: a 1us threshold must fail naming a transport value and a 50ms one
+# must pass on the same tree.
 #
 # ─── How the tooth is planted ──────────────────────────────────────────────
 # The original latency bug was the classic Nagle/delayed-ACK stall: each
@@ -21,9 +38,12 @@
 # and ~50ms even with client-side TCP_NODELAY). The fix was a single-write
 # frame in transport.rs plus TCP_NODELAY on kerneld's accepted sockets. This
 # smoke reverts BOTH fixes — the two-write frame split AND re-enabled
-# server-side Nagle — rebuilds, and requires the e2e latency gate to fail
-# (median >> 5ms). Both mutations must apply; if either pattern no longer
-# matches, the tooth reports itself as testing nothing.
+# server-side Nagle — rebuilds, and requires the e2e to FAIL. Both mutations
+# must apply; if either pattern no longer matches, the tooth reports itself
+# as testing nothing. The mutation is deliberately as severe as the original
+# bug (~40-50ms per round trip), which starves the marker budgets ahead of
+# the latency gate, so the tooth asserts the build fails and reports which
+# check caught it (see gate_caught above).
 #
 # ─── Why it is smoke.sh, not *_check.sh ────────────────────────────────────
 # run_checks.sh globs tests/*_check.sh, and deploy.sh gates on that same
@@ -45,6 +65,29 @@ POLYGLOT_TARGET_DIR="${POLYGLOT_TARGET_DIR:-/tmp/polyglot-target}"
 pass=0; fail=0
 ok()  { echo "ok:   $1"; pass=$((pass+1)); }
 bad() { echo "FAIL: $1"; fail=$((fail+1)); }
+
+# gate_caught OUT — print the first diagnostic line naming how a mutated e2e
+# run was caught, or nothing if the output carried no diagnostic.
+#
+# A mutated transport can trip several checks, and run_leg evaluates them in a
+# fixed order (async -> T4-T8 sweep -> IPC baselines -> trampoline -> the
+# latency gate), so a mutation severe enough to starve the marker budgets or
+# the baseline legs is named by an earlier check than the one the tooth is
+# about. The latency teeth therefore assert that the build FAILS and report
+# the catcher, rather than asserting the latency gate specifically; the
+# field-level assertion — that the threshold is applied to the TRANSPORT
+# component — is the nineteenth tooth's knob, which needs no mutation at all.
+gate_caught() {
+    printf '%s\n' "$1" | grep -aoE \
+        -e 'transport [0-9]+ ns exceeds the [0-9]+ ns regression threshold' \
+        -e '[A-Z_0-9]+ baseline median [0-9]+ ns exceeds the [0-9]+ ns threshold' \
+        -e 'T4-T8 [A-Z]+ sweep size\[[0-9]+\] median [0-9]+ ns > [0-9]+ ns catastrophe cap' \
+        -e 'compute/transport split is dead' \
+        -e 'wasm-sidecar produced no [A-Z_0-9]+ [a-z]+ report' \
+        -e '\[wait\] [A-Z_0-9]+: TIMED OUT after [0-9.]+s' \
+        -e 'wasm-sidecar failed' \
+        | head -1
+}
 
 # ─── Prerequisites ─────────────────────────────────────────────────────────
 [ -f "$TRANSPORT" ] && [ -f "$KERNELD" ] || {
@@ -90,7 +133,11 @@ if [ "$rc" -eq 0 ]; then
     ok "baseline e2e passed (gate healthy)"
 else
     bad "baseline e2e failed — nothing to prove; fix the transport first"
-    printf '%s\n' "$out" | grep -E 'BENCH|WASM_SIDECAR|panicked' | sed 's/^/        /'
+    # Include the leg errors and gate lines, not just the BENCH lines: the
+    # failure reason lives in the `[tcp]`/`[shm]` lines after the panic (a
+    # marker that never arrived, a gate that tripped), and a baseline failure
+    # is exactly when the reason matters most.
+    printf '%s\n' "$out" | grep -aE 'BENCH|WASM_SIDECAR|panicked|\[(tcp|shm)\] |exceeds|TIMED OUT|produced no|split is dead' | sed 's/^/        /'
     echo; echo "---- passed=$pass failed=$fail"; exit 1
 fi
 
@@ -135,7 +182,8 @@ if [ "$rc" -eq 0 ]; then
     bad "tooth: the e2e latency gate did NOT fail on the regression — it is blind."
     printf '%s\n' "$out" | grep -E 'BENCH|WASM_SIDECAR|panicked' | sed 's/^/        /'
 else
-    ok "tooth: the latency gate failed as required (median blew past the threshold)"
+    why="$(gate_caught "$out")"
+    ok "tooth: the build failed on the regression — caught by: ${why:-(no diagnostic line matched)}"
 fi
 
 # ─── restore byte-identically and prove the gate passes again ─────────────
@@ -149,9 +197,11 @@ trap - EXIT
 # (ring2/ring3 wasm<->kerneld, ring4/ring5 lisp<->kerneld) — so the TCP
 # Nagle tooth above cannot catch a ring-specific regression. This tooth
 # delays the Ring::send producer's cursor publish by 8ms per frame: every
-# ring send on the shm leg (message + arena alike) stalls, inflating the
-# shm medians (add ~2us -> ~16ms, sqrt -> ~90ms) without touching TCP. The
-# gate must fail on it.
+# ring send on the shm leg (message + arena alike) stalls, so the shm
+# transports inflate (add ~5us -> ~16ms, sqrt ~29us -> ~90ms) without
+# touching TCP. The stall is severe enough to starve the marker budgets
+# ahead of the latency gate, so the tooth asserts the build fails and
+# reports the catcher (see gate_caught above).
 echo
 echo "=== tooth: delay the ring producer's publish; the shm gate must fail ==="
 RING=user/polyglot/src/ring.rs
@@ -185,7 +235,8 @@ if [ "$rc" -eq 0 ]; then
     bad "tooth: the e2e latency gate did NOT fail on the ring regression — it is blind."
     printf '%s\n' "$out" | grep -E 'BENCH|WASM_SIDECAR|panicked' | sed 's/^/        /'
 else
-    ok "tooth: the latency gate failed as required (shm median blew past the threshold)"
+    why="$(gate_caught "$out")"
+    ok "tooth: the build failed on the ring regression — caught by: ${why:-(no diagnostic line matched)}"
 fi
 
 # ─── restore byte-identically ──────────────────────────────────────────────
@@ -921,6 +972,43 @@ mv -f "$SNAP_SIDECAR5" "$SIDECAR"
 trap - EXIT
 touch "$SIDECAR"
 
+# ─── nineteenth tooth: the gate's threshold is keyed to the TRANSPORT ──
+# The regression gate now bounds transport_ns, configured by
+# POLYGLOT_BENCH_TRANSPORT_NS (renamed from POLYGLOT_BENCH_MEDIAN_NS, which
+# bounded the total round trip). This tooth is that field's negative control,
+# and it needs no mutation at all: on the PRISTINE tree a threshold below the
+# live transport must FAIL, and the failure must name a transport value, not
+# a total; a generous threshold must then PASS. Without it, a typo in the env
+# name (the gate silently keeping its 5ms default) or a gate accidentally
+# still comparing the total would go unnoticed — the latency teeth above
+# would still bite either way, because a big enough transport regression also
+# blows the total.
+echo
+echo "=== tooth: a sub-transport threshold must fail the gate on the pristine tree ==="
+# 1us is far below every live transport (shm add ~5us .. tcp sqrt ~0.9ms),
+# so the first leg's first gates must trip on the transport component.
+out="$(POLYGLOT_BENCH_TRANSPORT_NS=1000 run_e2e)"; rc=$?
+if [ "$rc" -eq 0 ]; then
+    bad "tooth: the gate PASSED with POLYGLOT_BENCH_TRANSPORT_NS=1000 — the env var is not wired (or not compared against a transport), so the gate is not configurable:"
+    printf '%s\n' "$out" | grep -aE 'BENCH_ADD|BENCH_SQRT|transport' | sed 's/^/        /'
+elif printf '%s\n' "$out" | grep -qE 'transport [0-9]+ ns exceeds the 1000 ns regression threshold'; then
+    ok "tooth: a 1us transport threshold failed the gate on the transport component, as required"
+else
+    bad "tooth: the gate failed, but not by reporting a transport value against the 1000ns threshold:"
+    printf '%s\n' "$out" | grep -aE 'BENCH|threshold|panicked|FAILED' | sed 's/^/        /'
+fi
+
+# The same tree with a threshold above every live transport must PASS: the
+# knob has to move the verdict in both directions, or the tooth above could
+# be explained by the e2e failing for an unrelated reason.
+out="$(POLYGLOT_BENCH_TRANSPORT_NS=50000000 run_e2e)"; rc=$?
+if [ "$rc" -eq 0 ]; then
+    ok "tooth: the same tree PASSED with a 50ms transport threshold — the gate is keyed to the transport and the knob moves it both ways"
+else
+    bad "tooth: the gate still failed with a 50ms transport threshold — the verdict is not driven by the transport component:"
+    printf '%s\n' "$out" | grep -aE 'transport|panicked|FAILED' | sed 's/^/        /'
+fi
+
 echo
 echo "=== restore check: the gate must pass on the unmutated tree ==="
 if ! build_sidecars; then
@@ -933,7 +1021,44 @@ if [ "$rc" -eq 0 ]; then
     ok "transport restored — the e2e latency gate passes again"
 else
     bad "the e2e latency gate still fails after the teeth were removed:"
-    printf '%s\n' "$out" | grep -E 'BENCH|WASM_SIDECAR|panicked' | sed 's/^/        /'
+    printf '%s\n' "$out" | grep -aE 'BENCH|WASM_SIDECAR|panicked|\[(tcp|shm)\] |exceeds|TIMED OUT|produced no|split is dead' | sed 's/^/        /'
+fi
+
+# ─── shm teardown: the e2e must not leave its 64 MiB arena behind ──────────
+# Every run creates /tmp/sls-arena-<port>.bin (64 MiB) + /tmp/sls-chan-<port>.bin
+# and must remove both at teardown: the test's Drop guard covers the normal and
+# panicking returns, the kerneld's SIGTERM handler covers the runs where the
+# test process is killed outright. Nothing used to remove them, and 571
+# abandoned arenas (~36 GB) had accumulated on a dev host. This asserts the
+# exact paths the run above reported rather than counting /tmp entries, so a
+# concurrent e2e elsewhere on the host cannot fail it.
+arena_leak="$(printf '%s\n' "$out" | grep -ao 'arena=/tmp/sls-arena-[0-9]*\.bin' | tail -1 | cut -d= -f2)"
+if [ -z "$arena_leak" ]; then
+    bad "shm teardown: the e2e reported no arena path — it did not run, so the leak is unchecked"
+else
+    port_leak="$(printf '%s' "$arena_leak" | sed 's@^/tmp/sls-arena-\([0-9]*\)\.bin$@\1@')"
+    chan_leak="/tmp/sls-chan-$port_leak.bin"
+    leaked=""
+    for p in "$arena_leak" "$chan_leak"; do
+        [ -e "$p" ] && leaked="$leaked $p"
+    done
+    if [ -n "$leaked" ]; then
+        bad "shm teardown: the e2e leaked its shm files in /tmp:$leaked"
+    else
+        ok "shm teardown: the e2e removed $arena_leak + the matching channel file (no 64 MiB leak)"
+    fi
+fi
+
+# The structural half of the same invariant, asserted directly: the e2e kills
+# the kerneld at points spanning its creation window (before the first create,
+# mid-ftruncate, and after READY) and requires the /tmp pair to stay absent.
+# The guard for that lives in the test above (kerneld_killed_during_creation_
+# leaves_no_shm_files), and a SKIP there still exits 0 — so assert the marker
+# rather than trusting the e2e's exit code.
+if printf '%s\n' "$out" | grep -qa 'TOOTH_OK'; then
+    ok "kill-during-creation tooth: no shm file survives a kill anywhere in the kerneld's creation window"
+else
+    bad "kill-during-creation tooth did not report TOOTH_OK — the structural leak guard did not run"
 fi
 
 dirty=0

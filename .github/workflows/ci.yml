@@ -382,23 +382,69 @@ jobs:
           test -x "$POLYGLOT_TARGET_DIR/release/wasm-sidecar"
         working-directory: aerosls2
 
+      # Unit coverage for the sidecar's own arithmetic. The transport split
+      # estimator (median of the per-sample total-minus-compute differences,
+      # which the latency gate bounds) is pure: no transport, SBCL or kerneld,
+      # so it runs even when the two-process e2e below is having a bad day.
+      # The tests assert that the paired estimator follows each sample's own
+      # compute rather than the two series' marginal medians, that a negative
+      # median clamps, and that one stalled sample cannot move it.
+      - name: Sidecar unit tests (transport-split estimator)
+        run: |
+          set -e
+          export CARGO_TARGET_DIR="$POLYGLOT_TARGET_DIR"
+          cargo test -p polyglot --features linux --bin wasm-sidecar --manifest-path user/Cargo.toml
+        working-directory: aerosls2
+
+      # Unit coverage for the shm creation path. The structural half of the
+      # /tmp leak fix is that the arena and channel are created unnamed
+      # (O_TMPFILE) and linked only once complete, so these tests assert the
+      # path stays absent until publish, that the fallback (a filesystem
+      # without O_TMPFILE) names the file up front — the negative control that
+      # keeps the first assertion from being vacuous — that a stale file is
+      # replaced rather than erroring, and that a published channel opens on
+      # every ring. They are lib tests, so this step is what runs them; the
+      # e2e target below would not.
+      - name: Ring unit tests (anonymous shm creation)
+        run: |
+          set -e
+          export CARGO_TARGET_DIR="$POLYGLOT_TARGET_DIR"
+          cargo test -p polyglot --features linux --lib --manifest-path user/Cargo.toml
+        working-directory: aerosls2
+
       # Run the real two-process e2e natively. The test skips (prints SKIP:
       # and still passes) only when the bins or sbcl are missing — both are
       # provisioned above, so treat any SKIP as a hard failure: the e2e
       # must actually run on every push, not silently skip. The test also
-      # enforces a latency regression gate: either bench leg's median round
-      # trip must stay under POLYGLOT_BENCH_MEDIAN_NS (default 5ms; measured
-      # medians are ~0.6ms add / ~1.5ms sqrt), failing the build if it blows
-      # past the threshold.
+      # enforces a latency regression gate: each bench leg's TRANSPORT
+      # component (total round trip minus the Lisp-side compute) must stay
+      # under POLYGLOT_BENCH_TRANSPORT_NS (default 5ms; measured idle
+      # transport is ~0.24-0.87ms on tcp and ~5-29us on the shared-ring
+      # legs), failing the build if it blows past the threshold. Bounding
+      # the transport rather than the total keeps the gate keyed to what a
+      # transport regression actually moves, and stops a deskcheduled Lisp
+      # side (whose timed compute dominates the shm legs' totals) from
+      # failing it.
       - name: Run the two-process wasm-lisp e2e (real transport)
         env:
           # ns; 5ms catches an order-of-magnitude transport regression with
-          # wide headroom over the ~0.6-1.5ms measured medians.
-          POLYGLOT_BENCH_MEDIAN_NS: 5000000
+          # wide headroom over the measured idle transport medians.
+          POLYGLOT_BENCH_TRANSPORT_NS: 5000000
         run: |
           set -e
-          out="$(cargo test -p polyglot --test e2e_two_process --manifest-path user/Cargo.toml -- --nocapture 2>&1)"
+          # Capture the status instead of letting `set -e` end the step at the
+          # assignment: `out="$(cargo test …)"` aborts on a non-zero exit
+          # BEFORE the printf below, so a failing run (cargo exits 101 on a
+          # test failure) reached CI as a bare exit code with every line of
+          # test output thrown away — which is why this job's intermittent
+          # failures carried no diagnosis at all. Print first, judge after.
+          rc=0
+          out="$(cargo test -p polyglot --test e2e_two_process --manifest-path user/Cargo.toml -- --nocapture 2>&1)" || rc=$?
           printf '%s\n' "$out"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::polyglot e2e run failed (cargo test exit $rc); the output above names the stage"
+            exit 1
+          fi
           if printf '%s\n' "$out" | grep -q 'SKIP:'; then
             echo "::error::polyglot e2e skipped (missing prerequisite); it must run on this job"
             exit 1

@@ -153,14 +153,51 @@ fn spawn_linux(
 }
 
 fn wait_for_marker(rx: &mpsc::Receiver<String>, marker: &str, timeout: Duration) -> Option<String> {
-    let deadline = Instant::now() + timeout;
+    let start = Instant::now();
+    let deadline = start + timeout;
+    let mut closed = false;
     while Instant::now() < deadline {
         match rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(line) if line.contains(marker) => return Some(line),
+            Ok(line) if line.contains(marker) => {
+                // Print the margin on every wait, not just on failure: the
+                // end-to-end wall time is elastic (the sweeps and the 1MiB
+                // async variant scale with load, so a loaded host both slows
+                // the benches and can push a leg past its budget),
+                // and a marker that lands at 50s of a 60s budget is the
+                // warning that the next run on a busier host will fail.
+                // Without this the CI log says only that the step took six
+                // minutes and then exits 101.
+                eprintln!(
+                    "[wait] {marker}: ok after {:.1}s of {:.0}s budget",
+                    start.elapsed().as_secs_f64(),
+                    timeout.as_secs_f64()
+                );
+                return Some(line);
+            }
             Ok(_) => {}
             Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(_) => break,
+            Err(_) => {
+                // The channel closed: the writer exited. That is not a
+                // timeout, and saying so would be its own misleading report
+                // (the async marker is legitimately absent on the TCP leg,
+                // where the wasm sidecar exits after its verdict).
+                closed = true;
+                break;
+            }
         }
+    }
+    if closed {
+        eprintln!(
+            "[wait] {marker}: stream ended after {:.1}s, marker never seen (budget {:.0}s)",
+            start.elapsed().as_secs_f64(),
+            timeout.as_secs_f64()
+        );
+    } else {
+        eprintln!(
+            "[wait] {marker}: TIMED OUT after {:.1}s (budget {:.0}s)",
+            start.elapsed().as_secs_f64(),
+            timeout.as_secs_f64()
+        );
     }
     None
 }
@@ -174,16 +211,29 @@ fn wait_for_markers(
     count: usize,
     timeout: Duration,
 ) -> Vec<String> {
+    let start = Instant::now();
     let mut found = Vec::new();
-    let deadline = Instant::now() + timeout;
+    let deadline = start + timeout;
+    let mut closed = false;
     while found.len() < count && Instant::now() < deadline {
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(line) if line.contains(marker) => found.push(line),
             Ok(_) => {}
             Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(_) => break,
+            Err(_) => {
+                closed = true;
+                break;
+            }
         }
     }
+    eprintln!(
+        "[wait] {marker}: {}/{} after {:.1}s of {:.0}s budget{}",
+        found.len(),
+        count,
+        start.elapsed().as_secs_f64(),
+        timeout.as_secs_f64(),
+        if closed { " (stream ended)" } else { "" }
+    );
     found
 }
 
@@ -198,6 +248,46 @@ fn free_port() -> u16 {
 fn kill_child(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// Unlink the kerneld's shm files when the test ends, however it ends.
+///
+/// sls-kerneld creates `/tmp/sls-arena-<port>.bin` (64 MiB) and
+/// `/tmp/sls-chan-<port>.bin` and reports both paths in its READY line. Nothing
+/// removed them, so every run left 64 MiB behind — 571 abandoned arena files
+/// had accumulated on the dev host. A Drop guard rather than straight-line
+/// code so the panicking and early-return paths clean up too; the kerneld
+/// removes its own files on a caught signal, which covers the runs where this
+/// process is killed outright.
+///
+/// The guard is armed from the port *before* the kerneld is spawned (the paths
+/// are deterministic), because a hang between spawn and READY would otherwise
+/// leak an arena the test never learned the name of. READY's own values are
+/// then merged in, so the paths actually used by the sidecars are always
+/// covered even if a caller ever passes `--arena-path`/`--chan`.
+struct ShmCleanup(Vec<String>);
+
+impl ShmCleanup {
+    /// Add a path to remove at teardown. Removing an already-gone file is not
+    /// an error (the kerneld's handler can beat the guard to the unlink).
+    fn add(&mut self, path: String) {
+        if !self.0.contains(&path) {
+            self.0.push(path);
+        }
+    }
+}
+
+impl Drop for ShmCleanup {
+    fn drop(&mut self) {
+        for p in &self.0 {
+            // Keep this quiet: cleanup must never mask the test's real result.
+            if let Err(e) = std::fs::remove_file(p) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!("[cleanup] could not remove {p}: {e}");
+                }
+            }
+        }
+    }
 }
 
 /// Parse `median_ns=<u64>` out of a BENCH line emitted by the wasm-sidecar.
@@ -226,7 +316,7 @@ fn run_leg(
     lisp_script: &str,
     calc_lisp: &str,
     wasm_bin: &str,
-    max_median_ns: u64,
+    max_transport_ns: u64,
     pin_cpu: &str,
     lisp_pin: &str,
     kerneld_pin: &str,
@@ -371,7 +461,7 @@ fn run_leg(
             // max(40ms, 8x its own measured compute + 10ms): a 4KiB
             // payload taking 40ms is a catastrophe, while a 1MiB payload
             // at 62ms compute gets ~0.5s headroom. A transport regression
-            // that stalls per-frame still blows the ADD/SQRT/STR median
+            // that stalls per-frame still blows the ADD/SQRT/STR transport
             // gates (5ms over 1000 samples) long before it hides here.
             let compute_i = parse_field(line, "compute_ns=").unwrap_or(0);
             let cap = 40_000_000u64.max(compute_i * 8 + 10_000_000);
@@ -453,12 +543,30 @@ fn run_leg(
     }
 
     // ── latency regression gate (per transport leg) ──────────────────────
-    // Fail if either bench leg's median round trip exceeds the threshold.
-    // Measured medians are ~0.7ms (add) and ~1.5ms (sqrt) over TCP; the
-    // shared-ring leg is ~200x faster on add (~3us) and ~9x faster on sqrt
-    // (~175us, still dominated by 4096 real SBCL sqrts) — all sidecar
-    // traffic, message + arena bookkeeping, is shared memory. 5ms default
-    // catches an order-of-magnitude transport regression with wide headroom.
+    // Fail if either bench leg's TRANSPORT component exceeds the threshold.
+    //
+    // Both bench legs report total = compute + transport: compute is the
+    // Lisp-side work (timed on the Lisp side, carried in the reply), and
+    // transport is the remainder the transport owns. The gate bounds the
+    // transport, NOT the total round trip.
+    //
+    // Why: a transport regression inflates the total *by* inflating the
+    // transport (the Nagle/delayed-ACK stall this gate exists for added
+    // ~40ms of frame delivery while the Lisp compute was unchanged), so
+    // gating the transport still catches every regression the total gate
+    // caught — while every leg's transport is smaller than its total, so
+    // the same threshold now carries strictly more headroom. What the total
+    // gate *additionally* failed on was compute inflation: a host that
+    // deschedules the Lisp side slows the timed compute (the shm sqrt leg's
+    // 4096 real SBCL sqrts dominate its ~130us total) without touching the
+    // transport. That is a host episode, not a transport regression, and it
+    // is the intermittent CI failure this gating removes.
+    //
+    // Measured idle transport on this host: 0.87ms (tcp sqrt, the widest of
+    // the six legs), 0.24ms (tcp add), 0.81ms (tcp str), 29us (shm sqrt),
+    // 24us (shm str), 4.7us (shm add) — so the 5ms default carries ~6x
+    // headroom on the widest leg and 170-1000x on the shared-ring legs,
+    // while still being ~6x below the ~40ms a Nagle-class regression adds.
     for (name, bench) in [
         ("BENCH_ADD", &bench_add),
         ("BENCH_SQRT", &bench_sqrt),
@@ -468,50 +576,70 @@ fn run_leg(
             kill_child(&mut lisp);
             return Err(format!("wasm-sidecar produced no {name} latency report (transport={transport})"));
         };
-        let median_ns = parse_median_ns(line)
+        let total_ns = parse_median_ns(line)
             .unwrap_or_else(|| panic!("{name} line missing median_ns: {line}"));
-        if median_ns > max_median_ns {
+        let compute_ns = parse_field(line, "compute_ns=")
+            .unwrap_or_else(|| panic!("{name} line missing compute_ns: {line}"));
+        let transport_ns = parse_field(line, "transport_ns=")
+            .unwrap_or_else(|| panic!("{name} line missing transport_ns: {line}"));
+
+        // ── compute/transport split guard ──────────────────────────────
+        // These legs report total = compute (Lisp-side work, timed on
+        // the Lisp side and carried in the reply) + transport (derived
+        // as total - compute). A dead or stale split shows compute_ns=0
+        // (the Lisp timing or its wire field broke) or transport_ns=0
+        // (the Lisp clock runs ahead of the wasm calibration). Both
+        // must be live; the floors sit far below the live medians:
+        // sqrt's 4096 sqrts cannot finish in <10us, reverse's 32..63 B
+        // byte loop (with cold arena page faults) measures ~9us on shm
+        // and cannot finish in <1us, and add's timed 2048-iteration sum
+        // measures ~3-5us on shm and cannot finish in <1us. The message
+        // + arena bookkeeping can never be zero. Checked before the gate
+        // so a dead split reports as a dead split, not as a slow
+        // transport (zeroing compute inflates the derived transport).
+        //
+        // Known floor on this metric: transport is measured across two clock
+        // domains — the total is rdtsc-derived on the wasm side, the compute
+        // is timed by the Lisp — and the ratio error between the two scales
+        // with the interval measured. The sidecar pairs the subtraction per
+        // sample instead of differencing two medians (which removes the
+        // ordering effect), but that floor is not an ordering artifact: on a
+        // compute-dominant leg the transport falls below it and the value
+        // clamps to 0, which this liveness check then reads as a dead split.
+        // Measured with a 10ms sleep injected into the timed Lisp compute:
+        // the shared-ring add leg reported total p50 10027611 ns against
+        // compute 10117000 ns and the paired median still clamped, i.e. over
+        // half the paired samples read total < compute (~0.9% of a 10ms
+        // interval, ~90us, against a ~4us ring transport). The gated legs sit
+        // nowhere near that floor — their computes are 1-264us, so the same
+        // 0.9% is 0.01-2.4us against transports of 4-870us — so this gate is
+        // sound for them; removing the floor itself needs the two clocks
+        // reconciled, or a transport reference measured in one clock.
+        let min_compute = match name {
+            "BENCH_SQRT" => 10_000,
+            _ => 1_000,
+        };
+        if compute_ns < min_compute || transport_ns == 0 {
             kill_child(&mut lisp);
             return Err(format!(
-                "{name} median {median_ns} ns exceeds the {max_median_ns} ns regression threshold \
-                 (transport={transport}) — round-trip latency exploded"
+                "{name} compute/transport split is dead: compute_ns={compute_ns} transport_ns={transport_ns} total={total_ns} (transport={transport}) — the Lisp-side timing or its wire path broke"
+            ));
+        }
+
+        // ── the regression gate: bound the transport component ─────────
+        // Not the total: see the rationale above. A genuine transport
+        // regression moves transport toward the total (compute unchanged),
+        // so it trips here; compute inflation (host load) moves neither.
+        if transport_ns > max_transport_ns {
+            kill_child(&mut lisp);
+            return Err(format!(
+                "{name} transport {transport_ns} ns exceeds the {max_transport_ns} ns regression threshold \
+                 (compute {compute_ns} ns, total {total_ns} ns, transport={transport}) — the transport path is slow"
             ));
         }
         eprintln!(
-            "[gate] {name} median {median_ns} ns <= {max_median_ns} ns threshold (transport={transport}) — OK"
+            "[gate] {name} transport {transport_ns} ns <= {max_transport_ns} ns threshold (compute {compute_ns} ns, total {total_ns} ns, transport={transport}) — OK"
         );
-
-        if name == "BENCH_ADD" || name == "BENCH_SQRT" || name == "BENCH_STR" {
-            // ── compute/transport split guard ──────────────────────────────
-            // These legs report total = compute (Lisp-side work, timed on
-            // the Lisp side and carried in the reply) + transport (derived
-            // as total - compute). A dead or stale split shows compute_ns=0
-            // (the Lisp timing or its wire field broke) or transport_ns=0
-            // (the Lisp clock runs ahead of the wasm calibration). Both
-            // must be live; the floors sit far below the live medians:
-            // sqrt's 4096 sqrts cannot finish in <10us, reverse's 32..63 B
-            // byte loop (with cold arena page faults) measures ~9us on shm
-            // and cannot finish in <1us, and add's timed 2048-iteration sum
-            // measures ~3-5us on shm and cannot finish in <1us. The message
-            // + arena bookkeeping can never be zero.
-            let min_compute = match name {
-                "BENCH_SQRT" => 10_000,
-                _ => 1_000,
-            };
-            let compute_ns = parse_field(line, "compute_ns=")
-                .unwrap_or_else(|| panic!("{name} line missing compute_ns: {line}"));
-            let transport_ns = parse_field(line, "transport_ns=")
-                .unwrap_or_else(|| panic!("{name} line missing transport_ns: {line}"));
-            if compute_ns < min_compute || transport_ns == 0 {
-                kill_child(&mut lisp);
-                return Err(format!(
-                    "{name} compute/transport split is dead: compute_ns={compute_ns} transport_ns={transport_ns} total={median_ns} (transport={transport}) — the Lisp-side timing or its wire path broke"
-                ));
-            }
-            eprintln!(
-                "[gate] {name} split: compute {compute_ns} ns + transport {transport_ns} ns (total {median_ns} ns, transport={transport}) — OK"
-            );
-        }
     }
 
     kill_child(&mut lisp);
@@ -532,7 +660,10 @@ fn two_process_wasm_lisp_arena_roundtrip() {
     // spawns are wrapped in taskset. All-on-one-core was tried first and
     // serialized the four processes through a single CPU (tcp ADD ~0.7ms ->
     // ~1.8ms, SQRT ~1.5ms -> ~4.6ms — right at the 5ms gate), so distinct
-    // cores keep the numbers honest while still preventing migration.
+    // cores keep the numbers honest while still preventing migration. (That
+    // measurement is why the gate bounds the transport component and not the
+    // total: the single-core numbers are what a starved Lisp side looks
+    // like, and they are a host-topology artifact, not a transport one.)
     // Overridable so CI can pick quiet cores.
     let pin_cpu = std::env::var("POLYGLOT_PIN_CPU").unwrap_or_else(|_| "0".to_string());
     let lisp_pin = std::env::var("POLYGLOT_PIN_LISP_CPU").unwrap_or_else(|_| "1".to_string());
@@ -570,6 +701,12 @@ fn two_process_wasm_lisp_arena_roundtrip() {
 
     // ── launch the kernel transport ──────────────────────────────────────
     let port = free_port();
+    // Armed before the kerneld can create anything (see ShmCleanup): a READY
+    // timeout would otherwise leave an unnameable 64 MiB arena on disk.
+    let mut shm_cleanup = ShmCleanup(vec![
+        format!("/tmp/sls-arena-{port}.bin"),
+        format!("/tmp/sls-chan-{port}.bin"),
+    ]);
     let (mut kerneld, kerneld_out) = spawn_linux(
         &kerneld_bin,
         // 64 MB: the design-doc arena size AND the bitmap capacity of the
@@ -605,9 +742,15 @@ fn two_process_wasm_lisp_arena_roundtrip() {
     };
     let arena_path = field("arena=");
     let chan_path = field("chan=");
+    // READY is authoritative about the paths actually in use; merge rather than
+    // replace, since the deterministic pair is what covers spawn→READY.
+    shm_cleanup.add(arena_path.clone());
+    shm_cleanup.add(chan_path.clone());
 
     // ── latency regression gate (shared by both legs) ────────────────────
-    let max_median_ns: u64 = std::env::var("POLYGLOT_BENCH_MEDIAN_NS")
+    // NS bound on the TRANSPORT component of the add/sqrt/str bench legs
+    // (see the gate's rationale in run_leg), not on the total round trip.
+    let max_transport_ns: u64 = std::env::var("POLYGLOT_BENCH_TRANSPORT_NS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(5_000_000);
@@ -623,7 +766,7 @@ fn two_process_wasm_lisp_arena_roundtrip() {
             &lisp_script,
             &calc_lisp,
             &wasm_bin,
-            max_median_ns,
+            max_transport_ns,
             &pin_cpu,
             &lisp_pin,
             &kerneld_pin,
@@ -647,5 +790,147 @@ fn two_process_wasm_lisp_arena_roundtrip() {
     }
     eprintln!(
         "e2e PASS: wasm(wasmi) -> lisp(SBCL) -> wasm over tcp + shm transports, arena={arena_path}"
+    );
+}
+
+/// The shm cleanup guard must unlink every path it was given, and must
+/// tolerate one that is already gone (the kerneld's signal handler can beat
+/// it to the unlink). Hermetic — no transport, no kerneld.
+#[test]
+fn shm_cleanup_unlinks_both_paths() {
+    let dir = std::env::temp_dir();
+    let a = dir.join(format!("sls-cleanup-test-a-{}.bin", std::process::id()));
+    let b = dir.join(format!("sls-cleanup-test-b-{}.bin", std::process::id()));
+    for p in [&a, &b] {
+        std::fs::write(p, b"x").expect("write fixture");
+    }
+    assert!(a.exists() && b.exists(), "fixtures must exist first");
+
+    {
+        let _guard = ShmCleanup(vec![
+            a.to_string_lossy().to_string(),
+            b.to_string_lossy().to_string(),
+        ]);
+    }
+    assert!(
+        !a.exists() && !b.exists(),
+        "the guard must unlink both shm files"
+    );
+
+    // A path already removed (or never created) must be tolerated silently:
+    // cleanup must not turn a missing file into a failure.
+    let _guard = ShmCleanup(vec![a.to_string_lossy().to_string()]);
+    drop(_guard);
+}
+
+/// The guard is armed from the port before the kerneld runs, so the pair it is
+/// given up front must be removable on its own — and merging READY's values
+/// afterwards must not double up the same path.
+#[test]
+fn shm_cleanup_add_merges_without_duplicates() {
+    let dir = std::env::temp_dir();
+    let p = dir.join(format!("sls-cleanup-test-c-{}.bin", std::process::id()));
+    let path = p.to_string_lossy().to_string();
+    std::fs::write(&p, b"x").expect("write fixture");
+
+    let mut guard = ShmCleanup(vec![path.clone()]);
+    guard.add(path.clone()); // READY names the same path the port predicted
+    assert_eq!(guard.0.len(), 1, "the same path must not be tracked twice");
+
+    let other = dir.join(format!("sls-cleanup-test-d-{}.bin", std::process::id()));
+    let other_s = other.to_string_lossy().to_string();
+    std::fs::write(&other, b"x").expect("write fixture");
+    guard.add(other_s.clone());
+    assert_eq!(guard.0.len(), 2, "a distinct READY path must be added");
+    drop(guard);
+    assert!(
+        !p.exists() && !other.exists(),
+        "the guard must unlink every tracked path, added or initial"
+    );
+}
+
+/// The leak fix's structural tooth: kill the kerneld at points spanning its
+/// whole creation window and assert it leaves nothing on disk.
+///
+/// This is the window the previous scheme could not cover. The handler was
+/// installed only once *both* files existed, and the arena file was created by
+/// name, so a SIGTERM arriving during the 64 MiB `ftruncate` + arena init hit
+/// the default disposition and left the arena behind — exactly what the
+/// 0/2/5 ms delays below land on. Now the handler is installed before the
+/// first create and the files are created unnamed and linked last, so there is
+/// no moment at which a name exists untracked. A SIGKILL cannot run a handler,
+/// which is why the anonymous create is the part that covers it.
+///
+/// The kill lands asynchronously, so the tooth does not assert *how far* the
+/// kerneld got — only that no combination of timing leaves a file. Errors that
+/// would masquerade as a leak (a port that another process grabbed, making the
+/// kerneld panic after it published) are avoided by drawing each port from
+/// `free_port()`.
+#[test]
+fn kerneld_killed_during_creation_leaves_no_shm_files() {
+    if !using_wsl() && std::env::consts::OS != "linux" {
+        eprintln!("SKIP: this tooth needs a Linux environment (WSL on Windows, native on CI)");
+        return;
+    }
+    let target_dir = std::env::var("POLYGLOT_TARGET_DIR")
+        .unwrap_or_else(|_| "/tmp/polyglot-target".to_string());
+    let kerneld_bin = format!("{target_dir}/release/sls-kerneld");
+    let have_bin = linux_sh(&format!("test -x {kerneld_bin} && echo _OK"))
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("_OK"))
+        .unwrap_or(false);
+    if !have_bin {
+        eprintln!(
+            "SKIP: sls-kerneld not built at {kerneld_bin} — the kill-during-creation tooth did not run"
+        );
+        return;
+    }
+
+    // 0 ms is before the handler is installed and before the first create;
+    // 2-20 ms land inside the ftruncate + arena init; 50-150 ms land after the
+    // files are published and the service is live. All must clean up.
+    let ports: Vec<String> = (0..7).map(|_| free_port().to_string()).collect();
+    let script = format!(
+        r#"
+set -u
+BIN={kerneld_bin}
+delays="0 0.002 0.005 0.010 0.020 0.050 0.150"
+set -- {ports}
+leaks=0
+for d in $delays; do
+  port=$1
+  shift
+  err=/tmp/sls-tooth-$port.err
+  rm -f "/tmp/sls-arena-$port.bin" "/tmp/sls-chan-$port.bin"
+  "$BIN" --port "$port" --arena-size 64 >/dev/null 2>"$err" &
+  pid=$!
+  sleep "$d"
+  kill -TERM "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null
+  for f in "/tmp/sls-arena-$port.bin" "/tmp/sls-chan-$port.bin"; do
+    if [ -e "$f" ]; then
+      echo "LEAK delay=$d port=$port file=$f"
+      sed -n '1,3p' "$err"
+      leaks=$(( leaks + 1 ))
+      rm -f "$f"
+    fi
+  done
+  rm -f "$err"
+done
+if [ "$leaks" -eq 0 ]; then echo TOOTH_OK; else echo "TOOTH_FAIL leaks=$leaks"; fi
+"#,
+        kerneld_bin = kerneld_bin,
+        ports = ports.join(" ")
+    );
+    let out = linux_sh(&script).output().expect("run the kill-during-creation tooth");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    eprintln!("{text}");
+    assert!(
+        text.contains("TOOTH_OK"),
+        "the kerneld left a shm file behind when killed during creation:\n{text}"
     );
 }
