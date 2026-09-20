@@ -83,11 +83,53 @@
 #                         reject never logs; the step-12 reject gate must bite)
 #   silent      -> ABORT (no cluster.pids at all; the guard must say how to
 #                         start one)
+#   latecreate  -> PASS  (the fakes are idled past EVERY wait the old fakes
+#                         carried before the guard is even started, and the
+#                         create announce still reaches both followers)
+#   leadergap   -> PASS  (the leader is UNREACHABLE for a bounded window
+#                         right after the create -- a busy leader, not a
+#                         dead one -- and no survivor may declare it dead)
 #
 # The last five matter as much as the first: a guard that cannot fail is a
 # guard that has never been seen to work. And a PASS that never killed the
 # leader would prove nothing, so the adopted tooth asserts the leader's
 # fake pid is actually dead after the run.
+#
+# The latecreate tooth exists because the FAKES were deciding verdicts. The
+# fakes used to bound each wait with a fixed iteration count (200 x 0.05s =
+# 10s to learn the create announce, 600 x 0.05s = 30s for the death/claim/
+# migrate events, 900 x 0.05s = 45s for the service declares). Those clocks
+# start when the FAKE process starts and run alongside the guard's own
+# FAST-scaled gates, and the learn one was exactly the guard's WAIT_NODES
+# pre-create budget (10s) -- so on 2026-09-20 CI failed nockpt and lateflip
+# with "nodes 2/3 never learned partition": exactly one follower empty, the
+# other learned, the mutation's own gate never reached. Nothing about the
+# kernel path was wrong; a fake-side timer expired during the guard's own
+# cluster-forming budget. The fake's waits are now life-bounded (see the
+# rule at the top of failover_adoption_smoke_nodes.py), and this tooth is
+# the control for it: it idles the fakes ${LATE_IDLE}s -- past every old cap,
+# including the 45s one -- before running the guard in the plain adopted
+# mode, so with a fake-side budget restored it fails at that same learn
+# gate, and with none it passes for its own reason. A run that wants to skip
+# the idle (a tight local loop) can set AEROSLS_FAILOVER_SMOKE_LATE_IDLE=0.
+#
+# The leadergap tooth exists because TIMEOUTS were deciding verdicts -- the
+# second face of the same rule. The fakes' servers were single-threaded, so
+# concurrent pollers queued behind each other; every client has a short
+# timeout (the survivor's own 0.5s leader poll, the guard's curl --max-time
+# 3, this smoke's --max-time 1), and a survivor read a few late answers as
+# DEATH -- three failed polls, ~2.3s -- then transitioned, which made the
+# guard read its row as "never learned". That is not hypothetical: it is
+# what CI hit on 2026-09-20, and what three smokes at once reproduced here.
+# Two changes fix it, and this tooth is the control for both: the fakes now
+# serve concurrently (ThreadingHTTPServer, so nothing queues up to time out
+# behind) and death needs DEAD_SILENCE=4s of CONTINUOUS unreachability,
+# matching the property being modelled (failover_tick's "silent >=
+# FAILOVER_DEAD_TICKS", a duration). The tooth makes the leader answer
+# /api/health only ${LEADER_GAP}s after the create: longer than the old
+# 3-strikes burst (~2.3s) and shorter than the silence floor, so it fails
+# with the old rule and passes with the new one by construction.
+# AEROSLS_FAILOVER_SMOKE_LEADER_GAP tunes the window.
 #
 # Runs on a port base far from any real cluster and never touches a running
 # one: the guard's pid file lives in a private temp dir (AEROSLS_CLUSTER_DIR),
@@ -101,6 +143,17 @@ cd "$(dirname "$0")/.."
 GUARD=tests/failover_adoption_live_check.sh
 FAKE=tests/failover_adoption_smoke_nodes.py
 BASE=59200
+# The latecreate tooth's idle, in seconds. 50 > every wait the pre-fix fakes
+# could hold (the longest was 900 x 0.05s = 45s), so the tooth's point holds
+# by construction; 0 disables the idle (it does NOT disable the tooth, which
+# then still proves the plain adopted path).
+LATE_IDLE="${AEROSLS_FAILOVER_SMOKE_LATE_IDLE:-50}"
+# The leadergap tooth's unreachability window, in seconds. It must be
+# LONGER than the "3 failed polls" burst the fake's old death rule fired on
+# (~2.3s: four 0.5s timeouts) and SHORTER than the sustained-silence floor
+# that replaced it (DEAD_SILENCE=4s in the fake), so it fails with the old
+# rule and passes with the new one by construction.
+LEADER_GAP="${AEROSLS_FAILOVER_SMOKE_LEADER_GAP:-3}"
 
 [ -f "$GUARD" ] || { echo "ABORT: $GUARD not found or not executable."; exit 2; }
 [ -f "$FAKE" ]  || { echo "ABORT: $FAKE not found."; exit 2; }
@@ -142,9 +195,14 @@ cleanup() { cleanup_fakes; [ -n "$STATE" ] && rm -rf "$STATE"; rm -rf "$SMOKE_CL
 trap cleanup EXIT
 
 # $1 = mode, $2 = expected exit, $3 = a phrase the output must contain,
-# $4 = label
+# $4 = label, $5 = optional seconds to idle the fakes before the guard runs
+#      (the latecreate tooth's control: nothing about the kernel path
+#      changes, so the tooth can only fail if a FAKE-side clock decided it)
+# $6 = optional seconds of leader unreachability after the create (the
+#      leadergap tooth's control: a bounded episode a real death rule
+#      survives, but a "few failed polls" rule does not)
 tooth() {
-    local mode="$1" want_rc="$2" want_txt="$3" label="$4"
+    local mode="$1" want_rc="$2" want_txt="$3" label="$4" delay="${5:-0}" gap="${6:-0}"
     local out rc
     cleanup_fakes
     [ -n "$STATE" ] && rm -rf "$STATE"
@@ -185,11 +243,29 @@ tooth() {
     done
     printf '1 %s\n2 %s\n3 %s\n' "$lpid" "$f1pid" "$f2pid" > "$PID_FILE"
 
+    if [ "$delay" != 0 ]; then
+        echo "  note: idling the fakes ${delay}s before the guard runs (the tooth's point)"
+        sleep "$delay"
+    fi
+    if [ "$gap" != 0 ]; then
+        echo "  note: the leader will go unreachable for ${gap}s after the create (the tooth's point)"
+        echo "$gap" > "$STATE/health_gap"
+    fi
+
     out="$(AEROSLS_HTTP_BASE=$BASE AEROSLS_FAILOVER_FAKE=1 \
            AEROSLS_FAILOVER_FAST=1 AEROSLS_LOG_DIR=$STATE bash "$GUARD" 2>&1)"
     rc=$?
 
-    if [ "$mode" = "adopted" ] || [ "$mode" = "svc_stable" ]; then
+    # The hygiene check below asks "did this PASS mean what it claims", so it
+    # may only run when the guard actually passed. Running it after a failure
+    # reports the consequence instead of the cause: an abort at an earlier
+    # gate (the learn gate, say) leaves the leader alive, and that would be
+    # reported as "guard passed, but the leader was never killed" -- hiding
+    # the guard's real verdict.
+    local guard_passed=0
+    case "$out" in *PASS*) guard_passed=1 ;; esac
+    if { [ "$mode" = "adopted" ] || [ "$mode" = "svc_stable" ]; } \
+            && [ "$rc" -eq 0 ] && [ "$guard_passed" -eq 1 ]; then
         # A PASS that never killed the leader proves nothing: the whole
         # point is that the ADOPTION happens after the leader dies.
         if kill -0 "$lpid" 2>/dev/null; then
@@ -217,6 +293,8 @@ tooth() {
 }
 
 tooth adopted          0 "PASS"      "adopted -> PASS (and the leader was really killed)"
+tooth adopted          0 "PASS"      "latecreate -> PASS (the fakes idled ${LATE_IDLE}s first — past every wait the old fakes carried — and the create announce still reached both followers)" "$LATE_IDLE"
+tooth adopted          0 "PASS"      "leadergap -> PASS (the leader was unreachable for ${LEADER_GAP}s after the create — a bounded episode, not silence — and no survivor declared it dead)" 0 "$LEADER_GAP"
 tooth notadopted       1 "never adopted" "notadopted -> FAIL (the leader leads but the adoption never fires)"
 tooth nolearn          1 "never learned" "nolearn -> FAIL (the create announce did not arrive)"
 tooth nockpt           1 "no checkpoint" "nockpt -> FAIL (the checkpoint never carried the row)"

@@ -70,6 +70,32 @@ Modes (written to <statedir>/mode by the smoke):
 The no-cluster tooth starts NO fakes at all.
 """
 
+# ─── The fake must never be the binding clock ─────────────────────────────
+# The guard scales its own patience down for the smoke
+# (AEROSLS_FAILOVER_FAST=1: WAIT_NODES=10s, WAIT_LEARN=6s, WAIT_CKPT=6s,
+# WAIT_OBSERVER=8s). The waits below used to carry fixed iteration caps of
+# their own -- 200 x 0.05s = 10s for the create announce and the lease row,
+# 600 x 0.05s = 30s for the death poll -- budgets that have nothing to do
+# with the guard's, start when the PROCESS starts, and therefore compete
+# with the guard's whole fast path. The learn cap was exactly the guard's
+# WAIT_NODES pre-create budget, so a host that spent its whole allowance
+# forming the cluster put the create announce at the cap's edge and the
+# survivor stopped listening before the guard had created the partition.
+# failover_adoption_live_smoke.sh paid for exactly that in CI on 2026-09-20
+# (nockpt and lateflip failed with "nodes 2/3 never learned partition" while
+# their own gates had budget to spare); this smoke and these fakes share the
+# shape and had simply not been caught yet.
+#
+# So every wait here on an event the guard's gates depend on is bounded by
+# the process's LIFE, not by a counter: the only clock that may decide a
+# tooth is the guard's. The modelled negatives (nolearn, nockpt,
+# nolearnlease, ...) are mode/event-gated and still return without logging
+# their line, so they still fail the GUARD's gate -- the property under
+# test -- rather than racing a fake-side timer. The control is this smoke's
+# "latecreate" tooth, which idles the fakes past every old cap before the
+# guard is even started. Full rationale and the CI evidence: the same rule
+# block at the top of tests/failover_adoption_smoke_nodes.py.
+
 import http.server
 import json
 import os
@@ -123,6 +149,15 @@ def leader_port():
     return port - node_id + leader_id
 
 
+# The modelled property is failover_tick's "silent >= FAILOVER_DEAD_TICKS"
+# (300 ticks) -- a DURATION of unreachability, not a count of failed
+# requests. A poll that timed out because the leader was busy answering
+# somebody else is not silence, so death needs DEAD_SILENCE seconds of
+# CONTINUOUS unreachability (see death_thread). Full story in
+# tests/failover_adoption_smoke_nodes.py.
+DEAD_SILENCE = 4.0
+
+
 def leader_alive():
     try:
         with urllib.request.urlopen(
@@ -145,12 +180,13 @@ def rx_thread():
     global learned
     if role != "follower":
         return
+    # Life-bounded, not counter-bounded (see the rule at the top of this
+    # file): the create announce can arrive at any point in the guard's run.
     row = None
-    for _ in range(200):
+    while row is None:
         row = read_created()
-        if row:
-            break
-        time.sleep(0.05)
+        if row is None:
+            time.sleep(0.05)
     if row and mode != "nolearn":
         log(learn_line(row, leader_id))
         learned = True   # learned regardless of nockpt: the learn gate
@@ -173,9 +209,9 @@ def lease_rx_thread():
     global lease_held_survivor
     if role != "follower":
         return
-    for _ in range(200):
-        if os.path.exists(lease):
-            break
+    # Life-bounded: the guard's lease phase runs after its own
+    # cluster-forming and learn gates.
+    while not os.path.exists(lease):
         time.sleep(0.05)
     if os.path.exists(lease) and mode != "nolearnlease":
         # A lease row exists but the survivor does NOT hold it -- the
@@ -198,59 +234,62 @@ def death_thread():
     global transitioned, flipped
     if role != "follower":
         return
-    for _ in range(600):
-        if not leader_alive():
-            # 3 consecutive failures to avoid a transient blip.
-            ok = True
-            for _ in range(3):
-                if leader_alive():
-                    ok = False
-                    break
-                time.sleep(0.1)
-            if not ok:
-                time.sleep(0.2)
-                continue
-            transitioned = True
-            log("[FAILOVER] Node %u declared DEAD (silent 300 ticks)" % leader_id)
-            # The write-lease strip: the survivor campaigns for the lease
-            # (its row times out, update_page_table_permissions_for_
-            # partition(pid, 1)) -- logged unless leasestrip suppresses it.
-            if mode != "leasestrip":
-                log("[MMU-LEASE] partition 1: page permissions force_read_only=1")
-            if mode == "leaserestore":
-                # The bug: a 2-node survivor that "wins" the 2-of-2 lease
-                # quorum and restores write permission. The guard's restore
-                # gate must catch this line.
-                log("[MMU-LEASE] partition 1: page permissions force_read_only=0")
-            if mode == "leasehold":
-                # The bug at the API level: partition_holds_write_lease()
-                # returning true on the survivor. The guard's holds_lease
-                # watch must catch it.
-                with lock:
-                    global lease_held_survivor
-                    lease_held_survivor = True
-            row = read_created()
-            if mode == "adopts":
-                # The bug: a FOLLOWER that recovered. cluster_is_leader()
-                # should have gated recovery to the leader (which a lone
-                # 2-node survivor can never become); the guard's step-7 log
-                # check must catch the Adopted line.
-                if row:
-                    log("[FAILOVER] Adopted partition %s from dead node %u"
-                        % (row["id"], leader_id))
-                    log("[FAILOVER] recovery for dead node %u: rc=0 (OK - adopted)"
-                        % leader_id)
-            if mode == "flipsleader":
-                # The other bug: a late second leader. Delay so a naive
-                # first-poll check would miss it; only a watch that HOLDS
-                # the full window can catch the flip.
-                def flip():
-                    global flipped
-                    time.sleep(1.5)
-                    flipped = True
-                threading.Thread(target=flip, daemon=True).start()
-            return
-        time.sleep(0.2)
+    # Life-bounded: the guard SIGKILLs the leader after its own gates have
+    # run, and this poll must still be listening when it does.
+    # Sustained silence, not "3 strikes": three failed polls can be a busy
+    # leader, and a declaration made on them flips this survivor's state
+    # before the guard has killed anything.
+    silent_since = None
+    while True:
+        if leader_alive():
+            silent_since = None
+            time.sleep(0.2)
+            continue
+        if silent_since is None:
+            silent_since = time.monotonic()
+        if time.monotonic() - silent_since < DEAD_SILENCE:
+            time.sleep(0.1)
+            continue
+        transitioned = True
+        log("[FAILOVER] Node %u declared DEAD (silent 300 ticks)" % leader_id)
+        # The write-lease strip: the survivor campaigns for the lease
+        # (its row times out, update_page_table_permissions_for_
+        # partition(pid, 1)) -- logged unless leasestrip suppresses it.
+        if mode != "leasestrip":
+            log("[MMU-LEASE] partition 1: page permissions force_read_only=1")
+        if mode == "leaserestore":
+            # The bug: a 2-node survivor that "wins" the 2-of-2 lease
+            # quorum and restores write permission. The guard's restore
+            # gate must catch this line.
+            log("[MMU-LEASE] partition 1: page permissions force_read_only=0")
+        if mode == "leasehold":
+            # The bug at the API level: partition_holds_write_lease()
+            # returning true on the survivor. The guard's holds_lease
+            # watch must catch it.
+            with lock:
+                global lease_held_survivor
+                lease_held_survivor = True
+        row = read_created()
+        if mode == "adopts":
+            # The bug: a FOLLOWER that recovered. cluster_is_leader()
+            # should have gated recovery to the leader (which a lone
+            # 2-node survivor can never become); the guard's step-7 log
+            # check must catch the Adopted line.
+            if row:
+                log("[FAILOVER] Adopted partition %s from dead node %u"
+                    % (row["id"], leader_id))
+                log("[FAILOVER] recovery for dead node %u: rc=0 (OK - adopted)"
+                    % leader_id)
+        if mode == "flipsleader":
+            # The other bug: a late second leader. Delay so a naive
+            # first-poll check would miss it; only a watch that HOLDS
+            # the full window can catch the flip.
+            def flip():
+                global flipped
+                time.sleep(1.5)
+                flipped = True
+            threading.Thread(target=flip, daemon=True).start()
+        return
 
 
 threading.Thread(target=death_thread, daemon=True).start()
@@ -375,6 +414,13 @@ class H(http.server.BaseHTTPRequestHandler):
         pass
 
 
-srv = http.server.HTTPServer(("127.0.0.1", port), H)
+# ThreadingHTTPServer, not HTTPServer: the plain server handles ONE request
+# at a time, so concurrent pollers queue and any client timeout (the
+# follower's own 0.5s leader poll, the guard's curl, the smoke's curl)
+# becomes a verdict -- e.g. a follower declaring the leader DEAD while it is
+# answering someone else. A real kernel answers concurrently, so this is the
+# faithful model too. Full story in the same place in
+# tests/failover_adoption_smoke_nodes.py.
+srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), H)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 time.sleep(600)

@@ -25,7 +25,12 @@ def serve(port, status, payload):
             s.end_headers()
             s.wfile.write(payload.encode())
         def log_message(s, *a): pass
-    srv = http.server.HTTPServer(("127.0.0.1", port), H)
+    # ThreadingHTTPServer, not HTTPServer: the plain server handles ONE
+    # request at a time, so three nodes polled concurrently (and beside a
+    # loaded host) can queue behind each other and turn a client timeout
+    # into "this node never answered". Full story in
+    # tests/failover_adoption_smoke_nodes.py.
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
 
 for i in (1, 2, 3):

@@ -123,6 +123,11 @@ class H(http.server.BaseHTTPRequestHandler):
         pass
 
 
-srv = http.server.HTTPServer(("127.0.0.1", port), H)
+# ThreadingHTTPServer, not HTTPServer: the plain server handles ONE request
+# at a time, so a busy fake can make a concurrent poller's short timeout
+# look like "this node never answered" -- a verdict decided by a clock
+# rather than by the modelled property. Full story in
+# tests/failover_adoption_smoke_nodes.py.
+srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), H)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 time.sleep(600)

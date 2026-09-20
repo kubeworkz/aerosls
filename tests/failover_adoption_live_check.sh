@@ -475,12 +475,14 @@ echo "==> waiting for a survivor to adopt '$NAME' from the dead leader (up to ${
 adopter=""; observer=""
 deadline=$(( $(date +%s) + WAIT_ADOPT ))
 while :; do
-    adopt1=""; adopt2=""
+    adopt1=""; adopt2=""; seen1=0; seen2=0
     if get200 "$F1_PORT" /api/cluster; then
+        seen1=1
         r1="$(jget "$FETCH_BODY" role)"
         [ "$r1" = "LEADER" ] && adopt1=1
     fi
     if get200 "$F2_PORT" /api/cluster; then
+        seen2=1
         r2="$(jget "$FETCH_BODY" role)"
         [ "$r2" = "LEADER" ] && adopt2=1
     fi
@@ -491,8 +493,9 @@ while :; do
        unrecoverable state -- stop it and inspect the consensus logs."
     fi
     if [ -n "$adopt1" ] || [ -n "$adopt2" ]; then
-        can=""; ob=""
-        if [ -n "$adopt1" ]; then can="$f1"; ob="$f2"; else can="$f2"; ob="$f1"; fi
+        can=""; ob=""; other_seen=0
+        if [ -n "$adopt1" ]; then can="$f1"; ob="$f2"; other_seen="$seen2"
+        else can="$f2"; ob="$f1"; other_seen="$seen1"; fi
         CAN_LOG="$LOG_DIR/node$can.log"
         dead_line="$(last_line "$CAN_LOG" "FAILOVER] Node $leader declared DEAD")"
         adopt_line="$(last_line "$CAN_LOG" "FAILOVER] Adopted partition.*dead node $leader")"
@@ -501,9 +504,17 @@ while :; do
         if get200 "$((HTTP_BASE + can))" /api/partitions; then
             owned="$(row_if "$FETCH_BODY" "$NAME" "$can")"
         fi
+        # Accept the candidate only when the OTHER survivor's role was
+        # actually READ this pass and was not LEADER. An unreadable role is
+        # not evidence of "no second leader": accepting a candidate on a
+        # transient fetch failure is exactly how a real split-brain slips
+        # past this gate and surfaces at a LATER step with the wrong message
+        # (observed: the splitbrain smoke tooth failed at the service gate
+        # instead of here). Until the other side is readable the loop keeps
+        # polling, which is what the deadline is for.
         if [ -n "$dead_line" ] && [ -n "$adopt_line" ] \
            && [ "$adopt_line" -gt "$dead_line" ] && [ -n "$rec_line" ] \
-           && [ -n "$owned" ]; then
+           && [ -n "$owned" ] && [ "$other_seen" -eq 1 ]; then
             adopter="$can"; observer="$ob"; break
         fi
     fi
