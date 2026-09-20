@@ -60,7 +60,11 @@ Modes (written to <statedir>/mode by the smoke):
     nockpt        followers learn but no checkpoint flows -> guard FAIL at
                   the checkpoint gate
     splitbrain    BOTH survivors become leader at once -> guard FAIL at the
-                  step-7 simultaneous split-brain check
+                  split-brain check: the step-7 simultaneous-lead read when
+                  one poll happens to catch both, and otherwise the
+                  two-owner read the later gates ask (each survivor serves
+                  the partition as its own, so a poll that straddles the two
+                  flips cannot decide the verdict or its message)
     observeradopts  node 2 adopts normally, but node 3 (the observer) ALSO
                   prints the Adopted line while staying FOLLOWER -- a
                   follower that recovered -> guard FAIL at the step-9

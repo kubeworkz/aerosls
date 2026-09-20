@@ -197,6 +197,44 @@ get200() {   # $1 = port, $2 = path
     esac
 }
 
+# ─── the split-brain detector ─────────────────────────────────────────────
+# split_brain_now <adopter> <observer> -- true when the observer serves
+# '$NAME' as its OWN while the adopter still serves it as its own: two
+# owners of one partition.
+#
+# Why this exists next to step 7's simultaneous-lead check: that check only
+# fires when ONE poll reads BOTH survivors as LEADER, but the two fakes flip
+# on their own timers ~4s after the kill, so the poll routinely straddles
+# them (the fake's `splitbrain` mode is the same mutation). When it does,
+# the guard accepts the adopter, and the SECOND owner then surfaces at
+# whichever gate polls next -- observed on CI as step 8 reporting "node 3
+# never saw the owner handoff", i.e. the right verdict with the wrong cause
+# (and a different gate under different timing). Ownership, unlike the role,
+# is durable: once a survivor serves '$NAME' with itself as the owner while
+# the adopter serves it too, that cannot un-happen, so asking ownership
+# removes the race from the verdict. Both reads must be positive, so a fetch
+# failure can never manufacture it.
+split_brain_now() {
+    get200 "$((HTTP_BASE + $2))" /api/partitions || return 1
+    SB_CLAIM_BODY="$FETCH_BODY"
+    [ -n "$(row_if "$SB_CLAIM_BODY" "$NAME" "$2")" ] || return 1
+    get200 "$((HTTP_BASE + $1))" /api/partitions || return 1
+    [ -n "$(row_if "$FETCH_BODY" "$NAME" "$1")" ]
+}
+
+fail_split_brain() {   # $1 = adopter, $2 = the survivor that claimed it too
+    fail "both survivors own partition '$NAME' at once -- split-brain:
+       $2 serves it as its OWN (owner node $2) while $1 still serves it as
+       the adopter (owner node $1). A partition must have exactly one owner,
+       and only the elected leader recovers it, so this is a SECOND OWNER,
+       not a replication hiccup: a follower flipped to leader and claimed
+       the partition as well. Which gate reports it depends on where the
+       second claim lands, so the verdict is asked at every gate the second
+       owner can derail -- it must never masquerade as a lost handoff or an
+       unresolved service. $2's list held:
+$(dump_rows "$SB_CLAIM_BODY")"
+}
+
 jget() {
     python3 - "$1" "$2" <<'PY'
 import json, sys
@@ -562,6 +600,12 @@ while :; do
         fi
     done
     [ "$r_ok" -eq 1 ] && { svc_adopt_ok=1; break; }
+    # A second owner derails this gate FIRST under some timing: the observer
+    # resolves the service to itself (service ownership derives from the
+    # partition owner), so the gate would report "never resolved to the
+    # adopter" for a split-brain. Ask the durable question here too (see
+    # split_brain_now()).
+    split_brain_now "$adopter" "$observer" && fail_split_brain "$adopter" "$observer"
     [ "$(date +%s)" -ge "$deadline" ] && break
     sleep "$POLL"
 done
@@ -580,8 +624,13 @@ handoff=""
 deadline=$(( $(date +%s) + WAIT_HANDOFF ))
 while :; do
     if get200 "$((HTTP_BASE + observer))" /api/partitions; then
-        handoff="$(row_if "$FETCH_BODY" "$NAME" "$adopter")"
+        OB_BODY="$FETCH_BODY"
+        handoff="$(row_if "$OB_BODY" "$NAME" "$adopter")"
         [ -n "$handoff" ] && break
+        # The observer may instead hold '$NAME' as its OWN: the split-brain
+        # shape, which must not be reported as a lost handoff (see
+        # split_brain_now()).
+        split_brain_now "$adopter" "$observer" && fail_split_brain "$adopter" "$observer"
     fi
     [ "$(date +%s)" -ge "$deadline" ] && break
     sleep "$POLL"
