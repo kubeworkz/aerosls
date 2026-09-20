@@ -28,9 +28,12 @@ use aerosls_shared_arena::{Arena, FLAG_BINARY};
 use polyglot::ring;
 use polyglot::transport::*;
 use std::collections::{HashMap, VecDeque};
+use std::ffi::CString;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::io::AsRawFd;
+use std::ptr;
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
@@ -210,6 +213,62 @@ struct Kernel {
     ready: Condvar,
 }
 
+/// The shm files this process created, published for the signal handler to
+/// unlink. Written once at startup and only read afterwards, so the handler
+/// touches nothing but two pointers — `unlink` itself is async-signal-safe.
+static SHM_PATHS: [AtomicPtr<libc::c_char>; 2] = [
+    AtomicPtr::new(ptr::null_mut()),
+    AtomicPtr::new(ptr::null_mut()),
+];
+
+/// Unlink the arena + channel files and exit.
+///
+/// The handler is installed before either file is named (see main), so it is
+/// also the path a signal takes when nothing exists yet: `unlink` of a
+/// non-existent path is a harmless ENOENT. That is what makes the install
+/// ordering safe rather than merely early.
+///
+/// The e2e removes these files at its own teardown too, since it may SIGKILL
+/// this process (which no handler can catch — and which the anonymous create
+/// in `ring::open_unnamed` covers for the whole creation window, because a
+/// file with no name cannot be leaked). SIGTERM/SIGINT are the signals a run
+/// can actually catch.
+extern "C" fn unlink_shm_and_exit(sig: libc::c_int) {
+    for slot in SHM_PATHS.iter() {
+        let p = slot.load(Ordering::SeqCst);
+        if !p.is_null() {
+            // SAFETY: each pointer is a leaked CString that outlives the
+            // process (nothing frees it before exit), and unlink() is
+            // async-signal-safe.
+            unsafe { libc::unlink(p) };
+        }
+    }
+    unsafe { libc::_exit(128 + sig) };
+}
+
+/// Install `unlink_shm_and_exit` for SIGTERM/SIGINT and remember the two
+/// paths it must remove. Called before the files are created, so no signal
+/// timing can leave one behind.
+fn install_shm_cleanup(arena_path: &str, chan_path: &str) {
+    for (slot, path) in SHM_PATHS.iter().zip([arena_path, chan_path]) {
+        match CString::new(path) {
+            Ok(c) => {
+                slot.store(c.into_raw(), Ordering::SeqCst);
+            }
+            Err(_) => eprintln!("[shm-cleanup] path contains a NUL, not tracked: {path}"),
+        }
+    }
+    // SAFETY: sa_sigaction is set to an extern "C" fn of the right shape and
+    // the mask is cleared; sigaction only reads the struct.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = unlink_shm_and_exit as *const () as usize;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(libc::SIGTERM, &sa, ptr::null_mut());
+        libc::sigaction(libc::SIGINT, &sa, ptr::null_mut());
+    }
+}
+
 fn main() {
     let mut port = 0u16;
     let mut arena_size_mb = 16u32;
@@ -237,32 +296,37 @@ fn main() {
     let arena_size = arena_size_mb * 1024 * 1024;
     let chan_path = chan_path.unwrap_or_else(|| format!("/tmp/sls-chan-{port}.bin"));
 
-    // Create + size the arena file, then map it and initialize the REAL
-    // shared-arena allocator over it (bitmap page allocator + atomic
-    // refcount headers, in the shared file both sidecars map). The kernel
-    // now drives allocation/reclamation through this allocator instead of a
-    // bump cursor; the sidecars still read/write the data pages directly.
-    let arena_fd = {
-        use std::os::unix::fs::OpenOptionsExt;
-        let f = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_CLOEXEC)
-            .open(&arena_path)
-            .unwrap_or_else(|e| panic!("arena file {arena_path}: {e}"));
-        f.set_len(arena_size as u64).expect("ftruncate arena");
-        f.sync_all().ok();
-        f
-    };
+    // Install the cleanup handler *before* either file can be named. Both
+    // paths are already known here and never change, so a signal arriving at
+    // any point — before the first create, mid-ftruncate, or after READY —
+    // finds its path tracked and removes whatever exists. (A signal before
+    // this line cannot leak either: no name has been created yet.)
+    install_shm_cleanup(&arena_path, &chan_path);
+
+    // Create + size the arena, map it, and initialize the REAL shared-arena
+    // allocator over it (bitmap page allocator + atomic refcount headers, in
+    // the shared file both sidecars map). The kernel now drives
+    // allocation/reclamation through this allocator instead of a bump cursor;
+    // the sidecars still read/write the data pages directly.
+    //
+    // The file is created *unnamed* and linked into place last (see
+    // ring::open_unnamed), so the expensive part — 64 MiB of ftruncate plus
+    // the arena init — happens with no name on disk. Neither a caught signal
+    // nor a SIGKILL during creation can leave a partial 64 MiB file behind,
+    // and no reader can map a half-initialized arena. The unnamed inode is
+    // mapped by fd; the sidecars map the linked name after READY.
+    let mut pending_arena = ring::open_unnamed(&arena_path)
+        .unwrap_or_else(|e| panic!("arena file {arena_path}: {e}"));
+    let arena_file = pending_arena.file();
+    arena_file.set_len(arena_size as u64).expect("ftruncate arena");
+    arena_file.sync_all().ok();
     let arena_base = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
             arena_size as usize,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_SHARED,
-            arena_fd.as_raw_fd(),
+            arena_file.as_raw_fd(),
             0,
         )
     };
@@ -273,6 +337,9 @@ fn main() {
             .init(arena_base as *mut u8, arena_size as usize)
             .expect("shared-arena init");
     }
+    pending_arena
+        .publish()
+        .unwrap_or_else(|e| panic!("link arena {arena_path}: {e}"));
 
     let kernel = Arc::new(Kernel {
         state: Mutex::new(KernelState {
@@ -291,6 +358,8 @@ fn main() {
     // request/reply pair against this process, so no TCP round trip remains
     // in the sidecar-to-kernel path either. The TCP listener below still
     // serves the tcp transport leg of the e2e.
+    // The channel is created the same way — sized and header-stamped while
+    // unnamed, then linked into place (see ring::create_channel).
     ring::create_channel(&chan_path).expect("create channel shm");
 
     // Arena ring threads: wasm sidecar requests (ring2 → ring3 replies),

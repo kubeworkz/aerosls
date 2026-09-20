@@ -140,6 +140,54 @@ fn cycles_to_ns(cycles: u64) -> u64 {
     (cycles as f64 / cpn) as u64
 }
 
+/// Median of the per-sample transport differences, i.e. the median of
+/// `cycles_to_ns(total_cy[i]) - compute_ns[i]` over the index-aligned pairs
+/// (clamped at 0, since a Lisp clock running ahead of the wasm calibration
+/// would otherwise read negative).
+///
+/// Deliberately NOT `p50(total) - p50(compute)`. Both vectors are filled in
+/// the same call order, so the per-sample subtraction keeps each call's total
+/// and its compute together; taking a median of each series first instead
+/// pairs two order statistics drawn from two independently sorted vectors.
+/// Measured over the six gated legs in one idle run (ns), the paired median
+/// is the same or lower: ADD/tcp 257159 vs 257159, SQRT/tcp 486761 vs
+/// 494268, STR/tcp 696878 vs 696878, ADD/shm 3732 vs 3913, SQRT/shm 26982 vs
+/// 31228, STR/shm 9595 vs 9640 — i.e. the difference of medians was mildly
+/// overstating the transport on the compute-heavier legs.
+///
+/// What pairing does NOT fix: the two timings come from two clock domains
+/// (the total is rdtsc-derived on this side, the compute is timed by the
+/// Lisp) and the ratio error between them scales with the interval measured.
+/// On a compute-dominant leg the transport drops below that error and the
+/// difference clamps to 0 with both fields live: with a 10ms sleep injected
+/// into the timed add compute, the shared-ring add leg reported total p50
+/// 10027611 ns against compute 10117000 ns and the paired median still
+/// clamped — at least half the paired samples read total < compute, a ~0.9%
+/// cross-domain error, ~90us on a 10ms interval, against a ~4us ring
+/// transport. That floor is not an ordering artifact; removing it needs the
+/// clocks reconciled or the subtraction avoided (e.g. a transport-only
+/// reference timed in this process's own clock). The gated legs sit nowhere
+/// near it: their computes are 1-264us, so ~0.9% is 0.01-2.4us against
+/// transports of 4-870us.
+fn median_transport_ns(total_cy: &[u64], compute_ns: &[u64]) -> u64 {
+    debug_assert_eq!(
+        total_cy.len(),
+        compute_ns.len(),
+        "the total/compute sample vectors must be index-aligned"
+    );
+    let mut diffs: Vec<i64> = total_cy
+        .iter()
+        .zip(compute_ns.iter())
+        .map(|(&t, &c)| cycles_to_ns(t) as i64 - c as i64)
+        .collect();
+    if diffs.is_empty() {
+        return 0;
+    }
+    let n = diffs.len();
+    diffs.sort_unstable();
+    diffs[n / 2].max(0) as u64
+}
+
 /// Full stat set (min/p50/p95/p99/max/mean/stddev) from a sorted sample
 /// vector, converted with the given per-sample converter (cycles->ns for
 /// wasm-side timings, identity for the Lisp-reported ns compute samples).
@@ -568,9 +616,11 @@ fn print_bench_split(
         // the tail metric and stddev shows how noisy the leg is.
         let (min_ns, p50_ns, p95_ns, p99_ns, max_ns, mean_ns, stddev_ns) = stats_sorted(&ts, cycles_to_ns);
         let (cmin, cp50, cp95, cp99, cmax, cmean, cstd) = stats_sorted(&cs, |x| x);
-        // transport = total - compute, clamped at 0 (a Lisp clock that runs
-        // ahead of the wasm calibration would otherwise go negative).
-        let median_transport = p50_ns.saturating_sub(cp50);
+        // transport = total - compute, paired per sample (see the rationale
+        // on median_transport_ns) and clamped at 0. NB: the trimmed slices,
+        // NOT the sorted `ts`/`cs` copies — sorting is what destroys the
+        // index alignment the pairing depends on.
+        let median_transport = median_transport_ns(total_cy, compute_ns);
         println!(
             "BENCH_{tag}: N={n} median_cy={median_cy} median_ns={p50_ns} min_ns={min_ns} p50_ns={p50_ns} \
              p95_ns={p95_ns} p99_ns={p99_ns} max_ns={max_ns} mean_ns={mean_ns} stddev_ns={stddev_ns} \
@@ -628,7 +678,10 @@ fn print_bench_sweep(
         // stddev on both the total round trip and the Lisp compute.
         let (min_ns, p50_ns, p95_ns, p99_ns, max_ns, mean_ns, stddev_ns) = stats_sorted(&ts, cycles_to_ns);
         let (cmin, cp50, cp95, cp99, cmax, cmean, cstd) = stats_sorted(&cs, |x| x);
-        let median_transport = p50_ns.saturating_sub(cp50);
+        // Same paired estimator as print_bench_split (the per-size splits are
+        // archived through the same BENCH_JSON transport_ns field). NB: the
+        // trimmed per-bucket slices `tc`/`cc`, not the sorted `ts`/`cs`.
+        let median_transport = median_transport_ns(&tc, &cc);
         println!(
             "BENCH_SWEEP_{tag}: size={size}KiB N={n} median_cy={median_cy} median_ns={p50_ns} min_ns={min_ns} \
              p50_ns={p50_ns} p95_ns={p95_ns} p99_ns={p99_ns} max_ns={max_ns} mean_ns={mean_ns} \
@@ -1092,5 +1145,84 @@ fn main() {
     } else {
         println!("WASM_SIDECAR FAIL status={status}");
         std::process::exit(1);
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::{calibrate_tsc, cycles_to_ns, median_transport_ns, CYCLES_PER_NS};
+
+    /// A cycle count whose `cycles_to_ns` is `ns`, to within rounding — so the
+    /// tests assert on nanoseconds without knowing this host's TSC rate.
+    fn cycles_for_ns(ns: u64) -> u64 {
+        let cpn = *CYCLES_PER_NS.get_or_init(calibrate_tsc);
+        (ns as f64 * cpn).ceil() as u64
+    }
+
+    /// The estimator this one replaced, computed the way the sidecar used to:
+    /// p50(totals) - p50(computes), clamped at 0.
+    fn diff_of_medians(total_cy: &[u64], compute_ns: &[u64]) -> u64 {
+        let mut t: Vec<u64> = total_cy.iter().map(|&c| cycles_to_ns(c)).collect();
+        let mut c: Vec<u64> = compute_ns.to_vec();
+        t.sort_unstable();
+        c.sort_unstable();
+        t[t.len() / 2].saturating_sub(c[c.len() / 2])
+    }
+
+    #[test]
+    fn pairs_each_sample_with_its_own_compute() {
+        // Totals 100/200/300 ns against computes 95/195/0: the paired
+        // differences are 5/5/300, so the median is 5 — while the two marginal
+        // medians (200 vs 95) put the same data at 105. The estimator must
+        // follow the pairing, not the marginals.
+        let totals: Vec<u64> = [100u64, 200, 300]
+            .iter()
+            .map(|&n| cycles_for_ns(n))
+            .collect();
+        let computes = vec![95u64, 195, 0];
+        let paired = median_transport_ns(&totals, &computes);
+        assert!(
+            (4..=6).contains(&paired),
+            "paired median should be ~5ns, got {paired}"
+        );
+        let marginal = diff_of_medians(&totals, &computes);
+        assert!(
+            marginal > paired + 50,
+            "the two estimators should disagree here: paired {paired}, marginal {marginal}"
+        );
+    }
+
+    #[test]
+    fn clamps_a_negative_median_instead_of_wrapping() {
+        // The compute ahead of the total (the cross-domain error, when the Lisp
+        // clock runs ahead of the wasm calibration): the median difference is
+        // negative and must clamp, not wrap to a huge u64.
+        let totals: Vec<u64> = [100u64, 100, 100]
+            .iter()
+            .map(|&n| cycles_for_ns(n))
+            .collect();
+        let computes = vec![200u64, 200, 200];
+        assert_eq!(median_transport_ns(&totals, &computes), 0);
+    }
+
+    #[test]
+    fn one_stalled_sample_does_not_move_the_median() {
+        // Four samples at ~4ns of transport and one stalled at ~300ms: the
+        // median is the typical sample, not the tail — which is what makes the
+        // estimator robust to a single scheduling hiccup.
+        let totals: Vec<u64> = [1004u64, 1004, 1004, 1004, 300_000]
+            .iter()
+            .map(|&n| cycles_for_ns(n))
+            .collect();
+        let computes = vec![1000u64, 1000, 1000, 1000, 0];
+        let paired = median_transport_ns(&totals, &computes);
+        assert!(
+            (3..=5).contains(&paired),
+            "median should be ~4ns, got {paired}"
+        );
+    }
+
+    #[test]
+    fn empty_input_is_zero() {
+        assert_eq!(median_transport_ns(&[], &[]), 0);
     }
 }

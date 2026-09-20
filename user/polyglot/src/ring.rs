@@ -29,6 +29,7 @@
 //! identically. Only the transport seam (the fake syscall / chan-send)
 //! switches.
 
+use std::ffi::CString;
 use std::fs::OpenOptions;
 use std::io;
 use std::os::unix::io::AsRawFd;
@@ -86,6 +87,11 @@ fn open_file(path: &str) -> io::Result<std::fs::File> {
 /// Map the whole channel file (both rings) and return the base pointer.
 fn map_channel(path: &str) -> io::Result<(*mut u8, usize)> {
     let file = open_file(path)?;
+    map_whole_file(&file, path)
+}
+
+/// Map an already-open file (the creation path has no name to open yet).
+fn map_whole_file(file: &std::fs::File, path: &str) -> io::Result<(*mut u8, usize)> {
     let len = file
         .metadata()
         .map_err(|e| io::Error::new(e.kind(), format!("stat channel file {path}: {e}")))?
@@ -112,23 +118,137 @@ fn map_channel(path: &str) -> io::Result<(*mut u8, usize)> {
     Ok((base as *mut u8, len))
 }
 
-/// Create (or truncate + init) the channel file with both rings' headers.
-pub fn create_channel(path: &str) -> io::Result<()> {
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let f = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_CLOEXEC)
-            .open(path)
-            .map_err(|e| io::Error::new(e.kind(), format!("create channel file {path}: {e}")))?;
-        f.set_len(CHAN_FILE_SIZE as u64)
-            .map_err(|e| io::Error::new(e.kind(), format!("ftruncate channel file {path}: {e}")))?;
-        f.sync_all().ok();
+/// A shared-memory file that exists but has not been given its name yet.
+///
+/// The structural half of the shm leak fix. `open_unnamed` creates the inode
+/// anonymously (`O_TMPFILE`), so the target path does not exist while the file
+/// is being sized, mapped and initialized — the expensive part, and the part a
+/// signal can interrupt. Nothing is left behind by a signal arriving during
+/// creation, nor by a SIGKILL, which no handler can catch. `publish` links the
+/// finished file into place, so the name also never refers to a
+/// half-initialized channel (a reader that opened it early would fail its
+/// header check).
+pub struct PendingShm {
+    file: std::fs::File,
+    target: String,
+    /// True until `publish` gives the file its name. False from the start on
+    /// the fallback path, where the file was created named.
+    unnamed: bool,
+}
+
+impl PendingShm {
+    /// The unnamed file, for `ftruncate` / `mmap` / header initialization.
+    pub fn file(&self) -> &std::fs::File {
+        &self.file
     }
-    let (base, len) = map_channel(path)?;
+
+    /// Give the file its name. A second call is a no-op. On the fallback path
+    /// (a filesystem without `O_TMPFILE`) there is nothing to publish.
+    pub fn publish(&mut self) -> io::Result<()> {
+        if !self.unnamed {
+            return Ok(());
+        }
+        // `/proc/self/fd/N` + AT_SYMLINK_FOLLOW is the documented way to name
+        // an O_TMPFILE inode: the magic link resolves to the unnamed dentry.
+        let link = format!("/proc/self/fd/{}", self.file.as_raw_fd());
+        let c_link = CString::new(link.clone())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{link}: {e}")))?;
+        let c_target = CString::new(self.target.clone()).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("{}: {e}", self.target))
+        })?;
+        // SAFETY: both pointers are NUL-terminated for the duration of the
+        // call and linkat only reads them.
+        let rc = unsafe {
+            libc::linkat(
+                libc::AT_FDCWD,
+                c_link.as_ptr(),
+                libc::AT_FDCWD,
+                c_target.as_ptr(),
+                libc::AT_SYMLINK_FOLLOW,
+            )
+        };
+        if rc != 0 {
+            let e = io::Error::last_os_error();
+            return Err(io::Error::new(
+                e.kind(),
+                format!("link {link} -> {}: {e}", self.target),
+            ));
+        }
+        self.unnamed = false;
+        Ok(())
+    }
+}
+
+/// Open the shared-memory file for `path` without giving it a name yet.
+///
+/// `O_TMPFILE` is tried first, in the target's own directory so the late link
+/// stays on one filesystem. A filesystem that does not support anonymous
+/// files (or a target that cannot be replaced) falls back to the previous
+/// create+truncate, where `publish` is a no-op and the caller's own cleanup
+/// covers the named window.
+pub fn open_unnamed(path: &str) -> io::Result<PendingShm> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let target = std::path::Path::new(path);
+    let dir = match target.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => std::path::Path::new("."),
+    };
+    match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_TMPFILE | libc::O_CLOEXEC)
+        .open(dir)
+    {
+        Ok(file) => {
+            // `linkat` refuses an existing target, and the previous
+            // incarnation reused such a file by truncating it. A file at this
+            // path is dead by construction (the port is unique per run), so
+            // drop it and keep the anonymous path; if it cannot be removed,
+            // fall through to the named create rather than guess.
+            match std::fs::remove_file(target) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(_) => return open_named(path),
+            }
+            Ok(PendingShm {
+                file,
+                target: path.to_string(),
+                unnamed: true,
+            })
+        }
+        Err(_) => open_named(path),
+    }
+}
+
+/// Create the file by name (the pre-anonymous behavior). Split out so the
+/// fallback is visible where it is taken.
+fn open_named(path: &str) -> io::Result<PendingShm> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|e| io::Error::new(e.kind(), format!("create channel file {path}: {e}")))?;
+    Ok(PendingShm {
+        file,
+        target: path.to_string(),
+        unnamed: false,
+    })
+}
+
+/// Create + init the channel file with both rings' headers.
+pub fn create_channel(path: &str) -> io::Result<()> {
+    let mut pending = open_unnamed(path)?;
+    pending
+        .file()
+        .set_len(CHAN_FILE_SIZE as u64)
+        .map_err(|e| io::Error::new(e.kind(), format!("ftruncate channel file {path}: {e}")))?;
+    pending.file().sync_all().ok();
+    let (base, len) = map_whole_file(pending.file(), path)?;
     unsafe { std::slice::from_raw_parts_mut(base, len) }.fill(0);
     for offset in [
         RING0_OFFSET,
@@ -148,7 +268,9 @@ pub fn create_channel(path: &str) -> io::Result<()> {
         }
     }
     unsafe { libc::munmap(base as *mut libc::c_void, len) };
-    Ok(())
+    // Publish last: the name appears only once every header is written, so a
+    // reader (or a crash) can never see a half-initialized channel.
+    pending.publish()
 }
 
 impl Ring {
@@ -258,5 +380,117 @@ impl Ring {
                 std::ptr::copy_nonoverlapping(self.data, buf.as_mut_ptr().add(first), buf.len() - first);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> String {
+        std::env::temp_dir()
+            .join(format!("sls-ring-test-{tag}-{}.bin", std::process::id()))
+            .to_string_lossy()
+            .to_string()
+    }
+
+    /// The leak fix in one assertion: while the file is unnamed the path does
+    /// not exist, so a signal during creation — or a SIGKILL, which no handler
+    /// can catch — has nothing to leave behind. `publish` is what makes it
+    /// appear, and a second call must be a no-op rather than an EEXIST.
+    #[test]
+    fn unnamed_until_published() {
+        let path = scratch("a");
+        let _ = std::fs::remove_file(&path);
+        let mut pending = open_unnamed(&path).expect("open unnamed");
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "the path must not exist while the file is unnamed"
+        );
+        pending.file().set_len(4096).expect("ftruncate");
+        pending.publish().expect("publish");
+        let md = std::fs::metadata(&path).expect("published file must exist");
+        assert_eq!(md.len(), 4096, "the linked file is the one we sized");
+        pending.publish().expect("publish must be idempotent");
+        std::fs::remove_file(&path).expect("cleanup");
+    }
+
+    /// Negative control for the test above: the *named* path is visible the
+    /// moment it is created, so `unnamed_until_published` is asserting a real
+    /// difference and would fail if creation ever went back to create+truncate.
+    #[test]
+    fn named_creation_is_visible_immediately() {
+        let path = scratch("b");
+        let _ = std::fs::remove_file(&path);
+        let named = open_named(&path).expect("open named");
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "the fallback names the file up front (which is why it needs cleanup)"
+        );
+        drop(named);
+        std::fs::remove_file(&path).expect("cleanup");
+    }
+
+    /// `linkat` refuses an existing target, and a previous incarnation reused
+    /// such a file by truncating it. A stale file must therefore be replaced
+    /// rather than turning the anonymous path into an error.
+    #[test]
+    fn stale_file_is_replaced() {
+        let path = scratch("c");
+        std::fs::write(&path, b"stale").expect("write stale file");
+        let mut pending = open_unnamed(&path).expect("open unnamed over a stale file");
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "the stale file is gone, and the new one is not published yet"
+        );
+        pending.file().set_len(128).expect("ftruncate");
+        pending.publish().expect("publish over the stale name");
+        assert_eq!(
+            std::fs::metadata(&path).expect("stat").len(),
+            128,
+            "the published file replaced the stale one"
+        );
+        std::fs::remove_file(&path).expect("cleanup");
+    }
+
+    /// The published channel must be a valid channel: `create_channel` sizes,
+    /// zeroes and header-stamps the file while it is still unnamed, so this is
+    /// also the check that the late link does not disturb any of that.
+    #[test]
+    fn published_channel_opens_on_every_ring() {
+        let path = scratch("d");
+        let _ = std::fs::remove_file(&path);
+        create_channel(&path).expect("create channel");
+        assert!(std::path::Path::new(&path).exists(), "create must publish");
+        assert_eq!(
+            std::fs::metadata(&path).expect("stat").len() as usize,
+            CHAN_FILE_SIZE,
+            "the channel file is fully sized"
+        );
+        for offset in [
+            RING0_OFFSET,
+            RING1_OFFSET,
+            RING2_OFFSET,
+            RING3_OFFSET,
+            RING4_OFFSET,
+            RING5_OFFSET,
+            RING6_OFFSET,
+            RING7_OFFSET,
+        ] {
+            Ring::open(&path, offset).unwrap_or_else(|e| panic!("ring @{offset}: {e}"));
+        }
+        std::fs::remove_file(&path).expect("cleanup");
+    }
+
+    /// An error path must not create a name either: a target in a directory
+    /// that does not exist fails, and leaves nothing behind.
+    #[test]
+    fn missing_directory_creates_nothing() {
+        let path = format!(
+            "/tmp/sls-ring-test-missing-{}/arena.bin",
+            std::process::id()
+        );
+        assert!(open_unnamed(&path).is_err(), "no such directory must error");
+        assert!(!std::path::Path::new(&path).exists(), "and create nothing");
     }
 }

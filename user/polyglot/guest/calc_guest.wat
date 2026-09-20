@@ -486,7 +486,15 @@
 
     (call $arena_free (local.get $in_cap))
 
-    (call $log (i32.const 288) (i32.const 27))
-    (call $log (i32.const 64) (i32.const 34))
+    ;; The log length is a byte count of the TEXT only — it excludes the
+    ;; data segment's trailing \00, which is a vestigial C-ism here: the
+    ;; host.log import takes an explicit length. A length that overshoots
+    ;; prints the NUL and the zero-fill past the segment end, so the
+    ;; capturing shell warns "ignored null byte in input"; a length that
+    ;; undershoots silently truncates the line (this one used to print
+    ;; "heavy_reduce=201" for a sum of 2016). "PASS async
+    ;; heavy_reduce=2016" is 28 bytes, "PASS add(2,3)=5 sqrt verified" 29.
+    (call $log (i32.const 288) (i32.const 28))
+    (call $log (i32.const 64) (i32.const 29))
     (i32.const 0))
 )
