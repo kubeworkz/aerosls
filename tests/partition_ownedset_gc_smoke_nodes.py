@@ -44,6 +44,28 @@ the destroy is never seen by the follower while it is down, exactly like a
 real withdraw broadcast.
 """
 
+# ─── The fake must never be the binding clock ─────────────────────────────
+# The guard scales its own patience down for the smoke (AEROSLS_GC_FAST=1:
+# WAIT_NODES=10s, WAIT_LEARN=6s, WAIT_FLUSH=6s, WAIT_BOOT=8s, WAIT_GC=8s).
+# The learn wait below used to be a fixed 100 x 0.05s = 5s -- SHORTER than
+# the guard's own WAIT_NODES budget for forming the cluster, and a clock
+# that starts when the FAKE process starts, so the guard could still be
+# inside its own cluster-forming phase (or its create could be racing a
+# slow host) when the follower stopped listening. That is the shape that
+# bit failover_adoption_live_smoke.sh in CI on 2026-09-20: its nockpt and
+# lateflip teeth failed with "nodes 2/3 never learned partition" while the
+# mutations' own gates had budget to spare -- a fake-side timer deciding a
+# tooth. This fake's window was half the size of that one's.
+#
+# So the wait is bounded by the process's LIFE, not by a counter: the only
+# clock that may decide a tooth is the guard's. The modelled negatives
+# (nolearn, nopersist) are mode-gated and still return without logging their
+# line, so they still fail the GUARD's gate -- the property under test. The
+# control is this smoke's "latecreate" tooth, which idles the fakes past
+# every old cap before the guard is even started. Full rationale and the CI
+# evidence: the same rule block at the top of
+# tests/failover_adoption_smoke_nodes.py.
+
 import http.server
 import json
 import os
@@ -111,12 +133,14 @@ def collect_line(row):
 # and the disk write, so the guard's disk gate must bite.
 def rx_thread():
     if role == "follower" and boot == 1:
+        # Life-bounded, not counter-bounded (see the rule at the top of this
+        # file): the create announce can arrive at any point in the guard's
+        # run, including after its own WAIT_NODES pre-create phase.
         row = None
-        for _ in range(100):
+        while row is None:
             row = read_json(created)
-            if row:
-                break
-            time.sleep(0.05)
+            if row is None:
+                time.sleep(0.05)
         if row and mode != "nolearn":
             log(learn_line(row))
             if mode != "nopersist":
@@ -211,13 +235,26 @@ class H(http.server.BaseHTTPRequestHandler):
         pass
 
 
-srv = http.server.HTTPServer(("127.0.0.1", port), H)
+# ThreadingHTTPServer, not HTTPServer: the plain server handles ONE request
+# at a time, so concurrent pollers queue behind each other and any client
+# timeout (the guard's curl among them) can read as "the node never
+# answered", deciding a tooth on a clock rather than on the modelled
+# property. Full story in tests/failover_adoption_smoke_nodes.py.
+srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), H)
 
 
 def ownedset_timer():
     """Boot-2 owned-set arrival, kernel-style. For the collected tooth
     only: log the collect line (restore is already logged, before it), then
-    mark the state so _partitions() stops serving the ghost."""
+    mark the state so _partitions() stops serving the ghost.
+
+    The 1s sleep is an event ARRIVAL delay, not a cap, and the distinction is
+    the whole point of the rule at the top of this file: a cap asks "how long
+    do I wait before giving up" and can therefore return a verdict the guard
+    never observed, while this always fires and only orders the model (the
+    owned-set collects one tick into boot 2). It sits inside the guard's own
+    WAIT_GC=8s window with an 8x margin, so the clock that judges the tooth
+    is still the guard's."""
     if role == "follower" and boot == 2 and mode == "collected":
         time.sleep(1.0)
         ghost = read_json(disk)

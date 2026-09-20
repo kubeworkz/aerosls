@@ -34,11 +34,31 @@
 #                           would prove nothing)
 #   silent        -> ABORT (no cluster.pids at all; the guard must say how
 #                           to start one)
+#   latecreate    -> PASS  (the fakes are idled past EVERY wait the old
+#                           fakes carried before the guard is even started,
+#                           and the guard still drives the whole ghost
+#                           collect for its own reason, reboot included)
 #
 # The last four matter as much as the first: a guard that cannot fail is a
 # guard that has never been seen to work. And a PASS that skipped the reboot
 # would prove nothing, so the collected tooth also asserts the follower's
 # boot counter reached 2.
+#
+# The latecreate tooth exists because the FAKES were deciding verdicts. The
+# follower's learn wait used to be a fixed 100 x 0.05s = 5s -- SHORTER than
+# the guard's own WAIT_NODES cluster-forming budget (10s), and a clock that
+# starts when the FAKE process starts, so the follower could stop listening
+# while the guard was still forming the cluster or creating the row. That is
+# the shape that bit failover_adoption_live_smoke.sh in CI on 2026-09-20
+# (nockpt/lateflip: "nodes 2/3 never learned partition", a fake-side timer
+# expiring inside the guard's own budget). The fake's waits are now
+# life-bounded (see the rule at the top of
+# partition_ownedset_gc_smoke_nodes.py), and this tooth is the control for
+# it: it idles the fakes 50s -- ten times the old cap -- before running the
+# guard in the plain collected mode, so with a fake-side budget restored it
+# fails at the learn gate, and with none it passes for its own reason. A run
+# that wants to skip the idle (a tight local loop) can set
+# AEROSLS_GC_SMOKE_LATE_IDLE=0.
 #
 # Runs on a port base far from any real cluster and never touches a running
 # one: the guard's pid file lives in a private temp dir (AEROSLS_CLUSTER_DIR),
@@ -52,6 +72,11 @@ cd "$(dirname "$0")/.."
 GUARD=tests/partition_ownedset_gc_live_check.sh
 FAKE=tests/partition_ownedset_gc_smoke_nodes.py
 BASE=59000
+# The latecreate tooth's idle, in seconds. 50 is ten times every wait the
+# pre-fix fakes could hold (the longest was 100 x 0.05s = 5s), so the
+# tooth's point holds by construction; 0 disables the idle (it does NOT
+# disable the tooth, which then still proves the plain collected path).
+LATE_IDLE="${AEROSLS_GC_SMOKE_LATE_IDLE:-50}"
 
 [ -f "$GUARD" ] || { echo "ABORT: $GUARD not found or not executable."; exit 2; }
 [ -f "$FAKE" ]  || { echo "ABORT: $FAKE not found."; exit 2; }
@@ -93,9 +118,11 @@ cleanup() { cleanup_fakes; [ -n "$STATE" ] && rm -rf "$STATE"; rm -rf "$SMOKE_CL
 trap cleanup EXIT
 
 # $1 = mode, $2 = expected exit, $3 = a phrase the output must contain,
-# $4 = label
+# $4 = label, $5 = optional seconds to idle the fakes before the guard runs
+#      (the latecreate tooth's control: nothing about the kernel path
+#      changes, so the tooth can only fail if a FAKE-side clock decided it)
 tooth() {
-    local mode="$1" want_rc="$2" want_txt="$3" label="$4"
+    local mode="$1" want_rc="$2" want_txt="$3" label="$4" delay="${5:-0}"
     local out rc
     cleanup_fakes
     [ -n "$STATE" ] && rm -rf "$STATE"
@@ -118,11 +145,25 @@ tooth() {
     done
     printf '1 %s\n2 %s\n' "$lpid" "$fpid" > "$PID_FILE"
 
+    if [ "$delay" != 0 ]; then
+        echo "  note: idling the fakes ${delay}s before the guard runs (the tooth's point)"
+        sleep "$delay"
+    fi
+
     out="$(AEROSLS_HTTP_BASE=$BASE AEROSLS_GC_FAKE=1 \
            AEROSLS_GC_FAST=1 AEROSLS_LOG_DIR=$STATE bash "$GUARD" 2>&1)"
     rc=$?
 
-    if [ "$mode" = "collected" ]; then
+    # The hygiene check below asks "did this PASS mean what it claims", so it
+    # may only run when the guard actually passed. Running it after a failure
+    # reports the consequence instead of the cause: an abort at an earlier
+    # gate (the learn gate, say) leaves the follower un-rebooted, and that
+    # would be reported as "guard passed, but the follower was never
+    # rebooted" -- hiding the guard's real verdict. The control run for the
+    # latecreate tooth hit exactly that, so the gate is explicit here.
+    local guard_passed=0
+    case "$out" in *PASS*) guard_passed=1 ;; esac
+    if [ "$mode" = "collected" ] && [ "$rc" -eq 0 ] && [ "$guard_passed" -eq 1 ]; then
         # A PASS that never rebooted the follower proves nothing: the whole
         # point is that a node which booted AFTER the destroy collects the
         # ghost restored from disk.
@@ -152,6 +193,7 @@ tooth() {
 }
 
 tooth collected    0 "PASS"      "collected -> PASS (and the follower was rebooted)"
+tooth collected    0 "PASS"      "latecreate -> PASS (the fakes idled ${LATE_IDLE}s first — past every wait the old fakes carried — and the guard still collected the ghost, reboot included)" "$LATE_IDLE"
 tooth notcollected 1 "still lists" "notcollected -> FAIL (the owned-set never collected the ghost)"
 tooth nolearn      1 "never learned" "nolearn -> FAIL (the create announce did not arrive)"
 tooth nopersist    1 "never flushed" "nopersist -> FAIL (the ghost never reached disk)"

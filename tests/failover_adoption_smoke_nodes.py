@@ -116,6 +116,38 @@ migrate, written by the adopter; the destination and the observer log the
 owner-initiated transfer apply).
 """
 
+# ─── The fake must never be the binding clock ─────────────────────────────
+# Every wait below is on an event the GUARD gates, and the guard already
+# scales its own patience down for the smoke (AEROSLS_FAILOVER_FAST=1:
+# WAIT_NODES=10s, WAIT_LEARN=6s, WAIT_ADOPT=10s, WAIT_CLAIM=8s, ...). The
+# loops used to carry fixed iteration caps of their own -- 200 x 0.05s =
+# 10s, 600 x 0.05s = 30s, 900 x 0.05s = 45s -- budgets that have nothing to
+# do with the guard's, start when the PROCESS starts, and therefore compete
+# with the guard's whole fast path. The learn wait is the worst case: its
+# 10s cap was exactly the guard's WAIT_NODES pre-create budget, so any host
+# that took that long to form the cluster (a loaded runner; a slow python
+# cold start) put the create announce at the cap's edge and a follower
+# stopped listening before the guard had even created the partition. CI hit
+# exactly that on 2026-09-20: failover_adoption_live_smoke.sh's nockpt and
+# lateflip teeth failed with "nodes 2/3 never learned partition" -- exactly
+# one follower empty, the other learned -- instead of the gate each tooth
+# mutates, so the mutation's verdict was never reached at all.
+#
+# So every wait here on an event the guard's gates depend on is bounded by
+# the process's LIFE, not by a counter: the only clock that may decide a
+# tooth is the guard's. A mode that models an event NEVER arriving (nolearn,
+# nockpt, migrate_noapply, migrate_nolease, svc_nostale, ...) still returns
+# without logging its line, so those teeth keep their teeth -- they now fail
+# the GUARD's gate, which is the property under test, rather than racing a
+# fake-side timer. Two counters remain, deliberately: reading the row on a
+# relaunch (the file preexists there, so it is a read, not a wait) and the
+# leader's convergence cadence (it logs either way, so a counter can only
+# move WHEN, never WHETHER -- and an unbounded one would stall the modes
+# whose survivors never write the reject signal). The negative control for
+# this rule is the smoke's "latecreate" tooth: it idles the fakes past every
+# old cap before running the guard, and with the old counters restored it
+# fails at exactly the CI signature.
+
 import http.server
 import json
 import os
@@ -136,6 +168,14 @@ leader_id = int(open(os.path.join(state, "leader")).read().strip())
 created = os.path.join(state, "created.json")
 lease = os.path.join(state, "lease.json")
 migrate = os.path.join(state, "migrate.json")
+# Test-only knob for the smoke's "leadergap" tooth: when <state>/health_gap
+# holds a number, the LEADER answers /api/health only after that many
+# seconds from the guard's create -- a bounded episode of unreachability,
+# exactly the shape a busy host produces. A real kernel survives it (its
+# death rule wants FAILOVER_DEAD_TICKS of SILENCE); a "3 failed polls" rule
+# does not. See gap_until below and the DEAD_SILENCE rule above.
+gap_file = os.path.join(state, "health_gap")
+gap_until = 0.0
 # True only on the RELAUNCHED leader process: the guard creates the
 # partition AFTER the original process boots, so the original sees
 # created.json appear mid-session, while every relaunch (step 10/11) boots
@@ -203,6 +243,23 @@ def leader_port():
     return port - node_id + leader_id
 
 
+# The modelled property is failover_tick's "silent >= FAILOVER_DEAD_TICKS"
+# (300 ticks) -- a DURATION of unreachability, not a count of failed
+# requests. A poll that timed out because the leader was busy answering
+# somebody else is not silence, so death needs DEAD_SILENCE seconds of
+# CONTINUOUS unreachability (see death_thread).
+#
+# Why 4s: the rule it replaces (three failed polls, 0.5s timeout each, 0.1s
+# apart) fired after ~2.3s of unreachability, and a loaded host produced
+# episodes that long -- observed: a follower declared the leader DEAD while
+# it was alive, transitioned, and the guard then read its row as "never
+# learned" although both followers' logs showed the learn. 4s sits above
+# every such episode seen (a real SIGKILL is unbounded) and inside the
+# guard's own post-kill gates (WAIT_ADOPT=10s, WAIT_OBSERVER=8s,
+# WAIT_HANDOFF=6s), so the declaration after a real kill is still prompt.
+DEAD_SILENCE = 4.0
+
+
 def leader_alive():
     try:
         with urllib.request.urlopen(
@@ -225,12 +282,15 @@ def rx_thread():
     global learned
     if role != "follower":
         return
+    # Life-bounded, not counter-bounded (see the rule at the top of this
+    # file): the create announce can arrive at any point in the guard's run,
+    # including after its own WAIT_NODES pre-create phase has spent its
+    # whole budget.
     row = None
-    for _ in range(200):
+    while row is None:
         row = read_created()
-        if row:
-            break
-        time.sleep(0.05)
+        if row is None:
+            time.sleep(0.05)
     if row and mode != "nolearn":
         log(learn_line(row, leader_id))
         learned = True   # learned regardless of nockpt: the learn gate
@@ -252,9 +312,9 @@ threading.Thread(target=rx_thread, daemon=True).start()
 def lease_rx_thread():
     if node_id == 2:
         return   # node 2 is the adopter -- it ISSUES the acquire itself
-    for _ in range(600):
-        if os.path.exists(lease):
-            break
+    # Life-bounded: step 11 runs after the whole death/adoption/relaunch
+    # dance, far outside any counter started at process boot.
+    while not os.path.exists(lease):
         time.sleep(0.05)
     if os.path.exists(lease):
         pid = json.load(open(lease)).get("partition_id", "1")
@@ -297,7 +357,9 @@ def svc_rx_thread():
     global svc_local, svc_remote, svc_last_gen
     if role == "leader":
         return   # local registrations shadow everything on the owner
-    for _ in range(900):
+    # Life-bounded: the step-12 re-announce comes long after the pre-kill
+    # registration, way outside a counter started at process boot.
+    while True:
         if not os.path.exists(svc):
             time.sleep(0.05)
             continue
@@ -353,62 +415,68 @@ def death_thread():
     global transitioned, late_flipped
     if role != "follower":
         return
-    for _ in range(600):
-        if not leader_alive():
-            # 3 consecutive failures to avoid a transient blip.
-            ok = True
-            for _ in range(3):
-                if leader_alive():
-                    ok = False
-                    break
-                time.sleep(0.1)
-            if not ok:
-                time.sleep(0.2)
-                continue
-            transitioned = True
-            # Every node that observes the death DECLARES it (failover_tick
-            # runs everywhere); only the leader recovers.
-            log("[FAILOVER] Node %u declared DEAD (silent 300 ticks)" % leader_id)
-            row = read_created()
-            if my_transition == "LEADER":
-                if mode != "notadopted" and row:
-                    log("[FAILOVER] Adopted partition %s from dead node %u"
-                        % (row["id"], leader_id))
-                    log("[FAILOVER] recovery for dead node %u: rc=0 (OK - adopted)"
-                        % leader_id)
-            else:
-                # The observer: it merely learns the handoff announce from
-                # the adopter -- except in the misbehaviour modes. The
-                # resurrect/migrate modes adopt exactly like "adopted" for
-                # the death phase; the extra steps are the relaunch and the
-                # step-11 migration.
-                if row and mode in ("adopted", "observeradopts", "lateflip",
-                                    "resurrect_stable", "resurrect_flap",
-                                    "resurrect_nostale", "migrate_stable",
-                                    "migrate_flap", "migrate_nolease",
-                                    "migrate_noapply", "migrate_nostale",
-                                    "migrate_noreacquire", "svc_stable",
-                                    "svc_flap", "svc_nostale"):
-                    log(learn_line(row, 2))
-                if row and mode == "observeradopts":
-                    # The bug: a FOLLOWER that recovered. cluster_is_leader()
-                    # should have gated this to the leader; the guard's
-                    # step-9 log check must catch the second Adopted line.
-                    log("[FAILOVER] Adopted partition %s from dead node %u"
-                        % (row["id"], leader_id))
-                    log("[FAILOVER] recovery for dead node %u: rc=0 (OK - adopted)"
-                        % leader_id)
-                if mode == "lateflip":
-                    # The other bug: the loser flips to LEADER after the
-                    # adoption (late split-brain). Delay so the step-7
-                    # simultaneous-flip check has already broken out.
-                    def flip():
-                        global late_flipped
-                        time.sleep(1.5)
-                        late_flipped = True
-                    threading.Thread(target=flip, daemon=True).start()
-            return
-        time.sleep(0.2)
+    # Life-bounded: the guard SIGKILLs the leader after its own gates have
+    # run, and this poll must still be listening when it does.
+    # Sustained silence, not "3 strikes": the old rule declared the leader
+    # DEAD after three failed polls, which a busy leader can produce. With
+    # three smokes running at once a follower's 0.5s poll timed out behind
+    # the guard's own requests, it declared the leader dead while the leader
+    # was answering, transitioned, and the guard then read its row as
+    # "never learned" -- a verdict decided by a client timeout.
+    silent_since = None
+    while True:
+        if leader_alive():
+            silent_since = None
+            time.sleep(0.2)
+            continue
+        if silent_since is None:
+            silent_since = time.monotonic()
+        if time.monotonic() - silent_since < DEAD_SILENCE:
+            time.sleep(0.1)
+            continue
+        transitioned = True
+        # Every node that observes the death DECLARES it (failover_tick
+        # runs everywhere); only the leader recovers.
+        log("[FAILOVER] Node %u declared DEAD (silent 300 ticks)" % leader_id)
+        row = read_created()
+        if my_transition == "LEADER":
+            if mode != "notadopted" and row:
+                log("[FAILOVER] Adopted partition %s from dead node %u"
+                    % (row["id"], leader_id))
+                log("[FAILOVER] recovery for dead node %u: rc=0 (OK - adopted)"
+                    % leader_id)
+        else:
+            # The observer: it merely learns the handoff announce from
+            # the adopter -- except in the misbehaviour modes. The
+            # resurrect/migrate modes adopt exactly like "adopted" for
+            # the death phase; the extra steps are the relaunch and the
+            # step-11 migration.
+            if row and mode in ("adopted", "observeradopts", "lateflip",
+                                "resurrect_stable", "resurrect_flap",
+                                "resurrect_nostale", "migrate_stable",
+                                "migrate_flap", "migrate_nolease",
+                                "migrate_noapply", "migrate_nostale",
+                                "migrate_noreacquire", "svc_stable",
+                                "svc_flap", "svc_nostale"):
+                log(learn_line(row, 2))
+            if row and mode == "observeradopts":
+                # The bug: a FOLLOWER that recovered. cluster_is_leader()
+                # should have gated this to the leader; the guard's
+                # step-9 log check must catch the second Adopted line.
+                log("[FAILOVER] Adopted partition %s from dead node %u"
+                    % (row["id"], leader_id))
+                log("[FAILOVER] recovery for dead node %u: rc=0 (OK - adopted)"
+                    % leader_id)
+            if mode == "lateflip":
+                # The other bug: the loser flips to LEADER after the
+                # adoption (late split-brain). Delay so the step-7
+                # simultaneous-flip check has already broken out.
+                def flip():
+                    global late_flipped
+                    time.sleep(1.5)
+                    late_flipped = True
+                threading.Thread(target=flip, daemon=True).start()
+        return
 
 
 threading.Thread(target=death_thread, daemon=True).start()
@@ -512,7 +580,9 @@ if role == "follower":
     def claim_thread():
         global flapped
         claim = os.path.join(state, "resurrect_claim")
-        for _ in range(600):
+        # Life-bounded: the relaunched leader re-announces after its boot,
+        # which is far into the guard's run.
+        while True:
             if os.path.exists(claim):
                 row = read_created()
                 if not row:
@@ -553,7 +623,8 @@ def migrate_poll_thread():
     global migrated_to
     if node_id == 2:
         return   # the adopter issues the migrate itself
-    for _ in range(600):
+    # Life-bounded: the step-11 transfer is the last thing the guard does.
+    while True:
         if os.path.exists(migrate):
             row = read_created()
             if not row:
@@ -709,6 +780,13 @@ class H(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/api/health":
+            # The leadergap tooth's bounded unreachability window: sleep out
+            # whatever is left of it before answering, so every poll the
+            # survivors make during the window really does time out.
+            if role == "leader" and gap_until:
+                left = gap_until - time.monotonic()
+                if left > 0:
+                    time.sleep(left)
             self._json(200, {"ok": "true", "ready": "true"})
         elif self.path == "/api/cluster":
             self._json(200, {"node_id": node_id, "role": self._role(),
@@ -782,6 +860,15 @@ class H(http.server.BaseHTTPRequestHandler):
                 with open(created, "w") as f:
                     json.dump({"id": 1, "owner_node": node_id, "name": name,
                                "state": "active"}, f, separators=(",", ":"))
+                # The smoke's leadergap tooth: this create opens a BOUNDED
+                # window in which the leader answers /api/health late (see
+                # do_GET), modelling a busy leader rather than a dead one.
+                global gap_until
+                try:
+                    gap_until = time.monotonic() + float(
+                        open(gap_file).read().strip() or 0)
+                except (OSError, ValueError):
+                    pass
                 self._json(200, {"ok": "true", "recognized": "true",
                                  "output": f"created partition 1 ({name})"})
             elif command.startswith("partition lease acquire "):
@@ -805,6 +892,16 @@ class H(http.server.BaseHTTPRequestHandler):
         pass
 
 
-srv = http.server.HTTPServer(("127.0.0.1", port), H)
+# ThreadingHTTPServer, not HTTPServer: the plain one serves ONE request at a
+# time, so every concurrent poller queues behind the others -- and every
+# client here has a short timeout (the follower's own 0.5s leader poll, the
+# guard's curl, the smoke's curl), which turns queueing into a verdict. That
+# is not hypothetical: with three smokes running at once, a follower
+# declared the leader DEAD while it was alive (its 0.5s poll timed out
+# behind the guard's own requests), transitioned, and the guard then read
+# its row as "never learned" -- with both followers' logs showing the learn
+# and the checkpoint on disk. A real kernel answers its services
+# concurrently, so the threaded server is also the more faithful model.
+srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), H)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 time.sleep(600)
