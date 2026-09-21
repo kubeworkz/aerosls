@@ -6,6 +6,7 @@
 #include "cap.h"
 #include "kernel_io.h"
 #include "smp.h"
+#include "process.h"   /* E1: kernel_yield_to_ring3 (the unified boot's hand-over) */
 
 extern volatile uint64_t kernel_tick_counter;   /* ~10 ms per tick (net_event.c) */
 
@@ -57,9 +58,9 @@ int env_service_create(uint32_t partition, uint32_t index,
     if (cap_send_msg(0, g_env_k_wr, req, (uint32_t)sizeof(req), 0, 0, tag, 0) != 0)
         return -1;
 
-    /* Spin for the reply. The send woke init; it runs under timer preemption
-     * (interrupts stay enabled here), processes the request, and replies. The
-     * deadline keeps a stuck env manager from blocking the HTTP server. */
+    /* Poll for the reply, handing the CPU to Ring-3 while we wait (below). The
+     * send woke init; the yield lets it run, process the request, and reply.
+     * The deadline keeps a stuck env manager from blocking the HTTP server. */
     uint64_t deadline = kernel_tick_counter + ENV_CREATE_TIMEOUT_TICKS;
     while ((int64_t)(kernel_tick_counter - deadline) < 0) {
         uint8_t reply[ENV_REPLY_MAX];
@@ -75,9 +76,24 @@ int env_service_create(uint32_t partition, uint32_t index,
                 return 0;
             }
         }
-        /* Keep the kernel's periodic service work ticking while we wait, and
-         * yield the pipeline so the preempting scheduler can run init. */
+        /* Keep the kernel's periodic service work ticking while we wait, then
+         * hand the CPU to Ring-3.
+         *
+         * POSIX-Environments E1: the unified boot's Ring-0 path never
+         * schedules — Ring-3 work runs only while the control plane yields —
+         * and smp_uniprocessor_tick() is a no-op once an AP is online, so
+         * without this call the spin below is a hole in the cooperative
+         * schedule: init cannot even read the request just queued, the
+         * deadline expires, and its reply arrives after we stopped looking.
+         * That is exactly what the deferred E4 boot check found (6.25 M polls,
+         * 0 messages received, with init's own trace printing `req recv'd /
+         * reply built / send OK` only after the deadline line). Ring-3 answers
+         * within a few budgets when it is alive; a dead env manager never
+         * answers, which is what the deadline is for. Same call the shell and
+         * HTTP loops' idle points make, and a no-op on every non-unified
+         * boot. */
         smp_uniprocessor_tick();
+        kernel_yield_to_ring3(PROC_CONTROL_PLANE_BUDGET_TICKS);
         __asm__ volatile("pause");
     }
     return -1;   /* init did not reply before the deadline */
