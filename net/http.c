@@ -1375,6 +1375,14 @@ static int api_processes_json(char* buf, int max) {
         // Navigator-Parity Gap Roadmap Phase 4: job priority tier.
         jb_str(&j,  "priority", proc_priority_name(pd->priority)); jb_putc(&j, ',');
         jb_uint(&j, "uid",   pd->owner_uid);                  jb_putc(&j, ',');
+        /* POSIX-Environments E4 (roadmap §7.1, verification plan): the
+         * partition this process is scheduled in and charges its frames to.
+         * Nothing exposed it before, so the E4 boot check could not assert
+         * that an environment's sidecars really carry their target partition
+         * (and neither could an operator looking at a process drawing down a
+         * tenant's quota — the same "nothing exposed it" gap owner_node had
+         * on /api/partitions). */
+        jb_uint(&j, "partition_id", pd->partition_id);        jb_putc(&j, ',');
         jb_hex(&j,  "rip",   pd->user_rip);
         jb_obj_close(&j);
     }

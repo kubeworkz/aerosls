@@ -854,6 +854,76 @@ int main(void) {
               "E3: a NULL request is rejected");
     }
 
+    /* ── 0c2. E4 follow-on: a targeted allocation charges the TARGET ─────
+     * SYS_SLS_ALLOC_REGION's `target_partition` (0 = the caller's own, which
+     * is what every E3 caller passes and what 0c just proved). The environment
+     * manager passes the ENVIRONMENT's partition, so a tenant's 4 MiB heap and
+     * 1 MiB of storage count against the tenant's frame quota instead of the
+     * environment manager's PARTITION_SYSTEM quota — before this, they were
+     * billed to init, so a tenant was not quota-bounded for its own storage
+     * and a placement the kernel refused leaked all 1344 frames to the creator
+     * (roadmap §7.2 measured both).
+     *
+     * The three refusals mirror cap_create_sidecar_in's target gate in the
+     * same order (caller not PARTITION_SYSTEM, target absent, target paused),
+     * so an environment cannot be billed to a partition that does not exist,
+     * is paused, or belongs to another tenant.
+     *
+     * TOOTH: charge the caller again — hand `caller->partition_id` to the
+     * allocator instead of the resolved target — and the assertion below sees
+     * partition 0 recorded for a request that named 5, so the check fails while
+     * the size/alignment checks still pass. */
+    {
+        host_stub_partition_extra_id     = 5;   /* a second live partition */
+        host_stub_partition_extra_paused = 0;
+
+        struct SLSAllocRegionRequest ar = { .nframes = 1024, .align_frames = 1,
+                                            .target_partition = 5 };
+        g_cur_pid = 100;                        /* init: PARTITION_SYSTEM, authority */
+        g_alloc_region_calls = 0;
+        g_alloc_region_last_part = 0xFFFFFFFFu;
+        uint64_t tbase = sys_sls_alloc_region(&ar);
+        CHECK(tbase != 0 && g_alloc_region_calls == 1,
+              "E4: a PARTITION_SYSTEM caller gets a region for another partition");
+        CHECK(g_alloc_region_last_part == 5,
+              "E4: a targeted allocation is charged to the TARGET partition, not the caller's");
+        CHECK(g_alloc_region_last_nframes == 1024 && g_alloc_region_last_align == 1,
+              "E4: the region size/alignment still pass straight through");
+
+        /* Target paused: refused, and the allocator is never reached. */
+        host_stub_partition_extra_paused = 1;
+        g_alloc_region_calls = 0;
+        CHECK(sys_sls_alloc_region(&ar) == 0,
+              "E4: a paused target partition is refused (returns 0)");
+        CHECK(g_alloc_region_calls == 0,
+              "E4: the paused-target refusal never reaches the allocator");
+        host_stub_partition_extra_paused = 0;
+
+        /* The caller's own partition is not PARTITION_SYSTEM any more. */
+        proc_table[0].partition_id = 5;         /* pretend init is a tenant */
+        g_alloc_region_calls = 0;
+        CHECK(sys_sls_alloc_region(&ar) == 0,
+              "E4: a non-PARTITION_SYSTEM caller may not charge another partition");
+        CHECK(g_alloc_region_calls == 0,
+              "E4: the non-system target refusal never reaches the allocator");
+
+        /* Still the system caller, targeting a partition that does not exist. */
+        ar.target_partition = 7;                /* only 0 and 5 are active here */
+        CHECK(sys_sls_alloc_region(&ar) == 0,
+              "E4: charging a non-active partition is refused (returns 0)");
+        CHECK(g_alloc_region_calls == 0,
+              "E4: the absent-target refusal never reaches the allocator");
+        proc_table[0].partition_id = 0;         /* restore: init is PARTITION_SYSTEM */
+
+        /* ...and target 0 still charges the CALLER, which is the E3 shape. */
+        ar.target_partition = 0;
+        g_alloc_region_calls = 0;
+        CHECK(sys_sls_alloc_region(&ar) != 0 && g_alloc_region_last_part == 0,
+              "E3: target 0 still charges the caller's own partition");
+
+        host_stub_partition_extra_id = 0xFFFFFFFFu;   /* restore the shared stub */
+    }
+
     /* ── 0d. E4 partition-targeted creation: the target_partition gate ───
      * cap_create_sidecar_in places the child in target_partition (0 = inherit,
      * tested everywhere else here). A nonzero target is honoured ONLY for a

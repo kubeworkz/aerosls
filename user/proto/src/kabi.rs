@@ -198,6 +198,19 @@ pub trait Kernel {
         let _ = (nframes, align_frames);
         0
     }
+
+    /// Like `alloc_region`, but charge `target_partition` instead of the
+    /// caller's partition (0 = the caller's — POSIX-Environments E4
+    /// follow-on, so a tenant environment's heap and storage count against
+    /// the TENANT's frame quota rather than the environment manager's). The
+    /// kernel honours a nonzero target only for a PARTITION_SYSTEM caller into
+    /// a live, unpaused partition. Default: ignore the partition and charge
+    /// the caller, so fakes that do not model partitions still work.
+    fn alloc_region_in(&self, nframes: u64, align_frames: u64,
+                       target_partition: u32) -> u64 {
+        let _ = target_partition;
+        self.alloc_region(nframes, align_frames)
+    }
 }
 
 // ── Real kernel ABI (feature `target`) ───────────────────────────────────────
@@ -319,12 +332,16 @@ mod abi {
     }
 
     /// SLSAllocRegionRequest (kernel/cap.h) — layout mirrors it exactly:
-    /// two u64s, no padding.
+    /// two u64s, then the E4 target partition and its pad (the request is
+    /// still 8-byte aligned; `k_alloc_region` sends 0 there, which the kernel
+    /// reads as "charge the caller", the pre-E4 behaviour).
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct AllocRegionReq {
         nframes: u64,
         align_frames: u64,
+        target_partition: u32,
+        _pad: u32,
     }
 
     /// Kernel SLSCapDesc (slot u16 + pad; proto's CapDescriptor is slot
@@ -843,13 +860,30 @@ mod abi {
         unsafe { sls_syscall(SYS_IRQ_MASK, &mut req as *mut IrqMaskReq as u64) as i32 }
     }
 
-    /// `k_alloc_region`: syscall 320. Allocate a contiguous physical region
-    /// of `nframes` frames, aligned to `align_frames` frames (a power of two;
-    /// 1 = any boundary), charged to the caller's partition. Returns the base
-    /// physical address, or 0 on failure/denial. POSIX-Environments E3.
+    /// `k_alloc_region`: syscall 320, charged to the caller's partition.
+    /// Allocate a contiguous physical region of `nframes` frames, aligned to
+    /// `align_frames` frames (a power of two; 1 = any boundary). Returns the
+    /// base physical address, or 0 on failure/denial. POSIX-Environments E3.
     #[no_mangle]
     pub extern "C" fn k_alloc_region(nframes: u64, align_frames: u64) -> u64 {
-        let req = AllocRegionReq { nframes, align_frames };
+        k_alloc_region_in(nframes, align_frames, 0)
+    }
+
+    /// `k_alloc_region_in`: syscall 320 with a `target_partition` (0 = the
+    /// caller's). POSIX-Environments E4 follow-on — the environment manager
+    /// uses it so an environment's heap and storage are charged to the
+    /// tenant partition, not to init's. The kernel refuses a nonzero target
+    /// from a non-PARTITION_SYSTEM caller, a partition that does not exist and
+    /// a paused one (all as 0, this ABI's only failure value).
+    #[no_mangle]
+    pub extern "C" fn k_alloc_region_in(nframes: u64, align_frames: u64,
+                                       target_partition: u32) -> u64 {
+        let req = AllocRegionReq {
+            nframes,
+            align_frames,
+            target_partition,
+            _pad: 0,
+        };
         unsafe { sls_syscall(SYS_ALLOC_REGION, &req as *const AllocRegionReq as u64) }
     }
 
@@ -1046,6 +1080,11 @@ mod abi {
 
         fn alloc_region(&self, nframes: u64, align_frames: u64) -> u64 {
             k_alloc_region(nframes, align_frames)
+        }
+
+        fn alloc_region_in(&self, nframes: u64, align_frames: u64,
+                           target_partition: u32) -> u64 {
+            k_alloc_region_in(nframes, align_frames, target_partition)
         }
     }
 }

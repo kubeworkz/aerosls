@@ -4146,12 +4146,23 @@ uint64_t sys_sls_create_sidecar(struct SLSCreateSidecarRequest* req) {
 
 /* ─── sys_sls_alloc_region (320) ─────────────────────────────────────────
  * POSIX-Environments E3: allocate a contiguous physical region charged to
- * the caller's partition, returning its base physical address (0 on any
- * failure). Gated to the sidecar creator tree, exactly like
- * cap_create_sidecar: a process without sidecar_authority (an
- * HTTP/shell-spawned PROGRAM) must not be able to mint arbitrary physical
- * memory. Charging to the CALLER's own partition keeps it backward
- * compatible — a target-partition variant is E4's job. */
+ * `target_partition` when it is nonzero and to the CALLER's partition
+ * otherwise, returning its base physical address (0 on any failure). Gated to
+ * the sidecar creator tree, exactly like cap_create_sidecar: a process
+ * without sidecar_authority (an HTTP/shell-spawned PROGRAM) must not be able
+ * to mint arbitrary physical memory.
+ *
+ * POSIX-Environments E4 follow-on for `target_partition`: every E3 caller
+ * passes 0 and is unchanged; a nonzero target is honoured only for a
+ * PARTITION_SYSTEM caller (the environment manager) into a live, unpaused
+ * partition — the same rule 4a2 above applies to a sidecar create, and for the
+ * same reason. While the env manager allocated with this path's caller-charged
+ * form, an environment's 4 MiB heap and 1 MiB of storage were billed to init's
+ * PARTITION_SYSTEM quota (measured in roadmap §7.2: the creator moved by +1360
+ * on a successful create, the tenant by only +176), and a placement the kernel
+ * then refused had already taken all 1344 frames with nothing holding them.
+ * Charging through this gate makes the refusal happen before any frame is
+ * taken, so a refused placement allocates nothing anywhere. */
 uint64_t sys_sls_alloc_region(struct SLSAllocRegionRequest* req) {
     if (!req) return 0;
     struct ProcessDescriptor* caller = sidecar_find_pid(cap_current_pid());
@@ -4161,6 +4172,36 @@ uint64_t sys_sls_alloc_region(struct SLSAllocRegionRequest* req) {
             (unsigned)cap_current_pid());
         return 0;
     }
+
+    uint32_t charged = caller->partition_id;
+    if (req->target_partition != 0) {
+        if (caller->partition_id != PARTITION_SYSTEM) {
+            kernel_serial_printf(
+                "[ALLOC_REGION] CAP_EPERM: pid=%u (partition %u) may not "
+                "charge partition %u — only PARTITION_SYSTEM may allocate "
+                "into another partition\n",
+                (unsigned)cap_current_pid(), (unsigned)caller->partition_id,
+                (unsigned)req->target_partition);
+            return 0;
+        }
+        if (req->target_partition >= PARTITION_MAX ||
+            !partition_exists(req->target_partition)) {
+            kernel_serial_printf(
+                "[ALLOC_REGION] CAP_EINVAL: target partition %u is not an "
+                "active partition\n",
+                (unsigned)req->target_partition);
+            return 0;
+        }
+        if (partition_is_paused(req->target_partition)) {
+            kernel_serial_printf(
+                "[ALLOC_REGION] CAP_EPERM: target partition %u is paused — "
+                "cannot charge it\n",
+                (unsigned)req->target_partition);
+            return 0;
+        }
+        charged = req->target_partition;
+    }
+
     return allocate_contiguous_frames_for_partition(
-        caller->partition_id, req->nframes, req->align_frames);
+        charged, req->nframes, req->align_frames);
 }

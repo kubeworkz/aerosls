@@ -100,8 +100,23 @@ char stack_top[16] __attribute__((weak));
  * getters are deliberately NOT stubbed here: cap.c's E4 path leaves quota
  * enforcement to the per-frame allocator, and several tests define their own
  * partition_get_frame_usage/_quota, which a weak def here would collide with.) */
-__attribute__((weak)) int partition_exists(uint32_t partition_id) { return partition_id == 0; }
-__attribute__((weak)) int partition_is_paused(uint32_t partition_id) { (void)partition_id; return 0; }
+
+/* ...and one test may opt a SECOND partition into existence (and pause it)
+ * without touching this default: with host_stub_partition_extra_id left at
+ * 0xFFFFFFFF nothing matches and every other test behaves exactly as before,
+ * while a test that sets it can exercise the POSITIVE path of a targeted
+ * operation and its paused refusal. cap_create_sidecar_host_test.c's E4
+ * alloc-region section is the first caller (the targeted charging and its
+ * three refusals cannot all be reached through partition 0 alone). */
+__attribute__((weak)) uint32_t host_stub_partition_extra_id     = 0xFFFFFFFFu;
+__attribute__((weak)) int      host_stub_partition_extra_paused = 0;
+__attribute__((weak)) int partition_exists(uint32_t partition_id) {
+    return partition_id == 0 || partition_id == host_stub_partition_extra_id;
+}
+__attribute__((weak)) int partition_is_paused(uint32_t partition_id) {
+    return partition_id == host_stub_partition_extra_id &&
+           host_stub_partition_extra_paused != 0;
+}
 
 /* ─── POSIX-Environments E4 (part 3b): env-manager control channel ───────────
  * cap.c's "kernel.*" wiring calls env_service_register() when it wires the

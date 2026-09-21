@@ -22,7 +22,10 @@ use crate::{posix_manifest, ramdisk_manifest};
 /// Per-environment frame budgets (must match the manifest builders' heap
 /// sizes). A POSIX environment draws POSIX_HEAP_FRAMES + RD_HEAP_FRAMES +
 /// RD_STORAGE_FRAMES frames up front, plus the two sidecars' image/stack
-/// frames the kernel charges to the partition on create.
+/// frames the kernel charges to the partition on create. ALL of it is charged
+/// to the environment's partition: the regions by `alloc_region_in` below
+/// (E4 follow-on — before it, these 1344 frames were billed to init's
+/// PARTITION_SYSTEM quota), the sidecar frames by `cap_create_sidecar_in`.
 pub const POSIX_HEAP_FRAMES: u64 = 1024; // 4 MiB — build_posix_manifest_tenant heap
 pub const RD_HEAP_FRAMES: u64 = 64; //     256 KiB — build_ramdisk_manifest_named heap
 pub const RD_STORAGE_FRAMES: u64 = 256; // 1 MiB — the private block device
@@ -98,12 +101,16 @@ pub fn create_environment<K: Kernel>(
     index: u32,
     images: &EnvImages,
 ) -> Result<Environment, i32> {
-    // Private regions from the frame pool. alloc_region returns 0 on
+    // Private regions from the frame pool, charged to the TARGET partition
+    // (E4 follow-on): the environment's heap and storage must count against
+    // the tenant's frame quota, not the environment manager's — otherwise a
+    // tenant is not quota-bounded for its own storage and a refused placement
+    // leaves the regions on the creator. alloc_region_in returns 0 on
     // exhaustion/denial; allocate all three before creating anything so a
     // shortfall fails cleanly, with nothing half-built.
-    let rd_heap = k.alloc_region(RD_HEAP_FRAMES, 1);
-    let rd_storage = k.alloc_region(RD_STORAGE_FRAMES, 1);
-    let px_heap = k.alloc_region(POSIX_HEAP_FRAMES, 1);
+    let rd_heap = k.alloc_region_in(RD_HEAP_FRAMES, 1, partition);
+    let rd_storage = k.alloc_region_in(RD_STORAGE_FRAMES, 1, partition);
+    let px_heap = k.alloc_region_in(POSIX_HEAP_FRAMES, 1, partition);
     if rd_heap == 0 || rd_storage == 0 || px_heap == 0 {
         return Err(ERR_NOMEM);
     }
@@ -248,12 +255,18 @@ mod tests {
         assert_eq!(env.partition, 5);
         assert_eq!(env.index, 3);
 
-        // Three private regions were allocated with the environment budgets.
+        // Three private regions were allocated with the environment budgets —
+        // and each of them charged to the TARGET partition. This is the
+        // assertion that bites when the charging reverts to the caller: an
+        // `alloc_region(...)` call here would record partition 0 ("the
+        // caller's") for all three while the region sizes stayed identical.
         let regions = k.regions();
         assert_eq!(regions.len(), 3);
-        assert_eq!(regions[0], (RD_HEAP_FRAMES, 1));
-        assert_eq!(regions[1], (RD_STORAGE_FRAMES, 1));
-        assert_eq!(regions[2], (POSIX_HEAP_FRAMES, 1));
+        assert_eq!(regions[0], (RD_HEAP_FRAMES, 1, 5));
+        assert_eq!(regions[1], (RD_STORAGE_FRAMES, 1, 5));
+        assert_eq!(regions[2], (POSIX_HEAP_FRAMES, 1, 5));
+        assert!(regions.iter().all(|r| r.2 == env.partition),
+                "every environment region is charged to the environment's partition");
 
         // Two sidecars were created, BOTH targeting partition 5.
         let created = k.created();
