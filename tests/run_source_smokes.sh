@@ -19,9 +19,10 @@
 # the verify job calls, so every source-only smoke's teeth are proven on
 # every push, independent of the kernel build.
 #
-# The eight build-needing smokes are excluded by name — five carry
-# GUARD-KIND: build for run_checks.sh, and three boot the built ISO (the
-# two phase5 smokes and the E1 unified-boot tooth). Everything else that
+# The nine build-needing smokes are excluded by name — five carry
+# GUARD-KIND: build for run_checks.sh, and four boot the built ISO (the
+# two phase5 smokes, the E1 unified-boot tooth and the E4
+# environment-create tooth). Everything else that
 # globs *_smoke.sh runs here, so a NEW source-only smoke is covered
 # automatically; and a smoke that is NOT on the exclusion list but cannot
 # run is a failure, not a skip, so a smoke that stops being source-only
@@ -31,12 +32,12 @@
 set -u
 cd "$(dirname "$0")/.."   # repo root
 
-# The eight build-needing smokes — the same set as the GUARD-KIND: build
+# The nine build-needing smokes — the same set as the GUARD-KIND: build
 # markers in run_checks.sh, plus the boot smokes (they boot
 # sls_operating_system.iso under QEMU, which only exists on a build host;
 # kernel-guards runs them for real right after `make x86-iso`). Keep in
 # step with what kernel-guards builds.
-BUILD_SMOKES="code_buffer_budget_smoke.sh kernel_image_end_smoke.sh no_hosted_link_smoke.sh no_tls_relocations_smoke.sh stack_frame_budget_smoke.sh phase5_boot_smoke.sh phase5_e1000_driver_smoke.sh unified_boot_check_smoke.sh"
+BUILD_SMOKES="code_buffer_budget_smoke.sh kernel_image_end_smoke.sh no_hosted_link_smoke.sh no_tls_relocations_smoke.sh stack_frame_budget_smoke.sh phase5_boot_smoke.sh phase5_e1000_driver_smoke.sh unified_boot_check_smoke.sh env_create_boot_check_smoke.sh"
 
 shopt -s nullglob
 smokes=(tests/*_smoke.sh)

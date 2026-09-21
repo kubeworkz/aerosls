@@ -103,10 +103,14 @@ pub struct SimKernel {
     /// Handles minted by `create_sidecar` (the sim's spawn log — tests
     /// assert a spawn happened and how often).
     spawns: UnsafeCell<Vec<u32>>,
-    /// POSIX-Environments E4: `alloc_region` calls as `(nframes, align)`, and
-    /// the next fake region base to hand out. When `regions_exhausted` is set,
-    /// `alloc_region` returns 0 (the frame pool cannot back the request).
-    regions: UnsafeCell<Vec<(u64, u64)>>,
+    /// POSIX-Environments E4: region allocations as `(nframes, align,
+    /// charged_partition)`, and the next fake region base to hand out. When
+    /// `regions_exhausted` is set, an allocation returns 0 (the frame pool
+    /// cannot back the request). The partition is recorded so a test can prove
+    /// an environment's heap and storage are charged to the TENANT: with the
+    /// caller-charged `alloc_region` the third field is 0 ("the caller's"),
+    /// with the E4 follow-on `alloc_region_in` it is the environment's own.
+    regions: UnsafeCell<Vec<(u64, u64, u32)>>,
     next_region_base: UnsafeCell<u64>,
     regions_exhausted: UnsafeCell<bool>,
     /// POSIX-Environments E4: each `create_sidecar_in` as `(manifest bytes,
@@ -132,8 +136,9 @@ impl SimKernel {
         }
     }
 
-    /// POSIX-Environments E4: the `(nframes, align)` of each `alloc_region`.
-    pub fn regions(&self) -> Vec<(u64, u64)> {
+    /// POSIX-Environments E4: the `(nframes, align, charged_partition)` of each
+    /// region allocation.
+    pub fn regions(&self) -> Vec<(u64, u64, u32)> {
         // SAFETY: single-threaded test harness only.
         unsafe { (*self.regions.get()).clone() }
     }
@@ -347,8 +352,16 @@ impl Kernel for SimKernel {
     }
 
     fn alloc_region(&self, nframes: u64, align_frames: u64) -> u64 {
+        // 0 in the partition slot is the ABI's "charge the caller" — the sim
+        // does not model a caller's partition, so the two are distinguished by
+        // value, exactly as the kernel sees them.
+        self.alloc_region_in(nframes, align_frames, 0)
+    }
+
+    fn alloc_region_in(&self, nframes: u64, align_frames: u64,
+                       target_partition: u32) -> u64 {
         // SAFETY: single-threaded test harness only.
-        unsafe { (*self.regions.get()).push((nframes, align_frames)) };
+        unsafe { (*self.regions.get()).push((nframes, align_frames, target_partition)) };
         if unsafe { *self.regions_exhausted.get() } {
             return 0;
         }

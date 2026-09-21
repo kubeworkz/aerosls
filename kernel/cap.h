@@ -1030,18 +1030,33 @@ void cap_set_bib_flags(uint32_t flags);
 uint64_t sys_sls_create_sidecar(struct SLSCreateSidecarRequest* req);
 
 /* ─── SYS_SLS_ALLOC_REGION (320) — POSIX-Environments E3 ─────────────────
- * Allocate a contiguous physical MEM region, charged to the CALLER's
- * partition, and return its base physical address (0 on failure/denial).
- * The env manager (init) uses it to give each POSIX environment a private
- * heap and its ramdisk private storage, instead of the fixed boot-layout
- * addresses init computes today. Restricted to the sidecar creator tree
- * (the E2 sidecar_authority flag): a plain ring-3 program must not be able
- * to mint arbitrary physical regions. The whole run is quota-checked, so a
- * partition cannot exceed its frame quota through this path either. */
+ * Allocate a contiguous physical MEM region, charged to `target_partition`
+ * when it is nonzero and to the CALLER's partition otherwise, and return its
+ * base physical address (0 on failure/denial). The env manager (init) uses it
+ * to give each POSIX environment a private heap and its ramdisk private
+ * storage, instead of the fixed boot-layout addresses init computes today.
+ * Restricted to the sidecar creator tree (the E2 sidecar_authority flag): a
+ * plain ring-3 program must not be able to mint arbitrary physical regions.
+ * The whole run is quota-checked against the CHARGED partition, so that
+ * partition cannot exceed its frame quota through this path either.
+ *
+ * POSIX-Environments E4 follow-on for `target_partition`: every E3 caller
+ * passes 0 and is unchanged, while a nonzero target is honoured only for a
+ * PARTITION_SYSTEM caller (the environment manager) into a live, unpaused
+ * partition — the same rule cap_create_sidecar_in applies to its own
+ * target_partition, and for the same reason. Without it an environment's
+ * 4 MiB heap and 1 MiB of storage were allocated by init and billed to init's
+ * PARTITION_SYSTEM quota: a tenant was not quota-bounded for its own storage
+ * (its disk counted against the system partition), and a placement the kernel
+ * refused left all 1344 frames charged to the creator with nothing holding
+ * them (roadmap §7.2, which measured both). */
 #define SYS_SLS_ALLOC_REGION 320
 struct SLSAllocRegionRequest {
-    uint64_t nframes;       /* region size in 4 KiB frames */
-    uint64_t align_frames;  /* alignment in frames (power of two; 1 = any) */
+    uint64_t nframes;         /* region size in 4 KiB frames */
+    uint64_t align_frames;    /* alignment in frames (power of two; 1 = any) */
+    uint32_t target_partition;/* E4: charge this partition; 0 = the caller's */
+    uint32_t _pad;            /* request stays 8-byte aligned (mirrored in
+                               * user/proto/src/kabi.rs's AllocRegionReq) */
 };
 uint64_t sys_sls_alloc_region(struct SLSAllocRegionRequest* req);
 
