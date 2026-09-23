@@ -36,10 +36,11 @@ int main(void) {
     CHECK(ENV_CREATE == 1 && ENV_DESTROY == 2, "opcodes");
     CHECK(ENV_FLAG_ERROR == 0x0001, "ENV_FLAG_ERROR");
     CHECK(ENV_OK == 0 && ENV_ERR_INVAL == 1 && ENV_ERR_NOMEM == 2 &&
-          ENV_ERR_PART == 3 && ENV_ERR_FULL == 4 && ENV_ERR_UNSUPP == 5,
+          ENV_ERR_PART == 3 && ENV_ERR_FULL == 4 && ENV_ERR_UNSUPP == 5 &&
+          ENV_ERR_NOENT == 6,
           "status codes");
     CHECK(ENV_FRAME_SIZE == 16 && ENV_CREATE_BODY_SIZE == 8 &&
-          ENV_DESTROY_BODY_SIZE == 4 && ENV_REPLY_BODY_SIZE == 12,
+          ENV_DESTROY_BODY_SIZE == 8 && ENV_REPLY_BODY_SIZE == 12,
           "sizes");
 
     /* ── frame encode: magic "AEROSEN\x01" + LE fields ────────────────────── */
@@ -74,6 +75,16 @@ int main(void) {
     CHECK(env_read_u32(cb, 0) == 0x11223344u && env_read_u32(cb, 4) == 0x55667788u,
           "create body round-trips partition + index");
     CHECK(cb[0] == 0x44 && cb[3] == 0x11, "create body is little-endian");
+
+    /* ── ENV_DESTROY body: { env_id u32, partition u32 } LE ───────────────── */
+    /* The partition is carried, not assumed: the control plane's destroy route
+     * is nested under the partition it names, so without it a caller could end
+     * partition B's environment through a path naming partition A. */
+    uint8_t db[ENV_DESTROY_BODY_SIZE];
+    env_destroy_body_encode(db, 0x01020304u, 0x0A0B0C0Du);
+    CHECK(env_read_u32(db, 0) == 0x01020304u && env_read_u32(db, 4) == 0x0A0B0C0Du,
+          "destroy body round-trips env_id + partition");
+    CHECK(db[0] == 0x04 && db[3] == 0x01, "destroy body is little-endian");
 
     /* ── reply body parse: { status u16, pad u16, env_id u32, partition u32 } */
     uint8_t rb[ENV_REPLY_BODY_SIZE];

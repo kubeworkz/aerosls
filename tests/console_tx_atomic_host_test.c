@@ -126,6 +126,17 @@ uint64_t allocate_contiguous_frames_for_partition(uint32_t partition_id,
     return 0;
 }
 
+/* SYS_SLS_FREE_REGION's frame-pool hook (POSIX-Environments E5) — the
+ * allocator's counterpart. Reached only by that syscall, which this test never
+ * issues; the real one's bitmap/owner/counter behaviour is covered by
+ * frame_quota_host_test.c's contiguous scenarios and end to end by
+ * tests/env_recycle_boot_check.sh. */
+int free_contiguous_frames_for_partition(uint64_t base_addr, uint64_t nframes,
+                                         uint32_t partition_id) {
+    (void)base_addr; (void)nframes; (void)partition_id;
+    return 0;
+}
+
 /* Page-table hooks are only reached by cap_create_sidecar (not called
  * here); inert stubs that satisfy the linker. */
 uint64_t user_clone_page_table(void) { return 0; }

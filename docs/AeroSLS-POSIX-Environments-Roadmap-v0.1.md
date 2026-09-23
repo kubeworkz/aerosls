@@ -142,7 +142,7 @@ The obvious cheaper shape — give up after a **single** attempt, so a waiter ne
 
 **Verified (2026-09-17, this host).**
 
-- `tests/run_all.sh` — **112/0** with the new `serial_tx_lock_host_test` (25 checks) in the count; `tests/run_checks.sh` 27 passed / 1 failed / 6 skipped, the failure being §6.1's pre-existing `e3_multi_env_boot_check.sh`.
+- `tests/run_all.sh` — **112/0** with the new `serial_tx_lock_host_test` (25 checks) in the count; `tests/run_checks.sh` 27 passed / 1 failed / 6 skipped, the failure being §6.1's pre-existing `e3_multi_env_boot_check.sh`. *Superseded:* that failure is closed (§6.1), and the guards have grown since — see §8.1 for the counts as of the E5 work.
 - `tests/unified_boot_check.sh` — 17 assertions green on the unified entry, including the two that only a unified boot can satisfy: `/api/health` answered twice across a heartbeat sample (heartbeats advanced 6 → 57 while the control plane served), and a typed `help` answered by the *kernel* shell (the control plane owns the console). Boot-to-verdict ~15 s.
 - `tests/unified_boot_check_smoke.sh` — tooth (kernel-only entry) fails in ~8 s naming the contradiction; restore run passes. ~19 s total.
 - The other two modes did not move: `tests/run_all.sh` 111/0; the boot guards the serial-TX change touches all pass on the same ISO — `phase5_boot_smoke.sh`, `phase5_e1000_driver_smoke.sh` (`[e1000] PASS` present), `aerocap_boot_check.sh`, `cap_boot_check.sh` — and the kernel-only boot still reaches `/api/health` (CI's own decoder-build step).
@@ -179,7 +179,7 @@ The obvious cheaper shape — give up after a **single** attempt, so a waiter ne
 
 **Verification plan.** In the Phase 5 boot — which does not need E1 — `init` starts two tenant-profile instances in `PARTITION_SYSTEM`, each with its own ramdisk. Each runs a boot script that writes a file and lists the root. Assert both reach `System ready` and each sees only its own file. **Tooth:** point both instances at the same ramdisk — the isolation assertion fails.
 
-### 6.1 Findings (2026-09-17) — `e3_multi_env_boot_check.sh` is red on `main`
+### 6.1 Findings (2026-09-17) — `e3_multi_env_boot_check.sh` WAS red on `main` (closed)
 
 Found while validating E1, and **not** an E1 regression: the check fails identically on the pristine tree at `8350ed1` (a detached worktree of `main`, no E1 changes) and on the E1 branch, on the same host, with the same verdict —
 
@@ -190,6 +190,8 @@ FAIL  within 120s: init done-marker or 3 live rootfs never seen (live rootfs: 2/
 What the boot shows: both tenants ARE spawned (`[INIT] E3 env 1/2: drv.ramdisk.<i> spawned`, `aerosls.posix.<i> spawned`), the boot completes to `System ready` and the shell prompt, but only two `[POSIX] aero state=00000000` (live rootfs) lines ever appear, and init's `[INIT] E3: tenant environments spawned.` marker is missing from the log even though the line is printed unconditionally after the tenant loop (`user/init/src/entry.rs`) — i.e. at least one tenant POSIX instance does not reach a live rootfs inside the window, and the marker line is lost on the shared console. `x86-iso-e3` is built by no CI job (§5's `kernel-guards` builds only `x86-iso`), which is why this has been invisible.
 
 Left as found — it is E3's to close, not E1's — but recorded here because E1's own guard work now depends on reading that same shared console, and because the check's `done_marker` gate is the fragile-grep shape E1's guard had to stop using (see §4.1).
+
+**Closed (E3, PR #47).** The guard is green and now runs in CI. The cause was not the boot: the kernel DROPPED every byte a sidecar wrote while the irqtest's serial-loopback window held the port, and the two tenants' diagnostic batches landed inside that window — so both tenants came up on distinct private ramdisks and the evidence of it was destroyed in the same instant. The interlock now defers and replays that output instead of discarding it (the hardware MCR bit is the authority for "the wire is free", not the setter that runs before its own `outb`), the guard's address parse is anchored so a coalesced line cannot read the e1000 BAR0 as a tenant's storage base, and its gate is the three live-rootfs lines rather than init's lossy console marker. `kernel-guards` now builds `x86-iso-e3` before the guards step, so `run_checks.sh --require-all` exercises it on every push and this cannot go unseen again.
 
 ## 7. Phase E4 — Partition-targeted creation and the environment manager
 
@@ -263,6 +265,18 @@ So the gate is pinned where it is reachable instead: `tests/cap_create_sidecar_h
 **Explicitly not in scope.** Graceful in-environment shutdown (signalling processes inside the POSIX sidecar before the kill).
 
 **Verification plan.** A recycle program in the style of `part_recycle.c`: N cycles of partition create → environment create → run a command → destroy, where N exceeds `PROC_MAX` and `SIDECAR_REGISTRY_MAX`. Assert process slots, registry entries and the system frame count are stable across all N. **Tooth:** skip the registry cleanup — the cycle that exceeds the registry size fails with registry full.
+
+### 8.1 Findings (E5) — three defects the recycle guard flushed out
+
+The guard is `tests/env_recycle_boot_check.sh` (18 create → destroy cycles over the unified boot's HTTP control plane, teeth in `env_recycle_boot_check_smoke.sh`); both are picked up by `run_checks.sh` and `run_guard_smokes.sh` by name. One clause of the plan is not implemented and is stated in the guard's own header: "run a command" inside the environment needs E6's terminals, so a cycle asserts placement, wiring and per-partition charging instead.
+
+Writing it found three real defects, none of which any host test could have seen:
+
+1. **Channel ids were never reused.** `cap_chan_create` exhausted `CAP_CHAN_MAX` (64) partway through the loop. Channel ids are now returned by `cap_object_destroy()` (and by the object-alloc failure path that had reserved one).
+2. **`alloc_proc_syscall_stack()` could not pair its two frames.** It called the single-frame allocator twice and trusted the results to be adjacent, on the reasoning that "first-fit ASCENDING plus single-threaded means two consecutive allocs are neighbours". Measured: the lowest free frame was `0x0e1ff000`, with the 64 MiB cap arena and the tenant's 1344-frame region immediately above it, so the two calls returned `0x0e1ff000` and `0x12740000` — 17728 frames apart — and the retry could not help. Every environment create died with `[SIDECAR] create: syscall stack allocation failed`, the E4 guard with it. The pair now comes from `allocate_contiguous_frames_for_partition()`; `tests/syscall_stack_pair_host_test.c` reproduces the geometry by frame number and fails 8 of its checks if the old body returns.
+3. **`cap_revoke()` shared one static scratch array across every revoke.** It collected holder indices into `static uint16_t holders[CAP_HOLDER_MAX]`, and two cores revoking *different* objects do not contend (different object locks), so the second walk overwrote the first's list — after which the first stamped `CAP_FREELIST_END` into nodes the second had already pushed back onto the holder freelist, **truncating it**. The pool then reported itself empty while thousands of nodes were free, and creates died with `chan_create failed (-7)`. The dead holders are now chained through their own `next` with the head in a local, so no scratch storage exists. Control: with only the shared-static form restored, the 18-cycle guard fails 3/3 at cycles 4, 6 and 7.
+
+**Verified.** `tests/run_all.sh` 115/0/2 (including the new 16-check pair test); `run_checks.sh --require-all` with the E3 guard green and the new E5 guard in the set; the E5 guard green on six four-core runs (and two single-core control runs); `env_create_boot_check.sh` green; `e3_multi_env_boot_check.sh` green; the E5 teeth 4/4; `script_conventions_check.sh` 0 violations.
 
 ## 9. Phase E6 — Terminals and the control-plane surface
 

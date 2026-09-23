@@ -592,6 +592,26 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         MAX_ENVIRONMENTS,
     );
 
+    // POSIX-Environments E5: every ENV request is also a tick for the
+    // environment table. A `partition destroy` ends an environment's sidecars
+    // without an ENV_DESTROY ever being asked for, and the manager can only
+    // notice from inside a request — so it is done there (EnvManager)
+    // and reported here when the count moves, rather than silently: an
+    // environment that ends is ended, and never restarted (roadmap §8).
+    let mut handle_env = |req: &[u8], reply: &mut [u8]| -> usize {
+        let before = env_mgr.ended_without_destroy();
+        let n = env_mgr.handle_request(&RealKernel, req, reply);
+        let after = env_mgr.ended_without_destroy();
+        if after > before {
+            log_fmt!(
+                &console,
+                "[INIT] {} environment(s) ended by their partition's teardown — table cleared, not restarted",
+                after - before,
+            );
+        }
+        n
+    };
+
     // POSIX-Environments E1: two loops, one per boot shape. A unified boot
     // (posix_channel == None, because the hardware path above was skipped) runs
     // the heartbeat loop; every other boot runs the supervisor loop unchanged.
@@ -605,7 +625,7 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
             &posix_policy,
             respawn_posix,
             env_channel,
-            |req: &[u8], reply: &mut [u8]| env_mgr.handle_request(&RealKernel, req, reply),
+            handle_env,
         ),
         None => {
             log(&console, "[INIT] unified boot: entering the heartbeat loop (DM watchdog + env control, no POSIX subject)");
@@ -615,7 +635,7 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                 &dm_policy,
                 respawn_dm,
                 env_channel,
-                |req: &[u8], reply: &mut [u8]| env_mgr.handle_request(&RealKernel, req, reply),
+                handle_env,
             )
         }
     };

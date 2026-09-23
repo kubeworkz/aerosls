@@ -159,6 +159,19 @@ pub struct SimKernel {
     /// `(base, nframes, charged_partition)` — the environment's storage given
     /// back to its tenant partition, and the evidence the leak tests count.
     freed_regions: UnsafeCell<Vec<(u64, u64, u32)>>,
+    /// POSIX-Environments E5: partitions a `partition destroy` has deactivated.
+    /// `partition_destroy()` leaves the slot inactive, and
+    /// `sys_sls_free_region()` refuses a release into a partition that is not
+    /// active BEFORE it touches the frame bitmap — which is the whole reason
+    /// the environment manager may attempt a release after a partition
+    /// teardown ended an environment instead of leaking a double-decrement.
+    dead_partitions: UnsafeCell<Vec<u32>>,
+    /// POSIX-Environments E5: handles `cap_revoke` was called with, in order —
+    /// the environment manager's own channel ends coming back. A destroy that
+    /// stopped revoking them would stop growing this, and the kernel's channel
+    /// space would drift back to being exhausted by the loop (which is how the
+    /// real boot failed: `chan_create failed (-7)` at the twelfth environment).
+    revoked: UnsafeCell<Vec<u32>>,
 }
 
 impl SimKernel {
@@ -181,6 +194,8 @@ impl SimKernel {
             killed: UnsafeCell::new(Vec::new()),
             kill_deferred: UnsafeCell::new(false),
             freed_regions: UnsafeCell::new(Vec::new()),
+            dead_partitions: UnsafeCell::new(Vec::new()),
+            revoked: UnsafeCell::new(Vec::new()),
         }
     }
 
@@ -235,6 +250,12 @@ impl SimKernel {
         unsafe { (*self.sidecars.get()).len() }
     }
 
+    /// POSIX-Environments E5: handles `cap_revoke` was called with.
+    pub fn revoked_handles(&self) -> Vec<u32> {
+        // SAFETY: single-threaded test harness only.
+        unsafe { (*self.revoked.get()).clone() }
+    }
+
     /// POSIX-Environments E5: pids `proc_kill` was called with, in order.
     pub fn killed_pids(&self) -> Vec<u32> {
         // SAFETY: single-threaded test harness only.
@@ -262,6 +283,31 @@ impl SimKernel {
         unsafe { *self.kill_deferred.get() = false };
         for pid in self.killed_pids() {
             self.teardown_sidecar(pid);
+        }
+    }
+
+    /// POSIX-Environments E5: model a `partition destroy`. The kernel kills
+    /// every process in the partition (`process_kill_partition`, which drops
+    /// each sidecar's registry entry) and deactivates the slot, after which
+    /// `sys_sls_free_region()` refuses a release into it because
+    /// `partition_reclaim_all_frames()` has already returned every frame that
+    /// partition owned. Both halves are modelled, because both are what the
+    /// environment manager's partition-teardown handling depends on.
+    pub fn destroy_partition(&self, partition: u32) {
+        // SAFETY: single-threaded test harness only.
+        unsafe {
+            let reg = &mut *self.sidecars.get();
+            let mut i = 0;
+            while i < reg.len() {
+                if reg[i].1 == partition {
+                    let handle = reg[i].3;
+                    reg.remove(i);
+                    (*self.free_handles.get()).push(handle);
+                } else {
+                    i += 1;
+                }
+            }
+            (*self.dead_partitions.get()).push(partition);
         }
     }
 
@@ -437,6 +483,27 @@ impl Kernel for SimKernel {
         Ok(())
     }
 
+    /// E5: give a sidecar's channel handle back to the sim's reuse pool — the
+    /// kernel's cap_revoke drops the holder (the slot returns) and frees the
+    /// channel at refcount 0 (the channel id returns), so a create/destroy
+    /// loop must be able to reuse both. Handing the handle back is what makes
+    /// the sim's channel budget exercised the way the kernel's is.
+    fn cap_revoke(&self, handle: u32) -> Result<(), i32> {
+        if (handle as usize) >= self.endpoints.len() {
+            return Err(-1);
+        }
+        // SAFETY: single-threaded test harness only.
+        unsafe {
+            (*self.revoked.get()).push(handle);
+            let free = &mut *self.free_handles.get();
+            if !free.contains(&handle) {
+                self.endpoints[handle as usize].reset();
+                free.push(handle);
+            }
+        }
+        Ok(())
+    }
+
     fn cap_info(&self, handle: u32) -> Result<CapInfo, i32> {
         if (handle as usize) >= self.endpoints.len() {
             return Err(-1);
@@ -532,7 +599,14 @@ impl Kernel for SimKernel {
             return false;
         }
         // SAFETY: single-threaded test harness only.
-        unsafe { (*self.freed_regions.get()).push((base, nframes, target_partition)) };
+        unsafe {
+            // E5: refused — before the bitmap is touched — when the charged
+            // partition is not active (sys_sls_free_region).
+            if (*self.dead_partitions.get()).contains(&target_partition) {
+                return false;
+            }
+            (*self.freed_regions.get()).push((base, nframes, target_partition));
+        }
         true
     }
 
@@ -619,6 +693,10 @@ impl Kernel for SharedKernel {
 
     fn close(&self, chan: u32, reason: u16, detail: u32) -> Result<(), i32> {
         self.0.close(chan, reason, detail)
+    }
+
+    fn cap_revoke(&self, handle: u32) -> Result<(), i32> {
+        self.0.cap_revoke(handle)
     }
 
     fn cap_info(&self, handle: u32) -> Result<CapInfo, i32> {

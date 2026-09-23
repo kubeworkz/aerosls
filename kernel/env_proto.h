@@ -46,7 +46,12 @@
 
 #define ENV_FRAME_SIZE       16u
 #define ENV_CREATE_BODY_SIZE  8u
-#define ENV_DESTROY_BODY_SIZE 4u
+/* { env_id u32, partition u32 }. The partition is carried so the control
+ * plane's nested destroy route (`POST /api/partition/{id}/env/destroy`)
+ * ENFORCES its own {id}: the env id alone identifies the environment globally,
+ * so without it a caller could end partition B's environment through a path
+ * that names partition A. Mirrors ENV_CREATE's { partition, index }. */
+#define ENV_DESTROY_BODY_SIZE 8u
 #define ENV_REPLY_BODY_SIZE  12u
 #define ENV_REQ_MAX (ENV_FRAME_SIZE + ENV_CREATE_BODY_SIZE)   /* largest request */
 #define ENV_REPLY_MAX (ENV_FRAME_SIZE + ENV_REPLY_BODY_SIZE)
@@ -94,6 +99,12 @@ static inline int env_frame_parse(const uint8_t* b, size_t len, uint16_t* ty) {
 static inline void env_create_body_encode(uint8_t* b, uint32_t partition, uint32_t index) {
     env_put_u32(b, 0, partition);
     env_put_u32(b, 4, index);
+}
+
+/* ENV_DESTROY request body: { env_id u32, partition u32 } (8 bytes). */
+static inline void env_destroy_body_encode(uint8_t* b, uint32_t env_id, uint32_t partition) {
+    env_put_u32(b, 0, env_id);
+    env_put_u32(b, 4, partition);
 }
 
 /* Reply body: { status u16, pad u16, env_id u32, partition u32 } (12 bytes). */

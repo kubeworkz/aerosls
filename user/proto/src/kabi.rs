@@ -145,6 +145,20 @@ pub trait Kernel {
     /// Close an endpoint with a reason; idempotent (transport spec §6.1).
     fn close(&self, chan: u32, reason: u16, detail: u32) -> Result<(), i32>;
 
+    /// Drop one of the caller's own caps (SYS_SLS_CAP_REVOKE, 294). The object
+    /// is invalidated for every holder, peer included, and freed at refcount
+    /// 0 — so for a channel this is what actually ENDS it: the peer's endpoint
+    /// closes and the channel's slot becomes reusable. `close()` only marks an
+    /// endpoint closed and leaves the cap held, which is why an end that must
+    /// not leak is revoked rather than closed (POSIX-Environments E5).
+    ///
+    /// `Err` means the cap was already gone, which is not an error for a
+    /// teardown: the peer may have revoked the object first.
+    fn cap_revoke(&self, handle: u32) -> Result<(), i32> {
+        let _ = handle;
+        Err(-1)   // only the real kernel and the sim hold caps to revoke
+    }
+
     /// Voluntarily give up the CPU (SYS_SLS_YIELD). The process parks,
     /// the scheduler picks the next runnable process, and the timer ISR
     /// resumes us — the yield looks like a syscall that took a while.
@@ -319,6 +333,7 @@ mod abi {
     const SYS_IRQ_UNBIND: u64 = 317;
     const SYS_IRQ_MASK: u64 = 318;
     const SYS_BOOT_GEN: u64 = 319;
+    const SYS_CAP_REVOKE: u64 = 294;
     const SYS_ALLOC_REGION: u64 = 320;
     const SYS_FREE_REGION: u64 = 321;
     const SYS_SIDECAR_PID: u64 = 322;
@@ -397,6 +412,15 @@ mod abi {
         nframes: u64,
         target_partition: u32,
         _pad: u32,
+    }
+
+    /// SLSCapRevokeRequest (kernel/cap.h) — the cap's slot index plus six
+    /// bytes of padding.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CapRevokeReq {
+        cap_idx: u16,
+        _pad: [u8; 6],
     }
 
     /// SLSSidecarPidRequest (kernel/cap.h) — a name pointer, the byte count to
@@ -1010,6 +1034,21 @@ mod abi {
         unsafe { sls_syscall(SYS_CAP_LIST, 0) };
     }
 
+    /// `k_cap_revoke`: syscall 294 — drop one of the caller's own caps. The
+    /// kernel invalidates the OBJECT for every holder (peer included) and
+    /// frees it at refcount 0; for a channel that is what ends it, and its
+    /// slot in `cap_channels[]` becomes reusable (POSIX-Environments E5).
+    /// Returns 0, or a CAP_E* code — notably CAP_EALREADY when the object was
+    /// already being revoked, which a teardown treats as success.
+    #[no_mangle]
+    pub extern "C" fn k_cap_revoke(handle: u32) -> i32 {
+        let req = CapRevokeReq {
+            cap_idx: handle as u16,
+            _pad: [0u8; 6],
+        };
+        unsafe { sls_syscall(SYS_CAP_REVOKE, &req as *const CapRevokeReq as u64) as i32 }
+    }
+
     /// The real kernel ABI. Only constructible/usable on the sidecar target.
     pub struct RealKernel;
 
@@ -1127,6 +1166,15 @@ mod abi {
 
         fn close(&self, chan: u32, reason: u16, detail: u32) -> Result<(), i32> {
             let r = k_chan_close(chan, reason, detail);
+            if r != ERR_OK {
+                Err(r)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn cap_revoke(&self, handle: u32) -> Result<(), i32> {
+            let r = k_cap_revoke(handle);
             if r != ERR_OK {
                 Err(r)
             } else {

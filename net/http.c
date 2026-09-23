@@ -3070,6 +3070,51 @@ static int api_partition_env_create_post(const char* body, char* buf, int max,
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
 
+// ─── POST /api/partition/{id}/env/destroy — POSIX-Environments E5 ─────────────
+// End a POSIX environment created by the route above. Body: {"env_id": N}.
+// The {id} is ENFORCED rather than assumed: the request carries it (the
+// ENV_DESTROY body is { env_id, partition }), and init refuses with
+// ENV_ERR_INVAL when the environment is not in the partition the path names —
+// otherwise the env id alone would identify the target and a caller could end
+// partition B's environment through a path naming A. An env_id the manager no
+// longer holds answers ENV_ERR_NOENT, which is also the answer after a
+// `partition destroy` already ended it. Same DB_ADMIN+ gate as the create: a
+// destroy is the other half of a tenancy-administration action.
+static int api_partition_env_destroy_post(const char* body, char* buf, int max,
+                                          SLSRole req_role, uint32_t partition) {
+    JSONBuf j = { buf, 0, max };
+    if (req_role > ROLE_DB_ADMIN) {
+        jb_obj_open(&j,0); jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","requires DB_ADMIN or higher");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
+    if (!body) {
+        jb_obj_open(&j,0); jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","missing body"); jb_obj_close(&j);
+        j.buf[j.pos]='\0'; return j.pos;
+    }
+    uint32_t env_id = (uint32_t)json_int(body, "env_id");
+
+    uint16_t status = ENV_ERR_INVAL;
+    uint32_t got_id = 0, got_part = 0;
+    int rc = env_service_destroy(env_id, partition, &status, &got_id, &got_part);
+
+    jb_obj_open(&j,0);
+    if (rc != 0) {
+        jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","environment manager unavailable or timed out");
+    } else if (status == ENV_OK) {
+        jb_str(&j,"ok","true"); jb_putc(&j,',');
+        jb_uint(&j,"env_id", got_id ? got_id : env_id); jb_putc(&j,',');
+        jb_uint(&j,"partition", got_part);
+    } else {
+        jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_uint(&j,"status", status); jb_putc(&j,',');
+        jb_str(&j,"error", env_status_str(status));
+    }
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
 // ─── POST /api/partition/assign — Gap Remediation Phase F ─────────────────────
 // Body: {"uid": N, "partition_id": N}.
 static int api_partition_assign_post(const char* body, char* buf, int max) {
@@ -6248,16 +6293,22 @@ static void http_route(int conn, char* req) {
             blen = api_partition_create_post(body_ptr, resp_body, (int)sizeof(resp_body), req_role);
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
-        // POST /api/partition/{id}/env — POSIX-Environments E4. The {id} is
-        // parsed from the path (digits only), so this never hijacks the exact
-        // /api/partition/assign|destroy|pause|resume routes below (those parse
-        // as zero digits and fall through).
+        // POST /api/partition/{id}/env and .../env/destroy — POSIX-Environments
+        // E4 (create) and E5 (destroy). The {id} is parsed from the path (digits
+        // only), so this never hijacks the exact /api/partition/assign|destroy|
+        // pause|resume routes below (those parse as zero digits and fall
+        // through).
         if (!strncmp(path, "/api/partition/", 15)) {
             const char* rest = path + 15;
             uint32_t pid = 0; const char* p = rest;
             while (*p >= '0' && *p <= '9') { pid = pid * 10u + (uint32_t)(*p - '0'); p++; }
             if (p != rest && !strcmp(p, "/env")) {
                 blen = api_partition_env_create_post(body_ptr, resp_body,
+                            (int)sizeof(resp_body), req_role, pid);
+                http_respond(conn, 200, "application/json", resp_body, blen); return;
+            }
+            if (p != rest && !strcmp(p, "/env/destroy")) {
+                blen = api_partition_env_destroy_post(body_ptr, resp_body,
                             (int)sizeof(resp_body), req_role, pid);
                 http_respond(conn, 200, "application/json", resp_body, blen); return;
             }

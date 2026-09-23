@@ -175,8 +175,8 @@ jobs:
       # review and inspecting nothing. Each was written after the bug it
       # catches had already cost a diagnostic round.
       #
-      # Thirteen of the twenty-four read only sources and run here. The six
-      # GUARD-KIND: build guards (code_buffer_budget, kernel_image_end,
+      # Most of them read only sources and run here. The GUARD-KIND: build
+      # guards (code_buffer_budget, kernel_image_end,
       # no_hosted_link, no_tls_relocations, stack_frame_budget,
       # tcache_roundtrip) need the
       # linked kernel or its objects, and this runner has no x86_64-elf-gcc
@@ -236,8 +236,8 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           "$HOME/.cargo/bin/cargo" --version
 
-      # run_guard_smokes.sh runs all twenty-four, but five need the linked
-      # kernel or its objects, so that runner needs a build host. The
+      # run_guard_smokes.sh runs every tests/*_smoke.sh, but some need the
+      # linked kernel or its objects, so that runner needs a build host. The
       # other smokes are source-only — gcc/binutils/python3/openssl and
       # the sources in the tree, nothing built — so they run HERE, on
       # every push, independent of the kernel build. That independence is

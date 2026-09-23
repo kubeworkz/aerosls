@@ -138,4 +138,16 @@ __attribute__((weak)) int env_service_reply_slot(uint16_t slot) { (void)slot; re
 __attribute__((weak)) void console_service_deferred_tick(void) { }
 __attribute__((weak)) void cap_irq_drain_pending(void)         { }
 
+/* NB: the frame-pool allocators (allocate_physical_ram_frame_for_partition,
+ * allocate_contiguous_frames_for_partition, free_contiguous_frames_for_
+ * partition, ...) are deliberately NOT stubbed here either, for the same
+ * reason as the quota getters below: several tests define their own — some
+ * inert, one a RECORDING stub cap_create_sidecar_host_test.c asserts on — and
+ * a definition in this header would be a plain redefinition inside those
+ * translation units rather than a weak/strong choice at link time. Each test
+ * that includes process.c and does not link frame_pool.c carries its own next
+ * to its own allocate_physical_ram_frame_for_partition(), which is the pattern
+ * that was already in place; tests/syscall_stack_pair_host_test.c links the
+ * real frame_pool.c and needs none. */
+
 #endif /* PROCESS_HOST_STUBS_H */

@@ -158,6 +158,91 @@ static uint16_t  cap_holder_free_head;  /* freelist chained via .next */
 struct CapChannel cap_channels[CAP_CHAN_MAX];
 static uint32_t   cap_chan_next;        /* next monotonic channel slot */
 
+/* Recycled channel ids (POSIX-Environments E5).
+ *
+ * `cap_chan_next` only ever grows, so a boot could create CAP_CHAN_MAX (64)
+ * channels EVER: nothing was leaking but the id space itself, and a sidecar
+ * world spends channels — an environment's create takes five (two messenger,
+ * two console, one ramdisk). Measured by tests/env_recycle_boot_check.sh,
+ * which is exactly the create/destroy loop this file's E5 work is for: the
+ * twelfth environment could not be created (`[SIDECAR] create: chan_create
+ * failed (-7)` — CAP_ENOMEM in cap_chan_create's `cap_chan_next >= CAP_CHAN_MAX`
+ * check).
+ *
+ * A channel's id belongs to the channel's LIFETIME, not to the monotonic
+ * counter, so it is released at the moment the channel object dies —
+ * cap_object_destroy, which is also the moment cap_channels[]'s slot becomes
+ * reusable. That reuse is safe by construction rather than by hope:
+ * cap_chan_create already resets every per-direction field a stale
+ * incarnation could leave behind (queues, depth, and Phase 5's close event),
+ * and the two places that remember a channel id outside the object — the IRQ
+ * registry (g_irq_chan) and the console service — either clear it on
+ * destruction (below) or re-resolve it through the object on every use. */
+static uint32_t   cap_chan_recycled[CAP_CHAN_MAX];
+static uint32_t   cap_chan_recycled_n;
+#define CAP_CHAN_NONE 0xFFFFFFFFu
+/* A CapObject's chan_id when it is not a channel yet (or no longer one). The
+ * field is uint16_t and CAP_CHAN_MAX is 64, so 0xFFFF cannot collide with a
+ * real channel — and it must not default to 0, because channel 0 is a real
+ * channel id that a recycled slot can legitimately hand out. */
+#define CAP_OBJ_CHAN_NONE 0xFFFFu
+
+/* ─── The capability allocator's shared pools (E5) ──────────────────────────
+ * The holder pool (`cap_holder_free_head` + `cap_holders[].next`), the object
+ * counter (`cap_obj_next`) and the channel-id stack above are the capability
+ * layer's shared free space, and all three were mutated with plain reads and
+ * writes — which is only correct while ONE core is inside the allocator at a
+ * time. A unified boot has more: `init` runs env requests on the BSP while
+ * the console service, the sidecar teardowns and the timer's ring-3 schedule
+ * run on the AP, so a create/destroy loop has two cores pushing and popping
+ * these lists at once.
+ *
+ * Measured, not theorised. `tests/env_recycle_boot_check.sh` — an 18-cycle
+ * create -> destroy loop — died between the third and the seventh environment
+ * on four cores with `[SIDECAR] create: chan_create failed (-7)` (CAP_ENOMEM
+ * out of the holder pool), and a walk of the pool at that moment reported
+ * `head=38 walk=8192 inactive=8152 CYCLE`: every node in the pool was free and
+ * all 8192 of them were reachable from the head — one closed ring, which is
+ * what a lost or duplicated push leaves behind (the list can no longer reach
+ * CAP_FREELIST_END, so it is permanently "empty"). The same loop on ONE core
+ * passed 18/18, twice.
+ *
+ * A spinlock rather than the CAS idiom its neighbour uses (cap_msg_payload_alloc
+ * is lock-free — the message-payload pool was hardened this way already), for
+ * one reason specific to this pool: a freelist CAS can hand the same node to
+ * two callers through ABA, and a holder node is linked into an object's list
+ * for the object's whole lifetime, so the pop/re-push window ABA punishes is
+ * exactly this pool's normal case.
+ *
+ * The lock is a LEAF, and that is deliberate: it is taken only inside
+ * cap_holder_alloc, cap_holder_free, cap_object_alloc and cap_chan_id_take/put,
+ * none of which calls anything else. Callers may hold a table, channel or
+ * object lock when they reach these (cap_chan_create holds the new object's
+ * lock across cap_holder_alloc), so no path may ever acquire one of those
+ * FROM here — that ordering is what keeps "table < channel < object < pool"
+ * acyclic. */
+static struct CapSpinlock cap_pool_lock;
+
+static uint32_t cap_chan_id_take(void) {
+    cap_lock(&cap_pool_lock);
+    uint32_t id = CAP_CHAN_NONE;
+    if (cap_chan_recycled_n > 0) {
+        id = cap_chan_recycled[--cap_chan_recycled_n];
+    } else if (cap_chan_next < CAP_CHAN_MAX) {
+        id = cap_chan_next++;
+    }
+    cap_unlock(&cap_pool_lock);
+    return id;
+}
+
+static void cap_chan_id_put(uint32_t chan_id) {
+    if (chan_id >= CAP_CHAN_MAX) return;
+    cap_lock(&cap_pool_lock);
+    if (cap_chan_recycled_n < CAP_CHAN_MAX)
+        cap_chan_recycled[cap_chan_recycled_n++] = chan_id;
+    cap_unlock(&cap_pool_lock);
+}
+
 /* Shared-memory arena: a physically contiguous pool carved from the frame
  * pool at boot. One frame, one object — no aliasing is possible. */
 static uint64_t cap_arena_base = 0;
@@ -312,8 +397,16 @@ static struct CapObject* cap_object_get(uint32_t obj_id) {
 }
 
 static int cap_object_alloc(uint8_t kind, uint32_t* out_id) {
-    if (cap_obj_next >= CAP_OBJECT_MAX) return -1;   /* Phase 1: no reclamation */
+    /* The counter is shared with the other cores (see cap_pool_lock). */
+    cap_lock(&cap_pool_lock);
+    if (cap_obj_next >= CAP_OBJECT_MAX) {   /* Phase 1: no reclamation */
+        cap_unlock(&cap_pool_lock);
+        kernel_serial_printf("[DIAG] object pool exhausted: next=%u active=%u\n",
+                             (unsigned)cap_obj_next, (unsigned)cap_object_count());
+        return -1;
+    }
     uint32_t id = cap_obj_next++;
+    cap_unlock(&cap_pool_lock);
     struct CapObject* o = &cap_objects[id];
     cap_lock_init(&o->lock);
     o->id = id;
@@ -325,13 +418,26 @@ static int cap_object_alloc(uint8_t kind, uint32_t* out_id) {
     o->max_perms = 0;
     o->phys_base = 0;
     o->npages = 0;
-    o->chan_id = 0;
+    o->chan_id = (uint16_t)CAP_OBJ_CHAN_NONE;
     *out_id = id;
     return 0;
 }
 
 static void cap_object_destroy(uint32_t obj_id) {
     struct CapObject* o = &cap_objects[obj_id];
+    /* E5: a channel's slot is reusable now, and the IRQ registry must not
+     * keep pointing at it — a recycled id in g_irq_chan would deliver a later
+     * device edge to some unrelated channel (the registry's own unbind/close
+     * paths clear it, but a channel can also die without passing through
+     * them, so the clearing belongs here too. The `active` guard makes this
+     * run exactly once per object). */
+    if (o->active && o->kind == CAP_OBJ_KIND_CHAN &&
+        o->chan_id < CAP_CHAN_MAX) {
+        for (uint32_t v = 0; v < CAP_IRQ_VECTORS; v++) {
+            if (g_irq_chan[v] == (uint16_t)o->chan_id) g_irq_chan[v] = CAP_NONE;
+        }
+        cap_chan_id_put(o->chan_id);
+    }
     o->active = 0;
     o->revoking = 1;
     o->holder_head = CAP_FREELIST_END;
@@ -340,10 +446,19 @@ static void cap_object_destroy(uint32_t obj_id) {
 
 static int cap_holder_alloc(uint32_t obj_id, uint8_t kind, uint16_t pid,
                             uint16_t ref, uint8_t qdir, uint16_t* out) {
-    if (cap_holder_free_head == CAP_FREELIST_END) return -1;
+    /* Pop under the pool lock (cap_pool_lock): two cores allocating for
+     * different objects must not read the same head, or both would be handed
+     * the same node. The node's own fields are written AFTER the pop, by this
+     * core, on a node no other core can reach any more. */
+    cap_lock(&cap_pool_lock);
+    if (cap_holder_free_head == CAP_FREELIST_END) {
+        cap_unlock(&cap_pool_lock);
+        return -1;
+    }
     uint16_t h = cap_holder_free_head;
     struct CapHolder* node = &cap_holders[h];
     cap_holder_free_head = node->next;
+    cap_unlock(&cap_pool_lock);
     node->obj_id = obj_id;
     node->kind = kind;
     node->pid = pid;
@@ -359,8 +474,17 @@ static int cap_holder_alloc(uint32_t obj_id, uint8_t kind, uint16_t pid,
 static void cap_holder_free(uint16_t h) {
     struct CapHolder* node = &cap_holders[h];
     node->active = 0;
+    node->prev = CAP_FREELIST_END;
+    /* Push under the pool lock. A plain push here and a plain pop in
+     * cap_holder_alloc is what turned the pool into one closed ring under two
+     * cores: a push that landed between another core's head read and its head
+     * write was lost, or a node was linked twice — either way the list stopped
+     * reaching CAP_FREELIST_END and every node reported itself free while the
+     * allocator saw an empty pool. */
+    cap_lock(&cap_pool_lock);
     node->next = cap_holder_free_head;
     cap_holder_free_head = h;
+    cap_unlock(&cap_pool_lock);
 }
 
 /* Link a PRE-ALLOCATED holder node (cap_holder_alloc) onto the object's
@@ -577,6 +701,8 @@ void cap_init(void) {
 
     cap_obj_next = 0;
     cap_chan_next = 0;
+    cap_chan_recycled_n = 0;
+    cap_lock_init(&cap_pool_lock);
     cap_arena_init();
     cap_msg_payload_init();
     sidecar_registry_init();
@@ -729,6 +855,7 @@ int cap_arena_alloc(uint32_t pid, uint32_t npages, uint32_t perm,
  * BEFORE any cap word is published to any table, and table locks are taken
  * one at a time (never two at once). A failed slot allocation rolls back
  * everything — no orphaned holders, no partially-minted channel. */
+
 int cap_chan_create(uint32_t pid, uint32_t far_pid,
                     uint16_t* out_rd, uint16_t* out_wr,
                     uint16_t* out_far_rd, uint16_t* out_far_wr) {
@@ -743,8 +870,8 @@ int cap_chan_create(uint32_t pid, uint32_t far_pid,
     int fti = (far_pid != 0 && far_pid != pid) ? cap_table_index(far_pid) : -1;
     if (far_pid != 0 && far_pid != pid && fti < 0) return CAP_ETABLEFULL;
 
-    if (cap_chan_next >= CAP_CHAN_MAX) return CAP_ENOMEM;
-    uint32_t chan_id = cap_chan_next++;
+    uint32_t chan_id = cap_chan_id_take();
+    if (chan_id == CAP_CHAN_NONE) return CAP_ENOMEM;
     struct CapChannel* ch = &cap_channels[chan_id];
     cap_lock_init(&ch->lock);
     ch->end0_pid = (uint16_t)pid;
@@ -764,6 +891,9 @@ int cap_chan_create(uint32_t pid, uint32_t far_pid,
 
     uint32_t obj_id;
     if (cap_object_alloc(CAP_OBJ_KIND_CHAN, &obj_id)) {
+        /* The reserved channel id goes back: the object never existed, so a
+         * later create must be able to take it (E5). */
+        cap_chan_id_put(chan_id);
         ch->active = 0;
         return CAP_ENOMEM;
     }
@@ -790,7 +920,6 @@ int cap_chan_create(uint32_t pid, uint32_t far_pid,
         if (h4 != CAP_FREELIST_END) cap_holder_free(h4);
         cap_unlock(&o->lock);
         cap_object_destroy(obj_id);
-        ch->active = 0;
         return CAP_ENOMEM;
     }
     cap_holder_link(h1, o);
@@ -1684,7 +1813,36 @@ static uint32_t cap_object_free_resources(uint32_t obj_id);
  * frames returned. Because ids/structs are never recycled, a stale slot
  * word can never alias a new object; because every creation path checks
  * revoking / the stamp under the object lock, no new reference can exist
- * between the linearization point and the free. */
+ * between the linearization point and the free.
+ *
+ * ─── Why the dead holders are chained through themselves (E5) ─────────────
+ * This used to collect the holder indices into
+ * `static uint16_t holders[CAP_HOLDER_MAX]` and index that array in all three
+ * later passes. One array, shared by every revoke. Two cores revoking
+ * DIFFERENT objects do not contend — they take different objects' locks — so
+ * both walked into the same buffer: whichever arrived second overwrote the
+ * first's list, and the first then ran its "stamp next/prev = END" pass over
+ * the SECOND's indices. A node that the second revoke had already pushed back
+ * onto the holder freelist got its `next` set to CAP_FREELIST_END, which
+ * TRUNCATES the freelist at that node: the head's `next` becomes END while
+ * thousands of nodes are still free, the pool reports itself empty, and every
+ * later create dies with `[SIDECAR] create: chan_create failed (-7)`
+ * (CAP_ENOMEM out of the holder pool). Measured with
+ * tests/env_recycle_boot_check.sh, whose destroy path tears two sidecars down
+ * at once: on four cores the 18-cycle loop died in the holder pool with the
+ * freelist holding one node, at cycle 4, 6 and 18 on different runs; on ONE
+ * core the same loop passed twice, and the audit walk reported
+ * `reach == inactive, off_free = 0` at every step.
+ *
+ * The chain now lives in the nodes' own `next` field with the head in a
+ * LOCAL. That is safe because phase 1 detaches the object's whole holder list
+ * (obj->holder_head = END) with obj->revoking set under the object lock: from
+ * then until the final free no creation path can link a new holder, and
+ * cap_holder_remove only ever walks the object's list, which is now empty. The
+ * nodes are this invocation's private list, so no scratch storage is needed at
+ * all — and the walk is bounded by CAP_HOLDER_MAX exactly as before, which now
+ * only guards a corrupted list against spinning rather than against an
+ * overflow. */
 int cap_revoke(uint32_t pid, uint16_t cap_idx) {
     (void)pid;
     int ti = cap_table_index(pid);
@@ -1712,24 +1870,18 @@ int cap_revoke(uint32_t pid, uint16_t cap_idx) {
     }
     obj->revoking = 1;      /* ← linearization point */
 
-    /* Collect holders into a STATIC scratch buffer, not a local: at
-     * CAP_HOLDER_MAX entries a local would be a 16 KiB frame, which this
-     * kernel treats as corruption risk (see the Makefile's
-     * -Wframe-larger-than note and tests/stack_frame_budget_check.sh).
-     * Single-writer by construction: revoke serializes on the object
-     * lock, so no two revokes can be in this walk at once. */
-    static uint16_t holders[CAP_HOLDER_MAX];
+    /* Phase 1: detach the holder list and stamp every queued word REVOKED in
+     * the same pass, rebuilding the list in place through each node's `next`
+     * with the head in the LOCAL `dead`. No scratch array — see this
+     * function's comment for the shared-static bug that made one necessary-
+     * looking. */
+    uint16_t dead = CAP_FREELIST_END;
     uint32_t n = 0;
     uint16_t h = obj->holder_head;
-    while (h != CAP_FREELIST_END && n < CAP_HOLDER_MAX) {
-        holders[n++] = h;
-        h = cap_holders[h].next;
-    }
     obj->holder_head = CAP_FREELIST_END;
-    for (uint32_t i = 0; i < n; i++) {
-        struct CapHolder* node = &cap_holders[holders[i]];
-        node->next = CAP_FREELIST_END;
-        node->prev = CAP_FREELIST_END;
+    while (h != CAP_FREELIST_END && n < CAP_HOLDER_MAX) {
+        struct CapHolder* node = &cap_holders[h];
+        uint16_t next = node->next;
         if (node->kind == HOLDER_QUEUE) {
             struct CapChannel* ch = &cap_channels[node->pid];
             /* ref encodes (ring entry, cap index): entry*MAX + i. */
@@ -1739,12 +1891,20 @@ int cap_revoke(uint32_t pid, uint16_t cap_idx) {
                 cap_word_stamp_revoked(
                     ch->q[node->qdir][entry].cap_word[cap_i]);
         }
+        node->next = dead;          /* push onto this invocation's own chain */
+        node->prev = CAP_FREELIST_END;
+        dead = h;
+        n++;
+        h = next;
     }
     cap_unlock(&obj->lock);
 
-    /* Zero slots + tear down mappings, one table at a time. */
-    for (uint32_t i = 0; i < n; i++) {
-        struct CapHolder* node = &cap_holders[holders[i]];
+    /* Phase 2: zero slots, one table at a time. The chain's links are ours
+     * alone until phase 4 frees the nodes, so walking `next` is stable here
+     * and nothing else can reach these nodes (they are still marked active and
+     * are not on the freelist). */
+    for (uint16_t d = dead; d != CAP_FREELIST_END; d = cap_holders[d].next) {
+        struct CapHolder* node = &cap_holders[d];
         if (node->kind != HOLDER_SLOT) continue;
         int hti = cap_table_index(node->pid);
         if (hti < 0) continue;
@@ -1766,11 +1926,19 @@ int cap_revoke(uint32_t pid, uint16_t cap_idx) {
         cap_unlock(&cap_tables[ti].lock);
     }
 
-    /* Finalize under the object lock; free at refcount 0. */
+    /* Phase 4: finalize under the object lock; free at refcount 0. Each link
+     * is read BEFORE the node is freed, because cap_holder_free() overwrites
+     * `next` with the freelist's current head. */
     cap_lock(&obj->lock);
     if (obj->refcount >= n) obj->refcount -= n;
     else obj->refcount = 0;
-    for (uint32_t i = 0; i < n; i++) cap_holder_free(holders[i]);
+    {   uint16_t d = dead;
+        while (d != CAP_FREELIST_END) {
+            uint16_t next = cap_holders[d].next;
+            cap_holder_free(d);
+            d = next;
+        }
+    }
     if (obj->refcount == 0) {
         cap_object_free_resources(obj_id);
         cap_object_destroy(obj_id);
@@ -1796,7 +1964,7 @@ static uint32_t cap_object_free_resources(uint32_t obj_id) {
                 freed++;
             }
         }
-    } else if (o->kind == CAP_OBJ_KIND_CHAN) {
+    } else if (o->kind == CAP_OBJ_KIND_CHAN && o->chan_id < CAP_CHAN_MAX) {
         struct CapChannel* ch = &cap_channels[o->chan_id];
         ch->active = 0;
     }
@@ -2383,8 +2551,8 @@ int k_irq_bind(uint32_t pid, uint16_t slot, uint32_t budget,
     /* Create the channel pair: end0 = driver (holds CHAN_R), end1 =
      * kernel (holds CHAN_W through the registry). A dedicated object +
      * ONE holder (the caller's CHAN_R) — the kernel end needs no slot. */
-    if (cap_chan_next >= CAP_CHAN_MAX) return CAP_ERR_SPACE;
-    uint32_t chan_id = cap_chan_next++;
+    uint32_t chan_id = cap_chan_id_take();
+    if (chan_id == CAP_CHAN_NONE) return CAP_ERR_SPACE;
     struct CapChannel* ch = &cap_channels[chan_id];
     cap_lock_init(&ch->lock);
     ch->end0_pid = (uint16_t)pid;
