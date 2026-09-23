@@ -35,10 +35,16 @@ int env_service_reply_slot(uint16_t slot) {
     return g_env_ready && slot == g_env_k_rd;
 }
 
-int env_service_create(uint32_t partition, uint32_t index,
-                       uint16_t* out_status, uint32_t* out_env_id) {
+/* One ENV round trip: send `ty` with `body`, then wait for the reply. The
+ * create and destroy paths differ only in the opcode and the body they carry,
+ * so they share this — including the stale-reply drain and the bounded wait
+ * whose yield is what lets init run at all (E4; see env_service.h). */
+static int env_service_rpc(uint16_t ty, const uint8_t* body, uint32_t body_len,
+                           uint16_t* out_status, uint32_t* out_env_id,
+                           uint32_t* out_partition) {
     if (out_status) *out_status = ENV_ERR_INVAL;
     if (out_env_id) *out_env_id = 0;
+    if (out_partition) *out_partition = 0;
     if (!g_env_ready) return -1;
 
     /* Drain any stale reply left by a previous request that timed out, so this
@@ -50,12 +56,15 @@ int env_service_create(uint32_t partition, uint32_t index,
                             0, 0, &sn, &stag, &sfl) == 0) { /* drop */ }
     }
 
-    uint8_t req[ENV_FRAME_SIZE + ENV_CREATE_BODY_SIZE];
-    env_frame_encode(req, ENV_CREATE, 0);
-    env_create_body_encode(req + ENV_FRAME_SIZE, partition, index);
+    uint8_t req[ENV_REQ_MAX];
+    if (ENV_FRAME_SIZE + body_len > sizeof(req)) return -1;
+    env_frame_encode(req, ty, 0);
+    for (uint32_t i = 0; i < body_len; i++) {
+        req[ENV_FRAME_SIZE + i] = body[i];
+    }
 
     uint32_t tag = g_env_tag++;
-    if (cap_send_msg(0, g_env_k_wr, req, (uint32_t)sizeof(req), 0, 0, tag, 0) != 0)
+    if (cap_send_msg(0, g_env_k_wr, req, ENV_FRAME_SIZE + body_len, 0, 0, tag, 0) != 0)
         return -1;
 
     /* Poll for the reply, handing the CPU to Ring-3 while we wait (below). The
@@ -69,10 +78,10 @@ int env_service_create(uint32_t partition, uint32_t index,
         int r = cap_recv_msg(0, g_env_k_rd, reply, (uint32_t)sizeof(reply),
                              &plen, 0, 0, &n_caps, &rtag, &flags);
         if (r == 0 && plen >= (ENV_FRAME_SIZE + ENV_REPLY_BODY_SIZE)) {
-            uint16_t ty = 0;
-            if (env_frame_parse(reply, plen, &ty)) {
+            uint16_t rty = 0;
+            if (env_frame_parse(reply, plen, &rty)) {
                 env_reply_body_parse(reply + ENV_FRAME_SIZE,
-                                     out_status, out_env_id, 0);
+                                     out_status, out_env_id, out_partition);
                 return 0;
             }
         }
@@ -97,4 +106,21 @@ int env_service_create(uint32_t partition, uint32_t index,
         __asm__ volatile("pause");
     }
     return -1;   /* init did not reply before the deadline */
+}
+
+int env_service_create(uint32_t partition, uint32_t index,
+                       uint16_t* out_status, uint32_t* out_env_id) {
+    uint8_t body[ENV_CREATE_BODY_SIZE];
+    env_create_body_encode(body, partition, index);
+    return env_service_rpc(ENV_CREATE, body, (uint32_t)sizeof(body),
+                           out_status, out_env_id, 0);
+}
+
+int env_service_destroy(uint32_t env_id, uint32_t partition,
+                        uint16_t* out_status, uint32_t* out_env_id,
+                        uint32_t* out_partition) {
+    uint8_t body[ENV_DESTROY_BODY_SIZE];
+    env_destroy_body_encode(body, env_id, partition);
+    return env_service_rpc(ENV_DESTROY, body, (uint32_t)sizeof(body),
+                           out_status, out_env_id, out_partition);
 }

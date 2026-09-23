@@ -41,7 +41,10 @@
  *      it, tick for tick, and the bounded wait keeps yielding to Ring-3;
  *   8. a stale reply left by an earlier timed-out request is drained, not
  *      mistaken for this request's answer;
- *   9. a reply shorter than frame+body is not accepted as success.
+ *   9. a reply shorter than frame+body is not accepted as success;
+ *  10. the E5 destroy round trip shares that wait and yield, and its request
+ *      carries the env_id AND the partition the manager enforces;
+ *  11. the destroy reply's own env_id/partition are handed back to the caller.
  *
  * Build and run:
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I arch/x86 \
@@ -81,6 +84,9 @@ static uint8_t  g_req[ENV_REQ_MAX];
 static uint32_t g_req_len = 0;
 static uint32_t g_req_tag = 0;
 static uint32_t g_reply_ready = 0;
+/* The frame type the fake manager replies with — the service echoes the request
+ * type, so a destroy round trip answers with an ENV_DESTROY frame. */
+static uint16_t g_reply_ty = ENV_CREATE;
 
 /* The single-slot inbox the service polls (one reply in flight). */
 static uint8_t  g_inbox[ENV_REPLY_MAX];
@@ -98,6 +104,7 @@ static int checks_failed = 0;
 
 static void reset_manager(int mode) {
     g_mode = mode;
+    g_reply_ty = ENV_CREATE;
     g_sends = 0;
     g_yields = 0;
     g_foreign_polls = 0;
@@ -116,7 +123,7 @@ static void reset_manager(int mode) {
 static void enqueue_reply(uint32_t env_id, uint32_t tag, int truncate) {
     uint8_t f[ENV_REPLY_MAX];
     uint32_t len = ENV_REPLY_MAX;
-    env_frame_encode(f, ENV_CREATE, 0);
+    env_frame_encode(f, g_reply_ty, 0);
     env_put_u16(f, ENV_FRAME_SIZE + 0, ENV_OK);
     env_put_u16(f, ENV_FRAME_SIZE + 2, 0);
     env_put_u32(f, ENV_FRAME_SIZE + 4, env_id);
@@ -242,6 +249,39 @@ int main(void) {
     reset_manager(MANAGER_TRUNCATED);
     CHECK(env_service_create(1, 0, &status, &env_id) == -1,
           "a reply shorter than frame + body is not accepted as an answer");
+
+    /* 10. E5: the destroy round trip shares the same wait (and therefore the
+     *     same yield), and its request carries BOTH fields the manager needs
+     *     to enforce the route's partition. */
+    reset_manager(MANAGER_ALIVE);
+    g_reply_ty = ENV_DESTROY;
+    uint32_t got_part = 0;
+    status = 0xFFFF; env_id = 0;
+    rc = env_service_destroy(ENV_ENV_ID, 7, &status, &env_id, &got_part);
+    CHECK(rc == 0 && status == ENV_OK && env_id == ENV_ENV_ID,
+          "the destroy round trip answers like the create one (rc 0, ENV_OK)");
+    CHECK(g_yields >= 1,
+          "the destroy wait hands the CPU to Ring-3 too — a destroy is work init does");
+    {
+        uint16_t rty = 0;
+        int framed = env_frame_parse(g_req, g_req_len, &rty);
+        CHECK(framed && rty == ENV_DESTROY &&
+              env_read_u32(g_req, ENV_FRAME_SIZE) == ENV_ENV_ID &&
+              env_read_u32(g_req, ENV_FRAME_SIZE + 4) == 7,
+              "the destroy request is an ENV_DESTROY frame for (env_id, partition 7)");
+        CHECK(g_req_len == ENV_FRAME_SIZE + ENV_DESTROY_BODY_SIZE,
+              "the destroy request is exactly frame + body");
+    }
+
+    /* 11. E5: the reply's own fields come back out — the control plane reports
+     *     the partition the environment really was in. */
+    reset_manager(MANAGER_ALIVE);
+    g_reply_ty = ENV_DESTROY;
+    enqueue_reply(ENV_ENV_ID, 1u, 0);   /* partition 1 in the reply body */
+    status = 0xFFFF; env_id = 0; got_part = 0;
+    rc = env_service_destroy(ENV_ENV_ID, 1, &status, &env_id, &got_part);
+    CHECK(rc == 0 && got_part == 1,
+          "the destroy reply's env_id and partition are parsed for the caller");
 
     printf("\n%d checks passed, %d failed\n", checks_passed, checks_failed);
     return checks_failed ? 1 : 0;

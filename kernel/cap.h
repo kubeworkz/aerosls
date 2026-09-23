@@ -1060,6 +1060,63 @@ struct SLSAllocRegionRequest {
 };
 uint64_t sys_sls_alloc_region(struct SLSAllocRegionRequest* req);
 
+/* ─── SYS_SLS_FREE_REGION (321) — POSIX-Environments E5 ──────────────────
+ * Release a contiguous region SYS_SLS_ALLOC_REGION handed out, so an
+ * environment's heap and storage can be reclaimed when the environment is
+ * destroyed *without* destroying its partition (partition_destroy() has its
+ * own wholesale path, partition_reclaim_all_frames(), and does not need this).
+ * Gated to the sidecar creator tree exactly like the allocator: handing
+ * physical memory back to the pool is the allocator's mirror image, not a
+ * lesser privilege.
+ *
+ * `target_partition` mirrors SYS_SLS_ALLOC_REGION's rule (0 = charge the
+ * caller's partition; a nonzero target is honoured only for a
+ * PARTITION_SYSTEM caller, and only into an ACTIVE partition) with ONE
+ * deliberate difference: a PAUSED target is legal here. The allocator refuses
+ * a paused target because charging a paused partition is meaningless, but
+ * releasing is precisely how a paused partition's environment is torn down —
+ * refusing would strand every frame that environment holds until the
+ * partition itself was destroyed, which is the leak this opcode exists to
+ * prevent. */
+#define SYS_SLS_FREE_REGION 321
+struct SLSFreeRegionRequest {
+    uint64_t base;            /* base physical address from alloc_region */
+    uint64_t nframes;         /* region size in 4 KiB frames */
+    uint32_t target_partition;/* release THIS partition's frames; 0 = caller's */
+    uint32_t _pad;            /* request stays 8-byte aligned (mirrored in
+                               * user/proto/src/kabi.rs's FreeRegionReq) */
+};
+int sys_sls_free_region(struct SLSFreeRegionRequest* req);
+
+/* ─── SYS_SLS_SIDECAR_PID (322) — POSIX-Environments E5 ──────────────────
+ * Resolve a sidecar NAME to its pid within `partition` (0 if no sidecar of
+ * that name is live), exposing the registry lookup cap_create_sidecar()'s
+ * CAP_CHAN wiring already performs internally. The environment manager needs
+ * it because create_sidecar hands back only the CALLER's messenger handles,
+ * never the child's pid: with no way back from a name to a pid, the only way
+ * to end one environment would be to kill its entire partition.
+ *
+ * This single lookup answers both halves of the destroy contract. Finding the
+ * pid is the first. The second is liveness: cap_table_teardown() drops a
+ * sidecar's registry entry as its very first action (so a later create can
+ * never wire a channel to a corpse), so a name that no longer resolves is a
+ * sidecar whose teardown has already run — which is what makes it safe to
+ * reclaim that environment's regions. That matters because process_kill()
+ * DEFERS a target that is RUNNING at the time of the kill (kernel/process.c,
+ * to avoid freeing page tables the running CPU is using): immediately after a
+ * kill the sidecar may still be alive, and freeing its frames then would be a
+ * use-after-free.
+ *
+ * The name is partition-scoped (E2), so the same index in two partitions
+ * resolves to two different sidecars. Gated to the sidecar creator tree. */
+#define SYS_SLS_SIDECAR_PID 322
+struct SLSSidecarPidRequest {
+    const char* name;         /* registry name, e.g. "aerosls.posix.3" */
+    uint32_t name_len;        /* bytes to compare, or 0 to read to the NUL */
+    uint32_t partition;       /* the partition the name is scoped to (E2) */
+};
+uint32_t sys_sls_sidecar_pid(struct SLSSidecarPidRequest* req);
+
 /* ─── Sidecar registry (Phase 5: name → pid for CAP_CHAN wiring) ────────
  * cap_create_sidecar registers each new sidecar under its manifest's
  * NAME record, and resolves CAP_CHAN peer_names against this table when

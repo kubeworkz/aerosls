@@ -58,6 +58,18 @@ uint64_t loader_load_into_process(const char* object_name, uint64_t base_vaddr, 
     (void)object_name; (void)base_vaddr; (void)pml4; (void)partition_id; return 0;
 }
 void* allocate_physical_ram_frame_for_partition(uint32_t partition_id) { (void)partition_id; return (void*)0x1000; }
+/* process.c's alloc_proc_syscall_stack() takes its 8 KiB pair from the
+ * CONTIGUOUS allocator rather than two single-frame calls (POSIX-Environments
+ * E5): two consecutive single-frame allocations are not neighbours in general
+ * — a lone free frame between reserved memory and an allocated block separates
+ * them by tens of thousands of frames. The real function is in frame_pool.c,
+ * which this test does not link; the pairing itself is covered against the real
+ * pool by tests/syscall_stack_pair_host_test.c. Inert here — never spawns. */
+uint64_t allocate_contiguous_frames_for_partition(uint32_t partition_id,
+                                                  uint64_t nframes,
+                                                  uint64_t align_frames) {
+    (void)partition_id; (void)nframes; (void)align_frames; return 0;
+}
 int catalog_check_access(uint32_t uid, const char* obj_name, uint32_t needed_perm) {
     (void)uid; (void)obj_name; (void)needed_perm; return 1;
 }

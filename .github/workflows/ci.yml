@@ -175,8 +175,8 @@ jobs:
       # review and inspecting nothing. Each was written after the bug it
       # catches had already cost a diagnostic round.
       #
-      # Thirteen of the twenty-four read only sources and run here. The six
-      # GUARD-KIND: build guards (code_buffer_budget, kernel_image_end,
+      # Most of them read only sources and run here. The GUARD-KIND: build
+      # guards (code_buffer_budget, kernel_image_end,
       # no_hosted_link, no_tls_relocations, stack_frame_budget,
       # tcache_roundtrip) need the
       # linked kernel or its objects, and this runner has no x86_64-elf-gcc
@@ -236,8 +236,8 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           "$HOME/.cargo/bin/cargo" --version
 
-      # run_guard_smokes.sh runs all twenty-four, but five need the linked
-      # kernel or its objects, so that runner needs a build host. The
+      # run_guard_smokes.sh runs every tests/*_smoke.sh, but some need the
+      # linked kernel or its objects, so that runner needs a build host. The
       # other smokes are source-only — gcc/binutils/python3/openssl and
       # the sources in the tree, nothing built — so they run HERE, on
       # every push, independent of the kernel build. That independence is
@@ -743,6 +743,37 @@ jobs:
         run: make X86_CC=gcc X86_LD=ld x86-iso
         working-directory: aerosls2
 
+      # ─── Rust bare-metal toolchain for the cross-built sidecars ────────
+      # `make x86-iso-e3` -> `selfhost-bootimage` cross-builds all six
+      # sidecars for x86_64-unknown-none (see the Makefile), so it needs
+      # cargo AND that target's rust-std component. The default x86-iso
+      # needs neither: it ships the checked-in sidecars.cpio, which is why
+      # this job could build an ISO at all with no toolchain step — and
+      # why the E3 step failed on EVERY run with
+      #   [SELFHOST] warning: x86_64-unknown-none target not installed
+      #   [SELFHOST] missing init binary: user/target/.../init.bin
+      # which skipped the guards step and every boot check behind it (the
+      # E3 multi-instance guard AND the E5 recycle guard). The install
+      # recipe matches the `verify` job's toolchain step (probe, don't
+      # assume: this runner is self-hosted) and then adds the target.
+      - name: Ensure the Rust bare-metal toolchain (cargo + x86_64-unknown-none)
+        run: |
+          set -e
+          # rustup is the standard installer for a modern glibc Linux
+          # toolchain (the distro's rustc is routinely years old) and is
+          # idempotent, so a runner that already has it is untouched.
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          fi
+          # GITHUB_PATH is only visible to *later* steps, so prepend it for
+          # this step too (the target-add below runs here).
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup show active-toolchain >/dev/null 2>&1 || rustup default stable
+          cargo --version
+          rustup target add x86_64-unknown-none
+          rustup target list --installed
+
       # The E3 multi-instance guard needs an ISO init never ships: it boots
       # init built with `e3_envs` so two tenant POSIX environments are spawned
       # beside the system one. No job built it, so tests/e3_multi_env_boot_check.sh
@@ -751,6 +782,8 @@ jobs:
       # week: a broken boot check and a check nobody runs hiding behind each
       # other. Built here, BEFORE the guards step, so `run_checks.sh
       # --require-all` runs it for real and fails the job if E3 regresses.
+      # The Rust bare-metal toolchain step above is what makes this build
+      # possible at all (it cross-builds for x86_64-unknown-none).
       - name: Build the E3 ISO (init with e3_envs) for the multi-instance guard
         run: make X86_CC=gcc X86_LD=ld x86-iso-e3
         working-directory: aerosls2

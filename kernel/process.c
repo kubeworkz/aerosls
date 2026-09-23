@@ -198,26 +198,31 @@ static void nested_ring3_prep(struct ProcessDescriptor* spawner,
 // processes). The allocator's WITHHELD net caught only the pops that hit the
 // live stack; the rest were silently reused — the overlap child's address
 // space was destroyed mid-run when its syscall-stack upper half (or a frame
-// near it) was handed out for the parent's mapping. The frame pool is first-fit
-// ASCENDING and the kernel is single-threaded, so two consecutive allocs
-// return adjacent frames; if they don't (defensive), free both and retry
-// once, then fail. Returns the stack TOP, or 0.
+// near it) was handed out for the parent's mapping.
+//
+// The pair comes from the CONTIGUOUS allocator, not from two single-frame
+// allocations. The old form assumed "alloc_raw_frame() is first-fit ASCENDING
+// and the kernel is single-threaded, so two consecutive allocs are adjacent",
+// which is not a property of the pool: it holds only while the LOWEST free
+// run is at least two frames long. Wedge a single free frame between reserved
+// memory below and allocated memory above and the assumption fails outright.
+// Measured live on the unified boot (POSIX-Environments E5, the recycle boot
+// check): the lowest free frame was 0x0e1ff000, with the 64 MiB capability
+// arena and the tenant's 1344-frame region immediately above it, so the two
+// calls returned 0x0e1ff000 and 0x12740000 — 17728 frames apart — and the
+// one retry could not help because the geometry was identical. Every
+// environment create in that boot died with "[SIDECAR] create: syscall stack
+// allocation failed", the E4 boot check with it; it is not deterministic
+// across tree revisions either, because anything that changes a sidecar
+// binary's size moves the initrd GRUB loads, which moves the boundary of the
+// reserved range, which moves the lowest free frame. A contiguous request has
+// no such dependency: the allocator finds ANY adjacent pair, checks and
+// charges the whole run in one step, and cannot half-allocate. Returns the
+// stack TOP, or 0.
 uint64_t alloc_proc_syscall_stack(uint32_t partition_id) {
-    for (int attempt = 0; attempt < 2; attempt++) {
-        void* a = allocate_physical_ram_frame_for_partition(partition_id);
-        void* b = allocate_physical_ram_frame_for_partition(partition_id);
-        if (!a || !b) {
-            if (a) free_physical_ram_frame_for_partition(a, partition_id);
-            if (b) free_physical_ram_frame_for_partition(b, partition_id);
-            return 0;
-        }
-        uint64_t sa = (uint64_t)(uintptr_t)a;
-        uint64_t sb = (uint64_t)(uintptr_t)b;
-        if (sb == sa + 4096) return sa + 8192 - 8;   /* contiguous pair */
-        free_physical_ram_frame_for_partition(a, partition_id);
-        free_physical_ram_frame_for_partition(b, partition_id);
-    }
-    return 0;
+    uint64_t base = allocate_contiguous_frames_for_partition(partition_id, 2, 1);
+    if (!base) return 0;
+    return base + 8192 - 8;
 }
 
 uint32_t process_create(struct ProcCreateRequest* req) {
@@ -635,11 +640,13 @@ static void proc_free_syscall_stack(struct ProcessDescriptor* pd) {
     for (int f = 0; f < 2; f++) {
         uint64_t addr = lower + (uint64_t)f * 4096;
         /* No machine-owned guard here, deliberately: these frames came
-         * from alloc_proc_syscall_stack() (the pool, at addresses between
-         * the image and the arena) — the coarse machine-owned watermark
-         * covers that whole range and would wrongly skip them (caught
-         * live as leaked syscall stacks). free_physical_ram_frame_for_
-         * partition() validates alignment/range/bit itself. */
+         * from alloc_proc_syscall_stack(), i.e. from the pool allocator,
+         * which never hands out a machine-owned kernel-image frame — and
+         * the pool's frames now sit wherever the contiguous run was found,
+         * on either side of the arena, so a watermark test would be both
+         * wrong and pointless (caught live as leaked syscall stacks).
+         * free_physical_ram_frame_for_partition() validates alignment,
+         * range and the bitmap bit itself. */
         free_physical_ram_frame_for_partition((void*)(uintptr_t)addr,
                                               frame_pool_frame_owner(addr / 4096));
     }

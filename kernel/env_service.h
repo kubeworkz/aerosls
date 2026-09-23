@@ -32,4 +32,17 @@ int env_service_reply_slot(uint16_t slot);
 int env_service_create(uint32_t partition, uint32_t index,
                        uint16_t* out_status, uint32_t* out_env_id);
 
+/* End the environment `env_id` known to live in `partition` by round-tripping
+ * ENV_DESTROY to init (E5): init kills the environment's sidecars and hands its
+ * frames back. On a reply, returns 0 and sets *out_status — ENV_OK when the
+ * environment was ended (whether or not the kernel had finished the deferred
+ * teardown by the time init answered), ENV_ERR_NOENT when the manager holds no
+ * such environment (which is also the answer after a partition destroy already
+ * ended it and init forgot it), or ENV_ERR_INVAL when the environment exists in
+ * a DIFFERENT partition than the one named — plus *out_env_id and, on ENV_OK,
+ * *out_partition. Same -1 on no channel or no reply as env_service_create. */
+int env_service_destroy(uint32_t env_id, uint32_t partition,
+                        uint16_t* out_status, uint32_t* out_env_id,
+                        uint32_t* out_partition);
+
 #endif /* ENV_SERVICE_H */

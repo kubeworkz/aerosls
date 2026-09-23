@@ -7,7 +7,7 @@
 //! by a per-opcode body.
 //!
 //! A request carries `ENV_CREATE { partition, index }` or
-//! `ENV_DESTROY { env_id }`; the reply echoes the frame type and carries a
+//! `ENV_DESTROY { env_id, partition }`; the reply echoes the frame type and a
 //! uniform `{ status, env_id, partition }` body (env_id meaningful only on an
 //! `ENV_OK` create). The C control plane mirrors these constants (E4 part 3).
 
@@ -29,7 +29,8 @@ pub const ENV_ERR_INVAL: u16 = 1; // malformed request / bad body
 pub const ENV_ERR_NOMEM: u16 = 2; // the frame pool cannot back the environment
 pub const ENV_ERR_PART: u16 = 3; //  absent/paused partition, or a refused create
 pub const ENV_ERR_FULL: u16 = 4; //  the environment table is full
-pub const ENV_ERR_UNSUPP: u16 = 5; // recognised opcode not yet built (ENV_DESTROY → E5)
+pub const ENV_ERR_UNSUPP: u16 = 5; // recognised opcode not yet built
+pub const ENV_ERR_NOENT: u16 = 6; //  no environment with that env_id (E5)
 
 /// The 16-byte ENV_* frame header — the payload of a channel MSG envelope.
 #[repr(C)]
@@ -106,18 +107,27 @@ pub fn parse_create_body(p: &[u8]) -> Option<(u32, u32)> {
     Some((read_u32(p, 0), read_u32(p, 4)))
 }
 
-/// `ENV_DESTROY` request body: `{ env_id u32 }` (4 bytes).
-pub fn encode_destroy_body(env_id: u32) -> [u8; 4] {
-    let mut b = [0u8; 4];
+/// `ENV_DESTROY` request body: `{ env_id u32, partition u32 }` (8 bytes).
+///
+/// The partition is carried, not assumed, because the control plane's destroy
+/// route is nested under the partition it names (`POST
+/// /api/partition/{id}/env/destroy`). Without it a caller could end partition
+/// B's environment through a path that names partition A: the env id alone
+/// identifies the environment globally, so nothing else in the request would
+/// contradict the path. It mirrors `ENV_CREATE`'s `{ partition, index }` — the
+/// environment is named by (partition, its identity within it) on both paths.
+pub fn encode_destroy_body(env_id: u32, partition: u32) -> [u8; 8] {
+    let mut b = [0u8; 8];
     put_u32(&mut b, 0, env_id);
+    put_u32(&mut b, 4, partition);
     b
 }
 
-pub fn parse_destroy_body(p: &[u8]) -> Option<u32> {
-    if p.len() < 4 {
+pub fn parse_destroy_body(p: &[u8]) -> Option<(u32, u32)> {
+    if p.len() < 8 {
         return None;
     }
-    Some(read_u32(p, 0))
+    Some((read_u32(p, 0), read_u32(p, 4)))
 }
 
 /// The uniform reply body: `{ status u16, pad u16, env_id u32, partition u32 }`
@@ -159,7 +169,18 @@ mod tests {
     #[test]
     fn bodies_round_trip() {
         assert_eq!(parse_create_body(&encode_create_body(7, 3)), Some((7, 3)));
-        assert_eq!(parse_destroy_body(&encode_destroy_body(42)), Some(42));
+        assert_eq!(parse_destroy_body(&encode_destroy_body(42, 7)), Some((42, 7)));
         assert_eq!(parse_reply_body(&encode_reply_body(ENV_OK, 9, 7)), Some((ENV_OK, 9, 7)));
+    }
+
+    /// The destroy body carries BOTH fields, and a body that stops short of
+    /// either is refused rather than half-read: the partition is what makes
+    /// the control plane's nested destroy route enforce its own `{id}`.
+    #[test]
+    fn destroy_body_refuses_a_partitionless_request() {
+        let full = encode_destroy_body(42, 7);
+        assert_eq!(full.len(), 8);
+        assert_eq!(parse_destroy_body(&full[..4]), None);
+        assert_eq!(parse_destroy_body(&full), Some((42, 7)));
     }
 }

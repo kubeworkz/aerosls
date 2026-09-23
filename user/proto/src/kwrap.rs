@@ -70,6 +70,9 @@ impl<K: Kernel> Kernel for KWrap<K> {
     fn close(&self, chan: u32, reason: u16, detail: u32) -> Result<(), i32> {
         self.0.close(chan, reason, detail)
     }
+    fn cap_revoke(&self, handle: u32) -> Result<(), i32> {
+        self.0.cap_revoke(handle)
+    }
     fn cap_info(&self, handle: u32) -> Result<CapInfo, i32> {
         self.0.cap_info(handle)
     }
