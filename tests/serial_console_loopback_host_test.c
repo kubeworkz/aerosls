@@ -22,9 +22,15 @@
  *      known level, and draining them destroys the edges it counts
  *      (caught live: the old discard rule turned phase 2 into 0/10 and
  *      manufactured the phantom stuck-driver ch=leak FAIL).
- *   2. Kernel TX is suppressed while the demo owns the port — every TX
- *      byte would loop back as a foreign RX byte (and never reach the
- *      wire anyway; QEMU internalizes loopback TX before the host chardev).
+ *   2. Kernel TX does not REACH THE WIRE while the demo owns the port —
+ *      every TX byte would loop back as a foreign RX byte (and never get
+ *      out anyway; QEMU internalizes loopback TX before the host chardev).
+ *      Deferred, NOT destroyed (test 6, and the overflow count in test 7):
+ *      a window belongs to the port, not to the writer, so discarding here
+ *      threw away other processes' lines — measured: both tenant POSIX
+ *      sidecars lost their whole boot diagnostic batch to the irqtest's
+ *      serial window, and the E3 boot check failed on a machine that had
+ *      reported the property it asserts. An absence is not a measurement.
  *   3. When the ownership clears, any residue is discarded AND the partial
  *      line is reset, so the next real input starts a fresh, clean line.
  *
@@ -116,7 +122,9 @@ static void uart_queue(const char* s) {
  * uses it. This is how "was the byte echoed to the operator" is asserted —
  * echo is the operator's only feedback about which keystrokes were
  * accepted, so bytes discarded silently must not echo either. */
-static char     g_cap[256];
+static char     g_cap[8192];   /* must hold a whole window's replayed batch:
+                                 * the defer buffer is 2 KiB (test 7 asserts the
+                                 * overflow report lands after all of it) */
 static void     cap_start(void) { kernel_serial_capture_start(g_cap, sizeof g_cap); }
 static void     cap_stop_expect(const char* expect, const char* msg) {
     size_t n = kernel_serial_capture_stop();
@@ -169,7 +177,12 @@ int main(void) {
               "*** the FIFO is left INTACT for the probe (ownership) ***");
         CHECK(out[0] == '\1', "the out buffer is untouched");
         kernel_serial_putchar('x');
-        cap_stop_expect("", "kernel TX is suppressed while the demo owns the port");
+        cap_stop_expect("",
+                        "kernel TX does not reach the wire while the demo owns the port");
+        /* That byte is DEFERRED, not dropped -- see test 6 for the delivery and
+         * test 4 for the replay at release. The distinction matters: this write
+         * used to be destroyed, and a boot guard reading the serial log cannot
+         * tell a destroyed line from a line that was never written. */
     }
 
     /* ═══ 4: loopback clearing drains residue and resets the editor ════ */
@@ -185,7 +198,11 @@ int main(void) {
               "the transition poll returns nothing");
         CHECK(g_rbr_reads == 1,
               "*** the straggler is discarded, not fed to the editor ***");
-        cap_stop_expect("", "and it is not echoed");
+        /* The RX straggler is not echoed -- and the 'x' test 3 wrote while the
+         * demo held the port is replayed here, at the release, captured since
+         * the capture is still armed. Byte-exact: nothing added, nothing lost. */
+        cap_stop_expect("x",
+                        "the window's deferred byte is replayed at release, not lost");
 
         /* Real input after the transition must be clean. */
         uart_queue("caps\n");
@@ -223,6 +240,68 @@ int main(void) {
               "*** and it is \"caps\", not \"Xcaps\" or \"Acaps\" ***");
         cap_stop_expect("caps\r\n",
                         "its echo shows only the real keystrokes");
+    }
+
+    /* ═══ 6: a whole line written inside a window arrives, whole ════════ */
+    /* The E3 multi-instance boot failed on exactly this: two tenant sidecars
+     * printed their boot diagnostics inside the irqtest's serial window, the
+     * kernel destroyed every byte, and the boot check reported a machine that
+     * had in fact reported the property it asserts. The contract this pins:
+     * silent ON the wire during the demo, complete AFTER it. */
+    printf("\n-- 6: output during a window is deferred, then delivered --\n");
+    {
+        const char* line = "[POSIX] aero state=00000000\n";
+        uart_reset();
+        g_mcr_loopback = 1;
+        CHECK(serial_console_poll(out, sizeof(out)) == 0,
+              "the poll takes ownership when the demo turns loopback on");
+        cap_start();
+        /* Through kernel_serial_print(), the path a sidecar's klog takes
+         * (syscall 165): it maps \n to \r\n, and that mapping happens INSIDE the
+         * window here, so the deferred bytes are already wire-shaped. */
+        kernel_serial_print(line);
+        CHECK(kernel_serial_capture_stop() == 0,
+              "*** nothing reaches the wire while the window is open ***");
+
+        g_mcr_loopback = 0;
+        cap_start();
+        CHECK(serial_console_poll(out, sizeof(out)) == 0,
+              "the release poll completes no console line");
+        size_t n = kernel_serial_capture_stop();
+        /* kernel_serial_putchar maps \n to \r\n, so the replay is 2 bytes longer. */
+        CHECK(n == strlen(line) + 1,
+              "*** the whole deferred line is replayed at release ***");
+        CHECK(strcmp(g_cap, "[POSIX] aero state=00000000\r\n") == 0,
+              "*** byte-for-byte, in order, with its line ending ***");
+    }
+
+    /* ═══ 7: the defer buffer is bounded, and says so ═══════════════════ */
+    /* A writer that exceeds the window's buffer must not grow kernel .bss
+     * without limit, and must not lose bytes SILENTLY — the overflow count is
+     * reported on the way out, where a boot log can see it. */
+    printf("\n-- 7: an overflowing window is bounded and reported --\n");
+    {
+        char big[2100];
+        memset(big, 'A', sizeof big - 1);
+        big[sizeof big - 1] = '\0';
+        uart_reset();
+        g_mcr_loopback = 1;
+        CHECK(serial_console_poll(out, sizeof(out)) == 0, "ownership taken");
+        cap_start();
+        kernel_serial_print(big);          /* 2099 bytes into a 2048-byte window */
+        CHECK(kernel_serial_capture_stop() == 0, "still nothing on the wire");
+        g_mcr_loopback = 0;
+        cap_start();
+        CHECK(serial_console_poll(out, sizeof(out)) == 0, "release poll");
+        size_t n = kernel_serial_capture_stop();
+        CHECK(n > 2048,
+              "*** the 2048 deferred bytes are replayed, plus the overflow report ***");
+        CHECK(strncmp(g_cap, big, 2048) == 0,
+              "*** in order, capped at the buffer size (nothing beyond it) ***");
+        CHECK(strstr(g_cap, "overflow") != NULL,
+              "*** and the loss is STATED, not silent ***");
+        CHECK(strstr(g_cap, "0x0000000000000033") != NULL,
+              "*** with the exact number of bytes it could not hold (51) ***");
     }
 
     printf("\n=== %d passed, %d failed ===\n", checks_passed, checks_failed);

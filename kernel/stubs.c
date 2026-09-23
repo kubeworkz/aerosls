@@ -369,6 +369,11 @@ void handle_ring3_fault(unsigned long error_code, unsigned long saved_cs, unsign
      * the wire without this, and nothing below is worth more than the three
      * values already printed. */
     kernel_serial_capture_stop();
+    /* Same reasoning, second suppressor: if a loopback window is open, TX
+     * defers, and a halting path never reaches the release that would replay
+     * it. Releasing here also flushes whatever the window had already
+     * deferred, so a sidecar's last line is not lost to the halt. */
+    serial_loopback_ownership_set(0);
 
     fault_explain(saved_rip);
     /* Search upward from this frame for the rip/cs pair the CPU pushed. 64

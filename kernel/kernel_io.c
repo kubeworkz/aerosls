@@ -43,7 +43,41 @@ void serial_init(void) {
 // draining them inside QEMU's RX-CTI window destroys the very edges the
 // demo counts).
 static volatile int g_serial_loopback_owned = 0;
-void serial_loopback_ownership_set(int owned) { g_serial_loopback_owned = owned; }
+
+// ─── Deferred output while the probe owns the port ────────────────────────
+// The interlock's rule is "no bytes on the wire while the demo runs" -- not
+// "no bytes ever". Dropping them instead loses evidence: the E3 multi-instance
+// boot check counts one live-rootfs line per POSIX instance, and BOTH tenant
+// sidecars emitted their `[POSIX] aero state=` line while the irqtest's serial
+// demo held the port (measured with a kernel-side trace ring: 8 of 94
+// SYS_SLS_SERIAL_WRITE calls in that boot ran inside the window, and they were
+// exactly the tenants' diagnostic batches). The port was then accused of a
+// failure it had never reported.
+//
+// Deferring keeps the demo's wire silent -- the bytes go out at release, when
+// MCR loopback is already off, so they cannot re-enter the probe's own RX
+// stream -- and keeps the evidence. Bounded, so a pathological writer cannot
+// balloon kernel .bss; the overflow count is reported once, on the way out,
+// rather than silently.
+#define SERIAL_LB_DEFER_CAP 2048
+static char   lb_defer_buf[SERIAL_LB_DEFER_CAP];
+static size_t lb_defer_len;
+static size_t lb_defer_dropped;
+
+static void lb_defer_replay(void);
+static void lb_defer_drain_if_free(void);
+
+void serial_loopback_ownership_set(int owned) {
+    g_serial_loopback_owned = owned ? 1 : 0;
+    /* "Released" is not the same instant as "the port can carry bytes".
+     * cap_io_write() calls this BEFORE its own outb, so at the release the
+     * device is still in loopback and anything written now loops back into the
+     * probe's RX stream instead of reaching the wire. Measured: flushing there
+     * re-manufactured the irqtest's phantom `stuck-driver w=1 ch=leak` FAIL and
+     * the replayed lines still never appeared. So the HARDWARE bit is the
+     * authority here, and the console poll below is the reaper. */
+    lb_defer_drain_if_free();
+}
 int  serial_loopback_ownership(void)          { return g_serial_loopback_owned; }
 
 // ─── Output capture (see kernel_io.h's own header comment) ────────────────
@@ -234,13 +268,22 @@ void kernel_serial_tx_unlock(void) {
 
 // ─── Output primitives ────────────────────────────────────────────────────────
 void kernel_serial_putchar(char c) {
-    /* Loopback ownership: while the probe owns the port, kernel TX is
-     * suppressed entirely — every byte would loop back into the probe's
-     * own RX stream (loopback internalizes TX→RX before the wire, so a
-     * wire print during the demo is both lost AND an interference).
-     * Suppression ends at ownership release (one release poll after the
-     * MCR bit clears, see serial_console_poll below). */
-    if (serial_loopback_ownership()) return;
+    /* Loopback ownership: while the probe owns the port, kernel TX must not
+     * reach the wire — every byte would loop back into the probe's own RX
+     * stream (loopback internalizes TX→RX before the wire, so a wire print
+     * during the demo is both lost AND an interference). Suppression ends at
+     * ownership release (one release poll after the MCR bit clears, see
+     * serial_console_poll below).
+     *
+     * Deferred rather than discarded: the byte is not the demo's to throw
+     * away, and a boot guard reading this log cannot tell a swallowed line
+     * from one that was never written ("an absence is not a measurement").
+     * The window is short and the buffer bounded — see lb_defer_buf. */
+    if (serial_loopback_ownership()) {
+        if (lb_defer_len < SERIAL_LB_DEFER_CAP) lb_defer_buf[lb_defer_len++] = c;
+        else lb_defer_dropped++;
+        return;
+    }
     if (capture_buf) {
         // Bounds-checked append; leave room for the NUL capture_stop() writes.
         if (capture_len + 1 < capture_cap) capture_buf[capture_len] = c;
@@ -270,6 +313,45 @@ void kernel_serial_print_hex64(uint64_t v) {
     buf[16] = 0;
     for (int i = 15; i >= 0; i--) { buf[i] = hex[v & 0xF]; v >>= 4; }
     kernel_serial_print(buf);
+}
+
+// ─── Deferred-output replay (see serial_loopback_ownership_set) ────────────
+// Runs at ownership release, with loopback already off. The buffer is copied
+// out and cleared BEFORE any byte is written, so a phase-2→3 re-entry mid-
+// replay (the probe re-taking the port) defers the remainder again instead of
+// having it written into the window it is meant to be silent in.
+// Replay only when the port is genuinely free: ownership clear AND the device's
+// own MCR loopback bit clear. Both conditions are needed -- see the setter.
+static void lb_defer_drain_if_free(void) {
+    if (g_serial_loopback_owned) return;
+    if (inb(SERIAL_COM1_BASE + 4) & 0x10) return;
+    lb_defer_replay();
+}
+
+static void lb_defer_replay(void) {
+    static char scratch[SERIAL_LB_DEFER_CAP];
+    size_t n = lb_defer_len;
+    size_t dropped = lb_defer_dropped;
+    if (!n && !dropped) return;
+    for (size_t i = 0; i < n; i++) scratch[i] = lb_defer_buf[i];
+    lb_defer_len = 0;
+    lb_defer_dropped = 0;
+    /* Held for the whole replay for the same reason print() holds it: the
+     * deferred batch is several lines and a second writer (the AP's sidecar
+     * drain in a unified boot) must not land inside one of them. Bounded and
+     * non-reentrant by design -- called from a context that already holds it,
+     * the wait expires and the bytes go out anyway, exactly as print() does. */
+    int held = kernel_serial_tx_lock();
+    for (size_t i = 0; i < n; i++) kernel_serial_putchar(scratch[i]);
+    if (held) kernel_serial_tx_unlock();
+    if (dropped) {
+        /* Never silent: an overflowing window is itself a finding. Printed
+         * after the unlock so the warning does not nest the lock the batch
+         * just held (kernel_serial_print takes it itself). */
+        kernel_serial_print("[serial] loopback window overflow: 0x");
+        kernel_serial_print_hex64((uint64_t)dropped);
+        kernel_serial_print(" byte(s) dropped\n");
+    }
 }
 // ─── Minimal printf ───────────────────────────────────────────────────────────
 // Handles: %s %-Ns %c %d %u %ld %lu %x %lx %016lx %04x %02x %Nx %%
@@ -417,6 +499,13 @@ int serial_console_poll(char* out, size_t cap) {
      * ownership hand-back) so the probe's own post-clear drain gets a
      * poll window before kernel TX resumes. */
     static int prev_loopback = 0;
+    /* The reaper for output a loopback window deferred. This runs every tick
+     * from the console service (and each HTTP sweep), and it is the first
+     * point at which the port is provably free again: the probe's own MCR-off
+     * write cleared ownership one instruction before its outb, so the setter
+     * could not flush there. Guarded on the hardware bit, so a window that is
+     * still open (or re-opened for phase 3) keeps the bytes deferred. */
+    lb_defer_drain_if_free();
     if (inb(SERIAL_COM1_BASE + 4) & 0x10) {
         serial_loopback_ownership_set(1);
         prev_loopback = 1;
