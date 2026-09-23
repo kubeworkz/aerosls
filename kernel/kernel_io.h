@@ -113,7 +113,18 @@ void console_reset_line(void);
  * (sidecar output routes through the console service) and must reach the
  * wire from that instruction onward. While owned, the kernel does NOT
  * transmit and does NOT touch the RX FIFO. Purely x86-hardware state —
- * host builds never set the flag. */
+ * host builds never set the flag.
+ *
+ * While the port is owned, kernel TX is DEFERRED, not discarded: the bytes
+ * are buffered (bounded, 2 KiB) and written at release, when loopback is
+ * off. Dropping them was worse than it looked — a window is not a property
+ * of the writer, so ANY process printing during the demo lost its line, and
+ * a guard reading the log could not tell a swallowed line from one that was
+ * never written. Measured live: the E3 multi-instance boot's two tenant
+ * POSIX sidecars each emitted their four boot diagnostics inside the irqtest
+ * serial window, and the boot check failed on a machine that had reported
+ * the very property it asserts. The overflow (a writer exceeding the buffer
+ * inside one window) is counted and reported on the way out, never silently. */
 /* Weak declarations: the state lives in kernel_io.c, but arch TUs that
  * consume the hooks (cap_io_write's MCR hand-off) are also linked by host
  * tests WITHOUT kernel_io.c — the same host-link pattern cap.c's arch

@@ -577,19 +577,23 @@ jobs:
     # ISO, via make x86-iso -- since M8 the default build is the decoder,
     # SLS_X86_FRONTEND=on, the same frontend deploy.sh ships) and runs
     # the deploy gate's two commands --
-    # run_checks.sh --require-all and run_guard_smokes.sh -- so all
-    # twenty-four guards pass AND all twenty-four smokes prove their teeth
-    # on every push (the five runtime guards -- entropy_boot_diversity,
+    # run_checks.sh --require-all and run_guard_smokes.sh -- so every
+    # build-run guard passes AND every smoke proves its teeth
+    # on every push (the five live-cluster guards -- entropy_boot_diversity,
     # partition_reannounce_live, partition_ownedset_gc_live, failover_adoption,
-    # failover_2node -- still report their owed skips: they need a live cluster). Then it
+    # failover_2node -- still report their owed skips: they need a live cluster).
+    # The E3 multi-instance guard is also GUARD-KIND: runtime but is NOT one of
+    # those skips: this job builds sls_operating_system_e3.iso for it a step
+    # earlier, so it boots the two-tenant image here for real. Then it
     # boots the
     # ISO under QEMU and checks the service end to end: the kernel's first
     # serial banner must appear, and its webapp must answer /api/health on
     # the forwarded port (the exact endpoint deploy.sh gates on) — proving
     # the webapp serves, not just that the kernel boots. Verified
-    # end-to-end on a fresh checkout: the ISO builds, all twenty-four guards
-    # + all twenty-four smokes pass, the ISO boots under QEMU, and /api/health
-    # answers in ~10s.
+    # end-to-end on a fresh checkout: the ISO builds, the build-run guards
+    # + every smoke pass, the ISO boots under QEMU, and /api/health
+    # answers in ~10s. (Deliberately no hard counts here: the old "twenty-four"
+    # numbers had already rotted past the real sizes.)
     #
     # Toolchain: the cross compiler (x86_64-elf-gcc) is replaced by the
     # host gcc/ld via the X86_CC/X86_LD overrides. The kernel is
@@ -737,6 +741,18 @@ jobs:
 
       - name: Build the kernel ISO (host gcc/ld as the toolchain)
         run: make X86_CC=gcc X86_LD=ld x86-iso
+        working-directory: aerosls2
+
+      # The E3 multi-instance guard needs an ISO init never ships: it boots
+      # init built with `e3_envs` so two tenant POSIX environments are spawned
+      # beside the system one. No job built it, so tests/e3_multi_env_boot_check.sh
+      # always exited 2 and run_checks.sh reported it as an owed RUNTIME skip —
+      # "needs a live cluster" — which is why the guard sat red on main for a
+      # week: a broken boot check and a check nobody runs hiding behind each
+      # other. Built here, BEFORE the guards step, so `run_checks.sh
+      # --require-all` runs it for real and fails the job if E3 regresses.
+      - name: Build the E3 ISO (init with e3_envs) for the multi-instance guard
+        run: make X86_CC=gcc X86_LD=ld x86-iso-e3
         working-directory: aerosls2
 
       - name: Run all guards with --require-all (every build-run guard must pass)
