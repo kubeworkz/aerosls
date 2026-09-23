@@ -3027,6 +3027,10 @@ static const char* env_status_str(uint16_t s) {
         case ENV_ERR_PART:   return "partition absent, paused, or placement refused";
         case ENV_ERR_FULL:   return "environment table full";
         case ENV_ERR_UNSUPP: return "unsupported";
+        /* E5: an ENV_DESTROY for an env_id the manager does not hold. Its own
+         * code rather than a generic failure, so a caller can tell "destroyed"
+         * from "there was nothing there". */
+        case ENV_ERR_NOENT:  return "no such environment";
         default:             return "unknown";
     }
 }

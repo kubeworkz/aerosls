@@ -211,6 +211,45 @@ pub trait Kernel {
         let _ = target_partition;
         self.alloc_region(nframes, align_frames)
     }
+
+    /// Release a contiguous region `alloc_region`/`alloc_region_in` handed out,
+    /// decrementing `target_partition`'s frame usage (0 = the caller's) —
+    /// POSIX-Environments E5. Gated to the sidecar creator tree exactly like
+    /// the allocator, and a nonzero target is honoured only for a
+    /// PARTITION_SYSTEM caller; unlike the allocator, a PAUSED target is
+    /// legal, because releasing a paused partition's frames is precisely how
+    /// a paused environment is torn down. Returns true when the region was
+    /// released. Default: false (unsupported), for fakes that never allocate.
+    fn free_region_in(&self, base: u64, nframes: u64, target_partition: u32) -> bool {
+        let _ = (base, nframes, target_partition);
+        false
+    }
+
+    /// Resolve a sidecar NAME to its pid within `partition` (0 = not live) —
+    /// POSIX-Environments E5. `create_sidecar` hands back only the CALLER's
+    /// messenger handles and never the child's pid, so this is the only way
+    /// back from an environment's identity to the process implementing it.
+    ///
+    /// It is also the liveness test the destroy path depends on: the kernel
+    /// drops a sidecar's registry entry as the first step of its teardown, so
+    /// a name that no longer resolves is a sidecar that is really gone — which
+    /// is what makes it safe to reclaim the environment's frames.
+    /// Default: 0 (nothing resolves), for fakes.
+    fn sidecar_pid(&self, name: &str, partition: u32) -> u32 {
+        let _ = (name, partition);
+        0
+    }
+
+    /// Kill a process by pid (`SYS_SLS_PROC_KILL`). No return value on
+    /// purpose: the kernel DEFERS a target that is RUNNING at the moment of
+    /// the kill (kernel/process.c finishes the teardown at the next schedule,
+    /// so it never frees page tables the running CPU is still using), so
+    /// "the kill was issued" is not "the process is gone". Confirm with
+    /// `sidecar_pid` before reclaiming anything the process owned.
+    /// Default: no-op, for fakes.
+    fn proc_kill(&self, pid: u32) {
+        let _ = pid;
+    }
 }
 
 // ── Real kernel ABI (feature `target`) ───────────────────────────────────────
@@ -281,6 +320,9 @@ mod abi {
     const SYS_IRQ_MASK: u64 = 318;
     const SYS_BOOT_GEN: u64 = 319;
     const SYS_ALLOC_REGION: u64 = 320;
+    const SYS_FREE_REGION: u64 = 321;
+    const SYS_SIDECAR_PID: u64 = 322;
+    const SYS_PROC_KILL: u64 = 161;
     const SYS_YIELD: u64 = 300;
 
     /// The raw syscall instruction (same convention as
@@ -342,6 +384,31 @@ mod abi {
         align_frames: u64,
         target_partition: u32,
         _pad: u32,
+    }
+
+    /// SLSFreeRegionRequest (kernel/cap.h) — the same shape as
+    /// AllocRegionReq's two u64s plus a target partition, so the release can
+    /// be charged to the same partition the allocation was (a tenant's), not
+    /// to whoever is doing the destroying.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct FreeRegionReq {
+        base: u64,
+        nframes: u64,
+        target_partition: u32,
+        _pad: u32,
+    }
+
+    /// SLSSidecarPidRequest (kernel/cap.h) — a name pointer, the byte count to
+    /// compare (0 = read to the NUL) and the partition the name is scoped to
+    /// (E2). The kernel copies the name into its own bounded buffer before
+    /// resolving it, so the pointer only has to be valid for the call.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct SidecarPidReq {
+        name: *const u8,
+        name_len: u32,
+        partition: u32,
     }
 
     /// Kernel SLSCapDesc (slot u16 + pad; proto's CapDescriptor is slot
@@ -887,6 +954,44 @@ mod abi {
         unsafe { sls_syscall(SYS_ALLOC_REGION, &req as *const AllocRegionReq as u64) }
     }
 
+    /// `k_free_region_in`: syscall 321 — release a region the allocator handed
+    /// out (POSIX-Environments E5). Returns 0 when the kernel released it and 1
+    /// on any refusal, which never touches the frame bitmap.
+    #[no_mangle]
+    pub extern "C" fn k_free_region_in(base: u64, nframes: u64,
+                                       target_partition: u32) -> i32 {
+        let req = FreeRegionReq {
+            base,
+            nframes,
+            target_partition,
+            _pad: 0,
+        };
+        unsafe { sls_syscall(SYS_FREE_REGION, &req as *const FreeRegionReq as u64) as i32 }
+    }
+
+    /// `k_sidecar_pid`: syscall 322 — a sidecar name to its pid within
+    /// `partition`, or 0 when no sidecar of that name is live
+    /// (POSIX-Environments E5). `name_len` excludes any NUL; 0 means "read to
+    /// the NUL". An empty name resolves to nothing.
+    #[no_mangle]
+    pub extern "C" fn k_sidecar_pid(name: *const u8, name_len: u32,
+                                    partition: u32) -> u32 {
+        let req = SidecarPidReq {
+            name,
+            name_len,
+            partition,
+        };
+        unsafe { sls_syscall(SYS_SIDECAR_PID, &req as *const SidecarPidReq as u64) as u32 }
+    }
+
+    /// `k_proc_kill`: syscall 161 — end a process by pid. The kernel defers a
+    /// target that is RUNNING, so this returning does not mean the process is
+    /// gone; `k_sidecar_pid` is the liveness test.
+    #[no_mangle]
+    pub extern "C" fn k_proc_kill(pid: u32) {
+        unsafe { sls_syscall(SYS_PROC_KILL, pid as u64) };
+    }
+
     /// Watchdog-respawn introspection (SYS_SLS_BOOT_GEN = 319): the
     /// current process's per-name boot generation — 0 on its first boot,
     /// 1+ after a watchdog respawn (a fresh process created from the same
@@ -1085,6 +1190,18 @@ mod abi {
         fn alloc_region_in(&self, nframes: u64, align_frames: u64,
                            target_partition: u32) -> u64 {
             k_alloc_region_in(nframes, align_frames, target_partition)
+        }
+
+        fn free_region_in(&self, base: u64, nframes: u64, target_partition: u32) -> bool {
+            k_free_region_in(base, nframes, target_partition) == 0
+        }
+
+        fn sidecar_pid(&self, name: &str, partition: u32) -> u32 {
+            k_sidecar_pid(name.as_ptr(), name.len() as u32, partition)
+        }
+
+        fn proc_kill(&self, pid: u32) {
+            k_proc_kill(pid)
         }
     }
 }

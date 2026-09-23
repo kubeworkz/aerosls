@@ -10,8 +10,8 @@
 //! second manifest builder in kernel C (roadmap §7).
 
 use aerosls_proto::env_proto::{
-    self, EnvFrame, ENV_CREATE, ENV_DESTROY, ENV_ERR_FULL, ENV_ERR_INVAL, ENV_ERR_NOMEM,
-    ENV_ERR_PART, ENV_ERR_UNSUPP, ENV_OK,
+    self, EnvFrame, ENV_CREATE, ENV_DESTROY, ENV_ERR_FULL, ENV_ERR_INVAL, ENV_ERR_NOENT,
+    ENV_ERR_NOMEM, ENV_ERR_PART, ENV_OK,
 };
 use aerosls_proto::kabi::{Kernel, ERR_NOMEM};
 use alloc::vec::Vec;
@@ -49,6 +49,11 @@ pub struct EnvImages {
 pub struct Environment {
     pub partition: u32,
     pub index: u32,
+    /// The three private regions this environment owns, kept per-environment
+    /// from E5: a destroy has to hand each of them back individually (E4 only
+    /// ever needed the ramdisk heap's base at create time), so all three bases
+    /// are part of the environment's identity now.
+    pub rd_heap: u64,
     pub rd_storage: u64,
     pub px_heap: u64,
     pub ramdisk_r: u32,
@@ -115,10 +120,8 @@ pub fn create_environment<K: Kernel>(
         return Err(ERR_NOMEM);
     }
 
-    let mut rd_name = NameBuf::new();
-    let _ = write!(rd_name, "drv.ramdisk.{}", index);
-    let mut px_name = NameBuf::new();
-    let _ = write!(px_name, "aerosls.posix.{}", index);
+    let rd_name = ramdisk_name(index);
+    let px_name = posix_name(index);
 
     // Tenant ramdisk: its own name + private R|W storage (0x3, so the POSIX
     // sidecar can format the empty region on first mount — E3), placed in the
@@ -148,6 +151,7 @@ pub fn create_environment<K: Kernel>(
     Ok(Environment {
         partition,
         index,
+        rd_heap,
         rd_storage,
         px_heap,
         ramdisk_r,
@@ -157,25 +161,162 @@ pub fn create_environment<K: Kernel>(
     })
 }
 
+/// The ramdisk sidecar's registry name for environment `index`. Built in one
+/// place so the name registered at create and the name resolved at destroy
+/// cannot drift apart — the destroy path finds a sidecar by exactly the name
+/// create gave it. Names are partition-scoped (E2), so `index` alone
+/// identifies the environment within its own partition.
+fn ramdisk_name(index: u32) -> NameBuf {
+    let mut n = NameBuf::new();
+    let _ = write!(n, "drv.ramdisk.{}", index);
+    n
+}
+
+/// The POSIX sidecar's registry name for environment `index` (see
+/// `ramdisk_name`).
+fn posix_name(index: u32) -> NameBuf {
+    let mut n = NameBuf::new();
+    let _ = write!(n, "aerosls.posix.{}", index);
+    n
+}
+
+/// End an environment: kill its two sidecars by the names it registered, and
+/// report the pids that were live (0 for one that was not).
+///
+/// Killing and releasing are separate steps on purpose. The kernel DEFERS a
+/// kill whose target is RUNNING at the time (kernel/process.c marks it
+/// `pending_teardown` and finishes at the next schedule, so it never frees
+/// page tables the running CPU is using). Releasing an environment's heap
+/// while a sidecar can still execute in it would be a use-after-free, so the
+/// caller must confirm the sidecars are gone — `sidecar_pid` is that test —
+/// before calling `reclaim_environment`.
+///
+/// The pids are resolved BEFORE the kill, because a kill of a parked sidecar
+/// drops its registry entry inside the syscall: afterwards the name resolves
+/// to nothing and the pid would be lost. They are kept in `Reclaim` so a
+/// deferred teardown can tell "my sidecar is still running" from "my sidecar
+/// died and a newer environment registered the same name".
+pub fn kill_environment<K: Kernel>(k: &K, env: &Environment) -> (u32, u32) {
+    let rd = ramdisk_name(env.index);
+    let px = posix_name(env.index);
+    let rd_pid = k.sidecar_pid(rd.as_str(), env.partition);
+    let px_pid = k.sidecar_pid(px.as_str(), env.partition);
+    if rd_pid != 0 {
+        k.proc_kill(rd_pid);
+    }
+    if px_pid != 0 {
+        k.proc_kill(px_pid);
+    }
+    (rd_pid, px_pid)
+}
+
+/// Release an environment's three private regions back to its OWN partition —
+/// the same partition `alloc_region_in` charged, so the tenant's frame usage
+/// returns exactly to where the create left it. Only call this once both
+/// sidecars are provably gone (see `kill_environment`). Returns true when all
+/// three releases succeeded; a region whose frames were already free is not an
+/// error (the frame pool skips them), so a retry after a partial failure is
+/// safe.
+pub fn reclaim_environment<K: Kernel>(k: &K, env: &Environment) -> bool {
+    let mut ok = true;
+    ok &= k.free_region_in(env.rd_heap, RD_HEAP_FRAMES, env.partition);
+    ok &= k.free_region_in(env.rd_storage, RD_STORAGE_FRAMES, env.partition);
+    ok &= k.free_region_in(env.px_heap, POSIX_HEAP_FRAMES, env.partition);
+    ok
+}
+
+/// An environment whose sidecars were killed, together with the pids that were
+/// live when they were. `pending` is non-zero only for the window between a
+/// deferred kill and the schedule tick that finishes it.
+pub struct Reclaim {
+    pub env: Environment,
+    pub ramdisk_pid: u32,
+    pub posix_pid: u32,
+}
+
+/// Is the sidecar we killed under `pid` gone? True when it was never live
+/// (pid 0 — nothing to wait for), when the name no longer resolves at all, or
+/// when it resolves to a DIFFERENT pid, which means our sidecar's entry was
+/// dropped and the name now belongs to a newer environment. That last case is
+/// why the pid is remembered: reclamation must never wait on — or worse, act
+/// on — a process that merely inherited the name.
+fn sidecar_gone<K: Kernel>(k: &K, name: &str, partition: u32, pid: u32) -> bool {
+    if pid == 0 {
+        return true;
+    }
+    let now = k.sidecar_pid(name, partition);
+    now == 0 || now != pid
+}
+
+/// Finish one environment's teardown: release its regions if both sidecars are
+/// really gone, otherwise leave everything alone and report that it is not
+/// done. Never partially releases, and never re-kills — the kill has already
+/// been issued; this only waits for the kernel to finish it.
+pub fn try_reclaim<K: Kernel>(k: &K, r: &Reclaim) -> bool {
+    let rd = ramdisk_name(r.env.index);
+    let px = posix_name(r.env.index);
+    if !sidecar_gone(k, rd.as_str(), r.env.partition, r.ramdisk_pid)
+        || !sidecar_gone(k, px.as_str(), r.env.partition, r.posix_pid)
+    {
+        return false;
+    }
+    reclaim_environment(k, &r.env)
+}
+
 /// The environment manager's state: the images every environment instantiates,
-/// the environments created so far (each with its assigned id, kept for a
-/// future `ENV_DESTROY` — E5), and a bound on how many may coexist. init owns
-/// one of these and drives it from the ENV request channel (E4 part 3).
+/// the environments created so far (each with its assigned id, kept for
+/// `ENV_DESTROY` — E5), the ones whose teardown the kernel has not finished
+/// yet, and a bound on how many may coexist. init owns one of these and drives
+/// it from the ENV request channel (E4 part 3).
 pub struct EnvManager {
     images: EnvImages,
     envs: Vec<(u32, Environment)>,
+    /// Environments killed but not yet reclaimed. Drained by `reap`, which
+    /// every request runs first, so a deferred teardown lands within a tick of
+    /// the kill. Empty at rest.
+    reclaiming: Vec<Reclaim>,
     next_id: u32,
     max_envs: usize,
 }
 
 impl EnvManager {
     pub fn new(images: EnvImages, max_envs: usize) -> EnvManager {
-        EnvManager { images, envs: Vec::new(), next_id: 1, max_envs }
+        EnvManager {
+            images,
+            envs: Vec::new(),
+            reclaiming: Vec::new(),
+            next_id: 1,
+            max_envs,
+        }
     }
 
     /// The environments created so far, as `(env_id, environment)`.
     pub fn environments(&self) -> &[(u32, Environment)] {
         &self.envs
+    }
+
+    /// Environments whose teardown is still outstanding — zero except in the
+    /// window between a kill of a RUNNING sidecar and the schedule tick that
+    /// finishes its teardown.
+    pub fn pending_reclaims(&self) -> usize {
+        self.reclaiming.len()
+    }
+
+    /// Finish any teardown the kernel deferred, and return how many are still
+    /// outstanding. Idempotent and free when nothing is pending, so every
+    /// request runs it first: the environments that need it were killed on an
+    /// earlier request, and this is the tick that releases their frames.
+    pub fn reap<K: Kernel>(&mut self, k: &K) -> usize {
+        if self.reclaiming.is_empty() {
+            return 0;
+        }
+        let pending = core::mem::take(&mut self.reclaiming);
+        for r in pending {
+            if !try_reclaim(k, &r) {
+                self.reclaiming.push(r);
+            }
+        }
+        self.reclaiming.len()
     }
 
     /// Handle one ENV request (`env_proto`): parse the frame + body, act, and
@@ -185,6 +326,11 @@ impl EnvManager {
     /// `ENV_ERR_INVAL`; a create is placed in the requested partition via
     /// `create_environment` (so the kernel's E4 gate authorises the placement).
     pub fn handle_request<K: Kernel>(&mut self, k: &K, req: &[u8], reply: &mut [u8]) -> usize {
+        // Finish any teardown the kernel deferred on an earlier request before
+        // serving this one, so a destroyed environment's frames come back
+        // within a tick of the kill. Idempotent and free when nothing is
+        // pending.
+        self.reap(k);
         let frame = match EnvFrame::parse(req) {
             Some(f) => f,
             None => return self.reply(reply, ENV_CREATE, ENV_ERR_INVAL, 0, 0),
@@ -212,9 +358,36 @@ impl EnvManager {
                     Err(_) => self.reply(reply, ENV_CREATE, ENV_ERR_PART, 0, partition),
                 }
             }
-            // Leak-free destroy is E5; recognise the opcode so the control plane
-            // gets a structured "not yet" instead of a dropped request.
-            ENV_DESTROY => self.reply(reply, ENV_DESTROY, ENV_ERR_UNSUPP, 0, 0),
+            ENV_DESTROY => {
+                let env_id = match env_proto::parse_destroy_body(body) {
+                    Some(v) => v,
+                    None => return self.reply(reply, ENV_DESTROY, ENV_ERR_INVAL, 0, 0),
+                };
+                // An unknown id is reported as such rather than silently
+                // succeeding: "destroyed" and "there was nothing there" are
+                // different answers to a caller, and this is the only way it
+                // can tell them apart.
+                let pos = match self.envs.iter().position(|(id, _)| *id == env_id) {
+                    Some(p) => p,
+                    None => return self.reply(reply, ENV_DESTROY, ENV_ERR_NOENT, env_id, 0),
+                };
+                let (_, env) = self.envs.remove(pos);
+                let partition = env.partition;
+                let (ramdisk_pid, posix_pid) = kill_environment(k, &env);
+                let pending = Reclaim { env, ramdisk_pid, posix_pid };
+                // Usually the environment's sidecars are parked (an idle
+                // environment is a blocked process), so the kill tears them
+                // down inside the syscall and this releases the frames right
+                // now. When they are not — a sidecar RUNNING at the moment of
+                // the kill — the kernel defers the teardown, the regions stay
+                // taken, and `reap` releases them on a later request. Both
+                // answers are ENV_OK: the environment IS being ended; only its
+                // memory accounting is a tick behind.
+                if !try_reclaim(k, &pending) {
+                    self.reclaiming.push(pending);
+                }
+                self.reply(reply, ENV_DESTROY, ENV_OK, env_id, partition)
+            }
             other => self.reply(reply, other, ENV_ERR_INVAL, 0, 0),
         }
     }
@@ -389,19 +562,145 @@ mod tests {
         assert_eq!(mgr.environments().len(), 0);
     }
 
+    fn destroy_req(env_id: u32) -> alloc::vec::Vec<u8> {
+        let mut r = EnvFrame::new(ENV_DESTROY, false).encode().to_vec();
+        r.extend_from_slice(&env_proto::encode_destroy_body(env_id));
+        r
+    }
+
     #[test]
-    fn env_manager_rejects_malformed_and_defers_destroy() {
+    fn env_manager_rejects_malformed_requests() {
         let k = SimKernel::new();
         let mut mgr = EnvManager::new(images(), 8);
         let mut reply = [0u8; 64];
         // A too-short / foreign frame is refused, and nothing is created.
         let n = mgr.handle_request(&k, &[0u8; 4], &mut reply);
         assert_eq!(reply_status(&reply, n).0, ENV_ERR_INVAL);
-        // ENV_DESTROY is recognised but deferred to E5.
-        let mut dreq = EnvFrame::new(ENV_DESTROY, false).encode().to_vec();
-        dreq.extend_from_slice(&env_proto::encode_destroy_body(1));
-        let dn = mgr.handle_request(&k, &dreq, &mut reply);
-        assert_eq!(reply_status(&reply, dn).0, ENV_ERR_UNSUPP);
+        // A destroy carrying no env_id is refused too, and touches nothing.
+        let dn = mgr.handle_request(&k, &EnvFrame::new(ENV_DESTROY, false).encode(), &mut reply);
+        assert_eq!(reply_status(&reply, dn).0, ENV_ERR_INVAL);
         assert_eq!(k.created().len(), 0);
+        assert_eq!(k.killed_pids().len(), 0);
+    }
+
+    /// E5: destroying an environment kills both sidecars, drops both registry
+    /// names, and hands all three regions back to the TENANT partition.
+    #[test]
+    fn destroy_kills_both_sidecars_and_releases_every_region() {
+        let k = SimKernel::new();
+        let mut mgr = EnvManager::new(images(), 8);
+        let mut reply = [0u8; 64];
+        let n = mgr.handle_request(&k, &create_req(6, 2), &mut reply);
+        let (status, env_id, _) = reply_status(&reply, n);
+        assert_eq!(status, ENV_OK);
+        assert_eq!(k.sidecar_count(), 2, "both sidecars registered on create");
+        let env = mgr.environments()[0].1;
+
+        let dn = mgr.handle_request(&k, &destroy_req(env_id), &mut reply);
+        let (dstatus, denv, dpart) = reply_status(&reply, dn);
+        assert_eq!(dstatus, ENV_OK);
+        assert_eq!(denv, env_id);
+        assert_eq!(dpart, 6, "the reply names the environment's own partition");
+        assert!(mgr.environments().is_empty(), "the table entry is gone");
+        assert_eq!(mgr.pending_reclaims(), 0, "an idle environment reclaims inline");
+
+        // Both sidecars were killed, and both names left the registry — the
+        // kernel drops a sidecar's entry as the first step of its teardown.
+        assert_eq!(k.killed_pids().len(), 2);
+        assert_eq!(k.sidecar_count(), 0);
+        assert_eq!(k.sidecar_pid("aerosls.posix.2", 6), 0);
+        assert_eq!(k.sidecar_pid("drv.ramdisk.2", 6), 0);
+
+        // All three regions came back, each charged to the tenant partition.
+        // This is the assertion that bites if the release reverts to the
+        // caller's partition (the E4 charging bug, at destroy time).
+        let freed = k.freed_regions();
+        assert_eq!(freed.len(), 3);
+        assert_eq!(freed[0], (env.rd_heap, RD_HEAP_FRAMES, 6));
+        assert_eq!(freed[1], (env.rd_storage, RD_STORAGE_FRAMES, 6));
+        assert_eq!(freed[2], (env.px_heap, POSIX_HEAP_FRAMES, 6));
+        assert!(freed.iter().all(|(_, _, p)| *p == env.partition));
+    }
+
+    /// E5: an unknown env_id is reported as such, not silently "succeeded".
+    #[test]
+    fn destroy_unknown_environment_reports_noent() {
+        let k = SimKernel::new();
+        let mut mgr = EnvManager::new(images(), 8);
+        let mut reply = [0u8; 64];
+        let dn = mgr.handle_request(&k, &destroy_req(7), &mut reply);
+        assert_eq!(reply_status(&reply, dn).0, ENV_ERR_NOENT);
+        assert_eq!(k.killed_pids().len(), 0, "nothing was killed");
+        assert!(k.freed_regions().is_empty(), "and nothing was released");
+    }
+
+    /// E5's ordering rule, as a negative control: when the kernel DEFERS the
+    /// kill (the target was RUNNING, so its teardown runs at the next
+    /// schedule), the environment's frames must NOT be released. Releasing
+    /// them while a sidecar can still execute in that heap is the
+    /// use-after-free the deferral exists to avoid.
+    #[test]
+    fn destroy_defers_reclamation_while_a_sidecar_is_still_alive() {
+        let k = SimKernel::new();
+        let mut mgr = EnvManager::new(images(), 8);
+        let mut reply = [0u8; 64];
+        let n = mgr.handle_request(&k, &create_req(6, 2), &mut reply);
+        let env_id = reply_status(&reply, n).1;
+        let env = mgr.environments()[0].1;
+
+        // Both sidecars are RUNNING at the moment of the kill.
+        k.set_kill_deferred(true);
+        let dn = mgr.handle_request(&k, &destroy_req(env_id), &mut reply);
+        assert_eq!(reply_status(&reply, dn).0, ENV_OK,
+                   "the environment is still ended, and the caller is told so");
+        assert!(mgr.environments().is_empty(), "its table entry is released");
+        assert_eq!(mgr.pending_reclaims(), 1, "but its memory is not");
+        assert!(k.freed_regions().is_empty(),
+                "NOTHING may be released while a sidecar can still run");
+        assert_eq!(k.sidecar_count(), 2, "the deferred kill leaves them registered");
+
+        // The next schedule finishes the teardown; the next request reaps.
+        k.complete_deferred_kill();
+        let n2 = mgr.handle_request(&k, &create_req(6, 3), &mut reply);
+        assert_eq!(reply_status(&reply, n2).0, ENV_OK);
+        assert_eq!(mgr.pending_reclaims(), 0, "the deferred reclaim completed");
+        let freed = k.freed_regions();
+        assert_eq!(freed.len(), 3, "the released regions are the destroyed one's");
+        assert_eq!(freed[0], (env.rd_heap, RD_HEAP_FRAMES, 6));
+        assert_eq!(freed[1], (env.rd_storage, RD_STORAGE_FRAMES, 6));
+        assert_eq!(freed[2], (env.px_heap, POSIX_HEAP_FRAMES, 6));
+    }
+
+    /// E5's leak test, the shape the roadmap's verification plan calls for: N
+    /// create → destroy cycles where N exceeds both PROC_MAX (16) and
+    /// SIDECAR_REGISTRY_MAX (16). The table holds exactly ONE environment at a
+    /// time, so every cycle after the first can only succeed if the previous
+    /// destroy really released its slot — and the registry, the table and the
+    /// released-frame ledger all advance by exactly the per-cycle amount, with
+    /// nothing left live behind them.
+    #[test]
+    fn recycle_cycles_leak_no_slots_registry_entries_or_frames() {
+        let k = SimKernel::new();
+        let mut mgr = EnvManager::new(images(), 1);
+        let mut reply = [0u8; 64];
+        const CYCLES: u32 = 24; // > PROC_MAX 16 and > SIDECAR_REGISTRY_MAX 16
+        for cycle in 0..CYCLES {
+            let n = mgr.handle_request(&k, &create_req(6, cycle + 1), &mut reply);
+            let (status, env_id, _) = reply_status(&reply, n);
+            assert_eq!(status, ENV_OK, "cycle {}: create fits the single slot", cycle);
+            assert_eq!(k.sidecar_count(), 2, "cycle {}: two sidecars live", cycle);
+
+            let dn = mgr.handle_request(&k, &destroy_req(env_id), &mut reply);
+            assert_eq!(reply_status(&reply, dn).0, ENV_OK, "cycle {}: destroy", cycle);
+            assert_eq!(mgr.pending_reclaims(), 0, "cycle {}: reclaimed inline", cycle);
+            assert_eq!(k.sidecar_count(), 0, "cycle {}: registry back to empty", cycle);
+            assert!(mgr.environments().is_empty(), "cycle {}: slot released", cycle);
+            // Exactly two kills and three releases per cycle — the ledger
+            // grows by the cycle's own work and nothing else.
+            assert_eq!(k.killed_pids().len() as u32, 2 * (cycle + 1));
+            assert_eq!(k.freed_regions().len() as u32, 3 * (cycle + 1));
+        }
+        assert_eq!(k.sidecar_count(), 0, "no registry entry survives the loop");
+        assert_eq!(mgr.pending_reclaims(), 0, "and nothing is left half-torn-down");
     }
 }

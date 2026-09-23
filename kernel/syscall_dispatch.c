@@ -618,6 +618,18 @@ uint64_t do_syscall(uint64_t num, void* arg) {
     case SYS_SLS_ALLOC_REGION:
         return sys_sls_alloc_region((struct SLSAllocRegionRequest*)arg);
 
+    // ─── POSIX-Environments E5: release a region (321) and resolve a sidecar
+    // name to its pid (322). Together these are what ending an environment
+    // needs — the pid to kill and the free to hand the frames back — and the
+    // resolve doubles as the liveness test that says when it is safe to free
+    // them (process_kill() defers a RUNNING target; see cap.h).
+    case SYS_SLS_FREE_REGION:
+        return (uint64_t)(int64_t)sys_sls_free_region(
+            (struct SLSFreeRegionRequest*)arg);
+    case SYS_SLS_SIDECAR_PID:
+        return (uint64_t)sys_sls_sidecar_pid(
+            (struct SLSSidecarPidRequest*)arg);
+
     // ─── Phase 5 channel transport (311-315) ───────────────────────────
     // The kabi.rs k_chan_* contract over cap_send_msg/cap_recv_msg
     // (kernel/chan.c, docs/AeroSLS-Sidecar-Channels-Transport-Spec-v0.1.md

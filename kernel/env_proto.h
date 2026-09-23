@@ -41,7 +41,8 @@
 #define ENV_ERR_NOMEM   2   /* the frame pool cannot back the environment */
 #define ENV_ERR_PART    3   /* absent/paused partition, or a refused create */
 #define ENV_ERR_FULL    4   /* the environment table is full */
-#define ENV_ERR_UNSUPP  5   /* recognised opcode not yet built (ENV_DESTROY -> E5) */
+#define ENV_ERR_UNSUPP  5   /* recognised opcode not yet built */
+#define ENV_ERR_NOENT   6   /* no environment with that env_id (E5) */
 
 #define ENV_FRAME_SIZE       16u
 #define ENV_CREATE_BODY_SIZE  8u

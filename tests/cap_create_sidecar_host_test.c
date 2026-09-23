@@ -325,6 +325,29 @@ uint64_t allocate_contiguous_frames_for_partition(uint32_t partition_id,
     return 0x50000000ULL;   /* fake, stable region base */
 }
 
+/* Recording stub for the contiguous region FREE (POSIX-Environments E5). The
+ * real free_contiguous_frames_for_partition lives in frame_pool.c (not linked
+ * here) and its bitmap/owner/counter behaviour is covered by
+ * frame_quota_host_test.c's scenario 14. This stub mirrors the part of its
+ * contract SYS_SLS_FREE_REGION has to respect — a null base, a misaligned base
+ * and a zero length are refused — and records the args, so the E5 section can
+ * prove the release reaches the pool charged to the TARGET partition rather
+ * than to whoever asked (the E4 charging bug, at the release end), and that
+ * every refusal happens BEFORE the pool is touched. */
+static uint32_t g_free_region_last_part    = 0xFFFFFFFFu;
+static uint64_t g_free_region_last_base    = 0;
+static uint64_t g_free_region_last_nframes = 0;
+static int      g_free_region_calls        = 0;
+int free_contiguous_frames_for_partition(uint64_t base_addr, uint64_t nframes,
+                                         uint32_t partition_id) {
+    if (base_addr == 0 || (base_addr % 4096u) != 0 || nframes == 0) return 1;
+    g_free_region_last_base    = base_addr;
+    g_free_region_last_nframes = nframes;
+    g_free_region_last_part    = partition_id;
+    g_free_region_calls++;
+    return 0;   /* released */
+}
+
 /* The E4 target-partition gate's partition-state queries (partition_exists /
  * partition_is_paused / frame quota+usage) are satisfied by the weak inert
  * stubs in process_host_stubs.h: partition_exists is true only for
@@ -922,6 +945,168 @@ int main(void) {
               "E3: target 0 still charges the caller's own partition");
 
         host_stub_partition_extra_id = 0xFFFFFFFFu;   /* restore the shared stub */
+    }
+
+    /* ── 0c3. E5 SYS_SLS_FREE_REGION (321): the release counterpart ──────
+     * `env destroy` must hand an environment's heap and storage back to the
+     * SAME partition the allocation charged (0c2), so the tenant's usage
+     * returns exactly to where the create left it.
+     *
+     * One asymmetry with 320 is deliberate and is the tooth here: a PAUSED
+     * target is LEGAL on the release path. The allocator refuses a paused
+     * target because charging a paused partition is meaningless, but releasing
+     * a paused partition's frames is precisely how its environment is torn
+     * down — refusing there would strand those frames until the partition
+     * itself was destroyed. */
+    {
+        host_stub_partition_extra_id     = 5;
+        host_stub_partition_extra_paused = 0;
+
+        struct SLSFreeRegionRequest fr = { .base = 0x60000000ULL, .nframes = 64,
+                                           .target_partition = 5 };
+        g_cur_pid = 100;                 /* init: PARTITION_SYSTEM, authority */
+        g_free_region_calls = 0;
+        g_free_region_last_part = 0xFFFFFFFFu;
+        CHECK(sys_sls_free_region(&fr) == 0,
+              "E5: an authority caller releases a region");
+        CHECK(g_free_region_calls == 1 &&
+              g_free_region_last_base == 0x60000000ULL &&
+              g_free_region_last_nframes == 64,
+              "E5: the release passes the base and length straight through");
+        CHECK(g_free_region_last_part == 5,
+              "E5: the release is charged to the TARGET partition, not the caller's");
+
+        /* The asymmetry: paused is fine here, where 320 refuses it. */
+        host_stub_partition_extra_paused = 1;
+        g_free_region_calls = 0;
+        CHECK(sys_sls_free_region(&fr) == 0 && g_free_region_last_part == 5,
+              "E5: a PAUSED target is legal on the release path (320 refuses it; 321 must not)");
+        host_stub_partition_extra_paused = 0;
+
+        /* Non-authority caller: refused before the pool is touched. */
+        proc_table[1].pid = 500;
+        proc_table[1].active = 1;
+        proc_table[1].state = PROC_SUSPENDED;
+        proc_table[1].partition_id = 5;
+        proc_table[1].sidecar_authority = 0;
+        g_cur_pid = 500;
+        g_free_region_calls = 0;
+        CHECK(sys_sls_free_region(&fr) == 1 && g_free_region_calls == 0,
+              "E5: a non-authority caller may not release frames (refused before the pool)");
+        proc_table[1].active = 0;
+
+        /* Non-system caller targeting another partition. */
+        g_cur_pid = 100;
+        proc_table[0].partition_id = 5;         /* pretend init is a tenant */
+        g_free_region_calls = 0;
+        CHECK(sys_sls_free_region(&fr) == 1 && g_free_region_calls == 0,
+              "E5: only PARTITION_SYSTEM may release into another partition");
+        proc_table[0].partition_id = 0;         /* restore */
+
+        /* Absent target partition. */
+        fr.target_partition = 7;                /* only 0 and 5 are active */
+        g_free_region_calls = 0;
+        CHECK(sys_sls_free_region(&fr) == 1 && g_free_region_calls == 0,
+              "E5: releasing into a non-active partition is refused");
+
+        /* The pool's own refusals, and the null request. */
+        fr.target_partition = 0;
+        struct SLSFreeRegionRequest bad = { .base = 0, .nframes = 4, .target_partition = 0 };
+        CHECK(sys_sls_free_region(&bad) == 1,
+              "E5: a null base is refused by the pool");
+        CHECK(sys_sls_free_region(NULL) == 1,
+              "E5: a NULL request is refused");
+
+        /* Target 0 releases the CALLER's own partition — the E3 shape. */
+        g_free_region_calls = 0;
+        struct SLSFreeRegionRequest own = { .base = 0x60000000ULL, .nframes = 8,
+                                            .target_partition = 0 };
+        CHECK(sys_sls_free_region(&own) == 0 && g_free_region_last_part == 0,
+              "E5: target 0 releases the caller's own partition");
+
+        host_stub_partition_extra_id = 0xFFFFFFFFu;   /* restore the shared stub */
+    }
+
+    /* ── 0c4. E5 SYS_SLS_SIDECAR_PID (322): name → pid, scoped by partition ─
+     * The destroy path needs the pid of each of an environment's two sidecars
+     * — create_sidecar returns only the CALLER's messenger handles — and it
+     * needs a liveness test that says when the kernel's teardown has actually
+     * run, because process_kill() defers a RUNNING target. Both come from this
+     * one lookup, so both are proven here against the REAL registry
+     * (sidecar_registry_* live in cap.c, linked in this test): an environment
+     * that has really died stops resolving, which is what makes reclaiming its
+     * frames safe. */
+    {
+        /* Register a pair the way create would, in partition 0 and 5. */
+        CHECK(sidecar_registry_register("drv.ramdisk.9", 401, 0) == 0,
+              "E5: a sidecar registers by name within its partition");
+        CHECK(sidecar_registry_register("aerosls.posix.9", 402, 5) == 0,
+              "E5: and another does so within its own");
+
+        g_cur_pid = 100;                 /* authority */
+        /* sizeof(literal) - 1 so the length cannot drift from the name — an
+         * explicit 14 here truncated "aerosls.posix.9" to 14 bytes and made
+         * every lookup against it fail for the wrong reason. */
+        struct SLSSidecarPidRequest req = { .name = "drv.ramdisk.9",
+                                            .name_len = sizeof("drv.ramdisk.9") - 1,
+                                            .partition = 0 };
+        CHECK(sys_sls_sidecar_pid(&req) == 401,
+              "E5: a name resolves to the pid registered in ITS partition");
+        struct SLSSidecarPidRequest other = { .name = "aerosls.posix.9",
+                                              .name_len = sizeof("aerosls.posix.9") - 1,
+                                              .partition = 5 };
+        CHECK(sys_sls_sidecar_pid(&other) == 402,
+              "E5: the same lookup finds a name in a different partition");
+
+        /* Partition-scoped (E2): the name exists, but not in partition 0. */
+        struct SLSSidecarPidRequest wrong = { .name = "aerosls.posix.9",
+                                              .name_len = sizeof("aerosls.posix.9") - 1,
+                                              .partition = 0 };
+        CHECK(sys_sls_sidecar_pid(&wrong) == 0,
+              "E5: a name registered in another partition does not resolve (E2 scoping)");
+
+        /* name_len 0 means "read to the NUL". */
+        struct SLSSidecarPidRequest auto_len = { .name = "drv.ramdisk.9",
+                                                 .name_len = 0, .partition = 0 };
+        CHECK(sys_sls_sidecar_pid(&auto_len) == 401,
+              "E5: a zero name_len measures the name instead of comparing nothing");
+
+        /* Unknown name, empty name, out-of-range partition, null request. */
+        struct SLSSidecarPidRequest unknown = { .name = "aerosls.posix.3",
+                                                .name_len = sizeof("aerosls.posix.3") - 1,
+                                                .partition = 0 };
+        CHECK(sys_sls_sidecar_pid(&unknown) == 0,
+              "E5: an unknown name resolves to nothing");
+        struct SLSSidecarPidRequest empty = { .name = "", .name_len = 0, .partition = 0 };
+        CHECK(sys_sls_sidecar_pid(&empty) == 0,
+              "E5: an empty name matches nothing");
+        struct SLSSidecarPidRequest oob = { .name = "drv.ramdisk.9",
+                                            .name_len = sizeof("drv.ramdisk.9") - 1,
+                                            .partition = 999 };
+        CHECK(sys_sls_sidecar_pid(&oob) == 0,
+              "E5: an out-of-range partition resolves to nothing");
+        CHECK(sys_sls_sidecar_pid(NULL) == 0,
+              "E5: a NULL request resolves to nothing");
+
+        /* Non-authority caller: refused. */
+        proc_table[1].pid = 500;
+        proc_table[1].active = 1;
+        proc_table[1].state = PROC_SUSPENDED;
+        proc_table[1].sidecar_authority = 0;
+        g_cur_pid = 500;
+        CHECK(sys_sls_sidecar_pid(&req) == 0,
+              "E5: a caller without sidecar_authority may not enumerate sidecars");
+        proc_table[1].active = 0;
+        g_cur_pid = 100;
+
+        /* The liveness property the reclaim ordering depends on: a sidecar
+         * whose teardown has run no longer resolves. */
+        sidecar_registry_remove_pid(401);
+        CHECK(sys_sls_sidecar_pid(&req) == 0,
+              "E5: a killed sidecar stops resolving, so its frames are safe to reclaim");
+        CHECK(sys_sls_sidecar_pid(&other) == 402,
+              "E5: and its neighbour in the other partition is untouched");
+        sidecar_registry_remove_pid(402);
     }
 
     /* ── 0d. E4 partition-targeted creation: the target_partition gate ───

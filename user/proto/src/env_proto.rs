@@ -29,7 +29,8 @@ pub const ENV_ERR_INVAL: u16 = 1; // malformed request / bad body
 pub const ENV_ERR_NOMEM: u16 = 2; // the frame pool cannot back the environment
 pub const ENV_ERR_PART: u16 = 3; //  absent/paused partition, or a refused create
 pub const ENV_ERR_FULL: u16 = 4; //  the environment table is full
-pub const ENV_ERR_UNSUPP: u16 = 5; // recognised opcode not yet built (ENV_DESTROY → E5)
+pub const ENV_ERR_UNSUPP: u16 = 5; // recognised opcode not yet built
+pub const ENV_ERR_NOENT: u16 = 6; //  no environment with that env_id (E5)
 
 /// The 16-byte ENV_* frame header — the payload of a channel MSG envelope.
 #[repr(C)]

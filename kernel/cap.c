@@ -4205,3 +4205,97 @@ uint64_t sys_sls_alloc_region(struct SLSAllocRegionRequest* req) {
     return allocate_contiguous_frames_for_partition(
         charged, req->nframes, req->align_frames);
 }
+
+/* ─── sys_sls_free_region (321) ──────────────────────────────────────────
+ * POSIX-Environments E5: the counterpart to sys_sls_alloc_region above.
+ * Releases a region the allocator handed out, decrementing the CHARGED
+ * partition's frame usage by exactly what was really freed —
+ * free_contiguous_frames_for_partition() skips frames that were already free
+ * rather than counting them, so a partly-freed region cannot underflow the
+ * counter. Returns 0 on success, 1 on any refusal (which never touches the
+ * bitmap).
+ *
+ * Gating is deliberately identical to the allocator's, including the
+ * PARTITION_SYSTEM-only rule for a nonzero target, with the single documented
+ * exception that a PAUSED target is legal (cap.h's own comment explains why:
+ * the allocator refuses a paused target to avoid charging it, but releasing a
+ * paused partition's environment is exactly what destroy does, and refusing
+ * there would leak those frames until the partition itself was destroyed). */
+int sys_sls_free_region(struct SLSFreeRegionRequest* req) {
+    if (!req) return 1;
+    struct ProcessDescriptor* caller = sidecar_find_pid(cap_current_pid());
+    if (!caller || !caller->sidecar_authority) {
+        kernel_serial_printf(
+            "[FREE_REGION] denied: pid=%u lacks sidecar_authority\n",
+            (unsigned)cap_current_pid());
+        return 1;
+    }
+
+    uint32_t charged = caller->partition_id;
+    if (req->target_partition != 0) {
+        if (caller->partition_id != PARTITION_SYSTEM) {
+            kernel_serial_printf(
+                "[FREE_REGION] CAP_EPERM: pid=%u (partition %u) may not "
+                "release frames charged to partition %u — only "
+                "PARTITION_SYSTEM may release into another partition\n",
+                (unsigned)cap_current_pid(), (unsigned)caller->partition_id,
+                (unsigned)req->target_partition);
+            return 1;
+        }
+        if (req->target_partition >= PARTITION_MAX ||
+            !partition_exists(req->target_partition)) {
+            kernel_serial_printf(
+                "[FREE_REGION] CAP_EINVAL: target partition %u is not an "
+                "active partition\n",
+                (unsigned)req->target_partition);
+            return 1;
+        }
+        charged = req->target_partition;
+    }
+
+    if (free_contiguous_frames_for_partition(req->base, req->nframes,
+                                             charged) != 0) {
+        kernel_serial_printf(
+            "[FREE_REGION] refused: base=0x%llx frames=%llu partition=%u "
+            "(null, misaligned, out of range, or no frames to free)\n",
+            (unsigned long long)req->base,
+            (unsigned long long)req->nframes, (unsigned)charged);
+        return 1;
+    }
+    kernel_serial_printf(
+        "[FREE_REGION] pid=%u released %llu frame(s) at 0x%llx charged to "
+        "partition %u\n",
+        (unsigned)cap_current_pid(), (unsigned long long)req->nframes,
+        (unsigned long long)req->base, (unsigned)charged);
+    return 0;
+}
+
+/* ─── sys_sls_sidecar_pid (322) ──────────────────────────────────────────
+ * POSIX-Environments E5: name → pid inside a partition, or 0. The name is
+ * copied into a bounded local buffer (never dereferenced past
+ * SIDECAR_REGISTRY_NAME_LEN), so a caller cannot make the registry compare a
+ * string it does not own. A name_len of 0 means "read to the NUL"; anything
+ * longer than the registry's own name field is clamped to it, which can only
+ * shorten a name that could never have matched a registration. */
+uint32_t sys_sls_sidecar_pid(struct SLSSidecarPidRequest* req) {
+    if (!req || !req->name) return 0;
+    struct ProcessDescriptor* caller = sidecar_find_pid(cap_current_pid());
+    if (!caller || !caller->sidecar_authority) {
+        kernel_serial_printf(
+            "[SIDECAR_PID] denied: pid=%u lacks sidecar_authority\n",
+            (unsigned)cap_current_pid());
+        return 0;
+    }
+    if (req->partition >= PARTITION_MAX) return 0;
+
+    char name[SIDECAR_REGISTRY_NAME_LEN];
+    uint32_t max = SIDECAR_REGISTRY_NAME_LEN - 1;
+    uint32_t want = req->name_len;
+    if (want == 0 || want > max) want = max;
+    uint32_t i = 0;
+    for (; i < want && req->name[i] != '\0'; i++) name[i] = req->name[i];
+    name[i] = '\0';
+    if (i == 0) return 0;   /* an empty name matches nothing */
+
+    return sidecar_registry_resolve(name, req->partition);
+}
