@@ -27,7 +27,10 @@
  *   6. writes a BootInfoBlock at the child's stack top whose header and cap
  *      table (messenger caps first, then the named MEM caps and the wired
  *      CHAN_R/CHAN_W pairs with their real slots) are exactly what a
- *      sidecar's _start would parse (user/proto/src/bootinfo.rs), and
+ *      sidecar's _start would parse (user/proto/src/bootinfo.rs) — including
+ *      BIB v3's identity words, the child's own pid and (section 17) the
+ *      environment index parsed out of its NAME record when it is an
+ *      environment (E6: the sidecar announces both on its own console), and
  *   7. (section 8) the spawn-to-spawn name→pid link: a sidecar spawned
  *      through cap_create_sidecar registers under its NAME record, and a
  *      LATER manifest's CAP_CHAN peer_name ("drv.ramdisk.0") resolves to
@@ -119,7 +122,7 @@
  *   gcc -no-pie -std=c11 -Wall -Wextra -I . -I kernel \
  *       -o /tmp/cap_create_sidecar_host_test \
  *       tests/cap_create_sidecar_host_test.c kernel/cap.c kernel/chan.c \
- *           kernel/console_service.c
+ *           kernel/console_service.c kernel/env_console.c
  *   /tmp/cap_create_sidecar_host_test
  */
 #include "kernel/cap.h"
@@ -727,6 +730,8 @@ struct Bib {
     uint64_t stack_top;
     uint32_t total_len;
     uint32_t flags;        /* E1 (BIB v2): SIDECAR_BIB_FLAG_UNIFIED */
+    uint32_t own_pid;      /* E6 (BIB v3): this sidecar's own pid */
+    uint32_t own_index;    /* E6 (BIB v3): its environment index, 0 if none */
     struct BibCap caps[SIDECAR_BIB_CAPS_MAX];
 };
 
@@ -738,8 +743,12 @@ static struct Bib bib_parse(const uint8_t* p) {
     b.budget_bytes = le64(p + 12);
     b.stack_top = le64(p + 20);
     b.total_len = le32(p + 28);
-    b.flags = le32(p + 32);   /* E1: v2 header adds flags(+32) reserved(+36) */
-    uint32_t off = 40;
+    b.flags = le32(p + 32);   /* E1: v2 header adds flags(+32) */
+    /* E6 (BIB v3): the header's identity words — own_pid replaced v2's
+     * `reserved`, own_index is new, `reserved` moved to +44. */
+    b.own_pid = le32(p + 36);
+    b.own_index = le32(p + 40);
+    uint32_t off = 48;
     for (uint16_t i = 0; i < b.cap_count && i < SIDECAR_BIB_CAPS_MAX; i++) {
         uint16_t nl = le16(p + off);
         off += 2;
@@ -1307,7 +1316,7 @@ int main(void) {
     if (bib) {
         b = bib_parse(bib);
         CHECK(memcmp(bib, SIDECAR_BIB_MAGIC, 8) == 0, "BIB magic");
-        CHECK(b.version == SIDECAR_BIB_VERSION, "BIB version 2");
+        CHECK(b.version == SIDECAR_BIB_VERSION, "BIB version 3");
         /* E1: a non-unified boot must leave the flag clear — every Phase-5
          * sidecar's behaviour (and this test's own expectations) rests on it. */
         CHECK(b.flags == 0, "BIB flags clear on a non-unified boot");
@@ -1333,13 +1342,26 @@ int main(void) {
               "synthetic ring3_ctx carries the BIB pointer in rdi (crt0 contract)");
         CHECK(b.stack_top == BIB_STACK_TOP, "BIB stack_top = RSP at _start + 16");
         /* Entry = name_len u16 + name + slot u16 + ty u8 + rights u8 +
-         * base u64 + len u64: 40 header + 22 (cap0) + 22 (cap1) + 28
+         * base u64 + len u64: 48 header + 22 (cap0) + 22 (cap1) + 28
          * (cap2 "budget") + 25 (cap3 "dma") + 27+27 (cap4/5 "peer0") +
          * 29+29 (cap6/7 "console") + 31 (cap8 "nic0.bar0").
-         * The header is 40 bytes, not 32: POSIX-Environments E1's BIB v2
-         * added flags u32 + reserved u32 after total_len. */
-        CHECK(b.total_len == 280,
-              "BIB total_len = 40 + 22 + 22 + 28 + 25 + 27 + 27 + 29 + 29 + 31");
+         * The header is 48 bytes, not 32: POSIX-Environments E1's BIB v2
+         * added flags u32 + reserved u32 after total_len (32 → 40), and E6's
+         * v3 made that reserved word the sidecar's own pid and added its own
+         * environment index (40 → 48, still 8-byte aligned for the caps). */
+        CHECK(b.total_len == 288,
+              "BIB total_len = 48 + 22 + 22 + 28 + 25 + 27 + 27 + 29 + 29 + 31");
+        /* E6 (BIB v3): the sidecar's OWN identity, straight from the kernel's
+         * spawn path — the pid it just handed the child, and the environment
+         * index parsed out of the manifest's NAME record. This manifest is
+         * named "drv.child.0", which is not an environment's name, so the
+         * index is 0 — an index, not a flag ("aerosls.posix.0" IS an
+         * environment: the E3 boot spawn). Section 17 reads the other half
+         * from a child that IS named like an environment. */
+        CHECK(b.own_pid == child->pid,
+              "BIB own_pid is the child's own pid");
+        CHECK(b.own_index == 0,
+              "a non-environment NAME yields own_index 0");
 
         CHECK(b.caps[0].name[0] == 0 && b.caps[0].slot == child_rd &&
               b.caps[0].ty == CAP_TYPE_CHAN_R && b.caps[0].rights == CAP_PERM_RECV &&
@@ -1544,10 +1566,12 @@ int main(void) {
         CHECK(c_bib != 0, "consumer's BIB is mapped at its stack top");
         if (c_bib) {
             struct Bib cb = bib_parse(c_bib);
+            CHECK(cb.own_pid == cons_pid,
+                  "consumer BIB own_pid is the consumer's own pid");
             CHECK(cb.cap_count == 6,
                   "consumer BIB lists 6 caps (2 messenger + 2 MEM + 2 wired CHAN)");
-            CHECK(cb.total_len == 195,
-                  "consumer BIB total_len = 40 + 22 + 22 + 28 + 25 + 29 + 29 (v2 header)");
+            CHECK(cb.total_len == 203,
+                  "consumer BIB total_len = 48 + 22 + 22 + 28 + 25 + 29 + 29 (v3 header)");
             CHECK(strcmp(cb.caps[4].name, "console") == 0 &&
                   cb.caps[4].ty == CAP_TYPE_CHAN_R &&
                   cb.caps[4].rights == CAP_PERM_RECV,
@@ -2781,6 +2805,100 @@ int main(void) {
               "E2: partition 7's entry is untouched by partition 5's restart");
         CHECK(sidecar_registry_count() == 2,
               "E2: two coexisting entries for the same name in two partitions");
+    }
+
+    /* ── 17. E6 BIB v3 identity: an environment's name reaches its own BIB ─
+     * The other half of section 5's identity check. There the child was named
+     * "drv.child.0" and own_index was 0; here the child IS an environment, so
+     * the index the sidecar will announce on its own console must be the index
+     * parsed out of its name by the SAME function the console registry files
+     * its console under (env_console_name_index). A sidecar announcing an index
+     * the registry did not file it under is exactly the disagreement E6's
+     * in-band identity exists to make impossible, so the two are asserted
+     * against one parse here. */
+    {
+        uint32_t idx = 0;
+        CHECK(env_console_name_index("aerosls.posix.3", &idx) == 1 && idx == 3,
+              "the shared parse reads index 3 out of 'aerosls.posix.3'");
+        idx = 0;
+        CHECK(env_console_name_index("drv.ramdisk.3", &idx) == 0 && idx == 0,
+              "...and refuses a name that is not an environment's (leaving 0)");
+
+        /* 17a. An environment NAME, but a console that is not an environment
+         * console (this blob wires none at all): the index and pid are still in
+         * the BIB — a reader can see what this sidecar is — but the
+         * ENV_CONSOLE flag is clear, so the sidecar announces nothing. The
+         * announcement belongs to a console the attach surface serves, and
+         * "environment 0" is a real environment, so silence must be
+         * distinguishable from environment 0 rather than folded into it. */
+        struct Blob quiet_blob;
+        build_peer_blob(&quiet_blob, image_kaddr, "aerosls.posix.3");
+        uint16_t quiet_ch = CAP_NONE;
+        CHECK(cap_create_sidecar(100, quiet_blob.data, quiet_blob.len,
+                                 CAP_NONE, CAP_NONE, &quiet_ch) == 0,
+              "a child named 'aerosls.posix.3' spawns through cap_create_sidecar");
+        uint32_t quiet_pid = sidecar_registry_resolve("aerosls.posix.3", 0);
+        CHECK(quiet_pid != 0, "...and is registered under that name");
+        /* Each new spawn is the last one, so g_pml4 is its clone and the BIB at
+         * BIB_VADDR is its. */
+        uint8_t* quiet_bib = host_ptr(BIB_VADDR);
+        CHECK(quiet_bib != 0, "the environment child's BIB is mapped at its stack top");
+        if (quiet_bib) {
+            struct Bib qb = bib_parse(quiet_bib);
+            CHECK(qb.own_pid == quiet_pid,
+                  "its BIB own_pid is its own pid (not the parent's, not a default)");
+            CHECK(qb.own_index == 3,
+                  "its BIB own_index is the index in its NAME record");
+            CHECK((qb.flags & SIDECAR_BIB_FLAG_ENV_CONSOLE) == 0,
+                  "a sidecar with no environment console carries no ENV_CONSOLE "
+                  "flag — it announces nothing");
+        }
+
+        /* 17b. The whole kernel-side path, end to end: an environment name AND
+         * the tenant console peer ("kernel.env.console"), which is what
+         * env_console_register() accepts — so the BIB carries the flag and the
+         * sidecar announces exactly the index this registry filed it under. */
+        struct Blob env_blob;
+        build_consumer_blob(&env_blob, image_kaddr, "aerosls.posix.4",
+                            "kernel.env.console");
+        uint16_t env_ch = CAP_NONE;
+        CHECK(cap_create_sidecar(100, env_blob.data, env_blob.len,
+                                 CAP_NONE, CAP_NONE, &env_ch) == 0,
+              "an environment with a 'kernel.env.console' peer spawns");
+        uint32_t env_pid = sidecar_registry_resolve("aerosls.posix.4", 0);
+        CHECK(env_pid != 0, "...and is registered under its name");
+        uint8_t* e_bib = host_ptr(BIB_VADDR);
+        CHECK(e_bib != 0, "its BIB is mapped at its stack top");
+        if (e_bib) {
+            struct Bib eb = bib_parse(e_bib);
+            uint32_t want_idx = 0;
+            CHECK(eb.own_pid == env_pid,
+                  "its BIB own_pid is its own pid");
+            CHECK(env_console_name_index("aerosls.posix.4", &want_idx) == 1 &&
+                  eb.own_index == want_idx,
+                  "its BIB own_index is the index the console registry parsed "
+                  "out of its own name — one parse, so the two cannot disagree");
+            CHECK((eb.flags & SIDECAR_BIB_FLAG_ENV_CONSOLE) != 0,
+                  "and the ENV_CONSOLE flag is set: this console has an attach "
+                  "surface, so the sidecar announces its identity on it");
+            /* The registry filed this child under the SAME index the BIB
+             * announces — one parse, two callers (env_console_name_index). A
+             * sidecar whose announced index and filed index could disagree is
+             * exactly what E6's in-band identity exists to make impossible. */
+            int found = 0;
+            for (uint32_t i = 0; i < env_console_count(); i++) {
+                uint32_t rp = 0, re = 0, ri = 0, rpid = 0;
+                if (env_console_entry(i, &rp, &re, &ri, &rpid) == 1 &&
+                    rpid == env_pid) {
+                    found = 1;
+                    CHECK(ri == eb.own_index && re == 0,
+                          "env_console filed it under the same index the BIB "
+                          "announces (and no manager bound an env_id here)");
+                    break;
+                }
+            }
+            CHECK(found, "env_console registered the environment's console");
+        }
     }
 
     if (g_fail == 0) printf("\nALL PASS\n");

@@ -129,6 +129,28 @@ __attribute__((weak)) int partition_is_paused(uint32_t partition_id) {
 __attribute__((weak)) void env_service_register(uint16_t kernel_chan_r, uint16_t kernel_chan_w) { (void)kernel_chan_r; (void)kernel_chan_w; }
 __attribute__((weak)) int env_service_reply_slot(uint16_t slot) { (void)slot; return 0; }
 
+/* ─── POSIX-Environments E6: per-environment consoles ───────────────────────
+ * cap.c's "kernel.*" wiring calls env_console_register() when it wires a
+ * tenant's kernel.env.console peer, and console_service_tick() asks
+ * env_console_kernel_slot() to skip that slot (an environment's output must
+ * not reach the kernel's serial transcript). The strong definitions live in
+ * env_console.c, which no cap.c/console_service.c host test links, so these
+ * weak inert stubs close the link: nothing registers (no console exists in
+ * host context) and no slot is claimed, so the console tick drains every slot
+ * exactly as it did before E6. tests/env_console_host_test.c links the real
+ * file, where the strong definitions win. */
+__attribute__((weak)) int env_console_register(uint16_t k_rd, uint16_t k_wr, uint32_t partition, uint32_t pid, const char* name) { (void)k_rd; (void)k_wr; (void)partition; (void)pid; (void)name; return 0; }
+__attribute__((weak)) int env_console_kernel_slot(uint16_t slot) { (void)slot; return 0; }
+
+/* E6's BIB v3 has cap.c ask the same identity question the console registry
+ * asks — "is this sidecar's name an environment's name, and which index?" — so
+ * cap_create_sidecar_in() calls env_console_name_index() to fill the header's
+ * own_index. A test that links cap.c but not env_console.c gets this inert
+ * answer (not an environment), which is exactly what a name like "drv.child.0"
+ * parses to anyway. tests/cap_create_sidecar_host_test.c DOES link
+ * env_console.c, so its BIB assertions read the real parse. */
+__attribute__((weak)) int env_console_name_index(const char* name, uint32_t* out_index) { (void)name; (void)out_index; return 0; }
+
 /* ─── the deferred drains cap_wait_chans' hlt wake now runs ──────────────── */
 /* kernel/process.c's cap_wait_chans drains the deferred console tick and
  * the latched device-IRQ notifications at its post-hlt wake (the only

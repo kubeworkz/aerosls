@@ -186,6 +186,17 @@ void kernel_yield_to_ring3(uint32_t budget_ticks) {
 
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 
+/* POSIX-Environments E6: env_service_create() binds the created environment's
+ * console (kernel/env_console.c) once the manager's reply names it. This test
+ * links the REAL kernel/env_service.c but not the console registry — its
+ * subject is the create round trip's yield-and-deadline, and no console exists
+ * in host context, so the binding is an inert stand-in. Its own behaviour is
+ * covered by tests/env_console_host_test.c. */
+int env_console_bind_env(uint32_t partition, uint32_t index, uint32_t env_id) {
+    (void)partition; (void)index; (void)env_id;
+    return 0;
+}
+
 /* ─── the test ──────────────────────────────────────────────────────────── */
 int main(void) {
     uint16_t status = 0xFFFF;

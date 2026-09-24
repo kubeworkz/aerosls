@@ -111,24 +111,36 @@ pub fn init<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
         return init_child(ctx);
     }
     match ctx.data[0] {
-        // Load the script: [0, cursor=0, script...]. A missing script is
-        // an empty one — the sidecar boots to a quiet system.
+        // Load the script: [0, cursor=0, script...].
         0 => {
-            let fd = match ctx.vfs().open(task, INIT_RC, O_RDONLY, 0) {
-                Ok(fd) => fd,
-                Err(Errno::ENoent) => return Step::Exit(0),
-                Err(_) => return Step::Exit(2),
-            };
             ctx.data.extend_from_slice(&0u32.to_le_bytes());
-            let mut buf = [0u8; 64];
-            loop {
-                match ctx.vfs().read(task, fd, &mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => ctx.data.extend_from_slice(&buf[..n]),
-                    Err(_) => return Step::Exit(2),
+            match ctx.vfs().open(task, INIT_RC, O_RDONLY, 0) {
+                Ok(fd) => {
+                    let mut buf = [0u8; 64];
+                    loop {
+                        match ctx.vfs().read(task, fd, &mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => ctx.data.extend_from_slice(&buf[..n]),
+                            Err(_) => return Step::Exit(2),
+                        }
+                    }
+                    ctx.vfs().close(task, fd).ok();
                 }
+                // POSIX-Environments E6: a missing boot script used to mean
+                // "a quiet system" — but a tenant environment's rootfs is
+                // blank (E3 formats it on first mount and seeds nothing), and
+                // a system with no task has no reader for the console it was
+                // given. That is precisely the unreachable environment G7
+                // rejects, so a missing script now starts the interactive
+                // shell instead: the same program the console-only mode in
+                // boot.rs spawns directly. One synthetic script line reaches
+                // the SAME fork/exec path every other command takes, so the
+                // shell inherits console stdio on fds 0,1,2 and talks over the
+                // environment's own console channel exactly as init.rc's
+                // commands do — nothing downstream is a special case.
+                Err(Errno::ENoent) => ctx.data.extend_from_slice(b"sh\n"),
+                Err(_) => return Step::Exit(2),
             }
-            ctx.vfs().close(task, fd).ok();
             ctx.data[0] = 1;
             Step::Yield
         }

@@ -7,6 +7,7 @@
 #include "checkpoint_mgr.h"
 #include "../kernel/dashboard.h"
 #include "console_service.h"
+#include "env_console.h"
 
 extern void tier_mgr_init(void);
 extern void tier_mgr_tick(void);
@@ -300,6 +301,10 @@ void microkernel_service_poll(void) {
     // to serial. Same lock-taking context as the ticks above (see
     // console_service.h for why it cannot run from the timer IRQ).
     console_service_tick();
+    // POSIX-Environments E6: the same context drains each tenant POSIX
+    // environment's own console into its per-environment buffer (never to
+    // serial), so the HTTP attach surface has something to read.
+    env_console_tick();
     // (E) Fire any scheduled agent runs
     agent_scheduler_tick();
 }

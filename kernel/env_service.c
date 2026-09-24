@@ -2,6 +2,7 @@
  * (POSIX-Environments E4). See env_service.h. */
 
 #include "env_service.h"
+#include "env_console.h"
 #include "env_proto.h"
 #include "cap.h"
 #include "kernel_io.h"
@@ -112,8 +113,26 @@ int env_service_create(uint32_t partition, uint32_t index,
                        uint16_t* out_status, uint32_t* out_env_id) {
     uint8_t body[ENV_CREATE_BODY_SIZE];
     env_create_body_encode(body, partition, index);
-    return env_service_rpc(ENV_CREATE, body, (uint32_t)sizeof(body),
-                           out_status, out_env_id, 0);
+    int rc = env_service_rpc(ENV_CREATE, body, (uint32_t)sizeof(body),
+                             out_status, out_env_id, 0);
+    /* POSIX-Environments E6: the environment's POSIX sidecar — and so its
+     * console, registered by cap.c from the sidecar's own name — was created
+     * INSIDE the round trip above, and the id that names it in the control
+     * plane only arrives with this reply. Completing the mapping here is what
+     * lets attach address a console by (partition, env_id), the same pair
+     * create and destroy speak, instead of exposing the internal index. A
+     * refusal to bind is not fatal to the create: the environment exists, and
+     * env_service.h's contract is about the create, not the console. */
+    if (rc == 0 && out_status && *out_status == ENV_OK &&
+        out_env_id && *out_env_id) {
+        if (!env_console_bind_env(partition, index, *out_env_id)) {
+            kernel_serial_printf(
+                "[ENV] environment id %u (partition %u, index %u) has no "
+                "console to bind — attach will answer no such environment\n",
+                (unsigned)*out_env_id, (unsigned)partition, (unsigned)index);
+        }
+    }
+    return rc;
 }
 
 int env_service_destroy(uint32_t env_id, uint32_t partition,

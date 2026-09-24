@@ -15,7 +15,11 @@
 //!    runner (`applets::init`, which executes `/etc/init.rc`, one forked
 //!    child per command) — as task 0's program, and opens `/dev/console` on
 //!    its stdio (fds 0,1,2 — the design's `stdio: [console, console,
-//!    console]`). Init's fork children inherit that stdio.
+//!    console]`). Init's fork children inherit that stdio. When the BIB said
+//!    this sidecar's console is an ENVIRONMENT console (v3's identity words
+//!    plus the `ENV_CONSOLE` flag), it then announces its own index and pid
+//!    on that console — E6's in-band identity, and the first bytes of the
+//!    environment's own stream.
 //! 5. if the manifest declared a network channel, stores the channel handle
 //!    for socket I/O (the net client is created lazily on first use).
 //!
@@ -63,7 +67,22 @@ pub struct BootCaps {
     /// for socket I/O.  CHAN_W (send) and CHAN_R (recv) endpoints.
     pub net_chan_w: Option<u32>,
     pub net_chan_r: Option<u32>,
+    /// POSIX-Environments E6: this sidecar's OWN identity `(index, pid)` — the
+    /// pair to announce on its own console — or `None` when there is none to
+    /// announce: a pre-v3 BIB, the host constructor below, or a sidecar whose
+    /// console is not an environment console (only a console the attach surface
+    /// serves has an identity to state; see bootinfo's `ENV_CONSOLE` flag).
+    /// `boot()` announces it on that console before init runs: an environment's
+    /// attached stream must carry the environment's own account of which
+    /// environment it is, because nothing else in the stream can — the cap
+    /// table names capabilities ("console", "budget"), never the sidecar.
+    pub identity: Option<(u32, u32)>,
 }
+
+/// The marker the identity announcement starts with. One constant, so the
+/// sidecar that writes it and the E6 attach guard that asserts it
+/// (tests/env_console_attach_check.sh, which greps this literal) cannot drift.
+pub const IDENTITY_MARKER: &str = "[env-id]";
 
 impl BootCaps {
     /// Resolve the caps from a parsed Boot Info Block, by name and type.
@@ -85,7 +104,16 @@ impl BootCaps {
             ramdisk_chan_r: ramdisk_r.map(|r| r.slot),
             net_chan_w: net_w.map(|n| n.slot),
             net_chan_r: net_r.map(|n| n.slot),
+            identity: bib.identity(),
         })
+    }
+
+    /// Give the sidecar an identity the way a BIB that carries
+    /// `BOOT_INFO_FLAG_ENV_CONSOLE` does, for a caller (host test) that stands
+    /// the sidecar up without one. `boot()` announces it.
+    pub fn with_identity(mut self, index: u32, pid: u32) -> BootCaps {
+        self.identity = Some((index, pid));
+        self
     }
 
     /// Host/test constructor (the sim's client table has no budget cap and
@@ -109,6 +137,10 @@ impl BootCaps {
             ramdisk_chan_r,
             net_chan_w,
             net_chan_r,
+            // The sim's client table is built by hand, not from a BIB, so the
+            // sidecar boots with no identity and stays quiet — which is also
+            // what keeps every pre-E6 host test's console output unchanged.
+            identity: None,
         }
     }
 }
@@ -203,6 +235,25 @@ pub fn boot<K: Kernel, A: BufferAlloc>(
         proc.vfs
             .open(0, "/dev/console", O_RDWR, 0)
             .map_err(BootErr::Console)?;
+    }
+
+    // 4.5 The environment's own account of itself — E6's in-band identity.
+    //
+    // Written to the in-memory console (never to the kernel log: a diagnostic
+    // is not the same claim) BEFORE the scheduler runs, so it is the first
+    // thing init's stdio produces and an attach that has read any of this
+    // environment's output has read this line. It is the one assertion an
+    // environment can make that its console cannot be lied about — the kernel
+    // writes this environment's bytes into this environment's console, and a
+    // reader who is told a different index is looking at the wrong console.
+    // Only an environment console has an identity to state: `caps.identity` is
+    // `None` for a sidecar whose console is the kernel transcript (`aerosls.init.0`,
+    // `drv.ramdisk.0`, and the system POSIX sidecar `aerosls.posix.0`). "Index 0"
+    // is a real environment, so a non-announcing sidecar must be silent rather
+    // than indistinguishable from environment 0.
+    if let Some((index, pid)) = caps.identity {
+        let line = alloc::format!("{} index={} pid={}\n", IDENTITY_MARKER, index, pid);
+        console.write(line.as_bytes()).map_err(BootErr::Console)?;
     }
 
     // 5. Network client (optional): connect and handshake with the

@@ -51,6 +51,7 @@
 #include "frame_pool.h"
 #include "process.h"
 #include "env_service.h"
+#include "env_console.h"
 #include "../arch/x86/user_paging.h"
 #include <stddef.h>
 
@@ -3839,6 +3840,7 @@ int cap_create_sidecar_in(uint32_t parent_pid,
      * kernel-owned service (e.g. the console): the kernel context (pid 0)
      * is the peer and holds that end of the channel. An unresolvable peer
      * leaves the cap unwired — non-fatal, the sidecar boots without it. */
+    int env_console_wired = 0;   /* E6: set when env_console took this console */
     for (uint8_t ci = 0; ci < m.n_caps; ci++) {
         struct SidecarCap* sc = &m.caps[ci];
         if (sc->kind != SIDECAR_TAG_CAP_CHAN) continue;
@@ -3862,6 +3864,28 @@ int cap_create_sidecar_in(uint32_t parent_pid,
                  * console_service leaves init's ENV replies for it (not serial). */
                 if (sidecar_prefix(sc->peer_name, "kernel.env.control")) {
                     env_service_register(k_rd, k_wr);
+                }
+                /* POSIX-Environments E6: this is a tenant POSIX environment's
+                 * console, not the shared kernel one. Register the kernel ends
+                 * against the environment (its partition + the index in its own
+                 * name) so env_console owns it: its output is buffered for that
+                 * environment and never printed here, and console_service skips
+                 * the slot. Unlike kernel.debug.console this is NOT a lossy
+                 * path to the kernel's serial transcript — see env_console.h. */
+                if (sidecar_prefix(sc->peer_name, "kernel.env.console")) {
+                    if (!env_console_register(k_rd, k_wr, pd->partition_id,
+                                              pd->pid, pd->name)) {
+                        kernel_serial_printf(
+                            "[SIDECAR] PID %u '%s': env console peer '%s' "
+                            "left unwired (bad name or registry full)\n",
+                            pd->pid, pd->name, sc->peer_name);
+                    } else {
+                        /* E6: environment console. The BIB below carries
+                         * SIDECAR_BIB_FLAG_ENV_CONSOLE for it, which is what
+                         * makes the sidecar announce its identity (boot.rs) —
+                         * a console the attach surface serves, and only that. */
+                        env_console_wired = 1;
+                    }
                 }
             }
         } else {
@@ -4059,7 +4083,8 @@ int cap_create_sidecar_in(uint32_t parent_pid,
     uint32_t bib_off = 0;
 
     /* Header: magic(8) + version(2) + cap_count(2) + budget(8) +
-     * stack_top(8) + total_len(4) + flags(4) + reserved(4) = 40 bytes (v2). */
+     * stack_top(8) + total_len(4) + flags(4) + own_pid(4) + own_index(4) +
+     * reserved(4) = 48 bytes (v3). */
     for (int i = 0; i < 8; i++) bib_buf[bib_off + i] = SIDECAR_BIB_MAGIC[i];
     bib_off += 8;
     *(uint16_t*)(bib_buf + bib_off) = SIDECAR_BIB_VERSION;  bib_off += 2;
@@ -4072,9 +4097,26 @@ int cap_create_sidecar_in(uint32_t parent_pid,
     /* E1 (BIB v2): the boot-context flags. UNIFIED is the mode bit init reads
      * to stay off the hardware — the kernel owns the NICs and the console in
      * that boot, so the sidecar world must not try to drive either. */
-    *(uint32_t*)(bib_buf + bib_off) = bib_flags;
+    *(uint32_t*)(bib_buf + bib_off) = bib_flags |
+        (env_console_wired ? SIDECAR_BIB_FLAG_ENV_CONSOLE : 0u);
     bib_off += 4;
-    *(uint32_t*)(bib_buf + bib_off) = 0;  bib_off += 4;  /* reserved */
+    /* E6 (BIB v3): the sidecar's OWN identity — its pid and, when its NAME is
+     * an environment's name, the index the console registry will file it
+     * under. Both are already in scope here (`pd->pid` is what
+     * env_console_register was handed a few hundred lines above, and the index
+     * is env_console_name_index(m.name) — the same parse that call makes), so
+     * this is where the kernel can say them once, to the only party that
+     * cannot look them up: the sidecar itself. boot.rs announces them on the
+     * environment's own console; see cap.h's identity note for why the attach
+     * surface needs an in-band self-report at all. `reserved` stays 0 and
+     * keeps the cap table 8-byte aligned (48-byte header). */
+    {
+        uint32_t own_index = 0;
+        if (m.name_len > 0) env_console_name_index(m.name, &own_index);
+        *(uint32_t*)(bib_buf + bib_off) = pd->pid;    bib_off += 4;
+        *(uint32_t*)(bib_buf + bib_off) = own_index;  bib_off += 4;
+        *(uint32_t*)(bib_buf + bib_off) = 0;          bib_off += 4;
+    }
 
     /* Cap 0: messenger CHAN_R (the child's read end of the messenger).
      * Entry layout: name_len u16, name, slot u16, ty u8, rights u8,
