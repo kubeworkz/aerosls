@@ -836,15 +836,17 @@ void cap_unlock(struct CapSpinlock* l);
  *                              can wire CAP_CHAN channels to it)
  *
  * BootInfoBlock wire format (filled by the kernel, read by sidecar _start):
- *   Header (40 bytes, v2):
+ *   Header (48 bytes, v3):
  *     magic[8]="AERSLSB1", version u16=SIDECAR_BIB_VERSION, cap_count u16,
  *     budget_bytes u64, stack_top u64, total_len u32,
- *     flags u32 (SIDECAR_BIB_FLAG_*), reserved u32
+ *     flags u32 (SIDECAR_BIB_FLAG_*), own_pid u32, own_index u32, reserved u32
  *   Cap entries (each): name_len u16, name[], slot u16, ty u8,
  *                       rights u8, base u64, len u64
- *   v2 (POSIX-Environments E1) added flags + reserved; v1 had neither, so the
- *   header was 32 bytes. Both sides ship in the same image (cap.c writes,
- *   user/proto/src/bootinfo.rs parses), so no v1 BIB is ever parsed by v2.
+ *   v2 (POSIX-Environments E1) added flags + reserved (header 32 → 40 bytes);
+ *   v3 (POSIX-Environments E6) made the reserved word the sidecar's own pid
+ *   and added its own environment index (header 40 → 48 bytes, caps still
+ *   8-byte aligned). Both sides ship in the same image (cap.c writes,
+ *   user/proto/src/bootinfo.rs parses), so no v1/v2 BIB is ever parsed by v3.
  */
 #define SYS_SLS_CREATE_SIDECAR 310
 
@@ -959,7 +961,7 @@ struct SidecarManifest {
  * Read by sidecar _start (user/proto/src/bootinfo.rs defines the
  * Rust parser for this exact wire format). */
 #define SIDECAR_BIB_MAGIC     "AERSLSB1"
-#define SIDECAR_BIB_VERSION   2   /* POSIX-Environments E1 added flags */
+#define SIDECAR_BIB_VERSION   3   /* E1 added flags; E6 added the identity */
 #define SIDECAR_BIB_CAPS_MAX  16
 
 /* E1: the boot context a sidecar cannot otherwise observe. Today one bit:
@@ -970,6 +972,31 @@ struct SidecarManifest {
  * to behave differently when it is not the boot. */
 #define SIDECAR_BIB_FLAG_UNIFIED 0x1u
 
+/* E6: this sidecar's console IS an environment console — cap_create_sidecar()
+ * registered it with env_console (the manifest's console peer was
+ * "kernel.env.console" and its name parsed as an environment's). It is the
+ * PRECONDITION of the identity words below: a sidecar whose console is the
+ * kernel transcript (`aerosls.init.0`, `drv.ramdisk.0`, …) has no attach
+ * surface to be identified on, so although its index and pid are filled in
+ * anyway, it does not announce anything (boot.rs) — an announcement is a claim
+ * about a console somebody can attach to, and "index 0" is a real environment
+ * (`aerosls.posix.0`), so silence has to be distinguishable from environment 0
+ * rather than folded into it. */
+#define SIDECAR_BIB_FLAG_ENV_CONSOLE 0x2u
+
+/* E6: the sidecar's OWN identity, the third thing a sidecar cannot otherwise
+ * observe. Until now a sidecar could not learn what the kernel called it: the
+ * BIB carried cap NAMES ("console", "budget") but never the manifest's NAME
+ * record, so `aerosls.posix.2` was a name only the kernel knew. That is what
+ * E6's attach surface needs to close its last gap — with the two consoles'
+ * addressing crossed consistently, every interaction through an address still
+ * looks self-consistent, and only a fact the ENVIRONMENT ITSELF emits on its
+ * own wire can expose the swap. So the kernel writes what it already has in
+ * scope at BIB time (`pd->pid` and the index env_console_name_index() parses
+ * out of `m.name`, the same parse the console registry uses) and the sidecar
+ * announces it (user/sidecar/src/boot.rs). `own_pid` 0 means "no identity":
+ * only a pid-less BIB has none, and v3 always fills it. */
+
 struct SidecarBib {
     uint8_t  magic[8];
     uint16_t version;
@@ -978,7 +1005,9 @@ struct SidecarBib {
     uint64_t stack_top;
     uint32_t total_len;
     uint32_t flags;             /* SIDECAR_BIB_FLAG_* (v2) */
-    uint32_t reserved;          /* = 0; keeps an 8-byte-aligned cap table (v2) */
+    uint32_t own_pid;           /* this sidecar's pid (v3; was `reserved`) */
+    uint32_t own_index;         /* its environment index, 0 if not an env (v3) */
+    uint32_t reserved;          /* = 0; keeps an 8-byte-aligned cap table (v3) */
 } __attribute__((packed));
 
 struct SidecarBibCap {

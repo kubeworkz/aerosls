@@ -200,7 +200,7 @@ marker "init was released by the sidecar creator (PROC_HELD -> PROC_SUSPENDED)" 
 # written whole. init's HAVING READ the flag stays asserted, from the other
 # side: Phase 3 requires the POSIX sidecar and the network/e1000 drivers to be
 # UNSPAWNED, which is exactly what reading UNIFIED makes init do.
-marker "the kernel stamped the BIB's UNIFIED flag into every sidecar's boot info block" "[E1] BIB v2 flags=0x1 (UNIFIED)"
+marker "the kernel stamped the BIB's UNIFIED flag into every sidecar's boot info block" "[E1] BIB v3 flags=0x1 (UNIFIED)"
 marker "the kernel owns the console in this boot (input forwarding off)" "[CONSOLE] sidecar input forwarding disabled"
 
 # ── Phase 3: device ownership — the hardware half stays unspawned ───────────

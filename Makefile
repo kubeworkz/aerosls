@@ -162,6 +162,7 @@ X86_C_SRC   = kernel/kernel.c arch/x86/idt.c arch/x86/gdt.c arch/x86/vga.c kerne
               kernel/boot_params.c kernel/node_reset.c \
               kernel/console.c kernel/console_service.c \
               kernel/env_service.c \
+              kernel/env_console.c \
               kernel/boot_image.c \
               kernel/loader.c \
               kernel/simi_x86.c \

@@ -50,6 +50,7 @@
 #include "../kernel/frame_pool.h" // Gap Remediation Phase F -- GET /api/partition/quotas, POST /api/partition/quota
 #include "../kernel/storage_quota.h" // Storage Isolation Roadmap Phase 1 -- GET /api/partition/storagequotas, POST /api/partition/storagequota
 #include "../kernel/env_service.h"  // POSIX-Environments E4 -- POST /api/partition/{id}/env
+#include "../kernel/env_console.h"  // POSIX-Environments E6 -- attach to an environment's console
 #include "../kernel/env_proto.h"    // POSIX-Environments E4 -- ENV_* status codes
 #include "../drivers/nvme_admin.h" // Navigator-Parity Gap Roadmap Phase 2 -- nvme_get_capacity_bytes()
 #include "../kernel/security_audit.h" // Navigator-Parity Gap Roadmap Phase 3 -- GET /api/security/audit
@@ -3115,6 +3116,114 @@ static int api_partition_env_destroy_post(const char* body, char* buf, int max,
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
 
+// ─── GET /api/partition/{id}/env — POSIX-Environments E6 ─────────────────────
+// List the environments with a LIVE console in partition {id}. This is the
+// kernel's own view — the consoles it brokered (kernel/env_console.c) — so it
+// needs no round trip to init and cannot disagree with what attach will find:
+// listing from the manager's table and attaching to the kernel registry would
+// be two sources of truth for one question. Read-only, like GET
+// /api/partitions: no extra role gate.
+//
+// `env_id` is the manager's id (the same one create and destroy speak) and is 0
+// for a console no manager bound — an E3 boot spawn, which is therefore listed
+// but not addressable by id. `index` is the environment's identity within its
+// partition, which is what its sidecar names carry.
+static int api_partition_env_list_get(char* buf, int max, uint32_t partition) {
+    JSONBuf j = { buf, 0, max };
+    jb_obj_open(&j, 0);
+    jb_str(&j, "ok", "true"); jb_putc(&j, ',');
+    jb_uint(&j, "partition", partition); jb_putc(&j, ',');
+    jb_arr_open(&j, "envs");
+    uint32_t total = env_console_count();
+    uint32_t shown = 0;
+    for (uint32_t i = 0; i < total; i++) {
+        uint32_t p = 0, id = 0, idx = 0, pid = 0;
+        if (!env_console_entry(i, &p, &id, &idx, &pid)) continue;
+        if (p != partition) continue;
+        if (shown) jb_putc(&j, ',');
+        jb_obj_open(&j, 0);
+        jb_uint(&j, "env_id", id); jb_putc(&j, ',');
+        jb_uint(&j, "index", idx); jb_putc(&j, ',');
+        jb_uint(&j, "posix_pid", pid); jb_putc(&j, ',');
+        jb_uint(&j, "dropped", env_console_dropped(partition, id));
+        jb_obj_close(&j);
+        shown++;
+    }
+    jb_arr_close(&j);
+    jb_putc(&j, ',');
+    jb_uint(&j, "live", shown);
+    jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
+}
+
+// ─── GET .../env/{env_id}/console — attach (read half) ───────────────────────
+// Drain what the environment has written since the last drain and return it.
+// Attach is a poll, not a stream: the kernel has no per-connection push, and
+// the roadmap's own constraint (AeroSLS-Web-Terminal-Plan-v0.1.md) is that a
+// line-based request/response console is what the kernel can actually serve.
+// Read-only.
+static int api_partition_env_console_get(char* buf, int max, uint32_t partition,
+                                         uint32_t env_id) {
+    JSONBuf j = { buf, 0, max };
+    static char out[ENV_CONSOLE_BUF + 1];
+    uint32_t n = 0;
+    int r = env_console_read(partition, env_id, (uint8_t*)out, ENV_CONSOLE_BUF, &n);
+    jb_obj_open(&j, 0);
+    if (!r) {
+        jb_str(&j, "ok", "false"); jb_putc(&j, ',');
+        jb_str(&j, "error", "no such environment console in this partition");
+    } else {
+        out[n] = '\0';
+        jb_str(&j, "ok", "true"); jb_putc(&j, ',');
+        jb_uint(&j, "env_id", env_id); jb_putc(&j, ',');
+        jb_str_multiline(&j, "output", out); jb_putc(&j, ',');
+        /* `dropped` separates "the environment is quiet" from "the environment
+         * outran the kernel's 4 KiB console buffer". */
+        jb_uint(&j, "dropped", env_console_dropped(partition, env_id));
+    }
+    jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
+}
+
+// ─── POST .../env/{env_id}/console — attach (write half) ─────────────────────
+// Body: {"input": "..."}. The line is delivered to THIS environment's console
+// and no other. Same DB_ADMIN+ gate as create/destroy: typing into a tenant is
+// the same class of action as placing one, and the roadmap rules out any
+// authentication beyond this existing token/role model.
+static int api_partition_env_console_post(const char* body, char* buf, int max,
+                                          SLSRole req_role, uint32_t partition,
+                                          uint32_t env_id) {
+    JSONBuf j = { buf, 0, max };
+    if (req_role > ROLE_DB_ADMIN) {
+        jb_obj_open(&j, 0); jb_str(&j, "ok", "false"); jb_putc(&j, ',');
+        jb_str(&j, "error", "requires DB_ADMIN or higher");
+        jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
+    }
+    if (!body) {
+        jb_obj_open(&j, 0); jb_str(&j, "ok", "false"); jb_putc(&j, ',');
+        jb_str(&j, "error", "missing body");
+        jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
+    }
+    char input[512];
+    input[0] = '\0';
+    json_str(body, "input", input, (int)sizeof(input));
+
+    int queued = env_console_write(partition, env_id,
+                                   (const uint8_t*)input,
+                                   (uint32_t)strlen(input));
+    jb_obj_open(&j, 0);
+    if (queued < 0) {
+        jb_str(&j, "ok", "false"); jb_putc(&j, ',');
+        jb_str(&j, "error", "no such environment console in this partition");
+    } else {
+        jb_str(&j, "ok", "true"); jb_putc(&j, ',');
+        jb_uint(&j, "env_id", env_id); jb_putc(&j, ',');
+        /* 0 means the environment has not drained the previous line — the
+         * write was refused rather than queued, so the payload pool cannot be
+         * exhausted by an environment that never reads its console. */
+        jb_uint(&j, "queued", (uint64_t)queued);
+    }
+    jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
+}
+
 // ─── POST /api/partition/assign — Gap Remediation Phase F ─────────────────────
 // Body: {"uid": N, "partition_id": N}.
 static int api_partition_assign_post(const char* body, char* buf, int max) {
@@ -5549,6 +5658,29 @@ static void http_route(int conn, char* req) {
             blen = api_partition_quotas_list(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
+        // ── POSIX-Environments E6: GET /api/partition/{id}/env (list) and
+        // GET /api/partition/{id}/env/{env_id}/console (attach, read half).
+        // The {id} is parsed as digits only, so the exact routes above and
+        // below are never hijacked (they parse as zero digits and fall
+        // through) — the same discipline the POST env block uses.
+        if (!strncmp(path, "/api/partition/", 15)) {
+            const char* rest = path + 15;
+            uint32_t pid = 0; const char* p = rest;
+            while (*p >= '0' && *p <= '9') { pid = pid * 10u + (uint32_t)(*p - '0'); p++; }
+            if (p != rest && !strcmp(p, "/env")) {
+                blen = api_partition_env_list_get(resp_body, (int)sizeof(resp_body), pid);
+                http_respond(conn, 200, "application/json", resp_body, blen); return;
+            }
+            if (p != rest && !strncmp(p, "/env/", 5)) {
+                const char* q = p + 5; uint32_t eid = 0;
+                while (*q >= '0' && *q <= '9') { eid = eid * 10u + (uint32_t)(*q - '0'); q++; }
+                if (q != p + 5 && !strcmp(q, "/console")) {
+                    blen = api_partition_env_console_get(resp_body, (int)sizeof(resp_body),
+                                                         pid, eid);
+                    http_respond(conn, 200, "application/json", resp_body, blen); return;
+                }
+            }
+        }
         // ── Multitenant Isolation Gap Analysis §5 item 8: GET /api/partition/cpuweights ──
         if (!strcmp(path, "/api/partition/cpuweights")) {
             blen = api_partition_cpuweights_list(resp_body, (int)sizeof(resp_body));
@@ -6311,6 +6443,18 @@ static void http_route(int conn, char* req) {
                 blen = api_partition_env_destroy_post(body_ptr, resp_body,
                             (int)sizeof(resp_body), req_role, pid);
                 http_respond(conn, 200, "application/json", resp_body, blen); return;
+            }
+            // POSIX-Environments E6: POST /api/partition/{id}/env/{env_id}/console
+            // — attach, write half. Checked AFTER /env/destroy, whose path also
+            // begins "/env/" but carries no digits.
+            if (p != rest && !strncmp(p, "/env/", 5)) {
+                const char* q = p + 5; uint32_t eid = 0;
+                while (*q >= '0' && *q <= '9') { eid = eid * 10u + (uint32_t)(*q - '0'); q++; }
+                if (q != p + 5 && !strcmp(q, "/console")) {
+                    blen = api_partition_env_console_post(body_ptr, resp_body,
+                                (int)sizeof(resp_body), req_role, pid, eid);
+                    http_respond(conn, 200, "application/json", resp_body, blen); return;
+                }
             }
         }
         if (!strcmp(path, "/api/partition/assign")) {

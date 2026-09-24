@@ -212,11 +212,18 @@ pub fn build_posix_manifest_tenant(
             rights: 0x3, // R | W
             kind: CapKind::Mem { base: heap_base, size: heap_size },
         }),
+        // POSIX-Environments E6: a tenant's console is its OWN kernel-brokered
+        // channel pair, not the shared kernel console. The kernel mints the far
+        // end into pid 0 and keys it to this environment by the instance name's
+        // index (kernel/env_console.c), so this environment's output is buffered
+        // for its own attach and can never be read by — or read — another's.
+        // The system profile above keeps `kernel.debug.console`: it IS the
+        // kernel transcript.
         Some(ManifestCap {
             name: "console",
             rights: 0x7, // R | W | send
             kind: CapKind::Chan {
-                peer: Some("kernel.debug.console"),
+                peer: Some("kernel.env.console"),
                 flags: 0,
             },
         }),
