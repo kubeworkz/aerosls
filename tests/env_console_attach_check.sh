@@ -181,8 +181,12 @@
 # inputs that do NOT have the E6 property (the kernel-only boot, which has no
 # environment manager at all; E6_TOOTH=cross-wire, which delivers every command
 # to the other environment's console; E6_TOOTH=no-input, which withholds the
-# commands so both streams stay empty; and E6_TOOTH=skip-pause, which leaves the
-# neighbour partition live so the paused-peer clauses of phase 6b have to fail)
+# commands so both streams stay empty; E6_TOOTH=skip-pause, which leaves the
+# neighbour partition live so the paused-peer clauses of phase 6b have to fail;
+# E6_TOOTH=late-identity, which holds environment 2's boot identity out of the
+# read for a few polls so clause 3b has to wait for a LATE line rather than a
+# missing one; and E6_TOOTH=late-identity-gone, which withholds it for good so
+# the same clause has to fail, bounded)
 # and requires this guard to go red on each, then requires it to pass on the real
 # input. The no-input arm is not decoration: "no stream carries foreign output"
 # is trivially true of two empty streams, and a guard that only checked that
@@ -211,6 +215,16 @@
 #                                    phase 6b: the neighbour keeps draining, so
 #                                    the clauses that need a frozen peer MUST
 #                                    fail (and only those).
+#                       late-identity — hold environment 2's own boot
+#                                    announcement out of the read for
+#                                    E6_LATE_POLLS polls (default 3) and then
+#                                    release it: a line that is LATE, not lost,
+#                                    which clause 3b must still see (its wait
+#                                    is for both streams, not for either).
+#                       late-identity-gone — withhold that line for good:
+#                                    clause 3b MUST fail, and after its bounded
+#                                    wait rather than on the first read.
+#   E6_LATE_POLLS     polls E6_TOOTH=late-identity holds the line out (default 3)
 #
 # Exit: 0 if every assertion held, 1 if one failed (or QEMU died first),
 # 2 on a missing prerequisite.
@@ -616,28 +630,61 @@ send_addr() {   # send_addr <1|2> — the env_id a command for that environment 
 # announcement with it. That asymmetry is the whole point: the claim travels
 # by one path and is read by the other.
 #
-# Bounded: the announcement is written when the sidecar boots, which is around
-# the same time as the manager's reply that binds the env_id, so a stream that
-# is empty here is early rather than broken.
+# Bounded, and bounded on the RIGHT event: each sidecar boots on its own, so
+# environment 2's line routinely lands after environment 1's, and waiting for
+# "either stream announced" while asserting "both did" is a race — on
+# 2026-09-25 kernel-guards lost it (env 1 announced, the loop broke, env 2's
+# assertion read a stream that was still empty and went red). The wait is for
+# BOTH streams to carry an announcement. The swap control still satisfies it
+# immediately: when the consoles are crossed, both lines ARE present, just in
+# the wrong streams, so the loop stops and the assertions below decide whose
+# they are. E6_TOOTH=late-identity exercises the same shape deterministically,
+# by holding environment 2's line out of the read for a few polls.
 own1="[env-id] index=$i1 pid=$p1"
 own2="[env-id] index=$i2 pid=$p2"
+announce_line() {   # announce_line <stream> — its '[env-id]' line, or 'nothing'
+    local l
+    l="$(printf '%s' "$1" | tr -d '\r' | grep -o '\[env-id\][^$]*' | head -1)"
+    if [ -n "$l" ]; then printf '%s' "$l"; else printf 'nothing'; fi
+}
+LATE_HOLD=0
+case "$TOOTH" in
+    late-identity)      LATE_HOLD="${E6_LATE_POLLS:-3}"
+                        echo "note: E6_TOOTH=late-identity — holding environment 2's announcement out of the read for $LATE_HOLD poll(s); the wait must absorb a late line rather than assert on the first one" ;;
+    late-identity-gone) LATE_HOLD=999999
+                        echo "note: E6_TOOTH=late-identity-gone — environment 2's announcement is withheld for good; clause 3b MUST fail, after its bounded wait" ;;
+esac
+HELD2=""
 announced=0
 for i in $(seq 1 $((ATTACH_WAIT_S * 2))); do
     drain_both
-    case "$S1$S2" in *"[env-id]"*) announced=1; break ;; esac
+    if [ "$LATE_HOLD" -gt 0 ]; then
+        if [ "$i" -le "$LATE_HOLD" ]; then
+            held="$(announce_line "$S2")"
+            if [ "$held" != "nothing" ]; then
+                HELD2="$held"
+                S2="${S2//"$held"/}"  # quoted: the line is literal, not a pattern
+            fi
+        elif [ -n "$HELD2" ]; then
+            S2="$S2$HELD2"             # …and now it has arrived, which is the point
+            HELD2=""
+        fi
+    fi
+    case "$S1" in *"[env-id]"*) case "$S2" in *"[env-id]"*) announced=1 ;; esac ;; esac
+    if [ "$announced" = 1 ]; then break; fi
     sleep 0.5
 done
 if [ "$announced" -ne 1 ]; then
-    echo "FAILED: neither console ever announced its identity ('[env-id]' absent from both streams after ${ATTACH_WAIT_S}s) — the environment's own account of itself is not reaching its console" >&2
+    echo "FAILED: the consoles never both announced an identity (after ${ATTACH_WAIT_S}s: environment 1's stream carried $(announce_line "$S1"), environment 2's carried $(announce_line "$S2")) — the environment's own account of itself is not reaching its console" >&2
     fail=1
 else
     case "$S1" in
         *"$own1"*) echo "ok:   identity: environment 1's stream announces its own index and pid ('$own1')" ;;
-        *) echo "FAILED: identity: environment 1's console does not carry its own announcement (expected '$own1'; the '[env-id]' line it did carry: $(printf '%s' "$S1" | tr -d '\r' | grep -o '\[env-id\][^$]*' | head -1)) — the stream an operator reads at environment 1's address belongs to another environment" >&2; fail=1 ;;
+        *) echo "FAILED: identity: environment 1's console does not carry its own announcement (expected '$own1'; the '[env-id]' line it did carry: $(announce_line "$S1")) — the stream an operator reads at environment 1's address belongs to another environment" >&2; fail=1 ;;
     esac
     case "$S2" in
         *"$own2"*) echo "ok:   identity: environment 2's stream announces its own index and pid ('$own2')" ;;
-        *) echo "FAILED: identity: environment 2's console does not carry its own announcement (expected '$own2'; the '[env-id]' line it did carry: $(printf '%s' "$S2" | tr -d '\r' | grep -o '\[env-id\][^$]*' | head -1))" >&2; fail=1 ;;
+        *) echo "FAILED: identity: environment 2's console does not carry its own announcement (expected '$own2'; the '[env-id]' line it did carry: $(announce_line "$S2"))" >&2; fail=1 ;;
     esac
     case "$S1" in
         *"[env-id] index=$i2 pid=$p2"*) echo "FAILED: identity: environment 1's console carries environment 2's announcement ('$own2') — the two consoles are swapped" >&2; fail=1 ;;

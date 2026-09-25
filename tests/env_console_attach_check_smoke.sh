@@ -22,9 +22,12 @@
 # kernel-guards pass); the kernel-level mutants that DO is why the source
 # controls below are a record rather than an arm.
 #
-# Six arms, five of them teeth, listed in the order the code below runs them
+# Eight arms, seven of them teeth, listed in the order the code below runs them
 # (the prerequisite arm first, so a source-only runner is told what is missing
-# before anything is booted):
+# before anything is booted). Six of the seven teeth require the guard to go RED
+# on an input that lacks the property; the seventh (arm 6) is a TIMING tooth and
+# requires the guard to stay GREEN on an input that has the property but delivers
+# it late — see arm 6 for why a late line is a tooth and not a nicety.
 #
 #   1. PREREQUISITE CONTRACT — E6_ISO pointing at nothing must exit 2 and say
 #      why. run_checks.sh files a runtime guard's 2 as an owed skip, so a guard
@@ -62,7 +65,28 @@
 #      stay green, or the arm would be satisfied by the guard collapsing for some
 #      unrelated reason.
 #
-#   6. RESTORE — the guard unmodified on the unified boot must pass, so the
+#   6. TOOTH (late identity) — E6_TOOTH=late-identity runs the real boot and
+#      holds environment 2's own boot announcement out of the guard's read for
+#      E6_LATE_POLLS polls (default 3) before releasing it. The line is LATE, not
+#      missing, so the guard must still PASS — and it must pass for the right
+#      reason, because its wait is for BOTH streams to announce rather than for
+#      either one. Why this is a tooth at all: kernel-guards run 36161966465 went
+#      red on clause 3b with no mutant in the tree, and the failing line was
+#      "environment 2's console does not carry its own announcement ... the
+#      '[env-id]' line it did carry: " (empty) — the guard had broken its wait as
+#      soon as EITHER stream announced and then asserted BOTH against a stream it
+#      had not finished reading. An invisible-until-it-isn't race is not a tooth;
+#      this arm makes it deterministic by construction instead of by luck.
+#
+#   7. TOOTH (identity withheld) — E6_TOOTH=late-identity-gone withholds that
+#      line for good, so arm 6's wait has to be shown to be a wait and not an
+#      early exit. With E6_ATTACH_WAIT_S=6 the guard must go red on clause 3b's
+#      bounded-wait message — and on THAT message and not the per-stream one,
+#      which is what arm_lacks below checks — after taking its full window.
+#      Together, arms 6 and 7 pin the wait to the right event: a lost line fails,
+#      a late line does not.
+#
+#   8. RESTORE — the guard unmodified on the unified boot must pass, so the
 #      smoke also proves the guard is not simply failing everything (a tooth
 #      that fires on both inputs proves nothing about either).
 #
@@ -193,8 +217,13 @@
 #     and the shipped ISO rebuilt from it.
 #
 # Needs the built ISO + QEMU, so it degrades to the prerequisite-contract arm on
-# a source-only runner (and prints why); on a build host it runs all six arms,
+# a source-only runner (and prints why); on a build host it runs all eight arms,
 # via run_guard_smokes.sh and CI's kernel-guards job.
+#
+# (Arms 6 and 7 are a pair around one line's arrival: the late line must be
+# absorbed and the withheld line must not be, so the guard's wait is pinned to the
+# event it claims to wait for. Arm 6 is the only arm that expects the guard's own
+# verdict to be PASS on a tooth input — the smoke still fails if it goes red.)
 #
 # Exit: 0 when every tooth fired and the real input still passed, 1 otherwise,
 # 2 on a missing prerequisite.
@@ -265,7 +294,7 @@ run_arm abort "a missing ISO is refused (exit 2), never a quiet pass" \
 arm_says "missing" "it says which prerequisite it wanted, so run_checks files it as an owed skip and not as rot"
 
 if [ ! -f "$ISO" ] || ! command -v qemu-system-x86_64 >/dev/null 2>&1; then
-    echo "note: $ISO or qemu-system-x86_64 missing — the five booting arms cannot run here" >&2
+    echo "note: $ISO or qemu-system-x86_64 missing — the seven booting arms cannot run here" >&2
     [ "$fail" -eq 0 ] && echo "note: prerequisite contract only (this is a build host smoke)"
     exit "$fail"
 fi
@@ -301,7 +330,32 @@ arm_lacks "the two consoles are NOT isolated" "the same-partition isolation clau
 arm_lacks "FAILED: identity:" "clause 3b stayed green — the environments still announce themselves correctly"
 arm_lacks "never reported both environments' consoles" "the census stayed green — the tooth moved the pause clauses, not the boot"
 
-# ── Arm 6: RESTORE — the guard unmodified, at its own defaults ─────────────
+# ── Arm 6: TOOTH — a LATE identity line must still be absorbed ─────────────
+# The one tooth here that must be GREEN, and the only one whose input is a timing
+# rather than a wrongness: environment 2 announces, but not until the guard has
+# already read its stream a few times. A guard that broke its wait on the first
+# '[env-id]' seen anywhere would assert environment 2's line before it arrived
+# and go red here; the real guard waits for both streams and passes. This is the
+# shape run 36161966465's red had, minus the luck. No shortened attach window on
+# purpose: the boot is the real one, and only the arrival of one line is moved.
+run_arm pass "a LATE identity line is absorbed (the wait is for both streams, not either)" \
+    E6_ISO="$ISO" E6_TOOTH=late-identity
+arm_says "holding environment 2's announcement" "the guard says it is running the tooth, so this arm is not the pristine boot by accident"
+arm_says "PASS  E6 attach" "and it passed, having waited for the line rather than asserting before it arrived"
+
+# ── Arm 7: TOOTH — withhold it for good; the SAME clause must go red ───────
+# The complement of arm 6, and the reason arm 6 is evidence: a guard that had
+# quietly stopped checking the announcement would pass arm 6 for the wrong reason
+# and would have to pass this one too. The short window is deliberate — the red
+# has to come from the bounded wait, and the message has to name what each stream
+# carried (environment 2's: nothing), because that line is all an operator has.
+run_arm fail "withholding environment 2's identity for good turns clause 3b red, after its bounded wait" \
+    E6_ISO="$ISO" E6_TOOTH=late-identity-gone E6_ATTACH_WAIT_S=6
+arm_says "never both announced an identity" "the failure is the wait timing out, not an early exit"
+arm_says "environment 2's carried nothing" "and it says which stream was silent, so the red is diagnosable from the log alone"
+arm_lacks "does not carry its own announcement" "the per-stream clause never ran — the wait is what failed, so arm 6 and this arm are about the same event from both sides"
+
+# ── Arm 8: RESTORE — the guard unmodified, at its own defaults ─────────────
 run_arm pass "the guard unmodified passes on the unified boot (the teeth are not blanket failures)" \
     E6_ISO="$ISO"
 arm_says "PASS  E6 attach" "it passed on the property, not by skipping the phases"
