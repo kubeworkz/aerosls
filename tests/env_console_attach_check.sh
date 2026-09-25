@@ -249,7 +249,7 @@ CATPID=$!
 # Host port: the first free loopback one, never a fixed number (the deploy gate
 # runs sibling checks while live cluster nodes hold 3000+i; tests/free_port.sh
 # is the repo's shared allocator).
-PORT=$(bash tests/free_port.sh) || { echo "ABORT: no free port in 3001..3020" >&2; exit 2; }
+PORT=$(bash tests/free_port.sh) || { echo "ABORT: no free loopback port for the QEMU hostfwd (see tests/free_port.sh)" >&2; exit 2; }
 BASE="http://127.0.0.1:$PORT"
 W="$(mktemp -d)"
 qemu_err() { [ -s "$W/qemu.err" ] && sed 's/^/      qemu: /' "$W/qemu.err" >&2; }

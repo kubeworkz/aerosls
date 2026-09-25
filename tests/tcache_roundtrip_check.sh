@@ -340,10 +340,11 @@ done
     exit 2
 }
 
-# Port. The first free one in 3001..3020 (a live node on a deploy host, a
-# previous boot) — see tests/free_port.sh for why and how it probes.
+# Port. The first free one in the guard band (tests/free_port.sh: default
+# 32001-32020, deliberately outside the live REST band; a previous boot or a
+# wrong band override is refused there rather than collided with).
 if [ -z "$PORT" ]; then
-    PORT=$(bash tests/free_port.sh) || { echo "ABORT: no free port in 3001..3020" >&2; exit 2; }
+    PORT=$(bash tests/free_port.sh) || { echo "ABORT: no free loopback port for the QEMU hostfwd (see tests/free_port.sh)" >&2; exit 2; }
 fi
 
 W="$(mktemp -d)"

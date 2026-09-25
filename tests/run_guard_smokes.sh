@@ -4,7 +4,7 @@
 # ─── Why this exists ───────────────────────────────────────────────────────
 # tests/run_checks.sh runs every tests/*_check.sh guard; the guards' TEETH
 # are proven by the tests/*_smoke.sh scripts, which deliberately break a
-# guard's input and assert it fails. Fourteen smokes are source-only (they
+# guard's input and assert it fails. Thirty-two smokes are source-only (they
 # need only gcc/binutils/python3/openssl and the tree's sources) and run
 # anywhere -- CI runs them on every push via tests/run_source_smokes.sh.
 # Five (code_buffer_budget, kernel_image_end, no_hosted_link,
