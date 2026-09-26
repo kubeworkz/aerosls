@@ -62,6 +62,19 @@ Modes (written to <statedir>/mode by the smoke):
                   learn gate
     nockpt        followers learn but no checkpoint flows -> guard FAIL at
                   the checkpoint gate
+    learnlost1    the FIRST announce's packet is LOST on the wire for BOTH
+                  followers: they only ever see the row on the owner's next
+                  periodic re-announce pass (~10 s later), so the
+                  create-announce gate must wait out another period and
+                  pass. Its control is the SAME mode with the re-drive
+                  disabled, which must still FAIL the gate
+    ckptlost1     the same loss one stream over: both followers learn from
+                  the first announce, but the checkpoint frame carrying the
+                  row is lost for that pass and lands with the next one, so
+                  the checkpoint gate (a CKPT line AFTER the sync line) must
+                  wait out another period -> guard PASS (same control shape
+                  as learnlost1). Both drop to the "adopted" path after the
+                  pre-kill gates, so the whole failover chain still runs
     splitbrain    BOTH survivors become leader at once -> guard FAIL at the
                   split-brain check: the step-7 simultaneous-lead read when
                   one poll happens to catch both, and otherwise the
@@ -183,6 +196,10 @@ leader_id = int(open(os.path.join(state, "leader")).read().strip())
 created = os.path.join(state, "created.json")
 lease = os.path.join(state, "lease.json")
 migrate = os.path.join(state, "migrate.json")
+# The periodic re-announce's pass counter -- owned by the node that owns the
+# row, exactly like partition_reannounce_tick(). See its block below.
+reannounce = os.path.join(state, "reannounce")
+REANNOUNCE_PERIOD = 10.0   # models 1000 ticks ~= 10 s; see the block below
 # Test-only knob for the smoke's "leadergap" tooth: when <state>/health_gap
 # holds a number, the LEADER answers /api/health only after that many
 # seconds from the guard's create -- a bounded episode of unreachability,
@@ -244,6 +261,31 @@ def read_created():
         except ValueError:
             return None
     return None
+
+
+def read_epoch():
+    """The owner's re-announce pass counter (0 = no pass yet).
+
+    Retry-tolerant like read_created(): a torn or empty file means "not
+    yet", never an exception. A dead RX thread never logs its line, so a
+    reader that can raise is a verdict decided by timing (the CI false RED
+    of 2026-09-25 in the 2-node sibling, same rule).
+    """
+    if os.path.exists(reannounce):
+        try:
+            return int(open(reannounce).read().strip() or 0)
+        except ValueError:
+            return 0
+    return 0
+
+
+def next_reannounce():
+    """Block until one periodic pass AFTER the pass this node is reacting
+    to. max(..., 1): seeing the row before the owner has written pass 1 is
+    still the mutation announce, i.e. pass 1, not a pass of its own."""
+    at = max(read_epoch(), 1)
+    while read_epoch() <= at:
+        time.sleep(0.05)
 
 
 def read_lease():
@@ -311,12 +353,66 @@ def leader_alive():
         return False
 
 
+# ─── Periodic re-announce: the owner's pass counter ──────────────────────
+# Announce-on-change converges the nodes that were up for a change; a node
+# whose packet was LOST on the wire waits for the next mutation -- unless
+# the owner's periodic re-announce reaches it. partition_reannounce_tick()
+# (kernel/partition.c, called from the BSP sweep) re-broadcasts the rows a
+# node OWNS every 1000 ticks (~10 s at the nominal 100 Hz sweep), and every
+# node does it for its own rows. The fake models exactly that as a PASS
+# COUNTER written by the OWNER while it still holds the row: pass 1 is the
+# one-shot mutation announce, pass 2+ are the periodic ones. The followers'
+# lost-packet modes (learnlost1, ckptlost1) key off it, so "the first packet
+# was lost, the re-announce re-delivered it" is a real second event owned by
+# the SENDER -- not a receiver-side sleep, which would model the wrong node
+# and would keep delivering after the owner died.
+#
+# Why 10 s: that is the kernel's own period (PARTITION_REANNOUNCE_TICKS
+# 1000). The smoke's FAST guard windows are 6 s, so pass 2 lands in the
+# guard's SECOND window -- later than one window (the first genuinely times
+# out: that is the tooth) and comfortably inside two, with seconds of
+# margin at both edges so a loaded host cannot move it out. Do not shorten
+# it below one window: the lost-packet modes would stop modelling a loss at
+# all and their teeth would go vacuous (the smokes assert the guard printed
+# its re-drive precisely so that cannot pass unnoticed).
+if role == "leader":
+
+    def reannounce_thread():
+        epoch = 0
+        last = 0.0
+        while True:
+            row = read_created()
+            if not row or int(row.get("owner_node") or 0) != node_id:
+                epoch = 0   # nothing owned: the tick broadcasts nothing
+                time.sleep(0.05)
+                continue
+            now = time.monotonic()
+            if epoch == 0 or now - last >= REANNOUNCE_PERIOD:
+                epoch += 1
+                last = now
+                # Whole-write (tmp + os.replace), the same rule the lease row
+                # follows: a reader sees a pass NUMBER or the previous one,
+                # never a torn file.
+                tmp = "%s.tmp%d" % (reannounce, os.getpid())
+                with open(tmp, "w") as f:
+                    f.write(str(epoch))
+                os.replace(tmp, reannounce)
+            time.sleep(0.05)
+
+    threading.Thread(target=reannounce_thread, daemon=True).start()
+
+
 # ─── RX thread: learn the created row, log learn + checkpoint ─────────────
 # The guard creates the partition AFTER the fakes are up, so the learn
 # cannot be logged at process start: the follower's announce RX fires when
 # the row arrives on the wire (here: when created.json appears). nolearn
 # never learns (the guard's learn gate must bite); nockpt learns but never
-# logs the checkpoint RX (the checkpoint gate must bite).
+# logs the checkpoint RX (the checkpoint gate must bite). learnlost1 drops
+# the FIRST announce's packet for BOTH followers and learns on the owner's
+# next periodic re-announce -- the guard's second window, so its
+# announce gate must re-drive; ckptlost1 drops the checkpoint frame carrying
+# the row for that same pass, which lands with the next one, so its
+# checkpoint gate must re-drive too.
 learned = False
 
 
@@ -333,11 +429,31 @@ def rx_thread():
         row = read_created()
         if row is None:
             time.sleep(0.05)
+    if mode == "learnlost1":
+        # The first announce's packet never landed (a lost HOP, not a broken
+        # RX path): this node only ever sees what the owner's periodic
+        # re-announce carries. learned stays False until then, so the row is
+        # not served either -- the guard must spend another window, which is
+        # exactly what its re-drive is for. With a single bounded window the
+        # guard FAILed here with "nodes 2/3 never learned partition", a
+        # message that accuses partition_sync_upsert for a hop that had not
+        # landed.
+        next_reannounce()
     if row and mode != "nolearn":
         log(learn_line(row, leader_id))
         learned = True   # learned regardless of nockpt: the learn gate
                          # must pass, and the checkpoint gate is the log
                          # line below, which nockpt skips.
+        if mode == "ckptlost1":
+            # The checkpoint frame carrying the row was lost for the pass
+            # that delivered the announce; the next periodic broadcast
+            # carries it (the real leader's state tree goes out every 100
+            # ticks -- the fake collapses the two periods onto the one clock
+            # the guard's windows straddle, which can only make the guard's
+            # job harder, never easier). The guard's checkpoint gate wants a
+            # CKPT line AFTER the sync line, so it must wait out another
+            # period too.
+            next_reannounce()
         if mode != "nockpt":
             log("[DSPP-CKPT] RX: COMPLETE seq=1000 (448 bytes)")
 
@@ -520,7 +636,8 @@ def death_thread():
             # resurrect/migrate modes adopt exactly like "adopted" for
             # the death phase; the extra steps are the relaunch and the
             # step-11 migration.
-            if row and mode in ("adopted", "observeradopts", "lateflip",
+            if row and mode in ("adopted", "learnlost1", "ckptlost1",
+                                "observeradopts", "lateflip",
                                 "resurrect_stable", "resurrect_flap",
                                 "resurrect_nostale", "migrate_stable",
                                 "migrate_flap", "migrate_nolease",
@@ -570,7 +687,8 @@ threading.Thread(target=death_thread, daemon=True).start()
 # Modes that must pass the guard's step 10 (the resurrected-owner conflict
 # gate) -- every PASS mode AND every migrate_* mode, because the migrate
 # teeth can only fail at a step-11 gate if step 10 got them there first.
-STEP10_MODES = ("adopted", "resurrect_stable", "migrate_stable",
+STEP10_MODES = ("adopted", "learnlost1", "ckptlost1", "resurrect_stable",
+                "migrate_stable",
                 "migrate_flap", "migrate_nolease", "migrate_noapply",
                 "migrate_nostale", "migrate_noreacquire", "migrate_lost1",
                 "migrate_norow", "svc_stable", "svc_flap", "svc_nostale")

@@ -91,6 +91,23 @@
 # while the leader still holds the lease, and only then fails. A lost hop
 # costs a retry; a broken RX path fails every attempt. See step 4.6.
 #
+# The same rule now covers the two PRE-KILL learn gates (steps 3 and 4),
+# because an announce is a hop too. The create announce is broadcast ONCE
+# (announce-on-change) and the checkpoint carrying the row is broadcast
+# periodically, by the leader alone; a survivor that misses the one-shot
+# announce waits for the owner's next periodic re-announce --
+# partition_reannounce_tick() (kernel/partition.c, called from the BSP
+# sweep) re-broadcasts the rows a node OWNS every 1000 ticks (~10 s), and
+# there is NO command that fires it: user/shell.c's live partition triggers
+# are create/list/assign/destroy/pause/resume/lease acquire/migrate, and
+# none of them re-announces. So the guard's re-drive IS that period: each
+# gate may wait out up to AEROSLS_FAILOVER_ANNOUNCE_ATTEMPTS fresh windows,
+# and an extra window is spent only while the leader is still answering AND
+# still holds the row -- the exact state the periodic re-announce (and the
+# leader's checkpoint broadcast) needs to fire again, the same evidence-
+# first rule step 4.6 follows for the lease. A lost announce costs a printed
+# retry instead of a RED; a broken RX path fails every window.
+#
 # ─── What this guard does NOT do ─────────────────────────────────────────
 # Exactly one node is killed and it is left dead. The operator stops the
 # cluster afterwards (./run-cluster.sh --stop). It does not RELAUNCH the
@@ -125,6 +142,13 @@
 #                                drive before it accuses the RX path
 #                                (default 3; 1 = the pre-2026-09-25 single
 #                                window, kept for the smoke's control tooth).
+#   AEROSLS_FAILOVER_ANNOUNCE_ATTEMPTS
+#                                how many periodic re-announce periods each
+#                                of the two pre-kill learn gates (the create
+#                                announce in step 3, the checkpoint in step
+#                                4) may wait out before it accuses the RX
+#                                path (default 3; 1 = the pre-change single
+#                                window, kept for the smokes' control teeth).
 #   AEROSLS_LOG_DIR               where node<id>.log serial logs live
 #                                (default: cluster/).
 #   AEROSLS_CLUSTER_DIR          where cluster.pids lives (default: cluster/,
@@ -167,6 +191,16 @@ fi
 # still fails the gate. AEROSLS_FAILOVER_LEASE_ATTEMPTS=1 restores the old
 # single-window behaviour (the smoke's control tooth pins that).
 LEASE_ATTEMPTS="${AEROSLS_FAILOVER_LEASE_ATTEMPTS:-3}"
+# How many periodic re-announce periods the two pre-kill learn gates may
+# wait out before they accuse the RX path (see steps 3 and 4). The re-drive
+# is the kernel's OWN periodic re-announce / checkpoint broadcast -- no
+# command fires either -- so an attempt is a fresh window, and it is spent
+# only while the leader still answers and still holds the row. A lost
+# announce costs a retry; a broken RX path (the nolearn/nockpt teeth) eats
+# every attempt and still fails its gate.
+# AEROSLS_FAILOVER_ANNOUNCE_ATTEMPTS=1 restores the old single-window
+# behaviour (the smokes' learnlost1/ckptlost1 control teeth pin that).
+ANNOUNCE_ATTEMPTS="${AEROSLS_FAILOVER_ANNOUNCE_ATTEMPTS:-3}"
 
 die()  { echo; echo "ABORT: $*" >&2; exit 2; }
 fail() { echo; echo "FAIL  $*"; exit 1; }
@@ -333,48 +367,137 @@ S_PORT=$((HTTP_BASE + survivor))
 S_LOG="$LOG_DIR/node$survivor.log"
 
 # ─── 3. create a fresh partition; the survivor must learn it ──────────────
+# The pre-kill gate, and an announce hop like the lease row below: the
+# create announce is broadcast ONCE, so a single bounded wait cannot tell a
+# lost/slow hop from a broken RX path. The re-drive is the kernel's own
+# periodic re-announce (there is no command for it -- see the header), so
+# each attempt is a fresh WAIT_LEARN window, admitted only while the leader
+# is still answering AND still holds the row: the exact state
+# partition_reannounce_tick() needs to re-broadcast. A genuinely broken RX
+# path (the smoke's nolearn) fails every window and still fails the gate.
 echo "==> creating partition '$NAME' on node $leader (both nodes up)"
 "$CTL" --host "localhost:$L_PORT" "${TOKEN_ARGS[@]}" \
     shell partition create "$NAME" >/dev/null \
     || die "partition create failed on node $leader (aeroslsctl output above)"
 
-echo "==> waiting for node $survivor to learn '$NAME' (up to ${WAIT_LEARN}s)"
+echo "==> waiting for node $survivor to learn '$NAME' (up to ${WAIT_LEARN}s, up to ${ANNOUNCE_ATTEMPTS} re-announce period(s))"
 learned=""
-deadline=$(( $(date +%s) + WAIT_LEARN ))
+attempt=0
+redrives=0
 while :; do
-    if get200 "$S_PORT" /api/partitions; then
-        learned="$(row_if "$FETCH_BODY" "$NAME" "$leader")"
-    fi
+    attempt=$((attempt + 1))
+    deadline=$(( $(date +%s) + WAIT_LEARN ))
+    while :; do
+        if get200 "$S_PORT" /api/partitions; then
+            learned="$(row_if "$FETCH_BODY" "$NAME" "$leader")"
+        fi
+        [ -n "$learned" ] && break
+        [ "$(date +%s)" -ge "$deadline" ] && break
+        sleep "$POLL"
+    done
     [ -n "$learned" ] && break
-    [ "$(date +%s)" -ge "$deadline" ] && break
-    sleep "$POLL"
+    [ "$attempt" -ge "$ANNOUNCE_ATTEMPTS" ] && break
+    # Evidence first: the periodic re-announce can only fire for a row its
+    # owner still holds, on a node that is still up. A leader that stopped
+    # answering, or one that lost the row, is the announce path regressing
+    # -- retrying that would paper over a real find, so the gate falls
+    # through to its FAIL.
+    if ! get200 "$L_PORT" /api/partitions; then
+        echo "   note: node $leader is not answering /api/partitions; not waiting out another re-announce period"
+        break
+    fi
+    if [ -z "$(row_if "$FETCH_BODY" "$NAME" "$leader")" ]; then
+        echo "   note: node $leader no longer holds '$NAME'; not waiting out another re-announce period (the row's owner is the only re-announcer -- this is not a lost hop)"
+        break
+    fi
+    echo "   note: '$NAME' has not reached $survivor after ${WAIT_LEARN}s -- the periodic re-announce is the re-drive; re-driving the announce (attempt $((attempt + 1)) of ${ANNOUNCE_ATTEMPTS})"
+    redrives=$((redrives + 1))
 done
-[ -n "$learned" ] || fail "node $survivor never learned partition '$NAME' from the
-       create announce within ${WAIT_LEARN}s. DSPP_PARTITION_ANNOUNCE
-       replication is broken -- the 2-node test cannot proceed."
+if [ -z "$learned" ]; then
+    # The FAIL must say which side of the hop is implicated, with the
+    # evidence the gate actually collected -- never blame the RX path for a
+    # walk it did not take.
+    if [ "$redrives" -gt 0 ]; then
+        hop_note="A lost/slow announce is ruled out: the gate waited out ${redrives} extra
+       re-announce period(s) while node $leader still held '$NAME' -- so the survivor's
+       announce RX was given fresh periodic broadcasts and still learned nothing. The
+       announce RX path (partition_sync_upsert) is broken that way."
+    elif [ "$ANNOUNCE_ATTEMPTS" -le 1 ]; then
+        hop_note="The re-drive was disabled (AEROSLS_FAILOVER_ANNOUNCE_ATTEMPTS=$ANNOUNCE_ATTEMPTS),
+       so the gate spent its single window and nothing more (the smoke's learnlost1
+       control runs this shape to pin that the re-drive is what rescues a lost announce)."
+    else
+        hop_note="No extra re-announce period was waited out (the leader stopped answering, or
+       stopped holding the row), so this may be the announce path rather than a lost hop."
+    fi
+    fail "node $survivor never learned partition '$NAME' from the
+       create announce (no row owned by node $leader in its list after ${attempt}
+       window(s) of ${WAIT_LEARN}s). DSPP_PARTITION_ANNOUNCE replication is
+       broken -- the 2-node test cannot proceed. ${hop_note}"
+fi
 echo "   $survivor learned $learned"
 
 # ─── 4. the checkpoint must carry the row before the leader dies ──────────
 # The refusal this guard asserts is the quorum gate, so we must first prove
 # the OTHER prerequisites were in place: the survivor held a checkpoint
 # carrying the row, i.e. adoption was data-possible and still refused.
-echo "==> waiting for a checkpoint carrying '$NAME' to reach the survivor (up to ${WAIT_CKPT}s)"
+#
+# The gate wants a `[DSPP-CKPT] RX: COMPLETE` AFTER the sync line, and only
+# the leader broadcasts checkpoints (failover_live_checkpoint_broadcast,
+# every 100 ticks), so a frame lost on the hop -- or a sync line that landed
+# late, on the re-announce step 3 waited out -- can leave the gate on a
+# window that has already spent itself. The re-drive is that same periodic
+# broadcast: fresh WAIT_CKPT windows, admitted only while the leader is
+# still answering AND still holds the row, exactly like step 3.
+echo "==> waiting for a checkpoint carrying '$NAME' to reach the survivor (up to ${WAIT_CKPT}s, up to ${ANNOUNCE_ATTEMPTS} broadcast period(s))"
 ckpt_ok=0
-deadline=$(( $(date +%s) + WAIT_CKPT ))
+attempt=0
+redrives=0
 while :; do
-    learn_line="$(last_line "$S_LOG" "PARTITION] sync.*$NAME")"
-    ck="$(last_line "$S_LOG" "DSPP-CKPT] RX: COMPLETE")"
-    if [ -n "$learn_line" ] && [ -n "$ck" ] && [ "$ck" -gt "$learn_line" ]; then
-        ckpt_ok=1; break
+    attempt=$((attempt + 1))
+    deadline=$(( $(date +%s) + WAIT_CKPT ))
+    while :; do
+        learn_line="$(last_line "$S_LOG" "PARTITION] sync.*$NAME")"
+        ck="$(last_line "$S_LOG" "DSPP-CKPT] RX: COMPLETE")"
+        if [ -n "$learn_line" ] && [ -n "$ck" ] && [ "$ck" -gt "$learn_line" ]; then
+            ckpt_ok=1; break
+        fi
+        [ "$(date +%s)" -ge "$deadline" ] && break
+        sleep "$POLL"
+    done
+    [ "$ckpt_ok" -eq 1 ] && break
+    [ "$attempt" -ge "$ANNOUNCE_ATTEMPTS" ] && break
+    if ! get200 "$L_PORT" /api/partitions; then
+        echo "   note: node $leader is not answering /api/partitions; not waiting out another checkpoint period"
+        break
     fi
-    [ "$(date +%s)" -ge "$deadline" ] && break
-    sleep "$POLL"
+    if [ -z "$(row_if "$FETCH_BODY" "$NAME" "$leader")" ]; then
+        echo "   note: node $leader no longer holds '$NAME'; not waiting out another checkpoint period (the leader is the only broadcaster -- this is not a lost frame)"
+        break
+    fi
+    echo "   note: no checkpoint carrying '$NAME' on $survivor after ${WAIT_CKPT}s -- the leader's periodic broadcast is the re-drive; re-driving the checkpoint broadcast (attempt $((attempt + 1)) of ${ANNOUNCE_ATTEMPTS})"
+    redrives=$((redrives + 1))
 done
-[ "$ckpt_ok" -eq 1 ] || fail "no checkpoint carrying '$NAME' reached node $survivor
-       within ${WAIT_CKPT}s ('DSPP-CKPT] RX: COMPLETE' must appear after the sync
-       line in $S_LOG). Without it the held checkpoint predates the create, and
-       the guard could not distinguish 'quorum gate refused adoption' from
-       'nothing to adopt'."
+if [ "$ckpt_ok" -eq 0 ]; then
+    if [ "$redrives" -gt 0 ]; then
+        hop_note="A lost/slow frame is ruled out: the gate waited out ${redrives} extra broadcast
+       period(s) while node $leader still held '$NAME' -- so fresh checkpoints went
+       out and the survivor still logged none. The checkpoint RX path is broken that way."
+    elif [ "$ANNOUNCE_ATTEMPTS" -le 1 ]; then
+        hop_note="The re-drive was disabled (AEROSLS_FAILOVER_ANNOUNCE_ATTEMPTS=$ANNOUNCE_ATTEMPTS),
+       so the gate spent its single window and nothing more (the smoke's ckptlost1
+       control runs this shape to pin that the re-drive is what rescues a lost frame)."
+    else
+        hop_note="No extra broadcast period was waited out (the leader stopped answering, or
+       stopped holding the row), so this may be the checkpoint path rather than a lost
+       frame."
+    fi
+    fail "no checkpoint carrying '$NAME' reached node $survivor
+       (no 'DSPP-CKPT] RX: COMPLETE' after the sync line in $S_LOG, after
+       ${attempt} window(s) of ${WAIT_CKPT}s). Without it the held checkpoint
+       predates the create, and the guard could not distinguish 'quorum gate
+       refused adoption' from 'nothing to adopt'. ${hop_note}"
+fi
 echo "   checkpoint carrying '$NAME' held by the survivor"
 
 # ─── 4.5 the write-lease layer must be LIVE and CONTESTED before the kill ─

@@ -55,6 +55,18 @@
 #                           re-drive the campaign and pass — its control is
 #                           the SAME mode with the re-drive disabled, which
 #                           must still FAIL the gate)
+#   learnlost1    -> PASS  (the FIRST create announce's packet is lost on
+#                           the wire: the survivor only ever sees the row on
+#                           the owner's next periodic re-announce, so the
+#                           create-announce gate must wait out another period
+#                           and pass — its control is the SAME mode with the
+#                           re-drive disabled, which must still FAIL the
+#                           gate)
+#   ckptlost1     -> PASS  (the same loss one stream over: the checkpoint
+#                           frame carrying the row is lost for the pass that
+#                           delivered the announce, so the checkpoint gate
+#                           must wait out another broadcast period too — same
+#                           control shape)
 #   no-cluster    -> ABORT (no fakes at all — the guard must say how to
 #                           start a cluster, exit 2)
 #   latecreate    -> PASS  (the fakes are idled past EVERY wait the old
@@ -103,6 +115,22 @@
 # re-drive happened (the tooth asserts the guard printed it), and with
 # AEROSLS_FAILOVER_LEASE_ATTEMPTS=1 -- the pre-fix behaviour -- the same
 # lost hop is still the gate's honest FAIL.
+#
+# The same rule now covers the two PRE-KILL learn gates, because an announce
+# is a hop too -- and there the re-drive is the kernel's OWN periodic
+# re-announce: partition_reannounce_tick() re-broadcasts the rows a node OWNS
+# every 1000 ticks (~10 s), and no shell command fires it (user/shell.c's
+# live partition triggers are create/list/assign/destroy/pause/resume/lease
+# acquire/migrate). The guard may wait out up to
+# AEROSLS_FAILOVER_ANNOUNCE_ATTEMPTS fresh windows per gate, each re-drive
+# admitted only while the leader still answers AND still holds the row. The
+# teeth below pin both sides of it: learnlost1/ckptlost1 model the lost
+# packet (the fake's owner bumps a re-announce pass counter while it holds
+# the row; the survivor learns -- and checkpoints -- on the NEXT pass, never
+# inside the first window) and must PASS with the guard's own re-drive note
+# in its output, while the same modes with
+# AEROSLS_FAILOVER_ANNOUNCE_ATTEMPTS=1 -- the pre-change single window --
+# must still FAIL each gate, so neither tooth can pass on the old guard.
 #
 # Source-only: needs nothing built — the fakes are python3 and the guard is
 # bash + curl, so this runs in CI's verify job on every push via
@@ -242,7 +270,7 @@ tooth() {
     # path behind a flipped bit in the wire). Both must mean what they claim,
     # so both carry the hygiene checks below.
     local pass_tooth=0
-    case "$mode" in staysfollower|leaselost1) pass_tooth=1 ;; esac
+    case "$mode" in staysfollower|leaselost1|learnlost1|ckptlost1) pass_tooth=1 ;; esac
     if [ "$pass_tooth" -eq 1 ] && [ "$rc" -eq 0 ] && [ "$guard_passed" -eq 1 ]; then
         # A PASS that never killed the leader proves nothing: the whole
         # point is that the refusal happens AFTER the leader dies.
@@ -278,6 +306,22 @@ tooth() {
         # guard's own re-drive note has to be in its output.
         if [ "$mode" = "leaselost1" ] && ! printf '%s\n' "$out" | grep -q "re-driving the campaign"; then
             echo "TOOTH FAIL $label — guard passed, but it never re-drove the campaign (the lost first campaign was not modelled, so the tooth proves nothing)"
+            printf '%s\n' "$out" | sed 's/^/           /'
+            dump_fake_err
+            fails=$((fails + 1))
+            return
+        fi
+        # learnlost1/ckptlost1's PASSes must mean the re-drive really
+        # happened too: if the fake had delivered the lost packet inside the
+        # first window the tooth would be vacuous (it would pass on the
+        # pre-re-drive guard), so the guard's own note for the gate under
+        # test has to be in its output -- the announce note for learnlost1,
+        # the checkpoint note for ckptlost1.
+        local want_note=""
+        [ "$mode" = "learnlost1" ] && want_note="re-driving the announce"
+        [ "$mode" = "ckptlost1" ]  && want_note="re-driving the checkpoint broadcast"
+        if [ -n "$want_note" ] && ! printf '%s\n' "$out" | grep -q "$want_note"; then
+            echo "TOOTH FAIL $label — guard passed, but it never printed '$want_note' (the lost packet was not modelled, so the tooth proves nothing)"
             printf '%s\n' "$out" | sed 's/^/           /'
             dump_fake_err
             fails=$((fails + 1))
@@ -323,6 +367,20 @@ tooth leasehold      1 "holds_lease=1" "leasehold -> FAIL (partition_holds_write
 # is survivable, a broken RX path is not.
 tooth leaselost1     0 "PASS" "leaselost1 -> PASS (the first campaign's packet was lost on the wire; the re-drive created the survivor's lease row instead of failing the RX path)" 0 ""
 tooth leaselost1     1 "never created a lease row" "leaselost1 control -> FAIL with the re-drive disabled (AEROSLS_FAILOVER_LEASE_ATTEMPTS=1: the same lost hop is the gate's honest RED, so the tooth above is not vacuous)" 0 "AEROSLS_FAILOVER_LEASE_ATTEMPTS=1"
+
+# The same re-drive, on the two PRE-KILL learn gates. learnlost1 drops the
+# FIRST create announce on the wire -- the survivor only ever sees the row on
+# the owner's next periodic re-announce, which is a real second event in the
+# fake (the owner bumps the pass counter), never a receiver-side sleep -- and
+# ckptlost1 drops the checkpoint frame carrying the row for that pass. Both
+# must PASS by spending one more window (each tooth asserts the guard printed
+# the matching re-drive note, so a fake that delivered inside the first
+# window would fail them loudly instead of passing vacuously), and both
+# controls must still FAIL their gate with the re-drive disabled.
+tooth learnlost1     0 "PASS" "learnlost1 -> PASS (the first create announce's packet was lost on the wire; the guard waited out another periodic re-announce window instead of failing the survivor's RX path)" 0 ""
+tooth learnlost1     1 "never learned" "learnlost1 control -> FAIL with the re-drive disabled (AEROSLS_FAILOVER_ANNOUNCE_ATTEMPTS=1: the same lost announce is the gate's honest RED, so the tooth above is not vacuous)" 0 "AEROSLS_FAILOVER_ANNOUNCE_ATTEMPTS=1"
+tooth ckptlost1      0 "PASS" "ckptlost1 -> PASS (the checkpoint frame carrying the row was lost for the pass that delivered the announce; the guard waited out another broadcast period instead of failing the checkpoint gate)" 0 ""
+tooth ckptlost1      1 "no checkpoint" "ckptlost1 control -> FAIL with the re-drive disabled (AEROSLS_FAILOVER_ANNOUNCE_ATTEMPTS=1: the same lost frame is the gate's honest RED, so the tooth above is not vacuous)" 0 "AEROSLS_FAILOVER_ANNOUNCE_ATTEMPTS=1"
 
 # The silent tooth: no cluster at all. The guard must abort (2) and say how
 # to start one -- not pass, and not blame the wrong layer.

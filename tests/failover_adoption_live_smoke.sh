@@ -79,6 +79,20 @@
 #                         campaign never reaches it at all, so even the
 #                         re-driven campaign leaves no row -- the gate
 #                         must still bite after spending every attempt)
+#   learnlost1  -> PASS  (the FIRST create announce's packet is lost on
+#                         the wire for BOTH followers: they only ever see
+#                         the row on the owner's next periodic re-announce,
+#                         so the create-announce gate must wait out another
+#                         period and pass -- its control is the SAME mode
+#                         with the re-drive disabled, which must still FAIL
+#                         the gate. The whole failover chain still runs
+#                         afterwards, exactly like "adopted")
+#   ckptlost1   -> PASS  (the same loss one stream over: the checkpoint
+#                         frame carrying the row is lost for the pass that
+#                         delivered the announce, so the checkpoint gate must
+#                         wait out another broadcast period too -- same
+#                         control shape. Still the full adopted chain after
+#                         the pre-kill gates)
 #   svc_stable  -> PASS  (step 12: the guard registers a service twin on the
 #                         owner, re-registers it on the adopter, and when the
 #                         resurrected owner re-announces the SAME name the
@@ -161,6 +175,26 @@
 # it), with AEROSLS_FAILOVER_LEASE_ATTEMPTS=1 -- the pre-fix behaviour --
 # the same lost hop is still the gate's honest FAIL, and migrate_norow (a
 # truly broken RX path) still fails the gate with the re-drive on.
+#
+# The same rule now covers the two PRE-KILL learn gates, because an announce
+# is a hop too -- and there the re-drive is the kernel's OWN periodic
+# re-announce: partition_reannounce_tick() re-broadcasts the rows a node OWNS
+# every 1000 ticks (~10 s), and no shell command fires it (user/shell.c's
+# live partition triggers are create/list/assign/destroy/pause/resume/lease
+# acquire/migrate). The guard may wait out up to
+# AEROSLS_FAILOVER_ANNOUNCE_ATTEMPTS fresh windows per gate, each re-drive
+# admitted only while the leader still answers AND still holds the row. That
+# matters more here than in the 2-node sibling: step 3's row is what the
+# adopter adopts and what the observer sees the owner handoff against, and
+# step 4's checkpoint is what makes the adoption data-possible at all, so a
+# single dropped announce packet used to RED the whole guard at its floor.
+# The teeth pin both sides: learnlost1/ckptlost1 model the lost packet (the
+# fake's owner bumps a re-announce pass counter while it holds the row; the
+# survivors learn -- and checkpoint -- on the NEXT pass, never inside the
+# first window) and must PASS with the guard's own re-drive note for the gate
+# under test in its output, while the same modes with
+# AEROSLS_FAILOVER_ANNOUNCE_ATTEMPTS=1 -- the pre-change single window --
+# must still FAIL that gate, so neither tooth can pass on the old guard.
 #
 # Runs on a port base far from any real cluster and never touches a running
 # one: the guard's pid file lives in a private temp dir (AEROSLS_CLUSTER_DIR),
@@ -317,7 +351,8 @@ tooth() {
     # migrate_lost1 (the same step-11 path behind a flipped bit in the
     # wire). All must mean what they claim, so all carry the checks below.
     if { [ "$mode" = "adopted" ] || [ "$mode" = "svc_stable" ] \
-            || [ "$mode" = "migrate_lost1" ]; } \
+            || [ "$mode" = "migrate_lost1" ] \
+            || [ "$mode" = "learnlost1" ] || [ "$mode" = "ckptlost1" ]; } \
             && [ "$rc" -eq 0 ] && [ "$guard_passed" -eq 1 ]; then
         # A PASS that never killed the leader proves nothing: the whole
         # point is that the ADOPTION happens after the leader dies.
@@ -335,6 +370,22 @@ tooth() {
         if [ "$mode" = "migrate_lost1" ] \
                 && ! printf '%s\n' "$out" | grep -q "re-driving the campaign"; then
             echo "TOOTH FAIL $label — guard passed, but it never re-drove the campaign (the lost first campaign was not modelled, so the tooth proves nothing)"
+            printf '%s\n' "$out" | sed 's/^/           /'
+            dump_fake_err
+            fails=$((fails + 1))
+            return
+        fi
+        # learnlost1/ckptlost1's PASSes must mean the re-drive really
+        # happened too: if the fake had delivered the lost packet inside the
+        # first window the tooth would be vacuous (it would pass on the
+        # pre-re-drive guard), so the guard's own note for the gate under
+        # test has to be in its output -- the announce note for learnlost1,
+        # the checkpoint note for ckptlost1.
+        local want_note=""
+        [ "$mode" = "learnlost1" ] && want_note="re-driving the announce"
+        [ "$mode" = "ckptlost1" ]  && want_note="re-driving the checkpoint broadcast"
+        if [ -n "$want_note" ] && ! printf '%s\n' "$out" | grep -q "$want_note"; then
+            echo "TOOTH FAIL $label — guard passed, but it never printed '$want_note' (the lost packet was not modelled, so the tooth proves nothing)"
             printf '%s\n' "$out" | sed 's/^/           /'
             dump_fake_err
             fails=$((fails + 1))
@@ -390,6 +441,21 @@ tooth migrate_noreacquire 1 "never re-acquired the write lease" "migrate_noreacq
 tooth migrate_lost1 0 "PASS" "migrate_lost1 -> PASS (the first step-11 campaign's packet was lost on the wire for the observer; the re-drive created its lease row instead of failing the RX path)" 0 0
 tooth migrate_lost1 1 "never created a lease row" "migrate_lost1 control -> FAIL with the re-drive disabled (AEROSLS_FAILOVER_LEASE_ATTEMPTS=1: the same lost hop is the gate's honest RED, so the tooth above is not vacuous)" 0 0 "AEROSLS_FAILOVER_LEASE_ATTEMPTS=1"
 tooth migrate_norow 1 "never created a lease row" "migrate_norow -> FAIL (the observer's lease RX path is broken: no row appears, however often the guard re-drives, so the gate still bites)" 0 0
+# The same re-drive, on the two PRE-KILL learn gates. learnlost1 drops the
+# FIRST create announce on the wire for BOTH followers -- they only ever see
+# the row on the owner's next periodic re-announce, a real second event in
+# the fake (the owner bumps the pass counter), never a receiver-side sleep --
+# and ckptlost1 drops the checkpoint frame carrying the row for that pass.
+# Both must PASS by spending one more window (each tooth asserts the guard
+# printed the matching re-drive note, so a fake that delivered inside the
+# first window would fail them loudly instead of passing vacuously), both
+# controls must still FAIL their gate with the re-drive disabled, and both
+# modes continue down the plain "adopted" path so the teeth still prove the
+# whole failover chain runs.
+tooth learnlost1 0 "PASS" "learnlost1 -> PASS (the first create announce's packet was lost on the wire for both followers; the guard waited out another periodic re-announce window instead of failing their RX path)" 0 0
+tooth learnlost1 1 "never learned" "learnlost1 control -> FAIL with the re-drive disabled (AEROSLS_FAILOVER_ANNOUNCE_ATTEMPTS=1: the same lost announce is the gate's honest RED, so the tooth above is not vacuous)" 0 0 "AEROSLS_FAILOVER_ANNOUNCE_ATTEMPTS=1"
+tooth ckptlost1 0 "PASS" "ckptlost1 -> PASS (the checkpoint frame carrying the row was lost for the pass that delivered the announce; the guard waited out another broadcast period instead of failing the checkpoint gate)" 0 0
+tooth ckptlost1 1 "no checkpoint" "ckptlost1 control -> FAIL with the re-drive disabled (AEROSLS_FAILOVER_ANNOUNCE_ATTEMPTS=1: the same lost frame is the gate's honest RED, so the tooth above is not vacuous)" 0 0 "AEROSLS_FAILOVER_ANNOUNCE_ATTEMPTS=1"
 tooth svc_stable  0 "PASS"   "svc_stable -> PASS (the service twin survives the resurrected owner's stale re-announce: rejected on the observer, every node still resolves to the adopter)"
 tooth svc_flap    1 "service registration FLAPPED" "svc_flap -> FAIL (the old last-wins apply of the stale service claim must be caught by step 12)"
 tooth svc_nostale 1 "never rejected" "svc_nostale -> FAIL (a stale service re-announce that never fires must be caught by step 12)"
