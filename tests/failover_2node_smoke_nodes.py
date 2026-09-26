@@ -58,6 +58,10 @@ Modes (written to <statedir>/mode by the smoke):
                    lease-held gate
     nolearnlease   node 2 never creates its lease row (the REQUEST_VOTE RX
                    path broken) -> guard FAIL at the lease-learn gate
+    leaselost1     the first campaign's packet is LOST on the wire: node 2
+                   only ever sees the row of the SECOND campaign, i.e. the
+                   guard's re-drive. A lost hop must not read as a broken
+                   RX path -> guard PASS (the re-drive gate)
     leasestrip     node 2 declares the death but never logs the MMU-LEASE
                    strip -> guard FAIL at the strip gate
     leaserestore   node 2 logs the strip AND then a restore (lease
@@ -122,6 +126,7 @@ transitioned = False
 flipped = False
 lease_held_leader = False
 lease_held_survivor = False
+campaign_term = 0        # one acquire = one campaign (leaselost1 reads it)
 
 
 def log(line):
@@ -137,6 +142,32 @@ def read_created():
         except ValueError:
             return None
     return None
+
+
+def read_lease():
+    # A half-arrived row is NOT a broken RX path. read_created()'s rule,
+    # applied to the lease row too: a partial read means "not yet", never
+    # an exception. The writer os.replace()s the row in whole (below), but
+    # the reader must not be what decides a verdict anyway -- the old
+    # `json.load(open(lease))` right after `os.path.exists(lease)` could
+    # catch the zero-byte window of a write and die with a JSONDecodeError,
+    # killing this thread. A dead RX thread never logs the row, so the
+    # guard read a racing reader as "the leader's REQUEST_VOTE RX path is
+    # broken" -- the CI false RED of 2026-09-25.
+    if os.path.exists(lease):
+        try:
+            return json.load(open(lease))
+        except ValueError:
+            return None
+    return None
+
+
+def lease_term(row):
+    """The campaign term of a lease row (the writer's acquire counter)."""
+    try:
+        return int(row.get("term", 1))
+    except (AttributeError, TypeError, ValueError):
+        return 1
 
 
 def learn_line(row, owner):
@@ -203,24 +234,43 @@ threading.Thread(target=rx_thread, daemon=True).start()
 # campaign arrives (here: when lease.json appears). The guard requires
 # `[CONSENSUS] partition N lease initialised` in the survivor's log BEFORE
 # the kill -- without a row, the absence of a restore would be vacuous.
-# nolearnlease never logs it (the lease-learn gate must bite). The leader
-# side creates its own row on `partition lease acquire` (below).
+# nolearnlease never logs it (the lease-learn gate must bite). leaselost1
+# logs it only for the SECOND campaign: the first one's packet was lost on
+# the wire, which is what the guard's re-drive gate must survive. The
+# leader side creates its own row on `partition lease acquire` (below).
 def lease_rx_thread():
     global lease_held_survivor
     if role != "follower":
         return
-    # Life-bounded: the guard's lease phase runs after its own
-    # cluster-forming and learn gates.
-    while not os.path.exists(lease):
-        time.sleep(0.05)
-    if os.path.exists(lease) and mode != "nolearnlease":
-        # A lease row exists but the survivor does NOT hold it -- the
-        # global lease_held_survivor stays False (default).
-        log("[CONSENSUS] partition %s lease initialised (FOLLOWER, term=0)."
-            % json.load(open(lease)).get("partition_id", "1"))
-        # A lease row exists but the survivor does NOT hold it. The leader
-        # does (its own acquire below) -- the row here is the follower's
-        # mirror of the same partition's lease state.
+    # Life-bounded, and retry-tolerant (read_lease): the guard's lease
+    # phase runs after its own cluster-forming and learn gates, and a read
+    # that lands mid-write must retry, not kill this thread.
+    row = None
+    while row is None:
+        row = read_lease()
+        if row is None:
+            time.sleep(0.05)
+    if mode == "nolearnlease":
+        return   # the lease-learn gate must bite: no row is ever RXed
+    if mode == "leaselost1" and lease_term(row) < 2:
+        # The first campaign's packet never landed (a lost HOP, not a
+        # broken RX path): this node only ever sees the row of the second
+        # campaign -- the guard's re-drive. With a single bounded wait the
+        # guard FAILed here with "never created a lease row" (the CI false
+        # RED of 2026-09-25), so this mode is the control for the re-drive
+        # gate: a lost hop must PASS, a broken RX path (nolearnlease) must
+        # still FAIL.
+        while True:
+            row = read_lease()
+            if row is not None and lease_term(row) >= 2:
+                break
+            time.sleep(0.05)
+    # A lease row exists but the survivor does NOT hold it -- the global
+    # lease_held_survivor stays False (default). The leader does (its own
+    # acquire below) -- the row here is the follower's mirror of the same
+    # partition's lease state.
+    log("[CONSENSUS] partition %s lease initialised (FOLLOWER, term=0)."
+        % row.get("partition_id", "1"))
 
 
 threading.Thread(target=lease_rx_thread, daemon=True).start()
@@ -392,17 +442,28 @@ class H(http.server.BaseHTTPRequestHandler):
                 # hold (the command succeeds -- so the guard's acquire
                 # shell step does not die -- but no row is held, and the
                 # lease-held gate must bite).
+                #
+                # Each acquire is one CAMPAIGN: the row carries the term,
+                # so the RX side can tell a re-driven campaign from the
+                # first one (leaselost1). The row is written whole
+                # (os.replace): the RX side reads a ROW, never a half-arrived
+                # packet, which is the whole point of a wire hop model.
                 pid = command[len("partition lease acquire "):].strip()
                 if mode != "nolease":
-                    with open(lease, "w") as f:
-                        json.dump({"partition_id": int(pid), "term": 1},
-                                  f, separators=(",", ":"))
+                    global lease_held_leader, campaign_term
                     with lock:
-                        global lease_held_leader
+                        campaign_term += 1
+                        term = campaign_term
+                    tmp = "%s.tmp%d" % (lease, os.getpid())
+                    with open(tmp, "w") as f:
+                        json.dump({"partition_id": int(pid), "term": term},
+                                  f, separators=(",", ":"))
+                    os.replace(tmp, lease)
+                    with lock:
                         lease_held_leader = True
                     log("[CONSENSUS] partition %s lease initialised (FOLLOWER, term=0)." % pid)
-                    log("[CONSENSUS] partition %s: node %u campaigning for write lease, term 1." % (pid, node_id))
-                    log("[CONSENSUS] partition %s: quorum stable, node %u elected LEADER (write lease) for term 1." % (pid, node_id))
+                    log("[CONSENSUS] partition %s: node %u campaigning for write lease, term %d." % (pid, node_id, term))
+                    log("[CONSENSUS] partition %s: quorum stable, node %u elected LEADER (write lease) for term %d." % (pid, node_id, term))
                 self._json(200, {"ok": "true", "recognized": "true",
                                  "output": f"lease acquire {pid} issued"})
             else:

@@ -85,6 +85,12 @@
 # partitions the whole window) and the survivor's log shows the strip with
 # never a restore.
 #
+# The row reaches the survivor over a packet hop, so the guard does not
+# accuse the RX path off ONE bounded wait: it re-drives the campaign (up to
+# AEROSLS_FAILOVER_LEASE_ATTEMPTS, each attempt a fresh WAIT_LEASE window)
+# while the leader still holds the lease, and only then fails. A lost hop
+# costs a retry; a broken RX path fails every attempt. See step 4.6.
+#
 # ─── What this guard does NOT do ─────────────────────────────────────────
 # Exactly one node is killed and it is left dead. The operator stops the
 # cluster afterwards (./run-cluster.sh --stop). It does not RELAUNCH the
@@ -114,6 +120,11 @@
 #                                nodes). Refused by default.
 #   AEROSLS_FAILOVER_FAST=1      scale every wait down to seconds. Used by
 #                                the smoke; never for a real cluster.
+#   AEROSLS_FAILOVER_LEASE_ATTEMPTS
+#                                how many campaigns the lease-row gate may
+#                                drive before it accuses the RX path
+#                                (default 3; 1 = the pre-2026-09-25 single
+#                                window, kept for the smoke's control tooth).
 #   AEROSLS_LOG_DIR               where node<id>.log serial logs live
 #                                (default: cluster/).
 #   AEROSLS_CLUSTER_DIR          where cluster.pids lives (default: cluster/,
@@ -146,10 +157,16 @@ NAME="guard-2node-$$"             # unique per run, so a stale persisted
                                   # row can never be mistaken for it
 
 if [ "$FAST" = "1" ]; then
-    POLL=0.5; WAIT_NODES=10; WAIT_LEARN=6; WAIT_CKPT=6; WAIT_OBSERVER=8
+    POLL=0.5; WAIT_NODES=10; WAIT_LEARN=6; WAIT_CKPT=6; WAIT_OBSERVER=8; WAIT_LEASE=6
 else
-    POLL=2;   WAIT_NODES=240; WAIT_LEARN=30; WAIT_CKPT=60; WAIT_OBSERVER=90
+    POLL=2;   WAIT_NODES=240; WAIT_LEARN=30; WAIT_CKPT=60; WAIT_OBSERVER=90; WAIT_LEASE=30
 fi
+# How many campaigns the lease-row gate may drive before it accuses the RX
+# path (see step 4.6). One acquire is one campaign; a lost/slow hop costs a
+# retry, a broken RX path (the nolearnlease tooth) eats every attempt and
+# still fails the gate. AEROSLS_FAILOVER_LEASE_ATTEMPTS=1 restores the old
+# single-window behaviour (the smoke's control tooth pins that).
+LEASE_ATTEMPTS="${AEROSLS_FAILOVER_LEASE_ATTEMPTS:-3}"
 
 die()  { echo; echo "ABORT: $*" >&2; exit 2; }
 fail() { echo; echo "FAIL  $*"; exit 1; }
@@ -414,21 +431,94 @@ done
        live cannot assert it stays read-only."
 echo "   node $leader holds the write lease for '$NAME'"
 
-echo "==> waiting for node $survivor to LEARN the lease row (up to ${WAIT_LEARN}s)"
+# The row is created by the survivor's RX path when the leader's campaign
+# LANDS -- a packet hop, not a function call, so it can be delayed or lost
+# independently of the code under test. A single bounded wait cannot tell a
+# lost hop from a broken RX path, and on 2026-09-25 in CI it did not: the
+# plain staysfollower arm and the leaserestore arm both failed here with
+# "never created a lease row" on a loaded runner while every other arm in
+# the same run -- and both arms on the re-run -- passed. That false RED
+# blamed process_partition_consensus_packet's find-or-create for a hop that
+# had not landed yet (the fakes had a real bug here too: a lease row caught
+# mid-write killed the survivor's RX thread, fixed in
+# failover_2node_smoke_nodes.py). So the gate now RE-DRIVES the campaign:
+# each attempt is a fresh WAIT_LEASE window, and a re-drive is admitted
+# only while the leader is answering AND still holds the write lease -- the
+# exact state the first acquire won in, so the re-drive is the same
+# trigger, not a new scenario (the shell `partition lease acquire` is
+# documented as the only live trigger, and partition_lease_trigger_
+# election creates the row if missing and re-campaigns). A hop that is
+# merely lost/slow now costs a printed retry instead of a RED.
+#
+# The tooth is intact: a genuinely broken RX path (nolearnlease) never
+# creates the row, so every attempt fails it -- and the FAIL below still
+# says `never created a lease row`. The smoke pins both sides of that:
+# leaselost1->PASS (the first campaign is dropped on the wire: the re-drive
+# must rescue it) and the leaselost1 attempts=1 control->FAIL (with the
+# re-drive disabled the same loss is still the gate's honest RED).
+echo "==> waiting for node $survivor to LEARN the lease row (up to ${WAIT_LEASE}s, up to ${LEASE_ATTEMPTS} campaign attempt(s))"
 lease_init=""
-deadline=$(( $(date +%s) + WAIT_LEARN ))
+attempt=0
+redrives=0
 while :; do
-    lease_init="$(last_line "$S_LOG" "CONSENSUS] partition $PART_ID lease initialised")"
+    attempt=$((attempt + 1))
+    deadline=$(( $(date +%s) + WAIT_LEASE ))
+    while :; do
+        lease_init="$(last_line "$S_LOG" "CONSENSUS] partition $PART_ID lease initialised")"
+        [ -n "$lease_init" ] && break
+        [ "$(date +%s)" -ge "$deadline" ] && break
+        sleep "$POLL"
+    done
     [ -n "$lease_init" ] && break
-    [ "$(date +%s)" -ge "$deadline" ] && break
-    sleep "$POLL"
+    [ "$attempt" -ge "$LEASE_ATTEMPTS" ] && break
+    # Evidence first: re-drive only while the acquire that won can be
+    # repeated. A leader that stopped answering, or one that lost the
+    # leash it just held, is the lease layer regressing -- retrying that
+    # would paper over a real find, so the gate falls through to its FAIL.
+    if ! get200 "$L_PORT" /api/partitions; then
+        echo "   note: node $leader is not answering /api/partitions; not re-driving the campaign"
+        break
+    fi
+    if [ "$(holds_lease_of "$FETCH_BODY" "$NAME")" != "1" ]; then
+        echo "   note: node $leader no longer holds the write lease; not re-driving (the lease layer regressed -- this is not a lost hop)"
+        break
+    fi
+    echo "   note: no lease row on $survivor after ${WAIT_LEASE}s -- re-driving the campaign (attempt $((attempt + 1)) of ${LEASE_ATTEMPTS})"
+    redrives=$((redrives + 1))
+    "$CTL" --host "localhost:$L_PORT" "${TOKEN_ARGS[@]}" \
+        shell partition lease acquire "$PART_ID" >/dev/null \
+        || echo "   note: the re-acquire returned non-zero; spending the remaining attempt(s) on the wait anyway"
 done
-[ -n "$lease_init" ] || fail "node $survivor never created a lease row for partition
-       $PART_ID (no 'partition $PART_ID lease initialised' line in $S_LOG within
-       ${WAIT_LEARN}s). Without a row the survivor has nothing to contest --
-       the strip gate below would be vacuous, so the guard refuses to run
-       blind. The leader's REQUEST_VOTE RX path (process_partition_
-       consensus_packet's find-or-create) is broken."
+if [ -z "$lease_init" ]; then
+    # The FAIL must say which side of the hop is implicated, with the
+    # evidence the gate actually collected -- never blame the RX path for a
+    # walk it did not take.
+    if [ "$redrives" -gt 0 ]; then
+        hop_note="A lost/slow hop is ruled out: the campaign was re-driven ${redrives} time(s),
+       each time with the leader still holding the write lease -- so the
+       survivor's RX side was given fresh campaigns and still created no row.
+       The leader's REQUEST_VOTE RX path (process_partition_consensus_packet's
+       find-or-create) is broken that way."
+    elif [ "$LEASE_ATTEMPTS" -le 1 ]; then
+        hop_note="The re-drive was disabled (AEROSLS_FAILOVER_LEASE_ATTEMPTS=$LEASE_ATTEMPTS),
+       so the gate spent its single window and nothing more (the smoke's
+       leaselost1 control runs this shape to pin that the re-drive is what
+       rescues a lost hop)."
+    else
+        hop_note="The campaign was NOT re-driven (the leader stopped answering, or stopped
+       holding the lease), so this may be the lease layer rather than the RX hop."
+    fi
+    if get200 "$S_PORT" /api/health; then
+        s_note="The survivor's HTTP server is answering, so the node is up and serving."
+    else
+        s_note="The survivor's HTTP server is NOT answering either -- suspect the node, not the RX path."
+    fi
+    fail "node $survivor never created a lease row for partition
+       $PART_ID (no 'partition $PART_ID lease initialised' line in $S_LOG after
+       ${attempt} campaign attempt(s) of ${WAIT_LEASE}s each). Without a row the
+       survivor has nothing to contest -- the strip gate below would be vacuous,
+       so the guard refuses to run blind. ${hop_note} ${s_note}"
+fi
 echo "   $survivor learned the lease row: $(sed -n "${lease_init}p" "$S_LOG" | sed 's/^/      /')"
 
 # ─── 5. capture the leader's identity BEFORE killing it ───────────────────
