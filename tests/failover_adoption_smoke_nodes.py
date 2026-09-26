@@ -30,7 +30,10 @@ by exactly one real site):
     (FOLLOWER, term=0)." (every receiver of the campaign), "campaigning
     for write lease", the "[MMU-LEASE] partition N: page permissions
     force_read_only=1" strip on campaign and "=0" restore on the quorum
-    win, then "quorum stable, node M elected LEADER (write lease)".
+    win, then "quorum stable, node M elected LEADER (write lease)". The
+    row is written WHOLE (tmp + os.replace) and carries the campaign's
+    term, so a receiver can tell a re-driven campaign from the first one
+    (migrate_lost1) -- a hop delivers a row, never half a packet.
     migrate:               the source logs "voluntarily stepped down from
     LEADER -- lease relinquished" then "[PARTITION] migrated partition N:
     node S -> node D. Lease relinquished=yes, ..." and the receivers log
@@ -103,6 +106,14 @@ Modes (written to <statedir>/mode by the smoke):
                   its row -> guard FAIL at the step-11 restore gate
     migrate_noreacquire  node 1's re-acquire after the migrate never holds
                   -> guard FAIL at the step-11 re-acquire gate
+    migrate_lost1  the FIRST step-11 lease campaign's packet never reaches
+                  the OBSERVER (a lost HOP, not a broken RX path): it only
+                  ever logs the row of the SECOND campaign, i.e. the
+                  guard's re-drive -> guard PASS (the re-drive gate)
+    migrate_norow  the OBSERVER never receives the campaign at all (its
+                  lease RX path is broken): no row is ever logged, no
+                  matter how often the guard re-drives -> guard FAIL at
+                  the step-11 lease-learn gate
 
 Both survivors DECLARE the death (every node runs failover_tick); only the
 leader recovers. So the observer's log always carries its own declaration
@@ -235,6 +246,33 @@ def read_created():
     return None
 
 
+def read_lease():
+    # A half-arrived row is NOT a broken RX path. read_created()'s rule,
+    # applied to the lease row too: a partial read means "not yet", never
+    # an exception. The writer os.replace()s the row in whole (below), but
+    # the reader must not be what decides a verdict anyway -- the old
+    # `json.load(open(lease))` right after `os.path.exists(lease)` could
+    # catch the zero-byte window of the in-place buffered write this file
+    # used to do and die with a JSONDecodeError, killing this thread; a
+    # dead RX thread never logs the row, so the guard read a racing reader
+    # as "the lease RX path is broken" -- the CI false RED of 2026-09-25
+    # in the 2-node sibling, same reader, same fix.
+    if os.path.exists(lease):
+        try:
+            return json.load(open(lease))
+        except ValueError:
+            return None
+    return None
+
+
+def lease_term(row):
+    """The campaign term of a lease row (0 when no row has arrived yet)."""
+    try:
+        return int(row.get("term", 0))
+    except (AttributeError, TypeError, ValueError):
+        return 0
+
+
 def learn_line(row, owner):
     return ("[PARTITION] sync: partition %s '%s' (owner node %s) learned "
             "from node %s." % (row["id"], row["name"], owner, owner))
@@ -313,16 +351,43 @@ threading.Thread(target=rx_thread, daemon=True).start()
 # initialised" -- without a row, the absence of a restore would be vacuous.
 # migrate_nolease never writes lease.json (the acquirer's hold never takes)
 # and migrate_noreacquire suppresses the row on node 1's re-acquire.
+# migrate_lost1 models the LOST HOP at this receiver: the observer never
+# sees the first campaign's packet and only logs the row of the second
+# campaign (the guard's re-drive); migrate_norow models the BROKEN RX path
+# on the observer: it never logs a row at all, however often the guard
+# re-drives.
 def lease_rx_thread():
     if node_id == 2:
         return   # node 2 is the adopter -- it ISSUES the acquire itself
-    # Life-bounded: step 11 runs after the whole death/adoption/relaunch
-    # dance, far outside any counter started at process boot.
-    while not os.path.exists(lease):
-        time.sleep(0.05)
-    if os.path.exists(lease):
-        pid = json.load(open(lease)).get("partition_id", "1")
-        log("[CONSENSUS] partition %s lease initialised (FOLLOWER, term=0)." % pid)
+    if mode == "migrate_norow" and node_id == 3:
+        return   # the observer's campaign RX never fires (the gate must bite)
+    # Life-bounded, and retry-tolerant (read_lease): step 11 runs after the
+    # whole death/adoption/relaunch dance, far outside any counter started
+    # at process boot, and a read that lands mid-write must retry, not kill
+    # this thread.
+    row = None
+    while row is None:
+        row = read_lease()
+        if row is None:
+            time.sleep(0.05)
+    if mode == "migrate_lost1" and node_id == 3 and lease_term(row) < 2:
+        # The first campaign's packet (term 1) never landed on the OBSERVER
+        # -- a lost HOP, not a broken RX path -- so this node only ever
+        # sees the row of the second campaign: the guard's re-drive. The
+        # guard's lease-learn gate waits on the OBSERVER's log, so with a
+        # single bounded window it FAILed here with "never created a lease
+        # row" (the same false RED the 2-node pair fixed on 2026-09-25),
+        # which makes this mode the control for the re-drive gate: a lost
+        # hop must PASS, a broken RX path (migrate_norow) must still FAIL.
+        while True:
+            row = read_lease()
+            if row is not None and lease_term(row) >= 2:
+                break
+            time.sleep(0.05)
+    # The row is this node's MIRROR of the acquirer's lease state -- this
+    # node does NOT hold the lease (its holds_lease stays 0).
+    log("[CONSENSUS] partition %s lease initialised (FOLLOWER, term=0)."
+        % row.get("partition_id", "1"))
 
 
 threading.Thread(target=lease_rx_thread, daemon=True).start()
@@ -460,7 +525,8 @@ def death_thread():
                                 "resurrect_nostale", "migrate_stable",
                                 "migrate_flap", "migrate_nolease",
                                 "migrate_noapply", "migrate_nostale",
-                                "migrate_noreacquire", "svc_stable",
+                                "migrate_noreacquire", "migrate_lost1",
+                                "migrate_norow", "svc_stable",
                                 "svc_flap", "svc_nostale"):
                 log(learn_line(row, 2))
             if row and mode == "observeradopts":
@@ -506,8 +572,8 @@ threading.Thread(target=death_thread, daemon=True).start()
 # teeth can only fail at a step-11 gate if step 10 got them there first.
 STEP10_MODES = ("adopted", "resurrect_stable", "migrate_stable",
                 "migrate_flap", "migrate_nolease", "migrate_noapply",
-                "migrate_nostale", "migrate_noreacquire", "svc_stable",
-                "svc_flap", "svc_nostale")
+                "migrate_nostale", "migrate_noreacquire", "migrate_lost1",
+                "migrate_norow", "svc_stable", "svc_flap", "svc_nostale")
 if role == "leader":
 
     def resurrect_thread():
@@ -659,16 +725,31 @@ def acquire_lease(pid):
         return   # the adopter's acquire never holds (lease-held gate bites)
     if node_id == leader_id and mode == "migrate_noreacquire":
         return   # the destination's re-acquire never holds (gate bites)
-    with open(lease, "w") as f:
-        json.dump({"partition_id": int(pid)}, f, separators=(",", ":"))
+    # Each acquire is one CAMPAIGN and the row carries its term, so the RX
+    # side can tell a re-driven campaign from the first one (migrate_lost1).
+    # The term comes from the row on disk, so it is monotonic ACROSS
+    # processes: step 11a's acquire here (node 2) and step 11f's
+    # re-acquire on node 1 count in the same series. The row is written
+    # WHOLE (tmp + os.replace): the RX side reads a ROW, never a
+    # half-arrived packet. The in-place buffered write this replaces had a
+    # zero-byte window, and a reader's bare json.load in exactly that
+    # window killed its RX thread (the CI false RED of 2026-09-25 in the
+    # 2-node sibling; this file's reader had the same read and the same
+    # window).
+    term = lease_term(read_lease()) + 1
+    tmp = "%s.tmp%d" % (lease, os.getpid())
+    with open(tmp, "w") as f:
+        json.dump({"partition_id": int(pid), "term": term},
+                  f, separators=(",", ":"))
+    os.replace(tmp, lease)
     with lock:
         lease_held = True
     log("[CONSENSUS] partition %s lease initialised (FOLLOWER, term=0)." % pid)
-    log("[CONSENSUS] partition %s: node %u campaigning for write lease, term 1."
-        % (pid, node_id))
+    log("[CONSENSUS] partition %s: node %u campaigning for write lease, term %d."
+        % (pid, node_id, term))
     log("[MMU-LEASE] partition %s: page permissions force_read_only=1" % pid)
     log("[CONSENSUS] partition %s: quorum stable, node %u elected LEADER "
-        "(write lease) for term 1." % (pid, node_id))
+        "(write lease) for term %d." % (pid, node_id, term))
     log("[MMU-LEASE] partition %s: page permissions force_read_only=0" % pid)
 
 

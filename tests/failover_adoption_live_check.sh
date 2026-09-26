@@ -80,6 +80,13 @@
 # relinquished at the migrate (holds_lease 0 everywhere) and re-acquired
 # on the new owner only through a fresh 2-of-3 quorum.
 #
+# The lease row reaches the observer over a packet hop, so the pre-migrate
+# lease-row gate does not accuse the RX path off ONE bounded wait: it
+# re-drives the campaign (up to AEROSLS_FAILOVER_LEASE_ATTEMPTS, each
+# attempt a fresh WAIT_LEASE window) while the adopter still holds the
+# lease, and only then fails. A lost hop costs a retry; a broken RX path
+# fails every attempt. See step 11a.
+#
 # Step 12 then pins the same claim-class resolution on the SERVICE registry
 # (kernel/service_registry.c): the guard registers a service twin on the
 # owner before the kill, re-registers it on the adopter after the adoption,
@@ -118,6 +125,12 @@
 #                                the wrong process.
 #   AEROSLS_FAILOVER_FAST=1      scale every wait down to seconds. Used by
 #                                the smoke; never for a real cluster.
+#   AEROSLS_FAILOVER_LEASE_ATTEMPTS
+#                                how many campaigns the step-11 lease-row
+#                                gate may drive before it accuses the
+#                                observer's RX path (default 3; 1 = the
+#                                pre-2026-09-25 single window, kept for the
+#                                smoke's control tooth).
 #   AEROSLS_LOG_DIR               where node<id>.log serial logs live
 #                                (default: cluster/). The smoke points this
 #                                at its scratch state dir.
@@ -160,6 +173,13 @@ if [ "$FAST" = "1" ]; then
 else
     POLL=2;   WAIT_NODES=240; WAIT_LEARN=30; WAIT_CKPT=60; WAIT_ADOPT=240; WAIT_HANDOFF=120; WAIT_OBSERVER=60; WAIT_BOOT=240; WAIT_CLAIM=240; WAIT_CONV=180; WAIT_MIGRATE=120; WAIT_TRANSFER=120; WAIT_LEASE=120
 fi
+# How many campaigns the step-11 lease-row gate may drive before it accuses
+# the observer's RX path (see step 11a). One acquire is one campaign; a
+# lost/slow hop costs a retry, a broken RX path (the migrate_norow tooth)
+# eats every attempt and still fails the gate.
+# AEROSLS_FAILOVER_LEASE_ATTEMPTS=1 restores the old single-window
+# behaviour (the smoke's migrate_lost1 control tooth pins that).
+LEASE_ATTEMPTS="${AEROSLS_FAILOVER_LEASE_ATTEMPTS:-3}"
 
 die()  { echo; echo "ABORT: $*" >&2; exit 2; }
 fail() { echo; echo "FAIL  $*"; exit 1; }
@@ -976,18 +996,91 @@ done
        the resurrected leader back up the 2-of-3 quorum IS reachable -- a no-win means
        the lease layer is broken (acquire inert or the vote exchange incomplete)."
 echo "   node $adopter holds the write lease for '$NAME'"
-echo "==> waiting for node $observer to LEARN the lease row (up to ${WAIT_LEASE}s)"
+# The row is created by the observer's RX path when the adopter's campaign
+# LANDS -- a packet hop, not a function call, so it can be delayed or lost
+# independently of the code under test. A single bounded wait cannot tell a
+# lost hop from a broken RX path, and the 2-node sibling guard paid for
+# learning that on 2026-09-25: in CI it failed this exact gate shape with
+# "never created a lease row" on a loaded runner while every other arm in
+# the same run passed, and both arms passed on the re-run of the same
+# commit. So the gate now RE-DRIVES the campaign: each attempt is a fresh
+# WAIT_LEASE window, and a re-drive is admitted only while the adopter is
+# answering AND still holds the write lease -- the exact state the first
+# acquire won in, so the re-drive is the same trigger, not a new scenario
+# (the shell `partition lease acquire` is documented as the only live
+# trigger, and partition_lease_trigger_election creates the row if missing
+# and re-campaigns). A hop that is merely lost/slow now costs a printed
+# retry instead of a RED.
+#
+# The tooth is intact: a genuinely broken RX path (the smoke's
+# migrate_norow) never creates the row, so every attempt fails it -- and
+# the FAIL below still says `never created a lease row`. The smoke pins
+# both sides of that: migrate_lost1->PASS (the first campaign is dropped
+# on the wire for the observer: the re-drive must rescue it) and the
+# migrate_lost1 attempts=1 control->FAIL (with the re-drive disabled the
+# same loss is still the gate's honest RED).
+echo "==> waiting for node $observer to LEARN the lease row (up to ${WAIT_LEASE}s, up to ${LEASE_ATTEMPTS} campaign attempt(s))"
 lease_init_obs=""
-deadline=$(( $(date +%s) + WAIT_LEASE ))
+attempt=0
+redrives=0
 while :; do
-    lease_init_obs="$(last_line "$OBS_LOG" "CONSENSUS] partition $PART_ID lease initialised")"
+    attempt=$((attempt + 1))
+    deadline=$(( $(date +%s) + WAIT_LEASE ))
+    while :; do
+        lease_init_obs="$(last_line "$OBS_LOG" "CONSENSUS] partition $PART_ID lease initialised")"
+        [ -n "$lease_init_obs" ] && break
+        [ "$(date +%s)" -ge "$deadline" ] && break
+        sleep "$POLL"
+    done
     [ -n "$lease_init_obs" ] && break
-    [ "$(date +%s)" -ge "$deadline" ] && break
-    sleep "$POLL"
+    [ "$attempt" -ge "$LEASE_ATTEMPTS" ] && break
+    # Evidence first: re-drive only while the acquire that won can be
+    # repeated. An adopter that stopped answering, or one that lost the
+    # leash it just held, is the lease layer regressing -- retrying that
+    # would paper over a real find, so the gate falls through to its FAIL.
+    if ! get200 "$ADP_PORT" /api/partitions; then
+        echo "   note: node $adopter is not answering /api/partitions; not re-driving the campaign"
+        break
+    fi
+    if ! holds_lease_row "$FETCH_BODY" "$NAME"; then
+        echo "   note: node $adopter no longer holds the write lease; not re-driving (the lease layer regressed -- this is not a lost hop)"
+        break
+    fi
+    echo "   note: no lease row on $observer after ${WAIT_LEASE}s -- re-driving the campaign (attempt $((attempt + 1)) of ${LEASE_ATTEMPTS})"
+    redrives=$((redrives + 1))
+    "$CTL" --host "localhost:$ADP_PORT" "${TOKEN_ARGS[@]}" \
+        shell partition lease acquire "$PART_ID" >/dev/null \
+        || echo "   note: the re-acquire returned non-zero; spending the remaining attempt(s) on the wait anyway"
 done
-[ -n "$lease_init_obs" ] || fail "node $observer never created a lease row for partition
-       $PART_ID (no 'partition $PART_ID lease initialised' in $OBS_LOG within ${WAIT_LEASE}s).
-       Without a row the absence of a restore on the resurrected node would be vacuous."
+if [ -z "$lease_init_obs" ]; then
+    # The FAIL must say which side of the hop is implicated, with the
+    # evidence the gate actually collected -- never blame the RX path for a
+    # walk it did not take.
+    if [ "$redrives" -gt 0 ]; then
+        hop_note="A lost/slow hop is ruled out: the campaign was re-driven ${redrives} time(s),
+       each time with the adopter still holding the write lease -- so the
+       observer's RX side was given fresh campaigns and still created no row.
+       The observer's lease RX path (the campaign's find-or-create on the
+       receiving side) is broken that way."
+    elif [ "$LEASE_ATTEMPTS" -le 1 ]; then
+        hop_note="The re-drive was disabled (AEROSLS_FAILOVER_LEASE_ATTEMPTS=$LEASE_ATTEMPTS),
+       so the gate spent its single window and nothing more (the smoke's
+       migrate_lost1 control runs this shape to pin that the re-drive is what
+       rescues a lost hop)."
+    else
+        hop_note="The campaign was NOT re-driven (the adopter stopped answering, or stopped
+       holding the lease), so this may be the lease layer rather than the RX hop."
+    fi
+    if get200 "$OBS_PORT" /api/health; then
+        s_note="The observer's HTTP server is answering, so the node is up and serving."
+    else
+        s_note="The observer's HTTP server is NOT answering either -- suspect the node, not the RX path."
+    fi
+    fail "node $observer never created a lease row for partition
+       $PART_ID (no 'partition $PART_ID lease initialised' in $OBS_LOG after
+       ${attempt} campaign attempt(s) of ${WAIT_LEASE}s each). Without a row the
+       absence of a restore on the resurrected node would be vacuous. ${hop_note} ${s_note}"
+fi
 echo "   $observer learned the lease row"
 
 # 11b. the migrate itself: adopter -> original leader (the destination step
