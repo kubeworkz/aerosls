@@ -3,6 +3,7 @@
 #include "cap.h"
 #include "kernel_io.h"
 #include "env_service.h"
+#include "env_console.h"
 
 #define CONSOLE_SVC_BUF 4096
 
@@ -71,6 +72,12 @@ void console_service_tick(void) {
          * reply CHAN_R also lives in the pid-0 table, but its messages are ENV
          * replies for env_service_create(), not console text — leave them. */
         if (env_service_reply_slot((uint16_t)s)) continue;
+        /* POSIX-Environments E6: an environment's console also lives in the
+         * pid-0 table, but its output is THAT ENVIRONMENT's, not the kernel's —
+         * env_console_tick() buffers it for the attach surface. Printing it
+         * here would put every tenant's output back on the shared serial
+         * transcript, which is exactly what E6 removes. */
+        if (env_console_kernel_slot((uint16_t)s)) continue;
 
         struct CapChannel* ch = 0;
         int kdir = 0;

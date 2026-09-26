@@ -821,10 +821,24 @@ jobs:
           mkfifo "$SER.in" "$SER.out" 2>/dev/null || true
           cat "$SER.out" > boot.log &
           CATPID=$!
+          # Host port: probed, never fixed. tests/free_port.sh allocates from
+          # AEROSLS_FREE_PORT_RANGE (default 32001-32020), deliberately outside
+          # the live REST band (node i = AEROSLS_HTTP_BASE+i; production 3001).
+          # A boot smoke squatting :3001 on the runner host is what made
+          # tests/webapp_served_check.sh compare a boot-check kernel's assets
+          # instead of the deployed instance's on 2026-09-24 -- probing cannot
+          # protect a port another guard trusts without probing. The port is
+          # also RESERVED until QEMU binds it (a per-port flock, held by a
+          # detached holder), so two QEMU steps on this runner cannot both
+          # probe the same port free and then collide on the bind.
+          PORT=$(bash tests/free_port.sh) || {
+            echo "FAILED: no free loopback port for the QEMU hostfwd (tests/free_port.sh)" >&2
+            exit 1
+          }
           qemu-system-x86_64 -cdrom sls_operating_system.iso \
               -drive id=disk,file=sls_storage.img,if=none,format=raw \
               -device nvme,drive=disk,serial=slsdev0 \
-              -netdev user,id=net0,hostfwd=tcp::3001-:3000 \
+              -netdev user,id=net0,hostfwd=tcp:127.0.0.1:$PORT-:3000 \
               -device e1000,netdev=net0,mac=52:54:00:12:34:01 \
               -display none -m 4G -smp 4 -boot d -no-reboot \
               -serial pipe:"$SER" 2>/dev/null &
@@ -835,13 +849,14 @@ jobs:
             kill "$CATPID" 2>/dev/null || true
             exit 1
           }
-          # The kernel's webapp listens on guest port 3000, forwarded to host
-          # 3001. Poll /api/health — the exact endpoint deploy.sh gates on —
-          # until it answers, qemu dies (crash), or the window runs out.
+          # The kernel's webapp listens on guest port 3000, forwarded to the
+          # probed host port above. Poll /api/health — the exact endpoint
+          # deploy.sh gates on — until it answers, qemu dies (crash), or the
+          # window runs out.
           healthy=0
           qemu_alive=1
           for i in $(seq 1 75); do
-            if curl -sf --max-time 2 http://localhost:3001/api/health > health.json 2>/dev/null; then
+            if curl -sf --max-time 2 http://127.0.0.1:$PORT/api/health > health.json 2>/dev/null; then
               healthy=1
               break
             fi
@@ -1134,10 +1149,24 @@ jobs:
           mkfifo "$SER.in" "$SER.out"
           cat "$SER.out" > decoder_boot.log &
           CATPID=$!
+          # Host port: probed, never fixed. tests/free_port.sh allocates from
+          # AEROSLS_FREE_PORT_RANGE (default 32001-32020), deliberately outside
+          # the live REST band (node i = AEROSLS_HTTP_BASE+i; production 3001).
+          # A boot smoke squatting :3001 on the runner host is what made
+          # tests/webapp_served_check.sh compare a boot-check kernel's assets
+          # instead of the deployed instance's on 2026-09-24 -- probing cannot
+          # protect a port another guard trusts without probing. The port is
+          # also RESERVED until QEMU binds it (a per-port flock, held by a
+          # detached holder), so two QEMU steps on this runner cannot both
+          # probe the same port free and then collide on the bind.
+          PORT=$(bash tests/free_port.sh) || {
+            echo "FAILED: no free loopback port for the QEMU hostfwd (tests/free_port.sh)" >&2
+            exit 1
+          }
           qemu-system-x86_64 -cdrom sls_operating_system.iso \
               -drive id=disk,file=sls_storage.img,if=none,format=raw \
               -device nvme,drive=disk,serial=slsdev0 \
-              -netdev user,id=net0,hostfwd=tcp::3001-:3000 \
+              -netdev user,id=net0,hostfwd=tcp:127.0.0.1:$PORT-:3000 \
               -device e1000,netdev=net0,mac=52:54:00:12:34:01 \
               -display none -m 4G -smp 4 -boot d -no-reboot \
               -serial pipe:"$SER" 2>/dev/null &
@@ -1149,7 +1178,7 @@ jobs:
           }
           healthy=0
           for i in $(seq 1 75); do
-            if curl -sf --max-time 2 http://localhost:3001/api/health >/dev/null 2>&1; then
+            if curl -sf --max-time 2 http://127.0.0.1:$PORT/api/health >/dev/null 2>&1; then
               healthy=1
               break
             fi
@@ -1170,7 +1199,7 @@ jobs:
             # would abort the step BEFORE the pass check runs. Empty body
             # fails the grep below with the endpoint named.
             body=$(curl -s --max-time 120 -X POST \
-              "http://localhost:3001/api/qemu/$ep" \
+              "http://127.0.0.1:$PORT/api/qemu/$ep" \
               -H "Authorization: Bearer $TOK") || true
             echo "$ep -> $body"
             echo "$body" | grep -q '"pass":"true"' || {

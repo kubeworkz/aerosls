@@ -53,11 +53,27 @@ Modes (written to <statedir>/mode by the smoke):
                    learn gate
     nockpt         node 2 learns but no checkpoint line flows -> guard
                    FAIL at the checkpoint gate
+    learnlost1     the FIRST announce's packet is LOST on the wire: node 2
+                   only ever sees the row on the owner's next periodic
+                   re-announce pass (~10 s later), so the create-announce
+                   gate must wait out another period and pass. Its control
+                   is the SAME mode with the re-drive disabled, which must
+                   still FAIL the gate
+    ckptlost1      the same loss one stream over: node 2 learns from the
+                   first announce, but the checkpoint frame carrying the
+                   row is lost for that pass and lands with the next one,
+                   so the checkpoint gate (a CKPT line AFTER the sync
+                   line) must wait out another period -> guard PASS (same
+                   control shape as learnlost1)
     nolease        the leader's `partition lease acquire` never takes (the
                    command succeeds, no row is held) -> guard FAIL at the
                    lease-held gate
     nolearnlease   node 2 never creates its lease row (the REQUEST_VOTE RX
                    path broken) -> guard FAIL at the lease-learn gate
+    leaselost1     the first campaign's packet is LOST on the wire: node 2
+                   only ever sees the row of the SECOND campaign, i.e. the
+                   guard's re-drive. A lost hop must not read as a broken
+                   RX path -> guard PASS (the re-drive gate)
     leasestrip     node 2 declares the death but never logs the MMU-LEASE
                    strip -> guard FAIL at the strip gate
     leaserestore   node 2 logs the strip AND then a restore (lease
@@ -115,6 +131,10 @@ leader_id = int(open(os.path.join(state, "leader")).read().strip())
 
 created = os.path.join(state, "created.json")
 lease = os.path.join(state, "lease.json")
+# The periodic re-announce's pass counter -- owned by the node that owns the
+# row, exactly like partition_reannounce_tick(). See its block below.
+reannounce = os.path.join(state, "reannounce")
+REANNOUNCE_PERIOD = 10.0   # models 1000 ticks ~= 10 s; see the block below
 logfile = os.path.join(logdir, f"node{node_id}.log")
 lock = threading.Lock()
 
@@ -122,6 +142,7 @@ transitioned = False
 flipped = False
 lease_held_leader = False
 lease_held_survivor = False
+campaign_term = 0        # one acquire = one campaign (leaselost1 reads it)
 
 
 def log(line):
@@ -137,6 +158,57 @@ def read_created():
         except ValueError:
             return None
     return None
+
+
+def read_epoch():
+    """The owner's re-announce pass counter (0 = no pass yet).
+
+    Retry-tolerant like read_created(): a torn or empty file means "not
+    yet", never an exception. A dead RX thread never logs its line, so a
+    reader that can raise is a verdict decided by timing (the CI false RED
+    of 2026-09-25, same rule).
+    """
+    if os.path.exists(reannounce):
+        try:
+            return int(open(reannounce).read().strip() or 0)
+        except ValueError:
+            return 0
+    return 0
+
+
+def next_reannounce():
+    """Block until one periodic pass AFTER the pass this node is reacting
+    to. max(..., 1): seeing the row before the owner has written pass 1 is
+    still the mutation announce, i.e. pass 1, not a pass of its own."""
+    at = max(read_epoch(), 1)
+    while read_epoch() <= at:
+        time.sleep(0.05)
+
+
+def read_lease():
+    # A half-arrived row is NOT a broken RX path. read_created()'s rule,
+    # applied to the lease row too: a partial read means "not yet", never
+    # an exception. The writer os.replace()s the row in whole (below), but
+    # the reader must not be what decides a verdict anyway -- the old
+    # `json.load(open(lease))` right after `os.path.exists(lease)` could
+    # catch the zero-byte window of a write and die with a JSONDecodeError,
+    # killing this thread. A dead RX thread never logs the row, so the
+    # guard read a racing reader as "the leader's REQUEST_VOTE RX path is
+    # broken" -- the CI false RED of 2026-09-25.
+    if os.path.exists(lease):
+        try:
+            return json.load(open(lease))
+        except ValueError:
+            return None
+    return None
+
+
+def lease_term(row):
+    """The campaign term of a lease row (the writer's acquire counter)."""
+    try:
+        return int(row.get("term", 1))
+    except (AttributeError, TypeError, ValueError):
+        return 1
 
 
 def learn_line(row, owner):
@@ -167,12 +239,65 @@ def leader_alive():
         return False
 
 
+# ─── Periodic re-announce: the owner's pass counter ──────────────────────
+# Announce-on-change converges the nodes that were up for a change; a node
+# whose packet was LOST on the wire waits for the next mutation -- unless
+# the owner's periodic re-announce reaches it. partition_reannounce_tick()
+# (kernel/partition.c, called from the BSP sweep) re-broadcasts the rows a
+# node OWNS every 1000 ticks (~10 s at the nominal 100 Hz sweep), and every
+# node does it for its own rows. The fake models exactly that as a PASS
+# COUNTER written by the OWNER while it still holds the row: pass 1 is the
+# one-shot mutation announce, pass 2+ are the periodic ones. The followers'
+# lost-packet modes (learnlost1, ckptlost1) key off it, so "the first packet
+# was lost, the re-announce re-delivered it" is a real second event owned by
+# the SENDER -- not a receiver-side sleep, which would model the wrong node
+# and would keep delivering after the owner died.
+#
+# Why 10 s: that is the kernel's own period (PARTITION_REANNOUNCE_TICKS
+# 1000). The smoke's FAST guard windows are 6 s, so pass 2 lands in the
+# guard's SECOND window -- later than one window (the first genuinely times
+# out: that is the tooth) and comfortably inside two, with seconds of
+# margin at both edges so a loaded host cannot move it out. Do not shorten
+# it below one window: the lost-packet modes would stop modelling a loss at
+# all and their teeth would go vacuous (the smokes assert the guard printed
+# its re-drive precisely so that cannot pass unnoticed).
+if role == "leader":
+
+    def reannounce_thread():
+        epoch = 0
+        last = 0.0
+        while True:
+            row = read_created()
+            if not row or int(row.get("owner_node") or 0) != node_id:
+                epoch = 0   # nothing owned: the tick broadcasts nothing
+                time.sleep(0.05)
+                continue
+            now = time.monotonic()
+            if epoch == 0 or now - last >= REANNOUNCE_PERIOD:
+                epoch += 1
+                last = now
+                # Whole-write (tmp + os.replace), the same rule the lease row
+                # follows: a reader sees a pass NUMBER or the previous one,
+                # never a torn file.
+                tmp = "%s.tmp%d" % (reannounce, os.getpid())
+                with open(tmp, "w") as f:
+                    f.write(str(epoch))
+                os.replace(tmp, reannounce)
+            time.sleep(0.05)
+
+    threading.Thread(target=reannounce_thread, daemon=True).start()
+
+
 # ─── RX thread: learn the created row, log learn + checkpoint ─────────────
 # The guard creates the partition AFTER the fakes are up, so the learn
 # cannot be logged at process start: the follower's announce RX fires when
 # the row arrives on the wire (here: when created.json appears). nolearn
 # never learns (the learn gate must bite); nockpt learns but never logs the
-# checkpoint RX (the checkpoint gate must bite).
+# checkpoint RX (the checkpoint gate must bite). learnlost1 drops the FIRST
+# announce's packet and learns on the owner's next periodic re-announce --
+# the guard's second window, so its announce gate must re-drive; ckptlost1
+# drops the checkpoint frame carrying the row for that same pass, which
+# lands with the next one, so its checkpoint gate must re-drive too.
 learned = False
 
 
@@ -187,11 +312,30 @@ def rx_thread():
         row = read_created()
         if row is None:
             time.sleep(0.05)
+    if mode == "learnlost1":
+        # The first announce's packet never landed (a lost HOP, not a broken
+        # RX path): this node only ever sees what the owner's periodic
+        # re-announce carries. learned stays False until then, so the row is
+        # not served either -- the guard must spend another window, which is
+        # exactly what its re-drive is for. With a single bounded window the
+        # guard FAILed here with "never learned", a message that accuses
+        # partition_sync_upsert for a hop that had not landed.
+        next_reannounce()
     if row and mode != "nolearn":
         log(learn_line(row, leader_id))
         learned = True   # learned regardless of nockpt: the learn gate
                          # must pass, and the checkpoint gate is the log
                          # line below, which nockpt skips.
+        if mode == "ckptlost1":
+            # The checkpoint frame carrying the row was lost for the pass
+            # that delivered the announce; the next periodic broadcast
+            # carries it (the real leader's state tree goes out every 100
+            # ticks -- the fake collapses the two periods onto the one clock
+            # the guard's windows straddle, which can only make the guard's
+            # job harder, never easier). The guard's checkpoint gate wants a
+            # CKPT line AFTER the sync line, so it must wait out another
+            # period too.
+            next_reannounce()
         if mode != "nockpt":
             log("[DSPP-CKPT] RX: COMPLETE seq=1000 (448 bytes)")
 
@@ -203,24 +347,43 @@ threading.Thread(target=rx_thread, daemon=True).start()
 # campaign arrives (here: when lease.json appears). The guard requires
 # `[CONSENSUS] partition N lease initialised` in the survivor's log BEFORE
 # the kill -- without a row, the absence of a restore would be vacuous.
-# nolearnlease never logs it (the lease-learn gate must bite). The leader
-# side creates its own row on `partition lease acquire` (below).
+# nolearnlease never logs it (the lease-learn gate must bite). leaselost1
+# logs it only for the SECOND campaign: the first one's packet was lost on
+# the wire, which is what the guard's re-drive gate must survive. The
+# leader side creates its own row on `partition lease acquire` (below).
 def lease_rx_thread():
     global lease_held_survivor
     if role != "follower":
         return
-    # Life-bounded: the guard's lease phase runs after its own
-    # cluster-forming and learn gates.
-    while not os.path.exists(lease):
-        time.sleep(0.05)
-    if os.path.exists(lease) and mode != "nolearnlease":
-        # A lease row exists but the survivor does NOT hold it -- the
-        # global lease_held_survivor stays False (default).
-        log("[CONSENSUS] partition %s lease initialised (FOLLOWER, term=0)."
-            % json.load(open(lease)).get("partition_id", "1"))
-        # A lease row exists but the survivor does NOT hold it. The leader
-        # does (its own acquire below) -- the row here is the follower's
-        # mirror of the same partition's lease state.
+    # Life-bounded, and retry-tolerant (read_lease): the guard's lease
+    # phase runs after its own cluster-forming and learn gates, and a read
+    # that lands mid-write must retry, not kill this thread.
+    row = None
+    while row is None:
+        row = read_lease()
+        if row is None:
+            time.sleep(0.05)
+    if mode == "nolearnlease":
+        return   # the lease-learn gate must bite: no row is ever RXed
+    if mode == "leaselost1" and lease_term(row) < 2:
+        # The first campaign's packet never landed (a lost HOP, not a
+        # broken RX path): this node only ever sees the row of the second
+        # campaign -- the guard's re-drive. With a single bounded wait the
+        # guard FAILed here with "never created a lease row" (the CI false
+        # RED of 2026-09-25), so this mode is the control for the re-drive
+        # gate: a lost hop must PASS, a broken RX path (nolearnlease) must
+        # still FAIL.
+        while True:
+            row = read_lease()
+            if row is not None and lease_term(row) >= 2:
+                break
+            time.sleep(0.05)
+    # A lease row exists but the survivor does NOT hold it -- the global
+    # lease_held_survivor stays False (default). The leader does (its own
+    # acquire below) -- the row here is the follower's mirror of the same
+    # partition's lease state.
+    log("[CONSENSUS] partition %s lease initialised (FOLLOWER, term=0)."
+        % row.get("partition_id", "1"))
 
 
 threading.Thread(target=lease_rx_thread, daemon=True).start()
@@ -392,17 +555,28 @@ class H(http.server.BaseHTTPRequestHandler):
                 # hold (the command succeeds -- so the guard's acquire
                 # shell step does not die -- but no row is held, and the
                 # lease-held gate must bite).
+                #
+                # Each acquire is one CAMPAIGN: the row carries the term,
+                # so the RX side can tell a re-driven campaign from the
+                # first one (leaselost1). The row is written whole
+                # (os.replace): the RX side reads a ROW, never a half-arrived
+                # packet, which is the whole point of a wire hop model.
                 pid = command[len("partition lease acquire "):].strip()
                 if mode != "nolease":
-                    with open(lease, "w") as f:
-                        json.dump({"partition_id": int(pid), "term": 1},
-                                  f, separators=(",", ":"))
+                    global lease_held_leader, campaign_term
                     with lock:
-                        global lease_held_leader
+                        campaign_term += 1
+                        term = campaign_term
+                    tmp = "%s.tmp%d" % (lease, os.getpid())
+                    with open(tmp, "w") as f:
+                        json.dump({"partition_id": int(pid), "term": term},
+                                  f, separators=(",", ":"))
+                    os.replace(tmp, lease)
+                    with lock:
                         lease_held_leader = True
                     log("[CONSENSUS] partition %s lease initialised (FOLLOWER, term=0)." % pid)
-                    log("[CONSENSUS] partition %s: node %u campaigning for write lease, term 1." % (pid, node_id))
-                    log("[CONSENSUS] partition %s: quorum stable, node %u elected LEADER (write lease) for term 1." % (pid, node_id))
+                    log("[CONSENSUS] partition %s: node %u campaigning for write lease, term %d." % (pid, node_id, term))
+                    log("[CONSENSUS] partition %s: quorum stable, node %u elected LEADER (write lease) for term %d." % (pid, node_id, term))
                 self._json(200, {"ok": "true", "recognized": "true",
                                  "output": f"lease acquire {pid} issued"})
             else:

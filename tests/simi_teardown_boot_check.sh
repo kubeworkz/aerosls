@@ -110,7 +110,7 @@ fi
 # QEMU die on "Could not set up host forwarding rule" on 2026-09-13). QEMU's
 # stderr is kept so a failed start names its cause instead of looking like a
 # grub failure.
-PORT=$(bash tests/free_port.sh) || { echo "ABORT: no free port in 3001..3020" >&2; exit 2; }
+PORT=$(bash tests/free_port.sh) || { echo "ABORT: no free loopback port for the QEMU hostfwd (see tests/free_port.sh)" >&2; exit 2; }
 BASE="http://127.0.0.1:$PORT"
 qemu_err() { [ -s "$W/qemu.err" ] && sed 's/^/      qemu: /' "$W/qemu.err" >&2; }
 

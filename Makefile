@@ -162,6 +162,7 @@ X86_C_SRC   = kernel/kernel.c arch/x86/idt.c arch/x86/gdt.c arch/x86/vga.c kerne
               kernel/boot_params.c kernel/node_reset.c \
               kernel/console.c kernel/console_service.c \
               kernel/env_service.c \
+              kernel/env_console.c \
               kernel/boot_image.c \
               kernel/loader.c \
               kernel/simi_x86.c \
@@ -614,12 +615,28 @@ x86-iso: $(X86_BIN)
 	              -o $(X86_ISO) isodir
 	rm -rf isodir
 
+# Host port for `make x86-run`'s REST forward (guest 3000). `?=` so a host
+# that also runs the CI runner, or the live cluster, can move it out of the
+# way: 3001 is node 1's REST port AND the production backend, and a QEMU
+# sitting there is not a failure -- it makes whatever trusts that port without
+# probing test the wrong machine (tests/webapp_served_check.sh did exactly that
+# on 2026-09-24). Test boots never use this port: they allocate from
+# tests/free_port.sh's band (AEROSLS_FREE_PORT_RANGE), which refuses an overlap
+# with 3001 by construction.
+X86_HTTP_PORT ?= 3001
+
 x86-run: x86-iso
 	@if [ ! -f sls_storage.img ]; then qemu-img create -f raw sls_storage.img 10G; fi
+	@if timeout 2 bash -c 'exec 3<>"/dev/tcp/127.0.0.1/$(X86_HTTP_PORT)"' 2>/dev/null; then \
+		echo "x86-run: host port $(X86_HTTP_PORT) already has a listener — refusing" >&2; \
+		echo "         rather than colliding (node 1's REST API and the production" >&2; \
+		echo "         backend live on 3001). Move it: X86_HTTP_PORT=<free port> make x86-run" >&2; \
+		exit 1; \
+	fi
 	qemu-system-x86_64 -cdrom $(X86_ISO) \
 		-drive id=disk,file=sls_storage.img,if=none,format=raw \
 		-device nvme,drive=disk,serial=slsdev0 \
-		-netdev user,id=net0,hostfwd=tcp::3001-:3000 \
+		-netdev user,id=net0,hostfwd=tcp::$(X86_HTTP_PORT)-:3000 \
 		-device e1000,netdev=net0,mac=52:54:00:12:34:01 \
 		-vga std -display gtk \
 		-m 4G -smp 4 -boot d -serial file:sls_kernel_debug.log

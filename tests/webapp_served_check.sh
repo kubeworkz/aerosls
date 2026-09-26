@@ -29,6 +29,28 @@
 # cluster, which is why this carries the same GUARD-KIND: runtime marker as
 # the cluster guards.
 #
+# ─── The port this guard trusts, and why nothing else may bind it ──────────
+# This guard cannot tell a deployed kernel from a test boot: both answer
+# /api/health, and a boot-check kernel built from this same commit serves the
+# same committed bundle. So a squatter on the URL below does not fail loudly --
+# it makes this guard judge the wrong machine, which can read as a PASS against
+# an unrelated boot or as a FAIL against a guest that was still starting.
+# That is the 2026-09-24 CI failure: a local QEMU held :3001 (a boot check's
+# free-port scan handed it production's port), and this guard, running on the
+# same host, fetched from it instead of from the deployed instance. Nothing in
+# the kernel, this guard, or the commit was wrong.
+#
+# The defence is at the source, not here: test boots must not be able to reach
+# the live band. Boot checks allocate their QEMU hostfwd from
+# tests/free_port.sh (AEROSLS_FREE_PORT_RANGE, default 32001-32020, and a band
+# that overlaps 3001 or AEROSLS_HTTP_BASE+1..+CLUSTER_NODE_MAX is refused; the
+# port is also reserved until QEMU binds it, so two concurrent guard runs
+# cannot collide on the bind), CI's
+# inline QEMU steps allocate the same way, and `make x86-run` refuses a taken
+# X86_HTTP_PORT instead of colliding. tests/guard_port_band_check.sh enforces
+# the whole rule on every push. When the instance you mean is not on 3001, name
+# it: SERVED_URL=... or --url.
+#
 # GUARD-KIND: runtime (needs a LIVE deployed kernel instance, never a build)
 #
 # Usage:
@@ -62,6 +84,8 @@ command -v python3 >/dev/null 2>&1 || { echo "ABORT: python3 not found" >&2; exi
 if ! curl -sf --max-time 5 "$URL/" >/dev/null 2>&1; then
     echo "ABORT: no live kernel instance answering $URL/ — this guard needs a" >&2
     echo "       deployed kernel (post-restart on the server), not a build." >&2
+    echo "       To point it at a different instance:" >&2
+    echo "           SERVED_URL=http://127.0.0.1:<port> tests/webapp_served_check.sh" >&2
     exit 2
 fi
 

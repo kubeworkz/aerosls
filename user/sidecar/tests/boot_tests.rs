@@ -154,6 +154,72 @@ fn boot_mounts_and_runs_init() {
     t.join().unwrap();
 }
 
+/// POSIX-Environments E6: the sidecar announces its own environment index and
+/// pid on its own console, before anything else in that stream. This is the
+/// in-band identity the E6 attach guard asserts (tests/env_console_attach_check.sh)
+/// — the environment's own account of which environment it is, which is the one
+/// claim a crossed pair of consoles cannot fake, because the kernel writes an
+/// environment's bytes into that environment's console and a reader holding
+/// another index's stream is looking at the wrong console.
+#[test]
+fn identity_is_announced_first_on_its_own_console() {
+    let (fake, client) = FakeKernel::new(image(), 1);
+    let t = boot_driver(fake);
+
+    let caps = BootCaps::new(0, 0, 0, None, Some(0), Some(0), None, None)
+        .with_identity(2, 13);
+    let console = Arc::new(CharNode::console());
+    let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
+        .expect("boot");
+
+    // boot() has not run the scheduler yet: these are the environment's first
+    // bytes, and they are already the announcement.
+    assert_eq!(
+        console.console_io().output(),
+        b"[env-id] index=2 pid=13\n",
+        "the announcement is the first bytes of the environment's own stream"
+    );
+
+    // It is a prefix, not a substitute: init's own output follows it.
+    booted.run(200);
+    let out = console.console_io().output();
+    assert!(
+        out.starts_with(b"[env-id] index=2 pid=13\n"),
+        "the announcement is still first once init has run"
+    );
+    assert!(
+        String::from_utf8_lossy(&out).contains("init says hi"),
+        "init's output follows the announcement"
+    );
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
+
+/// A boot with no identity (the host constructor — nothing for a sidecar to
+/// announce) stays silent, so a sidecar that is not an environment is not made
+/// to look like environment 0. The same property keeps every pre-E6 host
+/// test's console expectations exact.
+#[test]
+fn no_identity_means_no_announcement() {
+    let (fake, client) = FakeKernel::new(image(), 1);
+    let t = boot_driver(fake);
+
+    let caps = BootCaps::new(0, 0, 0, None, Some(0), Some(0), None, None);
+    let console = Arc::new(CharNode::console());
+    let mut booted = boot(client.clone(), &caps, console.clone(), FakeAlloc(client.clone()))
+        .expect("boot");
+    booted.run(200);
+
+    assert!(
+        !String::from_utf8_lossy(&console.console_io().output()).contains("[env-id]"),
+        "a sidecar with no identity announces nothing"
+    );
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
+
 /// Network sidecar absent: the boot script reaches the `netcheck` gate,
 /// which exits 1 (no NET_INFO handshake ever ran, so NETBOOT_OK is 0),
 /// and the fail-fast runner aborts the script before nettest or the
@@ -1573,12 +1639,14 @@ fn cloexec_prevents_pipe_fd_leak_in_pipeline() {
 }
 
 fn build_bib(caps: &[(&str, u16, u16, u64, u64, u32)]) -> Vec<u8> {
-    // v2 header: 32 bytes through total_len, then flags u32 + reserved u32
-    // (POSIX-Environments E1). The version comes from the PARSER's own
-    // constant, so a future bump cannot leave this builder emitting a header
-    // `BootInfo::from_raw` rejects — which is exactly what a hardcoded `1`
-    // did when E1 bumped the format.
-    const HEADER_LEN: usize = 40;
+    // v3 header: 32 bytes through total_len, then flags u32 (POSIX-Environments
+    // E1) + own_pid u32 + own_index u32 + reserved u32 (POSIX-Environments E6).
+    // The version comes from the PARSER's own constant, so a future bump cannot
+    // leave this builder emitting a header `BootInfo::from_raw` rejects — which
+    // is exactly what a hardcoded `1` did when E1 bumped the format. It has
+    // already earned its keep once more: this builder needed the two extra
+    // words E6 added, and the version followed on its own.
+    const HEADER_LEN: usize = 48;
     let mut b = Vec::new();
     b.extend_from_slice(b"AERSLSB1");
     b.extend_from_slice(&aerosls_proto::bootinfo::BOOT_INFO_VERSION.to_le_bytes());
@@ -1592,6 +1660,8 @@ fn build_bib(caps: &[(&str, u16, u16, u64, u64, u32)]) -> Vec<u8> {
             .sum::<usize>();
     b.extend_from_slice(&(total as u32).to_le_bytes()); // total_len
     b.extend_from_slice(&0u32.to_le_bytes()); // flags (0 = not the unified boot)
+    b.extend_from_slice(&0u32.to_le_bytes()); // own_pid   (v3)
+    b.extend_from_slice(&0u32.to_le_bytes()); // own_index (v3)
     b.extend_from_slice(&0u32.to_le_bytes()); // reserved
     for (name, ty, rights, base, len, slot) in caps {
         b.extend_from_slice(&(name.len() as u16).to_le_bytes());

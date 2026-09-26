@@ -913,8 +913,15 @@ this makes it a machine.
    "NVMe unavailable": the >4 GiB BAR degradation would otherwise turn
    every run into a no-op-shaped pass. `GUARD-KIND: build` — it needs a
    built ISO and QEMU, so source-only runners skip it legitimately and
-   kernel-guards/deploy run it for real. Its port auto-advances
-   (3001..3020) so it cannot collide with a live node on a deploy host.
+   kernel-guards/deploy run it for real. Its port comes from
+   `tests/free_port.sh`, whose band (`AEROSLS_FREE_PORT_RANGE`, default
+   32001-32020) is outside the live REST band by construction and refused
+   outright if it overlaps it, so it can neither collide with a live node on
+   a deploy host nor squat the 3001 that `tests/webapp_served_check.sh` and
+   CI's inline smokes trust (2026-09-24). The allocation is held reserved
+   (per-port lock file, released once QEMU binds the port) so two concurrent
+   guard runs cannot both probe the same port free and then collide on the
+   bind.
 2. **The teeth.** `tests/tcache_roundtrip_smoke.sh` is source-only and
    runs on EVERY push (verify job, via run_source_smokes.sh): it feeds
    the guard's --replay mode a well-formed artifact set and asserts the

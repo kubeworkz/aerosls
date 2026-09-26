@@ -76,7 +76,7 @@ CATPID=$!
 # Host port: the first free loopback one, never a fixed number (the deploy gate
 # runs sibling checks while live cluster nodes hold 3000+i; tests/free_port.sh
 # is the repo's shared allocator).
-PORT=$(bash tests/free_port.sh) || { echo "ABORT: no free port in 3001..3020" >&2; exit 2; }
+PORT=$(bash tests/free_port.sh) || { echo "ABORT: no free loopback port for the QEMU hostfwd (see tests/free_port.sh)" >&2; exit 2; }
 BASE="http://127.0.0.1:$PORT"
 W="$(mktemp -d)"
 qemu_err() { [ -s "$W/qemu.err" ] && sed 's/^/      qemu: /' "$W/qemu.err" >&2; }
@@ -200,7 +200,7 @@ marker "init was released by the sidecar creator (PROC_HELD -> PROC_SUSPENDED)" 
 # written whole. init's HAVING READ the flag stays asserted, from the other
 # side: Phase 3 requires the POSIX sidecar and the network/e1000 drivers to be
 # UNSPAWNED, which is exactly what reading UNIFIED makes init do.
-marker "the kernel stamped the BIB's UNIFIED flag into every sidecar's boot info block" "[E1] BIB v2 flags=0x1 (UNIFIED)"
+marker "the kernel stamped the BIB's UNIFIED flag into every sidecar's boot info block" "[E1] BIB v3 flags=0x1 (UNIFIED)"
 marker "the kernel owns the console in this boot (input forwarding off)" "[CONSOLE] sidecar input forwarding disabled"
 
 # ── Phase 3: device ownership — the hardware half stays unspawned ───────────

@@ -6,14 +6,16 @@
 //! ```text
 //! offset  size  field
 //! 0       8     magic         "AERSLSB1"
-//! 8       2     version       = 2
+//! 8       2     version       = 3
 //! 10      2     cap_count
 //! 12      8     budget_bytes
 //! 20      8     stack_top
 //! 28      4     total_len     (whole BIB, for bounds checking)
 //! 32      4     flags         (BOOT_INFO_FLAG_*; 0 on a non-unified boot)
-//! 36      4     reserved      (= 0; keeps caps[] 8-byte aligned)
-//! 40      n     caps[]        { name_len u16, name UTF-8,
+//! 36      4     own_pid       (this sidecar's pid; 0 = no identity)
+//! 40      4     own_index     (its environment index; 0 = not an environment)
+//! 44      4     reserved      (= 0; keeps caps[] 8-byte aligned)
+//! 48      n     caps[]        { name_len u16, name UTF-8,
 //!                               slot u16, ty u8, rights u8,
 //!                               base u64, len u64 }
 //! ```
@@ -27,6 +29,18 @@
 //! both sides (kernel/cap.c writes, this parser reads) ship in the same boot
 //! image, so no version 1 BIB is ever parsed by a version 2 reader.
 //!
+//! version 3 (POSIX-Environments E6) adds `own_pid`/`own_index` and the
+//! `ENV_CONSOLE` flag: the sidecar's OWN identity, which it cannot otherwise
+//! observe — the cap table below names capabilities ("console", "budget"),
+//! never the sidecar, so `aerosls.posix.2` was a name only the kernel knew. A
+//! sidecar whose console is an environment console announces the pair on that
+//! console at boot (user/sidecar/src/boot.rs), which is E6's in-band
+//! self-report: the attach surface's last gap is a *consistent* crossing of the
+//! two consoles' addressing, where every interaction through an address still
+//! looks self-consistent, so only something the environment emits about itself
+//! can expose it. It was version 2's `reserved` word plus one new word, and the
+//! version was bumped with it rather than reusing the word silently.
+//!
 //! `total_len` is a small extension over the Phase 2 doc's illustrative
 //! layout: without it, a malformed `name_len` (u16, unbounded) could make the
 //! parser read past the kernel's allocation. With it, every read is checked.
@@ -36,7 +50,7 @@
 use core::str;
 
 pub const BOOT_INFO_MAGIC: [u8; 8] = *b"AERSLSB1";
-pub const BOOT_INFO_VERSION: u16 = 2;
+pub const BOOT_INFO_VERSION: u16 = 3;
 pub const MAX_BOOT_CAPS: usize = 16;
 
 /// POSIX-Environments E1: this sidecar was created by the UNIFIED boot. The
@@ -45,6 +59,18 @@ pub const MAX_BOOT_CAPS: usize = 16;
 /// sidecar must not assume the Phase-5 posture — where the sidecar world *is*
 /// the boot and owns the hardware capabilities.
 pub const BOOT_INFO_FLAG_UNIFIED: u32 = 1 << 0;
+
+/// POSIX-Environments E6: this sidecar's console is an ENVIRONMENT console —
+/// the kernel registered it with the per-environment console registry, so an
+/// attach surface serves it. It is the precondition of `own_index`/`own_pid`
+/// (see `identity()`): the two identity words are filled in for every sidecar
+/// that has a name, but only a sidecar with an environment console announces
+/// them, because an announcement is a claim about a console somebody can attach
+/// to. Without the flag, "environment 0" (the system POSIX sidecar
+/// `aerosls.posix.0`, whose console is the kernel transcript) and "not an
+/// environment at all" (`aerosls.init.0`, `drv.ramdisk.0`) would be the same
+/// statement.
+pub const BOOT_INFO_FLAG_ENV_CONSOLE: u32 = 1 << 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BootErr {
@@ -96,9 +122,24 @@ pub struct BootInfo<'a> {
     pub stack_top: u64,
     pub n_caps: usize,
     pub caps: [BootCap<'a>; MAX_BOOT_CAPS],
+    /// v3 (E6): the pid the kernel gave THIS sidecar. 0 on a BIB that carried
+    /// no identity (the host sim's `BootCaps::new`). It is filled in for every
+    /// named sidecar; whether it is ANNOUNCED is `identity()`'s business (the
+    /// pair with `BOOT_INFO_FLAG_ENV_CONSOLE`).
+    pub own_pid: u32,
+    /// v3 (E6): this sidecar's environment index, parsed by the kernel out of
+    /// its own registry name (`aerosls.posix.<index>`) with the SAME function
+    /// the per-environment console registry uses. It is 0 both for a sidecar
+    /// whose name is not an environment's name and for the system POSIX sidecar
+    /// `aerosls.posix.0` — an index, not a flag: "environment 0" is a real
+    /// environment (the E3 boot spawn). What separates those two cases is
+    /// `BOOT_INFO_FLAG_ENV_CONSOLE`, which is why the announcement is keyed on
+    /// that flag rather than on this index being nonzero.
+    pub own_index: u32,
 }
 
-const HEADER_LEN: usize = 40;
+/// v3 header: 40 bytes through `flags`, then own_pid + own_index + reserved.
+const HEADER_LEN: usize = 48;
 /// Fixed cap-entry bytes after the name: slot/ty/rights (4) + base/len (16).
 /// (Name length is variable.) Used by the test's BIB builder.
 #[cfg(test)]
@@ -127,6 +168,8 @@ impl<'a> BootInfo<'a> {
         let stack_top = le_u64(p, 20);
         let total_len = le_u32(p, 28) as usize;
         let flags = le_u32(p, 32);
+        let own_pid = le_u32(p, 36);
+        let own_index = le_u32(p, 40);
         if total_len < HEADER_LEN {
             return Err(BootErr::TooShort);
         }
@@ -189,6 +232,8 @@ impl<'a> BootInfo<'a> {
             stack_top,
             n_caps: cap_count,
             caps,
+            own_pid,
+            own_index,
         })
     }
 
@@ -208,6 +253,28 @@ impl<'a> BootInfo<'a> {
     /// Phase-5 boot, so a sidecar that does not care behaves as before.
     pub fn is_unified(&self) -> bool {
         self.flags & BOOT_INFO_FLAG_UNIFIED != 0
+    }
+
+    /// POSIX-Environments E6: is this sidecar's console an ENVIRONMENT console
+    /// (one the attach surface serves)? See `BOOT_INFO_FLAG_ENV_CONSOLE`.
+    pub fn is_env_console(&self) -> bool {
+        self.flags & BOOT_INFO_FLAG_ENV_CONSOLE != 0
+    }
+
+    /// POSIX-Environments E6: this sidecar's own identity `(index, pid)` — the
+    /// pair it announces on its own console at boot — or `None` when it has no
+    /// identity to announce: `own_pid` 0 (a pre-v3 BIB or the host sim's
+    /// constructor) or no environment console (see
+    /// `BOOT_INFO_FLAG_ENV_CONSOLE`). This is the one thing a sidecar can say
+    /// about itself that the kernel did not learn from what the sidecar did: it
+    /// is handed to the sidecar at boot, so announcing it is a claim about the
+    /// environment, not a read-back of the console the claim travels on.
+    pub fn identity(&self) -> Option<(u32, u32)> {
+        if self.own_pid == 0 || !self.is_env_console() {
+            None
+        } else {
+            Some((self.own_index, self.own_pid))
+        }
     }
 }
 
@@ -246,10 +313,19 @@ mod tests {
     use std::vec::Vec;
 
     fn build_bib(caps: &[(&str, u16, u16, u64, u64)]) -> Vec<u8> {
-        build_bib_flags(caps, 0)
+        build_bib_all(caps, 0, 0, 0)
     }
 
     fn build_bib_flags(caps: &[(&str, u16, u16, u64, u64)], flags: u32) -> Vec<u8> {
+        build_bib_all(caps, flags, 0, 0)
+    }
+
+    fn build_bib_all(
+        caps: &[(&str, u16, u16, u64, u64)],
+        flags: u32,
+        own_pid: u32,
+        own_index: u32,
+    ) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(&BOOT_INFO_MAGIC);
         b.extend_from_slice(&BOOT_INFO_VERSION.to_le_bytes());
@@ -263,7 +339,9 @@ mod tests {
                 .sum::<usize>();
         b.extend_from_slice(&(total as u32).to_le_bytes());
         b.extend_from_slice(&flags.to_le_bytes()); // v2: boot-context flags
-        b.extend_from_slice(&0u32.to_le_bytes()); // v2: reserved
+        b.extend_from_slice(&own_pid.to_le_bytes()); // v3: own pid
+        b.extend_from_slice(&own_index.to_le_bytes()); // v3: own env index
+        b.extend_from_slice(&0u32.to_le_bytes()); // v3: reserved
         for (name, ty, rights, base, len) in caps {
             b.extend_from_slice(&(name.len() as u16).to_le_bytes());
             b.extend_from_slice(name.as_bytes());
@@ -310,6 +388,47 @@ mod tests {
         assert!(uni.is_unified());
         // ...and the caps after the new header fields still parse.
         assert_eq!(uni.find_cap(2, "console").unwrap().rights, 0x7);
+    }
+
+    #[test]
+    fn identity_survives_the_round_trip() {
+        // E6: the sidecar's own index/pid ride in the header, so a sidecar can
+        // announce them without asking the kernel anything — the property the
+        // attach surface's last gap needs (see the module docs).
+        let bib = build_bib_all(
+            &[("console", 2, 0x7, 0, 0)],
+            BOOT_INFO_FLAG_ENV_CONSOLE,
+            13,
+            2,
+        );
+        let info = unsafe { BootInfo::from_raw(bib.as_ptr()) }.unwrap();
+        assert_eq!(info.own_pid, 13);
+        assert_eq!(info.own_index, 2);
+        assert!(info.is_env_console());
+        assert_eq!(info.identity(), Some((2, 13)));
+        // ...and the caps still parse after the wider header.
+        assert_eq!(info.n_caps, 1);
+        assert_eq!(info.find_cap(2, "console").unwrap().rights, 0x7);
+
+        // A BIB that named no identity says so, rather than inventing pid 0
+        // as an identity (index 0 alone is a real environment — `aerosls.posix.0`).
+        let plain = build_bib(&[("console", 2, 0x7, 0, 0)]);
+        let plain = unsafe { BootInfo::from_raw(plain.as_ptr()) }.unwrap();
+        assert_eq!(plain.own_pid, 0);
+        assert_eq!(plain.identity(), None);
+
+        // And the flag is what gates the announcement, not the index: a sidecar
+        // whose name IS an environment's but whose console is the kernel
+        // transcript (`aerosls.posix.0`, the E3 boot spawn) carries index 0 and
+        // no environment console — silence, which is NOT environment 0 being
+        // announced. Both words are still reported, so a reader can tell the
+        // two apart.
+        let boot_spawn = build_bib_all(&[("console", 2, 0x7, 0, 0)], 0, 13, 0);
+        let boot_spawn = unsafe { BootInfo::from_raw(boot_spawn.as_ptr()) }.unwrap();
+        assert_eq!(boot_spawn.own_pid, 13);
+        assert_eq!(boot_spawn.own_index, 0);
+        assert!(!boot_spawn.is_env_console());
+        assert_eq!(boot_spawn.identity(), None);
     }
 
     #[test]
