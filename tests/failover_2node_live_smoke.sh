@@ -119,9 +119,9 @@
 # The same rule now covers the two PRE-KILL learn gates, because an announce
 # is a hop too -- and there the re-drive is the kernel's OWN periodic
 # re-announce: partition_reannounce_tick() re-broadcasts the rows a node OWNS
-# every 1000 ticks (~10 s), and no shell command fires it (user/shell.c's
-# live partition triggers are create/list/assign/destroy/pause/resume/lease
-# acquire/migrate). The guard may wait out up to
+# every 1000 ticks (~10 s), and no shell command fires it (user/shell.c has
+# no announce command at all: create/list/assign/destroy/pause/resume/lease
+# acquire/migrate plus quota bookkeeping). The guard may wait out up to
 # AEROSLS_FAILOVER_ANNOUNCE_ATTEMPTS fresh windows per gate, each re-drive
 # admitted only while the leader still answers AND still holds the row. The
 # teeth below pin both sides of it: learnlost1/ckptlost1 model the lost

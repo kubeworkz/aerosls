@@ -94,9 +94,10 @@
 # announce waits for the owner's next periodic re-announce --
 # partition_reannounce_tick() (kernel/partition.c, called from the BSP
 # sweep) re-broadcasts the rows a node OWNS every 1000 ticks (~10 s), and
-# there is NO command that fires it: user/shell.c's live partition triggers
-# are create/list/assign/destroy/pause/resume/lease acquire/migrate, and
-# none of them re-announces. So the guard's re-drive IS that period: each
+# there is NO command that fires it: user/shell.c has no announce command at
+# all (its partition commands are create/list/assign/destroy/pause/resume/
+# lease acquire/migrate plus quota bookkeeping, and none of them announces a
+# row). So the guard's re-drive IS that period: each
 # gate may wait out up to AEROSLS_FAILOVER_ANNOUNCE_ATTEMPTS fresh windows,
 # and an extra window is spent only while the leader is still answering
 # AND still holds the row -- the exact state the periodic re-announce (and
