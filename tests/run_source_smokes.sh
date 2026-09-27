@@ -3,12 +3,12 @@
 #
 # ─── Why this exists ───────────────────────────────────────────────────────
 # run_guard_smokes.sh globs tests/*_smoke.sh, but nine of the
-# forty-one need the linked kernel, its objects, or the built ISO
+# forty-two need the linked kernel, its objects, or the built ISO
 # (they synthesize tooth inputs and then restore-check against the real
 # image, or boot the ISO under QEMU), so that runner only works on a
-# build host. The other thirty-two are source-only: they need only
+# build host. The other thirty-three are source-only: they need only
 # gcc/binutils/python3/openssl/cargo/sbcl and the sources in the tree —
-# nothing built. CI's verify job has no build, so those thirty-two can
+# nothing built. CI's verify job has no build, so those thirty-three can
 # and must run there.
 #
 # A source-only smoke that runs ONLY on build hosts is a smoke that rots
