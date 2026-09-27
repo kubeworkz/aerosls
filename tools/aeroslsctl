@@ -15,7 +15,8 @@ is no "aeroslsctl view" of the cluster that could drift from the kernel's,
 because this program has no view of its own.
 
 It covers the ORCHESTRATION surface (cluster, nodes, services, workloads,
-mesh, partitions, reconcile) as first-class verbs. The kernel serves ~146
+mesh, partitions, env, reconcile) as first-class verbs. `env` is the POSIX
+environment surface (`list`/`create`/`attach`/`destroy`). The kernel serves ~146
 routes in total; wrapping all of them by hand would be a second API to
 keep in sync, and it would rot. Everything else is reachable through two
 honest escape hatches that cannot rot because they pass through:
@@ -430,6 +431,71 @@ def cmd_health(args):
     return _emit(args, d, lambda: print(json.dumps(d, indent=2)))
 
 
+def cmd_env(args):
+    """POSIX environments inside partitions (POSIX-Environments E6).
+
+    The kernel-brokered console surface. `attach` is a POLL, not a stream:
+    the node's console is line-based (POST a line, GET what came back), which
+    is the shape the kernel can actually serve -- a true stream needs a
+    push channel it does not have. So `attach --line` sends and then reads
+    once, and a bare `attach` reads again; repeat it to continue a session.
+    """
+    part = args.partition
+    if args.action == "list":
+        d = _request(args, "GET", f"/api/partition/{part}/env")
+
+        def show():
+            envs = d.get("envs") or []
+            if envs:
+                _table(envs, ["env_id", "index", "posix_pid", "dropped"])
+            else:
+                print("no environments with a live console in this partition")
+            print(f"\nlive {_cell(d.get('live'))}")
+        return _emit(args, d, show)
+
+    if args.action == "create":
+        d = _request(args, "POST", f"/api/partition/{part}/env",
+                     {"index": args.index})
+        return _emit(args, d, lambda: print(
+            f"created env {_cell(d.get('env_id'))} in partition "
+            f"{_cell(d.get('partition'))} (index {args.index})"))
+
+    if args.action == "attach":
+        eid = args.env_id
+        path = f"/api/partition/{part}/env/{eid}/console"
+        if args.line:
+            line = " ".join(args.line)
+            sent = _request(args, "POST", path, {"input": line})
+            if _refused(sent):
+                # A renderer, even a no-op one, so the refusal path prints the
+                # node's own reason (`refused: …` on stderr) instead of dumping
+                # raw JSON — the same shape every other verb's refusal takes.
+                return _emit(args, sent, lambda: None)
+            # `queued` 0 is the kernel's flow control, not an error: the
+            # environment has not drained the previous line yet.
+            _emit(args, sent, lambda: print(
+                f"queued {_cell(sent.get('queued'))} byte(s)"))
+        d = _request(args, "GET", path)
+
+        def show():
+            out = d.get("output") or ""
+            if out:
+                sys.stdout.write(out if out.endswith("\n") else out + "\n")
+            dropped = _num(d.get("dropped"))
+            if dropped:
+                print(f"({dropped} byte(s) dropped — the environment outran "
+                      f"the kernel's 4 KiB console buffer)", file=sys.stderr)
+        return _emit(args, d, show)
+
+    # destroy — the partition is in the path on purpose: the env id alone
+    # identifies the environment globally, so the node ENFORCES that the
+    # environment really lives in the partition named here.
+    d = _request(args, "POST", f"/api/partition/{part}/env/destroy",
+                 {"env_id": args.env_id})
+    return _emit(args, d, lambda: print(
+        f"destroyed env {args.env_id} in partition {part}"))
+
+
 # ─── argument parsing ─────────────────────────────────────────────────────
 
 def build_parser():
@@ -495,6 +561,27 @@ def build_parser():
     m.set_defaults(func=cmd_mesh)
 
     pa = sub.add_parser("partitions"); pa.set_defaults(func=cmd_partitions)
+
+    ev = sub.add_parser("env", help="POSIX environments inside partitions")
+    es = ev.add_subparsers(dest="action", required=True)
+    el = es.add_parser("list", help="environments with a live console")
+    el.add_argument("partition", type=int)
+    ec = es.add_parser("create", help="create an environment IN a partition")
+    ec.add_argument("partition", type=int)
+    ec.add_argument("--index", type=int, default=1,
+                     help="the environment's identity within its partition "
+                          "(its sidecar names carry it; default 1)")
+    ea = es.add_parser("attach", help="read an environment's console, and "
+                                       "optionally send it one line first")
+    ea.add_argument("partition", type=int)
+    ea.add_argument("env_id", type=int)
+    ea.add_argument("--line", nargs=argparse.REMAINDER,
+                    help="a line to forward before reading (repeat the "
+                         "command without it to continue a session)")
+    ed = es.add_parser("destroy", help="end an environment and free its frames")
+    ed.add_argument("partition", type=int)
+    ed.add_argument("env_id", type=int)
+    ev.set_defaults(func=cmd_env)
 
     r = sub.add_parser("reconcile", help="turn the reconciler on or off")
     r.add_argument("state", choices=["on", "off"])

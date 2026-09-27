@@ -107,6 +107,30 @@ static inline void env_destroy_body_encode(uint8_t* b, uint32_t env_id, uint32_t
     env_put_u32(b, 4, partition);
 }
 
+/* The human-readable name of an ENV_* reply status.
+ *
+ * ONE definition, two askers: the control plane's create/destroy routes relay a
+ * refusal to an HTTP client (net/http.c), and the shell's `env create`/
+ * `env destroy` print the same refusal on the serial console
+ * (user/shell.c). They were about to be two switches over the same seven
+ * codes — the drift this file's own header warns about — so the mapping lives
+ * beside the codes it names. */
+static inline const char* env_status_name(uint16_t s) {
+    switch (s) {
+        case ENV_OK:         return "ok";
+        case ENV_ERR_INVAL:  return "invalid request";
+        case ENV_ERR_NOMEM:  return "frame pool exhausted";
+        case ENV_ERR_PART:   return "partition absent, paused, or placement refused";
+        case ENV_ERR_FULL:   return "environment table full";
+        case ENV_ERR_UNSUPP: return "unsupported";
+        /* E5: an ENV_DESTROY for an env_id the manager does not hold. Its own
+         * code rather than a generic failure, so a caller can tell "destroyed"
+         * from "there was nothing there". */
+        case ENV_ERR_NOENT:  return "no such environment";
+        default:             return "unknown";
+    }
+}
+
 /* Reply body: { status u16, pad u16, env_id u32, partition u32 } (12 bytes). */
 static inline void env_reply_body_parse(const uint8_t* b, uint16_t* status,
                                         uint32_t* env_id, uint32_t* partition) {
