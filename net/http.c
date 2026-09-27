@@ -3020,21 +3020,9 @@ static int api_partition_create_post(const char* body, char* buf, int max, SLSRo
 // environment manager (env_service_create), which owns the Rust manifest
 // builders, and relays the result. Same DB_ADMIN+ gate as partition create —
 // placing a tenant environment is a tenancy-administration action.
-static const char* env_status_str(uint16_t s) {
-    switch (s) {
-        case ENV_OK:         return "ok";
-        case ENV_ERR_INVAL:  return "invalid request";
-        case ENV_ERR_NOMEM:  return "frame pool exhausted";
-        case ENV_ERR_PART:   return "partition absent, paused, or placement refused";
-        case ENV_ERR_FULL:   return "environment table full";
-        case ENV_ERR_UNSUPP: return "unsupported";
-        /* E5: an ENV_DESTROY for an env_id the manager does not hold. Its own
-         * code rather than a generic failure, so a caller can tell "destroyed"
-         * from "there was nothing there". */
-        case ENV_ERR_NOENT:  return "no such environment";
-        default:             return "unknown";
-    }
-}
+// The status name comes from env_proto.h's env_status_name(), which the shell's
+// own `env create`/`env destroy` also print — one mapping, so an operator
+// reading the console and a client reading JSON are told the same thing.
 
 static int api_partition_env_create_post(const char* body, char* buf, int max,
                                          SLSRole req_role, uint32_t partition) {
@@ -3066,7 +3054,7 @@ static int api_partition_env_create_post(const char* body, char* buf, int max,
     } else {
         jb_str(&j,"ok","false"); jb_putc(&j,',');
         jb_uint(&j,"status", status); jb_putc(&j,',');
-        jb_str(&j,"error", env_status_str(status));
+        jb_str(&j,"error", env_status_name(status));
     }
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
@@ -3111,7 +3099,7 @@ static int api_partition_env_destroy_post(const char* body, char* buf, int max,
     } else {
         jb_str(&j,"ok","false"); jb_putc(&j,',');
         jb_uint(&j,"status", status); jb_putc(&j,',');
-        jb_str(&j,"error", env_status_str(status));
+        jb_str(&j,"error", env_status_name(status));
     }
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }

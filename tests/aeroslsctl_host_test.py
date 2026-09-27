@@ -48,6 +48,10 @@ def check(cond, msg):
 
 ROUTES = {}
 LAST_REQUEST = {}
+# The full ordered request log. `env attach --line` is one command that makes
+# TWO requests (write half, then read half), and the order is the claim —
+# LAST_REQUEST alone would only show the last one.
+REQS = []
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -61,6 +65,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         LAST_REQUEST["method"] = method
         LAST_REQUEST["body"] = json.loads(raw) if raw else None
         LAST_REQUEST["auth"] = self.headers.get("Authorization")
+        REQS.append({"method": method, "path": self.path,
+                     "body": LAST_REQUEST["body"]})
         entry = ROUTES.get((method, self.path))
         if entry is None:
             self.send_response(404)
@@ -366,6 +372,87 @@ def main():
     rc, out, err = run("raw", "GET", "/api/streams")
     check(rc == 2, "a JSON refusal on raw still exits REFUSED")
     check("nope" in out or "nope" in err, "...and still shows the reason")
+
+    # ═══ 9: the POSIX environment surface (POSIX-Environments E6) ═════════
+    # The shell and CLI half of E6. Every route is the one net/http.c serves
+    # for the E6 console surface, and the attach command's two-request shape
+    # (line first, then read) is the kernel's own line-based console contract
+    # rather than a client convenience.
+    print("\n-- 9: the environment surface --")
+    ROUTES[("GET", "/api/partition/1/env")] = (200, {
+        "ok": "true", "partition": 1, "live": 1,
+        "envs": [{"env_id": 7, "index": 1, "posix_pid": 103, "dropped": 0}]})
+    rc, out, _ = run("env", "list", "1")
+    check(rc == 0 and LAST_REQUEST["path"] == "/api/partition/1/env",
+          "*** `env list <partition>` asks that partition's own route ***")
+    check("103" in out and "live 1" in out,
+          "its table carries posix_pid, and the live count is shown")
+
+    ROUTES[("GET", "/api/partition/1/env")] = (200, {
+        "ok": "true", "partition": 1, "live": 0, "envs": []})
+    rc, out, _ = run("env", "list", "1")
+    check("no environments" in out,
+          "an empty listing says so rather than printing a bare header")
+
+    ROUTES[("POST", "/api/partition/1/env")] = (200, {
+        "ok": "true", "env_id": 8, "partition": 1})
+    rc, out, _ = run("env", "create", "1", "--index", "2")
+    check(rc == 0 and LAST_REQUEST["body"] == {"index": 2},
+          "*** `env create` sends {index:N} to the partition's route ***")
+    check("8" in out, "...and reports the node's env_id")
+
+    ROUTES[("POST", "/api/partition/1/env")] = (200, {
+        "ok": "false", "error": "partition absent, paused, or placement refused"})
+    rc, _, err = run("env", "create", "1", "--index", "2")
+    check(rc == 2 and "placement refused" in err,
+          "*** a refused placement exits 2 with the node's reason ***")
+
+    ROUTES[("POST", "/api/partition/1/env/7/console")] = (200, {
+        "ok": "true", "env_id": 7, "queued": 12})
+    ROUTES[("GET", "/api/partition/1/env/7/console")] = (200, {
+        "ok": "true", "env_id": 7, "output": "hello-from-7\n", "dropped": 0})
+    REQS.clear()
+    rc, out, _ = run("env", "attach", "1", "7", "--line", "echo", "hello-from-7")
+    check([r["method"] for r in REQS] == ["POST", "GET"],
+          "*** `attach --line` writes the line FIRST, then reads ***")
+    check(REQS and REQS[0]["body"] == {"input": "echo hello-from-7"},
+          "*** ...and the words after --line are rejoined into one line ***")
+    check("hello-from-7" in out,
+          "*** the environment's output reaches stdout ***")
+
+    # `queued` 0 is the kernel's flow control -- the peer has not drained the
+    # previous line -- not a refusal. A client that treated it as failure would
+    # report success as an error on a busy environment.
+    ROUTES[("POST", "/api/partition/1/env/7/console")] = (200, {
+        "ok": "true", "env_id": 7, "queued": 0})
+    rc, out, _ = run("env", "attach", "1", "7", "--line", "echo", "x")
+    check(rc == 0 and "queued 0" in out,
+          "*** queued 0 is reported as flow control, not as an error ***")
+
+    ROUTES[("POST", "/api/partition/1/env/7/console")] = (200, {
+        "ok": "false", "error": "no such environment console in this partition"})
+    rc, _, err = run("env", "attach", "1", "7", "--line", "x")
+    check(rc == 2 and "no such environment console" in err,
+          "*** a console refusal exits 2 with the node's own reason ***")
+
+    ROUTES[("GET", "/api/partition/1/env/7/console")] = (200, {
+        "ok": "true", "env_id": 7, "output": "", "dropped": 4211})
+    rc, out, err = run("env", "attach", "1", "7")
+    check(rc == 0 and "dropped" in err,
+          "*** a non-zero dropped count is surfaced, not silently swallowed ***")
+
+    ROUTES[("POST", "/api/partition/1/env/destroy")] = (200, {
+        "ok": "true", "env_id": 7, "partition": 1})
+    rc, out, _ = run("env", "destroy", "1", "7")
+    check(rc == 0 and LAST_REQUEST["body"] == {"env_id": 7},
+          "*** `env destroy` names the env_id in the body of the partition's route ***")
+    check("destroyed" in out, "...and says what it did")
+
+    ROUTES[("POST", "/api/partition/1/env/destroy")] = (200, {
+        "ok": "false", "error": "no such environment"})
+    rc, _, err = run("env", "destroy", "1", "7")
+    check(rc == 2 and "no such environment" in err,
+          "*** an unknown env_id is a refusal, not a silent success ***")
 
     print(f"\n{'='*58}")
     print(f"passed={passed} failed={failed}")

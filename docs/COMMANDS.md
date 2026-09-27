@@ -18,6 +18,7 @@ tools/aeroslsctl cluster status
 tools/aeroslsctl nodes
 tools/aeroslsctl workloads
 tools/aeroslsctl workload declare --name api --partition 1 --restart on-failure
+tools/aeroslsctl env list 1
 tools/aeroslsctl shell partition migrate 1 2
 ```
 
@@ -42,7 +43,7 @@ Either one reports success on every rejection. Any other client written against 
 
 ### Coverage
 
-First-class verbs cover the orchestration surface: `cluster`, `nodes`, `services`, `workloads`, `workload declare`, `mesh`, `partitions`, `reconcile`, `health`. The kernel serves ~146 routes in total; the rest are reached through two passthroughs that cannot fall out of sync because they don't wrap anything:
+First-class verbs cover the orchestration surface: `cluster`, `nodes`, `services`, `workloads`, `workload declare`, `mesh`, `partitions`, `env`, `reconcile`, `health`. The kernel serves ~146 routes in total; the rest are reached through two passthroughs that cannot fall out of sync because they don't wrap anything:
 
 - `aeroslsctl shell <any shell command>` → `POST /api/shell/exec`
 - `aeroslsctl raw GET|POST <path> [--body JSON]` → any route
@@ -722,6 +723,42 @@ Real resource and execution isolation within one kernel — a `partition_id` tag
 | `partition connquotas`                                       | List per-partition connection usage/quota                                                                                |
 | `partition migrate <partition_id> <dest_node_id>`             | Cold-migrate a partition's ownership (and, for stream/blob data, the actual bytes) to another cluster node — pauses, hands off the lease, moves stream data over the real DSPP wire protocol if `cluster init` has been run on this boot (same-disk relocate otherwise), reclaims frames, leaves the partition **paused** on success |
 
+### POSIX Environments inside partitions (POSIX-Environments Roadmap E1–E6)
+
+A **POSIX environment** is an on-demand POSIX runtime *inside* a partition — the PASE equivalent (`docs/AeroSLS-POSIX-Environments-Roadmap-v0.1.md`): a tenant ramdisk driver plus a tenant POSIX sidecar, created in a partition, reachable through its own console. Creating one is a `DB_ADMIN+` action over HTTP; the shell is the trusted console and has no gate, as for `partition`.
+
+`env list` reads the **kernel's** console registry (`kernel/env_console.c`), which is the same source `GET /api/partition/{id}/env` reads — so the shell and the API cannot disagree about which environments exist. An `env_id` of `0` is a console no environment manager bound (an E3 boot spawn): listed, but not addressable by id.
+
+| Command                                       | Description                                                                                                                                                                 |
+| --------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `env create <partition_id> [index]`            | Create a POSIX environment in a partition. `index` is the environment's identity within its partition (it is what its sidecar names `drv.ramdisk.<index>` / `aerosls.posix.<index>` carry) and defaults to `1`. Reports the manager-assigned `env_id`. Refused for an absent or paused partition, or when the frame pool cannot back it. |
+| `env list [partition_id]`                      | List the environments with a **live console** — `env_id`, `index`, `posix_pid`, `dropped`. With no argument, every partition's.                                                                                             |
+| `env attach <partition_id> <env_id> [line]`     | Forward one line to that environment's console and return what it has written since the last read; with no `line`, just drain again. **This is a poll, not a stream** — the kernel's console is line-based (`POST` a line, `GET` what came back), so repeat the command to continue a session. Reports `queued`/`input refused` when the environment has not drained the previous line. |
+| `env destroy <partition_id> <env_id>`          | End an environment: kill its sidecars and hand its frames back. The partition is required because the manager **enforces** it — the `env_id` alone is globally unique, so without it a caller could end partition B's environment through a path naming partition A. |
+
+A worked session at the serial console:
+
+```
+uid:1000> env create 1
+[ENV] create partition=1 index=1 -> ok env_id=1
+uid:1000> env list 1
+[ENV] list partition=1 live=1
+[ENV] env partition=1 env_id=1 index=1 posix_pid=103 dropped=0
+uid:1000> env attach 1 1 setenv GREETING hello-from-1
+[ENV] attach partition=1 env=1 -> queued 28 byte(s)
+[ENV] attach partition=1 env=1 dropped=0
+uid:1000> env attach 1 1 echo $GREETING | cat
+[ENV] attach partition=1 env=1 -> queued 21 byte(s)
+[ENV] attach partition=1 env=1 dropped=0
+uid:1000> env attach 1 1
+[ENV] attach partition=1 env=1 dropped=0
+hello-from-1
+uid:1000> env destroy 1 1
+[ENV] destroy partition=1 env=1 -> ok
+```
+
+`hello-from-1` appears on the last `env attach` because the environment only echoes it when its shell runs the line — the drain is a separate read, which is the whole shape of a line-based console. The same surface over HTTP (`GET`/`POST /api/partition/{id}/env/{env_id}/console`) is what a terminal front-end polls; `aeroslsctl env attach` is the CLI form of exactly this.
+
 ### Checkpointing (Core Backup Strategies)
 
 All four are exact-match commands — `sh_eq`, not prefix — so they take no arguments and a trailing word makes them unrecognised.
@@ -1180,6 +1217,27 @@ curl -X POST localhost:3001/api/shell/exec -H "Authorization: Bearer $TOK" \
 ```
 
 `cluster init` additionally has its own typed route, `POST /api/cluster/init`. See `run-cluster.sh` at the repo root for booting the nodes themselves — that part is still not something the kernel can do for you.
+
+#### POSIX Environments
+
+Environment creation and destroy are `DB_ADMIN+`; the console read is ungated, like `GET /api/partitions`.
+
+| Method | Path                                          | Auth            | Description                                                                                     |
+| ------ | --------------------------------------------- | --------------- | ------------------------------------------------------------------------------------------------- |
+| `GET`  | `/api/partition/{id}/env`                       | `APP_USER+`       | List the environments with a **live console** in partition `{id}` — `{envs:[{env_id, index, posix_pid, dropped}], live}`. `env_id` 0 is a console no manager bound (an E3 boot spawn) |
+| `POST` | `/api/partition/{id}/env`                       | **`DB_ADMIN+`**   | Create an environment IN that partition — `{"index":N}` → `{ok, env_id, partition}`                                                          |
+| `POST` | `/api/partition/{id}/env/destroy`               | **`DB_ADMIN+`**   | End it — `{"env_id":N}` → `{ok, env_id, partition}`. Refused (`invalid request`) when the environment is not in the partition the path names              |
+| `GET`  | `/api/partition/{id}/env/{env_id}/console`      | `APP_USER+`       | Attach, read half: what that environment wrote since the last read — `{ok, env_id, output, dropped}`. Destructive: output is returned once |
+| `POST` | `/api/partition/{id}/env/{env_id}/console`      | **`DB_ADMIN+`**   | Attach, write half: `{"input":"…"}` → `{ok, env_id, queued}`. `queued` 0 means the environment has not drained the previous line (flow control, not an error) |
+
+Attach is a **poll, not a stream** — the kernel has no per-connection push, and a line-based request/response console is what it can actually serve (`docs/AeroSLS-Web-Terminal-Plan-v0.1.md`). Repeat the GET to keep reading; `dropped` separates "the environment is quiet" from "it outran the kernel's 4 KiB console buffer".
+
+```bash
+tools/aeroslsctl --host localhost:3001 env list 1
+tools/aeroslsctl --host localhost:3001 env create 1 --index 1
+tools/aeroslsctl --host localhost:3001 env attach 1 1 --line echo hello | cat
+tools/aeroslsctl --host localhost:3001 env destroy 1 1
+```
 
 #### Tenants
 

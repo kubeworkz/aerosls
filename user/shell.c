@@ -46,6 +46,9 @@
 #include "../kernel/workload.h"
 #include "../kernel/workload_ctx.h"         // Multi-Node Partition Scaling Roadmap Phase 7 addendum -- SYS_SLS_CLUSTER_INIT/STATUS
 #include "../kernel/cap.h"            // Capability SDK Phase 1 -- SYS_SLS_CAP_*
+#include "../kernel/env_service.h"    // POSIX-Environments E4 -- env_service_create/destroy (the shell's `env create`/`env destroy`, E6)
+#include "../kernel/env_proto.h"      // POSIX-Environments E4 -- ENV_* status codes + env_status_name()
+#include "../kernel/env_console.h"    // POSIX-Environments E6 -- env_console_count/entry/read/write (the shell's `env list`/`env attach`)
 
 // ─── Legacy allocation request (syscall 105) ─────────────────────────────────
 struct SLSAllocationRequest {
@@ -369,6 +372,16 @@ static void print_help(void) {
         "  partition connquota set <id> <quota>     set max concurrent inbound\n"
         "                                            connections for a partition (0=unlimited)\n"
         "  partition connquotas                     list per-partition connection usage/quota\n"
+        "  -- POSIX environments inside partitions (POSIX-Environments E6) --\n"
+        "  env create <partition_id> [index]        create a POSIX environment in a\n"
+        "                                            partition (index defaults to 1)\n"
+        "  env list [partition_id]                  list environments with a live\n"
+        "                                            console (env_id, index, pid)\n"
+        "  env attach <partition_id> <env_id> [line]  forward one line to an\n"
+        "                                            environment and drain its console;\n"
+        "                                            repeat to continue (line-based poll)\n"
+        "  env destroy <partition_id> <env_id>      end an environment and hand its\n"
+        "                                            frames back\n"
         "  -- Cluster / cross-node identity (Multi-Node Phase 7 addendum) --\n"
         "  cluster init <node_id>                   set THIS boot's real node identity\n"
         "                                            (required before partition migrate\n"
@@ -1421,6 +1434,170 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
             kernel_serial_printf("[PARTITION] migrate partition=%u -> node=%u -> %s\n",
                                  req.partition_id, req.dest_node_id, rc == 0 ? "OK" : "FAILED");
         }
+
+        // ── POSIX-Environments E6 (roadmap §9): the environment control-plane
+        // surface. `env create`/`env list`/`env attach`/`env destroy` are the
+        // shell half of a surface whose other halves E6 already built — the
+        // HTTP routes (GET/POST /api/partition/{id}/env…, net/http.c) and the
+        // per-environment consoles (kernel/env_console.c). They are the same
+        // kernel entry points those routes call: env_service_create()'s
+        // ENV_CREATE round trip to init's environment manager, and
+        // env_console_read()/env_console_write() on the environment's own
+        // brokered console. There is no second implementation to keep in
+        // step, and the status wording a refusal prints comes from
+        // env_proto.h's env_status_name(), which the HTTP routes use too.
+        //
+        // `env list` reads the KERNEL's console registry, not init's manager
+        // table — the same source GET /api/partition/{id}/env reads — so the
+        // shell and the API cannot disagree about which environments exist.
+        // An env_id of 0 is a console no manager bound (an E3 boot spawn):
+        // listed, but not addressable by id.
+        //
+        // ── Why `env attach` takes an optional LINE instead of looping ────
+        // The kernel's console is a LINE-BASED request/response surface, not a
+        // byte stream — the constraint AeroSLS-Web-Terminal-Plan-v0.1.md
+        // records and that E6's HTTP route already obeys (POST a line, GET
+        // what came back). An interactive read-eval loop here would have to
+        // block on the serial port, and sls_shell_execute() is ALSO the body
+        // of POST /api/shell/exec: a loop would hang a remote caller for as
+        // long as a human sat at the console. So attach is a poll. `env
+        // attach <partition> <env_id> <line>` forwards one line and returns a
+        // drain; `env attach <partition> <env_id>` drains again. Repeat it to
+        // continue the session — the streaming form is the web terminal's.
+        else if (sh_starts(input_buffer, "env create ")) {
+            // env create <partition_id> [index] — index is the environment's
+            // identity within its partition (what its sidecar names carry),
+            // defaulting to 1 when omitted.
+            const char* p = input_buffer + 11;   /* strlen("env create ") */
+            char ptok[16], itok[16];
+            p = sh_token(p, ptok, sizeof(ptok));
+            p = sh_token(p, itok, sizeof(itok));
+            uint32_t part  = sh_atoi(ptok);
+            uint32_t index = itok[0] ? sh_atoi(itok) : 1u;
+            uint16_t st = ENV_ERR_INVAL;
+            uint32_t id = 0;
+            int r = env_service_create(part, index, &st, &id);
+            if (r != 0) {
+                kernel_serial_printf(
+                    "[ENV] create partition=%u index=%u -> no reply from the environment manager "
+                    "(kernel.env.control is not wired, or it did not answer before the deadline)\n",
+                    part, index);
+            } else if (st == ENV_OK) {
+                kernel_serial_printf("[ENV] create partition=%u index=%u -> ok env_id=%u\n",
+                                     part, index, id);
+            } else {
+                kernel_serial_printf("[ENV] create partition=%u index=%u -> %s\n",
+                                     part, index, env_status_name(st));
+            }
+        }
+        else if (sh_starts(input_buffer, "env list")) {
+            // env list [partition_id] — no argument lists every partition's
+            // environments. Two passes so the count precedes the rows (a
+            // single pass would have to print live= after the listing, which
+            // reads worse than it costs).
+            const char* p = input_buffer + 8;   /* strlen("env list") */
+            char ptok[16];
+            sh_token(p, ptok, sizeof(ptok));
+            int filter = ptok[0] ? 1 : 0;
+            uint32_t want = sh_atoi(ptok);
+            uint32_t total = env_console_count(), shown = 0;
+            for (uint32_t i = 0; i < total; i++) {
+                uint32_t ep = 0, eid = 0, eidx = 0, epid = 0;
+                if (!env_console_entry(i, &ep, &eid, &eidx, &epid)) continue;
+                if (filter && ep != want) continue;
+                shown++;
+            }
+            if (filter)
+                kernel_serial_printf("[ENV] list partition=%u live=%u\n", want, shown);
+            else
+                kernel_serial_printf("[ENV] list partition=* live=%u\n", shown);
+            for (uint32_t i = 0; i < total; i++) {
+                uint32_t ep = 0, eid = 0, eidx = 0, epid = 0;
+                if (!env_console_entry(i, &ep, &eid, &eidx, &epid)) continue;
+                if (filter && ep != want) continue;
+                kernel_serial_printf(
+                    "[ENV] env partition=%u env_id=%u index=%u posix_pid=%u dropped=%u\n",
+                    ep, eid, eidx, epid, env_console_dropped(ep, eid));
+            }
+        }
+        else if (sh_starts(input_buffer, "env attach ")) {
+            // env attach <partition_id> <env_id> [line to forward]
+            const char* p = input_buffer + 11;   /* strlen("env attach ") */
+            char ptok[16], etok[16];
+            p = sh_token(p, ptok, sizeof(ptok));
+            p = sh_token(p, etok, sizeof(etok));
+            uint32_t part = sh_atoi(ptok);
+            uint32_t eid  = sh_atoi(etok);
+            char line[256];
+            sh_copy(line, p, sizeof(line));
+            uint32_t llen = (uint32_t)sh_len(line);
+
+            int drain = 1;
+            if (llen > 0) {
+                int q = env_console_write(part, eid, (const uint8_t*)line, llen);
+                if (q < 0) {
+                    kernel_serial_printf(
+                        "[ENV] attach partition=%u env=%u -> no such environment console in this partition\n",
+                        part, eid);
+                    drain = 0;
+                } else if (q == 0) {
+                    kernel_serial_printf(
+                        "[ENV] attach partition=%u env=%u -> input refused "
+                        "(the environment has not drained the previous line)\n",
+                        part, eid);
+                    drain = 0;
+                } else {
+                    kernel_serial_printf(
+                        "[ENV] attach partition=%u env=%u -> queued %d byte(s)\n",
+                        part, eid, q);
+                }
+            }
+            if (drain) {
+                // static, not automatic: ENV_CONSOLE_BUF is 4 KiB and
+                // sls_shell_execute()'s frame budget is watched by
+                // tests/stack_frame_budget_check.sh — same reason net/http.c's
+                // own console read is static.
+                static char out[ENV_CONSOLE_BUF + 1];
+                uint32_t n = 0;
+                if (!env_console_read(part, eid, (uint8_t*)out, ENV_CONSOLE_BUF, &n)) {
+                    kernel_serial_printf(
+                        "[ENV] attach partition=%u env=%u -> no such environment console in this partition\n",
+                        part, eid);
+                } else {
+                    out[n] = '\0';
+                    kernel_serial_printf("[ENV] attach partition=%u env=%u dropped=%u\n",
+                                         part, eid, env_console_dropped(part, eid));
+                    if (n) kernel_serial_print(out);
+                }
+            }
+        }
+        else if (sh_starts(input_buffer, "env destroy ")) {
+            // env destroy <partition_id> <env_id> — the partition is carried
+            // because the manager ENFORCES it: the env id alone identifies the
+            // environment globally, so without the partition a caller could
+            // end partition B's environment through a path naming partition A
+            // (kernel/env_proto.h, ENV_DESTROY_BODY_SIZE).
+            const char* p = input_buffer + 12;   /* strlen("env destroy ") */
+            char ptok[16], etok[16];
+            p = sh_token(p, ptok, sizeof(ptok));
+            sh_token(p, etok, sizeof(etok));
+            uint32_t part = sh_atoi(ptok);
+            uint32_t eid  = sh_atoi(etok);
+            uint16_t st = ENV_ERR_INVAL;
+            uint32_t rid = 0, rpart = 0;
+            int r = env_service_destroy(eid, part, &st, &rid, &rpart);
+            if (r != 0) {
+                kernel_serial_printf(
+                    "[ENV] destroy partition=%u env=%u -> no reply from the environment manager\n",
+                    part, eid);
+            } else if (st == ENV_OK) {
+                kernel_serial_printf("[ENV] destroy partition=%u env=%u -> ok\n", part, eid);
+            } else {
+                kernel_serial_printf("[ENV] destroy partition=%u env=%u -> %s\n",
+                                     part, eid, env_status_name(st));
+            }
+        }
+
         // ── Multi-Node Partition Scaling Roadmap Phase 7 addendum: operator-
         // driven node identity. Single-uint32_t arg, same "sh_atoi + cast to
         // void* via uintptr_t" shape "partition destroy "/"partition pause "
