@@ -33,8 +33,10 @@
 # job was cancelled on resume. No power request can prevent that; the only
 # fix is to keep the lid OPEN. So the ARM is a mitigation for idle standby,
 # not a guarantee -- and what makes a lid cancel diagnosable is the pair
-# below: PREFLIGHT names the Reason, EVIDENCE records the gap so the next
-# job's PREFLIGHT can report it.
+# below: PREFLIGHT names the Reason (over a lookback wide enough to reach a
+# close that happened hours ago, not only one that just ended), EVIDENCE
+# records the gap AND the Reason behind it, so the next job's PREFLIGHT can
+# say why the host slept.
 #
 # A 60-70 minute job (kernel-guards, verify) is exposed to this the whole time
 # it runs, and the red it produces is indistinguishable at a glance from a
@@ -55,16 +57,25 @@
 #     (506 enter / 507 exit Modern Standby, 42 sleep / 107 resume), carry each
 #     event's Reason (Lid, Power Button, ...), and warn when the host resumed
 #     from standby within AEROSLS_KEEP_AWAKE_RESUME_WINDOW seconds: a long job
-#     starting then is the one that gets expired if it happens again. When the
-#     last transition's Reason is Lid it says that outright -- that warning
-#     means the ARM could not have helped and the lid has to stay open.
+#     starting then is the one that gets expired if it happens again. The live
+#     query's lookback is the wider of the resume and evidence windows, so a
+#     suspend that ended hours ago -- the usual case, since the suspended job
+#     is cancelled and only the NEXT one starts -- is still in view. When the
+#     last transition's Reason is Lid it says that outright, at that same
+#     evidence-window horizon -- that warning means the ARM could not have
+#     helped and the lid has to stay open.
 #   * EVIDENCE -- a detached sampler takes the wall clock every
 #     AEROSLS_KEEP_AWAKE_SAMPLE_SECONDS; a gap past the sample interval plus
 #     AEROSLS_KEEP_AWAKE_SLACK_SECONDS is the suspend signature (nothing else
 #     stops a running 15 s sample for over a minute), and it is appended to
-#     AEROSLS_KEEP_AWAKE_EVIDENCE with the job's name. The NEXT job's
-#     preflight surfaces it -- which matters because the suspended job is
-#     usually cancelled by the service and never writes another line.
+#     AEROSLS_KEEP_AWAKE_EVIDENCE with the job's name and, recovered from the
+#     Kernel-Power log, the Reason for the transition (the 506 enter event is
+#     about GAP seconds back, so the lookback spans the gap plus the resume
+#     window). The NEXT job's preflight surfaces both -- which matters because
+#     the suspended job is usually cancelled by the service and never writes
+#     another line, so this record is the only place the cause survives. When
+#     that Reason is Lid the warning says so and prints the remedy, exactly
+#     like the preflight line above.
 #
 # This step never fails the job: it is a best-effort mitigation, and a host
 # without Windows interop (a plain Linux box, the build host) has no Windows
@@ -76,8 +87,11 @@
 #   start        (the ci.yml step) preflight + arm + sampler, then return
 #   check        preflight only (smoke and by hand); exit 0 either way
 #   jump E O     evaluate the gap rule on an expected/observed sample pair
+#   reason-field GAP  print the " reason=<token>" the sampler would append to a
+#                GAP-second suspend record (empty when the log cannot say)
 #   payload      print the base64 -EncodedCommand string the arm path sends
 #   events-payload  print the base64 -EncodedCommand for the Kernel-Power query
+#                (over the preflight lookback: the wider of the two windows)
 #
 # Test seams (the smoke drives the real parser and rule with these):
 #   --events-file F    read standby events from F (the same
@@ -88,7 +102,9 @@
 #   --no-bridge        act as if powershell.exe is absent (foreign host)
 #
 # Env: AEROSLS_KEEP_AWAKE_SECONDS (7200), _SAMPLE_SECONDS (15),
-#      _SLACK_SECONDS (60), _RESUME_WINDOW (600), _EVIDENCE_WINDOW (21600),
+#      _SLACK_SECONDS (60), _RESUME_WINDOW (600, resume warning),
+#      _EVIDENCE_WINDOW (21600, evidence record AND the live event lookback /
+#      lid-remedy horizon -- the live lookback is the wider of the two),
 #      _LOG (/tmp/aerosls-keep-awake.log), _EVIDENCE (/tmp/aerosls-host-standby.log)
 #
 # Exit: 0 always (a skipped mitigation is not a failure), 2 on a usage error.
@@ -100,6 +116,13 @@ SAMPLE="${AEROSLS_KEEP_AWAKE_SAMPLE_SECONDS:-15}"
 SLACK="${AEROSLS_KEEP_AWAKE_SLACK_SECONDS:-60}"
 RESUME_WINDOW="${AEROSLS_KEEP_AWAKE_RESUME_WINDOW:-600}"
 EVIDENCE_WINDOW="${AEROSLS_KEEP_AWAKE_EVIDENCE_WINDOW:-21600}"
+# How far back the live Kernel-Power query reaches. A suspend is usually noticed
+# only when the NEXT job starts -- often hours later -- so the lookback has to
+# span the EVIDENCE_WINDOW, not just the resume window; the resume window alone
+# sees only a standby that just ended and would call an hours-old lid close
+# "reason=none". max() keeps the resume warning working if that knob is raised
+# past the evidence window.
+EVENTS_LOOKBACK=$(( RESUME_WINDOW > EVIDENCE_WINDOW ? RESUME_WINDOW : EVIDENCE_WINDOW ))
 LOG="${AEROSLS_KEEP_AWAKE_LOG:-/tmp/aerosls-keep-awake.log}"
 EVIDENCE="${AEROSLS_KEEP_AWAKE_EVIDENCE:-/tmp/aerosls-host-standby.log}"
 
@@ -115,7 +138,8 @@ while [ $# -gt 0 ]; do
         --evidence-file) EVIDENCE="${2:?--evidence-file needs a path}"; shift 2 ;;
         --now-epoch)     NOW_EPOCH="${2:?--now-epoch needs seconds}"; shift 2 ;;
         --no-bridge)     NO_BRIDGE=1; shift ;;
-        --*) echo "usage: $0 {start|check|jump E O|payload|events-payload} [--events-file F]" >&2
+        --*) echo "usage: $0 {start|check|jump E O|reason-field GAP|payload|events-payload}" >&2
+             echo "       [--events-file F]" >&2
              echo "       [--evidence-file F] [--now-epoch N] [--no-bridge]" >&2
              exit 2 ;;
         # Leading-dash POSITIONALS reach here too (jump can take a negative
@@ -210,14 +234,18 @@ Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='Microsoft-Window
 EOF
 }
 
-collect_events() {   # prints "<iso-utc> <id> <reason>" lines; empty when unavailable
+# Lookback is the caller's: preflight asks over the evidence window (a suspend
+# hours old is still the reason the host slept), standby_reason_field over the
+# gap it just measured. The default matches the resume window for a bare call.
+collect_events() {   # collect_events [LOOKBACK_SECONDS] -> "<iso-utc> <id> <reason>"
+    local lookback="${1:-$RESUME_WINDOW}"
     if [ -n "$EVENTS_FILE" ]; then
         cat "$EVENTS_FILE" 2>/dev/null || true
         return 0
     fi
     [ "$BRIDGE" = none ] && return 0
     local enc
-    enc="$(encode_ps "$(ps_payload_events "$RESUME_WINDOW")")" || return 0
+    enc="$(encode_ps "$(ps_payload_events "$lookback")")" || return 0
     [ -n "$enc" ] || return 0
     timeout 25 "$BRIDGE" -NoProfile -EncodedCommand "$enc" 2>>"$LOG" \
         | tr -d '\r' || true
@@ -227,13 +255,14 @@ collect_events() {   # prints "<iso-utc> <id> <reason>" lines; empty when unavai
 preflight() {   # preflight ANNOTATE(1/0)
     local annotate="$1" src=none events n=0 resumes=0 unparsed=0 warns=0 lid=0
     local ts id reason epoch age rnote lage tag ets rest egap ejob eepoch eage events_blob
+    local ereason rfield
 
     if [ -n "$EVENTS_FILE" ]; then
         src=file
     elif [ "$BRIDGE" != none ]; then
         src=live
     fi
-    events_blob="$(collect_events)"
+    events_blob="$(collect_events "$EVENTS_LOOKBACK")"
     # Two independent trackers, each keeping the NEWEST match by epoch -- the
     # live query prints newest-first, so "last line wins" would keep the oldest:
     #   last_*   the most recent enter/exit Modern Standby (506/507) + its Reason
@@ -285,12 +314,15 @@ EOF
     fi
 
     # A lid-close standby is the one case the ARM cannot help with, so when the
-    # last transition was a Lid inside the window it gets its own line, with the
-    # remedy: the power request did not fail, it was never able to apply.
+    # last transition was a Lid inside the EVIDENCE window it gets its own line,
+    # with the remedy: the power request did not fail, it was never able to
+    # apply. The gate is the evidence window (not the resume window) because
+    # that is the horizon the live lookback now reaches -- a lid close hours
+    # before this job started is still the reason the host slept.
     if [ "$lid" = 1 ] && [ -n "$last_epoch" ]; then
         lage=$(( $(now) - last_epoch ))
-        if [ "$lage" -ge 0 ] && [ "$lage" -le "$RESUME_WINDOW" ]; then
-            warn "$annotate" "the host's last Modern Standby (event ${last_id} ${last_ts}, ${lage}s ago) was for Reason: ${last_reason} -- SetThreadExecutionState(ES_SYSTEM_REQUIRED) cannot block a lid-close standby, so keep the lid OPEN for the whole job."
+        if [ "$lage" -ge 0 ] && [ "$lage" -le "$EVIDENCE_WINDOW" ]; then
+            warn "$annotate" "the host's last Modern Standby (event ${last_id} ${last_ts}, ${lage}s ago, within the last ${EVIDENCE_WINDOW}s) was for Reason: ${last_reason} -- SetThreadExecutionState(ES_SYSTEM_REQUIRED) cannot block a lid-close standby, so keep the lid OPEN for the whole job."
             warns=$(( warns + 1 ))
         fi
     fi
@@ -300,12 +332,23 @@ EOF
             case "$tag" in SUSPENDED|STEPBACK) ;; *) continue ;; esac
             egap="$(printf '%s\n' "$rest" | sed -n 's/.*gap=\(-\{0,1\}[0-9][0-9]*\)s.*/\1/p')"
             ejob="$(printf '%s\n' "$rest" | sed -n 's/.*job=\([^ ]*\).*/\1/p')"
+            # The sampler appends " reason=<token>" when it could recover one.
+            ereason="$(printf '%s\n' "$rest" | sed -n 's/.*reason=\([^ ]*\).*/\1/p')"
             eepoch="$(iso_to_epoch "$ets")"
             [ -n "$eepoch" ] || continue
             eage=$(( $(now) - eepoch ))
             if [ "$eage" -ge 0 ] && [ "$eage" -le "$EVIDENCE_WINDOW" ]; then
                 if [ "$tag" = SUSPENDED ]; then
-                    warn "$annotate" "${EVIDENCE} records a suspend gap during job '${ejob:-unknown}': gap=${egap:-?}s at ${ets} (within the last ${EVIDENCE_WINDOW}s)."
+                    # Name the cause when the record carries one, and -- for the
+                    # one cause the ARM provably cannot stop -- the remedy.
+                    rfield=""
+                    if [ -n "$ereason" ]; then
+                        rfield=", Reason: ${ereason}"
+                        case "$ereason" in
+                            [Ll][Ii][Dd]) rfield="${rfield} -- SetThreadExecutionState(ES_SYSTEM_REQUIRED) cannot block a lid-close standby, so keep the lid OPEN for the whole job." ;;
+                        esac
+                    fi
+                    warn "$annotate" "${EVIDENCE} records a suspend gap during job '${ejob:-unknown}': gap=${egap:-?}s at ${ets} (within the last ${EVIDENCE_WINDOW}s)${rfield}"
                 else
                     warn "$annotate" "${EVIDENCE} records a backwards clock step during job '${ejob:-unknown}': gap=${egap:-?}s at ${ets} (within the last ${EVIDENCE_WINDOW}s)."
                 fi
@@ -342,6 +385,34 @@ arm() {   # 0 armed, 1 arm failed, 2 no arm line in time, 3/4 unusable host
     return 2
 }
 
+# ─── the Reason behind a gap the sampler just measured ────────────────────
+# The sampler runs after the host is back, so the Kernel-Power log still holds
+# the transition that caused the gap: the 506 enter event sits at the START of
+# it (about GAP seconds back) and the 507 exit at the resume. The lookback is
+# therefore GAP + AEROSLS_KEEP_AWAKE_RESUME_WINDOW -- the resume window alone
+# would miss the enter event of a long suspend -- and the newest 506/507 wins,
+# the same rule preflight() applies to its own blob. Prints " reason=<token>",
+# or nothing at all: a foreign host, or a log that no longer reaches back, is
+# recorded without a cause rather than with a guessed one.
+standby_reason_field() {   # standby_reason_field GAP_SECONDS
+    local gap="$1" blob ts id reason epoch best_reason="" best_epoch=""
+    if [ -z "$EVENTS_FILE" ] && [ "$BRIDGE" = none ]; then return 0; fi
+    blob="$(collect_events "$(( gap + RESUME_WINDOW ))")" || true
+    while read -r ts id reason; do
+        [ -n "$ts" ] && [ -n "$reason" ] || continue
+        case "$id" in 506|507) ;; *) continue ;; esac
+        epoch="$(iso_to_epoch "$ts")"
+        [ -n "$epoch" ] || continue
+        if [ -z "$best_epoch" ] || [ "$epoch" -gt "$best_epoch" ]; then
+            best_epoch="$epoch"; best_reason="$reason"
+        fi
+    done <<EOF
+$blob
+EOF
+    [ -z "$best_reason" ] || printf ' reason=%s' "$best_reason"
+    return 0
+}
+
 # ─── sampler: the suspend evidence, written for the next job to read ───────
 sampler() {   # sampler JOB  (detached; writes only to $EVIDENCE)
     local job="$1" prev nowv delta verdict horizon
@@ -356,8 +427,9 @@ sampler() {   # sampler JOB  (detached; writes only to $EVIDENCE)
         verdict="$(gap_verdict "$SAMPLE" "$delta")"
         case "$verdict" in
             *verdict=normal)   continue ;;
-            *verdict=suspend)  printf 'SUSPENDED %s gap=%ss job=%s\n' \
-                                   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$delta" "${job:-local}" >> "$EVIDENCE" ;;
+            *verdict=suspend)  printf 'SUSPENDED %s gap=%ss job=%s%s\n' \
+                                   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$delta" "${job:-local}" \
+                                   "$(standby_reason_field "$delta")" >> "$EVIDENCE" ;;
             *)                 printf 'STEPBACK %s gap=%ss job=%s\n' \
                                    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$delta" "${job:-local}" >> "$EVIDENCE" ;;
         esac
@@ -398,18 +470,23 @@ jump)
     gap_verdict "${POSITIONAL[0]}" "${POSITIONAL[1]}"
     exit 0
     ;;
+reason-field)
+    [ "${#POSITIONAL[@]}" -ge 1 ] || { echo "usage: $0 reason-field GAP_SECONDS" >&2; exit 2; }
+    printf 'reason-field%s\n' "$(standby_reason_field "${POSITIONAL[0]}")"
+    exit 0
+    ;;
 payload)
     encode_ps "$(ps_payload_arm "$HOLD")"
     echo
     exit 0
     ;;
 events-payload)
-    encode_ps "$(ps_payload_events "$RESUME_WINDOW")"
+    encode_ps "$(ps_payload_events "$EVENTS_LOOKBACK")"
     echo
     exit 0
     ;;
 *)
-    echo "usage: $0 {start|check|jump E O|payload|events-payload} [--events-file F] [--evidence-file F] [--now-epoch N] [--no-bridge]" >&2
+    echo "usage: $0 {start|check|jump E O|reason-field GAP|payload|events-payload} [--events-file F] [--evidence-file F] [--now-epoch N] [--no-bridge]" >&2
     exit 2
     ;;
 esac
