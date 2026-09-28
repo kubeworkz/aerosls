@@ -327,6 +327,24 @@ jobs:
         run: cargo build -p aerosls --features target --manifest-path user/Cargo.toml
         working-directory: aerosls2
 
+      # ─── aerobackup: the E7 census target's host test ──────────────────
+      # backup/aerobackup is the workload E7's Linux ABI shim will be
+      # measured against (tools/linux_abi_candidate.conf), so its retention
+      # prune runs here rather than by hand. The prune is the part of
+      # backup/backup.sh that decides which backups SURVIVE: a prune that
+      # orders by name instead of modification time, or that counts an
+      # in-flight .img.partial copy as a backup, silently deletes the wrong
+      # file — and the wrong file here is somebody's last good backup. The
+      # test gives backups real mtimes (File::set_modified) instead of
+      # sleeping, so it is deterministic rather than timing-dependent, and
+      # four sabotages were each observed to redden it: an unwired prune, a
+      # .partial counted as a backup, name-ordered retention, and a dense
+      # copy. Reuses the toolchain installed above; the crate has no
+      # dependencies, so this is a compile of one small crate.
+      - name: aerobackup host test (E7 census target: retention prune)
+        run: cargo test --manifest-path backup/aerobackup/Cargo.toml
+        working-directory: aerosls2
+
   polyglot-e2e:
     # actions: write is needed for upload-artifact (the bench archive) and
     # for listing/downloading the previous run's artifact (drift baseline).

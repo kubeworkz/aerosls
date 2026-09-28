@@ -1,0 +1,24 @@
+# aerobackup's build contract, for the one target it is censused as.
+#
+# ─── Why this file exists ──────────────────────────────────────────────────
+# Design §5.1 refuses static-PIE for E7's v1: the kernel's ELF64 loader maps
+# PT_LOAD segments at absolute `p_vaddr`s and does no relocation, so an ET_DYN
+# image has no load bias and cannot be started.
+#
+# `x86_64-unknown-linux-musl` produces ET_DYN by DEFAULT — measured, not assumed.
+# The first real census run was refused by tools/linux_syscall_census.sh with
+# "is ET_DYN (PIE)", which is what that tool is for; the design document's v0.1
+# claim that this target "produces non-PIE static executables" was wrong, and the
+# instrument caught it before any syscall table was built on top of it.
+#
+# `relocation-model=static` is the fix: measured to give
+#   Type: EXEC, no PT_INTERP, no DT_NEEDED, statically linked, runs.
+#
+# Scoped to the musl triple on purpose, so `cargo test` on the host target is
+# unaffected. NOTE that cargo reads .cargo/config.toml relative to the CURRENT
+# DIRECTORY, not the manifest — so this only applies when cargo is invoked from
+# inside this crate. That is why CANDIDATE_BUILD in tools/linux_abi_candidate.conf
+# `cd`s here first, and why the census tool re-checks the image contract on every
+# run instead of trusting this comment.
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "relocation-model=static"]
