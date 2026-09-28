@@ -4,14 +4,21 @@
 # one second past the limit is a suspend, a backwards step is classified as one,
 # a resume inside the window warns while an old one does not, an enter with no
 # exit is not a resume, recent suspend evidence warns while old evidence does
-# not, the arm payload decodes to the real SetThreadExecutionState call, and a
-# host with no Windows bridge skips instead of failing.
+# not, a Lid-close Reason is surfaced with its remedy while another Reason is
+# not, the arm payload decodes to the real SetThreadExecutionState call, the
+# events payload reads each event's Message for the Reason, and a host with no
+# Windows bridge skips instead of failing.
 #
 # ─── Why this exists ───────────────────────────────────────────────────────
 # runner_host_keep_awake.sh decides, from two numbers, whether the runner host
 # stopped running -- the suspend signature that killed kernel-guards in run
-# 36270544785 (2026-09-26: connected standby at 21:46:44Z, the WSL VM frozen
-# 21 minutes, the job expired service-side and cancelled on resume). A rule
+# 36270544785 (2026-09-26: Modern Standby at 21:46:44Z, the WSL VM frozen
+# 21 minutes, the job expired service-side and cancelled on resume). It also
+# reports WHY the standby happened, from the Kernel-Power Reason: the
+# 2026-09-27 case (run 36350908094) died the same way with Reason: Lid, which
+# the keep-awake power request cannot prevent -- so the reason is named and the
+# remedy (keep the lid open) is printed. The smoke pins both directions: a Lid
+# warns and prints the remedy, another reason does not. A rule
 # like that fails in both directions: too loose and a suspend reads as a
 # normal job, too eager and every loaded host warns on itself. The boundaries
 # (at the slack, one second past it) are pinned here, not just the extreme
@@ -21,9 +28,9 @@
 # (fixtures in $T, a fixed --now-epoch), so the smoke is hermetic: it never
 # reads the live Windows event log, never arms a power request, and never
 # writes the shared /tmp evidence. The fixture line format is exactly what the
-# live Get-WinEvent query prints ("<iso-utc> <id>"), so the parser under test
-# is the parser the runner runs; the 2026-09-26 pair is reproduced here as
-# timestamped fixture data, not as a special case.
+# live Get-WinEvent query prints ("<iso-utc> <id> <reason>"), so the parser
+# under test is the parser the runner runs; the 2026-09-26/27 pairs are
+# reproduced here as timestamped fixture data, not as a special case.
 #
 # Source-only: needs only the tree, GNU date and base64/iconv (coreutils). No
 # build, no QEMU, so it runs in the verify job's run_source_smokes.sh on every
@@ -45,6 +52,10 @@
 #   evidence: suspend 25 h ago             -> warnings=0
 #   evidence: step back 10 min ago         -> 1 warning, clock-step wording
 #   payload decoded                        -> SetThreadExecutionState + 2147483649
+#   events payload decoded                 -> Kernel-Power query reads each Message
+#   lid: resume 181s ago, reason Lid       -> 2 warnings: resume + lid remedy
+#   power button: resume 181s ago          -> 1 warning, reason named, no lid
+#   no-reason event line (2 fields)        -> reason=none lid=0, still parses
 #   start --no-bridge                      -> SKIP, exit 0
 #
 # Exit: 0 if every tooth bit, 1 otherwise.
@@ -66,11 +77,21 @@ NOW=1790000000
 fixture_event() {  # fixture_event EPOCH ID -> "<iso-utc> <id>"
     printf '%s %s\n' "$(date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ)" "$2"
 }
+fixture_event_reason() {  # EPOCH ID REASON -> "<iso-utc> <id> <reason>"
+    printf '%s %s %s\n' "$(date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ)" "$2" "$3"
+}
 fixture_event "$((NOW - 181))"  507 > "$T/recent.events"
 fixture_event "$((NOW - 1500))" 506 >> "$T/recent.events"
 fixture_event "$((NOW - 4000))" 507 > "$T/old.events"
 fixture_event "$((NOW - 1500))" 506 > "$T/enter-only.events"
 fixture_event "$((NOW - 1498))" 566 >> "$T/enter-only.events"
+# A lid close forces Modern Standby with Reason: Lid on both the 506 enter and
+# the 507 exit -- the shape the 2026-09-27 host showed. A Power Button pair is
+# the control that must NOT claim a lid.
+fixture_event_reason "$((NOW - 1500))" 506 Lid          >  "$T/lid.events"
+fixture_event_reason "$((NOW - 181))"  507 Lid          >> "$T/lid.events"
+fixture_event_reason "$((NOW - 1500))" 506 Power_Button >  "$T/powerbutton.events"
+fixture_event_reason "$((NOW - 181))"  507 Power_Button >> "$T/powerbutton.events"
 : > "$T/none.events"
 printf 'SUSPENDED %s gap=1323s job=kernel-guards\n' \
     "$(date -u -d "@$((NOW - 1200))" +%Y-%m-%dT%H:%M:%SZ)" > "$T/evidence-recent.log"
@@ -182,6 +203,49 @@ if [ "$rc" = 0 ] && has "$out" 'keep-awake: SKIP' && ! has "$out" 'WARN'; then
 else
     bad "start --no-bridge did not skip cleanly (rc=$rc):"
     printf '%s\n' "$out" | sed 's/^/      /'
+fi
+
+# ── 15. a Lid reason is surfaced, with the remedy, alongside the resume ─────
+out="$(check_out "$T/lid.events" "$T/absent.log")"
+rc=$?
+if [ "$rc" = 0 ] && has "$out" 'reason=Lid lid=1' \
+    && has "$out" 'host resumed from standby 181s ago (event 507' \
+    && has "$out" 'reason=Lid' && has "$out" 'was for Reason: Lid' \
+    && has "$out" 'keep the lid OPEN' && has "$out" 'preflight: warnings=2'; then
+    ok "a Lid-close transition warns twice: the resume plus the lid remedy"
+else
+    bad "a lid reason was not surfaced as expected (rc=$rc):"
+    printf '%s\n' "$out" | sed 's/^/      /'
+fi
+
+# ── 16. the lid rule is specific: another reason names itself, no lid claim ──
+out="$(check_out "$T/powerbutton.events" "$T/absent.log")"
+if has "$out" 'reason=Power_Button lid=0' && has "$out" 'reason=Power_Button' \
+    && ! has "$out" 'keep the lid OPEN' && has "$out" 'preflight: warnings=1'; then
+    ok "a non-lid reason (Power_Button) is named but does not claim a lid"
+else
+    bad "a non-lid reason was misread:"
+    printf '%s\n' "$out" | sed 's/^/      /'
+fi
+
+# ── 17. a two-field line (the old format, no reason) still parses ──────────
+out="$(check_out "$T/recent.events" "$T/absent.log")"
+if has "$out" 'reason=none lid=0' && has "$out" 'preflight: warnings=1'; then
+    ok "a two-field event line (no reason) parses as reason=none lid=0"
+else
+    bad "a reason-less line broke the parser:"
+    printf '%s\n' "$out" | sed 's/^/      /'
+fi
+
+# ── 18. the events payload the live preflight sends fetches the Message ────
+enc="$(bash "$KEEP" events-payload 2>/dev/null | head -n 1)"
+ps_text="$(printf '%s' "$enc" | base64 -d 2>/dev/null | iconv -f UTF-16LE -t UTF-8 2>/dev/null || true)"
+if has "$ps_text" 'Microsoft-Windows-Kernel-Power' && has "$ps_text" '$_.Message' \
+    && has "$ps_text" 'Reason:' && has "$ps_text" '.Id'; then
+    ok "events payload queries Kernel-Power and reads each event's Message/Reason"
+else
+    bad "events payload did not carry the reason query (${#enc} base64 chars):"
+    printf '%s\n' "$ps_text" | sed 's/^/      /'
 fi
 
 echo

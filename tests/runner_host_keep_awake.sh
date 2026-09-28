@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # tests/runner_host_keep_awake.sh -- hold a Windows power request for the life
-# of a self-hosted CI job, so the host cannot enter connected standby mid-job,
-# and record (for the next job) any suspend gap that happened anyway.
+# of a self-hosted CI job to keep the host out of *idle* connected standby,
+# record (for the next job) any suspend gap that happened anyway, and surface
+# at job start the last standby's Kernel-Power reason -- so a lid-close cancel
+# is diagnosable instead of silent.
 #
 # ─── Why this exists ───────────────────────────────────────────────────────
 # On 2026-09-26, run 36270544785 (main, merge commit bc4cb5b) went red with
 # kernel-guards cancelled 22 minutes into run_checks.sh, mid
 # cap_boot_check.sh, and "The operation was canceled." as the only symptom.
 # The cause was nowhere in the job. The Windows Kernel-Power log shows the
-# host entering connected standby at 21:46:44Z -- 33 seconds after
+# host entering Modern Standby at 21:46:44Z -- 33 seconds after
 # cap_boot_check started -- and leaving it at 22:07:20Z. The WSL VM froze
 # with the host, the job stopped renewing, GitHub's run service expired the
 # job at 21:56:25Z, and on resume the runner's renewjob got HTTP 404 ("job is
@@ -17,14 +19,32 @@
 # clock is correct again (WSL resyncs it), so nothing in the job's own output
 # says "suspend" -- the evidence lives only in the Windows event log.
 #
+# ─── What the ARM can and cannot do (read this before trusting it) ─────────
+# SetThreadExecutionState(ES_SYSTEM_REQUIRED) -- the ARM below -- keeps the
+# host out of IDLE standby, the standby Windows enters on its own when the
+# idle timer fires. It does NOT veto a standby something else forces, and a
+# LID CLOSE is exactly that: closing the lid demands Modern Standby and the
+# power request does not block it. Kernel-Power 506 says so itself -- "The
+# system is entering Modern Standby / Reason: Lid." -- and the matching 507
+# exit carries the same "Reason: Lid.". The 2026-09-27 case (run 36350908094,
+# main, merge 8390da3) proves it: the ARM was up -- the ci.yml step logged
+# "keep-awake: armed ... hold=7200s" -- and the host still entered Modern
+# Standby for Reason: Lid at 22:13:48Z, left it at 22:43:44Z, and the frozen
+# job was cancelled on resume. No power request can prevent that; the only
+# fix is to keep the lid OPEN. So the ARM is a mitigation for idle standby,
+# not a guarantee -- and what makes a lid cancel diagnosable is the pair
+# below: PREFLIGHT names the Reason, EVIDENCE records the gap so the next
+# job's PREFLIGHT can report it.
+#
 # A 60-70 minute job (kernel-guards, verify) is exposed to this the whole time
 # it runs, and the red it produces is indistinguishable at a glance from a
 # real CI failure. This script is the fix, at the job boundary:
 #
 #   * ARM -- spawn a Windows PowerShell (through WSL interop) that holds
 #     SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED) for
-#     AEROSLS_KEEP_AWAKE_SECONDS, so connected standby cannot be entered
-#     while the job runs. The request is scoped to that process and needs no
+#     AEROSLS_KEEP_AWAKE_SECONDS, so IDLE connected standby is not entered
+#     while the job runs (it cannot stop a lid-close standby -- see above).
+#     The request is scoped to that process and needs no
 #     elevation and changes no settings (it is what media players use to keep
 #     a machine awake with the screen off; powercfg /change standby-timeout
 #     would need admin, would change the machine permanently, and is
@@ -32,10 +52,12 @@
 #     and the process releases on its own timer if it outlives that -- the
 #     worst case is the host staying awake a little longer, the safe side.
 #   * PREFLIGHT -- at job start, read the Windows Kernel-Power standby events
-#     (506 enter / 507 exit connected standby, 42 sleep / 107 resume) and warn
-#     when the host resumed from standby within AEROSLS_KEEP_AWAKE_RESUME_WINDOW
-#     seconds: a long job starting then is the one that gets expired if it
-#     happens again.
+#     (506 enter / 507 exit Modern Standby, 42 sleep / 107 resume), carry each
+#     event's Reason (Lid, Power Button, ...), and warn when the host resumed
+#     from standby within AEROSLS_KEEP_AWAKE_RESUME_WINDOW seconds: a long job
+#     starting then is the one that gets expired if it happens again. When the
+#     last transition's Reason is Lid it says that outright -- that warning
+#     means the ARM could not have helped and the lid has to stay open.
 #   * EVIDENCE -- a detached sampler takes the wall clock every
 #     AEROSLS_KEEP_AWAKE_SAMPLE_SECONDS; a gap past the sample interval plus
 #     AEROSLS_KEEP_AWAKE_SLACK_SECONDS is the suspend signature (nothing else
@@ -45,8 +67,8 @@
 #     usually cancelled by the service and never writes another line.
 #
 # This step never fails the job: it is a best-effort mitigation, and a host
-# without Windows interop (a plain Linux box, the build host) has no
-# connected standby to keep the runner out of -- it says so and moves on. A
+# without Windows interop (a plain Linux box, the build host) has no Windows
+# Modern Standby for the runner to be caught in -- it says so and moves on. A
 # mitigation that failed closed would red every job on every non-WSL host,
 # a worse bug than the one it prevents.
 #
@@ -55,10 +77,12 @@
 #   check        preflight only (smoke and by hand); exit 0 either way
 #   jump E O     evaluate the gap rule on an expected/observed sample pair
 #   payload      print the base64 -EncodedCommand string the arm path sends
+#   events-payload  print the base64 -EncodedCommand for the Kernel-Power query
 #
 # Test seams (the smoke drives the real parser and rule with these):
-#   --events-file F    read standby events from F (the same "<iso-utc> <id>"
-#                      lines the live query prints) instead of the host log
+#   --events-file F    read standby events from F (the same
+#                      "<iso-utc> <id> <reason>" lines the live query prints)
+#                      instead of the host log
 #   --evidence-file F  read/append the sampler evidence at F
 #   --now-epoch N      treat N as the current time (deterministic windows)
 #   --no-bridge        act as if powershell.exe is absent (foreign host)
@@ -91,7 +115,7 @@ while [ $# -gt 0 ]; do
         --evidence-file) EVIDENCE="${2:?--evidence-file needs a path}"; shift 2 ;;
         --now-epoch)     NOW_EPOCH="${2:?--now-epoch needs seconds}"; shift 2 ;;
         --no-bridge)     NO_BRIDGE=1; shift ;;
-        --*) echo "usage: $0 {start|check|jump E O|payload} [--events-file F]" >&2
+        --*) echo "usage: $0 {start|check|jump E O|payload|events-payload} [--events-file F]" >&2
              echo "       [--evidence-file F] [--now-epoch N] [--no-bridge]" >&2
              exit 2 ;;
         # Leading-dash POSITIONALS reach here too (jump can take a negative
@@ -173,13 +197,20 @@ Start-Sleep -Seconds $1
 EOF
 }
 
+# The query prints "<iso-utc> <id> <reason>", one line per event. The reason
+# is the last event's own Message field, normalized to one token: for an
+# enter/exit Modern Standby event that Message is "... Reason: Lid." (or
+# "Power Button.", "Input Keyboard.", ...), and a state-change 566 carries
+# "Reason PolicyChange" with no colon. The parser in preflight() branches on
+# the ID and keeps the reason of the newest 506/507, so the live line format
+# and the --events-file seam format are one and the same.
 ps_payload_events() {
     cat <<EOF
-Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='Microsoft-Windows-Kernel-Power'; StartTime=(Get-Date).AddSeconds(-$1)} -MaxEvents 80 -ErrorAction SilentlyContinue | ForEach-Object { '{0} {1}' -f \$_.TimeCreated.ToUniversalTime().ToString('o'), \$_.Id }
+Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='Microsoft-Windows-Kernel-Power'; StartTime=(Get-Date).AddSeconds(-$1)} -MaxEvents 80 -ErrorAction SilentlyContinue | ForEach-Object { \$r = ''; \$m = \$_.Message; if (\$m -match 'Reason:\s*([^\.\r\n]+)') { \$r = \$Matches[1].Trim() } elseif (\$m -match 'Reason\s+(\S+)') { \$r = \$Matches[1] }; \$r = \$r -replace '\s+', '_'; '{0} {1} {2}' -f \$_.TimeCreated.ToUniversalTime().ToString('o'), \$_.Id, \$r }
 EOF
 }
 
-collect_events() {   # prints "<iso-utc> <id>" lines; empty when unavailable
+collect_events() {   # prints "<iso-utc> <id> <reason>" lines; empty when unavailable
     if [ -n "$EVENTS_FILE" ]; then
         cat "$EVENTS_FILE" 2>/dev/null || true
         return 0
@@ -194,8 +225,8 @@ collect_events() {   # prints "<iso-utc> <id>" lines; empty when unavailable
 
 # ─── preflight: recent resume (OS truth) + suspend evidence (job history) ──
 preflight() {   # preflight ANNOTATE(1/0)
-    local annotate="$1" src=none events n=0 resumes=0 unparsed=0 warns=0
-    local ts id epoch age tag ets rest egap ejob eepoch eage events_blob
+    local annotate="$1" src=none events n=0 resumes=0 unparsed=0 warns=0 lid=0
+    local ts id reason epoch age rnote lage tag ets rest egap ejob eepoch eage events_blob
 
     if [ -n "$EVENTS_FILE" ]; then
         src=file
@@ -203,8 +234,13 @@ preflight() {   # preflight ANNOTATE(1/0)
         src=live
     fi
     events_blob="$(collect_events)"
-    local latest_resume="" latest_id="" latest_epoch=""
-    while read -r ts id _; do
+    # Two independent trackers, each keeping the NEWEST match by epoch -- the
+    # live query prints newest-first, so "last line wins" would keep the oldest:
+    #   last_*   the most recent enter/exit Modern Standby (506/507) + its Reason
+    #   latest_* the most recent resume (507/107), what the resume warning uses
+    local latest_resume="" latest_id="" latest_epoch="" latest_reason=""
+    local last_id="" last_ts="" last_epoch="" last_reason=""
+    while read -r ts id reason; do
         [ -n "$ts" ] || continue
         n=$(( n + 1 ))
         epoch="$(iso_to_epoch "$ts")"
@@ -213,24 +249,48 @@ preflight() {   # preflight ANNOTATE(1/0)
             continue
         fi
         case "$id" in
-            507|107)   # 507 exit connected standby, 107 resume from sleep
+            506|507)   # enter/exit Modern Standby -- both carry the Reason
+                if [ -z "$last_epoch" ] || [ "$epoch" -gt "$last_epoch" ]; then
+                    last_id="$id"; last_ts="$ts"; last_epoch="$epoch"; last_reason="$reason"
+                fi
+                ;;
+        esac
+        case "$id" in
+            507|107)   # 507 exit Modern Standby, 107 resume from sleep
                 resumes=$(( resumes + 1 ))
-                latest_resume="$ts"
-                latest_id="$id"
-                latest_epoch="$epoch"
+                if [ -z "$latest_epoch" ] || [ "$epoch" -gt "$latest_epoch" ]; then
+                    latest_resume="$ts"; latest_id="$id"; latest_epoch="$epoch"; latest_reason="$reason"
+                fi
                 ;;
         esac
     done <<EOF
 $events_blob
 EOF
 
-    printf 'preflight: source=%s events=%s resumes=%s unparsed=%s evidence=%s\n' \
-        "$src" "$n" "$resumes" "$unparsed" "$EVIDENCE"
+    case "$last_reason" in
+        [Ll][Ii][Dd]) lid=1 ;;
+    esac
+
+    printf 'preflight: source=%s events=%s resumes=%s unparsed=%s reason=%s lid=%s evidence=%s\n' \
+        "$src" "$n" "$resumes" "$unparsed" "${last_reason:-none}" "$lid" "$EVIDENCE"
 
     if [ -n "$latest_epoch" ]; then
         age=$(( $(now) - latest_epoch ))
         if [ "$age" -ge 0 ] && [ "$age" -le "$RESUME_WINDOW" ]; then
-            warn "$annotate" "host resumed from standby ${age}s ago (event ${latest_id} ${latest_resume}, window ${RESUME_WINDOW}s) -- a long job started now risks service-side expiry if the host sleeps again."
+            rnote=""
+            [ -n "$latest_reason" ] && rnote=", reason=${latest_reason}"
+            warn "$annotate" "host resumed from standby ${age}s ago (event ${latest_id} ${latest_resume}${rnote}, window ${RESUME_WINDOW}s) -- a long job started now risks service-side expiry if the host sleeps again."
+            warns=$(( warns + 1 ))
+        fi
+    fi
+
+    # A lid-close standby is the one case the ARM cannot help with, so when the
+    # last transition was a Lid inside the window it gets its own line, with the
+    # remedy: the power request did not fail, it was never able to apply.
+    if [ "$lid" = 1 ] && [ -n "$last_epoch" ]; then
+        lage=$(( $(now) - last_epoch ))
+        if [ "$lage" -ge 0 ] && [ "$lage" -le "$RESUME_WINDOW" ]; then
+            warn "$annotate" "the host's last Modern Standby (event ${last_id} ${last_ts}, ${lage}s ago) was for Reason: ${last_reason} -- SetThreadExecutionState(ES_SYSTEM_REQUIRED) cannot block a lid-close standby, so keep the lid OPEN for the whole job."
             warns=$(( warns + 1 ))
         fi
     fi
@@ -343,8 +403,13 @@ payload)
     echo
     exit 0
     ;;
+events-payload)
+    encode_ps "$(ps_payload_events "$RESUME_WINDOW")"
+    echo
+    exit 0
+    ;;
 *)
-    echo "usage: $0 {start|check|jump E O|payload} [--events-file F] [--evidence-file F] [--now-epoch N] [--no-bridge]" >&2
+    echo "usage: $0 {start|check|jump E O|payload|events-payload} [--events-file F] [--evidence-file F] [--now-epoch N] [--no-bridge]" >&2
     exit 2
     ;;
 esac
