@@ -10,8 +10,9 @@
 # predates the field), the arm payload decodes to the real
 # SetThreadExecutionState call, the events payload reads each event's Message
 # for the Reason over a lookback that follows the wider of the two windows (so
-# an hours-old lid close is still named), and a host with no Windows bridge
-# skips instead of failing.
+# an hours-old lid close is still named), each host power event is annotated
+# exactly once -- a repeat of a suspend already reported goes quiet while a new
+# one still warns -- and a host with no Windows bridge skips instead of failing.
 #
 # ─── Why this exists ───────────────────────────────────────────────────────
 # runner_host_keep_awake.sh decides, from two numbers, whether the runner host
@@ -26,8 +27,12 @@
 # preflight looks), so the live lookback spans the evidence window, not just the
 # resume window, and the lid-remedy gate moved with it. The evidence record the
 # sampler writes carries that same reason forward, so the next job's annotation
-# says why the host slept. The smoke pins both directions: a Lid
-# warns and prints the remedy, another reason does not. A rule
+# says why the host slept. Reporting once matters as much as reporting at all:
+# a record that stays in the window for six hours would otherwise be
+# re-annotated by every job behind it (run 36363316334 printed the same
+# 2026-09-27T22:43:56Z suspend from three jobs), so the ledger silences what CI
+# has already said and only new events speak. The smoke pins both directions:
+# a Lid warns and prints the remedy, another reason does not. A rule
 # like that fails in both directions: too loose and a suspend reads as a
 # normal job, too eager and every loaded host warns on itself. The boundaries
 # (at the slack, one second past it) are pinned here, not just the extreme
@@ -64,6 +69,9 @@
 #                                              + keep the lid OPEN
 #   evidence: suspend 10 min ago, power btn -> 1 warning, reason named, no lid
 #   evidence: suspend 10 min ago, no reason  -> 1 warning, no cause claimed
+#   announce-once: same record twice        -> 1 warning, then 0
+#   announce-once: a later lid close        -> still warns (a new event)
+#   announce-once: same timestamp, two jobs -> 2 warnings (two events)
 #   lid: resume 3000s ago, inside evidence  -> 1 warning, Reason: Lid + remedy
 #   events payload lookback (600/21600)     -> AddSeconds(-21600) (wider wins)
 #   reason-field 1811s (lid fixture)        -> reason=Lid
@@ -115,6 +123,10 @@ fixture_event_reason "$((NOW - 181))"  507 Power_Button >> "$T/powerbutton.event
 # remedy gate moved with it).
 fixture_event_reason "$((NOW - 3000))" 506 Lid >  "$T/lid-old.events"
 fixture_event_reason "$((NOW - 2800))" 507 Lid >> "$T/lid-old.events"
+# A LATER lid close: a distinct host power event (new timestamps), so the
+# announce-once ledger must still report it after an older event was reported.
+fixture_event_reason "$((NOW - 90))" 506 Lid >  "$T/lid-later.events"
+fixture_event_reason "$((NOW - 60))" 507 Lid >> "$T/lid-later.events"
 : > "$T/none.events"
 printf 'SUSPENDED %s gap=1323s job=kernel-guards\n' \
     "$(date -u -d "@$((NOW - 1200))" +%Y-%m-%dT%H:%M:%SZ)" > "$T/evidence-recent.log"
@@ -128,10 +140,28 @@ printf 'SUSPENDED %s gap=1323s job=kernel-guards reason=Lid\n' \
     "$(date -u -d "@$((NOW - 1200))" +%Y-%m-%dT%H:%M:%SZ)" > "$T/evidence-lid.log"
 printf 'SUSPENDED %s gap=1323s job=verify reason=Power_Button\n' \
     "$(date -u -d "@$((NOW - 1200))" +%Y-%m-%dT%H:%M:%SZ)" > "$T/evidence-powerbutton.log"
+# Two suspend records in one file: each is its own event, so each gets its one
+# report. The second pair below shares a timestamp on purpose -- a record is
+# identified by its whole line, not by the clock alone.
+printf 'SUSPENDED %s gap=1323s job=kernel-guards reason=Lid\nSUSPENDED %s gap=900s job=verify reason=Power_Button\n' \
+    "$(date -u -d "@$((NOW - 1200))" +%Y-%m-%dT%H:%M:%SZ)" \
+    "$(date -u -d "@$((NOW - 3000))" +%Y-%m-%dT%H:%M:%SZ)" > "$T/evidence-two.log"
+printf 'SUSPENDED %s gap=1323s job=kernel-guards reason=Lid\nSUSPENDED %s gap=900s job=verify reason=Power_Button\n' \
+    "$(date -u -d "@$((NOW - 1200))" +%Y-%m-%dT%H:%M:%SZ)" \
+    "$(date -u -d "@$((NOW - 1200))" +%Y-%m-%dT%H:%M:%SZ)" > "$T/evidence-samets.log"
 
 check_out() {  # check_out EVENTS_FILE EVIDENCE_FILE -> preflight output
+    # `check` never touches the announce-once ledger: a by-hand run must not
+    # consume or suppress the annotation CI is going to emit.
     bash "$KEEP" check --no-bridge --now-epoch "$NOW" \
+        --announced-file "$T/ann-check.log" \
         --events-file "$1" --evidence-file "$2" 2>&1
+}
+
+ann_start() {  # ann_start ANNOUNCED EVENTS EVIDENCE -> the annotating path
+    AEROSLS_KEEP_AWAKE_LOG="$T/keep.log" bash "$KEEP" start --no-bridge \
+        --now-epoch "$NOW" --announced-file "$1" \
+        --events-file "$2" --evidence-file "$3" 2>&1
 }
 
 expect_verdict() {  # expected observed want label
@@ -367,6 +397,49 @@ if grep -q 'collect_events "\$EVENTS_LOOKBACK"' "$KEEP"; then
     ok "preflight's live query is issued over the widened lookback"
 else
     bad "preflight still queries only the resume window"
+fi
+
+echo
+# ── 27. each recorded suspend is annotated once, not by every job behind it ─
+# The frozen job never writes another line, so its record has to survive to a
+# later job -- but only to ONE. Two records in the file are two events.
+ann="$T/ann-evidence.log"
+o1="$(ann_start "$ann" "$T/none.events" "$T/evidence-two.log")"
+o2="$(ann_start "$ann" "$T/none.events" "$T/evidence-two.log")"
+if has "$o1" 'preflight: warnings=2' && has "$o1" '::warning title=Runner host standby::' \
+    && has "$o2" 'preflight: warnings=0' && ! has "$o2" 'WARN' \
+    && ! has "$o2" '::warning'; then
+    ok "two recorded suspends are annotated once each, then the repeats go quiet"
+else
+    bad "the announce-once ledger did not silence the repeat:"
+    printf '%s\n' "$o1" | sed 's/^/      first:  /'
+    printf '%s\n' "$o2" | sed 's/^/      second: /'
+fi
+
+# ── 28. the live events are announced once too, and a NEW event still warns ─
+ann="$T/ann-live.log"
+o1="$(ann_start "$ann" "$T/lid.events" "$T/absent.log")"
+o2="$(ann_start "$ann" "$T/lid.events" "$T/absent.log")"
+o3="$(ann_start "$ann" "$T/lid-later.events" "$T/absent.log")"
+if has "$o1" 'preflight: warnings=2' && has "$o1" 'keep the lid OPEN' \
+    && has "$o2" 'preflight: warnings=0' && ! has "$o2" 'WARN' \
+    && has "$o3" 'preflight: warnings=2' && has "$o3" 'keep the lid OPEN'; then
+    ok "a live lid transition is annotated once; a later one still warns"
+else
+    bad "the live announce-once rule misfired:"
+    printf '%s\n' "$o1" | sed 's/^/      first:  /'
+    printf '%s\n' "$o2" | sed 's/^/      second: /'
+    printf '%s\n' "$o3" | sed 's/^/      later:  /'
+fi
+
+# ── 29. two records sharing a timestamp are two events ─────────────────────
+ann="$T/ann-samets.log"
+o1="$(ann_start "$ann" "$T/none.events" "$T/evidence-samets.log")"
+if has "$o1" 'preflight: warnings=2'; then
+    ok "two records at the same timestamp are still two events, both reported"
+else
+    bad "a shared timestamp collapsed two records into one report:"
+    printf '%s\n' "$o1" | sed 's/^/      /'
 fi
 
 echo

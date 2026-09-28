@@ -75,7 +75,10 @@
 #     the suspended job is usually cancelled by the service and never writes
 #     another line, so this record is the only place the cause survives. When
 #     that Reason is Lid the warning says so and prints the remedy, exactly
-#     like the preflight line above.
+#     like the preflight line above. It surfaces to exactly ONE job, though:
+#     the first preflight to see a host power event annotates it and records
+#     that fact, so the jobs behind it -- every one inside the same window --
+#     stay quiet instead of repeating the same line.
 #
 # This step never fails the job: it is a best-effort mitigation, and a host
 # without Windows interop (a plain Linux box, the build host) has no Windows
@@ -98,6 +101,7 @@
 #                      "<iso-utc> <id> <reason>" lines the live query prints)
 #                      instead of the host log
 #   --evidence-file F  read/append the sampler evidence at F
+#   --announced-file F read/write the announce-once ledger at F
 #   --now-epoch N      treat N as the current time (deterministic windows)
 #   --no-bridge        act as if powershell.exe is absent (foreign host)
 #
@@ -105,7 +109,9 @@
 #      _SLACK_SECONDS (60), _RESUME_WINDOW (600, resume warning),
 #      _EVIDENCE_WINDOW (21600, evidence record AND the live event lookback /
 #      lid-remedy horizon -- the live lookback is the wider of the two),
-#      _LOG (/tmp/aerosls-keep-awake.log), _EVIDENCE (/tmp/aerosls-host-standby.log)
+#      _LOG (/tmp/aerosls-keep-awake.log), _EVIDENCE (/tmp/aerosls-host-standby.log),
+#      _ANNOUNCED (/tmp/aerosls-keep-awake-announced.log -- what CI has already
+#      annotated, so a suspend is reported once instead of by every later job)
 #
 # Exit: 0 always (a skipped mitigation is not a failure), 2 on a usage error.
 set -u
@@ -125,6 +131,9 @@ EVIDENCE_WINDOW="${AEROSLS_KEEP_AWAKE_EVIDENCE_WINDOW:-21600}"
 EVENTS_LOOKBACK=$(( RESUME_WINDOW > EVIDENCE_WINDOW ? RESUME_WINDOW : EVIDENCE_WINDOW ))
 LOG="${AEROSLS_KEEP_AWAKE_LOG:-/tmp/aerosls-keep-awake.log}"
 EVIDENCE="${AEROSLS_KEEP_AWAKE_EVIDENCE:-/tmp/aerosls-host-standby.log}"
+# Per-host ledger of the host power events CI has already annotated (see
+# warn_once): a suspend is worth one annotation, not one per job.
+ANNOUNCED="${AEROSLS_KEEP_AWAKE_ANNOUNCED:-/tmp/aerosls-keep-awake-announced.log}"
 
 MODE="${1:-start}"
 [ $# -gt 0 ] && shift
@@ -136,10 +145,11 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --events-file)   EVENTS_FILE="${2:?--events-file needs a path}"; shift 2 ;;
         --evidence-file) EVIDENCE="${2:?--evidence-file needs a path}"; shift 2 ;;
+        --announced-file) ANNOUNCED="${2:?--announced-file needs a path}"; shift 2 ;;
         --now-epoch)     NOW_EPOCH="${2:?--now-epoch needs seconds}"; shift 2 ;;
         --no-bridge)     NO_BRIDGE=1; shift ;;
         --*) echo "usage: $0 {start|check|jump E O|reason-field GAP|payload|events-payload}" >&2
-             echo "       [--events-file F]" >&2
+             echo "       [--events-file F] [--announced-file F]" >&2
              echo "       [--evidence-file F] [--now-epoch N] [--no-bridge]" >&2
              exit 2 ;;
         # Leading-dash POSITIONALS reach here too (jump can take a negative
@@ -190,6 +200,34 @@ warn() {   # warn ANNOTATE(1/0) MESSAGE...  -- annotation in the CI step, text a
         printf '::warning title=Runner host standby::%s\n' "$*"
     fi
     printf 'WARN  %s\n' "$*"
+}
+
+# ─── announce each host power event once ──────────────────────────────────
+# The frozen job cannot annotate its own suspend, so the record -- and the live
+# Kernel-Power transition behind it -- has to survive to a later job. It must
+# survive to exactly ONE: every job inside the window would otherwise repeat the
+# same annotation (run 36363316334 reported the 2026-09-27T22:43:56Z suspend
+# from three separate jobs). This ledger is the per-host memory of what has
+# already been said. It is read and written only when an annotation is actually
+# emitted (annotate=1), so a by-hand `check` neither consumes nor suppresses a
+# CI annotation. A new host power event carries a new key, so it announces
+# itself; only a repeat of an event already reported is silent.
+announced() {   # announced KEY -- true when this event was already annotated
+    [ -f "$ANNOUNCED" ] || return 1
+    grep -qxF -- "$1" "$ANNOUNCED" 2>/dev/null
+}
+announce() {   # announce KEY -- remember this event as annotated
+    printf '%s\n' "$1" >> "$ANNOUNCED" 2>/dev/null || true
+}
+warn_once() {   # warn_once ANNOTATE KEY MESSAGE... -- warn() at most once per KEY
+    local annotate="$1" key="$2"
+    shift 2
+    if [ "$annotate" = 1 ]; then
+        if announced "$key"; then return 1; fi
+        announce "$key"
+    fi
+    warn "$annotate" "$@"
+    return 0
 }
 
 # ─── PowerShell payloads, as -EncodedCommand strings ───────────────────────
@@ -255,7 +293,7 @@ collect_events() {   # collect_events [LOOKBACK_SECONDS] -> "<iso-utc> <id> <rea
 preflight() {   # preflight ANNOTATE(1/0)
     local annotate="$1" src=none events n=0 resumes=0 unparsed=0 warns=0 lid=0
     local ts id reason epoch age rnote lage tag ets rest egap ejob eepoch eage events_blob
-    local ereason rfield
+    local ereason rfield emsg
 
     if [ -n "$EVENTS_FILE" ]; then
         src=file
@@ -308,8 +346,10 @@ EOF
         if [ "$age" -ge 0 ] && [ "$age" -le "$RESUME_WINDOW" ]; then
             rnote=""
             [ -n "$latest_reason" ] && rnote=", reason=${latest_reason}"
-            warn "$annotate" "host resumed from standby ${age}s ago (event ${latest_id} ${latest_resume}${rnote}, window ${RESUME_WINDOW}s) -- a long job started now risks service-side expiry if the host sleeps again."
-            warns=$(( warns + 1 ))
+            if warn_once "$annotate" "resume:${latest_id} ${latest_resume}" \
+                "host resumed from standby ${age}s ago (event ${latest_id} ${latest_resume}${rnote}, window ${RESUME_WINDOW}s) -- a long job started now risks service-side expiry if the host sleeps again."; then
+                warns=$(( warns + 1 ))
+            fi
         fi
     fi
 
@@ -322,8 +362,10 @@ EOF
     if [ "$lid" = 1 ] && [ -n "$last_epoch" ]; then
         lage=$(( $(now) - last_epoch ))
         if [ "$lage" -ge 0 ] && [ "$lage" -le "$EVIDENCE_WINDOW" ]; then
-            warn "$annotate" "the host's last Modern Standby (event ${last_id} ${last_ts}, ${lage}s ago, within the last ${EVIDENCE_WINDOW}s) was for Reason: ${last_reason} -- SetThreadExecutionState(ES_SYSTEM_REQUIRED) cannot block a lid-close standby, so keep the lid OPEN for the whole job."
-            warns=$(( warns + 1 ))
+            if warn_once "$annotate" "lid:${last_id} ${last_ts}" \
+                "the host's last Modern Standby (event ${last_id} ${last_ts}, ${lage}s ago, within the last ${EVIDENCE_WINDOW}s) was for Reason: ${last_reason} -- SetThreadExecutionState(ES_SYSTEM_REQUIRED) cannot block a lid-close standby, so keep the lid OPEN for the whole job."; then
+                warns=$(( warns + 1 ))
+            fi
         fi
     fi
 
@@ -348,11 +390,16 @@ EOF
                             [Ll][Ii][Dd]) rfield="${rfield} -- SetThreadExecutionState(ES_SYSTEM_REQUIRED) cannot block a lid-close standby, so keep the lid OPEN for the whole job." ;;
                         esac
                     fi
-                    warn "$annotate" "${EVIDENCE} records a suspend gap during job '${ejob:-unknown}': gap=${egap:-?}s at ${ets} (within the last ${EVIDENCE_WINDOW}s)${rfield}"
+                    emsg="${EVIDENCE} records a suspend gap during job '${ejob:-unknown}': gap=${egap:-?}s at ${ets} (within the last ${EVIDENCE_WINDOW}s)${rfield}"
                 else
-                    warn "$annotate" "${EVIDENCE} records a backwards clock step during job '${ejob:-unknown}': gap=${egap:-?}s at ${ets} (within the last ${EVIDENCE_WINDOW}s)."
+                    emsg="${EVIDENCE} records a backwards clock step during job '${ejob:-unknown}': gap=${egap:-?}s at ${ets} (within the last ${EVIDENCE_WINDOW}s)."
                 fi
-                warns=$(( warns + 1 ))
+                # Keyed on the record itself, not just its timestamp: two
+                # records that share a timestamp (a different job, gap or
+                # Reason) are still two events and each gets its one report.
+                if warn_once "$annotate" "evidence:${tag} ${ets} ${rest}" "$emsg"; then
+                    warns=$(( warns + 1 ))
+                fi
             fi
         done < "$EVIDENCE"
     fi
@@ -486,7 +533,7 @@ events-payload)
     exit 0
     ;;
 *)
-    echo "usage: $0 {start|check|jump E O|reason-field GAP|payload|events-payload} [--events-file F] [--evidence-file F] [--now-epoch N] [--no-bridge]" >&2
+    echo "usage: $0 {start|check|jump E O|reason-field GAP|payload|events-payload} [--events-file F] [--evidence-file F] [--announced-file F] [--now-epoch N] [--no-bridge]" >&2
     exit 2
     ;;
 esac
