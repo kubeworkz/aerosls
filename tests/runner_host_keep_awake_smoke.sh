@@ -4,14 +4,35 @@
 # one second past the limit is a suspend, a backwards step is classified as one,
 # a resume inside the window warns while an old one does not, an enter with no
 # exit is not a resume, recent suspend evidence warns while old evidence does
-# not, the arm payload decodes to the real SetThreadExecutionState call, and a
-# host with no Windows bridge skips instead of failing.
+# not, a Lid-close Reason is surfaced with its remedy while another Reason is
+# not, a suspend gap the sampler recorded names the Reason it recovered (Lid and
+# its remedy, another reason without one, no cause at all when the record
+# predates the field), the arm payload decodes to the real
+# SetThreadExecutionState call, the events payload reads each event's Message
+# for the Reason over a lookback that follows the wider of the two windows (so
+# an hours-old lid close is still named), each host power event is annotated
+# exactly once -- a repeat of a suspend already reported goes quiet while a new
+# one still warns -- and a host with no Windows bridge skips instead of failing.
 #
 # ─── Why this exists ───────────────────────────────────────────────────────
 # runner_host_keep_awake.sh decides, from two numbers, whether the runner host
 # stopped running -- the suspend signature that killed kernel-guards in run
-# 36270544785 (2026-09-26: connected standby at 21:46:44Z, the WSL VM frozen
-# 21 minutes, the job expired service-side and cancelled on resume). A rule
+# 36270544785 (2026-09-26: Modern Standby at 21:46:44Z, the WSL VM frozen
+# 21 minutes, the job expired service-side and cancelled on resume). It also
+# reports WHY the standby happened, from the Kernel-Power Reason: the
+# 2026-09-27 case (run 36350908094) died the same way with Reason: Lid, which
+# the keep-awake power request cannot prevent -- so the reason is named and the
+# remedy (keep the lid open) is printed. That naming has to survive an hours-old
+# suspend (the frozen job never writes another line; only the NEXT job's
+# preflight looks), so the live lookback spans the evidence window, not just the
+# resume window, and the lid-remedy gate moved with it. The evidence record the
+# sampler writes carries that same reason forward, so the next job's annotation
+# says why the host slept. Reporting once matters as much as reporting at all:
+# a record that stays in the window for six hours would otherwise be
+# re-annotated by every job behind it (run 36363316334 printed the same
+# 2026-09-27T22:43:56Z suspend from three jobs), so the ledger silences what CI
+# has already said and only new events speak. The smoke pins both directions:
+# a Lid warns and prints the remedy, another reason does not. A rule
 # like that fails in both directions: too loose and a suspend reads as a
 # normal job, too eager and every loaded host warns on itself. The boundaries
 # (at the slack, one second past it) are pinned here, not just the extreme
@@ -21,9 +42,9 @@
 # (fixtures in $T, a fixed --now-epoch), so the smoke is hermetic: it never
 # reads the live Windows event log, never arms a power request, and never
 # writes the shared /tmp evidence. The fixture line format is exactly what the
-# live Get-WinEvent query prints ("<iso-utc> <id>"), so the parser under test
-# is the parser the runner runs; the 2026-09-26 pair is reproduced here as
-# timestamped fixture data, not as a special case.
+# live Get-WinEvent query prints ("<iso-utc> <id> <reason>"), so the parser
+# under test is the parser the runner runs; the 2026-09-26/27 pairs are
+# reproduced here as timestamped fixture data, not as a special case.
 #
 # Source-only: needs only the tree, GNU date and base64/iconv (coreutils). No
 # build, no QEMU, so it runs in the verify job's run_source_smokes.sh on every
@@ -44,7 +65,22 @@
 #   evidence: suspend 20 min ago           -> 1 warning, names the job + gap
 #   evidence: suspend 25 h ago             -> warnings=0
 #   evidence: step back 10 min ago         -> 1 warning, clock-step wording
+#   evidence: suspend 10 min ago, reason Lid -> 1 warning naming Reason: Lid
+#                                              + keep the lid OPEN
+#   evidence: suspend 10 min ago, power btn -> 1 warning, reason named, no lid
+#   evidence: suspend 10 min ago, no reason  -> 1 warning, no cause claimed
+#   announce-once: same record twice        -> 1 warning, then 0
+#   announce-once: a later lid close        -> still warns (a new event)
+#   announce-once: same timestamp, two jobs -> 2 warnings (two events)
+#   lid: resume 3000s ago, inside evidence  -> 1 warning, Reason: Lid + remedy
+#   events payload lookback (600/21600)     -> AddSeconds(-21600) (wider wins)
+#   reason-field 1811s (lid fixture)        -> reason=Lid
+#   reason-field 1811s (reason-less lines)  -> no reason field
 #   payload decoded                        -> SetThreadExecutionState + 2147483649
+#   events payload decoded                 -> Kernel-Power query reads each Message
+#   lid: resume 181s ago, reason Lid       -> 2 warnings: resume + lid remedy
+#   power button: resume 181s ago          -> 1 warning, reason named, no lid
+#   no-reason event line (2 fields)        -> reason=none lid=0, still parses
 #   start --no-bridge                      -> SKIP, exit 0
 #
 # Exit: 0 if every tooth bit, 1 otherwise.
@@ -66,11 +102,31 @@ NOW=1790000000
 fixture_event() {  # fixture_event EPOCH ID -> "<iso-utc> <id>"
     printf '%s %s\n' "$(date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ)" "$2"
 }
+fixture_event_reason() {  # EPOCH ID REASON -> "<iso-utc> <id> <reason>"
+    printf '%s %s %s\n' "$(date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ)" "$2" "$3"
+}
 fixture_event "$((NOW - 181))"  507 > "$T/recent.events"
 fixture_event "$((NOW - 1500))" 506 >> "$T/recent.events"
 fixture_event "$((NOW - 4000))" 507 > "$T/old.events"
 fixture_event "$((NOW - 1500))" 506 > "$T/enter-only.events"
 fixture_event "$((NOW - 1498))" 566 >> "$T/enter-only.events"
+# A lid close forces Modern Standby with Reason: Lid on both the 506 enter and
+# the 507 exit -- the shape the 2026-09-27 host showed. A Power Button pair is
+# the control that must NOT claim a lid.
+fixture_event_reason "$((NOW - 1500))" 506 Lid          >  "$T/lid.events"
+fixture_event_reason "$((NOW - 181))"  507 Lid          >> "$T/lid.events"
+fixture_event_reason "$((NOW - 1500))" 506 Power_Button >  "$T/powerbutton.events"
+fixture_event_reason "$((NOW - 181))"  507 Power_Button >> "$T/powerbutton.events"
+# A lid close HOURS before the job started: past the 600s resume window but
+# inside the 21600s evidence window, so the resume warning does not fire while
+# the cause still must be named (the live lookback reaches it, and the lid
+# remedy gate moved with it).
+fixture_event_reason "$((NOW - 3000))" 506 Lid >  "$T/lid-old.events"
+fixture_event_reason "$((NOW - 2800))" 507 Lid >> "$T/lid-old.events"
+# A LATER lid close: a distinct host power event (new timestamps), so the
+# announce-once ledger must still report it after an older event was reported.
+fixture_event_reason "$((NOW - 90))" 506 Lid >  "$T/lid-later.events"
+fixture_event_reason "$((NOW - 60))" 507 Lid >> "$T/lid-later.events"
 : > "$T/none.events"
 printf 'SUSPENDED %s gap=1323s job=kernel-guards\n' \
     "$(date -u -d "@$((NOW - 1200))" +%Y-%m-%dT%H:%M:%SZ)" > "$T/evidence-recent.log"
@@ -78,10 +134,34 @@ printf 'SUSPENDED %s gap=1323s job=kernel-guards\n' \
     "$(date -u -d "@$((NOW - 90000))" +%Y-%m-%dT%H:%M:%SZ)" > "$T/evidence-old.log"
 printf 'STEPBACK %s gap=5s job=verify\n' \
     "$(date -u -d "@$((NOW - 600))" +%Y-%m-%dT%H:%M:%SZ)" > "$T/evidence-stepback.log"
+# What the sampler writes once it has recovered the cause: the same line, plus
+# the Reason token. The 2026-09-27 record is this shape with Lid.
+printf 'SUSPENDED %s gap=1323s job=kernel-guards reason=Lid\n' \
+    "$(date -u -d "@$((NOW - 1200))" +%Y-%m-%dT%H:%M:%SZ)" > "$T/evidence-lid.log"
+printf 'SUSPENDED %s gap=1323s job=verify reason=Power_Button\n' \
+    "$(date -u -d "@$((NOW - 1200))" +%Y-%m-%dT%H:%M:%SZ)" > "$T/evidence-powerbutton.log"
+# Two suspend records in one file: each is its own event, so each gets its one
+# report. The second pair below shares a timestamp on purpose -- a record is
+# identified by its whole line, not by the clock alone.
+printf 'SUSPENDED %s gap=1323s job=kernel-guards reason=Lid\nSUSPENDED %s gap=900s job=verify reason=Power_Button\n' \
+    "$(date -u -d "@$((NOW - 1200))" +%Y-%m-%dT%H:%M:%SZ)" \
+    "$(date -u -d "@$((NOW - 3000))" +%Y-%m-%dT%H:%M:%SZ)" > "$T/evidence-two.log"
+printf 'SUSPENDED %s gap=1323s job=kernel-guards reason=Lid\nSUSPENDED %s gap=900s job=verify reason=Power_Button\n' \
+    "$(date -u -d "@$((NOW - 1200))" +%Y-%m-%dT%H:%M:%SZ)" \
+    "$(date -u -d "@$((NOW - 1200))" +%Y-%m-%dT%H:%M:%SZ)" > "$T/evidence-samets.log"
 
 check_out() {  # check_out EVENTS_FILE EVIDENCE_FILE -> preflight output
+    # `check` never touches the announce-once ledger: a by-hand run must not
+    # consume or suppress the annotation CI is going to emit.
     bash "$KEEP" check --no-bridge --now-epoch "$NOW" \
+        --announced-file "$T/ann-check.log" \
         --events-file "$1" --evidence-file "$2" 2>&1
+}
+
+ann_start() {  # ann_start ANNOUNCED EVENTS EVIDENCE -> the annotating path
+    AEROSLS_KEEP_AWAKE_LOG="$T/keep.log" bash "$KEEP" start --no-bridge \
+        --now-epoch "$NOW" --announced-file "$1" \
+        --events-file "$2" --evidence-file "$3" 2>&1
 }
 
 expect_verdict() {  # expected observed want label
@@ -182,6 +262,184 @@ if [ "$rc" = 0 ] && has "$out" 'keep-awake: SKIP' && ! has "$out" 'WARN'; then
 else
     bad "start --no-bridge did not skip cleanly (rc=$rc):"
     printf '%s\n' "$out" | sed 's/^/      /'
+fi
+
+# ── 15. a Lid reason is surfaced, with the remedy, alongside the resume ─────
+out="$(check_out "$T/lid.events" "$T/absent.log")"
+rc=$?
+if [ "$rc" = 0 ] && has "$out" 'reason=Lid lid=1' \
+    && has "$out" 'host resumed from standby 181s ago (event 507' \
+    && has "$out" 'reason=Lid' && has "$out" 'was for Reason: Lid' \
+    && has "$out" 'keep the lid OPEN' && has "$out" 'preflight: warnings=2'; then
+    ok "a Lid-close transition warns twice: the resume plus the lid remedy"
+else
+    bad "a lid reason was not surfaced as expected (rc=$rc):"
+    printf '%s\n' "$out" | sed 's/^/      /'
+fi
+
+# ── 16. the lid rule is specific: another reason names itself, no lid claim ──
+out="$(check_out "$T/powerbutton.events" "$T/absent.log")"
+if has "$out" 'reason=Power_Button lid=0' && has "$out" 'reason=Power_Button' \
+    && ! has "$out" 'keep the lid OPEN' && has "$out" 'preflight: warnings=1'; then
+    ok "a non-lid reason (Power_Button) is named but does not claim a lid"
+else
+    bad "a non-lid reason was misread:"
+    printf '%s\n' "$out" | sed 's/^/      /'
+fi
+
+# ── 17. a two-field line (the old format, no reason) still parses ──────────
+out="$(check_out "$T/recent.events" "$T/absent.log")"
+if has "$out" 'reason=none lid=0' && has "$out" 'preflight: warnings=1'; then
+    ok "a two-field event line (no reason) parses as reason=none lid=0"
+else
+    bad "a reason-less line broke the parser:"
+    printf '%s\n' "$out" | sed 's/^/      /'
+fi
+
+# ── 18. the events payload the live preflight sends fetches the Message ────
+enc="$(bash "$KEEP" events-payload 2>/dev/null | head -n 1)"
+ps_text="$(printf '%s' "$enc" | base64 -d 2>/dev/null | iconv -f UTF-16LE -t UTF-8 2>/dev/null || true)"
+if has "$ps_text" 'Microsoft-Windows-Kernel-Power' && has "$ps_text" '$_.Message' \
+    && has "$ps_text" 'Reason:' && has "$ps_text" '.Id'; then
+    ok "events payload queries Kernel-Power and reads each event's Message/Reason"
+else
+    bad "events payload did not carry the reason query (${#enc} base64 chars):"
+    printf '%s\n' "$ps_text" | sed 's/^/      /'
+fi
+
+echo
+# ── 19. a recorded suspend gap names the Reason it recovered ───────────────
+out="$(check_out "$T/none.events" "$T/evidence-lid.log")"
+if has "$out" "records a suspend gap during job 'kernel-guards'" \
+    && has "$out" 'Reason: Lid' && has "$out" 'keep the lid OPEN' \
+    && has "$out" 'preflight: warnings=1'; then
+    ok "a recorded lid-close gap names Reason: Lid and prints the remedy"
+else
+    bad "a recorded lid reason was not surfaced:"
+    printf '%s\n' "$out" | sed 's/^/      /'
+fi
+
+# ── 20. the evidence lid rule is specific: another reason claims no lid ────
+out="$(check_out "$T/none.events" "$T/evidence-powerbutton.log")"
+if has "$out" 'Reason: Power_Button' && ! has "$out" 'keep the lid OPEN' \
+    && has "$out" 'preflight: warnings=1'; then
+    ok "a recorded non-lid gap names its reason without claiming a lid"
+else
+    bad "a recorded non-lid reason was misread:"
+    printf '%s\n' "$out" | sed 's/^/      /'
+fi
+
+# ── 21. a record from before the field existed still warns, cause-free ─────
+out="$(check_out "$T/none.events" "$T/evidence-recent.log")"
+if has "$out" 'records a suspend gap' && ! has "$out" 'Reason:' \
+    && has "$out" 'preflight: warnings=1'; then
+    ok "a reason-less suspend record warns without claiming a cause"
+else
+    bad "a reason-less record gained a cause:"
+    printf '%s\n' "$out" | sed 's/^/      /'
+fi
+
+# ── 22. the lookup the sampler runs on a gap: newest 506/507 wins ──────────
+out="$(bash "$KEEP" reason-field 1811 --no-bridge --now-epoch "$NOW" \
+    --events-file "$T/lid.events" 2>&1)"
+if [ "$out" = 'reason-field reason=Lid' ]; then
+    ok "reason-field recovers the newest 506/507 Reason (reason=Lid)"
+else
+    bad "reason-field did not recover the lid reason: '$out'"
+fi
+
+out="$(bash "$KEEP" reason-field 1811 --no-bridge --now-epoch "$NOW" \
+    --events-file "$T/recent.events" 2>&1)"
+if [ "$out" = 'reason-field' ]; then
+    ok "reason-field claims nothing when the events carry no reason"
+else
+    bad "reason-field invented a cause: '$out'"
+fi
+
+# ── 23. the sampler's own record really carries that field ─────────────────
+if grep -q 'standby_reason_field "\$delta"' "$KEEP"; then
+    ok "the sampler appends the recovered reason to the gap it records"
+else
+    bad "the sampler writes its gap record without the reason field"
+fi
+
+# ── 24. a lid close older than the resume window is still named ────────────
+# The live lookback spans the evidence window now, and the lid-remedy gate
+# moved with it, so a close that happened hours ago is still the reason the
+# host slept -- and still prints the remedy. The resume warning stays at its
+# own window: this is a cause, not an imminent re-sleep.
+out="$(check_out "$T/lid-old.events" "$T/absent.log")"
+if has "$out" 'reason=Lid lid=1' && has "$out" 'was for Reason: Lid' \
+    && has "$out" 'keep the lid OPEN' && ! has "$out" 'host resumed from standby' \
+    && has "$out" 'preflight: warnings=1'; then
+    ok "a lid close older than the resume window is still named (evidence window)"
+else
+    bad "an old lid transition was not named:"
+    printf '%s\n' "$out" | sed 's/^/      /'
+fi
+
+# ── 25. the live lookback really is the wider of the two windows ───────────
+ps_from() {  # ps_from RESUME_WINDOW EVIDENCE_WINDOW -> decoded events payload
+    local e
+    e="$(AEROSLS_KEEP_AWAKE_RESUME_WINDOW="$1" AEROSLS_KEEP_AWAKE_EVIDENCE_WINDOW="$2" \
+        bash "$KEEP" events-payload 2>/dev/null | head -n 1)"
+    printf '%s' "$e" | base64 -d 2>/dev/null | iconv -f UTF-16LE -t UTF-8 2>/dev/null || true
+}
+if has "$(ps_from 600 21600)" 'AddSeconds(-21600)' \
+    && has "$(ps_from 43200 600)" 'AddSeconds(-43200)'; then
+    ok "the live lookback follows the wider window (evidence 21600; resume when wider)"
+else
+    bad "the live lookback did not follow the wider of the two windows"
+fi
+
+# ── 26. preflight's own query is issued over that lookback ─────────────────
+if grep -q 'collect_events "\$EVENTS_LOOKBACK"' "$KEEP"; then
+    ok "preflight's live query is issued over the widened lookback"
+else
+    bad "preflight still queries only the resume window"
+fi
+
+echo
+# ── 27. each recorded suspend is annotated once, not by every job behind it ─
+# The frozen job never writes another line, so its record has to survive to a
+# later job -- but only to ONE. Two records in the file are two events.
+ann="$T/ann-evidence.log"
+o1="$(ann_start "$ann" "$T/none.events" "$T/evidence-two.log")"
+o2="$(ann_start "$ann" "$T/none.events" "$T/evidence-two.log")"
+if has "$o1" 'preflight: warnings=2' && has "$o1" '::warning title=Runner host standby::' \
+    && has "$o2" 'preflight: warnings=0' && ! has "$o2" 'WARN' \
+    && ! has "$o2" '::warning'; then
+    ok "two recorded suspends are annotated once each, then the repeats go quiet"
+else
+    bad "the announce-once ledger did not silence the repeat:"
+    printf '%s\n' "$o1" | sed 's/^/      first:  /'
+    printf '%s\n' "$o2" | sed 's/^/      second: /'
+fi
+
+# ── 28. the live events are announced once too, and a NEW event still warns ─
+ann="$T/ann-live.log"
+o1="$(ann_start "$ann" "$T/lid.events" "$T/absent.log")"
+o2="$(ann_start "$ann" "$T/lid.events" "$T/absent.log")"
+o3="$(ann_start "$ann" "$T/lid-later.events" "$T/absent.log")"
+if has "$o1" 'preflight: warnings=2' && has "$o1" 'keep the lid OPEN' \
+    && has "$o2" 'preflight: warnings=0' && ! has "$o2" 'WARN' \
+    && has "$o3" 'preflight: warnings=2' && has "$o3" 'keep the lid OPEN'; then
+    ok "a live lid transition is annotated once; a later one still warns"
+else
+    bad "the live announce-once rule misfired:"
+    printf '%s\n' "$o1" | sed 's/^/      first:  /'
+    printf '%s\n' "$o2" | sed 's/^/      second: /'
+    printf '%s\n' "$o3" | sed 's/^/      later:  /'
+fi
+
+# ── 29. two records sharing a timestamp are two events ─────────────────────
+ann="$T/ann-samets.log"
+o1="$(ann_start "$ann" "$T/none.events" "$T/evidence-samets.log")"
+if has "$o1" 'preflight: warnings=2'; then
+    ok "two records at the same timestamp are still two events, both reported"
+else
+    bad "a shared timestamp collapsed two records into one report:"
+    printf '%s\n' "$o1" | sed 's/^/      /'
 fi
 
 echo

@@ -37,12 +37,18 @@ jobs:
         with:
           path: aerosls2
 
-      # Host connected standby mid-job freezes the WSL VM, and the run
-      # service then expires the job (2026-09-26: kernel-guards cancelled
-      # 33 s into run_checks.sh with no guard failing). This step holds a
-      # Windows power request for the life of the job and records any
-      # suspend gap it sees anyway. Never fails the job; a host without
-      # Windows interop skips it. See tests/runner_host_keep_awake.sh.
+      # Host standby mid-job freezes the WSL VM, and the run service then
+      # expires the job (2026-09-26: kernel-guards cancelled 33 s into
+      # run_checks.sh with no guard failing). This step holds a Windows
+      # power request for the life of the job to keep the host out of IDLE
+      # standby, and records any suspend gap it sees anyway, with the
+      # Kernel-Power Reason behind it, so the NEXT job's step annotates the
+      # cause. It CANNOT stop a LID-CLOSE Modern Standby: closing the lid
+      # forces standby and the request does not block it (2026-09-27
+      # kernel-guards: Reason: Lid at 22:13:48Z, resumed 22:43:44Z, job
+      # cancelled on resume). Keep the lid OPEN for a long job. Never fails
+      # the job; a host without Windows interop skips it. See
+      # tests/runner_host_keep_awake.sh.
       - name: Keep the host awake for this job
         run: bash tests/runner_host_keep_awake.sh start
         working-directory: aerosls2
@@ -347,12 +353,18 @@ jobs:
         with:
           path: aerosls2
 
-      # Host connected standby mid-job freezes the WSL VM, and the run
-      # service then expires the job (2026-09-26: kernel-guards cancelled
-      # 33 s into run_checks.sh with no guard failing). This step holds a
-      # Windows power request for the life of the job and records any
-      # suspend gap it sees anyway. Never fails the job; a host without
-      # Windows interop skips it. See tests/runner_host_keep_awake.sh.
+      # Host standby mid-job freezes the WSL VM, and the run service then
+      # expires the job (2026-09-26: kernel-guards cancelled 33 s into
+      # run_checks.sh with no guard failing). This step holds a Windows
+      # power request for the life of the job to keep the host out of IDLE
+      # standby, and records any suspend gap it sees anyway, with the
+      # Kernel-Power Reason behind it, so the NEXT job's step annotates the
+      # cause. It CANNOT stop a LID-CLOSE Modern Standby: closing the lid
+      # forces standby and the request does not block it (2026-09-27
+      # kernel-guards: Reason: Lid at 22:13:48Z, resumed 22:43:44Z, job
+      # cancelled on resume). Keep the lid OPEN for a long job. Never fails
+      # the job; a host without Windows interop skips it. See
+      # tests/runner_host_keep_awake.sh.
       - name: Keep the host awake for this job
         run: bash tests/runner_host_keep_awake.sh start
         working-directory: aerosls2
@@ -633,12 +645,18 @@ jobs:
         with:
           path: aerosls2
 
-      # Host connected standby mid-job freezes the WSL VM, and the run
-      # service then expires the job (2026-09-26: kernel-guards cancelled
-      # 33 s into run_checks.sh with no guard failing). This step holds a
-      # Windows power request for the life of the job and records any
-      # suspend gap it sees anyway. Never fails the job; a host without
-      # Windows interop skips it. See tests/runner_host_keep_awake.sh.
+      # Host standby mid-job freezes the WSL VM, and the run service then
+      # expires the job (2026-09-26: kernel-guards cancelled 33 s into
+      # run_checks.sh with no guard failing). This step holds a Windows
+      # power request for the life of the job to keep the host out of IDLE
+      # standby, and records any suspend gap it sees anyway, with the
+      # Kernel-Power Reason behind it, so the NEXT job's step annotates the
+      # cause. It CANNOT stop a LID-CLOSE Modern Standby: closing the lid
+      # forces standby and the request does not block it (2026-09-27
+      # kernel-guards: Reason: Lid at 22:13:48Z, resumed 22:43:44Z, job
+      # cancelled on resume). Keep the lid OPEN for a long job. Never fails
+      # the job; a host without Windows interop skips it. See
+      # tests/runner_host_keep_awake.sh.
       - name: Keep the host awake for this job
         run: bash tests/runner_host_keep_awake.sh start
         working-directory: aerosls2
@@ -1032,12 +1050,18 @@ jobs:
         with:
           path: aerosls2
 
-      # Host connected standby mid-job freezes the WSL VM, and the run
-      # service then expires the job (2026-09-26: kernel-guards cancelled
-      # 33 s into run_checks.sh with no guard failing). This step holds a
-      # Windows power request for the life of the job and records any
-      # suspend gap it sees anyway. Never fails the job; a host without
-      # Windows interop skips it. See tests/runner_host_keep_awake.sh.
+      # Host standby mid-job freezes the WSL VM, and the run service then
+      # expires the job (2026-09-26: kernel-guards cancelled 33 s into
+      # run_checks.sh with no guard failing). This step holds a Windows
+      # power request for the life of the job to keep the host out of IDLE
+      # standby, and records any suspend gap it sees anyway, with the
+      # Kernel-Power Reason behind it, so the NEXT job's step annotates the
+      # cause. It CANNOT stop a LID-CLOSE Modern Standby: closing the lid
+      # forces standby and the request does not block it (2026-09-27
+      # kernel-guards: Reason: Lid at 22:13:48Z, resumed 22:43:44Z, job
+      # cancelled on resume). Keep the lid OPEN for a long job. Never fails
+      # the job; a host without Windows interop skips it. See
+      # tests/runner_host_keep_awake.sh.
       - name: Keep the host awake for this job
         run: bash tests/runner_host_keep_awake.sh start
         working-directory: aerosls2
@@ -1311,12 +1335,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Host connected standby mid-job freezes the WSL VM, and the run
-      # service then expires the job (2026-09-26: kernel-guards cancelled
-      # 33 s into run_checks.sh with no guard failing). This step holds a
-      # Windows power request for the life of the job and records any
-      # suspend gap it sees anyway. Never fails the job; a host without
-      # Windows interop skips it. See tests/runner_host_keep_awake.sh.
+      # Host standby mid-job freezes the WSL VM, and the run service then
+      # expires the job (2026-09-26: kernel-guards cancelled 33 s into
+      # run_checks.sh with no guard failing). This step holds a Windows
+      # power request for the life of the job to keep the host out of IDLE
+      # standby, and records any suspend gap it sees anyway, with the
+      # Kernel-Power Reason behind it, so the NEXT job's step annotates the
+      # cause. It CANNOT stop a LID-CLOSE Modern Standby: closing the lid
+      # forces standby and the request does not block it (2026-09-27
+      # kernel-guards: Reason: Lid at 22:13:48Z, resumed 22:43:44Z, job
+      # cancelled on resume). Keep the lid OPEN for a long job. Never fails
+      # the job; a host without Windows interop skips it. See
+      # tests/runner_host_keep_awake.sh.
       - name: Keep the host awake for this job
         run: bash tests/runner_host_keep_awake.sh start
 
@@ -1764,12 +1794,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Host connected standby mid-job freezes the WSL VM, and the run
-      # service then expires the job (2026-09-26: kernel-guards cancelled
-      # 33 s into run_checks.sh with no guard failing). This step holds a
-      # Windows power request for the life of the job and records any
-      # suspend gap it sees anyway. Never fails the job; a host without
-      # Windows interop skips it. See tests/runner_host_keep_awake.sh.
+      # Host standby mid-job freezes the WSL VM, and the run service then
+      # expires the job (2026-09-26: kernel-guards cancelled 33 s into
+      # run_checks.sh with no guard failing). This step holds a Windows
+      # power request for the life of the job to keep the host out of IDLE
+      # standby, and records any suspend gap it sees anyway, with the
+      # Kernel-Power Reason behind it, so the NEXT job's step annotates the
+      # cause. It CANNOT stop a LID-CLOSE Modern Standby: closing the lid
+      # forces standby and the request does not block it (2026-09-27
+      # kernel-guards: Reason: Lid at 22:13:48Z, resumed 22:43:44Z, job
+      # cancelled on resume). Keep the lid OPEN for a long job. Never fails
+      # the job; a host without Windows interop skips it. See
+      # tests/runner_host_keep_awake.sh.
       - name: Keep the host awake for this job
         run: bash tests/runner_host_keep_awake.sh start
 
