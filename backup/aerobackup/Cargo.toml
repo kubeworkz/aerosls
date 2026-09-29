@@ -1,0 +1,38 @@
+# aerobackup — the E7 Linux ABI shim's designated census target
+# (tools/linux_abi_candidate.conf; design docs/AeroSLS-Linux-ABI-Shim-Design-v0.1.md §5.5.1).
+#
+# `tools/linux_syscall_census.sh --run` builds this with
+# `--target x86_64-unknown-linux-musl` and then checks the result against design
+# §5.1's image contract before tracing it: ET_EXEC, statically linked, no
+# PT_INTERP, no DT_NEEDED. The musl target's default is a non-PIE static ET_EXEC;
+# that is an expectation, not a fact this file enforces — the census tool verifies
+# it on the built binary and fails loudly with the fix if it ever stops holding.
+#
+# rust-version is declared because the tests use File::set_modified (1.75), which
+# is what lets the retention test give a backup the mtime it needs instead of
+# sleeping and hoping.
+[package]
+name = "aerobackup"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Snapshot-and-retain for sls_storage.img: the workload half of backup/backup.sh, rewritten as a static single-threaded binary"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "aerobackup"
+path = "src/main.rs"
+
+[lib]
+name = "aerobackup"
+path = "src/lib.rs"
+
+[[test]]
+name = "retention_prune"
+path = "tests/retention_prune.rs"
+
+# Deliberately empty. A census target should measure the syscalls of a workload,
+# not of a dependency tree, and every crate added here is code the shim's own
+# audit would have to account for. Everything in this crate is `std`.
+[dependencies]
