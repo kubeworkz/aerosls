@@ -96,15 +96,23 @@
 #               refusal, and a refusal that has never been observed to fire is
 #               not a guarantee. Runs anywhere; needs no candidate, no strace.
 #
-# ─── Not a tests/*_check.sh guard yet, deliberately ────────────────────────
-# CI runs `tests/run_checks.sh --require-all`, where an exit-2 guard WITHOUT a
-# `# GUARD-KIND:` classification becomes a FAILURE. There is no honest
-# classification for "no first user has been designated" — the missing input is
-# a business decision, not a build artefact and not a live cluster — so wiring
-# this in as a guard today would either redden CI for a reason nothing in CI can
-# fix, or add a permanent silent SKIP. The guard and its smoke land with the
-# artifact, as a short `tests/linux_abi_census_check.sh` that execs `--check`;
-# until then this tool is runnable by hand and by its own selftest.
+# ─── Where the guard is, and why it is not this file ───────────────────────
+# `--run` and `--check` both refuse to proceed until a candidate is DESIGNATED,
+# and there is no honest `# GUARD-KIND:` classification for "no first user has
+# been designated yet": that missing input is a business decision, not a build
+# artefact and not a live cluster. So this tool was not a guard while it had
+# nothing to check — wiring it in then would either have reddened CI for a
+# reason nothing in CI could fix, or added a permanent silent SKIP.
+#
+# That is no longer the state of the tree. The guard is
+# tests/linux_abi_census_check.sh, which execs `--check` and adds the two things
+# a tool cannot assert about itself: that a pass actually reported its
+# conclusions (the vacuity control), and that exiting 2 without an `ABORT:` line
+# is a broken instrument rather than an owed skip. It is SOURCE-ONLY — three
+# checked-in files plus the kernel's syscall-number header, no strace, no cargo,
+# no built binary — so CI checks the artifacts on every push while the two modes
+# that MEASURE (`--run`, `--prove-vdso`) stay hand-run on a census host.
+# tests/linux_abi_census_check_smoke.sh proves the guard's teeth.
 #
 # Exit: 0 pass, 1 fail (the designation or the artifact is wrong), 2 prerequisite
 # missing (no candidate designated, no strace, no toolchain).
