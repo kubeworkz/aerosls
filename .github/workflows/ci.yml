@@ -341,7 +341,7 @@ jobs:
       # .partial counted as a backup, name-ordered retention, and a dense
       # copy. Reuses the toolchain installed above; the crate has no
       # dependencies, so this is a compile of one small crate.
-      - name: aerobackup host test (E7 census target: retention prune)
+      - name: "aerobackup host test (E7 census target: retention prune)"
         run: cargo test --manifest-path backup/aerobackup/Cargo.toml
         working-directory: aerosls2
 
