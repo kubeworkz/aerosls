@@ -27,6 +27,7 @@
 #include "tenant.h"
 #include "service_registry.h"   // Orchestration Plan Phase 4 -- services_registry[]
 #include "workload.h"            // Orchestration Plan Phase 5 -- workloads[]           // Multitenant Isolation Gap Analysis §5 item 1 -- tenants[]/tenant_next_id
+#include "env_ckpt.h"            // POSIX-Environments v0.2 Phase P1a -- env_ckpt_table[]
 #include "checkpoint_delta.h"    // Step 4: incremental dirty tracking
 #include "../drivers/nvme_io.h"
 
@@ -34,6 +35,16 @@
 // The NVMe driver passes this address as the PRP1 DMA buffer.  Physical alignment
 // to 4096 is required; the linker places page-aligned BSS objects correctly.
 static uint8_t __attribute__((aligned(4096))) p_buf[4096];
+
+// ─── P1a restore staging (POSIX-Environments Roadmap v0.2) ──────────────────
+// A snapshot off NVMe is read HERE first and handed to env_ckpt_adopt(), which
+// validates every record before a byte of env_ckpt_table[] is touched. The
+// staging array is what makes "refusal over partial application" true rather
+// than aspirational: persist_read_array() loads straight into whatever it is
+// given, so reading into the live table would pollute kernel state with a
+// torn or foreign snapshot before anything had a chance to refuse it -- the
+// same reasoning persist_scan_regions() applies to every other region.
+static struct EnvCkptRecord p_env_staging[ENV_CKPT_MAX];
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 static void p_memcpy(void* d, const void* s, uint32_t n) {
@@ -585,6 +596,8 @@ static const struct PersistRegionSpec p_region_specs[] = {
       1, { { PERSIST_SERVICE_ENT_LBA, (uint32_t)sizeof(services_registry) } } },
     { PERSIST_WORKLOAD_HDR_LBA, PERSIST_MAGIC_WORKLOAD,
       1, { { PERSIST_WORKLOAD_ENT_LBA, (uint32_t)sizeof(workloads) } } },
+    { PERSIST_ENV_CKPT_HDR_LBA, PERSIST_MAGIC_ENV_CKPT,
+      1, { { PERSIST_ENV_CKPT_ENT_LBA, (uint32_t)sizeof(env_ckpt_table) } } },
 };
 #define P_REGION_COUNT ((int)(sizeof(p_region_specs)/sizeof(p_region_specs[0])))
 
@@ -730,6 +743,7 @@ static void persist_vec_backfill_cb(struct VecId id, uint64_t external_id,
 #define PERSIST_PEND_TENANT        (1u << 13)
 #define PERSIST_PEND_SERVICE       (1u << 14)   /* Orchestration Plan Phase 4 */
 #define PERSIST_PEND_WORKLOAD      (1u << 15)   /* Orchestration Plan Phase 5 */
+#define PERSIST_PEND_ENV           (1u << 16)   /* POSIX-Environments v0.2 Phase P1a */
 
 static uint32_t persist_defer_depth   = 0;
 static uint32_t persist_pending_mask  = 0;
@@ -772,6 +786,7 @@ void persist_defer_end(void) {
     if (pend & PERSIST_PEND_TENANT)        persist_tenants();
     if (pend & PERSIST_PEND_SERVICE)       persist_services();
     if (pend & PERSIST_PEND_WORKLOAD)      persist_workloads();
+    if (pend & PERSIST_PEND_ENV)           persist_environments();
 }
 
 // ─── persist_catalog ─────────────────────────────────────────────────────────
@@ -1092,6 +1107,59 @@ void persist_workloads(void) {
     persist_write_array(workloads, wl_bytes, PERSIST_WORKLOAD_ENT_LBA);
     persist_region_commit();
     kernel_serial_print("[PERSIST] Workload declarations snapshot written.\n");
+}
+
+// ─── persist_environments (POSIX-Environments Roadmap v0.2, Phase P1a) ───────
+// Writes env_ckpt_table[] -- the environment checkpoint records described in
+// kernel/env_ckpt.h. The whole fixed array is written, not just its live
+// prefix, for the same reason every other region here writes its whole array:
+// the region's checksum span is a compile-time constant (see p_region_specs
+// above), so a shorter write would fail its own verification on the next boot.
+// Live-versus-stale is carried by the header's record count instead, and
+// env_ckpt_adopt() only ever reads [0, count).
+//
+// A count of zero is written, not skipped. Skipping would leave whatever
+// snapshot was last on disk still there, and the next boot would restore
+// environments an operator had destroyed -- "a valid-looking region that
+// nothing refreshed" is precisely the stale-versus-absent distinction this
+// codebase's checkpoint identity stamp exists to police.
+//
+// The header's three version slots carry the fields the restore side needs to
+// describe a foreign snapshot honestly: v0 = live record count, v1 =
+// sizeof(struct EnvCkptRecord), v2 = ENV_CKPT_REC_VERSION. v1 is the one that
+// catches a same-version rebuild with a different layout, which is why it is
+// recorded rather than inferred.
+void persist_environments(void) {
+    ckpt_mark_dirty(CKPT_REGION_ENV);
+    if (persist_defer_note(PERSIST_PEND_ENV)) return;
+    if (!io_sq || !io_cq) return;
+
+    // P1a quiesce: freeze each captured environment's partition so what is
+    // written down is a consistent instant rather than a moving target. It sits
+    // AFTER the two gates above on purpose -- a deferred or I/O-less capture
+    // writes nothing, so freezing a tenant for it would be a pause with no
+    // snapshot to show for it. From here to env_ckpt_release_capture() the body
+    // is deliberately straight-line: no early return may be added between the
+    // quiesce and its release, or a failed capture would leave a tenant frozen
+    // with nothing on disk to show for it (v0.2 §4's `leak-unpause` tooth).
+    struct EnvCkptQuiesce q;
+    env_ckpt_quiesce_for_capture(&q);
+
+    uint32_t bytes = (uint32_t)sizeof(env_ckpt_table);
+    stage_hdr(PERSIST_ENV_CKPT_HDR_LBA, PERSIST_MAGIC_ENV_CKPT,
+              env_ckpt_count, (uint32_t)sizeof(struct EnvCkptRecord),
+              ENV_CKPT_REC_VERSION);
+    persist_write_array(env_ckpt_table, bytes, PERSIST_ENV_CKPT_ENT_LBA);
+    persist_region_commit();
+
+    // Un-freeze exactly the partitions THIS capture froze -- never one an
+    // operator had already paused (rule 1). Safe and required even if the
+    // write above did nothing useful.
+    env_ckpt_release_capture(&q);
+
+    kernel_serial_printf(
+        "[PERSIST] Environment checkpoint snapshot written (%u live record(s), %u frozen, %u dropped).\n",
+        env_ckpt_count, q.n_quiesced + q.n_already_paused, q.n_dropped);
 }
 
 // ─── persist_restore_all ─────────────────────────────────────────────────────
@@ -1620,6 +1688,58 @@ void persist_restore_all(void) {
             }
         } else {
             kernel_serial_print("[PERSIST] Workloads: no snapshot — cold start.\n");
+        }
+    }
+
+    // ── 17. Environment checkpoint records (POSIX-Environments v0.2, P1a) ────
+    // The only block here whose failure mode is not "cold start" but "refuse
+    // with a reason, and leave NO environment behind" (v0.2 §4). The bytes are
+    // read into p_env_staging and handed to env_ckpt_adopt(), which validates
+    // the whole snapshot off to the side and only then touches the live table
+    // -- so a snapshot that is good for records 0..k-1 and bad at k leaves
+    // nothing half-restored. The refusal is printed with its own reason and
+    // stays queryable through env_ckpt_last_refusal() rather than living only
+    // in the transcript.
+    //
+    // The region's checksum was already verified by persist_scan_regions()
+    // above, so a torn write is caught before this block runs at all; what is
+    // checked here is the snapshot's MEANING (version, record size, per-record
+    // consistency), which a checksum cannot speak to.
+    if (nvme_read_sync(PERSIST_ENV_CKPT_HDR_LBA, p_buf) == 0) {
+        uint64_t magic = 0;
+        p_memcpy(&magic, p_buf, 8);
+        if (magic == PERSIST_MAGIC_ENV_CKPT && persist_region_trusted(PERSIST_MAGIC_ENV_CKPT)) {
+            uint32_t count = 0, rec_size = 0, version = 0;
+            p_memcpy(&count,    p_buf +  8, 4);
+            p_memcpy(&rec_size, p_buf + 12, 4);
+            p_memcpy(&version,  p_buf + 16, 4);
+            // Bounded by the ARRAY, never by the header's count: a corrupt or
+            // foreign count must not be able to steer the read off the end of
+            // the staging array. adopt() refuses an out-of-range count.
+            persist_read_array(p_env_staging, (uint32_t)sizeof(p_env_staging),
+                               PERSIST_ENV_CKPT_ENT_LBA);
+            int rc = env_ckpt_adopt(p_env_staging, count, rec_size, version);
+            if (rc == ENV_CKPT_REFUSE_NONE) {
+                env_ckpt_after_restore();
+                // Put back the pause state the snapshot recorded: a partition
+                // that was administratively paused when the capture ran comes
+                // back paused, not running. Done here, after adopt(), because
+                // partition_table[] was itself restored earlier (block 5), so
+                // "does this partition exist?" is meaningful by now. A record
+                // in PARTITION_SYSTEM is counted but not acted on (rule 2).
+                uint32_t repaused = env_ckpt_apply_restored_pauses();
+                kernel_serial_printf(
+                    "[ENV_CKPT] Restored %u environment checkpoint record(s) (%u partition(s) re-paused).\n",
+                    env_ckpt_count_live(), repaused);
+            } else {
+                char why[96];
+                struct EnvCkptRefusal r = env_ckpt_last_refusal();
+                env_ckpt_refusal_text(&r, why, (uint32_t)sizeof(why));
+                kernel_serial_printf(
+                    "[ENV_CKPT] snapshot REFUSED -- no environment restored: %s.\n", why);
+            }
+        } else {
+            kernel_serial_print("[ENV_CKPT] no snapshot — cold start.\n");
         }
     }
 }

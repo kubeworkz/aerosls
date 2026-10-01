@@ -155,6 +155,11 @@ int checkpoint_trigger(void) {
     if (dirty & (1u << CKPT_REGION_TENANTS))     persist_tenants();
     if (dirty & (1u << CKPT_REGION_SERVICES))    persist_services();
     if (dirty & (1u << CKPT_REGION_WORKLOADS))   persist_workloads();
+    // POSIX-Environments v0.2 Phase P1a. Inside the dirty mask (unlike the
+    // tcache below) because env_ckpt_record()/_drop() mark it, so the region
+    // bit is a real saving rather than a formality -- and because a full
+    // checkpoint (ckpt_mark_all_dirty()) picks it up with no extra wiring.
+    if (dirty & (1u << CKPT_REGION_ENV))         persist_environments();
 
     persist_defer_end();
 

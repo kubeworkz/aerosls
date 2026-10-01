@@ -57,6 +57,7 @@
 #include "kernel/stream.h"
 #include "kernel/persist.h"
 #include "kernel/checkpoint_mgr.h"
+#include "kernel/env_ckpt.h"   /* POSIX-Environments v0.2 Phase P1a -- env_ckpt_table[] and its region */
 #include <stdio.h>
 #include <stdint.h>
 
@@ -160,6 +161,20 @@ static struct Region regions[] = {
     { "checkpoints", 1, {
         HDR("checkpoints", PERSIST_CKPT_HDR_LBA),
         { "ckpt_history", PERSIST_CKPT_ENT_LBA, SECTORS_PER_FRAME } }, 2 },
+    /* POSIX-Environments Roadmap v0.2 Phase P1a. One frame each, like every
+     * other region here, and gap_required=1 like every region from PART onward
+     * -- the gap check below is what keeps persist.h's promise that a future
+     * resize cannot silently spill into its neighbour. Note that
+     * TLS anchor's LBA (7680) deliberately does NOT appear in this table (that
+     * region is written by its own subsystem and was never registered here, and
+     * tls_key_containment_check.sh counts any mention of it as a new user), so
+     * this row
+     * is also what makes the checkpoints->environments boundary meaningful:
+     * without it the nearest neighbour after the checkpoint history would look
+     * like STREAM_DIR_LBA and the gap would go unmeasured. */
+    { "environments", 1, {
+        HDR("environments", PERSIST_ENV_CKPT_HDR_LBA),
+        ARR("env_ckpt_table", PERSIST_ENV_CKPT_ENT_LBA, env_ckpt_table) }, 2 },
 };
 #define NREGIONS ((int)(sizeof(regions)/sizeof(regions[0])))
 
