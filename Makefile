@@ -600,6 +600,95 @@ $(X86_BIN): $(X86_OBJECTS) $(TCG_OBJS) $(TARGET_OBJS) $(MBEDTLS_OBJS)
 	$(X86_LD) $(X86_LDFLAGS) $(X86_OBJECTS) $(TCG_OBJS) $(TARGET_OBJS) $(MBEDTLS_OBJS) $(LIBGCC) -o $(X86_BIN)
 
 x86-iso: $(X86_BIN)
+	# ── Refuse to ship a sidecar archive that is not from THESE sources ─────
+	# `sidecars.cpio` is tracked, so this recipe usually ships an archive packed
+	# in an earlier session, and a `user/` change that was never re-packed is
+	# invisible until boot time -- where it does NOT look like a packaging
+	# problem, it looks like a kernel bug (P1a's create round trip answered by
+	# an init with no ENV_REGISTER arm: "reply carries 28 bytes, short of the
+	# 216-byte registration"). The archive carries the digest of what it was
+	# packed from; a mismatch stops the build HERE. The rule is a digest and not
+	# "is the archive older than user/*.rs" (a fresh clone writes the index in
+	# path order, so every clean checkout would refuse); the tool explains.
+	# The archive's own BYTES are checked as well (the archive-bytes tool against
+	# the bytes stamp): the source digest cannot see a repack or a swap done out
+	# of band -- user/ untouched, only the archive changed. And the RECORD is
+	# checked too, so the stamps cannot have been refreshed independently of
+	# each other: with only the two per-subject checks, a `user/` edit plus a
+	# hand-run source digest over the old archive turned the first one green
+	# while the old binaries still shipped. All three files come from one
+	# `make selfhost-bootimage` run, and the record is what proves it.
+	# And the archive's six binaries are checked against this tree's own BUILD
+	# OUTPUT where the flattened `.bin` files exist: a record and its two stamps
+	# can all be rewritten from a stale archive, but the build output is the one
+	# half a hand cannot rewrite. (The e3_envs pack rebuilds all six sidecars and
+	# overwrites the shared flattened paths, so any file named by a packed-variant
+	# record is skipped -- not just init.)
+	@if [ -s "$(SIDECAR_CPIO)" ]; then \
+		want="$$(tools/sidecar_source_digest.sh)"; \
+		have="$$(cat "$(SIDECAR_STAMP)" 2>/dev/null || true)"; \
+		if [ "$$have" != "$$want" ]; then \
+			echo "x86-iso: REFUSING to ship $(SIDECAR_CPIO) -- it was NOT packed from the user/ sources in this tree." >&2; \
+			if [ -n "$$have" ]; then \
+				echo "         $(SIDECAR_STAMP) records $$have" >&2; \
+			else \
+				echo "         $(SIDECAR_STAMP) is missing -- nothing here can say what the archive was packed from" >&2; \
+			fi; \
+			echo "         the user/ sources are now $$want" >&2; \
+			echo "         A stale archive boots an init built from older sources, and the failure lands on" >&2; \
+			echo "         the KERNEL (a create whose registration the manager answers with an error frame)." >&2; \
+			echo "         Re-pack from these sources and retry:" >&2; \
+			echo "             make selfhost-bootimage && make x86-iso" >&2; \
+			echo "         Re-pack where the x86_64-unknown-none target is installed, and COMMIT the" >&2; \
+			echo "         archive AND its stamps: all are tracked, and every host that does not build" >&2; \
+			echo "         sidecars (CI's ISO job, deploy) ships exactly what is in the index." >&2; \
+			exit 1; \
+		fi; \
+		want_sha="$$(tools/sidecar_archive_digest.sh "$(SIDECAR_CPIO)")"; \
+		have_sha="$$(cat "$(SIDECAR_ARCHIVE_STAMP)" 2>/dev/null || true)"; \
+		if [ "$$have_sha" != "$$want_sha" ]; then \
+			echo "x86-iso: REFUSING to ship $(SIDECAR_CPIO) -- its BYTES are not the archive that was packed and stamped." >&2; \
+			if [ -n "$$have_sha" ]; then \
+				echo "         $(SIDECAR_ARCHIVE_STAMP) records $$have_sha" >&2; \
+			else \
+				echo "         $(SIDECAR_ARCHIVE_STAMP) is missing -- nothing here can say which archive bytes were packed" >&2; \
+			fi; \
+			echo "         the archive on disk hashes to $$want_sha" >&2; \
+			echo "         So it was re-packed or replaced AFTER the stamp was written: a cpio built by" >&2; \
+			echo "         hand from stale images changes these bytes and nothing else, while the SOURCES" >&2; \
+			echo "         still match -- the stale-archive failure with nothing edited under user/." >&2; \
+			echo "         Re-pack and re-stamp from these sources, then retry:" >&2; \
+			echo "             make selfhost-bootimage && make x86-iso" >&2; \
+			echo "         Commit the archive AND all three stamps ($(SIDECAR_STAMP), $(SIDECAR_ARCHIVE_STAMP), $(SIDECAR_STAMP_RECORD))." >&2; \
+			exit 1; \
+		fi; \
+		want_record="$$(tools/sidecar_stamp_record.sh "$(SIDECAR_CPIO)")"; \
+		have_record="$$(cat "$(SIDECAR_STAMP_RECORD)" 2>/dev/null || true)"; \
+		if [ "$$have_record" != "$$want_record" ]; then \
+			echo "x86-iso: REFUSING to ship $(SIDECAR_CPIO) -- its stamps were not all written by one packer run." >&2; \
+			if [ -n "$$have_record" ]; then \
+				echo "         $(SIDECAR_STAMP_RECORD) records a different sources/bytes pair than the instruments compute now." >&2; \
+			else \
+				echo "         $(SIDECAR_STAMP_RECORD) is missing -- nothing here can show the two stamps came from one run" >&2; \
+			fi; \
+			echo "         A stamp refreshed on its own still matches its subject while the other half describes the previous" >&2; \
+			echo "         archive (a user/ edit plus a hand-run source digest was enough to ship the old binaries); the record" >&2; \
+			echo "         is the one artifact both stamps are projections of, so this is the state it makes visible." >&2; \
+			echo "         Re-pack from these sources and retry:" >&2; \
+			echo "             make selfhost-bootimage && make x86-iso" >&2; \
+			echo "         Commit the archive AND all three stamps ($(SIDECAR_STAMP), $(SIDECAR_ARCHIVE_STAMP), $(SIDECAR_STAMP_RECORD))." >&2; \
+			exit 1; \
+		fi; \
+		tools/sidecar_build_output_check.sh --variant-record "$(SIDECAR_E3_CPIO).stamps" \
+			--build boot/init.bin="$(SIDECAR_INIT_BIN)" \
+			--build boot/dm.bin="$(SIDECAR_DM_BIN)" \
+			--build boot/posix.bin="$(SIDECAR_POSIX_BIN)" \
+			--build boot/ramdisk.bin="$(SIDECAR_RAMDISK_BIN)" \
+			--build boot/net.bin="$(SIDECAR_NET_BIN)" \
+			--build boot/e1000.bin="$(SIDECAR_E1000_BIN)" \
+			"$(SIDECAR_CPIO)" || exit 1; \
+		echo "[ISO] $(SIDECAR_CPIO) is from the user/ sources in this tree ($$want), its bytes are the stamped ones ($$want_sha), both stamps are one packer run's record, and its six binaries are this tree's flattened outputs where those exist"; \
+	fi
 	mkdir -p isodir/boot/grub
 	cp $(X86_BIN) isodir/boot/
 	# Phase 5: when the sidecars initrd exists, ship it so the Phase 5
@@ -904,10 +993,12 @@ user-programs: $(USER_BINS)
 #          no cross-GCC needed)
 #   aerosls-bootimage flatten   -> the flat binaries (PT_LOAD extraction,
 #                          mini-objcopy) at SIDECAR_INIT_BIN/SIDECAR_DM_BIN
-# If the cross target is not installed, cargo build fails and the target
-# warns and uses the SIDECAR_*_BIN paths as-is (set them to existing
-# binaries to build only the archive). The packaging itself is verified
-# independently by the crate's golden tests:
+# If the cross target is not installed the target FAILS rather than reusing
+# whatever ELFs happen to be on disk: the stamp it writes attests the PACKED
+# BINARIES as well as the sources, so a run that did not build them must not
+# write one. To pack deliberately prebuilt images, run aerosls-bootimage
+# directly. The packaging itself is verified independently by the crate's
+# golden tests:
 #   cargo test -p aerosls-bootimage (user/Cargo.toml).
 CARGO            ?= cargo
 # Extra Cargo features for the init sidecar ONLY (init is built in its own
@@ -929,20 +1020,67 @@ SIDECAR_RAMDISK_BIN ?= user/target/x86_64-unknown-none/release/ramdisk.bin
 SIDECAR_NET_BIN    ?= user/target/x86_64-unknown-none/release/network.bin
 SIDECAR_E1000_BIN  ?= user/target/x86_64-unknown-none/release/e1000_driver.bin
 SIDECAR_CPIO       ?= sidecars.cpio
+# The digest of the `user/` sources $(SIDECAR_CPIO) was packed from, written by
+# selfhost-bootimage and verified by x86-iso. Derived from SIDECAR_CPIO (so the
+# E3 image gets its own and the two cannot be confused), TRACKED for the same
+# reason the archive is: the default `make x86-iso` ships the committed
+# archive, and the check has to be able to answer for a tree that never built
+# one. See tools/sidecar_source_digest.sh for why it is a digest and not an
+# mtime comparison.
+SIDECAR_STAMP      ?= $(SIDECAR_CPIO).digest
+# The sha256 of $(SIDECAR_CPIO)'s OWN BYTES, written by selfhost-bootimage and
+# verified by x86-iso next to the source stamp above. The source digest cannot
+# see an archive re-packed or swapped out of band (user/ untouched, the stamp
+# still matching), so the bytes are recorded separately. Derived from
+# SIDECAR_CPIO like the digest (the E3 image gets its own pair), TRACKED for the
+# same reason, and plain sha256sum so a host with no cargo can verify it. See
+# tools/sidecar_archive_digest.sh for why BOTH stamps exist and neither suffices.
+SIDECAR_ARCHIVE_STAMP ?= $(SIDECAR_CPIO).sha256
+# The PACK-RUN RECORD: the one artifact the two stamps are DERIVED from, and
+# the manifest of the six packed binaries. `selfhost-bootimage` runs
+# tools/sidecar_stamp_record.sh once, which computes the source digest, the
+# archive's sha256 and the digest of each `boot/*.bin` entry in a single
+# invocation, and then projects each stamp out of the record (`sed -n
+# 's/^sources //p'` / `s/^bytes //p'`). That is what keeps them from drifting
+# independently: two stamp files written by two commands can each match their
+# own subject while disagreeing with each other -- edit a `user/` source,
+# hand-run the source digest over the old archive, and the source stamp is
+# green again while the old binaries ship. tests/sidecar_stamp_check.sh clause
+# K recomputes this record, requires the committed one to match, and requires
+# each stamp to equal its field; clause L re-extracts the six binaries it names
+# and requires them to be the archive's. Derived from SIDECAR_CPIO like the
+# stamps (the E3 image gets its own), TRACKED for the same reason they are: the
+# committed archive ships from trees that never run the packer.
+SIDECAR_STAMP_RECORD ?= $(SIDECAR_CPIO).stamps
 
 .PHONY: selfhost-bootimage
 selfhost-bootimage:
 	@echo "[SELFHOST] building the init + DM + POSIX + ramdisk + network + e1000_driver sidecars for x86_64-unknown-none..."
-	@$(CARGO) build --manifest-path user/Cargo.toml -p aerosls-dm -p aerosls-sidecar -p aerosls-ramdisk -p aerosls-network -p aerosls-e1000-driver \
+	@# A FAILED build here is FATAL -- do not relax it into a warning. The next
+	@# steps pack $(SIDECAR_CPIO) and write $(SIDECAR_STAMP), and that stamp is
+	@# what lets `x86-iso` ship the archive. A run that fell back to whatever
+	@# binaries were already on disk (no x86_64-unknown-none target, a compile
+	@# error) would stamp them as if this tree's sources produced them -- the
+	@# stale-archive failure this whole mechanism exists to catch, one layer
+	@# down, and harder to see: the SOURCES match, only the binaries inside are
+	@# older. So: no build, no stamp. (To pack deliberately prebuilt images, run
+	@# aerosls-bootimage directly; a stamp is only for an archive this target
+	@# built.) tests/sidecar_stamp_check.sh clause G holds this line.
+	@$(CARGO) build --quiet --manifest-path user/Cargo.toml -p aerosls-dm -p aerosls-sidecar -p aerosls-ramdisk -p aerosls-network -p aerosls-e1000-driver \
 		--features target --target x86_64-unknown-none --release \
-		--bin dm --bin posix --bin ramdisk --bin network --bin e1000_driver 2>/dev/null \
-		|| echo "[SELFHOST] warning: x86_64-unknown-none target not installed; using existing binaries"
+		--bin dm --bin posix --bin ramdisk --bin network --bin e1000_driver \
+		|| { echo "[SELFHOST] REFUSING to pack and stamp: the sidecars did not build for x86_64-unknown-none." >&2; \
+		     echo "           The stamp attests the packed binaries, and reusing existing ones would make it a lie." >&2; \
+		     echo "           Install the target (rustup target add x86_64-unknown-none) and retry — see user/README.md." >&2; \
+		     exit 1; }
 	@# init is built separately so INIT_FEATURES can add e3_envs for the E3
 	@# image without applying it to the other packages (which don't define it).
-	@$(CARGO) build --manifest-path user/Cargo.toml -p aerosls-init \
+	@$(CARGO) build --quiet --manifest-path user/Cargo.toml -p aerosls-init \
 		--features target $(if $(INIT_FEATURES),--features $(INIT_FEATURES)) --target x86_64-unknown-none --release \
-		--bin init 2>/dev/null \
-		|| echo "[SELFHOST] warning: could not build the init sidecar; using existing binary"
+		--bin init \
+		|| { echo "[SELFHOST] REFUSING to pack and stamp: the init sidecar did not build for x86_64-unknown-none." >&2; \
+		     echo "           Reusing an existing init.bin would stamp binaries this tree did not produce." >&2; \
+		     exit 1; }
 	@if [ -s "$(SIDECAR_INIT_ELF)" ]; then \
 		$(CARGO) run --quiet --manifest-path user/Cargo.toml -p aerosls-bootimage -- \
 			flatten --input "$(SIDECAR_INIT_ELF)" --output "$(SIDECAR_INIT_BIN)" \
@@ -974,20 +1112,64 @@ selfhost-bootimage:
 			--load-vaddr 0x400000000000; \
 	fi
 	@test -s "$(SIDECAR_INIT_BIN)" \
-		|| { echo "[SELFHOST] missing init binary: $(SIDECAR_INIT_BIN)"; echo "           build it with the cross target (see user/README.md) or set SIDECAR_INIT_BIN="; exit 1; }
+		|| { echo "[SELFHOST] missing init binary: $(SIDECAR_INIT_BIN)"; echo "           the flatten step produced nothing; is the cross target installed? (see user/README.md)"; exit 1; }
 	@test -s "$(SIDECAR_DM_BIN)" \
-		|| { echo "[SELFHOST] missing DM binary: $(SIDECAR_DM_BIN)"; echo "           build it with the cross target (see user/README.md) or set SIDECAR_DM_BIN="; exit 1; }
+		|| { echo "[SELFHOST] missing DM binary: $(SIDECAR_DM_BIN)"; echo "           the flatten step produced nothing; is the cross target installed? (see user/README.md)"; exit 1; }
 	@test -s "$(SIDECAR_RAMDISK_BIN)" \
-		|| { echo "[SELFHOST] missing ramdisk binary: $(SIDECAR_RAMDISK_BIN)"; echo "           build it with the cross target (see user/README.md) or set SIDECAR_RAMDISK_BIN="; exit 1; }
+		|| { echo "[SELFHOST] missing ramdisk binary: $(SIDECAR_RAMDISK_BIN)"; echo "           the flatten step produced nothing; is the cross target installed? (see user/README.md)"; exit 1; }
 	@test -s "$(SIDECAR_NET_BIN)" \
-		|| { echo "[SELFHOST] missing network binary: $(SIDECAR_NET_BIN)"; echo "           build it with the cross target (see user/README.md) or set SIDECAR_NET_BIN="; exit 1; }
+		|| { echo "[SELFHOST] missing network binary: $(SIDECAR_NET_BIN)"; echo "           the flatten step produced nothing; is the cross target installed? (see user/README.md)"; exit 1; }
 	@test -s "$(SIDECAR_E1000_BIN)" \
-		|| { echo "[SELFHOST] missing e1000 driver binary: $(SIDECAR_E1000_BIN)"; echo "           build it with the cross target (see user/README.md) or set SIDECAR_E1000_BIN="; exit 1; }
+		|| { echo "[SELFHOST] missing e1000 driver binary: $(SIDECAR_E1000_BIN)"; echo "           the flatten step produced nothing; is the cross target installed? (see user/README.md)"; exit 1; }
 	$(CARGO) run --quiet --manifest-path user/Cargo.toml -p aerosls-bootimage -- \
 		--init "$(SIDECAR_INIT_BIN)" --dm "$(SIDECAR_DM_BIN)" \
 		--posix "$(SIDECAR_POSIX_BIN)" --ramdisk "$(SIDECAR_RAMDISK_BIN)" \
 		--net "$(SIDECAR_NET_BIN)" --e1000 "$(SIDECAR_E1000_BIN)" -o "$(SIDECAR_CPIO)"
 	@echo "[SELFHOST] boot image: $(SIDECAR_CPIO) (load as an initrd at the bootloader's module path)"
+	@# The stamps, written HERE because this is the only target that packs an
+	@# archive: `x86-iso` ships $(SIDECAR_CPIO) and refuses one whose stamps do
+	@# not match the tree, so a `user/` change that is not re-packed stops at the
+	@# ISO instead of at a boot. They attest the packed BINARIES as well as the
+	@# sources, and the builds above are what make that true: they are FATAL, so
+	@# these lines are only ever reached by a run that rebuilt all six sidecars
+	@# from these sources. A host that reused existing binaries never gets here,
+	@# and so never stamps them.
+	@#
+	@# ONE WRITE, FOUR FILES: sidecar_stamp_record.sh computes the source digest,
+	@# the archive's sha256 and the digest of each of the six packed binaries in
+	@# a single invocation into $(SIDECAR_STAMP_RECORD); the two stamp files are
+	@# then PROJECTED out of that record -- views of one computation, not
+	@# independent writes. That is the property that stops one stamp from being
+	@# refreshed on its own (a `user/` edit plus a hand-run source digest) while
+	@# the archive still holds the previous binaries; without the record both
+	@# checks stayed green in exactly that state.
+	@#
+	@# The six binaries are passed for verification (--verify ENTRY=PATH): the
+	@# record refuses to be written unless each archive entry is the flattened
+	@# `$(SIDECAR_*_BIN)` file this run just produced, so the packer cannot bless
+	@# images it did not build. tests/sidecar_stamp_check.sh clause L then
+	@# re-extracts each entry from the archive, so the record cannot misstate
+	@# which binaries are inside.
+	@#
+	@# The halves are, deliberately, different questions:
+	@#   $(SIDECAR_STAMP)          is over the SOURCES -- recomputable with no
+	@#                             cargo (even absent the archive), which is what
+	@#                             lets x86-iso verify the COMMITTED archive in CI
+	@#                             and on deploy, and what ties the images inside
+	@#                             to the tree that built them.
+	@#   $(SIDECAR_ARCHIVE_STAMP) is over the archive's own BYTES -- what catches
+	@#                             a repack or swap done out of band, where the
+	@#                             sources are untouched and only the archive
+	@#                             changed. Also plain sha256sum, so also verifiable
+	@#                             on a host with no cargo.
+	@#   the `binary ` lines        name the six packed images themselves, each
+	@#                             with the digest of its entry's data.
+	@tools/sidecar_stamp_record.sh --verify boot/init.bin="$(SIDECAR_INIT_BIN)" --verify boot/dm.bin="$(SIDECAR_DM_BIN)" --verify boot/posix.bin="$(SIDECAR_POSIX_BIN)" --verify boot/ramdisk.bin="$(SIDECAR_RAMDISK_BIN)" --verify boot/net.bin="$(SIDECAR_NET_BIN)" --verify boot/e1000.bin="$(SIDECAR_E1000_BIN)" "$(SIDECAR_CPIO)" > "$(SIDECAR_STAMP_RECORD)"
+	@sed -n 's/^sources //p' "$(SIDECAR_STAMP_RECORD)" > "$(SIDECAR_STAMP)"
+	@sed -n 's/^bytes //p' "$(SIDECAR_STAMP_RECORD)" > "$(SIDECAR_ARCHIVE_STAMP)"
+	@echo "[SELFHOST] stamp record: $(SIDECAR_STAMP_RECORD) (sources + archive bytes + the six packed binaries, verified against the flattened outputs -- the stamps below are views of this file)"
+	@echo "[SELFHOST] stamp: $(SIDECAR_STAMP) (the digest of the user/ sources the packed binaries were built from; x86-iso verifies it)"
+	@echo "[SELFHOST] stamp: $(SIDECAR_ARCHIVE_STAMP) (sha256 of the archive's own bytes -- a repack or swap out of band changes them; x86-iso verifies it too)"
 
 # ── POSIX-Environments E3: the multi-instance-boot image ────────────────────
 # The same six sidecars as `selfhost-bootimage`, except `init` is built with

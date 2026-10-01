@@ -8,8 +8,17 @@
 *.a
 # POSIX-Environments E3 boot image (init built with e3_envs). The shipped
 # sidecars.cpio is tracked; this tenant-environment variant is a local/CI build
-# artifact only (make x86-iso-e3 -> tests/e3_multi_env_boot_check.sh).
+# artifact only (make x86-iso-e3 -> tests/e3_multi_env_boot_check.sh). Its
+# stamps go with it: `sidecars.cpio.digest` (the user/ sources),
+# `sidecars.cpio.sha256` (the archive's own bytes) and `sidecars.cpio.stamps`
+# (the one pack-run record those two are projections of) ARE tracked -- the
+# default x86-iso ships the committed archive and `make x86-iso` verifies all
+# three against the tree -- while the E3 archive and its stamps are written by
+# the build that makes it, so none of the four belongs in the index.
 sidecars_e3.cpio
+sidecars_e3.cpio.digest
+sidecars_e3.cpio.sha256
+sidecars_e3.cpio.stamps
 
 # Rust sidecar workspace build output
 user/target/
