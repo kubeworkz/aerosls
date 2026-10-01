@@ -555,10 +555,11 @@ the only thing that could have found any of them:
    before it boots, for a run that points `P1A_ISO` at an older image anyway.
 
    The rule has its own guard and teeth — `tests/sidecar_stamp_check.sh`
-   (clauses A–N) and `tests/sidecar_stamp_check_smoke.sh` (54 teeth, plus five
+   (clauses A–N) and `tests/sidecar_stamp_check_smoke.sh` (55 teeth, plus six
    green arms: a stamp and an archive-bytes stamp whose only difference is a
-   trailing newline, the e3_envs init the E3 pack overwrites, half an E3
-   quartet with no record, and the vacuity control) — because a rule that lives in one recipe can be deleted,
+   trailing newline, the two shared binaries the E3 pack rebuilds — skipped
+   once by the guard and once by the recipe's own build-output check — half an
+   E3 quartet with no record, and the vacuity control) — because a rule that lives in one recipe can be deleted,
    turned into a warning, or simply never run by a host that ships the committed
    archive, which CI's ISO job and `deploy/` both do. The guard asks the
    question a level earlier, with no Rust toolchain, no ISO and no boot: does
@@ -652,13 +653,16 @@ the only thing that could have found any of them:
    because they compare those files to one another. `make x86-iso` now also
    runs `tools/sidecar_build_output_check.sh`: for each of the six entries whose
    flattened `.bin` file is still in the tree, the archive entry must hash to
-   that file. The one exception is the `init.bin` the e3_envs pack overwrites:
-   an init that IS the E3 archive's entry is a known build, not a stale image,
-   and is skipped — and the E3 record that names it is trusted only after a
-   live recomputation of `sidecars_e3.cpio` equals it, so a hand-written
-   record that merely names the flattened init exempts nothing. Only init can
-   differ between the variants, so the five shared entries are compared
-   absolutely. Clause **M**
+   that file. The one exception is a file the e3_envs pack rebuilt: that pack
+   rebuilds all six sidecars and flattens them over the shared paths, and a
+   rebuild is not byte-identical across toolchains (CI's kernel-guards job
+   builds the E3 ISO before it runs the guard), so the default archive may
+   legitimately hold binaries the on-disk files no longer match — same sources,
+   different compiler. A file that IS an entry of the E3 archive is a known
+   build, not a stale image, and is skipped, whatever its path — and the E3
+   record that names it is trusted only after a live recomputation of
+   `sidecars_e3.cpio` equals it, so a hand-written record that merely names the
+   flattened file exempts nothing. Clause **M**
    makes the same comparison in the guard natively (paths read from the
    Makefile, its own `newc_entry_sha` extraction) and requires the recipe to
    keep the call above the copy. On a host with no build outputs — CI's ISO
@@ -666,8 +670,11 @@ the only thing that could have found any of them:
    so and holds rather than failing or pretending: the claim cannot be made
    there. The smoke's M teeth move one build output, rewrite the record and
    stamps consistently from a stale archive (the residual state), and delete
-   the recipe's call, plus one green arm for the E3 overwrite and two teeth
-   for the fabricated and the mismatched E3 record. Clause **N** turns that
+   the recipe's call, plus two green arms for the E3 rebuild — the guard's own
+   skip, and the recipe's check tool skipping the same two overwritten files,
+   which is the gate `make x86-iso` actually refuses on — and three teeth for
+   the fabricated record, the mismatched E3 record, and the fabricated record
+   at the check tool. Clause **N** turns that
    anchoring into a standing rule for the E3 pack's own four files, wherever
    they are present: the E3 record must equal a live recomputation of
    `sidecars_e3.cpio` (v2 shape, all six binaries) and each E3 stamp must be a

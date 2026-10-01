@@ -621,8 +621,9 @@ x86-iso: $(X86_BIN)
 	# And the archive's six binaries are checked against this tree's own BUILD
 	# OUTPUT where the flattened `.bin` files exist: a record and its two stamps
 	# can all be rewritten from a stale archive, but the build output is the one
-	# half a hand cannot rewrite. (The e3_envs pack legitimately overwrites the
-	# shared init.bin, so a file named by a packed-variant record is skipped.)
+	# half a hand cannot rewrite. (The e3_envs pack rebuilds all six sidecars and
+	# overwrites the shared flattened paths, so any file named by a packed-variant
+	# record is skipped -- not just init.)
 	@if [ -s "$(SIDECAR_CPIO)" ]; then \
 		want="$$(tools/sidecar_source_digest.sh)"; \
 		have="$$(cat "$(SIDECAR_STAMP)" 2>/dev/null || true)"; \

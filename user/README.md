@@ -203,11 +203,12 @@ Finally, `make x86-iso` also compares the archive's six entries against the
 tree's own flattened `.bin` outputs whenever those exist
 (`tools/sidecar_build_output_check.sh`), so a stale archive whose record and
 stamps were all rewritten from it cannot ship from a tree that has built the
-sidecars — the E3 pack's overwrite of the shared `init.bin` is recognised from
-the E3 pair (its record must equal a live recomputation of `sidecars_e3.cpio`)
-and skipped — and `tests/sidecar_stamp_check.sh` holds that E3 quartet to the
-same one-run rule whenever it is present (each E3 stamp must be a field of
-that record), skipping cleanly when the ignored files are absent. All three
+sidecars — a file the E3 pack rebuilt (it rebuilds all six and overwrites the
+shared flattened paths) is recognised from the E3 pair (its record must equal a
+live recomputation of `sidecars_e3.cpio`) and skipped, whatever its path — and
+`tests/sidecar_stamp_check.sh` holds that E3 quartet to the same one-run rule
+whenever it is present (each E3 stamp must be a field of that record), skipping
+cleanly when the ignored files are absent. All three
 are plain coreutils and all are recomputable from a clean checkout, so a host
 that never builds sidecars (CI, deploy) verifies the committed archive. To
 pack already-built images deliberately, run `aerosls-bootimage` directly; that

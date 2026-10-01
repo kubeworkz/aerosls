@@ -106,14 +106,18 @@
 #      that set: the flattened `.bin` files `selfhost-bootimage` produces,
 #      read from the Makefile's own `SIDECAR_*_BIN` defaults and compared
 #      natively, so the answer does not depend on the check tool the recipe
-#      calls. The one exemption is an `init.bin` that is the E3 archive's
-#      entry -- the e3_envs pack overwrites the shared flattened file -- and
-#      even that record is trusted only after a live recomputation of
-#      sidecars_e3.cpio equals it, so a hand-written record that merely names
-#      the flattened file cannot mask a stale one. On a host with no build
-#      outputs (CI's ISO job, deploy, a fresh clone) there is nothing to
-#      compare against and the clause holds without pretending: the claim is
-#      made at pack time, and re-made here wherever the pack output survives.
+#      calls. The one exemption is a file the anchored E3 record names: that
+#      pack rebuilds all six sidecars over the shared flattened paths, and two
+#      builds of the same sources are not byte-identical across toolchains
+#      (CI's kernel-guards job rebuilds them for the E3 ISO and then runs this
+#      guard), so a file that is an entry of the E3 archive is a build of
+#      these sources rather than a stale image -- and that record is trusted
+#      only after a live recomputation of sidecars_e3.cpio equals it, so a
+#      hand-written record that merely names the file cannot mask a stale one.
+#      On a host with no build outputs (CI's ISO job, deploy, a fresh clone)
+#      there is nothing to compare against and the clause holds without
+#      pretending: the claim is made at pack time, and re-made here wherever
+#      the pack output survives.
 #      The recipe half requires `x86-iso` to run
 #      tools/sidecar_build_output_check.sh over the same six paths, above the
 #      copy of the archive.
@@ -126,9 +130,9 @@
 #      rule applies one archive over: the committed E3 record must equal a
 #      live recomputation of sidecars_e3.cpio (v2 nine-line shape), and each
 #      E3 stamp must be a field of that record. M leans on the E3 record
-#      whenever it excuses an e3_envs init mismatch and K and L never look at
-#      the E3 files, so this is the clause that keeps the file M trusts from
-#      being a hand-written one.
+#      whenever it excuses a flattened binary mismatch, and K and L never look
+#      at the E3 files, so this is the clause that keeps the file M trusts
+#      from being a hand-written one.
 #
 # ─── Hermetic seam ────────────────────────────────────────────────────────
 # The optional ROOT argument is the same one tests/env_checkpoint_restore_check.sh
@@ -669,17 +673,21 @@ fi
 # stale pack, and K and L stay green because they compare the files to each
 # other. This clause compares the archive to something outside that set: the
 # flattened `.bin` files `selfhost-bootimage` produces, read from the Makefile
-# exactly as the recipe passes them. The one exemption is an init.bin that IS
-# the E3 archive's entry, and only when the committed E3 record equals a live
-# recomputation of sidecars_e3.cpio: the e3_envs pack overwrites the shared
-# flattened file, and a record alone cannot excuse a mismatch.
+# exactly as the recipe passes them. The one exemption is a file the anchored
+# E3 record NAMES: that pack rebuilds all six sidecars and flattens them over
+# the shared paths, and two builds of the same sources are not byte-identical
+# across toolchains (CI's kernel-guards job rebuilds every sidecar for the E3
+# ISO, then runs this guard) -- so a file that is an entry of the E3 archive is
+# a verified build of these sources, not a stale image, and the comparison has
+# nothing left to say. A hand-written record exempts nothing: the anchor is a
+# live recomputation of sidecars_e3.cpio.
 m_err=""
 m_cmp=0
 m_var=0
-# The E3 record is the only record allowed to explain an init mismatch, and
-# only after it has been ANCHORED: a live recomputation of sidecars_e3.cpio
-# must equal the committed E3 record. A hand-written record that merely names
-# the flattened init would otherwise excuse a stale one in the archive.
+# The E3 record is the only record allowed to explain a mismatch, and only
+# after it has been ANCHORED: a live recomputation of sidecars_e3.cpio must
+# equal the committed E3 record. A hand-written record that merely names a
+# flattened file would otherwise excuse a stale one in the archive.
 m_e3_ok=0
 if [ -s "$E3_CPIO" ] && [ -f "$E3_RECORD" ]; then
     m_e3_shot=$("$RECORD_TOOL" "$E3_CPIO" 2>/dev/null || true)
@@ -712,18 +720,17 @@ for m_name in $BIN_ENTRIES; do
         continue
     fi
     m_variant=""
-    if [ "$m_name" = "boot/init.bin" ] && [ "$m_e3_ok" -eq 1 ] \
-        && grep -q "^binary ${m_name} ${m_file}$" "$E3_RECORD"; then
-        # Only init can differ between this tree's pack variants (e3_envs
-        # rewrites it and overwrites the shared file); the five shared entries
-        # are compared absolutely, and the record above had to be anchored.
+    if [ "$m_e3_ok" -eq 1 ] && grep -q "^binary ${m_name} ${m_file}$" "$E3_RECORD"; then
+        # The file IS an entry of the anchored E3 archive: a covered pack of
+        # these sources produced it. The two builds may differ without either
+        # being stale (toolchains differ), so there is no claim to make here.
         m_variant="$E3_RECORD"
     fi
     if [ -n "$m_variant" ]; then
         m_var=$((m_var + 1))
         continue
     fi
-    m_err="$m_path is the flattened output this tree built for $m_name and it hashes to $m_file, while $CPIO's entry hashes to $m_own — the archive holds a different image than the build did. A record and two stamps rewritten from a stale archive agree with each other; the build output is the half they cannot rewrite. (An init named by a hand-written E3 record is not exempt: the record must match a live recomputation of $E3_CPIO.) Re-pack from these sources: make selfhost-bootimage"
+    m_err="$m_path is the flattened output this tree built for $m_name and it hashes to $m_file, while $CPIO's entry hashes to $m_own — the archive holds a different image than the build did, and no verified pack names that file. A record and two stamps rewritten from a stale archive agree with each other; the build output is the half they cannot rewrite. (A file named by a hand-written E3 record is not exempt: that record must match a live recomputation of $E3_CPIO first.) Re-pack from these sources: make selfhost-bootimage"
     break
 done
 if [ -n "$m_err" ]; then
@@ -748,7 +755,7 @@ else
         elif [ "${m_line:-0}" -ge "$m_copy" ]; then
             bad "M. x86-iso checks the archive against the build outputs (command $m_line) at or after it copies it (command $m_copy) — the check must gate the copy, not report on it afterwards"
         else
-            ok "M. the archive's six binaries are this tree's flattened outputs wherever those exist — $m_cmp compared, $m_var skipped as a packed variant (the e3_envs init, anchored to the E3 archive), and x86-iso runs the check (command $m_line) before it copies the archive (command $m_copy)"
+            ok "M. the archive's six binaries are this tree's flattened outputs wherever those exist — $m_cmp compared, $m_var skipped as a packed variant (files the anchored E3 record names), and x86-iso runs the check (command $m_line) before it copies the archive (command $m_copy)"
         fi
     fi
 fi
@@ -762,10 +769,10 @@ fi
 # not here look like drift. Where the files ARE here, the rule is K's, one
 # archive over -- one tool invocation computes every half of the E3 record,
 # and the two E3 stamps are projections of it. That matters beyond tidiness:
-# M is allowed to skip an init mismatch when this record names the flattened
-# init, and M's own anchor only recomputes the record at the moment it needs
-# it; N is what keeps the committed record honest even on a tree where no
-# init mismatch happens to be present.
+# M is allowed to skip a flattened file when this record names it, and M's
+# own anchor only recomputes the record at the moment it needs it; N is what
+# keeps the committed record honest even on a tree where no mismatch happens
+# to be present.
 n_err=""
 if [ ! -s "$E3_CPIO" ] || [ ! -f "$E3_RECORD" ]; then
     ok "N. no E3 pack in this tree ($E3_CPIO and $E3_RECORD are ignored build files; at least one of them is absent) — the E3 one-run rule is skipped, not assumed"
@@ -791,7 +798,7 @@ else
     elif [ "$n_want" != "$n_want2" ]; then
         n_err="cannot be evaluated: $RECORD_TOOL answered differently on two runs over $E3_CPIO — a record that is not stable cannot bind anything"
     elif [ "$(cat "$E3_RECORD")" != "$n_want" ]; then
-        n_err="$E3_RECORD does not match what the instruments compute over $E3_CPIO now — the committed E3 record and the E3 archive have drifted apart, and that record is the file clause M accepts as proof that an e3_envs init.bin is the packed one (a hand-written record must not read as a verified variant). Re-pack the E3 image (make selfhost-bootimage-e3) or remove its four files"
+        n_err="$E3_RECORD does not match what the instruments compute over $E3_CPIO now — the committed E3 record and the E3 archive have drifted apart, and that record is the file clause M accepts as proof that a flattened binary is the packed one (a hand-written record must not read as a verified variant). Re-pack the E3 image (make selfhost-bootimage-e3) or remove its four files"
     elif [ "$(cat "$E3_STAMP" 2>/dev/null || true)" != "$n_sources" ]; then
         n_err="$E3_STAMP is absent or is not the sources field of $E3_RECORD — it was written or removed without the record that computes it, so the four E3 files are not one pack run's. make selfhost-bootimage-e3 writes all four together"
     elif [ "$(cat "$E3_ARCHIVE_STAMP" 2>/dev/null || true)" != "$n_bytes" ]; then

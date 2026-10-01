@@ -50,11 +50,18 @@
 # teeth move one build output, rewrite the whole record consistently from a
 # stale archive (the residual state K and L cannot see), delete the recipe's
 # call, and write an E3 record that merely NAMES the flattened init without an
-# archive to recompute it from -- a record is not an authority by itself. The
-# green arm is the e3_envs pack overwriting the shared init.bin: an init that
-# IS the E3 archive's entry, with the E3 record verified against a live
-# recomputation of that archive, must be skipped, not refused, or
-# `make x86-iso` would block after every E3 pack.
+# archive to recompute it from -- a record is not an authority by itself. Two
+# of the arms run the recipe's own gate (tools/sidecar_build_output_check.sh)
+# on the same trees, because that is the check x86-iso refuses on: it must skip
+# both files the anchored E3 record names, and refuse the fabricated record's
+# init -- proving the widening only in the guard would leave the build gate
+# refusing healthy archives after every E3 pack. The green arm is the e3_envs
+# pack overwriting the shared flattened binaries (the
+# arm overwrites two of them, init and dm): a file that IS the E3 archive's
+# entry, with the E3 record verified against a live recomputation of that
+# archive, must be skipped, not refused, or `make x86-iso` would block after
+# every E3 pack -- and the exemption is the file the record NAMES, not one
+# special path.
 #
 # The N teeth hold the E3 pack's OWN four files to the one-run rule wherever
 # they exist: the two E3 stamps must be fields of a record that recomputes to
@@ -664,12 +671,20 @@ open(p, "w").write("\n".join(lines[:start] + kept + lines[end:]))
 PY
 tooth "M: x86-iso stops checking the archive against the tree's build outputs" M "$W/m3"
 
-# ── M green arm: the E3 pack overwriting the shared init.bin ──────────────
-# `make selfhost-bootimage-e3` overwrites the flattened init.bin with the
-# e3_envs build, so the default archive legitimately holds an init the file no
-# longer matches. The file is the E3 ARCHIVE's init entry and the E3 record
-# recomputes to that archive, so M must skip it and stay green -- a refusal
-# here would block `make x86-iso` after every E3 pack. The quartet is written
+# ── M green arm: the E3 pack rebuilding the shared binaries ──────────────
+# `make selfhost-bootimage-e3` rebuilds all six sidecars and flattens them over
+# the shared paths, so the default archive legitimately holds binaries a
+# rebuild no longer matches byte for byte. CI's kernel-guards job does exactly
+# that (it builds the E3 ISO, then runs this guard) and its rebuilds come from
+# a different toolchain than the committed archive's: same sources, different
+# bytes. Each file IS an entry of the E3 ARCHIVE and the E3 record recomputes
+# to that archive, so M must skip those files and stay green -- a refusal here
+# blocks `make x86-iso` after every E3 pack and reddens a healthy archive in
+# CI. This arm overwrites TWO of the six (init and dm) so the tooth proves the
+# exemption is "a file the anchored E3 record names", not init alone, and it
+# runs the recipe's own gate (tools/sidecar_build_output_check.sh) on the same
+# tree for the same reason one layer down: the widening must hold in the check
+# x86-iso actually refuses on, not only in the guard. The quartet is written
 # whole (e3_pack): clause N holds the E3 pair to the same one-run rule, so an
 # E3 pack that is only half here would be red on its own.
 #
@@ -691,15 +706,34 @@ e3_pack() {   # e3_pack <dir> [newc spec]...
 seed "$W/m4"
 m_flat="$W/m4/user/target/x86_64-unknown-none/release"
 e3_text='stub boot/init.bin built with e3_envs'
+e3_dm='stub boot/dm.bin rebuilt for the e3_envs pack'
 printf '%s' "$e3_text" > "$m_flat/init.bin"
-e3_pack "$W/m4" "edit:boot/init.bin=$e3_text"
+printf '%s' "$e3_dm" > "$m_flat/dm.bin"
+e3_pack "$W/m4" "edit:boot/init.bin=$e3_text" "edit:boot/dm.bin=$e3_dm"
 out="$(bash "$GUARD" "$W/m4" 2>&1)"; rc=$?
 if [ "$rc" -eq 0 ]; then
-    echo "ok:   M green: the e3_envs init is the E3 archive's entry and the E3 record recomputes to it, so M skips it instead of refusing the default archive"
+    echo "ok:   M green: the shared flattened init AND dm are the anchored E3 archive's entries, so M skips both instead of refusing the default archive (the exemption is the file the record names, not the path)"
     passed=$((passed + 1))
 else
-    echo "FAIL: M refuses the default archive after an E3 pack overwrites the shared init.bin"
+    echo "FAIL: M refuses the default archive after an E3 pack overwrites the shared init.bin AND dm.bin"
     printf '%s\n' "$out" | sed 's/^/      /'
+    failed=$((failed + 1))
+fi
+
+# The same exemption one layer down. `make x86-iso` gates on
+# tools/sidecar_build_output_check.sh, which reads the same anchored E3 record:
+# if only init were exempt there, `make x86-iso` run after an E3 pack (CI's
+# kernel-guards order: build the E3 ISO, then run the guard) would refuse a
+# healthy archive on dm's mismatch -- the guard's M would be green while the
+# recipe's own gate blocked the build. Fixing M without this arm would leave
+# the refusal in the one place a boot check cannot see it.
+m4_tool_out="$(bash "$W/m4/tools/sidecar_build_output_check.sh" "$W/m4/sidecars.cpio" 2>&1)"; m4_tool_rc=$?
+if [ "$m4_tool_rc" -eq 0 ] && printf '%s\n' "$m4_tool_out" | grep -q 'matched a packed variant'; then
+    echo "ok:   M green: the recipe's own gate skips both packed-variant files (init and dm) by the anchored E3 record"
+    passed=$((passed + 1))
+else
+    echo "FAIL: the recipe's gate (sidecar_build_output_check.sh) refuses a healthy archive after an E3 pack (exit $m4_tool_rc)"
+    printf '%s\n' "$m4_tool_out" | sed 's/^/      /'
     failed=$((failed + 1))
 fi
 
@@ -723,6 +757,18 @@ seed "$W/m5"
 printf '%s' "$e3_text" > "$W/m5/user/target/x86_64-unknown-none/release/init.bin"
 fake_variant_record "$W/m5"
 tooth "M: the E3 record names the flattened init but no E3 archive backs it (a fabricated record)" M "$W/m5"
+# And the recipe's gate must refuse it too: without the E3 archive to recompute
+# the record over, the anchor fails there exactly as M's does, so the same
+# hand-written record cannot get a stale init onto an ISO.
+m5_tool_out="$(bash "$W/m5/tools/sidecar_build_output_check.sh" "$W/m5/sidecars.cpio" 2>&1)"; m5_tool_rc=$?
+if [ "$m5_tool_rc" -eq 1 ] && printf '%s\n' "$m5_tool_out" | grep -q 'REFUSING'; then
+    echo "ok:   M: the recipe's own gate refuses the fabricated record's file too (an unanchored record exempts nothing)"
+    passed=$((passed + 1))
+else
+    echo "FAIL: the recipe's gate accepted a file named by a fabricated E3 record (exit $m5_tool_rc)"
+    printf '%s\n' "$m5_tool_out" | sed 's/^/      /'
+    failed=$((failed + 1))
+fi
 
 seed "$W/m6"
 printf '%s' "$e3_text" > "$W/m6/user/target/x86_64-unknown-none/release/init.bin"

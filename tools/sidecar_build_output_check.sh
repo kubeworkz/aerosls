@@ -20,17 +20,19 @@
 # output is still in the tree.
 #
 # ─── The E3 exception, and why it is not a hole ────────────────────────────
-# `make selfhost-bootimage-e3` builds init with the e3_envs feature and
-# OVERWRITES the same flattened init.bin the default pack uses, so after an E3
-# pack the default archive legitimately holds a default init the on-disk file
-# no longer matches. A flattened `init.bin` that is the E3 archive's entry is
-# a known build, not a stale image, and is skipped -- and "is the E3 archive's
-# entry" is CHECKED, not taken from a record: the variant record named by the
-# Makefile (or --variant-record) must equal a live recomputation of its own
-# archive, and that archive must exist and must not be the archive being
-# checked. A hand-written record that merely names some other init therefore
-# excuses nothing. Only init can differ between the variants; the five shared
-# entries are always compared absolutely.
+# `make selfhost-bootimage-e3` rebuilds ALL SIX sidecars (init with the e3_envs
+# feature) and flattens them over the same shared paths the default pack uses,
+# so after an E3 pack the default archive legitimately holds binaries the
+# on-disk files no longer match: same sources, and a rebuild is not
+# byte-identical across toolchains (CI's kernel-guards job builds the E3 ISO
+# before anything runs this tool or the guard). A flattened file that is an
+# entry of the E3 archive is a known build, not a stale image, and is skipped
+# -- whatever its path, init or not -- and "is the E3 archive's entry" is
+# CHECKED, not taken from a record: the variant record named by the Makefile
+# (or --variant-record) must equal a live recomputation of its own archive, and
+# that archive must exist and must not be the archive being checked. A
+# hand-written record that merely names some file therefore excuses nothing,
+# for any of the six entries.
 #
 # ─── Reuse, not reimplementation ───────────────────────────────────────────
 # Entries are read with tools/sidecar_archive_entry_digest.sh — the same
@@ -139,10 +141,10 @@ path_var() {   # path_var <entry> -> the Makefile variable naming its path
     esac
 }
 
-# The records that may explain an init mismatch: the E3 archive's (whose build
-# overwrites the shared init.bin) and any explicitly named variant. The record
-# of the archive being checked is never one of them -- a record of THIS archive
-# cannot excuse this archive's entries.
+# The records that may explain a flattened-file mismatch: the E3 archive's
+# (whose build rebuilds all six and overwrites the shared paths) and any
+# explicitly named variant. The record of the archive being checked is never
+# one of them -- a record of THIS archive cannot excuse this archive's entries.
 e3_cpio="$(makefile_default SIDECAR_E3_CPIO)"; [ -n "$e3_cpio" ] || e3_cpio=sidecars_e3.cpio
 records=("$e3_cpio.stamps")
 if [ -n "$variant_record" ]; then
@@ -189,17 +191,15 @@ for entry in "${BINARIES[@]}"; do
         continue
     fi
     matched_variant=""
-    if [ "$entry" = "boot/init.bin" ]; then
-        # Only init can differ between this tree's pack variants (e3_envs
-        # rewrites it and overwrites the shared flattened file), and only an
-        # anchored record may say so.
-        for rec in "${records[@]}"; do
-            if anchored_variant "$rec" && grep -q "^binary $entry $file_sha$" "$rec"; then
-                matched_variant="$rec"
-                break
-            fi
-        done
-    fi
+    # The e3_envs pack rebuilds all six sidecars and overwrites their shared
+    # flattened paths, so any of the six may legitimately differ -- and only an
+    # anchored record that NAMES this entry may say so.
+    for rec in "${records[@]}"; do
+        if anchored_variant "$rec" && grep -q "^binary $entry $file_sha$" "$rec"; then
+            matched_variant="$rec"
+            break
+        fi
+    done
     if [ -n "$matched_variant" ]; then
         variants=$((variants + 1))
         skipped="$skipped $entry"
@@ -208,9 +208,7 @@ for entry in "${BINARIES[@]}"; do
     echo "sidecar_build_output_check: REFUSING: $archive's '$entry' is not the build output at $path." >&2
     echo "         the archive entry hashes to $entry_sha" >&2
     echo "         the file on disk hashes to $file_sha" >&2
-    if [ "$entry" = "boot/init.bin" ]; then
-        echo "         and no verified packed-variant record in this tree names that file (${records[*]})" >&2
-    fi
+    echo "         and no verified packed-variant record in this tree names that file (${records[*]})" >&2
     echo "         — so $path is what THIS tree's build produced and the archive holds another" >&2
     echo "         image. The record and the two stamps can be rewritten from a stale archive so" >&2
     echo "         that they agree with each other; the build output is the half a hand cannot" >&2
@@ -222,7 +220,7 @@ done
 if [ "$checked" -eq 0 ] && [ "$variants" -eq 0 ]; then
     echo "sidecar_build_output_check: no flattened sidecar outputs in this tree — nothing to compare against $archive"
 elif [ "$variants" -gt 0 ]; then
-    echo "sidecar_build_output_check: $archive holds all $checked flattened sidecar outputs compared, and$skipped matched a packed variant's record (the e3_envs pack overwrites the shared init.bin)"
+    echo "sidecar_build_output_check: $archive holds all $checked flattened sidecar outputs compared, and$skipped matched a packed variant's record (the e3_envs pack rebuilds all six over the shared flattened paths)"
 else
     echo "sidecar_build_output_check: $archive holds all $checked flattened sidecar outputs present in this tree"
 fi
