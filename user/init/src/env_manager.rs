@@ -10,8 +10,10 @@
 //! second manifest builder in kernel C (roadmap §7).
 
 use aerosls_proto::env_proto::{
-    self, EnvFrame, ENV_CREATE, ENV_DESTROY, ENV_ERR_FULL, ENV_ERR_INVAL, ENV_ERR_NOENT,
-    ENV_ERR_NOMEM, ENV_ERR_PART, ENV_OK,
+    self, EnvFrame, RegisterRegion, RegisterReply, ENV_CREATE, ENV_DESTROY, ENV_ERR_FULL,
+    ENV_ERR_INVAL, ENV_ERR_NOENT, ENV_ERR_NOMEM, ENV_ERR_PART, ENV_OK, ENV_REGISTER,
+    REGION_POSIX_HEAP, REGION_RD_HEAP, REGION_RD_STORAGE, TASK_POSIX_SIDECAR,
+    TASK_RAMDISK_SIDECAR,
 };
 use aerosls_proto::kabi::{Kernel, ERR_NOMEM};
 use alloc::vec::Vec;
@@ -159,6 +161,60 @@ pub fn create_environment<K: Kernel>(
         posix_r,
         posix_w,
     })
+}
+
+/// POSIX-Environments v0.2 P1a: this environment's half of its checkpoint
+/// record — the `ENV_REGISTER` reply body the kernel's env_ckpt_register_from()
+/// completes with its own half (the format stamps, the console binding, and
+/// where the kernel loaded each sidecar).
+///
+/// `env_id` is a parameter rather than a field because it is the MANAGER that
+/// assigns it (`EnvManager::next_id`) and holds it beside the environment; the
+/// environment itself is identified by (partition, index).
+///
+/// The regions are emitted kind-labelled, in the record's order (POSIX heap,
+/// ramdisk heap, ramdisk storage) — NOT in `struct Environment`'s declaration
+/// order, which is (rd_heap, rd_storage, px_heap). That reordering is the whole
+/// reason the kind travels with the base: the kernel refuses a body whose
+/// kinds are not the three distinct ones, so a reordering that forgets to move
+/// the kinds is a refusal rather than a heap silently recorded as storage.
+/// tests/env_register_pin_check.sh checks this function's mapping, and
+/// tests/env_register_host_test.c drives the kernel's half against the same.
+pub fn environment_register_reply(env_id: u32, env: &Environment) -> RegisterReply {
+    let mut r = RegisterReply::empty(env.partition, env.index, env_id);
+
+    r.n_regions = 3;
+    r.regions[0] = RegisterRegion {
+        base: env.px_heap,
+        frames: POSIX_HEAP_FRAMES as u32,
+        kind: REGION_POSIX_HEAP,
+    };
+    r.regions[1] = RegisterRegion {
+        base: env.rd_heap,
+        frames: RD_HEAP_FRAMES as u32,
+        kind: REGION_RD_HEAP,
+    };
+    r.regions[2] = RegisterRegion {
+        base: env.rd_storage,
+        frames: RD_STORAGE_FRAMES as u32,
+        kind: REGION_RD_STORAGE,
+    };
+
+    // init's four messenger endpoints, in the same order the create path
+    // created them (ramdisk R|W, then POSIX R|W) so a reader of the record can
+    // tell which end is which without a second field.
+    r.n_chans = 4;
+    r.chans = [env.ramdisk_r, env.ramdisk_w, env.posix_r, env.posix_w];
+
+    // The two sidecars, by the very names `create_environment` registered them
+    // under — the same one-source-of-truth helpers `kill_environment` resolves
+    // them with, so a restore that re-registers these names lands on the same
+    // sidecars the teardown would have.
+    let rd = ramdisk_name(env.index);
+    let px = posix_name(env.index);
+    r.set_task(0, rd.as_str(), TASK_RAMDISK_SIDECAR);
+    r.set_task(1, px.as_str(), TASK_POSIX_SIDECAR);
+    r
 }
 
 /// The ramdisk sidecar's registry name for environment `index`. Built in one
@@ -533,6 +589,41 @@ impl EnvManager {
                     self.reclaiming.push(pending);
                 }
                 self.reply(reply, ENV_DESTROY, ENV_OK, env_id, partition)
+            }
+            // P1a: hand the kernel this environment's half of its checkpoint
+            // record. The reply is NOT the uniform status body -- it is the
+            // registration itself (env_proto::RegisterReply), so it is written
+            // here rather than through reply().
+            ENV_REGISTER => {
+                let (env_id, partition) = match env_proto::parse_register_body(body) {
+                    Some(v) => v,
+                    None => return self.reply(reply, ENV_REGISTER, ENV_ERR_INVAL, 0, 0),
+                };
+                // Same identity rules as ENV_DESTROY: an unknown id is NOENT,
+                // and a request naming the wrong partition is malformed — the
+                // registration must describe the environment the caller named,
+                // never one behind a different partition's route.
+                let pos = match self.envs.iter().position(|(id, _)| *id == env_id) {
+                    Some(p) => p,
+                    None => return self.reply(reply, ENV_REGISTER, ENV_ERR_NOENT, env_id, partition),
+                };
+                if self.envs[pos].1.partition != partition {
+                    return self.reply(reply, ENV_REGISTER, ENV_ERR_INVAL, env_id, partition);
+                }
+                let reg = environment_register_reply(env_id, &self.envs[pos].1);
+                let hdr = EnvFrame::new(ENV_REGISTER, false).encode();
+                let reg_body = reg.encode();
+                let n = hdr.len() + reg_body.len();
+                if reply.len() < n {
+                    // A reply buffer too small is a caller bug, not an answer
+                    // to send short: a TRUNCATED registration is exactly the
+                    // half-applied record the kernel refuses, so send nothing
+                    // and let its round trip time out.
+                    return 0;
+                }
+                reply[..hdr.len()].copy_from_slice(&hdr);
+                reply[hdr.len()..n].copy_from_slice(&reg_body);
+                n
             }
             other => self.reply(reply, other, ENV_ERR_INVAL, 0, 0),
         }
@@ -988,6 +1079,120 @@ mod tests {
         assert_eq!(freed[1], (env.rd_storage, RD_STORAGE_FRAMES, 6));
         assert_eq!(freed[2], (env.px_heap, POSIX_HEAP_FRAMES, 6));
         assert_eq!(k.revoked_handles().len(), 4, "and so did its channel ends");
+    }
+
+    // ── P1a: ENV_REGISTER — the reply the kernel turns into a checkpoint record ──
+    const REGISTER_REPLY_LEN: usize = EnvFrame::SIZE
+        + aerosls_proto::env_proto::REGISTER_REPLY_BODY_SIZE;
+
+    fn register_req(env_id: u32, partition: u32) -> alloc::vec::Vec<u8> {
+        let mut r = EnvFrame::new(ENV_REGISTER, false).encode().to_vec();
+        r.extend_from_slice(&env_proto::encode_register_body(env_id, partition));
+        r
+    }
+
+    /// `read_u32` is crate-private in aerosls-proto, so the test reads the wire
+    /// body the way an outside reader would — byte by byte, little-endian.
+    fn le32(b: &[u8], i: usize) -> u32 {
+        u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
+    }
+
+    /// The registration the kernel receives is the environment's OWN facts, in
+    /// the RECORD's order — not `struct Environment`'s declaration order, and
+    /// with the kind of each region travelling beside its base.
+    #[test]
+    fn register_reply_carries_regions_chans_and_names_in_the_record_order() {
+        let k = SimKernel::new();
+        let env = create_environment(&k, 5, 3, &images()).unwrap();
+        let reg = environment_register_reply(77, &env);
+
+        assert_eq!(reg.partition, 5);
+        assert_eq!(reg.index, 3);
+        assert_eq!(reg.env_id, 77);
+        assert_eq!(reg.n_regions, 3);
+        // The record's order — POSIX heap first — while `Environment` declares
+        // (rd_heap, rd_storage, px_heap). This clause is what fails if the
+        // mapping is rewritten to walk the struct's fields in order.
+        assert_eq!(reg.regions[0],
+                   RegisterRegion { base: env.px_heap, frames: POSIX_HEAP_FRAMES as u32,
+                                    kind: REGION_POSIX_HEAP });
+        assert_eq!(reg.regions[1],
+                   RegisterRegion { base: env.rd_heap, frames: RD_HEAP_FRAMES as u32,
+                                    kind: REGION_RD_HEAP });
+        assert_eq!(reg.regions[2],
+                   RegisterRegion { base: env.rd_storage, frames: RD_STORAGE_FRAMES as u32,
+                                    kind: REGION_RD_STORAGE });
+        // The three kinds are exactly the three the kernel accepts, once each:
+        // the record layer refuses a repeated kind, so a swap that moved a base
+        // without moving its kind would be a refusal, not a silent mis-record.
+        let kinds = [reg.regions[0].kind, reg.regions[1].kind, reg.regions[2].kind];
+        assert_ne!(kinds[0], kinds[1]);
+        assert_ne!(kinds[1], kinds[2]);
+        assert_ne!(kinds[0], kinds[2]);
+        assert!(reg.regions.iter().all(|r| r.base != 0 && r.frames != 0));
+
+        // The four messenger endpoints init holds, in create order.
+        assert_eq!(reg.n_chans, 4);
+        assert_eq!(reg.chans, [env.ramdisk_r, env.ramdisk_w, env.posix_r, env.posix_w]);
+
+        // The two sidecars, by the very names create registered them under.
+        assert_eq!(reg.n_tasks, 2);
+        assert_eq!(&reg.task_names[0][..13], b"drv.ramdisk.3");
+        assert_eq!(reg.task_names[0][13], 0);
+        assert_eq!(reg.task_kinds[0], TASK_RAMDISK_SIDECAR);
+        assert_eq!(&reg.task_names[1][..15], b"aerosls.posix.3");
+        assert_eq!(reg.task_names[1][15], 0);
+        assert_eq!(reg.task_kinds[1], TASK_POSIX_SIDECAR);
+    }
+
+    /// The request path: an ENV_REGISTER for a live environment is answered with
+    /// the full registration body (frame + 200 bytes), naming that environment.
+    #[test]
+    fn env_manager_answers_register_with_the_full_registration_body() {
+        let k = SimKernel::new();
+        let mut mgr = EnvManager::new(images(), 8);
+        let mut reply = [0u8; aerosls_proto::env_proto::REPLY_MAX];
+        let n = mgr.handle_request(&k, &create_req(6, 2), &mut reply);
+        let env_id = reply_status(&reply, n).1;
+
+        let rn = mgr.handle_request(&k, &register_req(env_id, 6), &mut reply);
+        assert_eq!(rn, REGISTER_REPLY_LEN,
+                   "the register reply is the frame plus the whole registration");
+        let f = EnvFrame::parse(&reply[..rn]).expect("the register reply is an ENV frame");
+        assert_eq!(f.ty, ENV_REGISTER);
+        assert!(!f.is_error());
+        let b = &reply[EnvFrame::SIZE..rn];
+        assert_eq!(le32(b, env_proto::REG_OFF_ENV_ID), env_id);
+        assert_eq!(le32(b, env_proto::REG_OFF_PARTITION), 6);
+        assert_eq!(le32(b, env_proto::REG_OFF_INDEX), 2);
+        assert_eq!(le32(b, env_proto::REG_OFF_N_REGIONS), 3);
+        assert_eq!(le32(b, env_proto::REG_OFF_N_CHANS), 4);
+        assert_eq!(le32(b, env_proto::REG_OFF_N_TASKS), 2);
+    }
+
+    /// The identity rules are the destroy path's: a registration for an unknown
+    /// environment is NOENT, and one naming the wrong partition is malformed.
+    /// Neither may answer with a registration — the kernel stores what the
+    /// reply says, so an answer about the wrong environment is worse than none.
+    #[test]
+    fn env_manager_register_refuses_unknown_env_and_wrong_partition() {
+        let k = SimKernel::new();
+        let mut mgr = EnvManager::new(images(), 8);
+        let mut reply = [0u8; aerosls_proto::env_proto::REPLY_MAX];
+        let n = mgr.handle_request(&k, &create_req(6, 2), &mut reply);
+        let env_id = reply_status(&reply, n).1;
+
+        // Unknown id.
+        let un = mgr.handle_request(&k, &register_req(env_id + 5, 6), &mut reply);
+        assert_eq!(reply_status(&reply, un).0, ENV_ERR_NOENT);
+        // Known id, wrong partition.
+        let wn = mgr.handle_request(&k, &register_req(env_id, 7), &mut reply);
+        assert_eq!(reply_status(&reply, wn).0, ENV_ERR_INVAL);
+        // ...and the right pair still answers, so the refusals above were the
+        // checks and not a broken register path.
+        let rn = mgr.handle_request(&k, &register_req(env_id, 6), &mut reply);
+        assert_eq!(rn, REGISTER_REPLY_LEN);
+        assert_eq!(le32(&reply[EnvFrame::SIZE..], env_proto::REG_OFF_ENV_ID), env_id);
     }
 
     /// E5's reap must terminate: a deferred teardown whose env was killed and

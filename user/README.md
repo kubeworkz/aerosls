@@ -171,7 +171,8 @@ ELFs; flatten them to the flat images with `aerosls-bootimage flatten` (or
 Build the initrd that boots the init sidecar on real hardware/QEMU:
 
 ```sh
-make selfhost-bootimage        # cross-builds BOTH sidecars (init + dm),
+make selfhost-bootimage        # cross-builds the six sidecars (init, dm,
+                               # posix, ramdisk, network, e1000_driver),
                                # flattens them, packs sidecars.cpio (needs
                                # the x86_64-unknown-none target:
                                # rustup target add x86_64-unknown-none)
@@ -180,9 +181,37 @@ make x86-iso                   # ships sidecars.cpio into the ISO when present
 
 The archive is a `newc` initrd (`boot/init.bin`, `boot/init.manifest`,
 `boot/dm.bin`, `boot/dm.manifest`, `boot/layout`) with every image at its
-manifest-declared physical address (see `user/bootimage/`). Both binaries
-come from the crates; override with `SIDECAR_INIT_BIN=`/`SIDECAR_DM_BIN=`
-when the cross target is unavailable.
+manifest-declared physical address (see `user/bootimage/`). All six binaries
+come from the crates, and `selfhost-bootimage` REFUSES to pack — and refuses to
+write the stamps — unless every one of them built: they attest the packed
+binaries, so a run that would otherwise have reused existing ones stops
+instead. It writes three tracked files: `sidecars.cpio.stamps` is the pack-run
+record — one tool invocation computes the digest of the `user/` sources, the
+sha256 of the archive's own bytes and the sha256 of each of the six packed
+`boot/*.bin` entries together — and `sidecars.cpio.digest` and
+`sidecars.cpio.sha256` are the two stamp files projected out of it. The record
+is also checked against the pack's inputs: the same invocation takes every
+flattened `.bin` the run just built (`--verify ENTRY=PATH`) and refuses to be
+written if the archive holds anything else, so the packer cannot bless images
+other than its own. `make x86-iso` refuses to ship an archive whose source
+digest no longer matches the tree, whose bytes are not the ones that were
+packed, or whose record and stamps do not all come from one packer run — so a
+`sidecars.cpio` repacked or swapped out of band, or a stamp refreshed on its
+own, is refused too, and a record that names binaries the archive does not hold
+is red to `tests/sidecar_stamp_check.sh`, which re-reads the entries itself.
+Finally, `make x86-iso` also compares the archive's six entries against the
+tree's own flattened `.bin` outputs whenever those exist
+(`tools/sidecar_build_output_check.sh`), so a stale archive whose record and
+stamps were all rewritten from it cannot ship from a tree that has built the
+sidecars — the E3 pack's overwrite of the shared `init.bin` is recognised from
+the E3 pair (its record must equal a live recomputation of `sidecars_e3.cpio`)
+and skipped — and `tests/sidecar_stamp_check.sh` holds that E3 quartet to the
+same one-run rule whenever it is present (each E3 stamp must be a field of
+that record), skipping cleanly when the ignored files are absent. All three
+are plain coreutils and all are recomputable from a clean checkout, so a host
+that never builds sidecars (CI, deploy) verifies the committed archive. To
+pack already-built images deliberately, run `aerosls-bootimage` directly; that
+archive carries no stamp and `x86-iso` will not ship it.
 
 Boot under QEMU with the ISO's Phase 5 menuentry (GRUB loads sidecars.cpio
 as a Multiboot2 module):

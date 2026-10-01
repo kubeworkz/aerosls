@@ -349,7 +349,13 @@ where
             match kind {
                 aerosls_proto::CH_KIND_MSG => match env.recv_msg_len(&mut buf) {
                     Ok((tag, len)) => {
-                        let mut reply = [0u8; 64];
+                        // P1a: sized for the widest ENV reply — an
+                        // ENV_REGISTER answer is the environment's full
+                        // registration (env_proto::REPLY_MAX), not the 12-byte
+                        // status body the create/destroy answers carry. A
+                        // smaller buffer would make the manager decline to
+                        // answer a registration at all (see env_manager).
+                        let mut reply = [0u8; aerosls_proto::env_proto::REPLY_MAX];
                         let n = handle_env(&buf[..len], &mut reply);
                         if n > 0 {
                             let _ = env.request(tag, &reply[..n]);
@@ -473,7 +479,9 @@ where
                     match kind {
                         aerosls_proto::CH_KIND_MSG => match env.recv_msg_len(&mut buf) {
                             Ok((tag, len)) => {
-                                let mut reply = [0u8; 64];
+                                // P1a: see the supervisor loop above — the
+                                // reply must fit a full ENV_REGISTER body.
+                                let mut reply = [0u8; aerosls_proto::env_proto::REPLY_MAX];
                                 let n = handle_env(&buf[..len], &mut reply);
                                 if n > 0 {
                                     let _ = env.request(tag, &reply[..n]);
