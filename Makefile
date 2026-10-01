@@ -201,6 +201,7 @@ X86_C_SRC   = kernel/kernel.c arch/x86/idt.c arch/x86/gdt.c arch/x86/vga.c kerne
               kernel/agent_tools.c \
               kernel/checkpoint_mgr.c \
               kernel/checkpoint_delta.c \
+              kernel/env_ckpt.c \
               kernel/state_tree.c \
               kernel/failover.c \
               drivers/nvme_io.c \
@@ -362,6 +363,29 @@ plugins: compiler/SLSAllocationPassV2.cpp
 
 %.x86.o: %.c $(AB_STAMP)
 	$(X86_CC) $(X86_CFLAGS) -c $< -o $@
+
+# ── Header-only edits must relink the kernel ───────────────────────────────
+# $(AB_STAMP) tracks the build CONFIGURATION and the pattern rule above names
+# no header at all, so a header-only edit -- a new #define, a retuned constant
+# -- compiles nothing and ships the PREVIOUS object. That is not hypothetical:
+# CKPT_NUM_REGIONS grew 17 -> 18 when CKPT_REGION_ENV was added to
+# kernel/checkpoint_delta.h, and checkpoint_delta.x86.o did not rebuild. The
+# stale object's ckpt_mark_all_dirty() still wrote (1u << 17) - 1 and its
+# ckpt_mark_dirty() still dropped region 17 as out of range, so a FULL
+# checkpoint silently CLEARED the very bit the change existed to set. The
+# environment region was never written, P1a's restore had nothing to replay,
+# and every source-level clause stayed green -- the boot arm is what caught
+# it, because it is the only thing that reads the mask the kernel actually
+# computed (logged as `dirty=0x1ffff`, one bit short, in
+# tests/env_checkpoint_restore_check.sh's B3).
+#
+# Named prerequisites, in the same spirit as the sls-i386-stub-class.h rule
+# below and the embedded -bytes.h fixtures above: exactly the translation
+# units that include checkpoint_delta.h, i.e. every consumer of the region
+# NUMBERING. A change to the region map now invalidates precisely the objects
+# whose behaviour it changes.
+kernel/checkpoint_delta.x86.o kernel/checkpoint_mgr.x86.o kernel/env_ckpt.x86.o \
+kernel/persist.x86.o kernel/qemu_sls_tcache.x86.o: kernel/checkpoint_delta.h
 
 # ── kernel/tls_platform.c needs the vendored mbedTLS headers ───────────────
 # An explicit rule rather than adding these to X86_CFLAGS, so vendor/mbedtls's

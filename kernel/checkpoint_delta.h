@@ -37,7 +37,14 @@
 #define CKPT_REGION_SERVICES      14
 #define CKPT_REGION_WORKLOADS     15
 #define CKPT_REGION_TCACHE        16
-#define CKPT_NUM_REGIONS          17
+// POSIX-Environments Roadmap v0.2 Phase P1a. The region bit the tcache block in
+// checkpoint_mgr.c asked for by name ("adding a region bit is the right
+// long-term shape"): an environment checkpoint is written by
+// persist_environments(), marked dirty from env_ckpt_record()/_drop() and from
+// the environment manager once its protocol lands -- so a full checkpoint
+// includes environments without being made unconditional.
+#define CKPT_REGION_ENV           17
+#define CKPT_NUM_REGIONS          18
 
 // ─── Compaction interval: force a full checkpoint every N incremental ones ────
 #define CKPT_FULL_INTERVAL        8

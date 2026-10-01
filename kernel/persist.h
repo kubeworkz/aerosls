@@ -272,6 +272,27 @@
 #define PERSIST_TLS_LBA                 7680ULL
 #define PERSIST_TLS_MAGIC               0x534C53544C533031ULL   /* "SLSTLS01" */
 
+// ─── POSIX-Environments Roadmap v0.2, Phase P1a (environment checkpoint) ─────
+// The environment checkpoint records (kernel/env_ckpt.h) get the next block
+// after the TLS anchor, following the same discipline as every region above:
+//
+//   PERSIST_TLS_LBA   7680 + 8 sectors -> ends 7688
+//   +1 frame safety gap, matching every other boundary in this file
+//   PERSIST_ENV_CKPT_HDR_LBA 7696 + 8  -> ends 7704   (header: count + record size + version)
+//   PERSIST_ENV_CKPT_ENT_LBA 7704 + 8  -> ends 7712   (env_ckpt_table[]: 8 x 368 B = 2,944 B)
+//   STREAM_DIR_LBA    8192                             -> 480 sectors / 60 frames still free
+//
+// One frame for the entry array is not a coincidence and not slack to be
+// spent: env_ckpt.c carries a _Static_assert that the whole array fits a
+// single 4 KiB frame, because persist_environments() writes it as one
+// persist_write_array() span and the checksum span in p_region_specs is a
+// compile-time constant. Letting ENV_CKPT_MAX grow past that turns a silent
+// truncation into a build failure.
+// (The region's magic value lives with the other PERSIST_MAGIC_* constants
+// below, as PERSIST_MAGIC_ENV_CKPT -- not duplicated as a _MAGIC_NV alias here.)
+#define PERSIST_ENV_CKPT_HDR_LBA        7696ULL
+#define PERSIST_ENV_CKPT_ENT_LBA        7704ULL
+
 // One-way format-version marker, written into PERSIST_ROWSTORE_HDR_LBA's/
 // PERSIST_VECSTORE_HDR_LBA's own header frame (the v2 field, previously
 // always 0) -- see the LBA layout comment above for the full reasoning.
@@ -295,6 +316,7 @@
 #define PERSIST_MAGIC_TENANT         0xCAFE00000000000EULL   /* Multitenant Isolation Gap Analysis §5 item 1 */
 #define PERSIST_MAGIC_SERVICE        0xCAFE00000000000FULL   /* Orchestration Plan Phase 4 (service registry) */
 #define PERSIST_MAGIC_WORKLOAD       0xCAFE000000000010ULL   /* Orchestration Plan Phase 5 (declarative workloads) */
+#define PERSIST_MAGIC_ENV_CKPT       0xCAFE000000000012ULL   /* POSIX-Environments v0.2 Phase P1a (environment checkpoint records) */
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 
@@ -391,6 +413,17 @@ void persist_row_journal(void);
 // the same derived-not-stored treatment row_journal_attachment_count
 // already gets.
 void persist_databases(void);
+
+// Snapshot env_ckpt_table[] (kernel/env_ckpt.h) → NVMe. POSIX-Environments
+// Roadmap v0.2 Phase P1a: call after every successful env_ckpt_record()/_drop()
+// and from checkpoint_trigger()'s dirty-region walk. Unlike every other writer
+// here, a zero live-record count is still WRITTEN (as a committed empty
+// snapshot) rather than skipped -- see persist_environments()'s own comment for
+// why letting a stale snapshot stand is the wrong failure. Restoring it is
+// likewise not a plain array load: persist_restore_all() hands the snapshot to
+// env_ckpt_adopt(), which refuses an unusable one in full instead of applying
+// part of it.
+void persist_environments(void);
 
 // Snapshot views[] → NVMe. Query-Surface Roadmap Phase 5: call after every
 // successful view_create()/view_drop(). Pure definitions, direct restore --

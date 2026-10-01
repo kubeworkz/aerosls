@@ -2754,6 +2754,24 @@ static int api_partitions_list(char* buf, int max) {
         jb_obj_open(&j, 0);
         jb_uint(&j, "id", partition_table[i].partition_id); jb_putc(&j, ',');
         jb_str(&j, "name", partition_table[i].name); jb_putc(&j, ',');
+        /* Whether partition_pause() has taken this partition out of the
+         * scheduling rotation. The pause state had NO read surface anywhere --
+         * not here, not in `partition list`, not on any route -- which is the
+         * same gap the owner_node field below was added to close, and it cost
+         * the same kind of time: the only way to learn a partition was paused
+         * was to watch the rotation not contain it.
+         *
+         * P1a's boot arm is the first caller that has to know.
+         * tests/env_checkpoint_restore_check.sh pauses a partition, checkpoints
+         * the node, reboots against the same NVMe image, and requires the
+         * recorded pause to have been re-applied -- and the only honest
+         * evidence for that is this flag, read from the running kernel rather
+         * than inferred from a log line. Deliberately NOT persisted:
+         * partition_paused[] is per-boot kernel state (kernel/partition.c says
+         * so at its definition), so a set bit after a reboot IS the restore
+         * having put it back. */
+        jb_uint(&j, "paused", (uint32_t)partition_is_paused(partition_table[i].partition_id));
+        jb_putc(&j, ',');
         /* The owner node, which nothing exposed before. partition_migrate()
          * refuses a destination that already owns the partition, and only the
          * owner holds the data to send -- so this is the field that decides
@@ -3100,6 +3118,52 @@ static int api_partition_env_destroy_post(const char* body, char* buf, int max,
         jb_str(&j,"ok","false"); jb_putc(&j,',');
         jb_uint(&j,"status", status); jb_putc(&j,',');
         jb_str(&j,"error", env_status_name(status));
+    }
+    jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── POST /api/env/restore — POSIX-Environments v0.2 P1a (restore) ───────────
+// Replay every environment record this boot adopted from its own NVMe snapshot
+// (persist_restore_all() block 17), each through the SAME create path the route
+// above uses -- env_service_restore_pending()'s whole contract is that a
+// restored environment is a created environment or it is not restored at all.
+//
+// Not nested under /api/partition/{id}/ because a snapshot is not a partition's
+// business: the records name their own partitions, and one pass replays all of
+// them. The pass is idempotent per boot (a record is replayed at most once) and
+// reports its counts, so an operator can tell "nothing was pending" from
+// "everything replayed" from "these were refused, and why" -- the serial
+// transcript carries each refusal's reason. Same DB_ADMIN+ gate as create and
+// destroy: bringing environments back is a tenancy-administration action.
+//
+// The payload caveat is stated where an operator will read it: this restores
+// the environment, not (yet) its contents -- see kernel/env_ckpt.h.
+static int api_env_restore_post(char* buf, int max, SLSRole req_role) {
+    JSONBuf j = { buf, 0, max };
+    if (req_role > ROLE_DB_ADMIN) {
+        jb_obj_open(&j,0); jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","requires DB_ADMIN or higher");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
+
+    struct EnvSvcRestoreReport rep;
+    int rc = env_service_restore_pending(&rep);
+
+    jb_obj_open(&j,0);
+    if (rc != 0) {
+        jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","environment manager unavailable or timed out");
+        jb_putc(&j,',');
+        jb_uint(&j,"pending", rep.n_pending); jb_putc(&j,',');
+        jb_uint(&j,"remaining", rep.n_remaining);
+    } else {
+        jb_str(&j,"ok","true"); jb_putc(&j,',');
+        jb_uint(&j,"pending", rep.n_pending); jb_putc(&j,',');
+        jb_uint(&j,"replayed", rep.n_replayed); jb_putc(&j,',');
+        jb_uint(&j,"refused", rep.n_refused); jb_putc(&j,',');
+        jb_uint(&j,"remaining", rep.n_remaining); jb_putc(&j,',');
+        jb_uint(&j,"resumed", rep.n_resumed); jb_putc(&j,',');
+        jb_uint(&j,"repaused", rep.n_repaused);
     }
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
@@ -6411,6 +6475,14 @@ static void http_route(int conn, char* req) {
         // of them. ────────────────────────────────────────────────────────────
         if (!strcmp(path, "/api/partitions")) {
             blen = api_partition_create_post(body_ptr, resp_body, (int)sizeof(resp_body), req_role);
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        // POST /api/env/restore — POSIX-Environments v0.2 P1a: replay the
+        // environment records the boot adopted from its snapshot, through the
+        // same create path as the route below. A whole-node pass, so it has no
+        // partition in its path.
+        if (!strcmp(path, "/api/env/restore")) {
+            blen = api_env_restore_post(resp_body, (int)sizeof(resp_body), req_role);
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         // POST /api/partition/{id}/env and .../env/destroy — POSIX-Environments
