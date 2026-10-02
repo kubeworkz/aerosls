@@ -38,8 +38,11 @@ blockcache/       # the POSIX sidecar's block cache — the ramdisk protocol cli
                   # poll_dead (observe a queued close without a request)
   src/copy.rs     # the client's entire unsafe surface (raw memory copies)
 vfs/              # the POSIX sidecar's VFS — the layer above the block cache
-  src/aerofs.rs   # aerofs-lite on-disk format (superblock/inode/dirent, CRC-32,
-                  # 11 direct + 1 indirect block) + the genrootfs image builder
+  src/aerofs.rs   # aerofs-lite on-disk format (superblock/inode/dirent, CRC-32):
+                  # v1 read-only (11 direct + 1 indirect) and v2 writable
+                  # (10 direct + 2 indirect, block bitmap, 136 192-byte
+                  # ceiling) under the rule "read v1, write v2, refuse the
+                  # rest"; + the genrootfs image builder (deliberately still v1)
   src/ramfs.rs    # in-memory /tmp filesystem (never stale)
   src/fileobj.rs  # file-like objects: PipeNode (ends counted by the VFS, so
                   # EOF/EPIPE/EAGAIN are exact), CharNode (/dev/console — the
@@ -49,7 +52,9 @@ vfs/              # the POSIX sidecar's VFS — the layer above the block cache
                   # (pooled: fork copies a table sharing FileNodes; CLONE_FILES
                   # shares the table object), shared-offset FileNode, the
                   # syscall surface, pipe(), devfs (/dev), fd dispatch over
-                  # FileObj (file/pipe/device), stale→EIO, fail-permanently
+                  # FileObj (file/pipe/device), stale→EIO, fail-permanently;
+                  # v2 mounts are writable (create/write/truncate/unlink/…),
+                  # v1 mounts refuse every mutation with ERofs
   src/errno.rs    # shared POSIX errno set
 procmgr/          # the POSIX sidecar's proc manager — cooperative tasks over
                   # the VFS (Phase 2 §3.2–§3.3, §4)
