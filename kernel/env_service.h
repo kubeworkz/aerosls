@@ -45,4 +45,81 @@ int env_service_destroy(uint32_t env_id, uint32_t partition,
                         uint16_t* out_status, uint32_t* out_env_id,
                         uint32_t* out_partition);
 
+/* POSIX-Environments v0.2 P1a: have the environment manager hand over its half
+ * of the environment's checkpoint record.
+ *
+ * A record needs facts that exist in exactly one place each, and this is the
+ * direction they travel. init owns the three frame-pool regions it allocated,
+ * the four messenger endpoints it holds, and the registry names the sidecars
+ * were created under; the kernel owns the loaded sidecars' entry points and the
+ * console binding. So this round-trips ENV_REGISTER { env_id, partition } to
+ * init, parses the reply into `struct EnvCkptRegister`, resolves each named
+ * task to the sidecar the kernel actually released (its `user_rip`), and hands
+ * both halves to env_ckpt_register_from() -- which either stores one complete
+ * record or stores nothing.
+ *
+ * `console_id` is the environment's E6 console key (its index) when a console
+ * was registered and bound, 0 when it was not -- an environment whose POSIX
+ * sidecar never came up, which nobody can reach and therefore nobody can
+ * checkpoint the output of either. `index` is passed, not read back from the
+ * reply: it is the (partition, index) identity the sidecars' names carry, and
+ * it is what the kernel resolves those names with.
+ *
+ * Returns 0 when a record was stored, -1 when the channel is not wired or init
+ * did not answer -- in which case the environment EXISTS and is simply not
+ * checkpointed, which is why the caller logs rather than failing the create.
+ * A refusal from the record layer (a foreign/duplicated/incomplete
+ * registration) is returned as -1 too, with the reason on the serial
+ * transcript: refusal-over-partial-application, applied to the create path. */
+int env_service_register_env(uint32_t partition, uint32_t index,
+                             uint32_t env_id, uint32_t console_id);
+
+/* ─── P1a: restore-through-create ────────────────────────────────────────────
+ * Replay every environment record the last boot's snapshot left pending -- each
+ * one through env_service_create(), the SAME ENV_CREATE round trip an HTTP
+ * `POST /api/partition/{id}/env` makes. A restored environment is a created
+ * environment or it is not restored at all: nothing here has a second create
+ * path, and the record layer's gate (env_ckpt_restore_admissible) refuses the
+ * records that must not be replayed before any of this runs.
+ *
+ * What the pass does, per record, in this order -- the order is the feature:
+ *
+ *   1. A partition the snapshot left PAUSED is resumed for the length of the
+ *      create (E4's placement gate refuses a paused target) and re-paused by
+ *      the pass's own ledger afterwards. From the first resume to that repause
+ *      the body is deliberately straight-line with NO `return`: a pass that
+ *      bailed out between them would leave a partition an operator had frozen
+ *      RUNNING.
+ *   2. The create is issued. A failure (no reply, or an ENV_ERR_* status) is
+ *      refused with its own reason and recorded -- never reported as a replay.
+ *   3. The record the create's own ENV_REGISTER produced is compared with the
+ *      one that was adopted (env_ckpt_restore_same_identity()). On a mismatch
+ *      the environment the create just made is DESTROYED and the record is
+ *      refused: refusal over partial application, so a refused restore leaves
+ *      no environment behind -- not a fresh one, and not a half-restored one.
+ *      What this layer does NOT have yet is the payload: the environment that
+ *      comes back is empty (see env_ckpt.h), which is why a replay is counted
+ *      as replayed, never as restored.
+ *
+ * Fills `out` even when it returns -1: the counts ARE the contract, and a pass
+ * that replayed nothing must be distinguishable from one that replayed
+ * everything. A NULL `out` is refused (returns -1) rather than silently
+ * dropping the report.
+ *
+ * Returns 0 when the pass ran (including "nothing was pending" -- a boot that
+ * adopted nothing has nothing to replay, which is not a failure), or -1 when
+ * records ARE pending and the control channel is not wired: nothing is
+ * attempted and nothing settles, so the records stay pending and an operator can
+ * ask again once the manager is up. */
+struct EnvSvcRestoreReport {
+    uint32_t n_pending;    /* records the snapshot left to replay */
+    uint32_t n_replayed;   /* creates that came back and re-registered */
+    uint32_t n_refused;    /* records this pass declined, each with a reason */
+    uint32_t n_remaining;  /* still pending when the pass ended */
+    uint32_t n_resumed;    /* paused partitions stepped out of for a replay */
+    uint32_t n_repaused;   /* ...and put back paused by the same pass */
+};
+
+int env_service_restore_pending(struct EnvSvcRestoreReport* out);
+
 #endif /* ENV_SERVICE_H */

@@ -33,7 +33,7 @@ int main(void) {
 
     /* ── the cross-language constant contract (== env_proto.rs) ───────────── */
     CHECK(ENV_VERSION == 1, "ENV_VERSION");
-    CHECK(ENV_CREATE == 1 && ENV_DESTROY == 2, "opcodes");
+    CHECK(ENV_CREATE == 1 && ENV_DESTROY == 2 && ENV_REGISTER == 3, "opcodes");
     CHECK(ENV_FLAG_ERROR == 0x0001, "ENV_FLAG_ERROR");
     CHECK(ENV_OK == 0 && ENV_ERR_INVAL == 1 && ENV_ERR_NOMEM == 2 &&
           ENV_ERR_PART == 3 && ENV_ERR_FULL == 4 && ENV_ERR_UNSUPP == 5 &&
@@ -42,6 +42,32 @@ int main(void) {
     CHECK(ENV_FRAME_SIZE == 16 && ENV_CREATE_BODY_SIZE == 8 &&
           ENV_DESTROY_BODY_SIZE == 8 && ENV_REPLY_BODY_SIZE == 12,
           "sizes");
+
+    /* ── P1a: ENV_REGISTER's sizes and the record they image ─────────────────
+     * The reply body IS `struct EnvCkptRegister` (kernel/env_ckpt.h), so its
+     * counts come from the record's constants rather than being restated. The
+     * layout itself is pinned field-for-field by tests/env_register_host_test.c
+     * (literal byte offsets) and cross-language by
+     * tests/env_register_pin_check.sh. */
+    CHECK(ENV_REGISTER_BODY_SIZE == 8 && ENV_REGISTER_REPLY_BODY_SIZE == 200,
+          "register body sizes");
+    CHECK(sizeof(struct EnvCkptRegister) == ENV_REGISTER_REPLY_BODY_SIZE,
+          "the register body is a padding-free image of struct EnvCkptRegister");
+    CHECK(ENV_REGISTER_REPLY_BODY_SIZE ==
+              16 + ENV_CKPT_MAX_REGIONS * 16 + 4 + ENV_CKPT_MAX_CHANS * 4 +
+              4 + ENV_CKPT_MAX_TASKS * ENV_CKPT_NAME_LEN + ENV_CKPT_MAX_TASKS * 4,
+          "the body is field-sum, so a count change on either side moves it");
+    CHECK(ENV_REQ_MAX == ENV_FRAME_SIZE + ENV_CREATE_BODY_SIZE &&
+          ENV_REPLY_MAX == ENV_FRAME_SIZE + ENV_REGISTER_REPLY_BODY_SIZE,
+          "ENV_REPLY_MAX covers the widest reply (a registration)");
+    CHECK(ENV_CKPT_MAX_REGIONS == 3 && ENV_CKPT_MAX_CHANS == 4 &&
+          ENV_CKPT_MAX_TASKS == 4 && ENV_CKPT_NAME_LEN == 24,
+          "the register body's counts are the record's");
+    CHECK(ENV_CKPT_REGION_POSIX_HEAP == 1 && ENV_CKPT_REGION_RD_HEAP == 2 &&
+          ENV_CKPT_REGION_RD_STORAGE == 3 &&
+          ENV_CKPT_TASK_POSIX_SIDECAR == 0 && ENV_CKPT_TASK_RAMDISK_SIDECAR == 1 &&
+          ENV_CKPT_TASK_LINUX == 2,
+          "the region and task kinds init must name are these values (== env_proto.rs)");
 
     /* ── frame encode: magic "AEROSEN\x01" + LE fields ────────────────────── */
     uint8_t f[ENV_FRAME_SIZE];
@@ -95,6 +121,39 @@ int main(void) {
     uint16_t st = 0xFFFF; uint32_t eid = 0, part = 0;
     env_reply_body_parse(rb, &st, &eid, &part);
     CHECK(st == ENV_OK && eid == 7 && part == 5, "reply body parses status/env_id/partition");
+
+    /* ── ENV_REGISTER request body: { env_id u32, partition u32 } LE ──────── */
+    uint8_t grb[ENV_REGISTER_BODY_SIZE];
+    env_register_body_encode(grb, 0x0BADF00Du, 0x00000007u);
+    uint32_t g_id = 0, g_part = 0;
+    CHECK(env_register_body_parse(grb, sizeof grb, &g_id, &g_part) == 1 &&
+          g_id == 0x0BADF00Du && g_part == 7u,
+          "register body round-trips env_id + partition");
+    CHECK(grb[0] == 0x0D && grb[3] == 0x0B, "register body is little-endian");
+    CHECK(env_register_body_parse(grb, ENV_REGISTER_BODY_SIZE - 1, &g_id, &g_part) == 0,
+          "a register body one byte short is refused, not half-read");
+
+    /* ── ENV_REGISTER reply body: the registration, exactly ───────────────── */
+    struct EnvCkptRegister reg_in;
+    memset(&reg_in, 0, sizeof reg_in);
+    reg_in.partition_id = 6; reg_in.index = 3; reg_in.env_id = 42;
+    reg_in.n_regions = ENV_CKPT_MAX_REGIONS;
+    reg_in.regions[0].base = 0x40000000ull; reg_in.regions[0].frames = 1024;
+    reg_in.regions[0].kind = ENV_CKPT_REGION_POSIX_HEAP;
+    reg_in.n_chans = ENV_CKPT_MAX_CHANS;
+    reg_in.chans[3] = 14;
+    reg_in.n_tasks = 2;
+    memcpy(reg_in.task_name[0], "drv.ramdisk.3", 14);
+    reg_in.task_kind[0] = ENV_CKPT_TASK_RAMDISK_SIDECAR;
+    uint8_t regb[ENV_REGISTER_REPLY_BODY_SIZE];
+    struct EnvCkptRegister reg_out;
+    memset(&reg_out, 0x5A, sizeof reg_out);
+    env_register_reply_encode(regb, &reg_in);
+    CHECK(env_register_reply_parse(regb, sizeof regb, &reg_out) == 1 &&
+          memcmp(&reg_in, &reg_out, sizeof reg_in) == 0,
+          "the registration encodes and parses back field for field");
+    CHECK(env_register_reply_parse(regb, sizeof regb - 1, &reg_out) == 0,
+          "a registration one byte short is refused, not half-applied");
 
     if (failures == 0) {
         printf("ALL PASS: kernel/env_proto.h matches the ENV_* wire contract\n");

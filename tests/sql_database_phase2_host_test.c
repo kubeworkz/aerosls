@@ -19,7 +19,7 @@
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers \
  *       -o /tmp/sql_database_phase2_host_test tests/sql_database_phase2_host_test.c \
  *       kernel/object_catalog.c kernel/database.c kernel/rowstore.c kernel/storage_quota.c kernel/row_index.c \
- *       kernel/row_constraint.c kernel/row_journal.c kernel/persist.c kernel/checkpoint_delta.c kernel/view.c \
+ *       kernel/row_constraint.c kernel/row_journal.c kernel/persist.c kernel/env_ckpt.c kernel/checkpoint_delta.c kernel/view.c \
  *       kernel/cursor.c kernel/mvcc.c kernel/predicate.c \
  *       kernel/sql_parser.c kernel/sql_exec.c kernel/group_profile.c \
  *       kernel/authlist.c kernel/security_audit.c
@@ -28,6 +28,7 @@
 #include "kernel/object_catalog.h"
 #include "kernel/loader.h"
 #include "kernel/partition.h"
+#include "tests/partition_host_stubs.h"  /* P1a quiesce: env_ckpt.c calls partition_pause/_resume/_is_paused/_exists */
 #include "kernel/database.h"
 #include "kernel/rowstore.h"
 #include "kernel/row_index.h"

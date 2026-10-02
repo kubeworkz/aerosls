@@ -41,7 +41,7 @@
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers -I net \
  *       -o /tmp/persist_rdbms_vecstore_host_test \
  *       tests/persist_rdbms_vecstore_host_test.c \
- *       kernel/persist.c kernel/checkpoint_delta.c kernel/view.c kernel/rowstore.c kernel/storage_quota.c kernel/row_index.c kernel/mvcc.c \
+ *       kernel/persist.c kernel/env_ckpt.c kernel/checkpoint_delta.c kernel/view.c kernel/rowstore.c kernel/storage_quota.c kernel/row_index.c kernel/mvcc.c \
  *       kernel/row_constraint.c kernel/row_journal.c kernel/vecstore.c \
  *       kernel/vec_index.c
  *   /tmp/persist_rdbms_vecstore_host_test
@@ -49,6 +49,7 @@
 #include "kernel/object_catalog.h"
 #include "kernel/loader.h"
 #include "kernel/partition.h"
+#include "tests/partition_host_stubs.h"  // P1a quiesce: env_ckpt.c now calls partition_pause/_resume/_is_paused/_exists
 #include "kernel/rowstore.h"
 #include "kernel/row_index.h"
 #include "kernel/row_constraint.h"
