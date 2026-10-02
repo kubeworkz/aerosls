@@ -512,3 +512,234 @@ fn mount_state_derived_from_device() {
     t.join().unwrap();
     let _ = fake;
 }
+
+// ── P1b part 1: aerofs-lite v2, the writable format, end to end ─────────────
+//
+// These run the whole real chain — VFS → block cache → wire → ramdisk driver
+// → storage — with the WRITABLE driver (the manifest a tenant environment's
+// ramdisk gets). What they add to the tests above is the version rule and the
+// format's ceiling: an empty store formats v2 and mounts writable, a v1 image
+// is mounted as-is and stays read-only, and a file LARGER than v1's
+// 71,168-byte ceiling survives a reboot — where "reboot" is the store's own
+// bytes re-booted as a fresh kernel, a fresh driver and a fresh mount.
+
+/// The first-cut tenant store: 1 MiB (what `RD_STORAGE_FRAMES` 256 is).
+const V2_STORE_BYTES: usize = 1024 * 1024;
+/// Past v1's ceiling of 71,168 bytes, so the write proves the format moved.
+const BIG_FILE: usize = 71_200;
+
+/// Boot a driver whose storage cap is WRITABLE, over `storage`.
+fn boot_writable(storage: Vec<u8>) -> (FakeKernel, FakeClient, JoinHandle<()>) {
+    let (fake, client) = FakeKernel::new_writable(storage, 1);
+    let (base, len) = fake.storage_info();
+    let dev = Device {
+        storage_slot: DRIVER_STORAGE,
+        storage_base: base,
+        storage_len: len,
+        storage_writable: true,
+    };
+    let mut eps = EndpointSet::new(DRIVER_CONSOLE);
+    for h in fake.initial_chan_caps() {
+        eps.adopt(h);
+    }
+    let driver_fake = fake.clone();
+    let t = std::thread::spawn(move || {
+        let _ = server::run(&driver_fake, &mut eps, &dev);
+    });
+    (fake, client, t)
+}
+
+/// A VFS whose `/` is mounted through `mount_aerofs_or_format` — the tenant
+/// environment's boot path — and `/tmp` ramfs. Returns whether the store was
+/// formatted (i.e. it was empty).
+fn mount_root_or_format(client: &FakeClient) -> (Vfs<FakeClient, FakeAlloc>, bool) {
+    let cache = BlockCache::connect(
+        KWrap(Arc::new(client.clone())),
+        0,
+        0,
+        AWrap(Arc::new(Mutex::new(FakeAlloc(client.clone())))),
+    )
+    .unwrap();
+    let mut vfs = Vfs::new();
+    let formatted = vfs.mount_aerofs_or_format("/", cache).unwrap();
+    vfs.mount_ramfs("/tmp").unwrap();
+    (vfs, formatted)
+}
+
+/// Write `data` to `path` through the VFS (O_CREAT|O_RDWR), returning the fd.
+fn write_file(vfs: &mut Vfs<FakeClient, FakeAlloc>, path: &str, data: &[u8]) -> u32 {
+    let fd = vfs.open(0, path, O_CREAT | O_RDWR, 0o644).unwrap();
+    assert_eq!(vfs.write(0, fd, data).unwrap(), data.len(), "the write is whole");
+    fd
+}
+
+/// Read a whole file through the VFS, asserting it has exactly `want.len()`
+/// bytes.
+fn read_file(vfs: &mut Vfs<FakeClient, FakeAlloc>, path: &str, want: &[u8]) -> Vec<u8> {
+    let fd = vfs.open(0, path, O_RDONLY, 0).unwrap();
+    let mut got = vec![0u8; want.len()];
+    let mut off = 0usize;
+    while off < got.len() {
+        let n = vfs.read(0, fd, &mut got[off..]).unwrap();
+        assert!(n > 0, "no premature EOF at {off}");
+        off += n;
+    }
+    let mut extra = [0u8; 1];
+    assert_eq!(vfs.read(0, fd, &mut extra).unwrap(), 0, "no bytes past the size");
+    vfs.close(0, fd).unwrap();
+    got
+}
+
+#[test]
+fn v2_empty_store_formats_writable() {
+    let (_fake, client, t) = boot_writable(vec![0u8; V2_STORE_BYTES]);
+    let (mut vfs, formatted) = mount_root_or_format(&client);
+    assert!(formatted, "an all-zero store has no superblock and is formatted");
+    assert_eq!(vfs.mounts()[0].1, MountState::Active);
+
+    // A file past v1's 71,168-byte ceiling, patterned so a shifted byte
+    // cannot pass as an equal one.
+    let big: Vec<u8> = (0..BIG_FILE).map(|i| (i % 251) as u8).collect();
+    let fd = write_file(&mut vfs, "/big.bin", &big);
+    vfs.close(0, fd).unwrap();
+    let small = b"the small one\n";
+    let fd = write_file(&mut vfs, "/small.txt", small);
+    vfs.close(0, fd).unwrap();
+
+    assert_eq!(read_file(&mut vfs, "/big.bin", &big), big);
+    assert_eq!(read_file(&mut vfs, "/small.txt", small), small);
+    assert_eq!(vfs.stat(0, "/big.bin").unwrap().size, BIG_FILE as u64);
+
+    // The store now holds a v2 image — the writer's half of the version rule.
+    let bytes = client.storage_bytes();
+    assert_eq!(&bytes[..4], b"AFSL");
+    assert_eq!(
+        u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+        2,
+        "the format wrote v2"
+    );
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
+
+#[test]
+fn v2_large_file_survives_a_reboot() {
+    // Power-on #1: format, then write both files.
+    let (_fake, client, t) = boot_writable(vec![0u8; V2_STORE_BYTES]);
+    let (mut vfs, formatted) = mount_root_or_format(&client);
+    assert!(formatted);
+    let big: Vec<u8> = (0..BIG_FILE).map(|i| (i % 251) as u8).collect();
+    let small = b"the small one\n";
+    let fd = write_file(&mut vfs, "/big.bin", &big);
+    vfs.close(0, fd).unwrap();
+    let fd = write_file(&mut vfs, "/small.txt", small);
+    vfs.close(0, fd).unwrap();
+    client.kill_driver(0);
+    t.join().unwrap();
+    let store = client.storage_bytes();
+
+    // Power-on #2: a fresh kernel and driver over the same bytes.
+    let (_fake2, client2, t2) = boot_writable(store);
+    let (mut vfs2, formatted2) = mount_root_or_format(&client2);
+    assert!(!formatted2, "a valid v2 superblock is mounted, not re-formatted");
+    assert_eq!(read_file(&mut vfs2, "/big.bin", &big), big, "byte-identical after the reboot");
+    assert_eq!(read_file(&mut vfs2, "/small.txt", small), small);
+
+    // The store is still writable after the remount: a third file lands and
+    // reads back, so nothing about mounting froze the allocation state.
+    let fd = write_file(&mut vfs2, "/after.txt", b"after the reboot\n");
+    vfs2.close(0, fd).unwrap();
+    assert_eq!(read_file(&mut vfs2, "/after.txt", b"after the reboot\n"), b"after the reboot\n");
+
+    client2.kill_driver(0);
+    t2.join().unwrap();
+}
+
+#[test]
+fn v2_allocator_frees_and_refuses_clearly() {
+    let (_fake, client, t) = boot_writable(vec![0u8; V2_STORE_BYTES]);
+    let (mut vfs, formatted) = mount_root_or_format(&client);
+    assert!(formatted);
+
+    // Directories and unlink exist on the writable format.
+    vfs.mkdir(0, "/d", 0o755).unwrap();
+    let fd = write_file(&mut vfs, "/d/f", b"payload\n");
+    vfs.close(0, fd).unwrap();
+    assert_eq!(vfs.rmdir(0, "/d"), Err(Errno::ENotempty), "a non-empty dir is refused");
+    vfs.unlink(0, "/d/f").unwrap();
+    vfs.rmdir(0, "/d").unwrap();
+    assert_eq!(vfs.open(0, "/d/f", O_RDONLY, 0), Err(Errno::ENoent));
+
+    // Past the FORMAT's per-file ceiling is EFBIG — the format, not the
+    // store, is what bounds a file. (These run before the ENOSPC arm below:
+    // a refused write allocates nothing.)
+    assert!(200 * 1024 > 136_192);
+    let fd = vfs.open(0, "/efbig", O_CREAT | O_RDWR, 0o644).unwrap();
+    assert_eq!(vfs.write(0, fd, &vec![0u8; 200 * 1024]), Err(Errno::EFbig));
+    assert_eq!(vfs.lseek(0, fd, 140_000, SEEK_SET).unwrap(), 140_000);
+    assert_eq!(vfs.write(0, fd, b"x"), Err(Errno::EFbig), "an offset past the ceiling too");
+    vfs.close(0, fd).unwrap();
+
+    // A 120 KiB file can be written, deleted and written again: the blocks
+    // an unlink freed are reusable, so the second write does not run out.
+    let chunk = vec![0x5A; 120 * 1024];
+    let fd = write_file(&mut vfs, "/churn", &chunk);
+    vfs.close(0, fd).unwrap();
+    vfs.unlink(0, "/churn").unwrap();
+    let fd = write_file(&mut vfs, "/churn2", &chunk);
+    vfs.close(0, fd).unwrap();
+    assert_eq!(read_file(&mut vfs, "/churn2", &chunk), chunk);
+
+    // Filling the store fails ENOSPC, never a silent short write. The format
+    // caps a single file at 136,192 B, so filling a 1 MiB store takes several
+    // of them: eight 130 KB files is more than the store's block count.
+    let fill = vec![0xA5; 130_000];
+    let mut full = false;
+    for i in 0..10 {
+        let name = format!("/fill{i}");
+        let fd = vfs.open(0, &name, O_CREAT | O_RDWR, 0o644).unwrap();
+        match vfs.write(0, fd, &fill) {
+            Ok(n) => assert_eq!(n, fill.len()),
+            Err(e) => {
+                assert_eq!(e, Errno::ENospc, "the store is full, and says so");
+                assert!(i > 0, "not the first file");
+                full = true;
+                vfs.close(0, fd).unwrap();
+                break;
+            }
+        }
+        vfs.close(0, fd).unwrap();
+    }
+    assert!(full, "ten 130 KB files exceed a 1 MiB store, so one write must refuse");
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
+
+#[test]
+fn v1_image_mounts_read_only_through_the_formatting_mount() {
+    // The SYSTEM ramdisk path: a store holding a valid v1 image is mounted
+    // as-is, read-only. It must not be re-formatted — that would turn every
+    // existing image (the system rootfs included) into a v2 store.
+    let (_fake, client, t) = boot(sample_image());
+    let (mut vfs, formatted) = mount_root_or_format(&client);
+    assert!(!formatted, "a valid v1 superblock means no format");
+    let mut buf = [0u8; 8];
+    let fd = vfs.open(0, "/etc/passwd", O_RDONLY, 0).unwrap();
+    let n = vfs.read(0, fd, &mut buf).unwrap();
+    assert_eq!(&buf[..n], b"root:x:0");
+    vfs.close(0, fd).unwrap();
+    // Every mutating entry point answers ERofs — the read half of the rule.
+    assert_eq!(vfs.open(0, "/etc/new", O_CREAT | O_WRONLY, 0o644), Err(Errno::ERofs));
+    assert_eq!(vfs.open(0, "/etc/passwd", O_WRONLY, 0), Err(Errno::ERofs));
+    assert_eq!(vfs.mkdir(0, "/newdir", 0o755), Err(Errno::ERofs));
+    assert_eq!(vfs.unlink(0, "/etc/passwd"), Err(Errno::ERofs));
+    assert_eq!(vfs.rmdir(0, "/etc"), Err(Errno::ERofs));
+    // And the image on the device is untouched: still v1, still the same
+    // bytes the builder wrote for it.
+    let bytes = client.storage_bytes();
+    assert_eq!(u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]), 1);
+    client.kill_driver(0);
+    t.join().unwrap();
+}
