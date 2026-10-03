@@ -147,6 +147,36 @@ static void mint_dev(uint32_t pid, uint16_t slot, uint64_t word) {
     printf("ok: %s\n", msg); \
 } while (0)
 
+/* ─── Link stubs for kernel/env_storage.h ────────────────────────────────
+ * cap.c's env-storage syscall wrappers (323-326) name the durable-region
+ * module, which this test neither links nor exercises (no NVMe, no
+ * persist, nothing attached). The values below are the real module's own
+ * answers for that world: restore of a missing entry is the contract's
+ * successful no-op, write/release find no entry, owner says not-attached,
+ * and attach cannot back a store where no NVMe command can run. */
+#include "kernel/env_storage.h"
+uint64_t env_storage_attach(uint32_t partition_id, uint32_t index,
+                            uint64_t region_base, uint64_t region_bytes) {
+    (void)partition_id; (void)index; (void)region_base; (void)region_bytes;
+    return ENV_STORAGE_ERR_IO;
+}
+uint64_t env_storage_restore(uint64_t region_base) {
+    (void)region_base;
+    return ENV_STORAGE_OK;
+}
+uint64_t env_storage_write(uint64_t region_base, uint32_t lba, uint32_t bytes) {
+    (void)region_base; (void)lba; (void)bytes;
+    return ENV_STORAGE_ERR_NOENT;
+}
+uint64_t env_storage_release(uint64_t region_base) {
+    (void)region_base;
+    return ENV_STORAGE_ERR_NOENT;
+}
+uint32_t env_storage_owner(uint64_t region_base) {
+    (void)region_base;
+    return 0xFFFFFFFFu;
+}
+
 int main(void) {
     cap_init();
     const uint32_t P = 901;

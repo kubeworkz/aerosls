@@ -22,7 +22,7 @@
  *       kernel/row_constraint.c kernel/row_journal.c kernel/persist.c kernel/env_ckpt.c kernel/checkpoint_delta.c kernel/view.c \
  *       kernel/cursor.c kernel/mvcc.c kernel/predicate.c \
  *       kernel/sql_parser.c kernel/sql_exec.c kernel/group_profile.c \
- *       kernel/authlist.c kernel/security_audit.c
+ *       kernel/authlist.c kernel/security_audit.c kernel/env_storage.c
  *   /tmp/sql_database_phase2_host_test
  */
 #include "kernel/object_catalog.h"

@@ -14,7 +14,7 @@
  *       -o /tmp/sql_expr_phase3_host_test tests/sql_expr_phase3_host_test.c \
  *       kernel/sql_exec.c kernel/sql_parser.c kernel/predicate.c \
  *       kernel/row_index.c kernel/rowstore.c kernel/storage_quota.c kernel/persist.c kernel/env_ckpt.c kernel/checkpoint_delta.c kernel/view.c kernel/cursor.c \
- *       kernel/mvcc.c kernel/row_constraint.c kernel/row_journal.c kernel/database.c
+ *       kernel/mvcc.c kernel/row_constraint.c kernel/row_journal.c kernel/database.c kernel/env_storage.c
  *   /tmp/sql_expr_phase3_host_test
  */
 #include "kernel/object_catalog.h"

@@ -16,7 +16,7 @@
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers \
  *       -o /tmp/mvcc_host_test tests/mvcc_host_test.c \
  *       kernel/mvcc.c kernel/rowstore.c kernel/storage_quota.c kernel/persist.c kernel/env_ckpt.c kernel/checkpoint_delta.c kernel/view.c \
- *       kernel/row_constraint.c kernel/row_journal.c
+ *       kernel/row_constraint.c kernel/row_journal.c kernel/env_storage.c
  *   /tmp/mvcc_host_test
  *
  * Phase 23 update: mvcc.c now calls into kernel/row_constraint.c (constraint
