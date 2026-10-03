@@ -11,11 +11,15 @@
 
 use aerosls_proto::env_proto::{
     self, EnvFrame, RegisterRegion, RegisterReply, ENV_CREATE, ENV_DESTROY, ENV_ERR_FULL,
-    ENV_ERR_INVAL, ENV_ERR_NOENT, ENV_ERR_NOMEM, ENV_ERR_PART, ENV_OK, ENV_REGISTER,
+    ENV_ERR_INVAL, ENV_ERR_NOENT, ENV_ERR_NOMEM, ENV_ERR_PART, ENV_ERR_QUOTA, ENV_OK,
+    ENV_REGISTER,
     REGION_POSIX_HEAP, REGION_RD_HEAP, REGION_RD_STORAGE, TASK_POSIX_SIDECAR,
     TASK_RAMDISK_SIDECAR,
 };
-use aerosls_proto::kabi::{Kernel, ERR_NOMEM};
+use aerosls_proto::kabi::{
+    Kernel, ERR_NOMEM, ENV_STORAGE_ERR_IO, ENV_STORAGE_ERR_NOSLOT,
+    ENV_STORAGE_ERR_QUOTA,
+};
 use alloc::vec::Vec;
 use core::fmt::Write;
 
@@ -120,6 +124,35 @@ pub fn create_environment<K: Kernel>(
     let px_heap = k.alloc_region_in(POSIX_HEAP_FRAMES, 1, partition);
     if rd_heap == 0 || rd_storage == 0 || px_heap == 0 {
         return Err(ERR_NOMEM);
+    }
+
+    // P1b: the tenant's block device stops being RAM-only here. Attach the
+    // storage region under this environment's identity BEFORE anything is
+    // spawned: the kernel allocates and zeroes the store's NVMe extent,
+    // charges its occupancy to the TENANT's storage quota (a quota that
+    // cannot cover it refuses the create — before a sidecar exists, before a
+    // byte is placed), and stamps the extent into the descriptor at
+    // ENV_REGISTER so a restore reattaches to this same store. The ramdisk
+    // server restores from it at its handshake and write-throughs every
+    // RD_WRITE from there on.
+    if let Err(status) =
+        k.env_storage_attach(partition, index, rd_storage, RD_STORAGE_BYTES)
+    {
+        // Refusal over partial application (v0.2 §4): nothing has been
+        // spawned yet, so the three regions go straight back and this create
+        // leaves no trace — a refused placement allocates nothing (E4).
+        k.free_region_in(rd_heap, RD_HEAP_FRAMES, partition);
+        k.free_region_in(rd_storage, RD_STORAGE_FRAMES, partition);
+        k.free_region_in(px_heap, POSIX_HEAP_FRAMES, partition);
+        return Err(if status == ENV_STORAGE_ERR_QUOTA {
+            // The quota's own error, carried as its own code all the way to
+            // the ENV_CREATE reply (v0.2 §5's demand, at the create end).
+            ENV_ERR_QUOTA as i32
+        } else if status == ENV_STORAGE_ERR_IO || status == ENV_STORAGE_ERR_NOSLOT {
+            ERR_NOMEM
+        } else {
+            ENV_ERR_INVAL as i32
+        });
     }
 
     let rd_name = ramdisk_name(index);
@@ -275,6 +308,12 @@ pub fn kill_environment<K: Kernel>(k: &K, env: &Environment) -> (u32, u32) {
 /// safe.
 pub fn reclaim_environment<K: Kernel>(k: &K, env: &Environment) -> bool {
     let mut ok = true;
+    // P1b: the durable store goes FIRST, while its region's base is still a
+    // name the directory can be looked up by — release hands the extent back
+    // to the band and the charged pages back to the tenant's quota. A store
+    // that never attached (the system ramdisk's shape) answers NOENT, which
+    // is not a failure here.
+    let _ = k.env_storage_release(env.rd_storage);
     ok &= k.free_region_in(env.rd_heap, RD_HEAP_FRAMES, env.partition);
     ok &= k.free_region_in(env.rd_storage, RD_STORAGE_FRAMES, env.partition);
     ok &= k.free_region_in(env.px_heap, POSIX_HEAP_FRAMES, env.partition);
@@ -545,6 +584,13 @@ impl EnvManager {
                         self.reply(reply, ENV_CREATE, ENV_OK, id, partition)
                     }
                     Err(ERR_NOMEM) => self.reply(reply, ENV_CREATE, ENV_ERR_NOMEM, 0, partition),
+                    // P1b: the create's durable store does not fit the
+                    // tenant's storage quota — named as the quota's own
+                    // refusal, ahead of the generic arms, because "the disk
+                    // is over quota" and "the frame pool said no" are
+                    // different answers to an operator (v0.2 §5).
+                    Err(e) if e == ENV_ERR_QUOTA as i32 =>
+                        self.reply(reply, ENV_CREATE, ENV_ERR_QUOTA, 0, partition),
                     // Any other kernel error is a refused placement: an absent or
                     // paused partition, or a caller the E4 gate denied.
                     Err(_) => self.reply(reply, ENV_CREATE, ENV_ERR_PART, 0, partition),

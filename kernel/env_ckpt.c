@@ -7,6 +7,7 @@
 
 #include "env_ckpt.h"
 #include "checkpoint_delta.h"
+#include "env_storage.h"   /* P1b: the descriptor names the durable store */
 #include "partition.h"   /* P1a quiesce: partition_pause/_resume/_is_paused/_exists */
 
 // The whole array is written into ONE NVMe frame by persist_environments()
@@ -225,6 +226,20 @@ int env_ckpt_register_from(const struct EnvCkptRegister* reg,
         // The restore layer owns re-creating the sidecar -- and therefore knows
         // the stack it just mapped. Inventing a number here would put a wrong
         // address in a record whose whole purpose is to be trusted.
+    }
+
+    // P1b: the descriptor NAMES the durable store. Looked up by the identity
+    // init just registered — region_base is this boot's placement and may
+    // change across a reboot, the (partition, index) identity does not. A
+    // RAM-backed or unattached region stamps all three fields 0, which is
+    // still the honest "0 until then": there is no extent to reattach to.
+    uint64_t store_lba = 0, store_sectors = 0;
+    uint32_t store_bytes = 0;
+    if (env_storage_extent_of(rec.partition_id, rec.index,
+                              &store_lba, &store_sectors, &store_bytes) == 0) {
+        rec.state_lba     = store_lba;
+        rec.state_sectors = store_sectors;
+        rec.state_bytes   = store_bytes;
     }
 
     return env_ckpt_record(&rec);

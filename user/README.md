@@ -18,7 +18,8 @@ Cargo workspace for the capability-based sidecars designed in `docs/`:
 
 ```
 proto/            # no_std: RD_* frames + channel envelope + the kernel ABI
-                  # (Kernel trait, cap types, error codes, the real extern
+                  # (Kernel trait, cap types, error codes, the P1b
+                  # env-storage calls, the real extern
                   # "C" ABI behind feature `target`) in kabi.rs; plus the
                   # kernel ↔ sidecar contracts: bootinfo.rs (Boot Info Block,
                   # Phase 2 §6.1) and manifest.rs (the packed AERSLSM1
@@ -27,7 +28,10 @@ ramdisk/          # the aerosls.ramdisk.v1 driver sidecar (dumb RD_* server)
   src/kapi.rs     # re-exports proto::kabi (incl. RealKernel under `target`)
   src/heap.rs     # bump allocator over the budget region (reserved)
   src/endpoints.rs# RD_* endpoint set: adoption + handshake state
-  src/server.rs   # the RD_* dispatch and handlers
+  src/server.rs   # the RD_* dispatch and handlers: restores the durable
+                  # store from NVMe at startup and write-throughs every
+                  # RD_WRITE into it (kernel/env_storage — a quota refusal
+                  # replies the new RD_ERR_QUOTA)
   src/copy.rs     # the driver's entire unsafe surface (memmove block copy)
   src/entry.rs    # rust_entry (feature `target`)
   src/crt0.S      # _start stub (RISC-V + x86-64), linked by the image build
@@ -38,8 +42,11 @@ blockcache/       # the POSIX sidecar's block cache — the ramdisk protocol cli
                   # poll_dead (observe a queued close without a request)
   src/copy.rs     # the client's entire unsafe surface (raw memory copies)
 vfs/              # the POSIX sidecar's VFS — the layer above the block cache
-  src/aerofs.rs   # aerofs-lite on-disk format (superblock/inode/dirent, CRC-32,
-                  # 11 direct + 1 indirect block) + the genrootfs image builder
+  src/aerofs.rs   # aerofs-lite on-disk format (superblock/inode/dirent, CRC-32):
+                  # v1 read-only (11 direct + 1 indirect) and v2 writable
+                  # (10 direct + 2 indirect, block bitmap, 136 192-byte
+                  # ceiling) under the rule "read v1, write v2, refuse the
+                  # rest"; + the genrootfs image builder (deliberately still v1)
   src/ramfs.rs    # in-memory /tmp filesystem (never stale)
   src/fileobj.rs  # file-like objects: PipeNode (ends counted by the VFS, so
                   # EOF/EPIPE/EAGAIN are exact), CharNode (/dev/console — the
@@ -49,8 +56,14 @@ vfs/              # the POSIX sidecar's VFS — the layer above the block cache
                   # (pooled: fork copies a table sharing FileNodes; CLONE_FILES
                   # shares the table object), shared-offset FileNode, the
                   # syscall surface, pipe(), devfs (/dev), fd dispatch over
-                  # FileObj (file/pipe/device), stale→EIO, fail-permanently
-  src/errno.rs    # shared POSIX errno set
+                  # FileObj (file/pipe/device), stale→EIO, fail-permanently;
+                  # v2 mounts are writable (create/write/truncate/unlink/…),
+                  # v1 mounts refuse every mutation with ERofs, a non-empty
+                  # store this build cannot parse is refused EInval rather
+                  # than formatted over (P1b), and the storage-quota
+                  # refusal surfaces as EDquot
+  src/errno.rs    # shared POSIX errno set (incl. EDquot 122 — the durable
+                  # storage quota refusal's POSIX name, P1b)
 procmgr/          # the POSIX sidecar's proc manager — cooperative tasks over
                   # the VFS (Phase 2 §3.2–§3.3, §4)
   src/procmgr.rs  # ProcManager: run queue, Program/step model, Ctx, fork
@@ -93,7 +106,9 @@ sidecar/          # the POSIX sidecar itself (aerosls.posix.v1)
                   # the env, < and > redirects), true/false
                   # + register_default_applets
   src/boot.rs     # BootCaps (initial caps by manifest name, from the BIB)
-                  # and boot(): handshake with the ramdisk driver, mount /
+                  # and boot(): handshake with the ramdisk driver, probe the
+                  # superblock and report a refusal BY NAME (MountRefused —
+                  # P1b's bad-format-version), mount /
                   # (aerofs), /dev (console + null), /tmp (ramfs), install
                   # the applet registry, then spawn init with console stdio
                   # (Phase 2 §6.2 steps 4–9)

@@ -16,6 +16,7 @@
 #include "workload.h"            // Orchestration Plan Phase 5
 #include "frame_pool.h"
 #include "storage_quota.h"   // Storage Isolation Roadmap Phase 1 -- SYS_SLS_PARTITION_STORAGE_QUOTA_SET/LIST
+#include "env_storage.h"     // POSIX-Environments Roadmap v0.2 Phase P1b -- durable environment stores
 #include "../net/tcp_quota.h" // Network Fairness Phase 2 -- SYS_SLS_PARTITION_CONN_QUOTA_SET/LIST
 #include "sql_exec.h"
 #include "vecstore.h"   // Vector Store Roadmap Phase 4 -- pulls in ../net/ollama_client.h transitively
@@ -629,6 +630,21 @@ uint64_t do_syscall(uint64_t num, void* arg) {
     case SYS_SLS_SIDECAR_PID:
         return (uint64_t)sys_sls_sidecar_pid(
             (struct SLSSidecarPidRequest*)arg);
+
+    // ─── POSIX-Environments Roadmap v0.2, Phase P1b (323-326) ────────────
+    // The environment's durable store: attach at create (init), restore at
+    // the ramdisk server's handshake, write-through on every RD_WRITE with
+    // first-touch quota charging, release at destroy. Gating lives in the
+    // wrappers (cap.c), beside the sys_sls_alloc_region family — trusted
+    // caller resolution, never a request field.
+    case SYS_SLS_ENV_STORAGE_ATTACH:
+        return sys_sls_env_storage_attach((struct SLSEnvStorageAttachRequest*)arg);
+    case SYS_SLS_ENV_STORAGE_RESTORE:
+        return sys_sls_env_storage_restore((struct SLSEnvStorageRegionRequest*)arg);
+    case SYS_SLS_ENV_STORAGE_WRITE:
+        return sys_sls_env_storage_write((struct SLSEnvStorageWriteRequest*)arg);
+    case SYS_SLS_ENV_STORAGE_RELEASE:
+        return sys_sls_env_storage_release((struct SLSEnvStorageRegionRequest*)arg);
 
     // ─── Phase 5 channel transport (311-315) ───────────────────────────
     // The kabi.rs k_chan_* contract over cap_send_msg/cap_recv_msg

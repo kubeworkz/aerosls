@@ -185,6 +185,40 @@ jobs:
         run: bash tools/syntax_check_all.sh
         working-directory: aerosls2
 
+      # ─── Rust toolchain for the guards, the AeroIDL gate and the gate smokes ──
+      # Three consumers, all of them in LATER steps, so this toolchain step
+      # must come BEFORE the guards step (a GITHUB_PATH entry is only
+      # visible to *later* steps): the guards step just below runs
+      # aerofs_v2_check.sh, whose host-test clause shells out to
+      # `cargo test -p aerosls-vfs`, and under the fail-closed rule below a
+      # guard that cannot run its half is a FAILURE, not a skip; the
+      # aeroidl-check gate further down needs cargo too; and two of the
+      # source smokes abort (exit 2) without it — aeroidl_gate_smoke.sh and
+      # polyglot_latency_gate_smoke.sh. This runner is self-hosted, so the
+      # toolchain may or may not be pre-installed; probe for it rather than
+      # assuming either way. rustup is the standard installer for a modern
+      # glibc Linux toolchain (the distro's rustc is routinely years old
+      # and can lag Cargo's edition/resolver features); it is idempotent,
+      # so a runner that already has it is untouched. `~/.cargo/bin` is
+      # added to GITHUB_PATH so later steps see cargo even though rustup
+      # installs outside the job's initial PATH. No third-party action: the
+      # rest of this file uses only actions/checkout, and the fallback
+      # logic is two lines.
+      - name: Ensure the Rust toolchain (cargo for the guards, aeroidl-check and the gate smokes)
+        run: |
+          set -e
+          if command -v cargo >/dev/null 2>&1; then
+            echo "cargo already available: $(cargo --version)"
+            exit 0
+          fi
+          if command -v rustup >/dev/null 2>&1; then
+            rustup update stable
+          else
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/cargo" --version
+
       # ─── The *_check.sh guards ──────────────────────────────────────────
       # These were run by nothing until now: run_all.sh globs *_host_test.c,
       # and these are shell scripts, so the guards sat in tests/ passing
@@ -221,37 +255,6 @@ jobs:
       # through green. They are *smoke.sh*, not *_check.sh, so
       # run_checks.sh and deploy.sh's guard gate never run them.
       #
-      # ─── Rust toolchain for the AeroIDL gate and the gate smokes ──────
-      # The aeroidl-check gate below needs cargo, and so do two of the
-      # source smokes the step after next runs: aeroidl_gate_smoke.sh and
-      # polyglot_latency_gate_smoke.sh abort (exit 2) without it. A
-      # GITHUB_PATH entry is only visible to *later* steps, so this
-      # toolchain step must come BEFORE the source-smokes step. This
-      # runner is self-hosted, so the toolchain may or may not be
-      # pre-installed; probe for it rather than assuming either way.
-      # rustup is the standard installer for a modern glibc Linux
-      # toolchain (the distro's rustc is routinely years old and can lag
-      # Cargo's edition/resolver features); it is idempotent, so a runner
-      # that already has it is untouched. `~/.cargo/bin` is added to
-      # GITHUB_PATH so later steps see cargo even though rustup installs
-      # outside the job's initial PATH. No third-party action: the rest
-      # of this file uses only actions/checkout, and the fallback logic
-      # is two lines.
-      - name: Ensure the Rust toolchain (cargo for aeroidl-check and the gate smokes)
-        run: |
-          set -e
-          if command -v cargo >/dev/null 2>&1; then
-            echo "cargo already available: $(cargo --version)"
-            exit 0
-          fi
-          if command -v rustup >/dev/null 2>&1; then
-            rustup update stable
-          else
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
-          fi
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          "$HOME/.cargo/bin/cargo" --version
-
       # run_guard_smokes.sh runs every tests/*_smoke.sh, but some need the
       # linked kernel or its objects, so that runner needs a build host. The
       # other smokes are source-only — gcc/binutils/python3/openssl and

@@ -50,6 +50,9 @@
 #define ENV_ERR_FULL    4   /* the environment table is full */
 #define ENV_ERR_UNSUPP  5   /* recognised opcode not yet built */
 #define ENV_ERR_NOENT   6   /* no environment with that env_id (E5) */
+#define ENV_ERR_QUOTA   7   /* the environment's durable store does not fit the
+                             * partition's storage quota (P1b) — the quota's own
+                             * error, deliberately not NOMEM's frame-pool one */
 
 #define ENV_FRAME_SIZE       16u
 #define ENV_CREATE_BODY_SIZE  8u
@@ -250,6 +253,10 @@ static inline const char* env_status_name(uint16_t s) {
          * code rather than a generic failure, so a caller can tell "destroyed"
          * from "there was nothing there". */
         case ENV_ERR_NOENT:  return "no such environment";
+        /* P1b: the create's durable store does not fit the tenant's storage
+         * quota. Its own code and its own words — "exhausted" here is the
+         * quota speaking, not the frame pool. */
+        case ENV_ERR_QUOTA:  return "storage quota exhausted";
         default:             return "unknown";
     }
 }

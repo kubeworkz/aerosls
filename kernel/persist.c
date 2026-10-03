@@ -28,6 +28,7 @@
 #include "service_registry.h"   // Orchestration Plan Phase 4 -- services_registry[]
 #include "workload.h"            // Orchestration Plan Phase 5 -- workloads[]           // Multitenant Isolation Gap Analysis §5 item 1 -- tenants[]/tenant_next_id
 #include "env_ckpt.h"            // POSIX-Environments v0.2 Phase P1a -- env_ckpt_table[]
+#include "env_storage.h"         // POSIX-Environments v0.2 Phase P1b -- env_storage_table[]
 #include "checkpoint_delta.h"    // Step 4: incremental dirty tracking
 #include "../drivers/nvme_io.h"
 
@@ -598,6 +599,8 @@ static const struct PersistRegionSpec p_region_specs[] = {
       1, { { PERSIST_WORKLOAD_ENT_LBA, (uint32_t)sizeof(workloads) } } },
     { PERSIST_ENV_CKPT_HDR_LBA, PERSIST_MAGIC_ENV_CKPT,
       1, { { PERSIST_ENV_CKPT_ENT_LBA, (uint32_t)sizeof(env_ckpt_table) } } },
+    { PERSIST_ENVSTOR_HDR_LBA, PERSIST_MAGIC_ENV_STORAGE,
+      1, { { PERSIST_ENVSTOR_ENT_LBA, (uint32_t)sizeof(env_storage_table) } } },
 };
 #define P_REGION_COUNT ((int)(sizeof(p_region_specs)/sizeof(p_region_specs[0])))
 
@@ -744,6 +747,7 @@ static void persist_vec_backfill_cb(struct VecId id, uint64_t external_id,
 #define PERSIST_PEND_SERVICE       (1u << 14)   /* Orchestration Plan Phase 4 */
 #define PERSIST_PEND_WORKLOAD      (1u << 15)   /* Orchestration Plan Phase 5 */
 #define PERSIST_PEND_ENV           (1u << 16)   /* POSIX-Environments v0.2 Phase P1a */
+#define PERSIST_PEND_ENVSTOR       (1u << 17)   /* POSIX-Environments v0.2 Phase P1b */
 
 static uint32_t persist_defer_depth   = 0;
 static uint32_t persist_pending_mask  = 0;
@@ -787,6 +791,7 @@ void persist_defer_end(void) {
     if (pend & PERSIST_PEND_SERVICE)       persist_services();
     if (pend & PERSIST_PEND_WORKLOAD)      persist_workloads();
     if (pend & PERSIST_PEND_ENV)           persist_environments();
+    if (pend & PERSIST_PEND_ENVSTOR)       persist_env_storage();
 }
 
 // ─── persist_catalog ─────────────────────────────────────────────────────────
@@ -1160,6 +1165,34 @@ void persist_environments(void) {
     kernel_serial_printf(
         "[PERSIST] Environment checkpoint snapshot written (%u live record(s), %u frozen, %u dropped).\n",
         env_ckpt_count, q.n_quiesced + q.n_already_paused, q.n_dropped);
+}
+
+// ─── persist_env_storage (POSIX-Environments Roadmap v0.2, Phase P1b) ───────
+// Writes env_storage_table[] -- the environment storage directory described
+// in kernel/env_storage.h. Same whole-array discipline as every region here:
+// the checksum span is a compile-time constant in p_region_specs, so the
+// full fixed array is written every time and liveness rides in the entries'
+// own flags rather than in a shorter write. Every mutation path (attach,
+// first-touch charging, release) calls this; inside a persist_defer batch
+// it collapses to one write, exactly like persist_environments().
+void persist_env_storage(void) {
+    if (persist_defer_note(PERSIST_PEND_ENVSTOR)) return;
+    if (!io_sq || !io_cq) return;
+
+    uint32_t live = 0;
+    for (uint32_t i = 0; i < ENV_STORAGE_MAX; i++)
+        if (env_storage_table[i].flags & ENV_STORAGE_F_VALID) live++;
+
+    uint32_t bytes = (uint32_t)sizeof(env_storage_table);
+    stage_hdr(PERSIST_ENVSTOR_HDR_LBA, PERSIST_MAGIC_ENV_STORAGE,
+              live, (uint32_t)sizeof(struct EnvStorageEntry),
+              ENV_STORAGE_REC_VERSION);
+    persist_write_array(env_storage_table, bytes, PERSIST_ENVSTOR_ENT_LBA);
+    persist_region_commit();
+
+    kernel_serial_printf(
+        "[PERSIST] Environment storage directory written (%u store(s)).\n",
+        live);
 }
 
 // ─── persist_restore_all ─────────────────────────────────────────────────────
@@ -1740,6 +1773,51 @@ void persist_restore_all(void) {
             }
         } else {
             kernel_serial_print("[ENV_CKPT] no snapshot — cold start.\n");
+        }
+    }
+
+    // ─── P1b: the environment storage directory ──────────────────────────
+    // Cross the boot boundary first: re-charging persisted occupancy is a
+    // once-per-boot act, and this call is what makes "once per boot" a
+    // line of code rather than an accident of BSS zeroing.
+    env_storage_boot_reset();
+    // A plain validated array, unlike the env_ckpt staging/adopt path above:
+    // entries carry their own VALID flags and are keyed by (partition,
+    // index), so what is checked here is only the snapshot's MEANING --
+    // record size and version. A refusal leaves the boot's BSS-zero table
+    // untouched: every region then starts unattached-RAM and the next
+    // create attaches it fresh, which is the honest cold start (and the
+    // shape the §5 `bad-format-version` refusal discipline is built on).
+    if (nvme_read_sync(PERSIST_ENVSTOR_HDR_LBA, p_buf) == 0) {
+        uint64_t magic = 0;
+        p_memcpy(&magic, p_buf, 8);
+        if (magic == PERSIST_MAGIC_ENV_STORAGE &&
+            persist_region_trusted(PERSIST_MAGIC_ENV_STORAGE)) {
+            uint32_t rec_size = 0, version = 0;
+            p_memcpy(&rec_size, p_buf + 12, 4);
+            p_memcpy(&version,  p_buf + 16, 4);
+            if (rec_size == (uint32_t)sizeof(struct EnvStorageEntry) &&
+                version == ENV_STORAGE_REC_VERSION) {
+                // Bounded by the ARRAY, never by the header's count: a
+                // corrupt count must not steer the read past the table.
+                persist_read_array(env_storage_table,
+                                   (uint32_t)sizeof(env_storage_table),
+                                   PERSIST_ENVSTOR_ENT_LBA);
+                uint32_t live = 0;
+                for (uint32_t i = 0; i < ENV_STORAGE_MAX; i++)
+                    if (env_storage_table[i].flags & ENV_STORAGE_F_VALID) live++;
+                kernel_serial_printf(
+                    "[PERSIST] Environment storage directory restored (%u store(s)).\n",
+                    live);
+            } else {
+                kernel_serial_printf(
+                    "[ENV-STORAGE] directory REFUSED -- record size %u version %u "
+                    "(expected %u/%u); every store starts unattached until its "
+                    "next create.\n",
+                    rec_size, version,
+                    (uint32_t)sizeof(struct EnvStorageEntry),
+                    ENV_STORAGE_REC_VERSION);
+            }
         }
     }
 }

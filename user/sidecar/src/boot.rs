@@ -159,6 +159,14 @@ pub enum BootErr {
     Handshake(&'static str),
     /// A mount failed.
     Mount(Errno),
+    /// P1b §5's `bad-format-version` clause: the root store was refused BY
+    /// NAME (its superblock parses as neither v1 nor v2 — a `&'static str`
+    /// naming the `SuperblockRefusal`: "magic", "version", "block-size",
+    /// "crc" or "layout"). The mount API can only hand back an errno, and
+    /// "a v3 store was refused" reads identical to "the device is broken" as
+    /// a bare `EInval` — so the probe below names it on the serial log, where
+    /// a guard (and an operator) can see WHICH refusal happened.
+    MountRefused(&'static str),
     /// The console stdio open failed.
     Console(Errno),
 }
@@ -204,8 +212,27 @@ pub fn boot<K: Kernel, A: BufferAlloc>(
     //    is wired. Without one the sidecar boots in console-only mode.
     let mut vfs = Vfs::new();
     if let (Some(ramdisk_w), Some(ramdisk_r)) = (caps.ramdisk_chan_w, caps.ramdisk_chan_r) {
-        let cache = BlockCache::connect(k_wrap, ramdisk_w, ramdisk_r, alloc_wrap)
+        let mut cache = BlockCache::connect(k_wrap, ramdisk_w, ramdisk_r, alloc_wrap)
             .map_err(|e| BootErr::Handshake(handshake_class(&e)))?;
+        // P1b: name a root-store refusal BEFORE the mount below can only give
+        // back an errno. The probe reads block 0 through the same cache (a
+        // flaky read skips the probe — the mount still refuses with EInval;
+        // this arm only ADDS the name). A zeroed region is the fresh-store
+        // case and says nothing.
+        let mut probe = [0u8; aerosls_proto::BLOCK_SIZE as usize];
+        if cache.read_block(0, &mut probe).is_ok() && probe.iter().any(|&b| b != 0) {
+            if let Err(r) = aerosls_vfs::aerofs::parse_superblock_refusing(&probe) {
+                use aerosls_vfs::aerofs::SuperblockRefusal as R;
+                let name: &'static str = match r {
+                    R::Magic => "magic",
+                    R::Version { .. } => "version",
+                    R::BlockSize => "block-size",
+                    R::Crc => "crc",
+                    R::Layout => "layout",
+                };
+                return Err(BootErr::MountRefused(name));
+            }
+        }
         // 3. Mount the root aerofs image, formatting it first if the store is
         //    empty (a tenant environment's ramdisk starts as blank
         //    k_alloc_region memory — E3). The pre-seeded system rootfs has a

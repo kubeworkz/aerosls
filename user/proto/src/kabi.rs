@@ -50,6 +50,19 @@ pub const ERR_SPACE: i32 = 6;
 pub const ERR_TARGET: i32 = 7;
 pub const ERR_STATE: i32 = 8;
 pub const ERR_TYPE: i32 = 9;
+
+/// kernel/env_storage.h's status codes — the error value the P1b durable-
+/// storage syscalls (323-326) return, carried verbatim so a caller can name
+/// WHY a store was refused instead of inferring it. QUOTA is its own code:
+/// the roadmap's verification plan insists a quota refusal be told apart
+/// from a frame-pool exhaustion (v0.2 §5).
+pub const ENV_STORAGE_OK: i32 = 0;
+pub const ENV_STORAGE_ERR_QUOTA: i32 = 1;
+pub const ENV_STORAGE_ERR_NOSLOT: i32 = 2;
+pub const ENV_STORAGE_ERR_NOENT: i32 = 3;
+pub const ENV_STORAGE_ERR_ID: i32 = 4;
+pub const ENV_STORAGE_ERR_INVAL: i32 = 5;
+pub const ENV_STORAGE_ERR_IO: i32 = 6;
 pub const ERR_PROTO: i32 = 10;
 pub const ERR_NOMEM: i32 = 11;
 pub const ERR_BUFSZ: i32 = 12;
@@ -239,6 +252,52 @@ pub trait Kernel {
         false
     }
 
+    /// ─── P1b: the environment's durable store (POSIX-Environments v0.2) ──
+    /// Four syscalls (323-326) over kernel/env_storage.h's table. The error
+    /// value is the kernel's own ENV_STORAGE_* status (see the constants in
+    /// this module), so a caller can name the refusal — QUOTA in particular
+    /// is its own code, never a generic failure.
+    ///
+    /// Attach records a region under (partition, index), allocates and
+    /// zeroes its 1 MiB NVMe extent, and (re)charges the store's persisted
+    /// occupancy to the partition's storage quota — refused before anything
+    /// is wired when the quota no longer covers it. init calls it at create,
+    /// before the ramdisk server exists. Default: unsupported — a fake that
+    /// models no durable storage must not claim an attach happened.
+    fn env_storage_attach(&self, partition_id: u32, index: u32,
+                          region_base: u64, region_bytes: u64) -> Result<(), i32> {
+        let _ = (partition_id, index, region_base, region_bytes);
+        Err(ERR_NOTFOUND)
+    }
+
+    /// Read the extent back into the region at the ramdisk server's RD_INFO
+    /// handshake — the post-reboot half of durability. An unattached or
+    /// RAM-backed region answers Ok with nothing loaded (no extent exists to
+    /// load); only a real device failure is Err. Default: nothing to load.
+    fn env_storage_restore(&self, region_base: u64) -> Result<(), i32> {
+        let _ = region_base;
+        Ok(())
+    }
+
+    /// Write-through: charge first-touch pages to the store's partition and
+    /// persist the touched pages to the extent. `Err(ENV_STORAGE_ERR_QUOTA)`
+    /// is the quota's own refusal (the kernel reverts the frame pages from
+    /// their persisted image itself). Default Ok = an unattached region's
+    /// write, which the real kernel also answers with a success that means
+    /// "nothing durable happened here".
+    fn env_storage_write(&self, region_base: u64, lba: u32, bytes: u32) -> Result<(), i32> {
+        let _ = (region_base, lba, bytes);
+        Ok(())
+    }
+
+    /// Destroy-side release: extent back to the band, charged pages back to
+    /// the quota, directory entry cleared. Default: Ok (nothing durable to
+    /// give back).
+    fn env_storage_release(&self, region_base: u64) -> Result<(), i32> {
+        let _ = region_base;
+        Ok(())
+    }
+
     /// Resolve a sidecar NAME to its pid within `partition` (0 = not live) —
     /// POSIX-Environments E5. `create_sidecar` hands back only the CALLER's
     /// messenger handles and never the child's pid, so this is the only way
@@ -337,6 +396,10 @@ mod abi {
     const SYS_ALLOC_REGION: u64 = 320;
     const SYS_FREE_REGION: u64 = 321;
     const SYS_SIDECAR_PID: u64 = 322;
+    const SYS_ENV_STORAGE_ATTACH: u64 = 323;
+    const SYS_ENV_STORAGE_RESTORE: u64 = 324;
+    const SYS_ENV_STORAGE_WRITE: u64 = 325;
+    const SYS_ENV_STORAGE_RELEASE: u64 = 326;
     const SYS_PROC_KILL: u64 = 161;
     const SYS_YIELD: u64 = 300;
 
@@ -993,6 +1056,67 @@ mod abi {
         unsafe { sls_syscall(SYS_FREE_REGION, &req as *const FreeRegionReq as u64) as i32 }
     }
 
+    /* ─── P1b: durable environment storage (syscalls 323-326) ─────────────
+     * The request structs are the kernel headers' layouts, field for field
+     * (kernel/env_storage.h): attach carries the identity and the region,
+     * the region calls carry the base, the write call carries the sectors
+     * the ramdisk server just copied. */
+    #[repr(C)]
+    struct EnvStorageAttachReq {
+        partition_id: u32,
+        index: u32,
+        region_base: u64,
+        region_bytes: u64,
+    }
+
+    #[repr(C)]
+    struct EnvStorageRegionReq {
+        region_base: u64,
+    }
+
+    #[repr(C)]
+    struct EnvStorageWriteReq {
+        region_base: u64,
+        lba: u32,
+        bytes: u32,
+    }
+
+    #[no_mangle]
+    pub extern "C" fn k_env_storage_attach(partition_id: u32, index: u32,
+                                           region_base: u64,
+                                           region_bytes: u64) -> u64 {
+        let req = EnvStorageAttachReq {
+            partition_id,
+            index,
+            region_base,
+            region_bytes,
+        };
+        unsafe { sls_syscall(SYS_ENV_STORAGE_ATTACH,
+                             &req as *const EnvStorageAttachReq as u64) }
+    }
+
+    #[no_mangle]
+    pub extern "C" fn k_env_storage_restore(region_base: u64) -> u64 {
+        let req = EnvStorageRegionReq { region_base };
+        unsafe { sls_syscall(SYS_ENV_STORAGE_RESTORE,
+                             &req as *const EnvStorageRegionReq as u64) }
+    }
+
+    #[no_mangle]
+    pub extern "C" fn k_env_storage_write(region_base: u64, lba: u32,
+                                          bytes: u32) -> u64 {
+        let req = EnvStorageWriteReq { region_base, lba, bytes };
+        unsafe { sls_syscall(SYS_ENV_STORAGE_WRITE,
+                             &req as *const EnvStorageWriteReq as u64) }
+    }
+
+    #[no_mangle]
+    pub extern "C" fn k_env_storage_release(region_base: u64) -> u64 {
+        let req = EnvStorageRegionReq { region_base };
+        unsafe { sls_syscall(SYS_ENV_STORAGE_RELEASE,
+                             &req as *const EnvStorageRegionReq as u64) }
+    }
+
     /// `k_sidecar_pid`: syscall 322 — a sidecar name to its pid within
     /// `partition`, or 0 when no sidecar of that name is live
     /// (POSIX-Environments E5). `name_len` excludes any NUL; 0 means "read to
@@ -1242,6 +1366,29 @@ mod abi {
 
         fn free_region_in(&self, base: u64, nframes: u64, target_partition: u32) -> bool {
             k_free_region_in(base, nframes, target_partition) == 0
+        }
+
+        fn env_storage_attach(&self, partition_id: u32, index: u32,
+                              region_base: u64,
+                              region_bytes: u64) -> Result<(), i32> {
+            let rc = k_env_storage_attach(partition_id, index, region_base, region_bytes);
+            if rc == ENV_STORAGE_OK as u64 { Ok(()) } else { Err(rc as i32) }
+        }
+
+        fn env_storage_restore(&self, region_base: u64) -> Result<(), i32> {
+            let rc = k_env_storage_restore(region_base);
+            if rc == ENV_STORAGE_OK as u64 { Ok(()) } else { Err(rc as i32) }
+        }
+
+        fn env_storage_write(&self, region_base: u64, lba: u32,
+                             bytes: u32) -> Result<(), i32> {
+            let rc = k_env_storage_write(region_base, lba, bytes);
+            if rc == ENV_STORAGE_OK as u64 { Ok(()) } else { Err(rc as i32) }
+        }
+
+        fn env_storage_release(&self, region_base: u64) -> Result<(), i32> {
+            let rc = k_env_storage_release(region_base);
+            if rc == ENV_STORAGE_OK as u64 { Ok(()) } else { Err(rc as i32) }
         }
 
         fn sidecar_pid(&self, name: &str, partition: u32) -> u32 {
