@@ -36,7 +36,7 @@ use core::cell::{Cell, RefCell};
 
 use aerosls_blockcache::{BlockCache, BufferAlloc, Error as CacheError};
 use aerosls_proto::kabi::Kernel;
-use aerosls_proto::{R, W};
+use aerosls_proto::{R, W, RD_ERR_QUOTA};
 
 use crate::aerofs::{
     bitmap_clear, bitmap_find_clear, bitmap_set, encode_dirent, encode_inode_v2, parse_dirent,
@@ -1372,9 +1372,14 @@ impl<K: Kernel, A: BufferAlloc> AerofsFs<K, A> {
 
 /// Map a block-cache (device-level) failure to errno. Everything the cache
 /// can produce is device-level: stale, driver status, kernel error,
-/// protocol violation — all `EIO` (respawn §6: device gone or unreliable).
+/// protocol violation — all `EIO` (respawn §6: device gone or unreliable)
+/// — with ONE named exception: the quota's own status (P1b), which becomes
+/// `EDQUOT`. A tenant must be able to tell "you are over quota" from "the
+/// disk died" (v0.2 §5), and a generic mapping would erase exactly the
+/// distinction the phase is about.
 fn map_cache_err(e: CacheError) -> Errno {
     match e {
+        CacheError::Status(status) if status == RD_ERR_QUOTA => Errno::EDquot,
         CacheError::Stale { .. }
         | CacheError::Status(_)
         | CacheError::Kernel(_)
@@ -1702,7 +1707,30 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
         const BS: usize = aerosls_proto::BLOCK_SIZE as usize;
         let mut block = [0u8; BS];
         let needs_format = match cache.read_block(0, &mut block) {
-            Ok(()) => crate::aerofs::parse_superblock(&block).is_none(),
+            Ok(()) => {
+                if block.iter().all(|&b| b == 0) {
+                    // A fresh region: nothing there to lose.
+                    true
+                } else {
+                    match crate::aerofs::parse_superblock_refusing(&block) {
+                        Ok(_) => false, // v1 or v2: mount below (mount_aerofs
+                                        // re-parses and applies the version rule)
+                        Err(_) => {
+                            // P1b §5 `bad-format-version`: a NON-EMPTY store this
+                            // build refuses is REFUSED, never formatted over.
+                            // `parse_superblock(..).is_none()` alone would call
+                            // a v3 store "unformatted" and the formatter would
+                            // erase its bytes to “fix” it — refusal over partial
+                            // application, the same rule the parse layer's named
+                            // refusals exist for. The name itself is surfaced by
+                            // the caller's probe (sidecar boot.rs), which can
+                            // still see the SuperblockRefusal; all this layer
+                            // can honestly return is the refusal errno.
+                            return Err(Errno::EInval);
+                        }
+                    }
+                }
+            }
             Err(_) => true, // unreadable block 0 → treat as unformatted
         };
         if needs_format {

@@ -569,6 +569,16 @@ impl Kernel for SimKernel {
         base
     }
 
+    fn env_storage_attach(&self, _partition_id: u32, _index: u32,
+                          _region_base: u64, _region_bytes: u64) -> Result<(), i32> {
+        // The host sim has no NVMe, so attach is an accounting no-op that
+        // says yes — create_environment runs, the regions and names behave
+        // as they will on the real kernel. Durability itself is proven by
+        // tests/env_storage_host_test.c (the REAL kernel module) and the
+        // live boot guard, never by a fake asserting itself.
+        Ok(())
+    }
+
     fn create_sidecar_in(&self, manifest: &[u8], target_partition: u32) -> Result<(u32, u32), i32> {
         // SAFETY: single-threaded test harness only.
         unsafe { (*self.created.get()).push((manifest.to_vec(), target_partition)) };
@@ -722,6 +732,11 @@ impl Kernel for SharedKernel {
 
     fn free_region_in(&self, base: u64, nframes: u64, target_partition: u32) -> bool {
         self.0.free_region_in(base, nframes, target_partition)
+    }
+
+    fn env_storage_attach(&self, partition_id: u32, index: u32,
+                          region_base: u64, region_bytes: u64) -> Result<(), i32> {
+        self.0.env_storage_attach(partition_id, index, region_base, region_bytes)
     }
 
     fn sidecar_pid(&self, name: &str, partition: u32) -> u32 {

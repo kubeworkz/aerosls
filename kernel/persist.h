@@ -293,6 +293,24 @@
 #define PERSIST_ENV_CKPT_HDR_LBA        7696ULL
 #define PERSIST_ENV_CKPT_ENT_LBA        7704ULL
 
+// ─── POSIX-Environments Roadmap v0.2, Phase P1b (environment storage) ────────
+// The environment storage directory (kernel/env_storage.h: 8 x 32 B entries
+// keyed by (partition, index)) takes the next two frames after the P1a
+// region, with the same 1-frame safety gap on each boundary:
+//
+//   PERSIST_ENV_CKPT_ENT_LBA 7704 + 8 -> ends 7712
+//   +1 frame safety gap
+//   PERSIST_ENVSTOR_HDR_LBA 7720 + 8  -> ends 7728   (header: magic + count + size + version)
+//   PERSIST_ENVSTOR_ENT_LBA 7728 + 8  -> ends 7736   (env_storage_table[]: 8 x 32 B = 256 B)
+//   STREAM_DIR_LBA    8192                             -> 456 sectors still free
+//
+// The DATA the directory names does not live here: each environment's
+// extent is a 1 MiB band at ENV_STORAGE_DATA_LBA_BASE (after stream data,
+// before the row-store pool), because a directory is a small record and a
+// store is not.
+#define PERSIST_ENVSTOR_HDR_LBA         7720ULL
+#define PERSIST_ENVSTOR_ENT_LBA         7728ULL
+
 // One-way format-version marker, written into PERSIST_ROWSTORE_HDR_LBA's/
 // PERSIST_VECSTORE_HDR_LBA's own header frame (the v2 field, previously
 // always 0) -- see the LBA layout comment above for the full reasoning.
@@ -317,6 +335,7 @@
 #define PERSIST_MAGIC_SERVICE        0xCAFE00000000000FULL   /* Orchestration Plan Phase 4 (service registry) */
 #define PERSIST_MAGIC_WORKLOAD       0xCAFE000000000010ULL   /* Orchestration Plan Phase 5 (declarative workloads) */
 #define PERSIST_MAGIC_ENV_CKPT       0xCAFE000000000012ULL   /* POSIX-Environments v0.2 Phase P1a (environment checkpoint records) */
+#define PERSIST_MAGIC_ENV_STORAGE    0xCAFE000000000013ULL   /* POSIX-Environments v0.2 Phase P1b (environment storage directory) */
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 
@@ -424,6 +443,7 @@ void persist_databases(void);
 // env_ckpt_adopt(), which refuses an unusable one in full instead of applying
 // part of it.
 void persist_environments(void);
+void persist_env_storage(void);   /* POSIX-Environments v0.2 Phase P1b -- env_storage_table[] */
 
 // Snapshot views[] → NVMe. Query-Surface Roadmap Phase 5: call after every
 // successful view_create()/view_drop(). Pure definitions, direct restore --
