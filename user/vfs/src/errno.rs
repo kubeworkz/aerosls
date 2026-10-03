@@ -28,6 +28,9 @@ pub enum Errno {
     ENospc,
     /// Read-only filesystem.
     ERofs,
+    /// File too large — the format's per-file block ceiling, or a write past
+    /// it. (POSIX EFBIG; the v2 format's ceiling is `MAX_FILE_BYTES_V2`.)
+    EFbig,
     /// Invalid argument.
     EInval,
     /// File name too long.
@@ -71,6 +74,7 @@ impl Errno {
             Errno::ENotempty => 39,
             Errno::ENospc => 28,
             Errno::ERofs => 30,
+            Errno::EFbig => 27,
             Errno::EInval => 22,
             Errno::ENametoolong => 36,
             Errno::ENomem => 12,

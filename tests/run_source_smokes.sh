@@ -3,12 +3,12 @@
 #
 # ─── Why this exists ───────────────────────────────────────────────────────
 # run_guard_smokes.sh globs tests/*_smoke.sh, but ten of the
-# forty-nine need the linked kernel, its objects, or the built ISO
+# fifty need the linked kernel, its objects, or the built ISO
 # (they synthesize tooth inputs and then restore-check against the real
 # image, or boot the ISO under QEMU), so that runner only works on a
-# build host. The other thirty-nine are source-only: they need only
+# build host. The other forty are source-only: they need only
 # gcc/binutils/python3/openssl/cargo/sbcl and the sources in the tree —
-# nothing built. CI's verify job has no build, so those thirty-nine can
+# nothing built. CI's verify job has no build, so those forty can
 # and must run there.
 #
 # A source-only smoke that runs ONLY on build hosts is a smoke that rots
@@ -17,10 +17,11 @@
 # anyway. tls_cert_oracle_smoke.sh is the precedent — it failed at link
 # for months, invisible until the deploy gate ran it. This runner is what
 # the verify job calls, so every source-only smoke's teeth are proven on
-# every push, independent of the kernel build. (env_register_pin_check_smoke.sh
-# is the most recent addition and is source-only by construction: its subject is
-# a layout shared by two languages with no compiler in common, so it needs
-# neither a build nor a boot to prove its teeth.)
+# every push, independent of the kernel build. (aerofs_v2_check_smoke.sh
+# is the most recent addition and is source-only by construction: it builds a
+# minimal root holding exactly the files its guard reads, so proving its teeth
+# needs neither a build nor a boot; only its vacuity control runs the guard
+# against the real tree.)
 #
 # The ten build-needing smokes are excluded by name — five carry
 # GUARD-KIND: build for run_checks.sh, and five boot the built ISO (the

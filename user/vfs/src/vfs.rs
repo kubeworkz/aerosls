@@ -39,8 +39,10 @@ use aerosls_proto::kabi::Kernel;
 use aerosls_proto::{R, W};
 
 use crate::aerofs::{
-    parse_dirent, parse_inode, parse_superblock, path_comps, DirEntry, FileType, Inode,
-    Superblock, SuperblockRecord, DIRENT_SIZE, NDIRECT, S_IFDIR,
+    bitmap_clear, bitmap_find_clear, bitmap_set, encode_dirent, encode_inode_v2, parse_dirent,
+    parse_inode, parse_inode_v2, parse_superblock, path_comps, v2_block_bitmap_len, DirEntry,
+    FileType, Inode, Superblock, SuperblockRecord, DIRENT_SIZE, MAX_BLOCKS_V2, MAX_FILE_BYTES_V2,
+    NAME_MAX, NDIRECT, NDIRECT_V2, NINDIRECT, S_IFDIR, S_IFREG,
 };
 use crate::errno::{DirEnt, Errno, Stat};
 use crate::fileobj::{CharNode, FileObj, PipeNode, PtyState, PIPE_CAP};
@@ -252,9 +254,10 @@ impl<K: Kernel, A: BufferAlloc> Fs<K, A> {
     }
     fn read_only(&self) -> bool {
         match self {
-            // aerofs-lite v1 is implemented read-only (the boot image is
-            // immutable); writes live in ramfs until a writable FS lands.
-            Fs::Aerofs(_) => true,
+            // v1 is read-only by the version rule; v2 — the writable format —
+            // answers for itself, so this cannot drift from the mount's own
+            // version check.
+            Fs::Aerofs(f) => f.read_only(),
             Fs::Ram(_) => false,
             // The fs layer is read-only, but device *objects* are not —
             // their writes go through `FileObj::Char`, never here.
@@ -278,14 +281,14 @@ impl<K: Kernel, A: BufferAlloc> Fs<K, A> {
     }
     fn write(&mut self, ino: u64, offset: u64, buf: &[u8]) -> Result<usize, Errno> {
         match self {
-            Fs::Aerofs(_) => Err(Errno::ERofs),
+            Fs::Aerofs(f) => f.write(ino, offset, buf),
             Fs::Ram(f) => f.write(ino, offset, buf),
             Fs::Dev(_) => Err(Errno::EInval),
         }
     }
     fn truncate(&mut self, ino: u64, len: u64) -> Result<(), Errno> {
         match self {
-            Fs::Aerofs(_) => Err(Errno::ERofs),
+            Fs::Aerofs(f) => f.truncate(ino, len),
             Fs::Ram(f) => f.truncate(ino, len),
             Fs::Dev(_) => Err(Errno::ERofs),
         }
@@ -313,35 +316,35 @@ impl<K: Kernel, A: BufferAlloc> Fs<K, A> {
     }
     fn create_file(&mut self, parent: u64, name: &str, mode: u16) -> Result<u64, Errno> {
         match self {
-            Fs::Aerofs(_) => Err(Errno::ERofs),
+            Fs::Aerofs(f) => f.create_file(parent, name, mode),
             Fs::Ram(f) => f.create_file(parent, name, mode, 0, 0),
             Fs::Dev(_) => Err(Errno::ERofs),
         }
     }
     fn create_dir(&mut self, parent: u64, name: &str, mode: u16) -> Result<u64, Errno> {
         match self {
-            Fs::Aerofs(_) => Err(Errno::ERofs),
+            Fs::Aerofs(f) => f.create_dir(parent, name, mode),
             Fs::Ram(f) => f.create_dir(parent, name, mode, 0, 0),
             Fs::Dev(_) => Err(Errno::ERofs),
         }
     }
     fn unlink(&mut self, parent: u64, name: &str) -> Result<(), Errno> {
         match self {
-            Fs::Aerofs(_) => Err(Errno::ERofs),
+            Fs::Aerofs(f) => f.unlink(parent, name),
             Fs::Ram(f) => f.unlink(parent, name),
             Fs::Dev(_) => Err(Errno::ERofs),
         }
     }
     fn rmdir(&mut self, parent: u64, name: &str) -> Result<(), Errno> {
         match self {
-            Fs::Aerofs(_) => Err(Errno::ERofs),
+            Fs::Aerofs(f) => f.rmdir(parent, name),
             Fs::Ram(f) => f.rmdir(parent, name),
             Fs::Dev(_) => Err(Errno::ERofs),
         }
     }
     fn rename(&mut self, old_parent: u64, old_name: &str, new_parent: u64, new_name: &str) -> Result<(), Errno> {
         match self {
-            Fs::Aerofs(_) => Err(Errno::ERofs),
+            Fs::Aerofs(f) => f.rename(old_parent, old_name, new_parent, new_name),
             Fs::Ram(f) => f.rename(old_parent, old_name, new_parent, new_name),
             Fs::Dev(_) => Err(Errno::ERofs),
         }
@@ -504,6 +507,12 @@ fn ty_of(mode: u16) -> FileType {
 /// aerofs-lite over the ramdisk block cache: the root filesystem. Owns the
 /// device (the block cache) and an inode cache; records the superblock
 /// identity for revalidation on remount (respawn decision §5.9b).
+///
+/// Version rule (POSIX-Environments v0.2 §5, P1b part 1): a v1 image mounts
+/// READ-ONLY — every existing image, the system rootfs included, is v1 and
+/// stays exactly what it was. A v2 image mounts WRITABLE, and v2 is what
+/// `mount_aerofs_or_format` writes over an empty store. A version that is
+/// neither is refused at parse time, by name, before this struct exists.
 pub struct AerofsFs<K: Kernel, A: BufferAlloc> {
     cache: BlockCache<K, A>,
     sb: Superblock,
@@ -513,6 +522,11 @@ pub struct AerofsFs<K: Kernel, A: BufferAlloc> {
     /// permanently instead of silently reconnecting.
     id: u64,
     inodes: BTreeMap<u64, Inode>,
+    /// True when the store is v2: the version this build formats and the only
+    /// one it writes. Every mutating entry point below checks it and answers
+    /// `ERofs` on a v1 mount, which is what keeps "v1 stays read-only" true
+    /// even if a caller forgets the `Fs::read_only` gate.
+    writable: bool,
 }
 
 impl<K: Kernel, A: BufferAlloc> AerofsFs<K, A> {
@@ -537,11 +551,22 @@ impl<K: Kernel, A: BufferAlloc> AerofsFs<K, A> {
             record,
             id,
             inodes: BTreeMap::new(),
+            writable: sb.version == crate::aerofs::AEROFS_VERSION_V2,
         })
     }
 
     pub fn record(&self) -> SuperblockRecord {
         self.record
+    }
+
+    /// True when this mount accepts writes (a v2 store).
+    pub fn writable(&self) -> bool {
+        self.writable
+    }
+
+    /// The `Fs::read_only` answer for this mount: v1 is read-only, v2 is not.
+    pub fn read_only(&self) -> bool {
+        !self.writable
     }
 
     pub fn stale(&self) -> bool {
@@ -677,7 +702,12 @@ impl<K: Kernel, A: BufferAlloc> AerofsFs<K, A> {
         self.cache
             .read_block(blk, &mut block)
             .map_err(map_cache_err)?;
-        let inode = parse_inode(&block[in_blk..]).ok_or(Errno::EInval)?;
+        let inode = if self.writable {
+            parse_inode_v2(&block[in_blk..])
+        } else {
+            parse_inode(&block[in_blk..])
+        }
+        .ok_or(Errno::EInval)?;
         if inode.ty().is_none() {
             return Err(Errno::EInval);
         }
@@ -686,31 +716,53 @@ impl<K: Kernel, A: BufferAlloc> AerofsFs<K, A> {
     }
 
     /// Resolve file block `blk` to a device block, following the indirect
-    /// pointer when needed.
+    /// pointer when needed. The version decides which pointers exist: v1 has
+    /// 11 direct + 1 indirect (139 blocks), v2 has 10 direct + 2 indirect
+    /// (266 blocks) — the P1b format move, in one branch.
     fn block_addr(&mut self, inode: &Inode, blk: u64) -> Result<u32, Errno> {
-        if blk < NDIRECT as u64 {
-            let b = inode.blocks[blk as usize];
-            if b == 0 {
-                return Err(Errno::EInval); // sparse hole — builder never makes these
+        self.block_addr_opt(inode, blk)?
+            .ok_or(Errno::EInval) // sparse hole — the writer never makes these
+    }
+
+    /// `block_addr` that answers None for a hole instead of failing: the
+    /// truncate path walks a file's block range where holes are legal to skip.
+    fn block_addr_opt(&mut self, inode: &Inode, blk: u64) -> Result<Option<u32>, Errno> {
+        // (indirect block, its pointer index). Which one exists is the only
+        // version-dependent step; the walk of it below is shared.
+        let (indirect, idx) = if self.writable {
+            if blk < crate::aerofs::NDIRECT_V2 as u64 {
+                let b = inode.blocks[blk as usize];
+                return Ok(if b == 0 { None } else { Some(b) });
             }
-            return Ok(b);
-        }
-        if inode.indirect == 0 {
-            return Err(Errno::EInval);
+            if blk < (crate::aerofs::NDIRECT_V2 + crate::aerofs::NINDIRECT) as u64 {
+                (inode.indirect, (blk - crate::aerofs::NDIRECT_V2 as u64) as usize)
+            } else if blk < crate::aerofs::MAX_BLOCKS_V2 {
+                (
+                    inode.indirect2,
+                    (blk - (crate::aerofs::NDIRECT_V2 + crate::aerofs::NINDIRECT) as u64) as usize,
+                )
+            } else {
+                return Err(Errno::EFbig);
+            }
+        } else {
+            if blk < NDIRECT as u64 {
+                let b = inode.blocks[blk as usize];
+                return Ok(if b == 0 { None } else { Some(b) });
+            }
+            (inode.indirect, (blk - NDIRECT as u64) as usize)
+        };
+        if indirect == 0 {
+            return Ok(None);
         }
         let mut ib = [0u8; BS];
         self.cache
-            .read_block(inode.indirect as u64, &mut ib)
+            .read_block(indirect as u64, &mut ib)
             .map_err(map_cache_err)?;
-        let idx = (blk - NDIRECT as u64) as usize;
         if idx >= crate::aerofs::NINDIRECT {
             return Err(Errno::EInval);
         }
         let b = u32::from_le_bytes([ib[idx * 4], ib[idx * 4 + 1], ib[idx * 4 + 2], ib[idx * 4 + 3]]);
-        if b == 0 {
-            return Err(Errno::EInval);
-        }
-        Ok(b)
+        Ok(if b == 0 { None } else { Some(b) })
     }
 
     /// Read a directory's full entry list. Reads the whole dir into a
@@ -740,7 +792,13 @@ impl<K: Kernel, A: BufferAlloc> AerofsFs<K, A> {
         let mut p = 0usize;
         while p + DIRENT_SIZE <= data.len() {
             let e: DirEntry = parse_dirent(&data[p..]).ok_or(Errno::EInval)?;
-            out.push((e.name_str().to_string(), e.ino, e.ty));
+            // A v2 tombstone (a deleted entry whose ino was zeroed) is a hole
+            // in the entry list, not an entry named "": skip it. v1 images
+            // never emit one — the builder writes real entries only — so this
+            // filter is inert for every image that existed before v2.
+            if e.ino != 0 {
+                out.push((e.name_str().to_string(), e.ino, e.ty));
+            }
             let rec = if e.rec_len as usize >= DIRENT_SIZE {
                 e.rec_len as usize
             } else {
@@ -752,6 +810,563 @@ impl<K: Kernel, A: BufferAlloc> AerofsFs<K, A> {
             }
         }
         Ok(out)
+    }
+
+    // ── v2: the writable half ────────────────────────────────────────────────
+    //
+    // Every entry point below is guarded by `self.writable`, so a v1 mount
+    // answers `ERofs` from the operation itself and not only from the VFS's
+    // `read_only()` gate above it — "v1 stays read-only" holds twice over.
+    //
+    // The allocation map is the single source of truth for what is free: the
+    // block bitmap then the inode bitmap, exactly as `format_v2` wrote them.
+    // It is read and rewritten through the same block cache as data, so the
+    // worst an interrupted operation can leave is a block or inode that is
+    // marked used and is not reachable — a leak, never two owners of one
+    // block and never a name pointing at freed data. (A journal is what would
+    // make it optimal; a leak is what makes it safe.)
+
+    /// Read the whole allocation map (block bitmap, then inode bitmap).
+    fn alloc_map(&mut self) -> Result<Vec<u8>, Errno> {
+        let len = self.sb.alloc_blocks as usize * BS;
+        let mut map = vec![0u8; len];
+        for b in 0..self.sb.alloc_blocks as u64 {
+            let mut blk = [0u8; BS];
+            self.cache
+                .read_block(self.sb.alloc_start as u64 + b, &mut blk)
+                .map_err(map_cache_err)?;
+            map[b as usize * BS..(b as usize + 1) * BS].copy_from_slice(&blk);
+        }
+        Ok(map)
+    }
+
+    /// Write the allocation map back and flush. The flush is the point: a bit
+    /// that claims a block must be on the device before the block's contents
+    /// are relied on, or a crash could hand one block to two files.
+    fn store_alloc_map(&mut self, map: &[u8]) -> Result<(), Errno> {
+        for b in 0..self.sb.alloc_blocks as u64 {
+            let mut blk = [0u8; BS];
+            blk.copy_from_slice(&map[b as usize * BS..(b as usize + 1) * BS]);
+            self.cache
+                .write_block(self.sb.alloc_start as u64 + b, &blk)
+                .map_err(map_cache_err)?;
+        }
+        self.cache.flush().map_err(map_cache_err)
+    }
+
+    /// Where the block bitmap ends and the inode bitmap begins in the map.
+    fn alloc_bitmap_split(&self) -> usize {
+        v2_block_bitmap_len(self.sb.total_blocks)
+    }
+
+    /// Allocate one data block: the first clear bit of the block bitmap,
+    /// zeroed on the device so nothing from a reused store can leak into a
+    /// file that only ever writes part of it.
+    fn alloc_block(&mut self) -> Result<u32, Errno> {
+        self.op_guard()?;
+        let split = self.alloc_bitmap_split();
+        let mut map = self.alloc_map()?;
+        let b = bitmap_find_clear(&map[..split], 0, self.sb.total_blocks as u64)
+            .ok_or(Errno::ENospc)?;
+        bitmap_set(&mut map[..split], b);
+        self.store_alloc_map(&map)?;
+        let zero = [0u8; BS];
+        self.cache.write_block(b, &zero).map_err(map_cache_err)?;
+        Ok(b as u32)
+    }
+
+    /// Give a data block back. 0 is the "no block" pointer, never a block.
+    fn free_block(&mut self, blk: u32) -> Result<(), Errno> {
+        if blk == 0 {
+            return Ok(());
+        }
+        let split = self.alloc_bitmap_split();
+        let mut map = self.alloc_map()?;
+        bitmap_clear(&mut map[..split], blk as u64);
+        self.store_alloc_map(&map)
+    }
+
+    /// Allocate an inode slot and write its empty record. The inode bitmap's
+    /// bit i is inode i (bits 0 and 1 are the two reserved slots, bit 2 the
+    /// root), so the search starts at 2 and the format's map has a bit for
+    /// every ino through `inode_count` inclusive.
+    fn alloc_inode(&mut self, mode: u16) -> Result<u64, Errno> {
+        self.op_guard()?;
+        let split = self.alloc_bitmap_split();
+        let mut map = self.alloc_map()?;
+        let ino = bitmap_find_clear(&map[split..], 2, self.sb.inode_count as u64 + 1)
+            .ok_or(Errno::ENospc)?;
+        bitmap_set(&mut map[split..], ino);
+        self.store_alloc_map(&map)?;
+        let fresh = Inode {
+            mode,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            mtime: 1,
+            blocks: [0; NDIRECT],
+            indirect: 0,
+            indirect2: 0,
+        };
+        self.write_inode(ino, &fresh)?;
+        Ok(ino)
+    }
+
+    fn free_inode(&mut self, ino: u64) -> Result<(), Errno> {
+        let split = self.alloc_bitmap_split();
+        let mut map = self.alloc_map()?;
+        bitmap_clear(&mut map[split..], ino);
+        self.store_alloc_map(&map)?;
+        self.inodes.remove(&ino);
+        Ok(())
+    }
+
+    /// Write one inode into the table, through the cache, and keep the cache
+    /// in step: every mutating path ends here, so an inode the cache holds is
+    /// always what the device holds.
+    fn write_inode(&mut self, ino: u64, inode: &Inode) -> Result<(), Errno> {
+        let byte_off = crate::aerofs::inode_offset(ino as u32);
+        let blk = self.sb.inode_start as u64 + (byte_off / BS) as u64;
+        let in_blk = byte_off % BS;
+        let mut block = [0u8; BS];
+        self.cache.read_block(blk, &mut block).map_err(map_cache_err)?;
+        encode_inode_v2(&mut block[in_blk..], inode);
+        self.cache.write_block(blk, &block).map_err(map_cache_err)?;
+        self.inodes.insert(ino, *inode);
+        Ok(())
+    }
+
+    /// Resolve block `blk` of a file that is being WRITTEN: allocate (and
+    /// zero) whatever does not exist yet, so an offset past the current end
+    /// reads back as zeroes rather than stale bytes. Indirect blocks are
+    /// allocated the first time their range is touched.
+    fn ensure_block(&mut self, inode: &mut Inode, blk: u64) -> Result<u32, Errno> {
+        if blk < NDIRECT_V2 as u64 {
+            let slot = &mut inode.blocks[blk as usize];
+            if *slot == 0 {
+                *slot = self.alloc_block()?;
+            }
+            return Ok(*slot);
+        }
+        let (ind, idx) = if blk < (NDIRECT_V2 + NINDIRECT) as u64 {
+            (&mut inode.indirect, (blk - NDIRECT_V2 as u64) as usize)
+        } else if blk < MAX_BLOCKS_V2 {
+            (
+                &mut inode.indirect2,
+                (blk - (NDIRECT_V2 + NINDIRECT) as u64) as usize,
+            )
+        } else {
+            return Err(Errno::EFbig);
+        };
+        if *ind == 0 {
+            // A fresh indirect block: alloc_block() zeroes it, so every
+            // pointer in it starts out as a hole.
+            *ind = self.alloc_block()?;
+        }
+        let ib_addr = *ind;
+        let mut ib = [0u8; BS];
+        self.cache
+            .read_block(ib_addr as u64, &mut ib)
+            .map_err(map_cache_err)?;
+        let ptr = u32::from_le_bytes([ib[idx * 4], ib[idx * 4 + 1], ib[idx * 4 + 2], ib[idx * 4 + 3]]);
+        if ptr != 0 {
+            return Ok(ptr);
+        }
+        let fresh = self.alloc_block()?;
+        ib[idx * 4..idx * 4 + 4].copy_from_slice(&fresh.to_le_bytes());
+        self.cache
+            .write_block(ib_addr as u64, &ib)
+            .map_err(map_cache_err)?;
+        Ok(fresh)
+    }
+
+    /// Read a whole file's bytes. Every directory operation reads its data
+    /// this way (directories are small), and the same routine is what the
+    /// frozen-file byte-identity clauses read through.
+    fn read_file_bytes(&mut self, inode: &Inode) -> Result<Vec<u8>, Errno> {
+        let mut data = vec![0u8; inode.size as usize];
+        let mut done = 0usize;
+        while done < data.len() {
+            let blk = (done / BS) as u64;
+            let in_blk = done % BS;
+            let addr = self.block_addr(inode, blk)?;
+            let mut scratch = [0u8; BS];
+            self.cache
+                .read_block(addr as u64, &mut scratch)
+                .map_err(map_cache_err)?;
+            let take = core::cmp::min(BS - in_blk, data.len() - done);
+            data[done..done + take].copy_from_slice(&scratch[in_blk..in_blk + take]);
+            done += take;
+        }
+        Ok(data)
+    }
+
+    /// Read-modify-write `bytes` at `offset` in a file, allocating blocks as
+    /// needed: the one primitive directory data is written through.
+    fn write_at(&mut self, inode: &mut Inode, offset: usize, bytes: &[u8]) -> Result<(), Errno> {
+        let mut done = 0usize;
+        while done < bytes.len() {
+            let pos = offset + done;
+            let blk = (pos / BS) as u64;
+            let in_blk = pos % BS;
+            let take = core::cmp::min(BS - in_blk, bytes.len() - done);
+            let addr = self.ensure_block(inode, blk)?;
+            let mut scratch = [0u8; BS];
+            self.cache
+                .read_block(addr as u64, &mut scratch)
+                .map_err(map_cache_err)?;
+            scratch[in_blk..in_blk + take].copy_from_slice(&bytes[done..done + take]);
+            self.cache
+                .write_block(addr as u64, &scratch)
+                .map_err(map_cache_err)?;
+            done += take;
+        }
+        Ok(())
+    }
+
+    /// Step over one directory entry, returning the offset of the next.
+    fn dirent_next(data: &[u8], p: usize) -> Option<(DirEntry, usize)> {
+        if p + DIRENT_SIZE > data.len() {
+            return None;
+        }
+        let e = parse_dirent(&data[p..])?;
+        let rec = if e.rec_len as usize >= DIRENT_SIZE {
+            e.rec_len as usize
+        } else {
+            return None;
+        };
+        Some((e, p + rec))
+    }
+
+    /// Look a directory entry up by name: (byte offset, entry). Tombstones —
+    /// entries a v2 delete zeroed — are skipped, exactly as `read_dir_entries`
+    /// skips them.
+    fn dir_lookup(&mut self, dir: u64, name: &str) -> Result<Option<(usize, DirEntry)>, Errno> {
+        let inode = self.inode(dir)?;
+        if inode.ty() != Some(FileType::Dir) {
+            return Err(Errno::ENotdir);
+        }
+        let data = self.read_file_bytes(&inode)?;
+        let mut p = 0usize;
+        while let Some((e, next)) = Self::dirent_next(&data, p) {
+            if e.ino != 0 && e.name_str() == name {
+                return Ok(Some((p, e)));
+            }
+            p = next;
+        }
+        Ok(None)
+    }
+
+    /// Insert an entry into a directory: reuse the first tombstone if there is
+    /// one (a directory that churns files does not grow), else append and let
+    /// `write_at` allocate the next block. The parent inode is written back,
+    /// so its size follows its data.
+    fn dir_insert(&mut self, dir: u64, name: &str, ino: u32, ty: FileType) -> Result<(), Errno> {
+        let mut dinode = self.inode(dir)?;
+        if dinode.ty() != Some(FileType::Dir) {
+            return Err(Errno::ENotdir);
+        }
+        let entry = DirEntry::new(name, ino, ty).ok_or(Errno::ENametoolong)?;
+        let data = self.read_file_bytes(&dinode)?;
+        let mut at = dinode.size as usize;
+        let mut p = 0usize;
+        while let Some((e, next)) = Self::dirent_next(&data, p) {
+            if e.ino == 0 {
+                at = p;
+                break;
+            }
+            p = next;
+        }
+        let mut bytes = [0u8; DIRENT_SIZE];
+        encode_dirent(&mut bytes, &entry);
+        let p = at;
+        self.write_at(&mut dinode, p, &bytes)?;
+        let end = (p + DIRENT_SIZE) as u32;
+        if end > dinode.size {
+            dinode.size = end;
+        }
+        self.write_inode(dir, &dinode)?;
+        self.cache.flush().map_err(map_cache_err)
+    }
+
+    /// Remove an entry by tombstones: `ino` zeroed (that is the flag every
+    /// walk skips) and the name zeroed, `rec_len` kept so the walk still
+    /// steps over the slot.
+    fn dir_remove(&mut self, dir: u64, name: &str) -> Result<(), Errno> {
+        let mut dinode = self.inode(dir)?;
+        let (at, e) = self.dir_lookup(dir, name)?.ok_or(Errno::ENoent)?;
+        let tomb = DirEntry {
+            name: [0u8; NAME_MAX],
+            ino: 0,
+            ty: e.ty,
+            rec_len: DIRENT_SIZE as u8,
+        };
+        let mut bytes = [0u8; DIRENT_SIZE];
+        encode_dirent(&mut bytes, &tomb);
+        self.write_at(&mut dinode, at, &bytes)?;
+        self.cache.flush().map_err(map_cache_err)
+    }
+
+    /// `write(2)` on a v2 store. A write past the current end zero-fills the
+    /// gap (the blocks `ensure_block` allocates are zeroed), which is what
+    /// POSIX says a hole reads as; the file's size follows its last write.
+    pub fn write(&mut self, ino: u64, offset: u64, buf: &[u8]) -> Result<usize, Errno> {
+        if !self.writable {
+            return Err(Errno::ERofs);
+        }
+        self.op_guard()?;
+        let mut inode = self.inode(ino)?;
+        if inode.ty() != Some(FileType::File) {
+            return Err(Errno::EIsdir);
+        }
+        let end = offset.checked_add(buf.len() as u64).ok_or(Errno::EFbig)?;
+        if end > MAX_FILE_BYTES_V2 {
+            return Err(Errno::EFbig);
+        }
+        let mut done = 0usize;
+        while done < buf.len() {
+            let pos = offset + done as u64;
+            let blk = pos / BS as u64;
+            let in_blk = (pos % BS as u64) as usize;
+            let take = core::cmp::min(BS - in_blk, buf.len() - done);
+            let addr = self.ensure_block(&mut inode, blk)?;
+            let mut scratch = [0u8; BS];
+            self.cache
+                .read_block(addr as u64, &mut scratch)
+                .map_err(map_cache_err)?;
+            scratch[in_blk..in_blk + take].copy_from_slice(&buf[done..done + take]);
+            self.cache
+                .write_block(addr as u64, &scratch)
+                .map_err(map_cache_err)?;
+            done += take;
+        }
+        if end > inode.size as u64 {
+            inode.size = end as u32;
+        }
+        self.write_inode(ino, &inode)?;
+        self.cache.flush().map_err(map_cache_err)?;
+        Ok(buf.len())
+    }
+
+    /// `truncate(2)` on a v2 store: shrink frees the blocks past the new end
+    /// (and an indirect block whose whole range is gone), grow allocates
+    /// zeroed blocks, and either way the size lands on the device.
+    pub fn truncate(&mut self, ino: u64, len: u64) -> Result<(), Errno> {
+        if !self.writable {
+            return Err(Errno::ERofs);
+        }
+        self.op_guard()?;
+        let mut inode = self.inode(ino)?;
+        if inode.ty() != Some(FileType::File) {
+            return Err(Errno::EIsdir);
+        }
+        if len > MAX_FILE_BYTES_V2 {
+            return Err(Errno::EFbig);
+        }
+        let old_size = inode.size as u64;
+        if len < old_size {
+            let keep = len.div_ceil(BS as u64);
+            let mut blk = keep;
+            while blk < old_size.div_ceil(BS as u64) {
+                if let Some(addr) = self.block_addr_opt(&inode, blk)? {
+                    self.free_block(addr)?;
+                }
+                blk += 1;
+            }
+            if keep <= NDIRECT_V2 as u64 && inode.indirect != 0 {
+                self.free_block(inode.indirect)?;
+                inode.indirect = 0;
+            }
+            if keep <= (NDIRECT_V2 + NINDIRECT) as u64 && inode.indirect2 != 0 {
+                self.free_block(inode.indirect2)?;
+                inode.indirect2 = 0;
+            }
+        } else {
+            // grow (or no-op): allocate through the new end, zeroed.
+            let mut blk = old_size.div_ceil(BS as u64);
+            while blk < len.div_ceil(BS as u64) {
+                self.ensure_block(&mut inode, blk)?;
+                blk += 1;
+            }
+        }
+        inode.size = len as u32;
+        self.write_inode(ino, &inode)?;
+        self.cache.flush().map_err(map_cache_err)
+    }
+
+    /// The checks a create shares: a valid name, a directory parent, and no
+    /// existing entry under that name.
+    fn create_check(&mut self, parent: u64, name: &str) -> Result<(), Errno> {
+        if name.is_empty() || name.len() > NAME_MAX || name.contains('/') {
+            return Err(Errno::ENametoolong);
+        }
+        if name == "." || name == ".." {
+            return Err(Errno::EExist);
+        }
+        let p = self.inode(parent)?;
+        if p.ty() != Some(FileType::Dir) {
+            return Err(Errno::ENotdir);
+        }
+        if self.dir_lookup(parent, name)?.is_some() {
+            return Err(Errno::EExist);
+        }
+        Ok(())
+    }
+
+    pub fn create_file(&mut self, parent: u64, name: &str, mode: u16) -> Result<u64, Errno> {
+        if !self.writable {
+            return Err(Errno::ERofs);
+        }
+        self.op_guard()?;
+        self.create_check(parent, name)?;
+        let ino = self.alloc_inode(S_IFREG | (mode & 0o7777))?;
+        self.dir_insert(parent, name, ino as u32, FileType::File)?;
+        Ok(ino)
+    }
+
+    pub fn create_dir(&mut self, parent: u64, name: &str, mode: u16) -> Result<u64, Errno> {
+        if !self.writable {
+            return Err(Errno::ERofs);
+        }
+        self.op_guard()?;
+        self.create_check(parent, name)?;
+        let ino = self.alloc_inode(S_IFDIR | (mode & 0o7777))?;
+        // "." and ".." are real entries, exactly as the builder writes them.
+        let mut dinode = self.inode(ino)?;
+        let mut dot = [0u8; DIRENT_SIZE];
+        encode_dirent(&mut dot, &DirEntry::new(".", ino as u32, FileType::Dir).unwrap());
+        let mut dotdot = [0u8; DIRENT_SIZE];
+        encode_dirent(
+            &mut dotdot,
+            &DirEntry::new("..", parent as u32, FileType::Dir).unwrap(),
+        );
+        self.write_at(&mut dinode, 0, &dot)?;
+        self.write_at(&mut dinode, DIRENT_SIZE, &dotdot)?;
+        dinode.size = (2 * DIRENT_SIZE) as u32;
+        self.write_inode(ino, &dinode)?;
+        self.dir_insert(parent, name, ino as u32, FileType::Dir)?;
+        Ok(ino)
+    }
+
+    /// `unlink(2)`: regular files (and the never-on-disk node types) only —
+    /// a directory is `rmdir`'s, as POSIX says, and answers `EISDIR` here.
+    /// The NAME goes first and the blocks second: after the name is gone the
+    /// file is unreachable, so an interrupted free can leak a block but can
+    /// never leave a live name pointing at a freed one.
+    pub fn unlink(&mut self, parent: u64, name: &str) -> Result<(), Errno> {
+        if !self.writable {
+            return Err(Errno::ERofs);
+        }
+        self.op_guard()?;
+        let e = self.dir_lookup(parent, name)?.ok_or(Errno::ENoent)?.1;
+        if FileType::from_dt(e.ty) == Some(FileType::Dir) {
+            return Err(Errno::EIsdir);
+        }
+        let ino = e.ino as u64;
+        let inode = self.inode(ino)?;
+        self.dir_remove(parent, name)?;
+        for blk in 0..(inode.size as u64).div_ceil(BS as u64) {
+            if let Some(addr) = self.block_addr_opt(&inode, blk)? {
+                self.free_block(addr)?;
+            }
+        }
+        if inode.indirect != 0 {
+            self.free_block(inode.indirect)?;
+        }
+        if inode.indirect2 != 0 {
+            self.free_block(inode.indirect2)?;
+        }
+        self.free_inode(ino)
+    }
+
+    /// `rmdir(2)`: directories only, and only empty ones — "empty" means no
+    /// live entry besides "." and "..", which is the same walk the v1 reader
+    /// does. The mount root itself is refused `EBUSY` here as well as in the
+    /// VFS, so a caller that reaches this far cannot unroot the mount.
+    pub fn rmdir(&mut self, parent: u64, name: &str) -> Result<(), Errno> {
+        if !self.writable {
+            return Err(Errno::ERofs);
+        }
+        self.op_guard()?;
+        let e = self.dir_lookup(parent, name)?.ok_or(Errno::ENoent)?.1;
+        if FileType::from_dt(e.ty) != Some(FileType::Dir) {
+            return Err(Errno::ENotdir);
+        }
+        let ino = e.ino as u64;
+        if ino == self.sb.root_inode as u64 {
+            return Err(Errno::EBusy);
+        }
+        let dir = self.inode(ino)?;
+        let data = self.read_file_bytes(&dir)?;
+        let mut p = 0usize;
+        while let Some((ent, next)) = Self::dirent_next(&data, p) {
+            if ent.ino != 0 && ent.name_str() != "." && ent.name_str() != ".." {
+                return Err(Errno::ENotempty);
+            }
+            p = next;
+        }
+        self.dir_remove(parent, name)?;
+        for blk in 0..(dir.size as u64).div_ceil(BS as u64) {
+            if let Some(addr) = self.block_addr_opt(&dir, blk)? {
+                self.free_block(addr)?;
+            }
+        }
+        if dir.indirect != 0 {
+            self.free_block(dir.indirect)?;
+        }
+        if dir.indirect2 != 0 {
+            self.free_block(dir.indirect2)?;
+        }
+        self.free_inode(ino)
+    }
+
+    /// `rename(2)` within a v2 store. An existing destination is refused
+    /// `EEXIST` rather than replaced: no replace semantics in the first cut,
+    /// and a half-replace would be worse than the refusal. A moved directory
+    /// gets its ".." repointed, which is the one thing a rename changes
+    /// inside the object rather than in its parent.
+    pub fn rename(
+        &mut self,
+        old_parent: u64,
+        old_name: &str,
+        new_parent: u64,
+        new_name: &str,
+    ) -> Result<(), Errno> {
+        if !self.writable {
+            return Err(Errno::ERofs);
+        }
+        self.op_guard()?;
+        if old_name.is_empty() || new_name.is_empty() || new_name.len() > NAME_MAX {
+            return Err(Errno::ENametoolong);
+        }
+        if old_parent == new_parent && old_name == new_name {
+            return Ok(());
+        }
+        let e = self.dir_lookup(old_parent, old_name)?.ok_or(Errno::ENoent)?.1;
+        if self.dir_lookup(new_parent, new_name)?.is_some() {
+            return Err(Errno::EExist);
+        }
+        let ty = FileType::from_dt(e.ty).ok_or(Errno::EInval)?;
+        if ty == FileType::Dir {
+            let mut dinode = self.inode(e.ino as u64)?;
+            let data = self.read_file_bytes(&dinode)?;
+            let mut p = 0usize;
+            while let Some((ent, next)) = Self::dirent_next(&data, p) {
+                if ent.ino != 0 && ent.name_str() == ".." {
+                    let mut dotdot = [0u8; DIRENT_SIZE];
+                    encode_dirent(
+                        &mut dotdot,
+                        &DirEntry::new("..", new_parent as u32, FileType::Dir).unwrap(),
+                    );
+                    self.write_at(&mut dinode, p, &dotdot)?;
+                    break;
+                }
+                p = next;
+            }
+        }
+        self.dir_remove(old_parent, old_name)?;
+        self.dir_insert(new_parent, new_name, e.ino, ty)?;
+        Ok(())
     }
 }
 
@@ -1091,15 +1706,26 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
             Err(_) => true, // unreadable block 0 → treat as unformatted
         };
         if needs_format {
-            // A blank aerofs: superblock + inode table + an empty root dir.
-            let img = crate::aerofs::ImageBuilder::new().build();
-            let nblocks = img.len().div_ceil(BS);
-            for b in 0..nblocks {
-                let mut blk = [0u8; BS];
+            // An empty store formats as v2 — the writable format — sized by
+            // the DEVICE's block count, which is what bounds v2's allocator.
+            // (A v1 image is never formatted over: block 0 parses, so this
+            // branch is not reached, and the mount below is read-only.)
+            let total = cache.blocks() as u32;
+            let img = crate::aerofs::format_v2(total).ok_or(Errno::EInval)?;
+            // Only the non-zero blocks are written: a fresh format's metadata
+            // is ~11 blocks, and the free space it leaves unwritten is
+            // unreachable until `alloc_block` zeroes it. Writing all 2,048
+            // blocks of a 1 MiB store would make every environment's first
+            // mount two thousand requests. (See `format_v2`'s header.)
+            for b in 0..total as usize {
                 let start = b * BS;
-                let end = core::cmp::min(start + BS, img.len());
-                blk[..end - start].copy_from_slice(&img[start..end]);
-                cache.write_block(b as u64, &blk).map_err(|_| Errno::EIo)?;
+                let blk = &img[start..start + BS];
+                if blk.iter().all(|&x| x == 0) {
+                    continue;
+                }
+                let mut raw = [0u8; BS];
+                raw.copy_from_slice(blk);
+                cache.write_block(b as u64, &raw).map_err(|_| Errno::EIo)?;
             }
             cache.flush().map_err(|_| Errno::EIo)?;
         }
@@ -1207,6 +1833,7 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
             record,
             id,
             inodes: BTreeMap::new(),
+            writable: sb.version == crate::aerofs::AEROFS_VERSION_V2,
         });
         Ok(())
     }

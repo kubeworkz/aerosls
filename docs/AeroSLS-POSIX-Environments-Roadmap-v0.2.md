@@ -55,7 +55,7 @@ Everything in this section is a reading of the tree, with the file named. Nothin
 | `partition_migrate()` moves **nothing about a process, a sidecar, or an environment** — the code says so, and scopes the gap to a named dependency | `kernel/partition.c` — "there is no function anywhere in net/dspp.c that moves or retags a catalog object's `partition_id`"; "Scoped to streams only" |
 | The **cluster checkpoint transport is 24 KiB and single-slot**, and carries a serialized state tree with no names and no process data | `net/dspp_checkpoint.c` — `CKPT_RECV_MAX` (24 KiB), `dspp_ckpt_send()`, `dspp_ckpt_recv_ready/size/copy()`; `kernel/failover.c` synthesizes `recovered-N` because "the checkpoint carries no names" |
 | Failover recovery **adopts ownership only** — a partition row and an owner stamp — and never data | `kernel/failover.c` — `failover_recover_from()`, `partition_set_owner_node()` |
-| The environment's filesystem today is **aerofs-lite on a RAM region**: read-only format, 512 B blocks, 11 direct + 1 indirect block per file (max 71 168 bytes), formatted in place on first mount for a tenant | `user/vfs/src/aerofs.rs` — `NDIRECT`/`NINDIRECT`/`MAX_BLOCKS`; `user/init/src/ramdisk_manifest.rs` (tenant storage cap `0x3`, "format the empty region on first mount") |
+| The environment's filesystem is **aerofs-lite on a RAM region**: v1 is read-only in format (512 B blocks, 11 direct + 1 indirect, max 71 168 bytes) and v2 is writable (10 direct + 2 indirect, max 136 192 bytes) since P1b's first increment — but the region itself is still RAM, formatted in place on first mount for a tenant | `user/vfs/src/aerofs.rs` — `NDIRECT`/`NINDIRECT`, `MAX_FILE_BYTES_V1`/`_V2`; `user/init/src/ramdisk_manifest.rs` (tenant storage cap `0x3`, "format the empty region on first mount") |
 
 Two consequences fall straight out of that table, and they shape everything below.
 
@@ -723,7 +723,7 @@ as "the environment came back with its contents".
 **Scope.**
 
 - **The block device stops being RAM.** The tenant ramdisk's `storage` cap resolves to a region backed by NVMe rather than by `alloc_region_in(RD_STORAGE_FRAMES, …)`. The tree already has the pattern: a stream is a persistent object with its own NVMe LBA range and a directory that survives reboot (`stream_persist_directory()`), and it is already moved between nodes page-by-page. P1b reuses that shape rather than inventing a second persistence story — the design question to settle in review is whether the environment's storage *is* a stream (a named blob with an LBA range, gaining migration and quota for free) or a dedicated per-environment LBA region with its own small directory.
-- **A writable, larger on-disk format.** aerofs-lite is explicitly "the read-only root filesystem format" with 512 B blocks, 11 direct + 1 indirect block per inode, and a **71 168-byte maximum file size** (`NDIRECT` 11, `NINDIRECT` 128, so `MAX_BLOCKS` 139). A durable tenant filesystem cannot ship that as its ceiling. P1b's deliverable is a writable format — by extending aerofs-lite with a second indirect block (or a different on-disk layout with a compatibility rule) — and the *migration* of the format is a real decision, not an implementation detail, because the system rootfs image and every existing tenant ramdisk are formatted in it.
+- **A writable, larger on-disk format.** *(Landed — see the addendum below.)* aerofs-lite is explicitly "the read-only root filesystem format" with 512 B blocks, 11 direct + 1 indirect block per inode, and a **71 168-byte maximum file size** (`NDIRECT` 11, `NINDIRECT` 128, so `MAX_BLOCKS` 139). A durable tenant filesystem cannot ship that as its ceiling. P1b's deliverable is a writable format — by extending aerofs-lite with a second indirect block (or a different on-disk layout with a compatibility rule) — and the *migration* of the format is a real decision, not an implementation detail, because the system rootfs image and every existing tenant ramdisk are formatted in it.
 - **Quota-charged, like everything else.** The durable storage is charged to the partition through the existing per-partition storage quota (`kernel/storage_quota.h`), which closes the residue E4's findings recorded on the *frame* side by extending the same discipline to the durable side. A tenant's disk counts against the tenant.
 - **The descriptor names it.** P1a's descriptor carries the storage's identity (LBA range or stream id) so a restore reattaches to the *same* store, and a migration (P3) can carry it. This is why P1b depends on P1a rather than the other way round: the descriptor is the thing that has to be able to name durable storage.
 - **Ordering with the format change.** The durable region must be mountable after a reboot *and* after a version bump, so the format carries its own version and refuses an unknown one (the superblock already has `AEROFS_VERSION` and an `sb_crc`; a v2 is the honest way to add a writable layout rather than overloading v1's semantics).
@@ -742,6 +742,86 @@ as "the environment came back with its contents".
 - **`P1B_TOOTH=unquotaed`** — the durable region is charged to `PARTITION_SYSTEM`. Expected: red on the quota-usage clause; this is E4 Finding 1's exact shape (`+1344` frames on the creator, `0` on the tenant) reappearing on the durable side, so the tooth is a regression test for a defect this project has already run once.
 - **`P1B_TOOTH=format-v1-only`** — the 71 200-byte file write. Expected: red on the large-file clause while the small-file clause stays green, which is the tooth that keeps the format change honest.
 - **`P1B_TOOTH=bad-format-version`** — a store labelled v3. Expected: refused by name, and red on the refusal clause, rather than mounted as v2.
+
+### Findings addendum — what has landed, increment by increment
+
+P1b is now partly built. What exists is the **format layer**: the writable
+on-disk v2 that a durable region has to be formatted in. It went first because
+the device swap is worthless without it — a durable region formatted in v1
+inherits the 71 168-byte ceiling and the read-only semantics — and because it is
+the part that can be verified on the host, with no reboot.
+
+Landed, and verified:
+
+- **`user/vfs/src/aerofs.rs` — the v2 layout.** aerofs-lite grew a version
+  rather than a second format: `AEROFS_VERSION_V2` keeps the
+  superblock-on-block-0 shape, the 512 B blocks and the dirent encoding, and
+  widens the file layout to 10 direct + 2 indirect blocks (`MAX_BLOCKS_V2` 266,
+  `MAX_FILE_BYTES_V2` 136 192). The superblock gains `version`, `total_blocks`,
+  `alloc_start`, `alloc_blocks` and a CRC over the fixed 48-byte header; the
+  allocation map is two bitmaps (blocks first, inodes second). **The
+  compatibility rule is written into the code — read v1, write v2, refuse the
+  rest** — and an unknown magic, version, block size, CRC or layout is refused
+  *by name* (`SuperblockRefusal::Version { found }`, not "corrupt"), so a v3
+  store fails as v3 and not as a crash.
+- **`user/vfs/src/vfs.rs` — the writable mount.** An `AerofsFs` is writable iff
+  its superblock says v2; nothing else grants it. On a v1 store (the system
+  rootfs image, and every existing tenant store) reads dispatch to v1's inode
+  parse and block walk, and **every** mutating entry point refuses with `ERofs`
+  — proven by a test that mounts a v1 image through the formatting mount and
+  watches its device bytes stay v1. The v2 half is the full set:
+  `write`/`truncate`/`create_file`/`create_dir`/`unlink`/`rmdir`/`rename`,
+  block and inode allocation from the on-disk bitmaps, tombstoned dirents
+  (name removed first, blocks second — a crash can leak a block, never hand it
+  to two owners), and a flush that stores the allocation map before content.
+  Mounting an *empty* store formats it v2 sized by the device's own block count
+  rather than a constant, and writes only the non-zero blocks (11 writes for a
+  1 MiB store).
+- **`user/vfs/src/errno.rs`** — `EFbig` (27) is the ceiling's own error: a write
+  past 136 192 bytes is refused as a file too big, not as ENOSPC.
+- **`user/vfs/tests/vfs_tests.rs` — five new integration tests**, including the
+  one that makes the durability claim the format layer's to carry: a
+  71 200-byte file (larger than v1's ceiling) written through the mounted
+  filesystem, then **a second power-on** — a fresh fake kernel, a fresh driver
+  and a fresh mount over the same device bytes — reads it back byte-identical
+  and still writable. The others: an empty store formats writable; the allocator
+  frees blocks on unlink and refuses clearly (`EFbig` past the ceiling, `ENOSPC`
+  when the store is full, proven by churning a 120 KiB file); and the v1
+  read-only gate.
+- **`tests/aerofs_v2_check.sh` + `tests/aerofs_v2_check_smoke.sh`** — the guard
+  pins every claim above as a source clause (the version rule and the named
+  refusal, the two ceilings and the inode pointer offsets, the builder that must
+  stay v1, writability derived from the version with the `ERofs` gates, the
+  block-count-sized formatting, the named host tests) and runs the host tests
+  where a toolchain exists; its smoke renames each clause away and requires
+  ABORT, with 17 teeth biting.
+
+**The decisions this increment made**, and the reason for each:
+
+- **Extend, not replace.** §11 Q3 is answered by the implementation: v2 is a
+  version the existing parser can refuse cleanly, so the system rootfs image and
+  every existing tenant ramdisk keep mounting — read-only — with no migration
+  step, and no image is rewritten before the durable region exists.
+- **Writability is a property of the volume, not a mount flag.** A `-w` mount
+  option would admit two ways to be wrong (a v1 store written, a v2 store
+  mounted read-only); the version in the superblock is the one thing a device
+  cannot lie about.
+- **No upgrade-in-place path yet.** `mount_aerofs_or_format` formats an empty
+  store v2 and never re-formats a v1 one; the only v1 stores in the tree are
+  read-only images, and an in-place upgrader would be a migration story with no
+  customer.
+- **The image builder stayed v1 on purpose.** The system rootfs ships as a v1
+  image, and a guard clause pins that the builder does not drift into v2 while
+  the durable half is missing.
+
+**Still owed — the rest of P1b.** This addendum stops short of the phase's
+claim: **nothing durable exists yet.** The tenant storage is still
+`alloc_region_in(RD_STORAGE_FRAMES, …)` — 1 MiB of frames — it is not
+quota-charged, and P1a's descriptor does not name it. §11 Q1 (stream vs
+dedicated LBA region) is deliberately still open: it is the next increment's
+first decision, and it decides the shape of everything after it.
+`tests/env_storage_durable_check.sh` and its four teeth are the boot arm that
+comes with that increment, and §10's P1b gate stays red until then.
 
 ---
 
@@ -861,6 +941,8 @@ P1a is unblocked and is the thing E7 waits on, so it starts first. P2 has no dep
 | 2 | P1b — durable storage | a file larger than 71 168 bytes survives a reboot and is charged to the partition |
 | 3 | P3 — placement/migration/failover | an environment moves with its data, its console and its lease, or is refused by name |
 
+Step 2 has begun: P1b's format increment — the writable aerofs v2 — has landed (§5), and the durable device this table's gate measures is the increment that follows. Step 1's gate is still open for the same reason §4 records (P1a's payload).
+
 E7's own gate — *"a static binary doing the first user's actual work, running natively, surviving a checkpoint/restore cycle"* — becomes reachable at the end of step 1 for the first half and the end of step 2 for the second, and E7's deliverable list (`AeroSLS-Linux-ABI-Shim-Design-v0.1.md` §10.4) is already written to report those halves separately rather than blur them.
 
 ---
@@ -869,7 +951,7 @@ E7's own gate — *"a static binary doing the first user's actual work, running 
 
 1. **P1b: is an environment's storage *a stream*, or its own LBA region?** A stream gains migration, quota and persistence for free (`stream_persist_directory()`, `stream_migrate_*`) but carries a stream's own size and directory semantics; a dedicated region is simpler to size per environment and duplicates the persistence story. This is the same class of choice v0.1 §14 Q2 left open (ramdisk sidecar vs in-process ramfs), and it should be settled the same way — on measurement, not taste.
 2. **P1a: is quiescing the whole partition the right granularity, or should an environment pause alone?** Today `partition_pause()` is the only pause mechanism, and it stops the tenant's other work too. If environments are the unit of checkpointing, a per-environment pause may be the correct primitive — but it is a new scheduling concept and it should be argued for rather than assumed.
-3. **P1b: does the durable format replace aerofs-lite or extend it?** v1's superblock is already versioned (`AEROFS_VERSION`, `sb_crc`), so a v2 is the clean path — but every existing tenant ramdisk and the system rootfs are v1 images, and the migration rule (read v1, write v2, refuse v3) needs to be written down before it is implemented.
+3. **P1b: does the durable format replace aerofs-lite or extend it?** *(Settled by P1b's first increment, §5: the rule is implemented as **read v1, write v2, refuse the rest by name** — v2 is a version bump, no existing image is rewritten, and the rootfs builder deliberately stays v1.)* The rule was written down before it was implemented, as this question asked; the durable region it is for is still owed.
 4. **P2: what is a tenant partition's *recommended* connection quota?** The mechanism defaults to 0 = unlimited for backward compatibility; a fresh tenant that never opts in is exactly the starvation case `tcp_quota.h` documents. Should the environment-create path set a non-zero default as part of its budget, and if so, what number is defensible?
 5. **P3: failover destination (a) or (b)?** Bulk-transfer surviving environments during failover (the PASE-grade answer, a much larger lift) or restore them from their own durable storage on the survivor and report the gap by name (the smaller, consistent-with-`failover.c` first cut). The plan is written to admit either; the decision is a product one about what "a cluster that doesn't lose your environments" has to mean in this window.
 6. **§9's interop question.** Should a Linux-POSIX task be able to reach the SLS catalog or the integrated DB through a mediated service, and if so, is that service part of the sidecar it already talks to or a second kernel-brokered service in the `kernel.env.console` shape? This is the question that decides whether AeroSLS's POSIX environments are PASE-with-IFS or a sealed compatibility box, and it is deliberately left open here rather than answered by omission.
@@ -891,7 +973,7 @@ Everything this document asserts about the tree, with its source.
 | Restore must resolve pids by name, because a kill drops the registry entry | `user/init/src/env_manager.rs` — `kill_environment()`'s "resolved BEFORE the kill" comment |
 | The tenant profile is exactly three caps and the test asserts what is absent | `user/init/src/posix_manifest.rs` — `build_posix_manifest_tenant()`, `tenant_profile_has_only_budget_console_and_its_own_ramdisk` |
 | Tenant ramdisk storage is writable and formatted on first mount; the system's is read-only | `user/init/src/ramdisk_manifest.rs` — `storage_rights` 0x3 vs 0x1 |
-| The filesystem is read-only in format, 512 B blocks, 139 blocks per file | `user/vfs/src/aerofs.rs` — `AEROFS_VERSION`, `NDIRECT`, `NINDIRECT`, `MAX_BLOCKS` |
+| aerofs-lite v1 is read-only in format (512 B blocks, 139 blocks per file); v2 is writable (266 blocks, 136 192 bytes) and the superblock's version — not a mount flag — decides | `user/vfs/src/aerofs.rs` — `AEROFS_VERSION_V1`/`_V2`, `MAX_FILE_BYTES_V1`/`_V2`, `parse_superblock_refusing()`, `format_v2()` |
 | The kernel brokers a tenant-reachable service through a `kernel.*` name, keyed to `(partition, index)` | `kernel/env_console.h` — `env_console_register()`, `env_console_name_index()`; `kernel/env_service.c` (`kernel.env.control`) |
 | Per-partition connection quotas exist, with syscalls and an HTTP surface, and 0 means unlimited | `net/tcp_quota.h` — `tcp_conn_attribute()`, `tcp_partition_set_conn_quota()`, `SYS_SLS_PARTITION_CONN_QUOTA_SET/LIST`; `net/http.c` — `api_partition_connquotas_list()` |
 | The starvation failure mode the quota closes is documented, not assumed | `net/tcp_quota.h`'s "Why this is a genuinely different mechanism" block |
