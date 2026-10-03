@@ -352,6 +352,22 @@ static void seat_sidecars(void) {
 }
 
 /* ─── the test ──────────────────────────────────────────────────────────── */
+/* ─── Link stub for kernel/env_storage.h ─────────────────────────────────
+ * env_ckpt_register_from() stamps the checkpoint descriptor's state LBA
+ * from the durable-region table (P1b part 2). This test links env_ckpt.c
+ * but not the durable region itself (that would drag in persist.c's whole
+ * world), and there is no store here anyway — so the honest answer is 1:
+ * nothing to name, the fields stay 0, their pre-P1b value. The module's
+ * own behavior has its own test: tests/env_storage_host_test.c. */
+#include "kernel/env_storage.h"
+int env_storage_extent_of(uint32_t partition_id, uint32_t index,
+                          uint64_t* out_lba, uint64_t* out_sectors,
+                          uint32_t* out_bytes) {
+    (void)partition_id; (void)index;
+    (void)out_lba; (void)out_sectors; (void)out_bytes;
+    return 1;
+}
+
 int main(void) {
     uint16_t status = 0xFFFF;
     uint32_t env_id = 0;

@@ -197,6 +197,11 @@ pub const RD_ERR_IO: u16 = 5;
 pub const RD_ERR_RO: u16 = 6;
 pub const RD_ERR_BUSY: u16 = 7;
 pub const RD_ERR_PROTO: u16 = 8;
+/// P1b: the partition's storage quota refused the write — the quota's own
+/// status, deliberately not NOMEM's (a frame-pool exhaustion) and not
+/// RANGE's, so the POSIX side can surface EDQUOT and nothing else can
+/// masquerade as it (v0.2 §5's "refused with the quota's own error").
+pub const RD_ERR_QUOTA: u16 = 9;
 
 pub const BLOCK_SIZE: u32 = 512;
 /// v1 per-request I/O bound (implementation plan §6.6).

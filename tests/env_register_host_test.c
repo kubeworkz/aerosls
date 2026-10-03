@@ -105,6 +105,22 @@ static const uint64_t k_entries[ENV_CKPT_MAX_TASKS] = {
     0x0000000040001000ull, 0x0000000040002000ull, 0, 0
 };
 
+/* ─── Link stub for kernel/env_storage.h ─────────────────────────────────
+ * env_ckpt_register_from() stamps the checkpoint descriptor's state LBA
+ * from the durable-region table (P1b part 2). This test links env_ckpt.c
+ * but not the durable region itself (that would drag in persist.c's whole
+ * world), and there is no store here anyway — so the honest answer is 1:
+ * nothing to name, the fields stay 0, their pre-P1b value. The module's
+ * own behavior has its own test: tests/env_storage_host_test.c. */
+#include "kernel/env_storage.h"
+int env_storage_extent_of(uint32_t partition_id, uint32_t index,
+                          uint64_t* out_lba, uint64_t* out_sectors,
+                          uint32_t* out_bytes) {
+    (void)partition_id; (void)index;
+    (void)out_lba; (void)out_sectors; (void)out_bytes;
+    return 1;
+}
+
 int main(void) {
     /* ── 1. The wire body and the struct are the same 200 bytes ─────────────
      * The struct is a padding-free image of the wire layout, which is what

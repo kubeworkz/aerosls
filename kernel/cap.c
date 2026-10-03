@@ -52,6 +52,7 @@
 #include "process.h"
 #include "env_service.h"
 #include "env_console.h"
+#include "env_storage.h"   // POSIX-Environments Roadmap v0.2 Phase P1b
 #include "../arch/x86/user_paging.h"
 #include <stddef.h>
 
@@ -4508,4 +4509,102 @@ uint32_t sys_sls_sidecar_pid(struct SLSSidecarPidRequest* req) {
     if (i == 0) return 0;   /* an empty name matches nothing */
 
     return sidecar_registry_resolve(name, req->partition);
+}
+
+/* ─── sys_sls_env_storage_attach (323) / _restore (324) / _write (325) /
+ * _release (326) ─────────────────────────────────────────────────────────
+ * POSIX-Environments Roadmap v0.2 Phase P1b — the syscall half of an
+ * environment's durable store (kernel/env_storage.h carries the design).
+ * Placed in cap.c beside the sys_sls_alloc_region family on purpose: these
+ * are region syscalls, gated the way that one gates. Caller identity is
+ * resolved the trusted way — cap_current_pid(), never a request field.
+ * attach/release are PARTITION_SYSTEM-only (init creates and destroys
+ * environments); restore/write must come from the store's OWN partition,
+ * resolved from the table by env_storage_owner() rather than from anything
+ * the request says, so one environment's ramdisk server can never name
+ * another environment's region. */
+uint64_t sys_sls_env_storage_attach(struct SLSEnvStorageAttachRequest* req) {
+    if (!req) return ENV_STORAGE_ERR_INVAL;
+    struct ProcessDescriptor* caller = sidecar_find_pid(cap_current_pid());
+    if (!caller || !caller->sidecar_authority) {
+        kernel_serial_printf(
+            "[ENV-STORAGE] attach denied: pid=%u lacks sidecar_authority\n",
+            (unsigned)cap_current_pid());
+        return ENV_STORAGE_ERR_INVAL;
+    }
+    if (caller->partition_id != PARTITION_SYSTEM) {
+        kernel_serial_printf(
+            "[ENV-STORAGE] attach denied: pid=%u (partition %u) may not "
+            "create stores — only PARTITION_SYSTEM creates environments\n",
+            (unsigned)cap_current_pid(), (unsigned)caller->partition_id);
+        return ENV_STORAGE_ERR_INVAL;
+    }
+    if (req->partition_id >= PARTITION_MAX ||
+        !partition_exists(req->partition_id)) {
+        kernel_serial_printf(
+            "[ENV-STORAGE] attach refused: partition %u is not active\n",
+            (unsigned)req->partition_id);
+        return ENV_STORAGE_ERR_INVAL;
+    }
+    if (partition_is_paused(req->partition_id)) {
+        kernel_serial_printf(
+            "[ENV-STORAGE] attach refused: partition %u is paused — a paused "
+            "partition is charged nothing, and a store it cannot pay for is "
+            "a store that must not exist\n",
+            (unsigned)req->partition_id);
+        return ENV_STORAGE_ERR_INVAL;
+    }
+    return env_storage_attach(req->partition_id, req->index,
+                              req->region_base, req->region_bytes);
+}
+
+uint64_t sys_sls_env_storage_restore(struct SLSEnvStorageRegionRequest* req) {
+    if (!req) return ENV_STORAGE_ERR_INVAL;
+    struct ProcessDescriptor* caller = sidecar_find_pid(cap_current_pid());
+    if (!caller || !caller->sidecar_authority) return ENV_STORAGE_ERR_INVAL;
+    uint32_t owner = env_storage_owner(req->region_base);
+    if (owner != 0xFFFFFFFFu && owner != caller->partition_id) {
+        kernel_serial_printf(
+            "[ENV-STORAGE] restore denied: pid=%u (partition %u) named "
+            "partition %u's store\n",
+            (unsigned)cap_current_pid(), (unsigned)caller->partition_id,
+            (unsigned)owner);
+        // INVAL, not NOENT: NOENT is the honest "this region was never
+        // attached" answer the server treats as RAM-by-design, and a
+        // PERMISSION-shaped refusal must not be mistakable for that.
+        return ENV_STORAGE_ERR_INVAL;
+    }
+    return env_storage_restore(req->region_base);
+}
+
+uint64_t sys_sls_env_storage_write(struct SLSEnvStorageWriteRequest* req) {
+    if (!req) return ENV_STORAGE_ERR_INVAL;
+    struct ProcessDescriptor* caller = sidecar_find_pid(cap_current_pid());
+    if (!caller || !caller->sidecar_authority) return ENV_STORAGE_ERR_INVAL;
+    uint32_t owner = env_storage_owner(req->region_base);
+    if (owner != 0xFFFFFFFFu && owner != caller->partition_id) {
+        kernel_serial_printf(
+            "[ENV-STORAGE] write denied: pid=%u (partition %u) named "
+            "partition %u's store\n",
+            (unsigned)cap_current_pid(), (unsigned)caller->partition_id,
+            (unsigned)owner);
+        // INVAL, not NOENT — see the restore wrapper above: NOENT means
+        // "unattached, RAM by design" and is answered as success there.
+        return ENV_STORAGE_ERR_INVAL;
+    }
+    return env_storage_write(req->region_base, req->lba, req->bytes);
+}
+
+uint64_t sys_sls_env_storage_release(struct SLSEnvStorageRegionRequest* req) {
+    if (!req) return ENV_STORAGE_ERR_INVAL;
+    struct ProcessDescriptor* caller = sidecar_find_pid(cap_current_pid());
+    if (!caller || !caller->sidecar_authority) return ENV_STORAGE_ERR_INVAL;
+    if (caller->partition_id != PARTITION_SYSTEM) {
+        kernel_serial_printf(
+            "[ENV-STORAGE] release denied: pid=%u (partition %u) may not "
+            "destroy stores\n",
+            (unsigned)cap_current_pid(), (unsigned)caller->partition_id);
+        return ENV_STORAGE_ERR_INVAL;
+    }
+    return env_storage_release(req->region_base);
 }

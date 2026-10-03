@@ -43,7 +43,7 @@
  *       tests/persist_rdbms_vecstore_host_test.c \
  *       kernel/persist.c kernel/env_ckpt.c kernel/checkpoint_delta.c kernel/view.c kernel/rowstore.c kernel/storage_quota.c kernel/row_index.c kernel/mvcc.c \
  *       kernel/row_constraint.c kernel/row_journal.c kernel/vecstore.c \
- *       kernel/vec_index.c
+ *       kernel/vec_index.c kernel/env_storage.c
  *   /tmp/persist_rdbms_vecstore_host_test
  */
 #include "kernel/object_catalog.h"

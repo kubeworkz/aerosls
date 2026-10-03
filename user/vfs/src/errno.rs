@@ -26,6 +26,12 @@ pub enum Errno {
     ENotempty,
     /// No space left on device.
     ENospc,
+    /// Disk quota exceeded — the partition's storage quota refused the write
+    /// (POSIX EDQUOT; P1b). Deliberately its own errno and not ENospc's:
+    /// ENospc is the device having no room, EDQUOT is the tenant's own
+    /// ceiling saying no, and v0.2 §5 requires the two be tellable apart
+    /// ("the quota's own error, not a frame-pool exhaustion").
+    EDquot,
     /// Read-only filesystem.
     ERofs,
     /// File too large — the format's per-file block ceiling, or a write past
@@ -73,6 +79,7 @@ impl Errno {
             Errno::EExist => 17,
             Errno::ENotempty => 39,
             Errno::ENospc => 28,
+            Errno::EDquot => 122,
             Errno::ERofs => 30,
             Errno::EFbig => 27,
             Errno::EInval => 22,

@@ -57,6 +57,16 @@ pub fn run<K: Kernel>(k: &K, eps: &mut EndpointSet, dev: &Device) -> Result<(), 
     let mut buf = [0u8; ChanHeader::MAX_PAYLOAD];
     let mut caps = [GrantedCap::default(); ChanHeader::MAX_CAPS];
 
+    // P1b: hand the store its bytes back BEFORE the first RD_INFO reply —
+    // the POSIX sidecar's mount reads the superblock through this device, so
+    // a restore that ran later would race that first read. Unattached and
+    // RAM-backed regions answer Ok with nothing loaded (kernel/env_storage.h's
+    // design); only a real device failure stops the server, because a
+    // half-loaded store must not be served.
+    if let Err(status) = k.env_storage_restore(dev.storage_base) {
+        return Err(status);
+    }
+
     loop {        // Re-scan cap table for newly-wired CHAN endpoints (e.g. the POSIX
         // sidecar's "ramdisk" channel, wired after this sidecar booted).
         // For each CHAN_R, adopt it — the kernel's CHAN_R send fallback
@@ -328,6 +338,37 @@ fn write_blocks<K: Kernel>(
     let src = grant.base as *const u8;
     let dst = (dev.storage_base + lba * BLOCK_SIZE as u64) as *mut u8;
     unsafe { copy::copy_blocks(src, dst, bytes) };
+    // P1b: write-through. The RAM copy above is the view RD_MAP and RD_READ
+    // serve from; the kernel charges the partition's storage quota for the
+    // pages this write touches and puts those pages on NVMe, so the region
+    // is a cache whose authoritative copy survives a reboot.
+    //
+    //   QUOTA — the quota's own refusal (v0.2 §5): the kernel has already
+    //     reverted the frame pages from their persisted image, so replying
+    //     it here leaves no half-written block and no metered-but-lost page.
+    //   NOENT — an UNATTACHED region (the system rootfs ramdisk, and the
+    //     §5 `ram-backed` posture): the kernel did nothing and so did we;
+    //     the write is the RAM copy's, exactly as before P1b.
+    //   anything else — a device failure: the copy above may have landed in
+    //     RAM but never on media, so it must not read back as success.
+    match k.env_storage_write(dev.storage_base, lba as u32, bytes as u32) {
+        Ok(()) => {}
+        Err(status) if status == kapi::ENV_STORAGE_ERR_NOENT => {}
+        Err(status) if status == kapi::ENV_STORAGE_ERR_QUOTA => {
+            reply_status(k, handle, tag, RD_WRITE, RD_ERR_QUOTA, 0, Some(&grant));
+            return Ok(());
+        }
+        Err(status) if status == kapi::ENV_STORAGE_ERR_INVAL => {
+            // The kernel's permission-shaped refusal (another partition's
+            // store): an authority answer, so CAP rather than IO.
+            reply_status(k, handle, tag, RD_WRITE, RD_ERR_CAP, 0, Some(&grant));
+            return Ok(());
+        }
+        Err(_) => {
+            reply_status(k, handle, tag, RD_WRITE, RD_ERR_IO, 0, Some(&grant));
+            return Ok(());
+        }
+    }
     reply_status(k, handle, tag, RD_WRITE, RD_OK, bytes as u64, Some(&grant));
     Ok(())
 }
