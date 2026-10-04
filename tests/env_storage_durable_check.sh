@@ -51,6 +51,15 @@
 #                    is built and run HERE, inside the inspected root (its own
 #                    "Build and run:" comment is the build recipe — the guard
 #                    refuses to run one the comment no longer states).
+#   S12 (source)     the observables the live arm reads: the operator's
+#                    storagequota surface and the [STORAGE-QUOTA] section.
+#   S13 (source)     the wiring of the BOOT evidence itself: ci.yml runs
+#                    THIS guard's --live arm, after the ISO build. A clause
+#                    cannot reboot anything — but it can insist that the job
+#                    that can does. Without it the evidence is a recording
+#                    someone trusted, and §5's "what this increment does not
+#                    claim" line never retires; with it, deleting or
+#                    reordering the step reddens this guard by name.
 #   D1-D5 (replay)   the live claims, validated from a recorded run's
 #                    artifacts: the attach happened durably, the environment
 #                    came back WITH the reboot's own serial evidence (the
@@ -172,10 +181,11 @@ source_clauses() {
     local QH="$ROOT/kernel/storage_quota.h" SHELL="$ROOT/user/shell.c"
     local EP="$ROOT/kernel/env_proto.h"     EPR="$ROOT/user/proto/src/env_proto.rs"
     local DISP="$ROOT/kernel/syscall_dispatch.c" CAP="$ROOT/kernel/cap.c"
+    local CIW="$ROOT/.github/workflows/ci.yml"
 
     for f in "$H" "$C" "$P" "$PC" "$E" "$S" "$K" "$PL" "$ER" "$VF" "$AE" \
              "$SB" "$CK" "$EPH" "$SH" "$RW" "$QH" "$SHELL" "$EP" "$EPR" \
-             "$DISP" "$CAP"; do
+             "$DISP" "$CAP" "$CIW"; do
         # A tree without the surface cannot be judged at all: refusal (exit 2,
         # the run_checks fail-closed), never a quiet pass over what is missing.
         [ -f "$f" ] || { echo "ABORT: missing $f — the P1b surface this guard reads is not in this tree" >&2; exit 2; }
@@ -442,9 +452,29 @@ source_clauses() {
     has "$ROOT/kernel/storage_quota.c" "[STORAGE-QUOTA] Per-partition on-disk page usage/quota" || \
         bad "S12b. sys_sls_partition_storage_quota_list prints no [STORAGE-QUOTA] section — the usage the plan asserts on is unreadable"
 
+    # ── S13. the boot evidence's wiring: CI runs the live arm ──────────────
+    # A source clause cannot reboot anything — but it can insist that the job
+    # that CAN does. §10 step 2's gate IS the live arm; without this clause
+    # the reboot evidence runs only when someone runs it by hand, and the
+    # roadmap's "what this increment does not claim" line never retires.
+    # Two halves, each with its own name: the invocation (present at all)
+    # and its order after the ISO build — a boot guard ahead of its image
+    # aborts (exit 2) before booting, reddening for the wrong reason while
+    # proving nothing about the reboot.
+    if ! has "$CIW" "env_storage_durable_check.sh --live"; then
+        bad "S13. ci.yml never invokes this guard's live arm — the reboot evidence would run only by hand, and §10 step 2's gate would not be exercised on any push"
+    else
+        ok "S13. ci.yml invokes this guard's live arm (the durable region's reboot evidence is wired into CI)"
+        if order_ok "$CIW" "make X86_CC=gcc X86_LD=ld x86-iso" "env_storage_durable_check.sh --live"; then
+            ok "S13b. the live arm runs AFTER the ISO build — the boot guard finds its image instead of aborting before it"
+        else
+            bad "S13b. ci.yml's live arm does not run AFTER the ISO build — a boot guard ahead of its image aborts before booting and proves nothing about the reboot"
+        fi
+    fi
+
     if [ "$fail" -eq 0 ]; then
         echo
-        echo "env_storage_durable_check: every source clause held (S1-S12)."
+        echo "env_storage_durable_check: every source clause held (S1-S13)."
     else
         echo
         echo "env_storage_durable_check: source clauses FAILED."

@@ -975,6 +975,27 @@ jobs:
           echo "OK: kernel booted from the ISO and /api/health answered"
         working-directory: aerosls2
 
+      # P1b's gate (POSIX-Environments v0.2 §10, step 2): a file larger than
+      # 71 168 bytes survives a reboot and is charged to the partition. The
+      # guard's source clauses and its teeth run in `verify`; only THIS job
+      # has the ISO, so until this step the reboot evidence — write past the
+      # ceiling, checkpoint, in-place node reboot, re-read byte-identically
+      # through the environment's own console, quota re-charged, an
+      # over-quota write refused by the quota's own error — existed only
+      # from hand runs on a build host, which §5's second increment said
+      # plainly under "what this increment does not claim". The arm brings
+      # its own QEMU (host port from tests/free_port.sh, its own temp
+      # workdir and NVMe image), needs sls_operating_system.iso from the
+      # "Build the kernel ISO" step above, and runs HERE — after the cheap
+      # service smoke, so a kernel that does not boot is named by that step
+      # first and a durability regression is named by this one. The guard's
+      # own S13 clause pins this step's existence and its order after the
+      # ISO build, so deleting or reordering it reddens the guard rather
+      # than silently retiring the gate.
+      - name: P1b durable region live boot (write, reboot, re-read, quota)
+        run: bash tests/env_storage_durable_check.sh --live
+        working-directory: aerosls2
+
       # Phase 5 self-hosted gate: the ISO's serial log must carry the
       # driver-SDK demos' PASS lines ('irqtest] PASS' — LAPIC timer edges at
       # vector 32, and the serial port's IRQ4 at vector 36 through the
