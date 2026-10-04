@@ -25,12 +25,17 @@
 #
 # The guard has TWO halves this smoke exercises, plus its controls:
 #
-#   * the SOURCE clauses (S1-S12), proven by mutating a throwaway copy of
+#   * the SOURCE clauses (S1-S13), proven by mutating a throwaway copy of
 #     the tree that contains exactly the files the guard reads — plus the
 #     ten-file include closure its S11 host build needs, because S11 builds
 #     INSIDE the inspected root (aerofs_v2_check.sh's cargo rule). So the
 #     source teeth are proven on every push with no QEMU, no ISO, no build:
-#     only gcc.
+#     only gcc. Among them sit the WIRING teeth (S13/S13b): the guard's
+#     clause that CI's kernel-guards job runs the --live arm after its ISO
+#     build, and this smoke's proof that deleting that step, or ordering it
+#     ahead of its image, reddens the guard by that name — the gate that
+#     keeps the reboot evidence running on every push cannot retire
+#     silently.
 #   * the BOOT arm's validation (`--replay`), proven against a synthesized
 #     artifact set shaped exactly like what a live run records (identity,
 #     boot1/boot2 serial slices, the two console fingerprints, the four
@@ -110,6 +115,7 @@ SEED_FILES=(
     user/sidecar/src/boot.rs
     user/shell.c
     tests/env_storage_host_test.c
+    .github/workflows/ci.yml
 )
 
 seed() {   # seed <dir>
@@ -183,6 +189,59 @@ if [ "$rc" -eq 2 ] && printf '%s\n' "$out" | grep -q "^ABORT: missing "; then
     passed=$((passed + 1))
 else
     echo "FAIL: A. a missing file did not abort (exit $rc)"; echo "$out" | sed 's/^/      /'
+    failed=$((failed + 1))
+fi
+
+# ── B. The wiring of the BOOT evidence itself (S13/S13b) ───────────────────
+# (Always runs: the clause that keeps CI running the live arm must itself be
+# proven to bite when that step is deleted or reordered. No QEMU here — the
+# teeth are on the wiring text; the BOOT they guard is CI's own step.)
+# A missing ci.yml is a refusal to evaluate, like any other missing surface:
+seed "$W/w0"; rm -f "$W/w0/.github/workflows/ci.yml"
+out="$(bash "$GUARD" "$W/w0" 2>&1)"; rc=$?
+if [ "$rc" -eq 2 ] && printf '%s\n' "$out" | grep -q "^ABORT: missing "; then
+    echo "ok:   B. a missing .github/workflows/ci.yml aborts (exit 2) instead of reporting the wiring sound"
+    passed=$((passed + 1))
+else
+    echo "FAIL: B. a missing ci.yml did not abort (exit $rc)"; echo "$out" | sed 's/^/      /'
+    failed=$((failed + 1))
+fi
+
+# …the invocation deleted: the reboot evidence would retire silently, and
+# the guard must name S13 (and S13b alone must NOT fire — the elif chain
+# keeps the attribution as narrow as the mutation):
+seed "$W/w1"
+replace "$W/w1/.github/workflows/ci.yml" \
+    'run: bash tests/env_storage_durable_check.sh --live' \
+    'run: bash tests/env_storage_durable_check.sh'
+out="$(bash "$GUARD" "$W/w1" 2>&1)"; rc=$?
+if [ "$rc" -eq 1 ] && printf '%s\n' "$out" | grep -q "^FAIL: S13\." && \
+   ! printf '%s\n' "$out" | grep -q "^FAIL: S13b\."; then
+    echo "ok:   B1. ci.yml without the --live arm reddens S13 (and only it) — the gate cannot be deleted quietly"
+    passed=$((passed + 1))
+else
+    echo "FAIL: B1. a ci.yml missing the live arm did NOT bite narrowly — exit $rc (want 1 with 'FAIL: S13.' and no 'FAIL: S13b.')"
+    printf '%s\n' "$out" | sed 's/^/      /'
+    failed=$((failed + 1))
+fi
+
+# …the invocation ordered BEFORE the ISO build: S13 stays green (the step
+# exists) and S13b alone reddens — a boot guard ahead of its image aborts
+# before booting:
+seed "$W/w2"
+replace "$W/w2/.github/workflows/ci.yml" \
+    '- name: Build the kernel ISO (host gcc/ld as the toolchain)' \
+    '- name: P1b live arm before its ISO (the misorder S13b catches)
+        run: bash tests/env_storage_durable_check.sh --live
+      - name: Build the kernel ISO (host gcc/ld as the toolchain)'
+out="$(bash "$GUARD" "$W/w2" 2>&1)"; rc=$?
+if [ "$rc" -eq 1 ] && printf '%s\n' "$out" | grep -q "^FAIL: S13b\." && \
+   printf '%s\n' "$out" | grep -q "^ok:   S13\."; then
+    echo "ok:   B2. a live arm ordered before the ISO build reddens S13b while S13 holds green — the order half bites alone"
+    passed=$((passed + 1))
+else
+    echo "FAIL: B2. the reordered wiring did NOT bite as attributed — exit $rc (want 1, 'FAIL: S13b.', 'ok:   S13.')"
+    printf '%s\n' "$out" | sed 's/^/      /'
     failed=$((failed + 1))
 fi
 

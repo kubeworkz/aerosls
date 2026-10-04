@@ -940,6 +940,70 @@ kernel-guards boots the ISO for the format layer's guard; the boot evidence
 for the durable region itself is that arm. Migration of a durable store
 (P3) and snapshotting one are still out of scope, as §5's scope said.
 
+### Third increment — the boot evidence, on every push
+
+**What exists now.** The gate §10 names for step 2 — a file larger than
+71 168 bytes survives a reboot and is charged to the partition — is no
+longer something that ran by hand on a build host and was believed:
+`tests/env_storage_durable_check.sh --live` runs in CI's `kernel-guards`
+job (the build host that already has the ISO) and re-makes the whole
+evidence chain — write past the ceiling, checkpoint, in-place node reboot,
+re-read byte-identically through the environment's own console, quota
+re-charged, an over-quota write refused by the quota's own error — on
+every push.
+
+Landed, and verified:
+
+- **`.github/workflows/ci.yml` — the step.** "P1b durable region live
+  boot (write, reboot, re-read, quota)" runs the guard's `--live` arm
+  right after the service smoke: the cheap boot sanity names a kernel
+  that does not boot first, and this step names a durability regression
+  second. The arm brings its own QEMU (host port from
+  `tests/free_port.sh`, its own temp workdir and NVMe image), so it
+  neither collides with the job's other boots nor leaves state behind.
+- **`tests/env_storage_durable_check.sh` — clauses S13 and S13b.** The
+  guard now reads `.github/workflows/ci.yml` as part of its surface (a
+  missing one is the same exit-2 ABORT as any other missing file) and
+  pins two halves: ci.yml invokes the guard's `--live` arm at all (S13),
+  and the invocation sits AFTER the ISO build (S13b — a boot guard ahead
+  of its image aborts before booting, reddening for the wrong reason
+  while proving nothing about the reboot). A source clause cannot reboot
+  anything; it can insist that the job that can does.
+- **`tests/env_storage_durable_check_smoke.sh` — three wiring teeth.**
+  A missing ci.yml aborts (exit 2) instead of reporting the wiring
+  sound; deleting the `--live` step reddens S13 **and only S13** (the
+  guard's own `elif` keeps the attribution as narrow as the mutation);
+  ordering the step before the ISO build reddens S13b while S13 holds
+  green. The smoke is 15 checks now and still source-level — no QEMU,
+  no ISO, no build, only gcc.
+
+**The decisions this increment made**, and the reason for each:
+
+- **Pin the wiring where the guard that needs it lives.** Guards already
+  read ci.yml when the wiring is their own property
+  (`guard_port_band_check.sh` for the hostfwd ports,
+  `kernel_copy_matrix_check.sh` for wired sources); P1b's one CI-only
+  claim is this arm, so its clause sits with the rest of the guard's —
+  one file to read for everything the phase asserts.
+- **After the service smoke, not before it.** Both boot the same ISO;
+  running the cheap health check first means a boot failure is named by
+  the step whose whole job is that, and a durability failure by this
+  one. Attribution, not ordering convenience.
+- **Still not in `verify`.** The arm needs an ISO and QEMU; `verify`
+  proves the source clauses and every tooth (wiring teeth included),
+  kernel-guards runs the boot. The second increment's "does not claim"
+  paragraph above stays as written — it records what THAT increment
+  shipped; this one retires its conclusion only as far as CI is
+  concerned.
+
+**What this increment does not claim.** It does not make the arm faster
+or hermetic: it costs two boots of wall time inside kernel-guards (the
+job's long pole remains its own total), and it still fails closed with
+the artifacts directory printed for `--replay`. A hand run on a build
+host remains how an operator obtains a fresh artifacts directory.
+Migration of a durable store (P3) and snapshotting one remain out of
+scope, as §5's scope said.
+
 ---
 
 ## 6. Phase P2 — Networking inside environments
@@ -1058,7 +1122,7 @@ P1a is unblocked and is the thing E7 waits on, so it starts first. P2 has no dep
 | 2 | P1b — durable storage | a file larger than 71 168 bytes survives a reboot and is charged to the partition |
 | 3 | P3 — placement/migration/failover | an environment moves with its data, its console and its lease, or is refused by name |
 
-Step 2's two increments have both landed: the format layer — the writable aerofs v2 — first (§5), then the durable device itself — the extent band, the persisted directory and the first-touch quota charge (§5's second-increment addendum). What remains for the gate is the boot evidence: `tests/env_storage_durable_check.sh --live` on a build host (write past 71 168 bytes, reboot, re-read through the environment's console, quota re-charged, over-quota refused by the quota's own error). Step 1's gate is still open for the same reason §4 records (P1a's payload).
+Step 2's three increments have landed: the format layer — the writable aerofs v2 — first (§5), then the durable device itself — the extent band, the persisted directory and the first-touch quota charge (§5's second-increment addendum), then the boot evidence itself: `tests/env_storage_durable_check.sh --live` runs in CI's `kernel-guards` job — the build host that has the ISO — re-making the gate on every push (write past 71 168 bytes, reboot, re-read through the environment's console, quota re-charged, over-quota refused by the quota's own error), with the wiring pinned by the guard's S13 clause (§5's third-increment addendum). Step 1's gate is still open for the same reason §4 records (P1a's payload).
 
 E7's own gate — *"a static binary doing the first user's actual work, running natively, surviving a checkpoint/restore cycle"* — becomes reachable at the end of step 1 for the first half and the end of step 2 for the second, and E7's deliverable list (`AeroSLS-Linux-ABI-Shim-Design-v0.1.md` §10.4) is already written to report those halves separately rather than blur them.
 
@@ -1068,7 +1132,7 @@ E7's own gate — *"a static binary doing the first user's actual work, running 
 
 1. **P1b: is an environment's storage *a stream*, or its own LBA region?** *(Settled by P1b's second increment, §5: a **dedicated per-environment LBA extent band** — streams are fixed 64 MiB slots deliberately excluded from the storage quota, so a stream-backed store would get persistence at the cost of the phase's central requirement; the band reuses persist.c's checksummed-region story without inheriting a stream's semantics, and its extent is exactly the region it mirrors, page for page. The reasons are recorded in §5's second-increment addendum.)* A stream gains migration, quota and persistence for free (`stream_persist_directory()`, `stream_migrate_*`) but carries a stream's own size and directory semantics; a dedicated region is simpler to size per environment and duplicates the persistence story. This is the same class of choice v0.1 §14 Q2 left open (ramdisk sidecar vs in-process ramfs), and it was settled the way this question asked — by implementation, with the reasons written down.
 2. **P1a: is quiescing the whole partition the right granularity, or should an environment pause alone?** Today `partition_pause()` is the only pause mechanism, and it stops the tenant's other work too. If environments are the unit of checkpointing, a per-environment pause may be the correct primitive — but it is a new scheduling concept and it should be argued for rather than assumed.
-3. **P1b: does the durable format replace aerofs-lite or extend it?** *(Settled by P1b's first increment, §5: the rule is implemented as **read v1, write v2, refuse the rest by name** — v2 is a version bump, no existing image is rewritten, and the rootfs builder deliberately stays v1.)* The rule was written down before it was implemented, as this question asked; the durable region it is for is still owed.
+3. **P1b: does the durable format replace aerofs-lite or extend it?** *(Settled by P1b's first increment, §5: the rule is implemented as **read v1, write v2, refuse the rest by name** — v2 is a version bump, no existing image is rewritten, and the rootfs builder deliberately stays v1.)* The rule was written down before it was implemented, as this question asked; the durable region it is for landed with P1b's second increment (the extent band), and its reboot evidence is re-made in CI on every push since the third.
 4. **P2: what is a tenant partition's *recommended* connection quota?** The mechanism defaults to 0 = unlimited for backward compatibility; a fresh tenant that never opts in is exactly the starvation case `tcp_quota.h` documents. Should the environment-create path set a non-zero default as part of its budget, and if so, what number is defensible?
 5. **P3: failover destination (a) or (b)?** Bulk-transfer surviving environments during failover (the PASE-grade answer, a much larger lift) or restore them from their own durable storage on the survivor and report the gap by name (the smaller, consistent-with-`failover.c` first cut). The plan is written to admit either; the decision is a product one about what "a cluster that doesn't lose your environments" has to mean in this window.
 6. **§9's interop question.** Should a Linux-POSIX task be able to reach the SLS catalog or the integrated DB through a mediated service, and if so, is that service part of the sidecar it already talks to or a second kernel-brokered service in the `kernel.env.console` shape? This is the question that decides whether AeroSLS's POSIX environments are PASE-with-IFS or a sealed compatibility box, and it is deliberately left open here rather than answered by omission.
@@ -1095,7 +1159,8 @@ Everything this document asserts about the tree, with its source.
 | The directory is persisted through persist.c's own machinery (checksum, torn-write, pending bit 17), re-charges occupancy at boot, and refuses a foreign snapshot by name | `kernel/persist.h` — `PERSIST_ENVSTOR_HDR_LBA` 7720/7728, `PERSIST_MAGIC_ENV_STORAGE`, `PERSIST_PEND_ENVSTOR`; `kernel/persist.c` — `persist_env_storage()`, the restore block; `kernel/env_storage.c` — `env_storage_boot_reset()` |
 | Storage quota is charged to the store's OWN partition before any NVMe byte, with the denial printed by name and the pages reverted | `kernel/env_storage.c` — `es_charge_to()`, `[ENV-STORAGE] quota denied`; `kernel/storage_quota.h` — `storage_page_reserve()` |
 | The durable surface crosses the wire as four gated syscalls (323-326) and named statuses, and the tenant sees EDQUOT not EIO | `kernel/cap.c` — `sys_sls_env_storage_*`; `kernel/env_proto.h` / `user/proto/src/env_proto.rs` — `ENV_ERR_QUOTA` 7; `user/proto/src/lib.rs` — `RD_ERR_QUOTA` 9; `user/vfs/src/errno.rs` — `EDquot` 122 |
-| The kernel module is executed on the host, and the guard's teeth are proven (12 teeth across the four §5 tooth names) | `tests/env_storage_host_test.c` (32 checks); `tests/env_storage_durable_check.sh` + `tests/env_storage_durable_check_smoke.sh` |
+| The kernel module is executed on the host, and the guard's teeth are proven (15 teeth: the four §5 tooth names plus the third increment's S13 wiring teeth) | `tests/env_storage_host_test.c` (39 checks); `tests/env_storage_durable_check.sh` + `tests/env_storage_durable_check_smoke.sh` |
+| The reboot evidence runs in CI on every push — kernel-guards invokes the live arm after its ISO build, and the guard reddens BY NAME if that wiring is deleted or reordered | `.github/workflows/ci.yml` — the "P1b durable region live boot" step; `tests/env_storage_durable_check.sh` clauses S13/S13b, teeth B/B1/B2 in the smoke |
 | The kernel brokers a tenant-reachable service through a `kernel.*` name, keyed to `(partition, index)` | `kernel/env_console.h` — `env_console_register()`, `env_console_name_index()`; `kernel/env_service.c` (`kernel.env.control`) |
 | Per-partition connection quotas exist, with syscalls and an HTTP surface, and 0 means unlimited | `net/tcp_quota.h` — `tcp_conn_attribute()`, `tcp_partition_set_conn_quota()`, `SYS_SLS_PARTITION_CONN_QUOTA_SET/LIST`; `net/http.c` — `api_partition_connquotas_list()` |
 | The starvation failure mode the quota closes is documented, not assumed | `net/tcp_quota.h`'s "Why this is a genuinely different mechanism" block |
