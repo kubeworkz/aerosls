@@ -15,6 +15,7 @@ struct EnvConsole {
     uint16_t k_wr;       /* kernel (pid 0) CHAN_W — the environment's input  */
     uint32_t len;
     uint32_t dropped;
+    uint8_t  identity;    /* the boot [env-id] line seen since this wiring */
     uint8_t  buf[ENV_CONSOLE_BUF];
 };
 
@@ -121,6 +122,7 @@ int env_console_register(uint16_t k_rd, uint16_t k_wr, uint32_t partition,
     e->k_wr = k_wr;
     e->len = 0;
     e->dropped = 0;
+    e->identity = 0;   /* only THIS boot's announcement counts */
     kernel_serial_printf(
         "[ENV-CONSOLE] environment (partition %u, index %u) console wired: "
         "posix pid %u, kernel ends rd=%u wr=%u\n",
@@ -181,6 +183,23 @@ static void ec_push(struct EnvConsole* e, const uint8_t* data, uint32_t n) {
     e->len += n;
 }
 
+/* boot.rs step 4.5's announcement is ONE console.write of one line, so it
+ * arrives as one message starting with its marker. Scanned only on the drain
+ * path — the environment's OWN bytes entering this boot — so the captured
+ * stream a payload injects into the buffer can never pass as this boot's
+ * announcement. */
+static int ec_sees_identity(const uint8_t* b, uint32_t n) {
+    static const char marker[] = "[env-id]";
+    const uint32_t m = (uint32_t)(sizeof(marker) - 1);
+    if (!b || n < m) return 0;
+    for (uint32_t i = 0; i + m <= n; i++) {
+        uint32_t k = 0;
+        while (k < m && b[i + k] == (uint8_t)marker[k]) k++;
+        if (k == m) return 1;
+    }
+    return 0;
+}
+
 static void ec_release(struct EnvConsole* e) {
     uint16_t rd = e->k_rd;
     /* Revoke the kernel end of the output channel. The channel is shared with
@@ -191,6 +210,7 @@ static void ec_release(struct EnvConsole* e) {
     e->used = 0;
     e->len = 0;
     e->dropped = 0;
+    e->identity = 0;
     e->env_id = 0;
     e->pid = 0;
     e->k_rd = 0xFFFFu;
@@ -212,6 +232,8 @@ void env_console_tick(void) {
                                  &plen, 0, 0, &n_caps, &tag, &flags);
             if (r != 0) break;
             if (plen > sizeof(env_console_msg)) plen = sizeof(env_console_msg);
+            if (!e->identity && ec_sees_identity(env_console_msg, plen))
+                e->identity = 1;
             ec_push(e, env_console_msg, plen);
             env_console_drained_total++;
         }
@@ -324,6 +346,11 @@ int env_console_inject(uint32_t partition, uint32_t env_id,
     for (uint32_t i = 0; i < n; i++) e->buf[i] = bytes[i];
     e->len = n;
     return 1;
+}
+
+int env_console_identity_seen(uint32_t partition, uint32_t index) {
+    struct EnvConsole* e = ec_find(partition, index);
+    return (e && e->identity) ? 1 : 0;
 }
 
 uint32_t env_console_dropped(uint32_t partition, uint32_t env_id) {

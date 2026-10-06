@@ -617,15 +617,38 @@ int env_payload_wait_parked(const struct EnvCkptRecord* rec) {
     if (!rec) return 0;
     uint64_t deadline = kernel_tick_counter + EP_WAIT_TICKS;
     for (;;) {
-        int all_parked = 1;
+        /* Parked AND announced — parked alone is not the pour's go signal.
+         * A freshly replayed sidecar blocks mid-boot (the ramdisk RD_INFO
+         * handshake) in a posture this predicate cannot tell from the
+         * captured idle park, and pouring there replaces its half-finished
+         * boot with the captured state — after which boot.rs's [env-id] line
+         * can never be written by anyone, and the durable guard's post-
+         * reboot identity wait reads exactly that line out of this
+         * environment's console. The flag is set only by the drain of the
+         * sidecar's own bytes and cleared at wiring, so it can only come
+         * from THIS boot's announcement. The tasks loop runs first so a
+         * missing sidecar is still answered at once, and at capture time
+         * the flag has been set since boot (the record exists because the
+         * environment ran), so the pre-freeze wait is unchanged in
+         * practice. */
+        int ready = 1;
         for (uint32_t t = 0; t < rec->n_tasks && t < ENV_CKPT_MAX_TASKS; t++) {
             if (rec->tasks[t].kind == ENV_CKPT_TASK_LINUX) continue;
             struct ProcessDescriptor* pd = ep_find_proc(rec->tasks[t].name);
             if (!pd) return 0;                   /* nothing to wait for */
-            if (!ep_proc_parked(pd)) { all_parked = 0; break; }
+            if (!ep_proc_parked(pd)) { ready = 0; break; }
         }
-        if (all_parked) return 1;
-        if (kernel_tick_counter >= deadline) return 0;
+        if (ready && !env_console_identity_seen(rec->partition_id, rec->index))
+            ready = 0;
+        if (ready) return 1;
+        if (kernel_tick_counter >= deadline) {
+            kernel_serial_printf(
+                "[ENV_PAYLOAD] wait timed out (partition=%u index=%u): "
+                "announced=%d — proceeding on the posture as it stands\n",
+                (unsigned)rec->partition_id, (unsigned)rec->index,
+                env_console_identity_seen(rec->partition_id, rec->index));
+            return 0;
+        }
         kernel_yield_to_ring3(50);
     }
 }
