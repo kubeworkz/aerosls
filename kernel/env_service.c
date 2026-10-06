@@ -10,6 +10,7 @@
 #include "smp.h"
 #include "process.h"   /* E1: kernel_yield_to_ring3 (the unified boot's hand-over) */
 #include "checkpoint_mgr.h"   /* P1a: the checkpoint sequence a registration belongs to */
+#include "env_payload.h"     /* P1a: the payload pour that follows a replay */
 
 extern volatile uint64_t kernel_tick_counter;   /* ~10 ms per tick (net_event.c) */
 
@@ -315,6 +316,15 @@ int env_service_register_env(uint32_t partition, uint32_t index,
 // pass that bailed out there would leave a partition the snapshot had frozen
 // RUNNING, which is the restore side of the same failure the capture's quiesce
 // interval refuses (v0.2 §4's `leak-unpause` tooth).
+/* P1a payload: whether this pass pours the captured contents back after
+ * each replay. The restore route sets it on EVERY invocation (no sticky
+ * state across requests); every other caller sees the default, on. */
+static int es_restore_payload = 1;
+
+void env_service_set_restore_payload(int on) {
+    es_restore_payload = on ? 1 : 0;
+}
+
 int env_service_restore_pending(struct EnvSvcRestoreReport* out) {
     if (!out) return -1;
     out->n_pending   = env_ckpt_restore_pending();
@@ -323,6 +333,8 @@ int env_service_restore_pending(struct EnvSvcRestoreReport* out) {
     out->n_remaining = out->n_pending;
     out->n_resumed   = 0;
     out->n_repaused  = 0;
+    out->n_payloads      = 0;
+    out->n_payload_skips = 0;
 
     if (out->n_pending == 0) return 0;   /* nothing to replay is not a failure */
     // No manager, no attempt: refusing every record because init is not up yet
@@ -330,6 +342,12 @@ int env_service_restore_pending(struct EnvSvcRestoreReport* out) {
     if (!g_env_ready) return -1;
 
     uint32_t refused_before = env_ckpt_restore_refused();
+
+    /* What this pass replayed, so the payload pour below can run AFTER the
+     * repause — the pour must not yield, and yielding is only illegal from
+     * there on (env_payload.h's rule). */
+    struct { uint32_t p, idx, env_id; uint64_t seq; } done[ENV_CKPT_MAX];
+    uint32_t n_done = 0;
 
     while (env_ckpt_restore_pending() > 0) {
         uint32_t p = 0, idx = 0, old_id = 0;
@@ -389,6 +407,18 @@ int env_service_restore_pending(struct EnvSvcRestoreReport* out) {
 
         env_ckpt_restore_settle(p, idx);
         out->n_replayed++;
+        /* P1a payload: wait (bounded, yielding — legal here, inside the
+         * resume/repause interval) until this environment's sidecars have
+         * run to their parked idle point, which is the only posture the
+         * pour can restore into. A timeout is not a failure of the replay:
+         * the pour re-checks and refuses BY NAME if they never got there. */
+        if (es_restore_payload)
+            (void)env_payload_wait_parked(&w);
+        if (n_done < ENV_CKPT_MAX) {
+            done[n_done].p = p;      done[n_done].idx = idx;
+            done[n_done].env_id = new_id; done[n_done].seq = w.sequence;
+            n_done++;
+        }
         kernel_serial_printf(
             "[ENV_RESTORE] record (partition %u, index %u) replayed through "
             "create: env %u -> %u, identity intact\n",
@@ -400,6 +430,37 @@ int env_service_restore_pending(struct EnvSvcRestoreReport* out) {
     // `continue` was used, never `return`: see the comment at the top.
     out->n_resumed   = env_ckpt_restore_resumed();
     out->n_repaused  = env_ckpt_restore_repause();
+
+    /* P1a payload: pour the captured contents into every environment this
+     * pass replayed, now that each partition is back in the state the
+     * snapshot recorded. Straight-line and NO yield from here to the last
+     * memcpy (env_payload.h's rule): Ring-3 runs only while the control
+     * plane yields, so nothing can execute over the memory being poured. */
+    for (uint32_t d = 0; d < n_done; d++) {
+        if (!es_restore_payload) {
+            out->n_payload_skips++;
+            kernel_serial_printf(
+                "[ENV_PAYLOAD] restore asked for metadata only (partition %u, "
+                "index %u): the replay stands, the contents are withheld\n",
+                (unsigned)done[d].p, (unsigned)done[d].idx);
+            continue;
+        }
+        uint32_t pages = 0, cons = 0;
+        if (env_payload_restore(done[d].p, done[d].idx, done[d].env_id,
+                                done[d].seq, &pages, &cons) == 0) {
+            out->n_payloads++;
+        } else {
+            out->n_payload_skips++;
+            char why[96];
+            struct EnvPayloadRefusal pr = env_payload_last_refusal();
+            env_payload_refusal_text(&pr, why, (uint32_t)sizeof(why));
+            kernel_serial_printf(
+                "[ENV_PAYLOAD] contents not restored for (partition %u, "
+                "index %u): %s -- the replay stands; contents are not claimed\n",
+                (unsigned)done[d].p, (unsigned)done[d].idx, why);
+        }
+    }
+
     out->n_remaining = env_ckpt_restore_pending();
     out->n_refused   = env_ckpt_restore_refused() - refused_before;
 

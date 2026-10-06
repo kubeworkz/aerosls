@@ -280,7 +280,8 @@
 //   +1 frame safety gap, matching every other boundary in this file
 //   PERSIST_ENV_CKPT_HDR_LBA 7696 + 8  -> ends 7704   (header: count + record size + version)
 //   PERSIST_ENV_CKPT_ENT_LBA 7704 + 8  -> ends 7712   (env_ckpt_table[]: 8 x 368 B = 2,944 B)
-//   STREAM_DIR_LBA    8192                             -> 480 sectors / 60 frames still free
+//   PERSIST_ENVSTOR_* / PERSIST_ENV_PAYLOAD_* (below) -> ends 7760
+//   STREAM_DIR_LBA    8192                             -> 432 sectors / 54 frames still free
 //
 // One frame for the entry array is not a coincidence and not slack to be
 // spent: env_ckpt.c carries a _Static_assert that the whole array fits a
@@ -310,6 +311,24 @@
 // store is not.
 #define PERSIST_ENVSTOR_HDR_LBA         7720ULL
 #define PERSIST_ENVSTOR_ENT_LBA         7728ULL
+
+// ─── POSIX-Environments Roadmap v0.2, Phase P1a (environment payload) ──────
+// The payload directory (kernel/env_payload.h: 8 x 32 B entries keyed by
+// (partition, index), naming each environment's payload BAND SLOT) takes the
+// next two frames after P1b's directory, with the same 1-frame safety gaps:
+//
+//   PERSIST_ENVSTOR_ENT_LBA 7728 + 8 -> ends 7736
+//   +1 frame safety gap
+//   PERSIST_ENV_PAYLOAD_HDR_LBA 7744 + 8 -> ends 7752
+//   PERSIST_ENV_PAYLOAD_ENT_LBA 7752 + 8 -> ends 7760
+//   STREAM_DIR_LBA    8192                             -> 432 sectors still free
+//
+// The PAYLOAD itself is 5-ish MiB per environment and does not live here —
+// it lives in a band slot at ENV_PAYLOAD_SLOT_LBA(), right after P1b's
+// extent band (1 130 496), because a directory is a small record and a
+// payload is not. The same split as the P1b region above.
+#define PERSIST_ENV_PAYLOAD_HDR_LBA     7744ULL
+#define PERSIST_ENV_PAYLOAD_ENT_LBA     7752ULL
 
 // One-way format-version marker, written into PERSIST_ROWSTORE_HDR_LBA's/
 // PERSIST_VECSTORE_HDR_LBA's own header frame (the v2 field, previously

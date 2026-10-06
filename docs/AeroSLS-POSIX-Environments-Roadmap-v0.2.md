@@ -269,31 +269,35 @@ What this increment deliberately does **not** do, and what each still needs:
   writer now, and a pause an operator had set is restored as a pause.
 - **The payload.** The sidecars' page tables, mapped frames, register save areas
   and the console's buffered bytes are not captured; 1344 frames plus page tables
-  is a bulk area this phase has not placed yet.
+  is a bulk area this phase has not placed yet. Built in the sixth increment
+  below — the bulk band is placed, and the capture takes all four.
 - **Restore-through-create.** Built in the fourth increment below, at the
   DESCRIPTOR level: a boot's adopted records are replayed through the
   environment manager's own create path, and what comes back is checked against
   what was written down. What is still missing is the payload, so the
-  environment that comes back is empty.
+  environment that comes back is empty — closed by the sixth increment below,
+  at the DESCRIPTOR level unchanged: the pour is added *after* the replay, not
+  as a second create path.
 - **The verification plan above.** Written in the fourth increment below —
   `tests/env_checkpoint_restore_check.sh` with the four `P1A_TOOTH` teeth in its
   smoke — and its **boot arm** landed in the fifth: the guard now boots, creates
   an environment, checkpoints, reboots against the same NVMe image and replays
   it, and `P1A_TOOTH=no-restore` is run both as a recorded-artifact mutant and as
-  a live boot. What is still owed is the **payload** clauses — the file bytes and
-  the shell variable the plan's own text names — and the guard says so in its
-  header rather than passing silently: with no payload, "the file's bytes
-  survived" is not a fact this tree can measure yet.
+  a live boot. The **payload** clauses the plan's own text names — the file
+  bytes and the shell variable — landed in the sixth: B10/B11 are assertions
+  fed by the contents phase, not a `note:`.
 
 The honest summary: an environment's *identity, placement and structure* — the
 two sidecars by name, the three kind-labelled regions, the four messenger ends,
 the console binding, and where each sidecar was loaded — is now written into a
 persisted record by the very call that creates the environment, and is read back
 through a gate that refuses anything it cannot vouch for. What an environment
-*contains* — its files, its memory, the bytes its console has buffered — cannot
-survive a reboot yet, and neither can the record be turned back into a running
-environment. Both of those are the payload and restore increments; P1a is still
-not finished, and this addendum is still not a claim that it is.
+*contains* — its files, its memory, the bytes its console has buffered — could
+not survive a reboot when this section was written, and neither could the record
+be turned back into a running environment. Both of those are the payload and
+restore increments: the restore came in the fourth below, the payload in the
+sixth, and P1a's contents claim stands or falls on the live run of the arm that
+fifth and sixth built together.
 
 ### Third increment — the quiesce, and the pause that comes back
 
@@ -468,12 +472,12 @@ What this increment deliberately does **not** do:
   memory and its console's buffered bytes are not captured. The pass therefore
   counts a REPLAY, never a RESTORE. The fifth increment below gives the guard
   its boot arm, so "an environment came back, in the same partition, with the
-  pause that was recorded" is a measured fact as of now — but the plan's two
-  CONTENTS clauses (a file's bytes surviving, a shell variable set before the
-  reboot visible after it) are still owed, together with the boot-side mutations
-  for the other three tooth names. Until then, "the environment came back" is
-  measured and "the environment came back with its contents" is not, and the
-  guard's header says exactly that.
+  pause that was recorded" is a measured fact as of now — and the sixth closes
+  what this bullet owes: the plan's two CONTENTS clauses (a file's bytes
+  surviving, a shell variable set before the reboot visible after it) are B10
+  and B11 today, fed by the contents phase through the environment's own
+  console. The pass counts payloads poured (and skips reported by name) beside
+  its replays.
 - **An automatic replay at boot.** The pass is invoked by the operator (the
   route), not by the kernel at boot: driving an `ENV_CREATE` round trip needs
   init running, and "init is up" is not a boot step the kernel can observe from
@@ -522,9 +526,12 @@ artifacts (in the smoke, no QEMU) *and* as a live boot that withholds the
 `POST /api/env/restore` call entirely. Both take **B8 and nothing else** red:
 B6, B7 and B9 are notes under the tooth, because they are replay claims and
 there was no replay. That is the tooth the plan asked for — with no payload the
-DESCRIPTOR is the restore, so withholding it takes liveness red; when the payload
-lands B8 stays green under it and the contents clauses become the ones that go
-red.
+DESCRIPTOR is the restore, so withholding it takes liveness red. As of the
+sixth increment the tooth's target moved with it: it now withholds the PAYLOAD
+(`"payload":false`) through the same pass, B8 stays green under it (an empty
+environment is still an environment) and B10/B11 are what go red — the split
+§4's tooth list anticipated, and the reason the header's wording changed with
+the payload rather than around it.
 
 **What the first live runs had to be taught.** Each of these presented as a
 restore defect and was not one. They are recorded here because the boot arm is
@@ -706,13 +713,127 @@ the only thing that could have found any of them:
    fixture had happily carried the invented per-entry field for as long as the
    guard existed, which is the class of mistake only a real boot catches.
 
-The arm's own verdict, from its last green live run: `L1–L10` and `B1–B9`
-(9 artifact clauses), `replayed in 1 at index 2, with the recorded pause
-restored`; and from the live tooth, `B8` alone, with `B6`/`B7`/`B9` noted.
+The arm's own verdict, from its last green live run (the sixth increment's
+first): `L1–L11` and `B1–B11` (11 artifact clauses), `replayed in 1 at index 2,
+with the recorded pause restored`, `1 payload(s) poured and 0 skipped`, and the
+file and the variable read back through the environment's own console after the
+replay; and from the live tooth, `B1–B9` green with B7 naming the withholding
+(`payloads=0`, `payload_skips=1`) and exactly `B10`/`B11` red — two failures and
+nothing else, which is what makes the tooth attributable.
 
-**Still owed.** The payload, and with it the plan's two contents clauses. The
-guard says so in a `note:` on every run rather than letting a green arm be read
-as "the environment came back with its contents".
+### Sixth increment — the payload: the two CONTENTS clauses become assertions
+
+Everything before this increment measured the DESCRIPTOR: an environment came
+back, in the same partition, with the pause that was recorded — and it came back
+**empty**. The plan's two contents clauses (a file's bytes surviving, a shell
+variable set before the reboot visible after it) were printed as a `note:` on
+every run rather than asserted, because "the file's bytes survived" was not a
+fact this tree could measure. This increment makes it one, and the `note:` is
+gone: `B10` and `B11` are artifact clauses now, fed by `contents_pre.json` and
+`contents_post.json`, both written and read through the environment's **own
+console**.
+
+**The payload layer.** `kernel/env_payload.h` / `kernel/env_payload.c` carry it.
+Storage is a slot directory (`PERSIST_ENV_PAYLOAD_HDR_LBA` 7744 / `..._ENT_LBA`
+7752 in persist.c's small-record band, entries first then header, the same
+one-frame-each discipline) over an 8 MiB-slot bulk band
+(`ENV_PAYLOAD_DATA_LBA_BASE` 1130496, immediately after P1b's extent band — the
+"two mechanisms, one record" shape §4's scope asked for: the descriptor stays
+small, the bytes go to a bulk area it names). Magics `SLSPLOA1`/`SLSPBLO1`,
+version 1, per-page CRCs with the index's own CRC over them.
+
+**Captured frozen, inside the quiesce interval.** `persist_environments()` calls
+`env_payload_capture_all()` after the region commit and before
+`env_ckpt_release_capture()` — between the freeze and the release, so what the
+payload captured is what the checkpoint froze (clause T7 pins the line order).
+What it takes: the sidecars' mapped frames in the image window, each identity
+region's bytes (the shell's variable table lives in the POSIX sidecar's heap —
+a shell variable is *payload*, not metadata), each parked sidecar's save area
+(`CapParkCtx`, the nine qwords, plus the user rip/rsp), and the console's
+buffered bytes through a new **non-destructive** `env_console_snapshot()` — the
+existing `env_console_read()` drains the buffer, and capture must not consume
+what restore has to replay.
+
+**The freeze has to LAND on a parked posture.** The increment's first live run
+refused the pour with `EP_REFUSE_RUNNING`: the capture had recorded
+`ENV_PAYLOAD_FORM_RUNNING` for `drv.ramdisk.2` although the partition was
+frozen. Two facts were true at the same time. A sidecar that parks on a finite
+deadline (the ramdisk's 200 ms discovery poll) is mid-wake once a cycle; and a
+partition paused in that window cannot run it back into its park —
+`cap_park_deadline_tick` still fires from the timer ISR and marks the task
+runnable with `waiting_nchans` cleared, while `pick_next_partition` skips paused
+partitions, so for the whole freeze the capture reads a posture that is neither
+parked nor actually computing. Both halves are closed. The deadline tick now
+leaves a frozen partition's task parked — the timeout is delivered on the first
+tick after `partition_resume()`, one pause later, to a process whose world was
+frozen alongside it — and `persist_environments()` waits for each environment's
+sidecars to reach their idle point **before the first pause** (bounded,
+yielding, and legal there, because nothing is frozen yet), so the posture the
+capture records is the posture the freeze caught. That wait is best-effort by
+construction: a sidecar that never parks is captured as the mid-compute posture
+it really is, and the restore refuses it by name rather than pouring into it.
+
+**Poured after the repause, straight-line, onto the captured placement.** The
+restore pass records what it replayed, waits (bounded, yielding legally — this
+is inside the resume/repause interval) for the sidecars to be parked again, and
+then pours with **no yield between the first byte and the last**: Ring-3 runs
+only while the control plane yields, so a yield in the pour body would let the
+environment run on half-restored bytes. Two rules are load-bearing and both are
+source clauses: bytes move **only onto the captured placement** — a region whose
+base the replay moved is refused (`EP_REFUSE_PLACEMENT`) *before* a byte moves,
+because the sidecar's own allocator holds raw pointers into those regions — and
+the register half restores the park form only; boot-local channel ids are not
+resurrected, because they are per-boot and were never identity. Console bytes
+come back through `env_console_inject()` **under the new env_id**, so the first
+command the restored environment answers is its own history.
+
+**Reported by name.** The restore response carries `payloads` and
+`payload_skips`, and `POST /api/env/restore` takes `"payload":false` — a
+metadata-only replay that says what it withheld instead of passing silently.
+A pour that fails leaves the replay standing and logs
+`[ENV_PAYLOAD] contents not restored` — the honest state: an environment without
+its contents is not a restored environment, and nothing claims otherwise.
+
+**The clauses.** Source clause **T7** (capture inside the frozen window, the
+pre-freeze wait that lands the freeze on a parked posture, pour after the
+repause with no yield, the placement refusal, the knob and its route,
+the report fields, the console halves, `env_payload.c` linked, every host test
+that links `persist.c`/`env_service.c` resolving the payload symbols — linked
+via `tests/payload_host_stubs.h` where the test does not exercise them — and
+`tests/env_payload_host_test.c` driving the entry points); live clauses **L4b**
+(file written, variable set, both read back through the console *before* the
+checkpoint) and **L11** (the same two read back *after* the replay); artifact
+clauses **B10** (byte-identical) and **B11** (the variable set before is visible
+after) — the plan's two contents clauses, asserted.
+
+**The tooth changed meaning, as §4's tooth list anticipated.**
+`P1A_TOOTH=no-restore` no longer withholds the replay — it withholds the
+**payload** (`"payload":false` through the same pass). B8 (liveness) stays green
+because an empty environment is still an environment, and B10/B11 are what go
+red; B7 must report the withholding by name (`payloads=0`,
+`payload_skips≥1`). Withholding the descriptor now would prove nothing about
+the bytes it is the payload of. The source tooth group `P1A_TOOTH=payload`
+adds nine teeth over T7 — capture called outside the frozen window, a yield or
+a return between the repause and the pour, the knob and the report dropped, a
+host test left with unresolvable symbols, the placement refusal disabled, the
+console inject disabled, and the host test itself deleted (a claim, not a
+feature).
+
+`tests/env_payload_host_test.c` (43 checks: the round trip, the full refusal
+matrix — absent, format, sequence, placement, size, no process, running, not
+parked, no mapping, console, both CRC layers — the bounded wait, and the
+refusal text) links the real `kernel/env_payload.c`; the host suite runs 120
+tests green with it included; the guard's smoke runs 45 checks green including
+the new split (B8 green under the tooth while B10/B11 redden).
+
+**Still owed.** Nothing inside this increment: the live round trip with contents
+is measured — `--live` writes the file and sets the variable through the console
+before the checkpoint and reads both back after the replay — and so is its
+`no-restore` tooth arm, the last measurement §4's verification plan names. What
+remains beyond P1a is unchanged: the boot-side mutations for the other three
+tooth names at boot granularity (they are source teeth today), and per §11 Q2
+the question of whether an environment should pause alone rather than take its
+partition with it.
 
 ---
 
@@ -1122,7 +1243,7 @@ P1a is unblocked and is the thing E7 waits on, so it starts first. P2 has no dep
 | 2 | P1b — durable storage | a file larger than 71 168 bytes survives a reboot and is charged to the partition |
 | 3 | P3 — placement/migration/failover | an environment moves with its data, its console and its lease, or is refused by name |
 
-Step 2's three increments have landed: the format layer — the writable aerofs v2 — first (§5), then the durable device itself — the extent band, the persisted directory and the first-touch quota charge (§5's second-increment addendum), then the boot evidence itself: `tests/env_storage_durable_check.sh --live` runs in CI's `kernel-guards` job — the build host that has the ISO — re-making the gate on every push (write past 71 168 bytes, reboot, re-read through the environment's console, quota re-charged, over-quota refused by the quota's own error), with the wiring pinned by the guard's S13 clause (§5's third-increment addendum). Step 1's gate is still open for the same reason §4 records (P1a's payload).
+Step 2's three increments have landed: the format layer — the writable aerofs v2 — first (§5), then the durable device itself — the extent band, the persisted directory and the first-touch quota charge (§5's second-increment addendum), then the boot evidence itself: `tests/env_storage_durable_check.sh --live` runs in CI's `kernel-guards` job — the build host that has the ISO — re-making the gate on every push (write past 71 168 bytes, reboot, re-read through the environment's console, quota re-charged, over-quota refused by the quota's own error), with the wiring pinned by the guard's S13 clause (§5's third-increment addendum). Step 1's gate — an environment survives a reboot with its file and its shell variable, via its own console — is now measured rather than owed: the payload increment (§4's sixth) made the two CONTENTS clauses B10/B11 in the guard that already re-made the descriptor half, and the gate closes on that arm's first green live run.
 
 E7's own gate — *"a static binary doing the first user's actual work, running natively, surviving a checkpoint/restore cycle"* — becomes reachable at the end of step 1 for the first half and the end of step 2 for the second, and E7's deliverable list (`AeroSLS-Linux-ABI-Shim-Design-v0.1.md` §10.4) is already written to report those halves separately rather than blur them.
 
@@ -1161,6 +1282,10 @@ Everything this document asserts about the tree, with its source.
 | The durable surface crosses the wire as four gated syscalls (323-326) and named statuses, and the tenant sees EDQUOT not EIO | `kernel/cap.c` — `sys_sls_env_storage_*`; `kernel/env_proto.h` / `user/proto/src/env_proto.rs` — `ENV_ERR_QUOTA` 7; `user/proto/src/lib.rs` — `RD_ERR_QUOTA` 9; `user/vfs/src/errno.rs` — `EDquot` 122 |
 | The kernel module is executed on the host, and the guard's teeth are proven (15 teeth: the four §5 tooth names plus the third increment's S13 wiring teeth) | `tests/env_storage_host_test.c` (39 checks); `tests/env_storage_durable_check.sh` + `tests/env_storage_durable_check_smoke.sh` |
 | The reboot evidence runs in CI on every push — kernel-guards invokes the live arm after its ISO build, and the guard reddens BY NAME if that wiring is deleted or reordered | `.github/workflows/ci.yml` — the "P1b durable region live boot" step; `tests/env_storage_durable_check.sh` clauses S13/S13b, teeth B/B1/B2 in the smoke |
+| The payload rides a slot directory over an 8 MiB-slot bulk band placed after P1b's extent band, separate from the small-record descriptor | `kernel/env_payload.h` — `ENV_PAYLOAD_SLOT_SECTORS` 16384, `ENV_PAYLOAD_DATA_LBA_BASE` 1130496; `kernel/persist.h` — `PERSIST_ENV_PAYLOAD_HDR_LBA` 7744 / `..._ENT_LBA` 7752 |
+| The capture runs inside the frozen window and the pour runs after the repause with no yield, and a moved placement is refused before a byte moves | `kernel/persist.c` — `(void)env_payload_capture_all();` between the region commit and `env_ckpt_release_capture()`; `kernel/env_service.c` — `env_payload_wait_parked()` then `env_payload_restore()`; `kernel/env_payload.c` — `EP_REFUSE_PLACEMENT`; source clause T7 in `tests/env_checkpoint_restore_check.sh` |
+| A shell variable and the console's buffered bytes are payload, and both come back under the new boot's ids | `kernel/env_console.h` — `env_console_snapshot()`, `env_console_inject()`; `tests/env_payload_host_test.c` (43 checks, round trip plus the full refusal matrix) |
+| The two CONTENTS clauses are assertions fed through the environment's own console, and the tooth withholds the payload rather than the descriptor | `tests/env_checkpoint_restore_check.sh` — clauses B10/B11, live clauses L4b/L11, T7; `tests/env_checkpoint_restore_check_smoke.sh` — the `payload` tooth group (9 teeth) and the `no-restore` split |
 | The kernel brokers a tenant-reachable service through a `kernel.*` name, keyed to `(partition, index)` | `kernel/env_console.h` — `env_console_register()`, `env_console_name_index()`; `kernel/env_service.c` (`kernel.env.control`) |
 | Per-partition connection quotas exist, with syscalls and an HTTP surface, and 0 means unlimited | `net/tcp_quota.h` — `tcp_conn_attribute()`, `tcp_partition_set_conn_quota()`, `SYS_SLS_PARTITION_CONN_QUOTA_SET/LIST`; `net/http.c` — `api_partition_connquotas_list()` |
 | The starvation failure mode the quota closes is documented, not assumed | `net/tcp_quota.h`'s "Why this is a genuinely different mechanism" block |
@@ -1190,6 +1315,7 @@ Everything this document asserts about the tree, with its source.
 | No environment in the checkpoint region set | every environment dies on reboot; E7 cannot pass its gate (§8) | P1a |
 | No quiesce before capture | a checkpoint of two sidecars is internally inconsistent | P1a |
 | No descriptor version/checksum/refusal | a stale checkpoint is half-applied instead of refused | P1a |
+| The payload is never captured or poured — a replayed environment comes back empty | the file-bytes and shell-variable clauses cannot be asserted; "the environment came back" is measured but "came back with its contents" is not | P1a (sixth increment) |
 | Environment storage is a RAM region | files do not survive reboot; the durable-storage claim is false | P1b |
 | aerofs-lite is read-only with a 71 168-byte file cap | a durable tenant filesystem would ship an unusable ceiling | P1b |
 | Durable storage is not quota-charged to the partition | a tenant's disk is unbounded and unmetered | P1b |

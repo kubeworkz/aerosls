@@ -70,6 +70,7 @@
  *   /tmp/env_service_wait_host_test
  */
 #include "kernel/cap.h"
+#include "tests/payload_host_stubs.h"  /* P1a payload: persist.c/env_service.c call env_payload_* */
 #include "kernel/env_proto.h"
 #include "kernel/env_service.h"
 #include "kernel/env_ckpt.h"      /* P1a: the record the create path registers */

@@ -203,6 +203,7 @@ X86_C_SRC   = kernel/kernel.c arch/x86/idt.c arch/x86/gdt.c arch/x86/vga.c kerne
               kernel/checkpoint_delta.c \
               kernel/env_ckpt.c \
               kernel/env_storage.c \
+              kernel/env_payload.c \
               kernel/state_tree.c \
               kernel/failover.c \
               drivers/nvme_io.c \

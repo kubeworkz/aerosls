@@ -19,6 +19,7 @@
  *   /tmp/sql_null_phase4_host_test
  */
 #include "kernel/object_catalog.h"
+#include "tests/payload_host_stubs.h"  /* P1a payload: persist.c/env_service.c call env_payload_* */
 #include "kernel/loader.h"
 #include "kernel/vecstore.h"
 #include "kernel/vec_index.h"

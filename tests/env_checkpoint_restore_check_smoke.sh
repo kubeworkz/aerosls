@@ -1,14 +1,22 @@
 #!/usr/bin/env bash
 # tests/env_checkpoint_restore_check_smoke.sh — the TEETH for
-# tests/env_checkpoint_restore_check.sh, and the four teeth v0.2 §4 names:
+# tests/env_checkpoint_restore_check.sh, and the teeth v0.2 §4 names plus the
+# payload group the sixth increment added:
 #
-#   P1A_TOOTH=no-restore        — the replay is skipped, or stops creating
+#   P1A_TOOTH=no-restore        — the replay runs, the payload does not (the
+#                                 create makes an environment; the CONTENTS
+#                                 are withheld)
 #   P1A_TOOTH=stale-descriptor  — a record that no longer describes the
 #                                 environment the create made is accepted
 #   P1A_TOOTH=leak-unpause      — a pause a restore stepped out of is not put
 #                                 back (or the snapshot's pause is, too early)
 #   P1A_TOOTH=dirty-capture     — a record captured without a quiesce is
 #                                 replayed anyway
+#   P1A_TOOTH=payload           — the payload's own wiring: captured outside
+#                                 the frozen window, poured before the repause
+#                                 or with a yield in it, the metadata-only knob
+#                                 or the payloads report missing, a host test
+#                                 left unresolvable, an entry point undriven
 #
 # ─── What a teeth smoke is for, and why this one is source-level ──────────
 # A guard that has never been seen to fail is a guard nobody can trust. Each
@@ -18,40 +26,28 @@
 # reddened on everything, or on the wrong clause, would pass a tooth that only
 # checked the exit code.
 #
-# The teeth are source mutations rather than boot-time ones because the restore
-# has a half that does not exist yet: the PAYLOAD. The environment that comes
-# back is empty (its files, its memory and its console's buffered bytes are not
-# captured — see tests/env_checkpoint_restore_check.sh's header), so the
-# roadmap's payload clauses (a file's bytes survive a reboot, a shell variable
-# set before it is visible after it) cannot be asserted yet. What CAN be
-# asserted today is that the replay and its four refusals are wired the way
-# they are written — which is what the source groups below prove, on every
-# push, with no QEMU — and, since the fifth increment, that the BOOT ARM's
-# artifact half has teeth: the guard's --replay validator is run here over a
-# synthesized well-formed recorded run with exactly one mutation at a time, so
-# B1-B9 are each proven to bite without a boot. The last arm of that section is
-# the live tooth: a recorded run with the replay withheld and the tooth named,
-# where B8 must go red and nothing else. What is still owed is the payload
-# clauses and the boot-side mutations of the other three tooth names; the four
-# names stay.
+# The teeth are source mutations rather than boot-time ones so that every push
+# proves them with no QEMU and no build: the replay and its four refusals, the
+# payload's capture/pour wiring, and — since the fifth increment — the BOOT
+# ARM's artifact half as well: the guard's --replay validator is run here over
+# a synthesized well-formed recorded run with exactly one mutation at a time,
+# so B1-B11 are each proven to bite without a boot. That fixture is where
+# P1A_TOOTH=no-restore is proven too: the recorded run is a REPLAYED
+# environment whose payload was withheld (restore.json payloads=0,
+# payload_skips=1, and a contents_post that read nothing back), where B8 must
+# stay GREEN and B10/B11 must be the only clauses red — the tooth's split,
+# on every push, with no QEMU and no build. What is still owed is the
+# boot-side mutations of the other tooth names; the names stay.
 #
 # The guard has TWO halves and this smoke has a section for each:
 #
-#   * the SOURCE clauses (T1-T6) — proven by mutating a throwaway copy of the
+#   * the SOURCE clauses (T1-T7) — proven by mutating a throwaway copy of the
 #     tree that contains exactly the files the guard reads;
 #   * the BOOT arm's validation (`--replay`) — proven against a synthesized
 #     artifact set, the same one a live run records (identity.json, the two
-#     boot logs, the checkpoint/pause/restore answers and the three HTTP
-#     snapshots). That is where P1A_TOOTH=no-restore is proven to bite: the
-#     live tooth withholds the replay, and the withheld run's evidence is
-#     exactly a set with no restore.json and no [ENV_RESTORE] line — so the arm
-#     below IS the tooth, run on every push with no QEMU and no build.
-#
-#     That fixture has to be FAITHFUL, and it was the live tooth run that proved
-#     it: the first version kept boot2.log's [ENV_RESTORE] lines, which a
-#     withheld replay cannot produce, so the arm passed while the live run took
-#     B6 red alongside B8. The fixture now strips them, the same way the run
-#     does.
+#     boot logs, the checkpoint/pause/restore answers, the three HTTP
+#     snapshots and the two CONTENTS transcripts). That is where every B
+#     clause, the CONTENTS ones included, is proven to bite.
 #
 # The hermetic seam for the source half is the guard's own optional root
 # argument: it inspects a repository root, defaulting to its own parent. So
@@ -77,8 +73,8 @@ GUARD="$ROOT/tests/env_checkpoint_restore_check.sh"
 
 TOOTH_SET="${1:-${P1A_TOOTH:-}}"
 case "$TOOTH_SET" in
-    ""|no-restore|stale-descriptor|leak-unpause|dirty-capture) ;;
-    *) echo "ABORT: unknown P1A_TOOTH='$TOOTH_SET' — expected no-restore, stale-descriptor, leak-unpause or dirty-capture" >&2; exit 2 ;;
+    ""|no-restore|stale-descriptor|leak-unpause|dirty-capture|payload) ;;
+    *) echo "ABORT: unknown P1A_TOOTH='$TOOTH_SET' — expected no-restore, stale-descriptor, leak-unpause, dirty-capture or payload" >&2; exit 2 ;;
 esac
 want_tooth() { [ -z "$TOOTH_SET" ] || [ "$TOOTH_SET" = "$1" ]; }
 
@@ -95,8 +91,14 @@ SEED_FILES=(
     kernel/env_service.h
     kernel/env_service.c
     kernel/persist.c
+    kernel/env_payload.h
+    kernel/env_payload.c
+    kernel/env_console.h
+    kernel/env_console.c
     net/http.c
     tests/partition_host_stubs.h
+    tests/payload_host_stubs.h
+    Makefile
 )
 
 seed() {   # seed <dir>
@@ -284,6 +286,71 @@ else
     skipped=$((skipped + 1))
 fi
 
+# ── P1A_TOOTH=payload ─────────────────────────────────────────────────────
+# The sixth increment's wiring, one broken property each: the capture outside
+# the frozen window, the pour out of order (or with a yield or a bail-out
+# between the repause and the first memcpy), the metadata-only knob gone from
+# the route, the report the validator's B7 reads gone from the response, a host
+# test left unable to resolve the payload symbols, the placement refusal
+# deleted, the console inject cut, and an entry point nothing drives.
+if want_tooth payload; then
+    seed "$W/p1"
+    sed -i '/(void)env_payload_capture_all();/d' "$W/p1/kernel/persist.c"
+    tooth payload T7 "the payload capture is no longer called inside the quiesce interval" "$W/p1"
+
+    seed "$W/p2"
+    python3 - "$W/p2/kernel/env_service.c" <<'PY'
+import sys
+p = sys.argv[1]
+lines = open(p).read().split("\n")
+i = next(i for i, l in enumerate(lines) if "out->n_repaused  = env_ckpt_restore_repause();" in l)
+# A yield planted between the repause and the pour — Ring-3 would resume over
+# memory the pour is about to overwrite.
+lines[i + 1:i + 1] = ["    kernel_yield_to_ring3(1);"]
+open(p, "w").write("\n".join(lines))
+PY
+    tooth payload T7 "a yield between the repause and the pour (the pour is no longer straight-line)" "$W/p2"
+
+    seed "$W/p3"
+    python3 - "$W/p3/kernel/env_service.c" <<'PY'
+import sys
+p = sys.argv[1]
+lines = open(p).read().split("\n")
+i = next(i for i, l in enumerate(lines) if "out->n_repaused  = env_ckpt_restore_repause();" in l)
+# A bail-out after the pause is back but before anything is poured: every
+# replayed environment would come back empty with a clean report.
+lines[i + 1:i + 1] = ["    return 0;"]
+open(p, "w").write("\n".join(lines))
+PY
+    tooth payload T7 "a return between the repause and the pour (replays that are never filled)" "$W/p3"
+
+    seed "$W/p4"
+    sed -i '/env_service_set_restore_payload(with_payload);/d' "$W/p4/net/http.c"
+    tooth payload T7 "the route lost the metadata-only knob (the tooth could not withhold the payload)" "$W/p4"
+
+    seed "$W/p5"
+    sed -i '/jb_uint(&j,"payload_skips", rep.n_payload_skips);/d' "$W/p5/net/http.c"
+    tooth payload T7 "the response no longer reports payload_skips (a skip is indistinguishable from a pour)" "$W/p5"
+
+    seed "$W/p6"
+    sed -i '/payload_host_stubs.h/d' "$W/p6/tests/mvcc_host_test.c"
+    tooth payload T7 "a host test links persist.c with neither env_payload.c nor the stub header (unresolvable symbols)" "$W/p6"
+
+    seed "$W/p7"
+    sed -i 's/EP_REFUSE_PLACEMENT/EP_REFUSE_NONE/g' "$W/p7/kernel/env_payload.c"
+    tooth payload T7 "the pour no longer refuses a moved placement (bytes would move before the rule)" "$W/p7"
+
+    seed "$W/p8"
+    sed -i 's/env_console_inject(/env_console_inject_DISABLED(/g' "$W/p8/kernel/env_payload.c"
+    tooth payload T7 "the restore never injects the buffered console bytes under the new env_id" "$W/p8"
+
+    seed "$W/p9"
+    rm -f "$W/p9/tests/env_payload_host_test.c"
+    tooth payload T7 "the payload entry points are exercised by no host test (a claim, not a feature)" "$W/p9"
+else
+    skipped=$((skipped + 1))
+fi
+
 # ═══ The boot arm's teeth: the artifact validation half, no QEMU ══════════
 # The set below is what a live run records (the guard's own file names and
 # shapes); a mutation here is the same class of mistake as a wrong boot, and
@@ -316,7 +383,7 @@ LOG
 [ENV_RESTORE] 1 pending, 1 replayed, 0 refused, 0 still pending (1 partition(s) resumed for a create, 1 re-paused).
 LOG
     cat > "$d/restore.json" <<'JSON'
-{"ok":"true","pending":1,"replayed":1,"refused":0,"remaining":0,"resumed":1,"repaused":1}
+{"ok":"true","pending":1,"replayed":1,"refused":0,"remaining":0,"resumed":1,"repaused":1,"payloads":1,"payload_skips":0}
 JSON
     cat > "$d/partitions_pre.json" <<'JSON'
 {"ok":"true","partitions":[{"id":1,"name":"p1arestore","paused":true}]}
@@ -334,6 +401,16 @@ JSON
 JSON
     cat > "$d/processes.json" <<'JSON'
 {"ok":"true","processes":[{"pid":77,"name":"aerosls.posix.2","partition_id":1}]}
+JSON
+    # The CONTENTS evidence, exactly what the live arm records: both claims
+    # read back through the environment's own console, before and after the
+    # reboot. A well-formed run has them EQUAL and non-empty — the pair an
+    # empty replay can never produce.
+    cat > "$d/contents_pre.json" <<'JSON'
+{"file_bytes":"P1A-FILE-7f3a9c01","ok":true,"var_value":"P1A-VAR-b19e0203"}
+JSON
+    cat > "$d/contents_post.json" <<'JSON'
+{"file_bytes":"P1A-FILE-7f3a9c01","ok":true,"var_value":"P1A-VAR-b19e0203"}
 JSON
 }
 
@@ -363,25 +440,27 @@ else
 fi
 
 # ── P1A_TOOTH=no-restore: the requested mutant ────────────────────────────
-# What the live tooth leaves behind: the whole run, minus the replay. The
-# liveness clause must be the ONLY thing that goes red — the tooth is
-# attributable, or it proves nothing.
+# What the live tooth leaves behind: the WHOLE replay — create, identity,
+# liveness, pause — with only the payload withheld (restore.json payloads=0,
+# payload_skips=1) and a contents read that saw nothing come back. The split
+# that must hold: B10 and B11 (the CONTENTS clauses) red, B8 (liveness) GREEN,
+# and nothing else — an attributable tooth, or it proves nothing.
 cp -a "$W/art-good" "$W/art-tooth"
-rm -f "$W/art-tooth/restore.json"
-# A withheld replay writes no [ENV_RESTORE] line either, so the fixture must not
-# carry one: this is the difference between "the tooth is attributable" and "the
-# fixture happened to keep a line a withholding boot cannot produce". Without
-# this the B6 note and the B6 failure are indistinguishable here (the first live
-# tooth run took B6 red alongside B8 for exactly that reason).
-sed -i '/\[ENV_RESTORE\]/d' "$W/art-tooth/boot2.log"
+printf '{"ok":"true","pending":1,"replayed":1,"refused":0,"remaining":0,"resumed":1,"repaused":1,"payloads":0,"payload_skips":1}\n' > "$W/art-tooth/restore.json"
+# The post-replay console read of a payload-withheld environment: the file and
+# the variable are simply not there (empty fields — the live arm's transcript
+# would be empty too, and contents_write records exactly this).
+printf '{"file_bytes":"","ok":true,"var_value":""}\n' > "$W/art-tooth/contents_post.json"
 printf 'no-restore\n' > "$W/art-tooth/tooth.txt"
 out="$(bash "$GUARD" --replay "$W/art-tooth" 2>&1)"; rc=$?
-if [ "$rc" -eq 1 ] && printf '%s\n' "$out" | grep -q "^FAIL: B8\." && \
-   [ "$(printf '%s\n' "$out" | grep -c '^FAIL: ')" -eq 1 ]; then
-    echo "ok:   P1A_TOOTH=no-restore: withholding the replay takes B8 (the liveness clause) red, and nothing else"
+if [ "$rc" -eq 1 ] && printf '%s\n' "$out" | grep -q "^FAIL: B10\." && \
+   printf '%s\n' "$out" | grep -q "^FAIL: B11\." && \
+   ! printf '%s\n' "$out" | grep -q "^FAIL: B8\." && \
+   [ "$(printf '%s\n' "$out" | grep -c '^FAIL: ')" -eq 2 ]; then
+    echo "ok:   P1A_TOOTH=no-restore: withholding the payload takes B10 and B11 (the CONTENTS clauses) red while B8 stays green, and nothing else"
     passed=$((passed + 1))
 else
-    echo "FAIL: P1A_TOOTH=no-restore did NOT bite B8 alone — exit $rc"
+    echo "FAIL: P1A_TOOTH=no-restore did NOT bite B10+B11 alone (B8 must stay green) — exit $rc"
     printf '%s\n' "$out" | sed 's/^/      /'
     failed=$((failed + 1))
 fi
@@ -405,7 +484,7 @@ boot_tooth "B5: the reboot restored records but re-applied no pause" B5 "$W/art-
 cp -a "$W/art-good" "$W/art-b6"; sed -i '/replayed through create/d' "$W/art-b6/boot2.log"
 boot_tooth "B6: the replay left no identity-intact line (it never re-registered)" B6 "$W/art-b6"
 
-cp -a "$W/art-good" "$W/art-b7"; printf '{"ok":"true","pending":1,"replayed":0,"refused":0,"remaining":1,"resumed":1,"repaused":1}\n' > "$W/art-b7/restore.json"
+cp -a "$W/art-good" "$W/art-b7"; printf '{"ok":"true","pending":1,"replayed":0,"refused":0,"remaining":1,"resumed":1,"repaused":1,"payloads":1,"payload_skips":0}\n' > "$W/art-b7/restore.json"
 boot_tooth "B7: a pass that replayed nothing and says so" B7 "$W/art-b7"
 
 cp -a "$W/art-good" "$W/art-b8"; printf '{"ok":"true","partition":1,"envs":[]}\n' > "$W/art-b8/envlist.json"
@@ -425,8 +504,30 @@ boot_tooth "B8: the returned environment is listed under a different partition" 
 cp -a "$W/art-good" "$W/art-b9"; printf '{"ok":"true","partitions":[{"id":1,"name":"p1arestore","paused":false}]}\n' > "$W/art-b9/partitions_post.json"
 boot_tooth "B9: the pass resumed for the create and never put the pause back" B9 "$W/art-b9"
 
-cp -a "$W/art-good" "$W/art-b9b"; printf '{"ok":"true","pending":1,"replayed":1,"refused":0,"remaining":0,"resumed":0,"repaused":0}\n' > "$W/art-b9b/restore.json"
+cp -a "$W/art-good" "$W/art-b9b"; printf '{"ok":"true","pending":1,"replayed":1,"refused":0,"remaining":0,"resumed":0,"repaused":0,"payloads":1,"payload_skips":0}\n' > "$W/art-b9b/restore.json"
 boot_tooth "B9: a pass that never stepped out of the recorded pause" B9 "$W/art-b9b"
+
+# ── The CONTENTS clauses, one mutation each ───────────────────────────────
+# B10/B11 read the pair of transcripts the live arm records through the
+# environment's own console. Each mutation below is one way the claim can be
+# false, and each must redden exactly its own clause.
+cp -a "$W/art-good" "$W/art-b10"; printf '{"file_bytes":"P1A-FILE-d1fferent","ok":true,"var_value":"P1A-VAR-b19e0203"}\n' > "$W/art-b10/contents_post.json"
+boot_tooth "B10: the file came back with different bytes" B10 "$W/art-b10"
+
+cp -a "$W/art-good" "$W/art-b10b"; printf '{"file_bytes":"","ok":true,"var_value":"P1A-VAR-b19e0203"}\n' > "$W/art-b10b/contents_post.json"
+boot_tooth "B10: the file came back with nothing at all" B10 "$W/art-b10b"
+
+cp -a "$W/art-good" "$W/art-b10c"; printf '{"file_bytes":"","ok":true,"var_value":"P1A-VAR-b19e0203"}\n' > "$W/art-b10c/contents_pre.json"
+boot_tooth "B10: a pre-checkpoint read that recorded no bytes (an empty pair must not pass as equal)" B10 "$W/art-b10c"
+
+cp -a "$W/art-good" "$W/art-b11"; printf '{"file_bytes":"P1A-FILE-7f3a9c01","ok":true,"var_value":"P1A-VAR-0dd0000d"}\n' > "$W/art-b11/contents_post.json"
+boot_tooth "B11: the shell variable came back as a different value" B11 "$W/art-b11"
+
+cp -a "$W/art-good" "$W/art-b11b"; printf '{"file_bytes":"P1A-FILE-7f3a9c01","ok":true,"var_value":""}\n' > "$W/art-b11b/contents_post.json"
+boot_tooth "B11: the shell variable is not visible after the replay" B11 "$W/art-b11b"
+
+cp -a "$W/art-good" "$W/art-b11c"; rm -f "$W/art-b11c/contents_post.json"
+boot_tooth "B11: the run never recorded the contents evidence" B11 "$W/art-b11c"
 
 # ── The vacuity control ───────────────────────────────────────────────────
 # The guard must be GREEN on the untouched tree. Without this arm, a guard that

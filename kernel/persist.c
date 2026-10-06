@@ -28,6 +28,7 @@
 #include "service_registry.h"   // Orchestration Plan Phase 4 -- services_registry[]
 #include "workload.h"            // Orchestration Plan Phase 5 -- workloads[]           // Multitenant Isolation Gap Analysis §5 item 1 -- tenants[]/tenant_next_id
 #include "env_ckpt.h"            // POSIX-Environments v0.2 Phase P1a -- env_ckpt_table[]
+#include "env_payload.h"        // POSIX-Environments v0.2 Phase P1a -- the payload capture
 #include "env_storage.h"         // POSIX-Environments v0.2 Phase P1b -- env_storage_table[]
 #include "checkpoint_delta.h"    // Step 4: incremental dirty tracking
 #include "../drivers/nvme_io.h"
@@ -1147,6 +1148,28 @@ void persist_environments(void) {
     // is deliberately straight-line: no early return may be added between the
     // quiesce and its release, or a failed capture would leave a tenant frozen
     // with nothing on disk to show for it (v0.2 §4's `leak-unpause` tooth).
+    //
+    // P1a payload: the freeze has to LAND on a parked posture, so the sidecars
+    // are given their idle point to reach while their partition still runs,
+    // before the first pause. A sidecar that parks on a finite deadline (the
+    // ramdisk's 200 ms discovery poll) is mid-wake once a cycle, and a partition
+    // paused in that window never runs it back into its park: the capture would
+    // record ENV_PAYLOAD_FORM_RUNNING for it and the restore would refuse the
+    // pour by name (EP_REFUSE_RUNNING) -- the live arm's failure this closes.
+    // Bounded and yielding, which is legal here (nothing is frozen yet), and
+    // best-effort: a sidecar that never parks is captured as the mid-compute
+    // posture it really is. Only records this quiesce would actually freeze are
+    // waited for -- PARTITION_SYSTEM's never pauses, a missing partition is
+    // dropped below, and a partition an operator already paused cannot run its
+    // sidecars into a park at all (waiting would only burn the bound).
+    for (uint32_t i = 0; i < env_ckpt_count; i++) {
+        const struct EnvCkptRecord* rec = &env_ckpt_table[i];
+        uint32_t p = rec->partition_id;
+        if (!partition_exists(p) || p == PARTITION_SYSTEM) continue;
+        if (partition_is_paused(p)) continue;
+        (void)env_payload_wait_parked(rec);
+    }
+
     struct EnvCkptQuiesce q;
     env_ckpt_quiesce_for_capture(&q);
 
@@ -1156,6 +1179,15 @@ void persist_environments(void) {
               ENV_CKPT_REC_VERSION);
     persist_write_array(env_ckpt_table, bytes, PERSIST_ENV_CKPT_ENT_LBA);
     persist_region_commit();
+
+    // P1a payload: capture the sidecars' mapped frames, their park save
+    // areas and the console's buffered bytes while the quiesce above still
+    // holds them frozen — a page-walk of a running sidecar would describe a
+    // moving target, which is the whole reason the quiesce exists. Still
+    // inside the straight-line interval: a payload I/O failure logs and
+    // skips (the record above already landed), it never returns early and
+    // never keeps a tenant frozen.
+    (void)env_payload_capture_all();
 
     // Un-freeze exactly the partitions THIS capture froze -- never one an
     // operator had already paused (rule 1). Safe and required even if the

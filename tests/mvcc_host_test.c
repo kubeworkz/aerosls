@@ -28,6 +28,7 @@
  * header comments) and every scenario below still passes unchanged.
  */
 #include "kernel/object_catalog.h"
+#include "tests/payload_host_stubs.h"  /* P1a payload: persist.c/env_service.c call env_payload_* */
 #include "kernel/loader.h"
 #include "kernel/partition.h"
 #include "tests/partition_host_stubs.h"  /* P1a quiesce: env_ckpt.c calls partition_pause/_resume/_is_paused/_exists */
