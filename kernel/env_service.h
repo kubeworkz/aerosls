@@ -118,8 +118,21 @@ struct EnvSvcRestoreReport {
     uint32_t n_remaining;  /* still pending when the pass ended */
     uint32_t n_resumed;    /* paused partitions stepped out of for a replay */
     uint32_t n_repaused;   /* ...and put back paused by the same pass */
+    uint32_t n_payloads;   /* replays whose CONTENTS were poured back (P1a) */
+    uint32_t n_payload_skips; /* replays that came back empty, each named in
+                               * the serial log — absent payload, a named
+                               * refusal, or a metadata-only request */
 };
 
 int env_service_restore_pending(struct EnvSvcRestoreReport* out);
+
+/* P1a payload: the restore route's `"payload": false` knob — a
+ * METADATA-ONLY restore brings the environment back without its captured
+ * memory (an empty environment, replay counted as replay). This is also
+ * the no-restore tooth's boot-side handle: the roadmap's tooth says "the
+ * create runs, the payload does not", and this is the seam that makes
+ * that state producible on a real boot. Set on every route invocation (no
+ * sticky state), and consulted per record inside the pass. */
+void env_service_set_restore_payload(int on);
 
 #endif /* ENV_SERVICE_H */

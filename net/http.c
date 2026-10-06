@@ -3136,15 +3136,28 @@ static int api_partition_env_destroy_post(const char* body, char* buf, int max,
 // transcript carries each refusal's reason. Same DB_ADMIN+ gate as create and
 // destroy: bringing environments back is a tenancy-administration action.
 //
-// The payload caveat is stated where an operator will read it: this restores
-// the environment, not (yet) its contents -- see kernel/env_ckpt.h.
-static int api_env_restore_post(char* buf, int max, SLSRole req_role) {
+// The payload caveat is stated where an operator will read it: a default
+// restore brings the environment back WITH its captured contents (P1a's
+// payload layer), and `"payload": false` in the body asks for the other
+// thing — metadata only, an empty environment whose replay still counts.
+static int api_env_restore_post(char* buf, int max, SLSRole req_role,
+                                const char* body) {
     JSONBuf j = { buf, 0, max };
     if (req_role > ROLE_DB_ADMIN) {
         jb_obj_open(&j,0); jb_str(&j,"ok","false"); jb_putc(&j,',');
         jb_str(&j,"error","requires DB_ADMIN or higher");
         jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
     }
+
+    /* P1a's metadata-only knob, matched as a literal so the whole decision
+     * is one greppable place. Unset body or unset flag = full restore. */
+    int with_payload = 1;
+    if (body && (strstr(body, "\"payload\":false") ||
+                 strstr(body, "\"payload\": false") ||
+                 strstr(body, "\"payload\":0") ||
+                 strstr(body, "\"payload\": 0")))
+        with_payload = 0;
+    env_service_set_restore_payload(with_payload);
 
     struct EnvSvcRestoreReport rep;
     int rc = env_service_restore_pending(&rep);
@@ -3163,7 +3176,9 @@ static int api_env_restore_post(char* buf, int max, SLSRole req_role) {
         jb_uint(&j,"refused", rep.n_refused); jb_putc(&j,',');
         jb_uint(&j,"remaining", rep.n_remaining); jb_putc(&j,',');
         jb_uint(&j,"resumed", rep.n_resumed); jb_putc(&j,',');
-        jb_uint(&j,"repaused", rep.n_repaused);
+        jb_uint(&j,"repaused", rep.n_repaused); jb_putc(&j,',');
+        jb_uint(&j,"payloads", rep.n_payloads); jb_putc(&j,',');
+        jb_uint(&j,"payload_skips", rep.n_payload_skips);
     }
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
@@ -6482,7 +6497,7 @@ static void http_route(int conn, char* req) {
         // same create path as the route below. A whole-node pass, so it has no
         // partition in its path.
         if (!strcmp(path, "/api/env/restore")) {
-            blen = api_env_restore_post(resp_body, (int)sizeof(resp_body), req_role);
+            blen = api_env_restore_post(resp_body, (int)sizeof(resp_body), req_role, body_ptr);
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         // POST /api/partition/{id}/env and .../env/destroy — POSIX-Environments

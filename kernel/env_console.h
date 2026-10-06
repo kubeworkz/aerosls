@@ -114,6 +114,23 @@ int env_console_write(uint32_t partition, uint32_t env_id,
 int env_console_read(uint32_t partition, uint32_t env_id,
                      uint8_t* out, uint32_t cap, uint32_t* out_len);
 
+/* Non-destructive copy of the buffered output — POSIX-Environments v0.2
+ * Phase P1a's payload capture. Same read as env_console_read but the buffer
+ * and its counters are left exactly as they were: a checkpoint must not
+ * drain the console it is snapshotting. Returns 1 if the environment has a
+ * console (even when nothing is buffered — *out_len 0), or 0 if it has none. */
+int env_console_snapshot(uint32_t partition, uint32_t env_id,
+                         uint8_t* out, uint32_t cap, uint32_t* out_len);
+
+/* Put buffered output back on the environment this identity NOW binds to —
+ * Phase P1a's payload restore. The replayed environment gets the bytes the
+ * capture read, under its NEW env_id (ids are per-boot and deliberately
+ * never compared). Returns 1 on success, or 0 when no console is bound to
+ * (partition, env_id), which the caller treats as a named refusal rather
+ * than a silent drop. */
+int env_console_inject(uint32_t partition, uint32_t env_id,
+                       const uint8_t* bytes, uint32_t len);
+
 /* Bytes dropped for (partition, env_id) because its buffer was full, or 0. Lets
  * a reader tell "the environment is quiet" from "the environment was louder
  * than the buffer". */

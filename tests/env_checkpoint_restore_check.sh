@@ -21,8 +21,10 @@
 #   P1A_RAM / P1A_SMP                                 (default 1G / 2 — see below)
 #   P1A_ARTIFACTS    where the recorded evidence lands (default a temp dir,
 #                    printed at the end so it can be --replay'd later)
-#   P1A_TOOTH=no-restore  withhold the replay and require the LIVENESS clause
-#                    to go red (the vacuity control the roadmap's tooth names)
+#   P1A_TOOTH=no-restore  run the replay with the payload WITHHELD (a
+#                    metadata-only restore) and require the two CONTENTS clauses
+#                    to go red while liveness stays green (the vacuity control
+#                    the roadmap's tooth names)
 #
 # ─── Why this guard exists ────────────────────────────────────────────────
 # tests/env_ckpt_check.sh guards the *capture* wiring ("is the record layer
@@ -37,7 +39,7 @@
 # below, and tests/env_checkpoint_restore_check_smoke.sh makes each one bite by
 # breaking exactly that property in a throwaway copy of the tree.
 #
-# ─── The two halves, and the one thing this guard will not claim ───────────
+# ─── The two halves ───────────────────────────────────────────────────────
 #   * The DESCRIPTOR half — source clauses T1–T6, and the live round trip. The
 #     live arm proves, across a real reboot against the same NVMe image, that:
 #     the first boot is COLD for the environment region (a reused image would
@@ -47,21 +49,26 @@
 #     reproduced the identity, the environment is LIVE again in the same
 #     partition (its console bound, its POSIX sidecar carrying the partition),
 #     and the operator's pause was put back after the create.
-#   * The PAYLOAD half does not exist yet. The sidecars' page tables, mapped
-#     frames, register save areas and the console's buffered bytes are not
-#     captured, so the environment that comes back is EMPTY: a file written
-#     before the checkpoint is gone. The guard says that out loud (a `note:`
-#     line) instead of asserting a byte it cannot produce, and the clause that
-#     will assert it — a file's bytes surviving, a shell variable set before
-#     the reboot visible after it — is deliberately NOT written here yet.
+#   * The PAYLOAD half — source clause T7, the live contents phase, and the two
+#     CONTENTS clauses (B10, B11). The capture pours the sidecars' mapped
+#     frames and park save areas, the identity regions' bytes (the shell's
+#     variable table lives in the sidecar's heap) and the console's buffered
+#     bytes; the restore pours them back only after the repause, straight-line
+#     with no yield, and only onto the captured placement (a region moved by
+#     the replay is refused BEFORE a byte moves). The live arm proves the
+#     observable half through the environment's own console: a file written
+#     before the checkpoint is read back byte-identically after the replay,
+#     and a shell variable set before it is visible after it — the assertion
+#     the roadmap names as the one that distinguishes a restore from a create.
 #
-# `P1A_TOOTH=no-restore` is the vacuity control for the live arm: with the
-# replay withheld the environment must NOT come back, so the liveness clause
-# (B8) must go red and every other clause must stay green. Today that is the
-# honest shape of the tooth — with no payload, the DESCRIPTOR *is* the restore,
-# so withholding it takes the environment's liveness red. When the payload
-# lands, B8 stays green under this tooth (an empty environment is still an
-# environment) and the CONTENTS clauses become the ones that go red.
+# `P1A_TOOTH=no-restore` is the vacuity control for the CONTENTS clauses: the
+# tooth runs the replay WITH the payload withheld (`"payload":false`, the
+# create runs, the payload does not), so the environment comes back LIVE but
+# EMPTY. B8 (liveness) stays green — an empty environment is still an
+# environment — while B10 (the file's bytes) and B11 (the shell variable) must
+# go red, and B7 must report the withholding by name (payloads=0,
+# payload_skips≥1). A tooth that took the descriptor red instead would prove
+# nothing about the payload it withholds.
 #
 # ─── The source invariants, and what breaks if one is dropped ─────────────
 #   A.  Preconditions (else exit 2 — the guard could not be evaluated at all).
@@ -98,19 +105,35 @@
 #   T6. Every entry point this guard asserts on is exercised by
 #       tests/env_ckpt_host_test.c: an API with no observed behaviour is a
 #       claim, not a feature.
+#   T7. payload: the capture is called INSIDE the quiesce interval (frozen
+#       sources only), the restore POURS after the repause straight-line with
+#       no yield and refuses a moved placement before a byte (the pour body
+#       itself carries no yield), the pass waits for the parked posture only
+#       where a yield is legal and reports payloads/payload_skips by name, the
+#       route carries the metadata-only knob (`payload:false`), the console
+#       snapshot is non-destructive and the restore injects under the NEW
+#       env_id, the kernel links env_payload.c, every host test that links
+#       persist.c/env_service.c can resolve the payload symbols (linked or
+#       stubbed), and tests/env_payload_host_test.c drives the entry points.
 #
 # ─── The live clauses, in the order the run produces them ────────────────
 #   L1  a fresh 10G NVMe image, grub entry 3 (the unified boot), cold for the
 #       environment region;  L2 the control plane is up;  L3 a partition;
-#   L4 an environment in it at P1A_INDEX;  L5 the partition admin-paused;
+#   L4 an environment in it at P1A_INDEX;  L4b a file and a shell variable
+#       set THROUGH that environment's console, read back through it (the
+#       contents evidence);  L5 the partition admin-paused;
 #   L6 the checkpoint writes the region (the [PERSIST] line, not just status 0);
 #   L7 reboot IN PLACE, same disk, same grub entry;  L8 the control plane is
 #       back and the boot says it restored the snapshot's records;  L9 the
-#       recorded pause is back BEFORE any replay;  L10 the replay runs (or is
-#       withheld, under P1A_TOOTH=no-restore).
-# The validator then reads the recorded artifacts as B1..B9 in the same order,
-# ending with B8 (liveness: the console registry AND the process table agree)
-# and B9 (the pause the pass stepped out of was put back).
+#       recorded pause is back BEFORE any replay;  L10 the replay runs (with
+#       the payload, or withheld under P1A_TOOTH=no-restore);  L11 the
+#       partition is resumed for the CONTENTS read, the file and the variable
+#       are read back through the new environment's own console, and the
+#       operator's pause is put back afterwards.
+# The validator then reads the recorded artifacts as B1..B11 in the same order,
+# ending with B8 (liveness: the console registry AND the process table agree),
+# B9 (the pause the pass stepped out of was put back) and B10/B11 (the CONTENTS:
+# the file's bytes and the shell variable, read back through the console).
 #
 # ─── What the FIRST live runs of this arm had to be taught ───────────────
 # Written down because each one presented as a restore bug and was not one:
@@ -184,7 +207,7 @@ body() {
 # ─── The artifact validation half. Shared by the live run and --replay. ─────
 # One python pass over a run's evidence; every failure is a line, and a missing
 # or unparseable artifact is a failure too — a guard that cannot read its
-# inputs must not pass. The clause labels (B1..B9) are the contract the smoke
+# inputs must not pass. The clause labels (B1..B11) are the contract the smoke
 # asserts on, so they are pinned rather than reworded casually.
 validate() {   # validate <dir> <tooth-name> ; 0 = every clause held
     python3 - "$1" "${2:-}" <<'PY'
@@ -331,17 +354,14 @@ else:
            "(%s record(s), %s partition(s) re-paused)" % (m.group(1), m.group(2)))
 
 # ── B6. the replay went through create and reproduced the identity ──────────
-# B6 is a REPLAY claim, so under the no-restore tooth there is no replay to have
-# a report — a note, exactly as B7 and B9 are notes. Reading "the replay's own
-# line is missing" as a failure here would make the tooth take TWO clauses red
-# and destroy the thing the tooth is for: attributability. The first live tooth
-# run did exactly that (B6 and B8), which is why this is a note and why the
-# smoke's tooth fixture now strips the replay lines the way a real tooth run
-# does.
-if tooth == "no-restore":
-    note("B6. P1A_TOOTH=no-restore: the replay was withheld, so there is no "
-         "identity-intact line and no claim to check")
-elif b2 is None or P is None:
+# B6 is evaluated on EVERY run, the tooth included: P1A_TOOTH=no-restore now
+# withholds the PAYLOAD, not the replay ("the create runs, the payload does
+# not" — roadmap §4), so there is always a replay report to read. (Before the
+# payload landed the tooth withheld the replay itself and B6/B7/B9 were notes;
+# with an environment whose CONTENTS are the claim, withholding the descriptor
+# again would take four clauses red at once and destroy the tooth's
+# attributability.)
+if b2 is None or P is None:
     bad("B6. boot2.log/identity.json: missing — cannot see the replay's own report")
 else:
     replayed_line = re.search(
@@ -363,35 +383,56 @@ else:
            "env %s as env %s under the same (partition %s, index %s)"
            % (replayed_line.group(3), replayed_line.group(4), P, I))
 
-# ── B7. the pass reported itself, and refused nothing ───────────────────────
-res = None
-if tooth == "no-restore":
-    note("B7. P1A_TOOTH=no-restore withheld the replay on purpose — there is no "
-         "restore.json to read, and B8 is the clause that must go red")
-else:
-    res = jf("restore.json")
-    if res is not None:
-        if str(res.get("ok")) != "true":
-            bad("B7. restore.json ok=%r — the replay pass did not complete"
-                % res.get("ok"))
-        elif int(res.get("replayed", 0)) < 1 or int(res.get("refused", -1)) != 0 \
-                or int(res.get("remaining", -1)) != 0:
-            bad("B7. the pass reported replayed=%s refused=%s remaining=%s — "
-                "expected at least 1 replay, 0 refused and nothing still pending"
-                % (res.get("replayed"), res.get("refused"), res.get("remaining")))
+# ── B7. the pass reported itself, refused nothing — and poured its contents ─
+res = jf("restore.json")
+if res is not None:
+    if str(res.get("ok")) != "true":
+        bad("B7. restore.json ok=%r — the replay pass did not complete"
+            % res.get("ok"))
+    elif int(res.get("replayed", 0)) < 1 or int(res.get("refused", -1)) != 0 \
+            or int(res.get("remaining", -1)) != 0:
+        bad("B7. the pass reported replayed=%s refused=%s remaining=%s — "
+            "expected at least 1 replay, 0 refused and nothing still pending"
+            % (res.get("replayed"), res.get("refused"), res.get("remaining")))
+    elif tooth == "no-restore":
+        if int(res.get("payloads", -1)) != 0:
+            bad("B7. P1A_TOOTH=no-restore asked for a metadata-only restore, "
+                "but the pass reports payloads=%s — the tooth did not withhold "
+                "the payload, so its CONTENTS claims prove nothing"
+                % res.get("payloads"))
+        elif int(res.get("payload_skips", 0)) < 1:
+            bad("B7. the tooth withheld the payload but the pass reports "
+                "payload_skips=%s — a pass that came up empty without saying "
+                "so is the failure the report exists to prevent"
+                % res.get("payload_skips"))
         else:
-            ok("B7. the replay pass reported %s replayed, %s refused, %s still "
-               "pending (pending at entry: %s)"
-               % (res.get("replayed"), res.get("refused"), res.get("remaining"),
-                  res.get("pending")))
+            ok("B7. the pass replayed %s environment(s) and withheld the "
+               "contents by request, reported by name (payloads=0, "
+               "payload_skips=%s) — the tooth ran through the same pass"
+               % (res.get("replayed"), res.get("payload_skips")))
+    elif int(res.get("payloads", 0)) < 1:
+        bad("B7. the pass reports payloads=%s payload_skips=%s — the replay "
+            "ran but no contents were poured, so the environments came back "
+            "empty and the report must not read as a full restore"
+            % (res.get("payloads"), res.get("payload_skips")))
+    else:
+        ok("B7. the replay pass reported %s replayed, %s refused, %s still "
+           "pending (pending at entry: %s), with %s payload(s) poured and "
+           "%s skipped"
+           % (res.get("replayed"), res.get("refused"), res.get("remaining"),
+              res.get("pending"), res.get("payloads"),
+              res.get("payload_skips")))
 
 # ── B8. THE LIVENESS CLAUSE: the environment is back in the same partition ──
-# This is the clause P1A_TOOTH=no-restore exists to trip: with the replay
-# withheld, an environment that "comes back" would mean the guard was reading
-# something other than a restore. Two independent surfaces must agree — the
+# The descriptor half of the restore: two independent surfaces must agree — the
 # console registry says an environment with this (partition, index) is live and
 # bound, and the process table says its POSIX sidecar carries that partition —
 # so a listing that merely repeats the request cannot satisfy this clause.
+# Under P1A_TOOTH=no-restore this clause is DELIBERATELY GREEN: the tooth
+# withholds the payload, not the replay, and an empty environment is still an
+# environment (roadmap §4). The clauses the tooth takes red are the CONTENTS
+# ones, B10 and B11 — that split is what makes the tooth attributable to the
+# payload instead of to the descriptor it does not touch.
 # GET /api/partition/{id}/env is PARTITION-SCOPED, so the partition is the
 # route's own key at the TOP level of the response (`"partition": N`), and each
 # entry carries the environment's (index, env_id) inside it -- there is no
@@ -410,12 +451,7 @@ console_live = envlist is not None and \
 side_live = procs is not None and any(
     p.get("name") == sidecar and str(p.get("partition_id")) == str(P)
     for p in procs.get("processes", []))
-if tooth == "no-restore":
-    bad("B8. P1A_TOOTH=no-restore: the replay was withheld, so the environment is "
-        "NOT live again after the reboot — that is the tooth working, and this is "
-        "the clause that must go red for it (with a payload it would stay green, "
-        "because an empty environment is still an environment)")
-elif console_live and side_live:
+if console_live and side_live:
     ok("B8. the environment is LIVE again in partition %s at index %s: its "
        "console is bound again and its POSIX sidecar carries the partition it "
        "was checkpointed in" % (P, I))
@@ -432,10 +468,9 @@ else:
         "sidecar is not running where it was checkpointed" % (sidecar, P))
 
 # ── B9. the pause the replay stepped out of was put back ────────────────────
-if tooth == "no-restore":
-    note("B9. P1A_TOOTH=no-restore: the pass never ran, so it never owed a pause "
-         "back (no claim to check)")
-elif res is None:
+# Evaluated on every run, the tooth included: the tooth runs the replay, so the
+# pass owes the pause back exactly like a full restore.
+if res is None:
     bad("B9. restore.json: missing — cannot see whether the pause was put back")
 elif int(res.get("resumed", -1)) != 1 or int(res.get("repaused", -1)) != 1:
     bad("B9. the pass reported resumed=%s repaused=%s — the create cannot be "
@@ -459,10 +494,73 @@ else:
         ok("B9. the partition is paused again after the replay: the pass stepped "
            "out of the pause for the create and put exactly that pause back")
 
-print("note: this pass restored the environment's IDENTITY, not its contents. The")
-print("note: payload (the sidecars' frames, their page tables, the console's bytes)")
-print("note: is not captured yet, so a file written before the checkpoint is gone —")
-print("note: the clause that will assert it arrives with the payload increment.")
+# ── B10. THE FILE CLAUSE: the bytes written before the checkpoint are read
+# back byte-identically after the replay — through the environment's own console
+# (roadmap §4). Two directions are required: contents_pre.json proves the file
+# really was there and was really read back through the console before the
+# reboot (an empty pair must never pass as "equal"), and contents_post.json is
+# the claim after the replay. The arm reads both through POST/GET
+# /api/partition/{id}/env/{env_id}/console, so neither can be satisfied by
+# anything the request itself echoed.
+def cjf(clause, name):
+    s = read(name)
+    if s is None:
+        bad("%s. %s: missing — this run never recorded the contents evidence "
+            "the clause exists for" % (clause, name))
+        return None
+    try:
+        return json.loads(s)
+    except Exception as e:
+        bad("%s. %s: unparseable JSON (%s) — a guard that cannot read its "
+            "inputs must not pass" % (clause, name, e))
+        return None
+
+pre_c  = cjf("B10", "contents_pre.json")
+post_c = cjf("B10", "contents_post.json")
+pre_v  = cjf("B11", "contents_pre.json")
+post_v = cjf("B11", "contents_post.json")
+
+why = (" (P1A_TOOTH=no-restore withheld the payload: the create ran, the "
+       "contents did not — this is the tooth going red)" if tooth == "no-restore" else "")
+
+if pre_c is not None and post_c is not None:
+    pf = str(pre_c.get("file_bytes") or "")
+    qf = str(post_c.get("file_bytes") or "")
+    if not pf:
+        bad("B10. contents_pre.json recorded NO file bytes — the run never "
+            "read the file back through the console before the checkpoint, so "
+            "there is nothing for a post-reboot read to be compared against "
+            "(an empty pair must not pass as equal)")
+    elif not qf:
+        bad("B10. the file read before the checkpoint (%r) was NOT read back "
+            "after the replay — no bytes came through the environment's own "
+            "console%s" % (pf, why))
+    elif qf != pf:
+        bad("B10. the file came back DIFFERENT: %r after the replay vs %r "
+            "before the checkpoint — byte-identical is the claim, and this is "
+            "not it%s" % (qf, pf, why))
+    else:
+        ok("B10. the file written before the checkpoint came back byte-identical "
+           "(%d bytes, read through the environment's own console after the replay)"
+           % len(pf))
+
+if pre_v is not None and post_v is not None:
+    pv = str(pre_v.get("var_value") or "")
+    qv = str(post_v.get("var_value") or "")
+    if not pv:
+        bad("B11. contents_pre.json recorded NO shell variable value — the run "
+            "never saw the variable it claims to have set before the reboot")
+    elif not qv:
+        bad("B11. the shell variable set before the checkpoint (%r) is NOT "
+            "visible after the replay — `echo $VAR` through the environment's "
+            "own console saw nothing%s" % (pv, why))
+    elif qv != pv:
+        bad("B11. the shell variable came back as %r, not the %r set before the "
+            "checkpoint%s" % (qv, pv, why))
+    else:
+        ok("B11. the shell variable set before the checkpoint is visible after "
+           "the replay (%r, read through the environment's own console)" % qv)
+
 sys.exit(1 if fails else 0)
 PY
 }
@@ -479,7 +577,7 @@ if [ -n "$REPLAY" ]; then
     }
     if validate "$REPLAY" "${P1A_TOOTH:-}"; then
         echo
-        echo "env_checkpoint_restore_check: the recorded reboot held the descriptor-level restore."
+        echo "env_checkpoint_restore_check: the recorded reboot held the descriptor- and contents-level restore."
         exit 0
     fi
     echo
@@ -492,8 +590,10 @@ cd "$ROOT"
 
 # ── A. Preconditions ──────────────────────────────────────────────────────
 for f in kernel/env_ckpt.h kernel/env_ckpt.c kernel/env_service.h \
-         kernel/env_service.c kernel/persist.c net/http.c \
-         tests/env_ckpt_host_test.c tests/partition_host_stubs.h; do
+         kernel/env_service.c kernel/persist.c kernel/env_payload.h \
+         kernel/env_payload.c net/http.c \
+         tests/env_ckpt_host_test.c tests/partition_host_stubs.h \
+         tests/payload_host_stubs.h; do
     if [ ! -f "$f" ]; then
         echo "ABORT: $f is missing — cannot evaluate the P1a restore path at all" >&2
         exit 2
@@ -777,6 +877,177 @@ else
     ok "T6. every restore entry point this guard asserts on is exercised against the real kernel/env_ckpt.c"
 fi
 
+# ── T7. payload: captured frozen, poured straight-line, reported by name ───
+# The capture runs INSIDE the quiesce interval (its sources must not move),
+# and the pour runs AFTER the repause with no yield to the last memcpy (Ring-3
+# runs only while the control plane yields, so nothing can execute over memory
+# being poured). Both orderings are the whole contract; either one moved is a
+# payload that lies about what it captured.
+payload_missing=""
+if [ -n "$wbody" ]; then
+    cap_line=$(line_of "$wbody" "(void)env_payload_capture_all();")
+    if [ -z "${cap_line:-}" ]; then
+        payload_missing="$payload_missing capture-not-called"
+    elif [ "$cap_line" -le "$q_line" ] || [ "$cap_line" -ge "$rr_line" ]; then
+        bad "T7. the payload capture (line $cap_line) is outside the quiesce interval (quiesce $q_line, release $rr_line) — a payload captured while the environment runs captures bytes that are already moving"
+    else
+        ok "T7. the payload capture runs inside the frozen window (line $cap_line, between quiesce $q_line and release $rr_line), so what it captured is what the checkpoint froze"
+    fi
+
+    # The freeze has to LAND on a parked posture, or the capture records a
+    # mid-compute one: a sidecar that parks on a finite deadline (the ramdisk's
+    # 200 ms discovery poll) is mid-wake once a cycle, and a partition paused in
+    # that window never runs it back into its park -- the timer ISR's deadline
+    # wake has nowhere to schedule it, so waiting_nchans stays cleared until the
+    # release. That is what the live arm's first payload run measured
+    # (EP_REFUSE_RUNNING on restore). The wait therefore sits BEFORE the quiesce,
+    # where a yield is legal and the sidecars can still run; a yield after it
+    # would buy nothing, because a frozen partition cannot park.
+    prewait_line=$(line_of "$wbody" "env_payload_wait_parked(rec);")
+    if [ -z "${prewait_line:-}" ]; then
+        payload_missing="$payload_missing prewait-not-called"
+    elif [ -n "${q_line:-}" ] && [ "$prewait_line" -ge "$q_line" ]; then
+        bad "T7. the wait for the sidecars' parked posture (line $prewait_line) sits at or after the quiesce (line $q_line) — nothing inside a frozen partition can run back into its park, so the capture would record ENV_PAYLOAD_FORM_RUNNING and the pour would be refused by name (EP_REFUSE_RUNNING)"
+    else
+        ok "T7. the pass waits (bounded, yielding — legal before the freeze) for the sidecars to reach their parked idle point BEFORE the quiesce lands, so the posture the capture records is the posture the freeze caught"
+    fi
+else
+    payload_missing="$payload_missing persist-body"
+fi
+
+if [ -z "$drv" ]; then
+    payload_missing="$payload_missing restore-body"
+else
+    wait_line=$(line_of "$drv" "(void)env_payload_wait_parked(&w);")
+    pour_line=$(line_of "$drv" "env_payload_restore(done[d].p, done[d].idx,")
+    skip_line=$(line_of "$drv" "out->n_payload_skips++;")
+    if [ -z "${pour_line:-}" ]; then
+        bad "T7. env_service_restore_pending() never pours a payload — the replay would still hand back an EMPTY environment, which is the failure this increment exists to close"
+    elif [ "$pour_line" -le "$rep_line" ]; then
+        bad "T7. the pour (line $pour_line) runs before the repause (line $rep_line) — the pour must land after the snapshot's pause state is back, never into a partition still mid-dance"
+    else
+        between=$(printf '%s\n' "$drv" | sed -n "$((rep_line + 1)),${pour_line}p")
+        if printf '%s' "$between" | grep -qE '^[[:space:]]*(return|goto)'; then
+            bad "T7. a return or goto sits between the repause (line $rep_line) and the pour (line $pour_line) — a pass that bails there replays environments it never fills"
+        elif printf '%s' "$between" | grep -qF "kernel_yield_to_ring3"; then
+            bad "T7. the pass yields between the repause and the pour — the pour body must be straight-line from the repause to the last memcpy (env_payload.h's rule), because Ring-3 runs only while the control plane yields"
+        else
+            ok "T7. the pour runs after the repause (line $pour_line) with no return and no yield in between — straight-line from the snapshot's pause state to the last memcpy"
+        fi
+    fi
+    if [ -z "${wait_line:-}" ]; then
+        payload_missing="$payload_missing wait-not-called"
+    elif [ "$wait_line" -ge "$rep_line" ]; then
+        bad "T7. the bounded wait for the parked posture (line $wait_line) runs after the repause (line $rep_line) — a yield that late would resume Ring-3 into memory the pour is about to overwrite"
+    elif ! printf '%s' "$drv" | grep -qF "if (es_restore_payload)"; then
+        payload_missing="$payload_missing knob-not-gated"
+    else
+        ok "T7. the pass waits (bounded, yielding — legal inside the resume/repause interval) for each sidecar's parked posture before recording it for the pour"
+    fi
+    if [ -z "${skip_line:-}" ] || ! printf '%s' "$drv" | grep -qF "out->n_payloads++;"; then
+        payload_missing="$payload_missing report-counts"
+    fi
+    if ! printf '%s' "$drv" | grep -qF "contents are not claimed"; then
+        payload_missing="$payload_missing refusal-honesty"
+    fi
+fi
+
+# The route: the metadata-only knob the tooth pulls, and the report fields the
+# validator's B7 reads.
+if ! has net/http.c "env_service_set_restore_payload(with_payload);"; then
+    payload_missing="$payload_missing knob-route"
+fi
+if ! has net/http.c 'jb_uint(&j,"payloads", rep.n_payloads);' || \
+   ! has net/http.c 'jb_uint(&j,"payload_skips", rep.n_payload_skips);'; then
+    payload_missing="$payload_missing payload-report"
+fi
+if ! has kernel/env_service.h "uint32_t n_payloads;" || \
+   ! has kernel/env_service.h "void env_service_set_restore_payload(int on);"; then
+    payload_missing="$payload_missing report-decl"
+fi
+
+# The console halves: a snapshot that does not drain the buffer the operator is
+# watching, and an inject under the NEW env_id (ids are per-boot, so the old
+# binding is gone by the time the bytes come back).
+if ! has kernel/env_console.h "int env_console_snapshot(" || \
+   ! has kernel/env_console.c "int env_console_snapshot(" || \
+   ! has kernel/env_payload.c "env_console_snapshot("; then
+    payload_missing="$payload_missing console-snapshot"
+fi
+if ! has kernel/env_console.h "int env_console_inject(" || \
+   ! has kernel/env_console.c "int env_console_inject(" || \
+   ! has kernel/env_payload.c "env_console_inject("; then
+    payload_missing="$payload_missing console-inject"
+fi
+
+# The pour's own body: placement refused before a byte moves, and no yield
+# inside it (the media pass has already proven every page; the memcpy loop is
+# the only writer).
+pbody=$(body kernel/env_payload.c "int env_payload_restore(uint32_t partition, uint32_t index,")
+if [ -z "$pbody" ]; then
+    payload_missing="$payload_missing restore-not-in-env_payload.c"
+else
+    pl_line=$(line_of "$pbody" "EP_REFUSE_PLACEMENT")
+    pr_line=$(line_of "$pbody" "THE POUR")
+    if [ -z "${pl_line:-}" ]; then
+        bad "T7. env_payload_restore() never refuses a moved placement — the replay's regions could sit anywhere and the captured interior pointers would be poured into nothing"
+    elif [ -z "${pr_line:-}" ] || [ "$pl_line" -ge "$pr_line" ]; then
+        bad "T7. the placement check (line ${pl_line:-?}) does not precede the pour (line ${pr_line:-?}) — bytes would move before the rule that refuses to move them"
+    elif printf '%s' "$pbody" | grep -qF "kernel_yield_to_ring3"; then
+        bad "T7. the pour body yields — env_payload.h's rule is no yield from the first memcpy to the last, or Ring-3 can execute over memory mid-pour"
+    else
+        ok "T7. the pour refuses a moved placement before the first byte (line $pl_line < pour line $pr_line) and carries no yield inside its body"
+    fi
+fi
+if ! has Makefile "kernel/env_payload.c"; then
+    payload_missing="$payload_missing makefile-not-linked"
+fi
+
+# The payload's own host test drives the entry points (T6's rule, T7's API).
+missing_payload_test=""
+for sym in env_payload_capture_all env_payload_restore env_payload_wait_parked \
+           env_payload_present env_payload_last_refusal \
+           env_payload_refusal_text env_payload_clear_refusal; do
+    has tests/env_payload_host_test.c "$sym" || missing_payload_test="$missing_payload_test $sym"
+done
+if [ -n "$missing_payload_test" ]; then
+    bad "T7. tests/env_payload_host_test.c never exercises:$missing_payload_test — a payload entry point no test drives is a claim, not a feature"
+fi
+
+# Where persist.c/env_service.c get the payload symbols when a host test does
+# not link kernel/env_payload.c: linked, or the weak stub header — never
+# unresolved (the 29 link failures this rule pins).
+link_missing=""
+for t in tests/*_host_test.c; do
+    cmd=$(awk '
+        /[*] *gcc / { grab=1 }
+        grab {
+            line = $0
+            gsub(/\r/, "", line)
+            sub(/^[[:space:]]*\*[[:space:]]?/, "", line)
+            print line
+            if (line !~ /[\\][[:space:]]*$/) { exit }
+        }
+    ' "$t")
+    case "$cmd" in
+        *"kernel/persist.c"*|*"kernel/env_service.c"*)
+            case "$cmd" in
+                *"kernel/env_payload.c"*) ;;
+                *) grep -qF "tests/payload_host_stubs.h" "$t" || \
+                       link_missing="$link_missing $(basename "$t")" ;;
+            esac ;;
+    esac
+done
+if [ -n "$link_missing" ]; then
+    bad "T7. these host tests link persist.c/env_service.c without kernel/env_payload.c and without tests/payload_host_stubs.h, so they fail at LINK time on env_payload_capture_all/_restore/_wait_parked:$link_missing"
+fi
+
+if [ -n "$payload_missing" ]; then
+    bad "T7. the payload wiring is incomplete:$payload_missing — the capture, the pour, the knob, the console halves or the report the validator's B10/B11 and B7 read"
+elif [ -z "$missing_payload_test" ] && [ -z "$link_missing" ]; then
+    ok "T7. every payload entry point is exercised against the real kernel/env_payload.c, and every host test linking persist.c/env_service.c resolves its symbols"
+fi
+
 # ─── Default mode ends here: the source clauses. ───────────────────────────
 if [ "$LIVE" -ne 1 ]; then
     if [ "$fail" -ne 0 ]; then
@@ -785,7 +1056,7 @@ if [ "$LIVE" -ne 1 ]; then
         exit 1
     fi
     echo
-    echo "env_checkpoint_restore_check: the P1a restore-through-create path is wired and its four refusals are in place."
+    echo "env_checkpoint_restore_check: the P1a restore-through-create path is wired, its four refusals are in place, and its payload pour is pinned."
     exit 0
 fi
 
@@ -870,7 +1141,7 @@ fi
 
 case "$TOOTH" in
     ""|no-restore) ;;
-    stale-descriptor|leak-unpause|dirty-capture)
+    stale-descriptor|leak-unpause|dirty-capture|payload)
         echo "ABORT: P1A_TOOTH=$TOOTH is a source-level tooth (see tests/env_checkpoint_restore_check_smoke.sh); the boot arm knows only no-restore" >&2
         exit 2 ;;
     *) echo "ABORT: unknown P1A_TOOTH='$TOOTH' — expected no-restore" >&2; exit 2 ;;
@@ -1021,6 +1292,98 @@ wait_health() {   # wait until the CURRENT boot's control plane answers
     return 1
 }
 
+# ─── The environment's own console over HTTP (the CONTENTS channel) ────────
+# POST queues one line to the environment's stdin (fd 0 of its shell); GET
+# DRAINS what the console has buffered (env_console_read is destructive), so a
+# poll accumulates by appending every read to a transcript. Both CONTENTS
+# clauses read through this channel — the roadmap is explicit that the claim
+# "cannot be faked by echoing the request", so nothing here reads the file or
+# the variable any other way.
+FILE_TOK="P1A-FILE-7f3a9c01"     # the file's bytes (a single line, by construction)
+VAR_TOK="P1A-VAR-b19e0203"       # the shell variable's value
+
+cons_send() {   # cons_send <env_id> <line> — queued to that console, retried
+    # The verdict is `queued`, never `ok`: the route answers ok:true even when
+    # the kernel REFUSED the line (queued:0 — the environment has not drained
+    # the previous one yet, env_console_write's pool guard). A send that stops
+    # at ok drops lines silently and the shell never runs them: that was the
+    # first live L4b failure (the transcript held only the announce line and
+    # two prompts). The body is JSON-encoded by python so any line is safe,
+    # and the kernel appends the '\n' the sh applet completes a command on.
+    local eid="$1" line="$2" t
+    python3 - "$line" > "$WD/send_body.json" <<'PY'
+import json, sys
+print(json.dumps({"input": sys.argv[1]}))
+PY
+    for t in $(seq 1 20); do
+        if curl -sf --max-time 10 -H "Authorization: Bearer $TOKEN" \
+                -H "Content-Type: application/json" \
+                -d "$(cat "$WD/send_body.json")" \
+                -o "$WD/cons.json" \
+                "$BASE/api/partition/$PID/env/$eid/console" 2>/dev/null && \
+           [ "$(jval "$WD/cons.json" ok)" = "true" ] && \
+           [ -n "$(jval "$WD/cons.json" queued)" ] && \
+           [ "$(jval "$WD/cons.json" queued)" != "0" ]; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+cons_poll() {   # cons_poll <env_id> <transcript> <seconds> <regex>...
+    # Drain-append until every regex matches the accumulated transcript (or
+    # the seconds run out — a timeout is EVIDENCE for the validator, not a
+    # crash: under the tooth nothing will ever appear, and that is the red).
+    local eid="$1" tr="$2" secs="$3" waited=0 all re
+    shift 3
+    : > "$tr"
+    while [ "$waited" -lt "$secs" ]; do
+        if curl -sf --max-time 10 -H "Authorization: Bearer $TOKEN" \
+                -o "$WD/cons.json" \
+                "$BASE/api/partition/$PID/env/$eid/console" 2>/dev/null && \
+           [ "$(jval "$WD/cons.json" ok)" = "true" ]; then
+            python3 - "$WD/cons.json" "$tr" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+open(sys.argv[2], "a").write(d.get("output", ""))
+PY
+        fi
+        all=1
+        for re in "$@"; do
+            grep -qE -- "$re" "$tr" 2>/dev/null || { all=0; break; }
+        done
+        [ "$all" -eq 1 ] && return 0
+        sleep 1; waited=$((waited + 1))
+    done
+    return 1
+}
+
+contents_write() {  # contents_write <out.json> <transcript> — extract the two
+    # claims from what the CONSOLE actually produced. The patterns are anchored
+    # to a whole line: an echoed input line (`echo P1A-FILE-… > file`) starts
+    # with the command, never with the token, so only real output can match.
+    # The shell's prompt ("$ ", no newline) is written BEFORE it reads input,
+    # so it merges onto the FRONT of whatever the command prints — a claim line
+    # reads `$ P1A-FILE-…` (or `$ $ …` after prompt-less no-output commands).
+    # Repeated `$ ` prefixes are allowed but NOT recorded: the claim is the
+    # bare token (group 1), so pre and post compare byte-for-byte whatever
+    # prompt shape each side happened to have, and an echo of the request
+    # still cannot match.
+    python3 - "$1" "$2" <<'PY'
+import json, os, re, sys
+p, tr = sys.argv[1], sys.argv[2]
+txt = open(tr, encoding="utf-8", errors="replace").read() if os.path.isfile(tr) else ""
+m = re.search(r"(?m)^(?:\$ *)*(P1A-FILE-[0-9a-f]+)$", txt)
+n = re.search(r"(?m)^(?:\$ *)*(P1A-VAR-[0-9a-f]+)$", txt)
+json.dump({"ok": True,
+           "file_bytes": m.group(1) if m else "",
+           "var_value":  n.group(1) if n else ""},
+          open(p, "w"), sort_keys=True)
+open(p, "a").write("\n")
+PY
+}
+
 # ─── L3. a partition over HTTP, then an environment in it ─────────────────
 pname="p1arestore"
 api "$WD/pcreate.json" -X POST -d "{\"name\":\"$pname\"}" "$BASE/api/partitions" || \
@@ -1037,6 +1400,29 @@ if [ "$(jval "$WD/create.json" ok)" != "true" ] || [ -z "$ENV_ID" ] || [ "$ENV_I
     boot_fail "the environment manager did not create an environment in partition $PID"
 fi
 ok "L4. env $ENV_ID is live in partition $PID at index $INDEX (the identity to restore)"
+
+# ─── L4b. the CONTENTS: a file and a shell variable, set through the console ─
+# Everything B10/B11 read AFTER the replay is written and read back NOW through
+# the environment's own console: set the variable, write the file, then read
+# both back. The pre read is what makes the pair evidence (an empty pair could
+# never be "byte-identical" afterwards), and it must succeed before the
+# checkpoint — a run whose contents never appeared cannot claim anything about
+# them surviving.
+cons_send "$ENV_ID" "setenv P1A_VAR $VAR_TOK" || \
+    boot_fail "the environment's console never accepted the variable (no pre-checkpoint contents to restore)"
+cons_send "$ENV_ID" "echo $FILE_TOK > /tmp/p1a.txt" || \
+    boot_fail "the environment's console never accepted the file write"
+cons_send "$ENV_ID" "cat /tmp/p1a.txt" || boot_fail "cat never queued"
+cons_send "$ENV_ID" 'echo $P1A_VAR'    || boot_fail "echo never queued"
+if ! cons_poll "$ENV_ID" "$WD/console1.txt" 60 \
+        '^(\$ )*'"${FILE_TOK}"'$' '^(\$ )*'"${VAR_TOK}"'$'; then
+    boot_fail "the contents did not read back through the console before the checkpoint (tail: $(tail -c 300 "$WD/console1.txt" 2>/dev/null))"
+fi
+contents_write "$WD/contents_pre.json" "$WD/console1.txt"
+[ "$(jval "$WD/contents_pre.json" file_bytes)" = "$FILE_TOK" ] && \
+[ "$(jval "$WD/contents_pre.json" var_value)"  = "$VAR_TOK" ] || \
+    boot_fail "the pre-checkpoint console read did not yield both claims"
+ok "L4b. through the environment's own console: file '$FILE_TOK' written and read back, variable P1A_VAR=$VAR_TOK set and echoed — the contents evidence the reboot must reproduce"
 
 # ─── L5. pause the partition, so a pause is part of what is checkpointed ───
 api "$WD/pause.json" -X POST -d "{\"partition_id\":$PID}" "$BASE/api/partition/pause" || \
@@ -1062,6 +1448,7 @@ PY
 cp "$WD/create.json" "$ART/create.json"
 cp "$WD/pause.json" "$ART/pause.json"
 cp "$WD/checkpoint.json" "$ART/checkpoint.json"
+cp "$WD/contents_pre.json" "$ART/contents_pre.json"
 cp "$LOG" "$ART/boot1.log"
 SPLIT=$(wc -c < "$LOG")
 if [ -n "$TOOTH" ]; then printf '%s\n' "$TOOTH" > "$ART/tooth.txt"; fi
@@ -1107,14 +1494,20 @@ sys.exit(1)
 PY
 ok "L9. partition $PID is paused again after the reboot — the recorded pause came back with the snapshot"
 
-# ─── L10. the replay, unless the no-restore tooth withholds it ─────────────
+# ─── L10. the replay — with the payload, or withheld under the tooth ───────
+# The tooth's shape since the payload landed: the replay RUNS (the create
+# makes an environment — B8 must stay green) and only the CONTENTS are
+# withheld (`"payload":false`, the pass's own metadata-only knob). B10/B11 are
+# the clauses that must go red for it.
 if [ "$TOOTH" = "no-restore" ]; then
-    note "L10. P1A_TOOTH=no-restore: the replay is deliberately withheld — the environment must NOT come back, and B8 must say so"
+    RESTORE_BODY='{"payload":false}'
+    note "L10. P1A_TOOTH=no-restore: the replay runs with the payload WITHHELD (metadata only) — the environment must come back live but EMPTY, B10/B11 must go red and B8 must stay green"
 else
-    api "$WD/restore.json" -X POST "$BASE/api/env/restore" || boot_fail "POST /api/env/restore did not answer"
-    [ "$(jval "$WD/restore.json" ok)" = "true" ] || boot_fail "the replay pass did not complete (ok=$(jval "$WD/restore.json" ok))"
-    ok "L10. the replay ran: replayed $(jval "$WD/restore.json" replayed), refused $(jval "$WD/restore.json" refused), remaining $(jval "$WD/restore.json" remaining), repaused $(jval "$WD/restore.json" repaused)"
+    RESTORE_BODY='{}'
 fi
+api "$WD/restore.json" -X POST -d "$RESTORE_BODY" "$BASE/api/env/restore" || boot_fail "POST /api/env/restore did not answer"
+[ "$(jval "$WD/restore.json" ok)" = "true" ] || boot_fail "the replay pass did not complete (ok=$(jval "$WD/restore.json" ok))"
+ok "L10. the replay ran: replayed $(jval "$WD/restore.json" replayed), refused $(jval "$WD/restore.json" refused), remaining $(jval "$WD/restore.json" remaining), repaused $(jval "$WD/restore.json" repaused), payloads $(jval "$WD/restore.json" payloads), payload_skips $(jval "$WD/restore.json" payload_skips)"
 
 # ─── The post-replay snapshots the validator reads ────────────────────────
 api "$WD/envlist.json" "$BASE/api/partition/$PID/env" || true
@@ -1125,6 +1518,40 @@ cp "$WD/envlist.json" "$ART/envlist.json"
 cp "$WD/post.json"    "$ART/partitions_post.json"
 cp "$WD/procs.json"   "$ART/processes.json"
 [ -f "$WD/restore.json" ] && cp "$WD/restore.json" "$ART/restore.json"
+
+# ─── L11. the CONTENTS read-back, through the NEW environment's own console ─
+# The snapshots above were taken with the partition still paused (B9 reads
+# that state), so nothing here can move them. The partition is resumed for the
+# read — a paused partition is excluded from scheduling, so nothing typed into
+# it would ever run — and the operator's pause is put back afterwards, exactly
+# as the pass put its own back.
+NEW_ENV="$(python3 - "$WD/envlist.json" "$INDEX" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1])); idx = sys.argv[2]
+print(next((e.get("env_id") for e in d.get("envs", [])
+            if str(e.get("index")) == idx), 0))
+PY
+)"
+if [ -n "${NEW_ENV:-}" ] && [ "$NEW_ENV" != "0" ]; then
+    api "$WD/resume.json" -X POST -d "{\"partition_id\":$PID}" "$BASE/api/partition/resume" || true
+    [ "$(jval "$WD/resume.json" ok)" = "true" ] || \
+        boot_fail "partition $PID could not be resumed for the contents read"
+    cons_send "$NEW_ENV" "cat /tmp/p1a.txt" || true
+    cons_send "$NEW_ENV" 'echo $P1A_VAR'    || true
+    # A timeout is not a crash: under the tooth (or after a failed pour) the
+    # console answers with nothing, and the EMPTY transcript is precisely the
+    # evidence B10/B11 turn red on.
+    cons_poll "$NEW_ENV" "$WD/console2.txt" 60 \
+        '^(\$ )*'"${FILE_TOK}"'$' '^(\$ )*'"${VAR_TOK}"'$' || \
+        note "L11. the contents did not both read back within 60s — the transcript is the evidence B10/B11 will judge"
+    api "$WD/repause.json" -X POST -d "{\"partition_id\":$PID}" "$BASE/api/partition/pause" || true
+    ok "L11. the file and the variable were read back through env $NEW_ENV's own console (the transcript is the claim)"
+else
+    : > "$WD/console2.txt"
+    note "L11. no environment is listed at index $INDEX after the replay — there is no console to read contents through, and B8/B10/B11 will say so"
+fi
+contents_write "$WD/contents_post.json" "$WD/console2.txt"
+cp "$WD/contents_post.json" "$ART/contents_post.json"
 tail -c +$((SPLIT + 1)) "$LOG" > "$ART/boot2.log"
 
 kill "$QPID" 2>/dev/null || true
@@ -1138,7 +1565,7 @@ echo
 
 if validate "$ART" "$TOOTH"; then
     echo
-    echo "env_checkpoint_restore_check: the environment survived a checkpoint and a real reboot — replayed in $PID at index $INDEX, with the recorded pause restored."
+    echo "env_checkpoint_restore_check: the environment survived a checkpoint and a real reboot — replayed in $PID at index $INDEX, with the recorded pause restored and its contents read back through its own console."
     exit 0
 fi
 echo

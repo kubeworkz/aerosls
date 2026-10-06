@@ -1633,6 +1633,17 @@ void cap_park_deadline_tick(void) {
         if (!pd->active || pd->state != PROC_BLOCKED) continue;
         if (pd->waiting_deadline == 0) continue;   /* block forever */
         if (now < pd->waiting_deadline) continue;
+        /* A frozen partition keeps the posture it was frozen with. Waking
+         * this process would clear waiting_chan/waiting_nchans and mark it
+         * runnable in a partition pick_next_partition() will not schedule,
+         * so it would sit SUSPENDED-with-no-park for the whole freeze --
+         * exactly the posture P1a's payload capture reads as mid-compute
+         * (ENV_PAYLOAD_FORM_RUNNING) and the restore refuses by name
+         * (EP_REFUSE_RUNNING). Deferring the wake to the first tick after
+         * partition_resume() delivers the same timeout, one pause later, to
+         * a process whose world was frozen alongside it -- the pause already
+         * defers everything else this partition does. */
+        if (partition_is_paused(pd->partition_id)) continue;
         pd->state         = PROC_SUSPENDED;
         pd->resume_kernel = 1;
         pd->waiting_chan  = CAP_NONE;

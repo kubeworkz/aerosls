@@ -41,6 +41,7 @@
  *   /tmp/persist_defer_host_test
  */
 #include "kernel/object_catalog.h"
+#include "tests/payload_host_stubs.h"  /* P1a payload: persist.c/env_service.c call env_payload_* */
 #include "kernel/loader.h"
 #include "kernel/partition.h"
 #include "kernel/rowstore.h"

@@ -302,6 +302,30 @@ int env_console_read(uint32_t partition, uint32_t env_id,
     return 1;
 }
 
+int env_console_snapshot(uint32_t partition, uint32_t env_id,
+                         uint8_t* out, uint32_t cap, uint32_t* out_len) {
+    if (out_len) *out_len = 0;
+    struct EnvConsole* e = ec_find_env(partition, env_id);
+    if (!e) return 0;
+    uint32_t n = e->len < cap ? e->len : cap;
+    for (uint32_t i = 0; i < n; i++) out[i] = e->buf[i];
+    if (out_len) *out_len = n;
+    return 1;
+}
+
+int env_console_inject(uint32_t partition, uint32_t env_id,
+                       const uint8_t* bytes, uint32_t len) {
+    struct EnvConsole* e = ec_find_env(partition, env_id);
+    if (!e || !bytes) return 0;
+    uint32_t n = len < ENV_CONSOLE_BUF ? len : ENV_CONSOLE_BUF;
+    /* The buffer is the TICK's to write, but the tick runs in this same
+     * non-IRQ kernel context — the same single-writer argument
+     * env_console_read() makes for its drain. */
+    for (uint32_t i = 0; i < n; i++) e->buf[i] = bytes[i];
+    e->len = n;
+    return 1;
+}
+
 uint32_t env_console_dropped(uint32_t partition, uint32_t env_id) {
     struct EnvConsole* e = ec_find_env(partition, env_id);
     return e ? e->dropped : 0;
