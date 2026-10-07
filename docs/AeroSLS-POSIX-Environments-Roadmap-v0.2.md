@@ -1156,6 +1156,103 @@ scope, as §5's scope said.
 - **`P2_TOOTH=unattributed`** — connections are admitted without attribution. Expected: red on the attribution clause (a connection with no partition counts against nobody), which is the same "denial looks like absence" family the E6 console guard was built around.
 - **`P2_TOOTH=restore-sockets`** — the descriptor is made to carry live connection ids. Expected: the guard's own consistency clause reddens after a checkpoint/restore, which is the tooth that keeps P1a and P2's boundary from blurring.
 
+### The increments — four PRs, one tooth each
+
+§6 names the design, the guard that will measure it
+(`tests/env_net_isolation_check.sh`) and the four teeth; what is not named is
+the order. The order below is the rule P1a and P1b were broken by: land the
+piece everything else writes into first — the piece verifiable without the
+hard part — and give every increment exactly one of the guard's named teeth,
+so each PR reddens something real when the property it carries is removed.
+§6's clause set closes on the fourth.
+
+Named once, so no increment claims credit for what already exists: the NET_*
+wire and its client (`user/proto/src/lib.rs`, `user/sidecar/src/net_client.rs`
+— socket/bind/connect/listen/accept/send/recv/poll/shutdown), the `nc` applet
+the console already drives it with (`user/sidecar/src/applets.rs`), the network
+driver's own server (`user/network/src/server.rs`), the kernel stack the
+service will front (`net/ipv4.c`, `net/tcp.c`), the attribution and quota
+module (`net/tcp_quota.h`, syscalls 277/278, `GET/POST
+/api/partition/connquota(s)`), and E2's mint path — `cap_create_sidecar()`'s
+kernel-service branch, the `kernel.` prefix arm whose per-name cases today are
+`kernel.env.control` and `kernel.env.console` (`kernel/cap.c`). What P2 adds is
+the tenant's right to reach any of it, a kernel-owned peer to reach through,
+the bounds at the admit path, and the guard that proves it.
+
+### First increment — the cap and the kernel-owned name: the wire
+
+The tenant manifest gains the `network` Chan cap — peer `kernel.net.socket`,
+rights 0x7 beside its console and ramdisk siblings — `cap_create_sidecar()`'s
+kernel-service branch grows the `kernel.net.socket` arm beside the two that
+already mint kernel ends, and the service behind that name speaks NET_* but
+answers every verb with a refusal by name. Nothing admits yet: the channel
+exists, is typed, and fails honestly, which is the wire the rest of the phase
+writes into. The pin it rotates is `tenant_profile_has_only_budget_console_and_its_own_ramdisk`,
+which counts caps (`n_caps == 3`) and asserts `network` among the absent — both
+halves move: four caps, `network`'s absence replaced by a positive pin that
+its peer is exactly `kernel.net.socket` and never `drv.network.0` (the test's
+name counts caps too and rotates with the claim). The system profile's own
+`network → drv.network.0` cap (`build_posix_manifest()`) is untouched. Proven
+without a byte of TCP: host tests on the refusal rendering, source clauses on
+the manifest pin, the mint arm and the registration under the kernel-owned
+name, and one live clause that needs no peer — a tenant console's `nc` reaches
+the service and is refused **by name**. Tooth: **`system-peer`** — point the cap
+at `drv.network.0` instead and channel creation refuses it for crossing
+partitions, red before a socket is ever opened (the boundary, not the API).
+
+### Second increment — the outbound path, attributed and admitted at the connect
+
+The service implements the verbs §6 scopes (`socket`, `connect`,
+`send`/`sendto`, `recv`/`recvfrom`, `shutdown`, `close`) against the kernel's
+own stack — never `drv.network.0`, which is the whole reason the peer is
+kernel-owned — and the admit path runs `tcp_conn_attribute(conn_id, uid)` and
+the caller's partition quota before a connection exists. The default stays
+0 = unlimited, so behaviour is byte-identical for every operator who has not
+opted in (§6's BSS-zero-safe rule kept), and `nc <host> <port>` from a
+tenant's own console carries real bytes end to end. The guard gains three
+clauses: the outbound reach clause (live, through the environment's own
+console), the attribution clause pinned at the admit path's line order
+(source), and the 0 = unlimited regression clause. Tooth: **`unattributed`** —
+admit without attribution and the attribution clause reddens, because a
+connection with no partition counts against nobody (the "denial looks like
+absence" family E6's console guard was built around). Not yet: listeners
+(third), the quota's starvation measurement and CI wiring (fourth — the
+mechanism lands here, its proof lands there), UDP and name resolution (§6
+names them as following), and the Linux shim's socket syscalls (§9's
+forward-to-this-service, no second implementation).
+
+### Third increment — the listener, the isolation, and the descriptor's line
+
+The other half of §6's "client and listener": bind/listen/accept through the
+service, each partition's listeners reachable only from inside that
+partition — a tenant reaches its own partition's service and nothing beyond
+it. The guard's isolation clauses land with it: two environments in two
+partitions, each listener driven by `nc` through its own environment's
+console — A reaches A and **not** B, the refusal by name. And the checkpoint
+boundary becomes measurable: the descriptor carries the listener's
+configuration and never a connection id, a checkpoint/restore re-establishes
+the listener with every socket closed (§6's descriptor angle, so P1a's
+reviewers are never asked to capture TCP state). Tooth: **`restore-sockets`** —
+make the descriptor carry live connection ids and the guard's consistency
+clause reddens after the reboot.
+
+### Fourth increment — the bounds measured, and the gate on every push
+
+§6's verification plan in full: a small conn quota set on partition A through
+the surface that already exists (syscalls 277/278, `POST
+/api/partition/connquota` — no new API), A's environment flooding past it, the
+excess refused **by name** while **B keeps serving throughout** — the clause
+that is the whole point of the phase — the request family still under
+`net/http_rate_limit.c`, and a partition with no quota set behaving as before
+(0 = unlimited). The `--live` arm is wired into CI's `kernel-guards` job after
+its ISO build, the S13 shape P1b established: the guard reddens by name if the
+step is deleted or reordered. §10's P2 gate closes here, and §11 Q4 (the
+recommended non-zero default) stays open — these increments make the quota
+enforceable, not prescribe its number. Tooth: **`no-quota`** — remove the quota
+check from the admit path and the starvation clause reddens (B starved by A's
+flood) while the reachability clauses stay green: the vacuity control and the
+reason the phase exists.
+
 ---
 
 ## 7. Phase P3 — Placement, migration and failover
@@ -1234,7 +1331,7 @@ Each excluded item has a stated destination, so none is silently dropped.
 
 ## 10. Suggested execution order
 
-P1a is unblocked and is the thing E7 waits on, so it starts first. P2 has no dependency on P1 and should run **in parallel** — it is the phase most independent of the others, and serialising it behind persistence would idle a second pair of hands. P1b follows P1a because its descriptor field is P1a's. P3 starts only once P1a, P1b and P2 are all in, because every one of them is part of its payload, and a migration that is missing one of the three is exactly the "two nodes that disagree" failure the phase exists to prevent.
+P1a is unblocked and is the thing E7 waits on, so it starts first. P2 has no dependency on P1 and should run **in parallel** — it is the phase most independent of the others, and serialising it behind persistence would idle a second pair of hands. §6 breaks it into four increments — the wire, the outbound path, the listener and the descriptor's line, and the measured bounds — each carrying one of the guard's teeth, so the parallel lane starts at a named first PR. P1b follows P1a because its descriptor field is P1a's. P3 starts only once P1a, P1b and P2 are all in, because every one of them is part of its payload, and a migration that is missing one of the three is exactly the "two nodes that disagree" failure the phase exists to prevent.
 
 | Order | Phase | Gate to leave it |
 |---|---|---|
