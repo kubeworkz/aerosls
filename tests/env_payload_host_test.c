@@ -134,6 +134,13 @@ int env_console_inject(uint32_t partition, uint32_t env_id,
     memcpy(g_inject_bytes, bytes, len < sizeof g_inject_bytes ? len : sizeof g_inject_bytes);
     return 1;
 }
+/* The boot-announcement flag the bounded wait reads (env_console_tick sets it
+ * in the kernel; here it is a switch the wait cases flip). */
+static int g_identity_seen = 1;
+int env_console_identity_seen(uint32_t partition, uint32_t index) {
+    (void)partition; (void)index;
+    return g_identity_seen;
+}
 
 /* ─── Synthetic address space ─────────────────────────────────────────────── */
 #define IMG_VADDR 0x400000000000ULL     /* cap.c's USER_PROC_CODE_BASE literal */
@@ -399,6 +406,13 @@ int main(void) {
     kernel_tick_counter = 0;
     CHECK(env_payload_wait_parked(&g_scratch) == 1,
           "wait: an already-parked sidecar answers immediately");
+    g_identity_seen = 0;
+    kernel_tick_counter = 0;
+    CHECK(env_payload_wait_parked(&g_scratch) == 0,
+          "wait: parked but not yet announced is not the pour's go signal — "
+          "the bound answers instead of letting the pour erase the [env-id] "
+          "line nobody else can write");
+    g_identity_seen = 1;
     proc_table[0].waiting_chan = CAP_NONE;
     kernel_tick_counter = 0;
     CHECK(env_payload_wait_parked(&g_scratch) == 0,

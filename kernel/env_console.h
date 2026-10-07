@@ -131,6 +131,19 @@ int env_console_snapshot(uint32_t partition, uint32_t env_id,
 int env_console_inject(uint32_t partition, uint32_t env_id,
                        const uint8_t* bytes, uint32_t len);
 
+/* Has the environment wired to (partition, index) written its boot identity
+ * line ([env-id], sidecar boot.rs step 4.5) since that wiring? POSIX-
+ * Environments v0.2 Phase P1a's payload restore reads it: the pour may only
+ * land once the freshly replayed sidecar has announced, because a sidecar
+ * still inside its first ramdisk handshake is equally "parked" to a channel
+ * wait — pouring over it replaces its half-finished boot with the captured
+ * state, after which nobody can ever write that line and the durable guard's
+ * post-reboot identity wait (which drains exactly this buffer) times out.
+ * The flag is set only by the drain of the sidecar's OWN bytes and cleared on
+ * (re)wiring, so it can only ever name this boot's announcement. Returns 1 if
+ * seen, 0 otherwise (including when no console is wired there). */
+int env_console_identity_seen(uint32_t partition, uint32_t index);
+
 /* Bytes dropped for (partition, env_id) because its buffer was full, or 0. Lets
  * a reader tell "the environment is quiet" from "the environment was louder
  * than the buffer". */
