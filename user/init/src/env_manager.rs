@@ -746,10 +746,14 @@ mod tests {
         assert_eq!(px.name, Some("aerosls.posix.3"));
         assert_eq!(px.find_cap("ramdisk").unwrap().kind,
                    CapKind::Chan { peer: Some("drv.ramdisk.3"), flags: 0 });
-        // The tenant profile carries no hardware/network caps.
-        for absent in ["network", "uart", "irq.timer.0", "nic0.bar0"] {
+        // The tenant profile carries no hardware caps. Its network cap —
+        // P2's first increment — peers at the kernel-owned service, and the
+        // system partition's sidecar is never named (the system-peer tooth).
+        for absent in ["uart", "irq.timer.0", "nic0.bar0"] {
             assert!(px.find_cap(absent).is_none());
         }
+        assert_eq!(px.find_cap("network").unwrap().kind,
+                   CapKind::Chan { peer: Some("kernel.net.socket"), flags: 0 });
     }
 
     #[test]

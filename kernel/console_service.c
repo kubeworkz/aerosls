@@ -4,6 +4,7 @@
 #include "kernel_io.h"
 #include "env_service.h"
 #include "env_console.h"
+#include "net_socket_service.h"
 
 #define CONSOLE_SVC_BUF 4096
 
@@ -78,6 +79,13 @@ void console_service_tick(void) {
          * here would put every tenant's output back on the shared serial
          * transcript, which is exactly what E6 removes. */
         if (env_console_kernel_slot((uint16_t)s)) continue;
+        /* POSIX-Environments P2: a tenant's socket-service channel also
+         * lives in the pid-0 table, but it carries NET_* frames, not
+         * console text — printing them here would leak a tenant's socket
+         * traffic onto the shared serial transcript AND steal the frames
+         * net_socket_service_tick() must answer. Skip, same shape as the
+         * two exclusions above. */
+        if (net_socket_service_kernel_slot((uint16_t)s)) continue;
 
         struct CapChannel* ch = 0;
         int kdir = 0;
