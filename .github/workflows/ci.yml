@@ -996,6 +996,21 @@ jobs:
         run: bash tests/env_storage_durable_check.sh --live
         working-directory: aerosls2
 
+      # P2 increment 4 — the bounds measured, the gate on every push. The
+      # guard's own live arm sets a small conn quota on partition A through
+      # POST /api/partition/connquota, pushes A to it from a second
+      # environment in A, requires the EXCESS accept to be refused BY NAME
+      # (charged to nobody), and requires partition B — no quota, 0 =
+      # unlimited — to keep serving a client of its own throughout: §10's
+      # P2 gate ("two partitions, one throttled and one not, and the
+      # unthrottled one keeps serving"). The guard's N17/N17b clauses pin
+      # this step's existence and its order after the ISO build — the S13
+      # shape P1b established — so deleting or reordering it reddens the
+      # guard by name rather than silently retiring the gate.
+      - name: P2 net quota live (A flooded past quota, refused by name, B keeps serving)
+        run: bash tests/env_net_isolation_check.sh --live
+        working-directory: aerosls2
+
       # Phase 5 self-hosted gate: the ISO's serial log must carry the
       # driver-SDK demos' PASS lines ('irqtest] PASS' — LAPIC timer edges at
       # vector 32, and the serial port's IRQ4 at vector 36 through the

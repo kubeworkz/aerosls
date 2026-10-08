@@ -1307,6 +1307,153 @@ check from the admit path and the starvation clause reddens (B starved by A's
 flood) while the reachability clauses stay green: the vacuity control and the
 reason the phase exists.
 
+### Findings addendum — what landed, increment 4 (the bounds measured, and the gate on every push)
+
+The fourth increment is in, on the source side. What the design prose above
+promised, and what actually landed — with the one honest limit stated
+plainly:
+
+- **No new API, pinned end to end.** The live arm drives the surface that
+  already existed: syscalls 277/278 and their dispatch, `POST
+  /api/partition/connquota` with the exact `{partition_id, quota}` body, the
+  `GET /api/partition/connquotas` readback, and the operator shell pair. The
+  guard's **N15** pins every one of those links, so the surface cannot rot
+  under the gate that leans on it.
+- **The starvation clause, named.** **N16** pins the gate in
+  `net/tcp_quota.c` itself — deny before attributing, and the `quota != 0`
+  half that keeps 0 = unlimited (§11 Q4's contract). This is the clause
+  §6's named `no-quota` tooth reddens: the gate becomes constant-false, N16
+  reddens, and the reachability clauses N12-N14 stay green — the vacuity
+  control the roadmap names, asserted as NARROWNESS (no `FAIL:` line for
+  N12/N13/N14 may appear), not as an exit code alone.
+- **The gate is on every push.** ci.yml's kernel-guards job gained the live
+  step right after its ISO build — the S13 shape P1b established, point for
+  point: **N17** reddens if the step is deleted, **N17b** alone if it is
+  reordered ahead of its image, and the smoke proves both halves bite
+  separately.
+- **The live arm (L5), written and honestly scoped.** It sets a quota of 1
+  on partition A, arms a loopback listener from a second environment in A,
+  floods from A's first environment, requires the EXCESS accept to be
+  refused **by name** (closed, charged to nobody), and then requires
+  partition B — quota 0, read back — to serve a client of its own
+  throughout, with B's identity carrying no refusal: §10's P2 gate, in full.
+  **Limit: the arm has never booted.** Its first real run happens in CI's
+  kernel-guards job on the next push; the loopback leg (guest→its own NAT
+  address through QEMU user-net) is the named risk, and the arm fails BY
+  NAME with that diagnosis rather than passing vacuously if user-net does
+  not hairpin the guest's own address back to it.
+
+Proven by: the guard's N15-N17b clauses and the smoke's four new teeth
+(`no-quota-surface`, `no-quota`, `no-ci-live`, `no-ci-order`) — 24 teeth in
+total, all biting with the vacuity control green; ci.yml parses as YAML and
+carries the step after the ISO build. §11 Q4 stays open, exactly as the
+prose above requires: these increments make the quota enforceable, not its
+number prescribed.
+
+### Findings addendum — what landed, increment 3 (the listener, the isolation, and the descriptor's line)
+
+The third increment is in. What the design prose above promised, and what
+actually landed:
+
+- **The listener verbs.** `kernel/net_socket_service.c` now admits `bind`,
+  `listen` and `accept` alongside the client verbs, against the kernel's own
+  `net/tcp.c`. **Finding — the stack has no separate `tcp_bind`.** The bind
+  claims the port on the channel's own socket (`sk->lport`); the stack's
+  listener slot is drawn at `listen()` (`tcp_listen(sk->lport)`), so a bind
+  that is never followed by `listen()` costs a conn slot nothing. The accept
+  is the same non-blocking scan `tcp_accept()` and `http.c`'s pickup loop do
+  — one pass per service tick, answering `NET_EAGAIN` (status 11) when
+  nothing is pending, which the client's bounded retry treats as "poll again",
+  never an error.
+- **Attribution binds at accept, not at listen.** The listener itself is
+  deliberately unattributed; the accepted conn is charged to the caller's
+  partition (`tcp_conn_attribute_partition(found, e->partition)`) the instant
+  it is handed out — the same admit-at-the-moment rule the connect path
+  keeps, and the inbound half of the `unattributed` tooth. Over quota, the
+  accept closes the conn and charges nobody (deny before side-effect). The
+  host test pins all four arms: a ready accept, the listener staying listening
+  for a second accept, the over-quota refusal-by-name, and the non-listener
+  refusal.
+- **Isolation is keyed to the channel, and the guard now says so.** Every
+  socket — listener and accepted — is bound to the partition whose sidecar
+  opened the channel, so a listener belongs to exactly one partition. The
+  guard (`tests/env_net_isolation_check.sh`) gains three source clauses: **N12**
+  (bind claims the port, listen/accept reach the stack, accept attributes),
+  **N13** (no cross-partition reach), and **N14** (the descriptor's line). Its
+  `--live` arm gains **L4**: two partitions, B opens a listener through its
+  own console, A runs `nc` at it and must be answered **by name** — the
+  isolation property, end-to-end. The teeth
+  (`tests/env_net_isolation_check_smoke.sh`) gain `no-listener-verbs`,
+  `no-accept-attribution`, `no-bind-port` and the named **`restore-sockets`**
+  tooth, all biting with the vacuity control green.
+- **The descriptor's line, stated honestly.** The checkpoint descriptor
+  (`RegisterReply`, `user/proto/src/env_proto.rs`) carries the environment's
+  identity, its three regions and its four messenger endpoints — and never a
+  connection id, socket id or listener handle. **Finding — the descriptor
+  carries no port or listener *configuration* either.** The listener is
+  re-established by re-running the applet over the restored channels, not
+  carried as a config record; N14 therefore pins the negative (no conn id /
+  socket / listener handle enters the record) plus the messenger endpoints a
+  restore does re-wire, rather than asserting a config field that does not
+  exist. §6's descriptor angle holds unchanged: P1a's reviewers are never
+  asked to capture TCP state.
+
+Proven by: `tests/net_socket_service_host_test.c` (137 checks — the outbound
+flow plus this increment's listener arms, against the real `net/tcp_quota.c`
+with only `net/tcp.c`'s data-path entry points stubbed); the guard's N12–N14
+source clauses and its L4 live arm; and the smoke's four new teeth, all
+verified with the vacuity control green.
+
+### Findings addendum — what landed, increment 2 (the outbound path)
+
+The second increment is in. What the design prose above promised, and what
+actually landed, with the one finding worth recording:
+
+- **The verbs.** `kernel/net_socket_service.c` implements the client verbs
+  §6 scopes — `socket`, `connect`, `send`, `recv`, `shutdown`, `close` —
+  against the kernel's own `net/tcp.c`, never `drv.network.0`. `bind`,
+  `listen` and `accept` stay refused **by name** (increment 3's listener), so
+  a tenant is never left wondering whether a verb is absent or broken.
+- **The admit path.** A `NET_CONNECT` is attributed to the caller's partition
+  (`tcp_conn_attribute_partition`) and checked against that partition's quota
+  (`tcp_partition_get_conn_quota`/`usage`) **before** a connection exists —
+  the property the whole phase rests on, and the one the `unattributed` tooth
+  removes. The quota's default stays 0 = unlimited (the module's BSS-zero-safe
+  rule), so behaviour is byte-identical for an operator who has not opted in.
+  The attribution module (`net/tcp_quota.c`) was widened to the full
+  `tcp_conns[]` range for this: an outbound connection lands in the reserved
+  tail and, unattributed, would count against nobody.
+- **The counters.** Admission is independently countable —
+  `net_socket_admits()` and `net_socket_quota_refusals()` — so an admit and a
+  quota deny are each observable, which is what the `unattributed` tooth and
+  the guard's N10/N11 clauses pin.
+- **The handshake.** `NET_INFO` now answers `max_sockets` the real
+  `NSS_MAX_SOCKS` (8) rather than increment 1's 0 — the increment-2 change
+  from "nothing admits" to "here is the ceiling a client can plan against".
+- **Finding — the sockaddr byte order.** The wire is little-endian
+  (`user/proto`'s `encode_sockaddr` writes the client's logical `ip` with
+  `to_le_bytes`), but the kernel stores `IPv4Addr` in **network** order
+  (`include/config.h`: `KERNEL_STATIC_IP = 0x0F02000A` for 10.0.2.15), which
+  is what `tcp_connect()`/`ipv4_send()`/`arp_lookup()` all compare and write —
+  `tcp_connect()`'s `(ntohl(dst_ip) & mask)` turns that network-order value
+  into logical form for its subnet test. The service therefore decodes the
+  wire bytes in **memory order** (most-significant address byte first), yielding
+  the network-order `IPv4Addr` directly. Decoding LE here — the obvious reading
+  of "the wire is LE" — would hand `tcp_connect` a byte-swapped address and
+  route every outbound connect to the wrong host. The host test pins the exact
+  value the stack receives (`0x0100007F` for 127.0.0.1) so this cannot regress
+  silently.
+
+Proven by: `tests/net_socket_service_host_test.c` (109 checks — the outbound
+flow against the real `net/tcp_quota.c` with only `net/tcp.c`'s five data-path
+entry points stubbed, the LE/network-order decode pinned, the quota teeth, and
+the deny-before-side-effect clause); `tests/env_net_isolation_check.sh` N10
+(admit path: verbs reach the stack, the connect is attributed and quota-checked
+before the connection exists) and N11 (the admission counters and the quota
+module are compiled in and linked by the host test); and the `unattributed`
+tooth in `tests/env_net_isolation_check_smoke.sh`, which reddens N10 when the
+attribution call is removed.
+
 ---
 
 ## 7. Phase P3 — Placement, migration and failover

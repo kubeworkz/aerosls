@@ -51,14 +51,23 @@
  * (release happens at the same two teardown points tcp_close() is already
  * called from).
  *
- * ─── Why this only covers the inbound pool ─────────────────────────────
+ *─── Why this began as inbound-only, and what P2 increment 2 changed ───
  * net/tcp.h's TCP_INBOUND_MAX_CONNS / TCP_OUTBOUND_RESERVED_CONNS split
- * (Network Fairness Phase 2's other half) already fully protects this
- * kernel's own outbound connections (net/ollama_client.c, net/
- * inference.c) from ever being starved by inbound tenant load -- those
- * connections have no partition_id to attribute anyway, since they're the
- * kernel's own outbound calls, not a tenant's. So this module only ever
- * needs to reason about conn_ids in [0, TCP_INBOUND_MAX_CONNS).
+ * (Network Fairness Phase 2's other half) fully protects this kernel's
+ * own outbound connections (net/ollama_client.c, net/inference.c) from
+ * being starved by inbound tenant load. When this module was written,
+ * outbound connections were ONLY the kernel's own calls -- they had no
+ * partition to attribute. P2 increment 2 breaks that premise: a tenant
+ * now reaches the kernel stack outbound through
+ * kernel/net_socket_service.c, and its connections land in the reserved
+ * tail. An outbound connection with no partition counts against nobody --
+ * the same "denial looks like absence" failure this module closes -- so
+ * attribution spans the full tcp_conns[] range via
+ * tcp_conn_attribute_partition(). The UID form keeps its inbound bound
+ * because its one caller (net/http.c) speaks inbound conn_ids and a
+ * bearer token; the socket service knows the caller's partition directly
+ * (its channel registration carries it) and calls the partition form, so
+ * no uid is invented for a tenant that has none.
  *
  * ─── Why 0 = unlimited by default ──────────────────────────────────────
  * Same convention as storage_quota.h/frame_pool.c/http_rate_limit.h's own
@@ -72,20 +81,32 @@
 // always < PARTITION_MAX, far below this value).
 #define TCP_CONN_PARTITION_NONE 0xFFFFFFFFu
 
-// Must be called once at startup (net/http.c's http_server_run(), alongside
-// its own init loop) before any connection is accepted. Unlike this
-// module's quota array (0 = unlimited is safely BSS-zero already), the
-// attribution array's "unattributed" sentinel is deliberately NOT 0 --
-// partition 0 (PARTITION_SYSTEM) is a real, commonly-used partition, so a
+// Must be called once before any attribution (net/http.c's
+// http_server_run(), alongside its own init loop; the socket service also
+// calls it on first registration — it is idempotent, and the explicit
+// init is REQUIRED rather than BSS-safe: unlike this module's quota array
+// (0 = unlimited is safely BSS-zero already), the attribution array's
+// "unattributed" sentinel is deliberately NOT 0 -- partition 0
+// (PARTITION_SYSTEM) is a real, commonly-used partition, so a
 // BSS-zeroed attribution array would misread every fresh slot as "already
-// attributed to partition 0" instead of "unattributed." This explicit init
-// is the fix, the same "BSS zero isn't automatically the right default"
-// carefulness tcp_init()'s own explicit conn_id stamping loop already
-// applies for a different field.
+// attributed to partition 0" instead of "unattributed."
 void tcp_quota_init(void);
 
+// POSIX-Environments P2 increment 2: attribute conn_id to partition_id
+// DIRECTLY, no uid. For callers that already know the caller's partition
+// (the socket service's registration carries it) rather than receiving an
+// identity at the wire (http.c's bearer token). Covers the FULL
+// tcp_conns[] range: a tenant's outbound connection must be attributed or
+// it counts against nobody. Same idempotence and the same
+// deny-before-attributing quota posture as the uid form below. Returns 1
+// when the conn_id is attributed (or already was), 0 when refused
+// (over-quota, or an out-of-range conn_id/partition_id).
+int tcp_conn_attribute_partition(int conn_id, uint32_t partition_id);
+
 // Attempts to attribute connection conn_id to uid's partition and admit it
-// against that partition's connection quota. Idempotent: if conn_id is
+// against that partition's connection quota. INBOUND conn_ids only
+// ([0, TCP_INBOUND_MAX_CONNS)) — the outbound tail is attributed through
+// tcp_conn_attribute_partition() above. Idempotent: if conn_id is
 // already attributed (to any partition), returns 1 immediately without
 // re-checking or double-counting -- callers are expected to invoke this on
 // every accumulation sweep until it succeeds, exactly like
@@ -107,7 +128,9 @@ int tcp_conn_attribute(int conn_id, uint32_t uid);
 // Safe to call on a never-attributed or already-released conn_id (no-op).
 // Callers (net/http.c) call this at both points a connection slot is
 // reclaimed -- normal dispatch-then-close and idle-timeout close -- the
-// same two call sites tcp_close() is already invoked from.
+// same two call sites tcp_close() is already invoked from. Full
+// tcp_conns[] range since P2 increment 2 (a tenant's outbound conn
+// releases here too).
 void tcp_conn_release(int conn_id);
 
 // Sets partition_id's concurrent inbound connection quota. 0 = unlimited
