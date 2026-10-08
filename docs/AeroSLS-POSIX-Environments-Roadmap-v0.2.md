@@ -835,6 +835,60 @@ tooth names at boot granularity (they are source teeth today), and per §11 Q2
 the question of whether an environment should pause alone rather than take its
 partition with it.
 
+### The announce gate — the pour waits for the replayed sidecar's `[env-id]` before it lands
+
+The sixth increment's payload made the restore path land on a sidecar that was
+parked, and *parked* turned out to be the wrong question. The payload's first
+CI run reddened three times at the same place — the durable guard's post-reboot
+identity wait (`cons_wait "[env-id] index=$INDEX" 90`, feeding clause L16 in
+`tests/env_storage_durable_check.sh`), whose failure is "the environment
+never announced its identity after the reboot" — and the first attempt was
+deterministic, reproduced on the build host with the guard's own exit status.
+The cause was in this phase, not the guard's: a freshly replayed sidecar blocks
+mid-boot at the ramdisk's RD_INFO handshake, parked at a channel in a `recv`,
+and that posture is indistinguishable from the captured idle park — so
+`env_payload_wait_parked()` said yes, and the pour replaced the half-finished
+boot's pages, `user_rip` and `user_rsp` with captured state. After the resume
+there was no boot left to finish: `boot()` never reached its `[env-id]` line —
+`IDENTITY_MARKER` (`user/sidecar/src/boot.rs`) is written to the environment's
+own console only and never appears on serial — and the guard, draining that
+console over HTTP, timed out against a buffer nothing was running to write to.
+Main never tripped this because main has no pour: as the guard's own comment
+records, the re-pause froze the fresh sidecar mid-boot and the operator's next
+act was to resume the partition and let the boot finish — the sequence the pour
+silently broke.
+
+**The gate.** Parked is now the first condition, not the only one. `struct
+EnvConsole` carries an `identity` flag (`kernel/env_console.c`), set only when
+the console's own drain path sees the sidecar's marker among the bytes it
+drains (`ec_sees_identity()`), and cleared at wiring and at release — the
+inject path writes the buffer directly and can never set it, so the flag can
+only come from this boot's announcement, never from the restore's echo of it.
+`env_payload_wait_parked()` (`kernel/env_payload.c`) is ready only when every
+task is parked **and** `env_console_identity_seen(partition, index)` sees that
+announcement. Everything else about the wait is untouched: the tasks loop runs
+first, so a missing sidecar is still answered at once; the bound stays
+`EP_WAIT_TICKS` 3000 (~30 s at timer.h's documented ~100 Hz) with the same
+no-yield discipline; and a timeout logs `announced=%d — proceeding on the
+posture as it stands` and proceeds — the gate decides *where the pour lands*,
+it is not a new refusal, and the capture-side pre-freeze wait is unchanged in
+practice: the record exists because the environment ran, so its flag has been
+set since boot.
+
+**The clauses.** T7's pins did not move: the pre-freeze wait before the
+quiesce, `env_payload_wait_parked()` before the repause, the pour after it with
+no yield between. `tests/env_payload_host_test.c` gained the check that names
+the defect — "parked but not yet announced is not the pour's go signal"
+returns the tick bound instead of proceeding — bringing the suite to 44 green.
+
+**The evidence.** The repair landed with all seven of its checks green,
+including `kernel-guards` at 1 h 32 m, whose live arm contains the very wait
+that failed: after the reboot the environment announces `[env-id]`, the shell
+answers it, and both files read back through the environment's own console
+(clause L16). Worth recording plainly: the defect was in this phase's restore
+path and was caught by P1b's guard, because P1b's reboot evidence rides P1a's
+replay and pour — each phase's gate now runs the other's payload.
+
 ---
 
 ## 5. Phase P1b — Durable environment storage
@@ -1243,7 +1297,11 @@ P1a is unblocked and is the thing E7 waits on, so it starts first. P2 has no dep
 | 2 | P1b — durable storage | a file larger than 71 168 bytes survives a reboot and is charged to the partition |
 | 3 | P3 — placement/migration/failover | an environment moves with its data, its console and its lease, or is refused by name |
 
-Step 2's three increments have landed: the format layer — the writable aerofs v2 — first (§5), then the durable device itself — the extent band, the persisted directory and the first-touch quota charge (§5's second-increment addendum), then the boot evidence itself: `tests/env_storage_durable_check.sh --live` runs in CI's `kernel-guards` job — the build host that has the ISO — re-making the gate on every push (write past 71 168 bytes, reboot, re-read through the environment's console, quota re-charged, over-quota refused by the quota's own error), with the wiring pinned by the guard's S13 clause (§5's third-increment addendum). Step 1's gate — an environment survives a reboot with its file and its shell variable, via its own console — is now measured rather than owed: the payload increment (§4's sixth) made the two CONTENTS clauses B10/B11 in the guard that already re-made the descriptor half, and the gate closes on that arm's first green live run.
+Step 2's three increments have landed: the format layer — the writable aerofs v2 — first (§5), then the durable device itself — the extent band, the persisted directory and the first-touch quota charge (§5's second-increment addendum), then the boot evidence itself: `tests/env_storage_durable_check.sh --live` runs in CI's `kernel-guards` job — the build host that has the ISO — re-making the gate on every push (write past 71 168 bytes, reboot, re-read through the environment's console, quota re-charged, over-quota refused by the quota's own error), with the wiring pinned by the guard's S13 clause (§5's third-increment addendum). Step 1's gate — an environment survives a reboot with its file and its shell variable, via its own console — is now measured rather than owed: the payload increment (§4's sixth) made the two CONTENTS clauses B10/B11 in the guard that already re-made the descriptor half, and the gate closes on that arm's first green live run. The payload's first
+CI run then found the restore path pouring onto a freshly replayed sidecar
+blocked mid-boot; §4's announce-gate repair closes that, and P1b's live arm
+re-makes it on every push — the identity wait it runs before clause L16 reads
+an environment that finished its own boot.
 
 E7's own gate — *"a static binary doing the first user's actual work, running natively, surviving a checkpoint/restore cycle"* — becomes reachable at the end of step 1 for the first half and the end of step 2 for the second, and E7's deliverable list (`AeroSLS-Linux-ABI-Shim-Design-v0.1.md` §10.4) is already written to report those halves separately rather than blur them.
 
@@ -1286,6 +1344,7 @@ Everything this document asserts about the tree, with its source.
 | The capture runs inside the frozen window and the pour runs after the repause with no yield, and a moved placement is refused before a byte moves | `kernel/persist.c` — `(void)env_payload_capture_all();` between the region commit and `env_ckpt_release_capture()`; `kernel/env_service.c` — `env_payload_wait_parked()` then `env_payload_restore()`; `kernel/env_payload.c` — `EP_REFUSE_PLACEMENT`; source clause T7 in `tests/env_checkpoint_restore_check.sh` |
 | A shell variable and the console's buffered bytes are payload, and both come back under the new boot's ids | `kernel/env_console.h` — `env_console_snapshot()`, `env_console_inject()`; `tests/env_payload_host_test.c` (43 checks, round trip plus the full refusal matrix) |
 | The two CONTENTS clauses are assertions fed through the environment's own console, and the tooth withholds the payload rather than the descriptor | `tests/env_checkpoint_restore_check.sh` — clauses B10/B11, live clauses L4b/L11, T7; `tests/env_checkpoint_restore_check_smoke.sh` — the `payload` tooth group (9 teeth) and the `no-restore` split |
+| The pour waits for parked **and** announced, the flag can only come from this boot's drained `[env-id]`, and a timeout proceeds by name instead of refusing | `kernel/env_payload.c` — `env_payload_wait_parked()`, `EP_WAIT_TICKS` 3000, the `announced=` timeout log; `kernel/env_console.c` — the `identity` flag, `ec_sees_identity()`, `env_console_identity_seen()`; `tests/env_payload_host_test.c` (44 checks); source clause T7 in `tests/env_checkpoint_restore_check.sh` |
 | The kernel brokers a tenant-reachable service through a `kernel.*` name, keyed to `(partition, index)` | `kernel/env_console.h` — `env_console_register()`, `env_console_name_index()`; `kernel/env_service.c` (`kernel.env.control`) |
 | Per-partition connection quotas exist, with syscalls and an HTTP surface, and 0 means unlimited | `net/tcp_quota.h` — `tcp_conn_attribute()`, `tcp_partition_set_conn_quota()`, `SYS_SLS_PARTITION_CONN_QUOTA_SET/LIST`; `net/http.c` — `api_partition_connquotas_list()` |
 | The starvation failure mode the quota closes is documented, not assumed | `net/tcp_quota.h`'s "Why this is a genuinely different mechanism" block |
@@ -1316,6 +1375,7 @@ Everything this document asserts about the tree, with its source.
 | No quiesce before capture | a checkpoint of two sidecars is internally inconsistent | P1a |
 | No descriptor version/checksum/refusal | a stale checkpoint is half-applied instead of refused | P1a |
 | The payload is never captured or poured — a replayed environment comes back empty | the file-bytes and shell-variable clauses cannot be asserted; "the environment came back" is measured but "came back with its contents" is not | P1a (sixth increment) |
+| The pour lands on a freshly replayed sidecar's half-finished boot, so the environment never announces its identity after the resume | the durable guard's post-reboot identity wait times out against a console nothing is running to write to, and a restored environment's boot is erased by its own restore | P1a (the announce gate) |
 | Environment storage is a RAM region | files do not survive reboot; the durable-storage claim is false | P1b |
 | aerofs-lite is read-only with a 71 168-byte file cap | a durable tenant filesystem would ship an unusable ceiling | P1b |
 | Durable storage is not quota-charged to the partition | a tenant's disk is unbounded and unmetered | P1b |
