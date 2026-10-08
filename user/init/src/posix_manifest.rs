@@ -185,12 +185,18 @@ pub fn build_posix_manifest(
 
 /// Build a **tenant-profile** POSIX manifest (POSIX-Environments E3): the
 /// runtime a per-partition environment gets. It carries only what a tenant
-/// needs — a budget MEM region, a console channel, and a block channel to
-/// its OWN ramdisk (`ramdisk_peer`) — and NONE of the system profile's
-/// direct-hardware caps: no network, no UART port I/O, no timer/serial IRQ
-/// binds, no NIC BAR. E2's kernel-side gate (cap_create_sidecar) already
-/// rejects a hardware cap in a non-system-partition manifest; this profile
-/// is the builder-side half — the two together are defence in depth.
+/// needs — a budget MEM region, a console channel, a block channel to
+/// its OWN ramdisk (`ramdisk_peer`), and (P2's first increment) a socket
+/// channel to the KERNEL-owned service `kernel.net.socket` — and NONE of
+/// the system profile's direct-hardware caps: no UART port I/O, no
+/// timer/serial IRQ binds, no NIC BAR, and no network DRIVER. The system
+/// profile's `network` cap names the sidecar `drv.network.0`; this one
+/// names a kernel service instead, deliberately — that sidecar lives in
+/// the system partition, and pointing a tenant at it would cross the LPAR
+/// Phase 11 IPC boundary, which E2's scoped registry refuses to wire.
+/// E2's kernel-side gate (cap_create_sidecar) already rejects a hardware
+/// cap in a non-system-partition manifest; this profile is the builder-
+/// side half — the two together are defence in depth.
 ///
 /// `name` is the instance's registry identity (e.g. "aerosls.posix.1"), so
 /// several environments coexist; `ramdisk_peer` is that environment's own
@@ -235,8 +241,23 @@ pub fn build_posix_manifest_tenant(
                 flags: 0,
             },
         }),
+        // POSIX-Environments P2, first increment: the tenant's socket
+        // channel, peerd at a KERNEL-OWNED name — never `drv.network.0`,
+        // the system partition's network sidecar. The service behind this
+        // name speaks NET_* and, in this increment, refuses every verb by
+        // name: the channel exists, is typed, and fails honestly, and the
+        // rest of the phase writes into it. Rights sit beside its console
+        // and ramdisk siblings (R | W | send).
+        Some(ManifestCap {
+            name: "network",
+            rights: 0x7, // R | W | send — NET_* to the kernel-owned service
+            kind: CapKind::Chan {
+                peer: Some("kernel.net.socket"),
+                flags: 0,
+            },
+        }),
         None, None, None, None, None,
-        None, None, None, None, None, None, None, None,
+        None, None, None, None, None, None, None,
     ];
     let m = Manifest {
         version_major: 1,
@@ -259,7 +280,7 @@ pub fn build_posix_manifest_tenant(
             chan_queue_depth: 16,
         }),
         caps,
-        n_caps: 3,
+        n_caps: 4,
         bootstrap: Some(Bootstrap {
             console: Some("console"),
             debug: None,
@@ -296,23 +317,37 @@ mod tests {
     }
 
     #[test]
-    fn tenant_profile_has_only_budget_console_and_its_own_ramdisk() {
-        // E3: a per-environment POSIX instance. Its own name and its own
-        // ramdisk peer; exactly three caps; NONE of the system profile's
-        // hardware or network caps.
+    fn tenant_profile_is_budget_console_ramdisk_and_kernel_socket() {
+        // E3 plus P2's first increment: a per-environment POSIX instance.
+        // Its own name, its own ramdisk peer, the kernel-owned socket
+        // service; exactly four caps; NONE of the system profile's
+        // hardware caps — and its network cap peers at the kernel-owned
+        // name, never at the system partition's network sidecar.
         let blob = build_posix_manifest_tenant(
             "aerosls.posix.1", "drv.ramdisk.1",
             0x3000_0000, 0x40000, 0x3040_0000);
         let m = parse_manifest(&blob).unwrap();
         assert_eq!(m.name, Some("aerosls.posix.1"));
-        assert_eq!(m.n_caps, 3);
-        // The three tenant caps are present...
+        assert_eq!(m.n_caps, 4);
+        // The four tenant caps are present...
         assert!(m.find_cap("budget").is_some());
         assert!(m.find_cap("console").is_some());
         let rd = m.find_cap("ramdisk").expect("ramdisk chan present");
         assert_eq!(rd.kind, CapKind::Chan { peer: Some("drv.ramdisk.1"), flags: 0 });
-        // ...and every system-profile hardware/network cap is absent.
-        for absent in ["network", "uart", "irq.timer.0", "irq.serial.0", "nic0.bar0"] {
+        // ...the socket cap's peer is exactly the kernel-owned service and
+        // never `drv.network.0`: that sidecar sits in the system partition,
+        // and a channel to it would be refused at creation for crossing
+        // partitions — the P2 system-peer tooth, pinned here at the source.
+        let net = m.find_cap("network").expect("network chan present");
+        assert_eq!(net.rights, 0x7);
+        let peer: &str = match &net.kind {
+            CapKind::Chan { peer: Some(p), flags: 0 } => p,
+            other => panic!("network must be a plain Chan cap, got {other:?}"),
+        };
+        assert_eq!(peer, "kernel.net.socket",
+                   "the tenant's socket cap peers at the kernel-owned service, never drv.network.0");
+        // ...and every system-profile hardware cap is absent.
+        for absent in ["uart", "irq.timer.0", "irq.serial.0", "nic0.bar0"] {
             assert!(m.find_cap(absent).is_none(),
                     "tenant profile must not carry '{absent}'");
         }

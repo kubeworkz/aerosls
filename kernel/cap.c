@@ -53,6 +53,7 @@
 #include "env_service.h"
 #include "env_console.h"
 #include "env_storage.h"   // POSIX-Environments Roadmap v0.2 Phase P1b
+#include "net_socket_service.h"  // POSIX-Environments P2 first increment
 #include "../arch/x86/user_paging.h"
 #include <stddef.h>
 
@@ -3886,6 +3887,24 @@ int cap_create_sidecar_in(uint32_t parent_pid,
                          * makes the sidecar announce its identity (boot.rs) —
                          * a console the attach surface serves, and only that. */
                         env_console_wired = 1;
+                    }
+                }
+                /* POSIX-Environments P2, first increment: the tenant's
+                 * socket service. The peer name "kernel.net.socket" is
+                 * kernel-owned, so the kernel end minted above is THIS
+                 * service's end — registered HERE, never resolved against
+                 * the sidecar registry, so a tenant's channel to it can
+                 * never cross partitions (the boundary, not the API: a
+                 * manifest pointing at drv.network.0 goes through the
+                 * registry branch below and is refused there instead). */
+                if (sidecar_prefix(sc->peer_name, "kernel.net.socket")) {
+                    if (!net_socket_service_register(k_rd, k_wr,
+                                                     pd->partition_id,
+                                                     pd->pid, pd->name)) {
+                        kernel_serial_printf(
+                            "[SIDECAR] PID %u '%s': socket service peer '%s' "
+                            "left unregistered (registry full)\n",
+                            pd->pid, pd->name, sc->peer_name);
                     }
                 }
             }

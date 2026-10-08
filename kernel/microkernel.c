@@ -8,6 +8,7 @@
 #include "../kernel/dashboard.h"
 #include "console_service.h"
 #include "env_console.h"
+#include "net_socket_service.h"
 
 extern void tier_mgr_init(void);
 extern void tier_mgr_tick(void);
@@ -305,6 +306,11 @@ void microkernel_service_poll(void) {
     // environment's own console into its per-environment buffer (never to
     // serial), so the HTTP attach surface has something to read.
     env_console_tick();
+    // POSIX-Environments P2 first increment: the same context drains each
+    // tenant's socket-service channel — answers the NET_INFO handshake and
+    // refuses every verb by name. Same single-writer argument as the tick
+    // above it (see net_socket_service.h).
+    net_socket_service_tick();
     // (E) Fire any scheduled agent runs
     agent_scheduler_tick();
 }
