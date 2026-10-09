@@ -18,41 +18,67 @@ static uint16_t partition_conn_count[PARTITION_MAX];
 static uint16_t partition_conn_quota[PARTITION_MAX];
 
 void tcp_quota_init(void) {
+    // Idempotent by design: net/http.c's http_server_run() and the socket
+    // service's first registration both call this, and either may run
+    // second. A second sentinel sweep would orphan every attribution the
+    // first caller had already bound (the counters would keep counting
+    // against a partition whose conn table said "unattributed"), so the
+    // first call arms the table and later calls are no-ops.
+    static int inited = 0;
+    if (inited) return;
+    inited = 1;
     // Every slot starts unattributed. See tcp_quota.h's own comment on why
     // this can't just rely on BSS zero-init the way partition_conn_count[]/
-    // partition_conn_quota[] safely do.
-    for (int i = 0; i < TCP_INBOUND_MAX_CONNS; i++) {
+    // partition_conn_quota[] safely do. Full TCP_MAX_CONNS range since P2
+    // increment 2: a tenant's outbound connection lands in the reserved
+    // tail and is attributed here too (tcp_conn_attribute_partition).
+    for (int i = 0; i < TCP_MAX_CONNS; i++) {
         tcp_conn_partition[i] = TCP_CONN_PARTITION_NONE;
     }
 }
 
-int tcp_conn_attribute(int conn_id, uint32_t uid) {
-    if (conn_id < 0 || conn_id >= TCP_INBOUND_MAX_CONNS) return 0;
+int tcp_conn_attribute_partition(int conn_id, uint32_t partition_id) {
+    // POSIX-Environments P2 increment 2: the FULL tcp_conns[] range. A
+    // tenant's outbound connection lands in the reserved tail
+    // (>= TCP_INBOUND_MAX_CONNS) and must be attributed to its partition
+    // here -- an unattributed outbound connection counts against nobody,
+    // which is exactly the "denial looks like absence" failure this module
+    // exists to close (the P2_TOOTH=unattributed tooth).
+    if (conn_id < 0 || conn_id >= TCP_MAX_CONNS) return 0;
+    if (partition_id >= PARTITION_MAX) return 0;  // defensive, mirrors http_rate_limit.c
 
-    // Idempotent: once attributed, every subsequent sweep's call for the
-    // same still-open connection is a no-op success, exactly like
-    // http_partition_rate_check() being re-invoked per request -- callers
-    // are expected to call this repeatedly until it returns 1 or the
-    // connection is torn down.
+    // Idempotent: once attributed, every subsequent call for the same
+    // still-open connection is a no-op success, exactly like
+    // http_partition_rate_check() being re-invoked per request.
     if (tcp_conn_partition[conn_id] != TCP_CONN_PARTITION_NONE) return 1;
 
-    uint32_t pid = partition_get_for_uid(uid);
-    if (pid >= PARTITION_MAX) return 0;   // defensive only, mirrors http_rate_limit.c's own guard
-
-    uint16_t quota = partition_conn_quota[pid];
-    if (quota != 0 && partition_conn_count[pid] >= quota) {
+    uint16_t quota = partition_conn_quota[partition_id];
+    if (quota != 0 && partition_conn_count[partition_id] >= quota) {
         // Over quota: deny before attributing -- same "denial happens
         // before any side effect" posture as storage_page_reserve().
         return 0;
     }
 
-    tcp_conn_partition[conn_id] = pid;
-    partition_conn_count[pid]++;
+    tcp_conn_partition[conn_id] = partition_id;
+    partition_conn_count[partition_id]++;
     return 1;
 }
 
+int tcp_conn_attribute(int conn_id, uint32_t uid) {
+    // The HTTP path (net/http.c): identity arrives as a bearer token, so
+    // the uid resolves to a partition here. The inbound bound is kept
+    // because http.c's conn_ids are inbound by construction; the outbound
+    // tail is reached through tcp_conn_attribute_partition() directly, by
+    // a caller that already knows the partition (the socket service's
+    // registration).
+    if (conn_id < 0 || conn_id >= TCP_INBOUND_MAX_CONNS) return 0;
+    return tcp_conn_attribute_partition(conn_id, partition_get_for_uid(uid));
+}
+
 void tcp_conn_release(int conn_id) {
-    if (conn_id < 0 || conn_id >= TCP_INBOUND_MAX_CONNS) return;
+    // Full range since P2 increment 2 — every attributed conn_id, inbound
+    // or outbound, releases here.
+    if (conn_id < 0 || conn_id >= TCP_MAX_CONNS) return;
     uint32_t pid = tcp_conn_partition[conn_id];
     if (pid == TCP_CONN_PARTITION_NONE) return;   // never attributed -- safe no-op
 
