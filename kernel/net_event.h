@@ -2,6 +2,7 @@
 #define NET_EVENT_H
 
 #include <stdint.h>
+#include "../arch/x86/lapic.h"
 
 /*
  * Phase E — Event-Driven I/O
@@ -38,10 +39,30 @@ extern volatile uint64_t cpu_idle_wait_count;
 void net_poll_tick(void);
 
 // Yield the CPU until the next interrupt fires.
-// Enables interrupts (STI) immediately before HLT so the CPU can wake
-// on the timer tick that drives net_poll_tick().  Returns after one
-// interrupt fires; the caller rechecks its condition in a loop.
+//
+// On the BSP: STI + HLT must be adjacent — the CPU guarantees one
+// instruction of interrupt shadow after STI, so HLT is entered before any
+// pending interrupt fires, avoiding a lost-wakeup race. Returns after one
+// interrupt (the BSP's armed LAPIC timer, ~10 ms) fires; the caller
+// rechecks its condition in a loop.
+//
+// On an AP: HLT would sleep FOREVER. Only the BSP's LAPIC timer is armed
+// (init_timer(), BSP boot); init_local_apic_registers() masks every core's
+// LVT timer and nobody arms it on the APs, so an AP has no periodic
+// interrupt to wake it, and a device IRQ may never be routed its way —
+// caught live: the socket service runs on an AP (ap_kernel_main), and a
+// tcp_connect()/tcp_recv() parked inside this wait never returned: no
+// SYN-ACK timeout line, no reply to the client, and the AP's console drain
+// stalled behind it. A masked LVT timer bit detects that case exactly; the
+// AP yields with PAUSE instead, the caller's loop rechecks its condition,
+// and the RX that satisfies it is drained by net_poll_tick() from the
+// BSP's timer ISR regardless of which core spins here.
 static inline void net_event_hlt_wait(void) {
+    if (lapic_read(LAPIC_REG_LVT_TMR) & (1u << 16)) {
+        /* No local timer (masked): HLT would never wake. */
+        __asm__ volatile("pause");
+        return;
+    }
     cpu_idle_wait_count++;
     // STI + HLT must be adjacent: the CPU guarantees one instruction of
     // interrupt shadow after STI, so HLT is entered before any pending
