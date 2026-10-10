@@ -289,8 +289,18 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
                 .unwrap_or(NET_ERR_PROTO);
             return Err(NetError::Status(status));
         }
-        let (new_id, rip, rport) =
-            parse_net_accept_body(&body[NetFrame::SIZE..]).ok_or(NetError::Protocol)?;
+        // The kernel's accept reply is the shared status body
+        // {status u16, value u64} with value = the NEW socket id
+        // (nss_reply_ok's contract; the host test reads the id from the
+        // same value field), not the rich {id, sockaddr} body this
+        // crate's doc comment describes — SocketOps drops the remote
+        // address anyway, so parse what the wire actually carries and
+        // hand the caller a usable id.
+        let (_status, value) =
+            parse_status_body(&body[NetFrame::SIZE..]).ok_or(NetError::Protocol)?;
+        let new_id = value as u32;
+        let rip = 0u32;
+        let rport = 0u16;
 
         self.socks.insert(
             new_id,
@@ -482,16 +492,29 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
     /// Receive a reply and return the body bytes (everything after the
     /// NetFrame header) as an owned Vec.
     fn recv_reply_owned(&mut self, expected_tag: u32, expected_ty: u16) -> Result<(RecvResult, alloc::vec::Vec<u8>), NetError> {
-        // Retry recv with yield.  A single non-blocking recv often returns
-        // ERR_STATE because the network sidecar hasn't had time to
-        // process the request yet.  yield lets the scheduler run the
-        // net sidecar before we retry.
+        // Retry recv, PARKING on the reply channel with a deadline between
+        // attempts. A bare k_yield loop gives the kernel's
+        // net_socket_service_tick() zero wall time: once this sidecar is
+        // the only runnable process (init parked, drivers parked), k_yield
+        // returns instantly, all 20 attempts finish, and the client gives
+        // up with Closed BEFORE the tick ever drains the request — caught
+        // live: the verb was logged reaching the service only AFTER the
+        // client had already walked away, so every applet net op failed
+        // silently. A deadline park wakes early when the reply lands or
+        // at the deadline via the timer ISR — the same way entry.rs's
+        // NET_INFO handshake waits (200ms × 10).
+        //
+        // Budget: a NET_CONNECT reply can take the stack's full ARP+SYN-
+        // ACK wait (~2.5s) before the service answers, so 25 parks × 200ms
+        // = 5s clears it with headroom; every other verb replies on the
+        // next tick after its frame is drained.
         //
         // NOTE: The kernel's channel transport only propagates F_NO_REPLY
         // through the flags field -- F_REPLY is never visible to the
         // receiver.  So we check kind and tag only.
-        extern "C" { fn k_yield(); }
-        for _ in 0..20 {
+        const REPLY_PARK_NS: u64 = 200_000_000; // 200ms
+        const MAX_PARKS: u32 = 25;              // ~5s worst case
+        for _ in 0..MAX_PARKS {
             let mut buf = [0u8; ChanHeader::MAX_PAYLOAD];
             let mut caps = [GrantedCap::default(); ChanHeader::MAX_CAPS];
             match self.k.recv(self.chan_r, &mut buf, &mut caps) {
@@ -512,7 +535,7 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
                 }
                 Err(_) => {}
             }
-            unsafe { k_yield(); }
+            let _ = self.k.wait(&[self.chan_r], REPLY_PARK_NS);
         }
         Err(NetError::Closed)
     }

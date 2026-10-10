@@ -53,7 +53,13 @@ echo "X86_C_SRC lists $(echo "$IN_MAKE" | wc -l) C files."
 missing=0
 for f in $(find $SEARCH_DIRS -name '*.c' 2>/dev/null | grep -v '/riscv/' | sort); do
     case "$f" in *_riscv.c) continue ;; esac
-    if echo "$IN_MAKE" | grep -qxF "$f"; then continue; fi
+    # Here-string, not `echo | grep -q`: under `set -o pipefail` a grep -q
+    # that exits on its match can close the pipe while echo still writes,
+    # echo dies of EPIPE, the pipeline returns 141 instead of 0, and a file
+    # that IS listed gets reported as missing — a false FAIL that only
+    # appears under load (CI's rerun hit it at a SHA that passed twice).
+    # The here-string needs no subshell and has no writer to kill.
+    if grep -qxF "$f" <<< "$IN_MAKE"; then continue; fi
     if [ -n "${EXCLUDED[$f]:-}" ]; then
         echo "skip: $f  (${EXCLUDED[$f]})"
         continue

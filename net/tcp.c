@@ -3,6 +3,16 @@
 #include "arp.h"
 #include "../kernel/kernel_io.h"
 #include "../kernel/net_event.h"  /* Phase E: HLT-based yield */
+#include "../kernel/timer.h"       /* kernel_tick_counter: AP-safe deadlines */
+
+/* The tick counter's real definition is kernel/timer.c's strong one; this
+ * weak default exists only so host tests that link net/tcp.c (e.g.
+ * tcp_pool_separation_host_test, which drives the SYN path but never
+ * tcp_connect) resolve the symbol without pulling in the timer — the same
+ * weak-stub convention cap.c uses for cap_current_pid(). A host test that
+ * actually ENTERED tcp_connect's waits would have to advance it (or avoid
+ * the call, as those tests already document). */
+__attribute__((weak)) volatile uint64_t kernel_tick_counter = 0;
 
 struct TCPConn tcp_conns[TCP_MAX_CONNS];
 
@@ -345,9 +355,17 @@ int tcp_connect(IPv4Addr dst_ip, uint16_t dst_port) {
     MACAddr dummy;
     if (!arp_lookup(resolve_ip, &dummy)) {
         arp_send_request(resolve_ip);
-        for (int i = 0; i < 50; i++) {
-            net_event_hlt_wait();
+        /* Wait ~0.5 s (50 ticks at ~100 Hz) for the reply. The deadline
+         * counts kernel_tick_counter — advanced by the BSP's LAPIC timer
+         * ISR — instead of counting hlt wakes: this code runs on the
+         * socket service's AP core, where HLT never wakes (APs leave their
+         * LVT timer masked — see net_event.h). The ARP reply itself is
+         * delivered by net_poll_tick() from that same BSP ISR, so spinning
+         * here with pause observes it just as well. */
+        uint64_t arp_deadline = kernel_tick_counter + 50;
+        while (kernel_tick_counter < arp_deadline) {
             if (arp_lookup(resolve_ip, &dummy)) break;
+            __asm__ volatile("pause");
         }
         if (!arp_lookup(resolve_ip, &dummy)) {
             kernel_serial_printf("[TCP] connect: ARP timeout for gateway\n");
@@ -389,13 +407,17 @@ int tcp_connect(IPv4Addr dst_ip, uint16_t dst_port) {
     // 4. Send SYN (tcp_send_flags increments snd_nxt for the SYN).
     tcp_send_flags(nc, TCP_FLAG_SYN, 0, 0);
 
-    // 5. Spin-wait for ESTABLISHED (200 ticks ≈ 2 s at 100 Hz).
-    for (int i = 0; i < 200; i++) {
-        net_event_hlt_wait();
+    // 5. Wait for ESTABLISHED (200 ticks ≈ 2 s at 100 Hz). Tick-deadline
+    //    + pause for the same reason as the ARP wait above: on the AP core
+    //    hlt never wakes, and the SYN-ACK/RST that resolves this is
+    //    processed by net_poll_tick() on the BSP either way.
+    uint64_t syn_deadline = kernel_tick_counter + 200;
+    while (kernel_tick_counter < syn_deadline) {
         if (nc->state == TCP_ESTABLISHED)
             return (int)(nc - tcp_conns);
         if (nc->state == TCP_CLOSED)
             return -1;
+        __asm__ volatile("pause");
     }
 
     // Timeout — clean up.

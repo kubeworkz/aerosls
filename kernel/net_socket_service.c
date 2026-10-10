@@ -35,9 +35,11 @@
 
 /* user/proto's NET_* verb numbers, spelled out. socket/connect/send/recv/
  * shutdown/close admit (increment 2); bind/listen/accept admit too (increment
- * 3's listener, below); everything else is refused as unknown. The full
- * eleven-name table below is the refusal renderer's "by name" source — the
- * out-of-table types are the ones the admit switch refuses. */
+ * 3's listener, below), and poll answers the listener/relay loops' readiness
+ * question with the spec's events body; everything else is refused as
+ * unknown. The full eleven-name table below is the refusal renderer's "by
+ * name" source — the out-of-table types are the ones the admit switch
+ * refuses. */
 #define NSS_VERB_SOCKET   2u
 #define NSS_VERB_BIND     3u
 #define NSS_VERB_CONNECT  4u
@@ -47,6 +49,7 @@
 #define NSS_VERB_RECV     8u
 #define NSS_VERB_SHUTDOWN 9u
 #define NSS_VERB_CLOSE    10u
+#define NSS_VERB_POLL     11u
 
 /* The grant rights bits the wire speaks (user/proto's R and W). A send's
  * data buffer arrives as an R-only grant; a recv's as a W-only grant — the
@@ -664,6 +667,53 @@ static void nss_handle(struct NetSockSvc* e, uint32_t plen, uint32_t tag) {
         e->socks[ns].partition = e->partition;
         nss_admits_total++;
         nss_reply_ok(e, ty, tag, ns);           /* value = the NEW socket id */
+        return;
+    }
+    case NSS_VERB_POLL: {
+        /* {sock_id u32}. The reply body is the spec's NET_POLL reply —
+         * {sock_id u32, events u16} (user/proto lib.rs) — NOT the status
+         * body: bit0 (0x01) is "ready" in every caller — an ESTABLISHED
+         * conn pending on a listener (the ACCEPT arm's exact scan, so
+         * poll and accept can never disagree), or a connected socket with
+         * bytes buffered or the peer closed (so recv after a ready poll
+         * returns the data or the 0 EOF the relay expects). An empty
+         * mask ANSWERS with 0 — never a refusal-by-name: every nc -l and
+         * relay loop polls first, so a `default`-arm refusal spins the
+         * caller through the refusal path forever (caught live: the
+         * listener's poll loop flooded refusals until the serial console
+         * drain starved out). */
+        if (plen < NSS_HDR + 4) { nss_refuse(e, ty, tag, NSS_STATUS_CAP, 0); return; }
+        uint32_t sid = (uint32_t)nss_buf[NSS_HDR]
+                     | ((uint32_t)nss_buf[NSS_HDR + 1] << 8)
+                     | ((uint32_t)nss_buf[NSS_HDR + 2] << 16)
+                     | ((uint32_t)nss_buf[NSS_HDR + 3] << 24);
+        struct NetSock* sk = nss_sock(e, sid);
+        if (!sk) { nss_refuse(e, ty, tag, NSS_STATUS_CAP, 0); return; }
+        uint64_t events = 0;
+        struct TCPConn* c = (sk->conn_id >= 0) ? &tcp_conns[sk->conn_id] : 0;
+        if (c && c->state == TCP_LISTEN) {
+            /* Accept-ready: the ACCEPT arm's scan, verbatim. */
+            for (int i = 0; i < TCP_MAX_CONNS; i++) {
+                if (i == sk->conn_id) continue;
+                struct TCPConn* p = &tcp_conns[i];
+                if (p->active && p->state == TCP_ESTABLISHED &&
+                    p->local_port == sk->lport) { events |= 0x01u; break; }
+            }
+        } else if (c) {
+            if (c->rbuf_used > 0) events |= 0x01u;
+            if (c->state == TCP_CLOSE_WAIT || c->state == TCP_CLOSED)
+                events |= 0x01u;   /* EOF is readable */
+        }
+        /* else: bound-but-not-listening / not-connected — honest 0. */
+        uint8_t reply[16 + 6];
+        for (uint32_t i = 0; i < 8; i++) reply[i] = nss_buf[i];
+        nss_wire_u16(reply + 8, 1);
+        nss_wire_u16(reply + 10, NSS_VERB_POLL);
+        nss_wire_u16(reply + 12, 0);
+        nss_wire_u16(reply + 14, 0);
+        nss_wire_u32(reply + 16, sid);
+        nss_wire_u16(reply + 20, (uint16_t)events);
+        nss_send(e, reply, 22, tag);
         return;
     }
     default:
