@@ -854,11 +854,25 @@ serial_wait_shell() {
     done
     return 1
 }
-serial_cmd() {   # serial_cmd <line> <fixed marker to wait for>
-    local line="$1" marker="$2" i
+serial_cmd() {   # serial_cmd <line> <fixed marker to wait for> — waits for a NEW occurrence
+    # The marker must be counted BEFORE the line goes out, and the wait must
+    # be for the count to GROW. A marker that already sits in the log — the
+    # same section printed by an earlier `partition storagequotas` — matched
+    # instantly and returned before the guest had run this command at all
+    # (caught live: the after-write copy caught boot1's pre-write section, so
+    # L10 reported `delta 0` and D4 reddened while the kernel had really
+    # charged 24 pages — the section simply printed after the cp). Only a
+    # count that grew proves THIS command's answer is in the log; if it never
+    # grows the command's output genuinely never arrived, and timing out says
+    # so instead of reading stale evidence.
+    local line="$1" marker="$2" i before_n now_n
+    before_n="$(grep -acF -- "$marker" "$LOG" 2>/dev/null || true)"
+    before_n="${before_n:-0}"
     printf '%s\n' "$line" > "$SER.in"
     for i in $(seq 1 60); do
-        grep -aqF -- "$marker" "$LOG" 2>/dev/null && return 0
+        now_n="$(grep -acF -- "$marker" "$LOG" 2>/dev/null || true)"
+        now_n="${now_n:-0}"
+        [ "$now_n" -gt "$before_n" ] && return 0
         sleep 1
     done
     return 1
