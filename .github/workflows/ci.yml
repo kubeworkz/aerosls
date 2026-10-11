@@ -330,6 +330,28 @@ jobs:
         run: cargo build -p aerosls --features target --manifest-path user/Cargo.toml
         working-directory: aerosls2
 
+      # ─── fake-kernel driver suites (the whole family, one gate) ─────────
+      # Every sidecar crate's integration tests run against
+      # user/kernel-sim's fake kernel — and nothing ran them anywhere until
+      # this step: ramdisk's driver_tests had been broken for six weeks
+      # (three stale move-return asserts) and one of them WEDGED FOREVER on
+      # a reply the driver never delivered — a real test binary sat hung for
+      # NINE DAYS, silently, because FakeClient::recv had no deadline. Both
+      # defects are fixed (the reply's returned cap carries the grant's real
+      # length; the fake's recv panics loudly at its deadline), and this
+      # step is what keeps them fixed: the suites are cheap (~0.1s), so the
+      # whole family rides together — kernel-sim's own bound/close tests,
+      # the network/ramdisk/nvme driver_tests, blockcache's client_tests,
+      # vfs/procmgr/dm. `-p` scoping keeps every other workspace member
+      # out of it.
+      - name: fake-kernel driver suites (kernel-sim + every driver's integration tests)
+        run: >-
+          cargo test --manifest-path user/Cargo.toml
+          -p aerosls-kernel-sim -p aerosls-network -p aerosls-ramdisk
+          -p aerosls-nvme-driver -p aerosls-blockcache -p aerosls-vfs
+          -p aerosls-procmgr -p aerosls-dm
+        working-directory: aerosls2
+
       # ─── aerobackup: the E7 census target's host test ──────────────────
       # backup/aerobackup is the workload E7's Linux ABI shim will be
       # measured against (tools/linux_abi_candidate.conf), so its retention

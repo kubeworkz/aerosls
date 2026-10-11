@@ -30,7 +30,7 @@ use aerosls_proto::kabi::{
 use aerosls_proto::*;
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Driver table layout (matches the manifest's initial caps in order).
 pub const DRIVER_STORAGE: u32 = 1;
@@ -41,6 +41,18 @@ pub const DRIVER_CONSOLE: u32 = 2;
 const T_TRANSIENT: u16 = 0x8000;
 
 const DEAD: u32 = u32::MAX;
+
+/// How long the fake client's blocking `recv` waits for a reply before it
+/// panics (see FakeClient::recv). Override with
+/// AEROSLS_FAKE_RECV_DEADLINE_MS — the wedge test below sets it short; an
+/// operator with a pathologically loaded box can raise it.
+fn recv_deadline() -> Duration {
+    std::env::var("AEROSLS_FAKE_RECV_DEADLINE_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_secs(30))
+}
 
 const CHAN_RIGHTS: u16 = 0x7; // SEND | RECV | CLOSE
 
@@ -764,7 +776,19 @@ impl FakeClient {
     }
 
     /// Receive the next message/event from the client end (blocks until one
-    /// arrives, mirroring the kernel wakeup).
+    /// arrives, mirroring the kernel wakeup) — bounded, never infinite.
+    ///
+    /// The wait ends at `recv_deadline()` (30s default) and panics on
+    /// expiry instead of parking forever. A reply that never arrives is a
+    /// wedged driver, and an unbounded wait here handed every consumer of
+    /// this fake the same silent-hang failure mode: the test binary prints
+    /// nothing, fails nothing, and never exits — a real driver_tests
+    /// process sat wedged like that for NINE DAYS before anyone noticed.
+    /// CI budgets and smoke timeouts recover from a loud failure; they
+    /// cannot recover a silent hang. Everything else is unchanged: queued
+    /// data pops immediately, kill_driver's shutdown still ends the wait
+    /// (Close event, or ERR_SHUTDOWN when the queue is empty), and
+    /// spurious wakeups recheck.
     pub fn recv(
         &self,
         chan: u32,
@@ -773,12 +797,36 @@ impl FakeClient {
     ) -> Result<RecvResult, i32> {
         let mut st = self.state.lock().unwrap();
         let ci = channel_by_client(&st, chan).ok_or(kabi::ERR_NOTFOUND)?;
+        let deadline = Instant::now() + recv_deadline();
+        let mut expired = false;
         loop {
             let ready = st.channels[ci].client_rx.front().is_some();
             if ready || st.shutdown {
                 break;
             }
-            st = self.cond.wait(st).unwrap();
+            let now = Instant::now();
+            if now >= deadline {
+                expired = true;
+                break;
+            }
+            let (guard, _) = self.cond.wait_timeout(st, deadline - now).unwrap();
+            st = guard;
+        }
+        if expired {
+            let outstanding = st.channels[ci].outstanding_tag;
+            // Panic OUTSIDE the lock: poisoning it would make the wedged
+            // driver thread's next lock().unwrap() panic too, burying the
+            // cause under a mutex-poisoning report.
+            drop(st);
+            panic!(
+                "FakeClient::recv: no message on channel {} within {:?} (outstanding \
+                 request tag {:?}) — the driver thread never answered. A wedged driver \
+                 used to block here forever and hang the whole test binary; it fails \
+                 loudly now.",
+                chan,
+                recv_deadline(),
+                outstanding
+            );
         }
         let ch = &mut st.channels[ci];
         let Some(entry) = ch.client_rx.pop_front() else {
@@ -980,5 +1028,59 @@ impl Kernel for FakeClient {
             return Err(kabi::ERR_SHUTDOWN);
         }
         Ok(client_ready_kind(&st, chan).unwrap_or(CH_KIND_NONE))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The wedge the recv deadline exists for: a client `recv` whose
+    /// driver never answers must FAIL LOUDLY instead of parking forever.
+    /// No driver thread is booted here, so nothing ever replies; with a
+    /// short deadline the panic path proves itself in half a second —
+    /// the failure mode that let a real driver_tests process sit wedged
+    /// for nine days, silently, is now a named panic.
+    #[test]
+    #[should_panic(expected = "never answered")]
+    fn recv_wedge_panics_instead_of_hanging() {
+        std::env::set_var("AEROSLS_FAKE_RECV_DEADLINE_MS", "500");
+        let (_fake, client) = FakeKernel::new(vec![0u8; 64], 1);
+        let mut buf = [0u8; 64];
+        let mut caps = [GrantedCap::default(); 4];
+        let _ = client.recv(0, &mut buf, &mut caps);
+    }
+
+    /// The bound changes nothing for the healthy paths: the deadline
+    /// override above is process-wide, so pin here that a SHORT deadline
+    /// still delivers a queued message instantly and a kill_driver close
+    /// still wakes a waiter (the two ways recv legitimately ends).
+    #[test]
+    fn short_deadline_still_delivers_and_closes() {
+        std::env::set_var("AEROSLS_FAKE_RECV_DEADLINE_MS", "500");
+        let (fake, client) = FakeKernel::new(vec![0u8; 64], 1);
+
+        // Driver → client: a queued message pops immediately. The send
+        // is addressed by the DRIVER-side channel handle (the table slot
+        // the server loop discovers via cap_info), not the client's own
+        // channel number — find it the same way a real server does.
+        let handle = (0u32..16)
+            .find(|&s| {
+                s != DRIVER_CONSOLE
+                    && matches!(fake.cap_info(s), Ok(i) if i.ty == kabi::CAP_CHAN)
+            })
+            .expect("a wired channel handle");
+        fake.send(handle, 9, 0, &[4, 5, 6], &[], kabi::TIMEOUT_NONE)
+            .unwrap();
+        let mut buf = [0u8; 64];
+        let mut caps = [GrantedCap::default(); 4];
+        let rr = client.recv(0, &mut buf, &mut caps).unwrap();
+        assert_eq!(rr.tag, 9);
+        assert_eq!(&buf[..3], &[4, 5, 6]);
+
+        // kill_driver still wakes a blocked recv with the close event.
+        client.kill_driver(0);
+        let rr = client.recv(0, &mut buf, &mut caps).unwrap();
+        assert_eq!(rr.kind, CH_KIND_CLOSE);
     }
 }

@@ -394,7 +394,15 @@ fn reply_status<K: Kernel>(
     let send_cap = [SendCap {
         slot: grant.map_or(u32::MAX, |g| g.handle),
         offset: 0,
-        len: BLOCK_SIZE,
+        // The grant's REAL length — not a hard-coded BLOCK_SIZE. The
+        // fake kernel validates off+len against the grant's region, so
+        // BLOCK_SIZE made every reply carrying a smaller-than-block
+        // buffer (a 256-byte region) fail ERR_RANGE — and this
+        // `let _ =` ate the error, so the client waited forever for a
+        // reply that had already failed to send: a wedged test binary
+        // that sat hung for nine days. Same move-return shape (9b57b1d),
+        // honest length.
+        len: grant.map_or(0, |g| g.len as u32),
         rights: grant.map_or(0, |g| g.rights),
         flags: 0,
     }];
