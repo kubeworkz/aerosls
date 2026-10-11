@@ -3827,16 +3827,6 @@ pub fn nc<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
             Ok(p) => p,
             Err(_) => return Step::Exit(2),
         };
-        let mut ip_bytes = [0u8; 4];
-        for (idx, octet) in host_str.split('.').enumerate() {
-            if idx >= 4 {
-                return Step::Exit(2);
-            }
-            ip_bytes[idx] = match octet.parse() {
-                Ok(v) => v,
-                Err(_) => return Step::Exit(2),
-            };
-        }
         // The client holds the LOGICAL u32 — first dotted octet in the
         // MSB ("10.0.2.15" -> 0x0A00020F) — the contract user/proto's
         // encode_sockaddr and kernel.net.socket's CONNECT decode share
@@ -3847,8 +3837,13 @@ pub fn nc<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
         // dial to 10.0.2.15 reached tcp_connect as 0x0A00020F — off the
         // kernel's own address — went out the wire instead of the
         // loopback hook, and timed out waiting for a SYN-ACK that could
-        // never arrive (caught live: the P2 L5 same-host flood).
-        let ip = u32::from_be_bytes(ip_bytes);
+        // never arrive (caught live: the P2 L5 same-host flood). The
+        // parse lives in nc_parse_ip() below so its host test can pin
+        // the round trip end to end.
+        let ip = match nc_parse_ip(host_str) {
+            Some(ip) => ip,
+            None => return Step::Exit(2),
+        };
         let sock_id = match ctx.net().unwrap().socket(sock_type) {
             Ok(id) => id,
             Err(_) => return Step::Exit(1),
@@ -5927,9 +5922,32 @@ pub fn register_default_applets<K: Kernel, A: BufferAlloc>(pm: &mut ProcManager<
     pm.register_applet("sshd", sshd);
 }
 
+/// Parse nc's dotted-quad argument into the LOGICAL u32 — first octet
+/// in the MSB ("10.0.2.15" -> 0x0A00020F) — the value user/proto's
+/// encode_sockaddr LE-encodes onto the wire and kernel.net.socket's
+/// CONNECT decode turns back into its network-order IPv4Addr. The shape
+/// is byte-for-byte the inline parse this replaced: a 3-part quad leaves
+/// the last octet 0, a 5th octet or any non-number is an error. The
+/// host test below pins the whole round trip (parse -> encode -> the
+/// kernel's own decode against KERNEL_STATIC_IP), because the
+/// from_le_bytes double-swap this contract forbids shipped once and
+/// cost every same-host dial its SYN-ACK timeout (caught live: the P2
+/// L5 flood).
+fn nc_parse_ip(host_str: &str) -> Option<u32> {
+    let mut ip_bytes = [0u8; 4];
+    for (idx, octet) in host_str.split('.').enumerate() {
+        if idx >= 4 {
+            return None;
+        }
+        ip_bytes[idx] = octet.parse().ok()?;
+    }
+    Some(u32::from_be_bytes(ip_bytes))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_line as parse_line_raw, Stage};
+    use super::{nc_parse_ip, parse_line as parse_line_raw, Stage};
+    use aerosls_proto::encode_sockaddr;
 
     fn st(argv: &[&str]) -> Stage {
         Stage {
@@ -5953,6 +5971,48 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    /// nc's dotted-quad parse survives the whole wire round trip:
+    /// parse -> the LOGICAL u32 -> encode_sockaddr's LE bytes -> the
+    /// kernel's CONNECT decode (verbatim C:
+    /// `(ap[0]<<24)|(ap[1]<<16)|(ap[2]<<8)|ap[3]` from
+    /// kernel/net_socket_service.c, the same one
+    /// tests/net_socket_service_host_test.c pins from the C side) ->
+    /// KERNEL_STATIC_IP (include/config.h: 0x0F02000A for 10.0.2.15,
+    /// i.e. memory bytes 0A 00 02 0F = the on-wire octets). The
+    /// regression this pins: `from_le_bytes` in the old inline parse
+    /// double-swapped, the kernel saw 0x0A00020F instead of its own
+    /// address, every same-host dial missed ipv4_send's loopback hook
+    /// and died on the SYN-ACK timeout (caught live: the P2 L5 flood).
+    #[test]
+    fn nc_parse_ip_round_trips_through_the_kernel_decode() {
+        let ip = nc_parse_ip("10.0.2.15").expect("10.0.2.15 parses");
+        assert_eq!(ip, 0x0A00020F, "logical u32: first octet in the MSB");
+
+        let sa = encode_sockaddr(ip, 8082);
+        let kernel_ip = ((sa[0] as u32) << 24) | ((sa[1] as u32) << 16)
+                      | ((sa[2] as u32) << 8) | (sa[3] as u32);
+        assert_eq!(
+            kernel_ip, 0x0F02000A,
+            "the kernel's decode must land on KERNEL_STATIC_IP — its own address"
+        );
+        assert_eq!([sa[4], sa[5]], 8082u16.to_le_bytes(), "port stays LE");
+    }
+
+    /// The parse's shape, kept byte-for-byte from the inline original:
+    /// more parts than fit, or any non-number octet, is the Exit(2)
+    /// None; a short quad leaves the missing octets 0.
+    #[test]
+    fn nc_parse_ip_shape_and_failures() {
+        assert_eq!(nc_parse_ip("127.0.0.1"), Some(0x7F000001));
+        assert_eq!(nc_parse_ip("255.255.255.255"), Some(0xFFFF_FFFF));
+        assert_eq!(nc_parse_ip("1.2.3"), Some(0x0102_0300));
+        assert_eq!(nc_parse_ip("1.2.3.4.5"), None);
+        assert_eq!(nc_parse_ip("a.b.c.d"), None);
+        assert_eq!(nc_parse_ip("256.1.1.1"), None);
+        assert_eq!(nc_parse_ip(""), None);
+        assert_eq!(nc_parse_ip("1.2.3."), None);
     }
 
     #[test]
