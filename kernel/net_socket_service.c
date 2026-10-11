@@ -528,6 +528,34 @@ static void nss_handle(struct NetSockSvc* e, uint32_t plen, uint32_t tag) {
         void* buf = nss_grant_ptr(nss_out_caps, nss_out_n_caps,
                                   NSS_RIGHT_W, &blen);
         if (!buf) { nss_refuse(e, ty, tag, NSS_STATUS_CAP, 0); return; }
+        /* One pass per tick — the ACCEPT arm's rule, for the same reason
+         * (its comment names this hazard; http.c's own loop and
+         * tls_platform.c pre-check rbuf_used for it too): tcp_recv() spins
+         * in net_event_hlt_wait() until data or close, and this tick runs
+         * in ring-0 non-IRQ context where that spin stalls the WHOLE
+         * kernel — caught live: the L5 arm's idle ESTABLISHED conn froze
+         * the guest outright (heartbeat stopped, no fault, QEMU alive).
+         * Readiness is the POLL arm's bit0 check verbatim, so poll and
+         * recv can never disagree: data buffered → tcp_recv returns
+         * immediately; peer closed → it returns the 0 EOF; anything else
+         * (established-idle, listen, SYN-sent) answers NET_ERR_WOULDBLOCK
+         * — the status body shape ACCEPT's EAGAIN uses, and the exact
+         * status net_client.rs recv() already documents — never a block
+         * and never a refusal-by-name. */
+        struct TCPConn* rc = &tcp_conns[sk->conn_id];
+        if (rc->rbuf_used == 0 &&
+            rc->state != TCP_CLOSE_WAIT && rc->state != TCP_CLOSED) {
+            uint8_t reply[16 + 10];
+            for (uint32_t i = 0; i < 8; i++) reply[i] = nss_buf[i];
+            nss_wire_u16(reply + 8, 1);
+            nss_wire_u16(reply + 10, NSS_VERB_RECV);
+            nss_wire_u16(reply + 12, NSS_ERR_FLAG);
+            nss_wire_u16(reply + 14, 0);
+            nss_wire_u16(reply + 16, 10u);      /* NET_ERR_WOULDBLOCK */
+            for (uint32_t i = 0; i < 8; i++) reply[18 + i] = 0;
+            nss_send(e, reply, 26, tag);
+            return;
+        }
         int got = tcp_recv(sk->conn_id, buf, (uint16_t)blen);
         if (got < 0) { nss_refuse(e, ty, tag, NSS_STATUS_CAP, 0); return; }
         nss_reply_ok(e, ty, tag, (uint64_t)(uint32_t)got);

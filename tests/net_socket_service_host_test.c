@@ -670,6 +670,55 @@ int main(void) {
               "the stack recv saw the granted buffer length");
         CHECK(memcmp(rbuf, "world", 5) == 0,
               "the W-grant buffer was filled with the stack's reply");
+
+        /* Idle-ESTABLISHED recv tooth: an idle conn must answer
+         * NET_ERR_WOULDBLOCK WITHOUT entering the stack. tcp_recv() spins
+         * in net_event_hlt_wait() until data or close, and this service
+         * tick runs in ring-0 non-IRQ context, where that spin stalls the
+         * WHOLE kernel — caught live: the L5 arm's idle conn froze the
+         * guest outright (heartbeat stopped, no fault, QEMU alive). The
+         * stub would happily "return data"; the call COUNT is what proves
+         * the service never reached it — the anti-spin assertion. The
+         * state flip below writes the real tcp_conns[] the service scans
+         * (the same pool the isolation teeth walk), leaving active=0 so no
+         * accept-scan elsewhere can see this conn. */
+        uint32_t idle_conn = (uint32_t)g_tcp_last_conn;
+        tcp_conns[idle_conn].state     = TCP_ESTABLISHED;
+        tcp_conns[idle_conn].rbuf_used = 0;
+        int recv_before = g_tcp_calls_recv;
+        /* Its own buffer: cap_create_mem refuses to alias the live MEM
+         * object the recv case above still holds over rbuf. */
+        uint8_t* iroom_raw = (uint8_t*)malloc(8192);
+        if (!iroom_raw) { printf("FAIL: malloc idle-recv buffer\n"); return 1; }
+        uint8_t* iroom = (uint8_t*)(((uintptr_t)iroom_raw + 4095u) & ~(uintptr_t)4095u);
+        memset(iroom, 0, 4096);
+        uint16_t islot = 0;
+        if (cap_create_mem(a2.far_pid, (uint64_t)(uintptr_t)iroom, 1,
+                           0x3 /* R|W */, &islot) != 0) {
+            printf("FAIL: cap_create_mem for the idle-recv buffer\n");
+            return 1;
+        }
+        uint8_t idle_req[20];
+        net_frame(idle_req, 8);                /* NET_RECV */
+        idle_req[16] = (uint8_t)sock_a; idle_req[17] = 0;
+        idle_req[18] = 0; idle_req[19] = 0;
+        struct SLSCapDesc idlerd = { .slot = islot, .offset = 0, .len = 16,
+                                     .rights = 0x2 /* W */, .flags = 0 };
+        CHECK(far_send_caps(&a2, idle_req, 20, 54, &idlerd, 1) == 0,
+              "the sidecar sends NET_RECV on an idle ESTABLISHED conn");
+        net_socket_service_tick();
+        n = far_recv(&a2, reply, sizeof reply, &tag);
+        CHECK(n == 26 && reply_u16(reply, 12) == 0x0001 &&
+              reply_u16(reply, 16) == 10,
+              "the idle recv answers NET_ERR_WOULDBLOCK (error flag + status 10)");
+        CHECK(reply_u16(reply, 10) == 8,
+              "the would-block answer echoes the NET_RECV verb");
+        CHECK(g_tcp_calls_recv == recv_before,
+              "the stack recv was NEVER entered on the idle conn (no ring-0 spin)");
+        tcp_conns[idle_conn].state     = TCP_CLOSED;
+        tcp_conns[idle_conn].rbuf_used = 0;
+
+        free(iroom_raw);
         free(rbuf_raw);
         free(membuf_raw);
     }
