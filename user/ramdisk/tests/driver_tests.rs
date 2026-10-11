@@ -100,8 +100,12 @@ fn boot_handshake_then_read() {
     assert_eq!(status, RD_OK);
     assert_eq!(bytes, 512);
     assert_eq!(client.region_bytes(region), storage[..512].to_vec());
-    // The transient grant was auto-revoked at the reply.
-    assert_eq!(fake.driver_grant_count(), 0);
+    // Move-return (9b57b1d): the window=1 buffer travels back in the
+    // reply and is RE-ADOPTED for reuse — the driver table keeps exactly
+    // one live grant for it, not zero. (These asserts predated the
+    // move-return transport and went stale with it; nothing ran this
+    // suite in CI, so the rot sat for six weeks.)
+    assert_eq!(fake.driver_grant_count(), 1);
 
     // Read a later block.
     let region2 = client.new_region(vec![0u8; 512], R | W);
@@ -181,7 +185,11 @@ fn read_requires_writable_grant() {
     assert_eq!(status, RD_ERR_CAP);
     // Buffer untouched.
     assert_eq!(client.region_bytes(region), vec![0u8; 512]);
-    assert_eq!(fake.driver_grant_count(), 0);
+    // Move-return: a refusal still returns the buffer (the window=1
+    // client is never left holding a grant the driver refused), so it is
+    // re-adopted rather than revoked — one live grant, same as the
+    // success path.
+    assert_eq!(fake.driver_grant_count(), 1);
 
     client.kill_driver(0);
     t.join().unwrap();
@@ -531,7 +539,15 @@ fn client_close_drops_endpoint() {
     };
     client.send(0, 2, 0, &rw_req(RD_READ, 0, 1), &[grant]).unwrap();
     client.close(0, CLOSE_PEER, 0).unwrap();
-    assert_eq!(fake.driver_grant_count(), 0);
+    // Two legal outcomes, both bounded (capability-layer spec §4.3 rule
+    // 5, move-return edition): close wins the race → the transient is
+    // still listed on the channel and revoked at close (0); the reply
+    // wins → the buffer was already re-adopted for the client and is no
+    // longer a channel transient (1). What must NEVER happen is growth
+    // — a count above 1 is a leak, which is exactly the class of defect
+    // this suite once hid behind an unbounded wait.
+    let n = fake.driver_grant_count();
+    assert!(n <= 1, "leaked transients: driver_grant_count={}", n);
 
     // A fresh injected endpoint still works (the driver survived).
     let ep = client.inject_posix_endpoint().unwrap();
