@@ -17,7 +17,54 @@ static uint16_t ip_checksum(struct IPv4Header* hdr) {
 // ─── Build and transmit an Ethernet + IPv4 frame ─────────────────────────────
 // dst_ip=0xFFFFFFFF: broadcast — Ethernet ff:ff:ff:ff:ff:ff, bypasses ARP.
 // Callers (udp_send) pass src_ip explicitly; ipv4_send always uses NET_MY_IP.
+//
+// Loopback (dst_ip == our OWN address): delivered to THIS stack's receive
+// path instead of the wire. QEMU user-net (slirp) does not hairpin a guest's
+// packets back into that same guest, so a connect to our own address would
+// ARP-resolve, transmit, and silently vanish — the local listener never sees
+// the SYN, the accept gate never runs, and the P2 guard's quota-flood
+// topology (E1 connects to E2's :8082 listener, both environments inside the
+// same partition) can never produce its by-name refusal. Caught live: the
+// L5 arm's flood step failed with "the flood did not reach the accept gate
+// (is the guest's own address hairpinned by user-net?)" — it is not, and
+// cannot be made to be. One hook closes it for every protocol: the frame is
+// built exactly as the wire path builds it (same headers, same checksums)
+// and handed to ipv4_handle_packet, so tcp_handle_segment / udp_handle_
+// packet / icmp see a byte-identical segment and every reply routes back
+// through this same hook (SYN → SYN-ACK → ACK each nest once; bounded).
+static void ipv4_loopback_send(uint8_t proto, void* payload, uint16_t plen) {
+    uint8_t* pkt = (uint8_t*)net_alloc_buf();
+    if (!pkt) return;
+    struct EthernetHeader* eth = (struct EthernetHeader*)pkt;
+    struct IPv4Header*     ip  = (struct IPv4Header*)(pkt + ETH_HDR_LEN);
+    uint8_t* dat = (uint8_t*)ip + sizeof(struct IPv4Header);
+
+    eth->dst       = net_my_mac;   /* ourselves, both directions */
+    eth->src       = net_my_mac;
+    eth->ethertype = htons(ETHERTYPE_IPV4);
+
+    ip->version_ihl = 0x45;
+    ip->dscp        = 0;
+    ip->total_len   = htons((uint16_t)(sizeof(struct IPv4Header) + plen));
+    ip->id          = htons(ip_id_counter++);
+    ip->flags_frag  = 0;
+    ip->ttl         = 64;
+    ip->protocol    = proto;
+    ip->src         = NET_MY_IP;
+    ip->dst         = NET_MY_IP;
+    ip->checksum    = ip_checksum(ip);
+
+    for (uint16_t i = 0; i < plen; i++) dat[i] = ((uint8_t*)payload)[i];
+
+    ipv4_handle_packet(eth, ip);
+    net_free_buf(pkt);
+}
+
 void ipv4_send(IPv4Addr dst_ip, uint8_t proto, void* payload, uint16_t plen) {
+    if (dst_ip == NET_MY_IP) {
+        ipv4_loopback_send(proto, payload, plen);
+        return;
+    }
     uint8_t* pkt = (uint8_t*)net_alloc_buf();
     if (!pkt) return;
 

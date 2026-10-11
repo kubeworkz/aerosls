@@ -427,6 +427,116 @@ int main(void) {
     CHECK(diff9 <= 1, "scenario 9: with no weights configured anywhere, behavior reproduces scenario 1's fair (not proportional) split exactly");
     CHECK(g_partition_turns_remaining == 0, "scenario 9: g_partition_turns_remaining never becomes nonzero when every partition sits at the default weight 1 (backward-compatibility guarantee, verified directly)");
 
+    /* ── Scenario 10 (L5 scheduler-wedge hunt): park → wake → pick, through
+     * the REAL pickers and the EXACT descriptor writes the park and wake
+     * perform. The live L5 arm wedged with `[CAP] woken PID 104 (channel
+     * 10)` on the serial and the scheduler never picking 104 again — its
+     * console input queue stayed undrained and every later env_console_write
+     * refused with queued=0 — while the rest of the system kept running.
+     * Static reading of the whole chain (pick_next_runnable →
+     * pick_next_partition → pick_next_process_in_partition) says a
+     * descriptor left in the wake's posture MUST be picked within one
+     * rotation; this scenario pins that claim as an executable invariant,
+     * so a future regression in the pickers (or in proc_runnable's shape)
+     * is caught here instead of only in a 30-minute live arm. Layout mirrors
+     * the live failure: PARTITION_SYSTEM {100 init, 102 drv.ramdisk.0,
+     * the E1 control plane}, partition 1 {103 drv.ramdisk.1, 104
+     * aerosls.posix.1}, partition 2 {105, 106}. ──────────────────────────── */
+    reset_proc_table();
+    add_runnable(0, 100, PARTITION_SYSTEM);   /* init */
+    add_runnable(1, 102, PARTITION_SYSTEM);   /* drv.ramdisk.0 */
+    add_runnable(2, 1, PARTITION_SYSTEM);     /* kplane: post-yield posture */
+    proc_table[2].is_control_plane = 1;       /* (proc_control_plane_tick's
+                                                 flip): SUSPENDED +
+                                                 resume_control=1 */
+    proc_table[2].resume_control   = 1;
+    add_runnable(3, 103, 1);                  /* drv.ramdisk.1 */
+    add_runnable(4, 104, 1);                  /* aerosls.posix.1 */
+    add_runnable(5, 105, 2);                  /* drv.ramdisk.2 */
+    add_runnable(6, 106, 2);                  /* B's sidecar */
+    proc_count = 6;
+
+    /* 104 parks exactly the way cap_wait_chans leaves it: BLOCKED, wait
+     * LIST registered (console chan 10 + ramdisk chan 11), park recorded
+     * as SYS_SLS_CHAN_WAIT. kernel_rsp zeroed so that after the wake
+     * proc_runnable() depends on resume_kernel ALONE — the sharpest form
+     * of "the wake itself makes it schedulable" (an async-child shape:
+     * no kernel_enter_ring3 frame, no timer-saved ring3_ctx yet). */
+    proc_table[4].state            = PROC_BLOCKED;
+    proc_table[4].kernel_rsp       = 0;
+    proc_table[4].waiting_nchans   = 2;
+    proc_table[4].waiting_chans[0] = 10;
+    proc_table[4].waiting_chans[1] = 11;
+    proc_table[4].park_syscall     = 45;   /* SYS_SLS_CHAN_WAIT */
+    proc_table[4].resume_kernel    = 0;
+
+    /* Tick threading: the live cadence, using the pickers exactly as their
+     * two callers do — pick_next_partition from the last-scheduled
+     * partition, then pick_next_process_in_partition with exclude = the
+     * process that just ran (schedule_ring3's shape; the CP's
+     * pick_next_runnable passes -1, a strict superset of the same pick).
+     * A picked process "runs one slice" and goes back to SUSPENDED with
+     * has_ring3_ctx=1 — what schedule_ring3's context save does — and the
+     * control plane's slice ends flipped back runnable with resume_control
+     * — what proc_control_plane_tick does. */
+    int cur10 = -1;
+    uint32_t lastp10 = PARTITION_SYSTEM;
+    int turns103 = 0, turns104 = 0, turns_cp = 0;
+    for (int tick = 0; tick < 30; tick++) {
+        uint32_t chosen10;
+        if (!pick_next_partition(lastp10, &chosen10)) break;
+        int idx10 = pick_next_process_in_partition(chosen10, cur10);
+        if (idx10 < 0) break;
+        if (idx10 == 3) turns103++;
+        if (idx10 == 4) turns104++;
+        if (idx10 == 2) turns_cp++;
+        proc_table[idx10].state        = PROC_SUSPENDED;
+        proc_table[idx10].has_ring3_ctx = 1;
+        cur10     = idx10;
+        lastp10   = chosen10;
+    }
+    CHECK(turns104 == 0, "scenario 10: while 104 is parked (BLOCKED, wait list registered) the pickers never choose it — the park posture is respected");
+    CHECK(turns103 >= 5, "scenario 10: its partition-mate 103 keeps getting partition 1's turns while 104 is parked (the partition stays live)");
+
+    /* The wake — byte for byte what cap_wake_chan(chan 10) writes when the
+     * parked wait LIST contains that channel. */
+    proc_table[4].state         = PROC_SUSPENDED;
+    proc_table[4].resume_kernel = 1;
+    proc_table[4].waiting_chan  = CAP_NONE;
+    proc_table[4].waiting_nchans = 0;
+
+    turns103 = 0; turns104 = 0; turns_cp = 0;
+    for (int tick = 0; tick < 30; tick++) {
+        uint32_t chosen10;
+        if (!pick_next_partition(lastp10, &chosen10)) break;
+        int idx10 = pick_next_process_in_partition(chosen10, cur10);
+        if (idx10 < 0) break;
+        if (idx10 == 3) turns103++;
+        if (idx10 == 4) turns104++;
+        if (idx10 == 2) turns_cp++;
+        proc_table[idx10].state        = PROC_SUSPENDED;
+        proc_table[idx10].has_ring3_ctx = 1;
+        cur10   = idx10;
+        lastp10 = chosen10;
+    }
+    printf("   (scenario 10 post-wake tallies over 30 ticks: 103=%d, 104=%d, kplane=%d)\n",
+           turns103, turns104, turns_cp);
+    CHECK(turns104 >= 3, "scenario 10: after the wake's exact field writes, the pickers choose 104 within a bounded number of ticks — the live wedge (woken, never picked) is NOT reproducible from the wake's posture alone");
+    CHECK(turns103 >= 3, "scenario 10: 104's wake does not starve its partition-mate 103 — both rotate within partition 1");
+    CHECK(turns_cp >= 2, "scenario 10: the control plane still gets its SYSTEM-partition turns across the rotation");
+
+    /* The picked-104 frame must be the cap_recv_resume shape, and building
+     * it must consume resume_kernel (proc_build_resume_frame's contract —
+     * the same builder schedule_ring3/kernel_switch_next/kernel_yield_to_ring3
+     * all use). Done after the tally loops so the consumption cannot mask
+     * the pick assertions above. */
+    uint64_t f10[20];
+    proc_build_resume_frame(&proc_table[4], f10);
+    CHECK(f10[15] == (uint64_t)cap_recv_resume, "scenario 10: 104's resume frame targets cap_recv_resume (the resume_kernel shape — the parked k_chan_wait re-runs on schedule)");
+    CHECK(f10[16] == 0x08 && f10[19] == 0x10, "scenario 10: the resume frame is a kernel-context iretq (CS=0x08/SS=0x10), not a ring-3 frame");
+    CHECK(f10[9] == (uint64_t)&proc_table[4], "scenario 10: the frame's rdi carries 104's own descriptor (cap_recv_resume's argument)");
+    CHECK(proc_table[4].resume_kernel == 0, "scenario 10: building the resume frame consumed resume_kernel — a second build falls back to ring3_ctx, so the flag cannot double-fire");
+
     printf("\n%s\n", g_fail == 0 ? "ALL CHECKS PASSED" : "SOME CHECKS FAILED");
     return g_fail == 0 ? 0 : 1;
 }

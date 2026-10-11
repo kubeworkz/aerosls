@@ -91,6 +91,26 @@ int smp_ap_online(void) {
     return __atomic_load_n(&ap_bootstrap_lock, __ATOMIC_SEQ_CST) != 0;
 }
 
+/* Strong override of process.c's weak default (the cap.c convention): is
+ * THIS core the BSP? Only the BSP arms the syscall MSRs — EFER.SCE, STAR,
+ * LSTAR and the per-core GS bases, all written once by syscall_gate_init()
+ * (kernel.c) — and only it runs the Ring-3 scheduler (the timer ISR's
+ * schedule_ring3, the control plane's kernel_yield_to_ring3).
+ * process_find_current() consults this before answering "who is running":
+ * without the gate, an AP's service poll (this file's ap_kernel_main loop)
+ * reaches cap_send_msg -> cap_wake_chan -> cap_maybe_handoff, finds THE
+ * BSP'S RUNNING PROCESS in the shared proc_table, switches to the woken
+ * peer on this core, and the resume's sysretq #UDs — EFER.SCE is clear on
+ * every AP. Caught live: three L5 arms died one line after a
+ * `[CAP] send handoff:` print; -d int showed #UD at
+ * syscall_return_path+3 with EFER=0x500 (SCE clear) and
+ * RSP=f000ff53f000ff53, then #GP, then the triple fault. QEMU's BSP is
+ * local APIC id 0 and boot_application_processors() SIPIs the APs at other
+ * ids, so id 0 ⇔ BSP on every supported configuration. */
+int smp_on_bsp(void) {
+    return (lapic_read(LAPIC_REG_ID) >> 24) == 0;
+}
+
 void smp_uniprocessor_tick(void) {
     /* Checked live, not latched at boot: if an AP turns up late -- past the
      * timeout -- it resumes ownership of this work and the BSP stops, so
