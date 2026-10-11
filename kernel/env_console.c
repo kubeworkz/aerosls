@@ -2,6 +2,8 @@
 #include "env_console.h"
 #include "cap.h"
 #include "kernel_io.h"
+#include "process.h"   /* L5 wedge diagnostic: the refusal dump names every
+                           process's posture (see env_console_write) */
 
 /* One environment's console endpoint. `buf` is that environment's output,
  * never the kernel's: nothing in this file calls kernel_serial_putchar(). */
@@ -16,6 +18,12 @@ struct EnvConsole {
     uint32_t len;
     uint32_t dropped;
     uint8_t  identity;    /* the boot [env-id] line seen since this wiring */
+    /* L5 wedge diagnostic: set on this console's first write refusal; from
+     * then on env_console_tick's drains for this console print one line, so
+     * the failure window is legible (before it, the healthy stream stays
+     * quiet). */
+    uint8_t  refused;
+    uint32_t refuse_count;
     uint8_t  buf[ENV_CONSOLE_BUF];
 };
 
@@ -224,6 +232,7 @@ void env_console_tick(void) {
 
         /* Buffer this environment's output. Unlike the console service this
          * does NOT print it — that is E6's whole property. */
+        uint32_t ec_drained_msgs = 0, ec_drained_bytes = 0;   /* L5 diag */
         for (;;) {
             uint32_t plen = 0, tag = 0, flags = 0;
             uint16_t n_caps = 0;
@@ -236,6 +245,27 @@ void env_console_tick(void) {
                 e->identity = 1;
             ec_push(e, env_console_msg, plen);
             env_console_drained_total++;
+            ec_drained_msgs++;
+            ec_drained_bytes += plen;
+        }
+        /* L5 wedge diagnostic: a console that has ever refused a write gets
+         * its drains logged — the refusal window is exactly when WHEN the
+         * peer drained (and how much) is the missing half of the story. */
+        if (e->refused && ec_drained_msgs) {
+            uint32_t q0 = 0, q1 = 0, e0pid = 0xFFFFFFFFu;
+            struct CapChannel* dch = ec_chan_of(e->k_wr, 0);
+            if (dch) {
+                cap_lock(&dch->lock);
+                q0 = dch->qdepth[0]; q1 = dch->qdepth[1];
+                cap_unlock(&dch->lock);
+                e0pid = dch->end0_pid;
+            }
+            kernel_serial_printf(
+                "[ENV-CONSOLE][L5DIAG] drained part=%u env=%u msgs=%u bytes=%u "
+                "(input q0=%u q1=%u end0pid=%u)\n",
+                (unsigned)e->partition, (unsigned)e->env_id,
+                (unsigned)ec_drained_msgs, (unsigned)ec_drained_bytes,
+                (unsigned)q0, (unsigned)q1, (unsigned)e0pid);
         }
 
         /* A closed peer ends the console: print the tail it never read (so an
@@ -292,8 +322,46 @@ int env_console_write(uint32_t partition, uint32_t env_id,
         int dest = (0 == ch->end0_pid) ? 1 : 0;
         cap_lock(&ch->lock);
         int undrained = (ch->qdepth[dest] > 0);
+        uint32_t q0 = ch->qdepth[0], q1 = ch->qdepth[1];
         cap_unlock(&ch->lock);
-        if (undrained) return 0;
+        if (undrained) {
+            /* L5 wedge diagnostic: the refusal is the ONLY observable the
+             * guard gets (queued=0), and it says nothing about WHICH queue
+             * is occupied or what every process is doing at that moment.
+             * The first refusal (and every 10th after) prints both, plus a
+             * one-line posture for every active process — the parked
+             * channel list is what distinguishes "the peer never reads"
+             * from "the peer reads but something else holds it here". */
+            e->refuse_count++;
+            if (e->refuse_count == 1 || (e->refuse_count % 10) == 0) {
+                e->refused = 1;
+                kernel_serial_printf(
+                    "[ENV-CONSOLE][L5DIAG] write refused part=%u env=%u "
+                    "refusal#%u input q0=%u q1=%u dest=%d end0pid=%u "
+                    "outbuf=%u dropped=%u\n",
+                    (unsigned)e->partition, (unsigned)e->env_id,
+                    (unsigned)e->refuse_count, (unsigned)q0, (unsigned)q1,
+                    dest, (unsigned)ch->end0_pid, (unsigned)e->len,
+                    (unsigned)e->dropped);
+                for (int pi = 0; pi < PROC_MAX; pi++) {
+                    const struct ProcessDescriptor* pd = &proc_table[pi];
+                    if (!pd->active) continue;
+                    kernel_serial_printf(
+                        "[ENV-CONSOLE][L5DIAG]   proc pid=%u '%s' state=%u "
+                        "prio=%u part=%u wch=0x%x wn=%u park=%u rk=%u rs=%u "
+                        "rc=%u hr3=%u\n",
+                        pd->pid, pd->name, (unsigned)pd->state,
+                        (unsigned)pd->priority, pd->partition_id,
+                        (unsigned)pd->waiting_chan, pd->waiting_nchans,
+                        pd->park_syscall, pd->resume_kernel, pd->resume_sysret,
+                        pd->resume_control, pd->has_ring3_ctx);
+                }
+            }
+            e->refused = 1;
+            return 0;
+        }
+        e->refused = 0;   /* a write got through again: drains go quiet */
+        e->refuse_count = 0;
     }
 
     uint32_t tag = env_console_tag++;

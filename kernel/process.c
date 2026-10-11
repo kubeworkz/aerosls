@@ -1216,13 +1216,132 @@ void kernel_yield_to_ring3(uint32_t budget_ticks) {
     kernel_yield_switch(&cp->kernel_rsp, next->cr3, f);
 }
 
+// (defined below, after its caller — a static forward declaration so
+// proc_control_plane_tick's call above resolves in the same translation
+// unit).
+static void proc_strand_diag_tick(void);
+
 void proc_control_plane_tick(void) {
+    /* L5 scheduler-wedge diagnostic — runs FIRST, every tick, before the
+     * control-plane early returns below, so it also observes while a
+     * Ring-3 process (or the hlt park loop) is the one being interrupted. */
+    proc_strand_diag_tick();
     struct ProcessDescriptor* cp = control_plane_desc();
     if (!cp || cp->state != PROC_BLOCKED || cp->yield_deadline == 0) return;
     if (kernel_tick_counter < cp->yield_deadline) return;
     cp->yield_deadline = 0;
     cp->state          = PROC_SUSPENDED;
     cp->resume_control = 1;   /* resume via the kernel-context iretq path */
+}
+
+// ─── L5 scheduler-wedge diagnostic (one-shot per PID, timer cadence) ────────
+// The live L5 arm found a woken process that the scheduler never picked
+// again: `[CAP] woken PID 104 (channel 10)` printed, the message stayed in
+// its channel queue (every later env_console_write refused with queued=0
+// while qdepth>0), init's heartbeat kept ticking and every OTHER partition
+// kept getting turns. Static reading of the whole picker chain
+// (pick_next_runnable -> pick_next_partition ->
+// pick_next_process_in_partition) shows the within-partition scan covers
+// every slot and proc_runnable() only asks for SUSPENDED plus a resume
+// context — exactly what the wake leaves behind — so the live descriptor
+// must have departed from what any of these code paths write, and no
+// amount of reading says which. This watchdog prints the full descriptor
+// (one line, once per PID per posture episode) for every process sitting
+// in a state no pick can consume:
+//
+//  (a) SUSPENDED with resume_kernel/resume_sysret/resume_control set —
+//      "woken, waiting for a pick" — for PROC_STRAND_DIAG_TICKS ticks. A
+//      healthy woken process is picked within one partition rotation
+//      (single-digit ticks); 500 ticks (5 s) is ~100x headroom and well
+//      inside the L5 failure's 20 s window.
+//  (b) BLOCKED with NO wait registered (waiting_nchans == 0,
+//      waiting_chan == CAP_NONE, waiting_deadline == 0) — "parked on
+//      nothing", i.e. no cap_wake_chan()/deadline tick can ever find it.
+//  (c) SUSPENDED but NOT proc_runnable() (no kernel_rsp, no ring3_ctx, no
+//      resume flag) — "suspended with nothing to resume from": no pick
+//      will ever take it and no wake applies, the same wedge reached by a
+//      different corruption shape than (a).
+//  (d) more than one active Ring-3 descriptor in PROC_RUNNING — on a
+//      single CPU at most one process can actually be executing, so a
+//      second RUNNING descriptor is one that believes it runs while no
+//      switch ever resumes it (schedule_ring3's find-current scan takes
+//      the first match and saves/rotates from there).
+//
+// Paused partitions are excluded from (a)/(b): a frozen partition
+// legitimately holds woken-but-unscheduled tasks for the whole pause (the
+// P1a quiesce posture — cap_park_deadline_tick defers its wakes for
+// exactly this reason), and printing them would bury the real finding.
+// The scan is O(PROC_MAX) per tick and prints at most once per PID per
+// episode, so a healthy boot emits nothing.
+#define PROC_STRAND_DIAG_TICKS 500
+static uint64_t g_strand_since[PROC_MAX];    /* tick the posture was first seen, 0 = none */
+static uint8_t  g_strand_printed[PROC_MAX];  /* already reported this episode */
+static uint8_t  g_strand_running_printed;    /* detector (c) one-shot for the boot */
+
+static void proc_strand_diag_print(const struct ProcessDescriptor* pd,
+                                   const char* why) {
+    kernel_serial_printf(
+        "[PROC][STRAND] %s PID %u '%s' act=%u state=%u prio=%u part=%u "
+        "park=%u req=0x%lx wch=0x%x wn=%u wd=%lu krsp=0x%lx hr3=%u "
+        "rk=%u rs=%u rc=%u ctl=%u ticks=%lu\n",
+        why, pd->pid, pd->name, pd->active, (unsigned)pd->state,
+        (unsigned)pd->priority, pd->partition_id, pd->park_syscall,
+        (unsigned long)pd->park_req, (unsigned)pd->waiting_chan,
+        pd->waiting_nchans, (unsigned long)pd->waiting_deadline,
+        (unsigned long)pd->kernel_rsp, pd->has_ring3_ctx, pd->resume_kernel,
+        pd->resume_sysret, pd->resume_control, pd->is_control_plane,
+        (unsigned long)kernel_tick_counter);
+}
+
+static void proc_strand_diag_tick(void) {
+    uint64_t now  = kernel_tick_counter;
+    int      nrun = 0;   /* detector (c): active Ring-3 descriptors RUNNING */
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct ProcessDescriptor* pd = &proc_table[i];
+        if (!pd->active) {
+            g_strand_since[i]   = 0;
+            g_strand_printed[i] = 0;
+            continue;
+        }
+        int paused = partition_is_paused(pd->partition_id);
+        int strand_a = !paused && pd->state == PROC_SUSPENDED &&
+                       (pd->resume_kernel || pd->resume_sysret ||
+                        pd->resume_control);
+        int strand_b = !paused && !pd->is_control_plane &&
+                       pd->state == PROC_BLOCKED &&
+                       pd->waiting_nchans == 0 &&
+                       pd->waiting_chan == CAP_NONE &&
+                       pd->waiting_deadline == 0;
+        int strand_c = !paused && pd->state == PROC_SUSPENDED &&
+                       pd->kernel_rsp == 0 && !pd->has_ring3_ctx &&
+                       !pd->resume_kernel && !pd->resume_sysret &&
+                       !pd->resume_control;
+        if ((pd->state == PROC_RUNNING) && !pd->is_control_plane) nrun++;
+
+        const char* why = NULL;
+        if      (strand_a) why = "woken-never-picked";
+        else if (strand_b) why = "blocked-no-wait";
+        else if (strand_c) why = "suspended-unrunnable";
+        if (!why) {
+            g_strand_since[i] = 0;
+            g_strand_printed[i] = 0;
+            continue;
+        }
+        if (g_strand_since[i] == 0) g_strand_since[i] = now ? now : 1;
+        if (g_strand_printed[i]) continue;
+        if (now - g_strand_since[i] < PROC_STRAND_DIAG_TICKS) continue;
+        proc_strand_diag_print(pd, why);
+        g_strand_printed[i] = 1;
+    }
+    if (nrun > 1 && !g_strand_running_printed) {
+        g_strand_running_printed = 1;
+        for (int i = 0; i < PROC_MAX; i++) {
+            struct ProcessDescriptor* pd = &proc_table[i];
+            if (!pd->active || pd->state != PROC_RUNNING ||
+                pd->is_control_plane) continue;
+            proc_strand_diag_print(pd, "multi-running");
+        }
+    }
 }
 
 // ─── schedule_ring3 ──────────────────────────────────────────────────────────
@@ -1338,7 +1457,36 @@ uint64_t schedule_ring3(uint64_t ctx_rsp) {
 // process's owner_uid. Returns NULL when called from pure kernel context
 // (no Ring-3 process running), which callers should treat as uid 0 /
 // ROLE_SYSTEM_KERNEL — always-passes, per catalog_check_access().
+/* Weak default (the cap.c convention: host-testable in isolation, the real
+ * kernel overrides): "this is the BSP" — every host test and any boot
+ * without smp.c linked keeps pre-existing behaviour unchanged. The strong
+ * override in kernel/smp.c reads the LAPIC id. */
+__attribute__((weak)) int smp_on_bsp(void) { return 1; }
+
 struct ProcessDescriptor* process_find_current(void) {
+    /* Off the BSP there is NO Ring-3 process, and saying otherwise is
+     * fatal. Ring-3 runs only under BSP machinery — the timer's
+     * schedule_ring3, the control plane's kernel_yield_to_ring3, and the
+     * syscall entry itself (LSTAR / EFER.SCE / STAR / the per-core GS
+     * MSRs are armed by syscall_gate_init() on the BSP alone; an AP's
+     * trampoline sets only EFER.LME for long mode). But proc_table is
+     * SHARED, so a plain scan from an AP returns THE BSP'S RUNNING
+     * PROCESS — and every consumer that acts on "the current process"
+     * then acts on it from the wrong core. That is exactly how the L5
+     * live arms died: the net service's reply is sent from the AP's
+     * microkernel_service_poll, its cap_send_msg -> cap_wake_chan found
+     * the BSP's running process via this scan, cap_maybe_handoff handed
+     * the CPU to the woken peer ON THE AP, and the resume's sysretq
+     * #UDed there — EFER.SCE is clear on every AP (QEMU's crash dump:
+     * #UD at syscall_return_path+3, EFER=0x500, then #GP pushing onto
+     * the garbage stack RSP=f000ff53f000ff53, then the triple fault —
+     * caught with -d int after three live arms died one line after a
+     * `[CAP] send handoff:` print). Answering NULL on an AP is the
+     * correct semantics, not a workaround: no Ring-3 process is running
+     * here, the wake still marks its target runnable, and the BSP's own
+     * scheduler picks it up on its next tick — one tick of handoff
+     * latency in exchange for the machine staying alive. */
+    if (!smp_on_bsp()) return 0;
     for (int i = 0; i < PROC_MAX; i++) {
         /* E1: the control plane is NOT a Ring-3 process. It is excluded here
          * deliberately, so every "who is asking?" caller keeps its pre-E1

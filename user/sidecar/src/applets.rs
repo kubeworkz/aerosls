@@ -3837,7 +3837,18 @@ pub fn nc<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
                 Err(_) => return Step::Exit(2),
             };
         }
-        let ip = u32::from_le_bytes(ip_bytes);
+        // The client holds the LOGICAL u32 — first dotted octet in the
+        // MSB ("10.0.2.15" -> 0x0A00020F) — the contract user/proto's
+        // encode_sockaddr and kernel.net.socket's CONNECT decode share
+        // (pinned by tests/net_socket_service_host_test.c): proto LE-encodes
+        // that logical value, and the kernel's decode turns those wire
+        // bytes back into its network-order IPv4Addr (0x0F02000A for
+        // 10.0.2.15). from_le_bytes here double-swapped the address, so a
+        // dial to 10.0.2.15 reached tcp_connect as 0x0A00020F — off the
+        // kernel's own address — went out the wire instead of the
+        // loopback hook, and timed out waiting for a SYN-ACK that could
+        // never arrive (caught live: the P2 L5 same-host flood).
+        let ip = u32::from_be_bytes(ip_bytes);
         let sock_id = match ctx.net().unwrap().socket(sock_type) {
             Ok(id) => id,
             Err(_) => return Step::Exit(1),

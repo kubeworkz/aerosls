@@ -352,8 +352,13 @@ int tcp_connect(IPv4Addr dst_ip, uint16_t dst_port) {
         (ntohl(NET_MY_IP) & 0xFFFFFF00UL))
         resolve_ip = NET_GW_IP;
 
+    /* Own address needs no MAC: ipv4_send()'s loopback hook returns
+     * before any ARP resolution, so an ARP warmup for NET_MY_IP can only
+     * miss (nothing echoes our gratuitous announce back through slirp)
+     * and abort a dial that would otherwise succeed entirely in-kernel.
+     * Skip the warmup exactly when resolve_ip is ourselves. */
     MACAddr dummy;
-    if (!arp_lookup(resolve_ip, &dummy)) {
+    if (resolve_ip != NET_MY_IP && !arp_lookup(resolve_ip, &dummy)) {
         arp_send_request(resolve_ip);
         /* Wait ~0.5 s (50 ticks at ~100 Hz) for the reply. The deadline
          * counts kernel_tick_counter — advanced by the BSP's LAPIC timer
