@@ -1485,6 +1485,105 @@ attribution call is removed.
 - **`P3_TOOTH=console-unrebound`** — the destination does not re-register the console. Expected: red on the attached-operator clause, and only there — the E6 lesson that an environment nobody can reach is not an environment.
 - **`P3_TOOTH=silent-failover`** — failover adopts the partition and reports nothing about the environment. Expected: red on the by-name reporting clause under destination (b), which is the tooth that keeps an honest gap honest.
 
+### Findings addendum — what landed, increment 1 (the placement gate)
+
+The first increment is in. It is the "refused *by name*, before anything is
+created" half of the placement bullet above — the whole-environment version of
+E4 Finding 1's fix — and it landed as one question plus three rollbacks:
+
+- **The gate became a question.** `SYS_SLS_PLACEMENT_CAN_HOLD` (327,
+  `kernel/cap.h`) answers "can partition P hold N more frames on this node?"
+  from the two counters only the kernel owns — the partition's frame
+  quota/usage (LPAR Phase 13's `partition_get_frame_quota`/`_usage`) and the
+  node's free-frame count (`frame_pool_free_count()`, new) — granting nothing
+  and mutating nothing. The environment manager asks it before the first
+  allocation; a NO is refused `ENV_ERR_CAPACITY` (status 8, named in
+  `env_status_name()` so the shell and the HTTP routes both say "insufficient
+  frame capacity") with nothing allocated anywhere. The question covers the
+  three regions exactly (1344 frames); the sidecars' image/stack frames ride
+  the allocator's own quota check, whose rollback is now complete.
+- **Finding — the pre-flight cannot be the whole answer, so the rollback was
+  the real increment.** Another create can land between question and answer;
+  the allocator's own quota check stays the backstop for that race. Writing
+  the backstop honest exposed that **three of the create path's failure arms
+  leaked**: the alloc-shortfall arm returned `NOMEM` leaving whichever regions
+  had already succeeded charged to the tenant, and a first- or second-sidecar
+  create failure left the storage attach and all three regions held. All four
+  arms now unwind completely — shortfall frees what succeeded (a zero base is
+  the allocator's own failure value, so one unconditional call per region is
+  safe); a sidecar failure releases the store and frees the regions; a
+  second-sidecar failure additionally ends the half-created ramdisk first.
+- **Finding — the rollback must not free live memory, so it confirms the
+  kill.** The kernel DEFERS a kill whose target is RUNNING
+  (`kernel/process.c`), so freeing the half-created ramdisk's heap on the
+  strength of having *asked* would be a use-after-free in exactly the window
+  E5's destroy path learned to wait out. The rollback resolves the sidecar
+  name again after the kill and releases everything only when it no longer
+  resolves; on a deferred kill the regions stay **held** — a bounded leak is
+  the right side of that trade, and the deferred teardown still returns the
+  sidecar's own frames. Pinned by the sim's `kill_deferred` negative control.
+- **Finding — the question broke twelve host tests at link time.**
+  `sys_sls_placement_can_hold` is the first cap.c code to reference
+  `partition_get_frame_quota`/`_usage` and `frame_pool_free_count`, and no
+  cap.c host test links `frame_pool.c` (they fake the allocator).
+  `tests/process_host_stubs.h` gained weak **settable** stand-ins — quota 0 =
+  unlimited (the kernel's own BSS-zero default), usage 0, free count
+  effectively unbounded — so every existing test's world is unchanged and the
+  P3 section of `cap_create_sidecar_host_test.c` drives the knobs directly.
+- **What the question deliberately does not answer.** Absent and paused
+  partitions keep their own named refusals at the first alloc/create (the
+  order 4a2 fix); a tenant reading "insufficient frame capacity" for a paused
+  partition would be a lie about which gate said no. A caller without
+  `sidecar_authority` gets 0 ("cannot hold") rather than an error — the same
+  refusal path — because a probe that reports node free-frame counts to
+  arbitrary ring-3 programs is reconnaissance it does not need.
+
+Proven by: six new host tests in `user/init/src/env_manager.rs` (48 green) —
+the pre-flight's question asked exactly once about the target partition with
+the whole demand; quota and node refusals allocating **nothing** (no region
+attempted, no sidecar created, no sidecar registered) and answering
+`ENV_ERR_CAPACITY` by name through the request path; the mid-way shortfall and
+the second-sidecar rollback freeing exactly what was taken; and the deferred-
+kill negative control freeing nothing; plus `tests/cap_create_sidecar_host_test.c`
+section 18 driving the real `sys_sls_placement_can_hold` — quota arithmetic
+exact at the boundary, node arithmetic one-short/one-exact, the zero-frame
+edge, the authority gate, and the across-every-scenario clause that the
+QUESTION reached the allocator not once.
+
+**The live proof, and the finding it caught.** The rebuilt ISO's
+`env_create_boot_check.sh` gained Phase 8: a third, live partition capped at
+128 frames over HTTP (`POST /api/partition/quota`), where the create must be
+refused **by name** — "insufficient frame capacity", which only the
+pre-flight can say — with target and creator both moving +0 frames and no
+process placed; then the arm's own control, lifting the cap so the very same
+partition must accept (index 1), making the quota's arithmetic the only
+variable between refusal and success. The `capacity-unchecked` tooth
+withholds the cap so the arm must go red, and the smoke's third tooth arm
+requires the guard to fail naming that arm.
+
+- **Finding — the first live run named the wrong gate, and the fix is
+  deferral.** With the absent-target arm of Phase 7 (still asserted by its
+  kernel line), the pre-flight answered "cannot hold" for partition
+  0xFFFFFFFF — a true statement about a partition that does not exist, and
+  exactly the lie cap.h's contract forbids ("insufficient frame capacity"
+  for an absent or paused target). The query now DEFERS on any target its
+  state gates own — out of range, absent or paused answers "can hold", so
+  the allocator's own `CAP_EINVAL`/`CAP_EPERM` gate still refuses, by name,
+  before the first frame. The host test pins all three deferrals; the live
+  rerun shows the absent arm back on its `CAP_EINVAL` line and the capacity
+  arm on its own name.
+- **Finding — the worktree ships seeded objects, and the digest gate does
+  not see them.** The first live run refused every capacity create as
+  "unknown": `sidecars.cpio`'s digest gate fired correctly on the stale
+  archive, but the kernel OBJECTS (`net/http.o` embedding
+  `env_status_name`) were seeded from a build of older sources and the
+  Makefile has no header-dependency tracking, so `env_proto.h`'s new case
+  never reached the ISO until a full `make clean` rebuild. The digest gate
+  guards the archive; nothing guarded the objects. Any future
+  header-semantic change (a status name, a wire constant) needs the same
+  clean rebuild on a seeded tree — worth a dependency-tracking fix in its
+  own right.
+
 ---
 
 ## 8. Capacity for the first cut

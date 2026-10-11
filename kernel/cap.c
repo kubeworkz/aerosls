@@ -4436,6 +4436,50 @@ uint64_t sys_sls_alloc_region(struct SLSAllocRegionRequest* req) {
         charged, req->nframes, req->align_frames);
 }
 
+/* ─── sys_sls_placement_can_hold (327) ──────────────────────────────────
+ * POSIX-Environments P3 increment 1: the placement gate as a question
+ * (see cap.h). "Can partition P hold N more frames on this node?" —
+ * answered from the partition's quota/usage and the node's free count,
+ * granting nothing and mutating nothing. A NO here is what lets the
+ * environment manager refuse a create with ENV_ERR_CAPACITY BEFORE the
+ * first frame is taken; the allocator's own quota check stays as the
+ * backstop for the races the pre-flight cannot see (another create
+ * landing between question and answer), and its rollback frees what the
+ * race took. Denied callers answer 0 ("cannot hold") rather than an
+ * error: for a process that may not place, every placement cannot hold,
+ * and the refusal path is the same one.
+ *
+ * A partition that cannot be ASKED about — out of range, absent, or
+ * paused — is DEFERRED (answered 1): its own named state gate refuses at
+ * the first alloc_region_in / cap_create_sidecar_in, exactly as it did
+ * before this syscall existed. The live boot caught the pre-deferral
+ * behaviour: an absent target was refused as "insufficient frame capacity"
+ * — a true statement about a partition that does not exist, and the wrong
+ * gate's name, which is the lie this call's contract forbids. */
+uint64_t sys_sls_placement_can_hold(struct SLSPlacementCanHoldRequest* req) {
+    if (!req) return 0;
+    struct ProcessDescriptor* caller = sidecar_find_pid(cap_current_pid());
+    if (!caller || !caller->sidecar_authority) return 0;
+
+    uint32_t p = (req->target_partition != 0) ? req->target_partition
+                                              : caller->partition_id;
+    /* Deferred, not refused — see the header comment. Nothing is
+     * allocated either way: the state gate refuses before the first
+     * frame, so the E4 rule (a refused placement allocates nothing)
+     * holds with or without this query answering. */
+    if (p >= PARTITION_MAX) return 1;
+    if (!partition_exists(p) || partition_is_paused(p)) return 1;
+    if (req->frames == 0) return 1;
+
+    /* Quota headroom first (exact, O(1)), then the node's free count.
+     * quota == 0 is unlimited — the module's BSS-zero-safe default. */
+    uint64_t quota = partition_get_frame_quota(p);
+    uint64_t usage = partition_get_frame_usage(p);
+    if (quota != 0 && usage + req->frames > quota) return 0;
+    if (frame_pool_free_count() < req->frames) return 0;
+    return 1;
+}
+
 /* ─── sys_sls_free_region (321) ──────────────────────────────────────────
  * POSIX-Environments E5: the counterpart to sys_sls_alloc_region above.
  * Releases a region the allocator handed out, decrementing the CHARGED

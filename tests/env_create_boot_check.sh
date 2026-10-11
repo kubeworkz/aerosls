@@ -54,10 +54,22 @@
 #      (asserted). Nothing is placed in the refused target either
 #      (frame_usage 0, no process carrying that partition). The same is
 #      asserted for a target that does not exist (CAP_EINVAL).
+#   7. A placement that cannot FIT is refused BY NAME before the first frame
+#      (P3 increment 1): a third, live partition is capped at 128 frames over
+#      HTTP (POST /api/partition/quota) — an environment needs its 1344
+#      region frames — and the create answers ok:false with the refusal's own
+#      words, "insufficient frame capacity" (env_status_name(ENV_ERR_CAPACITY)
+#      on the wire), never a mid-create "frame pool exhausted" (NOMEM, whose
+#      partial allocations would already have been rolled back) and never a
+#      generic "partition absent, paused, or placement refused" (PART). The
+#      name IS the proof of which gate answered. Nothing is allocated for it
+#      either, and — the arm's own control — lifting the quota and asking
+#      again on that very same partition must SUCCEED, so the only variable
+#      between the refusal and the success is the quota's arithmetic.
 #
-# Assertion 6 is the one a boot is the only place to make: whether a placement
-# is refused, and whether the refusal is real (nothing lands anyway), is not
-# visible in a unit test of the caller.
+# Assertions 6 and 7 are the ones a boot is the only place to make: whether a
+# placement is refused, and whether the refusal is real (nothing lands
+# anyway), is not visible in a unit test of the caller.
 #
 # Prerequisite: sls_operating_system.iso (make x86-iso; the unified entry
 # needs sidecars.cpio present — commit it, so CI ships it) and
@@ -65,21 +77,24 @@
 #
 # GUARD-KIND: runtime (needs the built ISO + QEMU).
 #
-# Teeth: tests/env_create_boot_check_smoke.sh — it points this guard at two
+# Teeth: tests/env_create_boot_check_smoke.sh — it points this guard at three
 # inputs that must turn it red (the kernel-only boot, which has no env manager
-# at all; and E4_TOOTH=skip-pause, which withholds the pause that the refusal
-# assertion depends on, so a guard whose refusal arm was vacuous would pass
-# there and the smoke would catch it) and then requires it to pass on the real
-# boot. The matching SOURCE control — deleting the paused check in
-# cap_create_sidecar_in — was run by hand and turns this guard red naming the
-# refusal arm (recorded in §7.2).
+# at all; E4_TOOTH=skip-pause, which withholds the pause that the refusal
+# assertion depends on; and E4_TOOTH=capacity-unchecked, which withholds the
+# frame quota that the capacity arm depends on — in both cases a guard whose
+# refusal arm was vacuous would pass there and the smoke would catch it) and
+# then requires it to pass on the real boot. The matching SOURCE control —
+# deleting the paused check in cap_create_sidecar_in — was run by hand and
+# turns this guard red naming the refusal arm (recorded in §7.2).
 #
 # Env knobs (used by the smoke; the defaults are what every other caller gets):
 #   E4_ISO          path to the ISO to boot        (default sls_operating_system.iso)
 #   E4_BOOT_ENTRY   1-based grub MENU POSITION     (default 3 = the unified entry)
 #   E4_WINDOW_S     seconds to wait for the markers (default 120)
-#   E4_TOOTH        smokes only: `skip-pause` withholds the pause before the
-#                   refused-placement arm, so its assertion MUST fail
+#   E4_TOOTH        smokes only. `skip-pause` withholds the pause before the
+#                   refused-placement arm, and `capacity-unchecked` withholds
+#                   the frame quota before the capacity arm — each so that
+#                   arm's refusal assertions MUST fail on its own input.
 #
 # Exit: 0 if every assertion held, 1 if one failed (or QEMU died first),
 # 2 on a missing prerequisite.
@@ -518,6 +533,112 @@ elif grep -aqF "[ALLOC_REGION] CAP_EINVAL: target partition 4294967295 is not an
     echo "ok:   the kernel refused the absent target in its own words (CAP_EINVAL)"
 else
     echo "FAILED: no '[ALLOC_REGION] CAP_EINVAL: target partition … is not an active partition' line for the absent target" >&2
+    fail=1
+fi
+
+# ── Phase 8: a placement that cannot FIT is refused BY NAME, pre-frame ─────
+# P3 increment 1's live half. Phase 7's refusals are partition-STATE gates
+# (paused, absent); this one is pure arithmetic: the partition exists, is
+# live, and accepts every other verb — but its frame quota cannot hold the
+# environment's 1344 region frames, so init's placement pre-flight
+# (SYS_SLS_PLACEMENT_CAN_HOLD, 327) refuses ENV_ERR_CAPACITY BEFORE the first
+# allocation. The refusal's own name on the wire is the assertion that matters:
+# "insufficient frame capacity" can only come from the pre-flight, so this arm
+# cannot pass on an unrelated ok:false — the failure mode the smoke's own
+# header names as the one that matters. The quota is set over HTTP
+# (POST /api/partition/quota, Gap Remediation Phase F), which also gives the
+# arm its control: lift the cap and the very same partition must accept.
+pname3="e4bootquota"
+api "$W/pcreate3.json" -X POST -d "{\"name\":\"$pname3\"}" "$BASE/api/partitions" || true
+id3="$(jval "$W/pcreate3.json" partition_id)"
+if [ "$(jval "$W/pcreate3.json" ok)" = "true" ] && [ -n "$id3" ]; then
+    echo "ok:   POST /api/partitions defined '$pname3' as partition $id3"
+else
+    echo "FAILED: could not define the quota partition (id='$id3')" >&2
+    fail=1
+fi
+
+if [ "$TOOTH" = "capacity-unchecked" ]; then
+    # The tooth's input: the quota is withheld, so the create is ALLOWED —
+    # the same input the kernel would produce if the pre-flight were skipped
+    # — and the refusal assertions below MUST go red.
+    echo "note: E4_TOOTH=capacity-unchecked — not capping partition $id3's frames; the capacity refusal assertions below MUST fail"
+else
+    api "$W/quota.json" -X POST -d "{\"partition_id\":$id3,\"frame_quota\":128}" "$BASE/api/partition/quota" || true
+    if [ "$(jval "$W/quota.json" ok)" = "true" ]; then
+        echo "ok:   POST /api/partition/quota capped partition $id3 at 128 frames (an environment needs 1344)"
+    else
+        echo "FAILED: could not cap partition $id3's frame quota (ok='$(jval "$W/quota.json" ok)')" >&2
+        fail=1
+    fi
+fi
+
+partitions_snapshot
+q_target_before="$(frame_usage "$W/parts.json" "$id3")"
+[ -n "$q_target_before" ] || q_target_before=0
+q_sys_before="$(frame_usage "$W/parts.json" 0)"
+[ -n "$q_sys_before" ] || q_sys_before=0
+
+api "$W/envq.json" -X POST -d '{"index":0}' "$BASE/api/partition/$id3/env" || true
+q_ok="$(jval "$W/envq.json" ok)"
+q_err="$(jval "$W/envq.json" error)"
+if [ "$q_ok" = "false" ] && [ "$q_err" = "insufficient frame capacity" ]; then
+    echo "ok:   POST /api/partition/$id3/env was refused BY NAME ($q_err) — the placement pre-flight fired before the first frame"
+elif [ "$q_ok" = "false" ]; then
+    echo "FAILED: the capacity-limited create was refused as '$q_err' — not as its own named refusal 'insufficient frame capacity', so a different gate answered" >&2
+    fail=1
+else
+    echo "FAILED: a create into the capacity-limited partition $id3 was NOT refused (ok='$q_ok' env_id='$(jval "$W/envq.json" env_id)') — the placement pre-flight did not fire" >&2
+    fail=1
+fi
+
+if [ "$TOOTH" = "capacity-unchecked" ]; then
+    :   # on the tooth's input the placement succeeded, so "nothing placed" is not asserted
+else
+    # The refusal must be REAL, exactly as Phase 7's: nothing charged to the
+    # target, nothing in it, and the creator untouched. The pre-flight runs
+    # before ANY allocation, so unlike the mid-create arms there is not even
+    # a rollback to hide behind — zero frames is the honest reading.
+    partitions_snapshot
+    q_target_after="$(frame_usage "$W/parts.json" "$id3")"
+    [ -n "$q_target_after" ] || q_target_after=0
+    q_sys_after="$(frame_usage "$W/parts.json" 0)"
+    q_delta_target=$(( q_target_after - q_target_before ))
+    q_delta_sys=$(( ${q_sys_after:-0} - ${q_sys_before:-0} ))
+    if [ "$q_delta_target" -eq 0 ] && [ "$q_delta_sys" -le 64 ] 2>/dev/null; then
+        echo "ok:   the capacity-refused placement allocated nothing (target +$q_delta_target frames, creator +$q_delta_sys)"
+    else
+        echo "FAILED: the capacity-refused placement took frames (target +$q_delta_target, creator +$q_delta_sys) with nothing holding them" >&2
+        fail=1
+    fi
+    processes_snapshot
+    q_procs="$(proc_count_for_partition "$W/procs.json" "$id3")"
+    if [ "$q_procs" = "0" ]; then
+        echo "ok:   no process was placed in the capacity-refused partition"
+    else
+        echo "FAILED: $q_procs process(es) run in the capacity-refused partition $id3" >&2
+        fail=1
+    fi
+fi
+
+# The arm's own control (and the allow side of the gate): lift the quota —
+# 0 = unlimited, frame_pool.h's own convention — and the VERY SAME partition
+# must accept an environment. Between the refusal above and this success the
+# only variable is the quota's arithmetic, so neither can be explained by
+# something else about the partition. Index 1 keeps the identity distinct
+# from every other environment in this boot.
+api "$W/quota2.json" -X POST -d "{\"partition_id\":$id3,\"frame_quota\":0}" "$BASE/api/partition/quota" || true
+if [ "$(jval "$W/quota2.json" ok)" = "true" ]; then
+    echo "ok:   POST /api/partition/quota lifted partition $id3's cap (0 = unlimited)"
+else
+    echo "FAILED: could not lift partition $id3's frame quota" >&2
+    fail=1
+fi
+api "$W/envq2.json" -X POST -d '{"index":1}' "$BASE/api/partition/$id3/env" || true
+if [ "$(jval "$W/envq2.json" ok)" = "true" ]; then
+    echo "ok:   with its quota lifted, the SAME partition $id3 accepted an environment (the refusal was the quota's arithmetic)"
+else
+    echo "FAILED: with its quota lifted, partition $id3 still refused the create ($(jval "$W/envq2.json" error))" >&2
     fail=1
 fi
 

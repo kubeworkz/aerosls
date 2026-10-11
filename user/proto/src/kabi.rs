@@ -252,6 +252,28 @@ pub trait Kernel {
         false
     }
 
+    /// ─── P3 increment 1: the placement gate as a question (syscall 327) ──
+    /// "Can `target_partition` (0 = the caller's) hold `frames` more frames
+    /// on this node?" — answered from the partition's frame quota/usage and
+    /// the node's free-frame count, mutating nothing. The environment
+    /// manager asks it before the first allocation so a create that cannot
+    /// fit is refused ENV_ERR_CAPACITY BY NAME with nothing allocated —
+    /// E4's "a refused placement allocates nothing", extended from the
+    /// kernel's gate to the numbers. It answers the CAPACITY question
+    /// ONLY: an absent or paused partition is still refused, by its own
+    /// named gate, at the first alloc/create — the kernel's query DEFERS
+    /// on those (answers true), so the state gate's own name reaches the
+    /// caller instead of "insufficient frame capacity" naming the wrong
+    /// gate (the live boot caught the pre-deferral behaviour).
+    /// Default: true (unlimited) —
+    /// a fake that models no frame pool must not refuse placements it
+    /// cannot evaluate, which is exactly the pre-P3 posture every existing
+    /// fake had.
+    fn placement_can_hold(&self, target_partition: u32, frames: u64) -> bool {
+        let _ = (target_partition, frames);
+        true
+    }
+
     /// ─── P1b: the environment's durable store (POSIX-Environments v0.2) ──
     /// Four syscalls (323-326) over kernel/env_storage.h's table. The error
     /// value is the kernel's own ENV_STORAGE_* status (see the constants in
@@ -395,6 +417,8 @@ mod abi {
     const SYS_CAP_REVOKE: u64 = 294;
     const SYS_ALLOC_REGION: u64 = 320;
     const SYS_FREE_REGION: u64 = 321;
+    // POSIX-Environments P3 increment 1: the placement gate (kernel/cap.h).
+    const SYS_PLACEMENT_CAN_HOLD: u64 = 327;
     const SYS_SIDECAR_PID: u64 = 322;
     const SYS_ENV_STORAGE_ATTACH: u64 = 323;
     const SYS_ENV_STORAGE_RESTORE: u64 = 324;
@@ -1056,6 +1080,31 @@ mod abi {
         unsafe { sls_syscall(SYS_FREE_REGION, &req as *const FreeRegionReq as u64) as i32 }
     }
 
+    /// `k_placement_can_hold`: syscall 327 — the placement gate as a
+    /// question (POSIX-Environments P3 increment 1; kernel/cap.h carries the
+    /// contract). Returns 1 when the partition can hold the frames on this
+    /// node, 0 when it cannot — and also 0 when the caller may not place,
+    /// because for that caller every placement cannot hold. The request
+    /// layout is kernel/cap.h's SLSPlacementCanHoldRequest, field for field.
+    #[repr(C)]
+    struct PlacementCanHoldReq {
+        frames: u64,
+        target_partition: u32,
+        _pad: u32,
+    }
+
+    #[no_mangle]
+    pub extern "C" fn k_placement_can_hold(target_partition: u32,
+                                          frames: u64) -> u64 {
+        let req = PlacementCanHoldReq {
+            frames,
+            target_partition,
+            _pad: 0,
+        };
+        unsafe { sls_syscall(SYS_PLACEMENT_CAN_HOLD,
+                             &req as *const PlacementCanHoldReq as u64) }
+    }
+
     /* ─── P1b: durable environment storage (syscalls 323-326) ─────────────
      * The request structs are the kernel headers' layouts, field for field
      * (kernel/env_storage.h): attach carries the identity and the region,
@@ -1366,6 +1415,10 @@ mod abi {
 
         fn free_region_in(&self, base: u64, nframes: u64, target_partition: u32) -> bool {
             k_free_region_in(base, nframes, target_partition) == 0
+        }
+
+        fn placement_can_hold(&self, target_partition: u32, frames: u64) -> bool {
+            k_placement_can_hold(target_partition, frames) != 0
         }
 
         fn env_storage_attach(&self, partition_id: u32, index: u32,

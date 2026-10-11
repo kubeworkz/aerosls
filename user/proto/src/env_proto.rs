@@ -38,6 +38,10 @@ pub const ENV_ERR_NOENT: u16 = 6; //  no environment with that env_id (E5)
 pub const ENV_ERR_QUOTA: u16 = 7; //  the environment's durable store does not fit
                                   //  the partition's storage quota (P1b) — its own
                                   //  code, never a frame-pool NOMEM
+pub const ENV_ERR_CAPACITY: u16 = 8; //  the create's frame demand exceeds the partition's
+                                     //  frame quota or the node's free frames (P3 inc. 1) —
+                                     //  refused by the placement pre-flight BEFORE the
+                                     //  first frame is taken, never a mid-create NOMEM
 
 /// The 16-byte ENV_* frame header — the payload of a channel MSG envelope.
 #[repr(C)]

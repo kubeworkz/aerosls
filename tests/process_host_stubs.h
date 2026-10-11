@@ -96,10 +96,10 @@ char stack_top[16] __attribute__((weak));
  * partition.c, which no cap.c host test links (its cluster/dspp/persist
  * dependency chain is irrelevant here), so these weak inert stubs — true only
  * for PARTITION_SYSTEM (0) — close the link. A test that inherits the caller's
- * partition (target 0) never reaches the gate, so they stay inert. (The quota
- * getters are deliberately NOT stubbed here: cap.c's E4 path leaves quota
- * enforcement to the per-frame allocator, and several tests define their own
- * partition_get_frame_usage/_quota, which a weak def here would collide with.) */
+ * partition (target 0) never reaches the gate, so they stay inert. (The frame-
+ * quota getters and the node's free-frame count are stubbed in their own
+ * section below: since P3 increment 1, cap.c's placement gate calls them at
+ * link time.) */
 
 /* ...and one test may opt a SECOND partition into existence (and pause it)
  * without touching this default: with host_stub_partition_extra_id left at
@@ -116,6 +116,43 @@ __attribute__((weak)) int partition_exists(uint32_t partition_id) {
 __attribute__((weak)) int partition_is_paused(uint32_t partition_id) {
     return partition_id == host_stub_partition_extra_id &&
            host_stub_partition_extra_paused != 0;
+}
+
+/* ─── POSIX-Environments P3 increment 1: the placement gate's counters ─────
+ * sys_sls_placement_can_hold (327) answers "can partition P hold N more
+ * frames on this node?" from the partition's frame quota/usage (frame_pool.h)
+ * and the node's free-frame count — the strong definitions live in
+ * frame_pool.c, which no cap.c host test links (this test suite fakes the
+ * allocator exactly as above), so these weak SETTABLE stand-ins close the
+ * link. Defaults keep every existing test's world unchanged: quota 0 is
+ * "unlimited" (the kernel's own BSS-zero default), usage 0, and a free count
+ * so large no existing create can see the gate refuse for capacity — the
+ * refusals existing tests exercise are the partition-state ones, which stay
+ * theirs. cap_create_sidecar_host_test.c's P3 section drives the knobs.
+ *
+ * The two QUOTA getters may be opted out (HOST_STUBS_FRAME_QUOTA_LOCAL): a
+ * weak definition and a later strong one in the SAME translation unit is a
+ * redefinition error, and three tests — migration_data_movement,
+ * stream_partition, usage_metering — carry richer PER-PARTITION fakes of
+ * exactly these two (arrays with the kernel's out-of-range sentinel), whose
+ * semantics a single global knob cannot stand in for. Those files define the
+ * macro before including this header; frame_pool_free_count() has no such
+ * owner and is always stubbed here. */
+#ifndef HOST_STUBS_FRAME_QUOTA_LOCAL
+__attribute__((weak)) uint64_t host_stub_frame_quota = 0;            /* 0 = unlimited */
+__attribute__((weak)) uint64_t host_stub_frame_usage = 0;
+__attribute__((weak)) uint64_t partition_get_frame_quota(uint32_t partition_id) {
+    (void)partition_id;
+    return host_stub_frame_quota;
+}
+__attribute__((weak)) uint64_t partition_get_frame_usage(uint32_t partition_id) {
+    (void)partition_id;
+    return host_stub_frame_usage;
+}
+#endif /* !HOST_STUBS_FRAME_QUOTA_LOCAL */
+__attribute__((weak)) uint64_t host_stub_frame_free  = 0xFFFFFFFFull;
+__attribute__((weak)) uint64_t frame_pool_free_count(void) {
+    return host_stub_frame_free;
 }
 
 /* ─── POSIX-Environments E4 (part 3b): env-manager control channel ───────────

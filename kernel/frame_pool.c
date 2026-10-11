@@ -656,3 +656,17 @@ uint64_t frame_pool_allocated_count(void) {
     }
     return count;
 }
+
+/* POSIX-Environments P3 increment 1: the node-wide half of the placement
+ * gate (sys_sls_placement_can_hold, 327). Free = every candidate frame
+ * except frame 0 whose bitmap bit is clear; frame 0 is excluded because
+ * alloc_raw_frame() and frame_pool_reserve_contiguous() both skip it — it
+ * is never handed out, so counting it as free would inflate every
+ * pre-flight by exactly one frame. Reserved/boot-withheld frames are
+ * bitmap-SET (frame_pool_reserve_range marks them), so they are correctly
+ * counted as unavailable here without a second bookkeeping pass. */
+uint64_t frame_pool_free_count(void) {
+    uint64_t used = frame_pool_allocated_count();
+    if (frame_pool_is_reserved(0)) used -= 1;   /* frame 0: never handed out */
+    return (TOTAL_FRAMES - 1) - used;
+}

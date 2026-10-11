@@ -14,7 +14,7 @@
 # for an unrelated reason, or a guard whose patterns drifted out of the
 # sources and now match nothing.
 #
-# Three arms, two of them teeth:
+# Four arms, three of them teeth:
 #
 #   1. TOOTH (wrong boot)  — E4_BOOT_ENTRY=2 boots grub's kernel-only entry,
 #      which has the kernel HTTP server but NO unified control plane and NO
@@ -31,7 +31,16 @@
 #      (grepping for a string that is there anyway, or accepting any ok:false)
 #      passes this arm, and the smoke fails it for that.
 #
-#   3. RESTORE — the guard unmodified on the unified boot must pass, so the
+#   3. TOOTH (withheld cap) — E4_TOOTH=capacity-unchecked runs the guard on
+#      the real boot but does not cap the third partition's frame quota before
+#      asking for an environment in it — the same input the kernel would
+#      produce if P3 increment 1's placement pre-flight were skipped. The
+#      create is ALLOWED, so the capacity arm's refusal assertions must go
+#      red; the smoke requires the guard to fail NAMING that arm (the
+#      "placement pre-flight did not fire" line), so a capacity arm that
+#      passed for an unrelated reason cannot hide here.
+#
+#   4. RESTORE — the guard unmodified on the unified boot must pass, so the
 #      smoke also proves the guard is not simply failing everything (a tooth
 #      that fires on both inputs proves nothing about either) and leaves no
 #      footprint behind.
@@ -99,6 +108,19 @@ if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -qF "was NOT refused"; then
     printf '%s\n' "$out" | grep -F "FAILED:" | head -3 | sed 's/^/           /'
 else
     echo "TOOTH FAIL guard rc=$rc with E4_TOOTH=skip-pause, expected 1 naming a create that was NOT refused" >&2
+    printf '%s\n' "$out" | sed 's/^/           /' >&2
+    fails=$((fails + 1))
+fi
+
+# ── Tooth 3: the capacity arm must bite when the cap is withheld ───────────
+echo "TOOTH  env_create_boot_check.sh with E4_TOOTH=capacity-unchecked (the quota is never set)"
+out="$(E4_TOOTH=capacity-unchecked bash tests/env_create_boot_check.sh 2>&1)"
+rc=$?
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -qF "the placement pre-flight did not fire"; then
+    echo "TOOTH OK   guard failed (rc=1) when the capped partition was left uncapped:"
+    printf '%s\n' "$out" | grep -F "FAILED:" | head -3 | sed 's/^/           /'
+else
+    echo "TOOTH FAIL guard rc=$rc with E4_TOOTH=capacity-unchecked, expected 1 naming a create the placement pre-flight did not refuse" >&2
     printf '%s\n' "$out" | sed 's/^/           /' >&2
     fails=$((fails + 1))
 fi

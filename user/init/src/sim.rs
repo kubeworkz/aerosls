@@ -129,6 +129,32 @@ pub struct SimKernel {
     regions: UnsafeCell<Vec<(u64, u64, u32)>>,
     next_region_base: UnsafeCell<u64>,
     regions_exhausted: UnsafeCell<bool>,
+    /// POSIX-Environments P3 increment 1: the placement gate asked as a
+    /// QUESTION. Every `placement_can_hold` is recorded as
+    /// `(target_partition, frames)` — the pre-flight's evidence — and the
+    /// answer is computed the way kernel/cap.c computes it: the partition's
+    /// frame quota/usage first (exact, O(1)), then the node's free count.
+    /// `placement_free` is the node's answer basis; `u64::MAX` is "no node
+    /// limit", the pre-P3 posture (a fake that models no frame pool must not
+    /// refuse placements it cannot evaluate). A quota entry makes that
+    /// partition's arithmetic exact; quota 0 is unlimited, as in the
+    /// kernel's BSS-zero default.
+    placement_queries: UnsafeCell<Vec<(u32, u64)>>,
+    placement_free: UnsafeCell<u64>,
+    placement_quotas: UnsafeCell<Vec<(u32, u64, u64)>>,
+    /// P3 inc. 1: fail `alloc_region_in` once this many regions have been
+    /// ATTEMPTED (-1 = never), so a test can drive the mid-way shortfall
+    /// (first region taken, later ones refused) whose partial state the
+    /// create path's rollback must undo.
+    region_fail_after: UnsafeCell<i64>,
+    /// P3 inc. 1: fail `create_sidecar_in` once this many creations have
+    /// been ATTEMPTED (-1 = never) — the second-sidecar failure whose
+    /// rollback must end the first sidecar and give everything back.
+    sidecar_fail_after: UnsafeCell<i64>,
+    /// P3 inc. 1: region bases handed back through `env_storage_release`, so
+    /// a test can prove a create that failed after its attach released the
+    /// store instead of stranding its NVMe extent.
+    released_storage: UnsafeCell<Vec<u64>>,
     /// POSIX-Environments E4: each `create_sidecar_in` as `(manifest bytes,
     /// target_partition)`, so tests see which partition a spawn targeted and
     /// what manifest it carried.
@@ -187,6 +213,12 @@ impl SimKernel {
             regions: UnsafeCell::new(Vec::new()),
             next_region_base: UnsafeCell::new(0x1000_0000),
             regions_exhausted: UnsafeCell::new(false),
+            placement_queries: UnsafeCell::new(Vec::new()),
+            placement_free: UnsafeCell::new(u64::MAX),
+            placement_quotas: UnsafeCell::new(Vec::new()),
+            region_fail_after: UnsafeCell::new(-1),
+            sidecar_fail_after: UnsafeCell::new(-1),
+            released_storage: UnsafeCell::new(Vec::new()),
             created: UnsafeCell::new(Vec::new()),
             sidecars: UnsafeCell::new(Vec::new()),
             free_handles: UnsafeCell::new(Vec::new()),
@@ -316,6 +348,56 @@ impl SimKernel {
     pub fn set_regions_exhausted(&self, exhausted: bool) {
         // SAFETY: single-threaded test harness only.
         unsafe { *self.regions_exhausted.get() = exhausted };
+    }
+
+    /// P3 inc. 1: every `placement_can_hold` the create path asked, as
+    /// `(target_partition, frames)`, in order — the refusal test asserts the
+    /// pre-flight asked about the RIGHT partition with the WHOLE demand.
+    pub fn placement_queries(&self) -> Vec<(u32, u64)> {
+        // SAFETY: single-threaded test harness only.
+        unsafe { (*self.placement_queries.get()).clone() }
+    }
+
+    /// P3 inc. 1: the node's free-frame answer basis (`u64::MAX` = no
+    /// limit), so a test can refuse a placement on node capacity alone.
+    pub fn set_placement_free(&self, frames: u64) {
+        // SAFETY: single-threaded test harness only.
+        unsafe { *self.placement_free.get() = frames };
+    }
+
+    /// P3 inc. 1: give partition `p` a frame quota against `usage`, the way
+    /// LPAR Phase 13's frame_pool.c stores them (quota 0 = unlimited), so a
+    /// test can drive the quota-refusal arithmetic exactly.
+    pub fn set_partition_frame_quota(&self, p: u32, quota: u64, usage: u64) {
+        // SAFETY: single-threaded test harness only.
+        unsafe {
+            let qs = &mut *self.placement_quotas.get();
+            if let Some(e) = qs.iter_mut().find(|e| e.0 == p) {
+                *e = (p, quota, usage);
+            } else {
+                qs.push((p, quota, usage));
+            }
+        }
+    }
+
+    /// P3 inc. 1: fail `alloc_region_in` once `n` regions have been attempted
+    /// (-1 restores the always-succeed posture).
+    pub fn set_region_fail_after(&self, n: i64) {
+        // SAFETY: single-threaded test harness only.
+        unsafe { *self.region_fail_after.get() = n };
+    }
+
+    /// P3 inc. 1: fail `create_sidecar_in` once `n` creations have been
+    /// attempted (-1 restores the always-succeed posture).
+    pub fn set_sidecar_fail_after(&self, n: i64) {
+        // SAFETY: single-threaded test harness only.
+        unsafe { *self.sidecar_fail_after.get() = n };
+    }
+
+    /// P3 inc. 1: region bases released through `env_storage_release`.
+    pub fn released_storage(&self) -> Vec<u64> {
+        // SAFETY: single-threaded test harness only.
+        unsafe { (*self.released_storage.get()).clone() }
     }
 
     /// Register a capability on a handle (used by tests to set up initial state).
@@ -548,6 +630,33 @@ impl Kernel for SimKernel {
         Ok((h, h))
     }
 
+    /// P3 inc. 1: the placement gate asked as a QUESTION (kabi's trait
+    /// method; kernel/cap.h's SYS_SLS_PLACEMENT_CAN_HOLD contract, answered
+    /// from this sim's own knobs). Every question is recorded, so a refusal
+    /// test can prove the pre-flight asked about the TARGET partition with
+    /// the WHOLE environment's frames — and that it asked at all, which is
+    /// the tooth that bites when the pre-flight is deleted.
+    fn placement_can_hold(&self, target_partition: u32, frames: u64) -> bool {
+        // SAFETY: single-threaded test harness only.
+        unsafe {
+            (*self.placement_queries.get()).push((target_partition, frames));
+            if frames == 0 {
+                return true;
+            }
+            // Quota first, exactly as cap.c does it (exact, O(1)); quota 0
+            // is unlimited, the kernel's BSS-zero default.
+            if let Some(&(_, quota, usage)) = (*self.placement_quotas.get())
+                .iter()
+                .find(|e| e.0 == target_partition)
+            {
+                if quota != 0 && usage + frames > quota {
+                    return false;
+                }
+            }
+            frames <= *self.placement_free.get()
+        }
+    }
+
     fn alloc_region(&self, nframes: u64, align_frames: u64) -> u64 {
         // 0 in the partition slot is the ABI's "charge the caller" — the sim
         // does not model a caller's partition, so the two are distinguished by
@@ -560,6 +669,15 @@ impl Kernel for SimKernel {
         // SAFETY: single-threaded test harness only.
         unsafe { (*self.regions.get()).push((nframes, align_frames, target_partition)) };
         if unsafe { *self.regions_exhausted.get() } {
+            return 0;
+        }
+        // P3 inc. 1: a set mid-way shortfall — every attempt past the limit
+        // is refused while the earlier ones still succeeded, which is the
+        // partial state the create path's rollback must undo.
+        let fail_after = unsafe { *self.region_fail_after.get() };
+        if fail_after >= 0
+            && unsafe { (*self.regions.get()).len() } as i64 > fail_after
+        {
             return 0;
         }
         let base = unsafe { *self.next_region_base.get() };
@@ -579,9 +697,30 @@ impl Kernel for SimKernel {
         Ok(())
     }
 
+    fn env_storage_release(&self, region_base: u64) -> Result<(), i32> {
+        // P3 inc. 1: attach is an accounting no-op here, so release is one
+        // too — but RECORDED, because "the failed create released its
+        // store" is a claim a test must be able to check rather than take
+        // on faith.
+        // SAFETY: single-threaded test harness only.
+        unsafe { (*self.released_storage.get()).push(region_base) };
+        Ok(())
+    }
+
     fn create_sidecar_in(&self, manifest: &[u8], target_partition: u32) -> Result<(u32, u32), i32> {
         // SAFETY: single-threaded test harness only.
         unsafe { (*self.created.get()).push((manifest.to_vec(), target_partition)) };
+        // P3 inc. 1: a set failure point — the SECOND create of a two-create
+        // path fails after the first succeeded, which is the state the
+        // rollback has to unwind. The attempt is recorded before the
+        // refusal, the way the real kernel's counters see a refused create's
+        // request while registering no sidecar.
+        let fail_after = unsafe { *self.sidecar_fail_after.get() };
+        if fail_after >= 0
+            && unsafe { (*self.created.get()).len() } as i64 > fail_after
+        {
+            return Err(-1);
+        }
         let ends = self.create_sidecar(manifest)?;
         // E5: register the new sidecar under its manifest NAME in its target
         // partition, the way the real kernel's create path does, so
@@ -737,6 +876,14 @@ impl Kernel for SharedKernel {
     fn env_storage_attach(&self, partition_id: u32, index: u32,
                           region_base: u64, region_bytes: u64) -> Result<(), i32> {
         self.0.env_storage_attach(partition_id, index, region_base, region_bytes)
+    }
+
+    fn env_storage_release(&self, region_base: u64) -> Result<(), i32> {
+        self.0.env_storage_release(region_base)
+    }
+
+    fn placement_can_hold(&self, target_partition: u32, frames: u64) -> bool {
+        self.0.placement_can_hold(target_partition, frames)
     }
 
     fn sidecar_pid(&self, name: &str, partition: u32) -> u32 {
