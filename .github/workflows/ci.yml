@@ -352,6 +352,24 @@ jobs:
           -p aerosls-procmgr -p aerosls-dm
         working-directory: aerosls2
 
+      # ─── POSIX sidecar: the host tests that pin the client's wire half ─
+      # user/sidecar defaults to the HOST build (the fake kernel), so its
+      # unit and boot tests can run here on every push — and before this
+      # step they ran by hand only. They pin the halves of cross-language
+      # contracts no kernel-side guard can see: nc's dotted-quad parse, for
+      # one, must yield the LOGICAL u32 whose LE encoding the kernel's
+      # CONNECT decode turns back into its own network-order address —
+      # from_le_bytes there double-swapped every same-host dial, missed
+      # ipv4_send's loopback hook and died on the SYN-ACK timeout until it
+      # was caught live (P2 L5). Now that regression fails this step (both
+      # nc_parse_ip tests go red) instead of a live arm. Same toolchain as
+      # the steps above; `-p aerosls-sidecar` builds that member against
+      # the host target only — the shipped `target`-feature bin is skipped
+      # by required-features, so nothing cross-compiles here.
+      - name: POSIX sidecar host tests (client wire contracts)
+        run: cargo test -p aerosls-sidecar --manifest-path user/Cargo.toml
+        working-directory: aerosls2
+
       # ─── aerobackup: the E7 census target's host test ──────────────────
       # backup/aerobackup is the workload E7's Linux ABI shim will be
       # measured against (tools/linux_abi_candidate.conf), so its retention
