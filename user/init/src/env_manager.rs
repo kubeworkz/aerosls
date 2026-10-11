@@ -10,9 +10,9 @@
 //! second manifest builder in kernel C (roadmap §7).
 
 use aerosls_proto::env_proto::{
-    self, EnvFrame, RegisterRegion, RegisterReply, ENV_CREATE, ENV_DESTROY, ENV_ERR_FULL,
-    ENV_ERR_INVAL, ENV_ERR_NOENT, ENV_ERR_NOMEM, ENV_ERR_PART, ENV_ERR_QUOTA, ENV_OK,
-    ENV_REGISTER,
+    self, EnvFrame, RegisterRegion, RegisterReply, ENV_CREATE, ENV_DESTROY, ENV_ERR_CAPACITY,
+    ENV_ERR_FULL, ENV_ERR_INVAL, ENV_ERR_NOENT, ENV_ERR_NOMEM, ENV_ERR_PART, ENV_ERR_QUOTA,
+    ENV_OK, ENV_REGISTER,
     REGION_POSIX_HEAP, REGION_RD_HEAP, REGION_RD_STORAGE, TASK_POSIX_SIDECAR,
     TASK_RAMDISK_SIDECAR,
 };
@@ -112,6 +112,22 @@ pub fn create_environment<K: Kernel>(
     index: u32,
     images: &EnvImages,
 ) -> Result<Environment, i32> {
+    // P3 increment 1: the placement pre-flight — ask the kernel the
+    // CAPACITY question BEFORE the first frame is taken (kernel/cap.h's
+    // SYS_SLS_PLACEMENT_CAN_HOLD, 327): "can this partition hold the whole
+    // environment's private memory on this node?", answered from the two
+    // counters only the kernel owns (the partition's frame quota/usage, the
+    // node's free-frame count). A NO is refused BY NAME — ENV_ERR_CAPACITY,
+    // never a mid-create NOMEM — with nothing allocated anywhere: E4's
+    // "a refused placement allocates nothing", extended from the kernel's
+    // gate to the numbers. The question covers the three regions exactly;
+    // the sidecar image/stack frames the kernel charges at create ride the
+    // allocator's own quota check, whose rollback is complete below.
+    let env_frames = RD_HEAP_FRAMES + RD_STORAGE_FRAMES + POSIX_HEAP_FRAMES;
+    if !k.placement_can_hold(partition, env_frames) {
+        return Err(ENV_ERR_CAPACITY as i32);
+    }
+
     // Private regions from the frame pool, charged to the TARGET partition
     // (E4 follow-on): the environment's heap and storage must count against
     // the tenant's frame quota, not the environment manager's — otherwise a
@@ -123,6 +139,15 @@ pub fn create_environment<K: Kernel>(
     let rd_storage = k.alloc_region_in(RD_STORAGE_FRAMES, 1, partition);
     let px_heap = k.alloc_region_in(POSIX_HEAP_FRAMES, 1, partition);
     if rd_heap == 0 || rd_storage == 0 || px_heap == 0 {
+        // P3 inc. 1: a shortfall mid-way leaves the earlier regions TAKEN
+        // (the pre-flight shrinks the window but cannot close it — another
+        // create can land between question and answer). Hand back every one
+        // that succeeded: free_region_in refuses a zero base (the failure
+        // value) without touching the pool, so one call per region is
+        // unconditional and the failed create leaks nothing.
+        k.free_region_in(rd_heap, RD_HEAP_FRAMES, partition);
+        k.free_region_in(rd_storage, RD_STORAGE_FRAMES, partition);
+        k.free_region_in(px_heap, POSIX_HEAP_FRAMES, partition);
         return Err(ERR_NOMEM);
     }
 
@@ -170,7 +195,17 @@ pub fn create_environment<K: Kernel>(
         RD_STORAGE_BYTES,
         0x3,
     );
-    let (ramdisk_r, ramdisk_w) = k.create_sidecar_in(&rd_manifest, partition)?;
+    let (ramdisk_r, ramdisk_w) = k.create_sidecar_in(&rd_manifest, partition).map_err(|e| {
+        // P3 inc. 1: the store is attached and the regions are taken — give
+        // them back, so a create refused HERE leaves nothing held anywhere
+        // (the counterpart of the attach-refusal arm above; the attach
+        // happened, so the store is released before its region is freed).
+        let _ = k.env_storage_release(rd_storage);
+        k.free_region_in(rd_heap, RD_HEAP_FRAMES, partition);
+        k.free_region_in(rd_storage, RD_STORAGE_FRAMES, partition);
+        k.free_region_in(px_heap, POSIX_HEAP_FRAMES, partition);
+        e
+    })?;
 
     // Tenant POSIX: tenant profile (no hardware/network — E2), wired to THIS
     // environment's ramdisk, placed in the same partition.
@@ -181,7 +216,28 @@ pub fn create_environment<K: Kernel>(
         images.posix_size,
         px_heap,
     );
-    let (posix_r, posix_w) = k.create_sidecar_in(&px_manifest, partition)?;
+    let (posix_r, posix_w) = k.create_sidecar_in(&px_manifest, partition).map_err(|e| {
+        // P3 inc. 1: the ramdisk already exists under its name — END it
+        // first and confirm the kernel finished the job (kernel/process.c
+        // DEFERS a kill whose target is RUNNING, and freeing the heap a
+        // live sidecar can still execute in would be a use-after-free). Only
+        // once the name no longer resolves is everything given back: the
+        // store release, then the three regions. On a deferred kill the
+        // regions stay HELD — a bounded leak is the right side of that
+        // trade, and the deferred teardown still returns the sidecar's own
+        // image/stack frames.
+        let rd_pid = k.sidecar_pid(rd_name.as_str(), partition);
+        if rd_pid != 0 {
+            k.proc_kill(rd_pid);
+        }
+        if k.sidecar_pid(rd_name.as_str(), partition) == 0 {
+            let _ = k.env_storage_release(rd_storage);
+            k.free_region_in(rd_heap, RD_HEAP_FRAMES, partition);
+            k.free_region_in(rd_storage, RD_STORAGE_FRAMES, partition);
+            k.free_region_in(px_heap, POSIX_HEAP_FRAMES, partition);
+        }
+        e
+    })?;
 
     Ok(Environment {
         partition,
@@ -584,6 +640,14 @@ impl EnvManager {
                         self.reply(reply, ENV_CREATE, ENV_OK, id, partition)
                     }
                     Err(ERR_NOMEM) => self.reply(reply, ENV_CREATE, ENV_ERR_NOMEM, 0, partition),
+                    // P3 inc. 1: the placement pre-flight refused BEFORE the
+                    // first frame — its own code, so a caller can tell "this
+                    // node/partition cannot hold another environment" from a
+                    // mid-create NOMEM (whose partial allocations have been
+                    // rolled back).
+                    Err(e) if e == ENV_ERR_CAPACITY as i32 => {
+                        self.reply(reply, ENV_CREATE, ENV_ERR_CAPACITY, 0, partition)
+                    }
                     // P1b: the create's durable store does not fit the
                     // tenant's storage quota — named as the quota's own
                     // refusal, ahead of the generic arms, because "the disk
@@ -783,6 +847,145 @@ mod tests {
         k.set_regions_exhausted(true);
         assert_eq!(create_environment(&k, 5, 1, &images()), Err(ERR_NOMEM));
         assert_eq!(k.created().len(), 0);
+        // P3 inc. 1: even this arm now hands back whatever DID succeed
+        // (here: nothing, since every attempt failed).
+        assert!(k.freed_regions().is_empty());
+    }
+
+    // ── P3 increment 1: the placement gate — refused before the first frame ──
+    /// The whole environment's private memory: the three regions the create
+    /// takes up front (1344 frames — E4's own count, the number the pre-flight
+    /// asks the kernel about).
+    const ENV_FRAMES: u64 = RD_HEAP_FRAMES + RD_STORAGE_FRAMES + POSIX_HEAP_FRAMES;
+
+    #[test]
+    fn placement_pre_flight_runs_before_anything_is_taken() {
+        // The allow side: with quota headroom the create succeeds — and the
+        // evidence the gate actually RAN is the question itself, asked
+        // exactly once, about the target partition, with the whole demand.
+        // This is the tooth that bites when the pre-flight is deleted: a
+        // create that never asked has no query to show.
+        let k = SimKernel::new();
+        k.set_partition_frame_quota(5, 2 * ENV_FRAMES, 0);
+        let env = create_environment(&k, 5, 1, &images()).expect("create succeeds under quota");
+        assert_eq!(k.placement_queries(), alloc::vec![(5, ENV_FRAMES)]);
+        assert_eq!(env.partition, 5);
+        assert_eq!(k.regions().len(), 3, "the three regions were taken under quota");
+        assert_eq!(k.created().len(), 2);
+    }
+
+    #[test]
+    fn refused_placement_allocates_nothing() {
+        // Quota refusal: usage + demand exceeds partition 5's frame quota.
+        // Refused BY NAME — and not one frame, sidecar, or store attach is
+        // taken anywhere: a refused placement allocates nothing (E4's rule,
+        // extended from the kernel's gate to the numbers).
+        let k = SimKernel::new();
+        k.set_partition_frame_quota(5, ENV_FRAMES, 1); // 1 + ENV_FRAMES > ENV_FRAMES
+        assert_eq!(
+            create_environment(&k, 5, 1, &images()),
+            Err(ENV_ERR_CAPACITY as i32)
+        );
+        // The question named the RIGHT partition with the WHOLE demand.
+        assert_eq!(k.placement_queries(), alloc::vec![(5, ENV_FRAMES)]);
+        assert!(k.regions().is_empty(), "not one region was even attempted");
+        assert!(k.created().is_empty(), "no sidecar was created");
+        assert!(k.sidecars().is_empty(), "no sidecar was registered");
+    }
+
+    #[test]
+    fn node_capacity_refusal_is_the_same_named_refusal() {
+        // The other half of the arithmetic: quota unlimited, but the NODE
+        // cannot back the demand — one frame short refuses, exactly enough
+        // holds. Both refusals are the pre-flight's own ENV_ERR_CAPACITY,
+        // never the generic ENV_ERR_PART.
+        let k = SimKernel::new();
+        k.set_placement_free(ENV_FRAMES - 1);
+        assert_eq!(
+            create_environment(&k, 7, 1, &images()),
+            Err(ENV_ERR_CAPACITY as i32)
+        );
+        assert!(k.regions().is_empty() && k.created().is_empty());
+        k.set_placement_free(ENV_FRAMES);
+        assert!(create_environment(&k, 7, 1, &images()).is_ok());
+    }
+
+    #[test]
+    fn capacity_refusal_is_named_through_the_request_path() {
+        // The reply a caller sees over the ENV channel: ENV_ERR_CAPACITY by
+        // name (never a generic ENV_ERR_PART), env_id 0, and nothing in the
+        // manager's table.
+        let k = SimKernel::new();
+        k.set_partition_frame_quota(5, 16, 0);
+        let mut mgr = EnvManager::new(images(), 8);
+        let mut reply = [0u8; 64];
+        let n = mgr.handle_request(&k, &create_req(5, 1), &mut reply);
+        let (status, env_id, partition) = reply_status(&reply, n);
+        assert_eq!(status, ENV_ERR_CAPACITY);
+        assert_eq!((env_id, partition), (0, 5));
+        assert!(mgr.environments().is_empty());
+        assert!(k.regions().is_empty(), "the refusal allocated nothing");
+        assert_eq!(k.placement_queries(), alloc::vec![(5, ENV_FRAMES)]);
+    }
+
+    #[test]
+    fn shortfall_mid_way_rolls_back_what_succeeded() {
+        // The frame pool refuses from the SECOND region on: the first is
+        // taken, the rest are not — and the create hands the taken one back,
+        // so a failed create leaks nothing. (Before P3 inc. 1 this arm
+        // returned NOMEM with the earlier regions still charged to the
+        // tenant — the leak the pre-flight alone cannot close, because
+        // another create can land between question and answer.)
+        let k = SimKernel::new();
+        k.set_region_fail_after(1);
+        assert_eq!(create_environment(&k, 5, 1, &images()), Err(ERR_NOMEM));
+        let freed = k.freed_regions();
+        assert_eq!(freed, alloc::vec![(0x1000_0000, RD_HEAP_FRAMES, 5)],
+                   "the one region that succeeded went back to the tenant partition");
+        assert!(k.created().is_empty());
+    }
+
+    #[test]
+    fn second_sidecar_failure_ends_the_first_and_releases_everything() {
+        // The ramdisk is created; the POSIX sidecar's create is refused. The
+        // rollback ends the half-created ramdisk (confirming the kill landed
+        // — a live sidecar's heap must never be freed under it), releases
+        // the store attach, and gives the three regions back.
+        let k = SimKernel::new();
+        k.set_sidecar_fail_after(1);
+        assert!(create_environment(&k, 5, 1, &images()).is_err());
+        assert!(k.sidecars().is_empty(), "the half-created ramdisk was ended");
+        let freed = k.freed_regions();
+        assert_eq!(
+            freed,
+            alloc::vec![
+                (0x1000_0000, RD_HEAP_FRAMES, 5),
+                (0x1000_0000 + RD_HEAP_FRAMES * 4096, RD_STORAGE_FRAMES, 5),
+                (0x1000_0000 + (RD_HEAP_FRAMES + RD_STORAGE_FRAMES) * 4096,
+                 POSIX_HEAP_FRAMES, 5),
+            ],
+            "all three regions went back to the tenant partition"
+        );
+        assert_eq!(k.released_storage(), alloc::vec![freed[1].0],
+                   "the store's attach was released before its region was freed");
+    }
+
+    #[test]
+    fn deferred_kill_stops_the_rollback_from_freeing_live_memory() {
+        // The negative control for the rollback's ORDER: when the kernel
+        // DEFERS the kill (the ramdisk was RUNNING at the moment of the
+        // create failure) its heap can still be executed in, so the rollback
+        // releases NOTHING rather than freeing live memory. A bounded leak
+        // is the right side of that trade — a use-after-free is not.
+        let k = SimKernel::new();
+        k.set_sidecar_fail_after(1);
+        k.set_kill_deferred(true);
+        assert!(create_environment(&k, 5, 1, &images()).is_err());
+        assert_eq!(k.sidecars().len(), 1,
+                   "the deferred kill left the ramdisk registered");
+        assert!(k.freed_regions().is_empty(),
+                "nothing was freed under a sidecar that can still run");
+        assert!(k.released_storage().is_empty());
     }
 
     // ── EnvManager dispatch: the ENV_* request path ─────────────────────────

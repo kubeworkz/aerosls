@@ -58,6 +58,10 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include "kernel/simi_ctx_migrate.h"   // PEC Phase 3 -- stubbed below
+/* This test carries its own PER-PARTITION frame quota/usage fakes (below,
+ * with the kernel's out-of-range sentinel), richer than the header's single
+ * global knob — so it opts out of those two weak stubs (P3 increment 1). */
+#define HOST_STUBS_FRAME_QUOTA_LOCAL 1
 #include "tests/process_host_stubs.h"   /* stack_bottom/stack_top (frame_pool_init reservation bounds) */
 
 /* arch/x86/boot.asm's bootstrap-stack bounds (stack_bottom/stack_top) come

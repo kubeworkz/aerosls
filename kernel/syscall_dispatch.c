@@ -619,6 +619,14 @@ uint64_t do_syscall(uint64_t num, void* arg) {
     case SYS_SLS_ALLOC_REGION:
         return sys_sls_alloc_region((struct SLSAllocRegionRequest*)arg);
 
+    // ─── POSIX-Environments P3 increment 1: the placement gate (327) ────
+    // "Can partition P hold N more frames?" — the pre-flight that lets a
+    // create refuse by name (ENV_ERR_CAPACITY) before the first frame is
+    // taken, so a refused placement allocates nothing anywhere.
+    case SYS_SLS_PLACEMENT_CAN_HOLD:
+        return sys_sls_placement_can_hold(
+            (struct SLSPlacementCanHoldRequest*)arg);
+
     // ─── POSIX-Environments E5: release a region (321) and resolve a sidecar
     // name to its pid (322). Together these are what ending an environment
     // needs — the pid to kill and the free to hand the frames back — and the

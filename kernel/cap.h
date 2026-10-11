@@ -1117,6 +1117,40 @@ struct SLSFreeRegionRequest {
 };
 int sys_sls_free_region(struct SLSFreeRegionRequest* req);
 
+/* ─── SYS_SLS_PLACEMENT_CAN_HOLD (327) — POSIX-Environments P3 inc. 1 ───
+ * The placement gate asked as a QUESTION rather than taken as a side
+ * effect. E4's refusal discipline proved the kernel can refuse a placement
+ * after it has already begun taking frames — the refusal works, but the
+ * frames the earlier steps had already charged stayed held until someone
+ * unwound them. P3's first increment moves the refusal BEFORE the first
+ * frame: the environment manager asks "can partition P hold N more frames
+ * on this node?" and the kernel answers from the two counters only it
+ * owns — the partition's frame quota/usage (partition.h) and the node's
+ * free-frame count (frame_pool_free_count()). No = the create is refused
+ * ENV_ERR_CAPACITY by name, before any allocation, so a refused placement
+ * allocates nothing anywhere — E4's rule, extended from "the kernel's
+ * gate says no" to "the numbers say no".
+ *
+ * The query answers the CAPACITY question ONLY. Absent/paused partitions
+ * are deliberately NOT its refusal: the query DEFERS on them (answers
+ * "can hold"), so their own named refusals still fire at the first
+ * alloc_region_in/create_sidecar_in (rule 4a2) and the caller hears the
+ * gate that actually said no. A tenant reading "insufficient frame
+ * capacity" for a paused or absent partition would be a lie about which
+ * gate said no — the live boot measured exactly that before the deferral
+ * landed (see cap.c). And it is gated to the
+ * sidecar creator tree exactly like the allocator: asking is harmless,
+ * but the only process that needs to ask is the only process that may
+ * place, and a probe that reports node free-frame counts to arbitrary
+ * ring-3 programs is reconnaissance it does not need. */
+#define SYS_SLS_PLACEMENT_CAN_HOLD 327
+struct SLSPlacementCanHoldRequest {
+    uint64_t frames;          /* frames the placement wants to hold */
+    uint32_t target_partition;/* ask about THIS partition; 0 = the caller's */
+    uint32_t _pad;            /* request stays 8-byte aligned */
+};
+uint64_t sys_sls_placement_can_hold(struct SLSPlacementCanHoldRequest* req);
+
 /* ─── SYS_SLS_SIDECAR_PID (322) — POSIX-Environments E5 ──────────────────
  * Resolve a sidecar NAME to its pid within `partition` (0 if no sidecar of
  * that name is live), exposing the registry lookup cap_create_sidecar()'s

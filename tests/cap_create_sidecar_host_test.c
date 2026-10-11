@@ -2931,6 +2931,113 @@ int main(void) {
         }
     }
 
+    /* ── 18. P3 increment 1: SYS_SLS_PLACEMENT_CAN_HOLD (327) ─────────────
+     * The placement gate asked as a QUESTION: "can partition P hold N more
+     * frames on this node?" — answered ONLY from counters (the partition's
+     * frame quota/usage, the node's free count), granting nothing and
+     * mutating nothing. The environment manager asks it before the first
+     * allocation, so a create that cannot fit is refused ENV_ERR_CAPACITY
+     * with nothing taken anywhere — E4's "a refused placement allocates
+     * nothing", extended from the kernel's gate to the numbers. The counters
+     * are process_host_stubs.h's settable stand-ins (frame_pool.c is not
+     * linked here, same as the allocator stubs in 0c); "mutating nothing" is
+     * proved with the recording allocator stubs — no scenario below may
+     * reach the allocator at all, because the QUESTION grants nothing. */
+    {
+        struct SLSPlacementCanHoldRequest pc = {
+            .frames = 1344, .target_partition = 0
+        };
+        g_cur_pid = 100;                       /* init: authority, partition 0 */
+        proc_table[0].partition_id = 0;
+        host_stub_partition_extra_id     = 5;  /* a second live partition */
+        host_stub_partition_extra_paused = 0;
+        g_alloc_region_calls = 0;
+
+        /* The allow side: default knobs (quota 0 = unlimited, node ample). */
+        host_stub_frame_quota = 0;
+        host_stub_frame_usage = 0;
+        host_stub_frame_free  = 0xFFFFFFFFULL;
+        CHECK(sys_sls_placement_can_hold(&pc) == 1,
+              "P3: with quota unlimited and node frames ample, the placement can hold");
+
+        /* Quota headroom exactly covered still holds (the kernel refuses only
+         * on usage + frames > quota, not >=). */
+        host_stub_frame_quota = 1344;
+        CHECK(sys_sls_placement_can_hold(&pc) == 1,
+              "P3: a frame quota exactly equal to the demand still holds");
+
+        /* Quota refusal: usage + demand exceeds the quota EVEN THOUGH the
+         * node has room — the quota is checked first, and it is exact. */
+        host_stub_frame_usage = 900;           /* 900 + 1344 > 1344 */
+        pc.target_partition = 5;
+        CHECK(sys_sls_placement_can_hold(&pc) == 0,
+              "P3: usage + demand over the partition's frame quota is refused, with node frames ample");
+
+        /* Node refusal: quota unlimited, but the node cannot back the
+         * demand — one frame short refuses, exactly enough holds. */
+        host_stub_frame_quota = 0;
+        host_stub_frame_usage = 0;
+        host_stub_frame_free  = 1343;
+        CHECK(sys_sls_placement_can_hold(&pc) == 0,
+              "P3: a node free-frame count one below the demand is refused");
+        host_stub_frame_free  = 1344;
+        CHECK(sys_sls_placement_can_hold(&pc) == 1,
+              "P3: a node free-frame count exactly equal to the demand still holds");
+
+        /* A zero-frame question always answers yes — there is nothing to
+         * hold, so no counter can refuse it. */
+        host_stub_frame_quota = 1;
+        host_stub_frame_usage = 5;
+        pc.frames = 0;
+        CHECK(sys_sls_placement_can_hold(&pc) == 1,
+              "P3: a zero-frame question always answers yes");
+        pc.frames = 1344;
+
+        /* The caller gate: asking is harmless, but the only process that
+         * needs to ask is the only process that may place — a probe that
+         * reports node free-frame counts to arbitrary ring-3 programs is
+         * reconnaissance it does not need, so a non-authority caller gets 0
+         * ("cannot hold"), the same answer a real refusal would give. */
+        proc_table[1].pid = 501;
+        proc_table[1].active = 1;
+        proc_table[1].sidecar_authority = 0;   /* a plain spawned program */
+        g_cur_pid = 501;
+        CHECK(sys_sls_placement_can_hold(&pc) == 0,
+              "P3: a caller without sidecar_authority is refused (every placement cannot hold for it)");
+        proc_table[1].active = 0;
+        g_cur_pid = 100;
+
+        /* The query refuses only the CAPACITY question. A partition that
+         * cannot be asked about — out of range, absent, or paused — is
+         * DEFERRED (answered 1, "not this gate's refusal"), so its own
+         * named state gate still refuses at the first alloc, by name:
+         * reporting "insufficient frame capacity" for a partition that
+         * does not exist or is paused names the wrong gate, which the live
+         * boot caught before this deferral landed. */
+        pc.target_partition = PARTITION_MAX;
+        CHECK(sys_sls_placement_can_hold(&pc) == 1,
+              "P3: an out-of-range target is DEFERRED to its state gate, not refused as capacity");
+        pc.target_partition = 9;               /* neither 0 nor the extra id */
+        CHECK(sys_sls_placement_can_hold(&pc) == 1,
+              "P3: an ABSENT target is DEFERRED to its state gate");
+        pc.target_partition = 5;
+        host_stub_partition_extra_paused = 1;
+        CHECK(sys_sls_placement_can_hold(&pc) == 1,
+              "P3: a PAUSED target is DEFERRED to its state gate");
+        host_stub_partition_extra_paused = 0;
+        CHECK(sys_sls_placement_can_hold(NULL) == 0,
+              "P3: a NULL request is refused");
+
+        CHECK(g_alloc_region_calls == 0,
+              "P3: across every scenario above the QUESTION reached the allocator not once — it grants nothing");
+
+        /* Restore the shared stubs. */
+        host_stub_frame_quota = 0;
+        host_stub_frame_usage = 0;
+        host_stub_frame_free  = 0xFFFFFFFFULL;
+        host_stub_partition_extra_id = 0xFFFFFFFFu;
+    }
+
     if (g_fail == 0) printf("\nALL PASS\n");
     else             printf("\n%d FAILURE(S)\n", g_fail);
     return g_fail != 0;

@@ -333,6 +333,15 @@ void sys_sls_partition_quota_list(void);
 uint64_t frame_pool_total_frames(void);
 uint64_t frame_pool_allocated_count(void);
 
+/* POSIX-Environments P3 increment 1 (the placement gate): how many frames
+ * the pool could still hand out — every bitmap-clear frame except frame 0,
+ * which alloc_raw_frame() and the contiguous allocator both skip (it is
+ * never handed out, so counting it as free would inflate every placement
+ * pre-flight by exactly one frame). This is the node-wide half of
+ * sys_sls_placement_can_hold (327): the quota half is partition.c's, and a
+ * create's pre-flight asks both before any frame is taken. */
+uint64_t frame_pool_free_count(void);
+
 // ─── Syscalls ─────────────────────────────────────────────────────────────
 #define SYS_SLS_PARTITION_QUOTA_SET 213
 

@@ -53,6 +53,11 @@
 #define ENV_ERR_QUOTA   7   /* the environment's durable store does not fit the
                              * partition's storage quota (P1b) — the quota's own
                              * error, deliberately not NOMEM's frame-pool one */
+#define ENV_ERR_CAPACITY 8   /* the create's frame demand exceeds the partition's
+                             * frame quota or the node's free frames (P3 inc. 1) —
+                             * refused by init's placement pre-flight BEFORE the
+                             * first frame is taken, so nothing is allocated
+                             * anywhere; deliberately not NOMEM's mid-create one */
 
 #define ENV_FRAME_SIZE       16u
 #define ENV_CREATE_BODY_SIZE  8u
@@ -257,6 +262,13 @@ static inline const char* env_status_name(uint16_t s) {
          * quota. Its own code and its own words — "exhausted" here is the
          * quota speaking, not the frame pool. */
         case ENV_ERR_QUOTA:  return "storage quota exhausted";
+        /* P3 increment 1: the create's frame demand exceeds the partition's
+         * frame quota or the node's free frames — the placement pre-flight's
+         * own refusal, BEFORE the first frame is taken. Its own code and its
+         * own words so a caller can tell "this node/partition cannot hold
+         * another environment" from a mid-create NOMEM (whose partial
+         * allocations have been rolled back). */
+        case ENV_ERR_CAPACITY: return "insufficient frame capacity";
         default:             return "unknown";
     }
 }
