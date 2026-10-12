@@ -12,6 +12,7 @@
 #include "../kernel/partition.h"
 #include "../kernel/stream.h"   // Multi-Node Partition Scaling Roadmap Phase 7 -- stream_migrate_recv_begin()/_page()
 #include "../kernel/simi_ctx_migrate.h"  // PEC Phase 3 -- simi_ctx_migrate_recv_begin()/_chunk()
+#include "../kernel/env_migrate.h"  // POSIX-Environments P3 increment 2 -- env_migrate_recv_begin()/_page()
 #include "../kernel/kernel_io.h"
 
 /* The consensus handlers below need a wall-clock reading to restart election
@@ -434,7 +435,9 @@ void dspp_migrate_note_ack(uint64_t transfer_id, uint16_t opcode,
 
     if (status != 0) { ack_nack_seen = 1; return; }
 
-    if (opcode == DSPP_MIGRATE_BEGIN_ACK) { ack_begin_seen = 1; return; }
+    if (opcode == DSPP_MIGRATE_BEGIN_ACK || opcode == DSPP_MIGRATE_ENV_BEGIN_ACK) {
+        ack_begin_seen = 1; return;
+    }
     if (page_index != ack_page_index) return;
     if (frag_index >= DSPP_MIGRATE_FRAGS_PER_PAGE) return;
     if (!ack_frag_seen[frag_index]) {
@@ -493,6 +496,153 @@ void dspp_migrate_rx(struct DSPPMigratePagePacket* packet, uint16_t len) {
      * BSP could not otherwise make progress, since it is the thread doing
      * the waiting. Hence `volatile` on the record below. */
     if (h->opcode == DSPP_MIGRATE_BEGIN_ACK || h->opcode == DSPP_MIGRATE_PAGE_ACK) {
+        dspp_migrate_note_ack(h->transfer_id, h->opcode, h->page_index,
+                              h->frag_index, h->status);
+        return;
+    }
+}
+
+    /* ─── Environment payload migration (POSIX-Environments P3 inc. 2) ──
+     * Wire encode/decode + routing only; kernel/env_migrate.c owns what the
+     * bytes mean, exactly as kernel/stream.c does for the stream family.
+     * The ACK path shares the stream family's single outstanding-ACK record
+     * on purpose: env_migrate_send() is synchronous in the same way
+     * stream_migrate_send_partition() is, so exactly one page of one
+     * transfer is ever in flight from this node, and a second arming record
+     * would imply a concurrency that does not exist. */
+void dspp_env_migrate_send_begin(uint64_t transfer_id, uint32_t node_dest_id,
+                                 uint32_t partition_id, uint32_t env_index,
+                                 uint32_t total_pages, const void* record,
+                                 uint32_t record_len) {
+    struct DSPPEnvMigrateBeginPacket pkt;
+    pkt.header.magic           = DSPP_MIGRATE_MAGIC;
+    pkt.header.opcode          = DSPP_MIGRATE_ENV_BEGIN_REQ;
+    pkt.header.node_source_id  = (uint16_t)cluster_local_node_id();
+    pkt.header.node_dest_id    = node_dest_id;
+    pkt.header.transfer_id     = transfer_id;
+    pkt.header.partition_id    = partition_id;
+    pkt.header.page_index      = 0;
+    pkt.header.status          = 0;
+    pkt.header.env_index       = env_index;
+    pkt.header.total_pages     = total_pages;
+    pkt.header.record_len      = record_len;
+    pkt.header.frag_index      = 0;
+    for (uint32_t i = 0; i < DSPP_ENV_MIGRATE_RECORD_MAX; i++)
+        pkt.record[i] = 0;
+    const uint8_t* rec_bytes = (const uint8_t*)record;
+    if (record && record_len <= DSPP_ENV_MIGRATE_RECORD_MAX)
+        for (uint32_t i = 0; i < record_len; i++) pkt.record[i] = rec_bytes[i];
+    dspp_transmit_raw(&pkt, (uint16_t)sizeof(pkt));
+}
+
+void dspp_env_migrate_send_page(uint64_t transfer_id, uint32_t node_dest_id,
+                                uint32_t partition_id, uint32_t page_index,
+                                const uint8_t* page_data) {
+    struct DSPPEnvMigratePagePacket pkt;
+    pkt.header.magic           = DSPP_MIGRATE_MAGIC;
+    pkt.header.opcode          = DSPP_MIGRATE_ENV_PAGE_REQ;
+    pkt.header.node_source_id  = (uint16_t)cluster_local_node_id();
+    pkt.header.node_dest_id    = node_dest_id;
+    pkt.header.transfer_id     = transfer_id;
+    pkt.header.partition_id    = partition_id;
+    pkt.header.page_index      = page_index;
+    pkt.header.status          = 0;
+    pkt.header.env_index       = 0;
+    pkt.header.total_pages     = 0;
+    pkt.header.record_len      = 0;
+    /* One page, DSPP_MIGRATE_FRAGS_PER_PAGE frames — the stream family's
+     * slicing, because a 4 KiB page does not fit an Ethernet frame and two
+     * families slicing at different sizes for no reason is a thing to get
+     * wrong later (dspp.h's own note). */
+    for (uint32_t f = 0; f < DSPP_MIGRATE_FRAGS_PER_PAGE; f++) {
+        pkt.header.frag_index = f;
+        for (uint32_t b = 0; b < DSPP_MIGRATE_FRAG_BYTES; b++)
+            pkt.page_data[b] = page_data[f * DSPP_MIGRATE_FRAG_BYTES + b];
+        dspp_transmit_raw(&pkt, (uint16_t)sizeof(pkt));
+    }
+}
+
+void dspp_env_migrate_send_frag(uint64_t transfer_id, uint32_t node_dest_id,
+                                uint32_t partition_id, uint32_t page_index,
+                                uint32_t frag_index, const uint8_t* page_data) {
+    if (frag_index >= DSPP_MIGRATE_FRAGS_PER_PAGE) return;
+    struct DSPPEnvMigratePagePacket pkt;
+    pkt.header.magic           = DSPP_MIGRATE_MAGIC;
+    pkt.header.opcode          = DSPP_MIGRATE_ENV_PAGE_REQ;
+    pkt.header.node_source_id  = (uint16_t)cluster_local_node_id();
+    pkt.header.node_dest_id    = node_dest_id;
+    pkt.header.transfer_id     = transfer_id;
+    pkt.header.partition_id    = partition_id;
+    pkt.header.page_index      = page_index;
+    pkt.header.frag_index      = frag_index;
+    pkt.header.status          = 0;
+    pkt.header.env_index       = 0;
+    pkt.header.total_pages     = 0;
+    pkt.header.record_len      = 0;
+    for (uint32_t b = 0; b < DSPP_MIGRATE_FRAG_BYTES; b++)
+        pkt.page_data[b] = page_data[frag_index * DSPP_MIGRATE_FRAG_BYTES + b];
+    dspp_transmit_raw(&pkt, (uint16_t)sizeof(pkt));
+}
+
+static void dspp_env_migrate_send_ack(uint16_t opcode, uint32_t reply_to_node,
+                                      uint64_t transfer_id, uint32_t partition_id,
+                                      uint32_t env_index, uint32_t page_index,
+                                      uint32_t frag_index, uint8_t status) {
+    struct DSPPEnvMigrateHeader ack;
+    ack.magic           = DSPP_MIGRATE_MAGIC;
+    ack.opcode          = opcode;
+    ack.node_source_id  = (uint16_t)cluster_local_node_id();
+    ack.node_dest_id    = reply_to_node;
+    ack.transfer_id     = transfer_id;
+    ack.partition_id    = partition_id;
+    ack.page_index      = page_index;
+    ack.status          = status;
+    ack.env_index       = env_index;
+    ack.total_pages     = 0;
+    ack.record_len      = 0;
+    ack.frag_index      = frag_index;
+    dspp_transmit_raw(&ack, (uint16_t)sizeof(ack));
+}
+
+void dspp_env_migrate_rx(void* buf, uint16_t len) {
+    if (!buf || len < sizeof(struct DSPPEnvMigrateHeader)) return;
+    struct DSPPEnvMigrateHeader* h = (struct DSPPEnvMigrateHeader*)buf;
+
+    /* Same point-to-point self-filter as every family here: no L2 addressing
+     * for a specific node exists, so a frame not addressed to us is silently
+     * ignored, not an error. */
+    if (h->node_dest_id != cluster_local_node_id()) return;
+
+    if (h->opcode == DSPP_MIGRATE_ENV_BEGIN_REQ) {
+        if (len < sizeof(struct DSPPEnvMigrateBeginPacket)) return;
+        struct DSPPEnvMigrateBeginPacket* pkt = (struct DSPPEnvMigrateBeginPacket*)buf;
+        int rc = env_migrate_recv_begin(h->transfer_id, h->partition_id,
+                                        h->env_index, h->total_pages,
+                                        (const struct EnvCkptRecord*)pkt->record,
+                                        h->record_len);
+        dspp_env_migrate_send_ack(DSPP_MIGRATE_ENV_BEGIN_ACK, h->node_source_id,
+                                  h->transfer_id, h->partition_id, h->env_index,
+                                  0, 0, (uint8_t)(rc == 0 ? 0 : 1));
+        return;
+    }
+
+    if (h->opcode == DSPP_MIGRATE_ENV_PAGE_REQ) {
+        if (len < sizeof(struct DSPPEnvMigratePagePacket)) return;  // truncated -- page_data not actually present
+        struct DSPPEnvMigratePagePacket* pkt = (struct DSPPEnvMigratePagePacket*)buf;
+        int rc = env_migrate_recv_page(h->transfer_id, h->page_index,
+                                       h->frag_index, pkt->page_data);
+        dspp_env_migrate_send_ack(DSPP_MIGRATE_ENV_PAGE_ACK, h->node_source_id,
+                                  h->transfer_id, h->partition_id, h->env_index,
+                                  h->page_index, h->frag_index,
+                                  (uint8_t)(rc == 0 ? 0 : 1));
+        return;
+    }
+
+    /* The sender side: the ENV ACKs land in the SAME outstanding-ACK record
+     * the stream family arms (note_ack above accepts both families' opcodes),
+     * because only one synchronous transfer is ever in flight from a node. */
+    if (h->opcode == DSPP_MIGRATE_ENV_BEGIN_ACK ||
+        h->opcode == DSPP_MIGRATE_ENV_PAGE_ACK) {
         dspp_migrate_note_ack(h->transfer_id, h->opcode, h->page_index,
                               h->frag_index, h->status);
         return;
@@ -560,6 +710,31 @@ DSPP_PART_SAME_OFFSET(transfer_id);
 DSPP_PART_SAME_OFFSET(partition_id);
 DSPP_PART_SAME_OFFSET(status);
 #undef DSPP_PART_SAME_OFFSET
+/* ─── Environment payload family (POSIX-Environments P3 inc. 2) ────────
+ * Same contract, same reason: dspp_env_migrate_rx() reads magic/opcode/
+ * node_dest_id before it knows which header it holds, so the env header's
+ * prefix must sit at the stream header's offsets — a compile error rather
+ * than a misrouted packet. And both env packets must fit the link, or the
+ * environment's migration would announce itself and then go quiet, exactly
+ * as the stream and context families each once did. */
+#define DSPP_ENV_SAME_OFFSET(f) \
+    _Static_assert(__builtin_offsetof(struct DSPPEnvMigrateHeader, f) == \
+                   __builtin_offsetof(struct DSPPMigrateHeader, f), \
+                   "DSPP migrate header prefix drifted: " #f)
+DSPP_ENV_SAME_OFFSET(magic);
+DSPP_ENV_SAME_OFFSET(opcode);
+DSPP_ENV_SAME_OFFSET(node_source_id);
+DSPP_ENV_SAME_OFFSET(node_dest_id);
+DSPP_ENV_SAME_OFFSET(transfer_id);
+DSPP_ENV_SAME_OFFSET(partition_id);
+DSPP_ENV_SAME_OFFSET(status);
+/* Only the PREFIX through `status` is contractual; the tail layouts differ
+ * by design (the stream tail is two 64-byte name strings). */
+_Static_assert(sizeof(struct DSPPEnvMigrateBeginPacket) <= DSPP_MAX_WIRE_PAYLOAD,
+               "DSPP env-migrate BEGIN packet is undeliverable on this link");
+_Static_assert(sizeof(struct DSPPEnvMigratePagePacket) <= DSPP_MAX_WIRE_PAYLOAD,
+               "DSPP env-migrate PAGE packet is undeliverable on this link");
+#undef DSPP_ENV_SAME_OFFSET
 #undef DSPP_SAME_OFFSET
 
 static void dspp_ctx_hdr_init(struct DSPPCtxMigrateHeader* h, uint16_t opcode,
@@ -853,6 +1028,11 @@ void dspp_rx_dispatch(void* buf, uint16_t len) {
         if (opcode >= DSPP_MIGRATE_CTX_BEGIN_REQ && opcode <= DSPP_MIGRATE_CTX_CHUNK_ACK) {
             if (len < sizeof(struct DSPPCtxMigrateHeader)) return;
             dspp_ctx_migrate_rx((struct DSPPCtxMigrateChunkPacket*)buf, len);
+            return;
+        }
+
+        if (opcode >= DSPP_MIGRATE_ENV_BEGIN_REQ && opcode <= DSPP_MIGRATE_ENV_PAGE_ACK) {
+            dspp_env_migrate_rx(buf, len);   /* length checks live inside */
             return;
         }
 

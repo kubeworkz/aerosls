@@ -52,6 +52,7 @@
 #include "kernel/object_catalog.h"
 #include "net/dspp.h"
 #include "net/net.h"
+#include "kernel/env_migrate.h"   // POSIX-Environments P3 inc. 2 -- stubbed below
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
@@ -138,6 +139,28 @@ int stream_migrate_recv_begin(uint64_t tid, uint32_t pid, const char* name,
 int stream_migrate_recv_page(uint64_t tid, uint32_t idx, uint32_t frag, const uint8_t* data) {
     (void)tid; (void)idx; (void)frag; (void)data;
     stream_page_calls++; return 0;
+}
+
+/* POSIX-Environments P3 inc. 2: kernel/env_migrate.c's receive side.
+ * Counted, like the stream receivers above, so a frame misrouted into the
+ * env family is visible rather than silent -- this test never SENDS an
+ * ENV_* opcode (18–21), so both counters are asserted nowhere and stay 0;
+ * were one to arrive, refusing (nonzero) is the honest answer here too.
+ * Real coverage: tests/env_migrate_host_test.c. */
+static int env_begin_calls = 0;
+static int env_page_calls  = 0;
+int env_migrate_recv_begin(uint64_t transfer_id, uint32_t partition_id,
+                           uint32_t index, uint32_t total_pages,
+                           const struct EnvCkptRecord* record,
+                           uint32_t record_len) {
+    (void)transfer_id; (void)partition_id; (void)index; (void)total_pages;
+    (void)record; (void)record_len;
+    env_begin_calls++; return 1;
+}
+int env_migrate_recv_page(uint64_t transfer_id, uint32_t page_index,
+                          uint32_t frag_index, const uint8_t* data) {
+    (void)transfer_id; (void)page_index; (void)frag_index; (void)data;
+    env_page_calls++; return 1;
 }
 
 /* ─── Settable node identity: the one fake this test hinges on ─────────

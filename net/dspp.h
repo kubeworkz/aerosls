@@ -390,6 +390,91 @@ void dspp_service_announce(const char* name, uint32_t partition_id,
 void dspp_service_withdraw(const char* name);
 void dspp_service_rx(struct DSPPServiceHeader* h, uint16_t len);
 
+/* ─── Environment payload migration (POSIX-Environments P3 increment 2) ──
+ * The stream family above moves a partition's STREAMS; the context family
+ * moves a running SIMI program. This family moves one ENVIRONMENT's whole
+ * footprint — its checkpoint descriptor (kernel/env_ckpt.h's
+ * struct EnvCkptRecord, carried whole in the BEGIN) plus every payload page
+ * the record names: the three frame-pool regions and the P1b durable
+ * extent — page-by-page with the same per-fragment acknowledgement, so the
+ * transfer discipline the stream path proved on a live cluster (confirm the
+ * BEGIN, confirm every fragment, retransmit only what did not land, never
+ * let the source believe anything moved without the destination's word)
+ * applies unchanged to an environment's state.
+ *
+ * Opcodes 18–21 sit above the partition-table family (15–17) — the first
+ * range under this magic that nothing else claims. The gap between the
+ * service family (9–10) and the partition family (15+) LOOKED free when
+ * this family was first drawn and is not: the checkpoint family below
+ * (DSPP_CKPT_*, sharing this same magic) already took 11–14, and routing
+ * is by numeric range in dspp_rx_dispatch(), so two families on one range
+ * means the first branch silently swallows the second's frames. Same
+ * shared magic, same prefix layout (static-asserted in dspp.c), same
+ * point-to-point self-filter.
+ *
+ * The payload PAGE packets carry THIS family's header rather than reusing
+ * struct DSPPMigratePagePacket: the stream header's tail (name, mime, size)
+ * means nothing here, and reading a meaningless field is exactly what the
+ * context family's separate header was created to stop. */
+enum DSPPEnvMigrateOpcode {
+    DSPP_MIGRATE_ENV_BEGIN_REQ = 18,  // sender -> receiver: an environment is arriving; here is its record and payload size
+    DSPP_MIGRATE_ENV_BEGIN_ACK = 19,  // receiver -> sender: staging slot ready (status=0) or refused (status!=0)
+    DSPP_MIGRATE_ENV_PAGE_REQ  = 20,  // sender -> receiver: one 1 KiB fragment of transfer_id's payload page page_index
+    DSPP_MIGRATE_ENV_PAGE_ACK  = 21   // receiver -> sender: fragment staged (status=0) or refused (status!=0)
+};
+
+/* The descriptor crosses WHOLE (a fixed-size struct, a few hundred bytes),
+ * not in chunks: chunk reassembly exists for arbitrary-length checkpoints,
+ * and a fixed-size record that arrives in one piece is one fewer state
+ * machine to trust with an environment's identity. The static assert in
+ * kernel/env_migrate.c holds this blob to the record's size. */
+#define DSPP_ENV_MIGRATE_RECORD_MAX 1024
+
+struct DSPPEnvMigrateHeader {
+    /* ── Prefix: byte-identical layout to struct DSPPMigrateHeader ──── */
+    uint64_t magic;             // DSPP_MIGRATE_MAGIC
+    uint16_t opcode;            // enum DSPPEnvMigrateOpcode
+    uint16_t node_source_id;
+    uint32_t node_dest_id;      // self-filtered on receipt, as with every family here
+    uint64_t transfer_id;       // (partition_id << 32) | index — the environment's identity
+    uint32_t partition_id;
+    uint32_t page_index;        // meaningful on PAGE_REQ/PAGE_ACK
+    uint8_t  status;            // meaningful on *_ACK: 0 = ok, nonzero = refused
+    /* ── Environment-specific tail ────────────────────────────── */
+    uint32_t env_index;         // the environment's index within its partition
+    uint32_t total_pages;       // the payload's page count (BEGIN_REQ; both sides recompute from the record and cross-check)
+    uint32_t record_len;        // live bytes of the descriptor blob (BEGIN_REQ)
+    uint32_t frag_index;        // which slice of page_index this is (PAGE_REQ/PAGE_ACK)
+} __attribute__((packed));
+
+struct DSPPEnvMigrateBeginPacket {
+    struct DSPPEnvMigrateHeader header;
+    uint8_t                     record[DSPP_ENV_MIGRATE_RECORD_MAX];
+} __attribute__((packed));
+
+struct DSPPEnvMigratePagePacket {
+    struct DSPPEnvMigrateHeader header;
+    uint8_t                     page_data[DSPP_MIGRATE_FRAG_BYTES];
+} __attribute__((packed));
+
+/* Sender side (kernel/env_migrate.c). Fire-and-forget, like every other
+ * send here — see net_event.h's blocking-wait note. */
+void dspp_env_migrate_send_begin(uint64_t transfer_id, uint32_t node_dest_id,
+                                 uint32_t partition_id, uint32_t env_index,
+                                 uint32_t total_pages, const void* record,
+                                 uint32_t record_len);
+void dspp_env_migrate_send_page(uint64_t transfer_id, uint32_t node_dest_id,
+                                uint32_t partition_id, uint32_t page_index,
+                                const uint8_t* page_data);
+void dspp_env_migrate_send_frag(uint64_t transfer_id, uint32_t node_dest_id,
+                                uint32_t partition_id, uint32_t page_index,
+                                uint32_t frag_index, const uint8_t* page_data);
+
+/* Receiver side, reached from dspp_rx_dispatch() for the ENV opcodes.
+ * Self-filters on node_dest_id, routes BEGIN_REQ/PAGE_REQ into
+ * kernel/env_migrate.c and ACKs each. */
+void dspp_env_migrate_rx(void* buf, uint16_t len);
+
 /* ─── Partition-table replication (Multi-Node Phase 2 gap) ─────────────
  * Partition tables were local-only: a partition created on node 1 did
  * not exist on node 2, and the failover doc row's honest boundary said
