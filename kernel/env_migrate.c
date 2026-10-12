@@ -211,6 +211,106 @@ int env_migrate_send(uint32_t partition_id, uint32_t index, uint32_t dest_node_i
     return ENV_MIGRATE_OK;
 }
 
+/* ─── The migration's environment step ─────────────────────────────────────
+ * partition_migrate()'s Step 3c calls exactly this and nothing else from this
+ * module — one reference in the orchestration, one stub in a host test, and
+ * the whole freeze/send/thaw discipline in one place where it can be proven
+ * as a unit (tests/env_migrate_host_test.c, Phase F). */
+int env_migrate_partition(uint32_t partition_id, uint32_t dest_node_id,
+                          uint32_t* out_expected, uint32_t* out_moved) {
+    uint32_t expected = 0;
+    if (out_expected) *out_expected = 0;
+    if (out_moved)    *out_moved    = 0;
+    env_migrate_status = ENV_MIGRATE_OK;
+
+    /* The control plane's own partition never migrates — named here rather
+     * than left to the freeze's refusal, so the caller is told which of the
+     * two reasons said no instead of a generic "could not freeze". The
+     * orchestration refuses id 0 long before this; this is the belt for
+     * every other caller. */
+    if (partition_id == PARTITION_SYSTEM) {
+        env_migrate_status = ENV_MIGRATE_REFUSE_SYSTEM;
+        return env_migrate_status;
+    }
+
+    /* 1. The partition's environments are its records — the same table the
+     * destroy path keeps in step (env_ckpt_drop_env) and the capture drops
+     * dead partitions from. Counted BEFORE anything is read, so "0 of 0" and
+     * "0 of N" stay the two different answers partition_migrate() already
+     * distinguishes for streams. */
+    for (uint32_t i = 0; i < env_ckpt_count; i++)
+        if (env_ckpt_table[i].partition_id == partition_id) expected++;
+    if (out_expected) *out_expected = expected;
+    if (expected == 0) return ENV_MIGRATE_OK;   /* nothing here to move */
+
+    /* A record this boot has not replayed yet describes an environment that
+     * does not exist on this node: its region bases are last boot's placement
+     * and nothing is mapped there. Reading them would push somebody else's
+     * bytes across the wire under this environment's name, so the whole step
+     * is refused instead — before a single frame is read. */
+    for (uint32_t i = 0; i < env_ckpt_count; i++) {
+        if (env_ckpt_table[i].partition_id != partition_id) continue;
+        if (!env_ckpt_restore_pending_record(partition_id, env_ckpt_table[i].index))
+            continue;
+        kernel_serial_printf(
+            "[ENV_MIGRATE] partition %u: environment index %u is still awaiting this "
+            "boot's replay, so it does not exist here and has no payload to send -- "
+            "migration ABORTED before the ownership handoff, nothing transferred.\n",
+            (unsigned)partition_id, (unsigned)env_ckpt_table[i].index);
+        env_migrate_status = ENV_MIGRATE_REFUSE_UNREPLAYED;
+        return env_migrate_status;
+    }
+
+    /* 2. Freeze them — the caller holds the partition paused already, so this
+     * marks a state that exists rather than creating one, and it marks exactly
+     * the records counted above or it refused. */
+    struct EnvCkptPartitionQuiesce freeze;
+    if (env_ckpt_quiesce_partition(partition_id, &freeze) != expected) {
+        kernel_serial_printf(
+            "[ENV_MIGRATE] partition %u: could not freeze its %u environment(s) -- "
+            "this node does not hold the partition paused, so nothing may be read as a "
+            "consistent instant. Migration ABORTED before the ownership handoff, nothing "
+            "transferred.\n",
+            (unsigned)partition_id, (unsigned)expected);
+        env_migrate_status = ENV_MIGRATE_REFUSE_UNFROZEN;
+        return env_migrate_status;
+    }
+
+    /* 3. Send them. A refusal anywhere stops the walk — later environments are
+     * not attempted, because the caller is going to abort and each further
+     * transfer would be staging bytes for a migration that will not happen. */
+    uint32_t moved = 0;
+    for (uint32_t i = 0; i < env_ckpt_count; i++) {
+        if (env_ckpt_table[i].partition_id != partition_id) continue;
+        int rc = env_migrate_send(partition_id, env_ckpt_table[i].index, dest_node_id);
+        if (rc != ENV_MIGRATE_OK) {
+            /* 4. Thaw first: the abort below must not leave flags describing an
+             * instant that has already ended. The source is untouched either
+             * way — env_migrate_send never kills, frees or drops — so the
+             * environment is exactly where it was. */
+            env_ckpt_release_partition(&freeze);
+            if (out_moved) *out_moved = moved;
+            kernel_serial_printf(
+                "[ENV_MIGRATE] partition %u: %u of %u environment(s) confirmed by node %u "
+                "before index %u was refused (%s) -- ABORTING; ownership must not move "
+                "while an environment's payload is still here.\n",
+                (unsigned)partition_id, (unsigned)moved, (unsigned)expected,
+                (unsigned)dest_node_id, (unsigned)env_ckpt_table[i].index,
+                env_migrate_status_name(rc));
+            return rc;
+        }
+        moved++;
+    }
+
+    env_ckpt_release_partition(&freeze);
+    if (out_moved) *out_moved = moved;
+    kernel_serial_printf(
+        "[ENV_MIGRATE] partition %u: all %u environment(s) confirmed by node %u; "
+        "the caller may hand over ownership.\n",
+        (unsigned)partition_id, (unsigned)moved, (unsigned)dest_node_id);
+    return ENV_MIGRATE_OK;
+}
+
 /* ─── Receiver ────────────────────────────────────────────────────────────── */
 
 /* A small bounded table, like the stream receive slots': the sender is

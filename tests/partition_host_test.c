@@ -85,6 +85,32 @@ uint32_t cluster_local_node_id(void) { return g_fake_local_node_id; }
 uint32_t cluster_leader_id(void) { return 0; }  /* resurrected-owner conflict resolution (partition_sync_upsert): no consensus layer here, so no leader known */
 int partition_lease_step_down(uint32_t partition_id) { (void)partition_id; return 1; }   /* Multi-Node Partition Scaling Roadmap Phase 6 -- not exercised by this test, safe "nothing to relinquish" stub */
 
+/* POSIX-Environments P3 increment 3: kernel/partition.c Step 3c calls
+ * env_migrate_partition() to move this partition's environments inside the
+ * same critical section as the streams -- a NEW external dependency of
+ * partition.c, so this test needs a stand-in for it exactly as it already
+ * needs stream_migrate_send_partition()/simi_ctx_migrate_send_partition().
+ * FAITHFUL for this file: it registers no environments, so the real function
+ * would count 0 records for the partition, transfer 0 and answer 0 -- exactly
+ * what this returns.
+ *
+ * This file was the one the first pass over the suite MISSED: its header
+ * says "built and run directly:" rather than "Build and run:", so a search
+ * for that phrase never saw that it links partition.c and the suite went red
+ * at the linker instead. tests/env_migration_check.sh clause I now reads the
+ * build command exactly the way tests/run_all.sh does (from the "* gcc"
+ * line, continuations included) so it sees what the runner sees. The
+ * ordering against the ownership handoff is proven in
+ * tests/partition_migrate_phase6_host_test.c, the transfer itself in
+ * tests/env_migrate_host_test.c. */
+int env_migrate_partition(uint32_t partition_id, uint32_t dest_node_id,
+                          uint32_t* out_expected, uint32_t* out_moved) {
+    (void)partition_id; (void)dest_node_id;
+    if (out_expected) *out_expected = 0;
+    if (out_moved)    *out_moved    = 0;
+    return 0;
+}
+
 static int g_fail = 0;
 #define CHECK(cond, msg) do { \
     if (!(cond)) { printf("FAIL: %s\n", msg); g_fail++; } \

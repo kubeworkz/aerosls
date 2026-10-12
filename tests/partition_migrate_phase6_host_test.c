@@ -183,6 +183,38 @@ static int transmit_call_count = 0;
  * below already asserts on. */
 void dspp_transmit_raw(const void* dspp_payload, uint16_t dspp_len) { (void)dspp_payload; (void)dspp_len; transmit_call_count++; }
 
+/* ─── POSIX-Environments P3 increment 3: Step 3c call-tracking stub ────────
+ * NOT the permissive "nothing to move" stand-in the other partition.c-linking
+ * tests use: Scenario 7 below needs this step's own facts -- which partition
+ * and destination it was handed, whether the partition was PAUSED when it ran
+ * (the critical section's own freeze, so what crosses is not a running
+ * environment's bytes), and above all the OWNER at that instant, which must
+ * still be THIS node. That last one is the `ownership-first` property itself:
+ * the payload step's whole job is to run before the handoff. The real
+ * env_migrate_partition() (freeze -> send every environment -> thaw, refusing
+ * a shortfall) is exercised against the real wire in
+ * tests/env_migrate_host_test.c, Phase F. */
+static int      env_step_calls = 0;
+static int      g_envs_expected = 0;    /* environments the partition holds */
+static int      g_envs_moved = 0;       /* how many the destination confirmed */
+static uint32_t env_step_partition = 0xFFFFFFFFu;
+static uint32_t env_step_dest = 0;
+static int      env_step_saw_paused = -1;
+static uint32_t env_step_saw_owner = 0xFFFFFFFFu;
+int env_migrate_partition(uint32_t partition_id, uint32_t dest_node_id,
+                          uint32_t* out_expected, uint32_t* out_moved) {
+    env_step_calls++;
+    env_step_partition  = partition_id;
+    env_step_dest       = dest_node_id;
+    env_step_saw_paused = partition_is_paused(partition_id);
+    env_step_saw_owner  = partition_get_owner_node(partition_id);
+    if (out_expected) *out_expected = (uint32_t)g_envs_expected;
+    if (out_moved)    *out_moved    = (uint32_t)g_envs_moved;
+    /* Mirrors the real one's contract: nonzero exactly when fewer environments
+     * were confirmed than exist, which is the signal Step 4 must not run on. */
+    return (g_envs_moved < g_envs_expected) ? 5 /* ENV_MIGRATE_REFUSE_BEGIN */ : 0;
+}
+
 int main(void) {
     partition_init();
     cluster_init(1);   /* this node is node 1, empty roster, quorum=1 (self only) */
@@ -425,6 +457,83 @@ int main(void) {
               "*** a SUCCESSFUL migration still leaves it paused -- it is resumed "
               "on the destination, so the restore must not fire here ***");
         g_streams_present = 0; g_streams_confirmed = 0;
+    }
+
+    /* ═══════════════════════════════════════════════════════════════════════
+     * AN ENVIRONMENT'S PAYLOAD MUST LAND BEFORE OWNERSHIP MOVES
+     *
+     * The same defect, one level up. partition_migrate() already refuses to
+     * hand over a partition whose streams did not follow -- paid for once, on
+     * a live cluster, with a page-0 refusal and an ownership record pointing
+     * at the wrong node. Until P3 increment 3, its ENVIRONMENTS (two
+     * sidecars, their memory, their storage, their console) were not part of
+     * that calculation at all: the ownership handoff could complete while
+     * every byte of the environment was still on this node. That is the
+     * roadmap's `ownership-first` tooth, and it is what Step 3c closes.
+     *
+     * Three facts are asserted at the moment the step runs, because that is
+     * the only instant they mean anything: the partition is PAUSED, the owner
+     * is still THIS node, and the step was handed this partition and this
+     * destination. Afterwards, ownership moves as it always did.
+     * ═══════════════════════════════════════════════════════════════════════ */
+    printf("\n-- an environment's payload lands before the ownership handoff --\n");
+    {
+        uint32_t p = partition_create("env-host");
+        CHECK(p != 0xFFFFFFFFu, "a partition to migrate with environments (setup)");
+
+        env_step_calls = 0;
+        g_envs_expected = 2; g_envs_moved = 2;
+        int rc = partition_migrate(p, 7);
+
+        CHECK(rc == 0, "a partition whose two environments were both confirmed migrates");
+        CHECK(env_step_calls == 1, "the environment step ran exactly once, inside this migration");
+        CHECK(env_step_partition == p && env_step_dest == 7,
+              "...and it was handed this partition and this destination, not some other pair");
+        CHECK(env_step_saw_paused == 1,
+              "*** it ran with the partition PAUSED -- a payload read from a running "
+              "environment is the moving target env_migrate_send() refuses ***");
+        CHECK(env_step_saw_owner == 1 && env_step_saw_owner != 7,
+              "*** and with OWNERSHIP STILL LOCAL: the payload step ran BEFORE the "
+              "handoff, which is the whole point of putting it in this critical section ***");
+        CHECK(partition_get_owner_node(p) == 7,
+              "...ownership then moved to node 7 as it always did -- ordering, not delay");
+
+        /* The shortfall arm: one environment of two confirmed. This is the
+         * environment-shaped replay of the live-cluster defect above. */
+        uint32_t q = partition_create("env-short");
+        CHECK(q != 0xFFFFFFFFu, "a second partition for the shortfall arm (setup)");
+        CHECK(partition_is_paused(q) == 0, "...and it is running, so a restored pause state is observable");
+        int reclaim_before = g_reclaim_calls;
+
+        g_envs_expected = 2; g_envs_moved = 1;      /* one short */
+        CHECK(partition_migrate(q, 7) == 1,
+              "*** 1 of 2 environments confirmed FAILS the migration -- not a partial success ***");
+        CHECK(partition_get_owner_node(q) == 1,
+              "*** ownership stays with this node: never ownership without the data ***");
+        CHECK(g_reclaim_calls == reclaim_before,
+              "no frames were reclaimed by the failed attempt -- the environments are still here");
+        CHECK(partition_is_paused(q) == 0,
+              "the pause state was restored: a failed migration leaves the tenant running, not frozen");
+
+        g_envs_moved = 2;                            /* the destination takes the rest */
+        CHECK(partition_migrate(q, 7) == 0,
+              "and the retry succeeds once every environment confirms -- an abort left a "
+              "recoverable state, exactly as the streams' abort does");
+        CHECK(partition_get_owner_node(q) == 7, "...ownership moves on the successful attempt");
+
+        /* 0 of 0 must stay a success: a partition with no environments has
+         * nothing to confirm, and conflating it with 0 of N is the bug the
+         * expected count exists to prevent (the streams' own distinction). */
+        uint32_t r = partition_create("env-empty");
+        g_envs_expected = 0; g_envs_moved = 0;
+        int calls_before = env_step_calls;
+        CHECK(partition_migrate(r, 7) == 0,
+              "a partition with NO environments still migrates -- 0 of 0 is not a failure");
+        CHECK(env_step_calls == calls_before + 1,
+              "...and its environment step still ran (and counted nothing), so the zero "
+              "came from a real walk rather than from the step being skipped");
+
+        g_envs_expected = 0; g_envs_moved = 0;
     }
 
     printf("\n%d passed, %d failed\n", checks_passed, checks_failed);

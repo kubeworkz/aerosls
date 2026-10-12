@@ -321,6 +321,54 @@ void env_ckpt_quiesce_for_capture(struct EnvCkptQuiesce* out);
  * it. That is the `leak-unpause` tooth in v0.2 §4. */
 void env_ckpt_release_capture(const struct EnvCkptQuiesce* q);
 
+/* ─── One partition, frozen for one payload transfer ─────────────────────────
+ * The full-table quiesce above pauses every partition that holds a record.
+ * partition_migrate() must not do that: it is moving ONE tenant, and pausing
+ * its neighbours for the length of a wire transfer would be a blast radius the
+ * operator never asked for. It has already paused its own partition (step 1),
+ * so what the transfer actually needs is the FLAG, not the pause:
+ *
+ *   - ENV_CKPT_FLAG_QUIESCED — so env_migrate_send()'s "is this a moving
+ *     target?" gate answers yes, and so the record that crosses the wire is
+ *     admissible on the destination (restore rule 2 refuses an unquiesced one);
+ *   - ENV_CKPT_FLAG_PARTITION_PAUSED — so the destination's restore puts the
+ *     partition back frozen, which is where a successful migration always
+ *     leaves it (partition_migrate() resumes nothing; resume happens over
+ *     there).
+ *
+ * The freeze REFUSES rather than guesses: PARTITION_SYSTEM is never frozen
+ * (rule 2), and a partition the caller does not already hold paused is
+ * refused too — a helper that could pause would be a second way to freeze a
+ * tenant, and its release would then have to guess whose pause it was. 0
+ * records marked always means refused; the caller must treat it as such.
+ *
+ * release_partition() restores each marked record's PRIOR flags bit for bit,
+ * because the flags are a statement about a real instant: an aborted
+ * migration must not leave a partition the operator had RUNNING described as
+ * paused-and-frozen, and a record that was already quiesced must not lose that
+ * either. Both calls run inside partition_migrate()'s critical section, where
+ * nothing yields the table (a drop between them would shift the slots — the
+ * one thing release cannot defend against, named rather than papered over,
+ * and unreachable from a synchronous migrate). */
+struct EnvCkptPartitionQuiesce {
+    uint32_t partition_id;
+    uint32_t n_marked;                /* records this freeze marked */
+    uint16_t touched;                 /* which table slots (bit per slot) */
+    uint8_t  prior_flags[ENV_CKPT_MAX];
+};
+
+/* Freeze every record of ONE partition (see above). Returns the number of
+ * records marked, or 0 — refused — and 0 is also the honest answer for a
+ * partition that holds no environments, which is why the caller compares it
+ * against its own count of the partition's records rather than against 0. */
+uint32_t env_ckpt_quiesce_partition(uint32_t partition_id,
+                                    struct EnvCkptPartitionQuiesce* q);
+
+/* Undo exactly that, on EVERY path out of the transfer — success and failure
+ * alike — the same rule env_ckpt_release_capture() carries. Idempotent and
+ * safe with NULL. */
+void env_ckpt_release_partition(struct EnvCkptPartitionQuiesce* q);
+
 /* Restore side: put back the pause state the snapshot recorded. For every
  * adopted record carrying ENV_CKPT_FLAG_PARTITION_PAUSED, pause its partition
  * again (idempotently); partitions the snapshot does not name are left exactly
@@ -424,6 +472,22 @@ void env_ckpt_restore_refuse(uint32_t partition, uint32_t index,
  * refused so far (both counters are per-boot; restore_begin() resets them). */
 uint32_t env_ckpt_restore_pending(void);
 uint32_t env_ckpt_restore_refused(void);
+
+/* 1 when this boot still owes (partition_id, index) its replay: the record is
+ * on disk but the environment it describes does NOT exist here yet, because
+ * env_ckpt_restore_begin() arms every adopted record and the replay settles
+ * them one at a time. That distinction matters to a MIGRATION: sending such a
+ * record would read region bases nothing has allocated this boot and push
+ * whoever's bytes now live there to another node. env_migrate_partition()
+ * refuses on it rather than sending — refusal over partial application,
+ * applied to the transfer.
+ *
+ * What it does NOT catch, said plainly: a record whose replay was REFUSED
+ * leaves the pending set (env_ckpt_restore_next()) while still sitting in the
+ * table, so it reads as live here. Distinguishing that needs a liveness mark
+ * the record layer does not carry yet; it is P1a's gap (the refused record's
+ * destination), not something a wire protocol can infer. */
+int env_ckpt_restore_pending_record(uint32_t partition_id, uint32_t index);
 
 /* 1 when `got` -- the record the create's own ENV_REGISTER produced -- is the
  * environment `want` described. Compares identity only: (partition, index), the
