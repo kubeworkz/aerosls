@@ -385,11 +385,23 @@ source_clauses() {
         bad "S9e. attach no longer degrades to a RAM-backed store when the NVMe queue is absent — a boot whose NVMe never came up (the E5/E6 boots, a BAR below 4 GiB) would refuse ENVIRONMENT CREATION entirely"
 
     # ── S10. syscall surface: numbers, gating, dispatch ────────────────────
+    # The ceiling is an EXACT match on purpose: a number appearing here that
+    # nobody wired up, or two defines claiming one number, is exactly the
+    # drift this clause exists to catch. It is bumped only when the new
+    # number lands fully wired -- which is what S10f then asserts, so raising
+    # the ceiling cannot silently turn the collision check into decoration.
+    #
+    # 327 = POSIX-Environments P3 increment 1's placement gate
+    # (SYS_SLS_PLACEMENT_CAN_HOLD): cap.h's define, cap.c's
+    # sys_sls_placement_can_hold(), syscall_dispatch.c's case, and kabi's
+    # placement_can_hold() are all present, and cap_create_sidecar_host_test
+    # exercises it. Added by that increment; this file's ceiling still said
+    # 326, so the guard went red against correct code.
     local highest
     highest=$(grep -rhoE '#define SYS_SLS_[A-Z_]+ +[0-9]+' "$ROOT/kernel"/*.h "$ROOT/net"/*.h 2>/dev/null \
               | awk '{print $3}' | sort -n | tail -1)
-    [ "${highest:-0}" -eq 326 ] || \
-        bad "S10. the highest SYS_SLS_ number is ${highest:-none}, expected 326 (P1B's four: 323-326) — a collision or an unwired define"
+    [ "${highest:-0}" -eq 327 ] || \
+        bad "S10. the highest SYS_SLS_ number is ${highest:-none}, expected 327 (P1B's four: 323-326, plus P3 inc.1's 327) — a collision or an unwired define"
     has "$DISP" "case SYS_SLS_ENV_STORAGE_WRITE:" || \
         bad "S10b. syscall_dispatch has no SYS_SLS_ENV_STORAGE_WRITE case — the server's write-through would never reach the kernel"
     has "$CAP" "only PARTITION_SYSTEM creates environments" || \
@@ -398,6 +410,8 @@ source_clauses() {
         bad "S10d. restore/write do not gate on the store's owner partition — one environment's server could name another's region"
     has "$K" "const SYS_ENV_STORAGE_ATTACH: u64 = 323;" || \
         bad "S10e. kabi's syscall constants are missing P1B's (323-326) — the RealKernel shims would target the wrong numbers"
+    has "$DISP" "case SYS_SLS_PLACEMENT_CAN_HOLD:" || \
+        bad "S10f. syscall_dispatch has no SYS_SLS_PLACEMENT_CAN_HOLD case — the ceiling above was raised for a define the kernel never dispatches, i.e. the unwired-define drift S10 exists to catch"
 
     # ── S11. the real kernel module, executed here ─────────────────────────
     local HT="$ROOT/tests/env_storage_host_test.c"

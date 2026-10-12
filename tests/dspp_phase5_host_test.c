@@ -33,6 +33,7 @@
 #include "net/dspp.h"
 #include "net/net.h"   /* Multi-Node Partition Scaling Roadmap Phase 7 -- MACAddr, for this file's net_my_mac stand-in below */
 #include "kernel/simi_ctx_migrate.h"   // PEC Phase 3 -- stubbed below
+#include "kernel/env_migrate.h"       // POSIX-Environments P3 inc. 2 -- stubbed below
 
 /* The consensus entry points take a kernel_tick_counter reading, because
  * election timeouts are measured in wall-clock ticks rather than call
@@ -172,6 +173,24 @@ int stream_migrate_recv_page(uint64_t transfer_id, uint32_t page_index,
                              uint32_t frag_index, const uint8_t* frag_data) {
     (void)transfer_id; (void)page_index; (void)frag_index; (void)frag_data;
     return 1;   /* "unknown transfer" -- not exercised by this test */
+}
+/* POSIX-Environments P3 inc. 2: kernel/env_migrate.c's receive side, same
+ * permissive-denial choice as the stream stubs above -- this routing test
+ * never sends ENV_* opcodes (18–21), so these are not reached; were one to
+ * arrive, refusing (nonzero) is the honest answer for a node that stages
+ * nothing. Real coverage: tests/env_migrate_host_test.c. */
+int env_migrate_recv_begin(uint64_t transfer_id, uint32_t partition_id,
+                           uint32_t index, uint32_t total_pages,
+                           const struct EnvCkptRecord* record,
+                           uint32_t record_len) {
+    (void)transfer_id; (void)partition_id; (void)index; (void)total_pages;
+    (void)record; (void)record_len;
+    return 1;
+}
+int env_migrate_recv_page(uint64_t transfer_id, uint32_t page_index,
+                          uint32_t frag_index, const uint8_t* data) {
+    (void)transfer_id; (void)page_index; (void)frag_index; (void)data;
+    return 1;
 }
 
 int main(void) {

@@ -47,6 +47,7 @@
 #include "net/dspp.h"
 #include "net/net.h"
 #include "kernel/loader.h"
+#include "kernel/env_migrate.h"   // POSIX-Environments P3 inc. 2 -- stubbed below
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
@@ -115,6 +116,18 @@ int  stream_migrate_recv_begin(uint64_t t, uint32_t p, const char* n, const char
 }
 int  stream_migrate_recv_page(uint64_t t, uint32_t i, uint32_t f, const uint8_t* d) {
     (void)t;(void)i;(void)f;(void)d; return 0;
+}
+/* POSIX-Environments P3 inc. 2: kernel/env_migrate.c's receive side --
+ * permissive-denial like the stream stubs above. This test never sends
+ * ENV_* opcodes (18–21), so these are not reached; refusing (nonzero) is
+ * the honest answer for a node that stages nothing. Real coverage:
+ * tests/env_migrate_host_test.c. */
+int  env_migrate_recv_begin(uint64_t t, uint32_t p, uint32_t i, uint32_t n,
+                            const struct EnvCkptRecord* r, uint32_t rl) {
+    (void)t;(void)p;(void)i;(void)n;(void)r;(void)rl; return 1;
+}
+int  env_migrate_recv_page(uint64_t t, uint32_t pi, uint32_t f, const uint8_t* d) {
+    (void)t;(void)pi;(void)f;(void)d; return 1;
 }
 
 static uint32_t g_local_node = 1;

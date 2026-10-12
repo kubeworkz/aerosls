@@ -50,6 +50,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include "kernel/simi_ctx_migrate.h"   // PEC Phase 3 -- stubbed below
+#include "kernel/env_migrate.h"       // POSIX-Environments P3 inc. 2 -- stubbed below
 
 /* ─── PEC Phase 3 stubs: net/dspp.c's context-migration receive path ───
  * FAITHFUL. This test never sends CTX_* opcodes, so these are not
@@ -67,6 +68,27 @@ SimiCtxMigStatus simi_ctx_migrate_recv_chunk(uint64_t tid, uint32_t idx,
                                              const uint8_t* data, uint32_t n) {
     (void)tid; (void)idx; (void)data; (void)n;
     return SIMI_CTXMIG_ERR_NO_TRANSFER;
+}
+
+/* ─── POSIX-Environments P3 increment 2 stubs: kernel/env_migrate.c's
+ * receive side. FAITHFUL, same reasoning as the simi stubs above: this
+ * test never sends ENV_* opcodes (18–21), so these are not reached; and
+ * were one to arrive, refusing (nonzero -- "no staging slot") is the
+ * answer a node not set up to stage environments gives, rather than
+ * silently accepting bytes nothing will ever restore. Full coverage of
+ * the real path lives in tests/env_migrate_host_test.c. */
+int env_migrate_recv_begin(uint64_t transfer_id, uint32_t partition_id,
+                           uint32_t index, uint32_t total_pages,
+                           const struct EnvCkptRecord* record,
+                           uint32_t record_len) {
+    (void)transfer_id; (void)partition_id; (void)index; (void)total_pages;
+    (void)record; (void)record_len;
+    return 1;
+}
+int env_migrate_recv_page(uint64_t transfer_id, uint32_t page_index,
+                          uint32_t frag_index, const uint8_t* data) {
+    (void)transfer_id; (void)page_index; (void)frag_index; (void)data;
+    return 1;
 }
 
 
