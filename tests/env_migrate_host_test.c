@@ -66,8 +66,13 @@
  * produces, and Phase B already proved the wire format.
  *
  * What this deliberately does NOT cover, each its own increment: the
- * sender's wiring into partition_migrate()'s critical section (increment 3)
- * and the restore of a staged slot into a live environment (increment 4).
+ * orchestration around this module (partition_migrate() calling the step,
+ * and aborting before the ownership handoff when it falls short) is
+ * tests/partition_migrate_phase6_host_test.c's Scenario 7, and the restore
+ * of a staged slot into a live environment is increment 4. Phase F below
+ * covers THIS module's own half of increment 3 — the whole
+ * freeze → send → thaw step, against the real sender and the real wire —
+ * which is what partition.c's single call resolves to.
  *
  * Build and run:
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers -I net -I user \
@@ -911,6 +916,171 @@ int main(void) {
 
     env_migrate_reset();
     CHECK(env_migrate_staging_count() == 0, "teardown: the staging table is empty");
+
+    /* ═══ Phase F: the migration's environment step (P3 increment 3) ═══════
+     * env_migrate_partition() is the ONE function kernel/partition.c Step 3c
+     * calls: count the partition's environments, freeze them, send each, thaw
+     * on every path out. Everything below runs against the REAL sender, the
+     * REAL record layer and the REAL wire — the orchestration that decides
+     * WHEN to call it (and to abort before the handoff when it falls short)
+     * is tests/partition_migrate_phase6_host_test.c's Scenario 7.
+     *
+     * The records here are deliberately create-time records: flags 0, never
+     * frozen by anybody. That is what makes the freeze observable — if the
+     * step works, a record nobody ever quiesced is sendable while the step
+     * runs and bit-for-bit unchanged after it. */
+    printf("\n-- Phase F: the whole environment step --\n");
+    {
+        const uint32_t f_part = 78;
+        uint32_t f_exp = 0, f_moved = 0;
+        int f_before = 0;
+
+        env_ckpt_reset();
+        env_migrate_reset();
+        peer_reset();
+        g_fake_local_node_id = 1;   /* back to node A: Phase E left this process
+                                     * wearing node B's identity, and a sender
+                                     * that is its own destination refuses
+                                     * (REFUSE_DEST) before it reads a byte */
+
+        struct EnvCkptRecord fa = good_record(f_part, 0);
+        struct EnvCkptRecord fb = good_record(f_part, 1);
+        fa.flags = 0;              /* create-time: nothing has ever frozen it */
+        fb.flags = 0;
+        CHECK(env_ckpt_record(&fa) == 0, "setup: two environments registered in partition 78");
+        CHECK(env_ckpt_record(&fb) == 0, "setup: ...neither of them ever quiesced");
+        host_partition_define(f_part);
+
+        /* ── F1: a partition nobody paused cannot be frozen ───────────────
+         * The freeze only ever DESCRIBES a pause that exists; a helper that
+         * could take the pause itself would be a second way to freeze a
+         * tenant and its release would have to guess whose pause it was. */
+        f_before = captured_frame_count;
+        int f_rc = env_migrate_partition(f_part, DST_NODE, &f_exp, &f_moved);
+        CHECK(f_rc == ENV_MIGRATE_REFUSE_UNFROZEN,
+              "*** a partition that is not held paused is REFUSED ***");
+        CHECK(env_migrate_last_status() == ENV_MIGRATE_REFUSE_UNFROZEN,
+              "...and the refusal is queryable by name, not just nonzero");
+        CHECK(f_exp == 2 && f_moved == 0,
+              "the counts are honest even on refusal: 2 expected, 0 moved");
+        CHECK(captured_frame_count == f_before, "*** not one frame went on the wire ***");
+        CHECK(env_ckpt_find(f_part, 0)->flags == 0 &&
+              env_ckpt_find(f_part, 1)->flags == 0,
+              "...and neither record was marked: a refusal touches nothing");
+
+        /* ── F2: a record this boot has not replayed yet ──────────────────
+         * Its region bases are last boot's placement and nothing is mapped
+         * there now, so sending it would push whoever's bytes live there
+         * across the wire under this environment's name. Refused BEFORE the
+         * freeze, before a single page is read. */
+        partition_pause(f_part);
+        env_ckpt_restore_begin();
+        f_before = captured_frame_count;
+        f_rc = env_migrate_partition(f_part, DST_NODE, &f_exp, &f_moved);
+        CHECK(f_rc == ENV_MIGRATE_REFUSE_UNREPLAYED,
+              "*** a record still awaiting this boot's replay is REFUSED: that environment "
+              "does not exist on this node, so it has no payload to send ***");
+        CHECK(f_exp == 2 && f_moved == 0, "2 expected, 0 moved, again honestly");
+        CHECK(captured_frame_count == f_before, "and nothing was transmitted for it");
+        CHECK(env_ckpt_find(f_part, 0)->flags == 0,
+              "...the freeze never ran, because the gate that precedes it refused");
+        {
+            uint32_t pp, ii, ee;
+            while (env_ckpt_restore_next(&pp, &ii, &ee)) env_ckpt_restore_settle(pp, ii);
+            CHECK(env_ckpt_restore_pending() == 0, "teardown: the pending set is drained");
+        }
+
+        /* ── F3: the happy path — freeze, send both, thaw ───────────────── */
+        peer_reset();
+        env_migrate_reset();
+        f_before = captured_frame_count;
+        f_rc = env_migrate_partition(f_part, DST_NODE, &f_exp, &f_moved);
+        CHECK(f_rc == 0, "*** the paused partition's two environments both cross ***");
+        CHECK(f_exp == 2 && f_moved == 2, "2 expected, 2 moved -- equal, which is the whole check");
+        CHECK(captured_frame_count == f_before + 2 * expect_frames,
+              "*** one BEGIN plus one frame per fragment for EACH environment: 2 x the six-page transfer ***");
+        CHECK(env_ckpt_find(f_part, 0)->flags == 0 &&
+              env_ckpt_find(f_part, 1)->flags == 0,
+              "*** the freeze was released: both records are bit-for-bit what they were before it ***");
+        CHECK(source_is_intact(),
+              "and the source's pages are untouched -- the step reads and copies, it never frees");
+        {
+            struct DSPPEnvMigrateBeginPacket* bp =
+                (struct DSPPEnvMigrateBeginPacket*)(captured_frame[f_before] + ETH_HDR_LEN);
+            const struct EnvCkptRecord* wr = (const struct EnvCkptRecord*)bp->record;
+            CHECK(bp->header.partition_id == f_part && bp->header.env_index == 0 &&
+                  bp->header.total_pages == SRC_PAGES,
+                  "the first BEGIN belongs to the right environment and declares its pages");
+            CHECK((wr->flags & ENV_CKPT_FLAG_QUIESCED) != 0 &&
+                  (wr->flags & ENV_CKPT_FLAG_PARTITION_PAUSED) != 0,
+                  "*** the descriptor that CROSSED carries QUIESCED|PARTITION_PAUSED although "
+                  "the table had neither -- the freeze is what makes it admissible to the "
+                  "destination's restore rule ***");
+        }
+
+        /* Replay both transfers through the REAL receive path as node 2. */
+        {
+            int f_end = captured_frame_count;
+            g_fake_local_node_id = 2;
+            env_migrate_reset();
+            for (int i = f_before; i < f_end; i++) deliver(i);
+            const struct EnvMigrateStaging* s0 = env_migrate_recv_find(f_part, 0);
+            const struct EnvMigrateStaging* s1 = env_migrate_recv_find(f_part, 1);
+            CHECK(s0 && s0->complete && s1 && s1->complete,
+                  "*** the destination holds BOTH environments COMPLETE -- every page of both landed ***");
+            CHECK(all_bytes(env_migrate_recv_page_ptr(f_part, 0, 0), page_fill[0]) &&
+                  all_bytes(env_migrate_recv_page_ptr(f_part, 1, 3), page_fill[3]),
+                  "...and each environment's staged pages are byte-for-byte the source's");
+            g_fake_local_node_id = 1;
+            env_migrate_reset();
+        }
+
+        /* ── F4: a shortfall fails the step, and thaws anyway ─────────────
+         * The destination refuses every BEGIN. Partial (1 of 2) is proven at
+         * the orchestration level, where the abort is observable --
+         * partition_migrate_phase6_host_test.c Scenario 7; here the refusal
+         * must show up in BOTH counts and the flags must not outlive it. */
+        peer_reset();
+        nack_begin = 1;
+        env_migrate_reset();
+        f_before = captured_frame_count;
+        f_rc = env_migrate_partition(f_part, DST_NODE, &f_exp, &f_moved);
+        CHECK(f_rc == ENV_MIGRATE_REFUSE_BEGIN,
+              "*** a destination that refuses the BEGIN fails the whole step ***");
+        CHECK(f_exp == 2 && f_moved == 0, "2 expected, 0 moved -- the shortfall is reported, not absorbed");
+        CHECK(captured_frame_count == f_before + 1,
+              "...after exactly ONE BEGIN: the second environment was not attempted, because "
+              "the caller is going to abort");
+        CHECK(env_ckpt_find(f_part, 0)->flags == 0 &&
+              env_ckpt_find(f_part, 1)->flags == 0,
+              "*** the freeze was released on the FAILURE path too -- the flags describe an "
+              "instant and do not outlive it ***");
+        CHECK(source_is_intact(), "...and the source is intact, so the caller may retry");
+        nack_begin = 0;
+        peer_reset();
+
+        /* ── F5: 0 of 0 is success ──────────────────────────────────────── */
+        host_partition_define(79);
+        partition_pause(79);
+        f_before = captured_frame_count;
+        f_exp = 99; f_moved = 99;
+        f_rc = env_migrate_partition(79, DST_NODE, &f_exp, &f_moved);
+        CHECK(f_rc == 0 && f_exp == 0 && f_moved == 0,
+              "*** a partition holding no environments is 0 of 0 and SUCCEEDS -- the "
+              "distinction that keeps 0 of N a failure ***");
+        CHECK(captured_frame_count == f_before, "...and nothing at all was transmitted for it");
+
+        /* ── F6: the control plane's own partition, by name ─────────────── */
+        f_rc = env_migrate_partition(PARTITION_SYSTEM, DST_NODE, &f_exp, &f_moved);
+        CHECK(f_rc == ENV_MIGRATE_REFUSE_SYSTEM,
+              "*** PARTITION_SYSTEM is refused BY NAME, before anything is counted or frozen ***");
+
+        env_ckpt_reset();
+        env_migrate_reset();
+        partition_resume(f_part);
+        CHECK(env_ckpt_count_live() == 0, "teardown: the record table is empty again");
+        CHECK(env_migrate_staging_count() == 0, "teardown: and so is the staging table");
+    }
 
     /* ── The frame buffer was never re-entered, and nothing overflowed ──
      * dspp_tx_reentrant_dropped is the guard that would have silently eaten

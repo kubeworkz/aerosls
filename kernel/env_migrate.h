@@ -17,12 +17,13 @@
  * What this module deliberately does NOT do yet (each its own increment):
  *
  *   - It does not WIRE into partition_migrate(). The sender's first caller is
- *     increment 3, which folds the environment into the same critical section
- *     the streams already ride (pause → lease step-down → transfer →
- *     ownership handoff), so an ownership handoff can never precede its
- *     environment's payload — the `ownership-first` tooth at the environment
- *     level. The RECEIVER is live on the wire today: dspp_rx_dispatch() routes
- *     the ENV opcodes here on every node.
+ *     env_migrate_partition() below, increment 3's own entry point, which
+ *     folds the environment into the same critical section the streams ride
+ *     (pause → lease step-down → transfer → ownership handoff) so an ownership
+ *     handoff can never precede its environment's payload — the
+ *     `ownership-first` tooth at the environment level. The RECEIVER is live
+ *     on the wire today: dspp_rx_dispatch() routes the ENV opcodes here on
+ *     every node.
  *   - It does not RESTORE. A complete staging slot is the destination half's
  *     input; increment 4 replays the staged descriptor through the
  *     environment manager's existing create path (P1a rule 2 — a restored
@@ -56,7 +57,36 @@ enum EnvMigrateStatus {
     ENV_MIGRATE_REFUSE_BEGIN     = 5, /* the destination refused or never acknowledged the BEGIN */
     ENV_MIGRATE_REFUSE_PAGE      = 6, /* a page never confirmed; the transfer was abandoned */
     ENV_MIGRATE_REFUSE_READ      = 7, /* a source page could not be read (region or NVMe) */
+    ENV_MIGRATE_REFUSE_UNREPLAYED= 8, /* a record of this partition still awaits this boot's
+                                       * replay: the environment does not exist here yet, so
+                                       * its region bases name nothing this node owns */
+    ENV_MIGRATE_REFUSE_UNFROZEN  = 9, /* the partition-scoped freeze refused: the partition is
+                                       * not held paused (or is PARTITION_SYSTEM), so nothing
+                                       * may be read as a consistent instant */
 };
+
+/* The name of a status, by code — for the operator's log and for a guard that
+ * asserts on a word rather than on a number that could be retyped. `static
+ * inline` in the header DELIBERATELY: partition_migrate() prints it in its
+ * abort line, and a non-inline definition here would be a second external
+ * symbol partition.c takes on — every host test that links it would need a
+ * second stub for a pure string mapping. A mapping with no state belongs to
+ * the header, so the orchestration gains one dependency, not two. */
+static inline const char* env_migrate_status_name(int status) {
+    switch (status) {
+    case ENV_MIGRATE_OK:                 return "ok";
+    case ENV_MIGRATE_REFUSE_NO_RECORD:   return "no checkpoint record";
+    case ENV_MIGRATE_REFUSE_SYSTEM:      return "PARTITION_SYSTEM never migrates";
+    case ENV_MIGRATE_REFUSE_DEST:        return "not a real destination node";
+    case ENV_MIGRATE_REFUSE_UNQUIESCED:  return "record captured without a quiesce";
+    case ENV_MIGRATE_REFUSE_BEGIN:       return "destination never confirmed the BEGIN";
+    case ENV_MIGRATE_REFUSE_PAGE:        return "a page never confirmed";
+    case ENV_MIGRATE_REFUSE_READ:        return "source page unreadable";
+    case ENV_MIGRATE_REFUSE_UNREPLAYED:  return "environment not yet replayed on this boot";
+    case ENV_MIGRATE_REFUSE_UNFROZEN:    return "partition not held paused";
+    default:                             return "unknown status";
+    }
+}
 
 /* ─── Sender (the source node) ─────────────────────────────────────────────── */
 
@@ -82,6 +112,29 @@ int env_migrate_last_status(void);
  * destination REFUSES a BEGIN whose declared count disagrees, so the page
  * numbering cannot silently drift between the two kernels. */
 uint32_t env_migrate_payload_pages(const struct EnvCkptRecord* rec);
+
+/* ─── The migration's environment step (P3 increment 3) ─────────────────────
+ * Everything partition_migrate() needs from this module, in one call, so the
+ * orchestration grows ONE reference rather than a loop over another module's
+ * table (and every host test that links partition.c needs exactly one stub).
+ *
+ * The discipline, in order:
+ *   1. count this partition's records — its environments, as the kernel knows
+ *      them — and REFUSE if any is still awaiting this boot's replay;
+ *   2. freeze them (env_ckpt_quiesce_partition): the caller already holds the
+ *      partition paused, so this sets the flags and pauses nothing;
+ *   3. send every one of them, each confirmed page by page by env_migrate_send;
+ *   4. thaw on EVERY path out, success or failure — the flags describe the
+ *      instant the transfer held, and outlive it only while it holds.
+ *
+ * Returns 0 only when every environment confirmed, with *out_expected and
+ * *out_moved equal; nonzero — and *out_moved < *out_expected — when the caller
+ * must abort BEFORE the ownership handoff. The source is untouched either way
+ * (env_migrate_send's own rule), so an abort leaves the environment exactly
+ * where it was: `streams_expected` vs `streams_relocated`, applied to a
+ * partition's whole environments. */
+int env_migrate_partition(uint32_t partition_id, uint32_t dest_node_id,
+                          uint32_t* out_expected, uint32_t* out_moved);
 
 /* ─── Receiver (the destination node) ──────────────────────────────────────── */
 

@@ -20,6 +20,12 @@ _Static_assert(sizeof(struct EnvCkptRecord) * ENV_CKPT_MAX <= 4096,
 struct EnvCkptRecord env_ckpt_table[ENV_CKPT_MAX];
 uint32_t             env_ckpt_count = 0;
 
+// The partition-scoped quiesce addresses the records it marked with one bit
+// per table slot, so the table outgrowing the mask must be a build failure
+// rather than a silently dropped record.
+_Static_assert(ENV_CKPT_MAX <= 16,
+               "EnvCkptPartitionQuiesce.touched is a 16-bit mask; ENV_CKPT_MAX grew past it");
+
 static struct EnvCkptRefusal ec_refusal = { ENV_CKPT_REFUSE_NONE, 0, 0 };
 
 // ─── Restore-side runtime state ───────────────────────────────────────────────
@@ -447,6 +453,49 @@ void env_ckpt_release_capture(const struct EnvCkptQuiesce* q) {
     }
 }
 
+// The partition-scoped freeze (see env_ckpt.h for why it is NOT the
+// full-table quiesce: one tenant's migration must not pause its neighbours).
+// Marks a state that already exists — the caller holds the partition paused —
+// and never creates one.
+uint32_t env_ckpt_quiesce_partition(uint32_t partition_id,
+                                    struct EnvCkptPartitionQuiesce* q) {
+    if (q == (struct EnvCkptPartitionQuiesce*)0) return 0;
+    ec_memset(q, 0, (uint32_t)sizeof *q);
+    q->partition_id = partition_id;
+
+    // Rule 2 again: the control plane's own partition is never frozen, and a
+    // caller who asks anyway is told 0 rather than handed a silent exception.
+    if (partition_id == PARTITION_SYSTEM) return 0;
+    // The freeze only ever describes a pause somebody else already took.
+    // Refusing here is what keeps there being exactly ONE pause in play, so
+    // release never has to decide whether a resume it performs was its own.
+    if (!partition_exists(partition_id) || !partition_is_paused(partition_id))
+        return 0;
+
+    for (uint32_t i = 0; i < env_ckpt_count && i < ENV_CKPT_MAX; i++) {
+        if (env_ckpt_table[i].partition_id != partition_id) continue;
+        q->prior_flags[i] = env_ckpt_table[i].flags;
+        q->touched       |= (uint16_t)(1u << i);
+        env_ckpt_table[i].flags |= ENV_CKPT_FLAG_QUIESCED |
+                                  ENV_CKPT_FLAG_PARTITION_PAUSED;
+        q->n_marked++;
+    }
+    return q->n_marked;
+}
+
+void env_ckpt_release_partition(struct EnvCkptPartitionQuiesce* q) {
+    if (q == (struct EnvCkptPartitionQuiesce*)0) return;
+    for (uint32_t i = 0; i < env_ckpt_count && i < ENV_CKPT_MAX; i++) {
+        if (!((q->touched >> i) & 1u)) continue;
+        // The partition check is the one thing this can defend: if a record was
+        // dropped since the freeze the slots shifted, and slot i may now be a
+        // different environment whose flags were never ours to write.
+        if (env_ckpt_table[i].partition_id != q->partition_id) continue;
+        env_ckpt_table[i].flags = q->prior_flags[i];
+    }
+    ec_memset(q, 0, (uint32_t)sizeof *q);
+}
+
 uint32_t env_ckpt_apply_restored_pauses(void) {
     uint32_t applied = 0;
     for (uint32_t i = 0; i < env_ckpt_count; i++) {
@@ -493,6 +542,13 @@ void env_ckpt_restore_begin(void) {
 
 uint32_t env_ckpt_restore_pending(void) { return ec_restore_pending_count; }
 uint32_t env_ckpt_restore_refused(void) { return ec_restore_refused_count; }
+
+// Per-record form, for a caller that must know whether ONE record describes an
+// environment that exists on this boot (see env_ckpt.h: the migration gate).
+int env_ckpt_restore_pending_record(uint32_t partition_id, uint32_t index) {
+    int slot = ec_find_slot(partition_id, index);
+    return (slot >= 0 && ec_restore_pending[slot]) ? 1 : 0;
+}
 
 // The dirty-capture gate. A record the capture never froze describes a moving
 // target, so replaying it would be a create dressed as a restore -- refused

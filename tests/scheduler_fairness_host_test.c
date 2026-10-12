@@ -183,6 +183,24 @@ static void add_runnable(int idx, uint32_t pid, uint32_t partition_id) {
     proc_table[idx].kernel_rsp   = 1;   /* nonzero sentinel — "actually entered" */
 }
 
+/* POSIX-Environments P3 increment 3: kernel/partition.c Step 3c calls
+ * env_migrate_partition() to move this partition's environments inside the
+ * same critical section as the streams -- a NEW external dependency of
+ * partition.c, so this test needs a stand-in for it exactly as it already
+ * needs stream_migrate_send_partition()/simi_ctx_migrate_send_partition().
+ * FAITHFUL for this file: it registers no environments, so the real function
+ * would count 0 records for the partition, transfer 0 and answer 0 -- exactly
+ * what this returns. The ordering against the ownership handoff is proven in
+ * tests/partition_migrate_phase6_host_test.c and the transfer itself in
+ * tests/env_migrate_host_test.c. */
+int env_migrate_partition(uint32_t partition_id, uint32_t dest_node_id,
+                          uint32_t* out_expected, uint32_t* out_moved) {
+    (void)partition_id; (void)dest_node_id;
+    if (out_expected) *out_expected = 0;
+    if (out_moved)    *out_moved    = 0;
+    return 0;
+}
+
 int main(void) {
     /* ── Scenario 1: uneven partition sizes — 5 processes in PARTITION_
      * SYSTEM (slots 0-4), 1 process in partition 7 (slot 5). Simulate 20

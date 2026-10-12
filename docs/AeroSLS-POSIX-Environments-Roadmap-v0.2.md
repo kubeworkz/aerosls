@@ -1584,6 +1584,125 @@ requires the guard to fail naming that arm.
   clean rebuild on a seeded tree — worth a dependency-tracking fix in its
   own right.
 
+### Findings addendum — what landed, increment 2 (the transfer)
+
+The payload half of "checkpoint, transfer, restore, resume": `kernel/env_migrate.c` moves one
+environment's whole footprint — its P1a descriptor plus every byte that
+descriptor names (the three regions' frames and the P1b durable extent's
+pages) — over the DSPP migrate wire family the streams already ride, opcodes
+**18–21** (11–14 belongs to the checkpoint family, which shares the magic and
+would have swallowed the frames), the descriptor crossing WHOLE in the BEGIN,
+page numbering derived from the record on both sides with the destination
+refusing a declared total that disagrees, staging into partition-charged
+frames, never persisting what is staged. It killed nothing, freed nothing and
+dropped no record, so a short transfer left the environment exactly where it
+was. It deliberately did not wire itself in — that is this increment — and it
+repaired a guard this branch left red (`env_storage_durable_check.sh`'s S10
+ceiling, now 327 with S10f asserting 327 *is* dispatched). Full summary:
+commit `8379e82` / PR #74; proofs: `tests/env_migrate_host_test.c`, 107 checks.
+
+### Findings addendum — what landed, increment 3 (the environment inside the critical section)
+
+The step is now reachable from the only place that matters. `partition_migrate()`
+gains **Step 3c**: pause → lease step-down → streams → contexts → **environments**
+→ ownership handoff, so an ownership handoff can no longer precede its
+environment's payload. That is `P3_TOOTH=ownership-first`, closed at the
+environment level — the same partial-transfer defect this function already
+paid for once with a page-0 refusal, reproduced deliberately so its regression
+test is environment-shaped.
+
+- **The whole step is one call, deliberately.** `env_migrate_partition(partition_id,
+  dest_node_id, &expected, &moved)` (`kernel/env_migrate.c`) counts the
+  partition's records, freezes them, sends each through the real
+  `env_migrate_send()`, and thaws on every path out. partition.c grows **one**
+  new external reference rather than a loop over another module's table, so
+  every host test that links it needs **one** stand-in — 24 files, the exact
+  judgment call `stream_migrate_send_partition()`'s and
+  `simi_ctx_migrate_send_partition()`'s stubs already made (and the same
+  cascade, for the same reason: a new dependency of a widely-linked file).
+  The status-name mapping is `static inline` in `env_migrate.h` for the same
+  reason — a pure string map must not become a second dependency.
+- **Finding — one test was invisible to a search for the phrase "Build and
+  run:".** The first sweep over the suite found 23 files linking partition.c
+  by that phrase and stubbed them; `tests/partition_host_test.c` says "built
+  and run directly:" instead, was never seen, and the host suite went red at
+  the linker on `undefined reference to env_migrate_partition` — a missing
+  stub reported as a compile error, in the runner that builds the tests. The
+  fix is in the DETECTION, not the symptom: the guard's clause I (and this
+  note) now read the build command exactly the way `tests/run_all.sh` does —
+  from the `* gcc` line, backslash continuations included — so the guard sees
+  what the runner builds, and its tooth now removes *that* file's stand-in.
+- **The abort is the streams' own rule, applied wholesale.**
+  `envs_rc != 0 || envs_moved < envs_expected` returns **before** Step 4, with
+  the pause state restored and nothing reclaimed: fewer confirmed than exist is
+  a failure, not a partial success, and 0 of 0 stays a success — the distinction
+  `streams_expected` was introduced to buy.
+- **Finding — the quiesce had to become partition-scoped.** The capture's
+  `env_ckpt_quiesce_for_capture()` freezes *every* partition holding a record.
+  Inside one tenant's migration that is a blast radius nobody asked for: the
+  neighbours would be paused for the length of a wire transfer. New
+  `env_ckpt_quiesce_partition()` / `env_ckpt_release_partition()` freeze ONE
+  partition and **require that the caller already holds it paused** (Step 1
+  does), so there is exactly one pause in play and the release never has to
+  guess whose it was. They mark `QUIESCED | PARTITION_PAUSED` — the first so
+  the destination's restore rule 2 accepts the record that crossed, the second
+  because a successful migration always leaves the partition paused (resume
+  happens over there) — and they remember each record's **prior** flags and
+  restore them bit for bit, so an abort leaves no record claiming a freeze that
+  is already over. The full-table quiesce is untouched; checkpoint captures
+  still do what they did.
+- **Finding — a record table is not a list of live environments.** A record
+  this boot has not replayed yet describes an environment that does not exist
+  here: its region bases are last boot's placement, and reading them would
+  push whoever's bytes now occupy those frames across the wire under this
+  environment's name. New `env_ckpt_restore_pending_record()` gates the step
+  **before** anything is frozen or read, refusing
+  `ENV_MIGRATE_REFUSE_UNREPLAYED`. What it deliberately does not catch is
+  named in its own comment: a record whose replay was *refused* leaves the
+  pending set while staying in the table, so it reads as live. Telling those
+  apart needs a liveness mark the record layer does not carry — P1a's gap (the
+  refused record's destination), not something a wire protocol can infer.
+- **The default posture is untouched.** The step sits behind
+  `cluster_local_node_id() != 0`, exactly as the stream and context steps do:
+  with no real cluster identity there is nowhere to send an environment, so
+  the step is a no-op and ownership moves as it always did. Proven by a
+  *counting* stub in `partition_migrate_default_path_host_test.c` — the default
+  path asserts the step never runs, rather than assuming it.
+- **Deliberately NOT here, each its own increment:** the source environment's
+  teardown and the destination's restore (increment 4). On success the source's
+  records still describe environments that have moved and
+  `partition_reclaim_all_frames()` still reclaims the partition's frames as it
+  did before this increment — the roadmap's own "orphaned or destroyed by
+  teardown" boundary, named here instead of being quietly changed by a
+  transfer half.
+
+Proven by: `tests/env_migrate_host_test.c` **Phase F (31 new checks, 138
+total)** against the real sender, record layer and wire — refused-not-paused
+and refused-not-yet-replayed each cost zero frames and left the flags alone;
+the happy path sending **2 × 6 pages**, the crossing descriptor carrying
+`QUIESCED | PARTITION_PAUSED` although the table had neither, both slots
+complete after the bytes are replayed through the real receive path as node 2,
+and the flags **bit-for-bit restored on the failure path too**; 0 of 0
+succeeding; `PARTITION_SYSTEM` refused by name. `tests/partition_migrate_phase6_host_test.c`
+**Scenario 7 (72 checks total)** asserts, at the instant the step runs, that
+the partition is **paused** and the owner is **still this node** — then that a
+1-of-2 shortfall fails the migration, leaves ownership local, reclaims nothing
+and restores the pause state — and `partition_migrate_default_path_host_test.c`
+**(11 checks)** asserts the step never runs without a cluster.
+
+**The guard, and its teeth.** `tests/env_migration_check.sh` (source-only, ten
+clauses, runs in CI's verify job) checks the wiring a runtime test cannot see:
+the call exists, sits **before** `partition_set_owner_node()`, is followed by a
+non-constant abort that returns before the handoff, stays behind the cluster
+gate; the step freezes once and releases on **both** paths out; the freeze
+marks both bits and the release restores the prior flags; the pending gate is
+declared, defined and called; every host test linking partition.c satisfies
+its new dependency; and both orchestration tests still *assert* what they own.
+`tests/env_migration_check_smoke.sh` proves all ten bite — 12 teeth, including
+`ownership-first` (the step moved after the handoff), the neutered abort (the
+live-cluster defect verbatim), the never-released freeze (the leak-unpause
+shape), and the vacuity control on the untouched tree.
+
 ---
 
 ## 8. Capacity for the first cut

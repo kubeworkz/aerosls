@@ -108,6 +108,27 @@ int stream_migrate_send_partition(uint32_t partition_id, uint32_t dest_node_id) 
     (void)partition_id; (void)dest_node_id; migrate_send_calls++; return 0;
 }
 
+/* POSIX-Environments P3 increment 3: kernel/partition.c Step 3c calls
+ * env_migrate_partition() to move this partition's environments -- a NEW
+ * external dependency of partition.c, so this file needs a stand-in as it
+ * needs stream_migrate_send_partition()'s. Here it is CALL-COUNTING rather
+ * than permissive, because the default path's whole claim is that the step
+ * does not run at all when no real cluster is configured: with nowhere to
+ * send an environment, the step is a no-op, exactly as the stream branch is
+ * (an environment's bytes are already where its partition is). The
+ * ordering against the ownership handoff is proven in
+ * tests/partition_migrate_phase6_host_test.c, the transfer itself in
+ * tests/env_migrate_host_test.c. */
+static int env_step_calls = 0;
+int env_migrate_partition(uint32_t partition_id, uint32_t dest_node_id,
+                          uint32_t* out_expected, uint32_t* out_moved) {
+    (void)partition_id; (void)dest_node_id;
+    env_step_calls++;
+    if (out_expected) *out_expected = 0;
+    if (out_moved)    *out_moved    = 0;
+    return 0;
+}
+
 int main(void) {
     partition_init();
     CHECK(cluster_local_node_id() == 0, "setup: no cluster configured in this process -- cluster_init() is never called");
@@ -123,6 +144,7 @@ int main(void) {
     CHECK(relocate_calls == 1, "the OLD stream_relocate_partition() path was taken exactly once");
     CHECK(migrate_send_calls == 0, "the NEW stream_migrate_send_partition() path was NOT taken -- no real cluster means nowhere else to send the bytes, same as every pre-Phase-7 deployment");
     CHECK(partition_get_owner_node(pid_a) == 42, "ownership still genuinely moved to node 42 -- Phase 7 didn't touch this part of the orchestration");
+    CHECK(env_step_calls == 0, "*** and the P3 environment step did NOT run: with no cluster there is nowhere to send an environment, so Step 3c is a no-op exactly as the stream branch is ***");
 
     /* ── A second migration confirms this isn't a one-off -- the default
      * path holds consistently, not just on the first call. ─────────────── */
@@ -130,6 +152,7 @@ int main(void) {
     CHECK(rc == 0, "partition_migrate(tenant-b, node 7) also succeeds with no cluster configured");
     CHECK(relocate_calls == 2, "the OLD path was taken a second time for tenant-b");
     CHECK(migrate_send_calls == 0, "the NEW path remains untaken -- no cluster was configured at any point in this process's lifetime");
+    CHECK(env_step_calls == 0, "*** and the environment step never ran on the default path, on either migration -- the increment changed nothing about this posture ***");
 
     printf("\n%d passed, %d failed\n", checks_passed, checks_failed);
     return checks_failed == 0 ? 0 : 1;

@@ -19,6 +19,7 @@
 #include "../net/dspp.h"         // Multi-Node Phase 2 -- partition-row replication over DSPP (announce/withdraw)
 #include "stream.h"             // Multi-Node Phase 6 addendum -- stream_relocate_partition() (real migration data movement)
 #include "simi_ctx_migrate.h"   // PEC Phase 3 -- simi_ctx_migrate_send_partition()
+#include "env_migrate.h"        // POSIX-Environments P3 increment 3 -- env_migrate_partition()
 #include "service_registry.h"  // Orchestration Plan Phase 4 -- service_unregister_partition()
 
 struct SLSPartitionEntry  partition_table[PARTITION_MAX];
@@ -518,6 +519,51 @@ int partition_migrate(uint32_t partition_id, uint32_t dest_node_id) {
         ? simi_ctx_migrate_send_partition(partition_id, dest_node_id)
         : 0;
 
+    /* ─── Step 3c (POSIX-Environments P3 increment 3): this partition's
+     * environments, inside the SAME critical section the streams ride ──────
+     * Until now the migration moved a partition's streams, its SIMI contexts
+     * and its ownership record while its environments -- two sidecars, their
+     * memory, their storage, their console -- stayed behind on this node,
+     * where teardown orphans them. The payload exists now (increment 2), so
+     * what was missing is exactly one thing: putting it where the ownership
+     * handoff cannot get ahead of it.
+     *
+     * The ordering IS the property. env_migrate_partition() returns only
+     * after every page of every environment has been acknowledged by node
+     * dest_node_id, and the comparison below is the streams' own
+     * streams_expected-vs-streams_relocated rule applied to whole
+     * environments: fewer confirmed than exist, and this function returns
+     * BEFORE Step 4 -- the `ownership-first` tooth at the environment level,
+     * whose live counterpart is the defect partition_migrate() already paid
+     * for once with a page-0 refusal.
+     *
+     * The `cluster_local_node_id() != 0` branch is the one Step 3 and Step 3b
+     * already take, for the same reason: with no real cluster identity there
+     * is nowhere to send anything, and the same-disk posture for an
+     * environment is not a relocation but a no-op -- its bytes are already
+     * where its partition is. So the default path reports 0 of 0 and hands
+     * over exactly as it did before this increment. */
+    uint32_t envs_expected = 0, envs_moved = 0;
+    int envs_rc = (cluster_local_node_id() != 0)
+        ? env_migrate_partition(partition_id, dest_node_id, &envs_expected, &envs_moved)
+        : 0;
+
+    if (envs_rc != 0 || envs_moved < envs_expected) {
+        kernel_serial_printf(
+            "[PARTITION] ERROR: migrate ABORTED for partition %u -- %u of %u "
+            "environment(s) were confirmed by node %u (last gate: %s). Ownership NOT "
+            "transferred, no frames reclaimed, every environment still here and intact, "
+            "and the partition's pause state restored to what it was before the attempt. "
+            "Check node %u's log for the refusal reason, then retry.\n",
+            (unsigned)partition_id, (unsigned)envs_moved, (unsigned)envs_expected,
+            (unsigned)dest_node_id,
+            (envs_rc != 0) ? env_migrate_status_name(envs_rc)
+                           : "fewer environments confirmed than exist",
+            (unsigned)dest_node_id);
+        if (!was_paused_before_migrate) partition_resume(partition_id);
+        return 1;
+    }
+
     // Step 4 (Multi-Node Phase 2): the actual, load-bearing ownership
     // handoff -- a pure table write that already persists internally
     // (persist_partitions(), Phase 10). Frames are deliberately NOT
@@ -569,12 +615,14 @@ int partition_migrate(uint32_t partition_id, uint32_t dest_node_id) {
     kernel_serial_printf(
         "[PARTITION] migrated partition %u: node %u -> node %u. Lease "
         "relinquished=%s, %d stream(s) sent and confirmed by the destination, %u "
+        "environment(s) sent and confirmed by the destination, %u "
         "live context(s) checkpointed and sent, %u physical frame(s) "
         "reclaimed. Partition remains PAUSED -- resume must happen on the "
         "destination node.\n",
         (unsigned)partition_id, (unsigned)source_node_id, (unsigned)dest_node_id,
         lease_existed ? "yes" : "no (none was held)",
         streams_relocated,
+        (unsigned)envs_moved,
         (unsigned)contexts_migrated,
         (unsigned)frames_reclaimed);
 
