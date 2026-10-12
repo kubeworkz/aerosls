@@ -16,15 +16,19 @@
 # never printing an Adopted/recovery line, serving the row still owned by
 # the dead leader, AND — the write-lease layer — holding a lease row
 # before the kill, keeping holds_lease=0 (partition_holds_write_lease()
-# false) through the window, logging the [MMU-LEASE] strip on campaign,
-# and never logging a restore (only lease quorum-achieved restores, and a
-# lone 2-node survivor can never reach it).
+# false) through the window, and never logging a restore (only lease
+# quorum-achieved restores, and a lone 2-node survivor can never reach
+# it). The companion strip demand (a [MMU-LEASE] force_read_only=1 line
+# on campaign) was dropped on 2026-10-12: the kernel's 2026-08-16
+# ownership gate means a non-owning survivor never campaigns, so the
+# strip is unreachable on live hardware (see the guard's header for the
+# full dated note; the property stays pinned by
+# tests/consensus_phase1_host_test.c's call-tracking stub).
 #
 # Teeth (each a distinct failure the guard must tell apart):
 #   staysfollower -> PASS  (node 2 declares the death, stays FOLLOWER,
-#                           never adopts, holds_lease stays 0, the
-#                           MMU-LEASE strip is logged and never restored;
-#                           the leader was really killed)
+#                           never adopts, holds_lease stays 0, and never
+#                           logs a restore; the leader was really killed)
 #   flipsleader   -> FAIL  (node 2 flips to LEADER after a delay — a late
 #                           second leader; the never-LEADER watch must hold
 #                           the full window to catch it)
@@ -38,14 +42,11 @@
 #                           holds — the lease layer is dead; the lease-held
 #                           gate must bite, not silently skip the layer)
 #   nolearnlease  -> FAIL  (the survivor never created its lease row — the
-#                           lease-learn gate must bite, so the strip/restore
-#                           gates cannot be vacuous)
-#   leasestrip    -> FAIL  (the survivor never logged the MMU-LEASE strip
-#                           — reads-only never engaged at the page-
-#                           permission call site)
-#   leaserestore  -> FAIL  (the survivor logged the strip AND a restore —
-#                           write permission re-enabled without a lease
-#                           quorum; the page-permission split-brain)
+#                           lease-learn gate must bite, so the restore
+#                           gate cannot be vacuous)
+#   leaserestore  -> FAIL  (the survivor logged a restore — write permission
+#                           re-enabled without a lease quorum; the
+#                           page-permission split-brain)
 #   leasehold     -> FAIL  (the survivor reports holds_lease=1 after the
 #                           death — partition_holds_write_lease() true;
 #                           the page-level gate bypassed)
@@ -282,16 +283,11 @@ tooth() {
             return
         fi
         # A PASS that never engaged the write-lease layer proves nothing
-        # either: the strip must be in the survivor's log, and a restore
-        # must not be.
-        if ! grep -q "MMU-LEASE] partition 1: page permissions force_read_only=1" \
-                "$STATE/node2.log" 2>/dev/null; then
-            echo "TOOTH FAIL $label — guard passed, but the survivor never logged the MMU-LEASE strip (the lease layer never engaged)"
-            printf '%s\n' "$out" | sed 's/^/           /'
-            dump_fake_err
-            fails=$((fails + 1))
-            return
-        fi
+        # either: the survivor must hold its lease row (gated by the guard
+        # itself before the kill) and must NOT carry a restore in its log
+        # (impossible for a lone 2-node survivor). The strip is no longer
+        # part of a PASS: the ownership gate makes it unreachable for a
+        # non-owning survivor (guard header, 2026-10-12).
         if grep -q "MMU-LEASE] partition 1: page permissions force_read_only=0" \
                 "$STATE/node2.log" 2>/dev/null; then
             echo "TOOTH FAIL $label — guard passed, but the survivor's log contains a lease restore (impossible for a lone 2-node survivor)"
@@ -354,8 +350,7 @@ tooth adopts         1 "ALSO recovered" "adopts -> FAIL (a follower that recover
 tooth nolearn        1 "never learned"  "nolearn -> FAIL (the create announce did not arrive)"
 tooth nockpt         1 "no checkpoint"  "nockpt -> FAIL (the checkpoint never carried the row)"
 tooth nolease        1 "never HOLD the write lease" "nolease -> FAIL (the lease layer must be live before the kill; a dead lease layer is a broken guard, not a pass)"
-tooth nolearnlease   1 "never created a lease row" "nolearnlease -> FAIL (the survivor must hold a lease row before the kill, or the strip/restore gates are vacuous)"
-tooth leasestrip     1 "never stripped write permission" "leasestrip -> FAIL (the survivor must log the MMU-LEASE strip on campaign — reads-only at the page-permission call site)"
+tooth nolearnlease   1 "never created a lease row" "nolearnlease -> FAIL (the survivor must hold a lease row before the kill, or the restore gate is vacuous)"
 tooth leaserestore   1 "RESTORED write permission" "leaserestore -> FAIL (a restore on a lone 2-node survivor is the page-permission split-brain)"
 tooth leasehold      1 "holds_lease=1" "leasehold -> FAIL (partition_holds_write_lease() must stay false on the survivor)"
 # The re-drive gate, both sides of it. leaselost1 drops the FIRST campaign

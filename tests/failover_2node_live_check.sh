@@ -66,15 +66,42 @@
 # partition's pages. In a 2-node cluster the lease quorum is the SAME 2-of-2
 # majority as the election quorum (cluster_recompute_quorum() feeds both),
 # so the same math that denies a lone survivor the leadership also denies it
-# the lease -- with one extra, page-level guarantee worth pinning:
+# the lease -- pinned at the page-permission level by the negative:
 #
-#   - the survivor must STRIP write permission when it starts campaigning
-#     (update_page_table_permissions_for_partition(pid, 1), logged as
-#     `[MMU-LEASE] partition <pid>: page permissions force_read_only=1`) --
-#     reads-only must hold at the page-permission call site, not just in
-#     the table;
-#   - it must NEVER restore (force_read_only=0) -- a restore only fires on
-#     lease quorum-achieved, which a lone 2-node survivor can never reach.
+#   - the survivor must NEVER restore write permission (force_read_only=0)
+#     -- a restore only fires on lease quorum-achieved, which a lone 2-node
+#     survivor can never reach.
+#
+# ─── Why the campaign STRIP is no longer gated here (2026-10-12) ────────────
+# This guard used to also demand the positive: `[MMU-LEASE] partition <pid>:
+# page permissions force_read_only=1` on the survivor's first campaign. A
+# live 2-node cluster can no longer exhibit that line, for two independent
+# reasons, both deliberate kernel changes since the tooth was written:
+#
+#   1. the 2026-08-16 step-11 ownership gate --
+#      partition_lease_heartbeat_tick() never campaigns for a partition
+#      this node does not own (net/consensus.c, host-tested as Scenario
+#      19b in tests/consensus_phase1_host_test.c, added after a REAL live
+#      find: an ex-owner's stale row re-campaigning and winning the lease
+#      for a partition it no longer owned). Ownership reaching this
+#      survivor is adoption, and adoption is exactly what this guard
+#      proves impossible -- so its lease row never campaigns, and the
+#      strip that only a campaign prints can never appear;
+#   2. even where campaigns DO happen -- the leader's own `partition lease
+#      acquire <pid>` -- the strip is printed synchronously inside the
+#      shell command's serial-capture window and never reaches the serial
+#      log, the same phenomenon the step-11 live session documented for
+#      partition_migrate()'s own lines (2026-08-16).
+#
+# The strip property itself is pinned deterministically where it cannot
+# rot: tests/consensus_phase1_host_test.c's call-tracking stub proves
+# trigger_election() calls update_page_table_permissions_for_partition(pid,
+# 1) scoped to the contested partition (Scenario 13) and that ONLY the
+# quorum-achieving vote restores with =0 (Scenario 15). Demanding the strip
+# here made this guard permanently RED on real hardware while smoke-green
+# on fakes that emulated the pre-gate kernel -- first observed live
+# 2026-10-12; the negative above is the page-level invariant that remains
+# true and live-checkable.
 #
 # The guard therefore acquires the write lease BEFORE the kill (the only
 # live trigger is the shell `partition lease acquire <pid>`; a lease row is
@@ -738,21 +765,20 @@ PY
 done
 [ "$decl_seen" -eq 1 ] || { survivor_ok=0; survivor_why="never observed the death (no declaration in $S_LOG)"; }
 
-# 7e. the page-permission level: the survivor must have STRIPPED write
-# permission when it started campaigning ([MMU-LEASE] force_read_only=1)
-# and must NEVER have restored it (=0). The strip is logged by
-# update_page_table_permissions_for_partition() on every campaign start;
-# the restore only fires on lease quorum-achieved, unreachable for a lone
-# 2-node survivor. A survivor with the strip but a restore is the page-
-# level split-brain; a survivor with NEITHER means the lease layer never
-# engaged (vacuous -- caught earlier at the lease-learn gate, but the
-# strip is re-checked here against the final log).
-strip_n=$(grep -hc "MMU-LEASE] partition $PART_ID: page permissions force_read_only=1" "$S_LOG" 2>/dev/null || true)
+# 7e. the page-permission level: the survivor must NEVER restore write
+# permission ([MMU-LEASE] force_read_only=0). The restore only fires on
+# lease quorum-achieved, unreachable for a lone 2-node survivor, so any
+# restore line is the page-level split-brain -- writes re-enabled without
+# a lease. (The campaign strip is deliberately NOT gated here: the
+# ownership gate makes it unreachable for a non-owning survivor and the
+# shell's serial capture swallows it even on the campaigner -- see the
+# header's dated note. It is pinned by consensus_phase1_host_test.c's
+# call-tracking stub instead. The lease-learn gate before the kill keeps
+# this negative non-vacuous: the survivor demonstrably engaged the lease
+# layer -- it created a row and voted -- and still never restored.)
 restore_n=$(grep -hc "MMU-LEASE] partition $PART_ID: page permissions force_read_only=0" "$S_LOG" 2>/dev/null || true)
-if [ "$strip_n" -eq 0 ]; then
-    survivor_ok=0; survivor_why="never stripped write permission (no [MMU-LEASE] force_read_only=1 line for partition $PART_ID)"
-elif [ "$restore_n" -gt 0 ]; then
-    survivor_ok=0; survivor_why="RESTORED write permission after campaigning ([MMU-LEASE] force_read_only=0 line for partition $PART_ID)"
+if [ "$restore_n" -gt 0 ]; then
+    survivor_ok=0; survivor_why="RESTORED write permission without a lease quorum ([MMU-LEASE] force_read_only=0 line for partition $PART_ID)"
 fi
 
 if [ "$survivor_ok" -ne 1 ]; then

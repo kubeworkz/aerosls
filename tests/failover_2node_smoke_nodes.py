@@ -31,8 +31,11 @@ log strings the guard gates on (each printed by exactly one real site):
     restore (no row = no contest = vacuous).
     lease strip/restore:   "[MMU-LEASE] partition N: page permissions
     force_read_only=1" on every campaign start, "=0" only on lease
-    quorum-achieved. The guard requires the strip and forbids the restore
-    on the survivor.
+    quorum-achieved. The survivor logs NEITHER: since the 2026-08-16
+    ownership gate a non-owning row never campaigns (the guard dropped
+    its strip demand the same day it observed the line was unreachable
+    live -- see the guard's header), so the only lease page-permission
+    line this fake can emit on the survivor is the leaserestore bug.
 
 The survivor's death detection mirrors the kernel's: it polls the leader's
 HTTP port; when it stops answering, it transitions. What it does then is
@@ -40,8 +43,8 @@ the mode:
 
 Modes (written to <statedir>/mode by the smoke):
     staysfollower  node 2 declares the death and stays FOLLOWER forever,
-                   never adopting; the row stays owned by node 1; the
-                   lease strip is logged and never restored -> PASS
+                   never adopting; the row stays owned by node 1; no
+                   restore is ever logged -> PASS
     flipsleader    node 2 declares the death, then flips to LEADER after a
                    delay (a late second leader) -> guard FAIL at the
                    never-LEADER watch
@@ -74,11 +77,9 @@ Modes (written to <statedir>/mode by the smoke):
                    only ever sees the row of the SECOND campaign, i.e. the
                    guard's re-drive. A lost hop must not read as a broken
                    RX path -> guard PASS (the re-drive gate)
-    leasestrip     node 2 declares the death but never logs the MMU-LEASE
-                   strip -> guard FAIL at the strip gate
-    leaserestore   node 2 logs the strip AND then a restore (lease
-                   quorum-achieved on a 2-node survivor -- impossible) ->
-                   guard FAIL at the restore gate
+    leaserestore   node 2 logs a restore (lease quorum-achieved on a
+                   2-node survivor -- impossible) -> guard FAIL at the
+                   restore gate
     leasehold      node 2 reports holds_lease=1 in /api/partitions after
                    the death (partition_holds_write_lease() true on the
                    survivor) -> guard FAIL at the holds_lease watch
@@ -415,11 +416,15 @@ def death_thread():
             continue
         transitioned = True
         log("[FAILOVER] Node %u declared DEAD (silent 300 ticks)" % leader_id)
-        # The write-lease strip: the survivor campaigns for the lease
-        # (its row times out, update_page_table_permissions_for_
-        # partition(pid, 1)) -- logged unless leasestrip suppresses it.
-        if mode != "leasestrip":
-            log("[MMU-LEASE] partition 1: page permissions force_read_only=1")
+        # The page-permission layer on the survivor: NO strip line. Since
+        # the 2026-08-16 ownership gate (partition_lease_heartbeat_tick
+        # never campaigns for a partition this node does not own) a
+        # non-owning 2-node survivor's lease row stays silent forever, so
+        # neither trigger_election (the only strip site) nor the quorum
+        # path (the only restore site) can ever run here. The old fake
+        # modelled the pre-gate kernel (strip on campaign start); the
+        # guard no longer demands it (see its dated header note), so
+        # neither does this fake.
         if mode == "leaserestore":
             # The bug: a 2-node survivor that "wins" the 2-of-2 lease
             # quorum and restores write permission. The guard's restore
