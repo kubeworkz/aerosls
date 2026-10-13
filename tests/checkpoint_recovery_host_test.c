@@ -51,6 +51,12 @@ uint32_t cluster_local_node_id(void) { return g_local_node; }
  * failover_recover_from() directly, not via failover_tick()'s leader gate. */
 int cluster_is_leader(void) { return 0; }
 
+/* The failover deferral gate (failover.c -> env_migrate_in_flight): a
+ * controllable stand-in so the migration deferral itself is exercised below,
+ * not just bypassed. The real one lives in kernel/env_migrate.c. */
+int g_env_migrate_in_flight = 0;
+int env_migrate_in_flight(void) { return g_env_migrate_in_flight; }
+
 /* Roster stubs -- failover.c's leader broadcast iterates these; an empty
  * roster makes it a no-op in this test (no live cluster). */
 struct ClusterPeer cluster_roster[CLUSTER_NODE_MAX];
@@ -209,6 +215,26 @@ static void test_liveness(void) {
     failover_note_heartbeat(3, 0);
     failover_tick(160);  /* 160 > 150 (half of 300) */
     CHECK(failover_peer_status(3) == PEER_SUSPECTED, "node 3 suspected after 160 ticks");
+
+    /* Migration deferral (POSIX-Environments P3 live arm): while this node's
+     * own environment migration is in flight, a silent peer is NOT declared
+     * dead — the silence a synchronous payload send or a sweep-blocking
+     * restore produces on the COUNTERPARTY is not a death, and declaring it
+     * one flipped ownership back onto the sender on the live 2-node TCG run
+     * (both nodes adopted; the confirmation teardown then correctly
+     * refused). The declaration must fire on the first tick after the
+     * migration resolves — that pairing is what makes the deferral a delay,
+     * not a blindfold. */
+    failover_init();
+    g_env_migrate_in_flight = 1;
+    failover_note_heartbeat(4, 0);
+    failover_tick(351);  /* silence 301 >= DEAD, but a migration is in flight */
+    CHECK(failover_peer_status(4) != PEER_DEAD,
+          "*** node 4 NOT declared dead at 301 ticks of silence while a migration is in flight ***");
+    g_env_migrate_in_flight = 0;
+    failover_tick(352);
+    CHECK(failover_peer_status(4) == PEER_DEAD,
+          "...and declared dead on the first tick after the migration resolves");
 }
 
 /* ─── Scenario 2: node comes back from the dead ────────────────────── */

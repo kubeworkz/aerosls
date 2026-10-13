@@ -634,6 +634,13 @@ void dspp_env_migrate_rx(void* buf, uint16_t len) {
      * ignored, not an error. */
     if (h->node_dest_id != cluster_local_node_id()) return;
 
+    /* Destination-side visibility (P3 live arm): partition_migrate()'s own
+     * abort tells the operator to "check node N's log for the refusal
+     * reason" — which was a promise this family could not keep: a refused
+     * BEGIN/PAGE was answered with a non-zero ACK and NOTHING was logged,
+     * so a live migrate that never landed gave no diagnosis on either
+     * side. One line per refusal (and one per staged environment) keeps
+     * the promise; the volume is per-migration, not per-frame. */
     if (h->opcode == DSPP_MIGRATE_ENV_BEGIN_REQ) {
         if (len < sizeof(struct DSPPEnvMigrateBeginPacket)) return;
         struct DSPPEnvMigrateBeginPacket* pkt = (struct DSPPEnvMigrateBeginPacket*)buf;
@@ -641,6 +648,25 @@ void dspp_env_migrate_rx(void* buf, uint16_t len) {
                                         h->env_index, h->total_pages,
                                         (const struct EnvCkptRecord*)pkt->record,
                                         h->record_len);
+        if (rc == 0) {
+            kernel_serial_printf(
+                "[ENV_MIGRATE] RX: BEGIN for (partition %u, index %u) from node %u "
+                "STAGED, %u page(s).\n",
+                (unsigned)h->partition_id, (unsigned)h->env_index,
+                (unsigned)h->node_source_id, (unsigned)h->total_pages);
+        } else {
+            /* rc names the gate (kernel/env_migrate.c's recv_begin): 1 no
+             * record, 2 record_len != sizeof(EnvCkptRecord), 3 declared
+             * total disagrees with the record's own page count, 4 total over
+             * ENV_MIGRATE_MAX_PAGES, 5 a slot for this identity is already
+             * staged, 6 the staging table is full. */
+            kernel_serial_printf(
+                "[ENV_MIGRATE] RX: BEGIN for (partition %u, index %u) from node %u "
+                "REFUSED (rc=%d: 1=no-record 2=record-len 3=page-count 4=too-many "
+                "5=slot-exists 6=table-full), answered with a non-zero ACK.\n",
+                (unsigned)h->partition_id, (unsigned)h->env_index,
+                (unsigned)h->node_source_id, rc);
+        }
         dspp_env_migrate_send_ack(DSPP_MIGRATE_ENV_BEGIN_ACK, h->node_source_id,
                                   h->transfer_id, h->partition_id, h->env_index,
                                   0, 0, (uint8_t)(rc == 0 ? 0 : 1));
@@ -652,6 +678,13 @@ void dspp_env_migrate_rx(void* buf, uint16_t len) {
         struct DSPPEnvMigratePagePacket* pkt = (struct DSPPEnvMigratePagePacket*)buf;
         int rc = env_migrate_recv_page(h->transfer_id, h->page_index,
                                        h->frag_index, pkt->page_data);
+        if (rc != 0) {
+            kernel_serial_printf(
+                "[ENV_MIGRATE] RX: PAGE (partition %u, page %u, frag %u) from node %u "
+                "REFUSED (rc=%d), answered with a non-zero ACK.\n",
+                (unsigned)h->partition_id, (unsigned)h->page_index,
+                (unsigned)h->frag_index, (unsigned)h->node_source_id, rc);
+        }
         dspp_env_migrate_send_ack(DSPP_MIGRATE_ENV_PAGE_ACK, h->node_source_id,
                                   h->transfer_id, h->partition_id, h->env_index,
                                   h->page_index, h->frag_index,

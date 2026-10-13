@@ -5,6 +5,7 @@
  * Freestanding: local helpers, no libc.
  */
 #include "failover.h"
+#include "env_migrate.h"    /* env_migrate_in_flight() — the migration deferral gate */
 #include "state_tree.h"
 #include "partition.h"
 #include "kernel_io.h"
@@ -69,6 +70,7 @@ void failover_note_heartbeat(uint32_t node_id, uint64_t now) {
     if (!p) return;  /* table full */
 
     p->last_seen_tick = now;
+    p->defer_noted = 0;   /* seen: a later silence earns its own DEFERRED line */
     if (p->status == PEER_DEAD) {
         kernel_serial_printf("[FAILOVER] Node %u came back (was dead)\n", node_id);
     }
@@ -82,6 +84,31 @@ void failover_tick(uint64_t now) {
 
         uint64_t silence = now - peers[i].last_seen_tick;
         if (silence >= FAILOVER_DEAD_TICKS) {
+            /* P3 live arm (2026-10-13): a silence this node's OWN
+             * environment migration produced is not a death. The source's
+             * synchronous payload send and the destination's restore (create
+             * round trip + parked-posture wait) both run on the BSP sweep —
+             * the same context that transmits the consensus heartbeat — so
+             * either end can pass this threshold while both are alive. The
+             * live 2-node TCG run did exactly that: BOTH nodes declared the
+             * other DEAD and BOTH adopted partition 1, flipping ownership
+             * back onto the sender, where the confirmation teardown then
+             * correctly refused ("this node owns the partition again") —
+             * three correct behaviors composing into one stuck migration.
+             * Defer the declaration while env_migrate_in_flight() covers
+             * the silence; a peer that really dies is declared the moment
+             * the migration resolves (the deferral's inputs are bounded). */
+            if (env_migrate_in_flight()) {
+                if (!peers[i].defer_noted) {
+                    peers[i].defer_noted = 1;
+                    kernel_serial_printf(
+                        "[FAILOVER] Node %u silent %llu ticks -- declaration "
+                        "DEFERRED: an environment migration is in flight on "
+                        "this node\n",
+                        peers[i].node_id, (unsigned long long)silence);
+                }
+                continue;
+            }
             if (peers[i].status != PEER_DEAD) {
                 peers[i].status = PEER_DEAD;
                 peers[i].declared_dead_tick = now;

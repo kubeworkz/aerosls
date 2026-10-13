@@ -35,6 +35,8 @@ struct PeerLiveness {
     uint8_t  active;
     uint64_t last_seen_tick; /* kernel_tick_counter when last heartbeat received */
     uint64_t declared_dead_tick;
+    uint8_t  defer_noted;    /* one DEFERRED line per silent episode, not one per
+                              * sweep — see failover_tick()'s migration gate */
 };
 
 // ─── Failover Result ──────────────────────────────────────────────────────────

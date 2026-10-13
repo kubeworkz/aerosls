@@ -24,6 +24,14 @@
  * does return addresses inside the image. Without that, "allocations are
  * above the kernel now" would not distinguish a fix from a coincidence.
  *
+ * Scenario 6 leaves this file's original subject (reservations) for a
+ * second property the allocator gained live: the top-down staging path
+ * (allocate_physical_ram_frame_for_partition_top) must hand out frames
+ * from the top of RAM WITHOUT moving the ascending watermark — the
+ * destination's deterministic first-fit placement depends on that
+ * watermark being exactly the source's (P3 live arm, 2026-10-13: staged
+ * payload frames had shifted it and the restore's placement gate refused).
+ *
  * Build and run:
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers \
  *       -o /tmp/frame_pool_reserve_host_test \
@@ -485,6 +493,58 @@ int main(void) {
               "*** but the predicate still reports NOT reserved: reset cleared the "
               "bounds, so this is a fresh pool whose init has not run rather than "
               "the previous pool's answer ***");
+    }
+
+    /* ═══ Scenario 6: the top-down staging path (P3 live arm) ═════════
+     * allocate_physical_ram_frame_for_partition_top() exists because a
+     * receive side that staged an incoming payload ASCENDED shifted the
+     * first-fit watermark before the destination's fresh create, and the
+     * restore's placement gate then refused ("fresh environment landed off
+     * the staged bases", live 2-node TCG cluster, 2026-10-13 — invisible to
+     * host tests whose two nodes share one allocator history). The whole
+     * contract of the top-down path is that it leaves the ascending
+     * watermark UNTOUCHED, so the destination's first-fit reproduces the
+     * source's recorded bases: that is what these checks pin. */
+    printf("\n-- Scenario 6: top-down staging leaves the ascending watermark alone --\n");
+    {
+        const uint64_t ram_top = 256ULL * 1024 * 1024;   /* bound the scan, as scenario 4 */
+        frame_pool_reset();
+        frame_pool_reserve_below(FAKE_IMAGE_END);
+        frame_pool_limit_ram(ram_top);
+
+        void* w1 = allocate_physical_ram_frame_for_partition(7);
+        CHECK(w1 != 0, "the ascending probe allocates");
+        free_physical_ram_frame_for_partition(w1, 7);
+
+        void* top = allocate_physical_ram_frame_for_partition_top(7);
+        CHECK(top != 0, "the top-down path hands back a frame");
+        CHECK(top != 0 && (uint64_t)(uintptr_t)top == ram_top - 4096,
+              "*** ...and it is the LAST frame of RAM: the scan really runs "
+              "top-down, past every reserved frame above it ***");
+        CHECK(top != 0 && (uint64_t)(uintptr_t)top >= FAKE_IMAGE_END,
+              "...still above the kernel image (the reservation holds for both scans)");
+
+        void* w2 = allocate_physical_ram_frame_for_partition(7);
+        CHECK(w2 == w1,
+              "*** ...and the ascending watermark is EXACTLY where it was: a "
+              "top-down staging frame cannot move anybody else's deterministic "
+              "placement ***");
+        CHECK(partition_get_frame_usage(7) == 2,
+              "both frames are charged to the partition — same accounting as the ascending path");
+
+        /* Quota parity: at quota BOTH paths are refused, before the bitmap
+         * is touched — the denial-before-any-side-effect posture. */
+        free_physical_ram_frame_for_partition(w2, 7);
+        free_physical_ram_frame_for_partition(top, 7);
+        partition_set_frame_quota(7, 1);
+        void* q_asc = allocate_physical_ram_frame_for_partition(7);
+        CHECK(q_asc != 0, "under quota, the ascending path allocates");
+        CHECK(allocate_physical_ram_frame_for_partition_top(7) == 0,
+              "*** at quota, the top-down path is refused too — the quota check "
+              "comes before the bitmap, exactly as on the ascending path ***");
+        partition_set_frame_quota(7, 0);
+        frame_pool_reset();
+        frame_pool_limit_ram(0);
     }
 
     printf("\n=== %d passed, %d failed ===\n", checks_passed, checks_failed);

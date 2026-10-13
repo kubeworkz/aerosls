@@ -45,6 +45,13 @@ extern volatile uint64_t kernel_tick_counter;
 #define ENV_MIGRATE_SECTORS_PER_PAGE 8u
 
 static int env_migrate_status = ENV_MIGRATE_OK;
+/* Resolved-migration failover grace — see env_migrate.h's
+ * ENV_MIGRATE_RESOLVED_GRACE_ definition for the false "declared DEAD"
+ * this tail exists to cover. Set at BOTH points where a migration resolves
+ * on this node: env_migrate_recv_drop() (the destination's slot is gone)
+ * and env_migrate_confirm_disarm() (the source's confirmation walk
+ * finished); read by env_migrate_in_flight(). */
+static uint64_t env_migrate_resolved_tick = 0;
 int env_migrate_last_status(void) { return env_migrate_status; }
 
 /* The operands behind the most recent REFUSAL (restore side). The send side
@@ -359,7 +366,18 @@ int env_migrate_partition(uint32_t partition_id, uint32_t dest_node_id,
  * migrate critical section (increment 3) will serialize concurrent moves the
  * way it already does for streams. Runtime state only — see env_migrate.h. */
 #define ENV_MIGRATE_STAGING_MAX 2
-#define ENV_MIGRATE_MAX_PAGES   1536   /* >= any real payload: 3 regions' frames (1344) + the extent's pages */
+#define ENV_MIGRATE_MAX_PAGES   4096   /* >= any real payload, measured on a
+                                        * live cluster 2026-10-13: a shell-created
+                                        * environment's payload is the 3 region
+                                        * frames (POSIX_HEAP 1024 + RD_HEAP 64 +
+                                        * RD_STORAGE 256 = 1344) PLUS the two
+                                        * sidecars' image/stack frames the create
+                                        * charges to the partition PLUS the durable
+                                        * extent's pages — which put the old 1536
+                                        * cap just under a real BEGIN, refused as
+                                        * "too-many" (rc=4) on the wire. 4096 = 16
+                                        * MiB of headroom; the staging slot costs
+                                        * ~52 KB of BSS each (2 slots). */
 
 struct EnvMigrateSlot {
     uint8_t  active;
@@ -371,6 +389,9 @@ struct EnvMigrateSlot {
     uint32_t index;
     uint64_t transfer_id;
     uint32_t total_pages;
+    uint64_t opened_tick;      /* kernel_tick_counter at BEGIN — env_migrate_in_flight()
+                                * bounds its grace by the slot's age so a wedged
+                                * transfer cannot park failover's death detection */
     uint32_t pages_staged;     /* distinct pages whose fragments all landed */
     struct EnvCkptRecord record;
     /* Staged bytes: one partition-charged frame per payload page. */
@@ -403,6 +424,7 @@ static struct EnvMigrateSlot* env_migrate_slot(uint32_t partition_id, uint32_t i
 int env_migrate_recv_drop(uint32_t partition_id, uint32_t index) {
     struct EnvMigrateSlot* s = env_migrate_slot(partition_id, index);
     if (!s) return 1;
+    env_migrate_resolved_tick = kernel_tick_counter;   /* resolution point */
     for (uint32_t p = 0; p < ENV_MIGRATE_MAX_PAGES; p++) {
         if (s->pages[p]) {
             free_physical_ram_frame_for_partition(s->pages[p], s->partition_id);
@@ -425,22 +447,28 @@ int env_migrate_recv_drop(uint32_t partition_id, uint32_t index) {
 int env_migrate_recv_begin(uint64_t transfer_id, uint32_t partition_id,
                            uint32_t index, uint32_t total_pages,
                            const struct EnvCkptRecord* record, uint32_t record_len) {
+    /* Distinct refusal codes (P3 live arm): every gate below used to return
+     * the same 1, and dspp.c's one refusal line then said only "rc=1" —
+     * five different defects, indistinguishable on a live cluster where the
+     * sender's own log can only say "never confirmed". Any nonzero is still
+     * refused exactly as before (dspp.c maps it to a non-zero ACK status;
+     * the host tests assert the status, not these numbers). */
     if (!record) return 1;
-    if (record_len != (uint32_t)sizeof(struct EnvCkptRecord)) return 1;
+    if (record_len != (uint32_t)sizeof(struct EnvCkptRecord)) return 2;
     /* Both sides number pages from the same record; a declared total that
      * disagrees with the record means the two kernels would disagree about
      * what "every page landed" means — refused rather than reconciled. */
-    if (total_pages != env_migrate_payload_pages(record)) return 1;
-    if (total_pages > ENV_MIGRATE_MAX_PAGES) return 1;
+    if (total_pages != env_migrate_payload_pages(record)) return 3;
+    if (total_pages > ENV_MIGRATE_MAX_PAGES) return 4;
     /* No overwriting a slot in flight: a retransmitted BEGIN for an
      * environment already staged is refused, and the sender abandons rather
      * than clobbering. */
-    if (env_migrate_slot(partition_id, index)) return 1;
+    if (env_migrate_slot(partition_id, index)) return 5;
 
     struct EnvMigrateSlot* s = 0;
     for (int i = 0; i < ENV_MIGRATE_STAGING_MAX; i++)
         if (!env_migrate_staging[i].active) { s = &env_migrate_staging[i]; break; }
-    if (!s) return 1;
+    if (!s) return 6;
 
     s->active       = 1;
     s->complete     = 0;
@@ -449,6 +477,7 @@ int env_migrate_recv_begin(uint64_t transfer_id, uint32_t partition_id,
     s->index        = index;
     s->transfer_id  = transfer_id;
     s->total_pages  = total_pages;
+    s->opened_tick  = kernel_tick_counter;
     s->pages_staged = 0;
     s->record       = *record;
     /* A zero-page environment is complete the moment its BEGIN is accepted:
@@ -485,7 +514,19 @@ int env_migrate_recv_page(uint64_t transfer_id, uint32_t page_index,
         frag_index >= DSPP_MIGRATE_FRAGS_PER_PAGE) return 1;
 
     if (!s->pages[page_index]) {
-        void* frame = allocate_physical_ram_frame_for_partition(s->partition_id);
+        /* Staging frames come from the TOP of the frame pool (frame_pool.h).
+         * The restore creates a FRESH environment whose regions land
+         * wherever the ascending first-fit watermark currently is; staging
+         * this payload ASCENDED would consume the very runs that create is
+         * about to be handed, and the destination would land a
+         * payload-length past the staged bases — the placement gate's
+         * "fresh environment landed off the staged bases" refusal, caught
+         * live on the 2-node TCG cluster (2026-10-13) and invisible to host
+         * tests, whose two simulated nodes share one allocator history.
+         * Top-down staging leaves the watermark exactly where the source's
+         * was, so the destination reproduces the recorded bases. Same
+         * quota/owner/usage accounting; the drop frees them like any frame. */
+        void* frame = allocate_physical_ram_frame_for_partition_top(s->partition_id);
         if (!frame) return 1;
         s->pages[page_index] = (uint8_t*)frame;
     }
@@ -697,6 +738,21 @@ int env_migrate_restore(uint32_t partition_id, uint32_t index) {
         if (!fr || fr->frames != staged.regions[r].frames || fr->base != staged.regions[r].base) {
             refuse_code = ENV_MIGRATE_REFUSE_PLACEMENT;
             refuse_a    = staged.regions[r].kind;
+            /* Name both halves: the status says WHICH rule fired but not
+             * the delta, and on a live cluster the delta is the whole
+             * diagnosis (a payload-length shift is the staging watermark;
+             * anything else is a different divergence between the nodes'
+             * allocation histories). */
+            kernel_serial_printf(
+                "[ENV_MIGRATE] restore (partition %u, index %u): region kind %u: "
+                "staged base 0x%llx frames %u, fresh base 0x%llx frames %u%s\n",
+                (unsigned)partition_id, (unsigned)index,
+                (unsigned)staged.regions[r].kind,
+                (unsigned long long)staged.regions[r].base,
+                (unsigned)staged.regions[r].frames,
+                (unsigned long long)(fr ? fr->base : 0ull),
+                (unsigned)(fr ? fr->frames : 0u),
+                fr ? "" : " (no fresh region of this kind)");
             break;
         }
     }
@@ -874,6 +930,26 @@ uint32_t env_migrate_pending_count(void) {
     return n;
 }
 
+/* The failover deferral gate — see env_migrate.h for why a
+ * migration-produced silence is not a death and how each grace below is
+ * bounded (slot age, post-drop tail, the confirmation walk's tries cap), so
+ * a migration that genuinely wedges re-arms death detection instead of
+ * disabling it. */
+int env_migrate_in_flight(void) {
+    for (int i = 0; i < ENV_MIGRATE_STAGING_MAX; i++) {
+        const struct EnvMigrateSlot* s = &env_migrate_staging[i];
+        if (!s->active) continue;
+        if (kernel_tick_counter - s->opened_tick < ENV_MIGRATE_SLOT_GRACE_TICKS)
+            return 1;
+    }
+    if (env_migrate_resolved_tick != 0 &&
+        kernel_tick_counter - env_migrate_resolved_tick <
+            ENV_MIGRATE_RESOLVED_GRACE_TICKS)
+        return 1;
+    if (env_migrate_pending_count() > 0) return 1;
+    return 0;
+}
+
 static struct EnvMigrateConfirm*
 env_migrate_confirm_find(uint32_t partition_id, uint32_t index) {
     for (uint32_t i = 0; i < ENV_MIGRATE_CONFIRM_MAX; i++) {
@@ -928,6 +1004,14 @@ static void env_migrate_arm_confirms(uint32_t partition_id, uint32_t dest_node_i
 }
 
 static void env_migrate_confirm_disarm(struct EnvMigrateConfirm* c) {
+    /* Every caller is a terminal walk end — confirmed and torn down, the
+     * partition gone, ownership back, or the bounded give-up. The walk was
+     * this node's in-flight migration work, and its counterparty's sweep
+     * may just have been blocked behind the same restore and only now be
+     * resuming heartbeats: start the resolved tail so that silence is not
+     * declared a death (live 2026-10-13: the source declared the live
+     * destination DEAD a beat after its own teardown completed). */
+    env_migrate_resolved_tick = kernel_tick_counter;
     c->active        = 0;
     c->confirmed     = 0;
     c->tries         = 0;
@@ -996,6 +1080,7 @@ void env_migrate_reset(void) {
     }
     env_migrate_restored_count = 0;
     env_migrate_restored_next  = 0;
+    env_migrate_resolved_tick = 0;    /* a phase boundary is not a migration */
 }
 
 /* ─── The sweep's driver ────────────────────────────────────────────────────

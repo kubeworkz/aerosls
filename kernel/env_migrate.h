@@ -301,6 +301,39 @@ uint32_t env_migrate_tick(uint64_t now);
  * confirmation that never arrives must be countable, not suspected). */
 uint32_t env_migrate_pending_count(void);
 
+/* 1 while this node's environment-migration work may be blocking its OWN
+ * BSP sweep — and therefore its consensus-heartbeat transmit — or is
+ * waiting on a counterparty doing exactly that. True while: a staging slot
+ * is young (being received, or — a COMPLETE one — being restored: the
+ * create round trip and the parked-posture wait both run on the sweep),
+ * and while a teardown confirmation is armed (the payload crossed, the
+ * destination's word has not come back).
+ *
+ * The one caller is failover_tick(): the live 2-node TCG run (2026-10-13)
+ * showed BOTH nodes declaring the other DEAD over migration-produced
+ * silence (300+ ticks each side) and BOTH adopting the partition — which
+ * flipped ownership back onto the sender and correctly stopped the
+ * confirmation teardown ("this node owns the partition again"). A silence
+ * this function covers is not a death; a real one is declared the moment
+ * the migration resolves, because every input is bounded below. */
+int env_migrate_in_flight(void);
+
+/* The deferral's bounds. A staging slot defers death detection for at most
+ * SLOT_GRACE after its BEGIN — the restore's attempt budget (tries x
+ * (create RTT + the 30 s parked-posture wait)) with room for a slow TCG
+ * pour. A migration's RESOLUTION also keeps a tail: both points where a
+ * migration ends on this node — the destination's slot drop (the SOURCE's
+ * confirmation walk, its LIVE polls and destroy round trip, can block the
+ * source's own sweep for seconds AFTER the drop) and the source's own
+ * confirmation disarm (its walk finished while the destination's sweep may
+ * still be resuming from the restore) — set one shared RESOLVED tail.
+ * Without it the live 2-node runs of 2026-10-13 declared a live
+ * counterparty DEAD and adopted it (the destination after the drop, the
+ * source after its walk completed) — a false positive that survived every
+ * gate the confirmation guard itself checks. */
+#define ENV_MIGRATE_SLOT_GRACE_TICKS        60000ull  /* 600 s at ~100 Hz */
+#define ENV_MIGRATE_RESOLVED_GRACE_TICKS     30000ull  /* 300 s */
+
 /* Wire entries (called only by net/dspp.c's dispatch). live_query is the
  * destination's answer: 0 only when THIS node owns the partition, the
  * environment's record is live here, and it was restored WITH ITS CONTENTS

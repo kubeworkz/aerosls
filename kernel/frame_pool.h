@@ -180,6 +180,23 @@ void *allocate_physical_ram_frame(void);
  * and increments partition_id's usage counter on success. */
 void *allocate_physical_ram_frame_for_partition(uint32_t partition_id);
 
+/* The migrate receive side's staging frames: the SAME quota-checked,
+ * owner-tagged, usage-counted allocation as its sibling above, but scanned
+ * from the TOP of the pool DOWN. Placement on this OS is a deterministic
+ * function of the ASCENDING watermark (both allocators scan up, so a fresh
+ * environment's regions land at the first free run after everything so far
+ * — the boot replay's placement contract), and a receive side that staged
+ * the incoming payload ASCENDING shifted that watermark before the
+ * restore's create ran: the destination landed a payload-length past the
+ * recorded bases and the placement gate refused ("fresh environment landed
+ * off the staged bases", live 2-node TCG cluster, 2026-10-13 — invisible to
+ * host tests, whose two nodes share one allocator history). Staging from
+ * the top leaves the watermark untouched, so the destination's first-fit
+ * reproduces the source's bases. Use it for bytes held TEMPORARILY while
+ * somebody else's deterministic placement must not notice them; an
+ * allocation whose own ADDRESS is its contract stays on the ascending path. */
+void *allocate_physical_ram_frame_for_partition_top(uint32_t partition_id);
+
 /* POSIX-Environments E3: allocate a run of `nframes` CONTIGUOUS physical
  * frames, charged to `partition_id`, aligned to `align_frames` (a power of
  * two, in frames; 1 = any boundary). Returns the base PHYSICAL address, or 0

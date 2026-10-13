@@ -153,6 +153,12 @@ void* allocate_physical_ram_frame_for_partition(uint32_t partition_id) {
     memset(p, 0, FRAME_SIZE);
     return p;
 }
+/* The staging side now takes its frames top-down (frame_pool.h): same fake
+ * allocator here — the host test has no watermark to preserve, only bytes
+ * to hold. */
+void* allocate_physical_ram_frame_for_partition_top(uint32_t partition_id) {
+    return allocate_physical_ram_frame_for_partition(partition_id);
+}
 int free_physical_ram_frame_for_partition(void* frame, uint32_t partition_id) {
     (void)partition_id;
     free(frame);
@@ -764,6 +770,8 @@ int main(void) {
         CHECK(st && st->pages_staged == 0 && st->complete == 0,
               "...with no page yet -- a slot is not complete until one has landed");
         CHECK(env_migrate_staging_count() == 1, "exactly one staging slot is live");
+        CHECK(env_migrate_in_flight() == 1,
+              "*** in_flight: a live staging slot defers failover's death detection ***");
     }
 
     /* Three of page 0's four fragments, and no more. The receiver's whole
@@ -834,6 +842,18 @@ int main(void) {
     CHECK(env_migrate_recv_drop(SRC_PARTITION, SRC_INDEX) == 1, "dropping it a second time reports there was none");
     CHECK(env_migrate_staging_count() == 0, "and the staging table is empty again -- no frame leak");
     CHECK(env_migrate_recv_find(SRC_PARTITION, SRC_INDEX) == 0, "a dropped slot is not handed out");
+    /* The failover deferral's two other faces: the RESOLVED tail keeps the
+     * gate closed after this slot's drop — the source's confirmation walk
+     * outlives it — and the tail is BOUNDED — past it the gate re-arms so a
+     * genuinely dead peer is still declared (without the tail the live
+     * 2-node run's destination declared that live source DEAD and adopted,
+     * 2026-10-13). The same tail is set again by the source's own disarm,
+     * pinned in Phase H4. */
+    CHECK(env_migrate_in_flight() == 1,
+          "*** in_flight: a just-dropped slot keeps the resolved tail (the source's confirmation walk outlives it) ***");
+    kernel_tick_counter += ENV_MIGRATE_RESOLVED_GRACE_TICKS + 1;
+    CHECK(env_migrate_in_flight() == 0,
+          "...and the grace is bounded: past the resolved tail the gate re-arms death detection");
 
     /* ═══ Phase C: refusals and retransmission, against the real sender ══ */
     printf("\n-- Phase C: loss and refusal leave the source alone --\n");
@@ -1848,6 +1868,16 @@ int main(void) {
             CHECK(env_ckpt_find(100, 0) == 0 && env_migrate_pending_count() == 0,
                   "*** ...its record is gone and no confirmation is pending: nothing "
                   "on this node describes it anymore ***");
+            /* The disarm that just ran is the source's resolution point:
+             * with the record and confirmation both gone, the ONLY thing
+             * that can still hold the failover gate closed is the resolved
+             * tail this disarm started. (Without it the live 2-node run's
+             * source declared the still-blocked destination DEAD one sweep
+             * after this teardown completed and adopted it, 2026-10-13.) */
+            CHECK(env_migrate_staging_count() == 0 && env_migrate_in_flight() == 1,
+                  "*** in_flight: a finished confirmation walk keeps the resolved tail "
+                  "-- its counterparty's sweep may still be resuming, and that silence "
+                  "is not a death ***");
             CHECK(g_reclaim_calls == reclaim_before + 1 &&
                   g_reclaim_last_arg == 100,
                   "*** and the deferred reclamation completes on the LAST "

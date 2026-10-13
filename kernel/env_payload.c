@@ -41,6 +41,7 @@
 #include "../drivers/nvme_io.h"
 #include "kernel_io.h"
 #include "timer.h"          /* kernel_tick_counter */
+#include "smp.h"            /* smp_uniprocessor_tick() — the wait's own service pump */
 
 /* USER_PROC_CODE_BASE — cap.c's literal for the image/stack window. Kept
  * as a local mirror; tests/env_checkpoint_restore_check.sh pins it against
@@ -645,10 +646,29 @@ int env_payload_wait_parked(const struct EnvCkptRecord* rec) {
             kernel_serial_printf(
                 "[ENV_PAYLOAD] wait timed out (partition=%u index=%u): "
                 "announced=%d — proceeding on the posture as it stands\n",
-                (unsigned)rec->partition_id, (unsigned)rec->index,
+                (unsigned)rec->partition_id,
+                (unsigned)rec->index,
                 env_console_identity_seen(rec->partition_id, rec->index));
             return 0;
         }
+        /* Keep the kernel's periodic service work ticking while we wait, then
+         * hand the CPU to Ring-3 — the same pair env_service_rpc's wait loop
+         * makes (env_service.c), for the same reason.
+         *
+         * On a uniprocessor boot (QEMU -smp 1: no AP answers the SIPI, and
+         * that is the cluster's default) microkernel_service_poll() — and
+         * with it env_console_tick(), the drain that reads the sidecar's own
+         * bytes into the registry and sets the identity flag the check above
+         * reads — runs ONLY from smp_uniprocessor_tick(), which nothing in
+         * this loop otherwise calls. Without the call this wait starves its
+         * own predicate: the fresh sidecar boots (its [POSIX] lines land in
+         * the log), writes [env-id] into its console channel, and the bytes
+         * sit undrained until the deadline. Caught live on the 2-node TCG
+         * cluster: `[ENV_PAYLOAD] wait timed out ... announced=0` followed by
+         * the restore's REFUSE_PARKED, with the sidecar's boot complete in
+         * the same log. A no-op once an AP is online: the AP's own loop polls
+         * microkernel_service_poll() every tick. */
+        smp_uniprocessor_tick();
         kernel_yield_to_ring3(50);
     }
 }
