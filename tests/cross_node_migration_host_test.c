@@ -91,6 +91,20 @@ int env_migrate_recv_page(uint64_t transfer_id, uint32_t page_index,
     return 1;
 }
 
+/* POSIX-Environments P3 increment 5: the confirmation pair. Same choice,
+ * same reason: this test never sends LIVE_REQ/LIVE_ACK (22–23), so these
+ * are not reached; were one to arrive, "not live" (1) is the honest answer
+ * for a node that restored nothing, and "nothing pending" (1) for its ACK.
+ * Real coverage: tests/env_migrate_host_test.c, Phase H. */
+int env_migrate_live_query(uint32_t partition_id, uint32_t index) {
+    (void)partition_id; (void)index;
+    return 1;
+}
+int env_migrate_live_ack(uint32_t partition_id, uint32_t index, uint32_t status) {
+    (void)partition_id; (void)index; (void)status;
+    return 1;
+}
+
 
 static int checks_passed = 0;
 static int checks_failed = 0;

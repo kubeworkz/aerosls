@@ -584,6 +584,27 @@ void dspp_env_migrate_send_frag(uint64_t transfer_id, uint32_t node_dest_id,
     dspp_transmit_raw(&pkt, (uint16_t)sizeof(pkt));
 }
 
+/* P3 increment 5: the source's confirmation poll. Header-only, like the
+ * ACKs below — there are no bytes to move, only a question, and the answer
+ * arrives as a LIVE_ACK routed to env_migrate_live_ack(). */
+void dspp_env_migrate_send_live(uint64_t transfer_id, uint32_t node_dest_id,
+                                uint32_t partition_id, uint32_t env_index) {
+    struct DSPPEnvMigrateHeader pkt;
+    pkt.magic           = DSPP_MIGRATE_MAGIC;
+    pkt.opcode          = DSPP_MIGRATE_ENV_LIVE_REQ;
+    pkt.node_source_id  = (uint16_t)cluster_local_node_id();
+    pkt.node_dest_id    = node_dest_id;
+    pkt.transfer_id     = transfer_id;
+    pkt.partition_id    = partition_id;
+    pkt.page_index      = 0;
+    pkt.status          = 0;
+    pkt.env_index       = env_index;
+    pkt.total_pages     = 0;
+    pkt.record_len      = 0;
+    pkt.frag_index      = 0;
+    dspp_transmit_raw(&pkt, (uint16_t)sizeof(pkt));
+}
+
 static void dspp_env_migrate_send_ack(uint16_t opcode, uint32_t reply_to_node,
                                       uint64_t transfer_id, uint32_t partition_id,
                                       uint32_t env_index, uint32_t page_index,
@@ -635,6 +656,27 @@ void dspp_env_migrate_rx(void* buf, uint16_t len) {
                                   h->transfer_id, h->partition_id, h->env_index,
                                   h->page_index, h->frag_index,
                                   (uint8_t)(rc == 0 ? 0 : 1));
+        return;
+    }
+
+    /* P3 increment 5, destination half: the source asked whether the
+     * environment is live here WITH ITS CONTENTS. The answer is read from
+     * env_migrate.c's own state (never from this packet), so a stale or
+     * replayed question can only ever produce the honest answer for today. */
+    if (h->opcode == DSPP_MIGRATE_ENV_LIVE_REQ) {
+        int rc = env_migrate_live_query(h->partition_id, h->env_index);
+        dspp_env_migrate_send_ack(DSPP_MIGRATE_ENV_LIVE_ACK, h->node_source_id,
+                                  h->transfer_id, h->partition_id, h->env_index,
+                                  0, 0, (uint8_t)(rc == 0 ? 0 : 1));
+        return;
+    }
+
+    /* P3 increment 5, source half: the destination's answer. Deliberately
+     * NOT note_ack's outstanding record — the poll is fire-and-forget on a
+     * period, so there is no single synchronous waiter whose transfer_id it
+     * belongs to; the answer lands on the confirmation entry by identity. */
+    if (h->opcode == DSPP_MIGRATE_ENV_LIVE_ACK) {
+        env_migrate_live_ack(h->partition_id, h->env_index, h->status);
         return;
     }
 
@@ -1031,7 +1073,7 @@ void dspp_rx_dispatch(void* buf, uint16_t len) {
             return;
         }
 
-        if (opcode >= DSPP_MIGRATE_ENV_BEGIN_REQ && opcode <= DSPP_MIGRATE_ENV_PAGE_ACK) {
+        if (opcode >= DSPP_MIGRATE_ENV_BEGIN_REQ && opcode <= DSPP_MIGRATE_ENV_LIVE_ACK) {
             dspp_env_migrate_rx(buf, len);   /* length checks live inside */
             return;
         }

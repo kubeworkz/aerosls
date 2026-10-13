@@ -1669,7 +1669,8 @@ test is environment-shaped.
   *counting* stub in `partition_migrate_default_path_host_test.c` — the default
   path asserts the step never runs, rather than assuming it.
 - **Deliberately NOT here, each its own increment:** the source environment's
-  teardown and the destination's restore (increment 4). On success the source's
+  teardown (still open) and the destination's restore (landed as increment 4,
+  addendum below). On success the source's
   records still describe environments that have moved and
   `partition_reclaim_all_frames()` still reclaims the partition's frames as it
   did before this increment — the roadmap's own "orphaned or destroyed by
@@ -1702,6 +1703,174 @@ its new dependency; and both orchestration tests still *assert* what they own.
 `ownership-first` (the step moved after the handoff), the neutered abort (the
 live-cluster defect verbatim), the never-released freeze (the leak-unpause
 shape), and the vacuity control on the untouched tree.
+
+### Findings addendum — what landed, increment 4 (the destination's second act)
+
+Increment 3 sent the bytes; this one brings them back to life. A complete
+staging slot now becomes a **live environment** on the node that owns the
+partition — `env_migrate_restore(partition_id, index)` in `kernel/env_migrate.c`,
+driven by a new `env_migrate_tick()` on the BSP sweep in `net/http.c` (with the
+heartbeat and checkpoint broadcast: it TRANSMITS nothing itself, but it calls
+`env_service_create`, and only one core may run a create). The order is the
+boot replay's own — resume → create → identity → settle → wait-parked →
+repause → pour — with the bytes sourced from the staging slot instead of NVMe,
+and one gate the boot pass never needs:
+
+- **Ownership gates the create, before it.** `partition_get_owner_node() !=
+  cluster_local_node_id()` refuses `NOT_OWNER` before a single record is
+  stored: a follower rebuilding an environment for a partition served
+  elsewhere would be a second, unaccounted tenant charging its frames — the
+  mirror image of increment 3's "ownership must not move before the payload".
+  One gate, before the side effects, so the refusal costs nothing.
+- **The slot-retention rule, stated once and obeyed by every refusal.** The
+  staged slot is **kept** while the state is exactly what it was before the
+  attempt (nothing stored, nothing created — a retry can succeed where this
+  attempt could not) and **dropped the moment the environment exists** (a pour
+  refusal leaves the empty replay standing; retrying a pour into a live
+  environment would double-create). `env_migrate_recv_drop()` is the last thing
+  a successful restore does and the last thing an unappliable refusal does —
+  never the first. Finding: the NVMe-extent write is the sharp edge — the
+  environment is live and its memory holds the contents when the durable half
+  fails, so the slot is dropped *not* retried (a retry would re-run the CREATE
+  that now collides), and the refusal names the IO.
+- **A return migration is handled, not dodged.** This node already holding an
+  environment at that identity means the source-teardown half (increment 3's
+  named gap) has not landed: the staged bytes just crossed WITH ownership
+  returned, so the local instance is the stale one — it is ended and what
+  crossed is rebuilt, over a `NOENT`-as-good destroy.
+- **Placement is validated WHOLE before a byte.** Every staged region must
+  land at the base the staged record names and the durable extents must agree:
+  the sidecars' MEM regions are identity-mapped and their heaps hold RAW
+  POINTERS into them, so a fresh environment that landed anywhere else could
+  not receive these bytes without every interior pointer dangling silently.
+  Finding — the pause dance had to be *straight-line*: E4's placement gate
+  refuses a paused target, so a record recorded as paused is resumed for the
+  length of the create and put back by the ledger, and between the first
+  resume and the repause there is **no `return`** — a bail there would leave a
+  partition the record said was frozen RUNNING.
+- **The record's PAUSED flag is honoured.** A successful migration always
+  leaves its partition paused (resume happens over here, by an operator, after
+  the bytes landed) — `ENV_CKPT_FLAG_PARTITION_PAUSED` crossed the wire for
+  exactly this and now gates a `partition_pause()` on the destination.
+- **Finding — a live environment at the identity changes the gate's meaning.**
+  `env_ckpt_restore_pending_record()` (increment 3's gate) now has a second
+  caller: the restore's own stale-instance check must ask whether this boot
+  still OWES the record a replay before treating it as a live environment to
+  end. One gate, two questions — "may these bytes be read" at the wire and
+  "does something already live here" at the create.
+- **Deliberately NOT here:** the source's teardown. Increment 3's boundary is
+  unchanged — the source's records still describe an environment that has
+  moved, and this increment's return-migration path is what makes that
+  observation safe rather than silently fixed.
+
+Proven by: `tests/env_migrate_host_test.c` **Phase G (59 new checks, 193
+total)** against the real staging table, the real record layer and the real NVMe
+fake — the happy path pouring every region byte-for-byte and dropping the slot;
+every refusal checked for BOTH halves of the retention rule (kept where a retry
+could succeed, dropped where the environment exists); placement and extent
+mismatches refused before a byte; the identity mismatch ending what the create
+made; the attempts cap actually bounding the sweep; and the PAUSED flag pausing
+the destination's partition.
+
+**The guard, and its teeth.** `tests/env_migration_check.sh` grows from ten
+clauses to **eighteen (A–R)**: the restore is driven by the BSP sweep; the
+ownership gate precedes the create; both pre-create refusal paths drop the
+stored record while the slot survives them; the placement rule is decided
+before the first byte of the pour; the PAUSED flag gates the pause; the sweep's
+retry is bounded (period, cap, cap actually checked); and the host test still
+drives both the restore and its sweep. `tests/env_migration_check_smoke.sh`
+proves all eighteen bite — **20 teeth**, including the worth-stating pair
+`L` (the ownership gate moved after the create — a follower rebuilds someone
+else's tenant) and `N` (a pre-create refusal releasing the staged slot — bytes
+a retry could still have used), plus the vacuity control. Finding: tooth H's
+mutation had to widen from the send-side gate call to *every* call — the
+restore added a second call site, and a tooth that left any one in place left
+clause H green and proved nothing.
+
+### Findings addendum — what landed, increment 5 (the destination's word, then the teardown)
+
+The boundary increments 3 and 4 both named is now closed, and closed
+**gated**: the source tears its half of a migrated environment down only on
+the destination's own word that it is live with its contents there — never
+on the bytes having been sent. One sentence governs the whole increment:
+**no record may describe an environment that moved.**
+
+- **The pull, not a push.** `DSPP_MIGRATE_ENV_LIVE_REQ`/`LIVE_ACK`
+  (opcodes 22/23, `net/dspp.h`/`net/dspp.c`) — a header-only question the
+  source asks on the sweep's period, a header-only answer the destination
+  gives from its own state. A lost question or a lost answer is recovered
+  by the next period; nothing blocks, nothing is assumed.
+- **The word is grounded in a marker set exactly once.**
+  `env_migrate_live_query()` answers live only when this node owns the
+  partition, the record stands here, its restore has settled, AND the
+  pour's success tail set the restored marker — one line, the only one.
+  Staged is not restored: confirming from a completed slot would have the
+  source destroy the only complete copy. A refused pour leaves a record
+  behind and can never confirm anything.
+- **Arming is per environment, at the end of a fully-confirmed send.**
+  `env_migrate_partition()` arms one confirmation per environment after
+  every payload crossed (partial steps are aborts, and aborts arm nothing —
+  their environments are still here, so their records must stay). Entries
+  disarm themselves when ownership comes back locally (aborted handoff, a
+  return) or when the partition no longer exists (that partition's own
+  teardown owns its records and frames). A full confirmation table leaves
+  the un-armed environment's records standing, named in the log — every
+  overflow degrades toward records that describe a moved environment
+  (countable, an operator's to finish), never toward a teardown without the
+  destination's word.
+- **The teardown runs by name, bounded, with `NOENT` as good.** The
+  confirmed branch calls `env_service_destroy()`; the destroy path's own
+  bookkeeping drops the record (exactly like the HTTP destroy route), a
+  `NOENT` answers just as well (the record outlived its environment — drop
+  it), and no-reply or a refusal keeps the record with at most five
+  attempts before the sweep stops. An environment whose fate is unknown is
+  **described, not forgotten** — and countable:
+  `env_migrate_pending_count()` is the same contract
+  `env_migrate_staging_count()` gives the staging table.
+- **The frames wait for the records.** partition.c's Step 5 reclamation is
+  deferred while `envs_moved > 0`: the source's environments' sidecars are
+  still running on exactly those frames, and reclaiming first would put two
+  owners on one frame — the defect this increment exists to remove,
+  reproduced in miniature. The confirmation walk completes the
+  reclamation when the partition's LAST record leaves this node's books,
+  gated on a records-remain check so a never-armed or never-succeeded
+  sibling keeps its frames with its record. Finding: the walk shares the
+  restore loop's period deliberately — one node can be both roles in the
+  same sweep (a partition migrating out while another arrives).
+- **Finding — the reset clears BOTH tables.** A pending confirmation (or a
+  restored marker) surviving `env_migrate_reset()` could let a later walk
+  tear down an environment nothing ever sent in this boot — the defect in
+  miniature, on the test's own seam.
+- **Deliberately NOT here:** the live-cluster arm — a real two-node run of
+  the confirmation and the teardown — which needs a running cluster, same
+  honesty as increments 3 and 4's live clauses.
+
+Proven by: `tests/env_migrate_host_test.c` **Phase H (45 new checks, 238
+total)**. The destination half: a record alone, a partition owned
+elsewhere, a staged slot, a real restore, an unsettled restore and a gone
+instance — each answered not-live except the restore. The source half: a
+refused send arms nothing; a success arms exactly one per environment;
+"not yet" keeps the record; the word ends THAT environment by name with
+its unconfirmed sibling intact; ownership returning disarms without a
+destroy; the completion reclaims exactly once, for that partition, after
+the last record; a vanished partition ends its entry; 60 polls then stop;
+5 destroy attempts then stop with the record still standing and countable.
+
+**The guard, and its teeth.** `tests/env_migration_check.sh` grows from
+eighteen clauses to **twenty-five (A–Y)**: the confirmation pair wired end
+to end; the restored marker set exactly once; the teardown gated (the
+not-confirmed branch before `env_service_destroy()`, local ownership
+disarming); the arm exactly once with pending confirmations countable; the
+reclamation deferred and completed behind the records-remain gate; every
+`net/dspp.c`-linking host test standing in for the new pair (clause I's
+link class, for dspp.c); and the host test still driving the confirmation.
+`tests/env_migration_check_smoke.sh` proves all **25 teeth** bite, including
+the worth-stating `U` (the not-confirmed gate deleted — a teardown
+reachable on the arm alone, this increment's defect verbatim), plus the
+vacuity control. Finding: tooth S's first draft had the guard matching the
+function NAME in `dspp.c` — and `dspp.c`'s own comments mention it, so the
+guard reddened on nothing; the clause now names the call with its
+arguments, and comments are not wiring.
 
 ---
 

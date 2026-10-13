@@ -74,6 +74,18 @@
  * freeze → send → thaw step, against the real sender and the real wire —
  * which is what partition.c's single call resolves to.
  *
+ * Phase H -- the confirmation and the gated teardown (P3 increment 5).
+ * Two halves. The DESTINATION half proves what a LIVE_ACK is grounded in:
+ * env_migrate_live_query reads this node's own state -- a record alone is
+ * not a restoration, staged bytes are not a pour, an unsettled restore is
+ * not live. The SOURCE half runs the real env_migrate_partition() (which
+ * arms one teardown confirmation per environment) and then the real sweep:
+ * every gate that must keep the records -- a refused send, a not-yet
+ * answer, ownership coming back, a partition that vanished, a destination
+ * that never replies, a teardown that cannot complete -- the one gate that
+ * destroys BY NAME on the destination's word, and the deferred frame
+ * reclamation that completes only when the last record is gone.
+ *
  * Build and run:
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I drivers -I net -I user \
  *       -o /tmp/env_migrate_host_test \
@@ -85,6 +97,9 @@
 #include "kernel/simi_ctx_migrate.h"
 #include "kernel/env_ckpt.h"
 #include "kernel/env_migrate.h"
+#include "kernel/env_proto.h"        /* ENV_OK / ENV_ERR_* -- the create round trip's answer */
+#include "kernel/env_service.h"      /* env_service_create()/destroy() prototypes (Phase G) */
+#include "kernel/env_payload.h"      /* env_payload_wait_parked() prototype (Phase G) */
 #include "kernel/checkpoint_delta.h"   /* ckpt_mark_dirty, CKPT_REGION_ENV */
 #include "kernel/env_storage.h"        /* env_storage_extent_of stub */
 #include "kernel/frame_pool.h"
@@ -254,12 +269,19 @@ static int  loss_page = -1, loss_frag = 0, loss_times = 0, loss_applied = 0;
 static int  nack_begin = 0, nack_page = 0;
 static int  begin_loss_times = 0, begin_loss_applied = 0;
 static int  begin_ack_count = 0, page_ack_count = 0;
+/* P3 increment 5: LIVE_REQs are fire-and-forget polls -- the source never
+ * waits inside the transmit, so the peer deliberately does NOT answer them
+ * (each test delivers its own LIVE_ACK through the real dispatch instead).
+ * This counts what actually went on the wire, which is how "polled, but
+ * torn down anyway" is distinguished from "never asked". */
+static int  live_req_count = 0;
 
 static void peer_reset(void) {
     loss_page = -1; loss_frag = 0; loss_times = 0; loss_applied = 0;
     nack_begin = 0; nack_page = 0;
     begin_loss_times = 0; begin_loss_applied = 0;
     begin_ack_count = 0; page_ack_count = 0;
+    live_req_count = 0;
 }
 
 void e1000_transmit(NicRole role, void* buf, uint16_t size) {
@@ -278,6 +300,11 @@ void e1000_transmit(NicRole role, void* buf, uint16_t size) {
         (struct DSPPEnvMigrateHeader*)((uint8_t*)buf + ETH_HDR_LEN);
     if (h->magic != DSPP_MIGRATE_MAGIC) return;
 
+    if (h->opcode == DSPP_MIGRATE_ENV_LIVE_REQ) {
+        live_req_count++;   /* counted, never answered: the poll's answer is
+                             * delivered by the test through the real rx path */
+        return;
+    }
     if (h->opcode == DSPP_MIGRATE_ENV_BEGIN_REQ) {
         if (nack_begin) {
             dspp_migrate_note_ack(h->transfer_id, DSPP_MIGRATE_ENV_BEGIN_ACK, 0, 0, 1);
@@ -427,6 +454,193 @@ static int source_is_intact(void) {
 /* The staged page `p` on the receiving side, if it landed. */
 static const uint8_t* staged_page(uint32_t p) {
     return env_migrate_recv_page_ptr(SRC_PARTITION, SRC_INDEX, p);
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+ * Phase G stand-ins (P3 increment 4: the restore). env_service.c and
+ * env_payload.c are deliberately NOT linked: what the restore must prove is
+ * its ORDER and its byte discipline against the real staging table, the real
+ * record layer and the real NVMe fake — the create round trip itself is
+ * init's half and is exercised live by tests/env_checkpoint_restore_check.sh
+ * (the same split the boot replay's host coverage already makes).
+ * ════════════════════════════════════════════════════════════════════ */
+static uint32_t g_fake_owner_node = 1;
+uint32_t partition_get_owner_node(uint32_t partition_id) {
+    (void)partition_id; return g_fake_owner_node;
+}
+
+/* P3 increment 5: the deferred reclamation the confirmation walk runs when
+ * the partition's LAST record leaves this node's books. frame_pool.c is not
+ * linked here (the per-frame bitmap's own coverage is
+ * tests/frame_quota_host_test.c), so this counts calls and arguments -- the
+ * scheduler_fairness / partition_migrate phase6 technique: orchestration
+ * proven here, frame mechanics proven there. */
+static int      g_reclaim_calls = 0;
+static uint32_t g_reclaim_last_arg = 0xFFFFFFFFu;
+uint32_t partition_reclaim_all_frames(uint32_t partition_id) {
+    g_reclaim_calls++;
+    g_reclaim_last_arg = partition_id;
+    return 0;
+}
+
+static int      g_create_rc = 0;              /* -1 = the channel never answered */
+static uint16_t g_create_status = ENV_OK;     /* the ENV_* status the create reports */
+static uint32_t g_create_env_id = 500;
+static int      g_create_calls = 0;
+static struct EnvCkptRecord g_create_record;  /* what "init" registers on a successful create */
+
+int env_service_create(uint32_t partition, uint32_t index,
+                       uint16_t* out_status, uint32_t* out_env_id) {
+    g_create_calls++;
+    if (out_status) *out_status = g_create_status;
+    if (out_env_id) *out_env_id = g_create_env_id;
+    if (g_create_rc != 0) return g_create_rc;
+    /* The real create's ENV_REGISTER ends in env_ckpt_record(); this stub
+     * does the same with the test's fresh-environment record, whose bases
+     * are the DESTINATION's placement. */
+    g_create_record.partition_id = partition;
+    g_create_record.index        = index;
+    g_create_record.env_id       = g_create_env_id;
+    (void)env_ckpt_record(&g_create_record);
+    return 0;
+}
+
+static int      g_destroy_calls = 0;
+static uint32_t g_destroy_env_id = 0;
+static int      g_destroy_rc = 0;   /* P3 increment 5: -1 models a channel
+                                     * that never answers -- no reply, no
+                                     * side effects, exactly what a dead
+                                     * init leaves behind */
+int env_service_destroy(uint32_t env_id, uint32_t partition,
+                        uint16_t* out_status, uint32_t* out_env_id,
+                        uint32_t* out_partition) {
+    g_destroy_calls++;
+    g_destroy_env_id = env_id;
+    if (g_destroy_rc != 0) return g_destroy_rc;
+    if (out_status)   *out_status   = ENV_OK;
+    if (out_env_id)   *out_env_id   = env_id;
+    if (out_partition)*out_partition= partition;
+    /* The real ENV_DESTROY path tells the checkpoint the environment is gone
+     * (env_service.c calls env_ckpt_drop_env), so a later store upserts onto
+     * a clean identity -- exactly what a return migration needs. */
+    (void)env_ckpt_drop_env(partition, env_id);
+    return 0;
+}
+
+static int g_parked = 1;
+int env_payload_wait_parked(const struct EnvCkptRecord* rec) {
+    (void)rec; return g_parked;
+}
+
+/* ── Phase G's own world: the destination's regions and pages ──────────
+ * The staged record names the bases the payload crossed FOR (the placement
+ * both kernels must agree on); the fake create registers the destination's
+ * freshly allocated regions. The happy path uses the same buffers for both
+ * (placement matched); the placement-refusal case deliberately splits them. */
+#define G_PART 91u
+static uint8_t g_live_r0[2][4096] __attribute__((aligned(4096)));
+static uint8_t g_live_r1[1][4096] __attribute__((aligned(4096)));
+static uint8_t g_live_r2[1][4096] __attribute__((aligned(4096)));
+static uint8_t g_other_r0[2][4096] __attribute__((aligned(4096)));
+static uint8_t g_other_r1[1][4096] __attribute__((aligned(4096)));
+static uint8_t g_other_r2[1][4096] __attribute__((aligned(4096)));
+static uint8_t g_pages[6][4096] __attribute__((aligned(4096)));
+
+#define G_FILLS { 0x31, 0x32, 0x33, 0x34, 0x41, 0x42 }   /* 4 region pages, 2 extent */
+
+/* A record like good_record's, but with settable region bases -- the
+ * placement question every restore case turns on. */
+static struct EnvCkptRecord g_record(uint32_t part, uint32_t idx,
+                                     const void* r0, const void* r1, const void* r2) {
+    struct EnvCkptRecord r = good_record(part, idx);
+    r.regions[0].base = (uint64_t)(uintptr_t)r0;
+    r.regions[1].base = (uint64_t)(uintptr_t)r1;
+    r.regions[2].base = (uint64_t)(uintptr_t)r2;
+    return r;
+}
+
+static void g_fill_pages(void) {
+    const uint8_t fills[6] = G_FILLS;
+    for (uint32_t p = 0; p < 6; p++)
+        for (uint32_t b = 0; b < 4096; b++) g_pages[p][b] = fills[p];
+}
+
+static int g_pages_all(uint32_t p, uint8_t fill) {
+    for (uint32_t b = 0; b < 4096; b++) if (g_pages[p][b] != fill) return 0;
+    return 1;
+}
+
+/* Stage a slot DIRECTLY through the real receive entries. Phase B/F already
+ * proved these are fed faithfully by the wire; here the staging is the
+ * restore's INPUT, not its subject, so fragments are built rather than
+ * captured (the file's Phase E precedent for hand-built frames). */
+static void g_stage(uint32_t part, uint32_t idx, const struct EnvCkptRecord* rec,
+                    uint32_t n_pages) {
+    uint64_t tid = ((uint64_t)part << 32) | (uint64_t)idx;
+    if (env_migrate_recv_begin(tid, part, idx, n_pages, rec,
+                               (uint32_t)sizeof(*rec)) != 0) return;
+    for (uint32_t p = 0; p < n_pages; p++)
+        for (uint32_t f = 0; f < DSPP_MIGRATE_FRAGS_PER_PAGE; f++)
+            (void)env_migrate_recv_page(tid, p, f,
+                                        g_pages[p] + f * DSPP_MIGRATE_FRAG_BYTES);
+}
+
+/* ─── Phase H helpers ────────────────────────────────────────────────────────
+ * h_send_n registers n environments of `part` (create-time records, the
+ * Phase F posture), defines and pauses the partition, and runs the REAL
+ * env_migrate_partition() against the answering peer -- the setup every
+ * confirmation case starts from, so each case's only subject is the
+ * teardown gating itself. Call peer_reset() yourself if a case needs loss
+ * injected (peer_reset() clears the knobs, so it must run before they are
+ * set). Returns the step's own code, or -100 if a record could not even be
+ * registered (a setup failure, not a subject). */
+static int h_send_n(uint32_t part, uint32_t n) {
+    g_fake_local_node_id = 1;   /* the source's identity for every case */
+    g_fake_owner_node    = 1;   /* owned here at send time */
+    for (uint32_t i = 0; i < n; i++) {
+        struct EnvCkptRecord r = good_record(part, i);
+        r.flags = 0;            /* create-time: nothing has ever frozen it */
+        if (env_ckpt_record(&r) != 0) return -100;
+    }
+    host_partition_define(part);
+    partition_pause(part);
+    uint32_t e = 0, m = 0;
+    return env_migrate_partition(part, DST_NODE, &e, &m);
+}
+
+/* Deliver a hand-built LIVE_ACK through the REAL dspp_rx_dispatch -- Phase
+ * E's precedent for frames a correct sender never produces, except these
+ * are normal: the test delivers the destination's answer by hand because
+ * the peer stub deliberately does not answer polls. node_dest_id = 1 is the
+ * source's identity, so the family's self-filter passes exactly as on the
+ * wire. status is the whole answer: 0 = "live with its contents", anything
+ * else = "not yet". */
+static void h_deliver_live_ack(uint32_t part, uint32_t idx, uint8_t status) {
+    struct DSPPEnvMigrateHeader ack;
+    memset(&ack, 0, sizeof ack);
+    ack.magic          = DSPP_MIGRATE_MAGIC;
+    ack.opcode         = DSPP_MIGRATE_ENV_LIVE_ACK;
+    ack.node_source_id = (uint16_t)DST_NODE;
+    ack.node_dest_id   = 1;
+    ack.transfer_id    = ((uint64_t)part << 32) | idx;
+    ack.partition_id   = part;
+    ack.env_index      = idx;
+    ack.status         = status;
+    dspp_rx_dispatch(&ack, (uint16_t)sizeof(ack));
+}
+
+/* Reset the Phase G fakes to their healthy defaults, between cases. */
+static void g_reset_fakes(void) {
+    g_fake_owner_node = 2;        /* the destination identity Phase G runs as */
+    g_create_rc = 0;
+    g_create_status = ENV_OK;
+    g_create_env_id = 500;
+    g_create_calls = 0;
+    g_destroy_calls = 0;
+    g_destroy_env_id = 0;
+    g_destroy_rc = 0;
+    g_parked = 1;
+    memset(&g_create_record, 0, sizeof g_create_record);
 }
 
 int main(void) {
@@ -1080,6 +1294,638 @@ int main(void) {
         partition_resume(f_part);
         CHECK(env_ckpt_count_live() == 0, "teardown: the record table is empty again");
         CHECK(env_migrate_staging_count() == 0, "teardown: and so is the staging table");
+    }
+
+    /* ═══ Phase G: the restore -- a staged slot becomes a live environment ═
+     * P3 increment 4. The wire half (Phases A--E) fills a slot; this phase
+     * proves the destination's second act against the REAL staging table,
+     * the REAL record layer (env_ckpt.c) and the REAL NVMe fake: replay the
+     * staged descriptor through the create path, verify what came back is
+     * what crossed, pour the staged pages into the fresh environment's
+     * regions and durable extent, then drop the slot.
+     *
+     * The order is the subject. Every case below pins one link of it: the
+     * slot-retention rule (kept while the state is pre-attempt, dropped the
+     * moment the environment exists), refusal over partial application (a
+     * create that failed or came back different leaves NOTHING behind), the
+     * placement rule (bytes that crossed for base X may only land at base X
+     * -- the sidecars' heaps hold raw interior pointers into those regions,
+     * exactly env_payload.h's rule, applied to wire-delivered bytes), and
+     * the pour's byte fidelity (the destination holds the source's bytes,
+     * extent included). */
+    printf("\n-- Phase G: staged slot -> live environment (P3 increment 4) --\n");
+    {
+        const uint8_t fills[6] = G_FILLS;
+        uint64_t tid;
+        (void)tid;
+
+        env_ckpt_reset();
+        env_migrate_reset();
+        host_partition_stubs_reset();
+        host_partition_define(G_PART);
+        g_fake_local_node_id = 2;   /* this process IS the destination now */
+        g_reset_fakes();            /* owner = 2: this node owns the partition */
+        g_fill_pages();
+
+        /* ── G1: the happy path -- live, contents poured, slot dropped ──── */
+        {
+            struct EnvCkptRecord staged =
+                g_record(G_PART, 0, g_live_r0, g_live_r1, g_live_r2);
+            staged.flags |= ENV_CKPT_FLAG_PARTITION_PAUSED;  /* the operator's intent, carried across */
+            g_create_record = staged;                 /* placement matched */
+            memset(g_live_r0, 0xAA, sizeof g_live_r0);
+            memset(g_live_r1, 0xAA, sizeof g_live_r1);
+            memset(g_live_r2, 0xAA, sizeof g_live_r2);
+            {   /* the destination's durable extent, before the pour */
+                uint8_t pg[4096]; memset(pg, 0xBB, 4096);
+                nvme_write_sync(STATE_LBA + 0, pg);
+                nvme_write_sync(STATE_LBA + 8, pg);
+            }
+            g_stage(G_PART, 0, &staged, 6);
+            CHECK(env_migrate_staging_count() == 1, "setup: one complete slot staged");
+
+            int rc = env_migrate_restore(G_PART, 0);
+            CHECK(rc == ENV_MIGRATE_OK,
+                  "*** a complete slot for an owned partition becomes a LIVE environment ***");
+            CHECK(env_migrate_last_status() == ENV_MIGRATE_OK,
+                  "...and the status latch says so by name");
+            CHECK(g_pages_all(0, fills[0]) &&
+                  memcmp(g_live_r0[0], g_pages[0], 4096) == 0 &&
+                  memcmp(g_live_r0[1], g_pages[1], 4096) == 0 &&
+                  memcmp(g_live_r1[0], g_pages[2], 4096) == 0 &&
+                  memcmp(g_live_r2[0], g_pages[3], 4096) == 0,
+                  "*** every region page the wire carried is byte-for-byte in the fresh "
+                  "environment's regions ***");
+            {
+                uint8_t pg[4096];
+                CHECK(nvme_read_sync(STATE_LBA + 0, pg) == 0 &&
+                      memcmp(pg, g_pages[4], 4096) == 0 &&
+                      nvme_read_sync(STATE_LBA + 8, pg) == 0 &&
+                      memcmp(pg, g_pages[5], 4096) == 0,
+                      "*** and the durable extent's pages landed at the record's LBA ***");
+            }
+            CHECK(env_migrate_staging_count() == 0,
+                  "*** the staged slot is DROPPED after a successful pour -- the frames "
+                  "go back; the bytes are the environment now, not a copy beside it ***");
+            CHECK(env_ckpt_find(G_PART, 0) && env_ckpt_find(G_PART, 0)->env_id == 500,
+                  "the live record is the FRESH environment's (create's env_id), not the "
+                  "staged descriptor's stale one");
+            CHECK(!env_ckpt_restore_pending_record(G_PART, 0),
+                  "...and this boot does not still owe it a replay");
+            CHECK(host_partition_paused[G_PART] == 1,
+                  "*** the record recorded this partition as paused -- the restore left it "
+                  "PAUSED: resume happens over here, by an operator, after the bytes land ***");
+            CHECK(g_create_calls == 1 && g_destroy_calls == 0,
+                  "exactly one create, no destroy: nothing was torn down to get here");
+        }
+
+        /* ── G2: no slot, and an incomplete one ────────────────────────── */
+        env_ckpt_reset(); env_migrate_reset(); host_partition_stubs_reset();
+        host_partition_define(G_PART); g_fake_local_node_id = 2; g_reset_fakes();
+        {
+            int rc = env_migrate_restore(G_PART, 0);
+            CHECK(rc == ENV_MIGRATE_REFUSE_NO_SLOT,
+                  "*** no staged slot is REFUSED BY NAME, not guessed at ***");
+            CHECK(env_migrate_last_refusal()->code == (uint32_t)rc,
+                  "...and the refusal latch carries the code for a guard to assert");
+
+            struct EnvCkptRecord staged =
+                g_record(G_PART, 0, g_live_r0, g_live_r1, g_live_r2);
+            g_create_record = staged;
+            tid = ((uint64_t)G_PART << 32) | 0;
+            (void)env_migrate_recv_begin(tid, G_PART, 0, 6, &staged,
+                                         (uint32_t)sizeof(staged));
+            rc = env_migrate_restore(G_PART, 0);
+            CHECK(rc == ENV_MIGRATE_REFUSE_INCOMPLETE,
+                  "*** a slot whose pages have not all landed is refused -- a partial "
+                  "environment is not a restored one ***");
+            CHECK(env_migrate_staging_count() == 1,
+                  "...and the slot is KEPT: the bytes may still be arriving");
+            CHECK(g_create_calls == 0, "...and no create was ever attempted for it");
+            env_migrate_reset();
+        }
+
+        /* ── G3: the destination must OWN the partition ────────────────── */
+        {
+            g_fake_owner_node = 1;   /* the partition is served elsewhere */
+            struct EnvCkptRecord staged =
+                g_record(G_PART, 0, g_live_r0, g_live_r1, g_live_r2);
+            g_create_record = staged;
+            g_stage(G_PART, 0, &staged, 6);
+            int rc = env_migrate_restore(G_PART, 0);
+            CHECK(rc == ENV_MIGRATE_REFUSE_NOT_OWNER &&
+                  env_migrate_last_refusal()->a == 0,
+                  "*** a follower that does not own the partition REFUSES to build an "
+                  "environment in it -- the mirror image of the source's ownership rule ***");
+            CHECK(env_migrate_staging_count() == 1 && g_create_calls == 0,
+                  "the slot is kept (the announce may be in flight) and nothing was created");
+            env_migrate_reset();
+            g_fake_owner_node = 2;
+        }
+
+        /* ── G4: the boot replay's admissibility gate, verbatim ────────── */
+        {
+            struct EnvCkptRecord staged =
+                g_record(G_PART, 0, g_live_r0, g_live_r1, g_live_r2);
+            staged.flags = 0;   /* captured while its partition ran -- a moving target */
+            g_create_record = staged;
+            g_stage(G_PART, 0, &staged, 6);
+            int rc = env_migrate_restore(G_PART, 0);
+            CHECK(rc == ENV_MIGRATE_REFUSE_UNQUIESCED,
+                  "*** an unquiesced descriptor is refused the same way the boot replay "
+                  "refuses it: what crossed must be a consistent instant ***");
+            CHECK(g_create_calls == 0, "...before any create");
+            env_migrate_reset();
+        }
+
+        /* ── G5: a create that fails leaves NOTHING behind, and retries ── */
+        {
+            struct EnvCkptRecord staged =
+                g_record(G_PART, 0, g_live_r0, g_live_r1, g_live_r2);
+            staged.flags |= ENV_CKPT_FLAG_PARTITION_PAUSED;
+            g_create_record = staged;
+            g_create_rc = -1;   /* the channel never answered */
+            g_stage(G_PART, 0, &staged, 6);
+            int rc = env_migrate_restore(G_PART, 0);
+            CHECK(rc == ENV_MIGRATE_REFUSE_CREATE &&
+                  env_migrate_last_refusal()->b == 0,
+                  "*** a create that never answers is refused, operand b=0 (no ENV_* "
+                  "status arrived) ***");
+            CHECK(env_ckpt_find(G_PART, 0) == 0,
+                  "*** and the staged record it stored is DROPPED: refusal over partial "
+                  "application -- nothing half-applied stays behind ***");
+            CHECK(env_migrate_staging_count() == 1,
+                  "the slot is KEPT: nothing was created, so the state is exactly "
+                  "pre-attempt and the sweep may retry");
+
+            g_create_rc = 0; g_create_status = ENV_ERR_INVAL;
+            rc = env_migrate_restore(G_PART, 0);
+            CHECK(rc == ENV_MIGRATE_REFUSE_CREATE &&
+                  env_migrate_last_refusal()->b == (uint32_t)ENV_ERR_INVAL,
+                  "...and an ENV_ERR_* answer carries its status in the operand");
+            CHECK(env_ckpt_find(G_PART, 0) == 0, "record dropped on that path too");
+            g_create_status = ENV_OK;
+            env_migrate_reset();
+        }
+
+        /* ── G6: what came back must be what crossed ───────────────────── */
+        {
+            struct EnvCkptRecord staged =
+                g_record(G_PART, 0, g_live_r0, g_live_r1, g_live_r2);
+            g_create_record = staged;
+            strcpy(g_create_record.tasks[0].name, "aerosls.posix.9");  /* a DIFFERENT env */
+            g_stage(G_PART, 0, &staged, 6);
+            int rc = env_migrate_restore(G_PART, 0);
+            CHECK(rc == ENV_MIGRATE_REFUSE_IDENTITY,
+                  "*** a create that came back as a different environment is REFUSED ***");
+            CHECK(g_destroy_calls == 1 && g_destroy_env_id == 500,
+                  "*** and the environment the create made is ENDED -- a refused restore "
+                  "leaves no half-restored environment behind ***");
+            CHECK(env_ckpt_find(G_PART, 0) == 0 && env_migrate_staging_count() == 1,
+                  "record gone, slot kept -- the state is pre-attempt again");
+            env_migrate_reset();
+        }
+
+        /* ── G7: a return migration ends the stale instance first ────────
+         * The source-teardown half has not landed (increment 3 named it), so
+         * a node that already served this environment once still holds its
+         * record. The staged bytes just crossed with ownership returned: the
+         * local instance is the stale one. */
+        {
+            struct EnvCkptRecord stale =
+                g_record(G_PART, 7, g_live_r0, g_live_r1, g_live_r2);
+            stale.env_id = 42;
+            g_destroy_calls = 0; g_destroy_env_id = 0;   /* G6's identity refusal also destroys */
+            CHECK(env_ckpt_record(&stale) == 0, "setup: a stale live record from a prior life");
+            struct EnvCkptRecord staged =
+                g_record(G_PART, 7, g_live_r0, g_live_r1, g_live_r2);
+            g_create_record = staged;
+            g_stage(G_PART, 7, &staged, 6);
+            int rc = env_migrate_restore(G_PART, 7);
+            CHECK(rc == ENV_MIGRATE_OK,
+                  "*** a return migration SUCCEEDS: the staged bytes are the newer truth ***");
+            CHECK(g_destroy_calls == 1 && g_destroy_env_id == 42,
+                  "*** the stale instance was ended by its own env_id BEFORE the rebuild ***");
+            CHECK(env_ckpt_find(G_PART, 7) && env_ckpt_find(G_PART, 7)->env_id == 500,
+                  "...and the record now describes the rebuilt environment");
+        }
+
+        /* ── G8: the placement rule -- bytes that crossed for base X land at X ─ */
+        env_ckpt_reset(); env_migrate_reset(); host_partition_stubs_reset();
+        host_partition_define(G_PART); g_fake_local_node_id = 2; g_reset_fakes();
+        g_fill_pages();
+        {
+            struct EnvCkptRecord staged =
+                g_record(G_PART, 0, g_live_r0, g_live_r1, g_live_r2);
+            g_create_record =
+                g_record(G_PART, 0, g_other_r0, g_other_r1, g_other_r2); /* landed elsewhere */
+            memset(g_live_r0, 0xAA, sizeof g_live_r0);
+            memset(g_other_r0, 0xCC, sizeof g_other_r0);
+            g_stage(G_PART, 0, &staged, 6);
+            int rc = env_migrate_restore(G_PART, 0);
+            CHECK(rc == ENV_MIGRATE_REFUSE_PLACEMENT &&
+                  env_migrate_last_refusal()->a == ENV_CKPT_REGION_POSIX_HEAP,
+                  "*** an environment that landed OFF the staged bases refuses the pour, "
+                  "operand a=the offending region's kind -- its sidecars' heaps hold raw "
+                  "pointers into those regions ***");
+            CHECK(memcmp(g_live_r0[0], g_pages[0], 4096) != 0 &&
+                  memcmp(g_other_r0[0], g_pages[0], 4096) != 0,
+                  "*** NOT ONE byte was written: refusal over partial application, at the "
+                  "pour ***");
+            CHECK(env_ckpt_find(G_PART, 0) != 0,
+                  "the environment STANDS as the empty replay -- the boot pass's own answer");
+            CHECK(env_migrate_staging_count() == 0,
+                  "*** and the slot is DROPPED: staged bytes that can never be applied "
+                  "here are frames held forever for nothing ***");
+            env_ckpt_reset();
+        }
+
+        /* ── G9: the sidecars must be parked before their memory is poured ─ */
+        env_migrate_reset(); host_partition_stubs_reset();
+        host_partition_define(G_PART); g_reset_fakes();
+        {
+            struct EnvCkptRecord staged =
+                g_record(G_PART, 0, g_live_r0, g_live_r1, g_live_r2);
+            g_create_record = staged;
+            g_parked = 0;
+            g_stage(G_PART, 0, &staged, 6);
+            int rc = env_migrate_restore(G_PART, 0);
+            CHECK(rc == ENV_MIGRATE_REFUSE_PARKED,
+                  "*** sidecars that never reached the parked posture refuse the pour ***");
+            CHECK(memcmp(g_live_r0[0], g_pages[0], 4096) != 0,
+                  "not one byte written");
+            CHECK(env_migrate_staging_count() == 0 && env_ckpt_find(G_PART, 0) != 0,
+                  "slot dropped, environment stands");
+            env_ckpt_reset();
+        }
+
+        /* ── G10: the durable extents must agree ───────────────────────── */
+        env_migrate_reset(); host_partition_stubs_reset();
+        host_partition_define(G_PART); g_reset_fakes();
+        {
+            struct EnvCkptRecord staged =
+                g_record(G_PART, 0, g_live_r0, g_live_r1, g_live_r2);
+            g_create_record = staged;
+            g_create_record.state_lba = STATE_LBA + 64;  /* a different extent */
+            uint8_t pg[4096]; memset(pg, 0xBB, 4096);
+            nvme_write_sync(STATE_LBA + 0, pg);
+            g_stage(G_PART, 0, &staged, 6);
+            int rc = env_migrate_restore(G_PART, 0);
+            CHECK(rc == ENV_MIGRATE_REFUSE_EXTENT,
+                  "*** extents that disagree refuse by name -- the pages crossed for an "
+                  "LBA this node did not allocate ***");
+            nvme_read_sync(STATE_LBA + 0, pg);
+            {
+                int bb = 1; for (uint32_t b = 0; b < 4096; b++) if (pg[b] != 0xBB) bb = 0;
+                CHECK(bb, "...and not one extent byte was written");
+            }
+            CHECK(env_migrate_staging_count() == 0 && env_ckpt_find(G_PART, 0) != 0,
+                  "slot dropped, environment stands");
+            env_ckpt_reset();
+        }
+
+        /* ── G11: the control plane, by name ───────────────────────────── */
+        env_migrate_reset(); host_partition_stubs_reset(); g_reset_fakes();
+        {
+            struct EnvCkptRecord staged =
+                g_record(PARTITION_SYSTEM, 0, g_live_r0, g_live_r1, g_live_r2);
+            staged.partition_id = PARTITION_SYSTEM;
+            g_stage(PARTITION_SYSTEM, 0, &staged, 6);
+            int rc = env_migrate_restore(PARTITION_SYSTEM, 0);
+            CHECK(rc == ENV_MIGRATE_REFUSE_SYSTEM,
+                  "*** PARTITION_SYSTEM is refused BY NAME on the restore side too ***");
+            env_migrate_reset();
+        }
+
+        /* ── G12: the sweep -- env_migrate_tick() ────────────────────────
+         * The wire does not restore anything by itself; the BSP sweep's
+         * driver turns complete slots into environments, on a period, with
+         * a bounded attempt count. */
+        env_ckpt_reset(); env_migrate_reset(); host_partition_stubs_reset();
+        host_partition_define(G_PART); g_fake_local_node_id = 2; g_reset_fakes();
+        g_fill_pages();
+        {
+            uint64_t now = 1000;
+            struct EnvCkptRecord staged =
+                g_record(G_PART, 0, g_live_r0, g_live_r1, g_live_r2);
+            g_create_record = staged;
+            g_stage(G_PART, 0, &staged, 6);
+
+            CHECK(env_migrate_tick(now) == 1,
+                  "*** the sweep restores the complete, owned slot: 1 environment live ***");
+            CHECK(env_migrate_staging_count() == 0 && env_ckpt_find(G_PART, 0) != 0,
+                  "...slot gone, record live");
+            CHECK(env_migrate_tick(now + 500) == 0,
+                  "the period bounds it: a second sweep inside the period restores nothing");
+
+            /* An incomplete slot is never attempted by the sweep. */
+            {
+                struct EnvCkptRecord s2 =
+                    g_record(G_PART, 1, g_live_r0, g_live_r1, g_live_r2);
+                uint64_t t2 = ((uint64_t)G_PART << 32) | 1;
+                (void)env_migrate_recv_begin(t2, G_PART, 1, 6, &s2,
+                                             (uint32_t)sizeof(s2));
+                int before = g_create_calls;
+                CHECK(env_migrate_tick(now + 2000) == 0,
+                      "an INCOMPLETE slot is never touched by the sweep");
+                CHECK(g_create_calls == before, "...no create was attempted for it");
+                env_migrate_reset();
+            }
+
+            /* The attempts cap: five tries, then the sweep stops -- forever. */
+            env_ckpt_reset();
+            {
+                struct EnvCkptRecord s3 =
+                    g_record(G_PART, 2, g_live_r0, g_live_r1, g_live_r2);
+                g_create_record = s3;
+                g_create_rc = -1;
+                g_stage(G_PART, 2, &s3, 6);
+                uint64_t t = now + 4000;
+                int cap_before = g_create_calls;
+                for (int k = 0; k < 12; k++) { (void)env_migrate_tick(t); t += 2000; }
+                CHECK(g_create_calls - cap_before == 5,
+                      "*** a create that can never succeed is tried exactly 5 times, then "
+                      "the sweep stops -- no infinite retry, no silent frame leak ***");
+                CHECK(env_migrate_staging_count() == 1,
+                      "...and the bytes stay countable rather than vanishing");
+                env_migrate_reset();
+                g_create_rc = 0;
+            }
+
+            /* A slot whose partition is gone: dropped, frames returned. */
+            {
+                host_partition_define(G_PART + 1);
+                struct EnvCkptRecord s4 =
+                    g_record(G_PART + 1, 0, g_live_r0, g_live_r1, g_live_r2);
+                g_create_record = s4;
+                g_stage(G_PART + 1, 0, &s4, 6);
+                CHECK(env_migrate_staging_count() == 1, "setup: a slot for partition 92");
+                host_partition_destroy(G_PART + 1);
+                (void)env_migrate_tick(now + 30000);
+                CHECK(env_migrate_staging_count() == 0,
+                      "*** the sweep drops the slot of a partition that no longer exists -- "
+                      "its frames go back with the tenant they were charged to ***");
+            }
+
+            /* A slot owned by ANOTHER node waits -- that node may be us soon. */
+            {
+                struct EnvCkptRecord s5 =
+                    g_record(G_PART, 3, g_live_r0, g_live_r1, g_live_r2);
+                g_create_record = s5;
+                g_stage(G_PART, 3, &s5, 6);
+                g_fake_owner_node = 1;
+                int before = g_create_calls;
+                CHECK(env_migrate_tick(now + 33000) == 0 && g_create_calls == before,
+                      "a slot for a partition owned elsewhere is waited on, not restored");
+                CHECK(env_migrate_staging_count() == 1, "...and kept");
+                g_fake_owner_node = 2;
+                env_migrate_reset();
+            }
+        }
+
+        env_ckpt_reset();
+        env_migrate_reset();
+        host_partition_stubs_reset();
+        g_fake_local_node_id = 1;
+        CHECK(env_ckpt_count_live() == 0, "teardown: the record table is empty again");
+        CHECK(env_migrate_staging_count() == 0, "teardown: and so is the staging table");
+    }
+
+    /* ═══ Phase H: the destination's word, then the source's teardown ═══
+     * P3 increment 5. The rule this whole increment exists for: no record
+     * may describe an environment that moved. The DESTINATION half first
+     * proves what its word is grounded in; the SOURCE half then runs the
+     * real send (which arms the confirmations) and the real sweep against
+     * every gate that must keep the records, the one gate that destroys --
+     * and the deferred reclamation that completes only after both. */
+    printf("\n-- Phase H: nothing is torn down without the destination's word --\n");
+    {
+        const uint32_t H_PART = 96;
+        env_ckpt_reset(); env_migrate_reset(); host_partition_stubs_reset();
+        host_partition_define(H_PART);
+        g_fake_local_node_id = 2; g_reset_fakes();   /* node 2: the destination */
+        g_fill_pages();
+        uint64_t h_now = 40000;   /* past Phase G's last sweep reading (34000) */
+
+        /* ── The destination half: what a LIVE_ACK answer is grounded in ── */
+        {
+            struct EnvCkptRecord r =
+                g_record(H_PART, 0, g_live_r0, g_live_r1, g_live_r2);
+            CHECK(env_ckpt_record(&r) == 0, "setup: a record stands on this node");
+            CHECK(env_migrate_live_query(H_PART, 0) == 1,
+                  "*** a record alone never confirms: one never restored WITH ITS "
+                  "CONTENTS answers not-live ***");
+            g_fake_owner_node = 1;
+            CHECK(env_migrate_live_query(H_PART, 0) == 1,
+                  "a partition this node does not own answers not-live");
+            g_fake_owner_node = 2;
+
+            g_stage(H_PART, 0, &r, 6);
+            CHECK(env_migrate_recv_find(H_PART, 0) != 0, "setup: ...staged");
+            CHECK(env_migrate_live_query(H_PART, 0) == 1,
+                  "*** staged is not restored: a completed slot not yet poured answers "
+                  "not-live -- confirming from staged bytes would have the source "
+                  "destroy the only complete copy ***");
+            env_migrate_reset();
+            env_ckpt_reset();
+
+            struct EnvCkptRecord r2 =
+                g_record(H_PART, 0, g_live_r0, g_live_r1, g_live_r2);
+            g_create_record = r2;
+            g_stage(H_PART, 0, &r2, 6);
+            h_now += 1000;
+            CHECK(env_migrate_tick(h_now) == 1, "setup: the slot restores for real");
+            CHECK(env_migrate_live_query(H_PART, 0) == 0,
+                  "*** the node that restored WITH ITS CONTENTS answers LIVE ***");
+
+            env_ckpt_restore_begin();
+            CHECK(env_migrate_live_query(H_PART, 0) == 1,
+                  "an environment whose restore has not settled answers not-live");
+            {
+                uint32_t pp, ii, ee;
+                while (env_ckpt_restore_next(&pp, &ii, &ee))
+                    env_ckpt_restore_settle(pp, ii);
+            }
+            CHECK(env_migrate_live_query(H_PART, 0) == 0,
+                  "...and live again once settled");
+
+            (void)env_ckpt_drop(H_PART, 0);
+            CHECK(env_migrate_live_query(H_PART, 0) == 1,
+                  "an instance that is gone here answers not-live");
+        }
+
+        env_ckpt_reset(); env_migrate_reset(); host_partition_stubs_reset();
+
+        /* ── H1: a refused send arms NOTHING ──────────────────────────────
+         * The destination never saw the bytes, so its environment never
+         * came to be there -- and the source's are still whole here. A
+         * confirmation armed now could only ever destroy on a word that
+         * can never truthfully come. */
+        g_fake_local_node_id = 1; g_reset_fakes();
+        {
+            peer_reset();
+            nack_begin = 1;
+            int rc = h_send_n(97, 2);
+            CHECK(rc == ENV_MIGRATE_REFUSE_BEGIN, "setup: a refused send");
+            CHECK(env_migrate_pending_count() == 0,
+                  "*** a send the destination refused arms NO teardown confirmation -- "
+                  "its environments are still here, so its records must stay ***");
+            nack_begin = 0;
+            env_migrate_reset(); env_ckpt_reset();
+        }
+
+        /* ── H2: success arms one confirmation per environment, and the
+         * records survive every step up to the word ─────────────────────── */
+        {
+            int d_before = g_destroy_calls;
+            int rc = h_send_n(97, 2);
+            CHECK(rc == 0, "setup: both environments cross");
+            CHECK(env_migrate_pending_count() == 2,
+                  "*** every confirmed environment arms exactly one teardown "
+                  "confirmation -- one teardown, one question ***");
+            uint32_t id0 = env_ckpt_find(97, 0)->env_id;
+            int reclaim_before = g_reclaim_calls;
+            g_fake_owner_node = DST_NODE;   /* Step 4's handoff, simulated */
+
+            int req_before = live_req_count;
+            h_now += 1000; (void)env_migrate_tick(h_now);
+            CHECK(env_migrate_pending_count() == 2, "both confirmations still pending");
+            CHECK(g_destroy_calls == d_before,
+                  "*** before the destination's word: not one destroy ran ***");
+            CHECK(env_ckpt_find(97, 0) != 0 && env_ckpt_find(97, 1) != 0,
+                  "*** ...and BOTH records still stand -- no record may vanish "
+                  "before the destination confirms ***");
+            CHECK(live_req_count == req_before + 2,
+                  "the sweep polled once per pending environment (LIVE_REQ on the wire)");
+
+            /* "not yet" is an answer, not a permission. */
+            h_deliver_live_ack(97, 0, 1);
+            h_now += 1000; (void)env_migrate_tick(h_now);
+            CHECK(g_destroy_calls == d_before && env_ckpt_find(97, 0) != 0,
+                  "*** a not-yet answer keeps the record: waiting is not permission ***");
+
+            /* The word. */
+            h_deliver_live_ack(97, 0, 0);
+            h_now += 1000; (void)env_migrate_tick(h_now);
+            CHECK(g_destroy_calls == d_before + 1 && g_destroy_env_id == id0,
+                  "*** the destination's word ends THAT environment here, by name ***");
+            CHECK(env_ckpt_find(97, 0) == 0 && env_ckpt_find(97, 1) != 0,
+                  "*** ...exactly one record gone: the one that moved; the sibling "
+                  "whose word never came still stands ***");
+            CHECK(env_migrate_pending_count() == 1,
+                  "one confirmation is still pending (and countable)");
+            CHECK(g_reclaim_calls == reclaim_before,
+                  "no frames reclaimed while a record of the partition remains");
+
+            /* H3: ownership comes back -- the records are the truth again. */
+            g_fake_owner_node = 1;
+            h_now += 1000; (void)env_migrate_tick(h_now);
+            CHECK(env_migrate_pending_count() == 0,
+                  "*** ownership local again disarms: the records here are the truth "
+                  "again and nothing will destroy them ***");
+            CHECK(g_destroy_calls == d_before + 1 && env_ckpt_find(97, 1) != 0,
+                  "...the sibling's record survives untouched");
+            CHECK(g_reclaim_calls == reclaim_before,
+                  "...and its frames stay with it");
+        }
+        env_ckpt_reset(); env_migrate_reset(); host_partition_stubs_reset();
+
+        /* ── H4: the happy completion -- destroy, then the deferred
+         * reclamation, in that order ───────────────────────────────────── */
+        {
+            int d_before = g_destroy_calls;
+            int reclaim_before = g_reclaim_calls;
+            int rc = h_send_n(100, 1);
+            CHECK(rc == 0, "setup: one environment crosses");
+            uint32_t id = env_ckpt_find(100, 0)->env_id;
+            CHECK(env_migrate_pending_count() == 1, "one confirmation armed");
+            g_fake_owner_node = DST_NODE;
+            h_now += 1000; (void)env_migrate_tick(h_now);
+            h_deliver_live_ack(100, 0, 0);
+            h_now += 1000; (void)env_migrate_tick(h_now);
+            CHECK(g_destroy_calls == d_before + 1 && g_destroy_env_id == id,
+                  "*** the confirmed environment is ended by name ***");
+            CHECK(env_ckpt_find(100, 0) == 0 && env_migrate_pending_count() == 0,
+                  "*** ...its record is gone and no confirmation is pending: nothing "
+                  "on this node describes it anymore ***");
+            CHECK(g_reclaim_calls == reclaim_before + 1 &&
+                  g_reclaim_last_arg == 100,
+                  "*** and the deferred reclamation completes on the LAST "
+                  "confirmation, for THAT partition -- frames come back only once the "
+                  "records are gone, never before ***");
+        }
+        env_ckpt_reset(); env_migrate_reset(); host_partition_stubs_reset();
+
+        /* ── H5: a partition that no longer exists ends its entry (that
+         * partition's own teardown owns its records and frames) ─────────── */
+        {
+            int d_before = g_destroy_calls;
+            int rc = h_send_n(102, 1);
+            CHECK(rc == 0, "setup: ...sent");
+            g_fake_owner_node = DST_NODE;
+            host_partition_destroy(102);
+            h_now += 1000; (void)env_migrate_tick(h_now);
+            CHECK(env_migrate_pending_count() == 0,
+                  "*** a partition that no longer exists ends its confirmation entry -- "
+                  "that partition's own destroy owns its records and frames ***");
+            CHECK(g_destroy_calls == d_before,
+                  "...and no teardown runs against a partition that is already gone");
+        }
+        env_ckpt_reset(); env_migrate_reset(); host_partition_stubs_reset();
+
+        /* ── H6: a destination that never answers is asked a bounded number
+         * of times, then left alone -- countable, never destroyed ──────── */
+        {
+            int d_before = g_destroy_calls;
+            int rc = h_send_n(103, 1);
+            CHECK(rc == 0, "setup: ...sent");
+            g_fake_owner_node = DST_NODE;
+            int req_before = live_req_count;
+            for (int k = 0; k < 62; k++) { h_now += 1000; (void)env_migrate_tick(h_now); }
+            CHECK(live_req_count - req_before == 60,
+                  "*** a destination that never answers is asked exactly 60 times, then "
+                  "the sweep stops asking -- bounded, not a hot loop ***");
+            CHECK(g_destroy_calls == d_before,
+                  "...and never once torn down in the absence of the word");
+            CHECK(env_migrate_pending_count() == 1 && env_ckpt_find(103, 0) != 0,
+                  "*** ...with the record still standing AND still countable: a "
+                  "confirmation that never arrives must be counted, not suspected ***");
+        }
+        env_ckpt_reset(); env_migrate_reset(); host_partition_stubs_reset();
+
+        /* ── H7: a teardown that cannot complete keeps its record (the
+         * fate of the environment is unknown -- described, not forgotten)
+         * ─────────────────────────────────────────────────────────────── */
+        {
+            g_destroy_rc = -1;   /* the channel never answers */
+            int rc = h_send_n(104, 1);
+            CHECK(rc == 0, "setup: ...sent");
+            g_fake_owner_node = DST_NODE;
+            h_now += 1000; (void)env_migrate_tick(h_now);
+            h_deliver_live_ack(104, 0, 0);
+            int d_before = g_destroy_calls;
+            for (int k = 0; k < 8; k++) { h_now += 1000; (void)env_migrate_tick(h_now); }
+            CHECK(g_destroy_calls - d_before == 5,
+                  "*** a teardown that cannot complete is attempted exactly 5 times, "
+                  "then stops -- bounded, no infinite retry ***");
+            CHECK(env_migrate_pending_count() == 1 && env_ckpt_find(104, 0) != 0,
+                  "*** ...and the record STAYS: the destination is confirmed, but "
+                  "this node's environment could not be ended -- still countable, an "
+                  "operator's to finish by name ***");
+            g_destroy_rc = 0;
+        }
+        env_ckpt_reset(); env_migrate_reset(); host_partition_stubs_reset();
+        CHECK(env_ckpt_count_live() == 0,
+              "teardown: the record table is empty again");
+        CHECK(env_migrate_pending_count() == 0,
+              "teardown: and no confirmations are pending");
+        CHECK(env_migrate_staging_count() == 0,
+              "teardown: and so is the staging table");
+        CHECK(g_reclaim_calls == 1 && g_reclaim_last_arg == 100,
+              "exactly ONE reclamation ran across all of Phase H -- H4's completion: "
+              "every other gate kept its records AND their frames, never one without "
+              "the other");
+        g_fake_local_node_id = 1;
     }
 
     /* ── The frame buffer was never re-entered, and nothing overflowed ──

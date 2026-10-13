@@ -163,6 +163,23 @@ int env_migrate_recv_page(uint64_t transfer_id, uint32_t page_index,
     env_page_calls++; return 1;
 }
 
+/* POSIX-Environments P3 increment 5: the confirmation pair, counted for
+ * the same reason as the two above -- this test never SENDS LIVE_REQ/
+ * LIVE_ACK (22–23), so both counters stay 0; were one to arrive,
+ * "not live" (1) is the honest answer for a node that restored nothing,
+ * and "nothing pending" (1) for its ACK. Real coverage:
+ * tests/env_migrate_host_test.c, Phase H. */
+static int env_live_q_calls = 0;
+static int env_live_a_calls = 0;
+int env_migrate_live_query(uint32_t partition_id, uint32_t index) {
+    (void)partition_id; (void)index;
+    env_live_q_calls++; return 1;
+}
+int env_migrate_live_ack(uint32_t partition_id, uint32_t index, uint32_t status) {
+    (void)partition_id; (void)index; (void)status;
+    env_live_a_calls++; return 1;
+}
+
 /* ─── Settable node identity: the one fake this test hinges on ─────────
  * Two real nodes are two processes each reading their own compiled-in
  * identity. Here, one mutable global the test flips between the send

@@ -587,7 +587,30 @@ int partition_migrate(uint32_t partition_id, uint32_t dest_node_id) {
     // moved, is it correct to free this node's physical frames -- reuses
     // the same real reclamation partition_destroy() already established,
     // not a second implementation.
-    uint32_t frames_reclaimed = partition_reclaim_all_frames(partition_id);
+    //
+    // POSIX-Environments P3 increment 5, one condition: with environments
+    // moved (envs_moved > 0), their RECORDS still stand on this node. The
+    // source tears each down only on the destination's confirmation
+    // (kernel/env_migrate.c's confirmation walk), and until then each
+    // environment's sidecars are still running on exactly the frames this
+    // call would free -- reclaiming now would put two owners on one frame,
+    // the precise defect the increment exists to remove. So the
+    // reclamation is DEFERRED to that walk: it runs
+    // partition_reclaim_all_frames() when the partition's last confirmation
+    // completes and no record of it remains here. With nothing moved
+    // (envs_moved == 0), no record on this node describes the partition
+    // anymore and the reclaim runs exactly as it always did.
+    uint32_t frames_reclaimed = 0;
+    if (envs_moved > 0) {
+        kernel_serial_printf(
+            "[PARTITION] migrate partition %u: %u environment(s) moved, so this node's "
+            "frames are NOT reclaimed yet -- the teardown confirmations are pending on "
+            "this node (countable through env_migrate_pending_count()); the "
+            "destination's word runs each teardown, and the last one reclaims here.\n",
+            (unsigned)partition_id, (unsigned)envs_moved);
+    } else {
+        frames_reclaimed = partition_reclaim_all_frames(partition_id);
+    }
 
     // Step 6 ("resume on the destination"), deliberately NOT done here: this
     // function runs entirely on the SOURCE node. Calling partition_resume()
@@ -625,6 +648,15 @@ int partition_migrate(uint32_t partition_id, uint32_t dest_node_id) {
         (unsigned)envs_moved,
         (unsigned)contexts_migrated,
         (unsigned)frames_reclaimed);
+
+    /* P3 increment 5: say plainly what the number above means when
+     * environments moved -- 0 reclaimed is not "nothing to reclaim", it is
+     * "reclaimed later, on the destination's word" (see Step 5). */
+    if (envs_moved > 0)
+        kernel_serial_printf(
+            "[PARTITION] migrated partition %u: %u frame(s) reclaimed SO FAR -- the "
+            "remainder is deferred until this node's teardown confirmations complete.\n",
+            (unsigned)partition_id, (unsigned)frames_reclaimed);
 
     return 0;
 }

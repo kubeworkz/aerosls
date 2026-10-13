@@ -402,7 +402,7 @@ void dspp_service_rx(struct DSPPServiceHeader* h, uint16_t len);
  * let the source believe anything moved without the destination's word)
  * applies unchanged to an environment's state.
  *
- * Opcodes 18–21 sit above the partition-table family (15–17) — the first
+ * Opcodes 18–23 sit above the partition-table family (15–17) — the first
  * range under this magic that nothing else claims. The gap between the
  * service family (9–10) and the partition family (15+) LOOKED free when
  * this family was first drawn and is not: the checkpoint family below
@@ -420,7 +420,18 @@ enum DSPPEnvMigrateOpcode {
     DSPP_MIGRATE_ENV_BEGIN_REQ = 18,  // sender -> receiver: an environment is arriving; here is its record and payload size
     DSPP_MIGRATE_ENV_BEGIN_ACK = 19,  // receiver -> sender: staging slot ready (status=0) or refused (status!=0)
     DSPP_MIGRATE_ENV_PAGE_REQ  = 20,  // sender -> receiver: one 1 KiB fragment of transfer_id's payload page page_index
-    DSPP_MIGRATE_ENV_PAGE_ACK  = 21   // receiver -> sender: fragment staged (status=0) or refused (status!=0)
+    DSPP_MIGRATE_ENV_PAGE_ACK  = 21,  // receiver -> sender: fragment staged (status=0) or refused (status!=0)
+    /* P3 increment 5: the confirmation pull. After the bytes crossed and
+     * ownership moved, the SOURCE still holds its records, sidecars and
+     * frames until the destination says the environment is live WITH ITS
+     * CONTENTS there — so the source polls (LIVE_REQ, one per environment,
+     * on the sweep's period) and the destination answers from its own state
+     * (LIVE_ACK: status=0 = restored and live here; nonzero = not yet, or
+     * not anymore). One-way fire-and-forget like every other send here: a
+     * lost question is re-asked on a later period, a lost answer is re-asked
+     * the same way, so neither side needs retransmission state for it. */
+    DSPP_MIGRATE_ENV_LIVE_REQ  = 22,  // source -> destination: is (partition_id, env_index) live WITH CONTENTS on you?
+    DSPP_MIGRATE_ENV_LIVE_ACK  = 23   // destination -> source: it is (status=0) or it is not (status!=0)
 };
 
 /* The descriptor crosses WHOLE (a fixed-size struct, a few hundred bytes),
@@ -469,10 +480,18 @@ void dspp_env_migrate_send_page(uint64_t transfer_id, uint32_t node_dest_id,
 void dspp_env_migrate_send_frag(uint64_t transfer_id, uint32_t node_dest_id,
                                 uint32_t partition_id, uint32_t page_index,
                                 uint32_t frag_index, const uint8_t* page_data);
+/* P3 increment 5: the source's confirmation poll — a header-only LIVE_REQ
+ * asking whether (partition_id, env_index) is live with its contents on
+ * node_dest_id. Fire-and-forget; the answer comes back as a LIVE_ACK and is
+ * recorded by env_migrate_live_ack() in kernel/env_migrate.c. */
+void dspp_env_migrate_send_live(uint64_t transfer_id, uint32_t node_dest_id,
+                                uint32_t partition_id, uint32_t env_index);
 
 /* Receiver side, reached from dspp_rx_dispatch() for the ENV opcodes.
  * Self-filters on node_dest_id, routes BEGIN_REQ/PAGE_REQ into
- * kernel/env_migrate.c and ACKs each. */
+ * kernel/env_migrate.c and ACKs each; routes LIVE_REQ into the destination's
+ * live-with-contents answer (env_migrate_live_query) and LIVE_ACK into the
+ * source's confirmation record (env_migrate_live_ack). */
 void dspp_env_migrate_rx(void* buf, uint16_t len);
 
 /* ─── Partition-table replication (Multi-Node Phase 2 gap) ─────────────

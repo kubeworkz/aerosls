@@ -129,6 +129,18 @@ int  env_migrate_recv_begin(uint64_t t, uint32_t p, uint32_t i, uint32_t n,
 int  env_migrate_recv_page(uint64_t t, uint32_t pi, uint32_t f, const uint8_t* d) {
     (void)t;(void)pi;(void)f;(void)d; return 1;
 }
+/* POSIX-Environments P3 increment 5: the confirmation pair --
+ * permissive-denial like the stubs above. This test never sends
+ * LIVE_REQ/LIVE_ACK (22–23), so these are not reached; refusing
+ * "not live" (1) / "nothing pending" (1) is the honest answer for a node
+ * that restored nothing. Real coverage: tests/env_migrate_host_test.c,
+ * Phase H. */
+int  env_migrate_live_query(uint32_t p, uint32_t i) {
+    (void)p;(void)i; return 1;
+}
+int  env_migrate_live_ack(uint32_t p, uint32_t i, uint32_t s) {
+    (void)p;(void)i;(void)s; return 1;
+}
 
 static uint32_t g_local_node = 1;
 uint32_t cluster_local_node_id(void) { return g_local_node; }

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # tests/env_migration_check.sh — guards the WIRING of POSIX-Environments v0.2
-# Phase P3 increment 3 (the environment step inside partition_migrate()'s
-# critical section), not its logic.
+# Phase P3 increments 3–5 (the environment step inside partition_migrate()'s
+# critical section, the restore on the destination, and the confirmation-
+# gated teardown on the source), not its logic.
 #
 # ─── Why this guard exists, and what kind of thing it checks ────────────────
 # tests/env_migrate_host_test.c (Phase F) proves the step's BEHAVIOUR — the
@@ -64,18 +65,89 @@
 #      never runs without a cluster. A test that stops checking is how a
 #      property becomes decoration.
 #
+# ─── P3 increment 4: the restore half ────────────────────────────────────────
+# The wire fills a staging slot on the destination; env_migrate_restore()
+# turns it back into a live environment. tests/env_migrate_host_test.c
+# (Phase G) proves its BEHAVIOUR — the pour's byte fidelity, every refusal,
+# the slot-retention rule. The wiring a host test cannot notice is here:
+#
+#   K. The BSP sweep calls env_migrate_tick(): staged bytes that nothing
+#      restores are frames held forever — the wire delivers, the sweep
+#      makes live.
+#   L. The restore gates OWNERSHIP before it creates: a follower building
+#      an environment in a partition served elsewhere is a second,
+#      unaccounted tenant.
+#   M. Refusal over partial application on the create paths: a create that
+#      failed or came back different DROPS the stored record (and the
+#      identity-mismatch path ends the environment the create made).
+#   N. The slot-retention rule: the first recv_drop appears AFTER the
+#      create — a pre-create refusal keeps the slot (the state is
+#      pre-attempt, the sweep may retry), and the restore drops the slot
+#      itself on the paths where retrying cannot help.
+#   O. The pour is validated WHOLE before a byte: the placement refusal is
+#      decided before the first memcpy.
+#   P. The partition goes back to the state the record recorded: the
+#      PARTITION_PAUSED flag across the wire gates a partition_pause on
+#      the destination.
+#   Q. The sweep's retry is bounded: a period and an attempts cap both
+#      exist, so a create that can never succeed stops instead of spinning.
+#   R. The host test still exercises the restore (calls it AND the tick) —
+#      a test that stops checking is how a property becomes decoration.
+#
 # ─── Teeth ────────────────────────────────────────────────────────────────
 # tests/env_migration_check_smoke.sh mutates a copy of the tree once per
 # invariant and requires this guard to go red naming THAT clause — the
 # `P3_TOOTH=ownership-first` tooth among them — then requires it green on
 # the untouched tree.
 #
+# ─── P3 increment 5: the confirmation, then the gated teardown ──────────────
+# One sentence, the roadmap's rule applied to an environment that moved:
+# no record may describe it afterwards. Increments 3 and 4 moved the bytes
+# and rebuilt them on the destination, and both deliberately left the
+# source's records, sidecars and frames alive (their boundary, named then).
+# This closes it, and the closing is GATED: the source tears its half down
+# only on the destination's own word that the environment is live with its
+# contents there — never on the bytes having been sent.
+#
+# tests/env_migrate_host_test.c (Phase H) proves the BEHAVIOUR — what the
+# word is grounded in, every gate that keeps the records, the one that
+# destroys by name, the deferred reclamation. The wiring a host test
+# cannot notice:
+#
+#   S. The wire pair exists end to end: both opcodes exist, the dispatch
+#      range reaches LIVE_ACK, the walk actually SENDS the poll, and
+#      dspp.c answers from env_migrate_live_query and records through
+#      env_migrate_live_ack. A missing leg leaves the source asking a
+#      question that can never be answered — or answering one never asked.
+#   T. The destination's word is grounded in its own state: live_query is
+#      gated on the restored marker AND the marker is set in exactly one
+#      place — the pour's success tail. A marker set anywhere else
+#      confirms a source off an environment that was never poured.
+#   U. The teardown is gated: in env_migrate.c's walk the not-confirmed
+#      branch comes BEFORE env_service_destroy(), and a partition this
+#      node owns again disarms. A destroy reachable without the word is
+#      this increment's defect verbatim.
+#   V. The arm happens exactly once, at the end of a fully-confirmed send,
+#      and pending confirmations are countable (env_migrate_pending_count).
+#      Armed on an abort, it would destroy environments that never left.
+#   W. The frames wait for the records: partition.c defers its Step 5
+#      reclaim when environments moved, and env_migrate.c's walk completes
+#      it only when no record of the partition remains. Reclaiming earlier
+#      frees frames a live sidecar still runs on — the double-ownership
+#      defect this increment exists to remove.
+#   X. Every host test linking net/dspp.c without the real env_migrate.c
+#      defines the confirmation pair — clause I's link class, for dspp.c.
+#   Y. The host test still exercises the confirmation (Phase H: query,
+#      pending count) — a test that stops checking is how a property
+#      becomes decoration.
+#
 # What this guard deliberately does NOT claim: the live clauses the
 # roadmap's verification plan names (the environment live on the
 # destination, no residue on the source, the lease moved, an attached
-# operator seeing the destination's announcement) need increment 4's
-# restore half, and land in this file's live arm then. Asserting them now
-# would be asserting a boot nobody has run.
+# operator seeing the destination's announcement) need a RUNNING CLUSTER
+# and land in this file's live arm when one is available. Asserting them
+# now would be asserting a boot nobody has run — the restore's wiring
+# (clauses K–R) is what a source-only guard can hold.
 #
 # Optional argument: the repository root to inspect (the smoke's hermetic
 # seam; every real caller passes nothing and gets this script's own parent).
@@ -95,17 +167,18 @@ has() { grep -qF -- "$2" "$1" 2>/dev/null; }
 
 # ── A. Preconditions ──────────────────────────────────────────────────────
 for f in kernel/partition.c kernel/env_migrate.c kernel/env_migrate.h \
-         kernel/env_ckpt.c kernel/env_ckpt.h Makefile \
+         kernel/env_ckpt.c kernel/env_ckpt.h Makefile net/http.c \
+         net/dspp.c net/dspp.h \
          tests/env_migration_check.sh \
          tests/env_migrate_host_test.c \
          tests/partition_migrate_phase6_host_test.c \
          tests/partition_migrate_default_path_host_test.c; do
     if [ ! -f "$f" ]; then
-        echo "ABORT: $f is missing — cannot evaluate the P3 increment 3 wiring at all" >&2
+        echo "ABORT: $f is missing — cannot evaluate the P3 increment 3/4/5 wiring at all" >&2
         exit 2
     fi
 done
-ok "A. every file the environment step's wiring lives in is present"
+ok "A. every file the environment step's, restore's and confirmation's wiring lives in is present"
 
 # ── B. The wiring exists at all ───────────────────────────────────────────
 if ! has kernel/partition.c '#include "env_migrate.h"'; then
@@ -238,6 +311,190 @@ elif ! has tests/partition_migrate_default_path_host_test.c "env_step_calls == 0
     bad "J. partition_migrate_default_path_host_test.c no longer asserts the step never runs without a cluster — the default posture is now assumed rather than measured"
 else
     ok "J. both orchestration tests still assert their half: ownership local when the step ran, and the step never taken by default"
+fi
+
+# ── K. The sweep restores what the wire staged ────────────────────────────
+if ! has net/http.c '#include "../kernel/env_migrate.h"'; then
+    bad "K. net/http.c no longer includes env_migrate.h — the sweep cannot reach the restore"
+elif ! has net/http.c "env_migrate_tick(kernel_tick_counter);"; then
+    bad "K. the BSP sweep no longer calls env_migrate_tick() — staged bytes that nothing restores are partition-charged frames held forever; the wire delivers, the sweep makes live"
+else
+    ok "K. the BSP sweep drives the restore (env_migrate_tick, rate-limited internally)"
+fi
+
+# ── L. Ownership is gated BEFORE the create ───────────────────────────────
+owner_line=$(grep -nE "partition_get_owner_node\(partition_id\) != cluster_local_node_id\(\)" kernel/env_migrate.c | head -1 | cut -d: -f1)
+create_line=$(grep -nE "env_service_create\(partition_id, index" kernel/env_migrate.c | head -1 | cut -d: -f1)
+if [ -z "${owner_line:-}" ] || [ -z "${create_line:-}" ]; then
+    bad "L. could not locate both the ownership gate and the create in env_migrate.c (gate=${owner_line:-absent}, create=${create_line:-absent}) — a restore with no ownership gate builds a second, unaccounted tenant on a follower"
+elif [ "$owner_line" -ge "$create_line" ]; then
+    bad "L. the ownership gate (line $owner_line) no longer precedes the create (line $create_line) — a follower could rebuild an environment for a partition it does not serve"
+else
+    ok "L. the restore gates OWNERSHIP (line $owner_line) before it creates (line $create_line)"
+fi
+
+# ── M. A refused create leaves NOTHING behind ─────────────────────────────
+drop_count=$(grep -c "env_ckpt_drop(partition_id, index);" kernel/env_migrate.c)
+if ! has kernel/env_migrate.c "env_ckpt_restore_refuse(partition_id, index, ENV_CKPT_REFUSE_CREATE"; then
+    bad "M. the create-failure path no longer records its refusal in the record layer — the refusal is a log line a grep could miss, not a queryable fact"
+elif [ "${drop_count:-0}" -lt 2 ]; then
+    bad "M. env_ckpt_drop(partition_id, index) appears only ${drop_count:-0} time(s) — both the resume-refusal and the create-failure paths must drop the stored record, or a refused restore leaves a record describing an environment that does not exist"
+else
+    ok "M. both pre-create refusal paths drop the stored record (${drop_count} drops), refusal over partial application"
+fi
+
+# ── N. The slot-retention rule: dropped only once the environment exists ──
+first_drop=$(grep -n "env_migrate_recv_drop(partition_id, index);" kernel/env_migrate.c | head -1 | cut -d: -f1)
+if [ -z "${first_drop:-}" ] || [ -z "${create_line:-}" ]; then
+    bad "N. could not locate the restore's slot drops (first=${first_drop:-absent}) or the create (${create_line:-absent})"
+elif [ "$first_drop" -le "$create_line" ]; then
+    bad "N. the first slot drop (line $first_drop) is no longer AFTER the create (line $create_line) — a pre-create refusal would release staged bytes that a retry could still have used"
+elif [ "$(grep -c "env_migrate_recv_drop(partition_id, index);" kernel/env_migrate.c)" -lt 4 ]; then
+    bad "N. the restore drops the slot on fewer than 4 paths — success, the parked refusal, the validation refusal and the extent-IO failure each must release the frames (a slot that survives an unappliable pour is a frame leak with a name)"
+else
+    ok "N. the slot is kept through the pre-create refusals and dropped on the paths where the environment exists (first drop line $first_drop, after the create)"
+fi
+
+# ── O. The pour is validated WHOLE before a byte ──────────────────────────
+place_line=$(grep -n "refuse_code = ENV_MIGRATE_REFUSE_PLACEMENT" kernel/env_migrate.c | head -1 | cut -d: -f1)
+pour_line=$(grep -n "dst\[b\] = src\[b\]" kernel/env_migrate.c | head -1 | cut -d: -f1)
+if [ -z "${place_line:-}" ] || [ -z "${pour_line:-}" ]; then
+    bad "O. could not locate the placement decision (${place_line:-absent}) or the pour (${pour_line:-absent}) — a pour with no placement gate writes bytes that cross for base X into whatever now lives there"
+elif [ "$place_line" -ge "$pour_line" ]; then
+    bad "O. the placement refusal (line $place_line) is no longer BEFORE the first memcpy (line $pour_line) — refusal over partial application requires every destination validated before any byte"
+else
+    ok "O. the placement rule is decided (line $place_line) before the first byte of the pour (line $pour_line)"
+fi
+
+# ── P. The record's pause comes back with it ──────────────────────────────
+if ! has kernel/env_migrate.c "staged.flags & ENV_CKPT_FLAG_PARTITION_PAUSED"; then
+    bad "P. the restore no longer reads ENV_CKPT_FLAG_PARTITION_PAUSED off the staged record — the destination would leave a partition running that the source recorded as paused, losing the operator's intent across the wire"
+elif ! has kernel/env_migrate.c "partition_pause(partition_id)"; then
+    bad "P. the restore no longer calls partition_pause() — the flag is read but not acted on, and a successful migration leaves its partition RUNNING on the destination instead of paused for its operator"
+else
+    ok "P. the staged record's PAUSED flag gates a partition_pause on the destination"
+fi
+
+# ── Q. The sweep's retry is bounded on both axes ──────────────────────────
+if ! has kernel/env_migrate.c "#define ENV_MIGRATE_RESTORE_PERIOD_TICKS"; then
+    bad "Q. the restore tick has no PERIOD — it would run on every sweep, retrying a failing create at sweep rate (a sweep is load-dependent and unbounded)"
+elif ! has kernel/env_migrate.c "#define ENV_MIGRATE_RESTORE_MAX_TRIES"; then
+    bad "Q. the restore tick has no ATTEMPTS cap — a create that can never succeed would retry forever, logging every period, with the slot's frames held silently"
+elif ! has kernel/env_migrate.c "s->restore_tries >= ENV_MIGRATE_RESTORE_MAX_TRIES"; then
+    bad "Q. the attempts cap is defined but never CHECKED — the sweep would still retry forever"
+else
+    ok "Q. the sweep's retry is bounded: a period, a cap, and the cap actually checked"
+fi
+
+# ── R. The host test still exercises the restore ──────────────────────────
+if ! has tests/env_migrate_host_test.c "env_migrate_restore("; then
+    bad "R. env_migrate_host_test.c no longer calls env_migrate_restore() — Phase G is gone and the restore's behaviour is unproven"
+elif ! has tests/env_migrate_host_test.c "env_migrate_tick("; then
+    bad "R. env_migrate_host_test.c no longer drives env_migrate_tick() — the sweep's bounds (period, cap, ownership wait) are unproven"
+else
+    ok "R. the host test still drives both the restore and its sweep"
+fi
+
+# ══ P3 increment 5 clauses: the confirmation, then the gated teardown ══
+
+# ── S. The wire pair exists end to end ────────────────────────────────────
+if ! has net/dspp.h "DSPP_MIGRATE_ENV_LIVE_REQ"; then
+    bad "S. net/dspp.h no longer defines the LIVE_REQ opcode — the source has no question to ask"
+elif ! has net/dspp.h "DSPP_MIGRATE_ENV_LIVE_ACK"; then
+    bad "S. net/dspp.h no longer defines the LIVE_ACK opcode — the destination has no word to give"
+elif ! has net/dspp.c "opcode >= DSPP_MIGRATE_ENV_BEGIN_REQ && opcode <= DSPP_MIGRATE_ENV_LIVE_ACK"; then
+    bad "S. the ENV dispatch range no longer reaches LIVE_ACK — the destination's word would be silently dropped on arrival"
+elif ! has net/dspp.h "dspp_env_migrate_send_live("; then
+    bad "S. net/dspp.h no longer declares the LIVE_REQ sender — the source could not ask even if it wanted to"
+elif ! has kernel/env_migrate.c "dspp_env_migrate_send_live("; then
+    bad "S. env_migrate.c's walk no longer sends the LIVE_REQ poll — the source would never ask, and every teardown would wait a bounded forever while the destination's word went unrequested"
+elif ! has net/dspp.c "env_migrate_live_query(h->partition_id"; then
+    bad "S. dspp.c no longer answers LIVE_REQ from env_migrate_live_query() — the destination's word would come from the packet instead of its own state"
+elif ! has net/dspp.c "env_migrate_live_ack(h->partition_id"; then
+    bad "S. dspp.c no longer records LIVE_ACK through env_migrate_live_ack() — the source would poll into the void and never tear down"
+else
+    ok "S. the confirmation pair is wired end to end (both opcodes, the dispatch range, the poll, the query and the ack)"
+fi
+
+# ── T. The word is grounded in what the destination actually restored ────
+marker_set=$(grep -cF "env_migrate_restored_mark(partition_id, index);" kernel/env_migrate.c)
+if [ "${marker_set:-0}" -ne 1 ]; then
+    bad "T. the restored marker is set ${marker_set:-0} time(s), not exactly once — it must be set ONLY by the pour's success tail; a marker set anywhere else confirms a source off an environment that was never poured, and one set nowhere means nothing is ever confirmed"
+elif ! has kernel/env_migrate.c "env_migrate_restored_here("; then
+    bad "T. env_migrate_live_query() no longer consults the restored marker — the word would rest on the record's existence, which a refused pour also leaves behind"
+else
+    ok "T. the destination answers from the restored marker, set exactly once (the pour's success tail)"
+fi
+
+# ── U. The teardown is gated on the destination's word ────────────────────
+unconfirmed_line=$(grep -nE "if \(!c->confirmed\)" kernel/env_migrate.c | head -1 | cut -d: -f1)
+destroy_line=$(grep -nE "env_service_destroy\(env_id" kernel/env_migrate.c | head -1 | cut -d: -f1)
+if [ -z "${unconfirmed_line:-}" ] || [ -z "${destroy_line:-}" ]; then
+    bad "U. could not locate both the not-confirmed branch and the teardown in env_migrate.c's walk (gate=${unconfirmed_line:-absent}, destroy=${destroy_line:-absent}) — a walk with no gate reaches env_service_destroy() on the arm alone (P3_TOOTH=confirm-first)"
+elif [ "$unconfirmed_line" -ge "$destroy_line" ]; then
+    bad "U. the not-confirmed branch (line $unconfirmed_line) no longer precedes the teardown (line $destroy_line) — a confirmation not yet received could reach env_service_destroy() (P3_TOOTH=confirm-first)"
+elif ! has kernel/env_migrate.c "partition_get_owner_node(c->partition_id) == cluster_local_node_id()"; then
+    bad "U. the walk no longer disarms when this node owns the partition again — records that are the truth again (an aborted migration, a return) would be destroyed"
+else
+    ok "U. the walk gates the teardown: not-confirmed before destroy (line $unconfirmed_line < $destroy_line), and local ownership disarms"
+fi
+
+# ── V. The arm: exactly once, after every payload confirmed ───────────────
+arm_calls=$(grep -cF "env_migrate_arm_confirms(partition_id, dest_node_id);" kernel/env_migrate.c)
+if [ "${arm_calls:-0}" -ne 1 ]; then
+    bad "V. the confirmation arm runs ${arm_calls:-0} time(s), not exactly once — armed anywhere but the end of a fully-confirmed send it could destroy environments that never left"
+elif ! has kernel/env_migrate.h "env_migrate_pending_count"; then
+    bad "V. env_migrate.h no longer declares env_migrate_pending_count() — a confirmation that never arrives must be countable, not suspected"
+elif ! has kernel/env_migrate.c "uint32_t env_migrate_pending_count(void)"; then
+    bad "V. env_migrate.c no longer defines env_migrate_pending_count() — a declaration with no definition is a link error at best"
+else
+    ok "V. the arm happens exactly once, at the end of a fully-confirmed send, and pending confirmations are countable"
+fi
+
+# ── W. The frames wait for the records ────────────────────────────────────
+if ! has kernel/partition.c "if (envs_moved > 0)"; then
+    bad "W. partition.c's Step 5 no longer defers the reclamation when environments moved — the source's frames would go back to the pool while its environments' sidecars still run on them (two owners, one frame)"
+elif ! has kernel/env_migrate.c "partition_reclaim_all_frames(c->partition_id)"; then
+    bad "W. env_migrate.c's walk no longer completes the deferred reclamation — a migrated partition's frames would never come back (a silent, permanent leak)"
+elif ! has kernel/env_migrate.c "!env_migrate_partition_records_remain(c->partition_id)"; then
+    bad "W. the walk completes the reclamation without the records-remain gate — it could reclaim frames under a record (and sidecars) still standing here, which is the double-ownership defect in miniature"
+else
+    ok "W. the reclamation is deferred on the move and completed by the walk only when no record of the partition remains"
+fi
+
+# ── X. Every dspp.c-linking test stands in for the confirmation pair ──────
+missing=""
+for t in tests/*_host_test.c; do
+    cmd=$(awk '/\* *gcc /{grab=1}
+               grab { line=$0
+                      gsub(/\r/, "", line)
+                      sub(/^[[:space:]]*\*[[:space:]]?/, "", line)
+                      print line
+                      if (line !~ /\\[[:space:]]*$/) exit }' "$t" | tr '\n' ' ')
+    case "$cmd" in
+        *net/dspp.c*) ;;
+        *) continue ;;
+    esac
+    case "$cmd" in
+        *kernel/env_migrate.c*) continue ;;   # the real definitions are linked
+    esac
+    if ! grep -qE "env_migrate_live_query\(" "$t"; then
+        missing="$missing $t"
+    fi
+done
+if [ -n "$missing" ]; then
+    bad "X. these host tests link net/dspp.c (which now routes LIVE_REQ/LIVE_ACK through env_migrate_live_query/live_ack) without linking kernel/env_migrate.c and without a stand-in, so they fail at LINK time:$missing"
+else
+    ok "X. every host test linking net/dspp.c links the real confirmation pair or defines a stand-in for it"
+fi
+
+# ── Y. The host test still exercises the confirmation ────────────────────
+if ! has tests/env_migrate_host_test.c "env_migrate_live_query("; then
+    bad "Y. env_migrate_host_test.c no longer calls env_migrate_live_query() — what the destination's word is grounded in is unproven"
+elif ! has tests/env_migrate_host_test.c "env_migrate_pending_count("; then
+    bad "Y. env_migrate_host_test.c no longer checks env_migrate_pending_count() — the gated teardown (armed, waiting, completed) is unproven"
+else
+    ok "Y. the host test still drives the confirmation pair and the pending count"
 fi
 
 echo

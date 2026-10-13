@@ -21,6 +21,27 @@
 #     no longer returns, so the counts are decoration and ownership moves
 #     anyway: the live-cluster bug, verbatim.
 #
+# The restore half (P3 increment 4) adds its own worth-stating pair:
+#
+#   * `L` — the ownership gate moved AFTER the create: a follower could
+#     rebuild an environment for a partition it does not serve.
+#   * `N` — a pre-create refusal releases the staged slot: bytes a retry
+#     could still have used are freed on a path where nothing was created.
+#
+# The confirmation half (P3 increment 5, the gated teardown) adds the one
+# that is this increment's defect verbatim, plus its supporting cast:
+#
+#   * `U` — the not-confirmed branch deleted: a teardown reachable on the
+#     ARM alone, before the destination has said a word. The source would
+#     destroy its records for an environment whose fate there is unknown.
+#   * `T` — the restored marker no longer set exactly once, so the word no
+#     longer rests on what the destination actually poured.
+#   * `S`/`V`/`W` — a leg of the confirmation wire removed, the arm
+#     duplicated beyond the fully-confirmed send, and the frames reclaimed
+#     without the records-remain gate (two owners, one frame).
+#   * `X`/`Y` — a dspp.c-linking host test left without the stand-in, and
+#     the host test itself stopped exercising the confirmation.
+#
 # The last tooth is the vacuity control — the guard must be GREEN on the
 # real, unmutated tree. Without it, a guard that always failed would pass
 # every other tooth in this file.
@@ -53,6 +74,9 @@ SEED_FILES=(
     kernel/env_migrate.h
     kernel/env_ckpt.c
     kernel/env_ckpt.h
+    net/http.c
+    net/dspp.c
+    net/dspp.h
     tests/env_migration_check.sh
     tests/env_migrate_host_test.c
     tests/partition_migrate_phase6_host_test.c
@@ -61,7 +85,7 @@ SEED_FILES=(
 
 seed() {   # seed <dir>
     rm -rf "$1"
-    mkdir -p "$1/kernel" "$1/tests"
+    mkdir -p "$1/kernel" "$1/net" "$1/tests"
     local f
     for f in "${SEED_FILES[@]}"; do
         cp "$ROOT/$f" "$1/$f" || return 1
@@ -87,7 +111,7 @@ tooth() {   # tooth <name> <expected-clause> <dir>; the mutation has already run
     fi
 }
 
-echo "env_migration_check_smoke — teeth for the P3 increment 3 wiring guard"
+echo "env_migration_check_smoke — teeth for the P3 increments 3–5 wiring guard"
 echo "======================================================================"
 echo
 
@@ -157,7 +181,10 @@ tooth "G. the release stops restoring each record's prior flags" "G" "$W/g"
 
 # ── H. The not-yet-replayed gate unwired ───────────────────────────────────
 seed "$W/h"
-sed -i '/if (!env_ckpt_restore_pending_record(partition_id/d' "$W/h/kernel/env_migrate.c"
+# Every call, not just the send-side one: increment 4 added a second gate
+# (the restore's own live check), and a tooth that left any one of them in
+# place would leave clause H green and prove nothing.
+sed -i '/env_ckpt_restore_pending_record(/d' "$W/h/kernel/env_migrate.c"
 tooth "H. the pending-record gate no longer called before anything is read" "H" "$W/h"
 
 # ── I. A partition.c-linking test left without the new dependency ──────────
@@ -184,6 +211,125 @@ tooth "J. the orchestration test stops asserting ownership was local when the st
 seed "$W/j2"
 sed -i '/CHECK(env_step_calls == 0/d' "$W/j2/tests/partition_migrate_default_path_host_test.c"
 tooth "J. the default-path test stops asserting the step never runs" "J" "$W/j2"
+
+# ══ P3 increment 4 teeth: the restore half ═══════════════════════════════
+
+# ── K. The sweep stops restoring what the wire staged ─────────────────────
+seed "$W/k"
+sed -i '/env_migrate_tick(kernel_tick_counter);/d' "$W/k/net/http.c"
+tooth "K. the BSP sweep no longer drives the restore (staged bytes held forever)" "K" "$W/k"
+
+# ── L. The ownership gate moved AFTER the create ──────────────────────────
+# The two lines of the gate are cut and re-inserted after the create, so the
+# clause must fail on the ORDER rather than on the gate's mere presence.
+seed "$W/l"
+python3 - "$W/l/kernel/env_migrate.c" <<'PY'
+import sys
+p = sys.argv[1]
+lines = open(p, encoding="utf-8").read().split("\n")
+start = next(i for i, l in enumerate(lines)
+             if "partition_get_owner_node(partition_id) != cluster_local_node_id()" in l)
+gate = lines[start:start + 2]
+del lines[start:start + 2]
+create = next(i for i, l in enumerate(lines)
+              if "int rc = env_service_create(partition_id, index" in l)
+lines[create + 1:create + 1] = gate
+open(p, "w", encoding="utf-8", newline="\n").write("\n".join(lines))
+PY
+tooth "L. the ownership gate moved after the create (a follower could rebuild someone else's tenant)" "L" "$W/l"
+
+# ── M. The create-failure path stops dropping the stored record ───────────
+seed "$W/m"
+python3 - "$W/m/kernel/env_migrate.c" <<'PY'
+import sys
+p = sys.argv[1]
+lines = open(p, encoding="utf-8").read().split("\n")
+idx = [i for i, l in enumerate(lines) if l.strip() == "env_ckpt_drop(partition_id, index);"]
+del lines[idx[-1]]   # the create-failure path's drop
+open(p, "w", encoding="utf-8", newline="\n").write("\n".join(lines))
+PY
+tooth "M. a refused create leaves its stored record behind (half-applied restore)" "M" "$W/m"
+
+# ── N. The slot released BEFORE the environment exists ────────────────────
+seed "$W/n"
+python3 - "$W/n/kernel/env_migrate.c" <<'PY'
+import sys
+p = sys.argv[1]
+lines = open(p, encoding="utf-8").read().split("\n")
+inc = next(i for i, l in enumerate(lines)
+           if "return env_migrate_refuse(ENV_MIGRATE_REFUSE_INCOMPLETE" in l)
+lines[inc:inc] = ["            env_migrate_recv_drop(partition_id, index);"]
+open(p, "w", encoding="utf-8", newline="\n").write("\n".join(lines))
+PY
+tooth "N. a pre-create refusal now releases the staged slot (a retry could still have used the bytes)" "N" "$W/n"
+
+# ── O. The placement gate deleted: the pour runs unvalidated ──────────────
+seed "$W/o"
+sed -i '/refuse_code = ENV_MIGRATE_REFUSE_PLACEMENT;/d' "$W/o/kernel/env_migrate.c"
+tooth "O. the placement rule gone: bytes cross for base X and land wherever" "O" "$W/o"
+
+# ── P. The flag-pause read but never acted on ─────────────────────────────
+seed "$W/p"
+sed -i '/(void)partition_pause(partition_id);/d' "$W/p/kernel/env_migrate.c"
+tooth "P. the staged record's PAUSED flag no longer pauses the destination's partition" "P" "$W/p"
+
+# ── Q. The attempts cap defined but never enforced ────────────────────────
+seed "$W/q"
+sed -i '/#define ENV_MIGRATE_RESTORE_MAX_TRIES/d' "$W/q/kernel/env_migrate.c"
+tooth "Q. the sweep's attempts cap removed (a failing create retries forever)" "Q" "$W/q"
+
+# ── R. The host test stops exercising the restore ────────────────────────
+seed "$W/r"
+sed -i 's/env_migrate_restore(/env_migrate_restore_MUTATED(/g' "$W/r/tests/env_migrate_host_test.c"
+tooth "R. the host test no longer calls the restore (Phase G unproven)" "R" "$W/r"
+
+# ══ P3 increment 5 teeth: the confirmation, then the gated teardown ══════
+
+# ── S. A leg of the confirmation wire removed (the ack never recorded) ────
+seed "$W/s"
+sed -i '/env_migrate_live_ack(h->partition_id/d' "$W/s/net/dspp.c"
+tooth "S. dspp.c stops recording the destination's word (the source polls into the void)" "S" "$W/s"
+
+# ── T. The restored marker no longer set exactly once ─────────────────────
+# Removed from the pour's success tail: the marker would never be set, so
+# nothing would ever be confirmed — and if it were set ANYWHERE ELSE the
+# word would rest on something other than the pour. Either way the count
+# must stop being exactly one.
+seed "$W/t"
+sed -i '/env_migrate_restored_mark(partition_id, index);/d' "$W/t/kernel/env_migrate.c"
+tooth "T. the restored marker no longer set by the pour's success tail (the word ungrounded)" "T" "$W/t"
+
+# ── U. THE TOOTH: the not-confirmed gate deleted ──────────────────────────
+# The increment's defect verbatim: a teardown reachable on the arm alone,
+# before the destination has said the environment is live there. The source
+# would destroy the records (and sidecars, and frames) of an environment
+# whose fate on the destination is unknown.
+seed "$W/u"
+sed -i '/if (!c->confirmed) {/d' "$W/u/kernel/env_migrate.c"
+tooth "U. confirm-first: the not-confirmed gate deleted (a teardown reachable without the destination's word)" "U" "$W/u"
+
+# ── V. The arm duplicated beyond the fully-confirmed send ─────────────────
+seed "$W/v"
+sed -i 's/^    env_migrate_arm_confirms(partition_id, dest_node_id);$/    env_migrate_arm_confirms(partition_id, dest_node_id);\n    env_migrate_arm_confirms(partition_id, dest_node_id);/' "$W/v/kernel/env_migrate.c"
+tooth "V. the arm runs twice (armed beyond the end of a fully-confirmed send)" "V" "$W/v"
+
+# ── W. The frames reclaimed without the records-remain gate ───────────────
+seed "$W/w"
+sed -i '/!env_migrate_partition_records_remain(c->partition_id)/d' "$W/w/kernel/env_migrate.c"
+tooth "W. the deferred reclamation completed without the records-remain gate (frames under a record still standing)" "W" "$W/w"
+
+# ── X. A dspp.c-linking host test left without the confirmation stand-in ──
+# workload_ctx_host_test.c: the file that links net/dspp.c (and so now
+# routes LIVE_REQ/LIVE_ACK) but links the real kernel/env_migrate.c
+# nowhere. Removing its stand-in must be seen by clause X by name.
+seed "$W/x"
+sed -i '/env_migrate_live_query(/,+2d' "$W/x/tests/workload_ctx_host_test.c"
+tooth "X. a dspp.c-linking host test with neither the real confirmation pair nor a stand-in (workload_ctx_host_test.c)" "X" "$W/x"
+
+# ── Y. The host test stops exercising the confirmation ────────────────────
+seed "$W/y"
+sed -i 's/env_migrate_live_query(/env_migrate_live_query_MUTATED(/g' "$W/y/tests/env_migrate_host_test.c"
+tooth "Y. the host test no longer calls env_migrate_live_query (the word's grounding unproven)" "Y" "$W/y"
 
 # ── The vacuity control: green on the real tree ────────────────────────────
 out="$(bash "$GUARD" 2>&1)"; rc=$?
