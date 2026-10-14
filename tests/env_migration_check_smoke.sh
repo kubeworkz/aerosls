@@ -353,6 +353,18 @@ seed "$W/ab"
 sed -i 's/opcode <= DSPP_MIGRATE_ENV_INTENT/opcode <= DSPP_MIGRATE_ENV_LIVE_ACK/' "$W/ab/net/dspp.c"
 tooth "AB. the dispatch no longer routes the intent opcode (the announce falls through unheard)" "AB" "$W/ab"
 
+# ── AC. The silence arithmetic wraps on a stamp ahead of the sample ────────
+# The live defect verbatim: last_seen_tick is stamped by the heartbeat RX
+# path (timer ISR / AP core) while failover_tick()'s `now` is sampled by the
+# BSP sweep, so the stamp can land ahead of the sample and the unsigned
+# subtraction wraps to ~2^64 — past FAILOVER_DEAD_TICKS. A DEFERRED line
+# merely printed a silly number; on an ungated peer it declares DEAD the very
+# sweep that heard it.
+seed "$W/ac"
+sed -i '/uint64_t silence = (now > peers\[i\]\.last_seen_tick)/c\        uint64_t silence = now - peers[i].last_seen_tick;   /* MUTATED: wraps */' "$W/ac/kernel/failover.c"
+sed -i '/? now - peers\[i\]\.last_seen_tick : 0;/d' "$W/ac/kernel/failover.c"
+tooth "AC. the silence arithmetic wraps again on a heartbeat stamped ahead of the tick sample (a just-heard peer declared DEAD)" "AC" "$W/ac"
+
 # ── The vacuity control: green on the real tree ────────────────────────────
 out="$(bash "$GUARD" 2>&1)"; rc=$?
 if [ "$rc" -eq 0 ]; then

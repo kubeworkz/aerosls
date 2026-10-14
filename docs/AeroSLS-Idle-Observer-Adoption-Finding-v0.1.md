@@ -162,12 +162,27 @@ Two adjacent defects surfaced while proving this — one fixed, one noted:
    confirmed"). A re-BEGIN carrying the same identity-derived transfer_id
    AND the same record is now answered READY without touching the slot; a
    different record stays refused (host pin E4 holds, new pin E4b).
-2. **A uint64 silence underflow was observed once (NOT FIXED, cosmetic).**
+2. **A uint64 silence underflow was observed once (FIXED 2026-10-13).**
    One `declaration DEFERRED` line printed `silent 18446744073709551606
    ticks` — `now - last_seen_tick` underflowed (last_seen noted "ahead" of
    the sweep's sampled now). The deferral still held, but the same
-   arithmetic on an ungated peer would declare instantly. Worth a
-   `if (now < last_seen) last_seen = now` guard in `failover_tick()`.
+   arithmetic on an ungated peer would declare instantly. Root cause is
+   structural, not a clock bug: the two operands come from different
+   contexts. `now` is read once at `failover_tick()`'s call site on the BSP
+   sweep (`net/http.c:7226`), while `last_seen_tick` is stamped by the
+   heartbeat RX path (`process_consensus_packet()` ->
+   `failover_note_heartbeat()`, fed from the timer ISR / AP core), so a
+   heartbeat landing between those two reads legitimately leaves
+   `last_seen_tick > now` and the unsigned subtraction wraps to ~2^64 —
+   past `FAILOVER_DEAD_TICKS`. Fixed with a saturating subtraction in
+   `failover_tick()` (a stamp at or after `now` means the peer was seen at
+   least as recently as this sample: silence is zero), not with the
+   `last_seen = now` rewrite this note originally suggested — clamping the
+   stamp would discard the fresher evidence for every later sweep.
+   Pinned in `tests/checkpoint_recovery_host_test.c` on both sides (a peer
+   stamped ahead of the sample is neither DEAD nor SUSPECTED at that tick,
+   and is still declared 300 ticks of real silence later) and held by
+   clause AC of `env_migration_check.sh` with its smoke tooth.
 
 ## Coverage gaps
 

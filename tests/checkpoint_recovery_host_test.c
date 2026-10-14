@@ -271,6 +271,35 @@ static void test_liveness(void) {
     failover_tick(352);
     CHECK(failover_peer_status(7) == PEER_DEAD,
           "...and declared dead on the first tick after the intent budget expires");
+
+    /* The stamp-ahead case (observed live 2026-10-13, a DEFERRED line that
+     * printed "silent 18446744073709551606 ticks" = -10 unsigned): the two
+     * operands of the silence subtract come from different contexts, so the
+     * stamp may legitimately land AHEAD of the sample. `now` is read once at
+     * failover_tick()'s BSP-sweep call site (net/http.c), while
+     * last_seen_tick is stamped by the heartbeat RX path
+     * (process_consensus_packet -> failover_note_heartbeat, timer ISR / AP
+     * core). A heartbeat landing between those two reads leaves
+     * last_seen_tick > now, and an unsigned subtraction wraps to ~2^64 —
+     * past FAILOVER_DEAD_TICKS. The arithmetic must saturate: a peer heard
+     * at or after `now` has silence zero, not ~2^64. The pair below pins
+     * both halves — not declared on the wrapped tick, and still declared
+     * once real silence crosses the threshold from the same stamp — because
+     * a saturation that simply never declared would be a blindfold, not a
+     * fix. */
+    failover_init();
+    failover_note_heartbeat(9, 400);
+    failover_tick(390);   /* now is 10 ticks BEHIND the stamp: the wrap case */
+    CHECK(failover_peer_status(9) != PEER_DEAD,
+          "*** a heartbeat stamped ahead of the tick sample is NOT ~2^64 ticks of silence ***");
+    CHECK(failover_peer_status(9) != PEER_SUSPECTED,
+          "...and is not even suspected: from this sample the peer was just heard");
+    failover_tick(699);   /* 699 - 400 = 299, still under the threshold */
+    CHECK(failover_peer_status(9) != PEER_DEAD,
+          "...and 299 ticks of REAL silence from that stamp still defer the declaration");
+    failover_tick(701);   /* 701 - 400 = 301 >= FAILOVER_DEAD_TICKS */
+    CHECK(failover_peer_status(9) == PEER_DEAD,
+          "...but 301 ticks of real silence from the SAME stamp declares it dead");
 }
 
 /* ─── Scenario 2: node comes back from the dead ────────────────────── */

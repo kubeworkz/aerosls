@@ -82,7 +82,23 @@ void failover_tick(uint64_t now) {
         if (!peers[i].active) continue;
         if (peers[i].status == PEER_DEAD) continue;
 
-        uint64_t silence = now - peers[i].last_seen_tick;
+        /* Saturating, not wrapping (observed live 2026-10-13: a DEFERRED
+         * line printed "silent 18446744073709551606 ticks" = -10 in
+         * unsigned). The two operands come from DIFFERENT contexts, so the
+         * stamp can legitimately land AHEAD of the sample: `now` is read
+         * once at this function's call site on the BSP sweep
+         * (net/http.c), while last_seen_tick is stamped by the heartbeat
+         * RX path (process_consensus_packet -> failover_note_heartbeat,
+         * fed from the timer ISR / AP core). A heartbeat processed between
+         * the sweep's read of kernel_tick_counter and this comparison
+         * leaves last_seen_tick > now, and the unsigned subtraction wraps
+         * to ~2^64 — comfortably past FAILOVER_DEAD_TICKS. The DEFERRED
+         * lines below merely printed a silly number; the same arithmetic
+         * on an ungated peer would declare DEAD the very sweep the peer
+         * was heard on. A stamp at or after `now` means the peer was seen
+         * at least as recently as this sample: silence is zero. */
+        uint64_t silence = (now > peers[i].last_seen_tick)
+                         ? now - peers[i].last_seen_tick : 0;
         if (silence >= FAILOVER_DEAD_TICKS) {
             /* P3 live arm (2026-10-13): a silence this node's OWN
              * environment migration produced is not a death. The source's

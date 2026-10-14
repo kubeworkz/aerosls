@@ -550,6 +550,28 @@ else
     ok "AB. the intent announce has an opcode, a sender, and an RX path heard before the self-filter"
 fi
 
+# ── AC. The silence arithmetic saturates instead of wrapping ──────────────
+# The live find (docs/AeroSLS-Idle-Observer-Adoption-Finding-v0.1.md): a
+# DEFERRED line printed "silent 18446744073709551606 ticks" — -10 as
+# unsigned. The two operands come from different contexts: `now` is read at
+# failover_tick()'s BSP-sweep call site (net/http.c) while last_seen_tick is
+# stamped by the heartbeat RX path (process_consensus_packet ->
+# failover_note_heartbeat, timer ISR / AP core), so a heartbeat landing
+# between those two reads leaves last_seen_tick > now and the unsigned
+# subtraction wraps past FAILOVER_DEAD_TICKS. Harmless behind a gate that was
+# already deferring; fatal on an ungated peer, which would be declared DEAD
+# on the very sweep that heard it.
+ac_g=$(awk '/uint64_t silence = \(now > peers\[i\]\.last_seen_tick\)/{f=1} f && /\? now - peers\[i\]\.last_seen_tick : 0;/{print NR; exit}' kernel/failover.c)
+if [ -z "$ac_g" ]; then
+    bad "AC. failover.c's silence arithmetic no longer saturates — a heartbeat stamped ahead of the sweep's tick sample (the RX path stamps it, this path samples it) wraps to ~2^64 ticks and declares a just-heard peer DEAD"
+elif ! has tests/checkpoint_recovery_host_test.c "stamped ahead of the tick sample"; then
+    bad "AC. the host test no longer pins the stamp-ahead case — the wrap is only reachable from two contexts, so a host build is where it must be pinned"
+elif ! has tests/checkpoint_recovery_host_test.c "SAME stamp declares it dead"; then
+    bad "AC. the host test no longer pins the far side of the stamp-ahead case — saturation that never declares would be a blindfold, not a fix"
+else
+    ok "AC. the silence arithmetic saturates on a stamp ahead of the sample, pinned on both sides (not declared on the wrap, still declared 300 ticks later)"
+fi
+
 echo
 if [ "$fail" -eq 0 ]; then
     echo "---- env_migration_check: ALL INVARIANTS HOLD"
