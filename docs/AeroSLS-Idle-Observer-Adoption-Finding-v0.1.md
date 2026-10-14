@@ -1,11 +1,12 @@
 # The idle-observer adoption finding (v0.1)
 
-**Status:** diagnosed live, not yet fixed. **Observed:** 2026-10-13, twice, on real
+**Status:** diagnosed live 2026-10-13, FIXED the same day (migration-intent
+announce, option A below — see "Resolution"). **Observed:** twice, on real
 3-node TCG clusters (`tests/env_migrate_confirm_live_check.sh`, fresh disks).
-**Reproduce:** `tools/repro_observer_incident.sh` boots a fresh 3-node cluster and
-runs the confirm guard; the incident fires within seconds of the guard's
-`env create` (guard exits 1 at the migrate step: `partition 1 is already owned by
-node 1 -- nothing to migrate`).
+**Reproduce:** `tools/repro_observer_incident.sh` boots a fresh 3-node cluster
+and runs the confirm guard — it now PASSES on that shape; before the fix it
+exited 1 at the migrate step (`partition 1 is already owned by node 1 --
+nothing to migrate`).
 
 ## What was seen (live evidence)
 
@@ -74,7 +75,7 @@ merely makes such blocks routine and sustained. Any fix aimed only at
 
 ## Fix options
 
-**A. Migration-intent announce (recommended).** Before the blocking phase
+**A. Migration-intent announce (recommended; IMPLEMENTED 2026-10-13).** Before the blocking phase
 begins — at the env-create route entry (`net/http.c:3063`) and at the migrate
 send entry — the source stamps a local intent and TXes a one-shot cluster
 announce ("node N has env work in flight for partition P, budget B"). Receiving
@@ -116,6 +117,57 @@ for a REAL leader death, adoption can hand out ownership of partitions whose
 payload lived only on the dead node's NVMe, silently. Data-preserving
 adoption (require the checkpoint to actually carry the partition's payload,
 or mark adopted partitions degraded) deserves its own increment.
+
+## Resolution (2026-10-13)
+
+Option A landed, symmetric on both roles of a migration:
+
+- **Source side:** `partition_migrate()` and both operator env-create entries
+  (`net/http.c`, `user/shell.c`) call `env_migrate_intent_begin()` BEFORE
+  their blocking work — the stamp feeds `env_migrate_in_flight()` (the local
+  gate now also covers the create/capture/send window, which previously had
+  no deferral face at all) and transmits `DSPP_MIGRATE_ENV_INTENT` (a
+  broadcast; every peer latches it through `env_migrate_recv_intent`,
+  clamped to `ENV_MIGRATE_INTENT_GRACE_TICKS`).
+- **Destination side:** the restore loop announces before each restore
+  attempt, so an idle observer cannot declare the RESTORING node dead
+  either — the live 3-node run before this half showed exactly that
+  (a `declared DEAD` of the restoring destination, observe-only only by
+  role luck).
+- **The gate:** `failover_tick()` asks `env_migrate_peer_in_flight(peer)`
+  before declaring, beside the local gate. Pinned in
+  `tests/checkpoint_recovery_host_test.c` (the gate asks about the SILENT
+  PEER by identity, and death is declared the tick after the budget
+  expires) and `tests/env_migrate_host_test.c` (local stamp, the wire
+  frame, the latch, the clamp, the bounded expiry, the reset).
+- **Source guard teeth:** clauses Z/AA/AB of `env_migration_check.sh` (+
+  teeth in its smoke) hold the wiring: the declaration gate consults the
+  latch, every entry announces BEFORE its block (order-checked), the
+  opcode is defined/routed/heard before the self-filter.
+
+**Live proof** (fresh-disk clusters, the confirm guard):
+3-node PASS twice (19:11, 19:21 — every face fired: both observers latched
+the announces and printed `declaration DEFERRED`, the destination printed
+`DEFERRED: node N announced environment-migration intent`, the restore
+completed LIVE and the teardown ran on the word), and the original 2-node
+shape still PASSes (19:40).
+
+Two adjacent defects surfaced while proving this — one fixed, one noted:
+
+1. **A re-BEGIN of the same transfer was refused (FIXED).**
+   `env_migrate_recv_begin` refused any BEGIN for an already-staged
+   identity (rc=5), so the documented retransmission model failed exactly
+   when a lossy/fresh-boot link needed it: a late BEGIN ACK made the source
+   re-ask, the refusal abandoned a healthy migrate mid-send ("a page never
+   confirmed"). A re-BEGIN carrying the same identity-derived transfer_id
+   AND the same record is now answered READY without touching the slot; a
+   different record stays refused (host pin E4 holds, new pin E4b).
+2. **A uint64 silence underflow was observed once (NOT FIXED, cosmetic).**
+   One `declaration DEFERRED` line printed `silent 18446744073709551606
+   ticks` — `now - last_seen_tick` underflowed (last_seen noted "ahead" of
+   the sweep's sampled now). The deferral still held, but the same
+   arithmetic on an ungated peer would declare instantly. Worth a
+   `if (now < last_seen) last_seen = now` guard in `failover_tick()`.
 
 ## Coverage gaps
 

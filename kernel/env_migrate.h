@@ -334,6 +334,51 @@ int env_migrate_in_flight(void);
 #define ENV_MIGRATE_SLOT_GRACE_TICKS        60000ull  /* 600 s at ~100 Hz */
 #define ENV_MIGRATE_RESOLVED_GRACE_TICKS     30000ull  /* 300 s */
 
+/* ─── Migration intent (the idle-observer arm) ──────────────────────────────
+ * The three grace faces above cover only a node that HOLDS migration state:
+ * the destination's staging slot, the source's armed confirmation. The live
+ * 3-node runs of 2026-10-13 (docs/AeroSLS-Idle-Observer-Adoption-Finding-
+ * v0.1.md) showed the gap that leaves: a third node with no migration
+ * knowledge declared the busy SOURCE dead — the consensus leader's own
+ * blocking work (the env-create RPC wait, the synchronous payload send) runs
+ * on the sweep that transmits the only heartbeat stream — won the election
+ * the blocked node could not contest, and adopted every partition in its
+ * checkpoint. No local gate can ever see that: the knowledge lives on the
+ * blocked node.
+ *
+ * The intent makes it cluster knowledge BEFORE the block begins:
+ * env_migrate_intent_begin() stamps this node's own gate (so its own
+ * declarations defer too) and transmits a broadcast announce; every peer
+ * latches the budget through env_migrate_recv_intent() (the wire entry, from
+ * net/dspp.c) and failover_tick() consults env_migrate_peer_in_flight()
+ * beside the local gate. The announce is one-shot because it must precede
+ * the block — a blocked node transmits nothing — so the budget is sized for
+ * the whole blocking phase. Bounded like every other face: a leader that
+ * genuinely dies mid-migration delays failover by at most the remaining
+ * budget, and a peer that merely CLAIMS intent cannot extend past the cap
+ * recv_intent clamps to. */
+#define ENV_MIGRATE_INTENT_GRACE_TICKS      30000ull  /* 300 s */
+
+/* Announce this node's migration intent: stamp the local gate and TX the
+ * broadcast. Called at the operator-reachable entries whose work blocks the
+ * BSP sweep — partition_migrate() before its capture+send, the env-create
+ * routes before the create RPC. NOT called by the restore's own create (the
+ * destination is already covered by its staging slot) nor by boot replay
+ * (no cluster to announce to yet). */
+void env_migrate_intent_begin(void);
+
+/* The wire entry (net/dspp.c's dispatch): latch a peer's announced intent.
+ * budget_ticks is clamped to [1, ENV_MIGRATE_INTENT_GRACE_TICKS] — a peer
+ * cannot shield itself past the cap — and node 0 (the reserved sentinel) is
+ * ignored. */
+void env_migrate_recv_intent(uint32_t node_id, uint32_t budget_ticks);
+
+/* 1 while node_id's announced intent budget has not expired. The failover
+ * declaration gate's second question, after this node's own
+ * env_migrate_in_flight(): "does the silent peer hold migration work we can
+ * see?" */
+int env_migrate_peer_in_flight(uint32_t node_id);
+
 /* Wire entries (called only by net/dspp.c's dispatch). live_query is the
  * destination's answer: 0 only when THIS node owns the partition, the
  * environment's record is live here, and it was restored WITH ITS CONTENTS

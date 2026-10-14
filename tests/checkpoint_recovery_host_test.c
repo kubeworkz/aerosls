@@ -57,6 +57,18 @@ int cluster_is_leader(void) { return 0; }
 int g_env_migrate_in_flight = 0;
 int env_migrate_in_flight(void) { return g_env_migrate_in_flight; }
 
+/* The peer half of the same gate (the idle-observer arm): failover.c asks
+ * env_migrate_peer_in_flight() about the SILENT PEER before declaring it
+ * dead, because the knowledge lives on that peer (it announced intent before
+ * blocking its sweep), not here. The stub records which node was asked so the
+ * pin can prove the gate consults the right identity. */
+static uint32_t g_peer_in_flight_asked = 0;
+static int g_env_migrate_peer_in_flight = 0;
+int env_migrate_peer_in_flight(uint32_t node_id) {
+    g_peer_in_flight_asked = node_id;
+    return g_env_migrate_peer_in_flight;
+}
+
 /* Roster stubs -- failover.c's leader broadcast iterates these; an empty
  * roster makes it a no-op in this test (no live cluster). */
 struct ClusterPeer cluster_roster[CLUSTER_NODE_MAX];
@@ -235,6 +247,30 @@ static void test_liveness(void) {
     failover_tick(352);
     CHECK(failover_peer_status(4) == PEER_DEAD,
           "...and declared dead on the first tick after the migration resolves");
+
+    /* The idle-observer arm (docs/AeroSLS-Idle-Observer-Adoption-Finding-
+     * v0.1.md): a peer that ANNOUNCED migration intent is not declared dead
+     * while its budget stands — even when THIS node holds no migration state
+     * of its own. That is the live 3-node failure: the busy SOURCE stopped
+     * beating (its blocking work runs on the sweep that transmits the
+     * leader's heartbeat), an idle observer won the election the blocked
+     * node could not contest and adopted every partition in the source's
+     * checkpoint — every node alive, the migrating environment destroyed.
+     * The gate must ask about the SILENT PEER by identity, and the deferral
+     * must end when the budget does. */
+    failover_init();
+    failover_note_heartbeat(7, 0);
+    g_env_migrate_peer_in_flight = 1;
+    g_peer_in_flight_asked = 0;
+    failover_tick(351);  /* silence 301 >= DEAD, but node 7 announced intent */
+    CHECK(failover_peer_status(7) != PEER_DEAD,
+          "*** node 7 NOT declared dead while its announced migration intent stands ***");
+    CHECK(g_peer_in_flight_asked == 7,
+          "*** ...and the gate asked about node 7 -- the SILENT PEER, by identity ***");
+    g_env_migrate_peer_in_flight = 0;
+    failover_tick(352);
+    CHECK(failover_peer_status(7) == PEER_DEAD,
+          "...and declared dead on the first tick after the intent budget expires");
 }
 
 /* ─── Scenario 2: node comes back from the dead ────────────────────── */

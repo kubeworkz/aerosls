@@ -3060,6 +3060,16 @@ static int api_partition_env_create_post(const char* body, char* buf, int max,
 
     uint16_t status = ENV_ERR_INVAL;
     uint32_t env_id = 0;
+    /* The create RPC blocks this node's BSP sweep (sidecar boot + the
+     * parked-posture wait) — and on the consensus leader that sweep carries
+     * the only heartbeat stream. Announce the intent FIRST, while the sweep
+     * still runs, so no peer declares this node dead and adopts its
+     * partitions mid-create (docs/AeroSLS-Idle-Observer-Adoption-
+     * Finding-v0.1.md). The shell's `env create` (user/shell.c) announces
+     * the same way; the restore's own create (kernel/env_migrate.c) and the
+     * boot replay (kernel/env_service.c) deliberately do not — the first is
+     * already covered by its staging slot, the second has no cluster yet. */
+    env_migrate_intent_begin();
     int rc = env_service_create(partition, index, &status, &env_id);
 
     jb_obj_open(&j,0);

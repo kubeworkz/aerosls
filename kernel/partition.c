@@ -389,6 +389,15 @@ int partition_migrate(uint32_t partition_id, uint32_t dest_node_id) {
         return 1;
     }
 
+    /* Everything below — the pause, the env capture, the synchronous
+     * payload send — runs on this node's BSP sweep, and on the consensus
+     * leader that sweep carries the only heartbeat stream. Announce the
+     * intent NOW, while the sweep still runs, so no peer declares this
+     * node dead and adopts the very partition being migrated
+     * (docs/AeroSLS-Idle-Observer-Adoption-Finding-v0.1.md — observed live,
+     * twice, on 3-node clusters). */
+    env_migrate_intent_begin();
+
     // Step 1 (LPAR Phase 14): pause -- excludes the partition from scheduling
     // for the duration of the move. Reuses partition_pause() directly rather
     // than re-deriving the same runtime flag a second way.

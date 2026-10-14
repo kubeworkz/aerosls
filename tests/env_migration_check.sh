@@ -168,7 +168,7 @@ has() { grep -qF -- "$2" "$1" 2>/dev/null; }
 # ── A. Preconditions ──────────────────────────────────────────────────────
 for f in kernel/partition.c kernel/env_migrate.c kernel/env_migrate.h \
          kernel/env_ckpt.c kernel/env_ckpt.h Makefile net/http.c \
-         net/dspp.c net/dspp.h \
+         net/dspp.c net/dspp.h kernel/failover.c user/shell.c \
          tests/env_migration_check.sh \
          tests/env_migrate_host_test.c \
          tests/partition_migrate_phase6_host_test.c \
@@ -402,8 +402,8 @@ if ! has net/dspp.h "DSPP_MIGRATE_ENV_LIVE_REQ"; then
     bad "S. net/dspp.h no longer defines the LIVE_REQ opcode — the source has no question to ask"
 elif ! has net/dspp.h "DSPP_MIGRATE_ENV_LIVE_ACK"; then
     bad "S. net/dspp.h no longer defines the LIVE_ACK opcode — the destination has no word to give"
-elif ! has net/dspp.c "opcode >= DSPP_MIGRATE_ENV_BEGIN_REQ && opcode <= DSPP_MIGRATE_ENV_LIVE_ACK"; then
-    bad "S. the ENV dispatch range no longer reaches LIVE_ACK — the destination's word would be silently dropped on arrival"
+elif ! has net/dspp.c "opcode >= DSPP_MIGRATE_ENV_BEGIN_REQ && opcode <= DSPP_MIGRATE_ENV_INTENT"; then
+    bad "S. the ENV dispatch range no longer reaches LIVE_ACK (the range's written terminator must be at least DSPP_MIGRATE_ENV_INTENT=24, which passes LIVE_ACK=23) — the destination's word would be silently dropped on arrival"
 elif ! has net/dspp.h "dspp_env_migrate_send_live("; then
     bad "S. net/dspp.h no longer declares the LIVE_REQ sender — the source could not ask even if it wanted to"
 elif ! has kernel/env_migrate.c "dspp_env_migrate_send_live("; then
@@ -495,6 +495,59 @@ elif ! has tests/env_migrate_host_test.c "env_migrate_pending_count("; then
     bad "Y. env_migrate_host_test.c no longer checks env_migrate_pending_count() — the gated teardown (armed, waiting, completed) is unproven"
 else
     ok "Y. the host test still drives the confirmation pair and the pending count"
+fi
+
+# ── Z. A silent peer's announced migration intent defers its declaration ──
+# The idle-observer arm (docs/AeroSLS-Idle-Observer-Adoption-Finding-
+# v0.1.md): the local in_flight gate covers only nodes that HOLD migration
+# state, so a healthy third node declared the busy source DEAD and adopted
+# its partitions mid-migration — every node alive, the migrating environment
+# destroyed. The declaration path must ask the silent PEER's latch.
+if ! has kernel/failover.c "env_migrate_peer_in_flight(peers[i].node_id)"; then
+    bad "Z. failover.c's declaration path no longer consults env_migrate_peer_in_flight() — the idle-observer false 'declared DEAD' (a healthy observer adopting a busy source's partitions mid-migration) comes straight back"
+elif ! has kernel/env_migrate.h "int env_migrate_peer_in_flight(uint32_t node_id)"; then
+    bad "Z. env_migrate.h no longer declares env_migrate_peer_in_flight() — the gate failover.c asks has no contract"
+elif ! has kernel/env_migrate.c "env_migrate_recv_intent(uint32_t node_id, uint32_t budget_ticks)"; then
+    bad "Z. env_migrate.c no longer defines the intent latch (env_migrate_recv_intent) — no peer's announce can ever be remembered, and every observer is blind again"
+else
+    ok "Z. a silent peer's announced migration intent defers its declaration, through a declared, defined, clamped latch"
+fi
+
+# ── AA. The announce precedes the block at every operator entry ────────────
+# Ordering IS the invariant: a blocked node transmits nothing, so an announce
+# after the blocking call announces nothing. Three operator-reachable entries
+# block the BSP sweep — partition_migrate()'s capture+send, the HTTP
+# env-create route's RPC, the shell's 'env create' — and on the consensus
+# leader that sweep carries the only heartbeat stream.
+aa_pc_b=$(grep -nF 'env_migrate_intent_begin();' kernel/partition.c | head -1 | cut -d: -f1)
+aa_pc_s=$(grep -nF 'Step 1 (LPAR Phase 14)' kernel/partition.c | head -1 | cut -d: -f1)
+aa_ht_b=$(grep -nF 'env_migrate_intent_begin();' net/http.c | head -1 | cut -d: -f1)
+aa_ht_c=$(grep -nF 'int rc = env_service_create' net/http.c | head -1 | cut -d: -f1)
+aa_sh_b=$(grep -nF 'env_migrate_intent_begin();' user/shell.c | head -1 | cut -d: -f1)
+aa_sh_c=$(grep -nF 'int r = env_service_create' user/shell.c | head -1 | cut -d: -f1)
+if [ -z "$aa_pc_b" ] || [ -z "$aa_pc_s" ] || [ "$aa_pc_b" -ge "$aa_pc_s" ]; then
+    bad "AA. partition_migrate() no longer announces migration intent BEFORE its Step-1 pause/capture/send — the announce would go out after the sweep already blocked, which is no announce at all"
+elif [ -z "$aa_ht_b" ] || [ -z "$aa_ht_c" ] || [ "$aa_ht_b" -ge "$aa_ht_c" ]; then
+    bad "AA. the env-create route no longer announces migration intent BEFORE its create RPC — a sidecar boot + 30 s parked-posture wait undeferred on every observer"
+elif [ -z "$aa_sh_b" ] || [ -z "$aa_sh_c" ] || [ "$aa_sh_b" -ge "$aa_sh_c" ]; then
+    bad "AA. the shell's 'env create' no longer announces migration intent BEFORE its create RPC — the serial-side operator path undeferred"
+else
+    ok "AA. every operator-reachable blocking entry announces intent while its sweep still runs (before, not after)"
+fi
+
+# ── AB. The broadcast is defined, sent, and heard BEFORE the self-filter ───
+ab_h=$(awk '/^void dspp_env_migrate_rx/{f=1} f && /env_migrate_recv_intent\(\(uint32_t\)h->node_source_id/{print NR; exit}' net/dspp.c)
+ab_f=$(awk '/^void dspp_env_migrate_rx/{f=1} f && /if \(h->node_dest_id != cluster_local_node_id\(\)\) return;/{print NR; exit}' net/dspp.c)
+if ! has net/dspp.h "DSPP_MIGRATE_ENV_INTENT"; then
+    bad "AB. dspp.h no longer defines the intent opcode — sender and receiver cannot agree on the frame"
+elif ! has net/dspp.c "opcode <= DSPP_MIGRATE_ENV_INTENT"; then
+    bad "AB. dspp.c's dispatch no longer routes the intent opcode into the migrate RX — the announce falls through the dispatch unheard"
+elif ! has kernel/env_migrate.c "dspp_env_migrate_send_intent"; then
+    bad "AB. env_migrate.c no longer transmits the announce — a local gate alone cannot spare a THIRD node that holds no migration state"
+elif [ -z "$ab_h" ] || [ -z "$ab_f" ] || [ "$ab_h" -ge "$ab_f" ]; then
+    bad "AB. the intent RX no longer runs BEFORE the point-to-point self-filter — the announce carries node_dest_id 0 (broadcast), so the filter would drop every peer's announce on every node, leaving exactly the blind spot it exists to close"
+else
+    ok "AB. the intent announce has an opcode, a sender, and an RX path heard before the self-filter"
 fi
 
 echo

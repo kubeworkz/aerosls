@@ -47,6 +47,7 @@
 #include "../kernel/workload_ctx.h"         // Multi-Node Partition Scaling Roadmap Phase 7 addendum -- SYS_SLS_CLUSTER_INIT/STATUS
 #include "../kernel/cap.h"            // Capability SDK Phase 1 -- SYS_SLS_CAP_*
 #include "../kernel/env_service.h"    // POSIX-Environments E4 -- env_service_create/destroy (the shell's `env create`/`env destroy`, E6)
+#include "../kernel/env_migrate.h"     // POSIX-Environments P3 idle-observer arm -- env_migrate_intent_begin() before the blocking create RPC
 #include "../kernel/env_proto.h"      // POSIX-Environments E4 -- ENV_* status codes + env_status_name()
 #include "../kernel/env_console.h"    // POSIX-Environments E6 -- env_console_count/entry/read/write (the shell's `env list`/`env attach`)
 
@@ -1476,6 +1477,13 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
             uint32_t index = itok[0] ? sh_atoi(itok) : 1u;
             uint16_t st = ENV_ERR_INVAL;
             uint32_t id = 0;
+            /* The create RPC below blocks this node's BSP sweep (sidecar
+             * boot + the parked-posture wait) — and on the consensus leader
+             * that sweep carries the only heartbeat stream. Announce the
+             * intent FIRST, while the sweep still runs, so no peer declares
+             * this node dead and adopts its partitions mid-create
+             * (docs/AeroSLS-Idle-Observer-Adoption-Finding-v0.1.md). */
+            env_migrate_intent_begin();
             int r = env_service_create(part, index, &st, &id);
             if (r != 0) {
                 kernel_serial_printf(

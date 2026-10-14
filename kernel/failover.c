@@ -98,6 +98,31 @@ void failover_tick(uint64_t now) {
              * Defer the declaration while env_migrate_in_flight() covers
              * the silence; a peer that really dies is declared the moment
              * the migration resolves (the deferral's inputs are bounded). */
+            /* The idle-observer arm (docs/AeroSLS-Idle-Observer-Adoption-
+             * Finding-v0.1.md): the local gate below reads THIS node's
+             * migration state, which a third node correctly knows nothing
+             * about. The live 3-node runs showed what that costs: the busy
+             * SOURCE stopped beating (its blocking work runs on the sweep
+             * that transmits the leader's heartbeat), a healthy observer won
+             * the election the blocked node could not contest and adopted
+             * every partition in its checkpoint — every node alive, the
+             * migrating environment destroyed. The source announced its
+             * intent before blocking (env_migrate_intent_begin()); that
+             * announce is the knowledge this gate asks for. Bounded like
+             * every other face: the budget expires and a genuinely dead
+             * peer is declared. */
+            if (env_migrate_peer_in_flight(peers[i].node_id)) {
+                if (!peers[i].defer_noted) {
+                    peers[i].defer_noted = 1;
+                    kernel_serial_printf(
+                        "[FAILOVER] Node %u silent %llu ticks -- declaration "
+                        "DEFERRED: node %u announced environment-migration "
+                        "intent\n",
+                        peers[i].node_id, (unsigned long long)silence,
+                        peers[i].node_id);
+                }
+                continue;
+            }
             if (env_migrate_in_flight()) {
                 if (!peers[i].defer_noted) {
                     peers[i].defer_noted = 1;

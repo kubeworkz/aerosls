@@ -52,6 +52,22 @@ static int env_migrate_status = ENV_MIGRATE_OK;
  * and env_migrate_confirm_disarm() (the source's confirmation walk
  * finished); read by env_migrate_in_flight(). */
 static uint64_t env_migrate_resolved_tick = 0;
+
+/* Migration intent — see env_migrate.h's INTENT_GRACE_ block for the
+ * idle-observer false "declared DEAD" this pair exists to cover.
+ * env_migrate_intent_tick is THIS node's local gate stamp (set by
+ * env_migrate_intent_begin(), read by env_migrate_in_flight()); the peer
+ * table is what every OTHER node's announce latched here (set by
+ * env_migrate_recv_intent(), read by env_migrate_peer_in_flight()). */
+static uint64_t env_migrate_intent_tick = 0;
+#define ENV_MIGRATE_INTENT_PEERS_MAX 8
+struct EnvMigratePeerIntent {
+    uint32_t node_id;
+    uint8_t  active;
+    uint8_t  _pad[3];
+    uint64_t until_tick;   /* exclusive: expired the moment now reaches it */
+};
+static struct EnvMigratePeerIntent env_migrate_peer_intent[ENV_MIGRATE_INTENT_PEERS_MAX];
 int env_migrate_last_status(void) { return env_migrate_status; }
 
 /* The operands behind the most recent REFUSAL (restore side). The send side
@@ -460,10 +476,25 @@ int env_migrate_recv_begin(uint64_t transfer_id, uint32_t partition_id,
      * what "every page landed" means — refused rather than reconciled. */
     if (total_pages != env_migrate_payload_pages(record)) return 3;
     if (total_pages > ENV_MIGRATE_MAX_PAGES) return 4;
-    /* No overwriting a slot in flight: a retransmitted BEGIN for an
-     * environment already staged is refused, and the sender abandons rather
-     * than clobbering. */
-    if (env_migrate_slot(partition_id, index)) return 5;
+    /* No overwriting a slot in flight — but a retransmitted BEGIN for the
+     * SAME transfer is answered READY without touching the slot, not
+     * refused. transfer_id is derived from the identity ((partition<<32)|
+     * index), so a re-BEGIN after a lost or late ACK carries the same id
+     * and the same record: refusing it would make the documented
+     * retransmission model fail exactly when it is needed. Observed live
+     * 2026-10-13: a freshly-booted destination's BEGIN ACK was slow, the
+     * source re-asked, rc=5 abandoned the whole migrate mid-send ("a page
+     * never confirmed") on a cluster where every node was healthy. Pages
+     * re-stage idempotently under the same id. A BEGIN for the same
+     * identity with a DIFFERENT record is a different transfer's intent
+     * and stays refused (env_migrate_host_test E4). */
+    struct EnvMigrateSlot* existing = env_migrate_slot(partition_id, index);
+    if (existing) {
+        if (existing->transfer_id == transfer_id &&
+            existing->record.env_id == record->env_id)
+            return 0;   /* the same transfer re-asked: staged, ready */
+        return 5;
+    }
 
     struct EnvMigrateSlot* s = 0;
     for (int i = 0; i < ENV_MIGRATE_STAGING_MAX; i++)
@@ -946,7 +977,75 @@ int env_migrate_in_flight(void) {
         kernel_tick_counter - env_migrate_resolved_tick <
             ENV_MIGRATE_RESOLVED_GRACE_TICKS)
         return 1;
+    /* The intent face: the local gate covers the blocking PHASE itself (the
+     * create RPC wait and the synchronous send), which runs before any slot
+     * exists on the destination and before any confirmation is armed — the
+     * window in which this node's own declarations were previously
+     * undeferred. */
+    if (env_migrate_intent_tick != 0 &&
+        kernel_tick_counter - env_migrate_intent_tick <
+            ENV_MIGRATE_INTENT_GRACE_TICKS)
+        return 1;
     if (env_migrate_pending_count() > 0) return 1;
+    return 0;
+}
+
+/* ─── Migration intent (the idle-observer arm) ──────────────────────────
+ * The local stamp and the cluster announce, in that order: the announce
+ * must be on the wire before the caller blocks, because the block itself
+ * stops this node's only liveness traffic (the leader's heartbeat, from
+ * this same sweep). A second begin inside the budget refreshes the stamp
+ * and re-announces — cheap, and it lets back-to-back operator actions
+ * (create, then migrate) each extend every peer's latch. */
+void env_migrate_intent_begin(void) {
+    env_migrate_intent_tick = kernel_tick_counter;
+    dspp_env_migrate_send_intent((uint32_t)ENV_MIGRATE_INTENT_GRACE_TICKS);
+}
+
+void env_migrate_recv_intent(uint32_t node_id, uint32_t budget_ticks) {
+    if (node_id == 0 || node_id == cluster_local_node_id()) return;
+    if (budget_ticks == 0) budget_ticks = 1;
+    if (budget_ticks > ENV_MIGRATE_INTENT_GRACE_TICKS)
+        budget_ticks = (uint32_t)ENV_MIGRATE_INTENT_GRACE_TICKS;
+
+    struct EnvMigratePeerIntent* e = 0;
+    for (int i = 0; i < ENV_MIGRATE_INTENT_PEERS_MAX; i++) {
+        if (env_migrate_peer_intent[i].active &&
+            env_migrate_peer_intent[i].node_id == node_id) {
+            e = &env_migrate_peer_intent[i];
+            break;
+        }
+        if (!e && !env_migrate_peer_intent[i].active)
+            e = &env_migrate_peer_intent[i];
+    }
+    if (!e) {
+        /* Table full: the oldest budget expires soonest on its own; a
+         * refusal here must stay countable rather than silent. */
+        kernel_serial_printf(
+            "[ENV_MIGRATE] node %u announced intent but the peer-intent table "
+            "is full (%u) -- its announce is NOT latched; its own death "
+            "detection is unaffected, only this node's deferral about it.\n",
+            (unsigned)node_id, (unsigned)ENV_MIGRATE_INTENT_PEERS_MAX);
+        return;
+    }
+    if (!e->active) {
+        e->node_id = node_id;
+        e->active  = 1;
+        kernel_serial_printf(
+            "[ENV_MIGRATE] node %u announced environment-migration intent "
+            "(budget %u s) -- its silence is not a death until then.\n",
+            (unsigned)node_id, (unsigned)(budget_ticks / 100u));
+    }
+    e->until_tick = kernel_tick_counter + budget_ticks;
+}
+
+int env_migrate_peer_in_flight(uint32_t node_id) {
+    for (int i = 0; i < ENV_MIGRATE_INTENT_PEERS_MAX; i++) {
+        const struct EnvMigratePeerIntent* e = &env_migrate_peer_intent[i];
+        if (!e->active || e->node_id != node_id) continue;
+        if (kernel_tick_counter < e->until_tick) return 1;
+        return 0;
+    }
     return 0;
 }
 
@@ -1081,6 +1180,9 @@ void env_migrate_reset(void) {
     env_migrate_restored_count = 0;
     env_migrate_restored_next  = 0;
     env_migrate_resolved_tick = 0;    /* a phase boundary is not a migration */
+    env_migrate_intent_tick    = 0;
+    for (int i = 0; i < ENV_MIGRATE_INTENT_PEERS_MAX; i++)
+        env_migrate_peer_intent[i].active = 0;
 }
 
 /* ─── The sweep's driver ────────────────────────────────────────────────────
@@ -1134,6 +1236,19 @@ uint32_t env_migrate_tick(uint64_t now) {
         if (s->restore_tries >= ENV_MIGRATE_RESTORE_MAX_TRIES) continue;
 
         s->restore_tries++;
+        /* The destination announces too (the idle-observer arm, second
+         * half): the restore below blocks THIS node's sweep — the create
+         * round trip, the parked-posture wait, the pour — and on the
+         * consensus leader that sweep carries the only heartbeat stream.
+         * The source's announce (partition_migrate) covered the send; this
+         * one covers the restore, so no third node — which holds no slot,
+         * confirm or intent of its own — declares THIS node dead and
+         * adopts the partition under the pour. Observed live on a 3-node
+         * run: the restoring destination was declared DEAD at 300 ticks by
+         * an idle observer, and escaped adoption only by the role luck of
+         * that observer not being leader. Sweep context, so the announce
+         * transmit is legal here. */
+        env_migrate_intent_begin();
         int rc = env_migrate_restore(s->partition_id, s->index);
         if (rc == ENV_MIGRATE_OK) {
             restored++;
@@ -1214,6 +1329,14 @@ uint32_t env_migrate_tick(uint64_t now) {
                 continue;   /* countable and inert, never force-destroyed */
             }
             c->tries++;
+            if (c->tries == 1) {
+                kernel_serial_printf(
+                    "[ENV_MIGRATE] teardown (partition %u, index %u): asking node %u "
+                    "whether the environment is live there -- one poll per period, "
+                    "bounded; nothing is destroyed until the word comes back.\n",
+                    (unsigned)c->partition_id, (unsigned)c->index,
+                    (unsigned)c->dest_node);
+            }
             dspp_env_migrate_send_live(((uint64_t)c->partition_id << 32) | c->index,
                                        c->dest_node, c->partition_id, c->index);
             continue;   /* the answer lands as a LIVE_ACK; teardown is next period */

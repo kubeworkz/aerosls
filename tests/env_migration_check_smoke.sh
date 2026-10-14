@@ -74,9 +74,11 @@ SEED_FILES=(
     kernel/env_migrate.h
     kernel/env_ckpt.c
     kernel/env_ckpt.h
+    kernel/failover.c
     net/http.c
     net/dspp.c
     net/dspp.h
+    user/shell.c
     tests/env_migration_check.sh
     tests/env_migrate_host_test.c
     tests/partition_migrate_phase6_host_test.c
@@ -85,7 +87,7 @@ SEED_FILES=(
 
 seed() {   # seed <dir>
     rm -rf "$1"
-    mkdir -p "$1/kernel" "$1/net" "$1/tests"
+    mkdir -p "$1/kernel" "$1/net" "$1/tests" "$1/user"
     local f
     for f in "${SEED_FILES[@]}"; do
         cp "$ROOT/$f" "$1/$f" || return 1
@@ -330,6 +332,26 @@ tooth "X. a dspp.c-linking host test with neither the real confirmation pair nor
 seed "$W/y"
 sed -i 's/env_migrate_live_query(/env_migrate_live_query_MUTATED(/g' "$W/y/tests/env_migrate_host_test.c"
 tooth "Y. the host test no longer calls env_migrate_live_query (the word's grounding unproven)" "Y" "$W/y"
+
+# ── Z. The declaration path forgets the peer's announced intent ───────────
+# The idle-observer defect verbatim: failover.c declaring the busy source
+# DEAD because the only liveness it can see stopped with the blocked sweep,
+# then adopting every partition in its checkpoint.
+seed "$W/z"
+sed -i '/env_migrate_peer_in_flight(peers\[i\].node_id)/d' "$W/z/kernel/failover.c"
+tooth "Z. the declaration path no longer consults the silent peer's announced intent (the idle-observer false DEAD)" "Z" "$W/z"
+
+# ── AA. The announce moved AFTER the block it must precede ────────────────
+# Ordering is the invariant: a blocked node transmits nothing, so an announce
+# after Step 1 announces nothing.
+seed "$W/aa"
+sed -i '/env_migrate_intent_begin();/d; /Step 1 (LPAR Phase 14)/a\    env_migrate_intent_begin();' "$W/aa/kernel/partition.c"
+tooth "AA. partition_migrate announces intent AFTER its Step-1 block begins (an announce that never reaches the wire)" "AA" "$W/aa"
+
+# ── AB. The dispatch stops routing the announce into the migrate RX ───────
+seed "$W/ab"
+sed -i 's/opcode <= DSPP_MIGRATE_ENV_INTENT/opcode <= DSPP_MIGRATE_ENV_LIVE_ACK/' "$W/ab/net/dspp.c"
+tooth "AB. the dispatch no longer routes the intent opcode (the announce falls through unheard)" "AB" "$W/ab"
 
 # ── The vacuity control: green on the real tree ────────────────────────────
 out="$(bash "$GUARD" 2>&1)"; rc=$?

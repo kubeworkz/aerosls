@@ -855,6 +855,53 @@ int main(void) {
     CHECK(env_migrate_in_flight() == 0,
           "...and the grace is bounded: past the resolved tail the gate re-arms death detection");
 
+    /* The idle-observer arm (docs/AeroSLS-Idle-Observer-Adoption-Finding-
+     * v0.1.md): the intent covers the blocking PHASE itself — before any
+     * staging slot exists on the destination and before any confirmation is
+     * armed, the window in which every node's declarations about the busy
+     * source were previously undeferred. It announces on the wire BEFORE
+     * the block (a blocked node transmits nothing), and it is bounded like
+     * every other face — on this node and on every peer that latched it. */
+    env_migrate_intent_begin();
+    CHECK(env_migrate_in_flight() == 1,
+          "*** in_flight: announced intent covers the blocking phase itself (local gate) ***");
+    {
+        int saw_intent = 0;
+        for (int i = 0; i < captured_frame_count && !saw_intent; i++) {
+            const struct DSPPEnvMigrateHeader* h =
+                (const struct DSPPEnvMigrateHeader*)(captured_frame[i] + ETH_HDR_LEN);
+            if (h->opcode == DSPP_MIGRATE_ENV_INTENT) saw_intent = 1;
+        }
+        CHECK(saw_intent,
+              "*** intent_begin puts the broadcast on the wire BEFORE the block ***");
+    }
+    kernel_tick_counter += ENV_MIGRATE_INTENT_GRACE_TICKS + 1;
+    CHECK(env_migrate_in_flight() == 0,
+          "...and the local intent is bounded: past its budget the gate re-arms");
+
+    /* The peer half: what every OBSERVER latches from that broadcast. */
+    env_migrate_recv_intent(5, (uint32_t)ENV_MIGRATE_INTENT_GRACE_TICKS);
+    CHECK(env_migrate_peer_in_flight(5) == 1,
+          "*** peer intent: an announced budget latches on every node ***");
+    env_migrate_recv_intent(5, 0x7fffffffu);   /* a peer cannot shield itself past the cap */
+    kernel_tick_counter += ENV_MIGRATE_INTENT_GRACE_TICKS + 1;
+    CHECK(env_migrate_peer_in_flight(5) == 0,
+          "...and it is bounded even against a hostile budget: recv_intent clamps to the cap");
+    env_migrate_recv_intent(0, 100);           /* node 0 is the reserved sentinel */
+    CHECK(env_migrate_peer_in_flight(0) == 0,
+          "node 0 (the reserved sentinel) is never latched");
+    {
+        uint32_t keep = g_fake_local_node_id;
+        g_fake_local_node_id = 9;
+        env_migrate_recv_intent(9, 100);
+        CHECK(env_migrate_peer_in_flight(9) == 0,
+              "a node's own announce is never latched against itself");
+        g_fake_local_node_id = keep;
+    }
+    env_migrate_reset();
+    CHECK(env_migrate_peer_in_flight(5) == 0 && env_migrate_in_flight() == 0,
+          "reset clears both halves of the intent state");
+
     /* ═══ Phase C: refusals and retransmission, against the real sender ══ */
     printf("\n-- Phase C: loss and refusal leave the source alone --\n");
     g_fake_local_node_id = 1;
@@ -1079,6 +1126,30 @@ int main(void) {
               "*** a second BEGIN for an environment already staged is REFUSED, not absorbed ***");
         CHECK(st && st->complete == 1 && st->pages_staged == SRC_PAGES,
               "...and the slot in flight was not reset -- its pages are all still accounted for");
+        CHECK(env_migrate_staging_count() == 1, "...with still exactly one slot live");
+    }
+
+    /* ── E4b: the same transfer re-asked IS absorbed (answered ready) ────
+     * transfer_id derives from the identity, so a re-BEGIN after a lost
+     * ACK carries the same id and the same record: that is the SAME
+     * transfer asking again, and refusing it breaks the retransmission
+     * model exactly when a lossy link needs it (observed live 2026-10-13:
+     * a late ACK on a freshly-booted destination turned into rc=5 and a
+     * whole healthy migrate abandoned mid-send). The slot must not be
+     * touched: E4's refusal protects the bytes, this pin protects the
+     * retry. */
+    {
+        MAKE_BEGIN(91, 0, 0x9100, SRC_PAGES, &g_src_record, sizeof(g_src_record));
+        const struct DSPPEnvMigrateHeader* ack =
+            (const struct DSPPEnvMigrateHeader*)(captured_frame[captured_frame_count - 1]
+                                                 + ETH_HDR_LEN);
+        CHECK(ack->opcode == DSPP_MIGRATE_ENV_BEGIN_ACK && ack->status == 0,
+              "*** the same transfer's re-BEGIN is answered READY (ACK status 0), not refused ***");
+        const struct EnvMigrateStaging* st = env_migrate_recv_find(91, 0);
+        CHECK(st && st->record.env_id == g_src_record.env_id,
+              "...and the staged record is the one that stands");
+        CHECK(st && st->complete == 1 && st->pages_staged == SRC_PAGES,
+              "...and the staged slot was not touched -- its pages are all still accounted for");
         CHECK(env_migrate_staging_count() == 1, "...with still exactly one slot live");
     }
 

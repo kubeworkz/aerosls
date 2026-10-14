@@ -431,7 +431,16 @@ enum DSPPEnvMigrateOpcode {
      * lost question is re-asked on a later period, a lost answer is re-asked
      * the same way, so neither side needs retransmission state for it. */
     DSPP_MIGRATE_ENV_LIVE_REQ  = 22,  // source -> destination: is (partition_id, env_index) live WITH CONTENTS on you?
-    DSPP_MIGRATE_ENV_LIVE_ACK  = 23   // destination -> source: it is (status=0) or it is not (status!=0)
+    DSPP_MIGRATE_ENV_LIVE_ACK  = 23,  // destination -> source: it is (status=0) or it is not (status!=0)
+    /* The idle-observer arm (docs/AeroSLS-Idle-Observer-Adoption-
+     * Finding-v0.1.md): a BROADCAST, not a request — node_dest_id is 0 and
+     * every node latches it (the RX path handles it before the point-to-
+     * point self-filter for exactly that reason). The sender is about to
+     * block its BSP sweep on sanctioned work (env-create RPC, the
+     * synchronous payload send) and so cannot transmit for a while; this
+     * announce, sent BEFORE the block, is the only liveness its peers will
+     * hear about that work. record_len carries the budget in ticks. */
+    DSPP_MIGRATE_ENV_INTENT     = 24   // any node -> segment: I have environment-migration work in flight for the next budget ticks
 };
 
 /* The descriptor crosses WHOLE (a fixed-size struct, a few hundred bytes),
@@ -486,6 +495,12 @@ void dspp_env_migrate_send_frag(uint64_t transfer_id, uint32_t node_dest_id,
  * recorded by env_migrate_live_ack() in kernel/env_migrate.c. */
 void dspp_env_migrate_send_live(uint64_t transfer_id, uint32_t node_dest_id,
                                 uint32_t partition_id, uint32_t env_index);
+
+/* The migration-intent broadcast (DSPP_MIGRATE_ENV_INTENT): one frame to
+ * the whole segment carrying the budget in ticks. One-shot by design — it
+ * must be on the wire BEFORE the sender's sweep blocks, and a blocked node
+ * transmits nothing. */
+void dspp_env_migrate_send_intent(uint32_t budget_ticks);
 
 /* Receiver side, reached from dspp_rx_dispatch() for the ENV opcodes.
  * Self-filters on node_dest_id, routes BEGIN_REQ/PAGE_REQ into

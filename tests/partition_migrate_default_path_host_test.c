@@ -157,3 +157,11 @@ int main(void) {
     printf("\n%d passed, %d failed\n", checks_passed, checks_failed);
     return checks_failed == 0 ? 0 : 1;
 }
+
+/* POSIX-Environments P3 idle-observer arm stand-ins — the announce
+ * crosses the real DSPP wire, so a host build cannot run it; a no-op
+ * here keeps this test's link honest. Real coverage:
+ * tests/env_migrate_host_test.c (the local gate, the wire frame, the
+ * peer latch) and tests/checkpoint_recovery_host_test.c (the
+ * failover declaration gate). */
+void env_migrate_intent_begin(void) {}

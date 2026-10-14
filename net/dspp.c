@@ -605,6 +605,23 @@ void dspp_env_migrate_send_live(uint64_t transfer_id, uint32_t node_dest_id,
     dspp_transmit_raw(&pkt, (uint16_t)sizeof(pkt));
 }
 
+void dspp_env_migrate_send_intent(uint32_t budget_ticks) {
+    struct DSPPEnvMigrateHeader pkt;
+    pkt.magic           = DSPP_MIGRATE_MAGIC;
+    pkt.opcode          = DSPP_MIGRATE_ENV_INTENT;
+    pkt.node_source_id  = (uint16_t)cluster_local_node_id();
+    pkt.node_dest_id    = 0;              /* broadcast: every node latches */
+    pkt.transfer_id     = 0;
+    pkt.partition_id    = 0;              /* the announce is node-scoped */
+    pkt.page_index      = 0;
+    pkt.status          = 0;
+    pkt.env_index       = 0;
+    pkt.total_pages     = 0;
+    pkt.record_len      = budget_ticks;
+    pkt.frag_index      = 0;
+    dspp_transmit_raw(&pkt, (uint16_t)sizeof(pkt));
+}
+
 static void dspp_env_migrate_send_ack(uint16_t opcode, uint32_t reply_to_node,
                                       uint64_t transfer_id, uint32_t partition_id,
                                       uint32_t env_index, uint32_t page_index,
@@ -632,6 +649,18 @@ void dspp_env_migrate_rx(void* buf, uint16_t len) {
     /* Same point-to-point self-filter as every family here: no L2 addressing
      * for a specific node exists, so a frame not addressed to us is silently
      * ignored, not an error. */
+
+    /* The intent announce is the ONE broadcast in this family (node_dest_id
+     * is 0 by construction) and is handled BEFORE the self-filter, which
+     * would otherwise drop every peer's announce on every other node —
+     * leaving exactly the blind spot (docs/AeroSLS-Idle-Observer-Adoption-
+     * Finding-v0.1.md) it exists to close. budget rides in record_len and
+     * is clamped on the kernel side. */
+    if (h->opcode == DSPP_MIGRATE_ENV_INTENT) {
+        env_migrate_recv_intent((uint32_t)h->node_source_id, h->record_len);
+        return;
+    }
+
     if (h->node_dest_id != cluster_local_node_id()) return;
 
     /* Destination-side visibility (P3 live arm): partition_migrate()'s own
@@ -698,6 +727,19 @@ void dspp_env_migrate_rx(void* buf, uint16_t len) {
      * replayed question can only ever produce the honest answer for today. */
     if (h->opcode == DSPP_MIGRATE_ENV_LIVE_REQ) {
         int rc = env_migrate_live_query(h->partition_id, h->env_index);
+        /* Destination-side visibility, same promise as the BEGIN/PAGE
+         * refusals above: the source's "the sweep stops asking" line names
+         * its own half of a word that never came, and before this line its
+         * only question had NO visible face on this node at all — a live
+         * teardown that never completed gave no diagnosis here. One line
+         * per poll: LIVE polls exist only while a teardown waits (one per
+         * env per period, capped by the source's tries budget), so the
+         * volume is per-migration, not per-frame. */
+        kernel_serial_printf(
+            "[ENV_MIGRATE] LIVE poll (partition %u, index %u) from node %u -> %d "
+            "(0 = live here with contents; nonzero = not yet)\n",
+            (unsigned)h->partition_id, (unsigned)h->env_index,
+            (unsigned)h->node_source_id, rc);
         dspp_env_migrate_send_ack(DSPP_MIGRATE_ENV_LIVE_ACK, h->node_source_id,
                                   h->transfer_id, h->partition_id, h->env_index,
                                   0, 0, (uint8_t)(rc == 0 ? 0 : 1));
@@ -1106,7 +1148,7 @@ void dspp_rx_dispatch(void* buf, uint16_t len) {
             return;
         }
 
-        if (opcode >= DSPP_MIGRATE_ENV_BEGIN_REQ && opcode <= DSPP_MIGRATE_ENV_LIVE_ACK) {
+        if (opcode >= DSPP_MIGRATE_ENV_BEGIN_REQ && opcode <= DSPP_MIGRATE_ENV_INTENT) {
             dspp_env_migrate_rx(buf, len);   /* length checks live inside */
             return;
         }
