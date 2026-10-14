@@ -169,8 +169,10 @@ has() { grep -qF -- "$2" "$1" 2>/dev/null; }
 for f in kernel/partition.c kernel/env_migrate.c kernel/env_migrate.h \
          kernel/env_ckpt.c kernel/env_ckpt.h Makefile net/http.c \
          net/dspp.c net/dspp.h kernel/failover.c user/shell.c \
+         kernel/env_service.c kernel/env_payload.c \
          tests/env_migration_check.sh \
          tests/env_migrate_host_test.c \
+         tests/env_payload_host_test.c \
          tests/partition_migrate_phase6_host_test.c \
          tests/partition_migrate_default_path_host_test.c; do
     if [ ! -f "$f" ]; then
@@ -570,6 +572,47 @@ elif ! has tests/checkpoint_recovery_host_test.c "SAME stamp declares it dead"; 
     bad "AC. the host test no longer pins the far side of the stamp-ahead case — saturation that never declares would be a blindfold, not a fix"
 else
     ok "AC. the silence arithmetic saturates on a stamp ahead of the sample, pinned on both sides (not declared on the wrap, still declared 300 ticks later)"
+fi
+
+# ── AD. The console follows the environment, because create does both ──────
+# POSIX-Environments v0.2 P3, §7's "the console and the terminal follow".
+# This clause exists because the gap was once REPORTED as a missing
+# mechanism, and it is not one: the destination's restore calls
+# env_service_create() — the same ENV_CREATE round trip the HTTP route
+# makes — and inside that round trip init creates the POSIX sidecar, so
+# cap.c registers its console from the sidecar's own name (aerosls.posix.N)
+# against (partition, index), and env_service_create() then binds the fresh
+# env_id to it. The console is therefore inherited, not reimplemented, and
+# nothing in kernel/env_migrate.c needs to name env_console at all.
+#
+# What that leaves is the wiring being quietly BROKEN rather than absent:
+# a restore that stopped going through env_service_create (a "second create
+# path"), or a create that stopped binding, would leave an operator's attach
+# answering "no such environment" on the destination — invisible in every
+# run where nobody attached. Both halves are pinned here.
+ad_rc=$(awk '/env_migrate_restore/{f=1} f && /env_service_create\(partition_id, index/{print NR; exit}' kernel/env_migrate.c)
+ad_bind=$(awk '/^int env_service_create/{f=1} f && /env_console_bind_env\(partition, index, \*out_env_id\)/{print NR; exit}' kernel/env_service.c)
+if [ -z "$ad_rc" ]; then
+    bad "AD. the destination's restore no longer calls env_service_create() — the console would not be re-registered on the destination, so an operator's attach answers 'no such environment' for an environment that IS live there (§7's 'the console and the terminal follow')"
+elif [ -z "$ad_bind" ]; then
+    bad "AD. env_service_create() no longer binds the fresh env_id to the console — the environment exists and is live on the destination but is not addressable, which is G7's 'an environment you cannot reach is not an environment' reproduced on the migration path"
+else
+    ok "AD. the destination's console follows its environment: the restore goes through env_service_create(), which binds the new env_id to the console cap.c registered from the sidecar's name"
+fi
+
+# ── AE. The pour waits for the destination's OWN identity announcement ─────
+# The second half of "the console and the terminal follow": the captured
+# bytes are injected under the NEW env_id, so the operator's history is
+# continuous — but only if the pour waited for the freshly replayed sidecar
+# to announce [env-id]. Without that wait the pour lands on a half-booted
+# sidecar, its own boot announcement is erased by its own restore, and the
+# identity the attach stream is keyed by can never be written.
+if ! has kernel/env_payload.c "env_console_identity_seen"; then
+    bad "AE. the pour's posture gate no longer waits for the destination's [env-id] announcement — the captured bytes would land on a sidecar still inside its first boot, erasing the very announcement that identifies it"
+elif ! has tests/env_payload_host_test.c "env_console_identity_seen"; then
+    bad "AE. the payload host test no longer drives the identity wait — the gate's behaviour would be asserted by nobody"
+else
+    ok "AE. the pour waits for the destination's own identity announcement, and the host test drives that wait"
 fi
 
 echo

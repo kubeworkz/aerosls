@@ -75,4 +75,15 @@ void failover_live_checkpoint_broadcast(uint64_t now);
 /* How many partitions were adopted in the last failover_recover_from() call. */
 uint32_t failover_last_adopted_count(void);
 
+/* POSIX-Environments v0.2 Phase P3, failover destination (b) (§11 Q5): how
+ * many environments belonging to the partitions the last recovery adopted
+ * were named as NOT restored. Failover adopts partitions by ownership flip
+ * and restores no environment — the payload is 5.5 MiB and the leader's
+ * checkpoint broadcast is 24 KiB — so this counter is the honest size of
+ * that gap. Zero is the common case (a partition with no environments) and
+ * is what makes a non-zero worth reading. Countable rather than log-only so
+ * a host test can pin it and the `silent-failover` tooth has something to
+ * bite on beyond a grep of a serial line. */
+uint32_t failover_last_unrestored_envs(void);
+
 #endif /* FAILOVER_H */

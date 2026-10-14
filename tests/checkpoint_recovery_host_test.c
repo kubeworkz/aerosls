@@ -12,6 +12,7 @@
  */
 #include "kernel/failover.h"
 #include "kernel/state_tree.h"
+#include "kernel/env_ckpt.h"   /* P3 (b): env_ckpt_table[] feeds the tree's ST_NODE_ENVIRONMENT nodes */
 #include "kernel/partition.h"
 #include "kernel/object_catalog.h"
 #include "kernel/process.h"
@@ -37,6 +38,14 @@ struct SLSPartitionOwner  partition_owner_table[PARTITION_MAX];
 
 struct ProcessDescriptor proc_table[PROC_MAX];
 struct StreamEntry       stream_store[STREAM_MAX];
+
+/* POSIX-Environments P3 (b): the environment records state_tree_build()
+ * turns into ST_NODE_ENVIRONMENT nodes. Defined here rather than linked
+ * from kernel/env_ckpt.c, exactly like partition_table[]/proc_table[]/
+ * stream_store[] above — this test drives the CONSUMER (failover) and only
+ * needs the table to be populatable. Real record-layer coverage is
+ * tests/env_ckpt_host_test.c's. */
+struct EnvCkptRecord env_ckpt_table[ENV_CKPT_MAX];
 
 MACAddr net_my_mac;
 volatile uint64_t kernel_tick_counter = 0;
@@ -357,6 +366,77 @@ static void test_successful_failover(void) {
     CHECK(partition_get_owner_node(0) == 2, "partition 0 was already node 2 (unchanged)");
 }
 
+/* ─── Scenario 4b: P3 (b) — the adoption NAMES what it did not restore ─ */
+/* POSIX-Environments v0.2 Phase P3, failover destination (b) (§11 Q5).
+ * Failover adopts partitions by ownership flip and restores no environment
+ * — the payload is 5.5 MiB of regions and this checkpoint is a 24 KiB
+ * broadcast. What the tree now carries is the dead node's environment
+ * NAMES (ST_NODE_ENVIRONMENT), and this scenario pins that they are
+ * REPORTED: an operator who sees "Adopted partition 5" must be able to
+ * learn that partition 5's environment index 2 did not come with it.
+ *
+ * Three properties, because each fails differently:
+ *   - every environment of an ADOPTED partition is named (count is right);
+ *   - an environment in a partition NOT adopted is NOT named (reporting
+ *     state that is not this node's to restore would point an operator at
+ *     the wrong node's work);
+ *   - a recovery that adopts nothing reports ZERO, not the previous
+ *     recovery's count (a stale count is a lie of the same family). */
+static void test_unrestored_environments(void) {
+    printf("--- Scenario 4b: the adoption names the environments it did NOT restore ---\n");
+
+    /* Two live environment records, both in partitions node 1 owned in the
+     * fixture: partition 5 index 2, partition 7 index 1. A third sits in
+     * partition 9, which the checkpoint does NOT carry — the witness that
+     * the report is scoped to adopted partitions. */
+    memset(env_ckpt_table, 0, sizeof(env_ckpt_table));
+    env_ckpt_table[0].magic = ENV_CKPT_REC_MAGIC;
+    env_ckpt_table[0].partition_id = 5;  env_ckpt_table[0].index = 2;
+    env_ckpt_table[0].n_regions = 3;
+    env_ckpt_table[1].magic = ENV_CKPT_REC_MAGIC;
+    env_ckpt_table[1].partition_id = 7;  env_ckpt_table[1].index = 1;
+    env_ckpt_table[1].n_regions = 3;
+    env_ckpt_table[2].magic = ENV_CKPT_REC_MAGIC;
+    env_ckpt_table[2].partition_id = 9;  env_ckpt_table[2].index = 4;
+    env_ckpt_table[2].n_regions = 3;
+
+    memset(partition_table, 0, sizeof(partition_table));
+    memset(partition_owner_table, 0, sizeof(partition_owner_table));
+
+    partition_table[0].partition_id = 0; partition_table[0].active = 1;
+    partition_table[5].partition_id = 5; partition_table[5].active = 1;
+    partition_table[7].partition_id = 7; partition_table[7].active = 1;
+
+    partition_owner_table[0].partition_id = 0; partition_owner_table[0].node_id = 2;
+    partition_owner_table[0].active = 1;
+    partition_owner_table[1].partition_id = 5; partition_owner_table[1].node_id = 1;
+    partition_owner_table[1].active = 1;
+    partition_owner_table[2].partition_id = 7; partition_owner_table[2].node_id = 1;
+    partition_owner_table[2].active = 1;
+
+    simulate_checkpoint_from_node1();
+    CHECK(dspp_ckpt_recv_ready(), "checkpoint from node 1 received");
+
+    g_local_node = 2;
+    int rc = failover_recover_from(1);
+    CHECK(rc == FAILOVER_OK, "recovery succeeds");
+    CHECK(failover_last_adopted_count() == 2, "adopted 2 partitions");
+    CHECK(failover_last_unrestored_envs() == 2,
+          "*** exactly the 2 environments of the ADOPTED partitions were named as NOT restored ***");
+    CHECK(failover_last_unrestored_envs() != 3,
+          "...and the environment in partition 9 (not adopted) was NOT named — the report is scoped to what this node now owns");
+
+    /* A second recovery that adopts nothing must report zero, not the
+     * count left behind by the one above. */
+    dspp_ckpt_recv_reset();
+    rc = failover_recover_from(3);   /* no checkpoint from node 3 */
+    CHECK(rc == FAILOVER_NO_CHECKPOINT, "the second recovery adopts nothing");
+    CHECK(failover_last_unrestored_envs() == 0,
+          "*** ...and reports ZERO unrestored environments, not the previous recovery's 2 ***");
+
+    memset(env_ckpt_table, 0, sizeof(env_ckpt_table));
+}
+
 /* ─── Scenario 5: wrong source node in checkpoint ──────────────────── */
 static void test_wrong_source(void) {
     printf("--- Scenario 5: checkpoint from wrong source rejected ---\n");
@@ -379,6 +459,7 @@ int main(void) {
     test_resurrection();
     test_no_checkpoint();
     test_successful_failover();
+    test_unrestored_environments();
     test_wrong_source();
     test_unknown_peer();
 

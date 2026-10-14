@@ -36,6 +36,7 @@ static void fo_recovered_name(char* dst, uint32_t part_id) {
 /* ─── Peer liveness table ────────────────────────────────────────────── */
 static struct PeerLiveness peers[FAILOVER_MAX_PEERS];
 static uint32_t last_adopted = 0;
+static uint32_t last_unrestored_envs = 0;
 
 void failover_init(void) {
     fo_memset(peers, 0, sizeof(peers));
@@ -190,6 +191,11 @@ int failover_peer_status(uint32_t node_id) {
 /* ─── Recovery: adopt partitions from a received checkpoint ──────────── */
 int failover_recover_from(uint32_t dead_node_id) {
     last_adopted = 0;
+    /* Reset at ENTRY, not in the reporting block below: a recovery that
+     * returns early (no checkpoint, wrong source, no partitions) reported no
+     * environments, and a caller reading a stale count from the PREVIOUS
+     * recovery would be reading the last one's gap as this one's. */
+    last_unrestored_envs = 0;
 
     if (!dspp_ckpt_recv_ready()) return FAILOVER_NO_CHECKPOINT;
 
@@ -259,6 +265,46 @@ int failover_recover_from(uint32_t dead_node_id) {
 
     if (adopted == 0) return FAILOVER_NO_PARTITIONS;
 
+    /* POSIX-Environments v0.2 Phase P3, failover destination (b) (§11 Q5).
+     * The adoption above flips OWNERSHIP and restores no environment: the
+     * payload is 5.5 MiB of regions and this checkpoint is a 24 KiB
+     * broadcast, so the bytes were never here to begin with. What the tree
+     * DOES carry is the dead node's environment NAMES (ST_NODE_ENVIRONMENT,
+     * kernel/state_tree.c), and this is where that earns its keep.
+     *
+     * Every environment whose partition this node just adopted is reported
+     * BY NAME — partition, index, region count — as not restored. Without
+     * this the adoption is silent about them: an operator sees "Adopted
+     * partition 3" and has no way to learn that partition 3's environment
+     * index 2 went with the dead node. The gap is real either way; naming it
+     * is the whole of what destination (b) promises, and the
+     * `silent-failover` tooth reddens if this loop is deleted.
+     *
+     * Reported for the ADOPTED partitions only: an environment in a
+     * partition this node did not adopt belongs to whoever owns that
+     * partition now, and reporting it here would point an operator at state
+     * that is not this node's to restore. */
+    for (uint32_t i = 0; i < count; i++) {
+        if (nodes[i].type != ST_NODE_ENVIRONMENT) continue;
+        uint32_t part_id = nodes[i].partition_id;
+        if (partition_get_owner_node(part_id) != my_id) continue;
+
+        last_unrestored_envs++;
+        kernel_serial_printf(
+            "[FAILOVER] environment index %llu (partition %u, %llu region(s)) "
+            "was NOT restored -- failover adopts partitions, not environments; "
+            "restore it from its own durable storage or recreate it\n",
+            (unsigned long long)nodes[i].entity_id, part_id,
+            (unsigned long long)nodes[i].size);
+    }
+    if (last_unrestored_envs > 0) {
+        kernel_serial_printf(
+            "[FAILOVER] %u environment(s) of the adopted partitions were NOT "
+            "restored (named above) -- their data lived on node %u's own "
+            "storage and does not follow ownership\n",
+            (unsigned)last_unrestored_envs, dead_node_id);
+    }
+
     last_adopted = adopted;
     dspp_ckpt_recv_reset();
 
@@ -269,6 +315,12 @@ int failover_recover_from(uint32_t dead_node_id) {
 }
 
 uint32_t failover_last_adopted_count(void) { return last_adopted; }
+
+/* How many environments of the adopted partitions the last recovery named
+ * as NOT restored (POSIX-Environments P3, destination (b)). Countable
+ * rather than only logged so a host test can pin the property and an
+ * operator can read it back over the control plane. */
+uint32_t failover_last_unrestored_envs(void) { return last_unrestored_envs; }
 
 /* ─── Live checkpoint broadcast (leader -> followers) ────────────────── */
 static uint64_t failover_last_ckpt_tick = 0;

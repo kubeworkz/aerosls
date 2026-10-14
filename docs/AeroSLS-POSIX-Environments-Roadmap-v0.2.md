@@ -1872,6 +1872,220 @@ function NAME in `dspp.c` — and `dspp.c`'s own comments mention it, so the
 guard reddened on nothing; the clause now names the call with its
 arguments, and comments are not wiring.
 
+### Findings addendum — what landed, increment 6 (the round trip, proven live)
+
+The confirmation and the teardown were correct in the tree and unproven on
+metal. This increment ran them against a **real 2-node cluster** and fixed
+what the run exposed — three defects, each only visible with two live nodes:
+
+- **`env_payload_wait_parked()` now pumps services while it waits** (the
+  same `microkernel_service_poll()` + `smp_uniprocessor_tick()` + yield
+  pair `env_service_rpc`'s loop makes). The wait was starving the very drain
+  whose `[env-id]` announcement it waits for on a uniprocessor boot, so
+  every live restore REFUSE_PARKED at 30 s with `announced=0` — a gate that
+  could never open, on the only posture where it matters.
+- **`env_migrate_in_flight()` defers failover death detection across a
+  migration's whole life**: a young staging slot, an armed confirmation, and
+  a RESOLVED tail set at both resolution points. The resolved tail was the
+  one the live run forced: without it the source declared the still-blocked
+  destination DEAD one sweep after its own teardown completed. Proven live:
+  `declaration DEFERRED: an environment migration is in flight` at 304
+  ticks.
+- **`dspp_env_migrate_rx()` logs every refusal it answers with a non-zero
+  ACK**, so `partition_migrate()`'s "check node N's log" promise is one this
+  family can now keep.
+
+And one **operational** fix that was invisible until a live check needed it:
+`run-cluster.sh` boots nodes UNIFIED with a digest-guarded `sidecars.cpio`.
+Without it cluster nodes are kernel-only and the environment manager does
+not exist (`env create` → no reply) — invisible until a live confirmation
+check needs an environment at all.
+
+New `tests/env_migrate_confirm_live_check.sh` runs the whole round trip
+against a live cluster: migrate byte-confirmed, destination rebuilds LIVE
+from the wire, source tears down ONLY on the destination's word,
+reclamation completes, registries cross-checked.
+
+---
+
+### Findings addendum — what landed, increments 7 and 8 (the idle-observer arm)
+
+Increment 6's live runs surfaced a failure that no 2-node shape can produce,
+and it was written up first as a finding
+(`docs/AeroSLS-Idle-Observer-Adoption-Finding-v0.1.md`) before being fixed
+in two increments.
+
+**The finding.** The consensus leader is the ONLY heartbeat transmitter, and
+it transmits from the BSP sweep — the same context this roadmap sanctions
+blocking work on (the env-create RPC wait, the synchronous migrate send). A
+blocked leader stops beating and cannot resume until the work ends.
+Followers' election timers expire, a new leader takes the term the blocked
+node cannot contest, and its failover peer entry for the old leader — fed
+ONLY by the leader's heartbeat stream — crosses `FAILOVER_DEAD_TICKS`. The
+new leader declares the old one DEAD and `failover_recover_from()` adopts
+every partition in its last checkpoint: ownership flipped, synthesized
+names, no data. **Every node alive; the migrating environment silently
+destroyed.** Observed twice on real 3-node TCG clusters, roles rotated.
+
+`env_migrate_in_flight()` can never see this on the declarer: the migration
+knowledge lives on the blocked node, and the source's own inputs arm only at
+destination-side BEGIN and teardown-confirm — after the block that matters.
+
+**Increment 7 — the migration-intent announce (option A of the finding).**
+Before the blocking phase begins, the node about to block makes that work
+CLUSTER KNOWLEDGE: `env_migrate_intent_begin()` stamps a local gate (so its
+own declarations defer too) and TXes `DSPP_MIGRATE_ENV_INTENT`, a broadcast.
+Every peer latches it through `env_migrate_recv_intent()`, clamped to
+`ENV_MIGRATE_INTENT_GRACE_TICKS`, and `failover_tick()` asks
+`env_migrate_peer_in_flight(peer)` — by peer IDENTITY, before the local
+gate. The RX runs BEFORE the point-to-point self-filter, because the
+announce is the one broadcast in this family (`node_dest_id` 0) and the
+filter would otherwise drop every peer's announce on every node, reinstate
+the exact blind spot it exists to close. The destination announces too,
+before each restore attempt: the restore blocks THIS node's sweep, and on
+the leader that sweep carries the only heartbeat stream. Bounded like every
+other face — the budget expires and a genuinely dead peer is declared.
+
+One adjacent wire defect surfaced while proving it and is fixed in the same
+increment: `env_migrate_recv_begin()` refused ANY BEGIN for an
+already-staged identity (rc=5), so the documented retransmission model
+failed exactly when a fresh-boot link needed it — a slow BEGIN ACK made the
+source re-ask, the refusal abandoned a healthy migrate mid-send ("a page
+never confirmed"). A re-BEGIN carrying the same identity-derived
+`transfer_id` AND the same record is now answered READY without touching
+the slot; a different record stays refused.
+
+**Increment 8 — the silence arithmetic saturates.** One `declaration
+DEFERRED` line was observed printing `silent 18446744073709551606 ticks`
+(−10 unsigned). The cause is structural, not a clock bug: `now` is read
+once at `failover_tick()`'s BSP-sweep call site while `last_seen_tick` is
+stamped by the heartbeat RX path (timer ISR / AP core), so a heartbeat
+landing between those reads legitimately leaves `last_seen_tick > now` and
+the unsigned subtraction wraps past `FAILOVER_DEAD_TICKS`. Fixed with a
+saturating subtraction, deliberately NOT the `last_seen = now` rewrite the
+finding first suggested — clamping the stamp would discard the fresher
+evidence for every later sweep.
+
+**Live proof** (fresh-disk clusters, the confirm guard): 3-node PASS twice,
+every face firing — both observers latched the announces and printed
+`declaration DEFERRED`, the destination deferred by name, the restore
+completed LIVE, teardown ran only on the destination's word — and the
+original 2-node shape still PASSes. `tools/repro_observer_incident.sh`
+reproduces the incident on demand and now PASSES on that shape;
+`tools/regress_2node_confirm.sh` is the 2-node regression.
+
+---
+
+### Findings addendum — what landed, increment 9 (failover destination (b))
+
+§7 scoped failover as "restore-or-refuse, never half", and §11 Q5 left the
+destination open between (a) bulk-transfer surviving environments and (b)
+restore from durable storage with the gap **reported by name**. This
+increment implements **(b)**, chosen because the leader's checkpoint
+broadcast is 24 KiB and one environment's regions are 5.5 MiB — (a) is not
+a small extension of what exists, and (b) is consistent with `failover.c`'s
+existing ownership-only posture.
+
+Increments 1–8 are all MIGRATION: an operator asks for a partition to move
+and the environment moves with it. The DEATH path was untouched by every one
+of them, and Appendix B named the gap — "`failover_recover_from()` adopts
+ownership only; a dead node's environments vanish with no name in the
+report". That makes the REPORT the whole deliverable:
+
+- **The tree carries the names.** `ST_NODE_ENVIRONMENT` (a new node type in
+  `kernel/state_tree.h`) is emitted by `state_tree_build()` — one node per
+  live `env_ckpt_table` record, attached to its partition, `entity_id` = the
+  environment's INDEX (the name the console registry and every control-plane
+  route key it by) and `size` = its region count. The payload deliberately
+  does not ride here; carrying the NAME is what turns "the environment
+  vanished" into "environment index 2 of partition 3 was not restored".
+  `ST_MAX_NODES` 410 → 418; `ST_SERIAL_MAX` 16 448 B stays well inside the
+  receiver's 24 KiB.
+- **The adoption names what it did not restore.**
+  `failover_recover_from()` walks those nodes and prints each environment
+  of an ADOPTED partition as not restored, then a summary. Scoped to
+  adopted partitions only: an environment in a partition this node did not
+  adopt belongs to whoever owns that partition now, and naming it here would
+  point an operator at state that is not this node's to restore — the same
+  defect as silence, with better manners.
+- **The gap is countable, not just logged.**
+  `failover_last_unrestored_envs()`, reset at FUNCTION ENTRY so an early
+  return (no checkpoint, wrong source, no partitions) reports zero rather
+  than the previous recovery's count.
+- **The format is version 2.** Bumped rather than extending v1 silently, so
+  a v1 tree is REFUSED by name instead of being read by a parser that would
+  silently drop the environment names — the exact vanish (b) exists to
+  prevent. Safe because the serialized form crosses only the live cluster's
+  broadcast, never NVMe: `checkpoint_mgr.c` builds a tree in memory and
+  never serializes it.
+
+`tests/env_failover_check.sh` (7 clauses, B–H, plus an A that refuses to
+evaluate when a file is missing) and its smoke (9 teeth, including
+the worth-stating **`silent-failover`** — the walk deleted, the adoption
+still succeeds, nothing else notices) hold the wiring. Proven by
+`tests/checkpoint_recovery_host_test.c` Scenario 4b (7 new checks): exactly
+the environments of the ADOPTED partitions are named, the one in a
+non-adopted partition is not, and a second recovery that adopts nothing
+reports zero rather than the first one's count.
+
+**Two findings from writing the teeth, both about vacuity.** First, clause
+B originally asserted the bare identifier `ST_NODE_ENVIRONMENT` against
+`state_tree.c` — which appears in that file's own comments and in the
+serializer's `case`, so the clause held up after the emission itself was
+deleted. This is the same defect the increment-5 addendum records for
+tooth S ("comments are not wiring"); it recurred, and the clause now
+anchors to the emission. Second, three of the first teeth did not actually
+mutate what they claimed — one typoed the identifier, one renamed a line to
+a string that still prefix-matched the guard's own lookup, and one deleted
+a file-scope static initializer (harmless; statics zero-init) instead of
+the in-function reset. All three reported "did not bite", pointing at the
+GUARD when the fault was the MUTATION. `tooth()` now proves its mutation
+landed (`cmp` against the pristine copy) before trusting the result, and
+clause F's own lookup is anchored to the indented in-function line for the
+same reason.
+
+**Remaining boundary, stated rather than implied:** this is the REPORT half
+of (b). The restore half — the survivor actually recovering the
+environment from its own durable storage — is not implemented, and the
+report says so in its own words (`restore it from its own durable storage
+or recreate it`). Destination (a) remains the PASE-grade answer.
+
+---
+
+### Findings addendum — what landed, increment 10 (the console, pinned)
+
+§7's bullet "the console and the terminal follow" was reported at one point
+as a MISSING MECHANISM. Checking the tree showed it is not one — the
+console is **inherited**, and what was missing was the PIN.
+
+The chain: the destination's restore calls `env_service_create()`, the same
+ENV_CREATE round trip the HTTP route makes; inside that round trip init
+creates the POSIX sidecar, so `cap.c` registers its console from the
+sidecar's own name (`aerosls.posix.<index>`) against `(partition, index)`;
+and `env_service_create()` then binds the fresh `env_id` to it. Nothing in
+`kernel/env_migrate.c` needs to name `env_console` at all, which is why a
+grep of that file was the wrong test.
+
+What was genuinely absent was any clause or tooth holding that chain — a
+restore that stopped going through `env_service_create`, or a create that
+stopped binding, would leave an operator's attach answering `no such
+environment` on the destination for an environment that IS live there, and
+no run where nobody attached would notice. Clauses **AD** and **AE** of
+`tests/env_migration_check.sh` now hold both halves, with teeth **AD-a**
+(the restore no longer goes through create), **AD-b** (create no longer
+binds the `env_id`) and **AE** (the pour no longer waits for the
+destination's own `[env-id]` announcement, so the injected bytes would
+erase the very identity they are keyed by). The guard grew to **30
+clauses** (B–AE) and its smoke to **34 teeth**, all biting, vacuity control
+green.
+
+Deliberately NOT done here, and named: §7's runtime arm — boot a cluster,
+migrate, attach on the destination, and observe the stream — is still
+unbuilt, as is the `console-unrebound` LIVE tooth. The E6 guard's
+cross-partition witness covers the console registry's own scoping; what it
+does not cover is a migration, and that live arm is the honest next step
+for this bullet rather than more source clauses.
+
 ---
 
 ## 8. Capacity for the first cut

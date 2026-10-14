@@ -75,6 +75,9 @@ SEED_FILES=(
     kernel/env_ckpt.c
     kernel/env_ckpt.h
     kernel/failover.c
+    kernel/env_service.c
+    kernel/env_payload.c
+    tests/env_payload_host_test.c
     net/http.c
     net/dspp.c
     net/dspp.h
@@ -364,6 +367,35 @@ seed "$W/ac"
 sed -i '/uint64_t silence = (now > peers\[i\]\.last_seen_tick)/c\        uint64_t silence = now - peers[i].last_seen_tick;   /* MUTATED: wraps */' "$W/ac/kernel/failover.c"
 sed -i '/? now - peers\[i\]\.last_seen_tick : 0;/d' "$W/ac/kernel/failover.c"
 tooth "AC. the silence arithmetic wraps again on a heartbeat stamped ahead of the tick sample (a just-heard peer declared DEAD)" "AC" "$W/ac"
+
+# ── AD. The console no longer follows the environment ──────────────────────
+# POSIX-Environments v0.2 P3, §7's "the console and the terminal follow".
+# The console is inherited, not reimplemented: the destination's restore
+# calls env_service_create(), and inside that round trip init creates the
+# POSIX sidecar, so cap.c registers its console from the sidecar's own name
+# and env_service_create() binds the fresh env_id to it. Both halves can be
+# cut independently, and each leaves an operator's attach answering "no such
+# environment" for an environment that IS live on the destination.
+#
+# AD-a: the restore stops going through create — the sidecar is never
+# created on the destination at all, so no console is ever registered.
+seed "$W/ada"
+sed -i 's/env_service_create(partition_id, index, \&status, \&new_id)/env_service_create_MUTATED(partition_id, index, \&status, \&new_id)/' "$W/ada/kernel/env_migrate.c"
+tooth "AD-a. the destination's restore no longer goes through env_service_create (no sidecar, so no console, on the destination)" "AD" "$W/ada"
+
+# AD-b: create stops binding the env_id — the environment is live on the
+# destination but not addressable by the id the control plane speaks.
+seed "$W/adb"
+sed -i 's/if (env_console_bind_env(partition, index, \*out_env_id)) {/if (0) {   \/\* MUTATED: bind removed \*\//' "$W/adb/kernel/env_service.c"
+tooth "AD-b. env_service_create no longer binds the new env_id to the console (live on the destination, unreachable by attach)" "AD" "$W/adb"
+
+# ── AE. The pour stops waiting for the destination's identity ──────────────
+# Without the wait the captured bytes land on a sidecar still inside its
+# first boot, erasing the [env-id] announcement that identifies it — the
+# operator's history arrives and the identity it is keyed by never does.
+seed "$W/ae"
+sed -i 's/env_console_identity_seen(rec->partition_id, rec->index)/1 \/\* MUTATED: identity wait removed \*\//' "$W/ae/kernel/env_payload.c"
+tooth "AE. the pour no longer waits for the destination's own [env-id] announcement (the bytes erase the identity they are keyed by)" "AE" "$W/ae"
 
 # ── The vacuity control: green on the real tree ────────────────────────────
 out="$(bash "$GUARD" 2>&1)"; rc=$?
