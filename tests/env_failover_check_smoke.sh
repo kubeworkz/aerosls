@@ -20,20 +20,38 @@
 #     operator sees "Adopted partition 3" and has no way to learn that
 #     partition 3's environment index 2 went with the dead node.
 #
+# The second worth-stating tooth is increment 11's defect verbatim:
+#
+#   * `refused-as-restored` — the replay REFUSES a record and the report
+#     calls it restored. Both outcomes clear the pending bit, so a caller
+#     that reads only pending cannot tell them apart; the per-slot refused
+#     mark is the only thing that can, and deleting its one query is the
+#     whole defect. It lies about a dead node's data in the optimistic
+#     direction, which is the direction nobody questions.
+#
 # The supporting cast, each a way the report can be present but wrong:
 #
 #   * `unscoped-report` — the owner check removed, so the report names
 #     environments in partitions this node does not own. Worse than silence
 #     in one specific way: it is confident, and it is about someone else's
 #     work.
-#   * `stale-count` — the counter reset moved inside the reporting walk, so
-#     every early return leaves the PREVIOUS recovery's number standing.
+#   * `stale-count` / `stale-restored-count` — a counter reset moved out of
+#     function entry, so every early return leaves the PREVIOUS recovery's
+#     number standing (the gap, and the success).
 #   * `names-not-emitted` — the tree stops producing environment nodes, so
 #     the walk has nothing to find. The wiring-removed failure, one level up.
 #   * `names-before-partitions` — the emission order flipped, so each
 #     environment's parent lookup misses its partition and it lands on root.
 #   * `version-not-bumped` — v2's node type without v2's version, so a v1
 #     tree is misread instead of refused.
+#   * `no-durable-restore` / `no-replay-driver` — the restore half present
+#     but inert: records armed and never drained, or neither armed nor
+#     driven. The report still succeeds; nothing comes back.
+#   * `restored-not-pinned` — the host test asserts only >= 0, so a stale
+#     restored count passes every assertion that remains.
+#   * `tracker-shift-broken` — env_ckpt.c's drop() stops shifting the
+#     refused mark, so after a drop it points at a different environment
+#     and a healthy one is reported refused.
 #
 # The vacuity control is last and mandatory: the guard must be GREEN on the
 # real, unmutated tree. Without it, a guard that always failed would pass
@@ -65,6 +83,9 @@ SEED_FILES=(
     kernel/state_tree.c
     kernel/failover.c
     kernel/failover.h
+    kernel/env_ckpt.c
+    kernel/env_ckpt.h
+    kernel/env_service.h
     tests/checkpoint_recovery_host_test.c
     tests/env_failover_check.sh
 )
@@ -175,6 +196,46 @@ seed "$W/pin"
 sed -i 's/failover_last_unrestored_envs() == 2/failover_last_unrestored_envs() >= 0/' "$W/pin/tests/checkpoint_recovery_host_test.c"
 sed -i 's/failover_last_unrestored_envs() == 0/failover_last_unrestored_envs() >= 0/' "$W/pin/tests/checkpoint_recovery_host_test.c"
 tooth "accessor-not-pinned: the host test asserts only >= 0 (a stale count would pass every assertion)" "G" "$W/pin" tests/checkpoint_recovery_host_test.c "$ROOT/tests/checkpoint_recovery_host_test.c"
+
+# ── no-durable-restore: the arm call renamed away ─────────────────────────
+# Increment 11's wiring-removed failure: the report still walks, still
+# scopes, still counts — it just never asks the durable store for anything.
+seed "$W/noarm"
+sed -i 's/env_ckpt_restore_arm(part_id, env_idx)/env_ckpt_ARM_GONE(part_id, env_idx)/' "$W/noarm/kernel/failover.c"
+tooth "no-durable-restore: the records are never armed for replay (the restore half is present but inert)" "I" "$W/noarm" kernel/failover.c "$ROOT/kernel/failover.c"
+
+# ── no-replay-driver: armed, never drained ────────────────────────────────
+# Arming without driving leaves every record pending forever — the attempt
+# exists, the create round trip never happens, and nothing in the report
+# says which half died.
+seed "$W/nodrive"
+sed -i 's/env_service_restore_pending(&rep)/env_service_DRIVER_GONE(\&rep)/' "$W/nodrive/kernel/failover.c"
+tooth "no-replay-driver: the armed records are never drained through env_service_restore_pending()" "J" "$W/nodrive" kernel/failover.c "$ROOT/kernel/failover.c"
+
+# ── refused-as-restored: the one query that separates them ────────────────
+# THE increment-11 tooth. Both a settle and a refusal clear the pending bit,
+# so the per-slot refused mark is the only fact that tells a restored
+# environment from a refused one. Delete its query and the report calls a
+# REFUSED record restored — the lie, in the direction nobody questions.
+seed "$W/liar"
+sed -i '/} else if (env_ckpt_restore_refused_record(p, idx)) {/d' "$W/liar/kernel/failover.c"
+tooth "refused-as-restored: the refused mark is never consulted (a REFUSED record is reported restored)" "K" "$W/liar" kernel/failover.c "$ROOT/kernel/failover.c"
+
+# ── stale-restored-count: the success counter survives an early return ────
+seed "$W/rst"
+sed -i '/^    last_restored_envs = 0;$/d' "$W/rst/kernel/failover.c"
+tooth "stale-restored-count: the restored count no longer resets at entry (a later recovery reads the previous one's success)" "L" "$W/rst" kernel/failover.c "$ROOT/kernel/failover.c"
+
+# ── restored-not-pinned: the host test stops asserting the success ────────
+seed "$W/rpin"
+sed -i 's/failover_last_restored_envs() == 2/failover_last_restored_envs() >= 0/' "$W/rpin/tests/checkpoint_recovery_host_test.c"
+sed -i 's/failover_last_restored_envs() == 0/failover_last_restored_envs() >= 0/' "$W/rpin/tests/checkpoint_recovery_host_test.c"
+tooth "restored-not-pinned: the host test asserts the restored count only >= 0 (a stale success passes everything)" "L" "$W/rpin" tests/checkpoint_recovery_host_test.c "$ROOT/tests/checkpoint_recovery_host_test.c"
+
+# ── tracker-shift-broken: drop() stops moving the refused mark ────────────
+seed "$W/shift"
+sed -i '/ec_restore_refused_slot\[i\] = ec_restore_refused_slot\[i + 1\];/d' "$W/shift/kernel/env_ckpt.c"
+tooth "tracker-shift-broken: drop() no longer shifts the refused mark (after a drop it describes a different environment)" "M" "$W/shift" kernel/env_ckpt.c "$ROOT/kernel/env_ckpt.c"
 
 # ── The vacuity control: green on the real tree ───────────────────────────
 out="$(bash "$GUARD" 2>&1)"; rc=$?

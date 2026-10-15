@@ -473,6 +473,31 @@ void env_ckpt_restore_refuse(uint32_t partition, uint32_t index,
 uint32_t env_ckpt_restore_pending(void);
 uint32_t env_ckpt_restore_refused(void);
 
+/* ── The failover restore half (P3 increment 11) ─────────────────────────────
+ * A survivor adopting a dead node's partitions restores their environments
+ * from ITS OWN durable records through the same driver a reboot uses
+ * (env_service_restore_pending()). The boot-shaped API cannot serve it:
+ * restore_begin() arms EVERY record, and re-arming every record on a live
+ * survivor would replay the survivor's own healthy environments as if they
+ * were dead ones. These two are the per-record seams that make the restore
+ * scoped, and the distinction it draws exact.
+ *
+ * Arm ONE record for replay, leaving the rest of the table's pending state
+ * untouched. Idempotent (already-pending stays pending; a settled or refused
+ * slot is cleared back to armed). Returns 1 when no such record exists:
+ * arming nothing is a refusal, not a silent success. */
+int env_ckpt_restore_arm(uint32_t partition_id, uint32_t index);
+
+/* 1 when THIS record was REFUSED by the replay rather than settled by it.
+ * Both outcomes leave the pending set (env_ckpt_restore_refuse() and
+ * env_ckpt_restore_settle() both clear the pending bit), so pending alone
+ * cannot tell a restored environment from a refused one — and a caller that
+ * read only pending would report a REFUSED record as restored. That is the
+ * exact lie the `refused-as-restored` tooth reproduces; this tracker is what
+ * makes it unreportable. Kept in step with the table like the pending set
+ * (drop() shifts it, restore_begin() clears it). */
+int env_ckpt_restore_refused_record(uint32_t partition_id, uint32_t index);
+
 /* 1 when this boot still owes (partition_id, index) its replay: the record is
  * on disk but the environment it describes does NOT exist here yet, because
  * env_ckpt_restore_begin() arms every adopted record and the replay settles

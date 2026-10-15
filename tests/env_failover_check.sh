@@ -12,18 +12,25 @@
 # only — a dead node's environments vanish with no name in the report").
 #
 # §11 Q5 asked which of two destinations failover should take, and the answer
-# chosen is (b): adopt the PARTITION, restore no environment, and REPORT THE
-# GAP BY NAME. (a) — bulk-transferring a surviving environment to the
-# survivor — is the PASE-grade answer and a much larger lift; the leader's
-# checkpoint broadcast is 24 KiB and one environment's regions are 5.5 MiB,
-# so (a) is not a small extension of what exists. (b) is honest about what
-# failover can actually restore today.
+# chosen is (b): adopt the PARTITION, restore from the survivor's own durable
+# storage what that storage still holds, and REPORT THE REST BY NAME. (a) —
+# bulk-transferring a surviving environment to the survivor — is the
+# PASE-grade answer and a much larger lift; the leader's checkpoint
+# broadcast is 24 KiB and one environment's regions are 5.5 MiB, so (a) is
+# not a small extension of what exists. (b) is honest about what failover can
+# actually restore today, and "today" moved twice: increment 9 landed the
+# REPORT (every environment of an adopted partition named, whether or not
+# anything could be done about it), and increment 11 landed the RESTORE
+# HALF — the survivor replays each adopted partition's durable record
+# through the same driver a reboot uses, and the report became a per-
+# environment OUTCOME: restored, or not restored with its reason.
 #
-# That makes the REPORT the whole deliverable, which is why a source guard
-# is the right instrument: the behaviour is a loop that prints names, and a
-# loop that prints names can be deleted, unscoped, or left reading a stale
-# counter — each independently, each silently, and none of them visible in a
-# run where no node happened to die with an environment.
+# That makes both halves deliverables worth guarding, which is why a source
+# guard is the right instrument: the report is loops that print names, and
+# a loop that prints names can be deleted, unscoped, left reading a stale
+# counter, or made to call a replay that never runs — each independently,
+# each silently, and none of them visible in a run where no node happened to
+# die with an environment.
 #
 # ─── The invariants, and what breaks if one is dropped ────────────────────
 #   A. Files exist (else exit 2 — the wiring could not be evaluated at all).
@@ -52,21 +59,45 @@
 #   H. ST_VERSION was bumped with the node type, so a v1 tree is REFUSED by
 #      name rather than read by a parser that silently drops the environment
 #      names — which is exactly the silent vanish (b) exists to prevent.
+#   I. The restore half exists: each named environment's durable record is
+#      armed for replay (env_ckpt_restore_arm, the per-record form — the
+#      boot-shaped restore_begin() would re-arm the survivor's OWN live
+#      environments). Without it the report is back to naming a gap that is
+#      now optional.
+#   J. The armed records are drained through the STANDARD driver
+#      (env_service_restore_pending()) — the create round trip, identity
+#      check, pause ledger and payload pour are all its, and a second copy
+#      of those is a second place for them to rot. Arming without driving
+#      leaves every record pending forever.
+#   K. A record the replay REFUSED is never counted as restored. Both
+#      outcomes clear the pending bit, so the per-slot refused mark is the
+#      only thing that separates them; losing this clause makes a refusal
+#      read as a success — the silent lie, told about a dead node's data.
+#   L. The restored counter is declared in failover.h, defined in failover.c,
+#      reset at FUNCTION ENTRY beside its unrestored sibling, and pinned by
+#      the host test on both the count and the zero.
+#   M. The refused mark is kept in step with the table: refuse() sets the
+#      slot, drop() SHIFTS it with the record (a bit left behind by a drop
+#      points at a different environment), restore_begin() clears it.
 #
 # ─── Teeth ──────────────────────────────────────────────────────────────────
-# Proven in tests/env_failover_check_smoke.sh. The worth-stating one is
-# `silent-failover` — this increment's defect verbatim: the adoption
-# completes and says nothing about the environments. Expected: red on D.
+# Proven in tests/env_failover_check_smoke.sh. The worth-stating ones are
+# `silent-failover` — the adoption completes and says nothing about the
+# environments (increment 9's defect verbatim) — and `refused-as-restored`
+# — the replay refuses a record and the report calls it restored
+# (increment 11's, the lie only this pairing can tell). Expected: red on D
+# and K respectively.
 #
 # ─── Scope note ─────────────────────────────────────────────────────────────
 # This guard is SOURCE-ONLY: it reads the tree and needs no build, no NVMe
 # and no cluster, so it runs in CI's verify job on every push. The runtime
-# behaviour is pinned by tests/checkpoint_recovery_host_test.c (Scenario 4b),
-# which drives a real failover_recover_from() over a tree that carries
-# environment names. The roadmap's separate tests/env_failover_check.sh
-# runtime guard — boot a cluster, kill a node, watch a survivor adopt — is
-# the live arm this file deliberately does NOT try to be; see the note in
-# its own header about GUARD-KIND.
+# behaviour is pinned by tests/checkpoint_recovery_host_test.c (Scenarios
+# 4b and 4c), which drives a real failover_recover_from() over a tree that
+# carries environment names and a record store the driver replays from. The
+# roadmap's separate tests/failover_adoption_live_check.sh runtime guard —
+# boot a cluster, kill a node, watch a survivor adopt — is the live arm this
+# file deliberately does NOT try to be; see the note in its own header
+# about GUARD-KIND.
 #
 # GUARD-KIND: source
 #
@@ -94,6 +125,7 @@ has() { grep -qF -- "$2" "$1" 2>/dev/null; }
 # ── A. Preconditions ──────────────────────────────────────────────────────
 for f in kernel/state_tree.h kernel/state_tree.c \
          kernel/failover.c kernel/failover.h \
+         kernel/env_ckpt.c kernel/env_ckpt.h kernel/env_service.h \
          tests/checkpoint_recovery_host_test.c \
          tests/env_failover_check.sh; do
     if [ ! -f "$f" ]; then
@@ -196,6 +228,66 @@ elif ! has kernel/state_tree.h "num_environments"; then
     bad "H. the serialized header no longer counts environments — v2's node type arrived without the field that says it is in use"
 else
     ok "H. the serialized format is version 2 with its environment count, so a v1 tree is refused by name rather than misread"
+fi
+
+# ── I. The restore half: each named record is armed for replay ────────────
+# Increment 9 named the gap; increment 11 closes what it can. The anchor is
+# the CALL with its arguments, so a comment mentioning the function cannot
+# hold this up (the "comments are not wiring" lesson, paid for twice).
+if ! has kernel/failover.c "env_ckpt_restore_arm(part_id, env_idx)"; then
+    bad "I. failover.c no longer arms the adopted partitions' durable records for replay — the restore half of destination (b) is gone, and the report is back to naming a gap that is now optional"
+else
+    ok "I. each named environment's durable record is armed for replay (the per-record env_ckpt_restore_arm, not the boot's blanket begin)"
+fi
+
+# ── J. The armed records are drained through the standard driver ──────────
+if ! has kernel/failover.c "env_service_restore_pending(&rep)"; then
+    bad "J. failover.c no longer drives the replay through env_service_restore_pending() — armed records would sit pending forever and the create round trip, identity check and payload pour would each need a second, rotting copy here"
+else
+    ok "J. the replay is driven by env_service_restore_pending(), the same driver a reboot uses"
+fi
+
+# ── K. A refused record is never counted as restored ──────────────────────
+# The both-outcomes-clear-pending fact is why this clause exists: without
+# the per-slot refused mark the report reads a REFUSED record as restored.
+# The sharpest tooth in the smoke (`refused-as-restored`) deletes exactly
+# this query and requires the guard to name THIS clause.
+if ! has kernel/failover.c "env_ckpt_restore_refused_record(p, idx)"; then
+    bad "K. failover.c no longer consults the per-slot refused mark — a record the replay REFUSED clears the pending bit like a settled one, so the report would count a refusal as a restore: the silent lie this clause exists to prevent"
+else
+    ok "K. the outcome classifies refused records as unrestored, never restored (env_ckpt_restore_refused_record consulted per record)"
+fi
+
+# ── L. The restored counter: declared, defined, reset at entry, pinned ────
+fo_rst_reset=$(awk '/^    last_restored_envs = 0;/{print NR; exit}' kernel/failover.c)
+fo_walk_line=$(awk '/nodes\[i\].type != ST_NODE_ENVIRONMENT/{print NR; exit}' kernel/failover.c)
+if ! has kernel/failover.h "uint32_t failover_last_restored_envs(void);"; then
+    bad "L. failover.h no longer declares failover_last_restored_envs() — the restore has no countable contract, so nothing outside failover.c can read how much came back"
+elif ! has kernel/failover.c "uint32_t failover_last_restored_envs(void)"; then
+    bad "L. failover.c no longer defines failover_last_restored_envs() — declared but not implemented"
+elif [ -z "$fo_rst_reset" ] || [ -z "$fo_walk_line" ] || [ "$fo_rst_reset" -ge "$fo_walk_line" ]; then
+    bad "L. the restored count is not reset at function entry, before the walk — every early return (no checkpoint, wrong source, no partitions) would leave the PREVIOUS recovery's restored count standing, and a caller would read a stale success as this recovery's"
+elif ! has tests/checkpoint_recovery_host_test.c "failover_last_restored_envs() == 2"; then
+    bad "L. the host test no longer pins the restored COUNT — a serial line is a claim; a count a test asserts is a property"
+elif ! has tests/checkpoint_recovery_host_test.c "failover_last_restored_envs() == 0"; then
+    bad "L. the host test no longer pins the ZERO after a recovery that adopts nothing — without it a stale restored count passes every other assertion"
+else
+    ok "L. the restored count is declared, defined, reset at entry, and pinned on both sides by a host test"
+fi
+
+# ── M. The refused mark is kept in step with the table ────────────────────
+# Three lines, three independent ways to corrupt the classification: the
+# mark never set (refusals vanish), never shifted (a drop leaves it pointing
+# at a DIFFERENT environment, so a healthy one is reported refused), never
+# cleared (a previous pass's refusal outlives its record).
+if ! has kernel/env_ckpt.c "ec_restore_refused_slot[slot] = 1;"; then
+    bad "M. env_ckpt.c's restore_refuse() no longer marks the slot refused — the refused mark is never set, so every refusal classifies as a restore"
+elif ! has kernel/env_ckpt.c "ec_restore_refused_slot[i] = ec_restore_refused_slot[i + 1];"; then
+    bad "M. env_ckpt.c's drop() no longer shifts the refused mark with the record — after a drop the mark points at a different environment, and a healthy one is reported refused"
+elif ! has kernel/env_ckpt.c "ec_memset(ec_restore_refused_slot, 0,"; then
+    bad "M. env_ckpt.c's restore_begin() no longer clears the refused marks — a previous pass's refusal outlives its record and stains the next replay"
+else
+    ok "M. the refused mark is set on refuse, shifted on drop, cleared on begin — always describing the record it sits on"
 fi
 
 echo

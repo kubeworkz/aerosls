@@ -2088,6 +2088,91 @@ for this bullet rather than more source clauses.
 
 ---
 
+### Findings addendum — what landed, increment 11 (the restore half of destination (b))
+
+Increment 9's addendum closed with its own remaining boundary stated
+plainly: "the restore half — the survivor actually recovering the
+environment from its own durable storage — is not implemented, and the
+report says so in its own words". This increment implements it, and the
+report stops being a blanket and becomes a per-environment OUTCOME.
+
+The whole of the change is one re-classification of what "its own durable
+storage" means, and where to ask it:
+
+- **The durable store is `env_ckpt_table`, and the survivor already has
+  its copy.** The descriptor records are P1a's record layer — written by
+  `persist_environments()`, adopted at boot through `env_ckpt_adopt()`. A
+  survivor's table holds the dead node's environments' records exactly
+  when its own boot saw them (the shared single-level store's normal case;
+  per-node stores simply have nothing, and the report names that reason
+  instead of implying a restore happened). Nothing new persists anything:
+  destination (b) was always "restore from what is already here", and this
+  increment is the code that goes and looks.
+- **The replay is the reboot's own driver, not a copy.**
+  `env_service_restore_pending()` — the create round trip, the identity
+  check, the pause ledger, the payload pour — is driven from
+  `failover_recover_from()` for exactly the adopted partitions' records.
+  The driver is reused because all four of those behaviours are already
+  its, and a second copy would be a second place for them to rot. It runs
+  on the BSP sweep, the same context the migration destination's restore
+  already runs in.
+- **Arming is per-record, because the boot-shaped form is a trap.**
+  `env_ckpt_restore_begin()` arms EVERY record; calling it on a live
+  survivor would replay the survivor's OWN healthy environments as if they
+  were dead ones. `env_ckpt_restore_arm(partition, index)` narrows it to
+  one pair, idempotent, refusing (return 1) to arm nothing.
+- **The classification is exact, not inferred.** A settle and a refusal
+  both clear the pending bit, so "still pending" alone cannot tell a
+  restored environment from a refused one. The record layer gains a
+  per-slot refused mark (`ec_restore_refused_slot`, set by
+  `env_ckpt_restore_refuse()`, cleared by `settle()` and
+  `restore_begin()`, SHIFTED by `drop()`), and failover classifies each
+  armed record three ways: still pending (the replay never got to it —
+  `env_service_restore_pending()` returns -1 when the environment manager
+  is not up), refused (counted unrestored, named with the refusal's
+  provenance), or restored. The admission gate is untouched: a record that
+  was not captured frozen still refuses (UNQUIESCED), and the survivor
+  names it — refusal over partial application, applied to the death path.
+- **Two counters, both reset at entry.**
+  `failover_last_restored_envs()` joins `failover_last_unrestored_envs()`:
+  the first counts what came back, the second now counts what did not —
+  whether for want of a record, an incomplete replay, or a refusal. Both
+  zero on a recovery that adopts nothing.
+
+The guard grew from 8 clauses to **13** (B–M: the arm, the driver, the
+refused query, the counter's four properties, the tracker's three lines)
+and its smoke from 9 teeth to **15**, the new sharpest being
+**`refused-as-restored`** — the refused mark's one query deleted, so a
+record the replay REFUSED is reported restored. That tooth exists because
+the lie is only reachable in this pairing: before this increment there was
+no restore to misreport, and the direction it errs in (a success that is
+not one) is the direction no operator questions. Proven by
+`tests/checkpoint_recovery_host_test.c` Scenario 4c (12 new checks over
+four properties): a present record is replayed and counted restored with
+the armed set scoped to the adopted partitions (the partition-9 witness);
+a REFUSED record is counted unrestored, never restored; with no durable
+record nothing is armed, the driver is not even called, and both
+environments are named; and both counters reset at entry. Scenario 4b's
+fixture now keeps the driver UNREADY, which is what makes its original
+counts also the pin that an incomplete replay never reads as a success.
+
+**What this increment deliberately does NOT claim.** The CONTENTS. The
+replay brings the environment back — identity, sidecars, bindings — but
+the bytes follow only as far as the environment's durable extent is
+readable on this survivor, and that refusal is the payload layer's own to
+print (`[ENV_PAYLOAD]`; the restored-count's summary line says so rather
+than leaving it to inference). Destination (a) — the bulk transfer that
+makes contents follow ownership itself — remains the PASE-grade answer and
+is unchanged. The live arm is still owed, by the same honesty as
+increment 10's: what this increment proves is the wiring and the
+accounting, on the tree, with every tooth biting; the boot-a-cluster,
+kill-a-node, watch-it-come-back run is the same live arm P3's migration
+half already has the harness for (`tests/failover_adoption_live_check.sh`),
+and it is where a genuinely-deployed shared store would first be exercised
+end to end.
+
+---
+
 ## 8. Capacity for the first cut
 
 v0.1 §11 sized M1 at **four concurrent environments per node** and named the ceilings: `PROC_MAX` 16 (two slots per environment), `SIDECAR_REGISTRY_MAX` 16, `ENV_CONSOLE_MAX` 8. v0.2 adds its own, all of which are new *persistent* consumers rather than new process slots:
@@ -2227,8 +2312,8 @@ Everything this document asserts about the tree, with its source.
 | The tenant profile has no network cap at all | the environment cannot be PASE-for-real; E7's socket path stays unroutable | P2 |
 | No kernel-brokered socket service | reaching networking would require a cross-partition channel, violating LPAR Phase 11 | P2 |
 | No per-partition bound on a tenant's simultaneous connections | one environment starves its neighbours without tripping the rate limiter | P2 |
-| `partition_migrate()` does not move an environment | migration leaves the environment on the source (orphaned or destroyed) | P3 |
-| `failover_recover_from()` adopts ownership only | a dead node's environments vanish with no name in the report | P3 |
-| The failover broadcast path is 24 KiB | a 5.5 MiB environment cannot ride it; the gap must be stated, not implied | P3 (destination (a) or (b)) |
+| `partition_migrate()` does not move an environment | migration leaves the environment on the source (orphaned or destroyed) | P3 *(closed — increments 3–5)* |
+| `failover_recover_from()` adopts ownership only | a dead node's environments vanish with no name in the report | P3 *(report landed as increment 9; the restore half — the survivor replaying what its own durable storage still holds — as increment 11)* |
+| The failover broadcast path is 24 KiB | a 5.5 MiB environment cannot ride it; the gap must be stated, not implied | P3 (destination (a) or (b)) *((b) as built: named by increment 9, restored from durable storage by increment 11; (a) remains the PASE-grade answer)* |
 | No thread groups / `clone` / `futex` | Go, threaded CPython and Node are out | unscoped — §9 |
 | No mediated native↔POSIX interop | environments are a sealed box, not PASE-with-IFS | §9, §11 Q6 |

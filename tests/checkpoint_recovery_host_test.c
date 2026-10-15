@@ -13,6 +13,7 @@
 #include "kernel/failover.h"
 #include "kernel/state_tree.h"
 #include "kernel/env_ckpt.h"   /* P3 (b): env_ckpt_table[] feeds the tree's ST_NODE_ENVIRONMENT nodes */
+#include "kernel/env_service.h" /* P3 increment 11: struct EnvSvcRestoreReport, the replay driver's report */
 #include "kernel/partition.h"
 #include "kernel/object_catalog.h"
 #include "kernel/process.h"
@@ -46,6 +47,10 @@ struct StreamEntry       stream_store[STREAM_MAX];
  * needs the table to be populatable. Real record-layer coverage is
  * tests/env_ckpt_host_test.c's. */
 struct EnvCkptRecord env_ckpt_table[ENV_CKPT_MAX];
+/* P3 increment 11: failover.c's restore half walks the record store's LIVE
+ * image, bounded by env_ckpt_count exactly like the real env_ckpt.c defines
+ * it. Defined here for the same reason as the table above. */
+uint32_t             env_ckpt_count = 0;
 
 MACAddr net_my_mac;
 volatile uint64_t kernel_tick_counter = 0;
@@ -76,6 +81,90 @@ static int g_env_migrate_peer_in_flight = 0;
 int env_migrate_peer_in_flight(uint32_t node_id) {
     g_peer_in_flight_asked = node_id;
     return g_env_migrate_peer_in_flight;
+}
+
+/* ─── P3 increment 11: the failover restore-half seams ────────────────────
+ * failover_recover_from() now restores the adopted partitions' environments
+ * from THIS node's durable records through the standard replay path: arm
+ * each record (env_ckpt_restore_arm), drain through the driver
+ * (env_service_restore_pending), then classify per record — still-pending
+ * means the replay never got to it, refused means it did and was refused,
+ * otherwise restored. This test drives the CONSUMER (failover) and links
+ * neither kernel/env_ckpt.c nor kernel/env_service.c, so the three queries
+ * and the one call are controllable stand-ins — exactly like
+ * partition_table[] above; the real record layer is env_ckpt_host_test.c's.
+ * What is REAL here is failover.c's own accounting: which records it arms,
+ * which questions it asks of each, and how every answer is counted. */
+static uint32_t g_arm_count;
+static uint32_t g_arm_p[ENV_CKPT_MAX], g_arm_idx[ENV_CKPT_MAX];
+static int      g_arm_pending[ENV_CKPT_MAX];   /* armed, not yet processed */
+static int      g_arm_refused[ENV_CKPT_MAX];   /* the driver refused it */
+static int      g_replay_ready;                /* 0: the environment manager is
+                                                * not up — the driver settles
+                                                * nothing and returns -1 */
+static int      g_replay_refuse_slot;          /* which armed slot is refused */
+static uint32_t g_replay_calls;
+
+static void restore_stub_reset(void) {
+    memset(g_arm_p, 0, sizeof(g_arm_p));
+    memset(g_arm_idx, 0, sizeof(g_arm_idx));
+    memset(g_arm_pending, 0, sizeof(g_arm_pending));
+    memset(g_arm_refused, 0, sizeof(g_arm_refused));
+    g_arm_count = 0;
+    g_replay_ready = 0;
+    g_replay_refuse_slot = -1;
+    g_replay_calls = 0;
+}
+
+static int stub_slot(uint32_t p, uint32_t idx) {
+    for (uint32_t i = 0; i < g_arm_count; i++)
+        if (g_arm_p[i] == p && g_arm_idx[i] == idx) return (int)i;
+    return -1;
+}
+
+int env_ckpt_restore_arm(uint32_t p, uint32_t idx) {
+    /* Real semantics: 1 when no such record exists (arming nothing is a
+     * refusal); otherwise idempotent arming of exactly this slot. */
+    int present = 0;
+    for (uint32_t r = 0; r < env_ckpt_count && r < ENV_CKPT_MAX; r++)
+        if (env_ckpt_table[r].partition_id == p && env_ckpt_table[r].index == idx)
+            { present = 1; break; }
+    if (!present || g_arm_count >= ENV_CKPT_MAX) return 1;
+    int s = stub_slot(p, idx);
+    if (s < 0) {
+        s = (int)g_arm_count;
+        g_arm_p[g_arm_count] = p;
+        g_arm_idx[g_arm_count] = idx;
+        g_arm_count++;
+    }
+    g_arm_pending[s] = 1;
+    g_arm_refused[s] = 0;
+    return 0;
+}
+
+int env_ckpt_restore_pending_record(uint32_t p, uint32_t idx) {
+    int s = stub_slot(p, idx);
+    return (s >= 0 && g_arm_pending[s]) ? 1 : 0;
+}
+
+int env_ckpt_restore_refused_record(uint32_t p, uint32_t idx) {
+    int s = stub_slot(p, idx);
+    return (s >= 0 && g_arm_refused[s]) ? 1 : 0;
+}
+
+int env_service_restore_pending(struct EnvSvcRestoreReport* out) {
+    if (!out) return -1;
+    memset(out, 0, sizeof(*out));
+    g_replay_calls++;
+    if (!g_replay_ready) return -1;   /* manager not ready: nothing settles */
+    for (uint32_t i = 0; i < g_arm_count; i++) {
+        if (!g_arm_pending[i]) continue;
+        if ((int)i == g_replay_refuse_slot) { g_arm_refused[i] = 1; out->n_refused++; }
+        else                                 { out->n_replayed++; }
+        g_arm_pending[i] = 0;   /* both outcomes leave the pending set */
+    }
+    out->n_remaining = 0;
+    return 0;
 }
 
 /* Roster stubs -- failover.c's leader broadcast iterates these; an empty
@@ -367,13 +456,21 @@ static void test_successful_failover(void) {
 }
 
 /* ─── Scenario 4b: P3 (b) — the adoption NAMES what it did not restore ─ */
-/* POSIX-Environments v0.2 Phase P3, failover destination (b) (§11 Q5).
- * Failover adopts partitions by ownership flip and restores no environment
- * — the payload is 5.5 MiB of regions and this checkpoint is a 24 KiB
- * broadcast. What the tree now carries is the dead node's environment
- * NAMES (ST_NODE_ENVIRONMENT), and this scenario pins that they are
- * REPORTED: an operator who sees "Adopted partition 5" must be able to
- * learn that partition 5's environment index 2 did not come with it.
+/* POSIX-Environments v0.2 Phase P3, failover destination (b) (§11 Q5),
+ * increment 9's half: the report. Failover adopts partitions by ownership
+ * flip; the payload is 5.5 MiB of regions and this checkpoint is a 24 KiB
+ * broadcast. What the tree carries is the dead node's environment NAMES
+ * (ST_NODE_ENVIRONMENT), and this scenario pins that they are REPORTED: an
+ * operator who sees "Adopted partition 5" must be able to learn that
+ * partition 5's environment index 2 did not come with it.
+ *
+ * Under increment 11 the survivor ATTEMPTS a restore from its own durable
+ * records before naming anything — so this scenario's fixture keeps the
+ * replay driver UNREADY (the environment manager not up), which is the
+ * honest case where the attempt exists and cannot complete: every armed
+ * record stays pending and is named unrestored. The counts below are
+ * therefore also the pin that an incomplete replay NEVER reads as a
+ * success. Scenario 4c covers the outcomes when the driver IS ready.
  *
  * Three properties, because each fails differently:
  *   - every environment of an ADOPTED partition is named (count is right);
@@ -384,6 +481,8 @@ static void test_successful_failover(void) {
  *     recovery's count (a stale count is a lie of the same family). */
 static void test_unrestored_environments(void) {
     printf("--- Scenario 4b: the adoption names the environments it did NOT restore ---\n");
+
+    restore_stub_reset();   /* driver unready: the restore attempt cannot complete */
 
     /* Two live environment records, both in partitions node 1 owned in the
      * fixture: partition 5 index 2, partition 7 index 1. A third sits in
@@ -399,6 +498,7 @@ static void test_unrestored_environments(void) {
     env_ckpt_table[2].magic = ENV_CKPT_REC_MAGIC;
     env_ckpt_table[2].partition_id = 9;  env_ckpt_table[2].index = 4;
     env_ckpt_table[2].n_regions = 3;
+    env_ckpt_count = 3;
 
     memset(partition_table, 0, sizeof(partition_table));
     memset(partition_owner_table, 0, sizeof(partition_owner_table));
@@ -421,10 +521,14 @@ static void test_unrestored_environments(void) {
     int rc = failover_recover_from(1);
     CHECK(rc == FAILOVER_OK, "recovery succeeds");
     CHECK(failover_last_adopted_count() == 2, "adopted 2 partitions");
+    CHECK(g_arm_count == 2,
+          "*** the restore ATTEMPT was made: exactly the 2 adopted-partition records were armed for replay ***");
     CHECK(failover_last_unrestored_envs() == 2,
           "*** exactly the 2 environments of the ADOPTED partitions were named as NOT restored ***");
     CHECK(failover_last_unrestored_envs() != 3,
           "...and the environment in partition 9 (not adopted) was NOT named — the report is scoped to what this node now owns");
+    CHECK(failover_last_restored_envs() == 0,
+          "*** ...and NONE was counted restored — the replay could not complete, so an incomplete attempt is never a success ***");
 
     /* A second recovery that adopts nothing must report zero, not the
      * count left behind by the one above. */
@@ -433,8 +537,138 @@ static void test_unrestored_environments(void) {
     CHECK(rc == FAILOVER_NO_CHECKPOINT, "the second recovery adopts nothing");
     CHECK(failover_last_unrestored_envs() == 0,
           "*** ...and reports ZERO unrestored environments, not the previous recovery's 2 ***");
+    CHECK(failover_last_restored_envs() == 0,
+          "...and zero restored, like its unrestored sibling — both counters reset at entry");
 
     memset(env_ckpt_table, 0, sizeof(env_ckpt_table));
+    env_ckpt_count = 0;
+}
+
+/* ─── Scenario 4c: P3 increment 11 — the restore half of destination (b) ── */
+/* The survivor restores what its OWN durable storage still holds, and the
+ * report is per-environment: restored, or not restored with its reason.
+ * Increment 9's addendum named this half as its remaining boundary ("the
+ * survivor actually recovering the environment from its own durable
+ * storage — is not implemented"); this scenario pins that it now is.
+ *
+ * The fixture separates the two sources of truth the way the live system
+ * does: the CHECKPOINT is the DEAD node's broadcast (tree built while all
+ * three records were live), the TABLE is the SURVIVOR's own durable store,
+ * adjusted after capture to each sub-scenario's state. In a single-process
+ * test that ordering is the only way to give the tree and the table
+ * different content — and they MUST be able to differ, because "the tree
+ * names an environment this survivor holds no record for" is the whole
+ * no-durable-storage case.
+ *
+ * Four properties, because each fails differently:
+ *   - a present record is replayed through the standard driver and counted
+ *     RESTORED, and the armed set is SCOPED to the adopted partitions (the
+ *     partition-9 witness);
+ *   - a record the replay REFUSED is counted unrestored, NEVER restored —
+ *     both outcomes clear the pending bit, so a caller reading only pending
+ *     reports a refusal as a success (the `refused-as-restored` defect);
+ *   - with no durable record the environment is named unrestored and the
+ *     driver is not even called (no dangling replay of nothing);
+ *   - the counters reset at entry, restored beside its unrestored sibling. */
+static void fixture_checkpoint_with_envs(void) {
+    memset(env_ckpt_table, 0, sizeof(env_ckpt_table));
+    env_ckpt_table[0].magic = ENV_CKPT_REC_MAGIC;
+    env_ckpt_table[0].partition_id = 5;  env_ckpt_table[0].index = 2;
+    env_ckpt_table[0].n_regions = 3;
+    env_ckpt_table[1].magic = ENV_CKPT_REC_MAGIC;
+    env_ckpt_table[1].partition_id = 7;  env_ckpt_table[1].index = 1;
+    env_ckpt_table[1].n_regions = 3;
+    env_ckpt_table[2].magic = ENV_CKPT_REC_MAGIC;
+    env_ckpt_table[2].partition_id = 9;  env_ckpt_table[2].index = 4;
+    env_ckpt_table[2].n_regions = 3;
+    env_ckpt_count = 3;
+
+    memset(partition_table, 0, sizeof(partition_table));
+    memset(partition_owner_table, 0, sizeof(partition_owner_table));
+
+    partition_table[0].partition_id = 0; partition_table[0].active = 1;
+    partition_table[5].partition_id = 5; partition_table[5].active = 1;
+    partition_table[7].partition_id = 7; partition_table[7].active = 1;
+
+    partition_owner_table[0].partition_id = 0; partition_owner_table[0].node_id = 2;
+    partition_owner_table[0].active = 1;
+    partition_owner_table[1].partition_id = 5; partition_owner_table[1].node_id = 1;
+    partition_owner_table[1].active = 1;
+    partition_owner_table[2].partition_id = 7; partition_owner_table[2].node_id = 1;
+    partition_owner_table[2].active = 1;
+
+    simulate_checkpoint_from_node1();
+    g_local_node = 2;
+}
+
+static void test_restore_half(void) {
+    printf("--- Scenario 4c: the survivor restores what its durable storage holds ---\n");
+
+    /* (a) both records present, the replay succeeds. */
+    restore_stub_reset();
+    g_replay_ready = 1;
+    fixture_checkpoint_with_envs();
+    CHECK(dspp_ckpt_recv_ready(), "checkpoint from node 1 received");
+
+    int rc = failover_recover_from(1);
+    CHECK(rc == FAILOVER_OK, "recovery succeeds");
+    CHECK(failover_last_restored_envs() == 2,
+          "*** both adopted-partition environments were RESTORED from this survivor's durable records ***");
+    CHECK(failover_last_unrestored_envs() == 0, "nothing named unrestored");
+    CHECK(g_arm_count == 2, "armed exactly the 2 records of the adopted partitions");
+    CHECK(stub_slot(9, 4) == -1,
+          "*** ...and never armed the environment of partition 9 — the restore is scoped to what this node adopted ***");
+
+    /* (b) the driver REFUSES one record. Both outcomes clear the pending
+     * bit, so only the refused mark separates a restoration from a refusal. */
+    restore_stub_reset();
+    g_replay_ready = 1;
+    g_replay_refuse_slot = 1;   /* the (7,1) record */
+    fixture_checkpoint_with_envs();
+    CHECK(dspp_ckpt_recv_ready(), "checkpoint from node 1 received");
+
+    rc = failover_recover_from(1);
+    CHECK(rc == FAILOVER_OK, "recovery succeeds");
+    CHECK(failover_last_restored_envs() == 1,
+          "*** the REFUSED record is NOT counted restored — a refusal reported as a success is the silent lie ***");
+    CHECK(failover_last_unrestored_envs() == 1,
+          "...and IS counted unrestored, so the gap is still visible");
+
+    /* (c) the tree names two environments this survivor holds NO record
+     * for. The capture happened while they were live; the survivor's store
+     * has nothing for them (per-node stores, or a store that never saw
+     * them). Named unrestored with that reason — and the driver is not even
+     * called, because there is nothing durable to replay. */
+    restore_stub_reset();
+    g_replay_ready = 1;
+    fixture_checkpoint_with_envs();
+    CHECK(dspp_ckpt_recv_ready(), "checkpoint from node 1 received");
+    memset(&env_ckpt_table[0], 0, sizeof(env_ckpt_table));  /* drop (5,2) and (7,1) */
+    env_ckpt_table[0].magic = ENV_CKPT_REC_MAGIC;
+    env_ckpt_table[0].partition_id = 9;  env_ckpt_table[0].index = 4;
+    env_ckpt_table[0].n_regions = 3;
+    env_ckpt_count = 1;
+
+    rc = failover_recover_from(1);
+    CHECK(rc == FAILOVER_OK, "recovery succeeds");
+    CHECK(failover_last_restored_envs() == 0,
+          "no durable record, no restore claim");
+    CHECK(failover_last_unrestored_envs() == 2,
+          "*** both environments with no record on this survivor were named unrestored ***");
+    CHECK(g_replay_calls == 0,
+          "*** ...and the replay driver was never called — no dangling replay of nothing ***");
+
+    /* (d) the entry reset: a second recovery that adopts nothing zeroes
+     * BOTH counters rather than leaving the previous recovery's standing. */
+    dspp_ckpt_recv_reset();
+    rc = failover_recover_from(3);
+    CHECK(rc == FAILOVER_NO_CHECKPOINT, "the second recovery adopts nothing");
+    CHECK(failover_last_restored_envs() == 0 && failover_last_unrestored_envs() == 0,
+          "*** both counters zero at entry, not the previous recovery's ***");
+
+    memset(env_ckpt_table, 0, sizeof(env_ckpt_table));
+    env_ckpt_count = 0;
+    restore_stub_reset();
 }
 
 /* ─── Scenario 5: wrong source node in checkpoint ──────────────────── */
@@ -460,6 +694,7 @@ int main(void) {
     test_no_checkpoint();
     test_successful_failover();
     test_unrestored_environments();
+    test_restore_half();
     test_wrong_source();
     test_unknown_peer();
 

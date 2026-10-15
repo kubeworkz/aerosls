@@ -86,4 +86,18 @@ uint32_t failover_last_adopted_count(void);
  * bite on beyond a grep of a serial line. */
 uint32_t failover_last_unrestored_envs(void);
 
+/* P3 increment 11 — the restore half of destination (b): how many of the
+ * adopted partitions' environments the last recovery ACTUALLY RESTORED —
+ * replayed from this survivor's own durable records through the standard
+ * create round trip (env_service_restore_pending()), the same driver a
+ * reboot uses. Complementary to failover_last_unrestored_envs(), reset at
+ * recovery entry beside it, and classified per record: a record the replay
+ * REFUSED counts unrestored, never restored (both outcomes clear the pending
+ * bit; the per-slot refused mark is what tells them apart, and the
+ * `refused-as-restored` tooth holds that line). Claims the ENVIRONMENT came
+ * back, not its bytes: contents follow only as far as the environment's
+ * durable extent is readable on this survivor, and [ENV_PAYLOAD] names what
+ * is not. */
+uint32_t failover_last_restored_envs(void);
+
 #endif /* FAILOVER_H */
