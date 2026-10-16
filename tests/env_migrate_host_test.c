@@ -611,7 +611,7 @@ static int h_send_n(uint32_t part, uint32_t n) {
     host_partition_define(part);
     partition_pause(part);
     uint32_t e = 0, m = 0;
-    return env_migrate_partition(part, DST_NODE, &e, &m);
+    return env_migrate_partition(part, DST_NODE, 0, &e, &m);
 }
 
 /* Deliver a hand-built LIVE_ACK through the REAL dspp_rx_dispatch -- Phase
@@ -897,6 +897,56 @@ int main(void) {
         CHECK(env_migrate_peer_in_flight(9) == 0,
               "a node's own announce is never latched against itself");
         g_fake_local_node_id = keep;
+    }
+
+    /* The RELEASE (found live on a 3-node cluster, 2026-10-14): the announce
+     * is one-shot and its budget covers the whole blocking phase, so a
+     * create that finishes in seconds still blinded every observer for the
+     * remaining ~300 s — a leader killed right after an env create could not
+     * be declared DEAD, and the adoption guard's 240 s wait lost to the
+     * leftover budget. intent_end() releases the local gate at once and
+     * broadcasts the same announce with budget 0 — the only meaning 0 can
+     * have, since recv_intent clamped every nonzero value — and a peer's
+     * latch drops immediately instead of at the budget's end. */
+    {
+        int frames_before = captured_frame_count;
+        env_migrate_intent_begin();
+        env_migrate_intent_end();
+        CHECK(env_migrate_in_flight() == 0,
+              "*** intent_end releases the LOCAL gate immediately, not at the budget's end ***");
+        int saw_release = 0;
+        for (int i = frames_before; i < captured_frame_count && !saw_release; i++) {
+            const struct DSPPEnvMigrateHeader* h =
+                (const struct DSPPEnvMigrateHeader*)(captured_frame[i] + ETH_HDR_LEN);
+            if (h->opcode == DSPP_MIGRATE_ENV_INTENT && h->record_len == 0)
+                saw_release = 1;
+        }
+        CHECK(saw_release,
+              "*** and the budget-0 release crosses the wire on the same broadcast ***");
+    }
+    env_migrate_recv_intent(6, (uint32_t)ENV_MIGRATE_INTENT_GRACE_TICKS);
+    CHECK(env_migrate_peer_in_flight(6) == 1,
+          "the peer latch stands before its owner releases it");
+    env_migrate_recv_intent(6, 0);
+    CHECK(env_migrate_peer_in_flight(6) == 0,
+          "*** recv_intent's budget-0 release drops a peer's latch at once -- death detection is re-armed ***");
+    env_migrate_recv_intent(6, 0);
+    CHECK(env_migrate_peer_in_flight(6) == 0,
+          "a release for a node with no latch is a no-op, not an error");
+    {
+        /* The release is gated on the local stamp: the sweep's restore loop
+         * calls end() after EVERY attempt, and a period with no begin must
+         * transmit nothing — one broadcast per phase, not one per sweep. */
+        int frames_before = captured_frame_count;
+        env_migrate_intent_end();
+        CHECK(captured_frame_count == frames_before,
+              "*** end() without a begin transmits nothing (the sweep's every-period call stays quiet) ***");
+        env_migrate_intent_begin();
+        env_migrate_intent_end();
+        frames_before = captured_frame_count;
+        env_migrate_intent_end();
+        CHECK(captured_frame_count == frames_before,
+              "a second end() after a release is a no-op — the release is one-shot like the announce");
     }
     env_migrate_reset();
     CHECK(env_migrate_peer_in_flight(5) == 0 && env_migrate_in_flight() == 0,
@@ -1261,7 +1311,7 @@ int main(void) {
          * could take the pause itself would be a second way to freeze a
          * tenant and its release would have to guess whose pause it was. */
         f_before = captured_frame_count;
-        int f_rc = env_migrate_partition(f_part, DST_NODE, &f_exp, &f_moved);
+        int f_rc = env_migrate_partition(f_part, DST_NODE, 0, &f_exp, &f_moved);
         CHECK(f_rc == ENV_MIGRATE_REFUSE_UNFROZEN,
               "*** a partition that is not held paused is REFUSED ***");
         CHECK(env_migrate_last_status() == ENV_MIGRATE_REFUSE_UNFROZEN,
@@ -1281,7 +1331,7 @@ int main(void) {
         partition_pause(f_part);
         env_ckpt_restore_begin();
         f_before = captured_frame_count;
-        f_rc = env_migrate_partition(f_part, DST_NODE, &f_exp, &f_moved);
+        f_rc = env_migrate_partition(f_part, DST_NODE, 0, &f_exp, &f_moved);
         CHECK(f_rc == ENV_MIGRATE_REFUSE_UNREPLAYED,
               "*** a record still awaiting this boot's replay is REFUSED: that environment "
               "does not exist on this node, so it has no payload to send ***");
@@ -1299,7 +1349,7 @@ int main(void) {
         peer_reset();
         env_migrate_reset();
         f_before = captured_frame_count;
-        f_rc = env_migrate_partition(f_part, DST_NODE, &f_exp, &f_moved);
+        f_rc = env_migrate_partition(f_part, DST_NODE, 0, &f_exp, &f_moved);
         CHECK(f_rc == 0, "*** the paused partition's two environments both cross ***");
         CHECK(f_exp == 2 && f_moved == 2, "2 expected, 2 moved -- equal, which is the whole check");
         CHECK(captured_frame_count == f_before + 2 * expect_frames,
@@ -1316,11 +1366,21 @@ int main(void) {
             CHECK(bp->header.partition_id == f_part && bp->header.env_index == 0 &&
                   bp->header.total_pages == SRC_PAGES,
                   "the first BEGIN belongs to the right environment and declares its pages");
-            CHECK((wr->flags & ENV_CKPT_FLAG_QUIESCED) != 0 &&
-                  (wr->flags & ENV_CKPT_FLAG_PARTITION_PAUSED) != 0,
-                  "*** the descriptor that CROSSED carries QUIESCED|PARTITION_PAUSED although "
-                  "the table had neither -- the freeze is what makes it admissible to the "
-                  "destination's restore rule ***");
+            CHECK((wr->flags & ENV_CKPT_FLAG_QUIESCED) != 0,
+                  "*** the descriptor that CROSSED carries QUIESCED although the table had "
+                  "neither -- the freeze is what makes it admissible to the destination's "
+                  "restore rule ***");
+            /* P3 increment 12, found live (2026-10-14): the migration's own
+             * freeze used to cross as PARTITION_PAUSED too, and every
+             * destination honored a pause nobody took -- the restored
+             * environment was LIVE by the records and dead to the scheduler,
+             * its console accepting input nobody would read. The pause here is
+             * partition_migrate()'s own (operator_paused = 0), so the bit must
+             * NOT cross; F3b is the witness that this is scoping, not
+             * deletion. */
+            CHECK((wr->flags & ENV_CKPT_FLAG_PARTITION_PAUSED) == 0,
+                  "*** ...and NOT PARTITION_PAUSED: the migration's own freeze is nobody "
+                  "else's business and must not travel as an operator's pause ***");
         }
 
         /* Replay both transfers through the REAL receive path as node 2. */
@@ -1340,6 +1400,32 @@ int main(void) {
             env_migrate_reset();
         }
 
+        /* ── F3b: the OPERATOR's pause DOES cross (increment 12's other half) ─
+         * The witness that F3's flip is scoping, not deletion: when the pause
+         * the caller holds PREDATES the move (partition_migrate()'s
+         * was_paused_before_migrate), the staged record must carry
+         * PARTITION_PAUSED -- an operator's intent is the one thing that
+         * travels as "come back paused". */
+        peer_reset();
+        env_migrate_reset();
+        f_before = captured_frame_count;
+        f_rc = env_migrate_partition(f_part, DST_NODE, 1, &f_exp, &f_moved);
+        CHECK(f_rc == 0 && f_exp == 2 && f_moved == 2,
+              "the operator-paused migrate moves both environments like any other");
+        {
+            struct DSPPEnvMigrateBeginPacket* bp =
+                (struct DSPPEnvMigrateBeginPacket*)(captured_frame[f_before] + ETH_HDR_LEN);
+            const struct EnvCkptRecord* wr = (const struct EnvCkptRecord*)bp->record;
+            CHECK((wr->flags & ENV_CKPT_FLAG_QUIESCED) != 0 &&
+                  (wr->flags & ENV_CKPT_FLAG_PARTITION_PAUSED) != 0,
+                  "*** an OPERATOR's pause crosses: QUIESCED|PARTITION_PAUSED when the "
+                  "caller held the pause before the move ***");
+        }
+        CHECK(env_ckpt_find(f_part, 0)->flags == 0 &&
+              env_ckpt_find(f_part, 1)->flags == 0,
+              "...and the freeze was released here too");
+        peer_reset();
+
         /* ── F4: a shortfall fails the step, and thaws anyway ─────────────
          * The destination refuses every BEGIN. Partial (1 of 2) is proven at
          * the orchestration level, where the abort is observable --
@@ -1349,7 +1435,7 @@ int main(void) {
         nack_begin = 1;
         env_migrate_reset();
         f_before = captured_frame_count;
-        f_rc = env_migrate_partition(f_part, DST_NODE, &f_exp, &f_moved);
+        f_rc = env_migrate_partition(f_part, DST_NODE, 0, &f_exp, &f_moved);
         CHECK(f_rc == ENV_MIGRATE_REFUSE_BEGIN,
               "*** a destination that refuses the BEGIN fails the whole step ***");
         CHECK(f_exp == 2 && f_moved == 0, "2 expected, 0 moved -- the shortfall is reported, not absorbed");
@@ -1369,14 +1455,14 @@ int main(void) {
         partition_pause(79);
         f_before = captured_frame_count;
         f_exp = 99; f_moved = 99;
-        f_rc = env_migrate_partition(79, DST_NODE, &f_exp, &f_moved);
+        f_rc = env_migrate_partition(79, DST_NODE, 0, &f_exp, &f_moved);
         CHECK(f_rc == 0 && f_exp == 0 && f_moved == 0,
               "*** a partition holding no environments is 0 of 0 and SUCCEEDS -- the "
               "distinction that keeps 0 of N a failure ***");
         CHECK(captured_frame_count == f_before, "...and nothing at all was transmitted for it");
 
         /* ── F6: the control plane's own partition, by name ─────────────── */
-        f_rc = env_migrate_partition(PARTITION_SYSTEM, DST_NODE, &f_exp, &f_moved);
+        f_rc = env_migrate_partition(PARTITION_SYSTEM, DST_NODE, 0, &f_exp, &f_moved);
         CHECK(f_rc == ENV_MIGRATE_REFUSE_SYSTEM,
               "*** PARTITION_SYSTEM is refused BY NAME, before anything is counted or frozen ***");
 

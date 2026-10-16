@@ -231,6 +231,7 @@ static void* consumer(void* arg) {
  * tests/partition_migrate_phase6_host_test.c and the transfer itself in
  * tests/env_migrate_host_test.c. */
 int env_migrate_partition(uint32_t partition_id, uint32_t dest_node_id,
+                          int operator_paused,
                           uint32_t* out_expected, uint32_t* out_moved) {
     (void)partition_id; (void)dest_node_id;
     if (out_expected) *out_expected = 0;
@@ -304,3 +305,4 @@ int main(void) {
  * peer latch) and tests/checkpoint_recovery_host_test.c (the
  * failover declaration gate). */
 void env_migrate_intent_begin(void) {}
+void env_migrate_intent_end(void) {}

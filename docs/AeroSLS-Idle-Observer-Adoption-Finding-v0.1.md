@@ -184,14 +184,51 @@ Two adjacent defects surfaced while proving this — one fixed, one noted:
    and is still declared 300 ticks of real silence later) and held by
    clause AC of `env_migration_check.sh` with its smoke tooth.
 
+## Follow-up (2026-10-14): the announce now RELEASES
+
+The announce is one-shot and its budget covers the whole blocking phase —
+which meant the latch lived out the FULL budget after the phase was over.
+Found live on a 3-node cluster by `failover_adoption_live_check.sh`'s new
+step 4.5: an env create finished in seconds, the guard SIGKILLed the leader
+right after, and both survivors printed `declaration DEFERRED: node N
+announced environment-migration intent` for the announce's remaining
+~300 s — a kill that was minutes old was undeclarable DEAD, and the
+adoption guard's 240 s wait lost to a blind spot the create had already
+finished with.
+
+`env_migrate_intent_end()` is the release: it clears the local gate and
+re-broadcasts the SAME announce with budget 0 — the one value
+`env_migrate_recv_intent()`'s clamp made unrepresentable, so the wire
+needed no new opcode. A budget-0 frame deactivates the named peer's latch
+(and never creates one); a release for a node with no latch is a no-op.
+Every route that begins now ends on every exit: `partition_migrate()`
+(three refusal returns + the success tail), the HTTP env-create route,
+the shell's `env create`, and the sweep's restore loop after each restore
+attempt. The budget remains the backstop for a lost release frame — the
+release makes death detection prompt in the common case, never weaker in
+any case. Pinned in `tests/env_migrate_host_test.c` (local gate cleared,
+the budget-0 frame on the wire, the peer's latch dropped, the no-op
+faces), held by clause AG of `env_migration_check.sh` with four smoke
+teeth, and gated live by `failover_adoption_live_check.sh`: its
+kill-after-create step no longer races the announce's leftover budget.
+
 ## Coverage gaps
 
 - No live check exercises a busy owner plus an idle third node. The
   confirmation guard targets 2 nodes (correctly — until this is fixed);
   `failover_adoption_live_check.sh` kills nodes cleanly, which is a death the
-  machinery handles. `tools/repro_observer_incident.sh` is the only repro.
-- No host test pins "a node holding no migration knowledge must not adopt a
-  partition whose owner announced intent" — because the intent does not exist
-  yet. Option A should land with that pin, plus a 3-node live variant of the
-  confirm guard with observer teeth (node 3 must print DEFERRED, never
-  `ownership set`, and the environment must still restore).
+  machinery handles. Its env-create arm now covers the ADJACENT race (kill
+  right after a create — the release finding above; the guard fails if any
+  survivor defers the declaration), but a kill DURING the blocking phase
+  with a bystander third node remains live-reproducible only by
+  `tools/repro_observer_incident.sh`.
+- ~~No host test pins "a node holding no migration knowledge must not adopt a
+  partition whose owner announced intent"~~ — CLOSED by increment 7: the pin
+  is `tests/checkpoint_recovery_host_test.c`'s idle-observer scenario (the
+  gate asks about the SILENT PEER by identity; death is declared the tick
+  after the budget expires), with the wiring held by clauses Z/AA/AB of
+  `env_migration_check.sh` and their smoke teeth, and the release half by
+  clause AG (four teeth). What remains of the original ask is only its live
+  form — a DEFERRED observer tooth on a real cluster — which the incident
+  repro and the adoption guard's kill-after-create step between them
+  exercise, though not as one automated 3-node variant.

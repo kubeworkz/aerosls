@@ -1485,6 +1485,12 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
              * (docs/AeroSLS-Idle-Observer-Adoption-Finding-v0.1.md). */
             env_migrate_intent_begin();
             int r = env_service_create(part, index, &st, &id);
+            /* The create RPC returned: release the intent so this node is
+             * declarable DEAD again immediately, not after the announce's
+             * full 300 s budget (the release rides the same broadcast —
+             * budget 0 — and the sweep's restore loop does the same after
+             * every restore attempt). */
+            env_migrate_intent_end();
             if (r != 0) {
                 kernel_serial_printf(
                     "[ENV] create partition=%u index=%u -> no reply from the environment manager "

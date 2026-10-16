@@ -1835,6 +1835,15 @@ void persist_restore_all(void) {
                 persist_read_array(env_storage_table,
                                    (uint32_t)sizeof(env_storage_table),
                                    PERSIST_ENVSTOR_ENT_LBA);
+                // region_base rides in the persisted entry, but it names a
+                // PREVIOUS boot's frame address (env_storage.h's "Keys"
+                // section). This boot's frame pool re-hands that address on
+                // its first alloc, and es_find_base()'s first match would
+                // then resolve the new owner's region to this stale entry —
+                // found live as a permanent restore-denial loop for the
+                // freshly-attached environment. Surrender the placement at
+                // the load, keep identity/extent/occupancy.
+                env_storage_after_restore();
                 uint32_t live = 0;
                 for (uint32_t i = 0; i < ENV_STORAGE_MAX; i++)
                     if (env_storage_table[i].flags & ENV_STORAGE_F_VALID) live++;

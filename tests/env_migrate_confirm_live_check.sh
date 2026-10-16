@@ -46,6 +46,17 @@
 #     records describe an environment that moved": a destroyed
 #     environment's console unregisters when its sidecar peer dies
 #     (kernel/env_console.h), so the source's registry must empty.
+#   * THE CONSOLE FOLLOWED (POSIX-Environments P3 increment 10's owed live
+#     arm, its addendum's "attach on the destination, and observe the
+#     stream"): a line typed into the destination's console comes back
+#     through the destination's own GET — `POST .../console ok:true,
+#     queued>0` then the marker echoed in `GET .../console`'s output — and
+#     the SAME attach on the source is refused BY NAME (`no such
+#     environment console in this partition`). The `console-unrebound`
+#     defect (env_migration_check.sh's AD-a/AE teeth, source-side) leaves
+#     the environment LIVE on the destination with a console that answers
+#     nobody on either node — every line above still passes, which is why
+#     this arm exists.
 #
 # ─── Why it does not launch a cluster ─────────────────────────────────
 # The same contract as partition_reannounce_live_check.sh: this guard
@@ -89,6 +100,8 @@ WAIT_LEARN=30       # the create announce hop
 WAIT_RESTORE=150    # the destination's sweep period (~10s at 1000 ticks) + create RTT
 WAIT_TEARDOWN=180   # the source's poll + destroy RTT + reclamation
 WAIT_ENVLIST=60     # the console registry emptying on the source
+WAIT_CONSOLE=90     # a sidecar draining and echoing one line (increment 10's
+                    # live arm: the console must FOLLOW the environment)
 
 die()  { echo; echo "ABORT: $*" >&2; exit 2; }
 fail() { echo; echo "FAIL  $*"; exit 1; }
@@ -138,6 +151,27 @@ except Exception:
     d = {}
 print(d.get(sys.argv[2], ""))
 PY
+}
+
+# POST_JSON/POST_STATUS -- the console's WRITE half, same bound and
+# status-carrying shape as fetch(). The console route is POST with a
+# JSON body; its verdict for a real delivery is ok:true AND queued>0
+# (queued:0 means the environment has not drained the previous line and
+# the kernel REFUSED this one -- env_console_write's pool guard), so
+# every caller below checks queued, never just ok.
+POST_STATUS=""; POST_BODY=""
+post_json() {   # $1 = port, $2 = path, $3 = the input line
+    local body out
+    body="$(python3 - "$3" <<'PY'
+import json, sys
+print(json.dumps({"input": sys.argv[1]}))
+PY
+)"
+    out="$(curl -s --max-time 10 -w '\n%{http_code}' "${CURL_EXTRA[@]}" \
+                -H 'Content-Type: application/json' -d "$body" \
+                "http://127.0.0.1:$1$2" 2>/dev/null)"
+    POST_STATUS="$(printf '%s' "$out" | tail -n1)"
+    POST_BODY="$(printf '%s' "$out" | sed '$d')"
 }
 
 row_if() {   # $1 = json, $2 = name, $3 = owner -> "partition <id> '<name>' (owner node <o>)"
@@ -229,7 +263,8 @@ DST_LOG="$CLUSTER_DIR/node$other.log"
 echo "==> creating partition '$NAME' on node $leader"
 create_resp="$("$CTL" --host "localhost:$L_PORT" "${TOKEN_ARGS[@]}" \
     shell partition create "$NAME" 2>&1)" \
-    || die "partition create failed on node $leader (aeroslsctl output above)"
+    || die "partition create failed on node $leader -- aeroslsctl's output was:
+$(printf '%s' "$create_resp" | tail -6 | sed 's/^/       /')"
 case "$create_resp" in
     *"(FAILED)"*) die "partition create failed on node $leader: $create_resp" ;;
 esac
@@ -259,9 +294,15 @@ echo "   $learned"
 # The pre-gate for everything below: an env create that fails here would
 # make every later "the environment moved" line vacuous.
 echo "==> creating an environment in partition $PART_ID on node $leader"
+# The response is echoed on BOTH failure paths (the case-arm below already
+# prints it): the command's own non-zero exit used to die with 'output
+# above' while the output sat unprinted in $env_resp, so a transport error
+# or a node refusal -- the two most interesting causes -- vanished from the
+# transcript. Same fix as failover_adoption_live_check.sh's.
 env_resp="$("$CTL" --host "localhost:$L_PORT" "${TOKEN_ARGS[@]}" \
     shell env create "$PART_ID" 2>&1)" \
-    || die "env create failed on node $leader (aeroslsctl output above)"
+    || die "env create failed on node $leader -- aeroslsctl's output was:
+$(printf '%s' "$env_resp" | tail -6 | sed 's/^/       /')"
 case "$env_resp" in
     *"-> ok env_id="*)
         ENV_ID="$(printf '%s' "$env_resp" | sed -n 's/.*ok env_id=\([0-9]*\).*/\1/p' | head -1)"
@@ -304,7 +345,9 @@ echo "==> migrating partition $PART_ID from node $leader to node $other"
 # that never was).
 mig_resp="$("$CTL" --host "localhost:$L_PORT" "${TOKEN_ARGS[@]}" --timeout 600 \
     shell partition migrate "$PART_ID" "$other" 2>&1)" \
-    || die "partition migrate $PART_ID -> $other failed on node $leader (aeroslsctl output above)"
+    || die "partition migrate $PART_ID -> $other failed on node $leader --
+       aeroslsctl's output was:
+$(printf '%s' "$mig_resp" | tail -8 | sed 's/^/       /')"
 
 case "$mig_resp" in
     *"migrated partition $PART_ID: node $leader -> node $other"*) ;;
@@ -427,10 +470,95 @@ $(printf '%s' "$list_src" | grep "env partition=" | sed 's/^/       /')). The en
        operator-visible level."
 echo "   the source lists nothing for partition $PART_ID -- no record of it remains"
 
+# ─── 8b. the console FOLLOWED: attach, type, and hear it answer there ────
+# POSIX-Environments P3 increment 10's owed live arm (its addendum named
+# it: "boot a cluster, migrate, attach on the destination, and observe the
+# stream"). Every gate above reads REGISTRIES and LOGS; none of them ever
+# types into the environment. The defect this step exists to catch is a
+# restore that stopped going through the create/bind round trip
+# (env_migration_check.sh's AD-a/AE teeth): the environment would be LIVE
+# on the destination, every line above would still pass, and its console
+# would answer 'no such environment console in this partition' to
+# everyone. The two halves: the destination console must ECHO a typed
+# line back through its own GET (the stream is there), and the source
+# console must REFUSE the same attach by name (the stream moved; it did
+# not duplicate).
+DST_EID="$(printf '%s' "$list_dst" | sed -n "s/.*env partition=$PART_ID env_id=\([0-9]*\).*/\1/p" | head -1)"
+[ -n "$DST_EID" ] || fail "could not parse the destination's env_id from 'env list' output:
+$(printf '%s' "$list_dst" | grep 'env partition=' | sed 's/^/       /')"
+MARKER="P3-CONS-FOLLOWS-$$"
+CONS_TR="$(mktemp)"; trap 'rm -f "$CONS_TR"' EXIT
+
+echo "==> attaching on the destination: typing 'echo $MARKER' into (partition $PART_ID, env $DST_EID)"
+posted=0
+deadline=$(( $(date +%s) + WAIT_CONSOLE ))
+while :; do
+    post_json "$D_PORT" "/api/partition/$PART_ID/env/$DST_EID/console" "echo $MARKER"
+    if [ "$POST_STATUS" = "200" ] && [ "$(jget "$POST_BODY" ok)" = "true" ] \
+       && [ -n "$(jget "$POST_BODY" queued)" ] && [ "$(jget "$POST_BODY" queued)" != "0" ]; then
+        posted=1; break
+    fi
+    [ "$(date +%s)" -ge "$deadline" ] && break
+    sleep "$POLL"
+done
+[ "$posted" -eq 1 ] || fail "the destination's console refused the line (no ok:true with
+       queued>0 within ${WAIT_CONSOLE}s of POST /api/partition/$PART_ID/env/$DST_EID/console
+       on node $other). The environment is LISTED there but its console does not
+       answer -- the console-unrebound defect live: the restore no longer binds the
+       console to the environment's new identity. Last response:
+$(printf '%s' "$POST_BODY" | head -c 300)"
+
+echo "==> waiting for the marker to come back through the destination's console (up to ${WAIT_CONSOLE}s)"
+heard=0
+deadline=$(( $(date +%s) + WAIT_CONSOLE ))
+while :; do
+    fetch "$D_PORT" "/api/partition/$PART_ID/env/$DST_EID/console"
+    if [ "$FETCH_STATUS" = "200" ] && [ "$(jget "$FETCH_BODY" ok)" = "true" ]; then
+        jget "$FETCH_BODY" output >> "$CONS_TR" 2>/dev/null
+        # The claim is a WHOLE line: the echoed INPUT line starts with
+        # 'echo' and merely contains the token, so only the shell's own
+        # output (possibly carrying the '$ ' prompt on its front) counts --
+        # the same whole-line rule env_checkpoint_restore_check.sh pins.
+        if grep -qE "^(${MARKER}|\\\$ ${MARKER})\$" "$CONS_TR" 2>/dev/null; then
+            heard=1; break
+        fi
+    fi
+    [ "$(date +%s)" -ge "$deadline" ] && break
+    sleep "$POLL"
+done
+[ "$heard" -eq 1 ] || fail "the marker never came back through the destination's console
+       (node $other, partition $PART_ID, env $DST_EID) within ${WAIT_CONSOLE}s. The line
+       was queued and the environment never answered it there -- the stream did not
+       follow the environment to the node it now lives on. Transcript so far:
+$(tail -c 400 "$CONS_TR" 2>/dev/null | sed 's/^/       /')"
+echo "   the destination's console echoed the marker -- the stream followed the environment"
+
+# The symmetric half: the SOURCE console must refuse the same attach BY
+# NAME. Its registry emptied above; this asserts the same fact at the
+# ATTACH surface, where a console still bound on the node the environment
+# left would otherwise hide -- a duplicate of the very record the
+# teardown exists to erase.
+fetch "$L_PORT" "/api/partition/$PART_ID/env/$ENV_ID/console"
+if [ "$FETCH_STATUS" = "200" ] && [ "$(jget "$FETCH_BODY" ok)" = "false" ] \
+   && [ "$(jget "$FETCH_BODY" error)" = "no such environment console in this partition" ]; then
+    echo "   the source's console refuses by name -- the console moved, it did not duplicate"
+else
+    fail "the source node $leader still answers the console attach for (partition $PART_ID,
+       env $ENV_ID) after its teardown (HTTP $FETCH_STATUS: $(printf '%s' "$FETCH_BODY" | head -c 200)).
+       A console still bound on the node the environment left is the same
+       record-that-describes-a-moved-environment, at the attach surface."
+fi
+
 # ─── 9. cleanup: the migrated pair belongs to the destination now ─────
-echo "==> cleaning up: destroying env $ENV_ID and partition $PART_ID on node $other"
+# The DESTROY keys by the destination's OWN env_id (step 8b's DST_EID):
+# the restore rebuilt the environment through create, and a create
+# re-decides the manager's handle -- destroying by the source's old
+# ENV_ID would silently no-op and leak the rebuilt environment and its
+# partition on the destination (the `|| true` below exists for a
+# genuinely-gone environment, not to hide a wrong id).
+echo "==> cleaning up: destroying env ${DST_EID:-$ENV_ID} and partition $PART_ID on node $other"
 "$CTL" --host "localhost:$D_PORT" "${TOKEN_ARGS[@]}" \
-    shell env destroy "$PART_ID" "$ENV_ID" >/dev/null 2>&1 || true
+    shell env destroy "$PART_ID" "${DST_EID:-$ENV_ID}" >/dev/null 2>&1 || true
 "$CTL" --host "localhost:$D_PORT" "${TOKEN_ARGS[@]}" \
     shell partition destroy "$PART_ID" >/dev/null 2>&1 || true
 
@@ -440,4 +568,7 @@ echo "      node $other rebuilt env $ENV_ID from the wire (restore -> LIVE), and
 echo "      ended it ONLY on node $other's word (teardown 'confirmed the restore'), then"
 echo "      completed the deferred reclamation. The source no longer describes the"
 echo "      environment that moved."
+echo "      And the console FOLLOWED (P3 increment 10's live arm): a line typed into"
+echo "      (partition $PART_ID, env $DST_EID) on node $other came back through node $other's"
+echo "      own console GET, while the same attach on node $leader was refused by name."
 exit 0

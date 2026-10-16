@@ -369,6 +369,14 @@ static void test_liveness(void) {
     failover_tick(352);
     CHECK(failover_peer_status(7) == PEER_DEAD,
           "...and declared dead on the first tick after the intent budget expires");
+    /* The same transition now also happens EARLY, on the peer's own
+     * release: env_migrate_intent_end() broadcasts budget 0, recv_intent
+     * drops the latch, and env_migrate_peer_in_flight() answers 0 here —
+     * the exact stub flip above. The mechanics of the release (local gate
+     * cleared, budget-0 frame on the wire, latch dropped, no-op without a
+     * begin) are pinned against the real definitions in
+     * tests/env_migrate_host_test.c; this file pins what the failover gate
+     * does with the answer, and that answer's contract is unchanged. */
 
     /* The stamp-ahead case (observed live 2026-10-13, a DEFERRED line that
      * printed "silent 18446744073709551606 ticks" = -10 unsigned): the two

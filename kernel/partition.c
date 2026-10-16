@@ -499,6 +499,7 @@ int partition_migrate(uint32_t partition_id, uint32_t dest_node_id) {
             (unsigned)partition_id, streams_relocated, streams_expected,
             (unsigned)dest_node_id, (unsigned)dest_node_id);
         if (!was_paused_before_migrate) partition_resume(partition_id);
+        env_migrate_intent_end();   /* the blocked phase ended here; the peers' latches must too */
         return 1;
     }
 
@@ -553,8 +554,16 @@ int partition_migrate(uint32_t partition_id, uint32_t dest_node_id) {
      * where its partition is. So the default path reports 0 of 0 and hands
      * over exactly as it did before this increment. */
     uint32_t envs_expected = 0, envs_moved = 0;
+    // was_paused_before_migrate (captured above, before this function's own
+    // pause) travels into the environment step: the staged records may carry
+    // "come back paused" ONLY when the operator's pause predates the move.
+    // The migration's own freeze is released here at the end and must not
+    // cross as an operator's intent — a destination honoring it left every
+    // migrated environment live by the records and dead to the scheduler
+    // (P3 increment 10's live console arm, 2026-10-14).
     int envs_rc = (cluster_local_node_id() != 0)
-        ? env_migrate_partition(partition_id, dest_node_id, &envs_expected, &envs_moved)
+        ? env_migrate_partition(partition_id, dest_node_id, was_paused_before_migrate,
+                                &envs_expected, &envs_moved)
         : 0;
 
     if (envs_rc != 0 || envs_moved < envs_expected) {
@@ -570,6 +579,7 @@ int partition_migrate(uint32_t partition_id, uint32_t dest_node_id) {
                            : "fewer environments confirmed than exist",
             (unsigned)dest_node_id);
         if (!was_paused_before_migrate) partition_resume(partition_id);
+        env_migrate_intent_end();   /* the blocked phase ended here; the peers' latches must too */
         return 1;
     }
 
@@ -589,6 +599,7 @@ int partition_migrate(uint32_t partition_id, uint32_t dest_node_id) {
             "what it was before the attempt.\n",
             (unsigned)partition_id);
         if (!was_paused_before_migrate) partition_resume(partition_id);
+        env_migrate_intent_end();   /* the blocked phase ended here; the peers' latches must too */
         return 1;
     }
 
@@ -667,6 +678,11 @@ int partition_migrate(uint32_t partition_id, uint32_t dest_node_id) {
             "remainder is deferred until this node's teardown confirmations complete.\n",
             (unsigned)partition_id, (unsigned)frames_reclaimed);
 
+    /* The blocking phase ended above (the send and the handoff are done —
+     * what remains, the confirmation walk, runs on the sweep and keeps its
+     * own gates). Release the intent so no peer stays blind for the rest of
+     * the 300 s budget after a SUCCESSFUL migrate. */
+    env_migrate_intent_end();
     return 0;
 }
 

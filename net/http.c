@@ -3071,6 +3071,13 @@ static int api_partition_env_create_post(const char* body, char* buf, int max,
      * already covered by its staging slot, the second has no cluster yet. */
     env_migrate_intent_begin();
     int rc = env_service_create(partition, index, &status, &env_id);
+    /* The create RPC returned — success or refusal, the blocking phase is
+     * over. Release the intent so every peer's latch ends NOW instead of at
+     * the budget's end: an unreleased announce leaves a blind spot exactly
+     * as long as the leftover budget (found live: a leader killed seconds
+     * after a create was undeclarable DEAD for minutes — failover delayed,
+     * the adoption guard's wait exceeded). */
+    env_migrate_intent_end();
 
     jb_obj_open(&j,0);
     if (rc != 0) {

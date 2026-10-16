@@ -172,7 +172,12 @@ uint32_t env_migrate_payload_pages(const struct EnvCkptRecord* rec);
  *   1. count this partition's records — its environments, as the kernel knows
  *      them — and REFUSE if any is still awaiting this boot's replay;
  *   2. freeze them (env_ckpt_quiesce_partition): the caller already holds the
- *      partition paused, so this sets the flags and pauses nothing;
+ *      partition paused, so this sets the flags and pauses nothing. The
+ *      `operator_paused` argument is the caller's own knowledge of WHICH
+ *      pause it holds — partition_migrate() paused the partition itself for
+ *      the duration of the move in the common case, and only an OPERATOR's
+ *      pause may travel to the destination as "come back paused" (env_ckpt.h
+ *      carries the live-found reason the two must not be confused);
  *   3. send every one of them, each confirmed page by page by env_migrate_send;
  *   4. thaw on EVERY path out, success or failure — the flags describe the
  *      instant the transfer held, and outlive it only while it holds.
@@ -184,6 +189,7 @@ uint32_t env_migrate_payload_pages(const struct EnvCkptRecord* rec);
  * where it was: `streams_expected` vs `streams_relocated`, applied to a
  * partition's whole environments. */
 int env_migrate_partition(uint32_t partition_id, uint32_t dest_node_id,
+                          int operator_paused,
                           uint32_t* out_expected, uint32_t* out_moved);
 
 /* The operands behind the most recent refusal, the same contract
@@ -367,10 +373,25 @@ int env_migrate_in_flight(void);
  * (no cluster to announce to yet). */
 void env_migrate_intent_begin(void);
 
+/* Release the intent this node announced: clears the local gate and
+ * broadcasts the same announce with budget 0 — the release. Every route
+ * that calls begin() calls this on EVERY exit of its blocking phase
+ * (success and refusal alike): partition_migrate() around its
+ * pause/capture/send, the env-create routes around the create RPC, and the
+ * sweep's restore loop around each restore attempt. The budget remains the
+ * backstop for a lost release frame; this makes death detection prompt in
+ * the common case instead of blind for the leftover budget. No-op (no
+ * transmit) when no intent stands, so a sweep period with a begin elsewhere
+ * does not spam the wire. */
+void env_migrate_intent_end(void);
+
 /* The wire entry (net/dspp.c's dispatch): latch a peer's announced intent.
  * budget_ticks is clamped to [1, ENV_MIGRATE_INTENT_GRACE_TICKS] — a peer
  * cannot shield itself past the cap — and node 0 (the reserved sentinel) is
- * ignored. */
+ * ignored. The ONE exception to the clamp is budget 0, which is the
+ * announce's own release (env_migrate_intent_end's broadcast): it
+ * deactivates the named peer's latch, if one stands, and never creates
+ * one. */
 void env_migrate_recv_intent(uint32_t node_id, uint32_t budget_ticks);
 
 /* 1 while node_id's announced intent budget has not expired. The failover

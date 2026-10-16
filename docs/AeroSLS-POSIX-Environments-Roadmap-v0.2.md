@@ -1945,6 +1945,16 @@ the exact blind spot it exists to close. The destination announces too,
 before each restore attempt: the restore blocks THIS node's sweep, and on
 the leader that sweep carries the only heartbeat stream. Bounded like every
 other face — the budget expires and a genuinely dead peer is declared.
+**The announce now RELEASES (2026-10-14).** The budget covering the whole
+blocking phase meant the latch outlived the phase by up to 300 s — found
+live when a leader killed right after an env create stayed undeclarable
+DEAD (the adoption guard's wait lost to it). `env_migrate_intent_end()`
+clears the local gate and re-broadcasts the same announce with budget 0 —
+the one value the clamp made unrepresentable — and every announcing route
+calls it on every exit (`partition_migrate()`'s three refusals + success,
+both env-create routes, the sweep's restore loop per attempt). The budget
+stays the backstop for a lost release; clause AG of
+`env_migration_check.sh` holds the wiring.
 
 One adjacent wire defect surfaced while proving it and is fixed in the same
 increment: `env_migrate_recv_begin()` refused ANY BEGIN for an
@@ -2163,13 +2173,67 @@ readable on this survivor, and that refusal is the payload layer's own to
 print (`[ENV_PAYLOAD]`; the restored-count's summary line says so rather
 than leaving it to inference). Destination (a) — the bulk transfer that
 makes contents follow ownership itself — remains the PASE-grade answer and
-is unchanged. The live arm is still owed, by the same honesty as
-increment 10's: what this increment proves is the wiring and the
-accounting, on the tree, with every tooth biting; the boot-a-cluster,
-kill-a-node, watch-it-come-back run is the same live arm P3's migration
-half already has the harness for (`tests/failover_adoption_live_check.sh`),
-and it is where a genuinely-deployed shared store would first be exercised
-end to end.
+is unchanged. The live arm it owed landed with increment 12's addendum
+below (2026-10-16: the boot-a-cluster, kill-a-node, watch-it-come-back
+run, end to end, on a fresh 3-node TCG cluster).
+
+### Findings addendum — what landed, increment 12 (the operator's pause crosses the boundary; the live arm lands)
+
+Two halves, each earned by a live run of an arm this phase already had.
+
+**The defect (found 2026-10-14, by increment 10's console live arm).** An
+operator-paused partition that migrated came back RUNNING on the
+destination: `partition_migrate()` captured nothing about who had paused
+the partition, and the staged records' "come back paused" flag was
+stamped from the migration's OWN freeze — the very freeze this function
+releases at its end. So the operator's intent was dropped at the
+boundary while the migration's internal state crossed as if it were one
+— an operator's pause never survived a move, and a destination honouring
+the wrong half left a tenant live by the records and dead to the
+scheduler.
+
+**The fix.** `partition_migrate()` captures `was_paused_before_migrate`
+BEFORE its own pause and threads it into `env_migrate_partition()`: the
+staged records may carry "come back paused" only when the operator's
+pause predates the move. Held by clause AF of `env_migration_check.sh`
+(the argument must reach the environment step; its smoke tooth deletes
+the threading) and pinned on both halves in `tests/env_migrate_host_test.c`
+— the migration's own freeze does NOT cross (F3a), the operator's pause
+DOES (F3b).
+
+**The live arm (increment 11's owed run) landed the same week, and its
+first runs earned their keep.** `tests/failover_adoption_live_check.sh`
+grew the environment arm: an environment created on the leader inside its
+own partition, a gate that a checkpoint carrying its NAME reached both
+survivors, then the kill — followed by the survivor's declare → adopt →
+the step-7.5 lines that NAME the unrestored environment and classify it
+(`no durable record for it on this survivor; recreate it`), with the
+resurrect/migrate-back/lease/service choreography unchanged behind it.
+Live 2026-10-16 on a fresh 3-node TCG cluster: PASS end to end, and the
+path there was the honest one — the env create (the longest synchronous
+command in the system) churned leadership twice on that loaded host, the
+guard diagnosed the lost precondition (`node N is no longer LEADER`) and
+re-ran itself against whoever led now (restarts 1 and 2 of 3; a leader
+that lost its role never puts the env name into another broadcast, because
+the env lives on ITS tree), and the warm third run carried the whole
+choreography through, classification line included. Its teeth are 29,
+proven on every push by `tests/failover_adoption_live_smoke.sh` (3 fake
+nodes); the churn and self-restart paths are live-only and named as the
+smoke's one gap.
+
+**A third defect, found by the live runs and fixed in the same
+increment.** The environment store's restored directory carried LAST
+boot's `region_base` — a frame address this boot's pool re-hands to
+whoever attaches next, which `es_find_base()`'s first match then resolved
+to the STALE entry: found live (2026-10-15) as a 12 241-line
+restore-denial loop ending in `REFUSE_PARKED`, which killed the migrate's
+destination before its environment ever announced. `env_storage_after_restore()`
+surrenders every restored placement at the load — identity, extent and
+occupancy kept; only the claim on an address this node no longer holds —
+called by `persist_restore_all()` right after the table is read. Held by
+clause S3i of `env_storage_durable_check.sh` (order-in-the-load + the
+surrender) with its `stale-region-base` smoke tooth, and pinned by
+`tests/env_storage_host_test.c`.
 
 ---
 

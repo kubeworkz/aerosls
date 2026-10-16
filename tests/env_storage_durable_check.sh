@@ -27,7 +27,7 @@
 #   P1B_ARTIFACTS    where the recorded evidence lands (default a temp dir,
 #                    printed at the end so it can be --replay'd later)
 #   P1B_INDEX        the environment's index in its partition (default 2)
-#   P1B_TOOTH=ram-backed|unquotaed|format-v1-only|bad-format-version
+#   P1B_TOOTH=ram-backed|unquotaed|format-v1-only|bad-format-version|stale-region-base
 #                    source-level teeth (see the smoke): rejected by the boot
 #                    arm — the boot arm records what really happened — and
 #                    asserted by the source clauses and by --replay fixtures.
@@ -100,6 +100,15 @@
 #                                  refused by name. Expected: the source
 #                                  refusal clause (S8e) red — its zero-gate
 #                                  half specifically.
+#   P1B_TOOTH=stale-region-base   the directory load keeps a region_base
+#                                  restored from a PREVIOUS boot (the call
+#                                  after the array read deleted, or the
+#                                  clear inside it neutered) — the live
+#                                  env_migrate_confirm REFUSE_PARKED shape.
+#                                  Expected: S3h red for the missing call,
+#                                  S3i red for the nominal surrender, and
+#                                  S11 green under the call's removal (the
+#                                  seam is wiring, not a build dependency).
 #
 # ─── What this guard will NOT claim ────────────────────────────────────────
 # Byte-identity of the big file is a FINGERPRINT of three reads (wc -c,
@@ -259,6 +268,19 @@ source_clauses() {
         bad "S3f. the directory restore does not validate record size + version BEFORE reading into the live table — a foreign snapshot would land half-applied (refusal over partial application)"
     has "$PC" "directory REFUSED" || \
         bad "S3g. a refused directory has no named refusal line — the serial log would say nothing about why every store cold-started"
+    # The load's own seam: a region_base restored from a PREVIOUS boot is
+    # not this boot's placement (env_storage.h's "Keys" section) and must
+    # be surrendered at the read, or es_find_base()'s first match resolves
+    # the frame pool's fresh address to the stale entry — found live as a
+    # 12 241-line restore-denial loop ending in REFUSE_PARKED.
+    order_ok "$PC" "persist_read_array(env_storage_table," "env_storage_after_restore();" || \
+        bad "S3h. persist_restore_all never surrenders the restored region_base after reading the directory — a previous boot's address stays in the table, and this boot's frame pool re-hands it to the next attach, whose own server is then denied by the stale first match (the live env_migrate_confirm REFUSE_PARKED failure)"
+    has "$C" "void env_storage_after_restore(void)" || \
+        bad "S3i. env_storage.c no longer defines env_storage_after_restore() — the load seam does not exist, so the stale region_base shadow is back"
+    local ar_body
+    ar_body=$(body "$C" "void env_storage_after_restore(void)")
+    printf '%s' "$ar_body" | grep -qF "region_base = 0" || \
+        bad "S3i. env_storage_after_restore() does not clear region_base — the surrender is nominal and the first-match shadow survives"
 
     # ── S4. attach before spawn; release before free ───────────────────────
     order_ok "$E" "k.env_storage_attach(" "k.create_sidecar_in(&rd_manifest" || \
@@ -719,7 +741,7 @@ fi
 # ─── The boot arm ──────────────────────────────────────────────────────────
 case "$TOOTH" in
     "") ;;
-    ram-backed|unquotaed|format-v1-only|bad-format-version)
+    ram-backed|unquotaed|format-v1-only|bad-format-version|stale-region-base)
         echo "ABORT: P1B_TOOTH=$TOOTH is a source-level tooth (see tests/env_storage_durable_check_smoke.sh); the boot arm records what really happened and takes no teeth" >&2
         exit 2 ;;
     *) echo "ABORT: unknown P1B_TOOTH='$TOOTH'" >&2; exit 2 ;;

@@ -269,6 +269,7 @@ int env_migrate_send(uint32_t partition_id, uint32_t index, uint32_t dest_node_i
  * the whole freeze/send/thaw discipline in one place where it can be proven
  * as a unit (tests/env_migrate_host_test.c, Phase F). */
 int env_migrate_partition(uint32_t partition_id, uint32_t dest_node_id,
+                          int operator_paused,
                           uint32_t* out_expected, uint32_t* out_moved) {
     uint32_t expected = 0;
     if (out_expected) *out_expected = 0;
@@ -315,9 +316,17 @@ int env_migrate_partition(uint32_t partition_id, uint32_t dest_node_id,
 
     /* 2. Freeze them — the caller holds the partition paused already, so this
      * marks a state that exists rather than creating one, and it marks exactly
-     * the records counted above or it refused. */
+     * the records counted above or it refused. `operator_paused` is the
+     * caller's answer to the one question the flags cannot answer for
+     * themselves: partition_migrate() paused this partition for the move, so
+     * unless an OPERATOR's pause predates that, the staged records must carry
+     * QUIESCED alone — the migration's own freeze is released on the source
+     * and is nobody else's business. Marking it anyway made every destination
+     * "restore into paused": the environment LIVE by the records, its
+     * sidecars never scheduled again, its console accepting input nobody
+     * would read (P3 increment 10's live console arm, 2026-10-14). */
     struct EnvCkptPartitionQuiesce freeze;
-    if (env_ckpt_quiesce_partition(partition_id, &freeze) != expected) {
+    if (env_ckpt_quiesce_partition(partition_id, &freeze, operator_paused) != expected) {
         kernel_serial_printf(
             "[ENV_MIGRATE] partition %u: could not freeze its %u environment(s) -- "
             "this node does not hold the partition paused, so nothing may be read as a "
@@ -1002,9 +1011,49 @@ void env_migrate_intent_begin(void) {
     dspp_env_migrate_send_intent((uint32_t)ENV_MIGRATE_INTENT_GRACE_TICKS);
 }
 
+void env_migrate_intent_end(void) {
+    /* The blocking phase resolved (success OR refusal): release this node's
+     * own gate and ask every peer to drop its latch NOW rather than at the
+     * budget's end. The announce is one-shot and the budget was sized for
+     * the whole phase, so an unreleased intent leaves a blind spot exactly
+     * as long as the leftover budget — found live: an operator (or a guard)
+     * creating an environment and then killing the node could not be
+     * declared DEAD for a full 300 s, and the adoption guard's 240 s wait
+     * lost to it. The release rides the SAME broadcast (budget 0 = revoke,
+     * the only meaning 0 can have on this wire — recv_intent clamps every
+     * nonzero budget, so 0 was previously unrepresentable). A RELEASED
+     * frame is droppable: the budget still bounds the latch on its own;
+     * the release only makes death detection prompt in the common case.
+     * Gated on the local stamp so a sweep period with no begin transmits
+     * nothing — the restore loop below calls this after EVERY attempt. */
+    if (env_migrate_intent_tick == 0) return;
+    env_migrate_intent_tick = 0;
+    dspp_env_migrate_send_intent(0);
+}
+
 void env_migrate_recv_intent(uint32_t node_id, uint32_t budget_ticks) {
     if (node_id == 0 || node_id == cluster_local_node_id()) return;
-    if (budget_ticks == 0) budget_ticks = 1;
+    if (budget_ticks == 0) {
+        /* The announce's own release: the peer's blocking phase is over and
+         * its silence is a death again on the normal terms. Deactivate the
+         * latch if one stands; a release for a node this table never latched
+         * is a no-op, not an error (the frame may have been reordered ahead
+         * of the announce it cancels — begin/end pairs are retransmit-free
+         * one-shots — and the worst case is the budget's own bound). */
+        for (int i = 0; i < ENV_MIGRATE_INTENT_PEERS_MAX; i++) {
+            struct EnvMigratePeerIntent* e = &env_migrate_peer_intent[i];
+            if (!e->active || e->node_id != node_id) continue;
+            e->active = 0;
+            kernel_serial_printf(
+                "[ENV_MIGRATE] node %u released its environment-migration intent "
+                "-- its silence is a death again on the normal terms.\n",
+                (unsigned)node_id);
+            return;
+        }
+        return;
+    }
+    if (budget_ticks > ENV_MIGRATE_INTENT_GRACE_TICKS)
+        budget_ticks = (uint32_t)ENV_MIGRATE_INTENT_GRACE_TICKS;
     if (budget_ticks > ENV_MIGRATE_INTENT_GRACE_TICKS)
         budget_ticks = (uint32_t)ENV_MIGRATE_INTENT_GRACE_TICKS;
 
@@ -1250,6 +1299,13 @@ uint32_t env_migrate_tick(uint64_t now) {
          * transmit is legal here. */
         env_migrate_intent_begin();
         int rc = env_migrate_restore(s->partition_id, s->index);
+        /* The restore returned — the phase it shielded is over. Release the
+         * gate and the peers' latches immediately; without this the announce
+         * leaves every observer blind for the rest of the 300 s budget after
+         * every single restore attempt (found live: a leader killed right
+         * after an env create was undeclarable DEAD for minutes — the
+         * adoption guard lost to exactly that). */
+        env_migrate_intent_end();
         if (rc == ENV_MIGRATE_OK) {
             restored++;
         } else {

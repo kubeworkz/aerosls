@@ -251,15 +251,24 @@ else
     ok "F. the step freezes once and releases on ${release_calls} paths out (failure and success)"
 fi
 
-# ── G. The freeze marks both bits and the release restores what it found ──
+# ── G. QUIESCED always; the operator's pause only when the caller says so ──
+# The middle anchor is P3 increment 12's fix (found by increment 10's LIVE
+# console arm, 2026-10-14): the quiesce used to set PARTITION_PAUSED
+# unconditionally, so every staged record claimed an operator's pause it
+# never had — the migration's own freeze, recorded as an operator's intent.
+# Every destination then "restored into paused": the environment was LIVE
+# by the records and dead to the scheduler, its sidecars never scheduled
+# again, its console accepting input nobody would ever read. The flag's own
+# definition ("an operator's intent, not something the capture did") is
+# what this anchor holds.
 if ! has kernel/env_ckpt.c "env_ckpt_table[i].flags |= ENV_CKPT_FLAG_QUIESCED"; then
     bad "G. env_ckpt_quiesce_partition() no longer sets ENV_CKPT_FLAG_QUIESCED — the record that crosses would be refused by the destination's restore rule 2 (unquiesced)"
-elif ! has kernel/env_ckpt.c "ENV_CKPT_FLAG_PARTITION_PAUSED"; then
-    bad "G. the partition-scoped quiesce no longer records ENV_CKPT_FLAG_PARTITION_PAUSED — a destination's restore would not put the partition back frozen"
+elif ! has kernel/env_ckpt.c "if (operator_paused)"; then
+    bad "G. the partition-scoped quiesce no longer conditions ENV_CKPT_FLAG_PARTITION_PAUSED on the caller's operator_paused — the migration's own freeze would cross as an operator's pause again and every destination would restore into a partition nobody paused (the live-found defect: tenant dead on arrival, console input read by nobody)"
 elif ! has kernel/env_ckpt.c "env_ckpt_table[i].flags = q->prior_flags[i]"; then
     bad "G. env_ckpt_release_partition() no longer restores each record's PRIOR flags — an aborted migration would leave a running partition described as paused-and-frozen, which is a lie the capture's own rules exist to prevent"
 else
-    ok "G. the freeze sets both flag bits and the release restores the prior flags bit for bit"
+    ok "G. the freeze marks QUIESCED always, the operator's pause only on the caller's word, and the release restores the prior flags bit for bit"
 fi
 
 # ── H. The not-yet-replayed gate, wired end to end ────────────────────────
@@ -613,6 +622,62 @@ elif ! has tests/env_payload_host_test.c "env_console_identity_seen"; then
     bad "AE. the payload host test no longer drives the identity wait — the gate's behaviour would be asserted by nobody"
 else
     ok "AE. the pour waits for the destination's own identity announcement, and the host test drives that wait"
+fi
+
+# ── AF. The operator's intent threads from the only one who knows it ───────
+# G holds the RECEIVING end (the freeze marks the bit only when told); this
+# clause holds the ROUTE. partition_migrate() captures
+# was_paused_before_migrate BEFORE its own pause and is the single source of
+# this fact — partition_is_paused() reads 1 either way, so nothing downstream
+# can re-derive it. Three hops, each deletable independently: the call passes
+# it, the step forwards it, the contract declares it.
+if ! has kernel/partition.c "env_migrate_partition(partition_id, dest_node_id, was_paused_before_migrate,"; then
+    bad "AF. partition.c no longer passes was_paused_before_migrate into the environment step — an operator's pause would never travel to the destination, and (before increment 12's flip) the migration's own freeze travelled instead"
+elif ! has kernel/env_migrate.c "env_ckpt_quiesce_partition(partition_id, &freeze, operator_paused)"; then
+    bad "AF. env_migrate.c no longer forwards operator_paused to the freeze — the knowledge crosses one API boundary and stops, and the staged records fall back to a guess the flag cannot support"
+elif ! has kernel/env_migrate.h "int operator_paused"; then
+    bad "AF. env_migrate.h no longer declares the operator_paused parameter — the step's contract no longer names the one fact the flags cannot derive"
+else
+    ok "AF. the operator's pause threads partition_migrate -> env_migrate_partition -> the freeze, declared where the contract lives"
+fi
+
+# ── AG. Every announcing route RELEASES the intent when its phase ends ────
+# The announce is one-shot and its budget is sized for the whole blocking
+# phase, so without a release the latch lives out the FULL budget after the
+# phase is over. Found live on a 3-node cluster (2026-10-14): an env create
+# finished in seconds, the operator killed the node right after, and both
+# survivors printed "declaration DEFERRED: node N announced environment-
+# migration intent" for the announce's full 300 s — the adoption guard's
+# 240 s wait lost to a blind spot the create had already finished with.
+# The release rides the SAME broadcast (budget 0 — the only value
+# env_migrate_recv_intent's clamp made unrepresentable), so the wire needed
+# no new opcode; what must exist is the end() on every route, on every exit.
+if ! has kernel/env_migrate.h "void env_migrate_intent_end(void)"; then
+    bad "AG. env_migrate.h no longer declares env_migrate_intent_end() — the release has no contract, and every announce lives out its full budget after its phase ends"
+elif [ -z "$(awk '/^void env_migrate_intent_end/{f=1} f && /env_migrate_intent_tick = 0/{print NR; exit}' kernel/env_migrate.c)" ]; then
+    bad "AG. env_migrate_intent_end() no longer clears the LOCAL gate — this node stays undeclarable DEAD for the rest of the budget after its own blocking phase resolved (checked INSIDE end(), because the same assignment in the static initializer would satisfy a whole-file search)"
+elif ! has kernel/env_migrate.c "dspp_env_migrate_send_intent(0)"; then
+    bad "AG. env_migrate_intent_end() no longer broadcasts the budget-0 release — every PEER keeps its latch until the budget's end (the live 300 s blind spot after a create)"
+else
+    ag_rc=$(awk '/^void env_migrate_recv_intent/{f=1} f && /budget_ticks == 0/{print NR; exit}' kernel/env_migrate.c)
+    ag_cl=$(awk '/^void env_migrate_recv_intent/{f=1} f && /budget_ticks = \(uint32_t\)ENV_MIGRATE_INTENT_GRACE_TICKS/{print NR; exit}' kernel/env_migrate.c)
+    if [ -z "$ag_rc" ] || [ -z "$ag_cl" ] || [ "$ag_rc" -ge "$ag_cl" ]; then
+        bad "AG. env_migrate_recv_intent() no longer handles budget 0 as the release BEFORE the clamp — a release frame is latched as a 1-tick announce instead of ending one"
+    elif ! has kernel/partition.c "env_migrate_intent_end();"; then
+        bad "AG. partition_migrate() no longer releases the intent on its exit paths — a success and every refusal leave every peer blind for the rest of the budget"
+    elif [ "$(grep -cF 'env_migrate_intent_end();' kernel/partition.c)" -lt 4 ]; then
+        bad "AG. partition_migrate() calls env_migrate_intent_end() only $(grep -cF 'env_migrate_intent_end();' kernel/partition.c) time(s) — three refusal returns plus the success tail each need one, or one more abort path than before ships the blind spot again"
+    elif ! has net/http.c "env_migrate_intent_end();"; then
+        bad "AG. the HTTP env-create route no longer releases the intent after its create RPC — the exact live-found shape: a create finishing in seconds blinds every observer for 300 s"
+    elif ! has user/shell.c "env_migrate_intent_end();"; then
+        bad "AG. the shell's 'env create' no longer releases the intent after its create RPC — the serial-side operator path keeps the blind spot"
+    elif [ -z "$(awk '/env_migrate_intent_begin\(\);/{b=NR} /int rc = env_migrate_restore\(/{r=NR} /env_migrate_intent_end\(\);/{if (r && NR > r) {print NR; exit}}' kernel/env_migrate.c)" ]; then
+        bad "AG. the sweep's restore loop no longer releases the intent after each restore attempt — every restore period re-arms a full 300 s blind spot on the restoring node"
+    elif ! has tests/env_migrate_host_test.c "env_migrate_intent_end("; then
+        bad "AG. env_migrate_host_test.c no longer drives the release — the local gate, the budget-0 frame and the peer's dropped latch would be asserted by nobody"
+    else
+        ok "AG. every announcing route releases the intent when its phase ends: local gate cleared, budget-0 broadcast, the peer's clamp yielding to it, pinned in the host test"
+    fi
 fi
 
 echo

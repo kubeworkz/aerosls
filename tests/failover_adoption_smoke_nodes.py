@@ -194,12 +194,29 @@ mode = open(os.path.join(state, "mode")).read().strip()
 leader_id = int(open(os.path.join(state, "leader")).read().strip())
 
 created = os.path.join(state, "created.json")
+# The guard creates a SECOND partition -- the '-env' one it then puts an
+# environment inside (step 4.5) -- and later looks the FIRST one ($NAME) up
+# again for steps 10-12. created.json therefore keeps holding the first row
+# exactly as every earlier gate expects, and later creates append here
+# instead of overwriting it. _partitions() serves both.
+extra = os.path.join(state, "extra.json")
+# The environments the guard's step 4.5 creates: [{partition, index, env_id}].
+envs_f = os.path.join(state, "envs.json")
 lease = os.path.join(state, "lease.json")
 migrate = os.path.join(state, "migrate.json")
 # The periodic re-announce's pass counter -- owned by the node that owns the
 # row, exactly like partition_reannounce_tick(). See its block below.
 reannounce = os.path.join(state, "reannounce")
 REANNOUNCE_PERIOD = 10.0   # models 1000 ticks ~= 10 s; see the block below
+# The checkpoint BROADCAST period, modelled for followers: the real leader
+# puts its state tree out every 100 ticks (~1 s), and the guard's step-4.5
+# gate counts DELTAS of "[DSPP-CKPT] RX: COMPLETE" lines that land AFTER the
+# -env create. Emitting the line exactly once at learn time (as this fake
+# did before step 4.5 existed) leaves that gate at 0 forever no matter how
+# long it waits, so followers now log one per period -- same shape, same
+# line, bounded by the guard's own windows. 2 s keeps two lines inside one
+# FAST 6 s window with margin on a loaded host.
+CKPT_PERIOD = 2.0
 # Test-only knob for the smoke's "leadergap" tooth: when <state>/health_gap
 # holds a number, the LEADER answers /api/health only after that many
 # seconds from the guard's create -- a bounded episode of unreachability,
@@ -263,6 +280,33 @@ def read_created():
     return None
 
 
+def read_list(path):
+    """A JSON list from disk. A missing or torn file is an empty list, never
+    an exception: a reader that can raise turns a half-written file into a
+    verdict decided by timing (the rule read_created()/read_epoch() follow)."""
+    if os.path.exists(path):
+        try:
+            v = json.load(open(path))
+            if isinstance(v, list):
+                return v
+        except ValueError:
+            pass
+    return []
+
+
+def read_envs():
+    return read_list(envs_f)
+
+
+def all_rows():
+    """Every partition row this node serves: the primary ($NAME) plus any
+    created after it (the guard's -env partition)."""
+    row = read_created()
+    rows = [row] if row else []
+    rows.extend(read_list(extra))
+    return rows
+
+
 def read_epoch():
     """The owner's re-announce pass counter (0 = no pass yet).
 
@@ -313,6 +357,24 @@ def lease_term(row):
         return int(row.get("term", 0))
     except (AttributeError, TypeError, ValueError):
         return 0
+
+
+def read_migrate():
+    """The migrate (transfer) row. read_created()/read_lease()'s rule: a
+    half-arrived row means 'not yet', never an exception. A bare
+    json.load() in migrate_poll_thread() is what killed that RX thread --
+    the writer's in-place window (before this file's whole-write rule
+    reached migrate.json) let the destination read a zero-byte file once
+    and the thread died silently, so the transfer line never appeared:
+    observed as migrate_stable's FAIL ('the destination never logged the
+    owner-initiated transfer') while migrate_noapply, which models exactly
+    that absence, passed on the same gate."""
+    if os.path.exists(migrate):
+        try:
+            return json.load(open(migrate))
+        except ValueError:
+            return None
+    return None
 
 
 def learn_line(row, owner):
@@ -454,8 +516,29 @@ def rx_thread():
             # CKPT line AFTER the sync line, so it must wait out another
             # period too.
             next_reannounce()
+            # pass 2 lands at create+10 (REANNOUNCE_PERIOD) -- but the gate's
+            # first deadline is create+S+6 where S is how long step 3 took,
+            # and S stretched to 4-6 s on a loaded host, so create+10 sat ON
+            # the deadline: one run's poll caught it inside window 1 (no
+            # re-drive note, tooth vacuous), another run's control missed it
+            # by a hair. create+12 puts it strictly between window 1's
+            # deadline (S+6 < 12 whenever S < 6, which step 3's own re-drive
+            # rule guarantees) and window 2's (S+12 > 12 always) -- the first
+            # window misses (the tooth's note) and the second catches it,
+            # with margins that only close if step 3 itself nearly timed out.
+            time.sleep(2.0)
         if mode != "nockpt":
             log("[DSPP-CKPT] RX: COMPLETE seq=1000 (448 bytes)")
+            # Periodic broadcast from here on: this is the follower's RX
+            # clock, so it stops with this thread (which is life-bounded) and
+            # never runs on a node that did not learn. ckptlost1 (above) delays
+            # the FIRST of these and nockpt suppresses every one, which is what
+            # keeps those two teeth biting through this loop.
+            seq = 1001
+            while True:
+                time.sleep(CKPT_PERIOD)
+                log("[DSPP-CKPT] RX: COMPLETE seq=%d (448 bytes)" % seq)
+                seq += 1
 
 
 threading.Thread(target=rx_thread, daemon=True).start()
@@ -620,16 +703,70 @@ def death_thread():
             time.sleep(0.1)
             continue
         transitioned = True
+        # Prefetch BEFORE the declare: the guard's step-7.5 budget starts at
+        # the adopt line, so no file read (9p on a loaded host) may sit
+        # between the adopt line and the classification lines behind it.
+        # Observed a run where adopt+recovery landed and the classification
+        # never did within 10 s -- the gate read an I/O stall as "the
+        # adoption dropped the name", the increment-9 defect's exact shape.
+        row = read_created()
+        block = None
+        if my_transition == "LEADER" and mode != "notadopted" and row:
+            # The adopted partitions carry the guard's environment (step
+            # 4.5), and this survivor's own store holds no record of it --
+            # every node has its own disk, so the honest classification is
+            # the NOT-restored one. A RESTORED line here is the increment-11
+            # lie the guard's step 7.5 fails on, so it is never printed by
+            # any mode.
+            #
+            # Both lines are byte-shaped after kernel/failover.c's own
+            # printf's (331-411): the count in the summary is a bare
+            # "%u environment(s)" -- NOT "[%u]" -- and the per-env line ends
+            # in "; recreate it". The guard greps these literally.
+            #
+            # Bounded re-read while nothing matches: the registry provably
+            # exists (step 4.5's pre-gate proved the env live), so an empty
+            # or non-matching first read is torn/not-yet, never "no
+            # environment" -- a single-shot read that scored 0 printed
+            # nothing at all and failed the gate on that silence.
+            env_lines = []
+            n = 0
+            for _ in range(60):
+                adopted = {int(r["id"]) for r in all_rows()}
+                n = 0
+                env_lines = []
+                for e in read_envs():
+                    if int(e["partition"]) in adopted:
+                        n += 1
+                        env_lines.append(
+                            "[FAILOVER] environment index %u (partition %u, 3 "
+                            "region(s)) was NOT restored -- no durable record "
+                            "for it on this survivor; recreate it"
+                            % (int(e["index"]), int(e["partition"])))
+                if n:
+                    break
+                time.sleep(0.05)
+            if n:
+                env_lines.append(
+                    "[FAILOVER] %u environment(s) of the adopted partitions "
+                    "were NOT restored (named above) -- their payload lived "
+                    "on node %u's own storage and does not follow ownership"
+                    % (n, leader_id))
+            # ONE append for adopt+recovery+classification: the guard can
+            # never observe the adopt line without the classification lines
+            # already behind it in the same file.
+            block = "\n".join(
+                ["[FAILOVER] Adopted partition %s from dead node %u"
+                 % (row["id"], leader_id),
+                 "[FAILOVER] recovery for dead node %u: rc=0 (OK - adopted)"
+                 % leader_id]
+                + env_lines)
         # Every node that observes the death DECLARES it (failover_tick
         # runs everywhere); only the leader recovers.
         log("[FAILOVER] Node %u declared DEAD (silent 300 ticks)" % leader_id)
-        row = read_created()
         if my_transition == "LEADER":
-            if mode != "notadopted" and row:
-                log("[FAILOVER] Adopted partition %s from dead node %u"
-                    % (row["id"], leader_id))
-                log("[FAILOVER] recovery for dead node %u: rc=0 (OK - adopted)"
-                    % leader_id)
+            if block is not None:
+                log(block)
         else:
             # The observer: it merely learns the handoff announce from
             # the adopter -- except in the misbehaviour modes. The
@@ -814,13 +951,18 @@ def migrate_poll_thread():
     # Life-bounded: the step-11 transfer is the last thing the guard does.
     while True:
         if os.path.exists(migrate):
-            row = read_created()
-            if not row:
-                return
-            m = json.load(open(migrate))
-            owner_after = 1 if mode != "migrate_flap" else 2
             if mode == "migrate_noapply":
                 return   # the transfer never arrives (gate bites)
+            # Retry-tolerant, both files: a torn migrate row or a not-yet
+            # readable created row means "not yet", never a dead thread.
+            # The old `if not row: return` and bare json.load() killed this
+            # thread silently -- the single observed migrate_stable miss.
+            row = read_created()
+            m = read_migrate()
+            if row is None or m is None:
+                time.sleep(0.05)
+                continue
+            owner_after = 1 if mode != "migrate_flap" else 2
             log("[PARTITION] sync: partition %s claimed by node %s and node %s -- "
                 "owner-initiated transfer, applying."
                 % (row["id"], m["adopter"], m["dest"]))
@@ -894,10 +1036,17 @@ def do_migrate(pid, dest):
         lease_held = False   # the source's write permission is gone
         if mode != "migrate_flap":
             migrated_to = dest
-    with open(migrate, "w") as f:
+    # Whole-write (tmp + os.replace), the same rule the lease row and the
+    # re-announce counter follow: the RX side on nodes 1/3 polls this file
+    # every 50 ms from OTHER processes, and an in-place write shows them a
+    # zero-byte file for as long as this writer is preempted between open
+    # and close -- enough once to kill the destination's transfer thread.
+    tmp = "%s.tmp%d" % (migrate, os.getpid())
+    with open(tmp, "w") as f:
         json.dump({"id": row["id"] if row else 1,
                    "name": row["name"] if row else "",
                    "dest": dest, "adopter": node_id}, f, separators=(",", ":"))
+    os.replace(tmp, migrate)
     return out
 
 
@@ -928,20 +1077,35 @@ class H(http.server.BaseHTTPRequestHandler):
 
     def _partitions(self):
         """The /api/partitions body. The leader serves the current created
-        row; a follower serves the row only once it has learned it, with
-        the owner depending on what the transition/migrate did with it.
+        row(s); a follower serves the rows only once it has learned them, with
+        the owner depending on what the transition/migrate did with them.
         holds_lease is partition_holds_write_lease()'s raw output: 1 only
         on the process that won an acquire (the adopter before the migrate,
-        the destination after its re-acquire)."""
-        row = read_created()
+        the destination after its re-acquire).
+
+        EVERY row (the primary $NAME plus the -env partition the guard's step
+        4.5 creates) is decorated identically: they are one cluster table, and
+        the guard reads $NAME by name from the adopter in step 10 while reading
+        the -env row's id in step 4.5 -- so both must be listed with the same
+        owner derivation."""
         lease_val = 1 if lease_held else 0
+        rows = all_rows()
+
+        def decorate(owner=None, keep_owner=False):
+            out = []
+            for row in rows:
+                r = dict(row)
+                if not keep_owner:
+                    r["owner_node"] = owner
+                r["holds_lease"] = lease_val
+                out.append(r)
+            return out
+
         if role == "leader":
-            if not row:
+            if not rows:
                 return {"partitions": []}
-            r = dict(row)
-            r["owner_node"] = migrated_to if migrated_to else node_id
-            r["holds_lease"] = lease_val
-            return {"partitions": [r]}
+            return {"partitions": decorate(migrated_to if migrated_to
+                                            else node_id)}
         if mode == "nolearn":
             return {"partitions": []}
         if not learned:
@@ -949,37 +1113,27 @@ class H(http.server.BaseHTTPRequestHandler):
         if transitioned:
             if my_transition == "LEADER":
                 if mode == "notadopted":
-                    # Adopted nothing: the row still claims the DEAD leader.
-                    r = dict(row)
-                    r["holds_lease"] = lease_val
-                    return {"partitions": [r]}
+                    # Adopted nothing: the rows still claim the DEAD leader.
+                    return {"partitions": decorate(keep_owner=True)}
                 # resurrect_flap: the stale claim was applied, owner = 1.
                 if mode == "resurrect_flap" and "flapped" in globals() and flapped:
-                    r = dict(row)
-                    r["owner_node"] = 1
-                    r["holds_lease"] = lease_val
-                    return {"partitions": [r]}
+                    return {"partitions": decorate(1)}
                 # Adopted (owner = this node); after the step-11 migrate,
                 # migrated_to names the destination.
-                r = dict(row)
-                r["owner_node"] = migrated_to if migrated_to else node_id
-                r["holds_lease"] = lease_val
-                return {"partitions": [r]}
+                return {"partitions": decorate(migrated_to if migrated_to
+                                                else node_id)}
             # Observer: learned the handoff, owner = the adopter (node 2);
             # after the step-11 migrate, migrated_to names the destination.
             if mode == "resurrect_flap" and "flapped" in globals() and flapped:
-                r = dict(row)
-                r["owner_node"] = 1
-                r["holds_lease"] = lease_val
-                return {"partitions": [r]}
+                return {"partitions": decorate(1)}
+            return {"partitions": decorate(migrated_to if migrated_to else 2)}
+        # Not yet transitioned: the plain learned rows.
+        out = []
+        for row in rows:
             r = dict(row)
-            r["owner_node"] = migrated_to if migrated_to else 2
             r["holds_lease"] = lease_val
-            return {"partitions": [r]}
-        # Not yet transitioned: the plain learned row.
-        r = dict(row)
-        r["holds_lease"] = lease_val
-        return {"partitions": [r]}
+            out.append(r)
+        return {"partitions": out}
 
     def do_GET(self):
         if self.path == "/api/health":
@@ -1060,9 +1214,23 @@ class H(http.server.BaseHTTPRequestHandler):
             command = req.get("command", "")
             if role == "leader" and command.startswith("partition create "):
                 name = command[len("partition create "):].strip()
-                with open(created, "w") as f:
-                    json.dump({"id": 1, "owner_node": node_id, "name": name,
-                               "state": "active"}, f, separators=(",", ":"))
+                # The FIRST create ($NAME) owns created.json -- every earlier
+                # gate keys on that single row, exactly as before. The guard's
+                # SECOND create (the -env partition, step 4.5) appends, so the
+                # $NAME row survives for steps 10-12 to look up again, and each
+                # create gets its own id (the guard resolves PART_ID2 by name).
+                if not os.path.exists(created):
+                    pid = 1
+                    with open(created, "w") as f:
+                        json.dump({"id": pid, "owner_node": node_id, "name": name,
+                                   "state": "active"}, f, separators=(",", ":"))
+                else:
+                    rows = read_list(extra)
+                    pid = 1 + max([int(r["id"]) for r in rows], default=1)
+                    rows.append({"id": pid, "owner_node": node_id, "name": name,
+                                 "state": "active"})
+                    with open(extra, "w") as f:
+                        json.dump(rows, f, separators=(",", ":"))
                 # The smoke's leadergap tooth: this create opens a BOUNDED
                 # window in which the leader answers /api/health late (see
                 # do_GET), modelling a busy leader rather than a dead one.
@@ -1073,12 +1241,25 @@ class H(http.server.BaseHTTPRequestHandler):
                 except (OSError, ValueError):
                     pass
                 self._json(200, {"ok": "true", "recognized": "true",
-                                 "output": f"created partition 1 ({name})"})
+                                 "output": f"created partition {pid} ({name})"})
             elif command.startswith("partition lease acquire "):
                 pid = command[len("partition lease acquire "):].strip()
                 acquire_lease(pid)
                 self._json(200, {"ok": "true", "recognized": "true",
                                  "output": f"lease acquire {pid} issued"})
+            elif command.startswith("env list "):
+                # The guard polls this to prove the create round trip completed
+                # (its step 4.5 console-registration gate).
+                pid = int(command[len("env list "):].strip() or 0)
+                mine = [e for e in read_envs() if int(e["partition"]) == pid]
+                outp = ["[ENV] list partition=%d live=%d" % (pid, len(mine))]
+                for e in mine:
+                    outp.append("[ENV] env partition=%d env_id=%d index=%d "
+                                "posix_pid=%d dropped=0"
+                                % (e["partition"], e["env_id"], e["index"],
+                                   100 + int(e["env_id"])))
+                self._json(200, {"ok": "true", "recognized": "true",
+                                 "output": "\n".join(outp)})
             elif command.startswith("partition migrate "):
                 parts = command[len("partition migrate "):].split()
                 pid = parts[0] if parts else ""
@@ -1086,6 +1267,21 @@ class H(http.server.BaseHTTPRequestHandler):
                 out = do_migrate(pid, dest)
                 self._json(200, {"ok": "true", "recognized": "true",
                                  "output": out})
+            elif command.startswith("env create "):
+                # The guard's step 4.5: an environment inside the -env
+                # partition. The output shape is kernel/env_service_create's
+                # shell line -- "[ENV] create partition=P index=I -> ok
+                # env_id=N" -- which is what the guard parses its env_id from.
+                pid = int(command[len("env create "):].strip() or 0)
+                envs = read_envs()
+                eid = 1 + max([int(e["env_id"]) for e in envs], default=0)
+                envs.append({"partition": pid, "index": 1, "env_id": eid})
+                with open(envs_f, "w") as f:
+                    json.dump(envs, f, separators=(",", ":"))
+                self._json(200, {
+                    "ok": "true", "recognized": "true",
+                    "output": "[ENV] create partition=%d index=1 -> ok env_id=%d"
+                              % (pid, eid)})
             else:
                 self._json(200, {"ok": "false", "error": f"not a create: {command}"})
         else:

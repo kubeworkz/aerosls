@@ -202,6 +202,7 @@ static uint32_t env_step_dest = 0;
 static int      env_step_saw_paused = -1;
 static uint32_t env_step_saw_owner = 0xFFFFFFFFu;
 int env_migrate_partition(uint32_t partition_id, uint32_t dest_node_id,
+                          int operator_paused,
                           uint32_t* out_expected, uint32_t* out_moved) {
     env_step_calls++;
     env_step_partition  = partition_id;
@@ -547,3 +548,4 @@ int main(void) {
  * peer latch) and tests/checkpoint_recovery_host_test.c (the
  * failover declaration gate). */
 void env_migrate_intent_begin(void) {}
+void env_migrate_intent_end(void) {}

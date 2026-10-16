@@ -204,6 +204,16 @@ uint64_t env_storage_release(uint64_t region_base);
  * the same, but an explicit line is a seam a guard can pin. */
 void env_storage_boot_reset(void);
 
+/* The load's own seam, called by persist_restore_all() AFTER
+ * persist_read_array() has filled the table: every VALID entry surrenders
+ * its restored region_base (this-boot placement — see the "Keys"
+ * section), keeping identity, extent and occupancy. A restored base is a
+ * previous boot's address that this boot's frame pool re-hands to
+ * whoever attaches next; left in the table it wins es_find_base()'s
+ * first match and shadows the live owner — found live as a 12 241-line
+ * restore-denial loop that ended in REFUSE_PARKED. */
+void env_storage_after_restore(void);
+
 /* The descriptor's half: env_ckpt_register_from() looks the entry up by
  * (partition_id, index) and stamps state_lba/state_sectors/state_bytes from
  * it. Returns 0 when the region is attached and durable, 1 when there is

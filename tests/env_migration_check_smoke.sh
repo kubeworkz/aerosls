@@ -397,6 +397,59 @@ seed "$W/ae"
 sed -i 's/env_console_identity_seen(rec->partition_id, rec->index)/1 \/\* MUTATED: identity wait removed \*\//' "$W/ae/kernel/env_payload.c"
 tooth "AE. the pour no longer waits for the destination's own [env-id] announcement (the bytes erase the identity they are keyed by)" "AE" "$W/ae"
 
+# ── G (increment 12). The conditional marking removed — the defect verbatim ─
+# The live-found regression, reproduced: the quiesce marks
+# PARTITION_PAUSED UNCONDITIONALLY again, so every staged record claims an
+# operator's pause the migration itself took — and every destination
+# restores into a partition nobody paused, leaving the tenant LIVE by the
+# records and dead to the scheduler with its console reading input nobody
+# would ever drain. (Found by increment 10's console arm on a real 2-node
+# cluster; no host test saw it because none of them ran a destination.)
+seed "$W/leakpause"
+sed -i 's/if (operator_paused)/if (1)   \/\* MUTATED: the operator question ignored \*\//' "$W/leakpause/kernel/env_ckpt.c"
+tooth "G (inc 12). the quiesce ignores operator_paused — the migration's own freeze crosses as an operator's pause (the tenant dead on arrival, live-found)" "G" "$W/leakpause"
+
+# ── AF (increment 12). The operator's intent never reaches the step ────────
+# The other direction: partition_migrate() still KNOWS (it captured
+# was_paused_before_migrate before its own pause) but stops TELLING — a
+# constant 0 at the call. An operator-paused partition then migrates and
+# comes back RUNNING on the destination, the operator's pause silently
+# dropped at the one boundary where it was supposed to travel.
+seed "$W/nointent"
+sed -i 's/env_migrate_partition(partition_id, dest_node_id, was_paused_before_migrate,/env_migrate_partition(partition_id, dest_node_id, 0,   \/\* MUTATED \*\//' "$W/nointent/kernel/partition.c"
+tooth "AF (inc 12). was_paused_before_migrate never reaches the environment step (an operator's pause is dropped at the boundary)" "AF" "$W/nointent"
+
+# ── AG. The announce is never released — the live-found 300 s blind spot ───
+# Found on a 3-node cluster (2026-10-14): an env create finished in
+# seconds, the node was killed right after, and both survivors deferred the
+# declaration for the announce's full 300 s budget — the adoption guard's
+# 240 s wait lost to a blind spot the create had already finished with.
+# Four independent cuts, one per face of the release.
+
+# AG-a: the peer's release branch removed — budget 0 falls into the clamp
+# and becomes a 1-tick ANNOUNCE instead of ending one.
+seed "$W/agrecv"
+sed -i 's/if (budget_ticks == 0) {/if (0) {   \/\* MUTATED: the release is latched as a 1-tick announce \*\//' "$W/agrecv/kernel/env_migrate.c"
+tooth "AG-a. recv_intent no longer treats budget 0 as the release (a release frame latches instead of ending the latch)" "AG" "$W/agrecv"
+
+# AG-b: end() keeps the local stamp — this node stays undeclarable for the
+# rest of the budget even though the peers were told.
+seed "$W/agstamp"
+sed -i '/^void env_migrate_intent_end/,/^}/s/env_migrate_intent_tick = 0;/env_migrate_intent_tick = kernel_tick_counter;   \/\* MUTATED \*\//' "$W/agstamp/kernel/env_migrate.c"
+tooth "AG-b. env_migrate_intent_end() no longer clears the local gate (this node stays undeclarable DEAD after its phase resolved)" "AG" "$W/agstamp"
+
+# AG-c: partition_migrate's releases deleted — the exact live-found shape
+# on the migrate route: success and every refusal keep every peer blind.
+seed "$W/agpart"
+sed -i '/env_migrate_intent_end();/d' "$W/agpart/kernel/partition.c"
+tooth "AG-c. partition_migrate() no longer releases the intent on any of its four exits (the 300 s blind spot after a migrate)" "AG" "$W/agpart"
+
+# AG-d: the sweep's restore-loop release deleted — every restore period
+# re-arms a full budget on the restoring node.
+seed "$W/agsweep"
+sed -i '/int rc = env_migrate_restore/,/if (rc == ENV_MIGRATE_OK)/{/env_migrate_intent_end();/d}' "$W/agsweep/kernel/env_migrate.c"
+tooth "AG-d. the sweep's restore loop no longer releases the intent after each restore attempt" "AG" "$W/agsweep"
+
 # ── The vacuity control: green on the real tree ────────────────────────────
 out="$(bash "$GUARD" 2>&1)"; rc=$?
 if [ "$rc" -eq 0 ]; then

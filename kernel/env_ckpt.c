@@ -467,7 +467,8 @@ void env_ckpt_release_capture(const struct EnvCkptQuiesce* q) {
 // Marks a state that already exists — the caller holds the partition paused —
 // and never creates one.
 uint32_t env_ckpt_quiesce_partition(uint32_t partition_id,
-                                    struct EnvCkptPartitionQuiesce* q) {
+                                    struct EnvCkptPartitionQuiesce* q,
+                                    int operator_paused) {
     if (q == (struct EnvCkptPartitionQuiesce*)0) return 0;
     ec_memset(q, 0, (uint32_t)sizeof *q);
     q->partition_id = partition_id;
@@ -485,8 +486,21 @@ uint32_t env_ckpt_quiesce_partition(uint32_t partition_id,
         if (env_ckpt_table[i].partition_id != partition_id) continue;
         q->prior_flags[i] = env_ckpt_table[i].flags;
         q->touched       |= (uint16_t)(1u << i);
-        env_ckpt_table[i].flags |= ENV_CKPT_FLAG_QUIESCED |
-                                  ENV_CKPT_FLAG_PARTITION_PAUSED;
+        // QUIESCED always: the freeze is real either way, and the
+        // destination's admissibility gate requires it. PARTITION_PAUSED
+        // ONLY for the operator's own pause — the flag's definition is
+        // "an operator's intent, not something the capture did", and in a
+        // migration the pause is always something the MIGRATION did unless
+        // the operator beat it there. Marking the migration's own freeze as
+        // an operator's intent made every destination "restore into
+        // paused" — the environment LIVE by the records, dead to the
+        // scheduler, its console accepting input nobody would ever read
+        // (P3 increment 10's live arm, 2026-10-14). The caller is the only
+        // one who knows which kind of pause it holds; this is that
+        // knowledge arriving, not a guess.
+        env_ckpt_table[i].flags |= ENV_CKPT_FLAG_QUIESCED;
+        if (operator_paused)
+            env_ckpt_table[i].flags |= ENV_CKPT_FLAG_PARTITION_PAUSED;
         q->n_marked++;
     }
     return q->n_marked;
