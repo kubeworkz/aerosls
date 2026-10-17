@@ -1077,6 +1077,41 @@ int cap_create_sidecar_in_personality(uint32_t parent_pid,
                           uint32_t personality);
 uint64_t sys_sls_linux_spawn(struct SLSCreateSidecarRequest* req);
 
+/* ─── E7 increment 3 (Linux ABI Shim Design §3.3 steps 5-7) ────────────────
+ * The forward path's three seams, each in the file that can see what it
+ * needs: the TABLE scan lives in cap.c (only cap.c sees cap_tables), the
+ * post/park and recv/apply loops live in chan.c (only chan.c sees
+ * chan_resolve and the k_chan_* shapes they mirror), and the decisions are
+ * pure functions in linux_abi.h. cap_linux_find_channels scans the
+ * CURRENT process's own table (same posture as sidecar_find_parent_ch_w:
+ * a task's table is stable while it runs its own syscall) against
+ * linux_channel_shape_ok — §3.5's exactly-one-channel rule. Returns 0 and
+ * fills both slots, or -1 (no channel, or not exactly one candidate).
+ *
+ * k_linux_forward POSTS the described request and then parks — park-ONLY:
+ * it never reads a reply, so a successful forward's rax can only come from
+ * the resume re-run (the source guard's I3 clause holds this). Parking with
+ * SYS_LINUX_TRAP_RESUME arms the in-flight state; k_linux_deliver is the
+ * resume arm: recv the reply, apply it through the errno map (echo + size
+ * enforced by linux_syscall_apply_reply), and re-park on a spurious wake.
+ * Returns: k_linux_forward an int CAP status (both families; the caller
+ * maps via linux_errno_from_cap), k_linux_deliver the final Linux rax.
+ * One more invariant the park loop relies on: this channel's ONLY writer
+ * is the one task forwarding on it, and that task is parked between post
+ * and reply — so the inbound queue can never be full at post time (a
+ * flood parks on the reply, which is §10.2's bounded-flood posture). */
+struct SLSLinuxSyscallRequest;   /* kernel/linux_abi.h — named here so the
+                                  * prototypes below share ONE struct type
+                                  * with linux_abi.c, instead of declaring a
+                                  * prototype-scope shadow (a second, private
+                                  * struct that then conflicts at this file's
+                                  * own includers). */
+int      k_linux_forward(uint32_t pid, uint16_t ch_w, uint16_t ch_r,
+                         const struct SLSLinuxSyscallRequest* req);
+uint64_t k_linux_deliver(uint32_t pid, uint16_t ch_r, uint64_t expect_num);
+int      cap_linux_find_channels(uint32_t pid, uint16_t* out_ch_w,
+                                 uint16_t* out_ch_r);
+
 /* POSIX-Environments E1: the boot-context flags written into every BIB this
  * kernel fills (SIDECAR_BIB_FLAG_*). Set once at boot — kernel_main sets
  * SIDECAR_BIB_FLAG_UNIFIED before the init sidecar is created — and read by

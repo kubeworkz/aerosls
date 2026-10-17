@@ -180,6 +180,76 @@ void linux_syscall_describe(struct SLSLinuxSyscallRequest *req,
     req->status = 0;
 }
 
+/* ─── The park resume (E7 increment 3, §3.3 steps 5-7) ────────────────────────
+ * The increment that stops describing and starts delivering. Three pure
+ * functions, because every decision the forward path makes before it parks
+ * ("is this resume ours?", "is this table shape ours?", "is this payload an
+ * answer?") is a decision a source guard can only hold if the SOURCE holds
+ * it as a named contract, and a host test can only bite if it is pure.
+ *
+ * in-flight: a forward is armed from BEFORE the post until the reply is
+ * applied, and park_syscall is the arm (process.c reads the same value to
+ * suppress the post's sysret handoff). A stray trap at the sentinel while
+ * disarmed is refused — never parked — because no reply is owed; the
+ * refusal is by name, the same honesty as the increment-2 branch refused
+ * every number it could not interpret. Personality is an argument, not a
+ * lookup: the truth table "unrecognised personality asserts nothing" is
+ * host-assertable only if the value comes from outside. */
+int linux_forward_resume_is_live(uint32_t personality, uint32_t park_syscall)
+{
+    return linux_personality_intercepts(personality) &&
+           park_syscall == SYS_LINUX_TRAP_RESUME;
+}
+
+/* Channel shape (§3.5): exactly one sendable CHAN_W and exactly one
+ * recv-able CHAN_R. Both — not "at least one": a second candidate means
+ * the table does not carry the single channel §3.5 names, and guessing
+ * which of two channels is the sidecar's would be a routing decision the
+ * kernel is not allowed to make (it describes; it does not interpret). */
+int linux_channel_shape_ok(int n_chan_w, int n_chan_r)
+{
+    return n_chan_w == 1 && n_chan_r == 1;
+}
+
+/* Apply the sidecar's reply (§3.3 step 7). The reply is the same struct
+ * back — num echoed, ret/status filled — which makes "is this the answer
+ * to THIS request" a single field compare rather than a protocol: the
+ * channel is point-to-point and one-outstanding-per-task by construction
+ * (the task is parked between post and reply), so echoed num mismatch can
+ * only mean a misrouted or malformed reply, and both refuse with -EPROTO:
+ * a reply that is not provably this request's answer must not put anything
+ * into the task's rax (§5.7's rule restated one level up — not just "no
+ * leak of CAP codes", but "no answer that was not an answer"). */
+uint64_t linux_syscall_apply_reply(struct SLSLinuxSyscallRequest *req,
+                                   const void *payload, uint64_t payload_len)
+{
+    const uint8_t *src = (const uint8_t *)payload;
+    uint8_t *dst;
+    uint64_t expect;
+    uint64_t i;
+
+    if (!req || !payload) return (uint64_t)(int64_t)(-LINUX_EPROTO);
+    if (payload_len != sizeof *req)
+        return (uint64_t)(int64_t)(-LINUX_EPROTO);   /* not a reply at all */
+
+    expect = req->num;   /* what the FIRST trap described — the echo is
+                          * checked against this, before trusting anything */
+    dst = (uint8_t *)req;
+    for (i = 0; i < sizeof *req; i++)
+        dst[i] = src[i];   /* byte copy: channel payload, any alignment */
+
+    if (req->num != expect)
+        return (uint64_t)(int64_t)(-LINUX_EPROTO);   /* a different syscall's
+                                                     * answer, or garbage */
+
+    /* status 0 = the reply carries a real return value; nonzero = a CAP
+     * code the §5.7 map turns into Linux's own numbering here, at the last
+     * possible moment — a CAP-family negative never crosses into the task. */
+    if (req->status == 0)
+        return req->ret;
+    return (uint64_t)(int64_t)linux_errno_from_cap(req->status);
+}
+
 /* ─── The initial stack and auxv (§5.2) ────────────────────────────────────
  * Byte-exact layout, low address (returned rsp) upward — the canonical
  * process-entry image a static libc walks:

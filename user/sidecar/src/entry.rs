@@ -265,7 +265,7 @@ fn touch_cookie() {
     unsafe { core::ptr::read_volatile(&SYSCALL_COOKIE); }
 }
 
-fn klog(tag: &[u8], val: u32, extra: &[u8]) {
+pub(crate) fn klog(tag: &[u8], val: u32, extra: &[u8]) {
     let mut msg = [0u8; 96];
     let n = tag.len().min(24);
     msg[..n].copy_from_slice(&tag[..n]);
@@ -455,6 +455,13 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                 let _ = RealKernel.send(cw, 0, 0, chunk, &[], TIMEOUT_NONE);
             }
         }
+        // E7 increment 3: answer any Linux-personality child's forwarded
+        // syscalls (its channel was registered by the spawn path via
+        // linux::track). Non-blocking per pass, like the console arm above —
+        // the parked sidecar's quiesce wait set includes these channels
+        // (linux::append_wait), so a forward wakes this loop instead of
+        // spinning it.
+        crate::linux::service(&RealKernel);
         booted.proc.drain_wakes();
         // One-shot boot diagnostic: report what task 0 (init) did and how
         // many tasks are live, so a quiet boot can be told apart from a
@@ -524,7 +531,12 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                 // The kernel wakes the park on any listed channel; a
                 // spurious wake just re-runs the loop (drain_wakes + a
                 // re-poll re-check everything).
-                let mut chans = [u32::MAX; 4];
+                // The kernel wakes the park on any listed channel; a
+                // spurious wake just re-runs the loop (drain_wakes + a
+                // re-poll re-check everything). E7 increment 3: the Linux
+                // children's forward channels join the set — a child's
+                // request must wake us, not wait for an idle pass.
+                let mut chans = [u32::MAX; 8];
                 let mut n = 0usize;
                 if let Some(c) = caps.console_chan {
                     chans[n] = c;
@@ -534,6 +546,7 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                     chans[n] = r;
                     n += 1;
                 }
+                crate::linux::append_wait(&mut chans, &mut n);
                 if n == 0 {
                     // No wired channels: spin (v1 debug only).
                     continue;

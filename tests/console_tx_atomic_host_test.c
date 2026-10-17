@@ -45,7 +45,8 @@
  *       -include tests/kernel_io_panic_port.h \
  *       -o /tmp/console_tx_atomic_host_test \
  *       tests/console_tx_atomic_host_test.c kernel/cap.c \
- *       kernel/console_service.c kernel/kernel_io.c kernel/console.c
+ *       kernel/console_service.c kernel/kernel_io.c kernel/console.c \
+ *       kernel/linux_abi.c
  *   /tmp/console_tx_atomic_host_test
  */
 #include "kernel/cap.h"

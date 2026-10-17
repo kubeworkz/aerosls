@@ -28,7 +28,8 @@
  * Build and run:
  *   gcc -no-pie -std=c11 -Wall -Wextra -I . -I kernel \
  *       -o /tmp/io_cap_host_test \
- *       tests/io_cap_host_test.c kernel/cap.c kernel/chan.c kernel/frame_pool.c
+ *       tests/io_cap_host_test.c kernel/cap.c kernel/chan.c kernel/frame_pool.c \
+ *           kernel/linux_abi.c
  *   /tmp/io_cap_host_test
  */
 #include "kernel/cap.h"

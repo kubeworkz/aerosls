@@ -1894,6 +1894,27 @@ void cap_wake_chan(uint32_t chan_id) {
 void cap_maybe_handoff(void) {
     struct ProcessDescriptor* cur = process_find_current();
     if (!cur) return;   /* kernel context: nothing to hand off from */
+
+    /* E7 increment 3: a forwarded Linux syscall's POST wakes the sidecar,
+     * and cap_wake_chan above has just stashed it in handoff_target — but
+     * handing off HERE would run cap_sysret_resume when this task is next
+     * picked: the syscall-skipping resume, which hardcodes RAX = 0 and
+     * sysrets. A Linux forward is MID-syscall (the reply is not awaited
+     * yet), so the handoff would answer the caller with 0 forever and strand
+     * its reply in the queue. Skip the immediate handoff — the wake itself
+     * already made the sidecar runnable, and THIS task parks a few
+     * instructions later (k_linux_forward), which is where pick_next runs
+     * it: same ordering, one park deeper, correctness instead of a shortcut
+     * that returns a lie to ring-3. Consume the stashed target so no later
+     * wake-of-another can hand it off either; only a Linux-forwarding task
+     * can arm park_syscall to this sentinel (cleared on every forward exit,
+     * zeroed at slot reuse in proc_clear_resume_state), so SLS tasks and
+     * the sidecar's own sends are byte-for-byte unaffected. */
+    if (cur->park_syscall == SYS_LINUX_TRAP_RESUME) {
+        cur->handoff_target = NULL;
+        return;
+    }
+
     struct ProcessDescriptor* target = cur->handoff_target;
     cur->handoff_target = NULL;
     if (!target || target == cur) return;

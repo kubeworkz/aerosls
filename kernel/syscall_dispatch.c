@@ -71,38 +71,108 @@ static uint64_t sls_legacy_allocate(void* arg) {
 
 // ─── do_syscall ───────────────────────────────────────────────────────────────
 uint64_t do_syscall(uint64_t num, void* arg) {
-    /* ── E7 (increment 2): the Linux-personality branch (D1, §3.3) ────────
+    /* ── E7 (increment 3): the Linux-personality branch (D1, §3.3) ────────
      * The FIRST thing the dispatcher does, before the driver-SDK switch and
      * before the legacy chain, because the personality decides what `num`
      * MEANS (§2.2): for a Linux task, rax=105 is setuid and must never be
      * read as SYS_SLS_ALLOCATE. A non-Linux caller takes exactly the path it
      * always took — one predictable branch, no behavior change.
      *
-     * The branch DESCRIBES and refuses, by name, for now: the six captured
-     * argument registers are read from the per-CPU sibling block (the entry
-     * path destroyed the real ones before C could see them, §3.4), the
-     * request is built by the pure describe(), the class is looked up from
-     * the census table — and the answer is -ENOSYS, a LINUX errno, never a
-     * CAP code: this task was compiled against Linux's numbering, and
-     * returning a CAP-family negative would put a value no errno can
-     * produce into its error path (§5.7). Channel delivery and park/resume
-     * (increment 3) replace the refusal with the sidecar's answer; the
-     * routing, the capture and the number-space separation are what THIS
-     * increment lands, and they must not wait on the sidecar. */
+     * Increment 3 completes §3.3's steps 5-7 with TWO arms:
+     *
+     *  · the RESUME arm (num == SYS_LINUX_TRAP_RESUME): the park's re-run,
+     *    and the ONLY place a sidecar reply is ever read — recv it, apply
+     *    it through the §5.7 errno map (size and echo enforced by the pure
+     *    linux_syscall_apply_reply), and the resulting rax rides the
+     *    existing cap_recv_resume → syscall_return_path back to ring-3 as
+     *    if the syscall had simply taken a while. A sentinel trap with NO
+     *    forward in flight (park_syscall not armed) is a stray, refused BY
+     *    NAME — the increment-2 discipline, applied to the resume number.
+     *
+     *  · the FIRST trap: capture → describe → the §3.5 channel check →
+     *    arm → post → park. Every refusal on this side is -LINUX_ENOSYS,
+     *    a LINUX errno, never a CAP code — this task's binary was compiled
+     *    against Linux's numbering, and a CAP-family negative would be a
+     *    value no errno can produce in its error path (§5.7). The branch
+     *    still INTERPRETS nothing: it describes argument positions and
+     *    either hands the description on or refuses, so rax=105 remains
+     *    setuid from trap to sidecar (§3.6 — structural, not a filter). */
     {
         struct ProcessDescriptor* cur = process_find_current();
         if (cur && linux_personality_intercepts(cur->personality)) {
-            uint64_t largs[6];
-            struct SLSLinuxSyscallRequest req;
-            proc_read_linux_args(largs);
-            linux_syscall_describe(&req, num, largs);
-            kernel_serial_printf(
-                "[E7] linux syscall %lu (class=%s) refused: forwarding "
-                "lands with increment 3\n",
-                (unsigned long)num,
-                linux_syscall_class_name(linux_syscall_class(num)));
-            (void)req;   /* increment 3 posts THIS to the sidecar's channel */
-            return (uint64_t)(int64_t)(-LINUX_ENOSYS);
+            uint16_t ch_w, ch_r;
+
+            if (num == SYS_LINUX_TRAP_RESUME) {
+                /* Stray vs. in-flight: the arm is set before the post and
+                 * cleared when the reply lands, so an unarmed sentinel can
+                 * only be a raw ring-3 trap wearing the resume number —
+                 * there is no reply owed and nothing to park for. */
+                if (!linux_forward_resume_is_live(cur->personality,
+                                                  cur->park_syscall)) {
+                    kernel_serial_printf(
+                        "[E7] resume sentinel 0x%x with no forward in "
+                        "flight — stray trap refused by name\n",
+                        (unsigned)SYS_LINUX_TRAP_RESUME);
+                    return (uint64_t)(int64_t)(-LINUX_ENOSYS);
+                }
+                if (cap_linux_find_channels(cur->pid, &ch_w, &ch_r) != 0) {
+                    /* Woken with nowhere to deliver: the sidecar (or its
+                     * end of the channel) died while we parked. Close the
+                     * in-flight arm and answer with the map's own truth —
+                     * "the holder went away under us" is -EIO, never a
+                     * raw CAP code. */
+                    cur->park_syscall = 0;
+                    return (uint64_t)(int64_t)linux_errno_from_cap(
+                        CAP_ERR_REVOKED);
+                }
+                {
+                    uint64_t rax = k_linux_deliver(cur->pid, ch_r,
+                                                   (uint64_t)(uintptr_t)arg);
+                    cur->park_syscall = 0;  /* in-flight closes HERE — the
+                                            * next stray refuses again */
+                    return rax;
+                }
+            }
+
+            /* First trap: read the capture FIRST (before any call — the §3.4
+             * rule on the C side too), describe, resolve the channel, arm,
+             * post, park. k_linux_forward does not return once it parks;
+             * its non-zero return is a refusal before any park. */
+            {
+                uint64_t largs[6];
+                struct SLSLinuxSyscallRequest req;
+                int status;
+                proc_read_linux_args(largs);
+                linux_syscall_describe(&req, num, largs);
+                if (cap_linux_find_channels(cur->pid, &ch_w, &ch_r) != 0) {
+                    kernel_serial_printf(
+                        "[E7] linux syscall %lu (class=%s) refused: no "
+                        "sidecar channel — §3.5 wants exactly one\n",
+                        (unsigned long)num,
+                        linux_syscall_class_name(linux_syscall_class(num)));
+                    return (uint64_t)(int64_t)(-LINUX_ENOSYS);
+                }
+                /* Arm BEFORE the post: cap_maybe_handoff (process.c) reads
+                 * this state and skips the post's send-handoff — a sysret
+                 * handoff would return to ring-3 MID-forward with its
+                 * hardcoded rax=0, losing the reply (the sidecar's wake of
+                 * this task is expected: it is parked on our channel). The
+                 * park re-stamps the same value via proc_park_capture. */
+                cur->park_syscall = SYS_LINUX_TRAP_RESUME;
+                status = k_linux_forward(cur->pid, ch_w, ch_r, &req);
+                /* Reached ONLY when no park happened (post refused, or no
+                 * park possible) — no reply was read on this path, by
+                 * construction. Un-arm, then map the refusal into the
+                 * units this task speaks (both CAP families, one table). */
+                cur->park_syscall = 0;
+                kernel_serial_printf(
+                    "[E7] linux syscall %lu (class=%s) not delivered: "
+                    "cap status %d\n",
+                    (unsigned long)num,
+                    linux_syscall_class_name(linux_syscall_class(num)),
+                    status);
+                return (uint64_t)(int64_t)linux_errno_from_cap(status);
+            }
         }
     }
 

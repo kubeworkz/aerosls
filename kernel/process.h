@@ -175,14 +175,28 @@ struct ProcessDescriptor {
     struct CapParkCtx park_ctx;
     uint64_t   park_req;              // the request pointer the resume re-runs
                                        // (SLSCapRecvRequest for a recv park,
-                                       // SLSChanWaitRequest for a chan-wait park)
+                                       // SLSChanWaitRequest for a chan-wait park).
+                                       // E7 increment 3: for a Linux-forward park
+                                       // (SYS_LINUX_TRAP_RESUME) this carries the
+                                       // EXPECTED REPLY NUMBER, not a pointer — the
+                                       // request struct died with the abandoned
+                                       // first-trap frame, and a value survives the
+                                       // abandoned-frame rule by not being an
+                                       // address (kernel/chan.c k_linux_forward).
     uint32_t   park_syscall;          // the syscall the resume re-runs — set at park
-                                       // time (SYS_SLS_CAP_RECV or SYS_SLS_CHAN_WAIT)
+                                       // time (SYS_SLS_CAP_RECV or SYS_SLS_CHAN_WAIT,
+                                       // and SYS_LINUX_TRAP_RESUME for an E7 forward)
                                        // and consumed by cap_recv_resume()'s
                                        // do_syscall re-entry. Generalizes the resume
                                        // so ONE entry point serves both the
                                        // single-channel recv park and the Phase-5
-                                       // multi-channel k_chan_wait park.
+                                       // multi-channel k_chan_wait park (and the
+                                       // Linux reply deliver). For a Linux task the
+                                       // ARMED value doubles as the forward's
+                                       // in-flight marker: cap_maybe_handoff skips
+                                       // the post's sysret handoff while it is set,
+                                       // and the dispatcher refuses a sentinel trap
+                                       // that finds it clear (stray, refused by name).
     uint16_t   waiting_chan;          // channel id this process is BLOCKED on (recv
                                        // park), or CAP_NONE (0xFFFF) when not parked
     uint16_t   waiting_chans[CHAN_WAIT_MAX_CHANS];  // Phase 5 wait park: the channels

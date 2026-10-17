@@ -419,11 +419,19 @@ source_clauses() {
     # placement_can_hold() are all present, and cap_create_sidecar_host_test
     # exercises it. Added by that increment; this file's ceiling still said
     # 326, so the guard went red against correct code.
+    #
+    # 328 = E7 increment 2's Linux-personality spawn
+    # (SYS_SLS_LINUX_SPAWN): cap.h's define, cap.c's sys_sls_linux_spawn,
+    # and syscall_dispatch.c's case are all present (S10g-S10i assert the
+    # wiring, so this bump is not a decoration). Increment 2 landed 328
+    # and left this ceiling at 327 — this guard then went red against
+    # correct code for exactly the reason its own comment above names:
+    # the ceiling moves WITH the wiring, and here it moved late.
     local highest
     highest=$(grep -rhoE '#define SYS_SLS_[A-Z_]+ +[0-9]+' "$ROOT/kernel"/*.h "$ROOT/net"/*.h 2>/dev/null \
               | awk '{print $3}' | sort -n | tail -1)
-    [ "${highest:-0}" -eq 327 ] || \
-        bad "S10. the highest SYS_SLS_ number is ${highest:-none}, expected 327 (P1B's four: 323-326, plus P3 inc.1's 327) — a collision or an unwired define"
+    [ "${highest:-0}" -eq 328 ] || \
+        bad "S10. the highest SYS_SLS_ number is ${highest:-none}, expected 328 (P1B's four: 323-326, P3 inc.1's 327, E7 inc.2's 328) — a collision or an unwired define"
     has "$DISP" "case SYS_SLS_ENV_STORAGE_WRITE:" || \
         bad "S10b. syscall_dispatch has no SYS_SLS_ENV_STORAGE_WRITE case — the server's write-through would never reach the kernel"
     has "$CAP" "only PARTITION_SYSTEM creates environments" || \
@@ -434,6 +442,12 @@ source_clauses() {
         bad "S10e. kabi's syscall constants are missing P1B's (323-326) — the RealKernel shims would target the wrong numbers"
     has "$DISP" "case SYS_SLS_PLACEMENT_CAN_HOLD:" || \
         bad "S10f. syscall_dispatch has no SYS_SLS_PLACEMENT_CAN_HOLD case — the ceiling above was raised for a define the kernel never dispatches, i.e. the unwired-define drift S10 exists to catch"
+    has "$ROOT/kernel/cap.h" "#define SYS_SLS_LINUX_SPAWN 328" || \
+        bad "S10g. cap.h does not define SYS_SLS_LINUX_SPAWN as 328 — the ceiling above was raised for a number that is gone"
+    has "$DISP" "case SYS_SLS_LINUX_SPAWN:" || \
+        bad "S10h. syscall_dispatch has no SYS_SLS_LINUX_SPAWN case — 328 would fall into default and a Linux spawn would never be created (the ceiling's unwired-define drift)"
+    has "$ROOT/kernel/cap.c" "sys_sls_linux_spawn" || \
+        bad "S10i. cap.c no longer implements sys_sls_linux_spawn — the dispatcher case above would route to nothing"
 
     # ── S11. the real kernel module, executed here ─────────────────────────
     local HT="$ROOT/tests/env_storage_host_test.c"

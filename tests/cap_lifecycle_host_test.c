@@ -27,7 +27,8 @@
  * Build and run:
  *   gcc -no-pie -std=c11 -Wall -Wextra -I . -I kernel \
  *       -o /tmp/cap_lifecycle_host_test \
- *       tests/cap_lifecycle_host_test.c kernel/cap.c kernel/frame_pool.c
+ *       tests/cap_lifecycle_host_test.c kernel/cap.c kernel/frame_pool.c \
+ *           kernel/linux_abi.c
  *   /tmp/cap_lifecycle_host_test
  *
  * -no-pie is load-bearing: cap_create_mem() rejects ranges overlapping the

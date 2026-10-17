@@ -18,10 +18,14 @@
  *
  * ─── What is deliberately NOT here ────────────────────────────────────────
  * The personality field, the trap-path branch, the six-argument capture,
- * the request struct and the forwarding path (§3.3's steps 1-7) are
- * increment 2. fs_base/TLS (§5.3) is increment 3, because it is the one
- * piece that touches the MSR and the context switch. brk/mmap budget
- * policy (§5.4) is increment 4. This file carries no mechanism, so a bug
+ * the request struct and the describe-and-refuse branch (steps 1-4) are
+ * increment 2; the channel delivery, the park/resume and the reply's trip
+ * through the errno map (steps 5-7) and the sidecar core's first answers
+ * are increment 3 — the three pure functions gained here for it (apply,
+ * in-flight state, channel shape) are what that increment's host teeth
+ * bite on, instead of a boot. fs_base/TLS (§5.3) is increment 4, because
+ * it is the one piece that touches the MSR and the context switch.
+ * brk/mmap budget policy (§5.4) is increment 5. This file carries no mechanism, so a bug
  * here can only be a wrong number or a malformed image — both of which a
  * host test names, and neither of which can reach a running system.
  *
@@ -209,14 +213,62 @@ int linux_personality_intercepts(uint32_t personality);
 struct SLSLinuxSyscallRequest {
     uint64_t num;        /* the Linux syscall number, as it arrived in rax */
     uint64_t args[6];    /* rdi, rsi, rdx, r10, r8, r9 — capture order */
-    uint64_t ret;        /* the sidecar's return value (increment 3 fills) */
+    uint64_t ret;        /* the sidecar's return value — filled by the reply
+                          * (linux_syscall_apply_reply, increment 3) */
     int32_t  status;     /* the sidecar's CAP_ERR_* or CAP_E* status, mapped
-                          * to a Linux errno on the return path (§5.7) */
+                          * to a Linux errno on the return path (§5.7); 0 = the
+                          * reply carries a real return value in ret */
 };
 
 /* Build the request from the captured values. Pure: ret/status are zeroed,
  * so what a caller reads before an answer exists is defined, not stale. */
 void linux_syscall_describe(struct SLSLinuxSyscallRequest *req,
                             uint64_t num, const uint64_t args[6]);
+
+/* ─── The park resume (E7 increment 3, §3.3 steps 5-7) ──────────────────────
+ * A forwarded syscall's reply can only be read by the park's resume re-run,
+ * so "a forward is in flight" is a first-class state, not an inference:
+ * park_syscall == SYS_LINUX_TRAP_RESUME is armed BEFORE the post (it is also
+ * what stops cap_maybe_handoff from sysret-returning the half-finished
+ * syscall — kernel/process.c) and cleared the moment the reply is applied
+ * (or refused). A ring-3 trap carrying the sentinel number while NOT in
+ * flight is a stray and is refused by name — it never parks, because there
+ * is no reply to wait for and a parked stray would wedge into a task slot.
+ *
+ * The value is an ASCII "LINR" in a u32 (park_syscall is uint32_t): far
+ * outside Linux's errno/number space, outside every SYS_SLS_* number (the
+ * guard's M1 clause proves that against the whole number space), and outside
+ * the census's 27 — linux_syscall_class() answers UNKNOWN for it, so it can
+ * never be mistaken for a real syscall's description. */
+#define SYS_LINUX_TRAP_RESUME  0x4C494E52u /* "LINR" */
+
+/* 1 iff a trap at the resume sentinel may be treated as the resume re-run of
+ * an in-flight forward: the personality takes the branch AND the arm is set.
+ * Refusing anything else is what keeps the deliver loop from being entered
+ * by a stray raw trap (which would then poll a channel nothing is owed on). */
+int linux_forward_resume_is_live(uint32_t personality, uint32_t park_syscall);
+
+/* §3.5's capability posture as a pure rule: a Linux task's table holds the
+ * channel to its environment's sidecar and nothing else — exactly ONE
+ * sendable CHAN_W and exactly ONE recv-able CHAN_R. Counted over usable
+ * handles (SEND / RECV permissions, same requirements cap_send_msg and
+ * cap_recv_msg enforce); any other count — a missing channel, two
+ * candidates — is refused rather than guessed between. cap_linux_find_channels
+ * (kernel/cap.c) scans the live table against this rule. */
+int linux_channel_shape_ok(int n_chan_w, int n_chan_r);
+
+/* Apply a sidecar reply to the in-flight request and return the Linux rax:
+ * the payload is THIS struct with num echoed and ret/status filled. Pure and
+ * total — refuses a wrong size (-EPROTO: the reply is not an answer, so
+ * nothing in it may be trusted), enforces the num echo (-EPROTO: a reply for
+ * a different syscall must never produce this one's rax), passes ret through
+ * on status 0, and maps any nonzero status through the §5.7 errno map (so a
+ * CAP code reaches the task as a Linux errno and never as itself; the
+ * total map also covers whatever out-of-family value a buggy sidecar wrote).
+ * The caller's `req` holds the EXPECTED num on entry; on refusal its contents
+ * are the (rejected) reply's — the caller returns the errno and never reads
+ * req again, which is what makes the byte copy safe to do before the check. */
+uint64_t linux_syscall_apply_reply(struct SLSLinuxSyscallRequest *req,
+                                   const void *payload, uint64_t payload_len);
 
 #endif /* LINUX_ABI_H */

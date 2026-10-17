@@ -70,7 +70,7 @@
  *       -o /tmp/net_socket_service_host_test \
  *       tests/net_socket_service_host_test.c kernel/cap.c \
  *       kernel/net_socket_service.c kernel/kernel_io.c kernel/console.c \
- *       net/tcp_quota.c
+ *       net/tcp_quota.c kernel/linux_abi.c
  *   /tmp/net_socket_service_host_test
  */
 #include "kernel/cap.h"

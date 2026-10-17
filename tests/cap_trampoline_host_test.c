@@ -12,7 +12,8 @@
  * Build and run:
  *   gcc -no-pie -std=c11 -Wall -Wextra -I . -I kernel \
  *       -o /tmp/cap_trampoline_host_test \
- *       tests/cap_trampoline_host_test.c kernel/cap.c kernel/frame_pool.c
+ *       tests/cap_trampoline_host_test.c kernel/cap.c kernel/frame_pool.c \
+ *           kernel/linux_abi.c
  *   /tmp/cap_trampoline_host_test
  */
 #include "kernel/cap.h"

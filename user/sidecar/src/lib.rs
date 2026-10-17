@@ -59,6 +59,7 @@ pub mod allocator;
 pub mod applets;
 pub mod boot;
 pub mod heap;
+pub mod linux;
 pub mod net_client;
 
 #[cfg(feature = "target")]

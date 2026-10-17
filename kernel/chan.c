@@ -48,6 +48,8 @@
  *     transient grants require a reply window (§3.4).
  */
 #include "cap.h"
+#include "linux_abi.h"   /* E7 increment 3: SYS_LINUX_TRAP_RESUME, the request
+                          * struct, linux_syscall_apply_reply, errno map */
 #include "kernel_io.h"
 #include "timer.h"   /* Phase 5 deadlines: kernel_tick_counter, KERNEL_TICK_NS */
 #include <stddef.h>
@@ -751,4 +753,127 @@ uint64_t sys_sls_dev_mmap(struct SLSDevMmapRequest* req) {
                                       req->vaddr_hint, &vaddr);
     req->out_vaddr = vaddr;
     return r;
+}
+
+/* ─── k_linux_forward / k_linux_deliver (E7 increment 3, §3.3 steps 5-7) ────
+ * "Forwarding is the same shape as a blocking cap_recv" (§2.4), and this is
+ * the pair that keeps the claim honest: k_chan_wait's poll/park discipline
+ * with the polls and parks swapped into the two arms of ONE exchange —
+ * post-then-park here, recv-then-apply on the resume re-run.
+ *
+ * The split is the security property, not a style choice: the FIRST trap
+ * can produce only refusals (captured truth → errno), and the sidecar's rax
+ * can only be produced by k_linux_deliver — reached only through
+ * SYS_LINUX_TRAP_RESUME with the in-flight arm set (the dispatcher's I3
+ * clause). A reply that arrives before the task parks (SMP: the sidecar
+ * outran the park) is simply the head of the queue by the time the resume
+ * runs — the channel is point-to-point FIFO and the post happened-before.
+ *
+ * Park-time values never live in these frames: cap_wait_chans may never
+ * return (the woken peer's handoff switches away, the old chain abandoned
+ * below), so what the resume must know travels in park_req AS A VALUE — the
+ * expected reply num (mirroring k_chan_send's "park_req = &req" idiom
+ * only in role, not form: the request struct itself died with the first
+ * trap's frame, and the resume re-derives everything else from the table). */
+
+/* Post AND PARK. Returns only on a refusal (a CAP status — Phase-3 CAP_E*
+ * from the post, Phase-5 CAP_ERR_* from resolution; the dispatcher maps
+ * BOTH families through linux_errno_from_cap, which total-functions both
+ * by construction). Never reads a reply: on success the task is gone into
+ * the park and the rax belongs to the resume arm. */
+int k_linux_forward(uint32_t pid, uint16_t ch_w, uint16_t ch_r,
+                    const struct SLSLinuxSyscallRequest* req) {
+    uint32_t chan_id;
+    int dir;
+    int r;
+
+    if (!req) return CAP_ERR_PROTO;
+
+    /* Resolve through the CHAN_R (reply) handle FIRST: the park registers
+     * this channel id, and the reply's enqueue — not our post's — is what
+     * must wake it. Resolving by the recv handle also refuses a wrong-type
+     * / revoked slot before anything is posted (CAP_ERR_RIGHTS/REVOKED),
+     * so a task with a broken channel hears it as an errno, not a hang. */
+    r = chan_resolve(pid, ch_r, CAP_TYPE_CHAN_R, &chan_id, &dir);
+    if (r != CAP_ERR_OK) return r;
+
+    /* Step 5: post the 72-byte description. cap_send_msg copies the payload
+     * into the channel's pool synchronously — `req`'s frame may die after
+     * this and does die if the park switches (abandoned-frame rule).
+     * Non-blocking by design, and safe to be: this channel's ONLY writer is
+     * the one task forwarding on it, and that task is parked between post
+     * and reply — the inbound queue cannot be full at post time (cap.h's
+     * invariant). A failure here is therefore a real one — endpoint closed
+     * under us, payload pool exhausted (CAP_ENOSPC happens only between
+     * here and a peer's drain — bounded by the pool, not by trust, §3.6) —
+     * and deserves its mapped errno rather than a park nothing wakes. */
+    r = cap_send_msg(pid, ch_w, req, (uint32_t)sizeof *req, NULL, 0, 0, 0);
+    if (r != 0) return r;   /* CAP_E* family; mapped by the dispatcher */
+
+    /* Park, and keep parking. cap_wait_chans returns: noreturn when the
+     * wake's handoff switches us away (common case — the sidecar parks on
+     * this channel awaiting exactly this message); 1 from its in-kernel hlt
+     * path (nobody runnable to produce a reply — re-park, k_chan_wait's
+     * shape, console/IRQ drains already ran inside); 0 only where no park
+     * is possible at all (kernel context / host weak default) — a
+     * retryable "not answered yet", which the map reads as -EAGAIN. */
+    for (;;) {
+        if (!cap_wait_chans(&chan_id, 1, (void*)(uintptr_t)req->num,
+                            SYS_LINUX_TRAP_RESUME, 0))
+            return CAP_EAGAIN;
+    }
+}
+
+/* THE REPLY ARM — reached only as cap_recv_resume's re-run of a parked
+ * forward (SYS_LINUX_TRAP_RESUME + the armed park_syscall, checked by the
+ * dispatcher before this is called). Recvs into LOCALS (this frame is the
+ * resume's own, freshly built — no cross-park lifetime), validates and
+ * applies the reply through the pure §5.7 path, and re-parks on a spurious
+ * wake with the SAME expected num so the echo check is identical whether
+ * the reply came on the first wake or the third. Returns the final Linux
+ * rax: the sidecar's value, an errno-mapped refusal, or -EAGAIN if even
+ * the re-park is impossible. */
+uint64_t k_linux_deliver(uint32_t pid, uint16_t ch_r, uint64_t expect_num) {
+    uint32_t chan_id;
+    int dir;
+    int r = chan_resolve(pid, ch_r, CAP_TYPE_CHAN_R, &chan_id, &dir);
+    if (r != CAP_ERR_OK)
+        return (uint64_t)(int64_t)linux_errno_from_cap(r);
+
+    for (;;) {
+        struct SLSLinuxSyscallRequest reply;
+        struct SLSLinuxSyscallRequest req;
+        struct SLSChanRecvOut out;
+        int rr = k_chan_recv(pid, ch_r, &reply, (uint32_t)sizeof reply,
+                             NULL, 0, &out);
+
+        if (rr == CAP_ERR_OK) {
+            if (out.kind == CH_KIND_CLOSE) {
+                /* The sidecar closed the endpoint or died (its teardown
+                 * queues CLOSE for the peer): the partner is gone — the
+                 * map's CAP_ERR_TARGET reads -ESRCH, "no such process",
+                 * which is what a POSIX error path wants here. */
+                return (uint64_t)(int64_t)linux_errno_from_cap(CAP_ERR_TARGET);
+            }
+            if (out.kind != CH_KIND_MSG || out.len != sizeof reply)
+                return (uint64_t)(int64_t)linux_errno_from_cap(CAP_ERR_PROTO);
+            /* Rebuild a request carrying the EXPECTED num (describe zeroes
+             * ret/status), then overlay the reply — apply enforces size and
+             * echo against something the sidecar did not write. */
+            linux_syscall_describe(&req, expect_num, NULL);
+            return linux_syscall_apply_reply(&req, &reply, (uint64_t)out.len);
+        }
+
+        /* CAP_ERR_STATE with no CLOSE is "queue drained": a spurious wake
+         * (wake-all over-hits, or a close consumed earlier). Everything
+         * else — EBADF / TYPE / BUFSZ (a reply with attached caps or an
+         * oversized payload never fits the no-loss rule) — is the channel
+         * answering wrongly for this task, mapped like any reply status. */
+        if (rr != CAP_ERR_STATE)
+            return (uint64_t)(int64_t)linux_errno_from_cap(rr);
+
+        if (!cap_wait_chans(&chan_id, 1, (void*)(uintptr_t)expect_num,
+                            SYS_LINUX_TRAP_RESUME, 0))
+            return (uint64_t)(int64_t)linux_errno_from_cap(CAP_EAGAIN);
+    }
 }

@@ -122,7 +122,7 @@
  *   gcc -no-pie -std=c11 -Wall -Wextra -I . -I kernel \
  *       -o /tmp/cap_create_sidecar_host_test \
  *       tests/cap_create_sidecar_host_test.c kernel/cap.c kernel/chan.c \
- *           kernel/console_service.c kernel/env_console.c
+ *           kernel/console_service.c kernel/env_console.c kernel/linux_abi.c
  *   /tmp/cap_create_sidecar_host_test
  */
 #include "kernel/cap.h"

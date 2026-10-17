@@ -533,10 +533,12 @@ branch, no six-argument capture, no request struct and no forwarding. The
 Linux task does not exist yet, so the §8 checkpoint half of the gate is
 not closer than it was — the extra-tasks hook cannot capture a task that
 has not been built. Increment 2 is §3.3's mechanism (the personality, the
-branch, the capture, the park), increment 3 is §5.3's `fs_base`, and the
-checkpoint/restore integration is the increment AFTER the task can park in
-a forwarded syscall — because that parked state is exactly what §8 says a
-checkpoint serializes.
+branch, the capture), increment 3 is §3.3's delivery (steps 5–7 — the
+channel forward, the park/resume, the errno map applied to the reply, and
+the sidecar core's first answers, §10.7), increment 4 is §5.3's `fs_base`,
+and the checkpoint/restore integration is the increment AFTER the task can
+park in a forwarded syscall — because that parked state is exactly what
+§8 says a checkpoint serializes.
 
 ### 10.6 What has landed — increment 2 (the personality, the branch, the capture)
 
@@ -614,6 +616,146 @@ level: it can prove the branch is WIRED correctly, not that it FIRES —
 and this document says which rather than letting a green guard imply
 both.
 
+### 10.7 What has landed — increment 3 (forward, park/resume, the map applied, the sidecar's first answers)
+
+§3.3's steps 5–7, end to end in source, plus step 6's Rust half. The
+branch stops refusing and starts delivering — while still interpreting
+nothing. What exists now:
+
+- **The post, and the arm that must precede it.** `cap_linux_find_channels`
+  (`kernel/cap.c`) resolves the task's single sendable `CHAN_W` and single
+  recv-able `CHAN_R` against `linux_channel_shape_ok` — exactly one of
+  each, not "at least one": two candidates is a routing decision the
+  kernel is not allowed to make, so it is refused rather than guessed
+  between. The first trap then arms `cur->park_syscall =
+  SYS_LINUX_TRAP_RESUME` **before** the post, because `cap_maybe_handoff`
+  reads that state: a sysret handoff returned MID-forward would land back
+  in ring-3 with its hardcoded `rax=0` and the reply would be lost.
+  `k_linux_forward` (`kernel/chan.c`) resolves through the reply handle
+  first (a broken or revoked channel is an errno, not a hang),
+  `cap_send_msg`s the 72-byte description, then parks in
+  `cap_wait_chans` — it returns **only** on a refusal and never reads a
+  reply, by construction. Every refusal on this side leaves as a Linux
+  errno: `-LINUX_ENOSYS` for a pre-delivery refusal (no channel, stray
+  resume), `linux_errno_from_cap(status)` for the post's CAP status.
+- **The resume, the only reader.** `SYS_LINUX_TRAP_RESUME` (0x4C494E52
+  — "LINR", outside Linux's number space and outside every `SYS_SLS_*`)
+  routes through the pure `linux_forward_resume_is_live`
+  (`kernel/linux_abi.c`): a sentinel with no forward in flight — no arm,
+  or a personality that intercepts nothing — is refused **by name**,
+  never parked, the increment-2 discipline applied to the resume number.
+  Armed, `k_linux_deliver` recvs into resume-frame locals (the first
+  trap's frame died with it; park-time state travelled as values in
+  `park_req`) and hands the payload to `linux_syscall_apply_reply`, which
+  enforces the 72-byte size and the `num` echo **before** trusting
+  anything — a mismatch is `-EPROTO`, "no answer that was not an
+  answer" — and maps a nonzero `status` through §5.7 at the last
+  possible moment, so a CAP-family value never crosses into `rax`.
+  Status 0 means the sidecar's `ret` IS `rax`, passed through untouched
+  (the brk/mmap contract). A spurious wake re-parks with the same
+  expected `num`, so the echo check is identical on the third wake as on
+  the first. The resulting `rax` rides the existing `cap_recv_resume` →
+  `syscall_return_path` back to ring-3 as if the syscall had simply taken
+  a while.
+- **Step 6 — the sidecar core's answers (`user/sidecar/src/linux.rs`).**
+  The spawn path registers each child's two channel handles
+  (`linux::track`); the entry loop calls `linux::service` every pass —
+  the same non-blocking poll shape as its console arm — and the forward
+  channels join the quiesce **wait set** (`linux::append_wait`), so a
+  child's request WAKES the sidecar rather than waiting for an idle
+  pass. The answers are the census's, answered honestly: `set_tid_address`
+  (218) is stored-and-ignored — single-threaded, so the register echo is
+  the complete POSIX answer; `exit_group` (231) **reaps** — the task is
+  parked awaiting exactly this exchange, so `proc_kill` is an immediate
+  teardown and the frames return to the partition, and no reply is owed
+  because the task never runs again (a pid that cannot be resolved is
+  answered rather than left parked forever); everything else — every
+  number outside the census — answers `-ENOSYS` with the number logged,
+  §11 Q5's recommended policy: visible and cheap, never a silent success.
+  The reply is the same 72-byte `#[repr(C)]` struct, `num`/`ret`/`status`
+  at the offsets the host test pins, with a compile-time size assert as
+  the last thing between a kernel/sidecar layout drift and an eternity of
+  `-EPROTO`.
+- **Why three of these are pure functions.** `linux_forward_resume_is_live`,
+  `linux_channel_shape_ok` and `linux_syscall_apply_reply` live in
+  `kernel/linux_abi.c` with the increment's own reason written down:
+  every decision the forward path makes *before it parks* — "is this
+  resume ours?", "is this table shape ours?", "is this payload an
+  answer?" — is a decision a source guard can only hold if the source
+  holds it as a named contract, and a host test can only bite if it is
+  pure.
+
+**Host test** (`tests/linux_personality_host_test.c`, 19 → **42
+checks**): the sentinel's value as `"LINR"` and its fit inside
+`park_syscall`'s `u32` (a truncation would strand a parked forward on a
+different number); the in-flight truth table including both refusals
+(SLS at the sentinel, a disarmed Linux task, an unrecognised
+personality — each asserts nothing); the census table has no row for
+the sentinel (`LSC_UNKNOWN`), so it can never be mistaken for a
+describable syscall; the channel shape as a pure rule — only (1,1)
+passes, and (0,1)/(1,0) is §10.3's `no-cap-channel` tooth as a function;
+and `apply_reply` exhaustively: status-0 passthrough of a brk-class
+64-bit value un-mangled, the in-place overlay the dispatcher reads back,
+seven status rows mapped through §5.7 across both families plus the
+`CAP_NONE` sentinel and an out-of-family value (both → `-EIO`), and the
+refusals — undersize payload, zero size, a `num` echo from a different
+syscall, NULL — each defined as `-EPROTO` rather than returning a
+plausible value.
+
+**Source guard** (`tests/linux_personality_check.sh`, 18 → **29
+clauses**, still no `GUARD-KIND` — source-only, so it runs everywhere).
+Clauses I–K hold increment 3 with one consequence per clause: the
+forward/deliver pair exists at all; the post precedes the park *inside*
+`k_linux_forward` (scoped to the function — `k_chan_send` parks on the
+same shape for its own send); the arm is stamped before the call and
+un-armed on the refusal paths; the resume arm checks the in-flight state
+before it can deliver; both forward-failure exits cross
+`linux_errno_from_cap`; `apply_reply` maps the status and refuses by
+size and echo; the entry loop services **and** wait-qualifies the Linux
+children; the answer arms are the census's shape; the wire size is
+pinned twice; the reply fills `num`/`status` at the pinned offsets.
+Because A–H (routing) and I–K (delivery) are one branch, they are one
+guard: each half could be green alone while the seam between them is
+broken.
+
+Its smoke (`tests/linux_personality_check_smoke.sh`) proves **17 teeth
++ the restore check (18/18, exit 0)** on copies — the nine new ones,
+each a plausible future edit: the post deleted (a park nothing wakes),
+the arm stamp deleted (the mid-forward sysret handoff), the in-flight
+gate inverted, the reply's status returned raw instead of mapped, the
+num-echo check dead-coded, the entry loop's service call unhooked, the
+default answer arm flipped into a silent success (the answer §11 Q5
+forbids), the wire size moved 72 → 71, and the `num` echo never written
+(every reply then dies `-EPROTO`). Baseline and restore controls as
+before; the real tree is never touched.
+
+**Also landed with it:** `tests/env_storage_durable_check.sh`'s S10
+ceiling moved 327 → 328 with three new wiring clauses (S10g–S10i: the
+define, the `case`, the handler — the ceiling moving WITH the wiring,
+which its own comment already says is the rule), and each
+cap-family host test's documented build command now also links
+`kernel/linux_abi.c`, because a refusal can be produced anywhere and
+the map must therefore be linkable everywhere. Verified in this
+increment: guard 29/29 (exit 0), smoke 18/18 (exit 0), the personality
+host test 42/42, `tests/run_all.sh` over every `*_host_test.c` green,
+`tests/env_storage_durable_check.sh` green standalone, and the touched
+TUs syntax-check clean under freestanding flags; the sidecar archives
+were re-packed after the `user/` changes invalidated their stamps.
+
+**What this increment is NOT.** Everything above is still source-level.
+No qemu run has executed a real forward round trip: `tests/linux_abi_shim_check.sh`
+(§10.2's boot guard — one environment, one Linux task, the capability
+census, the attribution and flood clauses) still cannot run, and §10.3's
+`E7_TOOTH` arms still have nothing live to sabotage. The sidecar answers
+two syscalls for real and refuses the rest honestly, so a binary walking
+past the census's edge errors loudly at the boundary rather than
+receiving a fabricated value — but "a static binary doing the first
+user's actual work" is not closer to the observed-work half of the gate
+until a boot runs one. No `fs_base` (increment 4), no `brk`/`mmap`
+budget (5), no checkpoint half (§8, v0.2's). And §3.7's round-trip
+measurement is now *possible* rather than owed-in-principle: there is a
+round trip to measure, still unmeasured.
+
 ---
 
 ## 11. Open questions for review
@@ -668,6 +810,9 @@ Everything this document asserts about the tree, with its source:
 | The vDSO backstop measured: the same binary with no `AT_SYSINFO_EHDR`, row for row | `tools/linux_syscall_census_novdso.txt` |
 | The census and its proof, gated on every push, with the guard's own teeth proven | `tests/linux_abi_census_check.sh`; `tests/linux_abi_census_check_smoke.sh` |
 | The auxv a static binary is started with, as a literal list that omits `AT_SYSINFO_EHDR` | `tools/e7_stack_launcher.c` |
+| Steps 5–7 delivered: the post-then-park forward, the arm-before-post resume, a stray resume refused by name | `kernel/chan.c` (`k_linux_forward`/`k_linux_deliver`); `kernel/syscall_dispatch.c`; `kernel/cap.c` (`cap_linux_find_channels`); guard clauses I–K (§10.7) |
+| A reply's status reaches `rax` only through the §5.7 map, after size and num-echo are enforced | `kernel/linux_abi.c` (`linux_syscall_apply_reply`); `tests/linux_personality_host_test.c` (42 checks, §10.7) |
+| The sidecar's first answers: 218 echoed, 231 reaped, everything else ENOSYS with its number logged | `user/sidecar/src/linux.rs`; `user/sidecar/src/entry.rs` (`service`/`append_wait`) |
 
 ## Appendix B — Named gaps, each with its destination
 

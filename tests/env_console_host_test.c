@@ -49,7 +49,8 @@
  *       -include tests/kernel_io_panic_port.h \
  *       -o /tmp/env_console_host_test \
  *       tests/env_console_host_test.c kernel/cap.c \
- *       kernel/env_console.c kernel/kernel_io.c kernel/console.c
+ *       kernel/env_console.c kernel/kernel_io.c kernel/console.c \
+ *       kernel/linux_abi.c
  *   /tmp/env_console_host_test
  */
 #include "kernel/cap.h"

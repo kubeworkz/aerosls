@@ -1,7 +1,16 @@
 #!/usr/bin/env bash
-# linux_personality_check.sh — E7 increment 2 (Linux ABI Shim Design §3.3/§3.4):
-# the personality branch, its capture, and its spawn gate are WIRED, in the
-# right places, in the right order.
+# linux_personality_check.sh — E7 increments 2+3 (Linux ABI Shim Design
+# §3.3–§3.5): the personality branch, its capture and its spawn gate are
+# WIRED, in the right places, in the right order — and so is increment 3's
+# delivery: the post-then-park forward, the arm-before-post resume, the
+# §5.7 errno map's exits, and the sidecar core's first answers.
+#
+# Increments 2 and 3 are one guard because they are one branch: clauses A–H
+# hold that a Linux trap is described and refused (increment 2), clauses
+# I–K hold that it is delivered, parked, resumed and answered (increment 3).
+# Separately they could each be green while the seam between them is broken
+# — an arm-before-post that refused correctly, a reply that mapped correctly
+# into nobody's rax.
 #
 # ─── Why this exists ──────────────────────────────────────────────────────
 # Increment 2's whole deliverable is routing: a Linux task's trap must
@@ -38,8 +47,9 @@ bad() { echo "FAIL: $1"; fails=$((fails+1)); }
 
 # ─── A. Preconditions ──────────────────────────────────────────────────────
 for f in kernel/linux_abi.h kernel/linux_abi.c kernel/process.h kernel/process.c \
-         kernel/cap.h kernel/cap.c kernel/syscall_dispatch.c \
-         arch/x86/user_paging.h arch/x86/syscall.asm; do
+         kernel/cap.h kernel/cap.c kernel/syscall_dispatch.c kernel/chan.c \
+         arch/x86/user_paging.h arch/x86/syscall.asm \
+         user/sidecar/src/linux.rs user/sidecar/src/entry.rs; do
     if [ ! -f "$f" ]; then
         echo "ABORT: $f missing — the guard cannot be evaluated at all." >&2
         exit 2
@@ -55,6 +65,10 @@ CAPC=kernel/cap.c
 CAPH=kernel/cap.h
 DISP=kernel/syscall_dispatch.c
 LABH=kernel/linux_abi.h
+LABC=kernel/linux_abi.c
+CANC=kernel/chan.c
+LRS=user/sidecar/src/linux.rs
+LRE=user/sidecar/src/entry.rs
 
 # ─── B. The sibling per-CPU block, at the offsets the asm addresses ────────
 # The struct side is pinned by static asserts (a C reorder is a BUILD
@@ -214,6 +228,97 @@ if grep -q 'struct SLSLinuxSyscallRequest' "$LABH" && \
     ok "H. linux_abi.h carries the request struct, describe(), and SLS==0"
 else
     bad "H. a contract the branch consumes is gone from linux_abi.h — the request's ABI (increment 3's channel post) is no longer pinned anywhere"
+fi
+
+# ─── I. The delivery: post-then-park, arm-before-post, resume-by-arm ───────
+# Increment 3's wiring, one consequence per clause: a park nobody wakes, a
+# sysret handoff returned MID-forward (its hardcoded rax=0 loses the reply),
+# a raw ring-3 trap reading a reply nobody owed — each is silent in the
+# source until a Linux binary hits it, which no runner here can do.
+if grep -q 'int k_linux_forward(' "$CANC" && grep -q 'uint64_t k_linux_deliver(' "$CANC"; then
+    ok "I. chan.c carries the forward/deliver pair — §3.3 steps 5-7's channel path exists at all"
+else
+    bad "I. the k_linux_forward/k_linux_deliver pair is gone from chan.c — a Linux trap has no route to its sidecar and no path back"
+fi
+
+# Scoped to the forward's own body: k_chan_send parks on the same shape
+# (line ~447) for its own send, and that park has nothing to do with order
+# inside this function.
+fwd_start=$(grep -n 'int k_linux_forward(' "$CANC" | head -1 | cut -d: -f1)
+send_line=$(grep -n 'cap_send_msg(pid, ch_w, req' "$CANC" | head -1 | cut -d: -f1)
+park_line=$(grep -n 'cap_wait_chans(&chan_id, 1,' "$CANC" | awk -F: -v s="$fwd_start" '$1 > s { print $1; exit }')
+if [ -n "$fwd_start" ] && [ -n "$send_line" ] && [ -n "$park_line" ] && \
+   [ "$send_line" -gt "$fwd_start" ] && [ "$send_line" -lt "$park_line" ]; then
+    ok "I1. k_linux_forward posts the 72-byte request BEFORE it parks"
+else
+    bad "I1. the post does not precede the park inside k_linux_forward — the task would park for a reply to a request that was never sent, and nothing wakes it"
+fi
+
+arm_line=$(grep -n 'cur->park_syscall = SYS_LINUX_TRAP_RESUME;' "$DISP" | head -1 | cut -d: -f1)
+fwd_call=$(grep -n 'k_linux_forward(' "$DISP" | head -1 | cut -d: -f1)
+if [ -n "$arm_line" ] && [ -n "$fwd_call" ] && [ "$arm_line" -lt "$fwd_call" ] && \
+   [ "$(grep -c 'cur->park_syscall = 0;' "$DISP")" -ge 2 ]; then
+    ok "I2. park_syscall is armed BEFORE the post and cleared on the refusal paths (cap_maybe_handoff skips the send-handoff while armed)"
+else
+    bad "I2. the arm-before-post ordering or the un-arm is gone — cap_maybe_handoff would sysret to ring-3 MID-forward with its hardcoded rax=0 and the reply is lost"
+fi
+
+if grep -q 'if (!linux_forward_resume_is_live(' "$DISP" && \
+   grep -q 'k_linux_deliver(cur->pid, ch_r' "$DISP"; then
+    ok "I3. the resume arm checks the in-flight state before it delivers — a stray sentinel is refused by name"
+else
+    bad "I3. the in-flight check before k_linux_deliver is gone — a raw ring-3 trap wearing the resume number could read (or park for) a reply that was never owed"
+fi
+
+# ─── J. The map: a refusal on the delivery path leaves as a Linux errno ────
+# §5.7 at both exits of the exchange: the FIRST trap's refusals (captured
+# truth -> errno), and the sidecar's reply status (CAP units -> Linux units),
+# the last place either unit is available.
+if grep -q 'linux_errno_from_cap(status)' "$DISP" && grep -q 'CAP_ERR_REVOKED' "$DISP"; then
+    ok "J. both forward-failure exits (post refused, sidecar gone) cross linux_errno_from_cap — no raw CAP value ever reaches rax"
+else
+    bad "J. a forward-path refusal no longer crosses linux_errno_from_cap — a CAP-family negative in a Linux task's rax is a value no errno can produce (§5.7), and a dead sidecar would surface as a debug code instead of -EIO"
+fi
+if grep -q 'linux_errno_from_cap(req->status);' "$LABC"; then
+    ok "J1. linux_syscall_apply_reply maps a nonzero reply status through the table before returning"
+else
+    bad "J1. the reply's status is no longer mapped in apply_reply — the sidecar's CAP_ENOSYS (-10) would land in rax as a raw CAP code"
+fi
+if grep -q 'payload_len != sizeof \*req' "$LABC" && grep -q 'req->num != expect' "$LABC"; then
+    ok "J2. apply_reply refuses by size and by num echo BEFORE trusting the payload (72 bytes, this request's number)"
+else
+    bad "J2. the size or echo check is gone from apply_reply — a malformed or foreign payload could put an unvalidated value into the task's rax (§5.7's 'no answer that was not an answer')"
+fi
+
+# ─── K. The sidecar's first answers (user/sidecar/src/linux.rs, entry.rs) ──
+# Step 6 lives in Rust, and none of it is visible from a kernel clause: the
+# entry loop must actually call the service arm, the answers must be the
+# census's honest set (§11 Q5), and the reply must be the exact struct the
+# kernel's apply will accept or every exchange dies -EPROTO.
+if grep -qF 'crate::linux::service(&RealKernel);' "$LRE" && \
+   grep -qF 'crate::linux::append_wait(' "$LRE"; then
+    ok "K. the entry loop services the Linux children AND adds their channels to the quiesce wait set (a forward wakes the sidecar, not an idle pass)"
+else
+    bad "K. the entry loop no longer services or wait-qualifies the Linux children — every forwarded syscall sits unanswered in the channel queue while its task parks forever"
+fi
+if grep -qF '218 => Answer::Reply(args[0], STATUS_OK),' "$LRS" && \
+   grep -qF '231 => Answer::Exit,' "$LRS" && \
+   grep -qF '_ => Answer::Reply(0, E_NOSYS),' "$LRS"; then
+    ok "K1. the answers are the census's: set_tid_address echoes, exit_group reaps, everything else refuses ENOSYS with its number logged"
+else
+    bad "K1. an answer arm changed shape — worst is the default arm: a silent success for an unimplemented syscall is the answer §11 Q5's policy forbids"
+fi
+if grep -qF 'pub const LINUX_SYSCALL_REQ_BYTES: usize = 72;' "$LRS" && \
+   grep -qF 'size_of::<LinuxSyscallReq>() == LINUX_SYSCALL_REQ_BYTES' "$LRS"; then
+    ok "K2. the 72-byte wire size is pinned twice: a literal and a compile-time assert"
+else
+    bad "K2. the wire-size pin is gone — a kernel/sidecar layout drift makes every reply unparseable, and the kernel's apply then refuses every one -EPROTO forever"
+fi
+if grep -qF 'payload[0..8].copy_from_slice(&num.to_le_bytes());' "$LRS" && \
+   grep -qF 'payload[64..68].copy_from_slice(&status.to_le_bytes());' "$LRS"; then
+    ok "K3. the reply fills num, ret and status at the pinned offsets — the fields linux_syscall_apply_reply compares against"
+else
+    bad "K3. the reply no longer fills num/status at the pinned offsets — every reply would fail the kernel's echo check and the task could only ever see -EPROTO"
 fi
 
 echo

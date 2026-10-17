@@ -4378,6 +4378,55 @@ static uint16_t sidecar_find_parent_ch_w(uint32_t parent_pid, uint16_t ch_r) {
     return CAP_NONE;
 }
 
+/* ─── cap_linux_find_channels (E7 increment 3, §3.5) ─────────────────────
+ * Locate the SINGLE channel a Linux-personality task forwards on: its one
+ * sendable CHAN_W and one recv-able CHAN_R, per linux_channel_shape_ok —
+ * §3.5's "exactly one entry: the channel to its environment's sidecar"
+ * made into a scan instead of a prose hope. Anything else (no channel —
+ * the increment-2 "no-cap-channel" tooth; two sendable handles — a table
+ * that does not have the shape Linux forwarding assumes) is a refusal, not
+ * a guess: the forward must not be able to route a task's syscalls to the
+ * wrong channel, and §3.6 requires the kernel's side of this path to
+ * validate "is its channel present" and nothing more.
+ *
+ * Scanned WITHOUT the table lock, same posture and same reason as
+ * sidecar_find_parent_ch_w above: a process resolving its OWN table
+ * inside its OWN syscall runs single-threaded against it — no concurrent
+ * mutator exists (only this task's trap path and spawn/teardown mutators,
+ * and neither runs while this syscall executes). Perms are checked for
+ * USABILITY (SEND / RECV), matching what cap_send_msg / cap_recv_msg
+ * will enforce anyway — a handle the transport would reject does not
+ * count as a channel answer. */
+int cap_linux_find_channels(uint32_t pid, uint16_t* out_ch_w,
+                            uint16_t* out_ch_r) {
+    int cti = cap_table_index(pid);
+    int n_w = 0, n_r = 0;
+    uint16_t found_w = CAP_NONE, found_r = CAP_NONE;
+    if (cti < 0 || !out_ch_w || !out_ch_r) return -1;
+    for (int si = 0; si < CAP_TABLE_ENTRIES; si++) {
+        uint64_t w = cap_tables[cti].slots[si].word;
+        if (!cap_word_valid(w)) continue;
+        switch ((uint32_t)((w >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK)) {
+        case CAP_TYPE_CHAN_W:
+            if (!((w >> CAP_PERM_SHIFT) & CAP_PERM_SEND)) continue;
+            n_w++;
+            found_w = (uint16_t)si;
+            break;
+        case CAP_TYPE_CHAN_R:
+            if (!((w >> CAP_PERM_SHIFT) & CAP_PERM_RECV)) continue;
+            n_r++;
+            found_r = (uint16_t)si;
+            break;
+        default:
+            break;   /* MEM / IRQ / IO / … are not channel answers */
+        }
+    }
+    if (!linux_channel_shape_ok(n_w, n_r)) return -1;   /* the rule, pure */
+    *out_ch_w = found_w;
+    *out_ch_r = found_r;
+    return 0;
+}
+
 /* ─── sys_sls_create_sidecar ──────────────────────────────────────────────── */
 /* The personality-carrying create IS the create: the legacy wrapper passes
  * PROC_PERSONALITY_SLS, so every pre-E7 caller's child is byte-for-byte

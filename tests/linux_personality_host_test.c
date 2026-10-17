@@ -29,6 +29,8 @@
 #include <stdint.h>
 
 #include "linux_abi.h"
+#include "cap.h"       /* the CAP_E* / CAP_ERR_* codes the reply may carry —
+                        * the same families the errno-map host test pins */
 
 static int checks_passed = 0;
 static int checks_failed = 0;
@@ -105,6 +107,131 @@ int main(void)
     CHECK(LINUX_ENOSYS == 38,
           "LINUX_ENOSYS is 38 — the number a musl-built binary was compiled\n"
           "      against; the branch returns -38, never a CAP_E* family value");
+
+    /* ═══ E7 increment 3 (§3.3 steps 5-7): the reply, the in-flight state,
+     * the channel shape — all pure, all asserted here because the park that
+     * consumes them is exactly what no host can run ═════════════════════ */
+
+    /* ─── The resume sentinel and the in-flight predicate ──────────────── */
+    CHECK(SYS_LINUX_TRAP_RESUME == 0x4C494E52u,
+          "the resume sentinel is \"LINR\": outside Linux's number space,\n"
+          "      outside every SYS_SLS_*, and it fits the u32 park_syscall");
+    CHECK(sizeof(SYS_LINUX_TRAP_RESUME) <= sizeof(uint32_t),
+          "the sentinel fits park_syscall — a value cap_recv_resume passes\n"
+          "      through its %edi re-entry could truncate would strand a\n"
+          "      parked forward on a different number");
+    CHECK(linux_forward_resume_is_live(PROC_PERSONALITY_LINUX,
+                                       SYS_LINUX_TRAP_RESUME) == 1,
+          "an armed Linux task at the sentinel IS the in-flight resume\n"
+          "      re-run — the only arm that reads a reply");
+    CHECK(linux_forward_resume_is_live(PROC_PERSONALITY_SLS,
+                                       SYS_LINUX_TRAP_RESUME) == 0,
+          "an SLS task at the sentinel intercepts nothing (its number\n"
+          "      space is its own — §2.2 applied to the resume number too)");
+    CHECK(linux_forward_resume_is_live(PROC_PERSONALITY_LINUX, 0) == 0 &&
+          linux_forward_resume_is_live(PROC_PERSONALITY_LINUX,
+                                       311 /* SYS_SLS_CHAN_WAIT */) == 0,
+          "a disarmed Linux task is never a resume: a stray sentinel trap\n"
+          "      is refused by name, never parked");
+    CHECK(linux_forward_resume_is_live(0xFFFFFFFFu, SYS_LINUX_TRAP_RESUME) == 0,
+          "an unrecognised personality asserts no in-flight state either");
+    CHECK(linux_syscall_class(SYS_LINUX_TRAP_RESUME) == LSC_UNKNOWN,
+          "the census table has no row for the sentinel: it can never be\n"
+          "      mistaken for a describable syscall's number");
+
+    /* ─── §3.5's channel shape as a pure rule ──────────────────────────── */
+    CHECK(linux_channel_shape_ok(1, 1) == 1,
+          "exactly one sendable CHAN_W and one recv-able CHAN_R is the\n"
+          "      shape a Linux task forwards on");
+    CHECK(linux_channel_shape_ok(0, 1) == 0 &&
+          linux_channel_shape_ok(1, 0) == 0 &&
+          linux_channel_shape_ok(0, 0) == 0,
+          "a task WITHOUT its channel (§10.3's no-cap-channel tooth) can\n"
+          "      never forward — the refusal is structural");
+    CHECK(linux_channel_shape_ok(2, 1) == 0 &&
+          linux_channel_shape_ok(1, 2) == 0 &&
+          linux_channel_shape_ok(3, 3) == 0,
+          "two candidates are refused, not guessed between: routing a\n"
+          "      task's syscalls to the wrong channel is a decision the\n"
+          "      kernel may not make (§3.6: describe, never interpret)");
+
+    /* ─── apply_reply: the reply contract, total and by name ───────────── */
+    {
+        struct SLSLinuxSyscallRequest base;
+        struct SLSLinuxSyscallRequest reply;
+        uint64_t captured[6] = { 1, 2, 3, 4, 5, 6 };
+        uint64_t r;
+        int i;
+
+        /* success: status 0 means ret IS the rax (brk-class values pass
+         * through untouched — a huge positive, not an errno) */
+        linux_syscall_describe(&base, 158, captured);   /* the in-flight num */
+        memset(&reply, 0, sizeof(reply));
+        reply.num    = 158;               /* the echo */
+        reply.args[0] = 0xDEAD;           /* ignored by apply — ret/status only */
+        reply.ret    = 0x7F0000000000ULL;
+        reply.status = 0;
+        r = linux_syscall_apply_reply(&base, &reply, sizeof(reply));
+        CHECK(r == 0x7F0000000000ULL,
+              "status 0: the sidecar's ret IS the rax — a big positive\n"
+              "      passes through un-mangled (the brk/mmap contract)");
+        CHECK(base.ret == 0x7F0000000000ULL && base.status == 0 &&
+              base.num == 158 && base.args[0] == 0xDEAD,
+              "apply overlays the reply onto the request in place — the\n"
+              "      dispatcher reads the final rax from its return value");
+
+        /* nonzero status: the CAP code is MAPPED, never leaked (§5.7) —
+         * both families, exactly as the errno-map test pins them */
+        {   struct { int32_t status; int32_t want; } map[] = {
+                { CAP_EINVAL,    -LINUX_EINVAL },
+                { CAP_EAGAIN,    -LINUX_EAGAIN },
+                { CAP_ENOSYS,    -LINUX_ENOSYS },
+                { CAP_ERR_NOTFOUND, -LINUX_ENOENT },   /* the Phase-5 family */
+                { CAP_ERR_TIMEOUT,  -LINUX_ETIMEDOUT },
+                { CAP_NONE,      -LINUX_EIO },         /* the sentinel:\n translated, never leaked */
+                { 0x7FFF,        -LINUX_EIO },         /* out of both families */
+            };
+            size_t mi;
+            for (mi = 0; mi < sizeof(map) / sizeof(map[0]); mi++) {
+                linux_syscall_describe(&base, 1, NULL);
+                memset(&reply, 0, sizeof(reply));
+                reply.num = 1;
+                reply.status = map[mi].status;
+                r = linux_syscall_apply_reply(&base, &reply, sizeof(reply));
+                CHECK(r == (uint64_t)(int64_t)map[mi].want,
+                      "status maps through the errno table, never crosses\n"
+                      "      as itself");
+            }
+        }
+
+        /* refusals: an answer that is not provably THIS request's answer */
+        linux_syscall_describe(&base, 9, NULL);
+        memset(&reply, 0, sizeof(reply));
+        reply.num = 9;
+        CHECK(linux_syscall_apply_reply(&base, &reply, sizeof(reply) - 1) ==
+                  (uint64_t)(int64_t)(-LINUX_EPROTO) &&
+              linux_syscall_apply_reply(&base, &reply, 0) ==
+                  (uint64_t)(int64_t)(-LINUX_EPROTO) &&
+              linux_syscall_apply_reply(&base, &reply, sizeof(reply) + 1) ==
+                  (uint64_t)(int64_t)(-LINUX_EPROTO),
+              "a payload that is not exactly 72 bytes is not a reply:\n"
+              "      -EPROTO, before anything in it is trusted");
+        reply.num = 10;   /* a DIFFERENT syscall's answer */
+        CHECK(linux_syscall_apply_reply(&base, &reply, sizeof(reply)) ==
+                  (uint64_t)(int64_t)(-LINUX_EPROTO),
+              "a num echo mismatch is a misrouted or malformed reply:\n"
+              "      -EPROTO — another syscall's answer must never produce\n"
+              "      this syscall's rax");
+        reply.num = 9;
+        for (i = 0; i < 2; i++) {
+            void *null_arg = (i == 0) ? (void *)0 : (void *)&base;
+            void *null_req = (i == 0) ? (void *)&reply : (void *)0;
+            CHECK(linux_syscall_apply_reply(
+                      (struct SLSLinuxSyscallRequest *)null_req, null_arg,
+                      sizeof(reply)) == (uint64_t)(int64_t)(-LINUX_EPROTO),
+                  "a NULL request or NULL payload is refused, defined");
+        }
+    }
 
     printf("linux_personality_host_test: %d passed, %d failed\n",
            checks_passed, checks_failed);
