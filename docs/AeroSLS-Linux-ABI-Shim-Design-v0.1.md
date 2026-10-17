@@ -482,6 +482,62 @@ The decisive arm, because it tests the security property rather than the feature
 
 The gate is only "passed" when both halves are observed **in one run**, at which point the report says so in one line. Until v0.2 lands, the run reports the halves separately — work-only (green or red) and cycle (not attempted, with the reason) — so a partially-capable shim is never described as gated.
 
+### 10.5 What has landed — increment 1 (the contracts)
+
+E7 starts where this tree always starts: the record layer, before any
+mechanism. Three of §9's in-scope items are pure functions with no
+dependency on the trap path, the sidecar or a boot — the errno map (§5.7),
+the syscall classification table built from the census (§5.6), and the
+initial stack/auxv builder (§5.2) — and they are the contracts every later
+increment consumes. They landed together as `kernel/linux_abi.h` /
+`kernel/linux_abi.c` (in the x86 image's `X86_C_SRC`), each with the host
+test §10.1 named:
+
+- `tests/linux_errno_map_host_test.c` — 51 checks, exhaustive over both
+  families (all twelve `CAP_E*`, all fourteen `CAP_ERR_*` including the
+  `CAP_ERR_OK` success arm), the `CAP_NONE` sentinel's translation to
+  `-EIO` (§5.7's "translated, never leaked"), the range law (every result
+  is 0 or inside `[-4095, -1]`, musl's errno window), and the reverse map
+  **exactly where it is defined**: the twelve unique-preimage codes
+  round-trip, and the five collapse errnos (`EPERM`, `ENOMEM`, `EINVAL`,
+  `EIO`, `EBUSY`, which two or three CAP codes each map onto) return 0
+  rather than guess which kernel-side truth the errno no longer carries.
+- `tests/linux_syscall_table_host_test.c` — 42 checks, parsing
+  `tools/linux_syscall_census.txt` itself (traced rows *and* the declared
+  vDSO backstop) so the artifact is the specification rather than a
+  transcription: every one of the 27 numbers has a non-UNKNOWN class, the
+  class of each is §5.6's destination asserted by name, `mprotect` carries
+  `LSC_F_REFUSES_WX` (§5.4's W^X refusal pinned against the census's own
+  row — H2's Node exclusion as a table property), and the number-space
+  overlaps 105/160/320 are UNKNOWN: no entry, no semantics, no path to a
+  `SYS_` arm. The table's length is pinned to the row count, so a future
+  census run that adds a syscall reddens here until the table grows.
+- `tests/linux_initial_stack_host_test.c` — 40 checks over a poisoned
+  region: the canonical psABI image (argc lowest, strings highest — the
+  first draft of the builder was inverted, and the pointer-walk is what
+  caught it), §5.2's thirteen required `AT_*` each present exactly once
+  with the value named, `AT_SYSINFO_EHDR` **absent** by decision (the vDSO
+  honesty requirement asserted at the source, not at the trace),
+  `AT_RANDOM` copied verbatim from the caller's entropy, a 16-byte-aligned
+  entry rsp checked on the ABSOLUTE address, and the undersize/NULL
+  refusals returning 0 rather than a plausible address.
+
+All three run in `tests/run_all.sh` on every push; the module compiles
+freestanding (`-ffreestanding -mno-red-zone`); teeth were verified by
+sabotage (a flipped table class reddens naming `clock_gettime (228)`; a
+flipped errno mapping reddens on the exact forward clause *and* the
+round-trip that redefines the reverse).
+
+What this increment is NOT: there is no personality field, no trap-path
+branch, no six-argument capture, no request struct and no forwarding. The
+Linux task does not exist yet, so the §8 checkpoint half of the gate is
+not closer than it was — the extra-tasks hook cannot capture a task that
+has not been built. Increment 2 is §3.3's mechanism (the personality, the
+branch, the capture, the park), increment 3 is §5.3's `fs_base`, and the
+checkpoint/restore integration is the increment AFTER the task can park in
+a forwarded syscall — because that parked state is exactly what §8 says a
+checkpoint serializes.
+
 ---
 
 ## 11. Open questions for review
@@ -501,6 +557,9 @@ Everything this document asserts about the tree, with its source:
 | Claim | Source |
 |---|---|
 | Trap entry, `swapgs`, per-CPU scratch, asm number chain, `.unknown_syscall` → `do_syscall` | `arch/x86/syscall.asm` |
+| The errno map is total over both families and the `CAP_NONE` sentinel, with the reverse defined only on unique preimages | `kernel/linux_abi.h`/`.c`; `tests/linux_errno_map_host_test.c` (51 checks, §10.5) |
+| Every census number — traced and vDSO-declared — has a dispatch class, and the SLS overlaps 105/160/320 are UNKNOWN | `tests/linux_syscall_table_host_test.c` (42 checks) over `tools/linux_syscall_census.txt` |
+| The initial stack builder emits the canonical psABI image with §5.2's AT_* set, no `AT_SYSINFO_EHDR`, and refuses by returning 0 | `tests/linux_initial_stack_host_test.c` (40 checks) |
 | SLS ABI: `rax` = num, `rdi` = one request pointer | `kernel/syscall_dispatch.h`; `user/libsls/sls.h`; `user/aerosls/src/syscall.rs` |
 | `syscall_regs[8]` at `[gs:0x10..0x48]`, and the live late-read failure | `arch/x86/user_paging.h` |
 | Gate: `EFER`, `STAR` (`0x23`/`0x1B`), `LSTAR`, `SFMASK`, GS bases; **no FS base** | `arch/x86/user_paging.c`, `syscall_gate_init()` |

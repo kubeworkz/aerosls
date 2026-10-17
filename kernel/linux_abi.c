@@ -1,0 +1,326 @@
+/*
+ * linux_abi.c — Phase E7, increment 1: the three contracts as code.
+ *
+ * Pure functions only: no state, no allocation, no trap path, no sidecar.
+ * Each one is a total function whose every input is either enumerated by
+ * the census artifact or refused by name — the same "no silent default"
+ * discipline the rest of this tree applies to on-disk formats. See
+ * kernel/linux_abi.h for why this increment lands before any mechanism.
+ */
+#include "linux_abi.h"
+#include "cap.h"      /* CAP_E* (Phase-3 syscalls), CAP_ERR_* (Phase-5 k_chan), CAP_NONE */
+
+/* ─── The errno map (§5.7) ─────────────────────────────────────────────────
+ * Forward: CAP code -> Linux errno, total over both families and the
+ * CAP_NONE sentinel. The load-bearing decision is the sentinel's: an
+ * out-of-band value is a kernel answer that was not an answer, and the
+ * only honest translation is the generic "the kernel did not produce a
+ * result" — EIO — never a plausible errno a tenant binary might treat as
+ * a retry or an absence. Values outside both families get the same
+ * treatment for the same reason: they cannot have crossed here honestly. */
+int32_t linux_errno_from_cap(int32_t cap_code)
+{
+    switch (cap_code) {
+    case 0:                          return 0;                 /* success */
+    /* ── Phase-5 k_chan_ family (positive; cap.h CAP_ERR_*) ──
+     * CAP_ERR_OK is 0 and shares the success arm above. */
+    case CAP_ERR_NOTFOUND:           return -LINUX_ENOENT;     /* object absent */
+    case CAP_ERR_REVOKED:            return -LINUX_EIO;        /* died under us mid-op */
+    case CAP_ERR_RIGHTS:             return -LINUX_EPERM;      /* rights check failed */
+    case CAP_ERR_RANGE:              return -LINUX_ERANGE;
+    case CAP_ERR_BUDGET:             return -LINUX_ENOMEM;     /* budget, not RAM: the
+                                                                 * task's memory ask hit
+                                                                 * the partition's wall */
+    case CAP_ERR_SPACE:              return -LINUX_ENOBUFS;    /* channel full, not memory */
+    case CAP_ERR_TARGET:             return -LINUX_ESRCH;      /* the peer is gone */
+    case CAP_ERR_STATE:              return -LINUX_EBUSY;      /* wrong state for the op */
+    case CAP_ERR_TYPE:               return -LINUX_EINVAL;     /* malformed object word */
+    case CAP_ERR_PROTO:              return -LINUX_EPROTO;     /* conversation broke */
+    case CAP_ERR_NOMEM:              return -LINUX_ENOMEM;
+    case CAP_ERR_BUFSZ:              return -LINUX_EINVAL;     /* request won't fit the msg */
+    case CAP_ERR_TIMEOUT:            return -LINUX_ETIMEDOUT;
+    /* ── Phase-3 syscall family (negative; cap.h CAP_E*) ── */
+    case CAP_EINVAL:                 return -LINUX_EINVAL;
+    case CAP_EBADF:                  return -LINUX_EBADF;
+    case CAP_EAGAIN:                 return -LINUX_EAGAIN;
+    case CAP_ETABLEFULL:             return -LINUX_ENFILE;     /* a fixed KERNEL table:
+                                                                 * system-scoped, not the
+                                                                 * fd-scoped EMFILE */
+    case CAP_ECAPREVOKED:            return -LINUX_EIO;        /* handle died under us */
+    case CAP_EALREADY:               return -LINUX_EALREADY;
+    case CAP_ENOMEM:                 return -LINUX_ENOMEM;
+    case CAP_ENOSPC:                 return -LINUX_ENOSPC;
+    case CAP_ERANGE:                 return -LINUX_ERANGE;
+    case CAP_ENOSYS:                 return -LINUX_ENOSYS;
+    case CAP_ECONFLICT:              return -LINUX_EBUSY;      /* state conflict */
+    case CAP_EPERM:                  return -LINUX_EPERM;
+    default:
+        /* CAP_NONE (0xFFFF, the out-param sentinel) and anything else that
+         * is not an enumerated code: translated, never leaked (§5.7). */
+        return -LINUX_EIO;
+    }
+}
+
+/* Reverse: Linux errno -> CAP code, defined ONLY where the preimage is
+ * unique. Five errnos collapse two or three CAP codes onto one Linux value
+ * (EPERM, ENOMEM, EINVAL, EIO, EBUSY); for those the reverse is 0 = not
+ * defined, because picking one would invent a kernel-side truth the errno
+ * does not carry. The host test round-trips exactly the defined ones. */
+int32_t cap_code_from_linux_errno(int32_t linux_errno)
+{
+    switch (linux_errno) {
+    case -LINUX_ENOENT:    return CAP_ERR_NOTFOUND;
+    case -LINUX_ESRCH:     return CAP_ERR_TARGET;
+    case -LINUX_EBADF:     return CAP_EBADF;
+    case -LINUX_EAGAIN:    return CAP_EAGAIN;
+    case -LINUX_ENFILE:    return CAP_ETABLEFULL;
+    case -LINUX_EALREADY:  return CAP_EALREADY;
+    case -LINUX_ENOSPC:    return CAP_ENOSPC;
+    case -LINUX_ERANGE:    return CAP_ERANGE;
+    case -LINUX_ENOSYS:    return CAP_ENOSYS;
+    case -LINUX_ENOBUFS:   return CAP_ERR_SPACE;
+    case -LINUX_EPROTO:    return CAP_ERR_PROTO;
+    case -LINUX_ETIMEDOUT: return CAP_ERR_TIMEOUT;
+    default:               return 0;   /* no unique preimage (or not an error) */
+    }
+}
+
+/* ─── The syscall classification table (§5.6) ──────────────────────────────
+ * Built FROM tools/linux_syscall_census.txt: 27 rows, sorted by number.
+ * The class names where the semantics live, per §5.6's destination table;
+ * the flag pins §5.4's W^X refusal against the census's own mprotect row.
+ *
+ * The absence of a row is as load-bearing as any row: 105 (SLS
+ * SYS_SLS_ALLOCATE / Linux setuid), 160 (SYS_SLS_PROC_CREATE) and 320
+ * (SYS_SLS_ALLOC_REGION / kexec_file_load) have NO entry, so a
+ * Linux-personality dispatch that consults this table refuses them by
+ * name — the number-space property §2.2 requires, made structural. */
+const struct LinuxSyscallEntry linux_syscall_table[] = {
+    {   0, LSC_FD,     0 },   /* read */
+    {   1, LSC_FD,     0 },   /* write */
+    {   2, LSC_FD,     0 },   /* open */
+    {   3, LSC_FD,     0 },   /* close */
+    {   4, LSC_FD,     0 },   /* stat */
+    {   6, LSC_FD,     0 },   /* lstat */
+    {   7, LSC_FD,     0 },   /* poll */
+    {   8, LSC_FD,     0 },   /* lseek */
+    {   9, LSC_MEM,    0 },   /* mmap — §5.4 budget-backed */
+    {  10, LSC_MEM,    LSC_F_REFUSES_WX }, /* mprotect — W|X refused (§5.4) */
+    {  11, LSC_MEM,    0 },   /* munmap */
+    {  12, LSC_MEM,    0 },   /* brk — §5.4 bump pointer in the budget */
+    {  13, LSC_SIG,    0 },   /* rt_sigaction — recorded, never delivered */
+    {  14, LSC_SIG,    0 },   /* rt_sigprocmask — recorded, never delivered */
+    {  59, LSC_SPAWN,  0 },   /* execve — the spawn path */
+    {  72, LSC_FD,     0 },   /* fcntl */
+    {  74, LSC_FD,     0 },   /* fsync */
+    {  77, LSC_FD,     0 },   /* ftruncate */
+    {  82, LSC_FD,     0 },   /* rename — the .img.partial -> final swap */
+    {  83, LSC_FD,     0 },   /* mkdir */
+    {  87, LSC_FD,     0 },   /* unlink */
+    { 131, LSC_SIG,    0 },   /* sigaltstack — recorded, never delivered */
+    { 158, LSC_MSR,    0 },   /* arch_prctl(ARCH_SET_FS) — §5.3's one MSR */
+    { 217, LSC_FD,     0 },   /* getdents64 */
+    { 218, LSC_LOCAL,  0 },   /* set_tid_address — single-threaded: stored and ignored */
+    { 228, LSC_LOCAL,  0 },   /* clock_gettime — vDSO-backstopped (§5.5): a real trap here */
+    { 231, LSC_EXIT,   0 },   /* exit_group — the sidecar reaps, frames return */
+};
+const size_t linux_syscall_table_len =
+    sizeof(linux_syscall_table) / sizeof(linux_syscall_table[0]);
+
+enum LinuxSyscallClass linux_syscall_class(uint64_t num)
+{
+    size_t i;
+    for (i = 0; i < linux_syscall_table_len; i++) {
+        if (linux_syscall_table[i].num == num)
+            return linux_syscall_table[i].cls;
+    }
+    return LSC_UNKNOWN;   /* not in the census: refused by name, never dispatched */
+}
+
+uint32_t linux_syscall_flags(uint64_t num)
+{
+    size_t i;
+    for (i = 0; i < linux_syscall_table_len; i++) {
+        if (linux_syscall_table[i].num == num)
+            return linux_syscall_table[i].flags;
+    }
+    return 0;
+}
+
+const char *linux_syscall_class_name(enum LinuxSyscallClass cls)
+{
+    switch (cls) {
+    case LSC_FD:     return "fd";
+    case LSC_MEM:    return "mem";
+    case LSC_SIG:    return "sig";
+    case LSC_MSR:    return "msr";
+    case LSC_SPAWN:  return "spawn";
+    case LSC_LOCAL:  return "local";
+    case LSC_EXIT:   return "exit";
+    case LSC_UNKNOWN:
+    default:         return "unknown";
+    }
+}
+
+/* ─── The initial stack and auxv (§5.2) ────────────────────────────────────
+ * Byte-exact layout, low address (returned rsp) upward — the canonical
+ * process-entry image a static libc walks:
+ *     [ argc ]                     <- returned rsp (16-byte aligned, psABI)
+ *     [ argv pointers, NULL ]
+ *     [ envp pointers, NULL ]
+ *     [ auxv: 13 entries + AT_NULL, 16 bytes each ]
+ *     [ pad to 8, plus a further 8 iff needed to keep rsp 16-aligned ]
+ *     [ argv strings | env strings | execfn | "x86_64" | AT_RANDOM(16) ]
+ * The strings ride at the TOP of the used span (the stack grows down
+ * toward them); a libc reaches auxv by walking up from envp's NULL, so
+ * the auxv must be the last thing below the strings — an inverted image
+ * walks into whatever the caller left there.
+ * The strings are copied (the source may be the sidecar's memory, which
+ * will not exist in the restored world at the same address); AT_RANDOM
+ * is copied, and its absence is refused outright rather than filled with
+ * zeros — §5.2's rule that a stack without entropy makes canaries
+ * worthless. */
+
+static size_t lab_strlen(const char *s)
+{
+    size_t n = 0;
+    while (s[n]) n++;
+    return n;
+}
+
+static void lab_memcpy(uint8_t *dst, const uint8_t *src, size_t n)
+{
+    size_t i;
+    for (i = 0; i < n; i++) dst[i] = src[i];
+}
+
+static void lab_memzero(uint8_t *dst, size_t n)
+{
+    size_t i;
+    for (i = 0; i < n; i++) dst[i] = 0;
+}
+
+/* auxv entry count: §5.2's required set, AT_SYSINFO_EHDR deliberately
+ * absent, plus the AT_NULL terminator. */
+#define LAB_AUX_ENTRIES 13
+#define LAB_AUX_BYTES   ((LAB_AUX_ENTRIES + 1) * 16u)
+
+uint64_t linux_initial_stack_build(uint8_t *region, size_t region_bytes,
+                                   const struct LinuxInitStackParams *p)
+{
+    size_t n_argv = 0, n_envp = 0, i;
+    size_t str_bytes, str_off, ptr_pad, aux_off, envp_off, argv_off, argc_off;
+    uint8_t *w;
+    const char *platform = "x86_64";
+
+    if (!region || !p || !p->argv || !p->envp || !p->at_random || !p->execfn)
+        return 0;
+
+    while (p->argv[n_argv]) n_argv++;
+    while (p->envp[n_envp]) n_envp++;
+
+    /* ── sizes: refuse up front if the whole image cannot fit ── */
+    str_bytes = 0;
+    for (i = 0; i < n_argv; i++) str_bytes += lab_strlen(p->argv[i]) + 1;
+    for (i = 0; i < n_envp; i++) str_bytes += lab_strlen(p->envp[i]) + 1;
+    str_bytes += lab_strlen(p->execfn) + 1;
+    str_bytes += lab_strlen(platform) + 1;
+    str_bytes += LINUX_AT_RANDOM_BYTES;
+
+    /* +16 covers the alignment pad the loop below may subtract; without it
+     * an image that fits only to within a pad byte would wrap the offset. */
+    if (str_bytes + LAB_AUX_BYTES + (n_envp + 1) * 8u
+                             + (n_argv + 1) * 8u + 8u + 16u > region_bytes)
+        return 0;   /* would not fit: refused, caller sizes the allocation */
+
+    /* ── anchors, top-down: strings pinned at the region's top ── */
+    str_off = region_bytes - str_bytes;
+    /* pad sits between auxv and the strings; first make auxv 8-aligned ── */
+    ptr_pad = (str_off - LAB_AUX_BYTES) % 8u;
+    for (;;) {
+        size_t a_off = str_off - LAB_AUX_BYTES - ptr_pad;
+        size_t e_off = a_off - (n_envp + 1) * 8u;
+        size_t v_off = e_off - (n_argv + 1) * 8u;
+        size_t c_off = v_off - 8u;
+        /* psABI: %rsp is 16-byte aligned at process entry — checked on the
+         * ABSOLUTE address, since the region's own alignment is the
+         * caller's to choose and an offset-only check would assume it. */
+        if ((((uintptr_t)region + c_off) % 16u) == 0) break;
+        ptr_pad += 8u;   /* one more 8-byte pad flips rsp's parity */
+    }
+
+    aux_off  = str_off - LAB_AUX_BYTES - ptr_pad;
+    envp_off = aux_off - (n_envp + 1) * 8u;
+    argv_off = envp_off - (n_argv + 1) * 8u;
+    argc_off = argv_off - 8u;
+    str_off  = region_bytes - str_bytes;
+
+    lab_memzero(region + argc_off, region_bytes - argc_off);
+
+    /* ── strings + AT_RANDOM ──────────────────────────────────────────────
+     * Strings land at the TOP of the used span; the pointer arrays live at
+     * known offsets below them, so each string is copied while its pointer
+     * is written straight into its slot — no intermediate arrays, no 1 KiB
+     * of kernel stack, and the caller's const argv/envp are never mutated. */
+    w = region + str_off;
+    {
+        uint64_t execfn_va, platform_va, random_va;
+        uint64_t *argv_out = (uint64_t *)(void *)(region + argv_off);
+        uint64_t *envp_out = (uint64_t *)(void *)(region + envp_off);
+        const char *s;
+
+        for (i = 0; i < n_argv; i++) {
+            argv_out[i] = (uint64_t)(uintptr_t)w;
+            s = p->argv[i];
+            while (*s) *w++ = (uint8_t)*s++;
+            *w++ = 0;
+        }
+        argv_out[n_argv] = 0;
+        for (i = 0; i < n_envp; i++) {
+            envp_out[i] = (uint64_t)(uintptr_t)w;
+            s = p->envp[i];
+            while (*s) *w++ = (uint8_t)*s++;
+            *w++ = 0;
+        }
+        envp_out[n_envp] = 0;
+        execfn_va = (uint64_t)(uintptr_t)w;
+        s = p->execfn;
+        while (*s) *w++ = (uint8_t)*s++;
+        *w++ = 0;
+        platform_va = (uint64_t)(uintptr_t)w;
+        s = platform;
+        while (*s) *w++ = (uint8_t)*s++;
+        *w++ = 0;
+        random_va = (uint64_t)(uintptr_t)w;
+        lab_memcpy(w, p->at_random, LINUX_AT_RANDOM_BYTES);
+        w += LINUX_AT_RANDOM_BYTES;
+
+        /* ── auxv, ascending type order, AT_NULL terminated ── */
+        {
+            uint64_t *aux = (uint64_t *)(void *)(region + aux_off);
+            size_t a = 0;
+#define AUX(t, v) do { aux[a++] = (uint64_t)(t); aux[a++] = (uint64_t)(v); } while (0)
+            AUX(LINUX_AT_PHDR,     p->phdr_vaddr);
+            AUX(LINUX_AT_PHENT,    p->phent);
+            AUX(LINUX_AT_PHNUM,    p->phnum);
+            AUX(LINUX_AT_PAGESZ,   LINUX_PAGE_SIZE);
+            AUX(LINUX_AT_BASE,     0);            /* static image: no interp base */
+            AUX(LINUX_AT_ENTRY,    p->entry_vaddr);
+            AUX(LINUX_AT_PLATFORM, platform_va);
+            AUX(LINUX_AT_HWCAP,    0);
+            AUX(LINUX_AT_CLKTCK,   LINUX_CLKTCK);
+            AUX(LINUX_AT_SECURE,   0);
+            AUX(LINUX_AT_RANDOM,   random_va);
+            AUX(LINUX_AT_HWCAP2,   0);
+            AUX(LINUX_AT_EXECFN,   execfn_va);
+            /* LINUX_AT_SYSINFO_EHDR is absent: there is no vDSO (§5.2/§5.5). */
+            AUX(LINUX_AT_NULL,     0);
+#undef AUX
+        }
+
+        /* ── argc ── (argv/envp were written as the strings were copied) */
+        *(uint64_t *)(void *)(region + argc_off) = (uint64_t)n_argv;
+    }
+
+    return (uint64_t)(uintptr_t)(region + argc_off);
+}
