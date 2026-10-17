@@ -538,6 +538,82 @@ checkpoint/restore integration is the increment AFTER the task can park in
 a forwarded syscall — because that parked state is exactly what §8 says a
 checkpoint serializes.
 
+### 10.6 What has landed — increment 2 (the personality, the branch, the capture)
+
+The first mechanism, and the whole of §3.3's steps 1–4 — with step 6's
+sidecar deliberately still owed. What exists now:
+
+- **The personality, stamped at spawn.** `PROC_PERSONALITY_SLS` (0) /
+  `PROC_PERSONALITY_LINUX` (1) live in `kernel/linux_abi.h`; the field is
+  `ProcessDescriptor.personality` (`kernel/process.h`), reset by
+  `proc_clear_resume_state()` so a reused slot can never inherit one, and
+  stamped inside `cap_create_sidecar_in_personality()` — before the HELD
+  release, so a schedulable task never carries the wrong personality. The
+  spawn is `SYS_SLS_LINUX_SPAWN` (328, unique across every `SYS_SLS_*`
+  define): the same manifest path and the same request struct as 310, one
+  argument different, and therefore the same E2 `sidecar_authority` gate —
+  which lives inside the create both syscalls share (§11 Q3's answer, as
+  proposed). An unknown personality value is refused `CAP_EINVAL` rather
+  than stored.
+- **The capture.** `PerCPUData` gains the sibling block `linux_args[6]`
+  at `[gs:0x50..0x80)` — appended, with the existing offsets frozen by
+  `_Static_assert`s (`syscall_regs` at 0x10, `linux_args` at 0x50, size
+  0x80) so a C-side reorder is a build error instead of a silent desync
+  with the asm's literals. `syscall_entry_stub` writes all six registers
+  after its pushes and BEFORE any call — the §3.4 rule, inherited from
+  the live failure that produced `syscall_regs`. The capture is
+  unconditional for the honest first cut: six stores on the SLS path,
+  nothing read; a personality-gated capture needs the personality in a
+  register at trap time and is deferred with §3.7's fast path.
+- **The branch.** `do_syscall()`'s FIRST act is the personality
+  predicate, ahead of the driver-SDK switch and the legacy chain: a Linux
+  task's trap reads the capture (`proc_read_linux_args()`), builds the
+  §3.4 request through the pure `linux_syscall_describe()`, logs the
+  number and its census class by name, and refuses with `-LINUX_ENOSYS` —
+  a Linux errno, never a CAP-family value (§5.7). A non-Linux caller
+  takes exactly the path it always took.
+
+**Host test** (`tests/linux_personality_host_test.c`, 19 checks): the
+predicate's truth table including the "an unrecognised personality
+intercepts nothing" case (§10.3's inversion is its sabotage tooth),
+`PROC_PERSONALITY_SLS == 0` (BSS zero-init is the safe default), the
+request struct's ABI as literals (72 bytes; num 0, args 8, ret 56,
+status 64 — increment 3's channel post and the Rust mirror build against
+these), and `describe()` as the pure copy it claims (poisoned in, ret and
+status zeroed out, NULL capture defined).
+
+**Source guard** (`tests/linux_personality_check.sh`, 18 clauses, no
+`GUARD-KIND` — source-only, so it runs everywhere) because none of the
+wiring is observable without a boot: the six captures at their exact
+offsets and above the stub's first call; the predicate before the first
+`switch (num)`; the refusal value; the slot reset; the create's stamp;
+`sys_sls_linux_spawn` passing LINUX; the E2 gate still present; 328's
+uniqueness across the number space. Its smoke
+(`tests/linux_personality_check_smoke.sh`) proves eight teeth, each
+mutating a COPY (the real tree is never touched) and each required to
+redden naming its clause: a capture deleted, a capture redirected onto a
+frozen `syscall_regs` offset, the static assert dropped, the predicate
+inverted to SLS, the branch dead-coded, the spawn's LINUX argument
+dropped, the slot reset deleted, the authority gate neutralised — plus a
+restore check on the real tree. Verified: guard 18/18 (exit 0); smoke
+9/9 including the restore (exit 0); the five touched TUs
+(`cap.c`, `process.c`, `syscall_dispatch.c`, `linux_abi.c`,
+`user_paging.c`) syntax-check clean under freestanding flags.
+
+**What this increment is NOT.** No forwarding: a Linux task's every
+syscall is refused `-ENOSYS`, because the channel delivery and park /
+resume (§3.3 steps 5–7) are increment 3 — and so is the sidecar core
+that answers. No initial stack or ELF exec path yet (the spawn creates
+the task through the sidecar manifest path, not through a Linux
+`execve`); no `fs_base` (increment 4); no `brk`/`mmap` budget (5); no
+boot guard — `tests/linux_abi_shim_check.sh` and its
+`E7_TOOTH=personality-fallthrough` arm need a running Linux task, which
+needs increment 3 to be anything but an `ENOSYS` machine. Until then the
+guard above is what holds the routing, and it is deliberately source-
+level: it can prove the branch is WIRED correctly, not that it FIRES —
+and this document says which rather than letting a green guard imply
+both.
+
 ---
 
 ## 11. Open questions for review
@@ -560,6 +636,9 @@ Everything this document asserts about the tree, with its source:
 | The errno map is total over both families and the `CAP_NONE` sentinel, with the reverse defined only on unique preimages | `kernel/linux_abi.h`/`.c`; `tests/linux_errno_map_host_test.c` (51 checks, §10.5) |
 | Every census number — traced and vDSO-declared — has a dispatch class, and the SLS overlaps 105/160/320 are UNKNOWN | `tests/linux_syscall_table_host_test.c` (42 checks) over `tools/linux_syscall_census.txt` |
 | The initial stack builder emits the canonical psABI image with §5.2's AT_* set, no `AT_SYSINFO_EHDR`, and refuses by returning 0 | `tests/linux_initial_stack_host_test.c` (40 checks) |
+| A Linux-personality task's trap describes-and-refuses before any number chain, from arguments captured before any call | `kernel/syscall_dispatch.c` (`do_syscall`'s first branch); `arch/x86/syscall.asm`'s `[gs:0x50..0x80)` stores; `tests/linux_personality_check.sh` clauses C/C1/D |
+| The personality is explicit at spawn (328), stamped inside the create, gated by E2's `sidecar_authority`, and reset at every slot reuse | `kernel/cap.c` — `cap_create_sidecar_in_personality()`, `sys_sls_linux_spawn()`; `kernel/process.c` — `proc_clear_resume_state()`; guard clauses E/F |
+| The frozen per-CPU offsets are a BUILD error to move, and the request ABI is pinned as literals | `arch/x86/user_paging.h` static asserts; `tests/linux_personality_host_test.c` (19 checks) |
 | SLS ABI: `rax` = num, `rdi` = one request pointer | `kernel/syscall_dispatch.h`; `user/libsls/sls.h`; `user/aerosls/src/syscall.rs` |
 | `syscall_regs[8]` at `[gs:0x10..0x48]`, and the live late-read failure | `arch/x86/user_paging.h` |
 | Gate: `EFER`, `STAR` (`0x23`/`0x1B`), `LSTAR`, `SFMASK`, GS bases; **no FS base** | `arch/x86/user_paging.c`, `syscall_gate_init()` |

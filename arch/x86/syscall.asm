@@ -70,6 +70,23 @@ syscall_entry_stub:
     mov [gs:0x40], rbx
     mov [gs:0x48], rbp
 
+    ; E7 (increment 2, Linux ABI Shim Design §3.4): the six Linux argument
+    ; registers, to the SIBLING per-CPU block [gs:0x50..0x80), BEFORE any
+    ; call and before the number chain — for the same reason the block
+    ; above exists: a Linux-personality task's arguments live only in
+    ; rdi/rsi/rdx/r10/r8/r9, and the entry path DESTROYS them by the time
+    ; C could look (`mov rsi,rdi; mov rdi,rax` in .unknown_syscall). The
+    ; SLS path pays six stores and reads nothing; capturing unconditionally
+    ; is the honest first cut — a personality-gated capture would need the
+    ; personality in a register here, and the fast path is deferred to a
+    ; measurement (§3.7), not assumed.
+    mov [gs:0x50], rdi
+    mov [gs:0x58], rsi
+    mov [gs:0x60], rdx
+    mov [gs:0x68], r10
+    mov [gs:0x70], r8
+    mov [gs:0x78], r9
+
     ; ── Route on syscall number in RAX ───────────────────────────────────────
     cmp rax, 105
     je  .do_sls_allocate

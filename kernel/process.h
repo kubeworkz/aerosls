@@ -146,6 +146,17 @@ struct ProcessDescriptor {
                                        // (0 = spawned from kernel context).
     uint32_t   partition_id;          // Phase 9 (LPAR): partition_get_for_uid(owner_uid)
                                        // at spawn time — see partition.h
+    uint32_t   personality;           // E7 (Linux ABI Shim Design §3.3): what this
+                                       // task's rax MEANS at the trap —
+                                       // PROC_PERSONALITY_SLS (0, default) or
+                                       // PROC_PERSONALITY_LINUX (1). Values live in
+                                       // kernel/linux_abi.h; the trap branch reads it
+                                       // before ANY number chain (do_syscall), which
+                                       // is what keeps Linux 105 (setuid) from being
+                                       // interpreted as SLS 105 (SYS_SLS_ALLOCATE).
+                                       // Stamped at spawn (cap_create_sidecar_in),
+                                       // reset by proc_clear_resume_state() so a
+                                       // reused slot can never inherit it.
     ProcState  state;
     ProcPriority priority;             // Navigator-Parity Gap Roadmap Phase 4:
                                        // defaults to PROC_PRIO_NORMAL at spawn
@@ -469,6 +480,16 @@ void process_exit(uint32_t exit_code);
 // kernel_enter_ring3). Returns NULL if no Ring-3 process is currently
 // running (e.g. a call made from pure kernel context).
 struct ProcessDescriptor* process_find_current(void);
+
+/* E7 (increment 2): read this CPU's captured Linux argument registers
+ * (arch/x86/syscall.asm's sibling block at [gs:0x50..0x80)) into out[6]
+ * in capture order (rdi, rsi, rdx, r10, r8, r9). A named function rather
+ * than inline asm at each site, for the same reason arch_read_cr3() is:
+ * the %%gs read is privileged-adjacent and belongs in ONE place. Returns
+ * 1 if a capture was read, 0 if called from a context with no per-CPU
+ * syscall scratch (pure kernel context). */
+int proc_read_linux_args(uint64_t out[6]);
+
 uint32_t sys_sls_getppid(void);
 uint32_t sys_sls_yield(void);   /* SYS_SLS_YIELD (300) — Phase 1.5 immediate-wake handback */
 

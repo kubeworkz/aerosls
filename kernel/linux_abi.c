@@ -162,6 +162,24 @@ const char *linux_syscall_class_name(enum LinuxSyscallClass cls)
     }
 }
 
+/* ─── The personality (E7 increment 2) ───────────────────────────────────── */
+int linux_personality_intercepts(uint32_t personality)
+{
+    return personality == PROC_PERSONALITY_LINUX;
+}
+
+void linux_syscall_describe(struct SLSLinuxSyscallRequest *req,
+                            uint64_t num, const uint64_t args[6])
+{
+    size_t i;
+    if (!req) return;
+    req->num = num;
+    for (i = 0; i < 6; i++)
+        req->args[i] = args ? args[i] : 0;
+    req->ret    = 0;   /* no answer exists until the sidecar gives one */
+    req->status = 0;
+}
+
 /* ─── The initial stack and auxv (§5.2) ────────────────────────────────────
  * Byte-exact layout, low address (returned rsp) upward — the canonical
  * process-entry image a static libc walks:

@@ -10,6 +10,7 @@
 #include "cap.h"   /* Seed Kernel Phase 1: strong cap_current_pid()/cap_proc_cr3() below */
 #include "console_service.h"  /* deferred console drain (single-CPU park-wake cadence) */
 #include "syscall_dispatch.h"   /* Seed Kernel Phase 1.5: do_syscall() from cap_recv_resume() */
+#include "linux_abi.h"   /* E7 increment 2: PROC_PERSONALITY_* for proc_clear_resume_state() */
 
 /* Seed Kernel Phase 1.5: the resume path iretq's into cap_recv_resume(),
  * which re-runs the parked recv and then jumps to the syscall stub's shared
@@ -110,6 +111,39 @@ static void proc_clear_resume_state(struct ProcessDescriptor* pd) {
     pd->pending_teardown = 0;
     pd->resume_control = 0;   /* E1: the control plane's own resume shape */
     pd->yield_deadline = 0;
+    /* E7 (increment 2): a reused slot must not inherit a personality. The
+     * consequence of getting this wrong is not a wrong return value — it is
+     * the next occupant's SLS syscall being read through the LINUX branch
+     * (or vice versa) because the slot remembered who lived there before.
+     * Spawn paths that want LINUX stamp it after this, inside the same
+     * create call (cap_create_sidecar_in_personality), so no window exists
+     * where a schedulable task carries the wrong personality. */
+    pd->personality = PROC_PERSONALITY_SLS;
+}
+
+/* E7 (increment 2): read this CPU's captured Linux argument registers.
+ * The idiom is proc_park_capture's own (process.c's %%gs reads): the asm
+ * stub wrote these to the per-CPU sibling block at [gs:0x50..0x80) before
+ * any call — the entry frame on the syscall stack is NOT safe to read
+ * late (the -O2 call chain reuses it; the live failure that produced
+ * syscall_regs is recorded in arch/x86/user_paging.h). Kernel context
+ * (no syscall in flight) still reads whatever the last trap left; the
+ * caller gates on the CURRENT PROCESS's personality, which is only
+ * LINUX inside a Linux task's own trap, so the values always describe
+ * the syscall being described. */
+int proc_read_linux_args(uint64_t out[6]) {
+    if (!out) return 0;
+    __asm__ volatile("movq %%gs:0x50, %0\n\t"
+                     "movq %%gs:0x58, %1\n\t"
+                     "movq %%gs:0x60, %2\n\t"
+                     "movq %%gs:0x68, %3\n\t"
+                     "movq %%gs:0x70, %4\n\t"
+                     "movq %%gs:0x78, %5\n\t"
+                     : "=r"(out[0]), "=r"(out[1]), "=r"(out[2]),
+                       "=r"(out[3]), "=r"(out[4]), "=r"(out[5])
+                     :
+                     : "memory");
+    return 1;
 }
 
 // ─── process_init ─────────────────────────────────────────────────────────────

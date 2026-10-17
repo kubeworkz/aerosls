@@ -33,6 +33,7 @@
 #include "usage_metering.h" // Multitenant Isolation Gap Analysis §5 item 6 -- SYS_SLS_USAGE_REPORT
 #include "../net/consensus.h" // Multi-Node Partition Scaling Roadmap Phase 7 addendum -- SYS_SLS_CLUSTER_INIT/STATUS
 #include "cap.h"            // Seed Kernel Phase 1 -- SYS_SLS_CAP_* (289-297)
+#include "linux_abi.h"      // E7 increment 2 -- the Linux-personality branch (§3.3)
 
 // ─── spawn owner-uid resolution ──────────────────────────────────────────────
 // The owner_uid threaded into program_spawn*()/program_load()/sys_sls_load()
@@ -70,6 +71,41 @@ static uint64_t sls_legacy_allocate(void* arg) {
 
 // ─── do_syscall ───────────────────────────────────────────────────────────────
 uint64_t do_syscall(uint64_t num, void* arg) {
+    /* ── E7 (increment 2): the Linux-personality branch (D1, §3.3) ────────
+     * The FIRST thing the dispatcher does, before the driver-SDK switch and
+     * before the legacy chain, because the personality decides what `num`
+     * MEANS (§2.2): for a Linux task, rax=105 is setuid and must never be
+     * read as SYS_SLS_ALLOCATE. A non-Linux caller takes exactly the path it
+     * always took — one predictable branch, no behavior change.
+     *
+     * The branch DESCRIBES and refuses, by name, for now: the six captured
+     * argument registers are read from the per-CPU sibling block (the entry
+     * path destroyed the real ones before C could see them, §3.4), the
+     * request is built by the pure describe(), the class is looked up from
+     * the census table — and the answer is -ENOSYS, a LINUX errno, never a
+     * CAP code: this task was compiled against Linux's numbering, and
+     * returning a CAP-family negative would put a value no errno can
+     * produce into its error path (§5.7). Channel delivery and park/resume
+     * (increment 3) replace the refusal with the sidecar's answer; the
+     * routing, the capture and the number-space separation are what THIS
+     * increment lands, and they must not wait on the sidecar. */
+    {
+        struct ProcessDescriptor* cur = process_find_current();
+        if (cur && linux_personality_intercepts(cur->personality)) {
+            uint64_t largs[6];
+            struct SLSLinuxSyscallRequest req;
+            proc_read_linux_args(largs);
+            linux_syscall_describe(&req, num, largs);
+            kernel_serial_printf(
+                "[E7] linux syscall %lu (class=%s) refused: forwarding "
+                "lands with increment 3\n",
+                (unsigned long)num,
+                linux_syscall_class_name(linux_syscall_class(num)));
+            (void)req;   /* increment 3 posts THIS to the sidecar's channel */
+            return (uint64_t)(int64_t)(-LINUX_ENOSYS);
+        }
+    }
+
     /* Driver SDK block (307-309, 316-318): routed EXPLICITLY, before the
      * legacy switch. GCC builds one jump table for the legacy dense case
      * range (up to ~213) and the sparse high cases were unreachable
@@ -612,6 +648,14 @@ uint64_t do_syscall(uint64_t num, void* arg) {
     // ring-3 (async, HELD until parent provisions resources).
     case SYS_SLS_CREATE_SIDECAR:
         return sys_sls_create_sidecar((struct SLSCreateSidecarRequest*)arg);
+
+    // ─── E7 increment 2: the Linux-personality spawn (328) ───────────────
+    // The same request struct as 310 (SLSCreateSidecarRequest); the
+    // personality rides the syscall NUMBER, never the bytes (§5.1). The E2
+    // sidecar_authority gate lives inside the callee, so both numbers are
+    // gated identically.
+    case SYS_SLS_LINUX_SPAWN:
+        return sys_sls_linux_spawn((struct SLSCreateSidecarRequest*)arg);
 
     // ─── POSIX-Environments E3: allocate a contiguous physical region (320)
     // charged to the caller's partition, for a POSIX environment's private

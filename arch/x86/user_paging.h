@@ -2,6 +2,7 @@
 #define USER_PAGING_H
 
 #include <stdint.h>
+#include <stddef.h>   // offsetof — the frozen-offset static asserts below
 
 // ─── Page flag constants for user-space mappings ─────────────────────────────
 #define USER_PTE_PRESENT  (1ULL << 0)
@@ -46,7 +47,31 @@ struct PerCPUData {
     // syscall entry; it is only read mid-syscall by the current process,
     // so the values always describe the CURRENT syscall.
     uint64_t syscall_regs[8];
+    // offset 0x50: E7 (increment 2, Linux ABI Shim Design §3.4) — the six
+    // Linux argument registers, captured by syscall_entry_stub BEFORE any
+    // call, in a SIBLING block rather than a widening of syscall_regs:
+    // [0x50]=rdi, [0x58]=rsi, [0x60]=rdx, [0x68]=r10, [0x70]=r8, [0x78]=r9.
+    // A Linux-personality task passes six values where the SLS ABI passes
+    // one pointer, and the entry path clobbers the argument registers
+    // (`mov rsi,rdi; mov rdi,rax` in .unknown_syscall) before C sees them —
+    // so the ONLY safe read is this capture, done before any call for the
+    // same reason syscall_regs is: the -O2 call chain may reuse the entry
+    // frame. The existing offsets are frozen by the static asserts below;
+    // this block is appended, never interleaved.
+    uint64_t linux_args[6];
 };
+
+/* The offsets the asm addresses literally. These exist so a C-side reorder
+ * of PerCPUData becomes a BUILD error instead of a silent desync with
+ * arch/x86/syscall.asm, whose [gs:0xNN] literals cannot be checked by the
+ * compiler. The asm side of the same contract is held by clause B/C of
+ * tests/linux_personality_check.sh. */
+_Static_assert(offsetof(struct PerCPUData, syscall_regs) == 0x10,
+               "syscall_regs must stay at [gs:0x10]: syscall.asm addresses it literally");
+_Static_assert(offsetof(struct PerCPUData, linux_args) == 0x50,
+               "linux_args must stay at [gs:0x50]: syscall.asm addresses it literally");
+_Static_assert(sizeof(struct PerCPUData) == 0x80,
+               "PerCPUData grows only by appending — every existing offset is frozen");
 
 extern struct PerCPUData per_cpu_data[4];  // one slot per core
 

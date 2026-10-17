@@ -47,6 +47,7 @@
  * behavior (CAP_EAGAIN) so host tests run without the scheduler.
  */
 #include "cap.h"
+#include "linux_abi.h"   // E7 increment 2: PROC_PERSONALITY_* for the spawn stamp
 #include "kernel_io.h"
 #include "frame_pool.h"
 #include "process.h"
@@ -3288,10 +3289,11 @@ static uint32_t bib_flags = 0;
 
 void cap_set_bib_flags(uint32_t flags) { bib_flags = flags; }
 
-int cap_create_sidecar_in(uint32_t parent_pid,
+int cap_create_sidecar_in_personality(uint32_t parent_pid,
                           const void* manifest, uint32_t manifest_len,
                           uint16_t parent_ch_w, uint16_t console_ch_w,
-                          uint16_t* out_ch_r, uint32_t target_partition) {
+                          uint16_t* out_ch_r, uint32_t target_partition,
+                          uint32_t personality) {
     if (out_ch_r) *out_ch_r = CAP_NONE;
     (void)console_ch_w;  /* reserved: parent sends console cap via messenger */
     if (!manifest || manifest_len < SIDECAR_MANIFEST_HEADER_LEN)
@@ -3714,6 +3716,22 @@ int cap_create_sidecar_in(uint32_t parent_pid,
     /* ── 7. Populate process descriptor ──────────────────────────────── */
     struct ProcessDescriptor* pd = &proc_table[pi];
     pd->pid        = alloc_pid();
+    /* E7 (increment 2): the child's personality, stamped HERE — inside the
+     * create, after the E2 authority gate (step 4) and before the HELD
+     * release at the end — so the task is schedulable only with the
+     * personality it was spawned with. proc_clear_resume_state() reset the
+     * slot to PROC_PERSONALITY_SLS at spawn init; this is the only place a
+     * Linux personality is ever set. An unknown value is refused rather
+     * than stored: a personality no branch claims would be a task whose
+     * traps nobody interprets. */
+    if (personality != PROC_PERSONALITY_SLS &&
+        personality != PROC_PERSONALITY_LINUX) {
+        kernel_serial_printf(
+            "[CS] CAP_EINVAL: unknown personality %u for pid=%u\n",
+            personality, pd->pid);
+        return CAP_EINVAL;
+    }
+    pd->personality = personality;
     if (m.name_len > 0) {
         /* Use the manifest's NAME record for the debug name. */
         uint32_t nl = (m.name_len < PROC_NAME_LEN - 1) ? (uint32_t)m.name_len
@@ -4361,6 +4379,19 @@ static uint16_t sidecar_find_parent_ch_w(uint32_t parent_pid, uint16_t ch_r) {
 }
 
 /* ─── sys_sls_create_sidecar ──────────────────────────────────────────────── */
+/* The personality-carrying create IS the create: the legacy wrapper passes
+ * PROC_PERSONALITY_SLS, so every pre-E7 caller's child is byte-for-byte
+ * what it was before this parameter existed (and a zeroed slot is the same
+ * default — PROC_PERSONALITY_SLS is 0). */
+int cap_create_sidecar_in(uint32_t parent_pid,
+                          const void* manifest, uint32_t manifest_len,
+                          uint16_t parent_ch_w, uint16_t console_ch_w,
+                          uint16_t* out_ch_r, uint32_t target_partition) {
+    return cap_create_sidecar_in_personality(parent_pid, manifest, manifest_len,
+                                             parent_ch_w, console_ch_w, out_ch_r,
+                                             target_partition, PROC_PERSONALITY_SLS);
+}
+
 uint64_t sys_sls_create_sidecar(struct SLSCreateSidecarRequest* req) {
     if (!req) return (uint64_t)(int64_t)CAP_EINVAL;
     uint16_t ch_r = CAP_NONE;
@@ -4368,6 +4399,26 @@ uint64_t sys_sls_create_sidecar(struct SLSCreateSidecarRequest* req) {
                                   req->manifest, req->manifest_len,
                                   req->ch_w_idx, req->console_w_idx,
                                   &ch_r, req->target_partition);
+    if (r < 0) return (uint64_t)(int64_t)r;
+    req->out_ch_r = ch_r;
+    req->out_ch_w = sidecar_find_parent_ch_w(cap_current_pid(), ch_r);
+    return (uint64_t)ch_r;
+}
+
+/* ─── sys_sls_linux_spawn (328) — E7 increment 2 ──────────────────────
+ * The same request, the same flow, the LINUX personality — and therefore
+ * the same E2 `sidecar_authority` gate, because it lives inside
+ * cap_create_sidecar_in_personality, which this calls. A non-authorised
+ * process gets CAP_EPERM for this number exactly as it does for 310; the
+ * two syscalls differ in ONE argument to the same function. */
+uint64_t sys_sls_linux_spawn(struct SLSCreateSidecarRequest* req) {
+    if (!req) return (uint64_t)(int64_t)CAP_EINVAL;
+    uint16_t ch_r = CAP_NONE;
+    int r = cap_create_sidecar_in_personality(cap_current_pid(),
+                                  req->manifest, req->manifest_len,
+                                  req->ch_w_idx, req->console_w_idx,
+                                  &ch_r, req->target_partition,
+                                  PROC_PERSONALITY_LINUX);
     if (r < 0) return (uint64_t)(int64_t)r;
     req->out_ch_r = ch_r;
     req->out_ch_w = sidecar_find_parent_ch_w(cap_current_pid(), ch_r);

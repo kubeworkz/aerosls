@@ -183,4 +183,40 @@ struct LinuxInitStackParams {
 uint64_t linux_initial_stack_build(uint8_t *region, size_t region_bytes,
                                    const struct LinuxInitStackParams *p);
 
+/* ─── The personality (E7 increment 2, §3.3/§3.5) ─────────────────────────
+ * A task's personality decides what its `rax` MEANS at the trap, and it is
+ * explicit at spawn — never inferred from bytes (§5.1) — so the values
+ * live here, with the rest of E7's contracts, and struct ProcessDescriptor
+ * carries the field (kernel/process.h). PROC_PERSONALITY_SLS is 0: a
+ * zeroed slot — every slot at boot, every slot before its stamp — is the
+ * SLS personality, so the safe default is the one BSS already provides
+ * and a stale slot is the failure proc_clear_resume_state() refuses. */
+#define PROC_PERSONALITY_SLS    0u   /* the existing SLS ring-3 ABI (default) */
+#define PROC_PERSONALITY_LINUX  1u   /* Linux x86-64 ABI: rax = Linux number */
+
+/* 1 iff a task with this personality takes the Linux branch (describe and
+ * forward) rather than the number chains. The whole number-space safety
+ * property (§2.2) rests on this predicate being consulted before any
+ * `case`/`cmp`: a Linux task's rax = 105 is setuid, not SYS_SLS_ALLOCATE. */
+int linux_personality_intercepts(uint32_t personality);
+
+/* ─── The forwarded request (§3.4) ────────────────────────────────────────
+ * A DESCRIPTION, not an interpretation: the kernel knows the Linux
+ * argument POSITIONS (ABI, not policy) and nothing about what `num` means.
+ * Fixed-size so it crosses a channel unchanged; the six values are the
+ * ones the trap path captured to the per-CPU sibling block before any
+ * call (arch/x86/syscall.asm's linux_args[6], pinned at [gs:0x50..0x80)). */
+struct SLSLinuxSyscallRequest {
+    uint64_t num;        /* the Linux syscall number, as it arrived in rax */
+    uint64_t args[6];    /* rdi, rsi, rdx, r10, r8, r9 — capture order */
+    uint64_t ret;        /* the sidecar's return value (increment 3 fills) */
+    int32_t  status;     /* the sidecar's CAP_ERR_* or CAP_E* status, mapped
+                          * to a Linux errno on the return path (§5.7) */
+};
+
+/* Build the request from the captured values. Pure: ret/status are zeroed,
+ * so what a caller reads before an answer exists is defined, not stale. */
+void linux_syscall_describe(struct SLSLinuxSyscallRequest *req,
+                            uint64_t num, const uint64_t args[6]);
+
 #endif /* LINUX_ABI_H */

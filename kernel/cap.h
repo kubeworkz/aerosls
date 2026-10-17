@@ -1049,6 +1049,34 @@ int cap_create_sidecar(uint32_t parent_pid,
                        uint16_t parent_ch_w, uint16_t console_ch_w,
                        uint16_t* out_ch_r);
 
+/* ─── SYS_SLS_LINUX_SPAWN (328) — E7 increment 2 (Linux ABI Shim Design
+ * §3.3/§3.5, and §11 Q3's settled answer) ──────────────────────────────────
+ * Creates a Linux-PERSONALITY task through the SAME manifest path as
+ * SYS_SLS_CREATE_SIDECAR — same parser, same caps, same partition rules,
+ * and above all the same E2 gate inside cap_create_sidecar_in_personality:
+ * the caller must hold `sidecar_authority`, so only the sidecar creator
+ * tree (init -> DM -> the environment's POSIX sidecar) can spawn one, and
+ * every cap the child gets is one the manifest asked for. The personality
+ * is stamped inside the create, before the child is released, so no
+ * schedulable task ever carries the wrong personality — a follow-up
+ * "tag the child" syscall could not promise that: the child released by
+ * the create runs on the next tick.
+ *
+ * The manifest is unchanged on purpose: personality is explicit at spawn
+ * (§5.1 — never inferred from bytes), and the syscall NUMBER is the
+ * explicitness. The request struct is SLSCreateSidecarRequest itself,
+ * including its OUT fields, so the caller's provisioning flow is byte-for-
+ * byte the one it already knows. 328 is next after PLACEMENT_CAN_HOLD
+ * (327); confirmed via grep across every kernel header defining SYS_SLS_*. */
+#define SYS_SLS_LINUX_SPAWN 328
+
+int cap_create_sidecar_in_personality(uint32_t parent_pid,
+                          const void* manifest, uint32_t manifest_len,
+                          uint16_t parent_ch_w, uint16_t console_ch_w,
+                          uint16_t* out_ch_r, uint32_t target_partition,
+                          uint32_t personality);
+uint64_t sys_sls_linux_spawn(struct SLSCreateSidecarRequest* req);
+
 /* POSIX-Environments E1: the boot-context flags written into every BIB this
  * kernel fills (SIDECAR_BIB_FLAG_*). Set once at boot — kernel_main sets
  * SIDECAR_BIB_FLAG_UNIFIED before the init sidecar is created — and read by
