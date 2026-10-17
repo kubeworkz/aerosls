@@ -2216,10 +2216,19 @@ guard diagnosed the lost precondition (`node N is no longer LEADER`) and
 re-ran itself against whoever led now (restarts 1 and 2 of 3; a leader
 that lost its role never puts the env name into another broadcast, because
 the env lives on ITS tree), and the warm third run carried the whole
-choreography through, classification line included. Its teeth are 29,
+choreography through, classification line included. Its teeth are 31,
 proven on every push by `tests/failover_adoption_live_smoke.sh` (3 fake
-nodes); the churn and self-restart paths are live-only and named as the
-smoke's one gap.
+nodes) -- including the two that close the one gap those runs opened: the
+`prekillchurn` tooth flips the fake election right after the '-env'
+create (the live shape: the env create outlasted the election timeout and
+a survivor took the term), and requires the guard to diagnose the lost
+precondition, restart itself against the node that now leads, and carry
+the whole chain -- adoption, resurrect, migrate-back, lease, service --
+through against THAT node; its control pins the restart as the rescuer
+(AEROSLS_FAILOVER_MAX_RESTARTS=0 must end in the checkpoint gate's honest
+RED), and the PASS itself asserts the churned node's fake pid is dead and
+the restart note was printed. The churn self-restart is no longer
+live-only.
 
 **A third defect, found by the live runs and fixed in the same
 increment.** The environment store's restored directory carried LAST
