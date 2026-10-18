@@ -35,10 +35,25 @@
  *       not exist must answer -EBADF exactly; anything else — a short or
  *       failed write, a wrong error — issues MARKER 394 (asserted
  *       ABSENT, the 391/392/393 discipline).
+ *   12 (brk, the mem class) — E7 increment 6's budget span (§5.4): brk(0)
+ *       must come back as a page-aligned, nonzero break; brk(base+0x2000)
+ *       must ECHO the request (the grant); the fresh heap page must READ
+ *       ZERO (the kernel zero-fills every frame it maps — a recycled
+ *       frame must not carry its last tenant's bytes into this task);
+ *       writing "E7MEM-BRK-OK\n" into that page and write(1, page, 13)
+ *       must return 13 — the bytes crossing through increment 5's seam
+ *       FROM THE HEAP ITSELF is what proves the mapping is real; brk far
+ *       past the 64 KiB budget must come back as the UNCHANGED current
+ *       break (Linux's brk failure shape — the current break, NOT
+ *       -ENOMEM); mprotect(W|X) must be exactly -EPERM. Each wrong
+ *       outcome issues its own MARKER — 395 (the seam lied: bad base or
+ *       grant echo), 396 (a fresh heap page was not zero), 397 (the
+ *       budget refusal moved the break anyway), 398 (W|X was not
+ *       refused) — all asserted ABSENT, the 391/392 discipline.
  *   231 (exit_group) — the sidecar reaps; no reply is owed and this task
  *       never runs again (the hang below is unreachable by design).
  *
- * Registers: immediates only, and the one preserved value lives in r12 —
+ * Registers: immediates only, and the preserved values live in r12–r15 —
  * callee-saved, pushed by the entry stub and restored by the park/resume
  * (park_ctx) — because the kernel's SLS ABI does NOT promise the argument
  * registers survive a syscall return.
@@ -137,6 +152,91 @@ _start:
     mov     $394, %eax              /* MARKER: the fd-class seam lied */
     syscall
 .Lfd_done:
+    /* 5b. brk(0) — the mem class (E7 increment 6, §5.4): the budget
+     *    span's base must come back page-aligned and nonzero (the span
+     *    sits directly above this task's stack, decided at create from
+     *    the manifest's BUDGET record). r12 holds it across every park
+     *    below — callee-saved, like the fs block's r15. */
+    xor     %rdi, %rdi
+    mov     $12, %eax
+    syscall
+    test    %rax, %rax
+    jz      .Lmem_bad            /* zero is not a break */
+    test    $0xfff, %rax
+    jnz     .Lmem_bad            /* the span starts page-aligned */
+    mov     %rax, %r12           /* r12 = heap base */
+    /* 5c. brk(base+0x2000) — a growth INSIDE the 64 KiB budget must be
+     *    granted: rax must echo the request exactly (the kernel maps the
+     *    granted pages with fresh partition-charged frames; the sidecar's
+     *    ledger and the kernel's stamped span are the same truth). */
+    lea     0x2000(%r12), %r13
+    mov     %r13, %rdi
+    mov     $12, %eax
+    syscall
+    cmp     %r13, %rax
+    jne     .Lmem_bad            /* the grant did not echo the request */
+    /* 5d. the fresh heap page must READ ZERO — the kernel zero-fills
+     *    every frame it maps (the pool recycles frames across tasks and
+     *    partitions; an unzeroed frame would leak its last tenant's
+     *    bytes into this task's heap). A non-zero read is a different
+     *    failure than a bad grant, hence its own marker. */
+    cmpq    $0, (%r12)
+    jne     .Lmem_zero_bad
+    /* 5e. the memory is REAL: build "E7MEM-BRK-OK\n" (13 bytes) IN the
+     *    new heap page, then write(1, page, 13) through increment 5's
+     *    seam — the kernel copies the bytes out of this task's OWN
+     *    freshly-mapped heap, the fd table performs them on the console.
+     *    The string on serial IS the proof the page exists and is
+     *    writable; rax must return 13. */
+    movabs  $0x52422D4D454D3745, %rax    /* "E7MEM-BR" (little-endian) */
+    mov     %rax, (%r12)
+    movabs  $0x00000A4B4F2D4B, %rax      /* "K-OK\n" + NULs            */
+    mov     %rax, 8(%r12)
+    lea     (%r12), %rsi
+    mov     $1, %edi                /* fd 1 — the task's console      */
+    mov     $13, %edx
+    mov     $1, %eax
+    syscall
+    cmp     $13, %rax
+    jne     .Lmem_bad            /* the heap write failed or came back short */
+    /* 5f. brk(base+128 KiB) — past the 64 KiB budget: the break must NOT
+     *    move, and the answer must be the UNCHANGED current break
+     *    (r13), which is Linux's own brk failure shape — the current
+     *    break, NOT -ENOMEM. A negative rax here would be a lie no
+     *    libc's brk wrapper is written against. */
+    lea     0x20000(%r12), %r14
+    mov     %r14, %rdi
+    mov     $12, %eax
+    syscall
+    cmp     %r13, %rax
+    jne     .Lmem_budget_bad
+    /* 5g. mprotect(heap, 0x1000, PROT_WRITE|PROT_EXEC) — §5.4's W^X
+     *    refusal must come back exactly -EPERM (-1): simultaneous
+     *    write+execute is refused by the shim itself, and -1 is what the
+     *    §5.7 map delivers for CAP_EPERM (-12). prot is 0x6 — WRITE(0x2)
+     *    | EXEC(0x4); 0x3 would be READ|WRITE, which must NOT be refused. */
+    mov     %r12, %rdi
+    mov     $0x1000, %esi
+    mov     $6, %edx             /* PROT_WRITE|PROT_EXEC */
+    mov     $10, %eax
+    syscall
+    cmp     $-1, %rax
+    je      .Lmem_done
+    mov     $398, %eax           /* MARKER: W|X was not refused as -EPERM */
+    syscall
+    jmp     .Lmem_done
+.Lmem_bad:
+    mov     $395, %eax           /* MARKER: the brk seam lied (base/echo) */
+    syscall
+    jmp     .Lmem_done
+.Lmem_zero_bad:
+    mov     $396, %eax           /* MARKER: a fresh heap page was not zero */
+    syscall
+    jmp     .Lmem_done
+.Lmem_budget_bad:
+    mov     $397, %eax           /* MARKER: the budget refusal moved it */
+    syscall
+.Lmem_done:
     /* 6. exit_group(42): the sidecar reaps this task. */
     mov     $42, %edi
     mov     $231, %eax

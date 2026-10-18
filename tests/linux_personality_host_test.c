@@ -438,6 +438,184 @@ int main(void)
               "      mistaken for a root");
     }
 
+    /* ═══ E7 increment 6 (the mem class, §5.4): the budget span ══════════
+     * brk's row — "brk as a bump pointer inside a reserved span" — and
+     * mprotect's row — the W|X refusal H2's Node exclusion IS. The
+     * verdict is the re-check the resume arm performs AT the reply (the
+     * §5.3 posture one level up: a page-table write instead of an MSR
+     * write), and every branch below is a way a grant can be a LIE the
+     * kernel must refuse without mapping a single page. The frame reader
+     * is the unwind's read-back, over the same fake tables the copy's
+     * cases already build. ═══════════════════════════════════════════ */
+
+    CHECK(LINUX_BRK == 12 && LINUX_MPROTECT == 10 &&
+              LINUX_MMAP == 9 && LINUX_MUNMAP == 11,
+          "the mem numbers are the Linux ABI's — the census's own rows: "
+          "      mmap 9, mprotect 10, munmap 11, brk 12");
+    CHECK(linux_syscall_class(LINUX_BRK) == LSC_MEM &&
+              linux_syscall_class(LINUX_MPROTECT) == LSC_MEM,
+          "both landed rows are LSC_MEM — their semantics live in §5.4's "
+          "      budget policy, not in a number chain");
+    CHECK(LINUX_PROT_WRITE == 0x2u && LINUX_PROT_EXEC == 0x4u,
+          "the PROT bits are Linux mman.h's ABI: WRITE 0x2, EXEC 0x4 — "
+          "      the literals the sidecar's twin repeats");
+
+    /* ─── mprotect's W|X refusal, as a total predicate ───────────────── */
+    CHECK(linux_mprotect_refuses_wx(0x6) == 1 &&
+              linux_mprotect_refuses_wx(0x7) == 1,
+          "W|X (0x6) and RWX (0x7) are refused — the shim's own rule "
+          "      (§5.4), the refusal H2's Node exclusion rests on, decided "
+          "      from the prot word alone (no object, so the first trap "
+          "      can say it)");
+    CHECK(linux_mprotect_refuses_wx(0x0) == 0 &&
+              linux_mprotect_refuses_wx(0x1) == 0 &&
+              linux_mprotect_refuses_wx(0x2) == 0 &&
+              linux_mprotect_refuses_wx(0x4) == 0 &&
+              linux_mprotect_refuses_wx(0x5) == 0 &&
+              linux_mprotect_refuses_wx(~0x6ULL) == 0,
+          "anything without BOTH write and execute is not refused by this "
+          "      predicate — R|X stays possible; the rest is the sidecar's "
+          "      ENOSYS, not a fake grant");
+
+    /* ─── the brk verdict: the re-check at the reply ──────────────────── */
+    {   const uint64_t BASE  = 0x0000400000100000ULL;
+        const uint64_t LIMIT = BASE + 0x10000;   /* 64 KiB, page-rounded */
+        struct LinuxMemBrkVerdict v;
+
+        /* the denial echo: over-budget and shrink asks both arrive as
+         * rax == the current break (Linux's brk failure shape) */
+        v = linux_mem_brk_verdict(BASE, LIMIT, BASE + 0x2000,
+                                  BASE + 0x20000, BASE + 0x2000);
+        CHECK(v.malformed == 0 && v.map_pages == 0 &&
+                  v.map_va == 0 && v.new_cur == BASE + 0x2000,
+              "the denial echo (rax == the current break) is NOT "
+              "      malformed: the break stays, nothing maps — the "
+              "      over-budget ask's honest answer");
+
+        /* a no-op ask: brk(cur) is granted as itself, mapping nothing */
+        v = linux_mem_brk_verdict(BASE, LIMIT, BASE + 0x2000,
+                                  BASE + 0x2000, BASE + 0x2000);
+        CHECK(v.malformed == 0 && v.map_pages == 0 &&
+                  v.new_cur == BASE + 0x2000,
+              "a no-op ask (req == cur) maps nothing and is not "
+              "      malformed — brk(current) is a legal no-op");
+
+        /* the grant: two pages, from align_up(cur) — the base is
+         * page-aligned, so the range starts exactly at it */
+        v = linux_mem_brk_verdict(BASE, LIMIT, BASE, BASE + 0x2000,
+                                  BASE + 0x2000);
+        CHECK(v.malformed == 0 && v.map_va == BASE &&
+                  v.map_pages == 2 && v.new_cur == BASE + 0x2000,
+              "a granted growth maps exactly the pages between the old "
+              "      and new breaks — two for a 2-page ask");
+
+        /* a grant to exactly the limit is legal (the span is inclusive) */
+        v = linux_mem_brk_verdict(BASE, LIMIT, BASE, LIMIT, LIMIT);
+        CHECK(v.malformed == 0 && v.map_va == BASE &&
+                  v.map_pages == 0x10000 / 4096 && v.new_cur == LIMIT,
+              "a grant to exactly the span's limit is inside the span — "
+              "      the whole budget is the task's to take");
+
+        /* an UNALIGNED grant maps ceil(new) pages — and only those */
+        v = linux_mem_brk_verdict(BASE, LIMIT, BASE,
+                                  BASE + 0x1001, BASE + 0x1001);
+        CHECK(v.malformed == 0 && v.map_va == BASE &&
+                  v.map_pages == 2 && v.new_cur == BASE + 0x1001,
+              "an unaligned grant maps the pages it TOUCHES (ceil), not "
+              "      the bytes it asked for — brk is byte-granular, "
+              "      mappings are not");
+
+        /* an unaligned current break: the page CONTAINING cur is already
+         * mapped, so the next grant starts at align_up(cur) — a re-map
+         * would leak the frame underneath and zero the bytes on it */
+        v = linux_mem_brk_verdict(BASE, LIMIT, BASE + 0x1500,
+                                  BASE + 0x2500, BASE + 0x2500);
+        CHECK(v.malformed == 0 && v.map_va == BASE + 0x2000 &&
+                  v.map_pages == 1 && v.new_cur == BASE + 0x2500,
+              "after an unaligned break, the next grant maps only the "
+              "      pages ABOVE the one the break already sits in — the "
+              "      live page is never re-mapped");
+
+        /* a grant whose reply escaped the span: the kernel's own bound,
+         * whatever the policy side believed */
+        v = linux_mem_brk_verdict(BASE, LIMIT, BASE,
+                                  LIMIT + 8, LIMIT + 8);
+        CHECK(v.malformed == 1 && v.map_pages == 0 &&
+                  v.new_cur == BASE,
+              "a grant past the stamped limit is malformed — the span is "
+              "      the kernel's truth, not the grant's");
+
+        /* a "granted" shrink: rax echoes a request below the current
+         * break — v1 grows only, and nothing may ever unmap */
+        v = linux_mem_brk_verdict(BASE, LIMIT, BASE + 0x2000,
+                                  BASE + 0x1000, BASE + 0x1000);
+        CHECK(v.malformed == 1 && v.map_pages == 0 &&
+                  v.new_cur == BASE + 0x2000,
+              "a granted SHRINK is malformed: the break never moves "
+              "      backward and no page is ever unmapped by a grant");
+
+        /* a reply that is neither the grant's echo nor the refusal's */
+        v = linux_mem_brk_verdict(BASE, LIMIT, BASE + 0x2000,
+                                  BASE + 0x3000, BASE + 0x9000);
+        CHECK(v.malformed == 1 && v.map_pages == 0 &&
+                  v.new_cur == BASE + 0x2000,
+              "an rax that is neither the request's echo nor the current "
+              "      break is a malformed grant — nothing maps, the break "
+              "      stays, the caller logs it");
+
+        /* a grant below the span's base (a bogus low request) */
+        v = linux_mem_brk_verdict(BASE, LIMIT, BASE, BASE - 0x1000,
+                                  BASE - 0x1000);
+        CHECK(v.malformed == 1 && v.map_pages == 0,
+              "a grant below the stamped base is malformed — the span "
+              "      bounds the break from BOTH ends");
+    }
+
+    /* ─── the frame reader: the unwind's read-back ────────────────────── */
+    {   static uint64_t p_pml4[512] __attribute__((aligned(4096)));
+        static uint64_t p_pdpt[512] __attribute__((aligned(4096)));
+        static uint64_t p_pd[512]   __attribute__((aligned(4096)));
+        static uint64_t p_pt[512]   __attribute__((aligned(4096)));
+        static uint8_t  p_page[4096] __attribute__((aligned(4096)));
+        const uint64_t P = 1ULL, U = 4ULL, PS = 0x80ULL;
+        const uint64_t VA = 0x0000400000102000ULL;  /* the heap's own range */
+        unsigned i4 = (unsigned)((VA >> 39) & 0x1FF);
+        unsigned i3 = (unsigned)((VA >> 30) & 0x1FF);
+        unsigned i2 = (unsigned)((VA >> 21) & 0x1FF);
+        unsigned i1 = (unsigned)((VA >> 12) & 0x1FF);
+        uint64_t root = (uint64_t)(uintptr_t)p_pml4;
+
+        memset(p_pml4, 0, sizeof p_pml4);
+        memset(p_pdpt, 0, sizeof p_pdpt);
+        memset(p_pd, 0, sizeof p_pd);
+        memset(p_pt, 0, sizeof p_pt);
+        p_pml4[i4] = (uint64_t)(uintptr_t)p_pdpt | P | U;
+        p_pdpt[i3] = (uint64_t)(uintptr_t)p_pd   | P | U;
+        p_pd[i2]   = (uint64_t)(uintptr_t)p_pt   | P | U;
+        p_pt[i1]   = (uint64_t)(uintptr_t)p_page | P | U;
+
+        CHECK(linux_user_page_frame(root, VA) ==
+                  ((uint64_t)(uintptr_t)p_page & 0x000FFFFFFFFFF000ULL),
+              "the reader returns the leaf frame behind a user mapping — "
+              "      the address the unwind returns to the partition");
+
+        p_pt[i1] = (uint64_t)(uintptr_t)p_page | P;   /* supervisor leaf */
+        CHECK(linux_user_page_frame(root, VA) == 0,
+              "a supervisor leaf reads as 0 — the unwind can never free "
+              "      a frame the copy's boundaries would refuse");
+        p_pt[i1] = (uint64_t)(uintptr_t)p_page | P | U;
+
+        p_pt[i1] = 0;                                 /* absent leaf */
+        CHECK(linux_user_page_frame(root, VA) == 0,
+              "an absent leaf reads as 0 — nothing mapped, nothing freed");
+        p_pt[i1] = (uint64_t)(uintptr_t)p_page | P | U;
+
+        p_pd[i2] = (uint64_t)(uintptr_t)p_pt | P | U | PS;   /* 2 MiB */
+        CHECK(linux_user_page_frame(root, VA) == 0,
+              "a huge page reads as 0 by name — not this shim's user "
+              "      shape, exactly as the copy refuses it");
+    }
+
     printf("linux_personality_host_test: %d passed, %d failed\n",
            checks_passed, checks_failed);
     return checks_failed == 0 ? 0 : 1;

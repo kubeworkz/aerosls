@@ -61,7 +61,8 @@ bad() { echo "FAIL: $1"; fails=$((fails+1)); }
 for f in kernel/linux_abi.h kernel/linux_abi.c kernel/process.h kernel/process.c \
          kernel/cap.h kernel/cap.c kernel/syscall_dispatch.c kernel/chan.c \
          arch/x86/user_paging.h arch/x86/user_paging.c arch/x86/syscall.asm \
-         user/sidecar/src/linux.rs user/sidecar/src/entry.rs; do
+         user/sidecar/src/linux.rs user/sidecar/src/entry.rs \
+         user/sidecar/src/e7_probe.rs user/sidecar/fixtures/e7_linux_probe.S; do
     if [ ! -f "$f" ]; then
         echo "ABORT: $f missing — the guard cannot be evaluated at all." >&2
         exit 2
@@ -82,6 +83,8 @@ LABC=kernel/linux_abi.c
 CANC=kernel/chan.c
 LRS=user/sidecar/src/linux.rs
 LRE=user/sidecar/src/entry.rs
+LPRO=user/sidecar/src/e7_probe.rs
+FIX=user/sidecar/fixtures/e7_linux_probe.S
 
 # ─── B. The sibling per-CPU block, at the offsets the asm addresses ────────
 # The struct side is pinned by static asserts (a C reorder is a BUILD
@@ -478,6 +481,101 @@ if grep -qF 'let want = LINUX_SYSCALL_REQ_BYTES + args[2] as usize;' "$LRS" && \
     ok "M6. the sidecar checks the attached bytes against the kernel's own arithmetic (count == payload, chunk twin), performs them on the loop's console, and is handed that console"
 else
     bad "M6. the payload invariant, the chunk twin, the console perform, or the service's console hand-off is gone — bytes the task did not write could be performed, or a write could never reach the serial log it exists to prove"
+fi
+
+# ─── N. The plan's increment 6 (the mem class): the budget span, the W^X refusal ──
+# brk's row (§5.4) is a bump pointer inside a reserved span, and every way
+# it is silently wrong is invisible without a boot: a span that is not the
+# manifest's own, a stage that survives slot reuse, a grant mapped without
+# the kernel's re-check against ITS span, a frame that is neither the
+# partition's nor zeroed, a partial batch that leaks its frames into the
+# pool, a refusal shape that lies to libc (Linux returns the CURRENT break
+# on a failed brk, never a negative), and a W^X rule that exists at only
+# one end of the seam. The host test bites the pure verdict, the predicate
+# and the frame reader (23 new checks, no boot); these clauses hold the
+# call sites, the span's two derivations, and the Rust half the host test
+# cannot see.
+if grep -q 'struct LinuxMemBrkVerdict' "$LABH" && \
+   grep -q 'linux_mem_brk_verdict(uint64_t heap_base' "$LABH" && \
+   grep -q 'struct LinuxMemBrkVerdict linux_mem_brk_verdict(' "$LABC" && \
+   grep -q 'int linux_mprotect_refuses_wx(uint64_t prot)' "$LABH" && \
+   grep -q 'int linux_mprotect_refuses_wx(uint64_t prot)' "$LABC" && \
+   grep -q 'uint64_t linux_user_page_frame(uint64_t root, uint64_t va)' "$LABH" && \
+   grep -q 'uint64_t linux_user_page_frame(uint64_t root, uint64_t va)' "$LABC"; then
+    ok "N. the mem class's contracts exist: the pure brk verdict, the W|X predicate, the frame reader — each declared where the dispatcher and the host test both read them"
+else
+    bad "N. a mem-class contract is gone from linux_abi.h/.c — the brk apply has no verdict to consult (a grant would be trusted about the address it asks the kernel to map), the W|X refusal has no predicate, and the unwind has no read-back"
+fi
+if grep -q 'pd->linux_heap_base = 0;' "$PDC" && \
+   grep -q 'pd->linux_heap_limit = 0;' "$PDC" && \
+   grep -q 'pd->linux_brk_cur = 0;' "$PDC" && \
+   grep -q 'pd->mem_stage_valid = 0;' "$PDC"; then
+    ok "N1. proc_clear_resume_state() zeroes the heap span AND the staged brk — a reused slot inherits neither its predecessor's pages-to-be nor an unanswered grant"
+else
+    bad "N1. the mem state's slot-reuse clear is gone from process.c — the next occupant of a reused slot is handed its predecessor's brk_cur (whose grants map pages at a break it never asked for) and its live brk stage"
+fi
+if grep -qF 'if (personality == PROC_PERSONALITY_LINUX) {' "$CAPC" && \
+   grep -qF 'pd->linux_heap_base  = stack_base + (uint64_t)stk_pages * 4096;' "$CAPC" && \
+   grep -qF '((m.budget_mem_bytes + 4095ULL) / 4096ULL)' "$CAPC" && \
+   grep -qF 'const IMAGE_VBASE: u64 = 0x4000_0000_0000;' "$LPRO" && \
+   grep -qF 'const MEM_BUDGET_BYTES: u64 = 64 * 1024;' "$LPRO" && \
+   grep -qF 'let heap_base = stack_base + stk_pages * 4096;' "$LPRO"; then
+    ok "N2. the span is stamped inside the create, for LINUX only, from the manifest's BUDGET record — and the sidecar's ledger derives the same three numbers from the same record (one truth, mirrored)"
+else
+    bad "N2. the span's stamp or its twin is gone — the kernel would map brk pages against a span the manifest never declared (or stamp one onto every SLS slot), or the sidecar's ledger would be born at a base the kernel's pages never reach: the two halves silently disagree and every denial-echo check lies"
+fi
+if grep -qF 'linux_mprotect_refuses_wx(largs[2]))' "$DISP" && \
+   grep -qF '(uint64_t)(int64_t)(-LINUX_EPERM);' "$DISP" && \
+   grep -qF 'if args[2] & 0x2 != 0 && args[2] & 0x4 != 0 {' "$LRS" && \
+   grep -qF 'const E_PERM: i32 = -12;' "$LRS"; then
+    ok "N3. W|X is refused at BOTH ends: the first trap refuses -EPERM before any post, and the sidecar's arm carries the same refusal (CAP_EPERM pinned at -12 so §5.7 delivers 1)"
+else
+    bad "N3. the W|X refusal exists at one end or neither — one deletion away from a shim that maps write+execute pages, which is the exclusion H2 names (and E_PERM drifted would deliver a different errno than the refusal meant)"
+fi
+stage_line6=$(grep -n 'cur->mem_stage_valid = 1;' "$DISP" | head -1 | cut -d: -f1)
+arm_line6=$(grep -n 'cur->park_syscall = SYS_LINUX_TRAP_RESUME;' "$DISP" | head -1 | cut -d: -f1)
+verdict_line=$(grep -n 'linux_mem_brk_verdict(' "$DISP" | head -1 | cut -d: -f1)
+deliver_line6=$(grep -n 'k_linux_deliver(cur->pid, ch_r' "$DISP" | head -1 | cut -d: -f1)
+map_line=$(grep -n 'cur->linux_brk_cur = v.new_cur;' "$DISP" | head -1 | cut -d: -f1)
+if [ -n "$stage_line6" ] && [ -n "$arm_line6" ] && [ -n "$verdict_line" ] && \
+   [ -n "$deliver_line6" ] && [ -n "$map_line" ] && \
+   [ "$stage_line6" -lt "$arm_line6" ] && \
+   [ "$verdict_line" -gt "$deliver_line6" ] && [ "$map_line" -gt "$verdict_line" ] && \
+   grep -qF 'if (v.malformed) {' "$DISP" && \
+   grep -qF 'cur->linux_brk_cur = v.new_cur;' "$DISP"; then
+    ok "N4. the brk seam holds: staged BEFORE the arm, the verdict consulted only AFTER the reply is delivered, malformed grants refused before any map, and the break recorded only on a fully-mapped grant"
+else
+    bad "N4. the stage/apply seam is broken — a grant mapped without the verdict's span re-check (the reply would decide what the kernel maps), a stage that survives past its own reply, or a break that moves without pages behind it: a silent lie to ring-3 about its own heap"
+fi
+if grep -qF 'void *frame = allocate_physical_ram_frame_for_partition(cur->partition_id);' "$DISP" && \
+   grep -qF 'w[zi] = 0;' "$DISP" && \
+   grep -qF 'USER_PTE_NOEXEC);' "$DISP"; then
+    ok "N5. granted pages are the PARTITION's own frames (quota-charged, the hard ceiling §5.4 names), zero-filled before the task can read them, mapped non-executable"
+else
+    bad "N5. the brk frames are no longer partition-charged, no longer zeroed, or executable — an unzeroed frame leaks its last tenant's bytes into a fresh heap (the pool recycles across partitions), and an uncharged frame bypasses the very ceiling §5.4 rests on"
+fi
+if grep -qF 'f = linux_user_page_frame(' "$DISP" && \
+   grep -qF 'user_unmap_page(pml4, va);' "$DISP" && \
+   grep -qF 'free_physical_ram_frame_for_partition(' "$DISP"; then
+    ok "N6. a grant that runs out of frames mid-batch UNWINDS: the mapped frames are read back by the non-allocating walker, unmapped, and returned to the partition — no leak, no half-mapped grant"
+else
+    bad "N6. the mid-batch unwind is gone — a frame-exhausted brk leaks every frame it already mapped (the break stays but the partition's quota is spent on pages nobody owns), and the task's heap has holes the break claims are backed"
+fi
+if grep -qF 'if want > brk.cur && want <= brk.limit {' "$LRS" && \
+   grep -qF 'Answer::Reply(brk.cur, STATUS_OK)' "$LRS" && \
+   grep -qF 't.brk_cur = heap_base;' "$LRS"; then
+    ok "N7. the sidecar's brk arm grants only inside the span and answers the UNCHANGED current break otherwise — Linux's own failure shape, a value not an errno, so no libc's brk wrapper can be surprised"
+else
+    bad "N7. the brk arm changed shape — an errno on refusal (no libc's brk wrapper is written against it), a grant outside the span (the kernel's verdict then refuses and the two halves disagree on every reply), or a ledger not born at the span's base"
+fi
+if grep -qF 'E7MEM-BRK-OK' "$FIX" && \
+   [ "$(grep -cE 'mov +\$39[5-8], %eax' "$FIX")" -eq 4 ] && \
+   grep -qF 'mov     $12, %eax' "$FIX" && \
+   grep -qF 'mov     $10, %eax' "$FIX" && \
+   grep -qF 'cmp     %r13, %rax' "$FIX"; then
+    ok "N8. the probe fixture carries the mem block: brk query/grant/heap-write (the E7MEM positive marker), the denial-echo check, the W|X check, and four markers (395-398) the evidence asserts absent"
+else
+    bad "N8. the probe's mem block is gone or gutted — the shipped boot would prove nothing about brk while reading exactly as green (the 391/392 discipline's whole point: the markers' ABSENCE is the assertion)"
 fi
 
 echo

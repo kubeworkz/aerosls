@@ -127,6 +127,21 @@ static void proc_clear_resume_state(struct ProcessDescriptor* pd) {
     pd->fs_base = 0;
     pd->fs_base_stage = 0;
     pd->fs_stage_valid = 0;
+    /* E7 increment 6 (§5.4): the mem class's state clears here for the
+     * same two reasons — a reused slot must not inherit its
+     * predecessor's heap span (a stale brk_cur would make the next
+     * occupant's grant map pages at a break it never asked for, and a
+     * stale limit would let a grant the policy side refused through the
+     * kernel's own re-check), and an unanswered brk stage must not
+     * survive into a slot whose pid it never belonged to. Spawn paths
+     * that want LINUX stamp the span inside the same create call
+     * (cap_create_sidecar_in_personality), like the personality itself. */
+    pd->linux_heap_base = 0;
+    pd->linux_heap_limit = 0;
+    pd->linux_brk_cur = 0;
+    pd->mem_stage_num = 0;
+    pd->mem_stage_a0 = 0;
+    pd->mem_stage_valid = 0;
 }
 
 /* E7 (increment 2): read this CPU's captured Linux argument registers.

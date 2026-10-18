@@ -242,26 +242,44 @@ struct LinuxFdWritePlan linux_fd_write_plan(uint64_t num,
  * Frame -> pointer is the identity map's own claim (boot.asm: "the
  * physical addr = virtual addr"). x86-64 keeps the walk byte-oriented at
  * the end so the test's fake frames are ordinary aligned arrays. */
-int linux_user_copy_out(uint8_t *dst, uint64_t root, uint64_t va, uint32_t n)
+/* The one leaf walk both readers share (increment 5's copy, increment 6's
+ * frame read-back). Read-ONLY by construction: every level is checked
+ * before the next pointer is followed, and nothing anywhere writes a
+ * table or creates a missing one — the allocating walker (arch/x86/
+ * walk_page_tables_x86.c) is exactly what these must NOT be: over a
+ * tenant-supplied address its table allocation is a memory lever, not a
+ * read. The USER bit is checked at every level, matching what a ring-3
+ * load would require.
+ *
+ * Frame -> pointer is the identity map's own claim (boot.asm: "the
+ * physical addr = virtual addr"). */
+static int lab_walk_leaf(uint64_t root, uint64_t va, uint64_t *leaf_out)
 {
-    const uint64_t *tbl;
+    const uint64_t *tbl = (const uint64_t *)(uintptr_t)(root & LAB_PTE_FRAME);
     uint64_t leaf = 0;
     unsigned lvl;
 
+    for (lvl = 0; lvl < 4; lvl++) {
+        unsigned shift = 39u - 9u * lvl;
+        uint64_t e = tbl[(va >> shift) & 0x1FF];
+        if (!(e & LAB_PTE_PRESENT)) return -LINUX_EFAULT;
+        if ((lvl == 1 || lvl == 2) && (e & LAB_PTE_PS))
+            return -LINUX_EFAULT;   /* a huge page is not this shim's
+                                     * user shape; refused by name */
+        if (!(e & LAB_PTE_USER)) return -LINUX_EFAULT;
+        leaf = e;
+        if (lvl < 3) tbl = (const uint64_t *)(uintptr_t)(e & LAB_PTE_FRAME);
+    }
+    if (leaf_out) *leaf_out = leaf;
+    return 0;
+}
+
+int linux_user_copy_out(uint8_t *dst, uint64_t root, uint64_t va, uint32_t n)
+{
     if (!dst) return -LINUX_EFAULT;
     while (n) {
-        tbl = (const uint64_t *)(uintptr_t)(root & LAB_PTE_FRAME);
-        for (lvl = 0; lvl < 4; lvl++) {
-            unsigned shift = 39u - 9u * lvl;
-            uint64_t e = tbl[(va >> shift) & 0x1FF];
-            if (!(e & LAB_PTE_PRESENT)) return -LINUX_EFAULT;
-            if ((lvl == 1 || lvl == 2) && (e & LAB_PTE_PS))
-                return -LINUX_EFAULT;   /* a huge page is not this shim's
-                                         * user shape; refused by name */
-            if (!(e & LAB_PTE_USER)) return -LINUX_EFAULT;
-            leaf = e;
-            if (lvl < 3) tbl = (const uint64_t *)(uintptr_t)(e & LAB_PTE_FRAME);
-        }
+        uint64_t leaf = 0;
+        if (lab_walk_leaf(root, va, &leaf) != 0) return -LINUX_EFAULT;
         {
             uint32_t off = (uint32_t)(va & (LINUX_PAGE_SIZE - 1u));
             uint32_t page_left = LINUX_PAGE_SIZE - off;
@@ -279,6 +297,73 @@ int linux_user_copy_out(uint8_t *dst, uint64_t root, uint64_t va, uint32_t n)
         }
     }
     return 0;
+}
+
+/* ─── E7 increment 6 (the mem class, §5.4) — the budget span ──────────────
+ * The two decisions the resume arm's brk apply makes, and the one read it
+ * needs, as the pure functions the host test drives. Nothing below reads
+ * kernel state: the verdict is arithmetic over the stamped span and the
+ * staged request, the frame reader is a walk of a root the CALLER supplies
+ * (the task's PML4 in production, a fake table in the test — the same fake
+ * tables the copy's cases already build). */
+int linux_mprotect_refuses_wx(uint64_t prot)
+{
+    return (prot & LINUX_PROT_WRITE) && (prot & LINUX_PROT_EXEC);
+}
+
+struct LinuxMemBrkVerdict linux_mem_brk_verdict(uint64_t heap_base,
+                                                uint64_t heap_limit,
+                                                uint64_t brk_cur,
+                                                uint64_t req, uint64_t rax)
+{
+    struct LinuxMemBrkVerdict v;
+    v.malformed = 0;
+    v.map_va = 0;
+    v.map_pages = 0;
+    v.new_cur = brk_cur;
+
+    /* The denial echo — and the no-op ask (req == brk_cur). Linux's brk
+     * failure shape is the CURRENT break returned, never an errno: the
+     * sidecar answers the unchanged break for an over-budget ask and for
+     * a shrink (v1 grows only), and both arrive here as "the break did
+     * not move" — legal, not malformed, nothing to map. */
+    if (rax == brk_cur) return v;
+
+    /* A grant. The reply must echo the request exactly (increment 5's
+     * one-truth rule, on an address), and the value must sit inside the
+     * span the create stamped: the kernel never maps a page because a
+     * grant said so — the span is its own truth, whatever the policy
+     * side believed. Below the current break is a "granted" shrink, and
+     * rax is not even the request's echo — both are the malformed arm,
+     * never a map. */
+    if (rax == req && req > brk_cur &&
+        req >= heap_base && req <= heap_limit) {
+        uint64_t va0 = (brk_cur + LINUX_PAGE_SIZE - 1)
+                     & ~((uint64_t)LINUX_PAGE_SIZE - 1);
+        uint64_t va1 = (rax + LINUX_PAGE_SIZE - 1)
+                     & ~((uint64_t)LINUX_PAGE_SIZE - 1);
+        /* align_UP both ends: the page CONTAINING the old break is
+         * already mapped (whatever moved the break into it mapped its
+         * page), so [va0, va1) covers exactly the pages no grant has
+         * backed yet — a re-map would leak the frame underneath and
+         * zero the bytes on it. rax > brk_cur makes va1 > va0, so a
+         * granted growth always maps at least one page. */
+        v.map_va = va0;
+        v.map_pages = (uint32_t)((va1 - va0) / LINUX_PAGE_SIZE);
+        v.new_cur = rax;
+        return v;
+    }
+
+    v.malformed = 1;   /* neither the grant nor the refusal: nothing
+                        * maps, the break stays, the caller says so */
+    return v;
+}
+
+uint64_t linux_user_page_frame(uint64_t root, uint64_t va)
+{
+    uint64_t leaf = 0;
+    if (lab_walk_leaf(root, va, &leaf) != 0) return 0;
+    return leaf & LAB_PTE_FRAME;
 }
 
 /* ─── The personality (E7 increment 2) ───────────────────────────────────── */

@@ -35,6 +35,8 @@ FILES=(
     arch/x86/syscall.asm
     user/sidecar/src/linux.rs
     user/sidecar/src/entry.rs
+    user/sidecar/src/e7_probe.rs
+    user/sidecar/fixtures/e7_linux_probe.S
 )
 
 for f in "${FILES[@]}" "$GUARD"; do
@@ -78,8 +80,9 @@ tooth() {
 }
 
 echo "linux_personality_check_smoke — teeth for the E7 increment-2 wiring"
-echo "and increment-3 delivery guard, §5.3's one-MSR seam (clause set L), and"
-echo "increment 5's fd-class byte crossing (clause set M)"
+echo "and increment-3 delivery guard, §5.3's one-MSR seam (clause set L),"
+echo "increment 5's fd-class byte crossing (clause set M), and increment 6's"
+echo "mem-class budget span (clause set N)"
 echo "========================================================================"
 echo
 
@@ -306,6 +309,78 @@ tooth fd-ebadf-drifted M5 "the sidecar's E_BADF no longer pins CAP_EBADF (-2)" "
 seed "$W/t31"
 sed -i 's/if args\[2\] as usize > FD_PAYLOAD_CAP || rr.len != want {/if false {/' "$W/t31/user/sidecar/src/linux.rs"
 tooth fd-payload-check-off M6 "the write payload invariant is dead-coded" "$W/t31"
+
+# ─── Increment-6 teeth (the mem class: the budget span, the W^X refusal) ──
+
+# N1: the slot-reuse clear loses the break — a reused slot's brk_cur is
+# its predecessor's, and the next occupant's first granted growth maps
+# pages at a break nobody asked for.
+seed "$W/t32"
+sed -i '/pd->linux_brk_cur = 0;/d' "$W/t32/kernel/process.c"
+tooth mem-clear-dropped N1 "the reused-slot brk state reset is gone" "$W/t32"
+
+# N2: the stamp made unconditional — every SLS sidecar (init, DM, every
+# driver) is handed a Linux heap span, and the span no longer follows the
+# manifest that declared it.
+seed "$W/t33"
+python3 - "$W/t33/kernel/cap.c" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p, encoding='utf-8').read()
+old = "    if (personality == PROC_PERSONALITY_LINUX) {\n        pd->linux_heap_base"
+new = "    if (1) {   /* SLS slots get a Linux span too */\n        pd->linux_heap_base"
+assert old in s, "anchor not found"
+open(p, 'w', encoding='utf-8', newline='').write(s.replace(old, new, 1))
+PY
+tooth mem-span-unconditional N2 "the span stamp is no longer keyed on the LINUX personality" "$W/t33"
+
+# N3: the kernel's first-trap W|X refusal dead-coded — now only the
+# sidecar's arm refuses, and one Rust edit away from W|X pages.
+seed "$W/t34"
+sed -i 's/linux_mprotect_refuses_wx(largs\[2\])) {/0) {/' "$W/t34/kernel/syscall_dispatch.c"
+tooth wx-firsttrap-off N3 "the dispatcher's first-trap W|X refusal is dead-coded" "$W/t34"
+
+# N3: the sidecar's twin dead-coded — now only the kernel's plan refuses.
+seed "$W/t35"
+sed -i 's/if args\[2\] & 0x2 != 0 && args\[2\] & 0x4 != 0 {/if false {/' "$W/t35/user/sidecar/src/linux.rs"
+tooth wx-sidecar-off N3 "the sidecar's W|X arm is dead-coded" "$W/t35"
+
+# N4: the verdict's malformed branch dead-coded — a grant that escaped the
+# span or echoed the wrong value would still be mapped.
+seed "$W/t36"
+sed -i 's/if (v.malformed) {/if (0) {/' "$W/t36/kernel/syscall_dispatch.c"
+tooth brk-malformed-off N4 "the verdict's malformed branch is dead-coded" "$W/t36"
+
+# N5: the un-partitioned allocator swapped in — brk pages bypass the
+# frame quota entirely, the very ceiling §5.4 rests on.
+seed "$W/t37"
+sed -i 's/void \*frame = allocate_physical_ram_frame_for_partition(cur->partition_id);/void *frame = allocate_physical_ram_frame();/' "$W/t37/kernel/syscall_dispatch.c"
+tooth mem-uncharged-frames N5 "brk frames no longer come from the partition-charged allocator" "$W/t37"
+
+# N5: the zero-fill dropped — the pool recycles frames across tasks and
+# partitions, so a fresh heap page would carry its last tenant's bytes.
+seed "$W/t38"
+sed -i '/w\[zi\] = 0;/d' "$W/t38/kernel/syscall_dispatch.c"
+tooth mem-unzeroed-frames N5 "brk frames are no longer zero-filled before the task can read them" "$W/t38"
+
+# N6: the unwind's read-back deleted — a frame-exhausted grant leaks every
+# frame it already mapped, and nobody can say which they were.
+seed "$W/t39"
+sed -i '/f = linux_user_page_frame(/d' "$W/t39/kernel/syscall_dispatch.c"
+tooth mem-unwind-gone N6 "the mid-batch unwind no longer reads the frames back" "$W/t39"
+
+# N7: the refusal shape lies — an ENOSYS where Linux returns the CURRENT
+# break: every libc's brk wrapper reads the return against its request.
+seed "$W/t40"
+sed -i 's/Answer::Reply(brk.cur, STATUS_OK)/Answer::Reply(0, E_NOSYS)/' "$W/t40/user/sidecar/src/linux.rs"
+tooth brk-refusal-errno N7 "the brk refusal answers an errno instead of the unchanged break" "$W/t40"
+
+# N8: the probe's positive marker deleted — the mem block would still run
+# but prove nothing on serial, which is exactly the vacuity the marker
+# discipline exists to refuse.
+seed "$W/t41"
+sed -i '/E7MEM-BRK-OK/d' "$W/t41/user/sidecar/fixtures/e7_linux_probe.S"
+tooth mem-probe-marker-gone N8 "the probe's mem-block positive marker is gone" "$W/t41"
 
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"

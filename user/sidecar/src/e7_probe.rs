@@ -49,10 +49,26 @@ pub const PROBE_NAME: &str = "e7.linux.probe.0";
 /// 4 KiB-aligned from the manifest's MEM cap, budget_len is a MiB count).
 pub const PROBE_RESERVE: u64 = 64 * 1024;
 
-/// The caller's channel endpoints, as `linux::track` wants them.
+/// The child's layout, from the manifest THIS file authors and the
+/// kernel's create-side layout (kernel/cap.c steps 5-6) mirrored — §5.4's
+/// budget span is three numbers both sides derive from one record, and
+/// guard clause N2 pins both halves against drift: image at
+/// `IMAGE_VBASE`, `n_img` pages, one guard page, the stack, and the span
+/// directly above the stack, `mem_bytes` long (page-rounded). The Rust
+/// side cannot include kernel/linux_abi.h, so the literals repeat here,
+/// commented as twins — the §5.3 discipline (linux.rs's 158 arm).
+const IMAGE_VBASE: u64 = 0x4000_0000_0000; /* USER_PROC_CODE_BASE */
+const HEAP_GUARD_BYTES: u64 = 4096;        /* cap.c: one guard page */
+const MEM_BUDGET_BYTES: u64 = 64 * 1024;   /* the BUDGET record's mem_bytes */
+const STACK_BUDGET_BYTES: u64 = 16 * 1024; /* stack_bytes; kernel floor 4096 */
+
+/// The caller's channel endpoints and the child's §5.4 span, as
+/// `linux::track` wants them (the ledger is born with these).
 pub struct Spawned {
     pub ch_r: u32,
     pub ch_w: u32,
+    pub heap_base: u64,
+    pub heap_limit: u64,
 }
 
 /// Plant the payload at the budget tail and spawn it through the real
@@ -96,8 +112,12 @@ pub fn spawn<K: aerosls_proto::kabi::Kernel>(
             entry: 0,                      /* _start is at file offset 0 */
         }),
         budget: Some(Budget {
-            mem_bytes: 64 * 1024,         /* informational (copied to the BIB) */
-            stack_bytes: 16 * 1024,       /* kernel floor is 4096 */
+            /* mem_bytes is no longer informational for a Linux child:
+             * the create stamps the brk span from it (kernel/cap.c,
+             * increment 6), and the twin constants below derive the
+             * ledger from the same values. */
+            mem_bytes: MEM_BUDGET_BYTES,
+            stack_bytes: STACK_BUDGET_BYTES as u32, /* kernel floor is 4096 */
             heap_initial: 0,
         }),
         cpu: Some(Cpu {
@@ -135,5 +155,15 @@ pub fn spawn<K: aerosls_proto::kabi::Kernel>(
 
     // target_partition 0 = inherit (this sidecar's — the boot tree's).
     let (ch_r, ch_w) = k.linux_spawn(&blob, 0)?;
-    Ok(Spawned { ch_r, ch_w })
+
+    // The §5.4 span, derived from the SAME manifest numbers the create
+    // stamps from (the mirror of cap.c's steps 5-6, constants above):
+    // image pages, guard page, stack pages, then mem_bytes of brk span.
+    let n_img_pages = (PROBE.len() as u64 + 4095) / 4096;
+    let stack_base = IMAGE_VBASE + n_img_pages * 4096 + HEAP_GUARD_BYTES;
+    let stk_pages = (STACK_BUDGET_BYTES + 4095) / 4096;
+    let heap_base = stack_base + stk_pages * 4096;
+    let heap_limit = heap_base + ((MEM_BUDGET_BYTES + 4095) / 4096) * 4096;
+
+    Ok(Spawned { ch_r, ch_w, heap_base, heap_limit })
 }

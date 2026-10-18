@@ -214,6 +214,85 @@ struct LinuxFdWritePlan linux_fd_write_plan(uint64_t num,
  * may be 0). dst must hold n bytes; the caller owns it. */
 int linux_user_copy_out(uint8_t *dst, uint64_t root, uint64_t va, uint32_t n);
 
+/* ─── E7 increment 6 (the mem class, §5.4) — the budget span ──────────────
+ * §5.4's row is "budget-backed memory", and its first half is brk: a bump
+ * pointer inside a reserved span. The split is the design's own — the
+ * sidecar decides WHETHER the break moves (the budget is its policy: it
+ * authored the manifest's BUDGET record), the kernel provides the frames —
+ * and it is increment 4's posture one level up: a page-table write instead
+ * of an MSR write, so the same three rules hold. The span is stamped at
+ * create (kernel/cap.c, beside the personality stamp); the grant is
+ * re-checked AT THE MAP against the span AND against the request the FIRST
+ * trap staged, because a reply is never trusted about the address it asks
+ * the kernel to map.
+ *
+ * Three pieces, all pure enough for host teeth without a boot:
+ *   - the W|X refusal: simultaneous write+execute is refused by the shim
+ *     itself (§5.4; the census's mprotect row carries LSC_F_REFUSES_WX,
+ *     and H2's Node exclusion IS this refusal). It is a property of the
+ *     REQUEST — no object, no policy — so the first trap produces it
+ *     before the post, exactly like the write plan's -EFAULT, and the
+ *     sidecar carries the same refusal as its own arm so neither end
+ *     alone is load-bearing.
+ *   - the brk verdict: what the resume arm must do with a reply, over the
+ *     kernel's own span, the staged request and the reply's rax. Linux's
+ *     brk failure shape is the load-bearing convention here: a denied brk
+ *     returns the CURRENT break, not -ENOMEM — libc compares the return
+ *     against the request — so "the break did not move" is a success
+ *     answer with a value, never an errno, and a grant must echo the
+ *     request exactly (the increment-5 one-truth rule, on an address) and
+ *     sit inside the stamped span before a single page is mapped. The
+ *     mapped range is [align_up(cur), align_up(new)): the page CONTAINING
+ *     the old break was mapped by whatever moved the break there, so the
+ *     grant can never re-map a live page (which would leak the old frame
+ *     and reset the bytes on it).
+ *   - the page-frame reader: the leaf frame behind a user mapping, walked
+ *     read-only under the copy's own three boundaries (present, USER at
+ *     every level, no huge page). The resume arm needs it for the UNWIND:
+ *     a grant whose frames run out mid-batch must return the frames it
+ *     already mapped, and reading the leaf back is the only honest way to
+ *     learn which ones those are — deliberately NOT walk_page_tables,
+ *     which allocates a missing table (over any address, which is how a
+ *     read becomes a memory lever). */
+#define LINUX_BRK        12u           /* the census's brk row (§5.6)      */
+#define LINUX_MPROTECT   10u           /* the census's mprotect row        */
+#define LINUX_MMAP        9u           /* named: the mem class's NEXT      */
+#define LINUX_MUNMAP     11u           /* increment, not landed here       */
+#define LINUX_PROT_WRITE 0x2u          /* Linux mman.h PROT_* bits — ABI  */
+#define LINUX_PROT_EXEC  0x4u          /* (the sidecar's twin repeats them */
+                                       /*  as literals; guard N3 pins it)  */
+
+/* 1 iff this mprotect must be refused before the post: prot has BOTH the
+ * write and the execute bit. Total over every prot word. */
+int linux_mprotect_refuses_wx(uint64_t prot);
+
+struct LinuxMemBrkVerdict {
+    int      malformed;  /* 1: the reply was neither this request's grant
+                          * nor its refusal — nothing maps, the break
+                          * stays, the caller logs it                   */
+    uint64_t map_va;     /* first page to back (valid iff map_pages > 0) */
+    uint32_t map_pages;  /* fresh frames to map (0 = the break did not
+                          * move: denial echo or a no-op ask)           */
+    uint64_t new_cur;    /* the break the kernel records on success      */
+};
+
+/* Verdict on a brk reply. heap_base/heap_limit/brk_cur are the kernel's
+ * OWN stamped state (never the reply's), req is the break the first trap
+ * staged (args[0] as captured), rax is what the reply delivered. Pure:
+ * the host test drives every branch, including each way a grant can be a
+ * lie the kernel must refuse. */
+struct LinuxMemBrkVerdict linux_mem_brk_verdict(uint64_t heap_base,
+                                                uint64_t heap_limit,
+                                                uint64_t brk_cur,
+                                                uint64_t req, uint64_t rax);
+
+/* The 4 KiB frame behind a user mapping, walked read-only under the
+ * copy's boundaries; 0 when any level refuses (absent, supervisor, huge).
+ * The unwind's read-back — and only that: a kernel address or a missing
+ * page reads as 0, so a walker refusal can never free a frame that was
+ * not mapped by this path. */
+uint64_t linux_user_page_frame(uint64_t root, uint64_t va);
+
 /* ─── The errno map (§5.7) ─────────────────────────────────────────────────
  * Two families cross into the Linux task as negative rax: the Phase-3
  * CAP_E* syscalls return (-1)..(-12), and the Phase-5 k_chan_ path returns

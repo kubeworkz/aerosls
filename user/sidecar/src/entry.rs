@@ -437,7 +437,14 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     // proof, not a dependency of this sidecar's own boot.
     match crate::e7_probe::spawn(&RealKernel, caps.budget_base, caps.budget_len) {
         Ok(sp) => {
-            if crate::linux::track(sp.ch_r, sp.ch_w, crate::e7_probe::PROBE_NAME, 0) {
+            if crate::linux::track(
+                sp.ch_r,
+                sp.ch_w,
+                crate::e7_probe::PROBE_NAME,
+                0,
+                sp.heap_base,
+                sp.heap_limit,
+            ) {
                 klog(b"[E7] probe: spawned ch_r=", sp.ch_r, b"");
             } else {
                 klog(b"[E7] probe: spawned but TRACK TABLE FULL ch_r=", sp.ch_r, b"");

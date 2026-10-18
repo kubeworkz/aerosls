@@ -137,6 +137,34 @@ struct ProcessDescriptor {
     uint8_t    fs_stage_valid;         // 1 between that forward's arming and its
                                        // reply (or refusal) — cleared here, at the
                                        // apply, and at every non-SET forward.
+    uint64_t   linux_heap_base;        // E7 increment 6 (§5.4): the budget span a
+                                       // LINUX task's brk bump pointer lives in —
+                                       // stamped inside the create from the
+                                       // manifest's BUDGET record (mem_bytes,
+                                       // page-rounded, directly above the child's
+                                       // stack), zeroed at slot reuse beside
+                                       // personality. The kernel maps granted
+                                       // pages into this span with partition-
+                                       // charged frames at the reply; the
+                                       // sidecar's ledger (user/sidecar/src/
+                                       // linux.rs's MemBrk) is the policy twin of
+                                       // these three numbers, and the probe's
+                                       // denial-echo check is what proves the two
+                                       // halves never drift.
+    uint64_t   linux_heap_limit;       // base + round_up_4k(mem_bytes)
+    uint64_t   linux_brk_cur;          // the break THIS side has mapped to — the
+                                       // mechanism's truth about which pages are
+                                       // backed, consulted by the verdict at
+                                       // every brk reply
+    uint64_t   mem_stage_num;          // §5.4: a brk captured at the first trap
+                                       // (a break only means something against the
+                                       // break the FIRST trap saw) — held for the
+                                       // sidecar's verdict, consumed by the
+                                       // resume arm. Cleared at the apply, at
+                                       // every non-brk forward, and at slot reuse.
+    uint64_t   mem_stage_a0;           // args[0] as captured — the requested break
+    uint8_t    mem_stage_valid;        // 1 between that forward's arming and its
+                                       // reply (or refusal)
     uint64_t   user_rip;              // entry point in user space
     uint64_t   user_rsp;              // current user-space stack pointer
     uint64_t   user_stack_vaddr;      // vaddr base of the 8-page user stack

@@ -3732,6 +3732,31 @@ int cap_create_sidecar_in_personality(uint32_t parent_pid,
         return CAP_EINVAL;
     }
     pd->personality = personality;
+    /* E7 increment 6 (§5.4): the mem span, stamped HERE beside the
+     * personality — the only place a Linux personality is set. The span
+     * is the manifest's BUDGET record made structural: it sits directly
+     * above the child's stack, mem_bytes long (page-rounded), and brk
+     * starts at its base, so every page the resume arm ever maps into
+     * this task is inside a span THIS create decided — never one a
+     * grant claimed. An SLS child gets the zero span, so a brk-shaped
+     * stage on an SLS slot has no span to grant against (the verdict's
+     * bound checks refuse it) — same posture as the slot-reuse clear.
+     * The sidecar's ledger mirrors these numbers from the manifest it
+     * authored (user/sidecar/src/e7_probe.rs; guard clause N2 pins both
+     * halves). */
+    pd->linux_heap_base  = 0;
+    pd->linux_heap_limit = 0;
+    pd->linux_brk_cur    = 0;
+    pd->mem_stage_valid  = 0;
+    pd->mem_stage_num    = 0;
+    pd->mem_stage_a0     = 0;
+    if (personality == PROC_PERSONALITY_LINUX) {
+        pd->linux_heap_base  = stack_base + (uint64_t)stk_pages * 4096;
+        pd->linux_heap_limit = pd->linux_heap_base
+                             + ((m.budget_mem_bytes + 4095ULL) / 4096ULL)
+                               * 4096ULL;
+        pd->linux_brk_cur    = pd->linux_heap_base;
+    }
     if (m.name_len > 0) {
         /* Use the manifest's NAME record for the debug name. */
         uint32_t nl = (m.name_len < PROC_NAME_LEN - 1) ? (uint32_t)m.name_len

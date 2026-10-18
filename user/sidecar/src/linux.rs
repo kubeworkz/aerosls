@@ -32,10 +32,22 @@
 //!     POSIX Sidecar Phase 2 §3-§4), an unknown descriptor is EBADF, and
 //!     the attached count must equal args[2] exactly or the request is
 //!     malformed;
-//!   - everything else — the rest of the fd class (open/close/lseek/…,
-//!     Phase 2 §3-§4), the mem class (§5.4, increment 6),
-//!     the sig class (accepted-never-delivered), `clock_gettime` (needs the
-//!     clock plus a child-buffer write) and any number outside the census —
+//!   - `brk` (12, the mem class's bump pointer — E7 increment 6, §5.4):
+//!     the BUDGET SPAN is this side's ledger (it authored the manifest's
+//!     BUDGET record; the kernel stamped its own copy of the span at
+//!     create), so a growth inside the span is granted and echoed as the
+//!     new break, and everything else answers the UNCHANGED current
+//!     break — Linux's own brk failure shape, never an errno;
+//!   - `mprotect` (10, §5.4's W^X refusal): write+execute together is
+//!     refused EPERM — the refusal H2's Node exclusion IS, and the twin
+//!     of the kernel's first-trap refusal (both ends exist so neither
+//!     alone is load-bearing);
+//!   - everything else — `open`/`close`/`lseek` and the rest of the fd
+//!     class (Phase 2 §3-§4), `mmap`/`munmap` (§5.4's sub-allocation
+//!     half, the increment after 6), any mprotect whose prot is not
+//!     W|X (real permission changes are not landed), the sig class
+//!     (accepted-never-delivered), `clock_gettime` (needs the clock plus
+//!     a child-buffer write) and any number outside the census —
 //!     is answered `ENOSYS` with its number logged, §11 Q5's recommended
 //!     policy: visible and cheap, never a silent success.
 //!
@@ -73,6 +85,9 @@ const E_BADF: i32 = -2;       /* CAP_EBADF -> -EBADF (§5.7): the fd table has
 const E_REVOKED: i32 = 2;     /* CAP_ERR_REVOKED -> -EIO (§5.7): the console
                                 * channel died under the write — cap.h's
                                 * literal 2, a POSITIVE CAP_ERR_ status */
+const E_PERM: i32 = -12;      /* CAP_EPERM -> -EPERM (§5.7): §5.4's W|X
+                                * refusal — pinned at cap.h's -12 so the
+                                * map delivers 1, never an invented number */
 const STATUS_OK: i32 = 0;      /* CAP_ERR_OK: the reply carries a real `ret` */
 
 /// E7 increment 5 (the fd class): the number that may carry attached
@@ -117,11 +132,25 @@ enum Answer {
     Exit,
 }
 
+/// One Linux task's §5.4 heap ledger: the budget span the create stamped
+/// (the kernel's ProcessDescriptor carries the same three numbers as its
+/// own mechanism-side copy — kernel/cap.c derives them from the manifest
+/// this side authored; guard clause N2 pins both halves) and the bump
+/// pointer this side moves. Pure over a LOCAL copy — `service` writes
+/// `cur` back after the answer, like the fd table's reads — so the arm
+/// below is assertable without a table or a task.
+struct MemBrk {
+    base: u64,
+    limit: u64,
+    cur: u64,
+}
+
 /// The census's first answers (see the module header for the honest
-/// refusals). Pure over the request's registers and the task's fd table —
-/// pid/name resolution and the console handle belong to the caller
-/// (`service`), because they need `Kernel` and the entry loop's objects.
-fn answer(num: u64, args: &[u64; 6], fds: &[FdSlot]) -> Answer {
+/// refusals). Pure over the request's registers, the task's fd table and
+/// a local copy of its brk ledger — pid/name resolution and the console
+/// handle belong to the caller (`service`), because they need `Kernel`
+/// and the entry loop's objects.
+fn answer(num: u64, args: &[u64; 6], fds: &[FdSlot], brk: &mut MemBrk) -> Answer {
     match num {
         /* set_tid_address (218, LSC_LOCAL): single-threaded — the "address
          * of the cleared TID" can never be written, so the complete and
@@ -162,6 +191,46 @@ fn answer(num: u64, args: &[u64; 6], fds: &[FdSlot]) -> Answer {
             (0x1002, _) => Answer::Reply(0, E_INVAL),
             _ => Answer::Reply(0, E_NOSYS),
         },
+        /* brk (12, LSC_MEM — §5.4, E7 increment 6): the bump pointer
+         * inside the budget span, decided HERE because the span is this
+         * side's policy (it authored the BUDGET record). args[0] == 0 is
+         * the query and falls into the else below as a no-op: the
+         * current break IS the answer. A growth inside the span is
+         * granted and echoed as the new break; EVERYTHING else — past
+         * the limit, at or below the current break (v1 GROWS ONLY: a
+         * shrink is a refusal, not a crash), any nonsense low ask —
+         * answers the UNCHANGED current break, which is Linux's own brk
+         * failure shape: the syscall returns the current break rather
+         * than an errno, and libc compares it against the request. The
+         * KERNEL re-checks a grant against its own stamped span at the
+         * reply (kernel/linux_abi.c's verdict, over the request the
+         * first trap staged) — this arm decides WHETHER, the mechanism
+         * still refuses a value it cannot map. */
+        12 => {
+            let want = args[0];
+            if want > brk.cur && want <= brk.limit {
+                brk.cur = want;
+                Answer::Reply(want, STATUS_OK)
+            } else {
+                Answer::Reply(brk.cur, STATUS_OK)
+            }
+        }
+        /* mprotect (10, LSC_MEM — §5.4's W^X): only the refusal exists
+         * in v1 — simultaneous write+execute (prot & 0x2 & 0x4) is
+         * refused EPERM, the twin of linux_mprotect_refuses_wx (the
+         * kernel refuses it first-trap, before any post; both ends
+         * exist so neither alone is the load-bearing refusal — guard
+         * clause N3 pins both). Any other prot is ENOSYS with the
+         * number logged: real permission changes, mmap and munmap are
+         * the mem class's next increment, and a fake grant here would
+         * be a page the kernel never mapped. */
+        10 => {
+            if args[2] & 0x2 != 0 && args[2] & 0x4 != 0 {
+                Answer::Reply(0, E_PERM)
+            } else {
+                Answer::Reply(0, E_NOSYS)
+            }
+        }
         /* exit_group (231, LSC_EXIT): the sidecar reaps, the frames return
          * (§5.6) — handled by service(), which owns the pid lookup. */
         231 => Answer::Exit,
@@ -215,6 +284,11 @@ struct LinuxTask {
     name_len: usize,
     partition: u32,
     fds: [FdSlot; LINUX_MAX_FDS],   /* increment 5: the task's fd table  */
+    brk_base: u64,  /* increment 6: the §5.4 ledger — the span this side */
+    brk_limit: u64, /* authored into the manifest and the kernel stamped */
+    brk_cur: u64,   /* into its own descriptor, and the bump pointer     */
+                    /* this side moves (the kernel's brk_cur is the      */
+                    /* mechanism's twin — the probe proves they agree)   */
 }
 
 const MAX_LINUX_TASKS: usize = 8;
@@ -229,6 +303,9 @@ fn tasks() -> &'static mut [LinuxTask; MAX_LINUX_TASKS] {
         name_len: 0,
         partition: 0,
         fds: [FdSlot { used: false, kind: 0 }; LINUX_MAX_FDS],
+        brk_base: 0,
+        brk_limit: 0,
+        brk_cur: 0,
     }; MAX_LINUX_TASKS];
     unsafe { &mut TABLE }
 }
@@ -240,7 +317,14 @@ fn tasks() -> &'static mut [LinuxTask; MAX_LINUX_TASKS] {
 /// the next `service()` pass drains it. Returns false when the table is
 /// full (the child then parks unanswered, which its first forward's
 /// -EAGAIN/… never happens — it stays parked; a spawn path SHOULD check).
-pub fn track(ch_r: u32, ch_w: u32, name: &str, partition: u32) -> bool {
+pub fn track(
+    ch_r: u32,
+    ch_w: u32,
+    name: &str,
+    partition: u32,
+    heap_base: u64,
+    heap_limit: u64,
+) -> bool {
     let nlen = name.len().min(48);
     for t in tasks().iter_mut() {
         if t.used {
@@ -252,6 +336,15 @@ pub fn track(ch_r: u32, ch_w: u32, name: &str, partition: u32) -> bool {
         t.name[..nlen].copy_from_slice(&name.as_bytes()[..nlen]);
         t.name_len = nlen;
         t.partition = partition;
+        /* The §5.4 ledger is born with the task: the span the spawn
+         * caller derived from the manifest it authored (the kernel's
+         * create stamped its own copy from the same record — the two
+         * are one truth, mirrored because the Rust side cannot include
+         * kernel/linux_abi.h). The break starts at the span's base:
+         * nothing is mapped above the stack until a brk grants it. */
+        t.brk_base = heap_base;
+        t.brk_limit = heap_limit;
+        t.brk_cur = heap_base;
         /* The fd table is born with the task: fds 0, 1, 2 — its console,
          * registered at spawn like every process's stdio. All three
          * accept writes (a tty is bidirectional; write(0) is not EBADF
@@ -414,8 +507,21 @@ pub fn service<K: Kernel>(k: &K, console: &CharNode) {
         };
 
         let fds = tasks()[i].fds;
+        let mut mem = MemBrk {
+            base: tasks()[i].brk_base,
+            limit: tasks()[i].brk_limit,
+            cur: tasks()[i].brk_cur,
+        };
 
-        match answer(num, &args, &fds) {
+        let ans = answer(num, &args, &fds, &mut mem);
+        /* The ledger survives the reply: only a granted growth moves it
+         * (the arm's own rule), and the KERNEL's brk_cur is its own
+         * twin — the probe's denial-echo check is what proves the two
+         * never drift. The base and limit are never written here: they
+         * are the span, decided once, at spawn. */
+        tasks()[i].brk_cur = mem.cur;
+
+        match ans {
             Answer::Reply(ret, status) => {
                 if status == E_NOSYS {
                     enosys_log(num as u32, b" -> ENOSYS\n");

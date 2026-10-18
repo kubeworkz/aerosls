@@ -1052,8 +1052,137 @@ buffering that decides what a blocking stdin even means. `open`,
 half is Phase 2 §3-§4's VFS work, and until `open` lands the fd table
 cannot contain anything but its born stdio, which is what makes the
 EBADF arm above complete rather than provisional. No mem class (§5.4,
-now increment 6), no `clock_gettime` child-buffer write, and §3.7's
-round-trip measurement remains unmeasured.
+now superseded by §10.11), no `clock_gettime` child-buffer write, and
+§3.7's round-trip measurement remains unmeasured.
+
+### 10.11 What has landed — the plan's increment 6 (the mem class: brk's budget span + the W|X refusal)
+
+§5.4's first half — "**`brk` as a bump pointer inside a reserved span**
+and `mmap` as sub-allocations of the same budget; both refused with
+`ENOMEM` when the budget is exhausted. The hard ceiling is the
+partition's frame quota, kernel-enforced" — is now mechanism. The split
+is the design's own: the sidecar decides *whether* the break moves (the
+budget is its policy — it authored the manifest's `BUDGET` record), the
+kernel provides the frames, and the kernel re-checks the grant *at the
+map* against the span it stamped itself — the §5.3 posture one level up,
+where the `wrmsr` is replaced by a page-table write.
+
+**The span, stamped at create.** `cap_create_sidecar_in_personality()`
+(`kernel/cap.c`) stamps three fields on the descriptor for a
+`PROC_PERSONALITY_LINUX` child, beside the personality itself:
+`linux_heap_base` (directly above the child's stack),
+`linux_heap_limit` (base + the `BUDGET` record's `mem_bytes`,
+page-rounded) and `linux_brk_cur` (starts at the base — nothing above
+the stack is mapped until a `brk` grants it). `mem_stage_{num,a0,valid}`
+carry the requested break across the park (the first trap's frame is
+abandoned by the park — the increment-4 lesson: the stage lives on the
+descriptor), and `proc_clear_resume_state()` zeroes all six beside
+personality and TLS. An SLS child gets the zero span, so a brk-shaped
+stage on an SLS slot has no span to grant against.
+
+**The verdict, at the reply.** `linux_mem_brk_verdict()`
+(`kernel/linux_abi.c`, pure, host-tested) decides what the resume arm
+does with a reply, over the kernel's own span, the staged request and
+the reply's `rax`:
+
+- `rax == brk_cur` — the denial echo, which is **Linux's own brk
+  failure shape**: a denied brk returns the *current break*, never
+  `-ENOMEM`, and libc compares the return against the request. Not
+  malformed; nothing maps. Over-budget asks and shrinks both arrive
+  here, and so does the no-op `brk(cur)`.
+- `rax == req` inside `(brk_cur, limit]` — a grant: the verdict
+  computes `[align_up(brk_cur), align_up(rax))`, the exact pages no
+  grant has backed yet — the page *containing* the old break was mapped
+  by whatever moved the break into it, and a re-map would leak the
+  frame underneath and zero the bytes on it.
+- anything else — malformed: the break stays, nothing maps, the reply
+  is logged. A "granted" shrink and a grant that escaped the stamped
+  span both land here; the kernel never maps a page because a grant
+  said so.
+
+The arm then maps each page with
+`allocate_physical_ram_frame_for_partition()` — the hard ceiling §5.4
+names, quota-checked and owner-tagged — **zero-filled before the task
+can read it** (the pool recycles frames across tasks and partitions, so
+an unzeroed frame would carry its last tenant's bytes into a fresh
+heap) and non-executable (`USER_PTE_NOEXEC`: W^X by construction —
+the mprotect refusal below is the policy half of the same rule). Frame
+exhaustion mid-batch *unwinds*: `linux_user_page_frame()` reads each
+mapped leaf back under the copy's own boundaries (present, USER, no
+huge page; allocating nothing — deliberately not the allocating walker
+`arch/x86/walk_page_tables_x86.c` is), the pages are unmapped and
+returned to the partition, and the break does not move. x86-64 never
+caches a not-present translation (SDM Vol. 3A §4.10.4.1), so the fresh
+maps need no `INVLPG` for the task resuming on this same cr3 — the
+posture `cap_arch_map_page`'s runtime maps already rely on.
+
+**The sidecar's ledger, and both W|X ends.** `linux.rs` grew
+`MemBrk { base, limit, cur }` per task, born in `track()` from the span
+`e7_probe.rs` derives from the manifest it authors — the mirror of
+cap.c's layout (image pages, guard page, stack pages, then
+`mem_bytes`), pinned by guard clause N2 because the Rust side cannot
+include `kernel/linux_abi.h`. `answer()`'s new 12 arm grants a growth
+inside the span and answers the unchanged current break for everything
+else (the denial shape is a *value*, never an errno). The new 10 arm
+refuses write+execute (`prot & 0x2 & 0x4`) `EPERM` — `CAP_EPERM`
+pinned at −12 so §5.7 delivers 1 — the twin of the kernel's first-trap
+refusal, which lands before the post like the write plan's `-EFAULT`:
+a prot word is a property of the request, not of any object, so no
+channel is needed to say no, and both ends exist so neither alone is
+the load-bearing refusal.
+
+**The probe proves the span on the real machine.**
+`fixtures/e7_linux_probe.S` (now 420 bytes): `brk(0)` must return a
+page-aligned, nonzero break; `brk(base+0x2000)` must echo the request;
+the fresh page must **read zero**; `"E7MEM-BRK-OK\n"` built *in the
+heap* and `write(1, page, 13)` must return 13 — the bytes crossing
+through increment 5's seam *from the newly-mapped heap itself*, which
+is what proves the mapping is real; `brk(base+128 KiB)` (past the
+64 KiB budget) must come back as the **unchanged break**, not a
+negative; `mprotect(heap, 0x1000, PROT_WRITE|PROT_EXEC)` must be
+exactly −1. Markers 395–398 issue on each wrong outcome and are
+asserted ABSENT (the 391/392 discipline). Evidence, committed as
+`evidence/e7_mem_brk_shipped.log` (the shipped ISO, default entry): two
+complete probe cycles, each with `E7MEM-BRK-OK` on serial — the bytes
+built in a page the kernel mapped for this task at its own brk grant,
+then crossed child→copy→message→fd table→console→pump→kernel→serial
+through increment 5's seam; `num=0000000C ok` three times per cycle
+(the query, the granted growth, the over-budget denial — a *value*, so
+an ok line and never an errno line); the kernel's own
+`mprotect prot=0x6 refused before post` line once per cycle with **no**
+`num=0000000A` behind it — the refusal is first-trap, before any post,
+so the sidecar never sees the request; and `E7FD-WRITE-OK`, §5.3's
+latch (`9E ok` → `BB -> ENOSYS`) and `exit_group` intact behind the
+new block. **Markers 391–398 occur zero times** — the absence of 397
+and 398 is the proof that the denial returned the unchanged break and
+the W|X refusal returned −1; no malformed-grant or frame-exhaustion
+line appears, so every grant the sidecar made was one the kernel's own
+span agreed with.
+
+**Teeth.** Host test 86 checks (+19: the W|X predicate's total
+branches, the verdict's every arm — denial echo, no-op, grant, the
+exact-limit grant, the unaligned grant, the live-page-never-remapped
+rule, past-limit, shrink, foreign `rax`, below-base — and the frame
+reader against fake tables). Guard clause set N, 52 clauses (+9: the
+contracts; the slot-reuse clear; the span's two derivations keyed on
+the personality; W|X at both ends; the stage/apply seam through the
+verdict; partition-charged, zero-filled, NX frames; the unwind; the
+refusal shape; the fixture's own teeth). Smoke 42 (+10: an
+unconditional stamp, a dead-coded first-trap refusal, a dead-coded
+sidecar twin, a dead-coded malformed branch, un-charged frames,
+unzeroed frames, a gutted unwind, an errno-shaped refusal, a deleted
+positive marker, a dropped slot-reuse clear).
+
+**What this increment is NOT.** `mmap`/`munmap` — §5.4's
+sub-allocation half — remain ENOSYS by name: they need the sidecar to
+*choose* addresses (and `munmap` to free frames back through the
+partition), a second seam worth its own teeth. `mprotect` implements
+only the W|X refusal: a real permission change would rewrite PTEs the
+sidecar cannot see. `read`'s copy-IN is still the named next increment
+alongside them (§10.10's reasoning unchanged). brk shrink is refused —
+the unchanged break, v1 grows only, and no page is ever unmapped by a
+grant. And §3.7's round trip remains unmeasured: serial lines still
+carry no timing.
 
 ---
 
@@ -1121,7 +1250,7 @@ Everything this document asserts about the tree, with its source:
 | Six argument registers not captured by the trap path | every forwarded syscall gets wrong arguments (§3.4) | E7, §3.4 |
 | No initial stack/auxv builder | static libc start-up fails before `main` (§5.2) | E7, §5.2 |
 | No `MSR_IA32_FS_BASE` handling | TLS setup fails; musl/glibc binaries die early (§5.3) | E7, §5.3 |
-| No `brk`/`mmap` → budget mapping | Rust/Go heaps cannot grow (§5.4) | E7, §5.4 |
+| No `brk`/`mmap` → budget mapping (`brk` landed, increment 6, §10.11; `mmap`/`munmap` remain) | sub-allocating heaps and `munmap` still refuse (§5.4) | E7, §5.4 |
 | No `CAP_E*` → Linux errno table (and a `CAP_NONE` sentinel in returns) | silent wrong errors (§5.7) | E7, §5.7 |
 | Target designated, but no candidate binary and therefore no artifact | the table is still unmeasured; `--check` reports a named skip rather than a pass | write the crate, add the musl target, run `--run` |
 | No thread groups / `clone` / `futex` | Go and every threaded runtime are out (§7) | named as Go's gate; unscoped |

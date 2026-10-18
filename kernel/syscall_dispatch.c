@@ -154,6 +154,109 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                         }
                         cur->fs_base_stage = 0;
                     }
+                    /* E7 increment 6 apply half (§5.4): a staged brk is
+                     * resolved HERE, at the reply, inside this task's own
+                     * trap. The GRANT is the sidecar's (its 12 arm's
+                     * ledger decides whether the break moves); the value
+                     * is re-checked against the span THIS create stamped
+                     * and the request the FIRST trap staged, because the
+                     * page-table write is the dangerous half — the §5.3
+                     * rule one level up, where the wrmsr was replaced by
+                     * a map. A denial echo needs no frames (the break is
+                     * already where the reply says it is). A grant maps
+                     * fresh partition-charged frames, ZERO-FILLED before
+                     * the task can read them: the pool recycles frames
+                     * across tasks and partitions, so an unzeroed frame
+                     * would carry its last tenant's bytes into this
+                     * task's heap — anonymous memory must not, and the
+                     * probe asserts the zero (MARKER 396's absence).
+                     *
+                     * x86-64 never caches a NOT-PRESENT translation (SDM
+                     * Vol. 3A §4.10.4.1), so a fresh map needs no INVLPG
+                     * for the task about to resume on this same cr3 —
+                     * the same posture cap_arch_map_page's runtime maps
+                     * already rely on.
+                     *
+                     * Frame exhaustion mid-batch UNWINDS the batch: the
+                     * frames already mapped are read back through
+                     * linux_user_page_frame (the copy's own boundaries —
+                     * it mapped them, so it can read them), unmapped, and
+                     * returned to the partition; the break does not move
+                     * and the task sees Linux's own brk failure shape —
+                     * the unchanged current break — never a half-mapped
+                     * grant. */
+                    if (cur->mem_stage_valid) {
+                        uint64_t snum = cur->mem_stage_num;
+                        uint64_t sa0  = cur->mem_stage_a0;
+                        cur->mem_stage_valid = 0;
+                        cur->mem_stage_num   = 0;
+                        cur->mem_stage_a0    = 0;
+                        if (snum == LINUX_BRK) {
+                            struct LinuxMemBrkVerdict v =
+                                linux_mem_brk_verdict(
+                                    cur->linux_heap_base,
+                                    cur->linux_heap_limit,
+                                    cur->linux_brk_cur, sa0, rax);
+                            if (v.malformed) {
+                                kernel_serial_printf(
+                                    "[E7] brk reply 0x%lx for request "
+                                    "0x%lx (span 0x%lx..0x%lx, cur "
+                                    "0x%lx) is neither the grant nor "
+                                    "the refusal - break unmoved\n",
+                                    (unsigned long)rax,
+                                    (unsigned long)sa0,
+                                    (unsigned long)cur->linux_heap_base,
+                                    (unsigned long)cur->linux_heap_limit,
+                                    (unsigned long)cur->linux_brk_cur);
+                                rax = cur->linux_brk_cur;
+                            } else if (v.map_pages) {
+                                uint64_t *pml4 =
+                                    (uint64_t *)(uintptr_t)cur->cr3;
+                                uint64_t va = v.map_va;
+                                uint32_t done = 0;
+                                while (done < v.map_pages) {
+                                    void *frame = allocate_physical_ram_frame_for_partition(cur->partition_id);
+                                    if (!frame) break;   /* quota or pool:
+                                                         * the batch winds
+                                                         * back below */
+                                    {
+                                        uint64_t *w = (uint64_t *)frame;
+                                        int zi;
+                                        for (zi = 0; zi < 512; zi++)
+                                            w[zi] = 0;
+                                    }
+                                    user_map_page(pml4, va,
+                                        (uint64_t)(uintptr_t)frame,
+                                        USER_PTE_PRESENT | USER_PTE_USER |
+                                        USER_PTE_WRITE |
+                                        USER_PTE_NOEXEC);
+                                    va += 4096;
+                                    done++;
+                                }
+                                if (done == v.map_pages) {
+                                    cur->linux_brk_cur = v.new_cur;
+                                } else {
+                                    while (done) {
+                                        uint64_t f;
+                                        va -= 4096;
+                                        f = linux_user_page_frame(
+                                            cur->cr3, va);
+                                        user_unmap_page(pml4, va);
+                                        if (f) free_physical_ram_frame_for_partition(
+                                            (void *)(uintptr_t)f,
+                                            cur->partition_id);
+                                        done--;
+                                    }
+                                    kernel_serial_printf(
+                                        "[E7] brk grant 0x%lx: frame "
+                                        "exhaustion mid-batch - batch "
+                                        "unwound, break unmoved\n",
+                                        (unsigned long)v.new_cur);
+                                    rax = cur->linux_brk_cur;
+                                }
+                            }
+                        }
+                    }
                     return rax;
                 }
             }
@@ -198,6 +301,40 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                                      * the count the task
                                                      * will see are one
                                                      * truth */
+                /* E7 increment 6 (the mem class, §5.4), stage half: a
+                 * brk's requested break is captured HERE — before the
+                 * describe and before the post — because the reply can
+                 * only mean "the break moved to X" against the break the
+                 * FIRST trap saw, and the first trap's frame is abandoned
+                 * by the park (the increment-4 lesson: the stage lives
+                 * on the descriptor, not on the stack). Every other
+                 * forward clears the stage, so an old request can never
+                 * wait for a grant it was not asked for.
+                 *
+                 * The W|X refusal is a first-trap refusal too, beside
+                 * the write plan's own: simultaneous write+execute is
+                 * refused by the shim itself (§5.4 — the census's
+                 * mprotect row carries LSC_F_REFUSES_WX), and it is a
+                 * property of the REQUEST (a prot word, no object, no
+                 * policy) — so no channel is needed to say -EPERM and
+                 * the refusal lands before any arm. The sidecar carries
+                 * the same refusal as its own 10 arm; both ends exist so
+                 * neither alone is the load-bearing refusal (guard N3). */
+                cur->mem_stage_valid = 0;
+                cur->mem_stage_num   = 0;
+                cur->mem_stage_a0    = 0;
+                if (num == LINUX_BRK) {
+                    cur->mem_stage_valid = 1;
+                    cur->mem_stage_num   = num;
+                    cur->mem_stage_a0    = largs[0];
+                } else if (num == LINUX_MPROTECT &&
+                           linux_mprotect_refuses_wx(largs[2])) {
+                    kernel_serial_printf(
+                        "[E7] linux mprotect prot=0x%lx refused before "
+                        "post: write+execute is refused by the shim "
+                        "(§5.4)\n", (unsigned long)largs[2]);
+                    return (uint64_t)(int64_t)(-LINUX_EPERM);
+                }
                 linux_syscall_describe(&req, num, largs);
                 if (cap_linux_find_channels(cur->pid, &ch_w, &ch_r) != 0) {
                     kernel_serial_printf(
