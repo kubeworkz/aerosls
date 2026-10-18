@@ -429,6 +429,23 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     // above installs the NetClient into the ProcManager so applets
     // can call ctx.net() for socket I/O.
 
+    // E7 boot proof (Linux ABI Shim Design §3.3 steps 5-7): spawn the
+    // Linux-personality probe from THIS sidecar — the design-true creator
+    // (§3.5: its one capability is the channel back to us, and the answers
+    // in linux::service below are the only path by which its syscalls
+    // succeed or fail). Failures are logged, never fatal: the proof is a
+    // proof, not a dependency of this sidecar's own boot.
+    match crate::e7_probe::spawn(&RealKernel, caps.budget_base, caps.budget_len) {
+        Ok(sp) => {
+            if crate::linux::track(sp.ch_r, sp.ch_w, crate::e7_probe::PROBE_NAME, 0) {
+                klog(b"[E7] probe: spawned ch_r=", sp.ch_r, b"");
+            } else {
+                klog(b"[E7] probe: spawned but TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+            }
+        }
+        Err(rc) => klog(b"[E7] probe: spawn FAILED rc=", rc as u32, b""),
+    }
+
     let mut boot_stats_sent = false;
     loop {
         // ── Console input: recv from kernel, push into ConsoleIo ──
