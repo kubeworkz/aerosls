@@ -24,10 +24,16 @@
 //!     in this kernel), GET_FS/GET_GS (the value lives in the kernel's field,
 //!     not here, and neither is in the census), unknown cmd words — is
 //!     answered ENOSYS with its number logged, honest by the rule below;
-//!   - everything else — the fd class (its bytes live in the CHILD's address
-//!     space, a separate cr3 by §3.5, so `write` is a kernel copy + the
-//!     sidecar's fd table: POSIX Sidecar Phase 2 §3-§4), the mem class
-//!     (§5.4, increment 5),
+//!   - `write` (1, the fd class's byte crossing — E7 increment 5): the
+//!     bytes live in the CHILD's address space (a separate cr3 by §3.5),
+//!     so the KERNEL copied them out into the message behind this
+//!     72-byte header (kernel/linux_abi.c's plan + copy); this side owns
+//!     the POLICY half — the task's fd table (fds 0/1/2 are its console,
+//!     POSIX Sidecar Phase 2 §3-§4), an unknown descriptor is EBADF, and
+//!     the attached count must equal args[2] exactly or the request is
+//!     malformed;
+//!   - everything else — the rest of the fd class (open/close/lseek/…,
+//!     Phase 2 §3-§4), the mem class (§5.4, increment 6),
 //!     the sig class (accepted-never-delivered), `clock_gettime` (needs the
 //!     clock plus a child-buffer write) and any number outside the census —
 //!     is answered `ENOSYS` with its number logged, §11 Q5's recommended
@@ -39,6 +45,9 @@
 //! POSIX implementation and it is not in the kernel).
 
 use aerosls_proto::kabi::{GrantedCap, Kernel};
+use aerosls_vfs::CharNode;   /* E7 increment 5: the fd table's console slot —
+                              * service() holds the handle because only the
+                              * entry loop has the CharNode */
 
 /// The wire size of `kernel/linux_abi.h`'s struct, pinned as literals in
 /// `tests/linux_personality_host_test.c` (72 = num 8 + args 48 + ret 8 +
@@ -56,7 +65,23 @@ const E_CONFLICT: i32 = -11;   /* CAP_ECONFLICT -> -EBUSY: the reaper could not
 const E_INVAL: i32 = -1;      /* CAP_EINVAL -> -EINVAL (§5.7): the §5.3 address
                                 * bound — a non-canonical FS base is a bad
                                 * VALUE, not an unimplemented command */
+const E_BADF: i32 = -2;       /* CAP_EBADF -> -EBADF (§5.7): the fd table has
+                                * no slot for this descriptor — the fd
+                                * class's own policy answer (increment 5),
+                                * pinned at cap.h's -2 so the map delivers
+                                * 9, not an invented number */
+const E_REVOKED: i32 = 2;     /* CAP_ERR_REVOKED -> -EIO (§5.7): the console
+                                * channel died under the write — cap.h's
+                                * literal 2, a POSITIVE CAP_ERR_ status */
 const STATUS_OK: i32 = 0;      /* CAP_ERR_OK: the reply carries a real `ret` */
+
+/// E7 increment 5 (the fd class): the number that may carry attached
+/// bytes, and the bound the kernel's LINUX_FD_WRITE_CHUNK (1024) mirrors
+/// — a request whose count is larger than the chunk, or whose payload
+/// length is not exactly args[2], is malformed by this side's own twin
+/// arithmetic rather than trusted because it arrived.
+const LINUX_WRITE: u64 = 1;
+const FD_PAYLOAD_CAP: usize = 1024;
 
 /// The reply wire format: `kernel/linux_abi.h`'s SLSLinuxSyscallRequest,
 /// field order C-guaranteed by `repr(C)`. Only num/ret/status are read by
@@ -82,19 +107,44 @@ const _: () = assert!(core::mem::size_of::<LinuxSyscallReq>() == LINUX_SYSCALL_R
 enum Answer {
     /// Reply with this ret/status (status 0 = ret is the value).
     Reply(u64, i32),
+    /// write(2) — the fd class's perform half (increment 5): the fd
+    /// lookup already succeeded, so `service` performs these `len`
+    /// payload bytes on the task's console-backed slot and replies with
+    /// the count actually taken. Only `service` touches the console — it
+    /// holds the handle; this stays pure over the request and the table.
+    Write(usize),
     /// exit_group: reap the task, reply nothing.
     Exit,
 }
 
 /// The census's first answers (see the module header for the honest
-/// refusals). Pure over the request's registers — pid/name resolution
-/// belongs to the caller (`service`), because it needs `Kernel`.
-fn answer(num: u64, args: &[u64; 6]) -> Answer {
+/// refusals). Pure over the request's registers and the task's fd table —
+/// pid/name resolution and the console handle belong to the caller
+/// (`service`), because they need `Kernel` and the entry loop's objects.
+fn answer(num: u64, args: &[u64; 6], fds: &[FdSlot]) -> Answer {
     match num {
         /* set_tid_address (218, LSC_LOCAL): single-threaded — the "address
          * of the cleared TID" can never be written, so the complete and
          * truthful answer is the address itself (§5.6: stored, ignored). */
         218 => Answer::Reply(args[0], STATUS_OK),
+        /* write (1, LSC_FD — the fd class, E7 increment 5): the fd table
+         * decides, exactly as Phase 2 §3 puts the core between a
+         * descriptor and its destination. 0/1/2 are the task's console
+         * (a tty is bidirectional — Linux does not make write(0) an
+         * EBADF); every other descriptor has no slot, and since
+         * open/close are still ENOSYS (the default arm below) no other
+         * slot can exist yet — so EBADF here is the whole truth, not a
+         * shortcut. The BYTES are the payload the KERNEL copied out
+         * (§3.5: they live in the child's cr3, which this side cannot
+         * reach); the count is args[2], clamped by the kernel's plan and
+         * cross-checked against the payload length by `service`. */
+        1 => match fd_kind(fds, args[0]) {
+            Some(FD_KIND_CONSOLE) => Answer::Write(args[2] as usize),
+            /* A kind this increment does not perform — unreachable today
+             * (only the console is ever registered); ENOSYS, not a fake. */
+            Some(_) => Answer::Reply(0, E_NOSYS),
+            None => Answer::Reply(0, E_BADF),
+        },
         /* arch_prctl (158, LSC_MSR, §5.3): the POLICY side of the one
          * kernel semantic — mirror of kernel/linux_abi.h's bound (the Rust
          * side cannot include that header, so the literals are repeated,
@@ -121,6 +171,35 @@ fn answer(num: u64, args: &[u64; 6]) -> Answer {
     }
 }
 
+/// One slot of a Linux task's fd table (E7 increment 5 — the fd class's
+/// sidecar half: Phase 2 §3's table, at the granularity §3.5 allows — this
+/// registry entry IS the task). `kind` grows with the class: only the
+/// console exists while open() is ENOSYS, and an unknown kind answers
+/// ENOSYS rather than pretending to perform something it cannot.
+#[derive(Clone, Copy)]
+struct FdSlot {
+    used: bool,
+    kind: u8,
+}
+
+const FD_KIND_CONSOLE: u8 = 0;
+const LINUX_MAX_FDS: usize = 16;
+
+/// Resolve a descriptor against a task's table — pure over the slice, so
+/// every branch (slot present, slot empty, descriptor out of range) is
+/// guard clause M4's to hold rather than an observation from one boot.
+fn fd_kind(fds: &[FdSlot], fd: u64) -> Option<u8> {
+    if fd >= LINUX_MAX_FDS as u64 {
+        return None;
+    }
+    let s = &fds[fd as usize];
+    if s.used {
+        Some(s.kind)
+    } else {
+        None
+    }
+}
+
 /// One Linux-personality child whose forwards this sidecar answers. The
 /// registry is the spawn path's bookkeeping, not the kernel's: syscall 328
 /// hands back only the CALLER's channel handles, and the reaper needs a
@@ -135,6 +214,7 @@ struct LinuxTask {
     name: [u8; 48],
     name_len: usize,
     partition: u32,
+    fds: [FdSlot; LINUX_MAX_FDS],   /* increment 5: the task's fd table  */
 }
 
 const MAX_LINUX_TASKS: usize = 8;
@@ -148,6 +228,7 @@ fn tasks() -> &'static mut [LinuxTask; MAX_LINUX_TASKS] {
         name: [0; 48],
         name_len: 0,
         partition: 0,
+        fds: [FdSlot { used: false, kind: 0 }; LINUX_MAX_FDS],
     }; MAX_LINUX_TASKS];
     unsafe { &mut TABLE }
 }
@@ -171,6 +252,16 @@ pub fn track(ch_r: u32, ch_w: u32, name: &str, partition: u32) -> bool {
         t.name[..nlen].copy_from_slice(&name.as_bytes()[..nlen]);
         t.name_len = nlen;
         t.partition = partition;
+        /* The fd table is born with the task: fds 0, 1, 2 — its console,
+         * registered at spawn like every process's stdio. All three
+         * accept writes (a tty is bidirectional; write(0) is not EBADF
+         * on Linux), and the slots are what later increments grow by
+         * open()'s hand. */
+        t.fds = [FdSlot { used: false, kind: 0 }; LINUX_MAX_FDS];
+        for slot in t.fds.iter_mut().take(3) {
+            slot.used = true;
+            slot.kind = FD_KIND_CONSOLE;
+        }
         return true;
     }
     false
@@ -239,7 +330,12 @@ fn enosys_log(tag_num: u32, extra: &[u8]) {
 /// as the console arm of the entry loop — so it is safe to call from the
 /// loop's hot path, and the quiesce wait set (append_wait) is what turns a
 /// parked sidecar into a woken one.
-pub fn service<K: Kernel>(k: &K) {
+///
+/// `console` is the entry loop's CharNode — the fd table's console slots
+/// name it, this function performs on it (increment 5), and the loop's own
+/// pump drains what lands there to the kernel console channel on the next
+/// pass, so a write becomes serial output without a second path.
+pub fn service<K: Kernel>(k: &K, console: &CharNode) {
     for i in 0..MAX_LINUX_TASKS {
         if !tasks()[i].used {
             continue;
@@ -251,7 +347,12 @@ pub fn service<K: Kernel>(k: &K) {
         let nlen = tasks()[i].name_len;
         name_buf[..nlen].copy_from_slice(&tasks()[i].name[..nlen]);
 
-        let mut buf = [0u8; LINUX_SYSCALL_REQ_BYTES];
+        /* The recv buffer now carries the fd class's attached bytes
+         * behind the header: 72 + the mirror of LINUX_FD_WRITE_CHUNK.
+         * Undersize would be ERR_BUFSZ — which does NOT consume the
+         * message (transport spec §3.4) — so this capacity is what stops
+         * a write from wedging its own channel. */
+        let mut buf = [0u8; LINUX_SYSCALL_REQ_BYTES + FD_PAYLOAD_CAP];
         let mut slots = [GrantedCap::default(); 1];
         let rr = match k.recv(ch_r, &mut buf, &mut slots) {
             Ok(rr) => rr,
@@ -270,13 +371,12 @@ pub fn service<K: Kernel>(k: &K) {
             _ => continue,
         }
 
-        if rr.len != LINUX_SYSCALL_REQ_BYTES {
-            /* The kernel's forward always posts exactly 72 bytes, so this
-             * cannot be a parseable request. Answer with a well-formed
-             * ENOSYS reply whose num=0: it CANNOT echo the in-flight
-             * request's number, so the kernel's apply refuses it -EPROTO —
-             * the task errors out loud instead of hanging on a reply that
-             * never fits the contract. */
+        if rr.len < LINUX_SYSCALL_REQ_BYTES {
+            /* Shorter than a header can never be a parseable request.
+             * Answer with a well-formed reply whose num=0: it CANNOT echo
+             * the in-flight request's number, so the kernel's apply
+             * refuses it -EPROTO — the task errors out loud instead of
+             * hanging on a reply that never fits the contract. */
             enosys_log(0xBAD0, b"[POSIX] malformed request -> -EPROTO\n");
             reply(k, ch_w, rr.tag, 0, 0, E_NOSYS);
             continue;
@@ -288,7 +388,34 @@ pub fn service<K: Kernel>(k: &K) {
             *a = read_u64(&buf, 8 + 8 * ai);
         }
 
-        match answer(num, &args) {
+        /* E7 increment 5 (the fd class): exactly ONE number may carry
+         * bytes behind the header, and only under the kernel's own
+         * arithmetic — attached == args[2] (the clamp rides IN the
+         * description) and attached ≤ FD_PAYLOAD_CAP (the twin of
+         * LINUX_FD_WRITE_CHUNK). Every other number must be exactly 72.
+         * A violation is the malformed arm's answer: num=0, which the
+         * kernel's echo check refuses -EPROTO — loud, never a silent
+         * success and never bytes this task did not write. */
+        let payload: &[u8] = if num == LINUX_WRITE {
+            let want = LINUX_SYSCALL_REQ_BYTES + args[2] as usize;
+            if args[2] as usize > FD_PAYLOAD_CAP || rr.len != want {
+                enosys_log(0xBAD1, b"[POSIX] write payload mismatch -> -EPROTO\n");
+                reply(k, ch_w, rr.tag, 0, 0, E_NOSYS);
+                continue;
+            }
+            &buf[LINUX_SYSCALL_REQ_BYTES..rr.len]
+        } else {
+            if rr.len != LINUX_SYSCALL_REQ_BYTES {
+                enosys_log(0xBAD0, b"[POSIX] malformed request -> -EPROTO\n");
+                reply(k, ch_w, rr.tag, 0, 0, E_NOSYS);
+                continue;
+            }
+            &buf[..0]
+        };
+
+        let fds = tasks()[i].fds;
+
+        match answer(num, &args, &fds) {
             Answer::Reply(ret, status) => {
                 if status == E_NOSYS {
                     enosys_log(num as u32, b" -> ENOSYS\n");
@@ -300,6 +427,29 @@ pub fn service<K: Kernel>(k: &K) {
                     enosys_log(num as u32, b" ok\n");
                 }
                 reply(k, ch_w, rr.tag, num, ret, status);
+            }
+            Answer::Write(len) => {
+                /* The perform half of step 6 (increment 5): the fd
+                 * lookup said this descriptor names the console, and the
+                 * payload is the kernel's copy out of the child — both
+                 * halves of \"the kernel copy plus the sidecar's fd
+                 * table\" meet here. The count the task sees is what the
+                 * console took (a short write is POSIX-legal; the clamp
+                 * above already made args[2] the payload's own length). */
+                match console.write(&payload[..len]) {
+                    Ok(n) => {
+                        enosys_log(num as u32, b" write ok\n");
+                        reply(k, ch_w, rr.tag, num, n as u64, STATUS_OK);
+                    }
+                    Err(_) => {
+                        /* The console channel is dead: the write did not
+                         * happen, and that is an I/O error — CAP_ERR_
+                         * REVOKED's -EIO through §5.7 — never a success
+                         * and never ENOSYS. */
+                        enosys_log(num as u32, b" write FAILED (console closed)\n");
+                        reply(k, ch_w, rr.tag, num, 0, E_REVOKED);
+                    }
+                }
             }
             Answer::Exit => {
                 /* Visible like every other answer: exit_group is the one

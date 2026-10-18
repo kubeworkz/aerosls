@@ -13,6 +13,13 @@
 # arm, applied at the reply through the canonicality re-check, loaded at every
 # switch-in — four places where a silently-wrong TLS base is invisible to
 # every other clause here.
+# Clause set M (the plan's increment 5 — the fd class: "the kernel copy plus
+# the sidecar's fd table") holds the byte crossing: the plan's clamp riding
+# IN the description, the copy refusing before the arm, the forward carrying
+# attached bytes within the channel's payload bound, and the sidecar's fd
+# table answering EBADF — every one of them a place where the crossing is
+# silently truncated, oversized, or performed against a descriptor that was
+# never checked.
 # Separately they could each be green while the seam between them is broken
 # — an arm-before-post that refused correctly, a reply that mapped correctly
 # into nobody's rax.
@@ -251,11 +258,11 @@ fi
 # (line ~447) for its own send, and that park has nothing to do with order
 # inside this function.
 fwd_start=$(grep -n 'int k_linux_forward(' "$CANC" | head -1 | cut -d: -f1)
-send_line=$(grep -n 'cap_send_msg(pid, ch_w, req' "$CANC" | head -1 | cut -d: -f1)
+send_line=$(grep -n 'cap_send_msg(pid, ch_w, msg' "$CANC" | head -1 | cut -d: -f1)
 park_line=$(grep -n 'cap_wait_chans(&chan_id, 1,' "$CANC" | awk -F: -v s="$fwd_start" '$1 > s { print $1; exit }')
 if [ -n "$fwd_start" ] && [ -n "$send_line" ] && [ -n "$park_line" ] && \
    [ "$send_line" -gt "$fwd_start" ] && [ "$send_line" -lt "$park_line" ]; then
-    ok "I1. k_linux_forward posts the 72-byte request BEFORE it parks"
+    ok "I1. k_linux_forward posts the message (the 72-byte description plus any attached fd-class bytes) BEFORE it parks"
 else
     bad "I1. the post does not precede the park inside k_linux_forward — the task would park for a reply to a request that was never sent, and nothing wakes it"
 fi
@@ -301,7 +308,7 @@ fi
 # entry loop must actually call the service arm, the answers must be the
 # census's honest set (§11 Q5), and the reply must be the exact struct the
 # kernel's apply will accept or every exchange dies -EPROTO.
-if grep -qF 'crate::linux::service(&RealKernel);' "$LRE" && \
+if grep -qF 'crate::linux::service(&RealKernel, &booted.console);' "$LRE" && \
    grep -qF 'crate::linux::append_wait(' "$LRE"; then
     ok "K. the entry loop services the Linux children AND adds their channels to the quiesce wait set (a forward wakes the sidecar, not an idle pass)"
 else
@@ -391,6 +398,86 @@ if grep -qF '158 => match (args[0], args[1]) {' "$LRS" && \
     ok "L6. the sidecar's 158 arm grants ONLY SET_FS at a user-canonical address; a bad address is E_INVAL (a bad VALUE), everything else ENOSYS — CAP_EINVAL pinned at -1 for §5.7's map"
 else
     bad "L6. the policy arm changed shape — a grant for a non-canonical address or a non-SET cmd, or a drifted E_INVAL constant (the map would then answer a different error than the policy meant)"
+fi
+
+# ─── M. The plan's increment 5 (the fd class): the kernel copy, the fd table ──
+# write(2) is the one fd-class byte crossing: the bytes live in the CHILD's
+# address space (§3.5), so the kernel copies them out and the sidecar's fd
+# table performs them. Every clause below is a way that crossing is silently
+# wrong while every other clause here stays green: a clamp that leaves the
+# header claiming a count the payload does not carry, a copy attached AFTER
+# the arm (or not at all), a chunk the channel's pool refuses only for big
+# writes, a walker that reads what ring 3 could not, an fd table that never
+# registers stdio, and an invariant the sidecar stops checking. The host test
+# bites the plan and the copy's every branch (67 checks, no boot); these
+# clauses hold the call sites, the arithmetic across two headers, and the
+# Rust half the host test cannot see.
+if grep -q 'struct LinuxFdWritePlan linux_fd_write_plan(uint64_t num,' "$LABH" && \
+   grep -q 'struct LinuxFdWritePlan linux_fd_write_plan' "$LABC" && \
+   grep -q '#define LINUX_WRITE' "$LABH" && \
+   grep -q '#define LINUX_EFAULT' "$LABH" && \
+   grep -q '#define LINUX_FD_WRITE_CHUNK' "$LABH"; then
+    ok "M. the fd class's contracts exist: the pure plan, the write number, EFAULT as Linux's own literal, and the chunk"
+else
+    bad "M. an fd-class contract is gone from linux_abi.h/.c — the dispatcher's copy path has no plan to consult and no named errno to refuse with, so a bad span can only be discovered by faulting"
+fi
+chunk_n=$(grep -oE '#define LINUX_FD_WRITE_CHUNK +[0-9]+' "$LABH" | awk '{print $3}')
+pay_n=$(grep -oE '#define CAP_MSG_MAX_PAYLOAD +[0-9]+' "$CAPH" | awk '{print $3}')
+if [ -n "$chunk_n" ] && [ -n "$pay_n" ] && [ $((chunk_n + 72)) -le "$pay_n" ]; then
+    ok "M1. the chunk plus the 72-byte header fits the channel payload bound (${chunk_n} + 72 <= ${pay_n}) — no write can post a message the pool refuses"
+else
+    bad "M1. LINUX_FD_WRITE_CHUNK (${chunk_n:-?}) plus the header exceeds CAP_MSG_MAX_PAYLOAD (${pay_n:-?}) — every write above the pool's bound would be refused at post time, so the crossing dies as an errno instead of happening"
+fi
+plan_l=$(grep -n 'plan = linux_fd_write_plan(num, largs);' "$DISP" | head -1 | cut -d: -f1)
+desc_l=$(grep -n 'linux_syscall_describe(&req, num, largs);' "$DISP" | head -1 | cut -d: -f1)
+copy_l=$(grep -n 'linux_user_copy_out(fwd +' "$DISP" | head -1 | cut -d: -f1)
+arm_l5=$(grep -n 'cur->park_syscall = SYS_LINUX_TRAP_RESUME;' "$DISP" | head -1 | cut -d: -f1)
+if [ -n "$plan_l" ] && [ -n "$desc_l" ] && [ -n "$copy_l" ] && \
+   [ -n "$arm_l5" ] && [ "$plan_l" -lt "$desc_l" ] && \
+   [ "$copy_l" -lt "$arm_l5" ] && \
+   grep -qF 'if (plan.len) largs[2] = plan.len;' "$DISP" && \
+   grep -qF 'return (uint64_t)(int64_t)plan.refuse;' "$DISP" && \
+   grep -qF 'return (uint64_t)(int64_t)(-LINUX_EFAULT);' "$DISP" && \
+   grep -qF 'k_linux_forward(cur->pid, ch_w, ch_r, fwd, fwd_len);' "$DISP"; then
+    ok "M2. the seam's order: plan (clamp IN the header, refusal before any channel) -> describe -> copy -> arm -> forward(fwd, len) — every refusal lands before the arm"
+else
+    bad "M2. the dispatcher's copy seam broke — no clamp in the description (header, payload and rax disagree), a copy after the arm (a refusal with an arm to strand), a copy never attached, or a forward still passing the bare &req"
+fi
+if grep -qF 'const void* msg, uint32_t msg_len' "$CANC" && \
+   grep -qF 'r = cap_send_msg(pid, ch_w, msg, msg_len, NULL, 0, 0, 0);' "$CANC" && \
+   grep -qF 'msg_len < sizeof(struct SLSLinuxSyscallRequest)' "$CANC" && \
+   grep -qF 'const void* msg, uint32_t msg_len);' "$CAPH"; then
+    ok "M3. k_linux_forward takes the message and its length end to end: posts header+bytes, refuses an undersize message as CAP_ERR_PROTO, prototype matches definition"
+else
+    bad "M3. the forward's message path drifted — an undersize message accepted, a send that drops the attached bytes (every write would cross as a description of bytes that are not there), or a prototype/definition mismatch"
+fi
+if grep -qF '!(e & LAB_PTE_USER)' "$LABC" && \
+   grep -qF '#define LAB_PTE_PS' "$LABC" && \
+   grep -qF '!(e & LAB_PTE_PRESENT)' "$LABC" && \
+   [ "$(grep -c 'return -LINUX_EFAULT;' "$LABC")" -ge 4 ] && \
+   ! grep -qE 'get_or_create|allocate_physical_ram_frame' "$LABC"; then
+    ok "M4. the copy walks read-only with all three boundaries (present, user at every level, no huge page) and allocates NOTHING — a tenant pointer cannot exhaust the kernel or reach a supervisor page"
+else
+    bad "M4. the copy's boundaries are gone or it gained an allocator — a supervisor page or a huge stride could cross to the sidecar, or a crafted address could turn a read into a memory lever (walk_page_tables' own allocate is exactly what this walker must NOT be)"
+fi
+if grep -qF 'const E_BADF: i32 = -2;' "$LRS" && \
+   grep -qF '1 => match fd_kind(fds, args[0]) {' "$LRS" && \
+   grep -qF 'None => Answer::Reply(0, E_BADF),' "$LRS" && \
+   grep -qF 'fds: [FdSlot; LINUX_MAX_FDS],' "$LRS" && \
+   grep -qF 't.fds = [FdSlot { used: false, kind: 0 }; LINUX_MAX_FDS];' "$LRS" && \
+   grep -qF 't.fds.iter_mut().take(3)' "$LRS"; then
+    ok "M5. the sidecar's fd table exists per task, is born with console stdio (0/1/2), and an unknown descriptor is EBADF — CAP_EBADF pinned at -2 so §5.7 delivers 9"
+else
+    bad "M5. the fd table or its EBADF arm is gone — a descriptor nobody registered would be performed (or fake-answered) instead of refused, and a drifted E_BADF would surface a different errno than the policy meant"
+fi
+if grep -qF 'let want = LINUX_SYSCALL_REQ_BYTES + args[2] as usize;' "$LRS" && \
+   grep -qF 'if args[2] as usize > FD_PAYLOAD_CAP || rr.len != want {' "$LRS" && \
+   grep -qF 'const FD_PAYLOAD_CAP: usize = 1024;' "$LRS" && \
+   grep -qF 'match console.write(&payload[..len]) {' "$LRS" && \
+   grep -qF 'crate::linux::service(&RealKernel, &booted.console);' "$LRE"; then
+    ok "M6. the sidecar checks the attached bytes against the kernel's own arithmetic (count == payload, chunk twin), performs them on the loop's console, and is handed that console"
+else
+    bad "M6. the payload invariant, the chunk twin, the console perform, or the service's console hand-off is gone — bytes the task did not write could be performed, or a write could never reach the serial log it exists to prove"
 fi
 
 echo

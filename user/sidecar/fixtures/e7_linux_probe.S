@@ -25,6 +25,16 @@
  *       0 and this task dies with every following line absent from the log;
  *       its success latches as number 187 (0xBB, present only on success)
  *       and its wrong-place variant issues MARKER 393 (absent, like 391/392).
+ *   1 (write, the fd class) — E7 increment 5's byte crossing: the bytes
+ *       live in THIS task's address space (a separate cr3 by §3.5), so
+ *       the kernel must copy them out before the sidecar's fd table can
+ *       perform them on the console. The string .Lmsg is the POSITIVE
+ *       marker: it reaches the serial log iff plan, copy, message,
+ *       payload check, fd table and console all held, and iff it did, rax
+ *       must equal its length. The same write to a descriptor that does
+ *       not exist must answer -EBADF exactly; anything else — a short or
+ *       failed write, a wrong error — issues MARKER 394 (asserted
+ *       ABSENT, the 391/392/393 discipline).
  *   231 (exit_group) — the sidecar reaps; no reply is owed and this task
  *       never runs again (the hang below is unreachable by design).
  *
@@ -99,9 +109,44 @@ _start:
     mov     $187, %eax             /* LATCH: the applied FS base read back */
     syscall
 .Lfs_done:
-    /* 5. exit_group(42): the sidecar reaps this task. */
+    /* 5. write(1, .Lmsg, .Lmsgend-.Lmsg) — the fd class (E7 increment 5):
+     *    the kernel's copy out of THIS task's address space, then the
+     *    sidecar's fd table, then the console. rax must equal the count;
+     *    then the same write to descriptor 0x77 (never opened — open() is
+     *    still ENOSYS, so no fd beyond 0/1/2 can exist) must come back
+     *    exactly -EBADF (-9, CAP_EBADF's map), not a fabricated number and
+     *    not a success. Either wrong issues MARKER 394, asserted ABSENT by
+     *    the evidence. Argument registers are set fresh immediately before
+     *    each trap — only r12/r15 survive the park, and neither is needed
+     *    past the fs block above. */
+    lea     .Lmsg(%rip), %rsi
+    mov     $1, %edi                /* fd 1 — the task's console      */
+    mov     $.Lmsgend-.Lmsg, %edx   /* count: the message's own length */
+    mov     $1, %eax
+    syscall
+    cmp     $.Lmsgend-.Lmsg, %rax
+    jne     .Lfd_bad                /* failed or short: not a write   */
+    lea     .Lmsg(%rip), %rsi
+    mov     $0x77, %edi             /* a descriptor that cannot exist */
+    mov     $.Lmsgend-.Lmsg, %edx
+    mov     $1, %eax
+    syscall
+    cmp     $-9, %rax               /* -EBADF, and only -EBADF        */
+    je      .Lfd_done
+.Lfd_bad:
+    mov     $394, %eax              /* MARKER: the fd-class seam lied */
+    syscall
+.Lfd_done:
+    /* 6. exit_group(42): the sidecar reaps this task. */
     mov     $42, %edi
     mov     $231, %eax
     syscall
 .Lhang:
     jmp     .Lhang
+
+    /* The fd class's positive marker: printed on the console only if the
+     * whole seam performed it (build_probe.sh keeps this in .text — one
+     * section, _start at offset 0). */
+.Lmsg:
+    .ascii  "E7FD-WRITE-OK\n"
+.Lmsgend:

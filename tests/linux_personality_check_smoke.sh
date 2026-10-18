@@ -78,7 +78,8 @@ tooth() {
 }
 
 echo "linux_personality_check_smoke — teeth for the E7 increment-2 wiring"
-echo "and increment-3 delivery guard, and §5.3's one-MSR seam (clause set L)"
+echo "and increment-3 delivery guard, §5.3's one-MSR seam (clause set L), and"
+echo "increment 5's fd-class byte crossing (clause set M)"
 echo "========================================================================"
 echo
 
@@ -152,7 +153,7 @@ tooth authority-gate-off F2 "the sidecar_authority gate is neutralised" "$W/t8"
 # I1: the post deleted — the task parks for a reply nobody will ever be
 # asked for; the park machinery stays healthy, so nothing else notices.
 seed "$W/t9"
-sed -i '/r = cap_send_msg(pid, ch_w, req, (uint32_t)sizeof \*req, NULL, 0, 0, 0);/d' "$W/t9/kernel/chan.c"
+sed -i '/r = cap_send_msg(pid, ch_w, msg, msg_len, NULL, 0, 0, 0);/d' "$W/t9/kernel/chan.c"
 tooth forward-post-removed I1 "the post before the park is deleted" "$W/t9"
 
 # I2: the arm never set — cap_maybe_handoff then does a send-handoff whose
@@ -182,7 +183,7 @@ tooth echo-check-dropped J2 "the num-echo refusal is gone from apply_reply" "$W/
 # K: the service call unhooked — requests stay queued while their task
 # parks forever, and the wait set never learns to wake the sidecar.
 seed "$W/t14"
-sed -i 's/crate::linux::service(&RealKernel);//' "$W/t14/user/sidecar/src/entry.rs"
+sed -i 's/crate::linux::service(\&RealKernel, \&booted\.console);//' "$W/t14/user/sidecar/src/entry.rs"
 tooth service-unhooked K "the entry loop no longer services the Linux children" "$W/t14"
 
 # K1: the default arm becomes a silent success — §11 Q5's forbidden answer
@@ -259,6 +260,52 @@ tooth fs-predicate-loosened L5 "the stage/apply predicate ignores the cmd word" 
 seed "$W/t24"
 sed -i 's/(0x1002, a) if a <= 0x0000_7FFF_FFFF_FFFF => {/(0x1002, a) if a <= 0xFFFF_FFFF_FFFF_FFFF => {/' "$W/t24/user/sidecar/src/linux.rs"
 tooth fs-sidecar-bound-loosened L6 "the sidecar's FS-base bound admits every u64" "$W/t24"
+
+# ─── Increment-5 teeth (the fd class: the kernel copy, the fd table) ──────
+
+# M1: the chunk grown past the channel's payload bound — the crossing dies
+# at post time for big writes only, while every small-write clause stays green.
+seed "$W/t25"
+sed -i 's/#define LINUX_FD_WRITE_CHUNK  *[0-9]*u/#define LINUX_FD_WRITE_CHUNK  8192u/' "$W/t25/kernel/linux_abi.h"
+tooth fd-chunk-oversized M1 "the write chunk exceeds the channel payload bound" "$W/t25"
+
+# M2: the copy never attached — the header then describes bytes that are
+# not in the message, and the sidecar's invariant check (rightly) refuses
+# every write as malformed.
+seed "$W/t26"
+sed -i '/linux_user_copy_out(fwd +/d' "$W/t26/kernel/syscall_dispatch.c"
+tooth fd-copy-detached M2 "the copy call is gone — no bytes ever attach" "$W/t26"
+
+# M2: the clamp dropped from the description — header, payload and the rax
+# the task will read become three different truths.
+seed "$W/t27"
+sed -i 's/if (plan.len) largs\[2\] = plan.len;//' "$W/t27/kernel/syscall_dispatch.c"
+tooth fd-clamp-dropped M2 "args[2] no longer carries the clamp" "$W/t27"
+
+# M3: the send hard-codes 72 — the attached bytes exist everywhere in the
+# tree except the one call that crosses the channel.
+seed "$W/t28"
+sed -i 's/r = cap_send_msg(pid, ch_w, msg, msg_len, NULL, 0, 0, 0);/r = cap_send_msg(pid, ch_w, msg, 72, NULL, 0, 0, 0);/' "$W/t28/kernel/chan.c"
+tooth fd-send-drops-bytes M3 "the post sends only the header, dropping the payload" "$W/t28"
+
+# M4: the USER check deleted — the copy then reads any present page the
+# walk reaches, which is the whole security boundary of the crossing.
+seed "$W/t29"
+sed -i '/!(e & LAB_PTE_USER)/d' "$W/t29/kernel/linux_abi.c"
+tooth fd-copy-user-check-gone M4 "the walker no longer requires USER at every level" "$W/t29"
+
+# M5: the EBADF constant drifted — every unknown-descriptor refusal would
+# reach the task as a different errno than the policy meant (§5.7).
+seed "$W/t30"
+sed -i 's/const E_BADF: i32 = -2;/const E_BADF: i32 = -1;/' "$W/t30/user/sidecar/src/linux.rs"
+tooth fd-ebadf-drifted M5 "the sidecar's E_BADF no longer pins CAP_EBADF (-2)" "$W/t30"
+
+# M6: the payload invariant neutralised — bytes that are not the ones the
+# task wrote (or a count that disagrees with the header) would be performed
+# on the console without a check.
+seed "$W/t31"
+sed -i 's/if args\[2\] as usize > FD_PAYLOAD_CAP || rr.len != want {/if false {/' "$W/t31/user/sidecar/src/linux.rs"
+tooth fd-payload-check-off M6 "the write payload invariant is dead-coded" "$W/t31"
 
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"

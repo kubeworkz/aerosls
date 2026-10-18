@@ -478,7 +478,7 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         // the parked sidecar's quiesce wait set includes these channels
         // (linux::append_wait), so a forward wakes this loop instead of
         // spinning it.
-        crate::linux::service(&RealKernel);
+        crate::linux::service(&RealKernel, &booted.console);
         booted.proc.drain_wakes();
         // One-shot boot diagnostic: report what task 0 (init) did and how
         // many tasks are live, so a quiet boot can be told apart from a

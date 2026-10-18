@@ -184,6 +184,103 @@ int linux_arch_prctl_is_set_fs(uint64_t num, uint64_t cmd)
     return num == LINUX_ARCH_PRCTL && cmd == LINUX_ARCH_SET_FS;
 }
 
+/* ─── E7 increment 5 (the fd class) — the plan, and the copy ───────────────
+ * The two halves the header names, implemented as the pure functions the
+ * host test drives. Neither reads kernel state: the plan is arithmetic
+ * over the captured registers, the copy is a walk of a root the CALLER
+ * supplies (the task's PML4 in production, a fake table in the test).
+ *
+ * The plan's one soft spot, chosen deliberately: count == 0 plans nothing
+ * before canonicality is consulted. Linux does not fault a buffer it is
+ * not asked to touch — write(fd, NULL, 0) is legal — and inventing an
+ * -EFAULT there would be a rule no kernel the candidate was compiled
+ * against enforces (same discipline as 0 passing the §5.3 bound). */
+struct LinuxFdWritePlan linux_fd_write_plan(uint64_t num,
+                                            const uint64_t args[6])
+{
+    struct LinuxFdWritePlan p;
+    uint64_t count, span_end;
+
+    p.src = 0;
+    p.len = 0;
+    p.refuse = 0;
+    if (num != LINUX_WRITE || !args) return p;   /* nothing to attach */
+
+    count = args[2];
+    if (count == 0) return p;                    /* nothing to copy, and
+                                                  * nothing to validate */
+
+    p.src = args[1];
+    p.len = count > LINUX_FD_WRITE_CHUNK
+              ? (uint32_t)LINUX_FD_WRITE_CHUNK : (uint32_t)count;
+    span_end = p.src + (uint64_t)p.len;          /* wrap = refuse below */
+    if (!linux_fs_addr_is_user_canonical(p.src) || span_end < p.src ||
+        (span_end - 1) > LINUX_USER_ADDR_MAX) {
+        p.refuse = -LINUX_EFAULT;
+    }
+    return p;
+}
+
+/* Page-table flag bits, owned here as literals because linux/asm/page_64
+ * types are not includable (the cap.h discipline for CAP_E*): present,
+ * user, huge-page (PS at the PDPTE/PDE levels only — bit 7 of a 4 KiB
+ * PTE is PAT, not size), and the 4 KiB frame mask. */
+#define LAB_PTE_PRESENT  0x1ULL
+#define LAB_PTE_USER     0x4ULL
+#define LAB_PTE_PS       0x80ULL
+#define LAB_PTE_FRAME    0x000FFFFFFFFFF000ULL
+
+/* The copy. Read-ONLY by construction: every level is checked before the
+ * next pointer is followed, and nothing anywhere writes a table — the
+ * walker this could have reused (arch/x86/walk_page_tables_x86.c)
+ * ALLOCATES a missing table, which over a tenant-supplied address would be
+ * a memory-exhaustion lever, not a copy. The USER bit is checked at every
+ * level, matching what a ring-3 load would require: the copy can then
+ * only read bytes this task could read itself, which is the whole
+ * security argument for letting the sidecar see them.
+ *
+ * Frame -> pointer is the identity map's own claim (boot.asm: "the
+ * physical addr = virtual addr"). x86-64 keeps the walk byte-oriented at
+ * the end so the test's fake frames are ordinary aligned arrays. */
+int linux_user_copy_out(uint8_t *dst, uint64_t root, uint64_t va, uint32_t n)
+{
+    const uint64_t *tbl;
+    uint64_t leaf = 0;
+    unsigned lvl;
+
+    if (!dst) return -LINUX_EFAULT;
+    while (n) {
+        tbl = (const uint64_t *)(uintptr_t)(root & LAB_PTE_FRAME);
+        for (lvl = 0; lvl < 4; lvl++) {
+            unsigned shift = 39u - 9u * lvl;
+            uint64_t e = tbl[(va >> shift) & 0x1FF];
+            if (!(e & LAB_PTE_PRESENT)) return -LINUX_EFAULT;
+            if ((lvl == 1 || lvl == 2) && (e & LAB_PTE_PS))
+                return -LINUX_EFAULT;   /* a huge page is not this shim's
+                                         * user shape; refused by name */
+            if (!(e & LAB_PTE_USER)) return -LINUX_EFAULT;
+            leaf = e;
+            if (lvl < 3) tbl = (const uint64_t *)(uintptr_t)(e & LAB_PTE_FRAME);
+        }
+        {
+            uint32_t off = (uint32_t)(va & (LINUX_PAGE_SIZE - 1u));
+            uint32_t page_left = LINUX_PAGE_SIZE - off;
+            uint32_t take = n < page_left ? n : page_left;
+            const uint8_t *src =
+                (const uint8_t *)(uintptr_t)((leaf & LAB_PTE_FRAME) + off);
+            uint32_t i;
+            for (i = 0; i < take; i++) dst[i] = src[i];
+            dst += take;
+            va  += take;
+            n   -= take;
+            /* root is NOT reassigned: the next iteration re-walks all
+             * four levels from the PML4 for the next page — leaf-frame
+             * reuse would index a PT as though it were a PML4. */
+        }
+    }
+    return 0;
+}
+
 /* ─── The personality (E7 increment 2) ───────────────────────────────────── */
 int linux_personality_intercepts(uint32_t personality)
 {

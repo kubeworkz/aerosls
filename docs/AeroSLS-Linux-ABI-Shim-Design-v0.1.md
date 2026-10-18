@@ -930,9 +930,130 @@ answered by construction for the measured candidate: user data is `0x1B`
 (GDT slot 3), there is NO descriptor at `0x2b` (slot 5 is the TSS), and
 the census binary's musl TLS path loads no FS selector — `%fs`
 addressing runs off the MSR, which is what this increment writes. No
-`brk`/`mmap` budget (§5.4, the plan's 5), no §8 checkpoint half, no
+`brk`/`mmap` budget (§5.4 — the plan's 6, since the fd class took 5), no
+§8 checkpoint half, no
 boot-guard script — and §3.7's round trip remains unmeasured: serial
 lines still carry no timing.
+
+### 10.10 What has landed — the plan's increment 5 (the fd class: the kernel copy + the sidecar's fd table)
+
+§5.6's first row — "`read`, `write` | the copy's bulk plus the console;
+sidecar fd table" — has been the one row whose obstacle was named but
+never built: the bytes live in the CHILD's address space (a separate cr3
+by §3.5), so the sidecar that owns every fd decision cannot read them,
+and the kernel that can must not decide anything. This increment is
+exactly that crossing, in both halves, with the split §3.3 step 6
+requires: **the kernel copies, the sidecar's fd table performs.**
+
+**The plan (kernel/linux_abi.c, pure — the host test drives every
+branch).** `linux_fd_write_plan(num, args)` is arithmetic over the
+captured registers: a non-write number plans nothing (the rest of the fd
+class still forwards as the plain 72-byte description it was),
+`count == 0` plans nothing *before* canonicality is consulted —
+`write(fd, NULL, 0)` is legal and inventing `-EFAULT` there would be a
+rule no kernel the candidate was compiled against enforces, the same
+discipline that lets 0 pass §5.3's bound — and a span above
+`LINUX_FD_WRITE_CHUNK` (1024) clamps. **The clamp rides IN the
+description**: `args[2]` is rewritten to the byte count *before*
+`linux_syscall_describe`, so header, payload and the rax the task will
+read are one truth rather than three, and a short write — POSIX-legal,
+and handled correctly by std's `write_all` loop — is what the task sees.
+A span that leaves the user-canonical range (or wraps) refuses
+`-LINUX_EFAULT` **before the post**: a first-trap refusal with no channel
+and no arm, and EFAULT 14 is returned directly rather than through §5.7,
+because it is the task's truth about the task's own pointer, not a CAP
+code.
+
+**The copy (same file, also pure over a root the caller supplies).**
+`linux_user_copy_out(dst, root, va, n)` walks four levels **read-only**:
+present at every level, the USER bit at every level, no huge page (PS at
+the PDPTE/PDE — bit 7 of a 4 KiB PTE is PAT and is not refused), then
+copies from the identity-mapped frame (boot.asm's own claim: "the
+physical addr = virtual addr"), re-walking all four levels from the PML4
+for each page so a span crossing a page boundary validates and copies
+both. The walker this deliberately is *not* is
+`arch/x86/walk_page_tables_x86.c`, whose `get_or_create` ALLOCATES a
+missing table — over a tenant-supplied address that would be a memory
+lever, not a copy; guard clause M4 pins "allocates nothing" against the
+source. The USER bit is the security argument, stated as a property:
+**the copy can read exactly what ring 3 could read itself**, so
+forwarding the bytes to the sidecar exposes nothing the task did not
+already hold, and every refusal lands as an errno into rax — never a page
+fault in ring 0 over a tenant pointer.
+
+**The message widened by exactly one dimension.** `k_linux_forward`
+now takes `(const void *msg, uint32_t msg_len)` — the 72-byte header
+plus attached bytes — validates `msg_len >= sizeof(request)` as
+`CAP_ERR_PROTO`, reads the park's wake cookie byte-wise (the same
+no-alias discipline `apply_reply` applies to channel payloads), and posts
+`msg_len` rather than a hard-coded size. The arithmetic that keeps this
+inside the channel: `1024 + 72 <= CAP_MSG_MAX_PAYLOAD (4096)`, pinned by
+guard clause M1 as a computation across two headers, so a future chunk
+edit that oversizes the pool reddens the guard instead of failing
+silently at post time — only for big writes, where nothing else would
+notice.
+
+**The fd table (sidecar, linux.rs).** `FdSlot { used, kind }` per task,
+`LINUX_MAX_FDS` = 16, **born with the task** in `track()`: fds 0, 1, 2
+are the console (a tty is bidirectional — Linux does not make `write(0)`
+an EBADF). `answer()`'s new `1 =>` arm resolves the descriptor through
+`fd_kind` (pure over the slice — guard M5's) and answers:
+console slot → `Answer::Write`, unknown descriptor → `EBADF` with
+`CAP_EBADF` pinned at −2 so §5.7 delivers 9. That EBADF is the *whole
+truth*, not a shortcut: `open` is still ENOSYS, so no slot beyond the
+born three can exist. `service()` grew the second half of the honesty:
+the recv buffer carries `72 + 1024`, and for exactly one number the
+attached length must equal `args[2]` **and** sit under the chunk's mirror
+`FD_PAYLOAD_CAP` (1024) — a violation is the malformed arm's num=0 reply
+the kernel's echo check refuses `-EPROTO`, so bytes the task did not
+write can never be performed. The perform half is `console.write` on the
+entry loop's own CharNode (`service(&RealKernel, &booted.console)`), and
+the loop's existing pump drains it to the kernel console channel — no
+second path to serial.
+
+**The probe proves the whole seam on the real machine.**
+`fixtures/e7_linux_probe.S` (now 213 bytes) writes a fixed string to fd 1
+— `E7FD-WRITE-OK` — and requires `rax == len`; then writes the same
+buffer to descriptor 0x77 (which cannot exist) and requires `rax == -9`
+exactly. Either wrong issues **MARKER 394** (0x18A), asserted ABSENT in
+the 391/392/393 discipline. Evidence, committed as
+`evidence/e7_fd_write_shipped.log` (the shipped ISO, default entry): the
+string appears on serial twice — the bytes walked child→copy→message→
+fd table→console→pump→kernel→serial — `num=00000001 write ok` is the
+sidecar's perform line, the bad-fd attempt's `num=00000001 ok` is its
+answered EBADF reply, and **markers 391–394 occur zero times** (the
+absence of 394 *is* the proof that both rax checks passed; the bad-fd
+line is still num=1 because the syscall was write — 0x77 was its fd
+argument). Two complete probe cycles appear in the log, every marker
+clean in both, with §5.3's latch (`9E ok` → `BB -> ENOSYS`) and
+`exit_group` intact behind the new block.
+
+**Teeth.** Host test 67 checks (+15: seven plan cases including the
+count-0-before-canonicality rule and the wrap-around span, eight copy
+cases over fake 4 KiB-aligned tables — each flag refusal named).
+Guard clause set M, 43 clauses total (+7: contracts, the cross-header
+chunk arithmetic, the dispatcher's plan→describe→copy→arm→forward
+order, the forward's message path, the copy's three boundaries plus
+"allocates nothing", the fd table's born stdio and pinned EBADF, the
+sidecar's payload invariant and console hand-off). Smoke 32 (+7 teeth:
+oversized chunk, detached copy, dropped clamp, a send that hard-codes 72,
+the USER check deleted, drifted E_BADF, dead-coded payload check), plus
+the updated I1/K teeth for the widened forward and the handed console.
+
+**What this increment is NOT.** `read` — the copy-IN — has deliberately
+not landed: its bytes travel the other way, which means payload on the
+REPLY, and the reply is exactly 72 bytes as a pinned security property
+(`apply_reply`'s size check, host-tested and smoke-toothed as the
+property "a payload that is not exactly 72 bytes is not a reply").
+Loosening that for one syscall is a §10.7-class decision, so read gets
+its own increment with its own teeth, alongside the console-input
+buffering that decides what a blocking stdin even means. `open`,
+`close`, `lseek` and the rest of the fd class remain ENOSYS — the file
+half is Phase 2 §3-§4's VFS work, and until `open` lands the fd table
+cannot contain anything but its born stdio, which is what makes the
+EBADF arm above complete rather than provisional. No mem class (§5.4,
+now increment 6), no `clock_gettime` child-buffer write, and §3.7's
+round-trip measurement remains unmeasured.
 
 ---
 

@@ -165,8 +165,39 @@ uint64_t do_syscall(uint64_t num, void* arg) {
             {
                 uint64_t largs[6];
                 struct SLSLinuxSyscallRequest req;
+                struct LinuxFdWritePlan plan;
+                /* E7 increment 5 (the fd class): the message that crosses
+                 * is the 72-byte description plus, for a write, its bytes
+                 * — 8-aligned so k_linux_forward can read the header as a
+                 * struct without a copy of its own. */
+                uint64_t fwd_words[(sizeof(struct SLSLinuxSyscallRequest)
+                                    + LINUX_FD_WRITE_CHUNK + 7u) / 8u];
+                uint8_t *fwd = (uint8_t *)fwd_words;
+                uint32_t fwd_len = (uint32_t)sizeof(struct SLSLinuxSyscallRequest);
                 int status;
                 proc_read_linux_args(largs);
+                /* E7 increment 5, plan half: BEFORE the describe (the
+                 * clamp must be IN the description) and before the
+                 * channel lookup (a refusal the first trap can produce
+                 * alone, §3.3 — no channel needed to say -EFAULT). A
+                 * write's bytes are planned here; every other number's
+                 * plan is empty and the forward below stays the plain
+                 * 72-byte description it has always been. */
+                plan = linux_fd_write_plan(num, largs);
+                if (plan.refuse) {
+                    kernel_serial_printf(
+                        "[E7] linux write %lu bytes at 0x%lx refused "
+                        "before post: bad user span (plan)\n",
+                        (unsigned long)largs[2],
+                        (unsigned long)largs[1]);
+                    return (uint64_t)(int64_t)plan.refuse;
+                }
+                if (plan.len) largs[2] = plan.len;   /* the clamp rides IN
+                                                     * the description:
+                                                     * header, payload and
+                                                     * the count the task
+                                                     * will see are one
+                                                     * truth */
                 linux_syscall_describe(&req, num, largs);
                 if (cap_linux_find_channels(cur->pid, &ch_w, &ch_r) != 0) {
                     kernel_serial_printf(
@@ -189,6 +220,32 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                     cur->fs_base_stage = largs[1];
                     cur->fs_stage_valid = 1;
                 }
+                /* E7 increment 5, copy half: attach the bytes, if any,
+                 * AFTER the channel is known (a refused copy must not
+                 * leave a half-built message anywhere) and BEFORE the arm
+                 * — so a copy refusal is a plain first-trap refusal with
+                 * no arm to un-arm. linux_user_copy_out reads only this
+                 * task's own user pages (present, user, 4 KiB) or refuses
+                 * -LINUX_EFAULT; it never faults over a tenant pointer. */
+                if (plan.len) {
+                    if (linux_user_copy_out(fwd + sizeof(struct SLSLinuxSyscallRequest),
+                                            cur->cr3, plan.src,
+                                            plan.len) != 0) {
+                        kernel_serial_printf(
+                            "[E7] linux write %lu bytes at 0x%lx refused "
+                            "before post: unmapped or non-user span "
+                            "(copy)\n",
+                            (unsigned long)plan.len,
+                            (unsigned long)plan.src);
+                        return (uint64_t)(int64_t)(-LINUX_EFAULT);
+                    }
+                    fwd_len += plan.len;
+                }
+                {
+                    struct SLSLinuxSyscallRequest *fwd_req =
+                        (struct SLSLinuxSyscallRequest *)(void *)fwd;
+                    *fwd_req = req;
+                }
                 /* Arm BEFORE the post: cap_maybe_handoff (process.c) reads
                  * this state and skips the post's send-handoff — a sysret
                  * handoff would return to ring-3 MID-forward with its
@@ -196,7 +253,7 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                  * this task is expected: it is parked on our channel). The
                  * park re-stamps the same value via proc_park_capture. */
                 cur->park_syscall = SYS_LINUX_TRAP_RESUME;
-                status = k_linux_forward(cur->pid, ch_w, ch_r, &req);
+                status = k_linux_forward(cur->pid, ch_w, ch_r, fwd, fwd_len);
                 /* Reached ONLY when no park happened (post refused, or no
                  * park possible) — no reply was read on this path, by
                  * construction. Un-arm, then map the refusal into the

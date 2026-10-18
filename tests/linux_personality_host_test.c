@@ -281,6 +281,163 @@ int main(void)
           "a cmd-shaped argument under another number, or a cmd word under no\n"
           "      real cmd, never stages a write — the predicate needs BOTH words");
 
+    /* ═══ E7 increment 5 (the fd class): the kernel copy ═════════════════
+     * The byte crossing §5.6's read/write row names — "the copy's bulk
+     * plus the console; sidecar fd table" — asserted where its siblings
+     * live: the PLAN (pure arithmetic over the captured registers: how
+     * many bytes cross, from where, or why not) and the COPY (a read-only
+     * walk of a page-table root this test itself builds — the security
+     * argument of §3.5 is that the copy can read only what ring-3 could
+     * read itself, so every flag refusal below is a boundary, not a
+     * nicety, and none of them can page-fault in ring 0 over a tenant's
+     * pointer). ═══════════════════════════════════════════════════════ */
+
+    {   /* the plan: total, bounded, honest about count == 0 */
+        struct LinuxFdWritePlan p;
+        uint64_t wargs[6];
+
+        memset(&wargs, 0, sizeof wargs);
+        p = linux_fd_write_plan(40, wargs);   /* lseek, not write */
+        CHECK(p.src == 0 && p.len == 0 && p.refuse == 0,
+              "a non-write number plans nothing: no bytes, no refusal —\n"
+              "      the rest of the fd class still forwards as the plain\n"
+              "      72-byte description it has always been");
+
+        wargs[0] = 1;
+        wargs[1] = 0x0000400000001000ULL;
+        wargs[2] = 5;
+        p = linux_fd_write_plan(1, wargs);
+        CHECK(p.refuse == 0 && p.len == 5 && p.src == wargs[1],
+              "count 5 plans exactly 5 bytes, from the buffer address");
+
+        wargs[1] = 0;
+        wargs[2] = 0;
+        p = linux_fd_write_plan(1, wargs);
+        CHECK(p.refuse == 0 && p.len == 0,
+              "count 0 plans nothing BEFORE canonicality — write(fd, NULL,\n"
+              "      0) is legal, and inventing -EFAULT there would be a\n"
+              "      rule no kernel the candidate was compiled against\n"
+              "      enforces (the §5.3 bound's own discipline)");
+
+        wargs[1] = 0x0000400000001000ULL;
+        wargs[2] = 1ULL << 30;
+        p = linux_fd_write_plan(1, wargs);
+        CHECK(p.refuse == 0 && p.len == LINUX_FD_WRITE_CHUNK,
+              "a huge count clamps to the chunk — a short write is\n"
+              "      POSIX-legal, and the clamp rides IN args[2] so header,\n"
+              "      payload and the count the task will see are one truth\n"
+              "      (the guard's M clause pins the chunk against cap.h)");
+
+        wargs[1] = 0x0000800000000000ULL;   /* kernel-canonical */
+        wargs[2] = 8;
+        p = linux_fd_write_plan(1, wargs);
+        CHECK(p.refuse == -LINUX_EFAULT,
+              "a non-canonical buffer refuses -EFAULT at the PLAN — before\n"
+              "      the post, with no channel and no arm (first-trap\n"
+              "      refusal, §3.3)");
+
+        wargs[1] = 0x00007FFFFFFFFFFFULL - 2;
+        wargs[2] = 16;
+        p = linux_fd_write_plan(1, wargs);
+        CHECK(p.refuse == -LINUX_EFAULT,
+              "a span running off the top of the user range refuses\n"
+              "      -EFAULT — the end check is (span_end - 1) > MAX, so\n"
+              "      one byte past the boundary is caught, not rounded");
+
+        CHECK(LINUX_EFAULT == 14,
+              "EFAULT is 14 — Linux's own number, returned by the plan and\n"
+              "      copy paths DIRECTLY: the task's truth about the task's\n"
+              "      own pointer never crosses §5.7's CAP map");
+    }
+
+    {   /* the copy: fake page tables, 4 KiB-aligned like the real ones.
+         * Host addresses stand in for physical frames — the walker masks
+         * them with the same frame mask the identity map implies, and
+         * aligned(4096) keeps every flag bit clear in the pointer itself. */
+        static uint64_t f_pml4[512] __attribute__((aligned(4096)));
+        static uint64_t f_pdpt[512] __attribute__((aligned(4096)));
+        static uint64_t f_pd[512]   __attribute__((aligned(4096)));
+        static uint64_t f_pt[512]   __attribute__((aligned(4096)));
+        static uint8_t  f_page0[4096] __attribute__((aligned(4096)));
+        static uint8_t  f_page1[4096] __attribute__((aligned(4096)));
+        const uint64_t P = 1ULL, U = 4ULL, PS = 0x80ULL;
+        const uint64_t VA = 0x0000000123456000ULL;
+        unsigned i4 = (unsigned)((VA >> 39) & 0x1FF);
+        unsigned i3 = (unsigned)((VA >> 30) & 0x1FF);
+        unsigned i2 = (unsigned)((VA >> 21) & 0x1FF);
+        unsigned i1 = (unsigned)((VA >> 12) & 0x1FF);
+        uint64_t root = (uint64_t)(uintptr_t)f_pml4;
+        uint8_t out[32];
+        int r;
+        unsigned k;
+
+        memset(f_pml4, 0, sizeof f_pml4);
+        memset(f_pdpt, 0, sizeof f_pdpt);
+        memset(f_pd, 0, sizeof f_pd);
+        memset(f_pt, 0, sizeof f_pt);
+        for (k = 0; k < 4096; k++) { f_page0[k] = (uint8_t)(0xA0 ^ k);
+                                     f_page1[k] = (uint8_t)(0x5A ^ k); }
+        f_pml4[i4] = (uint64_t)(uintptr_t)f_pdpt | P | U;
+        f_pdpt[i3] = (uint64_t)(uintptr_t)f_pd   | P | U;
+        f_pd[i2]   = (uint64_t)(uintptr_t)f_pt   | P | U;
+        f_pt[i1]   = (uint64_t)(uintptr_t)f_page0 | P | U;
+        f_pt[i1 + 1] = (uint64_t)(uintptr_t)f_page1 | P | U;
+
+        r = linux_user_copy_out(out, root, VA + 0x40, 8);
+        CHECK(r == 0 && memcmp(out, f_page0 + 0x40, 8) == 0,
+              "the copy reads through a present+user chain, 4 KiB frames,\n"
+              "      identity frames — the bytes the task wrote are the\n"
+              "      bytes the sidecar will see");
+
+        CHECK(linux_user_copy_out(out, 0, 0, 0) == 0,
+              "n == 0 succeeds without reading anything (root may be 0) —\n"
+              "      the walker dereferences only inside the loop");
+
+        f_pml4[i4] = 0;
+        r = linux_user_copy_out(out, root, VA + 0x40, 8);
+        f_pml4[i4] = (uint64_t)(uintptr_t)f_pdpt | P | U;
+        CHECK(r == -LINUX_EFAULT,
+              "a missing PML4 entry refuses -EFAULT — an unmapped span is\n"
+              "      an errno into rax, never a page fault in ring 0");
+
+        f_pdpt[i3] = (uint64_t)(uintptr_t)f_pd | P;   /* supervisor mid-level */
+        r = linux_user_copy_out(out, root, VA + 0x40, 8);
+        f_pdpt[i3] = (uint64_t)(uintptr_t)f_pd | P | U;
+        CHECK(r == -LINUX_EFAULT,
+              "a supervisor bit at any MID level refuses — the copy reads\n"
+              "      exactly what ring 3 could read, which is the whole\n"
+              "      security argument for letting the sidecar see it");
+
+        f_pt[i1] = (uint64_t)(uintptr_t)f_page0 | P;   /* supervisor leaf  */
+        r = linux_user_copy_out(out, root, VA + 0x40, 8);
+        f_pt[i1] = (uint64_t)(uintptr_t)f_page0 | P | U;
+        CHECK(r == -LINUX_EFAULT,
+              "a supervisor leaf refuses — a kernel page smuggled into the\n"
+              "      child's span cannot reach the sidecar's console");
+
+        f_pt[i1] = 0;                                 /* leaf not present */
+        r = linux_user_copy_out(out, root, VA + 0x40, 8);
+        f_pt[i1] = (uint64_t)(uintptr_t)f_page0 | P | U;
+        CHECK(r == -LINUX_EFAULT,
+              "an absent leaf refuses — the page the task just unmapped\n"
+              "      mid-write is an errno, not a fault");
+
+        f_pd[i2] = (uint64_t)(uintptr_t)f_pt | P | U | PS;   /* 2 MiB page */
+        r = linux_user_copy_out(out, root, VA + 0x40, 8);
+        f_pd[i2] = (uint64_t)(uintptr_t)f_pt | P | U;
+        CHECK(r == -LINUX_EFAULT,
+              "a huge page (PS at the PDE) refuses by name — not this\n"
+              "      shim's user shape, and a 2 MiB stride through a 4 KiB\n"
+              "      frame assumption is how a copy reads the wrong bytes");
+
+        r = linux_user_copy_out(out, root, VA + 0xFF8, 16);
+        CHECK(r == 0 && memcmp(out, f_page0 + 0xFF8, 8) == 0 &&
+              memcmp(out + 8, f_page1, 8) == 0,
+              "a span crossing a page boundary copies BOTH pages in order —\n"
+              "      each page is re-walked from the PML4, leaf frame never\n"
+              "      mistaken for a root");
+    }
+
     printf("linux_personality_host_test: %d passed, %d failed\n",
            checks_passed, checks_failed);
     return checks_failed == 0 ? 0 : 1;

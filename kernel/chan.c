@@ -782,12 +782,22 @@ uint64_t sys_sls_dev_mmap(struct SLSDevMmapRequest* req) {
  * by construction). Never reads a reply: on success the task is gone into
  * the park and the rax belongs to the resume arm. */
 int k_linux_forward(uint32_t pid, uint16_t ch_w, uint16_t ch_r,
-                    const struct SLSLinuxSyscallRequest* req) {
+                    const void* msg, uint32_t msg_len) {
     uint32_t chan_id;
     int dir;
     int r;
+    /* The header's num, read BYTE-wise into a local: msg is a byte buffer
+     * by contract (the dispatcher built it as a header plus attached
+     * fd-class bytes), and this value is both the park's wake cookie and
+     * nothing else — same no-alias, any-alignment discipline
+     * linux_syscall_apply_reply applies to the channel payload. */
+    uint64_t fwd_num;
+    const uint8_t* m = (const uint8_t*)msg;
+    uint32_t bi;
 
-    if (!req) return CAP_ERR_PROTO;
+    if (!msg || msg_len < sizeof(struct SLSLinuxSyscallRequest))
+        return CAP_ERR_PROTO;
+    for (bi = 0; bi < 8; bi++) ((uint8_t*)&fwd_num)[bi] = m[bi];
 
     /* Resolve through the CHAN_R (reply) handle FIRST: the park registers
      * this channel id, and the reply's enqueue — not our post's — is what
@@ -797,8 +807,10 @@ int k_linux_forward(uint32_t pid, uint16_t ch_w, uint16_t ch_r,
     r = chan_resolve(pid, ch_r, CAP_TYPE_CHAN_R, &chan_id, &dir);
     if (r != CAP_ERR_OK) return r;
 
-    /* Step 5: post the 72-byte description. cap_send_msg copies the payload
-     * into the channel's pool synchronously — `req`'s frame may die after
+    /* Step 5: post the message — the 72-byte description, plus attached
+     * fd-class bytes when the dispatcher copied any (E7 increment 5).
+     * cap_send_msg copies the payload into the channel's pool
+     * synchronously — `msg`'s frame may die after
      * this and does die if the park switches (abandoned-frame rule).
      * Non-blocking by design, and safe to be: this channel's ONLY writer is
      * the one task forwarding on it, and that task is parked between post
@@ -807,7 +819,7 @@ int k_linux_forward(uint32_t pid, uint16_t ch_w, uint16_t ch_r,
      * under us, payload pool exhausted (CAP_ENOSPC happens only between
      * here and a peer's drain — bounded by the pool, not by trust, §3.6) —
      * and deserves its mapped errno rather than a park nothing wakes. */
-    r = cap_send_msg(pid, ch_w, req, (uint32_t)sizeof *req, NULL, 0, 0, 0);
+    r = cap_send_msg(pid, ch_w, msg, msg_len, NULL, 0, 0, 0);
     if (r != 0) return r;   /* CAP_E* family; mapped by the dispatcher */
 
     /* Park, and keep parking. cap_wait_chans returns: noreturn when the
@@ -818,7 +830,7 @@ int k_linux_forward(uint32_t pid, uint16_t ch_w, uint16_t ch_r,
      * is possible at all (kernel context / host weak default) — a
      * retryable "not answered yet", which the map reads as -EAGAIN. */
     for (;;) {
-        if (!cap_wait_chans(&chan_id, 1, (void*)(uintptr_t)req->num,
+        if (!cap_wait_chans(&chan_id, 1, (void*)(uintptr_t)fwd_num,
                             SYS_LINUX_TRAP_RESUME, 0))
             return CAP_EAGAIN;
     }

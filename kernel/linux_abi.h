@@ -25,9 +25,13 @@
  * in-flight state, channel shape) are what that increment's host teeth
  * bite on, instead of a boot. fs_base/TLS (§5.3) is increment 4, because
  * it is the one piece that touches the MSR and the context switch.
- * brk/mmap budget policy (§5.4) is increment 5. This file carries no mechanism, so a bug
- * here can only be a wrong number or a malformed image — both of which a
- * host test names, and neither of which can reach a running system.
+ * The fd class (§5.6's read/write row — "the kernel copy plus the
+ * sidecar's fd table") is increment 5: its PLAN and its COPY are pure
+ * over a page-table root, so the byte crossing gets host teeth without a
+ * boot, and brk/mmap budget policy (§5.4) moves to increment 6. This file
+ * carries no mechanism, so a bug here can only be a wrong number or a
+ * malformed image — both of which a host test names, and neither of which
+ * can reach a running system.
  *
  * ─── Freestanding rule ────────────────────────────────────────────────────
  * The kernel build is freestanding: no <errno.h>, no libc. Linux's errno
@@ -144,6 +148,71 @@ int linux_fs_addr_is_user_canonical(uint64_t addr);
  * BOTH ends of the stage/apply seam (first trap stages, resume arm
  * applies), so the two ends can never disagree about what got staged. */
 int linux_arch_prctl_is_set_fs(uint64_t num, uint64_t cmd);
+
+/* ─── E7 increment 5 (the fd class) — the kernel copy ─────────────────────
+ * The one fd-class byte crossing §5.6's row names: write(2)'s buffer lives
+ * in the CHILD's address space (a separate cr3 by §3.5), so the sidecar —
+ * which owns the fd table and every policy decision — cannot read it. The
+ * kernel copies it out into the forwarded message, exactly as increment 4
+ * taught the kernel to perform the one MSR write: mechanism here, policy
+ * (which fd, what it means) always in the sidecar (§3.3 step 6).
+ *
+ * Two pieces, both pure enough for host teeth without a boot:
+ *   - the PLAN — how many bytes cross, from where, or why not. It never
+ *     reads kernel state; given the same words every caller gets the same
+ *     answer. count == 0 plans nothing (Linux does not validate a buffer
+ *     it is not asked to touch), a span that leaves the user-canonical
+ *     range refuses -EFAULT BEFORE the post (a first-trap refusal, §3.3),
+ *     and a count above LINUX_FD_WRITE_CHUNK clamps — a short write is
+ *     POSIX-legal, and the clamp rides IN the description (args[2]) so
+ *     header, payload and the count the task will see are one truth.
+ *   - the COPY — a read-only walk of the task's OWN page tables: present,
+ *     user, never a huge page, every level. The USER bit is the security
+ *     boundary of this copy: it reads exactly what ring-3 could read
+ *     itself, so forwarding the bytes through the sidecar exposes nothing
+ *     the task did not already hold — and a missing mapping is -EFAULT
+ *     into rax, never a page fault in ring 0 over a tenant's pointer.
+ *
+ * The identity map (boot.asm, 0–4 GiB, "physical addr = virtual addr") is
+ * what lets a translated frame be read directly; the walk itself starts
+ * from the task's own PML4 physical address (ProcessDescriptor.cr3), so
+ * it is correct whichever cr3 the trap path is running on. */
+#define LINUX_WRITE           1u           /* the census's write row (§5.6) */
+#define LINUX_EFAULT          14           /* Linux's own number: a bad
+                                            * buffer address. Returned by
+                                            * the plan/copy paths directly —
+                                            * it is the task's truth about
+                                            * the task's own pointer, not a
+                                            * CAP-family code, so it never
+                                            * crosses the errno map (§5.7). */
+#define LINUX_FD_WRITE_CHUNK  1024u        /* bytes that cross per write
+                                            * trap: ≤ CAP_MSG_MAX_PAYLOAD
+                                            * − sizeof(request) (the guard's
+                                            * clause M does the arithmetic
+                                            * against cap.h's literal), and a
+                                            * legal short write either way. */
+
+struct LinuxFdWritePlan {
+    uint64_t src;      /* child VA the copy reads from (args[1])          */
+    uint32_t len;      /* bytes to attach: min(count, CHUNK); 0 = none     */
+    int32_t  refuse;   /* 0 = proceed; else the Linux errno to return
+                        * BEFORE any post (first-trap refusal discipline)  */
+};
+
+/* Plan one write's byte crossing. For any number other than LINUX_WRITE
+ * the plan is empty (no attach, no refusal) — the rest of the fd class
+ * still forwards as the plain 72-byte description it was. Pure: the host
+ * test drives every branch, including count==0 ignoring a non-canonical
+ * buffer and the wrap-around span. */
+struct LinuxFdWritePlan linux_fd_write_plan(uint64_t num,
+                                            const uint64_t args[6]);
+
+/* Copy n bytes from a task's user VA into dst, walking root's page tables
+ * read-only. Returns 0, or -LINUX_EFAULT — never a fault: every level is
+ * checked before the bytes are read, and a span crossing a page boundary
+ * validates BOTH pages. n == 0 succeeds without reading anything (root
+ * may be 0). dst must hold n bytes; the caller owns it. */
+int linux_user_copy_out(uint8_t *dst, uint64_t root, uint64_t va, uint32_t n);
 
 /* ─── The errno map (§5.7) ─────────────────────────────────────────────────
  * Two families cross into the Linux task as negative rax: the Phase-3

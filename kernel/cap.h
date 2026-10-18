@@ -1088,7 +1088,9 @@ uint64_t sys_sls_linux_spawn(struct SLSCreateSidecarRequest* req);
  * linux_channel_shape_ok — §3.5's exactly-one-channel rule. Returns 0 and
  * fills both slots, or -1 (no channel, or not exactly one candidate).
  *
- * k_linux_forward POSTS the described request and then parks — park-ONLY:
+ * k_linux_forward POSTS the message — the 72-byte description, plus for an
+ * fd-class write its attached bytes (E7 increment 5: the kernel copy out
+ * of the child's address space) — and then parks — park-ONLY:
  * it never reads a reply, so a successful forward's rax can only come from
  * the resume re-run (the source guard's I3 clause holds this). Parking with
  * SYS_LINUX_TRAP_RESUME arms the in-flight state; k_linux_deliver is the
@@ -1100,14 +1102,16 @@ uint64_t sys_sls_linux_spawn(struct SLSCreateSidecarRequest* req);
  * is the one task forwarding on it, and that task is parked between post
  * and reply — so the inbound queue can never be full at post time (a
  * flood parks on the reply, which is §10.2's bounded-flood posture). */
-struct SLSLinuxSyscallRequest;   /* kernel/linux_abi.h — named here so the
-                                  * prototypes below share ONE struct type
-                                  * with linux_abi.c, instead of declaring a
-                                  * prototype-scope shadow (a second, private
-                                  * struct that then conflicts at this file's
-                                  * own includers). */
+struct SLSLinuxSyscallRequest;   /* kernel/linux_abi.h — named here so this
+                                  * header and linux_abi.h share ONE struct
+                                  * type instead of a prototype-scope shadow
+                                  * (a second, private struct that then
+                                  * conflicts at this file's own includers).
+                                  * The forward's MESSAGE begins with this
+                                  * struct; its type is what msg_len
+                                  * validates against. */
 int      k_linux_forward(uint32_t pid, uint16_t ch_w, uint16_t ch_r,
-                         const struct SLSLinuxSyscallRequest* req);
+                         const void* msg, uint32_t msg_len);
 uint64_t k_linux_deliver(uint32_t pid, uint16_t ch_r, uint64_t expect_num);
 int      cap_linux_find_channels(uint32_t pid, uint16_t* out_ch_w,
                                  uint16_t* out_ch_r);
