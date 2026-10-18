@@ -119,6 +119,14 @@ static void proc_clear_resume_state(struct ProcessDescriptor* pd) {
      * create call (cap_create_sidecar_in_personality), so no window exists
      * where a schedulable task carries the wrong personality. */
     pd->personality = PROC_PERSONALITY_SLS;
+    /* E7 §5.3: the same rule for TLS as for personality — a reused slot's
+     * stale fs_base would point the next occupant's %fs at someone else's
+     * address space the instant the switch-in wrote it to the MSR. The
+     * staged-forward state clears here too: an unanswered stage must not
+     * survive into a slot whose pid it never belonged to. */
+    pd->fs_base = 0;
+    pd->fs_base_stage = 0;
+    pd->fs_stage_valid = 0;
 }
 
 /* E7 (increment 2): read this CPU's captured Linux argument registers.
@@ -1091,6 +1099,13 @@ static int pick_next_process_in_partition(uint32_t partition_id, int exclude_idx
 //    continues exactly where it left off.
 //  - otherwise:        iretq to the process's saved ring-3 context.
 static void proc_build_resume_frame(struct ProcessDescriptor* next, uint64_t* f) {
+    /* E7 §5.3 (the plan's increment 4): FSBASE follows the task being
+     * switched IN to — one wrmsr at the single frame-builder every switch
+     * path honours (timer schedule_ring3, kernel_switch_next, the control-
+     * plane yield), so two Linux tasks in a row can never carry each
+     * other's TLS and every other task returns to base 0 rather than a
+     * leftover. No personality branch: the invariant is the mechanism. */
+    user_write_fs_base(next->fs_base);
     for (int i = 0; i < 15; i++) f[i] = 0;
     if (next->resume_sysret) {
         next->resume_sysret = 0;

@@ -18,10 +18,16 @@
 //!     teardown and the frames return to the partition. No reply is owed:
 //!     the task never runs again. If the pid cannot be resolved the task is
 //!     answered rather than left parked forever;
+//!   - `arch_prctl` (158, §5.3): the POLICY half of the one kernel semantic —
+//!     SET_FS is GRANTED only for a user-canonical address (the kernel
+//!     re-checks that bound at the wrmsr), everything else — SET_GS (no GSR
+//!     in this kernel), GET_FS/GET_GS (the value lives in the kernel's field,
+//!     not here, and neither is in the census), unknown cmd words — is
+//!     answered ENOSYS with its number logged, honest by the rule below;
 //!   - everything else — the fd class (its bytes live in the CHILD's address
 //!     space, a separate cr3 by §3.5, so `write` is a kernel copy + the
 //!     sidecar's fd table: POSIX Sidecar Phase 2 §3-§4), the mem class
-//!     (§5.4, increment 5), `arch_prctl` (§5.3, increment 4 — kernel-side),
+//!     (§5.4, increment 5),
 //!     the sig class (accepted-never-delivered), `clock_gettime` (needs the
 //!     clock plus a child-buffer write) and any number outside the census —
 //!     is answered `ENOSYS` with its number logged, §11 Q5's recommended
@@ -47,6 +53,9 @@ const E_NOSYS: i32 = -10;      /* CAP_ENOSYS  -> -ENOSYS  (§5.7) */
 const E_CONFLICT: i32 = -11;   /* CAP_ECONFLICT -> -EBUSY: the reaper could not
                                 * resolve its own child — a state conflict, not
                                 * a permission or an absence of policy */
+const E_INVAL: i32 = -1;      /* CAP_EINVAL -> -EINVAL (§5.7): the §5.3 address
+                                * bound — a non-canonical FS base is a bad
+                                * VALUE, not an unimplemented command */
 const STATUS_OK: i32 = 0;      /* CAP_ERR_OK: the reply carries a real `ret` */
 
 /// The reply wire format: `kernel/linux_abi.h`'s SLSLinuxSyscallRequest,
@@ -86,6 +95,23 @@ fn answer(num: u64, args: &[u64; 6]) -> Answer {
          * of the cleared TID" can never be written, so the complete and
          * truthful answer is the address itself (§5.6: stored, ignored). */
         218 => Answer::Reply(args[0], STATUS_OK),
+        /* arch_prctl (158, LSC_MSR, §5.3): the POLICY side of the one
+         * kernel semantic — mirror of kernel/linux_abi.h's bound (the Rust
+         * side cannot include that header, so the literals are repeated,
+         * commented as twins): GRANT `SET_FS` (0x1002) only for a
+         * user-canonical address; a bad address is E_INVAL (a bad VALUE,
+         * not an unimplemented command); SET_GS has no GSR in this kernel,
+         * GET_FS/GET_GS return a value only the kernel's field holds (and
+         * are not in the census), any other cmd word is ENOSYS. The kernel
+         * re-checks canonicality at the wrmsr — the grant says WHETHER, the
+         * mechanism still refuses a value it cannot write. */
+        158 => match (args[0], args[1]) {
+            (0x1002, a) if a <= 0x0000_7FFF_FFFF_FFFF => {
+                Answer::Reply(0, STATUS_OK)
+            }
+            (0x1002, _) => Answer::Reply(0, E_INVAL),
+            _ => Answer::Reply(0, E_NOSYS),
+        },
         /* exit_group (231, LSC_EXIT): the sidecar reaps, the frames return
          * (§5.6) — handled by service(), which owns the pid lookup. */
         231 => Answer::Exit,

@@ -8,6 +8,11 @@
 # Increments 2 and 3 are one guard because they are one branch: clauses A–H
 # hold that a Linux trap is described and refused (increment 2), clauses
 # I–K hold that it is delivered, parked, resumed and answered (increment 3).
+# Clause set L (§5.3, the plan's increment 4) joins them because the one-MSR
+# seam spans the same files: field cleared at slot reuse, staged at the first
+# arm, applied at the reply through the canonicality re-check, loaded at every
+# switch-in — four places where a silently-wrong TLS base is invisible to
+# every other clause here.
 # Separately they could each be green while the seam between them is broken
 # — an arm-before-post that refused correctly, a reply that mapped correctly
 # into nobody's rax.
@@ -48,7 +53,7 @@ bad() { echo "FAIL: $1"; fails=$((fails+1)); }
 # ─── A. Preconditions ──────────────────────────────────────────────────────
 for f in kernel/linux_abi.h kernel/linux_abi.c kernel/process.h kernel/process.c \
          kernel/cap.h kernel/cap.c kernel/syscall_dispatch.c kernel/chan.c \
-         arch/x86/user_paging.h arch/x86/syscall.asm \
+         arch/x86/user_paging.h arch/x86/user_paging.c arch/x86/syscall.asm \
          user/sidecar/src/linux.rs user/sidecar/src/entry.rs; do
     if [ ! -f "$f" ]; then
         echo "ABORT: $f missing — the guard cannot be evaluated at all." >&2
@@ -58,6 +63,7 @@ done
 ok "A. every file this guard reads exists"
 
 UPH=arch/x86/user_paging.h
+UPC=arch/x86/user_paging.c
 ASM=arch/x86/syscall.asm
 PDH=kernel/process.h
 PDC=kernel/process.c
@@ -319,6 +325,72 @@ if grep -qF 'payload[0..8].copy_from_slice(&num.to_le_bytes());' "$LRS" && \
     ok "K3. the reply fills num, ret and status at the pinned offsets — the fields linux_syscall_apply_reply compares against"
 else
     bad "K3. the reply no longer fills num/status at the pinned offsets — every reply would fail the kernel's echo check and the task could only ever see -EPROTO"
+fi
+
+# ─── L. §5.3 (the plan's increment 4): the one MSR, both sides of its seam ──
+# arch_prctl(ARCH_SET_FS) is the single Linux semantic the KERNEL owns, and
+# every way it is silently wrong is invisible without a boot: a field never
+# cleared (a reused slot's stale TLS handed onward), a switch path that stops
+# loading it (two tasks sharing one base), an apply that trusts the grant's
+# address (the dangerous half unvalidated), a policy arm that grants more
+# than SET_FS at a non-canonical value, or a bound rewritten until it admits
+# everything. The host test bites the two pure functions; these clauses hold
+# the four call sites the host test cannot see.
+if grep -q '#define MSR_FS_BASE' "$UPH" && \
+   grep -q 'void user_write_fs_base(uint64_t base);' "$UPH" && \
+   grep -q 'void user_write_fs_base(uint64_t base)' "$UPC" && \
+   grep -q 'wrmsr(MSR_FS_BASE, base)' "$UPC" && \
+   [ "$(grep -c 'wrmsr(MSR_FS_BASE' "$UPC")" -eq 2 ]; then
+    ok "L. user_write_fs_base exists once — declared beside the gate, implemented over MSR_FS_BASE (the tree's ONLY writer, plus the gate's own zero)"
+else
+    bad "L. user_write_fs_base is missing, non-functional, or MSR_FS_BASE is written elsewhere too — §5.3's one kernel semantic has no single writer, so the invariant 'FSBASE == current task's fs_base' has nothing maintaining it"
+fi
+if grep -q 'wrmsr(MSR_FS_BASE, 0)' "$UPC"; then
+    ok "L1. gate init zeroes MSR_FS_BASE before any ring-3 task exists — the invariant is TRUE from the first ring-3 instruction, not established later"
+else
+    bad "L1. the gate no longer zeroes the FS base — the first scheduled task's %fs starts at firmware's leftover value, and every later write plays catch-up with an unknown baseline"
+fi
+if grep -qE 'uint64_t +fs_base;' "$PDH" && \
+   grep -q 'pd->fs_base = 0;' "$PDC" && \
+   grep -q 'pd->fs_stage_valid = 0;' "$PDC"; then
+    ok "L2. ProcessDescriptor carries fs_base, and the slot-reuse clear zeroes it AND its staged state beside personality"
+else
+    bad "L2. the field or its slot-reuse clearing is gone — the next occupant of a reused slot is scheduled with its predecessor's TLS base live in the MSR, pointing into someone else's address space"
+fi
+if grep -q 'user_write_fs_base(next->fs_base);' "$PDC"; then
+    ok "L3. every ring-3 switch-in loads FSBASE from the incoming task's field (proc_build_resume_frame — the single frame builder every switch honours)"
+else
+    bad "L3. the switch-in no longer writes FSBASE — two Linux tasks running back to back silently share the first one's TLS base, with nothing observable until a %fs walk reads the wrong task's data"
+fi
+stage_line=$(grep -n 'cur->fs_stage_valid = 1;' "$DISP" | head -1 | cut -d: -f1)
+arm_line53=$(grep -n 'cur->park_syscall = SYS_LINUX_TRAP_RESUME;' "$DISP" | head -1 | cut -d: -f1)
+deliver_line=$(grep -n 'k_linux_deliver(cur->pid, ch_r' "$DISP" | head -1 | cut -d: -f1)
+apply_line=$(grep -n 'user_write_fs_base(cur->fs_base);' "$DISP" | head -1 | cut -d: -f1)
+recheck_n=$(grep -c 'linux_fs_addr_is_user_canonical(' "$DISP")
+if [ -n "$stage_line" ] && [ -n "$arm_line53" ] && [ -n "$deliver_line" ] && \
+   [ -n "$apply_line" ] && [ "$stage_line" -lt "$arm_line53" ] && \
+   [ "$apply_line" -gt "$deliver_line" ] && [ "$recheck_n" -ge 1 ] && \
+   grep -q -- '-LINUX_EINVAL' "$DISP"; then
+    ok "L4. the seam holds: staged BEFORE the arm, applied only AFTER the reply is delivered, through the canonicality re-check (a granted SET_FS lands as a write; a bad address as -EINVAL)"
+else
+    bad "L4. the stage/apply seam is broken — no stage before the arm, a write that does not follow the reply, or the wrmsr no longer re-checks canonicality: the sidecar's grant alone would decide what reaches the MSR"
+fi
+if grep -q 'linux_arch_prctl_is_set_fs(uint64_t num, uint64_t cmd)' "$LABH" && \
+   grep -q 'int linux_fs_addr_is_user_canonical(uint64_t addr)' "$LABH" && \
+   grep -q 'return num == LINUX_ARCH_PRCTL && cmd == LINUX_ARCH_SET_FS;' "$LABC" && \
+   grep -q 'return addr <= LINUX_USER_ADDR_MAX;' "$LABC" && \
+   grep -q '#define LINUX_USER_ADDR_MAX' "$LABH"; then
+    ok "L5. both §5.3 bounds exist as the named pure contracts (one predicate at both seam ends, one unsigned canonicality compare the host test bites)"
+else
+    bad "L5. a §5.3 pure bound is gone or rewritten as something other than the named comparison — the host test's teeth bite these exact functions, and a non-pure replacement voids them while the guard's grep still passes"
+fi
+if grep -qF '158 => match (args[0], args[1]) {' "$LRS" && \
+   grep -qF '(0x1002, a) if a <= 0x0000_7FFF_FFFF_FFFF => {' "$LRS" && \
+   grep -qF '(0x1002, _) => Answer::Reply(0, E_INVAL),' "$LRS" && \
+   grep -qF 'const E_INVAL: i32 = -1;' "$LRS"; then
+    ok "L6. the sidecar's 158 arm grants ONLY SET_FS at a user-canonical address; a bad address is E_INVAL (a bad VALUE), everything else ENOSYS — CAP_EINVAL pinned at -1 for §5.7's map"
+else
+    bad "L6. the policy arm changed shape — a grant for a non-canonical address or a non-SET cmd, or a drifted E_INVAL constant (the map would then answer a different error than the policy meant)"
 fi
 
 echo

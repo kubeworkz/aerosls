@@ -756,6 +756,184 @@ budget (5), no checkpoint half (§8, v0.2's). And §3.7's round-trip
 measurement is now *possible* rather than owed-in-principle: there is a
 round trip to measure, still unmeasured.
 
+**Superseded since — see §10.8:** a real forward round trip has since run
+on QEMU twice per boot and its logs are committed; the boot guard
+described above remains unwritten, so the observation is one real round
+trip, not yet the full gate.
+
+### 10.8 What has landed — the boot proof (the round trip runs on the real machine)
+
+The one thing §10.7 said did not exist. A QEMU run now executes §3.3's
+steps 5–7 for real — spawn, forward, answer, resume, reap — and the
+serial logs are committed as evidence (`evidence/e7_phase5_shipped.log`,
+`evidence/e7_unified_entry3.log`, `evidence/e7_e3_multi_env.log`).
+Committed as `e7: increment 4 — the round trip is proven live on a real
+boot`, taking the number the plan had reserved for `fs_base` (§5.3); the
+number lives on the commit, the plan's sequence lives here — this
+addendum records the proof, and `fs_base` remains the next increment.
+
+**What runs.** The probe: `user/sidecar/fixtures/e7_linux_probe.S`
+assembled to a 70-byte flat image (one `.text`, `_start` at file offset
+0, the fixture's `build_probe.sh` carrying the exact build line) and
+embedded by `user/sidecar/src/e7_probe.rs` with `include_bytes!`. Before
+its event loop, the POSIX sidecar plants the payload at the TAIL of its
+own budget region — identity-mapped, because `rust_entry` already stands
+the heap there, so the write travels the heap's own mapping — builds a
+zero-capability manifest (§3.5's shape as a construction: the child's
+table gets only the messenger channel pair the create inserts;
+`image_kaddr` footnoted as the tail), and spawns through the real **328**
+(`k.linux_spawn` → `sys_sls_linux_spawn` →
+`cap_create_sidecar_in_personality`). The sidecar is the design-true
+creator: §3.5 places the task's single channel with *its environment's
+sidecar*, and `linux::service` — the answers — lives in that same
+binary.
+
+**What the serial log shows** (verbatim; shipped ISO, default Phase-5
+entry — the sequence recurs when the watchdog respawns the POSIX):
+
+```
+[SIDECAR] PID 105 'e7.linux.probe.0' released — runs on next schedule (BIB at 0x0000400000005000, entry 0x0000400000000000)
+[E7] probe: spawned ch_r0000000D
+[CAP] woken PID 104 (channel 11)
+[E7] linux: num=000000DA  ok
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 13)
+[E7] linux: num=00000027  -> ENOSYS
+[E7] linux: num=00000028  -> ENOSYS
+[E7] linux: num=000000E7  exit_group
+[PROC] PID 105 terminated.
+```
+
+Each `[E7] linux:` line is one completed round trip: the child's trap
+described from the `[gs:0x50..0x80)` capture, resolved to its one
+channel pair, posted, parked; the sidecar's answer (218 echoed, two
+outside-census numbers refused `-ENOSYS` per §11 Q5's policy, 231
+reaped) rode `k_linux_deliver` → `linux_syscall_apply_reply` → §5.7 back
+to ring-3 — and the NEXT line firing is the resume's proof: a task that
+never came back would issue no further traps. Across both boots: zero
+`refused` / `not delivered` / `stray trap` lines — those refusals exist
+and are guarded (clauses I–K); they simply did not fire.
+
+**The runs and their verdicts.** Shipped ISO default entry (the proof
+above); `tests/e3_multi_env_boot_check.sh` → 0 — three live rootfs at
+distinct storage regions, probe round trip inside the same boot;
+`tests/unified_boot_check.sh` → 18/18 — which by ITS OWN design contains
+no POSIX sidecar ("it would fight the kernel for the NIC and COM1"),
+hence no §3.5 endpoint, hence no Linux task can exist *there*; the proof
+lives on the Phase-5 entry of the same image, and the unified guard's
+absence-assertion is itself the evidence that this is architectural
+placement, not an omission. Alongside: `tests/linux_personality_check.sh`
+29/29 and its smoke 18/18 unchanged — a boot adds an observation, not a
+new clause.
+
+**Two environment findings, each with a boot's worth of confusion
+behind them.** (a) The kernel Makefile tracks no header dependencies, so
+a `process.h` change rebuilt only the files git rewrote; the resulting
+mixed-layout link manufactured phantom panics (`parent pid=0`, a
+`personality` field reading the impossible `4`) that a full
+`rm kernel/*.x86.o arch/x86/*.o` deleted outright. (b) The boot image is
+staged at physical `0x20000000` — past the end of a 512 MiB guest — so
+a `-m 512M` boot loads init into unbacked phys and dies at ring-3 entry
+on a `#PF` no code change explains; the harnesses' `-m 4G` is
+load-bearing, and every manual `-m 512M` run manufactures that fault.
+
+**What this proof is NOT.** `tests/linux_abi_shim_check.sh` (§10.2's
+boot guard — capability census, attribution and flood clauses) is still
+unwritten and §10.3's `E7_TOOTH` arms still have nothing to sabotage:
+what the logs prove is ONE honest forwarded round trip per spawn, not
+the census boundary, not the flood bound, not "the first user's actual
+work". The probe rides the sidecar-manifest spawn path with
+`image_entry = 0` by construction — no ELF/execve path exists (none was
+claimed). §3.7's round trip remains unmeasured: serial lines carry no
+timing, so "possible to measure" is still the honest status. And
+`fs_base` (§5.3, the plan's increment 4) and the `brk`/`mmap` budget (5)
+are untouched by this proof.
+
+### 10.9 What has landed — the plan's increment 4 (`fs_base`, §5.3)
+
+The one kernel-side Linux semantic, in the four places §5.3 names —
+landed, guarded, host-tested and PROVEN on a live boot (the thing §10.7
+said could not yet be done for anything, which §10.8 did for the round
+trip; this increment has both).
+
+- **The field, cleared where personality is cleared.**
+  `ProcessDescriptor.fs_base` sits beside `cr3`, with `fs_base_stage` and
+  `fs_stage_valid` carrying the one-forward-at-a-time staged grant;
+  `proc_clear_resume_state()` zeroes all three beside its personality
+  reset, so a reused slot never hands its predecessor's TLS to the next
+  occupant.
+- **The write, single-sited.** `user_write_fs_base()`
+  (`arch/x86/user_paging.c`, declared beside the gate) is the tree's only
+  writer of `MSR_IA32_FS_BASE`: gate init zeroes it once (the invariant
+  "FSBASE == current task's fs_base" is TRUE from the first ring-3
+  instruction), `proc_build_resume_frame()` loads `next->fs_base` on
+  every switch-in (the single frame builder every switch honours), and
+  the resume arm performs the granted SET — no personality branch, the
+  invariant instead of a special case.
+- **The seam: stage, grant, apply.** The first trap stages a real
+  `ARCH_SET_FS` through the shared predicate
+  `linux_arch_prctl_is_set_fs(num, args[0])` before the arm; the sidecar's
+  158 arm is the POLICY half (grant only `0x1002` at a user-canonical
+  address — `0x0000_7FFF_FFFF_FFFF` — `E_INVAL` for a bad address, ENOSYS
+  otherwise: SET_GS has no GSR, GET_FS's value lives in the kernel's
+  field); the reply arm re-checks `linux_fs_addr_is_user_canonical()`
+  and writes — the grant decides WHETHER, the mechanism still refuses a
+  value it cannot write, as -EINVAL in rax.
+
+**Host teeth.** `tests/linux_personality_host_test.c` 42 → **52 checks**
+(the census's own measured `0x47a1a8` must pass its own gate; the
+all-ones value must not; the predicate needs BOTH words). Guard 29 →
+**36 clauses** (set L: single writer, gate baseline, slot clear,
+switch-in, the stage/apply ordering *with the write strictly after the
+deliver*, the pure bounds, the sidecar arm) and smoke 18 → **25 passed**
+(seven new teeth t18–t24 — gutted writer, dropped baseline, deleted
+clear, deleted switch-in, deleted apply, cmd word dropped, bound widened
+to any u64). Three host tests that link `process.c` gained the weak
+`user_write_fs_base` stub in `tests/process_host_stubs.h` (the
+established pattern — their compile failure was the mechanism working).
+
+**Live proof** (`evidence/e7_fs_base_shipped.log`, shipped ISO, twice per
+boot — initial POSIX and its watchdog respawn):
+
+```
+[E7] linux: num=0000009E  ok          ← 158 arch_prctl granted by the sidecar
+[E7] linux: num=000000BB  -> ENOSYS   ← the LATCH: %fs:0 == the direct read, so the MSR moved
+[E7] linux: num=000000E7  exit_group  ← clean reap — not the segfault the failure path leaves
+```
+
+with zero MARKER 393 lines (the wrong-place tooth) and the only FAULT
+in the log being irqtest's own storm kill. **The live boot taught the
+fixture two lessons worth their own lines:** the resume clobbers
+caller-saved registers (the first run held `_start` in r8 and faulted on
+the kernel's leftover scratch — fault addr 0x16, then 0x10: two boots,
+two garbage values), so the address now rides r15, park_ctx's preserved
+set; and the %fs operand is displacement 0, because linear = FS_BASE +
+disp — adding `_start` twice would ask for the non-canonical
+`0x8000_0000_0000` by construction.
+
+**One build-system defect, fixed at the root this time.** The header
+edit repeated the `checkpoint_delta.h` incident from the Makefile's own
+comment: only the four edited `.c` files rebuilt, `cap.c` still read the
+OLD `ProcessDescriptor` layout, and init's first create panicked
+`[CS] CAP_EINVAL parent pid=0` — the same phantom that cost this session
+its first diagnosis. The Makefile now carries named prerequisites for
+`kernel/process.h`, `kernel/linux_abi.h` and `arch/x86/user_paging.h`
+over every kernel object (`$(X86_KERNEL_OBJS)`), in the same spirit as
+the `checkpoint_delta.h` line above it; `touch kernel/process.h` +
+`make -n kernel/cap.x86.o` proves the dependency fires.
+
+**What this increment is NOT.** `ARCH_GET_FS`/`SET_GS` are answered
+ENOSYS honestly (not in the census; a GET's value would have to travel
+back through a reply only the kernel can fill — a future arm, not a
+silent gap). The GDT question §5.3 asks to confirm rather than assume is
+answered by construction for the measured candidate: user data is `0x1B`
+(GDT slot 3), there is NO descriptor at `0x2b` (slot 5 is the TSS), and
+the census binary's musl TLS path loads no FS selector — `%fs`
+addressing runs off the MSR, which is what this increment writes. No
+`brk`/`mmap` budget (§5.4, the plan's 5), no §8 checkpoint half, no
+boot-guard script — and §3.7's round trip remains unmeasured: serial
+lines still carry no timing.
+
 ---
 
 ## 11. Open questions for review

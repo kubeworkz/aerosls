@@ -34,6 +34,8 @@
 #include "../net/consensus.h" // Multi-Node Partition Scaling Roadmap Phase 7 addendum -- SYS_SLS_CLUSTER_INIT/STATUS
 #include "cap.h"            // Seed Kernel Phase 1 -- SYS_SLS_CAP_* (289-297)
 #include "linux_abi.h"      // E7 increment 2 -- the Linux-personality branch (§3.3)
+#include "../arch/x86/user_paging.h"  // E7 §5.3 (the plan's inc 4) -- user_write_fs_base,
+                                      // the MSR write of a granted ARCH_SET_FS
 
 // ─── spawn owner-uid resolution ──────────────────────────────────────────────
 // The owner_uid threaded into program_spawn*()/program_load()/sys_sls_load()
@@ -130,6 +132,28 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                                    (uint64_t)(uintptr_t)arg);
                     cur->park_syscall = 0;  /* in-flight closes HERE — the
                                             * next stray refuses again */
+                    /* E7 §5.3 apply half: the granted ARCH_SET_FS lands
+                     * HERE — at the reply, inside this task's own trap,
+                     * before the return below reaches the sysret into the
+                     * new base. The GRANT is the sidecar's (its 158 arm);
+                     * the address is re-checked against
+                     * linux_fs_addr_is_user_canonical anyway, because the
+                     * wrmsr is the dangerous half — a denial (rax != 0)
+                     * leaves the old base untouched and returns the mapped
+                     * errno exactly as any other failed syscall would. */
+                    if (cur->fs_stage_valid) {
+                        cur->fs_stage_valid = 0;
+                        if (rax == 0) {
+                            if (!linux_fs_addr_is_user_canonical(
+                                    cur->fs_base_stage)) {
+                                rax = (uint64_t)(int64_t)(-LINUX_EINVAL);
+                            } else {
+                                cur->fs_base = cur->fs_base_stage;
+                                user_write_fs_base(cur->fs_base);
+                            }
+                        }
+                        cur->fs_base_stage = 0;
+                    }
                     return rax;
                 }
             }
@@ -151,6 +175,19 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                         (unsigned long)num,
                         linux_syscall_class_name(linux_syscall_class(num)));
                     return (uint64_t)(int64_t)(-LINUX_ENOSYS);
+                }
+                /* E7 §5.3 (the plan's increment 4), stage half: an
+                 * ARCH_SET_FS is captured HERE — before the post — and is
+                 * applied only if THIS forward's reply grants it (the
+                 * resume arm below, same predicate on both ends of the
+                 * seam). Every other forward clears the stage, so an old
+                 * TLS value can never wait for a grant it was not asked
+                 * for. */
+                cur->fs_base_stage = 0;
+                cur->fs_stage_valid = 0;
+                if (linux_arch_prctl_is_set_fs(num, largs[0])) {
+                    cur->fs_base_stage = largs[1];
+                    cur->fs_stage_valid = 1;
                 }
                 /* Arm BEFORE the post: cap_maybe_handoff (process.c) reads
                  * this state and skips the post's send-handoff — a sysret

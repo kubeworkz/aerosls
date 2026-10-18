@@ -23,6 +23,7 @@
 #define MSR_STAR         0xC0000081
 #define MSR_LSTAR        0xC0000082
 #define MSR_SFMASK       0xC0000084
+#define MSR_FS_BASE      0xC0000100  /* E7 §5.3: the one MSR the shim owns */
 #define MSR_GS_BASE      0xC0000101
 #define MSR_KERNEL_GS    0xC0000102
 
@@ -74,6 +75,15 @@ _Static_assert(sizeof(struct PerCPUData) == 0x80,
                "PerCPUData grows only by appending — every existing offset is frozen");
 
 extern struct PerCPUData per_cpu_data[4];  // one slot per core
+
+/* E7 §5.3 (the plan's increment 4): write MSR_IA32_FS_BASE for the task
+ * being switched in / the arch_prctl being granted. The ONLY writer of this
+ * MSR in the tree (gate init zeros it once, before any ring-3 exists) —
+ * called from process.c's proc_build_resume_frame (every switch-in) and
+ * syscall_dispatch.c's SYS_LINUX_TRAP_RESUME arm (a granted ARCH_SET_FS).
+ * Callers are ring-0; wrmsr is privileged. Declared here because the
+ * invariant it maintains belongs with the gate that programs STAR/LSTAR. */
+void user_write_fs_base(uint64_t base);
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 

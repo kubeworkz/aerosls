@@ -112,6 +112,39 @@ uint32_t linux_syscall_flags(uint64_t num);
  * Never NULL. */
 const char *linux_syscall_class_name(enum LinuxSyscallClass cls);
 
+/* ─── E7 §5.3 (the plan's increment 4) — arch_prctl's contracts ─────────
+ * The one Linux semantic the KERNEL unavoidably owns: the design's split is
+ * "the sidecar decides WHETHER the task may, the kernel does the write",
+ * so both halves of that sentence get a pure function — host-testable
+ * instead of boot-testable. The sidecar re-implements the same bound
+ * literally (user/sidecar/src/linux.rs's 158 arm, commented as the
+ * mirror) because the Rust side cannot include this header; the kernel
+ * re-checks the address AT THE WRITE regardless of what the grant said,
+ * because the wrmsr is the dangerous half. */
+#define LINUX_ARCH_PRCTL      158u           /* the census row (§5.6) */
+#define LINUX_ARCH_SET_FS     0x1002u        /* cmd word in args[0]    */
+#define LINUX_ARCH_SET_GS     0x1001u        /* no GSR in this kernel:
+                                                the sidecar always
+                                                answers it ENOSYS       */
+#define LINUX_ARCH_GET_FS     0x1003u        /* the value lives in the
+                                                kernel's field — this
+                                                sidecar cannot answer
+                                                (not in the census)    */
+#define LINUX_USER_ADDR_MAX   0x00007FFFFFFFFFFFULL
+
+/* Is this address legal as a task's FS base? User-canonical — bits 63..47
+ * all zero, one unsigned compare for a 48-bit user VA. 0 is legal
+ * (refusing it would invent a rule no Linux kernel has). The kernel
+ * applies this BEFORE every wrmsr, so a grant that somehow waved a
+ * non-canonical value through still ends as -EINVAL in rax instead of a
+ * garbage MSR. */
+int linux_fs_addr_is_user_canonical(uint64_t addr);
+
+/* Was this trap an ARCH_SET_FS? (num, args[0]) — ONE predicate used at
+ * BOTH ends of the stage/apply seam (first trap stages, resume arm
+ * applies), so the two ends can never disagree about what got staged. */
+int linux_arch_prctl_is_set_fs(uint64_t num, uint64_t cmd);
+
 /* ─── The errno map (§5.7) ─────────────────────────────────────────────────
  * Two families cross into the Linux task as negative rax: the Phase-3
  * CAP_E* syscalls return (-1)..(-12), and the Phase-5 k_chan_ path returns

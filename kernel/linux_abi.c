@@ -162,6 +162,28 @@ const char *linux_syscall_class_name(enum LinuxSyscallClass cls)
     }
 }
 
+/* ─── E7 §5.3 (the plan's increment 4) — arch_prctl, as two pure bounds ───
+ * Named here beside their siblings so the host test bites WITHOUT a boot:
+ * the canonicality of a proposed FS base (the kernel re-checks it at the
+ * wrmsr, whatever the sidecar's grant said) and the stage/apply predicate
+ * that both ends of the forward seam share. Nothing below reads kernel
+ * state: given the same two words, every caller gets the same answer, which
+ * is what makes "the sidecar decides, the kernel performs" assertable in
+ * BOTH directions rather than observed in one boot. */
+int linux_fs_addr_is_user_canonical(uint64_t addr)
+{
+    /* User-canonical on a 48-bit VA: bits 63..47 all zero — for an
+     * unsigned value, exactly addr <= 0x0000_7FFF_FFFF_FFFF. (0 passes:
+     * a degenerate but legal TLS base, and inventing a rejection here
+     * would be a rule no Linux kernel has.) */
+    return addr <= LINUX_USER_ADDR_MAX;
+}
+
+int linux_arch_prctl_is_set_fs(uint64_t num, uint64_t cmd)
+{
+    return num == LINUX_ARCH_PRCTL && cmd == LINUX_ARCH_SET_FS;
+}
+
 /* ─── The personality (E7 increment 2) ───────────────────────────────────── */
 int linux_personality_intercepts(uint32_t personality)
 {

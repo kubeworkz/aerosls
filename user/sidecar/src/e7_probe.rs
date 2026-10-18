@@ -34,8 +34,9 @@ use aerosls_proto::manifest::{
 
 /// The probe payload: `fixtures/e7_linux_probe.S`, built to a flat image
 /// (one `.text`, `_start` at file offset 0 — the create's flat mapper
-/// enters at `image_entry`, which is therefore 0). 70 bytes as committed;
-/// the fixture's header carries the exact build line.
+/// enters at `image_entry`, which is therefore 0). The committed .flat is
+/// the byte-exact output of fixtures/build_probe.sh; the fixture's header
+/// carries the exact build line.
 static PROBE: &[u8] = include_bytes!("../fixtures/e7_linux_probe.flat");
 
 /// The child's name — registered at create (the manifest's NAME record),

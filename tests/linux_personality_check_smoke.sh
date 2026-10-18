@@ -31,6 +31,7 @@ FILES=(
     kernel/syscall_dispatch.c
     kernel/chan.c
     arch/x86/user_paging.h
+    arch/x86/user_paging.c
     arch/x86/syscall.asm
     user/sidecar/src/linux.rs
     user/sidecar/src/entry.rs
@@ -77,7 +78,7 @@ tooth() {
 }
 
 echo "linux_personality_check_smoke — teeth for the E7 increment-2 wiring"
-echo "and increment-3 delivery guard"
+echo "and increment-3 delivery guard, and §5.3's one-MSR seam (clause set L)"
 echo "========================================================================"
 echo
 
@@ -212,6 +213,52 @@ else
     printf '%s\n' "$out" | grep "FAIL:" | head -5 | sed 's/^/           /'
     fail=$((fail+1))
 fi
+
+# ─── §5.3 teeth (the plan's increment 4: the one-MSR seam) ──────────────
+
+# L: the writer's body gutted — a user_write_fs_base that writes nothing is
+# the worst form of this bug: every caller looks correct, the MSR never moves.
+seed "$W/t18"
+sed -i 's/    wrmsr(MSR_FS_BASE, base);//' "$W/t18/arch/x86/user_paging.c"
+tooth fs-writer-gutted L "user_write_fs_base no longer writes MSR_FS_BASE" "$W/t18"
+
+# L1: the gate's zeroing dropped — the invariant then starts FALSE and every
+# later switch-in merely happens to overwrite firmware's leftover value.
+seed "$W/t19"
+sed -i 's/    wrmsr(MSR_FS_BASE, 0);//' "$W/t19/arch/x86/user_paging.c"
+tooth fs-baseline-gone L1 "gate init no longer zeroes MSR_FS_BASE" "$W/t19"
+
+# L2: the slot-reuse clear deleted — the reused slot hands the next occupant
+# its predecessor's TLS base, live in the MSR, from its very first schedule.
+seed "$W/t20"
+sed -i '/pd->fs_base = 0;/d' "$W/t20/kernel/process.c"
+tooth fs-clear-dropped L2 "the reused-slot fs_base reset is gone" "$W/t20"
+
+# L3: the switch-in write deleted — two Linux tasks running back to back
+# silently share the first one's TLS base, with nothing observable at all.
+seed "$W/t21"
+sed -i '/user_write_fs_base(next->fs_base);/d' "$W/t21/kernel/process.c"
+tooth fs-switch-unloaded L3 "the switch-in no longer loads the incoming task's FSBASE" "$W/t21"
+
+# L4: the apply write gutted — the grant is decided, the reply accepted, and
+# the task returns to a base that never moved: a silent lie to ring-3.
+seed "$W/t22"
+sed -i 's/ *user_write_fs_base(cur->fs_base);//' "$W/t22/kernel/syscall_dispatch.c"
+tooth fs-apply-missing L4 "the granted SET_FS no longer writes the MSR at the reply" "$W/t22"
+
+# L5: the predicate's cmd word dropped — now ANY arch_prctl (GET_FS, SET_GS,
+# an unknown cmd) stages a write of args[1], and the apply turns a GET into
+# a SET the sidecar never granted.
+seed "$W/t23"
+sed -i 's/return num == LINUX_ARCH_PRCTL && cmd == LINUX_ARCH_SET_FS;/return num == LINUX_ARCH_PRCTL;/' "$W/t23/kernel/linux_abi.c"
+tooth fs-predicate-loosened L5 "the stage/apply predicate ignores the cmd word" "$W/t23"
+
+# L6: the sidecar's canonical bound widened to "any u64" — the grant then
+# waves through exactly the values the kernel's re-check exists to refuse,
+# and -EINVAL becomes unreachable from the policy side.
+seed "$W/t24"
+sed -i 's/(0x1002, a) if a <= 0x0000_7FFF_FFFF_FFFF => {/(0x1002, a) if a <= 0xFFFF_FFFF_FFFF_FFFF => {/' "$W/t24/user/sidecar/src/linux.rs"
+tooth fs-sidecar-bound-loosened L6 "the sidecar's FS-base bound admits every u64" "$W/t24"
 
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"

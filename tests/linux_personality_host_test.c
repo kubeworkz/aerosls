@@ -233,6 +233,54 @@ int main(void)
         }
     }
 
+    /* ═══ E7 §5.3 (the plan's increment 4): arch_prctl's pure bounds ═══════
+     * The one Linux semantic the KERNEL owns, asserted where its siblings
+     * live — without a boot: the canonicality bound every wrmsr of an FS
+     * base is filtered by (the grant says WHETHER, this says whether the
+     * VALUE can be written), and the stage/apply predicate both ends of the
+     * forward seam share, so they cannot disagree about what got staged.
+     * The census's own measured call — arch_prctl(ARCH_SET_FS, 0x47a1a8)
+     * (tools/linux_syscall_census.txt) — must pass its own gate, or the
+     * first user's first hundred syscalls die at a check we wrote. ══════ */
+
+    CHECK(LINUX_ARCH_PRCTL == 158 && LINUX_ARCH_SET_FS == 0x1002u &&
+              LINUX_ARCH_SET_GS == 0x1001u && LINUX_ARCH_GET_FS == 0x1003u,
+          "arch_prctl's numbers are the Linux ABI's: 158, ARCH_SET_FS 0x1002,\n"
+          "      SET_GS 0x1001, GET_FS 0x1003 — literals where the branch, the\n"
+          "      stage and the sidecar's mirror each read them");
+    CHECK(linux_syscall_class(LINUX_ARCH_PRCTL) == LSC_MSR,
+          "158's census class is LSC_MSR — \"this one's semantics live in the\n"
+          "      kernel\" — not UNKNOWN (§5.6's row, the strata D1 leans on)");
+    CHECK(linux_fs_addr_is_user_canonical(0x47a1a8) == 1,
+          "the census's measured FS base (0x47a1a8) is canonical — the one\n"
+          "      call the first user actually makes passes its own gate");
+    CHECK(linux_fs_addr_is_user_canonical(0) == 1,
+          "0 is canonical — refusing it would invent a rule no Linux kernel\n"
+          "      has (the degenerate zero-TLS case is legal, just useless)");
+    CHECK(linux_fs_addr_is_user_canonical(0x0000400000000000ULL) == 1,
+          "USER_PROC_CODE_BASE (bits 63..47 all zero) is canonical — the\n"
+          "      probe's own SET_FS target passes");
+    CHECK(linux_fs_addr_is_user_canonical(0x0000800000000000ULL) == 0 &&
+              linux_fs_addr_is_user_canonical(0x00007FFFFFFFFFFFULL + 1) == 1 - 1,
+          "bit 47 set — one past the user maximum — is NOT a user-canonical\n"
+          "      address: the wrmsr refuses it even if the grant waved it through");
+    CHECK(linux_fs_addr_is_user_canonical(0xFFFF800000000000ULL) == 0 &&
+              linux_fs_addr_is_user_canonical(0xFFFFFFFFFFFFFFFFULL) == 0,
+          "a kernel-canonical value and the all-ones value are both refused —\n"
+          "      every-bit-set above all: an unvalidated wrmsr of -1 is how a\n"
+          "      mechanism becomes a story about one garbage MSR");
+    CHECK(linux_arch_prctl_is_set_fs(LINUX_ARCH_PRCTL, LINUX_ARCH_SET_FS) == 1,
+          "158+0x1002 IS the stage/apply pair — ONE predicate at both ends of\n"
+          "      the seam, so stage and apply can never disagree");
+    CHECK(linux_arch_prctl_is_set_fs(LINUX_ARCH_PRCTL, LINUX_ARCH_SET_GS) == 0 &&
+              linux_arch_prctl_is_set_fs(LINUX_ARCH_PRCTL, LINUX_ARCH_GET_FS) == 0,
+          "SET_GS / GET_FS are NOT the granted pair (no GSR in this kernel;\n"
+          "      GET_FS's value lives in the kernel's field — neither in census)");
+    CHECK(linux_arch_prctl_is_set_fs(218, LINUX_ARCH_SET_FS) == 0 &&
+              linux_arch_prctl_is_set_fs(LINUX_ARCH_PRCTL, 0xDEAD) == 0,
+          "a cmd-shaped argument under another number, or a cmd word under no\n"
+          "      real cmd, never stages a write — the predicate needs BOTH words");
+
     printf("linux_personality_host_test: %d passed, %d failed\n",
            checks_passed, checks_failed);
     return checks_failed == 0 ? 0 : 1;

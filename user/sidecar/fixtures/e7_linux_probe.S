@@ -20,6 +20,11 @@
  *       mismatch issues MARKER 392 (also asserted absent).
  *   40  — a third full round trip; its arrival is the sidecar's
  *       `[E7] linux: num=40 -> ENOSYS` line.
+ *   158 (arch_prctl, ARCH_SET_FS) — §5.3's one kernel semantic: the grant
+ *       must MOVE the MSR or the %fs read below walks into unmapped linear
+ *       0 and this task dies with every following line absent from the log;
+ *       its success latches as number 187 (0xBB, present only on success)
+ *       and its wrong-place variant issues MARKER 393 (absent, like 391/392).
  *   231 (exit_group) — the sidecar reaps; no reply is owed and this task
  *       never runs again (the hang below is unreachable by design).
  *
@@ -53,7 +58,48 @@ _start:
     /* 3. a third round trip: 40 must ARRIVE (the sidecar logs it). */
     mov     $40, %eax
     syscall
-    /* 4. exit_group(42): the sidecar reaps this task. */
+    /* 4. arch_prctl(ARCH_SET_FS, &_start) — §5.3's one kernel semantic.
+     *    rdi = cmd 0x1002, rsi = a user-canonical MAPPED address (the
+     *    image's own _start: USER_PROC_CODE_BASE + 0). Outcomes, each
+     *    visible in the serial log:
+     *      - DENIED: rax != 0 -> .Lhang, and NO latch line appears;
+     *      - granted but the MSR did not move: %fs:0 reads linear 0
+     *        (never mapped) -> #PF -> this task dies -> nothing below
+     *        runs, not even exit_group;
+     *      - success: direct read == %fs read, latch 187 (0xBB) issues,
+     *        and the sidecar's `[E7] linux: num=000000BB -> ENOSYS` is the
+     *        POSITIVE marker — its presence IS the assertion;
+     *      - the base moved but to the wrong place: MARKER 393 (asserted
+     *        ABSENT — the 391/392 discipline).
+     *
+     *    Register discipline, learned from the live boot that faulted
+     *    here: the target address rides r15 (callee-saved — park_ctx
+     *    preserves r12..r15), NEVER r8: the resume clobbers caller-saved
+     *    registers, and the first run read `(%r8)` with r8 left at a
+     *    kernel scratch value (fault addr 0x16/0x10 across two boots).
+     *    And the %fs operand is displacement 0, not the address again:
+     *    linear = FS_BASE + disp, so with FS_BASE = _start the read that
+     *    proves the base landed is %fs:0 — adding _start twice would ask
+     *    for 0x8000_0000_0000, non-canonical by construction. */
+    lea     _start(%rip), %r15
+    mov     %r15, %rsi
+    mov     $0x1002, %edi          /* ARCH_SET_FS */
+    mov     $158, %eax
+    syscall
+    test    %rax, %rax
+    jnz     .Lhang                 /* refused: parked forever, no latch */
+    mov     (%r15), %r13           /* the eight bytes at _start, direct  */
+    mov     %fs:0, %r14            /* FS_BASE + 0 == _start iff applied  */
+    cmp     %r13, %r14
+    je      .Lfs_ok
+    mov     $393, %eax             /* MARKER: base wrong-but-mapped */
+    syscall
+    jmp     .Lfs_done
+.Lfs_ok:
+    mov     $187, %eax             /* LATCH: the applied FS base read back */
+    syscall
+.Lfs_done:
+    /* 5. exit_group(42): the sidecar reaps this task. */
     mov     $42, %edi
     mov     $231, %eax
     syscall

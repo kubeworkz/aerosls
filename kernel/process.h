@@ -116,6 +116,27 @@ struct ProcessDescriptor {
     char       name[PROC_NAME_LEN];   // mirrors the SERVICE_PROCESS object name
     uint64_t   object_id;             // FNV-1a of the source SLS object
     uint64_t   cr3;                   // physical address of the process's PML4
+    uint64_t   fs_base;               // E7 §5.3 (the plan's increment 4): the live
+                                       // MSR_IA32_FS_BASE value for THIS task — the
+                                       // kernel's one Linux semantic. Zeroed at slot
+                                       // reuse beside personality and cleared
+                                       // forward-grant state (fs_base_stage), so a
+                                       // reused slot never hands its predecessor's
+                                       // TLS to the next occupant; written to the MSR
+                                       // at every ring-3 switch-in
+                                       // (proc_build_resume_frame) and the instant a
+                                       // granted ARCH_SET_FS lands (do_syscall's
+                                       // resume arm). Invariant: FSBASE == current
+                                       // task's fs_base, both directions.
+    uint64_t   fs_base_stage;          // §5.3: an ARCH_SET_FS value captured at the
+                                       // first trap and held for the sidecar's
+                                       // verdict — the sidecar decides WHETHER a
+                                       // task may set TLS, the resume arm performs
+                                       // the write. Only meaningful while
+                                       // fs_stage_valid is 1.
+    uint8_t    fs_stage_valid;         // 1 between that forward's arming and its
+                                       // reply (or refusal) — cleared here, at the
+                                       // apply, and at every non-SET forward.
     uint64_t   user_rip;              // entry point in user space
     uint64_t   user_rsp;              // current user-space stack pointer
     uint64_t   user_stack_vaddr;      // vaddr base of the 8-page user stack
