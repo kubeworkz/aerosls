@@ -166,6 +166,7 @@ X86_C_SRC   = kernel/kernel.c arch/x86/idt.c arch/x86/gdt.c arch/x86/vga.c kerne
               kernel/net_socket_service.c \
               kernel/boot_image.c \
               kernel/loader.c \
+              kernel/elf64_load.c \
               kernel/simi_x86.c \
               kernel/simi_runtime.c \
               kernel/simi_translate.c \

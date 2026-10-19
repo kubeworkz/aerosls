@@ -68,6 +68,12 @@ int main(void)
     p.envp        = envp;
     p.at_random   = random_bytes;
     p.execfn      = "/bin/aerobackup";
+    /* E7 increment 7: the builder translates every in-region pointer and
+     * the returned %rsp to region_vaddr. Identity here (the region's own
+     * host address) — every byte below is then exactly what the pre-v7
+     * builder produced, which is what makes the byte-exact clauses in this
+     * file pin the TRANSLATION too, not just the layout. */
+    p.region_vaddr = (uint64_t)(uintptr_t)region;
 
     memset(region, 0xAB, sizeof(region));   /* poison: every byte written is visible */
     rsp = linux_initial_stack_build(region, sizeof(region), &p);

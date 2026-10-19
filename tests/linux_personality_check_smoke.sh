@@ -36,7 +36,11 @@ FILES=(
     user/sidecar/src/linux.rs
     user/sidecar/src/entry.rs
     user/sidecar/src/e7_probe.rs
+    user/sidecar/src/e7_candidate.rs
     user/sidecar/fixtures/e7_linux_probe.S
+    user/sidecar/fixtures/build_candidate.sh
+    kernel/elf64_load.h
+    kernel/elf64_load.c
 )
 
 for f in "${FILES[@]}" "$GUARD"; do
@@ -81,8 +85,9 @@ tooth() {
 
 echo "linux_personality_check_smoke — teeth for the E7 increment-2 wiring"
 echo "and increment-3 delivery guard, §5.3's one-MSR seam (clause set L),"
-echo "increment 5's fd-class byte crossing (clause set M), and increment 6's"
-echo "mem-class budget span (clause set N)"
+echo "increment 5's fd-class byte crossing (clause set M), increment 6's"
+echo "mem-class budget span (clause set N), and increment 7's image class —"
+echo "the ONE ELF mapper and the §5.2 stack (clause set O)"
 echo "========================================================================"
 echo
 
@@ -381,6 +386,58 @@ tooth brk-refusal-errno N7 "the brk refusal answers an errno instead of the unch
 seed "$W/t41"
 sed -i '/E7MEM-BRK-OK/d' "$W/t41/user/sidecar/fixtures/e7_linux_probe.S"
 tooth mem-probe-marker-gone N8 "the probe's mem-block positive marker is gone" "$W/t41"
+
+# ─── Increment-7 teeth (the image class: the ONE ELF mapper, the §5.2 stack) ──
+
+# O1: the ET_EXEC gate inverted — every real candidate IS ET_EXEC, so the
+# inverted gate refuses the only images the mapper exists for and admits
+# the ET_DYN it must never bias (§5.1).
+seed "$W/t42"
+sed -i 's/if (ehdr->e_type != ELF_ET_EXEC) {/if (ehdr->e_type == ELF_ET_EXEC) {/' "$W/t42/kernel/elf64_load.c"
+tooth elf-gate-inverted O1 "the ET_EXEC gate is inverted (ET_EXEC refused, everything else admitted)" "$W/t42"
+
+# O2: the magic dispatch deleted — every ELF falls into the flat mapper
+# and enters at base+offset while its segments sit at their linked vaddrs.
+seed "$W/t43"
+sed -i '/image_is_elf = elf_blob_has_magic(/d' "$W/t43/kernel/cap.c"
+tooth elf-dispatch-gone O2 "the create's magic dispatch is gone" "$W/t43"
+
+# O3a: region_vaddr pointed at the HOST/phys address of the stack region —
+# every pointer in the image and the returned %rsp become physical
+# addresses, which a libc dereferences in its OWN space and faults on.
+# (The live bug increment 7's measurement caught; the cap host test pins
+# the fixed form.)
+seed "$W/t44"
+sed -i 's/sp.region_vaddr = stack_base;/sp.region_vaddr = linux_stack_phys;/' "$W/t44/kernel/cap.c"
+tooth stack-image-phys-pointers O3 "the stack image's pointers are no longer child vaddrs" "$W/t44"
+
+# O3b: the image's region grown back over the BIB's top page — step 9's
+# unconditional BIB write then clobbers the strings/auxv the builder just
+# wrote, and the child reads its own argc as the BIB magic.
+seed "$W/t45"
+sed -i 's/(size_t)stk_pages \* 4096 - 4096, &sp)/(size_t)stk_pages * 4096, \&sp)/' "$W/t45/kernel/cap.c"
+tooth stack-image-bib-clobber O3 "the §5.2 image no longer stops below the BIB page" "$W/t45"
+
+# O4: the entropy gate dead-coded — a zero-filled AT_RANDOM ships silently
+# and every canary seeded from it is worth nothing.
+seed "$W/t46"
+sed -i 's/if (entropy_get(rnd, sizeof rnd) != ENTROPY_OK) {/if (0) {/' "$W/t46/kernel/cap.c"
+tooth stack-image-no-entropy O4 "the AT_RANDOM entropy gate is dead-coded" "$W/t46"
+
+# O5: the candidate's spawn arm deleted — the boot measures only the flat
+# mapper again and every §5.1/§5.2 clause stays argued, not observed.
+seed "$W/t47"
+sed -i '/crate::e7_candidate::spawn(/d' "$W/t47/user/sidecar/src/entry.rs"
+tooth candidate-spawn-gone O5 "the census candidate's spawn arm is gone" "$W/t47"
+
+# O1b: the mapper routed back through user_map_page — a low-linked
+# segment's leaf is written through the shared kernel identity map's
+# huge-page entry and the child's first instruction fetch #PFs (the live
+# finding of increment 7's first census boot: rip=0x400000, error 0x15,
+# [LOADER] claiming R-X).
+seed "$W/t48"
+sed -i 's/cap_arch_map_page((uint64_t)(uintptr_t)pml4,/user_map_page(pml4,/' "$W/t48/kernel/elf64_load.c"
+tooth elf-unsafe-walk O1 "the ELF mapper routes its segments through user_map_page (the unsafe walk)" "$W/t48"
 
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"

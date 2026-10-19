@@ -54,7 +54,7 @@
  * Build and run:
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -o /tmp/simi_info_host_test \
  *       tests/simi_info_host_test.c kernel/loader.c kernel/simi_translate.c \
- *       kernel/simi_x86.c
+ *       kernel/simi_x86.c kernel/elf64_load.c kernel/linux_abi.c
  *   /tmp/simi_info_host_test
  */
 #include "kernel/loader.h"
@@ -201,6 +201,18 @@ static void upload(const char* name, const uint8_t* data, uint32_t len) {
     req.is_last     = 1;
     uint64_t rc = sys_sls_upload_binary(&req);
     if (rc != 0) { printf("FAIL: upload('%s') returned %llu, expected 0\n", name, (unsigned long long)rc); g_fail++; }
+}
+
+/* E7 increment 7: kernel/loader.c's ELF branch now delegates to
+ * kernel/elf64_load.c, which maps segments through the cap_arch_map_page
+ * arch hook (strong in arch/x86/user_paging.c for the kernel; weak-inert
+ * in kernel/cap.c for cap-linking tests — neither is in this link). This
+ * test never loads an ELF image; the stub satisfies the symbol in the
+ * same inert shape cap.c's weak definition uses. */
+int cap_arch_map_page(uint64_t pml4_phys, uint64_t vaddr, uint64_t paddr,
+                      uint32_t cap_perms) {
+    (void)pml4_phys; (void)vaddr; (void)paddr; (void)cap_perms;
+    return -1;
 }
 
 int main(void) {

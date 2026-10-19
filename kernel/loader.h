@@ -30,43 +30,12 @@ struct ServiceBinary {
 };
 
 // ─── Minimal ELF64 structures ─────────────────────────────────────────────────
-#define ELF_MAGIC0  0x7F
-#define ELF_MAGIC1  'E'
-#define ELF_MAGIC2  'L'
-#define ELF_MAGIC3  'F'
-#define ELF_CLASS64 2
-#define PT_LOAD     1
-#define PF_X        1       // segment execute permission
-#define PF_W        2       // segment write permission
-#define PF_R        4       // segment read permission
-
-struct ELF64Header {
-    uint8_t  e_ident[16];
-    uint16_t e_type;
-    uint16_t e_machine;
-    uint32_t e_version;
-    uint64_t e_entry;       // virtual address of entry point
-    uint64_t e_phoff;       // program header table offset
-    uint64_t e_shoff;
-    uint32_t e_flags;
-    uint16_t e_ehsize;
-    uint16_t e_phentsize;
-    uint16_t e_phnum;       // number of program headers
-    uint16_t e_shentsize;
-    uint16_t e_shnum;
-    uint16_t e_shstrndx;
-} __attribute__((packed));
-
-struct ELF64ProgramHeader {
-    uint32_t p_type;        // 1 = PT_LOAD
-    uint32_t p_flags;       // PF_X | PF_W | PF_R
-    uint64_t p_offset;      // offset of segment in binary
-    uint64_t p_vaddr;       // target virtual address
-    uint64_t p_paddr;
-    uint64_t p_filesz;      // bytes to copy from binary
-    uint64_t p_memsz;       // bytes to allocate (p_memsz - p_filesz = BSS)
-    uint64_t p_align;
-} __attribute__((packed));
+/* Moved (E7 increment 7) into kernel/elf64_load.h — the ELF64 structs and
+ * the PT_LOAD/PF_* constants now have ONE definition there, and this
+ * include is what keeps every consumer on it. It is also what lets the
+ * Linux-personality create (kernel/cap.c) share the same elf64_map_blob()
+ * this header's ELF branch now maps through. */
+#include "elf64_load.h"
 
 // ─── SIMI object format (AeroSLS-SIMI-ISA-v0.1.md, Phase 2; v0.3 Phase 6) ────
 // A SIMI-format binary is the flat .tmo container produced by the Phase 1

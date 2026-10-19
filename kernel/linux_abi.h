@@ -344,6 +344,24 @@ int32_t cap_code_from_linux_errno(int32_t linux_errno); /* 0 = no unique preimag
 #define LINUX_ELF64_PHENT     56u   /* sizeof(Elf64_Phdr); AT_PHENT's value */
 
 struct LinuxInitStackParams {
+    uint64_t       region_vaddr;  /* E7 increment 7: the vaddr this region is
+                                   * mapped at in the CHILD's page table.
+                                   * Every in-region POINTER this builder
+                                   * writes (the argv/envp slots and the
+                                   * AT_RANDOM/AT_EXECFN/AT_PLATFORM values)
+                                   * and the returned %rsp are offsets into
+                                   * the region translated to this base — a
+                                   * Linux child dereferences them in its OWN
+                                   * address space, where the region lives at
+                                   * stack_base, not at the host/phys address
+                                   * the builder writes through. A host test
+                                   * passes the region's own address
+                                   * (identity) and gets byte-identical
+                                   * images; the create passes the stack's
+                                   * user vaddr. The untranslated form ran
+                                   * the .flat probe (which never reads %rsp)
+                                   * and was caught by increment 7's
+                                   * measurement of the real candidate. */
     uint64_t       entry_vaddr;   /* AT_ENTRY: e_entry */
     uint64_t       phdr_vaddr;    /* AT_PHDR: vaddr of the program headers */
     uint16_t       phent;         /* AT_PHENT: LINUX_ELF64_PHENT */

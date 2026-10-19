@@ -122,10 +122,15 @@
  *   gcc -no-pie -std=c11 -Wall -Wextra -I . -I kernel \
  *       -o /tmp/cap_create_sidecar_host_test \
  *       tests/cap_create_sidecar_host_test.c kernel/cap.c kernel/chan.c \
- *           kernel/console_service.c kernel/env_console.c kernel/linux_abi.c
+ *           kernel/console_service.c kernel/env_console.c kernel/linux_abi.c \
+ *           kernel/elf64_load.c
  *   /tmp/cap_create_sidecar_host_test
  */
 #include "kernel/cap.h"
+#include "linux_abi.h"       /* E7 increment 7 (§5.2): PROC_PERSONALITY_LINUX
+                                * and the LINUX_AT_* the stack image carries */
+#include "kernel/entropy.h"  /* E7 increment 7: ENTROPY_* for the AT_RANDOM
+                                * gate's link stub */
 #include "tests/process_host_stubs.h"   /* per_cpu_data (weak), etc. */
 
 #include <stdio.h>
@@ -143,6 +148,20 @@ void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
  * service links; the test drives the console via console_service_tick()
  * with an empty input buffer anyway. */
 int serial_console_poll(char* out, size_t cap) { (void)out; (void)cap; return 0; }
+
+/* E7 increment 7 (§5.2): cap.c's Linux stack image needs 16 bytes of
+ * entropy for AT_RANDOM and REFUSES the create without them (kernel/
+ * entropy.c's pool is hardware-seeded, not linkable here). Refusing by
+ * default turns that refusal into a TESTED path; sections 18/20 arm it
+ * with a deterministic fill so the AT_RANDOM bytes read back through the
+ * child's page table can be compared byte for byte. */
+static int      g_entropy_armed = 0;
+int entropy_get(void* out, size_t n) {
+    uint8_t* o = (uint8_t*)out;
+    if (!g_entropy_armed) return ENTROPY_E_NOT_SEEDED;
+    for (size_t i = 0; i < n; i++) o[i] = (uint8_t)(0xA5 + i);
+    return ENTROPY_OK;
+}
 
 /* console_service.c prints each drained sidecar message under the kernel's
  * TX serializer (kernel/kernel_io.c, not linked here: no port I/O in a host
@@ -310,14 +329,23 @@ void* allocate_physical_ram_frame_for_partition(uint32_t partition_id) {
 /* Recording stub for the contiguous region allocator (POSIX-Environments
  * E3). The real one lives in frame_pool.c (not linked here); its allocation
  * logic — contiguity, quota, owner-tag, reclaim — is tested in
- * frame_quota_host_test.c. Here it only has to record the args so the
+ * frame_quota_host_test.c. Here it records the args so the
  * SYS_SLS_ALLOC_REGION test can prove the syscall passes the CALLER's own
- * partition and the requested size/alignment straight through, and returns a
- * stable fake base. */
-static uint32_t g_alloc_region_last_part   = 0xFFFFFFFFu;
+ * partition and the requested size/alignment straight through.
+ *
+ * E7 increment 7 (§5.2) widened this stub's job: the Linux child's stack
+ * IS one of these regions, and linux_initial_stack_build WRITES the
+ * argc/argv/envp/auxv image into it — a fake address cannot be written —
+ * so the stub now returns real, 4 KiB-aligned, zeroed host memory (the
+ * last return is recorded in g_contig_last_base). The E3 section's
+ * pass-through assertion checks against that recorded return instead of
+ * the old fixed literal, which is exactly as strong: it still proves the
+ * syscall handed the allocator's answer straight back to the caller. */
+static uint32_t g_alloc_region_last_part    = 0xFFFFFFFFu;
 static uint64_t g_alloc_region_last_nframes = 0;
 static uint64_t g_alloc_region_last_align   = 0;
 static int      g_alloc_region_calls        = 0;
+static uint64_t g_contig_last_base          = 0;
 uint64_t allocate_contiguous_frames_for_partition(uint32_t partition_id,
                                                   uint64_t nframes,
                                                   uint64_t align_frames) {
@@ -325,7 +353,12 @@ uint64_t allocate_contiguous_frames_for_partition(uint32_t partition_id,
     g_alloc_region_last_nframes = nframes;
     g_alloc_region_last_align   = align_frames;
     g_alloc_region_calls++;
-    return 0x50000000ULL;   /* fake, stable region base */
+    uint8_t* raw = (uint8_t*)malloc((size_t)nframes * 4096u + 4096u);
+    if (!raw) return 0;
+    uint8_t* p = (uint8_t*)(((uintptr_t)raw + 4095u) & ~(uintptr_t)4095u);
+    memset(p, 0, (size_t)nframes * 4096u);   /* like the real pool's frames */
+    g_contig_last_base = (uint64_t)(uintptr_t)p;
+    return g_contig_last_base;
 }
 
 /* Recording stub for the contiguous region FREE (POSIX-Environments E5). The
@@ -400,6 +433,25 @@ void user_map_page(uint64_t* pml4, uint64_t vaddr, uint64_t paddr, uint64_t flag
     pt[(vaddr >> 12) & 0x1FF] = (paddr & USER_PTE_FRAME_MASK) | flags;
 }
 
+/* E7 increment 7: the ELF mapper routes every segment through the REAL
+ * arch hook's contract (cap_arch_map_page: cap_perms W→0x02, X→0x04, NX
+ * unless X — kernel/cap.h). The real hook additionally re-points the
+ * child's path around the SHARED kernel identity map (user_map_page_safe);
+ * this test's PML4s are fresh/zeroed with no shared entries, so the same
+ * leaf install as user_map_page, with the hook's translation, is the
+ * faithful stand-in — and the E7c flag assertions still bite on the
+ * mapper's PF_*→cap_perms half, which lives in elf64_load.c. Strong, so it
+ * overrides cap.c's weak stub. */
+int cap_arch_map_page(uint64_t pml4_phys, uint64_t vaddr, uint64_t paddr,
+                      uint32_t cap_perms) {
+    uint64_t flags = USER_PTE_PRESENT | USER_PTE_USER;
+    if (!pml4_phys) return -1;
+    if (cap_perms & 0x02) flags |= USER_PTE_WRITE;      /* CAP_PERM_W */
+    if (!(cap_perms & 0x04)) flags |= USER_PTE_NOEXEC;  /* CAP_PERM_X */
+    user_map_page((uint64_t*)(uintptr_t)pml4_phys, vaddr, paddr, flags);
+    return 0;
+}
+
 /* The host test's PML4s are fresh/zeroed (no shared kernel identity map),
  * so identity mapping here is exactly user_map_page at the same address. */
 int user_map_identity(uint64_t* pml4, uint64_t phys, uint32_t npages,
@@ -426,7 +478,14 @@ static uint64_t leaf_pte(uint64_t vaddr) {
 
 static uint8_t* host_ptr(uint64_t vaddr) {
     uint64_t pte = leaf_pte(vaddr);
-    return pte ? (uint8_t*)(uintptr_t)(pte & USER_PTE_FRAME_MASK) : 0;
+    /* Frame PLUS the in-page offset: every caller before E7 increment 7
+     * read a page-aligned address (IMAGE_VBASE, BIB_VADDR), where the
+     * offset is zero and this was invisible — but the §5.2 stack image is
+     * read at %rsp and at the string pointers inside it, which are not
+     * aligned, and the frame-only form handed those reads the page's FIRST
+     * bytes (zeros on a stack whose image sits near the top). */
+    return pte ? (uint8_t*)((pte & USER_PTE_FRAME_MASK) | (vaddr & 0xFFFu))
+               : 0;
 }
 
 /* ─── Harness ─────────────────────────────────────────────────────────────── */
@@ -798,6 +857,61 @@ uint32_t env_storage_owner(uint64_t region_base) {
     return 0xFFFFFFFFu;
 }
 
+/* ─── E7 increment 7 (§5.2/§5.1): readers for the new sections ────────────
+ * The §5.2 stack image is read back THROUGH THE CHILD's page table
+ * (host_ptr), exactly as a libc would in its own address space — which is
+ * the point of these sections: a pointer the kernel wrote as a host/phys
+ * address cannot be followed here any more than it could in ring 3. */
+struct StackImage {
+    uint64_t argc;
+    uint64_t argv0_vaddr;
+    uint64_t rsp;
+    uint64_t aux[64][2];      /* type/value pairs; AT_NULL terminates */
+    int      naux;
+};
+static int read_stack_image(uint64_t rsp_vaddr, struct StackImage* si) {
+    uint64_t* w = (uint64_t*)host_ptr(rsp_vaddr);
+    uint64_t q;
+    int guard;
+    memset(si, 0, sizeof *si);
+    if (!w) return 0;
+    si->rsp = rsp_vaddr;
+    si->argc = w[0];
+    if (si->argc > 16) return 0;           /* the v1 argv is { name } */
+    si->argv0_vaddr = w[1];
+    q = 1 + si->argc;
+    for (guard = 0; guard < 32 && w[q] != 0; guard++) q += 1;
+    if (w[q] != 0) return 0;               /* argv must be NULL-terminated */
+    q += 1;
+    for (guard = 0; guard < 32 && w[q] != 0; guard++) q += 1;   /* envp */
+    q += 1;
+    for (; si->naux < 64; q += 2) {
+        si->aux[si->naux][0] = w[q];
+        si->aux[si->naux][1] = w[q + 1];
+        if (w[q] == 0) break;              /* AT_NULL */
+        si->naux++;
+    }
+    return 1;
+}
+/* The VALUE of an AT_* pair, or all-ones if the type is absent (so the
+ * zero-valued entries — AT_BASE/AT_SECURE/AT_PHNUM-of-a-flat-image — stay
+ * distinguishable from "not written"). */
+static uint64_t aux_get(const struct StackImage* si, uint64_t type) {
+    for (int i = 0; i <= si->naux; i++)
+        if (si->aux[i][0] == type) return si->aux[i][1];
+    return 0xFFFFFFFFFFFFFFFFULL;
+}
+/* The most recently created child: creates take the highest pid, so the
+ * newest live child is the highest-pid active slot that isn't the parent. */
+static struct ProcessDescriptor* newest_child(void) {
+    struct ProcessDescriptor* best = 0;
+    for (int i = 0; i < PROC_MAX; i++)
+        if (proc_table[i].active && proc_table[i].pid != 100 &&
+            (!best || proc_table[i].pid > best->pid))
+            best = &proc_table[i];
+    return best;
+}
+
 int main(void) {
     cap_init();
 
@@ -892,8 +1006,8 @@ int main(void) {
         g_cur_pid = 100;                 /* init: has sidecar_authority */
         g_alloc_region_calls = 0;
         uint64_t base = sys_sls_alloc_region(&ar);
-        CHECK(base == 0x50000000ULL,
-              "E3: an authority caller gets a region base back");
+        CHECK(base != 0 && base == g_contig_last_base,
+              "E3: an authority caller gets the allocator's region base back");
         CHECK(g_alloc_region_calls == 1 && g_alloc_region_last_part == 0 &&
               g_alloc_region_last_nframes == 16 && g_alloc_region_last_align == 4,
               "E3: the allocator is called with the caller's partition and the requested size/alignment");
@@ -3036,6 +3150,219 @@ int main(void) {
         host_stub_frame_usage = 0;
         host_stub_frame_free  = 0xFFFFFFFFULL;
         host_stub_partition_extra_id = 0xFFFFFFFFu;
+    }
+
+    /* ── 18. E7 increment 7 (§5.2): the Linux child's initial stack image ──
+     * cap_create_sidecar_in_personality with PROC_PERSONALITY_LINUX over
+     * the same flat image the SLS happy path used. The kernel must build
+     * the argc/argv/envp/auxv image INTO the child's contiguous stack
+     * region (never the per-page loop), hand the child a %rsp inside it —
+     * below the BIB's top page, which step 9 still writes — and every
+     * pointer in that image must be a CHILD vaddr (the builder's
+     * region_vaddr translation), not the host/phys address the builder
+     * writes through. Un-armed entropy must refuse before any of it. */
+    g_entropy_armed = 1;
+    {
+        struct Blob lb;
+        uint16_t lch = CAP_NONE;
+        uint32_t before = proc_count;
+        struct ProcessDescriptor* lc;
+        struct StackImage si;
+        uint64_t rnd_va;
+        const uint8_t* rb;
+        const char* xfn;
+        int rnd_ok, saw_sysinfo = 0;
+
+        build_valid_blob(&lb, image_kaddr, 0);
+        CHECK(cap_create_sidecar_in_personality(100, lb.data, lb.len,
+                                  CAP_NONE, CAP_NONE, &lch, 0,
+                                  PROC_PERSONALITY_LINUX) == 0,
+              "L1: a Linux-personality create over a flat image succeeds");
+        CHECK(proc_count == before + 1, "L1: exactly one process was created");
+        lc = newest_child();
+        CHECK(lc && lc->personality == PROC_PERSONALITY_LINUX,
+              "L1: the child carries the LINUX personality it was spawned with");
+        CHECK(lc && lc->user_rsp >= STACK_BASE &&
+              lc->user_rsp + 8 <= BIB_VADDR && (lc->user_rsp % 16) == 0,
+              "L1: %rsp is 16-byte aligned inside the stack, below the BIB's top page");
+        CHECK(lc && read_stack_image(lc->user_rsp, &si),
+              "L1: the stack image parses through the child's own page table");
+        CHECK(si.argc == 1, "L1: argc is 1 (the v1 argv is { name })");
+        {
+            const char* a0 = (const char*)host_ptr(si.argv0_vaddr);
+            CHECK(a0 && lc && strcmp(a0, lc->name) == 0,
+                  "L1: argv[0] is the child's name, through a child vaddr");
+        }
+        CHECK(aux_get(&si, LINUX_AT_ENTRY) == (lc ? lc->user_rip : 1),
+              "L1: AT_ENTRY is the child's entry");
+        CHECK(aux_get(&si, LINUX_AT_PAGESZ) == 4096,
+              "L1: AT_PAGESZ is 4096");
+        CHECK(aux_get(&si, LINUX_AT_PHNUM) == 0,
+              "L1: AT_PHNUM is 0 for a flat image (its headers don't exist to report)");
+        for (int i = 0; i < si.naux; i++)
+            if (si.aux[i][0] == 33) saw_sysinfo = 1;   /* AT_SYSINFO_EHDR */
+        CHECK(!saw_sysinfo,
+              "L1: AT_SYSINFO_EHDR is absent (no vDSO, §5.5)");
+        rnd_va = aux_get(&si, LINUX_AT_RANDOM);
+        rb = (const uint8_t*)host_ptr(rnd_va);
+        rnd_ok = rb != 0;
+        if (rnd_ok)
+            for (int i = 0; i < LINUX_AT_RANDOM_BYTES; i++)
+                if (rb[i] != (uint8_t)(0xA5 + i)) rnd_ok = 0;
+        CHECK(rnd_ok,
+              "L1: AT_RANDOM points at the stubbed entropy bytes, through a child vaddr");
+        xfn = (const char*)host_ptr(aux_get(&si, LINUX_AT_EXECFN));
+        CHECK(xfn && lc && strcmp(xfn, lc->name) == 0,
+              "L1: AT_EXECFN is the child's name, through a child vaddr");
+        CHECK(si.argv0_vaddr >= STACK_BASE && si.argv0_vaddr < BIB_VADDR &&
+              rnd_va >= STACK_BASE && rnd_va < BIB_VADDR,
+              "L1: every in-image pointer lands inside the child's stack region");
+        CHECK(lc && lc->linux_heap_base == BIB_STACK_TOP &&
+              lc->linux_heap_limit == BIB_STACK_TOP + BUDGET_MEM &&
+              lc->linux_brk_cur == lc->linux_heap_base,
+              "L1: the heap span starts above the stack (the increment-6 twin)");
+        CHECK(leaf_pte(BIB_VADDR) != 0,
+              "L1: the BIB's page is still mapped at the stack top");
+        {
+            uint8_t* bibp = host_ptr(BIB_VADDR);
+            CHECK(bibp && memcmp(bibp, SIDECAR_BIB_MAGIC, 8) == 0,
+                  "L1: the BIB sits at the stack-top page WITHOUT clobbering the §5.2 image");
+        }
+    }
+
+    /* ── 19. the AT_RANDOM gate (§5.2: refuse, never substitute) ───────────
+     * An UNSEEDED pool must refuse the whole create (CAP_ECONFLICT) — a
+     * stack image without entropy makes canaries worthless — and the
+     * half-built child must not survive: no process slot, and the
+     * contiguous stack region goes back to the CHILD's partition. */
+    g_entropy_armed = 0;
+    {
+        struct Blob lb2;
+        uint16_t lch2 = CAP_NONE;
+        uint32_t before2 = proc_count;
+        int frees_before = g_free_region_calls;
+        uint64_t region_before = g_contig_last_base;
+
+        build_valid_blob(&lb2, image_kaddr, 0);
+        CHECK(cap_create_sidecar_in_personality(100, lb2.data, lb2.len,
+                                  CAP_NONE, CAP_NONE, &lch2, 0,
+                                  PROC_PERSONALITY_LINUX) == CAP_ECONFLICT,
+              "L2: an unseeded entropy pool refuses the Linux create (§5.2: never a zero-filled AT_RANDOM)");
+        CHECK(proc_count == before2,
+              "L2: the refused create left no process behind");
+        CHECK(g_free_region_calls == frees_before + 1 &&
+              g_free_region_last_base == g_contig_last_base &&
+              g_contig_last_base != region_before &&
+              g_free_region_last_nframes == 4 &&
+              g_free_region_last_part == 0,
+              "L2: the refused create released its 4-frame stack region to the child's partition");
+    }
+
+    /* ── 20. E7 increment 7 (§5.1): the REAL census candidate as an image ──
+     * The exact bytes tools/linux_syscall_census.txt plants —
+     * user/sidecar/fixtures/e7_candidate.elf, a static non-PIE x86-64 ELF —
+     * loaded through the same create: segments land at their LINKED vaddrs
+     * with their own flags, the entry is e_entry, and the §5.2 image
+     * reports the image's own AT_PHDR/AT_PHNUM truthfully. */
+    {
+        static uint8_t cand[65536];
+        size_t cand_len = 0;
+        FILE* ef = fopen("user/sidecar/fixtures/e7_candidate.elf", "rb");
+        CHECK(ef != 0, "E7c: the committed candidate ELF is readable");
+        if (ef) { cand_len = fread(cand, 1, sizeof cand, ef); fclose(ef); }
+        CHECK(cand_len > 64 && cand_len < sizeof cand,
+              "E7c: the candidate ELF loaded into the buffer");
+        if (cand_len > 64) {
+            const uint8_t* eh = cand;
+            uint64_t e_entry = 0, e_phoff = 0;
+            uint16_t e_phnum = 0, e_phentsize = 0, e_type = 0;
+            struct Blob eb;
+            uint16_t ech = CAP_NONE;
+            uint32_t before3 = proc_count;
+            struct ProcessDescriptor* ec;
+            struct StackImage si2;
+            int segs_ok = 1, flags_ok = 1, mapped_any = 0;
+            uint64_t want_phdr = 0;
+            uint64_t c_stack_base;
+
+            memcpy(&e_entry,  eh + 24, 8);
+            memcpy(&e_phoff,  eh + 32, 8);
+            memcpy(&e_type,   eh + 16, 2);
+            memcpy(&e_phentsize, eh + 54, 2);
+            memcpy(&e_phnum,  eh + 56, 2);
+            CHECK(eh[0] == 0x7F && eh[1] == 'E' && eh[2] == 'L' && eh[3] == 'F',
+                  "E7c: it carries the ELF magic");
+            CHECK(e_type == 2,   /* ET_EXEC */
+                  "E7c: ET_EXEC — §5.1's gate: linked vaddrs, no bias");
+            CHECK(e_phentsize == LINUX_ELF64_PHENT,
+                  "E7c: 56-byte program headers");
+
+            g_entropy_armed = 1;
+            build_valid_blob(&eb, (uint64_t)(uintptr_t)cand, 0);
+            CHECK(cap_create_sidecar_in_personality(100, eb.data, eb.len,
+                                      CAP_NONE, CAP_NONE, &ech, 0,
+                                      PROC_PERSONALITY_LINUX) == 0,
+                  "E7c: the REAL candidate creates as a Linux child");
+            CHECK(proc_count == before3 + 1, "E7c: exactly one process");
+            ec = newest_child();
+            CHECK(ec && ec->personality == PROC_PERSONALITY_LINUX,
+                  "E7c: LINUX personality");
+            CHECK(ec && ec->user_rip == e_entry,
+                  "E7c: the entry is e_entry — the ELF's own linked address");
+
+            /* Each PT_LOAD: bytes at the linked p_vaddr, flags from p_flags. */
+            for (uint16_t i = 0; i < e_phnum &&
+                 e_phoff + (uint64_t)(i + 1) * e_phentsize <= cand_len; i++) {
+                const uint8_t* ph = cand + e_phoff + (uint64_t)i * e_phentsize;
+                uint32_t p_type = 0, p_flags = 0;
+                uint64_t p_offset = 0, p_vaddr = 0, p_filesz = 0;
+                const uint8_t* got;
+                uint64_t pte;
+                memcpy(&p_type,   ph + 0, 4);
+                memcpy(&p_flags,  ph + 4, 4);
+                memcpy(&p_offset, ph + 8, 8);
+                memcpy(&p_vaddr,  ph + 16, 8);
+                memcpy(&p_filesz, ph + 32, 8);
+                if (p_type != 1 /* PT_LOAD */ || p_filesz == 0) continue;
+                mapped_any = 1;
+                got = (const uint8_t*)host_ptr(p_vaddr);
+                if (!got || memcmp(got, cand + p_offset, p_filesz) != 0)
+                    segs_ok = 0;
+                pte = leaf_pte(p_vaddr);
+                if (!(pte & USER_PTE_PRESENT) || !(pte & USER_PTE_USER))
+                    flags_ok = 0;
+                if (((p_flags & 2) != 0) != ((pte & USER_PTE_WRITE) != 0))
+                    flags_ok = 0;      /* PF_W <=> writable */
+                if (((p_flags & 1) != 0) == ((pte & USER_PTE_NOEXEC) != 0))
+                    flags_ok = 0;      /* PF_X <=> executable */
+                if (!want_phdr && p_offset <= e_phoff &&
+                    e_phoff + (uint64_t)e_phnum * e_phentsize
+                        <= p_offset + p_filesz)
+                    want_phdr = p_vaddr + (e_phoff - p_offset);
+            }
+            CHECK(mapped_any && segs_ok,
+                  "E7c: every PT_LOAD's bytes land at its linked p_vaddr");
+            CHECK(flags_ok,
+                  "E7c: each segment's PTE carries the segment's own PF_W/PF_X");
+
+            /* The §5.2 image, now reporting the image truthfully. */
+            c_stack_base = IMAGE_VBASE
+                + ((uint64_t)((cand_len + 4095) / 4096)) * 4096 + 4096;
+            CHECK(ec && ec->user_rsp >= c_stack_base &&
+                  ec->user_rsp + 8 <= c_stack_base + STACK_BYTES &&
+                  (ec->user_rsp % 16) == 0,
+                  "E7c: %rsp sits 16-byte aligned in the candidate's stack region");
+            CHECK(ec && read_stack_image(ec->user_rsp, &si2),
+                  "E7c: the candidate's stack image parses");
+            CHECK(aux_get(&si2, LINUX_AT_ENTRY) == e_entry,
+                  "E7c: AT_ENTRY is the candidate's e_entry");
+            CHECK(aux_get(&si2, LINUX_AT_PHNUM) == e_phnum,
+                  "E7c: AT_PHNUM is the candidate's e_phnum");
+            CHECK(aux_get(&si2, LINUX_AT_PHENT) == LINUX_ELF64_PHENT,
+                  "E7c: AT_PHENT is 56");
+            CHECK(want_phdr != 0 && aux_get(&si2, LINUX_AT_PHDR) == want_phdr,
+                  "E7c: AT_PHDR is the candidate's program-header table, at its mapped vaddr");
+        }
     }
 
     if (g_fail == 0) printf("\nALL PASS\n");

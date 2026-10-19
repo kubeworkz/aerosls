@@ -58,6 +58,7 @@ extern crate alloc;
 pub mod allocator;
 pub mod applets;
 pub mod boot;
+pub mod e7_candidate;
 pub mod e7_probe;
 pub mod heap;
 pub mod linux;

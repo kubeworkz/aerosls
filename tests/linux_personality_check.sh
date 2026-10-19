@@ -85,6 +85,10 @@ LRS=user/sidecar/src/linux.rs
 LRE=user/sidecar/src/entry.rs
 LPRO=user/sidecar/src/e7_probe.rs
 FIX=user/sidecar/fixtures/e7_linux_probe.S
+E64H=kernel/elf64_load.h
+E64C=kernel/elf64_load.c
+CAND=user/sidecar/src/e7_candidate.rs
+CBUILD=user/sidecar/fixtures/build_candidate.sh
 
 # ─── B. The sibling per-CPU block, at the offsets the asm addresses ────────
 # The struct side is pinned by static asserts (a C reorder is a BUILD
@@ -514,8 +518,13 @@ if grep -q 'pd->linux_heap_base = 0;' "$PDC" && \
 else
     bad "N1. the mem state's slot-reuse clear is gone from process.c — the next occupant of a reused slot is handed its predecessor's brk_cur (whose grants map pages at a break it never asked for) and its live brk stage"
 fi
-if grep -qF 'if (personality == PROC_PERSONALITY_LINUX) {' "$CAPC" && \
-   grep -qF 'pd->linux_heap_base  = stack_base + (uint64_t)stk_pages * 4096;' "$CAPC" && \
+span_line="$(grep -nF 'pd->linux_heap_base  = stack_base + (uint64_t)stk_pages * 4096;' "$CAPC" | cut -d: -f1)"
+# The personality check is bound to the STAMP SITE (the line above the
+# stamp), not to the bare pattern: increment 7 added other
+# PROC_PERSONALITY_LINUX blocks to cap.c, and a free-standing pattern
+# match let the N2 mutation sail through them — a vacuous pass.
+if [ -n "$span_line" ] && \
+   sed -n "$((span_line - 1))p" "$CAPC" | grep -qF 'if (personality == PROC_PERSONALITY_LINUX) {' && \
    grep -qF '((m.budget_mem_bytes + 4095ULL) / 4096ULL)' "$CAPC" && \
    grep -qF 'const IMAGE_VBASE: u64 = 0x4000_0000_0000;' "$LPRO" && \
    grep -qF 'const MEM_BUDGET_BYTES: u64 = 64 * 1024;' "$LPRO" && \
@@ -576,6 +585,55 @@ if grep -qF 'E7MEM-BRK-OK' "$FIX" && \
     ok "N8. the probe fixture carries the mem block: brk query/grant/heap-write (the E7MEM positive marker), the denial-echo check, the W|X check, and four markers (395-398) the evidence asserts absent"
 else
     bad "N8. the probe's mem block is gone or gutted — the shipped boot would prove nothing about brk while reading exactly as green (the 391/392 discipline's whole point: the markers' ABSENCE is the assertion)"
+fi
+
+# ─── O. The plan's increment 7 (the image class): the ONE ELF mapper, the §5.2 stack ──
+# A real image format's load path has two halves that must not drift: the
+# mapper's gates (§5.1 — ET_EXEC, linked vaddrs, the flags from the
+# segment) and the create's stack image (§5.2 — child-vaddr pointers, the
+# BIB's page kept out of it, entropy refused rather than substituted).
+# Every clause below is a way a real ELF child is silently entered against
+# garbage that the .flat probe CANNOT see — which is exactly why
+# increment 7 exists. Teeth: clause set O in the smoke.
+if grep -qF 'int elf_blob_has_magic(const uint8_t* data, uint64_t size);' "$E64H" && \
+   grep -qF 'int elf64_map_blob(' "$E64H" && \
+   grep -qF 'if (ehdr->e_type == ELF_ET_DYN)' "$E64C" && \
+   grep -qF 'if (ehdr->e_type != ELF_ET_EXEC)' "$E64C" && \
+   grep -qF 'cap_arch_map_page((uint64_t)(uintptr_t)pml4,' "$E64C"; then
+    ok "O1. the ONE ELF mapper exists with §5.1's gates by name — magic-only dispatch, ET_DYN refused, nothing-but-ET_EXEC refused — and routes its segments through cap_arch_map_page's SAFE walk (a low-linked segment must shadow the shared kernel identity map, never write its leaf through a huge-page entry)"
+else
+    bad "O1. the ELF mapper's gates are gone, renamed, or routed back through user_map_page — an ET_DYN image mapped at its linked addresses with no bias, a non-ET_EXEC accepted by a mapper that believes its own header, or a low-linked segment (0x400000, inside the shared identity map) whose leaf lands in the kernel's own frames while the child's fetch still resolves through the supervisor huge page: the candidate #PFs at its first instruction while [LOADER] claims R-X"
+fi
+if grep -qF 'image_is_elf = elf_blob_has_magic(' "$CAPC" && \
+   grep -qF 'if (!elf64_map_blob(' "$CAPC" && \
+   grep -qF 'pd->user_rip   = image_is_elf ? elf_entry : image_vbase + m.image_entry;' "$CAPC"; then
+    ok "O2. the create dispatches on the MAGIC: the one mapper owns every ELF's segments, the entry is e_entry, never the flat mapper's base+offset — image format is an image property, never a personality inference (§5.1)"
+else
+    bad "O2. the create's magic dispatch is gone — an ELF would enter at base+offset while its segments sit at their linked vaddrs (first fetch from bytes that are not code), or the dispatch became a personality decision §5.1 forbids"
+fi
+if grep -qF 'built_rsp = linux_initial_stack_build(' "$CAPC" && \
+   grep -qF 'sp.region_vaddr = stack_base;' "$CAPC" && \
+   grep -qF '(size_t)stk_pages * 4096 - 4096, &sp);' "$CAPC" && \
+   grep -qF 'budget_stack_bytes < 2 * 4096u' "$CAPC"; then
+    ok "O3. the §5.2 image is built into the child's contiguous stack with CHILD-vaddr pointers (region_vaddr), one page short of the top so the unconditional BIB write cannot clobber it, over an 8 KiB floor that names the BIB-page-plus-image minimum"
+else
+    bad "O3. the stack image's contract broke — pointers built from the host/phys region address (a libc dereferences argv[0] in its OWN space and faults on unmapped linear), the image spanning the BIB's top page (argc/auxv clobbered after they were built), or a floor that admits a stack too small to hold either"
+fi
+if grep -qF 'if (entropy_get(rnd, sizeof rnd) != ENTROPY_OK)' "$CAPC" && \
+   grep -qF 'return CAP_ECONFLICT;' "$CAPC" && \
+   grep -qF 'free_contiguous_frames_for_partition(linux_stack_phys,' "$CAPC"; then
+    ok "O4. AT_RANDOM is entropy or refusal: an unseeded pool refuses the whole create (CAP_ECONFLICT), never a zero-filled substitute, and the refusal returns the half-built stack region to the partition"
+else
+    bad "O4. the entropy gate is gone — a stack image with zeroed AT_RANDOM bytes ships silently and every canary seeded from them is worth nothing, while the boot reads green"
+fi
+if grep -qF 'include_bytes!("../fixtures/e7_candidate.elf")' "$CAND" && \
+   grep -qF -- '-Wl,-Ttext=0x400000' "$CBUILD" && \
+   grep -qF -- '-no-pie' "$CBUILD" && \
+   grep -qF 'crate::e7_candidate::spawn(' "$LRE" && \
+   grep -qF 'crate::e7_candidate::CAND_NAME,' "$LRE"; then
+    ok "O5. the census candidate is a committed ET_EXEC fixture (reproducible, non-PIE build line) and the sidecar spawns it beside the probe — the controlled pair the boot measurement reads"
+else
+    bad "O5. the candidate's spawn path is gone — the boot measures only the flat mapper again and §5.1/§5.2's real-image clauses stay argued rather than observed"
 fi
 
 echo

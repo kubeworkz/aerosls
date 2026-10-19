@@ -46,7 +46,7 @@
  *       -o /tmp/console_tx_atomic_host_test \
  *       tests/console_tx_atomic_host_test.c kernel/cap.c \
  *       kernel/console_service.c kernel/kernel_io.c kernel/console.c \
- *       kernel/linux_abi.c
+ *       kernel/linux_abi.c kernel/elf64_load.c kernel/entropy.c kernel/sha256.c
  *   /tmp/console_tx_atomic_host_test
  */
 #include "kernel/cap.h"

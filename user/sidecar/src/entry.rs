@@ -22,7 +22,7 @@ use crate::allocator::BudgetAlloc;
 use crate::boot::{boot, BootCaps};
 use crate::heap::Bump;
 use aerosls_proto::bootinfo::BootInfo;
-use aerosls_proto::kabi::{CAP_CHAN_W, Kernel, RealKernel, TIMEOUT_NONE};
+use aerosls_proto::kabi::{CAP_CHAN_W, CAP_TYPE_DEV, Kernel, RealKernel, TIMEOUT_NONE};
 
 extern "C" {
     fn k_chan_send(chan: u32, tag: u32, flags: u16, payload: *const u8,
@@ -429,28 +429,70 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     // above installs the NetClient into the ProcManager so applets
     // can call ctx.net() for socket I/O.
 
-    // E7 boot proof (Linux ABI Shim Design §3.3 steps 5-7): spawn the
-    // Linux-personality probe from THIS sidecar — the design-true creator
-    // (§3.5: its one capability is the channel back to us, and the answers
-    // in linux::service below are the only path by which its syscalls
-    // succeed or fail). Failures are logged, never fatal: the proof is a
-    // proof, not a dependency of this sidecar's own boot.
-    match crate::e7_probe::spawn(&RealKernel, caps.budget_base, caps.budget_len) {
-        Ok(sp) => {
-            if crate::linux::track(
-                sp.ch_r,
-                sp.ch_w,
-                crate::e7_probe::PROBE_NAME,
-                0,
-                sp.heap_base,
-                sp.heap_limit,
-            ) {
-                klog(b"[E7] probe: spawned ch_r=", sp.ch_r, b"");
-            } else {
-                klog(b"[E7] probe: spawned but TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+    // E7 census scope (§10.12): the probe/candidate pair is spawned ONLY
+    // by the environment that owns hardware — the system POSIX profile
+    // mints `nic0.bar0` (CAP_TYPE_DEV) and the tenant profile carries no
+    // hardware caps at all (env_manager's tests pin "uart", "irq.timer.0"
+    // and "nic0.bar0" absent from every tenant manifest). The census is a
+    // SERIAL-measured instrument: its [LOADER] lines, markers and klogs
+    // all ride the one UART, and in a multi-environment boot they ride it
+    // DURING the irqtest's serial-loopback window — measured on an
+    // e3_multi_env boot, that volume overflowed the kernel's TX deferral
+    // ring (`[serial] loopback window overflow: 0x16e0 byte(s) dropped`)
+    // and took the tenants' own drop-proof `aero state=` lines with it,
+    // failing e3_multi_env_boot_check on a boot whose environments had
+    // actually come up. One pair per boot (the system POSIX and its
+    // watchdog respawn) keeps the proof and leaves each tenant's wire as
+    // quiet as it was before increment 7.
+    let census_host = bib.find_cap(CAP_TYPE_DEV, "nic0.bar0").is_some();
+    if census_host {
+        // E7 boot proof (Linux ABI Shim Design §3.3 steps 5-7): spawn the
+        // Linux-personality probe from THIS sidecar — the design-true creator
+        // (§3.5: its one capability is the channel back to us, and the answers
+        // in linux::service below are the only path by which its syscalls
+        // succeed or fail). Failures are logged, never fatal: the proof is a
+        // proof, not a dependency of this sidecar's own boot.
+        match crate::e7_probe::spawn(&RealKernel, caps.budget_base, caps.budget_len) {
+            Ok(sp) => {
+                if crate::linux::track(
+                    sp.ch_r,
+                    sp.ch_w,
+                    crate::e7_probe::PROBE_NAME,
+                    0,
+                    sp.heap_base,
+                    sp.heap_limit,
+                ) {
+                    klog(b"[E7] probe: spawned ch_r=", sp.ch_r, b"");
+                } else {
+                    klog(b"[E7] probe: spawned but TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+                }
             }
+            Err(rc) => klog(b"[E7] probe: spawn FAILED rc=", rc as u32, b""),
         }
-        Err(rc) => klog(b"[E7] probe: spawn FAILED rc=", rc as u32, b""),
+
+        // E7 increment 7 (§5.1/§5.2): the SAME create over a REAL ELF64 image
+        // — the census candidate fixture, segments at their linked vaddrs and
+        // entry at e_entry — a controlled pair with the .flat probe above:
+        // identical machine code, only the IMAGE FORMAT differs, so the serial
+        // log measures exactly how far a real ELF gets (§10.12 records the
+        // run). Like the probe: logged, never fatal.
+        match crate::e7_candidate::spawn(&RealKernel, caps.budget_base, caps.budget_len) {
+            Ok(sp) => {
+                if crate::linux::track(
+                    sp.ch_r,
+                    sp.ch_w,
+                    crate::e7_candidate::CAND_NAME,
+                    0,
+                    sp.heap_base,
+                    sp.heap_limit,
+                ) {
+                    klog(b"[E7] candidate: spawned ch_r=", sp.ch_r, b"");
+                } else {
+                    klog(b"[E7] candidate: spawned but TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+                }
+            }
+            Err(rc) => klog(b"[E7] candidate: spawn FAILED rc=", rc as u32, b""),
+        }
     }
 
     let mut boot_stats_sent = false;

@@ -1186,6 +1186,163 @@ carry no timing.
 
 ---
 
+### 10.12 What has landed — the plan's increment 7 (the image class: the real candidate, §5.1/§5.2)
+
+§5.1's "**the kernel parses [the ELF image], maps segments at their
+linked virtual addresses, and enters at `e_entry`**" and §5.2's initial
+stack are now mechanism — and, the whole point of the increment,
+OBSERVED rather than argued: a real `ET_EXEC` binary is loaded by the
+tree's ONE mapper and runs its entire syscall census on the machine.
+
+**One mapper (§5.1).** The ELF64 structs, the gates and the PT_LOAD loop
+moved out of `loader.c` into `kernel/elf64_load.{h,c}`, so the uploaded-
+program path and the Linux-personality create share one truth about
+segment flags, BSS zero-fill, partition charging and the image contract.
+Gates refuse by name BEFORE the first frame: not-ELF64, `ET_DYN` (there
+is no bias to give it), bounds, non-user-canonical vaddrs. The magic —
+and only the magic — picks the path (image format is an image property,
+never a personality inference); the entry becomes `e_entry`, never the
+flat mapper's `base+offset`.
+
+**The §5.2 stack, and what the measurement caught.** The Linux child's
+stack is ONE contiguous partition-charged region;
+`linux_initial_stack_build()` writes the argc/argv/envp/auxv image into
+it, with a new `region_vaddr` parameter translating every pointer in the
+image — and the returned `%rsp` — into the CHILD's address space. The
+image stops one page below the region's top so step 9's unconditional
+BIB write cannot clobber it (both truths survive: the probe still finds
+its BIB at the stack-top page and never reads `%rsp`; a libc child owns
+everything below it), an 8 KiB floor names the BIB-page-plus-image
+minimum, and an unseeded entropy pool REFUSES the create
+(`CAP_ECONFLICT`, region returned) rather than shipping a zero-filled
+`AT_RANDOM`.
+
+Two real bugs this increment's own measurement found, both pinned:
+
+1. **The untranslated image** — pointers built from the host/phys region
+   address. The `.flat` probe never reads `%rsp`, so it could not see
+   this; a libc dereferences `argv[0]` on its first line. Caught by the
+   cap host test before boot (`region_vaddr` is the fix, byte-identical
+   under identity, pinned by clause O3 / tooth t44).
+2. **The unsafe walk** — a real static binary links its segments LOW
+   (0x400000), squarely inside the child's SHARED kernel identity map
+   (supervisor 2 MiB huge pages, cloned by pointer). `user_map_page()`'s
+   walk treated the huge-page PD entry as a table pointer and wrote the
+   leaf into the kernel's own frames while the child's fetch still
+   resolved through the supervisor page. Measured on the FIRST census
+   boot: `[FAULT] Ring-3 #PF error=0x15 addr=0x400000 rip=0x400000`
+   with `[LOADER] ELF segment ... flags=R-X` printed above it — the
+   mapper entered the right address and the very first instruction
+   fetched non-executable. The mapper now routes segments through
+   `cap_arch_map_page()`'s safe walk (the fix create_sidecar's MEM caps
+   already had: re-point the CHILD's own path, replicate the shared
+   huge page at 4 KiB so the kernel keeps visibility of the rest).
+   Clause O1 / tooth t48 pin the routing.
+
+**The measurement — the census run.** The fixture
+(`user/sidecar/fixtures/e7_candidate.elf`, the probe source linked
+non-PIE; `fixtures/build_candidate.sh` reproduces it byte-exactly) is
+embedded and planted by `user/sidecar/src/e7_candidate.rs` and spawned
+beside the `.flat` probe — a CONTROLLED PAIR: identical machine code,
+identical sequence, only the image format differs. On the E3 ISO
+(`make x86-iso-e3`, 150 s serial capture):
+
+* **first run** (before the safe-walk fix): both candidates ENTER —
+  `rip=0x400000` proves the magic dispatch, the mapper and `e_entry` —
+  and die at their first instruction fetch (bug 2 above); the two
+  `.flat` probes complete the census (2× each marker);
+* **second run** (after): **4/4 children complete the whole census** —
+  `E7MEM-BRK-OK` ×4, `E7FD-WRITE-OK` ×4, the `0xBB` `fs_base` latch ×4,
+  `218` echoed, `39`/`40` mapped to `-ENOSYS`, `arch_prctl` applied and
+  read back through `%fs:0`, the fd-class byte crossing (success and
+  exact `-EBADF`), brk's span (query/grant/heap-write/over-budget echo),
+  `mprotect(W|X)` refused as `-EPERM`, `exit_group` reaped — and MARKER
+  391–398 all ABSENT (the 391/392 discipline), zero E7 Ring-3 faults.
+
+(One `[FAULT] Ring-3 ... error=0x0` in the same boot belongs to the
+irqtest applet suite's own p4-storm phase deliberately killing its
+target (observed: the system posix, code=134) — independent of E7; every
+census sequence completed around it.)
+
+**Where the census was too loud — measured, and the scope it earned.**
+The first scope (a pair from EVERY POSIX environment) turned the
+census into serial load, and the E3 multi-environment boot measured
+it: four POSIX instances, each pair's `[LOADER]` lines, markers and
+`[E7]` klogs riding the one UART — and riding it DURING the irqtest's
+serial-loopback window, whose deferred-TX ring is bounded. The kernel
+said so on the wire: `[serial] loopback window overflow: 0x16e0
+byte(s) dropped` — and what it dropped included the tenants' own
+drop-proof `[POSIX] aero state=` lines. `e3_multi_env_boot_check.sh`
+then failed `live rootfs: 2/3` on boots where every environment had
+actually come up (all spawn lines and all four census completions
+present in the same log): a regression this increment introduced, not
+the check's old lossy-marker flake. The pair is now spawned only by
+the environment that OWNS hardware — the system POSIX profile mints
+`nic0.bar0` (`CAP_TYPE_DEV`) while the tenant profile carries no
+hardware caps at all (`env_manager`'s tests pin `uart`, `irq.timer.0`
+and `nic0.bar0` absent from every tenant manifest) — so one boot
+carries one census (the system POSIX, plus its watchdog respawn),
+each tenant's wire stays as quiet as it was before increment 7, and
+the runs recorded above are exactly this scope.
+
+**Teeth.** Clause set O in `tests/linux_personality_check.sh` — O1 the
+gates + the safe walk, O2 the magic dispatch, O3 the §5.2 contract
+(child-vaddr pointers / BIB-page reservation / 8 KiB floor), O4 the
+entropy refusal, O5 the candidate's wiring — with teeth t42–t48 in the
+smoke (gate inverted, dispatch deleted, phys pointers, BIB clobber,
+entropy dead-coded, unsafe walk, spawn arm deleted). Host side:
+`cap_create_sidecar_host_test.c` gained L1 (the image through the real
+create, read back THROUGH the child's page table), L2 (the unseeded
+refusal returns the region to the partition) and E7c (the candidate's
+segments, flags, entry and AT_PHDR/PHENT/PHNUM truthfulness) — 377
+checks, plus the builder's 40 under `region_vaddr` identity.
+
+**Verified in this increment:** guard 57 clauses (exit 0) with clause
+set O added; smoke 49/49 including O's seven teeth (gate inverted,
+dispatch deleted, phys pointers, BIB clobber, entropy dead-coded,
+unsafe walk, spawn arm deleted), each reddening the clause it names;
+the cap host test green end to end (375+ checks, including the three
+new sections); the stack-builder host test 40/40 under the
+`region_vaddr` translation; `tests/run_all.sh` over every
+`*_host_test.c` green (the cap-linking family's build lines now also
+link `kernel/elf64_load.c`/`kernel/entropy.c`/`kernel/sha256.c`,
+`simi_info` its `linux_abi.c` half — the loader delegation and the
+entropy gate must be linkable everywhere cap.c/loader.c is);
+`tools/syntax_check_all.sh` 129/129; the conventions guard green after
+fixing the index-level debt it surfaced (four scripts committed
+non-executable; the `.flat`, the candidate `.elf` and the raw
+`evidence/*.log` serial captures now carry the `binary` attribute they
+always needed); `env_recycle_boot_check.sh` green standalone; the
+sidecar archives re-packed (`make selfhost-bootimage`) after the
+`user/` changes invalidated their stamps. The e3 batch failures were
+NOT absorbed as flake: they reproduced the census's serial overflow
+(the measurement above), and scoping the census to the owning
+environment is what fixes them — the re-run with that scope in place
+is the verification of this paragraph: `tests/run_checks.sh` over the
+whole tree exited 0 with **46 PASS / 0 FAIL / 7 SKIP**, the seven
+skips being the runtime guards that need a live cluster a build host
+does not have (`run_checks.sh` itself names them), and
+`e3_multi_env_boot_check.sh`, `linux_personality_check.sh` (clause
+set O), `sidecar_stamp_check.sh` and `stack_frame_budget_check.sh`
+among the 46.
+
+**What this increment is NOT.** The candidate is the probe's SOURCE
+linked as an `ET_EXEC` ELF — a controlled pair, not the designated
+first user: `aerobackup`'s musl binary has still never executed under
+the shim, and its census stays host-measured (`strace`,
+`tools/linux_syscall_census.txt`) while every surface beyond this
+sequence (`open`/`read`/`mmap`/…) remains ENOSYS by name. argv/envp are
+v1: `argv = { name }`, an empty environment — §5.2's environment-
+crossing record is un-landed here, named rather than invented in the
+call site. `ET_EXEC` only: no PIE, no interpreter, no dynamic linking
+(§12 untouched; §5.1 refuses the rest by name). The 8 KiB stack floor
+is a floor, not a measurement — §11's Q2 still stands; there is no
+vDSO by decision, and §11's Q5 (rseq/membarrier at start-up) is still
+open. `mmap`/`munmap` and `read`'s copy-IN remain the named gaps of
+§10.10/§10.11.
+
+---
+
 ## 11. Open questions for review
 
 1. **The first user: designated, built, and censused.** `AeroSLS-Roadmap-2026H2-v0.1.md` §5 says in bold that there is no named first user, and the tree agreed — no Go source, no `std`-Rust binary, every real operational workload bash or Python (§5.5.1) — so the target was a *decision*. It is now made and carried out: the backup operation, as `backup/aerobackup/` (a static single-threaded Rust rewrite of `backup/backup.sh`'s snapshot-and-retain core, 27 tests, no dependencies), designated in `tools/linux_abi_candidate.conf`, with the census measured and checked in at `tools/linux_syscall_census.txt` (§5.6). **The open question is no longer about the first user; it is whether this candidate is narrow enough to gate on.** Its measured surface is 27 syscalls, and the two that are structurally hardest — `arch_prctl(ARCH_SET_FS)` (§5.3) and the vDSO-backed `clock_gettime` — are both now named rather than discovered. Whether the other three operations follow, and in what order, is a product question this design does not answer.
@@ -1217,7 +1374,8 @@ Everything this document asserts about the tree, with its source:
 | `SYS_SLS_PROC_*` 160–162 | `kernel/process.h` |
 | `SYS_SLS_ALLOC_REGION` = 320 | `kernel/cap.h` |
 | `CAP_EINVAL`…`CAP_EPERM` (−1…−12), `CAP_ERR_PROTO`, `CAP_NONE` sentinel | `kernel/cap.h`; `kernel/chan.c` (`sys_sls_dev_mmap`) |
-| ELF64 loader: `PT_LOAD`, `p_flags`, zero-fill, partition-charged frames, returns `e_entry` | `kernel/loader.c` |
+| ELF64 image loading (gates, `PT_LOAD`, `p_flags`, zero-fill, partition-charged frames, `e_entry`) — the tree's ONE mapper, shared by the uploaded-program loader and the Linux create | `kernel/elf64_load.{h,c}` (extracted from `loader.c`, increment 7); guard clauses O1/O2 (§10.12) |
+| A real `ET_EXEC` candidate enters at `e_entry` and completes the whole census; the first measurement caught the unsafe low-vaddr walk (`#PF error=0x15 rip=0x400000`) it now routes around | `user/sidecar/src/e7_candidate.rs`; `user/sidecar/fixtures/e7_candidate.elf` + `build_candidate.sh`; §10.12's two runs; clause O1, tooth t48 |
 | Park/resume: `CapParkCtx`, `park_ctx`/`park_req`/`park_syscall`, `resume_sysret`, `cap_recv_resume`, `syscall_return_path` | `kernel/process.h`; `arch/x86/syscall.asm` |
 | Per-process address space (`user_clone_page_table`), no thread-group sharing | `kernel/process.c` |
 | `sidecar_authority` (E2), tenant profile, zero hardware caps | `kernel/process.h`; `user/init/src/posix_manifest.rs` |
@@ -1241,6 +1399,7 @@ Everything this document asserts about the tree, with its source:
 | Steps 5–7 delivered: the post-then-park forward, the arm-before-post resume, a stray resume refused by name | `kernel/chan.c` (`k_linux_forward`/`k_linux_deliver`); `kernel/syscall_dispatch.c`; `kernel/cap.c` (`cap_linux_find_channels`); guard clauses I–K (§10.7) |
 | A reply's status reaches `rax` only through the §5.7 map, after size and num-echo are enforced | `kernel/linux_abi.c` (`linux_syscall_apply_reply`); `tests/linux_personality_host_test.c` (42 checks, §10.7) |
 | The sidecar's first answers: 218 echoed, 231 reaped, everything else ENOSYS with its number logged | `user/sidecar/src/linux.rs`; `user/sidecar/src/entry.rs` (`service`/`append_wait`) |
+| The §5.2 image through the real create: child-vaddr pointers (`region_vaddr`), BIB-page reservation, 8 KiB floor, `AT_RANDOM` = entropy or `CAP_ECONFLICT` with the region returned | `kernel/cap.c` (steps 6–7); `kernel/linux_abi.{h,c}`; host tests L1/L2/E7c (377 checks); clauses O3/O4, teeth t44/t45/t46 (§10.12) |
 
 ## Appendix B — Named gaps, each with its destination
 

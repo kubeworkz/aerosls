@@ -537,7 +537,7 @@ uint64_t linux_initial_stack_build(uint8_t *region, size_t region_bytes,
         /* psABI: %rsp is 16-byte aligned at process entry — checked on the
          * ABSOLUTE address, since the region's own alignment is the
          * caller's to choose and an offset-only check would assume it. */
-        if ((((uintptr_t)region + c_off) % 16u) == 0) break;
+        if (((p->region_vaddr + (uint64_t)c_off) % 16u) == 0) break;
         ptr_pad += 8u;   /* one more 8-byte pad flips rsp's parity */
     }
 
@@ -562,28 +562,28 @@ uint64_t linux_initial_stack_build(uint8_t *region, size_t region_bytes,
         const char *s;
 
         for (i = 0; i < n_argv; i++) {
-            argv_out[i] = (uint64_t)(uintptr_t)w;
+            argv_out[i] = p->region_vaddr + (uint64_t)(w - region);
             s = p->argv[i];
             while (*s) *w++ = (uint8_t)*s++;
             *w++ = 0;
         }
         argv_out[n_argv] = 0;
         for (i = 0; i < n_envp; i++) {
-            envp_out[i] = (uint64_t)(uintptr_t)w;
+            envp_out[i] = p->region_vaddr + (uint64_t)(w - region);
             s = p->envp[i];
             while (*s) *w++ = (uint8_t)*s++;
             *w++ = 0;
         }
         envp_out[n_envp] = 0;
-        execfn_va = (uint64_t)(uintptr_t)w;
+        execfn_va = p->region_vaddr + (uint64_t)(w - region);
         s = p->execfn;
         while (*s) *w++ = (uint8_t)*s++;
         *w++ = 0;
-        platform_va = (uint64_t)(uintptr_t)w;
+        platform_va = p->region_vaddr + (uint64_t)(w - region);
         s = platform;
         while (*s) *w++ = (uint8_t)*s++;
         *w++ = 0;
-        random_va = (uint64_t)(uintptr_t)w;
+        random_va = p->region_vaddr + (uint64_t)(w - region);
         lab_memcpy(w, p->at_random, LINUX_AT_RANDOM_BYTES);
         w += LINUX_AT_RANDOM_BYTES;
 
@@ -614,5 +614,5 @@ uint64_t linux_initial_stack_build(uint8_t *region, size_t region_bytes,
         *(uint64_t *)(void *)(region + argc_off) = (uint64_t)n_argv;
     }
 
-    return (uint64_t)(uintptr_t)(region + argc_off);
+    return p->region_vaddr + (uint64_t)argc_off;
 }
