@@ -1348,6 +1348,212 @@ vDSO by decision, and §11's Q5 (rseq/membarrier at start-up) is still
 open. `mmap`/`munmap` and `read`'s copy-IN remain the named gaps of
 §10.10/§10.11.
 
+### 10.13 What is planned — the plan's increment 8 (the reply payload and the file class), scoped
+
+**Nothing in this section has landed.** It is written to increment 1's own
+discipline — the contracts before any mechanism (§10.5) — against the
+seams as they exist in the tree today, so the increment can be judged as
+a scope before a line of it exists. The two gaps §10.10 named — `read`'s
+copy-IN and the fd class that stayed ENOSYS beside it — are one
+increment because they are one boundary: increment 5 taught the forward
+to carry bytes OUT of the child, and this increment makes the reply
+carry bytes BACK and the paths out. (§10.11's `mmap`/`munmap` join only
+conditionally, as step 1 below — the diagnosis decides.)
+
+**What the increment must produce.** Two seams and one measurement: (1)
+the reply payload, host-tested on both sides; (2) the file class
+answered end to end; (3) the designated first user running with its
+REAL argv — `--storage /tmp/e7-census/sls_storage.img --backup-dir
+/tmp/e7-census/backups --kind hourly --retain 4`, `CANDIDATE_ARGS` as
+`tools/linux_abi_candidate.conf` records it — crossing on §5.2's ARGENV
+record, through its file work to `exit_group(0)`, every trap line of
+the run attributable and any remaining refusal named by the log line
+that proves it. That run is the gate's first half (§8).
+
+**The reply payload (the copy-IN), seam by seam.** Every place is named
+before it exists:
+
+- **`linux_fd_reply_plan(num, args)`** — the first-trap twin of
+  `linux_fd_write_plan` (`kernel/linux_abi.c`): per copy-IN number it
+  validates the CHILD's destination span (canonical, inside the user
+  range — the `(span_end - 1) > MAX` shape the write-plan host tests
+  already pin), clamps the count to a per-number chunk no larger than
+  `FD_PAYLOAD_CAP`, and refuses `-LINUX_EFAULT` before any post.
+  `read`'s count-0 rule is write's own, mirrored: `read(fd, NULL, 0)`
+  plans nothing BEFORE canonicality, because inventing -EFAULT there
+  would be a rule no kernel the candidate was compiled against has.
+- **The staged destination.** The copy-in aims where the FIRST trap
+  said, never where the reply says: the plan's (buffer VA, clamped
+  len) are staged in `struct ProcessDescriptor` beside `fs_base_stage`
+  (`kernel/process.h`), set before `k_linux_forward`, consumed at the
+  apply, cleared at every refusal and at slot reuse beside
+  `proc_clear_resume_state()`'s existing clears. `park_req` cannot
+  carry it — it holds the expected num as a VALUE precisely because
+  the first-trap frame died (§10.7), and `CapParkCtx` saves only
+  sysret-state registers. The stage is the value-shaped path, and its
+  lifecycle is four places where a stale destination would aim a
+  sidecar payload at a reused slot's successor — which is what makes
+  it clause work, not implementation detail.
+- **`linux_user_copy_in(dst, root, va, n)`** — the mirror of
+  `linux_user_copy_out` over the same four-level walk, and STRICTER
+  where it must be: every page present, USER **and writable**, in two
+  phases (validate the whole span, then write), allocating nothing.
+  Writable, not merely user: copy-out only needs readable, but copy-in
+  must never write a byte into a page the child itself could not have
+  written — or the sidecar would launder writes through the child's
+  read-only pages. That asymmetry is the new security property, and
+  its host test is M4's family extended to refusals-before-mutation.
+- **`k_linux_deliver`'s recv** (`kernel/chan.c`) — today
+  `k_chan_recv(… sizeof reply)` and `out.len != sizeof reply →
+  -CAP_ERR_PROTO`; it becomes a local of `72 + FD_PAYLOAD_CAP`
+  accepting exactly three shapes: 72 bytes (unchanged), `72 + n` where
+  `n` is echoed by the header's `ret` AND bounded by the staged len
+  (apply, copy in, `rax = n`), and anything else `-CAP_ERR_PROTO`.
+  The frame grows ~1 KiB on the resume path, so
+  `tests/stack_frame_budget_check.sh` is the teeth — and the fallback
+  if it reddens is NOT a static buffer: deliver runs concurrently on
+  SMP, each on its child's own resume frame, and the per-frame local is
+  what keeps that safe.
+- **`service()`'s bound** (`user/sidecar/src/linux.rs`) — the mirror
+  over the answer: a reply-payload number's payload must equal the
+  forwarded `args[2]`'s clamp (the clamp rides IN the description, as
+  in increment 5), returned through a new `Answer::ReplyBytes(ret,
+  bytes)` beside `Answer::Write`.
+
+**The paths (the forward's second shape).** `open`, `stat`, `lstat`,
+`unlink`, `mkdir` and `rename` carry a pathname OUT of the child:
+`linux_fd_path_plan` mirrors the write plan — copy-out of a
+NUL-terminated string bounded by `LINUX_PATH_CAP`, the twin of
+`FD_PAYLOAD_CAP` (1024), a span with no NUL within the cap refusing
+`-LINUX_ENAMETOOLONG` at the first trap. Named divergence: Linux's
+`PATH_MAX` is 4096; this shim refuses above 1024 by name, and the
+trigger to raise it is raising `FD_PAYLOAD_CAP` and both recv buffers
+together — not a quiet edit. `rename`'s two paths ride back to back,
+two NUL-terminated strings in one payload, split at the first NUL by
+the sidecar.
+
+**The §10.7 property changes here, by widening and not by relaxing.**
+"A payload that is not exactly 72 bytes is not a reply" stays TRUE for
+every number that planned no reply payload; the new truth is a second
+legal shape — 72 bytes plus a payload this request's own first trap
+allowed, bounded by the child's own clamp, echoed by `ret`, copied only
+where the child could write. The M-clause teeth that pin "exactly 72"
+are rewritten, not deleted, to pin both shapes, and every new refusal
+arm gets its own: payload with `n` beyond the staged len → `-EPROTO`;
+`ret != n` → `-EPROTO`; payload on a number with no reply plan →
+`-EPROTO`; a stage surviving an apply, a refusal or a slot reuse → its
+clause reddens.
+
+**The file class: what lands, and on whose code.** §5.6's class as the
+census measured it — `read`(0), `open`(2), `close`(3), `stat`(4),
+`lstat`(6), `lseek`(8), `fcntl`(72), `fsync`(74), `ftruncate`(77),
+`rename`(82), `mkdir`(83), `unlink`(87), `getdents64`(217): thirteen
+numbers. The kernel semantics are this increment's two seams and
+nothing more; every DECISION is the sidecar's existing VFS — which is
+D1 surviving its own file class: `user/vfs` already implements
+`open(task, path, flags, mode)`, `close`, `lseek`, `read`, `write`,
+`stat(path)` and `read_dir(path)` over `/` (aerofs-lite), `/dev` and
+`/tmp` (ramfs), mounted at boot (`user/sidecar/src/boot.rs`) and
+already exercised by the shell's redirects
+(`user/sidecar/tests/boot_tests.rs`). The new work is the BRIDGE, and
+it is small by construction:
+
+- `FdSlot` grows the File kind carrying the VFS fd and the open flags
+  it must echo (`F_GETFL`); `answer()` routes thirteen arms to the VFS
+  under the Linux task's VFS task id. An unknown kind keeps answering
+  ENOSYS — increment 5's rule, unchanged.
+- The flags need almost no translation: `user/vfs/src/vfs.rs` defines
+  `O_RDONLY/O_WRONLY/O_RDWR/O_CREAT/O_EXCL/O_TRUNC/O_APPEND` at
+  Linux's own octal values. What does not fit is named — the flag
+  word is `u16`, and `O_DIRECTORY`/`O_CLOEXEC` cannot fit in it — so
+  those bits are refused at `open` by name (trigger: widen the flag
+  word), never silently dropped.
+- `fcntl` answers exactly four commands — `F_GETFD`/`F_SETFD` (the
+  fd's own cloexec, which the VFS already tracks for `close_cloexec`)
+  and `F_GETFL`/`F_SETFL`; every other command is ENOSYS with the cmd
+  word logged, because a fabricated answer to a command nobody
+  measured is the placeholder failure in a new shape.
+- The struct forms are format references in `user/proto`, with golden
+  tests beside `argenv_wire_bytes_golden`: `struct stat` at musl's
+  x86-64 layout (144 bytes, field offsets pinned golden and proved
+  on-target by the probe reading back the fields it wrote) and
+  `struct linux_dirent64` (`d_reclen` 8-aligned, `d_name` NUL-padded,
+  records bounded by the reply payload).
+- `fsync` on a ramfs-backed slot answers 0 — the shmem-faithful
+  answer, since Linux's own tmpfs fsync is a no-op; durability of core
+  memory across a host failure is claimed by neither, and across
+  restore it is v0.2's CONTENTS question, not this one. A
+  device-backed slot answers ENOSYS until the cache has a flush entry
+  point to call — named, and unreachable from the census's single
+  `fsync` row, which lands on `/tmp`.
+
+**Step 0 — the diagnosis the first half is blocked on.** The firstuser
+still dies at `rip=0x28` before its file work, and no seam below
+matters until it does. What the E3 log already settles: the three
+children each earned the startup `arch_prctl`/`set_tid_address`/`brk`/
+`write` lines (the counts fit three of each) but the `num=` lines carry
+NO child name — so step 0.5 is that name on `service`'s log line, one
+line of Rust, after which every measurement is attributable. What else
+it settles: no `mmap`/`munmap` line exists at all (the census's 8/7
+rows are mid-run, never reached) and only two `exit_group` lines for
+three children — the death precedes both. A call whose RIP is 0x28 is
+a call THROUGH a NULL object's slot 0x28 — the shape of a failed
+allocation or a skipped initialization, not of an ENOSYS, which
+answers rather than jumps. The diagnosis decides step 1: if the
+evidence names `mmap`, anonymous `mmap`/`munmap` over the budget lands
+as step 1 — §5.4's second half minus file backing, which stays refused
+by name — and this section is amended with what was measured, not with
+a mechanism guessed.
+
+**Sequence.** 0: the attribution instrument, then the `rip=0x28`
+diagnosis. 1: whatever the diagnosis names (expected: anonymous
+`mmap`/`munmap`). 2: the reply payload, host teeth first —
+`linux_user_copy_in`, `linux_fd_reply_plan`, the three deliver shapes,
+the `service` bound. 3: the path plan, the VFS bridge, the thirteen
+arms. 4: the two format goldens. 5: the fixture probe on-target — a
+`fixtures/` file-class sequence (mkdir, open, write, lseek, read-back,
+stat, getdents, rename, unlink, close) ending in a marker line in the
+E7MEM/E7FD family, beside the probe/candidate pair. 6: the real-flags
+run — the measurement. Guard clause set **P** with teeth **t53+** in
+`tests/linux_personality_check.sh`/`_smoke.sh`; the census guard
+re-verified — its 27 rows stay classified, because classes are
+dispatch and the reply-payload capability is the plan's own
+per-number table, host-tested, not a new column the census check must
+understand.
+
+**The measurement, and its named risks.** The fixture sizes scale to
+the partition budget — the census stays the host measurement at its
+64 MiB fixture — and the gate reads the OPERATION, not a byte-identical
+histogram: the snapshot appears under `--backup-dir`, the rename
+lands, the retention count holds, the directory lists, exit 0 with
+zero unattributed traps. Two risks are named NOW rather than
+discovered. `clock_gettime` (228): the no-vDSO proof row (§5.5) says
+the first user makes this call once, and NO time source exists across
+the sidecar's ABI (verified against `kabi.rs` and `linux.rs` — there
+is none), so if that call panics the workload, the run's last ENOSYS
+line IS the evidence and the time seam is the NEXT increment — a
+shared change (`aerosls-proto`'s `kabi` is shared by every sidecar,
+with the gate that implies) whose three candidate sources are a
+kernel-anchored manifest record beside ARGENV, CPUID+rdtsc for the
+monotonic half, or widening ARGENV itself. `mmap`(8)/`munmap`(7)
+mid-run: if the run reaches malloc's large allocations, the same
+anonymous-map question answers itself from the run's own ENOSYS
+lines. `poll`(1) and `execve`(1) stay refused by name, as below.
+
+**What this increment is NOT.** `poll` — its revents are a copy-in of
+a REWRITTEN array plus console-input state this shim has never had; it
+belongs to the input class, unscoped. `execve` — the spawn class.
+`clock_gettime` — the time seam named above. File-backed `mmap`.
+Permissions reported but never enforced — mode comes from the VFS's
+own metadata, and the first refusal a real workload meets is where
+enforcement gets scoped, with its trigger. Symlinks — neither
+filesystem has them. `chmod`/`chown`/`utimens`/`flock`/`dup`/`pipe` —
+ENOSYS, and absent from the census, which is the census's own
+discipline for staying out. Sockets — `devfs`'s refusal unchanged.
+brk shrink — still §10.11's refusal. Threads, signal delivery and the
+checkpoint half of the gate keep their named destinations (Appendix
+B). §11's Q2, Q4 and Q5 are untouched here.
+
 ---
 
 ## 11. Open questions for review
@@ -1417,9 +1623,12 @@ Everything this document asserts about the tree, with its source:
 | Six argument registers not captured by the trap path | every forwarded syscall gets wrong arguments (§3.4) | E7, §3.4 |
 | No initial stack/auxv builder | static libc start-up fails before `main` (§5.2) | E7, §5.2 |
 | No `MSR_IA32_FS_BASE` handling | TLS setup fails; musl/glibc binaries die early (§5.3) | E7, §5.3 |
-| No `brk`/`mmap` → budget mapping (`brk` landed, increment 6, §10.11; `mmap`/`munmap` remain) | sub-allocating heaps and `munmap` still refuse (§5.4) | E7, §5.4 |
+| No `brk`/`mmap` → budget mapping (`brk` landed, increment 6, §10.11; `mmap`/`munmap` remain) | sub-allocating heaps and `munmap` still refuse (§5.4) | E7, §5.4 — scoped as increment 8's step 1 if its step-0 diagnosis demands anonymous maps (§10.13); otherwise the next increment |
 | No `CAP_E*` → Linux errno table (and a `CAP_NONE` sentinel in returns) | silent wrong errors (§5.7) | E7, §5.7 |
 | Target designated, but no candidate binary and therefore no artifact | the table is still unmeasured; `--check` reports a named skip rather than a pass | write the crate, add the musl target, run `--run` |
 | No thread groups / `clone` / `futex` | Go and every threaded runtime are out (§7) | named as Go's gate; unscoped |
 | No ARM64 userspace OS | E7 cannot run there (§4.1) | H2 item #1 |
 | No environment checkpoint/restore | the inherited gate cannot be passed (§8) | POSIX roadmap v0.2 §12 item 1 |
+| No reply payload: `read` and the file class never cross back (§10.10's named gap) | the first user cannot open, read, stat, list, rename or prune — its file work never leaves the sidecar (§5.6) | E7 increment 8, §10.13 (scoped) |
+| No time source across the sidecar's ABI | `clock_gettime` (228) refuses; the no-vDSO proof (§5.5) shows the first user makes this call | named §10.13: a shared change, its own increment after 8, decided by the run's evidence |
+| No console-input state, so `poll` cannot answer | `poll` (census ×1) refuses; a blocking read never waits | the input class, unscoped (named §10.13) |
