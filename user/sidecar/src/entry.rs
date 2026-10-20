@@ -493,6 +493,33 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
             }
             Err(rc) => klog(b"[E7] candidate: spawn FAILED rc=", rc as u32, b""),
         }
+
+        // The designated first user (§10.12's named boundary): backup/
+        // aerobackup's OWN static musl binary (tools/linux_abi_candidate.
+        // conf), embedded as built — ET_EXEC, unmodified, the census target
+        // finally executing instead of being straced on the host. argv is
+        // v1 (`argv = { name }`), so it runs WITHOUT its flags: the run
+        // measures how far an unmodified real libc binary gets — crt, TLS,
+        // the §5.2 stack image and auxv, then wherever it stops (a usage
+        // write and exit_group, the first -ENOSYS name, or a fault). Like
+        // the pair above: logged, never fatal.
+        match crate::e7_firstuser::spawn(&RealKernel, caps.budget_base, caps.budget_len) {
+            Ok(sp) => {
+                if crate::linux::track(
+                    sp.ch_r,
+                    sp.ch_w,
+                    crate::e7_firstuser::USER_NAME,
+                    0,
+                    sp.heap_base,
+                    sp.heap_limit,
+                ) {
+                    klog(b"[E7] firstuser: spawned ch_r=", sp.ch_r, b"");
+                } else {
+                    klog(b"[E7] firstuser: spawned but TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+                }
+            }
+            Err(rc) => klog(b"[E7] firstuser: spawn FAILED rc=", rc as u32, b""),
+        }
     }
 
     let mut boot_stats_sent = false;
