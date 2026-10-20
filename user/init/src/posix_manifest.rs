@@ -170,6 +170,7 @@ pub fn build_posix_manifest(
             log_level: 1,
         }),
         flags_value: Some(0),
+        argenv: None,
         signature: None,
     };
 
@@ -287,6 +288,7 @@ pub fn build_posix_manifest_tenant(
             log_level: 1,
         }),
         flags_value: Some(0),
+        argenv: None,
         signature: None,
     };
 

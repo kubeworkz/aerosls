@@ -62,7 +62,8 @@ for f in kernel/linux_abi.h kernel/linux_abi.c kernel/process.h kernel/process.c
          kernel/cap.h kernel/cap.c kernel/syscall_dispatch.c kernel/chan.c \
          arch/x86/user_paging.h arch/x86/user_paging.c arch/x86/syscall.asm \
          user/sidecar/src/linux.rs user/sidecar/src/entry.rs \
-         user/sidecar/src/e7_probe.rs user/sidecar/fixtures/e7_linux_probe.S; do
+         user/sidecar/src/e7_probe.rs user/sidecar/fixtures/e7_linux_probe.S \
+         user/sidecar/src/e7_firstuser.rs user/proto/src/manifest.rs; do
     if [ ! -f "$f" ]; then
         echo "ABORT: $f missing — the guard cannot be evaluated at all." >&2
         exit 2
@@ -89,6 +90,8 @@ E64H=kernel/elf64_load.h
 E64C=kernel/elf64_load.c
 CAND=user/sidecar/src/e7_candidate.rs
 CBUILD=user/sidecar/fixtures/build_candidate.sh
+LFU=user/sidecar/src/e7_firstuser.rs
+MANR=user/proto/src/manifest.rs
 
 # ─── B. The sibling per-CPU block, at the offsets the asm addresses ────────
 # The struct side is pinned by static asserts (a C reorder is a BUILD
@@ -634,6 +637,47 @@ if grep -qF 'include_bytes!("../fixtures/e7_candidate.elf")' "$CAND" && \
     ok "O5. the census candidate is a committed ET_EXEC fixture (reproducible, non-PIE build line) and the sidecar spawns it beside the probe — the controlled pair the boot measurement reads"
 else
     bad "O5. the candidate's spawn path is gone — the boot measures only the flat mapper again and §5.1/§5.2's real-image clauses stay argued rather than observed"
+fi
+# O6/O7 hold §5.2's environment-crossing record (SIDECAR_TAG_ARGENV) at
+# BOTH ends of the seam it crosses: the kernel's parse (bounded, refusing
+# by name, consulted by the stack-image site with the v1 fallback intact)
+# and the Rust format reference + the spawn sites that author the record.
+# Every clause here is a way a Linux child silently gets the EMPTY
+# environment again — the exact state this record exists to end — while
+# every other §5.2 clause stays green reading argc alone. The cap host
+# test's L3/L4 sections bite the bytes; the smoke's t49–t52 bite these.
+if grep -qF '#define SIDECAR_TAG_ARGENV       0x000E' "$CAPH" && \
+   grep -qF '#define SIDECAR_MANIFEST_MAX_ARGV  8' "$CAPH" && \
+   grep -qF '#define SIDECAR_MANIFEST_MAX_ENVP  16' "$CAPH" && \
+   grep -qF '#define SIDECAR_MANIFEST_ARGENV_BYTES 512' "$CAPH" && \
+   grep -qF 'char     argenv_arena[SIDECAR_MANIFEST_ARGENV_BYTES];' "$CAPH" && \
+   grep -qF 'case SIDECAR_TAG_ARGENV: {' "$CAPC" && \
+   grep -qF 'if (ac > SIDECAR_MANIFEST_MAX_ARGV ||' "$CAPC" && \
+   grep -qF 'if (q[j] == 0) return CAP_EINVAL;' "$CAPC" && \
+   grep -qF 'if (q != rp + rlen) return CAP_EINVAL;' "$CAPC" && \
+   grep -qF 'm.argc = ac;' "$CAPC" && \
+   grep -qF 'for (uint32_t i = 0; i < m.argc; i++)' "$CAPC" && \
+   grep -qF 'argv[m.argc] = 0;' "$CAPC" && \
+   grep -qF 'for (uint32_t i = 0; i < m.envc; i++)' "$CAPC" && \
+   grep -qF 'envp[m.envc] = 0;' "$CAPC" && \
+   grep -qF 'argv[0] = pd->name;' "$CAPC"; then
+    ok "O6. the ARGENV record exists by name with its bounds, the parse refuses by name (counts/arena ERANGE, interior NUL and trailing bytes EINVAL), and the §5.2 site consults it with the v1 fallback (argv = { name }, empty env) intact"
+else
+    bad "O6. the environment-crossing record is gone from one half of the seam — the parse would refuse every record as an unknown tag (flags=0, or ship a record whose strings can silently overflow/truncate), or the stack-image site would ignore it and hand every Linux child the empty environment again while every other §5.2 clause stays green"
+fi
+if grep -qF 'pub const TAG_ARGENV: u16 = 0x000E;' "$MANR" && \
+   grep -qF 'pub const MAX_ARGV: usize = 8;' "$MANR" && \
+   grep -qF 'pub const MAX_ENVP: usize = 16;' "$MANR" && \
+   grep -qF 'pub const ARGENV_MAX_STR_BYTES: usize = 512;' "$MANR" && \
+   grep -qF 'recs.push((TAG_ARGENV, p));' "$MANR" && \
+   grep -qF 'TAG_ARGENV => {' "$MANR" && \
+   grep -qF 'pub const LINUX_DEFAULT_ENV: &[&str] = &["PATH=/bin", "HOME=/root"];' "$LRS" && \
+   grep -qF 'argenv: Some(ArgEnv::new(&[PROBE_NAME], LINUX_DEFAULT_ENV)),' "$LPRO" && \
+   grep -qF 'argenv: Some(ArgEnv::new(&[CAND_NAME], LINUX_DEFAULT_ENV)),' "$CAND" && \
+   grep -qF 'argenv: Some(ArgEnv::new(&[USER_NAME], LINUX_DEFAULT_ENV)),' "$LFU"; then
+    ok "O7. the Rust format reference carries the record with the kernel's bounds and emits it, the environment crosses from one shared default list, and all three Linux spawn sites author the record (firstuser, probe and candidate — the pair stays a pair)"
+else
+    bad "O7. the record's Rust half or a spawn site is gone — the format reference would refuse its own record as unknown, the two halves of the wire format would drift apart silently, or a Linux child would cross with no record at all and be handed the empty environment while its sibling gets a real one"
 fi
 
 echo

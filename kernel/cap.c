@@ -3342,7 +3342,7 @@ int cap_create_sidecar_in_personality(uint32_t parent_pid,
     }
 
     /* Caps (≤16) + the fixed records (personality, name, image, budget,
-     * cpu, limits, bootstrap, flags, signature = 9) + slack. */
+     * cpu, limits, bootstrap, flags, argenv, signature = 10) + slack. */
     if (hdr->record_count > SIDECAR_MANIFEST_MAX_CAPS + 10)
         return CAP_ERANGE;
 
@@ -3515,6 +3515,68 @@ int cap_create_sidecar_in_personality(uint32_t parent_pid,
             sc->size_bytes = *(const uint64_t*)(rp + 2 + nlen + 8);
             sc->rights     = rp[2 + nlen + 16];
             m.n_caps++;
+            break;
+        }
+        case SIDECAR_TAG_ARGENV: {
+            /* §5.2's environment-crossing record (matches
+             * user/proto/src/manifest.rs TAG_ARGENV): argc u16, envc u16,
+             * then argv strings and envp strings each as len u16 + bytes,
+             * argv first. The strings are copied into the fixed arena as
+             * C strings — linux_initial_stack_build consumes C strings —
+             * and every refusal here is BY NAME before any child exists:
+             * a count over the fixed arrays or bytes over the arena is
+             * CAP_ERANGE; a short header, an unterminated string shape,
+             * an interior NUL, or bytes trailing the last string are
+             * CAP_EINVAL. A truncating parse is not an option here: a
+             * child whose environment silently stopped at its author's
+             * 100th byte would read as success while being wrong. */
+            if (rlen < 4) return CAP_EINVAL;
+            uint16_t ac = *(const uint16_t*)(rp + 0);
+            uint16_t ec = *(const uint16_t*)(rp + 2);
+            if (ac > SIDECAR_MANIFEST_MAX_ARGV ||
+                ec > SIDECAR_MANIFEST_MAX_ENVP) {
+                kernel_serial_printf(
+                    "[CS] CAP_ERANGE: ARGENV record: argc=%u envc=%u "
+                    "(limits %u/%u)\n",
+                    ac, ec, SIDECAR_MANIFEST_MAX_ARGV,
+                    SIDECAR_MANIFEST_MAX_ENVP);
+                return CAP_ERANGE;
+            }
+            const uint8_t* q = rp + 4;
+            for (uint32_t s = 0; s < (uint32_t)ac + ec; s++) {
+                if (q + 2 > rp + rlen) return CAP_EINVAL;
+                uint16_t slen = *(const uint16_t*)(q);
+                q += 2;
+                if (q + slen > rp + rlen) return CAP_EINVAL;
+                for (uint16_t j = 0; j < slen; j++)
+                    if (q[j] == 0) return CAP_EINVAL;  /* a length-prefixed
+                                                        * string with an
+                                                        * interior NUL is
+                                                        * malformed — the
+                                                        * copy would silently
+                                                        * truncate it */
+                if ((uint32_t)m.argenv_used + slen + 1u
+                        > SIDECAR_MANIFEST_ARGENV_BYTES) {
+                    kernel_serial_printf(
+                        "[CS] CAP_ERANGE: ARGENV record: string bytes "
+                        "over %u\n", SIDECAR_MANIFEST_ARGENV_BYTES);
+                    return CAP_ERANGE;
+                }
+                char* dst = m.argenv_arena + m.argenv_used;
+                for (uint16_t j = 0; j < slen; j++) dst[j] = (char)q[j];
+                dst[slen] = '\0';
+                if (s < ac) m.argv_off[s] = m.argenv_used;
+                else        m.env_off[s - ac] = m.argenv_used;
+                m.argenv_used = (uint16_t)(m.argenv_used + slen + 1);
+                q += slen;
+            }
+            /* Bytes trailing the last string: a counted list with junk
+             * behind it is malformed, not a v2 extension (this record is
+             * not length-prefixed per entry). */
+            if (q != rp + rlen) return CAP_EINVAL;
+            m.argc = ac;
+            m.envc = ec;   /* last-wins, like NAME: two records cannot
+                            * interleave their strings in the arena */
             break;
         }
         case SIDECAR_TAG_BOOTSTRAP:
@@ -3855,11 +3917,15 @@ int cap_create_sidecar_in_personality(uint32_t parent_pid,
      * with nothing; a Linux binary cannot). The layout is
      * linux_initial_stack_build()'s (host-tested as byte-exact); this site
      * owns the VALUES:
-     *   argv = { the child's own NAME, NULL }, envp = empty — §5.2 says
-     *     argv/envp are the environment's to define and cross on the
-     *     spawn request; no manifest record carries them yet, so v1 hands
-     *     the process name as argv[0] and an empty environment — named
-     *     as un-landed in §10.12 rather than invented here;
+     *   argv/envp come from the manifest's ARGENV record (§5.2's
+     *     environment-crossing record, SIDECAR_TAG_ARGENV) when it is
+     *     present — the sidecar knows the command line and the environment
+     *     (it is the thing that ran exec), so argv/envp are its to define;
+     *     an ABSENT record is the v1 fallback: argv = { the child's own
+     *     NAME, NULL }, an empty environment — which keeps every manifest
+     *     built before the record existed running byte-identically, and
+     *     gives a record with no argv entries a sane argv[0] rather than
+     *     an argc-0 stack no libc expects;
      *   AT_ENTRY/AT_PHDR/AT_PHENT/AT_PHNUM come from the loaded image
      *     (phnum 0 for a flat image, whose own headers don't exist to
      *     report — a real libc binary must be an ELF, §5.1);
@@ -3872,8 +3938,13 @@ int cap_create_sidecar_in_personality(uint32_t parent_pid,
      * candidate cannot — which is the whole point of increment 7. */
     if (personality == PROC_PERSONALITY_LINUX) {
         struct LinuxInitStackParams sp;
-        const char* argv[2];
-        const char* envp[1];
+        /* §5.2's environment-crossing record: the ARGENV strings live in
+         * m's fixed arena, so the pointers handed the builder are offsets
+         * into m — valid for the whole create. The absent-record fallback
+         * (argc/envc both zero, the parse's zeroed defaults) is v1:
+         * argv = { name }, an empty environment. */
+        const char* argv[SIDECAR_MANIFEST_MAX_ARGV + 1];
+        const char* envp[SIDECAR_MANIFEST_MAX_ENVP + 1];
         uint8_t rnd[LINUX_AT_RANDOM_BYTES];
         uint64_t built_rsp;
 
@@ -3892,9 +3963,17 @@ int cap_create_sidecar_in_personality(uint32_t parent_pid,
             pd->cr3 = 0;   /* the address is no longer a live table */
             return CAP_EINVAL;
         }
-        argv[0] = pd->name;
-        argv[1] = 0;
-        envp[0] = 0;
+        if (m.argc > 0) {
+            for (uint32_t i = 0; i < m.argc; i++)
+                argv[i] = m.argenv_arena + m.argv_off[i];
+            argv[m.argc] = 0;
+        } else {
+            argv[0] = pd->name;   /* the v1 argv, one argument long */
+            argv[1] = 0;
+        }
+        for (uint32_t i = 0; i < m.envc; i++)
+            envp[i] = m.argenv_arena + m.env_off[i];
+        envp[m.envc] = 0;   /* no record: the v1 empty environment */
         if (entropy_get(rnd, sizeof rnd) != ENTROPY_OK) {
             kernel_serial_printf(
                 "[CS] CAP_ECONFLICT: entropy pool not seeded — refusing "

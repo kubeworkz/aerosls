@@ -9,12 +9,18 @@
 //! `tools/linux_abi_candidate.conf`. Nothing about the binary is adapted for
 //! the shim: it is the candidate's census target as built.
 //!
-//! What this run MEASURES, and what it cannot: argv is v1 (§5.2 — the create
-//! crosses `argv = { name }` and nothing else), so the binary is invoked as
-//! `e7.linux.user.0` with NO flags: its `--storage/--retain` operation cannot
-//! start here, and the environment-crossing record that would carry its
-//! arguments is the un-landed §5.2 work, named rather than invented at this
-//! call site. The question this child answers is therefore the honest first
+//! What this run MEASURES, and what it cannot: argv keeps v1's SHAPE —
+//! §5.2's environment-crossing record (`SIDECAR_TAG_ARGENV`) is landed, and
+//! this child crosses `argv = { USER_NAME }` through it, so the binary is
+//! invoked as `e7.linux.user.0` with NO flags: its `--storage/--retain`
+//! operation cannot start here (a flag string invented at this call site
+//! would be a new command line, not this census's measurement). The
+//! record's envp half carries this environment's default environment
+//! (`PATH=/bin`, `HOME=/root`, linux.rs), so a real libc's `getenv` is
+//! answered off the §5.2 image instead of an empty environment — the
+//! second half of "argv/envp are the environment's to define" (§5.2),
+//! which the create previously had nothing to cross them on. The question
+//! this child answers is therefore the honest first
 //! one: does an unmodified real libc binary get through crt, TLS (§5.3), the
 //! §5.2 stack image and its auxv, and where does it stop — a usage write and
 //! a clean `exit_group`, the first `-ENOSYS` name (`openat`? `mmap`?
@@ -36,9 +42,10 @@
 //! a dependency of this sidecar's boot.
 
 use aerosls_proto::manifest::{
-    build_manifest, crc32, Bootstrap, Budget, Cpu, Image, Limits, Manifest,
-    ManifestCap, HEADER_LEN, MAX_MANIFEST_CAPS,
+    build_manifest, crc32, ArgEnv, Bootstrap, Budget, Cpu, Image, Limits,
+    Manifest, ManifestCap, HEADER_LEN, MAX_MANIFEST_CAPS,
 };
+use crate::linux::LINUX_DEFAULT_ENV;
 
 /// The designated first user: `backup/aerobackup`'s static musl release
 /// binary (see the module doc). §5.1's gate applies unchanged: ET_EXEC only —
@@ -48,7 +55,9 @@ static FIRSTUSER: &[u8] = include_bytes!("../fixtures/aerobackup.musl.elf");
 
 /// The child's name — registered at create (the manifest's NAME record),
 /// which is what `linux::service`'s exit_group reap and every `[E7] linux:`
-/// line resolve against. It is ALSO the child's entire argv (argv v1).
+/// line resolve against. It is ALSO the child's entire argv — crossed as
+/// argv through §5.2's environment-crossing record, byte-identical to the
+/// create's absent-record fallback.
 pub const USER_NAME: &str = "e7.linux.user.0";
 
 /// Reserve at the TOP of the budget region, sized to the payload: 1 MiB
@@ -149,6 +158,12 @@ pub fn spawn<K: aerosls_proto::kabi::Kernel>(
             log_level: 1,
         }),
         flags_value: Some(0),
+        // §5.2's environment-crossing record: both halves cross here —
+        // argv is v1's { name } spelled explicitly (byte-identical to the
+        // create's fallback), and envp is this environment's default
+        // (linux.rs) instead of the empty environment the create could
+        // only hand before the record landed.
+        argenv: Some(ArgEnv::new(&[USER_NAME], LINUX_DEFAULT_ENV)),
         signature: None,
     };
 

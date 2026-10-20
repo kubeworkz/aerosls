@@ -37,6 +37,8 @@ FILES=(
     user/sidecar/src/entry.rs
     user/sidecar/src/e7_probe.rs
     user/sidecar/src/e7_candidate.rs
+    user/sidecar/src/e7_firstuser.rs
+    user/proto/src/manifest.rs
     user/sidecar/fixtures/e7_linux_probe.S
     user/sidecar/fixtures/build_candidate.sh
     kernel/elf64_load.h
@@ -87,7 +89,8 @@ echo "linux_personality_check_smoke — teeth for the E7 increment-2 wiring"
 echo "and increment-3 delivery guard, §5.3's one-MSR seam (clause set L),"
 echo "increment 5's fd-class byte crossing (clause set M), increment 6's"
 echo "mem-class budget span (clause set N), and increment 7's image class —"
-echo "the ONE ELF mapper and the §5.2 stack (clause set O)"
+echo "the ONE ELF mapper, the §5.2 stack and its environment-crossing"
+echo "record (clause set O, including O6/O7)"
 echo "========================================================================"
 echo
 
@@ -438,6 +441,38 @@ tooth candidate-spawn-gone O5 "the census candidate's spawn arm is gone" "$W/t47
 seed "$W/t48"
 sed -i 's/cap_arch_map_page((uint64_t)(uintptr_t)pml4,/user_map_page(pml4,/' "$W/t48/kernel/elf64_load.c"
 tooth elf-unsafe-walk O1 "the ELF mapper routes its segments through user_map_page (the unsafe walk)" "$W/t48"
+
+# ─── O6/O7 teeth (§5.2's environment-crossing record, ARGENV) ───────────────
+
+# t49 (O6): the site's envp consult deleted — the record parses and is
+# then IGNORED, and every Linux child silently gets the empty environment
+# again while argc (the only thing the other clauses read) looks right.
+seed "$W/t49"
+sed -i '/for (uint32_t i = 0; i < m.envc; i++)/d' "$W/t49/kernel/cap.c"
+sed -i '/envp\[m.envc\] = 0;/d' "$W/t49/kernel/cap.c"
+tooth envp-consult-gone O6 "the §5.2 site no longer consults the ARGENV record's envp" "$W/t49"
+
+# t50 (O6): the parse's exact-consumption refusal neutralised — a record
+# with bytes trailing its strings would be silently accepted (and, with
+# the other refusals edited the same way, truncated lists would read as
+# success — the failure mode refusing-by-name exists to end).
+seed "$W/t50"
+sed -i 's/if (q != rp + rlen) return CAP_EINVAL;/if (0) {}/' "$W/t50/kernel/cap.c"
+tooth argenv-parse-loosened O6 "the ARGENV parse no longer refuses trailing bytes" "$W/t50"
+
+# t51 (O7): the firstuser's record dropped — the designated first user
+# (the only child that READS its environment) would cross with none, and
+# the boot would read green because argc is still { name } either way.
+seed "$W/t51"
+sed -i 's/argenv: Some(ArgEnv::new(\&\[USER_NAME\], LINUX_DEFAULT_ENV)),/argenv: None,/' "$W/t51/user/sidecar/src/e7_firstuser.rs"
+tooth firstuser-argenv-gone O7 "the firstuser no longer crosses the ARGENV record" "$W/t51"
+
+# t52 (O7): the shared default-environment list renamed out from under
+# the spawn sites — the two halves of the twin would drift apart, which
+# is why the list is ONE constant rather than three inline copies.
+seed "$W/t52"
+sed -i 's/pub const LINUX_DEFAULT_ENV/pub const XENV/' "$W/t52/user/sidecar/src/linux.rs"
+tooth env-list-gone O7 "the shared LINUX_DEFAULT_ENV list is gone from linux.rs" "$W/t52"
 
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"

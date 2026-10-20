@@ -760,6 +760,23 @@ static void build_peer_blob(struct Blob* b, uint64_t image_kaddr, const char* na
     blob_finish(b, image_kaddr);
 }
 
+/* The standard valid manifest plus one ARGENV record (§5.2's
+ * environment-crossing record) BEFORE the footer — the record has to sit
+ * inside the TLV walk (the footer is appended after the last record and
+ * re-finished into the header), exactly like every other record here. */
+static void build_argenv_blob(struct Blob* b, uint64_t image_kaddr,
+                              const void* ap, uint16_t al) {
+    memset(b, 0, sizeof(*b));
+    blob_preamble(b);
+    blob_name(b, "drv.child.0");
+    blob_chan(b, "peer0", "drv.peer.0");
+    blob_chan(b, "console", "kernel.debug.console");
+    blob_dev(b, "nic0.bar0", DEV_BAR0_BASE, DEV_BAR0_BYTES);
+    blob_record(b, SIDECAR_TAG_ARGENV, al);
+    blob_put(b, ap, al);
+    blob_finish(b, image_kaddr);
+}
+
 /* A consumer manifest: NAME + preamble + ONE CAP_CHAN named "console"
  * whose peer is a sidecar NAME. The kernel resolves that name through the
  * sidecar registry (not a "kernel.*" service), so the channel is minted
@@ -862,10 +879,18 @@ uint32_t env_storage_owner(uint64_t region_base) {
  * (host_ptr), exactly as a libc would in its own address space — which is
  * the point of these sections: a pointer the kernel wrote as a host/phys
  * address cannot be followed here any more than it could in ring 3. */
+/* envp slots recorded by read_stack_image — §5.2's environment-crossing
+ * record makes their CONTENT the thing to read back, through the child's
+ * own page table, exactly as its libc would. */
+#define ENV_SLOT_MAX 32
 struct StackImage {
     uint64_t argc;
     uint64_t argv0_vaddr;
     uint64_t rsp;
+    uint64_t envp_vaddr[ENV_SLOT_MAX];  /* the env pointers; nenvp is the
+                                         * list length (the NULL lives at
+                                         * envp_vaddr[nenvp] when recorded) */
+    int      nenvp;
     uint64_t aux[64][2];      /* type/value pairs; AT_NULL terminates */
     int      naux;
 };
@@ -883,7 +908,15 @@ static int read_stack_image(uint64_t rsp_vaddr, struct StackImage* si) {
     for (guard = 0; guard < 32 && w[q] != 0; guard++) q += 1;
     if (w[q] != 0) return 0;               /* argv must be NULL-terminated */
     q += 1;
-    for (guard = 0; guard < 32 && w[q] != 0; guard++) q += 1;   /* envp */
+    /* envp, walked and RECORDED: the ARGENV record's strings land here
+     * and the sections below read them back through the child's table. */
+    for (guard = 0; guard <= ENV_SLOT_MAX; guard++) {
+        if (w[q] == 0) break;
+        if (si->nenvp < ENV_SLOT_MAX) si->envp_vaddr[si->nenvp] = w[q];
+        si->nenvp += 1;
+        q += 1;
+    }
+    if (guard > ENV_SLOT_MAX) return 0;    /* envp must be NULL-terminated */
     q += 1;
     for (; si->naux < 64; q += 2) {
         si->aux[si->naux][0] = w[q];
@@ -3193,6 +3226,8 @@ int main(void) {
             CHECK(a0 && lc && strcmp(a0, lc->name) == 0,
                   "L1: argv[0] is the child's name, through a child vaddr");
         }
+        CHECK(si.nenvp == 0,
+              "L1: envp is EMPTY — no ARGENV record means the v1 fallback every pre-record manifest still runs under");
         CHECK(aux_get(&si, LINUX_AT_ENTRY) == (lc ? lc->user_rip : 1),
               "L1: AT_ENTRY is the child's entry");
         CHECK(aux_get(&si, LINUX_AT_PAGESZ) == 4096,
@@ -3363,6 +3398,152 @@ int main(void) {
             CHECK(want_phdr != 0 && aux_get(&si2, LINUX_AT_PHDR) == want_phdr,
                   "E7c: AT_PHDR is the candidate's program-header table, at its mapped vaddr");
         }
+    }
+
+    /* Append one ARGENV record (§5.2's environment-crossing record) with
+     * exactly the payload bytes given — the valid form and every refusal
+     * form below are hand-assembled the same bytes
+     * user/proto/src/manifest.rs emits (its argenv_wire_bytes_golden pins
+     * the Rust side of the same layout). */
+    g_entropy_armed = 1;
+
+    /* ── 21. §5.2's environment-crossing record (ARGENV) crosses ──────────
+     * argv and envp come from the manifest and land in the stack image
+     * with CHILD-vaddr pointers, exactly like the v1 argv they extend.
+     * The crossing is read back THROUGH the child's own page table, so
+     * this pins the bytes a libc would actually read — not the kernel's
+     * intent. The e7 spawn sites (user/sidecar/src/e7_*.rs) author the
+     * same record through manifest.rs; this section is the kernel half
+     * of that seam, with the strings built by hand. */
+    {
+        struct Blob xb;
+        uint16_t xch = CAP_NONE;
+        struct ProcessDescriptor* xc;
+        struct StackImage si3;
+        static const char* rec[] = { "crossed-probe", "--flag",
+                                     "PATH=/bin", "HOME=/root" };
+        uint8_t ap[4 + 2*(2 + 16)];   /* counts + four len-prefixed strings */
+        uint32_t al = 0;
+        int env_ok;
+        uint64_t e0 = 0, e1 = 0;
+
+        ap[al++] = 2; ap[al++] = 0;          /* argc = 2 */
+        ap[al++] = 2; ap[al++] = 0;          /* envc = 2 */
+        for (int i = 0; i < 4; i++) {
+            uint16_t n = (uint16_t)strlen(rec[i]);
+            memcpy(ap + al, &n, 2); al += 2;
+            memcpy(ap + al, rec[i], n); al += n;
+        }
+        build_argenv_blob(&xb, image_kaddr, ap, (uint16_t)al);
+
+        CHECK(cap_create_sidecar_in_personality(100, xb.data, xb.len,
+                                  CAP_NONE, CAP_NONE, &xch, 0,
+                                  PROC_PERSONALITY_LINUX) == 0,
+              "L3: a Linux create carrying the ARGENV record succeeds");
+        xc = newest_child();
+        CHECK(xc && read_stack_image(xc->user_rsp, &si3),
+              "L3: the child's stack image parses through its own page table");
+        CHECK(si3.argc == 2,
+              "L3: argc is the record's argv count");
+        {
+            const char* a0 = (const char*)host_ptr(si3.argv0_vaddr);
+            CHECK(a0 && strcmp(a0, "crossed-probe") == 0,
+                  "L3: argv[0] is the record's first argv string, through a child vaddr");
+        }
+        env_ok = si3.nenvp == 2;
+        if (si3.nenvp > 0) e0 = si3.envp_vaddr[0];
+        if (si3.nenvp > 1) e1 = si3.envp_vaddr[1];
+        CHECK(env_ok,
+              "L3: envp carries exactly the record's env strings — no longer the empty environment");
+        CHECK(e0 && host_ptr(e0) &&
+              strcmp((const char*)host_ptr(e0), "PATH=/bin") == 0,
+              "L3: envp[0] is the record's first env string, through a child vaddr");
+        CHECK(e1 && host_ptr(e1) &&
+              strcmp((const char*)host_ptr(e1), "HOME=/root") == 0,
+              "L3: envp[1] is the record's second env string, through a child vaddr");
+        CHECK(si3.argv0_vaddr >= STACK_BASE && si3.argv0_vaddr < BIB_VADDR &&
+              (e0 >= STACK_BASE && e0 < BIB_VADDR) &&
+              (e1 >= STACK_BASE && e1 < BIB_VADDR),
+              "L3: every record pointer lands inside the child's stack region");
+    }
+
+    /* ── 22. the ARGENV parse refuses BY NAME, before any child exists ────
+     * The record is manifest input like every other field, and its
+     * strings are copied into a FIXED arena on the create's stack — so
+     * every over-bound or malformed form is refused with its reason
+     * (CAP_ERANGE / CAP_EINVAL) and consumes no process slot. The one
+     * thing it must never do is truncate: a child handed a shorter
+     * environment than its author wrote would read as success. */
+    {
+        struct Blob rb;
+        uint16_t rch;
+        uint32_t before4 = proc_count;
+        uint8_t p[600];
+        uint16_t n16;
+
+        /* argv over the fixed array. */
+        memset(p, 0, 4); p[0] = SIDECAR_MANIFEST_MAX_ARGV + 1;
+        build_argenv_blob(&rb, image_kaddr, p, 4);
+        rch = CAP_NONE;
+        CHECK(cap_create_sidecar_in_personality(100, rb.data, rb.len,
+                                  CAP_NONE, CAP_NONE, &rch, 0,
+                                  PROC_PERSONALITY_LINUX) == CAP_ERANGE,
+              "L4: argc over the fixed array is refused ERANGE");
+
+        /* envp over the fixed array. */
+        memset(p, 0, 4); p[2] = SIDECAR_MANIFEST_MAX_ENVP + 1;
+        build_argenv_blob(&rb, image_kaddr, p, 4);
+        rch = CAP_NONE;
+        CHECK(cap_create_sidecar_in_personality(100, rb.data, rb.len,
+                                  CAP_NONE, CAP_NONE, &rch, 0,
+                                  PROC_PERSONALITY_LINUX) == CAP_ERANGE,
+              "L4: envp over the fixed array is refused ERANGE");
+
+        /* string bytes over the arena (one 512-byte string needs its
+         * NUL too, against SIDECAR_MANIFEST_ARGENV_BYTES). */
+        p[0] = 1; p[1] = 0; p[2] = 0; p[3] = 0;   /* argc 1, envc 0 */
+        n16 = SIDECAR_MANIFEST_ARGENV_BYTES;
+        memcpy(p + 4, &n16, 2);
+        memset(p + 6, 'a', SIDECAR_MANIFEST_ARGENV_BYTES);
+        build_argenv_blob(&rb, image_kaddr, p,
+                          (uint16_t)(6 + SIDECAR_MANIFEST_ARGENV_BYTES));
+        rch = CAP_NONE;
+        CHECK(cap_create_sidecar_in_personality(100, rb.data, rb.len,
+                                  CAP_NONE, CAP_NONE, &rch, 0,
+                                  PROC_PERSONALITY_LINUX) == CAP_ERANGE,
+              "L4: string bytes over the arena are refused ERANGE");
+
+        /* an interior NUL — the copy would silently truncate it. */
+        p[0] = 1; p[1] = 0; p[2] = 0; p[3] = 0;
+        n16 = 3; memcpy(p + 4, &n16, 2);
+        p[6] = 'a'; p[7] = 0; p[8] = 'b';
+        build_argenv_blob(&rb, image_kaddr, p, 9);
+        rch = CAP_NONE;
+        CHECK(cap_create_sidecar_in_personality(100, rb.data, rb.len,
+                                  CAP_NONE, CAP_NONE, &rch, 0,
+                                  PROC_PERSONALITY_LINUX) == CAP_EINVAL,
+              "L4: an interior NUL is refused EINVAL, never truncated");
+
+        /* bytes trailing the last string. */
+        memset(p, 0, 4); p[4] = 0xFF;
+        build_argenv_blob(&rb, image_kaddr, p, 5);
+        rch = CAP_NONE;
+        CHECK(cap_create_sidecar_in_personality(100, rb.data, rb.len,
+                                  CAP_NONE, CAP_NONE, &rch, 0,
+                                  PROC_PERSONALITY_LINUX) == CAP_EINVAL,
+              "L4: bytes trailing the last string are refused EINVAL");
+
+        /* a header too short to hold its own counts. */
+        memset(p, 0, 2);
+        build_argenv_blob(&rb, image_kaddr, p, 2);
+        rch = CAP_NONE;
+        CHECK(cap_create_sidecar_in_personality(100, rb.data, rb.len,
+                                  CAP_NONE, CAP_NONE, &rch, 0,
+                                  PROC_PERSONALITY_LINUX) == CAP_EINVAL,
+              "L4: a header shorter than its counts is refused EINVAL");
+
+        CHECK(proc_count == before4,
+              "L4: no ARGENV refusal left a process behind");
     }
 
     if (g_fail == 0) printf("\nALL PASS\n");

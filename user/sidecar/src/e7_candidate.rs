@@ -33,9 +33,10 @@
 //! this file overwrites the tail.
 
 use aerosls_proto::manifest::{
-    build_manifest, crc32, Bootstrap, Budget, Cpu, Image, Limits, Manifest,
-    ManifestCap, HEADER_LEN, MAX_MANIFEST_CAPS,
+    build_manifest, crc32, ArgEnv, Bootstrap, Budget, Cpu, Image, Limits,
+    Manifest, ManifestCap, HEADER_LEN, MAX_MANIFEST_CAPS,
 };
+use crate::linux::LINUX_DEFAULT_ENV;
 
 /// The census candidate payload: `fixtures/e7_linux_probe.S` linked as an
 /// ET_EXEC ELF64 (see build_candidate.sh for the exact, committed build
@@ -142,6 +143,13 @@ pub fn spawn<K: aerosls_proto::kabi::Kernel>(
             log_level: 1,
         }),
         flags_value: Some(0),
+        // §5.2's environment-crossing record: both halves cross here —
+        // argv is v1's { name } spelled explicitly (byte-identical to the
+        // create's fallback), and envp is this environment's default
+        // (linux.rs) instead of the empty environment the create could
+        // only hand before the record landed. The pair crosses the SAME
+        // record, so image format stays its only difference.
+        argenv: Some(ArgEnv::new(&[CAND_NAME], LINUX_DEFAULT_ENV)),
         signature: None,
     };
 

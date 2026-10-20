@@ -218,6 +218,7 @@ fn build_init_manifest(spec: &BootImageSpec, layout: &BootLayout, blob_offset: u
             log_level: 1,
         }),
         flags_value: Some(0),
+        argenv: None,
         signature: None,
     };
     pack_with_footer(&m, layout.init_image.phys)
@@ -295,6 +296,7 @@ fn build_dm_manifest(spec: &BootImageSpec, layout: &BootLayout, blob_offset: u32
             log_level: 1,
         }),
         flags_value: Some(0),
+        argenv: None,
         signature: None,
     };
     pack_with_footer(&m, layout.dm_image.phys)
@@ -413,6 +415,7 @@ fn build_posix_manifest(spec: &BootImageSpec, layout: &BootLayout, blob_offset: 
             log_level: 1,
         }),
         flags_value: Some(0),
+        argenv: None,
         signature: None,
     };
     pack_with_footer(&m, layout.posix_image.phys)
@@ -494,6 +497,7 @@ fn build_ramdisk_manifest(spec: &BootImageSpec, layout: &BootLayout, blob_offset
             log_level: 1,
         }),
         flags_value: Some(0),
+        argenv: None,
         signature: None,
     };
     pack_with_footer(&m, layout.ramdisk_image.phys)
@@ -568,6 +572,7 @@ fn build_net_manifest(spec: &BootImageSpec, layout: &BootLayout, blob_offset: u3
             log_level: 1,
         }),
         flags_value: Some(0),
+        argenv: None,
         signature: None,
     };
     pack_with_footer(&m, layout.net_image.phys)

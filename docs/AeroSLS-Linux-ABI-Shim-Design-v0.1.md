@@ -271,7 +271,7 @@ The contract is what `kernel/loader.c` already implements, stated positively so 
 
 The native sidecar path enters `_start` with no arguments; a Linux binary expects the System V initial stack (argc/argv/envp/auxv) and a static libc start-up that reads it. This is a bona-fide deliverable and the kernel must build it:
 
-- **argv/envp are the environment's to define** — the sidecar knows the command line and the environment (it is the thing that ran `exec`, Phase 2 §4.3); they cross on the spawn request.
+- **argv/envp are the environment's to define** — the sidecar knows the command line and the environment (it is the thing that ran `exec`, Phase 2 §4.3); they cross on the spawn request. **Landed** as the manifest's `ARGENV` record (`SIDECAR_TAG_ARGENV`, format reference `user/proto/src/manifest.rs`): `argc u16, envc u16`, then the argv and envp strings each as `len u16 + bytes`, bounded (8/16 entries, 512 NUL-terminated bytes — the kernel's fixed parse arena) so over-bound or malformed records are refused BY NAME (`CAP_ERANGE`/`CAP_EINVAL`), never truncated. An **absent** record is the v1 answer — `argv = { name }`, an empty environment — so every manifest built before the record exists runs byte-identically; a record with no argv entries falls back to `{ name }` as argv[0]. The spawn sites that first cross it are the system POSIX sidecar's three Linux children (the probe, the census candidate and the designated first user — the pair crosses the same record, so image format stays its only difference), whose envp is this environment's default (`PATH=/bin`, `HOME=/root` — the shell's own default env, honest about time: these spawns run at boot, before any `export` exists).
 - **auxv entries required by static musl/glibc start-up:** `AT_PHDR`, `AT_PHNUM`, `AT_PHENT`, `AT_ENTRY`, `AT_BASE`(0), `AT_PAGESZ`(4096), `AT_HWCAP`(0), `AT_HWCAP2`(0), `AT_CLKTCK`(100), `AT_RANDOM`(16 bytes from `kernel/entropy.c` — absent, stack canaries are worthless), `AT_SECURE`(0), `AT_PLATFORM`("x86_64"), `AT_EXECFN`. `AT_SYSINFO_EHDR` is **absent**, which is correct and must be explicit: there is no vDSO, so `clock_gettime`-class calls are real syscalls and must be in the census (§5.5). This list is not prose to be transcribed later — `tools/e7_stack_launcher.c` (§5.5) is the same list as code, which is how the vDSO declaration gets measured instead of believed.
 - **The stack size is a real question, not a formality.** `PROC_USER_STACK_PAGES` is 8 (32 KiB) for ring-3 processes today, and its own comment records that it grew once already for a large ABI struct. A static libc's start-up plus argv/envp/auxv may exceed 32 KiB of headroom on a real workload; the design requires the Linux task's stack to be a **separately-sized, partition-charged allocation** decided by measurement, not by inheriting the native constant.
 
@@ -1331,10 +1331,17 @@ linked as an `ET_EXEC` ELF — a controlled pair, not the designated
 first user: `aerobackup`'s musl binary has still never executed under
 the shim, and its census stays host-measured (`strace`,
 `tools/linux_syscall_census.txt`) while every surface beyond this
-sequence (`open`/`read`/`mmap`/…) remains ENOSYS by name. argv/envp are
-v1: `argv = { name }`, an empty environment — §5.2's environment-
-crossing record is un-landed here, named rather than invented in the
-call site. `ET_EXEC` only: no PIE, no interpreter, no dynamic linking
+sequence (`open`/`read`/`mmap`/…) remains ENOSYS by name. argv/envp
+cross on §5.2's environment-crossing record (`SIDECAR_TAG_ARGENV`) —
+landed after this increment: the record carries argv and envp, the
+create copies its strings into the stack image with child-vaddr
+pointers beside the v1 argv, and an ABSENT record keeps the v1
+fallback (`argv = { name }`, an empty environment) so every pre-record
+manifest runs byte-identically. Pinned by guard clauses O6/O7 (teeth
+t49–t52), the cap host test's L3 (the crossing read back through the
+child's own page table) and L4 (every over-bound or malformed record
+refused by name, no process consumed), and `manifest.rs`'s
+`argenv_wire_bytes_golden`. `ET_EXEC` only: no PIE, no interpreter, no dynamic linking
 (§12 untouched; §5.1 refuses the rest by name). The 8 KiB stack floor
 is a floor, not a measurement — §11's Q2 still stands; there is no
 vDSO by decision, and §11's Q5 (rseq/membarrier at start-up) is still
@@ -1400,6 +1407,7 @@ Everything this document asserts about the tree, with its source:
 | A reply's status reaches `rax` only through the §5.7 map, after size and num-echo are enforced | `kernel/linux_abi.c` (`linux_syscall_apply_reply`); `tests/linux_personality_host_test.c` (42 checks, §10.7) |
 | The sidecar's first answers: 218 echoed, 231 reaped, everything else ENOSYS with its number logged | `user/sidecar/src/linux.rs`; `user/sidecar/src/entry.rs` (`service`/`append_wait`) |
 | The §5.2 image through the real create: child-vaddr pointers (`region_vaddr`), BIB-page reservation, 8 KiB floor, `AT_RANDOM` = entropy or `CAP_ECONFLICT` with the region returned | `kernel/cap.c` (steps 6–7); `kernel/linux_abi.{h,c}`; host tests L1/L2/E7c (377 checks); clauses O3/O4, teeth t44/t45/t46 (§10.12) |
+| §5.2's argv/envp cross on the spawn request as the `ARGENV` record, with the empty-environment v1 fallback when it is absent and by-name refusals instead of truncation | `kernel/cap.h`/`cap.c` (`SIDECAR_TAG_ARGENV`, the parse arena, the §5.2 site); `user/proto/src/manifest.rs` (`ArgEnv`, `argenv_wire_bytes_golden`); `tests/cap_create_sidecar_host_test.c` L3/L4; guard clauses O6/O7, teeth t49–t52 |
 
 ## Appendix B — Named gaps, each with its destination
 

@@ -132,6 +132,7 @@ pub fn build_ramdisk_manifest_named(
             log_level: 1,
         }),
         flags_value: Some(0),
+        argenv: None,
         signature: None,
     };
 

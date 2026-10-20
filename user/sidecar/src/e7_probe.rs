@@ -28,9 +28,10 @@
 //! one capability pair (its messenger channel back to this sidecar).
 
 use aerosls_proto::manifest::{
-    build_manifest, crc32, Bootstrap, Budget, Cpu, Image, Limits, Manifest,
-    ManifestCap, HEADER_LEN, MAX_MANIFEST_CAPS,
+    build_manifest, crc32, ArgEnv, Bootstrap, Budget, Cpu, Image, Limits,
+    Manifest, ManifestCap, HEADER_LEN, MAX_MANIFEST_CAPS,
 };
+use crate::linux::LINUX_DEFAULT_ENV;
 
 /// The probe payload: `fixtures/e7_linux_probe.S`, built to a flat image
 /// (one `.text`, `_start` at file offset 0 — the create's flat mapper
@@ -139,6 +140,12 @@ pub fn spawn<K: aerosls_proto::kabi::Kernel>(
             log_level: 1,
         }),
         flags_value: Some(0),
+        // §5.2's environment-crossing record: both halves cross here —
+        // argv is v1's { name } spelled explicitly (byte-identical to the
+        // create's fallback), and envp is this environment's default
+        // (linux.rs) instead of the empty environment the create could
+        // only hand before the record landed.
+        argenv: Some(ArgEnv::new(&[PROBE_NAME], LINUX_DEFAULT_ENV)),
         signature: None,
     };
 

@@ -67,6 +67,18 @@ use aerosls_vfs::CharNode;   /* E7 increment 5: the fd table's console slot —
 /// ABI.
 pub const LINUX_SYSCALL_REQ_BYTES: usize = 72;
 
+/// The environment this environment's Linux children cross on the spawn
+/// (§5.2's environment-crossing record, `SIDECAR_TAG_ARGENV`): the POSIX
+/// sidecar's own default shell environment — `PATH=/bin` (applets'
+/// bare-command search path) and `HOME=/root` — the same two pairs
+/// `applets.rs`'s `sh` initializes on its first prompt. The three e7 spawn
+/// sites author their record's envp from THIS list so the twins cannot
+/// drift, and the answer is honest about time: these spawns run at boot,
+/// before any shell exists, so a later `export` lives in the shell task's
+/// own env region and never crossed (or pretended to). Clause O7 pins the
+/// list and its three users.
+pub const LINUX_DEFAULT_ENV: &[&str] = &["PATH=/bin", "HOME=/root"];
+
 /// CAP_E* (kernel/cap.h, negatives): the family this sidecar answers with,
 /// because linux_errno_from_cap maps every one of them into musl's errno
 /// window. Values pinned by tools/aeroidl/tests/cross_lang_constants.rs.

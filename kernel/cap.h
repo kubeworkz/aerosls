@@ -897,9 +897,28 @@ void cap_unlock(struct CapSpinlock* l);
 #define SIDECAR_TAG_BOOTSTRAP    0x0008
 #define SIDECAR_TAG_FLAGS        0x0009
 #define SIDECAR_TAG_NAME         0x000A
+/* §5.2's environment-crossing record (matches user/proto/src/manifest.rs
+ * TAG_ARGENV): the argv and envp that cross on the spawn request — the
+ * sidecar knows the command line and the environment, so they are its to
+ * define. Consumed only by the create's §5.2 stack image; an absent
+ * record is the v1 answer (argv = { name }, an empty environment), so
+ * every manifest built before the record existed keeps running. */
+#define SIDECAR_TAG_ARGENV       0x000E
 
 #define SIDECAR_MANIFEST_MAX_CAPS  16
 #define SIDECAR_MANIFEST_MAX_NAME  64
+
+/* ── ARGENV record bounds (§5.2) ─────────────────────────────────────────
+ * The record's strings are copied into a FIXED arena on the create's
+ * stack and NUL-terminated there (linux_initial_stack_build consumes
+ * C strings), so these bounds are what the parse refuses BY NAME rather
+ * than letting a manifest dictate the create's stack size or silently
+ * truncating a list. Mirrored in user/proto/src/manifest.rs — one truth
+ * across the seam, and the record's own counts make the header's
+ * "+10 fixed records" slack roomier, not tighter. */
+#define SIDECAR_MANIFEST_MAX_ARGV  8
+#define SIDECAR_MANIFEST_MAX_ENVP  16
+#define SIDECAR_MANIFEST_ARGENV_BYTES 512
 
 struct SidecarManifestHeader {
     uint8_t  magic[8];
@@ -955,6 +974,17 @@ struct SidecarManifest {
     /* CAP records */
     struct SidecarCap caps[SIDECAR_MANIFEST_MAX_CAPS];
     uint8_t  n_caps;
+    /* ARGENV record (§5.2's environment-crossing record): the record's
+     * strings copied NUL-terminated into a fixed arena (argv strings
+     * first, then envp, in record order), with an offset per entry. The
+     * zeroed counts mean "no record": the create's §5.2 site then hands
+     * the child the v1 fallback (argv = { name }, empty environment). */
+    uint16_t argc;
+    uint16_t envc;
+    uint16_t argenv_used;
+    uint16_t argv_off[SIDECAR_MANIFEST_MAX_ARGV]; /* into argenv_arena */
+    uint16_t env_off[SIDECAR_MANIFEST_MAX_ENVP];  /* into argenv_arena */
+    char     argenv_arena[SIDECAR_MANIFEST_ARGENV_BYTES];
 };
 
 /* BootInfoBlock — written by the kernel at the child's stack top.

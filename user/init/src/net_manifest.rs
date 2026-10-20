@@ -89,6 +89,7 @@ pub fn build_net_manifest(image_kaddr: u64, image_size: u32, heap_base: u64) -> 
             log_level: 1,
         }),
         flags_value: Some(0),
+        argenv: None,
         signature: None,
     };
 
