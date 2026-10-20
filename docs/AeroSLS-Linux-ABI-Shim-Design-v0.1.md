@@ -1487,26 +1487,67 @@ it is small by construction:
   point to call — named, and unreachable from the census's single
   `fsync` row, which lands on `/tmp`.
 
-**Step 0 — the diagnosis the first half is blocked on.** The firstuser
-still dies at `rip=0x28` before its file work, and no seam below
-matters until it does. What the E3 log already settles: the three
-children each earned the startup `arch_prctl`/`set_tid_address`/`brk`/
-`write` lines (the counts fit three of each) but the `num=` lines carry
-NO child name — so step 0.5 is that name on `service`'s log line, one
-line of Rust, after which every measurement is attributable. What else
-it settles: no `mmap`/`munmap` line exists at all (the census's 8/7
-rows are mid-run, never reached) and only two `exit_group` lines for
-three children — the death precedes both. A call whose RIP is 0x28 is
-a call THROUGH a NULL object's slot 0x28 — the shape of a failed
-allocation or a skipped initialization, not of an ENOSYS, which
-answers rather than jumps. The diagnosis decides step 1: if the
-evidence names `mmap`, anonymous `mmap`/`munmap` over the budget lands
-as step 1 — §5.4's second half minus file backing, which stays refused
-by name — and this section is amended with what was measured, not with
-a mechanism guessed.
+**Step 0 — executed, and the diagnosis names the loader, not `mmap`.**
+The instrument (step 0.5) landed: `service`'s line now carries the
+child's own name — `[E7] linux: num=0000009E child=e7.linux.user.0
+ok` — with `child=?` on the one arm that has no task context (reply's
+send-failure path), so a missing name looks missing rather than like a
+parsing accident. Two boots, the watchdog respawn reproducing the
+first exactly:
 
-**Sequence.** 0: the attribution instrument, then the `rip=0x28`
-diagnosis. 1: whatever the diagnosis names (expected: anonymous
+```
+e7.linux.probe.0   21 trap lines (two boots)  -> full sequence, exit_group
+e7.linux.cand.0    20 trap lines (two boots)  -> full sequence, exit_group
+e7.linux.user.0     4 trap lines (two boots)  -> 158, 218 — then nothing
+```
+
+So the firstuser earns exactly TWO traps per boot — `arch_prctl` (158,
+granted) and `set_tid_address` (218, echoed) — and then no further
+trap at all: no `open`, no `brk`, no `mmap`, no `clock_gettime`, no
+`exit_group`. **This corrects this section's earlier reading.** The
+startup `brk`/`write` lines it attributed to "three of each" belong to
+the probe and the candidate; the counts were unattributable, and the
+inference drawn from them was wrong. Both boots end `[FAULT] Ring-3
+#PF  error=0x15  addr=0x0000000000000028  rip=0x0000000000000028
+rdi=0x000000000800d860`.
+
+`error=0x15` is a user-mode **instruction fetch** from a **present**
+page: control was transferred TO 0x28, it did not fetch through a NULL
+object's slot — which retires the "failed allocation or skipped
+initialization" reading this section guessed. `rdi` names the site's
+own proof: `0x800d860` is `main`, a 39-byte FUNC in the committed
+firstuser ELF, so the death is inside musl's start path, which holds
+`main` in `rdi` from `_start` onward and clobbers it only at
+`libc_start_main_stage2`'s `call *%rbx`. The one indirect transfer in
+that path which preserves `rdi` is `__libc_start_init`'s `call
+*(%rbx)` — its `.init_array` loop, exactly one entry. `rbx` =
+`0x80773a0`, whose file bytes are `00 ae 00 08 00 00 00 00` =
+`0x800ae00` (`__do_init`). The child read back **`0x28`** — which is
+the file's bytes at offset `0x76710`: `.init_array`'s own value,
+shifted forward by `0x370`.
+
+The shift is `elf64_map_blob`'s unstated assumption. It copies each
+LOAD into per-page frames from frame offset 0 and maps the page
+*containing* `p_vaddr + p*4096`, so a segment whose `p_vaddr` is not
+page-aligned lands `p_vaddr & 0xFFF` bytes early in vaddr space and
+every read inside it returns the file that many bytes further on. The
+firstuser's RW LOAD is `vaddr=0x8077370` — the boot's own `[LOADER]
+ELF segment` line — and it is the only unaligned LOAD in either
+image: the candidate's two are `0x3ff000` and `0x400000`, which is why
+increment 7's census passed and this stayed invisible until a binary
+with a real libc linked a RW segment at a non-aligned address.
+
+**Step 1 is therefore the loader's alignment fix, not anonymous
+`mmap`.** The `mmap`/`clock_gettime` risks named below are neither
+cleared nor confirmed — this run never reaches `main`, so it cannot
+reach them — and they stay open until a run gets past the loader.
+Gate half one is blocked on the fix, not on §5.6's seams.
+
+**Sequence.** 0: DONE — the attribution instrument and the `rip=0x28`
+diagnosis, measured (above). 1: the loader's `p_vaddr` alignment fix
+— the mapper copies a non-page-aligned LOAD's bytes into the right
+page offsets (and gains a host test over a non-aligned segment, beside
+O1/O2's family). 2: whatever the run past the loader then names —
 `mmap`/`munmap`). 2: the reply payload, host teeth first —
 `linux_user_copy_in`, `linux_fd_reply_plan`, the three deliver shapes,
 the `service` bound. 3: the path plan, the VFS bridge, the thirteen
@@ -1623,7 +1664,8 @@ Everything this document asserts about the tree, with its source:
 | Six argument registers not captured by the trap path | every forwarded syscall gets wrong arguments (§3.4) | E7, §3.4 |
 | No initial stack/auxv builder | static libc start-up fails before `main` (§5.2) | E7, §5.2 |
 | No `MSR_IA32_FS_BASE` handling | TLS setup fails; musl/glibc binaries die early (§5.3) | E7, §5.3 |
-| No `brk`/`mmap` → budget mapping (`brk` landed, increment 6, §10.11; `mmap`/`munmap` remain) | sub-allocating heaps and `munmap` still refuse (§5.4) | E7, §5.4 — scoped as increment 8's step 1 if its step-0 diagnosis demands anonymous maps (§10.13); otherwise the next increment |
+| No `brk`/`mmap` → budget mapping (`brk` landed, increment 6, §10.11; `mmap`/`munmap` remain) | sub-allocating heaps and `munmap` still refuse (§5.4) | E7, §5.4 — increment 8's step 1 turned out to be the loader's alignment fix instead (§10.13's measured step-0 diagnosis), so anonymous maps are the increment after that |
+| `elf64_map_blob` assumes every PT_LOAD's `p_vaddr` is page-aligned | a libc-linked binary with a non-aligned RW LOAD reads every global in it 0x370 bytes off and dies at `rip=0x28` before `main` — measured, §10.13's step 0 | E7 — increment 8's step 1 |
 | No `CAP_E*` → Linux errno table (and a `CAP_NONE` sentinel in returns) | silent wrong errors (§5.7) | E7, §5.7 |
 | Target designated, but no candidate binary and therefore no artifact | the table is still unmeasured; `--check` reports a named skip rather than a pass | write the crate, add the musl target, run `--run` |
 | No thread groups / `clone` / `futex` | Go and every threaded runtime are out (§7) | named as Go's gate; unscoped |

@@ -414,19 +414,46 @@ fn reply<K: Kernel>(k: &K, ch_w: u32, tag: u32, num: u64, ret: u64, status: i32)
     payload[56..64].copy_from_slice(&ret.to_le_bytes());
     payload[64..68].copy_from_slice(&status.to_le_bytes());
     if k.send(ch_w, tag, 0, &payload, &[], aerosls_proto::kabi::TIMEOUT_NONE).is_err() {
-        enosys_log(0xF1F1, b"[POSIX] linux reply send failed\n");
+        /* No task context here: reply() is called from every arm of
+         * service(), so the name is not in scope and this line says so
+         * by name (`child=?`) rather than by silence. */
+        enosys_log(0xF1F1, b"", b"[POSIX] linux reply send failed\n");
     }
 }
 
 /// One ENOSYS/protocol log line, host-build tolerant (entry.rs's klog is
 /// the target-feature serial path; on host fakes the answers still run,
 /// they just stay quiet).
-fn enosys_log(tag_num: u32, extra: &[u8]) {
+///
+/// The CHILD'S NAME rides in the line — the design doc's §10.13 step 0.5,
+/// and the difference between a measurement and an inference. Several
+/// Linux tasks share this one service loop, `num=` names only the
+/// NUMBER, and without a name on the line a refusal belongs to any of
+/// them: the E3 log's per-child counts could only be read off the
+/// arithmetic that "fits three of each", never off the line that proves
+/// it. `child=?` is what a line with NO task context says (reply's own
+/// send-failure arm) — never an empty field, so a missing name looks
+/// missing rather than like a parsing accident. The caps below keep a
+/// 24-character name plus the longest suffix inside klog's own bound.
+fn enosys_log(tag_num: u32, child: &[u8], extra: &[u8]) {
     #[cfg(feature = "target")]
-    crate::entry::klog(b"[E7] linux: num=", tag_num, extra);
+    {
+        let mut line = [0u8; 72];
+        let mut off = 0;
+        line[off..off + 6].copy_from_slice(b"child=");
+        off += 6;
+        let name: &[u8] = if child.is_empty() { b"?" } else { child };
+        let n = name.len().min(24);
+        line[off..off + n].copy_from_slice(&name[..n]);
+        off += n;
+        let e = extra.len().min(line.len() - off);
+        line[off..off + e].copy_from_slice(&extra[..e]);
+        off += e;
+        crate::entry::klog(b"[E7] linux: num=", tag_num, &line[..off]);
+    }
     #[cfg(not(feature = "target"))]
     {
-        let _ = (tag_num, extra);
+        let _ = (tag_num, child, extra);
     }
 }
 
@@ -482,7 +509,7 @@ pub fn service<K: Kernel>(k: &K, console: &CharNode) {
              * the in-flight request's number, so the kernel's apply
              * refuses it -EPROTO — the task errors out loud instead of
              * hanging on a reply that never fits the contract. */
-            enosys_log(0xBAD0, b"[POSIX] malformed request -> -EPROTO\n");
+            enosys_log(0xBAD0, &name_buf[..nlen], b"[POSIX] malformed request -> -EPROTO\n");
             reply(k, ch_w, rr.tag, 0, 0, E_NOSYS);
             continue;
         }
@@ -504,14 +531,14 @@ pub fn service<K: Kernel>(k: &K, console: &CharNode) {
         let payload: &[u8] = if num == LINUX_WRITE {
             let want = LINUX_SYSCALL_REQ_BYTES + args[2] as usize;
             if args[2] as usize > FD_PAYLOAD_CAP || rr.len != want {
-                enosys_log(0xBAD1, b"[POSIX] write payload mismatch -> -EPROTO\n");
+                enosys_log(num as u32, &name_buf[..nlen], b"[POSIX] write payload mismatch -> -EPROTO\n");
                 reply(k, ch_w, rr.tag, 0, 0, E_NOSYS);
                 continue;
             }
             &buf[LINUX_SYSCALL_REQ_BYTES..rr.len]
         } else {
             if rr.len != LINUX_SYSCALL_REQ_BYTES {
-                enosys_log(0xBAD0, b"[POSIX] malformed request -> -EPROTO\n");
+                enosys_log(0xBAD0, &name_buf[..nlen], b"[POSIX] malformed request -> -EPROTO\n");
                 reply(k, ch_w, rr.tag, 0, 0, E_NOSYS);
                 continue;
             }
@@ -536,13 +563,13 @@ pub fn service<K: Kernel>(k: &K, console: &CharNode) {
         match ans {
             Answer::Reply(ret, status) => {
                 if status == E_NOSYS {
-                    enosys_log(num as u32, b" -> ENOSYS\n");
+                    enosys_log(num as u32, &name_buf[..nlen], b" -> ENOSYS\n");
                 } else {
                     /* An answered syscall must be visible too: this line
                      * is the serial-log half of E7's round-trip proof
                      * (a real task's real request arrived, and its reply
                      * is on its way back through §5.7). */
-                    enosys_log(num as u32, b" ok\n");
+                    enosys_log(num as u32, &name_buf[..nlen], b" ok\n");
                 }
                 reply(k, ch_w, rr.tag, num, ret, status);
             }
@@ -556,7 +583,7 @@ pub fn service<K: Kernel>(k: &K, console: &CharNode) {
                  * above already made args[2] the payload's own length). */
                 match console.write(&payload[..len]) {
                     Ok(n) => {
-                        enosys_log(num as u32, b" write ok\n");
+                        enosys_log(num as u32, &name_buf[..nlen], b" write ok\n");
                         reply(k, ch_w, rr.tag, num, n as u64, STATUS_OK);
                     }
                     Err(_) => {
@@ -564,7 +591,7 @@ pub fn service<K: Kernel>(k: &K, console: &CharNode) {
                          * happen, and that is an I/O error — CAP_ERR_
                          * REVOKED's -EIO through §5.7 — never a success
                          * and never ENOSYS. */
-                        enosys_log(num as u32, b" write FAILED (console closed)\n");
+                        enosys_log(num as u32, &name_buf[..nlen], b" write FAILED (console closed)\n");
                         reply(k, ch_w, rr.tag, num, 0, E_REVOKED);
                     }
                 }
@@ -573,7 +600,7 @@ pub fn service<K: Kernel>(k: &K, console: &CharNode) {
                 /* Visible like every other answer: exit_group is the one
                  * forward that gets NO reply, so without this line the
                  * reap would be invisible in the log. */
-                enosys_log(num as u32, b" exit_group\n");
+                enosys_log(num as u32, &name_buf[..nlen], b" exit_group\n");
                 /* exit_group: reap through the same name->pid lookup the
                  * environment destroy path uses (sidecar_pid is the
                  * liveness test — a name that no longer resolves is a
@@ -584,7 +611,7 @@ pub fn service<K: Kernel>(k: &K, console: &CharNode) {
                 if pid == 0 {
                     /* Cannot find it: answer rather than strand the task
                      * parked forever on a reply nobody will send. */
-                    enosys_log(num as u32, b" exit_group: NOT-FOUND (reap refused)\n");
+                    enosys_log(num as u32, &name_buf[..nlen], b" exit_group: NOT-FOUND (reap refused)\n");
                     reply(k, ch_w, rr.tag, num, 0, E_CONFLICT);
                 } else {
                     /* The task is PROC_BLOCKED awaiting this very exchange
