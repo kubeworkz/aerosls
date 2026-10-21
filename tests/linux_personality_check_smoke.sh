@@ -56,6 +56,8 @@ FILES=(
     kernel/kernel.c
     kernel/stubs.c
     tests/fpu_enable_host_test.c
+    # R (the signal seam) reads the plan's host test, same rule.
+    tests/linux_personality_host_test.c
 )
 
 for f in "${FILES[@]}" "$GUARD"; do
@@ -104,6 +106,8 @@ echo "increment 5's fd-class byte crossing (clause set M), increment 6's"
 echo "mem-class budget span (clause set N), and increment 7's image class —"
 echo "the ONE ELF mapper, the §5.2 stack and its environment-crossing"
 echo "record (clause set O, including O6/O7)"
+echo "and increment 10's signal seam (clause set R) — the three-number"
+echo "answers, the plan's first-trap refusals and the SignalKill delivery"
 echo "========================================================================"
 echo
 
@@ -328,8 +332,8 @@ tooth fd-ebadf-drifted M5 "the sidecar's E_BADF no longer pins CAP_EBADF (-2)" "
 # task wrote (or a count that disagrees with the header) would be performed
 # on the console without a check.
 seed "$W/t31"
-sed -i 's/if args\[2\] as usize > FD_PAYLOAD_CAP || rr.len != want {/if false {/' "$W/t31/user/sidecar/src/linux.rs"
-tooth fd-payload-check-off M6 "the write payload invariant is dead-coded" "$W/t31"
+sed -i 's/if rr.len != expected {/if false {/' "$W/t31/user/sidecar/src/linux.rs"
+tooth fd-payload-check-off M6 "the request-length invariant is dead-coded" "$W/t31"
 
 # ─── Increment-6 teeth (the mem class: the budget span, the W^X refusal) ──
 
@@ -553,6 +557,64 @@ printf '\nvoid sse_smoke_t75(void);
 void sse_smoke_t75(void) { extern void perform_lazy_context_switch(void*, void*); perform_lazy_context_switch(0, 0); }
 ' >> "$W/t75/kernel/process.c"
 tooth sse-lazy-woken Q4 "a .c file now calls perform_lazy_context_switch() (the lazy path is no longer dormant)" "$W/t75"
+
+# ─── R: the signal seam (§10.13's step 2) ──────────────────────────────
+
+# t76: the sigsetsize refusal silenced — a caller claiming a 4-byte sigset
+# would have its bytes silently reinterpreted as an 8-byte mask, and the
+# host test's literal -EINVAL check would catch it too, but the GUARD must
+# be the thing that reddens at source level.
+seed "$W/t76"
+sed -i 's/p.refuse = -LINUX_EINVAL;/p.refuse = 0;/' "$W/t76/kernel/linux_abi.c"
+tooth sigplan-einval-refusal-gone R1 "the plan's sigsetsize refusal no longer refuses" "$W/t76"
+
+# t77: the dispatch's first-trap return deleted — the refusal is still
+# computed, but the request now posts anyway: the sidecar answers a call
+# whose kernel half already decided it could not be served.
+seed "$W/t77"
+sed -i '/return (uint64_t)(int64_t)splan.refuse;/d' "$W/t77/kernel/syscall_dispatch.c"
+tooth sigplan-refusal-returns-late R2 "the dispatch no longer returns the plan's refusal from the first trap" "$W/t77"
+
+# t78: the tkill arm renamed away — the number the firstuser's raise()
+# takes (tkill, 200) falls to the default ENOSYS arm, so SIGABRT never
+# terminates and abort() walks into its hlt: the exact boot death this
+# seam exists to end, back by name.
+seed "$W/t78"
+sed -i 's/LINUX_TKILL => {/LINUX_TKILL_NEVER => {/' "$W/t78/user/sidecar/src/linux.rs"
+tooth tkill-arm-gone R4 "the sidecar no longer answers tkill (200)" "$W/t78"
+
+# t79: the terminate arm answers success — the silent lie of this whole
+# clause set: raise(SIGABRT) returns 0, abort() believes the signal was
+# delivered, and the task keeps running instead of being reaped.
+seed "$W/t79"
+sed -i 's/ACT_TERMINATE => Answer::SignalKill,/ACT_TERMINATE => Answer::Reply(0, STATUS_OK),/' "$W/t79/user/sidecar/src/linux.rs"
+tooth terminate-answers-success R4 "a default-terminate signal no longer converges on SignalKill" "$W/t79"
+
+# t80: the handler-install refusal answered 0 — v1 has no signal frames,
+# so a recorded handler would never run while its caller believes the
+# install succeeded.
+seed "$W/t80"
+sed -i 's|_ => Answer::Reply(0, E_NOSYS), /\* handler install not landed \*/|_ => Answer::Reply(0, STATUS_OK), /* handler install silently kept */|' "$W/t80/user/sidecar/src/linux.rs"
+tooth handler-install-answered-0 R5 "a handler install is no longer refused by name before any mutation" "$W/t80"
+
+# t81: tkill's tid scope deleted — any sender may signal any tid through
+# this arm, silently re-targeted instead of answered ESRCH.
+seed "$W/t81"
+sed -i 's/if sig.tid == 0 || args\[0\] as u32 != sig.tid as u32 {/if false {/' "$W/t81/user/sidecar/src/linux.rs"
+tooth tkill-tid-scope-gone R5 "tkill no longer requires the tid to be this task's own set_tid_address echo" "$W/t81"
+
+# t82: rt_sigprocmask out of the class table — its payload never crosses
+# (the dispatch's plan branch keys off LSC_SIG) while the census row still
+# shows the number as served.
+seed "$W/t82"
+sed -i 's/{  14, LSC_SIG,/{  14, LSC_MEM,/' "$W/t82/kernel/linux_abi.c"
+tooth sigprocmask-class-dropped R3 "rt_sigprocmask is no longer classed LSC_SIG" "$W/t82"
+
+# t83: the plan's host-test section deleted — the pure half would then be
+# argued from the guard's greps alone, every branch reachable only at boot.
+seed "$W/t83"
+sed -i '/linux_sig_copy_plan(/d' "$W/t83/tests/linux_personality_host_test.c"
+tooth sigplan-unhosttested R6 "the host test no longer drives linux_sig_copy_plan" "$W/t83"
 
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"

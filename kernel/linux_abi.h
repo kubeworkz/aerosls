@@ -80,7 +80,10 @@ enum LinuxSyscallClass {
     LSC_UNKNOWN = 0,   /* not in the census: refused by name, never dispatched */
     LSC_FD,            /* sidecar fd table + path resolution (Phase 2 §3-§4) */
     LSC_MEM,           /* §5.4 budget-backed memory: brk/mmap/munmap/mprotect */
-    LSC_SIG,           /* accepted and recorded; never delivered (§5.6) */
+    LSC_SIG,           /* recorded at the sidecar, and delivered ONLY as
+                        * tkill's default action (§10.13's step 2); a user
+                        * HANDLER is still never invoked — installation is
+                        * refused by name (no signal frames in v1)          */
     LSC_MSR,           /* §5.3 the one kernel-side semantic: arch_prctl(SET_FS) */
     LSC_SPAWN,         /* execve: the spawn path (the sidecar's to decide) */
     LSC_LOCAL,         /* sidecar-local: no fd, no memory, no kernel state */
@@ -292,6 +295,52 @@ struct LinuxMemBrkVerdict linux_mem_brk_verdict(uint64_t heap_base,
  * page reads as 0, so a walker refusal can never free a frame that was
  * not mapped by this path. */
 uint64_t linux_user_page_frame(uint64_t root, uint64_t va);
+
+/* ─── E7 increment 10 (the signal seam, §10.13's step 2) — the sig class's byte crossing ──
+ * rt_sigaction's `act` and rt_sigprocmask's `set` live in the CHILD's
+ * address space, so they cross exactly as write(2)'s buffer does: the
+ * KERNEL copies them OUT into the forwarded message (the same read-only
+ * walker, the same USER-bit boundary, the same first-trap -EFAULT), and
+ * the SIDECAR owns every semantic decision over the bytes — which
+ * disposition changed, whether a mask block happened, whether the answer
+ * is a delivery (its 13/14/200 arms). This function is the mechanism's
+ * half of that split and nothing more.
+ *
+ * Two refusals live HERE, both at the FIRST trap and before any channel,
+ * because both are places the request as asked cannot honestly be served:
+ *   - args[3] (sigsetsize) != 8 — the kernel-ABI sigset this seam crosses
+ *     is 8 bytes; a caller claiming another size would get its bytes
+ *     silently reinterpreted. Linux's own number answers this: EINVAL.
+ *   - args[2] (oldact/oldset) != 0 — writing the OLD disposition BACK
+ *     into the child is §10.10's copy-IN gap (increment 8's seam), which
+ *     does not exist yet. Answering 0 while the caller's out-pointer
+ *     keeps stack garbage it believes is an answer is exactly the silent
+ *     lie the refusals-by-name discipline exists to prevent; ENOSYS with
+ *     the call site's logged line is the honest shape, trigger: land the
+ *     reply payload's copy-IN and this refusal goes with it.
+ * A NULL act/set with a NULL out-pointer is a no-op the sidecar answers
+ * 0 — nothing to copy, nothing to ask. Pure: the host test drives every
+ * branch (tests/linux_personality_host_test.c). */
+#define LINUX_RT_SIGACTION   13u          /* the census's sigaction row   */
+#define LINUX_RT_SIGPROCMASK 14u          /* the census's sigprocmask row */
+#define LINUX_SIGACT_BYTES   32u          /* kernel-ABI struct sigaction:
+                                           * sa_handler, sa_flags, sa_mask,
+                                           * sa_restorer — four u64s       */
+#define LINUX_SIGSET_BYTES   8u           /* the sigset the shim crosses  */
+
+struct LinuxSigCopyPlan {
+    uint64_t src;    /* child VA to copy from (args[1]) — 0 = nothing   */
+    uint32_t len;    /* bytes to attach: 32 (act) or 8 (set); 0 = none   */
+    int32_t  refuse; /* 0 = proceed; else the Linux errno to return
+                      * BEFORE any post (first-trap refusal discipline)  */
+};
+
+/* Plan one sig-class byte crossing: EINVAL for a foreign sigsetsize, 
+ * ENOSYS for an out-pointer this kernel cannot write back, -EFAULT for a
+ * span ring 3 could not read, else the act/set bytes (or none). Total:
+ * any other number plans nothing and refuses nothing. */
+struct LinuxSigCopyPlan linux_sig_copy_plan(uint64_t num,
+                                            const uint64_t args[6]);
 
 /* ─── The errno map (§5.7) ─────────────────────────────────────────────────
  * Two families cross into the Linux task as negative rax: the Phase-3

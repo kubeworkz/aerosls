@@ -42,11 +42,28 @@
 //!     refused EPERM — the refusal H2's Node exclusion IS, and the twin
 //!     of the kernel's first-trap refusal (both ends exist so neither
 //!     alone is load-bearing);
+//!   - `rt_sigaction` (13) / `rt_sigprocmask` (14) / `tkill` (200) — the
+//!     signal seam (§10.13's step 2): the act/set bytes arrive ATTACHED
+//!     (the kernel copied them out of the child; this side never reads
+//!     the child's memory), dispositions record DFL/IGN only — a handler
+//!     install is ENOSYS by name BEFORE any mutation (no signal frames in
+//!     v1), the mask records BLOCK/UNBLOCK/SETMASK exactly, and delivery
+//!     is REAL: a tkill to the task's own tid whose signal is unblocked
+//!     with a default-terminate action kills the task through exit_group's
+//!     own reap path (no reply — it never runs again), while a blocked
+//!     signal pends and is delivered when a later rt_sigprocmask's new
+//!     mask reveals it — which is exactly how musl's `raise()` dies on
+//!     real Linux (block → tkill → unblock → the default action runs).
+//!     Refused by name with the number logged: handler invocation (no
+//!     frames/sigreturn), stop-by-default delivery, an oldact/oldset the
+//!     kernel will not copy back (it refuses first-trap; §10.10's copy-IN
+//!     gap), and a tid that is not this task's own (ESRCH — cross-task
+//!     signals are unscoped, never silently re-targeted at the sender);
 //!   - everything else — `open`/`close`/`lseek` and the rest of the fd
 //!     class (Phase 2 §3-§4), `mmap`/`munmap` (§5.4's sub-allocation
 //!     half, the increment after 6), any mprotect whose prot is not
-//!     W|X (real permission changes are not landed), the sig class
-//!     (accepted-never-delivered), `clock_gettime` (needs the clock plus
+//!     W|X (real permission changes are not landed), `clock_gettime`
+//!     (needs the clock plus
 //!     a child-buffer write) and any number outside the census —
 //!     is answered `ENOSYS` with its number logged, §11 Q5's recommended
 //!     policy: visible and cheap, never a silent success.
@@ -102,6 +119,57 @@ const E_PERM: i32 = -12;      /* CAP_EPERM -> -EPERM (§5.7): §5.4's W|X
                                 * map delivers 1, never an invented number */
 const STATUS_OK: i32 = 0;      /* CAP_ERR_OK: the reply carries a real `ret` */
 
+/// E7 increment 10 (the signal seam, §10.13's step 2): CAP_ERR_TARGET
+/// (kernel/cap.h's literal 7) pinned so tkill's "no such thread" reaches
+/// the task as -ESRCH through §5.7, never as an invented number.
+const E_TARGET: i32 = 7; /* CAP_ERR_TARGET -> -ESRCH (§5.7) */
+
+/// The sig seam's numbers and sizes — twins of kernel/linux_abi.h's
+/// LINUX_RT_SIGACTION / LINUX_RT_SIGPROCMASK / LINUX_SIGACT_BYTES /
+/// LINUX_SIGSET_BYTES (the Rust side cannot include that header, so the
+/// literals repeat, commented as twins; guard clause R pins both halves
+/// and the kernel's plan derives the SAME attach length from these
+/// same words: num and args[1] != 0).
+const LINUX_RT_SIGACTION: u64 = 13;
+const LINUX_RT_SIGPROCMASK: u64 = 14;
+const LINUX_TKILL: u64 = 200;
+const SIGACT_BYTES: usize = 32; /* kernel-ABI struct sigaction: four u64s */
+const SIGSET_BYTES: u64 = 8;    /* the sigset this seam crosses            */
+
+/// How far a signal number may run: Linux x86-64 signals are 1..=64
+/// (1..31 standard, 32..64 real-time; 0 is tkill's existence probe and
+/// rt_sigaction's EINVAL case, never an index).
+const SIG_MAX: usize = 64;
+
+/// Dispositions this v1 can honestly hold: SIG_DFL and SIG_IGN. A handler
+/// address is never stored — installation is refused before any mutation
+/// (no signal frames exist to invoke it with, so recording it would make
+/// every later delivery a coin flip between a silent kill and a silent
+/// nothing).
+const DISPO_DFL: u8 = 0;
+const DISPO_IGN: u8 = 1;
+
+/// A signal's DEFAULT action as POSIX defines it per signal number. The
+/// three v1 outcomes are each honest: IGNORE — the default has no
+/// observable effect, so answering 0 IS the complete delivery;
+/// TERMINATE — the kill arm runs (the CORE class kills without writing a
+/// dump: this kernel has no core-file path, named in §10.13 rather than
+/// faked); STOP — not landed, refused by name: silently killing a
+/// stop-default signal would be a different signal than the caller asked
+/// for.
+const ACT_IGNORE: u8 = 0;
+const ACT_TERMINATE: u8 = 1;
+const ACT_STOP: u8 = 2;
+
+fn default_action(sig: u64) -> u8 {
+    match sig {
+        17 | 18 | 23 | 28 => ACT_IGNORE, /* CHLD CONT URG WINCH */
+        19 | 20 | 21 | 22 => ACT_STOP,   /* STOP TSTP TTIN TTOU  */
+        1..=64 => ACT_TERMINATE, /* the rest, incl. the CORE class and RT 32..64 */
+        _ => ACT_STOP, /* unreachable: every arm range-checks first */
+    }
+}
+
 /// E7 increment 5 (the fd class): the number that may carry attached
 /// bytes, and the bound the kernel's LINUX_FD_WRITE_CHUNK (1024) mirrors
 /// — a request whose count is larger than the chunk, or whose payload
@@ -130,7 +198,10 @@ pub struct LinuxSyscallReq {
  * build it at all). */
 const _: () = assert!(core::mem::size_of::<LinuxSyscallReq>() == LINUX_SYSCALL_REQ_BYTES);
 
-/// What the answer to one forwarded syscall IS.
+/// What the answer to one forwarded syscall IS. Debug exists for the unit
+/// tests' failure messages only (cfg_attr — it never builds into the
+/// target binary).
+#[cfg_attr(test, derive(Debug))]
 enum Answer {
     /// Reply with this ret/status (status 0 = ret is the value).
     Reply(u64, i32),
@@ -142,6 +213,14 @@ enum Answer {
     Write(usize),
     /// exit_group: reap the task, reply nothing.
     Exit,
+    /// E7 increment 10 (the signal seam): a signal's DEFAULT ACTION ran —
+    /// reap the task through exit_group's own path and reply nothing. On
+    /// real Linux the process dies inside the delivering syscall and never
+    /// returns to its caller, so "no reply" is the faithful shape; the
+    /// variant is distinct from `Exit` only so the serial log names WHICH
+    /// decision killed the task — the boot's attribution reads the line,
+    /// not an inference.
+    SignalKill,
 }
 
 /// One Linux task's §5.4 heap ledger: the budget span the create stamped
@@ -157,17 +236,67 @@ struct MemBrk {
     cur: u64,
 }
 
+/// One Linux task's signal STATE (E7 increment 10, §10.13's step 2) — the
+/// sidecar's half of D1: the dispositions, the blocked mask, the pending
+/// bits, and the tid `tkill` is matched against. Pure over itself: every
+/// arm below mutates it through `&mut`, `service` writes it back beside
+/// the brk ledger, and the unit tests at this file's end drive the whole
+/// seam without a table, a task or a boot.
+///
+/// `tid` deserves its own note because the seam's correctness rests on it:
+/// this shim's tid IS `set_tid_address`'s answer (the arm below echoes
+/// args[0]), and musl stores that return into `pt->tid` as an int32 — so
+/// `tkill` hands back the sign-extended LOW 32 BITS of exactly this value.
+/// The match therefore compares at u32 width, which is the only width at
+/// which the two ends can be the same number.
+#[derive(Clone, Copy)]
+struct SigState {
+    tid: u64,
+    mask: u64,                /* blocked signals, bit (sig - 1), signals 1..=64 */
+    pending: u64,             /* blocked signals that have arrived              */
+    dispo: [u8; SIG_MAX + 1], /* indexed by signal number: DFL / IGN only       */
+}
+
+impl SigState {
+    const fn new() -> Self {
+        SigState {
+            tid: 0,
+            mask: 0,
+            pending: 0,
+            dispo: [DISPO_DFL; SIG_MAX + 1],
+        }
+    }
+}
+
 /// The census's first answers (see the module header for the honest
-/// refusals). Pure over the request's registers, the task's fd table and
-/// a local copy of its brk ledger — pid/name resolution and the console
+/// refusals). Pure over the request's registers, the task's fd table, a
+/// local copy of its brk ledger AND its signal state (E7 increment 10 —
+/// `service` writes both back, exactly as each is only ever changed by
+/// the arm that owns it), and the payload bytes the kernel attached (the
+/// act/set structs — this side never reads the child's memory itself).
+/// Pid/name resolution and the console
 /// handle belong to the caller (`service`), because they need `Kernel`
 /// and the entry loop's objects.
-fn answer(num: u64, args: &[u64; 6], fds: &[FdSlot], brk: &mut MemBrk) -> Answer {
+fn answer(
+    num: u64,
+    args: &[u64; 6],
+    fds: &[FdSlot],
+    brk: &mut MemBrk,
+    sig: &mut SigState,
+    payload: &[u8],
+) -> Answer {
     match num {
         /* set_tid_address (218, LSC_LOCAL): single-threaded — the "address
          * of the cleared TID" can never be written, so the complete and
-         * truthful answer is the address itself (§5.6: stored, ignored). */
-        218 => Answer::Reply(args[0], STATUS_OK),
+         * truthful answer is the address itself (§5.6: stored, ignored).
+         * E7 increment 10: that echo IS this shim's tid — musl stores the
+         * return into pt->tid as an int32 and tkill hands its low 32 bits
+         * back — so the answer is also RECORDED here: the seam's whole
+         * notion of "this task" for tkill's match (SigState's note). */
+        218 => {
+            sig.tid = args[0];
+            Answer::Reply(args[0], STATUS_OK)
+        }
         /* write (1, LSC_FD — the fd class, E7 increment 5): the fd table
          * decides, exactly as Phase 2 §3 puts the core between a
          * descriptor and its destination. 0/1/2 are the task's console
@@ -246,6 +375,158 @@ fn answer(num: u64, args: &[u64; 6], fds: &[FdSlot], brk: &mut MemBrk) -> Answer
         /* exit_group (231, LSC_EXIT): the sidecar reaps, the frames return
          * (§5.6) — handled by service(), which owns the pid lookup. */
         231 => Answer::Exit,
+        /* rt_sigaction (13, LSC_SIG — E7 increment 10, §10.13's step 2):
+         * the KERNEL copied `act` out of the child (32 bytes behind the
+         * header), so nothing here reads the child's memory. Both
+         * refusals the kernel refuses first-trap are checked here as this
+         * side's OWN twins — the W|X posture one level down: both ends, so
+         * neither alone is load-bearing. A foreign sigsetsize is EINVAL
+         * (Linux's own number) and an oldact out-pointer is ENOSYS — the
+         * copy-IN that would write the old disposition back does not
+         * exist (§10.10's named gap), and answering 0 with the pointer
+         * untouched would hand the caller stack garbage it believes is an
+         * answer. act NULL with no oldact is the no-op both Linux and
+         * this seam answer 0. The DISPOSITION records DFL/IGN only: a
+         * handler address is ENOSYS by name BEFORE any mutation — v1 has
+         * no signal frames, so installing a handler this shim can never
+         * invoke would make every later delivery a coin flip; sa_flags
+         * and sa_mask are deliberately NOT stored (they can only ride
+         * with a handler install, which was just refused — nothing may
+         * depend on bytes this side declined to keep). */
+        LINUX_RT_SIGACTION => {
+            if args[3] != SIGSET_BYTES {
+                Answer::Reply(0, E_INVAL)
+            } else if args[2] != 0 {
+                Answer::Reply(0, E_NOSYS)
+            } else if args[1] == 0 {
+                Answer::Reply(0, STATUS_OK)
+            } else if args[0] == 0 || args[0] > SIG_MAX as u64 {
+                Answer::Reply(0, E_INVAL)
+            } else if args[0] == 9 || args[0] == 20 {
+                /* SIGKILL / SIGSTOP: Linux itself refuses any change to
+                 * these dispositions (EINVAL), whatever the act says. */
+                Answer::Reply(0, E_INVAL)
+            } else if payload.len() < SIGACT_BYTES {
+                Answer::Reply(0, E_NOSYS) /* service's length check refuses these too */
+            } else {
+                match read_u64(payload, 0) {
+                    0 => {
+                        sig.dispo[args[0] as usize] = DISPO_DFL;
+                        Answer::Reply(0, STATUS_OK)
+                    }
+                    1 => {
+                        sig.dispo[args[0] as usize] = DISPO_IGN;
+                        Answer::Reply(0, STATUS_OK)
+                    }
+                    _ => Answer::Reply(0, E_NOSYS), /* handler install not landed */
+                }
+            }
+        }
+        /* rt_sigprocmask (14, LSC_SIG — the seam's other recorded half):
+         * same twins (sigsetsize, oldset) as 13 above. The mask itself is
+         * POSIX arithmetic — BLOCK / UNBLOCK / SETMASK — and then the
+         * DELIVERY: what does the new mask REVEAL? A revealed pending
+         * signal whose disposition is IGN (or whose default is ignore) is
+         * discarded — that IS its delivery; a default-terminate signal
+         * runs the kill arm RIGHT HERE with no reply, which is exactly
+         * where musl's raise() dies on real Linux (block → tkill pends →
+         * restore unmasks → the default action runs inside this syscall);
+         * a default-stop signal refuses the call by name BEFORE any
+         * mutation — nothing moved, not even the mask. */
+        LINUX_RT_SIGPROCMASK => {
+            if args[3] != SIGSET_BYTES {
+                Answer::Reply(0, E_INVAL)
+            } else if args[2] != 0 {
+                Answer::Reply(0, E_NOSYS)
+            } else if args[1] == 0 {
+                Answer::Reply(0, STATUS_OK)
+            } else if payload.len() < SIGSET_BYTES as usize {
+                Answer::Reply(0, E_NOSYS) /* service's length check refuses these too */
+            } else {
+                let set = read_u64(payload, 0);
+                let old = sig.mask;
+                match args[0] {
+                    0 | 1 | 2 => {
+                        let new_mask = match args[0] {
+                            0 => old | set,  /* SIG_BLOCK    */
+                            1 => old & !set, /* SIG_UNBLOCK  */
+                            _ => set,        /* SIG_SETMASK  */
+                        };
+                        /* Pass 1: what does the new mask REVEAL? Discards
+                         * (an IGN disposition, or an ignore-by-default
+                         * signal) are invisible either way; a
+                         * default-terminate signal KILLS right here — no
+                         * reply, this syscall never returns to its caller;
+                         * a default-stop signal refuses the CALL before
+                         * anything moves (not even the mask). */
+                        let mut revealed = sig.pending & !new_mask;
+                        let mut verdict = 0u8; /* 0 proceed, 1 kill, 2 refuse */
+                        while revealed != 0 && verdict == 0 {
+                            let bit = revealed.trailing_zeros();
+                            revealed &= !(1u64 << bit);
+                            let sig_no = bit + 1;
+                            if sig.dispo[sig_no as usize] == DISPO_IGN
+                                || default_action(sig_no as u64) == ACT_IGNORE
+                            {
+                                continue; /* discard — its delivery is a no-op */
+                            } else if default_action(sig_no as u64) == ACT_TERMINATE {
+                                verdict = 1;
+                            } else {
+                                verdict = 2;
+                            }
+                        }
+                        match verdict {
+                            1 => Answer::SignalKill,
+                            2 => Answer::Reply(0, E_NOSYS),
+                            _ => {
+                                /* Pass 2: apply — the revealed discards
+                                 * leave the pending set (pending &= mask
+                                 * keeps only what is STILL blocked), then
+                                 * the mask moves. Both refusals above
+                                 * return before this line: a failed call
+                                 * never half-changes the mask. */
+                                sig.pending &= new_mask;
+                                sig.mask = new_mask;
+                                Answer::Reply(0, STATUS_OK)
+                            }
+                        }
+                    }
+                    _ => Answer::Reply(0, E_INVAL), /* a `how` Linux does not have */
+                }
+            }
+        }
+        /* tkill (200 — the seam's DELIVERY): the tid must be the one this
+         * task's own set_tid_address answer declared, compared at u32
+         * width (musl stores that echo into pt->tid as an int32 and tkill
+         * sign-extends it back — SigState's note holds the arithmetic).
+         * A tid that matches nothing answers ESRCH — Linux's own answer
+         * for a thread that does not exist; cross-task signals stay
+         * unscoped, never silently re-targeted at the sender. sig 0 is
+         * Linux's existence probe: validate the tid, deliver nothing. The
+         * delivery decision is then exactly two questions: is it
+         * blocked (it PENDS — raise() observes 0 and the action runs at
+         * the next unblock, which is the arm above), and is its
+         * disposition/default one this v1 can honestly perform? */
+        LINUX_TKILL => {
+            if sig.tid == 0 || args[0] as u32 != sig.tid as u32 {
+                Answer::Reply(0, E_TARGET)
+            } else if args[1] == 0 {
+                Answer::Reply(0, STATUS_OK) /* existence probe */
+            } else if args[1] > SIG_MAX as u64 {
+                Answer::Reply(0, E_INVAL)
+            } else if sig.dispo[args[1] as usize] == DISPO_IGN {
+                Answer::Reply(0, STATUS_OK) /* ignored: 0 IS the delivery */
+            } else if sig.mask & (1u64 << (args[1] - 1)) != 0 {
+                sig.pending |= 1u64 << (args[1] - 1);
+                Answer::Reply(0, STATUS_OK) /* blocked: arrives as pending */
+            } else {
+                match default_action(args[1]) {
+                    ACT_TERMINATE => Answer::SignalKill,
+                    ACT_IGNORE => Answer::Reply(0, STATUS_OK),
+                    _ => Answer::Reply(0, E_NOSYS), /* stop-default: not landed */
+                }
+            }
+        }
         /* Everything else, named in the module header: ENOSYS + a logged
          * number, never a silent success and never a fabricated value. */
         _ => Answer::Reply(0, E_NOSYS),
@@ -281,6 +562,25 @@ fn fd_kind(fds: &[FdSlot], fd: u64) -> Option<u8> {
     }
 }
 
+/// The message length one request must arrive with — pure over (num,
+/// args), the TWIN of the kernel's attach decision: write carries
+/// `args[2]` bytes behind the header (the clamp that rode IN the
+/// description), rt_sigaction/rt_sigprocmask carry their fixed-size
+/// struct/set when an act/set pointer was actually passed, everything
+/// else is exactly the 72-byte description it has always been. Both ends
+/// deriving this from the same words is what makes a drifted attach
+/// detectable as a wrong LENGTH (the malformed arm, num=0 → -EPROTO)
+/// instead of silently dropping or misaligning bytes. Unit-tested at this
+/// file's end; guard clause R pins it against the kernel's plan.
+fn expected_req_len(num: u64, args: &[u64; 6]) -> usize {
+    match num {
+        LINUX_WRITE => LINUX_SYSCALL_REQ_BYTES + args[2] as usize,
+        LINUX_RT_SIGACTION if args[1] != 0 => LINUX_SYSCALL_REQ_BYTES + SIGACT_BYTES,
+        LINUX_RT_SIGPROCMASK if args[1] != 0 => LINUX_SYSCALL_REQ_BYTES + SIGSET_BYTES as usize,
+        _ => LINUX_SYSCALL_REQ_BYTES,
+    }
+}
+
 /// One Linux-personality child whose forwards this sidecar answers. The
 /// registry is the spawn path's bookkeeping, not the kernel's: syscall 328
 /// hands back only the CALLER's channel handles, and the reaper needs a
@@ -301,6 +601,9 @@ struct LinuxTask {
     brk_cur: u64,   /* into its own descriptor, and the bump pointer     */
                     /* this side moves (the kernel's brk_cur is the      */
                     /* mechanism's twin — the probe proves they agree)   */
+    sig: SigState,  /* increment 10: the signal seam's per-task state —  */
+                    /* dispositions, mask, pending, and the tid tkill    */
+                    /* matches (recorded from this task's OWN 218 echo)  */
 }
 
 const MAX_LINUX_TASKS: usize = 8;
@@ -318,6 +621,7 @@ fn tasks() -> &'static mut [LinuxTask; MAX_LINUX_TASKS] {
         brk_base: 0,
         brk_limit: 0,
         brk_cur: 0,
+        sig: SigState::new(),
     }; MAX_LINUX_TASKS];
     unsafe { &mut TABLE }
 }
@@ -357,6 +661,13 @@ pub fn track(
         t.brk_base = heap_base;
         t.brk_limit = heap_limit;
         t.brk_cur = heap_base;
+        /* The signal state is born with the task, like the fd table and
+         * the ledger below: a reused registry slot must not inherit its
+         * predecessor's dispositions, mask, pending bits or TID — an
+         * inherited tid would answer ESRCH-vs-deliver wrongly for the
+         * next child, which is the stale-state failure this reset exists
+         * to refuse (proc_clear_resume_state's discipline, sidecar side). */
+        t.sig = SigState::new();
         /* The fd table is born with the task: fds 0, 1, 2 — its console,
          * registered at spawn like every process's stdio. All three
          * accept writes (a tty is bidirectional; write(0) is not EBADF
@@ -520,30 +831,28 @@ pub fn service<K: Kernel>(k: &K, console: &CharNode) {
             *a = read_u64(&buf, 8 + 8 * ai);
         }
 
-        /* E7 increment 5 (the fd class): exactly ONE number may carry
-         * bytes behind the header, and only under the kernel's own
-         * arithmetic — attached == args[2] (the clamp rides IN the
-         * description) and attached ≤ FD_PAYLOAD_CAP (the twin of
-         * LINUX_FD_WRITE_CHUNK). Every other number must be exactly 72.
-         * A violation is the malformed arm's answer: num=0, which the
-         * kernel's echo check refuses -EPROTO — loud, never a silent
-         * success and never bytes this task did not write. */
-        let payload: &[u8] = if num == LINUX_WRITE {
-            let want = LINUX_SYSCALL_REQ_BYTES + args[2] as usize;
-            if args[2] as usize > FD_PAYLOAD_CAP || rr.len != want {
-                enosys_log(num as u32, &name_buf[..nlen], b"[POSIX] write payload mismatch -> -EPROTO\n");
-                reply(k, ch_w, rr.tag, 0, 0, E_NOSYS);
-                continue;
-            }
-            &buf[LINUX_SYSCALL_REQ_BYTES..rr.len]
-        } else {
-            if rr.len != LINUX_SYSCALL_REQ_BYTES {
-                enosys_log(0xBAD0, &name_buf[..nlen], b"[POSIX] malformed request -> -EPROTO\n");
-                reply(k, ch_w, rr.tag, 0, 0, E_NOSYS);
-                continue;
-            }
-            &buf[..0]
-        };
+        /* E7 increment 5 (the fd class), extended by increment 10 (the
+         * signal seam): the message length a request MUST arrive with is
+         * derived from num and args — the TWIN of the kernel's attach
+         * decision (write: args[2] behind the header; act/set: 32/8
+         * bytes when args[1] != 0). A drifted attach can only arrive as
+         * a wrong length, and a wrong length is the malformed arm:
+         * num=0, which the kernel's echo check refuses -EPROTO — loud,
+         * never a silent success and never bytes silently dropped. */
+        let expected = expected_req_len(num, &args);
+        if num == LINUX_WRITE
+            && (args[2] as usize > FD_PAYLOAD_CAP || rr.len != expected)
+        {
+            enosys_log(num as u32, &name_buf[..nlen], b"[POSIX] write payload mismatch -> -EPROTO\n");
+            reply(k, ch_w, rr.tag, 0, 0, E_NOSYS);
+            continue;
+        }
+        if rr.len != expected {
+            enosys_log(0xBAD0, &name_buf[..nlen], b"[POSIX] malformed request -> -EPROTO\n");
+            reply(k, ch_w, rr.tag, 0, 0, E_NOSYS);
+            continue;
+        }
+        let payload: &[u8] = &buf[LINUX_SYSCALL_REQ_BYTES..rr.len];
 
         let fds = tasks()[i].fds;
         let mut mem = MemBrk {
@@ -551,14 +860,23 @@ pub fn service<K: Kernel>(k: &K, console: &CharNode) {
             limit: tasks()[i].brk_limit,
             cur: tasks()[i].brk_cur,
         };
+        let mut sigstate = tasks()[i].sig; /* Copy — the seam's ledger, */
+                                           /* written back like brk's   */
 
-        let ans = answer(num, &args, &fds, &mut mem);
+        let ans = answer(num, &args, &fds, &mut mem, &mut sigstate, payload);
         /* The ledger survives the reply: only a granted growth moves it
          * (the arm's own rule), and the KERNEL's brk_cur is its own
          * twin — the probe's denial-echo check is what proves the two
          * never drift. The base and limit are never written here: they
          * are the span, decided once, at spawn. */
         tasks()[i].brk_cur = mem.cur;
+        /* E7 increment 10: the signal state survives the reply the same
+         * way — tid, mask, pending and dispositions are each written only
+         * by the arm that owns them, and a refusal arm mutated nothing
+         * (refusal-before-mutation), so this unconditional write-back
+         * carries exactly the change that was granted. A SignalKill then
+         * spends the whole entry below — the state goes with the slot. */
+        tasks()[i].sig = sigstate;
 
         match ans {
             Answer::Reply(ret, status) => {
@@ -623,6 +941,303 @@ pub fn service<K: Kernel>(k: &K, console: &CharNode) {
                     tasks()[i].used = false;
                 }
             }
+            Answer::SignalKill => {
+                /* E7 increment 10 (§10.13's step 2): a signal's default
+                 * action ran. The line names the NUMBER before the reap —
+                 * the log is what the boot's attribution reads, and this
+                 * is the difference between "the seam delivered" and
+                 * "the task happened to die". The reap itself is
+                 * exit_group's own path, twin for twin: same
+                 * name->pid liveness test, same immediate teardown for a
+                 * target parked awaiting THIS exchange, same refusal to
+                 * strand a task when the name resolves nowhere. No reply:
+                 * on real Linux the process dies inside the delivering
+                 * syscall and never returns to its caller. */
+                enosys_log(num as u32, &name_buf[..nlen], b" sig default-action -> kill\n");
+                let name = core::str::from_utf8(&name_buf[..nlen]).unwrap_or("");
+                let pid = k.sidecar_pid(name, partition);
+                if pid == 0 {
+                    enosys_log(num as u32, &name_buf[..nlen], b" sig kill: NOT-FOUND (reap refused)\n");
+                    reply(k, ch_w, rr.tag, num, 0, E_CONFLICT);
+                } else {
+                    k.proc_kill(pid);
+                    tasks()[i].used = false;
+                }
+            }
         }
+    }
+}
+/* ─── E7 increment 10 (the signal seam): the pure half, driven ────────────
+ * answer() has no Kernel, no channel and no task in its signature for
+ * exactly this reason: the whole seam — the two refusals' twins, the mask
+ * arithmetic, the tid match, pending/reveal, and the delivery decision —
+ * is decisions over a request, a payload slice and a SigState. These tests
+ * are the host teeth the boot cannot be (a wrong tid width or a mask that
+ * moves on a refusal is invisible in any single trace); the boot then
+ * measures the one flow these compose into: musl's raise() — block, tkill,
+ * unblock — ending in kill with no [FAULT]. */
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fds() -> [FdSlot; LINUX_MAX_FDS] {
+        [FdSlot { used: false, kind: 0 }; LINUX_MAX_FDS]
+    }
+    fn ledger() -> MemBrk {
+        MemBrk { base: 0, limit: 0, cur: 0 }
+    }
+    /* The fixture tid: what the candidate's set_tid_address answer echoes
+     * (the address of __thread_list_lock, 0x807c398 in the committed
+     * firstuser ELF). */
+    const TID: u64 = 0x807c398;
+
+    fn fresh() -> SigState {
+        SigState { tid: TID, ..SigState::new() }
+    }
+
+    fn act_payload(handler: u64) -> [u8; SIGACT_BYTES] {
+        let mut p = [0u8; SIGACT_BYTES];
+        p[..8].copy_from_slice(&handler.to_le_bytes());
+        p
+    }
+    fn set_payload(set: u64) -> [u8; SIGSET_BYTES as usize] {
+        set.to_le_bytes()
+    }
+
+    #[test]
+    fn expected_req_len_is_the_kernels_twin() {
+        let mut a = [0u64; 6];
+        assert_eq!(expected_req_len(LINUX_WRITE, &a), 72);
+        a[2] = 512;
+        assert_eq!(expected_req_len(LINUX_WRITE, &a), 72 + 512);
+        a = [0; 6];
+        a[1] = 0x1000; /* an act/set pointer is present */
+        assert_eq!(expected_req_len(LINUX_RT_SIGACTION, &a), 72 + SIGACT_BYTES);
+        assert_eq!(expected_req_len(LINUX_RT_SIGPROCMASK, &a), 72 + 8);
+        a[1] = 0; /* NULL act/set: the plain 72-byte description */
+        assert_eq!(expected_req_len(LINUX_RT_SIGACTION, &a), 72);
+        assert_eq!(expected_req_len(LINUX_TKILL, &a), 72);
+        assert_eq!(expected_req_len(999, &a), 72);
+    }
+
+    #[test]
+    fn default_actions_match_posix() {
+        /* terminate, incl. the CORE class (killed without a dump) and RT */
+        for s in [1u64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 32, 64] {
+            assert_eq!(default_action(s), ACT_TERMINATE, "sig {}", s);
+        }
+        /* default-ignore */
+        for s in [17u64, 18, 23, 28] {
+            assert_eq!(default_action(s), ACT_IGNORE, "sig {}", s);
+        }
+        /* default-stop: not landed */
+        for s in [19u64, 20, 21, 22] {
+            assert_eq!(default_action(s), ACT_STOP, "sig {}", s);
+        }
+    }
+
+    #[test]
+    fn sigaction_refuses_foreign_size_and_out_pointer_like_the_kernel() {
+        let mut sig = fresh();
+        /* sigsetsize != 8: Linux's own EINVAL */
+        let a = answer(13, &[6, 0x4000, 0, 4, 0, 0], &fds(), &mut ledger(),
+                       &mut sig, &act_payload(0));
+        assert!(matches!(a, Answer::Reply(0, E_INVAL)), "size twin: {:?}", a);
+        /* oldact != NULL: the copy-IN gap, ENOSYS by name */
+        let a = answer(13, &[6, 0x4000, 0x5000, 8, 0, 0], &fds(), &mut ledger(),
+                       &mut sig, &act_payload(0));
+        assert!(matches!(a, Answer::Reply(0, E_NOSYS)), "oldact twin: {:?}", a);
+        /* the refusal mutated nothing */
+        assert_eq!(sig.dispo[6], DISPO_DFL);
+        /* act NULL with no oldact: the no-op both sides answer 0 */
+        let a = answer(13, &[6, 0, 0, 8, 0, 0], &fds(), &mut ledger(),
+                       &mut sig, &[]);
+        assert!(matches!(a, Answer::Reply(0, STATUS_OK)), "null act: {:?}", a);
+    }
+
+    #[test]
+    fn sigaction_records_dfl_and_ign_but_refuses_handlers_before_mutation() {
+        let mut sig = fresh();
+        /* SIG_DFL recorded */
+        let a = answer(13, &[6, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
+                       &mut sig, &act_payload(0));
+        assert!(matches!(a, Answer::Reply(0, STATUS_OK)), "DFL: {:?}", a);
+        assert_eq!(sig.dispo[6], DISPO_DFL);
+        /* SIG_IGN recorded */
+        let a = answer(13, &[6, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
+                       &mut sig, &act_payload(1));
+        assert!(matches!(a, Answer::Reply(0, STATUS_OK)), "IGN: {:?}", a);
+        assert_eq!(sig.dispo[6], DISPO_IGN);
+        /* a handler address: ENOSYS, and the disposition UNCHANGED —
+         * refusal-before-mutation, the property that keeps a later
+         * delivery honest instead of half-recorded. */
+        let a = answer(13, &[6, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
+                       &mut sig, &act_payload(0x800abcd));
+        assert!(matches!(a, Answer::Reply(0, E_NOSYS)), "handler: {:?}", a);
+        assert_eq!(sig.dispo[6], DISPO_IGN, "the handler install must not land");
+        /* signal-number rules Linux itself owns: 0 and >64 are EINVAL,
+         * and SIGKILL/SIGSTOP refuse any change however benign. */
+        for s in [0u64, 65, 9, 20] {
+            let a = answer(13, &[s, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
+                           &mut sig, &act_payload(0));
+            assert!(matches!(a, Answer::Reply(0, E_INVAL)), "sig {}: {:?}", s, a);
+        }
+    }
+
+    #[test]
+    fn sigprocmask_is_exact_posix_arithmetic() {
+        let mut sig = fresh();
+        let run = |sig: &mut SigState, how: u64, set: u64| {
+            answer(14, &[how, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
+                   sig, &set_payload(set))
+        };
+        assert!(matches!(run(&mut sig, 2, 0b101), Answer::Reply(0, STATUS_OK)));
+        assert_eq!(sig.mask, 0b101, "SETMASK");
+        assert!(matches!(run(&mut sig, 0, 0b010), Answer::Reply(0, STATUS_OK)));
+        assert_eq!(sig.mask, 0b111, "BLOCK");
+        assert!(matches!(run(&mut sig, 1, 0b001), Answer::Reply(0, STATUS_OK)));
+        assert_eq!(sig.mask, 0b110, "UNBLOCK");
+        /* twins of the kernel's first-trap refusals, and the mask must
+         * not move on either */
+        let before = sig.mask;
+        let a2 = answer(14, &[2, 0x4000, 0, 16, 0, 0], &fds(), &mut ledger(),
+                        &mut sig, &set_payload(!0));
+        assert!(matches!(a2, Answer::Reply(0, E_INVAL)), "size twin: {:?}", a2);
+        let a3 = answer(14, &[2, 0x4000, 0x5000, 8, 0, 0], &fds(), &mut ledger(),
+                        &mut sig, &set_payload(!0));
+        assert!(matches!(a3, Answer::Reply(0, E_NOSYS)), "oldset twin: {:?}", a3);
+        assert_eq!(sig.mask, before, "a refused call never half-changes the mask");
+        /* a `how` Linux does not have */
+        let a = answer(14, &[9, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
+                       &mut sig, &set_payload(0));
+        assert!(matches!(a, Answer::Reply(0, E_INVAL)), "how: {:?}", a);
+        assert_eq!(sig.mask, before, "EINVAL moved no mask either");
+    }
+
+    #[test]
+    fn tkill_matches_the_recorded_tid_at_u32_width() {
+        /* The sign-extension case musl creates: the echo's low 32 bits
+         * have bit 31 set, pt->tid stores them as a negative int32, and
+         * tkill hands back the sign-extended form. Only a u32 compare
+         * can see the two as one number. */
+        let wide: u64 = 0x0000_0001_8000_0000;
+        let mut sig = SigState { tid: wide, ..SigState::new() };
+        /* sig 17 (default ignore) isolates the tid decision from delivery */
+        let a = answer(200, &[0xFFFF_FFFF_8000_0000, 17, 0, 0, 0, 0],
+                       &fds(), &mut ledger(), &mut sig, &[]);
+        assert!(matches!(a, Answer::Reply(0, STATUS_OK)), "u32 match: {:?}", a);
+        /* a tid that matches nothing: ESRCH (CAP_ERR_TARGET), never a
+         * re-target at the sender */
+        let a = answer(200, &[0x1234, 17, 0, 0, 0, 0],
+                       &fds(), &mut ledger(), &mut sig, &[]);
+        assert!(matches!(a, Answer::Reply(0, E_TARGET)), "mismatch: {:?}", a);
+        /* a task that never declared a tid has no self to deliver to */
+        let mut naked = SigState::new();
+        let a = answer(200, &[0, 17, 0, 0, 0, 0],
+                       &fds(), &mut ledger(), &mut naked, &[]);
+        assert!(matches!(a, Answer::Reply(0, E_TARGET)), "no tid: {:?}", a);
+    }
+
+    #[test]
+    fn tkill_delivery_decisions() {
+        /* unblocked + default-terminate: the kill arm */
+        let mut sig = fresh();
+        let a = answer(200, &[TID, 6, 0, 0, 0, 0],
+                       &fds(), &mut ledger(), &mut sig, &[]);
+        assert!(matches!(a, Answer::SignalKill), "SIGABRT: {:?}", a);
+        /* existence probe: sig 0 validates the tid and delivers nothing */
+        let a = answer(200, &[TID, 0, 0, 0, 0, 0],
+                       &fds(), &mut ledger(), &mut sig, &[]);
+        assert!(matches!(a, Answer::Reply(0, STATUS_OK)), "probe: {:?}", a);
+        /* out of range */
+        let a = answer(200, &[TID, 65, 0, 0, 0, 0],
+                       &fds(), &mut ledger(), &mut sig, &[]);
+        assert!(matches!(a, Answer::Reply(0, E_INVAL)), "range: {:?}", a);
+        /* SIG_IGN disposition: 0 IS the delivery */
+        answer(13, &[6, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
+               &mut sig, &act_payload(1));
+        let a = answer(200, &[TID, 6, 0, 0, 0, 0],
+                       &fds(), &mut ledger(), &mut sig, &[]);
+        assert!(matches!(a, Answer::Reply(0, STATUS_OK)), "ignored: {:?}", a);
+        /* blocked: the signal PENDS and nothing dies here */
+        let mut sig = fresh();
+        answer(14, &[2, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
+               &mut sig, &set_payload(1u64 << 5)); /* block SIGABRT */
+        let a = answer(200, &[TID, 6, 0, 0, 0, 0],
+                       &fds(), &mut ledger(), &mut sig, &[]);
+        assert!(matches!(a, Answer::Reply(0, STATUS_OK)), "blocked: {:?}", a);
+        assert_eq!(sig.pending & (1 << 5), 1 << 5, "the signal must pend");
+        /* default-ignore signal, unblocked: answered, not killed */
+        let a = answer(200, &[TID, 17, 0, 0, 0, 0],
+                       &fds(), &mut ledger(), &mut sig, &[]);
+        assert!(matches!(a, Answer::Reply(0, STATUS_OK)), "CHLD: {:?}", a);
+        /* default-stop signal, unblocked: refused by name, never a kill */
+        let a = answer(200, &[TID, 20, 0, 0, 0, 0],
+                       &fds(), &mut ledger(), &mut sig, &[]);
+        assert!(matches!(a, Answer::Reply(0, E_NOSYS)), "TSTP: {:?}", a);
+    }
+
+    #[test]
+    fn raise_flow_block_tkill_unblock_kills() {
+        /* musl raise() end to end: __block_app_sigs (14 BLOCK) ->
+         * tkill(tid, SIGABRT) (200) -> __restore_sigs (14 UNBLOCK) -> the
+         * default action runs INSIDE the unblock — the flow whose end the
+         * E3 boot must show as a kill with no [FAULT] line. */
+        let mut sig = fresh();
+        let block_abrt = answer(14, &[0, 0x4000, 0, 8, 0, 0], &fds(),
+                                &mut ledger(), &mut sig, &set_payload(1 << 5));
+        assert!(matches!(block_abrt, Answer::Reply(0, STATUS_OK)));
+        let tkill = answer(200, &[TID, 6, 0, 0, 0, 0], &fds(),
+                           &mut ledger(), &mut sig, &[]);
+        assert!(matches!(tkill, Answer::Reply(0, STATUS_OK)),
+                "blocked tkill answers 0, not a kill: {:?}", tkill);
+        assert_ne!(sig.pending, 0, "and the signal is pending");
+        let unblock = answer(14, &[1, 0x4000, 0, 8, 0, 0], &fds(),
+                             &mut ledger(), &mut sig, &set_payload(1 << 5));
+        assert!(matches!(unblock, Answer::SignalKill),
+                "the revealed pending SIGABRT must kill: {:?}", unblock);
+    }
+
+    #[test]
+    fn unblock_refuses_a_pending_stop_before_anything_moves() {
+        let mut sig = fresh();
+        answer(14, &[2, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
+               &mut sig, &set_payload(1 << 19)); /* block SIGSTOP */
+        let tkill = answer(200, &[TID, 20, 0, 0, 0, 0], &fds(),
+                           &mut ledger(), &mut sig, &[]);
+        assert!(matches!(tkill, Answer::Reply(0, STATUS_OK)));
+        assert_ne!(sig.pending, 0);
+        let before = sig.mask;
+        let unblock = answer(14, &[1, 0x4000, 0, 8, 0, 0], &fds(),
+                             &mut ledger(), &mut sig, &set_payload(1 << 19));
+        assert!(matches!(unblock, Answer::Reply(0, E_NOSYS)),
+                "a pending stop-default is refused by name: {:?}", unblock);
+        assert_eq!(sig.mask, before, "the mask did not move on the refusal");
+    }
+
+    #[test]
+    fn unblock_discards_a_pending_default_ignore_signal() {
+        let mut sig = fresh();
+        answer(14, &[2, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
+               &mut sig, &set_payload(1 << 16)); /* block SIGCHLD */
+        let tkill = answer(200, &[TID, 17, 0, 0, 0, 0], &fds(),
+                           &mut ledger(), &mut sig, &[]);
+        assert!(matches!(tkill, Answer::Reply(0, STATUS_OK)));
+        assert_ne!(sig.pending, 0, "a blocked signal pends whatever its default");
+        let unblock = answer(14, &[1, 0x4000, 0, 8, 0, 0], &fds(),
+                             &mut ledger(), &mut sig, &set_payload(1 << 16));
+        assert!(matches!(unblock, Answer::Reply(0, STATUS_OK)),
+                "discard, no kill: {:?}", unblock);
+        assert_eq!(sig.pending, 0, "the discarded pending bit is gone");
+        assert_eq!(sig.mask & (1 << 16), 0, "and the mask unblocked it");
+    }
+
+    #[test]
+    fn set_tid_address_records_the_tid_through_its_own_arm() {
+        let mut sig = SigState::new();
+        let a = answer(218, &[TID, 0, 0, 0, 0, 0], &fds(), &mut ledger(),
+                       &mut sig, &[]);
+        assert!(matches!(a, Answer::Reply(TID, STATUS_OK)), "echo: {:?}", a);
+        assert_eq!(sig.tid, TID, "the echo IS the recorded tid");
     }
 }

@@ -108,8 +108,8 @@ const struct LinuxSyscallEntry linux_syscall_table[] = {
     {  10, LSC_MEM,    LSC_F_REFUSES_WX }, /* mprotect — W|X refused (§5.4) */
     {  11, LSC_MEM,    0 },   /* munmap */
     {  12, LSC_MEM,    0 },   /* brk — §5.4 bump pointer in the budget */
-    {  13, LSC_SIG,    0 },   /* rt_sigaction — recorded, never delivered */
-    {  14, LSC_SIG,    0 },   /* rt_sigprocmask — recorded, never delivered */
+    {  13, LSC_SIG,    0 },   /* rt_sigaction — recorded; handler installs refused */
+    {  14, LSC_SIG,    0 },   /* rt_sigprocmask — recorded; unblock delivers (step 2) */
     {  59, LSC_SPAWN,  0 },   /* execve — the spawn path */
     {  72, LSC_FD,     0 },   /* fcntl */
     {  74, LSC_FD,     0 },   /* fsync */
@@ -297,6 +297,52 @@ int linux_user_copy_out(uint8_t *dst, uint64_t root, uint64_t va, uint32_t n)
         }
     }
     return 0;
+}
+
+/* ─── E7 increment 10 (the signal seam, §10.13's step 2) — the act/set copy plan ──
+ * The write plan's twin over the sig class: same walker, same boundaries,
+ * same first-trap discipline, different bytes (a fixed-size struct rather
+ * than a caller-chosen count — so there is no clamp to ride in the header:
+ * BOTH ends derive the attach length from num and args[1] != 0, which is
+ * what the sidecar's payload check mirrors). The two refusals the header
+ * names (sigsetsize, out-pointer) are decided here — pure over the six
+ * captured words, so the host test drives them without a boot. */
+struct LinuxSigCopyPlan linux_sig_copy_plan(uint64_t num, const uint64_t args[6])
+{
+    struct LinuxSigCopyPlan p;
+    uint64_t src, span_end;
+
+    p.src = 0;
+    p.len = 0;
+    p.refuse = 0;
+    if (num != LINUX_RT_SIGACTION && num != LINUX_RT_SIGPROCMASK)
+        return p;   /* not a sig-class crossing */
+    if (!args) return p;
+
+    if (args[3] != LINUX_SIGSET_BYTES) {
+        p.refuse = -LINUX_EINVAL;   /* Linux's own answer to a foreign
+                                     * sigsetsize */
+        return p;
+    }
+    if (args[2] != 0) {
+        p.refuse = -LINUX_ENOSYS;   /* oldact/oldset copy-back is §10.10's
+                                     * named gap — refused by name before
+                                     * any post, never answered 0 */
+        return p;
+    }
+
+    src = args[1];
+    if (src == 0) return p;         /* act/set NULL with no out-pointer:
+                                     * a no-op, nothing to copy */
+    p.src = src;
+    p.len = (num == LINUX_RT_SIGACTION) ? LINUX_SIGACT_BYTES
+                                        : LINUX_SIGSET_BYTES;
+    span_end = p.src + (uint64_t)p.len;
+    if (!linux_fs_addr_is_user_canonical(p.src) || span_end < p.src ||
+        (span_end - 1) > LINUX_USER_ADDR_MAX) {
+        p.refuse = -LINUX_EFAULT;
+    }
+    return p;
 }
 
 /* ─── E7 increment 6 (the mem class, §5.4) — the budget span ──────────────

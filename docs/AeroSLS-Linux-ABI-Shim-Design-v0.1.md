@@ -1678,13 +1678,96 @@ all clauses hold including Q1–Q4; smoke 61/61;
 `script_conventions_check` 0 violations; `stack_frame_budget_check`
 234 files PASS; `make x86-iso-e3` RC=0.
 
+**Step 2's signal half — DONE, measured: `abort`'s first `raise(SIGABRT)`
+now KILLS the task inside the delivering syscall, and the run ends with
+no `[FAULT]` line at all.** The seam is a three-part split. The KERNEL
+owns the byte crossing and nothing else: `linux_sig_copy_plan`
+(`kernel/linux_abi.{h,c}`) plans `rt_sigaction`'s 32-byte `act` and
+`rt_sigprocmask`'s 8-byte `set` out of the child through the same
+read-only USER-bit walker the fd class's writes use, and refuses at the
+FIRST trap — before any channel post — exactly three ways: a
+`sigsetsize` other than 8 is `-EINVAL` (Linux's own answer to a width
+the kernel-ABI sigset does not have), an `oldact`/`oldset` out-pointer
+is `-ENOSYS` (§10.10's copy-IN gap, refused BY NAME rather than answered
+0 — answering 0 would leave the caller's buffer full of stack garbage
+it believes is an answer), and a non-canonical or max-crossing span is
+`-EFAULT` (the bound checked on the WHOLE span, inclusive at
+`LINUX_USER_ADDR_MAX`'s last byte). The dispatch
+(`kernel/syscall_dispatch.c`) consumes the plan before its post, logs
+the refusal by name, and merges the span into the forward; 13/14 are
+classed `LSC_SIG` in the census table. The SIDECAR owns every semantic
+decision (`user/sidecar/src/linux.rs`): a per-task `SigState` (tid,
+mask, pending, dispositions); 13 records DFL/IGN only — a handler
+install is ENOSYS by name before any mutation, because v1 has no signal
+frames to deliver one on — with SIGKILL/SIGSTOP unchangeable (EINVAL,
+Linux's own rule); 14 does the BLOCK/UNBLOCK/SETMASK arithmetic and then
+a REVEAL pass over the pending set: a revealed IGN (or
+ignore-by-default) signal is discarded — that IS its delivery — a
+revealed default-terminate signal runs the kill RIGHT THERE with no
+reply, which is exactly where musl's `raise()` dies on real Linux, and
+a default-stop signal refuses the call before anything moves, not even
+the mask; 200 matches the tid against the `set_tid_address` echo at u32
+width (ESRCH otherwise — cross-task signals are never silently
+re-targeted), treats sig 0 as the existence probe, pends a blocked
+signal for the unblock arm above to deliver, and otherwise runs the
+default action. Every kill converges on one answer, `Answer::SignalKill`,
+whose service arm logs the number, reaps through exit_group's own path
+(same name→pid liveness, same immediate teardown, same no-strand
+refusal) and replies nothing — on real Linux the process dies inside
+the delivering syscall and never returns to its caller.
+
+Host teeth on both halves: `tests/linux_personality_host_test.c`, **98
+checks green** — the plan's two named refusals, their precedence (width
+before pointer), both EFAULT bounds including the inclusive-max
+boundary, both lengths, and the total number space; and
+`user/sidecar/src/linux.rs`'s unit tests, **11 green** —
+`expected_req_len`'s twins (72+32 / 72+8 / 72 for a NULL act, tkill and
+out-of-class), DFL and IGN recording, the handler-install refusal,
+SIGKILL's EINVAL, all three mask operations, the full SIGABRT sequence
+(block → tkill pends → 0 → unblock reveals → `SignalKill`), and the tid
+mismatch answered ESRCH. Guard clause **R** (R1–R6) with teeth
+**t76–t83**: the plan's EINVAL silenced, the dispatch's refusal return
+deleted, the tkill arm renamed away, a default-terminate arm answering
+success (the silent lie of the whole clause set), the handler-install
+refusal answered 0, tkill's tid scope deleted, `rt_sigprocmask` out of
+the class table, the plan's host-test section deleted. Smoke **69/69**.
+
+The measurement — same E3 harness, `e3_multi_env_boot_check.sh` RC=0,
+both of the boot's firstuser runs (the irqtest storm's kill of the
+system POSIX restarts the instance; both runs are identical):
+
+```
+[E7] linux: num=0000009E child=e7.linux.user.0 ok                    arch_prctl (158)
+[E7] linux: num=000000DA child=e7.linux.user.0 ok                    set_tid_address (218)
+[E7] linux: num=00000007 child=e7.linux.user.0 -> ENOSYS             munmap (7)
+[E7] linux sig syscall 14 refused before post: oldact/oldset copy-back not landed (trigger: reply payload copy-IN)
+[E7] linux: num=000000C8 child=e7.linux.user.0 sig default-action -> kill      tkill (200)
+[PROC] PID 111 terminated.
+[TORE] PID 111 teardown: 2 cap(s) dropped, 0 object(s) destroyed, 0 arena frame(s) returned, table 13 unbound
+[TORE] address space 0x0000000013129000 destroyed: 148 frame(s) freed
+```
+
+Five lines and a reap — against the SSE run's ten traps, an ENOSYS wall
+and a `[FAULT]` at `hlt`. The `oldset` refusal firing by name is the
+seam refusing exactly what it cannot honestly serve, with its trigger
+in the log (the reply payload's copy-IN); and the death is an
+ATTRIBUTION (`terminated.`, frames returned to the partition), not the
+fault path's `exited (code=134)` — the falsifiable gate this section
+set, met at the first `tkill` with no `[FAULT]` line anywhere in the
+firstuser's run. What remains ENOSYS in that run is `munmap` (7) alone.
+Suite: `run_all` 127 passed / 0 failed / 2 pre-existing skips;
+personality guard all 70 clauses hold; smoke 69/69;
+`script_conventions_check` 0 violations; `stack_frame_budget_check`
+234 files PASS; `make x86-iso-e3` RC=0; the sidecar crate's tests
+11/11 on the new suite.
+
 **Sequence.** 0: DONE — the attribution instrument and the `rip=0x28`
 diagnosis, measured (above). 1: DONE — the loader's `p_vaddr`
 alignment fix, host-tested (E8a) and guarded (O8, t53/t54), measured
-past `main` (above). 2: HALF DONE — the SSE gate landed and is measured
-(above); what remains under 2 is `munmap`(7) and the signal seam —
-`rt_sigprocmask`(14), `rt_sigaction`(13), `tkill`(200), each its own
-increment. 3: the reply payload, host teeth first —
+past `main` (above). 2: DONE — the SSE gate and the signal seam are
+both landed and measured (above); what remains under 2 is `munmap`(7),
+now the only ENOSYS in the firstuser's run before its kill — its own
+increment, the anonymous-map question above. 3: the reply payload, host teeth first —
 `linux_user_copy_in`, `linux_fd_reply_plan`, the three deliver shapes,
 the `service` bound. 4: the path plan, the VFS bridge, the thirteen
 arms. 5: the two format goldens. 6: the fixture probe on-target — a
@@ -1792,6 +1875,7 @@ Everything this document asserts about the tree, with its source:
 | The §5.2 image through the real create: child-vaddr pointers (`region_vaddr`), BIB-page reservation, 8 KiB floor, `AT_RANDOM` = entropy or `CAP_ECONFLICT` with the region returned | `kernel/cap.c` (steps 6–7); `kernel/linux_abi.{h,c}`; host tests L1/L2/E7c (377 checks); clauses O3/O4, teeth t44/t45/t46 (§10.12) |
 | §5.2's argv/envp cross on the spawn request as the `ARGENV` record, with the empty-environment v1 fallback when it is absent and by-name refusals instead of truncation | `kernel/cap.h`/`cap.c` (`SIDECAR_TAG_ARGENV`, the parse arena, the §5.2 site); `user/proto/src/manifest.rs` (`ArgEnv`, `argenv_wire_bytes_golden`); `tests/cap_create_sidecar_host_test.c` L3/L4; guard clauses O6/O7, teeth t49–t52 |
 | The SSE gate: the pure CR0/CR4/CPUID arithmetic at the SDM's own bit positions, the enable's CPUID → CR4 → CR0 → `fninit` → `ldmxcsr` order, the BSP call ahead of `syscall_gate_init`, the intact vector-7 chain, and the lazy path still dormant (no caller of `perform_lazy_context_switch`) | `arch/x86/fpu_enable.h`; `arch/x86/lazy_fpu.c` (`fpu_enable_sse`); `kernel/kernel.c` 4b; `tests/fpu_enable_host_test.c` (40 checks); guard clause Q, teeth t70–t75 (§10.13's step 2) |
+| The signal seam: the plan's three first-trap refusals (width, out-pointer, span) ahead of any channel post, the sidecar's dispositions/mask/pending with handler installs refused by name and tkill scoped to its own tid, and every default-terminate converging on one attributed no-reply kill | `kernel/linux_abi.{h,c}` (`linux_sig_copy_plan`, `LSC_SIG`); `kernel/syscall_dispatch.c`; `user/sidecar/src/linux.rs` (`SigState`, the 13/14/200 arms, `Answer::SignalKill`); `tests/linux_personality_host_test.c` (98 checks) + linux.rs unit tests (11); guard clause R, teeth t76–t83 (§10.13's step 2) |
 
 ## Appendix B — Named gaps, each with its destination
 
@@ -1804,7 +1888,7 @@ Everything this document asserts about the tree, with its source:
 | No `brk`/`mmap` → budget mapping (`brk` landed, increment 6, §10.11; `mmap`/`munmap` remain) | sub-allocating heaps and `munmap` still refuse (§5.4) | E7, §5.4 — `munmap` now refused on the firstuser's OWN line (§10.13's step-1 run), so the anonymous-map increment is measurable rather than inferred |
 | `elf64_map_blob` assumes every PT_LOAD's `p_vaddr` is page-aligned | a libc-linked binary with a non-aligned RW LOAD reads every global in it 0x370 bytes off and dies at `rip=0x28` before `main` — measured, §10.13's step 0 | **LANDED** — increment 8's step 1: page-base anchor + lead-offset copy, host teeth E8a, guard clause O8 with teeth t53/t54, measured past `main` |
 | No `CR4.OSFXSR` written anywhere (the IDT's vector-7 gate existed all along — `idt.c`, SIMI Phase 10; `vecstore.c`'s comment saying otherwise is stale), no `xsetbv` | any ring-3 SSE instruction is #UD — every real libc and every Rust binary dies at its first vector op (measured: musl `abort`'s `pxor`, §10.13's step-1 run) | **LANDED** — increment 9: `CR4.OSFXSR|OSXMMEXCPT` + `CR0.MP` armed on the BSP ahead of the trap gate, `fninit` + 0x1F80 `ldmxcsr`, CPUID refusal by name; host teeth `tests/fpu_enable_host_test.c` (40 checks), guard clause Q with teeth t70–t75, measured past `pxor` into `abort`'s tail (§10.13's step 2). `xsetbv`/`CR4.OSXSAVE` remain absent — named, and dormant with the lazy path |
-| `rt_sigprocmask` (14), `rt_sigaction` (13) and `tkill` (200) refuse | `abort()` cannot die at its first `raise(SIGABRT)`, so its tail runs and faults on `hlt` (`rip=0x805260c`) — the firstuser's run ends there, ten attributed traps deep (§10.13's step 2; `rt_sigaction` newly visible) | the signal seam — the NEXT increment, now with a falsifiable shape: with delivery in place the run ends at its first `tkill` with NO `[FAULT]` line; §11 Q5's logged-ENOSYS policy holds it visible meanwhile |
+| `rt_sigprocmask` (14), `rt_sigaction` (13) and `tkill` (200) refuse | `abort()` cannot die at its first `raise(SIGABRT)`, so its tail runs and faults on `hlt` (`rip=0x805260c`) — the firstuser's run ends there, ten attributed traps deep (§10.13's step 2; `rt_sigaction` newly visible) | **LANDED** — increment 10: the kernel's copy plan with all three refusals by name at the first trap, the sidecar's dispositions/mask/pending and the `SignalKill` delivery; host teeth (98 + 11 checks), guard clause R with teeth t76–t83; measured: both firstuser runs end at their first `tkill` with the kill attribution and NO `[FAULT]` (§10.13's step 2). §10.10's copy-IN gap stays — the `oldset` refusal is now LIVE in the log with its trigger named |
 | No `CAP_E*` → Linux errno table (and a `CAP_NONE` sentinel in returns) | silent wrong errors (§5.7) | E7, §5.7 |
 | Target designated, but no candidate binary and therefore no artifact | the table is still unmeasured; `--check` reports a named skip rather than a pass | write the crate, add the musl target, run `--run` |
 | No thread groups / `clone` / `futex` | Go and every threaded runtime are out (§7) | named as Go's gate; unscoped |

@@ -616,6 +616,101 @@ int main(void)
               "      shape, exactly as the copy refuses it");
     }
 
+    /* ─── the sig copy plan: the signal seam's byte crossing (§10.13 step 2) ──
+     * The mechanism half of the split: the KERNEL decides WHAT crosses
+     * (act/set bytes out, both first-trap refusals) and the SIDECAR
+     * decides WHAT IT MEANS. Every refusal is a NEGATIVE Linux errno
+     * decided before any channel post — the first-trap discipline. */
+    {
+        uint64_t a[6];
+        struct LinuxSigCopyPlan p;
+
+        memset(a, 0, sizeof a);
+        a[0] = 6;                       /* SIGABRT, the firstuser's */
+        a[1] = 0x00007FFFFFFFE000ULL;   /* act on the child's stack */
+        a[3] = LINUX_SIGSET_BYTES;
+        p = linux_sig_copy_plan(LINUX_RT_SIGACTION, a);
+        CHECK(p.refuse == 0 && p.len == LINUX_SIGACT_BYTES &&
+              p.src == a[1],
+              "a well-formed rt_sigaction plans its 32 act bytes out of "
+              "      the child with no refusal — the crossing SIGABRT "
+              "      delivery needs");
+
+        a[1] = 0x00007FFFFFFFE100ULL;
+        p = linux_sig_copy_plan(LINUX_RT_SIGPROCMASK, a);
+        CHECK(p.refuse == 0 && p.len == LINUX_SIGSET_BYTES &&
+              p.src == a[1],
+              "a well-formed rt_sigprocmask plans its 8 set bytes — the "
+              "      mask abort(3) sequences through before raise(3)");
+
+        a[3] = 4;   /* a width the kernel-ABI sigset does not have */
+        p = linux_sig_copy_plan(LINUX_RT_SIGACTION, a);
+        CHECK(p.refuse == -LINUX_EINVAL && p.len == 0,
+              "a sigsetsize other than 8 refuses -EINVAL at the first "
+              "      trap — a caller claiming another width would get its "
+              "      bytes silently reinterpreted");
+
+        a[3] = LINUX_SIGSET_BYTES;
+        a[2] = 0x00007FFFFFFFE200ULL;   /* oldact: the copy-IN gap */
+        p = linux_sig_copy_plan(LINUX_RT_SIGACTION, a);
+        CHECK(p.refuse == -LINUX_ENOSYS && p.len == 0,
+              "an oldact out-pointer refuses -ENOSYS by name — answering "
+              "      0 while the caller's buffer keeps stack garbage is "
+              "      the silent lie the refusal discipline forbids");
+
+        p = linux_sig_copy_plan(LINUX_RT_SIGPROCMASK, a);
+        CHECK(p.refuse == -LINUX_ENOSYS && p.len == 0,
+              "an oldset out-pointer refuses identically — the gap is "
+              "      the reply's copy-IN, not the call");
+
+        a[3] = 7;   /* BOTH defects: which refusal wins must be pinned */
+        p = linux_sig_copy_plan(LINUX_RT_SIGACTION, a);
+        CHECK(p.refuse == -LINUX_EINVAL,
+              "a foreign sigsetsize outranks the out-pointer refusal — "
+              "      the width check runs first, deterministically");
+
+        a[1] = 0;
+        a[2] = 0;
+        a[3] = LINUX_SIGSET_BYTES;
+        p = linux_sig_copy_plan(LINUX_RT_SIGPROCMASK, a);
+        CHECK(p.refuse == 0 && p.len == 0 && p.src == 0,
+              "a NULL set with no out-pointer plans nothing and refuses "
+              "      nothing — the query-shape no-op the sidecar answers 0");
+
+        a[1] = 0xFFFF800000000000ULL;   /* the kernel/non-canonical half */
+        p = linux_sig_copy_plan(LINUX_RT_SIGACTION, a);
+        CHECK(p.refuse == -LINUX_EFAULT,
+              "a non-canonical act address refuses -EFAULT at the first "
+              "      trap — ring 3 could not have that span read");
+
+        a[1] = 0x00007FFFFFFFFFE0ULL;   /* span ends on the LAST valid
+                                        * byte: MAX - 32 + 32 - 1 */
+        p = linux_sig_copy_plan(LINUX_RT_SIGACTION, a);
+        CHECK(p.refuse == 0 && p.len == LINUX_SIGACT_BYTES,
+              "a span ending exactly on the user max's last byte is "
+              "      allowed — the bound is inclusive (a >= here would "
+              "      refuse the frame that holds MAX itself)");
+
+        a[1] = 0x00007FFFFFFFFFFBULL;   /* first byte in, tail past MAX */
+        p = linux_sig_copy_plan(LINUX_RT_SIGACTION, a);
+        CHECK(p.refuse == -LINUX_EFAULT,
+              "an act span crossing the user-canonical max refuses "
+              "      -EFAULT — the bound is checked on the whole span, "
+              "      not its first byte");
+
+        a[1] = 0x00007FFFFFFFE000ULL;
+        CHECK(linux_sig_copy_plan(218, a).len == 0 &&
+              linux_sig_copy_plan(218, a).refuse == 0 &&
+              linux_sig_copy_plan(1, a).len == 0 &&
+              linux_sig_copy_plan(60, a).refuse == 0,
+              "a number outside the sig class plans nothing and refuses "
+              "      nothing — the plan is total over the number space");
+
+        p = linux_sig_copy_plan(LINUX_RT_SIGACTION, NULL);
+        CHECK(p.src == 0 && p.len == 0 && p.refuse == 0,
+              "a NULL args array is the zero plan — total, no fault");
+    }
+
     printf("linux_personality_host_test: %d passed, %d failed\n",
            checks_passed, checks_failed);
     return checks_failed == 0 ? 0 : 1;

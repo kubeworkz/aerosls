@@ -301,6 +301,40 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                                      * the count the task
                                                      * will see are one
                                                      * truth */
+                /* E7 increment 10 (the signal seam): the act/set byte
+                 * crossing — the write plan's twin for the sig class,
+                 * computed after it (one number is one plan) and BEFORE
+                 * the describe, so its refusals are first-trap refusals
+                 * too: a foreign sigsetsize, an oldact/oldset this kernel
+                 * cannot write back (§10.10's copy-IN gap), an act/set
+                 * span ring 3 could not read. The folded src/len then
+                 * rides the SAME copy block below — one walker, one arm
+                 * ordering, one EFAULT posture — and the sidecar derives
+                 * the attach length from num and args[1] != 0 the same
+                 * way (its payload check is the twin). */
+                {
+                    struct LinuxSigCopyPlan splan =
+                        linux_sig_copy_plan(num, largs);
+                    if (splan.refuse) {
+                        kernel_serial_printf(
+                            "[E7] linux sig syscall %lu refused before "
+                            "post: %s\n",
+                            (unsigned long)num,
+                            splan.refuse == -LINUX_EINVAL
+                                ? "sigsetsize != 8 (kernel ABI sigset "
+                                  "is 8 bytes)"
+                                : splan.refuse == -LINUX_ENOSYS
+                                  ? "oldact/oldset copy-back not landed "
+                                    "(trigger: reply payload copy-IN)"
+                                  : "act/set span not user-readable "
+                                    "(plan)");
+                        return (uint64_t)(int64_t)splan.refuse;
+                    }
+                    if (!plan.len && splan.len) {
+                        plan.src = splan.src;
+                        plan.len = splan.len;
+                    }
+                }
                 /* E7 increment 6 (the mem class, §5.4), stage half: a
                  * brk's requested break is captured HERE — before the
                  * describe and before the post — because the reply can

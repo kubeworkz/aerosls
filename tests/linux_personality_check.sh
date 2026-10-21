@@ -104,6 +104,7 @@ SWLA=arch/x86/switch_lazy.asm
 KERC=kernel/kernel.c
 STUB=kernel/stubs.c
 FHUT=tests/fpu_enable_host_test.c
+PHUT=tests/linux_personality_host_test.c
 
 # ─── B. The sibling per-CPU block, at the offsets the asm addresses ────────
 # The struct side is pinned by static asserts (a C reorder is a BUILD
@@ -336,10 +337,11 @@ if grep -qF 'crate::linux::service(&RealKernel, &booted.console);' "$LRE" && \
 else
     bad "K. the entry loop no longer services or wait-qualifies the Linux children — every forwarded syscall sits unanswered in the channel queue while its task parks forever"
 fi
-if grep -qF '218 => Answer::Reply(args[0], STATUS_OK),' "$LRS" && \
+if grep -qF '218 => {' "$LRS" && \
+   grep -qF 'sig.tid = args[0];' "$LRS" && \
    grep -qF '231 => Answer::Exit,' "$LRS" && \
    grep -qF '_ => Answer::Reply(0, E_NOSYS),' "$LRS"; then
-    ok "K1. the answers are the census's: set_tid_address echoes, exit_group reaps, everything else refuses ENOSYS with its number logged"
+    ok "K1. the answers are the census's core: set_tid_address echoes AND records the tid the seam's tkill matches against, exit_group reaps, the default arm still refuses ENOSYS with its number logged (the sig class's own answers are clause R)"
 else
     bad "K1. an answer arm changed shape — worst is the default arm: a silent success for an unimplemented syscall is the answer §11 Q5's policy forbids"
 fi
@@ -492,14 +494,15 @@ if grep -qF 'const E_BADF: i32 = -2;' "$LRS" && \
 else
     bad "M5. the fd table or its EBADF arm is gone — a descriptor nobody registered would be performed (or fake-answered) instead of refused, and a drifted E_BADF would surface a different errno than the policy meant"
 fi
-if grep -qF 'let want = LINUX_SYSCALL_REQ_BYTES + args[2] as usize;' "$LRS" && \
-   grep -qF 'if args[2] as usize > FD_PAYLOAD_CAP || rr.len != want {' "$LRS" && \
+if grep -qF 'let expected = expected_req_len(num, &args);' "$LRS" && \
+   grep -qF 'args[2] as usize > FD_PAYLOAD_CAP || rr.len != expected' "$LRS" && \
+   grep -qF 'if rr.len != expected {' "$LRS" && \
    grep -qF 'const FD_PAYLOAD_CAP: usize = 1024;' "$LRS" && \
    grep -qF 'match console.write(&payload[..len]) {' "$LRS" && \
    grep -qF 'crate::linux::service(&RealKernel, &booted.console);' "$LRE"; then
-    ok "M6. the sidecar checks the attached bytes against the kernel's own arithmetic (count == payload, chunk twin), performs them on the loop's console, and is handed that console"
+    ok "M6. the sidecar checks EVERY request's attached bytes against expected_req_len (the kernel's attach twin: write's count, the sig class's act/set — a drifted attach arrives only as a wrong length and dies -EPROTO), the write chunk cap is intact, the perform happens on the loop's console, and service is handed that console"
 else
-    bad "M6. the payload invariant, the chunk twin, the console perform, or the service's console hand-off is gone — bytes the task did not write could be performed, or a write could never reach the serial log it exists to prove"
+    bad "M6. the payload invariant, the chunk cap, the console perform, or the service's console hand-off is gone — bytes the task did not write could be performed, or a write could never reach the serial log it exists to prove"
 fi
 
 # ─── N. The plan's increment 6 (the mem class): the budget span, the W^X refusal ──
@@ -781,6 +784,63 @@ if [ "$lazy_calls" -eq 0 ] && \
     ok "Q4. the lazy-FPU path stays DORMANT and says so — no .c calls perform_lazy_context_switch(), so CR0.TS is never armed, #NM never fires, and the xsave/xrstor handler (which would itself need CR4.OSXSAVE) is unreachable; XMM state is therefore NOT switched per task, and both files name that gap instead of papering over it"
 else
     bad "Q4. a caller of the lazy switch appeared, or the dormancy claim is gone — TS would arm on a switch-in while the handler's xsave needs CR4.OSXSAVE (which is deliberately never set): the first #NM would #UD inside the handler, and the doc's 'XMM is not switched' claim would silently stop being true"
+fi
+
+# ─── R. The signal seam (§10.13's step 2): rt_sigaction 13, rt_sigprocmask 14, tkill 200 ──
+# The firstuser died at abort()'s hlt because all three numbers refused:
+# raise(SIGABRT) never terminated the task, so abort walked into its guard
+# instruction (rip=0x805260c, the wall the SSE gate left behind). The seam
+# is a three-part split: the KERNEL copies the bytes (act/set out of the
+# child, every refusal decided at the FIRST trap before any channel), the
+# SIDECAR owns every semantic decision (disposition, mask, pending), and
+# a default-terminate delivery's faithful shape is death INSIDE the
+# delivering syscall — no reply, reaped through exit_group's path, the log
+# naming WHICH decision killed the task. Every clause below is a way the
+# boot gets its [FAULT] line back — or a lie in a place the census reads
+# green while raise() silently succeeds.
+if grep -qF 'struct LinuxSigCopyPlan {' "$LABH" && \
+   grep -qF 'p.refuse = -LINUX_EINVAL;' "$LABC" && \
+   grep -qF 'p.refuse = -LINUX_ENOSYS;' "$LABC" && \
+   grep -qF 'p.refuse = -LINUX_EFAULT;' "$LABC"; then
+    ok "R1. linux_sig_copy_plan is the crossing's mechanism half with all three refusals as first-trap negative errnos: a foreign sigsetsize EINVAL, an oldact/oldset out-pointer ENOSYS (§10.10's copy-IN gap — never answered 0), a non-canonical span EFAULT"
+else
+    bad "R1. the plan or one of its refusals is gone — a foreign sigsetsize would have its bytes silently reinterpreted, or an out-pointer would keep stack garbage the caller believes is an answer (the silent lie §10.10's refusal-by-name discipline exists to prevent)"
+fi
+if grep -qF 'linux_sig_copy_plan(num, largs);' "$DISP" && \
+   grep -qF 'return (uint64_t)(int64_t)splan.refuse;' "$DISP" && \
+   grep -qF 'plan.src = splan.src;' "$DISP" && \
+   grep -qF 'fwd_len += plan.len;' "$DISP"; then
+    ok "R2. the dispatch runs the plan BEFORE any channel post (the refusal returns from the first trap) and merges its span into the forward — the act/set bytes ride the message the sidecar's 13/14 arms read"
+else
+    bad "R2. the dispatch no longer consumes the plan in that order — a refusal would post first (the exact shape R1 exists to prevent), or the sidecar's sig arms would read a payload the kernel never attached and answer a refusal to a request it never saw"
+fi
+if grep -qF '{  13, LSC_SIG,' "$LABC" && \
+   grep -qF '{  14, LSC_SIG,' "$LABC"; then
+    ok "R3. both sig numbers are classed LSC_SIG — recorded at the sidecar, refused only by name, so the class itself declares what this seam may answer"
+else
+    bad "R3. a sig number fell out of the class table — the dispatch's plan branch never runs for it, so its payload crosses unmeasured (or not at all) while the census still shows the row green"
+fi
+if grep -qF 'LINUX_RT_SIGACTION => {' "$LRS" && \
+   grep -qF 'LINUX_RT_SIGPROCMASK => {' "$LRS" && \
+   grep -qF 'LINUX_TKILL => {' "$LRS" && \
+   grep -qF 'ACT_TERMINATE => Answer::SignalKill,' "$LRS" && \
+   grep -qF 'Answer::SignalKill => {' "$LRS"; then
+    ok "R4. the sidecar answers all three numbers, and every path that RUNS a default-terminate action converges on SignalKill — the one variant service reaps through exit_group's path with no reply, exactly where real Linux dies inside the delivering syscall"
+else
+    bad "R4. an arm or the SignalKill convergence is gone — raise(SIGABRT) would refuse or reply successfully, abort() would walk on into its hlt, and the boot would show [FAULT] at 0x805260c again (§10.13's step-1 wall)"
+fi
+if grep -qF 'E_NOSYS), /* handler install not landed' "$LRS" && \
+   grep -qF 'if sig.tid == 0 || args[0] as u32 != sig.tid as u32 {' "$LRS" && \
+   grep -qF 'sig.pending |= 1u64 << (args[1] - 1);' "$LRS"; then
+    ok "R5. the seam's honesty lines hold: a handler install refuses ENOSYS by name BEFORE any mutation (v1 has no signal frames to deliver one on), tkill's tid is the set_tid_address echo at u32 width (ESRCH otherwise — never silently re-targeted), and a blocked signal PENDS so the unblock arm is where it delivers"
+else
+    bad "R5. one of the seam's honesty lines is gone — a handler install would record a disposition this shim can never invoke (every later delivery a coin flip), a tid mismatch could kill a task that never asked, or a blocked raise() would be lost outright instead of pending"
+fi
+if grep -qF 'linux_sig_copy_plan(' "$PHUT" && \
+   grep -qF 'p.refuse == -LINUX_EINVAL && p.len == 0' "$PHUT"; then
+    ok "R6. the plan is host-tested against the REAL kernel/linux_abi.c — both refusals by name, the EFAULT bounds, both lengths, the precedence and the total number space (run_all compiles and runs it)"
+else
+    bad "R6. the host test no longer drives the plan — the seam's pure half would be argued from the guard's greps alone, every branch reachable only at boot"
 fi
 
 echo
