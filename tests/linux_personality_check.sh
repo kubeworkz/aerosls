@@ -843,6 +843,59 @@ else
     bad "R6. the host test no longer drives the plan — the seam's pure half would be argued from the guard's greps alone, every branch reachable only at boot"
 fi
 
+# ─── S. poll (7) — the run's LAST ENOSYS answer (§10.13's step-2 coda) ────
+# The firstuser's num=00000007 line is POLL, not munmap — §10.13's log
+# annotation mislabelled it from the census row's COUNT (`11 munmap 7`):
+# munmap is 11 and never fires before the kill, while Rust std's
+# lang_start_internal polls fds {0,1,2} with a ZERO timeout before it
+# installs any signal handler, and an errno outside its tolerated set
+# (EAGAIN/ENOMEM/EINVAL, its own bitmask) aborts the task — which is why
+# the run died at raise(SIGABRT) four traps in. The answer is
+# deliberately small: a zero-timeout poll reports 0 events (this shim
+# has no console-input readiness state — under-reporting readiness can
+# only send a caller back to its own loop, never into an action built
+# on readiness nobody claimed), a poll that would WAIT is refused by
+# name at BOTH ends (it needs a wake against state that does not exist),
+# and no bytes cross either way (a count of 0 promises no revents —
+# the copy-IN that would carry them stays increment 8's named gap).
+# Every clause below is a way that answer silently becomes a lie while
+# the rest of this guard stays green: the predicate rewritten until it
+# refuses every poll (the wall back by name) or grants a wait whose
+# wake cannot come, the first-trap refusal deleted (the waiting poll
+# posts and parks), the sidecar arm gutted, or the pure half untested.
+if grep -qF '#define LINUX_POLL  7u' "$LABH" && \
+   grep -qF 'int linux_poll_refuses_blocking(uint64_t num, uint64_t timeout);' "$LABH" && \
+   grep -qF 'int linux_poll_refuses_blocking(uint64_t num, uint64_t timeout)' "$LABC" && \
+   grep -qF 'return num == LINUX_POLL && (int32_t)timeout != 0;' "$LABC"; then
+    ok "S. poll's waiting refusal is the named pure contract — the census's own number, Linux's INT timeout (the low 32 bits, sign-extended), refused iff the call would WAIT, declared where the dispatcher and the host test both read it"
+else
+    bad "S. the poll contract is gone or rewritten — the dispatcher has no predicate to consult (a waiting poll parks a task whose wake cannot come) and a rewritten one can only be argued from prose while the host test bites a function nothing calls"
+fi
+poll_ref=$(grep -nF 'linux_poll_refuses_blocking(num, largs[2]))' "$DISP" | head -1 | cut -d: -f1)
+if [ -n "$poll_ref" ] && \
+   sed -n "$((poll_ref + 1)),$((poll_ref + 6))p" "$DISP" | grep -qF 'console-input state' && \
+   sed -n "$((poll_ref + 1)),$((poll_ref + 6))p" "$DISP" | grep -qF -- '(uint64_t)(int64_t)(-LINUX_ENOSYS);'; then
+    ok "S1. the FIRST TRAP refuses a waiting poll before any post — a request property (a timeout word), so no channel is needed to say it (mprotect's posture), logged by name with its trigger, returning -ENOSYS in the task's own units"
+else
+    bad "S1. the dispatcher's poll refusal is gone or no longer returns from the first trap — a waiting poll would post and park on a channel whose wake cannot come (no console-input state), and the sidecar twin would then be the only wall left"
+fi
+poll_arm=$(grep -nF 'if (args[2] as i32) == 0 {' "$LRS" | head -1 | cut -d: -f1)
+if grep -qF '        7 => {' "$LRS" && \
+   [ -n "$poll_arm" ] && \
+   sed -n "$((poll_arm + 1))p" "$LRS" | grep -qF 'Answer::Reply(0, STATUS_OK)' && \
+   sed -n "$((poll_arm + 3))p" "$LRS" | grep -qF 'Answer::Reply(0, E_NOSYS)'; then
+    ok "S2. the sidecar's 7 arm answers the ZERO-timeout probe 0 events and the waiting poll ENOSYS by name — its twin of the first-trap refusal (N3's both-ends posture), the zero timeout decided at the arm's own literal"
+else
+    bad "S2. the poll arm is gone or either answer changed — a granted wait (a wake that can never come, or a five-second poll answered 0 into the caller's own loop) or an ENOSYS for the probe (the firstuser's measured wall, back by name)"
+fi
+if grep -qF 'LINUX_POLL == 7' "$PHUT" && \
+   grep -qF 'linux_poll_refuses_blocking(LINUX_POLL, 0)' "$PHUT" && \
+   grep -qF '0x100000000ULL' "$PHUT"; then
+    ok "S3. the predicate is host-tested against the REAL kernel/linux_abi.c — the zero-timeout probe, the timed and infinite refusals, the int-width rule (0x1_00000000 is a zero timeout) and the total number space (run_all compiles and runs it)"
+else
+    bad "S3. the host test no longer drives the predicate — the run's last-ENOSYS fix would be argued from the guard's greps alone, every branch reachable only at boot"
+fi
+
 echo
 if [ "$fails" -eq 0 ]; then
     echo "linux_personality_check: all clauses hold"

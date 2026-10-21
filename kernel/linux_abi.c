@@ -345,6 +345,19 @@ struct LinuxSigCopyPlan linux_sig_copy_plan(uint64_t num, const uint64_t args[6]
     return p;
 }
 
+/* ─── E7 increment 11 (§10.13's step-2 coda) — poll (7): the waiting-poll refusal ──
+ * The pure half both ends of the seam share (the header names the why):
+ * 1 iff this poll would WAIT, refused at the first trap; a zero-timeout
+ * probe falls to the sidecar's 0-events answer. Linux's timeout is an
+ * int, so the low 32 bits decide with C's own truncation — -1 (forever)
+ * and 5000 (ms) refuse, 0 and 0x1_00000000 (which truncates to 0) do
+ * not. Total over (num, timeout): a number that is not poll never waits
+ * as one. */
+int linux_poll_refuses_blocking(uint64_t num, uint64_t timeout)
+{
+    return num == LINUX_POLL && (int32_t)timeout != 0;
+}
+
 /* ─── E7 increment 6 (the mem class, §5.4) — the budget span ──────────────
  * The two decisions the resume arm's brk apply makes, and the one read it
  * needs, as the pure functions the host test drives. Nothing below reads

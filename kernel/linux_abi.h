@@ -217,6 +217,31 @@ struct LinuxFdWritePlan linux_fd_write_plan(uint64_t num,
  * may be 0). dst must hold n bytes; the caller owns it. */
 int linux_user_copy_out(uint8_t *dst, uint64_t root, uint64_t va, uint32_t n);
 
+/* ─── E7 increment 11 (§10.13's step-2 coda) — poll (7): the waiting-poll refusal ──
+ * The firstuser's LAST ENOSYS answer, and the number §10.13's log
+ * annotation once mislabelled munmap (munmap is 11 and never fires in
+ * that run — measured): Rust std's lang_start_internal polls fds
+ * {0,1,2} with a ZERO timeout before it installs any signal handler, and
+ * an errno outside its tolerated set (EAGAIN/ENOMEM/EINVAL, its own
+ * bitmask) aborts the task. That abort is why the run died at
+ * raise(SIGABRT) four traps in.
+ *
+ * The split is mprotect's posture over a timeout word instead of a prot
+ * word: a poll that would WAIT is refused HERE, at the first trap and
+ * before any channel post, because waiting needs a sleep/wake against
+ * console-input state this v1 has never had (§10.13's named input-class
+ * gap) — and a request property needs no object to say no. A ZERO-timeout
+ * poll is not refused: it is the snapshot the sidecar's 7 arm answers
+ * (0 events), and the sidecar carries this same refusal as its twin so
+ * neither end alone is load-bearing (guard clause S).
+ *
+ * The timeout is Linux's int (ms > 0, 0 = return now, < 0 = forever), so
+ * the LOW 32 BITS decide, sign-extended — exactly how the syscall passes
+ * it. Total over (num, timeout). */
+#define LINUX_POLL  7u             /* the census's poll row (§5.6)       */
+int linux_poll_refuses_blocking(uint64_t num, uint64_t timeout);
+
+
 /* ─── E7 increment 6 (the mem class, §5.4) — the budget span ──────────────
  * §5.4's row is "budget-backed memory", and its first half is brk: a bump
  * pointer inside a reserved span. The split is the design's own — the

@@ -315,6 +315,39 @@ fn answer(
             Some(_) => Answer::Reply(0, E_NOSYS),
             None => Answer::Reply(0, E_BADF),
         },
+        /* poll (7, LSC_FD — E7 increment 11, §10.13's step-2 coda): the
+         * firstuser's LAST ENOSYS answer, and the run's line that §10.13
+         * once annotated "munmap (7)" — the mislabel this increment
+         * corrects (munmap is 11 and never fires before the kill;
+         * num=00000007 is Rust std's lang_start_internal polling fds
+         * {0,1,2} with a zero timeout before any handler exists, and an
+         * errno outside its tolerated set aborts the task). The timeout
+         * word is Linux's int in args[2], so the low 32 bits decide.
+         *
+         * timeout 0 — the probe — answers 0 EVENTS: this shim has no
+         * console-input readiness state (§10.13's named input class), so
+         * "nothing ready" is the whole truth it can tell, and
+         * UNDER-reporting readiness can only send a caller back to its
+         * own loop — never into an action built on readiness nobody
+         * claimed. The array is never read and revents never written: a
+         * count of 0 promises neither (POSIX defines revents only for
+         * ready fds), so no copy crosses in either direction — the same
+         * non-fault posture as write(fd, NULL, 0), and the copy-IN that
+         * would carry revents back stays increment 8's named gap.
+         *
+         * a WAITING poll (ms > 0 or the -1 of forever) is ENOSYS by
+         * name — the TWIN of the kernel's first-trap refusal (guard
+         * clause S; mprotect's both-ends posture over a timeout word):
+         * waiting needs a wake against input state that does not exist,
+         * and answering 0 to a 5000 ms poll would make the caller spin
+         * its five seconds inside its own loop on a lie. */
+        7 => {
+            if (args[2] as i32) == 0 {
+                Answer::Reply(0, STATUS_OK)
+            } else {
+                Answer::Reply(0, E_NOSYS)
+            }
+        }
         /* arch_prctl (158, LSC_MSR, §5.3): the POLICY side of the one
          * kernel semantic — mirror of kernel/linux_abi.h's bound (the Rust
          * side cannot include that header, so the literals are repeated,
@@ -1239,5 +1272,38 @@ mod tests {
                        &mut sig, &[]);
         assert!(matches!(a, Answer::Reply(TID, STATUS_OK)), "echo: {:?}", a);
         assert_eq!(sig.tid, TID, "the echo IS the recorded tid");
+    }
+
+    #[test]
+    fn poll_answers_the_zero_timeout_probe_and_refuses_to_wait() {
+        /* The firstuser's ACTUAL call — poll(fds, 3, 0) from Rust std's
+         * lang_start_internal: zero timeout, answered 0 events, the
+         * array pointer never touched (no payload, no copy either way). */
+        let a = answer(7, &[0x7FFF_FFFF_E000, 3, 0, 0, 0, 0],
+                       &fds(), &mut ledger(), &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(0, STATUS_OK)),
+                "the zero-timeout probe answers 0: {:?}", a);
+        /* nfds does not change the answer: nothing is read, and a
+         * negative timeout is the -1 of forever (i32 truncation). */
+        let a = answer(7, &[0x1234, 0, 0, 0, 0, 0],
+                       &fds(), &mut ledger(), &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(0, STATUS_OK)),
+                "nfds 0, timeout 0: {:?}", a);
+        /* A waiting poll — ms or forever — is ENOSYS by name, the twin
+         * of the kernel's first-trap refusal; the u64 sign-extension
+         * path (-1 as musl passes it) is the one that must not read as
+         * a zero timeout. */
+        for t in [1u64, 5000, 0xFFFF_FFFF_FFFF_FFFF] {
+            let a = answer(7, &[0x7FFF_FFFF_E000, 3, t, 0, 0, 0],
+                           &fds(), &mut ledger(), &mut fresh(), &[]);
+            assert!(matches!(a, Answer::Reply(0, E_NOSYS)),
+                    "a waiting poll (timeout {}) is refused: {:?}", t, a);
+        }
+        /* Linux's int width, the other direction: 0x1_00000000
+         * truncates to a zero timeout and must NOT be refused. */
+        let a = answer(7, &[0x7FFF_FFFF_E000, 3, 0x1_0000_0000, 0, 0, 0],
+                       &fds(), &mut ledger(), &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(0, STATUS_OK)),
+                "int width: {:?}", a);
     }
 }

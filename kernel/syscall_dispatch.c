@@ -369,6 +369,26 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                         "(§5.4)\n", (unsigned long)largs[2]);
                     return (uint64_t)(int64_t)(-LINUX_EPERM);
                 }
+                /* E7 increment 11 (§10.13's step-2 coda): poll's
+                 * waiting-timeout refusal, the mprotect posture over a
+                 * timeout word. A poll that would WAIT is refused HERE,
+                 * before any post — it needs a wake against console-input
+                 * state this v1 has never had, and a task parked on a
+                 * channel whose wake cannot come is exactly the strand
+                 * the refusal-by-name discipline exists to prevent. A
+                 * zero-timeout probe is not refused: it forwards, and
+                 * the sidecar's 7 arm answers it 0 events (its twin of
+                 * this refusal is guard clause S). The timeout word is
+                 * Linux's int — the low 32 bits, printed as the caller
+                 * means it. */
+                else if (linux_poll_refuses_blocking(num, largs[2])) {
+                    kernel_serial_printf(
+                        "[E7] linux poll timeout=%ld refused before "
+                        "post: a waiting poll needs console-input state "
+                        "(input class)\n",
+                        (long)(int32_t)largs[2]);
+                    return (uint64_t)(int64_t)(-LINUX_ENOSYS);
+                }
                 linux_syscall_describe(&req, num, largs);
                 if (cap_linux_find_channels(cur->pid, &ch_w, &ch_r) != 0) {
                     kernel_serial_printf(

@@ -108,6 +108,9 @@ echo "the ONE ELF mapper, the §5.2 stack and its environment-crossing"
 echo "record (clause set O, including O6/O7)"
 echo "and increment 10's signal seam (clause set R) — the three-number"
 echo "answers, the plan's first-trap refusals and the SignalKill delivery"
+echo "and increment 11's poll answer (clause set S) — the run's LAST"
+echo "ENOSYS: a zero-timeout probe answered 0, a waiting poll refused"
+echo "at both ends before any post"
 echo "========================================================================"
 echo
 
@@ -615,6 +618,52 @@ tooth sigprocmask-class-dropped R3 "rt_sigprocmask is no longer classed LSC_SIG"
 seed "$W/t83"
 sed -i '/linux_sig_copy_plan(/d' "$W/t83/tests/linux_personality_host_test.c"
 tooth sigplan-unhosttested R6 "the host test no longer drives linux_sig_copy_plan" "$W/t83"
+
+# ─── S teeth (increment 11: poll (7), the run's last ENOSYS answer) ────────
+
+# t84: the predicate neutered to "refuse every poll" — a plausible
+# "simplification" that puts the firstuser's wall straight back (the
+# zero-timeout probe refuses again) while the dispatcher's wiring and the
+# sidecar's arm both stay exactly as they were.
+seed "$W/t84"
+sed -i 's/return num == LINUX_POLL && (int32_t)timeout != 0;/return num == LINUX_POLL;/' "$W/t84/kernel/linux_abi.c"
+tooth poll-predicate-neutered S "linux_poll_refuses_blocking no longer distinguishes the probe from the wait" "$W/t84"
+
+# t85: the first-trap refusal block deleted — the waiting poll now posts
+# and parks a task whose wake cannot come (no console-input state), and
+# the sidecar's twin would be the only wall left, answering AFTER the
+# park instead of the first trap refusing before any channel.
+seed "$W/t85"
+sed -i '/else if (linux_poll_refuses_blocking(num, largs\[2\])) {/,/(-LINUX_ENOSYS);/d' "$W/t85/kernel/syscall_dispatch.c"
+tooth poll-refusal-not-first-trap S1 "the dispatcher no longer refuses a waiting poll before any post" "$W/t85"
+
+# t86: the sidecar arm renamed away — the zero-timeout probe falls to the
+# default ENOSYS arm, so the firstuser's measured wall (num=00000007)
+# returns by name while the kernel's first-trap half stays green.
+seed "$W/t86"
+sed -i 's/^        7 => {$/        700 => {/' "$W/t86/user/sidecar/src/linux.rs"
+tooth poll-arm-gone S2 "the sidecar no longer answers poll (7)" "$W/t86"
+
+# t87: the arm's condition inverted — the probe now refuses ENOSYS (the
+# wall back) and the waiting poll is granted 0, both lies in one edit.
+seed "$W/t87"
+sed -i 's/if (args\[2\] as i32) == 0 {/if (args[2] as i32) != 0 {/' "$W/t87/user/sidecar/src/linux.rs"
+tooth poll-answers-inverted S2 "the probe and the wait answer each other's results" "$W/t87"
+
+# t88: the arm made unconditional — every poll, including a five-second
+# wait, is answered 0 events into the caller's own loop (the silent lie
+# the by-name refusal exists to prevent).
+seed "$W/t88"
+sed -i 's/if (args\[2\] as i32) == 0 {/if true {/' "$W/t88/user/sidecar/src/linux.rs"
+tooth poll-wait-granted S2 "a waiting poll is granted 0 events instead of refused by name" "$W/t88"
+
+# t89: the predicate's host-test section deleted — the pure half would
+# then be argued from the guard's greps alone, the int-width rule and
+# the sign-extension case reachable only at boot (t83's rule, one seam
+# along).
+seed "$W/t89"
+sed -i '/linux_poll_refuses_blocking(/d' "$W/t89/tests/linux_personality_host_test.c"
+tooth poll-unhosttested S3 "the host test no longer drives linux_poll_refuses_blocking" "$W/t89"
 
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"

@@ -1557,7 +1557,7 @@ The measurement — E3 boot, `e3_multi_env_boot_check.sh` RC=0:
 ```
 [E7] linux: num=0000009E child=e7.linux.user.0 ok                arch_prctl (158)
 [E7] linux: num=000000DA child=e7.linux.user.0 ok                set_tid_address (218)
-[E7] linux: num=00000007 child=e7.linux.user.0 -> ENOSYS         munmap (7)
+[E7] linux: num=00000007 child=e7.linux.user.0 -> ENOSYS         poll (7)
 [E7] linux: num=0000000E child=e7.linux.user.0 -> ENOSYS         rt_sigprocmask (14)
 [E7] linux: num=000000C8 child=e7.linux.user.0 -> ENOSYS         tkill (200)
 [E7] linux: num=0000000E child=e7.linux.user.0 -> ENOSYS         rt_sigprocmask (14)
@@ -1567,8 +1567,13 @@ The measurement — E3 boot, `e3_multi_env_boot_check.sh` RC=0:
 
 Seven traps instead of two, no `rip=0x28`, and `main` is reached:
 the loader was the whole wall. The child is now inside the Rust
-runtime, asks for `munmap`/`rt_sigprocmask`/`tkill`, gets ENOSYS for
-each, and aborts.
+runtime, asks for `poll`/`rt_sigprocmask`/`tkill`, gets ENOSYS for
+each, and aborts. (The `num=00000007` line was first annotated
+"munmap" here — wrong, and corrected at increment 11 below: Linux's
+number 7 is `poll`, while the census row `11 munmap 7` puts its
+`7` at the COUNT position. The same binary's reference trace has
+`poll` as its third syscall and its first `munmap` eighteen calls
+later; munmap is never trapped in this run at all.)
 
 **What this run names next — two gaps, each by its own line.** (1)
 The death: `[FAULT] Ring-3 fault  cs=0x23  error=0x0
@@ -1585,9 +1590,10 @@ and this section's first reading of it, are stale about the gate.) So
 task takes #UD on any SSE instruction**, which is every real libc and
 every Rust binary: a gate in front of the gate, since nothing in §5.6
 can be measured on a child that cannot execute SSE. (2) The three
-numbers refused above, each its own increment: `munmap`(7) — §5.4's
-second half and the anonymous-map question this section could not
-answer before, now answerable from the run's own line; and
+numbers refused above, each its own increment: `poll`(7) — the zero-
+timeout readiness probe Rust std's `lang_start_internal` makes before
+it installs any signal handler (mislabelled `munmap` above; corrected
+at increment 11, whose increment it became); and
 `rt_sigprocmask`(14)/`tkill`(200) — the signal seam, which §11 Q5's
 policy already covers (ENOSYS with a logged name) but which `abort()`
 needs before it can die cleanly instead of faulting.
@@ -1639,7 +1645,7 @@ The measurement — same E3 harness, `e3_multi_env_boot_check.sh` RC=0:
 [FPU] SSE/SSE2 enabled for ring 3 — CR4.OSFXSR|OSXMMEXCPT, CR0.MP; EM/TS clear, CR0.TS not armed
 [E7] linux: num=0000009E child=e7.linux.user.0 ok                arch_prctl (158)
 [E7] linux: num=000000DA child=e7.linux.user.0 ok                set_tid_address (218)
-[E7] linux: num=00000007 child=e7.linux.user.0 -> ENOSYS         munmap (7)
+[E7] linux: num=00000007 child=e7.linux.user.0 -> ENOSYS         poll (7)
 [E7] linux: num=0000000E child=e7.linux.user.0 -> ENOSYS         rt_sigprocmask (14)
 [E7] linux: num=000000C8 child=e7.linux.user.0 -> ENOSYS         tkill (200)
 [E7] linux: num=0000000E child=e7.linux.user.0 -> ENOSYS         rt_sigprocmask (14)
@@ -1739,7 +1745,7 @@ system POSIX restarts the instance; both runs are identical):
 ```
 [E7] linux: num=0000009E child=e7.linux.user.0 ok                    arch_prctl (158)
 [E7] linux: num=000000DA child=e7.linux.user.0 ok                    set_tid_address (218)
-[E7] linux: num=00000007 child=e7.linux.user.0 -> ENOSYS             munmap (7)
+[E7] linux: num=00000007 child=e7.linux.user.0 -> ENOSYS             poll (7)
 [E7] linux sig syscall 14 refused before post: oldact/oldset copy-back not landed (trigger: reply payload copy-IN)
 [E7] linux: num=000000C8 child=e7.linux.user.0 sig default-action -> kill      tkill (200)
 [PROC] PID 111 terminated.
@@ -1754,20 +1760,111 @@ in the log (the reply payload's copy-IN); and the death is an
 ATTRIBUTION (`terminated.`, frames returned to the partition), not the
 fault path's `exited (code=134)` — the falsifiable gate this section
 set, met at the first `tkill` with no `[FAULT]` line anywhere in the
-firstuser's run. What remains ENOSYS in that run is `munmap` (7) alone.
+firstuser's run. What remains ENOSYS in that run is `poll` (7) alone
+(the line first annotated `munmap` here; corrected at increment 11
+below — Linux's number 7 is poll, and munmap never fires in the run).
 Suite: `run_all` 127 passed / 0 failed / 2 pre-existing skips;
 personality guard all 70 clauses hold; smoke 69/69;
 `script_conventions_check` 0 violations; `stack_frame_budget_check`
 234 files PASS; `make x86-iso-e3` RC=0; the sidecar crate's tests
 11/11 on the new suite.
 
+**Step 2's poll coda — DONE, measured: the run's last ENOSYS ANSWER
+retires, and the firstuser's first output crosses the fd class.** The
+line this section had annotated `munmap (7)` is `poll` — Linux's
+number 7, Rust std's `lang_start_internal` polling fds {0,1,2} with a
+ZERO timeout before it installs any signal handler. The correction is
+triangulated rather than asserted: the kernel's own class table carries
+`{ 7, LSC_FD, 0 }, /* poll */` with munmap at 11; the census artifact
+(`tools/linux_syscall_census.txt`) carries `7 poll 1` and
+`11 munmap 7` — the annotation took the row's COUNT for the number —
+and the same fixture traced under `qemu-x86_64 -strace` in WSL makes
+`arch_prctl`, `set_tid_address`, `poll` its first three calls, the
+run's `9E`/`DA`/`07` order exactly, while its first `munmap` comes
+eighteen calls later, behind `mmap`s this shim has never answered.
+**munmap (11) is never trapped in the firstuser's run at all**, so the
+run's last ENOSYS could never have been its; §5.4's second half stays
+the named gap it was, waiting for the anonymous-map increment.
+
+The answer is deliberately the smallest honest one. A ZERO-timeout
+poll reports 0 events: this shim has no console-input readiness state
+(§10.13's named input class), so "nothing ready" is the whole truth it
+can tell, and UNDER-reporting readiness can only send a caller back to
+its own loop — never into an action built on readiness nobody claimed.
+The pollfd ARRAY is never read and revents never written: a count of 0
+promises neither (POSIX defines revents only for ready fds), so no
+copy crosses in either direction — the copy-IN that would carry
+revents stays increment 8's named gap. A poll that would WAIT (ms > 0,
+or -1's forever) is refused at the FIRST trap, before any channel
+post, by `linux_poll_refuses_blocking` (`kernel/linux_abi.{h,c}`):
+Linux's timeout is an int, so the low 32 bits decide sign-extended —
+-1 and 5000 refuse, 0 and 0x1_00000000 do not — and the sidecar's
+7 arm carries the same rule as its twin (mprotect's both-ends posture
+over a timeout word instead of a prot word): waiting needs a wake
+against input state that does not exist, and answering 0 to a 5000 ms
+poll would make the caller spin its five seconds inside its own loop
+on a lie.
+
+Host teeth: `tests/linux_personality_host_test.c`, **105 checks
+green** — the predicate's probe, the timed and infinite refusals, the
+int-width rule, the total number space — and
+`user/sidecar/src/linux.rs`'s unit tests, **12 green** (the new poll
+test: the probe's 0, nfds-irrelevance, both refusals, both int-width
+directions). Guard clause **S** (S1–S3) with teeth **t84–t89**: the
+predicate neutered to "refuse every poll" (the wall back by name), the
+first-trap refusal block deleted (the waiting poll posts and parks),
+the arm renamed away, the arm's two answers inverted, a waiting poll
+granted 0, and the predicate's host-test section deleted. Smoke
+**75/75**.
+
+The measurement — same E3 harness, `e3_multi_env_boot_check.sh` RC=0,
+both of the boot's firstuser runs identical:
+
+```
+[E7] linux: num=0000009E child=e7.linux.user.0 ok                    arch_prctl (158)
+[E7] linux: num=000000DA child=e7.linux.user.0 ok                    set_tid_address (218)
+[E7] linux: num=00000007 child=e7.linux.user.0 ok                    poll (7)
+[E7] linux sig syscall 13 refused before post: oldact/oldset copy-back not landed (trigger: reply payload copy-IN)
+[E7] linux: num=00000001 child=e7.linux.user.0 write ok              write(1) — the run's first output
+[E7] linux sig syscall 14 refused before post: oldact/oldset copy-back not landed (trigger: reply payload copy-IN)
+[E7] linux: num=000000C8 child=e7.linux.user.0 sig default-action -> kill      tkill (200)
+[PROC] PID 111 terminated.
+```
+
+**The run now goes further than it ever has, and what stops it has a
+name.** With `poll` answered, std's init walks past its own SIGPIPE
+setup refusal and the task WRITES — the fd class performs the bytes
+(`write ok`), and the payload drained onto the serial is Rust's own
+verdict about the remaining wall:
+
+```
+fatal runtime error: assertion failed: signal(libc::SIGPIPE, handler) != libc::SIG_ERR, aborting
+```
+
+`signal(SIGPIPE, …)` is `rt_sigaction` (13) with an `oldact`
+out-pointer; the copy-IN gap refuses it by name, `SIG_ERR` comes back,
+the assert fires, `abort` runs — and `raise(SIGABRT)` meets the same
+gap at 14 before the kill lands at the first `tkill`, attribution
+unchanged. **Zero sidecar ENOSYS answers remain in the run**: every
+ENOSYS the task still sees is a first-trap refusal printed beside its
+trigger, and both triggers are one sentence — §10.10's copy-IN gap,
+whose landing (step 3's `linux_user_copy_in` and the reply payload) is
+now the single MEASURED wall between this run and the workload's own
+code. Suite: `run_all` 127 passed / 0 failed / 2 pre-existing skips;
+personality guard all 74 clauses hold; smoke 75/75;
+`script_conventions_check` 0 violations; `stack_frame_budget_check`
+234 files PASS; `make x86-iso-e3` RC=0; the sidecar crate's tests
+green (12 of them `linux::tests`).
+
 **Sequence.** 0: DONE — the attribution instrument and the `rip=0x28`
 diagnosis, measured (above). 1: DONE — the loader's `p_vaddr`
 alignment fix, host-tested (E8a) and guarded (O8, t53/t54), measured
-past `main` (above). 2: DONE — the SSE gate and the signal seam are
-both landed and measured (above); what remains under 2 is `munmap`(7),
-now the only ENOSYS in the firstuser's run before its kill — its own
-increment, the anonymous-map question above. 3: the reply payload, host teeth first —
+past `main` (above). 2: DONE — the SSE gate, the signal seam and the
+poll coda are all landed and measured (above); nothing ENOSYS remains
+in the run as a sidecar ANSWER — `munmap`(11) never fires before the
+kill (the line read as it was `poll`, measured), and the only ENOSYS
+returns left are 13/14's by-name copy-IN refusals, step 3's own wall
+now named by the run itself. 3: the reply payload, host teeth first —
 `linux_user_copy_in`, `linux_fd_reply_plan`, the three deliver shapes,
 the `service` bound. 4: the path plan, the VFS bridge, the thirteen
 arms. 5: the two format goldens. 6: the fixture probe on-target — a
@@ -1798,11 +1895,16 @@ kernel-anchored manifest record beside ARGENV, CPUID+rdtsc for the
 monotonic half, or widening ARGENV itself. `mmap`(8)/`munmap`(7)
 mid-run: if the run reaches malloc's large allocations, the same
 anonymous-map question answers itself from the run's own ENOSYS
-lines. `poll`(1) and `execve`(1) stay refused by name, as below.
+lines. `execve`(1) stays refused by name, as below; `poll`(1)'s
+zero-timeout probe is now answered (the coda above) and its WAITING
+half refused by name.
 
-**What this increment is NOT.** `poll` — its revents are a copy-in of
-a REWRITTEN array plus console-input state this shim has never had; it
-belongs to the input class, unscoped. `execve` — the spawn class.
+**What this increment is NOT.** `poll`'s WAITING half — its revents
+are a copy-in of a REWRITTEN array plus console-input state this shim
+has never had; a poll that would block or time out belongs to the
+input class, unscoped, refused by name at BOTH ends (only the
+zero-timeout probe — which reads nothing and writes nothing — is
+answered). `execve` — the spawn class.
 `clock_gettime` — the time seam named above. File-backed `mmap`.
 Permissions reported but never enforced — mode comes from the VFS's
 own metadata, and the first refusal a real workload meets is where
@@ -1876,6 +1978,7 @@ Everything this document asserts about the tree, with its source:
 | §5.2's argv/envp cross on the spawn request as the `ARGENV` record, with the empty-environment v1 fallback when it is absent and by-name refusals instead of truncation | `kernel/cap.h`/`cap.c` (`SIDECAR_TAG_ARGENV`, the parse arena, the §5.2 site); `user/proto/src/manifest.rs` (`ArgEnv`, `argenv_wire_bytes_golden`); `tests/cap_create_sidecar_host_test.c` L3/L4; guard clauses O6/O7, teeth t49–t52 |
 | The SSE gate: the pure CR0/CR4/CPUID arithmetic at the SDM's own bit positions, the enable's CPUID → CR4 → CR0 → `fninit` → `ldmxcsr` order, the BSP call ahead of `syscall_gate_init`, the intact vector-7 chain, and the lazy path still dormant (no caller of `perform_lazy_context_switch`) | `arch/x86/fpu_enable.h`; `arch/x86/lazy_fpu.c` (`fpu_enable_sse`); `kernel/kernel.c` 4b; `tests/fpu_enable_host_test.c` (40 checks); guard clause Q, teeth t70–t75 (§10.13's step 2) |
 | The signal seam: the plan's three first-trap refusals (width, out-pointer, span) ahead of any channel post, the sidecar's dispositions/mask/pending with handler installs refused by name and tkill scoped to its own tid, and every default-terminate converging on one attributed no-reply kill | `kernel/linux_abi.{h,c}` (`linux_sig_copy_plan`, `LSC_SIG`); `kernel/syscall_dispatch.c`; `user/sidecar/src/linux.rs` (`SigState`, the 13/14/200 arms, `Answer::SignalKill`); `tests/linux_personality_host_test.c` (98 checks) + linux.rs unit tests (11); guard clause R, teeth t76–t83 (§10.13's step 2) |
+| The run's last ENOSYS answer retires: poll (7)'s zero-timeout probe answered 0 events with the array never read and revents never written, a WAITING poll refused at both ends before any post, and the firstuser's first output (its own fatal SIGPIPE assert) performed by the fd class | `kernel/linux_abi.{h,c}` (`linux_poll_refuses_blocking`, `LINUX_POLL`); `kernel/syscall_dispatch.c` (the first-trap refusal); `user/sidecar/src/linux.rs` (the 7 arm); `tests/linux_personality_host_test.c` (105 checks) + linux.rs unit tests (12); guard clause S, teeth t84–t89 (§10.13's poll coda) |
 
 ## Appendix B — Named gaps, each with its destination
 
@@ -1885,7 +1988,7 @@ Everything this document asserts about the tree, with its source:
 | Six argument registers not captured by the trap path | every forwarded syscall gets wrong arguments (§3.4) | E7, §3.4 |
 | No initial stack/auxv builder | static libc start-up fails before `main` (§5.2) | E7, §5.2 |
 | No `MSR_IA32_FS_BASE` handling | TLS setup fails; musl/glibc binaries die early (§5.3) | E7, §5.3 |
-| No `brk`/`mmap` → budget mapping (`brk` landed, increment 6, §10.11; `mmap`/`munmap` remain) | sub-allocating heaps and `munmap` still refuse (§5.4) | E7, §5.4 — `munmap` now refused on the firstuser's OWN line (§10.13's step-1 run), so the anonymous-map increment is measurable rather than inferred |
+| No `brk`/`mmap` → budget mapping (`brk` landed, increment 6, §10.11; `mmap`/`munmap` remain) | sub-allocating heaps and `munmap` still refuse (§5.4) | E7, §5.4 — corrected at the poll coda (§10.13): munmap (11) never fires before the firstuser's kill — the line once annotated `munmap` is `poll`, measured — so the anonymous-map increment belongs to the real-flags run, where malloc's large allocations actually reach it |
 | `elf64_map_blob` assumes every PT_LOAD's `p_vaddr` is page-aligned | a libc-linked binary with a non-aligned RW LOAD reads every global in it 0x370 bytes off and dies at `rip=0x28` before `main` — measured, §10.13's step 0 | **LANDED** — increment 8's step 1: page-base anchor + lead-offset copy, host teeth E8a, guard clause O8 with teeth t53/t54, measured past `main` |
 | No `CR4.OSFXSR` written anywhere (the IDT's vector-7 gate existed all along — `idt.c`, SIMI Phase 10; `vecstore.c`'s comment saying otherwise is stale), no `xsetbv` | any ring-3 SSE instruction is #UD — every real libc and every Rust binary dies at its first vector op (measured: musl `abort`'s `pxor`, §10.13's step-1 run) | **LANDED** — increment 9: `CR4.OSFXSR|OSXMMEXCPT` + `CR0.MP` armed on the BSP ahead of the trap gate, `fninit` + 0x1F80 `ldmxcsr`, CPUID refusal by name; host teeth `tests/fpu_enable_host_test.c` (40 checks), guard clause Q with teeth t70–t75, measured past `pxor` into `abort`'s tail (§10.13's step 2). `xsetbv`/`CR4.OSXSAVE` remain absent — named, and dormant with the lazy path |
 | `rt_sigprocmask` (14), `rt_sigaction` (13) and `tkill` (200) refuse | `abort()` cannot die at its first `raise(SIGABRT)`, so its tail runs and faults on `hlt` (`rip=0x805260c`) — the firstuser's run ends there, ten attributed traps deep (§10.13's step 2; `rt_sigaction` newly visible) | **LANDED** — increment 10: the kernel's copy plan with all three refusals by name at the first trap, the sidecar's dispositions/mask/pending and the `SignalKill` delivery; host teeth (98 + 11 checks), guard clause R with teeth t76–t83; measured: both firstuser runs end at their first `tkill` with the kill attribution and NO `[FAULT]` (§10.13's step 2). §10.10's copy-IN gap stays — the `oldset` refusal is now LIVE in the log with its trigger named |
@@ -1896,4 +1999,4 @@ Everything this document asserts about the tree, with its source:
 | No environment checkpoint/restore | the inherited gate cannot be passed (§8) | POSIX roadmap v0.2 §12 item 1 |
 | No reply payload: `read` and the file class never cross back (§10.10's named gap) | the first user cannot open, read, stat, list, rename or prune — its file work never leaves the sidecar (§5.6) | E7 increment 8, §10.13 (scoped) |
 | No time source across the sidecar's ABI | `clock_gettime` (228) refuses; the no-vDSO proof (§5.5) shows the first user makes this call | named §10.13: a shared change, its own increment after 8, decided by the run's evidence |
-| No console-input state, so `poll` cannot answer | `poll` (census ×1) refuses; a blocking read never waits | the input class, unscoped (named §10.13) |
+| No console-input state, so a WAITING `poll` cannot answer | a zero-timeout probe is answered (0 events, increment 11), but `poll` (census ×1) with a timeout, and a blocking read, still refuse by name | the input class, unscoped (named §10.13) |

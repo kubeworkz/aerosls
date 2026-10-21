@@ -711,6 +711,46 @@ int main(void)
               "a NULL args array is the zero plan — total, no fault");
     }
 
+    /* ═══ E7 increment 11 (§10.13's step-2 coda): poll (7) — the run's
+     * LAST ENOSYS answer ═════════════════════════════════════════════
+     * The firstuser's num=00000007 line is POLL, not munmap (11 never
+     * fires before the kill — §10.13's annotation took the census row's
+     * COUNT, `11 munmap 7`, for the number). Rust std's
+     * lang_start_internal polls fds {0,1,2} with a ZERO timeout before
+     * any signal handler exists, and an errno outside its tolerated set
+     * aborts the task — which is why the run died at raise(SIGABRT).
+     * The pure refusal below is the first trap's half (a WAITING poll
+     * is refused before any post); the sidecar's 7 arm carries the
+     * same rule as its twin and answers the zero-timeout probe 0
+     * events. Every case below is a way that refusal drifts into either
+     * silent lie: granting a wait whose wake can never come, or
+     * refusing the probe (the wall back by name). ═════════════════ */
+    CHECK(LINUX_POLL == 7,
+          "poll is Linux's own number 7 (the census's poll row) — the "
+          "      number §10.13's log line carried, once mislabelled munmap");
+    CHECK(linux_syscall_class(LINUX_POLL) == LSC_FD,
+          "poll is the fd class — it forwards to the sidecar's fd table, "
+          "      never a mem-class stage");
+    CHECK(linux_poll_refuses_blocking(LINUX_POLL, 0) == 0,
+          "a zero-timeout poll is NOT refused — the snapshot the sidecar "
+          "      answers 0 events (the firstuser's own call shape)");
+    CHECK(linux_poll_refuses_blocking(LINUX_POLL, 1) == 1 &&
+              linux_poll_refuses_blocking(LINUX_POLL, 5000) == 1,
+          "a timed poll is refused — waiting needs console-input state "
+          "      this v1 has never had (§10.13's named input class)");
+    CHECK(linux_poll_refuses_blocking(LINUX_POLL,
+                                     (uint64_t)(int64_t)-1) == 1,
+          "an infinite poll (-1, sign-extended as the register carries "
+          "      it) is refused — the same wait, with no end to it");
+    CHECK(linux_poll_refuses_blocking(LINUX_POLL, 0x100000000ULL) == 0,
+          "the timeout is Linux's INT: the low 32 bits decide "
+          "      (0x1_00000000 truncates to a zero timeout — allowed)");
+    CHECK(linux_poll_refuses_blocking(LINUX_BRK, 7) == 0 &&
+              linux_poll_refuses_blocking(218, 7) == 0 &&
+              linux_poll_refuses_blocking(0, (uint64_t)(int64_t)-1) == 0,
+          "a number that is not poll never waits as one — the predicate "
+          "      is total over the number space (brk's break, 218's echo)");
+
     printf("linux_personality_host_test: %d passed, %d failed\n",
            checks_passed, checks_failed);
     return checks_failed == 0 ? 0 : 1;
