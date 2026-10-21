@@ -1575,9 +1575,13 @@ The death: `[FAULT] Ring-3 fault  cs=0x23  error=0x0
 rip=0x00000000080525b0`, and `0x80525b0` is `pxor %xmm0,%xmm0` —
 musl `abort`'s FIRST SSE instruction, after a `__lock` that is integer
 only. This is the general #UD/#GP/#SS/#NP handler's line, and `#UD`
-carries no error code. The tree writes **no `CR4.OSFXSR` anywhere**,
-and `arch/x86/lazy_fpu.c` ships with no IDT vector-7 gate and no
-`xsetbv` — `kernel/vecstore.c` says so in its own words. So **a ring-3
+carries no error code. The tree writes **no `CR4.OSFXSR` anywhere**, and
+`arch/x86/lazy_fpu.c` ships no `xsetbv` — `kernel/vecstore.c` says so in
+its own words. (Corrected against the code at step 2: the vector-7 gate
+was NOT missing — `idt.c` has installed `isr7_stub` for #NM since SIMI
+Phase 10 — so the wall was `CR4.OSFXSR` alone; `vecstore.c`'s comment,
+and this section's first reading of it, are stale about the gate.) So
+**a ring-3
 task takes #UD on any SSE instruction**, which is every real libc and
 every Rust binary: a gate in front of the gate, since nothing in §5.6
 can be measured on a child that cannot execute SSE. (2) The three
@@ -1588,12 +1592,98 @@ answer before, now answerable from the run's own line; and
 policy already covers (ENOSYS with a logged name) but which `abort()`
 needs before it can die cleanly instead of faulting.
 
+**Step 2's SSE half — DONE, measured: the firstuser now EXECUTES the
+vector code that killed it, and the death moved into `abort`'s tail.**
+The gate is `fpu_enable_sse()` (`arch/x86/lazy_fpu.c`), armed on the
+BSP in `kernel.c`'s 4b block BEFORE `syscall_gate_init()` opens ring 3
+at all. Its bits live pure in `arch/x86/fpu_enable.h` so a host test
+pins them against the SDM rather than against a comment:
+`CR4.OSFXSR` (bit 9) and `OSXMMEXCPT` (bit 10) set with every other
+CR4 bit preserved, `CR0.MP` set and `EM`/`TS` cleared with the rest
+preserved, CPUID.1:EDX bits 25/26 gating the whole sequence — a CPU
+without SSE gets a refusal line instead of a CR4 write it would #GP on
+(a triple fault under `-no-reboot`, i.e. a silent reset) — then
+`fninit` and the 0x1F80 `ldmxcsr` (FNINIT does not touch MXCSR, so the
+separate `ldmxcsr` is what defines the SIMD state). The ORDER is
+load-bearing and is itself tested: `ldmxcsr` is an SSE instruction, so
+`OSFXSR` must already be set when it runs — the exact #UD the step-1
+run died on.
+
+What the gate deliberately does NOT do: arm `CR0.TS`. TS is the lazy
+switch's trigger (`switch_lazy.asm` sets it on a switch-in,
+`lazy_fpu.c`'s `clts` + xsave/xrstor services it); that path has no
+caller — `perform_lazy_context_switch` is referenced by nothing — and
+its xsave would need `CR4.OSXSAVE`, never set. So #NM never fires, the
+machinery stays dormant, and XMM state is NOT saved per task across a
+switch: a named gap, stated in both files rather than papered over.
+The vector-7 chain is nonetheless kept intact (`idt.c` → `isr7_stub` →
+`handle_device_not_available_fault` → `clts`), because an #NM with no
+handler is the same silent-triple-fault class the #UD diagnosis
+depended on avoiding.
+
+Host teeth: `tests/fpu_enable_host_test.c`, 40 checks, green — the bit
+arithmetic over 4000 seeded inputs plus the SDM's literal values; the
+enable's EMITTED order read back from `gcc -O0 -S` of the real
+`lazy_fpu.c` (CR4 write before CR0 before `fninit` before `ldmxcsr`,
+the 8064 = 0x1F80 immediate present); and the wiring (the `kernel.c`
+call ahead of `syscall_gate_init`, the vector-7 chain end to end, the
+dormancy claim). Mutations bite: deleting the CR4-write assignment
+reddens the order check; moving OSFXSR to bit 8 reddens three checks;
+deleting `kernel.c`'s call reddens two. Guard clause **Q**, teeth
+**t70–t75** — numbered after P's reserved `t55+`, so the
+reply-payload family's reservation stands. Smoke 61/61.
+
+The measurement — same E3 harness, `e3_multi_env_boot_check.sh` RC=0:
+
+```
+[FPU] SSE/SSE2 enabled for ring 3 — CR4.OSFXSR|OSXMMEXCPT, CR0.MP; EM/TS clear, CR0.TS not armed
+[E7] linux: num=0000009E child=e7.linux.user.0 ok                arch_prctl (158)
+[E7] linux: num=000000DA child=e7.linux.user.0 ok                set_tid_address (218)
+[E7] linux: num=00000007 child=e7.linux.user.0 -> ENOSYS         munmap (7)
+[E7] linux: num=0000000E child=e7.linux.user.0 -> ENOSYS         rt_sigprocmask (14)
+[E7] linux: num=000000C8 child=e7.linux.user.0 -> ENOSYS         tkill (200)
+[E7] linux: num=0000000E child=e7.linux.user.0 -> ENOSYS         rt_sigprocmask (14)
+[E7] linux: num=0000000E child=e7.linux.user.0 -> ENOSYS         rt_sigprocmask (14)
+[E7] linux: num=0000000D child=e7.linux.user.0 -> ENOSYS         rt_sigaction (13)
+[E7] linux: num=000000C8 child=e7.linux.user.0 -> ENOSYS         tkill (200)
+[E7] linux: num=0000000E child=e7.linux.user.0 -> ENOSYS         rt_sigprocmask (14)
+[FAULT] Ring-3 fault  cs=0x23  error=0x0  rip=0x000000000805260c  — killing process.
+[PROC] PID 111 'e7.linux.user.0' exited (code=134).
+```
+
+Ten attributed traps — `rt_sigaction` (13) newly among them — and
+`0x80525b0`, `pxor %xmm0,%xmm0`, NOW EXECUTES (with
+`movaps %xmm0,0x10(%rsp)` behind it). The death moved 0x5C bytes to
+`0x805260c`, which is `hlt`: the unconditional instruction after
+`abort`'s final `rt_sigprocmask`, followed by `raise(SIGKILL)` and
+`_Exit(127)`. `hlt` at CPL 3 is #UD with no error code — the same
+handler line as before, a different instruction. And it is reachable
+ONLY because nothing dies earlier: on a real system `abort`'s first
+`raise(SIGABRT)` terminates the task, so the whole tail is dead code.
+Here `tkill`/`rt_sigaction`/`rt_sigprocmask` all answer ENOSYS,
+`raise` returns, and `abort` walks to its guard instruction. The
+remaining wall is therefore exactly the signal seam this section
+already named as the next increment, now with a falsifiable shape:
+with SIGABRT delivery in place the firstuser dies at its FIRST `tkill`
+with **no `[FAULT]` line at all**, and `exited (code=134)` stops being
+the fault path's fixed `process_exit(134)` (`kernel/stubs.c`) and
+starts being an attribution. (The log's second FAULT —
+`rip=0x400000015067`, PID 104 — is `[irqtest] p4`'s own storm kill,
+byte-for-byte present in `boot_cap.log` from before this increment:
+pre-existing, not this gate's.)
+
+Suite after the change: `run_all` 127 passed / 0 failed / 2
+pre-existing skips (the new host test among them); personality guard
+all clauses hold including Q1–Q4; smoke 61/61;
+`script_conventions_check` 0 violations; `stack_frame_budget_check`
+234 files PASS; `make x86-iso-e3` RC=0.
+
 **Sequence.** 0: DONE — the attribution instrument and the `rip=0x28`
 diagnosis, measured (above). 1: DONE — the loader's `p_vaddr`
 alignment fix, host-tested (E8a) and guarded (O8, t53/t54), measured
-past `main` (above). 2: what the run past the loader named — the SSE
-gate first (no `CR4.OSFXSR`, so any ring-3 SSE instruction is #UD),
-then `munmap`(7), `rt_sigprocmask`(14) and `tkill`(200), each its own
+past `main` (above). 2: HALF DONE — the SSE gate landed and is measured
+(above); what remains under 2 is `munmap`(7) and the signal seam —
+`rt_sigprocmask`(14), `rt_sigaction`(13), `tkill`(200), each its own
 increment. 3: the reply payload, host teeth first —
 `linux_user_copy_in`, `linux_fd_reply_plan`, the three deliver shapes,
 the `service` bound. 4: the path plan, the VFS bridge, the thirteen
@@ -1701,6 +1791,7 @@ Everything this document asserts about the tree, with its source:
 | The sidecar's first answers: 218 echoed, 231 reaped, everything else ENOSYS with its number logged | `user/sidecar/src/linux.rs`; `user/sidecar/src/entry.rs` (`service`/`append_wait`) |
 | The §5.2 image through the real create: child-vaddr pointers (`region_vaddr`), BIB-page reservation, 8 KiB floor, `AT_RANDOM` = entropy or `CAP_ECONFLICT` with the region returned | `kernel/cap.c` (steps 6–7); `kernel/linux_abi.{h,c}`; host tests L1/L2/E7c (377 checks); clauses O3/O4, teeth t44/t45/t46 (§10.12) |
 | §5.2's argv/envp cross on the spawn request as the `ARGENV` record, with the empty-environment v1 fallback when it is absent and by-name refusals instead of truncation | `kernel/cap.h`/`cap.c` (`SIDECAR_TAG_ARGENV`, the parse arena, the §5.2 site); `user/proto/src/manifest.rs` (`ArgEnv`, `argenv_wire_bytes_golden`); `tests/cap_create_sidecar_host_test.c` L3/L4; guard clauses O6/O7, teeth t49–t52 |
+| The SSE gate: the pure CR0/CR4/CPUID arithmetic at the SDM's own bit positions, the enable's CPUID → CR4 → CR0 → `fninit` → `ldmxcsr` order, the BSP call ahead of `syscall_gate_init`, the intact vector-7 chain, and the lazy path still dormant (no caller of `perform_lazy_context_switch`) | `arch/x86/fpu_enable.h`; `arch/x86/lazy_fpu.c` (`fpu_enable_sse`); `kernel/kernel.c` 4b; `tests/fpu_enable_host_test.c` (40 checks); guard clause Q, teeth t70–t75 (§10.13's step 2) |
 
 ## Appendix B — Named gaps, each with its destination
 
@@ -1712,8 +1803,8 @@ Everything this document asserts about the tree, with its source:
 | No `MSR_IA32_FS_BASE` handling | TLS setup fails; musl/glibc binaries die early (§5.3) | E7, §5.3 |
 | No `brk`/`mmap` → budget mapping (`brk` landed, increment 6, §10.11; `mmap`/`munmap` remain) | sub-allocating heaps and `munmap` still refuse (§5.4) | E7, §5.4 — `munmap` now refused on the firstuser's OWN line (§10.13's step-1 run), so the anonymous-map increment is measurable rather than inferred |
 | `elf64_map_blob` assumes every PT_LOAD's `p_vaddr` is page-aligned | a libc-linked binary with a non-aligned RW LOAD reads every global in it 0x370 bytes off and dies at `rip=0x28` before `main` — measured, §10.13's step 0 | **LANDED** — increment 8's step 1: page-base anchor + lead-offset copy, host teeth E8a, guard clause O8 with teeth t53/t54, measured past `main` |
-| No `CR4.OSFXSR` written anywhere, no IDT vector-7 gate, no `xsetbv` | any ring-3 SSE instruction is #UD — every real libc and every Rust binary dies at its first vector op (measured: musl `abort`'s `pxor`, exit 134, §10.13's step-1 run) | the gate in front of §5.6 — increment 9, named by the step-1 run |
-| `rt_sigprocmask` (14) and `tkill` (200) refuse | `abort()` cannot finish dying cleanly and faults instead; the firstuser's run ends inside it (§10.13's step-1 run) | the signal seam — its own increment after the SSE gate; §11 Q5's logged-ENOSYS policy holds it visible meanwhile |
+| No `CR4.OSFXSR` written anywhere (the IDT's vector-7 gate existed all along — `idt.c`, SIMI Phase 10; `vecstore.c`'s comment saying otherwise is stale), no `xsetbv` | any ring-3 SSE instruction is #UD — every real libc and every Rust binary dies at its first vector op (measured: musl `abort`'s `pxor`, §10.13's step-1 run) | **LANDED** — increment 9: `CR4.OSFXSR|OSXMMEXCPT` + `CR0.MP` armed on the BSP ahead of the trap gate, `fninit` + 0x1F80 `ldmxcsr`, CPUID refusal by name; host teeth `tests/fpu_enable_host_test.c` (40 checks), guard clause Q with teeth t70–t75, measured past `pxor` into `abort`'s tail (§10.13's step 2). `xsetbv`/`CR4.OSXSAVE` remain absent — named, and dormant with the lazy path |
+| `rt_sigprocmask` (14), `rt_sigaction` (13) and `tkill` (200) refuse | `abort()` cannot die at its first `raise(SIGABRT)`, so its tail runs and faults on `hlt` (`rip=0x805260c`) — the firstuser's run ends there, ten attributed traps deep (§10.13's step 2; `rt_sigaction` newly visible) | the signal seam — the NEXT increment, now with a falsifiable shape: with delivery in place the run ends at its first `tkill` with NO `[FAULT]` line; §11 Q5's logged-ENOSYS policy holds it visible meanwhile |
 | No `CAP_E*` → Linux errno table (and a `CAP_NONE` sentinel in returns) | silent wrong errors (§5.7) | E7, §5.7 |
 | Target designated, but no candidate binary and therefore no artifact | the table is still unmeasured; `--check` reports a named skip rather than a pass | write the crate, add the musl target, run `--run` |
 | No thread groups / `clone` / `futex` | Go and every threaded runtime are out (§7) | named as Go's gate; unscoped |

@@ -46,6 +46,16 @@ FILES=(
     # O8 reads the host test that EXECUTES the mid-page case (E8a), so the
     # seeded copy needs it exactly as the guard does.
     tests/cap_create_sidecar_host_test.c
+    # Q (the SSE gate) reads the enable, its call site, the vector-7 chain
+    # and the host test that pins the emitted order — same rule as above.
+    arch/x86/fpu_enable.h
+    arch/x86/lazy_fpu.c
+    arch/x86/idt.c
+    arch/x86/interrupt.asm
+    arch/x86/switch_lazy.asm
+    kernel/kernel.c
+    kernel/stubs.c
+    tests/fpu_enable_host_test.c
 )
 
 for f in "${FILES[@]}" "$GUARD"; do
@@ -493,6 +503,56 @@ tooth elf-midpage-shift O8 "the mapper anchors at the SEGMENT start again, so a 
 seed "$W/t54"
 sed -i 's/if (a_lo < b_hi && b_lo < a_hi) {/if (0) {}/' "$W/t54/kernel/elf64_load.c"
 tooth elf-shared-page-no-refusal O8 "two LOADs sharing a page are no longer refused by name" "$W/t54"
+
+# ─── Q teeth (the SSE gate: CR4.OSFXSR, its order, and the vector-7 chain) ─
+
+# t70: the BSP call deleted — the gate exists, is compiled, is host-tested,
+# and runs on NOBODY: every ring-3 SSE instruction is #UD again (the
+# measured musl-abort pxor death) while every other clause stays green.
+seed "$W/t70"
+sed -i '/^    fpu_enable_sse();$/d' "$W/t70/kernel/kernel.c"
+tooth sse-gate-never-called Q1 "kernel.c no longer calls fpu_enable_sse() before the trap gate opens ring 3" "$W/t70"
+
+# t71: the OSFXSR bit moved one position — CR4 gains bit 8 (reserved!) and
+# never gains bit 9, so SSE stays #UD; a wrong bit is exactly the class of
+# error a comment cannot catch, which is why the host test pins the SDM's
+# own numbers and this clause pins the name.
+seed "$W/t71"
+sed -i '0,/(1ull << 9)/s//(1ull << 8)/' "$W/t71/arch/x86/fpu_enable.h"
+tooth sse-osfxsr-bit-moved Q1 "CR4.OSFXSR is no longer bit 9" "$W/t71"
+
+# t72: the CPUID refusal neutralised — the CR4 write now happens on any CPU
+# regardless of SSE support; on one without SSE the write #GPs and the
+# machine triple-faults under -no-reboot with no trace at all.
+seed "$W/t72"
+sed -i 's/if (!fpu_cpuid_has_sse(edx)) {/if (0) {}/' "$W/t72/arch/x86/lazy_fpu.c"
+tooth sse-cpuid-refusal-gone Q2 "the SSE gate no longer refuses by name on a CPU without SSE" "$W/t72"
+
+# t73: the ldmxcsr deleted — the x87 core is initialised but MXCSR keeps
+# whatever garbage it powers up with, so the "all exceptions masked"
+# invariant the runtime assumes is not actually established.
+seed "$W/t73"
+sed -i '/__asm__ volatile("ldmxcsr/d' "$W/t73/arch/x86/lazy_fpu.c"
+tooth sse-mxcsr-unloaded Q2 "the gate no longer loads the masked-reset MXCSR after fninit" "$W/t73"
+
+# t74: the vector-7 gate pointed at the wrong stub — a #NM (reachable the
+# moment anyone arms CR0.TS) lands on a stub that does not handle it: the
+# same silent-triple-fault class under -no-reboot that made the #UD
+# diagnosis possible only by luck of the general handler existing.
+seed "$W/t74"
+sed -i 's/(uint64_t)isr7_stub/(uint64_t)isr9_stub/' "$W/t74/arch/x86/idt.c"
+tooth sse-nm-gate-misrouted Q3 "vector 7 no longer routes to isr7_stub" "$W/t74"
+
+# t75: a call site for the dormant lazy switch appears — CR0.TS would now
+# arm on every switch-in while the handler's xsave needs CR4.OSXSAVE,
+# which the gate deliberately never sets: the first #NM would #UD inside
+# its own handler, and the doc's 'XMM is not switched per task' claim
+# stops being true without anything reddening.
+seed "$W/t75"
+printf '\nvoid sse_smoke_t75(void);
+void sse_smoke_t75(void) { extern void perform_lazy_context_switch(void*, void*); perform_lazy_context_switch(0, 0); }
+' >> "$W/t75/kernel/process.c"
+tooth sse-lazy-woken Q4 "a .c file now calls perform_lazy_context_switch() (the lazy path is no longer dormant)" "$W/t75"
 
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"

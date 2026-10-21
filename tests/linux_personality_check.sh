@@ -63,7 +63,10 @@ for f in kernel/linux_abi.h kernel/linux_abi.c kernel/process.h kernel/process.c
          arch/x86/user_paging.h arch/x86/user_paging.c arch/x86/syscall.asm \
          user/sidecar/src/linux.rs user/sidecar/src/entry.rs \
          user/sidecar/src/e7_probe.rs user/sidecar/fixtures/e7_linux_probe.S \
-         user/sidecar/src/e7_firstuser.rs user/proto/src/manifest.rs; do
+         user/sidecar/src/e7_firstuser.rs user/proto/src/manifest.rs \
+         arch/x86/fpu_enable.h arch/x86/lazy_fpu.c arch/x86/idt.c \
+         arch/x86/interrupt.asm arch/x86/switch_lazy.asm \
+         kernel/kernel.c kernel/stubs.c tests/fpu_enable_host_test.c; do
     if [ ! -f "$f" ]; then
         echo "ABORT: $f missing — the guard cannot be evaluated at all." >&2
         exit 2
@@ -93,6 +96,14 @@ CBUILD=user/sidecar/fixtures/build_candidate.sh
 LFU=user/sidecar/src/e7_firstuser.rs
 MANR=user/proto/src/manifest.rs
 CCT=tests/cap_create_sidecar_host_test.c
+FPUH=arch/x86/fpu_enable.h
+LFUC=arch/x86/lazy_fpu.c
+IDTC=arch/x86/idt.c
+ISRA=arch/x86/interrupt.asm
+SWLA=arch/x86/switch_lazy.asm
+KERC=kernel/kernel.c
+STUB=kernel/stubs.c
+FHUT=tests/fpu_enable_host_test.c
 
 # ─── B. The sibling per-CPU block, at the offsets the asm addresses ────────
 # The struct side is pinned by static asserts (a C reorder is a BUILD
@@ -700,6 +711,76 @@ if grep -qF 'uint64_t page_base = s->p_vaddr & ~(uint64_t)4095u;' "$E64C" && \
     ok "O8. a PT_LOAD that starts MID-PAGE lands at its LINKED vaddr: the page base is the mapping anchor and the segment's lead is where its bytes start inside the frame (both zero for an aligned segment, so the images that already worked are unmoved), two LOADs sharing a page are refused by name before the first frame, and tests/cap_create_sidecar_host_test.c's E8a section executes the case — the measured killer of the first user"
 else
     bad "O8. the mapper's page-alignment handling is gone — a segment linking mid-page lands (p_vaddr & 0xFFF) bytes early again, every global in it reads the file that much further on, and a libc-linked binary dies at rip=0x28 before main while [LOADER] reports a successful load; the shared-page refusal going with it would let a second segment silently discard the first's bytes and permissions through the one frame per page"
+fi
+
+# ─── Q. The SSE gate (§10.13's step-1 death, increment 9): CR4.OSFXSR and its order ──
+# The designated first user reached `main` and then died at musl abort()'s
+# `pxor %xmm0,%xmm0` (rip=0x80525b0, error=0x0 — #UD, which carries no error
+# code) because boot.asm wrote CR4.PAE and nothing else: with OSFXSR clear,
+# EVERY SSE instruction a ring-3 task executes is #UD, which is every real
+# libc and every Rust binary. The gate is fpu_enable_sse()
+# (arch/x86/lazy_fpu.c), armed on the BSP in kernel.c's 4b block before
+# syscall_gate_init() opens ring 3 at all. Every clause below is a way it is
+# silently a no-op again while the boot log still reads green: a call that
+# never happens, a bit at the wrong position, an ldmxcsr emitted BEFORE the
+# CR4 write (ldmxcsr is itself an SSE instruction — #UD with OSFXSR clear,
+# the exact death this gate exists to end), a vector-7 chain with a gap in
+# it (an #NM with no handler is the same silent-triple-fault class), or a
+# CR0.TS armed somewhere the dormant lazy-FPU path cannot service. The host
+# test (tests/fpu_enable_host_test.c) pins the bit arithmetic and the
+# EMITTED ORDER of the asm; these clauses hold the wiring around it. The
+# smoke's t70–t75 bite these.
+lf_cpuid=$(grep -nF '__asm__ volatile("cpuid"' "$LFUC" | head -1 | cut -d: -f1)
+lf_refuse=$(grep -nF 'if (!fpu_cpuid_has_sse(edx)) {' "$LFUC" | head -1 | cut -d: -f1)
+lf_cr4=$(grep -nF 'cr4 = fpu_cr4_enable_sse(cr4);' "$LFUC" | head -1 | cut -d: -f1)
+lf_cr0=$(grep -nF 'cr0 = fpu_cr0_enable_fpu(cr0);' "$LFUC" | head -1 | cut -d: -f1)
+lf_fninit=$(grep -nF '__asm__ volatile("fninit")' "$LFUC" | head -1 | cut -d: -f1)
+lf_ldmx=$(grep -nF '__asm__ volatile("ldmxcsr' "$LFUC" | head -1 | cut -d: -f1)
+kc_call=$(grep -nF 'fpu_enable_sse();' "$KERC" | head -1 | cut -d: -f1)
+kc_gate=$(grep -nF 'syscall_gate_init();' "$KERC" | head -1 | cut -d: -f1)
+if grep -qF '#define FPU_CR4_OSFXSR' "$FPUH" && \
+   grep -qF '(1ull << 9)' "$FPUH" && \
+   grep -qF '#define FPU_CR4_OSXMMEXCPT' "$FPUH" && \
+   grep -qF '(1ull << 10)' "$FPUH" && \
+   grep -qF '#define FPU_CR0_MP' "$FPUH" && \
+   grep -qF '#define FPU_SSE_MXCSR_DEFAULT 0x1F80u' "$FPUH" && \
+   grep -qF 'void fpu_enable_sse(void)' "$FPUH" && \
+   grep -qF 'void fpu_enable_sse(void) {' "$LFUC" && \
+   grep -qF 'fpu_cr4_enable_sse(' "$LFUC" && \
+   grep -qF 'fpu_cr0_enable_fpu(' "$LFUC" && \
+   grep -qF 'fpu_cpuid_has_sse(' "$LFUC" && \
+   grep -qF '#include "../arch/x86/fpu_enable.h"' "$KERC" && \
+   [ -n "$kc_call" ] && [ -n "$kc_gate" ] && [ "$kc_call" -lt "$kc_gate" ]; then
+    ok "Q1. the SSE gate exists with its SDM bits by name — CR4.OSFXSR (bit 9), OSXMMEXCPT (bit 10), CR0.MP, the 0x1F80 MXCSR reset — fpu_enable_sse() consumes the pure arithmetic rather than re-deriving literals the host test cannot see, and kernel.c CALLS it before syscall_gate_init() opens ring 3 at all"
+else
+    bad "Q1. the SSE gate's bits, its body, or its BSP call site are gone/renamed — every ring-3 SSE instruction is #UD again (musl abort()'s pxor, measured rip=0x80525b0), the enable writes literals no host test pins, or the gate is compiled and never runs on anybody"
+fi
+if [ -n "$lf_cpuid" ] && [ -n "$lf_refuse" ] && [ -n "$lf_cr4" ] && \
+   [ -n "$lf_cr0" ] && [ -n "$lf_fninit" ] && [ -n "$lf_ldmx" ] && \
+   [ "$lf_cpuid" -lt "$lf_refuse" ] && [ "$lf_refuse" -lt "$lf_cr4" ] && \
+   [ "$lf_cr4" -lt "$lf_cr0" ] && [ "$lf_cr0" -lt "$lf_fninit" ] && \
+   [ "$lf_fninit" -lt "$lf_ldmx" ] && \
+   grep -qF 'fpu_enable_host_test.c' "$LFUC"; then
+    ok "Q2. the enable's order is the safe one: CPUID first (a CPU without SSE gets a refusal line, not a #GP/triple fault), then CR4.OSFXSR, then CR0's EM/TS clear, then fninit, then ldmxcsr — ldmxcsr is itself an SSE instruction and #UDs before the CR4 write, which is the death this gate exists to end"
+else
+    bad "Q2. the SSE enable's order broke — ldmxcsr or fninit emitted before the CR4/CR0 writes (#UD on the gate's own first instruction, the same silent death class), the CPUID refusal bypassed (a #GP on the CR4 write of a CPU without SSE), or the host test that pins the emitted order is no longer referenced"
+fi
+if grep -qF 'set_idt_gate( 7, (uint64_t)isr7_stub,' "$IDTC" && \
+   grep -qF 'isr7_stub' "$ISRA" && \
+   grep -qF 'handle_device_not_available' "$STUB" && \
+   grep -qF '__asm__ volatile("clts")' "$LFUC"; then
+    ok "Q3. the vector-7 chain is intact end to end — idt.c's gate, isr7_stub, the stubs' route to handle_device_not_available_fault, and its clts that clears CR0.TS before touching state — so arming TS later cannot produce an unhandled #NM (the same silent-triple-fault class as the #UD this increment removed)"
+else
+    bad "Q3. a link in the #NM chain is gone — a vector-7 trap with no gate or no handler is a double/triple fault under -no-reboot (no trace, no panic), and a handler that lost its clts would #NM-loop on its own first SSE instruction"
+fi
+lazy_calls=$(grep -rn 'perform_lazy_context_switch(' kernel arch --include=*.c 2>/dev/null \
+              | grep -vE ':[[:space:]]*(\*|//)' | wc -l)
+if [ "$lazy_calls" -eq 0 ] && \
+   grep -qF 'referenced by nothing' "$LFUC" && \
+   grep -qF 'no caller' "$FPUH"; then
+    ok "Q4. the lazy-FPU path stays DORMANT and says so — no .c calls perform_lazy_context_switch(), so CR0.TS is never armed, #NM never fires, and the xsave/xrstor handler (which would itself need CR4.OSXSAVE) is unreachable; XMM state is therefore NOT switched per task, and both files name that gap instead of papering over it"
+else
+    bad "Q4. a caller of the lazy switch appeared, or the dormancy claim is gone — TS would arm on a switch-in while the handler's xsave needs CR4.OSXSAVE (which is deliberately never set): the first #NM would #UD inside the handler, and the doc's 'XMM is not switched' claim would silently stop being true"
 fi
 
 echo

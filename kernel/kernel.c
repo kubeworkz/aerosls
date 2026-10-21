@@ -39,6 +39,9 @@ extern int sls_launch_guest(const void *image, uint32_t len,
 #include "../kernel/auth.h"
 #include "../net/dhcp.h"
 #include "../arch/x86/user_paging.h"
+#include "../arch/x86/fpu_enable.h"  // §10.13's SSE gate: CR4.OSFXSR/OSXMMEXCPT
+                                     // + CR0.MP on the BSP, ahead of any
+                                     // ring-3 task (4b, below)
 #include "../net/net.h"
 #include "../net/e1000.h"
 #include "../net/http.h"
@@ -218,6 +221,13 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
     kernel_serial_print("[BSP] Round-robin task scheduler initialised.\n");
 
     // ── 4b. SYSCALL/SYSRET gate ───────────────────────────────────────────
+    // SSE/FP first: every real libc and every Rust binary executes vector
+    // code, and with CR4.OSFXSR clear (this tree wrote CR4.PAE at boot and
+    // nothing else) any SSE instruction a ring-3 task executes is #UD —
+    // the measured death of the designated first user at musl abort()'s
+    // pxor (§10.13). CPU features go on the BSP before the trap gate opens
+    // ring 3 at all; a CPU without SSE gets a refusal line, not a #GP.
+    fpu_enable_sse();
     syscall_gate_init();   // configure STAR/LSTAR/SFMASK/EFER, per-CPU GS
 
     // ── 4c. Process manager ────────────────────────────────────────────
