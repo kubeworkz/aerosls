@@ -43,6 +43,9 @@ FILES=(
     user/sidecar/fixtures/build_candidate.sh
     kernel/elf64_load.h
     kernel/elf64_load.c
+    # O8 reads the host test that EXECUTES the mid-page case (E8a), so the
+    # seeded copy needs it exactly as the guard does.
+    tests/cap_create_sidecar_host_test.c
 )
 
 for f in "${FILES[@]}" "$GUARD"; do
@@ -473,6 +476,23 @@ tooth firstuser-argenv-gone O7 "the firstuser no longer crosses the ARGENV recor
 seed "$W/t52"
 sed -i 's/pub const LINUX_DEFAULT_ENV/pub const XENV/' "$W/t52/user/sidecar/src/linux.rs"
 tooth env-list-gone O7 "the shared LINUX_DEFAULT_ENV list is gone from linux.rs" "$W/t52"
+
+# ─── O8 teeth (increment 8, step 1: a PT_LOAD that starts MID-PAGE) ────────
+
+# t53: the page anchor pointed back at the SEGMENT's start — the exact
+# assumption that killed the first user (§10.13's step-0 diagnosis): every
+# byte of a mid-page segment lands (p_vaddr & 0xFFF) early in vaddr space,
+# .init_array reads back 0x28, and the child dies at rip=0x28 before main.
+seed "$W/t53"
+sed -i 's/uint64_t page_base = s->p_vaddr & ~(uint64_t)4095u;/uint64_t page_base = s->p_vaddr;/' "$W/t53/kernel/elf64_load.c"
+tooth elf-midpage-shift O8 "the mapper anchors at the SEGMENT start again, so a mid-page LOAD lands (p_vaddr \& 0xFFF) bytes early" "$W/t53"
+
+# t54: the shared-page refusal dead-coded — a second LOAD covering a page
+# the first already owns maps the one frame twice, silently discarding the
+# first segment's bytes and its permissions.
+seed "$W/t54"
+sed -i 's/if (a_lo < b_hi && b_lo < a_hi) {/if (0) {}/' "$W/t54/kernel/elf64_load.c"
+tooth elf-shared-page-no-refusal O8 "two LOADs sharing a page are no longer refused by name" "$W/t54"
 
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"

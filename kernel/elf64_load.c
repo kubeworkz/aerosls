@@ -155,6 +155,41 @@ int elf64_map_blob(const uint8_t* data, uint64_t size, uint64_t* pml4,
         }
     }
 
+    /* ── two LOADs must not share a PAGE ────────────────────────────────
+     * The mapper installs ONE frame per page, so a page covered by two
+     * segments would be mapped twice and the second write would silently
+     * discard the first segment's bytes and its permissions. Aligned
+     * segments cannot share one; a non-aligned LOAD's page reaches BACK
+     * into the previous segment's tail, which is the case the alignment
+     * fix above makes possible. Refused by name, before the first frame,
+     * like every other gate above. */
+    for (ph = 0; ph < ehdr->e_phnum; ph++) {
+        const struct ELF64ProgramHeader* a = &phdr[ph];
+        uint64_t a_lo, a_hi;
+        uint16_t q;
+        if (a->p_type != PT_LOAD) continue;
+        if (a->p_filesz == 0) continue;
+        a_lo = a->p_vaddr & ~(uint64_t)4095u;
+        a_hi = (a->p_vaddr + a->p_memsz + 4095) & ~(uint64_t)4095u;
+        for (q = (uint16_t)(ph + 1); q < ehdr->e_phnum; q++) {
+            const struct ELF64ProgramHeader* b = &phdr[q];
+            uint64_t b_lo, b_hi;
+            if (b->p_type != PT_LOAD) continue;
+            if (b->p_filesz == 0) continue;
+            b_lo = b->p_vaddr & ~(uint64_t)4095u;
+            b_hi = (b->p_vaddr + b->p_memsz + 4095) & ~(uint64_t)4095u;
+            if (a_lo < b_hi && b_lo < a_hi) {
+                kernel_serial_printf(
+                    "[ELF] refuse: LOAD %u (vaddr 0x%llx) and LOAD %u "
+                    "(vaddr 0x%llx) share a page — one frame per page "
+                    "cannot hold both\n",
+                    (unsigned)ph, (unsigned long long)a->p_vaddr,
+                    (unsigned)q, (unsigned long long)b->p_vaddr);
+                return 0;
+            }
+        }
+    }
+
     /* ── map: the original loop, now only reachable past every check ── */
     for (ph = 0; ph < ehdr->e_phnum; ph++) {
         const struct ELF64ProgramHeader* s = &phdr[ph];
@@ -163,8 +198,27 @@ int elf64_map_blob(const uint8_t* data, uint64_t size, uint64_t* pml4,
         if (s->p_type != PT_LOAD) continue;
         if (s->p_filesz == 0) continue;
 
-        n_pages = (s->p_memsz + 4095) / 4096;
         {
+            /* A PT_LOAD's p_vaddr is NOT required to be page-aligned (the
+             * firstuser's RW segment links at 0x8077370 — 0x370 into its
+             * page), and a page's frame holds the bytes of the PAGE, not of
+             * the segment's start. Copying from segment offset 0 while
+             * mapping p_vaddr lands the whole segment (p_vaddr & 0xFFF)
+             * bytes early in vaddr space, so every read inside it returns
+             * the file that many bytes further on. Measured (§10.13's
+             * step-0 diagnosis): .init_array read back 0x28 instead of
+             * 0x800ae00, __libc_start_init's `call *(%rbx)` jumped to 0x28,
+             * and the firstuser died at rip=0x28 before main. The page
+             * BASE is the mapping anchor; the segment's offset inside its
+             * first page is where its bytes start in that frame. For an
+             * aligned segment both reduce to the arithmetic this loop
+             * always did — which is why increment 7's census never saw
+             * this, and why the aligned images' load is unchanged. */
+            uint64_t page_base = s->p_vaddr & ~(uint64_t)4095u;
+            uint64_t lead      = s->p_vaddr - page_base;
+
+            n_pages = (lead + s->p_memsz + 4095) / 4096;
+
             /* The segment's PERMS ride cap_arch_map_page's cap_perms word
              * (W→CAP_PERM_W, X→CAP_PERM_X — the same encoding the MEM/DEV
              * grants use), NOT user_map_page(): a real static binary links
@@ -192,8 +246,30 @@ int elf64_map_blob(const uint8_t* data, uint64_t size, uint64_t* pml4,
                 (s->p_flags & PF_R) ? 'R' : '-',
                 (s->p_flags & PF_W) ? 'W' : '-',
                 (s->p_flags & PF_X) ? 'X' : '-');
+            if (lead != 0) {
+                /* Visible, like every other load decision here: a segment
+                 * that starts mid-page is the case this mapper used to get
+                 * wrong, so a boot log now says which one and by how much. */
+                kernel_serial_printf(
+                    "[LOADER] segment vaddr 0x%llx is 0x%llx into its page; "
+                    "frames anchored at 0x%llx\n",
+                    (unsigned long long)s->p_vaddr,
+                    (unsigned long long)lead,
+                    (unsigned long long)page_base);
+            }
 
             for (p = 0; p < n_pages; p++) {
+                /* This page's vaddr, and where the SEGMENT starts inside
+                 * it: a page whose vaddr is below the segment's start
+                 * carries lead bytes of nothing before the segment's first
+                 * byte (zeros — they belong to no segment), and every
+                 * later page starts at the segment offset that vaddr
+                 * implies. Both are 0 for an aligned segment. */
+                uint64_t page_vaddr = page_base + p * 4096;
+                uint64_t seg_off    = (page_vaddr > s->p_vaddr)
+                                    ? (page_vaddr - s->p_vaddr) : 0;
+                uint64_t frame_off  = (page_vaddr < s->p_vaddr)
+                                    ? (s->p_vaddr - page_vaddr) : 0;
                 void* frame =
                     allocate_physical_ram_frame_for_partition(partition_id);
                 if (!frame) {
@@ -204,17 +280,14 @@ int elf64_map_blob(const uint8_t* data, uint64_t size, uint64_t* pml4,
                                               * recycles frames — an unzeroed
                                               * BSS would read a former
                                               * tenant's bytes */
-                {
-                    uint64_t byte_off = p * 4096;
-                    if (byte_off < s->p_filesz) {
-                        uint64_t copy_len = s->p_filesz - byte_off;
-                        if (copy_len > 4096) copy_len = 4096;
-                        e6_memcpy(frame,
-                                  data + s->p_offset + byte_off, copy_len);
-                    }
+                if (seg_off < s->p_filesz) {
+                    uint64_t copy_len = s->p_filesz - seg_off;
+                    if (copy_len > 4096 - frame_off) copy_len = 4096 - frame_off;
+                    e6_memcpy((uint8_t*)frame + frame_off,
+                              data + s->p_offset + seg_off, copy_len);
                 }
                 if (cap_arch_map_page((uint64_t)(uintptr_t)pml4,
-                                      s->p_vaddr + p * 4096,
+                                      page_vaddr,
                                       (uint64_t)(uintptr_t)frame,
                                       cap_perms) != 0) {
                     kernel_serial_print("[ELF] arch map failed mid-load\n");

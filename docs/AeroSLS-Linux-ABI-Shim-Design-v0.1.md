@@ -1537,25 +1537,71 @@ image: the candidate's two are `0x3ff000` and `0x400000`, which is why
 increment 7's census passed and this stayed invisible until a binary
 with a real libc linked a RW segment at a non-aligned address.
 
-**Step 1 is therefore the loader's alignment fix, not anonymous
-`mmap`.** The `mmap`/`clock_gettime` risks named below are neither
-cleared nor confirmed — this run never reaches `main`, so it cannot
-reach them — and they stay open until a run gets past the loader.
-Gate half one is blocked on the fix, not on §5.6's seams.
+**Step 1 — DONE, and it carried the firstuser past `main`.** The fix
+anchors each LOAD's frames at its **page** base and copies from the
+segment offset that vaddr implies; both are zero for an aligned
+segment, so every image that already worked is unmoved. The hazard the
+fix makes possible is refused by name before the first frame — two
+LOADs covering one page would be mapped twice through the one frame a
+page gets, the second silently discarding the first's bytes and
+permissions. Host teeth: a new **E8a** section in
+`tests/cap_create_sidecar_host_test.c` maps a synthetic image whose RW
+segment sits 0x370 into its page and asserts the bytes at their linked
+vaddr, the page's leading bytes zero, the BSS tail zero, the flags
+intact and the shared-page refusal — it **FAILs three ways against the
+old mapper and passes with the fix** (403 checks now). Guard clause
+**O8**, teeth **t53/t54**.
+
+The measurement — E3 boot, `e3_multi_env_boot_check.sh` RC=0:
+
+```
+[E7] linux: num=0000009E child=e7.linux.user.0 ok                arch_prctl (158)
+[E7] linux: num=000000DA child=e7.linux.user.0 ok                set_tid_address (218)
+[E7] linux: num=00000007 child=e7.linux.user.0 -> ENOSYS         munmap (7)
+[E7] linux: num=0000000E child=e7.linux.user.0 -> ENOSYS         rt_sigprocmask (14)
+[E7] linux: num=000000C8 child=e7.linux.user.0 -> ENOSYS         tkill (200)
+[E7] linux: num=0000000E child=e7.linux.user.0 -> ENOSYS         rt_sigprocmask (14)
+[E7] linux: num=0000000E child=e7.linux.user.0 -> ENOSYS         rt_sigprocmask (14)
+[PROC] PID 111 'e7.linux.user.0' exited (code=134).
+```
+
+Seven traps instead of two, no `rip=0x28`, and `main` is reached:
+the loader was the whole wall. The child is now inside the Rust
+runtime, asks for `munmap`/`rt_sigprocmask`/`tkill`, gets ENOSYS for
+each, and aborts.
+
+**What this run names next — two gaps, each by its own line.** (1)
+The death: `[FAULT] Ring-3 fault  cs=0x23  error=0x0
+rip=0x00000000080525b0`, and `0x80525b0` is `pxor %xmm0,%xmm0` —
+musl `abort`'s FIRST SSE instruction, after a `__lock` that is integer
+only. This is the general #UD/#GP/#SS/#NP handler's line, and `#UD`
+carries no error code. The tree writes **no `CR4.OSFXSR` anywhere**,
+and `arch/x86/lazy_fpu.c` ships with no IDT vector-7 gate and no
+`xsetbv` — `kernel/vecstore.c` says so in its own words. So **a ring-3
+task takes #UD on any SSE instruction**, which is every real libc and
+every Rust binary: a gate in front of the gate, since nothing in §5.6
+can be measured on a child that cannot execute SSE. (2) The three
+numbers refused above, each its own increment: `munmap`(7) — §5.4's
+second half and the anonymous-map question this section could not
+answer before, now answerable from the run's own line; and
+`rt_sigprocmask`(14)/`tkill`(200) — the signal seam, which §11 Q5's
+policy already covers (ENOSYS with a logged name) but which `abort()`
+needs before it can die cleanly instead of faulting.
 
 **Sequence.** 0: DONE — the attribution instrument and the `rip=0x28`
-diagnosis, measured (above). 1: the loader's `p_vaddr` alignment fix
-— the mapper copies a non-page-aligned LOAD's bytes into the right
-page offsets (and gains a host test over a non-aligned segment, beside
-O1/O2's family). 2: whatever the run past the loader then names —
-`mmap`/`munmap`). 2: the reply payload, host teeth first —
+diagnosis, measured (above). 1: DONE — the loader's `p_vaddr`
+alignment fix, host-tested (E8a) and guarded (O8, t53/t54), measured
+past `main` (above). 2: what the run past the loader named — the SSE
+gate first (no `CR4.OSFXSR`, so any ring-3 SSE instruction is #UD),
+then `munmap`(7), `rt_sigprocmask`(14) and `tkill`(200), each its own
+increment. 3: the reply payload, host teeth first —
 `linux_user_copy_in`, `linux_fd_reply_plan`, the three deliver shapes,
-the `service` bound. 3: the path plan, the VFS bridge, the thirteen
-arms. 4: the two format goldens. 5: the fixture probe on-target — a
+the `service` bound. 4: the path plan, the VFS bridge, the thirteen
+arms. 5: the two format goldens. 6: the fixture probe on-target — a
 `fixtures/` file-class sequence (mkdir, open, write, lseek, read-back,
 stat, getdents, rename, unlink, close) ending in a marker line in the
-E7MEM/E7FD family, beside the probe/candidate pair. 6: the real-flags
-run — the measurement. Guard clause set **P** with teeth **t53+** in
+E7MEM/E7FD family, beside the probe/candidate pair. 7: the real-flags
+run — the measurement. Guard clause set **P** with teeth **t55+** in
 `tests/linux_personality_check.sh`/`_smoke.sh`; the census guard
 re-verified — its 27 rows stay classified, because classes are
 dispatch and the reply-payload capability is the plan's own
@@ -1664,8 +1710,10 @@ Everything this document asserts about the tree, with its source:
 | Six argument registers not captured by the trap path | every forwarded syscall gets wrong arguments (§3.4) | E7, §3.4 |
 | No initial stack/auxv builder | static libc start-up fails before `main` (§5.2) | E7, §5.2 |
 | No `MSR_IA32_FS_BASE` handling | TLS setup fails; musl/glibc binaries die early (§5.3) | E7, §5.3 |
-| No `brk`/`mmap` → budget mapping (`brk` landed, increment 6, §10.11; `mmap`/`munmap` remain) | sub-allocating heaps and `munmap` still refuse (§5.4) | E7, §5.4 — increment 8's step 1 turned out to be the loader's alignment fix instead (§10.13's measured step-0 diagnosis), so anonymous maps are the increment after that |
-| `elf64_map_blob` assumes every PT_LOAD's `p_vaddr` is page-aligned | a libc-linked binary with a non-aligned RW LOAD reads every global in it 0x370 bytes off and dies at `rip=0x28` before `main` — measured, §10.13's step 0 | E7 — increment 8's step 1 |
+| No `brk`/`mmap` → budget mapping (`brk` landed, increment 6, §10.11; `mmap`/`munmap` remain) | sub-allocating heaps and `munmap` still refuse (§5.4) | E7, §5.4 — `munmap` now refused on the firstuser's OWN line (§10.13's step-1 run), so the anonymous-map increment is measurable rather than inferred |
+| `elf64_map_blob` assumes every PT_LOAD's `p_vaddr` is page-aligned | a libc-linked binary with a non-aligned RW LOAD reads every global in it 0x370 bytes off and dies at `rip=0x28` before `main` — measured, §10.13's step 0 | **LANDED** — increment 8's step 1: page-base anchor + lead-offset copy, host teeth E8a, guard clause O8 with teeth t53/t54, measured past `main` |
+| No `CR4.OSFXSR` written anywhere, no IDT vector-7 gate, no `xsetbv` | any ring-3 SSE instruction is #UD — every real libc and every Rust binary dies at its first vector op (measured: musl `abort`'s `pxor`, exit 134, §10.13's step-1 run) | the gate in front of §5.6 — increment 9, named by the step-1 run |
+| `rt_sigprocmask` (14) and `tkill` (200) refuse | `abort()` cannot finish dying cleanly and faults instead; the firstuser's run ends inside it (§10.13's step-1 run) | the signal seam — its own increment after the SSE gate; §11 Q5's logged-ENOSYS policy holds it visible meanwhile |
 | No `CAP_E*` → Linux errno table (and a `CAP_NONE` sentinel in returns) | silent wrong errors (§5.7) | E7, §5.7 |
 | Target designated, but no candidate binary and therefore no artifact | the table is still unmeasured; `--check` reports a named skip rather than a pass | write the crate, add the musl target, run `--run` |
 | No thread groups / `clone` / `futex` | Go and every threaded runtime are out (§7) | named as Go's gate; unscoped |

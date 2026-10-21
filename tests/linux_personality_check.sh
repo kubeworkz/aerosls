@@ -92,6 +92,7 @@ CAND=user/sidecar/src/e7_candidate.rs
 CBUILD=user/sidecar/fixtures/build_candidate.sh
 LFU=user/sidecar/src/e7_firstuser.rs
 MANR=user/proto/src/manifest.rs
+CCT=tests/cap_create_sidecar_host_test.c
 
 # ─── B. The sibling per-CPU block, at the offsets the asm addresses ────────
 # The struct side is pinned by static asserts (a C reorder is a BUILD
@@ -678,6 +679,27 @@ if grep -qF 'pub const TAG_ARGENV: u16 = 0x000E;' "$MANR" && \
     ok "O7. the Rust format reference carries the record with the kernel's bounds and emits it, the environment crosses from one shared default list, and all three Linux spawn sites author the record (firstuser, probe and candidate — the pair stays a pair)"
 else
     bad "O7. the record's Rust half or a spawn site is gone — the format reference would refuse its own record as unknown, the two halves of the wire format would drift apart silently, or a Linux child would cross with no record at all and be handed the empty environment while its sibling gets a real one"
+fi
+# O8 holds the mapper against the assumption that killed the first user
+# (§10.13's step-0 diagnosis, MEASURED): elf64_map_blob copied each LOAD
+# from segment offset 0 into a frame mapped at p_vaddr, so a segment
+# linking MID-PAGE landed every byte (p_vaddr & 0xFFF) early in vaddr
+# space — the firstuser's .init_array read back 0x28 instead of 0x800ae00,
+# __libc_start_init's `call *(%rbx)` jumped there, and the child died at
+# rip=0x28 before main while [LOADER] claimed the load succeeded. Every
+# committed image before it had page-aligned LOADs, which is why the
+# census could not see it. The cap host test's E8a section EXECUTES the
+# case (and the shared-page refusal) — the smoke's t53/t54 bite both.
+if grep -qF 'uint64_t page_base = s->p_vaddr & ~(uint64_t)4095u;' "$E64C" && \
+   grep -qF 'n_pages = (lead + s->p_memsz + 4095) / 4096;' "$E64C" && \
+   grep -qF 'e6_memcpy((uint8_t*)frame + frame_off,' "$E64C" && \
+   grep -qF 'if (a_lo < b_hi && b_lo < a_hi) {' "$E64C" && \
+   grep -qF 'share a page — one frame per page' "$E64C" && \
+   grep -qF 'E8a: the NON-ALIGNED segment' "$CCT" && \
+   grep -qF 'E8a: two LOADs sharing a page are REFUSED' "$CCT"; then
+    ok "O8. a PT_LOAD that starts MID-PAGE lands at its LINKED vaddr: the page base is the mapping anchor and the segment's lead is where its bytes start inside the frame (both zero for an aligned segment, so the images that already worked are unmoved), two LOADs sharing a page are refused by name before the first frame, and tests/cap_create_sidecar_host_test.c's E8a section executes the case — the measured killer of the first user"
+else
+    bad "O8. the mapper's page-alignment handling is gone — a segment linking mid-page lands (p_vaddr & 0xFFF) bytes early again, every global in it reads the file that much further on, and a libc-linked binary dies at rip=0x28 before main while [LOADER] reports a successful load; the shared-page refusal going with it would let a second segment silently discard the first's bytes and permissions through the one frame per page"
 fi
 
 echo

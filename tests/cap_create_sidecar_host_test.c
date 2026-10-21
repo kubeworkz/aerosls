@@ -131,6 +131,8 @@
                                 * and the LINUX_AT_* the stack image carries */
 #include "kernel/entropy.h"  /* E7 increment 7: ENTROPY_* for the AT_RANDOM
                                 * gate's link stub */
+#include "kernel/elf64_load.h"  /* increment 8 step 1: elf64_map_blob is driven
+                                 * directly by E8a's mid-page PT_LOAD case */
 #include "tests/process_host_stubs.h"   /* per_cpu_data (weak), etc. */
 
 #include <stdio.h>
@@ -505,6 +507,11 @@ static uint64_t le64(const uint8_t* p) {
     for (int i = 7; i >= 0; i--) v = (v << 8) | p[i];
     return v;
 }
+
+/* Little-endian writers, for the synthetic ELF E8a builds byte by byte. */
+static void w16(uint8_t* p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
+static void w32(uint8_t* p, uint32_t v) { for (int i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8 * i)); }
+static void w64(uint8_t* p, uint64_t v) { for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8 * i)); }
 
 static uint32_t slot_type(uint64_t w) {
     return (uint32_t)((w >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK);
@@ -3397,6 +3404,130 @@ int main(void) {
                   "E7c: AT_PHENT is 56");
             CHECK(want_phdr != 0 && aux_get(&si2, LINUX_AT_PHDR) == want_phdr,
                   "E7c: AT_PHDR is the candidate's program-header table, at its mapped vaddr");
+        }
+    }
+
+    /* ── 20b. E8a (increment 8, step 1): a NON-page-aligned PT_LOAD ──────
+     * The mapper's unstated assumption, measured on the real firstuser
+     * (§10.13's step-0 diagnosis): it copied each LOAD's bytes from segment
+     * offset 0 into a frame mapped at p_vaddr, so a segment linking 0x370
+     * into its page landed every byte 0x370 early in vaddr space —
+     * .init_array read back 0x28 instead of 0x800ae00, __libc_start_init's
+     * `call *(%rbx)` jumped to 0x28, and the child died at rip=0x28 before
+     * main. The committed candidate has only page-aligned LOADs (0x3ff000,
+     * 0x400000), which is why E7c above could not see it; the image below is
+     * the firstuser's shape in miniature: an aligned R-X segment holding the
+     * header table (the unchanged control), and an RW segment at 0x80001370
+     * — 0x370 into its page — with a BSS tail past filesz. */
+    {
+        static uint8_t img[8192];
+        static uint8_t want[0x400];
+        const uint64_t seg0_v  = 0x80000000ull;
+        const uint64_t seg1_v  = 0x80001370ull;   /* 0x370 into its page */
+        const uint64_t seg1_off = 0x400, seg1_fsz = 0x300, seg1_msz = 0x1234;
+        uint64_t pml4v, frames_before;
+        struct Elf64MapInfo mi;
+        int s1_ok = 1, gap_ok = 1, bss_ok = 1, flags_ok = 1;
+        size_t i;
+
+        memset(img, 0, sizeof img);
+        img[0] = 0x7F; img[1] = 'E'; img[2] = 'L'; img[3] = 'F';
+        img[4] = 2; img[5] = 1; img[6] = 1;          /* ELF64, LE, v1 */
+        w16(img + 0x10, 2);                          /* ET_EXEC */
+        w16(img + 0x12, 62);                         /* EM_X86_64 */
+        w32(img + 0x14, 1);
+        w64(img + 0x18, seg0_v + 0xB0);              /* e_entry */
+        w64(img + 0x20, 0x40);                       /* e_phoff */
+        w16(img + 0x34, 64);                         /* e_ehsize */
+        w16(img + 0x36, 56);                         /* e_phentsize */
+        w16(img + 0x38, 2);                          /* e_phnum */
+
+        /* LOAD 0: R-X, page-aligned, holds the header table — so AT_PHDR's
+         * anchor is exercised on the same pass. */
+        w32(img + 0x40 +  0, 1);                     /* PT_LOAD */
+        w32(img + 0x40 +  4, PF_R | PF_X);
+        w64(img + 0x40 +  8, 0);                     /* p_offset */
+        w64(img + 0x40 + 16, seg0_v);                /* p_vaddr */
+        w64(img + 0x40 + 24, seg0_v);
+        w64(img + 0x40 + 32, 0x400);                 /* p_filesz */
+        w64(img + 0x40 + 40, 0x400);                 /* p_memsz */
+        w64(img + 0x40 + 48, 0x1000);
+
+        /* LOAD 1: RW, MID-PAGE — the case this test exists for. */
+        w32(img + 0x78 +  0, 1);
+        w32(img + 0x78 +  4, PF_R | PF_W);
+        w64(img + 0x78 +  8, seg1_off);
+        w64(img + 0x78 + 16, seg1_v);
+        w64(img + 0x78 + 24, seg1_v);
+        w64(img + 0x78 + 32, seg1_fsz);
+        w64(img + 0x78 + 40, seg1_msz);
+        w64(img + 0x78 + 48, 0x1000);
+
+        /* Payloads in patterns no zero-fill and no shift can imitate. */
+        for (i = 0xB0; i < 0x400; i++) img[i] = (uint8_t)(0x11 + (i % 200));
+        for (i = 0; i < (size_t)seg1_fsz; i++) {
+            img[seg1_off + i] = (uint8_t)(0x51 + (i % 173));
+            want[i] = img[seg1_off + i];
+        }
+
+        pml4v = user_clone_page_table();
+        frames_before = (uint64_t)g_frame_count;
+        memset(&mi, 0, sizeof mi);
+        CHECK(pml4v != 0, "E8a: a fresh child PML4");
+        CHECK(elf64_map_blob(img, sizeof img, (uint64_t*)(uintptr_t)pml4v,
+                             0, &mi) == 1,
+              "E8a: the mapper loads an image whose RW segment is 0x370 into its page");
+        CHECK(mi.entry == seg0_v + 0xB0, "E8a: info->entry is e_entry");
+        CHECK(mi.phdr_vaddr == seg0_v + 0x40,
+              "E8a: AT_PHDR's anchor is the LOAD holding the table, at its linked vaddr");
+        CHECK(host_ptr(seg0_v) != 0 &&
+                  memcmp(host_ptr(seg0_v), img, 0xB0) == 0,
+              "E8a: the ALIGNED control segment lands unchanged — the fix must not move the images that already worked");
+        CHECK((uint64_t)g_frame_count - frames_before == 3,
+              "E8a: exactly 1 + 2 frames — the mid-page segment spans two pages, counted from its page base");
+
+        for (i = 0; i < (size_t)seg1_fsz; i++) {
+            const uint8_t* got = host_ptr(seg1_v + i);
+            if (!got || *got != want[i]) { s1_ok = 0; break; }
+        }
+        CHECK(s1_ok, "E8a: the NON-ALIGNED segment's bytes land at its linked p_vaddr — the 0x370 shift is gone");
+
+        for (uint64_t a = seg1_v - 0x300; a < seg1_v; a++) {
+            const uint8_t* got = host_ptr(a);
+            if (!got || *got != 0) { gap_ok = 0; break; }
+        }
+        CHECK(gap_ok, "E8a: the page's leading bytes BELOW the segment start are ZERO — not the segment's own bytes shifted down");
+
+        for (uint64_t a = seg1_v + seg1_fsz; a < seg1_v + seg1_msz; a++) {
+            const uint8_t* got = host_ptr(a);
+            if (!got || *got != 0) { bss_ok = 0; break; }
+        }
+        CHECK(bss_ok, "E8a: the BSS tail past filesz is zero-filled, across the page it spills into");
+
+        {
+            uint64_t p0 = leaf_pte(seg0_v), p1 = leaf_pte(seg1_v);
+            flags_ok = p0 && p1
+                    && !(p0 & USER_PTE_WRITE) && !(p0 & USER_PTE_NOEXEC)
+                    &&  (p1 & USER_PTE_WRITE) &&  (p1 & USER_PTE_NOEXEC);
+        }
+        CHECK(flags_ok, "E8a: each segment's PTE still carries its own PF_W/PF_X");
+
+        /* The hazard the alignment fix makes possible: two LOADs covering
+         * one page would be mapped twice, the second silently discarding
+         * the first's bytes and permissions. Refused by name, before the
+         * first frame. */
+        {
+            static uint8_t img2[8192];
+            struct Elf64MapInfo mi2;
+            uint64_t pml4b = user_clone_page_table();
+            memcpy(img2, img, sizeof img2);
+            w64(img2 + 0x78 + 16, seg0_v + 0xF00);   /* LOAD 0's own page */
+            w64(img2 + 0x78 + 24, seg0_v + 0xF00);
+            memset(&mi2, 0, sizeof mi2);
+            CHECK(pml4b != 0, "E8a: a second fresh PML4 for the refusal case");
+            CHECK(elf64_map_blob(img2, sizeof img2,
+                                 (uint64_t*)(uintptr_t)pml4b, 0, &mi2) == 0,
+                  "E8a: two LOADs sharing a page are REFUSED by name — one frame per page cannot hold both");
         }
     }
 
