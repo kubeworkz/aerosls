@@ -740,6 +740,48 @@ seed "$W/t99"
 sed -i '/p.refuse = -LINUX_EFAULT;/a\    p.refuse = -LINUX_ENOSYS;' "$W/t99/kernel/linux_abi.c"
 tooth retired-oldact-enosys-back R1 "the out-pointer ENOSYS the copy-IN retired reappears in the sig plan" "$W/t99"
 
+# t100: the six-register restore deleted — syscall_return_path hands
+# ring-3 kernel scratch in rdi/rsi/rdx/r10/r8/r9 on every syscall: the
+# 0x8054bdf wall (musl's `act` in r8 read at 0x88(r8)) back by name.
+seed "$W/t100"
+sed -i -E '/mov +(rdi|rsi|rdx|r10|r8|r9), +\[gs:0x(50|58|60|68|70|78)\]/d' "$W/t100/arch/x86/syscall.asm"
+tooth arg-regs-never-restored U "the return path gives back kernel scratch instead of the caller's registers" "$W/t100"
+
+# t101: the capture half deleted — park_ctx keeps the pushed set but
+# not the argument registers, so every resume restores words some later
+# trap on that core wrote.
+seed "$W/t101"
+sed -i '/movq %%gs:0x50, %%rax/d' "$W/t101/kernel/process.c"
+tooth park-loses-arg-regs U2 "proc_capture_entry_regs no longer snapshots the argument registers" "$W/t101"
+
+# t102: the resume re-stamp's load deleted — the resume never runs the
+# entry stub, so [gs:0x50..] still holds the LAST entry's values and
+# the sysret returns them (the store alone ships whatever rax held).
+seed "$W/t102"
+sed -i '/movq 72(%1), %%rax/d' "$W/t102/kernel/process.c"
+tooth resume-restamps-nothing U3 "a resume restores from a block nobody re-stamped" "$W/t102"
+
+# t103: the struct field dropped — the capture has nowhere to put the
+# registers and the resume's byte reads walk past the struct.
+seed "$W/t103"
+sed -i '/uint64_t linux_args\[6\];/d' "$W/t103/kernel/process.h"
+tooth parkctx-argfield-gone U4 "CapParkCtx no longer carries the argument registers" "$W/t103"
+
+# t104: the host-test pins deleted — the 72(%1)/112(%1) offsets the
+# resume asm indexes by would then be argued from greps alone.
+seed "$W/t104"
+sed -i '/offsetof(struct CapParkCtx, linux_args) == 72/d' "$W/t104/tests/cap_create_sidecar_host_test.c"
+sed -i '/sizeof(struct CapParkCtx) == 120/d' "$W/t104/tests/cap_create_sidecar_host_test.c"
+tooth parkctx-layout-unpinned U5 "nothing pins where the resume asm thinks the registers are" "$W/t104"
+
+# t105: the restore written through RAX — the one register the round
+# trip must not put back: ring-3 would read a capture word as the
+# syscall's result (and the word, not the errno, decides the caller's
+# branch).
+seed "$W/t105"
+sed -i '/mov  rsi, \[gs:0x58\]/a\    mov  rax, [gs:0x58]' "$W/t105/arch/x86/syscall.asm"
+tooth restore-clobbers-rax U1 "the return path overwrites the syscall result on its way back" "$W/t105"
+
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

@@ -3677,6 +3677,28 @@ int main(void) {
               "L4: no ARGENV refusal left a process behind");
     }
 
+    /* ── E7 increment 13: the preserved register set ──────────────────────
+     * cap_recv_resume()/cap_sysret_resume() re-stamp the per-CPU
+     * linux_args capture FROM CapParkCtx by byte offset — 72(%1) …
+     * 112(%1) — and syscall_return_path restores [gs:0x50..0x80) for the
+     * sysret. A reordered or regressed field is then a silent boot bug
+     * that sysrets someone else's registers (the0x8054bdf wall: musl's
+     * `act` pointer in r8 came back as kernel scratch and read
+     * 0x88(r8) = 0x90). Pinned HERE, the layout is a host test rather
+     * than a fault address. */
+    CHECK(offsetof(struct CapParkCtx, user_rsp) == 64,
+          "P1: park_ctx.user_rsp sits at 64 — p[8], the byte offset both "
+          "resume asms read the parked task's stack from");
+    CHECK(offsetof(struct CapParkCtx, linux_args) == 72,
+          "P1: park_ctx.linux_args sits at 72 — p[9], where the resume's "
+          "re-stamp reads the six preserved argument registers from");
+    CHECK(offsetof(struct CapParkCtx, linux_args) + 5 * 8 == 112,
+          "P1: the last preserved register (r9) lands at 112, exactly "
+          "where the re-stamp's 112(%1) and [gs:0x78] say it does");
+    CHECK(sizeof(struct CapParkCtx) == 120,
+          "P1: the ctx is 15x8 bytes — the eight pushed values, the user "
+          "RSP, and the six argument registers, nothing unaccounted");
+
     if (g_fail == 0) printf("\nALL PASS\n");
     else             printf("\n%d FAILURE(S)\n", g_fail);
     return g_fail != 0;

@@ -976,6 +976,73 @@ else
     bad "T6. the host test no longer drives the copy-IN — every boundary would be argued from these greps alone, reachable only at boot"
 fi
 
+# ─── U. The round trip preserves the caller-saved registers ─────────────────
+# The wall the firstuser's run died on once step 3 cleared the SIGPIPE
+# assert: musl's __libc_sigaction holds `act` in r8 across its unmask
+# rt_sigprocmask, the entry path destroys r8 by contract, and the resume
+# returned kernel scratch — Ring-3 #PF at rip=0x8054bdf (`mov 0x88(%r8),
+# %eax`), addr = r8+0x88 = 0x90/0x91 (two boots, two garbage r8s), exit
+# code 139. Linux changes only rax (result), rcx and r11 across a
+# syscall, so the SIX argument registers must survive the whole round
+# trip: captured at entry (clause C), snapshotted into park_ctx when the
+# task parks, re-stamped into the per-CPU block by BOTH resume paths,
+# and restored at syscall_return_path — four places, each one missing
+# store handing ring-3 kernel scratch on every syscall.
+restore_desc=""
+restore_ok=1
+for pair in "rdi 50" "rsi 58" "rdx 60" "r10 68" "r8 70" "r9 78"; do
+    set -- $pair
+    if ! grep -qE "mov +$1, +\\[gs:0x$2\\]" "$ASM"; then
+        restore_ok=0
+        restore_desc="$restore_desc [$1]=gs:0x$2"
+    fi
+done
+if [ "$restore_ok" -eq 1 ]; then
+    ok "U. syscall_return_path restores all six argument registers from this entry's capture ([gs:0x50..0x80)) — Linux's only-changed-registers rule, so a live value across a syscall survives to ring-3"
+else
+    bad "U. syscall_return_path is missing restore(s):$restore_desc — every syscall hands ring-3 kernel scratch in those registers (the 0x8054bdf wall, by name)"
+fi
+
+# The restore must not carry the return value away with it: RAX is the
+# syscall's answer, and a restore written through RAX would hand ring-3
+# the capture word instead of the result — the one register the round
+# trip must NOT put back.
+return_block="$(sed -n '/^syscall_return_path:/,/swapgs/p' "$ASM")"
+if printf '%s\n' "$return_block" | grep -qw 'rax'; then
+    bad "U1. the return path touches RAX between the pops and the swapgs — ring-3 would read a capture word as the syscall's return value"
+else
+    ok "U1. the return path never touches RAX — the syscall's result survives the restore"
+fi
+
+capfn="$(awk '/^static void proc_capture_entry_regs/{f=1} f{print} f&&/^}/{exit}' "$PDC")"
+if printf '%s\n' "$capfn" | grep -qF '%%gs:0x50' && \
+   printf '%s\n' "$capfn" | grep -qF 'ctx->linux_args[5]'; then
+    ok "U2. proc_capture_entry_regs snapshots the six argument registers into park_ctx beside the pushed set — a parked task's registers outlive the per-CPU block every later entry overwrites"
+else
+    bad "U2. the entry capture no longer reads [gs:0x50..0x80) into park_ctx — a parked task loses its argument registers to the next trap on that core, and every resume after it restores someone else's"
+fi
+
+u_loads="$(grep -cF 'movq 72(%1), %%rax' "$PDC")"
+u_stores="$(grep -cF 'movq %%rax, %%gs:0x50' "$PDC")"
+if [ "$u_loads" -ge 2 ] && [ "$u_stores" -ge 2 ]; then
+    ok "U3. BOTH resume paths re-stamp [gs:0x50..0x80) from park_ctx (load and store, two each) before the re-run and before the sysret — a resume returns the parked task's own registers, never the last entry's"
+else
+    bad "U3. only $u_loads load(s) / $u_stores store(s) of the linux_args re-stamp (need 2 each) — one resume path now hands its task whatever registers the previous syscall entry left on that core"
+fi
+
+if grep -qE 'uint64_t +linux_args\[6\];' "$PDH"; then
+    ok "U4. CapParkCtx carries linux_args[6] after user_rsp — the 72..112 byte window both resumes read and the host test pins"
+else
+    bad "U4. CapParkCtx has no linux_args[6] — the capture has nowhere to live and the resume's 72(%1) reads would walk off the struct"
+fi
+
+if grep -qF 'offsetof(struct CapParkCtx, linux_args) == 72' "$CCT" && \
+   grep -qF 'sizeof(struct CapParkCtx) == 120' "$CCT"; then
+    ok "U5. the host test pins the layout the resume asm indexes by byte — linux_args at 72 (p[9]), the full ctx 120 — so a reordered field is a red host test, not a boot that sysrets misaligned registers"
+else
+    bad "U5. the cap_create host test no longer pins CapParkCtx's layout — the resume asm's 72(%1)…112(%1) offsets would be argued from these greps alone"
+fi
+
 echo
 if [ "$fails" -eq 0 ]; then
     echo "linux_personality_check: all clauses hold"

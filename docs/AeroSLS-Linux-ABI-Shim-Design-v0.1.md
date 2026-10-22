@@ -156,7 +156,7 @@ Note what step 6 does to C1: **there is exactly one POSIX implementation, and th
 
 This is the part that a design pass is for, and it is easy to miss:
 
-- **Linux passes six argument registers** (`rdi, rsi, rdx, r10, r8, r9`); SLS passes one pointer. The stub's push list (`rbp, rbx, r12–r15, rcx, r11`) and the per-CPU block (`syscall_regs[8]`) **do not contain `rdi/rsi/rdx/r10/r8/r9`**, and the stub's own contract says the user program must treat them as clobbered. `struct PerCPUData` (`arch/x86/user_paging.h`) is `{ user_rsp, kernel_rsp, syscall_regs[8] }` — nothing else.
+- **Linux passes six argument registers** (`rdi, rsi, rdx, r10, r8, r9`); SLS passes one pointer. The stub's push list (`rbp, rbx, r12–r15, rcx, r11`) and the per-CPU block (`syscall_regs[8]`) **do not contain `rdi/rsi/rdx/r10/r8/r9`**, and the stub's own contract says the user program must treat them as clobbered. `struct PerCPUData` (`arch/x86/user_paging.h`) is `{ user_rsp, kernel_rsp, syscall_regs[8] }` — nothing else. *(Increment 13 closes this bullet's RETURN side: `syscall_return_path` now restores all six from the `linux_args` capture before `sysret`, so they survive the round trip as Linux promises — only the mid-syscall window, and the in-repo clobber lists that correctly describe it, remain. §10.13's register wall.)*
 - **Therefore the Linux path needs its own capture, and the existing offsets must stay frozen.** `syscall_regs[8]` at `[gs:0x10..0x48]` is read by the park/handoff/yield captures, and its comment records that a live failure came from reading that data late. The addition is a sibling block (`linux_args[6]`), written by step 2 above, before any call — not a widening of the existing block, and not a late read of the syscall stack.
 
 This is also the honest boundary of the "forwarding is nearly free" claim in §2.4: forwarding is free *once the arguments are captured*, and capturing them is a real, small, testable change to the trap path with an existing precedent for its failure mode.
@@ -909,7 +909,10 @@ the kernel's leftover scratch — fault addr 0x16, then 0x10: two boots,
 two garbage values), so the address now rides r15, park_ctx's preserved
 set; and the %fs operand is displacement 0, because linear = FS_BASE +
 disp — adding `_start` twice would ask for the non-canonical
-`0x8000_0000_0000` by construction.
+`0x8000_0000_0000` by construction. *(The first lesson got its
+kernel-level answer at increment 13 — §10.13's register wall: the
+round trip now preserves those registers, so the r15 workaround
+stopped being load-bearing. It stays, because it is still correct.)*
 
 **One build-system defect, fixed at the root this time.** The header
 edit repeated the `checkpoint_delta.h` incident from the Makefile's own
@@ -1971,10 +1974,12 @@ on a near-NULL field (`addr=0x91`) at `rip=0x8054bdf` — the same
 image whose entry the spawn logged (`0x800ab76`), so the rip is this
 child's own code — with attribution as a fault: `exited (code=139)`,
 not abort's tail. Which symbol holds that NULL+0x91 field, and which
-init step dereferences it, is the next increment's first diagnosis
-question (the run hands it the rip); what THIS increment owns is the
-seam behind it: 13/14 answer, payload crosses, refusals by name are
-nothing left in the run.
+init step dereferences it, was the next increment's first diagnosis
+question (the run hands it the rip) — ANSWERED at increment 13
+(below): `__libc_sigaction+0x8b`, reading `act->sa_flags` through
+`r8`, returned as kernel scratch by the round trip. What THIS
+increment owns is the seam behind it: 13/14 answer, payload crosses,
+refusals by name are nothing left in the run.
 
 **Suite for this increment.** `run_all` 127 passed / 0 failed / 2
 pre-existing skips; personality guard all **81** clauses hold; smoke
@@ -2009,6 +2014,144 @@ And the payload bound is exact — the deliver's clamp and service()'s
 `FD_PAYLOAD_CAP`'s widening (read's count) is step 4's decision to
 make with both recv buffers, never a quiet edit.
 
+**Step 4's first diagnosis question — ANSWERED, and the wall it named
+is down (increment 13): the round trip preserves the caller-saved
+registers.**
+
+The diagnosis, exactly as the run handed it over. `rip=0x8054bdf`
+resolves through the spawn's own entry (`0x800ab76` —
+`aerobackup.musl.elf`'s ELF entry point, matched to the digit) to
+`__libc_sigaction+0x8b` in the image, and the instruction there is
+`mov 0x88(%r8),%eax` — a field read through `%r8`. `%r8` was loaded
+from `%rsi` (the `act` pointer) at function entry (`0x8054b6e`) over a
+read that SUCCEEDED; the only event between that load and the fault
+is the unmask `rt_sigprocmask` at `0x8054bd3`. The fault address is
+`r8+0x88`: **0x90 on one boot, 0x91 on the next** — two boots, two
+ garbage `r8`s, the same lesson increment 4's fixture learned at
+`0x16`/`0x10` — and `rdi=0x131c15d8` at the fault, where two blocks
+earlier sat `mov $1,%edi`, proves the clobber is not one register but
+the whole caller-saved set: **nothing on the return path restores
+them**, so ring-3 comes back from every syscall holding whatever the
+kernel last left there.
+
+That is the stub's own documented contract ("Caller-saved regs … NOT
+preserved"), and for the kernel's SLS consumers it is legal — every
+in-repo inline asm lists them as clobbers, and `sls.h` says so. For a
+Linux binary it is a broken promise: `syscall` changes only rax
+(result), rcx and r11, and musl's inline asm declares exactly `rcx`
+and `r11`, so `__libc_sigaction` keeping `act` live in `%r8` across
+its unmask call is a CORRECT reading of the ABI this shim advertises.
+Increment 4 worked around it inside the FIXTURE (its address rides
+r15 now); the designated first user cannot be worked around — so the
+round trip is fixed, at the four places a register could leak:
+
+- **capture** (`kernel/process.c`): `proc_capture_entry_regs` now
+  snapshots `linux_args[6]` — the entry stub's `[gs:0x50..0x80)`
+  block — into `park_ctx` beside the pushed set. The fields live at
+  byte offsets **72..112** of `CapParkCtx` (`kernel/process.h`,
+  `p[9..14]`).
+- **both resumes re-stamp**: `cap_recv_resume` and
+  `cap_sysret_resume` write the six back into the per-CPU block from
+  `park_ctx` before the re-run and before the jump into the return
+  path — neither runs the entry stub, so without this the block holds
+  the LAST entry's values, possibly another task's on a shared core.
+  The same re-stamp fixes the latent half: the resume re-run's own
+  `proc_read_linux_args()` was reading that stale block.
+- **restore** (`arch/x86/syscall.asm`): `syscall_return_path` loads
+  all six from the block between the pops and the `swapgs` — and
+  never touches `rax`, the syscall's result (pinned both ways).
+- **layout pinned**: the cap_create host test asserts `user_rsp`@64,
+  `linux_args`@72, the last register @112 and the 120-byte total, so
+  the resume asm's `72(%1)…112(%1)` reads are a host test rather than
+  a fault address.
+
+One build lesson worth its own line: the first version gave the
+capture **15 `"=r"` outputs**, impossible at `-O0` where a fixed
+`rbp` leaves 14 registers — the -O2 kernel build was green while the
+three host tests that `#include process.c` went red with "operand has
+impossible constraints". The argument half now reads through one
+scratch register into memory outputs. The host suite caught its own
+first attempt, which is exactly what the suite is for.
+
+Teeth: guard clause set **U** (U, U1–U5), **81 → 87 clauses** — the
+six restores by register and offset, the return block's `rax`
+untouched, the capture's snapshot, the two-by-two re-stamp counts,
+the struct field, the host pins; smoke **85 → 91** (t100–t105:
+restore deleted, capture read deleted, re-stamp load deleted, struct
+field dropped, layout pins deleted, a restore written through `rax`);
+the cap_create host test **407 checks** (+4, the P1 layout pins);
+`stack_frame_budget_check` **234 files PASS**.
+
+The measurement — E3 harness RC=0 (`e3_multi_env_boot_check.sh`, both
+tenant environments, done-marker seen), the firstuser's run on the
+final binaries — every line after `rt_sigprocmask` is new ground past
+the old wall:
+
+```
+[E7] linux: num=0000009E child=e7.linux.user.0 ok                    arch_prctl (158)
+[E7] linux: num=000000DA child=e7.linux.user.0 ok                    set_tid_address (218)
+[E7] linux: num=00000007 child=e7.linux.user.0 ok                    poll (7)
+[E7] linux: num=0000000D child=e7.linux.user.0 ok + payload          rt_sigaction — signal(), oldact back
+[E7] linux: num=0000000D child=e7.linux.user.0 ok + payload          rt_sigaction — the second install
+[E7] linux: num=0000000E child=e7.linux.user.0 ok                    rt_sigprocmask
+[E7] linux: num=0000000D child=e7.linux.user.0 -> ENOSYS             a REAL handler install — refused by name (step 2's rule)
+[E7] linux: num=0000000D child=e7.linux.user.0 ok + payload          rt_sigaction
+[E7] linux: num=0000000D child=e7.linux.user.0 -> ENOSYS             refused by name
+[E7] linux: num=0000000C child=e7.linux.user.0 ok                    brk (12) — increment 6's heap arm  ×2
+[E7] linux mprotect prot=0x6 refused before post: write+execute is refused by the shim (§5.4)  ×2
+[E7] linux: num=00000009 child=e7.linux.user.0 -> ENOSYS             mmap (9) — §10.10's anonymous-map gap, by name  ×2
+[E7] linux: num=00000001 child=e7.linux.user.0 write ok              ×4
+[E7] linux: num=0000000E child=e7.linux.user.0 ok + payload          rt_sigprocmask carrying the mask as it WAS
+[E7] linux: num=000000C8 child=e7.linux.user.0 ok                    tkill (200) — the signal PENDS (clause R5)
+[E7] linux: num=0000000E child=e7.linux.user.0 sig default-action -> kill
+[PROC] PID 111 terminated.
+```
+
+**Zero `0x8054bdf`, zero `fatal runtime error`, zero oldact
+refusals, and no `[FAULT]` for this child at all** — the workload's
+death is a SIGNAL death, not a fault: a pended signal's default
+action fires at the unblock arm, inside the delivering syscall —
+exactly where R4/R5 converge ("where real Linux dies") — reaped as
+`terminated`, not `exited (code=139)`. Why the DEFAULT still applies
+is named by the two `-> ENOSYS` lines: the handler installs were
+refused by name (step 2's rule — no signal frames yet), so the
+disposition never moved. Two more walls are named in the same trace:
+`mmap`(9) refused by name twice (§10.10/§10.11's anonymous-map gap,
+now VISIBLE in the run rather than predicted from it), and the
+identity of the pended signal itself — `tkill`'s sig argument is not
+printed, so WHICH signal killed the workload (and which handler
+class would have caught it) is the next increment's first
+instrumentation question.
+
+**What this increment is NOT.** No signal frames: a user handler is
+still refused ENOSYS by name, and this increment changes no arm — it
+makes the registers SURVIVE, which is why the run can now reach its
+own handler code and be refused there honestly. The in-repo SLS asm
+clobber lists are untouched — they remain the correct declaration of
+the mid-syscall window. `rax`/`rcx`/`r11` are unchanged by design
+(the Linux rule itself). The `syscall_regs[8]` offsets stay frozen;
+the argument block is the sibling §3.4 always said it was. The park
+posture (one dead frame per park), the E3 gates and the frame budget
+are untouched.
+
+**Suite for this increment.** `run_all` 127 passed / 0 failed / 2
+pre-existing skips (the three tests that `#include process.c` back to
+green under the constraint fix); personality guard all **87 clauses**
+hold; smoke **91/91**; the cap_create host test **407 checks** (+4);
+`stack_frame_budget_check` 234 files PASS; `sidecar_stamp_check` PASS
+(archives repacked — `sls.h` is in the pack's source set);
+`script_conventions_check` 0 violations; `make selfhost-bootimage`
+and `make x86-iso-e3` RC=0; the E3 harness OK on the final binaries;
+and `tests/run_checks.sh` **45 PASS / 1 FAIL / 7 SKIP** — the one
+FAIL being the environmental `linux_abi_census_check` staleness that
+increments 11 and 12 both recorded (the census pins the Oct-17
+aerobackup artifact's sha256, that binary was rebuilt Oct 19, and the
+refresh needs `strace` this host does not have), the seven SKIPs the
+runtime cluster guards. Two earlier reds were this host's transient
+OOM under a build running alongside — the smoke's t16/t17 seed copies
+beside `make`, and those three `process.c` compiles beside parallel
+qemu+gcc — green on rerun with the machine's RAM to themselves.
+
 **Sequence.** 0: DONE — the attribution instrument and the `rip=0x28`
 diagnosis, measured (above). 1: DONE — the loader's `p_vaddr`
 alignment fix, host-tested (E8a) and guarded (O8, t53/t54), measured
@@ -2021,10 +2164,13 @@ now named by the run itself. 3: DONE — `linux_user_copy_in`,
 `linux_fd_reply_plan`, the three deliver shapes and the `service`
 bound landed and measured (above): the SIGPIPE assert is gone from
 the run, 13/14 answer with their payloads, and the NEW wall is a
-named rip (`0x8054bdf`, `addr=0x91`, `code=139`) whose diagnosis is
-step 4's first question. 4: the path plan, the VFS bridge, the thirteen
-arms — with the copy-IN machinery above already in place for `read`'s
-reply. 5: the two format goldens. 6: the fixture probe on-target — a
+named rip (`0x8054bdf`, `addr=0x91`, `code=139`) — DIAGNOSED AND DOWN
+at increment 13 (above): `__libc_sigaction`'s `act` in `r8` returned
+as kernel scratch, the round trip's register wall. 4: the path plan,
+the VFS bridge, the thirteen arms — with the copy-IN machinery above
+already in place for `read`'s reply, and the run's remaining named
+walls `mmap`(9) ENOSYS (§10.10) and the handler class (step 2's
+signal frames — the terminating signal's identity still unnamed). 5: the two format goldens. 6: the fixture probe on-target — a
 `fixtures/` file-class sequence (mkdir, open, write, lseek, read-back,
 stat, getdents, rename, unlink, close) ending in a marker line in the
 E7MEM/E7FD family, beside the probe/candidate pair. 7: the real-flags

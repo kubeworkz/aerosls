@@ -96,19 +96,36 @@ static inline const char* proc_priority_name(ProcPriority p) {
                                       //  unusable from ring-3 until this grew)
 
 // User register state captured when a blocking cap_recv parks a process
-// mid-syscall — exactly the eight values syscall_entry_stub pushed on entry
-// (r11 = user RFLAGS, rcx = user RIP, then the six callee-saved regs) plus
-// the user RSP that lives in per_cpu_data[0].user_rsp at park time.
-// cap_recv_resume() pushes these back onto a fresh syscall stack so the
-// stub's .syscall_return path can pop them and sysret with the user's
-// registers intact. Field order is load-bearing (process.c's resume asm
-// indexes it as [0..8]).
+// mid-syscall — the eight values syscall_entry_stub pushed on entry
+// (r11 = user RFLAGS, rcx = user RIP, then the six callee-saved regs),
+// the user RSP that lives in per_cpu_data[0].user_rsp at park time, and
+// (E7 increment 13) the six Linux argument registers the stub captured
+// at [gs:0x50..0x80).
+// cap_recv_resume() pushes the first nine back onto a fresh syscall
+// stack so the stub's syscall_return_path can pop them, re-stamps the
+// linux_args half into the per-CPU capture block, and the return path
+// restores those so sysret lands with the user's registers intact —
+// ALL of them: Linux changes only rax (result), rcx and r11 across a
+// syscall, and a real musl binary holds live values across one
+// (__libc_sigaction keeps `act` in r8 through its unmask syscall — the
+// 0x8054bdf fault wall when it came back as kernel scratch).
+// Field order is load-bearing (process.c's resume asm indexes it as
+// [0..8] for the pushed set and [9..14] for the argument half).
 struct CapParkCtx {
     uint64_t r11;                 /* user RFLAGS (sysret needs R11)  */
     uint64_t rcx;                 /* user RIP (sysret target)        */
     uint64_t r15, r14, r13, r12;  /* user callee-saved               */
     uint64_t rbx, rbp;
     uint64_t user_rsp;            /* [gs:0] at park time             */
+    /* E7 increment 13: Linux's syscall argument order — rdi, rsi, rdx,
+     * r10, r8, r9 — as syscall_entry_stub captured them. Both resume
+     * paths re-write [gs:0x50..0x80) from this before the re-run and
+     * before jumping into syscall_return_path (neither runs the entry
+     * stub, so without the re-stamp that block holds the LAST entry's
+     * values — possibly another process's). Offsets 72..112 are pinned
+     * by the resume asm's 72(%1)…112(%1) reads and the cap_create host
+     * test's offsetof checks. */
+    uint64_t linux_args[6];
 };
 
 struct ProcessDescriptor {
@@ -237,7 +254,9 @@ struct ProcessDescriptor {
     // re-runs the recv — the old kernel call chain on the syscall stack is
     // abandoned, never unwound (one dead frame per park; bounded, Phase-1
     // posture). Layout order is load-bearing: [r11, rcx, r15..rbp] match
-    // syscall_entry_stub's push order exactly.
+    // syscall_entry_stub's push order exactly, and linux_args[6] mirrors
+    // its [gs:0x50..0x80) capture (E7 increment 13 — the register round
+    // trip both resume paths re-stamp before the sysret).
     struct CapParkCtx park_ctx;
     uint64_t   park_req;              // the request pointer the resume re-runs
                                        // (SLSCapRecvRequest for a recv park,

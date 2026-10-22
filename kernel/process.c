@@ -1681,7 +1681,14 @@ static void kernel_switch_next(struct ProcessDescriptor* next) {
  * current process, so it always describes the CURRENT syscall. The
  * resume rebuild (cap_recv_resume / cap_sysret_resume) pushes these in
  * exactly the order syscall_entry_stub pushed the originals, so
- * .syscall_return's pops still land rcx=user RIP, r11=user RFLAGS. */
+ * .syscall_return's pops still land rcx=user RIP, r11=user RFLAGS.
+ * It ALSO snapshots the six Linux argument registers (linux_args,
+ * [gs:0x50..0x80)) — E7 increment 13's addition: the round trip must
+ * preserve them (Linux changes only rax/rcx/r11 across a syscall; musl
+ * holds `act` in r8 across its unmask syscall — the 0x8054bdf fault),
+ * and both resume paths re-stamp the per-CPU block from this field
+ * because they reach syscall_return_path WITHOUT running the entry
+ * stub, whose stores are the only other writer of that block. */
 static void proc_capture_entry_regs(struct CapParkCtx* ctx) {
     __asm__ volatile(
         "movq %%gs:0x10, %0\n\t"
@@ -1693,10 +1700,30 @@ static void proc_capture_entry_regs(struct CapParkCtx* ctx) {
         "movq %%gs:0x40, %6\n\t"
         "movq %%gs:0x48, %7\n\t"
         "movq %%gs:0, %8\n\t"
+        /* The argument half: read through ONE scratch register (rax),
+         * stored to memory outputs — 15 register outputs here would be
+         * impossible constraints at -O0 (a fixed rbp leaves 14 for 15),
+         * which is exactly how the three host tests that #include
+         * process.c caught the first attempt. */
+        "movq %%gs:0x50, %%rax\n\t"
+        "movq %%rax, %9\n\t"
+        "movq %%gs:0x58, %%rax\n\t"
+        "movq %%rax, %10\n\t"
+        "movq %%gs:0x60, %%rax\n\t"
+        "movq %%rax, %11\n\t"
+        "movq %%gs:0x68, %%rax\n\t"
+        "movq %%rax, %12\n\t"
+        "movq %%gs:0x70, %%rax\n\t"
+        "movq %%rax, %13\n\t"
+        "movq %%gs:0x78, %%rax\n\t"
+        "movq %%rax, %14\n\t"
         : "=r"(ctx->r11), "=r"(ctx->rcx), "=r"(ctx->r15), "=r"(ctx->r14),
           "=r"(ctx->r13), "=r"(ctx->r12), "=r"(ctx->rbx), "=r"(ctx->rbp),
-          "=r"(ctx->user_rsp)
-        : : "memory");
+          "=r"(ctx->user_rsp), "=m"(ctx->linux_args[0]),
+          "=m"(ctx->linux_args[1]), "=m"(ctx->linux_args[2]),
+          "=m"(ctx->linux_args[3]), "=m"(ctx->linux_args[4]),
+          "=m"(ctx->linux_args[5])
+        : : "rax", "memory");
 }
 
 /* Shared park capture: snapshot the current process's syscall-entry
@@ -2021,6 +2048,23 @@ void cap_sysret_resume(struct ProcessDescriptor* pd) {
         "pushq 16(%1)\n\t"   /* r15 */
         "pushq 8(%1)\n\t"    /* rcx — user RIP (sysret target) */
         "pushq 0(%1)\n\t"    /* r11 — user RFLAGS */
+        /* E7 increment 13: re-stamp the six Linux argument registers
+         * ([gs:0x50..0x80)) from park_ctx — syscall_return_path
+         * restores them for the sysret, and this path (like
+         * cap_recv_resume) never runs the entry stub, so the block
+         * still holds whatever the last syscall entry wrote. */
+        "movq 72(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x50\n\t"   /* rdi */
+        "movq 80(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x58\n\t"   /* rsi */
+        "movq 88(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x60\n\t"   /* rdx */
+        "movq 96(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x68\n\t"   /* r10 */
+        "movq 104(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x70\n\t"   /* r8 */
+        "movq 112(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x78\n\t"   /* r9 */
         "xor %%eax, %%eax\n\t"   /* syscall result: 0 = success */
         "jmp syscall_return_path\n\t"
         :
@@ -2134,6 +2178,28 @@ void cap_recv_resume(struct ProcessDescriptor* pd) {
         "movq %%rax, %%gs:0x40\n\t"   /* rbx */
         "movq 56(%1), %%rax\n\t"
         "movq %%rax, %%gs:0x48\n\t"   /* rbp */
+        /* E7 increment 13: re-stamp the six Linux argument registers
+         * ([gs:0x50..0x80)) from park_ctx too — the re-run's
+         * proc_read_linux_args AND syscall_return_path's restore both
+         * read that block, and the resume path does NOT go through the
+         * entry stub, so it still holds whatever the LAST syscall entry
+         * (possibly another process's) wrote. Without this the resumed
+         * task sysrets someone else's argument registers — the
+         * 0x8054bdf wall (musl's act pointer in r8 returned as kernel
+         * scratch) on one side and a stale-args re-forward on the
+         * other. */
+        "movq 72(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x50\n\t"   /* rdi */
+        "movq 80(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x58\n\t"   /* rsi */
+        "movq 88(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x60\n\t"   /* rdx */
+        "movq 96(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x68\n\t"   /* r10 */
+        "movq 104(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x70\n\t"   /* r8 */
+        "movq 112(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x78\n\t"   /* r9 */
         "mov %2, %%rsi\n\t"  /* arg = parked request (recv or chan wait) */
         "mov %3, %%edi\n\t"  /* num = pd->park_syscall (recv or chan wait) */
         "call do_syscall\n\t"
