@@ -63,9 +63,19 @@
 //!     (Answer::ReplyBytes), the kernel copies it into the span its own
 //!     first trap validated, and service() bounds the bytes against the
 //!     forwarded out-pointer before anything is sent;
+//!   - `mmap` (9, the mem class's anonymous-map half — E7 increment 16,
+//!     §5.4): the ledger's cursor decides the address for an anonymous
+//!     private map inside the budget span (or the caller's own FIXED
+//!     address echoes back when it is inside the span), PROT_NONE maps
+//!     no frames, W|X is EPERM and every un-served shape is refused by
+//!     name with the request's words on the line — the kernel's
+//!     first-trap ladder repeated as this side's twin, and the kernel's
+//!     verdict re-checks every grant against its own span and its own
+//!     cursors, so neither end is load-bearing alone;
 //!   - everything else — `open`/`close`/`lseek` and the rest of the fd
-//!     class (Phase 2 §3-§4), `mmap`/`munmap` (§5.4's sub-allocation
-//!     half, the increment after 6), any mprotect whose prot is not
+//!     class (Phase 2 §3-§4), `munmap` (frames return through the
+//!     partition at the task's teardown; unmapping through the channel
+//!     is its own seam), any mprotect whose prot is not
 //!     W|X (real permission changes are not landed), `clock_gettime`
 //!     (needs the clock plus
 //!     a child-buffer write) and any number outside the census —
@@ -121,6 +131,10 @@ const E_REVOKED: i32 = 2;     /* CAP_ERR_REVOKED -> -EIO (§5.7): the console
 const E_PERM: i32 = -12;      /* CAP_EPERM -> -EPERM (§5.7): §5.4's W|X
                                 * refusal — pinned at cap.h's -12 so the
                                 * map delivers 1, never an invented number */
+const E_NOMEM: i32 = -7;      /* CAP_ENOMEM -> -ENOMEM (§5.7): the mem
+                                * class's budget shape (increment 16) — a
+                                * FIXED ask outside the span, or a cursor
+                                * that cannot fit the request */
 const STATUS_OK: i32 = 0;      /* CAP_ERR_OK: the reply carries a real `ret` */
 
 /// E7 increment 10 (the signal seam, §10.13's step 2): CAP_ERR_TARGET
@@ -137,11 +151,11 @@ const E_TARGET: i32 = 7; /* CAP_ERR_TARGET -> -ESRCH (§5.7) */
 const LINUX_RT_SIGACTION: u64 = 13;
 const LINUX_RT_SIGPROCMASK: u64 = 14;
 const LINUX_TKILL: u64 = 200;
-/// mmap(9) — never armed (§10.10's named anonymous-map gap): it answers
-/// ENOSYS through the catch-all arm, and since the SIGABRT reading its
-/// refusals sit in front of, its LOG line carries the request's own
-/// numbers (len/prot/flags) so "the allocator asked for X and was
-/// refused" is read off the line.
+/// mmap(9) — armed since E7 increment 16 (§5.4's anonymous-map half):
+/// the 9 arm below answers the measured allocator's shapes from the
+/// ledger, and every refusal's LOG line carries the request's own
+/// numbers (addr/len/prot/flags) so "the allocator asked for X and this
+/// shim answered Y" is read off the line, never reconstructed.
 const LINUX_MMAP: u64 = 9;
 const SIGACT_BYTES: usize = 32; /* kernel-ABI struct sigaction: four u64s */
 const SIGSET_BYTES: u64 = 8;    /* the sigset this seam crosses            */
@@ -245,16 +259,22 @@ enum Answer {
 }
 
 /// One Linux task's §5.4 heap ledger: the budget span the create stamped
-/// (the kernel's ProcessDescriptor carries the same three numbers as its
+/// (the kernel's ProcessDescriptor carries the same four numbers as its
 /// own mechanism-side copy — kernel/cap.c derives them from the manifest
-/// this side authored; guard clause N2 pins both halves) and the bump
-/// pointer this side moves. Pure over a LOCAL copy — `service` writes
-/// `cur` back after the answer, like the fd table's reads — so the arm
-/// below is assertable without a table or a task.
+/// this side authored; guard clause N2 pins both halves) and the two
+/// cursors this side moves: brk's bump pointer `cur` growing up from the
+/// base, and `mtop` — the anonymous-map cursor (increment 16) — born at
+/// the limit and descending by every granted non-FIXED mmap, so brk's
+/// ceiling is min(limit, mtop) here and at the kernel's verdict: a page
+/// one side granted is a page the other may never map over. Pure over a
+/// LOCAL copy — `service` writes `cur` and `mtop` back after the answer,
+/// like the fd table's reads — so the arm below is assertable without a
+/// table or a task.
 struct MemBrk {
     base: u64,
     limit: u64,
     cur: u64,
+    mtop: u64,
 }
 
 /// One Linux task's signal STATE (E7 increment 10, §10.13's step 2) — the
@@ -446,11 +466,81 @@ fn answer(
          * still refuses a value it cannot map. */
         12 => {
             let want = args[0];
-            if want > brk.cur && want <= brk.limit {
+            /* The ceiling is the span's limit CAPPED by the anonymous-map
+             * cursor (increment 16): an arena a granted mmap backed is a
+             * page this growth may never map over — a re-map would leak
+             * the frame and zero the arena's bytes. The kernel's brk
+             * verdict caps by its OWN linux_mmap_top, and each side's
+             * cap is what makes the other's grant safe (guard V5). */
+            if want > brk.cur && want <= brk.mtop {
                 brk.cur = want;
                 Answer::Reply(want, STATUS_OK)
             } else {
                 Answer::Reply(brk.cur, STATUS_OK)
+            }
+        }
+        /* mmap (9, LSC_MEM — E7 increment 16, §5.4's anonymous-map half):
+         * the ledger's POLICY half decides, the kernel's verdict
+         * re-checks every grant against its own stamped span and its own
+         * two cursors at the reply (neither end load-bearing). The
+         * word-shape ladder is the kernel's first-trap refusal repeated
+         * as this side's own twin (guard clause V pins both): W|X is
+         * EPERM (mprotect's §5.4 rule over a prot word), PROT_EXEC alone
+         * and un-served shapes are ENOSYS by name, a malformed word is
+         * EINVAL, a FIXED address outside the span is ENOMEM — the
+         * budget shape §5.4 names. A pass either echoes the caller's own
+         * FIXED address (inside the span — last map wins, as Linux
+         * itself resolves it; the cursor does not move) or takes a page
+         * from the cursor descending from the span's top: strictly above
+         * the break, at or below the cursor, which then descends past
+         * it so no later grant re-hands this range. PROT_NONE backs no
+         * frames at the reply (a reservation whose every access faults)
+         * but consumes the same span. MAP_NORESERVE and MAP_STACK are
+         * accepted and ignored — documented no-op hints on x86-64, so
+         * ignoring them IS Linux's behavior, not a shortcut. */
+        9 => {
+            const PROT_WRITE: u64 = 0x2;
+            const PROT_EXEC: u64 = 0x4;
+            const PROT_MASK: u64 = 0x7;
+            const MAP_PRIVATE: u64 = 0x02;
+            const MAP_FIXED: u64 = 0x10;
+            const MAP_ANONYMOUS: u64 = 0x20;
+            /* The closed allowlist: PRIVATE|FIXED|ANON plus the two
+             * hints. SHARED (0x1) and every unknown bit are simply NOT
+             * in it — refused by name, the flags on the log line. */
+            const MAP_ALLOW: u64 = MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS
+                                 | 0x1000  /* MAP_NORESERVE: hint, ignored */
+                                 | 0x20000; /* MAP_STACK:    hint, ignored */
+            let (addr, len, prot, flags) =
+                (args[0], args[1], args[2], args[3]);
+            let len_r = match len.checked_add(0xFFF) {
+                Some(v) if len != 0 => v & !0xFFFu64,
+                _ => return Answer::Reply(0, E_INVAL),
+            };
+            if prot & !PROT_MASK != 0 {
+                Answer::Reply(0, E_INVAL)
+            } else if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 {
+                Answer::Reply(0, E_PERM)
+            } else if prot & PROT_EXEC != 0 || flags & MAP_ANONYMOUS == 0
+                   || flags & MAP_PRIVATE == 0 || flags & !MAP_ALLOW != 0 {
+                Answer::Reply(0, E_NOSYS)
+            } else if flags & MAP_FIXED != 0 {
+                if addr & 0xFFF != 0 {
+                    Answer::Reply(0, E_INVAL)
+                } else if addr < brk.base || addr > brk.limit
+                       || len_r > brk.limit - addr {
+                    Answer::Reply(0, E_NOMEM)
+                } else {
+                    Answer::Reply(addr, STATUS_OK)
+                }
+            } else {
+                match brk.mtop.checked_sub(len_r) {
+                    Some(top) if top >= brk.cur => {
+                        brk.mtop = top;
+                        Answer::Reply(top, STATUS_OK)
+                    }
+                    _ => Answer::Reply(0, E_NOMEM),
+                }
             }
         }
         /* mprotect (10, LSC_MEM — §5.4's W^X): only the refusal exists
@@ -459,9 +549,10 @@ fn answer(
          * kernel refuses it first-trap, before any post; both ends
          * exist so neither alone is the load-bearing refusal — guard
          * clause N3 pins both). Any other prot is ENOSYS with the
-         * number logged: real permission changes, mmap and munmap are
-         * the mem class's next increment, and a fake grant here would
-         * be a page the kernel never mapped. */
+         * number logged: real permission changes are not landed, and
+         * munmap's channel-side seam is its own increment (frames
+         * return through the partition at the task's teardown) — a
+         * fake grant here would be a page the kernel never mapped. */
         10 => {
             if args[2] & 0x2 != 0 && args[2] & 0x4 != 0 {
                 Answer::Reply(0, E_PERM)
@@ -736,6 +827,9 @@ struct LinuxTask {
     brk_cur: u64,   /* into its own descriptor, and the bump pointer     */
                     /* this side moves (the kernel's brk_cur is the      */
                     /* mechanism's twin — the probe proves they agree)   */
+    brk_mtop: u64,  /* increment 16: the anonymous-map cursor — born at  */
+                    /* the limit, descending by every granted non-FIXED  */
+                    /* mmap (the kernel's linux_mmap_top is its twin)    */
     sig: SigState,  /* increment 10: the signal seam's per-task state —  */
                     /* dispositions, mask, pending, and the tid tkill    */
                     /* matches (recorded from this task's OWN 218 echo)  */
@@ -756,6 +850,7 @@ fn tasks() -> &'static mut [LinuxTask; MAX_LINUX_TASKS] {
         brk_base: 0,
         brk_limit: 0,
         brk_cur: 0,
+        brk_mtop: 0,
         sig: SigState::new(),
     }; MAX_LINUX_TASKS];
     unsafe { &mut TABLE }
@@ -796,6 +891,11 @@ pub fn track(
         t.brk_base = heap_base;
         t.brk_limit = heap_limit;
         t.brk_cur = heap_base;
+        /* The anonymous-map cursor is born at the span's top (increment
+         * 16): brk grows up from the base, a granted mmap descends from
+         * the limit, and the two can never meet — the kernel stamps
+         * linux_mmap_top from the same manifest record. */
+        t.brk_mtop = heap_limit;
         /* The signal state is born with the task, like the fd table and
          * the ledger below: a reused registry slot must not inherit its
          * predecessor's dispositions, mask, pending bits or TID — an
@@ -914,6 +1014,24 @@ fn dec_into(buf: &mut [u8], off: usize, v: u64) -> usize {
         off += 1;
     }
     off
+}
+
+/// Append `v` as 16 lowercase hex digits at `off`; returns the new
+/// offset. Fixed width, no alloc, no fmt (the target build has neither)
+/// — the mmap grant's answer line (increment 16) carries an ADDRESS,
+/// which is unreadable in decimal on a serial log, and 16 digits covers
+/// every canonical x86-64 user address without a length probe. Clamped
+/// like dec_into, so a caller composes a line without measuring first.
+fn hex_into(buf: &mut [u8], off: usize, v: u64) -> usize {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut o = off;
+    let mut i = 0;
+    while i < 16 && o < buf.len() {
+        buf[o] = DIGITS[((v >> ((15 - i) * 4)) & 0xF) as usize];
+        o += 1;
+        i += 1;
+    }
+    o
 }
 
 /// Append `src` at `off`; returns the new offset (clamped to the buffer).
@@ -1052,6 +1170,7 @@ pub fn service<K: Kernel>(k: &K, console: &CharNode) {
             base: tasks()[i].brk_base,
             limit: tasks()[i].brk_limit,
             cur: tasks()[i].brk_cur,
+            mtop: tasks()[i].brk_mtop,
         };
         let mut sigstate = tasks()[i].sig; /* Copy — the seam's ledger, */
                                            /* written back like brk's   */
@@ -1060,9 +1179,12 @@ pub fn service<K: Kernel>(k: &K, console: &CharNode) {
         /* The ledger survives the reply: only a granted growth moves it
          * (the arm's own rule), and the KERNEL's brk_cur is its own
          * twin — the probe's denial-echo check is what proves the two
-         * never drift. The base and limit are never written here: they
-         * are the span, decided once, at spawn. */
+         * never drift. The same holds for mtop (increment 16): only the
+         * mmap arm descends it, and linux_mmap_top is its twin. The
+         * base and limit are never written here: they are the span,
+         * decided once, at spawn. */
         tasks()[i].brk_cur = mem.cur;
+        tasks()[i].brk_mtop = mem.mtop;
         /* E7 increment 10: the signal state survives the reply the same
          * way — tid, mask, pending and dispositions are each written only
          * by the arm that owns them, and a refusal arm mutated nothing
@@ -1093,6 +1215,38 @@ pub fn service<K: Kernel>(k: &K, console: &CharNode) {
                     } else {
                         enosys_log(num as u32, &name_buf[..nlen], b" -> ENOSYS\n");
                     }
+                } else if num == LINUX_MMAP && status != STATUS_OK {
+                    /* The errno family of mmap refusals (increment 16):
+                     * EPERM / EINVAL / ENOMEM rides with the same request
+                     * words the ENOSYS line carries — WHICH shape the
+                     * ladder or the ledger refused is read off the line.
+                     * (A FIXED ask outside the span never reaches this
+                     * line: the kernel's first trap refused it with the
+                     * address on ITS line, before any post.) */
+                    let mut ex = [0u8; 56];
+                    let mut off = push_bytes(&mut ex, 0, b" -> ");
+                    off = push_bytes(&mut ex, off,
+                        if status == E_PERM   { b"EPERM mmap(len=" }
+                        else if status == E_INVAL { b"EINVAL mmap(len=" }
+                        else                  { b"ENOMEM mmap(len=" });
+                    off = dec_into(&mut ex, off, args[1]);
+                    off = push_bytes(&mut ex, off, b", prot=");
+                    off = dec_into(&mut ex, off, args[2]);
+                    off = push_bytes(&mut ex, off, b", flags=");
+                    off = dec_into(&mut ex, off, args[3]);
+                    off = push_bytes(&mut ex, off, b")");
+                    enosys_log(num as u32, &name_buf[..nlen], &ex[..off]);
+                } else if num == LINUX_MMAP {
+                    /* A GRANTED map shows the address the ledger gave
+                     * (increment 16) — in hex, because an address is
+                     * unreadable in decimal on a serial log, and this
+                     * line is the run's proof that the allocator's arena
+                     * landed inside its span. */
+                    let mut ex = [0u8; 40];
+                    let mut off = push_bytes(&mut ex, 0, b" ok mmap -> 0x");
+                    off = hex_into(&mut ex, off, ret);
+                    off = push_bytes(&mut ex, off, b"\n");
+                    enosys_log(num as u32, &name_buf[..nlen], &ex[..off]);
                 } else if num == LINUX_TKILL {
                     /* tkill's SIG rides its line (increment 14): WHICH
                      * signal was asked for is the fact the pending →
@@ -1261,7 +1415,15 @@ mod tests {
         [FdSlot { used: false, kind: 0 }; LINUX_MAX_FDS]
     }
     fn ledger() -> MemBrk {
-        MemBrk { base: 0, limit: 0, cur: 0 }
+        MemBrk { base: 0, limit: 0, cur: 0, mtop: 0 }
+    }
+    /* The fixture span the mem-class tests share: 64 KiB exactly as the
+     * probe's manifest stamps it (increment 16's ledger tests). */
+    const SPAN_BASE: u64 = 0x807d000;
+    const SPAN_LIMIT: u64 = SPAN_BASE + 0x10000;
+    fn span() -> MemBrk {
+        MemBrk { base: SPAN_BASE, limit: SPAN_LIMIT,
+                 cur: SPAN_BASE, mtop: SPAN_LIMIT }
     }
     /* The fixture tid: what the candidate's set_tid_address answer echoes
      * (the address of __thread_list_lock, 0x807c398 in the committed
@@ -1616,5 +1778,193 @@ mod tests {
                        &fds(), &mut ledger(), &mut fresh(), &[]);
         assert!(matches!(a, Answer::Reply(0, STATUS_OK)),
                 "int width: {:?}", a);
+    }
+
+    #[test]
+    fn mmap_grants_anonymous_private_arenas_from_the_cursor() {
+        /* The firstuser's arena shape, measured: mmap(NULL, 4096, RW,
+         * ANON|PRIVATE). The cursor hands out the span's TOP page and
+         * descends past it; brk's break is untouched. */
+        let mut b = span();
+        let a = answer(9, &[0, 0x1000, 3, 0x22, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        match a {
+            Answer::Reply(ret, STATUS_OK) =>
+                assert_eq!(ret, SPAN_LIMIT - 0x1000,
+                           "the arena lands at the span's top"),
+            other => panic!("arena: {:?}", other),
+        }
+        assert_eq!(b.mtop, SPAN_LIMIT - 0x1000,
+                   "the cursor descends past the grant");
+        assert_eq!(b.cur, SPAN_BASE, "brk's break is untouched");
+        /* A second arena: the next page down, never re-handed */
+        let a = answer(9, &[0, 0x1000, 3, 0x22, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        match a {
+            Answer::Reply(ret, STATUS_OK) =>
+                assert_eq!(ret, SPAN_LIMIT - 0x2000),
+            other => panic!("arena 2: {:?}", other),
+        }
+        assert_eq!(b.mtop, SPAN_LIMIT - 0x2000);
+        /* PROT_NONE (the guard shape) backs no frames but consumes the
+         * same span: the cursor descends, the answer is the page. */
+        let a = answer(9, &[0, 0x1000, 0, 0x22, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        match a {
+            Answer::Reply(ret, STATUS_OK) =>
+                assert_eq!(ret, SPAN_LIMIT - 0x3000,
+                           "a PROT_NONE reservation consumes the span"),
+            other => panic!("guard: {:?}", other),
+        }
+        assert_eq!(b.mtop, SPAN_LIMIT - 0x3000);
+        /* MAP_STACK and MAP_NORESERVE are accepted and ignored — the
+         * documented no-op hints on x86-64 (Linux's own behavior). */
+        let a = answer(9, &[0, 0x1000, 3, 0x20022, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(_, STATUS_OK)),
+                "STACK hint: {:?}", a);
+        let a = answer(9, &[0, 0x1000, 3, 0x1022, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(_, STATUS_OK)),
+                "NORESERVE hint: {:?}", a);
+    }
+
+    #[test]
+    fn mmap_fixed_echoes_the_address_inside_the_span_and_moves_no_cursor() {
+        /* The firstuser's guard page, measured: FIXED|ANON|PRIVATE at
+         * the heap base — the echo is the whole answer, and the cursor
+         * does not move (last map wins, as Linux itself resolves it). */
+        let mut b = span();
+        let a = answer(9, &[SPAN_BASE, 0x1000, 0, 0x32, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        match a {
+            Answer::Reply(ret, STATUS_OK) =>
+                assert_eq!(ret, SPAN_BASE, "FIXED echoes the ask exactly"),
+            other => panic!("fixed guard: {:?}", other),
+        }
+        assert_eq!(b.mtop, SPAN_LIMIT, "a FIXED grant moves no cursor");
+        assert_eq!(b.cur, SPAN_BASE, "nor the break");
+        /* inside the span but NOT at its base: still an echo */
+        let a = answer(9, &[SPAN_BASE + 0x4000, 0x1000, 3, 0x32, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(r, STATUS_OK)
+                         if r == SPAN_BASE + 0x4000),
+                "fixed mid-span: {:?}", a);
+    }
+
+    #[test]
+    fn mmap_refuses_the_word_shapes_by_name_at_this_end_too() {
+        /* The kernel first-trap ladder's TWIN (guard V6): each shape
+         * below was refused by the kernel before any post — this arm
+         * answers the same way so neither end is load-bearing alone. */
+        let mut b = span();
+        /* W|X: EPERM — mprotect's §5.4 rule over a prot word */
+        let a = answer(9, &[0, 0x1000, 6, 0x22, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(0, E_PERM)), "wx: {:?}", a);
+        /* PROT_EXEC alone: ENOSYS by name (no executable anonymous map) */
+        let a = answer(9, &[0, 0x1000, 5, 0x22, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(0, E_NOSYS)), "exec: {:?}", a);
+        /* an unknown prot bit: EINVAL */
+        let a = answer(9, &[0, 0x1000, 8, 0x22, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(0, E_INVAL)), "prot: {:?}", a);
+        /* zero length: EINVAL (Linux's own number) */
+        let a = answer(9, &[0, 0, 3, 0x22, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(0, E_INVAL)), "len0: {:?}", a);
+        /* a length that overflows the page-round: EINVAL — the twin
+         * answers the same rather than trusting the kernel's ladder */
+        let a = answer(9, &[0, u64::MAX, 3, 0x22, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(0, E_INVAL)), "overflow: {:?}", a);
+        /* file-backed (no ANONYMOUS), shared, and unknown flag bits:
+         * ENOSYS by name — the flags ride the log line */
+        let a = answer(9, &[0, 0x1000, 3, 0x02, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(0, E_NOSYS)), "file: {:?}", a);
+        let a = answer(9, &[0, 0x1000, 3, 0x23, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(0, E_NOSYS)), "shared: {:?}", a);
+        let a = answer(9, &[0, 0x1000, 3, 0x62, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(0, E_NOSYS)), "unknown: {:?}", a);
+        /* a FIXED ask outside the span — below the base, past the
+         * limit, straddling it — is ENOMEM: the budget shape */
+        let a = answer(9, &[SPAN_BASE - 0x1000, 0x1000, 0, 0x32, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(0, E_NOMEM)), "below: {:?}", a);
+        let a = answer(9, &[SPAN_LIMIT, 0x1000, 0, 0x32, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(0, E_NOMEM)), "past: {:?}", a);
+        let a = answer(9, &[SPAN_LIMIT - 0x1000, 0x2000, 3, 0x32, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(0, E_NOMEM)), "straddle: {:?}", a);
+        /* a FIXED ask that is not page-aligned: EINVAL */
+        let a = answer(9, &[SPAN_BASE + 1, 0x1000, 0, 0x32, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(0, E_INVAL)), "align: {:?}", a);
+    }
+
+    #[test]
+    fn mmap_cannot_land_under_the_break_and_brk_cannot_map_an_arena() {
+        /* The two cursors, both ends (increment 16): a brk growth to
+         * the span's limit is legal while the cursor is at the limit… */
+        let mut b = span();
+        let a = answer(12, &[SPAN_LIMIT, 0, 0, 0, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(r, STATUS_OK)
+                         if r == SPAN_LIMIT), "brk to limit: {:?}", a);
+        assert_eq!(b.cur, SPAN_LIMIT);
+        /* …and refused (the denial echo, the unchanged break) once an
+         * arena owns the top page — a re-map would leak the frame and
+         * zero the arena's bytes. The kernel's verdict caps by its OWN
+         * linux_mmap_top for the same reason. */
+        let mut b = span();
+        let a = answer(9, &[0, 0x1000, 3, 0x22, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(_, STATUS_OK)), "arena: {:?}", a);
+        let a = answer(12, &[SPAN_LIMIT, 0, 0, 0, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(r, STATUS_OK)
+                         if r == SPAN_BASE),
+                "brk past the cursor answers the denial echo: {:?}", a);
+        assert_eq!(b.cur, SPAN_BASE, "the break did not move");
+        /* brk to exactly the cursor is still legal (the span is
+         * inclusive; the arena's first page is at the cursor) */
+        let a = answer(12, &[SPAN_LIMIT - 0x1000, 0, 0, 0, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(r, STATUS_OK)
+                         if r == SPAN_LIMIT - 0x1000),
+                "brk to the cursor: {:?}", a);
+        /* and a non-FIXED mmap may not land under the break: the gap
+         * between the break and the cursor is one page, the ask is
+         * two — ENOMEM, and the refusal moves nothing. */
+        let mut b = span();
+        b.cur = SPAN_LIMIT - 0x1000;  /* one page of gap left */
+        let a = answer(9, &[0, 0x2000, 3, 0x22, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(0, E_NOMEM)),
+                "an arena larger than the gap: {:?}", a);
+        assert_eq!(b.mtop, SPAN_LIMIT, "a refusal moves nothing");
+        /* the same one-page gap fits a one-page ask — the last page
+         * is the arena's, exactly at the break's ceiling */
+        let a = answer(9, &[0, 0x1000, 3, 0x22, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(r, STATUS_OK)
+                         if r == SPAN_LIMIT - 0x1000),
+                "the last page is the arena's: {:?}", a);
+    }
+
+    #[test]
+    fn hex_into_writes_fixed_width_lowercase() {
+        let mut buf = [0u8; 20];
+        let n = hex_into(&mut buf, 0, 0x807f000);
+        assert_eq!(&buf[..n], b"000000000807f000",
+                   "16 digits, zero-padded, lowercase");
+        let mut buf = [0u8; 4];
+        let n = hex_into(&mut buf, 0, 0xdeadbeefcafe);
+        assert_eq!(n, 4, "clamped to the buffer like dec_into");
     }
 }

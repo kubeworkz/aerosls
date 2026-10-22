@@ -484,7 +484,7 @@ int main(void)
 
         /* the denial echo: over-budget and shrink asks both arrive as
          * rax == the current break (Linux's brk failure shape) */
-        v = linux_mem_brk_verdict(BASE, LIMIT, BASE + 0x2000,
+        v = linux_mem_brk_verdict(BASE, LIMIT, LIMIT, BASE + 0x2000,
                                   BASE + 0x20000, BASE + 0x2000);
         CHECK(v.malformed == 0 && v.map_pages == 0 &&
                   v.map_va == 0 && v.new_cur == BASE + 0x2000,
@@ -493,7 +493,7 @@ int main(void)
               "      over-budget ask's honest answer");
 
         /* a no-op ask: brk(cur) is granted as itself, mapping nothing */
-        v = linux_mem_brk_verdict(BASE, LIMIT, BASE + 0x2000,
+        v = linux_mem_brk_verdict(BASE, LIMIT, LIMIT, BASE + 0x2000,
                                   BASE + 0x2000, BASE + 0x2000);
         CHECK(v.malformed == 0 && v.map_pages == 0 &&
                   v.new_cur == BASE + 0x2000,
@@ -502,7 +502,7 @@ int main(void)
 
         /* the grant: two pages, from align_up(cur) — the base is
          * page-aligned, so the range starts exactly at it */
-        v = linux_mem_brk_verdict(BASE, LIMIT, BASE, BASE + 0x2000,
+        v = linux_mem_brk_verdict(BASE, LIMIT, LIMIT, BASE, BASE + 0x2000,
                                   BASE + 0x2000);
         CHECK(v.malformed == 0 && v.map_va == BASE &&
                   v.map_pages == 2 && v.new_cur == BASE + 0x2000,
@@ -510,14 +510,14 @@ int main(void)
               "      and new breaks — two for a 2-page ask");
 
         /* a grant to exactly the limit is legal (the span is inclusive) */
-        v = linux_mem_brk_verdict(BASE, LIMIT, BASE, LIMIT, LIMIT);
+        v = linux_mem_brk_verdict(BASE, LIMIT, LIMIT, BASE, LIMIT, LIMIT);
         CHECK(v.malformed == 0 && v.map_va == BASE &&
                   v.map_pages == 0x10000 / 4096 && v.new_cur == LIMIT,
               "a grant to exactly the span's limit is inside the span — "
               "      the whole budget is the task's to take");
 
         /* an UNALIGNED grant maps ceil(new) pages — and only those */
-        v = linux_mem_brk_verdict(BASE, LIMIT, BASE,
+        v = linux_mem_brk_verdict(BASE, LIMIT, LIMIT, BASE,
                                   BASE + 0x1001, BASE + 0x1001);
         CHECK(v.malformed == 0 && v.map_va == BASE &&
                   v.map_pages == 2 && v.new_cur == BASE + 0x1001,
@@ -528,7 +528,7 @@ int main(void)
         /* an unaligned current break: the page CONTAINING cur is already
          * mapped, so the next grant starts at align_up(cur) — a re-map
          * would leak the frame underneath and zero the bytes on it */
-        v = linux_mem_brk_verdict(BASE, LIMIT, BASE + 0x1500,
+        v = linux_mem_brk_verdict(BASE, LIMIT, LIMIT, BASE + 0x1500,
                                   BASE + 0x2500, BASE + 0x2500);
         CHECK(v.malformed == 0 && v.map_va == BASE + 0x2000 &&
                   v.map_pages == 1 && v.new_cur == BASE + 0x2500,
@@ -538,7 +538,7 @@ int main(void)
 
         /* a grant whose reply escaped the span: the kernel's own bound,
          * whatever the policy side believed */
-        v = linux_mem_brk_verdict(BASE, LIMIT, BASE,
+        v = linux_mem_brk_verdict(BASE, LIMIT, LIMIT, BASE,
                                   LIMIT + 8, LIMIT + 8);
         CHECK(v.malformed == 1 && v.map_pages == 0 &&
                   v.new_cur == BASE,
@@ -547,7 +547,7 @@ int main(void)
 
         /* a "granted" shrink: rax echoes a request below the current
          * break — v1 grows only, and nothing may ever unmap */
-        v = linux_mem_brk_verdict(BASE, LIMIT, BASE + 0x2000,
+        v = linux_mem_brk_verdict(BASE, LIMIT, LIMIT, BASE + 0x2000,
                                   BASE + 0x1000, BASE + 0x1000);
         CHECK(v.malformed == 1 && v.map_pages == 0 &&
                   v.new_cur == BASE + 0x2000,
@@ -555,7 +555,7 @@ int main(void)
               "      backward and no page is ever unmapped by a grant");
 
         /* a reply that is neither the grant's echo nor the refusal's */
-        v = linux_mem_brk_verdict(BASE, LIMIT, BASE + 0x2000,
+        v = linux_mem_brk_verdict(BASE, LIMIT, LIMIT, BASE + 0x2000,
                                   BASE + 0x3000, BASE + 0x9000);
         CHECK(v.malformed == 1 && v.map_pages == 0 &&
                   v.new_cur == BASE + 0x2000,
@@ -564,11 +564,218 @@ int main(void)
               "      stays, the caller logs it");
 
         /* a grant below the span's base (a bogus low request) */
-        v = linux_mem_brk_verdict(BASE, LIMIT, BASE, BASE - 0x1000,
+        v = linux_mem_brk_verdict(BASE, LIMIT, LIMIT, BASE, BASE - 0x1000,
                                   BASE - 0x1000);
         CHECK(v.malformed == 1 && v.map_pages == 0,
               "a grant below the stamped base is malformed — the span "
               "      bounds the break from BOTH ends");
+
+        /* E7 increment 16: the ceiling is the span's limit CAPPED by
+         * the anonymous-map cursor — an arena a granted mmap backed is
+         * a page a brk growth may never map over (a re-map leaks the
+         * frame and zeros live bytes). The sidecar's ledger answers
+         * the DENIAL ECHO (rax == the current break) for such an ask:
+         * not malformed, nothing moves. A reply that granted it
+         * ANYWAY is a lie the verdict refuses. */
+        v = linux_mem_brk_verdict(BASE, LIMIT, LIMIT - 0x1000,
+                                  BASE, LIMIT, BASE);
+        CHECK(v.malformed == 0 && v.map_pages == 0 &&
+                  v.new_cur == BASE,
+              "a brk growth past the mmap cursor answers the denial "
+              "      echo — the arena's page is not brk's to map");
+        v = linux_mem_brk_verdict(BASE, LIMIT, LIMIT - 0x1000,
+                                  BASE, LIMIT, LIMIT);
+        CHECK(v.malformed == 1 && v.map_pages == 0 &&
+                  v.new_cur == BASE,
+              "a reply that granted a brk growth past the mmap cursor "
+              "      anyway is malformed — the capped span is the "
+              "      kernel's truth, not the grant's");
+        v = linux_mem_brk_verdict(BASE, LIMIT, LIMIT - 0x1000,
+                                  BASE, LIMIT - 0x1000, LIMIT - 0x1000);
+        CHECK(v.malformed == 0 && v.map_va == BASE &&
+                  v.map_pages == (0x10000 - 0x1000) / 4096 &&
+                  v.new_cur == LIMIT - 0x1000,
+              "a brk growth to exactly the mmap cursor is inside the "
+              "      capped span — the arena's first page is the "
+              "      cursor, and brk may reach it");
+        /* a zero cursor (a task stamped without one) leaves the span's
+         * own limit standing: the cap is min(), never a surprise 0 */
+        v = linux_mem_brk_verdict(BASE, LIMIT, 0, BASE, LIMIT, LIMIT);
+        CHECK(v.malformed == 0 && v.new_cur == LIMIT,
+              "mmap_top == 0 (no cursor stamped) leaves the span's own "
+              "      limit as brk's ceiling");
+    }
+
+    /* ─── the mmap seam (E7 increment 16, §5.4): first-trap ladder ─── */
+    {   struct LinuxMmapReq req;
+        const uint64_t BASE  = 0x0000400000100000ULL;
+        const uint64_t LIMIT = BASE + 0x10000;
+
+        /* the measured allocator's guard page: PROT_NONE at the span's
+         * base, FIXED|ANON|PRIVATE — refused by nothing */
+        req.addr = BASE; req.len = 4096; req.prot = 0;
+        req.flags = LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED;
+        CHECK(linux_mem_mmap_refusal(&req, BASE, LIMIT) == 0,
+              "the guard shape (PROT_NONE FIXED at the base) passes the "
+              "      first trap — it is the request this increment exists "
+              "      to serve");
+        /* the RW arena: NULL, RW, ANON|PRIVATE — refused by nothing */
+        req.addr = 0; req.prot = LINUX_PROT_READ | LINUX_PROT_WRITE;
+        req.flags = LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS;
+        CHECK(linux_mem_mmap_refusal(&req, BASE, LIMIT) == 0,
+              "the arena shape (RW anonymous private) passes the first "
+              "      trap");
+        /* the hints are accepted and ignored (documented no-ops) */
+        req.flags = LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_STACK;
+        CHECK(linux_mem_mmap_refusal(&req, BASE, LIMIT) == 0,
+              "MAP_STACK — a documented no-op hint on x86-64 — passes: "
+              "      ignoring it IS Linux's behavior, not a shortcut");
+        req.flags = LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_NORESERVE;
+        CHECK(linux_mem_mmap_refusal(&req, BASE, LIMIT) == 0,
+              "MAP_NORESERVE passes for the same reason");
+        /* W|X: EPERM — mprotect's §5.4 rule over a prot word */
+        req.prot = LINUX_PROT_WRITE | LINUX_PROT_EXEC;
+        CHECK(linux_mem_mmap_refusal(&req, BASE, LIMIT) == -LINUX_EPERM,
+              "W|X is refused EPERM at the first trap — mprotect's own "
+              "      §5.4 rule over a prot word, twin at both ends");
+        /* PROT_EXEC alone: ENOSYS by name */
+        req.prot = LINUX_PROT_EXEC;
+        CHECK(linux_mem_mmap_refusal(&req, BASE, LIMIT) == -LINUX_ENOSYS,
+              "executable anonymous memory is refused ENOSYS by name — "
+              "      its own increment, never a fake grant");
+        /* an unknown prot bit */
+        req.prot = 0x8;
+        CHECK(linux_mem_mmap_refusal(&req, BASE, LIMIT) == -LINUX_EINVAL,
+              "an unknown prot bit is EINVAL");
+        /* zero length */
+        req.prot = LINUX_PROT_READ; req.len = 0;
+        CHECK(linux_mem_mmap_refusal(&req, BASE, LIMIT) == -LINUX_EINVAL,
+              "a zero length is EINVAL — Linux's own number");
+        /* file-backed, shared, unknown flag bits: ENOSYS by name */
+        req.len = 4096; req.flags = LINUX_MAP_PRIVATE;
+        CHECK(linux_mem_mmap_refusal(&req, BASE, LIMIT) == -LINUX_ENOSYS,
+              "a file-backed map (no ANONYMOUS) is refused ENOSYS by "
+              "      name — the file class's own half of the path plan");
+        req.flags = LINUX_MAP_ANONYMOUS | LINUX_MAP_SHARED;
+        CHECK(linux_mem_mmap_refusal(&req, BASE, LIMIT) == -LINUX_ENOSYS,
+              "a shared map is refused ENOSYS by name");
+        req.flags = LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | 0x40;
+        CHECK(linux_mem_mmap_refusal(&req, BASE, LIMIT) == -LINUX_ENOSYS,
+              "an unknown flag bit is refused ENOSYS by name — the "
+              "      allowlist is closed");
+        /* FIXED: alignment, then the span bound */
+        req.addr = BASE + 1;
+        req.flags = LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED;
+        CHECK(linux_mem_mmap_refusal(&req, BASE, LIMIT) == -LINUX_EINVAL,
+              "a MAP_FIXED address that is not page-aligned is EINVAL");
+        req.addr = BASE - 0x1000;
+        CHECK(linux_mem_mmap_refusal(&req, BASE, LIMIT) == -LINUX_ENOMEM,
+              "a MAP_FIXED address below the stamped span is ENOMEM — "
+              "      the budget shape §5.4 names");
+        req.addr = LIMIT;
+        CHECK(linux_mem_mmap_refusal(&req, BASE, LIMIT) == -LINUX_ENOMEM,
+              "a MAP_FIXED range that starts at the limit is ENOMEM");
+        req.addr = LIMIT - 0x1000;
+        CHECK(linux_mem_mmap_refusal(&req, BASE, LIMIT) == 0,
+              "a MAP_FIXED page exactly at the span's top is inside the "
+              "      span — the whole budget is the task's to take");
+    }
+
+    /* ─── the mmap verdict: the re-check at the reply ─────────────── */
+    {   const uint64_t BASE  = 0x0000400000100000ULL;
+        const uint64_t LIMIT = BASE + 0x10000;
+        struct LinuxMmapReq req;
+        struct LinuxMemMmapVerdict v;
+
+        /* the refusal reply: not malformed, nothing maps — its errno
+         * rides the §5.7 map as usual */
+        req.addr = 0; req.len = 4096;
+        req.prot = LINUX_PROT_READ | LINUX_PROT_WRITE;
+        req.flags = LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS;
+        v = linux_mem_mmap_verdict(BASE, LIMIT, BASE, LIMIT, &req,
+                                   (uint64_t)(int64_t)(-LINUX_ENOSYS));
+        CHECK(v.malformed == 0 && v.range_pages == 0 && v.map_pages == 0 &&
+                  v.new_mmap_top == LIMIT,
+              "a refusal reply maps nothing and is not malformed — the "
+              "      errno rides the map, the cursor stands");
+
+        /* the granted arena: the cursor's pick, in range — one page
+         * backed, the cursor descends past it */
+        v = linux_mem_mmap_verdict(BASE, LIMIT, BASE, LIMIT, &req,
+                                   LIMIT - 0x1000);
+        CHECK(v.malformed == 0 && v.replace == 0 &&
+                  v.map_va == LIMIT - 0x1000 &&
+                  v.range_pages == 1 && v.map_pages == 1 &&
+                  v.prot_write == 1 &&
+                  v.new_mmap_top == LIMIT - 0x1000,
+              "a granted arena maps exactly the pages the cursor gave "
+              "      and descends the kernel's own cursor beside it");
+
+        /* PROT_NONE: the reservation maps no frames */
+        req.prot = LINUX_PROT_NONE;
+        v = linux_mem_mmap_verdict(BASE, LIMIT, BASE, LIMIT - 0x1000,
+                                   &req, LIMIT - 0x2000);
+        CHECK(v.malformed == 0 && v.range_pages == 1 && v.map_pages == 0 &&
+                  v.prot_write == 0,
+              "a PROT_NONE grant backs no frames — a reservation whose "
+              "      every access faults is its whole contract");
+        req.prot = LINUX_PROT_READ | LINUX_PROT_WRITE;
+
+        /* the forged grants: each is a lie the kernel must refuse */
+        v = linux_mem_mmap_verdict(BASE, LIMIT, BASE, LIMIT, &req, 0);
+        CHECK(v.malformed == 1 && v.range_pages == 0,
+              "a grant of address 0 is malformed — Linux never hands it");
+        v = linux_mem_mmap_verdict(BASE, LIMIT, BASE, LIMIT, &req,
+                                   LIMIT - 0x800);   /* unaligned */
+        CHECK(v.malformed == 1 && v.range_pages == 0,
+              "a non-FIXED grant that is not page-aligned is malformed");
+        v = linux_mem_mmap_verdict(BASE, LIMIT, LIMIT - 0x1000,
+                                   LIMIT, &req, LIMIT - 0x2000);
+        CHECK(v.malformed == 1 && v.range_pages == 0,
+              "a non-FIXED grant BELOW the break is malformed — it "
+              "      would land under brk's own pages");
+        v = linux_mem_mmap_verdict(BASE, LIMIT, BASE, LIMIT - 0x1000,
+                                   &req, LIMIT - 0x1000);
+        CHECK(v.malformed == 1 && v.range_pages == 0,
+              "a non-FIXED grant AT the cursor (not below it) is "
+              "      malformed — the cursor is where the NEXT grant "
+              "      starts, never inside a handed-out range");
+
+        /* FIXED: the echo rule on an address, and the span re-checked
+         * against the kernel's OWN stamp */
+        req.addr = BASE; req.len = 4096; req.prot = LINUX_PROT_NONE;
+        req.flags = LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED;
+        v = linux_mem_mmap_verdict(BASE, LIMIT, BASE + 0x2000, LIMIT,
+                                   &req, BASE);
+        CHECK(v.malformed == 0 && v.replace == 1 &&
+                  v.map_va == BASE && v.range_pages == 1 &&
+                  v.map_pages == 0 && v.new_mmap_top == LIMIT,
+              "the guard echo: FIXED PROT_NONE at the brk heap's base "
+              "      replaces one page, backs none, moves no cursor — "
+              "      the measured allocator's guard, as Linux maps it");
+        v = linux_mem_mmap_verdict(BASE, LIMIT, BASE, LIMIT, &req,
+                                   BASE + 0x1000);   /* wrong echo */
+        CHECK(v.malformed == 1 && v.range_pages == 0 && v.replace == 0,
+              "a FIXED grant that echoes a different address is "
+              "      malformed — the one-truth rule over an address");
+        req.addr = LIMIT + 0x1000;
+        v = linux_mem_mmap_verdict(BASE, LIMIT, BASE, LIMIT, &req,
+                                   LIMIT + 0x1000);
+        CHECK(v.malformed == 1 && v.range_pages == 0,
+              "a FIXED grant outside the kernel's OWN span is "
+              "      malformed, whatever the policy side believed");
+
+        /* the verdict is total: the refusal ladder re-runs over the
+         * staged words, so a shape the first trap would have refused
+         * maps nothing here either */
+        req.addr = 0; req.len = 4096;
+        req.prot = LINUX_PROT_WRITE | LINUX_PROT_EXEC;
+        req.flags = LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS;
+        v = linux_mem_mmap_verdict(BASE, LIMIT, BASE, LIMIT, &req,
+                                   LIMIT - 0x1000);
+        CHECK(v.malformed == 1 && v.range_pages == 0,
+              "a W|X request reaching the verdict maps nothing — the "
+              "      ladder is re-run, the verdict is total on any input");
     }
 
     /* ─── the frame reader: the unwind's read-back ────────────────────── */

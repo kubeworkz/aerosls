@@ -50,13 +50,33 @@
  *       grant echo), 396 (a fresh heap page was not zero), 397 (the
  *       budget refusal moved the break anyway), 398 (W|X was not
  *       refused) — all asserted ABSENT, the 391/392 discipline.
+ *   9 (mmap, the mem class) — E7 increment 16's anonymous-map half
+ *       (§5.4): mmap(NULL, 4096, RW, ANON|PRIVATE) must come back
+ *       page-aligned, nonzero and INSIDE the span (the ledger's cursor
+ *       hands out the span's top page); that page must READ ZERO and
+ *       carry "E7MEM-MMAP-OK\n" out through write(1, page, 14) — the
+ *       bytes crossing FROM THE MAPPED PAGE, the brk twin; the guard
+ *       mmap(base, 4096, PROT_NONE, FIXED|ANON|PRIVATE) must echo the
+ *       base EXACTLY (Linux MAP_FIXED replaces the brk heap's first
+ *       page — never touched again below); mmap(W|X) must be exactly
+ *       -EPERM (the §5.4 twin); and a 1 MiB arena — 16x the span —
+ *       must be exactly -ENOMEM (the budget shape; unlike brk, mmap's
+ *       failure shape IS an errno). Each wrong outcome issues its own
+ *       MARKER — 399 (the arena grant lied: errno, alignment or
+ *       span), 400 (a fresh arena page was not zero), 401 (the FIXED
+ *       guard did not echo the base), 402 (mmap's W|X was not refused),
+ *       403 (the over-budget arena was not -ENOMEM) — asserted ABSENT,
+ *       the 391/392 discipline.
  *   231 (exit_group) — the sidecar reaps; no reply is owed and this task
  *       never runs again (the hang below is unreachable by design).
  *
  * Registers: immediates only, and the preserved values live in r12–r15 —
  * callee-saved, pushed by the entry stub and restored by the park/resume
  * (park_ctx) — because the kernel's SLS ABI does NOT promise the argument
- * registers survive a syscall return.
+ * registers survive a syscall return. The mmap block's FLAGS argument
+ * rides %r10, never %rcx: SYSCALL itself clobbers rcx (the psABI's fourth
+ * syscall argument register is r10) — measured: flags in rcx arrive as 0
+ * and the arena request is refused by name.
  */
     .text
     .globl _start
@@ -221,8 +241,121 @@ _start:
     mov     $10, %eax
     syscall
     cmp     $-1, %rax
-    je      .Lmem_done
+    je      .Lmmap               /* the W|X twin passed: the map block  */
     mov     $398, %eax           /* MARKER: W|X was not refused as -EPERM */
+    syscall
+    jmp     .Lmem_done
+
+    /* 5h. mmap(NULL, 0x1000, PROT_READ|PROT_WRITE, ANON|PRIVATE) — the
+     *    measured allocator's arena shape (increment 16). The answer
+     *    must be page-aligned, nonzero, and INSIDE the span: below
+     *    base+64 KiB, where the ledger's descending cursor hands out
+     *    the span's TOP page. fd/offset ride -1/0 as the census
+     *    measured them (ignored for ANONYMOUS). */
+.Lmmap:
+    xor     %rdi, %rdi          /* addr = NULL                        */
+    mov     $0x1000, %esi       /* len                                */
+    mov     $3, %edx            /* PROT_READ|PROT_WRITE               */
+    mov     $0x22, %r10         /* flags — R10, not RCX: syscall      */
+                                /* itself clobbers rcx (the psABI's    */
+                                /* fourth argument register for a      */
+                                /* syscall is r10 — measured: rcx lost */
+                                /* the flags and the request refused)  */
+    mov     $-1, %r8            /* fd  = -1 (ignored)                 */
+    xor     %r9, %r9            /* off = 0                            */
+    mov     $9, %eax
+    syscall
+    test    %rax, %rax
+    jle     .Lmmap_bad          /* a negative errno, or zero: no arena */
+    test    $0xfff, %rax
+    jnz     .Lmmap_bad          /* the arena must be page-aligned     */
+    lea     0x10000(%r12), %rcx /* the span's limit                   */
+    cmp     %rcx, %rax
+    jae     .Lmmap_bad          /* outside the span: the ledger lied  */
+    mov     %rax, %r14          /* r14 = the granted arena            */
+    /* 5i. the arena must READ ZERO — anonymous memory must not carry
+     *    the pool's last tenant's bytes (the brk twin, MARKER 396's
+     *    rule, over the map's own frames). Then build "E7MEM-MMAP-OK\n"
+     *    (14 bytes) IN it and write(1, page, 14) through increment 5's
+     *    seam — the bytes crossing FROM THE MAPPED PAGE are what prove
+     *    the mapping is real; rax must return 14. */
+    cmpq    $0, (%r14)
+    jne     .Lmmap_zero_bad
+    movabs  $0x4D4D2D4D454D3745, %rax    /* "E7MEM-MM" (little-endian) */
+    mov     %rax, (%r14)
+    movabs  $0x00000A4B4F2D5041, %rax    /* "AP-OK\n" + NULs          */
+    mov     %rax, 8(%r14)
+    mov     %r14, %rsi
+    mov     $1, %edi             /* fd 1 — the task's console         */
+    mov     $14, %edx
+    mov     $1, %eax
+    syscall
+    cmp     $14, %rax
+    jne     .Lmmap_bad           /* the arena write failed or short   */
+    /* 5j. mmap(base, 0x1000, PROT_NONE, FIXED|ANON|PRIVATE) — the
+     *    measured allocator's guard page, landing ON the brk heap's
+     *    first page: Linux MAP_FIXED REPLACES (the old frame returns,
+     *    PROT_NONE backs none), and the reply must echo the address
+     *    EXACTLY — the one-truth rule over an address. Never touch the
+     *    page after this: it is PROT_NONE now, and any access faults. */
+    mov     %r12, %rdi          /* addr = the heap base               */
+    mov     $0x1000, %esi
+    xor     %edx, %edx          /* PROT_NONE                          */
+    mov     $0x32, %r10         /* flags in R10 (the syscall ABI)     */
+    mov     $-1, %r8
+    xor     %r9, %r9
+    mov     $9, %eax
+    syscall
+    cmp     %r12, %rax
+    jne     .Lmmap_fixed_bad
+    /* 5k. mmap(NULL, 0x1000, PROT_WRITE|PROT_EXEC, ANON|PRIVATE) —
+     *    §5.4's W^X refusal must come back exactly -EPERM (-1): the
+     *    same rule 5g measured over mprotect, over a prot word that
+     *    arrives with a mapping ask. */
+    xor     %rdi, %rdi
+    mov     $0x1000, %esi
+    mov     $6, %edx             /* PROT_WRITE|PROT_EXEC               */
+    mov     $0x22, %r10         /* flags in R10 (the syscall ABI)     */
+    mov     $-1, %r8
+    xor     %r9, %r9
+    mov     $9, %eax
+    syscall
+    cmp     $-1, %rax
+    jne     .Lmmap_wx_bad
+    /* 5l. mmap(NULL, 1 MiB, RW, ANON|PRIVATE) — the whole ask is 16x
+     *    the span, so the answer must be exactly -ENOMEM (-12): the
+     *    cursor cannot fit it, and unlike brk's denial echo, mmap's
+     *    failure shape IS an errno. */
+    xor     %rdi, %rdi
+    mov     $0x100000, %esi      /* 1 MiB                              */
+    mov     $3, %edx
+    mov     $0x22, %r10         /* flags in R10 (the syscall ABI)     */
+    mov     $-1, %r8
+    xor     %r9, %r9
+    mov     $9, %eax
+    syscall
+    cmp     $-12, %rax
+    jne     .Lmmap_budget_bad
+    jmp     .Lmem_done           /* the whole seam held: the exit path  */
+
+.Lmmap_bad:
+    mov     $399, %eax           /* MARKER: the arena grant lied       */
+    syscall
+    jmp     .Lmem_done
+.Lmmap_zero_bad:
+    mov     $400, %eax           /* MARKER: a fresh arena page not zero */
+    syscall
+    jmp     .Lmem_done
+.Lmmap_fixed_bad:
+    mov     $401, %eax           /* MARKER: the FIXED guard no echo    */
+    syscall
+    jmp     .Lmem_done
+.Lmmap_wx_bad:
+    mov     $402, %eax           /* MARKER: mmap's W|X not refused     */
+    syscall
+    jmp     .Lmem_done
+.Lmmap_budget_bad:
+    mov     $403, %eax           /* MARKER: over-budget not -ENOMEM    */
     syscall
     jmp     .Lmem_done
 .Lmem_bad:

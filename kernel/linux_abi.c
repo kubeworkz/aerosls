@@ -104,7 +104,8 @@ const struct LinuxSyscallEntry linux_syscall_table[] = {
     {   6, LSC_FD,     0 },   /* lstat */
     {   7, LSC_FD,     0 },   /* poll */
     {   8, LSC_FD,     0 },   /* lseek */
-    {   9, LSC_MEM,    0 },   /* mmap — §5.4 budget-backed */
+    {   9, LSC_MEM,    0 },   /* mmap — §5.4 budget-backed; the anon-ymous  */
+                              /* map half landed at increment 16            */
     {  10, LSC_MEM,    LSC_F_REFUSES_WX }, /* mprotect — W|X refused (§5.4) */
     {  11, LSC_MEM,    0 },   /* munmap */
     {  12, LSC_MEM,    0 },   /* brk — §5.4 bump pointer in the budget */
@@ -369,7 +370,10 @@ int linux_poll_refuses_blocking(uint64_t num, uint64_t timeout)
  * kernel state: the verdict is arithmetic over the stamped span and the
  * staged request, the frame reader is a walk of a root the CALLER supplies
  * (the task's PML4 in production, a fake table in the test — the same fake
- * tables the copy's cases already build). */
+ * tables the copy's cases already build). Increment 16 joins the section:
+ * mmap's first-trap refusals and its verdict are the same discipline over
+ * four staged words, with the span bounded from both ends by the two
+ * cursors the map owns. */
 int linux_mprotect_refuses_wx(uint64_t prot)
 {
     return (prot & LINUX_PROT_WRITE) && (prot & LINUX_PROT_EXEC);
@@ -377,10 +381,18 @@ int linux_mprotect_refuses_wx(uint64_t prot)
 
 struct LinuxMemBrkVerdict linux_mem_brk_verdict(uint64_t heap_base,
                                                 uint64_t heap_limit,
+                                                uint64_t mmap_top,
                                                 uint64_t brk_cur,
                                                 uint64_t req, uint64_t rax)
 {
     struct LinuxMemBrkVerdict v;
+    /* brk's ceiling is the span's limit CAPPED by the anonymous-map
+     * cursor (increment 16): a page a granted mmap backed — or reserved
+     * — is a page a brk growth may never map over (a re-map leaks the
+     * frame underneath and zeros the bytes on it). mmap_top == 0 means
+     * no cursor was ever stamped: the span's own limit stands. */
+    uint64_t ceiling = (mmap_top != 0 && mmap_top < heap_limit)
+                     ? mmap_top : heap_limit;
     v.malformed = 0;
     v.map_va = 0;
     v.map_pages = 0;
@@ -401,7 +413,7 @@ struct LinuxMemBrkVerdict linux_mem_brk_verdict(uint64_t heap_base,
      * rax is not even the request's echo — both are the malformed arm,
      * never a map. */
     if (rax == req && req > brk_cur &&
-        req >= heap_base && req <= heap_limit) {
+        req >= heap_base && req <= ceiling) {
         uint64_t va0 = (brk_cur + LINUX_PAGE_SIZE - 1)
                      & ~((uint64_t)LINUX_PAGE_SIZE - 1);
         uint64_t va1 = (rax + LINUX_PAGE_SIZE - 1)
@@ -420,6 +432,132 @@ struct LinuxMemBrkVerdict linux_mem_brk_verdict(uint64_t heap_base,
 
     v.malformed = 1;   /* neither the grant nor the refusal: nothing
                         * maps, the break stays, the caller says so */
+    return v;
+}
+
+/* ─── E7 increment 16 — the anonymous-map seam ───────────────────────────
+ * The two decisions the first trap makes about a mmap (refuse the shape,
+ * or stage the whole request), and the one the reply makes (was the grant
+ * a lie?), as the pure functions the host test drives. The apply — the
+ * replace walk, the frame allocs, the invlpg — is the resume arm's, on
+ * this side of the §5.4 line the brk apply already sits behind. */
+int linux_mem_mmap_refusal(const struct LinuxMmapReq *req,
+                           uint64_t span_base, uint64_t span_limit)
+{
+    /* 0 or a NEGATIVE Linux errno — the copy plans' convention, so the
+     * call site maps it straight into rax. The ladder reads
+     * malformed-word first, then un-served shapes, then the span — each
+     * step is a property of the REQUEST words alone, so no channel is
+     * ever posted for a shape that cannot be answered. */
+    uint64_t len_r;
+
+    if (req->len == 0) return -LINUX_EINVAL;
+    if (req->len > UINT64_MAX - (LINUX_PAGE_SIZE - 1))
+        return -LINUX_EINVAL;
+    len_r = (req->len + LINUX_PAGE_SIZE - 1)
+          & ~((uint64_t)LINUX_PAGE_SIZE - 1);
+
+    if (req->prot & ~(LINUX_PROT_READ | LINUX_PROT_WRITE |
+                      LINUX_PROT_EXEC)) return -LINUX_EINVAL;
+
+    /* W|X first: mprotect's own §5.4 rule over a prot word (the twin at
+     * both ends), so W|X reads EPERM wherever it arrives. */
+    if (linux_mprotect_refuses_wx(req->prot)) return -LINUX_EPERM;
+    if (req->prot & LINUX_PROT_EXEC) return -LINUX_ENOSYS;
+
+    if (!(req->flags & LINUX_MAP_ANONYMOUS)) return -LINUX_ENOSYS;
+    if (!(req->flags & LINUX_MAP_PRIVATE))   return -LINUX_ENOSYS;
+    if (req->flags & LINUX_MAP_SHARED)       return -LINUX_ENOSYS;
+    if (req->flags & ~LINUX_MAP_V1_ALLOW)    return -LINUX_ENOSYS;
+
+    /* FIXED asks for an exact address; Linux requires it page-aligned
+     * and the shim bounds it by the stamped span — outside the budget is
+     * the budget shape §5.4 names, ENOMEM. Non-FIXED addresses are the
+     * ledger's pick: no address rule here, the cursors decide at the
+     * reply. */
+    if (req->flags & LINUX_MAP_FIXED) {
+        if (req->addr & (LINUX_PAGE_SIZE - 1)) return -LINUX_EINVAL;
+        if (req->addr < span_base || req->addr > span_limit)
+            return -LINUX_ENOMEM;
+        if (len_r > span_limit - req->addr) return -LINUX_ENOMEM;
+    }
+    return 0;
+}
+
+struct LinuxMemMmapVerdict
+linux_mem_mmap_verdict(uint64_t heap_base, uint64_t heap_limit,
+                       uint64_t brk_cur, uint64_t mmap_top,
+                       const struct LinuxMmapReq *req, uint64_t rax)
+{
+    struct LinuxMemMmapVerdict v;
+    uint64_t len_r;
+    int is_fixed;
+
+    v.malformed = 0;
+    v.replace = 0;
+    v.prot_write = 0;
+    v.map_va = 0;
+    v.range_pages = 0;
+    v.map_pages = 0;
+    v.new_mmap_top = mmap_top;
+
+    /* A refusal reply: its errno rides the §5.7 map as usual, nothing
+     * maps, nothing is malformed. (MAP_FAILED's -1 arrives here too: it
+     * is just a negative errno the sidecar chose.) */
+    if ((int64_t)rax < 0) return v;
+
+    /* The refusal ladder re-runs over the staged words: the verdict is
+     * reached only through a request the first trap passed, but it is
+     * driven standalone by the host test and must be total on any input
+     * — a shape the trap would have refused maps nothing here either. */
+    if (linux_mem_mmap_refusal(req, heap_base, heap_limit) != 0) {
+        v.malformed = 1;
+        return v;
+    }
+
+    len_r = (req->len + LINUX_PAGE_SIZE - 1)
+          & ~((uint64_t)LINUX_PAGE_SIZE - 1);
+    is_fixed = (req->flags & LINUX_MAP_FIXED) != 0;
+
+    if (is_fixed) {
+        /* The echo rule on an address (increment 5's one-truth rule,
+         * over a mapping): a granted FIXED map returns exactly the
+         * address asked. The span re-check is the kernel's OWN stamp —
+         * the refusal ladder checked it at the first trap and the
+         * stamped span cannot have moved, but the kernel never maps
+         * because a grant said so, twice. */
+        if (rax != req->addr || rax < heap_base || rax > heap_limit ||
+            len_r > heap_limit - rax) {
+            v.malformed = 1;
+            return v;
+        }
+        v.replace = 1;              /* last map wins, as Linux itself */
+    } else {
+        /* The ledger's pick, re-checked against the kernel's OWN two
+         * cursors: nonzero, page-aligned, inside the span, strictly at
+         * or above the break (the page there is unmapped — brk maps
+         * below its break), and the whole range at or below the
+         * cursor — which then descends past it, so no later grant ever
+         * re-hands this range. */
+        if (rax == 0 || (rax & (LINUX_PAGE_SIZE - 1)) != 0 ||
+            rax < heap_base || rax > heap_limit ||
+            len_r > heap_limit - rax ||
+            rax < brk_cur || rax > mmap_top ||
+            len_r > mmap_top - rax) {
+            v.malformed = 1;
+            return v;
+        }
+    }
+
+    v.map_va = rax;
+    v.range_pages = len_r / LINUX_PAGE_SIZE;
+    /* PROT_NONE backs no frames: a reservation whose every access
+     * faults — PROT_NONE's whole observable contract, and the measured
+     * allocator's guard-page shape. */
+    v.map_pages = (req->prot == LINUX_PROT_NONE)
+                ? 0 : v.range_pages;
+    v.prot_write = (req->prot & LINUX_PROT_WRITE) ? 1 : 0;
+    v.new_mmap_top = is_fixed ? mmap_top : rax;
     return v;
 }
 

@@ -173,6 +173,17 @@ struct ProcessDescriptor {
                                        // mechanism's truth about which pages are
                                        // backed, consulted by the verdict at
                                        // every brk reply
+    uint64_t   linux_mmap_top;         // E7 increment 16 (§5.4): the anonymous-map
+                                       // cursor — born at the span's limit,
+                                       // descending by every granted non-FIXED
+                                       // mmap, stamped beside the heap numbers at
+                                       // the create and zeroed at slot reuse
+                                       // beside them. The MemBrk ledger's mtop is
+                                       // the policy twin; both ends re-check the
+                                       // other's grants (brk's ceiling is
+                                       // min(limit, mtop)) so a map can never
+                                       // overwrite a frame either side already
+                                       // handed out.
     uint64_t   mem_stage_num;          // §5.4: a brk captured at the first trap
                                        // (a break only means something against the
                                        // break the FIRST trap saw) — held for the
@@ -180,6 +191,14 @@ struct ProcessDescriptor {
                                        // resume arm. Cleared at the apply, at
                                        // every non-brk forward, and at slot reuse.
     uint64_t   mem_stage_a0;           // args[0] as captured — the requested break
+                                       // (brk), or a mmap's address
+    uint64_t   mem_stage_a1;           // args[1..3] as captured — a mmap's len,
+    uint64_t   mem_stage_a2;           // prot and flags: the WHOLE ask (increment
+    uint64_t   mem_stage_a3;           // 16), because the verdict re-checks the
+                                       // grant against what the FIRST trap saw —
+                                       // the brk rule over four words instead of
+                                       // one. Zeroed for SLS and for non-mmap
+                                       // forwards beside mem_stage_a0.
     uint8_t    mem_stage_valid;        // 1 between that forward's arming and its
                                        // reply (or refusal)
     uint64_t   reply_stage_num;        // E7 increment 12 (§10.13's step 3): the

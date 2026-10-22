@@ -135,12 +135,22 @@ static void proc_clear_resume_state(struct ProcessDescriptor* pd) {
      * kernel's own re-check), and an unanswered brk stage must not
      * survive into a slot whose pid it never belonged to. Spawn paths
      * that want LINUX stamp the span inside the same create call
-     * (cap_create_sidecar_in_personality), like the personality itself. */
+     * (cap_create_sidecar_in_personality), like the personality itself.
+     * E7 increment 16 widens the same rule: a stale mmap cursor would
+     * let a reused slot's non-FIXED grant land on (or its brk growth
+     * map over) a page the PREVIOUS occupant's map owned, and the
+     * staged mmap words must not survive into a slot whose pid they
+     * never belonged to — a reply carrying them would map against a
+     * span that is not the ask's. */
     pd->linux_heap_base = 0;
     pd->linux_heap_limit = 0;
     pd->linux_brk_cur = 0;
+    pd->linux_mmap_top = 0;
     pd->mem_stage_num = 0;
     pd->mem_stage_a0 = 0;
+    pd->mem_stage_a1 = 0;
+    pd->mem_stage_a2 = 0;
+    pd->mem_stage_a3 = 0;
     pd->mem_stage_valid = 0;
     /* E7 increment 12 (§10.13's step 3): the reply payload's staged
      * destination clears here for the same reason as every other stage —

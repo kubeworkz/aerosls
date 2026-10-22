@@ -188,14 +188,21 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                     if (cur->mem_stage_valid) {
                         uint64_t snum = cur->mem_stage_num;
                         uint64_t sa0  = cur->mem_stage_a0;
+                        uint64_t sa1  = cur->mem_stage_a1;
+                        uint64_t sa2  = cur->mem_stage_a2;
+                        uint64_t sa3  = cur->mem_stage_a3;
                         cur->mem_stage_valid = 0;
                         cur->mem_stage_num   = 0;
                         cur->mem_stage_a0    = 0;
+                        cur->mem_stage_a1    = 0;
+                        cur->mem_stage_a2    = 0;
+                        cur->mem_stage_a3    = 0;
                         if (snum == LINUX_BRK) {
                             struct LinuxMemBrkVerdict v =
                                 linux_mem_brk_verdict(
                                     cur->linux_heap_base,
                                     cur->linux_heap_limit,
+                                    cur->linux_mmap_top,
                                     cur->linux_brk_cur, sa0, rax);
                             if (v.malformed) {
                                 kernel_serial_printf(
@@ -255,8 +262,148 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                     rax = cur->linux_brk_cur;
                                 }
                             }
+                        } else if (snum == LINUX_MMAP) {
+                                /* E7 increment 16 apply half (§5.4): the
+                                 * staged anonymous map is resolved HERE,
+                                 * at the reply, inside this task's own
+                                 * trap — the brk verdict's rule over
+                                 * four staged words. The GRANT is the
+                                 * sidecar's (its 9 arm's ledger — a
+                                 * cursor descending from the span's top,
+                                 * or the request's own FIXED address);
+                                 * the verdict re-checks it against THIS
+                                 * create's stamped span and the kernel's
+                                 * OWN two cursors, because the
+                                 * page-table write is the dangerous
+                                 * half.
+                                 *
+                                 * MAP_FIXED REPLACES (Linux's own
+                                 * semantics): every present page in the
+                                 * range has its frame returned to the
+                                 * partition before the new protection is
+                                 * installed — and this is the ONE path
+                                 * in this tree that edits a translation
+                                 * ring-3 HAS run on (the allocator's
+                                 * guard page lands on the brk heap's
+                                 * first page), so each touched page gets
+                                 * an `invlpg` (user_invlpg). PROT_NONE
+                                 * backs no frames: a reservation whose
+                                 * every access faults — PROT_NONE's
+                                 * whole observable contract, and the
+                                 * measured allocator's guard shape.
+                                 *
+                                 * Frame exhaustion mid-batch UNWINDS the
+                                 * pages THIS grant backed (returned to
+                                 * the partition) and answers -ENOMEM —
+                                 * while the pages it already REPLACED
+                                 * stay replaced: a hole where the old
+                                 * mapping was is Linux's own failure
+                                 * shape, and this kernel keeps no
+                                 * shadow of the mappings it destroyed. */
+                                struct LinuxMmapReq mreq;
+                                struct LinuxMemMmapVerdict v;
+                                mreq.addr  = sa0;
+                                mreq.len   = sa1;
+                                mreq.prot  = sa2;
+                                mreq.flags = sa3;
+                                v = linux_mem_mmap_verdict(
+                                    cur->linux_heap_base,
+                                    cur->linux_heap_limit,
+                                    cur->linux_brk_cur,
+                                    cur->linux_mmap_top, &mreq, rax);
+                                if (v.malformed) {
+                                    kernel_serial_printf(
+                                        "[E7] mmap reply 0x%lx for "
+                                        "request addr=0x%lx len=%lu "
+                                        "(span 0x%lx..0x%lx, cur 0x%lx, "
+                                        "top 0x%lx) is neither the "
+                                        "grant nor the refusal - "
+                                        "nothing mapped\n",
+                                        (unsigned long)rax,
+                                        (unsigned long)sa0,
+                                        (unsigned long)sa1,
+                                        (unsigned long)cur->linux_heap_base,
+                                        (unsigned long)cur->linux_heap_limit,
+                                        (unsigned long)cur->linux_brk_cur,
+                                        (unsigned long)cur->linux_mmap_top);
+                                    rax = (uint64_t)(int64_t)
+                                          (-LINUX_ENOMEM);
+                                } else {
+                                    uint64_t *pml4 =
+                                        (uint64_t *)(uintptr_t)cur->cr3;
+                                    uint64_t va = v.map_va;
+                                    uint32_t idx = 0, backed = 0;
+                                    int failed = 0;
+                                    while (idx < v.range_pages) {
+                                        void *frame = 0;
+                                        if (idx < v.map_pages) {
+                                            frame = allocate_physical_ram_frame_for_partition(cur->partition_id);
+                                            if (!frame) {
+                                                failed = 1; break;
+                                            }
+                                            {
+                                                uint64_t *w =
+                                                    (uint64_t *)frame;
+                                                int zi;
+                                                for (zi = 0; zi < 512;
+                                                     zi++)
+                                                    w[zi] = 0;
+                                            }
+                                        }
+                                        if (v.replace) {
+                                            uint64_t old =
+                                                linux_user_page_frame(
+                                                    cur->cr3, va);
+                                            user_unmap_page(pml4, va);
+                                            if (old) free_physical_ram_frame_for_partition(
+                                                (void *)(uintptr_t)old,
+                                                cur->partition_id);
+                                        }
+                                        if (frame) {
+                                            user_map_page(pml4, va,
+                                                (uint64_t)(uintptr_t)frame,
+                                                USER_PTE_PRESENT |
+                                                USER_PTE_USER |
+                                                USER_PTE_NOEXEC |
+                                                (v.prot_write
+                                                     ? USER_PTE_WRITE : 0));
+                                            backed++;
+                                        }
+                                        if (v.replace)
+                                            user_invlpg(va);
+                                        va += 4096;
+                                        idx++;
+                                    }
+                                    if (failed) {
+                                        while (backed) {
+                                            uint64_t f;
+                                            va -= 4096;
+                                            f = linux_user_page_frame(
+                                                cur->cr3, va);
+                                            user_unmap_page(pml4, va);
+                                            if (f) free_physical_ram_frame_for_partition(
+                                                (void *)(uintptr_t)f,
+                                                cur->partition_id);
+                                            if (v.replace)
+                                                user_invlpg(va);
+                                            backed--;
+                                        }
+                                        kernel_serial_printf(
+                                            "[E7] mmap grant addr=0x%lx "
+                                            "len=%lu: frame exhaustion "
+                                            "mid-batch - backed pages "
+                                            "unwound, -ENOMEM\n",
+                                            (unsigned long)sa0,
+                                            (unsigned long)sa1);
+                                        rax = (uint64_t)(int64_t)
+                                              (-LINUX_ENOMEM);
+                                    } else {
+                                        cur->linux_mmap_top =
+                                            v.new_mmap_top;
+                                    }
+                                }
+                            }
                         }
-                    }
                     return rax;
                 }
             }
@@ -392,10 +539,58 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                 cur->mem_stage_valid = 0;
                 cur->mem_stage_num   = 0;
                 cur->mem_stage_a0    = 0;
+                cur->mem_stage_a1    = 0;
+                cur->mem_stage_a2    = 0;
+                cur->mem_stage_a3    = 0;
                 if (num == LINUX_BRK) {
                     cur->mem_stage_valid = 1;
                     cur->mem_stage_num   = num;
                     cur->mem_stage_a0    = largs[0];
+                } else if (num == LINUX_MMAP) {
+                    /* E7 increment 16 (§5.4): the anonymous-map ladder.
+                     * Everything a mmap can be REFUSED for, before any
+                     * arm — request words only (a prot word, a flags
+                     * word, a FIXED address against this create's own
+                     * stamped span), so no channel is posted for a
+                     * shape that cannot be answered. The sidecar's 9
+                     * arm repeats the same ladder as its own twin
+                     * (guard clause V): neither end is load-bearing
+                     * alone. A pass stages the WHOLE ask — addr, len,
+                     * prot, flags — because the verdict at the reply
+                     * re-checks the grant against what the FIRST trap
+                     * saw: the brk rule over four words instead of
+                     * one. */
+                    struct LinuxMmapReq mreq;
+                    int mref;
+                    mreq.addr  = largs[0];
+                    mreq.len   = largs[1];
+                    mreq.prot  = largs[2];
+                    mreq.flags = largs[3];
+                    mref = linux_mem_mmap_refusal(&mreq,
+                            cur->linux_heap_base, cur->linux_heap_limit);
+                    if (mref) {
+                        kernel_serial_printf(
+                            "[E7] linux mmap addr=0x%lx len=%lu prot=%lu "
+                            "flags=0x%lx refused before post: %s\n",
+                            (unsigned long)largs[0],
+                            (unsigned long)largs[1],
+                            (unsigned long)largs[2],
+                            (unsigned long)largs[3],
+                            mref == -LINUX_EPERM
+                                ? "write+execute is refused (§5.4)"
+                                : mref == -LINUX_EINVAL
+                                ? "malformed request word"
+                                : mref == -LINUX_ENOMEM
+                                ? "outside the stamped span"
+                                : "shape not served (by name)");
+                        return (uint64_t)(int64_t)mref;
+                    }
+                    cur->mem_stage_valid = 1;
+                    cur->mem_stage_num   = num;
+                    cur->mem_stage_a0    = largs[0];
+                    cur->mem_stage_a1    = largs[1];
+                    cur->mem_stage_a2    = largs[2];
+                    cur->mem_stage_a3    = largs[3];
                 } else if (num == LINUX_MPROTECT &&
                            linux_mprotect_refuses_wx(largs[2])) {
                     kernel_serial_printf(

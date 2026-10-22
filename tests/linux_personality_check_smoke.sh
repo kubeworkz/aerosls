@@ -114,6 +114,9 @@ echo "at both ends before any post"
 echo "and increment 12's reply payload (clause set T) — the copy-IN's"
 echo "first-trap destination plan, the deliver's three shapes, the"
 echo "two-phase writable copy and the stage's four-place lifecycle"
+echo "and increment 16's anonymous-map seam (clause set V) — the"
+echo "first-trap ladder, the verdict's two-cursor re-check, the FIXED"
+echo "replace's frame return and invlpg, and the fixture's map block"
 echo "========================================================================"
 echo
 
@@ -799,6 +802,105 @@ seed "$W/t107"
 sed -i 's/\.take(24)/.take(0)/' "$W/t107/user/sidecar/src/linux.rs"
 sed -i 's/b" -> ENOSYS mmap(len="/b" -> ENOSYS "/' "$W/t107/user/sidecar/src/linux.rs"
 tooth abort-evidence-stripped R8 "neither the written bytes nor the mmap request ride their lines" "$W/t107"
+
+# ─── V teeth (increment 16: the anonymous-map seam) ───────────────────────
+
+# t108: the first-trap ladder call deleted — "the sidecar already
+# refuses these" is how a W|X, file-backed or out-of-span map starts
+# POSTING: every request forwards, and the only wall left answers after
+# the park instead of the first trap refusing before any channel.
+seed "$W/t108"
+sed -i '/mref = linux_mem_mmap_refusal(&mreq,/d' "$W/t108/kernel/syscall_dispatch.c"
+tooth mmap-ladder-not-first-trap V1 "the dispatcher no longer consults the refusal ladder before any post" "$W/t108"
+
+# t109: the staged request cut back to the old one word — the verdict
+# would then re-check a grant against len/prot/flags the FIRST trap
+# never saw (the brk rule that makes a reply mean anything).
+seed "$W/t109"
+sed -i '/cur->mem_stage_a3    = largs\[3\];/d' "$W/t109/kernel/syscall_dispatch.c"
+tooth mmap-stage-truncated V1 "the four-word stage carries only part of the ask" "$W/t109"
+
+# t110: the verdict handed the span's limit where the cursor belongs —
+# a forged grant above the cursor now re-checks against a bound that
+# never moved, so the two cursors' convergence is argued from prose.
+seed "$W/t110"
+sed -i 's/^                                    cur->linux_mmap_top, &mreq, rax);$/                                    cur->linux_heap_limit, \&mreq, rax);/' "$W/t110/kernel/syscall_dispatch.c"
+tooth mmap-verdict-loses-cursor V2 "the verdict is called without the map cursor" "$W/t110"
+
+# t111: the replace's invlpg deleted — "the task is parked anyway" is
+# the wrong-but-plausible story: ring-3 HAS run on the page the guard
+# replaces, and the stale translation is the one this tree caches.
+seed "$W/t111"
+sed -i '/user_invlpg(va);/d' "$W/t111/kernel/syscall_dispatch.c"
+tooth mmap-replace-no-invlpg V3 "the replace path no longer shoots the stale translation down" "$W/t111"
+
+# t112: the replace walk gated off — a FIXED guard then maps over the
+# brk heap's live frame without reading it back: the frame leaks (the
+# partition pays for a page nobody owns) and the bytes under the guard
+# stay mapped for whoever reads them through the old translation.
+seed "$W/t112"
+sed -i 's/if (v.replace)/if (0)/g' "$W/t112/kernel/syscall_dispatch.c"
+tooth mmap-replace-gated-off V3 "the replace walk never runs — a FIXED map silently overlays a live frame" "$W/t112"
+
+# t113: the cursor never born at the create — brk's min() then sees a
+# zero cursor (the span's own limit stands), but every non-FIXED arena
+# re-checks above a cursor that is 0 and maps nothing: the allocator's
+# wall returns as -ENOMEM from a kernel that forgot to birth its state.
+seed "$W/t113"
+sed -i 's/pd->linux_mmap_top   = pd->linux_heap_limit;/pd->linux_mmap_top   = 0;/' "$W/t113/kernel/cap.c"
+tooth mmap-cursor-never-born V4 "the create no longer births the map cursor at the span's top" "$W/t113"
+
+# t114: the slot-reuse clear deleted — "dead code" is how a reused
+# task slot inherits its predecessor's cursor, and the next child's
+# arena lands where the last occupant's map still lives.
+seed "$W/t114"
+sed -i '/pd->linux_mmap_top = 0;/d' "$W/t114/kernel/process.c"
+tooth mmap-cursor-slotreuse-clear-gone V4 "a reused slot keeps the dead task's map cursor" "$W/t114"
+
+# t115: the arm renamed away — the measured allocator's two requests
+# fall to the default ENOSYS arm (the increment-15 wall, back by name)
+# while every other V clause stays exactly as wired.
+seed "$W/t115"
+sed -i 's/^        9 => {$/        900 => {/' "$W/t115/user/sidecar/src/linux.rs"
+tooth mmap-arm-gone V5 "the sidecar no longer answers mmap (9)" "$W/t115"
+
+# t116: brk's cap dropped — the ledger grants a growth to the span's
+# limit over an arena the cursor already handed out: a re-map leaks the
+# arena's frame and zeroes its bytes, which is the two-cursor rule's
+# whole reason to exist.
+seed "$W/t116"
+sed -i 's/if want > brk.cur && want <= brk.mtop {/if want > brk.cur \&\& want <= brk.limit {/' "$W/t116/user/sidecar/src/linux.rs"
+tooth brk-cap-dropped V5 "brk's ceiling is the span again, not the map cursor" "$W/t116"
+
+# t117: the host-test section deleted — the ladder's branches, the
+# verdict's forged-grant arms and the brk cap would then be argued from
+# these greps alone, every one reachable only at boot (t83's rule).
+seed "$W/t117"
+sed -i '/linux_mem_mmap_/d' "$W/t117/tests/linux_personality_host_test.c"
+tooth mmap-unhosttested V6 "the host test no longer drives the ladder, the verdict or the brk cap" "$W/t117"
+
+# t118: the fixture's map block deleted — the seam would have no
+# on-target proof: a regression would read as a quiet run with the
+# probe's brk block still green beside it.
+seed "$W/t118"
+sed -i '/^\.Lmmap:/,/^\.Lmem_bad:/{/^\.Lmem_bad:/!d}' "$W/t118/user/sidecar/fixtures/e7_linux_probe.S"
+tooth mmap-fixture-block-gone V7 "the probe no longer carries the E7MEM-MMAP block" "$W/t118"
+
+# t119: the granted address stripped from the answer line — the run's
+# proof that the arena landed inside its span goes back to a
+# reconstruction from which arms ran (increment 14/15's rule).
+seed "$W/t119"
+sed -i 's/ ok mmap -> 0x/ ok mmap ->/' "$W/t119/user/sidecar/src/linux.rs"
+tooth mmap-grant-address-not-logged V8 "a granted map's answer line no longer carries the address" "$W/t119"
+
+# t120: the mmap else re-hung one level deep — inside the brk verdict's
+# map-pages arm instead of at the snum level. It COMPILES (both forms
+# are valid C) and is unreachable for LINUX_MMAP: the allocator's arena
+# grant returns an address with nothing mapped, and the first write
+# faults (the measured failure this pin was written from).
+seed "$W/t120"
+sed -i 's/^                        } else if (snum == LINUX_MMAP) {/                            } else if (snum == LINUX_MMAP) {/' "$W/t120/kernel/syscall_dispatch.c"
+tooth mmap-apply-unreachable V2 "the mmap apply is chained inside the brk verdict's arm — unreachable for LINUX_MMAP" "$W/t120"
 
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"

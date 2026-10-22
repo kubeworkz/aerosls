@@ -332,6 +332,17 @@ void user_unmap_page(uint64_t* pml4, uint64_t vaddr) {
     pt[PT_IDX(vaddr)] = 0;
 }
 
+/* E7 increment 16: the one stale-translation shootdown the mmap apply
+ * needs — a MAP_FIXED replace edits a PRESENT leaf the task has run on
+ * (its TLB may hold the old translation), unlike every other mapping
+ * path here, which touches only not-present leaves. The task is parked
+ * in this trap on this CPU with its CR3 loaded, so one `invlpg` per
+ * touched page is complete: no IPI, no cross-CPU shootdown, same
+ * single-core posture every other TLB claim in this tree rests on. */
+void user_invlpg(uint64_t vaddr) {
+    __asm__ volatile("invlpg (%0)" : : "r"(vaddr) : "memory");
+}
+
 /* ─── Phase 2 teardown: user_destroy_page_table ───────────────────────────────
  * Free every frame a process's address space owns, recursively from the
  * user half of its PML4 down through the intermediate tables to the leaf

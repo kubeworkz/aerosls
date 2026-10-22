@@ -2256,6 +2256,163 @@ OOM under a build running alongside — the smoke's t16/t17 seed copies
 beside `make`, and those three `process.c` compiles beside parallel
 qemu+gcc — green on rerun with the machine's RAM to themselves.
 
+**The anonymous-map gap closes (increment 16).** §10.10's last
+anonymous wall: the two `mmap` requests that killed the firstuser's
+allocator are ANSWERED, from the same budget span brk lives in, at
+both ends, with neither end load-bearing alone. The contract, before
+the mechanism — exactly where brk's was (§5.4):
+
+- **Anonymous + private only.** `MAP_ANONYMOUS|MAP_PRIVATE` required;
+  file-backed, shared, and unknown flag bits are refused by name at
+  BOTH ends (the census's own discipline: a shape the shim does not
+  serve says its name on the answer line). `MAP_FIXED` is honored;
+  `MAP_NORESERVE` and `MAP_STACK` are accepted and ignored — both are
+  documented no-op hints on x86-64, so ignoring them IS Linux's
+  behavior, not a shortcut.
+- **W|X is refused EPERM** at the first trap — mprotect's own §5.4
+  rule over a prot word, twin at both ends. `PROT_EXEC` alone is
+  refused ENOSYS by name: executable anonymous memory is its own
+  increment and no measured shape needs it.
+- **The span is the truth, twice.** A `MAP_FIXED` address outside the
+  stamped span `[heap_base, heap_base+mem_bytes)` is refused ENOMEM at
+  the first trap — the budget shape §5.4 names — and a non-FIXED
+  address is picked by the sidecar's ledger, a cursor descending
+  from the span's top, whose grant the kernel's verdict re-checks
+  against its OWN cursors at the reply: a forged or drifted grant
+  maps nothing and answers ENOMEM.
+- **Two cursors, both ends.** `MemBrk` grows `mtop` beside `cur`;
+  the descriptor grows `linux_mmap_top` beside `linux_brk_cur`. brk's
+  ceiling is `min(heap_limit, mtop)` at both ends: an arena a mmap
+  granted is a page a brk growth may never map over (a re-map leaks
+  the frame and zeros live bytes), and a non-FIXED mmap may never
+  land under the break.
+- **MAP_FIXED replaces; PROT_NONE maps no frames.** The measured
+  guard — `mmap(base, 4096, PROT_NONE, FIXED|ANON|PRIVATE)` landing
+  on the page brk already mapped — is Linux's own semantics: the old
+  page's frame returns to the partition, the new protection is
+  installed, and — the one place in this tree where a replaced
+  translation WAS present and ring-3 HAS run on it — `invlpg` for
+  every touched page. A PROT_NONE mapping consumes no frames and
+  every access faults; that is PROT_NONE's whole observable
+  contract. A granted anonymous map is zero-filled: partition-
+  charged frames, RW-NX or read-only, mapped eagerly — no demand
+  paging anywhere, so nothing lazy can be wrong.
+- **A failed FIXED replace leaves a hole, as Linux does.** If frame
+  exhaustion unwinds a granted FIXED map midway, the pages already
+  replaced stay replaced and already-mapped pages are returned to
+  the partition: the reply is `-ENOMEM` either way. That is the
+  honest failure shape — the kernel does not keep a shadow of the
+  mappings it destroyed.
+
+**What this increment is NOT.** `munmap` stays refused by name —
+frames still return through the partition at the task's teardown
+(the mechanism §10.11 already measured for brk) and unmapping
+through the channel is its own seam. File-backed and shared
+mappings are the file class's own half of the path plan.
+`mprotect`'s real permission changes stay ENOSYS by name — the PTE
+rewrite is the sidecar-invisible half this increment deliberately
+does not widen. The cursor-vs-FIXED overlap resolves the way Linux
+itself resolves it — last map wins — and only when the span is
+nearly consumed; the exhaustion case is the budget refusal either
+way. Executable anonymous memory, `PROT_GROWSDOWN`-class bits, the
+time seam, the handler class, threads and the path plan are
+untouched.
+
+Clause set **V** with teeth **t108+** in
+`tests/linux_personality_check.sh`/`_smoke.sh`: the first-trap
+refusals (W|X, flag allowlist, the FIXED span bound), the stage
+carrying the whole request, the verdict's two cursor re-checks, the
+replace path's frame return and `invlpg`, and the fixture's
+E7MEM-MMAP block with its markers asserted ABSENT.
+
+**Measured — both boots identical, E3 harness RC=0.** The probe's
+whole map block, link by link on its own lines:
+
+```
+[E7] linux: num=00000001 child=e7.linux.probe.0 write ok len=13 |E7MEM-BRK-OK.|
+[E7] linux: num=00000009 child=e7.linux.probe.0 ok mmap -> 0x0000400000015000
+[E7] linux: num=00000001 child=e7.linux.probe.0 write ok len=14 |E7MEM-MMAP-OK.|
+[E7] linux: num=00000009 child=e7.linux.probe.0 ok mmap -> 0x0000400000006000
+[E7] linux mmap addr=0x0 len=4096 prot=6 flags=0x22 refused before post: write+execute is refused (§5.4)
+[E7] linux: num=00000009 child=e7.linux.probe.0 -> ENOMEM mmap(len=1048576, prot=3, flags=34)
+```
+
+The arena (5h) lands at the span's TOP page — the cursor's own pick,
+aligned and inside the 64 KiB span; the page reads zero and carries
+`E7MEM-MMAP-OK` (14 bytes) out through increment 5's seam FROM THE
+MAPPED PAGE, the brk twin; the guard (5j) echoes the heap base
+`0x…06000` EXACTLY (FIXED replaces the brk heap's first page, moves no
+cursor); the W|X twin (5k) is refused -EPERM at the FIRST TRAP with
+the request on the line; the 1 MiB ask (5l) — 16x the span — answers
+-ENOMEM with the request on its refusal line. **Markers 399–403:
+zero occurrences.**
+
+The firstuser — the measurement this increment exists for:
+
+```
+[E7] linux: num=00000009 child=e7.linux.user.0 ok mmap -> 0x00004000000ab000
+[E7] linux: num=00000009 child=e7.linux.user.0 ok mmap -> 0x00004000000ea000
+[E7] linux: num=0000000B child=e7.linux.user.0 -> ENOSYS
+[E7] linux: num=00000009 child=e7.linux.user.0 ok mmap -> 0x00004000000e9000
+[E7] linux: num=00000009 child=e7.linux.user.0 ok mmap -> 0x00004000000e8000
+[E7] linux: num=00000001 child=e7.linux.user.0 write ok len=64 |[backup] Copying sls_sto|
+[E7] linux: num=00000004 child=e7.linux.user.0 -> ENOSYS
+[E7] linux: num=00000001 child=e7.linux.user.0 write ok len=17 |[backup] FAILED: |
+[E7] linux: num=00000001 child=e7.linux.user.0 write ok len=15 |sls_storage.img|
+[E7] linux: num=00000001 child=e7.linux.user.0 write ok len=65 | not found (run from the|
+[E7] linux: num=00000001 child=e7.linux.user.0 write ok len=1 |.|
+[E7] linux: num=0000000B child=e7.linux.user.0 -> ENOSYS
+[E7] linux: num=0000000B child=e7.linux.user.0 -> ENOSYS
+[E7] linux: num=000000E7 child=e7.linux.user.0 exit_group
+[PROC] PID 111 terminated.
+```
+
+**The allocator crossed mmap — and the workload ran.** The guard
+page lands on the heap base (`0xab000`, echoed exactly), three RW
+arenas descend the cursor (`0xea000` → `0xe9000` → `0xe8000`, never
+re-handing a range), `munmap` refuses by name (frames still return
+through the partition at teardown), and then — for the FIRST time in
+any measured run — the program's own `main` executes: aerobackup
+copies its header to the console, fails honestly on the storage image
+that does not exist in the guest (`stat` refused by name on the line
+above it), and calls `exit_group`. No `[FAULT]`, no `tkill(6)`, no
+`memory allocation of 24 bytes failed`: increment 15's abort chain is
+replaced by the workload's own real behavior, and the run's every
+remaining wall is a NAME on a line (`munmap`(11), `stat`(4),
+handler installs (13)) rather than a crash.
+
+**Two bugs the instrument caught on the way — each read off its own
+line, none inferred.** (1) The fixture's first draft put mmap's
+flags in `%rcx`; `syscall` itself clobbers rcx, so the kernel
+captured `flags=0x0` — the refusal line printed the request
+(`addr=0x0 len=4096 prot=3 flags=0x0 refused before post: shape not
+served`) and named the bug at boot: the psABI's fourth syscall
+argument is `%r10`, the fixture is fixed, and the header now says so
+where the next fixture will read it. (2) The mmap apply's `else if`
+was first chained one brace too deep — inside the brk verdict's
+`map-pages` arm — where it COMPILES and is unreachable for
+`LINUX_MMAP`: the arena grant returned an address with nothing
+mapped and the first write faulted (`#PF error=0x6 addr=0x…ea000
+rip=0x8053af1` — `mov %rbp,(%rsi)`, musl linking its fresh arena).
+The compiler cannot catch that class (both forms are valid C), so
+V2 now pins the else's LEVEL as a whole line and tooth t120
+reproduces the mis-hang.
+
+**Suite for this increment.** guard **98 clauses** (V, 9 new);
+smoke **106/106** (t108–t120); the sidecar crate's `linux::` tests
+**17/17** (+5: the cursor's descent, the FIXED echo, the word-shape
+ladder, both cursors against each other, the hex instrument);
+`linux_personality_host_test` **161 checks** (+56: the ladder's
+totality, every forged-grant arm of the verdict, the brk cap);
+`run_all` **127 passed / 0 failed / 2 pre-existing skips**;
+`selfhost-bootimage` and `x86-iso-e3` RC=0 (user/ changed, archives
+repacked); E3 harness OK on the final binaries (both traces above);
+`tests/run_checks.sh` **45 PASS / 1 FAIL / 7 SKIP** — the
+environmental census FAIL (the Oct-17 artifact's sha256, unchanged
+since increment 11) and the seven cluster/runtime SKIPs, every boot
+guard green inside it (personality at its 98 clauses, E3, stamps,
+conventions, frame budget, unified boot).
+
 **Sequence.** 0: DONE — the attribution instrument and the `rip=0x28`
 diagnosis, measured (above). 1: DONE — the loader's `p_vaddr`
 alignment fix, host-tested (E8a) and guarded (O8, t53/t54), measured
@@ -2273,7 +2430,10 @@ at increment 13 (above): `__libc_sigaction`'s `act` in `r8` returned
 as kernel scratch, the round trip's register wall. 4: the path plan,
 the VFS bridge, the thirteen arms — with the copy-IN machinery above
 already in place for `read`'s reply, and the run's remaining named
-walls `mmap`(9) ENOSYS (§10.10) and the handler class (step 2's
+walls `mmap`(9) ENOSYS (§10.10 — RETIRED at increment 16 above: the
+anonymous-map seam landed and the firstuser now runs its workload to
+a clean `exit_group`, so the abort that named SIGABRT no longer
+fires) and the handler class (step 2's
 signal frames — the terminating signal NAMED at increment 14: SIGABRT,
 `sig=6`, raised by the workload's own abort and delivered at the
 unblock). 5: the two format goldens. 6: the fixture probe on-target — a
@@ -2397,7 +2557,7 @@ Everything this document asserts about the tree, with its source:
 | Six argument registers not captured by the trap path | every forwarded syscall gets wrong arguments (§3.4) | E7, §3.4 |
 | No initial stack/auxv builder | static libc start-up fails before `main` (§5.2) | E7, §5.2 |
 | No `MSR_IA32_FS_BASE` handling | TLS setup fails; musl/glibc binaries die early (§5.3) | E7, §5.3 |
-| No `brk`/`mmap` → budget mapping (`brk` landed, increment 6, §10.11; `mmap`/`munmap` remain) | sub-allocating heaps and `munmap` still refuse (§5.4) | E7, §5.4 — corrected at the poll coda (§10.13): munmap (11) never fires before the firstuser's kill — the line once annotated `munmap` is `poll`, measured — so the anonymous-map increment belongs to the real-flags run, where malloc's large allocations actually reach it |
+| No `brk`/`mmap` → budget mapping (`brk` landed, increment 6, §10.11; the anonymous-map half **LANDED** at increment 16; `munmap` remains) | `munmap` still refuses by name (frames return through the partition at the task's teardown — §5.6) | E7, §5.4 — **LANDED** at increment 16 (§10.13): the measured allocator's guard page (FIXED PROT_NONE, replace + invlpg) and its RW arenas (the descending cursor, both ends re-checking) are answered from the budget span, and the firstuser runs its real workload to a clean `exit_group`. `munmap` through the channel is the named remainder — its own seam |
 | `elf64_map_blob` assumes every PT_LOAD's `p_vaddr` is page-aligned | a libc-linked binary with a non-aligned RW LOAD reads every global in it 0x370 bytes off and dies at `rip=0x28` before `main` — measured, §10.13's step 0 | **LANDED** — increment 8's step 1: page-base anchor + lead-offset copy, host teeth E8a, guard clause O8 with teeth t53/t54, measured past `main` |
 | No `CR4.OSFXSR` written anywhere (the IDT's vector-7 gate existed all along — `idt.c`, SIMI Phase 10; `vecstore.c`'s comment saying otherwise is stale), no `xsetbv` | any ring-3 SSE instruction is #UD — every real libc and every Rust binary dies at its first vector op (measured: musl `abort`'s `pxor`, §10.13's step-1 run) | **LANDED** — increment 9: `CR4.OSFXSR|OSXMMEXCPT` + `CR0.MP` armed on the BSP ahead of the trap gate, `fninit` + 0x1F80 `ldmxcsr`, CPUID refusal by name; host teeth `tests/fpu_enable_host_test.c` (40 checks), guard clause Q with teeth t70–t75, measured past `pxor` into `abort`'s tail (§10.13's step 2). `xsetbv`/`CR4.OSXSAVE` remain absent — named, and dormant with the lazy path |
 | `rt_sigprocmask` (14), `rt_sigaction` (13) and `tkill` (200) refuse | `abort()` cannot die at its first `raise(SIGABRT)`, so its tail runs and faults on `hlt` (`rip=0x805260c`) — the firstuser's run ends there, ten attributed traps deep (§10.13's step 2; `rt_sigaction` newly visible) | **LANDED** — increment 10: the kernel's copy plan with all three refusals by name at the first trap, the sidecar's dispositions/mask/pending and the `SignalKill` delivery; host teeth (98 + 11 checks), guard clause R with teeth t76–t83; measured: both firstuser runs end at their first `tkill` with the kill attribution and NO `[FAULT]` (§10.13's step 2). §10.10's copy-IN gap then stayed as the named wall — retired at

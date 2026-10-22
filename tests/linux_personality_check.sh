@@ -588,10 +588,10 @@ if grep -qF 'f = linux_user_page_frame(' "$DISP" && \
 else
     bad "N6. the mid-batch unwind is gone — a frame-exhausted brk leaks every frame it already mapped (the break stays but the partition's quota is spent on pages nobody owns), and the task's heap has holes the break claims are backed"
 fi
-if grep -qF 'if want > brk.cur && want <= brk.limit {' "$LRS" && \
+if grep -qF 'if want > brk.cur && want <= brk.mtop {' "$LRS" && \
    grep -qF 'Answer::Reply(brk.cur, STATUS_OK)' "$LRS" && \
    grep -qF 't.brk_cur = heap_base;' "$LRS"; then
-    ok "N7. the sidecar's brk arm grants only inside the span and answers the UNCHANGED current break otherwise — Linux's own failure shape, a value not an errno, so no libc's brk wrapper can be surprised"
+    ok "N7. the sidecar's brk arm grants only inside the span CAPPED by the map cursor and answers the UNCHANGED current break otherwise — Linux's own failure shape, a value not an errno, so no libc's brk wrapper can be surprised, and never a page a granted map owns"
 else
     bad "N7. the brk arm changed shape — an errno on refusal (no libc's brk wrapper is written against it), a grant outside the span (the kernel's verdict then refuses and the two halves disagree on every reply), or a ledger not born at the span's base"
 fi
@@ -1058,6 +1058,115 @@ if grep -qF 'offsetof(struct CapParkCtx, linux_args) == 72' "$CCT" && \
     ok "U5. the host test pins the layout the resume asm indexes by byte — linux_args at 72 (p[9]), the full ctx 120 — so a reordered field is a red host test, not a boot that sysrets misaligned registers"
 else
     bad "U5. the cap_create host test no longer pins CapParkCtx's layout — the resume asm's 72(%1)…112(%1) offsets would be argued from these greps alone"
+fi
+
+# ─── V: the anonymous-map seam (E7 increment 16, §5.4) ────────────────────
+# §10.10's last anonymous wall lands: the two mmap requests that killed
+# the firstuser's allocator are answered from the same budget span brk
+# lives in, at both ends, with neither end load-bearing alone. The seam
+# is the brk pattern over four staged words: a first-trap ladder over
+# the REQUEST's own properties (so no channel is posted for a shape
+# that cannot be answered), a verdict at the reply that re-checks the
+# grant against the kernel's OWN stamped span and OWN two cursors, and
+# an apply that replaces (MAP_FIXED over the brk heap's first page —
+# the one path here that edits a translation ring-3 HAS run on, hence
+# invlpg). Every clause below is a way this becomes the silent lie it
+# was built to prevent: a W|X map granted, a cursor that hands the same
+# arena out twice, a brk growth mapping over an arena, a replace that
+# leaks the old frame or runs on a stale TLB entry, a fixed map whose
+# frames carry the pool's last tenant's bytes, or a ledger and a kernel
+# that each believe the other side capped.
+if grep -qF 'struct LinuxMmapReq {' "$LABH" && \
+   grep -qF 'int linux_mem_mmap_refusal(const struct LinuxMmapReq *req,' "$LABH" && \
+   grep -qF 'linux_mem_mmap_verdict(uint64_t heap_base, uint64_t heap_limit,' "$LABH" && \
+   grep -qF '#define LINUX_MAP_ANONYMOUS 0x0020u' "$LABH" && \
+   grep -qF '#define LINUX_MAP_V1_ALLOW' "$LABH" && \
+   grep -qF 'int linux_mem_mmap_refusal(const struct LinuxMmapReq *req,' "$LABC" && \
+   grep -qF 'linux_mem_mmap_verdict(uint64_t heap_base, uint64_t heap_limit,' "$LABC"; then
+    ok "V. the mmap seam is a named pure contract, declared where the dispatcher, the sidecar twin and the host test all read it: the request struct, the first-trap ladder, the verdict, and the closed flag allowlist"
+else
+    bad "V. one of the mmap contracts is gone or un-declared — the first trap would have no refusal to consult (a W|X or file-backed map posts), or the verdict no pure function the host test can drive"
+fi
+mmap_ref=$(grep -nF 'mref = linux_mem_mmap_refusal(&mreq,' "$DISP" | head -1 | cut -d: -f1)
+mmap_stage=$(grep -nF 'cur->mem_stage_a3    = largs[3];' "$DISP" | head -1 | cut -d: -f1)
+if [ -n "$mmap_ref" ] && [ -n "$mmap_stage" ] && [ "$mmap_ref" -lt "$mmap_stage" ] && \
+   sed -n "$((mmap_ref + 1)),$((mmap_ref + 18))p" "$DISP" | grep -qF 'refused before post' && \
+   sed -n "$((mmap_ref + 1)),$((mmap_ref + 18))p" "$DISP" | grep -qF -- '(uint64_t)(int64_t)mref;' && \
+   grep -qF 'cur->mem_stage_a1    = 0;' "$DISP" && \
+   grep -qF 'cur->mem_stage_a2    = 0;' "$DISP"; then
+    ok "V1. the FIRST TRAP consults the ladder before any post — the refusal returns in the task's own units with the request's words on the line, and a pass stages the WHOLE ask (addr/len/prot/flags) after the stage's three-word clear"
+else
+    bad "V1. the first-trap ladder or the four-word stage is gone — a W|X, file-backed or out-of-span map would post (the sidecar twin then being the only wall), or the verdict would re-check a grant against words the FIRST trap never saw"
+fi
+mmap_v=$(grep -nF 'v = linux_mem_mmap_verdict(' "$DISP" | head -1 | cut -d: -f1)
+if [ -n "$mmap_v" ] && \
+   sed -n "$((mmap_v - 3)),$((mmap_v + 6))p" "$DISP" | grep -qF 'cur->linux_mmap_top' && \
+   grep -qF 'v.new_mmap_top;' "$DISP" && \
+   grep -qF 'cur->linux_mmap_top,' "$DISP" && \
+   grep -qF '(-LINUX_ENOMEM);' "$DISP" && \
+   grep -qxF '                        } else if (snum == LINUX_MMAP) {' "$DISP" && \
+   ! grep -qF '                            } else if (snum == LINUX_MMAP) {' "$DISP"; then
+    ok "V2. the REPLY verdict runs with the kernel's OWN span and BOTH cursors (brk_cur, mmap_top) — at the snum level the brk chain is chained FROM (an else hung inside the brk verdict's map-pages arm compiles clean and is unreachable for LINUX_MMAP: the measured failure), a malformed grant answers -ENOMEM with nothing mapped, and a success moves the kernel's cursor by the verdict's own number"
+else
+    bad "V2. the verdict call, its cursor arguments or the malformed arm is gone — a forged or drifted grant would map pages the kernel never re-checked, or the two cursors would stop converging"
+fi
+inv_upc=$(grep -nF 'void user_invlpg(uint64_t vaddr)' "$UPC" | head -1 | cut -d: -f1)
+if [ -n "$inv_upc" ] && \
+   sed -n "$((inv_upc + 1))p" "$UPC" | grep -qF 'invlpg (%0)' && \
+   grep -qF 'void user_invlpg(uint64_t vaddr);' "$UPH" && \
+   grep -qF 'if (v.replace)' "$DISP" && \
+   grep -qF 'user_invlpg(va);' "$DISP" && \
+   grep -qF 'free_physical_ram_frame_for_partition' "$DISP"; then
+    ok "V3. MAP_FIXED replaces honestly — the old page's frame is read back and returned to the partition, the one stale-translation path (a PRESENT leaf ring-3 ran on) shoots its TLB entry down through the named invlpg, and the new protection is installed per prot"
+else
+    bad "V3. the replace walk, the frame return or the invlpg is gone — a replace would leak the old frame and zero live bytes, or ring-3 would keep running on the stale translation the guard page replaced"
+fi
+if grep -qF 'pd->linux_mmap_top   = pd->linux_heap_limit;' "$CAPC" && \
+   grep -qF 'pd->linux_mmap_top = 0;' "$PDC" && \
+   grep -qF 'uint64_t   linux_mmap_top;' "$PDH"; then
+    ok "V4. both cursors are stamped and cleared where the heap span is — the create births linux_mmap_top at the span's limit beside brk_cur, slot reuse zeroes it beside the other three, and the descriptor declares it"
+else
+    bad "V4. the kernel cursor's stamp, clear or field is gone — a reused slot would inherit its predecessor's cursor (a grant landing on a page the last occupant's map owned) or a LINUX task would have no cursor to cap brk by"
+fi
+mmap_arm=$(grep -nF '        9 => {' "$LRS" | head -1 | cut -d: -f1)
+if [ -n "$mmap_arm" ] && \
+   sed -n "$((mmap_arm + 1)),$((mmap_arm + 60))p" "$LRS" | grep -qF 'MAP_ALLOW' && \
+   sed -n "$((mmap_arm + 1)),$((mmap_arm + 60))p" "$LRS" | grep -qF 'checked_add(0xFFF)' && \
+   sed -n "$((mmap_arm + 1)),$((mmap_arm + 60))p" "$LRS" | grep -qF 'checked_sub(len_r)' && \
+   sed -n "$((mmap_arm + 1)),$((mmap_arm + 60))p" "$LRS" | grep -qF 'Answer::Reply(0, E_NOMEM)' && \
+   grep -qF 'mtop: u64,' "$LRS" && \
+   grep -qF 't.brk_mtop = heap_limit;' "$LRS" && \
+   grep -qF 'want > brk.cur && want <= brk.mtop' "$LRS" && \
+   grep -qF 'tasks()[i].brk_mtop = mem.mtop;' "$LRS"; then
+    ok "V5. the sidecar's 9 arm is the ladder's twin and the ledger's policy — the closed allowlist, the overflow-checked page-round, the descending cursor with its checked subtract, ENOMEM when the gap cannot fit, mtop born at the span's top, survived across the reply, and brk's ceiling capped by it (neither end load-bearing alone)"
+else
+    bad "V5. the arm, the ledger's mtop or brk's cap is gone — the cursor could hand the same arena out twice, land under the break, or a brk growth could map over an arena the other side granted"
+fi
+if grep -qF 'linux_mem_mmap_refusal(&req, BASE, LIMIT)' "$PHUT" && \
+   grep -qF 'linux_mem_mmap_verdict(BASE, LIMIT, BASE, LIMIT, &req,' "$PHUT" && \
+   grep -qF 'linux_mem_brk_verdict(BASE, LIMIT, LIMIT - 0x1000,' "$PHUT"; then
+    ok "V6. the host test drives the ladder, the verdict AND the brk cap against the REAL linux_abi.c — every branch reachable without a boot (run_all compiles and runs it)"
+else
+    bad "V6. the host test no longer drives the mmap seam — every refusal and verdict branch would be argued from these greps alone, reachable only at boot"
+fi
+if grep -qF '.Lmmap:' "$FIX" && \
+   grep -qF 'E7MEM-MMAP-OK' "$FIX" && \
+   grep -qF 'mov     $399, %eax' "$FIX" && \
+   grep -qF 'mov     $400, %eax' "$FIX" && \
+   grep -qF 'mov     $401, %eax' "$FIX" && \
+   grep -qF 'mov     $402, %eax' "$FIX" && \
+   grep -qF 'mov     $403, %eax' "$FIX"; then
+    ok "V7. the fixture carries the E7MEM-MMAP block — the arena grant (aligned, in-span), the zero-read, the bytes out FROM THE MAPPED PAGE, the FIXED guard's exact echo, the W|X twin and the budget shape, each with its own marker (399–403, asserted absent at boot)"
+else
+    bad "V7. the fixture's map block or its markers are gone — the anonymous-map seam would have no on-target proof, and a regression would read as a quiet run"
+fi
+if grep -qF 'fn hex_into' "$LRS" && \
+   grep -qF ' ok mmap -> 0x' "$LRS" && \
+   grep -qF 'EPERM mmap(len=' "$LRS" && \
+   grep -qF ' -> ENOSYS mmap(len=' "$LRS"; then
+    ok "V8. the instrument carries every mmap answer — a grant shows the address the ledger gave (hex: an address is unreadable in decimal), every refusal shows the request's words with the errno it became, and the increment-15 ENOSYS line is unchanged behind it"
+else
+    bad "V8. an mmap answer line is gone — the run's proof would be a reconstruction again (the increment-14/15 instrument rule)"
 fi
 
 echo

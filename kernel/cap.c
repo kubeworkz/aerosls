@@ -3884,15 +3884,25 @@ int cap_create_sidecar_in_personality(uint32_t parent_pid,
     pd->linux_heap_base  = 0;
     pd->linux_heap_limit = 0;
     pd->linux_brk_cur    = 0;
+    pd->linux_mmap_top   = 0;
     pd->mem_stage_valid  = 0;
     pd->mem_stage_num    = 0;
     pd->mem_stage_a0     = 0;
+    pd->mem_stage_a1     = 0;
+    pd->mem_stage_a2     = 0;
+    pd->mem_stage_a3     = 0;
     if (personality == PROC_PERSONALITY_LINUX) {
         pd->linux_heap_base  = stack_base + (uint64_t)stk_pages * 4096;
         pd->linux_heap_limit = pd->linux_heap_base
                              + ((m.budget_mem_bytes + 4095ULL) / 4096ULL)
                                * 4096ULL;
         pd->linux_brk_cur    = pd->linux_heap_base;
+        /* E7 increment 16: the anonymous-map cursor is born at the
+         * span's top — the sidecar ledger's mtop is the policy twin —
+         * so brk grows up from the base and a granted mmap descends
+         * from the limit, and the two can never meet: each verdict
+         * re-checks against its OWN copy of both cursors. */
+        pd->linux_mmap_top   = pd->linux_heap_limit;
     }
     if (m.name_len > 0) {
         /* Use the manifest's NAME record for the debug name. */

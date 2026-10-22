@@ -284,15 +284,101 @@ int linux_poll_refuses_blocking(uint64_t num, uint64_t timeout);
  *     read becomes a memory lever). */
 #define LINUX_BRK        12u           /* the census's brk row (§5.6)      */
 #define LINUX_MPROTECT   10u           /* the census's mprotect row        */
-#define LINUX_MMAP        9u           /* named: the mem class's NEXT      */
-#define LINUX_MUNMAP     11u           /* increment, not landed here       */
-#define LINUX_PROT_WRITE 0x2u          /* Linux mman.h PROT_* bits — ABI  */
-#define LINUX_PROT_EXEC  0x4u          /* (the sidecar's twin repeats them */
-                                       /*  as literals; guard N3 pins it)  */
+#define LINUX_MMAP        9u           /* the census's mmap row — the      */
+#define LINUX_MUNMAP     11u           /* anonymous-map half landed at     */
+                                       /* increment 16; munmap still named */
+#define LINUX_PROT_NONE  0x0u          /* Linux mman.h PROT_* bits — ABI  */
+#define LINUX_PROT_READ  0x1u          /* (the sidecar's twin repeats them */
+#define LINUX_PROT_WRITE 0x2u          /*  as literals; guard N3 pins it)  */
+#define LINUX_PROT_EXEC  0x4u
+
+/* The mmap flag bits this shim's v1 knows by name (Linux mman.h). The
+ * allowlist is closed: anything outside it is refused by name at BOTH
+ * ends, with the flags on the answer line. FIXED is honored; NORESERVE
+ * and STACK are documented no-op hints on x86-64 — accepting and
+ * ignoring them IS Linux's behavior, not a shortcut. ANONYMOUS+PRIVATE
+ * is the only served class: the measured allocator's arena shapes. */
+#define LINUX_MAP_SHARED    0x0001u
+#define LINUX_MAP_PRIVATE   0x0002u
+#define LINUX_MAP_FIXED     0x0010u
+#define LINUX_MAP_ANONYMOUS 0x0020u
+#define LINUX_MAP_NORESERVE 0x1000u  /* hint, ignored (documented no-op) */
+#define LINUX_MAP_STACK     0x20000u /* hint, ignored (documented no-op) */
+
+/* The closed allowlist: PRIVATE|ANON|FIXED|NORESERVE|STACK. A request
+ * whose flags leave bits outside this mask is a shape the shim does not
+ * serve — refused ENOSYS by name, the flags on the line. */
+#define LINUX_MAP_V1_ALLOW (LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | \
+                            LINUX_MAP_FIXED   | LINUX_MAP_NORESERVE | \
+                            LINUX_MAP_STACK)
 
 /* 1 iff this mprotect must be refused before the post: prot has BOTH the
- * write and the execute bit. Total over every prot word. */
+ * write and the execute bit. Total over every prot word. Also the mmap
+ * first-trap's W|X rule (increment 16): the same §5.4 refusal over a
+ * prot word that arrives with a mapping ask. */
 int linux_mprotect_refuses_wx(uint64_t prot);
+
+/* The request a first trap stages for a granted mmap — the whole ask,
+ * not just args[0]: the verdict at the reply re-checks the grant
+ * against THESE words (what the FIRST trap saw), never against the
+ * reply's. This is brk's staged-request rule (§5.4) over four words
+ * instead of one. */
+struct LinuxMmapReq {
+    uint64_t addr;   /* args[0] as captured — the FIXED address, or 0  */
+    uint64_t len;    /* args[1] as captured — bytes, not pages          */
+    uint64_t prot;   /* args[2] as captured — PROT_* word               */
+    uint64_t flags;  /* args[3] as captured — MAP_* word                */
+};
+
+/* The first-trap refusals for mmap (increment 16): pure predicates over
+ * the request words — properties of the REQUEST, not of any object, so
+ * the channel is never posted for a shape that cannot be answered (the
+ * mprotect/poll posture). Returns 0 (proceed to describe-and-post) or a
+ * NEGATIVE Linux errno — the copy plans' convention, so the call site
+ * maps it straight into rax: -EPERM for W|X, -EINVAL for a malformed
+ * word (zero length, unknown prot bit, MAP_FIXED on an unaligned
+ * address), -ENOSYS for a shape not served (file-backed, shared, EXEC,
+ * unknown flag bits), -ENOMEM for a FIXED address outside the stamped
+ * span — the budget shape §5.4 names. span_base/span_limit are the
+ * descriptor's OWN stamped numbers (for a task without a heap span
+ * they are 0 and only the non-span rules apply). */
+int linux_mem_mmap_refusal(const struct LinuxMmapReq *req,
+                           uint64_t span_base, uint64_t span_limit);
+
+struct LinuxMemMmapVerdict {
+    int      malformed;    /* 1: the reply was neither this request's
+                            * grant nor its refusal — nothing maps, the
+                            * caller logs it and answers ENOMEM        */
+    int      replace;      /* 1: MAP_FIXED — every present page in the
+                            * range is unmapped first (frame returned),
+                            * then the grant installs per prot        */
+    int      prot_write;   /* 1: map the granted pages RW-NX; 0: RO-NX */
+    uint64_t map_va;       /* the range's first page: the one to back
+                            * (map_pages > 0) or reserve (PROT_NONE)   */
+    uint64_t range_pages;  /* pages in the granted range — the replace
+                            * walk covers exactly these               */
+    uint64_t map_pages;    /* pages to back with zero-filled frames — 0
+                            * for PROT_NONE (reservation only: every
+                            * access faults, which is PROT_NONE's whole
+                            * observable contract); always <= range_pages */
+    uint64_t new_mmap_top; /* the kernel-side cursor after this grant: */
+                            /* descends for non-FIXED, unchanged for   */
+                            /* FIXED (last map wins, as Linux itself)  */
+};
+
+/* The verdict at the reply (increment 16): re-check a granted mmap's
+ * answer against the kernel's OWN stamped span and OWN two cursors
+ * (brk_cur, mmap_top) — the staged request is what the first trap saw,
+ * rax is what the reply delivered. FIXED must echo the staged address
+ * exactly; non-FIXED must be page-aligned and land strictly above the
+ * break and at or below the cursor. A refusal reply (rax < 0) maps
+ * nothing and is not malformed — its errno rides the §5.7 map as
+ * usual. Pure: the host test drives every branch, including each way a
+ * grant can be a lie the kernel must refuse. */
+struct LinuxMemMmapVerdict
+linux_mem_mmap_verdict(uint64_t heap_base, uint64_t heap_limit,
+                       uint64_t brk_cur, uint64_t mmap_top,
+                       const struct LinuxMmapReq *req, uint64_t rax);
 
 struct LinuxMemBrkVerdict {
     int      malformed;  /* 1: the reply was neither this request's grant
@@ -305,12 +391,16 @@ struct LinuxMemBrkVerdict {
 };
 
 /* Verdict on a brk reply. heap_base/heap_limit/brk_cur are the kernel's
- * OWN stamped state (never the reply's), req is the break the first trap
- * staged (args[0] as captured), rax is what the reply delivered. Pure:
- * the host test drives every branch, including each way a grant can be a
- * lie the kernel must refuse. */
+ * OWN stamped state (never the reply's), mmap_top is the anonymous-map
+ * cursor (increment 16): brk's ceiling is min(heap_limit, mmap_top),
+ * because a page a granted mmap backed is a page a brk growth may never
+ * map over (a re-map leaks the frame and zeros live bytes). req is the
+ * break the first trap staged (args[0] as captured), rax is what the
+ * reply delivered. Pure: the host test drives every branch, including
+ * each way a grant can be a lie the kernel must refuse. */
 struct LinuxMemBrkVerdict linux_mem_brk_verdict(uint64_t heap_base,
                                                 uint64_t heap_limit,
+                                                uint64_t mmap_top,
                                                 uint64_t brk_cur,
                                                 uint64_t req, uint64_t rax);
 

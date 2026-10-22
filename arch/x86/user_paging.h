@@ -126,6 +126,22 @@ int cap_arch_identity_map_user(uint64_t pml4_phys, uint64_t phys,
 // allocating: unlike get_or_alloc(), this never creates missing levels.
 void user_unmap_page(uint64_t* pml4, uint64_t vaddr);
 
+/* E7 increment 16 (§5.4): shoot down ONE stale TLB entry, for the one
+ * path in this tree that edits a PRESENT leaf the task has already run
+ * on: a MAP_FIXED mmap replacing a page (the measured allocator's guard
+ * page lands on the brk heap's first page). Every other mapping path
+ * edits only not-present leaves — ring-3 never touched them, so no
+ * translation can be cached (the brk apply's posture, §5.4) — but a
+ * replace changes a translation ring-3 HAS used, and the task is parked
+ * on this same CPU with its CR3 still loaded, so one `invlpg` per
+ * touched page is the whole requirement.
+ *
+ * Named, NOT inline: `invlpg` is privileged, so — exactly like
+ * arch_read_cr3 — a host test that links a translation unit containing
+ * it dies before main() gets anywhere, and the seam must exist (the
+ * personality guard greps this call from the mmap apply, tooth t111). */
+void user_invlpg(uint64_t vaddr);
+
 // Phase 2 teardown: free EVERY frame a process's address space owns -- the
 // user-half intermediate tables, the process's own leaf data frames
 // (binary/stack/SIMI-scratch; the cap arena and the shared SIMI activation
