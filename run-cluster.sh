@@ -586,17 +586,51 @@ make "$X86_BIN"
 # ─── Per-node ISO ──────────────────────────────────────────────────────
 # Same recipe as the Makefile's x86-iso target, with a generated grub.cfg
 # carrying this node's identity.
+#
+# ─── The sidecars initrd, and why the cluster boots UNIFIED ─────────
+# make x86-iso ships sidecars.cpio so its unified menu entry can load it
+# as a Multiboot2 module: init plus the sidecar world — the environment
+# manager the shell's `env create`/`env destroy` round-trip to, the
+# console registry, the storage and network drivers. Without it a cluster
+# node boots kernel-only: every HTTP route answers, and the environment
+# manager simply does not exist (`env create` -> "no reply from the
+# environment manager"), which stayed invisible until a live
+# env-migration confirmation check needed one. `unified=1` is what makes
+# the kernel CREATE the init sidecar and return into the Ring-0 control
+# plane (the same entry tests/env_create_boot_check.sh boots); the NIC
+# role tokens are read by the same e1000_assign_roles either way.
+# The sources-digest refusal from the x86-iso recipe guards the
+# inclusion here too — a stale archive must not look like a kernel bug
+# at boot time.
+SIDECAR_SRC=""
+if [ -s sidecars.cpio ]; then
+    sc_want="$(tools/sidecar_source_digest.sh)"
+    sc_have="$(cat sidecars.cpio.digest 2>/dev/null || true)"
+    if [ "$sc_want" != "$sc_have" ]; then
+        echo "error: sidecars.cpio was NOT packed from the user/ sources in this tree." >&2
+        echo "       sidecars.cpio.digest records ${sc_have:-nothing}; the sources are $sc_want." >&2
+        echo "       Re-pack with: make selfhost-bootimage && make x86-iso" >&2
+        exit 1
+    fi
+    SIDECAR_SRC="sidecars.cpio"
+fi
 build_node_iso() {
     local i="$1" iso; iso="$(node_iso "$i")"
     local staging; staging="$(mktemp -d)"
     mkdir -p "$staging/boot/grub"
     cp "$X86_BIN" "$staging/boot/"
+    local mod_line=""
+    if [ -n "$SIDECAR_SRC" ]; then
+        cp "$SIDECAR_SRC" "$staging/boot/sidecars.cpio"
+        mod_line="    module2 /boot/sidecars.cpio sidecars.cpio"
+    fi
     cat > "$staging/boot/grub/grub.cfg" <<EOF
 set timeout=0
 set default=0
 menuentry "AeroSLS — cluster node $i" {
     insmod multiboot2
-    multiboot2 /boot/$X86_BIN node=$i nic0=mgmt nic1=cluster
+    multiboot2 /boot/$X86_BIN node=$i unified=1 nic0=mgmt nic1=cluster
+$mod_line
     boot
 }
 EOF

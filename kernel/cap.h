@@ -897,9 +897,28 @@ void cap_unlock(struct CapSpinlock* l);
 #define SIDECAR_TAG_BOOTSTRAP    0x0008
 #define SIDECAR_TAG_FLAGS        0x0009
 #define SIDECAR_TAG_NAME         0x000A
+/* §5.2's environment-crossing record (matches user/proto/src/manifest.rs
+ * TAG_ARGENV): the argv and envp that cross on the spawn request — the
+ * sidecar knows the command line and the environment, so they are its to
+ * define. Consumed only by the create's §5.2 stack image; an absent
+ * record is the v1 answer (argv = { name }, an empty environment), so
+ * every manifest built before the record existed keeps running. */
+#define SIDECAR_TAG_ARGENV       0x000E
 
 #define SIDECAR_MANIFEST_MAX_CAPS  16
 #define SIDECAR_MANIFEST_MAX_NAME  64
+
+/* ── ARGENV record bounds (§5.2) ─────────────────────────────────────────
+ * The record's strings are copied into a FIXED arena on the create's
+ * stack and NUL-terminated there (linux_initial_stack_build consumes
+ * C strings), so these bounds are what the parse refuses BY NAME rather
+ * than letting a manifest dictate the create's stack size or silently
+ * truncating a list. Mirrored in user/proto/src/manifest.rs — one truth
+ * across the seam, and the record's own counts make the header's
+ * "+10 fixed records" slack roomier, not tighter. */
+#define SIDECAR_MANIFEST_MAX_ARGV  8
+#define SIDECAR_MANIFEST_MAX_ENVP  16
+#define SIDECAR_MANIFEST_ARGENV_BYTES 512
 
 struct SidecarManifestHeader {
     uint8_t  magic[8];
@@ -955,6 +974,17 @@ struct SidecarManifest {
     /* CAP records */
     struct SidecarCap caps[SIDECAR_MANIFEST_MAX_CAPS];
     uint8_t  n_caps;
+    /* ARGENV record (§5.2's environment-crossing record): the record's
+     * strings copied NUL-terminated into a fixed arena (argv strings
+     * first, then envp, in record order), with an offset per entry. The
+     * zeroed counts mean "no record": the create's §5.2 site then hands
+     * the child the v1 fallback (argv = { name }, empty environment). */
+    uint16_t argc;
+    uint16_t envc;
+    uint16_t argenv_used;
+    uint16_t argv_off[SIDECAR_MANIFEST_MAX_ARGV]; /* into argenv_arena */
+    uint16_t env_off[SIDECAR_MANIFEST_MAX_ENVP];  /* into argenv_arena */
+    char     argenv_arena[SIDECAR_MANIFEST_ARGENV_BYTES];
 };
 
 /* BootInfoBlock — written by the kernel at the child's stack top.
@@ -1048,6 +1078,73 @@ int cap_create_sidecar(uint32_t parent_pid,
                        const void* manifest, uint32_t manifest_len,
                        uint16_t parent_ch_w, uint16_t console_ch_w,
                        uint16_t* out_ch_r);
+
+/* ─── SYS_SLS_LINUX_SPAWN (328) — E7 increment 2 (Linux ABI Shim Design
+ * §3.3/§3.5, and §11 Q3's settled answer) ──────────────────────────────────
+ * Creates a Linux-PERSONALITY task through the SAME manifest path as
+ * SYS_SLS_CREATE_SIDECAR — same parser, same caps, same partition rules,
+ * and above all the same E2 gate inside cap_create_sidecar_in_personality:
+ * the caller must hold `sidecar_authority`, so only the sidecar creator
+ * tree (init -> DM -> the environment's POSIX sidecar) can spawn one, and
+ * every cap the child gets is one the manifest asked for. The personality
+ * is stamped inside the create, before the child is released, so no
+ * schedulable task ever carries the wrong personality — a follow-up
+ * "tag the child" syscall could not promise that: the child released by
+ * the create runs on the next tick.
+ *
+ * The manifest is unchanged on purpose: personality is explicit at spawn
+ * (§5.1 — never inferred from bytes), and the syscall NUMBER is the
+ * explicitness. The request struct is SLSCreateSidecarRequest itself,
+ * including its OUT fields, so the caller's provisioning flow is byte-for-
+ * byte the one it already knows. 328 is next after PLACEMENT_CAN_HOLD
+ * (327); confirmed via grep across every kernel header defining SYS_SLS_*. */
+#define SYS_SLS_LINUX_SPAWN 328
+
+int cap_create_sidecar_in_personality(uint32_t parent_pid,
+                          const void* manifest, uint32_t manifest_len,
+                          uint16_t parent_ch_w, uint16_t console_ch_w,
+                          uint16_t* out_ch_r, uint32_t target_partition,
+                          uint32_t personality);
+uint64_t sys_sls_linux_spawn(struct SLSCreateSidecarRequest* req);
+
+/* ─── E7 increment 3 (Linux ABI Shim Design §3.3 steps 5-7) ────────────────
+ * The forward path's three seams, each in the file that can see what it
+ * needs: the TABLE scan lives in cap.c (only cap.c sees cap_tables), the
+ * post/park and recv/apply loops live in chan.c (only chan.c sees
+ * chan_resolve and the k_chan_* shapes they mirror), and the decisions are
+ * pure functions in linux_abi.h. cap_linux_find_channels scans the
+ * CURRENT process's own table (same posture as sidecar_find_parent_ch_w:
+ * a task's table is stable while it runs its own syscall) against
+ * linux_channel_shape_ok — §3.5's exactly-one-channel rule. Returns 0 and
+ * fills both slots, or -1 (no channel, or not exactly one candidate).
+ *
+ * k_linux_forward POSTS the message — the 72-byte description, plus for an
+ * fd-class write its attached bytes (E7 increment 5: the kernel copy out
+ * of the child's address space) — and then parks — park-ONLY:
+ * it never reads a reply, so a successful forward's rax can only come from
+ * the resume re-run (the source guard's I3 clause holds this). Parking with
+ * SYS_LINUX_TRAP_RESUME arms the in-flight state; k_linux_deliver is the
+ * resume arm: recv the reply, apply it through the errno map (echo + size
+ * enforced by linux_syscall_apply_reply), and re-park on a spurious wake.
+ * Returns: k_linux_forward an int CAP status (both families; the caller
+ * maps via linux_errno_from_cap), k_linux_deliver the final Linux rax.
+ * One more invariant the park loop relies on: this channel's ONLY writer
+ * is the one task forwarding on it, and that task is parked between post
+ * and reply — so the inbound queue can never be full at post time (a
+ * flood parks on the reply, which is §10.2's bounded-flood posture). */
+struct SLSLinuxSyscallRequest;   /* kernel/linux_abi.h — named here so this
+                                  * header and linux_abi.h share ONE struct
+                                  * type instead of a prototype-scope shadow
+                                  * (a second, private struct that then
+                                  * conflicts at this file's own includers).
+                                  * The forward's MESSAGE begins with this
+                                  * struct; its type is what msg_len
+                                  * validates against. */
+int      k_linux_forward(uint32_t pid, uint16_t ch_w, uint16_t ch_r,
+                         const void* msg, uint32_t msg_len);
+uint64_t k_linux_deliver(uint32_t pid, uint16_t ch_r, uint64_t expect_num);
+int      cap_linux_find_channels(uint32_t pid, uint16_t* out_ch_w,
+                                 uint16_t* out_ch_r);
 
 /* POSIX-Environments E1: the boot-context flags written into every BIB this
  * kernel fills (SIDECAR_BIB_FLAG_*). Set once at boot — kernel_main sets

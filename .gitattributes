@@ -21,4 +21,17 @@
 # on checkout/commit. Marked binary so script_conventions_check.sh skips the
 # CR-byte scan (same rule as *.png/*.iso above).
 *.cpio binary
+# The .flat probe payload and the E7 census-candidate ELF are byte-exact
+# toolchain outputs (objcopy / ld) whose MACHINE bytes legitimately contain
+# 0x0D; text=auto must never line-convert them, and
+# script_conventions_check.sh's CR scan skips whatever carries the
+# `binary` attribute — same rule as *.cpio above.
+*.flat binary
+*.elf binary
+# The e7_* evidence logs are RAW serial captures: the UART emits CRLF and
+# the coalesced stream carries NUL bytes, so they are byte evidence, not
+# source text — text=auto would refuse to line-convert them anyway (NUL
+# detection), and the CR scan skips whatever carries `binary` — same rule
+# as *.cpio above.
+evidence/*.log binary
 vendor/** -text -diff

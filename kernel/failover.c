@@ -5,6 +5,9 @@
  * Freestanding: local helpers, no libc.
  */
 #include "failover.h"
+#include "env_migrate.h"    /* env_migrate_in_flight() — the migration deferral gate */
+#include "env_ckpt.h"       /* P3 increment 11: the durable records the restore half replays from */
+#include "env_service.h"    /* P3 increment 11: env_service_restore_pending(), the standard replay driver */
 #include "state_tree.h"
 #include "partition.h"
 #include "kernel_io.h"
@@ -35,6 +38,19 @@ static void fo_recovered_name(char* dst, uint32_t part_id) {
 /* ─── Peer liveness table ────────────────────────────────────────────── */
 static struct PeerLiveness peers[FAILOVER_MAX_PEERS];
 static uint32_t last_adopted = 0;
+static uint32_t last_unrestored_envs = 0;
+static uint32_t last_restored_envs = 0;
+
+/* The armed set of ONE recovery (P3 increment 11): the (partition, index)
+ * pairs whose durable records this pass put into the replay's pending set,
+ * so the driver's outcome can be classified PER RECORD afterwards. File
+ * scope, not stack: failover_recover_from()'s frame already carries the
+ * 16 KiB receive buffer and the full node array, and this is called from the
+ * BSP sweep — same context, never re-entered (the same single-threaded
+ * posture every table in this file already assumes). */
+static uint32_t fo_armed_p[ENV_CKPT_MAX];
+static uint32_t fo_armed_idx[ENV_CKPT_MAX];
+static uint32_t fo_armed_count = 0;
 
 void failover_init(void) {
     fo_memset(peers, 0, sizeof(peers));
@@ -69,6 +85,7 @@ void failover_note_heartbeat(uint32_t node_id, uint64_t now) {
     if (!p) return;  /* table full */
 
     p->last_seen_tick = now;
+    p->defer_noted = 0;   /* seen: a later silence earns its own DEFERRED line */
     if (p->status == PEER_DEAD) {
         kernel_serial_printf("[FAILOVER] Node %u came back (was dead)\n", node_id);
     }
@@ -80,8 +97,74 @@ void failover_tick(uint64_t now) {
         if (!peers[i].active) continue;
         if (peers[i].status == PEER_DEAD) continue;
 
-        uint64_t silence = now - peers[i].last_seen_tick;
+        /* Saturating, not wrapping (observed live 2026-10-13: a DEFERRED
+         * line printed "silent 18446744073709551606 ticks" = -10 in
+         * unsigned). The two operands come from DIFFERENT contexts, so the
+         * stamp can legitimately land AHEAD of the sample: `now` is read
+         * once at this function's call site on the BSP sweep
+         * (net/http.c), while last_seen_tick is stamped by the heartbeat
+         * RX path (process_consensus_packet -> failover_note_heartbeat,
+         * fed from the timer ISR / AP core). A heartbeat processed between
+         * the sweep's read of kernel_tick_counter and this comparison
+         * leaves last_seen_tick > now, and the unsigned subtraction wraps
+         * to ~2^64 — comfortably past FAILOVER_DEAD_TICKS. The DEFERRED
+         * lines below merely printed a silly number; the same arithmetic
+         * on an ungated peer would declare DEAD the very sweep the peer
+         * was heard on. A stamp at or after `now` means the peer was seen
+         * at least as recently as this sample: silence is zero. */
+        uint64_t silence = (now > peers[i].last_seen_tick)
+                         ? now - peers[i].last_seen_tick : 0;
         if (silence >= FAILOVER_DEAD_TICKS) {
+            /* P3 live arm (2026-10-13): a silence this node's OWN
+             * environment migration produced is not a death. The source's
+             * synchronous payload send and the destination's restore (create
+             * round trip + parked-posture wait) both run on the BSP sweep —
+             * the same context that transmits the consensus heartbeat — so
+             * either end can pass this threshold while both are alive. The
+             * live 2-node TCG run did exactly that: BOTH nodes declared the
+             * other DEAD and BOTH adopted partition 1, flipping ownership
+             * back onto the sender, where the confirmation teardown then
+             * correctly refused ("this node owns the partition again") —
+             * three correct behaviors composing into one stuck migration.
+             * Defer the declaration while env_migrate_in_flight() covers
+             * the silence; a peer that really dies is declared the moment
+             * the migration resolves (the deferral's inputs are bounded). */
+            /* The idle-observer arm (docs/AeroSLS-Idle-Observer-Adoption-
+             * Finding-v0.1.md): the local gate below reads THIS node's
+             * migration state, which a third node correctly knows nothing
+             * about. The live 3-node runs showed what that costs: the busy
+             * SOURCE stopped beating (its blocking work runs on the sweep
+             * that transmits the leader's heartbeat), a healthy observer won
+             * the election the blocked node could not contest and adopted
+             * every partition in its checkpoint — every node alive, the
+             * migrating environment destroyed. The source announced its
+             * intent before blocking (env_migrate_intent_begin()); that
+             * announce is the knowledge this gate asks for. Bounded like
+             * every other face: the budget expires and a genuinely dead
+             * peer is declared. */
+            if (env_migrate_peer_in_flight(peers[i].node_id)) {
+                if (!peers[i].defer_noted) {
+                    peers[i].defer_noted = 1;
+                    kernel_serial_printf(
+                        "[FAILOVER] Node %u silent %llu ticks -- declaration "
+                        "DEFERRED: node %u announced environment-migration "
+                        "intent\n",
+                        peers[i].node_id, (unsigned long long)silence,
+                        peers[i].node_id);
+                }
+                continue;
+            }
+            if (env_migrate_in_flight()) {
+                if (!peers[i].defer_noted) {
+                    peers[i].defer_noted = 1;
+                    kernel_serial_printf(
+                        "[FAILOVER] Node %u silent %llu ticks -- declaration "
+                        "DEFERRED: an environment migration is in flight on "
+                        "this node\n",
+                        peers[i].node_id, (unsigned long long)silence);
+                }
+                continue;
+            }
             if (peers[i].status != PEER_DEAD) {
                 peers[i].status = PEER_DEAD;
                 peers[i].declared_dead_tick = now;
@@ -122,6 +205,15 @@ int failover_peer_status(uint32_t node_id) {
 /* ─── Recovery: adopt partitions from a received checkpoint ──────────── */
 int failover_recover_from(uint32_t dead_node_id) {
     last_adopted = 0;
+    /* Reset at ENTRY, not in the reporting block below: a recovery that
+     * returns early (no checkpoint, wrong source, no partitions) reported no
+     * environments, and a caller reading a stale count from the PREVIOUS
+     * recovery would be reading the last one's gap as this one's. The
+     * restored counter is reset beside its unrestored sibling for the same
+     * reason (P3 increment 11). */
+    last_unrestored_envs = 0;
+    last_restored_envs = 0;
+    fo_armed_count = 0;
 
     if (!dspp_ckpt_recv_ready()) return FAILOVER_NO_CHECKPOINT;
 
@@ -191,6 +283,147 @@ int failover_recover_from(uint32_t dead_node_id) {
 
     if (adopted == 0) return FAILOVER_NO_PARTITIONS;
 
+    /* POSIX-Environments v0.2 Phase P3, failover destination (b) (§11 Q5),
+     * increments 9 and 11. The adoption above flips OWNERSHIP. What the tree
+     * carries is the dead node's environment NAMES (ST_NODE_ENVIRONMENT,
+     * kernel/state_tree.c); what THIS node can restore from is its OWN
+     * durable record store (env_ckpt_table, written by persist_environments()
+     * and adopted at boot — the survivor's copy exists exactly when its own
+     * boot saw the record, the shared single-level store's normal case).
+     *
+     * Increment 9 named every environment of an ADOPTED partition as not
+     * restored — the report was the whole deliverable, and its own addendum
+     * recorded the boundary: "the restore half — the survivor actually
+     * recovering the environment from its own durable storage — is not
+     * implemented". Increment 11 implements it. Per environment, and per
+     * outcome: a present record is ARMED and replayed through the same
+     * driver a reboot uses (env_service_restore_pending(): create round
+     * trip, identity check, pause ledger, payload pour); an absent record is
+     * named, with that reason. A blanket "failover adopts partitions, not
+     * environments" would now be the lie, because whether an environment
+     * comes back is a fact this node can check rather than assume.
+     *
+     * Reported for the ADOPTED partitions only: an environment in a
+     * partition this node did not adopt belongs to whoever owns that
+     * partition now, and acting on it here would point an operator at state
+     * that is not this node's to restore. The `silent-failover`,
+     * `unscoped-report` and `no-durable-restore` teeth hold these lines. */
+    for (uint32_t i = 0; i < count; i++) {
+        if (nodes[i].type != ST_NODE_ENVIRONMENT) continue;
+        uint32_t part_id = nodes[i].partition_id;
+        if (partition_get_owner_node(part_id) != my_id) continue;
+
+        uint32_t env_idx = (uint32_t)nodes[i].entity_id;
+
+        /* The durable record for this (partition, index) on THIS survivor.
+         * A direct table walk for the same reason state_tree.c walks it:
+         * the table is the record store's live image, and this lookup is
+         * the whole "from its own durable storage" question — present means
+         * restorable, absent means the name is the report. */
+        const struct EnvCkptRecord* rec = (const struct EnvCkptRecord*)0;
+        for (uint32_t r = 0; r < env_ckpt_count && r < ENV_CKPT_MAX; r++) {
+            if (env_ckpt_table[r].partition_id == part_id &&
+                env_ckpt_table[r].index        == env_idx) {
+                rec = &env_ckpt_table[r];
+                break;
+            }
+        }
+        if (!rec) {
+            last_unrestored_envs++;
+            kernel_serial_printf(
+                "[FAILOVER] environment index %llu (partition %u, %llu region(s)) "
+                "was NOT restored -- no durable record for it on this survivor; "
+                "recreate it\n",
+                (unsigned long long)env_idx, part_id,
+                (unsigned long long)nodes[i].size);
+            continue;
+        }
+        if (env_ckpt_restore_arm(part_id, env_idx) != 0 ||
+            fo_armed_count >= ENV_CKPT_MAX) {
+            // Defensive: the record was just found above, so the arm can only
+            // fail if the table moved underneath this walk. Refused rather
+            // than silently dropped — an environment this pass could not even
+            // TRY belongs in the unrestored count, not in no count at all.
+            last_unrestored_envs++;
+            kernel_serial_printf(
+                "[FAILOVER] environment index %llu (partition %u) was NOT "
+                "restored -- its durable record exists but could not be armed "
+                "for replay\n",
+                (unsigned long long)env_idx, part_id);
+            continue;
+        }
+        fo_armed_p[fo_armed_count]  = part_id;
+        fo_armed_idx[fo_armed_count] = env_idx;
+        fo_armed_count++;
+    }
+
+    /* Drain exactly what was armed through the standard replay driver. The
+     * pending set normally holds nothing else (the boot drains its own at
+     * startup), so this pass is the adopted partitions' records; the driver
+     * is REUSED rather than duplicated because the create round trip, the
+     * identity check, the pause ledger and the payload pour are all its, and
+     * a second copy of those is a second place for them to rot. Runs on the
+     * BSP sweep — the same context the migration destination's restore
+     * already runs in (env_migrate.c), with the same yielding-before-pour
+     * discipline env_payload.h requires. */
+    if (fo_armed_count > 0) {
+        struct EnvSvcRestoreReport rep;
+        int rrc = env_service_restore_pending(&rep);
+        for (uint32_t a = 0; a < fo_armed_count; a++) {
+            uint32_t p = fo_armed_p[a], idx = fo_armed_idx[a];
+            /* The three outcomes, from the two facts that tell them apart.
+             * Still-pending means the driver never got to this record (rrc
+             * != 0: the environment manager is not up). Refused means it got
+             * there and was refused — and the refused mark is the ONLY way
+             * to know, because both outcomes clear the pending bit. Reading
+             * pending alone would count a REFUSED record as restored: the
+             * `refused-as-restored` lie, which is why clause K of the guard
+             * exists and why that tooth is the sharpest in the smoke. */
+            if (rrc != 0 || env_ckpt_restore_pending_record(p, idx)) {
+                last_unrestored_envs++;
+                kernel_serial_printf(
+                    "[FAILOVER] environment index %u (partition %u) was NOT "
+                    "restored -- the replay did not complete on this survivor "
+                    "(rc=%d); recreate it\n",
+                    (unsigned)idx, (unsigned)p, rrc);
+            } else if (env_ckpt_restore_refused_record(p, idx)) {
+                last_unrestored_envs++;
+                kernel_serial_printf(
+                    "[FAILOVER] environment index %u (partition %u) was NOT "
+                    "restored -- the replay REFUSED its durable record (reason "
+                    "printed by [ENV_RESTORE] above); recreate it\n",
+                    (unsigned)idx, (unsigned)p);
+            } else {
+                last_restored_envs++;
+                kernel_serial_printf(
+                    "[FAILOVER] environment index %u (partition %u) RESTORED "
+                    "from this survivor's durable record, replayed through "
+                    "create\n", (unsigned)idx, (unsigned)p);
+            }
+        }
+    }
+
+    if (last_unrestored_envs > 0) {
+        kernel_serial_printf(
+            "[FAILOVER] %u environment(s) of the adopted partitions were NOT "
+            "restored (named above) -- their payload lived on node %u's own "
+            "storage and does not follow ownership\n",
+            (unsigned)last_unrestored_envs, dead_node_id);
+    }
+    if (last_restored_envs > 0) {
+        // Contents, honestly scoped: the replay brings the ENVIRONMENT back
+        // (identity, sidecars, bindings). Its bytes follow only as far as
+        // the durable extent is readable on this survivor, and the payload
+        // layer names that refusal itself ([ENV_PAYLOAD]) — so this line
+        // claims the environment, never the contents.
+        kernel_serial_printf(
+            "[FAILOVER] %u environment(s) of the adopted partitions were "
+            "restored from durable storage; contents follow only as far as "
+            "each durable extent is readable on this survivor ([ENV_PAYLOAD] "
+            "names what is not)\n",
+            (unsigned)last_restored_envs);
+    }
+
     last_adopted = adopted;
     dspp_ckpt_recv_reset();
 
@@ -201,6 +434,17 @@ int failover_recover_from(uint32_t dead_node_id) {
 }
 
 uint32_t failover_last_adopted_count(void) { return last_adopted; }
+
+/* How many environments of the adopted partitions the last recovery named
+ * as NOT restored (POSIX-Environments P3, destination (b), increment 9).
+ * Countable rather than only logged so a host test can pin the property and
+ * an operator can read it back over the control plane. */
+uint32_t failover_last_unrestored_envs(void) { return last_unrestored_envs; }
+
+/* How many the last recovery actually RESTORED from this survivor's own
+ * durable records (P3 increment 11, the restore half of destination (b)).
+ * See failover.h for why a refused record counts here as unrestored. */
+uint32_t failover_last_restored_envs(void) { return last_restored_envs; }
 
 /* ─── Live checkpoint broadcast (leader -> followers) ────────────────── */
 static uint64_t failover_last_ckpt_tick = 0;

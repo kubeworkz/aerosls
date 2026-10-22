@@ -41,8 +41,16 @@ syscall_entry_stub:
 
     ; Save callee-saved regs (C ABI requires caller to preserve these).
     ; Also save RCX (user RIP) and R11 (user RFLAGS) which SYSCALL destroys.
-    ; Caller-saved regs (R8-R10, RSI, RDX, RDI) are NOT preserved here —
-    ; user programs must list them as clobbers in their inline asm.
+    ; Caller-saved regs (R8-R10, RSI, RDX, RDI) are NOT on this push list —
+    ; the kernel clobbers them mid-syscall (in-repo asm may still list them
+    ; as clobbers) — but E7 increment 13 RESTORES them at
+    ; syscall_return_path from the linux_args capture below, so they
+    ; survive the round trip the way Linux promises (only RAX = result,
+    ; RCX and R11 change across a syscall). A real musl binary holds
+    ; live values across one — __libc_sigaction keeps `act` in R8
+    ; through its unmask rt_sigprocmask — and it #PF'd at 0x8054bdf
+    ; reading 0x88(R8) with R8 back as kernel scratch (0x90/0x91) until
+    ; the restore landed.
     push rbp
     push rbx
     push r12
@@ -69,6 +77,23 @@ syscall_entry_stub:
     mov [gs:0x38], r12
     mov [gs:0x40], rbx
     mov [gs:0x48], rbp
+
+    ; E7 (increment 2, Linux ABI Shim Design §3.4): the six Linux argument
+    ; registers, to the SIBLING per-CPU block [gs:0x50..0x80), BEFORE any
+    ; call and before the number chain — for the same reason the block
+    ; above exists: a Linux-personality task's arguments live only in
+    ; rdi/rsi/rdx/r10/r8/r9, and the entry path DESTROYS them by the time
+    ; C could look (`mov rsi,rdi; mov rdi,rax` in .unknown_syscall). The
+    ; SLS path pays six stores and reads nothing; capturing unconditionally
+    ; is the honest first cut — a personality-gated capture would need the
+    ; personality in a register here, and the fast path is deferred to a
+    ; measurement (§3.7), not assumed.
+    mov [gs:0x50], rdi
+    mov [gs:0x58], rsi
+    mov [gs:0x60], rdx
+    mov [gs:0x68], r10
+    mov [gs:0x70], r8
+    mov [gs:0x78], r9
 
     ; ── Route on syscall number in RAX ───────────────────────────────────────
     cmp rax, 105
@@ -270,7 +295,8 @@ syscall_entry_stub:
 ; Phase 1.5: cap_recv_resume() (process.c) re-runs a parked recv and then
 ; jumps HERE to reuse the canonical syscall-return sequence — the eight pops
 ; undo the entry pushes (r11, rcx, r15..rbp), [gs:0] holds the user RSP the
-; resume path restored, and the trailing swapgs+sysret lands back in Ring-3.
+; resume path restored, the six-register restore below returns the
+; argument registers, and the trailing swapgs+sysret lands back in Ring-3.
 ; (Note: this label is deliberately NOT named `.syscall_return` — a leading
 ; dot would scope it to the previous non-local label and every `jmp` above
 ; would break. It is the shared return path for both entry modes.)
@@ -286,5 +312,21 @@ syscall_return_path:
     pop  rbp
 
     mov  rsp, [gs:0]
+    ; E7 increment 13 (§10.13's register wall): return the six Linux
+    ; argument registers from THIS entry's capture ([gs:0x50..0x80)) —
+    ; Linux changes only RAX (result), RCX and R11 across a syscall, so
+    ; a live value in any of them must survive. On the direct path the
+    ; capture is this very entry's (only the entry stub writes that
+    ; block, and no other syscall can have run on this core mid-flight);
+    ; cap_recv_resume()/cap_sysret_resume() re-stamp it from park_ctx
+    ; before they jump here, so a resume returns the PARKED task's own
+    ; registers, not whoever last trapped. Never touch RAX — it carries
+    ; the syscall's return value.
+    mov  rdi, [gs:0x50]
+    mov  rsi, [gs:0x58]
+    mov  rdx, [gs:0x60]
+    mov  r10, [gs:0x68]
+    mov  r8,  [gs:0x70]
+    mov  r9,  [gs:0x78]
     swapgs
     o64 sysret          ; return to Ring-3 (NASM 2.16: use o64 sysret, not sysretq)

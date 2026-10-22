@@ -409,6 +409,74 @@ void *allocate_physical_ram_frame_for_partition(uint32_t partition_id)
     return frame;
 }
 
+/* POSIX-Environments P3 live arm (2026-10-13): the migrate RECEIVE side's
+ * staging frames, taken from the TOP of the pool down instead of the bottom
+ * up.
+ *
+ * Placement on this OS is a deterministic function of the ASCENDING
+ * watermark: alloc_raw_frame() and allocate_contiguous_frames_for_partition()
+ * both scan upward, so a fresh environment's regions land at the first free
+ * run after everything allocated so far — the property the boot replay's
+ * placement contract rests on (the captured payload holds RAW interior
+ * pointers into identity-mapped regions, so a replay must land on the
+ * recorded bases; env_payload.h's placement rule). The SOURCE satisfies it:
+ * at create its watermark is just the boot's. The destination did NOT: its
+ * staging slot allocated the incoming payload's ~1600 frames ASCENDING
+ * before the restore's create ran, consuming the very low runs that create
+ * was about to be handed. Every region then landed a payload-length past
+ * the staged bases and the placement gate refused — caught live on the
+ * 2-node TCG cluster ("fresh environment landed off the staged bases",
+ * kind=POSIX_HEAP), invisible to the host test whose two simulated nodes
+ * share one allocator history.
+ *
+ * Taking the staging frames from the top leaves the ascending watermark
+ * exactly where the source's was, so the destination's first-fit
+ * reproduces the recorded bases byte for byte. Quota check, owner tag and
+ * usage accounting are the ascending path's own — only the scan direction
+ * differs — and free_*() is position-agnostic, so the staging slot's drop
+ * returns these frames like any other. */
+void *allocate_physical_ram_frame_for_partition_top(uint32_t partition_id)
+{
+    if (partition_id >= PARTITION_MAX) return 0;   // out of range -> fail closed
+
+    uint64_t quota = partition_frame_quota[partition_id];
+    if (quota != 0 && partition_frame_usage[partition_id] >= quota) {
+        // Over quota: fail cleanly before touching the bitmap at all —
+        // the same denial-before-any-side-effect posture as above.
+        return 0;
+    }
+
+    uint64_t sp = fp_current_sp();
+    for (size_t i = (TOTAL_FRAMES / 64); i-- > 0; ) {
+        if (physical_memory_bitmap[i] == 0xFFFFFFFFFFFFFFFFULL) continue;
+        for (int bit = 63; bit >= 0; bit--) {
+            uint64_t f = ((uint64_t)i * 64) + (uint64_t)bit;
+            if (f == 0) continue;   // frame 0 = address 0x0 = NULL
+            if (physical_memory_bitmap[i] & (1ULL << bit)) continue;
+            uint64_t base = f * FRAME_SIZE;
+            // Same last line of defence as alloc_raw_frame(): never hand
+            // back the frame the live kernel stack sits in. Withhold it
+            // (bit set, counters incremented) exactly as the ascending
+            // path does, so the two scans cannot disagree about it.
+            if (fp_frame_contains(base, sp)) {
+                physical_memory_bitmap[i] |= (1ULL << bit);
+                frames_reserved++;
+                frame_pool_live_stack_withheld++;
+                kernel_serial_printf(
+                    "[FRAME] *** WITHHELD frame 0x%llx (top-down scan): it "
+                    "contains the LIVE KERNEL STACK. ***\n",
+                    (unsigned long long)base);
+                continue;
+            }
+            physical_memory_bitmap[i] |= (1ULL << bit);
+            partition_frame_usage[partition_id]++;
+            frame_owner[f] = (uint8_t)partition_id;
+            return (void *)(uintptr_t)base;
+        }
+    }
+    return 0;
+}
+
 uint64_t allocate_contiguous_frames_for_partition(uint32_t partition_id,
                                                   uint64_t nframes,
                                                   uint64_t align_frames)

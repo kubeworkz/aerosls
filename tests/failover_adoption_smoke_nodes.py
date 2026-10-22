@@ -191,15 +191,68 @@ state = sys.argv[4]
 logdir = sys.argv[5]
 
 mode = open(os.path.join(state, "mode")).read().strip()
-leader_id = int(open(os.path.join(state, "leader")).read().strip())
+leader_f = os.path.join(state, "leader")
+leader_id = int(open(leader_f).read().strip())
+
+
+def current_leader():
+    """The node the cluster currently elects, per the state/leader file --
+    the same file the smoke harness writes the boot value into. For every
+    mode but prekillchurn the file names the boot leader forever, so this
+    is the boot argv leader; the prekillchurn tooth's churn thread flips it
+    mid-run (a survivor won the term) and a survivor's own election CASes
+    it back. A missing or torn file means the boot value: a reader that can
+    raise turns a torn write into a verdict decided by timing (the rule
+    read_created() follows)."""
+    try:
+        return int(open(leader_f).read().strip())
+    except (OSError, ValueError):
+        return leader_id
+
+
+def write_leader(value):
+    """Whole-write the leader file (tmp + os.replace) with a bounded retry:
+    current_leader() readers open it constantly, and WINDOWS denies
+    rename-over-open (a PermissionError that killed the churn thread on a
+    relaunched node, seen in the prekillchurn tooth's node2.stderr). A
+    racing reader must never decide a verdict -- the same rule
+    read_created() follows, applied to the writer's side."""
+    tmp = "%s.tmp%d" % (leader_f, os.getpid())
+    for attempt in range(5):
+        try:
+            with open(tmp, "w") as f:
+                f.write(str(value))
+            os.replace(tmp, leader_f)
+            return
+        except OSError:
+            if attempt == 4:
+                raise   # loud, in this process's stderr -- never silent
+            time.sleep(0.05)
 
 created = os.path.join(state, "created.json")
+# The guard creates a SECOND partition -- the '-env' one it then puts an
+# environment inside (step 4.5) -- and later looks the FIRST one ($NAME) up
+# again for steps 10-12. created.json therefore keeps holding the first row
+# exactly as every earlier gate expects, and later creates append here
+# instead of overwriting it. _partitions() serves both.
+extra = os.path.join(state, "extra.json")
+# The environments the guard's step 4.5 creates: [{partition, index, env_id}].
+envs_f = os.path.join(state, "envs.json")
 lease = os.path.join(state, "lease.json")
 migrate = os.path.join(state, "migrate.json")
 # The periodic re-announce's pass counter -- owned by the node that owns the
 # row, exactly like partition_reannounce_tick(). See its block below.
 reannounce = os.path.join(state, "reannounce")
 REANNOUNCE_PERIOD = 10.0   # models 1000 ticks ~= 10 s; see the block below
+# The checkpoint BROADCAST period, modelled for followers: the real leader
+# puts its state tree out every 100 ticks (~1 s), and the guard's step-4.5
+# gate counts DELTAS of "[DSPP-CKPT] RX: COMPLETE" lines that land AFTER the
+# -env create. Emitting the line exactly once at learn time (as this fake
+# did before step 4.5 existed) leaves that gate at 0 forever no matter how
+# long it waits, so followers now log one per period -- same shape, same
+# line, bounded by the guard's own windows. 2 s keeps two lines inside one
+# FAST 6 s window with margin on a loaded host.
+CKPT_PERIOD = 2.0
 # Test-only knob for the smoke's "leadergap" tooth: when <state>/health_gap
 # holds a number, the LEADER answers /api/health only after that many
 # seconds from the guard's create -- a bounded episode of unreachability,
@@ -224,8 +277,22 @@ lock = threading.Lock()
 # Per-mode: which node becomes leader (1 = node 2, 2 = node 3, 0 = both).
 if mode == "splitbrain":
     my_transition = "LEADER" if role == "follower" else "LEADER"
+elif mode == "prekillchurn":
+    # The churned election: node 1 (the boot leader) lost its role to node
+    # 2 mid-run, so after the step-6 kill of node 2 the survivor that
+    # adopts is node 1 -- the node the live 2026-10-16 restarts landed on.
+    my_transition = "LEADER" if node_id == 1 else "FOLLOWER"
 else:
     my_transition = "LEADER" if (role == "follower" and node_id == 2) else "FOLLOWER"
+
+# The node the adoption lands on once the current leader dies: node 2 in
+# every mode but prekillchurn (there the churn moved leadership to node 2
+# BEFORE the kill, so the remaining survivor, node 1, adopts). Every
+# hardcoded 2/1 pair the base choreography carries (the observer's handoff
+# learn, the owner derivation after a transition, the convergence pair's
+# adopter half) permutes through this and current_leader(), so the base
+# bytes stay byte-identical while the ids follow the real election.
+ADOPTER_ID = 1 if mode == "prekillchurn" else 2
 
 transitioned = False
 # lateflip: the observer flips to LEADER AFTER the adoption has been
@@ -261,6 +328,33 @@ def read_created():
         except ValueError:
             return None
     return None
+
+
+def read_list(path):
+    """A JSON list from disk. A missing or torn file is an empty list, never
+    an exception: a reader that can raise turns a half-written file into a
+    verdict decided by timing (the rule read_created()/read_epoch() follow)."""
+    if os.path.exists(path):
+        try:
+            v = json.load(open(path))
+            if isinstance(v, list):
+                return v
+        except ValueError:
+            pass
+    return []
+
+
+def read_envs():
+    return read_list(envs_f)
+
+
+def all_rows():
+    """Every partition row this node serves: the primary ($NAME) plus any
+    created after it (the guard's -env partition)."""
+    row = read_created()
+    rows = [row] if row else []
+    rows.extend(read_list(extra))
+    return rows
 
 
 def read_epoch():
@@ -315,16 +409,43 @@ def lease_term(row):
         return 0
 
 
+def read_migrate():
+    """The migrate (transfer) row. read_created()/read_lease()'s rule: a
+    half-arrived row means 'not yet', never an exception. A bare
+    json.load() in migrate_poll_thread() is what killed that RX thread --
+    the writer's in-place window (before this file's whole-write rule
+    reached migrate.json) let the destination read a zero-byte file once
+    and the thread died silently, so the transfer line never appeared:
+    observed as migrate_stable's FAIL ('the destination never logged the
+    owner-initiated transfer') while migrate_noapply, which models exactly
+    that absence, passed on the same gate."""
+    if os.path.exists(migrate):
+        try:
+            return json.load(open(migrate))
+        except ValueError:
+            return None
+    return None
+
+
+def row_owned_by(nid):
+    """The row node `nid` owns on disk: what ITS boot restore brings back
+    (the resurrect thread passes this node) and what its death leaves
+    behind (the death thread passes the dead id -- the adoption, the
+    observer's handoff learn and the classification are all ABOUT that
+    row, and in a restarted prekillchurn run the guard's gates are scoped
+    to it by NAME: the '-1' row in extra.json, owned by the churned
+    winner). The base modes have only created.json, whose row names the
+    boot leader; the fallback keeps them byte-identical (a torn or
+    partial view means 'not yet', never an exception)."""
+    for r in all_rows():
+        if int(r.get("owner_node", 0) or 0) == nid:
+            return r
+    return read_created()
+
+
 def learn_line(row, owner):
     return ("[PARTITION] sync: partition %s '%s' (owner node %s) learned "
             "from node %s." % (row["id"], row["name"], owner, owner))
-
-
-def leader_port():
-    # The smoke lays out nodes on consecutive ports: 1 -> BASE+1.
-    # We only know our own port, so derive the leader's port the same way
-    # the smoke does: leader_id is 1, its port is port - node_id + leader_id.
-    return port - node_id + leader_id
 
 
 # The modelled property is failover_tick's "silent >= FAILOVER_DEAD_TICKS"
@@ -344,10 +465,20 @@ def leader_port():
 DEAD_SILENCE = 4.0
 
 
-def leader_alive():
+def leader_alive(target=None):
+    """Poll a node's health. Without a target, the CURRENT election owner's
+    port (the prekillchurn flip moves it mid-run). With one, that EXACT
+    node: a silence observation, once started, stays pinned to the node
+    that went silent -- otherwise the other survivor's CAS (or, in
+    prekillchurn, the churn flip) redirects this poll to a live node, the
+    silence resets, and this thread never observes the death (seen in the
+    smoke: splitbrain's loser polling the winner post-CAS and never
+    transitioning)."""
+    nid = current_leader() if target is None else target
     try:
         with urllib.request.urlopen(
-                f"http://127.0.0.1:{leader_port()}/api/health", timeout=0.5):
+                f"http://127.0.0.1:{port - node_id + nid}/api/health",
+                timeout=0.5):
             return True
     except Exception:
         return False
@@ -418,8 +549,20 @@ learned = False
 
 def rx_thread():
     global learned
-    if role != "follower":
+    if role != "follower" and mode != "prekillchurn":
         return
+
+    def defer():
+        """The current election owner never RX's: it serves its own tree.
+        In every base mode that is the argv leader, which returns above;
+        prekillchurn also defers the ORIGINAL leader once the churn thread
+        flips the election away from it (its own unseen rows must be its to
+        BROADCAST -- the live ex-leader's exact lost precondition) and the
+        RELAUNCHED leader for as long as it leads."""
+        while current_leader() == node_id:
+            time.sleep(0.05)
+
+    defer()
     # Life-bounded, not counter-bounded (see the rule at the top of this
     # file): the create announce can arrive at any point in the guard's run,
     # including after its own WAIT_NODES pre-create phase has spent its
@@ -440,10 +583,49 @@ def rx_thread():
         # landed.
         next_reannounce()
     if row and mode != "nolearn":
-        log(learn_line(row, leader_id))
-        learned = True   # learned regardless of nockpt: the learn gate
-                         # must pass, and the checkpoint gate is the log
-                         # line below, which nockpt skips.
+        # Learn every row this node has not seen yet, in id order. The base
+        # modes reach here with only created.json, so the loop body runs
+        # once exactly as the old single learn did; prekillchurn's restarted
+        # run creates the '-1' partition while this node is a plain
+        # follower, and the cadence below picks it up on its next tick.
+        seen = set()
+        while True:
+            if current_leader() == node_id:
+                # The election moved under us mid-loop (the churn thread's
+                # flip): this node is the broadcaster now -- it must stop
+                # receiving and never "learn" the rows it owns.
+                defer()
+                continue
+            # A node never "learns" a row it OWNS: the relaunched follower
+            # in prekillchurn restored the transferred '-1' row (its own)
+            # from disk, and an rx learn of it would log "(owner node
+            # $adopter) learned from node $adopter" -- the step-11e no-flap
+            # gate's exact forbidden line. The base relaunch is the argv
+            # leader (rx never runs there), so this only bites the churn
+            # shape; the base followers own nothing, so their loop is
+            # byte-identical.
+            fresh = [r for r in all_rows()
+                     if int(r["id"]) not in seen
+                     and int(r.get("owner_node", 0) or 0) != node_id]
+            if not fresh:
+                # Everything this node should have RECEIVED has arrived
+                # (its own rows never arrive -- they are served from its
+                # disk), so the serving gate below may open. Setting the
+                # flag only after a non-empty pass left prekillchurn's
+                # churned ex-leader (which owns the run-1 rows and receives
+                # only the restarted run's '-1') serving [] forever while
+                # its log carried the learn.
+                learned = True
+                break
+            for r in sorted(fresh, key=lambda r: int(r["id"])):
+                if current_leader() == node_id:
+                    defer()
+                    break
+                log(learn_line(r, current_leader()))
+                seen.add(int(r["id"]))
+            learned = True   # learned regardless of nockpt: the learn gate
+                             # must pass, and the checkpoint gate is the log
+                             # line below, which nockpt skips.
         if mode == "ckptlost1":
             # The checkpoint frame carrying the row was lost for the pass
             # that delivered the announce; the next periodic broadcast
@@ -454,8 +636,52 @@ def rx_thread():
             # CKPT line AFTER the sync line, so it must wait out another
             # period too.
             next_reannounce()
+            # pass 2 lands at create+10 (REANNOUNCE_PERIOD) -- but the gate's
+            # first deadline is create+S+6 where S is how long step 3 took,
+            # and S stretched to 4-6 s on a loaded host, so create+10 sat ON
+            # the deadline: one run's poll caught it inside window 1 (no
+            # re-drive note, tooth vacuous), another run's control missed it
+            # by a hair. create+12 puts it strictly between window 1's
+            # deadline (S+6 < 12 whenever S < 6, which step 3's own re-drive
+            # rule guarantees) and window 2's (S+12 > 12 always) -- the first
+            # window misses (the tooth's note) and the second catches it,
+            # with margins that only close if step 3 itself nearly timed out.
+            time.sleep(2.0)
         if mode != "nockpt":
             log("[DSPP-CKPT] RX: COMPLETE seq=1000 (448 bytes)")
+            # Periodic broadcast from here on: this is the follower's RX
+            # clock, so it stops with this thread (which is life-bounded) and
+            # never runs on a node that did not learn. ckptlost1 (above) delays
+            # the FIRST of these and nockpt suppresses every one, which is what
+            # keeps those two teeth biting through this loop.
+            seq = 1001
+            while True:
+                time.sleep(CKPT_PERIOD)
+                log("[DSPP-CKPT] RX: COMPLETE seq=%d (448 bytes)" % seq)
+                seq += 1
+                # A row can land long after this thread's first pass (the
+                # guard's -env partition, the restarted run's '-1'): learn
+                # it on the same RX cadence the checkpoint frames ride --
+                # the periodic re-announce is what re-delivers a late row in
+                # the real kernel too. Base modes: every row already sits in
+                # `seen`, so this is a no-op for them. The leader deferral
+                # is what stops the churned node's clock at the flip.
+                while True:
+                    if current_leader() == node_id:
+                        defer()
+                        continue
+                    fresh = [r for r in all_rows()
+                             if int(r["id"]) not in seen
+                             and int(r.get("owner_node", 0) or 0)
+                             != node_id]
+                    if not fresh:
+                        break
+                    for r in sorted(fresh, key=lambda r: int(r["id"])):
+                        if current_leader() == node_id:
+                            defer()
+                            break
+                        log(learn_line(r, current_leader()))
+                        seen.add(int(r["id"]))
 
 
 threading.Thread(target=rx_thread, daemon=True).start()
@@ -473,8 +699,11 @@ threading.Thread(target=rx_thread, daemon=True).start()
 # on the observer: it never logs a row at all, however often the guard
 # re-drives.
 def lease_rx_thread():
-    if node_id == 2:
-        return   # node 2 is the adopter -- it ISSUES the acquire itself
+    # The acquirer ISSUES the acquire itself (its own acquire_lease logs
+    # the campaign); everyone else mirrors the row. Which node that is
+    # comes from the row itself (base: node 2; prekillchurn: node 1, the
+    # churned election's adopter) -- the skip lands after the row wait, a
+    # net no-op for the base argv shape.
     if mode == "migrate_norow" and node_id == 3:
         return   # the observer's campaign RX never fires (the gate must bite)
     # Life-bounded, and retry-tolerant (read_lease): step 11 runs after the
@@ -486,6 +715,12 @@ def lease_rx_thread():
         row = read_lease()
         if row is None:
             time.sleep(0.05)
+    try:
+        if int(row.get("acquirer", 2)) == node_id:
+            return   # we issued this acquire ourselves; acquire_lease
+                     # already logged its campaign on this node
+    except (TypeError, ValueError):
+        pass
     if mode == "migrate_lost1" and node_id == 3 and lease_term(row) < 2:
         # The first campaign's packet (term 1) never landed on the OBSERVER
         # -- a lost HOP, not a broken RX path -- so this node only ever
@@ -519,32 +754,50 @@ threading.Thread(target=lease_rx_thread, daemon=True).start()
 # wins" bug, so the guard's step-12 no-flap gate can bite). svc_nostale
 # suppresses the stale declare entirely (the announce never fires).
 def svc_owner():
-    # Same owner derivation as _partitions(): the original leader (or the
-    # step-11 destination), node 2 once the adopter transitioned, and node
-    # 2 on the leader once it converged (step 10).
+    # Same owner derivation as _partitions(): the current election owner
+    # (or the step-11 destination), ADOPTER_ID once a survivor transitioned,
+    # and ADOPTER_ID on the leader once it converged (step 10). The
+    # `or (role == "leader" and ...)` keeps the base argv leader's local
+    # derivation even after the CAS moved the election elsewhere -- the
+    # RELAUNCHED leader resolves from its restored row, which is exactly
+    # what the resurrect_flap tooth's step-12 gate reads. Every branch is
+    # byte-equivalent to the argv-only form for the base modes (the file
+    # names the boot leader until a survivor's own election, which in base
+    # happens exactly at the adoption).
     row = read_created()
     if not row:
         return 0
-    if role == "leader":
+    if (current_leader() == node_id
+            or (role == "leader" and mode != "prekillchurn")):
         if migrated_to:
             return migrated_to
         if os.path.exists(os.path.join(state, "leader_converged")):
-            return 2
+            return ADOPTER_ID
         return node_id
     if migrated_to:
         return migrated_to
     if transitioned:
-        return 2
-    return leader_id
+        return ADOPTER_ID
+    return current_leader()
 
 
 def svc_rx_thread():
     global svc_local, svc_remote, svc_last_gen
-    if role == "leader":
+    if role == "leader" and mode != "prekillchurn":
         return   # local registrations shadow everything on the owner
     # Life-bounded: the step-12 re-announce comes long after the pre-kill
     # registration, way outside a counter started at process boot.
     while True:
+        if current_leader() == node_id:
+            # The current election owner serves its LOCAL registry; it must
+            # not accept a remote announce. The base argv leader returned
+            # above, but prekillchurn's churned ex-leader reaches this line
+            # after the flip -- and the restarted leader, while it leads.
+            # A declare that lands while we lead is picked up on the next
+            # pass, once the election is elsewhere (generation-gated, so
+            # nothing is lost).
+            time.sleep(0.05)
+            continue
         if not os.path.exists(svc):
             time.sleep(0.05)
             continue
@@ -598,8 +851,11 @@ threading.Thread(target=svc_rx_thread, daemon=True).start()
 # adoption; the observer (node 3 in adopted) logs the handoff.
 def death_thread():
     global transitioned, late_flipped
-    if role != "follower":
-        return
+    if role != "follower" and mode != "prekillchurn":
+        return   # (in prekillchurn the argv leader enters too: it polls its
+                 # own port until the churn flips the election away, then
+                 # polls the node that now leads -- the live ex-leader's
+                 # exact position)
     # Life-bounded: the guard SIGKILLs the leader after its own gates have
     # run, and this poll must still be listening when it does.
     # Sustained silence, not "3 strikes": the old rule declared the leader
@@ -609,8 +865,16 @@ def death_thread():
     # was answering, transitioned, and the guard then read its row as
     # "never learned" -- a verdict decided by a client timeout.
     silent_since = None
+    target = current_leader()
     while True:
-        if leader_alive():
+        if silent_since is None:
+            # Not observing silence: follow the CURRENT election (the
+            # prekillchurn flip moves who we poll). Once silence starts the
+            # target is PINNED -- see leader_alive() -- so neither the
+            # other survivor's CAS nor the flip can erase it or redirect
+            # the declaration to the wrong node.
+            target = current_leader()
+        if leader_alive(target):
             silent_since = None
             time.sleep(0.2)
             continue
@@ -620,16 +884,98 @@ def death_thread():
             time.sleep(0.1)
             continue
         transitioned = True
+        # The node that died is the one this thread was observing: the
+        # election owner at the start of the silence (the boot leader in
+        # every base mode; node 2 in prekillchurn, whose file the churn
+        # thread flipped before the kill). Every "dead node %u" line below
+        # carries it.
+        dead_id = target
+        if my_transition == "LEADER" and mode == "prekillchurn":
+            # The compare-and-swap a real campaign performs on the cluster's
+            # leader view -- PREKILLCHURN ONLY. There it moves the view from
+            # the churned winner (node 2, now dead) to this node (node 1),
+            # which is what makes the guard's /api/cluster role reads, the
+            # reject line's owner and the post-adoption resolve settle on
+            # the adopter, exactly as the live runs showed. The base modes
+            # NEVER write the file: the whole argv choreography (and every
+            # relaunched process's boot-time `leader_id`, which gates
+            # e.g. migrate_noreacquire's suppression) reads it as the boot
+            # leader -- observed the hard way: a base CAS made the
+            # step-11e relaunch boot with leader_id=2, its
+            # `node_id == leader_id` suppression never fired, and
+            # migrate_noreacquire passed VACUOUSLY. A split-brain candidate
+            # would race this CAS the way two campaigns race an election;
+            # step-7's both-survivors-LEADER check is what must catch that.
+            try:
+                cur = int(open(leader_f).read().strip())
+            except (OSError, ValueError):
+                cur = leader_id
+            if cur == dead_id:
+                write_leader(node_id)
+        # Prefetch BEFORE the declare: the guard's step-7.5 budget starts at
+        # the adopt line, so no file read (9p on a loaded host) may sit
+        # between the adopt line and the classification lines behind it.
+        # Observed a run where adopt+recovery landed and the classification
+        # never did within 10 s -- the gate read an I/O stall as "the
+        # adoption dropped the name", the increment-9 defect's exact shape.
+        row = row_owned_by(dead_id)
+        block = None
+        if my_transition == "LEADER" and mode != "notadopted" and row:
+            # The adopted partitions carry the guard's environment (step
+            # 4.5), and this survivor's own store holds no record of it --
+            # every node has its own disk, so the honest classification is
+            # the NOT-restored one. A RESTORED line here is the increment-11
+            # lie the guard's step 7.5 fails on, so it is never printed by
+            # any mode.
+            #
+            # Both lines are byte-shaped after kernel/failover.c's own
+            # printf's (331-411): the count in the summary is a bare
+            # "%u environment(s)" -- NOT "[%u]" -- and the per-env line ends
+            # in "; recreate it". The guard greps these literally.
+            #
+            # Bounded re-read while nothing matches: the registry provably
+            # exists (step 4.5's pre-gate proved the env live), so an empty
+            # or non-matching first read is torn/not-yet, never "no
+            # environment" -- a single-shot read that scored 0 printed
+            # nothing at all and failed the gate on that silence.
+            env_lines = []
+            n = 0
+            for _ in range(60):
+                adopted = {int(r["id"]) for r in all_rows()}
+                n = 0
+                env_lines = []
+                for e in read_envs():
+                    if int(e["partition"]) in adopted:
+                        n += 1
+                        env_lines.append(
+                            "[FAILOVER] environment index %u (partition %u, 3 "
+                            "region(s)) was NOT restored -- no durable record "
+                            "for it on this survivor; recreate it"
+                            % (int(e["index"]), int(e["partition"])))
+                if n:
+                    break
+                time.sleep(0.05)
+            if n:
+                env_lines.append(
+                    "[FAILOVER] %u environment(s) of the adopted partitions "
+                    "were NOT restored (named above) -- their payload lived "
+                    "on node %u's own storage and does not follow ownership"
+                    % (n, dead_id))
+            # ONE append for adopt+recovery+classification: the guard can
+            # never observe the adopt line without the classification lines
+            # already behind it in the same file.
+            block = "\n".join(
+                ["[FAILOVER] Adopted partition %s from dead node %u"
+                 % (row["id"], dead_id),
+                 "[FAILOVER] recovery for dead node %u: rc=0 (OK - adopted)"
+                 % dead_id]
+                + env_lines)
         # Every node that observes the death DECLARES it (failover_tick
         # runs everywhere); only the leader recovers.
-        log("[FAILOVER] Node %u declared DEAD (silent 300 ticks)" % leader_id)
-        row = read_created()
+        log("[FAILOVER] Node %u declared DEAD (silent 300 ticks)" % dead_id)
         if my_transition == "LEADER":
-            if mode != "notadopted" and row:
-                log("[FAILOVER] Adopted partition %s from dead node %u"
-                    % (row["id"], leader_id))
-                log("[FAILOVER] recovery for dead node %u: rc=0 (OK - adopted)"
-                    % leader_id)
+            if block is not None:
+                log(block)
         else:
             # The observer: it merely learns the handoff announce from
             # the adopter -- except in the misbehaviour modes. The
@@ -637,6 +983,7 @@ def death_thread():
             # the death phase; the extra steps are the relaunch and the
             # step-11 migration.
             if row and mode in ("adopted", "learnlost1", "ckptlost1",
+                                "prekillchurn",
                                 "observeradopts", "lateflip",
                                 "resurrect_stable", "resurrect_flap",
                                 "resurrect_nostale", "migrate_stable",
@@ -645,15 +992,15 @@ def death_thread():
                                 "migrate_noreacquire", "migrate_lost1",
                                 "migrate_norow", "svc_stable",
                                 "svc_flap", "svc_nostale"):
-                log(learn_line(row, 2))
+                log(learn_line(row, ADOPTER_ID))
             if row and mode == "observeradopts":
                 # The bug: a FOLLOWER that recovered. cluster_is_leader()
                 # should have gated this to the leader; the guard's
                 # step-9 log check must catch the second Adopted line.
                 log("[FAILOVER] Adopted partition %s from dead node %u"
-                    % (row["id"], leader_id))
+                    % (row["id"], dead_id))
                 log("[FAILOVER] recovery for dead node %u: rc=0 (OK - adopted)"
-                    % leader_id)
+                    % dead_id)
             if mode == "lateflip":
                 # The other bug: the loser flips to LEADER after the
                 # adoption (late split-brain). Delay so the step-7
@@ -667,6 +1014,51 @@ def death_thread():
 
 
 threading.Thread(target=death_thread, daemon=True).start()
+
+
+# ─── Pre-kill election churn: the live 2026-10-16 shape ──────────────────
+# The env create (step 4.5) is the longest synchronous shell command in the
+# system; on a loaded host its block outlasts the election timeout and a
+# SURVIVOR wins the term mid-run. The leader the guard picked loses the
+# role it must keep through the pre-kill phase -- its tree stops
+# broadcasting, so the environment NAME its checkpoints must carry never
+# enters any broadcast again -- and the guard's post-create checkpoint gate
+# loses its precondition. The guard must diagnose that as a LOST
+# PRECONDITION (a churned election, not a lost hop) and restart itself
+# against the node that now leads, rather than burning every remaining
+# window and failing the adoption arm it could still have run.
+#
+# The fake flips the leader file the moment the '-env' partition exists --
+# the same instant the live create's block produced the flip. Nothing
+# after that is faked: the guard's own re-drive loop, its role diagnosis,
+# the exec'd restart, and the full 13-step chain against the NEW leader
+# (which is then killed at step 6, adopted from, relaunched at step 10 and
+# migrated-to at step 11 -- every id the base choreography hardcodes
+# permutes through ADOPTER_ID and current_leader()).
+if mode == "prekillchurn" and not created_preexisting:
+    # Original boots only: the RELAUNCHED node is the resurrected
+    # ex-leader, not an election winner -- re-flipping the file at its boot
+    # (the '-env' row already exists, so the wait passes instantly) would
+    # hand the dead node the election back mid-step-10, and on Windows the
+    # write raced the constant current_leader() readers into a
+    # PermissionError that killed the thread. The flip belongs to the
+    # original node 2's mid-run position, once.
+
+    def churn_thread():
+        while True:
+            if any(str(r.get("name", "")).endswith("-env")
+                   for r in read_list(extra)):
+                break
+            time.sleep(0.05)
+        # Land mid-create, like the live runs: after the -env partition
+        # exists (the guard's env create follows it immediately) but before
+        # its post-create checkpoint gate has counted anything -- node 2's
+        # RX cadence is now paused by the leader deferral, so its gain in
+        # the gate's window is 0 or 1, never the 2 the gate wants.
+        time.sleep(0.3)
+        write_leader(2)
+
+    threading.Thread(target=churn_thread, daemon=True).start()
 
 
 # ─── Resurrected-owner choreography (the guard's step 10) ────────────────
@@ -687,12 +1079,13 @@ threading.Thread(target=death_thread, daemon=True).start()
 # Modes that must pass the guard's step 10 (the resurrected-owner conflict
 # gate) -- every PASS mode AND every migrate_* mode, because the migrate
 # teeth can only fail at a step-11 gate if step 10 got them there first.
-STEP10_MODES = ("adopted", "learnlost1", "ckptlost1", "resurrect_stable",
+STEP10_MODES = ("adopted", "learnlost1", "ckptlost1", "prekillchurn",
+                "resurrect_stable",
                 "migrate_stable",
                 "migrate_flap", "migrate_nolease", "migrate_noapply",
                 "migrate_nostale", "migrate_noreacquire", "migrate_lost1",
                 "migrate_norow", "svc_stable", "svc_flap", "svc_nostale")
-if role == "leader":
+if role == "leader" or mode == "prekillchurn":
 
     def resurrect_thread():
         if not created_preexisting:
@@ -701,7 +1094,7 @@ if role == "leader":
                      # and re-announces its row
         row = None
         for _ in range(200):
-            row = read_created()
+            row = row_owned_by(node_id)
             if row:
                 break
             time.sleep(0.05)
@@ -728,9 +1121,14 @@ if role == "leader":
         # The boot restore: the stale (or, at step 11, transferred) row.
         log("[PERSIST] Partition ownership restored from NVMe.")
         time.sleep(1.0)   # the re-announce period, scaled by FAST
-        # The periodic re-announce of the row this node owns.
+        # The periodic re-announce of the row this node owns. The claimer's
+        # id rides along: the survivors' verdict lines name both halves of
+        # the conflict, and only the claimer knows which half it is (base:
+        # node 1, the boot leader; prekillchurn: node 2, the churned
+        # winner). Nothing READS the row body -- the survivors gate on the
+        # file's existence -- so adding the field cannot break a reader.
         with open(os.path.join(state, "resurrect_claim"), "w") as f:
-            f.write(json.dumps(row))
+            f.write(json.dumps(dict(row, claimer=node_id)))
         # Step-11 relaunch: the transferred row is already ours -- no
         # conflict to resolve, the cluster agrees. (The guard's step-11
         # gates only need the restore + the agreement.)
@@ -751,10 +1149,16 @@ if role == "leader":
             time.sleep(0.05)
         # The real kernel's conflict lines carry the partition id, not the
         # name (partition_sync_upsert logs the claimed-by pair before the
-        # name is in scope) -- keep the fake byte-identical.
-        log("[PARTITION] sync: partition %s claimed by node 1 and node 2 -- "
-            "leader node 2's claim wins, applying." % row["id"])
-        log(learn_line(row, 2))
+        # name is in scope) -- keep the fake byte-identical. The pair is
+        # this node (the resurrected, still-stale claimer) and the ADOPTER:
+        # node 2 in every base mode, node 1 in prekillchurn (byte-identical
+        # to the old hardcoded pair, and correct even though the base modes
+        # never move the leader file).
+        adopter = ADOPTER_ID
+        log("[PARTITION] sync: partition %s claimed by node %u and node %u "
+            "-- leader node %u's claim wins, applying."
+            % (row["id"], node_id, adopter, adopter))
+        log(learn_line(row, adopter))
         # Step 12's service resolve on this node derives the node from the
         # partition owner; the owner is 2 once the leader has converged.
         with open(os.path.join(state, "leader_converged"), "w") as fc:
@@ -762,37 +1166,64 @@ if role == "leader":
 
     threading.Thread(target=resurrect_thread, daemon=True).start()
 
-if role == "follower":
+if role == "follower" or mode == "prekillchurn":
     flapped = False
 
     def claim_thread():
         global flapped
         claim = os.path.join(state, "resurrect_claim")
+        if mode == "prekillchurn" and created_preexisting:
+            return   # the RELAUNCHED node: it is the claimer here, not a
+                     # survivor -- it must not "reject" its own claim (the
+                     # base relaunch is the argv leader and never reaches
+                     # this thread at all)
         # Life-bounded: the relaunched leader re-announces after its boot,
         # which is far into the guard's run.
         while True:
             if os.path.exists(claim):
-                row = read_created()
+                # The verdict is about the row AS CLAIMED: read it from the
+                # claim file, so a restarted run's '-1' row (id in
+                # extra.json, the row the guard's step-10 grep names) is
+                # the one judged -- not this node's own created.json view.
+                # The base claim file carries created.json's row, so its
+                # bytes are unchanged; a torn file falls back to it.
+                try:
+                    payload = json.load(open(claim))
+                except (OSError, ValueError):
+                    payload = {}
+                row = payload if payload.get("id") is not None else read_created()
                 if not row:
                     return
+                try:
+                    claimer = int(payload.get("claimer", 1))
+                except (AttributeError, TypeError, ValueError):
+                    claimer = 1   # the base shape: the boot leader claims
+                # The LIVE OWNER from this survivor's view: the adopter in
+                # every base mode (byte-identical to the old hardcoded
+                # "node 2"), node 1 in prekillchurn.
+                owner = ADOPTER_ID
                 if os.path.exists(migrate):
                     # Step-11 re-announce of the transferred row (owner =
                     # the destination): consistent with our post-migrate
                     # view -- a plain echo learn, no conflict.
-                    log(learn_line(row, 1))
+                    m = read_migrate()
+                    log(learn_line(row, m["dest"] if m else 1))
                     return
                 if mode == "resurrect_flap":
                     # The bug: the survivors APPLY the stale claim (the old
                     # "last announce wins" rule). The partition flaps back
-                    # to the resurrected owner.
-                    log("[PARTITION] sync: partition %s claimed by node 2 and "
-                        "node 1 -- taking the newer." % row["id"])
-                    log(learn_line(row, 1))
+                    # to the resurrected owner -- the CLAIMER, which is the
+                    # stale row's own node.
+                    log("[PARTITION] sync: partition %s claimed by node %u and "
+                        "node %u -- taking the newer."
+                        % (row["id"], owner, claimer))
+                    log(learn_line(row, claimer))
                     flapped = True
                 elif mode in STEP10_MODES:
-                    log("[PARTITION] sync: partition %s claimed by node 2 and "
-                        "node 1 -- keeping node 2 (live owner), rejecting the "
-                        "stale claim." % row["id"])
+                    log("[PARTITION] sync: partition %s claimed by node %u and "
+                        "node %u -- keeping node %u (live owner), rejecting the "
+                        "stale claim."
+                        % (row["id"], owner, claimer, owner))
                     if not os.path.exists(os.path.join(state, "resurrect_rejected")):
                         with open(os.path.join(state, "resurrect_rejected"), "w") as f:
                             f.write("1")
@@ -809,22 +1240,39 @@ if role == "follower":
 # migrate_flap logs the apply but flips to the WRONG owner (the flap).
 def migrate_poll_thread():
     global migrated_to
-    if node_id == 2:
-        return   # the adopter issues the migrate itself
+    # The ADOPTER issues the migrate itself; every other node applies it.
+    # Which node that is comes from the row (base: node 2; prekillchurn:
+    # node 1, the churned election's adopter), so the argv shape is no
+    # longer assumed -- and a base node 2 still skips exactly as before,
+    # just after the row lands instead of at boot (nothing logged either
+    # way).
+    while not os.path.exists(migrate):
+        time.sleep(0.05)
+    try:
+        if int(read_migrate().get("adopter", 2)) == node_id:
+            return
+    except (AttributeError, TypeError, ValueError):
+        return
     # Life-bounded: the step-11 transfer is the last thing the guard does.
     while True:
         if os.path.exists(migrate):
-            row = read_created()
-            if not row:
-                return
-            m = json.load(open(migrate))
-            owner_after = 1 if mode != "migrate_flap" else 2
             if mode == "migrate_noapply":
                 return   # the transfer never arrives (gate bites)
+            # Retry-tolerant, both files: a torn migrate row or a not-yet
+            # readable created row means "not yet", never a dead thread.
+            # The old `if not row: return` and bare json.load() killed this
+            # thread silently -- the single observed migrate_stable miss.
+            row = read_created()
+            m = read_migrate()
+            if row is None or m is None:
+                time.sleep(0.05)
+                continue
+            owner_after = (int(m["dest"]) if mode != "migrate_flap"
+                           else int(m["adopter"]))
             log("[PARTITION] sync: partition %s claimed by node %s and node %s -- "
                 "owner-initiated transfer, applying."
-                % (row["id"], m["adopter"], m["dest"]))
-            log(learn_line(row, owner_after))
+                % (m["id"], m["adopter"], m["dest"]))
+            log(learn_line({"id": m["id"], "name": m["name"]}, owner_after))
             with lock:
                 migrated_to = owner_after
             return
@@ -857,7 +1305,11 @@ def acquire_lease(pid):
     term = lease_term(read_lease()) + 1
     tmp = "%s.tmp%d" % (lease, os.getpid())
     with open(tmp, "w") as f:
-        json.dump({"partition_id": int(pid), "term": term},
+        # "acquirer": which node ISSUED this campaign -- the RX side's skip
+        # rule reads it (the acquirer mirrors nothing; everyone else
+        # mirrors the row), so the argv shape need not be assumed.
+        json.dump({"partition_id": int(pid), "term": term,
+                   "acquirer": node_id},
                   f, separators=(",", ":"))
     os.replace(tmp, lease)
     with lock:
@@ -875,6 +1327,16 @@ def do_migrate(pid, dest):
     global lease_held, migrated_to
     row = read_created()
     pid = pid or (str(row["id"]) if row else "1")
+    # The row being migrated is the one the COMMAND names (the guard
+    # migrates $NAME -- in a restarted prekillchurn run that is the '-1'
+    # row in extra.json, not created.json's stale first row; in the base
+    # modes the command names created.json's row, so the bytes are
+    # unchanged). The id+name travel in migrate.json so the receivers'
+    # transfer lines carry the same row the guard scopes its gate to.
+    for r in all_rows():
+        if str(r["id"]) == str(pid):
+            row = r
+            break
     # The SAME two lines the real kernel prints inside the shell capture
     # window: partition_migrate() runs synchronously under sls_shell_execute,
     # so its step-down and success lines land in the aeroslsctl RESPONSE,
@@ -894,10 +1356,17 @@ def do_migrate(pid, dest):
         lease_held = False   # the source's write permission is gone
         if mode != "migrate_flap":
             migrated_to = dest
-    with open(migrate, "w") as f:
+    # Whole-write (tmp + os.replace), the same rule the lease row and the
+    # re-announce counter follow: the RX side on nodes 1/3 polls this file
+    # every 50 ms from OTHER processes, and an in-place write shows them a
+    # zero-byte file for as long as this writer is preempted between open
+    # and close -- enough once to kill the destination's transfer thread.
+    tmp = "%s.tmp%d" % (migrate, os.getpid())
+    with open(tmp, "w") as f:
         json.dump({"id": row["id"] if row else 1,
                    "name": row["name"] if row else "",
                    "dest": dest, "adopter": node_id}, f, separators=(",", ":"))
+    os.replace(tmp, migrate)
     return out
 
 
@@ -911,75 +1380,89 @@ class H(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _role(self):
-        if role == "leader":
-            return "LEADER"
+        # The leader FILE, not the boot argv: an election won mid-run (the
+        # prekillchurn tooth) must move the role view the guard reads off
+        # /api/cluster -- which is exactly how the live 2026-10-16 runs
+        # diagnosed the churn. For every other mode the file names the boot
+        # leader until a survivor's own election, so each state the base
+        # choreography reaches returns the argv answer.
         if transitioned:
             if late_flipped:
                 return "LEADER"
             return my_transition
-        return "FOLLOWER"
+        return "LEADER" if current_leader() == node_id else "FOLLOWER"
 
     def _active(self):
-        if role == "leader":
-            return 3
         if transitioned:
             return 2
         return 3
 
     def _partitions(self):
         """The /api/partitions body. The leader serves the current created
-        row; a follower serves the row only once it has learned it, with
-        the owner depending on what the transition/migrate did with it.
+        row(s); a follower serves the rows only once it has learned them, with
+        the owner depending on what the transition/migrate did with them.
         holds_lease is partition_holds_write_lease()'s raw output: 1 only
         on the process that won an acquire (the adopter before the migrate,
-        the destination after its re-acquire)."""
-        row = read_created()
+        the destination after its re-acquire).
+
+        EVERY row (the primary $NAME plus the -env partition the guard's step
+        4.5 creates) is decorated identically: they are one cluster table, and
+        the guard reads $NAME by name from the adopter in step 10 while reading
+        the -env row's id in step 4.5 -- so both must be listed with the same
+        owner derivation."""
         lease_val = 1 if lease_held else 0
-        if role == "leader":
-            if not row:
+        rows = all_rows()
+
+        def decorate(owner=None, keep_owner=False):
+            out = []
+            for row in rows:
+                r = dict(row)
+                if not keep_owner:
+                    r["owner_node"] = owner
+                r["holds_lease"] = lease_val
+                out.append(r)
+            return out
+
+        if (current_leader() == node_id
+                or (role == "leader" and mode != "prekillchurn")):
+            if not rows:
                 return {"partitions": []}
-            r = dict(row)
-            r["owner_node"] = migrated_to if migrated_to else node_id
-            r["holds_lease"] = lease_val
-            return {"partitions": [r]}
+            return {"partitions": decorate(migrated_to if migrated_to
+                                            else node_id)}
         if mode == "nolearn":
             return {"partitions": []}
-        if not learned:
+        if not learned and not created_preexisting:
+            # A RELAUNCHED node serves what its boot restore brought back
+            # (prekillchurn's restarted leader, whose argv is FOLLOWER): the
+            # row is on ITS disk, so serving it is the restore, not a leak.
+            # Base followers never preexist created.json, so this is the
+            # argv gate it replaces, byte for byte.
             return {"partitions": []}
         if transitioned:
             if my_transition == "LEADER":
                 if mode == "notadopted":
-                    # Adopted nothing: the row still claims the DEAD leader.
-                    r = dict(row)
-                    r["holds_lease"] = lease_val
-                    return {"partitions": [r]}
+                    # Adopted nothing: the rows still claim the DEAD leader.
+                    return {"partitions": decorate(keep_owner=True)}
                 # resurrect_flap: the stale claim was applied, owner = 1.
                 if mode == "resurrect_flap" and "flapped" in globals() and flapped:
-                    r = dict(row)
-                    r["owner_node"] = 1
-                    r["holds_lease"] = lease_val
-                    return {"partitions": [r]}
+                    return {"partitions": decorate(1)}
                 # Adopted (owner = this node); after the step-11 migrate,
                 # migrated_to names the destination.
-                r = dict(row)
-                r["owner_node"] = migrated_to if migrated_to else node_id
-                r["holds_lease"] = lease_val
-                return {"partitions": [r]}
+                return {"partitions": decorate(migrated_to if migrated_to
+                                                else node_id)}
             # Observer: learned the handoff, owner = the adopter (node 2);
             # after the step-11 migrate, migrated_to names the destination.
             if mode == "resurrect_flap" and "flapped" in globals() and flapped:
-                r = dict(row)
-                r["owner_node"] = 1
-                r["holds_lease"] = lease_val
-                return {"partitions": [r]}
+                return {"partitions": decorate(1)}
+            return {"partitions": decorate(migrated_to if migrated_to
+                                            else ADOPTER_ID)}
+        # Not yet transitioned: the plain learned rows.
+        out = []
+        for row in rows:
             r = dict(row)
-            r["owner_node"] = migrated_to if migrated_to else 2
             r["holds_lease"] = lease_val
-            return {"partitions": [r]}
-        # Not yet transitioned: the plain learned row.
-        r = dict(row)
-        r["holds_lease"] = lease_val
-        return {"partitions": [r]}
+            out.append(r)
+        return {"partitions": out}
 
     def do_GET(self):
         if self.path == "/api/health":
@@ -1058,11 +1541,27 @@ class H(http.server.BaseHTTPRequestHandler):
             return
         if self.path == "/api/shell/exec":
             command = req.get("command", "")
-            if role == "leader" and command.startswith("partition create "):
+            if (current_leader() == node_id or (role == "leader"
+                    and mode != "prekillchurn")) \
+                    and command.startswith("partition create "):
                 name = command[len("partition create "):].strip()
-                with open(created, "w") as f:
-                    json.dump({"id": 1, "owner_node": node_id, "name": name,
-                               "state": "active"}, f, separators=(",", ":"))
+                # The FIRST create ($NAME) owns created.json -- every earlier
+                # gate keys on that single row, exactly as before. The guard's
+                # SECOND create (the -env partition, step 4.5) appends, so the
+                # $NAME row survives for steps 10-12 to look up again, and each
+                # create gets its own id (the guard resolves PART_ID2 by name).
+                if not os.path.exists(created):
+                    pid = 1
+                    with open(created, "w") as f:
+                        json.dump({"id": pid, "owner_node": node_id, "name": name,
+                                   "state": "active"}, f, separators=(",", ":"))
+                else:
+                    rows = read_list(extra)
+                    pid = 1 + max([int(r["id"]) for r in rows], default=1)
+                    rows.append({"id": pid, "owner_node": node_id, "name": name,
+                                 "state": "active"})
+                    with open(extra, "w") as f:
+                        json.dump(rows, f, separators=(",", ":"))
                 # The smoke's leadergap tooth: this create opens a BOUNDED
                 # window in which the leader answers /api/health late (see
                 # do_GET), modelling a busy leader rather than a dead one.
@@ -1073,12 +1572,25 @@ class H(http.server.BaseHTTPRequestHandler):
                 except (OSError, ValueError):
                     pass
                 self._json(200, {"ok": "true", "recognized": "true",
-                                 "output": f"created partition 1 ({name})"})
+                                 "output": f"created partition {pid} ({name})"})
             elif command.startswith("partition lease acquire "):
                 pid = command[len("partition lease acquire "):].strip()
                 acquire_lease(pid)
                 self._json(200, {"ok": "true", "recognized": "true",
                                  "output": f"lease acquire {pid} issued"})
+            elif command.startswith("env list "):
+                # The guard polls this to prove the create round trip completed
+                # (its step 4.5 console-registration gate).
+                pid = int(command[len("env list "):].strip() or 0)
+                mine = [e for e in read_envs() if int(e["partition"]) == pid]
+                outp = ["[ENV] list partition=%d live=%d" % (pid, len(mine))]
+                for e in mine:
+                    outp.append("[ENV] env partition=%d env_id=%d index=%d "
+                                "posix_pid=%d dropped=0"
+                                % (e["partition"], e["env_id"], e["index"],
+                                   100 + int(e["env_id"])))
+                self._json(200, {"ok": "true", "recognized": "true",
+                                 "output": "\n".join(outp)})
             elif command.startswith("partition migrate "):
                 parts = command[len("partition migrate "):].split()
                 pid = parts[0] if parts else ""
@@ -1086,6 +1598,21 @@ class H(http.server.BaseHTTPRequestHandler):
                 out = do_migrate(pid, dest)
                 self._json(200, {"ok": "true", "recognized": "true",
                                  "output": out})
+            elif command.startswith("env create "):
+                # The guard's step 4.5: an environment inside the -env
+                # partition. The output shape is kernel/env_service_create's
+                # shell line -- "[ENV] create partition=P index=I -> ok
+                # env_id=N" -- which is what the guard parses its env_id from.
+                pid = int(command[len("env create "):].strip() or 0)
+                envs = read_envs()
+                eid = 1 + max([int(e["env_id"]) for e in envs], default=0)
+                envs.append({"partition": pid, "index": 1, "env_id": eid})
+                with open(envs_f, "w") as f:
+                    json.dump(envs, f, separators=(",", ":"))
+                self._json(200, {
+                    "ok": "true", "recognized": "true",
+                    "output": "[ENV] create partition=%d index=1 -> ok env_id=%d"
+                              % (pid, eid)})
             else:
                 self._json(200, {"ok": "false", "error": f"not a create: {command}"})
         else:

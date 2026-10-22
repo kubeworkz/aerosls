@@ -22,7 +22,7 @@ use crate::allocator::BudgetAlloc;
 use crate::boot::{boot, BootCaps};
 use crate::heap::Bump;
 use aerosls_proto::bootinfo::BootInfo;
-use aerosls_proto::kabi::{CAP_CHAN_W, Kernel, RealKernel, TIMEOUT_NONE};
+use aerosls_proto::kabi::{CAP_CHAN_W, CAP_TYPE_DEV, Kernel, RealKernel, TIMEOUT_NONE};
 
 extern "C" {
     fn k_chan_send(chan: u32, tag: u32, flags: u16, payload: *const u8,
@@ -265,7 +265,7 @@ fn touch_cookie() {
     unsafe { core::ptr::read_volatile(&SYSCALL_COOKIE); }
 }
 
-fn klog(tag: &[u8], val: u32, extra: &[u8]) {
+pub(crate) fn klog(tag: &[u8], val: u32, extra: &[u8]) {
     let mut msg = [0u8; 96];
     let n = tag.len().min(24);
     msg[..n].copy_from_slice(&tag[..n]);
@@ -429,6 +429,99 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     // above installs the NetClient into the ProcManager so applets
     // can call ctx.net() for socket I/O.
 
+    // E7 census scope (§10.12): the probe/candidate pair is spawned ONLY
+    // by the environment that owns hardware — the system POSIX profile
+    // mints `nic0.bar0` (CAP_TYPE_DEV) and the tenant profile carries no
+    // hardware caps at all (env_manager's tests pin "uart", "irq.timer.0"
+    // and "nic0.bar0" absent from every tenant manifest). The census is a
+    // SERIAL-measured instrument: its [LOADER] lines, markers and klogs
+    // all ride the one UART, and in a multi-environment boot they ride it
+    // DURING the irqtest's serial-loopback window — measured on an
+    // e3_multi_env boot, that volume overflowed the kernel's TX deferral
+    // ring (`[serial] loopback window overflow: 0x16e0 byte(s) dropped`)
+    // and took the tenants' own drop-proof `aero state=` lines with it,
+    // failing e3_multi_env_boot_check on a boot whose environments had
+    // actually come up. One pair per boot (the system POSIX and its
+    // watchdog respawn) keeps the proof and leaves each tenant's wire as
+    // quiet as it was before increment 7.
+    let census_host = bib.find_cap(CAP_TYPE_DEV, "nic0.bar0").is_some();
+    if census_host {
+        // E7 boot proof (Linux ABI Shim Design §3.3 steps 5-7): spawn the
+        // Linux-personality probe from THIS sidecar — the design-true creator
+        // (§3.5: its one capability is the channel back to us, and the answers
+        // in linux::service below are the only path by which its syscalls
+        // succeed or fail). Failures are logged, never fatal: the proof is a
+        // proof, not a dependency of this sidecar's own boot.
+        match crate::e7_probe::spawn(&RealKernel, caps.budget_base, caps.budget_len) {
+            Ok(sp) => {
+                if crate::linux::track(
+                    sp.ch_r,
+                    sp.ch_w,
+                    crate::e7_probe::PROBE_NAME,
+                    0,
+                    sp.heap_base,
+                    sp.heap_limit,
+                ) {
+                    klog(b"[E7] probe: spawned ch_r=", sp.ch_r, b"");
+                } else {
+                    klog(b"[E7] probe: spawned but TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+                }
+            }
+            Err(rc) => klog(b"[E7] probe: spawn FAILED rc=", rc as u32, b""),
+        }
+
+        // E7 increment 7 (§5.1/§5.2): the SAME create over a REAL ELF64 image
+        // — the census candidate fixture, segments at their linked vaddrs and
+        // entry at e_entry — a controlled pair with the .flat probe above:
+        // identical machine code, only the IMAGE FORMAT differs, so the serial
+        // log measures exactly how far a real ELF gets (§10.12 records the
+        // run). Like the probe: logged, never fatal.
+        match crate::e7_candidate::spawn(&RealKernel, caps.budget_base, caps.budget_len) {
+            Ok(sp) => {
+                if crate::linux::track(
+                    sp.ch_r,
+                    sp.ch_w,
+                    crate::e7_candidate::CAND_NAME,
+                    0,
+                    sp.heap_base,
+                    sp.heap_limit,
+                ) {
+                    klog(b"[E7] candidate: spawned ch_r=", sp.ch_r, b"");
+                } else {
+                    klog(b"[E7] candidate: spawned but TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+                }
+            }
+            Err(rc) => klog(b"[E7] candidate: spawn FAILED rc=", rc as u32, b""),
+        }
+
+        // The designated first user (§10.12's named boundary): backup/
+        // aerobackup's OWN static musl binary (tools/linux_abi_candidate.
+        // conf), embedded as built — ET_EXEC, unmodified, the census target
+        // finally executing instead of being straced on the host. argv is
+        // v1 (`argv = { name }`), so it runs WITHOUT its flags: the run
+        // measures how far an unmodified real libc binary gets — crt, TLS,
+        // the §5.2 stack image and auxv, then wherever it stops (a usage
+        // write and exit_group, the first -ENOSYS name, or a fault). Like
+        // the pair above: logged, never fatal.
+        match crate::e7_firstuser::spawn(&RealKernel, caps.budget_base, caps.budget_len) {
+            Ok(sp) => {
+                if crate::linux::track(
+                    sp.ch_r,
+                    sp.ch_w,
+                    crate::e7_firstuser::USER_NAME,
+                    0,
+                    sp.heap_base,
+                    sp.heap_limit,
+                ) {
+                    klog(b"[E7] firstuser: spawned ch_r=", sp.ch_r, b"");
+                } else {
+                    klog(b"[E7] firstuser: spawned but TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+                }
+            }
+            Err(rc) => klog(b"[E7] firstuser: spawn FAILED rc=", rc as u32, b""),
+        }
+    }
+
     let mut boot_stats_sent = false;
     loop {
         // ── Console input: recv from kernel, push into ConsoleIo ──
@@ -455,6 +548,13 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                 let _ = RealKernel.send(cw, 0, 0, chunk, &[], TIMEOUT_NONE);
             }
         }
+        // E7 increment 3: answer any Linux-personality child's forwarded
+        // syscalls (its channel was registered by the spawn path via
+        // linux::track). Non-blocking per pass, like the console arm above —
+        // the parked sidecar's quiesce wait set includes these channels
+        // (linux::append_wait), so a forward wakes this loop instead of
+        // spinning it.
+        crate::linux::service(&RealKernel, &booted.console);
         booted.proc.drain_wakes();
         // One-shot boot diagnostic: report what task 0 (init) did and how
         // many tasks are live, so a quiet boot can be told apart from a
@@ -524,7 +624,12 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                 // The kernel wakes the park on any listed channel; a
                 // spurious wake just re-runs the loop (drain_wakes + a
                 // re-poll re-check everything).
-                let mut chans = [u32::MAX; 4];
+                // The kernel wakes the park on any listed channel; a
+                // spurious wake just re-runs the loop (drain_wakes + a
+                // re-poll re-check everything). E7 increment 3: the Linux
+                // children's forward channels join the set — a child's
+                // request must wake us, not wait for an idle pass.
+                let mut chans = [u32::MAX; 8];
                 let mut n = 0usize;
                 if let Some(c) = caps.console_chan {
                     chans[n] = c;
@@ -534,6 +639,7 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                     chans[n] = r;
                     n += 1;
                 }
+                crate::linux::append_wait(&mut chans, &mut n);
                 if n == 0 {
                     // No wired channels: spin (v1 debug only).
                     continue;

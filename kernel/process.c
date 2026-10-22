@@ -10,6 +10,7 @@
 #include "cap.h"   /* Seed Kernel Phase 1: strong cap_current_pid()/cap_proc_cr3() below */
 #include "console_service.h"  /* deferred console drain (single-CPU park-wake cadence) */
 #include "syscall_dispatch.h"   /* Seed Kernel Phase 1.5: do_syscall() from cap_recv_resume() */
+#include "linux_abi.h"   /* E7 increment 2: PROC_PERSONALITY_* for proc_clear_resume_state() */
 
 /* Seed Kernel Phase 1.5: the resume path iretq's into cap_recv_resume(),
  * which re-runs the parked recv and then jumps to the syscall stub's shared
@@ -110,6 +111,83 @@ static void proc_clear_resume_state(struct ProcessDescriptor* pd) {
     pd->pending_teardown = 0;
     pd->resume_control = 0;   /* E1: the control plane's own resume shape */
     pd->yield_deadline = 0;
+    /* E7 (increment 2): a reused slot must not inherit a personality. The
+     * consequence of getting this wrong is not a wrong return value — it is
+     * the next occupant's SLS syscall being read through the LINUX branch
+     * (or vice versa) because the slot remembered who lived there before.
+     * Spawn paths that want LINUX stamp it after this, inside the same
+     * create call (cap_create_sidecar_in_personality), so no window exists
+     * where a schedulable task carries the wrong personality. */
+    pd->personality = PROC_PERSONALITY_SLS;
+    /* E7 §5.3: the same rule for TLS as for personality — a reused slot's
+     * stale fs_base would point the next occupant's %fs at someone else's
+     * address space the instant the switch-in wrote it to the MSR. The
+     * staged-forward state clears here too: an unanswered stage must not
+     * survive into a slot whose pid it never belonged to. */
+    pd->fs_base = 0;
+    pd->fs_base_stage = 0;
+    pd->fs_stage_valid = 0;
+    /* E7 increment 6 (§5.4): the mem class's state clears here for the
+     * same two reasons — a reused slot must not inherit its
+     * predecessor's heap span (a stale brk_cur would make the next
+     * occupant's grant map pages at a break it never asked for, and a
+     * stale limit would let a grant the policy side refused through the
+     * kernel's own re-check), and an unanswered brk stage must not
+     * survive into a slot whose pid it never belonged to. Spawn paths
+     * that want LINUX stamp the span inside the same create call
+     * (cap_create_sidecar_in_personality), like the personality itself.
+     * E7 increment 16 widens the same rule: a stale mmap cursor would
+     * let a reused slot's non-FIXED grant land on (or its brk growth
+     * map over) a page the PREVIOUS occupant's map owned, and the
+     * staged mmap words must not survive into a slot whose pid they
+     * never belonged to — a reply carrying them would map against a
+     * span that is not the ask's. */
+    pd->linux_heap_base = 0;
+    pd->linux_heap_limit = 0;
+    pd->linux_brk_cur = 0;
+    pd->linux_mmap_top = 0;
+    pd->mem_stage_num = 0;
+    pd->mem_stage_a0 = 0;
+    pd->mem_stage_a1 = 0;
+    pd->mem_stage_a2 = 0;
+    pd->mem_stage_a3 = 0;
+    pd->mem_stage_valid = 0;
+    /* E7 increment 12 (§10.13's step 3): the reply payload's staged
+     * destination clears here for the same reason as every other stage —
+     * an unanswered copy-in destination must not survive into a slot whose
+     * pid it never belonged to, or a later reply payload would be written
+     * into the REUSED slot's successor's address space (the four-place
+     * lifecycle the staged-destination contract names).
+     */
+    pd->reply_stage_num = 0;
+    pd->reply_stage_va = 0;
+    pd->reply_stage_len = 0;
+    pd->reply_stage_valid = 0;
+}
+
+/* E7 (increment 2): read this CPU's captured Linux argument registers.
+ * The idiom is proc_park_capture's own (process.c's %%gs reads): the asm
+ * stub wrote these to the per-CPU sibling block at [gs:0x50..0x80) before
+ * any call — the entry frame on the syscall stack is NOT safe to read
+ * late (the -O2 call chain reuses it; the live failure that produced
+ * syscall_regs is recorded in arch/x86/user_paging.h). Kernel context
+ * (no syscall in flight) still reads whatever the last trap left; the
+ * caller gates on the CURRENT PROCESS's personality, which is only
+ * LINUX inside a Linux task's own trap, so the values always describe
+ * the syscall being described. */
+int proc_read_linux_args(uint64_t out[6]) {
+    if (!out) return 0;
+    __asm__ volatile("movq %%gs:0x50, %0\n\t"
+                     "movq %%gs:0x58, %1\n\t"
+                     "movq %%gs:0x60, %2\n\t"
+                     "movq %%gs:0x68, %3\n\t"
+                     "movq %%gs:0x70, %4\n\t"
+                     "movq %%gs:0x78, %5\n\t"
+                     : "=r"(out[0]), "=r"(out[1]), "=r"(out[2]),
+                       "=r"(out[3]), "=r"(out[4]), "=r"(out[5])
+                     :
+                     : "memory");
+    return 1;
 }
 
 // ─── process_init ─────────────────────────────────────────────────────────────
@@ -1057,6 +1135,13 @@ static int pick_next_process_in_partition(uint32_t partition_id, int exclude_idx
 //    continues exactly where it left off.
 //  - otherwise:        iretq to the process's saved ring-3 context.
 static void proc_build_resume_frame(struct ProcessDescriptor* next, uint64_t* f) {
+    /* E7 §5.3 (the plan's increment 4): FSBASE follows the task being
+     * switched IN to — one wrmsr at the single frame-builder every switch
+     * path honours (timer schedule_ring3, kernel_switch_next, the control-
+     * plane yield), so two Linux tasks in a row can never carry each
+     * other's TLS and every other task returns to base 0 rather than a
+     * leftover. No personality branch: the invariant is the mechanism. */
+    user_write_fs_base(next->fs_base);
     for (int i = 0; i < 15; i++) f[i] = 0;
     if (next->resume_sysret) {
         next->resume_sysret = 0;
@@ -1606,7 +1691,14 @@ static void kernel_switch_next(struct ProcessDescriptor* next) {
  * current process, so it always describes the CURRENT syscall. The
  * resume rebuild (cap_recv_resume / cap_sysret_resume) pushes these in
  * exactly the order syscall_entry_stub pushed the originals, so
- * .syscall_return's pops still land rcx=user RIP, r11=user RFLAGS. */
+ * .syscall_return's pops still land rcx=user RIP, r11=user RFLAGS.
+ * It ALSO snapshots the six Linux argument registers (linux_args,
+ * [gs:0x50..0x80)) — E7 increment 13's addition: the round trip must
+ * preserve them (Linux changes only rax/rcx/r11 across a syscall; musl
+ * holds `act` in r8 across its unmask syscall — the 0x8054bdf fault),
+ * and both resume paths re-stamp the per-CPU block from this field
+ * because they reach syscall_return_path WITHOUT running the entry
+ * stub, whose stores are the only other writer of that block. */
 static void proc_capture_entry_regs(struct CapParkCtx* ctx) {
     __asm__ volatile(
         "movq %%gs:0x10, %0\n\t"
@@ -1618,10 +1710,30 @@ static void proc_capture_entry_regs(struct CapParkCtx* ctx) {
         "movq %%gs:0x40, %6\n\t"
         "movq %%gs:0x48, %7\n\t"
         "movq %%gs:0, %8\n\t"
+        /* The argument half: read through ONE scratch register (rax),
+         * stored to memory outputs — 15 register outputs here would be
+         * impossible constraints at -O0 (a fixed rbp leaves 14 for 15),
+         * which is exactly how the three host tests that #include
+         * process.c caught the first attempt. */
+        "movq %%gs:0x50, %%rax\n\t"
+        "movq %%rax, %9\n\t"
+        "movq %%gs:0x58, %%rax\n\t"
+        "movq %%rax, %10\n\t"
+        "movq %%gs:0x60, %%rax\n\t"
+        "movq %%rax, %11\n\t"
+        "movq %%gs:0x68, %%rax\n\t"
+        "movq %%rax, %12\n\t"
+        "movq %%gs:0x70, %%rax\n\t"
+        "movq %%rax, %13\n\t"
+        "movq %%gs:0x78, %%rax\n\t"
+        "movq %%rax, %14\n\t"
         : "=r"(ctx->r11), "=r"(ctx->rcx), "=r"(ctx->r15), "=r"(ctx->r14),
           "=r"(ctx->r13), "=r"(ctx->r12), "=r"(ctx->rbx), "=r"(ctx->rbp),
-          "=r"(ctx->user_rsp)
-        : : "memory");
+          "=r"(ctx->user_rsp), "=m"(ctx->linux_args[0]),
+          "=m"(ctx->linux_args[1]), "=m"(ctx->linux_args[2]),
+          "=m"(ctx->linux_args[3]), "=m"(ctx->linux_args[4]),
+          "=m"(ctx->linux_args[5])
+        : : "rax", "memory");
 }
 
 /* Shared park capture: snapshot the current process's syscall-entry
@@ -1860,6 +1972,27 @@ void cap_wake_chan(uint32_t chan_id) {
 void cap_maybe_handoff(void) {
     struct ProcessDescriptor* cur = process_find_current();
     if (!cur) return;   /* kernel context: nothing to hand off from */
+
+    /* E7 increment 3: a forwarded Linux syscall's POST wakes the sidecar,
+     * and cap_wake_chan above has just stashed it in handoff_target — but
+     * handing off HERE would run cap_sysret_resume when this task is next
+     * picked: the syscall-skipping resume, which hardcodes RAX = 0 and
+     * sysrets. A Linux forward is MID-syscall (the reply is not awaited
+     * yet), so the handoff would answer the caller with 0 forever and strand
+     * its reply in the queue. Skip the immediate handoff — the wake itself
+     * already made the sidecar runnable, and THIS task parks a few
+     * instructions later (k_linux_forward), which is where pick_next runs
+     * it: same ordering, one park deeper, correctness instead of a shortcut
+     * that returns a lie to ring-3. Consume the stashed target so no later
+     * wake-of-another can hand it off either; only a Linux-forwarding task
+     * can arm park_syscall to this sentinel (cleared on every forward exit,
+     * zeroed at slot reuse in proc_clear_resume_state), so SLS tasks and
+     * the sidecar's own sends are byte-for-byte unaffected. */
+    if (cur->park_syscall == SYS_LINUX_TRAP_RESUME) {
+        cur->handoff_target = NULL;
+        return;
+    }
+
     struct ProcessDescriptor* target = cur->handoff_target;
     cur->handoff_target = NULL;
     if (!target || target == cur) return;
@@ -1925,6 +2058,23 @@ void cap_sysret_resume(struct ProcessDescriptor* pd) {
         "pushq 16(%1)\n\t"   /* r15 */
         "pushq 8(%1)\n\t"    /* rcx — user RIP (sysret target) */
         "pushq 0(%1)\n\t"    /* r11 — user RFLAGS */
+        /* E7 increment 13: re-stamp the six Linux argument registers
+         * ([gs:0x50..0x80)) from park_ctx — syscall_return_path
+         * restores them for the sysret, and this path (like
+         * cap_recv_resume) never runs the entry stub, so the block
+         * still holds whatever the last syscall entry wrote. */
+        "movq 72(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x50\n\t"   /* rdi */
+        "movq 80(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x58\n\t"   /* rsi */
+        "movq 88(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x60\n\t"   /* rdx */
+        "movq 96(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x68\n\t"   /* r10 */
+        "movq 104(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x70\n\t"   /* r8 */
+        "movq 112(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x78\n\t"   /* r9 */
         "xor %%eax, %%eax\n\t"   /* syscall result: 0 = success */
         "jmp syscall_return_path\n\t"
         :
@@ -2038,6 +2188,28 @@ void cap_recv_resume(struct ProcessDescriptor* pd) {
         "movq %%rax, %%gs:0x40\n\t"   /* rbx */
         "movq 56(%1), %%rax\n\t"
         "movq %%rax, %%gs:0x48\n\t"   /* rbp */
+        /* E7 increment 13: re-stamp the six Linux argument registers
+         * ([gs:0x50..0x80)) from park_ctx too — the re-run's
+         * proc_read_linux_args AND syscall_return_path's restore both
+         * read that block, and the resume path does NOT go through the
+         * entry stub, so it still holds whatever the LAST syscall entry
+         * (possibly another process's) wrote. Without this the resumed
+         * task sysrets someone else's argument registers — the
+         * 0x8054bdf wall (musl's act pointer in r8 returned as kernel
+         * scratch) on one side and a stale-args re-forward on the
+         * other. */
+        "movq 72(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x50\n\t"   /* rdi */
+        "movq 80(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x58\n\t"   /* rsi */
+        "movq 88(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x60\n\t"   /* rdx */
+        "movq 96(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x68\n\t"   /* r10 */
+        "movq 104(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x70\n\t"   /* r8 */
+        "movq 112(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x78\n\t"   /* r9 */
         "mov %2, %%rsi\n\t"  /* arg = parked request (recv or chan wait) */
         "mov %3, %%edi\n\t"  /* num = pd->park_syscall (recv or chan wait) */
         "call do_syscall\n\t"

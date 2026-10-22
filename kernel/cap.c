@@ -47,6 +47,13 @@
  * behavior (CAP_EAGAIN) so host tests run without the scheduler.
  */
 #include "cap.h"
+#include "linux_abi.h"   // E7 increment 2: PROC_PERSONALITY_* for the spawn stamp
+                         // + (increment 7) the §5.2 stack-image builder
+#include "elf64_load.h"  // E7 increment 7 (§5.1): the tree's one ELF64
+                         // PT_LOAD mapper — a Linux child may be a real
+                         // static binary, not a flat image
+#include "entropy.h"     // E7 increment 7 (§5.2): AT_RANDOM from
+                         // entropy_get(), whose failure refuses the create
 #include "kernel_io.h"
 #include "frame_pool.h"
 #include "process.h"
@@ -3288,10 +3295,11 @@ static uint32_t bib_flags = 0;
 
 void cap_set_bib_flags(uint32_t flags) { bib_flags = flags; }
 
-int cap_create_sidecar_in(uint32_t parent_pid,
+int cap_create_sidecar_in_personality(uint32_t parent_pid,
                           const void* manifest, uint32_t manifest_len,
                           uint16_t parent_ch_w, uint16_t console_ch_w,
-                          uint16_t* out_ch_r, uint32_t target_partition) {
+                          uint16_t* out_ch_r, uint32_t target_partition,
+                          uint32_t personality) {
     if (out_ch_r) *out_ch_r = CAP_NONE;
     (void)console_ch_w;  /* reserved: parent sends console cap via messenger */
     if (!manifest || manifest_len < SIDECAR_MANIFEST_HEADER_LEN)
@@ -3334,7 +3342,7 @@ int cap_create_sidecar_in(uint32_t parent_pid,
     }
 
     /* Caps (≤16) + the fixed records (personality, name, image, budget,
-     * cpu, limits, bootstrap, flags, signature = 9) + slack. */
+     * cpu, limits, bootstrap, flags, argenv, signature = 10) + slack. */
     if (hdr->record_count > SIDECAR_MANIFEST_MAX_CAPS + 10)
         return CAP_ERANGE;
 
@@ -3509,6 +3517,68 @@ int cap_create_sidecar_in(uint32_t parent_pid,
             m.n_caps++;
             break;
         }
+        case SIDECAR_TAG_ARGENV: {
+            /* §5.2's environment-crossing record (matches
+             * user/proto/src/manifest.rs TAG_ARGENV): argc u16, envc u16,
+             * then argv strings and envp strings each as len u16 + bytes,
+             * argv first. The strings are copied into the fixed arena as
+             * C strings — linux_initial_stack_build consumes C strings —
+             * and every refusal here is BY NAME before any child exists:
+             * a count over the fixed arrays or bytes over the arena is
+             * CAP_ERANGE; a short header, an unterminated string shape,
+             * an interior NUL, or bytes trailing the last string are
+             * CAP_EINVAL. A truncating parse is not an option here: a
+             * child whose environment silently stopped at its author's
+             * 100th byte would read as success while being wrong. */
+            if (rlen < 4) return CAP_EINVAL;
+            uint16_t ac = *(const uint16_t*)(rp + 0);
+            uint16_t ec = *(const uint16_t*)(rp + 2);
+            if (ac > SIDECAR_MANIFEST_MAX_ARGV ||
+                ec > SIDECAR_MANIFEST_MAX_ENVP) {
+                kernel_serial_printf(
+                    "[CS] CAP_ERANGE: ARGENV record: argc=%u envc=%u "
+                    "(limits %u/%u)\n",
+                    ac, ec, SIDECAR_MANIFEST_MAX_ARGV,
+                    SIDECAR_MANIFEST_MAX_ENVP);
+                return CAP_ERANGE;
+            }
+            const uint8_t* q = rp + 4;
+            for (uint32_t s = 0; s < (uint32_t)ac + ec; s++) {
+                if (q + 2 > rp + rlen) return CAP_EINVAL;
+                uint16_t slen = *(const uint16_t*)(q);
+                q += 2;
+                if (q + slen > rp + rlen) return CAP_EINVAL;
+                for (uint16_t j = 0; j < slen; j++)
+                    if (q[j] == 0) return CAP_EINVAL;  /* a length-prefixed
+                                                        * string with an
+                                                        * interior NUL is
+                                                        * malformed — the
+                                                        * copy would silently
+                                                        * truncate it */
+                if ((uint32_t)m.argenv_used + slen + 1u
+                        > SIDECAR_MANIFEST_ARGENV_BYTES) {
+                    kernel_serial_printf(
+                        "[CS] CAP_ERANGE: ARGENV record: string bytes "
+                        "over %u\n", SIDECAR_MANIFEST_ARGENV_BYTES);
+                    return CAP_ERANGE;
+                }
+                char* dst = m.argenv_arena + m.argenv_used;
+                for (uint16_t j = 0; j < slen; j++) dst[j] = (char)q[j];
+                dst[slen] = '\0';
+                if (s < ac) m.argv_off[s] = m.argenv_used;
+                else        m.env_off[s - ac] = m.argenv_used;
+                m.argenv_used = (uint16_t)(m.argenv_used + slen + 1);
+                q += slen;
+            }
+            /* Bytes trailing the last string: a counted list with junk
+             * behind it is malformed, not a v2 extension (this record is
+             * not length-prefixed per entry). */
+            if (q != rp + rlen) return CAP_EINVAL;
+            m.argc = ac;
+            m.envc = ec;   /* last-wins, like NAME: two records cannot
+                            * interleave their strings in the arena */
+            break;
+        }
         case SIDECAR_TAG_BOOTSTRAP:
         case SIDECAR_TAG_FLAGS:
             break;  /* informational */
@@ -3667,6 +3737,33 @@ int cap_create_sidecar_in(uint32_t parent_pid,
 
     uint32_t n_img_pages = (m.image_size + 4095) / 4096;
     uint64_t image_vbase = 0x400000000000ULL;  /* USER_PROC_CODE_BASE */
+    /* E7 increment 7 (§5.1): a planted image may be a REAL ELF64 binary
+     * (the census candidate: a static, non-PIE musl build — tools/
+     * linux_syscall_census.txt's designated first user), whose segments
+     * live at their linked p_vaddr (0x400000…) instead of the flat
+     * mapper's 0x400000000000 base, and whose entry is e_entry rather
+     * than base+offset. The MAGIC decides which path runs — image format
+     * is an image property, never a personality inference (§5.1 — the
+     * native sidecar path keeps its flat mapper byte for byte, and the
+     * branch below is the ONLY place the two diverge). */
+    int image_is_elf = 0;
+    struct Elf64MapInfo elfinfo;
+    uint64_t elf_entry = 0;
+    image_is_elf = elf_blob_has_magic(
+        (const uint8_t*)(uintptr_t)image_kaddr, m.image_size);
+    if (image_is_elf) {
+        if (!elf64_map_blob((const uint8_t*)(uintptr_t)image_kaddr,
+                            m.image_size, pml4, child_partition, &elfinfo)) {
+            /* The mapper validated everything BEFORE the first frame and
+             * logged the refusal by name (§5.1's ET_EXEC gate, bounds,
+             * user-canonical vaddrs); the create refuses with it — and
+             * takes the just-cloned PML4 back rather than leaking it (the
+             * refusal happened before pd->cr3 was ever set). */
+            user_destroy_page_table(new_cr3);
+            return CAP_EINVAL;
+        }
+        elf_entry = elfinfo.entry;
+    } else {
     uint64_t bytes_left  = m.image_size;
     for (uint32_t p = 0; p < n_img_pages; p++) {
         void* frame = allocate_physical_ram_frame_for_partition(child_partition);
@@ -3692,12 +3789,53 @@ int cap_create_sidecar_in(uint32_t parent_pid,
 
         bytes_left -= chunk;
     }
+    }
 
     /* ── 6. User stack ───────────────────────────────────────────────── */
     uint64_t stack_base = image_vbase
                         + (uint64_t)n_img_pages * 4096 + 4096;  /* guard pg */
     uint32_t stk_pages = (m.budget_stack_bytes + 4095) / 4096;
     if (stk_pages < 1) stk_pages = 1;
+    uint64_t linux_stack_phys = 0;
+    if (personality == PROC_PERSONALITY_LINUX) {
+        /* E7 increment 7 (§5.2): the Linux child's stack is ONE
+         * contiguous, partition-charged region — linux_initial_stack_build
+         * writes the argc/argv/envp/auxv image into it as a single byte
+         * span, which scattered per-page frames cannot hold. (The probe,
+         * which never reads %rsp, was the only Linux child that could
+         * live with the per-page loop; a static libc start-up cannot.)
+         * Same flags as every stack page: WRITE, never EXEC — and the
+         * region's END is still stack_base + stk_pages*4096, so the heap
+         * span stamped below (and its sidecar-side twin) stay one truth. */
+        /* E7 increment 7 (§5.2 + the BIB's standing contract): the stack
+         * must hold the BIB's top page (step 9 writes it unconditionally)
+         * PLUS at least one page of §5.2 stack image below it — an 8 KiB
+         * floor. Below that the image cannot exist at all, so refuse by
+         * name here rather than letting the builder fail on a mystery. */
+        if (m.budget_stack_bytes < 2 * 4096u) {
+            kernel_serial_printf(
+                "[CS] CAP_EINVAL: a Linux child's stack must reserve the "
+                "BIB page and hold a §5.2 image (stack_bytes=%u)\n",
+                m.budget_stack_bytes);
+            user_destroy_page_table(new_cr3);
+            return CAP_EINVAL;
+        }
+        linux_stack_phys = allocate_contiguous_frames_for_partition(child_partition, stk_pages, 1);
+        if (!linux_stack_phys) {
+            kernel_serial_print("[SIDECAR] create: linux stack alloc failed\n");
+            user_destroy_page_table(new_cr3);   /* the image frames and
+                                                 * tables just mapped go
+                                                 * back — pd->cr3 is not
+                                                 * set yet */
+            return CAP_ENOMEM;
+        }
+        for (uint32_t p = 0; p < stk_pages; p++) {
+            user_map_page(pml4, stack_base + (uint64_t)p * 4096,
+                          linux_stack_phys + (uint64_t)p * 4096,
+                          USER_PTE_PRESENT | USER_PTE_USER | USER_PTE_WRITE
+                          | USER_PTE_NOEXEC);
+        }
+    } else {
     for (uint32_t p = 0; p < stk_pages; p++) {
         void* frame = allocate_physical_ram_frame_for_partition(child_partition);
         if (!frame) {
@@ -3709,11 +3847,63 @@ int cap_create_sidecar_in(uint32_t parent_pid,
                       USER_PTE_PRESENT | USER_PTE_USER | USER_PTE_WRITE
                       | USER_PTE_NOEXEC);
     }
+    }
     uint64_t user_rsp = stack_base + (uint64_t)stk_pages * 4096 - 16;
 
     /* ── 7. Populate process descriptor ──────────────────────────────── */
     struct ProcessDescriptor* pd = &proc_table[pi];
     pd->pid        = alloc_pid();
+    /* E7 (increment 2): the child's personality, stamped HERE — inside the
+     * create, after the E2 authority gate (step 4) and before the HELD
+     * release at the end — so the task is schedulable only with the
+     * personality it was spawned with. proc_clear_resume_state() reset the
+     * slot to PROC_PERSONALITY_SLS at spawn init; this is the only place a
+     * Linux personality is ever set. An unknown value is refused rather
+     * than stored: a personality no branch claims would be a task whose
+     * traps nobody interprets. */
+    if (personality != PROC_PERSONALITY_SLS &&
+        personality != PROC_PERSONALITY_LINUX) {
+        kernel_serial_printf(
+            "[CS] CAP_EINVAL: unknown personality %u for pid=%u\n",
+            personality, pd->pid);
+        return CAP_EINVAL;
+    }
+    pd->personality = personality;
+    /* E7 increment 6 (§5.4): the mem span, stamped HERE beside the
+     * personality — the only place a Linux personality is set. The span
+     * is the manifest's BUDGET record made structural: it sits directly
+     * above the child's stack, mem_bytes long (page-rounded), and brk
+     * starts at its base, so every page the resume arm ever maps into
+     * this task is inside a span THIS create decided — never one a
+     * grant claimed. An SLS child gets the zero span, so a brk-shaped
+     * stage on an SLS slot has no span to grant against (the verdict's
+     * bound checks refuse it) — same posture as the slot-reuse clear.
+     * The sidecar's ledger mirrors these numbers from the manifest it
+     * authored (user/sidecar/src/e7_probe.rs; guard clause N2 pins both
+     * halves). */
+    pd->linux_heap_base  = 0;
+    pd->linux_heap_limit = 0;
+    pd->linux_brk_cur    = 0;
+    pd->linux_mmap_top   = 0;
+    pd->mem_stage_valid  = 0;
+    pd->mem_stage_num    = 0;
+    pd->mem_stage_a0     = 0;
+    pd->mem_stage_a1     = 0;
+    pd->mem_stage_a2     = 0;
+    pd->mem_stage_a3     = 0;
+    if (personality == PROC_PERSONALITY_LINUX) {
+        pd->linux_heap_base  = stack_base + (uint64_t)stk_pages * 4096;
+        pd->linux_heap_limit = pd->linux_heap_base
+                             + ((m.budget_mem_bytes + 4095ULL) / 4096ULL)
+                               * 4096ULL;
+        pd->linux_brk_cur    = pd->linux_heap_base;
+        /* E7 increment 16: the anonymous-map cursor is born at the
+         * span's top — the sidecar ledger's mtop is the policy twin —
+         * so brk grows up from the base and a granted mmap descends
+         * from the limit, and the two can never meet: each verdict
+         * re-checks against its OWN copy of both cursors. */
+        pd->linux_mmap_top   = pd->linux_heap_limit;
+    }
     if (m.name_len > 0) {
         /* Use the manifest's NAME record for the debug name. */
         uint32_t nl = (m.name_len < PROC_NAME_LEN - 1) ? (uint32_t)m.name_len
@@ -3726,8 +3916,128 @@ int cap_create_sidecar_in(uint32_t parent_pid,
         pd->name[2]    = '\0';
     }
     pd->cr3        = new_cr3;
-    pd->user_rip   = image_vbase + m.image_entry;
+    /* E7 increment 7 (§5.1): an ELF image enters at its e_entry — an
+     * absolute linked address — not the flat mapper's base+offset. */
+    pd->user_rip   = image_is_elf ? elf_entry : image_vbase + m.image_entry;
     pd->user_rsp   = user_rsp;
+    /* ── E7 increment 7 (§5.2): the Linux child's initial stack image ────
+     * A static libc start-up reads argc/argv/envp/auxv off %rsp before it
+     * executes one line of its own code, and building that image is the
+     * KERNEL's deliverable (§5.2 — the native sidecar path enters _start
+     * with nothing; a Linux binary cannot). The layout is
+     * linux_initial_stack_build()'s (host-tested as byte-exact); this site
+     * owns the VALUES:
+     *   argv/envp come from the manifest's ARGENV record (§5.2's
+     *     environment-crossing record, SIDECAR_TAG_ARGENV) when it is
+     *     present — the sidecar knows the command line and the environment
+     *     (it is the thing that ran exec), so argv/envp are its to define;
+     *     an ABSENT record is the v1 fallback: argv = { the child's own
+     *     NAME, NULL }, an empty environment — which keeps every manifest
+     *     built before the record existed running byte-identically, and
+     *     gives a record with no argv entries a sane argv[0] rather than
+     *     an argc-0 stack no libc expects;
+     *   AT_ENTRY/AT_PHDR/AT_PHENT/AT_PHNUM come from the loaded image
+     *     (phnum 0 for a flat image, whose own headers don't exist to
+     *     report — a real libc binary must be an ELF, §5.1);
+     *   AT_RANDOM is 16 bytes from entropy_get(), which CAN FAIL — §5.2
+     *     refuses a zero-filled substitute outright (a stack without
+     *     entropy makes canaries worthless), so an unseeded pool refuses
+     *     this create instead (entropy_source_check.sh requires the
+     *     result be inspected; it is).
+     * The probe still runs without this (it never reads %rsp); the census
+     * candidate cannot — which is the whole point of increment 7. */
+    if (personality == PROC_PERSONALITY_LINUX) {
+        struct LinuxInitStackParams sp;
+        /* §5.2's environment-crossing record: the ARGENV strings live in
+         * m's fixed arena, so the pointers handed the builder are offsets
+         * into m — valid for the whole create. The absent-record fallback
+         * (argc/envc both zero, the parse's zeroed defaults) is v1:
+         * argv = { name }, an empty environment. */
+        const char* argv[SIDECAR_MANIFEST_MAX_ARGV + 1];
+        const char* envp[SIDECAR_MANIFEST_MAX_ENVP + 1];
+        uint8_t rnd[LINUX_AT_RANDOM_BYTES];
+        uint64_t built_rsp;
+
+        if (image_is_elf && elfinfo.phnum != 0 && elfinfo.phdr_vaddr == 0) {
+            /* The program-header table isn't inside any mapped LOAD, so
+             * AT_PHDR could not be made truthful — and a libc that walks
+             * it would fault on unmapped linear. Refused by name. */
+            kernel_serial_printf(
+                "[CS] CAP_EINVAL: ELF image's phdrs are not in any "
+                "mapped segment — no truthful AT_PHDR for pid=%u\n",
+                pd->pid);
+            free_contiguous_frames_for_partition(linux_stack_phys,
+                                                  stk_pages,
+                                                  child_partition);
+            user_destroy_page_table(new_cr3);
+            pd->cr3 = 0;   /* the address is no longer a live table */
+            return CAP_EINVAL;
+        }
+        if (m.argc > 0) {
+            for (uint32_t i = 0; i < m.argc; i++)
+                argv[i] = m.argenv_arena + m.argv_off[i];
+            argv[m.argc] = 0;
+        } else {
+            argv[0] = pd->name;   /* the v1 argv, one argument long */
+            argv[1] = 0;
+        }
+        for (uint32_t i = 0; i < m.envc; i++)
+            envp[i] = m.argenv_arena + m.env_off[i];
+        envp[m.envc] = 0;   /* no record: the v1 empty environment */
+        if (entropy_get(rnd, sizeof rnd) != ENTROPY_OK) {
+            kernel_serial_printf(
+                "[CS] CAP_ECONFLICT: entropy pool not seeded — refusing "
+                "to build a Linux stack image without AT_RANDOM "
+                "(pid=%u, §5.2)\n", pd->pid);
+            free_contiguous_frames_for_partition(linux_stack_phys,
+                                                  stk_pages,
+                                                  child_partition);
+            user_destroy_page_table(new_cr3);
+            pd->cr3 = 0;
+            return CAP_ECONFLICT;
+        }
+        sp.entry_vaddr = pd->user_rip;
+        sp.phdr_vaddr  = image_is_elf ? elfinfo.phdr_vaddr : 0;
+        sp.phent       = image_is_elf ? elfinfo.phent : LINUX_ELF64_PHENT;
+        sp.phnum       = image_is_elf ? elfinfo.phnum : 0;
+        sp.argv        = argv;
+        sp.envp        = envp;
+        sp.at_random   = rnd;
+        sp.execfn      = pd->name;
+        /* The region is mapped at stack_base in the CHILD's page table
+         * (the mapping loop in step 6) while linux_stack_phys is the
+         * host/phys address the builder writes through — region_vaddr is
+         * the translation between the two. Every pointer in the image and
+         * the returned %rsp must be child vaddrs: a libc that dereferences
+         * argv[0] or AT_EXECFN in its own address space would otherwise
+         * fault on unmapped linear (increment 7's measurement caught this;
+         * the cap host test pins it). */
+        sp.region_vaddr = stack_base;
+        /* The BIB's home is the stack's TOP 4 KiB page and step 9 writes
+         * it there UNCONDITIONALLY, after this image — so the image's
+         * region stops one page short of the top. Both truths survive:
+         * the probe still finds its BIB at the stack-top page (it never
+         * reads %rsp), and a libc child's image owns everything below it,
+         * with its stack growing down away from the BIB page. The
+         * un-shrunk region had the BIB write clobber the image's strings
+         * and auxv — found by increment 7's measurement, pinned by the
+         * cap host test. */
+        built_rsp = linux_initial_stack_build(
+            (uint8_t*)(uintptr_t)linux_stack_phys,
+            (size_t)stk_pages * 4096 - 4096, &sp);
+        if (built_rsp == 0) {
+            kernel_serial_printf(
+                "[CS] CAP_EINVAL: §5.2 stack image does not fit for "
+                "pid=%u (stack_bytes too small)\n", pd->pid);
+            free_contiguous_frames_for_partition(linux_stack_phys,
+                                                  stk_pages,
+                                                  child_partition);
+            user_destroy_page_table(new_cr3);
+            pd->cr3 = 0;
+            return CAP_EINVAL;
+        }
+        pd->user_rsp = built_rsp;
+    }
     pd->owner_uid  = parent->owner_uid;
     pd->parent_pid = parent_pid;
     pd->partition_id = child_partition;
@@ -4360,7 +4670,69 @@ static uint16_t sidecar_find_parent_ch_w(uint32_t parent_pid, uint16_t ch_r) {
     return CAP_NONE;
 }
 
+/* ─── cap_linux_find_channels (E7 increment 3, §3.5) ─────────────────────
+ * Locate the SINGLE channel a Linux-personality task forwards on: its one
+ * sendable CHAN_W and one recv-able CHAN_R, per linux_channel_shape_ok —
+ * §3.5's "exactly one entry: the channel to its environment's sidecar"
+ * made into a scan instead of a prose hope. Anything else (no channel —
+ * the increment-2 "no-cap-channel" tooth; two sendable handles — a table
+ * that does not have the shape Linux forwarding assumes) is a refusal, not
+ * a guess: the forward must not be able to route a task's syscalls to the
+ * wrong channel, and §3.6 requires the kernel's side of this path to
+ * validate "is its channel present" and nothing more.
+ *
+ * Scanned WITHOUT the table lock, same posture and same reason as
+ * sidecar_find_parent_ch_w above: a process resolving its OWN table
+ * inside its OWN syscall runs single-threaded against it — no concurrent
+ * mutator exists (only this task's trap path and spawn/teardown mutators,
+ * and neither runs while this syscall executes). Perms are checked for
+ * USABILITY (SEND / RECV), matching what cap_send_msg / cap_recv_msg
+ * will enforce anyway — a handle the transport would reject does not
+ * count as a channel answer. */
+int cap_linux_find_channels(uint32_t pid, uint16_t* out_ch_w,
+                            uint16_t* out_ch_r) {
+    int cti = cap_table_index(pid);
+    int n_w = 0, n_r = 0;
+    uint16_t found_w = CAP_NONE, found_r = CAP_NONE;
+    if (cti < 0 || !out_ch_w || !out_ch_r) return -1;
+    for (int si = 0; si < CAP_TABLE_ENTRIES; si++) {
+        uint64_t w = cap_tables[cti].slots[si].word;
+        if (!cap_word_valid(w)) continue;
+        switch ((uint32_t)((w >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK)) {
+        case CAP_TYPE_CHAN_W:
+            if (!((w >> CAP_PERM_SHIFT) & CAP_PERM_SEND)) continue;
+            n_w++;
+            found_w = (uint16_t)si;
+            break;
+        case CAP_TYPE_CHAN_R:
+            if (!((w >> CAP_PERM_SHIFT) & CAP_PERM_RECV)) continue;
+            n_r++;
+            found_r = (uint16_t)si;
+            break;
+        default:
+            break;   /* MEM / IRQ / IO / … are not channel answers */
+        }
+    }
+    if (!linux_channel_shape_ok(n_w, n_r)) return -1;   /* the rule, pure */
+    *out_ch_w = found_w;
+    *out_ch_r = found_r;
+    return 0;
+}
+
 /* ─── sys_sls_create_sidecar ──────────────────────────────────────────────── */
+/* The personality-carrying create IS the create: the legacy wrapper passes
+ * PROC_PERSONALITY_SLS, so every pre-E7 caller's child is byte-for-byte
+ * what it was before this parameter existed (and a zeroed slot is the same
+ * default — PROC_PERSONALITY_SLS is 0). */
+int cap_create_sidecar_in(uint32_t parent_pid,
+                          const void* manifest, uint32_t manifest_len,
+                          uint16_t parent_ch_w, uint16_t console_ch_w,
+                          uint16_t* out_ch_r, uint32_t target_partition) {
+    return cap_create_sidecar_in_personality(parent_pid, manifest, manifest_len,
+                                             parent_ch_w, console_ch_w, out_ch_r,
+                                             target_partition, PROC_PERSONALITY_SLS);
+}
+
 uint64_t sys_sls_create_sidecar(struct SLSCreateSidecarRequest* req) {
     if (!req) return (uint64_t)(int64_t)CAP_EINVAL;
     uint16_t ch_r = CAP_NONE;
@@ -4368,6 +4740,26 @@ uint64_t sys_sls_create_sidecar(struct SLSCreateSidecarRequest* req) {
                                   req->manifest, req->manifest_len,
                                   req->ch_w_idx, req->console_w_idx,
                                   &ch_r, req->target_partition);
+    if (r < 0) return (uint64_t)(int64_t)r;
+    req->out_ch_r = ch_r;
+    req->out_ch_w = sidecar_find_parent_ch_w(cap_current_pid(), ch_r);
+    return (uint64_t)ch_r;
+}
+
+/* ─── sys_sls_linux_spawn (328) — E7 increment 2 ──────────────────────
+ * The same request, the same flow, the LINUX personality — and therefore
+ * the same E2 `sidecar_authority` gate, because it lives inside
+ * cap_create_sidecar_in_personality, which this calls. A non-authorised
+ * process gets CAP_EPERM for this number exactly as it does for 310; the
+ * two syscalls differ in ONE argument to the same function. */
+uint64_t sys_sls_linux_spawn(struct SLSCreateSidecarRequest* req) {
+    if (!req) return (uint64_t)(int64_t)CAP_EINVAL;
+    uint16_t ch_r = CAP_NONE;
+    int r = cap_create_sidecar_in_personality(cap_current_pid(),
+                                  req->manifest, req->manifest_len,
+                                  req->ch_w_idx, req->console_w_idx,
+                                  &ch_r, req->target_partition,
+                                  PROC_PERSONALITY_LINUX);
     if (r < 0) return (uint64_t)(int64_t)r;
     req->out_ch_r = ch_r;
     req->out_ch_w = sidecar_find_parent_ch_w(cap_current_pid(), ch_r);

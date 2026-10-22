@@ -18,6 +18,7 @@
  *   /tmp/checkpoint_cluster_host_test
  */
 #include "kernel/state_tree.h"
+#include "kernel/env_ckpt.h"    /* P3 (b): the env_ckpt_table[] stand-in at the foot of this file */
 #include "kernel/object_catalog.h"
 #include "kernel/partition.h"
 #include "kernel/process.h"
@@ -322,3 +323,15 @@ int main(void) {
     printf("\n%d passed, %d failed\n", checks_passed, checks_failed);
     return checks_failed ? 1 : 0;
 }
+
+/* POSIX-Environments P3 (b) stand-in — kernel/state_tree.c emits one
+ * ST_NODE_ENVIRONMENT node per LIVE environment record, so linking
+ * state_tree.c now also needs env_ckpt_table[]. This test links
+ * state_tree.c but not kernel/env_ckpt.c, so the table here is its own:
+ * every slot has magic 0, none matches ENV_CKPT_REC_MAGIC, and
+ * state_tree_build() emits zero environment nodes — so the node counts and
+ * byte sizes this file asserts are unchanged by P3 (b). Real coverage of
+ * the populated case lives in tests/checkpoint_recovery_host_test.c, which
+ * links the real kernel/env_ckpt.c and drives a recovery over a tree that
+ * carries environment names. */
+struct EnvCkptRecord env_ckpt_table[ENV_CKPT_MAX];

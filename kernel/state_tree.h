@@ -27,10 +27,23 @@
 #define ST_NODE_OBJECT     2
 #define ST_NODE_PROCESS    3
 #define ST_NODE_STREAM     4
+/* POSIX-Environments v0.2 Phase P3 (destination (b), §11 Q5): one node per
+ * LIVE environment, attached to its partition, so a survivor adopting the
+ * partition can NAME the environments it is not restoring. Identity only —
+ * entity_id is the environment's INDEX within its partition (the name the
+ * console registry and every control-plane route key it by, kernel/env_ckpt.h)
+ * and size is its region count. The payload deliberately does not ride here:
+ * this tree is the leader's 24 KiB broadcast and an environment's regions are
+ * 5.5 MiB, so carrying the bytes would be a lie about what failover can
+ * restore. Carrying the NAME is what turns "the environment vanished" into
+ * "environment index 2 of partition 3 was not restored" — the whole of what
+ * destination (b) promises. */
+#define ST_NODE_ENVIRONMENT 5
 
 // ─── Limits ───────────────────────────────────────────────────────────────────
-// Worst case: 1 root + 256 partitions + 128 objects + 16 processes + 8 streams
-#define ST_MAX_NODES  410
+// Worst case: 1 root + 256 partitions + 128 objects + 16 processes + 8
+// streams + 8 environments (ENV_CKPT_MAX)
+#define ST_MAX_NODES  418
 
 // Serialized buffer: header + node array. Sized for the worst case.
 #define ST_SERIAL_MAX  (sizeof(struct StateTreeHeader) + ST_MAX_NODES * sizeof(struct StateTreeNode))
@@ -50,7 +63,15 @@ struct StateTreeNode {
 
 // ─── Serialization Header ─────────────────────────────────────────────────────
 #define ST_MAGIC    0x53545245UL   /* "STRE" */
-#define ST_VERSION  1
+/* v2 adds ST_NODE_ENVIRONMENT nodes and the num_environments field below.
+ * Bumped rather than reusing v1's tail silently, so a v1 tree is REFUSED by
+ * name (state_tree_deserialize's version check) instead of being read by a
+ * parser that would silently drop the environment names — which is exactly
+ * the silent-vanish (b) exists to prevent. Safe to bump: the serialized form
+ * crosses only the live cluster's checkpoint broadcast (kernel/failover.c),
+ * never NVMe — checkpoint_mgr.c builds a tree in memory and never
+ * serializes it. */
+#define ST_VERSION  2
 
 struct StateTreeHeader {
     uint32_t magic;
@@ -63,6 +84,7 @@ struct StateTreeHeader {
     uint32_t num_objects;
     uint32_t num_processes;
     uint32_t num_streams;
+    uint32_t num_environments;  /* v2: ST_NODE_ENVIRONMENT nodes */
 };
 
 // ─── Diff Result ──────────────────────────────────────────────────────────────

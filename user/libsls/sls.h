@@ -177,16 +177,22 @@ static inline void sls_memset(void *dst, int val, size_t n) {
 /* Clobber list tells GCC which registers the kernel may modify.
  * RAX = return value (output).  RCX and R11 are trashed by the CPU's
  * SYSCALL/SYSRETQ mechanism.  RDI, RSI, RDX, R8-R10 are caller-saved in
- * the C ABI and not preserved by our kernel stub — list them ALL so GCC
- * spills any live values around each syscall.
+ * the C ABI and the kernel stub clobbers them MID-SYSCALL — list them
+ * ALL so GCC spills any live values around each syscall.
  *
  * RDI is the easy one to forget: it is also the input register for `arg`
- * ("D" constraint), but the kernel's syscall_entry_stub clobbers it
+ * ("D" constraint), and the kernel's syscall_entry_stub clobbers it
  * (.unknown_syscall does `mov rsi,rdi; mov rdi,rax` before calling the C
- * dispatcher) and never restores it before SYSRET. If RDI is not listed
- * here, GCC is free to keep a live value in it across the syscall and the
- * kernel will silently destroy it — caught live when cap_revoke() reused
- * the request pointer GCC had parked in RDI across an earlier syscall. */
+ * dispatcher). If RDI is not listed here, GCC is free to keep a live
+ * value in it across the syscall and the kernel will destroy it for the
+ * duration — caught live when cap_revoke() reused the request pointer
+ * GCC had parked in RDI across an earlier syscall.
+ *
+ * (E7 increment 13 changed the CONTRACT, not this advice:
+ * syscall_return_path now restores all six from the entry capture, so
+ * they survive the round trip as Linux promises — only RAX/RCX/R11
+ * change. The list stays because the mid-syscall window it describes is
+ * still real, and declaring these clobbers is correct on any kernel.) */
 static inline uint64_t _sls_syscall(uint64_t num, void *arg) {
     uint64_t ret;
     __asm__ volatile (

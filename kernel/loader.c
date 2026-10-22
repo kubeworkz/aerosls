@@ -234,69 +234,18 @@ uint64_t loader_load_into_process(const char* object_name,
     }
 
     // ── ELF64 loader ─────────────────────────────────────────────────────────
+    // Delegates to the tree's ONE PT_LOAD mapper (kernel/elf64_load.c):
+    // same flags, same BSS zero-fill, same partition charge — plus §5.1's
+    // ET_EXEC gate and the out-of-bounds/user-canonical refusals that this
+    // branch used to skip (an uploaded ET_DYN mapped at its linked addresses
+    // with no load bias could only ever crash at entry).
     if (sb->is_elf && sb->size >= sizeof(struct ELF64Header)) {
-        struct ELF64Header* ehdr = (struct ELF64Header*)sb->data;
-
-        if (ehdr->e_ident[4] != ELF_CLASS64) {
-            kernel_serial_print("[LOADER] ELF: not 64-bit, aborting.\n");
-            return 0;
+        struct Elf64MapInfo info;
+        if (!elf64_map_blob(sb->data, (uint64_t)sb->size, pml4,
+                            partition_id, &info)) {
+            return 0;   /* the mapper logged the refusal by name */
         }
-        if (ehdr->e_phnum == 0 || ehdr->e_phoff == 0) {
-            kernel_serial_print("[LOADER] ELF: no program headers.\n");
-            return 0;
-        }
-
-        struct ELF64ProgramHeader* phdr =
-            (struct ELF64ProgramHeader*)(sb->data + ehdr->e_phoff);
-
-        for (uint16_t ph = 0; ph < ehdr->e_phnum; ph++) {
-            if (phdr[ph].p_type != PT_LOAD) continue;
-            if (phdr[ph].p_filesz == 0) continue;
-
-            uint64_t vaddr_base = phdr[ph].p_vaddr;
-            uint32_t n_pages    = (uint32_t)
-                ((phdr[ph].p_memsz + 4095) / 4096);
-
-            // Determine page flags
-            uint64_t flags = USER_PTE_PRESENT | USER_PTE_USER;
-            if (phdr[ph].p_flags & PF_W) flags |= USER_PTE_WRITE;
-            if (!(phdr[ph].p_flags & PF_X)) flags |= USER_PTE_NOEXEC;
-
-            kernel_serial_printf(
-                "[LOADER] ELF segment: vaddr=0x%016lx  filesz=%lu  memsz=%lu  "
-                "flags=%c%c%c\n",
-                vaddr_base, phdr[ph].p_filesz, phdr[ph].p_memsz,
-                (phdr[ph].p_flags & PF_R) ? 'R' : '-',
-                (phdr[ph].p_flags & PF_W) ? 'W' : '-',
-                (phdr[ph].p_flags & PF_X) ? 'X' : '-');
-
-            for (uint32_t p = 0; p < n_pages; p++) {
-                // Phase 13 (LPAR): quota-checked — an ELF segment's page
-                // count is attacker/tenant-controlled (memsz from the
-                // uploaded binary), exactly the kind of unbounded,
-                // per-tenant growth this phase's quota exists to cap.
-                void* frame = allocate_physical_ram_frame_for_partition(partition_id);
-                if (!frame) return 0;
-                ld_memset(frame, 0, 4096);  // zero (BSS) fill
-
-                // Copy file content into this frame
-                uint64_t byte_off = (uint64_t)p * 4096;
-                if (byte_off < phdr[ph].p_filesz) {
-                    uint64_t copy_len = phdr[ph].p_filesz - byte_off;
-                    if (copy_len > 4096) copy_len = 4096;
-                    ld_memcpy(frame,
-                              sb->data + phdr[ph].p_offset + byte_off,
-                              (size_t)copy_len);
-                }
-
-                user_map_page(pml4, vaddr_base + (uint64_t)p * 4096,
-                              (uint64_t)(uintptr_t)frame, flags);
-            }
-        }
-
-        kernel_serial_printf("[LOADER] ELF64 loaded. Entry: 0x%016lx\n",
-                             ehdr->e_entry);
-        return ehdr->e_entry;
+        return info.entry;
     }
 
     // ── Flat binary loader ────────────────────────────────────────────────────

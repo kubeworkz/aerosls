@@ -720,7 +720,12 @@ while :; do
     # 7b. log: the survivor must have declared the death (it observed --
     # every node runs failover_tick, only the leader recovers), and must
     # NOT have printed an Adopted or recovery line AFTER that declaration.
-    obs_decl="$(last_line "$S_LOG" "FAILOVER] Node $leader declared DEAD")"
+    # "declared DEA" not "declared DEAD": the kernel's serial TX lock is
+    # bounded-wait by design (kernel_io.c), so under contention a line can
+    # be clobbered mid-word (observed live as "declared
+    # DEA[DSPP-CKPT] RX: BEGIN..."). The four-character anchor matches
+    # both the intact and the clobbered form.
+    obs_decl="$(last_line "$S_LOG" "FAILOVER] Node $leader declared DEA")"
     obs_adopt="$(last_line "$S_LOG" "FAILOVER] Adopted partition.*dead node $leader")"
     obs_rec="$(last_line "$S_LOG" "FAILOVER] recovery for dead node $leader")"
     if [ -n "$obs_decl" ]; then
@@ -835,7 +840,7 @@ echo "      the death, and still neither became LEADER nor adopted -- the"
 echo "      2-of-2 majority quorum cannot be met by one vote, so recovery"
 echo "      stayed leader-gated off, exactly as designed. No split-brain."
 echo "      evidence:"
-printf '        %s\n' "$(grep -h "FAILOVER] Node $leader declared DEAD" "$S_LOG" 2>/dev/null | tail -1)"
+printf '        %s\n' "$(grep -h "FAILOVER] Node $leader declared DEA" "$S_LOG" 2>/dev/null | tail -1)"
 printf '        %s\n' "$(grep -h "DSPP-CKPT] RX: COMPLETE" "$S_LOG" 2>/dev/null | tail -1)"
 printf '        %s\n' "$(grep -h "PARTITION] sync.*$NAME" "$S_LOG" 2>/dev/null | tail -1)"
 printf '        %s\n' "$(grep -h "FAILOVER] Adopted partition" "$S_LOG" 2>/dev/null | tail -1 | sed 's/^/adopted lines: /' || echo 'adopted lines: (none)')"

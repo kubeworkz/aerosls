@@ -67,6 +67,36 @@ void env_storage_boot_reset(void) {
     for (uint32_t i = 0; i < ENV_STORAGE_MAX; i++) es_boot_charged[i] = 0;
 }
 
+/* The directory's second seam — the one after persist_restore_all() has
+ * LOADED it. region_base is THIS boot's placement, not part of the
+ * identity (this file's "Keys" section says so: "region_base is NOT
+ * [stable across boots]: init allocates a fresh frame region every
+ * boot"), so the restored value names an address the frame pool is about
+ * to hand out again — to a DIFFERENT environment when the original one
+ * does not come back first. es_find_base() answers by first match, so a
+ * stale placement does not merely dangle: it SHADOWS the live owner.
+ * Found live on the 3-node TCG cluster (2026-10-15): node 2 restored
+ * partition 2's store carrying region_base=304541696 from an earlier
+ * run, the migrating environment's fresh store attached at the same
+ * deterministic address (slot=1, behind the stale slot 0), and
+ * owner(304541696) answered 2 — the new environment's own ramdisk server
+ * was denied sys_sls_env_storage_restore in a 12 241-line loop, never
+ * came up to announce its identity, and the destination's migrate
+ * restore died on REFUSE_PARKED with `announced=0` (the
+ * env_migrate_confirm_live_check failure this seam exists to end).
+ * The entry survives whole — key, extent, charged_pages: the re-attach
+ * finds it by (partition, index) and re-stamps the base. Only the claim
+ * on an address this node no longer holds is surrendered, which is the
+ * same honesty the refused-directory path already prints: unattached
+ * until its next create. Deliberately does NOT mark pending: the disk
+ * copy is last boot's placement and is re-surrendered at every load; the
+ * next real mutation persists this boot's table anyway. */
+void env_storage_after_restore(void) {
+    for (uint32_t i = 0; i < ENV_STORAGE_MAX; i++)
+        if (env_storage_table[i].flags & ENV_STORAGE_F_VALID)
+            env_storage_table[i].region_base = 0;
+}
+
 static struct EnvStorageEntry* es_find_key(uint32_t partition_id, uint32_t index) {
     for (uint32_t i = 0; i < ENV_STORAGE_MAX; i++) {
         struct EnvStorageEntry* e = &env_storage_table[i];

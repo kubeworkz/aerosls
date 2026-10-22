@@ -67,6 +67,15 @@ volatile uint64_t kernel_tick_counter = 0;
 void kernel_yield_to_ring3(uint32_t budget_ticks) {
     kernel_tick_counter += budget_ticks;   /* stands in for the timer ISR */
 }
+/* env_payload.c's wait loop calls this (kernel/smp.h) the way env_service_rpc's
+ * wait does: on a uniprocessor boot it is what runs env_console_tick(), the
+ * drain that sets the identity flag the wait reads. Counted so section 3 can
+ * pin that the wait actually CALLS it — without the call the wait starves its
+ * own predicate: the fresh sidecar writes [env-id], nobody drains it, and the
+ * wait times out on announced=0 (caught live on the -smp 1 2-node TCG cluster,
+ * 2026-10-13, as REFUSE_PARKED). */
+static unsigned g_service_pumps = 0;
+void smp_uniprocessor_tick(void) { g_service_pumps++; }
 struct ProcessDescriptor proc_table[PROC_MAX];
 
 /* ─── The device: a sparse RAM disk keyed by LBA ───────────────────────────── */
@@ -421,6 +430,10 @@ int main(void) {
     kernel_tick_counter = 0;
     CHECK(env_payload_wait_parked(&g_scratch) == 0,
           "wait: a missing sidecar is answered at once (there is nothing to wait for)");
+    CHECK(g_service_pumps > 0,
+          "wait: the loop keeps the service work ticking while it waits — the "
+          "identity flag it reads is set by env_console_tick(), which on a "
+          "uniprocessor boot only runs from this pump");
 
     /* ── 4. The refusal rendering and the latch ───────────────────────────── */
     CHECK(setup_and_capture(1) == 1, "re-capture for the refusal rendering");

@@ -66,9 +66,25 @@ void syscall_gate_init(void) {
     // User GS base starts at 0
     wrmsr(MSR_GS_BASE, 0);
 
+    // E7 §5.3: FS base starts at 0 BEFORE any ring-3 task exists, so the
+    // invariant "FSBASE == current task's fs_base" is true from the very
+    // first ring-3 instruction onward (switch-ins and granted SET_FS keep
+    // it; SLS tasks carry 0 by definition).
+    wrmsr(MSR_FS_BASE, 0);
+
     kernel_serial_printf(
         "[SYSCALL] Gate initialised. STAR=0x%016lx  LSTAR=0x%016lx\n",
         star, (uint64_t)(uintptr_t)syscall_entry_stub);
+}
+
+// ─── user_write_fs_base (E7 §5.3 — the plan's increment 4) ───────────────
+// The kernel's one Linux semantic, written in exactly one place: wrmsr of
+// MSR_IA32_FS_BASE with a value that came from a ProcessDescriptor field
+// (never from a reply buffer — the sidecar's grant decides WHETHER, this
+// decides nothing, it only performs). See the declaration in user_paging.h
+// for the two call sites and the invariant they maintain.
+void user_write_fs_base(uint64_t base) {
+    wrmsr(MSR_FS_BASE, base);
 }
 
 // ─── Page table index helpers ─────────────────────────────────────────────────
@@ -314,6 +330,17 @@ void user_unmap_page(uint64_t* pml4, uint64_t vaddr) {
     uint64_t* pt = present_child(pd, PD_IDX(vaddr));
     if (!pt)   return;
     pt[PT_IDX(vaddr)] = 0;
+}
+
+/* E7 increment 16: the one stale-translation shootdown the mmap apply
+ * needs — a MAP_FIXED replace edits a PRESENT leaf the task has run on
+ * (its TLB may hold the old translation), unlike every other mapping
+ * path here, which touches only not-present leaves. The task is parked
+ * in this trap on this CPU with its CR3 loaded, so one `invlpg` per
+ * touched page is complete: no IPI, no cross-CPU shootdown, same
+ * single-core posture every other TLB claim in this tree rests on. */
+void user_invlpg(uint64_t vaddr) {
+    __asm__ volatile("invlpg (%0)" : : "r"(vaddr) : "memory");
 }
 
 /* ─── Phase 2 teardown: user_destroy_page_table ───────────────────────────────

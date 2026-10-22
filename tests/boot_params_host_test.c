@@ -196,6 +196,7 @@ static uint32_t build_mb1(const char* cmdline, int with_flag) {
  * tests/partition_migrate_phase6_host_test.c and the transfer itself in
  * tests/env_migrate_host_test.c. */
 int env_migrate_partition(uint32_t partition_id, uint32_t dest_node_id,
+                          int operator_paused,
                           uint32_t* out_expected, uint32_t* out_moved) {
     (void)partition_id; (void)dest_node_id;
     if (out_expected) *out_expected = 0;
@@ -461,3 +462,12 @@ int main(void) {
     printf("\n=== %d passed, %d failed ===\n", checks_passed, checks_failed);
     return checks_failed ? 1 : 0;
 }
+
+/* POSIX-Environments P3 idle-observer arm stand-ins — the announce
+ * crosses the real DSPP wire, so a host build cannot run it; a no-op
+ * here keeps this test's link honest. Real coverage:
+ * tests/env_migrate_host_test.c (the local gate, the wire frame, the
+ * peer latch) and tests/checkpoint_recovery_host_test.c (the
+ * failover declaration gate). */
+void env_migrate_intent_begin(void) {}
+void env_migrate_intent_end(void) {}

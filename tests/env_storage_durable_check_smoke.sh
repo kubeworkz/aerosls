@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # tests/env_storage_durable_check_smoke.sh — the TEETH for
-# tests/env_storage_durable_check.sh, and the four teeth v0.2 §5 names:
+# tests/env_storage_durable_check.sh: the four teeth v0.2 §5 names, plus the
+# stale-region-base tooth the live env_migrate_confirm failure earned:
 #
 #   P1B_TOOTH=ram-backed          — the store loses its extent (durable flag
 #                                   off) but keeps its directory entry
@@ -13,6 +14,11 @@
 #   P1B_TOOTH=bad-format-version  — the formatting mount treats any
 #                                   unparsable store as fresh, so a store
 #                                   labelled v3 would be FORMATTED OVER
+#   P1B_TOOTH=stale-region-base   — the directory load keeps the previous
+#                                   boot's region_base (the surrender call
+#                                   after the array read, or the clear
+#                                   inside it) — the live REFUSE_PARKED
+#                                   restore-denial loop's exact shape
 #
 # ─── What a teeth smoke is for, and why this one is source-level ──────────
 # A guard that has never been seen to fail is a guard nobody can trust. Each
@@ -58,7 +64,7 @@
 #
 # Usage:  bash tests/env_storage_durable_check_smoke.sh [P1B_TOOTH=<name>]
 #         P1B_TOOTH=<name> bash tests/env_storage_durable_check_smoke.sh
-#         (default: all four groups, in the order above)
+#         (default: all five groups, in the order above)
 #
 # Exit: 0 every tooth bit, 1 a tooth did not, 2 misuse/precondition missing.
 set -u
@@ -70,8 +76,8 @@ GUARD="$ROOT/tests/env_storage_durable_check.sh"
 
 TOOTH_SET="${1:-${P1B_TOOTH:-}}"
 case "$TOOTH_SET" in
-    ""|ram-backed|unquotaed|format-v1-only|bad-format-version) ;;
-    *) echo "ABORT: unknown P1B_TOOTH='$TOOTH_SET' — expected ram-backed, unquotaed, format-v1-only or bad-format-version" >&2; exit 2 ;;
+    ""|ram-backed|unquotaed|format-v1-only|bad-format-version|stale-region-base) ;;
+    *) echo "ABORT: unknown P1B_TOOTH='$TOOTH_SET' — expected ram-backed, unquotaed, format-v1-only, bad-format-version or stale-region-base" >&2; exit 2 ;;
 esac
 want_tooth() { [ -z "$TOOTH_SET" ] || [ "$TOOTH_SET" = "$1" ]; }
 
@@ -100,6 +106,7 @@ SEED_FILES=(
     kernel/env_proto.h
     kernel/syscall_dispatch.c
     kernel/cap.c
+    kernel/cap.h
     kernel/partition.h
     kernel/kernel_io.h
     drivers/nvme_io.h
@@ -309,6 +316,36 @@ if want_tooth bad-format-version; then
         'if block.iter().all(|&b| b == 0) {' \
         'if true {'
     tooth bad-format-version S8e "the mount's zero-gate is gone (every unparsable store is 'unformatted' and gets formatted over)" "$W/b1"
+else
+    skipped=$((skipped + 1))
+fi
+
+# ── P1B_TOOTH=stale-region-base ───────────────────────────────────────────
+# The live env_migrate_confirm failure's exact shape: persist_restore_all's
+# directory read restores a region_base stamped by a PREVIOUS boot, and
+# without the surrender seam es_find_base()'s first match resolves this
+# boot's fresh frame-pool address to that stale entry — the next attach's
+# own ramdisk server is denied until REFUSE_PARKED (the 12 241-line
+# restore-denial loop). Two independent mutations, one per half of the seam:
+# the call after the array read (S3h), and the clear inside it (S3i). Both
+# must bite by name; the call's removal must NOT break the S11 build (the
+# seam is wiring, not a dependency — that separation is what lets either
+# half be caught alone).
+if want_tooth stale-region-base; then
+    seed "$W/s1"
+    replace "$W/s1/kernel/persist.c" \
+        'env_storage_after_restore();' \
+        ''
+    tooth stale-region-base S3h "persist_restore_all no longer surrenders the restored region_base after the directory read" "$W/s1"
+
+    # The neutered clear must still COMPILE (region_base = (0), not an
+    # undeclared identifier) — otherwise S11c would redden too and the
+    # attribution would be two clauses for one property.
+    seed "$W/s2"
+    replace "$W/s2/kernel/env_storage.c" \
+        'env_storage_table[i].region_base = 0;' \
+        'env_storage_table[i].region_base = (0);'
+    tooth stale-region-base S3i "env_storage_after_restore() no longer clears region_base (the surrender is nominal)" "$W/s2"
 else
     skipped=$((skipped + 1))
 fi

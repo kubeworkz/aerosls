@@ -37,6 +37,13 @@ static struct EnvCkptRefusal ec_refusal = { ENV_CKPT_REFUSE_NONE, 0, 0 };
 static uint8_t  ec_restore_pending[ENV_CKPT_MAX];
 static uint32_t ec_restore_pending_count = 0;
 static uint32_t ec_restore_refused_count = 0;
+// Per-SLOT refusal marks (P3 increment 11), parallel to ec_restore_pending.
+// Both a settle and a refusal clear the pending bit, so the pending set alone
+// cannot tell a restored environment from a refused one; failover's restore
+// half classifies per record, and this is the fact it classifies BY. Kept in
+// step with the table exactly like the pending set (drop() shifts it),
+// because a bit left behind by a shift would point at a different record.
+static uint8_t  ec_restore_refused_slot[ENV_CKPT_MAX];
 // The pause ledger for the replay: the partitions THIS pass resumed and
 // therefore owes a repause. Same shape as EnvCkptQuiesce.paused_by_capture[],
 // and for the same reason -- "what I did" is the only safe thing to undo.
@@ -262,6 +269,7 @@ int env_ckpt_drop(uint32_t partition_id, uint32_t index) {
     for (uint32_t i = (uint32_t)slot; i + 1 < env_ckpt_count; i++) {
         env_ckpt_table[i]    = env_ckpt_table[i + 1];
         ec_restore_pending[i] = ec_restore_pending[i + 1];
+        ec_restore_refused_slot[i] = ec_restore_refused_slot[i + 1];
     }
     env_ckpt_count--;
     ec_memset(&env_ckpt_table[env_ckpt_count], 0, (uint32_t)sizeof(struct EnvCkptRecord));
@@ -344,6 +352,7 @@ int env_ckpt_adopt(const struct EnvCkptRecord* staging, uint32_t count,
 
     ec_memcpy(env_ckpt_table, staging, count * (uint32_t)sizeof(struct EnvCkptRecord));
     env_ckpt_count = count;
+    ec_memset(ec_restore_refused_slot, 0, (uint32_t)sizeof(ec_restore_refused_slot));
     ec_clear_refusal();
     return 0;
 }
@@ -458,7 +467,8 @@ void env_ckpt_release_capture(const struct EnvCkptQuiesce* q) {
 // Marks a state that already exists — the caller holds the partition paused —
 // and never creates one.
 uint32_t env_ckpt_quiesce_partition(uint32_t partition_id,
-                                    struct EnvCkptPartitionQuiesce* q) {
+                                    struct EnvCkptPartitionQuiesce* q,
+                                    int operator_paused) {
     if (q == (struct EnvCkptPartitionQuiesce*)0) return 0;
     ec_memset(q, 0, (uint32_t)sizeof *q);
     q->partition_id = partition_id;
@@ -476,8 +486,21 @@ uint32_t env_ckpt_quiesce_partition(uint32_t partition_id,
         if (env_ckpt_table[i].partition_id != partition_id) continue;
         q->prior_flags[i] = env_ckpt_table[i].flags;
         q->touched       |= (uint16_t)(1u << i);
-        env_ckpt_table[i].flags |= ENV_CKPT_FLAG_QUIESCED |
-                                  ENV_CKPT_FLAG_PARTITION_PAUSED;
+        // QUIESCED always: the freeze is real either way, and the
+        // destination's admissibility gate requires it. PARTITION_PAUSED
+        // ONLY for the operator's own pause — the flag's definition is
+        // "an operator's intent, not something the capture did", and in a
+        // migration the pause is always something the MIGRATION did unless
+        // the operator beat it there. Marking the migration's own freeze as
+        // an operator's intent made every destination "restore into
+        // paused" — the environment LIVE by the records, dead to the
+        // scheduler, its console accepting input nobody would ever read
+        // (P3 increment 10's live arm, 2026-10-14). The caller is the only
+        // one who knows which kind of pause it holds; this is that
+        // knowledge arriving, not a guess.
+        env_ckpt_table[i].flags |= ENV_CKPT_FLAG_QUIESCED;
+        if (operator_paused)
+            env_ckpt_table[i].flags |= ENV_CKPT_FLAG_PARTITION_PAUSED;
         q->n_marked++;
     }
     return q->n_marked;
@@ -536,8 +559,31 @@ void env_ckpt_restore_begin(void) {
         ec_restore_pending[i] = 1u;
     ec_restore_pending_count = env_ckpt_count;
     ec_restore_refused_count = 0;
+    ec_memset(ec_restore_refused_slot, 0, (uint32_t)sizeof(ec_restore_refused_slot));
     ec_restore_resumed_count = 0;
     ec_clear_refusal();
+}
+
+// ── Per-record arming and per-record refusal (P3 increment 11) ────────────
+// See env_ckpt.h. Arm is the boot path's blanket restore_begin() narrowed to
+// one (partition, index): failover_recover_from() owes a replay only to the
+// ADOPTED partitions' records, and re-arming the whole table would replay the
+// survivor's own live environments. The refused mark is what keeps the two
+// pending-set outcomes distinguishable after the fact.
+int env_ckpt_restore_arm(uint32_t partition_id, uint32_t index) {
+    int slot = ec_find_slot(partition_id, index);
+    if (slot < 0) return 1;              // no such record: arming nothing is a refusal
+    ec_restore_refused_slot[slot] = 0;   // armed fresh: a prior refusal is not its state
+    if (!ec_restore_pending[slot]) {
+        ec_restore_pending[slot] = 1u;
+        ec_restore_pending_count++;
+    }
+    return 0;
+}
+
+int env_ckpt_restore_refused_record(uint32_t partition_id, uint32_t index) {
+    int slot = ec_find_slot(partition_id, index);
+    return (slot >= 0 && ec_restore_refused_slot[slot]) ? 1 : 0;
 }
 
 uint32_t env_ckpt_restore_pending(void) { return ec_restore_pending_count; }
@@ -606,12 +652,20 @@ int env_ckpt_restore_next(uint32_t* partition, uint32_t* index, uint32_t* env_id
 }
 
 void env_ckpt_restore_settle(uint32_t partition_id, uint32_t index) {
+    int slot = ec_find_slot(partition_id, index);
+    if (slot >= 0) ec_restore_refused_slot[slot] = 0;   // settled: NOT refused
     ec_restore_clear_pending(partition_id, index);
     ec_clear_refusal();
 }
 
 void env_ckpt_restore_refuse(uint32_t partition_id, uint32_t index,
                              uint32_t code, uint32_t a, uint32_t b) {
+    int slot = ec_find_slot(partition_id, index);
+    // The mark lands BEFORE the slot leaves the pending set, and it is what
+    // distinguishes this outcome from a settle after both have cleared it —
+    // failover's restore half counts a refused record as unrestored by
+    // reading this, never by re-deriving it from pending.
+    if (slot >= 0) ec_restore_refused_slot[slot] = 1;
     ec_restore_clear_pending(partition_id, index);
     ec_restore_refused_count++;
     ec_refuse(code, a, b);

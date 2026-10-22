@@ -69,8 +69,25 @@ pub const TAG_FLAGS: u16 = 0x0009;
 /// Sidecar identity: the instance name other manifests' `CAP_CHAN` peer
 /// fields resolve against (registered in the kernel's sidecar registry).
 pub const TAG_NAME: u16 = 0x000A;
+/// §5.2's environment-crossing record: the argv and envp that cross on
+/// the spawn request (kernel/cap.h `SIDECAR_TAG_ARGENV`). Consumed by the
+/// create's §5.2 stack image; an absent record is the v1 answer —
+/// `argv = { name }`, an empty environment.
+pub const TAG_ARGENV: u16 = 0x000E;
 /// Reserved for Phase 3 signed manifests; ignored by v1.
 pub const TAG_SIGNATURE: u16 = 0x7F00;
+
+/// Per-list bounds of one `ARGENV` record — the kernel's own
+/// (cap.h `SIDECAR_MANIFEST_MAX_ARGV`/`MAX_ENVP`), mirrored so a record
+/// this side builds is one the kernel will parse.
+pub const MAX_ARGV: usize = 8;
+pub const MAX_ENVP: usize = 16;
+/// Total NUL-terminated string bytes one record may carry (cap.h
+/// `SIDECAR_MANIFEST_ARGENV_BYTES` — the create copies them into a fixed
+/// arena on its stack). Over the bound the create refuses by name
+/// (`CAP_ERANGE`), so this side asserts it too rather than building a
+/// record destined to be refused.
+pub const ARGENV_MAX_STR_BYTES: usize = 512;
 
 /// Packed manifest header size: magic[8] + version u16×2 + record_count
 /// u16 + flags u16 + total_len u32 + body_crc32 u32 = 24 bytes (the
@@ -203,6 +220,63 @@ pub struct Bootstrap<'a> {
     pub log_level: u8,
 }
 
+/// The `ARGENV` record — §5.2's environment-crossing record: the argv
+/// and envp that cross on the spawn request, because "argv/envp are the
+/// environment's to define" (§5.2) — the sidecar knows the command line
+/// and the environment, and the create hands them to the §5.2 stack
+/// image. Wire form (kernel/cap.c `SIDECAR_TAG_ARGENV`):
+/// `argc u16, envc u16, argv strings (len u16 + bytes) × argc, env
+/// strings (len u16 + bytes) × envc` — no interior NUL, at most
+/// [`MAX_ARGV`]/[`MAX_ENVP`] entries, at most [`ARGENV_MAX_STR_BYTES`]
+/// NUL-terminated bytes in total.
+///
+/// Strings pack contiguously from index 0 and `None` tails each list —
+/// the invariant [`ArgEnv::new`] and the parser both maintain, which is
+/// what makes the two representations equal-comparable. The counts are
+/// derived, never stored, so they cannot drift from the arrays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArgEnv<'a> {
+    /// argv strings, packed from index 0; `None` tails the list.
+    pub argv: [Option<&'a str>; MAX_ARGV],
+    /// envp strings, packed from index 0; `None` tails the list.
+    pub envp: [Option<&'a str>; MAX_ENVP],
+}
+
+impl<'a> ArgEnv<'a> {
+    /// Build an `ARGENV` payload from borrowed string slices. The bounds
+    /// are hard: every call site's strings are compile-time literals, so
+    /// an over-limit environment is a programmer error — and silently
+    /// truncating it would hand the child a shorter environment than the
+    /// author wrote while reading as success. Assert instead, loudly.
+    pub fn new(argv: &[&'a str], envp: &[&'a str]) -> ArgEnv<'a> {
+        assert!(argv.len() <= MAX_ARGV, "ARGENV: argv is over {MAX_ARGV} entries");
+        assert!(envp.len() <= MAX_ENVP, "ARGENV: envp is over {MAX_ENVP} entries");
+        let mut bytes = 0usize;
+        for s in argv.iter().chain(envp.iter()) {
+            assert!(!s.as_bytes().contains(&0u8),
+                    "ARGENV: interior NUL in an env string ({s:?})");
+            bytes += s.len() + 1;   // the kernel's arena charges each NUL too
+        }
+        assert!(bytes <= ARGENV_MAX_STR_BYTES,
+                "ARGENV: strings are over {ARGENV_MAX_STR_BYTES} bytes");
+        let mut a = [None; MAX_ARGV];
+        let mut e = [None; MAX_ENVP];
+        for (i, s) in argv.iter().enumerate() { a[i] = Some(*s); }
+        for (i, s) in envp.iter().enumerate() { e[i] = Some(*s); }
+        ArgEnv { argv: a, envp: e }
+    }
+
+    /// The number of argv entries actually packed.
+    pub fn argc(&self) -> usize {
+        self.argv.iter().take_while(|s| s.is_some()).count()
+    }
+
+    /// The number of envp entries actually packed.
+    pub fn envc(&self) -> usize {
+        self.envp.iter().take_while(|s| s.is_some()).count()
+    }
+}
+
 /// A parsed manifest. Names are borrowed from the blob, which must outlive
 /// the manifest (same lifetime contract as `BootInfo`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -222,6 +296,11 @@ pub struct Manifest<'a> {
     pub n_caps: usize,
     pub bootstrap: Option<Bootstrap<'a>>,
     pub flags_value: Option<u32>,
+    /// The `ARGENV` record (§5.2's environment-crossing record), `None`
+    /// when absent: the create then hands the child the v1 answer —
+    /// `argv = { name }`, an empty environment — so every manifest
+    /// built before the record existed keeps parsing and running.
+    pub argenv: Option<ArgEnv<'a>>,
     /// The raw `SIGNATURE` payload (opaque to v1; `None` when absent).
     pub signature: Option<&'a [u8]>,
 }
@@ -298,6 +377,7 @@ pub fn parse_manifest(blob: &[u8]) -> Result<Manifest<'_>, ManifestErr> {
         n_caps: 0,
         bootstrap: None,
         flags_value: None,
+        argenv: None,
         signature: None,
     };
 
@@ -466,6 +546,58 @@ pub fn parse_manifest(blob: &[u8]) -> Result<Manifest<'_>, ManifestErr> {
                 }
                 m.flags_value = Some(le_u32(p, 0));
             }
+            TAG_ARGENV => {
+                // §5.2's environment-crossing record: argc u16, envc u16,
+                // then argv and envp strings each as len u16 + bytes. The
+                // bounds below are the KERNEL's own refusals mirrored
+                // (cap.c `SIDECAR_TAG_ARGENV`): counts over the fixed
+                // arrays, total NUL-terminated bytes over the create's
+                // arena, a malformed string, an interior NUL, or bytes
+                // trailing the last string — all refused, never silently
+                // truncated (a truncated env would read as success and
+                // hand the child fewer variables than its author wrote).
+                if p.len() < 4 {
+                    return Err(ManifestErr::BadRecordLen);
+                }
+                let argc = le_u16(p, 0) as usize;
+                let envc = le_u16(p, 2) as usize;
+                if argc > MAX_ARGV || envc > MAX_ENVP {
+                    return Err(ManifestErr::BadRecordLen);
+                }
+                let mut out = ArgEnv {
+                    argv: [None; MAX_ARGV],
+                    envp: [None; MAX_ENVP],
+                };
+                let mut off = 4usize;
+                let mut bytes = 0usize;
+                for i in 0..argc + envc {
+                    if off + 2 > p.len() {
+                        return Err(ManifestErr::BadRecordLen);
+                    }
+                    let n = le_u16(p, off) as usize;
+                    off += 2;
+                    if off + n > p.len() {
+                        return Err(ManifestErr::BadRecordLen);
+                    }
+                    let s = utf8(&p[off..off + n], ManifestErr::BadUtf8)?;
+                    if s.as_bytes().contains(&0u8) {
+                        return Err(ManifestErr::BadRecordLen);
+                    }
+                    bytes += n + 1;
+                    if bytes > ARGENV_MAX_STR_BYTES {
+                        return Err(ManifestErr::BadRecordLen);
+                    }
+                    if i < argc { out.argv[i] = Some(s); }
+                    else        { out.envp[i - argc] = Some(s); }
+                    off += n;
+                }
+                if off != p.len() {
+                    return Err(ManifestErr::BadRecordLen);
+                }
+                // A second record wins outright (last-wins, like NAME),
+                // so the lists can never interleave two records' strings.
+                m.argenv = Some(out);
+            }
             TAG_SIGNATURE => m.signature = Some(p),
             other => {
                 if tolerate {
@@ -619,6 +751,18 @@ pub fn build_manifest(m: &Manifest<'_>) -> alloc::vec::Vec<u8> {
     if let Some(f) = m.flags_value {
         recs.push((TAG_FLAGS, f.to_le_bytes().to_vec()));
     }
+    if let Some(e) = m.argenv {
+        // §5.2's environment-crossing record: argc u16, envc u16, then
+        // each string as len u16 + bytes — argv first, then envp, the
+        // layout kernel/cap.c's `SIDECAR_TAG_ARGENV` arm walks. The
+        // string shape is every name field's own (enc_name).
+        let mut p = alloc::vec::Vec::new();
+        p.extend_from_slice(&(e.argc() as u16).to_le_bytes());
+        p.extend_from_slice(&(e.envc() as u16).to_le_bytes());
+        for s in e.argv.iter().flatten() { p.extend_from_slice(&enc_name(s)); }
+        for s in e.envp.iter().flatten() { p.extend_from_slice(&enc_name(s)); }
+        recs.push((TAG_ARGENV, p));
+    }
     if let Some(s) = m.signature {
         recs.push((TAG_SIGNATURE, s.to_vec()));
     }
@@ -679,6 +823,7 @@ mod tests {
             n_caps: 4,
             bootstrap: Some(Bootstrap { console: Some("console"), debug: None, log_level: 1 }),
             flags_value: Some(0),
+            argenv: None,
             signature: None,
         }
     }
@@ -797,6 +942,7 @@ mod tests {
             n_caps: caps.len(),
             bootstrap: None,
             flags_value: None,
+            argenv: None,
             signature: None,
         }
     }
@@ -1015,6 +1161,7 @@ mod tests {
             n_caps: caps.len(),
             bootstrap: None,
             flags_value: None,
+            argenv: None,
             signature: None,
         }
     }
@@ -1131,5 +1278,124 @@ mod tests {
         assert_eq!(parsed.image.unwrap().entry, 0x10);
         assert_eq!(parsed.image.unwrap().offset, 0x8000);
         assert_eq!(parsed.image.unwrap().size, 0x4000);
+    }
+
+    /// The exact wire bytes of §5.2's environment-crossing record:
+    /// `argc u16, envc u16`, then each string as `len u16 + bytes` —
+    /// argv first, then envp. kernel/cap.c's `SIDECAR_TAG_ARGENV` arm
+    /// walks exactly this layout, and tests/cap_create_sidecar_host_test.c
+    /// builds the same bytes by hand; if this golden moves, all three
+    /// disagree silently while every side still parses its own output.
+    #[test]
+    fn argenv_wire_bytes_golden() {
+        let mut m = sample();
+        m.argenv = Some(ArgEnv::new(
+            &["crossed-argv", "--flag"],
+            &["PATH=/bin", "HOME=/root"],
+        ));
+        let blob = build_manifest(&m);
+        let p = record_payload(&blob, TAG_ARGENV)
+            .expect("the ARGENV record is emitted when present");
+        let mut want = Vec::new();
+        want.extend_from_slice(&2u16.to_le_bytes()); // argc
+        want.extend_from_slice(&2u16.to_le_bytes()); // envc
+        for s in ["crossed-argv", "--flag", "PATH=/bin", "HOME=/root"] {
+            want.extend_from_slice(&(s.len() as u16).to_le_bytes());
+            want.extend_from_slice(s.as_bytes());
+        }
+        assert_eq!(p, &want[..], "argc/envc then len-prefixed strings, argv first");
+    }
+
+    /// Build → parse round-trips §5.2's record with both halves intact,
+    /// lists packed and None-tailed — the representation both the counts
+    /// and the kernel's fallback consult are derived from.
+    #[test]
+    fn argenv_build_parse_roundtrip() {
+        let mut m = sample();
+        m.argenv = Some(ArgEnv::new(&["prog", "--x"], &["A=1", "B=2", "C=3"]));
+        let blob = build_manifest(&m);
+        let parsed = parse_manifest(&blob).unwrap();
+        assert_eq!(parsed.argenv, m.argenv);
+        let e = parsed.argenv.unwrap();
+        assert_eq!(e.argc(), 2);
+        assert_eq!(e.envc(), 3);
+        assert_eq!(e.argv[1], Some("--x"));
+        assert_eq!(e.envp[2], Some("C=3"));
+        assert_eq!(e.argv[2], None, "argv packs from index 0, None-tailed");
+    }
+
+    /// A manifest without the record parses to `None` — the create's v1
+    /// fallback (`argv = { name }`, empty environment) is keyed on that
+    /// absence, so every manifest built before the record existed must
+    /// still parse and still take the fallback.
+    #[test]
+    fn argenv_absent_is_the_v1_answer() {
+        let blob = build_manifest(&sample());
+        let m = parse_manifest(&blob).unwrap();
+        assert_eq!(m.argenv, None);
+    }
+
+    /// The parser refuses exactly what the kernel's `SIDECAR_TAG_ARGENV`
+    /// arm refuses (counts over the fixed arrays and bytes over the arena
+    /// → CAP_ERANGE; malformed shape, interior NUL and trailing bytes →
+    /// CAP_EINVAL) — never truncating a list or a string, because a
+    /// silently shortened environment would read as success while handing
+    /// the child fewer variables than its author wrote.
+    #[test]
+    fn argenv_parse_refuses_what_the_kernel_refuses() {
+        // argv over the fixed array (cap.c: CAP_ERANGE).
+        let mut p = Vec::new();
+        p.extend_from_slice(&((MAX_ARGV + 1) as u16).to_le_bytes());
+        p.extend_from_slice(&0u16.to_le_bytes());
+        let v = blob_with_extra(0, &[(TAG_ARGENV, &p)]);
+        assert_eq!(parse_manifest(&v), Err(ManifestErr::BadRecordLen));
+
+        // envp over the fixed array (cap.c: CAP_ERANGE).
+        let mut p = Vec::new();
+        p.extend_from_slice(&0u16.to_le_bytes());
+        p.extend_from_slice(&((MAX_ENVP + 1) as u16).to_le_bytes());
+        let v = blob_with_extra(0, &[(TAG_ARGENV, &p)]);
+        assert_eq!(parse_manifest(&v), Err(ManifestErr::BadRecordLen));
+
+        // A count with none of the strings it claims (shape).
+        let mut p = Vec::new();
+        p.extend_from_slice(&1u16.to_le_bytes());
+        p.extend_from_slice(&0u16.to_le_bytes());
+        let v = blob_with_extra(0, &[(TAG_ARGENV, &p)]);
+        assert_eq!(parse_manifest(&v), Err(ManifestErr::BadRecordLen));
+
+        // An interior NUL — the create copies C strings and refuses these
+        // by name (cap.c: CAP_EINVAL) rather than truncating at the NUL.
+        let mut p = Vec::new();
+        p.extend_from_slice(&1u16.to_le_bytes());
+        p.extend_from_slice(&0u16.to_le_bytes());
+        p.extend_from_slice(&3u16.to_le_bytes());
+        p.extend_from_slice(b"a\0b");
+        let v = blob_with_extra(0, &[(TAG_ARGENV, &p)]);
+        assert_eq!(parse_manifest(&v), Err(ManifestErr::BadRecordLen));
+
+        // The arena's byte budget: ARGENV_MAX_STR_BYTES + its NUL
+        // (cap.c: CAP_ERANGE — the fixed arena on the create's stack).
+        let mut p = Vec::new();
+        p.extend_from_slice(&1u16.to_le_bytes());
+        p.extend_from_slice(&0u16.to_le_bytes());
+        p.extend_from_slice(&(ARGENV_MAX_STR_BYTES as u16).to_le_bytes());
+        p.extend_from_slice(&vec![b'a'; ARGENV_MAX_STR_BYTES]);
+        let v = blob_with_extra(0, &[(TAG_ARGENV, &p)]);
+        assert_eq!(parse_manifest(&v), Err(ManifestErr::BadRecordLen));
+
+        // Bytes trailing the last string: the payload must be consumed
+        // exactly — a counted list with junk behind it is malformed.
+        let v = blob_with_extra(0, &[(TAG_ARGENV, &[0, 0, 0, 0, 0xFF])]);
+        assert_eq!(parse_manifest(&v), Err(ManifestErr::BadRecordLen));
+    }
+
+    /// ArgEnv::new fails loudly on over-limit inputs: every call site's
+    /// strings are literals, so truncating here would be a programmer
+    /// error shipped as a shorter environment that reads as success.
+    #[test]
+    #[should_panic(expected = "ARGENV: argv is over")]
+    fn argenv_new_refuses_over_limit() {
+        let _ = ArgEnv::new(&["a"; MAX_ARGV + 1], &[]);
     }
 }

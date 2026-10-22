@@ -176,6 +176,7 @@ pub fn build_e1000_manifest(spawn: &E1000Spawn) -> Vec<u8> {
             log_level: 1,
         }),
         flags_value: Some(0),
+        argenv: None,
         signature: None,
     };
 

@@ -83,6 +83,16 @@ __attribute__((weak)) void kernel_yield_switch(uint64_t* rsp_save, uint64_t cr3,
 }
 __attribute__((weak)) void kernel_resume_control_plane(void) { for (;;) {} }
 
+/* ─── E7 §5.3 (the plan's increment 4): the FS-base MSR write ────────────── */
+/* process.c's proc_build_resume_frame calls user_write_fs_base() on every
+ * ring-3 switch-in — a ring-0 wrmsr of MSR_IA32_FS_BASE that host tests
+ * never execute (they build and inspect resume frames, they do not run the
+ * switch, and wrmsr would #UD in user space anyway). No-op stands in; weak,
+ * like every other stub here, so a test that wants to OBSERVE the invariant
+ * ("every switch-in writes the incoming task's fs_base") can override it
+ * and count calls. */
+__attribute__((weak)) void user_write_fs_base(uint64_t base) { (void)base; }
+
 /* ─── arch/x86/boot.asm's bootstrap-stack bounds ────────────────────────── */
 /* frame_pool_init() reserves [stack_bottom, stack_top) by name instead of
  * trusting _kernel_image_end to cover it, so every host test that links

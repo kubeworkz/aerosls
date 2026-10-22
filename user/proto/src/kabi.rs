@@ -216,6 +216,22 @@ pub trait Kernel {
         self.create_sidecar(manifest)
     }
 
+    /// Spawn a LINUX-personality child (`SYS_SLS_LINUX_SPAWN`, 328 — E7): the
+    /// same manifest path and request struct as `create_sidecar`, stamped
+    /// PROC_PERSONALITY_LINUX inside the kernel's create — and therefore
+    /// behind the SAME E2 `sidecar_authority` gate, which lives in the create
+    /// both share (Linux ABI Shim Design §3.3, §10.6). Returns the CALLER's
+    /// messenger handles `(CHAN_R, CHAN_W)`; the child holds the complementary
+    /// pair, and the child's traps then DESCRIBE and forward onto that
+    /// channel (the kernel branch) instead of reaching the number chains.
+    /// Callers register the handles with `aerosls-sidecar`'s
+    /// `linux::track` so `linux::service` answers the child's forwards.
+    /// Default: unsupported (`ERR_NOTFOUND`), for fakes that never spawn.
+    fn linux_spawn(&self, manifest: &[u8], target_partition: u32) -> Result<(u32, u32), i32> {
+        let _ = (manifest, target_partition);
+        Err(ERR_NOTFOUND)
+    }
+
     /// Allocate a contiguous physical region of `nframes` frames, aligned to
     /// `align_frames` frames (a power of two; 1 = any boundary), charged to
     /// the caller's partition (`SYS_SLS_ALLOC_REGION`). Returns the base
@@ -419,6 +435,8 @@ mod abi {
     const SYS_FREE_REGION: u64 = 321;
     // POSIX-Environments P3 increment 1: the placement gate (kernel/cap.h).
     const SYS_PLACEMENT_CAN_HOLD: u64 = 327;
+    // E7 (Linux ABI Shim Design §3.3): the LINUX-personality create.
+    const SYS_LINUX_SPAWN: u64 = 328;
     const SYS_SIDECAR_PID: u64 = 322;
     const SYS_ENV_STORAGE_ATTACH: u64 = 323;
     const SYS_ENV_STORAGE_RESTORE: u64 = 324;
@@ -697,6 +715,9 @@ mod abi {
     /// `out_ch_r`/`out_ch_w` in the request; the shim reads both ends from
     /// there and returns 0 on success (a negative syscall value is an error).
     fn do_create_sidecar(
+        sysno: u64,   /* 310 = create_sidecar, 328 = linux_spawn (E7): the two
+                       * syscalls share ONE request struct and ONE create path —
+                       * they differ in the personality the kernel stamps */
         manifest: *const u8,
         manifest_len: u32,
         target_partition: u32,
@@ -713,7 +734,7 @@ mod abi {
             out_ch_w: CAP_NONE,
         };
         let rc = unsafe {
-            sls_syscall(SYS_CREATE_SIDECAR, &mut req as *mut CreateSidecarReq as u64)
+            sls_syscall(sysno, &mut req as *mut CreateSidecarReq as u64)
         } as i64;
         if rc < 0 {
             return rc as i32;
@@ -738,7 +759,7 @@ mod abi {
         out_r: *mut u32,
         out_w: *mut u32,
     ) -> i32 {
-        do_create_sidecar(manifest, manifest_len, 0, out_r, out_w)
+        do_create_sidecar(SYS_CREATE_SIDECAR, manifest, manifest_len, 0, out_r, out_w)
     }
 
     /// `k_create_sidecar_in`: syscall 310, placing the child in
@@ -753,7 +774,24 @@ mod abi {
         out_r: *mut u32,
         out_w: *mut u32,
     ) -> i32 {
-        do_create_sidecar(manifest, manifest_len, target_partition, out_r, out_w)
+        do_create_sidecar(SYS_CREATE_SIDECAR, manifest, manifest_len, target_partition, out_r, out_w)
+    }
+
+    /// `k_linux_spawn`: syscall 328 — the same create as `k_create_sidecar_in`
+    /// with the LINUX personality stamped inside the kernel's own create
+    /// (E7 increments 2/3). Returns the CALLER's messenger handles; the child
+    /// holds the complementary pair, and its traps forward onto that channel
+    /// (kernel/syscall_dispatch.c's Linux branch; served by
+    /// `aerosls-sidecar`'s `linux::service`).
+    #[no_mangle]
+    pub extern "C" fn k_linux_spawn(
+        manifest: *const u8,
+        manifest_len: u32,
+        target_partition: u32,
+        out_r: *mut u32,
+        out_w: *mut u32,
+    ) -> i32 {
+        do_create_sidecar(SYS_LINUX_SPAWN, manifest, manifest_len, target_partition, out_r, out_w)
     }
 
     #[no_mangle]
@@ -1411,6 +1449,20 @@ mod abi {
         fn alloc_region_in(&self, nframes: u64, align_frames: u64,
                            target_partition: u32) -> u64 {
             k_alloc_region_in(nframes, align_frames, target_partition)
+        }
+
+        fn linux_spawn(&self, manifest: &[u8], target_partition: u32) -> Result<(u32, u32), i32> {
+            let mut r: u32 = 0;
+            let mut w: u32 = 0;
+            let rc = unsafe {
+                k_linux_spawn(manifest.as_ptr(), manifest.len() as u32,
+                              target_partition, &mut r, &mut w)
+            };
+            if rc != ERR_OK {
+                Err(rc)
+            } else {
+                Ok((r, w))
+            }
         }
 
         fn free_region_in(&self, base: u64, nframes: u64, target_partition: u32) -> bool {

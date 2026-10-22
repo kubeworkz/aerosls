@@ -29,6 +29,12 @@
  *      RAM-backed store (metered, honestly slot=-1) instead of refusing
  *      the environment that asked — the path every boot whose NVMe never
  *      came up takes (E5/E6's smokes caught the refusal regression).
+ *   8. the boot-load seam surrenders placement, not identity: a
+ *      region_base restored from a PREVIOUS boot claims nothing, so the
+ *      frame pool's re-handing of that address to a different
+ *      environment resolves to the fresh attach — not to the stale
+ *      entry (the live 12 241-line restore-denial loop that ended in
+ *      REFUSE_PARKED, 2026-10-15).
  *
  * The NVMe layer is a RAM disk behind the real entry points (io_sq is
  * non-NULL, nvme_*_sync read/write a static 8 MiB band covering exactly
@@ -329,6 +335,42 @@ int main(void) {
               storage_get_page_usage(4) == 0,
           "release clears the no-device store and hands its pages back");
     io_sq = (void*)1;                       /* the device is back */
+
+    /* ── 8. the load seam surrenders placement, not identity ─────────────── */
+    /* The table as persist_restore_all() finds it after persist_read_array():
+     * VALID entries carrying PREVIOUS boot's region_base values. The live
+     * failure (3-node TCG, 2026-10-15): a restored entry's stale base equalled
+     * this boot's fresh allocation for a DIFFERENT environment, es_find_base()'s
+     * first match resolved the new owner's region to the stale entry, and the
+     * new environment's ramdisk server was denied restore in a loop until the
+     * migrate restore refused PARKED (announced=0). */
+    CHECK(env_storage_owner(BASE_C) == 2,
+          "pre-seam: the restored entry still claims its previous boot's base");
+
+    env_storage_after_restore();            /* what persist_restore_all() calls after the read */
+    CHECK(env_storage_owner(BASE_C) == 0xFFFFFFFFu,
+          "the load surrenders the restored region_base — a previous boot's "
+          "address claims nothing");
+    CHECK(env_storage_extent_of(2, 0, &lba, &sectors, &bytes) == 0,
+          "identity survives the surrender: (partition 2, index 0) still names "
+          "its extent (the re-attach finds it by key)");
+
+    /* This boot's frame pool re-hands that address to a DIFFERENT environment. */
+    CHECK(env_storage_attach(4, 0, BASE_C, ENV_STORAGE_EXTENT_BYTES) ==
+              ENV_STORAGE_OK,
+          "a fresh attach may legitimately land on the address the stale "
+          "entry used to claim");
+    CHECK(env_storage_owner(BASE_C) == 4,
+          "the fresh attach owns the address — no first-match shadowing by "
+          "the stale entry (the denial loop's root cause)");
+
+    /* ...and the original identity re-attaches at its own fresh placement. */
+    CHECK(env_storage_attach(2, 0, BASE_A, ENV_STORAGE_EXTENT_BYTES) ==
+              ENV_STORAGE_OK,
+          "the original identity re-attaches at a fresh base (the reboot's "
+          "real path)");
+    CHECK(env_storage_owner(BASE_A) == 2 && env_storage_owner(BASE_C) == 4,
+          "both identities resolve to their live placement after the seam");
 
     printf("%s\n", g_fail ? "env_storage_host_test: FAILED"
                           : "env_storage_host_test: all checks passed");
