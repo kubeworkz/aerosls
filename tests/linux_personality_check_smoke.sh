@@ -791,6 +791,15 @@ sed -i 's/fmt_sig_line(&mut ex, b" ok sig=", args\[1\]/fmt_sig_line(&mut ex, b" 
 sed -i 's/fmt_sig_line(&mut ex, b" sig=", kill_sig/fmt_sig_line(&mut ex, b" sig=", 0/' "$W/t106/user/sidecar/src/linux.rs"
 tooth signal-number-not-logged R7 "neither line carries the signal number anymore" "$W/t106"
 
+# t107: the abort-proof instrument stripped both halves — the excerpt
+# clamped to nothing and the mmap request dropped from the refusal line,
+# so the alloc-failure text goes back to a merged drain and the refusal
+# back to a bare number (the chain becomes an inference).
+seed "$W/t107"
+sed -i 's/\.take(24)/.take(0)/' "$W/t107/user/sidecar/src/linux.rs"
+sed -i 's/b" -> ENOSYS mmap(len="/b" -> ENOSYS "/' "$W/t107/user/sidecar/src/linux.rs"
+tooth abort-evidence-stripped R8 "neither the written bytes nor the mmap request ride their lines" "$W/t107"
+
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

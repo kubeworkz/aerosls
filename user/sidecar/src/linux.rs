@@ -137,6 +137,12 @@ const E_TARGET: i32 = 7; /* CAP_ERR_TARGET -> -ESRCH (§5.7) */
 const LINUX_RT_SIGACTION: u64 = 13;
 const LINUX_RT_SIGPROCMASK: u64 = 14;
 const LINUX_TKILL: u64 = 200;
+/// mmap(9) — never armed (§10.10's named anonymous-map gap): it answers
+/// ENOSYS through the catch-all arm, and since the SIGABRT reading its
+/// refusals sit in front of, its LOG line carries the request's own
+/// numbers (len/prot/flags) so "the allocator asked for X and was
+/// refused" is read off the line.
+const LINUX_MMAP: u64 = 9;
 const SIGACT_BYTES: usize = 32; /* kernel-ABI struct sigaction: four u64s */
 const SIGSET_BYTES: u64 = 8;    /* the sigset this seam crosses            */
 
@@ -885,6 +891,38 @@ fn reply_bytes<K: Kernel>(k: &K, ch_w: u32, tag: u32, num: u64, ret: u64,
     }
 }
 
+/// Append `v` in decimal at `off`; returns the new offset. Total for any
+/// u64 (20 digits max), so a future widening cannot print a truncated
+/// number, and clamped to the buffer so a caller can compose a line
+/// without measuring first.
+fn dec_into(buf: &mut [u8], off: usize, v: u64) -> usize {
+    let mut digits = [0u8; 20];
+    let mut nd = 0usize;
+    let mut x = v;
+    loop {
+        digits[nd] = b'0' + (x % 10) as u8;
+        nd += 1;
+        x /= 10;
+        if x == 0 {
+            break;
+        }
+    }
+    let mut off = off;
+    while nd > 0 && off < buf.len() {
+        nd -= 1;
+        buf[off] = digits[nd];
+        off += 1;
+    }
+    off
+}
+
+/// Append `src` at `off`; returns the new offset (clamped to the buffer).
+fn push_bytes(buf: &mut [u8], off: usize, src: &[u8]) -> usize {
+    let n = src.len().min(buf.len().saturating_sub(off));
+    buf[off..off + n].copy_from_slice(&src[..n]);
+    off + n
+}
+
 /// One ENOSYS/protocol log line, host-build tolerant (entry.rs's klog is
 /// the target-feature serial path; on host fakes the answers still run,
 /// they just stay quiet).
@@ -896,28 +934,9 @@ fn reply_bytes<K: Kernel>(k: &K, ch_w: u32, tag: u32, num: u64, ret: u64,
 /// FRONT of every line this makes — enosys_log's 72-byte cap truncates
 /// the tail, never the number that identifies the signal.
 fn fmt_sig_line(buf: &mut [u8], prefix: &[u8], sig_no: u64, suffix: &[u8]) -> usize {
-    let p = prefix.len().min(buf.len());
-    buf[..p].copy_from_slice(&prefix[..p]);
-    let mut off = p;
-    let mut digits = [0u8; 20];
-    let mut nd = 0usize;
-    let mut v = sig_no;
-    loop {
-        digits[nd] = b'0' + (v % 10) as u8;
-        nd += 1;
-        v /= 10;
-        if v == 0 {
-            break;
-        }
-    }
-    while nd > 0 && off < buf.len() {
-        nd -= 1;
-        buf[off] = digits[nd];
-        off += 1;
-    }
-    let s = suffix.len().min(buf.len() - off);
-    buf[off..off + s].copy_from_slice(&suffix[..s]);
-    off + s
+    let off = push_bytes(buf, 0, prefix);
+    let off = dec_into(buf, off, sig_no);
+    push_bytes(buf, off, suffix)
 }
 
 fn enosys_log(tag_num: u32, child: &[u8], extra: &[u8]) {
@@ -1055,7 +1074,25 @@ pub fn service<K: Kernel>(k: &K, console: &CharNode) {
         match ans {
             Answer::Reply(ret, status) => {
                 if status == E_NOSYS {
-                    enosys_log(num as u32, &name_buf[..nlen], b" -> ENOSYS\n");
+                    if num == LINUX_MMAP {
+                        /* The refusal's ARGUMENTS ride the line — the
+                         * SIGABRT reading's other half: what the caller
+                         * asked the kernel for, by name, so "the allocator
+                         * wanted len=X prot=P flags=F and this shim cannot
+                         * service it" is a line, not a reconstruction. */
+                        let mut ex = [0u8; 56];
+                        let mut off =
+                            push_bytes(&mut ex, 0, b" -> ENOSYS mmap(len=");
+                        off = dec_into(&mut ex, off, args[1]);
+                        off = push_bytes(&mut ex, off, b", prot=");
+                        off = dec_into(&mut ex, off, args[2]);
+                        off = push_bytes(&mut ex, off, b", flags=");
+                        off = dec_into(&mut ex, off, args[3]);
+                        off = push_bytes(&mut ex, off, b")");
+                        enosys_log(num as u32, &name_buf[..nlen], &ex[..off]);
+                    } else {
+                        enosys_log(num as u32, &name_buf[..nlen], b" -> ENOSYS\n");
+                    }
                 } else if num == LINUX_TKILL {
                     /* tkill's SIG rides its line (increment 14): WHICH
                      * signal was asked for is the fact the pending →
@@ -1110,7 +1147,34 @@ pub fn service<K: Kernel>(k: &K, console: &CharNode) {
                  * above already made args[2] the payload's own length). */
                 match console.write(&payload[..len]) {
                     Ok(n) => {
-                        enosys_log(num as u32, &name_buf[..nlen], b" write ok\n");
+                        /* Attribution — the SIGABRT reading's instrument:
+                         * WHICH child wrote WHAT, on THIS line. Console
+                         * output drains as one merged stream in flush
+                         * order, so without the excerpt here a message in
+                         * the drain belongs to any child of the
+                         * environment. 24 bytes, printable bytes as-is and
+                         * everything else as '.', so a short line's first
+                         * words identify it and no control byte can break
+                         * the log line. */
+                        let mut ex = [0u8; 56];
+                        let mut off = fmt_sig_line(&mut ex, b" write ok len=",
+                                                   n as u64, b" |");
+                        for &b in payload[..len].iter().take(24) {
+                            if off + 1 >= ex.len() {
+                                break;
+                            }
+                            ex[off] = if b.is_ascii_graphic() || b == b' ' {
+                                b
+                            } else {
+                                b'.'
+                            };
+                            off += 1;
+                        }
+                        if off < ex.len() {
+                            ex[off] = b'|';
+                            off += 1;
+                        }
+                        enosys_log(num as u32, &name_buf[..nlen], &ex[..off]);
                         reply(k, ch_w, rr.tag, num, n as u64, STATUS_OK);
                     }
                     Err(_) => {

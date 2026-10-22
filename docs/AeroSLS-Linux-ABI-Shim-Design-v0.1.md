@@ -2147,6 +2147,8 @@ alloc-failure → `abort()` → `raise(SIGABRT)` (named as a READING,
 not a measurement: proving it is the next instrumentation question,
 and the fix for it either way is §10.10's anonymous-map gap or the
 handler class that would have caught SIGABRT — both already scoped).
+*(PROVEN at increment 15, below — every link of that reading now
+sits on a child-tagged line.)*
 
 **On purpose, no behavior changed.** Every arm's answers are
 byte-identical — only the LOG grew teeth (the two numbers, an
@@ -2165,8 +2167,65 @@ t79's sed updated so its mutation still lands); the sidecar crate's
 archives repacked); E3 harness OK on the final binaries;
 `tests/run_checks.sh` **45 PASS / 1 FAIL / 7 SKIP** (the same
 environmental census FAIL and cluster SKIPs, `script_conventions`
-and `sidecar_stamp` green inside it). `run_all` was not re-run — this
-increment changes no C — last green at 127/0/2 in increment 13.
+and `sidecar_stamp` green inside it).`run_all` was not re-run — this increment changes no C — last green at
+127/0/2 in increment 13.
+
+**The abort reading is PROVEN (increment 15): every link sits on a
+child-tagged line.** The instrument exists because of what increment
+14's evidence could NOT say: console output drains as ONE merged
+stream in FLUSH order, so `memory allocation of 24 bytes failed` in
+the drain belonged to any child of the environment, and the mmap
+refusals were bare numbers with no request behind them. Two lines
+grew teeth: a write now carries `len=` plus a 24-byte excerpt of the
+child's own bytes (printable as-is, everything else as `.` — a short
+line's first words identify it, and no control byte can break the
+log line), and an mmap refusal carries the request it refused
+(`len`/`prot`/`flags`). Measured — both boots identical, E3 harness
+RC=0:
+
+```
+[E7] linux: num=00000009 child=e7.linux.user.0 -> ENOSYS mmap(len=4096, prot=0, flags=50)
+[E7] linux: num=00000009 child=e7.linux.user.0 -> ENOSYS mmap(len=4096, prot=3, flags=34)
+[E7] linux: num=00000001 child=e7.linux.user.0 write ok len=21 |memory allocation of |
+[E7] linux: num=00000001 child=e7.linux.user.0 write ok len=2 |24|
+[E7] linux: num=00000001 child=e7.linux.user.0 write ok len=14 | bytes failed.|
+[E7] linux: num=00000001 child=e7.linux.user.0 write ok len=78 |note: run with `RUST_BAC|
+[E7] linux: num=000000C8 child=e7.linux.user.0 ok sig=6
+[E7] linux: num=0000000E child=e7.linux.user.0 sig=6 default-action -> kill
+[PROC] PID 111 terminated.
+```
+
+**The chain, link by link.** Two mmap requests from the FIRSTUSER —
+`prot=0 flags=50` (0x32 = FIXED|ANON|PRIVATE: a guard page) and
+`prot=3 flags=34` (0x22 = ANON|PRIVATE: the RW arena) — refused by
+name (§10.10's gap), so the allocator has no arena to grow into; the
+SAME child's very next output, in three writes, is Rust's own
+`memory allocation of 24 bytes failed` plus its backtrace note — the
+workload's OWN bytes, on its OWN lines, immediately after its own
+refusals — and then `tkill(6)`: `abort()` → `raise(SIGABRT)` →
+blocked → pending → the unblock arm delivers SIGABRT's default
+action → `terminated`. Refused, reported by the victim itself,
+raised, delivered, reaped — five links, five lines, one child.
+
+**What this increment is NOT.** The excerpt is 24 bytes — enough to
+identify a line, not a transcript; longer output is still read in
+the drain (now cross-checkable against the attributed heads). The
+instrument logs the syscall, not its CALLER: "mallocng's arena
+pair" is read from the request shape (guard + RW arena), not from a
+stack the shim cannot see — the proven links are the ones above.
+And no behavior changed: same answers, same bytes, only the two
+lines richer — clause **R8** (89 total) pins both halves and tooth
+t107 strips them (excerpt clamped to zero, request dropped from the
+refusal).
+
+**Suite for this increment.** guard **89 clauses**; smoke **93/93**;
+the sidecar crate's `linux::` tests **12/12**; `selfhost-bootimage`
+and `x86-iso-e3` RC=0 (user/ changed, archives repacked); E3 harness
+OK on the final binaries (the trace above); `tests/run_checks.sh`
+**45 PASS / 1 FAIL / 7 SKIP** — the environmental census FAIL and
+the cluster SKIPs, every boot guard green inside it (personality at
+its 89 clauses, E3, stamps, conventions, frame budget, unified
+boot).
 
 **What this increment is NOT.** No signal frames: a user handler is
 still refused ENOSYS by name, and this increment changes no arm — it

@@ -851,6 +851,15 @@ else
     bad "R7. a signal number no longer rides its line — tkill's pending ask or the killing delivery goes back to arithmetic (the exact inference the child= field removed for refusals: a count that fits three children is not a line that proves one)"
 fi
 
+if grep -qF 'fmt_sig_line(&mut ex, b" write ok len=",' "$LRS" && \
+   grep -qF 'for &b in payload[..len].iter().take(24)' "$LRS" && \
+   grep -qF 'push_bytes(&mut ex, 0, b" -> ENOSYS mmap(len="' "$LRS" && \
+   grep -qF 'off = dec_into(&mut ex, off, args[1]);' "$LRS"; then
+    ok "R8. the SIGABRT reading's instrument holds: the workload's own console bytes ride its write lines (len + a 24-byte excerpt, child-attributed) and mmap refusals carry their request (len/prot/flags) — 'alloc failed after ENOSYS' is read off the E7 stream, never inferred from a merged console drain whose order is the flush, not the writer"
+else
+    bad "R8. the attribution is gone — the alloc-failure text would exist only in the merged console drain (any child of the environment could have written it) and the mmap refusal goes back to a bare ENOSYS with no request to name (the proven chain becomes an inference again)"
+fi
+
 # ─── S. poll (7) — the run's LAST ENOSYS answer (§10.13's step-2 coda) ────
 # The firstuser's num=00000007 line is POLL, not munmap — §10.13's log
 # annotation mislabelled it from the census row's COUNT (`11 munmap 7`):
