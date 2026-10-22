@@ -114,11 +114,26 @@
 #   leadergap   -> PASS  (the leader is UNREACHABLE for a bounded window
 #                         right after the create -- a busy leader, not a
 #                         dead one -- and no survivor may declare it dead)
+#   prekillchurn -> PASS (an election is won mid-run right after the
+#                         '-env' create -- the live 2026-10-16 shape: the
+#                         env create outlasted the election timeout and a
+#                         survivor took the term, so the picked leader
+#                         stops broadcasting its tree. The guard must
+#                         diagnose the LOST PRECONDITION (not a lost hop),
+#                         restart itself against the node that now leads,
+#                         and carry the whole chain -- adoption, resurrect,
+#                         migrate, service -- through against THAT node.
+#                         Its control runs the same mode with the restart
+#                         disabled and must still end in the checkpoint
+#                         gate's honest RED)
 #
-# The last five matter as much as the first: a guard that cannot fail is a
+# The last six matter as much as the first: a guard that cannot fail is a
 # guard that has never been seen to work. And a PASS that never killed the
 # leader would prove nothing, so the adopted tooth asserts the leader's
-# fake pid is actually dead after the run.
+# fake pid is actually dead after the run -- and the prekillchurn tooth
+# asserts the ELECTION-CHURNED node's fake pid is dead AND that the guard
+# printed its restart note (a PASS reached without the restart would say
+# nothing about the self-restart path this tooth exists to exercise).
 #
 # The latecreate tooth exists because the FAKES were deciding verdicts. The
 # fakes used to bound each wait with a fixed iteration count (200 x 0.05s =
@@ -392,6 +407,27 @@ tooth() {
             return
         fi
     fi
+    # prekillchurn's PASS must mean the churn really churned: the node
+    # that won the election (node 2) must be REALLY KILLED by the guard
+    # (its original pid is dead -- the guard's step 6), and the guard must
+    # have printed its restart note (the churn was diagnosed, not sailed
+    # past; without it the PASS would say nothing about the self-restart).
+    if [ "$mode" = "prekillchurn" ] && [ "$rc" -eq 0 ] && [ "$guard_passed" -eq 1 ]; then
+        if kill -0 "$f1pid" 2>/dev/null; then
+            echo "TOOTH FAIL $label — guard passed, but the election-churned node was never really killed (pid $f1pid still alive)"
+            printf '%s\n' "$out" | sed 's/^/           /'
+            dump_fake_err
+            fails=$((fails + 1))
+            return
+        fi
+        if ! printf '%s\n' "$out" | grep -q "restarting this guard against the same cluster"; then
+            echo "TOOTH FAIL $label — guard passed, but it never printed its restart note (the churn was not diagnosed, so the tooth proves nothing about the self-restart)"
+            printf '%s\n' "$out" | sed 's/^/           /'
+            dump_fake_err
+            fails=$((fails + 1))
+            return
+        fi
+    fi
     cleanup_fakes
 
     if [ "$rc" != "$want_rc" ]; then
@@ -456,6 +492,21 @@ tooth learnlost1 0 "PASS" "learnlost1 -> PASS (the first create announce's packe
 tooth learnlost1 1 "never learned" "learnlost1 control -> FAIL with the re-drive disabled (AEROSLS_FAILOVER_ANNOUNCE_ATTEMPTS=1: the same lost announce is the gate's honest RED, so the tooth above is not vacuous)" 0 0 "AEROSLS_FAILOVER_ANNOUNCE_ATTEMPTS=1"
 tooth ckptlost1 0 "PASS" "ckptlost1 -> PASS (the checkpoint frame carrying the row was lost for the pass that delivered the announce; the guard waited out another broadcast period instead of failing the checkpoint gate)" 0 0
 tooth ckptlost1 1 "no checkpoint" "ckptlost1 control -> FAIL with the re-drive disabled (AEROSLS_FAILOVER_ANNOUNCE_ATTEMPTS=1: the same lost frame is the gate's honest RED, so the tooth above is not vacuous)" 0 0 "AEROSLS_FAILOVER_ANNOUNCE_ATTEMPTS=1"
+# The churn self-restart, both sides. prekillchurn flips the election away
+# from the picked leader right after the '-env' create (the live
+# 2026-10-16 shape: the env create outlasted the election timeout and a
+# survivor won the term mid-run). The guard must diagnose the LOST
+# PRECONDITION (not a lost hop), restart itself against the node that now
+# leads, and carry the whole chain -- adoption, resurrect, migrate-back,
+# lease, service -- through against THAT node, which is then the one killed
+# at step 6, adopted from, relaunched at step 10 and migrated-to at step
+# 11. The control runs the same mode with the restart disabled
+# (AEROSLS_FAILOVER_MAX_RESTARTS=0) and must still end in the checkpoint
+# gate's honest RED, so the PASS above is not vacuous. The PASS also
+# carries the hygiene check above: the churned node's fake pid must be
+# dead, and the restart note must be in the output.
+tooth prekillchurn 0 "PASS" "prekillchurn -> PASS (an election was won mid-run right after the env create: the guard diagnosed the churned precondition, restarted itself against the new leader, and the whole chain completed against it -- the live 2026-10-16 shape, no longer live-only)"
+tooth prekillchurn 1 "the survivors never received 2 checkpoints" "prekillchurn control -> FAIL with the self-restart disabled (AEROSLS_FAILOVER_MAX_RESTARTS=0: the same churn is the gate's honest RED, so the tooth above is not vacuous)" 0 0 "AEROSLS_FAILOVER_MAX_RESTARTS=0"
 tooth svc_stable  0 "PASS"   "svc_stable -> PASS (the service twin survives the resurrected owner's stale re-announce: rejected on the observer, every node still resolves to the adopter)"
 tooth svc_flap    1 "service registration FLAPPED" "svc_flap -> FAIL (the old last-wins apply of the stale service claim must be caught by step 12)"
 tooth svc_nostale 1 "never rejected" "svc_nostale -> FAIL (a stale service re-announce that never fires must be caught by step 12)"

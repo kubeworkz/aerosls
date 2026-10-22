@@ -129,6 +129,18 @@ int  env_migrate_recv_begin(uint64_t t, uint32_t p, uint32_t i, uint32_t n,
 int  env_migrate_recv_page(uint64_t t, uint32_t pi, uint32_t f, const uint8_t* d) {
     (void)t;(void)pi;(void)f;(void)d; return 1;
 }
+/* POSIX-Environments P3 increment 5: the confirmation pair --
+ * permissive-denial like the stubs above. This test never sends
+ * LIVE_REQ/LIVE_ACK (22–23), so these are not reached; refusing
+ * "not live" (1) / "nothing pending" (1) is the honest answer for a node
+ * that restored nothing. Real coverage: tests/env_migrate_host_test.c,
+ * Phase H. */
+int  env_migrate_live_query(uint32_t p, uint32_t i) {
+    (void)p;(void)i; return 1;
+}
+int  env_migrate_live_ack(uint32_t p, uint32_t i, uint32_t s) {
+    (void)p;(void)i;(void)s; return 1;
+}
 
 static uint32_t g_local_node = 1;
 uint32_t cluster_local_node_id(void) { return g_local_node; }
@@ -213,6 +225,7 @@ int stream_count_for_partition(uint32_t partition_id) { (void)partition_id; retu
  * tests/partition_migrate_phase6_host_test.c and the transfer itself in
  * tests/env_migrate_host_test.c. */
 int env_migrate_partition(uint32_t partition_id, uint32_t dest_node_id,
+                          int operator_paused,
                           uint32_t* out_expected, uint32_t* out_moved) {
     (void)partition_id; (void)dest_node_id;
     if (out_expected) *out_expected = 0;
@@ -474,4 +487,16 @@ int main(void) {
 
     printf("\n=== %d passed, %d failed ===\n", checks_passed, checks_failed);
     return checks_failed ? 1 : 0;
+}
+
+/* POSIX-Environments P3 idle-observer arm stand-ins — the announce
+ * crosses the real DSPP wire, so a host build cannot run it; a no-op
+ * here keeps this test's link honest. Real coverage:
+ * tests/env_migrate_host_test.c (the local gate, the wire frame, the
+ * peer latch) and tests/checkpoint_recovery_host_test.c (the
+ * failover declaration gate). */
+void env_migrate_intent_begin(void) {}
+void env_migrate_intent_end(void) {}
+void env_migrate_recv_intent(uint32_t node_id, uint32_t budget_ticks) {
+    (void)node_id; (void)budget_ticks;
 }

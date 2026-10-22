@@ -35,7 +35,8 @@
  * Build and run:
  *   gcc -no-pie -std=c11 -Wall -Wextra -I . -I kernel \
  *       -o /tmp/dev_mmap_host_test \
- *       tests/dev_mmap_host_test.c kernel/cap.c kernel/chan.c kernel/frame_pool.c
+ *       tests/dev_mmap_host_test.c kernel/cap.c kernel/chan.c kernel/frame_pool.c \
+ *           kernel/linux_abi.c kernel/elf64_load.c kernel/entropy.c kernel/sha256.c
  *   /tmp/dev_mmap_host_test
  */
 #include "kernel/cap.h"

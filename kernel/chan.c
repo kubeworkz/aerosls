@@ -48,6 +48,11 @@
  *     transient grants require a reply window (§3.4).
  */
 #include "cap.h"
+#include "process.h"   /* E7 increment 12: the reply payload's staged
+                        * destination lives on the descriptor (the
+                        * copy-in aims where the FIRST trap said) */
+#include "linux_abi.h"   /* E7 increment 3: SYS_LINUX_TRAP_RESUME, the request
+                          * struct, linux_syscall_apply_reply, errno map */
 #include "kernel_io.h"
 #include "timer.h"   /* Phase 5 deadlines: kernel_tick_counter, KERNEL_TICK_NS */
 #include <stddef.h>
@@ -751,4 +756,273 @@ uint64_t sys_sls_dev_mmap(struct SLSDevMmapRequest* req) {
                                       req->vaddr_hint, &vaddr);
     req->out_vaddr = vaddr;
     return r;
+}
+
+/* ─── k_linux_forward / k_linux_deliver (E7 increment 3, §3.3 steps 5-7) ────
+ * "Forwarding is the same shape as a blocking cap_recv" (§2.4), and this is
+ * the pair that keeps the claim honest: k_chan_wait's poll/park discipline
+ * with the polls and parks swapped into the two arms of ONE exchange —
+ * post-then-park here, recv-then-apply on the resume re-run.
+ *
+ * The split is the security property, not a style choice: the FIRST trap
+ * can produce only refusals (captured truth → errno), and the sidecar's rax
+ * can only be produced by k_linux_deliver — reached only through
+ * SYS_LINUX_TRAP_RESUME with the in-flight arm set (the dispatcher's I3
+ * clause). A reply that arrives before the task parks (SMP: the sidecar
+ * outran the park) is simply the head of the queue by the time the resume
+ * runs — the channel is point-to-point FIFO and the post happened-before.
+ *
+ * Park-time values never live in these frames: cap_wait_chans may never
+ * return (the woken peer's handoff switches away, the old chain abandoned
+ * below), so what the resume must know travels in park_req AS A VALUE — the
+ * expected reply num (mirroring k_chan_send's "park_req = &req" idiom
+ * only in role, not form: the request struct itself died with the first
+ * trap's frame, and the resume re-derives everything else from the table). */
+
+/* Post AND PARK. Returns only on a refusal (a CAP status — Phase-3 CAP_E*
+ * from the post, Phase-5 CAP_ERR_* from resolution; the dispatcher maps
+ * BOTH families through linux_errno_from_cap, which total-functions both
+ * by construction). Never reads a reply: on success the task is gone into
+ * the park and the rax belongs to the resume arm. */
+int k_linux_forward(uint32_t pid, uint16_t ch_w, uint16_t ch_r,
+                    const void* msg, uint32_t msg_len) {
+    uint32_t chan_id;
+    int dir;
+    int r;
+    /* The header's num, read BYTE-wise into a local: msg is a byte buffer
+     * by contract (the dispatcher built it as a header plus attached
+     * fd-class bytes), and this value is both the park's wake cookie and
+     * nothing else — same no-alias, any-alignment discipline
+     * linux_syscall_apply_reply applies to the channel payload. */
+    uint64_t fwd_num;
+    const uint8_t* m = (const uint8_t*)msg;
+    uint32_t bi;
+
+    if (!msg || msg_len < sizeof(struct SLSLinuxSyscallRequest))
+        return CAP_ERR_PROTO;
+    for (bi = 0; bi < 8; bi++) ((uint8_t*)&fwd_num)[bi] = m[bi];
+
+    /* Resolve through the CHAN_R (reply) handle FIRST: the park registers
+     * this channel id, and the reply's enqueue — not our post's — is what
+     * must wake it. Resolving by the recv handle also refuses a wrong-type
+     * / revoked slot before anything is posted (CAP_ERR_RIGHTS/REVOKED),
+     * so a task with a broken channel hears it as an errno, not a hang. */
+    r = chan_resolve(pid, ch_r, CAP_TYPE_CHAN_R, &chan_id, &dir);
+    if (r != CAP_ERR_OK) return r;
+
+    /* Step 5: post the message — the 72-byte description, plus attached
+     * fd-class bytes when the dispatcher copied any (E7 increment 5).
+     * cap_send_msg copies the payload into the channel's pool
+     * synchronously — `msg`'s frame may die after
+     * this and does die if the park switches (abandoned-frame rule).
+     * Non-blocking by design, and safe to be: this channel's ONLY writer is
+     * the one task forwarding on it, and that task is parked between post
+     * and reply — the inbound queue cannot be full at post time (cap.h's
+     * invariant). A failure here is therefore a real one — endpoint closed
+     * under us, payload pool exhausted (CAP_ENOSPC happens only between
+     * here and a peer's drain — bounded by the pool, not by trust, §3.6) —
+     * and deserves its mapped errno rather than a park nothing wakes. */
+    r = cap_send_msg(pid, ch_w, msg, msg_len, NULL, 0, 0, 0);
+    if (r != 0) return r;   /* CAP_E* family; mapped by the dispatcher */
+
+    /* Park, and keep parking. cap_wait_chans returns: noreturn when the
+     * wake's handoff switches us away (common case — the sidecar parks on
+     * this channel awaiting exactly this message); 1 from its in-kernel hlt
+     * path (nobody runnable to produce a reply — re-park, k_chan_wait's
+     * shape, console/IRQ drains already ran inside); 0 only where no park
+     * is possible at all (kernel context / host weak default) — a
+     * retryable "not answered yet", which the map reads as -EAGAIN. */
+    for (;;) {
+        if (!cap_wait_chans(&chan_id, 1, (void*)(uintptr_t)fwd_num,
+                            SYS_LINUX_TRAP_RESUME, 0))
+            return CAP_EAGAIN;
+    }
+}
+
+/* THE REPLY ARM — reached only as cap_recv_resume's re-run of a parked
+ * forward (SYS_LINUX_TRAP_RESUME + the armed park_syscall, checked by the
+ * dispatcher before this is called). Recvs into LOCALS (this frame is the
+ * resume's own, freshly built — no cross-park lifetime), validates and
+ * applies the reply through the pure §5.7 path, and re-parks on a spurious
+ * wake with the SAME expected num so the echo check is identical whether
+ * the reply came on the first wake or the third. Returns the final Linux
+ * rax: the sidecar's value, an errno-mapped refusal, or -EAGAIN if even
+ * the re-park is impossible.
+ *
+ * E7 increment 12 (§10.13's step 3) widens the recv to the three shapes
+ * the contract names. The buffer is header + the write-chunk mirror (a
+ * reply with a payload hitting an exactly-72 buffer would be CAP_ERR_BUFSZ
+ * forever under the no-loss rule — a wedge, not an error), and the STAGED
+ * destination (process.h's reply_stage_*, set by this request's own first
+ * trap and consumed HERE — read into locals, then cleared, before any
+ * branch, so every path below leaves the stage empty) is what the copy-in
+ * aims with: the payload lands where the FIRST trap said, never where the
+ * reply says. The three shapes:
+ *   1. 72 bytes — the plain reply, unchanged. A SUCCESS (status 0) on a
+ *      request that staged an owed payload is refused -EPROTO: answering
+ *      0 while the caller's out-pointer keeps stack garbage is the silent
+ *      lie the whole seam exists to prevent (the twin of service()'s
+ *      bound — neither end alone is load-bearing).
+ *   2. 72 + n with a stage for THIS request, n within the staged clamp,
+ *      a header echoing this num, status 0, and a ret the shape predicate
+ *      says fits the number (one truth): apply, then copy n bytes in
+ *      through linux_user_copy_in's two-phase walk, then rax = the
+ *      apply's value (0 for the sig numbers, n for count-truth read).
+ *      A copy refusal is -EFAULT after apply — nothing was written
+ *      (two-phase), and the rax is discarded: the task hears the truth
+ *      about ITS pointer, never a success that only half-happened.
+ *   3. anything else — -CAP_ERR_PROTO (payload on a number with no reply
+ *      plan, n beyond the clamp, payload on an errno reply, a ret the
+ *      number contradicts, an echo that misses).
+ * Frame note: the buffer is ~1 KiB on this resume path by the contract's
+ * own arithmetic; the per-frame local (never a static) is what keeps SMP
+ * deliveries independent, and stack_frame_budget_check is the teeth. */
+uint64_t k_linux_deliver(uint32_t pid, uint16_t ch_r, uint64_t expect_num) {
+    uint32_t chan_id;
+    int dir;
+    int r = chan_resolve(pid, ch_r, CAP_TYPE_CHAN_R, &chan_id, &dir);
+    if (r != CAP_ERR_OK)
+        return (uint64_t)(int64_t)linux_errno_from_cap(r);
+
+    for (;;) {
+        struct SLSLinuxSyscallRequest req;
+        struct SLSChanRecvOut out;
+        uint8_t rbuf[sizeof(struct SLSLinuxSyscallRequest)
+                     + LINUX_FD_WRITE_CHUNK];
+        int rr = k_chan_recv(pid, ch_r, rbuf, (uint32_t)sizeof rbuf,
+                             NULL, 0, &out);
+
+        if (rr == CAP_ERR_OK) {
+            uint32_t n, i;
+            struct ProcessDescriptor *pd = 0;
+            int staged = 0;
+            uint64_t sva = 0;
+            uint32_t slen = 0;
+
+            if (out.kind == CH_KIND_CLOSE) {
+                /* The sidecar closed the endpoint or died (its teardown
+                 * queues CLOSE for the peer): the partner is gone — the
+                 * map's CAP_ERR_TARGET reads -ESRCH, "no such process",
+                 * which is what a POSIX error path wants here. */
+                return (uint64_t)(int64_t)linux_errno_from_cap(CAP_ERR_TARGET);
+            }
+            if (out.kind != CH_KIND_MSG ||
+                out.len < sizeof(struct SLSLinuxSyscallRequest))
+                return (uint64_t)(int64_t)linux_errno_from_cap(CAP_ERR_PROTO);
+            n = out.len - (uint32_t)sizeof(struct SLSLinuxSyscallRequest);
+
+            /* Consume the stage — BEFORE any branch below — so apply,
+             * copy and every refusal all leave it empty (the consume
+             * half of the four-place lifecycle; slot reuse is the
+             * fourth). The stage only counts when it belongs to THIS
+             * request's num: a stage under another number is the stale
+             * state the clears exist for, never a destination. */
+            for (i = 0; i < (uint32_t)PROC_MAX; i++) {
+                if (proc_table[i].active && proc_table[i].pid == pid) {
+                    pd = &proc_table[i];
+                    break;
+                }
+            }
+            if (pd && pd->reply_stage_valid &&
+                pd->reply_stage_num == expect_num) {
+                staged = 1;
+                sva = pd->reply_stage_va;
+                slen = pd->reply_stage_len;
+            }
+            if (pd) {
+                pd->reply_stage_valid = 0;
+                pd->reply_stage_num = 0;
+                pd->reply_stage_va = 0;
+                pd->reply_stage_len = 0;
+            }
+
+            if (n == 0) {
+                /* Shape 1 — the plain 72-byte reply, unchanged: apply is
+                 * still the only producer of this task's rax, and its
+                 * size/echo checks run against something the sidecar did
+                 * not write (the rebuilt request below). The one NEW
+                 * refusal: a success on a request that staged an owed
+                 * payload never wrote it back — the silent lie by
+                 * another name, refused here where both halves of the
+                 * exchange are visible. An errno reply (status != 0)
+                 * owes no payload and passes untouched. */
+                if (staged) {
+                    int32_t status = 0;
+                    const uint8_t *sb = rbuf
+                        + 64; /* offsetof(SLSLinuxSyscallRequest, status) */
+                    for (i = 0; i < 4; i++)
+                        status |= (int32_t)((uint32_t)sb[i] << (8 * i));
+                    if (status == 0)
+                        return (uint64_t)(int64_t)linux_errno_from_cap(
+                            CAP_ERR_PROTO);
+                }
+                linux_syscall_describe(&req, expect_num, NULL);
+                return linux_syscall_apply_reply(&req, rbuf,
+                                                 (uint64_t)out.len);
+            }
+
+            /* Shape 2 (and the arms that make shape 3): 72 + n. Every
+             * field the shape depends on is read BYTE-wise (channel
+             * payload, any alignment — apply's own idiom), and every
+             * check runs BEFORE apply or a single byte is written:
+             * a refusal below mutates nothing. */
+            {
+                uint64_t hdr_num = 0, hdr_ret = 0;
+                int32_t hdr_status = 0;
+                const uint8_t *b = rbuf;
+
+                if (!staged || n > slen)
+                    return (uint64_t)(int64_t)linux_errno_from_cap(
+                        CAP_ERR_PROTO);   /* payload with no reply plan, or
+                                          * beyond the staged clamp */
+                for (i = 0; i < 8; i++)
+                    hdr_num |= (uint64_t)b[i] << (8 * i);
+                for (i = 0; i < 8; i++)
+                    hdr_ret |= (uint64_t)b[56 + i] << (8 * i);
+                for (i = 0; i < 4; i++)
+                    hdr_status |= (int32_t)((uint32_t)b[64 + i] << (8 * i));
+                if (hdr_num != expect_num || hdr_status != 0 ||
+                    !linux_reply_shape_ok(expect_num, hdr_ret, n))
+                    return (uint64_t)(int64_t)linux_errno_from_cap(
+                        CAP_ERR_PROTO);   /* a misrouted header, an errno
+                                          * reply that still carried bytes,
+                                          * or a ret this number contradicts */
+            }
+            linux_syscall_describe(&req, expect_num, NULL);
+            {
+                uint64_t rax = linux_syscall_apply_reply(
+                    &req, rbuf, (uint64_t)sizeof(struct
+                                                SLSLinuxSyscallRequest));
+                /* apply re-enforces the echo (J2's order is untouched);
+                 * its only refusal in this shape is -EPROTO, and a copy
+                 * must never run for a reply apply did not accept. */
+                if (rax != (uint64_t)(int64_t)(-LINUX_EPROTO) &&
+                    linux_user_copy_in(rbuf +
+                                           sizeof(struct SLSLinuxSyscallRequest),
+                                       pd->cr3, sva, n) != 0) {
+                    /* The destination the child could not write (or an
+                     * unmapped span): -EFAULT into rax, apply's value
+                     * discarded — the task hears the truth about its own
+                     * pointer. linux_user_copy_in wrote NOTHING on this
+                     * path (validate-then-write), and rax is this
+                     * refusal rather than the success the reply claimed
+                     * for bytes that never landed. */
+                    return (uint64_t)(int64_t)(-LINUX_EFAULT);
+                }
+                return rax;
+            }
+        }
+
+        /* CAP_ERR_STATE with no CLOSE is "queue drained": a spurious wake
+         * (wake-all over-hits, or a close consumed earlier). Everything
+         * else — EBADF / TYPE / BUFSZ (a reply with attached caps or an
+         * oversized payload never fits the no-loss rule) — is the channel
+         * answering wrongly for this task, mapped like any reply status. */
+        if (rr != CAP_ERR_STATE)
+            return (uint64_t)(int64_t)linux_errno_from_cap(rr);
+
+        if (!cap_wait_chans(&chan_id, 1, (void*)(uintptr_t)expect_num,
+                            SYS_LINUX_TRAP_RESUME, 0))
+            return (uint64_t)(int64_t)linux_errno_from_cap(CAP_EAGAIN);
+    }
 }

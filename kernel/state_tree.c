@@ -5,6 +5,9 @@
  * Freestanding: local helpers, no libc, per this codebase's convention.
  */
 #include "state_tree.h"
+#include "env_ckpt.h"        /* POSIX-Environments P3 (b): the LIVE environment
+                              * records this tree names but deliberately does
+                              * not carry the payload of */
 #include "object_catalog.h"
 #include "partition.h"
 #include "process.h"
@@ -122,6 +125,47 @@ uint32_t state_tree_build(struct StateTreeNode* nodes, uint32_t max_nodes) {
         n++;
     }
 
+    /* Environment nodes — POSIX-Environments v0.2 P3, failover destination
+     * (b) (§11 Q5): one per LIVE record in the environment checkpoint table,
+     * attached to its partition node.
+     *
+     * What this buys, stated once: failover_recover_from() adopts PARTITIONS
+     * by ownership flip and restores no environment (the payload is 5.5 MiB
+     * and this tree is a 24 KiB broadcast — see ST_NODE_ENVIRONMENT in the
+     * header). Without these nodes the survivor's adoption is silent about
+     * them: an operator sees "Adopted partition 3 from dead node 1" and has
+     * no way to learn that partition 3's environment index 2 went with node
+     * 1. Naming it here is the difference between a gap reported by name and
+     * a gap discovered later, which is exactly the property destination (b)
+     * promises and the `silent-failover` tooth polices.
+     *
+     * entity_id is the INDEX, not env_id: index is the environment's identity
+     * within its partition (it is in the sidecar names and is what the console
+     * registry files by), while env_id is the manager's per-boot handle and
+     * carries no meaning on another node. */
+    for (uint32_t i = 0; i < ENV_CKPT_MAX && n < max_nodes; i++) {
+        const struct EnvCkptRecord* r = &env_ckpt_table[i];
+        if (r->magic != ENV_CKPT_REC_MAGIC) continue;   /* unused slot */
+
+        uint32_t parent = 1;
+        for (uint32_t p = 1; p < n; p++) {
+            if (nodes[p].type == ST_NODE_PARTITION &&
+                nodes[p].partition_id == r->partition_id) {
+                parent = nodes[p].id;
+                break;
+            }
+        }
+
+        nodes[n].id           = n + 1;
+        nodes[n].type         = ST_NODE_ENVIRONMENT;
+        nodes[n].parent_id    = parent;
+        nodes[n].partition_id = r->partition_id;
+        nodes[n].entity_id    = r->index;
+        nodes[n].size         = r->n_regions;
+        nodes[n].dirty        = 1;
+        n++;
+    }
+
     return n;
 }
 
@@ -146,8 +190,8 @@ uint32_t state_tree_serialize(const struct StateTreeNode* nodes, uint32_t node_c
         switch (nodes[i].type) {
         case ST_NODE_PARTITION: hdr.num_partitions++; break;
         case ST_NODE_OBJECT:   hdr.num_objects++;    break;
-        case ST_NODE_PROCESS:  hdr.num_processes++;  break;
-        case ST_NODE_STREAM:   hdr.num_streams++;    break;
+        case ST_NODE_PROCESS:  hdr.num_processes++;  break;        case ST_NODE_STREAM:   hdr.num_streams++; break;
+        case ST_NODE_ENVIRONMENT: hdr.num_environments++; break;
         default: break;
         }
     }

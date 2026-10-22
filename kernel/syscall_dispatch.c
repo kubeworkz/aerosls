@@ -33,6 +33,9 @@
 #include "usage_metering.h" // Multitenant Isolation Gap Analysis §5 item 6 -- SYS_SLS_USAGE_REPORT
 #include "../net/consensus.h" // Multi-Node Partition Scaling Roadmap Phase 7 addendum -- SYS_SLS_CLUSTER_INIT/STATUS
 #include "cap.h"            // Seed Kernel Phase 1 -- SYS_SLS_CAP_* (289-297)
+#include "linux_abi.h"      // E7 increment 2 -- the Linux-personality branch (§3.3)
+#include "../arch/x86/user_paging.h"  // E7 §5.3 (the plan's inc 4) -- user_write_fs_base,
+                                      // the MSR write of a granted ARCH_SET_FS
 
 // ─── spawn owner-uid resolution ──────────────────────────────────────────────
 // The owner_uid threaded into program_spawn*()/program_load()/sys_sls_load()
@@ -70,6 +73,636 @@ static uint64_t sls_legacy_allocate(void* arg) {
 
 // ─── do_syscall ───────────────────────────────────────────────────────────────
 uint64_t do_syscall(uint64_t num, void* arg) {
+    /* ── E7 (increment 3): the Linux-personality branch (D1, §3.3) ────────
+     * The FIRST thing the dispatcher does, before the driver-SDK switch and
+     * before the legacy chain, because the personality decides what `num`
+     * MEANS (§2.2): for a Linux task, rax=105 is setuid and must never be
+     * read as SYS_SLS_ALLOCATE. A non-Linux caller takes exactly the path it
+     * always took — one predictable branch, no behavior change.
+     *
+     * Increment 3 completes §3.3's steps 5-7 with TWO arms:
+     *
+     *  · the RESUME arm (num == SYS_LINUX_TRAP_RESUME): the park's re-run,
+     *    and the ONLY place a sidecar reply is ever read — recv it, apply
+     *    it through the §5.7 errno map (size and echo enforced by the pure
+     *    linux_syscall_apply_reply), and the resulting rax rides the
+     *    existing cap_recv_resume → syscall_return_path back to ring-3 as
+     *    if the syscall had simply taken a while. A sentinel trap with NO
+     *    forward in flight (park_syscall not armed) is a stray, refused BY
+     *    NAME — the increment-2 discipline, applied to the resume number.
+     *
+     *  · the FIRST trap: capture → describe → the §3.5 channel check →
+     *    arm → post → park. Every refusal on this side is -LINUX_ENOSYS,
+     *    a LINUX errno, never a CAP code — this task's binary was compiled
+     *    against Linux's numbering, and a CAP-family negative would be a
+     *    value no errno can produce in its error path (§5.7). The branch
+     *    still INTERPRETS nothing: it describes argument positions and
+     *    either hands the description on or refuses, so rax=105 remains
+     *    setuid from trap to sidecar (§3.6 — structural, not a filter). */
+    {
+        struct ProcessDescriptor* cur = process_find_current();
+        if (cur && linux_personality_intercepts(cur->personality)) {
+            uint16_t ch_w, ch_r;
+
+            if (num == SYS_LINUX_TRAP_RESUME) {
+                /* Stray vs. in-flight: the arm is set before the post and
+                 * cleared when the reply lands, so an unarmed sentinel can
+                 * only be a raw ring-3 trap wearing the resume number —
+                 * there is no reply owed and nothing to park for. */
+                if (!linux_forward_resume_is_live(cur->personality,
+                                                  cur->park_syscall)) {
+                    kernel_serial_printf(
+                        "[E7] resume sentinel 0x%x with no forward in "
+                        "flight — stray trap refused by name\n",
+                        (unsigned)SYS_LINUX_TRAP_RESUME);
+                    return (uint64_t)(int64_t)(-LINUX_ENOSYS);
+                }
+                if (cap_linux_find_channels(cur->pid, &ch_w, &ch_r) != 0) {
+                    /* Woken with nowhere to deliver: the sidecar (or its
+                     * end of the channel) died while we parked. Close the
+                     * in-flight arm and answer with the map's own truth —
+                     * "the holder went away under us" is -EIO, never a
+                     * raw CAP code. */
+                    cur->park_syscall = 0;
+                    return (uint64_t)(int64_t)linux_errno_from_cap(
+                        CAP_ERR_REVOKED);
+                }
+                {
+                    uint64_t rax = k_linux_deliver(cur->pid, ch_r,
+                                                   (uint64_t)(uintptr_t)arg);
+                    cur->park_syscall = 0;  /* in-flight closes HERE — the
+                                            * next stray refuses again */
+                    /* E7 §5.3 apply half: the granted ARCH_SET_FS lands
+                     * HERE — at the reply, inside this task's own trap,
+                     * before the return below reaches the sysret into the
+                     * new base. The GRANT is the sidecar's (its 158 arm);
+                     * the address is re-checked against
+                     * linux_fs_addr_is_user_canonical anyway, because the
+                     * wrmsr is the dangerous half — a denial (rax != 0)
+                     * leaves the old base untouched and returns the mapped
+                     * errno exactly as any other failed syscall would. */
+                    if (cur->fs_stage_valid) {
+                        cur->fs_stage_valid = 0;
+                        if (rax == 0) {
+                            if (!linux_fs_addr_is_user_canonical(
+                                    cur->fs_base_stage)) {
+                                rax = (uint64_t)(int64_t)(-LINUX_EINVAL);
+                            } else {
+                                cur->fs_base = cur->fs_base_stage;
+                                user_write_fs_base(cur->fs_base);
+                            }
+                        }
+                        cur->fs_base_stage = 0;
+                    }
+                    /* E7 increment 6 apply half (§5.4): a staged brk is
+                     * resolved HERE, at the reply, inside this task's own
+                     * trap. The GRANT is the sidecar's (its 12 arm's
+                     * ledger decides whether the break moves); the value
+                     * is re-checked against the span THIS create stamped
+                     * and the request the FIRST trap staged, because the
+                     * page-table write is the dangerous half — the §5.3
+                     * rule one level up, where the wrmsr was replaced by
+                     * a map. A denial echo needs no frames (the break is
+                     * already where the reply says it is). A grant maps
+                     * fresh partition-charged frames, ZERO-FILLED before
+                     * the task can read them: the pool recycles frames
+                     * across tasks and partitions, so an unzeroed frame
+                     * would carry its last tenant's bytes into this
+                     * task's heap — anonymous memory must not, and the
+                     * probe asserts the zero (MARKER 396's absence).
+                     *
+                     * x86-64 never caches a NOT-PRESENT translation (SDM
+                     * Vol. 3A §4.10.4.1), so a fresh map needs no INVLPG
+                     * for the task about to resume on this same cr3 —
+                     * the same posture cap_arch_map_page's runtime maps
+                     * already rely on.
+                     *
+                     * Frame exhaustion mid-batch UNWINDS the batch: the
+                     * frames already mapped are read back through
+                     * linux_user_page_frame (the copy's own boundaries —
+                     * it mapped them, so it can read them), unmapped, and
+                     * returned to the partition; the break does not move
+                     * and the task sees Linux's own brk failure shape —
+                     * the unchanged current break — never a half-mapped
+                     * grant. */
+                    if (cur->mem_stage_valid) {
+                        uint64_t snum = cur->mem_stage_num;
+                        uint64_t sa0  = cur->mem_stage_a0;
+                        uint64_t sa1  = cur->mem_stage_a1;
+                        uint64_t sa2  = cur->mem_stage_a2;
+                        uint64_t sa3  = cur->mem_stage_a3;
+                        cur->mem_stage_valid = 0;
+                        cur->mem_stage_num   = 0;
+                        cur->mem_stage_a0    = 0;
+                        cur->mem_stage_a1    = 0;
+                        cur->mem_stage_a2    = 0;
+                        cur->mem_stage_a3    = 0;
+                        if (snum == LINUX_BRK) {
+                            struct LinuxMemBrkVerdict v =
+                                linux_mem_brk_verdict(
+                                    cur->linux_heap_base,
+                                    cur->linux_heap_limit,
+                                    cur->linux_mmap_top,
+                                    cur->linux_brk_cur, sa0, rax);
+                            if (v.malformed) {
+                                kernel_serial_printf(
+                                    "[E7] brk reply 0x%lx for request "
+                                    "0x%lx (span 0x%lx..0x%lx, cur "
+                                    "0x%lx) is neither the grant nor "
+                                    "the refusal - break unmoved\n",
+                                    (unsigned long)rax,
+                                    (unsigned long)sa0,
+                                    (unsigned long)cur->linux_heap_base,
+                                    (unsigned long)cur->linux_heap_limit,
+                                    (unsigned long)cur->linux_brk_cur);
+                                rax = cur->linux_brk_cur;
+                            } else if (v.map_pages) {
+                                uint64_t *pml4 =
+                                    (uint64_t *)(uintptr_t)cur->cr3;
+                                uint64_t va = v.map_va;
+                                uint32_t done = 0;
+                                while (done < v.map_pages) {
+                                    void *frame = allocate_physical_ram_frame_for_partition(cur->partition_id);
+                                    if (!frame) break;   /* quota or pool:
+                                                         * the batch winds
+                                                         * back below */
+                                    {
+                                        uint64_t *w = (uint64_t *)frame;
+                                        int zi;
+                                        for (zi = 0; zi < 512; zi++)
+                                            w[zi] = 0;
+                                    }
+                                    user_map_page(pml4, va,
+                                        (uint64_t)(uintptr_t)frame,
+                                        USER_PTE_PRESENT | USER_PTE_USER |
+                                        USER_PTE_WRITE |
+                                        USER_PTE_NOEXEC);
+                                    va += 4096;
+                                    done++;
+                                }
+                                if (done == v.map_pages) {
+                                    cur->linux_brk_cur = v.new_cur;
+                                } else {
+                                    while (done) {
+                                        uint64_t f;
+                                        va -= 4096;
+                                        f = linux_user_page_frame(
+                                            cur->cr3, va);
+                                        user_unmap_page(pml4, va);
+                                        if (f) free_physical_ram_frame_for_partition(
+                                            (void *)(uintptr_t)f,
+                                            cur->partition_id);
+                                        done--;
+                                    }
+                                    kernel_serial_printf(
+                                        "[E7] brk grant 0x%lx: frame "
+                                        "exhaustion mid-batch - batch "
+                                        "unwound, break unmoved\n",
+                                        (unsigned long)v.new_cur);
+                                    rax = cur->linux_brk_cur;
+                                }
+                            }
+                        } else if (snum == LINUX_MMAP) {
+                                /* E7 increment 16 apply half (§5.4): the
+                                 * staged anonymous map is resolved HERE,
+                                 * at the reply, inside this task's own
+                                 * trap — the brk verdict's rule over
+                                 * four staged words. The GRANT is the
+                                 * sidecar's (its 9 arm's ledger — a
+                                 * cursor descending from the span's top,
+                                 * or the request's own FIXED address);
+                                 * the verdict re-checks it against THIS
+                                 * create's stamped span and the kernel's
+                                 * OWN two cursors, because the
+                                 * page-table write is the dangerous
+                                 * half.
+                                 *
+                                 * MAP_FIXED REPLACES (Linux's own
+                                 * semantics): every present page in the
+                                 * range has its frame returned to the
+                                 * partition before the new protection is
+                                 * installed — and this is the ONE path
+                                 * in this tree that edits a translation
+                                 * ring-3 HAS run on (the allocator's
+                                 * guard page lands on the brk heap's
+                                 * first page), so each touched page gets
+                                 * an `invlpg` (user_invlpg). PROT_NONE
+                                 * backs no frames: a reservation whose
+                                 * every access faults — PROT_NONE's
+                                 * whole observable contract, and the
+                                 * measured allocator's guard shape.
+                                 *
+                                 * Frame exhaustion mid-batch UNWINDS the
+                                 * pages THIS grant backed (returned to
+                                 * the partition) and answers -ENOMEM —
+                                 * while the pages it already REPLACED
+                                 * stay replaced: a hole where the old
+                                 * mapping was is Linux's own failure
+                                 * shape, and this kernel keeps no
+                                 * shadow of the mappings it destroyed. */
+                                struct LinuxMmapReq mreq;
+                                struct LinuxMemMmapVerdict v;
+                                mreq.addr  = sa0;
+                                mreq.len   = sa1;
+                                mreq.prot  = sa2;
+                                mreq.flags = sa3;
+                                v = linux_mem_mmap_verdict(
+                                    cur->linux_heap_base,
+                                    cur->linux_heap_limit,
+                                    cur->linux_brk_cur,
+                                    cur->linux_mmap_top, &mreq, rax);
+                                if (v.malformed) {
+                                    kernel_serial_printf(
+                                        "[E7] mmap reply 0x%lx for "
+                                        "request addr=0x%lx len=%lu "
+                                        "(span 0x%lx..0x%lx, cur 0x%lx, "
+                                        "top 0x%lx) is neither the "
+                                        "grant nor the refusal - "
+                                        "nothing mapped\n",
+                                        (unsigned long)rax,
+                                        (unsigned long)sa0,
+                                        (unsigned long)sa1,
+                                        (unsigned long)cur->linux_heap_base,
+                                        (unsigned long)cur->linux_heap_limit,
+                                        (unsigned long)cur->linux_brk_cur,
+                                        (unsigned long)cur->linux_mmap_top);
+                                    rax = (uint64_t)(int64_t)
+                                          (-LINUX_ENOMEM);
+                                } else {
+                                    uint64_t *pml4 =
+                                        (uint64_t *)(uintptr_t)cur->cr3;
+                                    uint64_t va = v.map_va;
+                                    uint32_t idx = 0, backed = 0;
+                                    int failed = 0;
+                                    while (idx < v.range_pages) {
+                                        void *frame = 0;
+                                        if (idx < v.map_pages) {
+                                            frame = allocate_physical_ram_frame_for_partition(cur->partition_id);
+                                            if (!frame) {
+                                                failed = 1; break;
+                                            }
+                                            {
+                                                uint64_t *w =
+                                                    (uint64_t *)frame;
+                                                int zi;
+                                                for (zi = 0; zi < 512;
+                                                     zi++)
+                                                    w[zi] = 0;
+                                            }
+                                        }
+                                        if (v.replace) {
+                                            uint64_t old =
+                                                linux_user_page_frame(
+                                                    cur->cr3, va);
+                                            user_unmap_page(pml4, va);
+                                            if (old) free_physical_ram_frame_for_partition(
+                                                (void *)(uintptr_t)old,
+                                                cur->partition_id);
+                                        }
+                                        if (frame) {
+                                            user_map_page(pml4, va,
+                                                (uint64_t)(uintptr_t)frame,
+                                                USER_PTE_PRESENT |
+                                                USER_PTE_USER |
+                                                USER_PTE_NOEXEC |
+                                                (v.prot_write
+                                                     ? USER_PTE_WRITE : 0));
+                                            backed++;
+                                        }
+                                        if (v.replace)
+                                            user_invlpg(va);
+                                        va += 4096;
+                                        idx++;
+                                    }
+                                    if (failed) {
+                                        while (backed) {
+                                            uint64_t f;
+                                            va -= 4096;
+                                            f = linux_user_page_frame(
+                                                cur->cr3, va);
+                                            user_unmap_page(pml4, va);
+                                            if (f) free_physical_ram_frame_for_partition(
+                                                (void *)(uintptr_t)f,
+                                                cur->partition_id);
+                                            if (v.replace)
+                                                user_invlpg(va);
+                                            backed--;
+                                        }
+                                        kernel_serial_printf(
+                                            "[E7] mmap grant addr=0x%lx "
+                                            "len=%lu: frame exhaustion "
+                                            "mid-batch - backed pages "
+                                            "unwound, -ENOMEM\n",
+                                            (unsigned long)sa0,
+                                            (unsigned long)sa1);
+                                        rax = (uint64_t)(int64_t)
+                                              (-LINUX_ENOMEM);
+                                    } else {
+                                        cur->linux_mmap_top =
+                                            v.new_mmap_top;
+                                    }
+                                }
+                            }
+                        }
+                    return rax;
+                }
+            }
+
+            /* First trap: read the capture FIRST (before any call — the §3.4
+             * rule on the C side too), describe, resolve the channel, arm,
+             * post, park. k_linux_forward does not return once it parks;
+             * its non-zero return is a refusal before any park. */
+            {
+                uint64_t largs[6];
+                struct SLSLinuxSyscallRequest req;
+                struct LinuxFdWritePlan plan;
+                struct LinuxFdReplyPlan rplan;
+                /* E7 increment 5 (the fd class): the message that crosses
+                 * is the 72-byte description plus, for a write, its bytes
+                 * — 8-aligned so k_linux_forward can read the header as a
+                 * struct without a copy of its own. */
+                uint64_t fwd_words[(sizeof(struct SLSLinuxSyscallRequest)
+                                    + LINUX_FD_WRITE_CHUNK + 7u) / 8u];
+                uint8_t *fwd = (uint8_t *)fwd_words;
+                uint32_t fwd_len = (uint32_t)sizeof(struct SLSLinuxSyscallRequest);
+                int status;
+                proc_read_linux_args(largs);
+                /* E7 increment 12 (§10.13's step 3): the reply payload's
+                 * staged destination clears FIRST — before any plan's
+                 * refusal can return below — so every refusal path leaves
+                 * the stage empty (the four-place lifecycle: top of the
+                 * first trap, consume at the deliver, refusal, slot
+                 * reuse). A destination staged by an earlier forward can
+                 * therefore never survive into the next trap's window. */
+                cur->reply_stage_num   = 0;
+                cur->reply_stage_va    = 0;
+                cur->reply_stage_len   = 0;
+                cur->reply_stage_valid = 0;
+                /* E7 increment 5, plan half: BEFORE the describe (the
+                 * clamp must be IN the description) and before the
+                 * channel lookup (a refusal the first trap can produce
+                 * alone, §3.3 — no channel needed to say -EFAULT). A
+                 * write's bytes are planned here; every other number's
+                 * plan is empty and the forward below stays the plain
+                 * 72-byte description it has always been. */
+                plan = linux_fd_write_plan(num, largs);
+                if (plan.refuse) {
+                    kernel_serial_printf(
+                        "[E7] linux write %lu bytes at 0x%lx refused "
+                        "before post: bad user span (plan)\n",
+                        (unsigned long)largs[2],
+                        (unsigned long)largs[1]);
+                    return (uint64_t)(int64_t)plan.refuse;
+                }
+                if (plan.len) largs[2] = plan.len;   /* the clamp rides IN
+                                                     * the description:
+                                                     * header, payload and
+                                                     * the count the task
+                                                     * will see are one
+                                                     * truth */
+                /* E7 increment 10 (the signal seam): the act/set byte
+                 * crossing — the write plan's twin for the sig class,
+                 * computed after it (one number is one plan) and BEFORE
+                 * the describe, so its refusals are first-trap refusals
+                 * too: a foreign sigsetsize, an oldact/oldset this kernel
+                 * cannot write back (§10.10's copy-IN gap), an act/set
+                 * span ring 3 could not read. The folded src/len then
+                 * rides the SAME copy block below — one walker, one arm
+                 * ordering, one EFAULT posture — and the sidecar derives
+                 * the attach length from num and args[1] != 0 the same
+                 * way (its payload check is the twin). */
+                {
+                    struct LinuxSigCopyPlan splan =
+                        linux_sig_copy_plan(num, largs);
+                    if (splan.refuse) {
+                        kernel_serial_printf(
+                            "[E7] linux sig syscall %lu refused before "
+                            "post: %s\n",
+                            (unsigned long)num,
+                            splan.refuse == -LINUX_EINVAL
+                                ? "sigsetsize != 8 (kernel ABI sigset "
+                                  "is 8 bytes)"
+                                : "act/set span not user-readable "
+                                  "(plan)");
+                        return (uint64_t)(int64_t)splan.refuse;
+                    }
+                    if (!plan.len && splan.len) {
+                        plan.src = splan.src;
+                        plan.len = splan.len;
+                    }
+                }
+                /* E7 increment 12 (the reply payload, §10.13's step 3):
+                 * the OUT-POINTER's destination span — the write plan's
+                 * twin over the IN direction, computed after the sig
+                 * plan (one number is one plan; a foreign sigsetsize
+                 * still answers EINVAL first) and BEFORE the describe,
+                 * so a destination ring 3 could not write is a first-trap
+                 * -EFAULT with no post. A NULL out-pointer plans nothing
+                 * (nothing is owed back). The (dst, len) below is
+                 * STAGED — beside fs_base_stage, set immediately before
+                 * the arm — and the deliver copies only within it: the
+                 * copy-in aims where the FIRST trap said, never where
+                 * the reply says. */
+                {
+                    struct LinuxFdReplyPlan rp =
+                        linux_fd_reply_plan(num, largs);
+                    if (rp.refuse) {
+                        kernel_serial_printf(
+                            "[E7] linux reply dst 0x%lx (%u bytes) "
+                            "refused before post: bad user span "
+                            "(reply plan)\n",
+                            (unsigned long)rp.dst,
+                            (unsigned)rp.len);
+                        return (uint64_t)(int64_t)rp.refuse;
+                    }
+                    rplan = rp;
+                }
+                /* E7 increment 6 (the mem class, §5.4), stage half: a
+                 * brk's requested break is captured HERE — before the
+                 * describe and before the post — because the reply can
+                 * only mean "the break moved to X" against the break the
+                 * FIRST trap saw, and the first trap's frame is abandoned
+                 * by the park (the increment-4 lesson: the stage lives
+                 * on the descriptor, not on the stack). Every other
+                 * forward clears the stage, so an old request can never
+                 * wait for a grant it was not asked for.
+                 *
+                 * The W|X refusal is a first-trap refusal too, beside
+                 * the write plan's own: simultaneous write+execute is
+                 * refused by the shim itself (§5.4 — the census's
+                 * mprotect row carries LSC_F_REFUSES_WX), and it is a
+                 * property of the REQUEST (a prot word, no object, no
+                 * policy) — so no channel is needed to say -EPERM and
+                 * the refusal lands before any arm. The sidecar carries
+                 * the same refusal as its own 10 arm; both ends exist so
+                 * neither alone is the load-bearing refusal (guard N3). */
+                cur->mem_stage_valid = 0;
+                cur->mem_stage_num   = 0;
+                cur->mem_stage_a0    = 0;
+                cur->mem_stage_a1    = 0;
+                cur->mem_stage_a2    = 0;
+                cur->mem_stage_a3    = 0;
+                if (num == LINUX_BRK) {
+                    cur->mem_stage_valid = 1;
+                    cur->mem_stage_num   = num;
+                    cur->mem_stage_a0    = largs[0];
+                } else if (num == LINUX_MMAP) {
+                    /* E7 increment 16 (§5.4): the anonymous-map ladder.
+                     * Everything a mmap can be REFUSED for, before any
+                     * arm — request words only (a prot word, a flags
+                     * word, a FIXED address against this create's own
+                     * stamped span), so no channel is posted for a
+                     * shape that cannot be answered. The sidecar's 9
+                     * arm repeats the same ladder as its own twin
+                     * (guard clause V): neither end is load-bearing
+                     * alone. A pass stages the WHOLE ask — addr, len,
+                     * prot, flags — because the verdict at the reply
+                     * re-checks the grant against what the FIRST trap
+                     * saw: the brk rule over four words instead of
+                     * one. */
+                    struct LinuxMmapReq mreq;
+                    int mref;
+                    mreq.addr  = largs[0];
+                    mreq.len   = largs[1];
+                    mreq.prot  = largs[2];
+                    mreq.flags = largs[3];
+                    mref = linux_mem_mmap_refusal(&mreq,
+                            cur->linux_heap_base, cur->linux_heap_limit);
+                    if (mref) {
+                        kernel_serial_printf(
+                            "[E7] linux mmap addr=0x%lx len=%lu prot=%lu "
+                            "flags=0x%lx refused before post: %s\n",
+                            (unsigned long)largs[0],
+                            (unsigned long)largs[1],
+                            (unsigned long)largs[2],
+                            (unsigned long)largs[3],
+                            mref == -LINUX_EPERM
+                                ? "write+execute is refused (§5.4)"
+                                : mref == -LINUX_EINVAL
+                                ? "malformed request word"
+                                : mref == -LINUX_ENOMEM
+                                ? "outside the stamped span"
+                                : "shape not served (by name)");
+                        return (uint64_t)(int64_t)mref;
+                    }
+                    cur->mem_stage_valid = 1;
+                    cur->mem_stage_num   = num;
+                    cur->mem_stage_a0    = largs[0];
+                    cur->mem_stage_a1    = largs[1];
+                    cur->mem_stage_a2    = largs[2];
+                    cur->mem_stage_a3    = largs[3];
+                } else if (num == LINUX_MPROTECT &&
+                           linux_mprotect_refuses_wx(largs[2])) {
+                    kernel_serial_printf(
+                        "[E7] linux mprotect prot=0x%lx refused before "
+                        "post: write+execute is refused by the shim "
+                        "(§5.4)\n", (unsigned long)largs[2]);
+                    return (uint64_t)(int64_t)(-LINUX_EPERM);
+                }
+                /* E7 increment 11 (§10.13's step-2 coda): poll's
+                 * waiting-timeout refusal, the mprotect posture over a
+                 * timeout word. A poll that would WAIT is refused HERE,
+                 * before any post — it needs a wake against console-input
+                 * state this v1 has never had, and a task parked on a
+                 * channel whose wake cannot come is exactly the strand
+                 * the refusal-by-name discipline exists to prevent. A
+                 * zero-timeout probe is not refused: it forwards, and
+                 * the sidecar's 7 arm answers it 0 events (its twin of
+                 * this refusal is guard clause S). The timeout word is
+                 * Linux's int — the low 32 bits, printed as the caller
+                 * means it. */
+                else if (linux_poll_refuses_blocking(num, largs[2])) {
+                    kernel_serial_printf(
+                        "[E7] linux poll timeout=%ld refused before "
+                        "post: a waiting poll needs console-input state "
+                        "(input class)\n",
+                        (long)(int32_t)largs[2]);
+                    return (uint64_t)(int64_t)(-LINUX_ENOSYS);
+                }
+                linux_syscall_describe(&req, num, largs);
+                if (cap_linux_find_channels(cur->pid, &ch_w, &ch_r) != 0) {
+                    kernel_serial_printf(
+                        "[E7] linux syscall %lu (class=%s) refused: no "
+                        "sidecar channel — §3.5 wants exactly one\n",
+                        (unsigned long)num,
+                        linux_syscall_class_name(linux_syscall_class(num)));
+                    return (uint64_t)(int64_t)(-LINUX_ENOSYS);
+                }
+                /* E7 §5.3 (the plan's increment 4), stage half: an
+                 * ARCH_SET_FS is captured HERE — before the post — and is
+                 * applied only if THIS forward's reply grants it (the
+                 * resume arm below, same predicate on both ends of the
+                 * seam). Every other forward clears the stage, so an old
+                 * TLS value can never wait for a grant it was not asked
+                 * for. */
+                cur->fs_base_stage = 0;
+                cur->fs_stage_valid = 0;
+                if (linux_arch_prctl_is_set_fs(num, largs[0])) {
+                    cur->fs_base_stage = largs[1];
+                    cur->fs_stage_valid = 1;
+                }
+                /* E7 increment 5, copy half: attach the bytes, if any,
+                 * AFTER the channel is known (a refused copy must not
+                 * leave a half-built message anywhere) and BEFORE the arm
+                 * — so a copy refusal is a plain first-trap refusal with
+                 * no arm to un-arm. linux_user_copy_out reads only this
+                 * task's own user pages (present, user, 4 KiB) or refuses
+                 * -LINUX_EFAULT; it never faults over a tenant pointer. */
+                if (plan.len) {
+                    if (linux_user_copy_out(fwd + sizeof(struct SLSLinuxSyscallRequest),
+                                            cur->cr3, plan.src,
+                                            plan.len) != 0) {
+                        kernel_serial_printf(
+                            "[E7] linux write %lu bytes at 0x%lx refused "
+                            "before post: unmapped or non-user span "
+                            "(copy)\n",
+                            (unsigned long)plan.len,
+                            (unsigned long)plan.src);
+                        return (uint64_t)(int64_t)(-LINUX_EFAULT);
+                    }
+                    fwd_len += plan.len;
+                }
+                {
+                    struct SLSLinuxSyscallRequest *fwd_req =
+                        (struct SLSLinuxSyscallRequest *)(void *)fwd;
+                    *fwd_req = req;
+                }
+                /* E7 increment 12: stage the reply payload's destination
+                 * HERE — after every first-trap refusal has had its say
+                 * (no channel, bad attach, W|X, waiting poll — each
+                 * returns with the stage still clear) and immediately
+                 * before the arm, so the window between staging and the
+                 * deliver is exactly the forward's in-flight life. */
+                if (rplan.len) {
+                    cur->reply_stage_num   = num;
+                    cur->reply_stage_va    = rplan.dst;
+                    cur->reply_stage_len   = rplan.len;
+                    cur->reply_stage_valid = 1;
+                }
+                /* Arm BEFORE the post: cap_maybe_handoff (process.c) reads
+                 * this state and skips the post's send-handoff — a sysret
+                 * handoff would return to ring-3 MID-forward with its
+                 * hardcoded rax=0, losing the reply (the sidecar's wake of
+                 * this task is expected: it is parked on our channel). The
+                 * park re-stamps the same value via proc_park_capture. */
+                cur->park_syscall = SYS_LINUX_TRAP_RESUME;
+                status = k_linux_forward(cur->pid, ch_w, ch_r, fwd, fwd_len);
+                /* Reached ONLY when no park happened (post refused, or no
+                 * park possible) — no reply was read on this path, by
+                 * construction. Un-arm, then map the refusal into the
+                 * units this task speaks (both CAP families, one table). */
+                cur->park_syscall = 0;
+                kernel_serial_printf(
+                    "[E7] linux syscall %lu (class=%s) not delivered: "
+                    "cap status %d\n",
+                    (unsigned long)num,
+                    linux_syscall_class_name(linux_syscall_class(num)),
+                    status);
+                return (uint64_t)(int64_t)linux_errno_from_cap(status);
+            }
+        }
+    }
+
     /* Driver SDK block (307-309, 316-318): routed EXPLICITLY, before the
      * legacy switch. GCC builds one jump table for the legacy dense case
      * range (up to ~213) and the sparse high cases were unreachable
@@ -612,6 +1245,14 @@ uint64_t do_syscall(uint64_t num, void* arg) {
     // ring-3 (async, HELD until parent provisions resources).
     case SYS_SLS_CREATE_SIDECAR:
         return sys_sls_create_sidecar((struct SLSCreateSidecarRequest*)arg);
+
+    // ─── E7 increment 2: the Linux-personality spawn (328) ───────────────
+    // The same request struct as 310 (SLSCreateSidecarRequest); the
+    // personality rides the syscall NUMBER, never the bytes (§5.1). The E2
+    // sidecar_authority gate lives inside the callee, so both numbers are
+    // gated identically.
+    case SYS_SLS_LINUX_SPAWN:
+        return sys_sls_linux_spawn((struct SLSCreateSidecarRequest*)arg);
 
     // ─── POSIX-Environments E3: allocate a contiguous physical region (320)
     // charged to the caller's partition, for a POSIX environment's private

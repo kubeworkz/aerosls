@@ -114,6 +114,7 @@ pub fn build_dm_manifest(image: &DmImage) -> Vec<u8> {
             log_level: 1,
         }),
         flags_value: Some(0),
+        argenv: None,
         signature: None,
     };
 

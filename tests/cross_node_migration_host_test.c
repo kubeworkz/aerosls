@@ -91,6 +91,20 @@ int env_migrate_recv_page(uint64_t transfer_id, uint32_t page_index,
     return 1;
 }
 
+/* POSIX-Environments P3 increment 5: the confirmation pair. Same choice,
+ * same reason: this test never sends LIVE_REQ/LIVE_ACK (22–23), so these
+ * are not reached; were one to arrive, "not live" (1) is the honest answer
+ * for a node that restored nothing, and "nothing pending" (1) for its ACK.
+ * Real coverage: tests/env_migrate_host_test.c, Phase H. */
+int env_migrate_live_query(uint32_t partition_id, uint32_t index) {
+    (void)partition_id; (void)index;
+    return 1;
+}
+int env_migrate_live_ack(uint32_t partition_id, uint32_t index, uint32_t status) {
+    (void)partition_id; (void)index; (void)status;
+    return 1;
+}
+
 
 static int checks_passed = 0;
 static int checks_failed = 0;
@@ -998,4 +1012,14 @@ int main(void) {
 
     printf("\n%d passed, %d failed\n", checks_passed, checks_failed);
     return checks_failed == 0 ? 0 : 1;
+}
+
+/* POSIX-Environments P3 idle-observer arm stand-ins — the announce
+ * crosses the real DSPP wire, so a host build cannot run it; a no-op
+ * here keeps this test's link honest. Real coverage:
+ * tests/env_migrate_host_test.c (the local gate, the wire frame, the
+ * peer latch) and tests/checkpoint_recovery_host_test.c (the
+ * failover declaration gate). */
+void env_migrate_recv_intent(uint32_t node_id, uint32_t budget_ticks) {
+    (void)node_id; (void)budget_ticks;
 }

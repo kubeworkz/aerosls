@@ -584,6 +584,44 @@ void dspp_env_migrate_send_frag(uint64_t transfer_id, uint32_t node_dest_id,
     dspp_transmit_raw(&pkt, (uint16_t)sizeof(pkt));
 }
 
+/* P3 increment 5: the source's confirmation poll. Header-only, like the
+ * ACKs below — there are no bytes to move, only a question, and the answer
+ * arrives as a LIVE_ACK routed to env_migrate_live_ack(). */
+void dspp_env_migrate_send_live(uint64_t transfer_id, uint32_t node_dest_id,
+                                uint32_t partition_id, uint32_t env_index) {
+    struct DSPPEnvMigrateHeader pkt;
+    pkt.magic           = DSPP_MIGRATE_MAGIC;
+    pkt.opcode          = DSPP_MIGRATE_ENV_LIVE_REQ;
+    pkt.node_source_id  = (uint16_t)cluster_local_node_id();
+    pkt.node_dest_id    = node_dest_id;
+    pkt.transfer_id     = transfer_id;
+    pkt.partition_id    = partition_id;
+    pkt.page_index      = 0;
+    pkt.status          = 0;
+    pkt.env_index       = env_index;
+    pkt.total_pages     = 0;
+    pkt.record_len      = 0;
+    pkt.frag_index      = 0;
+    dspp_transmit_raw(&pkt, (uint16_t)sizeof(pkt));
+}
+
+void dspp_env_migrate_send_intent(uint32_t budget_ticks) {
+    struct DSPPEnvMigrateHeader pkt;
+    pkt.magic           = DSPP_MIGRATE_MAGIC;
+    pkt.opcode          = DSPP_MIGRATE_ENV_INTENT;
+    pkt.node_source_id  = (uint16_t)cluster_local_node_id();
+    pkt.node_dest_id    = 0;              /* broadcast: every node latches */
+    pkt.transfer_id     = 0;
+    pkt.partition_id    = 0;              /* the announce is node-scoped */
+    pkt.page_index      = 0;
+    pkt.status          = 0;
+    pkt.env_index       = 0;
+    pkt.total_pages     = 0;
+    pkt.record_len      = budget_ticks;
+    pkt.frag_index      = 0;
+    dspp_transmit_raw(&pkt, (uint16_t)sizeof(pkt));
+}
+
 static void dspp_env_migrate_send_ack(uint16_t opcode, uint32_t reply_to_node,
                                       uint64_t transfer_id, uint32_t partition_id,
                                       uint32_t env_index, uint32_t page_index,
@@ -611,8 +649,27 @@ void dspp_env_migrate_rx(void* buf, uint16_t len) {
     /* Same point-to-point self-filter as every family here: no L2 addressing
      * for a specific node exists, so a frame not addressed to us is silently
      * ignored, not an error. */
+
+    /* The intent announce is the ONE broadcast in this family (node_dest_id
+     * is 0 by construction) and is handled BEFORE the self-filter, which
+     * would otherwise drop every peer's announce on every other node —
+     * leaving exactly the blind spot (docs/AeroSLS-Idle-Observer-Adoption-
+     * Finding-v0.1.md) it exists to close. budget rides in record_len and
+     * is clamped on the kernel side. */
+    if (h->opcode == DSPP_MIGRATE_ENV_INTENT) {
+        env_migrate_recv_intent((uint32_t)h->node_source_id, h->record_len);
+        return;
+    }
+
     if (h->node_dest_id != cluster_local_node_id()) return;
 
+    /* Destination-side visibility (P3 live arm): partition_migrate()'s own
+     * abort tells the operator to "check node N's log for the refusal
+     * reason" — which was a promise this family could not keep: a refused
+     * BEGIN/PAGE was answered with a non-zero ACK and NOTHING was logged,
+     * so a live migrate that never landed gave no diagnosis on either
+     * side. One line per refusal (and one per staged environment) keeps
+     * the promise; the volume is per-migration, not per-frame. */
     if (h->opcode == DSPP_MIGRATE_ENV_BEGIN_REQ) {
         if (len < sizeof(struct DSPPEnvMigrateBeginPacket)) return;
         struct DSPPEnvMigrateBeginPacket* pkt = (struct DSPPEnvMigrateBeginPacket*)buf;
@@ -620,6 +677,25 @@ void dspp_env_migrate_rx(void* buf, uint16_t len) {
                                         h->env_index, h->total_pages,
                                         (const struct EnvCkptRecord*)pkt->record,
                                         h->record_len);
+        if (rc == 0) {
+            kernel_serial_printf(
+                "[ENV_MIGRATE] RX: BEGIN for (partition %u, index %u) from node %u "
+                "STAGED, %u page(s).\n",
+                (unsigned)h->partition_id, (unsigned)h->env_index,
+                (unsigned)h->node_source_id, (unsigned)h->total_pages);
+        } else {
+            /* rc names the gate (kernel/env_migrate.c's recv_begin): 1 no
+             * record, 2 record_len != sizeof(EnvCkptRecord), 3 declared
+             * total disagrees with the record's own page count, 4 total over
+             * ENV_MIGRATE_MAX_PAGES, 5 a slot for this identity is already
+             * staged, 6 the staging table is full. */
+            kernel_serial_printf(
+                "[ENV_MIGRATE] RX: BEGIN for (partition %u, index %u) from node %u "
+                "REFUSED (rc=%d: 1=no-record 2=record-len 3=page-count 4=too-many "
+                "5=slot-exists 6=table-full), answered with a non-zero ACK.\n",
+                (unsigned)h->partition_id, (unsigned)h->env_index,
+                (unsigned)h->node_source_id, rc);
+        }
         dspp_env_migrate_send_ack(DSPP_MIGRATE_ENV_BEGIN_ACK, h->node_source_id,
                                   h->transfer_id, h->partition_id, h->env_index,
                                   0, 0, (uint8_t)(rc == 0 ? 0 : 1));
@@ -631,10 +707,51 @@ void dspp_env_migrate_rx(void* buf, uint16_t len) {
         struct DSPPEnvMigratePagePacket* pkt = (struct DSPPEnvMigratePagePacket*)buf;
         int rc = env_migrate_recv_page(h->transfer_id, h->page_index,
                                        h->frag_index, pkt->page_data);
+        if (rc != 0) {
+            kernel_serial_printf(
+                "[ENV_MIGRATE] RX: PAGE (partition %u, page %u, frag %u) from node %u "
+                "REFUSED (rc=%d), answered with a non-zero ACK.\n",
+                (unsigned)h->partition_id, (unsigned)h->page_index,
+                (unsigned)h->frag_index, (unsigned)h->node_source_id, rc);
+        }
         dspp_env_migrate_send_ack(DSPP_MIGRATE_ENV_PAGE_ACK, h->node_source_id,
                                   h->transfer_id, h->partition_id, h->env_index,
                                   h->page_index, h->frag_index,
                                   (uint8_t)(rc == 0 ? 0 : 1));
+        return;
+    }
+
+    /* P3 increment 5, destination half: the source asked whether the
+     * environment is live here WITH ITS CONTENTS. The answer is read from
+     * env_migrate.c's own state (never from this packet), so a stale or
+     * replayed question can only ever produce the honest answer for today. */
+    if (h->opcode == DSPP_MIGRATE_ENV_LIVE_REQ) {
+        int rc = env_migrate_live_query(h->partition_id, h->env_index);
+        /* Destination-side visibility, same promise as the BEGIN/PAGE
+         * refusals above: the source's "the sweep stops asking" line names
+         * its own half of a word that never came, and before this line its
+         * only question had NO visible face on this node at all — a live
+         * teardown that never completed gave no diagnosis here. One line
+         * per poll: LIVE polls exist only while a teardown waits (one per
+         * env per period, capped by the source's tries budget), so the
+         * volume is per-migration, not per-frame. */
+        kernel_serial_printf(
+            "[ENV_MIGRATE] LIVE poll (partition %u, index %u) from node %u -> %d "
+            "(0 = live here with contents; nonzero = not yet)\n",
+            (unsigned)h->partition_id, (unsigned)h->env_index,
+            (unsigned)h->node_source_id, rc);
+        dspp_env_migrate_send_ack(DSPP_MIGRATE_ENV_LIVE_ACK, h->node_source_id,
+                                  h->transfer_id, h->partition_id, h->env_index,
+                                  0, 0, (uint8_t)(rc == 0 ? 0 : 1));
+        return;
+    }
+
+    /* P3 increment 5, source half: the destination's answer. Deliberately
+     * NOT note_ack's outstanding record — the poll is fire-and-forget on a
+     * period, so there is no single synchronous waiter whose transfer_id it
+     * belongs to; the answer lands on the confirmation entry by identity. */
+    if (h->opcode == DSPP_MIGRATE_ENV_LIVE_ACK) {
+        env_migrate_live_ack(h->partition_id, h->env_index, h->status);
         return;
     }
 
@@ -1031,7 +1148,7 @@ void dspp_rx_dispatch(void* buf, uint16_t len) {
             return;
         }
 
-        if (opcode >= DSPP_MIGRATE_ENV_BEGIN_REQ && opcode <= DSPP_MIGRATE_ENV_PAGE_ACK) {
+        if (opcode >= DSPP_MIGRATE_ENV_BEGIN_REQ && opcode <= DSPP_MIGRATE_ENV_INTENT) {
             dspp_env_migrate_rx(buf, len);   /* length checks live inside */
             return;
         }

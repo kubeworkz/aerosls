@@ -122,10 +122,17 @@
  *   gcc -no-pie -std=c11 -Wall -Wextra -I . -I kernel \
  *       -o /tmp/cap_create_sidecar_host_test \
  *       tests/cap_create_sidecar_host_test.c kernel/cap.c kernel/chan.c \
- *           kernel/console_service.c kernel/env_console.c
+ *           kernel/console_service.c kernel/env_console.c kernel/linux_abi.c \
+ *           kernel/elf64_load.c
  *   /tmp/cap_create_sidecar_host_test
  */
 #include "kernel/cap.h"
+#include "linux_abi.h"       /* E7 increment 7 (§5.2): PROC_PERSONALITY_LINUX
+                                * and the LINUX_AT_* the stack image carries */
+#include "kernel/entropy.h"  /* E7 increment 7: ENTROPY_* for the AT_RANDOM
+                                * gate's link stub */
+#include "kernel/elf64_load.h"  /* increment 8 step 1: elf64_map_blob is driven
+                                 * directly by E8a's mid-page PT_LOAD case */
 #include "tests/process_host_stubs.h"   /* per_cpu_data (weak), etc. */
 
 #include <stdio.h>
@@ -143,6 +150,20 @@ void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
  * service links; the test drives the console via console_service_tick()
  * with an empty input buffer anyway. */
 int serial_console_poll(char* out, size_t cap) { (void)out; (void)cap; return 0; }
+
+/* E7 increment 7 (§5.2): cap.c's Linux stack image needs 16 bytes of
+ * entropy for AT_RANDOM and REFUSES the create without them (kernel/
+ * entropy.c's pool is hardware-seeded, not linkable here). Refusing by
+ * default turns that refusal into a TESTED path; sections 18/20 arm it
+ * with a deterministic fill so the AT_RANDOM bytes read back through the
+ * child's page table can be compared byte for byte. */
+static int      g_entropy_armed = 0;
+int entropy_get(void* out, size_t n) {
+    uint8_t* o = (uint8_t*)out;
+    if (!g_entropy_armed) return ENTROPY_E_NOT_SEEDED;
+    for (size_t i = 0; i < n; i++) o[i] = (uint8_t)(0xA5 + i);
+    return ENTROPY_OK;
+}
 
 /* console_service.c prints each drained sidecar message under the kernel's
  * TX serializer (kernel/kernel_io.c, not linked here: no port I/O in a host
@@ -310,14 +331,23 @@ void* allocate_physical_ram_frame_for_partition(uint32_t partition_id) {
 /* Recording stub for the contiguous region allocator (POSIX-Environments
  * E3). The real one lives in frame_pool.c (not linked here); its allocation
  * logic — contiguity, quota, owner-tag, reclaim — is tested in
- * frame_quota_host_test.c. Here it only has to record the args so the
+ * frame_quota_host_test.c. Here it records the args so the
  * SYS_SLS_ALLOC_REGION test can prove the syscall passes the CALLER's own
- * partition and the requested size/alignment straight through, and returns a
- * stable fake base. */
-static uint32_t g_alloc_region_last_part   = 0xFFFFFFFFu;
+ * partition and the requested size/alignment straight through.
+ *
+ * E7 increment 7 (§5.2) widened this stub's job: the Linux child's stack
+ * IS one of these regions, and linux_initial_stack_build WRITES the
+ * argc/argv/envp/auxv image into it — a fake address cannot be written —
+ * so the stub now returns real, 4 KiB-aligned, zeroed host memory (the
+ * last return is recorded in g_contig_last_base). The E3 section's
+ * pass-through assertion checks against that recorded return instead of
+ * the old fixed literal, which is exactly as strong: it still proves the
+ * syscall handed the allocator's answer straight back to the caller. */
+static uint32_t g_alloc_region_last_part    = 0xFFFFFFFFu;
 static uint64_t g_alloc_region_last_nframes = 0;
 static uint64_t g_alloc_region_last_align   = 0;
 static int      g_alloc_region_calls        = 0;
+static uint64_t g_contig_last_base          = 0;
 uint64_t allocate_contiguous_frames_for_partition(uint32_t partition_id,
                                                   uint64_t nframes,
                                                   uint64_t align_frames) {
@@ -325,7 +355,12 @@ uint64_t allocate_contiguous_frames_for_partition(uint32_t partition_id,
     g_alloc_region_last_nframes = nframes;
     g_alloc_region_last_align   = align_frames;
     g_alloc_region_calls++;
-    return 0x50000000ULL;   /* fake, stable region base */
+    uint8_t* raw = (uint8_t*)malloc((size_t)nframes * 4096u + 4096u);
+    if (!raw) return 0;
+    uint8_t* p = (uint8_t*)(((uintptr_t)raw + 4095u) & ~(uintptr_t)4095u);
+    memset(p, 0, (size_t)nframes * 4096u);   /* like the real pool's frames */
+    g_contig_last_base = (uint64_t)(uintptr_t)p;
+    return g_contig_last_base;
 }
 
 /* Recording stub for the contiguous region FREE (POSIX-Environments E5). The
@@ -400,6 +435,25 @@ void user_map_page(uint64_t* pml4, uint64_t vaddr, uint64_t paddr, uint64_t flag
     pt[(vaddr >> 12) & 0x1FF] = (paddr & USER_PTE_FRAME_MASK) | flags;
 }
 
+/* E7 increment 7: the ELF mapper routes every segment through the REAL
+ * arch hook's contract (cap_arch_map_page: cap_perms W→0x02, X→0x04, NX
+ * unless X — kernel/cap.h). The real hook additionally re-points the
+ * child's path around the SHARED kernel identity map (user_map_page_safe);
+ * this test's PML4s are fresh/zeroed with no shared entries, so the same
+ * leaf install as user_map_page, with the hook's translation, is the
+ * faithful stand-in — and the E7c flag assertions still bite on the
+ * mapper's PF_*→cap_perms half, which lives in elf64_load.c. Strong, so it
+ * overrides cap.c's weak stub. */
+int cap_arch_map_page(uint64_t pml4_phys, uint64_t vaddr, uint64_t paddr,
+                      uint32_t cap_perms) {
+    uint64_t flags = USER_PTE_PRESENT | USER_PTE_USER;
+    if (!pml4_phys) return -1;
+    if (cap_perms & 0x02) flags |= USER_PTE_WRITE;      /* CAP_PERM_W */
+    if (!(cap_perms & 0x04)) flags |= USER_PTE_NOEXEC;  /* CAP_PERM_X */
+    user_map_page((uint64_t*)(uintptr_t)pml4_phys, vaddr, paddr, flags);
+    return 0;
+}
+
 /* The host test's PML4s are fresh/zeroed (no shared kernel identity map),
  * so identity mapping here is exactly user_map_page at the same address. */
 int user_map_identity(uint64_t* pml4, uint64_t phys, uint32_t npages,
@@ -426,7 +480,14 @@ static uint64_t leaf_pte(uint64_t vaddr) {
 
 static uint8_t* host_ptr(uint64_t vaddr) {
     uint64_t pte = leaf_pte(vaddr);
-    return pte ? (uint8_t*)(uintptr_t)(pte & USER_PTE_FRAME_MASK) : 0;
+    /* Frame PLUS the in-page offset: every caller before E7 increment 7
+     * read a page-aligned address (IMAGE_VBASE, BIB_VADDR), where the
+     * offset is zero and this was invisible — but the §5.2 stack image is
+     * read at %rsp and at the string pointers inside it, which are not
+     * aligned, and the frame-only form handed those reads the page's FIRST
+     * bytes (zeros on a stack whose image sits near the top). */
+    return pte ? (uint8_t*)((pte & USER_PTE_FRAME_MASK) | (vaddr & 0xFFFu))
+               : 0;
 }
 
 /* ─── Harness ─────────────────────────────────────────────────────────────── */
@@ -446,6 +507,11 @@ static uint64_t le64(const uint8_t* p) {
     for (int i = 7; i >= 0; i--) v = (v << 8) | p[i];
     return v;
 }
+
+/* Little-endian writers, for the synthetic ELF E8a builds byte by byte. */
+static void w16(uint8_t* p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
+static void w32(uint8_t* p, uint32_t v) { for (int i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8 * i)); }
+static void w64(uint8_t* p, uint64_t v) { for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8 * i)); }
 
 static uint32_t slot_type(uint64_t w) {
     return (uint32_t)((w >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK);
@@ -701,6 +767,23 @@ static void build_peer_blob(struct Blob* b, uint64_t image_kaddr, const char* na
     blob_finish(b, image_kaddr);
 }
 
+/* The standard valid manifest plus one ARGENV record (§5.2's
+ * environment-crossing record) BEFORE the footer — the record has to sit
+ * inside the TLV walk (the footer is appended after the last record and
+ * re-finished into the header), exactly like every other record here. */
+static void build_argenv_blob(struct Blob* b, uint64_t image_kaddr,
+                              const void* ap, uint16_t al) {
+    memset(b, 0, sizeof(*b));
+    blob_preamble(b);
+    blob_name(b, "drv.child.0");
+    blob_chan(b, "peer0", "drv.peer.0");
+    blob_chan(b, "console", "kernel.debug.console");
+    blob_dev(b, "nic0.bar0", DEV_BAR0_BASE, DEV_BAR0_BYTES);
+    blob_record(b, SIDECAR_TAG_ARGENV, al);
+    blob_put(b, ap, al);
+    blob_finish(b, image_kaddr);
+}
+
 /* A consumer manifest: NAME + preamble + ONE CAP_CHAN named "console"
  * whose peer is a sidecar NAME. The kernel resolves that name through the
  * sidecar registry (not a "kernel.*" service), so the channel is minted
@@ -798,6 +881,77 @@ uint32_t env_storage_owner(uint64_t region_base) {
     return 0xFFFFFFFFu;
 }
 
+/* ─── E7 increment 7 (§5.2/§5.1): readers for the new sections ────────────
+ * The §5.2 stack image is read back THROUGH THE CHILD's page table
+ * (host_ptr), exactly as a libc would in its own address space — which is
+ * the point of these sections: a pointer the kernel wrote as a host/phys
+ * address cannot be followed here any more than it could in ring 3. */
+/* envp slots recorded by read_stack_image — §5.2's environment-crossing
+ * record makes their CONTENT the thing to read back, through the child's
+ * own page table, exactly as its libc would. */
+#define ENV_SLOT_MAX 32
+struct StackImage {
+    uint64_t argc;
+    uint64_t argv0_vaddr;
+    uint64_t rsp;
+    uint64_t envp_vaddr[ENV_SLOT_MAX];  /* the env pointers; nenvp is the
+                                         * list length (the NULL lives at
+                                         * envp_vaddr[nenvp] when recorded) */
+    int      nenvp;
+    uint64_t aux[64][2];      /* type/value pairs; AT_NULL terminates */
+    int      naux;
+};
+static int read_stack_image(uint64_t rsp_vaddr, struct StackImage* si) {
+    uint64_t* w = (uint64_t*)host_ptr(rsp_vaddr);
+    uint64_t q;
+    int guard;
+    memset(si, 0, sizeof *si);
+    if (!w) return 0;
+    si->rsp = rsp_vaddr;
+    si->argc = w[0];
+    if (si->argc > 16) return 0;           /* the v1 argv is { name } */
+    si->argv0_vaddr = w[1];
+    q = 1 + si->argc;
+    for (guard = 0; guard < 32 && w[q] != 0; guard++) q += 1;
+    if (w[q] != 0) return 0;               /* argv must be NULL-terminated */
+    q += 1;
+    /* envp, walked and RECORDED: the ARGENV record's strings land here
+     * and the sections below read them back through the child's table. */
+    for (guard = 0; guard <= ENV_SLOT_MAX; guard++) {
+        if (w[q] == 0) break;
+        if (si->nenvp < ENV_SLOT_MAX) si->envp_vaddr[si->nenvp] = w[q];
+        si->nenvp += 1;
+        q += 1;
+    }
+    if (guard > ENV_SLOT_MAX) return 0;    /* envp must be NULL-terminated */
+    q += 1;
+    for (; si->naux < 64; q += 2) {
+        si->aux[si->naux][0] = w[q];
+        si->aux[si->naux][1] = w[q + 1];
+        if (w[q] == 0) break;              /* AT_NULL */
+        si->naux++;
+    }
+    return 1;
+}
+/* The VALUE of an AT_* pair, or all-ones if the type is absent (so the
+ * zero-valued entries — AT_BASE/AT_SECURE/AT_PHNUM-of-a-flat-image — stay
+ * distinguishable from "not written"). */
+static uint64_t aux_get(const struct StackImage* si, uint64_t type) {
+    for (int i = 0; i <= si->naux; i++)
+        if (si->aux[i][0] == type) return si->aux[i][1];
+    return 0xFFFFFFFFFFFFFFFFULL;
+}
+/* The most recently created child: creates take the highest pid, so the
+ * newest live child is the highest-pid active slot that isn't the parent. */
+static struct ProcessDescriptor* newest_child(void) {
+    struct ProcessDescriptor* best = 0;
+    for (int i = 0; i < PROC_MAX; i++)
+        if (proc_table[i].active && proc_table[i].pid != 100 &&
+            (!best || proc_table[i].pid > best->pid))
+            best = &proc_table[i];
+    return best;
+}
+
 int main(void) {
     cap_init();
 
@@ -892,8 +1046,8 @@ int main(void) {
         g_cur_pid = 100;                 /* init: has sidecar_authority */
         g_alloc_region_calls = 0;
         uint64_t base = sys_sls_alloc_region(&ar);
-        CHECK(base == 0x50000000ULL,
-              "E3: an authority caller gets a region base back");
+        CHECK(base != 0 && base == g_contig_last_base,
+              "E3: an authority caller gets the allocator's region base back");
         CHECK(g_alloc_region_calls == 1 && g_alloc_region_last_part == 0 &&
               g_alloc_region_last_nframes == 16 && g_alloc_region_last_align == 4,
               "E3: the allocator is called with the caller's partition and the requested size/alignment");
@@ -3037,6 +3191,513 @@ int main(void) {
         host_stub_frame_free  = 0xFFFFFFFFULL;
         host_stub_partition_extra_id = 0xFFFFFFFFu;
     }
+
+    /* ── 18. E7 increment 7 (§5.2): the Linux child's initial stack image ──
+     * cap_create_sidecar_in_personality with PROC_PERSONALITY_LINUX over
+     * the same flat image the SLS happy path used. The kernel must build
+     * the argc/argv/envp/auxv image INTO the child's contiguous stack
+     * region (never the per-page loop), hand the child a %rsp inside it —
+     * below the BIB's top page, which step 9 still writes — and every
+     * pointer in that image must be a CHILD vaddr (the builder's
+     * region_vaddr translation), not the host/phys address the builder
+     * writes through. Un-armed entropy must refuse before any of it. */
+    g_entropy_armed = 1;
+    {
+        struct Blob lb;
+        uint16_t lch = CAP_NONE;
+        uint32_t before = proc_count;
+        struct ProcessDescriptor* lc;
+        struct StackImage si;
+        uint64_t rnd_va;
+        const uint8_t* rb;
+        const char* xfn;
+        int rnd_ok, saw_sysinfo = 0;
+
+        build_valid_blob(&lb, image_kaddr, 0);
+        CHECK(cap_create_sidecar_in_personality(100, lb.data, lb.len,
+                                  CAP_NONE, CAP_NONE, &lch, 0,
+                                  PROC_PERSONALITY_LINUX) == 0,
+              "L1: a Linux-personality create over a flat image succeeds");
+        CHECK(proc_count == before + 1, "L1: exactly one process was created");
+        lc = newest_child();
+        CHECK(lc && lc->personality == PROC_PERSONALITY_LINUX,
+              "L1: the child carries the LINUX personality it was spawned with");
+        CHECK(lc && lc->user_rsp >= STACK_BASE &&
+              lc->user_rsp + 8 <= BIB_VADDR && (lc->user_rsp % 16) == 0,
+              "L1: %rsp is 16-byte aligned inside the stack, below the BIB's top page");
+        CHECK(lc && read_stack_image(lc->user_rsp, &si),
+              "L1: the stack image parses through the child's own page table");
+        CHECK(si.argc == 1, "L1: argc is 1 (the v1 argv is { name })");
+        {
+            const char* a0 = (const char*)host_ptr(si.argv0_vaddr);
+            CHECK(a0 && lc && strcmp(a0, lc->name) == 0,
+                  "L1: argv[0] is the child's name, through a child vaddr");
+        }
+        CHECK(si.nenvp == 0,
+              "L1: envp is EMPTY — no ARGENV record means the v1 fallback every pre-record manifest still runs under");
+        CHECK(aux_get(&si, LINUX_AT_ENTRY) == (lc ? lc->user_rip : 1),
+              "L1: AT_ENTRY is the child's entry");
+        CHECK(aux_get(&si, LINUX_AT_PAGESZ) == 4096,
+              "L1: AT_PAGESZ is 4096");
+        CHECK(aux_get(&si, LINUX_AT_PHNUM) == 0,
+              "L1: AT_PHNUM is 0 for a flat image (its headers don't exist to report)");
+        for (int i = 0; i < si.naux; i++)
+            if (si.aux[i][0] == 33) saw_sysinfo = 1;   /* AT_SYSINFO_EHDR */
+        CHECK(!saw_sysinfo,
+              "L1: AT_SYSINFO_EHDR is absent (no vDSO, §5.5)");
+        rnd_va = aux_get(&si, LINUX_AT_RANDOM);
+        rb = (const uint8_t*)host_ptr(rnd_va);
+        rnd_ok = rb != 0;
+        if (rnd_ok)
+            for (int i = 0; i < LINUX_AT_RANDOM_BYTES; i++)
+                if (rb[i] != (uint8_t)(0xA5 + i)) rnd_ok = 0;
+        CHECK(rnd_ok,
+              "L1: AT_RANDOM points at the stubbed entropy bytes, through a child vaddr");
+        xfn = (const char*)host_ptr(aux_get(&si, LINUX_AT_EXECFN));
+        CHECK(xfn && lc && strcmp(xfn, lc->name) == 0,
+              "L1: AT_EXECFN is the child's name, through a child vaddr");
+        CHECK(si.argv0_vaddr >= STACK_BASE && si.argv0_vaddr < BIB_VADDR &&
+              rnd_va >= STACK_BASE && rnd_va < BIB_VADDR,
+              "L1: every in-image pointer lands inside the child's stack region");
+        CHECK(lc && lc->linux_heap_base == BIB_STACK_TOP &&
+              lc->linux_heap_limit == BIB_STACK_TOP + BUDGET_MEM &&
+              lc->linux_brk_cur == lc->linux_heap_base,
+              "L1: the heap span starts above the stack (the increment-6 twin)");
+        CHECK(leaf_pte(BIB_VADDR) != 0,
+              "L1: the BIB's page is still mapped at the stack top");
+        {
+            uint8_t* bibp = host_ptr(BIB_VADDR);
+            CHECK(bibp && memcmp(bibp, SIDECAR_BIB_MAGIC, 8) == 0,
+                  "L1: the BIB sits at the stack-top page WITHOUT clobbering the §5.2 image");
+        }
+    }
+
+    /* ── 19. the AT_RANDOM gate (§5.2: refuse, never substitute) ───────────
+     * An UNSEEDED pool must refuse the whole create (CAP_ECONFLICT) — a
+     * stack image without entropy makes canaries worthless — and the
+     * half-built child must not survive: no process slot, and the
+     * contiguous stack region goes back to the CHILD's partition. */
+    g_entropy_armed = 0;
+    {
+        struct Blob lb2;
+        uint16_t lch2 = CAP_NONE;
+        uint32_t before2 = proc_count;
+        int frees_before = g_free_region_calls;
+        uint64_t region_before = g_contig_last_base;
+
+        build_valid_blob(&lb2, image_kaddr, 0);
+        CHECK(cap_create_sidecar_in_personality(100, lb2.data, lb2.len,
+                                  CAP_NONE, CAP_NONE, &lch2, 0,
+                                  PROC_PERSONALITY_LINUX) == CAP_ECONFLICT,
+              "L2: an unseeded entropy pool refuses the Linux create (§5.2: never a zero-filled AT_RANDOM)");
+        CHECK(proc_count == before2,
+              "L2: the refused create left no process behind");
+        CHECK(g_free_region_calls == frees_before + 1 &&
+              g_free_region_last_base == g_contig_last_base &&
+              g_contig_last_base != region_before &&
+              g_free_region_last_nframes == 4 &&
+              g_free_region_last_part == 0,
+              "L2: the refused create released its 4-frame stack region to the child's partition");
+    }
+
+    /* ── 20. E7 increment 7 (§5.1): the REAL census candidate as an image ──
+     * The exact bytes tools/linux_syscall_census.txt plants —
+     * user/sidecar/fixtures/e7_candidate.elf, a static non-PIE x86-64 ELF —
+     * loaded through the same create: segments land at their LINKED vaddrs
+     * with their own flags, the entry is e_entry, and the §5.2 image
+     * reports the image's own AT_PHDR/AT_PHNUM truthfully. */
+    {
+        static uint8_t cand[65536];
+        size_t cand_len = 0;
+        FILE* ef = fopen("user/sidecar/fixtures/e7_candidate.elf", "rb");
+        CHECK(ef != 0, "E7c: the committed candidate ELF is readable");
+        if (ef) { cand_len = fread(cand, 1, sizeof cand, ef); fclose(ef); }
+        CHECK(cand_len > 64 && cand_len < sizeof cand,
+              "E7c: the candidate ELF loaded into the buffer");
+        if (cand_len > 64) {
+            const uint8_t* eh = cand;
+            uint64_t e_entry = 0, e_phoff = 0;
+            uint16_t e_phnum = 0, e_phentsize = 0, e_type = 0;
+            struct Blob eb;
+            uint16_t ech = CAP_NONE;
+            uint32_t before3 = proc_count;
+            struct ProcessDescriptor* ec;
+            struct StackImage si2;
+            int segs_ok = 1, flags_ok = 1, mapped_any = 0;
+            uint64_t want_phdr = 0;
+            uint64_t c_stack_base;
+
+            memcpy(&e_entry,  eh + 24, 8);
+            memcpy(&e_phoff,  eh + 32, 8);
+            memcpy(&e_type,   eh + 16, 2);
+            memcpy(&e_phentsize, eh + 54, 2);
+            memcpy(&e_phnum,  eh + 56, 2);
+            CHECK(eh[0] == 0x7F && eh[1] == 'E' && eh[2] == 'L' && eh[3] == 'F',
+                  "E7c: it carries the ELF magic");
+            CHECK(e_type == 2,   /* ET_EXEC */
+                  "E7c: ET_EXEC — §5.1's gate: linked vaddrs, no bias");
+            CHECK(e_phentsize == LINUX_ELF64_PHENT,
+                  "E7c: 56-byte program headers");
+
+            g_entropy_armed = 1;
+            build_valid_blob(&eb, (uint64_t)(uintptr_t)cand, 0);
+            CHECK(cap_create_sidecar_in_personality(100, eb.data, eb.len,
+                                      CAP_NONE, CAP_NONE, &ech, 0,
+                                      PROC_PERSONALITY_LINUX) == 0,
+                  "E7c: the REAL candidate creates as a Linux child");
+            CHECK(proc_count == before3 + 1, "E7c: exactly one process");
+            ec = newest_child();
+            CHECK(ec && ec->personality == PROC_PERSONALITY_LINUX,
+                  "E7c: LINUX personality");
+            CHECK(ec && ec->user_rip == e_entry,
+                  "E7c: the entry is e_entry — the ELF's own linked address");
+
+            /* Each PT_LOAD: bytes at the linked p_vaddr, flags from p_flags. */
+            for (uint16_t i = 0; i < e_phnum &&
+                 e_phoff + (uint64_t)(i + 1) * e_phentsize <= cand_len; i++) {
+                const uint8_t* ph = cand + e_phoff + (uint64_t)i * e_phentsize;
+                uint32_t p_type = 0, p_flags = 0;
+                uint64_t p_offset = 0, p_vaddr = 0, p_filesz = 0;
+                const uint8_t* got;
+                uint64_t pte;
+                memcpy(&p_type,   ph + 0, 4);
+                memcpy(&p_flags,  ph + 4, 4);
+                memcpy(&p_offset, ph + 8, 8);
+                memcpy(&p_vaddr,  ph + 16, 8);
+                memcpy(&p_filesz, ph + 32, 8);
+                if (p_type != 1 /* PT_LOAD */ || p_filesz == 0) continue;
+                mapped_any = 1;
+                got = (const uint8_t*)host_ptr(p_vaddr);
+                if (!got || memcmp(got, cand + p_offset, p_filesz) != 0)
+                    segs_ok = 0;
+                pte = leaf_pte(p_vaddr);
+                if (!(pte & USER_PTE_PRESENT) || !(pte & USER_PTE_USER))
+                    flags_ok = 0;
+                if (((p_flags & 2) != 0) != ((pte & USER_PTE_WRITE) != 0))
+                    flags_ok = 0;      /* PF_W <=> writable */
+                if (((p_flags & 1) != 0) == ((pte & USER_PTE_NOEXEC) != 0))
+                    flags_ok = 0;      /* PF_X <=> executable */
+                if (!want_phdr && p_offset <= e_phoff &&
+                    e_phoff + (uint64_t)e_phnum * e_phentsize
+                        <= p_offset + p_filesz)
+                    want_phdr = p_vaddr + (e_phoff - p_offset);
+            }
+            CHECK(mapped_any && segs_ok,
+                  "E7c: every PT_LOAD's bytes land at its linked p_vaddr");
+            CHECK(flags_ok,
+                  "E7c: each segment's PTE carries the segment's own PF_W/PF_X");
+
+            /* The §5.2 image, now reporting the image truthfully. */
+            c_stack_base = IMAGE_VBASE
+                + ((uint64_t)((cand_len + 4095) / 4096)) * 4096 + 4096;
+            CHECK(ec && ec->user_rsp >= c_stack_base &&
+                  ec->user_rsp + 8 <= c_stack_base + STACK_BYTES &&
+                  (ec->user_rsp % 16) == 0,
+                  "E7c: %rsp sits 16-byte aligned in the candidate's stack region");
+            CHECK(ec && read_stack_image(ec->user_rsp, &si2),
+                  "E7c: the candidate's stack image parses");
+            CHECK(aux_get(&si2, LINUX_AT_ENTRY) == e_entry,
+                  "E7c: AT_ENTRY is the candidate's e_entry");
+            CHECK(aux_get(&si2, LINUX_AT_PHNUM) == e_phnum,
+                  "E7c: AT_PHNUM is the candidate's e_phnum");
+            CHECK(aux_get(&si2, LINUX_AT_PHENT) == LINUX_ELF64_PHENT,
+                  "E7c: AT_PHENT is 56");
+            CHECK(want_phdr != 0 && aux_get(&si2, LINUX_AT_PHDR) == want_phdr,
+                  "E7c: AT_PHDR is the candidate's program-header table, at its mapped vaddr");
+        }
+    }
+
+    /* ── 20b. E8a (increment 8, step 1): a NON-page-aligned PT_LOAD ──────
+     * The mapper's unstated assumption, measured on the real firstuser
+     * (§10.13's step-0 diagnosis): it copied each LOAD's bytes from segment
+     * offset 0 into a frame mapped at p_vaddr, so a segment linking 0x370
+     * into its page landed every byte 0x370 early in vaddr space —
+     * .init_array read back 0x28 instead of 0x800ae00, __libc_start_init's
+     * `call *(%rbx)` jumped to 0x28, and the child died at rip=0x28 before
+     * main. The committed candidate has only page-aligned LOADs (0x3ff000,
+     * 0x400000), which is why E7c above could not see it; the image below is
+     * the firstuser's shape in miniature: an aligned R-X segment holding the
+     * header table (the unchanged control), and an RW segment at 0x80001370
+     * — 0x370 into its page — with a BSS tail past filesz. */
+    {
+        static uint8_t img[8192];
+        static uint8_t want[0x400];
+        const uint64_t seg0_v  = 0x80000000ull;
+        const uint64_t seg1_v  = 0x80001370ull;   /* 0x370 into its page */
+        const uint64_t seg1_off = 0x400, seg1_fsz = 0x300, seg1_msz = 0x1234;
+        uint64_t pml4v, frames_before;
+        struct Elf64MapInfo mi;
+        int s1_ok = 1, gap_ok = 1, bss_ok = 1, flags_ok = 1;
+        size_t i;
+
+        memset(img, 0, sizeof img);
+        img[0] = 0x7F; img[1] = 'E'; img[2] = 'L'; img[3] = 'F';
+        img[4] = 2; img[5] = 1; img[6] = 1;          /* ELF64, LE, v1 */
+        w16(img + 0x10, 2);                          /* ET_EXEC */
+        w16(img + 0x12, 62);                         /* EM_X86_64 */
+        w32(img + 0x14, 1);
+        w64(img + 0x18, seg0_v + 0xB0);              /* e_entry */
+        w64(img + 0x20, 0x40);                       /* e_phoff */
+        w16(img + 0x34, 64);                         /* e_ehsize */
+        w16(img + 0x36, 56);                         /* e_phentsize */
+        w16(img + 0x38, 2);                          /* e_phnum */
+
+        /* LOAD 0: R-X, page-aligned, holds the header table — so AT_PHDR's
+         * anchor is exercised on the same pass. */
+        w32(img + 0x40 +  0, 1);                     /* PT_LOAD */
+        w32(img + 0x40 +  4, PF_R | PF_X);
+        w64(img + 0x40 +  8, 0);                     /* p_offset */
+        w64(img + 0x40 + 16, seg0_v);                /* p_vaddr */
+        w64(img + 0x40 + 24, seg0_v);
+        w64(img + 0x40 + 32, 0x400);                 /* p_filesz */
+        w64(img + 0x40 + 40, 0x400);                 /* p_memsz */
+        w64(img + 0x40 + 48, 0x1000);
+
+        /* LOAD 1: RW, MID-PAGE — the case this test exists for. */
+        w32(img + 0x78 +  0, 1);
+        w32(img + 0x78 +  4, PF_R | PF_W);
+        w64(img + 0x78 +  8, seg1_off);
+        w64(img + 0x78 + 16, seg1_v);
+        w64(img + 0x78 + 24, seg1_v);
+        w64(img + 0x78 + 32, seg1_fsz);
+        w64(img + 0x78 + 40, seg1_msz);
+        w64(img + 0x78 + 48, 0x1000);
+
+        /* Payloads in patterns no zero-fill and no shift can imitate. */
+        for (i = 0xB0; i < 0x400; i++) img[i] = (uint8_t)(0x11 + (i % 200));
+        for (i = 0; i < (size_t)seg1_fsz; i++) {
+            img[seg1_off + i] = (uint8_t)(0x51 + (i % 173));
+            want[i] = img[seg1_off + i];
+        }
+
+        pml4v = user_clone_page_table();
+        frames_before = (uint64_t)g_frame_count;
+        memset(&mi, 0, sizeof mi);
+        CHECK(pml4v != 0, "E8a: a fresh child PML4");
+        CHECK(elf64_map_blob(img, sizeof img, (uint64_t*)(uintptr_t)pml4v,
+                             0, &mi) == 1,
+              "E8a: the mapper loads an image whose RW segment is 0x370 into its page");
+        CHECK(mi.entry == seg0_v + 0xB0, "E8a: info->entry is e_entry");
+        CHECK(mi.phdr_vaddr == seg0_v + 0x40,
+              "E8a: AT_PHDR's anchor is the LOAD holding the table, at its linked vaddr");
+        CHECK(host_ptr(seg0_v) != 0 &&
+                  memcmp(host_ptr(seg0_v), img, 0xB0) == 0,
+              "E8a: the ALIGNED control segment lands unchanged — the fix must not move the images that already worked");
+        CHECK((uint64_t)g_frame_count - frames_before == 3,
+              "E8a: exactly 1 + 2 frames — the mid-page segment spans two pages, counted from its page base");
+
+        for (i = 0; i < (size_t)seg1_fsz; i++) {
+            const uint8_t* got = host_ptr(seg1_v + i);
+            if (!got || *got != want[i]) { s1_ok = 0; break; }
+        }
+        CHECK(s1_ok, "E8a: the NON-ALIGNED segment's bytes land at its linked p_vaddr — the 0x370 shift is gone");
+
+        for (uint64_t a = seg1_v - 0x300; a < seg1_v; a++) {
+            const uint8_t* got = host_ptr(a);
+            if (!got || *got != 0) { gap_ok = 0; break; }
+        }
+        CHECK(gap_ok, "E8a: the page's leading bytes BELOW the segment start are ZERO — not the segment's own bytes shifted down");
+
+        for (uint64_t a = seg1_v + seg1_fsz; a < seg1_v + seg1_msz; a++) {
+            const uint8_t* got = host_ptr(a);
+            if (!got || *got != 0) { bss_ok = 0; break; }
+        }
+        CHECK(bss_ok, "E8a: the BSS tail past filesz is zero-filled, across the page it spills into");
+
+        {
+            uint64_t p0 = leaf_pte(seg0_v), p1 = leaf_pte(seg1_v);
+            flags_ok = p0 && p1
+                    && !(p0 & USER_PTE_WRITE) && !(p0 & USER_PTE_NOEXEC)
+                    &&  (p1 & USER_PTE_WRITE) &&  (p1 & USER_PTE_NOEXEC);
+        }
+        CHECK(flags_ok, "E8a: each segment's PTE still carries its own PF_W/PF_X");
+
+        /* The hazard the alignment fix makes possible: two LOADs covering
+         * one page would be mapped twice, the second silently discarding
+         * the first's bytes and permissions. Refused by name, before the
+         * first frame. */
+        {
+            static uint8_t img2[8192];
+            struct Elf64MapInfo mi2;
+            uint64_t pml4b = user_clone_page_table();
+            memcpy(img2, img, sizeof img2);
+            w64(img2 + 0x78 + 16, seg0_v + 0xF00);   /* LOAD 0's own page */
+            w64(img2 + 0x78 + 24, seg0_v + 0xF00);
+            memset(&mi2, 0, sizeof mi2);
+            CHECK(pml4b != 0, "E8a: a second fresh PML4 for the refusal case");
+            CHECK(elf64_map_blob(img2, sizeof img2,
+                                 (uint64_t*)(uintptr_t)pml4b, 0, &mi2) == 0,
+                  "E8a: two LOADs sharing a page are REFUSED by name — one frame per page cannot hold both");
+        }
+    }
+
+    /* Append one ARGENV record (§5.2's environment-crossing record) with
+     * exactly the payload bytes given — the valid form and every refusal
+     * form below are hand-assembled the same bytes
+     * user/proto/src/manifest.rs emits (its argenv_wire_bytes_golden pins
+     * the Rust side of the same layout). */
+    g_entropy_armed = 1;
+
+    /* ── 21. §5.2's environment-crossing record (ARGENV) crosses ──────────
+     * argv and envp come from the manifest and land in the stack image
+     * with CHILD-vaddr pointers, exactly like the v1 argv they extend.
+     * The crossing is read back THROUGH the child's own page table, so
+     * this pins the bytes a libc would actually read — not the kernel's
+     * intent. The e7 spawn sites (user/sidecar/src/e7_*.rs) author the
+     * same record through manifest.rs; this section is the kernel half
+     * of that seam, with the strings built by hand. */
+    {
+        struct Blob xb;
+        uint16_t xch = CAP_NONE;
+        struct ProcessDescriptor* xc;
+        struct StackImage si3;
+        static const char* rec[] = { "crossed-probe", "--flag",
+                                     "PATH=/bin", "HOME=/root" };
+        uint8_t ap[4 + 2*(2 + 16)];   /* counts + four len-prefixed strings */
+        uint32_t al = 0;
+        int env_ok;
+        uint64_t e0 = 0, e1 = 0;
+
+        ap[al++] = 2; ap[al++] = 0;          /* argc = 2 */
+        ap[al++] = 2; ap[al++] = 0;          /* envc = 2 */
+        for (int i = 0; i < 4; i++) {
+            uint16_t n = (uint16_t)strlen(rec[i]);
+            memcpy(ap + al, &n, 2); al += 2;
+            memcpy(ap + al, rec[i], n); al += n;
+        }
+        build_argenv_blob(&xb, image_kaddr, ap, (uint16_t)al);
+
+        CHECK(cap_create_sidecar_in_personality(100, xb.data, xb.len,
+                                  CAP_NONE, CAP_NONE, &xch, 0,
+                                  PROC_PERSONALITY_LINUX) == 0,
+              "L3: a Linux create carrying the ARGENV record succeeds");
+        xc = newest_child();
+        CHECK(xc && read_stack_image(xc->user_rsp, &si3),
+              "L3: the child's stack image parses through its own page table");
+        CHECK(si3.argc == 2,
+              "L3: argc is the record's argv count");
+        {
+            const char* a0 = (const char*)host_ptr(si3.argv0_vaddr);
+            CHECK(a0 && strcmp(a0, "crossed-probe") == 0,
+                  "L3: argv[0] is the record's first argv string, through a child vaddr");
+        }
+        env_ok = si3.nenvp == 2;
+        if (si3.nenvp > 0) e0 = si3.envp_vaddr[0];
+        if (si3.nenvp > 1) e1 = si3.envp_vaddr[1];
+        CHECK(env_ok,
+              "L3: envp carries exactly the record's env strings — no longer the empty environment");
+        CHECK(e0 && host_ptr(e0) &&
+              strcmp((const char*)host_ptr(e0), "PATH=/bin") == 0,
+              "L3: envp[0] is the record's first env string, through a child vaddr");
+        CHECK(e1 && host_ptr(e1) &&
+              strcmp((const char*)host_ptr(e1), "HOME=/root") == 0,
+              "L3: envp[1] is the record's second env string, through a child vaddr");
+        CHECK(si3.argv0_vaddr >= STACK_BASE && si3.argv0_vaddr < BIB_VADDR &&
+              (e0 >= STACK_BASE && e0 < BIB_VADDR) &&
+              (e1 >= STACK_BASE && e1 < BIB_VADDR),
+              "L3: every record pointer lands inside the child's stack region");
+    }
+
+    /* ── 22. the ARGENV parse refuses BY NAME, before any child exists ────
+     * The record is manifest input like every other field, and its
+     * strings are copied into a FIXED arena on the create's stack — so
+     * every over-bound or malformed form is refused with its reason
+     * (CAP_ERANGE / CAP_EINVAL) and consumes no process slot. The one
+     * thing it must never do is truncate: a child handed a shorter
+     * environment than its author wrote would read as success. */
+    {
+        struct Blob rb;
+        uint16_t rch;
+        uint32_t before4 = proc_count;
+        uint8_t p[600];
+        uint16_t n16;
+
+        /* argv over the fixed array. */
+        memset(p, 0, 4); p[0] = SIDECAR_MANIFEST_MAX_ARGV + 1;
+        build_argenv_blob(&rb, image_kaddr, p, 4);
+        rch = CAP_NONE;
+        CHECK(cap_create_sidecar_in_personality(100, rb.data, rb.len,
+                                  CAP_NONE, CAP_NONE, &rch, 0,
+                                  PROC_PERSONALITY_LINUX) == CAP_ERANGE,
+              "L4: argc over the fixed array is refused ERANGE");
+
+        /* envp over the fixed array. */
+        memset(p, 0, 4); p[2] = SIDECAR_MANIFEST_MAX_ENVP + 1;
+        build_argenv_blob(&rb, image_kaddr, p, 4);
+        rch = CAP_NONE;
+        CHECK(cap_create_sidecar_in_personality(100, rb.data, rb.len,
+                                  CAP_NONE, CAP_NONE, &rch, 0,
+                                  PROC_PERSONALITY_LINUX) == CAP_ERANGE,
+              "L4: envp over the fixed array is refused ERANGE");
+
+        /* string bytes over the arena (one 512-byte string needs its
+         * NUL too, against SIDECAR_MANIFEST_ARGENV_BYTES). */
+        p[0] = 1; p[1] = 0; p[2] = 0; p[3] = 0;   /* argc 1, envc 0 */
+        n16 = SIDECAR_MANIFEST_ARGENV_BYTES;
+        memcpy(p + 4, &n16, 2);
+        memset(p + 6, 'a', SIDECAR_MANIFEST_ARGENV_BYTES);
+        build_argenv_blob(&rb, image_kaddr, p,
+                          (uint16_t)(6 + SIDECAR_MANIFEST_ARGENV_BYTES));
+        rch = CAP_NONE;
+        CHECK(cap_create_sidecar_in_personality(100, rb.data, rb.len,
+                                  CAP_NONE, CAP_NONE, &rch, 0,
+                                  PROC_PERSONALITY_LINUX) == CAP_ERANGE,
+              "L4: string bytes over the arena are refused ERANGE");
+
+        /* an interior NUL — the copy would silently truncate it. */
+        p[0] = 1; p[1] = 0; p[2] = 0; p[3] = 0;
+        n16 = 3; memcpy(p + 4, &n16, 2);
+        p[6] = 'a'; p[7] = 0; p[8] = 'b';
+        build_argenv_blob(&rb, image_kaddr, p, 9);
+        rch = CAP_NONE;
+        CHECK(cap_create_sidecar_in_personality(100, rb.data, rb.len,
+                                  CAP_NONE, CAP_NONE, &rch, 0,
+                                  PROC_PERSONALITY_LINUX) == CAP_EINVAL,
+              "L4: an interior NUL is refused EINVAL, never truncated");
+
+        /* bytes trailing the last string. */
+        memset(p, 0, 4); p[4] = 0xFF;
+        build_argenv_blob(&rb, image_kaddr, p, 5);
+        rch = CAP_NONE;
+        CHECK(cap_create_sidecar_in_personality(100, rb.data, rb.len,
+                                  CAP_NONE, CAP_NONE, &rch, 0,
+                                  PROC_PERSONALITY_LINUX) == CAP_EINVAL,
+              "L4: bytes trailing the last string are refused EINVAL");
+
+        /* a header too short to hold its own counts. */
+        memset(p, 0, 2);
+        build_argenv_blob(&rb, image_kaddr, p, 2);
+        rch = CAP_NONE;
+        CHECK(cap_create_sidecar_in_personality(100, rb.data, rb.len,
+                                  CAP_NONE, CAP_NONE, &rch, 0,
+                                  PROC_PERSONALITY_LINUX) == CAP_EINVAL,
+              "L4: a header shorter than its counts is refused EINVAL");
+
+        CHECK(proc_count == before4,
+              "L4: no ARGENV refusal left a process behind");
+    }
+
+    /* ── E7 increment 13: the preserved register set ──────────────────────
+     * cap_recv_resume()/cap_sysret_resume() re-stamp the per-CPU
+     * linux_args capture FROM CapParkCtx by byte offset — 72(%1) …
+     * 112(%1) — and syscall_return_path restores [gs:0x50..0x80) for the
+     * sysret. A reordered or regressed field is then a silent boot bug
+     * that sysrets someone else's registers (the0x8054bdf wall: musl's
+     * `act` pointer in r8 came back as kernel scratch and read
+     * 0x88(r8) = 0x90). Pinned HERE, the layout is a host test rather
+     * than a fault address. */
+    CHECK(offsetof(struct CapParkCtx, user_rsp) == 64,
+          "P1: park_ctx.user_rsp sits at 64 — p[8], the byte offset both "
+          "resume asms read the parked task's stack from");
+    CHECK(offsetof(struct CapParkCtx, linux_args) == 72,
+          "P1: park_ctx.linux_args sits at 72 — p[9], where the resume's "
+          "re-stamp reads the six preserved argument registers from");
+    CHECK(offsetof(struct CapParkCtx, linux_args) + 5 * 8 == 112,
+          "P1: the last preserved register (r9) lands at 112, exactly "
+          "where the re-stamp's 112(%1) and [gs:0x78] say it does");
+    CHECK(sizeof(struct CapParkCtx) == 120,
+          "P1: the ctx is 15x8 bytes — the eight pushed values, the user "
+          "RSP, and the six argument registers, nothing unaccounted");
 
     if (g_fail == 0) printf("\nALL PASS\n");
     else             printf("\n%d FAILURE(S)\n", g_fail);

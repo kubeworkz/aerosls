@@ -96,19 +96,36 @@ static inline const char* proc_priority_name(ProcPriority p) {
                                       //  unusable from ring-3 until this grew)
 
 // User register state captured when a blocking cap_recv parks a process
-// mid-syscall — exactly the eight values syscall_entry_stub pushed on entry
-// (r11 = user RFLAGS, rcx = user RIP, then the six callee-saved regs) plus
-// the user RSP that lives in per_cpu_data[0].user_rsp at park time.
-// cap_recv_resume() pushes these back onto a fresh syscall stack so the
-// stub's .syscall_return path can pop them and sysret with the user's
-// registers intact. Field order is load-bearing (process.c's resume asm
-// indexes it as [0..8]).
+// mid-syscall — the eight values syscall_entry_stub pushed on entry
+// (r11 = user RFLAGS, rcx = user RIP, then the six callee-saved regs),
+// the user RSP that lives in per_cpu_data[0].user_rsp at park time, and
+// (E7 increment 13) the six Linux argument registers the stub captured
+// at [gs:0x50..0x80).
+// cap_recv_resume() pushes the first nine back onto a fresh syscall
+// stack so the stub's syscall_return_path can pop them, re-stamps the
+// linux_args half into the per-CPU capture block, and the return path
+// restores those so sysret lands with the user's registers intact —
+// ALL of them: Linux changes only rax (result), rcx and r11 across a
+// syscall, and a real musl binary holds live values across one
+// (__libc_sigaction keeps `act` in r8 through its unmask syscall — the
+// 0x8054bdf fault wall when it came back as kernel scratch).
+// Field order is load-bearing (process.c's resume asm indexes it as
+// [0..8] for the pushed set and [9..14] for the argument half).
 struct CapParkCtx {
     uint64_t r11;                 /* user RFLAGS (sysret needs R11)  */
     uint64_t rcx;                 /* user RIP (sysret target)        */
     uint64_t r15, r14, r13, r12;  /* user callee-saved               */
     uint64_t rbx, rbp;
     uint64_t user_rsp;            /* [gs:0] at park time             */
+    /* E7 increment 13: Linux's syscall argument order — rdi, rsi, rdx,
+     * r10, r8, r9 — as syscall_entry_stub captured them. Both resume
+     * paths re-write [gs:0x50..0x80) from this before the re-run and
+     * before jumping into syscall_return_path (neither runs the entry
+     * stub, so without the re-stamp that block holds the LAST entry's
+     * values — possibly another process's). Offsets 72..112 are pinned
+     * by the resume asm's 72(%1)…112(%1) reads and the cap_create host
+     * test's offsetof checks. */
+    uint64_t linux_args[6];
 };
 
 struct ProcessDescriptor {
@@ -116,6 +133,91 @@ struct ProcessDescriptor {
     char       name[PROC_NAME_LEN];   // mirrors the SERVICE_PROCESS object name
     uint64_t   object_id;             // FNV-1a of the source SLS object
     uint64_t   cr3;                   // physical address of the process's PML4
+    uint64_t   fs_base;               // E7 §5.3 (the plan's increment 4): the live
+                                       // MSR_IA32_FS_BASE value for THIS task — the
+                                       // kernel's one Linux semantic. Zeroed at slot
+                                       // reuse beside personality and cleared
+                                       // forward-grant state (fs_base_stage), so a
+                                       // reused slot never hands its predecessor's
+                                       // TLS to the next occupant; written to the MSR
+                                       // at every ring-3 switch-in
+                                       // (proc_build_resume_frame) and the instant a
+                                       // granted ARCH_SET_FS lands (do_syscall's
+                                       // resume arm). Invariant: FSBASE == current
+                                       // task's fs_base, both directions.
+    uint64_t   fs_base_stage;          // §5.3: an ARCH_SET_FS value captured at the
+                                       // first trap and held for the sidecar's
+                                       // verdict — the sidecar decides WHETHER a
+                                       // task may set TLS, the resume arm performs
+                                       // the write. Only meaningful while
+                                       // fs_stage_valid is 1.
+    uint8_t    fs_stage_valid;         // 1 between that forward's arming and its
+                                       // reply (or refusal) — cleared here, at the
+                                       // apply, and at every non-SET forward.
+    uint64_t   linux_heap_base;        // E7 increment 6 (§5.4): the budget span a
+                                       // LINUX task's brk bump pointer lives in —
+                                       // stamped inside the create from the
+                                       // manifest's BUDGET record (mem_bytes,
+                                       // page-rounded, directly above the child's
+                                       // stack), zeroed at slot reuse beside
+                                       // personality. The kernel maps granted
+                                       // pages into this span with partition-
+                                       // charged frames at the reply; the
+                                       // sidecar's ledger (user/sidecar/src/
+                                       // linux.rs's MemBrk) is the policy twin of
+                                       // these three numbers, and the probe's
+                                       // denial-echo check is what proves the two
+                                       // halves never drift.
+    uint64_t   linux_heap_limit;       // base + round_up_4k(mem_bytes)
+    uint64_t   linux_brk_cur;          // the break THIS side has mapped to — the
+                                       // mechanism's truth about which pages are
+                                       // backed, consulted by the verdict at
+                                       // every brk reply
+    uint64_t   linux_mmap_top;         // E7 increment 16 (§5.4): the anonymous-map
+                                       // cursor — born at the span's limit,
+                                       // descending by every granted non-FIXED
+                                       // mmap, stamped beside the heap numbers at
+                                       // the create and zeroed at slot reuse
+                                       // beside them. The MemBrk ledger's mtop is
+                                       // the policy twin; both ends re-check the
+                                       // other's grants (brk's ceiling is
+                                       // min(limit, mtop)) so a map can never
+                                       // overwrite a frame either side already
+                                       // handed out.
+    uint64_t   mem_stage_num;          // §5.4: a brk captured at the first trap
+                                       // (a break only means something against the
+                                       // break the FIRST trap saw) — held for the
+                                       // sidecar's verdict, consumed by the
+                                       // resume arm. Cleared at the apply, at
+                                       // every non-brk forward, and at slot reuse.
+    uint64_t   mem_stage_a0;           // args[0] as captured — the requested break
+                                       // (brk), or a mmap's address
+    uint64_t   mem_stage_a1;           // args[1..3] as captured — a mmap's len,
+    uint64_t   mem_stage_a2;           // prot and flags: the WHOLE ask (increment
+    uint64_t   mem_stage_a3;           // 16), because the verdict re-checks the
+                                       // grant against what the FIRST trap saw —
+                                       // the brk rule over four words instead of
+                                       // one. Zeroed for SLS and for non-mmap
+                                       // forwards beside mem_stage_a0.
+    uint8_t    mem_stage_valid;        // 1 between that forward's arming and its
+                                       // reply (or refusal)
+    uint64_t   reply_stage_num;        // E7 increment 12 (§10.13's step 3): the
+                                       // reply payload's DESTINATION captured at
+                                       // the first trap — the copy-in aims where
+                                       // the FIRST trap said, never where the
+                                       // reply says (the staged-destination
+                                       // contract, §10.13). The number is part of
+                                       // the stage so a payload can be checked
+                                       // against the request it was planned for.
+    uint64_t   reply_stage_va;         // args[2] as captured — the child VA the
+                                       // payload is copied back into
+    uint32_t   reply_stage_len;        // the clamp: bytes the first trap allowed
+                                       // (32 for rt_sigaction, 8 for rt_sigprocmask)
+    uint8_t    reply_stage_valid;      // 1 between that forward's arming and its
+                                       // deliver (or refusal) — cleared at the
+                                       // top of every first-trap block, consumed
+                                       // and cleared at the apply, and cleared at
+                                       // slot reuse beside the other stages.
     uint64_t   user_rip;              // entry point in user space
     uint64_t   user_rsp;              // current user-space stack pointer
     uint64_t   user_stack_vaddr;      // vaddr base of the 8-page user stack
@@ -146,6 +248,17 @@ struct ProcessDescriptor {
                                        // (0 = spawned from kernel context).
     uint32_t   partition_id;          // Phase 9 (LPAR): partition_get_for_uid(owner_uid)
                                        // at spawn time — see partition.h
+    uint32_t   personality;           // E7 (Linux ABI Shim Design §3.3): what this
+                                       // task's rax MEANS at the trap —
+                                       // PROC_PERSONALITY_SLS (0, default) or
+                                       // PROC_PERSONALITY_LINUX (1). Values live in
+                                       // kernel/linux_abi.h; the trap branch reads it
+                                       // before ANY number chain (do_syscall), which
+                                       // is what keeps Linux 105 (setuid) from being
+                                       // interpreted as SLS 105 (SYS_SLS_ALLOCATE).
+                                       // Stamped at spawn (cap_create_sidecar_in),
+                                       // reset by proc_clear_resume_state() so a
+                                       // reused slot can never inherit it.
     ProcState  state;
     ProcPriority priority;             // Navigator-Parity Gap Roadmap Phase 4:
                                        // defaults to PROC_PRIO_NORMAL at spawn
@@ -160,18 +273,34 @@ struct ProcessDescriptor {
     // re-runs the recv — the old kernel call chain on the syscall stack is
     // abandoned, never unwound (one dead frame per park; bounded, Phase-1
     // posture). Layout order is load-bearing: [r11, rcx, r15..rbp] match
-    // syscall_entry_stub's push order exactly.
+    // syscall_entry_stub's push order exactly, and linux_args[6] mirrors
+    // its [gs:0x50..0x80) capture (E7 increment 13 — the register round
+    // trip both resume paths re-stamp before the sysret).
     struct CapParkCtx park_ctx;
     uint64_t   park_req;              // the request pointer the resume re-runs
                                        // (SLSCapRecvRequest for a recv park,
-                                       // SLSChanWaitRequest for a chan-wait park)
+                                       // SLSChanWaitRequest for a chan-wait park).
+                                       // E7 increment 3: for a Linux-forward park
+                                       // (SYS_LINUX_TRAP_RESUME) this carries the
+                                       // EXPECTED REPLY NUMBER, not a pointer — the
+                                       // request struct died with the abandoned
+                                       // first-trap frame, and a value survives the
+                                       // abandoned-frame rule by not being an
+                                       // address (kernel/chan.c k_linux_forward).
     uint32_t   park_syscall;          // the syscall the resume re-runs — set at park
-                                       // time (SYS_SLS_CAP_RECV or SYS_SLS_CHAN_WAIT)
+                                       // time (SYS_SLS_CAP_RECV or SYS_SLS_CHAN_WAIT,
+                                       // and SYS_LINUX_TRAP_RESUME for an E7 forward)
                                        // and consumed by cap_recv_resume()'s
                                        // do_syscall re-entry. Generalizes the resume
                                        // so ONE entry point serves both the
                                        // single-channel recv park and the Phase-5
-                                       // multi-channel k_chan_wait park.
+                                       // multi-channel k_chan_wait park (and the
+                                       // Linux reply deliver). For a Linux task the
+                                       // ARMED value doubles as the forward's
+                                       // in-flight marker: cap_maybe_handoff skips
+                                       // the post's sysret handoff while it is set,
+                                       // and the dispatcher refuses a sentinel trap
+                                       // that finds it clear (stray, refused by name).
     uint16_t   waiting_chan;          // channel id this process is BLOCKED on (recv
                                        // park), or CAP_NONE (0xFFFF) when not parked
     uint16_t   waiting_chans[CHAN_WAIT_MAX_CHANS];  // Phase 5 wait park: the channels
@@ -469,6 +598,16 @@ void process_exit(uint32_t exit_code);
 // kernel_enter_ring3). Returns NULL if no Ring-3 process is currently
 // running (e.g. a call made from pure kernel context).
 struct ProcessDescriptor* process_find_current(void);
+
+/* E7 (increment 2): read this CPU's captured Linux argument registers
+ * (arch/x86/syscall.asm's sibling block at [gs:0x50..0x80)) into out[6]
+ * in capture order (rdi, rsi, rdx, r10, r8, r9). A named function rather
+ * than inline asm at each site, for the same reason arch_read_cr3() is:
+ * the %%gs read is privileged-adjacent and belongs in ONE place. Returns
+ * 1 if a capture was read, 0 if called from a context with no per-CPU
+ * syscall scratch (pure kernel context). */
+int proc_read_linux_args(uint64_t out[6]);
+
 uint32_t sys_sls_getppid(void);
 uint32_t sys_sls_yield(void);   /* SYS_SLS_YIELD (300) — Phase 1.5 immediate-wake handback */
 

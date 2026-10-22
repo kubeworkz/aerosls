@@ -166,6 +166,7 @@ X86_C_SRC   = kernel/kernel.c arch/x86/idt.c arch/x86/gdt.c arch/x86/vga.c kerne
               kernel/net_socket_service.c \
               kernel/boot_image.c \
               kernel/loader.c \
+              kernel/elf64_load.c \
               kernel/simi_x86.c \
               kernel/simi_runtime.c \
               kernel/simi_translate.c \
@@ -206,6 +207,7 @@ X86_C_SRC   = kernel/kernel.c arch/x86/idt.c arch/x86/gdt.c arch/x86/vga.c kerne
               kernel/env_storage.c \
               kernel/env_payload.c \
               kernel/env_migrate.c \
+              kernel/linux_abi.c \
               kernel/state_tree.c \
               kernel/failover.c \
               drivers/nvme_io.c \
@@ -390,6 +392,28 @@ plugins: compiler/SLSAllocationPassV2.cpp
 # whose behaviour it changes.
 kernel/checkpoint_delta.x86.o kernel/checkpoint_mgr.x86.o kernel/env_ckpt.x86.o \
 kernel/persist.x86.o kernel/qemu_sls_tcache.x86.o: kernel/checkpoint_delta.h
+
+# ── E7's shared headers: the struct and contracts every consumer reads ──────
+# The incident (this session, THREE times): process.h gained the E7 fs_base
+# fields (§5.3) and only the four edited .c files rebuilt -- cap.c still read
+# the OLD ProcessDescriptor layout, so cap_current_pid() looked at the wrong
+# slots and init's first create_sidecar panicked "[CS] CAP_EINVAL parent
+# pid=0" (an earlier mixed link even read a personality field as the
+# impossible 4). The second fix filtered kernel/%.c only, and the THIRD
+# incident walked straight through it: net/http.c includes process.h too, so
+# the kernel's HTTP layer -- which serves /api/processes -- walked the old
+# struct offsets and reported every process with an empty name and no
+# partition (env_console_attach + env_create_boot, red for the same reason as
+# the panic). The filter is GONE: same doctrine as checkpoint_delta.h above,
+# broadened to the whole kernel IMAGE -- ProcessDescriptor and the Linux-ABI
+# contracts ARE the whole kernel's shared state, so every object in
+# X86_C_SRC (kernel/, arch/x86/, net/, drivers/, user/shell.c alike) depends
+# on them -- over-rebuilding every kernel object on such an edit is the cheap
+# side of a trade whose other side ships a broken boot.
+# arch/x86/user_paging.h joins for its PerCPUData layout asserts and the §5.3
+# MSR declarations -- a header whose silent reorder is a desync with
+# syscall.asm's [gs:0xNN] literals that no compiler can see.
+$(X86_C_SRC:.c=.x86.o): kernel/process.h kernel/linux_abi.h arch/x86/user_paging.h
 
 # ── kernel/tls_platform.c needs the vendored mbedTLS headers ───────────────
 # An explicit rule rather than adding these to X86_CFLAGS, so vendor/mbedtls's

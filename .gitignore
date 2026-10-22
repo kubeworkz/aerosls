@@ -4,6 +4,10 @@
 *.o
 *.img
 *.elf
+# The E7 increment-7 census candidate is a COMMITTED fixture (the sidecar
+# include_bytes!s it, the cap host test reads it at boot-check time):
+# keep the one file the build script regenerates trackable.
+!user/sidecar/fixtures/e7_candidate.elf
 *.so
 *.a
 # POSIX-Environments E3 boot image (init built with e3_envs). The shipped

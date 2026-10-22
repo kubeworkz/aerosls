@@ -2,6 +2,7 @@
 #define USER_PAGING_H
 
 #include <stdint.h>
+#include <stddef.h>   // offsetof — the frozen-offset static asserts below
 
 // ─── Page flag constants for user-space mappings ─────────────────────────────
 #define USER_PTE_PRESENT  (1ULL << 0)
@@ -22,6 +23,7 @@
 #define MSR_STAR         0xC0000081
 #define MSR_LSTAR        0xC0000082
 #define MSR_SFMASK       0xC0000084
+#define MSR_FS_BASE      0xC0000100  /* E7 §5.3: the one MSR the shim owns */
 #define MSR_GS_BASE      0xC0000101
 #define MSR_KERNEL_GS    0xC0000102
 
@@ -46,9 +48,42 @@ struct PerCPUData {
     // syscall entry; it is only read mid-syscall by the current process,
     // so the values always describe the CURRENT syscall.
     uint64_t syscall_regs[8];
+    // offset 0x50: E7 (increment 2, Linux ABI Shim Design §3.4) — the six
+    // Linux argument registers, captured by syscall_entry_stub BEFORE any
+    // call, in a SIBLING block rather than a widening of syscall_regs:
+    // [0x50]=rdi, [0x58]=rsi, [0x60]=rdx, [0x68]=r10, [0x70]=r8, [0x78]=r9.
+    // A Linux-personality task passes six values where the SLS ABI passes
+    // one pointer, and the entry path clobbers the argument registers
+    // (`mov rsi,rdi; mov rdi,rax` in .unknown_syscall) before C sees them —
+    // so the ONLY safe read is this capture, done before any call for the
+    // same reason syscall_regs is: the -O2 call chain may reuse the entry
+    // frame. The existing offsets are frozen by the static asserts below;
+    // this block is appended, never interleaved.
+    uint64_t linux_args[6];
 };
 
+/* The offsets the asm addresses literally. These exist so a C-side reorder
+ * of PerCPUData becomes a BUILD error instead of a silent desync with
+ * arch/x86/syscall.asm, whose [gs:0xNN] literals cannot be checked by the
+ * compiler. The asm side of the same contract is held by clause B/C of
+ * tests/linux_personality_check.sh. */
+_Static_assert(offsetof(struct PerCPUData, syscall_regs) == 0x10,
+               "syscall_regs must stay at [gs:0x10]: syscall.asm addresses it literally");
+_Static_assert(offsetof(struct PerCPUData, linux_args) == 0x50,
+               "linux_args must stay at [gs:0x50]: syscall.asm addresses it literally");
+_Static_assert(sizeof(struct PerCPUData) == 0x80,
+               "PerCPUData grows only by appending — every existing offset is frozen");
+
 extern struct PerCPUData per_cpu_data[4];  // one slot per core
+
+/* E7 §5.3 (the plan's increment 4): write MSR_IA32_FS_BASE for the task
+ * being switched in / the arch_prctl being granted. The ONLY writer of this
+ * MSR in the tree (gate init zeros it once, before any ring-3 exists) —
+ * called from process.c's proc_build_resume_frame (every switch-in) and
+ * syscall_dispatch.c's SYS_LINUX_TRAP_RESUME arm (a granted ARCH_SET_FS).
+ * Callers are ring-0; wrmsr is privileged. Declared here because the
+ * invariant it maintains belongs with the gate that programs STAR/LSTAR. */
+void user_write_fs_base(uint64_t base);
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
@@ -90,6 +125,22 @@ int cap_arch_identity_map_user(uint64_t pml4_phys, uint64_t phys,
 // garbage collection, same posture as the rest of the kernel. Non-
 // allocating: unlike get_or_alloc(), this never creates missing levels.
 void user_unmap_page(uint64_t* pml4, uint64_t vaddr);
+
+/* E7 increment 16 (§5.4): shoot down ONE stale TLB entry, for the one
+ * path in this tree that edits a PRESENT leaf the task has already run
+ * on: a MAP_FIXED mmap replacing a page (the measured allocator's guard
+ * page lands on the brk heap's first page). Every other mapping path
+ * edits only not-present leaves — ring-3 never touched them, so no
+ * translation can be cached (the brk apply's posture, §5.4) — but a
+ * replace changes a translation ring-3 HAS used, and the task is parked
+ * on this same CPU with its CR3 still loaded, so one `invlpg` per
+ * touched page is the whole requirement.
+ *
+ * Named, NOT inline: `invlpg` is privileged, so — exactly like
+ * arch_read_cr3 — a host test that links a translation unit containing
+ * it dies before main() gets anywhere, and the seam must exist (the
+ * personality guard greps this call from the mmap apply, tooth t111). */
+void user_invlpg(uint64_t vaddr);
 
 // Phase 2 teardown: free EVERY frame a process's address space owns -- the
 // user-half intermediate tables, the process's own leaf data frames

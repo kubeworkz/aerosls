@@ -16,8 +16,12 @@
  * every page the record names has landed.
  */
 #include "env_migrate.h"
+#include "env_proto.h"          /* ENV_OK / ENV_ERR_* -- the create round trip's answer */
+#include "env_payload.h"        /* env_payload_wait_parked() -- the pour's posture gate */
+#include "env_service.h"        /* env_service_create()/destroy() -- the create path */
 #include "frame_pool.h"
 #include "kernel_io.h"
+#include "partition.h"          /* partition_exists()/get_owner_node()/pause() -- the restore's gates */
 #include "../drivers/nvme_io.h"
 #include "../net/dspp.h"
 #include "../net/consensus.h"   /* cluster_local_node_id() -- the destination guard */
@@ -41,7 +45,55 @@ extern volatile uint64_t kernel_tick_counter;
 #define ENV_MIGRATE_SECTORS_PER_PAGE 8u
 
 static int env_migrate_status = ENV_MIGRATE_OK;
+/* Resolved-migration failover grace — see env_migrate.h's
+ * ENV_MIGRATE_RESOLVED_GRACE_ definition for the false "declared DEAD"
+ * this tail exists to cover. Set at BOTH points where a migration resolves
+ * on this node: env_migrate_recv_drop() (the destination's slot is gone)
+ * and env_migrate_confirm_disarm() (the source's confirmation walk
+ * finished); read by env_migrate_in_flight(). */
+static uint64_t env_migrate_resolved_tick = 0;
+
+/* Migration intent — see env_migrate.h's INTENT_GRACE_ block for the
+ * idle-observer false "declared DEAD" this pair exists to cover.
+ * env_migrate_intent_tick is THIS node's local gate stamp (set by
+ * env_migrate_intent_begin(), read by env_migrate_in_flight()); the peer
+ * table is what every OTHER node's announce latched here (set by
+ * env_migrate_recv_intent(), read by env_migrate_peer_in_flight()). */
+static uint64_t env_migrate_intent_tick = 0;
+#define ENV_MIGRATE_INTENT_PEERS_MAX 8
+struct EnvMigratePeerIntent {
+    uint32_t node_id;
+    uint8_t  active;
+    uint8_t  _pad[3];
+    uint64_t until_tick;   /* exclusive: expired the moment now reaches it */
+};
+static struct EnvMigratePeerIntent env_migrate_peer_intent[ENV_MIGRATE_INTENT_PEERS_MAX];
 int env_migrate_last_status(void) { return env_migrate_status; }
+
+/* The operands behind the most recent REFUSAL (restore side). The send side
+ * sets env_migrate_status directly and deliberately does not touch this: its
+ * refusals have no operands worth carrying -- "a page never confirmed" names
+ * itself -- while a restore refusal is only actionable with its numbers (WHICH
+ * region broke the placement rule, WHICH ENV_* status the create answered). */
+static struct EnvMigrateRefusal env_migrate_refusal = {0, 0, 0};
+const struct EnvMigrateRefusal* env_migrate_last_refusal(void) {
+    return &env_migrate_refusal;
+}
+
+static int env_migrate_refuse(int code, uint32_t a, uint32_t b) {
+    env_migrate_status       = code;
+    env_migrate_refusal.code = (uint32_t)code;
+    env_migrate_refusal.a    = a;
+    env_migrate_refusal.b    = b;
+    return code;
+}
+
+/* P3 increment 5 (defined below, next to the confirmation walk they
+ * belong to): the source's pending-teardown table is armed here, at the
+ * end of a fully-confirmed send, and the destination's restored-marker is
+ * set at the end of a successful pour. */
+static void env_migrate_arm_confirms(uint32_t partition_id, uint32_t dest_node_id);
+static void env_migrate_restored_mark(uint32_t partition_id, uint32_t index);
 
 uint32_t env_migrate_payload_pages(const struct EnvCkptRecord* rec) {
     if (!rec) return 0;
@@ -217,6 +269,7 @@ int env_migrate_send(uint32_t partition_id, uint32_t index, uint32_t dest_node_i
  * the whole freeze/send/thaw discipline in one place where it can be proven
  * as a unit (tests/env_migrate_host_test.c, Phase F). */
 int env_migrate_partition(uint32_t partition_id, uint32_t dest_node_id,
+                          int operator_paused,
                           uint32_t* out_expected, uint32_t* out_moved) {
     uint32_t expected = 0;
     if (out_expected) *out_expected = 0;
@@ -263,9 +316,17 @@ int env_migrate_partition(uint32_t partition_id, uint32_t dest_node_id,
 
     /* 2. Freeze them — the caller holds the partition paused already, so this
      * marks a state that exists rather than creating one, and it marks exactly
-     * the records counted above or it refused. */
+     * the records counted above or it refused. `operator_paused` is the
+     * caller's answer to the one question the flags cannot answer for
+     * themselves: partition_migrate() paused this partition for the move, so
+     * unless an OPERATOR's pause predates that, the staged records must carry
+     * QUIESCED alone — the migration's own freeze is released on the source
+     * and is nobody else's business. Marking it anyway made every destination
+     * "restore into paused": the environment LIVE by the records, its
+     * sidecars never scheduled again, its console accepting input nobody
+     * would read (P3 increment 10's live console arm, 2026-10-14). */
     struct EnvCkptPartitionQuiesce freeze;
-    if (env_ckpt_quiesce_partition(partition_id, &freeze) != expected) {
+    if (env_ckpt_quiesce_partition(partition_id, &freeze, operator_paused) != expected) {
         kernel_serial_printf(
             "[ENV_MIGRATE] partition %u: could not freeze its %u environment(s) -- "
             "this node does not hold the partition paused, so nothing may be read as a "
@@ -308,6 +369,18 @@ int env_migrate_partition(uint32_t partition_id, uint32_t dest_node_id,
         "[ENV_MIGRATE] partition %u: all %u environment(s) confirmed by node %u; "
         "the caller may hand over ownership.\n",
         (unsigned)partition_id, (unsigned)moved, (unsigned)dest_node_id);
+
+    /* 5 (P3 increment 5): arm the teardown confirmations — one entry per
+     * environment just sent. From here the sweep asks node %u whether each
+     * environment is live THERE, and tears this node's half down only on
+     * its word — the step before this one moved bytes, this one arranges
+     * that the records describing them do not outlive the environment.
+     * The entries are armed BEFORE the caller's ownership handoff and
+     * disarm themselves if ownership never leaves (the caller aborted at
+     * Step 4): the sweep tears down only a partition another node now owns.
+     * Arming is deliberately AFTER every send succeeded: a partial step is
+     * an abort, and an abort's environments are still here. */
+    env_migrate_arm_confirms(partition_id, dest_node_id);
     return ENV_MIGRATE_OK;
 }
 
@@ -318,15 +391,32 @@ int env_migrate_partition(uint32_t partition_id, uint32_t dest_node_id,
  * migrate critical section (increment 3) will serialize concurrent moves the
  * way it already does for streams. Runtime state only — see env_migrate.h. */
 #define ENV_MIGRATE_STAGING_MAX 2
-#define ENV_MIGRATE_MAX_PAGES   1536   /* >= any real payload: 3 regions' frames (1344) + the extent's pages */
+#define ENV_MIGRATE_MAX_PAGES   4096   /* >= any real payload, measured on a
+                                        * live cluster 2026-10-13: a shell-created
+                                        * environment's payload is the 3 region
+                                        * frames (POSIX_HEAP 1024 + RD_HEAP 64 +
+                                        * RD_STORAGE 256 = 1344) PLUS the two
+                                        * sidecars' image/stack frames the create
+                                        * charges to the partition PLUS the durable
+                                        * extent's pages — which put the old 1536
+                                        * cap just under a real BEGIN, refused as
+                                        * "too-many" (rc=4) on the wire. 4096 = 16
+                                        * MiB of headroom; the staging slot costs
+                                        * ~52 KB of BSS each (2 slots). */
 
 struct EnvMigrateSlot {
     uint8_t  active;
     uint8_t  complete;
+    uint8_t  restore_tries;    /* P3 increment 4: restore attempts the sweep has spent
+                                * on this slot -- bounded so a slot that can never
+                                * restore stops logging, while the bytes stay countable */
     uint32_t partition_id;
     uint32_t index;
     uint64_t transfer_id;
     uint32_t total_pages;
+    uint64_t opened_tick;      /* kernel_tick_counter at BEGIN — env_migrate_in_flight()
+                                * bounds its grace by the slot's age so a wedged
+                                * transfer cannot park failover's death detection */
     uint32_t pages_staged;     /* distinct pages whose fragments all landed */
     struct EnvCkptRecord record;
     /* Staged bytes: one partition-charged frame per payload page. */
@@ -359,6 +449,7 @@ static struct EnvMigrateSlot* env_migrate_slot(uint32_t partition_id, uint32_t i
 int env_migrate_recv_drop(uint32_t partition_id, uint32_t index) {
     struct EnvMigrateSlot* s = env_migrate_slot(partition_id, index);
     if (!s) return 1;
+    env_migrate_resolved_tick = kernel_tick_counter;   /* resolution point */
     for (uint32_t p = 0; p < ENV_MIGRATE_MAX_PAGES; p++) {
         if (s->pages[p]) {
             free_physical_ram_frame_for_partition(s->pages[p], s->partition_id);
@@ -370,14 +461,8 @@ int env_migrate_recv_drop(uint32_t partition_id, uint32_t index) {
     s->active       = 0;
     s->complete     = 0;
     s->pages_staged = 0;
+    s->restore_tries = 0;
     return 0;
-}
-
-void env_migrate_reset(void) {
-    for (int i = 0; i < ENV_MIGRATE_STAGING_MAX; i++) {
-        struct EnvMigrateSlot* s = &env_migrate_staging[i];
-        if (s->active) env_migrate_recv_drop(s->partition_id, s->index);
-    }
 }
 
 /* Wire entry: the destination has received an ENV BEGIN. Called from
@@ -387,29 +472,52 @@ void env_migrate_reset(void) {
 int env_migrate_recv_begin(uint64_t transfer_id, uint32_t partition_id,
                            uint32_t index, uint32_t total_pages,
                            const struct EnvCkptRecord* record, uint32_t record_len) {
+    /* Distinct refusal codes (P3 live arm): every gate below used to return
+     * the same 1, and dspp.c's one refusal line then said only "rc=1" —
+     * five different defects, indistinguishable on a live cluster where the
+     * sender's own log can only say "never confirmed". Any nonzero is still
+     * refused exactly as before (dspp.c maps it to a non-zero ACK status;
+     * the host tests assert the status, not these numbers). */
     if (!record) return 1;
-    if (record_len != (uint32_t)sizeof(struct EnvCkptRecord)) return 1;
+    if (record_len != (uint32_t)sizeof(struct EnvCkptRecord)) return 2;
     /* Both sides number pages from the same record; a declared total that
      * disagrees with the record means the two kernels would disagree about
      * what "every page landed" means — refused rather than reconciled. */
-    if (total_pages != env_migrate_payload_pages(record)) return 1;
-    if (total_pages > ENV_MIGRATE_MAX_PAGES) return 1;
-    /* No overwriting a slot in flight: a retransmitted BEGIN for an
-     * environment already staged is refused, and the sender abandons rather
-     * than clobbering. */
-    if (env_migrate_slot(partition_id, index)) return 1;
+    if (total_pages != env_migrate_payload_pages(record)) return 3;
+    if (total_pages > ENV_MIGRATE_MAX_PAGES) return 4;
+    /* No overwriting a slot in flight — but a retransmitted BEGIN for the
+     * SAME transfer is answered READY without touching the slot, not
+     * refused. transfer_id is derived from the identity ((partition<<32)|
+     * index), so a re-BEGIN after a lost or late ACK carries the same id
+     * and the same record: refusing it would make the documented
+     * retransmission model fail exactly when it is needed. Observed live
+     * 2026-10-13: a freshly-booted destination's BEGIN ACK was slow, the
+     * source re-asked, rc=5 abandoned the whole migrate mid-send ("a page
+     * never confirmed") on a cluster where every node was healthy. Pages
+     * re-stage idempotently under the same id. A BEGIN for the same
+     * identity with a DIFFERENT record is a different transfer's intent
+     * and stays refused (env_migrate_host_test E4). */
+    struct EnvMigrateSlot* existing = env_migrate_slot(partition_id, index);
+    if (existing) {
+        if (existing->transfer_id == transfer_id &&
+            existing->record.env_id == record->env_id)
+            return 0;   /* the same transfer re-asked: staged, ready */
+        return 5;
+    }
 
     struct EnvMigrateSlot* s = 0;
     for (int i = 0; i < ENV_MIGRATE_STAGING_MAX; i++)
         if (!env_migrate_staging[i].active) { s = &env_migrate_staging[i]; break; }
-    if (!s) return 1;
+    if (!s) return 6;
 
     s->active       = 1;
     s->complete     = 0;
+    s->restore_tries = 0;
     s->partition_id = partition_id;
     s->index        = index;
     s->transfer_id  = transfer_id;
     s->total_pages  = total_pages;
+    s->opened_tick  = kernel_tick_counter;
     s->pages_staged = 0;
     s->record       = *record;
     /* A zero-page environment is complete the moment its BEGIN is accepted:
@@ -446,7 +554,19 @@ int env_migrate_recv_page(uint64_t transfer_id, uint32_t page_index,
         frag_index >= DSPP_MIGRATE_FRAGS_PER_PAGE) return 1;
 
     if (!s->pages[page_index]) {
-        void* frame = allocate_physical_ram_frame_for_partition(s->partition_id);
+        /* Staging frames come from the TOP of the frame pool (frame_pool.h).
+         * The restore creates a FRESH environment whose regions land
+         * wherever the ascending first-fit watermark currently is; staging
+         * this payload ASCENDED would consume the very runs that create is
+         * about to be handed, and the destination would land a
+         * payload-length past the staged bases — the placement gate's
+         * "fresh environment landed off the staged bases" refusal, caught
+         * live on the 2-node TCG cluster (2026-10-13) and invisible to host
+         * tests, whose two simulated nodes share one allocator history.
+         * Top-down staging leaves the watermark exactly where the source's
+         * was, so the destination reproduces the recorded bases. Same
+         * quota/owner/usage accounting; the drop frees them like any frame. */
+        void* frame = allocate_physical_ram_frame_for_partition_top(s->partition_id);
         if (!frame) return 1;
         s->pages[page_index] = (uint8_t*)frame;
     }
@@ -487,4 +607,878 @@ const uint8_t* env_migrate_recv_page_ptr(uint32_t partition_id, uint32_t index,
     struct EnvMigrateSlot* s = env_migrate_slot(partition_id, index);
     if (!s || page_index >= s->total_pages || !s->pages[page_index]) return 0;
     return s->pages[page_index];
+}
+
+/* ─── Restore (P3 increment 4): a staged slot becomes a live environment ─────
+ * See env_migrate.h for the full contract; this file owns the order, which is
+ * the part that cannot be delegated. The shape is env_service.c's boot
+ * replay — resume → create → identity → settle → wait-parked → repause →
+ * pour — with the bytes sourced from the staging slot instead of NVMe, and
+ * one extra gate the boot pass never needs: the destination must OWN the
+ * partition before it may build an environment inside it.
+ *
+ * The slot-retention rule, stated once because every refusal below follows
+ * it: the slot is KEPT while the state is exactly what it was before the
+ * attempt (nothing stored, nothing created — a retry can succeed where this
+ * attempt could not), and DROPPED the moment the environment exists (a pour
+ * refusal leaves the empty replay standing, and retrying a pour into a live
+ * environment would double-create). env_migrate_recv_drop() is therefore the
+ * last thing a successful restore does, and the last thing an unappliable
+ * refusal does — never the first. */
+int env_migrate_restore(uint32_t partition_id, uint32_t index) {
+    env_migrate_status = ENV_MIGRATE_OK;
+    env_migrate_refusal.code = ENV_MIGRATE_OK;
+    env_migrate_refusal.a = env_migrate_refusal.b = 0;
+
+    /* 1a. The slot, whole. The public view is a shared static, so the record
+     * is copied immediately: the drops below free the slot the view reads. */
+    const struct EnvMigrateStaging* view = env_migrate_recv_find(partition_id, index);
+    if (!view)
+        return env_migrate_refuse(ENV_MIGRATE_REFUSE_NO_SLOT, partition_id, index);
+    if (!view->complete)
+        return env_migrate_refuse(ENV_MIGRATE_REFUSE_INCOMPLETE,
+                                  view->pages_staged, view->total_pages);
+    struct EnvCkptRecord staged = view->record;
+    uint32_t staged_total_pages = env_migrate_payload_pages(&staged);
+    if (staged.partition_id != partition_id || staged.index != index)
+        return env_migrate_refuse(ENV_MIGRATE_REFUSE_RECORD,
+                                  staged.partition_id, staged.index);
+
+    /* The control plane never migrates (the send side refuses it by name), so
+     * a PARTITION_SYSTEM slot is malformed input rather than a tenant to
+     * rebuild — refused here rather than discovered mid-create. */
+    if (partition_id == PARTITION_SYSTEM)
+        return env_migrate_refuse(ENV_MIGRATE_REFUSE_SYSTEM, partition_id, index);
+
+    /* 1b. The boot replay's own admissibility gate, applied verbatim: what
+     * crossed must be a quiesced instant and name a partition that exists.
+     * One gate for both restores, so a record the boot would refuse cannot be
+     * smuggled in through the wire. */
+    int admissible = env_ckpt_restore_admissible(&staged);
+    if (admissible == ENV_CKPT_REFUSE_UNQUIESCED)
+        return env_migrate_refuse(ENV_MIGRATE_REFUSE_UNQUIESCED, index, admissible);
+    if (admissible != ENV_CKPT_REFUSE_NONE) {
+        if (!partition_exists(partition_id))
+            return env_migrate_refuse(ENV_MIGRATE_REFUSE_NOT_OWNER, 1, index);
+        return env_migrate_refuse(ENV_MIGRATE_REFUSE_RECORD,
+                                  (uint32_t)admissible, index);
+    }
+
+    /* 1c. The destination guard. A follower building an environment for a
+     * partition served elsewhere would be a second, unaccounted tenant
+     * charging its frames — the mirror image of the source's
+     * "ownership must not move before the payload" rule. */
+    if (partition_get_owner_node(partition_id) != cluster_local_node_id())
+        return env_migrate_refuse(ENV_MIGRATE_REFUSE_NOT_OWNER, 0, index);
+
+    /* 2. A return migration: this node already holds an environment at this
+     * identity because the source-teardown half has not landed (increment 3
+     * named it — the source's records still describe environments that
+     * moved). The staged bytes just crossed with ownership returned, so the
+     * local instance is the stale one; it is ended, and what crossed is
+     * rebuilt. env_service_destroy's own bookkeeping drops its record (the
+     * ENV_DESTROY path calls env_ckpt_drop_env), so the store below upserts
+     * onto a clean identity. A destroy that answers NOENT — the environment
+     * died long ago and only its record outlived it — is exactly as good. */
+    const struct EnvCkptRecord* live = env_ckpt_find(partition_id, index);
+    if (live && !env_ckpt_restore_pending_record(partition_id, index)) {
+        uint16_t d_status = 0; uint32_t d_id = 0, d_part = 0;
+        (void)env_service_destroy(live->env_id, partition_id, &d_status, &d_id, &d_part);
+        kernel_serial_printf(
+            "[ENV_MIGRATE] restore (partition %u, index %u): an environment of this "
+            "identity already lived here (env %u) -- the source-teardown half has not "
+            "landed, so the stale instance is ended and the staged one rebuilt.\n",
+            (unsigned)partition_id, (unsigned)index, (unsigned)live->env_id);
+    }
+
+    /* 3a. The staged descriptor enters the live table the same way the boot
+     * replay's adopted records did — validated all-or-nothing by the record
+     * layer — so the create below refreshes it rather than inventing it, and
+     * the periodic checkpoint flush persists it as this node's own record. */
+    int rec_rc = env_ckpt_record(&staged);
+    if (rec_rc != 0)
+        return env_migrate_refuse(ENV_MIGRATE_REFUSE_RECORD, (uint32_t)rec_rc, index);
+
+    /* 3b. The pause dance, exactly the boot pass's: E4's placement gate
+     * refuses a paused target, so a partition the record recorded as paused
+     * is resumed for the length of the create and put back afterwards by the
+     * ledger. From the first resume to the repause the body is straight-line
+     * with NO `return` — a bail between them would leave a partition the
+     * record said was frozen RUNNING. */
+    int resumed = env_ckpt_restore_resume_for_create(partition_id);
+    if (resumed < 0) {
+        env_ckpt_drop(partition_id, index);   /* nothing half-applied */
+        return env_migrate_refuse(ENV_MIGRATE_REFUSE_NOT_OWNER, 1, index);
+    }
+
+    uint16_t status = ENV_ERR_INVAL;
+    uint32_t new_id = 0;
+    int rc = env_service_create(partition_id, index, &status, &new_id);
+    if (rc != 0 || status != ENV_OK) {
+        env_ckpt_restore_refuse(partition_id, index, ENV_CKPT_REFUSE_CREATE,
+                                index, (rc != 0) ? 0u : (uint32_t)status);
+        env_ckpt_drop(partition_id, index);
+        (void)env_ckpt_restore_repause();
+        return env_migrate_refuse(ENV_MIGRATE_REFUSE_CREATE, index,
+                                  (rc != 0) ? 0u : (uint32_t)status);
+    }
+
+    if (!env_ckpt_restore_same_identity(&staged, env_ckpt_find(partition_id, index))) {
+        /* Refusal over partial application, applied to the replay: the create
+         * made SOMETHING and it is not what crossed, so it is ended rather
+         * than left running as a half-restore nobody could account for. The
+         * state is exactly pre-attempt afterwards (the destroy drops the
+         * record), so the slot stays and the sweep may retry. */
+        env_ckpt_restore_refuse(partition_id, index, ENV_CKPT_REFUSE_IDENTITY,
+                                index, new_id);
+        uint16_t d_status = 0; uint32_t d_id = 0, d_part = 0;
+        (void)env_service_destroy(new_id, partition_id, &d_status, &d_id, &d_part);
+        (void)env_ckpt_restore_repause();
+        return env_migrate_refuse(ENV_MIGRATE_REFUSE_IDENTITY, index, new_id);
+    }
+
+    /* The record is live here now — this boot owes it no replay (it was never
+     * armed; settle keeps the pending invariant explicit rather than relying
+     * on a never-armed record reading as settled). */
+    env_ckpt_restore_settle(partition_id, index);
+
+    /* 4a. Parked, or the pour may not touch a byte: the sidecars must have
+     * run to their idle point — the only posture whose memory the staged
+     * bytes describe. A yield is legal HERE, inside the resume/repause
+     * interval, exactly as in the boot pass. */
+    int parked = env_payload_wait_parked(&staged);
+
+    /* The ledger goes back before the pour, the boot pass's order: from the
+     * repause on, NOTHING yields. */
+    (void)env_ckpt_restore_repause();
+
+    if (!parked) {
+        /* The environment stands as the empty replay it already is — the boot
+         * pass's own answer to a pour that cannot run. The staged bytes are
+         * dropped with the slot: holding partition-charged frames forever for
+         * a posture that will not come back is the worse failure, and the
+         * refusal above names why the contents did not come back. */
+        env_migrate_recv_drop(partition_id, index);
+        return env_migrate_refuse(ENV_MIGRATE_REFUSE_PARKED, index, 0);
+    }
+
+    /* 4b. The pour, validated WHOLE before a byte: every staged region must
+     * land at the base the staged record names. The sidecars' MEM regions are
+     * identity-mapped and their heaps hold RAW POINTERS into them — exactly
+     * env_payload.h's placement rule — so a fresh environment that landed
+     * anywhere else cannot receive these bytes without every interior
+     * pointer dangling, silently. The durable extents must agree for the same
+     * reason: the pages crossed for an LBA this node must have allocated. */
+    const struct EnvCkptRecord* fresh = env_ckpt_find(partition_id, index);
+    uint32_t refuse_code = 0, refuse_a = 0;
+    for (uint32_t r = 0; r < staged.n_regions && r < ENV_CKPT_MAX_REGIONS; r++) {
+        const struct EnvCkptRegion* fr = 0;
+        for (uint32_t k = 0; fresh && k < fresh->n_regions && k < ENV_CKPT_MAX_REGIONS; k++)
+            if (fresh->regions[k].kind == staged.regions[r].kind) { fr = &fresh->regions[k]; break; }
+        if (!fr || fr->frames != staged.regions[r].frames || fr->base != staged.regions[r].base) {
+            refuse_code = ENV_MIGRATE_REFUSE_PLACEMENT;
+            refuse_a    = staged.regions[r].kind;
+            /* Name both halves: the status says WHICH rule fired but not
+             * the delta, and on a live cluster the delta is the whole
+             * diagnosis (a payload-length shift is the staging watermark;
+             * anything else is a different divergence between the nodes'
+             * allocation histories). */
+            kernel_serial_printf(
+                "[ENV_MIGRATE] restore (partition %u, index %u): region kind %u: "
+                "staged base 0x%llx frames %u, fresh base 0x%llx frames %u%s\n",
+                (unsigned)partition_id, (unsigned)index,
+                (unsigned)staged.regions[r].kind,
+                (unsigned long long)staged.regions[r].base,
+                (unsigned)staged.regions[r].frames,
+                (unsigned long long)(fr ? fr->base : 0ull),
+                (unsigned)(fr ? fr->frames : 0u),
+                fr ? "" : " (no fresh region of this kind)");
+            break;
+        }
+    }
+    if (!refuse_code && staged.state_sectors != 0 &&
+        (!fresh || fresh->state_lba != staged.state_lba ||
+         fresh->state_sectors != staged.state_sectors)) {
+        refuse_code = ENV_MIGRATE_REFUSE_EXTENT;
+        refuse_a    = (uint32_t)staged.state_sectors;
+    }
+    if (!refuse_code) {
+        /* Defensive: a complete slot has a frame behind every page (recv_page
+         * counts a page whole only once its frame holds all four fragments),
+         * so this is unreachable — checked anyway because the alternative to
+         * a named refusal mid-pour is a half-poured environment. */
+        for (uint32_t p = 0; p < staged_total_pages; p++) {
+            if (!env_migrate_recv_page_ptr(partition_id, index, p)) {
+                refuse_code = ENV_MIGRATE_REFUSE_INCOMPLETE;
+                refuse_a    = p;
+                break;
+            }
+        }
+    }
+    if (refuse_code) {
+        env_migrate_recv_drop(partition_id, index);
+        kernel_serial_printf(
+            "[ENV_MIGRATE] restore (partition %u, index %u): %s (a=%u) -- the "
+            "environment stands as the empty replay; the staged bytes can never be "
+            "applied here and the slot is dropped.\n",
+            (unsigned)partition_id, (unsigned)index,
+            env_migrate_status_name((int)refuse_code), (unsigned)refuse_a);
+        return env_migrate_refuse((int)refuse_code, refuse_a, index);
+    }
+
+    /* 4c. The partition goes back to the state the record recorded: a
+     * successful migration always leaves its partition PAUSED, because resume
+     * happens over here — by an operator, after the bytes have landed. The
+     * record carried ENV_CKPT_FLAG_PARTITION_PAUSED across the wire for
+     * exactly this (env_ckpt.h's partition-quiesce contract). */
+    if (staged.flags & ENV_CKPT_FLAG_PARTITION_PAUSED) {
+        (void)partition_pause(partition_id);
+        kernel_serial_printf(
+            "[ENV_MIGRATE] restore (partition %u, index %u): the record recorded this "
+            "partition as paused -- left paused; resume is an operator's call, after "
+            "the bytes have landed.\n",
+            (unsigned)partition_id, (unsigned)index);
+    }
+
+    /* 5. The pour. Straight-line, NO yield from here to the drop (env_payload.h's
+     * rule: Ring-3 runs only while the control plane yields, so nothing can
+     * execute over the memory being poured). Page numbering is the sender's
+     * own: every region's frames in record order, then the durable extent's
+     * pages — both sides derive it from the SAME record that crossed. */
+    uint32_t cursor = 0;
+    for (uint32_t r = 0; r < staged.n_regions && r < ENV_CKPT_MAX_REGIONS; r++) {
+        const struct EnvCkptRegion* fr = 0;
+        for (uint32_t k = 0; k < fresh->n_regions && k < ENV_CKPT_MAX_REGIONS; k++)
+            if (fresh->regions[k].kind == staged.regions[r].kind) { fr = &fresh->regions[k]; break; }
+        for (uint32_t f = 0; f < staged.regions[r].frames; f++) {
+            const uint8_t* src = env_migrate_recv_page_ptr(partition_id, index, cursor++);
+            uint8_t* dst = (uint8_t*)(fr->base + (uint64_t)f * 4096u);
+            for (uint32_t b = 0; b < 4096; b++) dst[b] = src[b];
+        }
+    }
+    uint32_t extent_pages = (staged.state_sectors + ENV_MIGRATE_SECTORS_PER_PAGE - 1)
+                            / ENV_MIGRATE_SECTORS_PER_PAGE;
+    for (uint32_t e = 0; e < extent_pages; e++) {
+        const uint8_t* src = env_migrate_recv_page_ptr(partition_id, index, cursor++);
+        if (nvme_write_sync(staged.state_lba +
+                            (uint64_t)e * ENV_MIGRATE_SECTORS_PER_PAGE, src) != 0) {
+            /* The environment exists and its memory holds the contents; the
+             * durable half could not be written down. Named, and the slot is
+             * dropped (not retried): a retry would re-run the CREATE — which
+             * now collides with the environment that succeeded — for an IO
+             * whose failure mode nothing here can change. */
+            kernel_serial_printf(
+                "[ENV_MIGRATE] restore (partition %u, index %u): NVMe write of extent "
+                "page %u of %u FAILED -- the environment is live with its contents in "
+                "memory, but its durable extent did not come back; the slot is dropped.\n",
+                (unsigned)partition_id, (unsigned)index,
+                (unsigned)e, (unsigned)extent_pages);
+            env_migrate_recv_drop(partition_id, index);
+            return env_migrate_refuse(ENV_MIGRATE_REFUSE_EXTENT, 1, index);
+        }
+    }
+
+    env_migrate_recv_drop(partition_id, index);
+    /* P3 increment 5: mark the restored identity BEFORE it can be asked
+     * about — from here this node may say "live with its contents" on the
+     * wire. Set only on this path: every refusal above left the record
+     * standing as an empty replay, and an empty replay must never confirm
+     * a source into destroying its complete copy. */
+    env_migrate_restored_mark(partition_id, index);
+    kernel_serial_printf(
+        "[ENV_MIGRATE] restore: env (partition %u, index %u) is LIVE on node %u as "
+        "env %u -- %u region page(s) and %u extent page(s) poured from the staged "
+        "slot, which is dropped.\n",
+        (unsigned)partition_id, (unsigned)index,
+        (unsigned)cluster_local_node_id(), (unsigned)new_id,
+        (unsigned)cursor, (unsigned)extent_pages);
+    return ENV_MIGRATE_OK;
+}
+
+/* ─── P3 increment 5: the confirmation machinery ─────────────────────────────
+ * Two runtime tables and the walk between them, closing the boundary
+ * increments 3 and 4 named: a successful migration used to leave the
+ * environment on BOTH nodes' books while its bytes lived on one. Now the
+ * source's records, sidecars and frames survive exactly until the
+ * destination has said — in its own words, on its own state — that the
+ * environment is live with its contents there.
+ *
+ * Neither table is persisted: both are lifecycle state of this boot's
+ * staging table, exactly like the slots themselves, and env_migrate_reset()
+ * clears both with it. Both are bounded; the bounds are chosen so that
+ * every overflow degrades in the CONSERVATIVE direction — records that
+ * describe an environment that moved (countable, nameable, an operator's to
+ * finish) — never in the direction of a teardown without the destination's
+ * word. */
+
+/* The destination's own knowledge that it restored (p, i) WITH ITS
+ * CONTENTS: set by the pour's success tail, nothing else. */
+#define ENV_MIGRATE_RESTORED_MAX 16u
+struct EnvMigrateRestored {
+    uint32_t partition_id;
+    uint32_t index;
+};
+static struct EnvMigrateRestored env_migrate_restored_table[ENV_MIGRATE_RESTORED_MAX];
+static uint32_t env_migrate_restored_count = 0;
+static uint32_t env_migrate_restored_next  = 0;   /* round-robin when full */
+
+static void env_migrate_restored_mark(uint32_t partition_id, uint32_t index) {
+    /* Idempotent: a re-restore of the same identity refreshes nothing and
+     * evicts nothing. */
+    for (uint32_t i = 0; i < env_migrate_restored_count; i++)
+        if (env_migrate_restored_table[i].partition_id == partition_id &&
+            env_migrate_restored_table[i].index == index) return;
+    uint32_t slot = env_migrate_restored_count < ENV_MIGRATE_RESTORED_MAX
+                        ? env_migrate_restored_count++
+                        : env_migrate_restored_next++ % ENV_MIGRATE_RESTORED_MAX;
+    env_migrate_restored_table[slot].partition_id = partition_id;
+    env_migrate_restored_table[slot].index        = index;
+}
+
+static int env_migrate_restored_here(uint32_t partition_id, uint32_t index) {
+    for (uint32_t i = 0; i < env_migrate_restored_count; i++)
+        if (env_migrate_restored_table[i].partition_id == partition_id &&
+            env_migrate_restored_table[i].index == index) return 1;
+    return 0;
+}
+
+/* The source's pending teardowns: armed by env_migrate_partition() after
+ * every payload confirmed, walked by the sweep below. One entry per
+ * environment — a teardown is per-name, and confirming a whole partition
+ * because one of its environments landed would be the same over-reach this
+ * increment exists to remove. */
+#define ENV_MIGRATE_CONFIRM_MAX        16u
+#define ENV_MIGRATE_CONFIRM_MAX_TRIES  60u  /* ~10 min of polls at the sweep's
+                                             * period, then stop asking */
+#define ENV_MIGRATE_TEARDOWN_MAX_TRIES 5u   /* bounded destroys, then stop */
+struct EnvMigrateConfirm {
+    uint8_t  active;
+    uint8_t  confirmed;      /* the destination answered "live with contents" */
+    uint8_t  destroy_tries;  /* teardown attempts since the confirmation */
+    uint8_t  stop_logged;    /* the bounded-stop final line has been printed */
+    uint16_t tries;          /* LIVE polls spent */
+    uint32_t partition_id;
+    uint32_t index;
+    uint32_t dest_node;
+};
+static struct EnvMigrateConfirm env_migrate_confirm[ENV_MIGRATE_CONFIRM_MAX];
+
+uint32_t env_migrate_pending_count(void) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < ENV_MIGRATE_CONFIRM_MAX; i++)
+        if (env_migrate_confirm[i].active) n++;
+    return n;
+}
+
+/* The failover deferral gate — see env_migrate.h for why a
+ * migration-produced silence is not a death and how each grace below is
+ * bounded (slot age, post-drop tail, the confirmation walk's tries cap), so
+ * a migration that genuinely wedges re-arms death detection instead of
+ * disabling it. */
+int env_migrate_in_flight(void) {
+    for (int i = 0; i < ENV_MIGRATE_STAGING_MAX; i++) {
+        const struct EnvMigrateSlot* s = &env_migrate_staging[i];
+        if (!s->active) continue;
+        if (kernel_tick_counter - s->opened_tick < ENV_MIGRATE_SLOT_GRACE_TICKS)
+            return 1;
+    }
+    if (env_migrate_resolved_tick != 0 &&
+        kernel_tick_counter - env_migrate_resolved_tick <
+            ENV_MIGRATE_RESOLVED_GRACE_TICKS)
+        return 1;
+    /* The intent face: the local gate covers the blocking PHASE itself (the
+     * create RPC wait and the synchronous send), which runs before any slot
+     * exists on the destination and before any confirmation is armed — the
+     * window in which this node's own declarations were previously
+     * undeferred. */
+    if (env_migrate_intent_tick != 0 &&
+        kernel_tick_counter - env_migrate_intent_tick <
+            ENV_MIGRATE_INTENT_GRACE_TICKS)
+        return 1;
+    if (env_migrate_pending_count() > 0) return 1;
+    return 0;
+}
+
+/* ─── Migration intent (the idle-observer arm) ──────────────────────────
+ * The local stamp and the cluster announce, in that order: the announce
+ * must be on the wire before the caller blocks, because the block itself
+ * stops this node's only liveness traffic (the leader's heartbeat, from
+ * this same sweep). A second begin inside the budget refreshes the stamp
+ * and re-announces — cheap, and it lets back-to-back operator actions
+ * (create, then migrate) each extend every peer's latch. */
+void env_migrate_intent_begin(void) {
+    env_migrate_intent_tick = kernel_tick_counter;
+    dspp_env_migrate_send_intent((uint32_t)ENV_MIGRATE_INTENT_GRACE_TICKS);
+}
+
+void env_migrate_intent_end(void) {
+    /* The blocking phase resolved (success OR refusal): release this node's
+     * own gate and ask every peer to drop its latch NOW rather than at the
+     * budget's end. The announce is one-shot and the budget was sized for
+     * the whole phase, so an unreleased intent leaves a blind spot exactly
+     * as long as the leftover budget — found live: an operator (or a guard)
+     * creating an environment and then killing the node could not be
+     * declared DEAD for a full 300 s, and the adoption guard's 240 s wait
+     * lost to it. The release rides the SAME broadcast (budget 0 = revoke,
+     * the only meaning 0 can have on this wire — recv_intent clamps every
+     * nonzero budget, so 0 was previously unrepresentable). A RELEASED
+     * frame is droppable: the budget still bounds the latch on its own;
+     * the release only makes death detection prompt in the common case.
+     * Gated on the local stamp so a sweep period with no begin transmits
+     * nothing — the restore loop below calls this after EVERY attempt. */
+    if (env_migrate_intent_tick == 0) return;
+    env_migrate_intent_tick = 0;
+    dspp_env_migrate_send_intent(0);
+}
+
+void env_migrate_recv_intent(uint32_t node_id, uint32_t budget_ticks) {
+    if (node_id == 0 || node_id == cluster_local_node_id()) return;
+    if (budget_ticks == 0) {
+        /* The announce's own release: the peer's blocking phase is over and
+         * its silence is a death again on the normal terms. Deactivate the
+         * latch if one stands; a release for a node this table never latched
+         * is a no-op, not an error (the frame may have been reordered ahead
+         * of the announce it cancels — begin/end pairs are retransmit-free
+         * one-shots — and the worst case is the budget's own bound). */
+        for (int i = 0; i < ENV_MIGRATE_INTENT_PEERS_MAX; i++) {
+            struct EnvMigratePeerIntent* e = &env_migrate_peer_intent[i];
+            if (!e->active || e->node_id != node_id) continue;
+            e->active = 0;
+            kernel_serial_printf(
+                "[ENV_MIGRATE] node %u released its environment-migration intent "
+                "-- its silence is a death again on the normal terms.\n",
+                (unsigned)node_id);
+            return;
+        }
+        return;
+    }
+    if (budget_ticks > ENV_MIGRATE_INTENT_GRACE_TICKS)
+        budget_ticks = (uint32_t)ENV_MIGRATE_INTENT_GRACE_TICKS;
+    if (budget_ticks > ENV_MIGRATE_INTENT_GRACE_TICKS)
+        budget_ticks = (uint32_t)ENV_MIGRATE_INTENT_GRACE_TICKS;
+
+    struct EnvMigratePeerIntent* e = 0;
+    for (int i = 0; i < ENV_MIGRATE_INTENT_PEERS_MAX; i++) {
+        if (env_migrate_peer_intent[i].active &&
+            env_migrate_peer_intent[i].node_id == node_id) {
+            e = &env_migrate_peer_intent[i];
+            break;
+        }
+        if (!e && !env_migrate_peer_intent[i].active)
+            e = &env_migrate_peer_intent[i];
+    }
+    if (!e) {
+        /* Table full: the oldest budget expires soonest on its own; a
+         * refusal here must stay countable rather than silent. */
+        kernel_serial_printf(
+            "[ENV_MIGRATE] node %u announced intent but the peer-intent table "
+            "is full (%u) -- its announce is NOT latched; its own death "
+            "detection is unaffected, only this node's deferral about it.\n",
+            (unsigned)node_id, (unsigned)ENV_MIGRATE_INTENT_PEERS_MAX);
+        return;
+    }
+    if (!e->active) {
+        e->node_id = node_id;
+        e->active  = 1;
+        kernel_serial_printf(
+            "[ENV_MIGRATE] node %u announced environment-migration intent "
+            "(budget %u s) -- its silence is not a death until then.\n",
+            (unsigned)node_id, (unsigned)(budget_ticks / 100u));
+    }
+    e->until_tick = kernel_tick_counter + budget_ticks;
+}
+
+int env_migrate_peer_in_flight(uint32_t node_id) {
+    for (int i = 0; i < ENV_MIGRATE_INTENT_PEERS_MAX; i++) {
+        const struct EnvMigratePeerIntent* e = &env_migrate_peer_intent[i];
+        if (!e->active || e->node_id != node_id) continue;
+        if (kernel_tick_counter < e->until_tick) return 1;
+        return 0;
+    }
+    return 0;
+}
+
+static struct EnvMigrateConfirm*
+env_migrate_confirm_find(uint32_t partition_id, uint32_t index) {
+    for (uint32_t i = 0; i < ENV_MIGRATE_CONFIRM_MAX; i++) {
+        struct EnvMigrateConfirm* c = &env_migrate_confirm[i];
+        if (c->active && c->partition_id == partition_id && c->index == index)
+            return c;
+    }
+    return 0;
+}
+
+/* Arm one entry per environment of the partition just sent. Called at the
+ * very end of a fully-confirmed env_migrate_partition(), before the caller
+ * hands ownership over: the entries only ever fire for a partition THIS
+ * node no longer owns, so an aborted handoff leaves them inert (and the
+ * sweep disarms them by name when it notices ownership is local). A table
+ * too full to arm leaves that environment's records exactly where they
+ * are — the conservative direction, printed rather than silently leaked. */
+static void env_migrate_arm_confirms(uint32_t partition_id, uint32_t dest_node_id) {
+    for (uint32_t i = 0; i < env_ckpt_count; i++) {
+        if (env_ckpt_table[i].partition_id != partition_id) continue;
+        uint32_t idx = env_ckpt_table[i].index;
+        /* Already armed (a retry of the same migration): keep the existing
+         * entry — its poll age and confirmation are still valid. */
+        if (env_migrate_confirm_find(partition_id, idx)) continue;
+        struct EnvMigrateConfirm* c = 0;
+        for (uint32_t k = 0; k < ENV_MIGRATE_CONFIRM_MAX; k++)
+            if (!env_migrate_confirm[k].active) {
+                c = &env_migrate_confirm[k];
+                break;
+            }
+        if (!c) {
+            kernel_serial_printf(
+                "[ENV_MIGRATE] partition %u, index %u: the confirmation table is full "
+                "(%u teardowns still pending) -- this teardown is NOT armed, so its "
+                "records stay: records that describe a moved environment (countable "
+                "through env_migrate_pending_count()), never a teardown without the "
+                "destination's word. Finish it by destroying env by name once the "
+                "destination's copy is confirmed.\n",
+                (unsigned)partition_id, (unsigned)idx,
+                (unsigned)ENV_MIGRATE_CONFIRM_MAX);
+            continue;
+        }
+        c->active        = 1;
+        c->confirmed     = 0;
+        c->tries         = 0;
+        c->destroy_tries = 0;
+        c->stop_logged   = 0;
+        c->partition_id  = partition_id;
+        c->index         = idx;
+        c->dest_node     = dest_node_id;
+    }
+}
+
+static void env_migrate_confirm_disarm(struct EnvMigrateConfirm* c) {
+    /* Every caller is a terminal walk end — confirmed and torn down, the
+     * partition gone, ownership back, or the bounded give-up. The walk was
+     * this node's in-flight migration work, and its counterparty's sweep
+     * may just have been blocked behind the same restore and only now be
+     * resuming heartbeats: start the resolved tail so that silence is not
+     * declared a death (live 2026-10-13: the source declared the live
+     * destination DEAD a beat after its own teardown completed). */
+    env_migrate_resolved_tick = kernel_tick_counter;
+    c->active        = 0;
+    c->confirmed     = 0;
+    c->tries         = 0;
+    c->destroy_tries = 0;
+    c->stop_logged   = 0;
+}
+
+/* Any entry of this partition still armed? The deferred reclamation waits
+ * for the LAST one. */
+static int env_migrate_confirm_partition_busy(uint32_t partition_id) {
+    for (uint32_t i = 0; i < ENV_MIGRATE_CONFIRM_MAX; i++)
+        if (env_migrate_confirm[i].active &&
+            env_migrate_confirm[i].partition_id == partition_id) return 1;
+    return 0;
+}
+
+/* Any RECORDS of this partition still on this node's books? The deferred
+ * reclamation also waits for this: an environment whose teardown was never
+ * armed (the table-full case) or never succeeded keeps its record, and
+ * reclaiming its frames under it would be exactly the double-ownership
+ * defect this increment exists to remove. */
+static int env_migrate_partition_records_remain(uint32_t partition_id) {
+    for (uint32_t i = 0; i < env_ckpt_count; i++)
+        if (env_ckpt_table[i].partition_id == partition_id) return 1;
+    return 0;
+}
+
+/* The destination's wire answer (see env_migrate.h): 0 ("live with
+ * contents") only when this node owns the partition, the record is here,
+ * and the pour's success tail marked it restored. A staged-but-not-restored
+ * slot answers 1 — staged is not restored, and confirming from staged bytes
+ * would have the source destroy the only complete copy. */
+int env_migrate_live_query(uint32_t partition_id, uint32_t index) {
+    if (partition_get_owner_node(partition_id) != cluster_local_node_id()) return 1;
+    if (!env_migrate_restored_here(partition_id, index)) return 1;
+    const struct EnvCkptRecord* rec = env_ckpt_find(partition_id, index);
+    if (!rec) return 1;   /* the instance is gone here */
+    if (env_ckpt_restore_pending_record(partition_id, index)) return 1;
+    return 0;
+}
+
+/* The source's receipt of that answer, recorded against the pending entry
+ * by identity. A stale answer (no entry) is dropped by name; a nonzero
+ * status is "not yet", not an error — the next period asks again. */
+int env_migrate_live_ack(uint32_t partition_id, uint32_t index, uint32_t status) {
+    struct EnvMigrateConfirm* c = env_migrate_confirm_find(partition_id, index);
+    if (!c) return 1;
+    if (status == 0) c->confirmed = 1;
+    return 0;
+}
+
+/* Test/phase-boundary reset — defined after the machinery it clears (the
+ * increment-5 tables above) and clearing both halves of the module's state:
+ * staging AND confirmations. A reset that left a pending confirmation would
+ * let the next walk tear down an environment nothing ever sent — precisely
+ * the defect this increment closes. */
+void env_migrate_reset(void) {
+    for (int i = 0; i < ENV_MIGRATE_STAGING_MAX; i++) {
+        struct EnvMigrateSlot* s = &env_migrate_staging[i];
+        if (s->active) env_migrate_recv_drop(s->partition_id, s->index);
+    }
+    for (uint32_t i = 0; i < ENV_MIGRATE_CONFIRM_MAX; i++) {
+        struct EnvMigrateConfirm* c = &env_migrate_confirm[i];
+        c->active = 0; c->confirmed = 0; c->tries = 0;
+        c->destroy_tries = 0; c->stop_logged = 0;
+    }
+    env_migrate_restored_count = 0;
+    env_migrate_restored_next  = 0;
+    env_migrate_resolved_tick = 0;    /* a phase boundary is not a migration */
+    env_migrate_intent_tick    = 0;
+    for (int i = 0; i < ENV_MIGRATE_INTENT_PEERS_MAX; i++)
+        env_migrate_peer_intent[i].active = 0;
+}
+
+/* ─── The sweep's driver ────────────────────────────────────────────────────
+ * Staged bytes do not restore themselves: the wire fills the slot, and this
+ * walk turns every COMPLETE slot whose partition this node owns into a live
+ * environment — on the sweep, the same context partition_reannounce_tick()
+ * and failover_tick() do their periodic work from, because the create round
+ * trip yields to init and the NVMe writes belong on the BSP.
+ *
+ * Two bounds, both deliberate: a PERIOD (the reannounce period — restoring
+ * on every sweep would retry a failing create at sweep rate, and a sweep is
+ * load-dependent and unbounded), and an ATTEMPTS cap per slot (a create that
+ * can never succeed — a manager that never comes up, an environment this
+ * node cannot build — stops logging after ENV_MIGRATE_RESTORE_MAX_TRIES,
+ * with one final line naming the slot; the bytes stay countable through
+ * env_migrate_staging_count() rather than leaking silently). */
+#define ENV_MIGRATE_RESTORE_PERIOD_TICKS 1000ull   /* ~10 s at CONSENSUS_TICK_HZ */
+#define ENV_MIGRATE_RESTORE_MAX_TRIES   5u
+
+uint32_t env_migrate_tick(uint64_t now) {
+    static uint64_t last_attempt = 0;
+    if (now < last_attempt + ENV_MIGRATE_RESTORE_PERIOD_TICKS) return 0;
+    last_attempt = now;
+
+    uint32_t restored = 0;
+    for (int i = 0; i < ENV_MIGRATE_STAGING_MAX; i++) {
+        struct EnvMigrateSlot* s = &env_migrate_staging[i];
+        if (!s->active || !s->complete) continue;   /* in flight: the sender is
+             * synchronous, so a complete slot is the only restorable input */
+
+        if (!partition_exists(s->partition_id)) {
+            /* The partition is gone: the bytes charge to a tenant that no
+             * longer exists and no restore may rebuild (every gate above
+             * would refuse by name). Dropped here so the frames go back with
+             * the partition they were charged to. An INCOMPLETE slot of a
+             * dead partition is deliberately NOT dropped: it may still be
+             * receiving; its teardown is the operator's env_migrate_recv_drop,
+             * named rather than guessed. */
+            kernel_serial_printf(
+                "[ENV_MIGRATE] slot (partition %u, index %u): the partition no longer "
+                "exists -- the staged slot is dropped, its frames returned.\n",
+                (unsigned)s->partition_id, (unsigned)s->index);
+            env_migrate_recv_drop(s->partition_id, s->index);
+            continue;
+        }
+        /* Not ours (yet): the ownership announce may be in flight. The slot
+         * waits — its bytes are the tenant's, and this node may well own the
+         * partition a moment later. */
+        if (partition_get_owner_node(s->partition_id) != cluster_local_node_id())
+            continue;
+        if (s->restore_tries >= ENV_MIGRATE_RESTORE_MAX_TRIES) continue;
+
+        s->restore_tries++;
+        /* The destination announces too (the idle-observer arm, second
+         * half): the restore below blocks THIS node's sweep — the create
+         * round trip, the parked-posture wait, the pour — and on the
+         * consensus leader that sweep carries the only heartbeat stream.
+         * The source's announce (partition_migrate) covered the send; this
+         * one covers the restore, so no third node — which holds no slot,
+         * confirm or intent of its own — declares THIS node dead and
+         * adopts the partition under the pour. Observed live on a 3-node
+         * run: the restoring destination was declared DEAD at 300 ticks by
+         * an idle observer, and escaped adoption only by the role luck of
+         * that observer not being leader. Sweep context, so the announce
+         * transmit is legal here. */
+        env_migrate_intent_begin();
+        int rc = env_migrate_restore(s->partition_id, s->index);
+        /* The restore returned — the phase it shielded is over. Release the
+         * gate and the peers' latches immediately; without this the announce
+         * leaves every observer blind for the rest of the 300 s budget after
+         * every single restore attempt (found live: a leader killed right
+         * after an env create was undeclarable DEAD for minutes — the
+         * adoption guard lost to exactly that). */
+        env_migrate_intent_end();
+        if (rc == ENV_MIGRATE_OK) {
+            restored++;
+        } else {
+            kernel_serial_printf(
+                "[ENV_MIGRATE] restore attempt %u of %u for (partition %u, index %u) "
+                "refused: %s (a=%u b=%u).\n",
+                (unsigned)s->restore_tries, (unsigned)ENV_MIGRATE_RESTORE_MAX_TRIES,
+                (unsigned)s->partition_id, (unsigned)s->index,
+                env_migrate_status_name(rc),
+                (unsigned)env_migrate_refusal.a, (unsigned)env_migrate_refusal.b);
+            if (s->active && s->restore_tries >= ENV_MIGRATE_RESTORE_MAX_TRIES)
+                kernel_serial_printf(
+                    "[ENV_MIGRATE] slot (partition %u, index %u): %u restore attempts "
+                    "spent -- the sweep stops trying. The bytes remain staged (countable "
+                    "through env_migrate_staging_count()); an operator/test may drop "
+                    "the slot, or fix what the last refusal named.\n",
+                    (unsigned)s->partition_id, (unsigned)s->index,
+                    (unsigned)s->restore_tries);
+        }
+    }
+
+    /* ─── P3 increment 5: the confirmation walk (the source's half) ───────
+     * Same period, same context as the restore loop above: the two halves
+     * are the two roles of one migration, and a node can be both in the
+     * same period (a partition migrated out while another arrives).
+     *
+     * Per entry, in order: the gates that say "these records are the truth
+     * again" disarm it; a not-yet-confirmed entry polls the destination
+     * (one LIVE_REQ per period, bounded, and a stop that stays countable);
+     * a CONFIRMED entry runs env_service_destroy() on this node's copy BY
+     * NAME — the destroy path's own bookkeeping drops the record, so no
+     * record here describes the environment anymore. When the partition's
+     * last entry completes and no records of it remain, the reclamation
+     * kernel/partition.c Step 5 deferred completes with it. */
+    for (uint32_t i = 0; i < ENV_MIGRATE_CONFIRM_MAX; i++) {
+        struct EnvMigrateConfirm* c = &env_migrate_confirm[i];
+        if (!c->active) continue;
+
+        if (!partition_exists(c->partition_id)) {
+            /* The partition is gone: its records and frames die with
+             * partition_destroy()'s own teardown, which reclaims for
+             * itself. The entry merely stops polling. */
+            kernel_serial_printf(
+                "[ENV_MIGRATE] teardown (partition %u, index %u): the partition no "
+                "longer exists -- the confirmation entry is dropped; its records and "
+                "frames went with the partition's own destroy.\n",
+                (unsigned)c->partition_id, (unsigned)c->index);
+            env_migrate_confirm_disarm(c);
+            continue;
+        }
+        if (partition_get_owner_node(c->partition_id) == cluster_local_node_id()) {
+            /* Ownership is local again: the migration aborted after arming,
+             * or the environment came back. Either way the records here are
+             * the truth again and must stay. */
+            kernel_serial_printf(
+                "[ENV_MIGRATE] teardown (partition %u, index %u): this node owns the "
+                "partition again -- what was armed describes a migration that did not "
+                "complete (or a return), and the local records stay.\n",
+                (unsigned)c->partition_id, (unsigned)c->index);
+            env_migrate_confirm_disarm(c);
+            continue;
+        }
+
+        if (!c->confirmed) {
+            if (c->tries >= ENV_MIGRATE_CONFIRM_MAX_TRIES) {
+                if (!c->stop_logged) {
+                    c->stop_logged = 1;
+                    kernel_serial_printf(
+                        "[ENV_MIGRATE] teardown (partition %u, index %u): %u "
+                        "confirmation polls of node %u spent -- the sweep stops "
+                        "asking. The records stay (countable through "
+                        "env_migrate_pending_count()): the destination never said the "
+                        "environment is live there, so nothing here may be destroyed.\n",
+                        (unsigned)c->partition_id, (unsigned)c->index,
+                        (unsigned)c->tries, (unsigned)c->dest_node);
+                }
+                continue;   /* countable and inert, never force-destroyed */
+            }
+            c->tries++;
+            if (c->tries == 1) {
+                kernel_serial_printf(
+                    "[ENV_MIGRATE] teardown (partition %u, index %u): asking node %u "
+                    "whether the environment is live there -- one poll per period, "
+                    "bounded; nothing is destroyed until the word comes back.\n",
+                    (unsigned)c->partition_id, (unsigned)c->index,
+                    (unsigned)c->dest_node);
+            }
+            dspp_env_migrate_send_live(((uint64_t)c->partition_id << 32) | c->index,
+                                       c->dest_node, c->partition_id, c->index);
+            continue;   /* the answer lands as a LIVE_ACK; teardown is next period */
+        }
+
+        /* Confirmed by the destination: tear THIS node's half down, by
+         * name. The environment id is captured first — the destroy may drop
+         * the record under us. */
+        const struct EnvCkptRecord* rec = env_ckpt_find(c->partition_id, c->index);
+        if (!rec) {
+            /* The record is already gone (an operator destroyed the
+             * environment by name in the meantime): the goal — no record
+             * describing an environment that moved — already holds. */
+            env_migrate_confirm_disarm(c);
+        } else if (c->destroy_tries >= ENV_MIGRATE_TEARDOWN_MAX_TRIES) {
+            if (!c->stop_logged) {
+                c->stop_logged = 1;
+                kernel_serial_printf(
+                    "[ENV_MIGRATE] teardown (partition %u, index %u): %u destroy "
+                    "attempts spent, none completed -- the sweep stops trying. The "
+                    "record stays (countable): the destination is confirmed, but this "
+                    "node's environment could not be ended; an operator may destroy env "
+                    "%u by name.\n",
+                    (unsigned)c->partition_id, (unsigned)c->index,
+                    (unsigned)c->destroy_tries, (unsigned)rec->env_id);
+            }
+        } else {
+            uint16_t d_status = ENV_ERR_INVAL;
+            uint32_t d_id = 0, d_part = 0;
+            uint32_t env_id = rec->env_id;
+            c->destroy_tries++;
+            int rc = env_service_destroy(env_id, c->partition_id,
+                                         &d_status, &d_id, &d_part);
+            if (rc == 0 && d_status == ENV_OK) {
+                /* The destroy path's own bookkeeping dropped the record
+                 * (env_service.c -> env_ckpt_drop_env), exactly like the
+                 * HTTP destroy route. */
+                kernel_serial_printf(
+                    "[ENV_MIGRATE] teardown (partition %u, index %u): node %u "
+                    "confirmed the restore, so env %u is ended here -- its record and "
+                    "sidecars are gone; no record on this node describes it.\n",
+                    (unsigned)c->partition_id, (unsigned)c->index,
+                    (unsigned)c->dest_node, (unsigned)env_id);
+                env_migrate_confirm_disarm(c);
+            } else if (rc == 0 && d_status == ENV_ERR_NOENT) {
+                /* The environment died long ago and only its record
+                 * outlived it — exactly as good: the record is dropped, the
+                 * goal holds. */
+                (void)env_ckpt_drop(c->partition_id, c->index);
+                kernel_serial_printf(
+                    "[ENV_MIGRATE] teardown (partition %u, index %u): env %u was "
+                    "already gone here (no such environment) -- the surviving record "
+                    "is dropped, so nothing describes it anymore.\n",
+                    (unsigned)c->partition_id, (unsigned)c->index,
+                    (unsigned)env_id);
+                env_migrate_confirm_disarm(c);
+            } else {
+                /* No channel, no reply, or a refusal: the environment's
+                 * fate is unknown, so the record stays and the attempts
+                 * above are bounded. */
+                kernel_serial_printf(
+                    "[ENV_MIGRATE] teardown (partition %u, index %u): destroy of env "
+                    "%u attempt %u of %u did not complete (rc=%d, status=%u) -- the "
+                    "record stays and the sweep retries on its period.\n",
+                    (unsigned)c->partition_id, (unsigned)c->index,
+                    (unsigned)env_id, (unsigned)c->destroy_tries,
+                    (unsigned)ENV_MIGRATE_TEARDOWN_MAX_TRIES, rc, (unsigned)d_status);
+            }
+        }
+
+        /* An entry that will never be active again, for a partition with no
+         * armed siblings and no records left, completes the reclamation
+         * kernel/partition.c Step 5 deferred. The records-remain gate means
+         * a never-armed sibling (the table-full case) keeps its frames with
+         * its record — half-reclaiming a partition whose environment still
+         * has records here is the double-ownership defect in miniature. */
+        if (!c->active &&
+            !env_migrate_confirm_partition_busy(c->partition_id) &&
+            !env_migrate_partition_records_remain(c->partition_id)) {
+            uint32_t frames = partition_reclaim_all_frames(c->partition_id);
+            kernel_serial_printf(
+                "[ENV_MIGRATE] teardown (partition %u): every environment is confirmed "
+                "gone from this node -- the deferred reclamation completes, %u frame(s) "
+                "returned. Nothing on this node describes the partition anymore.\n",
+                (unsigned)c->partition_id, (unsigned)frames);
+        }
+    }
+    return restored;
 }

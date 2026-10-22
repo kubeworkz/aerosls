@@ -331,10 +331,21 @@ void env_ckpt_release_capture(const struct EnvCkptQuiesce* q);
  *   - ENV_CKPT_FLAG_QUIESCED — so env_migrate_send()'s "is this a moving
  *     target?" gate answers yes, and so the record that crosses the wire is
  *     admissible on the destination (restore rule 2 refuses an unquiesced one);
- *   - ENV_CKPT_FLAG_PARTITION_PAUSED — so the destination's restore puts the
- *     partition back frozen, which is where a successful migration always
- *     leaves it (partition_migrate() resumes nothing; resume happens over
- *     there).
+ *   - ENV_CKPT_FLAG_PARTITION_PAUSED — ONLY when the pause the caller holds
+ *     was the OPERATOR's (an administrative state that predates the
+ *     migration), so the destination's restore brings that intent back too.
+ *     The flag's own definition (ENV_CKPT_FLAG_PARTITION_PAUSED, above) is
+ *     "an operator's intent, not something the capture did" — and in the
+ *     migration the pause IS something the migration did: partition_migrate()
+ *     pauses for the duration of the move and resumes at the end, on the
+ *     source. Marking the migration's own freeze as an operator's pause made
+ *     every destination honor a pause nobody took: the restored environment
+ *     was LIVE by the records and dead to the scheduler — its sidecars never
+ *     scheduled again, its console accepted input that nobody would ever
+ *     read. Found by P3 increment 10's LIVE console arm on a real 2-node
+ *     cluster (2026-10-14), not by any host test — which is why the caller
+ *     now TELLS this function which kind of pause it holds rather than this
+ *     function guessing (it cannot: partition_is_paused() is 1 either way).
  *
  * The freeze REFUSES rather than guesses: PARTITION_SYSTEM is never frozen
  * (rule 2), and a partition the caller does not already hold paused is
@@ -357,12 +368,23 @@ struct EnvCkptPartitionQuiesce {
     uint8_t  prior_flags[ENV_CKPT_MAX];
 };
 
-/* Freeze every record of ONE partition (see above). Returns the number of
- * records marked, or 0 — refused — and 0 is also the honest answer for a
- * partition that holds no environments, which is why the caller compares it
- * against its own count of the partition's records rather than against 0. */
+/* Freeze every record of ONE partition (see above). `operator_paused` is the
+ * caller's own knowledge — the ONE thing this function cannot derive, since
+ * partition_is_paused() reads 1 whether the operator paused the partition or
+ * partition_migrate() paused it for the move. Nonzero marks the records
+ * QUIESCED | PARTITION_PAUSED (the operator's intent travels to the
+ * destination); zero marks QUIESCED only (the migration's own freeze is
+ * released on the source and is not the destination's business — a record
+ * carrying it anyway would leave the restored partition frozen and its
+ * environment dead to the scheduler, the live-found defect above).
+ *
+ * Returns the number of records marked, or 0 — refused — and 0 is also the
+ * honest answer for a partition that holds no environments, which is why the
+ * caller compares it against its own count of the partition's records rather
+ * than against 0. */
 uint32_t env_ckpt_quiesce_partition(uint32_t partition_id,
-                                    struct EnvCkptPartitionQuiesce* q);
+                                    struct EnvCkptPartitionQuiesce* q,
+                                    int operator_paused);
 
 /* Undo exactly that, on EVERY path out of the transfer — success and failure
  * alike — the same rule env_ckpt_release_capture() carries. Idempotent and
@@ -472,6 +494,31 @@ void env_ckpt_restore_refuse(uint32_t partition, uint32_t index,
  * refused so far (both counters are per-boot; restore_begin() resets them). */
 uint32_t env_ckpt_restore_pending(void);
 uint32_t env_ckpt_restore_refused(void);
+
+/* ── The failover restore half (P3 increment 11) ─────────────────────────────
+ * A survivor adopting a dead node's partitions restores their environments
+ * from ITS OWN durable records through the same driver a reboot uses
+ * (env_service_restore_pending()). The boot-shaped API cannot serve it:
+ * restore_begin() arms EVERY record, and re-arming every record on a live
+ * survivor would replay the survivor's own healthy environments as if they
+ * were dead ones. These two are the per-record seams that make the restore
+ * scoped, and the distinction it draws exact.
+ *
+ * Arm ONE record for replay, leaving the rest of the table's pending state
+ * untouched. Idempotent (already-pending stays pending; a settled or refused
+ * slot is cleared back to armed). Returns 1 when no such record exists:
+ * arming nothing is a refusal, not a silent success. */
+int env_ckpt_restore_arm(uint32_t partition_id, uint32_t index);
+
+/* 1 when THIS record was REFUSED by the replay rather than settled by it.
+ * Both outcomes leave the pending set (env_ckpt_restore_refuse() and
+ * env_ckpt_restore_settle() both clear the pending bit), so pending alone
+ * cannot tell a restored environment from a refused one — and a caller that
+ * read only pending would report a REFUSED record as restored. That is the
+ * exact lie the `refused-as-restored` tooth reproduces; this tracker is what
+ * makes it unreportable. Kept in step with the table like the pending set
+ * (drop() shifts it, restore_begin() clears it). */
+int env_ckpt_restore_refused_record(uint32_t partition_id, uint32_t index);
 
 /* 1 when this boot still owes (partition_id, index) its replay: the record is
  * on disk but the environment it describes does NOT exist here yet, because

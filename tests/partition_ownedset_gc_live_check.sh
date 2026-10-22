@@ -193,8 +193,64 @@ PY
 }
 
 # last_line <file> <pattern> -- the line number of the LAST match, or ''.
+# last_line FILE PHRASE -> the line number of the last match, or empty.
+#
+# Exact grep first; on a MISS the phrase is retried with ONE splice tolerated.
+# Why that is needed: the kernel holds its serial TX lock per message, but the
+# wait is bounded (SERIAL_TX_SPIN_LIMIT in kernel/kernel_io.c) and the loser
+# proceeds UNLOCKED -- so a concurrent writer can land between two fragments of
+# one message. The timer ISR's DSPP prints (net_poll_tick, called from
+# timer_irq_handler) do exactly that: this guard's own failing run saw
+# "[PERSIST] Partiti" + the ISR's whole line + "on ownership restored from
+# NVMe." for a boot line that WAS printed. An exact-substring miss there is a
+# false negative in the evidence, not a missing fact, and a guard that calls a
+# printed line absent is as wrong as one that calls a silent line present.
+#
+# The fallback joins the log's lines and accepts the phrase split at exactly
+# one point with at most 300 bytes of foreign text between the fragments, so
+# every word must still appear, in order, at nearly the original spacing --
+# the same assertion, not a looser one. The returned number is the PREFIX
+# fragment's line, which keeps the restore-before-collect ordering below true.
 last_line() {
-    grep -n "$2" "$1" 2>/dev/null | tail -n1 | cut -d: -f1
+    local file="$1" phrase="$2" hit
+    hit="$(grep -n -- "$phrase" "$file" 2>/dev/null | tail -n1 | cut -d: -f1)"
+    if [ -n "$hit" ]; then printf '%s\n' "$hit"; return 0; fi
+    awk -v ph="$phrase" '
+        { buf = buf $0 "\001" }
+        END {
+            n = length(ph); blen = length(buf)
+            for (i = 1; i < n; i++) {
+                pre = substr(ph, 1, i); suf = substr(ph, i + 1)
+                start = 1
+                while (start <= blen) {
+                    rel = index(substr(buf, start), pre)
+                    if (rel == 0) break
+                    p = start + rel - 1
+                    w = substr(buf, p + length(pre), 300)
+                    if (index(w, suf) > 0) {
+                        head = substr(buf, 1, p - 1)
+                        printf "%d\n", gsub(/\001/, "\001", head) + 1
+                        exit
+                    }
+                    start = p + 1
+                }
+            }
+        }' "$file" 2>/dev/null
+}
+
+# phrased_ev FILE PHRASE -- the evidence text for the PASS block: the exact
+# line when there is one, else the splice-matched fragment annotated as such,
+# so an interleaved boot line still shows up as what it is rather than as an
+# empty evidence row.
+phrased_ev() {
+    local file="$1" phrase="$2" hit txt
+    txt="$(grep -h -- "$phrase" "$file" 2>/dev/null | tail -1)"
+    if [ -n "$txt" ]; then printf '%s\n' "$txt"; return 0; fi
+    hit="$(last_line "$file" "$phrase")"
+    if [ -n "$hit" ]; then
+        printf '%s   [phrase matched across a spliced serial write; line %s]\n' \
+            "$(sed -n "${hit}p" "$file")" "$hit"
+    fi
 }
 
 # ─── 1. the cluster must exist ────────────────────────────────────────────
@@ -394,7 +450,14 @@ echo "==> waiting for the rebooted node to collect '$NAME' from the owned-set (u
 gc=0
 deadline=$(( $(date +%s) + WAIT_GC ))
 while :; do
-    restore_line="$(last_line "$F_LOG" "Partition ownership restored from NVMe")"
+    # CLOBBER-TOLERANT ANCHOR: this boot's restore line was observed spliced
+    # mid-line by a print that preempts the holder of the bounded serial TX
+    # lock ("... restored from NVM[DSPP-CKPT] RX: BEGIN ..." with the tail
+    # lines later, 2026-10-15 on the adoption guard's relaunch), so the full
+    # phrase never appears contiguously and an exact grep reads a real
+    # restore as an absent one -- the same false-RED class failover_adoption_
+    # live_check.sh hit. Only persist.c prints these words.
+    restore_line="$(last_line "$F_LOG" "Partition ownership restored")"
     collect_line="$(last_line "$F_LOG" "no longer owned -- collected from the owned-set")"
     still=""
     if get200 "$F_PORT" /api/partitions; then
@@ -426,12 +489,15 @@ if [ -z "$collect_line" ]; then
 fi
 if [ -z "$restore_line" ]; then
     fail "the row is gone and the owned-set collected it, but the boot never
-       restored it ('Partition ownership restored from NVMe' never appeared
-       in $F_LOG) -- the ghost was not durable, so this test proved nothing."
+       restored it ('Partition ownership restored' never appeared in $F_LOG
+       -- a clobber-tolerant anchor, so this is an absent line rather than a
+       spliced one) -- the ghost was not durable, so this test proved
+       nothing. The boot's persist lines:
+$(grep -h 'PERSIST]' "$F_LOG" 2>/dev/null | head -6 | sed 's/^/       /')"
 fi
 
-collect_ev="$(grep -h "no longer owned -- collected from the owned-set" "$F_LOG" 2>/dev/null | tail -1)"
-restore_ev="$(grep -h "Partition ownership restored from NVMe" "$F_LOG" 2>/dev/null | tail -1)"
+collect_ev="$(phrased_ev "$F_LOG" "no longer owned -- collected from the owned-set")"
+restore_ev="$(phrased_ev "$F_LOG" "Partition ownership restored")"
 echo
 echo "PASS  node $follower was DOWN for the destroy and still collected '$NAME' after"
 echo "      a reboot -- the ghost came back from disk and the owner's full owned-set"

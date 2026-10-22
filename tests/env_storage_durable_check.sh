@@ -27,7 +27,7 @@
 #   P1B_ARTIFACTS    where the recorded evidence lands (default a temp dir,
 #                    printed at the end so it can be --replay'd later)
 #   P1B_INDEX        the environment's index in its partition (default 2)
-#   P1B_TOOTH=ram-backed|unquotaed|format-v1-only|bad-format-version
+#   P1B_TOOTH=ram-backed|unquotaed|format-v1-only|bad-format-version|stale-region-base
 #                    source-level teeth (see the smoke): rejected by the boot
 #                    arm — the boot arm records what really happened — and
 #                    asserted by the source clauses and by --replay fixtures.
@@ -100,6 +100,15 @@
 #                                  refused by name. Expected: the source
 #                                  refusal clause (S8e) red — its zero-gate
 #                                  half specifically.
+#   P1B_TOOTH=stale-region-base   the directory load keeps a region_base
+#                                  restored from a PREVIOUS boot (the call
+#                                  after the array read deleted, or the
+#                                  clear inside it neutered) — the live
+#                                  env_migrate_confirm REFUSE_PARKED shape.
+#                                  Expected: S3h red for the missing call,
+#                                  S3i red for the nominal surrender, and
+#                                  S11 green under the call's removal (the
+#                                  seam is wiring, not a build dependency).
 #
 # ─── What this guard will NOT claim ────────────────────────────────────────
 # Byte-identity of the big file is a FINGERPRINT of three reads (wc -c,
@@ -259,6 +268,19 @@ source_clauses() {
         bad "S3f. the directory restore does not validate record size + version BEFORE reading into the live table — a foreign snapshot would land half-applied (refusal over partial application)"
     has "$PC" "directory REFUSED" || \
         bad "S3g. a refused directory has no named refusal line — the serial log would say nothing about why every store cold-started"
+    # The load's own seam: a region_base restored from a PREVIOUS boot is
+    # not this boot's placement (env_storage.h's "Keys" section) and must
+    # be surrendered at the read, or es_find_base()'s first match resolves
+    # the frame pool's fresh address to the stale entry — found live as a
+    # 12 241-line restore-denial loop ending in REFUSE_PARKED.
+    order_ok "$PC" "persist_read_array(env_storage_table," "env_storage_after_restore();" || \
+        bad "S3h. persist_restore_all never surrenders the restored region_base after reading the directory — a previous boot's address stays in the table, and this boot's frame pool re-hands it to the next attach, whose own server is then denied by the stale first match (the live env_migrate_confirm REFUSE_PARKED failure)"
+    has "$C" "void env_storage_after_restore(void)" || \
+        bad "S3i. env_storage.c no longer defines env_storage_after_restore() — the load seam does not exist, so the stale region_base shadow is back"
+    local ar_body
+    ar_body=$(body "$C" "void env_storage_after_restore(void)")
+    printf '%s' "$ar_body" | grep -qF "region_base = 0" || \
+        bad "S3i. env_storage_after_restore() does not clear region_base — the surrender is nominal and the first-match shadow survives"
 
     # ── S4. attach before spawn; release before free ───────────────────────
     order_ok "$E" "k.env_storage_attach(" "k.create_sidecar_in(&rd_manifest" || \
@@ -397,11 +419,19 @@ source_clauses() {
     # placement_can_hold() are all present, and cap_create_sidecar_host_test
     # exercises it. Added by that increment; this file's ceiling still said
     # 326, so the guard went red against correct code.
+    #
+    # 328 = E7 increment 2's Linux-personality spawn
+    # (SYS_SLS_LINUX_SPAWN): cap.h's define, cap.c's sys_sls_linux_spawn,
+    # and syscall_dispatch.c's case are all present (S10g-S10i assert the
+    # wiring, so this bump is not a decoration). Increment 2 landed 328
+    # and left this ceiling at 327 — this guard then went red against
+    # correct code for exactly the reason its own comment above names:
+    # the ceiling moves WITH the wiring, and here it moved late.
     local highest
     highest=$(grep -rhoE '#define SYS_SLS_[A-Z_]+ +[0-9]+' "$ROOT/kernel"/*.h "$ROOT/net"/*.h 2>/dev/null \
               | awk '{print $3}' | sort -n | tail -1)
-    [ "${highest:-0}" -eq 327 ] || \
-        bad "S10. the highest SYS_SLS_ number is ${highest:-none}, expected 327 (P1B's four: 323-326, plus P3 inc.1's 327) — a collision or an unwired define"
+    [ "${highest:-0}" -eq 328 ] || \
+        bad "S10. the highest SYS_SLS_ number is ${highest:-none}, expected 328 (P1B's four: 323-326, P3 inc.1's 327, E7 inc.2's 328) — a collision or an unwired define"
     has "$DISP" "case SYS_SLS_ENV_STORAGE_WRITE:" || \
         bad "S10b. syscall_dispatch has no SYS_SLS_ENV_STORAGE_WRITE case — the server's write-through would never reach the kernel"
     has "$CAP" "only PARTITION_SYSTEM creates environments" || \
@@ -412,6 +442,12 @@ source_clauses() {
         bad "S10e. kabi's syscall constants are missing P1B's (323-326) — the RealKernel shims would target the wrong numbers"
     has "$DISP" "case SYS_SLS_PLACEMENT_CAN_HOLD:" || \
         bad "S10f. syscall_dispatch has no SYS_SLS_PLACEMENT_CAN_HOLD case — the ceiling above was raised for a define the kernel never dispatches, i.e. the unwired-define drift S10 exists to catch"
+    has "$ROOT/kernel/cap.h" "#define SYS_SLS_LINUX_SPAWN 328" || \
+        bad "S10g. cap.h does not define SYS_SLS_LINUX_SPAWN as 328 — the ceiling above was raised for a number that is gone"
+    has "$DISP" "case SYS_SLS_LINUX_SPAWN:" || \
+        bad "S10h. syscall_dispatch has no SYS_SLS_LINUX_SPAWN case — 328 would fall into default and a Linux spawn would never be created (the ceiling's unwired-define drift)"
+    has "$ROOT/kernel/cap.c" "sys_sls_linux_spawn" || \
+        bad "S10i. cap.c no longer implements sys_sls_linux_spawn — the dispatcher case above would route to nothing"
 
     # ── S11. the real kernel module, executed here ─────────────────────────
     local HT="$ROOT/tests/env_storage_host_test.c"
@@ -719,7 +755,7 @@ fi
 # ─── The boot arm ──────────────────────────────────────────────────────────
 case "$TOOTH" in
     "") ;;
-    ram-backed|unquotaed|format-v1-only|bad-format-version)
+    ram-backed|unquotaed|format-v1-only|bad-format-version|stale-region-base)
         echo "ABORT: P1B_TOOTH=$TOOTH is a source-level tooth (see tests/env_storage_durable_check_smoke.sh); the boot arm records what really happened and takes no teeth" >&2
         exit 2 ;;
     *) echo "ABORT: unknown P1B_TOOTH='$TOOTH'" >&2; exit 2 ;;

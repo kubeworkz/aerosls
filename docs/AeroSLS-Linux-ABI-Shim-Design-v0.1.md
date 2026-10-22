@@ -156,7 +156,7 @@ Note what step 6 does to C1: **there is exactly one POSIX implementation, and th
 
 This is the part that a design pass is for, and it is easy to miss:
 
-- **Linux passes six argument registers** (`rdi, rsi, rdx, r10, r8, r9`); SLS passes one pointer. The stub's push list (`rbp, rbx, r12–r15, rcx, r11`) and the per-CPU block (`syscall_regs[8]`) **do not contain `rdi/rsi/rdx/r10/r8/r9`**, and the stub's own contract says the user program must treat them as clobbered. `struct PerCPUData` (`arch/x86/user_paging.h`) is `{ user_rsp, kernel_rsp, syscall_regs[8] }` — nothing else.
+- **Linux passes six argument registers** (`rdi, rsi, rdx, r10, r8, r9`); SLS passes one pointer. The stub's push list (`rbp, rbx, r12–r15, rcx, r11`) and the per-CPU block (`syscall_regs[8]`) **do not contain `rdi/rsi/rdx/r10/r8/r9`**, and the stub's own contract says the user program must treat them as clobbered. `struct PerCPUData` (`arch/x86/user_paging.h`) is `{ user_rsp, kernel_rsp, syscall_regs[8] }` — nothing else. *(Increment 13 closes this bullet's RETURN side: `syscall_return_path` now restores all six from the `linux_args` capture before `sysret`, so they survive the round trip as Linux promises — only the mid-syscall window, and the in-repo clobber lists that correctly describe it, remain. §10.13's register wall.)*
 - **Therefore the Linux path needs its own capture, and the existing offsets must stay frozen.** `syscall_regs[8]` at `[gs:0x10..0x48]` is read by the park/handoff/yield captures, and its comment records that a live failure came from reading that data late. The addition is a sibling block (`linux_args[6]`), written by step 2 above, before any call — not a widening of the existing block, and not a late read of the syscall stack.
 
 This is also the honest boundary of the "forwarding is nearly free" claim in §2.4: forwarding is free *once the arguments are captured*, and capturing them is a real, small, testable change to the trap path with an existing precedent for its failure mode.
@@ -271,7 +271,7 @@ The contract is what `kernel/loader.c` already implements, stated positively so 
 
 The native sidecar path enters `_start` with no arguments; a Linux binary expects the System V initial stack (argc/argv/envp/auxv) and a static libc start-up that reads it. This is a bona-fide deliverable and the kernel must build it:
 
-- **argv/envp are the environment's to define** — the sidecar knows the command line and the environment (it is the thing that ran `exec`, Phase 2 §4.3); they cross on the spawn request.
+- **argv/envp are the environment's to define** — the sidecar knows the command line and the environment (it is the thing that ran `exec`, Phase 2 §4.3); they cross on the spawn request. **Landed** as the manifest's `ARGENV` record (`SIDECAR_TAG_ARGENV`, format reference `user/proto/src/manifest.rs`): `argc u16, envc u16`, then the argv and envp strings each as `len u16 + bytes`, bounded (8/16 entries, 512 NUL-terminated bytes — the kernel's fixed parse arena) so over-bound or malformed records are refused BY NAME (`CAP_ERANGE`/`CAP_EINVAL`), never truncated. An **absent** record is the v1 answer — `argv = { name }`, an empty environment — so every manifest built before the record exists runs byte-identically; a record with no argv entries falls back to `{ name }` as argv[0]. The spawn sites that first cross it are the system POSIX sidecar's three Linux children (the probe, the census candidate and the designated first user — the pair crosses the same record, so image format stays its only difference), whose envp is this environment's default (`PATH=/bin`, `HOME=/root` — the shell's own default env, honest about time: these spawns run at boot, before any `export` exists).
 - **auxv entries required by static musl/glibc start-up:** `AT_PHDR`, `AT_PHNUM`, `AT_PHENT`, `AT_ENTRY`, `AT_BASE`(0), `AT_PAGESZ`(4096), `AT_HWCAP`(0), `AT_HWCAP2`(0), `AT_CLKTCK`(100), `AT_RANDOM`(16 bytes from `kernel/entropy.c` — absent, stack canaries are worthless), `AT_SECURE`(0), `AT_PLATFORM`("x86_64"), `AT_EXECFN`. `AT_SYSINFO_EHDR` is **absent**, which is correct and must be explicit: there is no vDSO, so `clock_gettime`-class calls are real syscalls and must be in the census (§5.5). This list is not prose to be transcribed later — `tools/e7_stack_launcher.c` (§5.5) is the same list as code, which is how the vDSO declaration gets measured instead of believed.
 - **The stack size is a real question, not a formality.** `PROC_USER_STACK_PAGES` is 8 (32 KiB) for ring-3 processes today, and its own comment records that it grew once already for a large ABI struct. A static libc's start-up plus argv/envp/auxv may exceed 32 KiB of headroom on a real workload; the design requires the Linux task's stack to be a **separately-sized, partition-charged allocation** decided by measurement, not by inheriting the native constant.
 
@@ -482,6 +482,2009 @@ The decisive arm, because it tests the security property rather than the feature
 
 The gate is only "passed" when both halves are observed **in one run**, at which point the report says so in one line. Until v0.2 lands, the run reports the halves separately — work-only (green or red) and cycle (not attempted, with the reason) — so a partially-capable shim is never described as gated.
 
+### 10.5 What has landed — increment 1 (the contracts)
+
+E7 starts where this tree always starts: the record layer, before any
+mechanism. Three of §9's in-scope items are pure functions with no
+dependency on the trap path, the sidecar or a boot — the errno map (§5.7),
+the syscall classification table built from the census (§5.6), and the
+initial stack/auxv builder (§5.2) — and they are the contracts every later
+increment consumes. They landed together as `kernel/linux_abi.h` /
+`kernel/linux_abi.c` (in the x86 image's `X86_C_SRC`), each with the host
+test §10.1 named:
+
+- `tests/linux_errno_map_host_test.c` — 51 checks, exhaustive over both
+  families (all twelve `CAP_E*`, all fourteen `CAP_ERR_*` including the
+  `CAP_ERR_OK` success arm), the `CAP_NONE` sentinel's translation to
+  `-EIO` (§5.7's "translated, never leaked"), the range law (every result
+  is 0 or inside `[-4095, -1]`, musl's errno window), and the reverse map
+  **exactly where it is defined**: the twelve unique-preimage codes
+  round-trip, and the five collapse errnos (`EPERM`, `ENOMEM`, `EINVAL`,
+  `EIO`, `EBUSY`, which two or three CAP codes each map onto) return 0
+  rather than guess which kernel-side truth the errno no longer carries.
+- `tests/linux_syscall_table_host_test.c` — 42 checks, parsing
+  `tools/linux_syscall_census.txt` itself (traced rows *and* the declared
+  vDSO backstop) so the artifact is the specification rather than a
+  transcription: every one of the 27 numbers has a non-UNKNOWN class, the
+  class of each is §5.6's destination asserted by name, `mprotect` carries
+  `LSC_F_REFUSES_WX` (§5.4's W^X refusal pinned against the census's own
+  row — H2's Node exclusion as a table property), and the number-space
+  overlaps 105/160/320 are UNKNOWN: no entry, no semantics, no path to a
+  `SYS_` arm. The table's length is pinned to the row count, so a future
+  census run that adds a syscall reddens here until the table grows.
+- `tests/linux_initial_stack_host_test.c` — 40 checks over a poisoned
+  region: the canonical psABI image (argc lowest, strings highest — the
+  first draft of the builder was inverted, and the pointer-walk is what
+  caught it), §5.2's thirteen required `AT_*` each present exactly once
+  with the value named, `AT_SYSINFO_EHDR` **absent** by decision (the vDSO
+  honesty requirement asserted at the source, not at the trace),
+  `AT_RANDOM` copied verbatim from the caller's entropy, a 16-byte-aligned
+  entry rsp checked on the ABSOLUTE address, and the undersize/NULL
+  refusals returning 0 rather than a plausible address.
+
+All three run in `tests/run_all.sh` on every push; the module compiles
+freestanding (`-ffreestanding -mno-red-zone`); teeth were verified by
+sabotage (a flipped table class reddens naming `clock_gettime (228)`; a
+flipped errno mapping reddens on the exact forward clause *and* the
+round-trip that redefines the reverse).
+
+What this increment is NOT: there is no personality field, no trap-path
+branch, no six-argument capture, no request struct and no forwarding. The
+Linux task does not exist yet, so the §8 checkpoint half of the gate is
+not closer than it was — the extra-tasks hook cannot capture a task that
+has not been built. Increment 2 is §3.3's mechanism (the personality, the
+branch, the capture), increment 3 is §3.3's delivery (steps 5–7 — the
+channel forward, the park/resume, the errno map applied to the reply, and
+the sidecar core's first answers, §10.7), increment 4 is §5.3's `fs_base`,
+and the checkpoint/restore integration is the increment AFTER the task can
+park in a forwarded syscall — because that parked state is exactly what
+§8 says a checkpoint serializes.
+
+### 10.6 What has landed — increment 2 (the personality, the branch, the capture)
+
+The first mechanism, and the whole of §3.3's steps 1–4 — with step 6's
+sidecar deliberately still owed. What exists now:
+
+- **The personality, stamped at spawn.** `PROC_PERSONALITY_SLS` (0) /
+  `PROC_PERSONALITY_LINUX` (1) live in `kernel/linux_abi.h`; the field is
+  `ProcessDescriptor.personality` (`kernel/process.h`), reset by
+  `proc_clear_resume_state()` so a reused slot can never inherit one, and
+  stamped inside `cap_create_sidecar_in_personality()` — before the HELD
+  release, so a schedulable task never carries the wrong personality. The
+  spawn is `SYS_SLS_LINUX_SPAWN` (328, unique across every `SYS_SLS_*`
+  define): the same manifest path and the same request struct as 310, one
+  argument different, and therefore the same E2 `sidecar_authority` gate —
+  which lives inside the create both syscalls share (§11 Q3's answer, as
+  proposed). An unknown personality value is refused `CAP_EINVAL` rather
+  than stored.
+- **The capture.** `PerCPUData` gains the sibling block `linux_args[6]`
+  at `[gs:0x50..0x80)` — appended, with the existing offsets frozen by
+  `_Static_assert`s (`syscall_regs` at 0x10, `linux_args` at 0x50, size
+  0x80) so a C-side reorder is a build error instead of a silent desync
+  with the asm's literals. `syscall_entry_stub` writes all six registers
+  after its pushes and BEFORE any call — the §3.4 rule, inherited from
+  the live failure that produced `syscall_regs`. The capture is
+  unconditional for the honest first cut: six stores on the SLS path,
+  nothing read; a personality-gated capture needs the personality in a
+  register at trap time and is deferred with §3.7's fast path.
+- **The branch.** `do_syscall()`'s FIRST act is the personality
+  predicate, ahead of the driver-SDK switch and the legacy chain: a Linux
+  task's trap reads the capture (`proc_read_linux_args()`), builds the
+  §3.4 request through the pure `linux_syscall_describe()`, logs the
+  number and its census class by name, and refuses with `-LINUX_ENOSYS` —
+  a Linux errno, never a CAP-family value (§5.7). A non-Linux caller
+  takes exactly the path it always took.
+
+**Host test** (`tests/linux_personality_host_test.c`, 19 checks): the
+predicate's truth table including the "an unrecognised personality
+intercepts nothing" case (§10.3's inversion is its sabotage tooth),
+`PROC_PERSONALITY_SLS == 0` (BSS zero-init is the safe default), the
+request struct's ABI as literals (72 bytes; num 0, args 8, ret 56,
+status 64 — increment 3's channel post and the Rust mirror build against
+these), and `describe()` as the pure copy it claims (poisoned in, ret and
+status zeroed out, NULL capture defined).
+
+**Source guard** (`tests/linux_personality_check.sh`, 18 clauses, no
+`GUARD-KIND` — source-only, so it runs everywhere) because none of the
+wiring is observable without a boot: the six captures at their exact
+offsets and above the stub's first call; the predicate before the first
+`switch (num)`; the refusal value; the slot reset; the create's stamp;
+`sys_sls_linux_spawn` passing LINUX; the E2 gate still present; 328's
+uniqueness across the number space. Its smoke
+(`tests/linux_personality_check_smoke.sh`) proves eight teeth, each
+mutating a COPY (the real tree is never touched) and each required to
+redden naming its clause: a capture deleted, a capture redirected onto a
+frozen `syscall_regs` offset, the static assert dropped, the predicate
+inverted to SLS, the branch dead-coded, the spawn's LINUX argument
+dropped, the slot reset deleted, the authority gate neutralised — plus a
+restore check on the real tree. Verified: guard 18/18 (exit 0); smoke
+9/9 including the restore (exit 0); the five touched TUs
+(`cap.c`, `process.c`, `syscall_dispatch.c`, `linux_abi.c`,
+`user_paging.c`) syntax-check clean under freestanding flags.
+
+**What this increment is NOT.** No forwarding: a Linux task's every
+syscall is refused `-ENOSYS`, because the channel delivery and park /
+resume (§3.3 steps 5–7) are increment 3 — and so is the sidecar core
+that answers. No initial stack or ELF exec path yet (the spawn creates
+the task through the sidecar manifest path, not through a Linux
+`execve`); no `fs_base` (increment 4); no `brk`/`mmap` budget (5); no
+boot guard — `tests/linux_abi_shim_check.sh` and its
+`E7_TOOTH=personality-fallthrough` arm need a running Linux task, which
+needs increment 3 to be anything but an `ENOSYS` machine. Until then the
+guard above is what holds the routing, and it is deliberately source-
+level: it can prove the branch is WIRED correctly, not that it FIRES —
+and this document says which rather than letting a green guard imply
+both.
+
+### 10.7 What has landed — increment 3 (forward, park/resume, the map applied, the sidecar's first answers)
+
+§3.3's steps 5–7, end to end in source, plus step 6's Rust half. The
+branch stops refusing and starts delivering — while still interpreting
+nothing. What exists now:
+
+- **The post, and the arm that must precede it.** `cap_linux_find_channels`
+  (`kernel/cap.c`) resolves the task's single sendable `CHAN_W` and single
+  recv-able `CHAN_R` against `linux_channel_shape_ok` — exactly one of
+  each, not "at least one": two candidates is a routing decision the
+  kernel is not allowed to make, so it is refused rather than guessed
+  between. The first trap then arms `cur->park_syscall =
+  SYS_LINUX_TRAP_RESUME` **before** the post, because `cap_maybe_handoff`
+  reads that state: a sysret handoff returned MID-forward would land back
+  in ring-3 with its hardcoded `rax=0` and the reply would be lost.
+  `k_linux_forward` (`kernel/chan.c`) resolves through the reply handle
+  first (a broken or revoked channel is an errno, not a hang),
+  `cap_send_msg`s the 72-byte description, then parks in
+  `cap_wait_chans` — it returns **only** on a refusal and never reads a
+  reply, by construction. Every refusal on this side leaves as a Linux
+  errno: `-LINUX_ENOSYS` for a pre-delivery refusal (no channel, stray
+  resume), `linux_errno_from_cap(status)` for the post's CAP status.
+- **The resume, the only reader.** `SYS_LINUX_TRAP_RESUME` (0x4C494E52
+  — "LINR", outside Linux's number space and outside every `SYS_SLS_*`)
+  routes through the pure `linux_forward_resume_is_live`
+  (`kernel/linux_abi.c`): a sentinel with no forward in flight — no arm,
+  or a personality that intercepts nothing — is refused **by name**,
+  never parked, the increment-2 discipline applied to the resume number.
+  Armed, `k_linux_deliver` recvs into resume-frame locals (the first
+  trap's frame died with it; park-time state travelled as values in
+  `park_req`) and hands the payload to `linux_syscall_apply_reply`, which
+  enforces the 72-byte size and the `num` echo **before** trusting
+  anything — a mismatch is `-EPROTO`, "no answer that was not an
+  answer" — and maps a nonzero `status` through §5.7 at the last
+  possible moment, so a CAP-family value never crosses into `rax`.
+  Status 0 means the sidecar's `ret` IS `rax`, passed through untouched
+  (the brk/mmap contract). A spurious wake re-parks with the same
+  expected `num`, so the echo check is identical on the third wake as on
+  the first. The resulting `rax` rides the existing `cap_recv_resume` →
+  `syscall_return_path` back to ring-3 as if the syscall had simply taken
+  a while.
+- **Step 6 — the sidecar core's answers (`user/sidecar/src/linux.rs`).**
+  The spawn path registers each child's two channel handles
+  (`linux::track`); the entry loop calls `linux::service` every pass —
+  the same non-blocking poll shape as its console arm — and the forward
+  channels join the quiesce **wait set** (`linux::append_wait`), so a
+  child's request WAKES the sidecar rather than waiting for an idle
+  pass. The answers are the census's, answered honestly: `set_tid_address`
+  (218) is stored-and-ignored — single-threaded, so the register echo is
+  the complete POSIX answer; `exit_group` (231) **reaps** — the task is
+  parked awaiting exactly this exchange, so `proc_kill` is an immediate
+  teardown and the frames return to the partition, and no reply is owed
+  because the task never runs again (a pid that cannot be resolved is
+  answered rather than left parked forever); everything else — every
+  number outside the census — answers `-ENOSYS` with the number logged,
+  §11 Q5's recommended policy: visible and cheap, never a silent success.
+  The reply is the same 72-byte `#[repr(C)]` struct, `num`/`ret`/`status`
+  at the offsets the host test pins, with a compile-time size assert as
+  the last thing between a kernel/sidecar layout drift and an eternity of
+  `-EPROTO`.
+- **Why three of these are pure functions.** `linux_forward_resume_is_live`,
+  `linux_channel_shape_ok` and `linux_syscall_apply_reply` live in
+  `kernel/linux_abi.c` with the increment's own reason written down:
+  every decision the forward path makes *before it parks* — "is this
+  resume ours?", "is this table shape ours?", "is this payload an
+  answer?" — is a decision a source guard can only hold if the source
+  holds it as a named contract, and a host test can only bite if it is
+  pure.
+
+**Host test** (`tests/linux_personality_host_test.c`, 19 → **42
+checks**): the sentinel's value as `"LINR"` and its fit inside
+`park_syscall`'s `u32` (a truncation would strand a parked forward on a
+different number); the in-flight truth table including both refusals
+(SLS at the sentinel, a disarmed Linux task, an unrecognised
+personality — each asserts nothing); the census table has no row for
+the sentinel (`LSC_UNKNOWN`), so it can never be mistaken for a
+describable syscall; the channel shape as a pure rule — only (1,1)
+passes, and (0,1)/(1,0) is §10.3's `no-cap-channel` tooth as a function;
+and `apply_reply` exhaustively: status-0 passthrough of a brk-class
+64-bit value un-mangled, the in-place overlay the dispatcher reads back,
+seven status rows mapped through §5.7 across both families plus the
+`CAP_NONE` sentinel and an out-of-family value (both → `-EIO`), and the
+refusals — undersize payload, zero size, a `num` echo from a different
+syscall, NULL — each defined as `-EPROTO` rather than returning a
+plausible value.
+
+**Source guard** (`tests/linux_personality_check.sh`, 18 → **29
+clauses**, still no `GUARD-KIND` — source-only, so it runs everywhere).
+Clauses I–K hold increment 3 with one consequence per clause: the
+forward/deliver pair exists at all; the post precedes the park *inside*
+`k_linux_forward` (scoped to the function — `k_chan_send` parks on the
+same shape for its own send); the arm is stamped before the call and
+un-armed on the refusal paths; the resume arm checks the in-flight state
+before it can deliver; both forward-failure exits cross
+`linux_errno_from_cap`; `apply_reply` maps the status and refuses by
+size and echo; the entry loop services **and** wait-qualifies the Linux
+children; the answer arms are the census's shape; the wire size is
+pinned twice; the reply fills `num`/`status` at the pinned offsets.
+Because A–H (routing) and I–K (delivery) are one branch, they are one
+guard: each half could be green alone while the seam between them is
+broken.
+
+Its smoke (`tests/linux_personality_check_smoke.sh`) proves **17 teeth
++ the restore check (18/18, exit 0)** on copies — the nine new ones,
+each a plausible future edit: the post deleted (a park nothing wakes),
+the arm stamp deleted (the mid-forward sysret handoff), the in-flight
+gate inverted, the reply's status returned raw instead of mapped, the
+num-echo check dead-coded, the entry loop's service call unhooked, the
+default answer arm flipped into a silent success (the answer §11 Q5
+forbids), the wire size moved 72 → 71, and the `num` echo never written
+(every reply then dies `-EPROTO`). Baseline and restore controls as
+before; the real tree is never touched.
+
+**Also landed with it:** `tests/env_storage_durable_check.sh`'s S10
+ceiling moved 327 → 328 with three new wiring clauses (S10g–S10i: the
+define, the `case`, the handler — the ceiling moving WITH the wiring,
+which its own comment already says is the rule), and each
+cap-family host test's documented build command now also links
+`kernel/linux_abi.c`, because a refusal can be produced anywhere and
+the map must therefore be linkable everywhere. Verified in this
+increment: guard 29/29 (exit 0), smoke 18/18 (exit 0), the personality
+host test 42/42, `tests/run_all.sh` over every `*_host_test.c` green,
+`tests/env_storage_durable_check.sh` green standalone, and the touched
+TUs syntax-check clean under freestanding flags; the sidecar archives
+were re-packed after the `user/` changes invalidated their stamps.
+
+**What this increment is NOT.** Everything above is still source-level.
+No qemu run has executed a real forward round trip: `tests/linux_abi_shim_check.sh`
+(§10.2's boot guard — one environment, one Linux task, the capability
+census, the attribution and flood clauses) still cannot run, and §10.3's
+`E7_TOOTH` arms still have nothing live to sabotage. The sidecar answers
+two syscalls for real and refuses the rest honestly, so a binary walking
+past the census's edge errors loudly at the boundary rather than
+receiving a fabricated value — but "a static binary doing the first
+user's actual work" is not closer to the observed-work half of the gate
+until a boot runs one. No `fs_base` (increment 4), no `brk`/`mmap`
+budget (5), no checkpoint half (§8, v0.2's). And §3.7's round-trip
+measurement is now *possible* rather than owed-in-principle: there is a
+round trip to measure, still unmeasured.
+
+**Superseded since — see §10.8:** a real forward round trip has since run
+on QEMU twice per boot and its logs are committed; the boot guard
+described above remains unwritten, so the observation is one real round
+trip, not yet the full gate.
+
+### 10.8 What has landed — the boot proof (the round trip runs on the real machine)
+
+The one thing §10.7 said did not exist. A QEMU run now executes §3.3's
+steps 5–7 for real — spawn, forward, answer, resume, reap — and the
+serial logs are committed as evidence (`evidence/e7_phase5_shipped.log`,
+`evidence/e7_unified_entry3.log`, `evidence/e7_e3_multi_env.log`).
+Committed as `e7: increment 4 — the round trip is proven live on a real
+boot`, taking the number the plan had reserved for `fs_base` (§5.3); the
+number lives on the commit, the plan's sequence lives here — this
+addendum records the proof, and `fs_base` remains the next increment.
+
+**What runs.** The probe: `user/sidecar/fixtures/e7_linux_probe.S`
+assembled to a 70-byte flat image (one `.text`, `_start` at file offset
+0, the fixture's `build_probe.sh` carrying the exact build line) and
+embedded by `user/sidecar/src/e7_probe.rs` with `include_bytes!`. Before
+its event loop, the POSIX sidecar plants the payload at the TAIL of its
+own budget region — identity-mapped, because `rust_entry` already stands
+the heap there, so the write travels the heap's own mapping — builds a
+zero-capability manifest (§3.5's shape as a construction: the child's
+table gets only the messenger channel pair the create inserts;
+`image_kaddr` footnoted as the tail), and spawns through the real **328**
+(`k.linux_spawn` → `sys_sls_linux_spawn` →
+`cap_create_sidecar_in_personality`). The sidecar is the design-true
+creator: §3.5 places the task's single channel with *its environment's
+sidecar*, and `linux::service` — the answers — lives in that same
+binary.
+
+**What the serial log shows** (verbatim; shipped ISO, default Phase-5
+entry — the sequence recurs when the watchdog respawns the POSIX):
+
+```
+[SIDECAR] PID 105 'e7.linux.probe.0' released — runs on next schedule (BIB at 0x0000400000005000, entry 0x0000400000000000)
+[E7] probe: spawned ch_r0000000D
+[CAP] woken PID 104 (channel 11)
+[E7] linux: num=000000DA  ok
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 13)
+[E7] linux: num=00000027  -> ENOSYS
+[E7] linux: num=00000028  -> ENOSYS
+[E7] linux: num=000000E7  exit_group
+[PROC] PID 105 terminated.
+```
+
+Each `[E7] linux:` line is one completed round trip: the child's trap
+described from the `[gs:0x50..0x80)` capture, resolved to its one
+channel pair, posted, parked; the sidecar's answer (218 echoed, two
+outside-census numbers refused `-ENOSYS` per §11 Q5's policy, 231
+reaped) rode `k_linux_deliver` → `linux_syscall_apply_reply` → §5.7 back
+to ring-3 — and the NEXT line firing is the resume's proof: a task that
+never came back would issue no further traps. Across both boots: zero
+`refused` / `not delivered` / `stray trap` lines — those refusals exist
+and are guarded (clauses I–K); they simply did not fire.
+
+**The runs and their verdicts.** Shipped ISO default entry (the proof
+above); `tests/e3_multi_env_boot_check.sh` → 0 — three live rootfs at
+distinct storage regions, probe round trip inside the same boot;
+`tests/unified_boot_check.sh` → 18/18 — which by ITS OWN design contains
+no POSIX sidecar ("it would fight the kernel for the NIC and COM1"),
+hence no §3.5 endpoint, hence no Linux task can exist *there*; the proof
+lives on the Phase-5 entry of the same image, and the unified guard's
+absence-assertion is itself the evidence that this is architectural
+placement, not an omission. Alongside: `tests/linux_personality_check.sh`
+29/29 and its smoke 18/18 unchanged — a boot adds an observation, not a
+new clause.
+
+**Two environment findings, each with a boot's worth of confusion
+behind them.** (a) The kernel Makefile tracks no header dependencies, so
+a `process.h` change rebuilt only the files git rewrote; the resulting
+mixed-layout link manufactured phantom panics (`parent pid=0`, a
+`personality` field reading the impossible `4`) that a full
+`rm kernel/*.x86.o arch/x86/*.o` deleted outright. (b) The boot image is
+staged at physical `0x20000000` — past the end of a 512 MiB guest — so
+a `-m 512M` boot loads init into unbacked phys and dies at ring-3 entry
+on a `#PF` no code change explains; the harnesses' `-m 4G` is
+load-bearing, and every manual `-m 512M` run manufactures that fault.
+
+**What this proof is NOT.** `tests/linux_abi_shim_check.sh` (§10.2's
+boot guard — capability census, attribution and flood clauses) is still
+unwritten and §10.3's `E7_TOOTH` arms still have nothing to sabotage:
+what the logs prove is ONE honest forwarded round trip per spawn, not
+the census boundary, not the flood bound, not "the first user's actual
+work". The probe rides the sidecar-manifest spawn path with
+`image_entry = 0` by construction — no ELF/execve path exists (none was
+claimed). §3.7's round trip remains unmeasured: serial lines carry no
+timing, so "possible to measure" is still the honest status. And
+`fs_base` (§5.3, the plan's increment 4) and the `brk`/`mmap` budget (5)
+are untouched by this proof.
+
+### 10.9 What has landed — the plan's increment 4 (`fs_base`, §5.3)
+
+The one kernel-side Linux semantic, in the four places §5.3 names —
+landed, guarded, host-tested and PROVEN on a live boot (the thing §10.7
+said could not yet be done for anything, which §10.8 did for the round
+trip; this increment has both).
+
+- **The field, cleared where personality is cleared.**
+  `ProcessDescriptor.fs_base` sits beside `cr3`, with `fs_base_stage` and
+  `fs_stage_valid` carrying the one-forward-at-a-time staged grant;
+  `proc_clear_resume_state()` zeroes all three beside its personality
+  reset, so a reused slot never hands its predecessor's TLS to the next
+  occupant.
+- **The write, single-sited.** `user_write_fs_base()`
+  (`arch/x86/user_paging.c`, declared beside the gate) is the tree's only
+  writer of `MSR_IA32_FS_BASE`: gate init zeroes it once (the invariant
+  "FSBASE == current task's fs_base" is TRUE from the first ring-3
+  instruction), `proc_build_resume_frame()` loads `next->fs_base` on
+  every switch-in (the single frame builder every switch honours), and
+  the resume arm performs the granted SET — no personality branch, the
+  invariant instead of a special case.
+- **The seam: stage, grant, apply.** The first trap stages a real
+  `ARCH_SET_FS` through the shared predicate
+  `linux_arch_prctl_is_set_fs(num, args[0])` before the arm; the sidecar's
+  158 arm is the POLICY half (grant only `0x1002` at a user-canonical
+  address — `0x0000_7FFF_FFFF_FFFF` — `E_INVAL` for a bad address, ENOSYS
+  otherwise: SET_GS has no GSR, GET_FS's value lives in the kernel's
+  field); the reply arm re-checks `linux_fs_addr_is_user_canonical()`
+  and writes — the grant decides WHETHER, the mechanism still refuses a
+  value it cannot write, as -EINVAL in rax.
+
+**Host teeth.** `tests/linux_personality_host_test.c` 42 → **52 checks**
+(the census's own measured `0x47a1a8` must pass its own gate; the
+all-ones value must not; the predicate needs BOTH words). Guard 29 →
+**36 clauses** (set L: single writer, gate baseline, slot clear,
+switch-in, the stage/apply ordering *with the write strictly after the
+deliver*, the pure bounds, the sidecar arm) and smoke 18 → **25 passed**
+(seven new teeth t18–t24 — gutted writer, dropped baseline, deleted
+clear, deleted switch-in, deleted apply, cmd word dropped, bound widened
+to any u64). Three host tests that link `process.c` gained the weak
+`user_write_fs_base` stub in `tests/process_host_stubs.h` (the
+established pattern — their compile failure was the mechanism working).
+
+**Live proof** (`evidence/e7_fs_base_shipped.log`, shipped ISO, twice per
+boot — initial POSIX and its watchdog respawn):
+
+```
+[E7] linux: num=0000009E  ok          ← 158 arch_prctl granted by the sidecar
+[E7] linux: num=000000BB  -> ENOSYS   ← the LATCH: %fs:0 == the direct read, so the MSR moved
+[E7] linux: num=000000E7  exit_group  ← clean reap — not the segfault the failure path leaves
+```
+
+with zero MARKER 393 lines (the wrong-place tooth) and the only FAULT
+in the log being irqtest's own storm kill. **The live boot taught the
+fixture two lessons worth their own lines:** the resume clobbers
+caller-saved registers (the first run held `_start` in r8 and faulted on
+the kernel's leftover scratch — fault addr 0x16, then 0x10: two boots,
+two garbage values), so the address now rides r15, park_ctx's preserved
+set; and the %fs operand is displacement 0, because linear = FS_BASE +
+disp — adding `_start` twice would ask for the non-canonical
+`0x8000_0000_0000` by construction. *(The first lesson got its
+kernel-level answer at increment 13 — §10.13's register wall: the
+round trip now preserves those registers, so the r15 workaround
+stopped being load-bearing. It stays, because it is still correct.)*
+
+**One build-system defect, fixed at the root this time.** The header
+edit repeated the `checkpoint_delta.h` incident from the Makefile's own
+comment: only the four edited `.c` files rebuilt, `cap.c` still read the
+OLD `ProcessDescriptor` layout, and init's first create panicked
+`[CS] CAP_EINVAL parent pid=0` — the same phantom that cost this session
+its first diagnosis. The Makefile now carries named prerequisites for
+`kernel/process.h`, `kernel/linux_abi.h` and `arch/x86/user_paging.h`
+over every kernel object (`$(X86_KERNEL_OBJS)`), in the same spirit as
+the `checkpoint_delta.h` line above it; `touch kernel/process.h` +
+`make -n kernel/cap.x86.o` proves the dependency fires.
+
+**What this increment is NOT.** `ARCH_GET_FS`/`SET_GS` are answered
+ENOSYS honestly (not in the census; a GET's value would have to travel
+back through a reply only the kernel can fill — a future arm, not a
+silent gap). The GDT question §5.3 asks to confirm rather than assume is
+answered by construction for the measured candidate: user data is `0x1B`
+(GDT slot 3), there is NO descriptor at `0x2b` (slot 5 is the TSS), and
+the census binary's musl TLS path loads no FS selector — `%fs`
+addressing runs off the MSR, which is what this increment writes. No
+`brk`/`mmap` budget (§5.4 — the plan's 6, since the fd class took 5), no
+§8 checkpoint half, no
+boot-guard script — and §3.7's round trip remains unmeasured: serial
+lines still carry no timing.
+
+### 10.10 What has landed — the plan's increment 5 (the fd class: the kernel copy + the sidecar's fd table)
+
+§5.6's first row — "`read`, `write` | the copy's bulk plus the console;
+sidecar fd table" — has been the one row whose obstacle was named but
+never built: the bytes live in the CHILD's address space (a separate cr3
+by §3.5), so the sidecar that owns every fd decision cannot read them,
+and the kernel that can must not decide anything. This increment is
+exactly that crossing, in both halves, with the split §3.3 step 6
+requires: **the kernel copies, the sidecar's fd table performs.**
+
+**The plan (kernel/linux_abi.c, pure — the host test drives every
+branch).** `linux_fd_write_plan(num, args)` is arithmetic over the
+captured registers: a non-write number plans nothing (the rest of the fd
+class still forwards as the plain 72-byte description it was),
+`count == 0` plans nothing *before* canonicality is consulted —
+`write(fd, NULL, 0)` is legal and inventing `-EFAULT` there would be a
+rule no kernel the candidate was compiled against enforces, the same
+discipline that lets 0 pass §5.3's bound — and a span above
+`LINUX_FD_WRITE_CHUNK` (1024) clamps. **The clamp rides IN the
+description**: `args[2]` is rewritten to the byte count *before*
+`linux_syscall_describe`, so header, payload and the rax the task will
+read are one truth rather than three, and a short write — POSIX-legal,
+and handled correctly by std's `write_all` loop — is what the task sees.
+A span that leaves the user-canonical range (or wraps) refuses
+`-LINUX_EFAULT` **before the post**: a first-trap refusal with no channel
+and no arm, and EFAULT 14 is returned directly rather than through §5.7,
+because it is the task's truth about the task's own pointer, not a CAP
+code.
+
+**The copy (same file, also pure over a root the caller supplies).**
+`linux_user_copy_out(dst, root, va, n)` walks four levels **read-only**:
+present at every level, the USER bit at every level, no huge page (PS at
+the PDPTE/PDE — bit 7 of a 4 KiB PTE is PAT and is not refused), then
+copies from the identity-mapped frame (boot.asm's own claim: "the
+physical addr = virtual addr"), re-walking all four levels from the PML4
+for each page so a span crossing a page boundary validates and copies
+both. The walker this deliberately is *not* is
+`arch/x86/walk_page_tables_x86.c`, whose `get_or_create` ALLOCATES a
+missing table — over a tenant-supplied address that would be a memory
+lever, not a copy; guard clause M4 pins "allocates nothing" against the
+source. The USER bit is the security argument, stated as a property:
+**the copy can read exactly what ring 3 could read itself**, so
+forwarding the bytes to the sidecar exposes nothing the task did not
+already hold, and every refusal lands as an errno into rax — never a page
+fault in ring 0 over a tenant pointer.
+
+**The message widened by exactly one dimension.** `k_linux_forward`
+now takes `(const void *msg, uint32_t msg_len)` — the 72-byte header
+plus attached bytes — validates `msg_len >= sizeof(request)` as
+`CAP_ERR_PROTO`, reads the park's wake cookie byte-wise (the same
+no-alias discipline `apply_reply` applies to channel payloads), and posts
+`msg_len` rather than a hard-coded size. The arithmetic that keeps this
+inside the channel: `1024 + 72 <= CAP_MSG_MAX_PAYLOAD (4096)`, pinned by
+guard clause M1 as a computation across two headers, so a future chunk
+edit that oversizes the pool reddens the guard instead of failing
+silently at post time — only for big writes, where nothing else would
+notice.
+
+**The fd table (sidecar, linux.rs).** `FdSlot { used, kind }` per task,
+`LINUX_MAX_FDS` = 16, **born with the task** in `track()`: fds 0, 1, 2
+are the console (a tty is bidirectional — Linux does not make `write(0)`
+an EBADF). `answer()`'s new `1 =>` arm resolves the descriptor through
+`fd_kind` (pure over the slice — guard M5's) and answers:
+console slot → `Answer::Write`, unknown descriptor → `EBADF` with
+`CAP_EBADF` pinned at −2 so §5.7 delivers 9. That EBADF is the *whole
+truth*, not a shortcut: `open` is still ENOSYS, so no slot beyond the
+born three can exist. `service()` grew the second half of the honesty:
+the recv buffer carries `72 + 1024`, and for exactly one number the
+attached length must equal `args[2]` **and** sit under the chunk's mirror
+`FD_PAYLOAD_CAP` (1024) — a violation is the malformed arm's num=0 reply
+the kernel's echo check refuses `-EPROTO`, so bytes the task did not
+write can never be performed. The perform half is `console.write` on the
+entry loop's own CharNode (`service(&RealKernel, &booted.console)`), and
+the loop's existing pump drains it to the kernel console channel — no
+second path to serial.
+
+**The probe proves the whole seam on the real machine.**
+`fixtures/e7_linux_probe.S` (now 213 bytes) writes a fixed string to fd 1
+— `E7FD-WRITE-OK` — and requires `rax == len`; then writes the same
+buffer to descriptor 0x77 (which cannot exist) and requires `rax == -9`
+exactly. Either wrong issues **MARKER 394** (0x18A), asserted ABSENT in
+the 391/392/393 discipline. Evidence, committed as
+`evidence/e7_fd_write_shipped.log` (the shipped ISO, default entry): the
+string appears on serial twice — the bytes walked child→copy→message→
+fd table→console→pump→kernel→serial — `num=00000001 write ok` is the
+sidecar's perform line, the bad-fd attempt's `num=00000001 ok` is its
+answered EBADF reply, and **markers 391–394 occur zero times** (the
+absence of 394 *is* the proof that both rax checks passed; the bad-fd
+line is still num=1 because the syscall was write — 0x77 was its fd
+argument). Two complete probe cycles appear in the log, every marker
+clean in both, with §5.3's latch (`9E ok` → `BB -> ENOSYS`) and
+`exit_group` intact behind the new block.
+
+**Teeth.** Host test 67 checks (+15: seven plan cases including the
+count-0-before-canonicality rule and the wrap-around span, eight copy
+cases over fake 4 KiB-aligned tables — each flag refusal named).
+Guard clause set M, 43 clauses total (+7: contracts, the cross-header
+chunk arithmetic, the dispatcher's plan→describe→copy→arm→forward
+order, the forward's message path, the copy's three boundaries plus
+"allocates nothing", the fd table's born stdio and pinned EBADF, the
+sidecar's payload invariant and console hand-off). Smoke 32 (+7 teeth:
+oversized chunk, detached copy, dropped clamp, a send that hard-codes 72,
+the USER check deleted, drifted E_BADF, dead-coded payload check), plus
+the updated I1/K teeth for the widened forward and the handed console.
+
+**What this increment is NOT.** `read` — the copy-IN — has deliberately
+not landed: its bytes travel the other way, which means payload on the
+REPLY, and the reply is exactly 72 bytes as a pinned security property
+(`apply_reply`'s size check, host-tested and smoke-toothed as the
+property "a payload that is not exactly 72 bytes is not a reply").
+Loosening that for one syscall is a §10.7-class decision, so read gets
+its own increment with its own teeth, alongside the console-input
+buffering that decides what a blocking stdin even means. `open`,
+`close`, `lseek` and the rest of the fd class remain ENOSYS — the file
+half is Phase 2 §3-§4's VFS work, and until `open` lands the fd table
+cannot contain anything but its born stdio, which is what makes the
+EBADF arm above complete rather than provisional. No mem class (§5.4,
+now superseded by §10.11), no `clock_gettime` child-buffer write, and
+§3.7's round-trip measurement remains unmeasured.
+
+### 10.11 What has landed — the plan's increment 6 (the mem class: brk's budget span + the W|X refusal)
+
+§5.4's first half — "**`brk` as a bump pointer inside a reserved span**
+and `mmap` as sub-allocations of the same budget; both refused with
+`ENOMEM` when the budget is exhausted. The hard ceiling is the
+partition's frame quota, kernel-enforced" — is now mechanism. The split
+is the design's own: the sidecar decides *whether* the break moves (the
+budget is its policy — it authored the manifest's `BUDGET` record), the
+kernel provides the frames, and the kernel re-checks the grant *at the
+map* against the span it stamped itself — the §5.3 posture one level up,
+where the `wrmsr` is replaced by a page-table write.
+
+**The span, stamped at create.** `cap_create_sidecar_in_personality()`
+(`kernel/cap.c`) stamps three fields on the descriptor for a
+`PROC_PERSONALITY_LINUX` child, beside the personality itself:
+`linux_heap_base` (directly above the child's stack),
+`linux_heap_limit` (base + the `BUDGET` record's `mem_bytes`,
+page-rounded) and `linux_brk_cur` (starts at the base — nothing above
+the stack is mapped until a `brk` grants it). `mem_stage_{num,a0,valid}`
+carry the requested break across the park (the first trap's frame is
+abandoned by the park — the increment-4 lesson: the stage lives on the
+descriptor), and `proc_clear_resume_state()` zeroes all six beside
+personality and TLS. An SLS child gets the zero span, so a brk-shaped
+stage on an SLS slot has no span to grant against.
+
+**The verdict, at the reply.** `linux_mem_brk_verdict()`
+(`kernel/linux_abi.c`, pure, host-tested) decides what the resume arm
+does with a reply, over the kernel's own span, the staged request and
+the reply's `rax`:
+
+- `rax == brk_cur` — the denial echo, which is **Linux's own brk
+  failure shape**: a denied brk returns the *current break*, never
+  `-ENOMEM`, and libc compares the return against the request. Not
+  malformed; nothing maps. Over-budget asks and shrinks both arrive
+  here, and so does the no-op `brk(cur)`.
+- `rax == req` inside `(brk_cur, limit]` — a grant: the verdict
+  computes `[align_up(brk_cur), align_up(rax))`, the exact pages no
+  grant has backed yet — the page *containing* the old break was mapped
+  by whatever moved the break into it, and a re-map would leak the
+  frame underneath and zero the bytes on it.
+- anything else — malformed: the break stays, nothing maps, the reply
+  is logged. A "granted" shrink and a grant that escaped the stamped
+  span both land here; the kernel never maps a page because a grant
+  said so.
+
+The arm then maps each page with
+`allocate_physical_ram_frame_for_partition()` — the hard ceiling §5.4
+names, quota-checked and owner-tagged — **zero-filled before the task
+can read it** (the pool recycles frames across tasks and partitions, so
+an unzeroed frame would carry its last tenant's bytes into a fresh
+heap) and non-executable (`USER_PTE_NOEXEC`: W^X by construction —
+the mprotect refusal below is the policy half of the same rule). Frame
+exhaustion mid-batch *unwinds*: `linux_user_page_frame()` reads each
+mapped leaf back under the copy's own boundaries (present, USER, no
+huge page; allocating nothing — deliberately not the allocating walker
+`arch/x86/walk_page_tables_x86.c` is), the pages are unmapped and
+returned to the partition, and the break does not move. x86-64 never
+caches a not-present translation (SDM Vol. 3A §4.10.4.1), so the fresh
+maps need no `INVLPG` for the task resuming on this same cr3 — the
+posture `cap_arch_map_page`'s runtime maps already rely on.
+
+**The sidecar's ledger, and both W|X ends.** `linux.rs` grew
+`MemBrk { base, limit, cur }` per task, born in `track()` from the span
+`e7_probe.rs` derives from the manifest it authors — the mirror of
+cap.c's layout (image pages, guard page, stack pages, then
+`mem_bytes`), pinned by guard clause N2 because the Rust side cannot
+include `kernel/linux_abi.h`. `answer()`'s new 12 arm grants a growth
+inside the span and answers the unchanged current break for everything
+else (the denial shape is a *value*, never an errno). The new 10 arm
+refuses write+execute (`prot & 0x2 & 0x4`) `EPERM` — `CAP_EPERM`
+pinned at −12 so §5.7 delivers 1 — the twin of the kernel's first-trap
+refusal, which lands before the post like the write plan's `-EFAULT`:
+a prot word is a property of the request, not of any object, so no
+channel is needed to say no, and both ends exist so neither alone is
+the load-bearing refusal.
+
+**The probe proves the span on the real machine.**
+`fixtures/e7_linux_probe.S` (now 420 bytes): `brk(0)` must return a
+page-aligned, nonzero break; `brk(base+0x2000)` must echo the request;
+the fresh page must **read zero**; `"E7MEM-BRK-OK\n"` built *in the
+heap* and `write(1, page, 13)` must return 13 — the bytes crossing
+through increment 5's seam *from the newly-mapped heap itself*, which
+is what proves the mapping is real; `brk(base+128 KiB)` (past the
+64 KiB budget) must come back as the **unchanged break**, not a
+negative; `mprotect(heap, 0x1000, PROT_WRITE|PROT_EXEC)` must be
+exactly −1. Markers 395–398 issue on each wrong outcome and are
+asserted ABSENT (the 391/392 discipline). Evidence, committed as
+`evidence/e7_mem_brk_shipped.log` (the shipped ISO, default entry): two
+complete probe cycles, each with `E7MEM-BRK-OK` on serial — the bytes
+built in a page the kernel mapped for this task at its own brk grant,
+then crossed child→copy→message→fd table→console→pump→kernel→serial
+through increment 5's seam; `num=0000000C ok` three times per cycle
+(the query, the granted growth, the over-budget denial — a *value*, so
+an ok line and never an errno line); the kernel's own
+`mprotect prot=0x6 refused before post` line once per cycle with **no**
+`num=0000000A` behind it — the refusal is first-trap, before any post,
+so the sidecar never sees the request; and `E7FD-WRITE-OK`, §5.3's
+latch (`9E ok` → `BB -> ENOSYS`) and `exit_group` intact behind the
+new block. **Markers 391–398 occur zero times** — the absence of 397
+and 398 is the proof that the denial returned the unchanged break and
+the W|X refusal returned −1; no malformed-grant or frame-exhaustion
+line appears, so every grant the sidecar made was one the kernel's own
+span agreed with.
+
+**Teeth.** Host test 86 checks (+19: the W|X predicate's total
+branches, the verdict's every arm — denial echo, no-op, grant, the
+exact-limit grant, the unaligned grant, the live-page-never-remapped
+rule, past-limit, shrink, foreign `rax`, below-base — and the frame
+reader against fake tables). Guard clause set N, 52 clauses (+9: the
+contracts; the slot-reuse clear; the span's two derivations keyed on
+the personality; W|X at both ends; the stage/apply seam through the
+verdict; partition-charged, zero-filled, NX frames; the unwind; the
+refusal shape; the fixture's own teeth). Smoke 42 (+10: an
+unconditional stamp, a dead-coded first-trap refusal, a dead-coded
+sidecar twin, a dead-coded malformed branch, un-charged frames,
+unzeroed frames, a gutted unwind, an errno-shaped refusal, a deleted
+positive marker, a dropped slot-reuse clear).
+
+**What this increment is NOT.** `mmap`/`munmap` — §5.4's
+sub-allocation half — remain ENOSYS by name: they need the sidecar to
+*choose* addresses (and `munmap` to free frames back through the
+partition), a second seam worth its own teeth. `mprotect` implements
+only the W|X refusal: a real permission change would rewrite PTEs the
+sidecar cannot see. `read`'s copy-IN is still the named next increment
+alongside them (§10.10's reasoning unchanged). brk shrink is refused —
+the unchanged break, v1 grows only, and no page is ever unmapped by a
+grant. And §3.7's round trip remains unmeasured: serial lines still
+carry no timing.
+
+---
+
+### 10.12 What has landed — the plan's increment 7 (the image class: the real candidate, §5.1/§5.2)
+
+§5.1's "**the kernel parses [the ELF image], maps segments at their
+linked virtual addresses, and enters at `e_entry`**" and §5.2's initial
+stack are now mechanism — and, the whole point of the increment,
+OBSERVED rather than argued: a real `ET_EXEC` binary is loaded by the
+tree's ONE mapper and runs its entire syscall census on the machine.
+
+**One mapper (§5.1).** The ELF64 structs, the gates and the PT_LOAD loop
+moved out of `loader.c` into `kernel/elf64_load.{h,c}`, so the uploaded-
+program path and the Linux-personality create share one truth about
+segment flags, BSS zero-fill, partition charging and the image contract.
+Gates refuse by name BEFORE the first frame: not-ELF64, `ET_DYN` (there
+is no bias to give it), bounds, non-user-canonical vaddrs. The magic —
+and only the magic — picks the path (image format is an image property,
+never a personality inference); the entry becomes `e_entry`, never the
+flat mapper's `base+offset`.
+
+**The §5.2 stack, and what the measurement caught.** The Linux child's
+stack is ONE contiguous partition-charged region;
+`linux_initial_stack_build()` writes the argc/argv/envp/auxv image into
+it, with a new `region_vaddr` parameter translating every pointer in the
+image — and the returned `%rsp` — into the CHILD's address space. The
+image stops one page below the region's top so step 9's unconditional
+BIB write cannot clobber it (both truths survive: the probe still finds
+its BIB at the stack-top page and never reads `%rsp`; a libc child owns
+everything below it), an 8 KiB floor names the BIB-page-plus-image
+minimum, and an unseeded entropy pool REFUSES the create
+(`CAP_ECONFLICT`, region returned) rather than shipping a zero-filled
+`AT_RANDOM`.
+
+Two real bugs this increment's own measurement found, both pinned:
+
+1. **The untranslated image** — pointers built from the host/phys region
+   address. The `.flat` probe never reads `%rsp`, so it could not see
+   this; a libc dereferences `argv[0]` on its first line. Caught by the
+   cap host test before boot (`region_vaddr` is the fix, byte-identical
+   under identity, pinned by clause O3 / tooth t44).
+2. **The unsafe walk** — a real static binary links its segments LOW
+   (0x400000), squarely inside the child's SHARED kernel identity map
+   (supervisor 2 MiB huge pages, cloned by pointer). `user_map_page()`'s
+   walk treated the huge-page PD entry as a table pointer and wrote the
+   leaf into the kernel's own frames while the child's fetch still
+   resolved through the supervisor page. Measured on the FIRST census
+   boot: `[FAULT] Ring-3 #PF error=0x15 addr=0x400000 rip=0x400000`
+   with `[LOADER] ELF segment ... flags=R-X` printed above it — the
+   mapper entered the right address and the very first instruction
+   fetched non-executable. The mapper now routes segments through
+   `cap_arch_map_page()`'s safe walk (the fix create_sidecar's MEM caps
+   already had: re-point the CHILD's own path, replicate the shared
+   huge page at 4 KiB so the kernel keeps visibility of the rest).
+   Clause O1 / tooth t48 pin the routing.
+
+**The measurement — the census run.** The fixture
+(`user/sidecar/fixtures/e7_candidate.elf`, the probe source linked
+non-PIE; `fixtures/build_candidate.sh` reproduces it byte-exactly) is
+embedded and planted by `user/sidecar/src/e7_candidate.rs` and spawned
+beside the `.flat` probe — a CONTROLLED PAIR: identical machine code,
+identical sequence, only the image format differs. On the E3 ISO
+(`make x86-iso-e3`, 150 s serial capture):
+
+* **first run** (before the safe-walk fix): both candidates ENTER —
+  `rip=0x400000` proves the magic dispatch, the mapper and `e_entry` —
+  and die at their first instruction fetch (bug 2 above); the two
+  `.flat` probes complete the census (2× each marker);
+* **second run** (after): **4/4 children complete the whole census** —
+  `E7MEM-BRK-OK` ×4, `E7FD-WRITE-OK` ×4, the `0xBB` `fs_base` latch ×4,
+  `218` echoed, `39`/`40` mapped to `-ENOSYS`, `arch_prctl` applied and
+  read back through `%fs:0`, the fd-class byte crossing (success and
+  exact `-EBADF`), brk's span (query/grant/heap-write/over-budget echo),
+  `mprotect(W|X)` refused as `-EPERM`, `exit_group` reaped — and MARKER
+  391–398 all ABSENT (the 391/392 discipline), zero E7 Ring-3 faults.
+
+(One `[FAULT] Ring-3 ... error=0x0` in the same boot belongs to the
+irqtest applet suite's own p4-storm phase deliberately killing its
+target (observed: the system posix, code=134) — independent of E7; every
+census sequence completed around it.)
+
+**Where the census was too loud — measured, and the scope it earned.**
+The first scope (a pair from EVERY POSIX environment) turned the
+census into serial load, and the E3 multi-environment boot measured
+it: four POSIX instances, each pair's `[LOADER]` lines, markers and
+`[E7]` klogs riding the one UART — and riding it DURING the irqtest's
+serial-loopback window, whose deferred-TX ring is bounded. The kernel
+said so on the wire: `[serial] loopback window overflow: 0x16e0
+byte(s) dropped` — and what it dropped included the tenants' own
+drop-proof `[POSIX] aero state=` lines. `e3_multi_env_boot_check.sh`
+then failed `live rootfs: 2/3` on boots where every environment had
+actually come up (all spawn lines and all four census completions
+present in the same log): a regression this increment introduced, not
+the check's old lossy-marker flake. The pair is now spawned only by
+the environment that OWNS hardware — the system POSIX profile mints
+`nic0.bar0` (`CAP_TYPE_DEV`) while the tenant profile carries no
+hardware caps at all (`env_manager`'s tests pin `uart`, `irq.timer.0`
+and `nic0.bar0` absent from every tenant manifest) — so one boot
+carries one census (the system POSIX, plus its watchdog respawn),
+each tenant's wire stays as quiet as it was before increment 7, and
+the runs recorded above are exactly this scope.
+
+**Teeth.** Clause set O in `tests/linux_personality_check.sh` — O1 the
+gates + the safe walk, O2 the magic dispatch, O3 the §5.2 contract
+(child-vaddr pointers / BIB-page reservation / 8 KiB floor), O4 the
+entropy refusal, O5 the candidate's wiring — with teeth t42–t48 in the
+smoke (gate inverted, dispatch deleted, phys pointers, BIB clobber,
+entropy dead-coded, unsafe walk, spawn arm deleted). Host side:
+`cap_create_sidecar_host_test.c` gained L1 (the image through the real
+create, read back THROUGH the child's page table), L2 (the unseeded
+refusal returns the region to the partition) and E7c (the candidate's
+segments, flags, entry and AT_PHDR/PHENT/PHNUM truthfulness) — 377
+checks, plus the builder's 40 under `region_vaddr` identity.
+
+**Verified in this increment:** guard 57 clauses (exit 0) with clause
+set O added; smoke 49/49 including O's seven teeth (gate inverted,
+dispatch deleted, phys pointers, BIB clobber, entropy dead-coded,
+unsafe walk, spawn arm deleted), each reddening the clause it names;
+the cap host test green end to end (375+ checks, including the three
+new sections); the stack-builder host test 40/40 under the
+`region_vaddr` translation; `tests/run_all.sh` over every
+`*_host_test.c` green (the cap-linking family's build lines now also
+link `kernel/elf64_load.c`/`kernel/entropy.c`/`kernel/sha256.c`,
+`simi_info` its `linux_abi.c` half — the loader delegation and the
+entropy gate must be linkable everywhere cap.c/loader.c is);
+`tools/syntax_check_all.sh` 129/129; the conventions guard green after
+fixing the index-level debt it surfaced (four scripts committed
+non-executable; the `.flat`, the candidate `.elf` and the raw
+`evidence/*.log` serial captures now carry the `binary` attribute they
+always needed); `env_recycle_boot_check.sh` green standalone; the
+sidecar archives re-packed (`make selfhost-bootimage`) after the
+`user/` changes invalidated their stamps. The e3 batch failures were
+NOT absorbed as flake: they reproduced the census's serial overflow
+(the measurement above), and scoping the census to the owning
+environment is what fixes them — the re-run with that scope in place
+is the verification of this paragraph: `tests/run_checks.sh` over the
+whole tree exited 0 with **46 PASS / 0 FAIL / 7 SKIP**, the seven
+skips being the runtime guards that need a live cluster a build host
+does not have (`run_checks.sh` itself names them), and
+`e3_multi_env_boot_check.sh`, `linux_personality_check.sh` (clause
+set O), `sidecar_stamp_check.sh` and `stack_frame_budget_check.sh`
+among the 46.
+
+**What this increment is NOT.** The candidate is the probe's SOURCE
+linked as an `ET_EXEC` ELF — a controlled pair, not the designated
+first user: `aerobackup`'s musl binary has still never executed under
+the shim, and its census stays host-measured (`strace`,
+`tools/linux_syscall_census.txt`) while every surface beyond this
+sequence (`open`/`read`/`mmap`/…) remains ENOSYS by name. argv/envp
+cross on §5.2's environment-crossing record (`SIDECAR_TAG_ARGENV`) —
+landed after this increment: the record carries argv and envp, the
+create copies its strings into the stack image with child-vaddr
+pointers beside the v1 argv, and an ABSENT record keeps the v1
+fallback (`argv = { name }`, an empty environment) so every pre-record
+manifest runs byte-identically. Pinned by guard clauses O6/O7 (teeth
+t49–t52), the cap host test's L3 (the crossing read back through the
+child's own page table) and L4 (every over-bound or malformed record
+refused by name, no process consumed), and `manifest.rs`'s
+`argenv_wire_bytes_golden`. `ET_EXEC` only: no PIE, no interpreter, no dynamic linking
+(§12 untouched; §5.1 refuses the rest by name). The 8 KiB stack floor
+is a floor, not a measurement — §11's Q2 still stands; there is no
+vDSO by decision, and §11's Q5 (rseq/membarrier at start-up) is still
+open. `mmap`/`munmap` remain the named gaps of §10.10/§10.11; the
+reply payload's copy-IN landed at increment 12 (step 3's section
+below), and `read` rides that same machinery as step 4's arm.
+
+### 10.13 What is planned — the plan's increment 8 (the reply payload and the file class), scoped
+
+**Nothing in this section has landed.** It is written to increment 1's own
+discipline — the contracts before any mechanism (§10.5) — against the
+seams as they exist in the tree today, so the increment can be judged as
+a scope before a line of it exists. The two gaps §10.10 named — `read`'s
+copy-IN and the fd class that stayed ENOSYS beside it — are one
+increment because they are one boundary: increment 5 taught the forward
+to carry bytes OUT of the child, and this increment makes the reply
+carry bytes BACK and the paths out. (§10.11's `mmap`/`munmap` join only
+conditionally, as step 1 below — the diagnosis decides.)
+
+**What the increment must produce.** Two seams and one measurement: (1)
+the reply payload, host-tested on both sides; (2) the file class
+answered end to end; (3) the designated first user running with its
+REAL argv — `--storage /tmp/e7-census/sls_storage.img --backup-dir
+/tmp/e7-census/backups --kind hourly --retain 4`, `CANDIDATE_ARGS` as
+`tools/linux_abi_candidate.conf` records it — crossing on §5.2's ARGENV
+record, through its file work to `exit_group(0)`, every trap line of
+the run attributable and any remaining refusal named by the log line
+that proves it. That run is the gate's first half (§8).
+
+**The reply payload (the copy-IN), seam by seam.** Every place is named
+before it exists — and increment 12 consumed each name in order (step
+3's DONE section below):
+
+- **`linux_fd_reply_plan(num, args)`** — the first-trap twin of
+  `linux_fd_write_plan` (`kernel/linux_abi.c`): per copy-IN number it
+  validates the CHILD's destination span (canonical, inside the user
+  range — the `(span_end - 1) > MAX` shape the write-plan host tests
+  already pin), clamps the count to a per-number chunk no larger than
+  `FD_PAYLOAD_CAP`, and refuses `-LINUX_EFAULT` before any post.
+  `read`'s count-0 rule is write's own, mirrored: `read(fd, NULL, 0)`
+  plans nothing BEFORE canonicality, because inventing -EFAULT there
+  would be a rule no kernel the candidate was compiled against has.
+- **The staged destination.** The copy-in aims where the FIRST trap
+  said, never where the reply says: the plan's (buffer VA, clamped
+  len) are staged in `struct ProcessDescriptor` beside `fs_base_stage`
+  (`kernel/process.h`), set before `k_linux_forward`, consumed at the
+  apply, cleared at every refusal and at slot reuse beside
+  `proc_clear_resume_state()`'s existing clears. `park_req` cannot
+  carry it — it holds the expected num as a VALUE precisely because
+  the first-trap frame died (§10.7), and `CapParkCtx` saves only
+  sysret-state registers. The stage is the value-shaped path, and its
+  lifecycle is four places where a stale destination would aim a
+  sidecar payload at a reused slot's successor — which is what makes
+  it clause work, not implementation detail.
+- **`linux_user_copy_in(dst, root, va, n)`** — the mirror of
+  `linux_user_copy_out` over the same four-level walk, and STRICTER
+  where it must be: every page present, USER **and writable**, in two
+  phases (validate the whole span, then write), allocating nothing.
+  Writable, not merely user: copy-out only needs readable, but copy-in
+  must never write a byte into a page the child itself could not have
+  written — or the sidecar would launder writes through the child's
+  read-only pages. That asymmetry is the new security property, and
+  its host test is M4's family extended to refusals-before-mutation.
+- **`k_linux_deliver`'s recv** (`kernel/chan.c`) — today
+  `k_chan_recv(… sizeof reply)` and `out.len != sizeof reply →
+  -CAP_ERR_PROTO`; it becomes a local of `72 + FD_PAYLOAD_CAP`
+  accepting exactly three shapes: 72 bytes (unchanged), `72 + n` where
+  `n` is echoed by the header's `ret` AND bounded by the staged len
+  (apply, copy in, `rax = n`), and anything else `-CAP_ERR_PROTO`.
+  The frame grows ~1 KiB on the resume path, so
+  `tests/stack_frame_budget_check.sh` is the teeth — and the fallback
+  if it reddens is NOT a static buffer: deliver runs concurrently on
+  SMP, each on its child's own resume frame, and the per-frame local is
+  what keeps that safe.
+- **`service()`'s bound** (`user/sidecar/src/linux.rs`) — the mirror
+  over the answer: a reply-payload number's payload must equal the
+  forwarded `args[2]`'s clamp (the clamp rides IN the description, as
+  in increment 5), returned through a new `Answer::ReplyBytes(ret,
+  bytes)` beside `Answer::Write`.
+
+**The paths (the forward's second shape).** `open`, `stat`, `lstat`,
+`unlink`, `mkdir` and `rename` carry a pathname OUT of the child:
+`linux_fd_path_plan` mirrors the write plan — copy-out of a
+NUL-terminated string bounded by `LINUX_PATH_CAP`, the twin of
+`FD_PAYLOAD_CAP` (1024), a span with no NUL within the cap refusing
+`-LINUX_ENAMETOOLONG` at the first trap. Named divergence: Linux's
+`PATH_MAX` is 4096; this shim refuses above 1024 by name, and the
+trigger to raise it is raising `FD_PAYLOAD_CAP` and both recv buffers
+together — not a quiet edit. `rename`'s two paths ride back to back,
+two NUL-terminated strings in one payload, split at the first NUL by
+the sidecar.
+
+**The §10.7 property changes here, by widening and not by relaxing.**
+"A payload that is not exactly 72 bytes is not a reply" stays TRUE for
+every number that planned no reply payload; the new truth is a second
+legal shape — 72 bytes plus a payload this request's own first trap
+allowed, bounded by the child's own clamp, echoed by `ret`, copied only
+where the child could write. The M-clause teeth that pin "exactly 72"
+are rewritten, not deleted, to pin both shapes, and every new refusal
+arm gets its own: payload with `n` beyond the staged len → `-EPROTO`;
+`ret != n` → `-EPROTO`; payload on a number with no reply plan →
+`-EPROTO`; a stage surviving an apply, a refusal or a slot reuse → its
+clause reddens.
+
+**The file class: what lands, and on whose code.** §5.6's class as the
+census measured it — `read`(0), `open`(2), `close`(3), `stat`(4),
+`lstat`(6), `lseek`(8), `fcntl`(72), `fsync`(74), `ftruncate`(77),
+`rename`(82), `mkdir`(83), `unlink`(87), `getdents64`(217): thirteen
+numbers. The kernel semantics are this increment's two seams and
+nothing more; every DECISION is the sidecar's existing VFS — which is
+D1 surviving its own file class: `user/vfs` already implements
+`open(task, path, flags, mode)`, `close`, `lseek`, `read`, `write`,
+`stat(path)` and `read_dir(path)` over `/` (aerofs-lite), `/dev` and
+`/tmp` (ramfs), mounted at boot (`user/sidecar/src/boot.rs`) and
+already exercised by the shell's redirects
+(`user/sidecar/tests/boot_tests.rs`). The new work is the BRIDGE, and
+it is small by construction:
+
+- `FdSlot` grows the File kind carrying the VFS fd and the open flags
+  it must echo (`F_GETFL`); `answer()` routes thirteen arms to the VFS
+  under the Linux task's VFS task id. An unknown kind keeps answering
+  ENOSYS — increment 5's rule, unchanged.
+- The flags need almost no translation: `user/vfs/src/vfs.rs` defines
+  `O_RDONLY/O_WRONLY/O_RDWR/O_CREAT/O_EXCL/O_TRUNC/O_APPEND` at
+  Linux's own octal values. What does not fit is named — the flag
+  word is `u16`, and `O_DIRECTORY`/`O_CLOEXEC` cannot fit in it — so
+  those bits are refused at `open` by name (trigger: widen the flag
+  word), never silently dropped.
+- `fcntl` answers exactly four commands — `F_GETFD`/`F_SETFD` (the
+  fd's own cloexec, which the VFS already tracks for `close_cloexec`)
+  and `F_GETFL`/`F_SETFL`; every other command is ENOSYS with the cmd
+  word logged, because a fabricated answer to a command nobody
+  measured is the placeholder failure in a new shape.
+- The struct forms are format references in `user/proto`, with golden
+  tests beside `argenv_wire_bytes_golden`: `struct stat` at musl's
+  x86-64 layout (144 bytes, field offsets pinned golden and proved
+  on-target by the probe reading back the fields it wrote) and
+  `struct linux_dirent64` (`d_reclen` 8-aligned, `d_name` NUL-padded,
+  records bounded by the reply payload).
+- `fsync` on a ramfs-backed slot answers 0 — the shmem-faithful
+  answer, since Linux's own tmpfs fsync is a no-op; durability of core
+  memory across a host failure is claimed by neither, and across
+  restore it is v0.2's CONTENTS question, not this one. A
+  device-backed slot answers ENOSYS until the cache has a flush entry
+  point to call — named, and unreachable from the census's single
+  `fsync` row, which lands on `/tmp`.
+
+**Step 0 — executed, and the diagnosis names the loader, not `mmap`.**
+The instrument (step 0.5) landed: `service`'s line now carries the
+child's own name — `[E7] linux: num=0000009E child=e7.linux.user.0
+ok` — with `child=?` on the one arm that has no task context (reply's
+send-failure path), so a missing name looks missing rather than like a
+parsing accident. Two boots, the watchdog respawn reproducing the
+first exactly:
+
+```
+e7.linux.probe.0   21 trap lines (two boots)  -> full sequence, exit_group
+e7.linux.cand.0    20 trap lines (two boots)  -> full sequence, exit_group
+e7.linux.user.0     4 trap lines (two boots)  -> 158, 218 — then nothing
+```
+
+So the firstuser earns exactly TWO traps per boot — `arch_prctl` (158,
+granted) and `set_tid_address` (218, echoed) — and then no further
+trap at all: no `open`, no `brk`, no `mmap`, no `clock_gettime`, no
+`exit_group`. **This corrects this section's earlier reading.** The
+startup `brk`/`write` lines it attributed to "three of each" belong to
+the probe and the candidate; the counts were unattributable, and the
+inference drawn from them was wrong. Both boots end `[FAULT] Ring-3
+#PF  error=0x15  addr=0x0000000000000028  rip=0x0000000000000028
+rdi=0x000000000800d860`.
+
+`error=0x15` is a user-mode **instruction fetch** from a **present**
+page: control was transferred TO 0x28, it did not fetch through a NULL
+object's slot — which retires the "failed allocation or skipped
+initialization" reading this section guessed. `rdi` names the site's
+own proof: `0x800d860` is `main`, a 39-byte FUNC in the committed
+firstuser ELF, so the death is inside musl's start path, which holds
+`main` in `rdi` from `_start` onward and clobbers it only at
+`libc_start_main_stage2`'s `call *%rbx`. The one indirect transfer in
+that path which preserves `rdi` is `__libc_start_init`'s `call
+*(%rbx)` — its `.init_array` loop, exactly one entry. `rbx` =
+`0x80773a0`, whose file bytes are `00 ae 00 08 00 00 00 00` =
+`0x800ae00` (`__do_init`). The child read back **`0x28`** — which is
+the file's bytes at offset `0x76710`: `.init_array`'s own value,
+shifted forward by `0x370`.
+
+The shift is `elf64_map_blob`'s unstated assumption. It copies each
+LOAD into per-page frames from frame offset 0 and maps the page
+*containing* `p_vaddr + p*4096`, so a segment whose `p_vaddr` is not
+page-aligned lands `p_vaddr & 0xFFF` bytes early in vaddr space and
+every read inside it returns the file that many bytes further on. The
+firstuser's RW LOAD is `vaddr=0x8077370` — the boot's own `[LOADER]
+ELF segment` line — and it is the only unaligned LOAD in either
+image: the candidate's two are `0x3ff000` and `0x400000`, which is why
+increment 7's census passed and this stayed invisible until a binary
+with a real libc linked a RW segment at a non-aligned address.
+
+**Step 1 — DONE, and it carried the firstuser past `main`.** The fix
+anchors each LOAD's frames at its **page** base and copies from the
+segment offset that vaddr implies; both are zero for an aligned
+segment, so every image that already worked is unmoved. The hazard the
+fix makes possible is refused by name before the first frame — two
+LOADs covering one page would be mapped twice through the one frame a
+page gets, the second silently discarding the first's bytes and
+permissions. Host teeth: a new **E8a** section in
+`tests/cap_create_sidecar_host_test.c` maps a synthetic image whose RW
+segment sits 0x370 into its page and asserts the bytes at their linked
+vaddr, the page's leading bytes zero, the BSS tail zero, the flags
+intact and the shared-page refusal — it **FAILs three ways against the
+old mapper and passes with the fix** (403 checks now). Guard clause
+**O8**, teeth **t53/t54**.
+
+The measurement — E3 boot, `e3_multi_env_boot_check.sh` RC=0:
+
+```
+[E7] linux: num=0000009E child=e7.linux.user.0 ok                arch_prctl (158)
+[E7] linux: num=000000DA child=e7.linux.user.0 ok                set_tid_address (218)
+[E7] linux: num=00000007 child=e7.linux.user.0 -> ENOSYS         poll (7)
+[E7] linux: num=0000000E child=e7.linux.user.0 -> ENOSYS         rt_sigprocmask (14)
+[E7] linux: num=000000C8 child=e7.linux.user.0 -> ENOSYS         tkill (200)
+[E7] linux: num=0000000E child=e7.linux.user.0 -> ENOSYS         rt_sigprocmask (14)
+[E7] linux: num=0000000E child=e7.linux.user.0 -> ENOSYS         rt_sigprocmask (14)
+[PROC] PID 111 'e7.linux.user.0' exited (code=134).
+```
+
+Seven traps instead of two, no `rip=0x28`, and `main` is reached:
+the loader was the whole wall. The child is now inside the Rust
+runtime, asks for `poll`/`rt_sigprocmask`/`tkill`, gets ENOSYS for
+each, and aborts. (The `num=00000007` line was first annotated
+"munmap" here — wrong, and corrected at increment 11 below: Linux's
+number 7 is `poll`, while the census row `11 munmap 7` puts its
+`7` at the COUNT position. The same binary's reference trace has
+`poll` as its third syscall and its first `munmap` eighteen calls
+later; munmap is never trapped in this run at all.)
+
+**What this run names next — two gaps, each by its own line.** (1)
+The death: `[FAULT] Ring-3 fault  cs=0x23  error=0x0
+rip=0x00000000080525b0`, and `0x80525b0` is `pxor %xmm0,%xmm0` —
+musl `abort`'s FIRST SSE instruction, after a `__lock` that is integer
+only. This is the general #UD/#GP/#SS/#NP handler's line, and `#UD`
+carries no error code. The tree writes **no `CR4.OSFXSR` anywhere**, and
+`arch/x86/lazy_fpu.c` ships no `xsetbv` — `kernel/vecstore.c` says so in
+its own words. (Corrected against the code at step 2: the vector-7 gate
+was NOT missing — `idt.c` has installed `isr7_stub` for #NM since SIMI
+Phase 10 — so the wall was `CR4.OSFXSR` alone; `vecstore.c`'s comment,
+and this section's first reading of it, are stale about the gate.) So
+**a ring-3
+task takes #UD on any SSE instruction**, which is every real libc and
+every Rust binary: a gate in front of the gate, since nothing in §5.6
+can be measured on a child that cannot execute SSE. (2) The three
+numbers refused above, each its own increment: `poll`(7) — the zero-
+timeout readiness probe Rust std's `lang_start_internal` makes before
+it installs any signal handler (mislabelled `munmap` above; corrected
+at increment 11, whose increment it became); and
+`rt_sigprocmask`(14)/`tkill`(200) — the signal seam, which §11 Q5's
+policy already covers (ENOSYS with a logged name) but which `abort()`
+needs before it can die cleanly instead of faulting.
+
+**Step 2's SSE half — DONE, measured: the firstuser now EXECUTES the
+vector code that killed it, and the death moved into `abort`'s tail.**
+The gate is `fpu_enable_sse()` (`arch/x86/lazy_fpu.c`), armed on the
+BSP in `kernel.c`'s 4b block BEFORE `syscall_gate_init()` opens ring 3
+at all. Its bits live pure in `arch/x86/fpu_enable.h` so a host test
+pins them against the SDM rather than against a comment:
+`CR4.OSFXSR` (bit 9) and `OSXMMEXCPT` (bit 10) set with every other
+CR4 bit preserved, `CR0.MP` set and `EM`/`TS` cleared with the rest
+preserved, CPUID.1:EDX bits 25/26 gating the whole sequence — a CPU
+without SSE gets a refusal line instead of a CR4 write it would #GP on
+(a triple fault under `-no-reboot`, i.e. a silent reset) — then
+`fninit` and the 0x1F80 `ldmxcsr` (FNINIT does not touch MXCSR, so the
+separate `ldmxcsr` is what defines the SIMD state). The ORDER is
+load-bearing and is itself tested: `ldmxcsr` is an SSE instruction, so
+`OSFXSR` must already be set when it runs — the exact #UD the step-1
+run died on.
+
+What the gate deliberately does NOT do: arm `CR0.TS`. TS is the lazy
+switch's trigger (`switch_lazy.asm` sets it on a switch-in,
+`lazy_fpu.c`'s `clts` + xsave/xrstor services it); that path has no
+caller — `perform_lazy_context_switch` is referenced by nothing — and
+its xsave would need `CR4.OSXSAVE`, never set. So #NM never fires, the
+machinery stays dormant, and XMM state is NOT saved per task across a
+switch: a named gap, stated in both files rather than papered over.
+The vector-7 chain is nonetheless kept intact (`idt.c` → `isr7_stub` →
+`handle_device_not_available_fault` → `clts`), because an #NM with no
+handler is the same silent-triple-fault class the #UD diagnosis
+depended on avoiding.
+
+Host teeth: `tests/fpu_enable_host_test.c`, 40 checks, green — the bit
+arithmetic over 4000 seeded inputs plus the SDM's literal values; the
+enable's EMITTED order read back from `gcc -O0 -S` of the real
+`lazy_fpu.c` (CR4 write before CR0 before `fninit` before `ldmxcsr`,
+the 8064 = 0x1F80 immediate present); and the wiring (the `kernel.c`
+call ahead of `syscall_gate_init`, the vector-7 chain end to end, the
+dormancy claim). Mutations bite: deleting the CR4-write assignment
+reddens the order check; moving OSFXSR to bit 8 reddens three checks;
+deleting `kernel.c`'s call reddens two. Guard clause **Q**, teeth
+**t70–t75** — numbered after P's reserved `t55+`, so the
+reply-payload family's reservation stands. Smoke 61/61.
+
+The measurement — same E3 harness, `e3_multi_env_boot_check.sh` RC=0:
+
+```
+[FPU] SSE/SSE2 enabled for ring 3 — CR4.OSFXSR|OSXMMEXCPT, CR0.MP; EM/TS clear, CR0.TS not armed
+[E7] linux: num=0000009E child=e7.linux.user.0 ok                arch_prctl (158)
+[E7] linux: num=000000DA child=e7.linux.user.0 ok                set_tid_address (218)
+[E7] linux: num=00000007 child=e7.linux.user.0 -> ENOSYS         poll (7)
+[E7] linux: num=0000000E child=e7.linux.user.0 -> ENOSYS         rt_sigprocmask (14)
+[E7] linux: num=000000C8 child=e7.linux.user.0 -> ENOSYS         tkill (200)
+[E7] linux: num=0000000E child=e7.linux.user.0 -> ENOSYS         rt_sigprocmask (14)
+[E7] linux: num=0000000E child=e7.linux.user.0 -> ENOSYS         rt_sigprocmask (14)
+[E7] linux: num=0000000D child=e7.linux.user.0 -> ENOSYS         rt_sigaction (13)
+[E7] linux: num=000000C8 child=e7.linux.user.0 -> ENOSYS         tkill (200)
+[E7] linux: num=0000000E child=e7.linux.user.0 -> ENOSYS         rt_sigprocmask (14)
+[FAULT] Ring-3 fault  cs=0x23  error=0x0  rip=0x000000000805260c  — killing process.
+[PROC] PID 111 'e7.linux.user.0' exited (code=134).
+```
+
+Ten attributed traps — `rt_sigaction` (13) newly among them — and
+`0x80525b0`, `pxor %xmm0,%xmm0`, NOW EXECUTES (with
+`movaps %xmm0,0x10(%rsp)` behind it). The death moved 0x5C bytes to
+`0x805260c`, which is `hlt`: the unconditional instruction after
+`abort`'s final `rt_sigprocmask`, followed by `raise(SIGKILL)` and
+`_Exit(127)`. `hlt` at CPL 3 is #UD with no error code — the same
+handler line as before, a different instruction. And it is reachable
+ONLY because nothing dies earlier: on a real system `abort`'s first
+`raise(SIGABRT)` terminates the task, so the whole tail is dead code.
+Here `tkill`/`rt_sigaction`/`rt_sigprocmask` all answer ENOSYS,
+`raise` returns, and `abort` walks to its guard instruction. The
+remaining wall is therefore exactly the signal seam this section
+already named as the next increment, now with a falsifiable shape:
+with SIGABRT delivery in place the firstuser dies at its FIRST `tkill`
+with **no `[FAULT]` line at all**, and `exited (code=134)` stops being
+the fault path's fixed `process_exit(134)` (`kernel/stubs.c`) and
+starts being an attribution. (The log's second FAULT —
+`rip=0x400000015067`, PID 104 — is `[irqtest] p4`'s own storm kill,
+byte-for-byte present in `boot_cap.log` from before this increment:
+pre-existing, not this gate's.)
+
+Suite after the change: `run_all` 127 passed / 0 failed / 2
+pre-existing skips (the new host test among them); personality guard
+all clauses hold including Q1–Q4; smoke 61/61;
+`script_conventions_check` 0 violations; `stack_frame_budget_check`
+234 files PASS; `make x86-iso-e3` RC=0.
+
+**Step 2's signal half — DONE, measured: `abort`'s first `raise(SIGABRT)`
+now KILLS the task inside the delivering syscall, and the run ends with
+no `[FAULT]` line at all.** The seam is a three-part split. The KERNEL
+owns the byte crossing and nothing else: `linux_sig_copy_plan`
+(`kernel/linux_abi.{h,c}`) plans `rt_sigaction`'s 32-byte `act` and
+`rt_sigprocmask`'s 8-byte `set` out of the child through the same
+read-only USER-bit walker the fd class's writes use, and refuses at the
+FIRST trap — before any channel post — exactly three ways: a
+`sigsetsize` other than 8 is `-EINVAL` (Linux's own answer to a width
+the kernel-ABI sigset does not have), an `oldact`/`oldset` out-pointer
+is `-ENOSYS` (§10.10's copy-IN gap, refused BY NAME rather than answered
+0 — answering 0 would leave the caller's buffer full of stack garbage
+it believes is an answer; increment 12 below retires this refusal —
+the span is planned as a reply payload instead, measured), and a
+non-canonical or max-crossing span is
+`-EFAULT` (the bound checked on the WHOLE span, inclusive at
+`LINUX_USER_ADDR_MAX`'s last byte). The dispatch
+(`kernel/syscall_dispatch.c`) consumes the plan before its post, logs
+the refusal by name, and merges the span into the forward; 13/14 are
+classed `LSC_SIG` in the census table. The SIDECAR owns every semantic
+decision (`user/sidecar/src/linux.rs`): a per-task `SigState` (tid,
+mask, pending, dispositions); 13 records DFL/IGN only — a handler
+install is ENOSYS by name before any mutation, because v1 has no signal
+frames to deliver one on — with SIGKILL/SIGSTOP unchangeable (EINVAL,
+Linux's own rule); 14 does the BLOCK/UNBLOCK/SETMASK arithmetic and then
+a REVEAL pass over the pending set: a revealed IGN (or
+ignore-by-default) signal is discarded — that IS its delivery — a
+revealed default-terminate signal runs the kill RIGHT THERE with no
+reply, which is exactly where musl's `raise()` dies on real Linux, and
+a default-stop signal refuses the call before anything moves, not even
+the mask; 200 matches the tid against the `set_tid_address` echo at u32
+width (ESRCH otherwise — cross-task signals are never silently
+re-targeted), treats sig 0 as the existence probe, pends a blocked
+signal for the unblock arm above to deliver, and otherwise runs the
+default action. Every kill converges on one answer, `Answer::SignalKill`,
+whose service arm logs the number, reaps through exit_group's own path
+(same name→pid liveness, same immediate teardown, same no-strand
+refusal) and replies nothing — on real Linux the process dies inside
+the delivering syscall and never returns to its caller.
+
+Host teeth on both halves: `tests/linux_personality_host_test.c`, **98
+checks green** — the plan's two named refusals, their precedence (width
+before pointer), both EFAULT bounds including the inclusive-max
+boundary, both lengths, and the total number space; and
+`user/sidecar/src/linux.rs`'s unit tests, **11 green** —
+`expected_req_len`'s twins (72+32 / 72+8 / 72 for a NULL act, tkill and
+out-of-class), DFL and IGN recording, the handler-install refusal,
+SIGKILL's EINVAL, all three mask operations, the full SIGABRT sequence
+(block → tkill pends → 0 → unblock reveals → `SignalKill`), and the tid
+mismatch answered ESRCH. Guard clause **R** (R1–R6) with teeth
+**t76–t83**: the plan's EINVAL silenced, the dispatch's refusal return
+deleted, the tkill arm renamed away, a default-terminate arm answering
+success (the silent lie of the whole clause set), the handler-install
+refusal answered 0, tkill's tid scope deleted, `rt_sigprocmask` out of
+the class table, the plan's host-test section deleted. Smoke **69/69**.
+
+The measurement — same E3 harness, `e3_multi_env_boot_check.sh` RC=0,
+both of the boot's firstuser runs (the irqtest storm's kill of the
+system POSIX restarts the instance; both runs are identical):
+
+```
+[E7] linux: num=0000009E child=e7.linux.user.0 ok                    arch_prctl (158)
+[E7] linux: num=000000DA child=e7.linux.user.0 ok                    set_tid_address (218)
+[E7] linux: num=00000007 child=e7.linux.user.0 -> ENOSYS             poll (7)
+[E7] linux sig syscall 14 refused before post: oldact/oldset copy-back not landed (trigger: reply payload copy-IN)
+[E7] linux: num=000000C8 child=e7.linux.user.0 sig default-action -> kill      tkill (200)
+[PROC] PID 111 terminated.
+[TORE] PID 111 teardown: 2 cap(s) dropped, 0 object(s) destroyed, 0 arena frame(s) returned, table 13 unbound
+[TORE] address space 0x0000000013129000 destroyed: 148 frame(s) freed
+```
+
+Five lines and a reap — against the SSE run's ten traps, an ENOSYS wall
+and a `[FAULT]` at `hlt`. The `oldset` refusal firing by name is the
+seam refusing exactly what it cannot honestly serve, with its trigger
+in the log (the reply payload's copy-IN); and the death is an
+ATTRIBUTION (`terminated.`, frames returned to the partition), not the
+fault path's `exited (code=134)` — the falsifiable gate this section
+set, met at the first `tkill` with no `[FAULT]` line anywhere in the
+firstuser's run. What remains ENOSYS in that run is `poll` (7) alone
+(the line first annotated `munmap` here; corrected at increment 11
+below — Linux's number 7 is poll, and munmap never fires in the run).
+Suite: `run_all` 127 passed / 0 failed / 2 pre-existing skips;
+personality guard all 70 clauses hold; smoke 69/69;
+`script_conventions_check` 0 violations; `stack_frame_budget_check`
+234 files PASS; `make x86-iso-e3` RC=0; the sidecar crate's tests
+11/11 on the new suite.
+
+**Step 2's poll coda — DONE, measured: the run's last ENOSYS ANSWER
+retires, and the firstuser's first output crosses the fd class.** The
+line this section had annotated `munmap (7)` is `poll` — Linux's
+number 7, Rust std's `lang_start_internal` polling fds {0,1,2} with a
+ZERO timeout before it installs any signal handler. The correction is
+triangulated rather than asserted: the kernel's own class table carries
+`{ 7, LSC_FD, 0 }, /* poll */` with munmap at 11; the census artifact
+(`tools/linux_syscall_census.txt`) carries `7 poll 1` and
+`11 munmap 7` — the annotation took the row's COUNT for the number —
+and the same fixture traced under `qemu-x86_64 -strace` in WSL makes
+`arch_prctl`, `set_tid_address`, `poll` its first three calls, the
+run's `9E`/`DA`/`07` order exactly, while its first `munmap` comes
+eighteen calls later, behind `mmap`s this shim has never answered.
+**munmap (11) is never trapped in the firstuser's run at all**, so the
+run's last ENOSYS could never have been its; §5.4's second half stays
+the named gap it was, waiting for the anonymous-map increment.
+
+The answer is deliberately the smallest honest one. A ZERO-timeout
+poll reports 0 events: this shim has no console-input readiness state
+(§10.13's named input class), so "nothing ready" is the whole truth it
+can tell, and UNDER-reporting readiness can only send a caller back to
+its own loop — never into an action built on readiness nobody claimed.
+The pollfd ARRAY is never read and revents never written: a count of 0
+promises neither (POSIX defines revents only for ready fds), so no
+copy crosses in either direction — the copy-IN that would carry
+revents stays increment 8's named gap. A poll that would WAIT (ms > 0,
+or -1's forever) is refused at the FIRST trap, before any channel
+post, by `linux_poll_refuses_blocking` (`kernel/linux_abi.{h,c}`):
+Linux's timeout is an int, so the low 32 bits decide sign-extended —
+-1 and 5000 refuse, 0 and 0x1_00000000 do not — and the sidecar's
+7 arm carries the same rule as its twin (mprotect's both-ends posture
+over a timeout word instead of a prot word): waiting needs a wake
+against input state that does not exist, and answering 0 to a 5000 ms
+poll would make the caller spin its five seconds inside its own loop
+on a lie.
+
+Host teeth: `tests/linux_personality_host_test.c`, **105 checks
+green** — the predicate's probe, the timed and infinite refusals, the
+int-width rule, the total number space — and
+`user/sidecar/src/linux.rs`'s unit tests, **12 green** (the new poll
+test: the probe's 0, nfds-irrelevance, both refusals, both int-width
+directions). Guard clause **S** (S1–S3) with teeth **t84–t89**: the
+predicate neutered to "refuse every poll" (the wall back by name), the
+first-trap refusal block deleted (the waiting poll posts and parks),
+the arm renamed away, the arm's two answers inverted, a waiting poll
+granted 0, and the predicate's host-test section deleted. Smoke
+**75/75**.
+
+The measurement — same E3 harness, `e3_multi_env_boot_check.sh` RC=0,
+both of the boot's firstuser runs identical:
+
+```
+[E7] linux: num=0000009E child=e7.linux.user.0 ok                    arch_prctl (158)
+[E7] linux: num=000000DA child=e7.linux.user.0 ok                    set_tid_address (218)
+[E7] linux: num=00000007 child=e7.linux.user.0 ok                    poll (7)
+[E7] linux sig syscall 13 refused before post: oldact/oldset copy-back not landed (trigger: reply payload copy-IN)
+[E7] linux: num=00000001 child=e7.linux.user.0 write ok              write(1) — the run's first output
+[E7] linux sig syscall 14 refused before post: oldact/oldset copy-back not landed (trigger: reply payload copy-IN)
+[E7] linux: num=000000C8 child=e7.linux.user.0 sig default-action -> kill      tkill (200)
+[PROC] PID 111 terminated.
+```
+
+**The run now goes further than it ever has, and what stops it has a
+name.** With `poll` answered, std's init walks past its own SIGPIPE
+setup refusal and the task WRITES — the fd class performs the bytes
+(`write ok`), and the payload drained onto the serial is Rust's own
+verdict about the remaining wall:
+
+```
+fatal runtime error: assertion failed: signal(libc::SIGPIPE, handler) != libc::SIG_ERR, aborting
+```
+
+`signal(SIGPIPE, …)` is `rt_sigaction` (13) with an `oldact`
+out-pointer; the copy-IN gap refuses it by name, `SIG_ERR` comes back,
+the assert fires, `abort` runs — and `raise(SIGABRT)` meets the same
+gap at 14 before the kill lands at the first `tkill`, attribution
+unchanged. **Zero sidecar ENOSYS answers remain in the run**: every
+ENOSYS the task still sees is a first-trap refusal printed beside its
+trigger, and both triggers are one sentence — §10.10's copy-IN gap,
+whose landing (step 3's `linux_user_copy_in` and the reply payload) is
+now the single MEASURED wall between this run and the workload's own
+code. Suite: `run_all` 127 passed / 0 failed / 2 pre-existing skips;
+personality guard all 74 clauses hold; smoke 75/75;
+`script_conventions_check` 0 violations; `stack_frame_budget_check`
+234 files PASS; `make x86-iso-e3` RC=0; the sidecar crate's tests
+green (12 of them `linux::tests`).
+
+**Step 3's reply payload — DONE, measured: the oldact/oldset refusals
+retire, and the SIGPIPE assert is gone from the run.** The copy-IN
+lands as the contracts above name it, split the same way the OUT
+direction was: the FIRST trap validates and stages, the DELIVER copies
+within the stage, the SIDECAR decides the bytes.
+
+The kernel's three pieces (`kernel/linux_abi.{h,c}`):
+`linux_fd_reply_plan` is the write plan's mirror over the IN
+direction — per copy-IN number it turns a non-NULL out-pointer into a
+(dst, clamp) span (32 for rt_sigaction, 8 for rt_sigprocmask; NULL
+plans nothing, because nothing is owed back) and refuses a
+non-canonical or max-crossing span `-EFAULT` at the first trap, before
+any post; `linux_user_copy_in` is copy_out's mirror over the same
+four-level walk, STRICTER where it must be — present, USER **and
+writable** at every level (the sidecar must never launder a write
+through a page the child could not have written), in two phases
+(validate the WHOLE span, then write), so a refusal anywhere mutates
+NOTHING; and `linux_reply_shape_ok` keeps header, payload and rax one
+truth — a count-truth number (read, whose ret IS the count) must echo
+n, the sig numbers must answer 0, and a ret the number contradicts is
+`-EPROTO` before anything is copied. The sig plan's out-pointer ENOSYS
+is gone with it (guard R1 rewritten: two refusals AND the ENOSYS's
+absence).
+
+The STAGED DESTINATION (`kernel/process.h`, beside `fs_base_stage`):
+`reply_stage_{num, va, len, valid}` is the contract's value-shaped
+path — `park_req` cannot carry it (§10.7), so its lifecycle is the
+four places where a stale one would aim a sidecar payload at a reused
+slot's successor: cleared at the TOP of every first-trap block,
+STAGED immediately before the arm (after every other first-trap
+refusal has had its say), CONSUMED at the deliver (read into locals
+and cleared before any branch, and only when the stage's num is this
+request's), and cleared at slot reuse beside the other stages.
+
+The deliver (`kernel/chan.c`) accepts exactly the contract's three
+shapes, over a per-frame `72 + FD_PAYLOAD_CAP` buffer (an exactly-72
+buffer would make a payload reply `CAP_ERR_BUFSZ` forever under the
+no-loss rule — a wedge, not an error; the ~1 KiB frame is
+`stack_frame_budget_check`'s to measure, and a STATIC buffer is
+deliberately not the fallback — SMP delivers concurrently, each on its
+own resume frame): **1.** 72 bytes — the plain reply, unchanged,
+EXCEPT that a success (status 0) on a request that staged an owed
+payload is refused `-EPROTO` — answering 0 while the caller's
+out-pointer keeps stack garbage is the silent lie this seam exists to
+prevent, and an errno reply (which owes no payload) passes untouched.
+**2.** 72+n — the stage must belong to this request, n within the
+staged clamp, the header echoing this num with status 0 and a
+shape-legal ret: then apply, then copy n bytes in through the
+two-phase walk, then rax (0 for the sig numbers, n for read when it
+lands). **3.** anything else `-CAP_ERR_PROTO`: payload on a number
+with no reply plan, n beyond the clamp, payload on an errno reply, a
+contradicting ret, a missed echo. A copy refusal is `-EFAULT` with
+apply's value discarded — two-phase means nothing was written, and the
+task hears the truth about its own pointer.
+
+The sidecar's twin (`user/sidecar/src/linux.rs`): a new
+`Answer::ReplyBytes(ret, len, bytes)` beside `Reply`, and its bound
+lives in `service()` — a payload answer goes out only when the
+FORWARDED out-pointer asked for one and len equals that number's
+clamp, else it is re-sent as num=0 → the kernel's echo refuses
+`-EPROTO` (neither end load-bearing alone — the same posture as
+every seam here). The 13 arm answers a QUERY (act NULL, oldact set)
+and a SUCCESS with the OLD disposition captured BEFORE any mutation;
+the 14 arm likewise carries the mask as it WAS; every refusal arm
+(EINVAL, handler-install ENOSYS, stop-reveal ENOSYS) stays a plain
+72-byte errno reply — an errno owes no payload, which is the
+deliver's shape-1 rule on the other end. The bytes themselves are the
+truth of what this state records: handler word (DFL 0 / IGN 1),
+everything else ZERO — sa_flags/sa_restorer/sa_mask were never stored,
+and zero IS that fact rather than a default invented for the reply.
+
+Teeth: host test **131 checks** (+26: the reply plan's branches, the
+two-phase copy's bytes-unchanged refusals — read-only leaf, read-only
+mid-level, supervisor, absent, huge, and the cross-page case where the
+SECOND page refuses so the FIRST must be untouched — and the
+ret-shape rule both ways); guard clause **set T** (T, T1–T6) with
+**R1 rewritten** (the sig plan's two refusals plus the retired
+ENOSYS's absence) and teeth **t90–t99**: the plan's refusal deleted,
+the stage never staged, the consume deleted, the slot-reuse clear
+deleted, the clamp dropped from the shape gate, the writable check
+deleted, the sidecar bound inverted, the payload never sent, the
+host-test section deleted, and the retired ENOSYS re-added. Smoke
+**85/85**; the sidecar crate's `linux::` tests **12/12** (the oldact
+and oldset twins rewritten to their payload shapes, the query branch,
+and the capture-before-mutation case).
+
+The measurement — E3 harness OK (`e3_multi_env_boot_check.sh`, both
+tenant environments, done-marker seen), firstuser's run:
+
+```
+[E7] linux: num=0000009E child=e7.linux.user.0 ok                    arch_prctl (158)
+[E7] linux: num=000000DA child=e7.linux.user.0 ok                    set_tid_address (218)
+[E7] linux: num=00000007 child=e7.linux.user.0 ok                    poll (7)
+[E7] linux: num=0000000D child=e7.linux.user.0 ok + payload          rt_sigaction (13) — signal(SIGPIPE, …) with oldact
+[E7] linux: num=0000000D child=e7.linux.user.0 ok + payload          rt_sigaction (13) — the second install
+[E7] linux: num=0000000E child=e7.linux.user.0 ok                    rt_sigprocmask (14)
+[FAULT] Ring-3 #PF  error=0x5  addr=0x0000000000000091  rip=0x0000000008054bdf  rdi=0x00000000131c15d8 — killing process.
+[PROC] PID 111 'e7.linux.user.0' exited (code=139).
+```
+
+**The SIGPIPE assert retires, and the run's new wall has a name.**
+Counts over the whole log: zero `oldact/oldset copy-back` refusal
+lines, zero `fatal runtime error` / `SIG_ERR`, and zero ENOSYS
+answers for this child — six trap lines, every one `ok` (two with
+payload). `signal()` now gets the old disposition back (SIG_DFL 0, not
+SIG_ERR), the assert passes, and Rust std's init walks PAST the place
+that ended increment 11's run. What stops the run next is a `#PF`
+on a near-NULL field (`addr=0x91`) at `rip=0x8054bdf` — the same
+image whose entry the spawn logged (`0x800ab76`), so the rip is this
+child's own code — with attribution as a fault: `exited (code=139)`,
+not abort's tail. Which symbol holds that NULL+0x91 field, and which
+init step dereferences it, was the next increment's first diagnosis
+question (the run hands it the rip) — ANSWERED at increment 13
+(below): `__libc_sigaction+0x8b`, reading `act->sa_flags` through
+`r8`, returned as kernel scratch by the round trip. What THIS
+increment owns is the seam behind it: 13/14 answer, payload crosses,
+refusals by name are nothing left in the run.
+
+**Suite for this increment.** `run_all` 127 passed / 0 failed / 2
+pre-existing skips; personality guard all **81** clauses hold; smoke
+**85/85**; host test **131/131**; `stack_frame_budget_check` 234
+files PASS; `sidecar_stamp_check` PASS (archives repacked from these
+sources); `script_conventions_check` 0 violations; `make x86-iso-e3`
+RC=0; the sidecar crate's tests 12/12; and `tests/run_checks.sh`
+**45 PASS / 1 FAIL / 7 SKIP**. The one FAIL is
+`linux_abi_census_check.sh` — environmental and pre-existing this
+increment, exactly as increment 11 recorded it: the census pins the
+Oct-17 aerobackup artifact's sha256, that binary was rebuilt Oct 19,
+and the refresh (`tools/linux_syscall_census.sh --run`) needs `strace`,
+which this host does not have — the census ROWS are the same trace and
+unchanged. The seven SKIPs are the runtime cluster guards (including
+`webapp_served_check`) that need a live kernel a build host does not
+run. Every other guard in the set — `e3_multi_env_boot_check`,
+`linux_personality_check` (clause set T), `stack_frame_budget_check`,
+`sidecar_stamp_check`, `unified_boot_check`, `kernel_image_end_check`,
+`script_conventions_check` — is green in that same run.
+
+**What this increment is NOT.** `read`'s ARM — the file class's
+copy-IN perform — is still step 4: the machinery it needs (the reply
+plan, the two-phase copy, the count-truth ret rule) is landed and
+host-tested here, but no fd number stages a payload yet, and the path
+class (`open`/`stat`/`unlink`/…) rides the OUT direction's plan as
+step 4's bridge. A user HANDLER is still refused ENOSYS by name —
+this increment writes the old disposition BACK, it does not create
+signal frames (§10.13 step 2's rule stands). The input class is
+untouched: a waiting poll is still refused at both ends (clause S).
+And the payload bound is exact — the deliver's clamp and service()'s
+`len != want` arm refuse every size a first trap did not allow;
+`FD_PAYLOAD_CAP`'s widening (read's count) is step 4's decision to
+make with both recv buffers, never a quiet edit.
+
+**Step 4's first diagnosis question — ANSWERED, and the wall it named
+is down (increment 13): the round trip preserves the caller-saved
+registers.**
+
+The diagnosis, exactly as the run handed it over. `rip=0x8054bdf`
+resolves through the spawn's own entry (`0x800ab76` —
+`aerobackup.musl.elf`'s ELF entry point, matched to the digit) to
+`__libc_sigaction+0x8b` in the image, and the instruction there is
+`mov 0x88(%r8),%eax` — a field read through `%r8`. `%r8` was loaded
+from `%rsi` (the `act` pointer) at function entry (`0x8054b6e`) over a
+read that SUCCEEDED; the only event between that load and the fault
+is the unmask `rt_sigprocmask` at `0x8054bd3`. The fault address is
+`r8+0x88`: **0x90 on one boot, 0x91 on the next** — two boots, two
+ garbage `r8`s, the same lesson increment 4's fixture learned at
+`0x16`/`0x10` — and `rdi=0x131c15d8` at the fault, where two blocks
+earlier sat `mov $1,%edi`, proves the clobber is not one register but
+the whole caller-saved set: **nothing on the return path restores
+them**, so ring-3 comes back from every syscall holding whatever the
+kernel last left there.
+
+That is the stub's own documented contract ("Caller-saved regs … NOT
+preserved"), and for the kernel's SLS consumers it is legal — every
+in-repo inline asm lists them as clobbers, and `sls.h` says so. For a
+Linux binary it is a broken promise: `syscall` changes only rax
+(result), rcx and r11, and musl's inline asm declares exactly `rcx`
+and `r11`, so `__libc_sigaction` keeping `act` live in `%r8` across
+its unmask call is a CORRECT reading of the ABI this shim advertises.
+Increment 4 worked around it inside the FIXTURE (its address rides
+r15 now); the designated first user cannot be worked around — so the
+round trip is fixed, at the four places a register could leak:
+
+- **capture** (`kernel/process.c`): `proc_capture_entry_regs` now
+  snapshots `linux_args[6]` — the entry stub's `[gs:0x50..0x80)`
+  block — into `park_ctx` beside the pushed set. The fields live at
+  byte offsets **72..112** of `CapParkCtx` (`kernel/process.h`,
+  `p[9..14]`).
+- **both resumes re-stamp**: `cap_recv_resume` and
+  `cap_sysret_resume` write the six back into the per-CPU block from
+  `park_ctx` before the re-run and before the jump into the return
+  path — neither runs the entry stub, so without this the block holds
+  the LAST entry's values, possibly another task's on a shared core.
+  The same re-stamp fixes the latent half: the resume re-run's own
+  `proc_read_linux_args()` was reading that stale block.
+- **restore** (`arch/x86/syscall.asm`): `syscall_return_path` loads
+  all six from the block between the pops and the `swapgs` — and
+  never touches `rax`, the syscall's result (pinned both ways).
+- **layout pinned**: the cap_create host test asserts `user_rsp`@64,
+  `linux_args`@72, the last register @112 and the 120-byte total, so
+  the resume asm's `72(%1)…112(%1)` reads are a host test rather than
+  a fault address.
+
+One build lesson worth its own line: the first version gave the
+capture **15 `"=r"` outputs**, impossible at `-O0` where a fixed
+`rbp` leaves 14 registers — the -O2 kernel build was green while the
+three host tests that `#include process.c` went red with "operand has
+impossible constraints". The argument half now reads through one
+scratch register into memory outputs. The host suite caught its own
+first attempt, which is exactly what the suite is for.
+
+Teeth: guard clause set **U** (U, U1–U5), **81 → 87 clauses** — the
+six restores by register and offset, the return block's `rax`
+untouched, the capture's snapshot, the two-by-two re-stamp counts,
+the struct field, the host pins; smoke **85 → 91** (t100–t105:
+restore deleted, capture read deleted, re-stamp load deleted, struct
+field dropped, layout pins deleted, a restore written through `rax`);
+the cap_create host test **407 checks** (+4, the P1 layout pins);
+`stack_frame_budget_check` **234 files PASS**.
+
+The measurement — E3 harness RC=0 (`e3_multi_env_boot_check.sh`, both
+tenant environments, done-marker seen), the firstuser's run on the
+final binaries — every line after `rt_sigprocmask` is new ground past
+the old wall:
+
+```
+[E7] linux: num=0000009E child=e7.linux.user.0 ok                    arch_prctl (158)
+[E7] linux: num=000000DA child=e7.linux.user.0 ok                    set_tid_address (218)
+[E7] linux: num=00000007 child=e7.linux.user.0 ok                    poll (7)
+[E7] linux: num=0000000D child=e7.linux.user.0 ok + payload          rt_sigaction — signal(), oldact back
+[E7] linux: num=0000000D child=e7.linux.user.0 ok + payload          rt_sigaction — the second install
+[E7] linux: num=0000000E child=e7.linux.user.0 ok                    rt_sigprocmask
+[E7] linux: num=0000000D child=e7.linux.user.0 -> ENOSYS             a REAL handler install — refused by name (step 2's rule)
+[E7] linux: num=0000000D child=e7.linux.user.0 ok + payload          rt_sigaction
+[E7] linux: num=0000000D child=e7.linux.user.0 -> ENOSYS             refused by name
+[E7] linux: num=0000000C child=e7.linux.user.0 ok                    brk (12) — increment 6's heap arm  ×2
+[E7] linux mprotect prot=0x6 refused before post: write+execute is refused by the shim (§5.4)  ×2
+[E7] linux: num=00000009 child=e7.linux.user.0 -> ENOSYS             mmap (9) — §10.10's anonymous-map gap, by name  ×2
+[E7] linux: num=00000001 child=e7.linux.user.0 write ok              ×4
+[E7] linux: num=0000000E child=e7.linux.user.0 ok + payload          rt_sigprocmask carrying the mask as it WAS
+[E7] linux: num=000000C8 child=e7.linux.user.0 ok                    tkill (200) — the signal PENDS (clause R5)
+[E7] linux: num=0000000E child=e7.linux.user.0 sig default-action -> kill
+[PROC] PID 111 terminated.
+```
+
+**Zero `0x8054bdf`, zero `fatal runtime error`, zero oldact
+refusals, and no `[FAULT]` for this child at all** — the workload's
+death is a SIGNAL death, not a fault: a pended signal's default
+action fires at the unblock arm, inside the delivering syscall —
+exactly where R4/R5 converge ("where real Linux dies") — reaped as
+`terminated`, not `exited (code=139)`. Why the DEFAULT still applies
+is named by the two `-> ENOSYS` lines: the handler installs were
+refused by name (step 2's rule — no signal frames yet), so the
+disposition never moved. Two more walls are named in the same trace:
+`mmap`(9) refused by name twice (§10.10/§10.11's anonymous-map gap,
+now VISIBLE in the run rather than predicted from it).
+
+**The killing signal is NAMED (increment 14): `sig=6` — SIGABRT.**
+The log carries the number on BOTH of its lines now — `tkill`'s ok
+prints the sig it was asked for, and the kill line prints the signal
+it is delivering, carried on `Answer::SignalKill(u64)` itself so the
+line proves the number instead of the arithmetic implying it (the
+same rule that put `child=` on every refusal — a count that fits
+three children is not a line that proves one). Measured on the final
+binaries, E3 harness RC=0:
+
+```
+[E7] linux: num=0000000E child=e7.linux.user.0 ok + payload     rt_sigprocmask, the mask as it WAS
+[E7] linux: num=000000C8 child=e7.linux.user.0 ok sig=6         tkill(6) = raise(SIGABRT), blocked → PENDS
+[E7] linux: num=0000000E child=e7.linux.user.0 sig=6 default-action -> kill
+[PROC] PID 111 terminated.
+```
+
+The flow is exactly the one `raise_flow_block_tkill_unblock_kills`
+drives host-side: musl's raise() blocks SIGABRT, `tkill` pends it,
+the restore unmasks, and the unblock arm's reveal runs the default
+action INSIDE `rt_sigprocmask` — the number on the line is what
+turns "a signal killed it" into "SIGABRT's default action, delivered
+at the unblock". Why abort() at all: zero `fatal runtime error`,
+zero panic lines — and the refusals immediately before it are the
+two `mmap`(9) ENOSYS answers, so the candidate reading is Rust's
+alloc-failure → `abort()` → `raise(SIGABRT)` (named as a READING,
+not a measurement: proving it is the next instrumentation question,
+and the fix for it either way is §10.10's anonymous-map gap or the
+handler class that would have caught SIGABRT — both already scoped).
+*(PROVEN at increment 15, below — every link of that reading now
+sits on a child-tagged line.)*
+
+**On purpose, no behavior changed.** Every arm's answers are
+byte-identical — only the LOG grew teeth (the two numbers, an
+`Answer` payload and a no-alloc digit loop). The `fmt_sig_line`
+composer puts `sig=` at the FRONT of every line it
+makes so `enosys_log`'s 72-byte cap can never truncate the number
+that identifies the signal; `R7` pins both call sites and tooth
+t106 hardcodes zero in each (the exact regression: a line that
+prints `sig=0` forever reads as an identity).
+
+**Suite for this increment.** guard all **88 clauses** hold (R4's
+greps track the new variant shapes, R7 new); smoke **92/92** (t106;
+t79's sed updated so its mutation still lands); the sidecar crate's
+`linux::` tests **12/12** (the two `SignalKill(6)` pins);
+`make selfhost-bootimage` and `make x86-iso-e3` RC=0 (user/ changed,
+archives repacked); E3 harness OK on the final binaries;
+`tests/run_checks.sh` **45 PASS / 1 FAIL / 7 SKIP** (the same
+environmental census FAIL and cluster SKIPs, `script_conventions`
+and `sidecar_stamp` green inside it).`run_all` was not re-run — this increment changes no C — last green at
+127/0/2 in increment 13.
+
+**The abort reading is PROVEN (increment 15): every link sits on a
+child-tagged line.** The instrument exists because of what increment
+14's evidence could NOT say: console output drains as ONE merged
+stream in FLUSH order, so `memory allocation of 24 bytes failed` in
+the drain belonged to any child of the environment, and the mmap
+refusals were bare numbers with no request behind them. Two lines
+grew teeth: a write now carries `len=` plus a 24-byte excerpt of the
+child's own bytes (printable as-is, everything else as `.` — a short
+line's first words identify it, and no control byte can break the
+log line), and an mmap refusal carries the request it refused
+(`len`/`prot`/`flags`). Measured — both boots identical, E3 harness
+RC=0:
+
+```
+[E7] linux: num=00000009 child=e7.linux.user.0 -> ENOSYS mmap(len=4096, prot=0, flags=50)
+[E7] linux: num=00000009 child=e7.linux.user.0 -> ENOSYS mmap(len=4096, prot=3, flags=34)
+[E7] linux: num=00000001 child=e7.linux.user.0 write ok len=21 |memory allocation of |
+[E7] linux: num=00000001 child=e7.linux.user.0 write ok len=2 |24|
+[E7] linux: num=00000001 child=e7.linux.user.0 write ok len=14 | bytes failed.|
+[E7] linux: num=00000001 child=e7.linux.user.0 write ok len=78 |note: run with `RUST_BAC|
+[E7] linux: num=000000C8 child=e7.linux.user.0 ok sig=6
+[E7] linux: num=0000000E child=e7.linux.user.0 sig=6 default-action -> kill
+[PROC] PID 111 terminated.
+```
+
+**The chain, link by link.** Two mmap requests from the FIRSTUSER —
+`prot=0 flags=50` (0x32 = FIXED|ANON|PRIVATE: a guard page) and
+`prot=3 flags=34` (0x22 = ANON|PRIVATE: the RW arena) — refused by
+name (§10.10's gap), so the allocator has no arena to grow into; the
+SAME child's very next output, in three writes, is Rust's own
+`memory allocation of 24 bytes failed` plus its backtrace note — the
+workload's OWN bytes, on its OWN lines, immediately after its own
+refusals — and then `tkill(6)`: `abort()` → `raise(SIGABRT)` →
+blocked → pending → the unblock arm delivers SIGABRT's default
+action → `terminated`. Refused, reported by the victim itself,
+raised, delivered, reaped — five links, five lines, one child.
+
+**What this increment is NOT.** The excerpt is 24 bytes — enough to
+identify a line, not a transcript; longer output is still read in
+the drain (now cross-checkable against the attributed heads). The
+instrument logs the syscall, not its CALLER: "mallocng's arena
+pair" is read from the request shape (guard + RW arena), not from a
+stack the shim cannot see — the proven links are the ones above.
+And no behavior changed: same answers, same bytes, only the two
+lines richer — clause **R8** (89 total) pins both halves and tooth
+t107 strips them (excerpt clamped to zero, request dropped from the
+refusal).
+
+**Suite for this increment.** guard **89 clauses**; smoke **93/93**;
+the sidecar crate's `linux::` tests **12/12**; `selfhost-bootimage`
+and `x86-iso-e3` RC=0 (user/ changed, archives repacked); E3 harness
+OK on the final binaries (the trace above); `tests/run_checks.sh`
+**45 PASS / 1 FAIL / 7 SKIP** — the environmental census FAIL and
+the cluster SKIPs, every boot guard green inside it (personality at
+its 89 clauses, E3, stamps, conventions, frame budget, unified
+boot).
+
+**What this increment is NOT.** No signal frames: a user handler is
+still refused ENOSYS by name, and this increment changes no arm — it
+makes the registers SURVIVE, which is why the run can now reach its
+own handler code and be refused there honestly. The in-repo SLS asm
+clobber lists are untouched — they remain the correct declaration of
+the mid-syscall window. `rax`/`rcx`/`r11` are unchanged by design
+(the Linux rule itself). The `syscall_regs[8]` offsets stay frozen;
+the argument block is the sibling §3.4 always said it was. The park
+posture (one dead frame per park), the E3 gates and the frame budget
+are untouched.
+
+**Suite for this increment.** `run_all` 127 passed / 0 failed / 2
+pre-existing skips (the three tests that `#include process.c` back to
+green under the constraint fix); personality guard all **87 clauses**
+hold; smoke **91/91**; the cap_create host test **407 checks** (+4);
+`stack_frame_budget_check` 234 files PASS; `sidecar_stamp_check` PASS
+(archives repacked — `sls.h` is in the pack's source set);
+`script_conventions_check` 0 violations; `make selfhost-bootimage`
+and `make x86-iso-e3` RC=0; the E3 harness OK on the final binaries;
+and `tests/run_checks.sh` **45 PASS / 1 FAIL / 7 SKIP** — the one
+FAIL being the environmental `linux_abi_census_check` staleness that
+increments 11 and 12 both recorded (the census pins the Oct-17
+aerobackup artifact's sha256, that binary was rebuilt Oct 19, and the
+refresh needs `strace` this host does not have), the seven SKIPs the
+runtime cluster guards. Two earlier reds were this host's transient
+OOM under a build running alongside — the smoke's t16/t17 seed copies
+beside `make`, and those three `process.c` compiles beside parallel
+qemu+gcc — green on rerun with the machine's RAM to themselves.
+
+**The anonymous-map gap closes (increment 16).** §10.10's last
+anonymous wall: the two `mmap` requests that killed the firstuser's
+allocator are ANSWERED, from the same budget span brk lives in, at
+both ends, with neither end load-bearing alone. The contract, before
+the mechanism — exactly where brk's was (§5.4):
+
+- **Anonymous + private only.** `MAP_ANONYMOUS|MAP_PRIVATE` required;
+  file-backed, shared, and unknown flag bits are refused by name at
+  BOTH ends (the census's own discipline: a shape the shim does not
+  serve says its name on the answer line). `MAP_FIXED` is honored;
+  `MAP_NORESERVE` and `MAP_STACK` are accepted and ignored — both are
+  documented no-op hints on x86-64, so ignoring them IS Linux's
+  behavior, not a shortcut.
+- **W|X is refused EPERM** at the first trap — mprotect's own §5.4
+  rule over a prot word, twin at both ends. `PROT_EXEC` alone is
+  refused ENOSYS by name: executable anonymous memory is its own
+  increment and no measured shape needs it.
+- **The span is the truth, twice.** A `MAP_FIXED` address outside the
+  stamped span `[heap_base, heap_base+mem_bytes)` is refused ENOMEM at
+  the first trap — the budget shape §5.4 names — and a non-FIXED
+  address is picked by the sidecar's ledger, a cursor descending
+  from the span's top, whose grant the kernel's verdict re-checks
+  against its OWN cursors at the reply: a forged or drifted grant
+  maps nothing and answers ENOMEM.
+- **Two cursors, both ends.** `MemBrk` grows `mtop` beside `cur`;
+  the descriptor grows `linux_mmap_top` beside `linux_brk_cur`. brk's
+  ceiling is `min(heap_limit, mtop)` at both ends: an arena a mmap
+  granted is a page a brk growth may never map over (a re-map leaks
+  the frame and zeros live bytes), and a non-FIXED mmap may never
+  land under the break.
+- **MAP_FIXED replaces; PROT_NONE maps no frames.** The measured
+  guard — `mmap(base, 4096, PROT_NONE, FIXED|ANON|PRIVATE)` landing
+  on the page brk already mapped — is Linux's own semantics: the old
+  page's frame returns to the partition, the new protection is
+  installed, and — the one place in this tree where a replaced
+  translation WAS present and ring-3 HAS run on it — `invlpg` for
+  every touched page. A PROT_NONE mapping consumes no frames and
+  every access faults; that is PROT_NONE's whole observable
+  contract. A granted anonymous map is zero-filled: partition-
+  charged frames, RW-NX or read-only, mapped eagerly — no demand
+  paging anywhere, so nothing lazy can be wrong.
+- **A failed FIXED replace leaves a hole, as Linux does.** If frame
+  exhaustion unwinds a granted FIXED map midway, the pages already
+  replaced stay replaced and already-mapped pages are returned to
+  the partition: the reply is `-ENOMEM` either way. That is the
+  honest failure shape — the kernel does not keep a shadow of the
+  mappings it destroyed.
+
+**What this increment is NOT.** `munmap` stays refused by name —
+frames still return through the partition at the task's teardown
+(the mechanism §10.11 already measured for brk) and unmapping
+through the channel is its own seam. File-backed and shared
+mappings are the file class's own half of the path plan.
+`mprotect`'s real permission changes stay ENOSYS by name — the PTE
+rewrite is the sidecar-invisible half this increment deliberately
+does not widen. The cursor-vs-FIXED overlap resolves the way Linux
+itself resolves it — last map wins — and only when the span is
+nearly consumed; the exhaustion case is the budget refusal either
+way. Executable anonymous memory, `PROT_GROWSDOWN`-class bits, the
+time seam, the handler class, threads and the path plan are
+untouched.
+
+Clause set **V** with teeth **t108+** in
+`tests/linux_personality_check.sh`/`_smoke.sh`: the first-trap
+refusals (W|X, flag allowlist, the FIXED span bound), the stage
+carrying the whole request, the verdict's two cursor re-checks, the
+replace path's frame return and `invlpg`, and the fixture's
+E7MEM-MMAP block with its markers asserted ABSENT.
+
+**Measured — both boots identical, E3 harness RC=0.** The probe's
+whole map block, link by link on its own lines:
+
+```
+[E7] linux: num=00000001 child=e7.linux.probe.0 write ok len=13 |E7MEM-BRK-OK.|
+[E7] linux: num=00000009 child=e7.linux.probe.0 ok mmap -> 0x0000400000015000
+[E7] linux: num=00000001 child=e7.linux.probe.0 write ok len=14 |E7MEM-MMAP-OK.|
+[E7] linux: num=00000009 child=e7.linux.probe.0 ok mmap -> 0x0000400000006000
+[E7] linux mmap addr=0x0 len=4096 prot=6 flags=0x22 refused before post: write+execute is refused (§5.4)
+[E7] linux: num=00000009 child=e7.linux.probe.0 -> ENOMEM mmap(len=1048576, prot=3, flags=34)
+```
+
+The arena (5h) lands at the span's TOP page — the cursor's own pick,
+aligned and inside the 64 KiB span; the page reads zero and carries
+`E7MEM-MMAP-OK` (14 bytes) out through increment 5's seam FROM THE
+MAPPED PAGE, the brk twin; the guard (5j) echoes the heap base
+`0x…06000` EXACTLY (FIXED replaces the brk heap's first page, moves no
+cursor); the W|X twin (5k) is refused -EPERM at the FIRST TRAP with
+the request on the line; the 1 MiB ask (5l) — 16x the span — answers
+-ENOMEM with the request on its refusal line. **Markers 399–403:
+zero occurrences.**
+
+The firstuser — the measurement this increment exists for:
+
+```
+[E7] linux: num=00000009 child=e7.linux.user.0 ok mmap -> 0x00004000000ab000
+[E7] linux: num=00000009 child=e7.linux.user.0 ok mmap -> 0x00004000000ea000
+[E7] linux: num=0000000B child=e7.linux.user.0 -> ENOSYS
+[E7] linux: num=00000009 child=e7.linux.user.0 ok mmap -> 0x00004000000e9000
+[E7] linux: num=00000009 child=e7.linux.user.0 ok mmap -> 0x00004000000e8000
+[E7] linux: num=00000001 child=e7.linux.user.0 write ok len=64 |[backup] Copying sls_sto|
+[E7] linux: num=00000004 child=e7.linux.user.0 -> ENOSYS
+[E7] linux: num=00000001 child=e7.linux.user.0 write ok len=17 |[backup] FAILED: |
+[E7] linux: num=00000001 child=e7.linux.user.0 write ok len=15 |sls_storage.img|
+[E7] linux: num=00000001 child=e7.linux.user.0 write ok len=65 | not found (run from the|
+[E7] linux: num=00000001 child=e7.linux.user.0 write ok len=1 |.|
+[E7] linux: num=0000000B child=e7.linux.user.0 -> ENOSYS
+[E7] linux: num=0000000B child=e7.linux.user.0 -> ENOSYS
+[E7] linux: num=000000E7 child=e7.linux.user.0 exit_group
+[PROC] PID 111 terminated.
+```
+
+**The allocator crossed mmap — and the workload ran.** The guard
+page lands on the heap base (`0xab000`, echoed exactly), three RW
+arenas descend the cursor (`0xea000` → `0xe9000` → `0xe8000`, never
+re-handing a range), `munmap` refuses by name (frames still return
+through the partition at teardown), and then — for the FIRST time in
+any measured run — the program's own `main` executes: aerobackup
+copies its header to the console, fails honestly on the storage image
+that does not exist in the guest (`stat` refused by name on the line
+above it), and calls `exit_group`. No `[FAULT]`, no `tkill(6)`, no
+`memory allocation of 24 bytes failed`: increment 15's abort chain is
+replaced by the workload's own real behavior, and the run's every
+remaining wall is a NAME on a line (`munmap`(11), `stat`(4),
+handler installs (13)) rather than a crash.
+
+**Two bugs the instrument caught on the way — each read off its own
+line, none inferred.** (1) The fixture's first draft put mmap's
+flags in `%rcx`; `syscall` itself clobbers rcx, so the kernel
+captured `flags=0x0` — the refusal line printed the request
+(`addr=0x0 len=4096 prot=3 flags=0x0 refused before post: shape not
+served`) and named the bug at boot: the psABI's fourth syscall
+argument is `%r10`, the fixture is fixed, and the header now says so
+where the next fixture will read it. (2) The mmap apply's `else if`
+was first chained one brace too deep — inside the brk verdict's
+`map-pages` arm — where it COMPILES and is unreachable for
+`LINUX_MMAP`: the arena grant returned an address with nothing
+mapped and the first write faulted (`#PF error=0x6 addr=0x…ea000
+rip=0x8053af1` — `mov %rbp,(%rsi)`, musl linking its fresh arena).
+The compiler cannot catch that class (both forms are valid C), so
+V2 now pins the else's LEVEL as a whole line and tooth t120
+reproduces the mis-hang.
+
+**Suite for this increment.** guard **98 clauses** (V, 9 new);
+smoke **106/106** (t108–t120); the sidecar crate's `linux::` tests
+**17/17** (+5: the cursor's descent, the FIXED echo, the word-shape
+ladder, both cursors against each other, the hex instrument);
+`linux_personality_host_test` **161 checks** (+56: the ladder's
+totality, every forged-grant arm of the verdict, the brk cap);
+`run_all` **127 passed / 0 failed / 2 pre-existing skips**;
+`selfhost-bootimage` and `x86-iso-e3` RC=0 (user/ changed, archives
+repacked); E3 harness OK on the final binaries (both traces above);
+`tests/run_checks.sh` **45 PASS / 1 FAIL / 7 SKIP** — the
+environmental census FAIL (the Oct-17 artifact's sha256, unchanged
+since increment 11) and the seven cluster/runtime SKIPs, every boot
+guard green inside it (personality at its 98 clauses, E3, stamps,
+conventions, frame budget, unified boot).
+
+**Sequence.** 0: DONE — the attribution instrument and the `rip=0x28`
+diagnosis, measured (above). 1: DONE — the loader's `p_vaddr`
+alignment fix, host-tested (E8a) and guarded (O8, t53/t54), measured
+past `main` (above). 2: DONE — the SSE gate, the signal seam and the
+poll coda are all landed and measured (above); nothing ENOSYS remains
+in the run as a sidecar ANSWER — `munmap`(11) never fires before the
+kill (the line read as it was `poll`, measured), and the only ENOSYS
+returns left are 13/14's by-name copy-IN refusals, step 3's own wall
+now named by the run itself. 3: DONE — `linux_user_copy_in`,
+`linux_fd_reply_plan`, the three deliver shapes and the `service`
+bound landed and measured (above): the SIGPIPE assert is gone from
+the run, 13/14 answer with their payloads, and the NEW wall is a
+named rip (`0x8054bdf`, `addr=0x91`, `code=139`) — DIAGNOSED AND DOWN
+at increment 13 (above): `__libc_sigaction`'s `act` in `r8` returned
+as kernel scratch, the round trip's register wall. 4: the path plan,
+the VFS bridge, the thirteen arms — with the copy-IN machinery above
+already in place for `read`'s reply, and the run's remaining named
+walls `mmap`(9) ENOSYS (§10.10 — RETIRED at increment 16 above: the
+anonymous-map seam landed and the firstuser now runs its workload to
+a clean `exit_group`, so the abort that named SIGABRT no longer
+fires) and the handler class (step 2's
+signal frames — the terminating signal NAMED at increment 14: SIGABRT,
+`sig=6`, raised by the workload's own abort and delivered at the
+unblock). 5: the two format goldens. 6: the fixture probe on-target — a
+`fixtures/` file-class sequence (mkdir, open, write, lseek, read-back,
+stat, getdents, rename, unlink, close) ending in a marker line in the
+E7MEM/E7FD family, beside the probe/candidate pair. 7: the real-flags
+run — the measurement. Guard clause set **P** with teeth **t55+** in
+`tests/linux_personality_check.sh`/`_smoke.sh`; the census guard
+re-verified — its 27 rows stay classified, because classes are
+dispatch and the reply-payload capability is the plan's own
+per-number table, host-tested, not a new column the census check must
+understand.
+
+**The measurement, and its named risks.** The fixture sizes scale to
+the partition budget — the census stays the host measurement at its
+64 MiB fixture — and the gate reads the OPERATION, not a byte-identical
+histogram: the snapshot appears under `--backup-dir`, the rename
+lands, the retention count holds, the directory lists, exit 0 with
+zero unattributed traps. Two risks are named NOW rather than
+discovered. `clock_gettime` (228): the no-vDSO proof row (§5.5) says
+the first user makes this call once, and NO time source exists across
+the sidecar's ABI (verified against `kabi.rs` and `linux.rs` — there
+is none), so if that call panics the workload, the run's last ENOSYS
+line IS the evidence and the time seam is the NEXT increment — a
+shared change (`aerosls-proto`'s `kabi` is shared by every sidecar,
+with the gate that implies) whose three candidate sources are a
+kernel-anchored manifest record beside ARGENV, CPUID+rdtsc for the
+monotonic half, or widening ARGENV itself. `mmap`(8)/`munmap`(7)
+mid-run: if the run reaches malloc's large allocations, the same
+anonymous-map question answers itself from the run's own ENOSYS
+lines. `execve`(1) stays refused by name, as below; `poll`(1)'s
+zero-timeout probe is now answered (the coda above) and its WAITING
+half refused by name.
+
+**What this increment is NOT.** `poll`'s WAITING half — its revents
+are a copy-in of a REWRITTEN array plus console-input state this shim
+has never had; a poll that would block or time out belongs to the
+input class, unscoped, refused by name at BOTH ends (only the
+zero-timeout probe — which reads nothing and writes nothing — is
+answered). `execve` — the spawn class.
+`clock_gettime` — the time seam named above. File-backed `mmap`.
+Permissions reported but never enforced — mode comes from the VFS's
+own metadata, and the first refusal a real workload meets is where
+enforcement gets scoped, with its trigger. Symlinks — neither
+filesystem has them. `chmod`/`chown`/`utimens`/`flock`/`dup`/`pipe` —
+ENOSYS, and absent from the census, which is the census's own
+discipline for staying out. Sockets — `devfs`'s refusal unchanged.
+brk shrink — still §10.11's refusal. Threads, signal delivery and the
+checkpoint half of the gate keep their named destinations (Appendix
+B). §11's Q2, Q4 and Q5 are untouched here.
+
 ---
 
 ## 11. Open questions for review
@@ -501,6 +2504,12 @@ Everything this document asserts about the tree, with its source:
 | Claim | Source |
 |---|---|
 | Trap entry, `swapgs`, per-CPU scratch, asm number chain, `.unknown_syscall` → `do_syscall` | `arch/x86/syscall.asm` |
+| The errno map is total over both families and the `CAP_NONE` sentinel, with the reverse defined only on unique preimages | `kernel/linux_abi.h`/`.c`; `tests/linux_errno_map_host_test.c` (51 checks, §10.5) |
+| Every census number — traced and vDSO-declared — has a dispatch class, and the SLS overlaps 105/160/320 are UNKNOWN | `tests/linux_syscall_table_host_test.c` (42 checks) over `tools/linux_syscall_census.txt` |
+| The initial stack builder emits the canonical psABI image with §5.2's AT_* set, no `AT_SYSINFO_EHDR`, and refuses by returning 0 | `tests/linux_initial_stack_host_test.c` (40 checks) |
+| A Linux-personality task's trap describes-and-refuses before any number chain, from arguments captured before any call | `kernel/syscall_dispatch.c` (`do_syscall`'s first branch); `arch/x86/syscall.asm`'s `[gs:0x50..0x80)` stores; `tests/linux_personality_check.sh` clauses C/C1/D |
+| The personality is explicit at spawn (328), stamped inside the create, gated by E2's `sidecar_authority`, and reset at every slot reuse | `kernel/cap.c` — `cap_create_sidecar_in_personality()`, `sys_sls_linux_spawn()`; `kernel/process.c` — `proc_clear_resume_state()`; guard clauses E/F |
+| The frozen per-CPU offsets are a BUILD error to move, and the request ABI is pinned as literals | `arch/x86/user_paging.h` static asserts; `tests/linux_personality_host_test.c` (19 checks) |
 | SLS ABI: `rax` = num, `rdi` = one request pointer | `kernel/syscall_dispatch.h`; `user/libsls/sls.h`; `user/aerosls/src/syscall.rs` |
 | `syscall_regs[8]` at `[gs:0x10..0x48]`, and the live late-read failure | `arch/x86/user_paging.h` |
 | Gate: `EFER`, `STAR` (`0x23`/`0x1B`), `LSTAR`, `SFMASK`, GS bases; **no FS base** | `arch/x86/user_paging.c`, `syscall_gate_init()` |
@@ -509,7 +2518,8 @@ Everything this document asserts about the tree, with its source:
 | `SYS_SLS_PROC_*` 160–162 | `kernel/process.h` |
 | `SYS_SLS_ALLOC_REGION` = 320 | `kernel/cap.h` |
 | `CAP_EINVAL`…`CAP_EPERM` (−1…−12), `CAP_ERR_PROTO`, `CAP_NONE` sentinel | `kernel/cap.h`; `kernel/chan.c` (`sys_sls_dev_mmap`) |
-| ELF64 loader: `PT_LOAD`, `p_flags`, zero-fill, partition-charged frames, returns `e_entry` | `kernel/loader.c` |
+| ELF64 image loading (gates, `PT_LOAD`, `p_flags`, zero-fill, partition-charged frames, `e_entry`) — the tree's ONE mapper, shared by the uploaded-program loader and the Linux create | `kernel/elf64_load.{h,c}` (extracted from `loader.c`, increment 7); guard clauses O1/O2 (§10.12) |
+| A real `ET_EXEC` candidate enters at `e_entry` and completes the whole census; the first measurement caught the unsafe low-vaddr walk (`#PF error=0x15 rip=0x400000`) it now routes around | `user/sidecar/src/e7_candidate.rs`; `user/sidecar/fixtures/e7_candidate.elf` + `build_candidate.sh`; §10.12's two runs; clause O1, tooth t48 |
 | Park/resume: `CapParkCtx`, `park_ctx`/`park_req`/`park_syscall`, `resume_sysret`, `cap_recv_resume`, `syscall_return_path` | `kernel/process.h`; `arch/x86/syscall.asm` |
 | Per-process address space (`user_clone_page_table`), no thread-group sharing | `kernel/process.c` |
 | `sidecar_authority` (E2), tenant profile, zero hardware caps | `kernel/process.h`; `user/init/src/posix_manifest.rs` |
@@ -530,6 +2540,14 @@ Everything this document asserts about the tree, with its source:
 | The vDSO backstop measured: the same binary with no `AT_SYSINFO_EHDR`, row for row | `tools/linux_syscall_census_novdso.txt` |
 | The census and its proof, gated on every push, with the guard's own teeth proven | `tests/linux_abi_census_check.sh`; `tests/linux_abi_census_check_smoke.sh` |
 | The auxv a static binary is started with, as a literal list that omits `AT_SYSINFO_EHDR` | `tools/e7_stack_launcher.c` |
+| Steps 5–7 delivered: the post-then-park forward, the arm-before-post resume, a stray resume refused by name | `kernel/chan.c` (`k_linux_forward`/`k_linux_deliver`); `kernel/syscall_dispatch.c`; `kernel/cap.c` (`cap_linux_find_channels`); guard clauses I–K (§10.7) |
+| A reply's status reaches `rax` only through the §5.7 map, after size and num-echo are enforced | `kernel/linux_abi.c` (`linux_syscall_apply_reply`); `tests/linux_personality_host_test.c` (42 checks, §10.7) |
+| The sidecar's first answers: 218 echoed, 231 reaped, everything else ENOSYS with its number logged | `user/sidecar/src/linux.rs`; `user/sidecar/src/entry.rs` (`service`/`append_wait`) |
+| The §5.2 image through the real create: child-vaddr pointers (`region_vaddr`), BIB-page reservation, 8 KiB floor, `AT_RANDOM` = entropy or `CAP_ECONFLICT` with the region returned | `kernel/cap.c` (steps 6–7); `kernel/linux_abi.{h,c}`; host tests L1/L2/E7c (377 checks); clauses O3/O4, teeth t44/t45/t46 (§10.12) |
+| §5.2's argv/envp cross on the spawn request as the `ARGENV` record, with the empty-environment v1 fallback when it is absent and by-name refusals instead of truncation | `kernel/cap.h`/`cap.c` (`SIDECAR_TAG_ARGENV`, the parse arena, the §5.2 site); `user/proto/src/manifest.rs` (`ArgEnv`, `argenv_wire_bytes_golden`); `tests/cap_create_sidecar_host_test.c` L3/L4; guard clauses O6/O7, teeth t49–t52 |
+| The SSE gate: the pure CR0/CR4/CPUID arithmetic at the SDM's own bit positions, the enable's CPUID → CR4 → CR0 → `fninit` → `ldmxcsr` order, the BSP call ahead of `syscall_gate_init`, the intact vector-7 chain, and the lazy path still dormant (no caller of `perform_lazy_context_switch`) | `arch/x86/fpu_enable.h`; `arch/x86/lazy_fpu.c` (`fpu_enable_sse`); `kernel/kernel.c` 4b; `tests/fpu_enable_host_test.c` (40 checks); guard clause Q, teeth t70–t75 (§10.13's step 2) |
+| The signal seam: the plan's three first-trap refusals (width, out-pointer, span) ahead of any channel post, the sidecar's dispositions/mask/pending with handler installs refused by name and tkill scoped to its own tid, and every default-terminate converging on one attributed no-reply kill | `kernel/linux_abi.{h,c}` (`linux_sig_copy_plan`, `LSC_SIG`); `kernel/syscall_dispatch.c`; `user/sidecar/src/linux.rs` (`SigState`, the 13/14/200 arms, `Answer::SignalKill`); `tests/linux_personality_host_test.c` (98 checks) + linux.rs unit tests (11); guard clause R, teeth t76–t83 (§10.13's step 2) |
+| The run's last ENOSYS answer retires: poll (7)'s zero-timeout probe answered 0 events with the array never read and revents never written, a WAITING poll refused at both ends before any post, and the firstuser's first output (its own fatal SIGPIPE assert) performed by the fd class | `kernel/linux_abi.{h,c}` (`linux_poll_refuses_blocking`, `LINUX_POLL`); `kernel/syscall_dispatch.c` (the first-trap refusal); `user/sidecar/src/linux.rs` (the 7 arm); `tests/linux_personality_host_test.c` (105 checks) + linux.rs unit tests (12); guard clause S, teeth t84–t89 (§10.13's poll coda) |
 
 ## Appendix B — Named gaps, each with its destination
 
@@ -539,9 +2557,17 @@ Everything this document asserts about the tree, with its source:
 | Six argument registers not captured by the trap path | every forwarded syscall gets wrong arguments (§3.4) | E7, §3.4 |
 | No initial stack/auxv builder | static libc start-up fails before `main` (§5.2) | E7, §5.2 |
 | No `MSR_IA32_FS_BASE` handling | TLS setup fails; musl/glibc binaries die early (§5.3) | E7, §5.3 |
-| No `brk`/`mmap` → budget mapping | Rust/Go heaps cannot grow (§5.4) | E7, §5.4 |
+| No `brk`/`mmap` → budget mapping (`brk` landed, increment 6, §10.11; the anonymous-map half **LANDED** at increment 16; `munmap` remains) | `munmap` still refuses by name (frames return through the partition at the task's teardown — §5.6) | E7, §5.4 — **LANDED** at increment 16 (§10.13): the measured allocator's guard page (FIXED PROT_NONE, replace + invlpg) and its RW arenas (the descending cursor, both ends re-checking) are answered from the budget span, and the firstuser runs its real workload to a clean `exit_group`. `munmap` through the channel is the named remainder — its own seam |
+| `elf64_map_blob` assumes every PT_LOAD's `p_vaddr` is page-aligned | a libc-linked binary with a non-aligned RW LOAD reads every global in it 0x370 bytes off and dies at `rip=0x28` before `main` — measured, §10.13's step 0 | **LANDED** — increment 8's step 1: page-base anchor + lead-offset copy, host teeth E8a, guard clause O8 with teeth t53/t54, measured past `main` |
+| No `CR4.OSFXSR` written anywhere (the IDT's vector-7 gate existed all along — `idt.c`, SIMI Phase 10; `vecstore.c`'s comment saying otherwise is stale), no `xsetbv` | any ring-3 SSE instruction is #UD — every real libc and every Rust binary dies at its first vector op (measured: musl `abort`'s `pxor`, §10.13's step-1 run) | **LANDED** — increment 9: `CR4.OSFXSR|OSXMMEXCPT` + `CR0.MP` armed on the BSP ahead of the trap gate, `fninit` + 0x1F80 `ldmxcsr`, CPUID refusal by name; host teeth `tests/fpu_enable_host_test.c` (40 checks), guard clause Q with teeth t70–t75, measured past `pxor` into `abort`'s tail (§10.13's step 2). `xsetbv`/`CR4.OSXSAVE` remain absent — named, and dormant with the lazy path |
+| `rt_sigprocmask` (14), `rt_sigaction` (13) and `tkill` (200) refuse | `abort()` cannot die at its first `raise(SIGABRT)`, so its tail runs and faults on `hlt` (`rip=0x805260c`) — the firstuser's run ends there, ten attributed traps deep (§10.13's step 2; `rt_sigaction` newly visible) | **LANDED** — increment 10: the kernel's copy plan with all three refusals by name at the first trap, the sidecar's dispositions/mask/pending and the `SignalKill` delivery; host teeth (98 + 11 checks), guard clause R with teeth t76–t83; measured: both firstuser runs end at their first `tkill` with the kill attribution and NO `[FAULT]` (§10.13's step 2). §10.10's copy-IN gap then stayed as the named wall — retired at
+**increment 12**: the reply payload carries oldact/oldset back through
+the staged destination, measured (§10.13's step 3) |
 | No `CAP_E*` → Linux errno table (and a `CAP_NONE` sentinel in returns) | silent wrong errors (§5.7) | E7, §5.7 |
 | Target designated, but no candidate binary and therefore no artifact | the table is still unmeasured; `--check` reports a named skip rather than a pass | write the crate, add the musl target, run `--run` |
 | No thread groups / `clone` / `futex` | Go and every threaded runtime are out (§7) | named as Go's gate; unscoped |
 | No ARM64 userspace OS | E7 cannot run there (§4.1) | H2 item #1 |
 | No environment checkpoint/restore | the inherited gate cannot be passed (§8) | POSIX roadmap v0.2 §12 item 1 |
+| No reply payload: `read` and the file class never cross back (§10.10's named gap) | the first user cannot open, read, stat, list, rename or prune — its file work never leaves the sidecar (§5.6) | E7 increment 8, §10.13 (scoped) |
+| No time source across the sidecar's ABI | `clock_gettime` (228) refuses; the no-vDSO proof (§5.5) shows the first user makes this call | named §10.13: a shared change, its own increment after 8, decided by the run's evidence |
+| No console-input state, so a WAITING `poll` cannot answer | a zero-timeout probe is answered (0 events, increment 11), but `poll` (census ×1) with a timeout, and a blocking read, still refuse by name | the input class, unscoped (named §10.13) |

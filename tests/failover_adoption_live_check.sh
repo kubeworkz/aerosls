@@ -35,7 +35,7 @@
 #      leader's own periodic re-announce teaches the resurrected node the
 #      new owner (it converges).
 #
-# The evidence pins the PATH, not just the outcome. Seven strings, each
+# The evidence pins the PATH, not just the outcome. Nine strings, each
 # emitted by exactly one code site:
 #   * `[DSPP-CKPT] RX: COMPLETE`      -- net/dspp_checkpoint.c, only by the
 #     checkpoint RX; gates that the create reached the held checkpoint.
@@ -55,6 +55,17 @@
 #   * `leader node <M>'s claim wins, applying` -- partition_sync_upsert()'s
 #     leader-wins branch on the resurrected node; the leader's periodic
 #     re-announce taught it the new owner (the stale row converges away).
+#   * `[FAILOVER] environment index <i> (partition <id>, 3 region(s)) was
+#     NOT restored -- no durable record for it on this survivor` --
+#     POSIX-Environments P3 increments 9 and 11, LIVE: the dead leader's
+#     checkpoint carried the environment NAME (state_tree.c) and the
+#     survivor classified it per record against its OWN durable store
+#     (per-node disks hold nothing for it, so it is named with that
+#     reason). Step 4.5 guarantees the environment exists on the leader
+#     before the kill, so this line cannot be vacuous; step 7.5 requires
+#     it AFTER the adoption line, so an old run's line cannot satisfy it.
+#   * `[FAILOVER] <n> environment(s) of the adopted partitions were NOT
+#     restored` -- the countable summary of the same walk.
 #
 # ─── What this guard does, step by step ───────────────────────────────────
 # It kills the leader, waits for a survivor to adopt, verifies the handoff
@@ -191,12 +202,15 @@ CTL="tools/aeroslsctl"
 CLUSTER_DIR="${AEROSLS_CLUSTER_DIR:-cluster}"
 LOG_DIR="${AEROSLS_LOG_DIR:-$CLUSTER_DIR}"
 PID_FILE="$CLUSTER_DIR/cluster.pids"
-NAME="guard-failover-$$"             # unique per run, so a stale persisted
+# Unique per run AND per restart: the churn restart below re-execs this
+# script against the same cluster, and a name that collided with the aborted
+# attempt's own partition would make the re-run's create fail for a reason
+# that has nothing to do with the property under test.
+NAME="guard-failover-$$-${AEROSLS_FAILOVER_RESTARTS_USED:-0}"
 SVC="svc-$NAME"                      # the service-registry twin: registered on the
                                      # owner pre-kill, re-registered on the adopter
-                                     # after adoption; the resurrected owner
+                                     # after adoption; the resurrected owner's
                                      # stale re-announce must be REJECTED (step 12)
-                                     # row can never be mistaken for it
 
 if [ "$FAST" = "1" ]; then
     POLL=0.5; WAIT_NODES=10; WAIT_LEARN=6; WAIT_CKPT=6; WAIT_ADOPT=10; WAIT_HANDOFF=6; WAIT_OBSERVER=5; WAIT_BOOT=10; WAIT_CLAIM=8; WAIT_CONV=8; WAIT_MIGRATE=8; WAIT_TRANSFER=8; WAIT_LEASE=8
@@ -570,8 +584,8 @@ while :; do
     attempt=$((attempt + 1))
     deadline=$(( $(date +%s) + WAIT_CKPT ))
     while :; do
-        learn1="$(last_line "$F1_LOG" "PARTITION] sync.*$NAME")"
-        learn2="$(last_line "$F2_LOG" "PARTITION] sync.*$NAME")"
+        learn1="$(last_line "$F1_LOG" "PARTITION] sync.*'$NAME'")"
+        learn2="$(last_line "$F2_LOG" "PARTITION] sync.*'$NAME'")"
         ck1="$(last_line "$F1_LOG" "DSPP-CKPT] RX: COMPLETE")"
         ck2="$(last_line "$F2_LOG" "DSPP-CKPT] RX: COMPLETE")"
         if [ -n "$learn1" ] && [ -n "$ck1" ] && [ "$ck1" -gt "$learn1" ] \
@@ -616,6 +630,218 @@ if [ "$ckpt_ok" -eq 0 ]; then
        for the wrong reason. ${hop_note}"
 fi
 echo "   checkpoint carrying '$NAME' held by both survivors"
+
+# ─── 4.5. put an ENVIRONMENT on a leader-owned partition before it dies ────
+# POSIX-Environments P3 increments 9 and 11, LIVE (the addenda each named
+# this arm as owed). Its own pre-gate: without a live environment on the
+# dying leader the held checkpoint carries no ST_NODE_ENVIRONMENT node,
+# and step 7.5's lines could only ever be absent -- the exact shape
+# increment 9's addendum called "a run where no node happened to die with
+# an environment".
+#
+# The environment gets its OWN partition ('$NAME-env') rather than riding
+# '$NAME', because step 11 later migrates '$NAME' back to the resurrected
+# leader and that step's waits are budgeted for an EMPTY migrate. The env
+# partition is adopted like any other (the adoption walk does not care
+# which) and stays with the adopter for the rest of the run.
+ENV_NAME="$NAME-env"
+echo "==> creating partition '$ENV_NAME' on node $leader and an environment inside it"
+"$CTL" --host "localhost:$L_PORT" "${TOKEN_ARGS[@]}" \
+    shell partition create "$ENV_NAME" >/dev/null \
+    || die "partition create '$ENV_NAME' failed on node $leader (aeroslsctl output above)"
+# The create RETURNS success, but this id read was a single shot: on
+# 2026-10-16 a healthy run (both partitions learned, services resolved,
+# checkpoint held) aborted right here because node 1's sweep was still
+# digesting the create's announce burst when the read landed -- a
+# transient read, not a missing partition (the same command a minute
+# earlier read back fine). Retry like every other wait in this guard; the
+# final abort says what was SEEN (answering or not), not only what was
+# missing -- the lesson this file recorded on 2026-10-15 after three
+# undiagnosable 'output above' ABORTs.
+PART_ID2=""
+id_deadline=$(( $(date +%s) + WAIT_LEARN ))
+while :; do
+    if get200 "$L_PORT" /api/partitions; then
+        PART_ID2="$(row_id "$FETCH_BODY" "$ENV_NAME")"
+        [ -n "$PART_ID2" ] && break
+    fi
+    [ "$(date +%s)" -ge "$id_deadline" ] && break
+    sleep "$POLL"
+done
+if [ -z "$PART_ID2" ]; then
+    if get200 "$L_PORT" /api/health; then
+        _hp="answering /api/health"
+    else
+        _hp="NOT answering /api/health"
+    fi
+    die "could not read the partition id for '$ENV_NAME' from node $leader
+       within ${WAIT_LEARN}s (the create command itself succeeded; node $leader is
+       $_hp)."
+fi
+
+# The checkpoint counters are captured BEFORE the create, so "2 fresh
+# COMPLETEs" is provably post-create: the FIRST fresh one may be a frame
+# already in flight when the record landed, the second was built after it
+# (the tree is rebuilt from the live table every broadcast period).
+ck_pre1="$(grep -c 'DSPP-CKPT] RX: COMPLETE' "$F1_LOG" 2>/dev/null)"; ck_pre1="${ck_pre1:-0}"
+ck_pre2="$(grep -c 'DSPP-CKPT] RX: COMPLETE' "$F2_LOG" 2>/dev/null)"; ck_pre2="${ck_pre2:-0}"
+
+# The response is echoed on BOTH failure paths: the command's own non-zero
+# exit used to die with 'output above' while the output sat unprinted in
+# $env_resp -- a guard that hides the reason it failed made three live runs
+# undiagnosable (2026-10-15: two 'env create failed' ABORTs with no cause
+# anywhere in the transcript). The case-arm below already printed it; this
+# branch now does too.
+env_resp="$("$CTL" --host "localhost:$L_PORT" "${TOKEN_ARGS[@]}" \
+    shell env create "$PART_ID2" 2>&1)" \
+    || die "env create failed on node $leader -- aeroslsctl's output was:
+$(printf '%s' "$env_resp" | tail -6 | sed 's/^/       /')"
+case "$env_resp" in
+    *"-> ok env_id="*)
+        L_ENV_ID="$(printf '%s' "$env_resp" | sed -n 's/.*ok env_id=\([0-9]*\).*/\1/p' | head -1)"
+        ;;
+    *)  die "no environment was created on node $leader (no '-> ok env_id=' in the
+       response): $(printf '%s' "$env_resp" | tail -3 | sed 's/^/       /')
+       Without a live environment on the dying leader there is no environment
+       name for the checkpoint to carry, and step 7.5 could never fire." ;;
+esac
+echo "   environment env_id=$L_ENV_ID lives in partition $PART_ID2 ('$ENV_NAME') on node $leader"
+
+echo "==> waiting for the environment's console to register on node $leader (the create round trip completed)"
+env_live=""
+deadline=$(( $(date +%s) + WAIT_LEARN ))
+while :; do
+    env_list="$("$CTL" --host "localhost:$L_PORT" "${TOKEN_ARGS[@]}" shell env list "$PART_ID2" 2>&1)"
+    case "$env_list" in
+        *"env partition=$PART_ID2 env_id="*) env_live=1; break ;;
+    esac
+    [ "$(date +%s)" -ge "$deadline" ] && break
+    sleep "$POLL"
+done
+[ -n "$env_live" ] || die "the environment's console never registered on node $leader
+       ('env list $PART_ID2' never showed it within ${WAIT_LEARN}s). Output:
+$(printf '%s' "$env_list" | tail -3 | sed 's/^/       /')"
+echo "   the environment is live on the leader"
+
+# The wait is RE-DRIVEN, exactly like the two learn gates above: each attempt
+# is a fresh WAIT_CKPT window, admitted only while the leader this guard
+# picked is still answering and still holds the -env row. What this replaces
+# (live, 2026-10-15, a pristine 768 MiB 3-node cluster) was not a lost
+# broadcast: node 1 won term 2 while node 2 was this guard's leader, so the
+# node that was supposed to RECEIVE the post-create checkpoints was itself the
+# broadcaster -- it gained 0 in ${WAIT_CKPT}s while the other survivor gained
+# 26. A leadership change mid-run is a slow environment, not a broken RX
+# path, and the next window converges (both survivors are followers again).
+# A leader that stops answering, or stops holding the row, is not that, and
+# falls through to the FAIL, which now also reports who the cluster believes
+# leads -- the diagnosis that turn needed.
+echo "==> waiting for 2 fresh checkpoints (post-create) to reach both survivors"
+ckpt_env_ok=0
+ckpt_attempt=0
+while :; do
+    ckpt_attempt=$((ckpt_attempt + 1))
+    deadline=$(( $(date +%s) + WAIT_CKPT ))
+    while :; do
+        ck1="$(grep -c 'DSPP-CKPT] RX: COMPLETE' "$F1_LOG" 2>/dev/null)"; ck1="${ck1:-0}"
+        ck2="$(grep -c 'DSPP-CKPT] RX: COMPLETE' "$F2_LOG" 2>/dev/null)"; ck2="${ck2:-0}"
+        if [ "$((ck1 - ck_pre1))" -ge 2 ] && [ "$((ck2 - ck_pre2))" -ge 2 ]; then
+            ckpt_env_ok=1; break
+        fi
+        [ "$(date +%s)" -ge "$deadline" ] && break
+        sleep "$POLL"
+    done
+    [ "$ckpt_env_ok" -eq 1 ] && break
+    [ "$ckpt_attempt" -ge "$ANNOUNCE_ATTEMPTS" ] && break
+    if ! get200 "$L_PORT" /api/health; then
+        echo "   note: node $leader is not answering /api/health; not re-driving the checkpoint wait"
+        break
+    fi
+    # A leader that LOST its role mid-run will never put the env name into
+    # any broadcast again (the env lives on ITS tree; see the churn block
+    # below), so burning the remaining windows just delays the diagnosis --
+    # observed live on 2026-10-16 spending all 3 x 60s while the picked
+    # leader had been a plain follower since the create. Only a POSITIVE
+    # non-LEADER read breaks; a failed fetch keeps the re-drive alive (same
+    # posture as the partitions check above, which breaks only on a read
+    # that answers without the row).
+    if get200 "$L_PORT" /api/cluster \
+       && [ "$(jget "$FETCH_BODY" role)" != "LEADER" ]; then
+        echo "   note: node $leader is no longer LEADER (an election was won mid-run);"
+        echo "         not re-driving -- the churn diagnosis below decides what happens next"
+        break
+    fi
+    if ! get200 "$L_PORT" /api/partitions \
+       || [ -z "$(row_if "$FETCH_BODY" "$ENV_NAME" "$leader")" ]; then
+        echo "   note: node $leader no longer holds '$ENV_NAME' (owner node $leader); not re-driving"
+        break
+    fi
+    echo "   note: the survivors gained $((ck1 - ck_pre1))/$((ck2 - ck_pre2)) checkpoints
+       in ${WAIT_CKPT}s -- re-driving the wait (attempt $((ckpt_attempt + 1)) of $ANNOUNCE_ATTEMPTS)"
+done
+if [ "$ckpt_env_ok" -ne 1 ]; then
+    # ── CHURN: the precondition for the whole pre-kill phase is that the
+    # leader this guard picked KEEPS broadcasting through it. Live, on every
+    # 3-node run of 2026-10-15, one survivor received 0 checkpoints while
+    # the other received 26/54/78 -- and the zero one was no longer a
+    # follower: it had won an election mid-run (its log: "Terms timeout.
+    # campaigning for Term election: 3 / elected LEADER for term 3"). A node
+    # that is now the BROADCASTER never receives the env-name checkpoints its
+    # own held tree needs, so this run's adoption arm could not fire no
+    # matter how long the gate waited -- the env create it just ran is the
+    # longest synchronous shell command in the system (seconds on TCG), and
+    # the ex-leader never won the term back.
+    #
+    # That is a lost precondition, not a lost packet: the re-drive above
+    # already spent every window while the picked leader still held the row.
+    # Re-running the whole guard against the same cluster re-discovers
+    # whoever leads NOW, creates the partition + environment on THAT node,
+    # and so puts the env name into a held tree that is actually broadcast.
+    #
+    # The budget is 3, not 1, because a loaded host can make the env create
+    # itself exceed the election timeout EVERY time (2026-10-16: two
+    # consecutive runs each churned -- node 2 led, node 1 won term 2 during
+    # the create, then the restart re-picked node 1 and node 2 won term 3
+    # during the next create -- so one restart could not converge). Each
+    # re-run warms the create path it repeats (the sidecar boot and the
+    # parked-posture wait are the slow part), so warm-cache re-runs finish
+    # inside the timeout where cold ones did not. Bounded and loud: an
+    # exhausted budget still ends in this FAIL, with the roles printed.
+    churn=""
+    for _pn in "$F1_PORT" "$F2_PORT"; do
+        if get200 "$_pn" /api/cluster \
+           && [ "$(jget "$FETCH_BODY" role)" = "LEADER" ]; then
+            churn="$(( _pn - HTTP_BASE ))"
+        fi
+    done
+    _used="${AEROSLS_FAILOVER_RESTARTS_USED:-0}"
+    _max="${AEROSLS_FAILOVER_MAX_RESTARTS:-3}"
+    if [ -n "$churn" ] && [ "$_used" -lt "$_max" ] 2>/dev/null; then
+        echo "   note: node $churn won an election mid-run, so the node that must RECEIVE"
+        echo "         the environment-name checkpoints is now the broadcaster. The pre-kill"
+        echo "         phase's precondition is gone (not a lost hop -- the re-drive spent"
+        echo "         every window while the picked leader still held the row)."
+        echo "   ==> restarting this guard against the same cluster (restart $((_used + 1)) of $_max)"
+        AEROSLS_FAILOVER_RESTARTS_USED=$((_used + 1)) exec "$0"
+    fi
+    roles_now=""
+    for _pn in "$F1_PORT" "$F2_PORT"; do
+        if get200 "$_pn" /api/cluster; then
+            roles_now="$roles_now
+       node $(( _pn - HTTP_BASE )): role=$(jget "$FETCH_BODY" role) term=$(jget "$FETCH_BODY" term) active=$(jget "$FETCH_BODY" active_nodes)"
+        else
+            roles_now="$roles_now
+       node $(( _pn - HTTP_BASE )): not answering"
+        fi
+    done
+    fail "the survivors never received 2 checkpoints after the environment's
+       creation (${WAIT_CKPT}s per attempt, $ckpt_attempt attempt(s); $f1 gained
+       $((ck1 - ck_pre1)), $f2 gained $((ck2 - ck_pre2))). The leader's periodic
+       broadcast is what puts the environment NAME into the held tree -- without
+       it the adoption below proves only the partition half again, and the
+       increment-9/11 arm cannot fire. The cluster now looks like:$roles_now"
+fi
+echo "   the held checkpoints now carry '$ENV_NAME' and its environment's name"
+echo "   the held checkpoints now carry '$ENV_NAME' and its environment's name"
 
 # ─── 5. capture the leader's identity BEFORE killing it ───────────────────
 L_PID="$(awk -v n="$leader" '$1==n{print $2}' "$PID_FILE")"
@@ -670,17 +896,34 @@ while :; do
         [ "$r2" = "LEADER" ] && adopt2=1
     fi
     if [ -n "$adopt1" ] && [ -n "$adopt2" ]; then
-        fail "both survivors ($f1 and $f2) report LEADER after node $leader died --
-       split-brain: a partition must have exactly one owner, and
-       failover_tick() only lets the leader recover. The cluster is in an
-       unrecoverable state -- stop it and inspect the consensus logs."
+        # Two ROLES is not yet two OWNERS. This is the same distinction
+        # split_brain_now() below already makes for every later gate (see
+        # its comment): a poll that straddles a follower's LATE flip reads
+        # two LEADERs while only the adopter actually serves '$NAME' as its
+        # own -- observed live in the smoke's lateflip tooth, where the
+        # observer's 1.5 s delayed flip landed between the adopter's
+        # evidence and the poll that would have accepted it, and the step-9
+        # message the tooth is looking for was never reached. Ownership is
+        # durable and cannot un-happen, so a REAL split-brain (both serving
+        # themselves as owner) still fails here immediately, on evidence,
+        # while a role straddle is left to resolve on the next pass.
+        if split_brain_now "$f1" "$f2"; then
+            fail_split_brain "$f1" "$f2"
+        fi
     fi
     if [ -n "$adopt1" ] || [ -n "$adopt2" ]; then
         can=""; ob=""; other_seen=0
         if [ -n "$adopt1" ]; then can="$f1"; ob="$f2"; other_seen="$seen2"
         else can="$f2"; ob="$f1"; other_seen="$seen1"; fi
         CAN_LOG="$LOG_DIR/node$can.log"
-        dead_line="$(last_line "$CAN_LOG" "FAILOVER] Node $leader declared DEAD")"
+        # "declared DEA" not "declared DEAD": the kernel's serial TX lock is
+        # bounded-wait by design (kernel_io.c — on expiry the waiter's bytes
+        # go out anyway), so under contention a line can be clobbered
+        # mid-word — observed live as "[FAILOVER] Node 2 declared
+        # DEA[DSPP-CKPT] RX: BEGIN ...". The four-character anchor matches
+        # both the intact and the clobbered form; the clobber would have to
+        # land INSIDE the anchor to hide the declaration.
+        dead_line="$(last_line "$CAN_LOG" "FAILOVER] Node $leader declared DEA")"
         adopt_line="$(last_line "$CAN_LOG" "FAILOVER] Adopted partition.*dead node $leader")"
         rec_line="$(last_line "$CAN_LOG" "FAILOVER] recovery for dead node $leader: rc=0")"
         owned=""
@@ -716,12 +959,70 @@ if [ -z "$adopter" ]; then
        consensus heartbeating? (The adoption needs a leader.)"
     fi
     fail "a survivor became leader but never adopted '$NAME' within ${WAIT_ADOPT}s.
-       Check for 'FAILOVER] Node $leader declared DEAD' and 'FAILOVER] Adopted
+       Check for 'FAILOVER] Node $leader declared DEA' and 'FAILOVER] Adopted
        partition ... from dead node $leader' (rc=0) in $LOG_DIR/node*.log. A
        leader that never recovers means failover_recover_from() is broken or
        the held checkpoint did not carry the row."
 fi
 echo "   $adopter became leader, declared node $leader DEAD, and adopted $owned"
+
+# ─── 7.5. the adoption NAMES its unrestored environment (P3 9 + 11, live) ──
+# The survivor adopted the partitions; what it must not do is be SILENT
+# about the environment that came with one of them. Two lines, each from
+# exactly one code site in kernel/failover.c: the per-environment name
+# (the tree carried it) and the per-record classification (this survivor's
+# own durable store holds no record for it -- per-node disks -- so it is
+# named with THAT reason), plus the countable summary. Every line is
+# required to be AFTER the adopt_line, so a line from an earlier run on
+# the same cluster dir cannot satisfy the gate.
+#
+# The defect, verbatim, is the increment-9 `silent-failover` tooth: the
+# adoption completes and says nothing about the environments. The
+# increment-11 companion is `refused-as-restored`'s live shadow -- here the
+# honest "no durable record" branch must be the one that prints, never a
+# RESTORED claim this per-node store cannot back.
+echo "==> waiting for the adopter to name and classify partition $PART_ID2's environment (up to ${WAIT_ADOPT}s)"
+env_named=""
+env_line=""; env_res_line=""; env_sum_line=""; env_restored_line=""
+deadline=$(( $(date +%s) + WAIT_ADOPT ))
+while :; do
+    env_line="$(last_line "$CAN_LOG" "FAILOVER] environment index 1 (partition $PART_ID2")"
+    # The kernel prints "(partition %u, %llu region(s))" on the NOT-restored
+    # variant (failover.c) — the region count is part of the line and varies
+    # with the checkpoint, so the pattern anchors through it rather than
+    # closing the paren early (which matched nothing on the first live run).
+    env_res_line="$(last_line "$CAN_LOG" "FAILOVER] environment index 1 (partition $PART_ID2, [0-9]* region(s)) was NOT restored -- no durable record for it on this survivor")"
+    env_sum_line="$(last_line "$CAN_LOG" "FAILOVER] [0-9]* environment(s) of the adopted partitions were NOT restored")"
+    if [ -n "$env_line" ] && [ -n "$env_res_line" ] && [ -n "$env_sum_line" ] \
+       && [ "$env_line" -gt "$adopt_line" ] && [ "$env_res_line" -gt "$adopt_line" ] \
+       && [ "$env_sum_line" -gt "$adopt_line" ]; then
+        env_named=1; break
+    fi
+    [ "$(date +%s)" -ge "$deadline" ] && break
+    sleep "$POLL"
+done
+[ -n "$env_named" ] || fail "node $adopter adopted partition $PART_ID2 but never named and
+       classified its environment env_id=$L_ENV_ID (no '[FAILOVER] environment index 1
+       (partition $PART_ID2' line after the adopt_line at $adopt_line within
+       ${WAIT_ADOPT}s). Step 4.5 proved the environment was live on the leader and
+       carried in the held checkpoints, so the adoption DROPPED the name -- the
+       increment-9 silent-failover defect, live. The adopter's FAILOVER lines hold:
+$(grep -F 'FAILOVER]' "$CAN_LOG" | tail -10 | sed 's/^/       /')"
+# The store here is per-node: the dead leader's record died with it, so the
+# HONEST classification is "no durable record". A RESTORED line for this
+# identity would be the increment-11 lie on live metal (nothing on this
+# survivor could have backed it) and is failed as such.
+env_restored_line="$(last_line "$CAN_LOG" "FAILOVER] environment index 1 (partition $PART_ID2) RESTORED")"
+if [ -n "$env_restored_line" ] && [ "$env_restored_line" -gt "$adopt_line" ]; then
+    fail "node $adopter claims it RESTORED partition $PART_ID2's environment from
+       durable storage, but this cluster gives every node its own disk: nothing on
+       the adopter could have held that record. A restore claim the store cannot
+       back is the increment-11 classification lying on live metal (the
+       'refused-as-restored' tooth's live shadow). The adopter's log holds:
+$(grep -F 'FAILOVER]' "$CAN_LOG" | tail -10 | sed 's/^/       /')"
+fi
+echo "   $(grep -F "environment index 1 (partition $PART_ID2" "$CAN_LOG" | tail -1 | sed 's/^ *//')"
+echo "   the survivor named the dead node's environment and classified it against its own durable store"
 
 # ─── 7.5. the adopter re-registers the service twin ───────────────────────
 # The adoption moved ownership; the service twin moves with it. The adopter
@@ -823,7 +1124,7 @@ while :; do
     # declaration. (A stale line from a previous run of this guard against
     # the same cluster would sit BEFORE this run's declaration -- last_line
     # takes the LAST match, so the comparison is scoped to this run.)
-    obs_decl="$(last_line "$OBS_LOG" "FAILOVER] Node $leader declared DEAD")"
+    obs_decl="$(last_line "$OBS_LOG" "FAILOVER] Node $leader declared DEA")"
     obs_adopt="$(last_line "$OBS_LOG" "FAILOVER] Adopted partition.*dead node $leader")"
     obs_rec="$(last_line "$OBS_LOG" "FAILOVER] recovery for dead node $leader")"
     if [ -n "$obs_decl" ]; then
@@ -886,7 +1187,7 @@ PART_ID="$(get200 "$((HTTP_BASE + adopter))" /api/partitions && row_id "$FETCH_B
 #      learn) AFTER the boot restore -- the stale row does not survive.
 CAN_LOG="$LOG_DIR/node$adopter.log"
 adopt_line="$(last_line "$CAN_LOG" "FAILOVER] Adopted partition.*dead node $leader")"
-handoff_line="$(last_line "$OBS_LOG" "PARTITION] sync.*$NAME.*learned from node $adopter")"
+handoff_line="$(last_line "$OBS_LOG" "PARTITION] sync.*'$NAME'.*learned from node $adopter")"
 L_LOG="$LOG_DIR/node$leader.log"
 L_PORT=$((HTTP_BASE + leader))
 
@@ -916,7 +1217,19 @@ restored=0; rej_s=0; rej_o=0; lw=0
 deadline=$(( $(date +%s) + WAIT_CLAIM ))
 while :; do
     # Each gate latches independently -- they land on different polls.
-    restore_line="$(last_line "$L_LOG" "Partition ownership restored from NVMe")"
+    # CLOBBER-TOLERANT ANCHOR (the same concession step 7 makes for
+    # 'declared DEA'): this boot's restore line WAS printed on 2026-10-15
+    # but spliced mid-line by a print that preempts the holder of the
+    # bounded serial TX lock --
+    #   [PERSIST] Partition ownership restored from NVM[DSPP-CKPT] RX: BEGIN ...
+    #   [DSPP-CKPT] RX: COMPLETE ...
+    #   e.
+    # so the full phrase never appears contiguously and an exact grep
+    # reports 'never restored' for a restore that happened. The short
+    # anchor is the whole semantic payload of the line and is printed by
+    # exactly one site (persist.c); the clobber has to land inside those
+    # 28 characters to hide it.
+    restore_line="$(last_line "$L_LOG" "Partition ownership restored")"
     [ -n "$restore_line" ] && restored=1
     # Path (a): the stale claim escaped -- both survivors rejected it.
     rej_s_line="$(last_line "$CAN_LOG" "rejecting the stale claim")"
@@ -937,14 +1250,22 @@ while :; do
     sleep "$POLL"
 done
 [ "$restored" -eq 1 ] || fail "the relaunched leader never restored its stale row
-       ('Partition ownership restored from NVMe' absent from $L_LOG within
+       ('Partition ownership restored' absent from $L_LOG within
        ${WAIT_CLAIM}s). Without the stale row there is nothing to conflict
-       over -- the resurrected-owner resolution cannot be exercised."
+       over -- the resurrected-owner resolution cannot be exercised. The
+       anchor is clobber-tolerant (see the note at the latch above), so this
+       is an absent line, not a spliced one. The boot's persist lines:
+$(grep -h 'PERSIST]' "$L_LOG" 2>/dev/null | head -6 | sed 's/^/       /')"
 
 # no-flap: the owner must still be the adopter on BOTH survivors, and no
 # learn from the dead leader may have arrived after the adoption.
-flap_s="$(last_line "$CAN_LOG" "PARTITION] sync.*$NAME.*learned from node $leader")"
-flap_o="$(last_line "$OBS_LOG" "PARTITION] sync.*$NAME.*learned from node $leader")"
+# The name is anchored with its CLOSING quote everywhere below: the env
+# partition this guard also creates is named "$NAME-env", so an unanchored
+# '$NAME' substring matches ITS learn lines too — seen live tripping the
+# 11e flap gate on a perfectly converged cluster (the -env row, legitimately
+# owned by the adopter, re-learned periodically).
+flap_s="$(last_line "$CAN_LOG" "PARTITION] sync.*'$NAME'.*learned from node $leader")"
+flap_o="$(last_line "$OBS_LOG" "PARTITION] sync.*'$NAME'.*learned from node $leader")"
 still_s=""; still_o=""
 if get200 "$((HTTP_BASE + adopter))" /api/partitions; then
     still_s="$(row_if "$FETCH_BODY" "$NAME" "$adopter")"
@@ -989,8 +1310,8 @@ echo "==> waiting for the resurrected node to converge to the adopter (up to ${W
 converged=0
 deadline=$(( $(date +%s) + WAIT_CONV ))
 while :; do
-    conv_learn="$(last_line "$L_LOG" "PARTITION] sync.*$NAME.*learned from node $adopter")"
-    restore_line="$(last_line "$L_LOG" "Partition ownership restored from NVMe")"
+    conv_learn="$(last_line "$L_LOG" "PARTITION] sync.*'$NAME'.*learned from node $adopter")"
+    restore_line="$(last_line "$L_LOG" "Partition ownership restored")"
     if [ -n "$conv_learn" ] && [ -n "$restore_line" ] && [ "$conv_learn" -gt "$restore_line" ]; then
         converged=1; break
     fi
@@ -1224,7 +1545,9 @@ echo "   $observer learned the lease row"
 echo "==> migrating '$NAME' (partition $PART_ID) from node $adopter back to node $leader"
 mig_resp="$("$CTL" --host "localhost:$ADP_PORT" "${TOKEN_ARGS[@]}" \
     shell partition migrate "$PART_ID" "$leader" 2>&1)" \
-    || die "partition migrate $PART_ID -> $leader failed on node $adopter (aeroslsctl output above)"
+    || die "partition migrate $PART_ID -> $leader failed on node $adopter --
+       aeroslsctl's output was:
+$(printf '%s' "$mig_resp" | tail -8 | sed 's/^/       /')"
 case "$mig_resp" in
     *"migrated partition $PART_ID: node $adopter -> node $leader"*) ;;
     *) fail "the migrate of partition $PART_ID never ran on node $adopter
@@ -1348,16 +1671,19 @@ restore2=""
 deadline=$(( $(date +%s) + WAIT_CONV ))
 while :; do
     boot_gen="$(last_line "$L_LOG" "AEROSLS BOOT LOGGER")"
-    restore2="$(last_line "$L_LOG" "Partition ownership restored from NVMe")"
+    restore2="$(last_line "$L_LOG" "Partition ownership restored")"
     [ -n "$restore2" ] && [ -n "$boot_gen" ] && [ "$restore2" -gt "$boot_gen" ] && break
     [ "$(date +%s)" -ge "$deadline" ] && break
     sleep "$POLL"
 done
 [ -n "$restore2" ] && [ -n "$boot_gen" ] && [ "$restore2" -gt "$boot_gen" ]     || fail "the relaunched destination node $leader never restored its row
-       ('Partition ownership restored from NVMe' absent from $L_LOG within
+       ('Partition ownership restored' absent from $L_LOG within
        ${WAIT_CONV}s after this boot's 'AEROSLS BOOT LOGGER' marker). A step-11
        relaunch that loses the transferred row leaves the destination without
-       the row it must converge on."
+       the row it must converge on. The anchor is clobber-tolerant (see step
+       10's latch), so this is an absent line, not a spliced one. This boot's
+       persist lines:
+$(grep -h 'PERSIST]' "$L_LOG" 2>/dev/null | head -6 | sed 's/^/       /')"
 conv_l=0; conv_a=0; conv_o=0
 deadline=$(( $(date +%s) + WAIT_CONV ))
 while :; do
@@ -1390,9 +1716,9 @@ echo "   all three nodes agree: owner = node $leader"
 # one line after the apply and the guard reported FLAPPED on a converged
 # cluster). A real flap is the ADOPTER'S OWNERSHIP coming back -- the
 # adopter announcing owner = itself after handing the row off.
-flap_a="$(last_line "$ADP_LOG" "PARTITION] sync.*$NAME.*(owner node $adopter) learned from node $adopter")"
-flap_l="$(last_line "$L_LOG" "PARTITION] sync.*$NAME.*(owner node $adopter) learned from node $adopter")"
-flap_o="$(last_line "$OBS_LOG" "PARTITION] sync.*$NAME.*(owner node $adopter) learned from node $adopter")"
+flap_a="$(last_line "$ADP_LOG" "PARTITION] sync.*'$NAME' (owner node $adopter) learned from node $adopter")"
+flap_l="$(last_line "$L_LOG" "PARTITION] sync.*'$NAME' (owner node $adopter) learned from node $adopter")"
+flap_o="$(last_line "$OBS_LOG" "PARTITION] sync.*'$NAME' (owner node $adopter) learned from node $adopter")"
 tr_l="$(last_line "$L_LOG" "PARTITION] sync: partition $PART_ID claimed by node $adopter and node $leader -- owner-initiated transfer, applying")"
 tr_o="$(last_line "$OBS_LOG" "PARTITION] sync: partition $PART_ID claimed by node $adopter and node $leader -- owner-initiated transfer, applying")"
 if [ -n "$flap_a" ] && [ "$flap_a" -gt "$mig_line" ]; then
@@ -1463,15 +1789,15 @@ echo "      write lease was relinquished at the migrate (holds_lease 0 on all"
 echo "      three nodes) and re-acquired on the new owner only by a fresh"
 echo "      2-of-3 quorum."
 echo "      evidence:"
-printf '        %s\n' "$(grep -h "FAILOVER] Node $leader declared DEAD" "$LOG_DIR/node$adopter.log" 2>/dev/null | tail -1)"
+printf '        %s\n' "$(grep -h "FAILOVER] Node $leader declared DEA" "$LOG_DIR/node$adopter.log" 2>/dev/null | tail -1)"
 printf '        %s\n' "$(grep -h "FAILOVER] Adopted partition.*dead node $leader" "$LOG_DIR/node$adopter.log" 2>/dev/null | tail -1)"
 printf '        %s\n' "$(grep -h "FAILOVER] recovery for dead node $leader: rc=0" "$LOG_DIR/node$adopter.log" 2>/dev/null | tail -1)"
-printf '        %s\n' "$(grep -h "PARTITION] sync.*$NAME.*owner node $adopter.*learned from node $adopter" "$OBS_LOG" 2>/dev/null | tail -1)"
-printf '        %s\n' "$(grep -h "FAILOVER] Node $leader declared DEAD" "$OBS_LOG" 2>/dev/null | tail -1 | sed 's/^/observer: /')"
-printf '        %s\n' "$(grep -h "Partition ownership restored from NVMe" "$L_LOG" 2>/dev/null | tail -1 | sed 's/^/resurrected: /')"
+printf '        %s\n' "$(grep -h "PARTITION] sync.*'$NAME'.*owner node $adopter.*learned from node $adopter" "$OBS_LOG" 2>/dev/null | tail -1)"
+printf '        %s\n' "$(grep -h "FAILOVER] Node $leader declared DEA" "$OBS_LOG" 2>/dev/null | tail -1 | sed 's/^/observer: /')"
+printf '        %s\n' "$(grep -h "Partition ownership restored" "$L_LOG" 2>/dev/null | tail -1 | sed 's/^/resurrected: /')"
 printf '        %s\n' "$(grep -h "rejecting the stale claim" "$CAN_LOG" 2>/dev/null | tail -1 | sed 's/^/adopter: /')"
 printf '        %s\n' "$(grep -h "rejecting the stale claim" "$OBS_LOG" 2>/dev/null | tail -1 | sed 's/^/observer: /')"
-printf '        %s\n' "$(grep -h "PARTITION] sync.*$NAME.*learned from node $adopter" "$L_LOG" 2>/dev/null | tail -1 | sed 's/^/resurrected: /')"
+printf '        %s\n' "$(grep -h "PARTITION] sync.*'$NAME'.*learned from node $adopter" "$L_LOG" 2>/dev/null | tail -1 | sed 's/^/resurrected: /')"
 printf '        %s\n' "$(grep -h "\[SERVICE\].*$SVC.*rejecting the stale claim" "$OBS_LOG" 2>/dev/null | tail -1 | sed 's/^/service: /')"
 printf '        %s\n' "$(grep -h "PARTITION] migrated partition $PART_ID: node $adopter -> node $leader" "$ADP_LOG" 2>/dev/null | tail -1 | sed 's/^/migrate: /')"
 printf '        %s\n' "$(grep -h "CONSENSUS] partition $PART_ID: node $adopter voluntarily stepped down from LEADER" "$ADP_LOG" 2>/dev/null | tail -1 | sed 's/^/lease: /')"

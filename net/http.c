@@ -52,6 +52,7 @@
 #include "../kernel/env_service.h"  // POSIX-Environments E4 -- POST /api/partition/{id}/env
 #include "../kernel/env_console.h"  // POSIX-Environments E6 -- attach to an environment's console
 #include "../kernel/env_proto.h"    // POSIX-Environments E4 -- ENV_* status codes
+#include "../kernel/env_migrate.h"  // POSIX-Environments P3 increment 4 -- staged-slot restore tick
 #include "../drivers/nvme_admin.h" // Navigator-Parity Gap Roadmap Phase 2 -- nvme_get_capacity_bytes()
 #include "../kernel/security_audit.h" // Navigator-Parity Gap Roadmap Phase 3 -- GET /api/security/audit
 #include "../kernel/group_profile.h"  // Navigator-Parity Gap Roadmap Phase 3 -- GET /api/security/groups
@@ -3059,7 +3060,24 @@ static int api_partition_env_create_post(const char* body, char* buf, int max,
 
     uint16_t status = ENV_ERR_INVAL;
     uint32_t env_id = 0;
+    /* The create RPC blocks this node's BSP sweep (sidecar boot + the
+     * parked-posture wait) — and on the consensus leader that sweep carries
+     * the only heartbeat stream. Announce the intent FIRST, while the sweep
+     * still runs, so no peer declares this node dead and adopts its
+     * partitions mid-create (docs/AeroSLS-Idle-Observer-Adoption-
+     * Finding-v0.1.md). The shell's `env create` (user/shell.c) announces
+     * the same way; the restore's own create (kernel/env_migrate.c) and the
+     * boot replay (kernel/env_service.c) deliberately do not — the first is
+     * already covered by its staging slot, the second has no cluster yet. */
+    env_migrate_intent_begin();
     int rc = env_service_create(partition, index, &status, &env_id);
+    /* The create RPC returned — success or refusal, the blocking phase is
+     * over. Release the intent so every peer's latch ends NOW instead of at
+     * the budget's end: an unreleased announce leaves a blind spot exactly
+     * as long as the leftover budget (found live: a leader killed seconds
+     * after a create was undeclarable DEAD for minutes — failover delayed,
+     * the adoption guard's wait exceeded). */
+    env_migrate_intent_end();
 
     jb_obj_open(&j,0);
     if (rc != 0) {
@@ -7220,6 +7238,18 @@ void http_server_run(void) {
          * waiting for the next mutation. TRANSMITS, so it lives here on the
          * BSP sweep with the heartbeat and the checkpoint broadcast. */
         partition_reannounce_tick(kernel_tick_counter);
+        /* Environment migration restore (POSIX-Environments P3 increment 4):
+         * the wire fills a staging slot on the destination; env_migrate_tick()
+         * turns every COMPLETE slot whose partition this node OWNS into a live
+         * environment — replayed through the same ENV_CREATE round trip the
+         * boot replay uses, with the staged pages poured into the fresh
+         * environment's regions and durable extent. It sits here for the same
+         * two reasons the ticks above do: the create round trip yields to init
+         * (legal on the sweep, illegal inside the pour that follows it), and
+         * the restore's NVMe writes belong on the BSP, in the same context
+         * partition_persist_flush() writes from. Rate-limited internally to
+         * the reannounce period, with a bounded attempt count per slot. */
+        env_migrate_tick(kernel_tick_counter);
         /* Deferred persistence of learned rows: the RX apply (timer ISR)
          * only set the dirty flag; the NVMe write happens here, on the BSP
          * sweep, in the same context partition_create() persists from. */

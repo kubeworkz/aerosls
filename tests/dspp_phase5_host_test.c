@@ -193,6 +193,21 @@ int env_migrate_recv_page(uint64_t transfer_id, uint32_t page_index,
     return 1;
 }
 
+/* POSIX-Environments P3 increment 5: the confirmation pair, same
+ * permissive-denial choice. This routing test never sends LIVE_REQ/
+ * LIVE_ACK (22–23), so these are not reached; were one to arrive,
+ * "not live" (1) is the honest answer for a node that restored nothing,
+ * and "nothing pending" (1) for its ACK. Real coverage:
+ * tests/env_migrate_host_test.c, Phase H. */
+int env_migrate_live_query(uint32_t partition_id, uint32_t index) {
+    (void)partition_id; (void)index;
+    return 1;
+}
+int env_migrate_live_ack(uint32_t partition_id, uint32_t index, uint32_t status) {
+    (void)partition_id; (void)index; (void)status;
+    return 1;
+}
+
 /* POSIX-Environments P3 increment 3: kernel/partition.c Step 3c calls
  * env_migrate_partition() to move this partition's environments inside the
  * same critical section as the streams -- a NEW external dependency of
@@ -204,6 +219,7 @@ int env_migrate_recv_page(uint64_t transfer_id, uint32_t page_index,
  * tests/partition_migrate_phase6_host_test.c and the transfer itself in
  * tests/env_migrate_host_test.c. */
 int env_migrate_partition(uint32_t partition_id, uint32_t dest_node_id,
+                          int operator_paused,
                           uint32_t* out_expected, uint32_t* out_moved) {
     (void)partition_id; (void)dest_node_id;
     if (out_expected) *out_expected = 0;
@@ -414,4 +430,16 @@ int main(void) {
 
     printf("\n%d passed, %d failed\n", checks_passed, checks_failed);
     return checks_failed == 0 ? 0 : 1;
+}
+
+/* POSIX-Environments P3 idle-observer arm stand-ins — the announce
+ * crosses the real DSPP wire, so a host build cannot run it; a no-op
+ * here keeps this test's link honest. Real coverage:
+ * tests/env_migrate_host_test.c (the local gate, the wire frame, the
+ * peer latch) and tests/checkpoint_recovery_host_test.c (the
+ * failover declaration gate). */
+void env_migrate_intent_begin(void) {}
+void env_migrate_intent_end(void) {}
+void env_migrate_recv_intent(uint32_t node_id, uint32_t budget_ticks) {
+    (void)node_id; (void)budget_ticks;
 }

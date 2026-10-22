@@ -35,6 +35,8 @@ struct PeerLiveness {
     uint8_t  active;
     uint64_t last_seen_tick; /* kernel_tick_counter when last heartbeat received */
     uint64_t declared_dead_tick;
+    uint8_t  defer_noted;    /* one DEFERRED line per silent episode, not one per
+                              * sweep — see failover_tick()'s migration gate */
 };
 
 // ─── Failover Result ──────────────────────────────────────────────────────────
@@ -72,5 +74,30 @@ void failover_live_checkpoint_broadcast(uint64_t now);
 
 /* How many partitions were adopted in the last failover_recover_from() call. */
 uint32_t failover_last_adopted_count(void);
+
+/* POSIX-Environments v0.2 Phase P3, failover destination (b) (§11 Q5): how
+ * many environments belonging to the partitions the last recovery adopted
+ * were named as NOT restored. Failover adopts partitions by ownership flip
+ * and restores no environment — the payload is 5.5 MiB and the leader's
+ * checkpoint broadcast is 24 KiB — so this counter is the honest size of
+ * that gap. Zero is the common case (a partition with no environments) and
+ * is what makes a non-zero worth reading. Countable rather than log-only so
+ * a host test can pin it and the `silent-failover` tooth has something to
+ * bite on beyond a grep of a serial line. */
+uint32_t failover_last_unrestored_envs(void);
+
+/* P3 increment 11 — the restore half of destination (b): how many of the
+ * adopted partitions' environments the last recovery ACTUALLY RESTORED —
+ * replayed from this survivor's own durable records through the standard
+ * create round trip (env_service_restore_pending()), the same driver a
+ * reboot uses. Complementary to failover_last_unrestored_envs(), reset at
+ * recovery entry beside it, and classified per record: a record the replay
+ * REFUSED counts unrestored, never restored (both outcomes clear the pending
+ * bit; the per-slot refused mark is what tells them apart, and the
+ * `refused-as-restored` tooth holds that line). Claims the ENVIRONMENT came
+ * back, not its bytes: contents follow only as far as the environment's
+ * durable extent is readable on this survivor, and [ENV_PAYLOAD] names what
+ * is not. */
+uint32_t failover_last_restored_envs(void);
 
 #endif /* FAILOVER_H */
