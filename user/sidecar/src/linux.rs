@@ -232,8 +232,10 @@ enum Answer {
     /// returns to its caller, so "no reply" is the faithful shape; the
     /// variant is distinct from `Exit` only so the serial log names WHICH
     /// decision killed the task — the boot's attribution reads the line,
-    /// not an inference.
-    SignalKill,
+    /// not an inference. The payload is the SIGNAL NUMBER itself (increment
+    /// 14): the kill line prints `sig=<N>`, so WHICH signal killed the task
+    /// is read off the line rather than reconstructed from which arms ran.
+    SignalKill(u64),
 }
 
 /// One Linux task's §5.4 heap ledger: the budget span the create stamped
@@ -577,6 +579,10 @@ fn answer(
                          * anything moves (not even the mask). */
                         let mut revealed = sig.pending & !new_mask;
                         let mut verdict = 0u8; /* 0 proceed, 1 kill, 2 refuse */
+                        let mut kill_sig = 0u64; /* WHICH revealed signal earns
+                                                  * the kill — carried on the
+                                                  * Answer so the line names it
+                                                  * (increment 14) */
                         while revealed != 0 && verdict == 0 {
                             let bit = revealed.trailing_zeros();
                             revealed &= !(1u64 << bit);
@@ -587,12 +593,13 @@ fn answer(
                                 continue; /* discard — its delivery is a no-op */
                             } else if default_action(sig_no as u64) == ACT_TERMINATE {
                                 verdict = 1;
+                                kill_sig = sig_no as u64;
                             } else {
                                 verdict = 2;
                             }
                         }
                         match verdict {
-                            1 => Answer::SignalKill,
+                            1 => Answer::SignalKill(kill_sig),
                             2 => Answer::Reply(0, E_NOSYS),
                             _ => {
                                 /* Pass 2: apply — the revealed discards
@@ -643,7 +650,7 @@ fn answer(
                 Answer::Reply(0, STATUS_OK) /* blocked: arrives as pending */
             } else {
                 match default_action(args[1]) {
-                    ACT_TERMINATE => Answer::SignalKill,
+                    ACT_TERMINATE => Answer::SignalKill(args[1]),
                     ACT_IGNORE => Answer::Reply(0, STATUS_OK),
                     _ => Answer::Reply(0, E_NOSYS), /* stop-default: not landed */
                 }
@@ -882,16 +889,37 @@ fn reply_bytes<K: Kernel>(k: &K, ch_w: u32, tag: u32, num: u64, ret: u64,
 /// the target-feature serial path; on host fakes the answers still run,
 /// they just stay quiet).
 ///
-/// The CHILD'S NAME rides in the line — the design doc's §10.13 step 0.5,
-/// and the difference between a measurement and an inference. Several
-/// Linux tasks share this one service loop, `num=` names only the
-/// NUMBER, and without a name on the line a refusal belongs to any of
-/// them: the E3 log's per-child counts could only be read off the
-/// arithmetic that "fits three of each", never off the line that proves
-/// it. `child=?` is what a line with NO task context says (reply's own
-/// send-failure arm) — never an empty field, so a missing name looks
-/// missing rather than like a parsing accident. The caps below keep a
-/// 24-character name plus the longest suffix inside klog's own bound.
+/// Increment 14's composer: `prefix`, `sig_no` in decimal, `suffix` —
+/// no alloc, no fmt (the target build has neither). Signal numbers are
+/// 1..=SIG_MAX (two digits), but the digit loop is total for any u64 so
+/// a widening cannot print a truncated number, and `sig=` sits at the
+/// FRONT of every line this makes — enosys_log's 72-byte cap truncates
+/// the tail, never the number that identifies the signal.
+fn fmt_sig_line(buf: &mut [u8], prefix: &[u8], sig_no: u64, suffix: &[u8]) -> usize {
+    let p = prefix.len().min(buf.len());
+    buf[..p].copy_from_slice(&prefix[..p]);
+    let mut off = p;
+    let mut digits = [0u8; 20];
+    let mut nd = 0usize;
+    let mut v = sig_no;
+    loop {
+        digits[nd] = b'0' + (v % 10) as u8;
+        nd += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    while nd > 0 && off < buf.len() {
+        nd -= 1;
+        buf[off] = digits[nd];
+        off += 1;
+    }
+    let s = suffix.len().min(buf.len() - off);
+    buf[off..off + s].copy_from_slice(&suffix[..s]);
+    off + s
+}
+
 fn enosys_log(tag_num: u32, child: &[u8], extra: &[u8]) {
     #[cfg(feature = "target")]
     {
@@ -1028,6 +1056,15 @@ pub fn service<K: Kernel>(k: &K, console: &CharNode) {
             Answer::Reply(ret, status) => {
                 if status == E_NOSYS {
                     enosys_log(num as u32, &name_buf[..nlen], b" -> ENOSYS\n");
+                } else if num == LINUX_TKILL {
+                    /* tkill's SIG rides its line (increment 14): WHICH
+                     * signal was asked for is the fact the pending →
+                     * unblock flow later cashes in — read off the line,
+                     * never reconstructed from which arms ran. The
+                     * existence probe (sig 0) prints itself as itself. */
+                    let mut ex = [0u8; 32];
+                    let n = fmt_sig_line(&mut ex, b" ok sig=", args[1], b"\n");
+                    enosys_log(num as u32, &name_buf[..nlen], &ex[..n]);
                 } else {
                     /* An answered syscall must be visible too: this line
                      * is the serial-log half of E7's round-trip proof
@@ -1113,19 +1150,23 @@ pub fn service<K: Kernel>(k: &K, console: &CharNode) {
                     tasks()[i].used = false;
                 }
             }
-            Answer::SignalKill => {
+            Answer::SignalKill(kill_sig) => {
                 /* E7 increment 10 (§10.13's step 2): a signal's default
-                 * action ran. The line names the NUMBER before the reap —
-                 * the log is what the boot's attribution reads, and this
-                 * is the difference between "the seam delivered" and
-                 * "the task happened to die". The reap itself is
+                 * action ran. The line names the SIGNAL NUMBER (increment
+                 * 14 — the Answer carries it) before the reap — the log is
+                 * what the boot's attribution reads, and this is the
+                 * difference between "the seam delivered" and "the task
+                 * happened to die". The reap itself is
                  * exit_group's own path, twin for twin: same
                  * name->pid liveness test, same immediate teardown for a
                  * target parked awaiting THIS exchange, same refusal to
                  * strand a task when the name resolves nowhere. No reply:
                  * on real Linux the process dies inside the delivering
                  * syscall and never returns to its caller. */
-                enosys_log(num as u32, &name_buf[..nlen], b" sig default-action -> kill\n");
+                let mut ex = [0u8; 48];
+                let n = fmt_sig_line(&mut ex, b" sig=", kill_sig,
+                                     b" default-action -> kill\n");
+                enosys_log(num as u32, &name_buf[..nlen], &ex[..n]);
                 let name = core::str::from_utf8(&name_buf[..nlen]).unwrap_or("");
                 let pid = k.sidecar_pid(name, partition);
                 if pid == 0 {
@@ -1383,7 +1424,7 @@ mod tests {
         let mut sig = fresh();
         let a = answer(200, &[TID, 6, 0, 0, 0, 0],
                        &fds(), &mut ledger(), &mut sig, &[]);
-        assert!(matches!(a, Answer::SignalKill), "SIGABRT: {:?}", a);
+        assert!(matches!(a, Answer::SignalKill(6)), "SIGABRT: {:?}", a);
         /* existence probe: sig 0 validates the tid and delivers nothing */
         let a = answer(200, &[TID, 0, 0, 0, 0, 0],
                        &fds(), &mut ledger(), &mut sig, &[]);
@@ -1433,7 +1474,7 @@ mod tests {
         assert_ne!(sig.pending, 0, "and the signal is pending");
         let unblock = answer(14, &[1, 0x4000, 0, 8, 0, 0], &fds(),
                              &mut ledger(), &mut sig, &set_payload(1 << 5));
-        assert!(matches!(unblock, Answer::SignalKill),
+        assert!(matches!(unblock, Answer::SignalKill(6)),
                 "the revealed pending SIGABRT must kill: {:?}", unblock);
     }
 

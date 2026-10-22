@@ -823,9 +823,10 @@ fi
 if grep -qF 'LINUX_RT_SIGACTION => {' "$LRS" && \
    grep -qF 'LINUX_RT_SIGPROCMASK => {' "$LRS" && \
    grep -qF 'LINUX_TKILL => {' "$LRS" && \
-   grep -qF 'ACT_TERMINATE => Answer::SignalKill,' "$LRS" && \
-   grep -qF 'Answer::SignalKill => {' "$LRS"; then
-    ok "R4. the sidecar answers all three numbers, and every path that RUNS a default-terminate action converges on SignalKill — the one variant service reaps through exit_group's path with no reply, exactly where real Linux dies inside the delivering syscall"
+   grep -qF 'ACT_TERMINATE => Answer::SignalKill(args[1]),' "$LRS" && \
+   grep -qF '1 => Answer::SignalKill(kill_sig),' "$LRS" && \
+   grep -qF 'Answer::SignalKill(kill_sig) => {' "$LRS"; then
+    ok "R4. the sidecar answers all three numbers, and every path that RUNS a default-terminate action (tkill's own delivery and the unblock arm's reveal) converges on SignalKill — the one variant service reaps through exit_group's path with no reply, exactly where real Linux dies inside the delivering syscall"
 else
     bad "R4. an arm or the SignalKill convergence is gone — raise(SIGABRT) would refuse or reply successfully, abort() would walk on into its hlt, and the boot would show [FAULT] at 0x805260c again (§10.13's step-1 wall)"
 fi
@@ -841,6 +842,13 @@ if grep -qF 'linux_sig_copy_plan(' "$PHUT" && \
     ok "R6. the plan is host-tested against the REAL kernel/linux_abi.c — both refusals by name, the EFAULT bounds, both lengths, the precedence and the total number space (run_all compiles and runs it)"
 else
     bad "R6. the host test no longer drives the plan — the seam's pure half would be argued from the guard's greps alone, every branch reachable only at boot"
+fi
+if grep -qF 'fmt_sig_line(&mut ex, b" ok sig=", args[1], b"\n")' "$LRS" && \
+   grep -qF 'fmt_sig_line(&mut ex, b" sig=", kill_sig,' "$LRS" && \
+   grep -qF 'SignalKill(u64),' "$LRS"; then
+    ok "R7. the signal NUMBER rides its line: tkill's ok prints the sig it was asked for (the pending-then-unblock flow's evidence), the kill line prints the signal it is delivering (carried on the Answer itself) — WHICH signal is read off the log, never inferred from which arms ran"
+else
+    bad "R7. a signal number no longer rides its line — tkill's pending ask or the killing delivery goes back to arithmetic (the exact inference the child= field removed for refusals: a count that fits three children is not a line that proves one)"
 fi
 
 # ─── S. poll (7) — the run's LAST ENOSYS answer (§10.13's step-2 coda) ────

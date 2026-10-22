@@ -593,7 +593,7 @@ tooth tkill-arm-gone R4 "the sidecar no longer answers tkill (200)" "$W/t78"
 # clause set: raise(SIGABRT) returns 0, abort() believes the signal was
 # delivered, and the task keeps running instead of being reaped.
 seed "$W/t79"
-sed -i 's/ACT_TERMINATE => Answer::SignalKill,/ACT_TERMINATE => Answer::Reply(0, STATUS_OK),/' "$W/t79/user/sidecar/src/linux.rs"
+sed -i 's/ACT_TERMINATE => Answer::SignalKill(args\[1\]),/ACT_TERMINATE => Answer::Reply(0, STATUS_OK),/' "$W/t79/user/sidecar/src/linux.rs"
 tooth terminate-answers-success R4 "a default-terminate signal no longer converges on SignalKill" "$W/t79"
 
 # t80: the handler-install refusal answered 0 — v1 has no signal frames,
@@ -781,6 +781,15 @@ tooth parkctx-layout-unpinned U5 "nothing pins where the resume asm thinks the r
 seed "$W/t105"
 sed -i '/mov  rsi, \[gs:0x58\]/a\    mov  rax, [gs:0x58]' "$W/t105/arch/x86/syscall.asm"
 tooth restore-clobbers-rax U1 "the return path overwrites the syscall result on its way back" "$W/t105"
+
+# t106: the signal numbers pulled off both attribution lines — tkill's
+# pending ask and the killing delivery go back to printing a constant,
+# so WHICH signal is again reconstructed from which arms ran instead of
+# read off the line that proves it (increment 14's whole addition).
+seed "$W/t106"
+sed -i 's/fmt_sig_line(&mut ex, b" ok sig=", args\[1\]/fmt_sig_line(&mut ex, b" ok sig=", 0/' "$W/t106/user/sidecar/src/linux.rs"
+sed -i 's/fmt_sig_line(&mut ex, b" sig=", kill_sig/fmt_sig_line(&mut ex, b" sig=", 0/' "$W/t106/user/sidecar/src/linux.rs"
+tooth signal-number-not-logged R7 "neither line carries the signal number anymore" "$W/t106"
 
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"

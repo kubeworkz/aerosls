@@ -2117,11 +2117,56 @@ is named by the two `-> ENOSYS` lines: the handler installs were
 refused by name (step 2's rule — no signal frames yet), so the
 disposition never moved. Two more walls are named in the same trace:
 `mmap`(9) refused by name twice (§10.10/§10.11's anonymous-map gap,
-now VISIBLE in the run rather than predicted from it), and the
-identity of the pended signal itself — `tkill`'s sig argument is not
-printed, so WHICH signal killed the workload (and which handler
-class would have caught it) is the next increment's first
-instrumentation question.
+now VISIBLE in the run rather than predicted from it).
+
+**The killing signal is NAMED (increment 14): `sig=6` — SIGABRT.**
+The log carries the number on BOTH of its lines now — `tkill`'s ok
+prints the sig it was asked for, and the kill line prints the signal
+it is delivering, carried on `Answer::SignalKill(u64)` itself so the
+line proves the number instead of the arithmetic implying it (the
+same rule that put `child=` on every refusal — a count that fits
+three children is not a line that proves one). Measured on the final
+binaries, E3 harness RC=0:
+
+```
+[E7] linux: num=0000000E child=e7.linux.user.0 ok + payload     rt_sigprocmask, the mask as it WAS
+[E7] linux: num=000000C8 child=e7.linux.user.0 ok sig=6         tkill(6) = raise(SIGABRT), blocked → PENDS
+[E7] linux: num=0000000E child=e7.linux.user.0 sig=6 default-action -> kill
+[PROC] PID 111 terminated.
+```
+
+The flow is exactly the one `raise_flow_block_tkill_unblock_kills`
+drives host-side: musl's raise() blocks SIGABRT, `tkill` pends it,
+the restore unmasks, and the unblock arm's reveal runs the default
+action INSIDE `rt_sigprocmask` — the number on the line is what
+turns "a signal killed it" into "SIGABRT's default action, delivered
+at the unblock". Why abort() at all: zero `fatal runtime error`,
+zero panic lines — and the refusals immediately before it are the
+two `mmap`(9) ENOSYS answers, so the candidate reading is Rust's
+alloc-failure → `abort()` → `raise(SIGABRT)` (named as a READING,
+not a measurement: proving it is the next instrumentation question,
+and the fix for it either way is §10.10's anonymous-map gap or the
+handler class that would have caught SIGABRT — both already scoped).
+
+**On purpose, no behavior changed.** Every arm's answers are
+byte-identical — only the LOG grew teeth (the two numbers, an
+`Answer` payload and a no-alloc digit loop). The `fmt_sig_line`
+composer puts `sig=` at the FRONT of every line it
+makes so `enosys_log`'s 72-byte cap can never truncate the number
+that identifies the signal; `R7` pins both call sites and tooth
+t106 hardcodes zero in each (the exact regression: a line that
+prints `sig=0` forever reads as an identity).
+
+**Suite for this increment.** guard all **88 clauses** hold (R4's
+greps track the new variant shapes, R7 new); smoke **92/92** (t106;
+t79's sed updated so its mutation still lands); the sidecar crate's
+`linux::` tests **12/12** (the two `SignalKill(6)` pins);
+`make selfhost-bootimage` and `make x86-iso-e3` RC=0 (user/ changed,
+archives repacked); E3 harness OK on the final binaries;
+`tests/run_checks.sh` **45 PASS / 1 FAIL / 7 SKIP** (the same
+environmental census FAIL and cluster SKIPs, `script_conventions`
+and `sidecar_stamp` green inside it). `run_all` was not re-run — this
+increment changes no C — last green at 127/0/2 in increment 13.
 
 **What this increment is NOT.** No signal frames: a user handler is
 still refused ENOSYS by name, and this increment changes no arm — it
@@ -2170,7 +2215,9 @@ as kernel scratch, the round trip's register wall. 4: the path plan,
 the VFS bridge, the thirteen arms — with the copy-IN machinery above
 already in place for `read`'s reply, and the run's remaining named
 walls `mmap`(9) ENOSYS (§10.10) and the handler class (step 2's
-signal frames — the terminating signal's identity still unnamed). 5: the two format goldens. 6: the fixture probe on-target — a
+signal frames — the terminating signal NAMED at increment 14: SIGABRT,
+`sig=6`, raised by the workload's own abort and delivered at the
+unblock). 5: the two format goldens. 6: the fixture probe on-target — a
 `fixtures/` file-class sequence (mkdir, open, write, lseek, read-back,
 stat, getdents, rename, unlink, close) ending in a marker line in the
 E7MEM/E7FD family, beside the probe/candidate pair. 7: the real-flags
