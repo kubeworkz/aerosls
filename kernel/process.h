@@ -165,6 +165,23 @@ struct ProcessDescriptor {
     uint64_t   mem_stage_a0;           // args[0] as captured — the requested break
     uint8_t    mem_stage_valid;        // 1 between that forward's arming and its
                                        // reply (or refusal)
+    uint64_t   reply_stage_num;        // E7 increment 12 (§10.13's step 3): the
+                                       // reply payload's DESTINATION captured at
+                                       // the first trap — the copy-in aims where
+                                       // the FIRST trap said, never where the
+                                       // reply says (the staged-destination
+                                       // contract, §10.13). The number is part of
+                                       // the stage so a payload can be checked
+                                       // against the request it was planned for.
+    uint64_t   reply_stage_va;         // args[2] as captured — the child VA the
+                                       // payload is copied back into
+    uint32_t   reply_stage_len;        // the clamp: bytes the first trap allowed
+                                       // (32 for rt_sigaction, 8 for rt_sigprocmask)
+    uint8_t    reply_stage_valid;      // 1 between that forward's arming and its
+                                       // deliver (or refusal) — cleared at the
+                                       // top of every first-trap block, consumed
+                                       // and cleared at the apply, and cleared at
+                                       // slot reuse beside the other stages.
     uint64_t   user_rip;              // entry point in user space
     uint64_t   user_rsp;              // current user-space stack pointer
     uint64_t   user_stack_vaddr;      // vaddr base of the 8-page user stack

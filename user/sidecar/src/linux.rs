@@ -55,10 +55,14 @@
 //!     mask reveals it — which is exactly how musl's `raise()` dies on
 //!     real Linux (block → tkill → unblock → the default action runs).
 //!     Refused by name with the number logged: handler invocation (no
-//!     frames/sigreturn), stop-by-default delivery, an oldact/oldset the
-//!     kernel will not copy back (it refuses first-trap; §10.10's copy-IN
-//!     gap), and a tid that is not this task's own (ESRCH — cross-task
-//!     signals are unscoped, never silently re-targeted at the sender);
+//!     frames/sigreturn), stop-by-default delivery, and a tid that is not
+//!     this task's own (ESRCH — cross-task signals are unscoped, never
+//!     silently re-targeted at the sender). The oldact/oldset out-pointer
+//!     is NO LONGER refused: E7 increment 12 landed §10.10's copy-IN gap —
+//!     the old disposition/mask travels back as this reply's PAYLOAD
+//!     (Answer::ReplyBytes), the kernel copies it into the span its own
+//!     first trap validated, and service() bounds the bytes against the
+//!     forwarded out-pointer before anything is sent;
 //!   - everything else — `open`/`close`/`lseek` and the rest of the fd
 //!     class (Phase 2 §3-§4), `mmap`/`munmap` (§5.4's sub-allocation
 //!     half, the increment after 6), any mprotect whose prot is not
@@ -211,6 +215,15 @@ enum Answer {
     /// the count actually taken. Only `service` touches the console — it
     /// holds the handle; this stays pure over the request and the table.
     Write(usize),
+    /// E7 increment 12 (the reply payload, §10.13's step 3): the reply
+    /// carries PAYLOAD bytes BACK into the child — rt_sigaction's oldact
+    /// and rt_sigprocmask's oldset. Only `service` sends them (it owns the
+    /// bound: the bytes must equal the clamp the forwarded out-pointer
+    /// implies, or the answer goes out as num=0 → -EPROTO — the twin of
+    /// the deliver's staged-len check, neither end load-bearing alone).
+    /// The fixed buffer is the largest payload any current number owes
+    /// (SIGACT_BYTES = 32); `len` is the exact count that crosses.
+    ReplyBytes(u64, usize, [u8; SIGACT_BYTES]),
     /// exit_group: reap the task, reply nothing.
     Exit,
     /// E7 increment 10 (the signal seam): a signal's DEFAULT ACTION ran —
@@ -266,6 +279,49 @@ impl SigState {
             dispo: [DISPO_DFL; SIG_MAX + 1],
         }
     }
+}
+
+/// The bytes an oldact reply payload carries (E7 increment 12, §10.13's
+/// step 3) — the kernel-ABI struct sigaction as THIS state records it:
+/// the handler word at offset 0 (SIG_DFL 0 / SIG_IGN 1 — the only two
+/// dispositions v1 stores; `no` is range-checked by every caller), and
+/// every other field ZERO — sa_flags, sa_restorer and sa_mask were never
+/// stored (a handler install is refused before mutation, so nothing may
+/// depend on bytes this side declined to keep), and zero IS the honest
+/// answer rather than a default invented for the reply. Twin of the
+/// kernel's staged clamp (32 bytes — LINUX_SIGACT_BYTES), which the
+/// deliver bounds the copy against.
+fn old_act_bytes(sig: &SigState, no: u64) -> [u8; SIGACT_BYTES] {
+    let mut b = [0u8; SIGACT_BYTES];
+    let handler: u64 = if sig.dispo[no as usize] == DISPO_IGN { 1 } else { 0 };
+    b[0..8].copy_from_slice(&handler.to_le_bytes());
+    b
+}
+
+/// A SUCCESSFUL sig answer, with the out-pointer's payload attached iff
+/// the forwarded args[2] (the oldact/oldset pointer) was non-NULL — the
+/// arm-side half of service()'s bound: a NULL out-pointer owes no bytes
+/// and must carry none (the deliver refuses payload on a request that
+/// staged none), a non-NULL one owes exactly the struct's size. The two
+/// refusal paths above never reach here — an errno reply carries no
+/// payload, which is the deliver's shape-1 rule on the other end.
+fn sig_ok(args: &[u64; 6], old: [u8; SIGACT_BYTES]) -> Answer {
+    if args[2] != 0 {
+        Answer::ReplyBytes(0, SIGACT_BYTES, old)
+    } else {
+        Answer::Reply(0, STATUS_OK)
+    }
+}
+
+/// The bytes an oldset reply payload carries (increment 12): the 8-byte
+/// mask, little-endian, in the same fixed buffer ReplyBytes owns — `len`
+/// (SIGSET_BYTES) is what crosses and what service()'s bound checks, so
+/// the buffer's upper bytes never leave this side. Twin of the kernel's
+/// staged 8-byte clamp (LINUX_SIGSET_BYTES).
+fn sigset_payload(mask: u64) -> [u8; SIGACT_BYTES] {
+    let mut b = [0u8; SIGACT_BYTES];
+    b[..SIGSET_BYTES as usize].copy_from_slice(&mask.to_le_bytes());
+    b
 }
 
 /// The census's first answers (see the module header for the honest
@@ -408,33 +464,46 @@ fn answer(
         /* exit_group (231, LSC_EXIT): the sidecar reaps, the frames return
          * (§5.6) — handled by service(), which owns the pid lookup. */
         231 => Answer::Exit,
-        /* rt_sigaction (13, LSC_SIG — E7 increment 10, §10.13's step 2):
-         * the KERNEL copied `act` out of the child (32 bytes behind the
-         * header), so nothing here reads the child's memory. Both
-         * refusals the kernel refuses first-trap are checked here as this
-         * side's OWN twins — the W|X posture one level down: both ends, so
-         * neither alone is load-bearing. A foreign sigsetsize is EINVAL
-         * (Linux's own number) and an oldact out-pointer is ENOSYS — the
-         * copy-IN that would write the old disposition back does not
-         * exist (§10.10's named gap), and answering 0 with the pointer
-         * untouched would hand the caller stack garbage it believes is an
-         * answer. act NULL with no oldact is the no-op both Linux and
-         * this seam answer 0. The DISPOSITION records DFL/IGN only: a
-         * handler address is ENOSYS by name BEFORE any mutation — v1 has
-         * no signal frames, so installing a handler this shim can never
-         * invoke would make every later delivery a coin flip; sa_flags
-         * and sa_mask are deliberately NOT stored (they can only ride
-         * with a handler install, which was just refused — nothing may
-         * depend on bytes this side declined to keep). */
+        /* rt_sigaction (13, LSC_SIG — E7 increment 10, §10.13's step 2;
+         * the out-pointer half landed in increment 12): the KERNEL copied
+         * `act` out of the child (32 bytes behind the header), so nothing
+         * here reads the child's memory. The kernel's first-trap refusals
+         * are checked here as this side's OWN twins — the W|X posture one
+         * level down: both ends, so neither alone is load-bearing. A foreign
+         * sigsetsize is EINVAL (Linux's own number). act NULL with no
+         * oldact is the no-op both Linux and this seam answer 0.
+         *
+         * The OUT-POINTER (increment 12): when oldact was passed, a
+         * successful answer carries the OLD disposition back as this
+         * reply's payload — captured BEFORE any mutation below (oldact is
+         * the disposition as it WAS, and a refusal arm returns with the
+         * plain reply, no bytes: the deliver only copies on success). The
+         * DISPOSITION records DFL/IGN only: a handler address is ENOSYS by
+         * name BEFORE any mutation — v1 has no signal frames, so
+         * installing a handler this shim can never invoke would make every
+         * later delivery a coin flip; sa_flags and sa_mask are
+         * deliberately NOT stored (they can only ride with a handler
+         * install, which was just refused — nothing may depend on bytes
+         * this side declined to keep — and zero in the oldact payload IS
+         * that truth). */
         LINUX_RT_SIGACTION => {
             if args[3] != SIGSET_BYTES {
                 Answer::Reply(0, E_INVAL)
-            } else if args[2] != 0 {
-                Answer::Reply(0, E_NOSYS)
-            } else if args[1] == 0 {
-                Answer::Reply(0, STATUS_OK)
+            } else if args[1] == 0 && args[2] == 0 {
+                Answer::Reply(0, STATUS_OK) /* nothing in, nothing back */
             } else if args[0] == 0 || args[0] > SIG_MAX as u64 {
                 Answer::Reply(0, E_INVAL)
+            } else if args[1] == 0 {
+                /* QUERY — act NULL, oldact set: the OLD disposition is the
+                 * whole answer, carried back as the reply payload (this
+                 * side never touches the child's memory — the kernel
+                 * copies the bytes into the span its first trap validated).
+                 * Legal for EVERY signal, SIGKILL/SIGSTOP included: only
+                 * CHANGING those is EINVAL, and a range-checked query is
+                 * also what keeps the dispo[] index below inside the
+                 * table. */
+                let old = old_act_bytes(sig, args[0]);
+                Answer::ReplyBytes(0, SIGACT_BYTES, old)
             } else if args[0] == 9 || args[0] == 20 {
                 /* SIGKILL / SIGSTOP: Linux itself refuses any change to
                  * these dispositions (EINVAL), whatever the act says. */
@@ -442,21 +511,27 @@ fn answer(
             } else if payload.len() < SIGACT_BYTES {
                 Answer::Reply(0, E_NOSYS) /* service's length check refuses these too */
             } else {
+                /* oldact captured BEFORE the record moves: the caller must
+                 * see the disposition as it was at entry. */
+                let old = old_act_bytes(sig, args[0]);
                 match read_u64(payload, 0) {
                     0 => {
                         sig.dispo[args[0] as usize] = DISPO_DFL;
-                        Answer::Reply(0, STATUS_OK)
+                        sig_ok(args, old)
                     }
                     1 => {
                         sig.dispo[args[0] as usize] = DISPO_IGN;
-                        Answer::Reply(0, STATUS_OK)
+                        sig_ok(args, old)
                     }
                     _ => Answer::Reply(0, E_NOSYS), /* handler install not landed */
                 }
             }
         }
         /* rt_sigprocmask (14, LSC_SIG — the seam's other recorded half):
-         * same twins (sigsetsize, oldset) as 13 above. The mask itself is
+         * the same sigsetsize twin as 13, and — since increment 12 — the
+         * same OLDSET-AS-PAYLOAD answer (the out-pointer's 8 bytes cross
+         * back on success, captured before the mask moves; a refusal
+         * carries none). The mask itself is
          * POSIX arithmetic — BLOCK / UNBLOCK / SETMASK — and then the
          * DELIVERY: what does the new mask REVEAL? A revealed pending
          * signal whose disposition is IGN (or whose default is ignore) is
@@ -469,15 +544,23 @@ fn answer(
         LINUX_RT_SIGPROCMASK => {
             if args[3] != SIGSET_BYTES {
                 Answer::Reply(0, E_INVAL)
-            } else if args[2] != 0 {
-                Answer::Reply(0, E_NOSYS)
+            } else if args[1] == 0 && args[2] == 0 {
+                Answer::Reply(0, STATUS_OK) /* nothing in, nothing back */
             } else if args[1] == 0 {
-                Answer::Reply(0, STATUS_OK)
+                /* QUERY — set NULL, oldset set: the CURRENT mask back as
+                 * the reply payload (increment 12; Linux ignores `how`
+                 * when the set pointer is NULL, and so does this arm — the
+                 * query happens before the how match). */
+                Answer::ReplyBytes(0, SIGSET_BYTES as usize,
+                                   sigset_payload(sig.mask))
             } else if payload.len() < SIGSET_BYTES as usize {
                 Answer::Reply(0, E_NOSYS) /* service's length check refuses these too */
             } else {
                 let set = read_u64(payload, 0);
                 let old = sig.mask;
+                let old_bytes = sigset_payload(old); /* the oldset payload,
+                                                    * captured BEFORE the
+                                                    * mask moves */
                 match args[0] {
                     0 | 1 | 2 => {
                         let new_mask = match args[0] {
@@ -520,7 +603,13 @@ fn answer(
                                  * never half-changes the mask. */
                                 sig.pending &= new_mask;
                                 sig.mask = new_mask;
-                                Answer::Reply(0, STATUS_OK)
+                                if args[2] != 0 {
+                                    Answer::ReplyBytes(0,
+                                                       SIGSET_BYTES as usize,
+                                                       old_bytes)
+                                } else {
+                                    Answer::Reply(0, STATUS_OK)
+                                }
                             }
                         }
                     }
@@ -765,6 +854,30 @@ fn reply<K: Kernel>(k: &K, ch_w: u32, tag: u32, num: u64, ret: u64, status: i32)
     }
 }
 
+/// The reply WITH a payload behind the header (E7 increment 12): the same
+/// little-endian field writes as `reply()` — num at 0, ret at 56, status
+/// left zeroed at 64 — then the payload bytes appended at 72, sent as one
+/// message: exactly the shape kernel/chan.c's deliver validates (72 + n,
+/// n bounded by the staged clamp, ret's shape checked against the
+/// number). A send failure is reply()'s own (the child's end died
+/// mid-call; dropping the reply costs nothing but the log line).
+fn reply_bytes<K: Kernel>(k: &K, ch_w: u32, tag: u32, num: u64, ret: u64,
+                          bytes: &[u8]) {
+    let mut payload = [0u8; LINUX_SYSCALL_REQ_BYTES + SIGACT_BYTES];
+    debug_assert!(bytes.len() <= SIGACT_BYTES);
+    payload[0..8].copy_from_slice(&num.to_le_bytes());
+    payload[56..64].copy_from_slice(&ret.to_le_bytes());
+    payload[LINUX_SYSCALL_REQ_BYTES..LINUX_SYSCALL_REQ_BYTES + bytes.len()]
+        .copy_from_slice(bytes);
+    let total = LINUX_SYSCALL_REQ_BYTES + bytes.len();
+    if k.send(ch_w, tag, 0, &payload[..total], &[],
+              aerosls_proto::kabi::TIMEOUT_NONE)
+        .is_err()
+    {
+        enosys_log(0xF1F1, b"", b"[POSIX] linux reply (payload) send failed\n");
+    }
+}
+
 /// One ENOSYS/protocol log line, host-build tolerant (entry.rs's klog is
 /// the target-feature serial path; on host fakes the answers still run,
 /// they just stay quiet).
@@ -924,6 +1037,32 @@ pub fn service<K: Kernel>(k: &K, console: &CharNode) {
                 }
                 reply(k, ch_w, rr.tag, num, ret, status);
             }
+            Answer::ReplyBytes(ret, len, bytes) => {
+                /* E7 increment 12 (the reply payload): the BOUND over the
+                 * answer — a reply-payload number's bytes must equal the
+                 * clamp the forwarded out-pointer implies (non-NULL
+                 * args[2] = this number's fixed size), and only a request
+                 * that ASKED for one may carry one. A mismatch is never
+                 * sent: num=0 makes the kernel's echo refuse -EPROTO, so
+                 * the answer errors out loud instead of bytes landing in
+                 * a destination nothing validated — the twin of the
+                 * deliver's staged-len check, neither end load-bearing
+                 * alone. The deliver performs the copy (the kernel owns
+                 * the child's pages); this side only decides the bytes. */
+                let want = if num == LINUX_RT_SIGACTION {
+                    SIGACT_BYTES
+                } else {
+                    SIGSET_BYTES as usize
+                };
+                if args[2] == 0 || len != want || len > bytes.len() {
+                    enosys_log(0xBAD1, &name_buf[..nlen],
+                               b"[POSIX] reply payload mismatch -> -EPROTO\n");
+                    reply(k, ch_w, rr.tag, 0, 0, E_NOSYS);
+                    continue;
+                }
+                enosys_log(num as u32, &name_buf[..nlen], b" ok + payload\n");
+                reply_bytes(k, ch_w, rr.tag, num, ret, &bytes[..len]);
+            }
             Answer::Write(len) => {
                 /* The perform half of step 6 (increment 5): the fd
                  * lookup said this descriptor names the console, and the
@@ -1070,18 +1209,56 @@ mod tests {
     }
 
     #[test]
-    fn sigaction_refuses_foreign_size_and_out_pointer_like_the_kernel() {
+    fn sigaction_refuses_foreign_size_and_carries_oldact_back_as_payload() {
         let mut sig = fresh();
-        /* sigsetsize != 8: Linux's own EINVAL */
+        /* sigsetsize != 8: Linux's own EINVAL — a plain reply, never
+         * bytes: a refusal carries no payload (the deliver's shape-1
+         * rule on the other end). */
         let a = answer(13, &[6, 0x4000, 0, 4, 0, 0], &fds(), &mut ledger(),
                        &mut sig, &act_payload(0));
         assert!(matches!(a, Answer::Reply(0, E_INVAL)), "size twin: {:?}", a);
-        /* oldact != NULL: the copy-IN gap, ENOSYS by name */
+        /* oldact != NULL with a NULL act — the QUERY shape (increment 12):
+         * the old disposition comes back as the reply's payload, DFL (0)
+         * while nothing has been recorded. The copy-IN gap's answer. */
+        let a = answer(13, &[6, 0, 0x5000, 8, 0, 0], &fds(), &mut ledger(),
+                       &mut sig, &[]);
+        match a {
+            Answer::ReplyBytes(ret, len, bytes) => {
+                assert_eq!(ret, 0, "a query returns 0, not a count");
+                assert_eq!(len, SIGACT_BYTES, "the full struct crosses");
+                assert_eq!(read_u64(&bytes, 0), 0, "SIG_DFL has not changed");
+                assert!(bytes[8..].iter().all(|&b| b == 0),
+                        "flags/restorer/mask were never stored — zero IS\n        the truth, not a default invented for the reply");
+            }
+            other => panic!("oldact query: {:?}", other),
+        }
+        /* the old DISPOSITION crosses, captured BEFORE the new one is
+         * recorded: record IGN (no oldact), then record DFL WITH oldact —
+         * the payload must carry IGN, the disposition as it WAS. */
+        let a = answer(13, &[6, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
+                       &mut sig, &act_payload(1));
+        assert!(matches!(a, Answer::Reply(0, STATUS_OK)), "IGN: {:?}", a);
+        assert_eq!(sig.dispo[6], DISPO_IGN);
+        let a = answer(13, &[6, 0x4000, 0x5000, 8, 0, 0], &fds(),
+                       &mut ledger(), &mut sig, &act_payload(0));
+        match a {
+            Answer::ReplyBytes(ret, len, bytes) => {
+                assert_eq!((ret, len), (0, SIGACT_BYTES));
+                assert_eq!(read_u64(&bytes, 0), 1,
+                           "oldact is the disposition BEFORE this call");
+            }
+            other => panic!("oldact on success: {:?}", other),
+        }
+        assert_eq!(sig.dispo[6], DISPO_DFL, "and the new one landed");
+        /* a REFUSAL with oldact requested: the plain reply, no bytes —
+         * an errno owes no payload, and a mutation-free refusal leaves
+         * the out-pointer to the kernel's shape-1 path (which accepts an
+         * errno reply without copying). */
         let a = answer(13, &[6, 0x4000, 0x5000, 8, 0, 0], &fds(), &mut ledger(),
-                       &mut sig, &act_payload(0));
-        assert!(matches!(a, Answer::Reply(0, E_NOSYS)), "oldact twin: {:?}", a);
-        /* the refusal mutated nothing */
-        assert_eq!(sig.dispo[6], DISPO_DFL);
+                       &mut sig, &act_payload(0x800abcd));
+        assert!(matches!(a, Answer::Reply(0, E_NOSYS)),
+                "handler refusal carries no payload: {:?}", a);
+        assert_eq!(sig.dispo[6], DISPO_DFL, "nothing moved");
         /* act NULL with no oldact: the no-op both sides answer 0 */
         let a = answer(13, &[6, 0, 0, 8, 0, 0], &fds(), &mut ledger(),
                        &mut sig, &[]);
@@ -1136,15 +1313,44 @@ mod tests {
         let a2 = answer(14, &[2, 0x4000, 0, 16, 0, 0], &fds(), &mut ledger(),
                         &mut sig, &set_payload(!0));
         assert!(matches!(a2, Answer::Reply(0, E_INVAL)), "size twin: {:?}", a2);
+        assert_eq!(sig.mask, before, "a refused call never half-changes the mask");
+        /* the oldset OUT-POINTER (increment 12, the copy-IN gap's land):
+         * this call SUCCEEDS and the OLD mask crosses back as the reply
+         * payload — captured BEFORE the mask moves — and only then does
+         * the SETMASK land. A refusal twin remains below (`how`). */
         let a3 = answer(14, &[2, 0x4000, 0x5000, 8, 0, 0], &fds(), &mut ledger(),
                         &mut sig, &set_payload(!0));
-        assert!(matches!(a3, Answer::Reply(0, E_NOSYS)), "oldset twin: {:?}", a3);
-        assert_eq!(sig.mask, before, "a refused call never half-changes the mask");
+        match a3 {
+            Answer::ReplyBytes(ret, len, bytes) => {
+                assert_eq!((ret, len), (0, SIGSET_BYTES as usize),
+                           "a successful rt_sigprocmask returns 0, with the\n        8-byte oldset as payload");
+                assert_eq!(read_u64(&bytes, 0), before,
+                           "oldset is the mask BEFORE this call");
+            }
+            other => panic!("oldset twin: {:?}", other),
+        }
+        assert_eq!(sig.mask, !0, "and the SETMASK itself landed");
+        let before = sig.mask;
         /* a `how` Linux does not have */
         let a = answer(14, &[9, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
                        &mut sig, &set_payload(0));
         assert!(matches!(a, Answer::Reply(0, E_INVAL)), "how: {:?}", a);
         assert_eq!(sig.mask, before, "EINVAL moved no mask either");
+        /* the QUERY shape: set NULL with oldset — the current mask back
+         * as payload, no matter what `how` says (Linux ignores `how`
+         * when the set pointer is NULL, and so does the arm — the query
+         * runs before the how match), and nothing about the mask moves. */
+        let a = answer(14, &[9, 0, 0x6000, 8, 0, 0], &fds(), &mut ledger(),
+                       &mut sig, &[]);
+        match a {
+            Answer::ReplyBytes(ret, len, bytes) => {
+                assert_eq!((ret, len), (0, SIGSET_BYTES as usize));
+                assert_eq!(read_u64(&bytes, 0), before,
+                           "the query returns the CURRENT mask");
+            }
+            other => panic!("oldset query: {:?}", other),
+        }
+        assert_eq!(sig.mask, before, "a query never moves the mask");
     }
 
     #[test]

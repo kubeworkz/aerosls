@@ -651,23 +651,26 @@ int main(void)
               "      bytes silently reinterpreted");
 
         a[3] = LINUX_SIGSET_BYTES;
-        a[2] = 0x00007FFFFFFFE200ULL;   /* oldact: the copy-IN gap */
+        a[2] = 0x00007FFFFFFFE200ULL;   /* oldact: increment 12 landed the
+                                        * copy-IN — the sig plan's business
+                                        * is unchanged by it */
         p = linux_sig_copy_plan(LINUX_RT_SIGACTION, a);
-        CHECK(p.refuse == -LINUX_ENOSYS && p.len == 0,
-              "an oldact out-pointer refuses -ENOSYS by name — answering "
-              "      0 while the caller's buffer keeps stack garbage is "
-              "      the silent lie the refusal discipline forbids");
+        CHECK(p.refuse == 0 && p.len == LINUX_SIGACT_BYTES &&
+              p.src == a[1],
+              "an oldact out-pointer no longer refuses this plan — the "
+              "      act bytes still cross out exactly as before, and the "
+              "      destination's span is linux_fd_reply_plan's (step 3)");
 
         p = linux_sig_copy_plan(LINUX_RT_SIGPROCMASK, a);
-        CHECK(p.refuse == -LINUX_ENOSYS && p.len == 0,
-              "an oldset out-pointer refuses identically — the gap is "
-              "      the reply's copy-IN, not the call");
+        CHECK(p.refuse == 0 && p.len == LINUX_SIGSET_BYTES,
+              "an oldset out-pointer likewise — the plan carries the set "
+              "      bytes out, never a verdict about the reply");
 
         a[3] = 7;   /* BOTH defects: which refusal wins must be pinned */
         p = linux_sig_copy_plan(LINUX_RT_SIGACTION, a);
         CHECK(p.refuse == -LINUX_EINVAL,
-              "a foreign sigsetsize outranks the out-pointer refusal — "
-              "      the width check runs first, deterministically");
+              "a foreign sigsetsize still outranks everything — the "
+              "      width check runs first, deterministically");
 
         a[1] = 0;
         a[2] = 0;
@@ -750,6 +753,218 @@ int main(void)
               linux_poll_refuses_blocking(0, (uint64_t)(int64_t)-1) == 0,
           "a number that is not poll never waits as one — the predicate "
           "      is total over the number space (brk's break, 218's echo)");
+
+    /* ═══ E7 increment 12 (the reply payload, §10.13's step 3): the copy-IN ═
+     * The reply half of the fd class's byte crossing — §10.10's named
+     * gap closing. Three pure pieces, each with the branches a boot can
+     * only observe once: the first-trap destination plan, the two-phase
+     * copy (writable at every level, refusal mutates NOTHING), and the
+     * ret-shape predicate that keeps header, payload and rax one truth.
+     * Every case below is a way this seam drifts into the silent lie the
+     * refusal discipline exists to prevent: bytes into a destination no
+     * first trap validated, a write laundered through a read-only page,
+     * a half-written span, or a ret that contradicts the number. ════ */
+    CHECK(LINUX_READ == 0,
+          "read is Linux's own number 0 (the census's read row) — the "
+          "      count-truth number whose ret must equal its payload n");
+
+    {   /* the reply plan: the destination's first-trap validation */
+        uint64_t a[6];
+        struct LinuxFdReplyPlan r;
+
+        memset(a, 0, sizeof a);
+        a[0] = 6;
+        a[2] = 0x00007FFFFFFFE200ULL;   /* oldact on the child's stack */
+        r = linux_fd_reply_plan(LINUX_RT_SIGACTION, a);
+        CHECK(r.refuse == 0 && r.len == LINUX_SIGACT_BYTES &&
+              r.dst == a[2],
+              "an oldact pointer plans its 32-byte destination — the "
+              "      clamp the first trap will stage and the deliver "
+              "      bound the copy to");
+        r = linux_fd_reply_plan(LINUX_RT_SIGPROCMASK, a);
+        CHECK(r.refuse == 0 && r.len == LINUX_SIGSET_BYTES &&
+              r.dst == a[2],
+              "an oldset pointer plans 8 bytes — the fixed size this "
+              "      number owes, decided from num alone");
+
+        a[2] = 0;
+        r = linux_fd_reply_plan(LINUX_RT_SIGACTION, a);
+        CHECK(r.refuse == 0 && r.len == 0 && r.dst == 0,
+              "a NULL out-pointer plans NOTHING — no stage, no refusal: "
+              "      nothing is owed back, and a staged destination with "
+              "      no payload would make a plain success -EPROTO");
+
+        a[2] = 0x00007FFFFFFFE200ULL;
+        r = linux_fd_reply_plan(LINUX_WRITE, a);
+        CHECK(r.refuse == 0 && r.len == 0 && r.dst == 0,
+              "write has no reply payload — the plan is total over the "
+              "      number space; only copy-IN numbers plan a span");
+        r = linux_fd_reply_plan(218, a);
+        CHECK(r.len == 0 && r.refuse == 0,
+              "218's echo likewise — a number that owes no bytes plans "
+              "      nothing (total, like every plan here)");
+
+        a[2] = 0xFFFF800000000000ULL;   /* non-canonical destination */
+        r = linux_fd_reply_plan(LINUX_RT_SIGACTION, a);
+        CHECK(r.refuse == -LINUX_EFAULT,
+              "a non-canonical oldact refuses -EFAULT at the FIRST trap "
+              "      — before any post, so no channel ever carries bytes "
+              "      toward a destination ring 3 could not write");
+
+        a[2] = 0x00007FFFFFFFFFE0ULL;    /* ends on MAX's last byte */
+        r = linux_fd_reply_plan(LINUX_RT_SIGACTION, a);
+        CHECK(r.refuse == 0 && r.len == LINUX_SIGACT_BYTES,
+              "a destination ending exactly on the user max's last byte "
+              "      is allowed — the inclusive bound the write plan pins"
+              "");
+
+        a[2] = 0x00007FFFFFFFFFFBULL;    /* first byte in, tail past MAX */
+        r = linux_fd_reply_plan(LINUX_RT_SIGACTION, a);
+        CHECK(r.refuse == -LINUX_EFAULT,
+              "a destination crossing the user-canonical max refuses — "
+              "      the WHOLE span is validated, not its first byte");
+
+        r = linux_fd_reply_plan(LINUX_RT_SIGACTION, NULL);
+        CHECK(r.dst == 0 && r.len == 0 && r.refuse == 0,
+              "a NULL args array is the zero plan — total, no fault");
+    }
+
+    {   /* the copy-in: fake tables with the RW bit, and the two-phase
+         * refusal — the security property the IN direction adds. Host
+         * addresses stand in for physical frames exactly as the copy's
+         * cases do; P=1 R=2 U=4 are the same own literals. */
+        static uint64_t c_pml4[512] __attribute__((aligned(4096)));
+        static uint64_t c_pdpt[512] __attribute__((aligned(4096)));
+        static uint64_t c_pd[512]   __attribute__((aligned(4096)));
+        static uint64_t c_pt[512]   __attribute__((aligned(4096)));
+        static uint8_t  c_page0[4096] __attribute__((aligned(4096)));
+        static uint8_t  c_page1[4096] __attribute__((aligned(4096)));
+        const uint64_t P = 1ULL, R = 2ULL, U = 4ULL, PS = 0x80ULL;
+        const uint64_t VA = 0x00000002468AF000ULL;
+        unsigned i4 = (unsigned)((VA >> 39) & 0x1FF);
+        unsigned i3 = (unsigned)((VA >> 30) & 0x1FF);
+        unsigned i2 = (unsigned)((VA >> 21) & 0x1FF);
+        unsigned i1 = (unsigned)((VA >> 12) & 0x1FF);
+        uint64_t root = (uint64_t)(uintptr_t)c_pml4;
+        uint8_t src[64];
+        unsigned k;
+
+        memset(c_pml4, 0, sizeof c_pml4);
+        memset(c_pdpt, 0, sizeof c_pdpt);
+        memset(c_pd, 0, sizeof c_pd);
+        memset(c_pt, 0, sizeof c_pt);
+        for (k = 0; k < 64; k++) src[k] = (uint8_t)(0x3C ^ k);
+        c_pml4[i4] = (uint64_t)(uintptr_t)c_pdpt | P | R | U;
+        c_pdpt[i3] = (uint64_t)(uintptr_t)c_pd   | P | R | U;
+        c_pd[i2]   = (uint64_t)(uintptr_t)c_pt   | P | R | U;
+        c_pt[i1]   = (uint64_t)(uintptr_t)c_page0 | P | R | U;
+        c_pt[i1 + 1] = (uint64_t)(uintptr_t)c_page1 | P | R | U;
+        memset(c_page0, 0x11, sizeof c_page0);
+        memset(c_page1, 0x22, sizeof c_page1);
+
+        CHECK(linux_user_copy_in(src, root, VA + 0x40, 32) == 0 &&
+              memcmp(c_page0 + 0x40, src, 32) == 0,
+              "the copy-IN writes through a present+user+WRITABLE chain —\n"
+              "      the bytes the sidecar decided are the bytes the task\n"
+              "      reads back from its own buffer");
+
+        CHECK(linux_user_copy_in(src, 0, 0, 0) == 0,
+              "n == 0 succeeds without touching anything (root may be 0) —\n"
+              "      both phases run zero iterations");
+
+        CHECK(linux_user_copy_in(NULL, root, VA + 0x40, 8) == -LINUX_EFAULT,
+              "a NULL source refuses — the mirror of copy_out's NULL\n"
+              "      destination, decided before the walk");
+
+        /* ── refusals-before-mutation: the IN direction's new property ── */
+        memset(c_page0 + 0x100, 0x77, 32);
+        c_pt[i1] = (uint64_t)(uintptr_t)c_page0 | P | U;   /* read-only leaf */
+        CHECK(linux_user_copy_in(src, root, VA + 0x100, 32) == -LINUX_EFAULT &&
+              c_page0[0x100] == 0x77 && c_page0[0x107] == 0x77,
+              "a READ-ONLY leaf refuses -EFAULT and mutates NOTHING —\n"
+              "      the sidecar must never launder a write through a page\n"
+              "      the child itself could not have written");
+        c_pt[i1] = (uint64_t)(uintptr_t)c_page0 | P | R | U;
+
+        c_pd[i2] = (uint64_t)(uintptr_t)c_pt | P | U;      /* RO mid-level */
+        CHECK(linux_user_copy_in(src, root, VA + 0x100, 32) == -LINUX_EFAULT &&
+              c_page0[0x100] == 0x77,
+              "a read-only MID level refuses — effective writability is\n"
+              "      the conjunction of all four entries, checked at every\n"
+              "      level like the USER bit");
+        c_pd[i2] = (uint64_t)(uintptr_t)c_pt | P | R | U;
+
+        c_pd[i2] = (uint64_t)(uintptr_t)c_pt | P | R | U | PS;   /* 2 MiB */
+        CHECK(linux_user_copy_in(src, root, VA + 0x100, 32) == -LINUX_EFAULT &&
+              c_page0[0x100] == 0x77,
+              "a huge page refuses by name, bytes untouched — the same\n"
+              "      4-KiB-frame assumption the copy refuses it under");
+        c_pd[i2] = (uint64_t)(uintptr_t)c_pt | P | R | U;
+
+        c_pt[i1] = (uint64_t)(uintptr_t)c_page0 | P;       /* supervisor leaf */
+        CHECK(linux_user_copy_in(src, root, VA + 0x100, 32) == -LINUX_EFAULT &&
+              c_page0[0x100] == 0x77,
+              "a supervisor leaf refuses, bytes untouched — the same\n"
+              "      boundary copy_out reads with");
+        c_pt[i1] = (uint64_t)(uintptr_t)c_page0 | P | R | U;
+
+        c_pt[i1] = 0;                                     /* absent leaf */
+        CHECK(linux_user_copy_in(src, root, VA + 0x100, 32) == -LINUX_EFAULT &&
+              c_page0[0x100] == 0x77,
+              "an absent leaf refuses, bytes untouched — an unmapped\n"
+              "      destination is an errno, never a fault in ring 0");
+        c_pt[i1] = (uint64_t)(uintptr_t)c_page0 | P | R | U;
+
+        /* ── the two-phase shape across a page boundary: page 1 refuses,
+         * so page 0 must not have been written either. This is the case
+         * a single-pass "walk then write" implementation fails (it would
+         * half-write the span), and the reason phase 1 exists. */
+        memset(c_page0 + 0xFF0, 0x55, 16);
+        c_pt[i1 + 1] = 0;   /* the SECOND page is absent */
+        CHECK(linux_user_copy_in(src, root, VA + 0xFF0, 32) == -LINUX_EFAULT &&
+              c_page0[0xFF0] == 0x55 && c_page0[0xFF7] == 0x55,
+              "a span whose SECOND page refuses leaves the FIRST page\n"
+              "      untouched — validate the whole span, THEN write: no\n"
+              "      half-written reply payload ever lands");
+        c_pt[i1 + 1] = (uint64_t)(uintptr_t)c_page1 | P | R | U;
+
+        CHECK(linux_user_copy_in(src, root, VA + 0xFF0, 32) == 0 &&
+              memcmp(c_page0 + 0xFF0, src, 16) == 0 &&
+              memcmp(c_page1, src + 16, 16) == 0,
+              "the happy cross-page span writes BOTH pages in order —\n"
+              "      each page re-walked from the PML4, leaf frame never\n"
+              "      mistaken for a root (copy_out's own rule)");
+    }
+
+    {   /* the ret-shape predicate: header, payload and rax one truth */
+        CHECK(linux_reply_shape_ok(LINUX_RT_SIGACTION, 0, 32) == 1 &&
+              linux_reply_shape_ok(LINUX_RT_SIGPROCMASK, 0, 8) == 1,
+              "the sig numbers answer 0 with their payload — a success\n"
+              "      the caller checks as success, never a byte count\n"
+              "      musl would read as an errno");
+        CHECK(linux_reply_shape_ok(LINUX_RT_SIGACTION, 32, 32) == 0 &&
+              linux_reply_shape_ok(LINUX_RT_SIGPROCMASK, 8, 8) == 0,
+              "ret == n on a sig number is REFUSED — that is read's rule\n"
+              "      worn as a sigaction's rax would be a lie the assert\n"
+              "      in the run turns into a crash");
+        CHECK(linux_reply_shape_ok(LINUX_READ, 32, 32) == 1 &&
+              linux_reply_shape_ok(LINUX_READ, 0, 0) == 1,
+              "read echoes its count — the count-truth shape (step 4's\n"
+              "      number, its rule already pinned here)");
+        CHECK(linux_reply_shape_ok(LINUX_READ, 31, 32) == 0 &&
+              linux_reply_shape_ok(LINUX_READ, 0, 32) == 0,
+              "a read whose ret misses n by one (or answers 0) is refused\n"
+              "      — payload and rax must be the same truth");
+        CHECK(linux_reply_shape_ok(218, 0, 0) == 1 &&
+              linux_reply_shape_ok(1, 0, 4) == 1 &&
+              linux_reply_shape_ok(0xFFFF, 0, 0) == 1,
+              "the predicate is total — a non-read number with a zero ret\n"
+              "      is its success shape, whatever the number");
+        CHECK(linux_reply_shape_ok(218, 5, 0) == 0,
+              "and refused where the ret contradicts it — total means\n"
+              "      every input has ONE answer, not a default that\n"
+              "      guesses");
+    }
 
     printf("linux_personality_host_test: %d passed, %d failed\n",
            checks_passed, checks_failed);

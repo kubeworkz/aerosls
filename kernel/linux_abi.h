@@ -336,13 +336,12 @@ uint64_t linux_user_page_frame(uint64_t root, uint64_t va);
  *   - args[3] (sigsetsize) != 8 — the kernel-ABI sigset this seam crosses
  *     is 8 bytes; a caller claiming another size would get its bytes
  *     silently reinterpreted. Linux's own number answers this: EINVAL.
- *   - args[2] (oldact/oldset) != 0 — writing the OLD disposition BACK
- *     into the child is §10.10's copy-IN gap (increment 8's seam), which
- *     does not exist yet. Answering 0 while the caller's out-pointer
- *     keeps stack garbage it believes is an answer is exactly the silent
- *     lie the refusals-by-name discipline exists to prevent; ENOSYS with
- *     the call site's logged line is the honest shape, trigger: land the
- *     reply payload's copy-IN and this refusal goes with it.
+ *   - args[1] (act/set) spans the copy-IN (increment 12): a non-canonical
+ *     or max-crossing span is -EFAULT at the first trap, same as ever.
+ * The OUT-POINTER (args[2] != 0) is NO LONGER refused here: increment 12
+ * landed §10.10's copy-IN gap, and the out-pointer's span is planned by
+ * linux_fd_reply_plan below — one plan per number, both computed before
+ * the describe, both first-trap.
  * A NULL act/set with a NULL out-pointer is a no-op the sidecar answers
  * 0 — nothing to copy, nothing to ask. Pure: the host test drives every
  * branch (tests/linux_personality_host_test.c). */
@@ -360,12 +359,84 @@ struct LinuxSigCopyPlan {
                       * BEFORE any post (first-trap refusal discipline)  */
 };
 
-/* Plan one sig-class byte crossing: EINVAL for a foreign sigsetsize, 
- * ENOSYS for an out-pointer this kernel cannot write back, -EFAULT for a
- * span ring 3 could not read, else the act/set bytes (or none). Total:
- * any other number plans nothing and refuses nothing. */
+/* Plan one sig-class byte crossing: EINVAL for a foreign sigsetsize,
+ * -EFAULT for a span ring 3 could not read, else the act/set bytes (or
+ * none). Total: any other number plans nothing and refuses nothing. */
 struct LinuxSigCopyPlan linux_sig_copy_plan(uint64_t num,
                                             const uint64_t args[6]);
+
+/* ─── E7 increment 12 (the reply payload, §10.13's step 3) — the copy-IN ───
+ * The reply half of the fd class's byte crossing: increment 5 taught the
+ * forward to carry bytes OUT of the child, this makes the reply carry
+ * bytes BACK. §10.10's named gap — an oldact/oldset out-pointer the
+ * caller would otherwise read stack garbage from — closes here.
+ *
+ * The split is the same split, mirrored. The FIRST trap validates the
+ * CHILD's destination span and stages it (kernel/process.h's
+ * reply_stage_* beside fs_base_stage): the copy-in aims where the first
+ * trap said, never where the reply says — park_req cannot carry it (§10.7)
+ * and a stale one must not aim a payload at a reused slot's successor
+ * (cleared at the four places the contract names: top of every first-
+ * trap block, consume at the deliver, refusal, slot reuse). The DELIVER
+ * (kernel/chan.c) accepts exactly three shapes and copies only within
+ * the staged clamp. The SIDECAR owns the answer's bytes (its 13/14 arms)
+ * and its own bound over them (service() — payload length must equal the
+ * forwarded out-pointer's clamp). Neither end alone is load-bearing.
+ *
+ * linux_user_copy_in is linux_user_copy_out's mirror over the same
+ * four-level walk, and STRICTER where it must be: every page present,
+ * USER and WRITABLE, in two phases (validate the whole span, then
+ * write), allocating nothing. Writable, not merely user: copy-out only
+ * needs readable, but copy-in must never write a byte into a page the
+ * child itself could not have written — or the sidecar would launder
+ * writes through the child's read-only pages. That asymmetry is the new
+ * security property, and the refusals-before-mutation shape (a bad page
+ * ANYWHERE in the span leaves every byte untouched) is its host test. */
+#define LINUX_READ  0u           /* the census's read row (§5.6) — the
+                                  * count-truth number step 4 lands on
+                                  * this same machinery                */
+
+struct LinuxFdReplyPlan {
+    uint64_t dst;      /* child VA to copy the reply payload into (args[2]) */
+    uint32_t len;      /* bytes the first trap allows: 32 (13) or 8 (14);
+                        * 0 = this call owes no payload                    */
+    int32_t  refuse;   /* 0 = proceed; else the Linux errno to return
+                        * BEFORE any post (first-trap refusal discipline)  */
+};
+
+/* Plan one reply payload's destination span — the write plan's twin over
+ * the IN direction. For a copy-IN number with a NULL out-pointer the
+ * plan is empty (no stage, no refusal: nothing is owed back); with a
+ * pointer, the (dst, len) span must be user-canonical and inside the
+ * user range — the same (span_end - 1) > MAX shape the write plan's
+ * host tests pin — else -LINUX_EFAULT at the first trap. Pure: any other
+ * number plans nothing and refuses nothing (total). */
+struct LinuxFdReplyPlan linux_fd_reply_plan(uint64_t num,
+                                            const uint64_t args[6]);
+
+/* Copy n bytes into a task's user VA from src, walking root's page
+ * tables. Two phases: EVERY page of the span is first validated (present,
+ * USER, writable, no huge page, level by level), then the bytes are
+ * written — a refusal in phase one mutates NOTHING (the host test pins
+ * bytes-unchanged). Returns 0 or -LINUX_EFAULT, never a fault: the
+ * identity map is what lets a translated frame be written directly, and
+ * n == 0 succeeds without touching anything (root may be 0). src must
+ * hold n bytes; the caller owns it. */
+int linux_user_copy_in(const uint8_t *src, uint64_t root, uint64_t va,
+                       uint32_t n);
+
+/* Is this reply payload's `ret` the right shape for `num`? The one-truth
+ * rule applied to the IN direction: a count-truth number (LINUX_READ —
+ * read's return IS the byte count) must echo n in ret, every other
+ * copy-IN number this seam knows (rt_sigaction/rt_sigprocmask) returns
+ * 0 on success, so its ret must be 0. A payload whose ret contradicts
+ * the number is -EPROTO at the deliver, before anything is copied — the
+ * same 'header, payload and rax are one truth' rule increment 5 set on
+ * the OUT side. Total over (num, ret, n); a number with no reply plan
+ * never reaches it (the deliver refuses by stage first). A future
+ * copy-IN number whose Linux return is neither 0 nor its count grows
+ * this predicate with its own arm — never a default that guesses. */
+int linux_reply_shape_ok(uint64_t num, uint64_t ret, uint32_t n);
 
 /* ─── The errno map (§5.7) ─────────────────────────────────────────────────
  * Two families cross into the Linux task as negative rax: the Phase-3

@@ -111,6 +111,9 @@ echo "answers, the plan's first-trap refusals and the SignalKill delivery"
 echo "and increment 11's poll answer (clause set S) — the run's LAST"
 echo "ENOSYS: a zero-timeout probe answered 0, a waiting poll refused"
 echo "at both ends before any post"
+echo "and increment 12's reply payload (clause set T) — the copy-IN's"
+echo "first-trap destination plan, the deliver's three shapes, the"
+echo "two-phase writable copy and the stage's four-place lifecycle"
 echo "========================================================================"
 echo
 
@@ -664,6 +667,78 @@ tooth poll-wait-granted S2 "a waiting poll is granted 0 events instead of refuse
 seed "$W/t89"
 sed -i '/linux_poll_refuses_blocking(/d' "$W/t89/tests/linux_personality_host_test.c"
 tooth poll-unhosttested S3 "the host test no longer drives linux_poll_refuses_blocking" "$W/t89"
+
+# ─── T: the reply payload's copy-IN (increment 12, §10.13's step 3) ────────
+
+# t90: the reply plan's first-trap refusal deleted — a destination ring 3
+# could not write would post anyway, and the deliver's copy would land
+# bytes at a span nothing validated (T1's own refusal-by-name rule).
+seed "$W/t90"
+sed -i '/return (uint64_t)(int64_t)rp.refuse;/d' "$W/t90/kernel/syscall_dispatch.c"
+tooth reply-plan-refusal-gone T1 "the dispatch computes the destination plan but can no longer refuse it" "$W/t90"
+
+# t91: the stage never set — every reply payload then arrives for a
+# number with "no reply plan" and is refused, so the out-pointer the
+# caller passed keeps its stack garbage (the silent lie, by refusal).
+seed "$W/t91"
+sed -i '/cur->reply_stage_valid = 1;/d' "$W/t91/kernel/syscall_dispatch.c"
+tooth reply-stage-never-set T1 "the destination is validated but never staged for the deliver" "$W/t91"
+
+# t92: the deliver's consume deleted — the stage survives the apply, so
+# the NEXT reply payload aims at a destination already used (and a
+# refusal path leaves it armed for a request that never made it).
+seed "$W/t92"
+sed -i '/pd->reply_stage_valid = 0;/d' "$W/t92/kernel/chan.c"
+tooth reply-stage-never-consumed T2 "the deliver reads the stage but never clears it" "$W/t92"
+
+# t93: the slot-reuse clear deleted — "dead code" is how a reused task
+# slot inherits its predecessor's destination, and the next reply
+# payload writes into the successor's address space.
+seed "$W/t93"
+sed -i '/pd->reply_stage_valid = 0;/d' "$W/t93/kernel/process.c"
+tooth reply-stage-slotreuse-clear-gone T2 "a reused slot keeps the dead task's staged destination" "$W/t93"
+
+# t94: the staged clamp dropped from the shape gate — a payload larger
+# than the first trap allowed would pass shape validation and be copied.
+seed "$W/t94"
+sed -i 's/!staged || n > slen/!staged/' "$W/t94/kernel/chan.c"
+tooth deliver-clamp-gone T3 "the deliver accepts a payload beyond the staged clamp" "$W/t94"
+
+# t95: the writable check deleted — "readable is enough" is how the
+# sidecar starts laundering writes through pages the child could not
+# write itself (the IN direction's whole new security property).
+seed "$W/t95"
+sed -i '/if (require_rw && !(e & LAB_PTE_RW)) return -LINUX_EFAULT;/d' "$W/t95/kernel/linux_abi.c"
+tooth copyin-writable-check-gone T4 "the copy-IN writes wherever the chain is present+user, read-only or not" "$W/t95"
+
+# t96: the sidecar's bound inverted — ReplyBytes would send whatever it
+# likes, and only the kernel's staged clamp would still be holding the
+# line (one end load-bearing, which is exactly what T5 forbids).
+seed "$W/t96"
+sed -i 's/if args\[2\] == 0 || len != want || len > bytes.len() {/if false {/' "$W/t96/user/sidecar/src/linux.rs"
+tooth reply-bytes-unbounded T5 "the sidecar sends a payload no out-pointer asked for (or the wrong size)" "$W/t96"
+
+# t97: the payload never sent — an arm answers ReplyBytes and service
+# drops the bytes into a plain header, so the deliver sees a SUCCESS with
+# an owed payload and refuses -EPROTO (the caller's error instead of its
+# old disposition).
+seed "$W/t97"
+sed -i '/reply_bytes(k, ch_w, rr.tag, num, ret, &bytes\[\.\.len\]);/d' "$W/t97/user/sidecar/src/linux.rs"
+tooth reply-payload-never-sent T5 "service() accepts the payload answer and replies a bare 72-byte header" "$W/t97"
+
+# t98: the copy-IN's host-test section deleted — the two-phase order and
+# the writable boundary would then be argued from these greps alone,
+# every branch reachable only at boot (t83/t89's rule, third seam along).
+seed "$W/t98"
+sed -i '/linux_fd_reply_plan(/d; /linux_user_copy_in(/d; /linux_reply_shape_ok(/d' "$W/t98/tests/linux_personality_host_test.c"
+tooth copyin-unhosttested T6 "the host test no longer drives the reply plan, the copy or the shape predicate" "$W/t98"
+
+# t99: the retired out-pointer ENOSYS re-added to the sig plan — R1's
+# negation half: the refusal increment 12 removed must STAY removed, or
+# the reply payload is double-trapped and never staged.
+seed "$W/t99"
+sed -i '/p.refuse = -LINUX_EFAULT;/a\    p.refuse = -LINUX_ENOSYS;' "$W/t99/kernel/linux_abi.c"
+tooth retired-oldact-enosys-back R1 "the out-pointer ENOSYS the copy-IN retired reappears in the sig plan" "$W/t99"
 
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"

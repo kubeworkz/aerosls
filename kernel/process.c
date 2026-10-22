@@ -142,6 +142,17 @@ static void proc_clear_resume_state(struct ProcessDescriptor* pd) {
     pd->mem_stage_num = 0;
     pd->mem_stage_a0 = 0;
     pd->mem_stage_valid = 0;
+    /* E7 increment 12 (§10.13's step 3): the reply payload's staged
+     * destination clears here for the same reason as every other stage —
+     * an unanswered copy-in destination must not survive into a slot whose
+     * pid it never belonged to, or a later reply payload would be written
+     * into the REUSED slot's successor's address space (the four-place
+     * lifecycle the staged-destination contract names).
+     */
+    pd->reply_stage_num = 0;
+    pd->reply_stage_va = 0;
+    pd->reply_stage_len = 0;
+    pd->reply_stage_valid = 0;
 }
 
 /* E7 (increment 2): read this CPU's captured Linux argument registers.

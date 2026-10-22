@@ -269,6 +269,7 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                 uint64_t largs[6];
                 struct SLSLinuxSyscallRequest req;
                 struct LinuxFdWritePlan plan;
+                struct LinuxFdReplyPlan rplan;
                 /* E7 increment 5 (the fd class): the message that crosses
                  * is the 72-byte description plus, for a write, its bytes
                  * — 8-aligned so k_linux_forward can read the header as a
@@ -279,6 +280,17 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                 uint32_t fwd_len = (uint32_t)sizeof(struct SLSLinuxSyscallRequest);
                 int status;
                 proc_read_linux_args(largs);
+                /* E7 increment 12 (§10.13's step 3): the reply payload's
+                 * staged destination clears FIRST — before any plan's
+                 * refusal can return below — so every refusal path leaves
+                 * the stage empty (the four-place lifecycle: top of the
+                 * first trap, consume at the deliver, refusal, slot
+                 * reuse). A destination staged by an earlier forward can
+                 * therefore never survive into the next trap's window. */
+                cur->reply_stage_num   = 0;
+                cur->reply_stage_va    = 0;
+                cur->reply_stage_len   = 0;
+                cur->reply_stage_valid = 0;
                 /* E7 increment 5, plan half: BEFORE the describe (the
                  * clamp must be IN the description) and before the
                  * channel lookup (a refusal the first trap can produce
@@ -323,17 +335,40 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                             splan.refuse == -LINUX_EINVAL
                                 ? "sigsetsize != 8 (kernel ABI sigset "
                                   "is 8 bytes)"
-                                : splan.refuse == -LINUX_ENOSYS
-                                  ? "oldact/oldset copy-back not landed "
-                                    "(trigger: reply payload copy-IN)"
-                                  : "act/set span not user-readable "
-                                    "(plan)");
+                                : "act/set span not user-readable "
+                                  "(plan)");
                         return (uint64_t)(int64_t)splan.refuse;
                     }
                     if (!plan.len && splan.len) {
                         plan.src = splan.src;
                         plan.len = splan.len;
                     }
+                }
+                /* E7 increment 12 (the reply payload, §10.13's step 3):
+                 * the OUT-POINTER's destination span — the write plan's
+                 * twin over the IN direction, computed after the sig
+                 * plan (one number is one plan; a foreign sigsetsize
+                 * still answers EINVAL first) and BEFORE the describe,
+                 * so a destination ring 3 could not write is a first-trap
+                 * -EFAULT with no post. A NULL out-pointer plans nothing
+                 * (nothing is owed back). The (dst, len) below is
+                 * STAGED — beside fs_base_stage, set immediately before
+                 * the arm — and the deliver copies only within it: the
+                 * copy-in aims where the FIRST trap said, never where
+                 * the reply says. */
+                {
+                    struct LinuxFdReplyPlan rp =
+                        linux_fd_reply_plan(num, largs);
+                    if (rp.refuse) {
+                        kernel_serial_printf(
+                            "[E7] linux reply dst 0x%lx (%u bytes) "
+                            "refused before post: bad user span "
+                            "(reply plan)\n",
+                            (unsigned long)rp.dst,
+                            (unsigned)rp.len);
+                        return (uint64_t)(int64_t)rp.refuse;
+                    }
+                    rplan = rp;
                 }
                 /* E7 increment 6 (the mem class, §5.4), stage half: a
                  * brk's requested break is captured HERE — before the
@@ -436,6 +471,18 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                     struct SLSLinuxSyscallRequest *fwd_req =
                         (struct SLSLinuxSyscallRequest *)(void *)fwd;
                     *fwd_req = req;
+                }
+                /* E7 increment 12: stage the reply payload's destination
+                 * HERE — after every first-trap refusal has had its say
+                 * (no channel, bad attach, W|X, waiting poll — each
+                 * returns with the stage still clear) and immediately
+                 * before the arm, so the window between staging and the
+                 * deliver is exactly the forward's in-flight life. */
+                if (rplan.len) {
+                    cur->reply_stage_num   = num;
+                    cur->reply_stage_va    = rplan.dst;
+                    cur->reply_stage_len   = rplan.len;
+                    cur->reply_stage_valid = 1;
                 }
                 /* Arm BEFORE the post: cap_maybe_handoff (process.c) reads
                  * this state and skips the post's send-handoff — a sysret

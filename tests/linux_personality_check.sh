@@ -800,11 +800,11 @@ fi
 # green while raise() silently succeeds.
 if grep -qF 'struct LinuxSigCopyPlan {' "$LABH" && \
    grep -qF 'p.refuse = -LINUX_EINVAL;' "$LABC" && \
-   grep -qF 'p.refuse = -LINUX_ENOSYS;' "$LABC" && \
-   grep -qF 'p.refuse = -LINUX_EFAULT;' "$LABC"; then
-    ok "R1. linux_sig_copy_plan is the crossing's mechanism half with all three refusals as first-trap negative errnos: a foreign sigsetsize EINVAL, an oldact/oldset out-pointer ENOSYS (§10.10's copy-IN gap — never answered 0), a non-canonical span EFAULT"
+   grep -qF 'p.refuse = -LINUX_EFAULT;' "$LABC" && \
+   ! grep -qF 'p.refuse = -LINUX_ENOSYS;' "$LABC"; then
+    ok "R1. linux_sig_copy_plan is the crossing's mechanism half with BOTH of its first-trap refusals as negative errnos — a foreign sigsetsize EINVAL, a non-canonical act/set span EFAULT — and the out-pointer ENOSYS it once carried is GONE (increment 12 planned that span instead: clause set T)"
 else
-    bad "R1. the plan or one of its refusals is gone — a foreign sigsetsize would have its bytes silently reinterpreted, or an out-pointer would keep stack garbage the caller believes is an answer (the silent lie §10.10's refusal-by-name discipline exists to prevent)"
+    bad "R1. the plan or one of its refusals changed shape — a foreign sigsetsize would have its bytes silently reinterpreted, or the retired out-pointer ENOSYS is back (a span now owned by linux_fd_reply_plan would be double-trapped, and the reply payload would never be staged)"
 fi
 if grep -qF 'linux_sig_copy_plan(num, largs);' "$DISP" && \
    grep -qF 'return (uint64_t)(int64_t)splan.refuse;' "$DISP" && \
@@ -894,6 +894,86 @@ if grep -qF 'LINUX_POLL == 7' "$PHUT" && \
     ok "S3. the predicate is host-tested against the REAL kernel/linux_abi.c — the zero-timeout probe, the timed and infinite refusals, the int-width rule (0x1_00000000 is a zero timeout) and the total number space (run_all compiles and runs it)"
 else
     bad "S3. the host test no longer drives the predicate — the run's last-ENOSYS fix would be argued from the guard's greps alone, every branch reachable only at boot"
+fi
+
+# ─── T: the reply payload's copy-IN (E7 increment 12, §10.13's step 3) ────
+# §10.10's named gap lands: rt_sigaction/rt_sigprocmask's oldact/oldset
+# write back into the child, and the run's remaining first-trap
+# refusals (13/14) retire. The seam is three pieces and a lifecycle:
+# the first-trap destination plan, the two-phase writable copy, the
+# deliver's three shapes, and the stage cleared at four places. Every
+# clause below is a way this becomes the silent lie it was built to
+# prevent — bytes into a destination no trap validated, a write through
+# a read-only page, a stale stage aiming a payload at a reused slot's
+# successor, or a success reply whose promised payload never crossed.
+if grep -qF 'struct LinuxFdReplyPlan {' "$LABH" && \
+   grep -qF 'struct LinuxFdReplyPlan linux_fd_reply_plan(uint64_t num,' "$LABH" && \
+   grep -qF 'int linux_user_copy_in(const uint8_t *src, uint64_t root,' "$LABH" && \
+   grep -qF 'int linux_reply_shape_ok(uint64_t num, uint64_t ret, uint32_t n);' "$LABH" && \
+   grep -qF 'struct LinuxFdReplyPlan linux_fd_reply_plan(uint64_t num, const uint64_t args[6])' "$LABC" && \
+   grep -qF 'int linux_user_copy_in(const uint8_t *src, uint64_t root,' "$LABC" && \
+   grep -qF 'int linux_reply_shape_ok(uint64_t num, uint64_t ret, uint32_t n)' "$LABC"; then
+    ok "T. the copy-IN is a named pure contract, declared where both ends read it: the destination plan, the two-phase copy, and the ret-shape predicate — each with a host test instead of a boot"
+else
+    bad "T. one of the three copy-IN functions is gone or un-declared — the reply payload would have no first-trap validator (bytes aimed wherever the reply says), no writable-boundary copy, or no rule keeping header, payload and rax one truth"
+fi
+disp_plan=$(grep -nF 'linux_fd_reply_plan(num, largs);' "$DISP" | head -1 | cut -d: -f1)
+disp_clear=$(grep -nF 'cur->reply_stage_valid = 0;' "$DISP" | head -1 | cut -d: -f1)
+disp_set=$(grep -nF 'cur->reply_stage_valid = 1;' "$DISP" | head -1 | cut -d: -f1)
+if [ -n "$disp_plan" ] && [ -n "$disp_clear" ] && [ -n "$disp_set" ] && \
+   [ "$disp_clear" -lt "$disp_plan" ] && \
+   [ "$disp_plan" -lt "$disp_set" ] && \
+   sed -n "$((disp_plan + 1)),$((disp_plan + 10))p" "$DISP" | grep -qF '(reply plan)' && \
+   sed -n "$((disp_plan + 1)),$((disp_plan + 10))p" "$DISP" | grep -qF '(uint64_t)(int64_t)rp.refuse;'; then
+    ok "T1. the FIRST TRAP plans the destination (clear → plan → stage) — a span ring 3 could not write refuses -EFAULT before any post, and the stage is set only after every other first-trap refusal has had its say, so no refusal leaves a destination behind"
+else
+    bad "T1. the dispatch no longer plans/stages in that order — a bad destination would post first (the exact shape T exists to prevent), or a refusal would leave a stale stage aiming the next reply's payload at a span nothing validated"
+fi
+if grep -qF 'reply_stage_valid' "$PDH" && \
+   grep -qF 'pd->reply_stage_valid = 0;' "$PDC" && \
+   grep -qF 'pd->reply_stage_num == expect_num' "$CANC" && \
+   grep -qF 'pd->reply_stage_valid = 0;' "$CANC" && \
+   grep -qF 'reply_stage_len' "$CANC"; then
+    ok "T2. the stage's four-place lifecycle holds — set at the first trap, consumed-and-cleared at the deliver (only when the stage's num is THIS request's), cleared at slot reuse, declared on the descriptor: a stale destination cannot aim a payload at a reused slot's successor"
+else
+    bad "T2. a stage clear or the deliver's consume is gone — an unanswered copy-in destination survives into a slot whose pid it never belonged to, and the next reply payload lands in the successor's address space"
+fi
+deliver_buf=$(grep -nF '+ LINUX_FD_WRITE_CHUNK];' "$CANC" | head -1 | cut -d: -f1)
+if [ -n "$deliver_buf" ] && \
+   grep -qF 'out.len < sizeof(struct SLSLinuxSyscallRequest)' "$CANC" && \
+   grep -qF '!staged || n > slen' "$CANC" && \
+   grep -qF 'linux_reply_shape_ok(expect_num, hdr_ret, n)' "$CANC" && \
+   grep -qF 'linux_user_copy_in(rbuf +' "$CANC" && \
+   grep -qF 'uint64_t rax = linux_syscall_apply_reply(' "$CANC"; then
+    ok "T3. the deliver accepts exactly three shapes — 72 (a SUCCESS with an owed payload refused -EPROTO), 72+n within the staged clamp with a matching echo/status/ret, and CAP_ERR_PROTO otherwise — apply first, then the two-phase copy, then rax"
+else
+    bad "T3. a shape arm is gone — a payload would be copied for a number that staged none, beyond the clamp, past a refusal, or with a ret its number contradicts (the one-truth rule with bytes attached)"
+fi
+if grep -qF 'int require_rw)' "$LABC" && \
+   grep -qF 'if (require_rw && !(e & LAB_PTE_RW)) return -LINUX_EFAULT;' "$LABC" && \
+   grep -qF '#define LAB_PTE_RW' "$LABC" && \
+   grep -qF 'Phase 1 — validate the WHOLE span' "$LABC" && \
+   grep -qF 'Phase 2 — write.' "$LABC"; then
+    ok "T4. the copy-IN validates (present, USER, WRITABLE at every level) the WHOLE span before writing a byte — the sidecar can never launder a write through a page the child could not have written, and a refusal mutates nothing"
+else
+    bad "T4. the writable check or the two-phase order is gone — a read-only page under a payload becomes writable-by-sidecar, or a span half-writes before its second page refuses"
+fi
+if grep -qF 'ReplyBytes(u64, usize, [u8; SIGACT_BYTES]),' "$LRS" && \
+   grep -qF 'if args[2] == 0 || len != want || len > bytes.len() {' "$LRS" && \
+   grep -qF 'reply payload mismatch -> -EPROTO' "$LRS" && \
+   grep -qF 'reply_bytes(k, ch_w, rr.tag, num, ret, &bytes[..len]);' "$LRS" && \
+   grep -qF 'old_act_bytes(sig, args[0])' "$LRS"; then
+    ok "T5. the sidecar's twin bound — a ReplyBytes answer must equal the forwarded out-pointer's clamp or it goes out as num=0 → -EPROTO, the old disposition is captured BEFORE any mutation, and only service() sends the bytes (neither end load-bearing alone)"
+else
+    bad "T5. the sidecar's bound or the payload arm is gone — bytes could cross without a destination the first trap validated, or oldact could carry the NEW disposition (the caller reads a future that already moved)"
+fi
+if grep -qF 'linux_fd_reply_plan(LINUX_RT_SIGACTION, a)' "$PHUT" && \
+   grep -qF 'linux_user_copy_in(src, root' "$PHUT" && \
+   grep -qF 'linux_reply_shape_ok(LINUX_READ, 32, 32)' "$PHUT" && \
+   grep -qF 'c_page0[0x100] == 0x77' "$PHUT"; then
+    ok "T6. the host test drives all three halves against the REAL linux_abi.c — the plan's branches, the two-phase copy's bytes-unchanged refusals, and the ret-shape rule (run_all compiles and runs it)"
+else
+    bad "T6. the host test no longer drives the copy-IN — every boundary would be argued from these greps alone, reachable only at boot"
 fi
 
 echo

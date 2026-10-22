@@ -226,6 +226,8 @@ struct LinuxFdWritePlan linux_fd_write_plan(uint64_t num,
  * user, huge-page (PS at the PDPTE/PDE levels only — bit 7 of a 4 KiB
  * PTE is PAT, not size), and the 4 KiB frame mask. */
 #define LAB_PTE_PRESENT  0x1ULL
+#define LAB_PTE_RW       0x2ULL   /* E7 increment 12: the copy-IN's
+                                  * writability boundary */
 #define LAB_PTE_USER     0x4ULL
 #define LAB_PTE_PS       0x80ULL
 #define LAB_PTE_FRAME    0x000FFFFFFFFFF000ULL
@@ -243,17 +245,22 @@ struct LinuxFdWritePlan linux_fd_write_plan(uint64_t num,
  * physical addr = virtual addr"). x86-64 keeps the walk byte-oriented at
  * the end so the test's fake frames are ordinary aligned arrays. */
 /* The one leaf walk both readers share (increment 5's copy, increment 6's
- * frame read-back). Read-ONLY by construction: every level is checked
- * before the next pointer is followed, and nothing anywhere writes a
- * table or creates a missing one — the allocating walker (arch/x86/
- * walk_page_tables_x86.c) is exactly what these must NOT be: over a
- * tenant-supplied address its table allocation is a memory lever, not a
- * read. The USER bit is checked at every level, matching what a ring-3
- * load would require.
+ * frame read-back, increment 12's copy-in). Read-ONLY by construction:
+ * every level is checked before the next pointer is followed, and
+ * nothing anywhere writes a table or creates a missing one — the
+ * allocating walker (arch/x86/walk_page_tables_x86.c) is exactly what
+ * these must NOT be: over a tenant-supplied address its table allocation
+ * is a memory lever, not a read. The USER bit is checked at every level,
+ * matching what a ring-3 load would require; require_rw adds the write
+ * side of that same rule (only copy-in sets it), checked at EVERY level
+ * too — effective writability is the conjunction of all four entries,
+ * and a writable leaf under a read-only directory would let the copy-in
+ * launder a write through a page the child itself could not write.
  *
  * Frame -> pointer is the identity map's own claim (boot.asm: "the
  * physical addr = virtual addr"). */
-static int lab_walk_leaf(uint64_t root, uint64_t va, uint64_t *leaf_out)
+static int lab_walk_leaf(uint64_t root, uint64_t va, uint64_t *leaf_out,
+                         int require_rw)
 {
     const uint64_t *tbl = (const uint64_t *)(uintptr_t)(root & LAB_PTE_FRAME);
     uint64_t leaf = 0;
@@ -267,6 +274,7 @@ static int lab_walk_leaf(uint64_t root, uint64_t va, uint64_t *leaf_out)
             return -LINUX_EFAULT;   /* a huge page is not this shim's
                                      * user shape; refused by name */
         if (!(e & LAB_PTE_USER)) return -LINUX_EFAULT;
+        if (require_rw && !(e & LAB_PTE_RW)) return -LINUX_EFAULT;
         leaf = e;
         if (lvl < 3) tbl = (const uint64_t *)(uintptr_t)(e & LAB_PTE_FRAME);
     }
@@ -279,7 +287,7 @@ int linux_user_copy_out(uint8_t *dst, uint64_t root, uint64_t va, uint32_t n)
     if (!dst) return -LINUX_EFAULT;
     while (n) {
         uint64_t leaf = 0;
-        if (lab_walk_leaf(root, va, &leaf) != 0) return -LINUX_EFAULT;
+        if (lab_walk_leaf(root, va, &leaf, 0) != 0) return -LINUX_EFAULT;
         {
             uint32_t off = (uint32_t)(va & (LINUX_PAGE_SIZE - 1u));
             uint32_t page_left = LINUX_PAGE_SIZE - off;
@@ -304,9 +312,12 @@ int linux_user_copy_out(uint8_t *dst, uint64_t root, uint64_t va, uint32_t n)
  * same first-trap discipline, different bytes (a fixed-size struct rather
  * than a caller-chosen count — so there is no clamp to ride in the header:
  * BOTH ends derive the attach length from num and args[1] != 0, which is
- * what the sidecar's payload check mirrors). The two refusals the header
- * names (sigsetsize, out-pointer) are decided here — pure over the six
- * captured words, so the host test drives them without a boot. */
+ * what the sidecar's payload check mirrors). The refusal the header
+ * names (sigsetsize) is decided here — pure over the six
+ * captured words, so the host test drives it without a boot. The
+ * OUT-POINTER's span is no longer this plan's business: increment 12
+ * planned it as a reply payload (linux_fd_reply_plan below) instead of
+ * refusing it ENOSYS. */
 struct LinuxSigCopyPlan linux_sig_copy_plan(uint64_t num, const uint64_t args[6])
 {
     struct LinuxSigCopyPlan p;
@@ -322,12 +333,6 @@ struct LinuxSigCopyPlan linux_sig_copy_plan(uint64_t num, const uint64_t args[6]
     if (args[3] != LINUX_SIGSET_BYTES) {
         p.refuse = -LINUX_EINVAL;   /* Linux's own answer to a foreign
                                      * sigsetsize */
-        return p;
-    }
-    if (args[2] != 0) {
-        p.refuse = -LINUX_ENOSYS;   /* oldact/oldset copy-back is §10.10's
-                                     * named gap — refused by name before
-                                     * any post, never answered 0 */
         return p;
     }
 
@@ -421,8 +426,110 @@ struct LinuxMemBrkVerdict linux_mem_brk_verdict(uint64_t heap_base,
 uint64_t linux_user_page_frame(uint64_t root, uint64_t va)
 {
     uint64_t leaf = 0;
-    if (lab_walk_leaf(root, va, &leaf) != 0) return 0;
+    if (lab_walk_leaf(root, va, &leaf, 0) != 0) return 0;
     return leaf & LAB_PTE_FRAME;
+}
+
+/* ─── E7 increment 12 (the reply payload, §10.13's step 3) — the copy-IN ───
+ * The header names the split and the security property; these are its
+ * three pure halves. Nothing below reads kernel state: the plan is
+ * arithmetic over the six captured words, the copy walks a root the
+ * CALLER supplies (the task's own PML4 in production, a fake table in
+ * the host test), and the shape predicate is arithmetic over (num, ret,
+ * n). */
+
+/* The copy-IN's walk — write side. Phase one of copy_in's two phases:
+ * validate EVERY page of the span before a single byte moves. */
+static int lab_walk_leaf_rw(uint64_t root, uint64_t va, uint64_t *leaf_out)
+{
+    return lab_walk_leaf(root, va, leaf_out, 1);
+}
+
+int linux_user_copy_in(const uint8_t *src, uint64_t root, uint64_t va,
+                       uint32_t n)
+{
+    uint64_t v;
+    uint32_t left;
+
+    if (!src) return -LINUX_EFAULT;
+
+    /* Phase 1 — validate the WHOLE span (present, USER, writable, no
+     * huge page at any level). A refusal here mutates nothing: the
+     * two-phase shape is what makes a read-only page anywhere in the
+     * span leave every byte untouched, which the host test pins as
+     * bytes-unchanged (refusals-before-mutation, §10.13's M4 family
+     * extended to the IN direction). n == 0 returns before the walk. */
+    v = va;
+    left = n;
+    while (left) {
+        uint32_t off = (uint32_t)(v & (LINUX_PAGE_SIZE - 1u));
+        uint32_t page_left = LINUX_PAGE_SIZE - off;
+        uint32_t take = left < page_left ? left : page_left;
+        if (lab_walk_leaf_rw(root, v, 0) != 0) return -LINUX_EFAULT;
+        v += take;
+        left -= take;
+    }
+
+    /* Phase 2 — write. Every page was validated above, and the task is
+     * parked between its forward and its reply (no unmap can land
+     * between the phases on this path), so a walk below cannot fail;
+     * if one somehow did (a table changed under us), stop with -EFAULT
+     * — the partial write would be a kernel-mutation bug, never a
+     * tenant-controllable one, since phase 1 gates every page first. */
+    v = va;
+    left = n;
+    while (left) {
+        uint64_t leaf = 0;
+        uint32_t off = (uint32_t)(v & (LINUX_PAGE_SIZE - 1u));
+        uint32_t page_left = LINUX_PAGE_SIZE - off;
+        uint32_t take = left < page_left ? left : page_left;
+        uint32_t i;
+        uint8_t *dst;
+        if (lab_walk_leaf_rw(root, v, &leaf) != 0) return -LINUX_EFAULT;
+        dst = (uint8_t *)(uintptr_t)((leaf & LAB_PTE_FRAME) + off);
+        for (i = 0; i < take; i++) dst[i] = src[i];
+        src += take;
+        v += take;
+        left -= take;
+        /* root is NOT reassigned: the next iteration re-walks all four
+         * levels from the PML4 (copy_out's own rule — a leaf frame is
+         * not a table base). */
+    }
+    return 0;
+}
+
+struct LinuxFdReplyPlan linux_fd_reply_plan(uint64_t num, const uint64_t args[6])
+{
+    struct LinuxFdReplyPlan p;
+    uint64_t span_end;
+
+    p.dst = 0;
+    p.len = 0;
+    p.refuse = 0;
+    if (num != LINUX_RT_SIGACTION && num != LINUX_RT_SIGPROCMASK)
+        return p;   /* not a copy-IN number */
+    if (!args) return p;
+    if (args[2] == 0) return p;   /* no out-pointer: nothing is owed back */
+
+    p.dst = args[2];
+    p.len = (num == LINUX_RT_SIGACTION) ? LINUX_SIGACT_BYTES
+                                        : LINUX_SIGSET_BYTES;
+    /* The write plan's shape, on the other direction: the WHOLE span
+     * must sit in the user-canonical range or the first trap says
+     * -EFAULT — before any post, so a bad destination is a refusal the
+     * channel never sees (and the staged VA below can never be one). */
+    span_end = p.dst + (uint64_t)p.len;
+    if (!linux_fs_addr_is_user_canonical(p.dst) || span_end < p.dst ||
+        (span_end - 1) > LINUX_USER_ADDR_MAX) {
+        p.refuse = -LINUX_EFAULT;
+    }
+    return p;
+}
+
+int linux_reply_shape_ok(uint64_t num, uint64_t ret, uint32_t n)
+{
+    if (num == LINUX_READ) return ret == (uint64_t)n;
+    return ret == 0;
 }
 
 /* ─── The personality (E7 increment 2) ───────────────────────────────────── */
