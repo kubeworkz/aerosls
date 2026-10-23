@@ -212,6 +212,53 @@ faces), held by clause AG of `env_migration_check.sh` with four smoke
 teeth, and gated live by `failover_adoption_live_check.sh`: its
 kill-after-create step no longer races the announce's leftover budget.
 
+## Follow-up (2026-10-23): the frame is the liveness, and the blocked
+## sweep must keep beating
+
+The confirm guard's shape (`tools/repro_observer_incident.sh`, fresh
+3-node cluster) declared both busy nodes DEAD with nobody killed —
+`[FAILOVER] Node 1 declared DEAD (silent 304 ticks)` on the idle
+observer, then Node 2 at `silent 326`. Forensics, three steps:
+
+1. **The release-vs-heartbeat race.** `env_migrate_intent_end()`'s
+   budget-0 release dropped the observer's latch WITHOUT touching
+   `last_seen_tick`, so the next `failover_tick()` read the accumulated
+   block as ungated silence. Fixed: every intent frame — announce and
+   release alike — now feeds `failover_note_heartbeat()`
+   (`env_migrate_recv_intent()`). The arithmetic proves it landed: the
+   declaration read `silent 304`, exactly the ticks elapsed SINCE the
+   release (~107 log lines); pre-fix the same window would have read
+   ~790.
+2. **But the refresh alone was not enough** — and the reason is the
+   deeper defect. The declaration window showed node 1 ALIVE and
+   healthy: pure scheduler yields, receiving the leader's checkpoints
+   (seq 4717 → 4925, one per ~100 ticks). It was a DEPOSED FOLLOWER:
+   the block (>150 ticks) had stopped the leader's heartbeat stream,
+   the election watchdog had run, and node 2 held terms 3/5 while node
+   1 churned to 4/6. Followers transmit nothing that feeds
+   `last_seen_tick` — the only caller of `failover_note_heartbeat()`
+   outside this fix is the consensus HEARTBEAT RX, and only the leader
+   sends heartbeats. So the announce latch guaranteed the release would
+   land on a quiet follower, and 300 ticks later it was declared dead
+   while running.
+3. **The fix: keep the blocked sweep beating.**
+   `failover_sweep_keepalive()` pumps both streams (leader heartbeat +
+   checkpoint broadcast, at their own rate limits) and every wait on
+   the sweep calls it: the create/destroy RPC wait, the migrate send's
+   ACK waits and pour loops, the restore's parked wait. A blocked phase
+   cannot depose its own node; the latch remains the bounded backstop.
+   Plus the asymmetry fix: an intent frame refreshes a WATCHED peer's
+   stamp only (`failover_peer_status(node) >= 0`) — a follower's frame
+   must not arm a death-watch entry that fires 300 ticks after its own
+   release.
+
+Held by clauses AH (three smoke teeth) and AI (one) of
+`env_migration_check.sh`, and pinned in the host tests:
+`tests/env_migrate_host_test.c` models the watch table (an unwatched
+announce/release is a pure no-op, a watched one refreshes), and the
+wait-loop tests (`env_service_wait`, `env_payload`) assert their loops
+really pump the keepalive.
+
 ## Coverage gaps
 
 - No live check exercises a busy owner plus an idle third node. The

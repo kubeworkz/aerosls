@@ -72,6 +72,22 @@ int failover_recover_from(uint32_t dead_node_id);
  * failover_recover_from() consumes when the leader is declared dead. */
 void failover_live_checkpoint_broadcast(uint64_t now);
 
+/* The sweep's liveness half, callable from the blocking waits that run ON
+ * the sweep. The create round trip (env_service_rpc), the migrate send's
+ * ACK waits, the restore's parked wait and pour all execute on the BSP
+ * sweep — the same context that transmits the consensus heartbeat and the
+ * checkpoint broadcast — so while any of them blocks this node's
+ * heartbeat stream stops: every observer's election watchdog (150 ticks)
+ * fires, the busy node is DEPOSED mid-work, and as a quiet follower —
+ * followers transmit nothing that feeds last_seen_tick — it is declared
+ * DEAD 300 ticks after its own release while perfectly alive (live 3-node
+ * find, 2026-10-23, env_migrate_confirm_live's shape). Calling this from
+ * inside those waits keeps both streams flowing. Rate-limited at their
+ * own gates (LEADER_HEARTBEAT_TICKS, the checkpoint period), so a tight
+ * wait loop pays only a gated call per spin; transmit-only, no yield —
+ * legal even inside the pour's straight-line section. */
+void failover_sweep_keepalive(void);
+
 /* How many partitions were adopted in the last failover_recover_from() call. */
 uint32_t failover_last_adopted_count(void);
 

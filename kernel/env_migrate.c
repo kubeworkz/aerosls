@@ -25,6 +25,7 @@
 #include "../drivers/nvme_io.h"
 #include "../net/dspp.h"
 #include "../net/consensus.h"   /* cluster_local_node_id() -- the destination guard */
+#include "failover.h"           /* failover_note_heartbeat()/failover_peer_status() -- an intent frame refreshes its sender's liveness */
 
 /* The descriptor blob must fit the wire's BEGIN packet — the record crosses
  * whole by design (env_migrate.h), so a record that outgrew the blob is a
@@ -187,11 +188,14 @@ int env_migrate_send(uint32_t partition_id, uint32_t index, uint32_t dest_node_i
             if (dspp_migrate_nacked()) break;
             if (kernel_tick_counter != last_tick) { last_tick = kernel_tick_counter; stalled = 0; }
             else if (++stalled > DSPP_MIGRATE_STALL_SPINS) break;
+            failover_sweep_keepalive();   /* this wait runs ON the sweep: without
+                                           * this, an unconfirmed BEGIN stops this
+                                           * node's heartbeat stream and observers
+                                           * depose it mid-send (2026-10-23) */
             __asm__ volatile("pause");
         }
         if (begin_ok || dspp_migrate_nacked()) break;
-    }
-    dspp_migrate_disarm();
+    }        dspp_migrate_disarm();
 
     if (!begin_ok) {
         kernel_serial_printf(
@@ -229,6 +233,8 @@ int env_migrate_send(uint32_t partition_id, uint32_t index, uint32_t dest_node_i
                 if (dspp_migrate_nacked()) break;
                 if (kernel_tick_counter != last_tick) { last_tick = kernel_tick_counter; stalled = 0; }
                 else if (++stalled > DSPP_MIGRATE_STALL_SPINS) break;
+                failover_sweep_keepalive();   /* same as the BEGIN wait: the page
+                                              * ACK wait must not silence the leader */
                 __asm__ volatile("pause");
             }
             if (page_ok || dspp_migrate_nacked()) break;
@@ -874,12 +880,17 @@ int env_migrate_restore(uint32_t partition_id, uint32_t index) {
             const uint8_t* src = env_migrate_recv_page_ptr(partition_id, index, cursor++);
             uint8_t* dst = (uint8_t*)(fr->base + (uint64_t)f * 4096u);
             for (uint32_t b = 0; b < 4096; b++) dst[b] = src[b];
+            failover_sweep_keepalive();   /* the pour is straight-line but it IS
+                                          * the sweep — transmit-only here, no yield,
+                                          * so the no-yield rule stands */
         }
     }
     uint32_t extent_pages = (staged.state_sectors + ENV_MIGRATE_SECTORS_PER_PAGE - 1)
                             / ENV_MIGRATE_SECTORS_PER_PAGE;
     for (uint32_t e = 0; e < extent_pages; e++) {
         const uint8_t* src = env_migrate_recv_page_ptr(partition_id, index, cursor++);
+        failover_sweep_keepalive();   /* sync NVMe writes are the pour's long pole:
+                                      * keep beating across them too */
         if (nvme_write_sync(fresh->state_lba +
                             (uint64_t)e * ENV_MIGRATE_SECTORS_PER_PAGE, src) != 0) {
             /* The environment exists and its memory holds the contents; the
@@ -1053,6 +1064,30 @@ void env_migrate_intent_end(void) {
 
 void env_migrate_recv_intent(uint32_t node_id, uint32_t budget_ticks) {
     if (node_id == 0 || node_id == cluster_local_node_id()) return;
+    /* Every intent frame — announce or release — crossed the wire from a
+     * node that is, at this instant, alive enough to transmit, so it is the
+     * same liveness evidence a heartbeat is and must refresh last_seen_tick.
+     * This is the release-vs-heartbeat race a live 3-node run exposed
+     * (2026-10-23, env_migrate_confirm_live): the source announced intent,
+     * blocked in its create for 435 ticks, and on the return
+     * env_migrate_intent_end() fired the RELEASE — but the release only
+     * dropped the peer's latch without touching last_seen_tick, so the very
+     * next failover_tick still saw the 435 ticks of silence the create had
+     * accumulated, now UNdeferred, and declared the just-resurrected source
+     * DEAD, adopting its partitions mid-create. The source's very next
+     * frame is what ends its silence; feeding it here closes the window
+     * between "the block ended" and "the next real heartbeat lands".
+     *
+     * Refresh-only, deliberately: an intent frame proves the SENDER is
+     * alive but must not PUT it on the death-watch. Watch entries exist
+     * for nodes whose heartbeats were heard (leaders); a follower that
+     * announces intent and then stays quiet — followers transmit nothing
+     * that feeds last_seen_tick — would gain an entry here and be
+     * declared DEAD exactly 300 ticks after its own release, the very
+     * false death this call prevents (live 3-node find, 2026-10-23: the
+     * deposed source declared dead at +304 ticks post-release). */
+    if (failover_peer_status(node_id) >= 0)
+        failover_note_heartbeat(node_id, kernel_tick_counter);
     if (budget_ticks == 0) {
         /* The announce's own release: the peer's blocking phase is over and
          * its silence is a death again on the normal terms. Deactivate the

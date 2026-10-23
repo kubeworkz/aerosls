@@ -226,6 +226,42 @@ static uint32_t g_fake_local_node_id = 0;
 uint32_t cluster_local_node_id(void) { return g_fake_local_node_id; }
 uint32_t cluster_leader_id(void) { return 0; }
 
+/* kernel/failover.c's liveness stamp, reached from env_migrate_recv_intent()
+ * (an intent frame is the same liveness evidence a heartbeat is — the
+ * release-vs-heartbeat race this records). A recording stub, not a no-op:
+ * the intent tests below assert that BOTH the announce and the release
+ * refresh the observer's last-seen stamp, which is what keeps a just-
+ * unblocked source from being declared DEAD on the silence its own create
+ * accumulated (found live 2026-10-23 on a 3-node cluster). The stubs MODEL
+ * the real table: a first heartbeat note WATCHES the peer, and
+ * failover_peer_status() answers -1 for a node never noted -- which is how
+ * the intent tests below can pin that recv_intent refreshes a WATCHED
+ * peer's stamp and never CREATES a watch entry. */
+#define FAKE_PEERS_MAX 8
+static int      g_watched[FAKE_PEERS_MAX + 1];
+static uint32_t g_hb_last_node = 0;
+static uint64_t g_hb_last_now  = 0;
+static int      g_hb_calls     = 0;
+static void fake_watch(uint32_t node_id) {
+    if (node_id && node_id <= FAKE_PEERS_MAX) g_watched[node_id] = 1;
+}
+void failover_note_heartbeat(uint32_t node_id, uint64_t now) {
+    fake_watch(node_id);
+    g_hb_last_node = node_id;
+    g_hb_last_now  = now;
+    g_hb_calls++;
+}
+int failover_peer_status(uint32_t node_id) {
+    /* PEER_ALIVE (0) for a watched node; -1 (unknown) for one never noted. */
+    return (node_id && node_id <= FAKE_PEERS_MAX && g_watched[node_id]) ? 0 : -1;
+}
+/* kernel/failover.c's sweep keepalive, pumped by every blocking wait that
+ * runs on the sweep (the death-during-create fix: a blocked create/migrate/
+ * restore must not silence the leader's heartbeat stream). Counted so the
+ * send phases below can pin that the ACK waits really pump it. */
+static int g_keepalive_calls = 0;
+void failover_sweep_keepalive(void) { g_keepalive_calls++; }
+
 /* net/net.c's real global -- not linked; only the src MAC dspp_transmit_raw
  * stamps into the Ethernet header reads it. */
 MACAddr net_my_mac;
@@ -880,9 +916,20 @@ int main(void) {
           "...and the local intent is bounded: past its budget the gate re-arms");
 
     /* The peer half: what every OBSERVER latches from that broadcast. */
+    g_hb_calls = 0; g_hb_last_node = 0;
+    /* An UNWATCHED peer (a follower -- it has never been heard beating):
+     * the announce latches, but the frame must NOT create a death-watch
+     * entry. A watch entry for a quiet follower would be declared DEAD
+     * exactly 300 ticks after its own release (the 2026-10-23 live find). */
     env_migrate_recv_intent(5, (uint32_t)ENV_MIGRATE_INTENT_GRACE_TICKS);
     CHECK(env_migrate_peer_in_flight(5) == 1,
           "*** peer intent: an announced budget latches on every node ***");
+    CHECK(g_hb_calls == 0,
+          "*** ...but a never-beaten (follower) announce creates NO death-watch entry: no heartbeat noted ***");
+    fake_watch(5);   /* the observer has now heard node 5 beat, as it would a leader */
+    env_migrate_recv_intent(5, (uint32_t)ENV_MIGRATE_INTENT_GRACE_TICKS);
+    CHECK(g_hb_calls == 1 && g_hb_last_node == 5,
+          "*** a WATCHED announcing peer's stamp IS refreshed by the announce (liveness evidence) ***");
     env_migrate_recv_intent(5, 0x7fffffffu);   /* a peer cannot shield itself past the cap */
     kernel_tick_counter += ENV_MIGRATE_INTENT_GRACE_TICKS + 1;
     CHECK(env_migrate_peer_in_flight(5) == 0,
@@ -927,12 +974,34 @@ int main(void) {
     env_migrate_recv_intent(6, (uint32_t)ENV_MIGRATE_INTENT_GRACE_TICKS);
     CHECK(env_migrate_peer_in_flight(6) == 1,
           "the peer latch stands before its owner releases it");
+    fake_watch(6);   /* the observer has heard node 6 beat, as it would the leader */
+    g_hb_calls = 0; g_hb_last_node = 0; g_hb_last_now = 0;
     env_migrate_recv_intent(6, 0);
     CHECK(env_migrate_peer_in_flight(6) == 0,
           "*** recv_intent's budget-0 release drops a peer's latch at once -- death detection is re-armed ***");
+    /* The release-vs-heartbeat race (found live 2026-10-23 on a 3-node
+     * cluster, env_migrate_confirm_live): the source's create blocked its
+     * sweep for 435 ticks, then intent_end() fired the release. The release
+     * dropped the latch but did NOT refresh last_seen_tick, so the very next
+     * failover_tick still saw 435 ticks of silence — now UNdeferred — and
+     * declared the just-resurrected source DEAD, adopting its partitions
+     * mid-create. The release is the source's own frame: it is proof of
+     * life, so it must refresh the stamp the same way the announce does. */
+    CHECK(g_hb_calls == 1 && g_hb_last_node == 6,
+          "*** the RELEASE is proof of life too: it refreshes the observer's last-seen stamp ***");
+    CHECK(g_hb_last_now == kernel_tick_counter,
+          "...stamped with the release's own tick, so the silence the create accrued is forgiven at once");
     env_migrate_recv_intent(6, 0);
     CHECK(env_migrate_peer_in_flight(6) == 0,
           "a release for a node with no latch is a no-op, not an error");
+    {
+        /* Same asymmetry as the announce: an unwatched (never-beaten) peer's
+         * release drops a latch that never existed and creates no watch entry. */
+        g_hb_calls = 0;
+        env_migrate_recv_intent(7, 0);
+        CHECK(env_migrate_peer_in_flight(7) == 0 && g_hb_calls == 0,
+              "*** an unwatched peer's release is a pure no-op: no latch, no death-watch entry ***");
+    }
     {
         /* The release is gated on the local stamp: the sweep's restore loop
          * calls end() after EVERY attempt, and a period with no begin must
@@ -2163,6 +2232,14 @@ int main(void) {
      * dspp_tx_reentrant_dropped is the guard that would have silently eaten
      * an ACK had any phase nested a transmit inside a transmit; zero is the
      * evidence that the ACK path is the one this test thinks it is. */
+    /* The death-during-create fix, last: every phase above that blocked on
+     * the wire (the ACK waits, the pour) runs ON the sweep in the real
+     * kernel, so each pump of failover_sweep_keepalive() keeps the
+     * heartbeat/checkpoint streams alive mid-block. Counted, not stubbed
+     * silently: a wait loop that forgot the pump would leave this at 0. */
+    CHECK(g_keepalive_calls > 0,
+          "*** the blocking waits (ACK waits, pour) pumped the sweep keepalive: "
+          "a blocked send keeps the heartbeat stream alive (death-during-create) ***");
     CHECK(dspp_tx_reentrant_dropped == 0,
           "*** no DSPP frame was ever dropped for re-entering the transmit path ***");
     CHECK(dspp_tx_oversize_dropped == oversize_before,

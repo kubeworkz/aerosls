@@ -11,6 +11,7 @@
 #include "process.h"   /* E1: kernel_yield_to_ring3 (the unified boot's hand-over) */
 #include "checkpoint_mgr.h"   /* P1a: the checkpoint sequence a registration belongs to */
 #include "env_payload.h"     /* P1a: the payload pour that follows a replay */
+#include "failover.h"        /* failover_sweep_keepalive() — the blocked RPC wait keeps the heartbeat stream alive */
 
 extern volatile uint64_t kernel_tick_counter;   /* ~10 ms per tick (net_event.c) */
 
@@ -109,6 +110,12 @@ static int env_service_rpc_raw(uint16_t ty, const uint8_t* body, uint32_t body_l
          * HTTP loops' idle points make, and a no-op on every non-unified
          * boot. */
         smp_uniprocessor_tick();
+        failover_sweep_keepalive();   /* THIS wait is the create/destroy round trip
+                                      * running on the sweep: without this the
+                                      * leader's heartbeat stream dies here, observers
+                                      * depose it at 150 ticks and — as a quiet
+                                      * follower — it is declared dead after release
+                                      * (the death-during-create race, 2026-10-23) */
         kernel_yield_to_ring3(PROC_CONTROL_PLANE_BUDGET_TICKS);
         __asm__ volatile("pause");
     }

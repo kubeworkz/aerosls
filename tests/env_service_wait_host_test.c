@@ -298,6 +298,15 @@ void smp_uniprocessor_tick(void) {
     kernel_tick_counter++;   /* stands in for the timer ISR */
 }
 
+/* kernel/failover.c's sweep keepalive: the RPC wait below runs ON the sweep
+ * (the create round trip), so it pumps the heartbeat/checkpoint streams
+ * while it spins -- without it the leader's heartbeat stream dies here,
+ * observers depose it at the 150-tick election timeout, and as a quiet
+ * follower it is declared DEAD after its own release (death-during-create,
+ * 2026-10-23). Counted so the wait can pin that it really pumps. */
+static int g_keepalive_pumps = 0;
+void failover_sweep_keepalive(void) { g_keepalive_pumps++; }
+
 void kernel_yield_to_ring3(uint32_t budget_ticks) {
     (void)budget_ticks;
     g_yields++;
@@ -425,6 +434,9 @@ int main(void) {
           "the bounded wait ran exactly ENV_CREATE_TIMEOUT_TICKS ticks");
     CHECK(g_yields >= 1,
           "the bounded wait kept handing the CPU to Ring-3 on its way to the deadline");
+    CHECK(g_keepalive_pumps > 0,
+          "the bounded wait pumped the sweep keepalive -- the create round trip "
+          "must not silence the leader (death-during-create, 2026-10-23)");
 
     /* 8. a reply left behind by an earlier timed-out request is drained, so it
      *    cannot be reported as THIS request's answer. */

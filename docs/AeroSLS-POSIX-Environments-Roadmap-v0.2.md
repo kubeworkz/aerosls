@@ -1974,6 +1974,60 @@ never confirmed"). A re-BEGIN carrying the same identity-derived
 `transfer_id` AND the same record is now answered READY without touching
 the slot; a different record stays refused.
 
+**The frame itself is the liveness (2026-10-23, the release-vs-heartbeat
+race).** Dropping a latch is not resetting the silence. Found live by the
+`env_migrate_confirm_live` shape: the source announced intent and blocked
+in a PLAIN env-create for 435 ticks — the announce (both operator entries,
+since increment 7) covered the block itself — but when
+`env_migrate_intent_end()`'s RELEASE re-armed detection it only dropped the
+observer's latch, leaving `last_seen_tick` standing 435 ticks back, so the
+very next `failover_tick()` read that accumulated silence UNdeferred and
+declared the busy source DEAD, mid-create, from a node nobody had killed —
+exactly the declaration `env_migrate_confirm_live` and
+`failover_adoption_live` gate, and the window the budget-0 release opened:
+prompt, but stale. Every intent frame now does heartbeat work:
+`env_migrate_recv_intent()` feeds `failover_note_heartbeat()` BEFORE it
+branches on budget, so the announce and its release alike stamp the
+observer with the frame's own tick — the source's very next frame ends its
+silence, closing the gap between "the block ended" and "the next consensus
+heartbeat lands". Pinned in `tests/env_migrate_host_test.c` (a recording
+stub asserts BOTH faces refresh the stamp, the release stamped with its
+own tick).
+
+**Both halves were needed (same day, after the live re-run).** Refreshing
+the stamp at the release proved necessary but NOT sufficient: the same
+3-node shape then declared the source DEAD at `silent 304 ticks` — with
+the arithmetic proving the stamp WAS refreshed (pre-fix the same log line
+would have read ~790). The timeline named the real cause. The blocking
+phase does not merely stop the heartbeat STREAM, it stops the WATCHDOG:
+the election timeout (150 ticks) is shorter than the death threshold
+(300), so a create/migrate/restore block longer than ~150 ticks DEPOSES
+the busy node — and a deposed FOLLOWER transmits nothing that feeds
+`last_seen_tick` at all (only the leader sends `DSPP_CMD_HEARTBEAT`, and
+only consensus packets feed the failover table). Every announce therefore
+made the source a quiet follower at its own release, with 304 ticks of
+pre-block silence behind it. Two additions close the shape:
+
+- **The blocked sweep keeps beating.** `failover_sweep_keepalive()`
+  (failover.c) pumps BOTH streams — the leader heartbeat and the
+  checkpoint broadcast, each at its own existing rate limit — and every
+  wait that runs ON the sweep calls it: the create/destroy RPC wait
+  (env_service.c), the migrate send's BEGIN and per-page ACK waits and
+  both pour loops (env_migrate.c), and the restore's parked wait
+  (env_payload.c). A blocked phase no longer deposes its own node, so
+  nobody is deposed into the quiet-follower shape; the announce latch
+  stays as the backstop for a node that genuinely blocks past the budget.
+  Clause AH of `env_migration_check.sh` (three smoke teeth) holds every
+  site.
+- **An intent frame refreshes liveness; it never creates it.** The stamp
+  feed is gated on `failover_peer_status(node) >= 0`: the frame proves the
+  SENDER alive but must not put it on the death-watch — a follower whose
+  announce armed a fresh entry would be declared DEAD exactly 300 ticks
+  after its own release (the second half of the same live find). Clause AI
+  (one smoke tooth) holds the gate, and the host stub now models the watch
+  table: a first note watches, and an unwatched announce/release is a
+  pure no-op.
+
 **Increment 8 — the silence arithmetic saturates.** One `declaration
 DEFERRED` line was observed printing `silent 18446744073709551606 ticks`
 (−10 unsigned). The cause is structural, not a clock bug: `now` is read

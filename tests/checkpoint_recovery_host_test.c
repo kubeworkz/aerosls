@@ -65,6 +65,11 @@ uint32_t cluster_local_node_id(void) { return g_local_node; }
  * failover_recover_from() directly, not via failover_tick()'s leader gate. */
 int cluster_is_leader(void) { return 0; }
 
+/* net/consensus.c's sweep heartbeat, pumped by failover_sweep_keepalive()
+ * from the blocking waits (the death-during-create fix). A no-op here:
+ * the test drives failover_tick() directly and TX is not its subject. */
+void check_consensus_heartbeat_tick(uint64_t now) { (void)now; }
+
 /* The failover deferral gate (failover.c -> env_migrate_in_flight): a
  * controllable stand-in so the migration deferral itself is exercised below,
  * not just bypassed. The real one lives in kernel/env_migrate.c. */

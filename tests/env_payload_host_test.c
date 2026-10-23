@@ -76,6 +76,12 @@ void kernel_yield_to_ring3(uint32_t budget_ticks) {
  * 2026-10-13, as REFUSE_PARKED). */
 static unsigned g_service_pumps = 0;
 void smp_uniprocessor_tick(void) { g_service_pumps++; }
+/* The parked wait blocks the RESTORE's sweep (env_migrate.c), so it also
+ * pumps the heartbeat/checkpoint streams while it waits -- counted for the
+ * same reason as g_service_pumps above (the death-during-create fix,
+ * 2026-10-23: a silenced sweep deposes the leader and misdeclares it). */
+static unsigned g_keepalive_pumps = 0;
+void failover_sweep_keepalive(void) { g_keepalive_pumps++; }
 struct ProcessDescriptor proc_table[PROC_MAX];
 
 /* ─── The device: a sparse RAM disk keyed by LBA ───────────────────────────── */
@@ -434,6 +440,9 @@ int main(void) {
           "wait: the loop keeps the service work ticking while it waits — the "
           "identity flag it reads is set by env_console_tick(), which on a "
           "uniprocessor boot only runs from this pump");
+    CHECK(g_keepalive_pumps > 0,
+          "wait: the loop also pumps the sweep keepalive -- this wait blocks the "
+          "restore's sweep, and the heartbeat stream must survive it (2026-10-23)");
 
     /* ── 4. The refusal rendering and the latch ───────────────────────────── */
     CHECK(setup_and_capture(1) == 1, "re-capture for the refusal rendering");

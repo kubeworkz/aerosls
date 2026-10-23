@@ -42,6 +42,7 @@
 #include "kernel_io.h"
 #include "timer.h"          /* kernel_tick_counter */
 #include "smp.h"            /* smp_uniprocessor_tick() — the wait's own service pump */
+#include "failover.h"       /* failover_sweep_keepalive() — the parked wait runs on the sweep too */
 
 /* USER_PROC_CODE_BASE — cap.c's literal for the image/stack window. Kept
  * as a local mirror; tests/env_checkpoint_restore_check.sh pins it against
@@ -669,6 +670,8 @@ int env_payload_wait_parked(const struct EnvCkptRecord* rec) {
          * the same log. A no-op once an AP is online: the AP's own loop polls
          * microkernel_service_poll() every tick. */
         smp_uniprocessor_tick();
+        failover_sweep_keepalive();   /* the restore's parked wait blocks the sweep:
+                                      * keep the heartbeat/checkpoint streams alive */
         kernel_yield_to_ring3(50);
     }
 }

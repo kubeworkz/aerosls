@@ -75,6 +75,7 @@ SEED_FILES=(
     kernel/env_ckpt.c
     kernel/env_ckpt.h
     kernel/failover.c
+    kernel/failover.h
     kernel/env_service.c
     kernel/env_payload.c
     tests/env_payload_host_test.c
@@ -449,6 +450,33 @@ tooth "AG-c. partition_migrate() no longer releases the intent on any of its fou
 seed "$W/agsweep"
 sed -i '/int rc = env_migrate_restore/,/if (rc == ENV_MIGRATE_OK)/{/env_migrate_intent_end();/d}' "$W/agsweep/kernel/env_migrate.c"
 tooth "AG-d. the sweep's restore loop no longer releases the intent after each restore attempt" "AG" "$W/agsweep"
+
+# ── AH. The blocked sweep keeps beating ────────────────────────────────────
+# AH-a: the RPC wait's pump deleted — the exact live-found shape: the
+# create round trip silences the leader's heartbeat stream and observers
+# depose it mid-create (then, as a quiet follower, misdeclare it dead).
+seed "$W/ahsvc"
+sed -i 's/failover_sweep_keepalive();/\/* MUTATED *\//' "$W/ahsvc/kernel/env_service.c"
+tooth "AH-a. the create/destroy RPC wait no longer pumps the keepalive (the create round trip silences the leader)" "AH" "$W/ahsvc"
+
+# AH-b: the keepalive's body gutted — the calls remain, pumping nothing.
+seed "$W/ahfo"
+sed -i '/^void failover_sweep_keepalive/,/^}/{/check_consensus_heartbeat_tick(now);/d; /failover_live_checkpoint_broadcast(now);/d}' "$W/ahfo/kernel/failover.c"
+tooth "AH-b. failover_sweep_keepalive() no longer pumps both streams (calls remain, they transmit nothing)" "AH" "$W/ahfo"
+
+# AH-c: one of env_migrate.c's four pumps removed (3 < 4: an ACK wait or a
+# pour loop fell out of the keepalive's reach).
+seed "$W/ahmig"
+sed -i "0,/failover_sweep_keepalive();/s//\\/\\* MUTATED \\*\\//" "$W/ahmig/kernel/env_migrate.c"
+tooth "AH-c. env_migrate.c no longer pumps the keepalive at all four blocking sites" "AH" "$W/ahmig"
+
+# ── AI. An intent frame refreshes liveness, never creates a watch entry ────
+# AI-a: the peer-status gate deleted — every announcing peer gains a
+# death-watch entry, and a quiet follower is declared DEAD 300 ticks after
+# its own release (the second half of the 2026-10-23 live find).
+seed "$W/aigate"
+sed -i 's/if (failover_peer_status(node_id) >= 0)//' "$W/aigate/kernel/env_migrate.c"
+tooth "AI-a. recv_intent stamps every announcing peer's heartbeat (creating watch entries for followers)" "AI" "$W/aigate"
 
 # ── The vacuity control: green on the real tree ────────────────────────────
 out="$(bash "$GUARD" 2>&1)"; rc=$?

@@ -11,6 +11,7 @@
 #include "state_tree.h"
 #include "partition.h"
 #include "kernel_io.h"
+#include "timer.h"           /* kernel_tick_counter — failover_sweep_keepalive()'s now */
 #include "../net/dspp.h"
 #include "../net/consensus.h"
 
@@ -448,6 +449,23 @@ uint32_t failover_last_restored_envs(void) { return last_restored_envs; }
 
 /* ─── Live checkpoint broadcast (leader -> followers) ────────────────── */
 static uint64_t failover_last_ckpt_tick = 0;
+
+void failover_sweep_keepalive(void) {
+    /* The sweep's two liveness streams, driven from the middle of a
+     * blocking wait: the heartbeat (election watchdogs + last_seen_tick on
+     * every observer) and the checkpoint broadcast (the adoption payload).
+     * Both gates live in the callees, so calling this at spin rate is a
+     * no-op almost always — and a no-op is the point: a create/migrate/
+     * restore block that keeps these flowing never deposes its own node,
+     * and a node never deposed never turns into the quiet follower that
+     * this subsystem would misdeclare dead (the release-vs-heartbeat race,
+     * 2026-10-23). Read the tick here rather than trusting a caller's
+     * sampled `now`: waits call this precisely because their notion of
+     * "later" is frozen at loop entry. */
+    uint64_t now = kernel_tick_counter;
+    check_consensus_heartbeat_tick(now);
+    failover_live_checkpoint_broadcast(now);
+}
 
 void failover_live_checkpoint_broadcast(uint64_t now) {
     /* Only the leader produces checkpoints: it is the only node whose

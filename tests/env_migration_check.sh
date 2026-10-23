@@ -680,6 +680,48 @@ else
     fi
 fi
 
+# ── AH. The blocked sweep keeps beating (the death-during-create fix) ──────
+# The create round trip, the migrate ACK waits, the restore's parked wait
+# and the pour all run ON the BSP sweep -- the context that transmits the
+# consensus heartbeat. While any of them blocks, observers see only
+# silence: the 150-tick election watchdog deposes the busy leader, and as
+# a quiet follower (followers transmit nothing that feeds
+# last_seen_tick) it is declared DEAD 300 ticks after its own release.
+# Live 3-node find, 2026-10-23 (env_migrate_confirm_live's shape).
+# failover_sweep_keepalive() pumps both streams from inside the waits.
+if ! has kernel/failover.h "void failover_sweep_keepalive(void)"; then
+    bad "AH. failover.h no longer declares failover_sweep_keepalive() -- the blocking waits have nothing to pump"
+elif ! has kernel/failover.c "void failover_sweep_keepalive(void)"; then
+    bad "AH. failover.c no longer defines failover_sweep_keepalive() -- a declaration with no definition is a link error at best"
+elif ! awk '/^void failover_sweep_keepalive/{f=1} f && /check_consensus_heartbeat_tick\(now\)/{a=1} f && /failover_live_checkpoint_broadcast\(now\)/{b=1} END{exit !(a && b)}' kernel/failover.c; then
+    bad "AH. failover_sweep_keepalive() no longer pumps BOTH streams (the leader heartbeat and the checkpoint broadcast) -- either half missing re-creates a starvation face"
+elif ! has kernel/env_service.c "failover_sweep_keepalive();"; then
+    bad "AH. the create/destroy RPC wait (env_service.c) no longer pumps the keepalive -- the create round trip silences the leader mid-create, the exact live-found shape"
+elif ! has kernel/env_payload.c "failover_sweep_keepalive();"; then
+    bad "AH. the restore's parked wait (env_payload.c) no longer pumps the keepalive -- the wait blocks the restore's sweep"
+elif [ "$(grep -cF 'failover_sweep_keepalive();' kernel/env_migrate.c)" -lt 4 ]; then
+    bad "AH. env_migrate.c pumps the keepalive only $(grep -cF 'failover_sweep_keepalive();' kernel/env_migrate.c) time(s) -- both ACK waits and both pour loops must pump it (4 sites)"
+else
+    ok "AH. every blocking wait on the sweep pumps the keepalive: the heartbeat and checkpoint streams keep flowing mid-block"
+fi
+
+# ── AI. An intent frame refreshes liveness -- it never CREATES a watch entry
+# recv_intent() stamps the sender's heartbeat so a release cannot resurrect
+# the accumulated silence (the release-vs-heartbeat race). But the stamp
+# may only REFRESH a peer already on the death-watch (whose heartbeats were
+# heard): a quiet follower whose intent armed a fresh entry would be
+# declared DEAD exactly 300 ticks after its own release -- the second half
+# of the same 2026-10-23 live find.
+if ! awk '/^void env_migrate_recv_intent/{f=1} f && /failover_peer_status\(node_id\) >= 0/{g=NR} f && /failover_note_heartbeat\(node_id, kernel_tick_counter\)/{h=NR} END{exit !(g && h && g < h)}' kernel/env_migrate.c; then
+    bad "AI. env_migrate_recv_intent() no longer gates its heartbeat refresh on failover_peer_status(node_id) >= 0 -- an intent frame would arm a death-watch entry for a follower that never beats, declaring it dead 300 ticks after its release"
+elif ! has tests/env_migrate_host_test.c "failover_peer_status"; then
+    bad "AI. env_migrate_host_test.c no longer models the watch table (failover_peer_status) -- the refresh-only contract is unpinned"
+elif ! has tests/env_migrate_host_test.c "an unwatched peer's release is a pure no-op"; then
+    bad "AI. env_migrate_host_test.c no longer pins the unwatched release no-op -- a regression back to create-on-intent would go unnoticed"
+else
+    ok "AI. an intent frame refreshes a watched peer's stamp and never creates a death-watch entry"
+fi
+
 echo
 if [ "$fail" -eq 0 ]; then
     echo "---- env_migration_check: ALL INVARIANTS HOLD"
