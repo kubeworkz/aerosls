@@ -99,9 +99,12 @@ enum EnvMigrateStatus {
                                           * leave every interior pointer dangling —
                                           * env_payload's EP_REFUSE_PLACEMENT rule,
                                           * applied to bytes that arrived by wire */
-    ENV_MIGRATE_REFUSE_EXTENT      = 17, /* the fresh record's durable extent disagrees
-                                          * with the staged one — the pages crossed for
-                                          * an LBA this node did not allocate */
+    ENV_MIGRATE_REFUSE_EXTENT      = 17, /* this node has no durable extent able to
+                                          * receive the staged pages — extent
+                                          * coordinates are node-local (band slots
+                                          * come from each node's own history), so the
+                                          * gate is existence and size, never cross-node
+                                          * LBA equality */
     ENV_MIGRATE_REFUSE_PARKED      = 18, /* the sidecars never reached the parked posture
                                           * the pour may restore into */
 };
@@ -132,7 +135,7 @@ static inline const char* env_migrate_status_name(int status) {
     case ENV_MIGRATE_REFUSE_CREATE:      return "the destination's create round trip failed";
     case ENV_MIGRATE_REFUSE_IDENTITY:    return "what came back is not what crossed";
     case ENV_MIGRATE_REFUSE_PLACEMENT:   return "fresh environment landed off the staged bases";
-    case ENV_MIGRATE_REFUSE_EXTENT:      return "durable extent disagrees with the staged one";
+    case ENV_MIGRATE_REFUSE_EXTENT:      return "no durable extent here for the staged pages";
     case ENV_MIGRATE_REFUSE_PARKED:      return "sidecars never reached the parked posture";
     default:                             return "unknown status";
     }

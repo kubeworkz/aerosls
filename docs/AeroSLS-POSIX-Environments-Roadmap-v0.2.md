@@ -1739,10 +1739,19 @@ and one gate the boot pass never needs:
   returned, so the local instance is the stale one — it is ended and what
   crossed is rebuilt, over a `NOENT`-as-good destroy.
 - **Placement is validated WHOLE before a byte.** Every staged region must
-  land at the base the staged record names and the durable extents must agree:
-  the sidecars' MEM regions are identity-mapped and their heaps hold RAW
-  POINTERS into them, so a fresh environment that landed anywhere else could
-  not receive these bytes without every interior pointer dangling silently.
+  land at the base the staged record names: the sidecars' MEM regions are
+  identity-mapped and their heaps hold RAW POINTERS into them, so a fresh
+  environment that landed anywhere else could not receive these bytes without
+  every interior pointer dangling silently. The durable extent is different
+  in kind — its coordinates are **node-local** (band slots come from each
+  node's own first-free history, persisted per node), so what the pour needs
+  is an extent THIS node owns of at least the staged size, and it writes
+  THERE. Cross-node LBA equality was never an invariant: measured live
+  (2026-10-23), staged slot 5 = LBA 1124352, fresh slot 7 = LBA 1128448, both
+  2048 sectors — a gate that demanded agreement refused every such restore,
+  and pouring at the record's LBA instead would have written into another
+  tenant's extent here. `ENV_MIGRATE_REFUSE_EXTENT` now means "no durable
+  extent of this node's own for the staged pages", not "the LBAs differ".
   Finding — the pause dance had to be *straight-line*: E4's placement gate
   refuses a paused target, so a record recorded as paused is resumed for the
   length of the create and put back by the ledger, and between the first

@@ -767,8 +767,14 @@ int env_migrate_restore(uint32_t partition_id, uint32_t index) {
      * identity-mapped and their heaps hold RAW POINTERS into them — exactly
      * env_payload.h's placement rule — so a fresh environment that landed
      * anywhere else cannot receive these bytes without every interior
-     * pointer dangling, silently. The durable extents must agree for the same
-     * reason: the pages crossed for an LBA this node must have allocated. */
+     * pointer dangling, silently. The durable extent is different in kind:
+     * its coordinates are NODE-LOCAL (each node's band slot comes from its
+     * own first-free history, persisted per node), so the record's LBA is a
+     * fact about the SOURCE -- measured live: staged slot 5, fresh slot 7,
+     * both 2048 sectors. What the pour needs is an extent THIS node owns for
+     * this identity, at least as large as the staged one, and the pour below
+     * writes THERE -- so a source coordinate can never aim this node's bytes
+     * at another tenant's extent. */
     const struct EnvCkptRecord* fresh = env_ckpt_find(partition_id, index);
     uint32_t refuse_code = 0, refuse_a = 0;
     for (uint32_t r = 0; r < staged.n_regions && r < ENV_CKPT_MAX_REGIONS; r++) {
@@ -797,10 +803,24 @@ int env_migrate_restore(uint32_t partition_id, uint32_t index) {
         }
     }
     if (!refuse_code && staged.state_sectors != 0 &&
-        (!fresh || fresh->state_lba != staged.state_lba ||
-         fresh->state_sectors != staged.state_sectors)) {
+        (!fresh || fresh->state_lba == 0 ||
+         fresh->state_sectors < staged.state_sectors)) {
         refuse_code = ENV_MIGRATE_REFUSE_EXTENT;
         refuse_a    = (uint32_t)staged.state_sectors;
+        /* Name both halves, the placement refusal's own rule: the status
+         * says WHICH gate fired but not the delta, and on a live cluster the
+         * delta is the whole diagnosis -- "fresh present lba 0 sectors 0"
+         * reads as a destination with no durable extent this boot, while a
+         * present-but-undersized fresh names the size that fell short. */
+        kernel_serial_printf(
+            "[ENV_MIGRATE] restore (partition %u, index %u): EXTENT halves: "
+            "staged lba %llu sectors %u -- fresh %s lba %llu sectors %u\n",
+            (unsigned)partition_id, (unsigned)index,
+            (unsigned long long)staged.state_lba,
+            (unsigned)staged.state_sectors,
+            fresh ? "present" : "MISSING",
+            (unsigned long long)(fresh ? fresh->state_lba : 0ull),
+            (unsigned)(fresh ? fresh->state_sectors : 0u));
     }
     if (!refuse_code) {
         /* Defensive: a complete slot has a frame behind every page (recv_page
@@ -860,7 +880,7 @@ int env_migrate_restore(uint32_t partition_id, uint32_t index) {
                             / ENV_MIGRATE_SECTORS_PER_PAGE;
     for (uint32_t e = 0; e < extent_pages; e++) {
         const uint8_t* src = env_migrate_recv_page_ptr(partition_id, index, cursor++);
-        if (nvme_write_sync(staged.state_lba +
+        if (nvme_write_sync(fresh->state_lba +
                             (uint64_t)e * ENV_MIGRATE_SECTORS_PER_PAGE, src) != 0) {
             /* The environment exists and its memory holds the contents; the
              * durable half could not be written down. Named, and the slot is

@@ -1736,21 +1736,65 @@ int main(void) {
             env_ckpt_reset();
         }
 
-        /* ── G10: the durable extents must agree ───────────────────────── */
+        /* ── G10: extent coordinates are NODE-LOCAL ────────────────────
+         * The record's LBA is a fact about the SOURCE (measured live:
+         * staged slot 5 = LBA 1124352, fresh slot 7 = LBA 1128448, both
+         * 2048 sectors). The pour lands in THIS node's extent -- never the
+         * record's slot number, which may hold another tenant's store here. */
         env_migrate_reset(); host_partition_stubs_reset();
         host_partition_define(G_PART); g_reset_fakes();
         {
             struct EnvCkptRecord staged =
                 g_record(G_PART, 0, g_live_r0, g_live_r1, g_live_r2);
             g_create_record = staged;
-            g_create_record.state_lba = STATE_LBA + 64;  /* a different extent */
+            g_create_record.state_lba = STATE_LBA + 64;  /* this node's band slot differs */
+            uint8_t pg[4096]; memset(pg, 0xBB, 4096);
+            nvme_write_sync(STATE_LBA + 0, pg);  /* the record's LBA -- another store here */
+            g_stage(G_PART, 0, &staged, 6);
+            int rc = env_migrate_restore(G_PART, 0);
+            CHECK(rc == ENV_MIGRATE_OK,
+                  "*** a fresh extent at THIS node's own coordinates restores -- the "
+                  "source's slot number is not a fact about this node ***");
+            nvme_read_sync(STATE_LBA + 0, pg);
+            {
+                int bb = 1; for (uint32_t b = 0; b < 4096; b++) if (pg[b] != 0xBB) bb = 0;
+                CHECK(bb, "...and the record's LBA -- another store's extent here -- "
+                          "holds not one poured byte");
+            }
+            CHECK(nvme_read_sync(STATE_LBA + 64 + 0, pg) == 0 &&
+                  memcmp(pg, g_pages[4], 4096) == 0 &&
+                  nvme_read_sync(STATE_LBA + 64 + 8, pg) == 0 &&
+                  memcmp(pg, g_pages[5], 4096) == 0,
+                  "*** the staged extent pages landed in THIS node's extent, byte-for-byte ***");
+            CHECK(env_migrate_staging_count() == 0 && env_ckpt_find(G_PART, 0) != 0,
+                  "slot dropped, environment stands");
+            env_ckpt_reset();
+        }
+
+        /* ── G10b: no durable extent HERE refuses by name ─────────────────
+         * The gate that replaced cross-node LBA equality: a destination
+         * whose store never became durable (the record layer's "0 until
+         * then") has nothing to pour into, and the staged extent must not
+         * land in RAM's fiction. */
+        env_migrate_reset(); host_partition_stubs_reset();
+        host_partition_define(G_PART); g_reset_fakes();
+        {
+            struct EnvCkptRecord staged =
+                g_record(G_PART, 0, g_live_r0, g_live_r1, g_live_r2);
+            g_create_record = staged;
+            g_create_record.state_lba     = 0;
+            g_create_record.state_sectors = 0;
+            g_create_record.state_bytes   = 0;
             uint8_t pg[4096]; memset(pg, 0xBB, 4096);
             nvme_write_sync(STATE_LBA + 0, pg);
             g_stage(G_PART, 0, &staged, 6);
             int rc = env_migrate_restore(G_PART, 0);
             CHECK(rc == ENV_MIGRATE_REFUSE_EXTENT,
-                  "*** extents that disagree refuse by name -- the pages crossed for an "
-                  "LBA this node did not allocate ***");
+                  "*** a destination with no durable extent of its own refuses the staged "
+                  "pages by name -- 0-until-then is a gate, not a pour target ***");
+            CHECK(env_migrate_last_refusal() &&
+                  env_migrate_last_refusal()->a == (uint32_t)STATE_SECTORS,
+                  "...operand a = the staged extent's size that had nowhere to land");
             nvme_read_sync(STATE_LBA + 0, pg);
             {
                 int bb = 1; for (uint32_t b = 0; b < 4096; b++) if (pg[b] != 0xBB) bb = 0;
