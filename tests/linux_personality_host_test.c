@@ -1173,6 +1173,247 @@ int main(void)
               "      guesses");
     }
 
+    /* ─── E7 step 4 (the file class) against the REAL linux_abi.c ─────────
+     * The three new pure contracts, driven branch by branch like every
+     * increment before: the reply plan's file numbers (the stage the
+     * deliver will consume), the path classifier, the two serializers
+     * (the struct stat golden and the dirent packer — the layouts the
+     * sidecar must never see), and shape-ok's new arms. */
+    {
+        struct LinuxFdReplyPlan r;
+        uint64_t a[6] = { 0, 0, 0, 0, 0, 0 };
+
+        /* stat/lstat: dst is args[1], the payload the compact 24, the
+         * child-side write the serialized 144. */
+        a[1] = 0x6000;
+        r = linux_fd_reply_plan(LINUX_STAT, a);
+        CHECK(r.dst == 0x6000 && r.len == LINUX_STAT_PAYLOAD_BYTES &&
+              r.aux == LINUX_STAT_BYTES && r.kind == LINUX_STAGE_STAT &&
+              r.refuse == 0,
+              "stat plans its compact payload and its 144-byte child-side\n"
+              "      write at args[1] (first-trap, before any post)");
+        r = linux_fd_reply_plan(LINUX_LSTAT, a);
+        CHECK(r.kind == LINUX_STAGE_STAT && r.len == LINUX_STAT_PAYLOAD_BYTES,
+              "lstat plans the same stage — this VFS has no symlink follow");
+        /* a destination ring 3 could not write: -EFAULT first-trap */
+        a[1] = 0x0000800000000000ULL; /* non-canonical: bit 47 set */
+        r = linux_fd_reply_plan(LINUX_STAT, a);
+        CHECK(r.refuse == -LINUX_EFAULT,
+              "a statbuf past the user range is -EFAULT at the first trap");
+
+        /* getdents64: the child's count is the pack budget (capped),
+         * a count too small for even the \".\" record is EINVAL. */
+        a[1] = 0x6000; a[2] = 2048;
+        r = linux_fd_reply_plan(LINUX_GETDENTS64, a);
+        CHECK(r.dst == 0x6000 && r.len == LINUX_DENTS_PAYLOAD_CAP &&
+              r.aux == 2048 && r.kind == LINUX_STAGE_DENTS &&
+              r.refuse == 0,
+              "getdents64 stages the name-list cap and the count budget");
+        a[2] = 100000;
+        r = linux_fd_reply_plan(LINUX_GETDENTS64, a);
+        CHECK(r.aux == LINUX_DIRENT_USER_CAP,
+              "one oversized count is capped — the deliver's local and the\n"
+              "      caller's loop stay bounded");
+        a[2] = 10;
+        r = linux_fd_reply_plan(LINUX_GETDENTS64, a);
+        CHECK(r.refuse == -LINUX_EINVAL,
+              "a count that cannot hold one record is EINVAL (Linux's rule)");
+
+        /* read: count-0 plans NOTHING before canonicality (read(fd, NULL,
+         * 0) is a legal no-op on Linux), and the clamp rides IN. */
+        a[1] = 0x6000; a[2] = 0;
+        r = linux_fd_reply_plan(LINUX_READ, a);
+        CHECK(r.dst == 0 && r.len == 0 && r.kind == LINUX_STAGE_NONE &&
+              r.refuse == 0,
+              "read(fd, NULL, 0) plans no destination — no invented EFAULT");
+        a[2] = 65536;
+        r = linux_fd_reply_plan(LINUX_READ, a);
+        CHECK(r.dst == 0x6000 && r.len == LINUX_FD_WRITE_CHUNK &&
+              r.aux == LINUX_FD_WRITE_CHUNK && r.kind == LINUX_STAGE_RAW &&
+              r.refuse == 0,
+              "read's clamp is the chunk — header, payload and the count\n"
+              "      the task sees are one truth");
+        a[2] = 100;
+        r = linux_fd_reply_plan(LINUX_READ, a);
+        CHECK(r.len == 100, "a smaller count clamps smaller");
+
+        /* a number with no reply payload plans nothing (total). */
+        a[1] = 0x6000; a[2] = 8;
+        r = linux_fd_reply_plan(218, a);
+        CHECK(r.dst == 0 && r.len == 0 && r.kind == LINUX_STAGE_NONE &&
+              r.refuse == 0,
+              "set_tid_address owes no payload — the plan stays empty");
+    }
+    {
+        struct LinuxFdPathPlan p;
+        uint64_t a[6] = { 0x1234, 0x5678, 0, 0, 0, 0 };
+
+        /* The classifier: which registers name paths, nothing more —
+         * measuring bytes is linux_path_measure's job (it needs a cr3). */
+        p = linux_fd_path_plan(LINUX_OPEN, a);
+        CHECK(p.src == 0x1234 && p.src2 == 0 && p.two == 0 &&
+              p.refuse == 0,
+              "open carries one path in args[0]");
+        p = linux_fd_path_plan(LINUX_STAT, a);
+        CHECK(p.src == 0x1234 && p.two == 0, "stat carries one path");
+        p = linux_fd_path_plan(LINUX_UNLINK, a);
+        CHECK(p.src == 0x1234, "unlink carries one path");
+        p = linux_fd_path_plan(LINUX_MKDIR, a);
+        CHECK(p.src == 0x1234, "mkdir carries one path");
+        p = linux_fd_path_plan(LINUX_LSTAT, a);
+        CHECK(p.src == 0x1234, "lstat carries one path");
+        p = linux_fd_path_plan(LINUX_RENAME, a);
+        CHECK(p.src == 0x1234 && p.src2 == 0x5678 && p.two == 1,
+              "rename carries TWO paths, back to back behind the header");
+        p = linux_fd_path_plan(LINUX_READ, a);
+        CHECK(p.src == 0 && p.two == 0,
+              "a number with no path plans none (total function)");
+        p = linux_fd_path_plan(218, a);
+        CHECK(p.src == 0, "set_tid_address carries no path");
+    }
+    {
+        /* The struct stat golden (musl x86-64, 144 bytes): the one
+         * place the sidecar's compact Stat meets Linux's layout. The
+         * offsets asserted here are the ones the golden test in
+         * user/proto pins byte-for-byte and the probe reads back
+         * on-target — three instruments, one layout. */
+        uint8_t compact[LINUX_STAT_PAYLOAD_BYTES];
+        uint8_t st[LINUX_STAT_BYTES];
+        uint64_t mode = 0100644, uid = 1000, gid = 1000;
+        uint64_t size = 67108864ULL, mtime = 1792715282ULL;
+        uint64_t v;
+        uint32_t w;
+        size_t i;
+
+        for (i = 0; i < sizeof compact; i++) compact[i] = 0;
+        for (i = 0; i < 2; i++) compact[i] = (uint8_t)(mode >> (8 * i));
+        for (i = 0; i < 2; i++) compact[2 + i] = (uint8_t)(uid >> (8 * i));
+        for (i = 0; i < 2; i++) compact[4 + i] = (uint8_t)(gid >> (8 * i));
+        for (i = 0; i < 8; i++) compact[8 + i] = (uint8_t)(size >> (8 * i));
+        for (i = 0; i < 4; i++) compact[16 + i] = (uint8_t)(mtime >> (8 * i));
+        linux_stat_bytes(compact, st);
+
+        #define RD64(b, off) ({ uint64_t _v = 0; size_t _i; \
+            for (_i = 0; _i < 8; _i++) _v |= (uint64_t)(b)[(off) + _i] << (8 * _i); \
+            _v; })
+        #define RD32(b, off) ((uint32_t)(b)[off] | ((uint32_t)(b)[(off)+1] << 8) | \
+            ((uint32_t)(b)[(off)+2] << 16) | ((uint32_t)(b)[(off)+3] << 24))
+        v = RD64(st, 8);  CHECK(v == 0, "st_ino at 8: the VFS carries no inode — 0, honestly");
+        v = RD64(st, 16); CHECK(v == 1, "st_nlink at 16 is 1 (v1)");
+        w = RD32(st, LINUX_STAT_OFF_MODE);
+        CHECK(w == 0100644, "st_mode at 24 (u32) carries the vfs mode");
+        w = RD32(st, LINUX_STAT_OFF_UID);
+        CHECK(w == 1000, "st_uid at 28");
+        w = RD32(st, LINUX_STAT_OFF_GID);
+        CHECK(w == 1000, "st_gid at 32");
+        v = RD64(st, LINUX_STAT_OFF_SIZE);
+        CHECK(v == size, "st_size at 48");
+        v = RD64(st, 56); CHECK(v == 4096, "st_blksize at 56");
+        v = RD64(st, 64); CHECK(v == size / 512, "st_blocks at 64, derived");
+        v = RD64(st, 72); CHECK(v == mtime, "st_atim at 72 echoes mtime — one\n"
+              "      timestamp is the truth, two more would be fabrications");
+        v = RD64(st, LINUX_STAT_OFF_MTIME);
+        CHECK(v == mtime, "st_mtim.tv_sec at 88");
+        v = RD64(st, 96);
+        CHECK(v == 0, "st_mtim.tv_nsec at 96 is 0 (the VFS has no nanos)");
+        v = RD64(st, 104); CHECK(v == mtime, "st_ctim at 104 echoes mtime");
+        #undef RD64
+        #undef RD32
+    }
+    {
+        /* The dirent packer: the kernel owns d_reclen math. The payload
+         * below is the sidecar's UNPADDED format (count u32, then ino/
+         * ty/name_len/name) built by hand — the packer must lay out
+         * musl's records, respect the count budget, advance the cursor
+         * only by what it packed, and refuse a malformed stream. */
+        uint8_t pay[256];
+        uint8_t out[LINUX_DIRENT_USER_CAP];
+        uint32_t n = 0, fitted = 0;
+        int packed;
+        size_t i;
+
+        #define PUT_STR(s, tybyte, inoval) do { \
+            uint64_t _ino = (inoval); size_t _l = sizeof(s) - 1; \
+            for (i = 0; i < 8; i++) pay[n + i] = (uint8_t)(_ino >> (8 * i)); \
+            pay[n + 8] = (tybyte); \
+            pay[n + 9] = (uint8_t)(_l & 0xFF); pay[n + 10] = (uint8_t)(_l >> 8); \
+            for (i = 0; i < _l; i++) pay[n + 11 + i] = (uint8_t)(s)[i]; \
+            n += 11 + (uint32_t)_l; } while (0)
+        pay[0] = 4; pay[1] = 0; pay[2] = 0; pay[3] = 0; n = 4;
+        PUT_STR(".", 4, 1);
+        PUT_STR("..", 4, 1);
+        PUT_STR("sls_storage-20260101-000000.img", 8, 5);
+        PUT_STR("ptmx", 2, 9);
+        #undef PUT_STR
+
+        packed = linux_dirent_pack(pay, n, LINUX_DIRENT_USER_CAP, 0,
+                                   out, &fitted);
+        CHECK(packed == 24 + 24 + 56 + 24 && fitted == 4,
+              "four records pack to their 8-aligned d_reclens (24/24/56/24)");
+        CHECK(out[0] == 1 && out[8] == 1 && out[16] == 24 && out[18] == 4 &&
+              out[19] == '.' && out[20] == 0,
+              "\".\": d_ino 1, d_off 1, d_reclen 24, DT_DIR, NUL-padded name");
+        CHECK(out[24 + 8] == 2 && out[24 + 16] == 24 && out[24 + 18] == 4 &&
+              out[24 + 19] == '.' && out[24 + 20] == '.' &&
+              out[24 + 21] == 0,
+              "\"..\": d_off 2 (its own cookie), reclen 24, DT_DIR");
+        CHECK(out[48 + 8] == 3 && out[48 + 16] == 56 && out[48 + 18] == 8,
+              "the file: d_off 3, reclen 56 (19+31+1 rounded), DT_REG");
+        CHECK(out[48 + 19 + 31] == 0,
+              "d_name is NUL-terminated within its reclen");
+        for (i = 48 + 19 + 31 + 1; i < 48 + 56; i++)
+            if (out[i] != 0) break;
+        CHECK(i == 48 + 56, "the tail of the record is zero-padded");
+        CHECK(out[104 + 18] == 2 && out[104 + 19] == 'p',
+              "ptmx carries DT_CHR — the type the sidecar sent");
+
+        /* End of directory: the cursor has consumed everything. */
+        fitted = 0;
+        packed = linux_dirent_pack(pay, n, LINUX_DIRENT_USER_CAP, 4,
+                                   out, &fitted);
+        CHECK(packed == 0 && fitted == 0,
+              "a fully-consumed listing packs 0 bytes — getdents64's\n"
+              "      end-of-directory, never a fabricated record");
+        /* A tight budget: the caller loops — only what FIT is consumed. */
+        fitted = 0;
+        packed = linux_dirent_pack(pay, n, 50, 0, out, &fitted);
+        CHECK(packed == 48 && fitted == 2,
+              "a count budget stops before the record that would break it —\n"
+              "      packed bytes are the child's rax, fitted is the cursor");
+        /* Malformed streams are refused by name, never read past. */
+        fitted = 0;
+        CHECK(linux_dirent_pack(pay, 3, LINUX_DIRENT_USER_CAP, 0,
+                                out, &fitted) == -1,
+              "a payload without its count word is refused");
+        {
+            uint8_t bad[16] = { 1,0,0,0, 1,0,0,0,0,0,0,0, 8, 0xFF, 0xFF, 0 };
+            CHECK(linux_dirent_pack(bad, sizeof bad, LINUX_DIRENT_USER_CAP,
+                                    0, out, &fitted) == -1,
+                  "a name_len crossing the payload is refused");
+        }
+    }
+    {
+        /* shape-ok's file-class arms: stat owes EXACTLY the compact 24,
+         * getdents owes a success whose byte count is the KERNEL's (so
+         * ret is 0 on the wire — the deliver overwrites rax with what
+         * it packed), and read stays count-truth. */
+        CHECK(linux_reply_shape_ok(LINUX_STAT, 0,
+                                   LINUX_STAT_PAYLOAD_BYTES) == 1 &&
+              linux_reply_shape_ok(LINUX_LSTAT, 0,
+                                   LINUX_STAT_PAYLOAD_BYTES) == 1,
+              "stat's success shape is the compact payload at exactly 24");
+        CHECK(linux_reply_shape_ok(LINUX_STAT, 0,
+                                   LINUX_STAT_PAYLOAD_BYTES - 1) == 0 &&
+              linux_reply_shape_ok(LINUX_STAT, 32,
+                                   LINUX_STAT_PAYLOAD_BYTES) == 0,
+              "a wrong-size stat payload or a nonzero stat ret is -EPROTO");
+        CHECK(linux_reply_shape_ok(LINUX_GETDENTS64, 0, 1024) == 1 &&
+              linux_reply_shape_ok(LINUX_GETDENTS64, 0, 1025) == 0 &&
+              linux_reply_shape_ok(LINUX_GETDENTS64, 7, 100) == 0,
+              "getdents64: a success within the list cap — a ret the\n"
+              "      kernel itself computes must contradict on the wire");
+    }
+
     printf("linux_personality_host_test: %d passed, %d failed\n",
            checks_passed, checks_failed);
     return checks_failed == 0 ? 0 : 1;

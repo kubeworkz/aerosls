@@ -172,7 +172,7 @@
 #define CAP_ESPIPE      (-18)   /* lseek on a non-seekable object (ESPIPE)  */
 #define CAP_ENOTEMPTY   (-19)   /* rename over a non-empty directory
                                  * (ENOTEMPTY)                              */
-#define CAP_ENAMETOOLONG(-20)   /* a path over LINUX_PATH_CAP — this shim's
+#define CAP_ENAMETOOLONG (-20)  /* a path over LINUX_PATH_CAP — this shim's
                                  * named divergence from PATH_MAX (§5.6)    */
 #define CAP_EINVAL      (-1)
 #define CAP_EBADF       (-2)

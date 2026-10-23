@@ -431,8 +431,8 @@ impl SigState {
 /// answer rather than a default invented for the reply. Twin of the
 /// kernel's staged clamp (32 bytes — LINUX_SIGACT_BYTES), which the
 /// deliver bounds the copy against.
-fn old_act_bytes(sig: &SigState, no: u64) -> [u8; SIGACT_BYTES] {
-    let mut b = [0u8; SIGACT_BYTES];
+fn old_act_bytes(sig: &SigState, no: u64) -> [u8; FD_PAYLOAD_CAP] {
+    let mut b = [0u8; FD_PAYLOAD_CAP];
     let handler: u64 = if sig.dispo[no as usize] == DISPO_IGN { 1 } else { 0 };
     b[0..8].copy_from_slice(&handler.to_le_bytes());
     b
@@ -445,7 +445,7 @@ fn old_act_bytes(sig: &SigState, no: u64) -> [u8; SIGACT_BYTES] {
 /// staged none), a non-NULL one owes exactly the struct's size. The two
 /// refusal paths above never reach here — an errno reply carries no
 /// payload, which is the deliver's shape-1 rule on the other end.
-fn sig_ok(args: &[u64; 6], old: [u8; SIGACT_BYTES]) -> Answer {
+fn sig_ok(args: &[u64; 6], old: [u8; FD_PAYLOAD_CAP]) -> Answer {
     if args[2] != 0 {
         Answer::ReplyBytes(0, SIGACT_BYTES, old)
     } else {
@@ -458,8 +458,8 @@ fn sig_ok(args: &[u64; 6], old: [u8; SIGACT_BYTES]) -> Answer {
 /// (SIGSET_BYTES) is what crosses and what service()'s bound checks, so
 /// the buffer's upper bytes never leave this side. Twin of the kernel's
 /// staged 8-byte clamp (LINUX_SIGSET_BYTES).
-fn sigset_payload(mask: u64) -> [u8; SIGACT_BYTES] {
-    let mut b = [0u8; SIGACT_BYTES];
+fn sigset_payload(mask: u64) -> [u8; FD_PAYLOAD_CAP] {
+    let mut b = [0u8; FD_PAYLOAD_CAP];
     b[..SIGSET_BYTES as usize].copy_from_slice(&mask.to_le_bytes());
     b
 }
@@ -1065,16 +1065,10 @@ fn answer_file<K: Kernel, A: BufferAlloc>(
                                                    * the NUL rule refuses */
             };
             let flags = args[1] as u32;
-            if flags & !LO_KNOWN != 0 || flags & 0x3 == 0x3 {
-                return Answer::Reply(0, E_NOSYS);
-            }
-            let want_dir = flags & LO_DIRECTORY != 0;
-            let cloexec = flags & LO_CLOEXEC != 0;
-            let mut vf: u16 = (flags & 0x3) as u16;
-            if flags & 0x40 != 0 { vf |= aerosls_vfs::O_CREAT; }
-            if flags & 0x80 != 0 { vf |= aerosls_vfs::O_EXCL; }
-            if flags & 0x200 != 0 { vf |= aerosls_vfs::O_TRUNC; }
-            if flags & 0x400 != 0 { vf |= aerosls_vfs::O_APPEND; }
+            let (vf, cloexec, want_dir) = match translate_open_flags(flags) {
+                Ok(t) => t,
+                Err(x) => return Answer::Reply(0, x),
+            };
             /* O_LARGEFILE (0x8000) is accepted and IGNORED: off_t is
              * 64-bit here, so the bit carries no information — musl
              * ORs it into every open, and refusing it would refuse the
@@ -1291,6 +1285,33 @@ fn answer_file<K: Kernel, A: BufferAlloc>(
          * here. ENOSYS keeps the no-silent-success rule total. */
         _ => Answer::Reply(0, E_NOSYS),
     }
+}
+
+/// Translate a Linux open-flag word into (vfs flags, cloexec, dir-open
+/// selector) — the MEASURED contract (qemu -strace on the real
+/// candidate), pure so the guard suite can pin it without a boot:
+/// the candidate's three opens all fit, an accmode of 3 is EINVAL
+/// (Linux's own number), and any bit outside the measured set is
+/// ENOSYS BY NAME — refused, never silently dropped (the trigger the
+/// design's flag table named, consumed here). O_LARGEFILE rides every
+/// musl open and is accepted as a NO-OP: off_t is 64-bit, so the bit
+/// carries no information, and refusing it would refuse the
+/// candidate's first open by name.
+fn translate_open_flags(flags: u32) -> Result<(u16, bool, bool), i32> {
+    if flags & 0x3 == 0x3 {
+        return Err(E_INVAL); /* O_ACCMODE 3: no such access mode */
+    }
+    if flags & !LO_KNOWN != 0 {
+        return Err(E_NOSYS); /* an unmeasured bit, refused by name */
+    }
+    let want_dir = flags & LO_DIRECTORY != 0;
+    let cloexec = flags & LO_CLOEXEC != 0;
+    let mut vf: u16 = (flags & 0x3) as u16;
+    if flags & 0x40 != 0 { vf |= aerosls_vfs::O_CREAT; }
+    if flags & 0x80 != 0 { vf |= aerosls_vfs::O_EXCL; }
+    if flags & 0x200 != 0 { vf |= aerosls_vfs::O_TRUNC; }
+    if flags & 0x400 != 0 { vf |= aerosls_vfs::O_APPEND; }
+    Ok((vf, cloexec, want_dir))
 }
 
 /// Split the path payload at its NULs: one string for the single-path
@@ -2575,5 +2596,232 @@ mod tests {
         let mut buf = [0u8; 4];
         let n = hex_into(&mut buf, 0, 0xdeadbeefcafe);
         assert_eq!(n, 4, "clamped to the buffer like dec_into");
+    }
+
+    /* ─── E7 step 4 (the file class): the pure half, measured ──────────
+     * The flag contract, the errno map, the reply-payload bound, the
+     * request range and the two payload builders — decisions over words
+     * and bytes, driven here without a VFS, a table or a boot. The VFS
+     * arms themselves are the vfs crate's tests plus the on-target
+     * probe; these are the twins the kernel's halves pin against. */
+
+    #[test]
+    fn flag_contract_matches_the_measured_opens() {
+        /* The three opens qemu -strace measured, one for one: the
+         * storage read, the .partial write, the opendir. */
+        let (vf, ce, dir) = translate_open_flags(0x88000)  /* O_RDONLY|
+                                 * O_LARGEFILE|O_CLOEXEC          */
+            .expect("open 1 is refused by its own flag word");
+        assert_eq!((vf, ce, dir), (0, true, false));
+        let (vf, ce, dir) = translate_open_flags(0x88241)  /* O_WRONLY|
+                                 * O_CREAT|O_TRUNC|O_LARGEFILE|O_CLOEXEC */
+            .expect("open 2 is refused by its own flag word");
+        assert_eq!(vf, aerosls_vfs::O_WRONLY | aerosls_vfs::O_CREAT
+                       | aerosls_vfs::O_TRUNC);
+        assert!((ce, dir) == (true, false));
+        let (vf, ce, dir) = translate_open_flags(0x98000)  /* O_RDONLY|
+                                 * O_DIRECTORY|O_LARGEFILE|O_CLOEXEC */
+            .expect("the opendir is refused by its own flag word");
+        assert_eq!((vf, ce, dir), (0, true, true));
+        /* musl ORs O_LARGEFILE into every open — accepted as a no-op */
+        let (..) = translate_open_flags(0x88000).expect("LARGEFILE no-op");
+        /* An accmode of 3: EINVAL — Linux's own number, not ENOSYS. */
+        assert_eq!(translate_open_flags(0x80803), Err(E_INVAL));
+        /* An unmeasured bit (O_NOFOLLOW): ENOSYS BY NAME — refused,
+         * never silently dropped. */
+        assert_eq!(translate_open_flags(0x82000), Err(E_NOSYS));
+        /* O_DIRECTORY with a write mode is still translatable: the VFS
+         * decides the node's type (ENOTDIR), this fn decides words. */
+        assert_eq!(translate_open_flags(0x10001).map(|t| t.2), Ok(true));
+    }
+
+    #[test]
+    fn cap_of_pins_every_vfs_errno_to_its_cap_code() {
+        /* The values kernel/cap.h defines and linux_errno_from_cap maps
+         * FORWARD to these errnos' own Linux numbers — pinned here so a
+         * drift on either side is a red test before it is a wrong errno
+         * in a tenant binary's error path. Divergences are pinned as
+         * their honest selves: quota/EFBIG read as ENOSPC, EMFILE as
+         * ENFILE (cap.h's fixed-table note), ENOTTY-class as EINVAL. */
+        assert_eq!(cap_of(Errno::ENoent), 1);      /* CAP_ERR_NOTFOUND */
+        assert_eq!(cap_of(Errno::EIo), 2);         /* CAP_ERR_REVOKED -> EIO */
+        assert_eq!(cap_of(Errno::EBadf), -2);
+        assert_eq!(cap_of(Errno::EInval), -1);
+        assert_eq!(cap_of(Errno::EAgain), -3);
+        assert_eq!(cap_of(Errno::EMfile), -4);     /* -> ENFILE        */
+        assert_eq!(cap_of(Errno::ENomem), -7);
+        assert_eq!(cap_of(Errno::ENospc), -8);
+        assert_eq!(cap_of(Errno::ENosys), -10);
+        assert_eq!(cap_of(Errno::EBusy), -11);     /* -> EBUSY         */
+        assert_eq!(cap_of(Errno::EExist), -13);
+        assert_eq!(cap_of(Errno::ENotdir), -14);
+        assert_eq!(cap_of(Errno::EIsdir), -15);
+        assert_eq!(cap_of(Errno::EAcces), -16);    /* EACCES, NOT EPERM */
+        assert_eq!(cap_of(Errno::ERofs), -17);
+        assert_eq!(cap_of(Errno::ESPipe), -18);
+        assert_eq!(cap_of(Errno::ENotempty), -19);
+        assert_eq!(cap_of(Errno::ENametoolong), -20);
+        assert_eq!(cap_of(Errno::EDquot), -8);     /* named divergence  */
+        assert_eq!(cap_of(Errno::EFbig), -8);      /* named divergence  */
+        assert_eq!(cap_of(Errno::ESRCH), 7);       /* CAP_ERR_TARGET    */
+        assert_eq!(cap_of(Errno::ENoexec), -10);   /* execve not landed */
+    }
+
+    #[test]
+    fn payload_bound_derives_each_numbers_own_clamp() {
+        /* The sig class: exactly its struct, and only when an
+         * out-pointer was passed (the kernel's plan staged only then). */
+        assert!(payload_bound(13, &[0, 0x4000, 0x5000, 8, 0, 0], 32));
+        assert!(!payload_bound(13, &[0, 0x4000, 0x5000, 8, 0, 0], 31));
+        assert!(!payload_bound(13, &[0, 0x4000, 0, 8, 0, 0], 32));
+        assert!(payload_bound(14, &[2, 0x4000, 0x5000, 8, 0, 0], 8));
+        /* stat: exactly the compact Stat, at the statbuf pointer. */
+        assert!(payload_bound(LINUX_STAT, &[0, 0x6000, 0, 0, 0, 0],
+                              STAT_PAYLOAD_BYTES));
+        assert!(!payload_bound(LINUX_STAT, &[0, 0x6000, 0, 0, 0, 0],
+                               STAT_PAYLOAD_BYTES - 1));
+        assert!(!payload_bound(LINUX_STAT, &[0, 0, 0, 0, 0, 0],
+                               STAT_PAYLOAD_BYTES));
+        /* read: count-truth — at most the count the first trap clamped
+         * (which rides IN the description), at most the chunk. */
+        assert!(payload_bound(LINUX_READ, &[3, 0x7000, 64, 0, 0, 0], 64));
+        assert!(payload_bound(LINUX_READ, &[3, 0x7000, 4096, 0, 0, 0],
+                              FD_PAYLOAD_CAP));
+        assert!(!payload_bound(LINUX_READ, &[3, 0x7000, 64, 0, 0, 0], 65));
+        /* getdents64: at most the name-list cap. */
+        assert!(payload_bound(LINUX_GETDENTS64,
+                              &[3, 0x7000, 2048, 0, 0, 0],
+                              DENTS_PAYLOAD_CAP));
+        assert!(!payload_bound(LINUX_GETDENTS64,
+                               &[3, 0x7000, 2048, 0, 0, 0],
+                               DENTS_PAYLOAD_CAP + 1));
+        /* a number that owes no payload is total-false. */
+        assert!(!payload_bound(231, &[0, 0, 0, 0, 0, 0], 0));
+    }
+
+    #[test]
+    fn expected_req_range_bounds_the_path_attaches() {
+        /* One string behind the header: an empty path's NUL up to the
+         * cap + 1 — the twin of the kernel's path plan. */
+        let (lo, hi) = expected_req_range(LINUX_OPEN, &[0, 0x4000, 0, 0, 0, 0]);
+        assert_eq!((lo, hi), (LINUX_SYSCALL_REQ_BYTES + 1,
+                              LINUX_SYSCALL_REQ_BYTES + LINUX_PATH_CAP + 1));
+        /* rename: two strings, both bounded. */
+        let (lo, hi) = expected_req_range(LINUX_RENAME,
+                                          &[0x1000, 0x2000, 0, 0, 0, 0]);
+        assert_eq!((lo, hi), (LINUX_SYSCALL_REQ_BYTES + 2,
+                              LINUX_SYSCALL_REQ_BYTES + RECV_ATTACH_CAP));
+        /* every other number keeps its exact length. */
+        let mut a = [0u64; 6];
+        assert_eq!(expected_req_range(LINUX_WRITE, &a), (72, 72));
+        a[2] = 512;
+        assert_eq!(expected_req_range(LINUX_WRITE, &a), (584, 584));
+        a = [0; 6];
+        a[1] = 0x1000;
+        assert_eq!(expected_req_range(13, &a), (72 + 32, 72 + 32));
+        assert_eq!(expected_req_range(LINUX_GETDENTS64, &a), (72, 72));
+    }
+
+    #[test]
+    fn stat_payload_is_the_compact_24_the_kernel_reads_back() {
+        use aerosls_vfs::aerofs::FileType as FT;
+        let st = Stat { mode: 0o100644, uid: 1000, gid: 1000,
+                        size: 67_108_864, mtime: 1_792_715_282,
+                        ty: FT::File };
+        let b = stat_payload(&st);
+        assert_eq!(&b[0..2], &0o100644u16.to_le_bytes(), "mode @0");
+        assert_eq!(&b[2..4], &1000u16.to_le_bytes(), "uid  @2");
+        assert_eq!(&b[4..6], &1000u16.to_le_bytes(), "gid  @4");
+        assert_eq!(&b[8..16], &67_108_864u64.to_le_bytes(), "size @8");
+        assert_eq!(&b[16..20], &1_792_715_282u32.to_le_bytes(),
+                   "mtime @16 — the offsets kernel/linux_abi.c's
+        linux_stat_bytes reads");
+        assert_eq!(b.len(), STAT_PAYLOAD_BYTES);
+    }
+
+    #[test]
+    fn dents_payload_packs_names_inodes_and_types_for_the_kernel() {
+        /* The measured listing's shape: dot entries first (the VFS's
+         * read_dir includes them), then files — u32 count, then per
+         * entry ino/ty/name_len/name, which linux_dirent_pack parses. */
+        let mk = |name: &str, ino: u64, ty: FileType| DirEnt {
+            name: alloc::string::String::from(name), ino, ty,
+        };
+        let ents = [mk(".", 1, FileType::Dir), mk("..", 1, FileType::Dir),
+                    mk("sls_storage-20260101-000000.img", 5, FileType::File),
+                    mk("ptmx", 9, FileType::Char)];
+        let mut buf = [0u8; FD_PAYLOAD_CAP];
+        let n = dents_payload(&ents, &mut buf);
+        assert_eq!(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]), 4,
+                   "count");
+        assert_eq!(&buf[4..12], &1u64.to_le_bytes(), "first ino");
+        assert_eq!(buf[12], 4, "DT_DIR for \".\"");
+        assert_eq!(&buf[13..15], &1u16.to_le_bytes(), "name_len=1");
+        assert_eq!(buf[15], b'.');
+        /* the file's DT_REG and its exact name land where the kernel's
+         * parser expects them. The sidecar's format is UNPADDED (the
+         * kernel's packer owns d_reclen): record N+1 starts where
+         * record N's name ends — "." ends at 4+11+1 = 16, ".." (a
+         * 2-byte name) at 16+11+2 = 29, the 32-byte file at 29+11+32
+         * = 72. */
+        let off2 = 4 + 11 + 1;                  /* "." record ends   */
+        assert_eq!(buf[off2 + 8], 4, ".. is DT_DIR");
+        assert_eq!(&buf[off2 + 9..off2 + 11], &2u16.to_le_bytes(),
+                   ".. has a 2-byte name");
+        let off3 = off2 + 11 + 2;               /* ".." record ends  */
+        let file_off = off3;                    /* the file record   */
+        const FNAME: &[u8] = b"sls_storage-20260101-000000.img"; /* 31 bytes */
+        assert_eq!(buf[file_off + 8], 8, "a file is DT_REG");
+        assert_eq!(&buf[file_off + 9..file_off + 11],
+                   &(FNAME.len() as u16).to_le_bytes());
+        assert_eq!(&buf[file_off + 11..file_off + 11 + FNAME.len()],
+                   FNAME);
+        /* and the fourth record — ptmx as DT_CHR — then the payload
+         * ends: exactly four records plus the count word, no padding
+         * (the kernel's packer owns d_reclen). */
+        let chr_off = file_off + 11 + FNAME.len();
+        assert_eq!(buf[chr_off + 8], 2, "ptmx is DT_CHR");
+        assert_eq!(&buf[chr_off + 11..chr_off + 11 + 4], b"ptmx");
+        assert_eq!(chr_off + 11 + 4, n, "the payload is exactly four
+        records plus the count word — no padding crosses this side");
+        assert!(n <= DENTS_PAYLOAD_CAP);
+        /* The cap: a listing that cannot fit stops before the record
+         * that would break it — the tail continues next call (a short
+         * getdents is POSIX-legal; the kernel advances its cursor only
+         * by what it packed). */
+        let long = alloc::vec::Vec::from_iter(
+            (0..64).map(|i| mk(&alloc::format!("some-directory-name-{:04}", i),
+                               i as u64 + 2, FileType::File)));
+        let n = dents_payload(&long, &mut buf);
+        assert!(n <= DENTS_PAYLOAD_CAP, "bounded: {}", n);
+        let count = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])
+            as usize;
+        assert!(count < 64, "not every entry fit: {}", count);
+        /* end-of-directory: an empty listing still carries count=0. */
+        let n = dents_payload(&[], &mut buf);
+        assert_eq!((n, buf[0]), (4, 0));
+    }
+
+    #[test]
+    fn path_args_validate_the_nul_rules_by_name() {
+        assert_eq!(path_arg(b"/tmp/e7/x.img\0rest", 0), Some("/tmp/e7/x.img"));
+        assert_eq!(path_arg(b"/tmp/a\0/two\0", 1), Some("/two"));
+        /* no NUL — the kernel's plan always attaches one; a payload
+         * without it is malformed, never read past. */
+        assert_eq!(path_arg(b"/tmp/no-nul", 0), None);
+        /* over the cap: refused by name (the twin of the kernel's
+         * first-trap -ENAMETOOLONG). */
+        let mut over = alloc::vec::Vec::new();
+        over.extend_from_slice(b"/");
+        over.extend_from_slice(&[b'a'; LINUX_PATH_CAP]);
+        over.push(0);
+        assert_eq!(path_arg(&over, 0), None);
+        /* a second string whose index does not exist. */
+        assert_eq!(path_arg(b"only-one\0", 1), None);
+        /* non-UTF-8 is refused, not lossily coerced. */
+        assert_eq!(path_arg(&[0x2f, 0xff, 0xfe, 0], 0), None);
+        let p = path_pair(b"/old.partial\0/new.img\0").expect("pair");
+        assert_eq!(p, ("/old.partial", "/new.img"));
+        assert!(path_pair(b"/old.partial\0/no-second-nul").is_none());
     }
 }

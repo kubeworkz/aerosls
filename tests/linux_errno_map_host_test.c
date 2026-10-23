@@ -87,6 +87,35 @@ int main(void)
         CHECK(got == fwd5[i].want, msg);
     }
 
+    /* ─── The file class's forward map (E7 step 4) ──────────────────────
+     * The VFS's own failures each carry their own number across §5.7:
+     * mkdir's EEXIST must reach the task as 17 (the number Rust's
+     * create_dir_all branches on — a generic EIO here would make the
+     * measured workload fail its own retry), EACCES must stay 13 and
+     * NOT collapse into EPERM, and the path cap's refusal keeps its
+     * named number rather than a plausible one. */
+    struct { int32_t cap; int32_t want; const char *why; } fwd4[] = {
+        { CAP_EEXIST,       -LINUX_EEXIST,       "mkdir on a name that exists" },
+        { CAP_ENOTDIR,      -LINUX_ENOTDIR,      "a path component, or the fd, is not a directory" },
+        { CAP_EISDIR,       -LINUX_EISDIR,       "a directory where a file was required" },
+        { CAP_EACCES,       -LINUX_EACCES,       "mode bits or credentials say no" },
+        { CAP_EROFS,        -LINUX_EROFS,        "the mount is read-only" },
+        { CAP_ESPIPE,       -LINUX_ESPIPE,       "lseek on a non-seekable object" },
+        { CAP_ENOTEMPTY,    -LINUX_ENOTEMPTY,    "rename over a non-empty directory" },
+        { CAP_ENAMETOOLONG, -LINUX_ENAMETOOLONG, "a path over LINUX_PATH_CAP (the named divergence)" },
+    };
+    for (i = 0; i < sizeof(fwd4) / sizeof(fwd4[0]); i++) {
+        int32_t got = linux_errno_from_cap(fwd4[i].cap);
+        char msg[192];
+        snprintf(msg, sizeof(msg), "file class forward: %d -> %d (%s)",
+                 (int)fwd4[i].cap, (int)fwd4[i].want, fwd4[i].why);
+        CHECK(got == fwd4[i].want, msg);
+    }
+    CHECK(linux_errno_from_cap(CAP_EACCES) == -LINUX_EACCES &&
+          linux_errno_from_cap(CAP_EPERM) == -LINUX_EPERM &&
+          -LINUX_EACCES != -LINUX_EPERM,
+          "file class forward: EACCES stays 13 — it must not collapse into EPERM (1)");
+
     /* ─── Status 0 is success, in the forward map ────────────────────────── */
     CHECK(linux_errno_from_cap(0) == 0, "forward: status 0 is 0 (success), not an errno");
 
@@ -112,13 +141,14 @@ int main(void)
         int all_in_range = 1;
         int32_t probe;
         int32_t specials[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
-                               (int32_t)CAP_NONE, 99, -99, 65536, -1, -12 };
+                               (int32_t)CAP_NONE, 99, -99, 65536, -1, -12,
+                               -13, -20 };  /* the file class's new codes */
         for (i = 0; i < sizeof(specials) / sizeof(specials[0]); i++) {
             int32_t got = linux_errno_from_cap(specials[i]);
             if (got != 0 && (got < -4095 || got > -1))
                 all_in_range = 0;
         }
-        for (probe = -12; probe <= 13; probe++) {
+        for (probe = -20; probe <= 13; probe++) {
             int32_t got = linux_errno_from_cap(probe);
             if (got != 0 && (got < -4095 || got > -1))
                 all_in_range = 0;
@@ -140,6 +170,15 @@ int main(void)
         { -LINUX_ENOBUFS,   CAP_ERR_SPACE },
         { -LINUX_EPROTO,    CAP_ERR_PROTO },
         { -LINUX_ETIMEDOUT, CAP_ERR_TIMEOUT },
+        /* E7 step 4: each file-class code has exactly ONE preimage */
+        { -LINUX_EEXIST,    CAP_EEXIST },
+        { -LINUX_ENOTDIR,   CAP_ENOTDIR },
+        { -LINUX_EISDIR,    CAP_EISDIR },
+        { -LINUX_EACCES,    CAP_EACCES },
+        { -LINUX_EROFS,     CAP_EROFS },
+        { -LINUX_ESPIPE,    CAP_ESPIPE },
+        { -LINUX_ENOTEMPTY, CAP_ENOTEMPTY },
+        { -LINUX_ENAMETOOLONG, CAP_ENAMETOOLONG },
     };
     for (i = 0; i < sizeof(rev) / sizeof(rev[0]); i++) {
         int32_t got = cap_code_from_linux_errno(rev[i].linux_errno);
@@ -178,7 +217,10 @@ int main(void)
         int32_t defined_set[] = { CAP_ERR_NOTFOUND, CAP_ERR_TARGET, CAP_EBADF,
                                   CAP_EAGAIN, CAP_ETABLEFULL, CAP_EALREADY,
                                   CAP_ENOSPC, CAP_ERANGE, CAP_ENOSYS,
-                                  CAP_ERR_SPACE, CAP_ERR_PROTO, CAP_ERR_TIMEOUT };
+                                  CAP_ERR_SPACE, CAP_ERR_PROTO, CAP_ERR_TIMEOUT,
+                                  CAP_EEXIST, CAP_ENOTDIR, CAP_EISDIR,
+                                  CAP_EACCES, CAP_EROFS, CAP_ESPIPE,
+                                  CAP_ENOTEMPTY, CAP_ENAMETOOLONG };
         for (i = 0; i < sizeof(defined_set) / sizeof(defined_set[0]); i++) {
             int32_t c = defined_set[i];
             if (cap_code_from_linux_errno(linux_errno_from_cap(c)) != c)

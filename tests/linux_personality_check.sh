@@ -331,9 +331,9 @@ fi
 # entry loop must actually call the service arm, the answers must be the
 # census's honest set (§11 Q5), and the reply must be the exact struct the
 # kernel's apply will accept or every exchange dies -EPROTO.
-if grep -qF 'crate::linux::service(&RealKernel, &booted.console);' "$LRE" && \
+if grep -qF 'crate::linux::service(&RealKernel, &booted.console, &mut booted.proc.vfs);' "$LRE" && \
    grep -qF 'crate::linux::append_wait(' "$LRE"; then
-    ok "K. the entry loop services the Linux children AND adds their channels to the quiesce wait set (a forward wakes the sidecar, not an idle pass)"
+    ok "K. the entry loop services the Linux children (with the VFS the file class now needs) AND adds their channels to the quiesce wait set (a forward wakes the sidecar, not an idle pass)"
 else
     bad "K. the entry loop no longer services or wait-qualifies the Linux children — every forwarded syscall sits unanswered in the channel queue while its task parks forever"
 fi
@@ -488,19 +488,19 @@ if grep -qF 'const E_BADF: i32 = -2;' "$LRS" && \
    grep -qF '1 => match fd_kind(fds, args[0]) {' "$LRS" && \
    grep -qF 'None => Answer::Reply(0, E_BADF),' "$LRS" && \
    grep -qF 'fds: [FdSlot; LINUX_MAX_FDS],' "$LRS" && \
-   grep -qF 't.fds = [FdSlot { used: false, kind: 0 }; LINUX_MAX_FDS];' "$LRS" && \
+   grep -qF 't.fds = [FdSlot { used: false, kind: 0, vfs_fd: 0, flags: 0 }; LINUX_MAX_FDS];' "$LRS" && \
    grep -qF 't.fds.iter_mut().take(3)' "$LRS"; then
-    ok "M5. the sidecar's fd table exists per task, is born with console stdio (0/1/2), and an unknown descriptor is EBADF — CAP_EBADF pinned at -2 so §5.7 delivers 9"
+    ok "M5. the sidecar's fd table exists per task (console slots plus step 4's File kind carrying the VFS fd and flags), is born with console stdio (0/1/2), and an unknown descriptor is EBADF — CAP_EBADF pinned at -2 so §5.7 delivers 9"
 else
     bad "M5. the fd table or its EBADF arm is gone — a descriptor nobody registered would be performed (or fake-answered) instead of refused, and a drifted E_BADF would surface a different errno than the policy meant"
 fi
-if grep -qF 'let expected = expected_req_len(num, &args);' "$LRS" && \
-   grep -qF 'args[2] as usize > FD_PAYLOAD_CAP || rr.len != expected' "$LRS" && \
-   grep -qF 'if rr.len != expected {' "$LRS" && \
+if grep -qF 'let (lo, hi) = expected_req_range(num, &args);' "$LRS" && \
+   grep -qF 'args[2] as usize > FD_PAYLOAD_CAP || rr.len != lo' "$LRS" && \
+   grep -qF 'if rr.len < lo || rr.len > hi {' "$LRS" && \
    grep -qF 'const FD_PAYLOAD_CAP: usize = 1024;' "$LRS" && \
    grep -qF 'match console.write(&payload[..len]) {' "$LRS" && \
-   grep -qF 'crate::linux::service(&RealKernel, &booted.console);' "$LRE"; then
-    ok "M6. the sidecar checks EVERY request's attached bytes against expected_req_len (the kernel's attach twin: write's count, the sig class's act/set — a drifted attach arrives only as a wrong length and dies -EPROTO), the write chunk cap is intact, the perform happens on the loop's console, and service is handed that console"
+   grep -qF 'crate::linux::service(&RealKernel, &booted.console, &mut booted.proc.vfs);' "$LRE"; then
+    ok "M6. the sidecar checks EVERY request's attached bytes against expected_req_range — exact for write/sig (the kernel's attach twin), a cap-bounded range for the path numbers (rename carries two strings) — a drifted attach arrives only as a wrong length and dies -EPROTO, the write chunk cap is intact, the perform happens on the loop's console, and service is handed that console (plus the VFS)"
 else
     bad "M6. the payload invariant, the chunk cap, the console perform, or the service's console hand-off is gone — bytes the task did not write could be performed, or a write could never reach the serial log it exists to prove"
 fi
@@ -960,9 +960,12 @@ if [ -n "$deliver_buf" ] && \
    grep -qF 'out.len < sizeof(struct SLSLinuxSyscallRequest)' "$CANC" && \
    grep -qF '!staged || n > slen' "$CANC" && \
    grep -qF 'linux_reply_shape_ok(expect_num, hdr_ret, n)' "$CANC" && \
-   grep -qF 'linux_user_copy_in(rbuf +' "$CANC" && \
-   grep -qF 'uint64_t rax = linux_syscall_apply_reply(' "$CANC"; then
-    ok "T3. the deliver accepts exactly three shapes — 72 (a SUCCESS with an owed payload refused -EPROTO), 72+n within the staged clamp with a matching echo/status/ret, and CAP_ERR_PROTO otherwise — apply first, then the two-phase copy, then rax"
+   grep -qF 'uint64_t rax = linux_syscall_apply_reply(' "$CANC" && \
+   grep -qF 'skind == LINUX_STAGE_STAT' "$CANC" && \
+   grep -qF 'skind == LINUX_STAGE_DENTS' "$CANC" && \
+   grep -qF 'linux_dirent_pack(pay, n, saux,' "$CANC" && \
+   grep -qF 'linux_user_copy_in(pay, pd->cr3, sva, n) != 0' "$CANC"; then
+    ok "T3. the deliver accepts exactly three shapes — 72 (a SUCCESS with an owed payload refused -EPROTO), 72+n within the staged clamp with a matching echo/status/ret, and CAP_ERR_PROTO otherwise — apply first, then the payload's KIND decides what crosses (RAW verbatim, STAT serialized, DENTS packed with the cursor advanced only by what was packed), then rax"
 else
     bad "T3. a shape arm is gone — a payload would be copied for a number that staged none, beyond the clamp, past a refusal, or with a ret its number contradicts (the one-truth rule with bytes attached)"
 fi
@@ -975,12 +978,13 @@ if grep -qF 'int require_rw)' "$LABC" && \
 else
     bad "T4. the writable check or the two-phase order is gone — a read-only page under a payload becomes writable-by-sidecar, or a span half-writes before its second page refuses"
 fi
-if grep -qF 'ReplyBytes(u64, usize, [u8; SIGACT_BYTES]),' "$LRS" && \
-   grep -qF 'if args[2] == 0 || len != want || len > bytes.len() {' "$LRS" && \
+if grep -qF 'ReplyBytes(u64, usize, [u8; FD_PAYLOAD_CAP]),' "$LRS" && \
+   grep -qF 'if !payload_bound(num, &args, len) || len > bytes.len() {' "$LRS" && \
    grep -qF 'reply payload mismatch -> -EPROTO' "$LRS" && \
    grep -qF 'reply_bytes(k, ch_w, rr.tag, num, ret, &bytes[..len]);' "$LRS" && \
-   grep -qF 'old_act_bytes(sig, args[0])' "$LRS"; then
-    ok "T5. the sidecar's twin bound — a ReplyBytes answer must equal the forwarded out-pointer's clamp or it goes out as num=0 → -EPROTO, the old disposition is captured BEFORE any mutation, and only service() sends the bytes (neither end load-bearing alone)"
+   grep -qF 'old_act_bytes(sig, args[0])' "$LRS" && \
+   grep -qF 'fn payload_bound(num: u64, args: &[u64; 6], len: usize) -> bool {' "$LRS"; then
+    ok "T5. the sidecar's twin bound — payload_bound derives the per-number clamp from the same words the kernel's reply plan stages (the sig class's exact size, stat's compact 24, read's count, getdents' cap) or the answer goes out as num=0 → -EPROTO, the old disposition is captured BEFORE any mutation, and only service() sends the bytes (neither end load-bearing alone)"
 else
     bad "T5. the sidecar's bound or the payload arm is gone — bytes could cross without a destination the first trap validated, or oldact could carry the NEW disposition (the caller reads a future that already moved)"
 fi
