@@ -51,6 +51,10 @@ pub enum Errno {
     EMfile,
     /// Exec format error (the file is not a runnable image).
     ENoexec,
+    /// Function not implemented (E7 step 4: fsync on a device-backed fs
+    /// until the cache has a flush entry point; an open flag this shim
+    /// refuses by name rather than silently dropping).
+    ENosys,
     /// Illegal seek — the fd names a non-seekable object (pipe, device).
     ESPipe,
     /// Broken pipe — a write to a pipe whose read ends are all closed.
@@ -92,6 +96,7 @@ impl Errno {
             Errno::ESPipe => 29,
             Errno::EPipe => 32,
             Errno::ESRCH => 3,
+            Errno::ENosys => 38,
             Errno::ENotty => 25,
             Errno::EAddrInuse => 98,
             Errno::EXDev => 18,

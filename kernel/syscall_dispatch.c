@@ -422,7 +422,7 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                  * — 8-aligned so k_linux_forward can read the header as a
                  * struct without a copy of its own. */
                 uint64_t fwd_words[(sizeof(struct SLSLinuxSyscallRequest)
-                                    + LINUX_FD_WRITE_CHUNK + 7u) / 8u];
+                                    + LINUX_FWD_ATTACH_CAP + 7u) / 8u];
                 uint8_t *fwd = (uint8_t *)fwd_words;
                 uint32_t fwd_len = (uint32_t)sizeof(struct SLSLinuxSyscallRequest);
                 int status;
@@ -437,6 +437,8 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                 cur->reply_stage_num   = 0;
                 cur->reply_stage_va    = 0;
                 cur->reply_stage_len   = 0;
+                cur->reply_stage_kind  = 0;
+                cur->reply_stage_aux   = 0;
                 cur->reply_stage_valid = 0;
                 /* E7 increment 5, plan half: BEFORE the describe (the
                  * clamp must be IN the description) and before the
@@ -619,6 +621,19 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                         (long)(int32_t)largs[2]);
                     return (uint64_t)(int64_t)(-LINUX_ENOSYS);
                 }
+                /* E7 step 4 (the file class): the getdents64 cursor
+                 * rides IN the description — args[5], a word the child's
+                 * own 3-argument call never uses, is where the sidecar's
+                 * skip lives (the sidecar is stateless over it: it
+                 * slices its listing from the index this word names).
+                 * Any open resets the cursor: one listing at a time is
+                 * the named v1 boundary (two interleaved directory fds
+                 * would share this cursor), and a reused slot resets it
+                 * beside every other piece of per-task state. */
+                if (num == LINUX_OPEN)
+                    cur->linux_dir_pos = 0;
+                if (num == LINUX_GETDENTS64)
+                    largs[5] = cur->linux_dir_pos;
                 linux_syscall_describe(&req, num, largs);
                 if (cap_linux_find_channels(cur->pid, &ch_w, &ch_r) != 0) {
                     kernel_serial_printf(
@@ -661,6 +676,66 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                         return (uint64_t)(int64_t)(-LINUX_EFAULT);
                     }
                     fwd_len += plan.len;
+                } else {
+                    /* E7 step 4 (the file class): the path numbers' own
+                     * attach — open/stat/lstat/unlink/mkdir carry one
+                     * NUL-terminated string behind the header, rename
+                     * TWO back to back (the sidecar splits at the first
+                     * NUL and validates the second's, its twin of these
+                     * bounds). Measured and copied HERE, where the cr3
+                     * is in scope, still before the post: a span ring 3
+                     * could not read is -EFAULT, a string with no NUL
+                     * within LINUX_PATH_CAP is -ENAMETOOLONG by name —
+                     * never a truncated path. A number with no path
+                     * plans nothing (the classifier's total function)
+                     * and this arm adds no bytes, as ever. */
+                    struct LinuxFdPathPlan pplan =
+                        linux_fd_path_plan(num, largs);
+                    if (pplan.src) {
+                        uint32_t plen1 = 0, plen2 = 0;
+                        int m = linux_path_measure(cur->cr3, pplan.src,
+                                                   LINUX_PATH_CAP, &plen1);
+                        if (m != 0) {
+                            kernel_serial_printf(
+                                "[E7] linux path (syscall %lu) refused "
+                                "before post: %s\n",
+                                (unsigned long)num,
+                                m == -LINUX_ENAMETOOLONG
+                                    ? "path over LINUX_PATH_CAP (no NUL)"
+                                    : "path span not user-readable (measure)");
+                            return (uint64_t)(int64_t)m;
+                        }
+                        if (linux_user_copy_out(
+                                fwd + sizeof(struct SLSLinuxSyscallRequest),
+                                cur->cr3, pplan.src, plen1) != 0) {
+                            kernel_serial_printf(
+                                "[E7] linux path (syscall %lu) refused "
+                                "before post: unmapped span (copy)\n",
+                                (unsigned long)num);
+                            return (uint64_t)(int64_t)(-LINUX_EFAULT);
+                        }
+                        fwd_len += plen1;
+                        if (pplan.two) {
+                            m = linux_path_measure(cur->cr3, pplan.src2,
+                                                   LINUX_PATH_CAP, &plen2);
+                            if (m != 0) {
+                                kernel_serial_printf(
+                                    "[E7] linux rename dst path refused "
+                                    "before post: %s\n",
+                                    m == -LINUX_ENAMETOOLONG
+                                        ? "path over LINUX_PATH_CAP (no NUL)"
+                                        : "path span not user-readable");
+                                return (uint64_t)(int64_t)m;
+                            }
+                            if (linux_user_copy_out(
+                                    fwd + sizeof(struct SLSLinuxSyscallRequest)
+                                        + plen1,
+                                    cur->cr3, pplan.src2, plen2) != 0) {
+                                return (uint64_t)(int64_t)(-LINUX_EFAULT);
+                            }
+                            fwd_len += plen2;
+                        }
+                    }
                 }
                 {
                     struct SLSLinuxSyscallRequest *fwd_req =
@@ -677,6 +752,8 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                     cur->reply_stage_num   = num;
                     cur->reply_stage_va    = rplan.dst;
                     cur->reply_stage_len   = rplan.len;
+                    cur->reply_stage_kind  = rplan.kind;
+                    cur->reply_stage_aux   = rplan.aux;
                     cur->reply_stage_valid = 1;
                 }
                 /* Arm BEFORE the post: cap_maybe_handoff (process.c) reads

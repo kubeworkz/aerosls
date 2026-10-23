@@ -87,10 +87,16 @@
 //! every semantic decision (the §3.3 step-6 contract — there is exactly one
 //! POSIX implementation and it is not in the kernel).
 
+use aerosls_blockcache::BufferAlloc;
 use aerosls_proto::kabi::{GrantedCap, Kernel};
-use aerosls_vfs::CharNode;   /* E7 increment 5: the fd table's console slot —
-                              * service() holds the handle because only the
-                              * entry loop has the CharNode */
+use aerosls_vfs::aerofs::FileType;
+use aerosls_vfs::{CharNode, DirEnt, Errno, Stat, Vfs}; /* E7 increment 5: the fd
+                              * table's console slot — service() holds the
+                              * handle because only the entry loop has the
+                              * CharNode. Step 4 (the file class): the VFS
+                              * itself — every DECISION of the thirteen
+                              * arms is this layer's; this module only
+                              * translates (§5.6). */
 
 /// The wire size of `kernel/linux_abi.h`'s struct, pinned as literals in
 /// `tests/linux_personality_host_test.c` (72 = num 8 + args 48 + ret 8 +
@@ -202,6 +208,109 @@ fn default_action(sig: u64) -> u8 {
 const LINUX_WRITE: u64 = 1;
 const FD_PAYLOAD_CAP: usize = 1024;
 
+/// E7 step 4 (the file class, §5.6): the census's thirteen numbers as
+/// this side sees them — literals repeated from kernel/linux_abi.h (the
+/// Rust side cannot include that header; guard clause P pins both
+/// halves), and read (0) joins them: the fd class's read arm routes
+/// through this module now, where the fd table lives.
+const LINUX_READ: u64 = 0;
+const LINUX_OPEN: u64 = 2;
+const LINUX_CLOSE: u64 = 3;
+const LINUX_STAT: u64 = 4;
+const LINUX_LSTAT: u64 = 6;
+const LINUX_LSEEK: u64 = 8;
+const LINUX_FCNTL: u64 = 72;
+const LINUX_FSYNC: u64 = 74;
+const LINUX_FTRUNCATE: u64 = 77;
+const LINUX_RENAME: u64 = 82;
+const LINUX_MKDIR: u64 = 83;
+const LINUX_UNLINK: u64 = 87;
+const LINUX_GETDENTS64: u64 = 217;
+
+/// The path cap — the twin of kernel/linux_abi.h's LINUX_PATH_CAP and
+/// the shim's NAMED divergence from PATH_MAX 4096 (the kernel refuses a
+/// longer path at the first trap; this side validates the NULs it was
+/// given rather than trusting a length it cannot check).
+const LINUX_PATH_CAP: usize = 1024;
+/// The recv buffer's attach ceiling: rename carries TWO paths back to
+/// back behind the header (the twin of LINUX_FWD_ATTACH_CAP). The
+/// write/sig payloads are smaller and fit unchanged.
+const RECV_ATTACH_CAP: usize = 2 * (LINUX_PATH_CAP + 1);
+/// The compact Stat payload (the twin of LINUX_STAT_PAYLOAD_BYTES): the
+/// sidecar never sees musl's 144-byte layout — kernel/linux_abi.c's
+/// linux_stat_bytes is the only place the two layouts meet.
+const STAT_PAYLOAD_BYTES: usize = 24;
+/// The sidecar's directory-listing payload cap (the twin of
+/// LINUX_DENTS_PAYLOAD_CAP): names, not records — the kernel packs the
+/// Linux records, and a short getdents is POSIX-legal (the caller
+/// loops, and end-of-directory is 0 bytes).
+const DENTS_PAYLOAD_CAP: usize = 1024;
+
+/// The §5.7 map, this side: vfs::Errno → the CAP code whose kernel-side
+/// arm delivers the right Linux errno. Total over vfs::Errno (the match
+/// is exhaustive — a new errno is a compile error, not a silent EIO),
+/// and every code here is one linux_errno_from_cap maps FORWARD to the
+/// vfs errno's own number (guard clause P pins the round-trip in the
+/// host test). Codes the existing family already names keep its
+/// constants: CAP_ERR_NOTFOUND 1, CAP_ERR_REVOKED 2 (EIO),
+/// CAP_EINVAL -1, CAP_EBADF -2, CAP_ENOMEM -7, CAP_ENOSPC -8,
+/// CAP_ENOSYS -10, CAP_ECONFLICT -11 (EBUSY), CAP_EPERM -12, and the
+/// file class's own (-13)..(-20). Divergences are named where they
+/// exist: EDQUOT and EFBIG read as ENOSPC (both are "the store says
+/// no"; the quota's own number is owed to v0.2's storage work), EMFILE
+/// reads as ENFILE (a fixed table is system-scoped — cap.h's own note),
+/// ENOTTY/EADDRINUSE/EXDEV/ENOPROTOOPT read as EINVAL/ENOSYS — none is
+/// reachable from the census, and a wrong number would be worse than a
+/// named one.
+fn cap_of(e: Errno) -> i32 {
+    const CAP_ERR_NOTFOUND: i32 = 1;
+    match e {
+        Errno::ENoent => CAP_ERR_NOTFOUND,
+        Errno::EIo => E_REVOKED,           /* -EIO                    */
+        Errno::EAcces => E_ACCES,          /* -EACCES (not EPERM)     */
+        Errno::EBadf => E_BADF,
+        Errno::EIsdir => E_ISDIR,
+        Errno::ENotdir => E_NOTDIR,
+        Errno::EExist => E_EXIST,
+        Errno::ENotempty => E_NOTEMPTY,
+        Errno::ENospc => E_NOSPC,
+        Errno::EDquot => E_NOSPC,          /* named divergence        */
+        Errno::ERofs => E_ROFS,
+        Errno::EFbig => E_NOSPC,           /* named divergence        */
+        Errno::EInval => E_INVAL,
+        Errno::ENametoolong => E_NAMETOOLONG,
+        Errno::ENomem => E_NOMEM,
+        Errno::EAgain => E_AGAIN,
+        Errno::EBusy => E_CONFLICT,        /* -EBUSY                  */
+        Errno::EMfile => E_TABLEFULL,      /* ENFILE: a fixed table   */
+        Errno::ENoexec => E_NOSYS,         /* execve is not landed    */
+        Errno::ESPipe => E_SPIPE,
+        Errno::EPipe => E_REVOKED,         /* no pipe fds yet; EIO    */
+        Errno::ESRCH => E_TARGET,          /* -ESRCH                  */
+        Errno::ENotty => E_INVAL,          /* named divergence        */
+        Errno::EAddrInuse => E_INVAL,      /* named divergence        */
+        Errno::EXDev => E_INVAL,           /* named divergence        */
+        Errno::EAfNoSupport => E_NOSYS,    /* named divergence        */
+        Errno::ENosys => E_NOSYS,
+    }
+}
+
+/// The file class's CAP codes (cap.h's (-13)..(-20) and the existing
+/// family members these arms use) — the values the reply's status
+/// field carries, pinned here as twins.
+const E_ACCES: i32 = -16;
+const E_ISDIR: i32 = -15;
+const E_NOTDIR: i32 = -14;
+const E_EXIST: i32 = -13;
+const E_NOTEMPTY: i32 = -19;
+const E_ROFS: i32 = -17;
+const E_SPIPE: i32 = -18;
+const E_NAMETOOLONG: i32 = -20;
+const E_AGAIN: i32 = -3;      /* CAP_EAGAIN  -> -EAGAIN (read with no
+                               * console-input state — the input class)  */
+const E_NOSPC: i32 = -8;      /* CAP_ENOSPC  -> -ENOSPC                   */
+const E_TABLEFULL: i32 = -4;  /* CAP_ETABLEFULL -> -ENFILE                */
+
 /// The reply wire format: `kernel/linux_abi.h`'s SLSLinuxSyscallRequest,
 /// field order C-guaranteed by `repr(C)`. Only num/ret/status are read by
 /// the kernel's apply (`linux_syscall_apply_reply`), and args ride zeroed —
@@ -242,8 +351,11 @@ enum Answer {
     /// implies, or the answer goes out as num=0 → -EPROTO — the twin of
     /// the deliver's staged-len check, neither end load-bearing alone).
     /// The fixed buffer is the largest payload any current number owes
-    /// (SIGACT_BYTES = 32); `len` is the exact count that crosses.
-    ReplyBytes(u64, usize, [u8; SIGACT_BYTES]),
+    /// (step 4 widened it to FD_PAYLOAD_CAP: getdents64's name list;
+    /// `len` is the exact count that crosses — the buffer's upper bytes
+    /// never leave this side, and payload_bound is the per-number bound
+    /// over it).
+    ReplyBytes(u64, usize, [u8; FD_PAYLOAD_CAP]),
     /// exit_group: reap the task, reply nothing.
     Exit,
     /// E7 increment 10 (the signal seam): a signal's DEFAULT ACTION ran —
@@ -768,24 +880,73 @@ fn answer(
 struct FdSlot {
     used: bool,
     kind: u8,
+    /// E7 step 4: for the File kind, the VFS fd this descriptor names
+    /// (the VFS table is the task model's own — one VFS task per Linux
+    /// task, allocated at spawn). Console slots leave it 0.
+    vfs_fd: u32,
+    /// The LINUX open flags this descriptor answers F_GETFL with, and
+    /// whose O_CLOEXEC bit is F_GETFD/F_SETFD's own state (the VFS's
+    /// u16 flag word cannot hold either — that widening IS this
+    /// increment, justified by the census's three measured opens, all
+    /// carrying O_CLOEXEC and one carrying O_DIRECTORY).
+    flags: u32,
 }
 
 const FD_KIND_CONSOLE: u8 = 0;
+const FD_KIND_FILE: u8 = 1;
 const LINUX_MAX_FDS: usize = 16;
+
+/// Linux's own open-flag numbers as x86-64 musl hands them (measured by
+/// the candidate's three opens under qemu-x86_64 -strace — the flag
+/// contract is the trace, §5.6): O_LARGEFILE rides every musl open and
+/// is a NO-OP on 64-bit (accepted, ignored — named); O_DIRECTORY and
+/// O_CLOEXEC select the dir-open arm and the cloexec bit; everything
+/// NOT in this mask is refused by NAME at open (ENOSYS), never silently
+/// dropped — the trigger the design's flag table named ("widen the flag
+/// word") is consumed right here, by the measurement.
+const LO_LARGEFILE: u32 = 0x8000;
+const LO_DIRECTORY: u32 = 0x10000;
+const LO_CLOEXEC: u32 = 0x80000;
+const LO_KNOWN: u32 = 0x3 | 0x40 | 0x80 | 0x200 | 0x400
+    | LO_LARGEFILE | LO_DIRECTORY | LO_CLOEXEC;
+
+/// fcntl's four answered commands (the census's fcntl rows are all
+/// F_SETFD(1); F_GETFD/F_GETFL round out the four the design names).
+/// Every other command — F_DUPFD included — is ENOSYS by name: a
+/// fabricated answer to a command nobody measured is the placeholder
+/// failure in a new shape.
+const F_SETFD: u64 = 2;
+const F_GETFD: u64 = 1;
+const F_GETFL: u64 = 3;
+const F_SETFL: u64 = 4;
 
 /// Resolve a descriptor against a task's table — pure over the slice, so
 /// every branch (slot present, slot empty, descriptor out of range) is
 /// guard clause M4's to hold rather than an observation from one boot.
 fn fd_kind(fds: &[FdSlot], fd: u64) -> Option<u8> {
+    fd_slot(fds, fd).map(|s| s.kind)
+}
+
+fn fd_slot(fds: &[FdSlot], fd: u64) -> Option<&FdSlot> {
     if fd >= LINUX_MAX_FDS as u64 {
         return None;
     }
     let s = &fds[fd as usize];
-    if s.used {
-        Some(s.kind)
-    } else {
-        None
+    if s.used { Some(s) } else { None }
+}
+
+/// Mint the lowest free Linux fd for a VFS fd (open's own allocation
+/// rule), refusing the table-full shape as EBADF-family: Linux would
+/// say EMFILE, which this seam maps through cap.h's ETABLEFULL (-4 →
+/// ENFILE — the fixed-table honesty cap.h itself notes).
+fn alloc_fd(fds: &mut [FdSlot], kind: u8, vfs_fd: u32, flags: u32) -> Result<u64, i32> {
+    for (i, s) in fds.iter_mut().enumerate() {
+        if !s.used {
+            *s = FdSlot { used: true, kind, vfs_fd, flags };
+            return Ok(i as u64);
+        }
     }
+    Err(E_TABLEFULL)
 }
 
 /// The message length one request must arrive with — pure over (num,
@@ -807,6 +968,409 @@ fn expected_req_len(num: u64, args: &[u64; 6]) -> usize {
     }
 }
 
+/// The message-length RANGE one request may arrive with (step 4): the
+/// fixed numbers keep their one length (expected_req_len, still the
+/// kernel plan's twin); the path numbers carry a string's own length
+/// behind the header — 1 byte (the empty string's NUL) up to the cap
+/// (both caps for rename) — mirroring the kernel's path plan bounds.
+/// A length outside the range is the malformed arm (num=0 → -EPROTO),
+/// so an attach that drifted from the plan is loud at BOTH ends.
+fn expected_req_range(num: u64, args: &[u64; 6]) -> (usize, usize) {
+    const H: usize = LINUX_SYSCALL_REQ_BYTES;
+    match num {
+        LINUX_OPEN | LINUX_STAT | LINUX_LSTAT | LINUX_UNLINK | LINUX_MKDIR =>
+            (H + 1, H + LINUX_PATH_CAP + 1),
+        LINUX_RENAME => (H + 2, H + RECV_ATTACH_CAP),
+        _ => (expected_req_len(num, args), expected_req_len(num, args)),
+    }
+}
+
+/// The per-number bound over a REPLY payload (the twin of the kernel's
+/// reply-plan stages): the sig class owes exactly its struct's size
+/// when an out-pointer was passed, stat owes exactly the compact Stat,
+/// read owes at most its own count (count-truth: the payload IS the
+/// byte count, so `ret == len` is the deliver's shape rule), getdents64
+/// owes at most the name-list cap. A payload the bound refuses never
+/// crosses (service answers num=0 → -EPROTO) — the deliver's staged-len
+/// check is the same rule on the other end; neither is load-bearing
+/// alone.
+fn payload_bound(num: u64, args: &[u64; 6], len: usize) -> bool {
+    match num {
+        LINUX_RT_SIGACTION => args[2] != 0 && len == SIGACT_BYTES,
+        LINUX_RT_SIGPROCMASK => args[2] != 0 && len == SIGSET_BYTES as usize,
+        LINUX_STAT | LINUX_LSTAT => args[1] != 0 && len == STAT_PAYLOAD_BYTES,
+        LINUX_READ => args[1] != 0 && len <= args[2] as usize
+            && len <= FD_PAYLOAD_CAP,
+        LINUX_GETDENTS64 => args[1] != 0 && len <= DENTS_PAYLOAD_CAP,
+        _ => false,
+    }
+}
+
+/// E7 step 4 (the file class): the thirteen arms, each a TRANSLATION
+/// over the VFS — flag words into vfs flags, vfs errnos into CAP codes
+/// (cap_of), vfs results into the reply's own shape. `fds` is the
+/// caller's local copy of the task's table, written back by service
+/// like brk's ledger; `vt` is this task's VFS task. The console kind
+/// keeps its rule: write performs on the handle (service's own arm),
+/// read answers EAGAIN — this v1 has no console-input state (§10.13's
+/// named input class), and under-reporting readiness sends a caller
+/// back to its own loop rather than into an action built on a lie.
+fn answer_file<K: Kernel, A: BufferAlloc>(
+    num: u64,
+    args: &[u64; 6],
+    fds: &mut [FdSlot],
+    vt: u32,
+    vfs: &mut Vfs<K, A>,
+    payload: &[u8],
+) -> Answer {
+    /* The descriptor each fd-numbered arm looks up once: EBADF by the
+     * slot rule (guard M4's twin over the new table shape). The COPY
+     * matters — FdSlot is Copy, so an arm that flips a flag bit after
+     * the lookup (F_SETFD) mutates the table without a borrow of it
+     * still live. */
+    fn slot_of(fds: &[FdSlot], fd: u64) -> Result<FdSlot, i32> {
+        fd_slot(fds, fd).copied().ok_or(E_BADF)
+    }
+    match num {
+        /* read (0): file data crosses back as the reply's PAYLOAD —
+         * count-truth, the twin of write's attach (the kernel stages
+         * the destination at the first trap and copies only within the
+         * clamp; the deliver's rax is the payload's own length). The
+         * clamp rides IN the description (args[2]), so header, payload
+         * and the count the task sees are one truth. */
+        LINUX_READ => match slot_of(fds, args[0]) {
+            Ok(s) if s.kind == FD_KIND_CONSOLE => Answer::Reply(0, E_AGAIN),
+            Ok(s) => {
+                let want = (args[2] as usize).min(FD_PAYLOAD_CAP);
+                let mut buf = [0u8; FD_PAYLOAD_CAP];
+                match vfs.read(vt, s.vfs_fd, &mut buf[..want]) {
+                    Ok(n) => Answer::ReplyBytes(n as u64, n, buf),
+                    Err(e) => Answer::Reply(0, cap_of(e)),
+                }
+            }
+            Err(x) => Answer::Reply(0, x),
+        },
+        /* open (2): the measured flag contract (§5.6 — qemu -strace on
+         * the real candidate): O_RDONLY|O_LARGEFILE|O_CLOEXEC and
+         * O_WRONLY|O_CREAT|O_LARGEFILE|O_TRUNC|O_CLOEXEC, mode 0666;
+         * O_DIRECTORY selects the dir arm (opendir's shape — the VFS's
+         * plain open refuses a directory with EISDIR by design). Every
+         * bit outside the measured set is refused by NAME (ENOSYS) —
+         * never silently dropped — and the mode rides to the VFS
+         * untouched (create_file's own umask-less semantics). */
+        LINUX_OPEN => {
+            let Some(path) = path_arg(payload, 0) else {
+                return Answer::Reply(0, E_NOSYS); /* unterminated: service's
+                                                   * range let it through;
+                                                   * the NUL rule refuses */
+            };
+            let flags = args[1] as u32;
+            if flags & !LO_KNOWN != 0 || flags & 0x3 == 0x3 {
+                return Answer::Reply(0, E_NOSYS);
+            }
+            let want_dir = flags & LO_DIRECTORY != 0;
+            let cloexec = flags & LO_CLOEXEC != 0;
+            let mut vf: u16 = (flags & 0x3) as u16;
+            if flags & 0x40 != 0 { vf |= aerosls_vfs::O_CREAT; }
+            if flags & 0x80 != 0 { vf |= aerosls_vfs::O_EXCL; }
+            if flags & 0x200 != 0 { vf |= aerosls_vfs::O_TRUNC; }
+            if flags & 0x400 != 0 { vf |= aerosls_vfs::O_APPEND; }
+            /* O_LARGEFILE (0x8000) is accepted and IGNORED: off_t is
+             * 64-bit here, so the bit carries no information — musl
+             * ORs it into every open, and refusing it would refuse the
+             * candidate's first open by name. */
+            let opened = if want_dir {
+                vfs.open_dir(vt, path)
+            } else {
+                vfs.open(vt, path, vf, args[2] as u16)
+            };
+            match opened {
+                Ok(vfd) => {
+                    if cloexec {
+                        vfs.set_cloexec(vt, vfd, true).ok();
+                    }
+                    match alloc_fd(fds, FD_KIND_FILE, vfd, flags) {
+                        Ok(li) => Answer::Reply(li, STATUS_OK),
+                        Err(x) => {
+                            vfs.close(vt, vfd).ok(); /* mint failed: the
+                                                     * VFS fd goes back */
+                            Answer::Reply(0, x)
+                        }
+                    }
+                }
+                Err(e) => Answer::Reply(0, cap_of(e)),
+            }
+        }
+        /* close (3): the slot is spent on this side, the VFS fd on
+         * that side — the descriptor's two halves close together, and
+         * double-close is EBADF (the slot says so, as ever). */
+        LINUX_CLOSE => {
+            let i = args[0] as usize;
+            let Some(s) = fds.get(i).filter(|s| s.used) else {
+                return Answer::Reply(0, E_BADF);
+            };
+            if s.kind == FD_KIND_FILE {
+                if let Err(e) = vfs.close(vt, s.vfs_fd) {
+                    return Answer::Reply(0, cap_of(e));
+                }
+            }
+            fds[i].used = false;
+            Answer::Reply(0, STATUS_OK)
+        }
+        /* stat (4) / lstat (6): one VFS arm, two numbers. This VFS has
+         * no symlink follow at all (no symlink objects exist), so
+         * stat == lstat IS the truth, not a shortcut — and the reply
+         * carries the compact Stat (the kernel serializes musl's
+         * layout; this side never sees it). */
+        LINUX_STAT | LINUX_LSTAT => {
+            let Some(path) = path_arg(payload, 0) else {
+                return Answer::Reply(0, E_NOSYS);
+            };
+            match vfs.stat(vt, path) {
+                Ok(st) => {
+                    let mut buf = [0u8; FD_PAYLOAD_CAP];
+                    buf[..STAT_PAYLOAD_BYTES]
+                        .copy_from_slice(&stat_payload(&st));
+                    Answer::ReplyBytes(0, STAT_PAYLOAD_BYTES, buf)
+                }
+                Err(e) => Answer::Reply(0, cap_of(e)),
+            }
+        }
+        /* lseek (8): whence is Linux's own 0/1/2 — the VFS's SEEK_*
+         * constants ARE those numbers, so the word crosses untouched.
+         * A console slot is ESPIPE, the number Linux gives. SEEK_HOLE/
+         * SEEK_DATA (3/4) are not in the VFS's set and answer EINVAL —
+         * the census's two lseeks are both SEEK_CUR. */
+        LINUX_LSEEK => match slot_of(fds, args[0]) {
+            Ok(s) if s.kind == FD_KIND_FILE => {
+                match vfs.lseek(vt, s.vfs_fd, args[1] as i64, args[2] as u32) {
+                    Ok(off) => Answer::Reply(off, STATUS_OK),
+                    Err(e) => Answer::Reply(0, cap_of(e)),
+                }
+            }
+            Ok(_) => Answer::Reply(0, E_SPIPE),
+            Err(x) => Answer::Reply(0, x),
+        },
+        /* fcntl (72): the four answered commands — F_GETFD/F_SETFD
+         * over the slot's own cloexec bit (the VFS's u16 flag word
+         * cannot hold O_CLOEXEC; the bit lives HERE, which is the
+         * widening the design's flag table demanded), F_GETFL echoing
+         * the open flags, F_SETFL accepted only as the no-change ask
+         * (a changed flag is ENOSYS by name: the VFS mints flags at
+         * open and has no setter — a fabricated 0 would claim a
+         * semantics nothing performs). Everything else — F_DUPFD
+         * included — ENOSYS by name. */
+        LINUX_FCNTL => match slot_of(fds, args[0]) {
+            Ok(s) => match args[1] {
+                F_GETFD => Answer::Reply(
+                    if s.flags & LO_CLOEXEC != 0 { 1 } else { 0 },
+                    STATUS_OK),
+                F_SETFD => {
+                    let i = args[0] as usize;
+                    if args[2] & !1 != 0 {
+                        Answer::Reply(0, E_INVAL) /* FD_CLOEXEC is 0 or 1 */
+                    } else {
+                        if args[2] & 1 != 0 {
+                            fds[i].flags |= LO_CLOEXEC;
+                        } else {
+                            fds[i].flags &= !LO_CLOEXEC;
+                        }
+                        Answer::Reply(0, STATUS_OK)
+                    }
+                }
+                F_GETFL => Answer::Reply(
+                    (s.flags & !LO_CLOEXEC) as u64, STATUS_OK),
+                F_SETFL => {
+                    if (args[2] as u32) & !LO_CLOEXEC
+                        == (s.flags & !LO_CLOEXEC)
+                    {
+                        Answer::Reply(0, STATUS_OK) /* the no-change ask */
+                    } else {
+                        Answer::Reply(0, E_NOSYS)
+                    }
+                }
+                _ => Answer::Reply(0, E_NOSYS),
+            },
+            Err(x) => Answer::Reply(0, x),
+        },
+        /* fsync (74): the VFS's own rule — ramfs answers 0 (the
+         * shmem-faithful no-op; there is no device to flush and
+         * Linux's tmpfs fsync is a no-op), a device-backed slot answers
+         * ENOSYS by name until the block cache has a flush entry point
+         * (unreachable from the census's single fsync row, which lands
+         * on /tmp). */
+        LINUX_FSYNC => match slot_of(fds, args[0]) {
+            Ok(s) if s.kind == FD_KIND_FILE => {
+                match vfs.fsync(vt, s.vfs_fd) {
+                    Ok(()) => Answer::Reply(0, STATUS_OK),
+                    Err(e) => Answer::Reply(0, cap_of(e)),
+                }
+            }
+            Ok(_) => Answer::Reply(0, E_SPIPE),
+            Err(x) => Answer::Reply(0, x),
+        },
+        /* ftruncate (77): by fd, through the node's own (fs, ino) — a
+         * renamed path truncates the object the descriptor names, as
+         * POSIX requires (the VFS's truncate_at, not truncate(path)).
+         * The census's shape: ftruncate(fd, 67108864) after the sparse
+         * SEEK_CURs — the size lands exactly. */
+        LINUX_FTRUNCATE => match slot_of(fds, args[0]) {
+            Ok(s) if s.kind == FD_KIND_FILE => {
+                match vfs.truncate_at(vt, s.vfs_fd, args[1]) {
+                    Ok(()) => Answer::Reply(0, STATUS_OK),
+                    Err(e) => Answer::Reply(0, cap_of(e)),
+                }
+            }
+            Ok(_) => Answer::Reply(0, E_SPIPE),
+            Err(x) => Answer::Reply(0, x),
+        },
+        /* rename (82): both paths ride back to back; the split is the
+         * FIRST NUL, and each string is validated (NUL within cap,
+         * UTF-8) before either is used — the twin of the kernel's
+         * two-string attach. The VFS refuses a cross-mount rename and
+         * a rename onto a non-empty directory by its own rules (the
+         * design's named refusals, delivered through cap_of). */
+        LINUX_RENAME => {
+            let Some((old, new)) = path_pair(payload) else {
+                return Answer::Reply(0, E_NOSYS);
+            };
+            match vfs.rename(vt, old, new) {
+                Ok(()) => Answer::Reply(0, STATUS_OK),
+                Err(e) => Answer::Reply(0, cap_of(e)),
+            }
+        }
+        /* mkdir (83): the measured shape is mkdir(dir, 0777) with the
+         * EEXIST tolerated by the caller (create_dir_all's own retry) —
+         * so EEXIST must cross as 17, which is why the file class
+         * brought its own CAP codes (cap.h's (-13) family). */
+        LINUX_MKDIR => {
+            let Some(path) = path_arg(payload, 0) else {
+                return Answer::Reply(0, E_NOSYS);
+            };
+            match vfs.mkdir(vt, path, args[1] as u16) {
+                Ok(()) => Answer::Reply(0, STATUS_OK),
+                Err(e) => Answer::Reply(0, cap_of(e)),
+            }
+        }
+        /* unlink (87): the VFS's own rules (a directory is EISDIR, a
+         * missing name ENOENT — each crosses under its own number now).
+         * The census unlinks three pruned backups, all files. */
+        LINUX_UNLINK => {
+            let Some(path) = path_arg(payload, 0) else {
+                return Answer::Reply(0, E_NOSYS);
+            };
+            match vfs.unlink(vt, path) {
+                Ok(()) => Answer::Reply(0, STATUS_OK),
+                Err(e) => Answer::Reply(0, cap_of(e)),
+            }
+        }
+        /* getdents64 (217): the sidecar sends the LISTING (names,
+         * inodes, types) and the KERNEL packs the linux_dirent64
+         * records — d_reclen math stays kernel-side, the sidecar never
+         * sees a Linux layout (§5.6's trust boundary). args[5] is the
+         * kernel-staged cursor (the syscall's own three arguments leave
+         * that word unused): the tail from that entry index onward,
+         * capped by the payload bound so one reply cannot run unbounded
+         * — a short tail is POSIX-legal, the caller loops, and an empty
+         * tail is end-of-directory (0 bytes packed, 0 entries). */
+        LINUX_GETDENTS64 => match slot_of(fds, args[0]) {
+            Ok(s) if s.kind == FD_KIND_FILE => {
+                match vfs.read_dir_at(vt, s.vfs_fd, args[5]) {
+                    Ok(ents) => {
+                        let mut buf = [0u8; FD_PAYLOAD_CAP];
+                        let n = dents_payload(&ents, &mut buf);
+                        Answer::ReplyBytes(0, n, buf)
+                    }
+                    Err(e) => Answer::Reply(0, cap_of(e)),
+                }
+            }
+            Ok(_) => Answer::Reply(0, E_NOTDIR),
+            Err(x) => Answer::Reply(0, x),
+        },
+        /* Unreachable: service routes exactly the thirteen numbers
+         * here. ENOSYS keeps the no-silent-success rule total. */
+        _ => Answer::Reply(0, E_NOSYS),
+    }
+}
+
+/// Split the path payload at its NULs: one string for the single-path
+/// numbers, both strings for rename. Validated BY NAME — a missing NUL
+/// (the kernel's plan always attaches one) or a non-UTF-8 byte is
+/// refused rather than read past or lossily coerced; the cap is the
+/// kernel's own (LINUX_PATH_CAP per string, so a payload can never
+/// name more than the plan staged).
+fn path_arg(payload: &[u8], which: usize) -> Option<&str> {
+    let mut start = 0usize;
+    for _ in 0..which {
+        start += payload.get(start..)?.iter().position(|&b| b == 0)? + 1;
+    }
+    let rest = payload.get(start..)?;
+    let end = rest.iter().position(|&b| b == 0)?;
+    if end > LINUX_PATH_CAP {
+        return None;
+    }
+    core::str::from_utf8(&rest[..end]).ok()
+}
+
+fn path_pair(payload: &[u8]) -> Option<(&str, &str)> {
+    let old = path_arg(payload, 0)?;
+    let new = path_arg(payload, 1)?;
+    Some((old, new))
+}
+
+/// The compact Stat payload (the twin of LINUX_STAT_PAYLOAD_BYTES, the
+/// kernel's linux_stat_bytes reads these exact offsets): mode/uid/gid
+/// as the vfs::Stat carries them, size, and the one timestamp it has.
+fn stat_payload(st: &Stat) -> [u8; STAT_PAYLOAD_BYTES] {
+    let mut b = [0u8; STAT_PAYLOAD_BYTES];
+    b[0..2].copy_from_slice(&st.mode.to_le_bytes());
+    b[2..4].copy_from_slice(&st.uid.to_le_bytes());
+    b[4..6].copy_from_slice(&st.gid.to_le_bytes());
+    b[8..16].copy_from_slice(&st.size.to_le_bytes());
+    b[16..20].copy_from_slice(&st.mtime.to_le_bytes());
+    b
+}
+
+/// Linux d_type values (the kernel passes them through verbatim into
+/// linux_dirent64.d_type) — the vfs FileType's mapping, decided here
+/// once.
+fn dt_of(ty: FileType) -> u8 {
+    match ty {
+        FileType::Fifo => 1,  /* DT_FIFO */
+        FileType::Char => 2,  /* DT_CHR  */
+        FileType::Dir => 4,   /* DT_DIR  */
+        FileType::File => 8,  /* DT_REG  */
+    }
+}
+
+/// The directory-listing payload: u32 count, then per entry u64 ino,
+/// u8 ty (DT_*), u16 name_len, name bytes — the kernel's
+/// linux_dirent_pack reads this exact shape. Entries are appended until
+/// the payload cap would break mid-record: the tail continues on the
+/// next call (the kernel advances its cursor only by what it packed).
+fn dents_payload(ents: &[DirEnt], buf: &mut [u8; FD_PAYLOAD_CAP]) -> usize {
+    let mut off = 4usize;
+    let mut count = 0u32;
+    for e in ents {
+        let nl = e.name.len();
+        if nl == 0 || nl > 255 {
+            continue; /* a name the record format cannot carry */
+        }
+        let need = 11 + nl;
+        if off + need > DENTS_PAYLOAD_CAP {
+            break;
+        }
+        buf[off..off + 8].copy_from_slice(&e.ino.to_le_bytes());
+        buf[off + 8] = dt_of(e.ty);
+        buf[off + 9..off + 11].copy_from_slice(&(nl as u16).to_le_bytes());
+        buf[off + 11..off + 11 + nl].copy_from_slice(e.name.as_bytes());
+        off += need;
+        count += 1;
+    }
+    buf[0..4].copy_from_slice(&count.to_le_bytes());
+    off
+}
+
 /// One Linux-personality child whose forwards this sidecar answers. The
 /// registry is the spawn path's bookkeeping, not the kernel's: syscall 328
 /// hands back only the CALLER's channel handles, and the reaper needs a
@@ -821,6 +1385,10 @@ struct LinuxTask {
     name: [u8; 48],
     name_len: usize,
     partition: u32,
+    vfs_task: u32,  /* step 4: this task's VFS task id — the table the
+                     * thirteen file-class arms operate over. Allocated
+                     * at spawn (track's caller: the spawn path owns a
+                     * ProcManager), freed at exit beside the slot.     */
     fds: [FdSlot; LINUX_MAX_FDS],   /* increment 5: the task's fd table  */
     brk_base: u64,  /* increment 6: the §5.4 ledger — the span this side */
     brk_limit: u64, /* authored into the manifest and the kernel stamped */
@@ -846,7 +1414,8 @@ fn tasks() -> &'static mut [LinuxTask; MAX_LINUX_TASKS] {
         name: [0; 48],
         name_len: 0,
         partition: 0,
-        fds: [FdSlot { used: false, kind: 0 }; LINUX_MAX_FDS],
+        vfs_task: 0,
+        fds: [FdSlot { used: false, kind: 0, vfs_fd: 0, flags: 0 }; LINUX_MAX_FDS],
         brk_base: 0,
         brk_limit: 0,
         brk_cur: 0,
@@ -870,6 +1439,9 @@ pub fn track(
     partition: u32,
     heap_base: u64,
     heap_limit: u64,
+    vfs_task: u32,   /* step 4: the VFS task id the file-class arms
+                      * operate over — allocated by the spawn path
+                      * (it owns the ProcManager) before the track   */
 ) -> bool {
     let nlen = name.len().min(48);
     for t in tasks().iter_mut() {
@@ -882,6 +1454,7 @@ pub fn track(
         t.name[..nlen].copy_from_slice(&name.as_bytes()[..nlen]);
         t.name_len = nlen;
         t.partition = partition;
+        t.vfs_task = vfs_task;
         /* The §5.4 ledger is born with the task: the span the spawn
          * caller derived from the manifest it authored (the kernel's
          * create stamped its own copy from the same record — the two
@@ -908,7 +1481,7 @@ pub fn track(
          * accept writes (a tty is bidirectional; write(0) is not EBADF
          * on Linux), and the slots are what later increments grow by
          * open()'s hand. */
-        t.fds = [FdSlot { used: false, kind: 0 }; LINUX_MAX_FDS];
+        t.fds = [FdSlot { used: false, kind: 0, vfs_fd: 0, flags: 0 }; LINUX_MAX_FDS];
         for slot in t.fds.iter_mut().take(3) {
             slot.used = true;
             slot.kind = FD_KIND_CONSOLE;
@@ -976,8 +1549,8 @@ fn reply<K: Kernel>(k: &K, ch_w: u32, tag: u32, num: u64, ret: u64, status: i32)
 /// mid-call; dropping the reply costs nothing but the log line).
 fn reply_bytes<K: Kernel>(k: &K, ch_w: u32, tag: u32, num: u64, ret: u64,
                           bytes: &[u8]) {
-    let mut payload = [0u8; LINUX_SYSCALL_REQ_BYTES + SIGACT_BYTES];
-    debug_assert!(bytes.len() <= SIGACT_BYTES);
+    let mut payload = [0u8; LINUX_SYSCALL_REQ_BYTES + FD_PAYLOAD_CAP];
+    debug_assert!(bytes.len() <= FD_PAYLOAD_CAP);
     payload[0..8].copy_from_slice(&num.to_le_bytes());
     payload[56..64].copy_from_slice(&ret.to_le_bytes());
     payload[LINUX_SYSCALL_REQ_BYTES..LINUX_SYSCALL_REQ_BYTES + bytes.len()]
@@ -1089,7 +1662,11 @@ fn enosys_log(tag_num: u32, child: &[u8], extra: &[u8]) {
 /// name it, this function performs on it (increment 5), and the loop's own
 /// pump drains what lands there to the kernel console channel on the next
 /// pass, so a write becomes serial output without a second path.
-pub fn service<K: Kernel>(k: &K, console: &CharNode) {
+pub fn service<K: Kernel, A: BufferAlloc>(
+    k: &K,
+    console: &CharNode,
+    vfs: &mut Vfs<K, A>,
+) {
     for i in 0..MAX_LINUX_TASKS {
         if !tasks()[i].used {
             continue;
@@ -1106,7 +1683,7 @@ pub fn service<K: Kernel>(k: &K, console: &CharNode) {
          * Undersize would be ERR_BUFSZ — which does NOT consume the
          * message (transport spec §3.4) — so this capacity is what stops
          * a write from wedging its own channel. */
-        let mut buf = [0u8; LINUX_SYSCALL_REQ_BYTES + FD_PAYLOAD_CAP];
+        let mut buf = [0u8; LINUX_SYSCALL_REQ_BYTES + RECV_ATTACH_CAP];
         let mut slots = [GrantedCap::default(); 1];
         let rr = match k.recv(ch_r, &mut buf, &mut slots) {
             Ok(rr) => rr,
@@ -1118,6 +1695,12 @@ pub fn service<K: Kernel>(k: &K, console: &CharNode) {
              * come, and its channel slot is spent. Drop the registry entry
              * so a respawned child re-registers fresh. */
             aerosls_proto::CH_KIND_CLOSE => {
+                /* The child's end is gone: its VFS task goes with the
+                 * slot (step 4) — a respawned child re-registers and
+                 * re-allocates fresh, like every other piece of state. */
+                if let Some(vt) = tasks().get(i).filter(|t| t.used).map(|t| t.vfs_task) {
+                    let _ = vfs.exit_task(vt);
+                }
                 tasks()[i].used = false;
                 continue;
             }
@@ -1150,22 +1733,29 @@ pub fn service<K: Kernel>(k: &K, console: &CharNode) {
          * a wrong length, and a wrong length is the malformed arm:
          * num=0, which the kernel's echo check refuses -EPROTO — loud,
          * never a silent success and never bytes silently dropped. */
-        let expected = expected_req_len(num, &args);
+        let (lo, hi) = expected_req_range(num, &args);
         if num == LINUX_WRITE
-            && (args[2] as usize > FD_PAYLOAD_CAP || rr.len != expected)
+            && (args[2] as usize > FD_PAYLOAD_CAP || rr.len != lo)
         {
             enosys_log(num as u32, &name_buf[..nlen], b"[POSIX] write payload mismatch -> -EPROTO\n");
             reply(k, ch_w, rr.tag, 0, 0, E_NOSYS);
             continue;
         }
-        if rr.len != expected {
+        /* The path numbers carry a VARIABLE attach (a string's own
+         * length, both strings for rename) — a RANGE where every other
+         * number has one length. Its bounds are the twin of the
+         * kernel's path plan: at least one NUL's byte, at most the cap
+         * (two for rename); the arm below validates the NULs
+         * themselves, so an over-long or unterminated string is refused
+         * by name rather than read past. */
+        if rr.len < lo || rr.len > hi {
             enosys_log(0xBAD0, &name_buf[..nlen], b"[POSIX] malformed request -> -EPROTO\n");
             reply(k, ch_w, rr.tag, 0, 0, E_NOSYS);
             continue;
         }
         let payload: &[u8] = &buf[LINUX_SYSCALL_REQ_BYTES..rr.len];
 
-        let fds = tasks()[i].fds;
+        let mut fds = tasks()[i].fds;
         let mut mem = MemBrk {
             base: tasks()[i].brk_base,
             limit: tasks()[i].brk_limit,
@@ -1175,7 +1765,24 @@ pub fn service<K: Kernel>(k: &K, console: &CharNode) {
         let mut sigstate = tasks()[i].sig; /* Copy — the seam's ledger, */
                                            /* written back like brk's   */
 
-        let ans = answer(num, &args, &fds, &mut mem, &mut sigstate, payload);
+        /* E7 step 4 (the file class): the thirteen numbers route to the
+         * VFS bridge — every DECISION (rights, flags, errno) is the
+         * VFS's, and this module translates. Everything else stays the
+         * pure answer() it has always been; the fd table is written
+         * back like brk's ledger (each arm mutates only what it owns:
+         * open mints a slot, close spends it, fcntl flips one bit).
+         * read (0) joins the bridge here — the fd table lives in this
+         * module, so the fd class's read arm cannot stay kernel-side
+         * (its data crosses back as the reply's payload, count-truth). */
+        let ans = match num {
+            LINUX_READ | LINUX_OPEN | LINUX_CLOSE | LINUX_STAT | LINUX_LSTAT
+            | LINUX_LSEEK | LINUX_FCNTL | LINUX_FSYNC | LINUX_FTRUNCATE
+            | LINUX_RENAME | LINUX_MKDIR | LINUX_UNLINK | LINUX_GETDENTS64 =>
+                answer_file(num, &args, &mut fds, tasks()[i].vfs_task, vfs,
+                            payload),
+            _ => answer(num, &args, &fds, &mut mem, &mut sigstate, payload),
+        };
+        tasks()[i].fds = fds;
         /* The ledger survives the reply: only a granted growth moves it
          * (the arm's own rule), and the KERNEL's brk_cur is its own
          * twin — the probe's denial-echo check is what proves the two
@@ -1277,12 +1884,12 @@ pub fn service<K: Kernel>(k: &K, console: &CharNode) {
                  * deliver's staged-len check, neither end load-bearing
                  * alone. The deliver performs the copy (the kernel owns
                  * the child's pages); this side only decides the bytes. */
-                let want = if num == LINUX_RT_SIGACTION {
-                    SIGACT_BYTES
-                } else {
-                    SIGSET_BYTES as usize
-                };
-                if args[2] == 0 || len != want || len > bytes.len() {
+                /* The bound is now per-number (the sig class's exact
+                 * size, stat's compact 24, read's own count, getdents'
+                 * cap) — payload_bound derives it from the same words
+                 * the kernel's reply plan stages, so a drifted clamp
+                 * arrives here as a mismatch and goes out as num=0. */
+                if !payload_bound(num, &args, len) || len > bytes.len() {
                     enosys_log(0xBAD1, &name_buf[..nlen],
                                b"[POSIX] reply payload mismatch -> -EPROTO\n");
                     reply(k, ch_w, rr.tag, 0, 0, E_NOSYS);
@@ -1365,6 +1972,7 @@ pub fn service<K: Kernel>(k: &K, console: &CharNode) {
                      * No reply: the task will never run again, and its
                      * channel goes with its table. */
                     k.proc_kill(pid);
+                    let _ = vfs.exit_task(tasks()[i].vfs_task);
                     tasks()[i].used = false;
                 }
             }
@@ -1392,6 +2000,7 @@ pub fn service<K: Kernel>(k: &K, console: &CharNode) {
                     reply(k, ch_w, rr.tag, num, 0, E_CONFLICT);
                 } else {
                     k.proc_kill(pid);
+                    let _ = vfs.exit_task(tasks()[i].vfs_task);
                     tasks()[i].used = false;
                 }
             }
@@ -1412,7 +2021,7 @@ mod tests {
     use super::*;
 
     fn fds() -> [FdSlot; LINUX_MAX_FDS] {
-        [FdSlot { used: false, kind: 0 }; LINUX_MAX_FDS]
+        [FdSlot { used: false, kind: 0, vfs_fd: 0, flags: 0 }; LINUX_MAX_FDS]
     }
     fn ledger() -> MemBrk {
         MemBrk { base: 0, limit: 0, cur: 0, mtop: 0 }

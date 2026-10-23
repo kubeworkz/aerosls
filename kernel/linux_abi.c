@@ -53,6 +53,17 @@ int32_t linux_errno_from_cap(int32_t cap_code)
     case CAP_ERANGE:                 return -LINUX_ERANGE;
     case CAP_ENOSYS:                 return -LINUX_ENOSYS;
     case CAP_ECONFLICT:              return -LINUX_EBUSY;      /* state conflict */
+    /* ── E7 file class (step 4): the VFS's own failures, each its own
+     * code so a mkdir's EEXIST reaches the task as 17 and not as a
+     * generic EIO the caller cannot branch on (cap.h's (-13)..(-20)). */
+    case CAP_EEXIST:                 return -LINUX_EEXIST;
+    case CAP_ENOTDIR:                return -LINUX_ENOTDIR;
+    case CAP_EISDIR:                 return -LINUX_EISDIR;
+    case CAP_EACCES:                 return -LINUX_EACCES;
+    case CAP_EROFS:                  return -LINUX_EROFS;
+    case CAP_ESPIPE:                 return -LINUX_ESPIPE;
+    case CAP_ENOTEMPTY:              return -LINUX_ENOTEMPTY;
+    case CAP_ENAMETOOLONG:           return -LINUX_ENAMETOOLONG;
     case CAP_EPERM:                  return -LINUX_EPERM;
     default:
         /* CAP_NONE (0xFFFF, the out-param sentinel) and anything else that
@@ -81,6 +92,16 @@ int32_t cap_code_from_linux_errno(int32_t linux_errno)
     case -LINUX_ENOBUFS:   return CAP_ERR_SPACE;
     case -LINUX_EPROTO:    return CAP_ERR_PROTO;
     case -LINUX_ETIMEDOUT: return CAP_ERR_TIMEOUT;
+    /* E7 file class: each new code has exactly ONE preimage, so each
+     * reverse is defined — the round-trip the host test pins. */
+    case -LINUX_EEXIST:    return CAP_EEXIST;
+    case -LINUX_ENOTDIR:   return CAP_ENOTDIR;
+    case -LINUX_EISDIR:    return CAP_EISDIR;
+    case -LINUX_EACCES:    return CAP_EACCES;
+    case -LINUX_EROFS:     return CAP_EROFS;
+    case -LINUX_ESPIPE:    return CAP_ESPIPE;
+    case -LINUX_ENOTEMPTY: return CAP_ENOTEMPTY;
+    case -LINUX_ENAMETOOLONG: return CAP_ENAMETOOLONG;
     default:               return 0;   /* no unique preimage (or not an error) */
     }
 }
@@ -639,34 +660,255 @@ int linux_user_copy_in(const uint8_t *src, uint64_t root, uint64_t va,
 struct LinuxFdReplyPlan linux_fd_reply_plan(uint64_t num, const uint64_t args[6])
 {
     struct LinuxFdReplyPlan p;
-    uint64_t span_end;
+    uint64_t span_bytes;
 
     p.dst = 0;
     p.len = 0;
+    p.aux = 0;
+    p.kind = LINUX_STAGE_NONE;
     p.refuse = 0;
-    if (num != LINUX_RT_SIGACTION && num != LINUX_RT_SIGPROCMASK)
-        return p;   /* not a copy-IN number */
     if (!args) return p;
-    if (args[2] == 0) return p;   /* no out-pointer: nothing is owed back */
 
-    p.dst = args[2];
-    p.len = (num == LINUX_RT_SIGACTION) ? LINUX_SIGACT_BYTES
-                                        : LINUX_SIGSET_BYTES;
-    /* The write plan's shape, on the other direction: the WHOLE span
-     * must sit in the user-canonical range or the first trap says
-     * -EFAULT — before any post, so a bad destination is a refusal the
-     * channel never sees (and the staged VA below can never be one). */
-    span_end = p.dst + (uint64_t)p.len;
-    if (!linux_fs_addr_is_user_canonical(p.dst) || span_end < p.dst ||
-        (span_end - 1) > LINUX_USER_ADDR_MAX) {
-        p.refuse = -LINUX_EFAULT;
+    /* The sig class — increment 12's copy-IN, unchanged in shape, now
+     * named as the RAW family (the payload lands verbatim). */
+    if (num == LINUX_RT_SIGACTION || num == LINUX_RT_SIGPROCMASK) {
+        if (args[2] == 0) return p;   /* no out-pointer: nothing owed */
+        p.dst  = args[2];
+        p.len  = (num == LINUX_RT_SIGACTION) ? LINUX_SIGACT_BYTES
+                                             : LINUX_SIGSET_BYTES;
+        p.aux  = p.len;
+        p.kind = LINUX_STAGE_RAW;
+    } else if (num == LINUX_STAT || num == LINUX_LSTAT) {
+        /* stat/lstat: the out-pointer is args[1] (statbuf), the payload
+         * the COMPACT Stat (24 bytes — the sidecar never sees musl's
+         * layout) and the child-side write the serialized 144 bytes.
+         * A NULL statbuf is not refused here: the copy-in's page walk
+         * fails it as -EFAULT at the deliver, the same posture write
+         * and read take over a NULL buffer. */
+        p.dst  = args[1];
+        p.len  = LINUX_STAT_PAYLOAD_BYTES;
+        p.aux  = LINUX_STAT_BYTES;
+        p.kind = LINUX_STAGE_STAT;
+    } else if (num == LINUX_GETDENTS64) {
+        /* getdents64(fd, buf, count): a count too small for even the
+         * "." record is EINVAL at the first trap (Linux's own rule —
+         * the caller's buffer can never hold one record, so the call
+         * cannot succeed); the child-side write is the count itself,
+         * capped so one oversized ask cannot make the deliver's local
+         * (or the caller's patience) unbounded. */
+        if (args[2] < LINUX_DIRENT_MIN_RECLEN)
+            p.refuse = -LINUX_EINVAL;
+        p.dst  = args[1];
+        p.len  = LINUX_DENTS_PAYLOAD_CAP;
+        p.aux  = args[2] < LINUX_DIRENT_USER_CAP
+                     ? (uint32_t)args[2] : LINUX_DIRENT_USER_CAP;
+        p.kind = LINUX_STAGE_DENTS;
+    } else if (num == LINUX_READ) {
+        /* read(fd, buf, count) — count-truth's own rule, mirrored from
+         * write: a count-0 read plans NOTHING before canonicality,
+         * because inventing -EFAULT there would be a rule no kernel the
+         * candidate was compiled against has (read(fd, NULL, 0) is a
+         * legal no-op on Linux). The clamp rides IN the description as
+         * write's does: header, payload and the count the task sees are
+         * one truth. */
+        if (args[2] == 0) return p;
+        p.dst  = args[1];
+        p.len  = (args[2] < LINUX_FD_WRITE_CHUNK) ? (uint32_t)args[2]
+                                                   : LINUX_FD_WRITE_CHUNK;
+        p.aux  = p.len;
+        p.kind = LINUX_STAGE_RAW;
+    } else {
+        return p;   /* not a reply-payload number (total function) */
+    }
+
+    /* The write plan's shape, over the IN direction: the WHOLE span the
+     * deliver may write must sit in the user-canonical range or the
+     * first trap says -EFAULT — before any post, so a bad destination is
+     * a refusal the channel never sees (and the staged VA below can
+     * never be one). Checked against AUX — the child-side bytes — which
+     * for stat (144) and getdents (up to 2048) is larger than the
+     * payload clamp. */
+    span_bytes = p.aux;
+    {
+        uint64_t span_end = p.dst + span_bytes;
+        if (!linux_fs_addr_is_user_canonical(p.dst) || span_end < p.dst ||
+            (span_bytes && (span_end - 1) > LINUX_USER_ADDR_MAX)) {
+            p.refuse = -LINUX_EFAULT;
+        }
     }
     return p;
+}
+
+/* The path plan (step 4): open/stat/lstat/unlink/mkdir carry ONE
+ * pathname out of the child, rename TWO. The plan stays a pure
+ * CLASSIFIER over (num, args) — which register names a path, how many
+ * of them — because measuring a string means touching the child's
+ * bytes, and that needs the page walker and a cr3. The bytes are
+ * measured below, at the attach, by linux_path_measure (first-trap
+ * still: everything happens before the post). */
+struct LinuxFdPathPlan linux_fd_path_plan(uint64_t num, const uint64_t args[6])
+{
+    struct LinuxFdPathPlan p;
+
+    p.src = 0;
+    p.src2 = 0;
+    p.two = 0;
+    p.refuse = 0;
+    if (num != LINUX_RENAME && num != LINUX_OPEN && num != LINUX_STAT &&
+        num != LINUX_LSTAT && num != LINUX_UNLINK && num != LINUX_MKDIR) {
+        return p;   /* this number carries no path (total function) */
+    }
+    if (!args) return p;
+    p.src  = args[0];
+    p.two  = (num == LINUX_RENAME);
+    p.src2 = p.two ? args[1] : 0;
+    return p;
+}
+
+/* Measure one path string in the child's memory: walk for the NUL
+ * one byte at a time through the SAME copy-out walker every attach uses
+ * (present, user, 4 KiB rules — it never faults over a tenant pointer),
+ * and hand back the string's length INCLUDING the NUL. No buffer: the
+ * byte is a local, so the frame cost is a word regardless of cap. A
+ * span that cannot be read is -LINUX_EFAULT; no NUL within `cap` is
+ * -LINUX_ENAMETOOLONG — the shim's named divergence from PATH_MAX,
+ * refused by name rather than truncated, both before any post. */
+int linux_path_measure(uint64_t root, uint64_t va, uint32_t cap,
+                       uint32_t *out_len)
+{
+    uint32_t got = 0;
+    while (got < cap) {
+        uint8_t b = 0;
+        if (linux_user_copy_out(&b, root, va + got, 1) != 0)
+            return -LINUX_EFAULT;
+        got++;
+        if (b == 0) {
+            if (out_len) *out_len = got;
+            return 0;
+        }
+    }
+    return -LINUX_ENAMETOOLONG;
+}
+
+/* LE readers over a channel payload (the deliver's idiom, repeated: the
+ * sidecar's compact Stat is a byte stream, never aliased as a struct). */
+static uint16_t lab_rd_u16(const uint8_t *b)
+{
+    return (uint16_t)(b[0] | ((uint16_t)b[1] << 8));
+}
+
+static uint64_t lab_rd_u64(const uint8_t *b)
+{
+    uint64_t v = 0;
+    int i;
+    for (i = 7; i >= 0; i--) v = (v << 8) | b[i];
+    return v;
+}
+
+static uint32_t lab_rd_u32(const uint8_t *b)
+{
+    return (uint32_t)b[0] | ((uint32_t)b[1] << 8) |
+           ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+}
+
+static void lab_wr_u64(uint8_t *b, uint64_t v)
+{
+    int i;
+    for (i = 0; i < 8; i++) { b[i] = (uint8_t)(v & 0xFF); v >>= 8; }
+}
+
+void linux_stat_bytes(const uint8_t *src, uint8_t *dst)
+{
+    uint64_t size;
+    uint32_t mtime;
+    int i;
+
+    for (i = 0; i < (int)LINUX_STAT_BYTES; i++) dst[i] = 0;
+    size  = lab_rd_u64(src + 8);
+    mtime = (uint32_t)lab_rd_u64(src + 16);   /* u32 at payload @16 */
+    /* Fields the VFS carries: the truth, at musl's offsets. */
+    lab_wr_u64(dst + 8, 0);                   /* st_ino: not carried → 0 */
+    lab_wr_u64(dst + 16, 1);                  /* st_nlink: 1 (v1)        */
+    {
+        uint32_t mode = lab_rd_u16(src + 0);
+        uint32_t uid  = lab_rd_u16(src + 2);
+        uint32_t gid  = lab_rd_u16(src + 4);
+        for (i = 0; i < 4; i++) {
+            dst[LINUX_STAT_OFF_MODE + i] = (uint8_t)(mode >> (8 * i));
+            dst[LINUX_STAT_OFF_UID  + i] = (uint8_t)(uid  >> (8 * i));
+            dst[LINUX_STAT_OFF_GID  + i] = (uint8_t)(gid  >> (8 * i));
+        }
+    }
+    lab_wr_u64(dst + LINUX_STAT_OFF_SIZE, size);
+    lab_wr_u64(dst + 56, 4096);               /* st_blksize              */
+    lab_wr_u64(dst + 64, (size + 511) / 512); /* st_blocks derived       */
+    lab_wr_u64(dst + 72, mtime);              /* st_atim: echoes mtime   */
+    lab_wr_u64(dst + LINUX_STAT_OFF_MTIME, mtime);
+    lab_wr_u64(dst + 104, mtime);             /* st_ctim: echoes mtime   */
+}
+
+int linux_dirent_pack(const uint8_t *src, uint32_t n, uint32_t count_cap,
+                      uint64_t dir_pos, uint8_t *dst, uint32_t *fitted)
+{
+    uint32_t count;
+    uint32_t off = 4;
+    uint32_t packed = 0;
+    uint32_t i;
+
+    if (fitted) *fitted = 0;
+    if (n < 4) return -1;
+    count = lab_rd_u32(src);                  /* u32 LE at @0 */
+    for (i = 0; i < count; i++) {
+        uint64_t ino;
+        uint8_t ty;
+        uint16_t name_len;
+        uint16_t reclen;
+        uint8_t *rec;
+        uint32_t j;
+
+        if (off + 11 > n) return -1;
+        ino      = lab_rd_u64(src + off);
+        ty       = src[off + 8];
+        name_len = lab_rd_u16(src + off + 9);
+        off += 11;
+        if (off + name_len > n) return -1;
+        if (name_len == 0 || name_len > 255) return -1;
+        if (i < dir_pos) {                    /* already given out       */
+            off += name_len;
+            continue;
+        }
+        reclen = (uint16_t)((19u + name_len + 1u + 7u) & ~7u);
+        if (packed + reclen > count_cap) break;  /* caller loops         */
+        rec = dst + packed;
+        lab_wr_u64(rec, ino);                 /* d_ino                   */
+        lab_wr_u64(rec + 8, i + 1);           /* d_off: the entry's own
+                                               * cookie (index + 1)      */
+        for (j = 0; j < 2; j++)
+            rec[16 + j] = (uint8_t)(reclen >> (8 * j));
+        rec[18] = ty;                         /* d_type: DT_* pass-thru  */
+        for (j = 0; j < name_len; j++) rec[19 + j] = src[off + j];
+        rec[19 + name_len] = 0;
+        for (j = 19u + name_len + 1u; j < reclen; j++) rec[j] = 0;
+        packed += reclen;
+        off += name_len;
+        if (fitted) *fitted += 1;
+    }
+    return (int)packed;
 }
 
 int linux_reply_shape_ok(uint64_t num, uint64_t ret, uint32_t n)
 {
     if (num == LINUX_READ) return ret == (uint64_t)n;
+    /* stat/lstat: success with EXACTLY the compact Stat — a payload the
+     * serializer cannot parse is a protocol break, refused before any
+     * byte is written (the twin of service()'s own bound). */
+    if (num == LINUX_STAT || num == LINUX_LSTAT)
+        return ret == 0 && n == LINUX_STAT_PAYLOAD_BYTES;
+    /* getdents64: success; the byte count the child sees is the
+     * KERNEL's packing result, never the sidecar's number — so ret is 0
+     * here and the deliver overwrites rax with what was packed. */
+    if (num == LINUX_GETDENTS64)
+        return ret == 0 && n <= LINUX_DENTS_PAYLOAD_CAP;
     return ret == 0;
 }
 

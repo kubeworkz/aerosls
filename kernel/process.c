@@ -163,6 +163,14 @@ static void proc_clear_resume_state(struct ProcessDescriptor* pd) {
     pd->reply_stage_va = 0;
     pd->reply_stage_len = 0;
     pd->reply_stage_valid = 0;
+    /* E7 step 4 (the file class): the stage's KIND and child-side clamp
+     * clear with the rest of the stage, and the getdents64 cursor dies
+     * with the slot — a successor task starts no listing its predecessor
+     * began (one cursor per slot, reset where every other piece of
+     * per-task state resets). */
+    pd->reply_stage_kind = 0;
+    pd->reply_stage_aux = 0;
+    pd->linux_dir_pos = 0;
 }
 
 /* E7 (increment 2): read this CPU's captured Linux argument registers.

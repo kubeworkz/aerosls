@@ -293,6 +293,23 @@ impl<K: Kernel, A: BufferAlloc> Fs<K, A> {
             Fs::Dev(_) => Err(Errno::ERofs),
         }
     }
+    /// fsync(2) at the fs level (E7 step 4): the rule lives with the
+    /// device that could (or could not) make it true. ramfs is core
+    /// memory — there is no device to flush, and Linux's own tmpfs fsync
+    /// is a no-op, so 0 IS the shmem-faithful answer (durability of core
+    /// memory across a host failure is claimed by neither side; across
+    /// restore it is v0.2's CONTENTS question). A device-backed fs
+    /// answers ENOSYS BY NAME until the block cache exposes a flush
+    /// entry point — a fabricated 0 here would claim a durability this
+    /// cache does not promise, which is exactly the placeholder failure
+    /// the honesty rules exist to refuse.
+    fn fsync(&mut self, _ino: u64) -> Result<(), Errno> {
+        match self {
+            Fs::Aerofs(_) => Err(Errno::ENosys),
+            Fs::Ram(_) => Ok(()),
+            Fs::Dev(_) => Err(Errno::ENosys),
+        }
+    }
     fn stat(&mut self, ino: u64) -> Result<Stat, Errno> {
         match self {
             Fs::Aerofs(f) => f.stat(ino),
@@ -2902,6 +2919,113 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
         let fs = self.fs_mut(fs_idx)?;
         let parent = fs.lookup(&rel[..rel.len() - 1])?;
         fs.unlink(parent.0, rel.last().unwrap())
+    }
+
+    // ── E7 step 4 (the file class): the four arms `open`/`read_dir`/
+    //    `truncate` do not cover. Every decision stays in this layer —
+    //    the sidecar's linux.rs translates, it never re-implements.
+
+    /// `open(2)` on a DIRECTORY — opendir's own shape (the census's
+    /// `open(dir, O_RDONLY|O_DIRECTORY)` row). The regular `open`
+    /// refuses a directory with EISDIR because every read/write arm
+    /// below assumes a regular file's bytes; this method mints the
+    /// directory fd its own way: the SAME `FileObj::File` node (fs,
+    /// fs_id, ino, offset) so `read_dir_at` can resolve it, READ rights
+    /// checked against the node's mode like any open, and a non-dir
+    /// path refused ENOTDIR (Linux's own number for the wrong node).
+    pub fn open_dir(&mut self, task: u32, path: &str) -> Result<u32, Errno> {
+        let full = self.full_path(task, path)?;
+        let (fs_idx, rel) = self.resolve(&full)?;
+        let (ino, ty) = {
+            let fs = self.fs_mut(fs_idx)?;
+            fs.lookup(&rel)?
+        };
+        if ty != FileType::Dir {
+            return Err(Errno::ENotdir);
+        }
+        let st = {
+            let fs = self.fs_mut(fs_idx)?;
+            fs.stat(ino)?
+        };
+        self.check_open_perms(R, st, task)?;
+        let fs_id = self.fss[fs_idx].id();
+        let node = Arc::new(FileObj::File(FileNode {
+            fs: fs_idx,
+            fs_id,
+            ino,
+            offset: Cell::new(0),
+        }));
+        let fd = {
+            let idx = self.task_mut(task)?.fds;
+            self.table_pool[idx].alloc(FdEntry {
+                node,
+                rights: R,
+                flags: O_RDONLY,
+                cloexec: false,
+            })?
+        };
+        Ok(fd)
+    }
+
+    /// getdents64's VFS half: the tail of a directory fd's listing from
+    /// entry index `from`. The KERNEL owns the cursor — it advances the
+    /// staged `linux_dir_pos` only by records it actually packed — so
+    /// this is a fresh slice and never a stored position: a directory
+    /// mutated between calls re-lists, and the index skips what the
+    /// caller already saw (the honest v1 boundary, named). Names, inodes
+    /// and types only: the `linux_dirent64` layout — d_reclen math,
+    /// d_off cookies, NUL padding — is the kernel's to lay out (§5.6:
+    /// the sidecar never sees a Linux layout).
+    pub fn read_dir_at(
+        &mut self,
+        task: u32,
+        fd: u32,
+        from: u64,
+    ) -> Result<Vec<DirEnt>, Errno> {
+        let obj = {
+            let idx = self.task_mut(task)?.fds;
+            let e = self.table_pool[idx].get(fd).ok_or(Errno::EBadf)?;
+            e.node.clone()
+        };
+        let FileObj::File(node) = &*obj else {
+            return Err(Errno::ENotdir);
+        };
+        let fs = self.fs_mut_id(node.fs, node.fs_id)?;
+        let all = fs.read_dir(node.ino)?;
+        Ok(all.into_iter().skip(from as usize).collect())
+    }
+
+    /// `ftruncate(2)` by fd: through the node's own (fs, ino) — the path
+    /// never re-resolves, so a descriptor keeps naming the object it
+    /// opened even if the path was renamed under it (POSIX's rule).
+    pub fn truncate_at(&mut self, task: u32, fd: u32, len: u64) -> Result<(), Errno> {
+        let obj = {
+            let idx = self.task_mut(task)?.fds;
+            let e = self.table_pool[idx].get(fd).ok_or(Errno::EBadf)?;
+            e.node.clone()
+        };
+        let FileObj::File(node) = &*obj else {
+            return Err(Errno::ESPipe); /* pipes/devices/sockets: ESPIPE,
+                                       * the number Linux gives           */
+        };
+        let fs = self.fs_mut_id(node.fs, node.fs_id)?;
+        fs.truncate(node.ino, len)
+    }
+
+    /// `fsync(2)` by fd: validate the descriptor names a file, then the
+    /// fs's own rule (ramfs: the shmem-faithful 0; device-backed: ENOSYS
+    /// by name — see `Fs::fsync`).
+    pub fn fsync(&mut self, task: u32, fd: u32) -> Result<(), Errno> {
+        let obj = {
+            let idx = self.task_mut(task)?.fds;
+            let e = self.table_pool[idx].get(fd).ok_or(Errno::EBadf)?;
+            e.node.clone()
+        };
+        let FileObj::File(node) = &*obj else {
+            return Err(Errno::ESPipe);
+        };
+        let fs = self.fs_mut_id(node.fs, node.fs_id)?;
+        fs.fsync(node.ino)
     }
 
     pub fn rmdir(&mut self, task: u32, path: &str) -> Result<(), Errno> {

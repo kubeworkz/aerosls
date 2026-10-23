@@ -218,6 +218,23 @@ struct ProcessDescriptor {
                                        // top of every first-trap block, consumed
                                        // and cleared at the apply, and cleared at
                                        // slot reuse beside the other stages.
+    uint8_t    reply_stage_kind;       // E7 step 4 (the file class): LINUX_STAGE_*
+                                       // — what the deliver does with the payload
+                                       // before the copy-in (RAW verbatim, STAT
+                                       // serialized, DENTS packed). Consumed and
+                                       // cleared with the rest of the stage.
+    uint32_t   reply_stage_aux;        // the CHILD-side clamp the plan staged
+                                       // (bytes the deliver may write at
+                                       // reply_stage_va — 144 for stat, the
+                                       // child's count for getdents64)
+    uint64_t   linux_dir_pos;          // step 4's getdents64 cursor: the ENTRY
+                                       // INDEX the next call starts at, advanced
+                                       // by the deliver only by records actually
+                                       // packed (a short getdents is POSIX-legal;
+                                       // the caller loops). Reset when this task
+                                       // opens a new path (one listing at a time
+                                       // — named v1 boundary) and at slot reuse.
+                                       // SLS and non-Linux tasks never read it.
     uint64_t   user_rip;              // entry point in user space
     uint64_t   user_rsp;              // current user-space stack pointer
     uint64_t   user_stack_vaddr;      // vaddr base of the 8-page user stack

@@ -454,17 +454,28 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         // proof, not a dependency of this sidecar's own boot.
         match crate::e7_probe::spawn(&RealKernel, caps.budget_base, caps.budget_len) {
             Ok(sp) => {
-                if crate::linux::track(
-                    sp.ch_r,
-                    sp.ch_w,
-                    crate::e7_probe::PROBE_NAME,
-                    0,
-                    sp.heap_base,
-                    sp.heap_limit,
-                ) {
-                    klog(b"[E7] probe: spawned ch_r=", sp.ch_r, b"");
-                } else {
-                    klog(b"[E7] probe: spawned but TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+                /* E7 step 4: each Linux child gets its own VFS task —
+                 * the table the file-class arms operate over (a failure
+                 * is logged, never fatal, like every other spawn step:
+                 * an untracked child parks unanswered, and its guard
+                 * line says so). */
+                match booted.proc.vfs.add_task() {
+                    Ok(vt) => {
+                        if crate::linux::track(
+                            sp.ch_r,
+                            sp.ch_w,
+                            crate::e7_probe::PROBE_NAME,
+                            0,
+                            sp.heap_base,
+                            sp.heap_limit,
+                            vt,
+                        ) {
+                            klog(b"[E7] probe: spawned ch_r=", sp.ch_r, b"");
+                        } else {
+                            klog(b"[E7] probe: spawned but TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+                        }
+                    }
+                    Err(_) => klog(b"[E7] probe: VFS task alloc FAILED ch_r=", sp.ch_r, b""),
                 }
             }
             Err(rc) => klog(b"[E7] probe: spawn FAILED rc=", rc as u32, b""),
@@ -478,17 +489,23 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         // run). Like the probe: logged, never fatal.
         match crate::e7_candidate::spawn(&RealKernel, caps.budget_base, caps.budget_len) {
             Ok(sp) => {
-                if crate::linux::track(
-                    sp.ch_r,
-                    sp.ch_w,
-                    crate::e7_candidate::CAND_NAME,
-                    0,
-                    sp.heap_base,
-                    sp.heap_limit,
-                ) {
-                    klog(b"[E7] candidate: spawned ch_r=", sp.ch_r, b"");
-                } else {
-                    klog(b"[E7] candidate: spawned but TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+                match booted.proc.vfs.add_task() {
+                    Ok(vt) => {
+                        if crate::linux::track(
+                            sp.ch_r,
+                            sp.ch_w,
+                            crate::e7_candidate::CAND_NAME,
+                            0,
+                            sp.heap_base,
+                            sp.heap_limit,
+                            vt,
+                        ) {
+                            klog(b"[E7] candidate: spawned ch_r=", sp.ch_r, b"");
+                        } else {
+                            klog(b"[E7] candidate: spawned but TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+                        }
+                    }
+                    Err(_) => klog(b"[E7] candidate: VFS task alloc FAILED ch_r=", sp.ch_r, b""),
                 }
             }
             Err(rc) => klog(b"[E7] candidate: spawn FAILED rc=", rc as u32, b""),
@@ -505,17 +522,23 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         // the pair above: logged, never fatal.
         match crate::e7_firstuser::spawn(&RealKernel, caps.budget_base, caps.budget_len) {
             Ok(sp) => {
-                if crate::linux::track(
-                    sp.ch_r,
-                    sp.ch_w,
-                    crate::e7_firstuser::USER_NAME,
-                    0,
-                    sp.heap_base,
-                    sp.heap_limit,
-                ) {
-                    klog(b"[E7] firstuser: spawned ch_r=", sp.ch_r, b"");
-                } else {
-                    klog(b"[E7] firstuser: spawned but TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+                match booted.proc.vfs.add_task() {
+                    Ok(vt) => {
+                        if crate::linux::track(
+                            sp.ch_r,
+                            sp.ch_w,
+                            crate::e7_firstuser::USER_NAME,
+                            0,
+                            sp.heap_base,
+                            sp.heap_limit,
+                            vt,
+                        ) {
+                            klog(b"[E7] firstuser: spawned ch_r=", sp.ch_r, b"");
+                        } else {
+                            klog(b"[E7] firstuser: spawned but TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+                        }
+                    }
+                    Err(_) => klog(b"[E7] firstuser: VFS task alloc FAILED ch_r=", sp.ch_r, b""),
                 }
             }
             Err(rc) => klog(b"[E7] firstuser: spawn FAILED rc=", rc as u32, b""),
@@ -554,7 +577,7 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         // the parked sidecar's quiesce wait set includes these channels
         // (linux::append_wait), so a forward wakes this loop instead of
         // spinning it.
-        crate::linux::service(&RealKernel, &booted.console);
+        crate::linux::service(&RealKernel, &booted.console, &mut booted.proc.vfs);
         booted.proc.drain_wakes();
         // One-shot boot diagnostic: report what task 0 (init) did and how
         // many tasks are live, so a quiet boot can be told apart from a

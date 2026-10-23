@@ -152,6 +152,28 @@
 #define CAP_VIEW_MAX_PAGES   4096  /* 12-bit len field in the cap word */
 
 /* ─── Errors (errno-style negative codes, widened through do_syscall's ABI) ─ */
+/* E7 increment (the file class, §5.6): the VFS's own failures that the
+ * existing codes cannot name. A wrong NUMBER here would surface as the
+ * wrong errno in a tenant binary's error path, so each failure is its own
+ * code — mapped forward by linux_errno_from_cap and back by the unique-
+ * preimage rule (each below has exactly one code, so its reverse is
+ * defined). The family continues at (-13); tools/aeroidl/tests/
+ * cross_lang_constants.rs pins both halves. */
+#define CAP_EEXIST      (-13)   /* mkdir on a name that exists (EEXIST)     */
+#define CAP_ENOTDIR     (-14)   /* a path component — or the fd — is not a
+                                 * directory (ENOTDIR)                      */
+#define CAP_EISDIR      (-15)   /* a directory where a file was required
+                                 * (EISDIR)                                 */
+#define CAP_EACCES      (-16)   /* the object exists but its mode bits or
+                                 * the task's credentials say no (EACCES).
+                                 * Distinct from CAP_EPERM, which is
+                                 * authority this kernel itself denies      */
+#define CAP_EROFS       (-17)   /* the mount is read-only (EROFS)           */
+#define CAP_ESPIPE      (-18)   /* lseek on a non-seekable object (ESPIPE)  */
+#define CAP_ENOTEMPTY   (-19)   /* rename over a non-empty directory
+                                 * (ENOTEMPTY)                              */
+#define CAP_ENAMETOOLONG(-20)   /* a path over LINUX_PATH_CAP — this shim's
+                                 * named divergence from PATH_MAX (§5.6)    */
 #define CAP_EINVAL      (-1)
 #define CAP_EBADF       (-2)
 #define CAP_EAGAIN      (-3)

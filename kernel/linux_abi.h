@@ -65,6 +65,18 @@
 #define LINUX_ENOBUFS    105
 #define LINUX_ETIMEDOUT  110
 #define LINUX_EALREADY   114
+/* The file class's own errnos (E7 step 4): the VFS failures §5.7's map
+ * must be able to name — each is the twin of a cap.h CAP_E* code added
+ * with this increment, and of the sidecar's vfs::Errno code() values
+ * (user/vfs/src/errno.rs pins the Linux numbering on the Rust side). */
+#define LINUX_EACCES      13
+#define LINUX_EEXIST      17
+#define LINUX_ENOTDIR     20
+#define LINUX_EISDIR      21
+#define LINUX_ESPIPE      29
+#define LINUX_EROFS       30
+#define LINUX_ENAMETOOLONG 36
+#define LINUX_ENOTEMPTY   39
 
 /* ─── The syscall classification table (§5.6) ──────────────────────────────
  * The census artifact (tools/linux_syscall_census.txt) is the specification:
@@ -481,18 +493,122 @@ struct LinuxSigCopyPlan linux_sig_copy_plan(uint64_t num,
  * child itself could not have written — or the sidecar would launder
  * writes through the child's read-only pages. That asymmetry is the new
  * security property, and the refusals-before-mutation shape (a bad page
- * ANYWHERE in the span leaves every byte untouched) is its host test. */
-#define LINUX_READ  0u           /* the census's read row (§5.6) — the
-                                  * count-truth number step 4 lands on
-                                  * this same machinery                */
+ * ANYWHERE in the span leaves every byte untouched) is its host test. */#define LINUX_READ  0u           /* the census's read row (§5.6) — the
+                                 * count-truth number step 4 lands on
+                                 * this same machinery                */
+
+/* ─── E7 step 4 (the file class): the census's thirteen numbers ───────────
+ * The numbers themselves, so the plan/attach/shape contracts below name
+ * their own family instead of repeating literals (the sidecar mirrors
+ * these as its own consts — guard clause P pins both halves). LSC_FD
+ * rows in linux_syscall_table[] already classify every one of them, so
+ * routing is the table's; what is NEW here is what each number's first
+ * trap attaches and what its reply may carry back. */
+#define LINUX_OPEN        2u
+#define LINUX_CLOSE       3u
+#define LINUX_STAT        4u
+#define LINUX_LSTAT       6u
+#define LINUX_LSEEK       8u
+#define LINUX_FCNTL       72u
+#define LINUX_FSYNC       74u
+#define LINUX_FTRUNCATE   77u
+#define LINUX_RENAME      82u
+#define LINUX_MKDIR       83u
+#define LINUX_UNLINK      87u
+#define LINUX_GETDENTS64  217u
+
+/* Path bytes: the twin of FD_PAYLOAD_CAP, and the shim's NAMED
+ * divergence from Linux's PATH_MAX 4096 — a longer path is refused by
+ * name (first-trap -ENAMETOOLONG via linux_fd_path_plan), never
+ * truncated, and the trigger to raise it is raising this cap and both
+ * recv buffers together (§5.6's trigger rule). rename carries TWO paths
+ * back to back in one payload, so the attach ceiling is two caps. */
+#define LINUX_PATH_CAP        1024u
+#define LINUX_FWD_ATTACH_CAP  (2u * (LINUX_PATH_CAP + 1u))
+
+/* What a staged reply payload IS — the apply/deliver's dispatch over the
+ * three reply shapes this increment adds to increment 12's copy-IN.
+ * RAW is the existing rule (the payload bytes land at the staged
+ * destination verbatim — read's data and the sig class's structs);
+ * STAT serializes the sidecar's compact Stat into a full Linux
+ * `struct stat`; DENTS packs the sidecar's name list into
+ * `linux_dirent64` records the KERNEL lays out (d_reclen math stays
+ * kernel-side — the sidecar never sees a Linux layout). */
+#define LINUX_STAGE_NONE  0u
+#define LINUX_STAGE_RAW   1u
+#define LINUX_STAGE_STAT  2u
+#define LINUX_STAGE_DENTS 3u
+
+/* `struct stat`, musl x86-64 (144 bytes): field offsets the golden test
+ * pins and the probe reads back on-target (§5.6). The sidecar's payload
+ * is a COMPACT Stat (mode u16, uid u16, gid u16, size u64, mtime u32 —
+ * 24 bytes, zero-padded) and linux_stat_bytes below is the only place
+ * the two layouts meet. */
+#define LINUX_STAT_BYTES         144u
+#define LINUX_STAT_PAYLOAD_BYTES 24u
+#define LINUX_STAT_OFF_MODE      24u   /* u32 st_mode */
+#define LINUX_STAT_OFF_UID       28u   /* u32 st_uid  */
+#define LINUX_STAT_OFF_GID       32u   /* u32 st_gid  */
+#define LINUX_STAT_OFF_SIZE      48u   /* i64 st_size */
+#define LINUX_STAT_OFF_MTIME     88u   /* i64 st_mtim.tv_sec; nsec at +96 */
+
+/* getdents64's two bounds: the sidecar may attach at most
+ * LINUX_DENTS_PAYLOAD_CAP bytes of name list, and the KERNEL packs at
+ * most LINUX_DIRENT_USER_CAP bytes of records into the child's buffer
+ * (a short getdents is POSIX-legal — the caller loops; the census asks
+ * for 2048). `struct linux_dirent64` is musl's: d_ino u64, d_off i64,
+ * d_reclen u16 (8-aligned: align8(19 + strlen + 1)), d_type u8, d_name. */
+#define LINUX_DENTS_PAYLOAD_CAP 1024u
+#define LINUX_DIRENT_USER_CAP   2048u
+#define LINUX_DIRENT_MIN_RECLEN 24u   /* "." — the smallest record */
 
 struct LinuxFdReplyPlan {
-    uint64_t dst;      /* child VA to copy the reply payload into (args[2]) */
-    uint32_t len;      /* bytes the first trap allows: 32 (13) or 8 (14);
-                        * 0 = this call owes no payload                    */
+    uint64_t dst;      /* child VA to copy the reply payload into
+                        * (args[2] for the sig class, args[1] for read,
+                        * stat/lstat and getdents64)                    */
+    uint32_t len;      /* the payload CLAMP: bytes the sidecar may
+                        * attach behind the reply header (32/8 for the
+                        * sig class; LINUX_STAT_PAYLOAD_BYTES for stat;
+                        * LINUX_DENTS_PAYLOAD_CAP for getdents64; for
+                        * read, min(count, FD_PAYLOAD_CAP)); 0 = no
+                        * payload is owed back                          */
+    uint32_t aux;      /* the CHILD-side clamp: bytes the deliver may
+                        * write at dst (LINUX_STAT_BYTES for stat — the
+                        * serialized form is larger than the payload;
+                        * min(count, LINUX_DIRENT_USER_CAP) for
+                        * getdents64; == len for the RAW family)        */
+    uint8_t  kind;     /* LINUX_STAGE_*: what the deliver does with the
+                        * payload before the copy-in                   */
     int32_t  refuse;   /* 0 = proceed; else the Linux errno to return
                         * BEFORE any post (first-trap refusal discipline)  */
 };
+
+/* The path plan (the forward's second shape): open/stat/lstat/unlink/
+ * mkdir carry ONE pathname out of the child (args[0]), rename TWO
+ * (args[0], args[1]). The plan is a pure CLASSIFIER — which registers
+ * name paths — because measuring a string touches the child's bytes and
+ * needs a cr3. linux_path_measure (below) does the measuring at the
+ * attach, still first-trap: a span ring 3 could not read is
+ * -LINUX_EFAULT, a string with no NUL within LINUX_PATH_CAP is
+ * -LINUX_ENAMETOOLONG — both before any post. Total over (num, args). */
+struct LinuxFdPathPlan {
+    uint64_t src;      /* args[0] — the first path's child VA (0 = none) */
+    uint64_t src2;     /* args[1] — rename's second path (0 otherwise)   */
+    uint8_t  two;      /* 1 = this number carries two paths              */
+    int32_t  refuse;   /* reserved: the classifier touches no bytes, so
+                        * today always 0 — the refusals are measure's   */
+};
+
+struct LinuxFdPathPlan linux_fd_path_plan(uint64_t num,
+                                          const uint64_t args[6]);
+
+/* Measure one path string in the child's memory (the attach's own
+ * walker rules — present, user, never faulting): returns 0 with the
+ * length INCLUDING the NUL, -LINUX_EFAULT for a span that cannot be
+ * read, -LINUX_ENAMETOOLONG when no NUL arrives within `cap`. A local
+ * byte, no buffer — the frame cost is a word regardless of cap. */
+int linux_path_measure(uint64_t root, uint64_t va, uint32_t cap,
+                       uint32_t *out_len);
 
 /* Plan one reply payload's destination span — the write plan's twin over
  * the IN direction. For a copy-IN number with a NULL out-pointer the
@@ -527,6 +643,33 @@ int linux_user_copy_in(const uint8_t *src, uint64_t root, uint64_t va,
  * copy-IN number whose Linux return is neither 0 nor its count grows
  * this predicate with its own arm — never a default that guesses. */
 int linux_reply_shape_ok(uint64_t num, uint64_t ret, uint32_t n);
+
+/* Serialize the sidecar's compact Stat payload (LINUX_STAT_PAYLOAD_BYTES,
+ * little-endian: mode u16 @0, uid u16 @2, gid u16 @4, size u64 @8,
+ * mtime u32 @16) into musl's 144-byte `struct stat` — the one place the
+ * two layouts meet. Fields the VFS does not carry are filled HONESTLY,
+ * never invented: st_ino 0 (the vfs::Stat carries no inode), st_nlink 1,
+ * st_dev/st_rdev 0, st_blksize 4096, st_blocks derived from size,
+ * atim/ctim echoing mtime (one timestamp is the truth; two more would
+ * be fabrications). dst must hold LINUX_STAT_BYTES; src must hold
+ * LINUX_STAT_PAYLOAD_BYTES. The deliver calls it; the golden host test
+ * pins every offset. */
+void linux_stat_bytes(const uint8_t *src, uint8_t *dst);
+
+/* Pack the sidecar's compact directory-entry list into the child's
+ * `linux_dirent64` stream. The payload (n bytes from src) is:
+ *   u32 count; then per entry: u64 ino, u8 ty, u16 name_len, name bytes.
+ * Records are laid out HERE — d_reclen = align8(19 + name_len + 1),
+ * d_off the entry's own cookie (index + 1) — starting at the entry the
+ * staged cursor (dir_pos) names, and packing stops before the first
+ * record that would exceed count_cap bytes (aux: the child's buffer
+ * size). Returns the byte count packed into dst and writes the number
+ * of entries CONSUMED to *fitted (what the cursor must advance by —
+ * only what was packed); -1 on a malformed payload (count/name_len
+ * crossing n). A listing with nothing left to give packs 0 bytes, 0
+ * entries — getdents64's end-of-directory. */
+int linux_dirent_pack(const uint8_t *src, uint32_t n, uint32_t count_cap,
+                      uint64_t dir_pos, uint8_t *dst, uint32_t *fitted);
 
 /* ─── The errno map (§5.7) ─────────────────────────────────────────────────
  * Two families cross into the Linux task as negative rax: the Phase-3

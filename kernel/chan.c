@@ -898,6 +898,8 @@ uint64_t k_linux_deliver(uint32_t pid, uint16_t ch_r, uint64_t expect_num) {
             int staged = 0;
             uint64_t sva = 0;
             uint32_t slen = 0;
+            uint8_t skind = 0;   /* step 4: LINUX_STAGE_* — what the    */
+            uint32_t saux = 0;   /* payload IS before the copy-in       */
 
             if (out.kind == CH_KIND_CLOSE) {
                 /* The sidecar closed the endpoint or died (its teardown
@@ -928,12 +930,16 @@ uint64_t k_linux_deliver(uint32_t pid, uint16_t ch_r, uint64_t expect_num) {
                 staged = 1;
                 sva = pd->reply_stage_va;
                 slen = pd->reply_stage_len;
+                skind = pd->reply_stage_kind;
+                saux = pd->reply_stage_aux;
             }
             if (pd) {
                 pd->reply_stage_valid = 0;
                 pd->reply_stage_num = 0;
                 pd->reply_stage_va = 0;
                 pd->reply_stage_len = 0;
+                pd->reply_stage_kind = 0;
+                pd->reply_stage_aux = 0;
             }
 
             if (n == 0) {
@@ -993,13 +999,54 @@ uint64_t k_linux_deliver(uint32_t pid, uint16_t ch_r, uint64_t expect_num) {
                 uint64_t rax = linux_syscall_apply_reply(
                     &req, rbuf, (uint64_t)sizeof(struct
                                                 SLSLinuxSyscallRequest));
+                const uint8_t *pay = rbuf +
+                    (uint32_t)sizeof(struct SLSLinuxSyscallRequest);
                 /* apply re-enforces the echo (J2's order is untouched);
                  * its only refusal in this shape is -EPROTO, and a copy
                  * must never run for a reply apply did not accept. */
-                if (rax != (uint64_t)(int64_t)(-LINUX_EPROTO) &&
-                    linux_user_copy_in(rbuf +
-                                           sizeof(struct SLSLinuxSyscallRequest),
-                                       pd->cr3, sva, n) != 0) {
+                if (rax == (uint64_t)(int64_t)(-LINUX_EPROTO))
+                    return rax;
+                /* E7 step 4 (the file class): the payload's SHAPE decides
+                 * what crosses into the child. RAW is increment 12's rule
+                 * unchanged (the bytes land verbatim — read's data and the
+                 * sig class's structs). STAT and DENTS are the two shapes
+                 * where the KERNEL holds the Linux layout: the sidecar's
+                 * compact Stat is serialized here, and the sidecar's name
+                 * list is packed into d_reclen-padded records here — the
+                 * sidecar never sees (and never lies about) a reclen. The
+                 * copy-in is the same validate-then-write walker for all
+                 * three: a bad destination writes nothing and answers
+                 * -EFAULT, the task hearing the truth about its pointer.
+                 * getdents64's rax is the KERNEL's packed byte count —
+                 * never the sidecar's — and the cursor advances only by
+                 * entries actually packed (a short getdents is legal; the
+                 * caller loops, and end-of-directory is 0 bytes, 0 entries). */
+                if (skind == LINUX_STAGE_STAT) {
+                    uint8_t sbuf[LINUX_STAT_BYTES];
+                    if (n != LINUX_STAT_PAYLOAD_BYTES)
+                        return (uint64_t)(int64_t)(-LINUX_EPROTO);
+                    linux_stat_bytes(pay, sbuf);
+                    if (linux_user_copy_in(sbuf, pd->cr3, sva,
+                                           LINUX_STAT_BYTES) != 0)
+                        return (uint64_t)(int64_t)(-LINUX_EFAULT);
+                    return rax;   /* the stat's own 0 */
+                }
+                if (skind == LINUX_STAGE_DENTS) {
+                    uint8_t dbuf[LINUX_DIRENT_USER_CAP];
+                    uint32_t fitted = 0;
+                    int packed = linux_dirent_pack(pay, n, saux,
+                                                   pd->linux_dir_pos,
+                                                   dbuf, &fitted);
+                    if (packed < 0)
+                        return (uint64_t)(int64_t)(-LINUX_EPROTO);
+                    if (packed > 0 &&
+                        linux_user_copy_in(dbuf, pd->cr3, sva,
+                                           (uint32_t)packed) != 0)
+                        return (uint64_t)(int64_t)(-LINUX_EFAULT);
+                    pd->linux_dir_pos += fitted;
+                    return (uint64_t)(uint32_t)packed;
+                }
+                if (linux_user_copy_in(pay, pd->cr3, sva, n) != 0) {
                     /* The destination the child could not write (or an
                      * unmapped span): -EFAULT into rax, apply's value
                      * discarded — the task hears the truth about its own
