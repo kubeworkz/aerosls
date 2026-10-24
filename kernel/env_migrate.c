@@ -779,7 +779,19 @@ int env_migrate_restore(uint32_t partition_id, uint32_t index) {
         return env_migrate_refuse(ENV_MIGRATE_REFUSE_INCOMPLETE,
                                   view->pages_staged, view->total_pages);
     struct EnvCkptRecord staged = view->record;
-    uint32_t staged_total_pages = env_migrate_payload_pages(&staged);
+    /* The SLOT's declared total, NOT the record's payload. The record names
+     * the payload pages only (regions + durable extent); the BEGIN's total
+     * additionally carries the image-window tail, and the difference between
+     * the two IS the tail's page count. Deriving this number from the record
+     * made that difference identically ZERO on every restore: the live 3-node
+     * suite (2026-10-24, guards_all.log) printed "1344 region page(s), 0
+     * image-window page(s) and 256 extent page(s) poured" while the slot
+     * carried the tail the source had just sent -- staged, never validated
+     * against the fresh sidecar windows (4b'), never poured, and the count
+     * agreement that guards both halves never tested. recv_begin already
+     * bound the declared total to [payload, payload + ENV_MIGRATE_IMAGE_MAX]
+     * (see the gate there), so the subtraction below cannot underflow. */
+    uint32_t staged_total_pages = view->total_pages;
     if (staged.partition_id != partition_id || staged.index != index)
         return env_migrate_refuse(ENV_MIGRATE_REFUSE_RECORD,
                                   staged.partition_id, staged.index);
@@ -1084,19 +1096,6 @@ int env_migrate_restore(uint32_t partition_id, uint32_t index) {
     }
     uint32_t region_pages = cursor;
 
-    /* The image-window tail: the pages validated whole at 4b' — the fresh
-     * sidecars' OWN boot-stack/.data/.bss frames at their resolved
-     * positions. This is what makes the poured heap describable again: the
-     * resumed context's stack locals, the static allocator state and the
-     * `booted` frame all become the instant the regions describe, instead
-     * of a destination-side boot's (the live #PF this tail fixes). */
-    for (uint32_t k = 0; k < img_pages; k++) {
-        const uint8_t* src = env_migrate_recv_page_ptr(partition_id, index, cursor++);
-        uint8_t* dst = (uint8_t*)env_mig_img_dst[k];
-        for (uint32_t b = 0; b < 4096; b++) dst[b] = src[b];
-        failover_sweep_keepalive();   /* same rule as the region pour */
-    }
-
     uint32_t extent_pages = (staged.state_sectors + ENV_MIGRATE_SECTORS_PER_PAGE - 1)
                             / ENV_MIGRATE_SECTORS_PER_PAGE;
     for (uint32_t e = 0; e < extent_pages; e++) {
@@ -1119,6 +1118,28 @@ int env_migrate_restore(uint32_t partition_id, uint32_t index) {
             env_migrate_recv_drop(partition_id, index);
             return env_migrate_refuse(ENV_MIGRATE_REFUSE_EXTENT, 1, index);
         }
+    }
+
+    /* The image-window tail: the pages validated whole at 4b' — the fresh
+     * sidecars' OWN boot-stack/.data/.bss frames at their resolved
+     * positions. This is what makes the poured heap describable again: the
+     * resumed context's stack locals, the static allocator state and the
+     * `booted` frame all become the instant the regions describe, instead
+     * of a destination-side boot's (the live #PF this tail fixes).
+     *
+     * It is read LAST, after the extent, because that is the sender's own
+     * numbering: env_migrate_read_page() serves the whole payload (every
+     * region's frames, then the durable extent's pages) and only then does
+     * env_migrate_read_image_page() serve the tail. This loop used to sit
+     * BETWEEN the regions and the extent, so the moment the tail's count
+     * became nonzero (the staged_total_pages fix above) the extent's staged
+     * bytes would have been poured into the sidecars' image frames and the
+     * tail's bytes written to NVMe — two whole pages of each other. */
+    for (uint32_t k = 0; k < img_pages; k++) {
+        const uint8_t* src = env_migrate_recv_page_ptr(partition_id, index, cursor++);
+        uint8_t* dst = (uint8_t*)env_mig_img_dst[k];
+        for (uint32_t b = 0; b < 4096; b++) dst[b] = src[b];
+        failover_sweep_keepalive();   /* same rule as the region pour */
     }
 
     env_migrate_recv_drop(partition_id, index);

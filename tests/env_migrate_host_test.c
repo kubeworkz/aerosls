@@ -576,23 +576,48 @@ int env_payload_wait_parked(const struct EnvCkptRecord* rec) {
 
 /* The image-window helpers the migrate path shares with the payload layer
  * (env_payload.h's P3 block). This test's world has NO live sidecar
- * processes, so the list answers with an empty tail and err=0 — exactly
- * the page stream the pre-image migrate always sent, which keeps every
- * phase's page counts and orderings below unchanged. */
+ * processes by default, so the list answers with an empty tail and err=0 —
+ * exactly the page stream the pre-image migrate always sent, which keeps
+ * every phase's page counts and orderings below unchanged. G1b raises
+ * g_img_tail to a REAL tail, so the restore's tail arithmetic (the count is
+ * the slot's declared total minus the record's payload), its pour order
+ * (regions, extent, then tail — the sender's own numbering) and its
+ * halves-agreement gate are all exercised against a declared total of
+ * payload + tail. */
+static uint32_t g_img_tail = 0;
+static uint8_t  g_img_frame[4][4096] __attribute__((aligned(4096)));
+/* The fake sidecar the stub hands back. ProcessDescriptor is complete only
+ * in the kernel's translation units — this file never touches its fields,
+ * it just has to be a non-NULL pointer the restore can carry and pass back
+ * to env_payload_resolve_vaddr, so an aligned opaque blob is the honest
+ * spelling here. */
+static uint64_t g_img_pd_words[32] __attribute__((aligned(16)));
+#define G_IMG_PD ((struct ProcessDescriptor*)(void*)g_img_pd_words)
+#define G_IMG_VBASE 0x400000000000ull   /* env_payload.c's EP_IMAGE_VBASE */
+
 uint32_t env_payload_image_window_list(const struct EnvCkptRecord* rec,
                                        uint64_t* vaddrs,
                                        struct ProcessDescriptor** pds,
                                        uint32_t cap, uint32_t* err) {
-    (void)rec; (void)vaddrs; (void)pds; (void)cap;
+    (void)rec;
     if (err) *err = 0;
-    return 0;
+    if (g_img_tail > cap) { if (err) *err = 2; return 0; }
+    for (uint32_t k = 0; k < g_img_tail; k++) {
+        vaddrs[k] = G_IMG_VBASE + (uint64_t)k * 4096ull;
+        pds[k]    = G_IMG_PD;
+    }
+    return g_img_tail;
 }
 int env_payload_proc_parked(const struct ProcessDescriptor* pd) {
     (void)pd; return 1;
 }
-int env_payload_resolve_vaddr(uint64_t cr3, uint64_t vaddr,
-                              uint64_t* out_phys) {
-    (void)cr3; (void)vaddr; (void)out_phys; return 1;
+int env_payload_resolve_vaddr(uint64_t cr3, uint64_t vaddr, uint64_t* out_phys) {
+    (void)cr3;
+    if (vaddr < G_IMG_VBASE) return 0;
+    uint64_t k = (vaddr - G_IMG_VBASE) / 4096ull;
+    if (k >= sizeof g_img_frame / sizeof g_img_frame[0]) return 0;
+    *out_phys = (uint64_t)(uintptr_t)&g_img_frame[k][0];
+    return 1;
 }
 
 /* ── Phase G's own world: the destination's regions and pages ──────────
@@ -607,7 +632,7 @@ static uint8_t g_live_r2[1][4096] __attribute__((aligned(4096)));
 static uint8_t g_other_r0[2][4096] __attribute__((aligned(4096)));
 static uint8_t g_other_r1[1][4096] __attribute__((aligned(4096)));
 static uint8_t g_other_r2[1][4096] __attribute__((aligned(4096)));
-static uint8_t g_pages[6][4096] __attribute__((aligned(4096)));
+static uint8_t g_pages[8][4096] __attribute__((aligned(4096)));   /* 6 payload + up to 2 tail */
 
 #define G_FILLS { 0x31, 0x32, 0x33, 0x34, 0x41, 0x42 }   /* 4 region pages, 2 extent */
 
@@ -703,6 +728,7 @@ static void g_reset_fakes(void) {
     g_destroy_env_id = 0;
     g_destroy_rc = 0;
     g_parked = 1;
+    g_img_tail = 0;   /* the fake image windows hold nothing again */
     memset(&g_create_record, 0, sizeof g_create_record);
 }
 
@@ -1644,6 +1670,88 @@ int main(void) {
                   "PAUSED: resume happens over here, by an operator, after the bytes land ***");
             CHECK(g_create_calls == 1 && g_destroy_calls == 0,
                   "exactly one create, no destroy: nothing was torn down to get here");
+        }
+
+        /* ── G1b: the image-window tail the BEGIN declared crosses too ───
+         * The tail's page count is the slot's DECLARED total minus the
+         * record's payload. It used to be derived from the record alone,
+         * which made it identically ZERO on every restore — found live on
+         * the 3-node suite (2026-10-24): "1344 region page(s), 0 image-
+         * window page(s) and 256 extent page(s) poured" while the source had
+         * just sent a real tail, so the tail was staged, never validated
+         * against the fresh windows, never poured, and the count agreement
+         * guarding both halves was never tested. This pins the tail's bytes
+         * landing — and, because the sender numbers regions, extent, then
+         * tail, that the extent still lands in NVMe rather than in the
+         * sidecars' image frames. */
+        {
+            env_ckpt_reset(); env_migrate_reset(); host_partition_stubs_reset();
+            host_partition_define(G_PART); g_fake_local_node_id = 2; g_reset_fakes();
+            g_fill_pages();
+            memset(g_pages[6], 0xC1, 4096);        /* tail page 0 */
+            memset(g_pages[7], 0xC2, 4096);        /* tail page 1 */
+            memset(g_img_frame, 0xEE, sizeof g_img_frame);
+            g_img_tail = 2;                        /* this node's fresh windows hold 2 */
+
+            struct EnvCkptRecord staged =
+                g_record(G_PART, 0, g_live_r0, g_live_r1, g_live_r2);
+            g_create_record = staged;              /* placement matched */
+            g_stage(G_PART, 0, &staged, 8);        /* 6 payload + 2 tail */
+            const struct EnvMigrateStaging* st = env_migrate_recv_find(G_PART, 0);
+            CHECK(st && st->complete && st->total_pages == 8,
+                  "setup: a slot staged with the record's 6 payload pages PLUS a 2-page tail declared");
+
+            int rc = env_migrate_restore(G_PART, 0);
+            CHECK(rc == ENV_MIGRATE_OK,
+                  "*** a declared tail crosses: a total past the record's payload restores cleanly ***");
+            CHECK(memcmp(g_img_frame[0], g_pages[6], 4096) == 0 &&
+                  memcmp(g_img_frame[1], g_pages[7], 4096) == 0,
+                  "*** ...and the tail's bytes are in the fresh sidecars' image frames "
+                  "(the count came from the SLOT, not from the record) ***");
+            CHECK(memcmp(g_live_r0[0], g_pages[0], 4096) == 0 &&
+                  memcmp(g_live_r0[1], g_pages[1], 4096) == 0 &&
+                  memcmp(g_live_r1[0], g_pages[2], 4096) == 0 &&
+                  memcmp(g_live_r2[0], g_pages[3], 4096) == 0,
+                  "the region pages are still poured first, byte-for-byte");
+            {
+                uint8_t pg[4096];
+                CHECK(nvme_read_sync(STATE_LBA + 0, pg) == 0 &&
+                      memcmp(pg, g_pages[4], 4096) == 0 &&
+                      nvme_read_sync(STATE_LBA + 8, pg) == 0 &&
+                      memcmp(pg, g_pages[5], 4096) == 0,
+                      "*** and the EXTENT still landed in NVMe: the pour reads regions, "
+                      "extent, THEN tail — the sender's own numbering ***");
+            }
+            CHECK(env_migrate_staging_count() == 0,
+                  "the slot — tail pages included — is dropped after the pour");
+        }
+
+        /* ── G1c: a tail THIS node's windows cannot reproduce is refused ─
+         * The halves-agreement gate at 4b' only ever runs when a tail
+         * actually crossed, so G1b is what makes it reachable; this is its
+         * teeth: a wire count the fresh sidecars' windows cannot match names
+         * both halves and refuses rather than pouring a half-environment. */
+        {
+            env_ckpt_reset(); env_migrate_reset(); host_partition_stubs_reset();
+            host_partition_define(G_PART); g_fake_local_node_id = 2; g_reset_fakes();
+            g_fill_pages();
+            memset(g_pages[6], 0xC1, 4096);
+            memset(g_pages[7], 0xC2, 4096);
+            g_img_tail = 0;                        /* nothing mapped here */
+
+            struct EnvCkptRecord staged =
+                g_record(G_PART, 0, g_live_r0, g_live_r1, g_live_r2);
+            g_create_record = staged;
+            g_stage(G_PART, 0, &staged, 8);        /* the wire still carries 8 */
+
+            int rc = env_migrate_restore(G_PART, 0);
+            CHECK(rc == ENV_MIGRATE_REFUSE_PLACEMENT,
+                  "*** a wire tail this node's fresh windows cannot reproduce is REFUSED by name ***");
+            CHECK(env_migrate_last_refusal()->a == 2,
+                  "...with the WIRE's page count as the operand (a=2), not this node's 0");
+            CHECK(env_migrate_staging_count() == 0,
+                  "...and the slot is dropped: the environment exists as an empty replay, never a half-poured one");
+            g_img_tail = 0;
         }
 
         /* ── G2: no slot, and an incomplete one ────────────────────────── */
