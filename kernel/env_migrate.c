@@ -19,6 +19,7 @@
 #include "env_proto.h"          /* ENV_OK / ENV_ERR_* -- the create round trip's answer */
 #include "env_payload.h"        /* env_payload_wait_parked() -- the pour's posture gate */
 #include "env_service.h"        /* env_service_create()/destroy() -- the create path */
+#include "process.h"             /* struct ProcessDescriptor -- the image-window walk's cr3s */
 #include "frame_pool.h"
 #include "kernel_io.h"
 #include "partition.h"          /* partition_exists()/get_owner_node()/pause() -- the restore's gates */
@@ -44,6 +45,24 @@ extern volatile uint64_t kernel_tick_counter;
 /* 8 NVMe sectors per 4 KiB page — the stream family's geometry, reused so
  * the two payload walkers cannot disagree about page boundaries. */
 #define ENV_MIGRATE_SECTORS_PER_PAGE 8u
+
+/* The image-window tail the staged payload carries after the payload
+ * pages (region frames + durable extent). The reboot payload has always
+ * captured the sidecars' image-window frames — the boot stack and the
+ * .data/.bss the resumed context RUNS on; a staged payload with only the
+ * region frames pours a source heap under a destination sidecar whose own
+ * stack frame slots hold different locals, and the restored environment
+ * #PF'd on its first console input (live find, 2026-10-23). Collected on
+ * the send side from the FROZEN sidecars and re-derived on the restore
+ * side from the FRESH sidecars, in env_payload.h's shared canonical order —
+ * so no vaddrs cross the wire, and the page count that crossed is what
+ * validates the halves. Ceiling: a POSIX sidecar image is ~305 pages and a
+ * ramdisk sidecar's ~26; 1024 is generous headroom under the receive
+ * side's 4096-page staging ceiling. */
+#define ENV_MIGRATE_IMAGE_MAX 1024u
+static uint64_t env_mig_img_vaddr[ENV_MIGRATE_IMAGE_MAX];
+static struct ProcessDescriptor* env_mig_img_pd[ENV_MIGRATE_IMAGE_MAX];
+static uint32_t env_mig_img_count = 0;
 
 static int env_migrate_status = ENV_MIGRATE_OK;
 /* Resolved-migration failover grace — see env_migrate.h's
@@ -108,11 +127,14 @@ uint32_t env_migrate_payload_pages(const struct EnvCkptRecord* rec) {
 }
 
 /* ─── Reading one payload page, source side ────────────────────────────────
- * Page numbering is the record's own: every region's frames in record order,
- * then the durable extent's pages. Regions are frame-pool frames —
- * identity-mapped on the real kernel (frame_pool.h's contract), real host
- * pointers under the host test's settable frame fake — so a region page is
- * one memcpy either way. Extent pages come off NVMe, 8 sectors at a time. */
+ * Page numbering is the record's own for the payload pages: every region's
+ * frames in record order, then the durable extent's pages; the image-
+ * window tail follows (env_migrate_read_image_page below), its count the
+ * difference between the BEGIN's declared total and this function's range.
+ * Regions are frame-pool frames — identity-mapped on the real kernel
+ * (frame_pool.h's contract), real host pointers under the host test's
+ * settable frame fake — so a region page is one memcpy either way. Extent
+ * pages come off NVMe, 8 sectors at a time. */
 static int env_migrate_read_page(const struct EnvCkptRecord* rec,
                                  uint32_t page_index, uint8_t* buf) {
     uint32_t p = page_index;
@@ -129,6 +151,19 @@ static int env_migrate_read_page(const struct EnvCkptRecord* rec,
     if (rec->state_sectors == 0) return -1;   /* page beyond the payload */
     uint64_t slba = rec->state_lba + (uint64_t)p * ENV_MIGRATE_SECTORS_PER_PAGE;
     return nvme_read_sync(slba, buf);
+}
+
+/* Image-window page k of the tail: resolved at read time (a retransmission
+ * re-resolves) in the owning sidecar's page tables — the walk is the one
+ * env_migrate_send() froze above, so the frames cannot have moved. */
+static int env_migrate_read_image_page(uint32_t k, uint8_t* buf) {
+    uint64_t phys = 0;
+    if (k >= env_mig_img_count || !env_mig_img_pd[k] ||
+        !env_payload_resolve_vaddr(env_mig_img_pd[k]->cr3,
+                                   env_mig_img_vaddr[k], &phys))
+        return -1;
+    for (uint32_t b = 0; b < 4096; b++) buf[b] = ((const uint8_t*)phys)[b];
+    return 0;
 }
 
 /* ─── Sender ──────────────────────────────────────────────────────────────── */
@@ -162,7 +197,60 @@ int env_migrate_send(uint32_t partition_id, uint32_t index, uint32_t dest_node_i
         return env_migrate_status;
     }
 
-    uint32_t total_pages = env_migrate_payload_pages(rec);
+    /* The image-window tail (env_payload.h's shared list), collected under
+     * the caller's freeze so the frames cannot move between this walk and
+     * the page reads below. */
+    uint32_t img_err = 0;
+    env_mig_img_count = env_payload_image_window_list(rec, env_mig_img_vaddr,
+                                                      env_mig_img_pd,
+                                                      ENV_MIGRATE_IMAGE_MAX,
+                                                      &img_err);
+    if (img_err == 2) {
+        kernel_serial_printf(
+            "[ENV_MIGRATE] env (partition %u, index %u): more image-window pages than "
+            "the %u-page tail ceiling -- transfer abandoned, source untouched.\n",
+            (unsigned)partition_id, (unsigned)index, (unsigned)ENV_MIGRATE_IMAGE_MAX);
+        env_migrate_status = ENV_MIGRATE_REFUSE_READ;
+        return env_migrate_status;
+    }
+    if (img_err == 1) {
+        kernel_serial_printf(
+            "[ENV_MIGRATE] env (partition %u, index %u): SOME but not all named sidecars "
+            "are live here -- a half-environment's image cannot be staged, transfer "
+            "abandoned, source untouched.\n",
+            (unsigned)partition_id, (unsigned)index);
+        env_migrate_status = ENV_MIGRATE_REFUSE_READ;
+        return env_migrate_status;
+    }
+    if (env_mig_img_count == 0) {
+        /* The degenerate record-only shape: a host test's world, and the
+         * same page stream the pre-image migrate always sent. Named rather
+         * than silent, so a LIVE transfer that lands here is visible in the
+         * transcript as "regions and extent only". */
+        kernel_serial_printf(
+            "[ENV_MIGRATE] env (partition %u, index %u): no live sidecar to collect an "
+            "image-window tail from -- sending region and extent pages only.\n",
+            (unsigned)partition_id, (unsigned)index);
+    }
+    /* Posture gate, the reboot capture's own rule (env_payload.h's
+     * register rule): the pour resumes the instant these bytes describe,
+     * so every collected sidecar must have been frozen PARKED on its
+     * channel wait — a mid-compute instant has stack frames no resume can
+     * replay, and pouring them would re-create the very mixed state this
+     * tail exists to remove. */
+    for (uint32_t k = 0; k < env_mig_img_count; k++) {
+        if (!env_payload_proc_parked(env_mig_img_pd[k])) {
+            kernel_serial_printf(
+                "[ENV_MIGRATE] env (partition %u, index %u): a sidecar was frozen "
+                "mid-compute, not parked -- the staged instant cannot be resumed, "
+                "transfer abandoned, source untouched.\n",
+                (unsigned)partition_id, (unsigned)index);
+            env_migrate_status = ENV_MIGRATE_REFUSE_UNQUIESCED;
+            return env_migrate_status;
+        }
+    }
+    uint32_t payload_pages = env_migrate_payload_pages(rec);
+    uint32_t total_pages = payload_pages + env_mig_img_count;
     uint64_t transfer_id = ((uint64_t)partition_id << 32) | (uint64_t)index;
 
     static uint8_t __attribute__((aligned(4096))) send_page_buf[4096];
@@ -207,9 +295,14 @@ int env_migrate_send(uint32_t partition_id, uint32_t index, uint32_t dest_node_i
         return env_migrate_status;
     }
 
-    /* ── Every page, confirmed fragment by fragment ────────────────────── */
+    /* ── Every page, confirmed fragment by fragment ──────────────────────
+     * Payload pages come off the record (regions, then extent); the tail
+     * pages come off the frozen sidecars' image windows. */
     for (uint32_t p = 0; p < total_pages; p++) {
-        if (env_migrate_read_page(rec, p, send_page_buf) != 0) {
+        int page_rd = (p < payload_pages)
+                    ? env_migrate_read_page(rec, p, send_page_buf)
+                    : env_migrate_read_image_page(p - payload_pages, send_page_buf);
+        if (page_rd != 0) {
             kernel_serial_printf(
                 "[ENV_MIGRATE] env (partition %u, index %u): source page %u "
                 "unreadable -- transfer abandoned at %u of %u page(s), source "
@@ -331,6 +424,40 @@ int env_migrate_partition(uint32_t partition_id, uint32_t dest_node_id,
      * "restore into paused": the environment LIVE by the records, its
      * sidecars never scheduled again, its console accepting input nobody
      * would read (P3 increment 10's live console arm, 2026-10-14). */
+
+    /* 2a. The freeze must LAND on a parked posture: a bounded
+     * resume/wait/repause for the MIGRATE's own pause — the pause dance
+     * the RESTORE already performs (resume for create, repause before the
+     * pour), mirrored here for the SEND. Sidecars wake on a finite
+     * deadline (the ramdisk's 200 ms discovery poll), and a partition
+     * paused mid-wake never runs them back into their park — the posture
+     * gate inside env_migrate_send() would then refuse EVERY attempt for a
+     * posture that only needed a moment to settle, and pouring a
+     * mid-compute instant would resume it over a parked destination stack
+     * (the mixed-state defect this phase exists to prevent). Three
+     * exclusions, each the honest one: a partition an OPERATOR paused
+     * cannot run its sidecars into a park at all (waiting would burn the
+     * bound — its posture is the operator's own doing, and the send's gate
+     * answers for it); a partition not held paused is this step's own
+     * UNFROZEN refusal below, unchanged; and the wait runs only while the
+     * partition runs, so it sits between a resume and the retake — the
+     * pause is back in place before this returns, and the caller's own
+     * pause bookkeeping (and the quiesce/release interval clause F pins)
+     * sees exactly the state it handed in. Bounded and yielding inside
+     * env_payload_wait_parked (which pumps the sweep itself), and
+     * BEST-EFFORT, same as persist's pre-capture wait: a sidecar that
+     * never parks reaches the send's NAMED refusal instead of crossing as
+     * a silent mixed state. */
+    if (partition_is_paused(partition_id) && !operator_paused) {
+        (void)partition_resume(partition_id);
+        for (uint32_t i = 0; i < env_ckpt_count; i++) {
+            const struct EnvCkptRecord* rec = &env_ckpt_table[i];
+            if (rec->partition_id != partition_id) continue;
+            (void)env_payload_wait_parked(rec);
+        }
+        (void)partition_pause(partition_id);
+    }
+
     struct EnvCkptPartitionQuiesce freeze;
     if (env_ckpt_quiesce_partition(partition_id, &freeze, operator_paused) != expected) {
         kernel_serial_printf(
@@ -486,10 +613,17 @@ int env_migrate_recv_begin(uint64_t transfer_id, uint32_t partition_id,
      * the host tests assert the status, not these numbers). */
     if (!record) return 1;
     if (record_len != (uint32_t)sizeof(struct EnvCkptRecord)) return 2;
-    /* Both sides number pages from the same record; a declared total that
-     * disagrees with the record means the two kernels would disagree about
-     * what "every page landed" means — refused rather than reconciled. */
-    if (total_pages != env_migrate_payload_pages(record)) return 3;
+    /* Both sides number the PAYLOAD pages from the same record — the one
+     * that crossed in the BEGIN. The declared total may additionally carry
+     * the image-window tail (env_payload.h's shared order; its count is the
+     * difference and is validated against THIS node's fresh sidecar windows
+     * at restore), but never fewer payload pages than the record names and
+     * never more than the tail ceiling — otherwise the two kernels would
+     * disagree about what "every page landed" means, and a bogus tail could
+     * stage frames nobody will ever fill. */
+    uint32_t payload_pages = env_migrate_payload_pages(record);
+    if (total_pages < payload_pages ||
+        total_pages > payload_pages + ENV_MIGRATE_IMAGE_MAX) return 3;
     if (total_pages > ENV_MIGRATE_MAX_PAGES) return 4;
     /* No overwriting a slot in flight — but a retransmitted BEGIN for the
      * SAME transfer is answered READY without touching the slot, not
@@ -841,6 +975,68 @@ int env_migrate_restore(uint32_t partition_id, uint32_t index) {
             }
         }
     }
+
+    /* 4b'. The image-window tail the sender appended after the payload
+     * pages (env_payload.h's shared order). Validated WHOLE before the pour
+     * touches a byte, like the placement rule it belongs to: the FRESH
+     * sidecars' windows must hold exactly the page count that crossed, and
+     * every one of their vaddr positions must resolve to a live frame here.
+     * Both sides derive the same order from their own live processes, so
+     * the count disagreement names both halves — what the source's windows
+     * held vs. what this node's fresh sidecars hold. */
+    uint32_t payload_pages = env_migrate_payload_pages(&staged);
+    uint32_t img_pages = staged_total_pages > payload_pages
+                       ? staged_total_pages - payload_pages : 0u;
+    static uint64_t env_mig_img_dst[ENV_MIGRATE_IMAGE_MAX];
+    if (!refuse_code && img_pages > ENV_MIGRATE_IMAGE_MAX) {
+        kernel_serial_printf(
+            "[ENV_MIGRATE] restore (partition %u, index %u): %u image-window page(s) "
+            "crossed, past the %u-page tail ceiling -- the staged instant cannot be "
+            "validated here.\n",
+            (unsigned)partition_id, (unsigned)index,
+            (unsigned)img_pages, (unsigned)ENV_MIGRATE_IMAGE_MAX);
+        refuse_code = ENV_MIGRATE_REFUSE_PLACEMENT;
+        refuse_a    = img_pages;
+    }
+    if (!refuse_code && img_pages > 0) {
+        /* Reuses the module's list buffers: on this node they belong to no
+         * in-flight send (the sender and this restore never interleave —
+         * the keepalive pumps heartbeat and checkpoint only, and the sweep
+         * drives this pass serially). */
+        uint32_t img_err = 0;
+        uint32_t n_img = env_payload_image_window_list(fresh, env_mig_img_vaddr,
+                                                       env_mig_img_pd,
+                                                       ENV_MIGRATE_IMAGE_MAX,
+                                                       &img_err);
+        if (img_err || n_img != img_pages) {
+            kernel_serial_printf(
+                "[ENV_MIGRATE] restore (partition %u, index %u): image-window halves: "
+                "the wire carried %u page(s), this node's fresh sidecars' windows hold "
+                "%u%s -- the staged instant cannot be rebuilt here.\n",
+                (unsigned)partition_id, (unsigned)index,
+                (unsigned)img_pages, (unsigned)n_img,
+                img_err == 1 ? " (SOME but not all named sidecars are live)"
+              : img_err == 2 ? " (more pages than the tail ceiling)" : "");
+            refuse_code = ENV_MIGRATE_REFUSE_PLACEMENT;
+            refuse_a    = img_pages;
+        }
+        for (uint32_t k = 0; k < n_img && !refuse_code; k++) {
+            if (!env_mig_img_pd[k] ||
+                !env_payload_resolve_vaddr(env_mig_img_pd[k]->cr3,
+                                           env_mig_img_vaddr[k],
+                                           &env_mig_img_dst[k])) {
+                kernel_serial_printf(
+                    "[ENV_MIGRATE] restore (partition %u, index %u): image-window "
+                    "page %u of %u (vaddr 0x%llx) has no live frame at its vaddr "
+                    "here -- the staged instant cannot be rebuilt.\n",
+                    (unsigned)partition_id, (unsigned)index,
+                    (unsigned)k, (unsigned)n_img,
+                    (unsigned long long)env_mig_img_vaddr[k]);
+                refuse_code = ENV_MIGRATE_REFUSE_PLACEMENT;
+                refuse_a    = k;
+            }
+        }
+    }
     if (refuse_code) {
         env_migrate_recv_drop(partition_id, index);
         kernel_serial_printf(
@@ -870,7 +1066,8 @@ int env_migrate_restore(uint32_t partition_id, uint32_t index) {
      * rule: Ring-3 runs only while the control plane yields, so nothing can
      * execute over the memory being poured). Page numbering is the sender's
      * own: every region's frames in record order, then the durable extent's
-     * pages — both sides derive it from the SAME record that crossed. */
+     * pages, then the image-window tail — both sides derive it from the SAME
+     * record that crossed plus their own live sidecars' windows. */
     uint32_t cursor = 0;
     for (uint32_t r = 0; r < staged.n_regions && r < ENV_CKPT_MAX_REGIONS; r++) {
         const struct EnvCkptRegion* fr = 0;
@@ -885,6 +1082,21 @@ int env_migrate_restore(uint32_t partition_id, uint32_t index) {
                                           * so the no-yield rule stands */
         }
     }
+    uint32_t region_pages = cursor;
+
+    /* The image-window tail: the pages validated whole at 4b' — the fresh
+     * sidecars' OWN boot-stack/.data/.bss frames at their resolved
+     * positions. This is what makes the poured heap describable again: the
+     * resumed context's stack locals, the static allocator state and the
+     * `booted` frame all become the instant the regions describe, instead
+     * of a destination-side boot's (the live #PF this tail fixes). */
+    for (uint32_t k = 0; k < img_pages; k++) {
+        const uint8_t* src = env_migrate_recv_page_ptr(partition_id, index, cursor++);
+        uint8_t* dst = (uint8_t*)env_mig_img_dst[k];
+        for (uint32_t b = 0; b < 4096; b++) dst[b] = src[b];
+        failover_sweep_keepalive();   /* same rule as the region pour */
+    }
+
     uint32_t extent_pages = (staged.state_sectors + ENV_MIGRATE_SECTORS_PER_PAGE - 1)
                             / ENV_MIGRATE_SECTORS_PER_PAGE;
     for (uint32_t e = 0; e < extent_pages; e++) {
@@ -918,11 +1130,11 @@ int env_migrate_restore(uint32_t partition_id, uint32_t index) {
     env_migrate_restored_mark(partition_id, index);
     kernel_serial_printf(
         "[ENV_MIGRATE] restore: env (partition %u, index %u) is LIVE on node %u as "
-        "env %u -- %u region page(s) and %u extent page(s) poured from the staged "
-        "slot, which is dropped.\n",
+        "env %u -- %u region page(s), %u image-window page(s) and %u extent page(s) "
+        "poured from the staged slot, which is dropped.\n",
         (unsigned)partition_id, (unsigned)index,
         (unsigned)cluster_local_node_id(), (unsigned)new_id,
-        (unsigned)cursor, (unsigned)extent_pages);
+        (unsigned)region_pages, (unsigned)img_pages, (unsigned)extent_pages);
     return ENV_MIGRATE_OK;
 }
 

@@ -278,6 +278,84 @@ static struct ProcessDescriptor* ep_find_proc(const char* name) {
     return 0;
 }
 
+/* ─── The image-window list, shared with the migrate path (P3) ────────────
+ * The canonical order both restore paths derive independently: the record's
+ * sidecar tasks in record order (E7's Linux tasks skipped, exactly as the
+ * capture skips them), ascending vaddr within each task's window. The
+ * walk shape is capture_all's own (2 MiB pages walked inline, 1 GiB
+ * skipped — nothing user maps one here), window predicate only: the region
+ * pages are positional in the migrate stream and are not this list's
+ * business. */
+uint32_t env_payload_image_window_list(const struct EnvCkptRecord* rec,
+                                       uint64_t* vaddrs,
+                                       struct ProcessDescriptor** pds,
+                                       uint32_t cap, uint32_t* err) {
+    if (err) *err = 0;
+    if (!rec || !vaddrs || !pds) { if (err) *err = 1; return 0; }
+    uint32_t n = 0, resolved = 0, named = 0;
+    for (uint32_t t = 0; t < rec->n_tasks && t < ENV_CKPT_MAX_TASKS; t++) {
+        if (rec->tasks[t].kind == ENV_CKPT_TASK_LINUX) continue; /* E7's */
+        named++;
+        struct ProcessDescriptor* pd = ep_find_proc(rec->tasks[t].name);
+        if (!pd || !pd->cr3) continue;
+        resolved++;
+        uint64_t cr3 = pd->cr3;
+        uint64_t* pml4 = (uint64_t*)(uintptr_t)cr3;
+        int overflow = 0;
+        for (uint64_t i4 = 0; i4 < 512 && !overflow; i4++) {
+            if (!(pml4[i4] & 1ull)) continue;
+            uint64_t* pdpt = (uint64_t*)(uintptr_t)(pml4[i4] & 0x000ffffffffff000ull);
+            for (uint64_t i3 = 0; i3 < 512 && !overflow; i3++) {
+                if (!(pdpt[i3] & 1ull)) continue;
+                if (pdpt[i3] & (1ull << 7)) continue;   /* 1 GiB: nothing user maps it here */
+                /* Named pdir, NOT pd: capture_all's walk spells its page
+                 * directory `pd`, but here `pd` is the owning PROCESS (it is
+                 * what pds[] stores), and shadowing it would file every page
+                 * under the page-directory word instead of the sidecar. */
+                uint64_t* pdir = (uint64_t*)(uintptr_t)(pdpt[i3] & 0x000ffffffffff000ull);
+                for (uint64_t i2 = 0; i2 < 512 && !overflow; i2++) {
+                    if (!(pdir[i2] & 1ull)) continue;
+                    uint64_t vbase2m = (i4 << 39) | (i3 << 30) | (i2 << 21);
+                    if (pdir[i2] & (1ull << 7)) {
+                        if (!(pdir[i2] & (1ull << 2))) continue;
+                        for (uint64_t off = 0; off < 0x200000ull; off += 4096ull) {
+                            uint64_t v = vbase2m + off;
+                            if (!ep_in_image_window(v)) continue;
+                            if (n >= cap) { if (err) *err = 2; return 0; }
+                            vaddrs[n] = v; pds[n] = pd; n++;
+                        }
+                        continue;
+                    }
+                    uint64_t* pt = (uint64_t*)(uintptr_t)(pdir[i2] & 0x000ffffffffff000ull);
+                    for (uint64_t i1 = 0; i1 < 512; i1++) {
+                        if (!(pt[i1] & 1ull) || !(pt[i1] & (1ull << 2))) continue;
+                        uint64_t v = vbase2m | (i1 << 12);
+                        if (!ep_in_image_window(v)) continue;
+                        if (n >= cap) { if (err) *err = 2; return 0; }
+                        vaddrs[n] = v; pds[n] = pd; n++;
+                    }
+                }
+            }
+        }
+    }
+    /* SOME-but-not-all is the half-environment a pour must never resume;
+     * NONE-resolving is the degenerate "nothing live here" the migrate
+     * path answers with an empty tail (a host test's world, and the same
+     * answer the record-only stages below give). */
+    if (resolved > 0 && resolved < named) { if (err) *err = 1; return 0; }
+    return n;
+}
+
+int env_payload_proc_parked(const struct ProcessDescriptor* pd) {
+    return ep_proc_parked(pd);
+}
+
+int env_payload_resolve_vaddr(uint64_t cr3, uint64_t vaddr,
+                              uint64_t* out_phys) {
+    if (!out_phys) return 0;
+    return ep_resolve(cr3, vaddr, out_phys);
+}
+
 /* The index-zone size the restore must reproduce exactly (it places the
  * data zone): regions + tasks + per-task blocks + console. */
 static uint32_t ep_index_bytes(uint32_t n_tasks, const uint32_t* task_npages,

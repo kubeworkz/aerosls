@@ -239,4 +239,35 @@ void env_payload_refusal_text(const struct EnvPayloadRefusal* r,
 /* Reset the refusal latch (host tests, and the restore pass per attempt). */
 void env_payload_clear_refusal(void);
 
+/* ─── The image-window list, shared with the migrate path (P3) ─────────────
+ * The reboot payload's page walk collects BOTH the sidecars' image-window
+ * frames and their private-region pages; the migrate payload (P3 inc. 3/4)
+ * used to carry only the region frames, and the destination poured them
+ * under a freshly-booted sidecar whose boot stack, .data and .bss were its
+ * OWN — a mixed state that #PF'd the restored environment on its first
+ * console input (live find, 2026-10-23). The staged payload now appends the
+ * image-window tail after the payload pages, in the canonical order this
+ * pair defines: the record's sidecar tasks in record order, ascending
+ * vaddr within each task — an order both nodes derive from their OWN live
+ * processes, so no vaddrs cross the wire (the region pages are positional
+ * the same way, and the placement gate validates the halves).
+ *
+ * `env_payload_image_window_list` fills vaddrs[] and the owning process per
+ * page and returns the count. err: 0 = ok (count may be 0 — no live
+ * sidecar resolves, e.g. a host test's world), 1 = SOME but not all named
+ * sidecars resolve (a half-environment's bytes cannot be resumed), 2 = more
+ * pages than cap. `env_payload_proc_parked` is the posture predicate the
+ * sender gates on (the pour resumes the instant the sidecars were frozen
+ * in; a mid-compute instant cannot be resumed), and
+ * `env_payload_resolve_vaddr` is the page-table resolve the pour needs on
+ * both ends. */
+struct ProcessDescriptor;
+uint32_t env_payload_image_window_list(const struct EnvCkptRecord* rec,
+                                       uint64_t* vaddrs,
+                                       struct ProcessDescriptor** pds,
+                                       uint32_t cap, uint32_t* err);
+int env_payload_proc_parked(const struct ProcessDescriptor* pd);
+int env_payload_resolve_vaddr(uint64_t cr3, uint64_t vaddr,
+                              uint64_t* out_phys);
+
 #endif /* ENV_PAYLOAD_H */

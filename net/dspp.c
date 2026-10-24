@@ -243,6 +243,14 @@ void dspp_transmit_raw(const void* dspp_payload, uint16_t dspp_len) {
     static volatile uint8_t tx_in_progress = 0;
     if (tx_in_progress) {
         dspp_tx_reentrant_dropped++;
+        /* First + every 500th, so a live transcript can tell a rare
+         * ISR collision from a stuck flag (which would silently eat every
+         * later frame while the senders' own "Sent" prints keep firing). */
+        if (dspp_tx_reentrant_dropped == 1 || (dspp_tx_reentrant_dropped % 500) == 0) {
+            kernel_serial_printf(
+                "[DSPP] transmit dropped: re-entrant (frame_buf busy) -- %llu total.\n",
+                (unsigned long long)dspp_tx_reentrant_dropped);
+        }
         return;
     }
     tx_in_progress = 1;
@@ -262,6 +270,21 @@ void dspp_transmit_raw(const void* dspp_payload, uint16_t dspp_len) {
     /* DSPP is L2-only and belongs on the cluster segment, never the
      * management NIC -- see net/e1000.h on why this is a role and not a
      * route. */
+    /* Heartbeat TX marker -- first + every 500th, rate-limited like the
+     * guards above. A live transcript showing "hb TX" on the sender with
+     * no "hb RX" on every receiver localizes a lost heartbeat to the
+     * wire/driver; neither marker localizes it to the sender's gate. */
+    if (dspp_len == (uint16_t)sizeof(struct DSPPPacketHeader)) {
+        const struct DSPPPacketHeader* peek = (const struct DSPPPacketHeader*)dspp_payload;
+        if (peek->magic == DSPP_MAGIC && peek->opcode == DSPP_CMD_HEARTBEAT) {
+            static uint64_t hb_tx_seen = 0;
+            hb_tx_seen++;
+            if (hb_tx_seen == 1 || (hb_tx_seen % 500) == 0) {
+                kernel_serial_printf("[NET] hb TX: %llu heartbeat frame(s) handed to the NIC\n",
+                                     (unsigned long long)hb_tx_seen);
+            }
+        }
+    }
     e1000_transmit(NIC_ROLE_CLUSTER, frame_buf, (uint16_t)(ETH_HDR_LEN + dspp_len));
     tx_in_progress = 0;
 }
@@ -1169,9 +1192,22 @@ void dspp_rx_dispatch(void* buf, uint16_t len) {
     struct DSPPFullPagePacket* pkt = (struct DSPPFullPagePacket*)buf;
 
     switch (pkt->header.opcode) {
+        case DSPP_CMD_HEARTBEAT: {
+            /* Heartbeat RX marker -- first + every 500th, the receiver's
+             * half of the TX marker above: "hb TX" here never printing on
+             * any node while the sender prints it proves the frames die
+             * between the two NICs. */
+            static uint64_t hb_rx_seen = 0;
+            hb_rx_seen++;
+            if (hb_rx_seen == 1 || (hb_rx_seen % 500) == 0) {
+                kernel_serial_printf("[NET] hb RX: %llu heartbeat frame(s) reached dispatch\n",
+                                     (unsigned long long)hb_rx_seen);
+            }
+            process_consensus_packet(pkt, kernel_tick_counter);
+            return;
+        }
         case DSPP_CMD_REQUEST_VOTE:
         case DSPP_CMD_VOTE_REPLY:
-        case DSPP_CMD_HEARTBEAT:
             process_consensus_packet(pkt, kernel_tick_counter);
             return;
         case DSPP_CMD_PARTITION_REQUEST_VOTE:

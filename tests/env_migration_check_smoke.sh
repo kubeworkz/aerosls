@@ -464,11 +464,15 @@ seed "$W/ahfo"
 sed -i '/^void failover_sweep_keepalive/,/^}/{/check_consensus_heartbeat_tick(now);/d; /failover_live_checkpoint_broadcast(now);/d}' "$W/ahfo/kernel/failover.c"
 tooth "AH-b. failover_sweep_keepalive() no longer pumps both streams (calls remain, they transmit nothing)" "AH" "$W/ahfo"
 
-# AH-c: one of env_migrate.c's four pumps removed (3 < 4: an ACK wait or a
-# pour loop fell out of the keepalive's reach).
+# AH-c: EVERY pump in env_migrate.c removed (0 < 4: the ACK waits and the
+# pour loops all fell out of the keepalive's reach). All of them, not the
+# first — the module grew two more pour-loop pumps with the image-window
+# tail (2026-10-23), and a single-site mutation then left 5 >= 4 and the
+# clause stayed green, proving nothing (the count is a FLOOR, so the tooth
+# has to reach below it).
 seed "$W/ahmig"
-sed -i "0,/failover_sweep_keepalive();/s//\\/\\* MUTATED \\*\\//" "$W/ahmig/kernel/env_migrate.c"
-tooth "AH-c. env_migrate.c no longer pumps the keepalive at all four blocking sites" "AH" "$W/ahmig"
+sed -i "s/failover_sweep_keepalive();/\\/\\* MUTATED \\*\\//g" "$W/ahmig/kernel/env_migrate.c"
+tooth "AH-c. env_migrate.c no longer pumps the keepalive at any of its blocking sites" "AH" "$W/ahmig"
 
 # ── AI. An intent frame refreshes liveness, never creates a watch entry ────
 # AI-a: the peer-status gate deleted — every announcing peer gains a

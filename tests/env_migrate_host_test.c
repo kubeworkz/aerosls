@@ -574,6 +574,27 @@ int env_payload_wait_parked(const struct EnvCkptRecord* rec) {
     (void)rec; return g_parked;
 }
 
+/* The image-window helpers the migrate path shares with the payload layer
+ * (env_payload.h's P3 block). This test's world has NO live sidecar
+ * processes, so the list answers with an empty tail and err=0 — exactly
+ * the page stream the pre-image migrate always sent, which keeps every
+ * phase's page counts and orderings below unchanged. */
+uint32_t env_payload_image_window_list(const struct EnvCkptRecord* rec,
+                                       uint64_t* vaddrs,
+                                       struct ProcessDescriptor** pds,
+                                       uint32_t cap, uint32_t* err) {
+    (void)rec; (void)vaddrs; (void)pds; (void)cap;
+    if (err) *err = 0;
+    return 0;
+}
+int env_payload_proc_parked(const struct ProcessDescriptor* pd) {
+    (void)pd; return 1;
+}
+int env_payload_resolve_vaddr(uint64_t cr3, uint64_t vaddr,
+                              uint64_t* out_phys) {
+    (void)cr3; (void)vaddr; (void)out_phys; return 1;
+}
+
 /* ── Phase G's own world: the destination's regions and pages ──────────
  * The staged record names the bases the payload crossed FOR (the placement
  * both kernels must agree on); the fake create registers the destination's

@@ -162,8 +162,12 @@ int env_migrate_last_status(void);
  * region's frames, plus the durable extent's pages (8 NVMe sectors per
  * 4 KiB page, the stream family's own sector geometry). Both sides compute
  * this from the SAME record — the one that crossed in the BEGIN — and the
- * destination REFUSES a BEGIN whose declared count disagrees, so the page
- * numbering cannot silently drift between the two kernels. */
+ * destination REFUSES a BEGIN whose declared total carries fewer payload
+ * pages than the record names (or an image tail past the ceiling), so the
+ * page numbering cannot silently drift between the two kernels. The
+ * staged total may carry the image-window tail beyond these payload pages:
+ * its count is the difference, and the restore validates it against this
+ * node's own fresh sidecars' windows (env_payload.h's shared order). */
 uint32_t env_migrate_payload_pages(const struct EnvCkptRecord* rec);
 
 /* ─── The migration's environment step (P3 increment 3) ─────────────────────

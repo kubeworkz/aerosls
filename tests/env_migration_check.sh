@@ -700,7 +700,7 @@ elif ! has kernel/env_service.c "failover_sweep_keepalive();"; then
 elif ! has kernel/env_payload.c "failover_sweep_keepalive();"; then
     bad "AH. the restore's parked wait (env_payload.c) no longer pumps the keepalive -- the wait blocks the restore's sweep"
 elif [ "$(grep -cF 'failover_sweep_keepalive();' kernel/env_migrate.c)" -lt 4 ]; then
-    bad "AH. env_migrate.c pumps the keepalive only $(grep -cF 'failover_sweep_keepalive();' kernel/env_migrate.c) time(s) -- both ACK waits and both pour loops must pump it (4 sites)"
+    bad "AH. env_migrate.c pumps the keepalive only $(grep -cF 'failover_sweep_keepalive();' kernel/env_migrate.c) time(s) -- both ACK waits and every pour loop (regions, image-window tail, extent) must pump it (floor of 4 sites)"
 else
     ok "AH. every blocking wait on the sweep pumps the keepalive: the heartbeat and checkpoint streams keep flowing mid-block"
 fi

@@ -91,7 +91,16 @@ void net_rx_dispatch(void* frame, uint16_t len, int ifindex) {
     if (len < ETH_HDR_LEN) return;
     struct EthernetHeader* eth = (struct EthernetHeader*)frame;
 
-    if (net_frame_is_self(eth, ifindex)) { net_self_echo_dropped++; return; }
+    if (net_frame_is_self(eth, ifindex)) {
+        net_self_echo_dropped++;
+        /* First + every 500th: a silent counter hid the possibility that
+         * cross-node frames were being dropped here as "self". */
+        if (net_self_echo_dropped == 1 || (net_self_echo_dropped % 500) == 0) {
+            kernel_serial_printf("[NET] self-echo frame dropped on ifindex %d -- %llu total.\n",
+                                 ifindex, (unsigned long long)net_self_echo_dropped);
+        }
+        return;
+    }
 
     uint16_t et = ntohs(eth->ethertype);
 
