@@ -343,9 +343,25 @@ int env_migrate_in_flight(void);
  * Without it the live 2-node runs of 2026-10-13 declared a live
  * counterparty DEAD and adopted it (the destination after the drop, the
  * source after its walk completed) — a false positive that survived every
- * gate the confirmation guard itself checks. */
+ * gate the confirmation guard itself checks.
+ *
+ * Sized to the window the tail actually defends, NOT to the intent
+ * budget: by the time either resolution point fires, every multi-period
+ * block either side can enter is already announced by its OWN intent
+ * (partition_migrate's announce covers the source's send; the restore
+ * loop's second-half announce covers the destination's restore). What is
+ * left unannounced is one sweep's resume latency — the counterparty's
+ * sweep finishing its current slice and reaching the heartbeat it owes —
+ * so the tail is one sweep period (the ~10 s the confirm walk polls on)
+ * plus margin. The old 300 s matched the intent budget from BEFORE the
+ * intent arm existed; it cost the adoption guard its whole wait on the
+ * 2026-10-24 runtime-suite run: the destination's drop stamped the tail,
+ * and for the next five minutes the surviving LEADER deferred every
+ * death declaration — including a SIGKILLed node's — so nothing was ever
+ * adopted. A blind leader for five minutes is a worse failure than the
+ * one this tail exists to prevent. */
 #define ENV_MIGRATE_SLOT_GRACE_TICKS        60000ull  /* 600 s at ~100 Hz */
-#define ENV_MIGRATE_RESOLVED_GRACE_TICKS     30000ull  /* 300 s */
+#define ENV_MIGRATE_RESOLVED_GRACE_TICKS     1500ull  /* 15 s: one sweep period + margin */
 
 /* ─── Migration intent (the idle-observer arm) ──────────────────────────────
  * The three grace faces above cover only a node that HOLDS migration state:

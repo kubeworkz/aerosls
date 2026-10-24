@@ -1093,10 +1093,11 @@ $(get200 "$((HTTP_BASE + observer))" /api/partitions && dump_rows "$FETCH_BODY")
 # recovers, or a late flip to LEADER -- would otherwise slip past. Both are
 # the other half of the split-brain property, and they pin the two gates:
 #   * cluster_is_leader() in failover_tick(): every node that observes the
-#     death DECLARES it (the observer's log must carry its own declaration
-#     -- it observed), but only the leader calls failover_recover_from().
-#     An Adopted or recovery line on the OBSERVER, after its declaration,
-#     means a follower recovered too: two owners of one partition.
+#     death evaluates it (the observer's log must carry its own evidence --
+#     a declaration, or a bounded-grace DEFERRED line), but only the leader
+#     calls failover_recover_from(). An Adopted or recovery line on the
+#     OBSERVER at or after this run's observation mark means a follower
+#     recovered too: two owners of one partition.
 #   * the election: the loser's consensus role must stay FOLLOWER. A flip
 #     to LEADER after the adoption window is a late split-brain -- two
 #     leaders, two owners.
@@ -1106,12 +1107,40 @@ echo "==> watching node $observer stay FOLLOWER and never adopt (up to ${WAIT_OB
 # poll, or a late misbehaviour -- a follower that recovers after the
 # adoption, or a flip to LEADER that lands a moment later -- would slip
 # past. It passes only if EVERY poll observed the loser as FOLLOWER and no
-# Adopted/recovery line ever appeared after the declaration. A transient
-# fetch failure does NOT fail the watch -- only a 200 that says LEADER, or
-# a late Adopted line, does.
+# Adopted/recovery line ever appeared at or after this run's observation
+# mark. A transient fetch failure does NOT fail the watch -- only a 200
+# that says LEADER, or a late Adopted line, does.
+#
+# ─── The observation mark: three defects the suite run found (2026-10-24) ──
+# Run against a cluster shared by six guards in a row, this step failed
+# twice for observation defects, not for misbehaviour:
+#   1. DECLARATION DEMANDED OF A CORRECTLY-DEFERRED OBSERVER: the observer
+#      had migrated an environment minutes earlier (the confirm guard), so
+#      its own bounded resolution grace (env_migrate_in_flight) withheld
+#      the declaration at first crossing -- one DEFERRED line, then the
+#      declaration a grace later. A graced observer that never adopts is
+#      exactly the property this step pins; demanding the declaration
+#      itself races the grace. A DEFERRED line for $leader is therefore
+#      observation evidence too.
+#   2. UN-WINDOWED FAILURE REPORT: the "ALSO recovered" diagnosis grepped
+#      the observer's WHOLE serial log, which on a shared cluster spans
+#      every earlier guard -- where the observer HAD legally been the
+#      bootstrap leader and printed recovery lines (rc=1, nothing adopted)
+#      for the same node id's earlier, real deaths. Stale-but-legal lines
+#      were reported as this-run misbehaviour, hiding the real failure.
+#   3. INTERLEAVING-SPLIT PREFIX: a busy node's serial print can be split
+#      mid-prefix (observed live: "[INIT] heartbeat 184[FA" + "ILOVER]
+#      Node 1 declared DEAD" across two lines), so the full "[FAILOVER]
+#      Node N declared DEA" prefix misses real declarations. The anchors
+#      below drop the prefix and match on the stable fragment.
+# Adoption evidence itself is verified against live API state in step 7,
+# so a stale log line can never fake an adoption there; only this observer
+# check reasons about log lines at all, which is why its windowing has to
+# be airtight.
 loser_ok=1
 loser_why=""
-decl_seen=0
+obs_seen=0
+obs_mark=0
 deadline=$(( $(date +%s) + WAIT_OBSERVER ))
 while :; do
     # 9a. role: must be FOLLOWER at EVERY poll. Once flipped, the loser is
@@ -1119,23 +1148,29 @@ while :; do
     if get200 "$OBS_PORT" /api/cluster; then
         [ "$(jget "$FETCH_BODY" role)" = "FOLLOWER" ] || { loser_ok=0; loser_why="flipped to LEADER"; }
     fi
-    # 9b. log: the observer must have declared the death (it observed), and
-    # must NOT have printed an Adopted or recovery line AFTER that
-    # declaration. (A stale line from a previous run of this guard against
-    # the same cluster would sit BEFORE this run's declaration -- last_line
-    # takes the LAST match, so the comparison is scoped to this run.)
-    obs_decl="$(last_line "$OBS_LOG" "FAILOVER] Node $leader declared DEA")"
-    obs_adopt="$(last_line "$OBS_LOG" "FAILOVER] Adopted partition.*dead node $leader")"
-    obs_rec="$(last_line "$OBS_LOG" "FAILOVER] recovery for dead node $leader")"
-    if [ -n "$obs_decl" ]; then
-        decl_seen=1
-        [ -z "$obs_adopt" ] || [ "$obs_adopt" -lt "$obs_decl" ] || { loser_ok=0; loser_why="printed its own Adopted line"; }
-        [ -z "$obs_rec" ] || [ "$obs_rec" -lt "$obs_decl" ] || { loser_ok=0; loser_why="printed its own recovery line"; }
+    # 9b. observation mark: this run's DECLARATION (fragment anchor, so an
+    # interleaving-split prefix still matches) or its bounded-grace
+    # DEFERRED line, whichever is later. Stale lines from earlier guards
+    # sit before this run's mark, so they never satisfy the check and
+    # never condemn it.
+    obs_decl="$(last_line "$OBS_LOG" "Node $leader declared DEA")"
+    obs_defr="$(last_line "$OBS_LOG" "Node $leader silent .*DEFERRED")"
+    obs_mark=0
+    [ -n "$obs_decl" ] && obs_mark=$obs_decl
+    if [ -n "$obs_defr" ] && [ "$obs_defr" -gt "$obs_mark" ]; then obs_mark=$obs_defr; fi
+    if [ "$obs_mark" -gt 0 ]; then obs_seen=1; fi
+    # 9c. adoption evidence must land strictly BEFORE the mark, never at
+    # or after it.
+    obs_adopt="$(last_line "$OBS_LOG" "Adopted partition.*dead node $leader")"
+    obs_rec="$(last_line "$OBS_LOG" "recovery for dead node $leader")"
+    if [ "$obs_mark" -gt 0 ]; then
+        [ -z "$obs_adopt" ] || [ "$obs_adopt" -lt "$obs_mark" ] || { loser_ok=0; loser_why="printed its own Adopted line"; }
+        [ -z "$obs_rec" ] || [ "$obs_rec" -lt "$obs_mark" ] || { loser_ok=0; loser_why="printed its own recovery line"; }
     fi
     [ "$(date +%s)" -ge "$deadline" ] && break
     sleep "$POLL"
 done
-[ "$decl_seen" -eq 1 ] || { loser_ok=0; loser_why="never observed the death (no declaration in $OBS_LOG)"; }
+[ "$obs_seen" -eq 1 ] || { loser_ok=0; loser_why="never observed the death (no declaration or deferral for node $leader in $OBS_LOG)"; }
 if [ "$loser_ok" -ne 1 ]; then
     # Which gate failed? Report the specific violation.
     if get200 "$OBS_PORT" /api/cluster && [ "$(jget "$FETCH_BODY" role)" != "FOLLOWER" ]; then
@@ -1144,17 +1179,25 @@ if [ "$loser_ok" -ne 1 ]; then
        one leader and the loser stays FOLLOWER; a second leader means two
        owners of '$NAME'. Stop the cluster and inspect the consensus logs."
     fi
-    obs_adopt="$(last_line "$OBS_LOG" "FAILOVER] Adopted partition.*dead node $leader")"
-    obs_rec="$(last_line "$OBS_LOG" "FAILOVER] recovery for dead node $leader")"
-    if [ -n "$obs_adopt" ] || [ -n "$obs_rec" ]; then
+    # Windowed diagnosis, same mark as the watch above: recovery lines from
+    # BEFORE this run's observation are earlier guards' legal history on the
+    # shared cluster, not this run's misbehaviour -- reporting them was the
+    # misdiagnosis that hid the real (observation) failure in the 2026-10-24
+    # suite run.
+    obs_adopt="$(last_line "$OBS_LOG" "Adopted partition.*dead node $leader")"
+    obs_rec="$(last_line "$OBS_LOG" "recovery for dead node $leader")"
+    late=0
+    [ -n "$obs_adopt" ] && [ "$obs_adopt" -ge "$obs_mark" ] && late=1
+    [ -n "$obs_rec" ] && [ "$obs_rec" -ge "$obs_mark" ] && late=1
+    if [ "$late" -eq 1 ]; then
         fail "node $observer ALSO recovered from dead node $leader -- a follower
        must never adopt (cluster_is_leader() in failover_tick gates recovery
-       to the leader). The observer's log shows:
-$(grep -h "FAILOVER] Adopted partition.*dead node $leader\|FAILOVER] recovery for dead node $leader" "$OBS_LOG" 2>/dev/null | tail -2 | sed 's/^/         /')
+       to the leader). Lines at/after this run's observation mark ($obs_mark):
+$(grep -hn "FAILOVER] Adopted partition.*dead node $leader\|FAILOVER] recovery for dead node $leader" "$OBS_LOG" 2>/dev/null | awk -F: -v m="$obs_mark" '$1 >= m' | tail -2 | sed 's/^/         /')
        Two Adopted lines means two owners of '$NAME'."
     fi
     fail "node $observer neither stayed FOLLOWER nor observed the death cleanly
-       (role check / declaration check failed: ${loser_why:-unknown}) within
+       (role check / observation check failed: ${loser_why:-unknown}) within
        ${WAIT_OBSERVER}s. Inspect $OBS_LOG."
 fi
 echo "   node $observer stayed FOLLOWER and never adopted (observed the death only)"
