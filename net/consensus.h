@@ -83,6 +83,16 @@ enum NodeRole {
  * for a segment that loses the occasional frame. */
 #define LEADER_HEARTBEAT_TICKS        30u
 
+/* Non-leader liveness beat interval, 600 ms. The requirement is one
+ * thing: comfortably below FAILOVER_DEAD_TICKS (300, kernel/failover.h --
+ * referenced by name only, this header does not reach into kernel/), so
+ * several beats land inside any death window even when a sweep blocks for
+ * one or two intervals. Half the leader's rate is plenty -- the beat
+ * proves existence, carries no authority, and every non-leading node on
+ * the segment sends it. Rate-limited for the same reason the leader's is:
+ * the caller is a busy loop, not a 100 Hz timer. */
+#define LIVENESS_BEAT_TICKS           60u
+
 /* consensus_election_timeout() computes this node's staggered deadline. It
  * is defined further down, immediately after CLUSTER_NODE_MAX, because it
  * takes the modulus from that constant rather than repeating the literal. */
@@ -112,6 +122,14 @@ struct ClusterNode {
      * its own transmissions with this, and still honours an incoming
      * higher-term heartbeat via the other. */
     uint64_t last_beat_sent_tick;
+
+    /* kernel_tick_counter at the last liveness beat this node SENT while
+     * NOT leader (DSPP_CMD_LIVENESS). The mirror pair again: that field is
+     * "when did I last speak as one", this is "when did I last prove I
+     * exist". Each rate-limits its own transmissions, neither reads the
+     * other, and a role flip simply starts ticking the one that now
+     * applies. Zeroed by cluster_init() beside its siblings. */
+    uint64_t last_liveness_sent_tick;
 
     /* Votes accumulated in the CURRENT campaign, self included.
      *
@@ -170,6 +188,28 @@ struct ConsensusMessage {
 #define DSPP_CMD_PARTITION_REQUEST_VOTE 0x13
 #define DSPP_CMD_PARTITION_VOTE_REPLY   0x14
 #define DSPP_CMD_PARTITION_HEARTBEAT    0x15
+
+/* DSPP_CMD_LIVENESS: the non-leader's bare-header beat, and why it has to
+ * exist (live 3-node find, 2026-10-24, env_migrate_confirm_live).
+ *
+ * The cluster-wide heartbeat above is leader-only, and
+ * failover_note_heartbeat() -- the only refresher of the death-watch's
+ * last_seen_tick -- was fed by received HEARTBEATs (leaders) and bounded
+ * migration intent frames alone. So a node that WAS leader and lost the
+ * role stopped producing liveness evidence altogether: its watch entry on
+ * every peer, created while it led, aged past FAILOVER_DEAD_TICKS and was
+ * declared DEAD while it sat there alive and serving HTTP. The intent
+ * announce/release merely postponed it -- the rerun saw the release
+ * refresh land and 301 ticks later the declaration fire anyway.
+ *
+ * Every role now speaks: the leader's HEARTBEAT and everyone else's
+ * LIVENESS beat are the same bare DSPPPacketHeader, so silence comes to
+ * mean silence for every node, not just the current leader. The RX side
+ * notes failover liveness ONLY and returns: it must never reset
+ * last_heartbeat_tick or touch the term/role, or follower chatter would
+ * keep a dead leader's authority alive and elections would never fire.
+ * (0x16 is the next free opcode: this file owns 0x10-0x15.) */
+#define DSPP_CMD_LIVENESS       0x16
 
 /* PARTITION_LEASE_MAX deliberately mirrors kernel/partition.h's
  * PARTITION_MAX (256, raised for the Multitenant Isolation Gap Analysis §5
@@ -485,8 +525,11 @@ uint32_t cluster_leader_id(void);
 
 /* The cluster-wide membership heartbeat. As LEADER, broadcasts a
  * DSPP_CMD_HEARTBEAT at most once per LEADER_HEARTBEAT_TICKS. Otherwise
- * measures silence since last_heartbeat_tick and campaigns once
- * consensus_election_timeout() is exceeded.
+ * measures silence since last_heartbeat_tick, campaigns once
+ * consensus_election_timeout() is exceeded, and broadcasts a bare
+ * DSPP_CMD_LIVENESS beat at most once per LIVENESS_BEAT_TICKS -- the
+ * follower half of the failover liveness feed (see the opcode's comment
+ * above for the ex-leader hole it closes).
  *
  * `now` is a kernel_tick_counter reading. Driven from the BSP's HTTP sweep
  * (net/http.c) -- NOT, despite what this function's own comment in
