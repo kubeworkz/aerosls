@@ -5,6 +5,7 @@
 #include "env_service.h"
 #include "env_console.h"
 #include "net_socket_service.h"
+#include "env_catalog.h"
 
 #define CONSOLE_SVC_BUF 4096
 
@@ -86,6 +87,12 @@ void console_service_tick(void) {
          * net_socket_service_tick() must answer. Skip, same shape as the
          * two exclusions above. */
         if (net_socket_service_kernel_slot((uint16_t)s)) continue;
+        /* POSIX-Environments §9: the catalog service's channel likewise
+         * carries CAT_* frames, not console text. Printing them here would
+         * leak a tenant's object names onto the shared serial transcript
+         * AND steal the frames env_catalog_service_tick() must answer.
+         * Third exclusion of the same shape. */
+        if (env_catalog_service_kernel_slot((uint16_t)s)) continue;
 
         struct CapChannel* ch = 0;
         int kdir = 0;

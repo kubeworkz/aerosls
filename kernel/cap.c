@@ -61,6 +61,7 @@
 #include "env_console.h"
 #include "env_storage.h"   // POSIX-Environments Roadmap v0.2 Phase P1b
 #include "net_socket_service.h"  // POSIX-Environments P2 first increment
+#include "env_catalog.h"        // POSIX-Environments §9 interop surface
 #include "../arch/x86/user_paging.h"
 #include <stddef.h>
 
@@ -4213,6 +4214,28 @@ int cap_create_sidecar_in_personality(uint32_t parent_pid,
                                                      pd->pid, pd->name)) {
                         kernel_serial_printf(
                             "[SIDECAR] PID %u '%s': socket service peer '%s' "
+                            "left unregistered (registry full)\n",
+                            pd->pid, pd->name, sc->peer_name);
+                    }
+                }
+                /* POSIX-Environments §9: the mediated interop surface — a
+                 * read-only, partition-scoped view of the object catalog,
+                 * brokered by the SECOND kernel-owned service. Same shape as
+                 * the arm above it, and for the same reason the boundary
+                 * holds: "kernel.env.catalog" is kernel-owned, so the kernel
+                 * end minted above is THIS service's end, registered HERE
+                 * with the caller's already-verified partition. A manifest
+                 * cannot point a catalog channel at another tenant, because
+                 * the partition every verb is filtered by is pd->partition_id
+                 * — state the kernel read off the process descriptor, never
+                 * a field the wire carries. See env_catalog.h for what the
+                 * surface exposes and what it deliberately refuses. */
+                if (sidecar_prefix(sc->peer_name, "kernel.env.catalog")) {
+                    if (!env_catalog_service_register(k_rd, k_wr,
+                                                      pd->partition_id,
+                                                      pd->pid, pd->name)) {
+                        kernel_serial_printf(
+                            "[SIDECAR] PID %u '%s': catalog service peer '%s' "
                             "left unregistered (registry full)\n",
                             pd->pid, pd->name, sc->peer_name);
                     }

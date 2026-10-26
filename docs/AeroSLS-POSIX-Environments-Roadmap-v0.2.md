@@ -2346,9 +2346,115 @@ Each excluded item has a stated destination, so none is silently dropped.
 - **The ARM64 userspace OS.** H2 item #1's work, and the reason E7 targets x86-64 first. Unchanged.
 - **A capacity phase** that raises `PROC_MAX`/`SIDECAR_REGISTRY_MAX` (§8).
 
-**A real design question, deliberately not answered here.**
+**Answered here — §9.1.**
 
-- **Native ↔ POSIX interop.** PASE programs share the IFS and Db2 with native ILE jobs; that sharing is arguably *more* of PASE's value than the binary compatibility itself. Today a Linux task in AeroSLS gets **exactly one capability — the channel to its own POSIX sidecar** (`AeroSLS-Linux-ABI-Shim-Design-v0.1.md` §3.5) — which is superb isolation and makes the environment a sealed box: it cannot see the SLS object catalog, the integrated DB, or a native SIMI program. Whether a *mediated* interop surface (the sidecar proxying specific requests to the catalog or the row store through the kernel's existing capability checks, so the tenant never gains authority the profile denies) is the right answer, and how narrow it should be, is the largest architectural question left in the project. v0.2 does not decide it — it records it, because P1b's durable storage and P2's brokered sockets are both inputs any answer would need, and deciding it before both exist would decide it on guesses.
+- **Native ↔ POSIX interop.** PASE programs share the IFS and Db2 with native ILE jobs; that sharing is arguably *more* of PASE's value than the binary compatibility itself. Today a Linux task in AeroSLS gets **exactly one capability — the channel to its own POSIX sidecar** (`AeroSLS-Linux-ABI-Shim-Design-v0.1.md` §3.5) — which is superb isolation and makes the environment a sealed box: it cannot see the SLS object catalog, the integrated DB, or a native SIMI program. This was the largest architectural question left in the project, and §9.1 now answers it: **yes to a mediated surface, read-only and partition-scoped, brokered by a second kernel service.** The two inputs v0.2 said it was waiting on — P1b's durable storage and P2's brokered sockets — both exist, so the answer is no longer decided on guesses.
+
+---
+
+## 9.1 Native ↔ POSIX interop: the mediated surface, answered
+
+§9 recorded this as "the largest architectural question left in the project"
+and deliberately left it open until P1b and P2 existed. Both exist. This
+section states the answer, the reasons it could have gone the other way, and
+what the first cut deliberately does not do.
+
+**The answer.** A POSIX environment reaches a **read-only, partition-scoped
+view of the object catalog**, brokered by a **second kernel-owned service**,
+`kernel.env.catalog`, reached through the same channel machinery P2 built for
+`kernel.net.socket`. Four verbs: `CAT_INFO` (the handshake), `CAT_LIST`,
+`CAT_STAT`, `CAT_READ`. No write verb exists in the table.
+
+**Why a mediated surface at all, rather than the sealed box.** The sealed box
+is superb isolation and a poor operating system. §10.4's "first user" gate
+asks a POSIX environment to do real work, and real work means reading the
+system's data: a program that cannot see the catalog cannot read a table, and
+an environment that cannot read a table is a demo rather than a PASE. IBM i's
+own answer to this is the point of the mapping — a PASE program *shares* the
+IFS and Db2 with native jobs (§0.1's table) — so refusing interop outright
+would concede the half of PASE that §0.1 called "arguably more of PASE's
+value than the binary compatibility itself".
+
+**Why mediated rather than direct.** The alternative — handing the sidecar a
+catalog authority — is LPAR Phase 11 undone by an API call: the tenant would
+gain authority its profile denies, and the isolation boundary would move from
+a place the kernel enforces to a place a sidecar decides. §2's third design
+principle already forbids that in words (*"the kernel brokers; the partition
+bounds"*), and P2 proved the shape that satisfies it: the tenant names a
+kernel-owned peer, `cap_create_sidecar()` mints the kernel end, and the
+service answers against kernel state with the caller's identity attached.
+The catalog reuses that machinery unchanged, so a reviewer has one shape to
+check rather than two.
+
+**Why a second service rather than a wider first one.** P2's verbs run a
+tenant's traffic against the kernel stack (`tcp_quota`, attribution,
+admission). These verbs answer a name lookup. One channel answering two specs
+would mean the socket service's admission path and a catalog lookup sharing a
+switch, and the property §9 needs — that the partition a verb is filtered by
+is one the *kernel* verified — is easier to audit when it is the only thing a
+file does. Two small services with one wire discipline beat one service with
+two jobs.
+
+**The boundary, and the answer a foreign name gets.** Every verb is answered
+against `object_catalog[]` entries whose `SLSObjectEntry.partition_id` equals
+the partition the channel **registered with** — `pd->partition_id`, read off
+the process descriptor in `cap_create_sidecar()`, never a field the wire
+carries. A name in another partition is **not representable in the reply**: it
+is absent from `CAT_LIST`, and `CAT_STAT`/`CAT_READ` on it answer the same
+`CAT_ERR_NOENT` as a name that never existed. That choice of answer is the
+security property, not an omission. A `CAT_ERR_PERM` would confirm to a
+tenant that a name exists in some partition it cannot see, turning a list call
+into an existence oracle across the LPAR boundary. P2's own summary states the
+same property for sockets — *"a cross-partition socket is not representable at
+the wire"*; this is that statement applied to a catalog entry.
+
+**What is refused inside the partition, and why by name.** Two kinds answer a
+refusal instead of data, each for a reason the tree already states elsewhere:
+
+- `OBJ_TYPE_SYSTEM_METADATA` → `CAT_ERR_PERM`. `object_catalog.h`'s own role
+  table gives `APP_USER` no read on `SYSTEM_METADATA`. The catalog does not
+  re-derive that policy; it surfaces the refusal by name so the answer is
+  visible in a transcript instead of silent.
+- `uses_rowstore == 1` → `CAT_ERR_TYPE` on `CAT_READ`. Phase 24's guard in
+  `sys_sls_select()` names the SQL path for a row-set table, and `CAT_READ`
+  *is* the legacy record path, so it inherits that refusal verbatim. Routing
+  SQL through a mediated byte channel is a larger design than this first cut,
+  and saying so by name beats silently returning a legacy view of a table that
+  no longer keeps its rows there. `CAT_STAT` still answers for such an object:
+  its type and size are real metadata, and hiding them would make the refusal
+  unexplainable.
+
+**Explicitly not in scope for this cut.**
+
+- **A write path, schema mutation, or any `CAT_*` verb that changes state.**
+  A read-only surface has no write-path permission question to get wrong,
+  which is exactly why it is the right first cut: the hard part of interop is
+  the isolation, and isolation is fully exercised by reading.
+- **A per-object ACL keyed on a uid.** A registered channel carries a
+  partition and a pid, not a uid. Inventing an ACL the caller's identity
+  cannot support would be worse than not having one. Row-level policy is the
+  SQL path's job (`rowstore.c`'s `catalog_check_access`) and stays there.
+- **Cross-partition federation, shared stores, and reaching a native SIMI
+  program.** P1b already scoped shared storage out with the note that it
+  "needs the object catalog's authority model in front of it, not just a
+  format"; this cut puts a first, narrow slice of that model in front of the
+  catalog and no more.
+- **The tenant-side client and its shell command.** The service, its wire and
+  its boundary land and are guarded here; the sidecar client that speaks the
+  four verbs is the next increment, and it is a client of a surface that
+  already exists rather than a design decision.
+
+**Verification.** `kernel/env_catalog.c` compiles into the kernel; the
+service is registered by `cap_create_sidecar()` under the kernel-owned name
+`kernel.env.catalog`, its kernel slot is skipped by `console_service_tick()`
+so `CAT_*` frames never reach the shared serial transcript, and its tick runs
+in `microkernel_service_poll()` beside `net_socket_service_tick()`.
+`tests/env_catalog_broker_check.sh` guards each of those five wires plus the
+boundary itself, and `tests/env_catalog_host_test.c` links the real service
+and executes the verbs against a seeded two-partition catalog — including the
+clause that a name present in partition 2 is answered `CAT_ERR_NOENT` by a
+channel registered in partition 1, which is the property this section exists
+to establish.
 
 ---
 
