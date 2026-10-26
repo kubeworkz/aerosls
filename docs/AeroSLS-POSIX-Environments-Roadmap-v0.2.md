@@ -2450,7 +2450,9 @@ service is registered by `cap_create_sidecar()` under the kernel-owned name
 so `CAT_*` frames never reach the shared serial transcript, and its tick runs
 in `microkernel_service_poll()` beside `net_socket_service_tick()`.
 `tests/env_catalog_broker_check.sh` guards each of those five wires plus the
-boundary itself, and `tests/env_catalog_host_test.c` links the real service
+boundary itself — and `tests/env_catalog_broker_check_smoke.sh` reddens every
+one of those teeth on a copy of the tree, so the guard's green run is one whose
+failure mode has been observed — and `tests/env_catalog_host_test.c` links the real service
 and executes the verbs against a seeded two-partition catalog — including the
 clause that a name present in partition 2 is answered `CAT_ERR_NOENT` by a
 channel registered in partition 1, which is the property this section exists

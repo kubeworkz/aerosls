@@ -51,11 +51,12 @@
 #
 # ─── What this guard does NOT do ──────────────────────────────────────────
 # It has no live arm: §9.1 names a source guard, and the verbs are executed
-# by the host test. A committed smoke that reddens each tooth below when the
-# property is removed is NOT written yet — said here rather than implied, so
-# that nobody reads the teeth above as proven when only the green run has
-# been. Each anchor is a CODE line rather than a comment (the N12 rule), so
-# prose cannot satisfy one.
+# by the host test. Its teeth ARE proven: tests/
+# env_catalog_broker_check_smoke.sh reddens each anchor below on a copy of
+# the tree and requires this guard to exit 1 naming the clause it broke —
+# so a green run here is a green run whose failure mode has been seen. Each
+# anchor is a CODE line rather than a comment (the N12 rule), so prose
+# cannot satisfy one.
 #
 # GUARD-KIND: host (plain bash over the tree; no build, no QEMU).
 #
