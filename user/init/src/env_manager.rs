@@ -629,6 +629,40 @@ impl EnvManager {
                     Some(v) => v,
                     None => return self.reply(reply, ENV_CREATE, ENV_ERR_INVAL, 0, 0),
                 };
+                // Idempotent by identity: an environment at (partition, index)
+                // that already stands IS the answer to this create.
+                //
+                // The caller cannot tell "created" from "created, but my reply
+                // missed the deadline": env_service_create() returns -1 either
+                // way (kernel/env_service.c drains the stale reply and retries on
+                // the next sweep), and the migrate restore's REFUSE_CREATE arm
+                // then retried ENV_CREATE on the following period — under load on
+                // the 3-node TCG cluster that first reply did arrive late, so the
+                // retry reached here with the environment already built. Without
+                // this arm it built a SECOND one at the same identity: two
+                // sidecars both named aerosls.posix.<index> (the later one
+                // shadowing the first in cap's name registry), ~1700 frames
+                // charged twice, and — because placement on this OS is a
+                // deterministic function of the ascending frame watermark — the
+                // retry's regions landed one environment past the staged bases,
+                // where the restore's placement gate refused every remaining
+                // attempt ("fresh environment landed off the staged bases",
+                // guard env_migrate_confirm_live, 2026-10-26). Answering with the
+                // environment that already exists makes the retry converge on the
+                // same frames instead of allocating past them.
+                //
+                // Nothing stale can be handed back: `forget_dead_environments`
+                // ran above, so an entry here has live sidecars. Placed before
+                // the capacity check because an identity that already exists
+                // needs no new room.
+                if let Some(pos) = self
+                    .envs
+                    .iter()
+                    .position(|(_, e)| e.partition == partition && e.index == index)
+                {
+                    let id = self.envs[pos].0;
+                    return self.reply(reply, ENV_CREATE, ENV_OK, id, partition);
+                }
                 if self.envs.len() >= self.max_envs {
                     return self.reply(reply, ENV_CREATE, ENV_ERR_FULL, 0, partition);
                 }
@@ -1028,6 +1062,51 @@ mod tests {
         let n2 = mgr.handle_request(&k, &create_req(7, 1), &mut reply);
         assert_eq!(reply_status(&reply, n2).1, 2);
         assert_eq!(mgr.environments().len(), 2);
+    }
+
+    /// The lost-reply retry: a create for an identity that already stands
+    /// answers with THAT environment instead of building a second one at the
+    /// same (partition, index).
+    ///
+    /// The caller this protects cannot distinguish "nothing was created" from
+    /// "created, but my reply missed the deadline" (env_service_create returns
+    /// -1 for both), and the migrate restore's sweep retries the round trip on
+    /// its next period. Built twice, the identity would grow two pairs of
+    /// sidecars under one name — the second shadowing the first — and, because
+    /// regions are placed at the ascending frame watermark, the retry's
+    /// environment would land a whole environment past the staged bases the
+    /// restore's placement gate requires (the live refusal, 2026-10-26).
+    #[test]
+    fn a_second_create_for_an_identity_that_exists_answers_with_it_and_builds_nothing() {
+        let k = SimKernel::new();
+        let mut mgr = EnvManager::new(images(), 8);
+        let mut reply = [0u8; 64];
+        let n1 = mgr.handle_request(&k, &create_req(6, 1), &mut reply);
+        let first = reply_status(&reply, n1).1;
+
+        let n2 = mgr.handle_request(&k, &create_req(6, 1), &mut reply);
+        assert_eq!(reply_status(&reply, n2), (ENV_OK, first, 6),
+                   "the retry is answered with the environment that already stands");
+        assert_eq!(mgr.environments().len(), 1,
+                   "one identity, one environment — the retry did not duplicate it");
+        assert_eq!(k.created().len(), 2,
+                   "still just the first create's two sidecars");
+        assert_eq!(k.regions().len(), 3,
+                   "the retry took no frames — the watermark must not move");
+
+        // A different index is a different environment, and a full manager that
+        // already holds THIS identity still answers it (the identity check sits
+        // ahead of the capacity check).
+        let mut full = EnvManager::new(images(), 1);
+        let mut r2 = [0u8; 64];
+        let m1 = full.handle_request(&k, &create_req(7, 1), &mut r2);
+        let held = reply_status(&r2, m1).1;
+        let m2 = full.handle_request(&k, &create_req(7, 1), &mut r2);
+        assert_eq!(reply_status(&r2, m2), (ENV_OK, held, 7),
+                   "an identity that exists is not refused for lack of room");
+        let m3 = full.handle_request(&k, &create_req(7, 2), &mut r2);
+        assert_eq!(reply_status(&r2, m3).0, ENV_ERR_FULL,
+                   "a NEW identity at capacity is still refused");
     }
 
     #[test]
