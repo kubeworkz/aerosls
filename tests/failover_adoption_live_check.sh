@@ -213,9 +213,9 @@ SVC="svc-$NAME"                      # the service-registry twin: registered on 
                                      # stale re-announce must be REJECTED (step 12)
 
 if [ "$FAST" = "1" ]; then
-    POLL=0.5; WAIT_NODES=10; WAIT_LEARN=6; WAIT_CKPT=6; WAIT_ADOPT=10; WAIT_HANDOFF=6; WAIT_OBSERVER=5; WAIT_BOOT=10; WAIT_CLAIM=8; WAIT_CONV=8; WAIT_MIGRATE=8; WAIT_TRANSFER=8; WAIT_LEASE=8
+    POLL=0.5; WAIT_NODES=10; WAIT_LEARN=6; WAIT_CKPT=6; WAIT_ADOPT=10; WAIT_HANDOFF=6; WAIT_OBSERVER=5; WAIT_BOOT=10; WAIT_CLAIM=8; WAIT_CONV=8; WAIT_MIGRATE=8; WAIT_TRANSFER=8; WAIT_LEASE=8; STILL_READ=8
 else
-    POLL=2;   WAIT_NODES=240; WAIT_LEARN=30; WAIT_CKPT=60; WAIT_ADOPT=240; WAIT_HANDOFF=120; WAIT_OBSERVER=60; WAIT_BOOT=240; WAIT_CLAIM=240; WAIT_CONV=180; WAIT_MIGRATE=120; WAIT_TRANSFER=120; WAIT_LEASE=120
+    POLL=2;   WAIT_NODES=240; WAIT_LEARN=30; WAIT_CKPT=60; WAIT_ADOPT=240; WAIT_HANDOFF=120; WAIT_OBSERVER=60; WAIT_BOOT=240; WAIT_CLAIM=240; WAIT_CONV=180; WAIT_MIGRATE=120; WAIT_TRANSFER=120; WAIT_LEASE=120; STILL_READ=30
 fi
 # How many campaigns the step-11 lease-row gate may drive before it accuses
 # the observer's RX path (see step 11a). One acquire is one campaign; a
@@ -322,6 +322,14 @@ PY
 
 # row_if <json> <name> <owner> -- prints "partition <id> '<name>' (owner
 # node <owner>)" when a row with BOTH the name and the owner exists.
+#
+# Exit status is load-bearing: 0 means "the body parsed" (with or without
+# the row), 3 means "the body did not parse". An unreadable body used to
+# answer the same as an absent row -- both printed nothing -- which lets a
+# truncated response report a perfectly owned partition as '<none>' (the
+# 2026-10-24 step-10 find). Callers that only want the row keep testing -n;
+# callers that must tell "couldn't read" from "read it, it isn't there"
+# test $? as well.
 row_if() {
     python3 - "$1" "$2" "$3" <<'PY'
 import json, sys
@@ -329,7 +337,8 @@ name, owner = sys.argv[2], sys.argv[3]
 try:
     rows = json.loads(sys.argv[1]).get("partitions", [])
 except Exception:
-    rows = []
+    # Unparseable (truncated body, error JSON, empty): NOT "no such row".
+    sys.exit(3)
 for p in rows:
     if p.get("name") == name and str(p.get("owner_node")) == owner:
         print("partition %s '%s' (owner node %s)" % (p.get("id"), name, owner))
@@ -880,7 +889,7 @@ done
 #   * a survivor to report LEADER (role flip on the surviving pair), and
 #   * its log to show the death declaration THEN the adoption, and
 #   * its partition list to hold '$NAME' with owner = that survivor.
-echo "==> waiting for a survivor to adopt '$NAME' from the dead leader (up to ${WAIT_ADOPT}s; death at 300 ticks of silence)"
+echo "==> waiting for a survivor to adopt '$NAME' from the dead leader (up to ${WAIT_ADOPT}s; declared after FAILOVER_DECLARE_TICKS of silence)"
 adopter=""; observer=""
 deadline=$(( $(date +%s) + WAIT_ADOPT ))
 while :; do
@@ -1309,13 +1318,51 @@ $(grep -h 'PERSIST]' "$L_LOG" 2>/dev/null | head -6 | sed 's/^/       /')"
 # owned by the adopter, re-learned periodically).
 flap_s="$(last_line "$CAN_LOG" "PARTITION] sync.*'$NAME'.*learned from node $leader")"
 flap_o="$(last_line "$OBS_LOG" "PARTITION] sync.*'$NAME'.*learned from node $leader")"
+# A failed read is not a stolen partition (the 2026-10-24 step-10 find).
+# Both lists are read ONCE here, and the run failed with the adopter's list
+# holding '<none>' while the observer, reading the same table moments
+# later, held 'partition 23 ... (owner node 1)'. The row had provably been
+# there the whole time: node 1 set partition 23's ownership to itself at
+# its adoption and NOTHING touched it between there and this gate (its
+# next ownership line for 23 is the later, false, re-adoption). So the
+# single read lost -- a 3 s curl against a node that had just adopted 24
+# partitions, a non-200, or a 200 cut mid-body so json.loads failed -- and
+# an unreadable read was reported as the exact misbehaviour this gate
+# exists to catch: the same defect step 9's watch already fixed (an
+# observation failure reported as misbehaviour), one gate later.
+#
+# So the pair is re-read while EITHER half is UNUSABLE (fetch failed,
+# non-200, or an unparseable body -- row_if exits 3 on that), for a bounded
+# window. A read that SUCCEEDS and disagrees still fails immediately: that
+# is the real thing, and it is never retried away.
 still_s=""; still_o=""
-if get200 "$((HTTP_BASE + adopter))" /api/partitions; then
-    still_s="$(row_if "$FETCH_BODY" "$NAME" "$adopter")"
-fi
-if get200 "$OBS_PORT" /api/partitions; then
-    still_o="$(row_if "$FETCH_BODY" "$NAME" "$adopter")"
-fi
+s_state="not attempted"; o_state="not attempted"
+read_ok=0
+still_deadline=$(( $(date +%s) + STILL_READ ))
+while :; do
+    s_ok=0; o_ok=0
+    if get200 "$((HTTP_BASE + adopter))" /api/partitions; then
+        if still_s="$(row_if "$FETCH_BODY" "$NAME" "$adopter")"; then
+            s_ok=1; s_state="read ok (row ${still_s:-absent})"
+        else
+            s_state="HTTP 200 but the body did not parse"
+        fi
+    else
+        still_s=""; s_state="fetch failed (HTTP ${FETCH_STATUS:-none})"
+    fi
+    if get200 "$OBS_PORT" /api/partitions; then
+        if still_o="$(row_if "$FETCH_BODY" "$NAME" "$adopter")"; then
+            o_ok=1; o_state="read ok (row ${still_o:-absent})"
+        else
+            o_state="HTTP 200 but the body did not parse"
+        fi
+    else
+        still_o=""; o_state="fetch failed (HTTP ${FETCH_STATUS:-none})"
+    fi
+    if [ "$s_ok" -eq 1 ] && [ "$o_ok" -eq 1 ]; then read_ok=1; break; fi
+    [ "$(date +%s)" -ge "$still_deadline" ] && break
+    sleep "$POLL"
+done
 if [ -n "$flap_s" ] && [ "$flap_s" -gt "$adopt_line" ]; then
     fail "the adopted partition FLAPPED: node $adopter re-learned '$NAME' from the
        resurrected node $leader (learn line at $flap_s, after the adoption).
@@ -1326,6 +1373,13 @@ if [ -n "$flap_o" ] && [ "$flap_o" -gt "$handoff_line" ]; then
        resurrected node $leader (learn line at $flap_o, after the handoff).
        The conflict path must reject the stale claim, not apply it."
 fi
+[ "$read_ok" -eq 1 ] || fail "could not read BOTH survivors' lists for '$NAME' within ${STILL_READ}s --
+       an OBSERVATION failure, not a stolen partition (a gate that cannot
+       read must not accuse the kernel of losing a row it provably holds).
+       adopter node $adopter: $s_state
+       observer node $observer: $o_state
+       Rerun once the adopter's HTTP answers steadily; if it reproduces,
+       the adopter's /api/partitions path is what to inspect."
 [ -n "$still_s" ] && [ -n "$still_o" ] || fail "the survivors no longer agree on the owner of
        '$NAME': adopter list held '${still_s:-<none>}', observer list held
        '${still_o:-<none>}'. The resurrected node's stale claim stole the

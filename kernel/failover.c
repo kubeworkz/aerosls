@@ -42,6 +42,23 @@ static uint32_t last_adopted = 0;
 static uint32_t last_unrestored_envs = 0;
 static uint32_t last_restored_envs = 0;
 
+/* THIS node's relaunch grace (see FAILOVER_RELAUNCH_GRACE_TICKS): 0 when
+ * disarmed. Reset by failover_init(), armed by failover_note_relaunch_grace()
+ * from the boot path — kept apart from init so a host test can arm it
+ * explicitly and pin both halves of the window. */
+static uint64_t fo_relaunch_grace_until = 0;
+
+/* Silence before this tick is not counted. Set to the grace's expiry when
+ * the grace is armed, so a peer's silence is measured from the end of OUR
+ * boot rather than from wherever it happened to stop beating. Declaring at
+ * the instant the grace lifted was the live 2026-10-24 find: node 1 and
+ * node 3 both printed "Node 2 declared DEAD (silent 302/304 ticks)" within
+ * lines of their own grace expiring — the silence they measured had
+ * accrued ACROSS their boot, the exact window the grace exists to excuse
+ * (our restore burst is what stalled that peer). 0 when no grace was ever
+ * armed, which leaves every pre-existing silence arithmetic untouched. */
+static uint64_t fo_watch_from = 0;
+
 /* The armed set of ONE recovery (P3 increment 11): the (partition, index)
  * pairs whose durable records this pass put into the replay's pending set,
  * so the driver's outcome can be classified PER RECORD afterwards. File
@@ -56,7 +73,19 @@ static uint32_t fo_armed_count = 0;
 void failover_init(void) {
     fo_memset(peers, 0, sizeof(peers));
     last_adopted = 0;
+    fo_relaunch_grace_until = 0;
+    fo_watch_from = 0;
     kernel_serial_print("[FAILOVER] Subsystem initialised.\n");
+}
+
+void failover_note_relaunch_grace(uint64_t now) {
+    fo_relaunch_grace_until = now + FAILOVER_RELAUNCH_GRACE_TICKS;
+    fo_watch_from = fo_relaunch_grace_until;
+    kernel_serial_printf(
+        "[FAILOVER] relaunch grace: this node just came up -- no peer is "
+        "declared DEAD for %u ticks (until tick %llu).\n",
+        (unsigned)FAILOVER_RELAUNCH_GRACE_TICKS,
+        (unsigned long long)fo_relaunch_grace_until);
 }
 
 static struct PeerLiveness* find_peer(uint32_t node_id) {
@@ -72,6 +101,13 @@ static struct PeerLiveness* alloc_peer(uint32_t node_id) {
             peers[i].node_id = node_id;
             peers[i].active  = 1;
             peers[i].status  = PEER_ALIVE;
+            /* Per-episode state must be this peer's own, never the previous
+             * occupant's: a recycled slot carrying a stale grace_until_tick
+             * would defer declarations against a node that was never
+             * relaunched, and a stale grace_noted would swallow its line. */
+            peers[i].defer_noted     = 0;
+            peers[i].grace_noted     = 0;
+            peers[i].grace_until_tick = 0;
             return &peers[i];
         }
     }
@@ -87,13 +123,36 @@ void failover_note_heartbeat(uint32_t node_id, uint64_t now) {
 
     p->last_seen_tick = now;
     p->defer_noted = 0;   /* seen: a later silence earns its own DEFERRED line */
+    p->grace_noted = 0;   /* ...and its own silence-grace line */
     if (p->status == PEER_DEAD) {
         kernel_serial_printf("[FAILOVER] Node %u came back (was dead)\n", node_id);
+        /* The peer half of the relaunch grace: a node that returns from DEAD
+         * is the relaunched one, and its first seconds are its own
+         * restore — both its beats and its peers' stability are in question
+         * for exactly that window. One window per episode (re-armed here,
+         * never by an ordinary beat: re-arming on every beat would excuse a
+         * peer that stopped beating entirely, which is the one case this
+         * gate exists for). */
+        p->grace_until_tick = now + FAILOVER_RELAUNCH_GRACE_TICKS;
+        kernel_serial_printf(
+            "[FAILOVER] relaunch grace: node %u just came back -- no "
+            "declaration against it for %u ticks (until tick %llu).\n",
+            node_id, (unsigned)FAILOVER_RELAUNCH_GRACE_TICKS,
+            (unsigned long long)p->grace_until_tick);
     }
     p->status = PEER_ALIVE;
 }
 
 void failover_tick(uint64_t now) {
+    /* This node's own relaunch grace: a node that has just booted is
+     * restoring its durable state on this very sweep and its boot's I/O is
+     * stalling the peers it is rejoining, so everything below would fire on
+     * a silence it caused. The silence keeps accruing meanwhile — the grace
+     * ends and the declaration fires on the first tick after it (the
+     * per-peer half below pins that pairing; this early return is the same
+     * delay, applied to the whole pass). */
+    if (now < fo_relaunch_grace_until) return;
+
     for (int i = 0; i < FAILOVER_MAX_PEERS; i++) {
         if (!peers[i].active) continue;
         if (peers[i].status == PEER_DEAD) continue;
@@ -115,7 +174,37 @@ void failover_tick(uint64_t now) {
          * at least as recently as this sample: silence is zero. */
         uint64_t silence = (now > peers[i].last_seen_tick)
                          ? now - peers[i].last_seen_tick : 0;
+        /* ...except the part of it that accrued across OUR relaunch grace.
+         * The grace defers declarations, but on its own it only moves the
+         * firing to the expiry tick: the silence a peer looked to have was
+         * silence measured against a boot of ours that was stalling it, and
+         * the live run showed exactly that (both survivors declared the
+         * same healthy peer within lines of their grace lifting, at 302 and
+         * 304 ticks). Re-basing on the grace's expiry says the honest thing
+         * — our watch starts when our own settle window ends — and it is a
+         * no-op the moment fo_watch_from is 0, so a node that never armed a
+         * grace keeps the arithmetic it always had. A peer that stops
+         * beating AFTER the expiry is declared on the normal terms. */
+        if (fo_watch_from > peers[i].last_seen_tick && now >= fo_watch_from)
+            silence = now - fo_watch_from;
         if (silence >= FAILOVER_DEAD_TICKS) {
+            /* The relaunch grace (see FAILOVER_RELAUNCH_GRACE_TICKS): a peer
+             * that just came back is NOT declared dead while its window
+             * stands, whatever the silence says. Checked first — it is the
+             * newest fact about the peer, and the two migration gates below
+             * are bounded by their own budgets anyway. One DEFERRED line per
+             * silent episode, the flag an ordinary beat resets. */
+            if (now < peers[i].grace_until_tick) {
+                if (!peers[i].defer_noted) {
+                    peers[i].defer_noted = 1;
+                    kernel_serial_printf(
+                        "[FAILOVER] Node %u silent %llu ticks -- declaration "
+                        "DEFERRED: relaunch grace (it came back at tick %llu)\n",
+                        peers[i].node_id, (unsigned long long)silence,
+                        (unsigned long long)peers[i].last_seen_tick);
+                }
+                continue;
+            }
             /* P3 live arm (2026-10-13): a silence this node's OWN
              * environment migration produced is not a death. The source's
              * synchronous payload send and the destination's restore (create
@@ -163,6 +252,29 @@ void failover_tick(uint64_t now) {
                         "DEFERRED: an environment migration is in flight on "
                         "this node\n",
                         peers[i].node_id, (unsigned long long)silence);
+                }
+                continue;
+            }
+            /* The silence grace (FAILOVER_SILENCE_GRACE_TICKS): the LAST
+             * gate, immediately before the declaration, and only when no
+             * other arm has already deferred this sweep. Every other reason
+             * above is more specific and keeps precedence; this one is the
+             * catch-all that says "300 ticks is suspicion, not proof" on a
+             * cluster whose peers stall for whole seconds. One line per
+             * episode (grace_noted, reset by an ordinary beat exactly like
+             * defer_noted), and silence keeps accruing across it, so a peer
+             * that is really gone is declared on the first tick past
+             * FAILOVER_DECLARE_TICKS. */
+            if (silence < FAILOVER_DECLARE_TICKS) {
+                if (!peers[i].grace_noted) {
+                    peers[i].grace_noted = 1;
+                    kernel_serial_printf(
+                        "[FAILOVER] Node %u silent %llu ticks -- declaration "
+                        "DEFERRED: silence grace (%u ticks of it still to run, "
+                        "declaring at %u)\n",
+                        peers[i].node_id, (unsigned long long)silence,
+                        (unsigned)(FAILOVER_DECLARE_TICKS - silence),
+                        (unsigned)FAILOVER_DECLARE_TICKS);
                 }
                 continue;
             }

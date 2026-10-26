@@ -321,9 +321,22 @@ static void test_liveness(void) {
     failover_tick(100);
     CHECK(failover_peer_status(1) == PEER_ALIVE, "node 1 still alive at tick 100");
 
-    /* Silence: no heartbeat for 300+ ticks */
+    /* Silence: no heartbeat for 300+ ticks. FAILOVER_DEAD_TICKS alone is
+     * SUSPICION — the declaration additionally requires the per-episode
+     * silence grace (FAILOVER_DECLARE_TICKS), because every declaration
+     * three consecutive live suite runs made was false and all of them
+     * landed between 300 and 596 ticks of a peer that was alive; the fourth
+     * run's four false declarations all landed just past the line, sizing
+     * the grace against stalls of ~2900 ticks (see failover.h). The tick
+     * samples below are written against the MACRO, not the number, so the
+     * grace can be re-sized without this test silently pinning a stale
+     * threshold. */
     failover_tick(351);
-    CHECK(failover_peer_status(1) == PEER_DEAD, "node 1 declared dead after 300 ticks of silence");
+    CHECK(failover_peer_status(1) != PEER_DEAD,
+          "*** 301 ticks of silence does NOT declare: the silence grace holds it ***");
+    failover_tick(50 + FAILOVER_DECLARE_TICKS + 1);  /* silence DECLARE+1 */
+    CHECK(failover_peer_status(1) == PEER_DEAD,
+          "...and a full FAILOVER_DECLARE_TICKS of silence declares: the grace delays, it does not blindfold");
 
     /* Suspected state at half the dead threshold */
     failover_init();
@@ -343,11 +356,11 @@ static void test_liveness(void) {
     failover_init();
     g_env_migrate_in_flight = 1;
     failover_note_heartbeat(4, 0);
-    failover_tick(351);  /* silence 301 >= DEAD, but a migration is in flight */
+    failover_tick(FAILOVER_DECLARE_TICKS + 1);  /* silence DECLARE+1, but a migration is in flight */
     CHECK(failover_peer_status(4) != PEER_DEAD,
-          "*** node 4 NOT declared dead at 301 ticks of silence while a migration is in flight ***");
+          "*** node 4 NOT declared dead past the silence grace while a migration is in flight ***");
     g_env_migrate_in_flight = 0;
-    failover_tick(352);
+    failover_tick(FAILOVER_DECLARE_TICKS + 2);
     CHECK(failover_peer_status(4) == PEER_DEAD,
           "...and declared dead on the first tick after the migration resolves");
 
@@ -365,13 +378,13 @@ static void test_liveness(void) {
     failover_note_heartbeat(7, 0);
     g_env_migrate_peer_in_flight = 1;
     g_peer_in_flight_asked = 0;
-    failover_tick(351);  /* silence 301 >= DEAD, but node 7 announced intent */
+    failover_tick(FAILOVER_DECLARE_TICKS + 1);  /* silence DECLARE+1, but node 7 announced intent */
     CHECK(failover_peer_status(7) != PEER_DEAD,
           "*** node 7 NOT declared dead while its announced migration intent stands ***");
     CHECK(g_peer_in_flight_asked == 7,
           "*** ...and the gate asked about node 7 -- the SILENT PEER, by identity ***");
     g_env_migrate_peer_in_flight = 0;
-    failover_tick(352);
+    failover_tick(FAILOVER_DECLARE_TICKS + 2);
     CHECK(failover_peer_status(7) == PEER_DEAD,
           "...and declared dead on the first tick after the intent budget expires");
     /* The same transition now also happens EARLY, on the peer's own
@@ -408,9 +421,72 @@ static void test_liveness(void) {
     failover_tick(699);   /* 699 - 400 = 299, still under the threshold */
     CHECK(failover_peer_status(9) != PEER_DEAD,
           "...and 299 ticks of REAL silence from that stamp still defer the declaration");
-    failover_tick(701);   /* 701 - 400 = 301 >= FAILOVER_DEAD_TICKS */
+    failover_tick(400 + FAILOVER_DECLARE_TICKS + 1);  /* silence DECLARE+1 from that stamp */
     CHECK(failover_peer_status(9) == PEER_DEAD,
-          "...but 301 ticks of real silence from the SAME stamp declares it dead");
+          "...but a full FAILOVER_DECLARE_TICKS of real silence from the SAME stamp declares it dead");
+}
+
+/* ─── Scenario 1b: the relaunch grace (a just-relaunched node) ─────── */
+/* Both directions of FAILOVER_RELAUNCH_GRACE_TICKS, because the live
+ * suite run (2026-10-24) hit BOTH: a freshly booted node declaring a
+ * healthy peer DEAD five times over (its own restore burst stalling that
+ * peer), and a just-relaunched migration destination re-declared DEAD
+ * 106 log lines after "came back", which re-adopted every partition onto
+ * the wrong owner and failed failover_adoption_live_check's convergence
+ * gate.
+ *
+ * Every check below is a PAIR — held during the window, declared on the
+ * first tick after it. The second half is the whole point: a grace that
+ * suppressed the declaration for ever would be a blindfold, and a death
+ * that happened inside the window must still be reported once the window
+ * closes (the silence keeps accruing while the grace stands). */
+static void test_relaunch_grace(void) {
+    printf("--- Scenario 1b: relaunch grace (just-relaunched node) ---\n");
+
+    /* THIS node just came up: failover_note_relaunch_grace() is what the
+     * boot path calls beside failover_init(), so the test arms it exactly
+     * the way kernel.c does. */
+    failover_init();
+    failover_note_relaunch_grace(0);
+    failover_note_heartbeat(21, 0);
+    failover_tick(351);   /* silence 301 — but WE are the node that relaunched */
+    CHECK(failover_peer_status(21) != PEER_DEAD,
+          "*** a just-relaunched node declares nobody dead during its grace ***");
+    failover_tick(FAILOVER_RELAUNCH_GRACE_TICKS + 100);  /* grace 0 + RELAUNCH is over — and the watch RE-BASES */
+    CHECK(failover_peer_status(21) != PEER_DEAD,
+          "*** ...and the silence that accrued ACROSS our own boot is not counted: "
+          "our watch starts when the grace ends ***");
+    failover_tick(FAILOVER_RELAUNCH_GRACE_TICKS + FAILOVER_DECLARE_TICKS + 1);  /* the re-based window is a FULL declare window */
+    CHECK(failover_peer_status(21) == PEER_DEAD,
+          "...and a peer still silent a full FAILOVER_DECLARE_TICKS after the grace ends is declared");
+
+    /* The PEER came back: the grace is armed by the return itself, no call
+     * needed — that is the arm failover_note_heartbeat() gained. */
+    failover_init();
+    failover_note_heartbeat(22, 0);
+    failover_tick(FAILOVER_DECLARE_TICKS + 1);  /* past FAILOVER_DECLARE_TICKS */
+    CHECK(failover_peer_status(22) == PEER_DEAD,
+          "the peer is declared dead BEFORE it comes back (the grace arms on the return)");
+    failover_note_heartbeat(22, 1300);  /* DEAD -> ALIVE: window = 1300 + RELAUNCH */
+    failover_tick(1300 + FAILOVER_DEAD_TICKS + 1);  /* silence DEAD+1 — enough WITHOUT the relaunch grace */
+    CHECK(failover_peer_status(22) != PEER_DEAD,
+          "*** a just-relaunched peer is not declared dead during its grace, "
+          "even past the silence grace ***");
+    failover_tick(1300 + FAILOVER_RELAUNCH_GRACE_TICKS + 1);  /* relaunch grace over; silence DECLARE+1 */
+    CHECK(failover_peer_status(22) == PEER_DEAD,
+          "...and is declared the moment its own grace expires");
+
+    /* An ordinary beat must NOT re-arm: the grace is per episode, so a peer
+     * that goes quiet for good is still declared on the normal terms. */
+    failover_init();
+    failover_note_heartbeat(23, 0);
+    failover_note_heartbeat(23, 5000);  /* still ALIVE: no window to arm */
+    failover_tick(5000 + FAILOVER_DEAD_TICKS + 1);  /* silence DEAD+1 from an ordinary beat */
+    CHECK(failover_peer_status(23) != PEER_DEAD,
+          "301 ticks is held by the silence grace like any other episode");
+    failover_tick(5000 + FAILOVER_DECLARE_TICKS + 1);  /* silence DECLARE+1 — a RELAUNCH grace would run to 11000 */
+    CHECK(failover_peer_status(23) == PEER_DEAD,
+          "*** ...but an ordinary beat never arms a relaunch grace: a full silence grace declares anyway ***");
 }
 
 /* ─── Scenario 2: node comes back from the dead ────────────────────── */
@@ -418,7 +494,7 @@ static void test_resurrection(void) {
     printf("--- Scenario 2: node resurrection ---\n");
     failover_init();
     failover_note_heartbeat(1, 0);
-    failover_tick(400);  /* declare dead */
+    failover_tick(FAILOVER_DECLARE_TICKS + 1);  /* declare dead, past the silence grace */
     CHECK(failover_peer_status(1) == PEER_DEAD, "node 1 dead");
 
     failover_note_heartbeat(1, 500);
@@ -703,6 +779,7 @@ static void test_unknown_peer(void) {
 
 int main(void) {
     test_liveness();
+    test_relaunch_grace();
     test_resurrection();
     test_no_checkpoint();
     test_successful_failover();

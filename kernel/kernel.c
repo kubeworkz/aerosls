@@ -251,6 +251,14 @@ void kernel_main(uint32_t mb2_magic, uint32_t mb2_phys) {
     workload_init();           // Orchestration Plan Phase 5 -- declarative workloads (reconciler OFF by default)
     wlctx_init();              // live execution contexts -- the producer partition_migrate() needs
     failover_init();           // Step 5 -- peer liveness + checkpoint recovery (after cluster identity)
+    /* This node just came up: hold every death declaration for
+     * FAILOVER_RELAUNCH_GRACE_TICKS (failover.h) while the restores below
+     * run. Booting is exactly when this node's watch fires wrongly — its
+     * own restore burst stalls the peers it is rejoining, and the live
+     * suite caught it both ways (a fresh node 1 declaring node 2 DEAD five
+     * times over; a relaunched destination re-declared DEAD 106 lines after
+     * "came back", re-adopting every partition onto the wrong owner). */
+    failover_note_relaunch_grace(kernel_tick_counter);
 
     // ── 4d. Service binary loader ───────────────────────────────────────────
     loader_init();
