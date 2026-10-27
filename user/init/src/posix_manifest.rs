@@ -187,8 +187,10 @@ pub fn build_posix_manifest(
 /// Build a **tenant-profile** POSIX manifest (POSIX-Environments E3): the
 /// runtime a per-partition environment gets. It carries only what a tenant
 /// needs — a budget MEM region, a console channel, a block channel to
-/// its OWN ramdisk (`ramdisk_peer`), and (P2's first increment) a socket
-/// channel to the KERNEL-owned service `kernel.net.socket` — and NONE of
+/// its OWN ramdisk (`ramdisk_peer`), a socket channel to the KERNEL-owned
+/// service `kernel.net.socket` (P2's first increment), and §9.1's catalog
+/// channel to the second kernel-owned service `kernel.env.catalog` — and
+/// NONE of
 /// the system profile's direct-hardware caps: no UART port I/O, no
 /// timer/serial IRQ binds, no NIC BAR, and no network DRIVER. The system
 /// profile's `network` cap names the sidecar `drv.network.0`; this one
@@ -257,8 +259,25 @@ pub fn build_posix_manifest_tenant(
                 flags: 0,
             },
         }),
+        // POSIX-Environments §9.1: the tenant's catalog channel, peered at
+        // the SECOND kernel-owned name. This is the cap that makes the
+        // mediated interop surface reachable at all — without it the
+        // service exists, registers nobody, and a tenant's environment is
+        // the sealed box §9.1 exists to open. Same rights as its console,
+        // ramdisk and network siblings, and the same rule about which name
+        // it carries: `kernel.env.catalog` is kernel-owned, so cap.c wires
+        // it for THIS partition and the verbs are filtered by the partition
+        // the kernel read off the process descriptor.
+        Some(ManifestCap {
+            name: "catalog",
+            rights: 0x7, // R | W | send — CAT_* to the kernel-owned service
+            kind: CapKind::Chan {
+                peer: Some("kernel.env.catalog"),
+                flags: 0,
+            },
+        }),
         None, None, None, None, None,
-        None, None, None, None, None, None, None,
+        None, None, None, None, None, None,
     ];
     let m = Manifest {
         version_major: 1,
@@ -281,7 +300,7 @@ pub fn build_posix_manifest_tenant(
             chan_queue_depth: 16,
         }),
         caps,
-        n_caps: 4,
+        n_caps: 5,
         bootstrap: Some(Bootstrap {
             console: Some("console"),
             debug: None,
@@ -319,19 +338,20 @@ mod tests {
     }
 
     #[test]
-    fn tenant_profile_is_budget_console_ramdisk_and_kernel_socket() {
-        // E3 plus P2's first increment: a per-environment POSIX instance.
-        // Its own name, its own ramdisk peer, the kernel-owned socket
-        // service; exactly four caps; NONE of the system profile's
-        // hardware caps — and its network cap peers at the kernel-owned
-        // name, never at the system partition's network sidecar.
+    fn tenant_profile_is_budget_console_ramdisk_and_kernel_services() {
+        // E3, P2's first increment and §9.1: a per-environment POSIX
+        // instance. Its own name, its own ramdisk peer, and channels to
+        // BOTH kernel-owned services — sockets and the mediated catalog;
+        // exactly five caps; NONE of the system profile's hardware caps —
+        // and each kernel-service cap peers at its kernel-owned name, never
+        // at the system partition's sidecars.
         let blob = build_posix_manifest_tenant(
             "aerosls.posix.1", "drv.ramdisk.1",
             0x3000_0000, 0x40000, 0x3040_0000);
         let m = parse_manifest(&blob).unwrap();
         assert_eq!(m.name, Some("aerosls.posix.1"));
-        assert_eq!(m.n_caps, 4);
-        // The four tenant caps are present...
+        assert_eq!(m.n_caps, 5);
+        // The five tenant caps are present...
         assert!(m.find_cap("budget").is_some());
         assert!(m.find_cap("console").is_some());
         let rd = m.find_cap("ramdisk").expect("ramdisk chan present");
@@ -348,6 +368,18 @@ mod tests {
         };
         assert_eq!(peer, "kernel.net.socket",
                    "the tenant's socket cap peers at the kernel-owned service, never drv.network.0");
+        // ...and so is §9.1's catalog cap: the same shape, the other
+        // kernel-owned name. Without it the mediated surface exists in the
+        // kernel and is reachable by nobody — which is exactly the gap the
+        // E3/E4 guards would have gone on describing as an environment.
+        let cat = m.find_cap("catalog").expect("catalog chan present");
+        assert_eq!(cat.rights, 0x7);
+        let cat_peer: &str = match &cat.kind {
+            CapKind::Chan { peer: Some(p), flags: 0 } => p,
+            other => panic!("catalog must be a plain Chan cap, got {other:?}"),
+        };
+        assert_eq!(cat_peer, "kernel.env.catalog",
+                   "the tenant's catalog cap peers at the kernel-owned service");
         // ...and every system-profile hardware cap is absent.
         for absent in ["uart", "irq.timer.0", "irq.serial.0", "nic0.bar0"] {
             assert!(m.find_cap(absent).is_none(),

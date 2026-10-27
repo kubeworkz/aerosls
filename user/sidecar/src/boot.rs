@@ -38,6 +38,7 @@ use aerosls_proto::kwrap::{AWrap, KWrap};
 use aerosls_vfs::{CharNode, Errno, Vfs, O_RDWR};
 
 use crate::applets;
+use crate::catalog_client::CatalogClient;
 use crate::net_client::NetClient;
 
 /// The initial caps the bootstrap needs, by manifest name (the kernel built
@@ -67,6 +68,15 @@ pub struct BootCaps {
     /// for socket I/O.  CHAN_W (send) and CHAN_R (recv) endpoints.
     pub net_chan_w: Option<u32>,
     pub net_chan_r: Option<u32>,
+    /// The catalog channel (`catalog`), if the manifest declared one: the
+    /// tenant's end of POSIX-Environments §9.1's mediated, read-only,
+    /// partition-scoped view of the object catalog, peered at the
+    /// KERNEL-owned name `kernel.env.catalog`. Same shape as the network
+    /// pair — CHAN_W (send) and CHAN_R (recv) — and the same rule: a
+    /// manifest that does not name the cap leaves both `None`, and the
+    /// sidecar boots with no catalog rather than failing.
+    pub catalog_chan_w: Option<u32>,
+    pub catalog_chan_r: Option<u32>,
     /// POSIX-Environments E6: this sidecar's OWN identity `(index, pid)` — the
     /// pair to announce on its own console — or `None` when there is none to
     /// announce: a pre-v3 BIB, the host constructor below, or a sidecar whose
@@ -95,6 +105,8 @@ impl BootCaps {
         let console = bib.find_cap(CAP_CHAN, "console");
         let net_r = bib.find_cap(CAP_CHAN, "network");
         let net_w = bib.find_cap(CAP_CHAN_W, "network");
+        let cat_r = bib.find_cap(CAP_CHAN, "catalog");
+        let cat_w = bib.find_cap(CAP_CHAN_W, "catalog");
         Ok(BootCaps {
             budget_slot: budget.slot,
             budget_base: budget.base,
@@ -104,6 +116,8 @@ impl BootCaps {
             ramdisk_chan_r: ramdisk_r.map(|r| r.slot),
             net_chan_w: net_w.map(|n| n.slot),
             net_chan_r: net_r.map(|n| n.slot),
+            catalog_chan_w: cat_w.map(|c| c.slot),
+            catalog_chan_r: cat_r.map(|c| c.slot),
             identity: bib.identity(),
         })
     }
@@ -113,6 +127,15 @@ impl BootCaps {
     /// the sidecar up without one. `boot()` announces it.
     pub fn with_identity(mut self, index: u32, pid: u32) -> BootCaps {
         self.identity = Some((index, pid));
+        self
+    }
+
+    /// Give the sidecar a catalog channel the way a manifest that names the
+    /// `catalog` cap does. Host/test constructor only — `from_bib()` reads
+    /// the real pair off the BIB.
+    pub fn with_catalog(mut self, chan_w: u32, chan_r: u32) -> BootCaps {
+        self.catalog_chan_w = Some(chan_w);
+        self.catalog_chan_r = Some(chan_r);
         self
     }
 
@@ -141,6 +164,11 @@ impl BootCaps {
             // sidecar boots with no identity and stays quiet — which is also
             // what keeps every pre-E6 host test's console output unchanged.
             identity: None,
+            // Likewise no catalog channel: a host test that wants one asks
+            // for it with `with_catalog()`, exactly as `with_identity()`
+            // works, so no existing constructor call changes.
+            catalog_chan_w: None,
+            catalog_chan_r: None,
         }
     }
 }
@@ -181,6 +209,10 @@ pub struct Booted<K: Kernel, A: BufferAlloc> {
     /// The network driver client (None if the manifest has no network
     /// channel). Applet-level socket I/O goes through this.
     pub net: Option<NetClient<K, A>>,
+    /// The catalog client (None if the manifest has no `catalog` cap):
+    /// §9.1's mediated, read-only view of the object catalog, installed
+    /// into the ProcManager so `ctx.catalog()` can reach it from any task.
+    pub catalog: Option<CatalogClient<K>>,
 }
 
 impl<K: Kernel, A: BufferAlloc> Booted<K, A> {
@@ -287,11 +319,21 @@ pub fn boot<K: Kernel, A: BufferAlloc>(
     //    network driver when a net_chan was declared in the manifest.
     let net: Option<NetClient<K, A>> = match (caps.net_chan_w, caps.net_chan_r) {
         (Some(cw), Some(cr)) => {
-            let nc = NetClient::new(KWrap(k_arc), cw, cr, AWrap(alloc_arc));
+            let nc = NetClient::new(KWrap(k_arc.clone()), cw, cr, AWrap(alloc_arc));
             // NOTE: NET_INFO handshake moved to entry.rs (binary crate)
             // to survive LTO — library-crate serial_trace calls are stripped.
             Some(nc)
         }
+        _ => None,
+    };
+
+    // 6. Catalog client (optional): the tenant's end of §9.1's mediated
+    //    surface, when the manifest named the `catalog` cap. No handshake
+    //    is required — the service answers any well-formed CAT frame — but
+    //    CAT_INFO is the first call a client makes, so it learns the
+    //    partition the kernel registered it under.
+    let catalog: Option<CatalogClient<K>> = match (caps.catalog_chan_w, caps.catalog_chan_r) {
+        (Some(cw), Some(cr)) => Some(CatalogClient::new(KWrap(k_arc), cw, cr)),
         _ => None,
     };
 
@@ -301,6 +343,7 @@ pub fn boot<K: Kernel, A: BufferAlloc>(
         proc,
         console,
         net,
+        catalog,
     })
 }
 

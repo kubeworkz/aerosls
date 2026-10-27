@@ -2439,10 +2439,14 @@ refusal instead of data, each for a reason the tree already states elsewhere:
   "needs the object catalog's authority model in front of it, not just a
   format"; this cut puts a first, narrow slice of that model in front of the
   catalog and no more.
-- **The tenant-side client and its shell command.** The service, its wire and
-  its boundary land and are guarded here; the sidecar client that speaks the
-  four verbs is the next increment, and it is a client of a surface that
-  already exists rather than a design decision.
+- **The tenant-side client and its shell command** — built, in this same
+  increment: `user/proto`'s `CatFrame` and `CatalogOps`, the sidecar's
+  `CatalogClient`, the fifth tenant cap, and the `catalog` applet. What is
+  still out of scope is its **live arm**: the command reaches the wire only
+  inside a booted environment, so the client's guard is a source guard too
+  (C1/C2 below) and an end-to-end run — `env attach … "catalog info"` against
+  a created environment — is the natural next increment, needing E6's attach
+  surface as its harness rather than a new design decision.
 
 **Verification.** `kernel/env_catalog.c` compiles into the kernel; the
 service is registered by `cap_create_sidecar()` under the kernel-owned name
@@ -2457,6 +2461,19 @@ and executes the verbs against a seeded two-partition catalog — including the
 clause that a name present in partition 2 is answered `CAT_ERR_NOENT` by a
 channel registered in partition 1, which is the property this section exists
 to establish.
+
+The tenant half is guarded the same way, in the same file: **C1** pins the
+fifth tenant cap (`catalog`, rights 0x7, peer exactly `kernel.env.catalog`,
+*n counted* by `n_caps`, absent from the SYSTEM profile, asserted by its own
+pin test) and **C2** pins the client — the `CAT_MAGIC` source of truth, the
+four `CatalogOps` verbs, the status word read off every reply, the rendered
+refusal surfaced to the caller, and the chain manifest → BIB → boot →
+procmgr → the `catalog` applet. Each has teeth in the smoke above, and the
+client's own bytes are executed by `user/sidecar`'s catalog tests against a
+scripted kernel: a two-object `CAT_LIST` whose first body word is 2 must read
+as OK rather than PERM — the offset bug the kernel header records, checked
+from the other side of the wire — and a refusal must arrive with the service's
+own text so the applet can print it verbatim.
 
 ---
 

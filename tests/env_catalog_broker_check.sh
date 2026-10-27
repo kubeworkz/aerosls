@@ -48,10 +48,17 @@
 #       pins the indistinguishable-NOENT clause, and is actually built by
 #       run_all.sh — a test the runner skips is a boundary guarded by
 #       nothing, which is the failure run_all.sh's own header exists for.
+#   C1. THE CAP: the tenant manifest names kernel.env.catalog (rights 0x7,
+#       counted by n_caps, absent from the SYSTEM profile, pinned by its
+#       own test) — the half of reachability that lives in user/;
+#   C2. THE CLIENT: proto's CAT_* wire, the four CatalogOps verbs, the
+#       status-word discipline and the rendered refusal, and the chain
+#       manifest -> BIB -> boot -> procmgr -> the `catalog` applet.
 #
 # ─── What this guard does NOT do ──────────────────────────────────────────
 # It has no live arm: §9.1 names a source guard, and the verbs are executed
-# by the host test. Its teeth ARE proven: tests/
+# by the host test (C1/C2's applet reaches the wire only in a boot, so they
+# are source clauses too). Its teeth ARE proven: tests/
 # env_catalog_broker_check_smoke.sh reddens each anchor below on a copy of
 # the tree and requires this guard to exit 1 naming the clause it broke —
 # so a green run here is a green run whose failure mode has been seen. Each
@@ -88,10 +95,22 @@ MMK="$ROOT/kernel/microkernel.c"
 ENV="$ROOT/kernel/env_catalog.c"
 TST="$ROOT/tests/env_catalog_host_test.c"
 RUNALL="$ROOT/tests/run_all.sh"
+# C1/C2 read the tenant side: the manifest that asks for the channel and
+# the client that speaks on it.
+MAN="$ROOT/user/init/src/posix_manifest.rs"
+PROTO="$ROOT/user/proto/src/lib.rs"
+CATOPS="$ROOT/user/proto/src/catalops.rs"
+CLIENT="$ROOT/user/sidecar/src/catalog_client.rs"
+BOOT="$ROOT/user/sidecar/src/boot.rs"
+ENTRY="$ROOT/user/sidecar/src/entry.rs"
+APPLETS="$ROOT/user/sidecar/src/applets.rs"
+PM="$ROOT/user/procmgr/src/procmgr.rs"
 
 # Precondition: every file the clauses read. Missing is a refusal to
 # evaluate (exit 2) — not a pass, and not a finding.
-for f in "$MKF" "$CAP" "$CONS" "$MMK" "$ENV" "$TST" "$RUNALL"; do
+for f in "$MKF" "$CAP" "$CONS" "$MMK" "$ENV" "$TST" "$RUNALL" \
+         "$MAN" "$PROTO" "$CATOPS" "$CLIENT" "$BOOT" "$ENTRY" \
+         "$APPLETS" "$PM"; do
     [ -f "$f" ] || { echo "ABORT: ${f#"$ROOT"/} missing — the guard cannot be evaluated" >&2; exit 2; }
 done
 
@@ -278,6 +297,74 @@ fi
 has "$RUNALL" 'for src in tests/*_host_test.c; do' ||
     bad "B2. run_all.sh no longer globs tests/*_host_test.c — the host suite would never build this test"
 clause "$c7" B2 "the host test links the real service, pins the indistinguishable-NOENT clause, and is built by run_all.sh"
+
+# ── C1. THE CAP: a manifest that asks for the channel ────────────────────
+# Everything above is the kernel half, and §9.1's own scope note used to say
+# the tenant side was "the next increment". It is this one. A service no
+# manifest can name registers nothing in a real boot, so the reachability
+# chain continues in user/: the TENANT profile gains a fifth cap peered at
+# exactly `kernel.env.catalog`, `n_caps` moves with it (a count that no
+# longer counts the caps that exist is how a cap silently stops being
+# granted), and the SYSTEM profile stays without one — only the tenant
+# profile was to change, same reason as env_net_isolation's N2.
+c8=$fail
+TENANT="$(fn_body "$MAN" 'pub fn build_posix_manifest_tenant(')"
+SYSTEMMF="$(fn_body "$MAN" 'pub fn build_posix_manifest(')"
+if [ -z "$TENANT" ] || [ -z "$SYSTEMMF" ]; then
+    bad "C1. posix_manifest.rs: a profile builder is gone — the boundary cannot be evaluated"
+fi
+hasstr "$TENANT" 'peer: Some("kernel.env.catalog"),' ||
+    bad "C1. tenant manifest: no cap peers at kernel.env.catalog — the service would register nobody in a real boot"
+printf '%s\n' "$TENANT" | grep -A2 -F 'name: "catalog"' | grep -qF 'rights: 0x7' ||
+    bad "C1. tenant manifest: the catalog cap's rights must be 0x7 (R|W|send), beside console, ramdisk and network"
+hasstr "$TENANT" 'n_caps: 5,' ||
+    bad "C1. tenant manifest: n_caps no longer counts all five tenant caps"
+if hasstr "$SYSTEMMF" 'peer: Some("kernel.env.catalog"),'; then
+    bad "C1. system profile: only the TENANT profile was to carry a catalog cap — the system profile must stay without one"
+fi
+has "$MAN" 'assert_eq!(cat_peer, "kernel.env.catalog",' ||
+    bad "C1. posix_manifest.rs: the pin test no longer asserts the catalog peer — the positive half of the pin is gone"
+clause "$c8" C1 "the tenant manifest names kernel.env.catalog with rights 0x7, n_caps counts it, the system profile does not carry it, and the pin test asserts it"
+
+# ── C2. THE CLIENT: the four verbs, and the one status discipline ────────
+# The wire's source of truth on this side, the client that speaks it, and
+# every hop by which a shell command reaches it — the same chain shape W2
+# pins for cap_create_sidecar(), continued into userland. The status anchor
+# is not incidental: §9.1's contract is that the status word at CAT_STATUS
+# is read on EVERY reply before anything else, and that the refusal's
+# rendered text reaches the caller's transcript. A client that read the
+# first body word instead would report a two-object list as PERM — the bug
+# the kernel header records, re-created on the other side of the wire.
+c9=$fail
+has "$PROTO" 'pub const CAT_MAGIC: [u8; 8] = *b"AEROSCT\x01";' ||
+    bad "C2. proto: the CAT_* magic is gone — the client has no wire to speak"
+for verb in cat_info cat_list cat_stat cat_read; do
+    has "$CATOPS" "fn $verb(&mut self" ||
+        bad "C2. catalops.rs: the CatalogOps trait no longer declares $verb — §9.1's four verbs are the surface"
+done
+has "$CLIENT" 'impl<K: Kernel> CatalogOps for CatalogClient<K> {' ||
+    bad "C2. catalog_client.rs: the client no longer implements CatalogOps — procmgr has nothing to dispatch through"
+for call in CAT_INFO CAT_LIST CAT_STAT CAT_READ; do
+    has "$CLIENT" "self.call($call," ||
+        bad "C2. catalog_client.rs: no longer sends $call — a verb in the trait with no wire behind it"
+done
+has "$CLIENT" 'cat_status(reply)' ||
+    bad "C2. catalog_client.rs: the status word is no longer read off the reply — §9.1's status discipline would be gone from the client"
+has "$CLIENT" 'cat_text(reply)' ||
+    bad "C2. catalog_client.rs: the service's rendered refusal is no longer surfaced — §9.1 requires it to reach the caller's transcript"
+has "$BOOT" 'bib.find_cap(CAP_CHAN, "catalog")' ||
+    bad "C2. boot.rs: the BIB's catalog cap is no longer resolved — a granted cap would never become a client"
+has "$BOOT" 'CatalogClient::new(' ||
+    bad "C2. boot.rs: the catalog client is never constructed"
+has "$PM" 'pub fn set_catalog(' ||
+    bad "C2. procmgr.rs: no way to install the client after boot"
+has "$PM" 'pub fn catalog(&mut self)' ||
+    bad "C2. procmgr.rs: ctx.catalog() is gone — applets cannot reach the surface"
+has "$ENTRY" 'set_catalog(' ||
+    bad "C2. entry.rs: the client is never installed into the ProcManager"
+has "$APPLETS" 'pm.register_applet("catalog", catalog);' ||
+    bad "C2. applets.rs: the `catalog` shell command is not registered — the surface has no user"
+clause "$c9" C2 "the client speaks all four verbs, reads the status word, surfaces the refusal text, and is wired manifest -> BIB -> boot -> procmgr -> applet"
 
 echo ""
 if [ "$fail" -eq 0 ]; then

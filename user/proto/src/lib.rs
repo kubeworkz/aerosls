@@ -35,6 +35,7 @@ extern crate std;
 pub mod kabi;
 pub mod kwrap;
 pub mod sockops;
+pub mod catalops;
 
 /// Re-export `spin::Mutex` for use in AWrap constructors across crates.
 pub use spin::Mutex;
@@ -533,6 +534,326 @@ pub fn parse_close_body(p: &[u8]) -> Option<(u16, u32)> {
     Some((read_u16(p, 0), read_u32(p, 2)))
 }
 
+/// ── CAT_* protocol (POSIX-Environments v0.2 §9.1 — the mediated catalog)
+///
+/// The client half of kernel/env_catalog.h's wire. The kernel header is the
+/// source of truth for the bytes (the kernel does not link Rust, so they are
+/// written twice and pinned against each other: the host test reads the
+/// kernel's side, and the round-trip tests below read these). Same 16-byte
+/// header shape as NetFrame, distinct magic, so a CAT_* frame on a socket
+/// channel — or a NET_* frame on a catalog channel — is dropped as
+/// not-a-frame rather than answered as a verb.
+
+pub const CAT_MAGIC: [u8; 8] = *b"AEROSCT\x01";
+pub const CAT_VERSION: u16 = 1;
+
+/// Header size, and the offsets of the fields a client reads on EVERY reply:
+/// status sits at CAT_STATUS on a clean answer and a refusal alike, so the
+/// caller reads it without first branching on the error flag, and a verb's
+/// payload (or the rendered refusal text) always starts at CAT_BODY.
+pub const CAT_HDR: usize = 16;
+pub const CAT_STATUS: usize = 16;
+pub const CAT_BODY: usize = 18;
+
+pub const CAT_INFO: u16 = 1;
+pub const CAT_LIST: u16 = 2;
+pub const CAT_STAT: u16 = 3;
+pub const CAT_READ: u16 = 4;
+
+pub const CAT_FLAG_ERROR: u16 = 0x0001;
+
+pub const CAT_OK: u16 = 0;
+/// "Not in this namespace" — covers both a name that never existed and one
+/// in a partition that is not yours. The service refuses to distinguish
+/// them; a client that printed them differently would be re-creating the
+/// existence oracle §9.1 removes.
+pub const CAT_ERR_NOENT: u16 = 1;
+pub const CAT_ERR_PERM: u16 = 2;
+pub const CAT_ERR_SHAPE: u16 = 3;
+pub const CAT_ERR_TYPE: u16 = 4;
+pub const CAT_ERR_UNKNOWN: u16 = 9;
+
+pub const CAT_MAX_NAME: usize = 64;   // OBJECT_NAME_LEN
+pub const CAT_MAX_KEY: usize = 64;    // RECORD_KEY_LEN
+pub const CAT_MAX_VALUE: usize = 256; // RECORD_VAL_LEN
+pub const CAT_LIST_PAGE_MAX: u16 = 8;
+/// A CAT_LIST reply is fixed-slot: `{type u8, tier u8, pad u16, name[64]}`.
+pub const CAT_LIST_ENTRY: usize = 68;
+/// `{header[16], status[2], count u16, total u16, partition u32}` — so the
+/// entries start at CAT_LIST_HDR - CAT_BODY == 8 bytes into the body.
+pub const CAT_LIST_HDR: usize = 26;
+/// The rendered refusal, capped where the kernel caps it.
+pub const CAT_TEXT_CAP: usize = 192;
+
+/// The 16-byte CAT_* frame header — the payload of a channel MSG envelope.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CatFrame {
+    pub magic: [u8; 8],
+    pub version: u16,
+    pub ty: u16,
+    pub flags: u16,
+    pub pad: u16,
+}
+
+impl CatFrame {
+    pub const SIZE: usize = 16;
+
+    pub fn new(ty: u16) -> CatFrame {
+        CatFrame {
+            magic: CAT_MAGIC,
+            version: CAT_VERSION,
+            ty,
+            flags: 0,
+            pad: 0,
+        }
+    }
+
+    pub fn encode(&self) -> [u8; Self::SIZE] {
+        let mut b = [0u8; Self::SIZE];
+        b[0..8].copy_from_slice(&self.magic);
+        put_u16(&mut b, 8, self.version);
+        put_u16(&mut b, 10, self.ty);
+        put_u16(&mut b, 12, self.flags);
+        put_u16(&mut b, 14, self.pad);
+        b
+    }
+
+    pub fn is_error(&self) -> bool {
+        self.flags & CAT_FLAG_ERROR != 0
+    }
+
+    /// Length + magic check: `parse` is how the client distinguishes a real
+    /// reply from a frame that belongs to another service, so an unparseable
+    /// body is a protocol failure and never a status.
+    pub fn parse(b: &[u8]) -> Option<CatFrame> {
+        if b.len() < Self::SIZE {
+            return None;
+        }
+        let f = CatFrame {
+            magic: read8(b, 0),
+            version: read_u16(b, 8),
+            ty: read_u16(b, 10),
+            flags: read_u16(b, 12),
+            pad: read_u16(b, 14),
+        };
+        if f.magic != CAT_MAGIC || f.version != CAT_VERSION {
+            return None;
+        }
+        Some(f)
+    }
+}
+
+/// One CAT_LIST entry: the kernel's fixed slot, decoded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CatListEntry {
+    pub obj_type: u8,
+    pub tier: u8,
+    pub name: [u8; CAT_MAX_NAME],
+    pub name_len: u8,
+}
+
+impl CatListEntry {
+    /// The name as text. The kernel writes NUL-terminated ASCII here; an
+    /// unterminated slot (a full 64-byte name) is truncated rather than read
+    /// past its buffer.
+    pub fn name_str(&self) -> &str {
+        core::str::from_utf8(&self.name[..self.name_len as usize]).unwrap_or("")
+    }
+}
+
+/// CAT_INFO reply body: `{max_objects u32, max_name u32, max_value u32,
+/// partition u32}` (16 bytes). The last field is the partition the KERNEL
+/// computed this boundary from — the identity a tenant can verify rather
+/// than trust.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CatInfo {
+    pub max_objects: u32,
+    pub max_name: u32,
+    pub max_value: u32,
+    pub partition: u32,
+}
+
+/// CAT_LIST reply head: how many entries this page holds, how many the
+/// namespace holds in total, and the partition the listing was scoped to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CatListHead {
+    pub count: u16,
+    pub total: u16,
+    pub partition: u32,
+}
+
+/// CAT_STAT reply body: `{type u8, tier u8, pad u16, size_pages u32,
+/// owner_uid u32, database_id u32}` (16 bytes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CatStat {
+    pub obj_type: u8,
+    pub tier: u8,
+    pub size_pages: u32,
+    pub owner_uid: u32,
+    pub database_id: u32,
+}
+
+/// CAT_READ reply body: `{key_len u8, pad u8, value_len u16, key[64],
+/// value[value_len]}`. Owned, because the value outlives the reply buffer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatValue {
+    pub key: alloc::vec::Vec<u8>,
+    pub value: alloc::vec::Vec<u8>,
+}
+
+/// The status word of a full reply (header included), or None when the
+/// buffer is too short to hold one. Read on every reply before anything
+/// else — clean or refused.
+pub fn cat_status(reply: &[u8]) -> Option<u16> {
+    if reply.len() < CAT_STATUS + 2 {
+        return None;
+    }
+    Some(read_u16(reply, CAT_STATUS))
+}
+
+/// The rendered refusal text of a failed reply — the bytes the service put
+/// at CAT_BODY ("CAT_STAT refused by kernel.env.catalog — …"). §9.1's whole
+/// point is that a refusal is visible in the CALLER's transcript, so the
+/// client surfaces it verbatim rather than reducing it to a number.
+pub fn cat_text(reply: &[u8]) -> Option<&[u8]> {
+    if reply.len() <= CAT_BODY {
+        return None;
+    }
+    Some(&reply[CAT_BODY..])
+}
+
+/// Status codes as names, for a client that has no text to show (a status
+/// read from a truncated frame). Mirrors the kernel's verb-name table.
+pub fn cat_status_name(status: u16) -> &'static str {
+    match status {
+        CAT_OK => "OK",
+        CAT_ERR_NOENT => "NOENT",
+        CAT_ERR_PERM => "PERM",
+        CAT_ERR_SHAPE => "SHAPE",
+        CAT_ERR_TYPE => "TYPE",
+        CAT_ERR_UNKNOWN => "UNKNOWN",
+        _ => "?",
+    }
+}
+
+/// CAT_LIST request body: `{page u16, page_size u16}` (4 bytes).
+pub fn encode_cat_list_body(page: u16, page_size: u16) -> [u8; 4] {
+    let mut b = [0u8; 4];
+    put_u16(&mut b, 0, page);
+    put_u16(&mut b, 2, page_size);
+    b
+}
+
+/// CAT_STAT request body: `{name_len u8, name[name_len]}`. Returns the body
+/// length, or None for a name the wire cannot carry (empty, or >=
+/// CAT_MAX_NAME) — which is a client-side refusal, since the service would
+/// answer those CAT_ERR_SHAPE without ever looking the name up.
+pub fn encode_cat_stat_body(name: &[u8], out: &mut [u8]) -> Option<usize> {
+    if name.is_empty() || name.len() >= CAT_MAX_NAME || out.len() < 1 + name.len() {
+        return None;
+    }
+    out[0] = name.len() as u8;
+    out[1..1 + name.len()].copy_from_slice(name);
+    Some(1 + name.len())
+}
+
+/// CAT_READ request body: `{name_len u8, name[nlen], key_len u8,
+/// key[klen]}` — the layout the service's READ arm parses.
+pub fn encode_cat_read_body(name: &[u8], key: &[u8], out: &mut [u8]) -> Option<usize> {
+    if name.is_empty() || name.len() >= CAT_MAX_NAME
+        || key.len() >= CAT_MAX_KEY
+        || out.len() < 2 + name.len() + key.len()
+    {
+        return None;
+    }
+    out[0] = name.len() as u8;
+    out[1..1 + name.len()].copy_from_slice(name);
+    out[1 + name.len()] = key.len() as u8;
+    let k = 2 + name.len();
+    out[k..k + key.len()].copy_from_slice(key);
+    Some(2 + name.len() + key.len())
+}
+
+/// CAT_INFO reply body (starting at CAT_BODY): 16 bytes as four u32s.
+pub fn parse_cat_info_body(body: &[u8]) -> Option<CatInfo> {
+    if body.len() < 16 {
+        return None;
+    }
+    Some(CatInfo {
+        max_objects: read_u32(body, 0),
+        max_name: read_u32(body, 4),
+        max_value: read_u32(body, 8),
+        partition: read_u32(body, 12),
+    })
+}
+
+/// CAT_LIST reply head (starting at CAT_BODY): count, total, partition.
+pub fn parse_cat_list_head(body: &[u8]) -> Option<CatListHead> {
+    if body.len() < 8 {
+        return None;
+    }
+    Some(CatListHead {
+        count: read_u16(body, 0),
+        total: read_u16(body, 2),
+        partition: read_u32(body, 4),
+    })
+}
+
+/// One CAT_LIST entry, read at `i` (0-based) from a reply body. The entry
+/// count comes from the head, never from the reply's byte length, so a
+/// short reply is a parse failure rather than a partial entry.
+pub fn parse_cat_list_entry(body: &[u8], i: u16) -> Option<CatListEntry> {
+    let off = 8 + i as usize * CAT_LIST_ENTRY;
+    if body.len() < off + CAT_LIST_ENTRY {
+        return None;
+    }
+    let mut name = [0u8; CAT_MAX_NAME];
+    name.copy_from_slice(&body[off + 4..off + 4 + CAT_MAX_NAME]);
+    let name_len = name.iter().position(|&c| c == 0).unwrap_or(CAT_MAX_NAME) as u8;
+    Some(CatListEntry {
+        obj_type: body[off],
+        tier: body[off + 1],
+        name,
+        name_len,
+    })
+}
+
+/// CAT_STAT reply body: 16 bytes as the object's own metadata.
+pub fn parse_cat_stat_body(body: &[u8]) -> Option<CatStat> {
+    if body.len() < 16 {
+        return None;
+    }
+    Some(CatStat {
+        obj_type: body[0],
+        tier: body[1],
+        size_pages: read_u32(body, 4),
+        owner_uid: read_u32(body, 8),
+        database_id: read_u32(body, 12),
+    })
+}
+
+/// CAT_READ reply body: the echoed key and its value. The key and value
+/// lengths come from the body itself (fixed slots make that unambiguous),
+/// and a value that does not fit the slot the service wrote is a parse
+/// failure, not a truncation.
+pub fn parse_cat_read_body(body: &[u8]) -> Option<CatValue> {
+    if body.len() < 4 {
+        return None;
+    }
+    let klen = body[0] as usize;
+    let vlen = read_u16(body, 2) as usize;
+    let key_end = 4 + klen;
+    let val_end = 4 + CAT_MAX_KEY + vlen;
+    if klen > CAT_MAX_KEY || body.len() < val_end || key_end > body.len() {
+        return None;
+    }
+    Some(CatValue {
+        key: alloc::vec::Vec::from(&body[4..key_end]),
+        value: alloc::vec::Vec::from(&body[4 + CAT_MAX_KEY..val_end]),
+    })
+}
+
 // ── little-endian helpers ────────────────────────────────────────────────────
 
 pub(crate) fn read8(b: &[u8], i: usize) -> [u8; 8] {
@@ -692,5 +1013,155 @@ mod tests {
         assert_eq!(&CH_MAGIC, b"AEROSCH\x01");
         assert_eq!(&RD_MAGIC, b"AEROSRD\x01");
         assert_eq!(&NET_MAGIC, b"AEROSNT\x01");
+        assert_eq!(&CAT_MAGIC, b"AEROSCT\x01");
+    }
+
+    // ── CAT_*: §9.1's mediated catalog ───────────────────────────────────
+
+    #[test]
+    fn cat_frame_roundtrips_and_refuses_a_foreign_frame() {
+        let f = CatFrame::new(CAT_LIST);
+        let bytes = f.encode();
+        assert_eq!(CatFrame::parse(&bytes).unwrap(), f);
+        assert_eq!(f.ty, CAT_LIST);
+        assert!(!f.is_error());
+        assert_eq!(read_u16(&CatFrame::new(CAT_STAT).encode(), 12), 0);
+
+        // The magic is one byte from NET_MAGIC on purpose — the two services
+        // must not be able to parse each other's traffic. A NET_* frame on a
+        // catalog channel parses to None, and a truncated header likewise,
+        // so a client treats either as protocol failure, never as a status.
+        let net = NetFrame::new(NET_INFO, false).encode();
+        let differing = net
+            .iter()
+            .zip(CAT_MAGIC.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert_eq!(differing, 1, "one byte apart, and that byte is the whole distinction");
+        assert!(CatFrame::parse(&net).is_none());
+        assert!(CatFrame::parse(&bytes[..8]).is_none());
+    }
+
+    #[test]
+    fn cat_status_is_read_from_the_status_word_not_the_first_body_word() {
+        // The offset bug the kernel header records: a body written over the
+        // status word made a two-object CAT_LIST read as status 2 (PERM).
+        // This is that reply, laid out the way the service lays it out, read
+        // back the way a client reads it.
+        let mut reply = [0u8; CAT_LIST_HDR + 2 * CAT_LIST_ENTRY];
+        reply[..16].copy_from_slice(&CatFrame::new(CAT_LIST).encode());
+        put_u16(&mut reply, CAT_STATUS, CAT_OK);
+        put_u16(&mut reply, CAT_BODY, 2); // count = 2 — the word at CAT_HDR
+        put_u16(&mut reply, CAT_BODY + 2, 4);
+        put_u32(&mut reply, CAT_BODY + 4, 3);
+
+        assert_eq!(cat_status(&reply), Some(CAT_OK), "status must not be 2");
+        let head = parse_cat_list_head(&reply[CAT_BODY..]).unwrap();
+        assert_eq!((head.count, head.total, head.partition), (2, 4, 3));
+
+        // And a refusal reads its status from the same place, with the
+        // service's rendered text starting at CAT_BODY.
+        let text = b"CAT_STAT refused by kernel.env.catalog: no read";
+        let mut bad = [0u8; 96];
+        bad[..16].copy_from_slice(&CatFrame::new(CAT_STAT).encode());
+        bad[12..14].copy_from_slice(&CAT_FLAG_ERROR.to_le_bytes());
+        put_u16(&mut bad, CAT_STATUS, CAT_ERR_PERM);
+        bad[CAT_BODY..CAT_BODY + text.len()].copy_from_slice(text);
+        assert_eq!(cat_status(&bad), Some(CAT_ERR_PERM));
+        assert_eq!(&cat_text(&bad).unwrap()[..text.len()], &text[..]);
+    }
+
+    #[test]
+    fn cat_list_entries_come_out_of_the_fixed_slots() {
+        let mut reply = [0u8; CAT_LIST_HDR + CAT_LIST_ENTRY];
+        reply[..16].copy_from_slice(&CatFrame::new(CAT_LIST).encode());
+        put_u16(&mut reply, CAT_STATUS, CAT_OK);
+        put_u16(&mut reply, CAT_BODY, 1);
+        put_u16(&mut reply, CAT_BODY + 2, 7);
+        put_u32(&mut reply, CAT_BODY + 4, 5);
+        let off = CAT_LIST_HDR;
+        reply[off] = 3; // type
+        reply[off + 1] = 1; // tier
+        reply[off + 4..off + 4 + 7].copy_from_slice(b"app.tab");
+
+        let body = &reply[CAT_BODY..];
+        let head = parse_cat_list_head(body).unwrap();
+        assert_eq!(head.count, 1);
+        let e = parse_cat_list_entry(body, 0).unwrap();
+        assert_eq!(e.name_str(), "app.tab");
+        assert_eq!((e.obj_type, e.tier), (3, 1));
+        // An entry past the reply's own bytes is a parse failure, never a
+        // partial name read past the buffer.
+        assert!(parse_cat_list_entry(body, 1).is_none());
+    }
+
+    #[test]
+    fn cat_request_bodies_refuse_what_the_service_would_answer_shape() {
+        let mut out = [0u8; 256];
+        // Empty and over-long names are refused by the CLIENT, because the
+        // service answers exactly those CAT_ERR_SHAPE without a lookup —
+        // sending them would buy a round trip to learn nothing.
+        assert_eq!(encode_cat_stat_body(b"", &mut out), None);
+        assert_eq!(encode_cat_stat_body(&[b'x'; 64], &mut out), None);
+        let n = encode_cat_stat_body(b"app.tab", &mut out).unwrap();
+        assert_eq!(n, 8);
+        assert_eq!(&out[..n], b"\x07app.tab");
+        assert_eq!(encode_cat_stat_body(b"app.tab", &mut [0u8; 4]), None);
+
+        assert_eq!(encode_cat_read_body(b"", &[b'k'], &mut out), None);
+        assert_eq!(encode_cat_read_body(b"t", &[b'k'; 64], &mut out), None);
+    }
+
+    #[test]
+    fn cat_read_reply_roundtrips_key_and_value() {
+        let mut reply = [0u8; CAT_BODY + 4 + CAT_MAX_KEY + 5];
+        reply[..16].copy_from_slice(&CatFrame::new(CAT_READ).encode());
+        put_u16(&mut reply, CAT_STATUS, CAT_OK);
+        reply[CAT_BODY] = 6; // key_len
+        put_u16(&mut reply, CAT_BODY + 2, 5); // value_len
+        reply[CAT_BODY + 4..CAT_BODY + 10].copy_from_slice(b"field1");
+        reply[CAT_BODY + 4 + CAT_MAX_KEY..CAT_BODY + 4 + CAT_MAX_KEY + 5]
+            .copy_from_slice(b"value");
+
+        let v = parse_cat_read_body(&reply[CAT_BODY..]).unwrap();
+        assert_eq!(v.key, b"field1");
+        assert_eq!(v.value, b"value");
+        // A value_len the slot cannot hold is a parse failure, not a
+        // truncated read.
+        let mut lying = reply[CAT_BODY..].to_vec();
+        put_u16(&mut lying, 2, 4096);
+        assert!(parse_cat_read_body(&lying).is_none());
+    }
+
+    #[test]
+    fn cat_stat_body_decodes_the_objects_own_metadata() {
+        let mut body = [0u8; 16];
+        body[0] = 4; // type
+        body[1] = 2; // tier
+        put_u32(&mut body, 4, 32);
+        put_u32(&mut body, 8, 1001);
+        put_u32(&mut body, 12, 7);
+        let s = parse_cat_stat_body(&body).unwrap();
+        assert_eq!(s.obj_type, 4);
+        assert_eq!(s.tier, 2);
+        assert_eq!((s.size_pages, s.owner_uid, s.database_id), (32, 1001, 7));
+        assert!(parse_cat_stat_body(&body[..15]).is_none());
+    }
+
+    #[test]
+    fn cat_info_answers_the_partition_the_boundary_computed_from() {
+        let mut body = [0u8; 16];
+        put_u32(&mut body, 0, 128);
+        put_u32(&mut body, 4, 64);
+        put_u32(&mut body, 8, 256);
+        put_u32(&mut body, 12, 5);
+        let i = parse_cat_info_body(&body).unwrap();
+        assert_eq!(
+            (i.max_objects, i.max_name, i.max_value, i.partition),
+            (128, 64, 256, 5)
+        );
+        assert!(parse_cat_info_body(&body[..12]).is_none());
+        assert_eq!(cat_status_name(CAT_ERR_NOENT), "NOENT");
+        assert_eq!(cat_status_name(0xBEEF), "?");
     }
 }

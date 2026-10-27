@@ -96,6 +96,8 @@ use alloc::vec::Vec;
 
 use aerosls_procmgr::{is_child, signal_exit_code, BlockReason, Ctx, ProcManager, ReadBlock, SIGCONT, SIGINT, SIGTSTP, Step, WaitOutcome, WriteBlock};
 use aerosls_proto::kabi::Kernel;
+use aerosls_proto::catalops::{CatalogOps, CatRefusal};
+use aerosls_proto::{CAT_ERR_UNKNOWN, CAT_LIST_PAGE_MAX, CAT_MAX_KEY, CAT_MAX_NAME};
 use aerosls_vfs::{BufferAlloc, Errno, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, Vfs};
 
 /// The boot script every POSIX sidecar init runs.
@@ -5886,8 +5888,166 @@ pub unsafe extern "C" fn k_cap_list() {}
 #[no_mangle]
 pub unsafe extern "C" fn posix_serial_print(_data: *const u8, _len: u32) {}
 
+/// `catalog`: POSIX-Environments §9.1's mediated, read-only,
+/// partition-scoped view of the object catalog — the four verbs
+/// `kernel.env.catalog` answers, reached through the tenant's `catalog`
+/// cap. This is the command that makes the surface reachable: the service,
+/// its wire and its boundary all exist before it, and without a caller an
+/// environment is still the sealed box §9.1 exists to open.
+///
+/// ```text
+/// catalog info                 the service's ceilings, and the partition
+///                              the KERNEL registered this channel under
+/// catalog list [page] [size]   one page of this namespace (size 1..=8)
+/// catalog stat NAME            type / tier / pages / owner / database
+/// catalog read NAME KEY        one (object, key) value
+/// ```
+///
+/// A refusal prints the service's OWN rendered line ("CAT_STAT refused by
+/// kernel.env.catalog: SYSTEM_METADATA is not tenant data") rather than a
+/// number: §9.1's contract is that a refusal is visible in the caller's
+/// transcript, and this is that transcript. Exit: 0 served, 1 refused or
+/// no catalog channel, 2 usage.
+pub fn catalog<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
+    // argv first, while ctx is only borrowed immutably: the client borrow
+    // below is exclusive and must not overlap it.
+    let argv: Vec<String> = ctx.argv().to_vec();
+    let (code, text) = match ctx.catalog() {
+        None => (
+            1,
+            String::from(
+                "catalog: no catalog channel — this environment's manifest names no 'catalog' cap\n",
+            ),
+        ),
+        Some(cat) => catalog_run(cat.as_mut(), &argv),
+    };
+    let task = ctx.task;
+    if ctx.vfs().write(task, 1, text.as_bytes()).is_err() {
+        return Step::Exit(2);
+    }
+    Step::Exit(code)
+}
+
+/// The subcommand dispatch, split out so the `ctx.catalog()` borrow is
+/// scoped to the call and the fd write below it happens with no borrow live.
+fn catalog_run(cat: &mut dyn CatalogOps, argv: &[String]) -> (i32, String) {
+    let sub = argv.get(1).map(|s| s.as_str()).unwrap_or("help");
+    match sub {
+        "help" | "-h" | "--help" => (0, catalog_usage().to_string()),
+
+        "info" => match cat.cat_info() {
+            Ok(i) => (
+                0,
+                alloc::format!(
+                    "partition {} — the kernel's own answer for this channel\n\
+                     objects {}   name {} B   value {} B\n",
+                    i.partition, i.max_objects, i.max_name, i.max_value
+                ),
+            ),
+            Err(e) => catalog_refusal(&e),
+        },
+
+        "list" => {
+            let page = match argv.get(2) {
+                None => 0,
+                Some(v) => match v.parse::<u16>() {
+                    Ok(p) => p,
+                    Err(_) => return (2, alloc::format!("catalog: page must be a number\n{}", catalog_usage())),
+                },
+            };
+            let size = match argv.get(3) {
+                None => CAT_LIST_PAGE_MAX,
+                Some(v) => match v.parse::<u16>() {
+                    Ok(s) => s,
+                    Err(_) => return (2, alloc::format!("catalog: page size must be a number\n{}", catalog_usage())),
+                },
+            };
+            match cat.cat_list(page, size) {
+                Ok((head, entries)) => {
+                    let mut text = alloc::format!(
+                        "page {}: {} of {} objects (partition {})\n",
+                        page, head.count, head.total, head.partition
+                    );
+                    for e in entries.iter().take(head.count as usize) {
+                        text.push_str(&alloc::format!(
+                            "  {:<24} type={} tier={}\n",
+                            e.name_str(), e.obj_type, e.tier
+                        ));
+                    }
+                    if head.count == 0 {
+                        text.push_str("  (empty page)\n");
+                    }
+                    (0, text)
+                }
+                Err(e) => catalog_refusal(&e),
+            }
+        }
+
+        "stat" => {
+            let name = match argv.get(2) {
+                Some(n) => n.as_bytes(),
+                None => return (2, alloc::format!("catalog: stat needs a name\n{}", catalog_usage())),
+            };
+            match cat.cat_stat(name) {
+                Ok(s) => (
+                    0,
+                    alloc::format!(
+                        "type={} tier={} pages={} owner={} database={}\n",
+                        s.obj_type, s.tier, s.size_pages, s.owner_uid, s.database_id
+                    ),
+                ),
+                Err(e) => catalog_refusal(&e),
+            }
+        }
+
+        "read" => {
+            let name = match argv.get(2) {
+                Some(n) => n.as_bytes(),
+                None => return (2, alloc::format!("catalog: read needs a name and a key\n{}", catalog_usage())),
+            };
+            let key = match argv.get(3) {
+                Some(k) => k.as_bytes(),
+                None => return (2, alloc::format!("catalog: read needs a key\n{}", catalog_usage())),
+            };
+            if name.len() >= CAT_MAX_NAME || key.len() >= CAT_MAX_KEY {
+                return (
+                    2,
+                    alloc::format!("catalog: name < {} B and key < {} B\n", CAT_MAX_NAME, CAT_MAX_KEY),
+                );
+            }
+            match cat.cat_read(name, key) {
+                Ok(v) => (0, alloc::format!("{}\n", String::from_utf8_lossy(&v.value))),
+                Err(e) => catalog_refusal(&e),
+            }
+        }
+
+        other => (
+            2,
+            alloc::format!("catalog: unknown subcommand '{}'\n{}", other, catalog_usage()),
+        ),
+    }
+}
+
+/// A refusal as the service rendered it. A status inside the service's own
+/// range already names the verb and the service ("CAT_STAT refused by
+/// kernel.env.catalog: …"), so it is printed verbatim; one of the client's
+/// own statuses (0xFFxx — no channel answered) is prefixed so a reader can
+/// tell a service answer from a local failure.
+fn catalog_refusal(e: &CatRefusal) -> (i32, String) {
+    if e.status <= CAT_ERR_UNKNOWN {
+        (1, alloc::format!("{}\n", e.as_str()))
+    } else {
+        (1, alloc::format!("catalog: {}\n", e.as_str()))
+    }
+}
+
+fn catalog_usage() -> &'static str {
+    "usage: catalog info | list [page] [page_size] | stat NAME | read NAME KEY\n"
+}
+
 pub fn register_default_applets<K: Kernel, A: BufferAlloc>(pm: &mut ProcManager<K, A>) {
     pm.register_applet("init", init);
+    pm.register_applet("catalog", catalog);
     pm.register_applet("cat", cat);
     pm.register_applet("grep", grep);
     pm.register_applet("wc", wc);

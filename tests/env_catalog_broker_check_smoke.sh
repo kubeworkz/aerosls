@@ -28,7 +28,12 @@
 #   B1. the four filters, the two-store rule, the strays rule, the two
 #       cap.c arm fields, and the NOENT/PERM distinction;
 #   B2. the host test's link, its two named clauses, its gcc build line,
-#       and run_all.sh's glob.
+#       and run_all.sh's glob;
+#   C1. the cap: the tenant manifest's catalog peer, its rights, the count,
+#       the SYSTEM profile's ABSENCE of it, and its pin test;
+#   C2. the client: the CAT magic, the four trait verbs, the status-word
+#       read, the surfaced refusal text, and the three wiring hops that
+#       reach a shell command (BIB resolve, install, registration).
 #
 # Mutations run on COPIES (seed() below): the real tree is never touched,
 # and the baseline run on an unmutated copy — plus the final run on the
@@ -55,6 +60,16 @@ FILES=(
     kernel/env_catalog.c
     tests/env_catalog_host_test.c
     tests/run_all.sh
+    # C1/C2: the tenant half — the manifest that asks for the channel and
+    # the client that speaks on it.
+    user/init/src/posix_manifest.rs
+    user/proto/src/lib.rs
+    user/proto/src/catalops.rs
+    user/sidecar/src/catalog_client.rs
+    user/sidecar/src/boot.rs
+    user/sidecar/src/entry.rs
+    user/sidecar/src/applets.rs
+    user/procmgr/src/procmgr.rs
 )
 
 for f in "${FILES[@]}" "$GUARD"; do
@@ -98,8 +113,8 @@ tooth() {
     fi
 }
 
-echo "env_catalog_broker_check_smoke — teeth for §9.1's five wires and the"
-echo "boundary they exist to carry:"
+echo "env_catalog_broker_check_smoke — teeth for §9.1's five wires, its"
+echo "boundary, and the tenant half (cap + client) that makes it reachable:"
 echo "  W1. the Makefile compiles the service"
 echo "  W2. cap_create_sidecar() reaches the registration, hop by hop"
 echo "  W3. the arm is gated on kernel.env.catalog, in the right place, and answers under it"
@@ -107,6 +122,8 @@ echo "  W4. console_service_tick() skips the catalog channel's kernel slot"
 echo "  W5. the tick runs in microkernel_service_poll(), after net_socket_service_tick()"
 echo "  B1. the boundary: filtered on the registered partition, as absence, unmovable by the wire"
 echo "  B2. the boundary's evidence: the host test links the real service and is RUN"
+echo "  C1. the cap: the tenant manifest names kernel.env.catalog (and the system one does not)"
+echo "  C2. the client: four verbs, the status word, the refusal text, and the wiring to a command"
 echo "========================================================================"
 echo
 
@@ -154,39 +171,36 @@ tooth gate-removed W3 "the arm is no longer gated on kernel.env.catalog" "$W/t6"
 # as a genuine line move rather than a deletion, because a deletion tests
 # the first anchor and not the ordering.
 seed "$W/t7"
-python3 - "$W/t7/kernel/cap.c" <<'PY'
-import sys
-p = sys.argv[1]
-lines = open(p, encoding='utf-8').read().split('\n')
-gate = '        if (sidecar_prefix(sc->peer_name, "kernel.")) {'
-arm  = '                if (sidecar_prefix(sc->peer_name, "kernel.env.catalog")) {'
-i, j = lines.index(gate), lines.index(arm)
-assert i < j, "expected the kernel. branch to open before the catalog arm"
-moved = lines.pop(i)
-# index shifted by one only if the removed line was before the insertion
-j = lines.index(arm)
-lines.insert(j + 1, moved)
-open(p, 'w', encoding='utf-8', newline='').write('\n'.join(lines))
-PY
+awk -v gate='        if (sidecar_prefix(sc->peer_name, "kernel.")) {' \
+    -v arm='                if (sidecar_prefix(sc->peer_name, "kernel.env.catalog")) {' '
+    $0 == gate { held = 1; next }
+    { print }
+    $0 == arm && held { print gate; held = 0 }
+    END { if (held) print gate }
+' "$W/t7/kernel/cap.c" > "$W/t7/kernel/cap.c.new"
+mv "$W/t7/kernel/cap.c.new" "$W/t7/kernel/cap.c"
 tooth arm-left-branch W3 "the catalog arm now sits AFTER the kernel-owned branch opens" "$W/t7"
 
 # ...and the other direction: the tenant-resolvable registry fallback
 # dragged up in front of the arm, so the arm would be reachable only after
 # a cross-partition resolve.
 seed "$W/t8"
-python3 - "$W/t8/kernel/cap.c" <<'PY'
-import sys
-p = sys.argv[1]
-lines = open(p, encoding='utf-8').read().split('\n')
-res  = '            uint32_t peer_pid = sidecar_registry_resolve(sc->peer_name,'
-arm  = '                if (sidecar_prefix(sc->peer_name, "kernel.env.catalog")) {'
-i, j = lines.index(res), lines.index(arm)
-assert i > j, "expected the registry fallback after the catalog arm"
-moved = lines.pop(i)
-j = lines.index(arm)
-lines.insert(j, moved)
-open(p, 'w', encoding='utf-8', newline='').write('\n'.join(lines))
-PY
+# A two-pass awk: the line being moved comes AFTER its destination in the
+# file, so the whole file is read before it is re-emitted without it.
+awk -v arm='                if (sidecar_prefix(sc->peer_name, "kernel.env.catalog")) {' \
+    -v res='            uint32_t peer_pid = sidecar_registry_resolve(sc->peer_name,' '
+    { line[NR] = $0 }
+    END {
+        done = 0
+        for (i = 1; i <= NR; i++) {
+            if (line[i] == res) continue
+            if (line[i] == arm && !done) { print res; done = 1 }
+            print line[i]
+        }
+        if (!done) print res
+    }
+' "$W/t8/kernel/cap.c" > "$W/t8/kernel/cap.c.new"
+mv "$W/t8/kernel/cap.c.new" "$W/t8/kernel/cap.c"
 tooth arm-after-fallback W3 "the registry-resolve fallback now precedes the catalog arm" "$W/t8"
 
 seed "$W/t9"
@@ -212,17 +226,12 @@ sed -i '/^    env_catalog_service_tick();$/d' "$W/t13/kernel/microkernel.c"
 tooth poll-tick-gone W5 "registered channels would never be drained" "$W/t13"
 
 seed "$W/t14"
-python3 - "$W/t14/kernel/microkernel.c" <<'PY'
-import sys
-p = sys.argv[1]
-lines = open(p, encoding='utf-8').read().split('\n')
-net = '    net_socket_service_tick();'
-cat = '    env_catalog_service_tick();'
-i, j = lines.index(net), lines.index(cat)
-assert i < j, "expected net_socket_service_tick() before env_catalog_service_tick()"
-lines[i], lines[j] = lines[j], lines[i]
-open(p, 'w', encoding='utf-8', newline='').write('\n'.join(lines))
-PY
+awk -v net='    net_socket_service_tick();' -v cat='    env_catalog_service_tick();' '
+    $0 == net && !sw { print cat; sw = 1; next }
+    $0 == cat && sw && !done { print net; done = 1; next }
+    { print }
+' "$W/t14/kernel/microkernel.c" > "$W/t14/kernel/microkernel.c.new"
+mv "$W/t14/kernel/microkernel.c.new" "$W/t14/kernel/microkernel.c"
 tooth tick-order-flipped W5 "the catalog tick now runs BEFORE net_socket_service_tick()" "$W/t14"
 
 # ─── B1. THE BOUNDARY ─────────────────────────────────────────────────────
@@ -243,20 +252,28 @@ sed -i 's/    e->partition = partition;/    e->partition = 0;/' "$W/t18/kernel/e
 tooth partition-store-gone B1 "the register argument no longer stores the partition" "$W/t18"
 
 seed "$W/t19"
-python3 - "$W/t19/kernel/cap.c" <<'PY'
-import sys
-p = sys.argv[1]
-lines = open(p, encoding='utf-8').read().split('\n')
-arm = '                if (sidecar_prefix(sc->peer_name, "kernel.env.catalog")) {'
-i = lines.index(arm)
-hits = 0
-for k in range(i, min(i + 7, len(lines))):
-    if 'pd->partition_id,' in lines[k]:
-        lines[k] = lines[k].replace('pd->partition_id,', 'partition_from_wire,')
-        hits += 1
-assert hits == 1, f"expected exactly one pd->partition_id in the arm, found {hits}"
-open(p, 'w', encoding='utf-8', newline='').write('\n'.join(lines))
-PY
+# Scoped, like the python this replaces: only the six lines the guard's ARM
+# extraction sees may change — a global s/// would mutate every other
+# pd->partition_id in the file and redden for the wrong reason.
+awk -v arm='                if (sidecar_prefix(sc->peer_name, "kernel.env.catalog")) {' '
+    { line[NR] = $0 }
+    END {
+        done = 0
+        for (i = 1; i <= NR; i++) {
+            if (!done && line[i] == arm) {
+                for (j = i + 1; j <= i + 6 && j <= NR; j++) {
+                    if (!done && index(line[j], "pd->partition_id,")) {
+                        sub(/pd->partition_id,/, "partition_from_wire,", line[j])
+                        done = 1
+                    }
+                }
+            }
+            print line[i]
+        }
+        if (!done) exit 1
+    }
+' "$W/t19/kernel/cap.c" > "$W/t19/kernel/cap.c.new"
+mv "$W/t19/kernel/cap.c.new" "$W/t19/kernel/cap.c"
 tooth partition-not-from-pd B1 "the arm no longer reads the partition off the process descriptor" "$W/t19"
 
 seed "$W/t20"
@@ -291,6 +308,65 @@ tooth no-extractable-build-line B2 "run_all.sh would SKIP the test with no failu
 seed "$W/t27"
 sed -i 's|for src in tests/\*_host_test.c; do|for src in tests/*_host_test_never.c; do|' "$W/t27/tests/run_all.sh"
 tooth runner-glob-gone B2 "run_all.sh would never build the host test" "$W/t27"
+
+# ─── C1. the cap a manifest must name ─────────────────────────────────────
+seed "$W/t28"
+sed -i 's/peer: Some("kernel.env.catalog"),/peer: Some("drv.catalog.0"),/' \
+    "$W/t28/user/init/src/posix_manifest.rs"
+tooth tenant-peer-rewritten C1 "the tenant's catalog cap no longer peers at the kernel-owned service" "$W/t28"
+
+seed "$W/t29"
+sed -i 's/n_caps: 5,/n_caps: 4,/' "$W/t29/user/init/src/posix_manifest.rs"
+tooth cap-not-counted C1 "n_caps stops counting the catalog cap" "$W/t29"
+
+seed "$W/t30"
+sed -i 's/rights: 0x7, \/\/ R | W | send — CAT_\*/rights: 0x3, \/\/ R | W | send — CAT_*/' \
+    "$W/t30/user/init/src/posix_manifest.rs"
+tooth catalog-rights-shrunk C1 "the catalog cap's rights shrink below its siblings" "$W/t30"
+
+# "give the system profile the same cap" — the plausible edit the
+# ABSENCE anchor exists for: only the tenant profile was to change, and a
+# shared cap would put a second, differently-partitioned channel behind
+# the same kernel-owned name.
+seed "$W/t31"
+sed -i '/        n_caps: if e1000_bar0_phys.is_some() { 8 } else { 7 },/i\        peer: Some("kernel.env.catalog"), // same as the tenant profile' \
+    "$W/t31/user/init/src/posix_manifest.rs"
+tooth system-gains-catalog C1 "the SYSTEM profile was given a catalog cap too" "$W/t31"
+
+seed "$W/t32"
+sed -i 's/assert_eq!(cat_peer, "kernel.env.catalog",/assert_eq!(cat_peer, "drv.catalog.0",/' \
+    "$W/t32/user/init/src/posix_manifest.rs"
+tooth pin-peer-rotated C1 "the pin test no longer asserts the kernel-owned catalog peer" "$W/t32"
+
+# ─── C2. the client, its four verbs and its status discipline ─────────────
+seed "$W/t33"
+sed -i 's/pub const CAT_MAGIC: \[u8; 8\] = \*b"AEROSCT/pub const CAT_MAGIC: [u8; 8] = *b"AEROSNT/' \
+    "$W/t33/user/proto/src/lib.rs"
+tooth magic-collision C2 "the client's CAT magic becomes the NET magic — the two services parse each other" "$W/t33"
+
+seed "$W/t34"
+sed -i '/fn cat_read(&mut self/d' "$W/t34/user/proto/src/catalops.rs"
+tooth verb-dropped C2 "the trait loses CAT_READ — three verbs where §9.1 names four" "$W/t34"
+
+seed "$W/t35"
+sed -i 's/let status = cat_status(reply)/let status = CAT_OK/' "$W/t35/user/sidecar/src/catalog_client.rs"
+tooth status-skipped C2 "the client stops reading the status word off every reply" "$W/t35"
+
+seed "$W/t36"
+sed -i 's/cat_text(reply)/None/' "$W/t36/user/sidecar/src/catalog_client.rs"
+tooth refusal-text-dropped C2 "the service's rendered refusal never reaches the caller's transcript" "$W/t36"
+
+seed "$W/t37"
+sed -i 's/bib.find_cap(CAP_CHAN, "catalog")/bib.find_cap(CAP_CHAN, "console")/' "$W/t37/user/sidecar/src/boot.rs"
+tooth bib-cap-unresolved C2 "the granted catalog cap is never resolved into a client" "$W/t37"
+
+seed "$W/t38"
+sed -i '/booted.proc.set_catalog(/d' "$W/t38/user/sidecar/src/entry.rs"
+tooth client-not-installed C2 "the client is constructed but never installed into the ProcManager" "$W/t38"
+
+seed "$W/t39"
+sed -i '/pm.register_applet("catalog", catalog);/d' "$W/t39/user/sidecar/src/applets.rs"
+tooth applet-unregistered C2 "the surface has no command — nobody can reach it" "$W/t39"
 
 echo
 echo "────────────────────────────────────────────────────────────────────────"

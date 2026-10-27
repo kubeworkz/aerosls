@@ -416,6 +416,13 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     if let Some(nc) = booted.net.take() {
         booted.proc.set_net(alloc::boxed::Box::new(nc));
     }
+    // Install the catalog client into the ProcManager so applets can call
+    // ctx.catalog() for §9.1's mediated, read-only, partition-scoped view
+    // of the object catalog. Absent when the manifest named no `catalog`
+    // cap — then `ctx.catalog()` is None and the applet says so.
+    if let Some(cc) = booted.catalog.take() {
+        booted.proc.set_catalog(alloc::boxed::Box::new(cc));
+    }
 
     // The console channel's WRITE endpoint (CHAN_R is `caps.console_chan`).
     // Applet/init stdout lands in the in-memory console (CharNode); the
