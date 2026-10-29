@@ -165,6 +165,47 @@ bad()  { echo "FAIL: $*"; fail=1; }
 # has <file> <fixed string> -> 0 when present
 has() { grep -qF -- "$2" "$1" 2>/dev/null; }
 
+# ── The ENV family's dispatch range, read as a NUMBER ─────────────────────
+# dspp.c admits the family with `opcode >= DSPP_MIGRATE_ENV_BEGIN_REQ &&
+# opcode <= X`, and X — the range's written terminator — is what teeth S and
+# AB actually assert on: X's value must reach DSPP_MIGRATE_ENV_INTENT (24),
+# or the announce and the destination's word fall through to the stream
+# family and die unheard. So the guard resolves X from the source and looks
+# its value up in the enum, instead of grepping one spelling of it. The
+# replica increment legitimately extended X to DSPP_MIGRATE_ENV_REPLICA_
+# LIVE_ACK (27); a tooth pinned to the old spelling then reddened for a
+# CORRECT change, and a tooth that reds for growth is a tooth someone edits
+# away rather than a property the tree keeps.
+env_range_term_sym=$(awk '
+    /opcode >= DSPP_MIGRATE_ENV_BEGIN_REQ/ { seen = 1 }
+    seen && match($0, /opcode <= [A-Za-z_0-9]+/) {
+        s = substr($0, RSTART, RLENGTH)
+        sub(/^opcode <= /, "", s)
+        print s
+        exit
+    }' net/dspp.c 2>/dev/null)
+
+# dspp_enum_value <symbol> -> the number net/dspp.h assigns it ('' if absent)
+dspp_enum_value() {
+    awk -v sym="$1" 'match($0, sym "[ \t]*= *[0-9]+") {
+        s = substr($0, RSTART, RLENGTH)
+        sub(/.*= */, "", s)
+        print s
+        exit
+    }' net/dspp.h 2>/dev/null
+}
+
+env_intent_val=$(dspp_enum_value DSPP_MIGRATE_ENV_INTENT)
+env_range_term_val=""
+if [ -n "$env_range_term_sym" ]; then
+    env_range_term_val=$(dspp_enum_value "$env_range_term_sym")
+fi
+env_range_reaches_intent=0
+if [ -n "$env_intent_val" ] && [ -n "$env_range_term_val" ] &&
+   [ "$env_range_term_val" -ge "$env_intent_val" ] 2>/dev/null; then
+    env_range_reaches_intent=1
+fi
+
 # ── A. Preconditions ──────────────────────────────────────────────────────
 for f in kernel/partition.c kernel/env_migrate.c kernel/env_migrate.h \
          kernel/env_ckpt.c kernel/env_ckpt.h Makefile net/http.c \
@@ -413,8 +454,8 @@ if ! has net/dspp.h "DSPP_MIGRATE_ENV_LIVE_REQ"; then
     bad "S. net/dspp.h no longer defines the LIVE_REQ opcode — the source has no question to ask"
 elif ! has net/dspp.h "DSPP_MIGRATE_ENV_LIVE_ACK"; then
     bad "S. net/dspp.h no longer defines the LIVE_ACK opcode — the destination has no word to give"
-elif ! has net/dspp.c "opcode >= DSPP_MIGRATE_ENV_BEGIN_REQ && opcode <= DSPP_MIGRATE_ENV_INTENT"; then
-    bad "S. the ENV dispatch range no longer reaches LIVE_ACK (the range's written terminator must be at least DSPP_MIGRATE_ENV_INTENT=24, which passes LIVE_ACK=23) — the destination's word would be silently dropped on arrival"
+elif [ "$env_range_reaches_intent" -ne 1 ]; then
+    bad "S. the ENV dispatch range no longer reaches LIVE_ACK (its terminator ${env_range_term_sym:-<none>} = ${env_range_term_val:-<unresolved>} must be at least DSPP_MIGRATE_ENV_INTENT=${env_intent_val:-24}, which passes LIVE_ACK=23) — the destination's word would be silently dropped on arrival"
 elif ! has net/dspp.h "dspp_env_migrate_send_live("; then
     bad "S. net/dspp.h no longer declares the LIVE_REQ sender — the source could not ask even if it wanted to"
 elif ! has kernel/env_migrate.c "dspp_env_migrate_send_live("; then
@@ -551,8 +592,8 @@ ab_h=$(awk '/^void dspp_env_migrate_rx/{f=1} f && /env_migrate_recv_intent\(\(ui
 ab_f=$(awk '/^void dspp_env_migrate_rx/{f=1} f && /if \(h->node_dest_id != cluster_local_node_id\(\)\) return;/{print NR; exit}' net/dspp.c)
 if ! has net/dspp.h "DSPP_MIGRATE_ENV_INTENT"; then
     bad "AB. dspp.h no longer defines the intent opcode — sender and receiver cannot agree on the frame"
-elif ! has net/dspp.c "opcode <= DSPP_MIGRATE_ENV_INTENT"; then
-    bad "AB. dspp.c's dispatch no longer routes the intent opcode into the migrate RX — the announce falls through the dispatch unheard"
+elif [ "$env_range_reaches_intent" -ne 1 ]; then
+    bad "AB. dspp.c's dispatch no longer routes the intent opcode into the migrate RX (its terminator ${env_range_term_sym:-<none>} = ${env_range_term_val:-<unresolved>} stops short of DSPP_MIGRATE_ENV_INTENT=${env_intent_val:-24}) — the announce falls through the dispatch unheard"
 elif ! has kernel/env_migrate.c "dspp_env_migrate_send_intent"; then
     bad "AB. env_migrate.c no longer transmits the announce — a local gate alone cannot spare a THIRD node that holds no migration state"
 elif [ -z "$ab_h" ] || [ -z "$ab_f" ] || [ "$ab_h" -ge "$ab_f" ]; then

@@ -353,9 +353,27 @@ sed -i '/env_migrate_intent_begin();/d; /Step 1 (LPAR Phase 14)/a\    env_migrat
 tooth "AA. partition_migrate announces intent AFTER its Step-1 block begins (an announce that never reaches the wire)" "AA" "$W/aa"
 
 # ── AB. The dispatch stops routing the announce into the migrate RX ───────
+# The mutation reads the terminator out of the tree it just seeded, because
+# the guard asserts the terminator's VALUE (>= ENV_INTENT), not its spelling.
+# A sed pinned to the old spelling went silently dead the moment the family
+# grew to the replica opcodes — the arm reported "bites" against a tree the
+# mutation had never touched, which is a tooth that never bit.
 seed "$W/ab"
-sed -i 's/opcode <= DSPP_MIGRATE_ENV_INTENT/opcode <= DSPP_MIGRATE_ENV_LIVE_ACK/' "$W/ab/net/dspp.c"
-tooth "AB. the dispatch no longer routes the intent opcode (the announce falls through unheard)" "AB" "$W/ab"
+ab_term=$(awk '
+    /opcode >= DSPP_MIGRATE_ENV_BEGIN_REQ/ { seen = 1 }
+    seen && match($0, /opcode <= [A-Za-z_0-9]+/) {
+        s = substr($0, RSTART, RLENGTH)
+        sub(/^opcode <= /, "", s)
+        print s
+        exit
+    }' "$W/ab/net/dspp.c" 2>/dev/null)
+if [ -z "$ab_term" ] || [ "$ab_term" = "DSPP_MIGRATE_ENV_LIVE_ACK" ]; then
+    echo "FAIL: AB. the seeded tree's dispatch range has no usable terminator (found '${ab_term}') — this mutation would change nothing, so the arm proves nothing"
+    failed=$((failed + 1))
+else
+    sed -i "s/opcode <= $ab_term/opcode <= DSPP_MIGRATE_ENV_LIVE_ACK/" "$W/ab/net/dspp.c"
+    tooth "AB. the dispatch no longer routes the intent opcode (the announce falls through unheard)" "AB" "$W/ab"
+fi
 
 # ── AC. The silence arithmetic wraps on a stamp ahead of the sample ────────
 # The live defect verbatim: last_seen_tick is stamped by the heartbeat RX
