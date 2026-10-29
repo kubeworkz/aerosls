@@ -202,6 +202,20 @@ __attribute__((weak)) int env_console_kernel_slot(uint16_t slot) { (void)slot; r
 __attribute__((weak)) int net_socket_service_register(uint16_t k_rd, uint16_t k_wr, uint32_t partition, uint32_t pid, const char* name) { (void)k_rd; (void)k_wr; (void)partition; (void)pid; (void)name; return 0; }
 __attribute__((weak)) int net_socket_service_kernel_slot(uint16_t slot) { (void)slot; return 0; }
 
+/* ─── §9.1 interop first increment: the catalog broker service ────────────
+ * cap.c's "kernel.*" wiring calls env_catalog_service_register() when it
+ * wires a tenant's kernel.env.catalog peer, and console_service_tick() asks
+ * env_catalog_service_kernel_slot() to skip that slot (CAT_* frames are not
+ * console text and must never reach the shared serial transcript). The strong
+ * definitions live in env_catalog.c, which none of the cap.c/console_service.c
+ * host tests link, so these weak inert stubs close the link: nothing registers
+ * (no catalog service in host context) and no slot is claimed, so both ticks
+ * drain every slot exactly as they did before §9.1 — what every existing
+ * assertion in those tests measures. tests/env_catalog_host_test.c links the
+ * real file, where the strong definitions win. */
+__attribute__((weak)) int env_catalog_service_register(uint16_t k_rd, uint16_t k_wr, uint32_t partition, uint32_t pid, const char* name) { (void)k_rd; (void)k_wr; (void)partition; (void)pid; (void)name; return 0; }
+__attribute__((weak)) int env_catalog_service_kernel_slot(uint16_t slot) { (void)slot; return 0; }
+
 /* E6's BIB v3 has cap.c ask the same identity question the console registry
  * asks — "is this sidecar's name an environment's name, and which index?" — so
  * cap_create_sidecar_in() calls env_console_name_index() to fill the header's

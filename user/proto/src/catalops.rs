@@ -14,8 +14,8 @@
 //! back to a synthesized line where no service answered to render one.
 
 use crate::{
-    CatInfo, CatListEntry, CatListHead, CatStat, CatValue, CAT_LIST_PAGE_MAX,
-    CAT_TEXT_CAP,
+    CatInfo, CatListEntry, CatListHead, CatRows, CatStat, CatValue,
+    CAT_LIST_PAGE_MAX, CAT_TEXT_CAP,
 };
 
 /// Client-side statuses: conditions where no service rendered a refusal.
@@ -70,10 +70,11 @@ pub type CatResult<T> = Result<T, CatRefusal>;
 /// carry the reply with no allocation and no length negotiation.
 pub type CatPage = (CatListHead, [CatListEntry; CAT_LIST_PAGE_MAX as usize]);
 
-/// The four verbs of §9.1's mediated surface, in the order the section
-/// names them. There is deliberately no write method: the verb does not
-/// exist in the kernel's table, and a trait that offered one would be
-/// promising something the service answers CAT_ERR_UNKNOWN.
+/// The verbs of §9.1's mediated surface. There is deliberately no write
+/// method: no such verb exists in the kernel's table, and a trait that
+/// offered one would be promising something the service answers
+/// CAT_ERR_UNKNOWN. `cat_query` reads, which is why it is here and an
+/// INSERT method is not — the service admits SELECT alone.
 pub trait CatalogOps {
     /// CAT_INFO — the handshake: the real ceilings and the partition the
     /// kernel computed this caller's boundary from.
@@ -90,4 +91,15 @@ pub trait CatalogOps {
 
     /// CAT_READ — one (object, key) pair from the legacy record path.
     fn cat_read(&mut self, name: &[u8], key: &[u8]) -> CatResult<CatValue>;
+
+    /// CAT_QUERY — one page of rows from a row-set table, run through the
+    /// real SQL engine on the kernel's side of the channel. A refusal comes
+    /// back as the service rendered it, including the ENGINE's own message
+    /// when the statement itself is what failed (`CAT_ERR_QUERY`), so a
+    /// caller sees "expected FROM" rather than a status number. `more` means
+    /// the page stopped at a bound and the next page exists; an empty `rows`
+    /// with `more == false` is a genuinely empty result — and a refusal is
+    /// never an empty result, which is the difference this verb exists to
+    /// keep visible.
+    fn cat_query(&mut self, sql: &[u8], page: u16, limit: u8) -> CatResult<CatRows>;
 }

@@ -12,6 +12,18 @@
 #include "cap.h"
 #include "kernel_io.h"
 #include "object_catalog.h"
+/* CAT_QUERY (§9.1's SQL path) reads a row-set table through the engine that
+ * owns it rather than reimplementing a reader: sql_parse() gates the
+ * statement's SHAPE before any name is resolved, sql_execute() runs it under
+ * the caller's uid, and the row-set cursor hands back the rows. proc_table
+ * is how the channel's (partition, pid) becomes the uid that policy runs
+ * against — the wire still states no identity. */
+#include "sql_parser.h"
+#include "sql_exec.h"
+#include "cursor.h"
+#include "rowstore.h"
+#include "process.h"
+#include "../user/permissions.h"   /* PERM_READ — the policy bit CAT_QUERY checks */
 #include <stddef.h>
 
 /* The wire, spelled out in C. See env_catalog.h's wire section; the host
@@ -29,6 +41,7 @@ static const struct { uint16_t ty; const char* name; } cat_verbs[] = {
     { 2, "CAT_LIST" },
     { 3, "CAT_STAT" },
     { 4, "CAT_READ" },
+    { 5, "CAT_QUERY" },
 };
 
 const char* env_catalog_verb_name(uint16_t ty) {
@@ -55,7 +68,23 @@ static struct EnvCatalogSvc cat_svc[ENV_CATALOG_SERVICE_MAX];
  * non-IRQ kernel context at a time (microkernel_service_poll), and a
  * channel's payload bound is what sizes it. */
 static uint8_t  cat_buf[4096];
-static uint8_t  cat_reply[1024];
+/* 4 KiB, not 1 KiB: CAT_QUERY's page is the first verb whose body can
+ * exceed the old 1024-byte reply (its byte ceiling is CAT_QUERY_BODY_MAX,
+ * below CAT_BODY + that still fits the channel's 4 KiB payload bound). */
+static uint8_t  cat_reply[4096];
+
+/* ─── CAT_QUERY scratch ────────────────────────────────────────────────────
+ * struct SqlStatement embeds a Predicate (32 nodes × a 256-byte literal
+ * each) plus 512 bytes of set-operator text — tens of kilobytes, never a
+ * stack local. sql_exec.c keeps the same type in static scratch for the
+ * same reason, and the re-entrancy argument is identical: this tick runs in
+ * ONE non-IRQ kernel context (microkernel_service_poll), which is also what
+ * makes cat_buf a single shared static rather than a per-call buffer. A
+ * query's statement, engine result and SQL text therefore live here, one
+ * query at a time. */
+static struct SqlStatement cat_stmt;
+static struct SqlResult    cat_result;
+static uint8_t             cat_sql[CAT_SQL_MAX + 1];
 static uint32_t cat_refusals_total = 0;
 static uint32_t cat_dropped_total  = 0;
 static uint32_t cat_served_total   = 0;
@@ -315,6 +344,75 @@ static uint32_t cat_partition_count(uint32_t partition) {
 
 /* ─── the verbs ─────────────────────────────────────────────────────────── */
 
+static uint32_t cat_strnlen(const char* s, uint32_t max) {
+    uint32_t n = 0;
+    while (n < max && s[n]) n++;
+    return n;
+}
+
+static int cat_streq(const char* a, const char* b) {
+    while (*a && *a == *b) { a++; b++; }
+    return *a == *b;
+}
+
+/* ─── CAT_QUERY: one page of rows ──────────────────────────────────────────
+ * The cursor hands rows to this callback one at a time; the page is built
+ * here so the two bounds (row count and bytes) are enforced in one place.
+ * `map` decides a row's SHAPE: NULL means "this row already carries exactly
+ * the reported columns" (SELECT *, and every aggregate/group result, whose
+ * rows are built from the projection); non-NULL is the projection case,
+ * where the engine hands back the FULL row and `map[c]` says which of its
+ * cells output column c came from — see the arm below for why that split is
+ * the engine's documented behaviour rather than a guess. */
+struct cat_qpage {
+    uint8_t* out;        /* reply base (cat_reply) */
+    uint32_t cap;        /* first byte past the body budget */
+    uint32_t off;        /* next byte to write */
+    uint32_t skip;       /* rows this page does not carry (page * limit) */
+    uint32_t want;       /* rows this page may carry */
+    uint32_t seen;       /* rows the cursor has delivered so far */
+    uint32_t ncols;      /* output columns */
+    uint32_t written;
+    const uint8_t* map;  /* projection: output col -> cell index; 0 = identity */
+    uint8_t  more;
+    uint8_t  over_budget;
+    uint8_t  mismatch;
+};
+
+static void cat_query_row(struct RowId id, const struct RowValues* v, void* p) {
+    (void)id;
+    struct cat_qpage* g = (struct cat_qpage*)p;
+    if (g->mismatch) return;
+    if (g->seen < g->skip) { g->seen++; return; }
+    if (g->written >= g->want) { g->more = 1; return; }
+    g->seen++;
+
+    uint32_t need = 0;
+    for (uint32_t c = 0; c < g->ncols; c++) {
+        uint32_t src = g->map ? (uint32_t)g->map[c] : c;
+        if (src >= v->count) { g->mismatch = 1; return; }
+        uint32_t len = cat_strnlen(v->values[src], RECORD_VAL_LEN);
+        need += 2u + len;
+    }
+    if (g->off + need > g->cap) {
+        /* The byte bound stopped the page — `more` says so, so a client
+         * pages on rather than believing the result ended here. */
+        g->over_budget = 1;
+        g->more = 1;
+        return;
+    }
+    for (uint32_t c = 0; c < g->ncols; c++) {
+        uint32_t src = g->map ? (uint32_t)g->map[c] : c;
+        uint32_t len = cat_strnlen(v->values[src], RECORD_VAL_LEN);
+        int is_null = (v->null_mask & (uint16_t)(1u << src)) != 0;
+        g->out[g->off++] = (uint8_t)(is_null ? 1u : 0u);   /* cell flags */
+        g->out[g->off++] = (uint8_t)len;
+        for (uint32_t i = 0; i < len; i++)
+            g->out[g->off++] = (uint8_t)v->values[src][i];
+    }
+    g->written++;
+}
+
 /* Answer one drained frame. */
 static void cat_handle(struct EnvCatalogSvc* e, uint32_t plen, uint32_t tag) {
     if (!cat_is_catalog_frame(cat_buf, plen)) {
@@ -496,6 +594,265 @@ static void cat_handle(struct EnvCatalogSvc* e, uint32_t plen, uint32_t tag) {
             cat_reply[CAT_BODY + 4 + CAT_MAX_KEY + i] = (uint8_t)value[i];
         cat_served_total++;
         cat_send(e, cat_reply, CAT_BODY + 4 + CAT_MAX_KEY + vlen, tag);
+        return;
+    }
+
+    case CAT_VERB_QUERY: {
+        /* {sql_len u16, page u16, limit u8, flags u8, sql[sql_len]}.
+         * The ORDER of the gates below is the design — env_catalog.h's
+         * CAT_QUERY section numbers them 1..9 — and the order is what makes
+         * the boundary hold: nothing resolves a name until the statement
+         * has parsed, and nothing executes until the name has resolved
+         * INSIDE this channel's partition. */
+
+        /* 1. SHAPE. */
+        if (plen < CAT_HDR + 6) { cat_refuse(e, ty, tag, CAT_ERR_SHAPE, 0); return; }
+        uint16_t slen = cat_get_u16(cat_buf + CAT_HDR);
+        uint16_t page = cat_get_u16(cat_buf + CAT_HDR + 2);
+        uint8_t  lim  = cat_buf[CAT_HDR + 4];
+        int bad = (cat_buf[CAT_HDR + 5] != 0) || slen == 0 || slen > CAT_SQL_MAX ||
+                  lim == 0 || lim > CAT_QUERY_ROWS_MAX ||
+                  plen < CAT_HDR + 6u + slen;
+        /* An embedded NUL would make the engine parse a PREFIX of what the
+         * caller believes it sent — a statement the caller never wrote. */
+        for (uint32_t i = 0; !bad && i < (uint32_t)slen; i++)
+            if (cat_buf[CAT_HDR + 6u + i] == 0) bad = 1;
+        if (bad) { cat_refuse(e, ty, tag, CAT_ERR_SHAPE, 0); return; }
+        for (uint32_t i = 0; i < (uint32_t)slen; i++)
+            cat_sql[i] = cat_buf[CAT_HDR + 6u + i];
+        cat_sql[slen] = '\0';
+
+        /* 2. PARSE first — before any name is looked up, so a statement the
+         *    kernel has not understood never reaches the catalog at all. */
+        char perr[SQL_ERR_MSG_LEN];
+        perr[0] = '\0';
+        if (sql_parse((const char*)cat_sql, &cat_stmt, perr,
+                      (uint32_t)sizeof perr) != 0) {
+            cat_refuse(e, ty, tag, CAT_ERR_QUERY,
+                       perr[0] ? perr : "the statement did not parse");
+            return;
+        }
+
+        /* 3. Shape by meaning. Only a plain, single-table SELECT is served:
+         *    every other form can name a SECOND table, and a second table
+         *    would have to be resolved outside the partition check below.
+         *    Each is refused BY NAME so a tenant learns which construct the
+         *    surface does not carry rather than a bare number. */
+        if (cat_stmt.kind != SQL_STMT_SELECT) {
+            cat_refuse(e, ty, tag, CAT_ERR_TYPE,
+                       "only SELECT is served on this surface");
+            return;
+        }
+        const struct SqlSelectStmt* s = &cat_stmt.u.select;
+        if (s->has_join) {
+            cat_refuse(e, ty, tag, CAT_ERR_TYPE,
+                       "a JOIN is not served — one table per query");
+            return;
+        }
+        if (s->has_set_op) {
+            cat_refuse(e, ty, tag, CAT_ERR_TYPE,
+                       "a set operator is not served — one table per query");
+            return;
+        }
+        if (s->has_cte) {
+            cat_refuse(e, ty, tag, CAT_ERR_TYPE,
+                       "a CTE is not served — one table per query");
+            return;
+        }
+        if (s->where.subquery_count || s->having.subquery_count) {
+            cat_refuse(e, ty, tag, CAT_ERR_TYPE,
+                       "a subquery is not served — one table per query");
+            return;
+        }
+
+        /* 4. THE BOUNDARY: one name, resolved inside THIS channel's
+         *    partition. A view is not a catalog object, so `FROM v` lands
+         *    here too and answers NOENT — views are not served by name. */
+        uint32_t tlen = cat_strnlen(s->table_name, OBJECT_NAME_LEN);
+        int idx = cat_find((const uint8_t*)s->table_name, tlen, e->partition);
+        if (idx < 0) { cat_refuse(e, ty, tag, CAT_ERR_NOENT, 0); return; }
+        const struct SLSObjectEntry* o = &object_catalog[idx];
+
+        /* 5./6. The same two in-namespace refusals every other verb makes. */
+        if (o->type == OBJ_TYPE_SYSTEM_METADATA) {
+            cat_refuse(e, ty, tag, CAT_ERR_PERM, "SYSTEM_METADATA is not tenant data");
+            return;
+        }
+        if (!o->uses_rowstore) {
+            cat_refuse(e, ty, tag, CAT_ERR_TYPE,
+                       "not a row-set table — use CAT_READ");
+            return;
+        }
+
+        /* 7. THE UID: read off the process this channel was registered for,
+         *    never off the wire. The descriptor's own partition must be the
+         *    channel's — defence in depth against a registration that outlived
+         *    the process it was minted for. */
+        uint32_t uid = 0;
+        int found = 0, same_partition = 0;
+        for (uint32_t i = 0; i < (uint32_t)PROC_MAX; i++) {
+            if (proc_table[i].active && proc_table[i].pid == e->pid) {
+                uid = proc_table[i].owner_uid;
+                found = 1;
+                same_partition = (proc_table[i].partition_id == e->partition);
+                break;
+            }
+        }
+        if (!found) {
+            cat_refuse(e, ty, tag, CAT_ERR_PERM,
+                       "the caller's pid no longer stands");
+            return;
+        }
+        if (!same_partition) {
+            cat_refuse(e, ty, tag, CAT_ERR_PERM,
+                       "the caller's process is not in this channel's partition");
+            return;
+        }
+
+        /* 8. POLICY: the SQL path's OWN row-level check, surfaced by name.
+         *    The engine would deny it too (mvcc.c's scan gate), but a denial
+         *    there returns an EMPTY result — indistinguishable from a table
+         *    with no matching rows. Refusing before executing is what keeps
+         *    "denied" and "empty" different answers, which is the same
+         *    distinction §9.1 draws between PERM and NOENT. */
+        if (!catalog_check_access(uid, s->table_name, PERM_READ)) {
+            cat_refuse(e, ty, tag, CAT_ERR_PERM,
+                       "row-level policy denied this uid");
+            return;
+        }
+
+        /* 9. EXECUTE — read-only, because step 3 admitted SELECT alone. */
+        if (sql_execute(uid, (const char*)cat_sql, &cat_result) != 0 ||
+            cat_result.error != SQL_ERR_NONE) {
+            cat_refuse(e, ty, tag, CAT_ERR_QUERY,
+                       cat_result.error_msg[0]
+                           ? cat_result.error_msg
+                           : "the SQL engine refused the statement");
+            return;
+        }
+        if (cat_result.kind != SQL_STMT_SELECT) {
+            /* Belt: step 3 admitted SELECT only, so this cannot fire — kept
+             * because "cannot fire" is a claim a reader should be able to
+             * check at the call site rather than in a comment. */
+            cat_refuse(e, ty, tag, CAT_ERR_TYPE,
+                       "only SELECT is served on this surface");
+            return;
+        }
+        if (cat_result.column_count == 0 ||
+            cat_result.column_count > ROWSTORE_MAX_COLUMNS) {
+            cat_refuse(e, ty, tag, CAT_ERR_QUERY,
+                       "the result carries no representable columns");
+            return;
+        }
+        uint32_t ncols = cat_result.column_count;
+
+        /* The projection question, answered from the engine's own contract:
+         * for `SELECT *` it fills columns[] from the layout, and for a
+         * projection it fills them from the SELECT list while the row still
+         * carries the FULL underlying row (sql_exec.h's documented "rows
+         * always carry the full row"). So a projection needs a map from
+         * output column -> cell index, and the layout is what supplies it.
+         * Aggregate/group results are the opposite: their rows are built
+         * FROM the projection, so they are already in step. */
+        uint8_t map[ROWSTORE_MAX_COLUMNS];
+        const uint8_t* mapp = 0;
+        int aggregate = (s->has_aggregates || s->has_group_by) ? 1 : 0;
+        if (!aggregate && !s->select_all) {
+            if (!table_headers[idx].active) {
+                cat_refuse(e, ty, tag, CAT_ERR_QUERY,
+                           "the table has no row-set layout");
+                return;
+            }
+            const struct RowTableLayout* lay = &table_headers[idx].layout;
+            for (uint32_t c = 0; c < ncols; c++) {
+                uint32_t hit = 0xFFFFFFFFu;
+                for (uint32_t k = 0; k < lay->column_count; k++) {
+                    if (cat_streq(lay->column_names[k], cat_result.columns[c])) {
+                        hit = k;
+                        break;
+                    }
+                }
+                if (hit == 0xFFFFFFFFu || hit > 0xFFu) {
+                    cat_refuse(e, ty, tag, CAT_ERR_QUERY,
+                               "a projected column is not in the table's layout");
+                    return;
+                }
+                map[c] = (uint8_t)hit;
+            }
+            mapp = map;
+        }
+
+        /* Build the page. The head is written first because its offsets are
+         * known, and PATCHED after the cursor has delivered the rows — nrows
+         * and `more` only exist once the page does. */
+        cat_hdr(ty, CAT_OK, 0);
+        uint8_t* body = cat_reply + CAT_BODY;
+        body[0] = (uint8_t)ncols;
+        body[1] = 0;                                   /* nrows: patched */
+        body[2] = 0;                                   /* more: patched */
+        body[3] = cat_result.truncated ? 1u : 0u;
+        cat_wire_u16(body + 4, page);
+        cat_wire_u16(body + 6, 0);
+        cat_wire_u32(body + 8, cat_result.row_count);  /* rows in the whole result */
+
+        uint32_t off = CAT_BODY + 12;
+        for (uint32_t c = 0; c < ncols; c++) {
+            uint32_t nlen = cat_strnlen(cat_result.columns[c], RECORD_KEY_LEN);
+            if (nlen > 0xFFu) nlen = 0xFFu;
+            if (off + 1u + nlen >= CAT_BODY + CAT_QUERY_BODY_MAX) {
+                if (cat_result.cursor_id) cursor_close(cat_result.cursor_id);
+                cat_refuse(e, ty, tag, CAT_ERR_QUERY,
+                           "the column names exceed the reply budget");
+                return;
+            }
+            cat_reply[off++] = (uint8_t)nlen;
+            for (uint32_t i = 0; i < nlen; i++)
+                cat_reply[off++] = (uint8_t)cat_result.columns[c][i];
+        }
+
+        struct cat_qpage g;
+        g.out = cat_reply;
+        g.cap = CAT_BODY + CAT_QUERY_BODY_MAX;
+        g.off = off;
+        g.skip = (uint32_t)page * (uint32_t)lim;
+        g.want = lim;
+        g.seen = 0;
+        g.ncols = ncols;
+        g.written = 0;
+        g.map = mapp;
+        g.more = 0;
+        g.over_budget = 0;
+        g.mismatch = 0;
+
+        if (cat_result.cursor_id) {
+            uint32_t fetch = g.skip + g.want + 1;   /* +1: see the row past the page */
+            if (fetch > CURSOR_MAX_ROWSET_ROWS) fetch = CURSOR_MAX_ROWSET_ROWS;
+            cursor_fetch_rows(cat_result.cursor_id, fetch, cat_query_row, &g);
+            cursor_close(cat_result.cursor_id);
+        } else if (cat_result.row_count != 0) {
+            cat_refuse(e, ty, tag, CAT_ERR_QUERY,
+                       "the statement reported rows but opened no result set");
+            return;
+        }
+
+        if (g.mismatch) {
+            cat_refuse(e, ty, tag, CAT_ERR_QUERY,
+                       "a result row does not match the reported columns");
+            return;
+        }
+        if (g.written == 0 && g.over_budget) {
+            cat_refuse(e, ty, tag, CAT_ERR_QUERY,
+                       "one row exceeds the reply budget");
+            return;
+        }
+
+        body[1] = (uint8_t)g.written;
+        body[2] = (g.more || g.skip + g.written < cat_result.row_count) ? 1u : 0u;
+        cat_served_total++;
+        /* g.off, not the pre-fetch `off`: the cursor wrote the rows past the
+         * name block, and sending the head-and-names length would hand a
+         * client a page whose nrows promises rows the bytes do not carry. */
+        cat_send(e, cat_reply, g.off, tag);
         return;
     }
 

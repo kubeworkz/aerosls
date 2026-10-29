@@ -41,6 +41,9 @@
  *   CAT_LIST  the names in this partition's namespace, paged.
  *   CAT_STAT  one name -> type, tier, page size, owner uid.
  *   CAT_READ  one (object, key) -> the value from the legacy KV record path.
+ *   CAT_QUERY one SELECT -> a page of rows from a row-set table, through
+ *             the REAL SQL engine (sql_parse/sql_execute), which is how a
+ *             rowstore-backed table is read — see the CAT_QUERY section.
  *
  * There is no write verb. Not "write is refused" — the verb does not exist
  * in the table, and a type outside the table is refused BY NAME with its
@@ -81,12 +84,59 @@
  *   uses_rowstore == 1 -> CAT_ERR_TYPE on CAT_READ. Phase 24's guard in
  *     sys_sls_select() refuses the legacy record API for a row-set table
  *     and names the SQL path instead; CAT_READ IS the legacy record path,
- *     so it inherits that refusal verbatim. Routing SQL through a mediated
- *     byte channel is a larger design than §9's first cut, and saying so
- *     by name is better than silently returning a legacy view of a table
- *     that no longer keeps its rows there. CAT_STAT still answers for such
- *     an object — its type and size are real metadata, and hiding them
- *     would make the refusal unexplainable.
+ *     so it inherits that refusal verbatim — and the SQL path it names is
+ *     now on this surface too, as CAT_QUERY. Saying so by name beats
+ *     silently returning a legacy view of a table that no longer keeps its
+ *     rows there. CAT_STAT still answers for such an object — its type and
+ *     size are real metadata, and hiding them would make the refusal
+ *     unexplainable.
+ *
+ * ─── CAT_QUERY: the SQL path, and the order the gates run in ───────────────
+ * A read of a ROW-SET table, because §9.1's first cut refused exactly that
+ * case and left "the SQL path" named but unbuilt. It is one more verb on the
+ * same channel, and the gates run in a fixed order, each for a reason:
+ *
+ *   1. SHAPE    — the frame carries {sql_len u16, page u16, limit u8,
+ *                 flags u8, sql[]}, sql_len <= CAT_SQL_MAX, limit 1..=4.
+ *   2. PARSE    — sql_parse() runs BEFORE anything looks the table up. A
+ *                 statement the parser rejects is CAT_ERR_QUERY with the
+ *                 parser's own message, so a malformed statement can never
+ *                 reach the engine, and — more importantly — no table name
+ *                 is resolved from text the kernel has not read.
+ *   3. SHAPE BY MEANING — only a plain, single-table SELECT is served:
+ *                 JOIN, set operators, CTEs, views and subqueries are each
+ *                 refused BY NAME (CAT_ERR_TYPE). This is the boundary
+ *                 decision, not a feature cut dressed up as one: every one
+ *                 of those forms can name a SECOND table, and a second
+ *                 table would have to be resolved outside the partition
+ *                 check below. One FROM source means one lookup, and the
+ *                 lookup is the boundary.
+ *   4. THE BOUNDARY — cat_find(table, THIS channel's partition). Absent or
+ *                 foreign is the same CAT_ERR_NOENT as ever: a foreign
+ *                 table is not representable, so no name from another
+ *                 partition can be SELECTed here, and the refusal does not
+ *                 confirm the table exists somewhere.
+ *   5. PERM     — SYSTEM_METADATA, still not tenant data.
+ *   6. TYPE     — a non-rowstore object is CAT_READ's job, refused by name.
+ *   7. THE UID  — the channel carries (partition, pid), so the uid is read
+ *                 off proc_table[pid]->owner_uid, and the descriptor's own
+ *                 partition_id must equal the channel's or the answer is
+ *                 PERM. Nothing on the wire states an identity: §9.1's
+ *                 rule, applied to a verb that now needs one.
+ *   8. POLICY   — catalog_check_access(uid, table, PERM_READ), the SQL
+ *                 path's OWN row-level check, surfaced by NAME. The engine
+ *                 would deny it too (mvcc.c's scan gate), but a denial
+ *                 there looks like an empty result — indistinguishable from
+ *                 a table with no matching rows. Refusing before executing
+ *                 is what makes "denied" and "empty" different answers.
+ *   9. EXECUTE  — sql_execute(uid, sql, ...), read-only: step 3 admitted
+ *                 SELECT alone, so there is no write verb here either.
+ *
+ * The reply is one page: {ncols, nrows, more, truncated, page, total}, the
+ * column names, then the rows' cells (each {flags u8, len u8, bytes[]} with
+ * flags bit 0 = NULL). Rows are bounded twice — CAT_QUERY_ROWS_MAX by count
+ * and CAT_QUERY_BODY_MAX by bytes — so a reply can never approach the
+ * channel's 4 KiB payload bound, and `more` tells the client to ask again.
  *
  * WHAT THIS INCREMENT IS NOT.
  * There is no write path, no schema mutation, no cross-partition federation
@@ -95,7 +145,10 @@
  * identity cannot support would be worse than not having one. The isolation
  * this service enforces is the partition, which is the boundary the rest of
  * the project already enforces. Row-level policy is the SQL path's job
- * (rowstore.c's catalog_check_access), and stays there.
+ * (rowstore.c's catalog_check_access), and stays there: CAT_QUERY calls
+ * that exact check with the uid it resolved from the channel rather than
+ * re-deriving it, so the mediated surface and the direct SQL surface make
+ * the same decision about the same caller.
  */
 
 #include <stdint.h>
@@ -128,10 +181,11 @@
  * net_socket_service.h makes for NET_SOCKET_SERVICE_MAX. */
 #define ENV_CATALOG_SERVICE_MAX 8
 
-#define CAT_VERB_INFO 1u
-#define CAT_VERB_LIST 2u
-#define CAT_VERB_STAT 3u
-#define CAT_VERB_READ 4u
+#define CAT_VERB_INFO  1u
+#define CAT_VERB_LIST  2u
+#define CAT_VERB_STAT  3u
+#define CAT_VERB_READ  4u
+#define CAT_VERB_QUERY 5u   /* the SQL path: a read of a row-set table */
 
 #define CAT_FLAG_ERROR 0x0001u
 
@@ -146,8 +200,14 @@
 /* The frame is malformed by name (short body, an over-long length field). */
 #define CAT_ERR_SHAPE 3u
 /* The verb is known and the object is in the namespace, but not the kind
- * this verb serves: CAT_READ on a rowstore-backed table. */
+ * this verb serves: CAT_READ on a rowstore-backed table, or a CAT_QUERY
+ * whose statement is a JOIN / a set operator / a CTE / a subquery — each
+ * refused by name in the arm that checks it. */
 #define CAT_ERR_TYPE 4u
+/* The verb and the table are both fine and the SQL ENGINE still refused the
+ * statement: a parse error, an unknown column, a constraint. The engine's
+ * own message renders after the refusal suffix, so the caller sees why. */
+#define CAT_ERR_QUERY 5u
 /* The verb is outside the table entirely: refused by name, by number. */
 #define CAT_ERR_UNKNOWN 9u
 
@@ -159,6 +219,16 @@
  * bound no matter how full the catalog gets. 8 entries of a 64-byte name
  * is a ~550-byte reply against a 4 KiB receive buffer. */
 #define CAT_LIST_PAGE_MAX 8u
+
+/* CAT_QUERY: the statement's own cap (SQL_MAX_TEXT_LEN — the parser's), the
+ * rows one reply may carry, and the body's byte ceiling. Three bounds, each
+ * documented rather than discovered: the count bound keeps a wide table
+ * from making one reply enormous, the byte bound keeps a page of 64-byte
+ * cells from doing the same, and `more` is what tells a client the page
+ * stopped for a bound rather than because the result ended. */
+#define CAT_SQL_MAX 512u
+#define CAT_QUERY_ROWS_MAX 4u
+#define CAT_QUERY_BODY_MAX 3072u
 
 #define CAT_TEXT_CAP 192u
 

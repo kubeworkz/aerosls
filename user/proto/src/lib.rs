@@ -559,6 +559,10 @@ pub const CAT_INFO: u16 = 1;
 pub const CAT_LIST: u16 = 2;
 pub const CAT_STAT: u16 = 3;
 pub const CAT_READ: u16 = 4;
+/// The SQL path: a read of a row-set table, page by page. Still read-only —
+/// a SELECT is the only statement the service admits, so this verb's
+/// existence does not put a write verb in the table.
+pub const CAT_QUERY: u16 = 5;
 
 pub const CAT_FLAG_ERROR: u16 = 0x0001;
 
@@ -571,6 +575,10 @@ pub const CAT_ERR_NOENT: u16 = 1;
 pub const CAT_ERR_PERM: u16 = 2;
 pub const CAT_ERR_SHAPE: u16 = 3;
 pub const CAT_ERR_TYPE: u16 = 4;
+/// The verb, the table and the uid were all fine and the SQL engine still
+/// refused the statement — the engine's own message arrives as the refusal
+/// text, so a caller sees the parse error rather than a number.
+pub const CAT_ERR_QUERY: u16 = 5;
 pub const CAT_ERR_UNKNOWN: u16 = 9;
 
 pub const CAT_MAX_NAME: usize = 64;   // OBJECT_NAME_LEN
@@ -584,6 +592,15 @@ pub const CAT_LIST_ENTRY: usize = 68;
 pub const CAT_LIST_HDR: usize = 26;
 /// The rendered refusal, capped where the kernel caps it.
 pub const CAT_TEXT_CAP: usize = 192;
+
+/// CAT_QUERY's three bounds, mirrored from env_catalog.h: the statement the
+/// parser accepts (SQL_MAX_TEXT_LEN), the rows one page may carry, and the
+/// body's byte ceiling. A client that respects the first two never learns
+/// the third the hard way; `more` is the service telling it a page stopped
+/// at a bound rather than at the end of the result.
+pub const CAT_SQL_MAX: usize = 512;
+pub const CAT_QUERY_ROWS_MAX: u8 = 4;
+pub const CAT_QUERY_BODY_MAX: usize = 3072;
 
 /// The 16-byte CAT_* frame header — the payload of a channel MSG envelope.
 #[repr(C)]
@@ -732,6 +749,7 @@ pub fn cat_status_name(status: u16) -> &'static str {
         CAT_ERR_PERM => "PERM",
         CAT_ERR_SHAPE => "SHAPE",
         CAT_ERR_TYPE => "TYPE",
+        CAT_ERR_QUERY => "QUERY",
         CAT_ERR_UNKNOWN => "UNKNOWN",
         _ => "?",
     }
@@ -830,6 +848,124 @@ pub fn parse_cat_stat_body(body: &[u8]) -> Option<CatStat> {
         size_pages: read_u32(body, 4),
         owner_uid: read_u32(body, 8),
         database_id: read_u32(body, 12),
+    })
+}
+
+/// One cell of a CAT_QUERY row: SQL NULL is a first-class answer rather
+/// than an empty string, which is the distinction rowstore.h's `null_mask`
+/// exists to preserve and a shell needs to print `NULL` instead of nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatCell {
+    pub null: bool,
+    pub value: alloc::vec::Vec<u8>,
+}
+
+impl CatCell {
+    pub fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.value).unwrap_or("")
+    }
+}
+
+/// One page of CAT_QUERY rows: the head, the column names the service
+/// reported, and the rows' cells. Owned, because the reply buffer does not
+/// outlive the call — same reason CatValue is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatRows {
+    pub ncols: u8,
+    pub nrows: u8,
+    pub more: bool,
+    pub truncated: bool,
+    pub page: u16,
+    pub total: u32,
+    pub columns: alloc::vec::Vec<alloc::vec::Vec<u8>>,
+    pub rows: alloc::vec::Vec<alloc::vec::Vec<CatCell>>,
+}
+
+/// CAT_QUERY request body: `{sql_len u16, page u16, limit u8, flags u8,
+/// sql[sql_len]}`. Returns the body length, or None for a statement the wire
+/// cannot carry (empty, longer than CAT_SQL_MAX, a NUL inside it — a NUL
+/// would make the kernel parse a prefix of what the caller believes it sent
+/// — or a limit outside 1..=CAT_QUERY_ROWS_MAX, which the service answers
+/// CAT_ERR_SHAPE and this refuses without a round trip).
+pub fn encode_cat_query_body(sql: &[u8], page: u16, limit: u8, out: &mut [u8]) -> Option<usize> {
+    if sql.is_empty()
+        || sql.len() > CAT_SQL_MAX
+        || sql.contains(&0)
+        || limit == 0
+        || limit > CAT_QUERY_ROWS_MAX
+        || out.len() < 6 + sql.len()
+    {
+        return None;
+    }
+    put_u16(out, 0, sql.len() as u16);
+    put_u16(out, 2, page);
+    out[4] = limit;
+    out[5] = 0; // flags: reserved, must be 0
+    out[6..6 + sql.len()].copy_from_slice(sql);
+    Some(6 + sql.len())
+}
+
+/// CAT_QUERY reply body (starting at CAT_BODY): the head, then the column
+/// names, then each row's cells. Every length is read off the body itself
+/// and bounds-checked against it — a reply that does not hold what its own
+/// head promises is a parse failure (EPROTO), never a partial row.
+pub fn parse_cat_rows(body: &[u8]) -> Option<CatRows> {
+    if body.len() < 12 {
+        return None;
+    }
+    let ncols = body[0] as usize;
+    let nrows = body[1] as usize;
+    let more = body[2] != 0;
+    let truncated = body[3] != 0;
+    let page = read_u16(body, 4);
+    let total = read_u32(body, 8);
+    if ncols > 16 {
+        return None;
+    }
+    let mut off = 12;
+    let mut columns = alloc::vec::Vec::with_capacity(ncols);
+    for _ in 0..ncols {
+        if off >= body.len() {
+            return None;
+        }
+        let n = body[off] as usize;
+        off += 1;
+        if off + n > body.len() {
+            return None;
+        }
+        columns.push(alloc::vec::Vec::from(&body[off..off + n]));
+        off += n;
+    }
+    let mut rows = alloc::vec::Vec::with_capacity(nrows);
+    for _ in 0..nrows {
+        let mut row = alloc::vec::Vec::with_capacity(ncols);
+        for _ in 0..ncols {
+            if off + 2 > body.len() {
+                return None;
+            }
+            let flags = body[off];
+            let n = body[off + 1] as usize;
+            off += 2;
+            if off + n > body.len() {
+                return None;
+            }
+            row.push(CatCell {
+                null: flags & 1 != 0,
+                value: alloc::vec::Vec::from(&body[off..off + n]),
+            });
+            off += n;
+        }
+        rows.push(row);
+    }
+    Some(CatRows {
+        ncols: ncols as u8,
+        nrows: nrows as u8,
+        more,
+        truncated,
+        page,
+        total,
+        columns,
+        rows,
     })
 }
 

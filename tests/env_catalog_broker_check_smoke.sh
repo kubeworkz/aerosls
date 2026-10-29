@@ -34,6 +34,15 @@
 #   C2. the client: the CAT magic, the four trait verbs, the status-word
 #       read, the surfaced refusal text, and the three wiring hops that
 #       reach a shell command (BIB resolve, install, registration).
+#   Q1. CAT_QUERY on both halves: the kernel's verb table and header,
+#       proto's two constants, the encoder/decoder, the trait method,
+#       the client's call, and the `sql` subcommand that reaches it;
+#   Q2. the ORDER of the QUERY arm's gates — the policy check and the
+#       boundary lookup each deleted once, and the parse/lookup pair
+#       genuinely SWAPPED (the mutation order teeth exist for: a gate
+#       moved still compiles and still looks like a gate);
+#   Q3. read-only posture: a sixth verb, a second execution site, the
+#       unknown-verb refusal, and the send length (g.off -> off).
 #
 # Mutations run on COPIES (seed() below): the real tree is never touched,
 # and the baseline run on an unmutated copy — plus the final run on the
@@ -58,6 +67,7 @@ FILES=(
     kernel/console_service.c
     kernel/microkernel.c
     kernel/env_catalog.c
+    kernel/env_catalog.h
     tests/env_catalog_host_test.c
     tests/run_all.sh
     # C1/C2: the tenant half — the manifest that asks for the channel and
@@ -124,6 +134,9 @@ echo "  B1. the boundary: filtered on the registered partition, as absence, unmo
 echo "  B2. the boundary's evidence: the host test links the real service and is RUN"
 echo "  C1. the cap: the tenant manifest names kernel.env.catalog (and the system one does not)"
 echo "  C2. the client: four verbs, the status word, the refusal text, and the wiring to a command"
+echo "  Q1. CAT_QUERY on both halves, with matching numbers and a reachable sql subcommand"
+echo "  Q2. the QUERY arm's gates in order (parse -> lookup -> uid -> policy -> execute)"
+echo "  Q3. read-only: five verbs, one execution site, and the reply sent at g.off"
 echo "========================================================================"
 echo
 
@@ -367,6 +380,71 @@ tooth client-not-installed C2 "the client is constructed but never installed int
 seed "$W/t39"
 sed -i '/pm.register_applet("catalog", catalog);/d' "$W/t39/user/sidecar/src/applets.rs"
 tooth applet-unregistered C2 "the surface has no command — nobody can reach it" "$W/t39"
+
+# ─── Q1. CAT_QUERY exists on BOTH halves with the same numbers ────────────
+seed "$W/t40"
+sed -i 's/pub const CAT_QUERY: u16 = 5;/pub const CAT_QUERY: u16 = 6;/' \
+    "$W/t40/user/proto/src/lib.rs"
+tooth query-number-mismatch Q1 "proto's CAT_QUERY no longer carries the kernel's number 5" "$W/t40"
+
+seed "$W/t41"
+sed -i '/    { 5, "CAT_QUERY" },/d' "$W/t41/kernel/env_catalog.c"
+tooth query-not-in-table Q1 "the kernel's verb table no longer names CAT_QUERY" "$W/t41"
+
+seed "$W/t42"
+sed -i '/"sql" => {/d' "$W/t42/user/sidecar/src/applets.rs"
+tooth sql-subcommand-gone Q1 "the SQL path has no user in a shell — verb 5 is unreachable" "$W/t42"
+
+seed "$W/t43"
+sed -i '/fn cat_query(&mut self/d' "$W/t43/user/proto/src/catalops.rs"
+tooth query-trait-method-gone Q1 "the trait cannot reach the SQL path — a kernel verb no client can send" "$W/t43"
+
+# ─── Q2. the ORDER of the QUERY arm's gates ────────────────────────────────
+seed "$W/t44"
+sed -i '/if (!catalog_check_access(uid, s->table_name, PERM_READ)) {/d' \
+    "$W/t44/kernel/env_catalog.c"
+tooth policy-check-gone Q2 "a denial would become an EMPTY result — denied and empty are one answer" "$W/t44"
+
+seed "$W/t45"
+sed -i '/same_partition = (proc_table\[i\].partition_id == e->partition);/d' "$W/t45/kernel/env_catalog.c"
+tooth pid-partition-check-gone Q2 "a descriptor whose process moved partitions could read" "$W/t45"
+
+# The mutation the Q2 ORDER tooth exists for: the parse call MOVED after
+# the boundary lookup. It still compiles, every anchor is still present,
+# and only the line positions say a name was resolved before the statement
+# had parsed. Two held lines (the call wraps) re-emitted after cat_find.
+seed "$W/t46"
+awk '
+    !held && index($0, "if (sql_parse((const char*)cat_sql, &cat_stmt, perr,") == 9 {
+        p1 = $0; getline p2; held = 1; next
+    }
+    held && index($0, "int idx = cat_find(") {
+        print; print p1; print p2; held = 0; next
+    }
+    { print }
+    END { if (held) { print p1; print p2 } }
+' "$W/t46/kernel/env_catalog.c" > "$W/t46/kernel/env_catalog.c.new"
+mv "$W/t46/kernel/env_catalog.c.new" "$W/t46/kernel/env_catalog.c"
+tooth parse-after-lookup Q2 "the statement now parses AFTER a name is resolved" "$W/t46"
+
+# ─── Q3. still read-only, and the reply is the cursor's own length ─────────
+seed "$W/t47"
+sed -i 's/cat_send(e, cat_reply, g.off, tag);/cat_send(e, cat_reply, off, tag);/' \
+    "$W/t47/kernel/env_catalog.c"
+tooth send-length-rewound Q3 "the reply would promise rows its bytes do not carry" "$W/t47"
+
+seed "$W/t48"
+sed -i '/    { 5, "CAT_QUERY" },/a\    { 6, "CAT_WRITE" },' "$W/t48/kernel/env_catalog.c"
+tooth sixth-verb-added Q3 "the table grew a verb §9.1 did not answer for" "$W/t48"
+
+seed "$W/t49"
+sed -i '/sql_execute(uid, (const char\*)cat_sql, &cat_result)/a\        sql_execute(uid, retry_sql, &cat_result); /* plausible re-run */' \
+    "$W/t49/kernel/env_catalog.c"
+tooth second-execution-site Q3 "a statement could run through a path the gate above never admitted" "$W/t49"
+
+seed "$W/t50"
+sed -i '/cat_refuse(e, ty, tag, CAT_ERR_UNKNOWN, 0);/d' "$W/t50/kernel/env_catalog.c"
+tooth unknown-refusal-gone Q3 "a verb outside the table would be answered something else" "$W/t50"
 
 echo
 echo "────────────────────────────────────────────────────────────────────────"

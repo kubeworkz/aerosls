@@ -4,7 +4,9 @@
 # object (and one object deliberately outside it), create an environment in
 # that partition, and then drive `catalog info | list | stat | read` INTO that
 # environment through `env attach` — requiring every answer to come back on
-# the environment's own console.
+# the environment's own console — and then the fifth verb, `catalog sql`,
+# whose read-only promise (§9.1's first cut) is asserted where it can only
+# be asserted: live, with a real row-set table behind it.
 #
 # ─── Why this exists ───────────────────────────────────────────────────────
 # tests/env_catalog_broker_check.sh proves the §9.1 wiring from the SOURCE:
@@ -60,6 +62,24 @@
 #      key that does not exist returns CAT_READ's refusal. The needle is the
 #      VALUE, which never appears in the line this guard types, so an echoed
 #      command could not satisfy it.
+#   9. `catalog sql` — the SQL path (CAT_QUERY), read-only end to end:
+#        · a real row-store table is seeded the documented three-step way
+#          (valloc -> schema set -> table create) under the bearer uid,
+#          which lands it IN this partition, and INSERT puts a run-unique
+#          value on it;
+#        · `catalog sql SELECT * FROM <tbl>` through attach returns a page
+#          whose head counts that one row and whose cell carries the value
+#          only the INSERT wrote — the engine ran, the boundary held, and
+#          the reply's byte length matched its own head (the cursor's g.off);
+#        · `catalog sql DROP TABLE <tbl>` is refused BY NAME with
+#          "only SELECT is served on this surface", and the row is STILL
+#          there afterwards — a refusal that executed would be the one bug
+#          this arm exists to catch, since deny-then-execute looks exactly
+#          like deny from a transcript that only shows the refusal;
+#        · `catalog sql SELECT * FROM <foreign>` is answered NOENT, not PERM
+#          and not rows — the partition boundary, enforced on a name the
+#          SQL path resolved for itself rather than one this file typed
+#          into a CAT_LIST.
 #
 # Teeth: every assertion reads the answer out of the ENVIRONMENT's console.
 # A guard that never sent a verb, sent it to the node's own shell instead, or
@@ -555,8 +575,88 @@ else
     die_fail "\`catalog read $IN_OBJ nokey\` produced no refusal line in ${WAIT_VERB}s"
 fi
 
-# ─── 8. teardown (the EXIT trap runs it from here either way) ─────────────
+# ─── 8. CAT_QUERY — a real row-store table read through the boundary ────────
+# Seeded the way every other namespace above is seeded: through the node's
+# shell under the bearer uid, so valloc's partition_get_for_uid() lands the
+# object INSIDE this partition and the teardown's partition destroy takes it
+# with everything else. The value is unique to this run, so a page holding
+# a row some earlier run inserted cannot satisfy the needle.
+TBL="e91tbl_$RUN"
+QVAL="e91q-$RUN"
+
+sh_exec "valloc $TBL 1 1" \
+    || die_fail "'valloc $TBL' was not recognised by the node shell"
+get /api/objects
+if printf '%s' "$GET_BODY" | grep -Fq -- "\"$TBL\""; then
+    echo "ok:   table object '$TBL' exists in the catalog (GET /api/objects names it)"
+else
+    die_fail "valloc never created '$TBL' — no table for CAT_QUERY to read (shell said: $(printf '%s' "$SHEL_OUT" | tail -2 | tr '\n' ' '))"
+fi
+
+sh_exec "schema set $TBL note STRING" \
+    || die_fail "'schema set $TBL note STRING' was not recognised by the node shell"
+sh_exec "table create $TBL" \
+    || die_fail "'table create $TBL' was not recognised by the node shell"
+case "$SHEL_OUT" in
+    *"create '$TBL' -> OK"*)
+        echo "ok:   \`table create $TBL\` promoted it to a row-set table (uses_rowstore — what CAT_QUERY requires)" ;;
+    *)
+        die_fail "'table create $TBL' did not promote the object (shell said: $(printf '%s' "$SHEL_OUT" | tail -3 | tr '\n' ' '))" ;;
+esac
+
+sh_exec "sql INSERT INTO $TBL (note) VALUES ('$QVAL')" \
+    || die_fail "'sql INSERT INTO $TBL …' was not recognised by the node shell"
+case "$SHEL_OUT" in
+    *"[SQL] OK,"*)
+        echo "ok:   the seed INSERT wrote one row carrying '$QVAL'" ;;
+    *)
+        die_fail "the seed INSERT never succeeded (shell said: $(printf '%s' "$SHEL_OUT" | tail -3 | tr '\n' ' ')) — nothing for CAT_QUERY to return" ;;
+esac
+
+# The page itself: the needle is the CELL VALUE, which never appears in the
+# line this guard types — an echoed command or a plausible head cannot
+# satisfy it — and the head is the service's own arithmetic over the real
+# result set.
+if run_verb "catalog sql SELECT * FROM $TBL" "$QVAL"; then
+    expect "$QVAL" "CAT_QUERY returns the row the seed INSERT wrote, through the boundary, on this environment's console"
+    expect "page 0: 1 row(s), 1 total" "the head reports exactly the one row the seed inserted (the cursor's own count)"
+    expect "note" "the column names the service reported travel with the page"
+    reject "refused" "the in-partition read is served, not refused"
+else
+    die_fail "\`catalog sql SELECT * FROM $TBL\` never returned '$QVAL' through env attach in ${WAIT_VERB}s — the SQL path is unreachable or the policy refused it (last output: ${VERB_OUT:-<nothing>})"
+fi
+
+# The read-only promise, live: DROP parses (it is a well-formed statement),
+# then step 3 refuses it BY NAME. The row must still be there afterwards —
+# a refusal that executed first would look identical in a transcript that
+# only shows the refusal line.
+if run_verb "catalog sql DROP TABLE $TBL" "CAT_QUERY refused by kernel.env.catalog"; then
+    expect "only SELECT is served on this surface" "a DDL statement is refused BY NAME — the mediated surface admits SELECT alone"
+    reject "row(s)" "…and with no page — a refusal is not a shaped answer"
+else
+    die_fail "\`catalog sql DROP TABLE $TBL\` produced no refusal line in ${WAIT_VERB}s — a non-SELECT reached the engine or was left silent"
+fi
+
+if run_verb "catalog sql SELECT * FROM $TBL" "$QVAL"; then
+    expect "$QVAL" "the refused DROP never executed — the row is still there (deny-then-execute would have lost it)"
+else
+    die_fail "the table vanished after the refused DROP — execution happened behind a refusal (last output: ${VERB_OUT:-<nothing>})"
+fi
+
+# The boundary, on a name the SQL path resolved for itself: the foreign
+# object exists in the SAME catalog but sits in PARTITION_SYSTEM, so
+# cat_find() skips it and the answer is NOENT — not PERM (an existence
+# oracle) and not rows (a boundary that leaked).
+if run_verb "catalog sql SELECT * FROM $OUT_OBJ" "CAT_QUERY refused by kernel.env.catalog"; then
+    reject "row(s)"             "no page — a foreign table yields nothing"
+    reject "row-level policy denied" "the answer is absence (NOENT), not a PERM that names the object back"
+    reject "$QVAL"               "certainly not this partition's data"
+else
+    die_fail "\`catalog sql SELECT * FROM $OUT_OBJ\` was not refused in ${WAIT_VERB}s — a foreign name was either served or left silent"
+fi
+
+# ─── 9. teardown (the EXIT trap runs it from here either way) ─────────────
 [ "$fail" -eq 0 ] || report_and_exit
 
-echo "OK: §9.1's catalog surface answered end to end — a partition and an environment created in it, info/list/stat/read driven into that environment through \`env attach\`, and every answer (both refusals included) came back on the environment's own console"
+echo "OK: §9.1's catalog surface answered end to end — a partition and an environment created in it, info/list/stat/read/sql driven into that environment through \`env attach\`, and every answer (all refusals included) came back on the environment's own console"
 exit 0

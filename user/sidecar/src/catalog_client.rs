@@ -74,7 +74,12 @@ impl<K: Kernel> CatalogClient<K> {
                                     // the next microkernel_service_poll()
 
         let tag = self.next_tag();
-        let mut payload = [0u8; 256];
+        // 640 rather than 256: CAT_QUERY's body is 6 bytes plus up to
+        // CAT_SQL_MAX (512) bytes of statement, and a request that did not
+        // fit would be refused here as "does not fit a frame" — a client-side
+        // answer for a request the wire was sized to carry. Every other verb
+        // is far smaller and unaffected.
+        let mut payload = [0u8; 640];
         if CatFrame::SIZE + body.len() > payload.len() {
             return Err(CatRefusal::new(
                 CAT_EPROTO,
@@ -216,6 +221,25 @@ impl<K: Kernel> CatalogClient<K> {
         parse_cat_read_body(&reply[CAT_BODY..])
             .ok_or_else(|| CatRefusal::new(CAT_EPROTO, "catalog: CAT_READ body is short"))
     }
+
+    /// CAT_QUERY: one page of rows from a row-set table, executed by the
+    /// KERNEL's SQL engine against the kernel's own catalog — so the answer
+    /// is the table's real rows, not a legacy view of a table that no longer
+    /// keeps them there. `page` is 0-based; `limit` must be 1..=
+    /// CAT_QUERY_ROWS_MAX, which this refuses locally for the same reason
+    /// `list()` refuses a page size the service would reject.
+    pub fn query(&mut self, sql: &[u8], page: u16, limit: u8) -> CatResult<CatRows> {
+        let mut body = [0u8; 6 + CAT_SQL_MAX];
+        let n = encode_cat_query_body(sql, page, limit, &mut body).ok_or_else(|| {
+            CatRefusal::new(
+                CAT_ERR_SHAPE,
+                "CAT_QUERY statement must be 1..=512 bytes with no NUL, limit 1..=4",
+            )
+        })?;
+        let reply = self.call(CAT_QUERY, &body[..n])?;
+        parse_cat_rows(&reply[CAT_BODY..])
+            .ok_or_else(|| CatRefusal::new(CAT_EPROTO, "catalog: CAT_QUERY body is short"))
+    }
 }
 
 /// The trait procmgr and the applets see. Kept as inherent methods above so
@@ -233,6 +257,9 @@ impl<K: Kernel> CatalogOps for CatalogClient<K> {
     }
     fn cat_read(&mut self, name: &[u8], key: &[u8]) -> CatResult<CatValue> {
         self.read_value(name, key)
+    }
+    fn cat_query(&mut self, sql: &[u8], page: u16, limit: u8) -> CatResult<CatRows> {
+        self.query(sql, page, limit)
     }
 }
 
@@ -441,11 +468,124 @@ mod tests {
         assert!(k.sent.lock().is_empty(), "nothing was put on the wire");
     }
 
+    /// CAT_QUERY's own shape rules, refused locally: an empty statement, a
+    /// statement past CAT_SQL_MAX, one carrying a NUL (which would make the
+    /// kernel parse a PREFIX of what the caller believes it sent), and a
+    /// limit outside 1..=4 are all answers the service would give anyway —
+    /// and none of them buys a round trip to learn.
+    #[test]
+    fn an_unservable_statement_never_reaches_the_wire() {
+        let (k, mut client) = client_with(Vec::new());
+        let mut buf = [0u8; 8 + CAT_SQL_MAX];
+        assert_eq!(
+            client.query(b"", 0, 4).expect_err("empty").status,
+            CAT_ERR_SHAPE
+        );
+        assert_eq!(
+            client.query(&[b'a'; CAT_SQL_MAX + 1], 0, 4).expect_err("long").status,
+            CAT_ERR_SHAPE
+        );
+        assert_eq!(
+            client.query(b"SELECT 1\0 DROP TABLE t", 0, 4).expect_err("NUL").status,
+            CAT_ERR_SHAPE
+        );
+        assert_eq!(
+            client.query(b"SELECT * FROM t", 0, 0).expect_err("no limit").status,
+            CAT_ERR_SHAPE
+        );
+        assert_eq!(
+            client
+                .query(b"SELECT * FROM t", 0, CAT_QUERY_ROWS_MAX + 1)
+                .expect_err("too many rows")
+                .status,
+            CAT_ERR_SHAPE
+        );
+        // And the encoder itself, which is what all of the above funnel
+        // through: {sql_len u16, page u16, limit u8, flags u8, sql[]}.
+        let n = encode_cat_query_body(b"SELECT 1", 3, 2, &mut buf).expect("fits");
+        assert_eq!(n, 6 + 8);
+        assert_eq!(le16(&buf, 0), 8, "sql_len");
+        assert_eq!(le16(&buf, 2), 3, "page");
+        assert_eq!(buf[4], 2, "limit");
+        assert_eq!(buf[5], 0, "flags stay 0");
+        assert_eq!(&buf[6..14], b"SELECT 1", "the statement follows");
+        assert!(k.sent.lock().is_empty(), "nothing was put on the wire");
+    }
+
+    /// A whole page, parsed: the head, the column names, the cells — and a
+    /// NULL cell stays NULL rather than collapsing into an empty string,
+    /// which is the distinction rowstore's null_mask exists to preserve.
+    #[test]
+    fn a_query_page_comes_back_with_its_columns_and_a_real_null() {
+        let mut body = Vec::new();
+        body.push(2); // ncols
+        body.push(1); // nrows
+        body.push(1); // more
+        body.push(0); // truncated
+        body.extend_from_slice(&2u16.to_le_bytes()); // page
+        body.extend_from_slice(&0u16.to_le_bytes()); // pad
+        body.extend_from_slice(&5u32.to_le_bytes()); // total rows in the result
+        for name in [&b"name"[..], &b"email"[..]] {
+            body.push(name.len() as u8);
+            body.extend_from_slice(name);
+        }
+        body.extend_from_slice(&[0, 3]); // cell flags, len
+        body.extend_from_slice(b"ada");
+        body.extend_from_slice(&[1, 0]); // NULL cell, len 0
+        let (k, mut client) = client_with(vec![reply(CAT_QUERY, 0, CAT_OK, &body)]);
+
+        let rows = client
+            .query(b"SELECT name, email FROM app.users", 2, 4)
+            .expect("served");
+        assert_eq!((rows.ncols, rows.nrows), (2, 1));
+        assert!(rows.more, "the page stopped at a bound, not at the end");
+        assert!(!rows.truncated);
+        assert_eq!((rows.page, rows.total), (2, 5));
+        assert_eq!(rows.columns[0], b"name");
+        assert_eq!(rows.columns[1], b"email");
+        assert!(!rows.rows[0][0].null);
+        assert_eq!(rows.rows[0][0].value, b"ada");
+        assert!(rows.rows[0][1].null, "NULL is an answer, not an empty field");
+
+        let sent = k.sent.lock();
+        assert_eq!(sent.len(), CatFrame::SIZE + 6 + 33, "frame + head + statement");
+        assert_eq!(le16(&sent, 10), CAT_QUERY, "verb 5 on the wire");
+        assert_eq!(le16(&sent, CAT_HDR), 33, "sql_len");
+        assert_eq!(le16(&sent, CAT_HDR + 2), 2, "page");
+        assert_eq!(sent[CAT_HDR + 4], 4, "limit");
+        assert_eq!(
+            &sent[CAT_HDR + 6..],
+            b"SELECT name, email FROM app.users",
+            "the statement rides verbatim"
+        );
+    }
+
+    /// A reply that does not hold what its own head promises is PROTOCOL,
+    /// never a half-parsed row: a truncated body must not become data.
+    #[test]
+    fn a_truncated_query_body_is_a_protocol_error() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[2, 1, 0, 0]);
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&[4]);
+        body.extend_from_slice(b"name");
+        body.push(2);
+        body.push(9); // len 9, but no bytes follow
+        let (_k, mut client) = client_with(vec![reply(CAT_QUERY, 0, CAT_OK, &body)]);
+
+        let e = client
+            .query(b"SELECT * FROM t", 0, 4)
+            .expect_err("short body");
+        assert_eq!(e.status, CAT_EPROTO);
+    }
+
     /// The trait object procmgr stores — the path `ctx.catalog()` takes and
-    /// the `catalog` applet calls through — dispatches all four verbs, each
+    /// the `catalog` applet calls through — dispatches every verb, each
     /// answered by its own scripted reply.
     #[test]
-    fn the_trait_object_the_applet_reaches_dispatches_all_four() {
+    fn the_trait_object_the_applet_reaches_dispatches_every_verb() {
         let mut info = [0u8; 16];
         info[12..16].copy_from_slice(&3u32.to_le_bytes());
         let mut list = Vec::new();
@@ -468,6 +608,12 @@ mod tests {
                 CAT_ERR_TYPE,
                 b"CAT_READ refused by kernel.env.catalog: rowstore-backed table",
             ),
+            reply(
+                CAT_QUERY,
+                CAT_FLAG_ERROR,
+                CAT_ERR_NOENT,
+                b"CAT_QUERY refused by kernel.env.catalog",
+            ),
         ]);
 
         {
@@ -482,9 +628,17 @@ mod tests {
                 ops.cat_read(b"t", b"k").expect_err("TYPE").status,
                 CAT_ERR_TYPE
             );
+            assert_eq!(
+                ops.cat_query(b"SELECT * FROM t", 0, 4).expect_err("NOENT").status,
+                CAT_ERR_NOENT
+            );
         }
         let sent = k.sent.lock();
-        assert_eq!(sent.len(), CatFrame::SIZE + 4, "CAT_READ's body is name+key");
-        assert_eq!(le16(&sent, 10), CAT_READ, "the last verb on the wire");
+        assert_eq!(
+            sent.len(),
+            CatFrame::SIZE + 6 + 15,
+            "CAT_QUERY's body is head + statement"
+        );
+        assert_eq!(le16(&sent, 10), CAT_QUERY, "the last verb on the wire");
     }
 }

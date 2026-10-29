@@ -51,9 +51,25 @@
 #   C1. THE CAP: the tenant manifest names kernel.env.catalog (rights 0x7,
 #       counted by n_caps, absent from the SYSTEM profile, pinned by its
 #       own test) — the half of reachability that lives in user/;
-#   C2. THE CLIENT: proto's CAT_* wire, the four CatalogOps verbs, the
+#   C2. THE CLIENT: proto's CAT_* wire, the four original CatalogOps verbs, the
 #       status-word discipline and the rendered refusal, and the chain
-#       manifest -> BIB -> boot -> procmgr -> the `catalog` applet.
+#       manifest -> BIB -> boot -> procmgr -> the catalog applet.
+#   Q1. THE SQL PATH IS ON THE WIRE: verb 5 and status 5 exist on BOTH
+#       sides with the same numbers, the encoder/decoder exist, and the
+#       applet grew the `sql` subcommand that makes them reachable — a
+#       kernel verb no client can send is §9.1's own failure mode one
+#       increment later;
+#   Q2. THE ORDER of CAT_QUERY's gates — parse before lookup, lookup inside
+#       the registered partition, uid off proc_table, catalog_check_access,
+#       and only then execution — each asserted by POSITION inside the
+#       QUERY arm, because every one of these properties is a property of
+#       WHERE the line sits. A gate moved after execution still compiles
+#       and still looks like a gate;
+#   Q3. IT IS STILL READ-ONLY: exactly one sql_execute() call site, exactly
+#       five verbs in the table, the unknown-verb refusal intact, and the
+#       reply sent at the length the CURSOR wrote (g.off) — the last is the
+#       bug this clause set was written beside: sending the pre-fetch `off`
+#       hands a client a head that promises rows the bytes do not carry.
 #
 # ─── What this guard does NOT do ──────────────────────────────────────────
 # It has no live arm: §9.1 names a source guard, and the verbs are executed
@@ -93,6 +109,7 @@ CAP="$ROOT/kernel/cap.c"
 CONS="$ROOT/kernel/console_service.c"
 MMK="$ROOT/kernel/microkernel.c"
 ENV="$ROOT/kernel/env_catalog.c"
+HDR="$ROOT/kernel/env_catalog.h"
 TST="$ROOT/tests/env_catalog_host_test.c"
 RUNALL="$ROOT/tests/run_all.sh"
 # C1/C2 read the tenant side: the manifest that asks for the channel and
@@ -108,7 +125,7 @@ PM="$ROOT/user/procmgr/src/procmgr.rs"
 
 # Precondition: every file the clauses read. Missing is a refusal to
 # evaluate (exit 2) — not a pass, and not a finding.
-for f in "$MKF" "$CAP" "$CONS" "$MMK" "$ENV" "$TST" "$RUNALL" \
+for f in "$MKF" "$CAP" "$CONS" "$MMK" "$ENV" "$HDR" "$TST" "$RUNALL" \
          "$MAN" "$PROTO" "$CATOPS" "$CLIENT" "$BOOT" "$ENTRY" \
          "$APPLETS" "$PM"; do
     [ -f "$f" ] || { echo "ABORT: ${f#"$ROOT"/} missing — the guard cannot be evaluated" >&2; exit 2; }
@@ -128,6 +145,16 @@ fn_body() {
     awk -v pat="$2" 'index($0, pat) == 1 { grab = 1 }
                      grab { print }
                      grab && /^}/ { exit }' "$1"
+}
+# q_arm <file> — the body of the `case CAT_VERB_QUERY:` arm, from that line
+# to the `default:` that follows it. Q2 asserts ORDER inside this slice:
+# the whole-file alternatives (fn_body above, or a bare grep) would be
+# satisfied by any other verb's identical line, which is precisely the bug
+# class an ordering tooth exists to catch.
+q_arm() {
+    awk 'index($0, "case CAT_VERB_QUERY:") { grab = 1 }
+         grab && /^    default:/ { exit }
+         grab { print }' "$1"
 }
 # order_ok <file> <first-fixed-string> <second-fixed-string> — 0 when both
 # are present and the first is on an earlier line. The N17b shape: an arm
@@ -364,7 +391,120 @@ has "$ENTRY" 'set_catalog(' ||
     bad "C2. entry.rs: the client is never installed into the ProcManager"
 has "$APPLETS" 'pm.register_applet("catalog", catalog);' ||
     bad "C2. applets.rs: the `catalog` shell command is not registered — the surface has no user"
-clause "$c9" C2 "the client speaks all four verbs, reads the status word, surfaces the refusal text, and is wired manifest -> BIB -> boot -> procmgr -> applet"
+clause "$c9" C2 "the client speaks the four original verbs, reads the status word, surfaces the refusal text, and is wired manifest -> BIB -> boot -> procmgr -> applet"
+
+# ── Q1. THE SQL PATH IS ON THE WIRE ──────────────────────────────────────
+# §9.1's first cut refused a row-store table by name and named "the SQL
+# path" as where it would be served. CAT_QUERY is that path, and it is only
+# a path if BOTH halves carry it with the same numbers: a verb the kernel
+# answers that the trait cannot send is unreachable, and a verb the client
+# sends that the kernel has never heard of is CAT_ERR_UNKNOWN by definition.
+# The applet subcommand is the last hop of the same chain C2 pins.
+c10=$fail
+has "$HDR" '#define CAT_VERB_QUERY 5u' ||
+    bad "Q1. env_catalog.h: CAT_VERB_QUERY is gone — the SQL path has no verb on the kernel side"
+has "$HDR" '#define CAT_ERR_QUERY 5u' ||
+    bad "Q1. env_catalog.h: CAT_ERR_QUERY is gone — an engine refusal would have no status of its own"
+has "$ENV" '{ 5, "CAT_QUERY" },' ||
+    bad "Q1. env_catalog.c: the verb table no longer names CAT_QUERY — a refusal could not render it BY NAME"
+has "$PROTO" 'pub const CAT_QUERY: u16 = 5;' ||
+    bad "Q1. proto: CAT_QUERY is not declared, or is not 5 — the two halves would disagree"
+has "$PROTO" 'pub const CAT_ERR_QUERY: u16 = 5;' ||
+    bad "Q1. proto: CAT_ERR_QUERY is not declared, or is not 5 — the status would not be recognised"
+has "$PROTO" 'pub fn encode_cat_query_body(' ||
+    bad "Q1. proto: no encoder for the CAT_QUERY request body — a client would hand-roll the layout"
+has "$PROTO" 'pub fn parse_cat_rows(' ||
+    bad "Q1. proto: no decoder for a CAT_QUERY page — the wire's shape has no source of truth on this side"
+has "$CATOPS" 'fn cat_query(&mut self' ||
+    bad "Q1. catalops.rs: the trait no longer offers cat_query — procmgr's Box<dyn CatalogOps> cannot reach the SQL path"
+has "$CLIENT" 'self.call(CAT_QUERY,' ||
+    bad "Q1. catalog_client.rs: the client no longer sends CAT_QUERY — a trait method with no wire behind it"
+has "$CLIENT" 'encode_cat_query_body(sql, page, limit, &mut body)' ||
+    bad "Q1. catalog_client.rs: the client no longer builds the request body through the shared encoder"
+has "$APPLETS" '"sql" => {' ||
+    bad "Q1. applets.rs: the 'catalog sql' subcommand is gone — the SQL path has no user in a shell"
+has "$APPLETS" 'cat.cat_query(sql.as_bytes(), page, limit)' ||
+    bad "Q1. applets.rs: the sql arm no longer calls cat_query — a subcommand that asks nothing"
+has "$APPLETS" 'sql [--page N] [--limit N] <SELECT statement>' ||
+    bad "Q1. applets.rs: the usage line no longer documents the sql subcommand — an undiscoverable verb"
+clause "$c10" Q1 "CAT_QUERY exists on both halves with matching numbers, has an encoder/decoder, and is reachable as 'catalog sql'"
+
+# ── Q2. THE ORDER of CAT_QUERY's gates ───────────────────────────────────
+# Every gate below is a property of POSITION, not of presence: a lookup
+# that moved after execution would resolve a name the engine already read,
+# a policy check after execution would be indistinguishable from an empty
+# result, and a uid resolved from anywhere but proc_table would be an
+# identity the wire supplied. Each is therefore asserted by line order
+# INSIDE the QUERY arm (q_arm extracts it; the whole-file order would be
+# satisfied by another verb's identical line).
+c11=$fail
+QARM="$(q_arm "$ENV")"
+if [ -z "$QARM" ]; then
+    bad "Q2. env_catalog.c: the CAT_VERB_QUERY arm is gone — there is no SQL path to evaluate"
+else
+    hasstr "$QARM" 'sql_parse((const char*)cat_sql, &cat_stmt, perr,' ||
+        bad "Q2. env_catalog.c: the QUERY arm no longer parses the statement itself — a statement the kernel has not understood would reach the catalog"
+    hasstr "$QARM" 'int idx = cat_find((const uint8_t*)s->table_name, tlen, e->partition);' ||
+        bad "Q2. env_catalog.c: the FROM table is no longer resolved with cat_find() against the REGISTERED partition"
+    hasstr "$QARM" 'cat_refuse(e, ty, tag, CAT_ERR_NOENT, 0)' ||
+        bad "Q2. env_catalog.c: a foreign or absent table is no longer answered CAT_ERR_NOENT"
+    hasstr "$QARM" 'proc_table[i].pid == e->pid' ||
+        bad "Q2. env_catalog.c: the uid is no longer resolved from the channel's own pid"
+    hasstr "$QARM" 'proc_table[i].partition_id == e->partition' ||
+        bad "Q2. env_catalog.c: the descriptor's partition is no longer checked against the channel's — a stale registration could read"
+    hasstr "$QARM" 'catalog_check_access(uid, s->table_name, PERM_READ)' ||
+        bad "Q2. env_catalog.c: the SQL path's row-level policy check is no longer called — a denial would look like an empty result"
+    hasstr "$QARM" 'cat_stmt.kind != SQL_STMT_SELECT' ||
+        bad "Q2. env_catalog.c: the SELECT-only gate is gone — the mediated surface would admit a write statement"
+    for shape in 'a JOIN is not served' 'a set operator is not served' \
+                 'a CTE is not served' 'a subquery is not served'; do
+        hasstr "$QARM" "$shape" ||
+            bad "Q2. env_catalog.c: the QUERY arm no longer refuses $shape by name — a second table could be resolved outside the partition check"
+    done
+    # ORDER: parse -> lookup -> policy -> execute, each step by position.
+    a="$(lines "$QARM" 'sql_parse((const char*)cat_sql, &cat_stmt, perr,')"
+    b="$(lines "$QARM" 'int idx = cat_find((const uint8_t*)s->table_name, tlen, e->partition);')"
+    if [ -z "$a" ] || [ -z "$b" ] || [ "$a" -ge "$b" ]; then
+        bad "Q2. env_catalog.c: the statement must PARSE before any table name is resolved — a lookup on unparsed text is how a name gets read outside the boundary"
+    fi
+    a="$b"
+    b="$(lines "$QARM" 'catalog_check_access(uid, s->table_name, PERM_READ)')"
+    if [ -z "$a" ] || [ -z "$b" ] || [ "$a" -ge "$b" ]; then
+        bad "Q2. env_catalog.c: the boundary lookup must come BEFORE the policy check — policy on a table the caller may not name would be the wrong question"
+    fi
+    a="$b"
+    b="$(lines "$QARM" 'sql_execute(uid, (const char*)cat_sql, &cat_result)')"
+    if [ -z "$a" ] || [ -z "$b" ] || [ "$a" -ge "$b" ]; then
+        bad "Q2. env_catalog.c: catalog_check_access() must run BEFORE sql_execute() — a denial after execution is an empty result, not an answer"
+    fi
+    a="$(lines "$QARM" 'proc_table[i].pid == e->pid')"
+    if [ -z "$a" ] || [ -z "$b" ] || [ "$a" -ge "$b" ]; then
+        bad "Q2. env_catalog.c: the uid must be resolved from proc_table BEFORE sql_execute() — the engine would otherwise run as an identity the wire supplied"
+    fi
+fi
+clause "$c11" Q2 "CAT_QUERY's gates run in order: parse, resolve inside the registered partition, uid off proc_table, policy, then execute"
+
+# ── Q3. STILL READ-ONLY, and the reply is the length the cursor wrote ─────
+# §9.1's whole first-cut argument is that a read-only surface has no
+# write-path permission question to get wrong. Three teeth keep it that
+# way, and the fourth keeps the page honest: the send length is g.off (the
+# offset the cursor advanced to), not the pre-fetch `off`, because a head
+# that reports rows the bytes do not carry is a parse failure waiting to be
+# blamed on the client.
+c12=$fail
+NSQL="$(grep -cF 'sql_execute(uid,' "$ENV" 2>/dev/null)"
+if [ "$NSQL" != "1" ]; then
+    bad "Q3. env_catalog.c: expected exactly ONE sql_execute() call site, found $NSQL — a second would be a path that runs a statement the gate above never admitted"
+fi
+NVERBS="$(grep -cE '\{ [0-9], "CAT_[A-Z]+" \},' "$ENV" 2>/dev/null)"
+if [ "$NVERBS" != "5" ]; then
+    bad "Q3. env_catalog.c: expected exactly FIVE verbs in the table, found $NVERBS — a sixth would be a surface §9.1 did not answer for"
+fi
+has "$ENV" 'cat_refuse(e, ty, tag, CAT_ERR_UNKNOWN, 0)' ||
+    bad "Q3. env_catalog.c: the unknown-verb refusal is gone — a verb outside the table would be answered something else"
+has "$ENV" 'cat_send(e, cat_reply, g.off, tag);' ||
+    bad "Q3. env_catalog.c: the CAT_QUERY reply is not sent at g.off — sending the pre-fetch offset hands back a head that promises rows the bytes do not carry"
+clause "$c12" Q3 "one execution site, five verbs, unknown still refused, and the reply sent at the cursor's own length"
 
 echo ""
 if [ "$fail" -eq 0 ]; then

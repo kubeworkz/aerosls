@@ -2542,7 +2542,10 @@ what the first cut deliberately does not do.
 view of the object catalog**, brokered by a **second kernel-owned service**,
 `kernel.env.catalog`, reached through the same channel machinery P2 built for
 `kernel.net.socket`. Four verbs: `CAT_INFO` (the handshake), `CAT_LIST`,
-`CAT_STAT`, `CAT_READ`. No write verb exists in the table.
+`CAT_STAT`, `CAT_READ`. No write verb exists in the table. *(A second
+increment adds a fifth, read-only verb — `CAT_QUERY`, the SQL path — with
+the five-verb table still carrying no writer: see the addendum at the end of
+this section.)*
 
 **Why a mediated surface at all, rather than the sealed box.** The sealed box
 is superb isolation and a poor operating system. §10.4's "first user" gate
@@ -2601,7 +2604,10 @@ refusal instead of data, each for a reason the tree already states elsewhere:
   and saying so by name beats silently returning a legacy view of a table that
   no longer keeps its rows there. `CAT_STAT` still answers for such an object:
   its type and size are real metadata, and hiding them would make the refusal
-  unexplainable.
+  unexplainable. *(That larger design is what the second increment built —
+  `CAT_QUERY` serves exactly this refused case, through the same channel,
+  with the refusal moved from "wrong path" to a real read; see the addendum
+  below.)*
 
 **Explicitly not in scope for this cut.**
 
@@ -2653,6 +2659,76 @@ scripted kernel: a two-object `CAT_LIST` whose first body word is 2 must read
 as OK rather than PERM — the offset bug the kernel header records, checked
 from the other side of the wire — and a refusal must arrive with the service's
 own text so the applet can print it verbatim.
+
+### §9.1 second increment — `CAT_QUERY`: the SQL path, read-only
+
+**What landed, and which refusal it answers.** The first cut refused
+`uses_rowstore` objects on `CAT_READ` with a name and a reason — *"Routing SQL
+through a mediated byte channel is a larger design than this first cut"* —
+and left that design as the stated next step. This increment is that design.
+A fifth verb, `CAT_QUERY` (verb 5, status `CAT_ERR_QUERY` 5, mirrored
+byte-for-byte in `user/proto`), takes `{sql_len, page, limit, flags,
+sql[sql_len]}` and returns one page of rows: the head, the column names the
+engine reported, and the cells. The table still contains **no write verb** —
+the increment's whole posture is that a fifth *read* does not reopen the
+question the first cut settled, and the guard's Q3 clause counts the verbs to
+keep it that way.
+
+**The gate order is the design, and it is asserted by position.** The
+statement is parsed before any name is resolved; the single FROM table is
+resolved by `cat_find(name, len, e->partition)` — the channel's registered
+partition, never a wire field; a name outside it answers `CAT_ERR_NOENT`
+with no `why`, preserving §9.1's anti-oracle rule verbatim; the caller's uid
+is read off `proc_table[]` by the channel's pid (and its partition re-checked
+against the channel's) rather than off any field the caller controls;
+`catalog_check_access(uid, table, PERM_READ)` runs **before** execution, so a
+denial is a `CAT_ERR_PERM` answer instead of an empty result — the same
+"denied and empty must differ" rule the SQL layer already paid for twice; and
+only then does `sql_execute()` run. Only a plain single-table `SELECT`
+reaches execution: `kind != SELECT`, a JOIN, a set operator, a CTE and a
+subquery are each refused by name, because every other form can name a
+*second* table that the one-partition lookup cannot account for. The
+statement text is bounded (`CAT_SQL_MAX`), NUL-scanned (an embedded NUL
+would make the engine parse a prefix the caller never wrote) and the page is
+bounded by `CAT_QUERY_ROWS_MAX`; the reply is sent at `g.off` — the cursor's
+own offset after delivering rows — not the pre-fetch `off`, which would hand
+a client a head promising rows its bytes do not carry.
+
+**Verification.** The same three-layer shape the first cut used:
+
+- **Host:** `tests/env_catalog_host_test.c` grew a section that seeds a
+  row-set table in partition 1 and executes the verb against the real
+  service — the happy page, the projection map, each shape refusal, the
+  foreign-table `NOENT`, the short/oversized/NUL statement shapes, the
+  read-only belt, and the send length (`g.off` — the offset bug this test
+  caught first, before any cluster ran it).
+- **Guard:** `tests/env_catalog_broker_check.sh` gained **Q1** (the verb and
+  status exist on both halves with matching numbers, encoder/decoder present,
+  `catalog sql` reachable), **Q2** (the gate order above, each link asserted
+  by line position *inside the QUERY arm* — a gate moved after execution
+  still compiles and still looks like a gate), and **Q3** (exactly one
+  execution site, exactly five verbs, the unknown-verb refusal intact, the
+  reply sent at `g.off`).
+- **Teeth:** eleven new arms in `env_catalog_broker_check_smoke.sh` — the
+  parse/lookup pair genuinely swapped, the policy check and the pid/partition
+  check deleted, the verb number changed on one side only, the table entry,
+  the subcommand and the trait method removed, the send length rewound, a
+  sixth verb added, a second execution site added, the unknown refusal
+  removed. 51 teeth, 0 lost, on both controls.
+- **Live:** `tests/env_catalog_live_check.sh` gained section 8: seed a table
+  the documented three-step way under the bearer uid (valloc → schema set →
+  table create → `INSERT`), then through `env attach` — the page carrying the
+  run-unique cell value and its own `page 0: 1 row(s), 1 total` head; a
+  `DROP TABLE` refused by name with *"only SELECT is served on this
+  surface"* **and the row still there afterwards** (a refusal that executed
+  first would look identical in a transcript that shows only the refusal);
+  and a foreign table answered `NOENT` — not `PERM`, not rows. This is also
+  the first live exercise of the policy check, which only this verb runs.
+
+The first cut's own "live arm" bullet is settled by the same increment: the
+client now reaches the wire inside a created environment, driven by E6's
+attach surface, and the guard's C2 covers the source half while
+`env_catalog_live_check.sh` covers the running half.
 
 ---
 

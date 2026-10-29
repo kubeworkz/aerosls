@@ -97,7 +97,7 @@ use alloc::vec::Vec;
 use aerosls_procmgr::{is_child, signal_exit_code, BlockReason, Ctx, ProcManager, ReadBlock, SIGCONT, SIGINT, SIGTSTP, Step, WaitOutcome, WriteBlock};
 use aerosls_proto::kabi::Kernel;
 use aerosls_proto::catalops::{CatalogOps, CatRefusal};
-use aerosls_proto::{CAT_ERR_UNKNOWN, CAT_LIST_PAGE_MAX, CAT_MAX_KEY, CAT_MAX_NAME};
+use aerosls_proto::{CAT_ERR_UNKNOWN, CAT_LIST_PAGE_MAX, CAT_MAX_KEY, CAT_MAX_NAME, CAT_QUERY_ROWS_MAX, CAT_SQL_MAX};
 use aerosls_vfs::{BufferAlloc, Errno, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, Vfs};
 
 /// The boot script every POSIX sidecar init runs.
@@ -5889,7 +5889,7 @@ pub unsafe extern "C" fn k_cap_list() {}
 pub unsafe extern "C" fn posix_serial_print(_data: *const u8, _len: u32) {}
 
 /// `catalog`: POSIX-Environments §9.1's mediated, read-only,
-/// partition-scoped view of the object catalog — the four verbs
+/// partition-scoped view of the object catalog — the verbs
 /// `kernel.env.catalog` answers, reached through the tenant's `catalog`
 /// cap. This is the command that makes the surface reachable: the service,
 /// its wire and its boundary all exist before it, and without a caller an
@@ -5901,6 +5901,9 @@ pub unsafe extern "C" fn posix_serial_print(_data: *const u8, _len: u32) {}
 /// catalog list [page] [size]   one page of this namespace (size 1..=8)
 /// catalog stat NAME            type / tier / pages / owner / database
 /// catalog read NAME KEY        one (object, key) value
+/// catalog sql [--page N] [--limit N] SELECT ...
+///                              a page of rows from a row-set table, run by
+///                              the kernel's own SQL engine (limit 1..=4)
 /// ```
 ///
 /// A refusal prints the service's OWN rendered line ("CAT_STAT refused by
@@ -6021,6 +6024,123 @@ fn catalog_run(cat: &mut dyn CatalogOps, argv: &[String]) -> (i32, String) {
             }
         }
 
+        "sql" => {
+            // Flags first, then the statement as the REST of the line: the
+            // shell splits on whitespace, so the statement arrives in pieces
+            // and rejoining them here is what makes
+            //   catalog sql SELECT name FROM app.users WHERE role = 'admin'
+            // reach the parser as one statement. Quoting is the shell's
+            // business (it strips the quotes before this applet sees them).
+            let mut page: u16 = 0;
+            let mut limit: u8 = CAT_QUERY_ROWS_MAX;
+            let mut i = 2usize;
+            while i + 1 < argv.len() {
+                let flag = argv[i].as_str();
+                if flag != "--page" && flag != "--limit" {
+                    break;
+                }
+                let v = argv[i + 1].as_str();
+                let n = match v.parse::<u32>() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        return (
+                            2,
+                            alloc::format!(
+                                "catalog: {} takes a number\n{}",
+                                flag,
+                                catalog_usage()
+                            ),
+                        )
+                    }
+                };
+                if flag == "--page" {
+                    if n > u16::MAX as u32 {
+                        return (2, alloc::format!("catalog: --page is too large\n{}", catalog_usage()));
+                    }
+                    page = n as u16;
+                } else {
+                    if n == 0 || n > CAT_QUERY_ROWS_MAX as u32 {
+                        return (
+                            2,
+                            alloc::format!(
+                                "catalog: --limit must be 1..={}\n{}",
+                                CAT_QUERY_ROWS_MAX,
+                                catalog_usage()
+                            ),
+                        );
+                    }
+                    limit = n as u8;
+                }
+                i += 2;
+            }
+            if i >= argv.len() {
+                return (
+                    2,
+                    alloc::format!("catalog: sql needs a statement\n{}", catalog_usage()),
+                );
+            }
+            let mut sql = String::new();
+            for (n, w) in argv[i..].iter().enumerate() {
+                if n > 0 {
+                    sql.push(' ');
+                }
+                sql.push_str(w);
+            }
+            if sql.is_empty() || sql.len() > CAT_SQL_MAX {
+                return (
+                    2,
+                    alloc::format!(
+                        "catalog: statement must be 1..={} bytes (this one is {})\n{}",
+                        CAT_SQL_MAX,
+                        sql.len(),
+                        catalog_usage()
+                    ),
+                );
+            }
+            match cat.cat_query(sql.as_bytes(), page, limit) {
+                Ok(r) => {
+                    let mut text = alloc::format!(
+                        "page {}: {} row(s), {} total{}{}\n",
+                        r.page,
+                        r.nrows,
+                        r.total,
+                        if r.more { ", more follow" } else { "" },
+                        if r.truncated { ", result truncated by the engine" } else { "" }
+                    );
+                    for (n, c) in r.columns.iter().enumerate() {
+                        if n > 0 {
+                            text.push_str("  ");
+                        }
+                        text.push_str(&String::from_utf8_lossy(c));
+                    }
+                    if !r.columns.is_empty() {
+                        text.push('\n');
+                    }
+                    for row in &r.rows {
+                        for (n, cell) in row.iter().enumerate() {
+                            if n > 0 {
+                                text.push_str("  ");
+                            }
+                            // NULL prints as NULL, not as an empty field:
+                            // the engine distinguishes them and a reader
+                            // must be able to as well.
+                            if cell.null {
+                                text.push_str("NULL");
+                            } else {
+                                text.push_str(&String::from_utf8_lossy(&cell.value));
+                            }
+                        }
+                        text.push('\n');
+                    }
+                    if r.nrows == 0 && !r.more {
+                        text.push_str("(no rows)\n");
+                    }
+                    (0, text)
+                }
+                Err(e) => catalog_refusal(&e),
+            }
+        }
+
         other => (
             2,
             alloc::format!("catalog: unknown subcommand '{}'\n{}", other, catalog_usage()),
@@ -6042,7 +6162,7 @@ fn catalog_refusal(e: &CatRefusal) -> (i32, String) {
 }
 
 fn catalog_usage() -> &'static str {
-    "usage: catalog info | list [page] [page_size] | stat NAME | read NAME KEY\n"
+    "usage: catalog info | list [page] [page_size] | stat NAME | read NAME KEY\n  sql [--page N] [--limit N] <SELECT statement>\n"
 }
 
 pub fn register_default_applets<K: Kernel, A: BufferAlloc>(pm: &mut ProcManager<K, A>) {
@@ -6761,5 +6881,139 @@ mod tests {
             alloc::vec!["/usr/bin//cat"]
         );
         assert_eq!(path_candidates("cat", ""), Vec::<String>::new());
+    }
+
+    // ── `catalog sql`: the SQL path, from the caller's side ──────────────────
+
+    use super::catalog_run;
+    use aerosls_proto::catalops::{CatPage, CatRefusal, CatResult, CatalogOps};
+    use aerosls_proto::{CatCell, CatInfo, CatRows, CatStat, CatValue, CAT_ERR_NOENT};
+
+    /// A catalog channel that RECORDS what the applet asked for and answers
+    /// with a scripted page. This applet's whole job is argv -> request and
+    /// reply -> text, so the test pins exactly those two directions and needs
+    /// no kernel on either side of them.
+    struct FakeCat {
+        sql: Vec<u8>,
+        page: u16,
+        limit: u8,
+        rows: CatRows,
+        refuse: Option<&'static str>,
+    }
+
+    fn sql_page() -> CatRows {
+        CatRows {
+            ncols: 2,
+            nrows: 1,
+            more: true,
+            truncated: false,
+            page: 2,
+            total: 5,
+            columns: alloc::vec![b"name".to_vec(), b"email".to_vec()],
+            rows: alloc::vec![alloc::vec![
+                CatCell { null: false, value: b"ada".to_vec() },
+                CatCell { null: true, value: Vec::new() },
+            ]],
+        }
+    }
+
+    impl CatalogOps for FakeCat {
+        fn cat_info(&mut self) -> CatResult<CatInfo> {
+            unreachable!("the sql arm never asks for INFO")
+        }
+        fn cat_list(&mut self, _p: u16, _s: u16) -> CatResult<CatPage> {
+            unreachable!("the sql arm never lists")
+        }
+        fn cat_stat(&mut self, _n: &[u8]) -> CatResult<CatStat> {
+            unreachable!("the sql arm never stats")
+        }
+        fn cat_read(&mut self, _n: &[u8], _k: &[u8]) -> CatResult<CatValue> {
+            unreachable!("the sql arm never reads")
+        }
+        fn cat_query(&mut self, sql: &[u8], page: u16, limit: u8) -> CatResult<CatRows> {
+            self.sql = sql.to_vec();
+            self.page = page;
+            self.limit = limit;
+            match self.refuse {
+                Some(t) => Err(CatRefusal::new(CAT_ERR_NOENT, t)),
+                None => Ok(self.rows.clone()),
+            }
+        }
+    }
+
+    fn fake() -> FakeCat {
+        FakeCat {
+            sql: Vec::new(),
+            page: 0,
+            limit: 0,
+            rows: sql_page(),
+            refuse: None,
+        }
+    }
+
+    fn argv_of(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The statement arrives SPLIT (the shell tokenised it), so the applet
+    /// rejoins it — and the flags are parsed before it, in order. The page it
+    /// prints is the head's, and NULL is printed as NULL rather than as an
+    /// empty field: the engine distinguishes them and so must the reader.
+    #[test]
+    fn sql_rejoins_the_split_statement_and_parses_its_flags() {
+        let mut c = fake();
+        let argv = argv_of(&[
+            "catalog", "sql", "--page", "2", "--limit", "3",
+            "SELECT", "name", "FROM", "app.users",
+        ]);
+        let (code, text) = catalog_run(&mut c, &argv);
+        assert_eq!(code, 0, "{}", text);
+        assert_eq!(c.sql, b"SELECT name FROM app.users", "the statement is rejoined");
+        assert_eq!((c.page, c.limit), (2, 3), "flags parse, in order");
+        assert!(
+            text.contains("page 2: 1 row(s), 5 total, more follow"),
+            "the head is reported: {:?}",
+            text
+        );
+        assert!(text.contains("name  email"), "columns first: {:?}", text);
+        assert!(text.contains("ada  NULL"), "NULL prints as NULL: {:?}", text);
+    }
+
+    /// A refusal is the SERVICE'S line, printed verbatim — §9.1's contract,
+    /// and the reason the status is never reduced to a number here.
+    #[test]
+    fn sql_a_refusal_is_printed_verbatim() {
+        let mut c = fake();
+        c.refuse = Some("CAT_QUERY refused by kernel.env.catalog: only SELECT is served");
+        let (code, text) = catalog_run(&mut c, &argv_of(&["catalog", "sql", "DELETE FROM t"]));
+        assert_eq!(code, 1, "a refusal is not success: {:?}", text);
+        assert!(
+            text.contains("CAT_QUERY refused by kernel.env.catalog: only SELECT is served"),
+            "the service's own words: {:?}",
+            text
+        );
+        assert!(
+            !text.contains("DELETE"),
+            "the refused statement is not echoed back as if it had run"
+        );
+    }
+
+    /// Usage failures are usage failures: no statement, a non-numeric flag,
+    /// or a --limit outside the service's own 1..=4 are all exit 2 with the
+    /// usage line, and none of them reaches the wire.
+    #[test]
+    fn sql_usage_errors_never_reach_the_wire() {
+        let mut c = fake();
+        let (code, _) = catalog_run(&mut c, &argv_of(&["catalog", "sql"]));
+        assert_eq!(code, 2, "a statement is required");
+        assert!(c.sql.is_empty(), "nothing was sent");
+
+        let (code, _) = catalog_run(&mut c, &argv_of(&["catalog", "sql", "--limit", "x", "SELECT 1"]));
+        assert_eq!(code, 2, "a non-numeric flag is a usage error");
+
+        let (code, text) = catalog_run(&mut c, &argv_of(&["catalog", "sql", "--limit", "9", "SELECT 1"]));
+        assert_eq!(code, 2, "a limit past the service's cap is a usage error");
+        assert!(text.contains("--limit must be 1..=4"), "{:?}", text);
+        assert!(c.sql.is_empty(), "nothing was sent");
     }
 }
