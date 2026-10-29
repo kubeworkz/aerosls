@@ -46,20 +46,11 @@ extern volatile uint64_t kernel_tick_counter;
  * the two payload walkers cannot disagree about page boundaries. */
 #define ENV_MIGRATE_SECTORS_PER_PAGE 8u
 
-/* The image-window tail the staged payload carries after the payload
- * pages (region frames + durable extent). The reboot payload has always
- * captured the sidecars' image-window frames — the boot stack and the
- * .data/.bss the resumed context RUNS on; a staged payload with only the
- * region frames pours a source heap under a destination sidecar whose own
- * stack frame slots hold different locals, and the restored environment
- * #PF'd on its first console input (live find, 2026-10-23). Collected on
- * the send side from the FROZEN sidecars and re-derived on the restore
- * side from the FRESH sidecars, in env_payload.h's shared canonical order —
- * so no vaddrs cross the wire, and the page count that crossed is what
- * validates the halves. Ceiling: a POSIX sidecar image is ~305 pages and a
- * ramdisk sidecar's ~26; 1024 is generous headroom under the receive
- * side's 4096-page staging ceiling. */
-#define ENV_MIGRATE_IMAGE_MAX 1024u
+/* The image-window tail ceiling (the reasoning — why a tail exists at all,
+ * and why 1024 — moved WITH the #define to env_migrate.h, where the replica
+ * receiver's BEGIN gate (kernel/env_replica.c) shares the same single
+ * definition; the wire's two receivers must never disagree about the
+ * ceiling). The staging arrays below are this file's alone. */
 static uint64_t env_mig_img_vaddr[ENV_MIGRATE_IMAGE_MAX];
 static struct ProcessDescriptor* env_mig_img_pd[ENV_MIGRATE_IMAGE_MAX];
 static uint32_t env_mig_img_count = 0;

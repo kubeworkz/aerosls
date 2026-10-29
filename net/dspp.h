@@ -440,7 +440,17 @@ enum DSPPEnvMigrateOpcode {
      * synchronous payload send) and so cannot transmit for a while; this
      * announce, sent BEFORE the block, is the only liveness its peers will
      * hear about that work. record_len carries the budget in ticks. */
-    DSPP_MIGRATE_ENV_INTENT     = 24   // any node -> segment: I have environment-migration work in flight for the next budget ticks
+    DSPP_MIGRATE_ENV_INTENT     = 24,  // any node -> segment: I have environment-migration work in flight for the next budget ticks
+    /* P3 destination (a), the proactive replica (kernel/env_replica.h): a
+     * replica's BEGIN rides its OWN opcode rather than 18 because
+     * transfer_id is ((partition<<32)|index) in BOTH the migration and the
+     * replica family — routing a BEGIN by id would be a guess about which
+     * receiver owns the transfer, and the migration receiver's table would
+     * stage a replica as a migration (and its sweep would try to RESTORE
+     * it). The opcode names the receiver; the shared PAGE family (20/21)
+     * follows it via env_replica_holds(), and the ACKs still reuse 19/21
+     * matched by transfer_id, so the sender's wait is identical either way. */
+    DSPP_MIGRATE_ENV_REPLICA_BEGIN_REQ = 25   // sender -> receiver: a replica of an environment is arriving (proactive, before any failure)
 };
 
 /* The descriptor crosses WHOLE (a fixed-size struct, a few hundred bytes),

@@ -170,6 +170,27 @@ int env_migrate_last_status(void);
  * node's own fresh sidecars' windows (env_payload.h's shared order). */
 uint32_t env_migrate_payload_pages(const struct EnvCkptRecord* rec);
 
+/* The image-window tail the staged payload carries after the payload
+ * pages (region frames + durable extent). The reboot payload has always
+ * captured the sidecars' image-window frames — the boot stack and the
+ * .data/.bss the resumed context RUNS on; a staged payload with only the
+ * region frames pours a source heap under a destination sidecar whose own
+ * stack frame slots hold different locals, and the restored environment
+ * #PF'd on its first console input (live find, 2026-10-23). Collected on
+ * the send side from the FROZEN sidecars and re-derived on the restore
+ * side from the FRESH sidecars, in env_payload.h's shared canonical order —
+ * so no vaddrs cross the wire, and the page count that crossed is what
+ * validates the halves. Ceiling: a POSIX sidecar image is ~305 pages and a
+ * ramdisk sidecar's ~26; 1024 is generous headroom under the receive
+ * side's 4096-page staging ceiling.
+ *
+ * Exported here (was env_migrate.c's private define) because this is the
+ * ONE number both wire receivers gate a BEGIN on: a declared total outside
+ * [payload_pages, payload_pages + this] is refused by name on either side,
+ * so the replica receiver (kernel/env_replica.c) must see the same ceiling
+ * this file sends under. */
+#define ENV_MIGRATE_IMAGE_MAX 1024u
+
 /* ─── The migration's environment step (P3 increment 3) ─────────────────────
  * Everything partition_migrate() needs from this module, in one call, so the
  * orchestration grows ONE reference rather than a loop over another module's

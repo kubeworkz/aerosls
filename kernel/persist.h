@@ -281,7 +281,8 @@
 //   PERSIST_ENV_CKPT_HDR_LBA 7696 + 8  -> ends 7704   (header: count + record size + version)
 //   PERSIST_ENV_CKPT_ENT_LBA 7704 + 8  -> ends 7712   (env_ckpt_table[]: 8 x 368 B = 2,944 B)
 //   PERSIST_ENVSTOR_* / PERSIST_ENV_PAYLOAD_* (below) -> ends 7760
-//   STREAM_DIR_LBA    8192                             -> 432 sectors / 54 frames still free
+//   PERSIST_ENV_REPLICA_* (below)                      -> ends 7776   (P3 destination (a))
+//   STREAM_DIR_LBA    8192                             -> 416 sectors / 52 frames still free
 //
 // One frame for the entry array is not a coincidence and not slack to be
 // spent: env_ckpt.c carries a _Static_assert that the whole array fits a
@@ -329,6 +330,15 @@
 // payload is not. The same split as the P1b region above.
 #define PERSIST_ENV_PAYLOAD_HDR_LBA     7744ULL
 #define PERSIST_ENV_PAYLOAD_ENT_LBA     7752ULL
+
+// P3 destination (a): the proactive REPLICA's directory (kernel/env_replica.h),
+// the payload directory's twin — same pair-of-frames discipline, entries
+// written first and header last. The replica BAND itself is not here: it is
+// payload-band sized (8 x 8 MiB) and sits directly after it at
+// ENV_REPLICA_DATA_LBA_BASE (env_replica.h), which asserts the adjacency at
+// compile time. Nothing else claims 7760..7776 — STREAM_DIR starts at 8192.
+#define PERSIST_ENV_REPLICA_HDR_LBA     7760ULL
+#define PERSIST_ENV_REPLICA_ENT_LBA     7768ULL
 
 // One-way format-version marker, written into PERSIST_ROWSTORE_HDR_LBA's/
 // PERSIST_VECSTORE_HDR_LBA's own header frame (the v2 field, previously

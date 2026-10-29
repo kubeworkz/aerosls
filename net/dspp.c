@@ -13,8 +13,34 @@
 #include "../kernel/stream.h"   // Multi-Node Partition Scaling Roadmap Phase 7 -- stream_migrate_recv_begin()/_page()
 #include "../kernel/simi_ctx_migrate.h"  // PEC Phase 3 -- simi_ctx_migrate_recv_begin()/_chunk()
 #include "../kernel/env_migrate.h"  // POSIX-Environments P3 increment 2 -- env_migrate_recv_begin()/_page()
+#include "../kernel/env_replica.h"  // POSIX-Environments P3 destination (a) -- env_replica_recv_begin()/_page(), env_replica_holds()
 #include "../kernel/kernel_io.h"
 
+/* ─── P3 destination (a): the replica receiver's WEAK defaults ─────────────
+ * kernel/env_replica.c owns the strong definitions; these keep THIS file's
+ * dependency surface at its historical boundary — every host test that
+ * links the dispatcher without the replica subsystem (the migration,
+ * stream, context and consensus tests) keeps linking unchanged, and the
+ * strong ones win the kernel link. Without a receiver linked, a replica
+ * BEGIN is refused by name (rc=1 below is logged as NO_RECORD) and its
+ * pages are unknown — never absorbed into another family's table. */
+__attribute__((weak)) int env_replica_recv_begin(uint64_t transfer_id,
+    uint32_t partition_id, uint32_t index, uint32_t total_pages,
+    const struct EnvCkptRecord* record, uint32_t record_len,
+    uint32_t src_node) {
+    (void)transfer_id; (void)partition_id; (void)index; (void)total_pages;
+    (void)record; (void)record_len; (void)src_node;
+    return 1;   /* ENV_REPLICA_REFUSE_NO_RECORD: no receiver is linked */
+}
+__attribute__((weak)) int env_replica_recv_page(uint64_t transfer_id,
+    uint32_t page_index, uint32_t frag_index, const uint8_t* data) {
+    (void)transfer_id; (void)page_index; (void)frag_index; (void)data;
+    return 1;   /* ENV_REPLICA_REFUSE_UNKNOWN: no receiver is linked */
+}
+__attribute__((weak)) int env_replica_holds(uint64_t transfer_id) {
+    (void)transfer_id;
+    return 0;   /* no replica transfers exist without the receiver */
+}
 /* The consensus handlers below need a wall-clock reading to restart election
  * timers on an accepted heartbeat or a granted vote (net/consensus.h's
  * "Election timing" block explains why a call count will not do).
@@ -696,6 +722,45 @@ void dspp_env_migrate_rx(void* buf, uint16_t len) {
      * so a live migrate that never landed gave no diagnosis on either
      * side. One line per refusal (and one per staged environment) keeps
      * the promise; the volume is per-migration, not per-frame. */
+    /* P3 destination (a), replica half: a replica BEGIN carries its OWN
+     * opcode (25), so it reaches the receiver whose table staged the
+     * transfer — see dspp.h's opcode comment for why routing by transfer_id
+     * would be a guess. The ACK is the same BEGIN_ACK, matched by
+     * transfer_id. */
+    if (h->opcode == DSPP_MIGRATE_ENV_REPLICA_BEGIN_REQ) {
+        if (len < sizeof(struct DSPPEnvMigrateBeginPacket)) return;
+        struct DSPPEnvMigrateBeginPacket* pkt = (struct DSPPEnvMigrateBeginPacket*)buf;
+        int rc = env_replica_recv_begin(h->transfer_id, h->partition_id,
+                                        h->env_index, h->total_pages,
+                                        (const struct EnvCkptRecord*)pkt->record,
+                                        h->record_len, (uint32_t)h->node_source_id);
+        if (rc == 0) {
+            kernel_serial_printf(
+                "[ENV_REPLICA] RX: BEGIN for (partition %u, index %u) from node %u "
+                "STAGED, %u page(s).\n",
+                (unsigned)h->partition_id, (unsigned)h->env_index,
+                (unsigned)h->node_source_id, (unsigned)h->total_pages);
+        } else {
+            /* rc names the gate (kernel/env_replica.c's recv_begin): 1 no
+             * record, 2 record_len != sizeof(EnvCkptRecord), 3 declared total
+             * outside [payload, payload+tail], 4 total over the band slot's
+             * 2048 pages, 5 identity in flight under another transfer, 6 the
+             * staging table is full, 7 no band slot for a NEW identity (the
+             * 9th), 13 an older capture after a newer one already landed. */
+            kernel_serial_printf(
+                "[ENV_REPLICA] RX: BEGIN for (partition %u, index %u) from node %u "
+                "REFUSED (rc=%d: 1=no-record 2=record-len 3=page-count 4=too-many "
+                "5=slot-exists 6=table-full 7=no-disk-slot 13=superseded), "
+                "answered with a non-zero ACK.\n",
+                (unsigned)h->partition_id, (unsigned)h->env_index,
+                (unsigned)h->node_source_id, rc);
+        }
+        dspp_env_migrate_send_ack(DSPP_MIGRATE_ENV_BEGIN_ACK, h->node_source_id,
+                                  h->transfer_id, h->partition_id, h->env_index,
+                                  0, 0, (uint8_t)(rc == 0 ? 0 : 1));
+        return;
+    }
+
     if (h->opcode == DSPP_MIGRATE_ENV_BEGIN_REQ) {
         if (len < sizeof(struct DSPPEnvMigrateBeginPacket)) return;
         struct DSPPEnvMigrateBeginPacket* pkt = (struct DSPPEnvMigrateBeginPacket*)buf;
@@ -731,12 +796,22 @@ void dspp_env_migrate_rx(void* buf, uint16_t len) {
     if (h->opcode == DSPP_MIGRATE_ENV_PAGE_REQ) {
         if (len < sizeof(struct DSPPEnvMigratePagePacket)) return;  // truncated -- page_data not actually present
         struct DSPPEnvMigratePagePacket* pkt = (struct DSPPEnvMigratePagePacket*)buf;
-        int rc = env_migrate_recv_page(h->transfer_id, h->page_index,
-                                       h->frag_index, pkt->page_data);
+        /* Route by which receiver HOLDS this transfer: a replica's table
+         * takes its own pages (its BEGIN staged them first), the migration
+         * receiver takes everything else. A page for a transfer nobody
+         * holds falls through to the migration receiver and is refused by
+         * name there — the sender's recovery (re-ask the BEGIN) is the
+         * same either way. */
+        int replica = env_replica_holds(h->transfer_id);
+        int rc = replica ? env_replica_recv_page(h->transfer_id, h->page_index,
+                                                 h->frag_index, pkt->page_data)
+                         : env_migrate_recv_page(h->transfer_id, h->page_index,
+                                                 h->frag_index, pkt->page_data);
         if (rc != 0) {
             kernel_serial_printf(
-                "[ENV_MIGRATE] RX: PAGE (partition %u, page %u, frag %u) from node %u "
+                "[%s] RX: PAGE (partition %u, page %u, frag %u) from node %u "
                 "REFUSED (rc=%d), answered with a non-zero ACK.\n",
+                replica ? "ENV_REPLICA" : "ENV_MIGRATE",
                 (unsigned)h->partition_id, (unsigned)h->page_index,
                 (unsigned)h->frag_index, (unsigned)h->node_source_id, rc);
         }
