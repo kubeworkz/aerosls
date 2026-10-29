@@ -36,6 +36,7 @@
 #include "kernel/partition.h"
 #include "net/e1000.h"
 #include "net/dspp.h"
+#include "net/consensus.h"  /* cluster_roster — what the push walks */
 #include "net/net.h"
 #include "tests/partition_host_stubs.h"
 #include <stdio.h>
@@ -192,11 +193,22 @@ static uint32_t g_fake_local_node_id = 0;
 uint32_t cluster_local_node_id(void) { return g_fake_local_node_id; }
 uint32_t cluster_leader_id(void) { return 0; }
 
+/* net/consensus.c is not linked — the roster the push walks is defined
+ * here, the way tests/checkpoint_recovery_host_test.c defines it. */
+struct ClusterPeer cluster_roster[CLUSTER_NODE_MAX];
+uint32_t            cluster_roster_count = 0;
+
 void failover_note_heartbeat(uint32_t node_id, uint64_t now) {
     (void)node_id; (void)now;
 }
 int failover_peer_status(uint32_t node_id) { (void)node_id; return -1; }
-void failover_sweep_keepalive(void) { }
+/* The loopback's delivery point — defined below, after the frame capture:
+ * the sender's ACK wait pumps this every spin, so frames are delivered from
+ * the WAIT, never from inside the transmit stub (dspp_transmit_raw() drops a
+ * frame transmitted while another is being built — and the real RX path
+ * delivers while a sender waits anyway). */
+static void loopback_drain(void);
+void failover_sweep_keepalive(void) { loopback_drain(); }
 
 MACAddr net_my_mac;
 
@@ -235,8 +247,8 @@ static void nvme_fake_reset(void) { fake_count = 0; }
  * This test never runs the SENDER (that is increment 2) — it hand-builds
  * the wire frames — so the capture only needs to prove what came BACK:
  * an ACK frame with the family's opcode and a status answering 0/nonzero. */
-#define MAX_CAPTURED_FRAMES 64
-#define FRAME_STRIDE (ETH_HDR_LEN + (unsigned)sizeof(struct DSPPEnvMigrateHeader))
+#define MAX_CAPTURED_FRAMES 256
+#define FRAME_STRIDE (ETH_HDR_LEN + (unsigned)sizeof(struct DSPPEnvMigrateBeginPacket))
 static uint8_t  captured_frame[MAX_CAPTURED_FRAMES][FRAME_STRIDE];
 static uint16_t captured_frame_len[MAX_CAPTURED_FRAMES];
 static int      captured_frame_count = 0;
@@ -251,10 +263,46 @@ void e1000_transmit(NicRole role, void* buf, uint16_t size) {
     captured_frame_count++;
     kernel_tick_counter += 1;   /* time passes while frames are on the wire */
 }
+/* ─── The loopback: one process, both nodes ────────────────────────────────
+ * A captured frame is delivered when the sender next PUMPS (its ACK wait),
+ * not when it is transmitted: dspp_transmit_raw() drops a frame emitted
+ * while another is being built, so the receiver's ACK has to be sent at
+ * top level — which is also the real shape, RX delivering while TX waits.
+ * Because one process has one local id, delivery rewrites the destination to
+ * this process and any source that IS this process to the peer: the frame
+ * lands exactly as its real recipient would receive it. g_loopback_tick
+ * models the PEER's own service poll running between frames (it is what
+ * turns a staged transfer into a finalized replica). */
+static int      g_loopback = 0;
+static int      g_loopback_tick = 1;
+static uint32_t g_loopback_peer = 1;
+static int      g_deliver_head = 0;
+
 static void capture_reset(void) {
     captured_frame_count = 0;
+    g_deliver_head = 0;
 }
 
+static void loopback_drain(void) {
+    while (g_loopback && g_deliver_head < captured_frame_count) {
+        uint8_t* frame = captured_frame[g_deliver_head];
+        uint16_t len   = captured_frame_len[g_deliver_head];
+        g_deliver_head++;
+        if (len < ETH_HDR_LEN + sizeof(struct DSPPEnvMigrateHeader)) continue;
+        struct DSPPEnvMigrateHeader* h =
+            (struct DSPPEnvMigrateHeader*)(frame + ETH_HDR_LEN);
+        if (h->magic != DSPP_MIGRATE_MAGIC) continue;
+        if (g_loopback_tick) env_replica_tick();   /* the peer's service poll */
+        h->node_dest_id = cluster_local_node_id();
+        if (h->node_source_id == cluster_local_node_id())
+            h->node_source_id = (uint16_t)g_loopback_peer;
+        if (getenv("REPLICA_TEST_TRACE"))
+            printf("[drain] opcode=%u dest=%u len=%u\n",
+                   (unsigned)h->opcode, (unsigned)h->node_dest_id,
+                   (unsigned)len);
+        dspp_rx_dispatch(h, (uint16_t)(len - ETH_HDR_LEN));
+    }
+}
 /* The last transmitted frame as the family's own header (ACKs are a bare
  * DSPPEnvMigrateHeader — dspp_env_migrate_send_ack's own shape). */
 static const struct DSPPEnvMigrateHeader* last_frame(void) {
@@ -282,7 +330,7 @@ static void wire_begin(uint64_t tid, uint32_t part, uint32_t idx,
     pkt.header.record_len     = rec_len;
     if (rec && rec_len == (uint32_t)sizeof(*rec))
         memcpy(pkt.record, rec, sizeof(*rec));
-    dspp_env_migrate_rx(&pkt, (uint16_t)sizeof(pkt));
+    dspp_rx_dispatch(&pkt, (uint16_t)sizeof(pkt));
 }
 static void wire_page(uint64_t tid, uint32_t part, uint32_t page,
                       uint32_t frag, uint8_t fill) {
@@ -299,7 +347,7 @@ static void wire_page(uint64_t tid, uint32_t part, uint32_t page,
     pkt.header.page_index     = page;
     pkt.header.frag_index     = frag;
     memcpy(pkt.page_data, data, DSPP_MIGRATE_FRAG_BYTES);
-    dspp_env_migrate_rx(&pkt, (uint16_t)sizeof(pkt));
+    dspp_rx_dispatch(&pkt, (uint16_t)sizeof(pkt));
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -625,6 +673,124 @@ int main(void) {
     CHECK(env_replica_staging_count() == 0, "H3: the wedged staging was dropped");
     CHECK(last_refusal() == ENV_REPLICA_REFUSE_STALE, "H4: the drop is named STALE");
     CHECK(!env_replica_present(PART_A, 12), "H5: no replica was recorded");
+
+    /* ── I: the capture-side sender, loop-backed end to end ─────────────── */
+    printf("-- I: the push, through stream -> wire -> receiver -> confirm --\n");
+    env_replica_reset();
+    nvme_fake_reset();
+    capture_reset();
+    /* One process, two nodes: this process IS the peer (id 1) for delivery,
+     * and the local id (2) is what senders stamp and the rewrites honor. */
+    g_fake_local_node_id = 2;
+    g_loopback_peer = 1;
+    cluster_roster_count = 1;
+    cluster_roster[0].node_id = 1;
+    cluster_roster[0].active = 1;
+    {
+        /* A record whose regions and extent are REAL bytes — the stream
+         * reads them exactly as the capture window would. */
+        static uint8_t push_r0[2][4096] __attribute__((aligned(4096)));
+        static uint8_t push_r1[1][4096] __attribute__((aligned(4096)));
+        for (int b = 0; b < 4096; b++) {
+            push_r0[0][b] = 0x80;
+            push_r0[1][b] = 0x81;
+            push_r1[0][b] = 0x82;
+        }
+        struct EnvCkptRecord rec2 = mk_record(79, 0, 11, 900);
+        rec2.regions[0].base = (uint64_t)(uintptr_t)push_r0;
+        rec2.regions[1].base = (uint64_t)(uintptr_t)push_r1;
+        static uint8_t ext[4096] __attribute__((aligned(4096)));
+        memset(ext, 0xC1, 4096); nvme_write_sync(STATE_LBA + 0, ext);
+        memset(ext, 0xC2, 4096); nvme_write_sync(STATE_LBA + 8, ext);
+
+        g_loopback = 1;
+        g_loopback_tick = 1;
+        CHECK(env_replica_push(&rec2) == 1,
+              "I1: push confirms FINALIZATION on the peer (not merely staging)");
+        g_loopback = 0;
+        {
+            int saw_replica_begin = 0, saw_confirm = 0, saw_pages = 0;
+            for (int i = 0; i < captured_frame_count; i++) {
+                if (captured_frame_len[i] <
+                    ETH_HDR_LEN + sizeof(struct DSPPEnvMigrateHeader)) continue;
+                const struct DSPPEnvMigrateHeader* h =
+                    (const struct DSPPEnvMigrateHeader*)
+                        (captured_frame[i] + ETH_HDR_LEN);
+                if (h->magic != DSPP_MIGRATE_MAGIC) continue;
+                if (h->opcode == DSPP_MIGRATE_ENV_REPLICA_BEGIN_REQ)
+                    saw_replica_begin = 1;
+                if (h->opcode == DSPP_MIGRATE_ENV_PAGE_REQ) saw_pages = 1;
+                if (h->opcode == DSPP_MIGRATE_ENV_REPLICA_LIVE_REQ)
+                    saw_confirm = 1;
+            }
+            CHECK(saw_replica_begin,
+                  "I2: a replica BEGIN (opcode 25) went on the wire, not opcode 18");
+            CHECK(saw_pages, "I3: the shared PAGE family carried the payload");
+            CHECK(saw_confirm,
+                  "I4: the confirm question (opcode 26) went out after the pages");
+        }
+        CHECK(env_replica_present(79, 0), "I5: the peer's band holds the replica");
+        CHECK(page_holds(79, 0, 0, 0x80) && page_holds(79, 0, 2, 0x82),
+              "I6: region pages crossed byte-exact, in record order");
+        CHECK(page_holds(79, 0, 3, 0xC1) && page_holds(79, 0, 4, 0xC2),
+              "I7: the durable extent crossed too — the FULL wire numbering");
+        CHECK(env_replica_lookup(79, 0, &ent) && ent.seq == 11,
+              "I8: the directory records the pushed capture's sequence");
+
+        /* An unquiesced record never crosses: the stream's own gate, fired
+         * before a byte is read. */
+        struct EnvCkptRecord cold = mk_record(80, 0, 5, 901);
+        cold.flags &= ~ENV_CKPT_FLAG_QUIESCED;
+        g_loopback = 1;
+        CHECK(env_replica_push(&cold) == 0,
+              "I9: an unquiesced record is refused at the door");
+        g_loopback = 0;
+        CHECK(!env_replica_present(80, 0), "I10: the refused push replicated nothing");
+
+        /* The confirm's honesty: a peer whose finalizer never ran can stage
+         * EVERY page and still must not be counted as holding a copy. */
+        struct EnvCkptRecord noc = rec2;
+        noc.partition_id = 81;
+        noc.env_id = 902;
+        noc.sequence = 12;
+        g_loopback = 1;
+        g_loopback_tick = 0;   /* the peer's service poll is wedged */
+        capture_reset();
+        CHECK(env_replica_push(&noc) == 0,
+              "I11: staged-but-never-finalized counts ABSENT, not held");
+        g_loopback = 0;
+        g_loopback_tick = 1;
+        {
+            /* The ladder must RE-ASK after an honest "not yet": the live
+             * run (2026-10-28) found the first reply returning from the
+             * WHOLE function — one question, one "absent", and every push
+             * on the cluster reported NOT finalized while the peer
+             * finalized a tick later. This peer answers "not yet" every
+             * time (its finalizer never runs), so more than one question
+             * must have gone on the wire. */
+            int asks = 0;
+            for (int i = 0; i < captured_frame_count; i++) {
+                if (captured_frame_len[i] <
+                    ETH_HDR_LEN + sizeof(struct DSPPEnvMigrateHeader)) continue;
+                const struct DSPPEnvMigrateHeader* h =
+                    (const struct DSPPEnvMigrateHeader*)
+                        (captured_frame[i] + ETH_HDR_LEN);
+                if (h->magic != DSPP_MIGRATE_MAGIC) continue;
+                if (h->opcode == DSPP_MIGRATE_ENV_REPLICA_LIVE_REQ) asks++;
+            }
+            CHECK(asks >= 2,
+                  "I11b: the confirm re-asks after a 'not yet' reply instead of ending the ladder");
+        }
+        CHECK(!env_replica_present(81, 0),
+              "I12: staging alone never becomes a findable replica");
+        env_replica_reset();   /* drop the wedged staging the tick never took */
+
+        cluster_roster_count = 0;
+        CHECK(env_replica_push(&rec2) == 0, "I13: an empty roster pushes nowhere");
+        cluster_roster_count = 1;
+    }
+    g_fake_local_node_id = 0;
+    cluster_roster_count = 0;
 
     printf("\n%d passed, %d failed\n", checks_passed, checks_failed);
     return checks_failed ? 1 : 0;

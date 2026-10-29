@@ -450,7 +450,17 @@ enum DSPPEnvMigrateOpcode {
      * it). The opcode names the receiver; the shared PAGE family (20/21)
      * follows it via env_replica_holds(), and the ACKs still reuse 19/21
      * matched by transfer_id, so the sender's wait is identical either way. */
-    DSPP_MIGRATE_ENV_REPLICA_BEGIN_REQ = 25   // sender -> receiver: a replica of an environment is arriving (proactive, before any failure)
+    DSPP_MIGRATE_ENV_REPLICA_BEGIN_REQ = 25, // sender -> receiver: a replica of an environment is arriving (proactive, before any failure)
+    /* P3 destination (a), increment 2: the source's confirm poll. PAGE ACKs
+     * prove STAGING; FINALIZATION (the peer's validate -> band write ->
+     * publish) can still refuse after every page landed, and only the peer
+     * knows. Fire-and-forget on a bounded retry, like the migration's LIVE
+     * family: REQ asks "is (partition, index) finalized with seq >= this?",
+     * ACK answers status=0 yes / nonzero not-yet-or-older. seq rides in
+     * total_pages (a BEGIN-only field) as its low 32 bits -- sequences are
+     * small, the payload head's own rule. */
+    DSPP_MIGRATE_ENV_REPLICA_LIVE_REQ  = 26,  // source -> peer: did my capture finalize as a replica on you?
+    DSPP_MIGRATE_ENV_REPLICA_LIVE_ACK  = 27   // peer -> source: yes (status=0) or not yet (status!=0)
 };
 
 /* The descriptor crosses WHOLE (a fixed-size struct, a few hundred bytes),
@@ -488,8 +498,12 @@ struct DSPPEnvMigratePagePacket {
 } __attribute__((packed));
 
 /* Sender side (kernel/env_migrate.c). Fire-and-forget, like every other
- * send here — see net_event.h's blocking-wait note. */
-void dspp_env_migrate_send_begin(uint64_t transfer_id, uint32_t node_dest_id,
+ * send here — see net_event.h's blocking-wait note. begin_opcode picks the
+ * receiver table: DSPP_MIGRATE_ENV_BEGIN_REQ (18) stages a migration,
+ * DSPP_MIGRATE_ENV_REPLICA_BEGIN_REQ (25) stages a replica — the page
+ * family below is shared and follows whichever table staged the transfer. */
+void dspp_env_migrate_send_begin(uint16_t begin_opcode, uint64_t transfer_id,
+                                 uint32_t node_dest_id,
                                  uint32_t partition_id, uint32_t env_index,
                                  uint32_t total_pages, const void* record,
                                  uint32_t record_len);
@@ -505,6 +519,16 @@ void dspp_env_migrate_send_frag(uint64_t transfer_id, uint32_t node_dest_id,
  * recorded by env_migrate_live_ack() in kernel/env_migrate.c. */
 void dspp_env_migrate_send_live(uint64_t transfer_id, uint32_t node_dest_id,
                                 uint32_t partition_id, uint32_t env_index);
+
+/* P3 destination (a), increment 2: the replica confirm poll's question —
+ * same header-only shape as the LIVE_REQ above, its own opcode (26) so the
+ * two families' confirmations can never land on each other's entry, and
+ * seq_low (the capture's sequence, low 32) in total_pages. The answer comes
+ * back as opcode 27 and is recorded by env_replica_confirm_note() in
+ * kernel/env_replica.c. */
+void dspp_env_replica_send_live(uint64_t transfer_id, uint32_t node_dest_id,
+                                uint32_t partition_id, uint32_t env_index,
+                                uint32_t seq_low);
 
 /* The migration-intent broadcast (DSPP_MIGRATE_ENV_INTENT): one frame to
  * the whole segment carrying the budget in ticks. One-shot by design — it

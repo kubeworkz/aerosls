@@ -49,6 +49,8 @@ need net/dspp.h
 need kernel/microkernel.c
 need kernel/persist.h
 need kernel/env_migrate.h
+need kernel/env_migrate.c
+need kernel/env_payload.c
 need tests/env_replica_host_test.c
 
 # 1. The receiver is built into the kernel.
@@ -66,12 +68,16 @@ else
 fi
 
 # 3. The dispatch routes that opcode to the replica receiver (a header-only
-#    opcode would ACK READY from the MIGRATE receiver's table instead).
+#    opcode would ACK READY from the MIGRATE receiver's table instead), AND
+#    dspp_rx_dispatch's ENV-family gate admits all three replica opcodes —
+#    the live run (2026-10-28) found the gate stopping at ENV_INTENT (24),
+#    so 25/26/27 fell through to the stream family and died silently.
 if grep -q 'h->opcode == DSPP_MIGRATE_ENV_REPLICA_BEGIN_REQ' net/dspp.c &&
-   grep -q 'env_replica_recv_begin(' net/dspp.c; then
-    ok "dspp.c routes the replica BEGIN to env_replica_recv_begin()"
+   grep -q 'env_replica_recv_begin(' net/dspp.c &&
+   grep -qE 'opcode <= DSPP_MIGRATE_ENV_REPLICA_LIVE_ACK' net/dspp.c; then
+    ok "dspp.c routes the replica BEGIN to env_replica_recv_begin(), and the dispatch gate admits opcodes 25-27"
 else
-    fail "dspp.c does not route DSPP_MIGRATE_ENV_REPLICA_BEGIN_REQ — the staged slot would belong to the wrong receiver"
+    fail "dspp.c does not route DSPP_MIGRATE_ENV_REPLICA_BEGIN_REQ (or the dispatch gate stops before REPLICA_LIVE_ACK) — the staged slot would belong to the wrong receiver, or the frame would die silently in the stream family"
 fi
 
 # 4. The shared PAGE family follows the receiver that HOLDS the transfer.
@@ -142,6 +148,68 @@ if [ -z "$unpinned" ]; then
     ok "the host test pins every pinnable refusal code by name"
 else
     fail "refusal code(s) no longer asserted by name in the host test:$unpinned"
+fi
+
+# 10. The capture hook: the push runs at the instant the record's payload
+#     lands locally, and the payload layer keeps its own link boundary.
+if grep -q 'env_replica_push(rec);' kernel/env_payload.c; then
+    ok "env_payload.c pushes each captured record inside the quiesce window"
+else
+    fail "env_payload.c no longer calls env_replica_push at the capture site — nothing would ever replicate"
+fi
+if grep -q '__attribute__((weak)) int env_replica_push' kernel/env_payload.c; then
+    ok "env_payload.c keeps its weak push default (payload-only host tests link)"
+else
+    fail "env_payload.c lost the weak env_replica_push — the payload host test stops building"
+fi
+
+# 11. The shared stream: one page-stream sender, parameterised — a fork
+#     here would let the two families' posture gates drift apart.
+if grep -q 'int env_migrate_send_stream' kernel/env_migrate.h &&
+   grep -q 'env_migrate_send_stream(rec, dest_node_id' kernel/env_migrate.c; then
+    ok "env_migrate.h exports the shared stream and env_migrate_send delegates to it"
+else
+    fail "the shared send stream is not exported/delegated — the push and the migration no longer share one page path"
+fi
+if grep -q 'dspp_env_migrate_send_begin(begin_opcode' kernel/env_migrate.c; then
+    ok "the stream passes its begin_opcode through to the wire"
+else
+    fail "the stream no longer passes begin_opcode — replica BEGINs would stage in the migration receiver"
+fi
+
+# 12. The confirm pair: both opcodes exist, both are routed, both weak
+#     defaults hold the dispatcher-only link boundary.
+if grep -qE 'DSPP_MIGRATE_ENV_REPLICA_LIVE_REQ[[:space:]]*=[[:space:]]*26' net/dspp.h &&
+   grep -qE 'DSPP_MIGRATE_ENV_REPLICA_LIVE_ACK[[:space:]]*=[[:space:]]*27' net/dspp.h; then
+    ok "dspp.h defines the confirm pair (26/27)"
+else
+    fail "dspp.h lacks the replica confirm opcodes 26/27 — the source could never learn the finalize outcome"
+fi
+if grep -q 'env_replica_live_query(h->partition_id' net/dspp.c &&
+   grep -q 'env_replica_confirm_note(h->partition_id' net/dspp.c; then
+    ok "dspp.c routes the confirm question and its answer to env_replica.c"
+else
+    fail "dspp.c no longer routes opcodes 26/27 — staged-but-refused would be invisible to the source"
+fi
+missing_weak2=""
+for sym in env_replica_live_query env_replica_confirm_note; do
+    grep -q "__attribute__((weak)) \(int\|void\) ${sym}" net/dspp.c ||
+        missing_weak2="$missing_weak2 $sym"
+done
+if [ -z "$missing_weak2" ]; then
+    ok "dspp.c keeps the confirm pair's weak defaults"
+else
+    fail "dspp.c lost weak default(s):$missing_weak2 — dispatcher-only suites stop building"
+fi
+
+# 13. The push arm is PINNED in the host test: a sender nobody drives is a
+#     sender nobody has ever seen work.
+if grep -q 'env_replica_push(&' tests/env_replica_host_test.c &&
+   grep -q 'DSPP_MIGRATE_ENV_REPLICA_LIVE_REQ' tests/env_replica_host_test.c &&
+   grep -q 'staged-but-never-finalized' tests/env_replica_host_test.c; then
+    ok "the host test drives the push end to end and pins the confirm's honesty"
+else
+    fail "the host test no longer drives the push/confirm arm (loopback send -> finalize -> confirm)"
 fi
 
 if [ "$failed" -ne 0 ]; then

@@ -41,6 +41,19 @@ __attribute__((weak)) int env_replica_holds(uint64_t transfer_id) {
     (void)transfer_id;
     return 0;   /* no replica transfers exist without the receiver */
 }
+/* The confirm pair (opcodes 26/27), same rule: without the receiver linked
+ * the honest answers are "not finalized here" and "nothing to record" —
+ * never an undefined symbol for the dispatcher-only suites. */
+__attribute__((weak)) int env_replica_live_query(uint32_t partition_id,
+    uint32_t index, uint32_t seq_low) {
+    (void)partition_id; (void)index; (void)seq_low;
+    return 1;   /* no receiver: nothing is finalized */
+}
+__attribute__((weak)) void env_replica_confirm_note(uint32_t partition_id,
+    uint32_t index, uint32_t seq_low, uint8_t status) {
+    (void)partition_id; (void)index; (void)seq_low; (void)status;
+}
+
 /* The consensus handlers below need a wall-clock reading to restart election
  * timers on an accepted heartbeat or a granted vote (net/consensus.h's
  * "Election timing" block explains why a call count will not do).
@@ -562,13 +575,14 @@ void dspp_migrate_rx(struct DSPPMigratePagePacket* packet, uint16_t len) {
      * stream_migrate_send_partition() is, so exactly one page of one
      * transfer is ever in flight from this node, and a second arming record
      * would imply a concurrency that does not exist. */
-void dspp_env_migrate_send_begin(uint64_t transfer_id, uint32_t node_dest_id,
+void dspp_env_migrate_send_begin(uint16_t begin_opcode, uint64_t transfer_id,
+                                 uint32_t node_dest_id,
                                  uint32_t partition_id, uint32_t env_index,
                                  uint32_t total_pages, const void* record,
                                  uint32_t record_len) {
     struct DSPPEnvMigrateBeginPacket pkt;
     pkt.header.magic           = DSPP_MIGRATE_MAGIC;
-    pkt.header.opcode          = DSPP_MIGRATE_ENV_BEGIN_REQ;
+    pkt.header.opcode          = begin_opcode;
     pkt.header.node_source_id  = (uint16_t)cluster_local_node_id();
     pkt.header.node_dest_id    = node_dest_id;
     pkt.header.transfer_id     = transfer_id;
@@ -652,6 +666,26 @@ void dspp_env_migrate_send_live(uint64_t transfer_id, uint32_t node_dest_id,
     pkt.status          = 0;
     pkt.env_index       = env_index;
     pkt.total_pages     = 0;
+    pkt.record_len      = 0;
+    pkt.frag_index      = 0;
+    dspp_transmit_raw(&pkt, (uint16_t)sizeof(pkt));
+}
+
+void dspp_env_replica_send_live(uint64_t transfer_id, uint32_t node_dest_id,
+                                uint32_t partition_id, uint32_t env_index,
+                                uint32_t seq_low) {
+    struct DSPPEnvMigrateHeader pkt;
+    pkt.magic           = DSPP_MIGRATE_MAGIC;
+    pkt.opcode          = DSPP_MIGRATE_ENV_REPLICA_LIVE_REQ;
+    pkt.node_source_id  = (uint16_t)cluster_local_node_id();
+    pkt.node_dest_id    = node_dest_id;
+    pkt.transfer_id     = transfer_id;
+    pkt.partition_id    = partition_id;
+    pkt.page_index      = 0;
+    pkt.status          = 0;
+    pkt.env_index       = env_index;
+    pkt.total_pages     = seq_low;   /* the capture's sequence, low 32: the
+                                      * BEGIN-only field's second life */
     pkt.record_len      = 0;
     pkt.frag_index      = 0;
     dspp_transmit_raw(&pkt, (uint16_t)sizeof(pkt));
@@ -853,6 +887,37 @@ void dspp_env_migrate_rx(void* buf, uint16_t len) {
      * belongs to; the answer lands on the confirmation entry by identity. */
     if (h->opcode == DSPP_MIGRATE_ENV_LIVE_ACK) {
         env_migrate_live_ack(h->partition_id, h->env_index, h->status);
+        return;
+    }
+
+    /* P3 destination (a), increment 2 — the replica confirm pair. The
+     * question (26) is answered from the DISK directory (never from the
+     * packet), so a stale or replayed question can only produce the honest
+     * answer for today. Destination-side visibility, same promise as the
+     * LIVE branch above: a NONZERO answer (not finalized / an older capture
+     * stands here) is the diagnosis-worthy half and gets a line — the
+     * success line belongs to the source, which logs its own per-peer
+     * outcome once, so one push produces one line per face, not two. */
+    if (h->opcode == DSPP_MIGRATE_ENV_REPLICA_LIVE_REQ) {
+        int rc = env_replica_live_query(h->partition_id, h->env_index,
+                                        h->total_pages);
+        if (rc != 0) {
+            kernel_serial_printf(
+                "[ENV_REPLICA] confirm poll (partition %u, index %u, seq>=%u) "
+                "from node %u -> %d (0 = finalized here; 1 = absent; 2 = only an "
+                "older capture stands)\n",
+                (unsigned)h->partition_id, (unsigned)h->env_index,
+                (unsigned)h->total_pages, (unsigned)h->node_source_id, rc);
+        }
+        dspp_env_migrate_send_ack(DSPP_MIGRATE_ENV_REPLICA_LIVE_ACK,
+                                  h->node_source_id, h->transfer_id,
+                                  h->partition_id, h->env_index, 0, 0,
+                                  (uint8_t)(rc == 0 ? 0 : 1));
+        return;
+    }
+    if (h->opcode == DSPP_MIGRATE_ENV_REPLICA_LIVE_ACK) {
+        env_replica_confirm_note(h->partition_id, h->env_index,
+                                 h->total_pages, h->status);
         return;
     }
 
@@ -1249,7 +1314,16 @@ void dspp_rx_dispatch(void* buf, uint16_t len) {
             return;
         }
 
-        if (opcode >= DSPP_MIGRATE_ENV_BEGIN_REQ && opcode <= DSPP_MIGRATE_ENV_INTENT) {
+        /* The ENV family's gate ends at the LAST opcode of the family, not
+         * at the migration half's: the replica pair (25 BEGIN, 26/27 confirm)
+         * shares this magic and must enter here too. The bound used to stop
+         * at ENV_INTENT (24), so a replica BEGIN fell through to the stream
+         * family below and died silently — the sender timed out on every
+         * peer while the peer logged nothing. Found by the live run
+         * (2026-10-28): the host test delivered frames straight into
+         * dspp_env_migrate_rx() and never crossed this gate. */
+        if (opcode >= DSPP_MIGRATE_ENV_BEGIN_REQ &&
+            opcode <= DSPP_MIGRATE_ENV_REPLICA_LIVE_ACK) {
             dspp_env_migrate_rx(buf, len);   /* length checks live inside */
             return;
         }

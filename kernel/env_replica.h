@@ -187,6 +187,36 @@ struct EnvReplicaRefusal env_replica_last_refusal(void);
 void         env_replica_clear_refusal(void);
 const char*  env_replica_refusal_name(uint32_t code);
 
+/* ─── The SENDER (increment 2) ───────────────────────────────────────────────
+ * Called by env_payload_capture_all() at the instant the record's payload
+ * lands on the LOCAL band, inside capture's quiesce window (sidecars frozen
+ * PARKED, records QUIESCED — exactly the posture the shared stream's gates
+ * demand). Pushes to every active peer in the roster, sequentially: one
+ * transfer at a time keeps the ACK record unambiguous (transfer_id is the
+ * identity in both families, so two in-flight peers would share it).
+ * Sanctioned blocking: intent_begin/end bracket the loop, every ACK wait
+ * pumps failover_sweep_keepalive() — the death-during-create rule applied
+ * to a new block. Returns how many peers CONFIRMED finalization; every
+ * non-confirmation is logged by name (pages refused / staged-but-not-
+ * finalized / never answered). The confirm question and its answer are the
+ * opcodes 26/27 pair below. */
+int env_replica_push(const struct EnvCkptRecord* rec);
+
+/* The receiver half of the confirm pair (dspp.c routes 26 here): reads the
+ * DISK directory, never the packet. 0 = a replica is finalized here for
+ * (partition, index) with seq >= seq_low (this capture or a newer one);
+ * 1 = absent; 2 = only an older capture stands. seq travels as its low 32
+ * bits — sequences are small, the payload head's own rule. */
+int env_replica_live_query(uint32_t partition_id, uint32_t index,
+                           uint32_t seq_low);
+
+/* The source half: dspp.c routes opcode 27 here. Identity-keyed, generation-
+ * counted — a poll captures the generation before it asks and accepts an
+ * answer only if the generation moved AND the identity matches, so a late
+ * answer to an earlier question can never satisfy the current one. */
+void env_replica_confirm_note(uint32_t partition_id, uint32_t index,
+                              uint32_t seq_low, uint8_t status);
+
 /* Host tests only: drop all staging (frees the frames) and clear the
  * latch. The directory lives on the device — the test's RAM disk owns it. */
 void env_replica_reset(void);

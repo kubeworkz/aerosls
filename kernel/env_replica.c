@@ -32,6 +32,8 @@
 #include "timer.h"              /* kernel_tick_counter — the stale bound */
 #include "../drivers/nvme_io.h"
 #include "../net/dspp.h"        /* DSPP_MIGRATE_FRAG_BYTES / _FRAGS_PER_PAGE */
+#include "../net/consensus.h"    /* cluster_roster — who to push to */
+#include "failover.h"            /* failover_sweep_keepalive() in the ACK waits */
 
 /* ─── Compile-time form checks ─────────────────────────────────────────────
  * The directory is two 4 KiB frames written as a pair; a struct that outgrew
@@ -627,3 +629,183 @@ void env_replica_reset(void) {
     er_refusal.b = 0;
 }
 
+/* ─── The SENDER (increment 2) ───────────────────────────────────────────────
+ * The capture-side push: same wire, same page numbering, same retransmission
+ * ladder as a migration — via env_migrate_send_stream(), which takes the
+ * BEGIN opcode (25, so the peer stages it in ITS replica table) and this
+ * module's log tag as parameters. What is new is the LAST mile: staging is
+ * proven by the PAGE ACKs, but finalization (the peer's validate → band
+ * write → publish) happens on the peer's own service tick and can refuse
+ * after every page landed — a refusal the ACKs structurally cannot carry.
+ * So the source ASKS. Opcodes 26/27, fire-and-forget on a bounded retry,
+ * answered from the peer's DISK directory — which is what makes "the copy
+ * is a fact the survivor holds" a checked statement rather than a hopeful
+ * one, and what makes a peer-side NO_DISK_SLOT/SUPERSEDED/IO refusal
+ * visible HERE instead of only in the peer's log. */
+
+static uint64_t er_confirm_gen;        /* bumped by every answer */
+static uint32_t er_confirm_partition;
+static uint32_t er_confirm_index;
+static int      er_confirm_status;      /* 0 = finalized on the peer */
+
+void env_replica_confirm_note(uint32_t partition_id, uint32_t index,
+                              uint32_t seq_low, uint8_t status) {
+    (void)seq_low;   /* the answer already reflects seq (the query compared
+                      * it); the poll validates by identity, not sequence */
+    er_confirm_partition = partition_id;
+    er_confirm_index     = index;
+    er_confirm_status    = (status == 0) ? 0 : 1;
+    er_confirm_gen++;
+}
+
+int env_replica_live_query(uint32_t partition_id, uint32_t index,
+                           uint32_t seq_low) {
+    struct EnvReplicaDirEntry e;
+    if (!env_replica_lookup(partition_id, index, &e)) return 1;  /* absent */
+    if ((uint32_t)e.seq < seq_low)
+        return 2;   /* a replica exists, but an OLDER capture than the one asking */
+    return 0;       /* finalized here, this capture or newer */
+}
+
+/* The bounded confirm: ask, wait for a FRESH answer about THIS identity,
+ * re-ask until the bound or a definitive answer. Only "finalized here" is
+ * definitive: the peer's finalize pass runs on its next service poll — one
+ * tick after staging completes — so the first question can honestly beat
+ * it, and an "absent" reply must RE-ASK rather than end the ladder (live
+ * find, 2026-10-28: the first reply returned from the whole function, so
+ * one question, one "not yet" and the push reported NOT finalized while the
+ * peer finalized a tick later on every peer of every push). Returns 0
+ * finalized, 1 the peer answered not-finalized/older on every ask, 2 never
+ * answered. The pace between asks spans the peer's service poll — the same
+ * period the migration's confirmation walk gets for free by asking once per
+ * sweep period — and the ladder's TOTAL span (6 × 120 ticks ≈ 7 s at
+ * HZ=100) has to cover the peer's finalize itself: a synchronous band
+ * write of the whole payload (1947 pages ≈ 7.6 MiB through emulated NVMe,
+ * seconds — not ticks). Live run, 2026-10-28: at 4 × 5 ticks the ladder
+ * exhausted in ~250 ms while the band write was still in flight — four
+ * honest "absent" answers for a replica that landed moments later. The
+ * block this adds sits inside capture's freeze, where the page stream
+ * already spends minutes: bounded, and small beside it. */
+#define ENV_REPLICA_CONFIRM_TRIES 6u
+#define ENV_REPLICA_CONFIRM_PACE_TICKS 120u
+static int er_confirm_finalized(uint32_t partition_id, uint32_t index,
+                                uint64_t seq, uint32_t dest) {
+    uint64_t tid = ((uint64_t)partition_id << 32) | (uint64_t)index;
+    int saw_answer = 0;   /* any fresh reply: 1 = the peer keeps saying not-yet */
+    for (uint32_t t = 0; t < ENV_REPLICA_CONFIRM_TRIES; t++) {
+        uint64_t gen = er_confirm_gen;
+        dspp_env_replica_send_live(tid, dest, partition_id, index,
+                                   (uint32_t)seq);
+        uint64_t deadline  = kernel_tick_counter + DSPP_MIGRATE_ACK_TIMEOUT_TICKS;
+        uint64_t last_tick = kernel_tick_counter;
+        uint32_t stalled   = 0;
+        while (kernel_tick_counter < deadline) {
+            if (er_confirm_gen != gen &&
+                er_confirm_partition == partition_id &&
+                er_confirm_index == index) {
+                if (er_confirm_status == 0) return 0;   /* finalized: done */
+                saw_answer = 1;                        /* not yet: pace, re-ask */
+                break;
+            }
+            if (kernel_tick_counter != last_tick) {
+                last_tick = kernel_tick_counter;
+                stalled = 0;
+            } else if (++stalled > DSPP_MIGRATE_STALL_SPINS) break;
+            failover_sweep_keepalive();   /* this runs inside capture's freeze:
+                                           * the same "a blocked sender must keep
+                                           * beating" rule the migration waits hold */
+            __asm__ volatile("pause");
+        }
+        /* A lost question is re-asked, exactly like the migration's LIVE
+         * poll — and so is an honest "not yet": pace so the next question
+         * lands in a LATER service-poll cycle of the peer. The stall bound
+         * keeps a host test (whose fake clock only moves when frames fly)
+         * from spinning on a pace that nothing will tick. */
+        {
+            uint64_t pace_deadline = kernel_tick_counter +
+                                     ENV_REPLICA_CONFIRM_PACE_TICKS;
+            uint64_t pace_last = kernel_tick_counter;
+            uint32_t pace_stalled = 0;
+            while (kernel_tick_counter < pace_deadline) {
+                if (kernel_tick_counter != pace_last) {
+                    pace_last = kernel_tick_counter;
+                    pace_stalled = 0;
+                } else if (++pace_stalled > DSPP_MIGRATE_STALL_SPINS) break;
+                failover_sweep_keepalive();
+                __asm__ volatile("pause");
+            }
+        }
+    }
+    return saw_answer ? 1 : 2;
+}
+
+int env_replica_push(const struct EnvCkptRecord* rec) {
+    if (!rec) return 0;
+
+    uint32_t confirmed = 0, peers = 0;
+
+    /* Announce BEFORE the first block, release after the last: this push
+     * runs inside capture's freeze, where this node transmits nothing but
+     * the push's own ACK waits — and the wait loops here cannot save a
+     * sweep that IS the blocked context. env_migrate_intent_begin()'s own
+     * contract ("the announce must be on the wire before the caller
+     * blocks"), reused because it is the same sentence: every intent frame
+     * is also liveness evidence for its sender. */
+    env_migrate_intent_begin();
+
+    for (uint32_t r = 0; r < cluster_roster_count; r++) {
+        if (!cluster_roster[r].active) continue;
+        uint32_t peer = cluster_roster[r].node_id;
+        if (peer == 0 || peer == cluster_local_node_id()) continue;
+        peers++;
+
+        int rc = env_migrate_send_stream(rec, peer,
+                                         DSPP_MIGRATE_ENV_REPLICA_BEGIN_REQ,
+                                         "[ENV_REPLICA]");
+        if (rc != ENV_MIGRATE_OK) {
+            kernel_serial_printf(
+                "[ENV_REPLICA] push (partition %u, index %u, seq %u) to node %u: "
+                "pages NOT confirmed (%s) -- no replica exists there; the "
+                "destination (b) ladder stands on that node.\n",
+                (unsigned)rec->partition_id, (unsigned)rec->index,
+                (unsigned)rec->sequence, (unsigned)peer,
+                env_migrate_status_name(rc));
+            continue;
+        }
+
+        int cf = er_confirm_finalized(rec->partition_id, rec->index,
+                                      rec->sequence, peer);
+        if (cf == 0) {
+            kernel_serial_printf(
+                "[ENV_REPLICA] push (partition %u, index %u, seq %u): FINALIZED on "
+                "node %u -- the copy is a fact that survivor holds.\n",
+                (unsigned)rec->partition_id, (unsigned)rec->index,
+                (unsigned)rec->sequence, (unsigned)peer);
+            confirmed++;
+        } else if (cf == 1) {
+            kernel_serial_printf(
+                "[ENV_REPLICA] push (partition %u, index %u, seq %u) to node %u: "
+                "staged but NOT finalized -- that node's log names the gate; "
+                "treat the replica as ABSENT there.\n",
+                (unsigned)rec->partition_id, (unsigned)rec->index,
+                (unsigned)rec->sequence, (unsigned)peer);
+        } else {
+            kernel_serial_printf(
+                "[ENV_REPLICA] push (partition %u, index %u, seq %u) to node %u: "
+                "no answer to the confirm poll -- staging unverified; treat the "
+                "replica as ABSENT there.\n",
+                (unsigned)rec->partition_id, (unsigned)rec->index,
+                (unsigned)rec->sequence, (unsigned)peer);
+        }
+    }
+
+    env_migrate_intent_end();
+
+    if (peers == 0) {
+        kernel_serial_printf(
+            "[ENV_REPLICA] push (partition %u, index %u): no active peer in the "
+            "roster -- nothing to replicate to.\n",
+            (unsigned)rec->partition_id, (unsigned)rec->index);
+    }
+    return (int)confirmed;
+}

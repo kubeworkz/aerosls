@@ -155,6 +155,17 @@ static inline const char* env_migrate_status_name(int status) {
  * being staged is refused rather than clobbering the slot in flight. */
 int env_migrate_send(uint32_t partition_id, uint32_t index, uint32_t dest_node_id);
 
+/* The page stream BOTH senders stand on (env_migrate.c owns the body —
+ * posture gates, the BEGIN round trip, the fragment retransmit ladder).
+ * begin_opcode picks the receiver's table (18 migration / 25 replica) and
+ * family tags every log line, so a replica push never reads as an ownership
+ * handoff in an operator's grep. Returns ENV_MIGRATE_* by name; does NOT
+ * touch env_migrate_last_status() — the caller stores what it needs.
+ * The caller holds the freeze over the sidecars this reads. */
+int env_migrate_send_stream(const struct EnvCkptRecord* rec,
+                            uint32_t dest_node_id, uint16_t begin_opcode,
+                            const char* family);
+
 /* The status of the most recent env_migrate_send() on this node. */
 int env_migrate_last_status(void);
 

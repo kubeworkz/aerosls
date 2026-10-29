@@ -2393,6 +2393,101 @@ to receive).
 
 ---
 
+### Findings addendum — what landed, increment 14 (the capture-side sender; the confirm question answered)
+
+Destination (a)'s increment 2 — and with it the answer to the thirteenth
+addendum's one open question: **how the source learns the finalize
+outcome. The answer: it asks.** A LIVE-style confirm pair (opcodes 26/27,
+the migration LIVE family's shape with its own opcodes so the two
+families' confirmations can never land on each other's entry): after
+every page is ACKed the source sends `REPLICA_LIVE_REQ` carrying
+`(partition, index, seq)` and the peer answers from its **disk
+directory** — `0` finalized (seq >= the asker's), `1` absent, `2` only an
+older capture stands. Four tries, fire-and-forget, each wait pumping the
+sweep keepalive. Staging is what the ACKs prove; finalization is what
+the poll proves — and a peer-side `NO_DISK_SLOT`/`SUPERSEDED`/`IO`
+refusal is now visible at the source by name instead of only in the
+peer's log.
+
+**The mechanism, as landed.** The push is not a fork of the migration
+sender — it is `env_migrate_send_stream()`, the migration's own
+BEGIN + fragment + retransmit body extracted with exactly two
+parameters: the **BEGIN opcode** (25 stages in the replica receiver, 18
+in the migration receiver; the page family stays shared and follows
+whichever table staged) and the **log tag** (a replica push must never
+read as an ownership handoff in an operator's grep). `env_replica_push()`
+calls it once per active roster peer — sequentially, because
+`transfer_id` is the identity in both families and two in-flight peers
+would share one ACK record — bracketed by `env_migrate_intent_begin/end`
+(the death-during-create sanction: the announce is on the wire before
+the first block, released the moment the loop ends).
+
+The hook is the thirteenth addendum's own sentence, literally:
+`env_payload_capture_all()` calls the push at the `captured++` site, so
+the record crosses at the same instant its payload lands on the local
+band, **inside** `env_ckpt_quiesce_for_capture`'s window — records
+QUIESCED, sidecars frozen PARKED, which is precisely the posture the
+stream's gates demand (an already-paused partition passes with
+`PARTITION_PAUSED`, the control plane's own records are refused
+`UNQUIESCED` by the same rule migration holds). `env_payload.c` keeps a
+**weak** default for the push so its host test links without the
+replica subsystem, exactly as dspp.c does.
+
+**Teeth.** `tests/env_replica_host_test.c` grew section I: **75 checks**,
+the whole path loop-backed through the real dispatch in one process —
+`push → stream → opcode 25 → staging → fragment ACKs → the peer's own
+tick finalizes → opcode 26 → confirm answer → push returns 1` — with the
+record's regions AND durable extent byte-exact in the peer's band (the
+full wire numbering), an unquiesced record refused at the door, and the
+confirm's honesty pinned both ways: a peer whose finalizer never ran
+answers *staged-but-not-finalized* and the push counts it ABSENT. The
+loopback delivers frames from the sender's own ACK wait (never from
+inside the transmit — `dspp_transmit_raw()` drops nested frames, and the
+real RX path delivers while a sender waits anyway). The static guard
+grew to **18 claims**: the hook, the weak default, the shared stream and
+its `begin_opcode` passthrough, both confirm opcodes and their routes,
+both weak defaults, the push arm in the test. Verified suites: the host
+suite and the guards green; `env_migrate_host_test` (285) and
+`env_payload_host_test` (46) re-run green across the extraction.
+
+**Stated boundary, settled by the live run (2026-10-28).** A 3-node TCG
+cluster on a fresh ISO: `partition create` + `env create` through
+`aeroslsctl`, then `POST /api/checkpoint`. Result — **eight `FINALIZED on
+node` lines** (every environment × both peers), zero "NOT finalized", both
+peers holding band slots 0–3 with the same `crc=0x0c5915fc` the source
+captured. The run found two defects the loopback could not see, each now
+fixed and pinned:
+
+1. **The dispatch gate.** `dspp_rx_dispatch()` routed only opcodes
+   `[ENV_BEGIN_REQ … ENV_INTENT]` = 18–24 into the ENV family: opcodes
+   25–27 fell through to the stream family and died silently. Every push
+   timed out at the BEGIN with the peers logging *nothing* — and no host
+   test could see it, because the test hand-delivered frames straight
+   into `dspp_env_migrate_rx()`, one call below the gate. The range now
+   ends at `DSPP_MIGRATE_ENV_REPLICA_LIVE_ACK`, the test delivers through
+   `dspp_rx_dispatch()` (the real entry), and guard tooth 3 greps the
+   gate itself.
+2. **The confirm ladder ended on its first answer.** The wait's
+   `return er_confirm_status` exited the whole function, so one honest
+   "not yet" meant exactly one question per push. Re-asking alone was
+   still not enough: 4 asks × 5 ticks ≈ 250 ms at HZ=100, versus the
+   peer's finalize being a *synchronous band write of the whole payload*
+   (1947 pages ≈ 7.6 MiB through emulated NVMe — seconds, not ticks).
+   The first checkpoint showed it precisely: peers answered `absent`
+   four times and published the entry a moment later. Only
+   "finalized here" is definitive now; anything else is paced and
+   re-asked (6 × 120 ticks ≈ 7 s total, small beside the page stream
+   already blocking inside the same freeze), and test claim **I11b**
+   pins that a "not yet" peer receives more than one question.
+
+The earlier boots also explained why the first two environments *looked*
+done at first ask: their directory entries were written by the previous
+boot, and a same-`seq` entry answers 0 — "this capture or a newer one" —
+which is the rule the protocol already states, and the byte-identical
+`crc` across boots shows the replica really was the same capture.
+
+---
+
 ## 8. Capacity for the first cut
 
 v0.1 §11 sized M1 at **four concurrent environments per node** and named the ceilings: `PROC_MAX` 16 (two slots per environment), `SIDECAR_REGISTRY_MAX` 16, `ENV_CONSOLE_MAX` 8. v0.2 adds its own, all of which are new *persistent* consumers rather than new process slots:

@@ -157,36 +157,53 @@ static int env_migrate_read_image_page(uint32_t k, uint8_t* buf) {
     return 0;
 }
 
-/* ─── Sender ──────────────────────────────────────────────────────────────── */
-
-int env_migrate_send(uint32_t partition_id, uint32_t index, uint32_t dest_node_id) {
-    env_migrate_status = ENV_MIGRATE_OK;
+/* ─── The shared page stream ─────────────────────────────────────────────────
+ * The BEGIN + fragment path that `env_migrate_send()` and the replica push
+ * (kernel/env_replica.c, P3 destination (a) increment 2) both stand on:
+ * identical posture gates, identical retransmission ladder, identical ACK
+ * waits — because it is the same wire and the same payload numbering. The
+ * two differences are PARAMETERS, not forks:
+ *
+ *   begin_opcode   which receiver table stages the transfer (18 = the
+ *                  migration receiver, 25 = the replica receiver). The
+ *                  receiver's OWN opcode decides, so a replica can never
+ *                  be staged as a migration — which its sweep would then
+ *                  try to RESTORE — and a migration can never occupy a
+ *                  replica's band slot.
+ *   family         the tag every log line below prints first: a migration
+ *                  carries an ownership handoff, a replica push does not,
+ *                  and an operator greps that tag to know which contract
+ *                  was in flight when a gate refused.
+ *
+ * It returns ENV_MIGRATE_* by name and does NOT touch env_migrate_status:
+ * that getter belongs to env_migrate_send(), which stores the returned
+ * code, while the replica push keeps its own account. Both callers hold
+ * the freeze over the sidecars this reads — migration under the
+ * partition's pause, the replica push inside capture's
+ * env_ckpt_quiesce_for_capture window — so the QUIESCED gate below is the
+ * same sentence for both. */
+int env_migrate_send_stream(const struct EnvCkptRecord* rec,
+                            uint32_t dest_node_id, uint16_t begin_opcode,
+                            const char* family) {
+    if (!rec) return ENV_MIGRATE_REFUSE_NO_RECORD;
+    if (family == 0) family = "[ENV_MIGRATE]";
 
     /* The same two identity guards partition_migrate() opens with: the
      * system partition never moves, and node 0 is the 'uninitialized'
-     * sentinel, not a destination. An environment's migration inherits the
-     * partition's rules rather than inventing softer ones. */
-    if (partition_id == PARTITION_SYSTEM) {
-        env_migrate_status = ENV_MIGRATE_REFUSE_SYSTEM;
-        return env_migrate_status;
-    }
-    if (dest_node_id == 0 || dest_node_id == cluster_local_node_id()) {
-        env_migrate_status = ENV_MIGRATE_REFUSE_DEST;
-        return env_migrate_status;
-    }
+     * sentinel, not a destination. A replica inherits the partition's
+     * rules too — copying the control plane's environment to a peer is a
+     * question about ownership this phase does not answer. */
+    uint32_t partition_id = rec->partition_id;
+    uint32_t index        = rec->index;
+    if (partition_id == PARTITION_SYSTEM) return ENV_MIGRATE_REFUSE_SYSTEM;
+    if (dest_node_id == 0 || dest_node_id == cluster_local_node_id())
+        return ENV_MIGRATE_REFUSE_DEST;
 
-    const struct EnvCkptRecord* rec = env_ckpt_find(partition_id, index);
-    if (!rec) {
-        env_migrate_status = ENV_MIGRATE_REFUSE_NO_RECORD;
-        return env_migrate_status;
-    }
     /* A capture that never froze the partition describes a moving target —
      * env_ckpt's own restore rule 2, enforced at the send end too: what would
      * cross is bytes torn between two writes. */
-    if ((rec->flags & ENV_CKPT_FLAG_QUIESCED) == 0) {
-        env_migrate_status = ENV_MIGRATE_REFUSE_UNQUIESCED;
-        return env_migrate_status;
-    }
+    if ((rec->flags & ENV_CKPT_FLAG_QUIESCED) == 0)
+        return ENV_MIGRATE_REFUSE_UNQUIESCED;
 
     /* The image-window tail (env_payload.h's shared list), collected under
      * the caller's freeze so the frames cannot move between this walk and
@@ -198,20 +215,19 @@ int env_migrate_send(uint32_t partition_id, uint32_t index, uint32_t dest_node_i
                                                       &img_err);
     if (img_err == 2) {
         kernel_serial_printf(
-            "[ENV_MIGRATE] env (partition %u, index %u): more image-window pages than "
+            "%s env (partition %u, index %u): more image-window pages than "
             "the %u-page tail ceiling -- transfer abandoned, source untouched.\n",
-            (unsigned)partition_id, (unsigned)index, (unsigned)ENV_MIGRATE_IMAGE_MAX);
-        env_migrate_status = ENV_MIGRATE_REFUSE_READ;
-        return env_migrate_status;
+            family, (unsigned)partition_id, (unsigned)index,
+            (unsigned)ENV_MIGRATE_IMAGE_MAX);
+        return ENV_MIGRATE_REFUSE_READ;
     }
     if (img_err == 1) {
         kernel_serial_printf(
-            "[ENV_MIGRATE] env (partition %u, index %u): SOME but not all named sidecars "
+            "%s env (partition %u, index %u): SOME but not all named sidecars "
             "are live here -- a half-environment's image cannot be staged, transfer "
             "abandoned, source untouched.\n",
-            (unsigned)partition_id, (unsigned)index);
-        env_migrate_status = ENV_MIGRATE_REFUSE_READ;
-        return env_migrate_status;
+            family, (unsigned)partition_id, (unsigned)index);
+        return ENV_MIGRATE_REFUSE_READ;
     }
     if (env_mig_img_count == 0) {
         /* The degenerate record-only shape: a host test's world, and the
@@ -219,9 +235,9 @@ int env_migrate_send(uint32_t partition_id, uint32_t index, uint32_t dest_node_i
          * than silent, so a LIVE transfer that lands here is visible in the
          * transcript as "regions and extent only". */
         kernel_serial_printf(
-            "[ENV_MIGRATE] env (partition %u, index %u): no live sidecar to collect an "
+            "%s env (partition %u, index %u): no live sidecar to collect an "
             "image-window tail from -- sending region and extent pages only.\n",
-            (unsigned)partition_id, (unsigned)index);
+            family, (unsigned)partition_id, (unsigned)index);
     }
     /* Posture gate, the reboot capture's own rule (env_payload.h's
      * register rule): the pour resumes the instant these bytes describe,
@@ -232,12 +248,11 @@ int env_migrate_send(uint32_t partition_id, uint32_t index, uint32_t dest_node_i
     for (uint32_t k = 0; k < env_mig_img_count; k++) {
         if (!env_payload_proc_parked(env_mig_img_pd[k])) {
             kernel_serial_printf(
-                "[ENV_MIGRATE] env (partition %u, index %u): a sidecar was frozen "
+                "%s env (partition %u, index %u): a sidecar was frozen "
                 "mid-compute, not parked -- the staged instant cannot be resumed, "
                 "transfer abandoned, source untouched.\n",
-                (unsigned)partition_id, (unsigned)index);
-            env_migrate_status = ENV_MIGRATE_REFUSE_UNQUIESCED;
-            return env_migrate_status;
+                family, (unsigned)partition_id, (unsigned)index);
+            return ENV_MIGRATE_REFUSE_UNQUIESCED;
         }
     }
     uint32_t payload_pages = env_migrate_payload_pages(rec);
@@ -257,8 +272,9 @@ int env_migrate_send(uint32_t partition_id, uint32_t index, uint32_t dest_node_i
         /* Send at the TOP of each attempt, exactly as stream.c does: the
          * first send happens here rather than before the loop, so the last
          * retransmission is never a frame nobody waits for. */
-        dspp_env_migrate_send_begin(transfer_id, dest_node_id, partition_id, index,
-                                    total_pages, rec, (uint32_t)sizeof(*rec));
+        dspp_env_migrate_send_begin(begin_opcode, transfer_id, dest_node_id,
+                                    partition_id, index, total_pages, rec,
+                                    (uint32_t)sizeof(*rec));
         uint64_t deadline  = kernel_tick_counter + DSPP_MIGRATE_ACK_TIMEOUT_TICKS;
         uint64_t last_tick = kernel_tick_counter;
         uint32_t stalled   = 0;
@@ -278,12 +294,12 @@ int env_migrate_send(uint32_t partition_id, uint32_t index, uint32_t dest_node_i
 
     if (!begin_ok) {
         kernel_serial_printf(
-            "[ENV_MIGRATE] env (partition %u, index %u): node %u never confirmed "
+            "%s env (partition %u, index %u): node %u never confirmed "
             "the BEGIN%s -- transfer abandoned, source untouched.\n",
-            (unsigned)partition_id, (unsigned)index, (unsigned)dest_node_id,
+            family, (unsigned)partition_id, (unsigned)index,
+            (unsigned)dest_node_id,
             dspp_migrate_nacked() ? " (refused: no staging slot)" : "");
-        env_migrate_status = ENV_MIGRATE_REFUSE_BEGIN;
-        return env_migrate_status;
+        return ENV_MIGRATE_REFUSE_BEGIN;
     }
 
     /* ── Every page, confirmed fragment by fragment ──────────────────────
@@ -295,13 +311,12 @@ int env_migrate_send(uint32_t partition_id, uint32_t index, uint32_t dest_node_i
                     : env_migrate_read_image_page(p - payload_pages, send_page_buf);
         if (page_rd != 0) {
             kernel_serial_printf(
-                "[ENV_MIGRATE] env (partition %u, index %u): source page %u "
+                "%s env (partition %u, index %u): source page %u "
                 "unreadable -- transfer abandoned at %u of %u page(s), source "
                 "untouched.\n",
-                (unsigned)partition_id, (unsigned)index, (unsigned)p,
+                family, (unsigned)partition_id, (unsigned)index, (unsigned)p,
                 (unsigned)p, (unsigned)total_pages);
-            env_migrate_status = ENV_MIGRATE_REFUSE_READ;
-            return env_migrate_status;
+            return ENV_MIGRATE_REFUSE_READ;
         }
 
         int page_ok = 0;
@@ -334,23 +349,49 @@ int env_migrate_send(uint32_t partition_id, uint32_t index, uint32_t dest_node_i
 
         if (!page_ok) {
             kernel_serial_printf(
-                "[ENV_MIGRATE] env (partition %u, index %u): page %u of %u never "
+                "%s env (partition %u, index %u): page %u of %u never "
                 "confirmed%s -- transfer abandoned, source untouched; the "
                 "destination's partial slot is droppable.\n",
-                (unsigned)partition_id, (unsigned)index, (unsigned)p,
-                (unsigned)total_pages,
+                family, (unsigned)partition_id, (unsigned)index,
+                (unsigned)p, (unsigned)total_pages,
                 dspp_migrate_nacked() ? " (destination refused)" : "");
-            env_migrate_status = ENV_MIGRATE_REFUSE_PAGE;
-            return env_migrate_status;
+            return ENV_MIGRATE_REFUSE_PAGE;
         }
     }
 
     kernel_serial_printf(
-        "[ENV_MIGRATE] env (partition %u, index %u): all %u page(s) confirmed "
+        "%s env (partition %u, index %u): all %u page(s) confirmed "
         "by node %u; source untouched, awaiting the caller's decision.\n",
-        (unsigned)partition_id, (unsigned)index, (unsigned)total_pages,
+        family, (unsigned)partition_id, (unsigned)index, (unsigned)total_pages,
         (unsigned)dest_node_id);
     return ENV_MIGRATE_OK;
+}
+
+/* The migration's own entry: identity guards with the getter's semantics
+ * (status set on EVERY refusal, which the stream's bare returns do not),
+ * then the shared stream under this family's opcode and tag. */
+int env_migrate_send(uint32_t partition_id, uint32_t index, uint32_t dest_node_id) {
+    env_migrate_status = ENV_MIGRATE_OK;
+
+    if (partition_id == PARTITION_SYSTEM) {
+        env_migrate_status = ENV_MIGRATE_REFUSE_SYSTEM;
+        return env_migrate_status;
+    }
+    if (dest_node_id == 0 || dest_node_id == cluster_local_node_id()) {
+        env_migrate_status = ENV_MIGRATE_REFUSE_DEST;
+        return env_migrate_status;
+    }
+
+    const struct EnvCkptRecord* rec = env_ckpt_find(partition_id, index);
+    if (!rec) {
+        env_migrate_status = ENV_MIGRATE_REFUSE_NO_RECORD;
+        return env_migrate_status;
+    }
+
+    env_migrate_status = env_migrate_send_stream(rec, dest_node_id,
+                                                 DSPP_MIGRATE_ENV_BEGIN_REQ,
+                                                 "[ENV_MIGRATE]");
+    return env_migrate_status;
 }
 
 /* ─── The migration's environment step ─────────────────────────────────────

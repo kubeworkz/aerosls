@@ -43,6 +43,17 @@
 #include "timer.h"          /* kernel_tick_counter */
 #include "smp.h"            /* smp_uniprocessor_tick() — the wait's own service pump */
 #include "failover.h"       /* failover_sweep_keepalive() — the parked wait runs on the sweep too */
+#include "env_replica.h"     /* P3 destination (a): env_replica_push(), the capture-side wire push */
+
+/* P3 destination (a), increment 2: the strong definition lives in
+ * kernel/env_replica.c; this weak default keeps THIS file's dependency
+ * surface where it was — tests/env_payload_host_test.c links the payload
+ * layer without the replica subsystem and gets "pushed to zero peers",
+ * never an undefined symbol. The kernel link takes the strong one. */
+__attribute__((weak)) int env_replica_push(const struct EnvCkptRecord* rec) {
+    (void)rec;
+    return 0;
+}
 
 /* USER_PROC_CODE_BASE — cap.c's literal for the image/stack window. Kept
  * as a local mirror; tests/env_checkpoint_restore_check.sh pins it against
@@ -681,6 +692,18 @@ uint32_t env_payload_capture_all(void) {
             (unsigned)n_pages, (unsigned)console_len,
             (unsigned)head.bytes, (unsigned)slot,
             (unsigned)rec->sequence);
+
+        /* P3 destination (a), increment 2: the SAME instant this record's
+         * payload lands on the local band, its record and pages go to every
+         * registered peer — inside the quiesce that owns the freeze this
+         * push's posture gates demand (records QUIESCED, sidecars frozen
+         * PARKED, both verified by env_ckpt_quiesce_for_capture above).
+         * Best-effort by contract, exactly like the payload I/O above: the
+         * push logs every non-confirmation by name and returns, never fails
+         * the local capture and never keeps a tenant frozen — a peer
+         * without a copy is destination (b)'s ladder to report on THAT
+         * node, not a reason to hold the capture open. */
+        (void)env_replica_push(rec);
     }
 
     if (ep_dir_write(ents, n_ents) != 0) {
