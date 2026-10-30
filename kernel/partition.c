@@ -34,7 +34,22 @@ struct SLSPartitionOwner  partition_owner_table[PARTITION_MAX];
  * does. BSS zero-init = "not paused", the correct default for every
  * partition until partition_pause() is explicitly called, same
  * backward-compatible-by-construction discipline as every other LPAR
- * phase's new state. */
+ * phase's new state.
+ *
+ * INVARIANT — why every path that installs or removes a row also owns
+ * this flag: the array is indexed by SLOT, so the bit describes whatever
+ * partition currently occupies that slot and nothing else. A slot freed
+ * with the bit still set hands that pause to the next partition landing
+ * there, which is how a node that paused NOTHING refused every
+ * `env create` for a brand-new partition — `[ALLOC_REGION] CAP_EPERM:
+ * target partition N is paused — cannot charge it`, measured on a live
+ * cluster after a migration destination (left paused BY DESIGN by
+ * env_migrate.c) saw its partition destroyed and the id reused. The
+ * refusal even surfaced as `frame pool exhausted` at the shell boundary,
+ * because ENV_ERR_NOMEM is what the manager maps any charge failure to.
+ * partition_destroy() already did this on the node executing it; the four
+ * paths below are the ones that mutate partition_table[i].active without
+ * having done it. */
 static uint8_t partition_paused[PARTITION_MAX];
 
 /* ─── String helpers (no libc dependency, same discipline as every other
@@ -78,6 +93,12 @@ uint32_t partition_create(const char* name) {
             partition_table[i].partition_id = (uint32_t)i;
             pt_strcpy(partition_table[i].name, name, PARTITION_NAME_LEN);
             partition_table[i].active = 1;
+            /* Taking a free slot installs a NEW partition there, and the
+             * slot may have been freed by a path that does not clear this
+             * bit (see the array's invariant comment). It starts RUNNING:
+             * nobody paused this partition. Same rule, same place, as
+             * partition_destroy()'s clearing on the way out. */
+            partition_paused[i] = 0;
 
             /* Phase 2 (Multi-Node): a newly created partition is owned by
              * this node by default -- see the header comment on why this
@@ -852,6 +873,16 @@ void partition_sync_upsert(uint32_t partition_id, uint32_t owner_node_id,
     if (!had) {
         partition_table[partition_id].partition_id = partition_id;
         partition_table[partition_id].active = 1;
+        /* A fresh row on THIS node: the id may carry a pause left over
+         * from whoever occupied the slot before (pause is local,
+         * non-persisted state — a migration destination keeps its pause
+         * while the rest of the cluster runs). The partition being
+         * learned has never been paused here, so installing it must not
+         * birth it paused. Only on !had: a re-announce of a row this node
+         * already carries (the periodic re-announce, every ~10s) must not
+         * touch the flag, or an operator's pause would be erased by the
+         * next tick. */
+        partition_paused[partition_id] = 0;
     }
     pt_strcpy(partition_table[partition_id].name, name, PARTITION_NAME_LEN);
 
@@ -901,6 +932,11 @@ void partition_sync_withdraw(uint32_t partition_id, uint32_t source_node_id) {
     }
 
     partition_table[partition_id].active = 0;
+    /* The row is gone and its pause went with it — the bit describes the
+     * slot's occupant, and there is none now. This is the clear whose
+     * absence let a later partition reusing this id be born paused on
+     * this node. */
+    partition_paused[partition_id] = 0;
     for (int i = 0; i < PARTITION_MAX; i++) {
         if (partition_owner_table[i].active &&
             partition_owner_table[i].partition_id == partition_id) {
@@ -970,9 +1006,11 @@ void partition_sync_ownedset(uint32_t source_node_id, uint32_t generation,
 
         /* Stale: the source no longer owns this partition. Remove the row
          * AND the owner row, and persist the removal -- an unpersisted GC
-         * would resurrect the ghost at the very next reboot. */
+         * would resurrect the ghost at the very next reboot. The pause bit
+         * leaves with the row for the same reason withdraw clears it. */
         partition_table[part_id].active = 0;
         partition_owner_table[i].active = 0;
+        partition_paused[part_id] = 0;
         partition_persist_dirty = 1;
         kernel_serial_printf(
             "[PARTITION] sync: partition %u (owner node %u) no longer owned -- "
