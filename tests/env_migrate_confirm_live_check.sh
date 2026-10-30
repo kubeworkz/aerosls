@@ -58,6 +58,49 @@
 #     nobody on either node — every line above still passes, which is why
 #     this arm exists.
 #
+# ─── Why step 2b clears residue first ──────────────────────────────────
+# Two failures, both caused by leftovers from earlier runs, and both
+# invisible until this guard spent rounds on them:
+#
+# 1. THE PLACEMENT WATERMARK. The destination cannot choose where its
+#    rebuilt environment lands. Placement on this OS is a deterministic
+#    function of the ASCENDING first-fit watermark (kernel/frame_pool.c:
+#    alloc_raw_frame() and the contiguous scan both start at the bottom
+#    on every call), and the staged payload carries RAW interior pointers
+#    into identity-mapped regions — so the restore's fresh create must
+#    reproduce the SOURCE's recorded bases exactly, or env_migrate.c's
+#    placement gate refuses the pour (ENV_MIGRATE_REFUSE_PLACEMENT,
+#    "fresh environment landed off the staged bases"). ONE environment
+#    left behind on either node holds low runs, every base moves
+#    downrange, and the migrate is then byte-confirmed while the restore
+#    still refuses: "region kind 1: staged base 0x123a5000 frames 1024,
+#    fresh base 0x12a54000 frames 1024" — a delta exactly the size of
+#    the residue, with the slot dropped and the LIVE polls answering
+#    "not yet" until the guard times out.
+#
+# 2. THE CAPTURE BUFFER. /api/shell/exec answers from an 8 KiB serial
+#    capture (SHELL_EXEC_OUT_CAP), bounds-checked and SILENTLY
+#    truncating — everything printed after the first 8 KiB of a command
+#    is discarded, and it never reaches the node's serial log either.
+#    Every stale row in the partition table is re-announced on every
+#    sync sweep, so a cluster carrying twenty leftovers floods that
+#    buffer during the migrate and the step-5 result line
+#    ("migrated partition N: node A -> node B") is gone before the guard
+#    can read it — which reads as "the migrate never ran" when it ran
+#    fine. Caught the same way: the response's last lines were
+#    [DSPP-CKPT]/[SERVICE] noise, and node1.log had no migrate line
+#    because capture suppresses the UART.
+#
+# So the guard clears residue on EVERY node before it creates anything:
+# it ends every environment it finds (other than the env_id 0 consoles
+# an E3 boot spawns, which are part of every node's identical boot
+# layout) and destroys every non-system partition row, then asserts the
+# precondition the gate actually compares — both nodes reporting the
+# SAME ram_allocated_frames, i.e. identical allocator histories. The
+# residue is TEST STATE, not the property under test; this guard drives
+# (and never kills) its cluster's nodes, and it destroys nothing it did
+# not find already sitting there.
+#
 # ─── Why it does not launch a cluster ─────────────────────────────────
 # The same contract as partition_reannounce_live_check.sh: this guard
 # drives (and never kills) its cluster's nodes, so it only ever touches
@@ -102,6 +145,8 @@ WAIT_TEARDOWN=180   # the source's poll + destroy RTT + reclamation
 WAIT_ENVLIST=60     # the console registry emptying on the source
 WAIT_CONSOLE=90     # a sidecar draining and echoing one line (increment 10's
                     # live arm: the console must FOLLOW the environment)
+WAIT_DRAIN=60       # step 2b: residue releasing its frames + the partition
+                    # tables settling (a pass or two, each a destroy + a poll)
 
 die()  { echo; echo "ABORT: $*" >&2; exit 2; }
 fail() { echo; echo "FAIL  $*"; exit 1; }
@@ -203,6 +248,109 @@ if not rows:
 PY
 }
 
+# ─── step 2b's observables ──────────────────────────────────────────────
+# /api/partitions carries every node's OWN frame_usage for each row of the
+# cluster-replicated table, so one read answers both questions residue
+# raises: which rows this node still carries, and what still holds frames
+# here. /api/metrics carries ram_allocated_frames — the allocator history
+# the placement gate is a function of.
+partition_rows() {      # $1 = port -> "id:frame_usage ..." (non-system rows)
+    get200 "$1" /api/partitions \
+        || die "node $(( $1 - HTTP_BASE )) did not answer /api/partitions while reading residue."
+    python3 - "$FETCH_BODY" <<'PY'
+import json, sys
+try:
+    rows = json.loads(sys.argv[1]).get("partitions", [])
+except Exception:
+    rows = []
+print(" ".join("%s:%s" % (r.get("id", 0), r.get("frame_usage", 0) or 0)
+               for r in rows if int(r.get("id", 0)) != 0))
+PY
+}
+
+allocated_frames() {    # $1 = port -> ram_allocated_frames
+    get200 "$1" /api/metrics \
+        || die "node $(( $1 - HTTP_BASE )) did not answer /api/metrics while checking allocator parity."
+    jget "$FETCH_BODY" ram_allocated_frames
+}
+
+# clear_residue <port> — end every environment this node binds, then drop
+# every non-system partition row it still carries. Idempotent (both readings
+# are empty on a clean node) and bounded; the FAIL below is the only path
+# that leaves residue standing, and it says so instead of letting the
+# placement gate refuse three minutes later.
+clear_residue() {        # $1 = port
+    local node port="$1" pair pid eid row rows ids id deadline said=0
+    node=$(( port - HTTP_BASE ))
+
+    # Environments first: `env destroy` hands an environment's frames back
+    # on its own, and prints which one it ended. env_id 0 consoles are E3
+    # boot spawns (user/shell.c) — part of every node's boot layout,
+    # identical on both, and not addressable — so they are left standing.
+    for pair in $("$CTL" --host "localhost:$port" "${TOKEN_ARGS[@]}" \
+                      shell env list 2>/dev/null \
+                  | sed -n 's/.*env partition=\([0-9][0-9]*\) env_id=\([1-9][0-9]*\).*/\1\/\2/p'); do
+        pid="${pair%/*}"; eid="${pair#*/}"
+        "$CTL" --host "localhost:$port" "${TOKEN_ARGS[@]}" \
+            shell env destroy "$pid" "$eid" >/dev/null 2>&1 || true
+        echo "   node $node: ended the leftover environment (partition $pid, env $eid)"
+    done
+
+    # Then the partition rows. Two reasons, and the second is the one that
+    # never showed up in the failure itself (the header's account):
+    #   * frames — a row still charging frames holds the low runs, and the
+    #     restore's fresh create then lands off the staged bases;
+    #   * noise — every row still in the table is re-announced every sweep
+    #     and eats the 8 KiB shell capture the migrate's result line needs.
+    # A row is destroyed on the node holding it; the tables settle after a
+    # pass or two, so this loops until this node reports nothing but the
+    # system partition.
+    deadline=$(( $(date +%s) + WAIT_DRAIN ))
+    while :; do
+        rows="$(partition_rows "$port")"
+        [ -z "$rows" ] && break
+        [ "$(date +%s)" -ge "$deadline" ] && break
+        ids=""
+        for row in $rows; do ids="$ids ${row%:*}"; done
+        [ "$said" -eq 0 ] && echo "   node $node: destroying the leftover partition row(s):$ids" && said=1
+        for id in $ids; do
+            "$CTL" --host "localhost:$port" "${TOKEN_ARGS[@]}" \
+                shell partition destroy "$id" >/dev/null 2>&1 || true
+        done
+        sleep "$POLL"
+    done
+    rows="$(partition_rows "$port")"
+    [ -z "$rows" ] || fail "node $node still carries leftover partition row(s) ('$rows') after
+       ${WAIT_DRAIN}s of destroying them. Residue there moves the placement watermark
+       off the boot watermark AND floods the 8 KiB shell capture, so both halves of
+       what follows are untrustworthy. The node's serial log ($CLUSTER_DIR/node$node.log)
+       names what is holding them."
+}
+
+# assert_parity <when> — the precondition env_migrate.c's placement gate
+# compares, checked at the moment it is load-bearing. Two nodes with the
+# same ram_allocated_frames have done the same allocation work, so the
+# ascending first-fit scan will hand out the same bases on both — which is
+# what the staged payload's raw interior pointers require.
+assert_parity() {        # $1 = when (a phrase for the failure line)
+    local src dst
+    src="$(allocated_frames "$L_PORT")"
+    dst="$(allocated_frames "$D_PORT")"
+    [ -n "$src" ] && [ -n "$dst" ] || die "could not read ram_allocated_frames (source '$src', destination '$dst')."
+    if [ "$src" != "$dst" ]; then
+        fail "the source and the destination disagree about their frame allocator: $src vs $dst
+       allocated frames $1. Placement on this OS is a deterministic function of the
+       ascending first-fit watermark (kernel/frame_pool.c scans from frame 1 on every
+       call) and the staged payload carries raw interior pointers into those regions,
+       so the destination's fresh create would land OFF the recorded bases and
+       env_migrate.c's placement gate would refuse the pour ('fresh environment landed
+       off the staged bases'). Step 2b clears residue to make these equal; if they
+       still differ, something is allocating on one node only — the node's log and
+       /api/partitions frame_usage will name it."
+    fi
+    echo "   both nodes report $src allocated frames — the histories the placement gate compares match"
+}
+
 # new_bytes <file> <offset> -- only what the file gained since the offset,
 # so every log assertion below is scoped to THIS migrate and cannot pass
 # on a line some earlier run left behind.
@@ -259,6 +407,18 @@ DST_LOG="$CLUSTER_DIR/node$other.log"
 [ -f "$ADP_LOG" ] || die "$ADP_LOG not found -- $CLUSTER_DIR is not this cluster's dir (AEROSLS_CLUSTER_DIR)."
 [ -f "$DST_LOG" ] || die "$DST_LOG not found."
 
+# ─── 2b. clear residue: both ends must sit at their boot watermark ─────
+# The header carries the full account of the two failures this prevents
+# (the placement gate refusing a pour whose fresh create landed past the
+# recorded bases; the 8 KiB shell capture losing the migrate's result line
+# to stale rows' sync traffic). Every node, not just the two used below:
+# a row any node still carries is re-announced to the others, so clearing
+# only the source and destination would not settle the tables.
+echo "==> clearing residue on every node (the placement gate compares allocator histories)"
+for id in $NODE_IDS; do
+    clear_residue $(( HTTP_BASE + id ))
+done
+
 # ─── 3. create the partition on the source; the destination learns it ─
 echo "==> creating partition '$NAME' on node $leader"
 create_resp="$("$CTL" --host "localhost:$L_PORT" "${TOKEN_ARGS[@]}" \
@@ -293,6 +453,16 @@ echo "   $learned"
 # ─── 4. create the environment on the source ──────────────────────────
 # The pre-gate for everything below: an env create that fails here would
 # make every later "the environment moved" line vacuous.
+#
+# And this is the exact moment the placement precondition must hold: the
+# bases recorded in the payload are decided by the create below, and the
+# destination's restore create must reproduce them later from the same
+# history. `partition create` above charged no frames (a table row), so a
+# difference here is residue step 2b could not clear — better named now,
+# in one line, than as a refused pour after the whole transfer.
+echo "==> checking that both nodes' frame allocators agree before the environment is created"
+assert_parity "before the environment's bases are recorded on node $leader"
+
 echo "==> creating an environment in partition $PART_ID on node $leader"
 # The response is echoed on BOTH failure paths (the case-arm below already
 # prints it): the command's own non-zero exit used to die with 'output
