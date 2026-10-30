@@ -43,8 +43,11 @@ CURL_EXTRA=()
 # One failure, said once, with the overall line every caller and transcript
 # already parses. The guards each re-wait for formation themselves; only
 # the manager's answer to `env create` is the thing they cannot wait out.
-warm_bad() {
-    echo "BAD  warm-up: $*"
+# The label is switchable: the mid-suite settle (below) fails through this
+# same single-exit path without calling itself the warm-up.
+BAD_LABEL="warm-up"
+bad_once() {
+    echo "BAD  $BAD_LABEL: $*"
     echo "RUNTIME-GUARDS overall: FAIL"
     exit 1
 }
@@ -78,87 +81,144 @@ fetch() {   # $1 = port, $2 = path
 
 # ─── the cluster must at least exist on disk ────────────────────────────
 PID_FILE="$CLUSTER_DIR/cluster.pids"
-[ -f "$PID_FILE" ] || warm_bad "no $PID_FILE -- is a cluster running? Start one first:
+[ -f "$PID_FILE" ] || bad_once "no $PID_FILE -- is a cluster running? Start one first:
        ./run-cluster.sh (then re-run this suite against it)."
-[ -f "$CTL" ] || warm_bad "$CTL not found -- run from the repo root."
-command -v curl    >/dev/null 2>&1 || warm_bad "curl not found."
-command -v python3 >/dev/null 2>&1 || warm_bad "python3 is needed to read the /api JSON."
+[ -f "$CTL" ] || bad_once "$CTL not found -- run from the repo root."
+command -v curl    >/dev/null 2>&1 || bad_once "curl not found."
+command -v python3 >/dev/null 2>&1 || bad_once "python3 is needed to read the /api JSON."
 NODE_IDS="$(awk '{print $1}' "$PID_FILE")"
-[ -n "$NODE_IDS" ] || warm_bad "$PID_FILE is empty -- nothing to test."
+[ -n "$NODE_IDS" ] || bad_once "$PID_FILE is empty -- nothing to test."
+
+# ─── the three probes the warm-up gate and every settle share ────────────
+# leader → partition → one env create per node, written once so the two
+# cannot drift apart: the warm-up runs them before guard 1, the settle runs
+# them again after a guard that killed a node or loaded the host.
+
+# find_leader: the node currently LEADER with quorum (active >= 2), printed.
+# Re-asked every time — the adoption guard kills the leader mid-suite, so a
+# leader id found earlier is stale by the next probe.
+find_leader() {
+    local id role active
+    for id in $NODE_IDS; do
+        fetch $((HTTP_BASE + id)) /api/cluster
+        [ "$FETCH_STATUS" = 200 ] || continue
+        role="$(jget "$FETCH_BODY" role)"
+        active="$(jget "$FETCH_BODY" active_nodes)"
+        if [ "$role" = "LEADER" ] && [ "${active:-0}" -ge 2 ] 2>/dev/null; then
+            printf '%s' "$id"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# make_partition <leader> <name> <deadline>: retry the create until it answers
+# or the deadline passes. Sets PART_ID ("" = timed out) and LAST_REPLY — a
+# command substitution would take both into a subshell, so this is called for
+# its globals, not its stdout.
+PART_ID=""
+LAST_REPLY=""
+make_partition() {
+    PART_ID=""
+    while :; do
+        [ "$(date +%s)" -ge "$3" ] && break
+        LAST_REPLY="$("$CTL" --host "localhost:$((HTTP_BASE + $1))" "${TOKEN_ARGS[@]}" \
+            shell partition create "$2" 2>&1)"
+        PART_ID="$(printf '%s' "$LAST_REPLY" \
+            | sed -n "s/.*create '$2' -> id=\([0-9]*\).*/\1/p" | head -1)"
+        [ -n "$PART_ID" ] && break
+        sleep "$POLL"
+    done
+}
+
+# probe_nodes <part> <deadline> <budget> <context>: one env create per node,
+# retried until each manager answers or the deadline passes, then every env it
+# created is swept. Fails ONCE through bad_once, naming the node and its last
+# reply — the guards would otherwise report one cause several times over.
+probe_nodes() {
+    local part="$1" deadline="$2" budget="$3" ctx="$4"
+    local id port eid pair
+    for id in $NODE_IDS; do
+        port=$((HTTP_BASE + id))
+        eid=""
+        while :; do
+            [ "$(date +%s)" -ge "$deadline" ] && break
+            LAST_REPLY="$("$CTL" --host "localhost:$port" "${TOKEN_ARGS[@]}" \
+                shell env create "$part" 2>&1)"
+            case "$LAST_REPLY" in
+                *"-> ok env_id="*)
+                    eid="$(printf '%s' "$LAST_REPLY" | sed -n 's/.*ok env_id=\([0-9]*\).*/\1/p' | head -1)"
+                    break ;;
+            esac
+            sleep "$POLL"
+        done
+        # Two different faults wear the same shape at a glance, and only one
+        # of them is the starvation this probe exists for. A manager that
+        # never ANSWERED (the client deadline expiring: fresh-boot / post-
+        # relaunch saturation) is the window; a manager that answered with a
+        # refusal is a different, reported cause — and its own words say
+        # which (measured: a stale per-id pause flag on one follower read
+        # `frame pool exhausted`, because ENV_ERR_NOMEM maps that way even
+        # when the kernel's own line is `CAP_EPERM: target partition 1 is
+        # paused`). Both retry to the deadline first, because a refusal can
+        # be transient too; the verdict, not the retry, is what differs.
+        [ -n "$eid" ] || {
+            case "$LAST_REPLY" in
+                *"-> "*)
+                    bad_once "node $id's environment manager REFUSED an env create for ${budget}s
+       ($ctx).
+       Last reply: $(oneline "$LAST_REPLY")" ;;
+                *)
+                    bad_once "node $id's environment manager never answered an env create
+       within ${budget}s ($ctx).
+       Last reply: $(oneline "$LAST_REPLY")" ;;
+            esac
+        }
+        echo "   node $id: env create answered -> ok env_id=$eid"
+
+        # Hand the frames straight back, and sweep rather than trust the last
+        # eid: a create whose CLIENT deadline expired can still have succeeded
+        # node-side, so a retried window may have stacked more than one env in
+        # this partition. Same list-and-destroy shape as the migrate guard's
+        # residue sweep, env_id 0 excluded (E3 boot spawns are not ours).
+        for pair in $("$CTL" --host "localhost:$port" "${TOKEN_ARGS[@]}" \
+                          shell env list 2>/dev/null \
+                      | sed -n "s/.*env partition=$part env_id=\([1-9][0-9]*\).*/$part\/\1/p"); do
+            "$CTL" --host "localhost:$port" "${TOKEN_ARGS[@]}" \
+                shell env destroy "${pair%/*}" "${pair#*/}" >/dev/null 2>&1 || true
+        done
+    done
+}
 
 WARM_NAME="guard-warmup-$$"      # unique per run, never stale
 WARM_LEADER=""
 WARM_PART=""
-WARM_LAST=""
 echo "=== warm-up: a leader, a partition create, and one env create per node (up to ${WAIT_WARM}s per phase)"
 
 # ─── phase A: a leader with quorum, then one partition create on it ────
 deadline=$(( $(date +%s) + WAIT_WARM ))
 while :; do
     [ "$(date +%s)" -ge "$deadline" ] && break
-    if [ -z "$WARM_LEADER" ]; then
-        for id in $NODE_IDS; do
-            fetch $((HTTP_BASE + id)) /api/cluster
-            [ "$FETCH_STATUS" = 200 ] || continue
-            role="$(jget "$FETCH_BODY" role)"
-            active="$(jget "$FETCH_BODY" active_nodes)"
-            if [ "$role" = "LEADER" ] && [ "${active:-0}" -ge 2 ] 2>/dev/null; then
-                WARM_LEADER="$id"
-                break
-            fi
-        done
-    fi
+    [ -z "$WARM_LEADER" ] && WARM_LEADER="$(find_leader)" || true
     if [ -n "$WARM_LEADER" ] && [ -z "$WARM_PART" ]; then
-        WARM_LAST="$("$CTL" --host "localhost:$((HTTP_BASE + WARM_LEADER))" "${TOKEN_ARGS[@]}" \
-            shell partition create "$WARM_NAME" 2>&1)"
-        WARM_PART="$(printf '%s' "$WARM_LAST" \
-            | sed -n "s/.*create '$WARM_NAME' -> id=\([0-9]*\).*/\1/p" | head -1)"
+        make_partition "$WARM_LEADER" "$WARM_NAME" "$deadline"
+        WARM_PART="$PART_ID"
         [ -n "$WARM_PART" ] && break
     fi
     sleep "$POLL"
 done
-[ -n "$WARM_LEADER" ] || warm_bad "no leader with quorum (active >= 2) among nodes $(echo $NODE_IDS)
+[ -n "$WARM_LEADER" ] || bad_once "no leader with quorum (active >= 2) among nodes $(echo $NODE_IDS)
        within ${WAIT_WARM}s -- the cluster never formed ($PID_FILE names the nodes that
        should be there; every guard would wait for formation again anyway)."
-[ -n "$WARM_PART" ] || warm_bad "partition create never answered on node $WARM_LEADER within
-       ${WAIT_WARM}s. Last reply: $(oneline "$WARM_LAST")"
+[ -n "$WARM_PART" ] || bad_once "partition create never answered on node $WARM_LEADER within
+       ${WAIT_WARM}s. Last reply: $(oneline "$LAST_REPLY")"
 
 # ─── phase B: one env create per node -- every manager must answer ─────
 # Fresh budget: formation may have consumed all of phase A's wait, and the
 # manager's own window deserves its own (it opens AFTER the APIs answer).
 deadline=$(( $(date +%s) + WAIT_WARM ))
-for id in $NODE_IDS; do
-    port=$((HTTP_BASE + id))
-    eid=""
-    while :; do
-        [ "$(date +%s)" -ge "$deadline" ] && break
-        WARM_LAST="$("$CTL" --host "localhost:$port" "${TOKEN_ARGS[@]}" \
-            shell env create "$WARM_PART" 2>&1)"
-        case "$WARM_LAST" in
-            *"-> ok env_id="*)
-                eid="$(printf '%s' "$WARM_LAST" | sed -n 's/.*ok env_id=\([0-9]*\).*/\1/p' | head -1)"
-                break ;;
-        esac
-        sleep "$POLL"
-    done
-    [ -n "$eid" ] || warm_bad "node $id's environment manager never answered an env create
-       within ${WAIT_WARM}s -- this is the fresh-boot saturation that failed three guards on
-       the first post-relaunch run, and starting the suite now would fail them the same way.
-       Last reply: $(oneline "$WARM_LAST")"
-    echo "   node $id: env create answered -> ok env_id=$eid"
-
-    # Hand the frames straight back, and sweep rather than trust the last
-    # eid: a create whose CLIENT deadline expired can still have succeeded
-    # node-side, so a retried window may have stacked more than one env in
-    # this partition. Same list-and-destroy shape as the migrate guard's
-    # residue sweep, env_id 0 excluded (E3 boot spawns are not ours).
-    for pair in $("$CTL" --host "localhost:$port" "${TOKEN_ARGS[@]}" \
-                      shell env list 2>/dev/null \
-                  | sed -n "s/.*env partition=$WARM_PART env_id=\([1-9][0-9]*\).*/$WARM_PART\/\1/p"); do
-        "$CTL" --host "localhost:$port" "${TOKEN_ARGS[@]}" \
-            shell env destroy "${pair%/*}" "${pair#*/}" >/dev/null 2>&1 || true
-    done
-done
+probe_nodes "$WARM_PART" "$deadline" "$WAIT_WARM" \
+    "fresh-boot saturation — the window that failed three guards on the first post-relaunch run, which the suite must not start into"
 
 # ─── teardown: the warm-up leaves nothing for the guards to inherit ────
 # Best-effort on purpose: a leftover row cannot fail guards 1-3 (they ran
@@ -182,6 +242,66 @@ failover_adoption_live_check.sh
 env_catalog_live_check.sh
 "
 
+# ─── settle: the same probe, re-run after a guard that loaded the system ──
+# Four guards open that same window in the MIDDLE of the suite, and each of
+# them made the NEXT guard fail on a cold pass while a plain re-run minutes
+# later was green:
+#   partition_reannounce / partition_ownedset_gc  SIGKILL a follower and
+#       relaunch it — the relaunched node's catch-up then flooded the next
+#       guard's response capture (env_migrate_confirm, 1st failure),
+#   e3_multi_env_boot        boots its own 4 GB TCG QEMU on the same host
+#       cores while node 1 is still catching up (e3 saw 2/3 rootfs in its
+#       120 s window),
+#   failover_adoption        kills the LEADER and relaunches it — the guard
+#       after it hit `no reply from the environment manager` right after
+#       e3's QEMU exited (adoption's own 1st failure came from that window).
+# Same transient as the warm-up, opened mid-suite: spend it here, once,
+# instead of letting the next guard report it as its own defect.
+#
+# What it does NOT gate: checkpoint catch-up traffic. A manager that answers
+# `env create` is the property the guards need to START; the relaunched
+# node's broadcast volume settles on its own afterwards.
+SETTLE_AFTER="
+partition_reannounce_live_check.sh
+partition_ownedset_gc_live_check.sh
+e3_multi_env_boot_check.sh
+failover_adoption_live_check.sh
+"
+# A cap, not a delay: a settled cluster passes on the first probe (seconds).
+SETTLE_WAIT="${AEROSLS_SETTLE_WAIT:-300}"
+
+settle() {                                   # $1 = the guard that just ran
+    local after="$1" leader="" part="" deadline n=0
+    echo "--- settle after $after (up to ${SETTLE_WAIT}s per phase)"
+    BAD_LABEL="settle (after $after)"
+    deadline=$(( $(date +%s) + SETTLE_WAIT ))
+    while :; do
+        [ "$(date +%s)" -ge "$deadline" ] && break
+        [ -z "$leader" ] && leader="$(find_leader)" || true
+        if [ -n "$leader" ] && [ -z "$part" ]; then
+            n=$((n + 1))
+            make_partition "$leader" "guard-settle-$$-$n" "$deadline"
+            part="$PART_ID"
+            [ -n "$part" ] && break
+        fi
+        sleep "$POLL"
+    done
+    [ -n "$leader" ] || bad_once "no leader with quorum (active >= 2) among nodes $NODE_IDS
+       within ${SETTLE_WAIT}s -- $after left the cluster without one, and every guard after it
+       waits for formation anyway."
+    [ -n "$part" ] || bad_once "partition create never answered on node $leader within
+       ${SETTLE_WAIT}s. Last reply: $(oneline "$LAST_REPLY")"
+
+    # Fresh budget, as in phase B: the manager's window opens after the APIs answer.
+    deadline=$(( $(date +%s) + SETTLE_WAIT ))
+    probe_nodes "$part" "$deadline" "$SETTLE_WAIT" \
+        "mid-suite saturation right after $after (its relaunched node / side QEMU still loading the host) — the next guard's first env create would die here exactly as a plain re-run minutes later would not"
+
+    "$CTL" --host "localhost:$((HTTP_BASE + leader))" "${TOKEN_ARGS[@]}" \
+        shell partition destroy "$part" >/dev/null 2>&1 || true
+    echo "OK   settle after $after (leader node $leader, settle partition id $part torn down)"
+}
+
 overall=0
 for g in $GUARDS; do
     echo "=== $g"
@@ -192,6 +312,12 @@ for g in $GUARDS; do
         echo "BAD  $g (rc=$rc)"
         overall=1
     fi
+    # The kill-heavy four starve whoever runs NEXT, not themselves, so settle
+    # before the next guard starts — including after a FAILED one: a guard
+    # that died mid-kill leaves the same load behind it.
+    case "$SETTLE_AFTER" in
+        *"$g"*) settle "$g" ;;
+    esac
 done
 echo "RUNTIME-GUARDS overall: $([ $overall -eq 0 ] && echo PASS || echo FAIL)"
 exit $overall
