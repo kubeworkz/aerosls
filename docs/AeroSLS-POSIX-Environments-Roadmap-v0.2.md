@@ -2591,10 +2591,37 @@ the same one (b)'s summary line already states.
   guard's flow the absent branch is the one that fires, because nothing
   there runs a payload capture (the leader's periodic broadcast carries
   the state tree only; the push fires from `env_payload_capture_all()`),
-  and the fakes emit it unchanged. The promotion's own LIVE run — a
-  capture, a killed node, a survivor that comes back WITH the
-  environment — is owed with the next cluster build, as increments 13 and
-  14 were run theirs.
+  and the fakes emit it unchanged. The promotion's own live arm is
+  settled below.
+
+**Stated boundary, settled by the live run (2026-10-29).** A 3-node TCG
+cluster on a fresh ISO: `partition create promo15` + `env create` through
+`aeroslsctl` on the leader (node 1), then `POST /api/checkpoint`. Result —
+the capture's 1947 pages reached BOTH peers: node 2 confirmed inside the
+ladder, and node 3's confirm answered "absent" while its synchronous
+7.6 MiB band write was still in flight, then finalized moments later —
+the pacing increment 14 already pinned, and here it cost nothing, because
+promotion reads the peer's DISK directory rather than the last packet it
+heard. Node 1 was then killed:
+
+1. **Exactly one adopter.** Node 2 declared node 1 DEAD (6000 ticks of
+   silence) and adopted partitions 1, 2 and 3; node 3 adopted none.
+2. **The promotion, on real metal.** `[ENV_REPLICA] PROMOTED replica
+   (partition 3, index 1): 1947 page(s), capture seq 0, provenance
+   node 1`, then the restore poured `1344 region page(s), 347
+   image-window page(s) and 256 extent page(s)` — the whole replica,
+   1947 = 1947 — and dropped the staged slot.
+3. **The classification it exists for.** `RESTORED from a replica held
+   on this survivor`, the both-sources summary line, and no
+   `NOT restored` line anywhere — with `shell env list` on the survivor
+   answering `env partition=3 env_id=1 index=1 posix_pid=104`: the
+   environment is running there, with its contents.
+
+The one branch this run did NOT exercise is the adoption guard's own
+replica branch — that guard's flow runs no payload capture (step 7.5's
+absent branch is the one its world produces, and the fakes emit it), so
+the guard change stays justified by review while the promotion itself is
+justified by this run.
 
 ---
 
