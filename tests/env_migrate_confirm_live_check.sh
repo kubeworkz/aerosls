@@ -147,6 +147,12 @@ WAIT_CONSOLE=90     # a sidecar draining and echoing one line (increment 10's
                     # live arm: the console must FOLLOW the environment)
 WAIT_DRAIN=60       # step 2b: residue releasing its frames + the partition
                     # tables settling (a pass or two, each a destroy + a poll)
+WAIT_RECLAIM=60     # step 2b: the ALLOCATOR settling after the destroys —
+                    # `env destroy` returns before its frames come back, so
+                    # the parity read has to wait for the number to stop
+                    # moving, not just for the tables to empty
+STABLE_READS=3      # consecutive identical ram_allocated_frames readings that
+                    # count as settled, POLL apart (~6s of quiet)
 
 die()  { echo; echo "ABORT: $*" >&2; exit 2; }
 fail() { echo; echo "FAIL  $*"; exit 1; }
@@ -281,6 +287,7 @@ allocated_frames() {    # $1 = port -> ram_allocated_frames
 # placement gate refuse three minutes later.
 clear_residue() {        # $1 = port
     local node port="$1" pair pid eid row rows ids id deadline said=0
+    local touched=0 prev="" now="" streak=0
     node=$(( port - HTTP_BASE ))
 
     # Environments first: `env destroy` hands an environment's frames back
@@ -294,6 +301,7 @@ clear_residue() {        # $1 = port
         "$CTL" --host "localhost:$port" "${TOKEN_ARGS[@]}" \
             shell env destroy "$pid" "$eid" >/dev/null 2>&1 || true
         echo "   node $node: ended the leftover environment (partition $pid, env $eid)"
+        touched=1
     done
 
     # Then the partition rows. Two reasons, and the second is the one that
@@ -313,6 +321,7 @@ clear_residue() {        # $1 = port
         ids=""
         for row in $rows; do ids="$ids ${row%:*}"; done
         [ "$said" -eq 0 ] && echo "   node $node: destroying the leftover partition row(s):$ids" && said=1
+        touched=1
         for id in $ids; do
             "$CTL" --host "localhost:$port" "${TOKEN_ARGS[@]}" \
                 shell partition destroy "$id" >/dev/null 2>&1 || true
@@ -325,6 +334,47 @@ clear_residue() {        # $1 = port
        off the boot watermark AND floods the 8 KiB shell capture, so both halves of
        what follows are untrustworthy. The node's serial log ($CLUSTER_DIR/node$node.log)
        names what is holding them."
+
+    # ─── and wait for the RECLAIM those destroys started ────────────────
+    # The tables are empty above; the allocator may not be. `env destroy`
+    # returns once the environment is ended — the frames come back a moment
+    # later, when the deferred teardown actually releases them. Measured on
+    # this cluster: destroying one leftover env left this node reading 933352
+    # allocated frames while every other node read 933351, and all three read
+    # 933351 seconds later. assert_parity, taken on the spot, reads that
+    # one-frame lag as "something is allocating on one node only" and fails
+    # the guard for a race that was already over (twice, on two different
+    # runs — the second time after clear_residue had itself been blamed).
+    #
+    # So: wait for THIS node's number to stop still — STABLE_READS identical
+    # readings POLL apart — instead of sleeping a guessed interval. Every
+    # node gets the check, including one this pass destroyed nothing on
+    # (~6s, and it cannot be waiting on our own work): a standing drift then
+    # fails HERE, named, rather than being handed to assert_parity as a
+    # coin-toss reading of two nodes at two different moments.
+    prev=""; streak=0
+    deadline=$(( $(date +%s) + WAIT_RECLAIM ))
+    while :; do
+        now="$(allocated_frames "$port")"
+        if [ -n "$now" ] && [ "$now" = "$prev" ]; then
+            streak=$((streak + 1))
+        else
+            streak=0
+        fi
+        prev="$now"
+        [ "$streak" -ge "$STABLE_READS" ] && break
+        [ "$(date +%s)" -ge "$deadline" ] && break
+        sleep "$POLL"
+    done
+    if [ "$streak" -lt "$STABLE_READS" ]; then
+        fail "node $node's allocator never stopped moving in ${WAIT_RECLAIM}s of waiting for the
+       reclaim its own destroys started (last readings: $now, never $STABLE_READS identical in a
+       row). Either something else is allocating here or a teardown is stuck — the node's serial
+       log ($CLUSTER_DIR/node$node.log) names it. A parity read taken now would be a coin toss."
+    fi
+    if [ "$touched" -eq 1 ]; then
+        echo "   node $node: reclaim settled at $now allocated frames ($STABLE_READS stable reads)"
+    fi
 }
 
 # assert_parity <when> — the precondition env_migrate.c's placement gate
@@ -344,9 +394,12 @@ assert_parity() {        # $1 = when (a phrase for the failure line)
        call) and the staged payload carries raw interior pointers into those regions,
        so the destination's fresh create would land OFF the recorded bases and
        env_migrate.c's placement gate would refuse the pour ('fresh environment landed
-       off the staged bases'). Step 2b clears residue to make these equal; if they
-       still differ, something is allocating on one node only — the node's log and
-       /api/partitions frame_usage will name it."
+       off the staged bases'). Step 2b clears residue to make these equal AND waits
+       for that reclaim to settle (STABLE_READS identical readings) before this line
+       runs, so a difference here is a standing one — something really is allocating
+       on one node only — not the destroy/reclaim race that used to fail this guard
+       seconds after its own cleanup. The node's log and /api/partitions
+       frame_usage will name what is doing it."
     fi
     echo "   both nodes report $src allocated frames — the histories the placement gate compares match"
 }
