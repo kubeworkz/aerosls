@@ -212,6 +212,56 @@ else
     fail "the host test no longer drives the push/confirm arm (loopback send -> finalize -> confirm)"
 fi
 
+# 14. PROMOTION (increment 3): the API exists on both sides — a finder with
+#     no reader is a band that only ever fills.
+if grep -q 'int env_replica_promote(uint32_t partition_id, uint32_t index);' kernel/env_replica.h &&
+   grep -q 'ENV_REPLICA_PROMOTE_REFUSE_ABSENT' kernel/env_replica.h &&
+   grep -q '^int env_replica_promote(uint32_t partition_id, uint32_t index) {' kernel/env_replica.c; then
+    ok "env_replica.h/.c carry the promotion entry and its named refusal enum"
+else
+    fail "the promotion entry (env_replica_promote + its PROMOTE_REFUSE_* codes) is missing — the band's only reader does not exist"
+fi
+
+# 15. The feed goes through the MIGRATION receiver — one numbering, one
+#     reader — and every failure inside it drops the half-built slot. Both
+#     halves are the point: feeding via a private path would fork the wire
+#     arithmetic, and a feed that leaves a partial slot lets the migrate
+#     sweep's restore loop replay bytes this promotion never finished
+#     laying down (refusal over partial application, made mechanical).
+if grep -q 'env_migrate_recv_begin(tid, partition_id, index, e.pages' kernel/env_replica.c &&
+   grep -q 'env_migrate_recv_page(' kernel/env_replica.c; then
+    ok "promotion stages the band through env_migrate's own receiver (begin + page feed)"
+else
+    fail "promotion no longer feeds env_migrate_recv_begin/recv_page — the band would need a second reader of the wire numbering"
+fi
+n_drops=$(grep -c 'env_migrate_recv_drop(partition_id, index);' kernel/env_replica.c)
+if [ "$n_drops" -ge 3 ]; then
+    ok "every mid-feed failure drops the staged slot ($n_drops drop sites: IO, fragment, incomplete)"
+else
+    fail "promotion has only $n_drops mid-feed drop site(s) — a failed feed can leave a partial slot the sweep would replay"
+fi
+if grep -q 'env_ckpt_valid(&e.record)' kernel/env_replica.c &&
+   grep -q 'e.pages > payload + ENV_MIGRATE_IMAGE_MAX' kernel/env_replica.c; then
+    ok "the record and page-count gates run BEFORE the first frame is staged"
+else
+    fail "promotion lost its pre-feed gates (env_ckpt_valid / the record's own page range) — a corrupt entry would be staged first and caught later, if ever"
+fi
+
+# 16. Promotion is PINNED by the host test: driven end to end against a
+#     real band, byte-exact, with the refusals asserted BY CODE — and the
+#     directory-patch arm proves the pre-feed gates fire on the bytes an
+#     operator's disk would actually hold.
+if grep -q 'env_replica_promote(79, 0)' tests/env_replica_host_test.c &&
+   grep -q 'ENV_REPLICA_PROMOTE_REFUSE_PAGES' tests/env_replica_host_test.c &&
+   grep -q 'ENV_REPLICA_PROMOTE_REFUSE_RECORD' tests/env_replica_host_test.c &&
+   grep -q 'ENV_REPLICA_PROMOTE_REFUSE_IO' tests/env_replica_host_test.c &&
+   grep -q 'ENV_REPLICA_PROMOTE_REFUSE_STAGE' tests/env_replica_host_test.c &&
+   grep -q 'byte-exact against the band' tests/env_replica_host_test.c; then
+    ok "the host test drives promotion against a real band and pins its refusals by code"
+else
+    fail "the host test's promotion arm is missing a drive or a named refusal — the band's reader would be unproven"
+fi
+
 if [ "$failed" -ne 0 ]; then
     echo "env_replica_check: FAILED"
     exit 1

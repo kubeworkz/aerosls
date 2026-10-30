@@ -14,6 +14,8 @@
 #include "kernel/state_tree.h"
 #include "kernel/env_ckpt.h"   /* P3 (b): env_ckpt_table[] feeds the tree's ST_NODE_ENVIRONMENT nodes */
 #include "kernel/env_service.h" /* P3 increment 11: struct EnvSvcRestoreReport, the replay driver's report */
+#include "kernel/env_replica.h" /* P3 (a) increment 3: the promotion seam failover now consults */
+#include "kernel/env_migrate.h"  /* ENV_MIGRATE_REFUSE_*: the restore status this test scripts */
 #include "kernel/partition.h"
 #include "kernel/object_catalog.h"
 #include "kernel/process.h"
@@ -170,6 +172,81 @@ int env_service_restore_pending(struct EnvSvcRestoreReport* out) {
     }
     out->n_remaining = 0;
     return 0;
+}
+
+/* ─── P3 (a) increment 3: the promotion seams ──────────────────────────────
+ * failover_recover_from() now consults this survivor's REPLICA band: on a
+ * HOLE (no durable record) the replica is the only source that can exist
+ * here, and when both exist the NEWER capture wins. It stages through
+ * env_replica_promote() and classifies on env_migrate_restore()'s status —
+ * the migration restore half, whose create round trip, identity check and
+ * pour are the proved replay for wire-numbered bytes.
+ *
+ * Same posture as the seams above: this test drives the CONSUMER, so the
+ * replica's disk and the migration's staging table are controllable
+ * stand-ins. What is REAL here is failover's accounting — which source it
+ * consults, when it promotes, when it falls back to (b), and how every
+ * outcome is counted. The real promote implementation (band → staging,
+ * byte-exact, refusal over partial application) is
+ * tests/env_replica_host_test.c's section J. */
+static int      g_rep_present;          /* the directory holds an entry for any identity */
+static uint64_t g_rep_seq;              /* its capture sequence */
+static uint32_t g_rep_src;              /* provenance node */
+static int      g_promote_rc;           /* env_replica_promote's scripted answer */
+static int      g_migrate_restore_rc;   /* env_migrate_restore's scripted answer */
+static uint32_t g_promote_calls, g_migrate_restore_calls, g_recv_drop_calls;
+
+static void replica_stub_reset(void) {
+    g_rep_present = 0;
+    g_rep_seq = 0;
+    g_rep_src = 1;
+    g_promote_rc = 0;
+    g_migrate_restore_rc = 0;
+    g_promote_calls = 0;
+    g_migrate_restore_calls = 0;
+    g_recv_drop_calls = 0;
+}
+
+int env_replica_lookup(uint32_t p, uint32_t idx, struct EnvReplicaDirEntry* out) {
+    if (!g_rep_present) return 0;
+    if (out) {
+        memset(out, 0, sizeof(*out));
+        out->partition_id = p;
+        out->index        = idx;
+        out->flags        = ENV_REPLICA_F_VALID;
+        out->seq          = g_rep_seq;
+        out->src_node     = g_rep_src;
+        out->pages        = 4;
+    }
+    return 1;
+}
+
+int env_replica_promote(uint32_t p, uint32_t idx) {
+    (void)p; (void)idx;
+    g_promote_calls++;
+    return g_promote_rc;
+}
+
+const char* env_replica_promotion_name(uint32_t code) {
+    return code == 0 ? "ok" : "scripted staging refusal";
+}
+
+/* The migration restore this test does NOT link (kernel/env_migrate.c is
+ * env_migrate_host_test.c's and env_replica_host_test's). Scripted here so
+ * failover's classification of its status is exercisable. */
+int env_migrate_restore(uint32_t p, uint32_t idx) {
+    (void)p; (void)idx;
+    g_migrate_restore_calls++;
+    return g_migrate_restore_rc;
+}
+
+/* failover.c drops any slot a FAILED promotion staged, on its way back to
+ * (b), so exactly one driver owns the replay. Counted, because a staged
+ * slot left behind is the double-drive Scenario 4d(g) exists to prevent. */
+int env_migrate_recv_drop(uint32_t p, uint32_t idx) {
+    (void)p; (void)idx;
+    g_recv_drop_calls++;
+    return 1;
 }
 
 /* Roster stubs -- failover.c's leader broadcast iterates these; an empty
@@ -760,6 +837,165 @@ static void test_restore_half(void) {
     restore_stub_reset();
 }
 
+/* ─── Scenario 4d: P3 (a) increment 3 — the replica is promoted ──────────── */
+/* The receiver (increment 13) and the capture-side sender (increment 14)
+ * make the dead node's bytes ALREADY HERE before anyone dies; this scenario
+ * pins the third increment's half — what the survivor DOES with them when
+ * it adopts the dead node's partition:
+ *
+ *   - a HOLE (no durable record) with a replica present: both adopted
+ *     environments come back through the promotion + migration restore,
+ *     and the (b) driver is never armed — the replica fully replaces (b)
+ *     where (b) had nothing;
+ *   - a hole whose promotion is REFUSED: named unrestored, and the replay
+ *     is never attempted (refusal over partial application);
+ *   - a hole whose replay refuses: named with the migration's own status,
+ *     never counted restored;
+ *   - a hole with NO replica: the honest no-record line of 4c(c), and
+ *     promotion is not even attempted;
+ *   - a record with an OLDER replica: (b) runs unchanged and the stale
+ *     copy is left unapplied (the newer-wins rule, both directions);
+ *   - a record with a NEWER replica: the replica wins when it applies, and
+ *     when it does not the survivor FALLS BACK to (b) — dropping the staged
+ *     slot, so exactly one driver ever owns this environment's replay.
+ *
+ * The partition-9 witness rides every case: it is never adopted, so no
+ * replica is ever consulted for it either. */
+static void fixture_hole_without_records(void) {
+    fixture_checkpoint_with_envs();
+    /* Drop the survivor's records for the two ADOPTED environments, keep
+     * the partition-9 witness: the tree still names all three (it was built
+     * while they were live), the survivor's store holds only what was never
+     * in its care. Exactly 4c(c)'s fixture, factored out because five more
+     * cases need the same hole. */
+    memset(env_ckpt_table, 0, sizeof(env_ckpt_table));
+    env_ckpt_table[0].magic = ENV_CKPT_REC_MAGIC;
+    env_ckpt_table[0].partition_id = 9;  env_ckpt_table[0].index = 4;
+    env_ckpt_table[0].n_regions = 3;
+    env_ckpt_count = 1;
+}
+
+static void test_replica_promotion(void) {
+    printf("--- Scenario 4d: a survivor promotes the dead node's replica ---\n");
+
+    /* (a) HOLE + replica present: restored via the replica, (b) untouched. */
+    replica_stub_reset();
+    restore_stub_reset();
+    g_replay_ready = 1;
+    g_rep_present = 1; g_rep_seq = 5; g_rep_src = 1;
+    fixture_hole_without_records();
+    CHECK(dspp_ckpt_recv_ready(), "checkpoint from node 1 received");
+
+    int rc = failover_recover_from(1);
+    CHECK(rc == FAILOVER_OK, "recovery succeeds");
+    CHECK(failover_last_restored_envs() == 2,
+          "*** both hole environments came back from the REPLICA — promoted and replayed through the migration restore ***");
+    CHECK(failover_last_unrestored_envs() == 0, "nothing named unrestored");
+    CHECK(g_promote_calls == 2,
+          "the promotion was attempted exactly once per adopted environment");
+    CHECK(g_arm_count == 0 && g_replay_calls == 0,
+          "*** ...and the durable-record driver was never armed or called: on a hole the replica fully replaces (b) ***");
+
+    /* (b) HOLE + promotion REFUSED: named, and no replay is attempted. */
+    replica_stub_reset();
+    restore_stub_reset();
+    g_replay_ready = 1;
+    g_rep_present = 1; g_rep_seq = 5;
+    g_promote_rc = ENV_REPLICA_PROMOTE_REFUSE_IO;
+    fixture_hole_without_records();
+
+    rc = failover_recover_from(1);
+    CHECK(rc == FAILOVER_OK, "recovery succeeds");
+    CHECK(failover_last_unrestored_envs() == 2,
+          "*** a replica that could not be staged is named NOT restored — never silently dropped ***");
+    CHECK(failover_last_restored_envs() == 0, "...and never counted restored");
+    CHECK(g_migrate_restore_calls == 0,
+          "*** ...and the replay was never attempted on a refused promotion (refusal over partial application) ***");
+
+    /* (c) HOLE + staged, but the REPLAY refuses: the migration's own
+     * status is what classifies it. */
+    replica_stub_reset();
+    restore_stub_reset();
+    g_replay_ready = 1;
+    g_rep_present = 1; g_rep_seq = 5;
+    g_migrate_restore_rc = ENV_MIGRATE_REFUSE_CREATE;
+    fixture_hole_without_records();
+
+    rc = failover_recover_from(1);
+    CHECK(rc == FAILOVER_OK, "recovery succeeds");
+    CHECK(failover_last_unrestored_envs() == 2 && failover_last_restored_envs() == 0,
+          "*** a replica whose replay refused is named NOT restored, with the migrate status ***");
+    CHECK(g_migrate_restore_calls == 2, "...and the replay was genuinely attempted for each");
+
+    /* (d) HOLE + NO replica: 4c(c)'s honest line, promotion not attempted. */
+    replica_stub_reset();
+    restore_stub_reset();
+    g_replay_ready = 1;
+    g_rep_present = 0;
+    fixture_hole_without_records();
+
+    rc = failover_recover_from(1);
+    CHECK(rc == FAILOVER_OK, "recovery succeeds");
+    CHECK(failover_last_unrestored_envs() == 2 && failover_last_restored_envs() == 0,
+          "no record and no replica: both environments named NOT restored");
+    CHECK(g_promote_calls == 0,
+          "*** ...and promotion is never attempted when the directory holds nothing — the absent answer comes from the lookup ***");
+    CHECK(g_replay_calls == 0, "...and the (b) driver is not called either");
+
+    /* (e) record + OLDER replica: (b) runs unchanged; the stale copy is
+     * left unapplied (the fixture's records carry sequence 0). */
+    replica_stub_reset();
+    restore_stub_reset();
+    g_replay_ready = 1;
+    g_rep_present = 1; g_rep_seq = 0;
+    fixture_checkpoint_with_envs();
+
+    rc = failover_recover_from(1);
+    CHECK(rc == FAILOVER_OK, "recovery succeeds");
+    CHECK(failover_last_restored_envs() == 2 && g_arm_count == 2,
+          "*** a replica OLDER than the durable record is not applied: (b) runs unchanged ***");
+    CHECK(g_promote_calls == 0,
+          "*** ...and the promotion entry is never called for the stale copy ***");
+
+    /* (f) record + NEWER replica, promotion applies: the replica wins and
+     * (b) never runs. */
+    replica_stub_reset();
+    restore_stub_reset();
+    g_replay_ready = 1;
+    g_rep_present = 1; g_rep_seq = 9;
+    fixture_checkpoint_with_envs();
+
+    rc = failover_recover_from(1);
+    CHECK(rc == FAILOVER_OK, "recovery succeeds");
+    CHECK(failover_last_restored_envs() == 2,
+          "*** a replica NEWER than the durable record wins — the receiver's own newer-wins rule, applied at promotion ***");
+    CHECK(g_arm_count == 0 && g_promote_calls == 2,
+          "...and the older record's driver was never armed (exactly one replay path per environment)");
+
+    /* (g) record + NEWER replica, promotion stages but the replay REFUSES:
+     * fall back to (b), and drop the staged slot so the migrate sweep's own
+     * restore loop cannot later replay over the record (b) chose. */
+    replica_stub_reset();
+    restore_stub_reset();
+    g_replay_ready = 1;
+    g_rep_present = 1; g_rep_seq = 9;
+    g_migrate_restore_rc = ENV_MIGRATE_REFUSE_PARKED;
+    fixture_checkpoint_with_envs();
+
+    rc = failover_recover_from(1);
+    CHECK(rc == FAILOVER_OK, "recovery succeeds");
+    CHECK(failover_last_restored_envs() == 2 && g_arm_count == 2,
+          "*** a newer replica whose replay refuses falls BACK to (b): the older record still restores through the driver ***");
+    CHECK(g_recv_drop_calls == 2,
+          "*** ...and the staged slot was dropped on the way: exactly one driver owns this environment's replay ***");
+    CHECK(failover_last_unrestored_envs() == 0, "the fallback is not reported as a gap");
+
+    replica_stub_reset();
+    restore_stub_reset();
+    memset(env_ckpt_table, 0, sizeof(env_ckpt_table));
+    env_ckpt_count = 0;
+}
+
 /* ─── Scenario 5: wrong source node in checkpoint ──────────────────── */
 static void test_wrong_source(void) {
     printf("--- Scenario 5: checkpoint from wrong source rejected ---\n");
@@ -785,6 +1021,7 @@ int main(void) {
     test_successful_failover();
     test_unrestored_environments();
     test_restore_half();
+    test_replica_promotion();
     test_wrong_source();
     test_unknown_peer();
 

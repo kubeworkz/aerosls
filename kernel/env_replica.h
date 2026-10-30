@@ -171,7 +171,7 @@ int env_replica_holds(uint64_t transfer_id);
  * many replicas finalized (0 is the normal answer until a sender exists). */
 int env_replica_tick(void);
 
-/* ─── The finder (promotion, increment 3, and the guards) ─────────────────── */
+/* ─── The finder (the guards and promotion's lookup) ─────────────────────── */
 int env_replica_present(uint32_t partition_id, uint32_t index);
 int env_replica_lookup(uint32_t partition_id, uint32_t index,
                        struct EnvReplicaDirEntry* out);
@@ -216,6 +216,44 @@ int env_replica_live_query(uint32_t partition_id, uint32_t index,
  * answer to an earlier question can never satisfy the current one. */
 void env_replica_confirm_note(uint32_t partition_id, uint32_t index,
                               uint32_t seq_low, uint8_t status);
+
+/* ─── PROMOTION (P3 destination (a), increment 3) ─────────────────────────
+ * The hole this module was built to close: a survivor adopts the dead node's
+ * partition and finds a replica instead of nothing. Promotion is the ONLY
+ * reader of the band, and it does exactly two things:
+ *
+ *   1. stage the replica's record and its wire-ordered pages into the
+ *      MIGRATION receiver's own staging table (env_migrate_recv_begin /
+ *      recv_page, fed locally from the band instead of the wire — the
+ *      begin family, page numbering and fragment geometry are already
+ *      shared with the sender that produced these bytes), then
+ *   2. hand the identity to env_migrate_restore() — the restore half whose
+ *      create round trip, identity check, placement gate, parked-posture
+ *      wait and no-yield pour are the proved replay for wire-numbered
+ *      bytes. (failover.c is the caller that makes step 2, so this entry
+ *      stages only and the caller classifies on the restore's own status.)
+ *
+ * Refusal over partial application, made mechanical: ANY failure between
+ * the first staged page and the last DROPS the half-built slot, so no
+ * later sweep can ever restore bytes this promotion did not finish laying
+ * down. A directory entry whose page count disagrees with its own record
+ * is refused before a frame is allocated. Codes are distinct by name and
+ * latched with their operands, like every other refusal this file owns. */
+enum {
+    ENV_REPLICA_PROMOTE_OK              = 0,
+    ENV_REPLICA_PROMOTE_REFUSE_ABSENT   = 1,  /* no directory entry for (partition, index) */
+    ENV_REPLICA_PROMOTE_REFUSE_RECORD   = 2,  /* entry's record failed env_ckpt_valid(); a=its code */
+    ENV_REPLICA_PROMOTE_REFUSE_PAGES    = 3,  /* entry.pages outside [payload, payload+tail]; a=pages, b=payload */
+    ENV_REPLICA_PROMOTE_REFUSE_IO       = 4,  /* device not ready, or a band page unreadable; a=page */
+    ENV_REPLICA_PROMOTE_REFUSE_STAGE    = 5,  /* the migration receiver refused the feed; a=its code, b=page */
+    ENV_REPLICA_PROMOTE_REFUSE_INCOMPLETE = 6, /* staged slot not complete after the feed (defensive); a=staged, b=wanted */
+};
+int env_replica_promote(uint32_t partition_id, uint32_t index);
+
+/* The promotion's own latch (distinct from the receiver's refusals above:
+ * different enum, different caller) and its rendering, same contract. */
+struct EnvReplicaRefusal env_replica_promotion_last(void);
+const char* env_replica_promotion_name(uint32_t code);
 
 /* Host tests only: drop all staging (frees the frames) and clear the
  * latch. The directory lives on the device — the test's RAM disk owns it. */

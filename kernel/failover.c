@@ -8,6 +8,7 @@
 #include "env_migrate.h"    /* env_migrate_in_flight() — the migration deferral gate */
 #include "env_ckpt.h"       /* P3 increment 11: the durable records the restore half replays from */
 #include "env_service.h"    /* P3 increment 11: env_service_restore_pending(), the standard replay driver */
+#include "env_replica.h"     /* P3 destination (a) increment 3: env_replica_promote() — the survivor's replica band */
 #include "state_tree.h"
 #include "partition.h"
 #include "kernel_io.h"
@@ -441,12 +442,123 @@ int failover_recover_from(uint32_t dead_node_id) {
                 break;
             }
         }
-        if (!rec) {
+
+        /* P3 destination (a), increment 3: PROMOTION. The record above is
+         * (b)'s source — this survivor's own durable store. The replica is
+         * the copy the dead node's capture pushed here while it lived, and
+         * it is consulted in exactly two shapes:
+         *
+         *   a HOLE (no record) — the replica is the only copy that can
+         *     exist on this disk, so it is promoted when present; its
+         *     absence folds into the same honest "no durable record" line
+         *     the report has always printed;
+         *   a record AND a replica — the NEWER capture wins, which is the
+         *     receiver's own rule (a same-identity entry is superseded by
+         *     a newer seq, never an older one). The loser is NAMED either
+         *     way: an older replica left unapplied, or a newer replica
+         *     whose promotion failed falling back to the record (b) knows
+         *     how to replay — (b) stays the floor under (a).
+         *
+         * Every refusal path counts the environment unrestored WITH its
+         * reason, or falls through to (b): no path is silent, and no path
+         * claims a restore the bytes cannot back. */
+        struct EnvReplicaDirEntry rep;
+        int has_rep = env_replica_lookup(part_id, env_idx, &rep);
+        int use_replica = 0;
+        if (has_rep && (!rec || (uint64_t)rec->sequence < rep.seq)) {
+            use_replica = 1;
+        } else if (has_rep) {
+            kernel_serial_printf(
+                "[FAILOVER] environment index %llu (partition %u): a replica "
+                "of capture seq %llu is held here, but this survivor's durable "
+                "record is capture seq %llu -- the older copy is not applied\n",
+                (unsigned long long)env_idx, part_id,
+                (unsigned long long)rep.seq,
+                (unsigned long long)rec->sequence);
+        }
+
+        if (!rec && !has_rep) {
             last_unrestored_envs++;
             kernel_serial_printf(
                 "[FAILOVER] environment index %llu (partition %u, %llu region(s)) "
-                "was NOT restored -- no durable record for it on this survivor; "
-                "recreate it\n",
+                "was NOT restored -- no durable record for it on this survivor "
+                "and no replica of it is held here; recreate it\n",
+                (unsigned long long)env_idx, part_id,
+                (unsigned long long)nodes[i].size);
+            continue;
+        }
+
+        if (use_replica) {
+            int prc = env_replica_promote(part_id, env_idx);
+            if (prc == ENV_REPLICA_PROMOTE_OK) {
+                int mrc = env_migrate_restore(part_id, env_idx);
+                if (mrc == ENV_MIGRATE_OK) {
+                    last_restored_envs++;
+                    kernel_serial_printf(
+                        "[FAILOVER] environment index %llu (partition %u) RESTORED "
+                        "from a replica held on this survivor (capture seq %llu, "
+                        "provenance node %u), replayed through the migration "
+                        "restore path\n",
+                        (unsigned long long)env_idx, part_id,
+                        (unsigned long long)rep.seq, (unsigned)rep.src_node);
+                    continue;
+                }
+                if (!rec) {
+                    last_unrestored_envs++;
+                    kernel_serial_printf(
+                        "[FAILOVER] environment index %llu (partition %u, %llu region(s)) "
+                        "was NOT restored -- its replica staged on this survivor but "
+                        "the replay refused it (%s); recreate it\n",
+                        (unsigned long long)env_idx, part_id,
+                        (unsigned long long)nodes[i].size,
+                        env_migrate_status_name(mrc));
+                    continue;
+                }
+                kernel_serial_printf(
+                    "[FAILOVER] environment index %llu (partition %u): the newer "
+                    "replica staged but its replay refused (%s) -- falling back to "
+                    "this survivor's durable record (capture seq %llu)\n",
+                    (unsigned long long)env_idx, part_id,
+                    env_migrate_status_name(mrc),
+                    (unsigned long long)rec->sequence);
+            } else {
+                if (!rec) {
+                    last_unrestored_envs++;
+                    kernel_serial_printf(
+                        "[FAILOVER] environment index %llu (partition %u, %llu region(s)) "
+                        "was NOT restored -- no durable record for it on this survivor, "
+                        "and the replica held here could not be applied (%s): refusal "
+                        "over partial application, nothing applied; recreate it\n",
+                        (unsigned long long)env_idx, part_id,
+                        (unsigned long long)nodes[i].size,
+                        env_replica_promotion_name((uint32_t)prc));
+                    continue;
+                }
+                kernel_serial_printf(
+                    "[FAILOVER] environment index %llu (partition %u): the newer "
+                    "replica could not be staged (%s) -- falling back to this "
+                    "survivor's durable record (capture seq %llu)\n",
+                    (unsigned long long)env_idx, part_id,
+                    env_replica_promotion_name((uint32_t)prc),
+                    (unsigned long long)rec->sequence);
+            }
+            /* Fell back to (b). Any slot this attempt staged would be
+             * replayed later by the migrate sweep's own restore loop — over
+             * the record the report just chose. Drop it so exactly one
+             * driver owns this environment's replay. */
+            env_migrate_recv_drop(part_id, env_idx);
+        }
+
+        if (!rec) {
+            /* Defensive: every hole path above continues. An environment
+             * that reaches the arm with no record would be arming nothing —
+             * refused by env_ckpt_restore_arm() and named by the branch
+             * below, but say it here rather than rely on a callee's gate. */
+            last_unrestored_envs++;
+            kernel_serial_printf(
+                "[FAILOVER] environment index %llu (partition %u, %llu region(s)) "
+                "was NOT restored -- no durable record for it on this survivor "
+                "and no replica of it is held here; recreate it\n",
                 (unsigned long long)env_idx, part_id,
                 (unsigned long long)nodes[i].size);
             continue;
@@ -519,21 +631,27 @@ int failover_recover_from(uint32_t dead_node_id) {
     if (last_unrestored_envs > 0) {
         kernel_serial_printf(
             "[FAILOVER] %u environment(s) of the adopted partitions were NOT "
-            "restored (named above) -- their payload lived on node %u's own "
-            "storage and does not follow ownership\n",
+            "restored (named above) -- each line names which source this "
+            "survivor lacked or could not apply: its own durable record, or "
+            "the replica node %u's capture pushed here\n",
             (unsigned)last_unrestored_envs, dead_node_id);
     }
     if (last_restored_envs > 0) {
         // Contents, honestly scoped: the replay brings the ENVIRONMENT back
         // (identity, sidecars, bindings). Its bytes follow only as far as
-        // the durable extent is readable on this survivor, and the payload
-        // layer names that refusal itself ([ENV_PAYLOAD]) — so this line
-        // claims the environment, never the contents.
+        // the chosen source can back them -- the durable extent readable on
+        // this survivor, or the replica band the capture pushed here -- and
+        // the pour names any refusal itself ([ENV_PAYLOAD] / [ENV_MIGRATE])
+        // -- so this line claims the environment, never the contents. The
+        // count mixes both sources on purpose: an operator counting restores
+        // wants one number, and each per-environment line above says which
+        // source it came from.
         kernel_serial_printf(
             "[FAILOVER] %u environment(s) of the adopted partitions were "
-            "restored from durable storage; contents follow only as far as "
-            "each durable extent is readable on this survivor ([ENV_PAYLOAD] "
-            "names what is not)\n",
+            "restored -- from this survivor's durable records or from a "
+            "replica of the dead node's capture (each line above says which); "
+            "contents follow only as far as that source is readable here "
+            "([ENV_PAYLOAD] / [ENV_MIGRATE] name what is not)\n",
             (unsigned)last_restored_envs);
     }
 

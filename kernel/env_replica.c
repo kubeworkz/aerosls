@@ -621,12 +621,136 @@ int env_replica_read_page(uint32_t partition_id, uint32_t index,
     return 0;
 }
 
+/* ─── PROMOTION (P3 destination (a), increment 3) ─────────────────────────
+ * See env_replica.h for the contract. Stages only: the caller (failover.c)
+ * makes step 2 — env_migrate_restore() — and classifies on its status, so
+ * one restore decision has one classifier instead of two.
+ *
+ * Why feed the MIGRATION receiver rather than pour the band into the
+ * payload blob: these bytes crossed the wire in the migration page
+ * numbering (record whole in the BEGIN; region frames, durable extent,
+ * image-window tail in page order) because the replica push IS a migration
+ * stream with a different begin opcode. The blob format ([head][tasks]
+ * [vaddrs][console]...) never crossed, and its tasks/vaddrs are re-derived
+ * from the FRESH sidecars at restore — env_migrate_restore() already does
+ * exactly that. A second reader of wire-ordered pages would be a second
+ * place for the numbering to rot; this way there is one. */
+static struct EnvReplicaRefusal er_promo;   /* last promotion's code + operands */
+
+static int er_promote_refuse(uint32_t code, uint32_t a, uint32_t b) {
+    er_promo.code = code;
+    er_promo.a = a;
+    er_promo.b = b;
+    kernel_serial_printf(
+        "[ENV_REPLICA] promotion REFUSED: %s (a=%u, b=%u) -- nothing was "
+        "staged; refusal over partial application.\n",
+        env_replica_promotion_name(code), (unsigned)a, (unsigned)b);
+    return (int)code;
+}
+
+struct EnvReplicaRefusal env_replica_promotion_last(void) {
+    return er_promo;
+}
+
+const char* env_replica_promotion_name(uint32_t code) {
+    switch (code) {
+    case ENV_REPLICA_PROMOTE_OK:                return "ok";
+    case ENV_REPLICA_PROMOTE_REFUSE_ABSENT:     return "no replica for this identity";
+    case ENV_REPLICA_PROMOTE_REFUSE_RECORD:     return "the replica's record failed validation";
+    case ENV_REPLICA_PROMOTE_REFUSE_PAGES:      return "page count disagrees with the record";
+    case ENV_REPLICA_PROMOTE_REFUSE_IO:         return "a replica band page could not be read";
+    case ENV_REPLICA_PROMOTE_REFUSE_STAGE:      return "the migration receiver refused the feed";
+    case ENV_REPLICA_PROMOTE_REFUSE_INCOMPLETE: return "the staged slot came up incomplete";
+    default:                                    return "unknown promotion status";
+    }
+}
+
+int env_replica_promote(uint32_t partition_id, uint32_t index) {
+    er_promo.code = ENV_REPLICA_PROMOTE_OK;
+    er_promo.a = er_promo.b = 0;
+
+    /* The device first, before the lookup that reads it: with no device,
+     * env_replica_lookup() cannot find an entry that exists, and reporting
+     * its miss as ABSENT would tell an operator "no replica is held here"
+     * about a disk we simply could not read. The gate is also the cheapest
+     * refusal — it fires before a directory read, let alone a frame. */
+    if (!er_io_ready())
+        return er_promote_refuse(ENV_REPLICA_PROMOTE_REFUSE_IO, 0, 0);
+
+    struct EnvReplicaDirEntry e;
+    if (!env_replica_lookup(partition_id, index, &e))
+        return er_promote_refuse(ENV_REPLICA_PROMOTE_REFUSE_ABSENT, 0, 0);
+
+    int vr = env_ckpt_valid(&e.record);
+    if (vr != 0)
+        return er_promote_refuse(ENV_REPLICA_PROMOTE_REFUSE_RECORD, (uint32_t)vr, 0);
+
+    /* The directory's own pages field against the record it carries: the
+     * same range the BEGIN gate enforced on the way in (payload pages, plus
+     * an image tail no larger than the ceiling). A torn directory entry is
+     * caught HERE, before a single frame is charged to the partition. */
+    uint32_t payload = env_migrate_payload_pages(&e.record);
+    if (e.pages < payload || e.pages > payload + ENV_MIGRATE_IMAGE_MAX ||
+        e.pages > ENV_REPLICA_MAX_PAGES)
+        return er_promote_refuse(ENV_REPLICA_PROMOTE_REFUSE_PAGES, e.pages, payload);
+
+    /* The wire's transfer id, derived the way both families derive it —
+     * this makes a re-promote of an identity already staged (a previous
+     * attempt's kept slot) answer READY instead of refused, and re-feeds
+     * its fragments idempotently. */
+    uint64_t tid = ((uint64_t)partition_id << 32) | (uint64_t)index;
+    int rc = env_migrate_recv_begin(tid, partition_id, index, e.pages,
+                                    &e.record,
+                                    (uint32_t)sizeof(struct EnvCkptRecord));
+    if (rc != 0)
+        return er_promote_refuse(ENV_REPLICA_PROMOTE_REFUSE_STAGE, (uint32_t)rc, 0);
+
+    for (uint32_t p = 0; p < e.pages; p++) {
+        if (nvme_read_sync(ENV_REPLICA_SLOT_LBA(e.slot) + (uint64_t)p * 8ull,
+                           er_io) != 0) {
+            env_migrate_recv_drop(partition_id, index);
+            return er_promote_refuse(ENV_REPLICA_PROMOTE_REFUSE_IO, p, 0);
+        }
+        for (uint32_t f = 0; f < DSPP_MIGRATE_FRAGS_PER_PAGE; f++) {
+            int fr = env_migrate_recv_page(
+                tid, p, f, er_io + (uint64_t)f * DSPP_MIGRATE_FRAG_BYTES);
+            if (fr != 0) {
+                env_migrate_recv_drop(partition_id, index);
+                return er_promote_refuse(ENV_REPLICA_PROMOTE_REFUSE_STAGE,
+                                         (uint32_t)fr, p);
+            }
+        }
+    }
+
+    /* Defensive: the feed above wrote every page, so complete must hold.
+     * If it does not, the slot can never be restored -- drop it rather than
+     * leave a slot the sweep would walk forever. */
+    const struct EnvMigrateStaging* v = env_migrate_recv_find(partition_id, index);
+    if (!v || !v->complete || v->total_pages != e.pages) {
+        uint32_t staged = (v) ? v->pages_staged : 0;
+        env_migrate_recv_drop(partition_id, index);
+        return er_promote_refuse(ENV_REPLICA_PROMOTE_REFUSE_INCOMPLETE,
+                                 staged, e.pages);
+    }
+
+    kernel_serial_printf(
+        "[ENV_REPLICA] PROMOTED replica (partition %u, index %u): %u page(s), "
+        "capture seq %llu, provenance node %u -- staged for the migration "
+        "restore path.\n",
+        (unsigned)partition_id, (unsigned)index, (unsigned)e.pages,
+        (unsigned long long)e.seq, (unsigned)e.src_node);
+    return ENV_REPLICA_PROMOTE_OK;
+}
+
 void env_replica_reset(void) {
     for (uint32_t i = 0; i < ENV_REPLICA_STAGING_MAX; i++)
         if (er_staging[i].active) er_slot_drop(&er_staging[i]);
     er_refusal.code = 0;
     er_refusal.a = 0;
     er_refusal.b = 0;
+    er_promo.code = ENV_REPLICA_PROMOTE_OK;
+    er_promo.a = 0;
+    er_promo.b = 0;
 }
 
 /* ─── The SENDER (increment 2) ───────────────────────────────────────────────

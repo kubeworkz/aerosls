@@ -975,24 +975,44 @@ if [ -z "$adopter" ]; then
 fi
 echo "   $adopter became leader, declared node $leader DEAD, and adopted $owned"
 
-# ─── 7.5. the adoption NAMES its unrestored environment (P3 9 + 11, live) ──
+# ─── 7.5. the adoption NAMES its environment and classifies it (P3 9+11+15) ─
 # The survivor adopted the partitions; what it must not do is be SILENT
 # about the environment that came with one of them. Two lines, each from
 # exactly one code site in kernel/failover.c: the per-environment name
-# (the tree carried it) and the per-record classification (this survivor's
-# own durable store holds no record for it -- per-node disks -- so it is
-# named with THAT reason), plus the countable summary. Every line is
-# required to be AFTER the adopt_line, so a line from an earlier run on
-# the same cluster dir cannot satisfy the gate.
+# (the tree carried it) and the classification against what THIS survivor
+# can back, plus the countable summary. Every line is required to be AFTER
+# the adopt_line, so a line from an earlier run on the same cluster dir
+# cannot satisfy the gate.
 #
 # The defect, verbatim, is the increment-9 `silent-failover` tooth: the
 # adoption completes and says nothing about the environments. The
-# increment-11 companion is `refused-as-restored`'s live shadow -- here the
-# honest "no durable record" branch must be the one that prints, never a
-# RESTORED claim this per-node store cannot back.
+# increment-11 companion is `refused-as-restored`'s live shadow -- here a
+# RESTORED claim this per-node store cannot back must never print.
+#
+# Since P3 (a) increment 15 there are TWO honest classifications, and this
+# step accepts exactly one of them per run, keyed off evidence in the
+# adopter's own log:
+#
+#   * absent -- no durable record AND no replica of it in this survivor's
+#     replica band: the "no durable record ... and no replica" line. This
+#     is the outcome THIS guard's flow produces, because nothing here ever
+#     runs a payload capture (POST /api/checkpoint): the leader's periodic
+#     broadcast carries the state TREE only, and env_replica_push() fires
+#     only from env_payload_capture_all(). The smoke's fakes emit this one.
+#   * replica -- a capture DID run before the death and the dead leader
+#     pushed a copy to this peer: promotion stages it and the migration
+#     restore replays it, so the "RESTORED from a replica held on this
+#     survivor" line, preceded by its own [ENV_REPLICA] PROMOTED line, is
+#     the honest answer. The old blanket prohibition of ANY RESTORED line
+#     would have failed a genuine promotion -- the check catching the
+#     feature rather than a lie.
+#
+# Each branch still prohibits the OTHER branch's line, so the lie check
+# bites in both worlds: a RESTORED claim with no replica promotion behind
+# it, or a no-record claim printed after this node's own promotion.
 echo "==> waiting for the adopter to name and classify partition $PART_ID2's environment (up to ${WAIT_ADOPT}s)"
-env_named=""
-env_line=""; env_res_line=""; env_sum_line=""; env_restored_line=""
+env_named=""; env_outcome=""
+env_line=""; env_res_line=""; env_sum_line=""; env_restored_line=""; env_sum_ok_line=""; promote_line=""
 deadline=$(( $(date +%s) + WAIT_ADOPT ))
 while :; do
     env_line="$(last_line "$CAN_LOG" "FAILOVER] environment index 1 (partition $PART_ID2")"
@@ -1002,10 +1022,19 @@ while :; do
     # closing the paren early (which matched nothing on the first live run).
     env_res_line="$(last_line "$CAN_LOG" "FAILOVER] environment index 1 (partition $PART_ID2, [0-9]* region(s)) was NOT restored -- no durable record for it on this survivor")"
     env_sum_line="$(last_line "$CAN_LOG" "FAILOVER] [0-9]* environment(s) of the adopted partitions were NOT restored")"
-    if [ -n "$env_line" ] && [ -n "$env_res_line" ] && [ -n "$env_sum_line" ] \
-       && [ "$env_line" -gt "$adopt_line" ] && [ "$env_res_line" -gt "$adopt_line" ] \
-       && [ "$env_sum_line" -gt "$adopt_line" ]; then
-        env_named=1; break
+    env_restored_line="$(last_line "$CAN_LOG" "FAILOVER] environment index 1 (partition $PART_ID2) RESTORED from a replica held on this survivor")"
+    env_sum_ok_line="$(last_line "$CAN_LOG" "FAILOVER] [0-9]* environment(s) of the adopted partitions were restored -- from")"
+    promote_line="$(last_line "$CAN_LOG" "ENV_REPLICA] PROMOTED replica (partition $PART_ID2")"
+    if [ -n "$env_line" ] && [ "$env_line" -gt "$adopt_line" ]; then
+        if [ -n "$env_res_line" ] && [ "$env_res_line" -gt "$adopt_line" ] \
+           && [ -n "$env_sum_line" ] && [ "$env_sum_line" -gt "$adopt_line" ]; then
+            env_named=1; env_outcome="absent"; break
+        fi
+        if [ -n "$env_restored_line" ] && [ "$env_restored_line" -gt "$adopt_line" ] \
+           && [ -n "$env_sum_ok_line" ] && [ "$env_sum_ok_line" -gt "$adopt_line" ] \
+           && [ -n "$promote_line" ] && [ "$promote_line" -gt "$adopt_line" ]; then
+            env_named=1; env_outcome="replica"; break
+        fi
     fi
     [ "$(date +%s)" -ge "$deadline" ] && break
     sleep "$POLL"
@@ -1013,25 +1042,48 @@ done
 [ -n "$env_named" ] || fail "node $adopter adopted partition $PART_ID2 but never named and
        classified its environment env_id=$L_ENV_ID (no '[FAILOVER] environment index 1
        (partition $PART_ID2' line after the adopt_line at $adopt_line within
-       ${WAIT_ADOPT}s). Step 4.5 proved the environment was live on the leader and
+       ${WAIT_ADOPT}s -- neither the no-record classification nor the
+       RESTORED-from-a-replica one, with its [ENV_REPLICA] promotion, appeared).
+       Step 4.5 proved the environment was live on the leader and
        carried in the held checkpoints, so the adoption DROPPED the name -- the
        increment-9 silent-failover defect, live. The adopter's FAILOVER lines hold:
 $(grep -F 'FAILOVER]' "$CAN_LOG" | tail -10 | sed 's/^/       /')"
-# The store here is per-node: the dead leader's record died with it, so the
-# HONEST classification is "no durable record". A RESTORED line for this
-# identity would be the increment-11 lie on live metal (nothing on this
-# survivor could have backed it) and is failed as such.
-env_restored_line="$(last_line "$CAN_LOG" "FAILOVER] environment index 1 (partition $PART_ID2) RESTORED")"
-if [ -n "$env_restored_line" ] && [ "$env_restored_line" -gt "$adopt_line" ]; then
-    fail "node $adopter claims it RESTORED partition $PART_ID2's environment from
+
+if [ "$env_outcome" = "replica" ]; then
+    # The promotion line is the evidence that a copy existed; without it a
+    # RESTORED claim is exactly the increment-11 lie this step exists to
+    # catch -- a restore this per-node store cannot back. The no-record line
+    # must be absent too: the loop classifies each environment once, so both
+    # present means two code paths claimed one environment.
+    if [ -n "$env_res_line" ] && [ "$env_res_line" -gt "$adopt_line" ]; then
+        fail "node $adopter classified partition $PART_ID2's environment BOTH ways:
+       it promoted a replica ([ENV_REPLICA] PROMOTED at line $promote_line) and still
+       printed 'no durable record ... on this survivor' (line $env_res_line) --
+       two sources named for one environment, and one of the two lines is lying.
+       The adopter's FAILOVER lines hold:
+$(grep -F 'FAILOVER]' "$CAN_LOG" | tail -10 | sed 's/^/       /')"
+    fi
+    echo "   $(grep -F "environment index 1 (partition $PART_ID2" "$CAN_LOG" | tail -1 | sed 's/^ *//')"
+    echo "   the survivor promoted the replica the dead leader's capture pushed here and replayed it"
+else
+    # The store here is per-node: the dead leader's record died with it, and
+    # this guard's flow never ran a capture, so the band holds no copy either.
+    # A RESTORED line for this identity would be the increment-11 lie on live
+    # metal (nothing on this survivor could have backed it) and is failed as
+    # such.
+    env_restored_line="$(last_line "$CAN_LOG" "FAILOVER] environment index 1 (partition $PART_ID2) RESTORED")"
+    if [ -n "$env_restored_line" ] && [ "$env_restored_line" -gt "$adopt_line" ]; then
+        fail "node $adopter claims it RESTORED partition $PART_ID2's environment from
        durable storage, but this cluster gives every node its own disk: nothing on
-       the adopter could have held that record. A restore claim the store cannot
+       the adopter could have held that record, and no [ENV_REPLICA] PROMOTED line
+       precedes it to back a replica instead. A restore claim the store cannot
        back is the increment-11 classification lying on live metal (the
        'refused-as-restored' tooth's live shadow). The adopter's log holds:
 $(grep -F 'FAILOVER]' "$CAN_LOG" | tail -10 | sed 's/^/       /')"
+    fi
+    echo "   $(grep -F "environment index 1 (partition $PART_ID2" "$CAN_LOG" | tail -1 | sed 's/^ *//')"
+    echo "   the survivor named the dead node's environment and classified it against its own durable store"
 fi
-echo "   $(grep -F "environment index 1 (partition $PART_ID2" "$CAN_LOG" | tail -1 | sed 's/^ *//')"
-echo "   the survivor named the dead node's environment and classified it against its own durable store"
 
 # ─── 7.5. the adopter re-registers the service twin ───────────────────────
 # The adoption moved ownership; the service twin moves with it. The adopter

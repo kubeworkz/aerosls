@@ -31,6 +31,7 @@
 #include "kernel/env_payload.h"
 #include "kernel/checkpoint_delta.h"
 #include "kernel/env_storage.h"
+#include "kernel/persist.h"      /* PERSIST_ENV_REPLICA_*_LBA — section J patches the real entry frame */
 #include "kernel/frame_pool.h"
 #include "kernel/object_catalog.h"
 #include "kernel/partition.h"
@@ -697,8 +698,25 @@ int main(void) {
             push_r1[0][b] = 0x82;
         }
         struct EnvCkptRecord rec2 = mk_record(79, 0, 11, 900);
-        rec2.regions[0].base = (uint64_t)(uintptr_t)push_r0;
-        rec2.regions[1].base = (uint64_t)(uintptr_t)push_r1;
+        /* A record the RECORD LAYER accepts, because promotion's first
+         * real gate is env_ckpt_valid(): exactly the three known region
+         * kinds once each, every region non-empty, and a task entry a
+         * restore could jump to. mk_record()'s two-region shorthand is fine
+         * for the wire gates (they count pages, they do not vouch for the
+         * descriptor), but the band's only reader vouches. Frames stay
+         * 1/1/1 so the wire numbering — PAYLOAD_PAGES, the page fills I6/I7
+         * read — is exactly what the two-region shorthand produced. */
+        rec2.n_regions      = 3;
+        rec2.regions[0].base = (uint64_t)(uintptr_t)push_r0[0];
+        rec2.regions[0].frames = 1;
+        rec2.regions[0].kind   = ENV_CKPT_REGION_POSIX_HEAP;
+        rec2.regions[1].base = (uint64_t)(uintptr_t)push_r0[1];
+        rec2.regions[1].frames = 1;
+        rec2.regions[1].kind   = ENV_CKPT_REGION_RD_HEAP;
+        rec2.regions[2].base = (uint64_t)(uintptr_t)push_r1[0];
+        rec2.regions[2].frames = 1;
+        rec2.regions[2].kind   = ENV_CKPT_REGION_RD_STORAGE;
+        rec2.tasks[0].entry = 0x401000;   /* env_ckpt_valid refuses entry 0 */
         static uint8_t ext[4096] __attribute__((aligned(4096)));
         memset(ext, 0xC1, 4096); nvme_write_sync(STATE_LBA + 0, ext);
         memset(ext, 0xC2, 4096); nvme_write_sync(STATE_LBA + 8, ext);
@@ -791,6 +809,153 @@ int main(void) {
     }
     g_fake_local_node_id = 0;
     cluster_roster_count = 0;
+
+    /* ── J: PROMOTION — the band's only reader ────────────────────────── */
+    /* The fixture is section I's own product: a finalized replica at
+     * (79, 0) — five wire-ordered pages standing in the band, sequence 11
+     * in the directory — which is exactly what a survivor holds when it
+     * adopts the dead node's partition. Promotion must move those bytes
+     * into the MIGRATION receiver's staging (one numbering, one reader —
+     * the whole reason the band stores wire order rather than the payload
+     * blob) and leave a slot the restore can find COMPLETE. Every refusal
+     * must be named, latched with its operands, and leave nothing staged:
+     * refusal over partial application, made mechanical. */
+    printf("-- J: promotion, band -> migration staging --\n");
+    env_migrate_reset();   /* the staging table this section feeds */
+    {
+        CHECK(env_replica_present(79, 0), "J0: section I's finalized replica is the fixture");
+
+        int prc = env_replica_promote(79, 0);
+        CHECK(prc == ENV_REPLICA_PROMOTE_OK,
+              "*** J1: promotion stages the replica into the migration receiver ***");
+
+        const struct EnvMigrateStaging* v = env_migrate_recv_find(79, 0);
+        CHECK(v != 0 && v->complete,
+              "J2: the staged slot is COMPLETE — the restore's own precondition");
+        CHECK(v != 0 && v->total_pages == PAYLOAD_PAGES &&
+              v->record.partition_id == 79 && v->record.env_id == 900,
+              "J3: the slot carries the record that crossed and the band's page count");
+
+        int exact = (v != 0);
+        if (v) {
+            static uint8_t jbuf[4096] __attribute__((aligned(4096)));
+            for (uint32_t p = 0; exact && p < v->total_pages; p++) {
+                const uint8_t* sp = env_migrate_recv_page_ptr(79, 0, p);
+                if (!sp || env_replica_read_page(79, 0, p, jbuf) != 0 ||
+                    memcmp(sp, jbuf, 4096) != 0)
+                    exact = 0;
+            }
+        }
+        CHECK(exact,
+              "*** J4: every staged page is byte-exact against the band — the wire numbering has ONE reader ***");
+
+        /* The handoff: the restore's first gates find what promote laid
+         * down. This world has no environment to finish building, so the
+         * restore is expected to refuse somewhere PAST the slot gates —
+         * what must never happen is NO_SLOT or INCOMPLETE. */
+        int rrc = env_migrate_restore(79, 0);
+        CHECK(rrc != ENV_MIGRATE_REFUSE_NO_SLOT &&
+              rrc != ENV_MIGRATE_REFUSE_INCOMPLETE,
+              "*** J5: env_migrate_restore() finds the promoted slot staged and complete — stage and replay are one path ***");
+        env_migrate_recv_drop(79, 0);
+
+        /* Absent, by name, with nothing staged — and latched. */
+        CHECK(env_replica_promote(79, 1) == ENV_REPLICA_PROMOTE_REFUSE_ABSENT,
+              "J6: an identity the directory does not hold answers ABSENT by name");
+        CHECK(env_migrate_recv_find(79, 1) == 0, "...and stages nothing for it");
+        CHECK(env_replica_promotion_last().code ==
+                  ENV_REPLICA_PROMOTE_REFUSE_ABSENT,
+              "...the refusal is LATCHED with its code — a guard reads the code, never a bare nonzero");
+
+        /* The device gate, before a frame is charged. */
+        io_sq = 0;
+        CHECK(env_replica_promote(79, 0) == ENV_REPLICA_PROMOTE_REFUSE_IO,
+              "J7: with no device the promotion is refused BEFORE anything is staged");
+        io_sq = (void*)1;
+        CHECK(env_migrate_recv_find(79, 0) == 0,
+              "...and the staging table is untouched");
+
+        /* The migration receiver's ceiling propagates BY NAME: fill its
+         * staging table (two slots; zero-page identities, so no frames) and
+         * the feed is refused outright rather than half-taken. */
+        {
+            struct EnvCkptRecord z;
+            memset(&z, 0, sizeof z);
+            z.magic        = ENV_CKPT_REC_MAGIC;
+            z.version      = ENV_CKPT_REC_VERSION;
+            z.size         = (uint32_t)sizeof z;
+            z.sequence     = 1;
+            z.partition_id = 90;
+            z.index        = 0;
+            z.env_id       = 950;
+            struct EnvCkptRecord z1 = z;
+            z1.partition_id = 91;
+            z1.env_id       = 951;
+            uint64_t t0 = ((uint64_t)90 << 32) | 0;
+            uint64_t t1 = ((uint64_t)91 << 32) | 0;
+            CHECK(env_migrate_recv_begin(t0, 90, 0, 0, &z, sizeof z) == 0 &&
+                  env_migrate_recv_begin(t1, 91, 0, 0, &z1, sizeof z1) == 0,
+                  "J8: the migration staging table is filled to its ceiling");
+            CHECK(env_replica_promote(79, 0) ==
+                      ENV_REPLICA_PROMOTE_REFUSE_STAGE,
+                  "*** J9: a full staging table refuses the promotion BY NAME — nothing partial is left ***");
+            CHECK(env_replica_promotion_last().a == 6,
+                  "...with the receiver's own table-full code carried through (a=6, propagation not paraphrase)");
+            env_migrate_recv_drop(90, 0);
+            env_migrate_recv_drop(91, 0);
+        }
+        CHECK(env_replica_promote(79, 0) == ENV_REPLICA_PROMOTE_OK,
+              "J10: with the table free again the promotion succeeds — the refusal was a state, not a stain");
+        env_migrate_recv_drop(79, 0);
+
+        /* A directory entry that disagrees with its own record: patched
+         * into the REAL entry frame and restored afterwards, so the guard
+         * sees the same bytes an operator's disk would. */
+        {
+            static uint8_t frame[4096] __attribute__((aligned(4096)));
+            struct EnvReplicaDirEntry* ents =
+                (struct EnvReplicaDirEntry*)frame;
+            int slot_idx = -1;
+            CHECK(nvme_read_sync(PERSIST_ENV_REPLICA_ENT_LBA, frame) == 0,
+                  "J11: the directory's entry frame reads");
+            for (uint32_t i = 0; i < ENV_REPLICA_MAX; i++)
+                if ((ents[i].flags & ENV_REPLICA_F_VALID) &&
+                    ents[i].partition_id == 79 && ents[i].index == 0) {
+                    slot_idx = i;
+                    break;
+                }
+            CHECK(slot_idx >= 0, "J12: the replica's own entry is in that frame");
+            if (slot_idx >= 0) {
+                struct EnvReplicaDirEntry saved = ents[slot_idx];
+
+                ents[slot_idx].pages = PAYLOAD_PAGES + ENV_MIGRATE_IMAGE_MAX + 1;
+                CHECK(nvme_write_sync(PERSIST_ENV_REPLICA_ENT_LBA, frame) == 0,
+                      "J13: the entry is patched with a page count its record cannot back");
+                CHECK(env_replica_promote(79, 0) ==
+                          ENV_REPLICA_PROMOTE_REFUSE_PAGES,
+                      "*** J14: a page count outside the record's own range is refused BEFORE any staging ***");
+                CHECK(env_migrate_recv_find(79, 0) == 0,
+                      "...with nothing staged");
+
+                ents[slot_idx] = saved;   /* back to real pages, broken record */
+                ents[slot_idx].record.magic = 0;
+                CHECK(nvme_write_sync(PERSIST_ENV_REPLICA_ENT_LBA, frame) == 0,
+                      "J15: then the entry's record is broken instead");
+                CHECK(env_replica_promote(79, 0) ==
+                          ENV_REPLICA_PROMOTE_REFUSE_RECORD,
+                      "...and an entry whose record fails validation is refused by name too");
+                CHECK(env_migrate_recv_find(79, 0) == 0,
+                      "...staging nothing");
+
+                ents[slot_idx] = saved;   /* restore the directory whole */
+                CHECK(nvme_write_sync(PERSIST_ENV_REPLICA_ENT_LBA, frame) == 0,
+                      "J16: the directory is restored");
+                CHECK(env_replica_promote(79, 0) == ENV_REPLICA_PROMOTE_OK,
+                      "J17: the restored entry promotes again — the refusals were about the bytes, not a latch");
+                env_migrate_recv_drop(79, 0);
+            }
+        }
+    }
 
     printf("\n%d passed, %d failed\n", checks_passed, checks_failed);
     return checks_failed ? 1 : 0;

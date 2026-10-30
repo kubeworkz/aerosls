@@ -2488,6 +2488,116 @@ which is the rule the protocol already states, and the byte-identical
 
 ---
 
+### Findings addendum — what landed, increment 15 (promotion: the survivor finds a copy instead of a hole)
+
+Destination (a)'s third increment, and the one that makes the first two
+mean something: increments 13 and 14 put the dead node's bytes on the
+peers' disks *before* anyone died; this increment is what the survivor
+DOES with them when it adopts the dead node's partition. Until now the
+adoption's per-environment classification had exactly one honest answer
+for an environment this survivor held no record for — "no durable record
+… recreate it" — while a byte-exact copy of it sat in this same node's
+replica band. Appendix B's row and §11 Q5's promise ("a survivor that
+later adopts the dead node's partition finds a replica instead of a
+hole") are this increment.
+
+**The mechanism, as landed.** A new entry in `kernel/env_replica.c` —
+`env_replica_promote(partition, index)` — is the band's only reader, and
+it does two things. First it STAGES: the device gate fires before even the
+directory lookup (a lookup that cannot read the disk would answer ABSENT
+about a disk it never saw, and "no replica is held here" is exactly the
+sentence that must not be a lie); then the directory entry's record is
+validated by the record layer's own `env_ckpt_valid()` and its page count
+against the range its own record names — both before a single frame is
+charged; then the band's pages are fed, in wire order, through the
+MIGRATION receiver's own entry points (`env_migrate_recv_begin` /
+`env_migrate_recv_page`, with the transfer id both families derive from
+the identity). One numbering, one reader: the band stores what the wire
+carried precisely so promotion could reuse the restore half that already
+speaks that numbering, rather than growing a second parser for a format
+(the payload blob) that never crossed the wire at all — its tasks and
+vaddrs are re-derived from the FRESH sidecars at restore, which
+`env_migrate_restore()` already does. Any failure inside the feed DROPS
+the half-built slot before returning its named code, so the migrate
+sweep's own restore loop can never later replay bytes this promotion did
+not finish laying down: refusal over partial application, made mechanical
+rather than promised.
+
+Second, `failover_recover_from()` classifies. Per environment of an
+adopted partition, and per outcome:
+
+- **a hole, a replica present** — promote, then `env_migrate_restore()`;
+  on success the line is `RESTORED from a replica held on this survivor
+  (capture seq …, provenance node …)`, and the record lands in
+  `env_ckpt_table` through the restore's own store step — §11 Q5's
+  "installs the record" happens, via the path the header chose;
+- **a hole, no replica** — the old line, extended: `no durable record for
+  it on this survivor and no replica of it is held here`;
+- **a record AND a replica — the NEWER capture wins**, which is the
+  receiver's own rule (a same-identity entry is superseded by a newer
+  seq, never an older one). An older replica is NAMED and not applied; a
+  newer replica whose promotion or replay then fails FALLS BACK to the
+  durable record, with a line saying so, and the staged slot is dropped
+  on the way so exactly one driver ever owns that environment's replay;
+- **promotion refused, or the replay refused** — named with its own code
+  (`env_replica_promotion_name` / `env_migrate_status_name`), counted
+  unrestored, never counted restored. Every path either falls through to
+  destination (b) or names a gap: (b) stays the floor under (a).
+
+**The two design texts, reconciled.** §11 Q5's settlement (written before
+any of this existed) said promotion would install "the record into
+`env_ckpt_table` and the blob into the local payload band";
+`env_replica.h`'s increment-1 header — written once the wire numbering
+was real — says promotion reuses migration's restore half. The header's
+refinement wins, and the difference is exactly one honest boundary: a
+promoted environment's contents live in the replica band and the regions
+the pour wrote, NOT yet in this survivor's payload band. The next
+checkpoint's own capture writes that entry (the normal path every
+environment takes), so until the first post-recovery checkpoint a reboot
+of the SURVIVOR would restore the promoted environment record without its
+payload — the same boundary migration's destination has always had, and
+the same one (b)'s summary line already states.
+
+**Verification.** The same three-layer shape as increments 13 and 14:
+
+- **Host:** `tests/checkpoint_recovery_host_test.c` grew Scenario 4d —
+  seven cases over the classification (hole+replica restored with the (b)
+  driver never armed; promotion refused → unrestored, replay never
+  attempted; replay refused → unrestored with the migrate status; no
+  replica → the old line and promotion never attempted; older replica →
+  (b) unchanged and the copy not applied; newer replica → wins and (b)
+  never arms; newer replica whose replay refuses → falls back to (b) with
+  the staged slot dropped). 87 checks. `tests/env_replica_host_test.c`
+  grew section J — promotion driven against section I's REAL band: staged
+  slot complete, every page byte-exact against the band, the restore
+  finding the staged slot (NO_SLOT never answerable), ABSENT and
+  device-down and table-full refusals by code with the latch, and the
+  directory-patch arm that gives PAGES and RECORD refusals the bytes an
+  operator's disk would actually hold. 101 checks, and the fixture's own
+  record had to become a record the record layer accepts (three regions,
+  a task entry) — promotion validates what the wire gates only counted.
+- **Guards:** `tests/env_failover_check.sh` gained clause N — the lookup,
+  the newer-wins comparison, the promotion call, the replay call, each
+  asserted as the call, plus three host-test pins; `tests/env_replica_check.sh`
+  gained claims 14–16 (the API on both halves, the feed through
+  `env_migrate`'s receiver with its three mid-feed drop sites and its
+  pre-feed gates, and the host test's named refusals). The failover smoke
+  grew six teeth — each link cut once, each reddening clause N and only N —
+  21 teeth, 0 lost, vacuity control green.
+- **Live:** the adoption guard's step 7.5 now accepts BOTH honest
+  classifications, keyed off the adopter's own `[ENV_REPLICA] PROMOTED`
+  line, each prohibiting the other's line — the old blanket prohibition of
+  any `RESTORED` line would have failed a genuine promotion. In this
+  guard's flow the absent branch is the one that fires, because nothing
+  there runs a payload capture (the leader's periodic broadcast carries
+  the state tree only; the push fires from `env_payload_capture_all()`),
+  and the fakes emit it unchanged. The promotion's own LIVE run — a
+  capture, a killed node, a survivor that comes back WITH the
+  environment — is owed with the next cluster build, as increments 13 and
+  14 were run theirs.
+
+---
+
 ## 8. Capacity for the first cut
 
 v0.1 §11 sized M1 at **four concurrent environments per node** and named the ceilings: `PROC_MAX` 16 (two slots per environment), `SIDECAR_REGISTRY_MAX` 16, `ENV_CONSOLE_MAX` 8. v0.2 adds its own, all of which are new *persistent* consumers rather than new process slots:
@@ -2759,7 +2869,9 @@ E7's own gate — *"a static binary doing the first user's actual work, running 
 2. **P1a: is quiescing the whole partition the right granularity, or should an environment pause alone?** Today `partition_pause()` is the only pause mechanism, and it stops the tenant's other work too. If environments are the unit of checkpointing, a per-environment pause may be the correct primitive — but it is a new scheduling concept and it should be argued for rather than assumed.
 3. **P1b: does the durable format replace aerofs-lite or extend it?** *(Settled by P1b's first increment, §5: the rule is implemented as **read v1, write v2, refuse the rest by name** — v2 is a version bump, no existing image is rewritten, and the rootfs builder deliberately stays v1.)* The rule was written down before it was implemented, as this question asked; the durable region it is for landed with P1b's second increment (the extent band), and its reboot evidence is re-made in CI on every push since the third.
 4. **P2: what is a tenant partition's *recommended* connection quota?** The mechanism defaults to 0 = unlimited for backward compatibility; a fresh tenant that never opts in is exactly the starvation case `tcp_quota.h` documents. Should the environment-create path set a non-zero default as part of its budget, and if so, what number is defensible?
-5. **P3: failover destination (a) or (b)?** Bulk-transfer surviving environments during failover (the PASE-grade answer, a much larger lift) or restore them from their own durable storage on the survivor and report the gap by name (the smaller, consistent-with-`failover.c` first cut). The plan is written to admit either; the decision is a product one about what "a cluster that doesn't lose your environments" has to mean in this window. *(Settled 2026-10: **both, in that order — (b) landed as increments 9 and 11 and stays the classification base; (a) now lands on top of it as the replica path**, because (b) answered "where does the survivor look?" and could not answer "where do the bytes come from when the node holding them is gone?" At declaration time the answer is nowhere — a dead node sends nothing, which is why the transfer cannot be bolted onto the failure and must be a PROACTIVE REPLICA: at the same instant `env_payload_capture_all()` writes the owner's local payload band, the captured record and its payload pages are pushed to the peers over the wire migration already proved (`DSPP_MIGRATE_ENV_BEGIN` carries the record whole; the page family moves 1 KiB fragments with a per-fragment ACK and a retransmit of only what did not land). The receiver stages them and finalizes into a per-environment replica slot — its own band, keyed `(partition, index, seq)` — so the copy is a fact the survivor holds before it needs it. A survivor that later adopts the dead node's partition finds a replica instead of a hole: promotion installs the record into `env_ckpt_table` and the blob into the local payload band, and the replay driver (b) already reuses — create round trip, identity check, pause ledger, pour — brings the environment back WITH its contents. The 24 KiB broadcast never grows: the state tree stays small, and the payload rides the fragment family that already moves 5.5 MiB for migration. A replica that is absent, stale or partial is named by the same three-way classification (b) already reports — refusal over partial application, applied to the replica. The increments and their teeth are in §7's thirteenth-increment addendum.)*
+5. **P3: failover destination (a) or (b)?** Bulk-transfer surviving environments during failover (the PASE-grade answer, a much larger lift) or restore them from their own durable storage on the survivor and report the gap by name (the smaller, consistent-with-`failover.c` first cut). The plan is written to admit either; the decision is a product one about what "a cluster that doesn't lose your environments" has to mean in this window. *(Settled 2026-10: **both, in that order — (b) landed as increments 9 and 11 and stays the classification base; (a) now lands on top of it as the replica path**, because (b) answered "where does the survivor look?" and could not answer "where do the bytes come from when the node holding them is gone?" At declaration time the answer is nowhere — a dead node sends nothing, which is why the transfer cannot be bolted onto the failure and must be a PROACTIVE REPLICA: at the same instant `env_payload_capture_all()` writes the owner's local payload band, the captured record and its payload pages are pushed to the peers over the wire migration already proved (`DSPP_MIGRATE_ENV_BEGIN` carries the record whole; the page family moves 1 KiB fragments with a per-fragment ACK and a retransmit of only what did not land). The receiver stages them and finalizes into a per-environment replica slot — its own band, keyed `(partition, index, seq)` — so the copy is a fact the survivor holds before it needs it. A survivor that later adopts the dead node's partition finds a replica instead of a hole: promotion installs the record into `env_ckpt_table` and the blob into the local payload band, and the replay driver (b) already reuses — create round trip, identity check, pause ledger, pour — brings the environment back WITH its contents. The 24 KiB broadcast never grows: the state tree stays small, and the payload rides the fragment family that already moves 5.5 MiB for migration. A replica that is absent, stale or partial is named by the same three-way classification (b) already reports — refusal over partial application, applied to the replica. The increments and their teeth are in §7's thirteenth-increment addendum;
+the third increment — the survivor PROMOTING a replica instead of finding
+a hole, with (b) as the floor under it — is §7's fifteenth.)*
 6. **§9's interop question.** Should a Linux-POSIX task be able to reach the SLS catalog or the integrated DB through a mediated service, and if so, is that service part of the sidecar it already talks to or a second kernel-brokered service in the `kernel.env.console` shape? This is the question that decides whether AeroSLS's POSIX environments are PASE-with-IFS or a sealed compatibility box, and it is deliberately left open here rather than answered by omission.
 
 ---

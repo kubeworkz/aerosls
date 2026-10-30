@@ -290,6 +290,34 @@ else
     ok "M. the refused mark is set on refuse, shifted on drop, cleared on begin — always describing the record it sits on"
 fi
 
+# ── N. The replica fills (a): consulted, promoted, replayed, counted ──────
+# P3 destination (a) increment 3. Five links, each asserted as the CALL or
+# the COMPARISON (the "comments are not wiring" rule, paid for twice):
+# the lookup that finds the dead node's copy, the newer-wins ordering that
+# decides between the two sources, the promotion that stages it, and the
+# migration restore that replays it. The last two teeth pin the HOST TEST's
+# classification arms, because this clause's whole subject is counting:
+# a promotion that only ever succeeds would let a broken fallback (the
+# floor under (a)) classify as a silent gap, and an unapplied stale copy
+# would be invisible rather than named.
+if ! has kernel/failover.c "env_replica_lookup(part_id, env_idx, &rep)"; then
+    bad "N. failover.c no longer consults this survivor's replica band — a hole a replica could fill is named 'no durable record' again while destination (a)'s bytes sit unread on this node's own disk"
+elif ! has kernel/failover.c "(uint64_t)rec->sequence < rep.seq"; then
+    bad "N. failover.c no longer orders the two sources by capture sequence — with both a record and a replica present the newer-wins rule (the receiver's own) would have no caller, and the older copy could be applied over the newer"
+elif ! has kernel/failover.c "env_replica_promote(part_id, env_idx)"; then
+    bad "N. failover.c no longer promotes a found replica — the lookup would find the copy and leave it in the band, which is (a) without its third increment"
+elif ! has kernel/failover.c "env_migrate_restore(part_id, env_idx)"; then
+    bad "N. failover.c no longer replays the promoted bytes through env_migrate_restore() — a staged replica with no replay is a classification that never runs, and the pour would need a second copy here"
+elif ! has tests/checkpoint_recovery_host_test.c "both hole environments came back from the REPLICA"; then
+    bad "N. the host test no longer pins the hole-to-replica restore — the count a serial line reports is a claim, not a property"
+elif ! has tests/checkpoint_recovery_host_test.c "the staged slot was dropped on the way"; then
+    bad "N. the host test no longer pins the FALLBACK (a newer replica whose replay refuses falls back to (b), staged slot dropped) — without it a broken floor under (a) reads as a plain gap"
+elif ! has tests/checkpoint_recovery_host_test.c "a replica OLDER than the durable record is not applied"; then
+    bad "N. the host test no longer pins the stale-replica branch — newer-wins with only its winning direction tested is a comparison that could be inverted unnoticed"
+else
+    ok "N. the replica is consulted on a hole, ordered by capture seq, promoted through the migration receiver, replayed, and pinned by the host test on both the restore and the fallback"
+fi
+
 echo
 if [ "$fail" -eq 0 ]; then
     echo "---- env_failover_check: ALL INVARIANTS HOLD"
