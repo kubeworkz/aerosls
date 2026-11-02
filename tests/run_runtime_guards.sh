@@ -237,6 +237,7 @@ entropy_boot_diversity_check.sh
 partition_reannounce_live_check.sh
 partition_ownedset_gc_live_check.sh
 env_migrate_confirm_live_check.sh
+partition_reuse_pause_live_check.sh
 e3_multi_env_boot_check.sh
 failover_adoption_live_check.sh
 env_catalog_live_check.sh
