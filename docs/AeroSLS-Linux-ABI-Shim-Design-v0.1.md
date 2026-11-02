@@ -1351,8 +1351,9 @@ refused by name, no process consumed), and `manifest.rs`'s
 `argenv_wire_bytes_golden`. `ET_EXEC` only: no PIE, no interpreter, no dynamic linking
 (§12 untouched; §5.1 refuses the rest by name). The 8 KiB stack floor
 is a floor, not a measurement — §11's Q2 still stands; there is no
-vDSO by decision, and §11's Q5 (rseq/membarrier at start-up) is still
-open. `mmap`/`munmap` remain the named gaps of §10.10/§10.11; the
+vDSO by decision, and §11's Q5 (rseq/membarrier at start-up) was still
+open when this increment landed — the census has since settled it
+(§11). `mmap`/`munmap` remain the named gaps of §10.10/§10.11; the
 reply payload's copy-IN landed at increment 12 (step 3's section
 below), and `read` rides that same machinery as step 4's arm.
 
@@ -3245,7 +3246,7 @@ transcript).
 2. **Stack sizing for Linux tasks.** §5.2 proposes measurement rather than inheriting `PROC_USER_STACK_PAGES`. Is a separate, partition-charged Linux stack accepted, or should the constant simply grow (which touches every ring-3 process)?
 3. **Where the personality field's setter lives — answered, and built.** §5.6/§3.5 proposed the spawn request, gated on the existing `sidecar_authority`, and increment 2 built exactly that: `SYS_SLS_LINUX_SPAWN` (328) is the same manifest path and request struct as 310 with one argument different, and `cap_create_sidecar_in_personality()` stamps the personality inside the create — before the HELD release, so a schedulable task never carries the wrong one — behind the same E2 authority gate (§10.6), while `proc_clear_resume_state()` clears it on reuse. No new authority bit, and no separate setter that could race the create. The entry stays here as the record of the choice rather than as a question.
 4. **The flood bound.** §10.2 requires a measured bound on a syscall-flooding task. Is "parks, and cannot reduce a neighbour's partition share" the right bar, or should the environment have an explicit syscall-rate ceiling as part of its E3 budget?
-5. **`rseq` and the other modern start-up syscalls.** musl as built by common toolchains may call `rseq`, `membarrier`-class calls, or `prlimit64` at start-up; the census settles which, but a policy decision is needed now: `ENOSYS` with a logged name (recommended — it is visible and cheap) or silent success.
+5. **`rseq` and the other modern start-up syscalls — settled by measurement, and the policy is the recommended one.** The design-pass worry was that musl would call `rseq`, `membarrier`-class calls or `prlimit64` at start-up. It does not: the artifact's 26 traced rows plus the declared `clock_gettime` backstop are the candidate's whole surface (`tools/linux_syscall_census.txt`), and no file in `kernel/`, `user/`, `tests/` or `tools/` names any of the three. What was actually being asked — what happens to a number the census does not cover — was decided at increment 3 and has been exercised live: the kernel describes the number and forwards, and the sidecar's default arm answers `-ENOSYS` with the number logged, visible and cheap, never a silent success (§10.6's branch, §10.7's answer set, and §10.8's boot proof, where `getpid` (39) and `sendfile` (40) were refused that way). A later candidate that does call one falls under the same rule: the census is what gets re-run against a new artifact, while the refusal is the default arm. The entry stays here as the record of the decision rather than as a question.
 
 ---
 
