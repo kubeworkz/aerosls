@@ -8,7 +8,7 @@
 # (`backup/aerobackup`) run its real nine-entry command line until the kernel
 # holds it at the copy continuation, CHECKPOINT, power the machine off, boot
 # the SAME NVMe image again, replay the record through POST /api/env/restore,
-# and assert the gate's facts on the second boot's serial transcript:
+# and assert the gate's facts across the two boots' serial transcripts:
 #
 #   * the restore reports payloads=1, payload_skips=0 (the contents came back,
 #     they were not refused by name);
@@ -17,7 +17,10 @@
 #     FIRST post-restore read is `off=0x30000`, and there is no second
 #     `Copying`, which would mean it restarted;
 #   * exactly one `[backup] Done:` line, no `[FAULT]`, and the tenant's exit
-#     tears the address space down (`frame(s) freed`).
+#     tears the address space down (`frame(s) freed`);
+#   * the stack was MEASURED: the work half's stop line and the resumed
+#     tenant's exit line carry the same poisoned span, their own headroom and
+#     deepest agree, and the headroom clears the gate's floor.
 #
 # ─── The drill is PART of the gate check, not a side script ────────────────
 # The pour's wait used to bound ELAPSED time: a sidecar still serving the
@@ -63,7 +66,8 @@
 #   --teeth            the source clauses, then the teeth build + ONE capture
 #                      + four replays (control + the three breaks)
 #   --replay DIR       validate a recorded run's artifacts only (no build, no
-#                      QEMU) — the same assertions, over boot2.log + facts;
+#                      QEMU) — the same assertions, over boot1.log, boot2.log
+#                      and facts;
 #                      a recording made with a tooth is validated under that
 #                      tooth's expectation (it is self-describing)
 #   positional ROOT    the source clauses over another tree (the hermetic seam)
@@ -91,7 +95,10 @@
 # teeth cover the three breaks increment 22 names (descriptor, fd, heap page);
 # the restart and stale-`fs_base` teeth the design also lists are NOT here —
 # the restart is what `descriptor` produces as a consequence and is asserted as
-# B3/B4, and `fs_base` has no arm yet.
+# B3/B4, and `fs_base` has no arm yet. B7's exit scan rides the process_kill
+# teardown, so a tenant that dies by fault (the `no-heap` tooth, and any crash)
+# is measured at its stop only; the clause says so by name instead of passing
+# silently on a missing line.
 #
 # GUARD-KIND: host (the source clauses need only bash; the live/teeth arms add
 # make + QEMU and are the only modes that build anything).
@@ -330,6 +337,108 @@ p_b6() {   # the tenant's frames came back
     return 1
 }
 
+# ─── Q2: the stack's high-water measurement, checked instead of quoted ─────
+# The gate profile poisons the span below the entry %rsp at create, and the
+# kernel reports it twice: at the stop (boot 1's work half) and at the resumed
+# tenant's teardown (boot 2). A line is only evidence if its numbers agree, so
+# the clause re-derives them: the budget is the gate's 64 KiB, the poisoned
+# span is inside it, headroom + deepest is that span, the lowest touched
+# address sits exactly `headroom` past a page-aligned base, and the headroom
+# clears a floor. The floor is half the region: the measured run leaves 57,424
+# bytes (87.6%), and a workload that eats into the last 32 KiB is the
+# regression this clause exists to catch, not run-to-run noise. A budget
+# change is a deliberate edit to HWM_ALLOC and the design's number, not a
+# silent drift a log line can absorb.
+HWM_ALLOC=65536
+HWM_MIN_HEADROOM=32768
+
+hwm_field() {   # <line> <name> -> its decimal value, empty when absent
+    printf '%s\n' "$1" | grep -oE "$2=[0-9]+" | head -1 | cut -d= -f2
+}
+
+hwm_parse() {   # <line> <where> -> 0 with HWM_* set, 1 and CM otherwise
+    local line="$1" where="$2"
+    HWM_ALLOC_V=$(hwm_field "$line" alloc)
+    HWM_SPAN_V=$(hwm_field "$line" poison-span)
+    HWM_HR_V=$(hwm_field "$line" headroom)
+    HWM_DEEP_V=$(hwm_field "$line" deepest)
+    HWM_LOW_V=$(printf '%s\n' "$line" | grep -oE 'lowest=0x[0-9a-fA-F]+' | head -1 | cut -d= -f2)
+    if [ -z "${HWM_ALLOC_V:-}" ] || [ -z "${HWM_SPAN_V:-}" ] || \
+       [ -z "${HWM_HR_V:-}" ] || [ -z "${HWM_DEEP_V:-}" ] || [ -z "${HWM_LOW_V:-}" ]; then
+        CM="the $where hwm line is not the shape the gate writes (alloc, poison-span, headroom, deepest, lowest=0x...): '$line'"
+        return 1
+    fi
+    if [ "$HWM_ALLOC_V" -ne "$HWM_ALLOC" ]; then
+        CM="the $where scan covers $HWM_ALLOC_V bytes, not the gate's $HWM_ALLOC — the budget moved without this clause, or the report measured another region"
+        return 1
+    fi
+    if [ "$HWM_SPAN_V" -le 0 ] || [ "$HWM_SPAN_V" -ge "$HWM_ALLOC_V" ]; then
+        CM="the $where poisoned span is $HWM_SPAN_V of $HWM_ALLOC_V bytes — the create arm either armed nothing or poisoned the whole region, image included"
+        return 1
+    fi
+    if [ "$HWM_DEEP_V" -le 0 ]; then
+        CM="the $where scan found every poisoned byte untouched (deepest=0) — the workload never used the stack below the entry %rsp, or the scan reads a region the poison never reached"
+        return 1
+    fi
+    if [ $((HWM_HR_V + HWM_DEEP_V)) -ne "$HWM_SPAN_V" ]; then
+        CM="the $where numbers disagree with themselves: headroom $HWM_HR_V + deepest $HWM_DEEP_V is $((HWM_HR_V + HWM_DEEP_V)), not the poisoned span $HWM_SPAN_V"
+        return 1
+    fi
+    if [ $((HWM_LOW_V % 4096)) -ne $((HWM_HR_V % 4096)) ]; then
+        CM="the $where lowest address $HWM_LOW_V is not $HWM_HR_V bytes past a page-aligned base (offsets $((HWM_LOW_V % 4096)) vs $((HWM_HR_V % 4096))) — the line's two numbers describe different spans"
+        return 1
+    fi
+    if [ "$HWM_HR_V" -lt "$HWM_MIN_HEADROOM" ]; then
+        CM="the $where headroom is $HWM_HR_V bytes, under the $HWM_MIN_HEADROOM-byte floor — the workload has eaten into the second half of its 64 KiB budget"
+        return 1
+    fi
+    return 0
+}
+
+p_b7() {   # the stack was measured at both boots, and its headroom holds
+    local d="$1" b1="$d/boot1.log" b2="$d/boot2.log"
+    local stop exitl adopted=0 stop_span stop_hr stop_deep
+    if [ ! -f "$b1" ]; then
+        CM="the recording has no boot1.log — the stop measurement cannot be checked, and the work half is where the stack's first number is taken"
+        return 1
+    fi
+    stop=$(grep -aF "[E7-GATE] stack hwm (stop):" "$b1" 2>/dev/null | tail -1)
+    if [ -z "$stop" ]; then
+        CM="the work half carries no stack hwm line — the gate profile's create arm (the 0xA5 poison) or its stop report is gone, so the run no longer measures the stack it budgets"
+        return 1
+    fi
+    hwm_parse "$stop" stop || return 1
+    stop_span="$HWM_SPAN_V"; stop_hr="$HWM_HR_V"; stop_deep="$HWM_DEEP_V"
+
+    grep -aqF "[ENV_PAYLOAD] linux task 'e7.gate.user.0' adopted at" "$b2" && adopted=1
+    exitl=$(grep -aF "[E7-GATE] stack hwm (exit):" "$b2" 2>/dev/null | tail -1)
+
+    if [ -z "$exitl" ]; then
+        if [ "$adopted" -eq 1 ] && grep -aqE '\[PROC\] PID [0-9]+ terminated\.' "$b2"; then
+            CM="boot 1 measured the stack (deepest $stop_deep, headroom $stop_hr) but the resumed tenant's teardown has no exit scan — the tenant left through process_kill, which is the path the report rides"
+            return 1
+        fi
+        CM="boot 1 measured the stack (deepest $stop_deep, headroom $stop_hr of $HWM_ALLOC); this recording's tenant left by fault or was never adopted, so its teardown has no exit scan to compare"
+        return 0
+    fi
+
+    hwm_parse "$exitl" exit || return 1
+    if [ "$adopted" -ne 1 ]; then
+        CM="boot 1 measured the stack (deepest $stop_deep, headroom $stop_hr of $HWM_ALLOC); this recording never adopted the tenant, so its exit scan ($HWM_DEEP_V bytes) is not the resumed copy's and is not compared to the stop"
+        return 0
+    fi
+    if [ "$HWM_SPAN_V" -ne "$stop_span" ]; then
+        CM="the two boots disagree on the poisoned span (stop $stop_span, exit $HWM_SPAN_V) — the checkpoint did not carry the create's arming, so the second scan is not the same stack"
+        return 1
+    fi
+    if [ "$HWM_DEEP_V" -lt "$stop_deep" ]; then
+        CM="the resumed scan is shallower ($HWM_DEEP_V) than the stop ($stop_deep) — the checkpoint lost the touched pages' poison, so boot 2 is measuring a different stack"
+        return 1
+    fi
+    CM="the stack is measured at both boots: deepest $HWM_DEEP_V bytes below the entry %rsp ($stop_deep at the stop, the resumed tail went $((HWM_DEEP_V - stop_deep)) deeper), $HWM_HR_V of $HWM_ALLOC bytes untouched — $((HWM_HR_V * 100 / HWM_ALLOC)).$((HWM_HR_V * 1000 / HWM_ALLOC % 10))% above the $HWM_MIN_HEADROOM-byte floor"
+    return 0
+}
+
 p_d1() {   # the drill: the wait outlived the fixed bound with a sidecar running
     local d="$1" b2="$d/boot2.log"
     if ! grep -aqF "[E7-GATE] stretch-done" "$b2"; then
@@ -475,6 +584,7 @@ assert_artifacts() {
     report_clause "$d" B4 b4 "$want"
     report_clause "$d" B5 b5 "$want"
     report_clause "$d" B6 b6 "$want"
+    report_clause "$d" B7 b7 "$want"
 
     if [ "$drill" = "1" ]; then
         report_clause "$d" D1 d1 "$want"
@@ -786,6 +896,11 @@ replay_for_tooth() {   # <name> <tag-base> <body> -> 0 when the pour landed
         IMG="$TC/$name.img"
         rm -rf "$TC/$name"
         gate_replay "$TC/$name/boot2.log" "${tag}r$try" "$body" "$TC/$name"
+        # The capture log belongs to every replay's recording: B7's stop
+        # measurement is taken in boot 1, and a tooth directory carrying only
+        # boot 2 could not be replayed on its own.
+        cp "$ART/boot1.log" "$TC/$name/boot1.log" || \
+            fail "could not attach the capture log to $name"
         payloads=$(fact "$TC/$name" payloads)
         skips=$(fact "$TC/$name" payload_skips)
         if [ "$payloads" = "1" ]; then return 0; fi

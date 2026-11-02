@@ -3074,11 +3074,12 @@ sized in iterations rather than time because the guest has no clock to read.
 `tests/e7_gate_check.sh --live` owns the whole invocation: it builds that drill
 image (`E7G_DRILL` defaults to 1, into a drill-only name so a run never
 replaces the plain gate image), boots it twice, and asserts the gate's clauses
-and the drill's in one pass. The gate clauses are B1–B6 (payload landed;
+and the drill's in one pass. The gate clauses are B1–B7 (payload landed;
 adoption form and spent stop; resume offset; one completion; no fault; address
-space returned); the drill clauses are D1–D2 — the stretch ran, the wait
-outlived the old bound with a sidecar RUNNING, the wait never answered, and the
-pour still landed. Boot 2 of the run:
+space returned; the stack's high-water at both boots with its headroom floor);
+the drill clauses are D1–D2 — the stretch ran, the wait outlived the old bound
+with a sidecar RUNNING, the wait never answered, and the pour still landed.
+Boot 2 of the run:
 
 ```
 [E7-GATE] stretch-start 0000AFC8 Miters      (45G iterations)
@@ -3239,6 +3240,24 @@ resumed tenant's address space comes back whole and goes back whole. The
 serial capture is `evidence/e7_gate_reboot.log` (both boots plus the harness
 transcript).
 
+**Run record — B7 under the teeth (2026-11-02).** The teeth arm was re-run with
+the stack clause in place, one invocation and no retries: the teeth build
+(`E7_TOOTH=1`, build id 20261102150403), the capture, then the control and the
+three breaks. All seven expected reds landed where they did in increment 22
+(`descriptor` B2/B3/B4, `no-fd` B3/B4, `no-heap` B4/B5), the control stayed
+green, and B7 was green on all four recordings — with a different reading in
+each, which is the point. The control measured 3,488 bytes below the entry
+`%rsp` with 57,424 untouched (the stop's 2,648 plus 840 from the resumed tail).
+`descriptor` never adopted the tenant, so B7 validated the restarted child's own
+exit scan (byte-identical to the control's, because it re-runs the same
+workload) and did not compare it to the stop. `no-fd`'s adopted tenant exited
+exactly as deep as the stop, which the clause accepts because the monotonic
+check is `>=` — a faithful restore cannot be shallower than the capture, but it
+need not go deeper. `no-heap` left by fault through `process_exit`, which the
+exit report does not ride, so B7 says so by name and checks the stop alone. Each
+tooth directory now carries the capture's `boot1.log` and replays standalone
+with the same line. Evidence: `evidence/e7_gate_teeth_b7.log`.
+
 ---
 
 ## 11. Open questions for review
@@ -3246,7 +3265,7 @@ transcript).
 1. **The first user: designated, built, and censused.** `AeroSLS-Roadmap-2026H2-v0.1.md` §5 says in bold that there is no named first user, and the tree agreed — no Go source, no `std`-Rust binary, every real operational workload bash or Python (§5.5.1) — so the target was a *decision*. It is now made and carried out: the backup operation, as `backup/aerobackup/` (a static single-threaded Rust rewrite of `backup/backup.sh`'s snapshot-and-retain core, 27 tests, no dependencies), designated in `tools/linux_abi_candidate.conf`, with the census measured and checked in at `tools/linux_syscall_census.txt` (§5.6). **The open question is no longer about the first user; it is whether this candidate is narrow enough to gate on.** Its measured surface is 27 syscalls, and the two that are structurally hardest — `arch_prctl(ARCH_SET_FS)` (§5.3) and the vDSO-backed `clock_gettime` — are both now named rather than discovered. Whether the other three operations follow, and in what order, is a product question this design does not answer.
 2. **Stack sizing for Linux tasks — the structure is answered, and the size is now measured.** §5.2 asked for a separate, partition-charged Linux stack decided by measurement rather than by growing `PROC_USER_STACK_PAGES`. The structure is settled and built, since increment 7: a Linux child gets one contiguous, partition-charged region sized from the manifest's `BUDGET` record (`kernel/cap.c`, step 6), because `linux_initial_stack_build()` writes argc/argv/envp/auxv as a single byte span that scattered per-page frames cannot hold. The constant was not grown — `PROC_USER_STACK_PAGES` still sizes `process_create` and `program_spawn_common`, and an SLS child created through the sidecar path keeps its per-page loop. The sizes are policy: the probe and the census candidate ask 16 KiB, the gate's first user asks 64 KiB (`user/sidecar/src/e7_firstuser.rs`), the kernel refuses below two pages by name (the BIB page plus one image page), and the gate log stamps the 64 KiB span it actually got (`stack=0x40000009b000..0x4000000ab000`, `evidence/e7_gate_reboot.log`).
 
-   **Measured.** The gate profile fills `[region base, entry %rsp)` with `0xA5` at create and scans the leading untouched run at the stop and at teardown; the captured pages carry the pattern through the checkpoint, so the teardown scan covers both boots. One plain-image gate run reports the deepest point as **3,488 bytes below the entry %rsp** (`lowest=0x4000000a9050`), leaving **57,424 of the 65,536 bytes untouched** — 8,112 used from the top, 4,096 of them the BIB page. The stop alone saw 2,648 bytes; the resumed tail went 840 bytes deeper, which is why the full-run number is the teardown one (`evidence/e7_stack_hwm.log`). The 64 KiB budget holds with 56 KiB to spare, so the size stays — now recorded instead of assumed.
+   **Measured.** The gate profile fills `[region base, entry %rsp)` with `0xA5` at create and scans the leading untouched run at the stop and at teardown; the captured pages carry the pattern through the checkpoint, so the teardown scan covers both boots. One plain-image gate run reports the deepest point as **3,488 bytes below the entry %rsp** (`lowest=0x4000000a9050`), leaving **57,424 of the 65,536 bytes untouched** — 8,112 used from the top, 4,096 of them the BIB page. The stop alone saw 2,648 bytes; the resumed tail went 840 bytes deeper, which is why the full-run number is the teardown one (`evidence/e7_stack_hwm.log`). The 64 KiB budget holds with 56 KiB to spare, so the size stays — now recorded instead of assumed, and re-derived on every gate run: clause B7 of `tests/e7_gate_check.sh` reads both lines, checks their own arithmetic and the poisoned span across the reboot, and reddens below a 32 KiB floor.
 3. **Where the personality field's setter lives — answered, and built.** §5.6/§3.5 proposed the spawn request, gated on the existing `sidecar_authority`, and increment 2 built exactly that: `SYS_SLS_LINUX_SPAWN` (328) is the same manifest path and request struct as 310 with one argument different, and `cap_create_sidecar_in_personality()` stamps the personality inside the create — before the HELD release, so a schedulable task never carries the wrong one — behind the same E2 authority gate (§10.6), while `proc_clear_resume_state()` clears it on reuse. No new authority bit, and no separate setter that could race the create. The entry stays here as the record of the choice rather than as a question.
 4. **The flood bound.** §10.2 requires a measured bound on a syscall-flooding task. Is "parks, and cannot reduce a neighbour's partition share" the right bar, or should the environment have an explicit syscall-rate ceiling as part of its E3 budget?
 5. **`rseq` and the other modern start-up syscalls — settled by measurement, and the policy is the recommended one.** The design-pass worry was that musl would call `rseq`, `membarrier`-class calls or `prlimit64` at start-up. It does not: the artifact's 26 traced rows plus the declared `clock_gettime` backstop are the candidate's whole surface (`tools/linux_syscall_census.txt`), and no file in `kernel/`, `user/`, `tests/` or `tools/` names any of the three. What was actually being asked — what happens to a number the census does not cover — was decided at increment 3 and has been exercised live: the kernel describes the number and forwards, and the sidecar's default arm answers `-ENOSYS` with the number logged, visible and cheap, never a silent success (§10.6's branch, §10.7's answer set, and §10.8's boot proof, where `getpid` (39) and `sendfile` (40) were refused that way). A later candidate that does call one falls under the same rule: the census is what gets re-run against a new artifact, while the refusal is the default arm. The entry stays here as the record of the decision rather than as a question.
@@ -3263,7 +3282,7 @@ Everything this document asserts about the tree, with its source:
 | The errno map is total over both families and the `CAP_NONE` sentinel, with the reverse defined only on unique preimages | `kernel/linux_abi.h`/`.c`; `tests/linux_errno_map_host_test.c` (51 checks, §10.5) |
 | Every census number — traced and vDSO-declared — has a dispatch class, and the SLS overlaps 105/160/320 are UNKNOWN | `tests/linux_syscall_table_host_test.c` (42 checks) over `tools/linux_syscall_census.txt` |
 | The initial stack builder emits the canonical psABI image with §5.2's AT_* set, no `AT_SYSINFO_EHDR`, and refuses by returning 0 | `tests/linux_initial_stack_host_test.c` (46 checks, the current run; 40 before Q2's scan checks) |
-| The gate workload's stack high-water, from the gate profile's 0xA5 poison and scan: 3,488 bytes below the entry `%rsp` at its deepest, lowest touched `0x4000000a9050`, 57,424 of 65,536 bytes untouched | `kernel/cap.c` (the create-time arm); `kernel/process.c` (`linux_stack_hwm_report`, at the stop and at teardown); `tests/linux_initial_stack_host_test.c`; `evidence/e7_stack_hwm.log` |
+| The gate workload's stack high-water, from the gate profile's 0xA5 poison and scan: 3,488 bytes below the entry `%rsp` at its deepest, lowest touched `0x4000000a9050`, 57,424 of 65,536 bytes untouched — green on the control and all three tooth replays (§10.14) | `kernel/cap.c` (the create-time arm); `kernel/process.c` (`linux_stack_hwm_report`, at the stop and at teardown); `tests/linux_initial_stack_host_test.c`; `tests/e7_gate_check.sh` (B7 re-derives both lines and holds the 32 KiB floor); `evidence/e7_stack_hwm.log` |
 | A Linux-personality task's trap describes-and-refuses before any number chain, from arguments captured before any call | `kernel/syscall_dispatch.c` (`do_syscall`'s first branch); `arch/x86/syscall.asm`'s `[gs:0x50..0x80)` stores; `tests/linux_personality_check.sh` clauses C/C1/D |
 | The personality is explicit at spawn (328), stamped inside the create, gated by E2's `sidecar_authority`, and reset at every slot reuse | `kernel/cap.c` — `cap_create_sidecar_in_personality()`, `sys_sls_linux_spawn()`; `kernel/process.c` — `proc_clear_resume_state()`; guard clauses E/F |
 | The frozen per-CPU offsets are a BUILD error to move, and the request ABI is pinned as literals | `arch/x86/user_paging.h` static asserts; `tests/linux_personality_host_test.c` (210 checks, the current run; 19 at increment 2) |
