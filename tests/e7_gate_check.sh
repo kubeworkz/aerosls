@@ -65,6 +65,10 @@
 #   --live             the source clauses, then the build + the two-boot run
 #   --teeth            the source clauses, then the teeth build + ONE capture
 #                      + four replays (control + the three breaks)
+#   --selfkill         the source clauses, then the self-kill build + ONE boot:
+#                      the gate tenant asks for its own death at the stop while
+#                      RUNNING, the deferred teardown scans its stack, and no
+#                      checkpoint is taken
 #   --replay DIR       validate a recorded run's artifacts only (no build, no
 #                      QEMU) — the same assertions, over boot1.log, boot2.log
 #                      and facts;
@@ -78,8 +82,9 @@
 #                      recorded as not-applicable). --teeth defaults it to 0:
 #                      the breaks are the run's subject, not the wait's.
 #   E7G_BUILD=1        0 reuses E7G_ISO as-is (the caller built it)
-#   E7G_ISO            default sls_operating_system_e3_drill.iso for --live
-#                      and sls_operating_system_e3_teeth.iso for --teeth — both
+#   E7G_ISO            default sls_operating_system_e3_drill.iso for --live,
+#                      sls_operating_system_e3_teeth.iso for --teeth and
+#                      sls_operating_system_e3_selfkill.iso for --selfkill —
 #                      dedicated names, so a run never replaces the plain gate
 #                      image with a build carrying a test-only profile
 #   E7G_BOOT_ENTRY     default 3 (the unified grub entry)
@@ -107,14 +112,16 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LIVE=0
 TEETH=0
+SELF=0
 REPLAY=""
 while [ $# -gt 0 ]; do
     case "$1" in
-        --live)   LIVE=1; shift ;;
-        --teeth)  TEETH=1; shift ;;
-        --replay) REPLAY="${2:-}"; shift 2 ;;
-        -*)       echo "ABORT: unknown argument '$1' (usage: $0 [ROOT] [--live|--teeth] [--replay DIR])" >&2; exit 2 ;;
-        *)        ROOT="$1"; shift ;;
+        --live)     LIVE=1; shift ;;
+        --teeth)    TEETH=1; shift ;;
+        --selfkill) SELF=1; shift ;;
+        --replay)   REPLAY="${2:-}"; shift 2 ;;
+        -*)         echo "ABORT: unknown argument '$1' (usage: $0 [ROOT] [--live|--teeth|--selfkill] [--replay DIR])" >&2; exit 2 ;;
+        *)          ROOT="$1"; shift ;;
     esac
 done
 cd "$ROOT" || exit 2
@@ -627,12 +634,12 @@ if [ -n "$REPLAY" ]; then
     exit 0
 fi
 
-if [ "$LIVE" -eq 0 ] && [ "$TEETH" -eq 0 ]; then
+if [ "$LIVE" -eq 0 ] && [ "$TEETH" -eq 0 ] && [ "$SELF" -eq 0 ]; then
     if [ "$fails" -ne 0 ]; then
         echo "e7_gate_check: $fails clause(s) failed"
         exit 1
     fi
-    echo "e7_gate_check: the gate's source wiring holds (use --live for the run, --teeth for the breaks)"
+    echo "e7_gate_check: the gate's source wiring holds (use --live for the run, --teeth for the breaks, --selfkill for the deferred teardown)"
     exit 0
 fi
 
@@ -640,6 +647,9 @@ fi
 if [ "$LIVE" -eq 1 ]; then
     DRILL="${E7G_DRILL:-1}"
     ISO="${E7G_ISO:-sls_operating_system_e3_drill.iso}"
+elif [ "$SELF" -eq 1 ]; then
+    DRILL=0
+    ISO="${E7G_ISO:-sls_operating_system_e3_selfkill.iso}"
 else
     DRILL="${E7G_DRILL:-0}"
     ISO="${E7G_ISO:-sls_operating_system_e3_teeth.iso}"
@@ -681,9 +691,15 @@ fi
 TOOTH_MAKE=""
 [ "$TOOTH_BUILD" = "1" ] && TOOTH_MAKE=1
 if [ "$BUILD" = "1" ]; then
-    echo "=== build: x86-iso-e3 E3_INIT_FEATURES=e3_envs,e7_gate E7_SLOW_BOOT=$DRILL E7_TOOTH=${TOOTH_MAKE:-<empty>} X86_E3_ISO=$ISO ==="
-    make x86-iso-e3 E3_INIT_FEATURES=e3_envs,e7_gate E7_SLOW_BOOT="$DRILL" \
-        E7_TOOTH="$TOOTH_MAKE" X86_E3_ISO="$ISO" || fail "the gate image did not build"
+    if [ "$SELF" -eq 1 ]; then
+        echo "=== build: x86-iso-e3 E3_INIT_FEATURES=e3_envs,e7_gate E7_SELFKILL=1 X86_E3_ISO=$ISO ==="
+        make x86-iso-e3 E3_INIT_FEATURES=e3_envs,e7_gate E7_SELFKILL=1 \
+            X86_E3_ISO="$ISO" || fail "the self-kill image did not build"
+    else
+        echo "=== build: x86-iso-e3 E3_INIT_FEATURES=e3_envs,e7_gate E7_SLOW_BOOT=$DRILL E7_TOOTH=${TOOTH_MAKE:-<empty>} X86_E3_ISO=$ISO ==="
+        make x86-iso-e3 E3_INIT_FEATURES=e3_envs,e7_gate E7_SLOW_BOOT="$DRILL" \
+            E7_TOOTH="$TOOTH_MAKE" X86_E3_ISO="$ISO" || fail "the gate image did not build"
+    fi
 fi
 [ -f "$ROOT/$ISO" ] || fail "no image at $ISO (E7G_BUILD=0 needs a prebuilt one)"
 
@@ -848,6 +864,99 @@ gate_replay() {   # gate_replay <log> <tag> <body> <artifact-dir>
     } > "$ard/facts"
     [ -f "$ard/boot2.log" ] || fail "boot 2's serial log was not recorded"
 }
+
+# ─── The self-kill arm: the deferred branch, observed live ─────────────────
+# process_kill() defers a RUNNING target, and the scheduler tears it down on
+# its next pass. Nothing else in the gate reaches that branch — every recorded
+# kill targets a parked task — so this mode builds the one image whose gate
+# stop asks for the running tenant's own death, then asserts the request, the
+# deferral, the teardown and the scan in one boot. No checkpoint is involved:
+# the tenant is killed at the copy continuation, so the workload cannot finish.
+assert_selfkill() {
+    local d="$1"
+    local b="$d/boot1.log"
+    local stop exitl n tl el stop_span stop_deep
+    if [ ! -f "$b" ]; then
+        bad "S1. the self-kill boot has no log at $b"
+        return
+    fi
+    if grep -aqF "[E7-GATE] self-kill:" "$b" && \
+       grep -aqE '\[PROC\] PID [0-9]+ kill deferred \(running\)' "$b"; then
+        ok "S1. the kill was requested while the tenant was RUNNING and process_kill() deferred it ($(grep -aoE 'self-kill: process_kill\(pid=[0-9]+\)' "$b" | head -1))"
+    else
+        bad "S1. the self-kill request or its deferral line is missing — the stop arm did not fire, or process_kill() did not see the task RUNNING"
+    fi
+    if grep -aqE "\[PROC\] PID [0-9]+ '[^']*' deferred teardown \(killed while running\)" "$b"; then
+        ok "S2. the scheduler's deferred branch tore the tenant down ($(grep -aoE "\[PROC\] PID [0-9]+ '[^']*' deferred teardown" "$b" | head -1))"
+    else
+        bad "S2. no deferred-teardown line — the scheduler never swept the task it had deferred"
+    fi
+    n=$(grep -acF "[E7-GATE] stack hwm (exit):" "$b")
+    exitl=$(grep -aF "[E7-GATE] stack hwm (exit):" "$b" | tail -1)
+    tl=$(grep -anE "deferred teardown \(killed while running\)" "$b" | head -1 | cut -d: -f1)
+    if [ "$n" -eq 1 ] && [ -n "$exitl" ] && [ -n "$tl" ]; then
+        el=$(grep -anF "[E7-GATE] stack hwm (exit):" "$b" | head -1 | cut -d: -f1)
+        if [ "$el" -gt "$tl" ]; then
+            ok "S3. exactly one stack scan, and it follows the deferred-teardown line (line $el after $tl) — the scan happens at the teardown, not at the request"
+        else
+            bad "S3. the exit scan (line $el) does not follow the deferred teardown (line $tl) — the scan is not being taken at the teardown"
+        fi
+    else
+        bad "S3. expected exactly one exit scan after a deferred teardown; found $n exit line(s), teardown line '${tl:-none}'"
+    fi
+    stop=$(grep -aF "[E7-GATE] stack hwm (stop):" "$b" | tail -1)
+    if [ -z "$stop" ]; then
+        bad "S4. the stop measurement is missing — the arm killed the task before its stack was recorded"
+        return
+    fi
+    hwm_parse "$stop" stop || { bad "S4. $CM"; return; }
+    stop_span="$HWM_SPAN_V"; stop_deep="$HWM_DEEP_V"
+    hwm_parse "$exitl" exit || { bad "S4. $CM"; return; }
+    if [ "$HWM_SPAN_V" -ne "$stop_span" ]; then
+        bad "S4. the deferred scan sees span $HWM_SPAN_V, the stop $stop_span — the same stack was not scanned"
+    elif [ "$HWM_DEEP_V" -lt "$stop_deep" ]; then
+        bad "S4. the deferred scan is shallower ($HWM_DEEP_V) than the stop ($stop_deep) — it is not the same stack's deepest point"
+    else
+        ok "S4. the deferred scan re-measures the same stack: deepest $HWM_DEEP_V below the entry %rsp ($stop_deep at the stop), $HWM_HR_V of $HWM_ALLOC untouched — $((HWM_HR_V * 100 / HWM_ALLOC)).$((HWM_HR_V * 1000 / HWM_ALLOC % 10))% above the floor"
+    fi
+    if [ "$(grep -acF '[backup] Done:' "$b")" -eq 0 ]; then
+        ok "S5. the tenant was taken down mid-copy (no [backup] Done:) — the kill landed on the running workload, not after it finished"
+    else
+        bad "S5. the workload printed [backup] Done: before the deferred teardown — the kill did not land on the running copy"
+    fi
+}
+
+if [ "$SELF" -eq 1 ]; then
+    echo "=== self-kill: create, run to the stop, kill while RUNNING ==="
+    rm -f "$IMG"
+    truncate -s 10G "$IMG" || fail "could not make the NVMe image"
+    boot "$L1" selfkill
+    BASE="http://127.0.0.1:$PORT"
+
+    api "$WD/pcreate.json" -X POST -d '{"name":"e7self"}' "$BASE/api/partitions" || fail "POST /api/partitions"
+    PID=$(jval "$WD/pcreate.json" partition_id)
+    [ -n "$PID" ] && [ "$PID" != "0" ] || fail "no partition id"
+    echo "partition=$PID"
+    api "$WD/create.json" -X POST -d '{"index":1}' "$BASE/api/partition/$PID/env" || fail "POST env"
+    echo "create: $(cat "$WD/create.json")"
+
+    for i in $(seq 1 480); do
+        grep -aqF "deferred teardown (killed while running)" "$L1" && break
+        kill -0 "$QPID" 2>/dev/null || fail "QEMU exited before the deferred teardown"
+        sleep 0.5
+    done
+    sleep 1
+    power_off
+
+    echo "=== self-kill clauses ==="
+    assert_selfkill "$ART"
+    if [ "$fails" -ne 0 ]; then
+        echo "e7_gate_check: $fails clause(s) failed; artifacts in $ART"
+        exit 1
+    fi
+    echo "e7_gate_check: the self-kill case is observed — deferred while RUNNING, torn down and scanned by the scheduler; artifacts in $ART"
+    exit 0
+fi
 
 if [ "$LIVE" -eq 1 ]; then
     rm -f "$IMG"

@@ -104,6 +104,25 @@ ifneq ($(E7_TOOTH),)
   AB_DEFS += -DE7G_TOOTH=1
 endif
 
+# ─── E7_SELFKILL: the gate's deferred-kill case, never a shipped build ───────
+# tests/e7_gate_check.sh --selfkill builds `make x86-iso-e3 E7_SELFKILL=1`,
+# the ONLY build whose gate stop asks process_kill() for the running tenant's
+# own death. That is the deferred path made live: the kill request lands while
+# the task is RUNNING, the scheduler tears it down on its next pass, and the
+# stack scan happens there rather than at the request. Empty here, so every
+# ordinary build compiles the arm out entirely.
+#
+# It joins AB_DEFS for the same reason E7_TOOTH does: the define has to be in
+# the config stamp, or flipping it would silently relink the previous build's
+# objects and the self-kill run would be an ordinary gate image.
+E7_SELFKILL ?=
+ifneq ($(E7_SELFKILL),)
+  ifneq ($(E7_SELFKILL),1)
+    $(error E7_SELFKILL must be empty or 1 (got '$(E7_SELFKILL)'))
+  endif
+  AB_DEFS += -DE7G_SELFKILL=1
+endif
+
 # ─── Rebuild when the CONFIGURATION changes, not only when sources do ────────
 # make compares source timestamps against object timestamps. It has no idea
 # that X86_CFLAGS or TCG_CFLAGS changed, so `make x86-iso SLS_SOFTMMU=on` over

@@ -3223,8 +3223,9 @@ wait-before-repause and pour-after ordering with the report's counters; and the
 teeth's build profile, three arms, route gate and report — and those run in the
 ordinary `tests/*_check.sh` sweep, with no build and no QEMU. `--live` adds the
 drill build and the two boots; `--teeth` adds the teeth build, one capture and
-four replays; `--replay DIR` re-runs the exact assertion function the live arm
-ends with, over a recording, and that function has teeth: a recording with
+four replays; `--selfkill` adds the self-kill build and one boot that observes
+the deferred teardown; `--replay DIR` re-runs the exact assertion function the
+live arm ends with, over a recording, and that function has teeth: a recording with
 `payloads=0` reddens B1, one with the outlived line removed or `stretch-done`
 deleted reddens D1, one with a `wait ended` line injected reddens D2, and a
 tooth recording is judged against the tooth it names — each with its own
@@ -3257,8 +3258,10 @@ the one gap: `no-heap` left by fault through `process_exit`, whose teardown the
 exit report did not ride, so B7 could check only the stop and name the missing
 scan.
 
-The report now sits in both teardown paths — `process_kill` for a normal
-kill/exit, `process_exit` for a fault — called before
+The report now sits at every teardown — `process_kill` for a non-running
+target, `schedule_ring3`'s deferred branch and its sweep of targets that parked
+before the tick (scanned where the kill is carried out, not at the request, when
+the stack could still grow), and `process_exit` for a fault — always before
 `proc_clear_resume_state()` drops the poison identity. The second run (build id
 20261102153754) is otherwise the same invocation: rc=0, the same seven reds,
 the control green. The `no-heap` recording now carries `stack hwm (exit): …
@@ -3268,9 +3271,29 @@ clause counts them, so a task that reported twice would redden rather than be
 read as one. B7's fault carve-out is gone: a recording whose adopted
 tenant has no exit line reddens by name, which was checked against the first
 run's `no-heap` recording and a control with its exit line removed. Each tooth
-directory carries the capture's `boot1.log` and replays standalone. Evidence:
+directory carries the capture's `boot1.log` and replays standalone. None of
+these recordings reaches the deferred branch — the tenant is parked when the
+sidecar kills it — so that site has its own live case, below. Evidence:
 `evidence/e7_gate_teeth_b7.log` (first run),
 `evidence/e7_gate_teeth_exitpass.log` (fault-path scan).
+
+**Run record — the deferred teardown, observed (2026-11-02).** Every recorded
+run above kills a parked task, so the deferred branch had only ever been
+compiled. `tests/e7_gate_check.sh --selfkill` builds the one image whose gate
+stop asks for the running tenant's death (`E7_SELFKILL=1`, compiled out of
+every other build) and takes no checkpoint. The transcript, in order: the
+stop's stack line; `[E7-GATE] self-kill: process_kill(pid=105) requested while
+RUNNING`; `[PROC] PID 105 terminated.`; `[PROC] PID 105 kill deferred (running)
+— teardown at next schedule`; then the scheduler's `[PROC] PID 105
+'e7.gate.user.0' deferred teardown (killed while running)` immediately followed
+by `[E7-GATE] stack hwm (exit): … deepest=2648`. The deferred scan re-measures
+the same span (60,912 bytes) and the same deepest point as the stop (2,648,
+88.9% headroom), exactly once, and no `[backup] Done:` appears — the tenant was
+taken down mid-copy. The sweep this needed is part of the change: a deferred
+kill is a property of the kill, not of which task the timer happened to
+interrupt, so a target that parks before the tick is torn down on the next
+pass instead of waiting to be scheduled. Evidence:
+`evidence/e7_gate_selfkill.log`.
 
 ---
 
@@ -3297,6 +3320,7 @@ Everything this document asserts about the tree, with its source:
 | Every census number — traced and vDSO-declared — has a dispatch class, and the SLS overlaps 105/160/320 are UNKNOWN | `tests/linux_syscall_table_host_test.c` (42 checks) over `tools/linux_syscall_census.txt` |
 | The initial stack builder emits the canonical psABI image with §5.2's AT_* set, no `AT_SYSINFO_EHDR`, and refuses by returning 0 | `tests/linux_initial_stack_host_test.c` (46 checks, the current run; 40 before Q2's scan checks) |
 | The gate workload's stack high-water, from the gate profile's 0xA5 poison and scan: 3,488 bytes below the entry `%rsp` at its deepest, lowest touched `0x4000000a9050`, 57,424 of 65,536 bytes untouched — green on the control and all three tooth replays, the fault path included (§10.14) | `kernel/cap.c` (the create-time arm); `kernel/process.c` (`linux_stack_hwm_report`, at the stop and at teardown); `tests/linux_initial_stack_host_test.c`; `tests/e7_gate_check.sh` (B7 re-derives both lines and holds the 32 KiB floor); `evidence/e7_stack_hwm.log` |
+| A deferred kill's stack is scanned at the teardown, not at the request: the self-kill run's request lands while the tenant is RUNNING, the scheduler sweeps it, and exactly one scan follows the teardown line on the same span (2,648 deep, 88.9% headroom) | `kernel/process.c` (`proc_deferred_teardown`, the `E7G_SELFKILL` stop arm, `schedule_ring3`'s sweep); `Makefile`'s `E7_SELFKILL`; `tests/e7_gate_check.sh --selfkill`; `evidence/e7_gate_selfkill.log` |
 | A Linux-personality task's trap describes-and-refuses before any number chain, from arguments captured before any call | `kernel/syscall_dispatch.c` (`do_syscall`'s first branch); `arch/x86/syscall.asm`'s `[gs:0x50..0x80)` stores; `tests/linux_personality_check.sh` clauses C/C1/D |
 | The personality is explicit at spawn (328), stamped inside the create, gated by E2's `sidecar_authority`, and reset at every slot reuse | `kernel/cap.c` — `cap_create_sidecar_in_personality()`, `sys_sls_linux_spawn()`; `kernel/process.c` — `proc_clear_resume_state()`; guard clauses E/F |
 | The frozen per-CPU offsets are a BUILD error to move, and the request ABI is pinned as literals | `arch/x86/user_paging.h` static asserts; `tests/linux_personality_host_test.c` (210 checks, the current run; 19 at increment 2) |

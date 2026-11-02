@@ -12,6 +12,13 @@
 #include "syscall_dispatch.h"   /* Seed Kernel Phase 1.5: do_syscall() from cap_recv_resume() */
 #include "linux_abi.h"   /* E7 increment 2: PROC_PERSONALITY_* for proc_clear_resume_state() */
 
+/* E7_SELFKILL: the gate's deferred-kill arm (`make x86-iso-e3 E7_SELFKILL=1`,
+ * never a shipped build). The Makefile puts the define in AB_DEFS, so it is
+ * part of the build-config stamp. */
+#ifndef E7G_SELFKILL
+#define E7G_SELFKILL 0
+#endif
+
 /* Seed Kernel Phase 1.5: the resume path iretq's into cap_recv_resume(),
  * which re-runs the parked recv and then jumps to the syscall stub's shared
  * return path (`.syscall_return` in arch/x86/syscall.asm, exported here). */
@@ -1502,6 +1509,23 @@ static void proc_strand_diag_tick(void) {
 // Partition-fair round-robin (Phase 12) between RUNNING/SUSPENDED Ring-3
 // processes — see pick_next_partition()/pick_next_process_in_partition()
 // above for the algorithm. Writes the chosen process's context to the
+// The one teardown a deferred kill gets, wherever the scheduler catches the
+// task. The stack report runs BEFORE proc_clear_resume_state() drops the
+// poison identity, and the three teardown steps mirror process_kill()'s for a
+// target that is not executing.
+static void proc_deferred_teardown(struct ProcessDescriptor* pd) {
+    kernel_serial_printf(
+        "[PROC] PID %u '%s' deferred teardown (killed while running)\n",
+        pd->pid, pd->name);
+    linux_stack_maybe_report(pd, "exit");
+    proc_clear_resume_state(pd);
+    cap_table_teardown(pd->pid);
+    user_destroy_page_table(pd->cr3);
+    proc_free_syscall_stack(pd);
+    pd->active = 0;
+    proc_count--;
+}
+
 // interrupt stack and returns ctx_rsp (same pointer; caller pops GPRs +
 // iretq from the updated stack).
 uint64_t schedule_ring3(uint64_t ctx_rsp) {
@@ -1538,15 +1562,20 @@ uint64_t schedule_ring3(uint64_t ctx_rsp) {
      * in between (single CPU, IF=0 inside the timer ISR). Making the
      * process inactive now also excludes it from the pick below. */
     if (current->pending_teardown) {
-        proc_clear_resume_state(current);
-        kernel_serial_printf(
-            "[PROC] PID %u '%s' deferred teardown (killed while running)\n",
-            current->pid, current->name);
-        cap_table_teardown(current->pid);
-        user_destroy_page_table(current->cr3);
-        proc_free_syscall_stack(current);
-        current->active = 0;
-        proc_count--;
+        proc_deferred_teardown(current);
+    }
+
+    /* A deferred kill is a property of the kill, not of which task the timer
+     * happened to interrupt. The target can park in a syscall, be held, or be
+     * switched away before the tick that would have found it RUNNING, so sweep
+     * the rest of the table here — the one place that runs with a saved
+     * context and a stable page table, before the next pick. The current task
+     * was handled above; a RUNNING entry here would be it (single CPU), so the
+     * state check is also the double-teardown guard. */
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct ProcessDescriptor* pd = &proc_table[i];
+        if (!pd->active || !pd->pending_teardown || pd->state == PROC_RUNNING) continue;
+        proc_deferred_teardown(pd);
     }
 
     // Phase 12: pick a partition first (round-robin, skipping ones with
@@ -1930,12 +1959,12 @@ int cap_wait_chans(const uint32_t* chan_ids, uint32_t n, void* req,
  * leading untouched run from the region's base. Measured twice: at the stop
  * (boot 1's work half) and at teardown (boot 2's continuation — the captured
  * pages carried the same poison through the checkpoint, so the scan sees the
- * deepest point of BOTH boots). Teardown has two paths, process_kill for a
- * normal kill/exit and process_exit for a task that dies on the fault path;
- * both report, so a tenant killed by a bad page is still measured. `alloc` is
- * the whole region; `poison-span` is what the create armed below the entry
- * %rsp; `deepest` is how much of that the workload wrote; `lowest` is the
- * lowest address it touched. */
+ * deepest point of BOTH boots). Teardown has three sites: process_kill for a
+ * non-running target, schedule_ring3's deferred branch for one killed while
+ * running, and process_exit for a fault; all report, so a tenant killed by a
+ * bad page is still measured. `alloc` is the whole region; `poison-span` is
+ * what the create armed below the entry %rsp; `deepest` is how much of that
+ * the workload wrote; `lowest` is the lowest address it touched. */
 static void linux_stack_hwm_report(struct ProcessDescriptor *pd,
                                    const char *where) {
     size_t headroom;
@@ -1971,6 +2000,27 @@ static void linux_stack_hwm_report(struct ProcessDescriptor *pd,
 int proc_gate_stop_at_sysret(uint64_t ret) {
     struct ProcessDescriptor* cur = process_find_current();
     if (!cur || !cur->gate_profile) return 0;
+
+#if E7G_SELFKILL
+    /* Gate-only, never a shipped build. The stop is the one instant a poisoned
+     * Linux task is provably RUNNING inside its own trap, so this is where the
+     * kernel can ask for its death the way a self-kill would: process_kill()
+     * sees PROC_RUNNING and defers, and the next scheduler pass tears the task
+     * down and scans its stack. Return to the caller so the sysret proceeds —
+     * the task keeps running until that pass, which is the point. gate_stopped
+     * makes the arm one-shot even if the copy reaches the offset again. */
+    if (!cur->gate_stopped) {
+        cur->gate_stopped = 1;
+        linux_stack_hwm_report(cur, "stop");
+        kernel_serial_printf(
+            "[E7-GATE] self-kill: process_kill(pid=%u) requested while RUNNING\n",
+            cur->pid);
+        process_kill(cur->pid);
+    }
+    /* This build never holds the tenant at the stop: the kill is the case, and
+     * every later reach of the offset returns straight to the sysret. */
+    return 0;
+#endif
 
     const struct CapParkCtx* p = &cur->park_ctx;
     uint64_t* c = (uint64_t*)&cur->ring3_ctx;
@@ -2402,12 +2452,6 @@ uint32_t sys_sls_getppid(void) {
 void process_kill(uint32_t pid) {
     for (int i = 0; i < PROC_MAX; i++) {
         if (!proc_table[i].active || proc_table[i].pid != pid) continue;
-        /* Q2: the report keys on the poison identity, NOT gate_profile — the
-         * pour spends the stop by clearing gate_profile (one-shot), and the
-         * resumed task's teardown is exactly the scan that covers boot 2.
-         * process_exit reports on the same rule; a task leaves through one
-         * path or the other, never both. */
-        linux_stack_maybe_report(&proc_table[i], "exit");
         kernel_serial_printf("[PROC] PID %u terminated.\n", pid);
         if (proc_table[i].state == PROC_RUNNING) {
             /* Self-kill (SYS_SLS_PROC_KILL with one's own pid) or any
@@ -2421,8 +2465,18 @@ void process_kill(uint32_t pid) {
             kernel_serial_printf(
                 "[PROC] PID %u kill deferred (running) — teardown at next "
                 "schedule\n", pid);
+            /* No report here: the stack is still live and may grow before the
+             * deferred teardown runs. schedule_ring3 scans it at that point. */
             return;
         }
+        /* Q2: the report keys on the poison identity, NOT gate_profile — the
+         * pour spends the stop by clearing gate_profile (one-shot), and the
+         * resumed task's teardown is exactly the scan that covers boot 2.
+         * This target is not running, so the teardown is here and so is the
+         * scan; a RUNNING one defers and is scanned in schedule_ring3's
+         * deferred branch, and process_exit reports on the same rule. A task
+         * leaves through one of the three sites, never more than one. */
+        linux_stack_maybe_report(&proc_table[i], "exit");
         proc_table[i].state  = PROC_ZOMBIE;
         /* Phase 2 teardown, same three steps and same ordering as
          * process_exit(): the target is not executing (its CR3 is not
