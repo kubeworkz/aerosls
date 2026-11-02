@@ -1194,3 +1194,19 @@ uint64_t linux_initial_stack_build(uint8_t *region, size_t region_bytes,
 
     return p->region_vaddr + (uint64_t)argc_off;
 }
+
+/* ─── Q2: the stack high-water scan ───────────────────────────────────────
+ * The gate profile poisons the span below the entry %rsp at create and asks
+ * this how much of it the workload never touched. The stack grows DOWN from
+ * %rsp, so the touched bytes form a suffix of the span; the untouched prefix
+ * is the headroom. A NULL region or zero span reports 0 ("nothing measured"),
+ * which the caller must not read as "no headroom" — it checks the span first.
+ */
+size_t linux_stack_hwm_headroom(const uint8_t *region, size_t bytes,
+                                uint8_t poison)
+{
+    size_t i = 0;
+    if (!region) return 0;
+    while (i < bytes && region[i] == poison) i++;
+    return i;
+}

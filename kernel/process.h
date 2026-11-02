@@ -198,6 +198,18 @@ struct ProcessDescriptor {
                                        // leaves it 0 (its pages are the image
                                        // window, which the walk knows).
     uint64_t   linux_image_hi;
+    // ── Q2: the gate stack's high-water measurement ──────────────────────
+    // The gate profile poisons the unused span below the entry %rsp at
+    // create and scans it at the stop and at teardown. These four fields
+    // are the region's identity: its child-vaddr base, the contiguous
+    // physical base (linux_stack_phys — one allocation, which is what makes
+    // the scan possible), its page count, and how many bytes below the entry
+    // %rsp carry the poison. Zeroed at slot reuse beside the heap/image
+    // fields; a non-gate create leaves them 0 and no scan runs.
+    uint64_t   linux_stack_base;
+    uint64_t   linux_stack_phys;
+    uint32_t   linux_stack_pages;
+    uint32_t   linux_stack_poison;      // bytes below entry %rsp (0 = no measurement)
     uint64_t   mem_stage_num;          // §5.4: a brk captured at the first trap
                                        // (a break only means something against the
                                        // break the FIRST trap saw) — held for the

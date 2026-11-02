@@ -224,6 +224,29 @@ int main(void)
     CHECK(linux_initial_stack_build(NULL, sizeof(region), &p) == 0,
           "a NULL region is refused");
 
+    /* ─── Q2: the high-water scan is pure over the stack bytes ────────────── */
+    {
+        uint8_t s[64];
+        memset(s, LINUX_STACK_POISON, sizeof(s));
+        CHECK(linux_stack_hwm_headroom(s, sizeof(s), LINUX_STACK_POISON)
+              == sizeof(s), "an untouched span reports all of it as headroom");
+        s[0] = 0;
+        CHECK(linux_stack_hwm_headroom(s, sizeof(s), LINUX_STACK_POISON) == 0,
+              "a write at the region's base leaves zero headroom");
+        memset(s, LINUX_STACK_POISON, sizeof(s));
+        s[37] = 0;
+        CHECK(linux_stack_hwm_headroom(s, sizeof(s), LINUX_STACK_POISON) == 37,
+              "the scan stops at the lowest touched byte, not the highest");
+        memset(s, LINUX_STACK_POISON, sizeof(s));
+        s[63] = 0;
+        CHECK(linux_stack_hwm_headroom(s, sizeof(s), LINUX_STACK_POISON) == 63,
+              "a write just below the entry %rsp reports the deepest headroom");
+        CHECK(linux_stack_hwm_headroom(NULL, sizeof(s), LINUX_STACK_POISON) == 0,
+              "a NULL region reports nothing measured, never headroom");
+        CHECK(linux_stack_hwm_headroom(s, 0, LINUX_STACK_POISON) == 0,
+              "a zero span reports nothing measured");
+    }
+
     printf("linux_initial_stack_host_test: %d passed, %d failed\n",
            checks_passed, checks_failed);
     return checks_failed == 0 ? 0 : 1;

@@ -4129,6 +4129,24 @@ int cap_create_sidecar_in_personality(uint32_t parent_pid,
             return CAP_EINVAL;
         }
         pd->user_rsp = built_rsp;
+        /* ── Q2: arm the gate stack's high-water measurement ──────────────
+         * The builder wrote the initial image upward from argc_off, so
+         * [region base, built_rsp) is stack the workload has not touched
+         * yet. Poison it — gate profile only, so no shipped environment
+         * carries the pattern — and remember the region's identity for the
+         * scan at the stop and at teardown. The span is below %rsp, which
+         * the psABI already treats as dead; the top page (the BIB) and the
+         * image above %rsp are outside it by construction. */
+        if (m.flags & SIDECAR_MANIFEST_FLAG_GATE) {
+            uint64_t poison_bytes = built_rsp - stack_base;
+            uint8_t* p = (uint8_t*)(uintptr_t)linux_stack_phys;
+            uint64_t b;
+            for (b = 0; b < poison_bytes; b++) p[b] = LINUX_STACK_POISON;
+            pd->linux_stack_base   = stack_base;
+            pd->linux_stack_phys   = linux_stack_phys;
+            pd->linux_stack_pages  = stk_pages;
+            pd->linux_stack_poison = (uint32_t)poison_bytes;
+        }
     }
     pd->owner_uid  = parent->owner_uid;
     pd->parent_pid = parent_pid;

@@ -165,6 +165,14 @@ static void proc_clear_resume_state(struct ProcessDescriptor* pd) {
      * previous occupant's image pages as if they were this task's own. */
     pd->linux_image_lo = 0;
     pd->linux_image_hi = 0;
+    /* Q2: the gate stack's measurement identity clears with the span for the
+     * same reason — a reused slot must not scan (or report) its predecessor's
+     * freed frames, and the poison count is what says whether a measurement
+     * was ever armed for THIS occupant. */
+    pd->linux_stack_base = 0;
+    pd->linux_stack_phys = 0;
+    pd->linux_stack_pages = 0;
+    pd->linux_stack_poison = 0;
     pd->mem_stage_num = 0;
     pd->mem_stage_a0 = 0;
     pd->mem_stage_a1 = 0;
@@ -1894,6 +1902,34 @@ int cap_wait_chans(const uint32_t* chan_ids, uint32_t n, void* req,
     return 1;   /* unreachable */
 }
 
+/* ─── Q2: the gate stack's high-water report ─────────────────────────────
+ * The create poisoned the span below the entry %rsp, so the headroom is the
+ * leading untouched run from the region's base. Measured twice: at the stop
+ * (boot 1's work half) and at teardown (boot 2's continuation — the captured
+ * pages carried the same poison through the checkpoint, so the scan sees the
+ * deepest point of BOTH boots). `alloc` is the whole region; `poison-span`
+ * is what the create armed below the entry %rsp; `deepest` is how much of
+ * that the workload wrote; `lowest` is the lowest address it touched. */
+static void linux_stack_hwm_report(struct ProcessDescriptor *pd,
+                                   const char *where) {
+    size_t headroom;
+    uint64_t alloc;
+    if (!pd || !pd->linux_stack_poison || !pd->linux_stack_phys) return;
+    headroom = linux_stack_hwm_headroom(
+        (const uint8_t *)(uintptr_t)pd->linux_stack_phys,
+        (size_t)pd->linux_stack_poison, LINUX_STACK_POISON);
+    alloc = (uint64_t)pd->linux_stack_pages * 4096;
+    kernel_serial_printf(
+        "[E7-GATE] stack hwm (%s): alloc=%lu poison-span=%lu headroom=%lu "
+        "deepest=%lu lowest=0x%llx\n",
+        where,
+        (unsigned long)alloc,
+        (unsigned long)pd->linux_stack_poison,
+        (unsigned long)headroom,
+        (unsigned long)((size_t)pd->linux_stack_poison - headroom),
+        (unsigned long long)(pd->linux_stack_base + (uint64_t)headroom));
+}
+
 /* ─── E7 increment 21: the gate workload's stop ──────────────────────────
  * B9's instant, made deterministic: the sysret that follows the read whose
  * replies have returned PROC_GATE_SRC_OFF bytes. The trap path calls this
@@ -1947,6 +1983,8 @@ int proc_gate_stop_at_sysret(uint64_t ret) {
         cur->pid, cur->name, (unsigned long)cur->gate_bytes,
         (unsigned long long)cur->user_rip,
         (unsigned long long)cur->user_rsp, (unsigned long)ret);
+
+    linux_stack_hwm_report(cur, "stop");
 
     struct ProcessDescriptor* next = pick_next_runnable();
     if (!next) {
@@ -2338,6 +2376,12 @@ uint32_t sys_sls_getppid(void) {
 void process_kill(uint32_t pid) {
     for (int i = 0; i < PROC_MAX; i++) {
         if (!proc_table[i].active || proc_table[i].pid != pid) continue;
+        /* Q2: the report keys on the poison identity, NOT gate_profile — the
+         * pour spends the stop by clearing gate_profile (one-shot), and the
+         * resumed task's teardown is exactly the scan that covers boot 2. */
+        if (proc_table[i].personality == PROC_PERSONALITY_LINUX &&
+            proc_table[i].linux_stack_poison)
+            linux_stack_hwm_report(&proc_table[i], "exit");
         kernel_serial_printf("[PROC] PID %u terminated.\n", pid);
         if (proc_table[i].state == PROC_RUNNING) {
             /* Self-kill (SYS_SLS_PROC_KILL with one's own pid) or any

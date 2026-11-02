@@ -558,10 +558,15 @@ fi
 if [ "$TOOTH_BUILD" != "0" ] && [ "$TOOTH_BUILD" != "1" ]; then
     fail "E7G_TOOTH must be 0 or 1 (got '$TOOTH_BUILD')"
 fi
+# The Makefile's knob is EMPTY-or-1: 0 is refused by name (it cannot be told
+# apart from an unset value in the config stamp). The control build therefore
+# passes the empty string; only the teeth build passes 1.
+TOOTH_MAKE=""
+[ "$TOOTH_BUILD" = "1" ] && TOOTH_MAKE=1
 if [ "$BUILD" = "1" ]; then
-    echo "=== build: x86-iso-e3 E3_INIT_FEATURES=e3_envs,e7_gate E7_SLOW_BOOT=$DRILL E7_TOOTH=$TOOTH_BUILD X86_E3_ISO=$ISO ==="
+    echo "=== build: x86-iso-e3 E3_INIT_FEATURES=e3_envs,e7_gate E7_SLOW_BOOT=$DRILL E7_TOOTH=${TOOTH_MAKE:-<empty>} X86_E3_ISO=$ISO ==="
     make x86-iso-e3 E3_INIT_FEATURES=e3_envs,e7_gate E7_SLOW_BOOT="$DRILL" \
-        E7_TOOTH="$TOOTH_BUILD" X86_E3_ISO="$ISO" || fail "the gate image did not build"
+        E7_TOOTH="$TOOTH_MAKE" X86_E3_ISO="$ISO" || fail "the gate image did not build"
 fi
 [ -f "$ROOT/$ISO" ] || fail "no image at $ISO (E7G_BUILD=0 needs a prebuilt one)"
 

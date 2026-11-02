@@ -782,6 +782,18 @@ struct LinuxInitStackParams {
 uint64_t linux_initial_stack_build(uint8_t *region, size_t region_bytes,
                                    const struct LinuxInitStackParams *p);
 
+/* ─── Q2: the stack high-water scan (E7's gate measurement) ───────────────
+ * The gate profile fills the unused span below the entry %rsp with
+ * LINUX_STACK_POISON at create, then scans it at the stop and at teardown:
+ * the leading run still holding the poison is the headroom the workload
+ * left. Pure over the bytes, so the host test can bite without a boot; the
+ * kernel passes the stack's contiguous physical base, which is what makes
+ * the region scannable at all (§5.2's single-span requirement, used for a
+ * measurement rather than only for the initial image). */
+#define LINUX_STACK_POISON  0xA5u
+size_t linux_stack_hwm_headroom(const uint8_t *region, size_t bytes,
+                                uint8_t poison);
+
 /* ─── The personality (E7 increment 2, §3.3/§3.5) ─────────────────────────
  * A task's personality decides what its `rax` MEANS at the trap, and it is
  * explicit at spawn — never inferred from bytes (§5.1) — so the values
