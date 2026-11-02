@@ -65,6 +65,9 @@ void ckpt_mark_dirty(uint32_t region) {
 
 static int checks_passed = 0;
 static int checks_failed = 0;
+/* E7 increment 20: env_ckpt.c's Linux-task stamp logs one line; this test
+ * links the record layer without kernel_io.c, so the sink is here. */
+void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 #define CHECK(cond, msg) do { \
     if (!(cond)) { printf("FAIL: %s\n", msg); checks_failed++; } \
     else         { printf("ok:   %s\n", msg); checks_passed++; } \

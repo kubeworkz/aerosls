@@ -84,6 +84,26 @@ else ifneq ($(SLS_SOFTMMU),off)
 $(error SLS_SOFTMMU must be 'on' or 'off', got '$(SLS_SOFTMMU)')
 endif
 
+# ─── E7_TOOTH: the gate's break arms (increment 22), never a shipped build ──
+# tests/e7_gate_check.sh --teeth builds `make x86-iso-e3 E7_TOOTH=1`, the ONLY
+# build that carries the three fault-injection arms kernel/env_payload.h
+# documents (a dropped Linux task record, a read of a fd the table does not
+# carry, a reply destination page unmapped before the forward). Empty here, so
+# every ordinary build — the shipped image, the default E3 image, and the gate
+# image itself — compiles them out entirely.
+#
+# It joins AB_DEFS for the reason SLS_SOFTMMU does: objects do not track their
+# compile flags, so the value must be IN the config stamp, or flipping it would
+# silently relink the previous build's objects and a "teeth" run would be the
+# control wearing a different filename.
+E7_TOOTH ?=
+ifneq ($(E7_TOOTH),)
+  ifneq ($(E7_TOOTH),1)
+    $(error E7_TOOTH must be empty or 1 (got '$(E7_TOOTH)'))
+  endif
+  AB_DEFS += -DE7G_TOOTH=1
+endif
+
 # ─── Rebuild when the CONFIGURATION changes, not only when sources do ────────
 # make compares source timestamps against object timestamps. It has no idea
 # that X86_CFLAGS or TCG_CFLAGS changed, so `make x86-iso SLS_SOFTMMU=on` over
@@ -1061,6 +1081,17 @@ CARGO            ?= cargo
 # `e3_envs` (see x86-iso-e3) so init spawns tenant environments; the feature is
 # defined solely in user/init/Cargo.toml, hence init-only.
 INIT_FEATURES    ?=
+# The E7 gate image boots a quiet /etc/init.rc: the demo applets' IRQ storm
+# owns the serial port while the gate tenant runs (measured: the tenant
+# faulted before its first syscall). Derived from INIT_FEATURES so the
+# shipped image and the default E3 image keep the full script.
+BOOTIMAGE_QUIET = $(if $(findstring e7_gate,$(INIT_FEATURES)),--quiet-init)
+# E7 §10.14's STALL DRILL, never a shipped profile: builds the POSIX sidecar
+# with `e7_slow_boot`, which makes the gate profile's own boot outlast the
+# pour's old fixed bound so a live run can prove the stall-bounded wait
+# extends. Enabled only by the drill (see .e7g_stall_drill.sh); empty here.
+E7_SLOW_BOOT ?=
+SIDECAR_SLOW_BOOT = $(if $(filter 1,$(E7_SLOW_BOOT)),--features aerosls-sidecar/e7_slow_boot)
 SIDECAR_INIT_ELF   ?= user/target/x86_64-unknown-none/release/init
 SIDECAR_DM_ELF     ?= user/target/x86_64-unknown-none/release/dm
 SIDECAR_POSIX_ELF ?= user/target/x86_64-unknown-none/release/posix
@@ -1121,7 +1152,7 @@ selfhost-bootimage:
 	@# aerosls-bootimage directly; a stamp is only for an archive this target
 	@# built.) tests/sidecar_stamp_check.sh clause G holds this line.
 	@$(CARGO) build --quiet --manifest-path user/Cargo.toml -p aerosls-dm -p aerosls-sidecar -p aerosls-ramdisk -p aerosls-network -p aerosls-e1000-driver \
-		--features target --target x86_64-unknown-none --release \
+		--features target $(SIDECAR_SLOW_BOOT) --target x86_64-unknown-none --release \
 		--bin dm --bin posix --bin ramdisk --bin network --bin e1000_driver \
 		|| { echo "[SELFHOST] REFUSING to pack and stamp: the sidecars did not build for x86_64-unknown-none." >&2; \
 		     echo "           The stamp attests the packed binaries, and reusing existing ones would make it a lie." >&2; \
@@ -1178,7 +1209,8 @@ selfhost-bootimage:
 	$(CARGO) run --quiet --manifest-path user/Cargo.toml -p aerosls-bootimage -- \
 		--init "$(SIDECAR_INIT_BIN)" --dm "$(SIDECAR_DM_BIN)" \
 		--posix "$(SIDECAR_POSIX_BIN)" --ramdisk "$(SIDECAR_RAMDISK_BIN)" \
-		--net "$(SIDECAR_NET_BIN)" --e1000 "$(SIDECAR_E1000_BIN)" -o "$(SIDECAR_CPIO)"
+		--net "$(SIDECAR_NET_BIN)" --e1000 "$(SIDECAR_E1000_BIN)" -o "$(SIDECAR_CPIO)" \
+		$(BOOTIMAGE_QUIET)
 	@echo "[SELFHOST] boot image: $(SIDECAR_CPIO) (load as an initrd at the bootloader's module path)"
 	@# The stamps, written HERE because this is the only target that packs an
 	@# archive: `x86-iso` ships $(SIDECAR_CPIO) and refuses one whose stamps do
@@ -1240,14 +1272,21 @@ selfhost-bootimage:
 # environments come up at distinct storage addresses.
 SIDECAR_E3_CPIO ?= sidecars_e3.cpio
 X86_E3_ISO      ?= sls_operating_system_e3.iso
+# The E3 image's init features. The default is the published two-tenant
+# boot; the E7 gate work-half builds with `E3_INIT_FEATURES=e3_envs,e7_gate`
+# so environment 1 carries the gate marker while the default image is
+# unchanged. Comma-separated: the recipe passes the value straight to
+# cargo's --features, which would read a space-separated list as a second
+# positional argument.
+E3_INIT_FEATURES ?= e3_envs
 
 .PHONY: selfhost-bootimage-e3 x86-iso-e3
 selfhost-bootimage-e3:
-	@$(MAKE) selfhost-bootimage INIT_FEATURES=e3_envs SIDECAR_CPIO="$(SIDECAR_E3_CPIO)"
+	@$(MAKE) selfhost-bootimage INIT_FEATURES="$(E3_INIT_FEATURES)" SIDECAR_CPIO="$(SIDECAR_E3_CPIO)"
 
 x86-iso-e3: selfhost-bootimage-e3
 	@$(MAKE) x86-iso SIDECAR_CPIO="$(SIDECAR_E3_CPIO)" X86_ISO="$(X86_E3_ISO)"
-	@echo "[ISO-E3] $(X86_E3_ISO) — init built with e3_envs (2 tenant POSIX environments)"
+	@echo "[ISO-E3] $(X86_E3_ISO) — init built with $(E3_INIT_FEATURES)"
 
 # ── SIMI host toolchain ─────────────────────────────────────────────────────
 # Assembler/interpreter/disassembler/JIT-test for SIMI bytecode (tools/simi/).

@@ -163,6 +163,17 @@ const LINUX_TKILL: u64 = 200;
 /// numbers (addr/len/prot/flags) so "the allocator asked for X and this
 /// shim answered Y" is read off the line, never reconstructed.
 const LINUX_MMAP: u64 = 9;
+/// clock_gettime (228) — the census's vDSO-backstopped row, and a REAL
+/// trap here because this kernel ships no vDSO (§5.5). The reply is one
+/// Linux `struct timespec` (two LE i64s) at args[1]; the kernel's plan
+/// and deliver own the 16-byte copy-out.
+const LINUX_CLOCK_GETTIME: u64 = 228;
+const TIMESPEC_BYTES: usize = 16;
+/// 2026-01-07T00:00:00Z — the day after the six staged old backups, so
+/// the backup's timestamped name cannot collide with one of them. The
+/// gate pins the value instead of reading a wall clock; a fixed epoch is
+/// what makes the run's file name reproducible.
+const GATE_EPOCH_SECS: u64 = 1_767_744_000;
 const SIGACT_BYTES: usize = 32; /* kernel-ABI struct sigaction: four u64s */
 const SIGSET_BYTES: u64 = 8;    /* the sigset this seam crosses            */
 
@@ -492,6 +503,29 @@ fn answer(
         218 => {
             sig.tid = args[0];
             Answer::Reply(args[0], STATUS_OK)
+        }
+        /* clock_gettime (228, LSC_LOCAL — E7 increment 19): the seam has
+         * no vDSO to backstop it, so the sidecar answers the call itself.
+         * CLOCK_REALTIME is the pinned gate epoch; CLOCK_MONOTONIC starts
+         * at zero (the workload only needs a readable clock, not an
+         * advancing one). Other clock ids are EINVAL, Linux's own answer
+         * for a clock this shim does not carry. The kernel stages the
+         * 16-byte destination and refuses a NULL/foreign span before any
+         * post; args[1] == 0 here is unreachable, but answering EINVAL
+         * (rather than fabricating a success) keeps the twin honest. */
+        LINUX_CLOCK_GETTIME => {
+            if args[1] == 0 {
+                return Answer::Reply(0, E_INVAL);
+            }
+            let (sec, nsec): (u64, u64) = match args[0] {
+                0 => (GATE_EPOCH_SECS, 0), /* CLOCK_REALTIME  */
+                1 => (0, 0),               /* CLOCK_MONOTONIC */
+                _ => return Answer::Reply(0, E_INVAL),
+            };
+            let mut b = [0u8; FD_PAYLOAD_CAP];
+            b[0..8].copy_from_slice(&sec.to_le_bytes());
+            b[8..16].copy_from_slice(&nsec.to_le_bytes());
+            Answer::ReplyBytes(0, TIMESPEC_BYTES, b)
         }
         /* write (1, LSC_FD — the fd class, E7 increment 5): the fd table
          * decides, exactly as Phase 2 §3 puts the core between a
@@ -1002,6 +1036,7 @@ fn payload_bound(num: u64, args: &[u64; 6], len: usize) -> bool {
         LINUX_READ => args[1] != 0 && len <= args[2] as usize
             && len <= FD_PAYLOAD_CAP,
         LINUX_GETDENTS64 => args[1] != 0 && len <= DENTS_PAYLOAD_CAP,
+        LINUX_CLOCK_GETTIME => args[1] != 0 && len == TIMESPEC_BYTES,
         _ => false,
     }
 }
@@ -1022,6 +1057,7 @@ fn answer_file<K: Kernel, A: BufferAlloc>(
     vt: u32,
     vfs: &mut Vfs<K, A>,
     payload: &[u8],
+    gate: bool,   /* increment 21: this is the gate profile's first user */
 ) -> Answer {
     /* The descriptor each fd-numbered arm looks up once: EBADF by the
      * slot rule (guard M4's twin over the new table shape). The COPY
@@ -1032,6 +1068,24 @@ fn answer_file<K: Kernel, A: BufferAlloc>(
         fd_slot(fds, fd).copied().ok_or(E_BADF)
     }
     match num {
+        /* write (1): the file-class half of increment 5's console write.
+         * The bytes arrived behind the request (the kernel's copy-out),
+         * the fd table decides the destination, and the VFS's own write
+         * returns the count — count-truth, like read in the other
+         * direction. A console descriptor keeps the console arm's
+         * Answer::Write (service drains it to the console); every other
+         * kind falls to the fd table's own refusal. */
+        LINUX_WRITE => match slot_of(fds, args[0]) {
+            Ok(s) if s.kind == FD_KIND_CONSOLE => Answer::Write(args[2] as usize),
+            Ok(s) if s.kind == FD_KIND_FILE => {
+                match vfs.write(vt, s.vfs_fd, payload) {
+                    Ok(n) => Answer::Reply(n as u64, STATUS_OK),
+                    Err(e) => Answer::Reply(0, cap_of(e)),
+                }
+            }
+            Ok(_) => Answer::Reply(0, E_NOSYS),
+            Err(x) => Answer::Reply(0, x),
+        },
         /* read (0): file data crosses back as the reply's PAYLOAD —
          * count-truth, the twin of write's attach (the kernel stages
          * the destination at the first trap and copies only within the
@@ -1042,6 +1096,20 @@ fn answer_file<K: Kernel, A: BufferAlloc>(
             Ok(s) if s.kind == FD_KIND_CONSOLE => Answer::Reply(0, E_AGAIN),
             Ok(s) => {
                 let want = (args[2] as usize).min(FD_PAYLOAD_CAP);
+                /* E7 increment 21: the continuation's evidence. The offset
+                 * the VFS is about to hand back IS src_off, and the gate
+                 * workload's copy is a sequence of reads from fd 3 — so the
+                 * gate tenant logs it, one line per read. The run's proof is
+                 * then readable off the serial log without trusting anything
+                 * reconstructed: boot 1's lines stop at 0x20000 (the fourth
+                 * read is the one the kernel holds at, so it never reaches
+                 * this arm), and boot 2's first line is 0x30000 — the
+                 * continuation, not a re-run. */
+                if gate {
+                    if let Some(off) = vfs.offset_of(vt, s.vfs_fd) {
+                        gate_read_log(off);
+                    }
+                }
                 let mut buf = [0u8; FD_PAYLOAD_CAP];
                 match vfs.read(vt, s.vfs_fd, &mut buf[..want]) {
                     Ok(n) => Answer::ReplyBytes(n as u64, n, buf),
@@ -1405,7 +1473,11 @@ struct LinuxTask {
     ch_w: u32,   /* replies leave here (our send handle)                 */
     name: [u8; 48],
     name_len: usize,
-    partition: u32,
+    partition: u32,  /* the registry scope every name->pid resolve below
+                      * passes: 0 = THIS sidecar's own partition, the
+                      * kernel's reading of a 0 request partition. It is
+                      * not "PARTITION_SYSTEM": the child is spawned with
+                      * target 0 (inherit), so it lives where we live. */
     vfs_task: u32,  /* step 4: this task's VFS task id — the table the
                      * thirteen file-class arms operate over. Allocated
                      * at spawn (track's caller: the spawn path owns a
@@ -1422,6 +1494,10 @@ struct LinuxTask {
     sig: SigState,  /* increment 10: the signal seam's per-task state —  */
                     /* dispositions, mask, pending, and the tid tkill    */
                     /* matches (recorded from this task's OWN 218 echo)  */
+    gate: bool,     /* increment 19: the tenant gate profile's child —   */
+                    /* its console bytes are mirrored to the serial log  */
+                    /* so the work-half measurement is not trapped in an */
+                    /* environment console nobody attached to           */
 }
 
 const MAX_LINUX_TASKS: usize = 8;
@@ -1442,6 +1518,7 @@ fn tasks() -> &'static mut [LinuxTask; MAX_LINUX_TASKS] {
         brk_cur: 0,
         brk_mtop: 0,
         sig: SigState::new(),
+        gate: false,
     }; MAX_LINUX_TASKS];
     unsafe { &mut TABLE }
 }
@@ -1463,6 +1540,9 @@ pub fn track(
     vfs_task: u32,   /* step 4: the VFS task id the file-class arms
                       * operate over — allocated by the spawn path
                       * (it owns the ProcManager) before the track   */
+    gate: bool,      /* increment 19: this is the gate profile's first
+                      * user — mirror its console output to the serial
+                      * log (the tenant console is otherwise unobserved) */
 ) -> bool {
     let nlen = name.len().min(48);
     for t in tasks().iter_mut() {
@@ -1490,6 +1570,7 @@ pub fn track(
          * the limit, and the two can never meet — the kernel stamps
          * linux_mmap_top from the same manifest record. */
         t.brk_mtop = heap_limit;
+        t.gate = gate;
         /* The signal state is born with the task, like the fd table and
          * the ledger below: a reused registry slot must not inherit its
          * predecessor's dispositions, mask, pending bits or TID — an
@@ -1651,6 +1732,20 @@ fn fmt_sig_line(buf: &mut [u8], prefix: &[u8], sig_no: u64, suffix: &[u8]) -> us
     push_bytes(buf, off, suffix)
 }
 
+/// Increment 21: the gate tenant's file-class read offset, in hex (klog's
+/// own encoding). Target builds only — the host fakes have no serial path,
+/// exactly like enosys_log.
+fn gate_read_log(off: u64) {
+    #[cfg(feature = "target")]
+    {
+        crate::entry::klog(b"[E7-GATE] read off=", off as u32, b"");
+    }
+    #[cfg(not(feature = "target"))]
+    {
+        let _ = off;
+    }
+}
+
 fn enosys_log(tag_num: u32, child: &[u8], extra: &[u8]) {
     #[cfg(feature = "target")]
     {
@@ -1796,11 +1891,12 @@ pub fn service<K: Kernel, A: BufferAlloc>(
          * module, so the fd class's read arm cannot stay kernel-side
          * (its data crosses back as the reply's payload, count-truth). */
         let ans = match num {
-            LINUX_READ | LINUX_OPEN | LINUX_CLOSE | LINUX_STAT | LINUX_LSTAT
-            | LINUX_LSEEK | LINUX_FCNTL | LINUX_FSYNC | LINUX_FTRUNCATE
-            | LINUX_RENAME | LINUX_MKDIR | LINUX_UNLINK | LINUX_GETDENTS64 =>
+            LINUX_READ | LINUX_WRITE | LINUX_OPEN | LINUX_CLOSE | LINUX_STAT
+            | LINUX_LSTAT | LINUX_LSEEK | LINUX_FCNTL | LINUX_FSYNC
+            | LINUX_FTRUNCATE | LINUX_RENAME | LINUX_MKDIR | LINUX_UNLINK
+            | LINUX_GETDENTS64 =>
                 answer_file(num, &args, &mut fds, tasks()[i].vfs_task, vfs,
-                            payload),
+                            payload, tasks()[i].gate),
             _ => answer(num, &args, &fds, &mut mem, &mut sigstate, payload),
         };
         tasks()[i].fds = fds;
@@ -1929,6 +2025,16 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                  * above already made args[2] the payload's own length). */
                 match console.write(&payload[..len]) {
                     Ok(n) => {
+                        /* Increment 19: the gate tenant's console is its OWN
+                         * environment console, which no attach surface is
+                         * reading in this run. Mirror the child's bytes to
+                         * the kernel serial log so the work-half measurement
+                         * (Copying / Done / pruned) is observed, not inferred
+                         * from a buffered stream nobody drained. */
+                        #[cfg(feature = "target")]
+                        if tasks()[i].gate {
+                            crate::entry::serial_write_raw(&payload[..len]);
+                        }
                         /* Attribution — the SIGABRT reading's instrument:
                          * WHICH child wrote WHAT, on THIS line. Console
                          * output drains as one merged stream in flush
@@ -1973,7 +2079,10 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                 /* Visible like every other answer: exit_group is the one
                  * forward that gets NO reply, so without this line the
                  * reap would be invisible in the log. */
-                enosys_log(num as u32, &name_buf[..nlen], b" exit_group\n");
+                let mut ex = [0u8; 48];
+                let n = fmt_sig_line(&mut ex, b" exit_group status=",
+                                     args[0], b"\n");
+                enosys_log(num as u32, &name_buf[..nlen], &ex[..n]);
                 /* exit_group: reap through the same name->pid lookup the
                  * environment destroy path uses (sidecar_pid is the
                  * liveness test — a name that no longer resolves is a
@@ -2071,6 +2180,42 @@ mod tests {
     }
     fn set_payload(set: u64) -> [u8; SIGSET_BYTES as usize] {
         set.to_le_bytes()
+    }
+
+    #[test]
+    fn clock_gettime_answers_the_pinned_epoch_and_zero_monotonic() {
+        let mut brk = ledger();
+        let mut sig = SigState::new();
+        let a = answer(228, &[0, 0x5000, 0, 0, 0, 0], &fds(), &mut brk,
+                       &mut sig, &[]);
+        match a {
+            Answer::ReplyBytes(ret, len, bytes) => {
+                assert_eq!(ret, 0);
+                assert_eq!(len, TIMESPEC_BYTES);
+                assert_eq!(read_u64(&bytes, 0), GATE_EPOCH_SECS);
+                assert_eq!(read_u64(&bytes, 8), 0);
+            }
+            _ => panic!("CLOCK_REALTIME did not answer a timespec: {:?}", a),
+        }
+        let a = answer(228, &[1, 0x5000, 0, 0, 0, 0], &fds(), &mut brk,
+                       &mut sig, &[]);
+        match a {
+            Answer::ReplyBytes(ret, len, bytes) => {
+                assert_eq!(ret, 0);
+                assert_eq!(len, TIMESPEC_BYTES);
+                assert_eq!(read_u64(&bytes, 0), 0);
+                assert_eq!(read_u64(&bytes, 8), 0);
+            }
+            _ => panic!("CLOCK_MONOTONIC did not answer a timespec: {:?}", a),
+        }
+        let a = answer(228, &[7, 0x5000, 0, 0, 0, 0], &fds(), &mut brk,
+                       &mut sig, &[]);
+        assert!(matches!(a, Answer::Reply(0, E_INVAL)),
+                "an unknown clock id is EINVAL: {:?}", a);
+        let a = answer(228, &[0, 0, 0, 0, 0, 0], &fds(), &mut brk,
+                       &mut sig, &[]);
+        assert!(matches!(a, Answer::Reply(0, E_INVAL)),
+                "a NULL timespec is refused defensively: {:?}", a);
     }
 
     #[test]

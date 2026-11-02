@@ -938,7 +938,7 @@ void cap_unlock(struct CapSpinlock* l);
  * truncating a list. Mirrored in user/proto/src/manifest.rs — one truth
  * across the seam, and the record's own counts make the header's
  * "+10 fixed records" slack roomier, not tighter. */
-#define SIDECAR_MANIFEST_MAX_ARGV  8
+#define SIDECAR_MANIFEST_MAX_ARGV  12
 #define SIDECAR_MANIFEST_MAX_ENVP  16
 #define SIDECAR_MANIFEST_ARGENV_BYTES 512
 
@@ -1036,6 +1036,18 @@ struct SidecarManifest {
  * rather than folded into it. */
 #define SIDECAR_BIB_FLAG_ENV_CONSOLE 0x2u
 
+/* Increment 19: the E7 gate profile. This is the MANIFEST header's flags
+ * bit, not a capability: a tenant that carries it has granted nothing extra
+ * (the tenant hardware gate is untouched, which a marker cap could not
+ * promise — a MEM cap over the budget's own pages is refused as an overlap
+ * with the budget object, and any other cap class would either add
+ * authority or fail to resolve). The create copies the bit into the BIB so
+ * the sidecar can select the profile from the one thing it already reads
+ * (BOOT_INFO_FLAG_GATE, user/proto/src/bootinfo.rs), while the default E3
+ * image's tenants stay byte-identical. */
+#define SIDECAR_MANIFEST_FLAG_GATE 0x0002u
+#define SIDECAR_BIB_FLAG_GATE      0x4u
+
 /* E6: the sidecar's OWN identity, the third thing a sidecar cannot otherwise
  * observe. Until now a sidecar could not learn what the kernel called it: the
  * BIB carried cap NAMES ("console", "budget") but never the manifest's NAME
@@ -1128,6 +1140,38 @@ int cap_create_sidecar_in_personality(uint32_t parent_pid,
                           uint16_t* out_ch_r, uint32_t target_partition,
                           uint32_t personality);
 uint64_t sys_sls_linux_spawn(struct SLSCreateSidecarRequest* req);
+
+/* ─── E7 increment 21 (§10.14 B8): hold the replay's Linux child for the pour ─
+ * A restore replays its record through the SAME create path a boot uses, and
+ * that path spawns the tenant from the sidecar's boot. Without a hold the
+ * child is schedulable the instant the create releases it: it executes
+ * _start a second time, runs the workload over the fresh (empty) VFS, and is
+ * mid-flight when the payload's pour arrives — the live reboot's measured
+ * failure ("the capture caught a sidecar mid-compute, not parked").
+ *
+ * These three seams make the child the pour's to start:
+ *
+ *   - arm(partition) while a restore's create round trip is in flight. A
+ *     Linux child born into that partition is left PROC_HELD (its release
+ *     line says so) instead of PROC_SUSPENDED.
+ *   - release(name) after the pour (or after a refused/skipped pour, so a
+ *     refused restore never leaves a task frozen forever) puts it back to
+ *     PROC_SUSPENDED; the captured ring3_ctx is then the first instruction
+ *     it runs.
+ *   - disarm(partition) when the environment's pour is over, so a later
+ *     spawn in the same partition is ordinary again.
+ *
+ * The hold is scoped by PARTITION, not by environment index, because the
+ * spawn arrives from the sidecar whose boot knows only its own partition's
+ * name; one restore pass replays one environment at a time, and a hidden
+ * child is identified by the record's task name at release. */
+void cap_linux_restore_arm(uint32_t partition_id);
+void cap_linux_restore_disarm(uint32_t partition_id);
+
+/* Release the held Linux task named `name` (the record's third slot).
+ * Returns 1 when one was released, 0 when no held task carries that name
+ * (a spill, a failed spawn, or an already-released task). */
+int cap_linux_restore_release(const char* name);
 
 /* ─── E7 increment 3 (Linux ABI Shim Design §3.3 steps 5-7) ────────────────
  * The forward path's three seams, each in the file that can see what it
@@ -1295,7 +1339,8 @@ uint64_t sys_sls_placement_can_hold(struct SLSPlacementCanHoldRequest* req);
 struct SLSSidecarPidRequest {
     const char* name;         /* registry name, e.g. "aerosls.posix.3" */
     uint32_t name_len;        /* bytes to compare, or 0 to read to the NUL */
-    uint32_t partition;       /* the partition the name is scoped to (E2) */
+    uint32_t partition;       /* the partition the name is scoped to (E2);
+                               * 0 = the CALLER's own partition */
 };
 uint32_t sys_sls_sidecar_pid(struct SLSSidecarPidRequest* req);
 

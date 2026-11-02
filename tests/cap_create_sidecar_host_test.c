@@ -145,6 +145,22 @@ char _kernel_image_end[1];
 void kernel_serial_print(const char* s) { (void)s; }
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 
+/* E7 increment 20: cap.c stamps each Linux child into its environment's
+ * checkpoint record (env_ckpt_linux_task_stamp, kernel/env_ckpt.c). The
+ * stamp's content is the record layer's and is proven by
+ * tests/env_ckpt_host_test.c; this test links the create without that layer.
+ * Recorded rather than dropped, so the call is observable here too. */
+static int g_ckpt_stamp_calls = 0;
+int env_ckpt_linux_task_stamp(uint32_t partition_id, const char* parent_name,
+                              const char* child_name, uint64_t entry,
+                              uint64_t stack_bottom, uint64_t stack_top,
+                              uint32_t cap_count) {
+    (void)partition_id; (void)parent_name; (void)child_name; (void)entry;
+    (void)stack_bottom; (void)stack_top; (void)cap_count;
+    g_ckpt_stamp_calls++;
+    return 1;
+}
+
 /* console_service.c polls serial input via serial_console_poll()
  * (kernel_io.c, not linked here). Stub it to "nothing ready" so the
  * service links; the test drives the console via console_service_tick()
@@ -1257,6 +1273,25 @@ int main(void) {
                                               .partition = 0 };
         CHECK(sys_sls_sidecar_pid(&wrong) == 0,
               "E5: a name registered in another partition does not resolve (E2 scoping)");
+
+        /* 0 = the CALLER's own partition — the ABI's reading of every other
+         * request partition, and the one a sidecar's exit passes to reap its
+         * Linux child (spawned with target 0, so it lives where the sidecar
+         * lives; user/sidecar/src/linux.rs `track`). Read as PARTITION_SYSTEM
+         * instead, a TENANT sidecar's reap answered 0 and refused by name —
+         * increment 21's resumed tenant did exactly that. */
+        proc_table[0].partition_id = 5;         /* the caller now lives in 5 */
+        struct SLSSidecarPidRequest own_part = {
+            .name = "aerosls.posix.9",
+            .name_len = sizeof("aerosls.posix.9") - 1, .partition = 0 };
+        CHECK(sys_sls_sidecar_pid(&own_part) == 402,
+              "E5: partition 0 means the CALLER's own — a tenant resolves the child it spawned there");
+        struct SLSSidecarPidRequest cross = {
+            .name = "drv.ramdisk.9",
+            .name_len = sizeof("drv.ramdisk.9") - 1, .partition = 0 };
+        CHECK(sys_sls_sidecar_pid(&cross) == 0,
+              "E5: and 0 does not widen to PARTITION_SYSTEM — the tenant still cannot resolve another partition's name");
+        proc_table[0].partition_id = 0;         /* restore */
 
         /* name_len 0 means "read to the NUL". */
         struct SLSSidecarPidRequest auto_len = { .name = "drv.ramdisk.9",

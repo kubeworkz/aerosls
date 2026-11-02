@@ -12,9 +12,9 @@
 use aerosls_proto::env_proto::{
     self, EnvFrame, RegisterRegion, RegisterReply, ENV_CREATE, ENV_DESTROY, ENV_ERR_CAPACITY,
     ENV_ERR_FULL, ENV_ERR_INVAL, ENV_ERR_NOENT, ENV_ERR_NOMEM, ENV_ERR_PART, ENV_ERR_QUOTA,
-    ENV_OK, ENV_REGISTER,
-    REGION_POSIX_HEAP, REGION_RD_HEAP, REGION_RD_STORAGE, TASK_POSIX_SIDECAR,
-    TASK_RAMDISK_SIDECAR,
+    ENV_OK, ENV_REGISTER, LINUX_TASK_NAME,
+    REGION_POSIX_HEAP, REGION_RD_HEAP, REGION_RD_STORAGE, TASK_LINUX,
+    TASK_POSIX_SIDECAR, TASK_RAMDISK_SIDECAR,
 };
 use aerosls_proto::kabi::{
     Kernel, ERR_NOMEM, ENV_STORAGE_ERR_IO, ENV_STORAGE_ERR_NOSLOT,
@@ -55,6 +55,13 @@ pub struct EnvImages {
 pub struct Environment {
     pub partition: u32,
     pub index: u32,
+    /// E7 increment 20: this environment carries the gate profile (the
+    /// `e7_gate` build's designated index). It selects the manifest's
+    /// FLAG_GATE bit AND the record's third task — the Linux tenant the
+    /// sidecar spawns under `LINUX_TASK_NAME`. Kept on the environment
+    /// because the registration reply is answered long after the create's
+    /// local `gate` decision, and a restore must name the same task list.
+    pub gate: bool,
     /// The three private regions this environment owns, kept per-environment
     /// from E5: a destroy has to hand each of them back individually (E4 only
     /// ever needed the ramdisk heap's base at create time), so all three bases
@@ -209,13 +216,31 @@ pub fn create_environment<K: Kernel>(
 
     // Tenant POSIX: tenant profile (no hardware/network — E2), wired to THIS
     // environment's ramdisk, placed in the same partition.
-    let px_manifest = posix_manifest::build_posix_manifest_tenant(
-        px_name.as_str(),
-        rd_name.as_str(),
-        images.posix_kaddr,
-        images.posix_size,
-        px_heap,
-    );
+    //
+    // E7 increment 20: on an `e7_gate` build, environment index 1 is the gate
+    // profile — the SAME designation the E3 boot makes for its env 1
+    // (`entry::spawn_e3_tenant_envs`), so a control-plane create of the
+    // designated index produces the environment the gate harness can
+    // checkpoint. Every other index (and every other build) gets the plain
+    // tenant manifest, byte for byte.
+    let gate = cfg!(feature = "e7_gate") && index == 1;
+    let px_manifest = if gate {
+        posix_manifest::build_posix_manifest_tenant_gate(
+            px_name.as_str(),
+            rd_name.as_str(),
+            images.posix_kaddr,
+            images.posix_size,
+            px_heap,
+        )
+    } else {
+        posix_manifest::build_posix_manifest_tenant(
+            px_name.as_str(),
+            rd_name.as_str(),
+            images.posix_kaddr,
+            images.posix_size,
+            px_heap,
+        )
+    };
     let (posix_r, posix_w) = k.create_sidecar_in(&px_manifest, partition).map_err(|e| {
         // P3 inc. 1: the ramdisk already exists under its name — END it
         // first and confirm the kernel finished the job (kernel/process.c
@@ -242,6 +267,7 @@ pub fn create_environment<K: Kernel>(
     Ok(Environment {
         partition,
         index,
+        gate,
         rd_heap,
         rd_storage,
         px_heap,
@@ -303,6 +329,17 @@ pub fn environment_register_reply(env_id: u32, env: &Environment) -> RegisterRep
     let px = posix_name(env.index);
     r.set_task(0, rd.as_str(), TASK_RAMDISK_SIDECAR);
     r.set_task(1, px.as_str(), TASK_POSIX_SIDECAR);
+    // E7 increment 20: the gate profile's third task. The NAME is identity
+    // (the sidecar spawns exactly this tenant, and the kernel's stamp at that
+    // spawn requires the name to match); the ENTRY/STACK are not init's to
+    // state — the task does not exist yet — so the kernel fills them
+    // (env_ckpt_linux_task_stamp) before any checkpoint can write the record.
+    // Naming it HERE, from the same `gate` bit that selected the manifest, is
+    // what makes a replay's create name the same task list: both boots derive
+    // it from the profile, never from whatever happened to be spawned.
+    if env.gate {
+        r.set_task(2, LINUX_TASK_NAME, TASK_LINUX);
+    }
     r
 }
 

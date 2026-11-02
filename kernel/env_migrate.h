@@ -365,8 +365,11 @@ int env_migrate_in_flight(void);
 
 /* The deferral's bounds. A staging slot defers death detection for at most
  * SLOT_GRACE after its BEGIN — the restore's attempt budget (tries x
- * (create RTT + the 30 s parked-posture wait)) with room for a slow TCG
- * pour. A migration's RESOLUTION also keeps a tail: both points where a
+ * (create RTT + the parked-posture wait, which is stall-bounded: a 30 s
+ * quiet window that restarts while the environment is still being scheduled,
+ * under a ~3 min ceiling — env_payload.h) with room for a slow TCG pour.
+ * The ceiling is deliberately below THIS grace, since the wait runs inside a
+ * restore the sweep is already covering. A migration's RESOLUTION also keeps a tail: both points where a
  * migration ends on this node — the destination's slot drop (the SOURCE's
  * confirmation walk, its LIVE polls and destroy round trip, can block the
  * source's own sweep for seconds AFTER the drop) and the source's own

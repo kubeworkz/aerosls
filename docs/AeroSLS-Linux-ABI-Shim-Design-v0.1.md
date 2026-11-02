@@ -2487,6 +2487,754 @@ B). §11's Q2, Q4 and Q5 are untouched here.
 
 ---
 
+### 10.14 What is planned — the E7 gate run, scoped
+
+**This section began as a contract for increments 19–22 and is now a record of
+them.** All four have their run records below: 19 the work half, 20 the
+capture, 21 the replay that resumes the tenant at its captured `rip`/`rsp`, and
+22 the harness that makes the run one invocation — with the three live breaks
+that turn its failure side from an assumption into an observation. The gate's
+two halves have each now been observed on the real machine (19 the work, 21 the
+work continuing through a cycle) and 22 makes that observation re-runnable from
+one command; what it is not is automated: only the harness's source clauses run
+on a push, the boots are manual invocations, and the `fs_base` break is still
+unarmed. The contract it was scoped against is kept as written. It takes as
+given the file class landed at increments 17–18 (`4fbe386`, `baf0469`) — the
+thirteen census numbers crossing through the VFS, the flag contract measured
+from the real opens, the reply payload's STAT/DENTS kinds (§10.13's plan text
+predates those two commits; the code and its tests are the state this section
+builds on) — and the firstuser fixture at
+`user/sidecar/fixtures/aerobackup.musl.elf`. It does not re-open the file
+class's syscall surface. What it now describes is the run that makes §8's two
+halves one observed fact.
+
+**§8's gate, made concrete.** One harness invocation contains the whole
+run: a cold boot, a tenant environment created through the environment
+manager, the firstuser running the backup operation with its real argv, a
+checkpoint taken while the copy holds open descriptors and a live heap
+buffer, a reboot against the same NVMe, the restore replay, the same task
+continuing rather than restarting, and the workload's clean completion.
+The cycle is a reboot, not a migration: P3 already has its own live
+guards.
+
+| Piece | Contract |
+|---|---|
+| **Environment** | One **tenant** environment, not the system POSIX and not `PARTITION_SYSTEM`. The tenant profile keeps its no-hardware rule; the gate is selected by a marker cap and a create-profile bit, not by minting a DEV cap. |
+| **Storage** | `/tmp/e7-census/sls_storage.img`, **512 KiB**: a 4 KiB non-zero marker at offset 0 and another at 256 KiB, zeros elsewhere. Six old backups named `sls_storage-20260101-000000.img` through `...20260106...`; the clock is pinned to **2026-01-07** so the new name cannot collide. |
+| **Argv** | `e7.linux.user.0 --storage /tmp/e7-census/sls_storage.img --backup-dir /tmp/e7-census/backups --kind hourly --retain 4` — **9 entries including argv[0]**; the binary and the command line are the designated ones, not a gate-only variant. |
+| **Checkpoint** | After the **third 64 KiB read**, at the next sysret: source fd and destination fd open, the 64 KiB buffer live, the partial file 64 KiB, source offset 192 KiB, destination offset 64 KiB. |
+| **Restore** | Reboot against the same NVMe, let the environment replay through the existing create path, resume the same Linux task at the captured `rip`/`rsp` with the captured `fs_base`, brk/mmap cursors, fd table and heap pages. |
+| **Pass** | Exactly one live `[backup] Copying`; the pre/post task line carries the same `rip`, `rsp`, `fs_base`, `brk`, `mmap`, fd numbers and buffer vaddr; one `[backup] Done: ... (524288 bytes, 6 sparse holes, 4 kept)`; three `pruned` lines; `exit_group(0)`; the restored source and destination byte-identical. No second firstuser spawn, no `[FAULT]`. |
+
+The expected counts are not a histogram; they follow from the staged
+image and `copy_sparse`'s 64 KiB chunk (`backup/aerobackup/src/lib.rs:206`).
+Eight chunks, two non-zero and six all-zero, give `bytes=524288` and
+`holes=6`. Seven backups exist after the new one, so retaining four
+prunes three and leaves `kept=4`. The new name is
+`sls_storage-20260107-0000<ss>.img`: the epoch pins the day, the tick may
+advance the seconds, and the harness matches the pattern rather than one
+literal name.
+
+The gate line is part of the contract, not an implementation detail:
+
+```
+[E7-GATE] checkpoint seq=<N> task=e7.linux.user.0 form=user
+          rip=<...> rsp=<...> fs_base=<...> brk=<...> mmap=<...>
+          fds=3,4 buf=<...> src_off=196608 dst_off=65536
+[E7-GATE] restore    seq=<N> task=e7.linux.user.0 form=user
+          rip=<same> rsp=<same> fs_base=<same> brk=<same> mmap=<same>
+          fds=3,4 buf=<same> src_off=196608
+```
+
+`form=user` is the first gate's chosen capture form (see the decisions
+below). The pre/post equality is the proof that the descriptors and the
+heap came back, not merely that the workload eventually produced a file:
+the source fd (3) and destination fd (4) are the captured
+`FdSlot`/`vfs_fd` pair, the buffer vaddr is the `Vec` inside the
+partition-charged arena, and the source offset is the `FileObj` position
+the copy had reached. A restart would print a second `Copying`, reopen and
+truncate the partial, and lose those values.
+
+**What is already true.**
+
+- The file class is landed on this branch: thirteen census numbers, the
+  measured open-flag contract, path/stat/dirent reply plans, the sidecar
+  fd table, and the VFS's `open_dir`/`read_dir_at`/`truncate_at`/`fsync`.
+  Its evidence is host/unit tests and the `strace` measurement; **it has
+  not opened a real file in a guest yet**.
+- The firstuser runs from `_start` through crt/TLS/auxv to
+  `exit_group(0)`, but with `argv = { name }` only. Increment 16's log is
+  the binary printing its header and failing `stat` on a storage image
+  that does not exist — not the workload.
+- P1a already captures the two sidecars' pages, park state and console,
+  and replays them through the existing create. Its live guard proves a
+  file and a shell variable survive a reboot. The Linux task is the one
+  task that path deliberately skips.
+- `tests/env_checkpoint_restore_check.sh` already owns the right harness
+  shape: a 10G NVMe, the unified boot, create → checkpoint → reboot →
+  replay → console read-back, with `--replay` validation. The gate
+  extends it; it does not invent a second restore path.
+
+**The blockers, one per increment.** The mapping is deliberately
+one-to-one so a partly finished gate always names what is missing.
+
+| ID | Blocker | Retired by |
+|---|---|---|
+| **B1** | The firstuser spawns only in the hardware-owning system POSIX, which is `PARTITION_SYSTEM` and is never frozen by the capture. The tenant profile has no hardware caps, so a normal environment never runs it. | 19 |
+| **B2** | `MAX_ARGV` is 8; the real command line is 9 entries including argv[0]. `ArgEnv::new` asserts, so the sidecar would panic before the task exists. | 19 |
+| **B3** | `clock_gettime` (228) has no source and answers ENOSYS. The real argv reaches `is_file()` and then stops at `SystemTime::now()`. | 19 |
+| **B4** | No storage image is staged. The host setup's 64 MiB image cannot fit the tenant's 4 MiB POSIX heap; the firstuser reports `StorageMissing`. | 19 |
+| **B5** | The tenant's three regions are 1,344 frames and the Linux task's image, stack and heap (roughly 152 + 16 + 64) are charged on top. The placement pre-flight counts only the 1,344; the firstuser spawn is logged, never fatal, so a create can succeed and leave no task. | 19 |
+| **B6** | The checkpoint record's `EnvCkptTask` is identity-sized; the payload skips `ENV_CKPT_TASK_LINUX` in all three loops, walks only the sidecars' CR3s, and has no Linux register frame, page range, cursors or per-page permissions. | 20 |
+| **B7** | Init registers only the two sidecar names, so `n_tasks` is always 2. There is no place for the Linux task in `ENV_REGISTER`, and the restore's identity comparison assumes the create named every task. | 20 |
+| **B8** | Restore has no adoption path: `e7_firstuser::spawn` runs unconditionally at every sidecar boot, the sidecar's `LinuxTask` table carries boot-local channel ids, and nothing maps/copies the captured pages or restores the register frame. | 21 |
+| **B9** | The partition pause does not by itself define the Linux task's capture form. A parked forward leaves a request/reply in a kernel channel queue the payload does not carry; a running task's `ring3_ctx` may be stale if it is the current task. | 21 |
+| **B10** | There is no gate harness or teeth. The existing guard has no E7 clauses, no byte-equality check (`cmp`/`sha` applets are absent), and no proof that a restart, a missing fd, or a missing heap page reddens. | 22 |
+
+**B1 and B5 — where the first user may live.** `user/sidecar/src/entry.rs:454`
+gates the E7 spawn on `census_host = nic0.bar0`; the tenant profile
+deliberately carries no hardware caps (`user/init/src/posix_manifest.rs`,
+`env_manager.rs:850`), so the only firstuser is the system POSIX's. The
+system POSIX is created by init without a target partition and therefore
+inherits `PARTITION_SYSTEM`; `env_ckpt_quiesce_for_capture` explicitly
+never freezes that partition (`kernel/env_ckpt.c:410`), and
+`env_ckpt_quiesce_partition` refuses it for the same reason
+(`env_ckpt.c:478`). A checkpoint of the one place the firstuser runs is
+therefore not a checkpoint of an environment at all.
+
+Increment 19 adds an opt-in gate marker to the tenant POSIX manifest.
+The first form tried was a MEM cap; the create refused it as an overlap
+with the tenant's own budget object (measured), and any other cap class
+would either add authority or fail to resolve. The marker is therefore
+a manifest FLAGS bit (`SIDECAR_MANIFEST_FLAG_GATE`) that the create
+copies into the BIB as `BOOT_INFO_FLAG_GATE`: no authority added, no
+overlapping object, and the hardware gate stays untouched. The sidecar
+spawns the firstuser when the bit is present, not when `nic0.bar0` is.
+One environment keeps the serial volume that forced the `census_host`
+scope in the first place.
+
+The frame arithmetic is the other half of B1. `env_manager.rs:126` sizes
+the placement pre-flight at `RD_HEAP_FRAMES + RD_STORAGE_FRAMES +
+POSIX_HEAP_FRAMES` = 64 + 256 + 1024 = 1,344 (`env_manager.rs:35-37`).
+The Linux task's image is 620,200 bytes (152 pages), its stack 16 pages,
+and its brk/mmap span up to 64 pages; those frames are partition-charged
+by the create and by the reply arms that follow. The gate profile must
+either reserve them in the placement question or prove post-create
+headroom before the run. A spawn refused `ENOMEM` is already non-fatal
+and logged; the gate must treat that log as a red, not as "the task will
+show up later."
+
+**B2 — one entry over the bound.** `MAX_ARGV` is 8
+(`user/proto/src/manifest.rs:83`; `kernel/cap.h`'s
+`SIDECAR_MANIFEST_MAX_ARGV` moves with it), and `ArgEnv::new` asserts
+`argv.len() <= MAX_ARGV` (`manifest.rs:252`). The designated command line
+is eight tokens **plus argv[0] = nine**. This is not a naming preference:
+the `--storage/--backup-dir/--kind/--retain` tokens are the census's
+`CANDIDATE_ARGS` (`tools/linux_abi_candidate.conf:143`), and dropping
+argv[0] would hand the binary a different stack image. Increment 19
+raises both bounds to 12, updates the parser's over-bound refusal test,
+and keeps the nine-entry call as the real one. The extra headroom is for
+a future `--now` or a second path, not for the gate.
+
+**B3 — the time seam.** `backup/aerobackup/src/lib.rs:325` calls
+`SystemTime::now()` before the copy. The census predicts
+`clock_gettime` (228); the no-vDSO decision makes it unavoidable, and
+`user/sidecar/src/linux.rs:870` answers it `ENOSYS` (the module header at
+`:79` names it the next wall). The staging fixes the `is_file()` wall
+first, so the real argv would now stop at the clock instead.
+
+Increment 19 adds the seam: a first-trap copy plan for the 16-byte
+`timespec`, a sidecar answer, and a pinned epoch. The kernel supplies a
+tick or the sidecar asks the kernel for one; `CLOCK_REALTIME` reads
+`1767744000 + ticks/100`, `CLOCK_MONOTONIC` reads the tick. The epoch is
+2026-01-07 00:00:00 UTC, deliberately the day after the six staged old
+backups. The host teeth cover the out-pointer, the two clock ids, the
+error path, and the `tv_nsec` range.
+
+**B4 — the image the guest can hold.** `/tmp` is a ramfs inside the
+tenant POSIX's 4 MiB budget (`user/sidecar/src/boot.rs:280`; 1 MiB
+request-buffer arena, ~3 MiB heap). The candidate's host setup uses a
+64 MiB image (`tools/linux_abi_candidate.conf:136`), which cannot fit and
+was never intended to: the guest fixture scales to the partition budget.
+The 512 KiB source plus the 512 KiB destination, the six tiny old
+backups and VFS metadata is about 1.1 MiB, inside the heap. The staging
+runs in the sidecar before the task is allowed to start, and the source
+and destination are part of the captured heap so the restore sees them.
+
+The other constraint is the firstuser's 1 MiB image reserve at the top of
+the sidecar budget (`e7_firstuser::USER_RESERVE`). Staging must keep the
+bump heap below that reserve, or the spawn must be held until staging and
+the image copy are complete. The run records the heap headroom it
+actually had; if 512 KiB cannot clear the reserve, the fallback is
+256 KiB with the same marker layout (four 64 KiB chunks, three holes) and
+a correspondingly adjusted `Done` line.
+
+**B6 and B7 — the task must be in the record, and the state must be in
+the payload.** `struct EnvCkptTask` (`kernel/env_ckpt.h:94`) carries
+name, kind, `cap_count`, `entry` and stack bounds. The record is held to
+one 4 KiB frame for eight records (`env_ckpt.c:16`); its task entry is
+identity-sized, and that is the right shape. The Linux register frame,
+cursors, page range and permissions belong in the 8 MiB payload slot
+(`env_payload.h:96-105`), not in the record. The record already accepts
+`ENV_CKPT_TASK_LINUX` as a kind (`env_ckpt.c:76`); the comment's "hook
+E7 fills" is the slot this increment fills.
+
+The payload does not accept it yet. `env_payload_capture_all` skips
+`ENV_CKPT_TASK_LINUX` in its task loop (`env_payload.c:413`), the
+image-window list skips it (`:308`), and the parked wait skips it
+(`:739`). The capture walks only the named sidecars' CR3s, so the Linux
+task's image, stack, heap and mmap pages are never read. `EP_MAX_PAGES`
+is 2,048 (`:65`), but the real ceiling is the six-page index zone
+(`:66`): the current sidecar footprint plus the Linux task must fit that
+index, and the gate must print its page count before the pour rather than
+discover the overflow after it. The run record below is exactly that
+discovery: 31,012 bytes, refused by name, then sixteen frames.
+
+`EnvPayloadTask` (`env_payload.h:188`) is sidecar-shaped. Its `park[9]`
+is `r11, rcx, r15..rbp, user_rsp`; a Linux `CapParkCtx` also carries
+`linux_args[6]` at offsets 72..112, and a user-space preemption needs the
+full `ring3_ctx`, not those nine words. The task record needs `fs_base`,
+`brk_cur`, `mmap_top`, the page range, and a per-page permission or kind:
+the image is RX, the stack/heap RW-NX, and `PROT_NONE` guard pages have
+no frames at all. A vaddr+CRC list is not enough to map them safely.
+
+`kernel/env_service.c:284` builds `entries[ENV_CKPT_MAX_TASKS]` and
+`:287` resolves only `reg.task_name[i]` from init's registration. The
+Linux task is not in that body. Increment 20 settles the registration
+order: either the sidecar spawns the task before the identity marker and
+the kernel adds it to the `ENV_REGISTER` body (or scans the partition for
+a `PROC_PERSONALITY_LINUX` task), or an explicit task-add reaches init
+before the record is written. The restore's identity comparison must
+then see the same task list the create produced; an allowance for "the
+Linux task arrived late" is a second create/restore path by another name
+and should be avoided.
+
+**B8 — the restore must adopt, not re-run.** `e7_firstuser::spawn` runs
+again at every gate-profile sidecar boot (`user/sidecar/src/entry.rs:530`). On replay that
+creates a new task at `_start`; the payload's pages would be orphaned and
+the workload would restart, printing a second `Copying` and truncating
+the partial. The sidecar's `LinuxTask` table (`user/sidecar/src/linux.rs:815`)
+holds `ch_r`/`ch_w`, and its `FdSlot` table (`:880`) holds `vfs_fd` plus
+the Linux flags. The heap and image pages that contain both tables are
+captured, and the VFS `FileObj` offsets are captured with them, so the
+descriptors can survive. The channel ids cannot: they are boot-local.
+
+Increment 21 creates the task from the payload (preferred) or adopts the
+fresh spawn before it runs; maps the captured pages with their captured
+permissions; restores `ring3_ctx`/`park_ctx`, `fs_base` and the cursors;
+and rebinds the sidecar's captured table to the new endpoints by task
+name. The gate spawn is skipped on a replay, or held until the pour. The
+first post-restore syscall must be the continuation, not `_start`.
+
+**B9 — one capture form, named.** The partition pause makes the
+environment consistent, but it does not by itself save a Linux task in a
+form the payload carries. A task caught in a forwarded syscall has a
+request or reply in a kernel channel queue; the payload has no channel
+queue state. A task caught in user space may still be the current task,
+so its `ring3_ctx` is whatever the last preemption wrote, not necessarily
+this instant.
+
+The first gate chooses `form=user`: arm a one-shot at the third copy
+`read`, checkpoint at the next `sysret`, before the task enters another
+syscall. No message is in flight, the fd table and heap are live, and
+`ring3_ctx` plus the page table is the whole state. The sidecars must be
+parked, exactly as P1a requires; `env_payload_wait_parked` gains the
+Linux task's form check rather than skipping it. The alternative — park
+the task and re-post its request — matches §8's claim but needs the
+request, expected reply and queue state added to the payload. That is a
+larger seam and not the first gate's job.
+
+**B10 — the harness and its teeth.** `tests/env_checkpoint_restore_check.sh`
+already does the expensive part. Increment 22 adds the gate clauses:
+the gate profile's create, the firstuser spawn, the `Copying` marker, the
+third-read trigger, the payload's page count, the reboot/replay, the
+pre/post task line, the `Done` line, and the byte comparison. The
+vacuity control and the named teeth are the point: force a restart and
+the second `Copying` reddens; drop the task record and `task=...` is
+missing; drop the fd table and the continuation answers EBADF; drop a
+heap page and the buffer's next read faults or the bytes diverge; skip
+`fs_base` and the TLS access reddens. Each tooth must redden on the
+clause it names, not on a blanket crash.
+
+The console makes the "exactly one `Copying`" clause easy to get wrong:
+the captured console bytes are part of the payload and may be replayed
+after the boot. The harness cuts the log at the restore marker and counts
+the live tail, or clears the console before the checkpoint. The
+workload's own output after the restore is the authority, not a replayed
+prefix.
+
+**Increments 19–22.**
+
+| # | Scope | Acceptance |
+|---|---|---|
+| **19** | **Work half.** Raise `MAX_ARGV`/`SIDECAR_MANIFEST_MAX_ARGV` to 12; add the gate profile marker and create-profile bit; add `clock_gettime` REALTIME/MONOTONIC with the 2026-01-07 epoch; stage the 512 KiB image and the six old backups; pass the real argv; run the workload to completion. | Guest serial shows the real file-class syscalls, one `Copying`, one `Done: ... (524288 bytes, 504 sparse holes, 4 kept)` — the 1 KiB-chunk hole count of the staged fixture, not a six-chunk shape — three `pruned` lines, `exit_group(0)`, no `[FAULT]`. This is the gate's **first half** and is reported separately; it is also the measurement of the copy window and the sidecar heap headroom. |
+| **20** | **Task identity, capture and registration.** Put the Linux task in the record's existing third task slot (name, kind, entry, stack, its two messenger caps); put its state in `EnvPayloadTask` (full context including `linux_args[6]`, `fs_base`, cursors, page range, per-page permissions); walk the Linux CR3; add the task to the record before the write; settle registration so the replay's create names the same task list. | A running gate environment checkpoints with `tasks=3`; the payload's third task has the expected page count and permission kinds; a host round-trip restores its bytes; the sidecar-only path is unchanged. |
+| **21** | **Restore/adopt.** Create the Linux task from the payload (or adopt the fresh spawn before it runs); map the captured pages with their permissions; restore the context and cursors; rebind the sidecar table's endpoints; keep the captured VFS/fd table; skip the gate spawn on replay or hold it until the pour. | Live reboot: the task resumes at the captured `rip`/`rsp`; the first post-restore syscall is the continuation at `src_off=196608`; fds 3/4 and the buffer vaddr are unchanged; no second `_start`; no `[FAULT]`. |
+| **22** | **The gate harness and teeth.** Extend `env_checkpoint_restore_check.sh` or add `tests/e7_gate_check.sh`; one invocation; the pre/post task line, the `Done` line and a byte comparison (`cmp` applet or a gate-owned CRC). Add the restart, no-task, no-fd, no-heap and stale-`fs_base` teeth. | One invocation produces the full evidence chain and the teeth redden on their named clauses. The run is reported as one line only when both halves are green in it. |
+
+**Decisions to settle before coding.**
+
+- **Capture form.** `form=user` at the next sysret (recommended for the
+  first gate: no channel queue state) versus `form=park` with a re-posted
+  request (closer to §8's claim, larger payload). The gate line carries
+  the chosen form so the evidence is unambiguous.
+- **Registration order.** Spawn the firstuser before the sidecar's
+  identity marker and let the kernel add it to the registration, or add
+  an explicit task-add before `ENV_REGISTER`. A restore-time allowance
+  for a late Linux task is a second identity path and is not preferred.
+- **Gate profile.** A MEM/CHAN marker in the tenant manifest plus a
+  create-profile bit; the default tenant profile and the hardware gate
+  stay unchanged.
+- **Sizing.** 512 KiB image, epoch `1767744000`, six old backups. The
+  fallback is 256 KiB if the staged heap cannot stay below the 1 MiB
+  image reserve.
+- **Page permissions.** Capture the PTE bits or a kind per page; never
+  map every Linux page RWX because the payload only carried a CRC.
+- **Console replay.** Count only the live post-restore output, or clear
+  the console before the checkpoint; the captured console bytes are not
+  a second run.
+
+**What this section is NOT.** It is not a run report, and no part of the
+gate is claimed as observed. It is not a second create or restore path:
+the gate rides `env_service_create`, `env_ckpt` and `env_payload` exactly
+as P1a does. It is not a workload adaptation; the binary and
+`CANDIDATE_ARGS` are unchanged, and every gate hook (the profile marker,
+the staging, the trigger, the log line) lives outside the binary. It is
+not the P3 migration path; the cycle is a reboot. It does not enlarge the
+default tenant profile, add hardware caps, change threads/dynamic
+linking/ARM64, or claim the file class is guest-proven before increment
+19 runs.
+
+**The first run is the work half.** Increment 19 is small enough to land
+and run on its own; it gives the first guest evidence that the file class
+carries a real backup, and it measures the window and the heap that the
+checkpoint trigger needs.
+
+**Run record — increment 19, the work half (2026-10-31).** The image was
+built with `make x86-iso-e3 E3_INIT_FEATURES=e3_envs,e7_gate` and booted
+under QEMU (`-cdrom sls_operating_system_e3.iso -display none -m 4G
+-no-reboot -net none -serial file:<log>`); the serial capture is
+`evidence/e7_gate_workhalf.log`. The gate tenant staged the 512 KiB image
+(`[E7-GATE] stage00080000 bytes`) with sidecar heap used `0x18B74D` and
+free `0x1748B3` — 477,363 bytes above the 1 MiB image reserve, so staging
+did not need to be held for the spawn. The gate image is also the only
+build that passes `--quiet-init`: with the demo applets' IRQ storm in
+`/etc/init.rc` the tenant faulted before its first syscall (`[FAULT]
+cs=0x23 rip=0x400000015357`), and the flag is derived from
+`E3_INIT_FEATURES` so the shipped image and the default E3 image keep
+the full script. The real nine-token command line
+crossed under the raised 12-entry bound (the paths in the guest's own
+output are the designated ones), the workload printed exactly one
+`Copying`, three `pruned` lines (2026-01-01..03), one `Done: ...
+(524288 bytes, 504 sparse holes, 4 kept)` and `exit_group status=0`, the
+capture contains no `[FAULT]`, and the teardown returned 172 frames. The
+`20260107-000000` in the filename is the pinned epoch read through the
+clock seam, not the host clock.
+
+The run also settled three things the scope could only predict. A `read`
+at end-of-file answers zero bytes, which the shape-1 rule read as "success
+with no payload" and refused `-EPROTO` (the copy died on its last read);
+`linux_reply_zero_ok` now names the two count-truth numbers whose zero IS
+the answer — read and getdents64 — and the host test pins read as one and
+stat/clock as not. The tenant's environment console has no reader in this
+run, so the gate profile mirrors the child's bytes to the serial log;
+without that, the workload's lines are buffered and the run looks silent.
+And a MEM marker cap is refused as an overlap with the tenant's budget
+object, so the profile rides the manifest flags bit into the BIB instead —
+no authority added, no overlapping object.
+
+This is the work half only: no checkpoint, restore or byte comparison was
+attempted, and increments 20–22 remain the owners of the cycle and the
+harness. The hole count is 504 because the copy reads through the 1 KiB
+`FD_PAYLOAD_CAP`: the fixture is two 4 KiB data runs (offset 0 and the
+256 KiB marker) inside 512 KiB. Increments 20–21 make the cycle half true;
+increment 22 makes it observed. Until 22, a checkpoint of an environment
+with a Linux task restores the sidecars and loses the task — that is a
+named failure, not a gate attempt. The gate is one harness invocation,
+but "one run" means one invocation containing the reboot, not one QEMU
+boot.
+
+**Run record — increment 20, the capture half (2026-11-01).** The gate image
+was rebuilt (`make x86-iso-e3 E3_INIT_FEATURES=e3_envs,e7_gate`) and booted
+with the P1A live arm's machine shape — a 10 GiB NVMe image, `-m 1G -smp 2`.
+The first attempt used `-m 4G` and could not checkpoint at all: the
+controller's 64-bit BAR landed at `0xc000000000`, which the kernel's NVMe
+bring-up refuses by design (`kernel.c` accepts only MMIO below 4 GiB), so
+`POST /api/checkpoint` answered `{"status":2}` (`CKPT_STATUS_NO_NVME`). At
+1 GiB the BAR is `0xfebb0000`, the admin and I/O queues come up, and the
+checkpoint answers `{"status":0,"seq":1,"count":1}`. That is a machine
+configuration fact, not a code defect; the live arm now uses the same 1 GiB
+the P1A checkpoint guard does.
+
+The partition was created through the control plane and its environment at
+index 1 — the gate profile — registered with `tasks=3`. The sidecar's spawn
+stamped the third slot (`entry=0x800ab76`,
+`stack=0x40000009b000..0x4000000ab000`, `caps=2`, i.e. the messenger pair),
+and the capture then walked the Linux CR3:
+
+```
+[ENV_PAYLOAD] linux task 'e7.gate.user.0' pages=165 rx=91 rw=46 other=28 form=2 image=0x8000000..0x807d000 heap=0x4000000ab000..0x4000000eb000
+[ENV_PAYLOAD] captured partition=1 index=1 tasks=3 pages=1858 console=0 bytes=7647232 slot=0 seq=0
+```
+
+The tenant was caught in user space (`form=2`, `ENV_PAYLOAD_FORM_USER`), so
+the blob carries its full `ring3_ctx` — rip, rsp and the six argument
+registers — plus `fs_base` and both cursors, rather than a park frame. Of
+its 165 pages, 91 are RX (the linked image's text), 46 are RW (stack and
+heap) and 28 are neither exactly RX nor exactly RW: the permission word
+distinguishes them, which a vaddr+CRC list could not. The other 1,693 pages
+are the sidecars' window and region pages, captured exactly as before; the
+sidecar-only path is unchanged.
+
+The first capture of this environment was refused by name: `index zone
+31012 exceeds the 24576-byte ceiling`. Six frames was the sidecar-only
+size; three `EnvPayloadTask` records (408 bytes each, the Linux one
+included), the region headers and 1,858 page entries at 16 bytes put the
+index at 31,012. `EP_STAGE_BYTES` is now sixteen frames, which
+keeps the ceiling above the slot's own limit: a 16-frame index leaves 2,031
+data pages in the 8 MiB slot, and the slot check refuses a larger capture by
+name before the index can outgrow the buffer. That is the only code change
+the run itself forced; the capture, the record stamp and the registration
+were already in the tree.
+
+Two seams are named rather than hidden. The pre-freeze wait still reports
+`announced=0` for this environment: the gate profile's sidecar never writes
+its `[env-id]` line, so `env_console_identity_seen()` is false and the
+capture burns the bounded 30 s before proceeding on the posture it finds.
+The wait's other half — both sidecars parked — is what P1a needs; the
+announcement is a create-path property this profile does not have, and
+increment 21's replay, being a create, will announce normally. And the
+payload's `seq=0` is the record's registration sequence, not the
+checkpoint's `seq=1`: the payload check is against the record it belongs to,
+which is the identity the restore starts from.
+
+The acceptance was "a running gate environment checkpoints with `tasks=3`;
+the payload's third task has the expected page count and permission kinds; a
+host round-trip restores its bytes; the sidecar-only path is unchanged."
+The two capture lines above prove the first two live; `tests/env_payload_host_test.c`
+(61 checks) proves the round trip, the permission refusal and the parked-form
+refusal against the real file; `tests/env_ckpt_host_test.c` (116 checks)
+proves the stamp and the three-task identity; and
+`tests/linux_personality_check.sh`'s W1–W6 clauses pin the wiring. The serial
+capture is `evidence/e7_gate_capture.log`. Increment 21 owns the resume;
+nothing here claims a restored task.
+
+**Run record — increment 21, the resume half (2026-11-01).** One harness
+invocation (`.e7g_reboot.sh`, the arm now committed as
+`tests/e7_gate_check.sh --live`), two boots of the same image and the same
+10 GiB NVMe device: boot 1 creates the gate environment, stops the tenant at the copy
+continuation and checkpoints; boot 2 replays the record and the tenant finishes
+the copy from its captured rip. The image is
+`make x86-iso-e3 E3_INIT_FEATURES=e3_envs,e7_gate`; the machine is
+`-m 1G -smp 2 -accel tcg`, the shape increment 20 established (4 GiB puts the
+NVMe BAR above the kernel's MMIO window and the checkpoint can never start).
+
+Boot 1 stopped the tenant where the plan says it must — at the sysret that
+closes the reply which crosses 192 KiB (the third 64 KiB read, at the
+sidecar's 1 KiB granularity: `ret=1024`), with the fourth read's `syscall`
+still unexecuted:
+
+```
+[E7-GATE] held at the copy continuation: pid=105 'e7.gate.user.0' src_off=196608 rip=0x8057ab7 rsp=0x4000000a9778 ret=1024 -- the next read is the one the payload resumes INTO
+  [api] -X POST http://127.0.0.1:32001/api/checkpoint -> HTTP 200 (body: {"status":0,"seq":1,"count":1})
+[ENV_PAYLOAD] capture: task 2 'e7.gate.user.0' kind=2 form=3 park_syscall=0 nchans=0 user_rip=0x8057ab7 user_rsp=0x4000000a9778
+[ENV_PAYLOAD] linux task 'e7.gate.user.0' pages=161 rx=91 rw=42 other=28 form=3 image=0x8000000..0x807d000 heap=0x4000000ab000..0x4000000eb000
+[ENV_PAYLOAD] captured partition=1 index=1 tasks=3 pages=1854 console=25 bytes=7630848 slot=0 seq=0
+```
+
+The capture's form is `3` (`ENV_PAYLOAD_FORM_ENTRY`), not the increment-20
+`form=2`: the stop is the one parked-looking posture whose whole state is the
+frame, so the blob carries the sysret's own 20 words rather than a timer-saved
+context. `pages=1854` is the tenant's 161 (91 RX text, 42 RW stack/heap, 28
+neither exactly RX nor exactly RW) plus the sidecars' 1,693.
+
+Boot 2 adopted it, held the fresh child until the pour, and released it at the
+captured instruction — not `_start`:
+
+```
+[ENV_CKPT] Restored 1 environment checkpoint record(s) (0 partition(s) re-paused).
+[ENV_RESTORE] record (partition 1, index 1) replayed through create: env 1 -> 1, identity intact
+[SIDECAR] PID 105 'e7.gate.user.0' HELD for the restore pour — runs only after the payload adopts it (BIB at 0x00004000000aa000, entry 0x000000000800ab76)
+[ENV_PAYLOAD] linux task 'e7.gate.user.0' adopted at rip=0x8057ab7 rsp=0x4000000a9778 fs_base=0x807c208 brk=0x4000000ad000 mtop=0x4000000d8000 form=3 held=1 stop=spent
+[SIDECAR] PID 105 'e7.gate.user.0' released after the restore pour — first instruction rip=0x8057ab7 rsp=0x4000000a9778
+```
+
+`POST /api/env/restore` answered `{"ok":true,"pending":1,"replayed":1,
+"refused":0,"remaining":0,"payloads":1,"payload_skips":0}`. The replay's
+create maps only what a spawn maps, so the pour walked the tenant's pages and
+allocated frames for the heap pages the original run had grown lazily
+(`[ENV_PAYLOAD] mapped a missing Linux page task=2 vaddr=0x4000000e5000
+perm=0x5 …`), charged to the child's partition, before writing a byte.
+
+The continuation is the evidence, not the register dump: the sidecar's
+restored fd offset resumes at `0x30000` and the reads run to `0x80000`, i.e.
+the remaining 320 KiB of the 512 KiB image, with **zero** `[backup] Copying`
+lines in boot 2 — the workload did not restart, it continued. The tenant's own
+last act is the bytes it was told to produce, written through the console
+descriptor it held before the reboot:
+
+```
+[E7-GATE] read off=00030000        (first read after the restore)
+[E7-GATE] read off=0007FC00
+[E7-GATE] read off=00080000
+[backup] Done: /tmp/e7-census/backups/hourly/sls_storage-20260107-000000.img (524288 bytes, 504 sparse holes, 4 kept)
+[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=118
+[E7] linux: num=000000E7 child=e7.gate.user.0 exit_group status=0
+```
+
+So the three claims the scope asks for hold live: the task resumes at its
+captured rip/rsp, its descriptors are the ones it held (fd 3 at the captured
+offset, fd 1 still writable — `524288 bytes` is the whole answer, no re-read of
+the first 192 KiB — and the retention half then runs through the same captured
+directory descriptors: three `pruned` lines before the `Done`), and its heap is
+the captured heap (the resumed run grows nothing, faults nothing, and `[FAULT]`
+is absent from both boots).
+
+**The run forced one code change, and it is the increment's own one-shot rule.**
+The first attempt resumed correctly and then hung: the replay's create is built
+from the same `FLAG_GATE` manifest, so the fresh descriptor came back with the
+stop ARMED (`gate_profile=1, gate_bytes=0`) while the sidecar's fd offset came
+back at 196,608. The resumed copy read another 192 KiB and `[E7-GATE] held at
+the copy continuation … src_off=196608` fired a second time — the task parked
+against a sidecar waiting for it, with no `Done`. The stop belongs to one
+instant, so the pour now spends it: `FORM_ENTRY` sets `gate_profile = 0` and
+`gate_bytes = PROC_GATE_SRC_OFF`, and the adopted line says `stop=spent`.
+`tests/env_payload_host_test.c` grew to 74 checks to pin exactly that (the
+replay's create arrives armed; the pour disarms; the resumed read is
+forwarded).
+
+**The run also forced a second fix, in the resolve the resumed exit depends
+on.** The first passing run resumed and completed, and then could not reap the
+tenant: `exit_group` answered `NOT-FOUND (reap refused)`, so boot 2 had no
+`[TORE] address space … 172 frame(s) freed` line where the work-half run (its
+environment in partition 0) reaped the same profile normally. The cause was
+the request-partition reading in `sys_sls_sidecar_pid`, not the replay: a 0
+partition meant PARTITION_SYSTEM, while a sidecar records 0 for its own Linux
+children (they are spawned with `target_partition` 0 = inherit, so they live
+where the sidecar lives). In a tenant partition the lookup therefore searched
+the wrong partition and answered 0. A 0 partition now means THE CALLER'S OWN —
+the reading every other request partition in this ABI already has
+(`alloc_region_in`, `free_region_in`, `create_sidecar_in`'s target) — so the
+tenant's exit resolves its child where the child is. The old reading was also
+looser than the E2 scoping it stood for: a tenant that passed 0 searched
+PARTITION_SYSTEM's names. `tests/cap_create_sidecar_host_test.c` gained both
+halves of the clause (a tenant resolves the child it spawned through 0; 0 still
+does not reach another partition's name), and the re-run's boot 2 ends:
+
+```
+[E7] linux: num=000000E7 child=e7.gate.user.0 exit_group status=0
+[PROC] PID 105 terminated.
+[TORE] PID 105 teardown: 2 cap(s) dropped, 0 object(s) destroyed, 0 arena frame(s) returned, table 7 unbound
+[TORE] address space 0x0000000012925000 destroyed: 172 frame(s) freed
+```
+
+**A third failure, from a discarded run in that same sequence, was in the wait
+rather than the replay.** One attempt refused the pour by name
+(`payload_skips:1`): the pre-pour wait's fixed 30 s deadline expired while
+`drv.ramdisk.1` was still RUNNING — being scheduled, serving the replay's own
+boot I/O. Nothing was wrong with the environment or the capture; the clock was
+wrong, and the transcript read as if the contents could not come back.
+`env_payload_wait_parked` now bounds QUIET rather than elapsed time:
+`EP_WAIT_TICKS` (3,000) is a stall window restarted by any observed progress —
+a switch-in on one of the record's sidecar tasks, or the `[env-id]`
+announcement landing — with `EP_WAIT_CEIL_TICKS` (18,000, ~3 min, sized under
+failover's 600 s migration grace, which already covers a restore on the
+sweep) as the absolute stop. The progress signal is small and new:
+`proc_build_resume_frame`, the one frame builder every switch path honours,
+bumps `ProcessDescriptor.switches`, so "this environment is still being
+scheduled" is a fact the kernel keeps rather than a guess the wait makes. The
+pour is untouched — it still checks the posture once, in its straight line,
+and still refuses by name when it is not there, so none of this makes a wrong
+capture look right.
+
+`tests/env_payload_host_test.c` (81 checks) pins the three outcomes: a task
+still being scheduled past the old bound is waited for until it parks and the
+pour lands; one that stops being scheduled ends at the stall window; one that
+never stops being scheduled is answered at the ceiling. The re-run above
+took its posture on the first pass — its boot-2 serial has no `wait ended`
+line and the restore reports `payloads:1, payload_skips:0` — so what it proves
+live is the success path, not the extension: the flake it fixes does not
+reproduce on demand (it was seen once in four boots).
+
+**The extension is now exercised live, by making the flake to order.** The
+drill build compiles `e7_slow_boot` into the POSIX sidecar (`E7_SLOW_BOOT=1`,
+nothing a shipped image contains), and the gate profile's boot runs a pure
+compute burst after staging and before it spawns the tenant: 45G iterations of
+a serial
+multiply-add chain, ~5,700 ticks (~57 s) measured — long enough that the old
+fixed bound lands on a sidecar that is RUNNING, which is the posture run 12
+measured (`drv.ramdisk.1` serving the replay's own boot I/O). The burst is
+sized in iterations rather than time because the guest has no clock to read.
+`tests/e7_gate_check.sh --live` owns the whole invocation: it builds that drill
+image (`E7G_DRILL` defaults to 1, into a drill-only name so a run never
+replaces the plain gate image), boots it twice, and asserts the gate's clauses
+and the drill's in one pass. The gate clauses are B1–B6 (payload landed;
+adoption form and spent stop; resume offset; one completion; no fault; address
+space returned); the drill clauses are D1–D2 — the stretch ran, the wait
+outlived the old bound with a sidecar RUNNING, the wait never answered, and the
+pour still landed. Boot 2 of the run:
+
+```
+[E7-GATE] stretch-start 0000AFC8 Miters      (45G iterations)
+[ENV_PAYLOAD] wait: outlived the fixed bound (partition=1 index=1): 3005 ticks
+              elapsed, quiet 0, announced=0, running=1/2 -- still being
+              scheduled, so the window was extended, not expired
+[E7-GATE] stretch-done  0000AFC8 Miters
+[ENV_PAYLOAD] restored partition=1 index=1 env=1 pages=1854 console=25 bytes
+```
+
+At 3,005 ticks the old fixed bound would have answered, and the pour would
+have refused by name — the exact failure the hardening exists to prevent:
+`aerosls.posix.1` was **RUNNING**, not parked (`running=1/2`), still booting,
+and `quiet 0` is the wait's progress ledger printing the truth — it had been
+switched in on the tick the old deadline would have fired. The wait ran on to
+the burst's end at ~6,300 ticks, saw the posture, and the pour landed
+(`payloads:1, payload_skips:0`); the tenant adopted at the same
+`rip=0x8057ab7 rsp=0x4000000a9778 stop=spent`, the copy resumed at
+`off=0x30000`, one `Done (524288 bytes, 504 sparse holes, 4 kept)` with no
+second `Copying`, no `[FAULT]`, and the reap returned `172 frame(s) freed`.
+The serial capture is `evidence/e7_gate_stall_drill.log`.
+
+The drill's shape was itself corrected by runs. Its first version paced the
+sidecar with 100 ms timed waits interleaved with short bursts, and the run
+passed the wait-extended check — but at the bound the sidecar was parked, so
+the pour would have landed under the old code too; it proved the extension,
+not the refusal. The second version used the pure burst at 6.0G iterations,
+which spanned ~900 ticks on this host and ended before the bound: the drill's
+`outlived` assertion caught it, and 45G is that measurement scaled to ~5,700
+ticks. The drill now pins the posture (`running=[12]/2` at the bound) and uses
+the pure burst, so a future re-run that lands in a parked moment, or a host
+fast enough to finish the burst early, is a red rather than a pass.
+
+**Run record — increment 22, the teeth (2026-11-01).** This retires B10. The
+gate's clauses were asserted positively and their failure side was unproven:
+a harness that has never watched a broken environment redden is a claim. The
+run is one invocation over one capture and four replays, and it is the first
+time the gate's own clauses were made to fail on purpose.
+
+*The arms are a build profile, never a shipped one.* Three fault-injection
+arms live behind `E7G_TOOTH` in `kernel/env_payload.{h,c}` and
+`kernel/syscall_dispatch.c`, selected per restore by the route's body
+(`{"tooth":"descriptor"}`) and compiled only by
+`make x86-iso-e3 ... E7_TOOTH=1`. `E7_TOOTH` joins `AB_DEFS`, so the define is
+part of the build-config stamp: flipping it rebuilds (the objects do not track
+their own flags, so without the stamp a "teeth" run would silently relink the
+previous build's objects and be the control wearing a different filename).
+Every other build refuses a named tooth by name — `this image was not built
+with the gate teeth` — and refuses a misspelt one too (`unknown tooth
+(descriptor|no-fd|no-heap)`), so a request can neither arm a shipped kernel nor
+fall back to the control and look green. The route reports `tooth:<name>`, and
+the recording carries it in `facts`, so a `--replay` of a tooth run is judged
+under the expectation it was produced with rather than against the green set it
+was made to redden.
+
+*One capture, four replays.* `tests/e7_gate_check.sh --teeth` captures the gate
+environment exactly as `--live` does (boot 1: create, workload to the copy
+continuation, checkpoint), then replays it four times over
+`cp --sparse=always` copies of the post-checkpoint NVMe image: the control (no
+tooth, which must be fully green — the arms do not fire unselected) and the
+three breaks. The clause probes, the expectation table and the recording
+format are shared with `--live` and `--replay`, so the three modes cannot
+drift. Each tooth declares the clauses it MUST redden and, by omission, the
+ones it MUST leave green; a tooth that reddens outside its set fails the run,
+which is what keeps a tooth from passing by breaking everything.
+
+*Every replay gets its own copy, and a refused pour is never a tooth's red.*
+The first attempt to fold this into one invocation hit the P1a posture window on
+one replay — the pour was refused before any tooth fired, so that boot proved
+nothing about the tooth it was meant to break. Boot 2 mutates the image it runs
+on (`[backup]` writes the checkpointed storage image and prunes three generations
+of it), so an attempt cannot simply be run again on the same disk: each replay is
+`--sparse=always`-copied from the capture immediately before it runs, and a
+refused attempt is repeated from the capture, printed as
+`note: <tooth> attempt N got no pour (payloads=..., payload_skips=...) — the P1a
+posture window, not this tooth; retrying on a fresh copy`. The repeat is bounded
+at three, and each one is reported as it happens and then counted in a line the
+run prints before its closing verdict; a tooth whose pour refuses every attempt
+fails the invocation (`no attempt got the payload poured — the run cannot measure
+this tooth`) rather than being retried into a pass. The invocation recorded in
+this section needed no repeat — the fix removed the failure mode the earlier
+attempt had exposed, without hiding it when it recurs.
+
+| Tooth | The break | Must redden | Must stay green (the specificity) | Named evidence |
+|---|---|---|---|---|
+| `descriptor` | the payload's Linux task record is dropped at the pour: no adoption, no pages, no context; the sidecars pour normally | B2 (no adopted line), B3 (first read `0x0`), B4 (a second `Copying`) | B1 `payloads=1, skips=0`, B5, B6 | `[E7-GATE] tooth descriptor: ... is DROPPED`; the released child restarts from `_start` and copies 512 KiB again (513 reads, `exit_group status=0`, 172 frames freed) |
+| `no-fd` | the continuation's `read(3)` is forwarded with fd 120, which the sidecar's 16-slot table does not carry, so the REAL lookup answers `-EBADF` | B3 (the read never reaches the VFS: no offset line), B4 (no `Done`) | B1, B2 (adopted, `stop=spent`), B5 (no fault), B6 | the forward line names fd 120; the tenant's own error names EBADF (`Bad file descriptor`), `exit_group status=1`, 168 frames freed |
+| `no-heap` | the reply's destination page — the child's own 64 KiB copy buffer — is unmapped just before the read is forwarded | B4, B5 (a `#PF` inside the withheld page) | B1, B2, B3 (the read IS issued at `off=0x30000`) | the forward line names the page; the deliver refuses the bytes `-EFAULT`; the tenant's `free` of that buffer then takes the `#PF` at `addr=0x...d803d`, `rip=0x8052f39` (`__libc_free`) |
+
+The control's clauses were all green and the three teeth reddened exactly
+seven clauses between them — `7 clause(s) red across descriptor/no-fd/no-heap,
+each exactly where its tooth says, the control green`. The serial evidence is
+`evidence/e7_gate_teeth.log`.
+
+**The teeth corrected a gate clause, which is the point of having them.** B3
+used to assert that SOME read at `off=0x30000` appears in the replay boot. The
+`descriptor` tooth's restart walks the whole file from zero and therefore
+passes through `0x30000` on its way: the clause would have been green on a run
+whose first post-restore read was `0x0`. B3 now asserts the FIRST read after
+the restore is `0x30000`, and the descriptor tooth reddens it by name. The
+consequence is also written down in the table: a lost task record produces a
+restart, so B3/B4 are the clauses that show it; B2 is the one that names it
+(the adoption line is absent).
+
+**The heap tooth's chain is the honest one, and the harness asserts it end to
+end.** The deliver's two-phase copy refuses the 1 KiB payload `-EFAULT` without
+writing a byte, so this kernel does not fault; the tenant's read returns
+`-EFAULT`, and unwinding drops the 64 KiB `Vec` whose allocator header sits in
+the page's last bytes — so the tenant's own `free` takes the `#PF` inside the
+withheld page. B5 is therefore red FOR THIS TOOTH (and the tooth's T clause
+matches the fault's page number against the tooth's own line), while `no-fd`
+stays fault-free and B5 green. That pair is the signature the harness needed:
+B3 green + B5 red-at-the-page is "the read happened and the page was gone";
+B3 red is "the read never happened".
+
+The expectation machinery itself was checked against negatives before the live
+run: a tooth recording that leaves its clause green fails, one that reddens
+outside its set fails, and one naming an unknown tooth is refused rather than
+judged. The same checks ran on the four real recordings through `--replay`.
+
+**The shipped build has no arms, proven two ways.** `make x86-iso-e3 ...
+E7_TOOTH=` (the default) rebuilt the plain gate image with an EMPTY config
+stamp; the plain ISO contains zero occurrences of `tooth no-fd` where the teeth
+ISO contains one. Booted, the plain image answered
+`{"ok":"false","error":"this image was not built with the gate teeth",
+"tooth":"descriptor"}` to a named tooth, `unknown tooth` to a typo, and the
+ordinary restore report (`{"ok":"true",..."tooth":"none"}`) to `{}`.
+
+The teeth named here are three of the five B10 lists. The restart tooth is
+not a separate arm: `descriptor` produces a restart as its consequence and
+B3/B4 are asserted on it. The stale-`fs_base` tooth has no arm yet — the
+adopted context's `fs_base` is carried and stamped, but nothing breaks it
+deliberately, and that is the one named gap this record leaves open.
+
+**The gate's check harness has four modes, so the gate is checked even where
+QEMU is not.** Its default mode is the G1–G6 source clauses — the drill is a
+build-time feature inside the gate branch; the wait's two bounds and the
+switch-in ledger; the outlived line gated on an open window and naming the
+running posture; the designated tenant, staged image and continuation; the
+wait-before-repause and pour-after ordering with the report's counters; and the
+teeth's build profile, three arms, route gate and report — and those run in the
+ordinary `tests/*_check.sh` sweep, with no build and no QEMU. `--live` adds the
+drill build and the two boots; `--teeth` adds the teeth build, one capture and
+four replays; `--replay DIR` re-runs the exact assertion function the live arm
+ends with, over a recording, and that function has teeth: a recording with
+`payloads=0` reddens B1, one with the outlived line removed or `stretch-done`
+deleted reddens D1, one with a `wait ended` line injected reddens D2, and a
+tooth recording is judged against the tooth it names — each with its own
+message and a non-zero exit, not a generic failure.
+
+The wait's own line is part of the change, not just the drill: a wait that
+crosses 30 s while still being scheduled now says so once, because the
+difference between "extended" and "expired" was otherwise only the absence
+of a refusal — which is also what a wait that never ran looks like.
+
+172 frames is the count the work-half run returned for the same profile — the
+resumed tenant's address space comes back whole and goes back whole. The
+serial capture is `evidence/e7_gate_reboot.log` (both boots plus the harness
+transcript).
+
+---
+
 ## 11. Open questions for review
 
 1. **The first user: designated, built, and censused.** `AeroSLS-Roadmap-2026H2-v0.1.md` §5 says in bold that there is no named first user, and the tree agreed — no Go source, no `std`-Rust binary, every real operational workload bash or Python (§5.5.1) — so the target was a *decision*. It is now made and carried out: the backup operation, as `backup/aerobackup/` (a static single-threaded Rust rewrite of `backup/backup.sh`'s snapshot-and-retain core, 27 tests, no dependencies), designated in `tools/linux_abi_candidate.conf`, with the census measured and checked in at `tools/linux_syscall_census.txt` (§5.6). **The open question is no longer about the first user; it is whether this candidate is narrow enough to gate on.** Its measured surface is 27 syscalls, and the two that are structurally hardest — `arch_prctl(ARCH_SET_FS)` (§5.3) and the vDSO-backed `clock_gettime` — are both now named rather than discovered. Whether the other three operations follow, and in what order, is a product question this design does not answer.
@@ -2540,6 +3288,7 @@ Everything this document asserts about the tree, with its source:
 | The vDSO backstop measured: the same binary with no `AT_SYSINFO_EHDR`, row for row | `tools/linux_syscall_census_novdso.txt` |
 | The census and its proof, gated on every push, with the guard's own teeth proven | `tests/linux_abi_census_check.sh`; `tests/linux_abi_census_check_smoke.sh` |
 | The auxv a static binary is started with, as a literal list that omits `AT_SYSINFO_EHDR` | `tools/e7_stack_launcher.c` |
+| The E7 gate's work half ran in the guest to completion: 512 KiB staged, one `Copying`, three `pruned`, `Done (524288 bytes, 504 sparse holes, 4 kept)`, `exit_group(0)`, no `[FAULT]` | `evidence/e7_gate_workhalf.log`; `tests/linux_personality_host_test.c` (the EOF and clock shapes) |
 | Steps 5–7 delivered: the post-then-park forward, the arm-before-post resume, a stray resume refused by name | `kernel/chan.c` (`k_linux_forward`/`k_linux_deliver`); `kernel/syscall_dispatch.c`; `kernel/cap.c` (`cap_linux_find_channels`); guard clauses I–K (§10.7) |
 | A reply's status reaches `rax` only through the §5.7 map, after size and num-echo are enforced | `kernel/linux_abi.c` (`linux_syscall_apply_reply`); `tests/linux_personality_host_test.c` (42 checks, §10.7) |
 | The sidecar's first answers: 218 echoed, 231 reaped, everything else ENOSYS with its number logged | `user/sidecar/src/linux.rs`; `user/sidecar/src/entry.rs` (`service`/`append_wait`) |
@@ -2547,6 +3296,8 @@ Everything this document asserts about the tree, with its source:
 | §5.2's argv/envp cross on the spawn request as the `ARGENV` record, with the empty-environment v1 fallback when it is absent and by-name refusals instead of truncation | `kernel/cap.h`/`cap.c` (`SIDECAR_TAG_ARGENV`, the parse arena, the §5.2 site); `user/proto/src/manifest.rs` (`ArgEnv`, `argenv_wire_bytes_golden`); `tests/cap_create_sidecar_host_test.c` L3/L4; guard clauses O6/O7, teeth t49–t52 |
 | The SSE gate: the pure CR0/CR4/CPUID arithmetic at the SDM's own bit positions, the enable's CPUID → CR4 → CR0 → `fninit` → `ldmxcsr` order, the BSP call ahead of `syscall_gate_init`, the intact vector-7 chain, and the lazy path still dormant (no caller of `perform_lazy_context_switch`) | `arch/x86/fpu_enable.h`; `arch/x86/lazy_fpu.c` (`fpu_enable_sse`); `kernel/kernel.c` 4b; `tests/fpu_enable_host_test.c` (40 checks); guard clause Q, teeth t70–t75 (§10.13's step 2) |
 | The signal seam: the plan's three first-trap refusals (width, out-pointer, span) ahead of any channel post, the sidecar's dispositions/mask/pending with handler installs refused by name and tkill scoped to its own tid, and every default-terminate converging on one attributed no-reply kill | `kernel/linux_abi.{h,c}` (`linux_sig_copy_plan`, `LSC_SIG`); `kernel/syscall_dispatch.c`; `user/sidecar/src/linux.rs` (`SigState`, the 13/14/200 arms, `Answer::SignalKill`); `tests/linux_personality_host_test.c` (98 checks) + linux.rs unit tests (11); guard clause R, teeth t76–t83 (§10.13's step 2) |
+| The E7 gate's resume half ran in the guest: one invocation, two boots of the same NVMe image, the tenant adopted at `rip=0x8057ab7 rsp=0x4000000a9778` (`stop=spent`), its copy finishing after the reboot — one `Copying`, one `Done (524288 bytes, 504 sparse holes, 4 kept)`, no `[FAULT]` — and its `exit_group` reaped by name (`[TORE] address space … 172 frame(s) freed`, the work-half count) | `evidence/e7_gate_reboot.log`; `tests/env_payload_host_test.c` (81 checks: the one-shot stop, the held replay's page mapping, and the stall-bounded wait's three outcomes); `tests/cap_create_sidecar_host_test.c` (the caller's-partition resolve) |
+| The gate's failure side is observed, not assumed: one invocation, one capture and four replays — the control green, `descriptor` reddening B2/B3/B4, `no-fd` B3/B4, `no-heap` B4/B5 (the 64 KiB buffer's `free` faulting inside the withheld page) — with each tooth's own line in the transcript and the shipped image refusing a named tooth by name | `evidence/e7_gate_teeth.log`; `tests/e7_gate_check.sh --teeth`; `kernel/env_payload.h`'s `E7G_TOOTH` block and `Makefile`'s `E7_TOOTH` (both compiled out by default) |
 | The run's last ENOSYS answer retires: poll (7)'s zero-timeout probe answered 0 events with the array never read and revents never written, a WAITING poll refused at both ends before any post, and the firstuser's first output (its own fatal SIGPIPE assert) performed by the fd class | `kernel/linux_abi.{h,c}` (`linux_poll_refuses_blocking`, `LINUX_POLL`); `kernel/syscall_dispatch.c` (the first-trap refusal); `user/sidecar/src/linux.rs` (the 7 arm); `tests/linux_personality_host_test.c` (105 checks) + linux.rs unit tests (12); guard clause S, teeth t84–t89 (§10.13's poll coda) |
 
 ## Appendix B — Named gaps, each with its destination
@@ -2567,7 +3318,12 @@ the staged destination, measured (§10.13's step 3) |
 | Target designated, but no candidate binary and therefore no artifact | the table is still unmeasured; `--check` reports a named skip rather than a pass | write the crate, add the musl target, run `--run` |
 | No thread groups / `clone` / `futex` | Go and every threaded runtime are out (§7) | named as Go's gate; unscoped |
 | No ARM64 userspace OS | E7 cannot run there (§4.1) | H2 item #1 |
-| No environment checkpoint/restore | the inherited gate cannot be passed (§8) | POSIX roadmap v0.2 §12 item 1 |
-| No reply payload: `read` and the file class never cross back (§10.10's named gap) | the first user cannot open, read, stat, list, rename or prune — its file work never leaves the sidecar (§5.6) | E7 increment 8, §10.13 (scoped) |
-| No time source across the sidecar's ABI | `clock_gettime` (228) refuses; the no-vDSO proof (§5.5) shows the first user makes this call | named §10.13: a shared change, its own increment after 8, decided by the run's evidence |
+| No environment checkpoint/restore | the inherited gate cannot be passed (§8) | POSIX roadmap v0.2 §12 item 1; §10.14 increments 20–22 for the Linux task and the run |
+| No Linux task in the checkpoint record or payload | the gate's cycle half restores the two sidecars and loses the first user; its descriptors and heap cannot come back | **LANDED** — increment 20 (§10.14): the record's third slot carries `entry`/stack/caps and the payload's `EnvPayloadTask` carries the 20-word context, `fs_base`, both cursors and every page's permission. Increment 21's live run replays it |
+| The Linux tenant resumes at its captured `rip`/`rsp` after a reboot | without it a restore either re-enters `_start` or holds the copy forever, and the cycle half never completes | **LANDED** — increment 21 (§10.14): one invocation, two boots, adopted at `rip=0x8057ab7 rsp=0x4000000a9778 stop=spent`, the copy finishing after the reboot with one `Copying`, one `Done (524288 bytes, 504 sparse holes, 4 kept)` and no `[FAULT]`; `evidence/e7_gate_reboot.log` |
+| `sys_sls_sidecar_pid` read a 0 partition as PARTITION_SYSTEM, so a tenant sidecar's name→pid resolve answered 0 for its own child and `exit_group`'s reap refused by name (measured on increment 21's resumed tenant) | a replay that leaks an address space could be counted as a clean cycle, and a tenant could also enumerate PARTITION_SYSTEM's names | **LANDED** — 0 now means the caller's own partition (the ABI's reading everywhere else), which is also tighter than the old scoping; `tests/cap_create_sidecar_host_test.c` pins both halves, and the resumed tenant's exit returns `172 frame(s) freed` (§10.14) |
+| The pre-pour wait bounded ELAPSED time, so a sidecar still serving the replay's own boot I/O when a fixed 30 s deadline expired was reported as a posture that never came — a healthy environment reading as one whose contents were refused (measured once in four boots: `payload_skips:1`, `drv.ramdisk.1` running) | a slow-but-working boot is indistinguishable from a wedged one, and the transcript blames the capture | **LANDED** — the bound is a stall window (3,000 ticks, restarted by any switch-in on the record's sidecar tasks or the `[env-id]` announcement) with an absolute ceiling (18,000), and `ProcessDescriptor.switches` is the progress signal; `tests/env_payload_host_test.c` pins all three outcomes, and `tests/e7_gate_check.sh --live` exercises the extension live as part of the gate — the wait outlived the fixed bound at 3,005 ticks with a sidecar RUNNING (`running=1/2`, `quiet 0`, `announced=0`), never answered, and the pour still landed (`payloads:1, payload_skips:0`) (§10.14) |
+| No gate harness or teeth: the E7 clauses were asserted positively and their failure side was unproven | a harness that has never seen a broken environment redden cannot say its green run means anything | **LANDED** — increment 22 (§10.14): `tests/e7_gate_check.sh` (source clauses, `--live`, `--teeth`, `--replay`), a build-gated tooth profile (`E7_TOOTH`, selected per restore and refused by name elsewhere), and three live breaks whose reds are asserted by name — `descriptor` (B2/B3/B4), `no-fd` (B3/B4), `no-heap` (B4/B5) — with the control green; `evidence/e7_gate_teeth.log`. The `fs_base` tooth remains |
+| No reply payload: `read` and the file class never cross back (§10.10's named gap) | the first user cannot open, read, stat, list, rename or prune — its file work never leaves the sidecar (§5.6) | **LANDED** — increments 17–18 (§10.13's step 4): the thirteen census numbers cross through the VFS, the measured flag contract, path/stat/dirent reply plans and the sidecar fd table. The guest workload run is §10.14 increment 19 |
+| No time source across the sidecar's ABI | `clock_gettime` (228) refuses; the no-vDSO proof (§5.5) shows the first user makes this call | §10.14 increment 19: the 16-byte copy-out, the sidecar answer and the pinned 2026-01-07 epoch |
 | No console-input state, so a WAITING `poll` cannot answer | a zero-timeout probe is answered (0 events, increment 11), but `poll` (census ×1) with a timeout, and a blocking read, still refuse by name | the input class, unscoped (named §10.13) |

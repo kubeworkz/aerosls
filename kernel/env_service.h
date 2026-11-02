@@ -135,4 +135,12 @@ int env_service_restore_pending(struct EnvSvcRestoreReport* out);
  * sticky state), and consulted per record inside the pass. */
 void env_service_set_restore_payload(int on);
 
+/* E7 increment 22: which gate TOOTH this pass installs (env_payload.h's
+ * ENV_PAYLOAD_TOOTH_*). NONE for every ordinary restore, and the only
+ * caller that names one is a teeth build's restore route — every other
+ * build refuses the request before this is reached, and the arms it would
+ * arm are compiled out. Set on every route invocation beside the payload
+ * knob (no sticky state), and consumed by the pour. */
+void env_service_set_restore_tooth(int tooth);
+
 #endif /* ENV_SERVICE_H */

@@ -151,6 +151,17 @@ const char *linux_syscall_class_name(enum LinuxSyscallClass cls);
                                                 (not in the census)    */
 #define LINUX_USER_ADDR_MAX   0x00007FFFFFFFFFFFULL
 
+/* ─── E7 increment 19: the time source across the seam ────────────────────
+ * clock_gettime (228) is in the census but vDSO-backstopped on Linux; this
+ * kernel ships no vDSO, so the call really traps here. The reply is one
+ * Linux `struct timespec` — two little-endian i64s, seconds then
+ * nanoseconds — written back to args[1]. NULL is -EFAULT at the FIRST trap
+ * (the same span rule every reply plan uses), before any channel post. The
+ * sidecar owns the value (a pinned epoch, linux.rs's 228 arm); the kernel
+ * owns only where the sixteen bytes land. */
+#define LINUX_CLOCK_GETTIME   228u
+#define LINUX_TIMESPEC_BYTES  16u
+
 /* Is this address legal as a task's FS base? User-canonical — bits 63..47
  * all zero, one unsigned compare for a 48-bit user VA. 0 is legal
  * (refusing it would invent a rule no Linux kernel has). The kernel
@@ -643,6 +654,13 @@ int linux_user_copy_in(const uint8_t *src, uint64_t root, uint64_t va,
  * copy-IN number whose Linux return is neither 0 nor its count grows
  * this predicate with its own arm — never a default that guesses. */
 int linux_reply_shape_ok(uint64_t num, uint64_t ret, uint32_t n);
+
+/* May a SUCCESS reply for `num` carry ZERO payload bytes? Only for the
+ * count-truth numbers, whose zero IS the answer: read at end-of-file and
+ * getdents64 at end-of-directory. A staged request for any other number
+ * owes a fixed struct, so a 0-byte success there is the protocol break
+ * chan.c's shape-1 rule refuses. Total over num. */
+int linux_reply_zero_ok(uint64_t num);
 
 /* Serialize the sidecar's compact Stat payload (LINUX_STAT_PAYLOAD_BYTES,
  * little-endian: mode u16 @0, uid u16 @2, gid u16 @4, size u64 @8,

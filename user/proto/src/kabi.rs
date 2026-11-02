@@ -345,6 +345,13 @@ pub trait Kernel {
     /// drops a sidecar's registry entry as the first step of its teardown, so
     /// a name that no longer resolves is a sidecar that is really gone — which
     /// is what makes it safe to reclaim the environment's frames.
+    ///
+    /// `partition` 0 means THE CALLER'S OWN — the same reading every other
+    /// request partition has (`create_sidecar_in`'s target, `alloc_region_in`,
+    /// `free_region_in`). It is what a sidecar passes to reap its own Linux
+    /// child: those are spawned with target 0, so they live in the sidecar's
+    /// partition, and 0 must therefore resolve there rather than in
+    /// PARTITION_SYSTEM (which made a tenant's reap refuse by name).
     /// Default: 0 (nothing resolves), for fakes.
     fn sidecar_pid(&self, name: &str, partition: u32) -> u32 {
         let _ = (name, partition);
@@ -530,8 +537,9 @@ mod abi {
 
     /// SLSSidecarPidRequest (kernel/cap.h) — a name pointer, the byte count to
     /// compare (0 = read to the NUL) and the partition the name is scoped to
-    /// (E2). The kernel copies the name into its own bounded buffer before
-    /// resolving it, so the pointer only has to be valid for the call.
+    /// (E2), where 0 = the caller's own partition. The kernel copies the name
+    /// into its own bounded buffer before resolving it, so the pointer only has
+    /// to be valid for the call.
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct SidecarPidReq {

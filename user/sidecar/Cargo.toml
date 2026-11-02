@@ -28,3 +28,10 @@ default = []
 #   cargo build -p aerosls-sidecar --features target \
 #       --target x86_64-unknown-none --release --bin posix
 target = ["aerosls-proto/target"]
+# E7 §10.14's STALL DRILL — a DRILL, never a shipped profile. The gate
+# profile's sidecar stretches its own boot past the pour's old fixed 30 s
+# bound (kernel/env_payload.h's EP_WAIT_TICKS) so a live run can prove the
+# stall-bounded wait extends instead of calling a working environment
+# refused. Enabled only by `make x86-iso-e3 ... E7_SLOW_BOOT=1`; a default
+# build compiles none of it (the call site is cfg'd, not runtime-branched).
+e7_slow_boot = []

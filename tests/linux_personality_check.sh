@@ -662,7 +662,7 @@ fi
 # every other §5.2 clause stays green reading argc alone. The cap host
 # test's L3/L4 sections bite the bytes; the smoke's t49–t52 bite these.
 if grep -qF '#define SIDECAR_TAG_ARGENV       0x000E' "$CAPH" && \
-   grep -qF '#define SIDECAR_MANIFEST_MAX_ARGV  8' "$CAPH" && \
+   grep -qF '#define SIDECAR_MANIFEST_MAX_ARGV  12' "$CAPH" && \
    grep -qF '#define SIDECAR_MANIFEST_MAX_ENVP  16' "$CAPH" && \
    grep -qF '#define SIDECAR_MANIFEST_ARGENV_BYTES 512' "$CAPH" && \
    grep -qF 'char     argenv_arena[SIDECAR_MANIFEST_ARGENV_BYTES];' "$CAPH" && \
@@ -681,7 +681,7 @@ else
     bad "O6. the environment-crossing record is gone from one half of the seam — the parse would refuse every record as an unknown tag (flags=0, or ship a record whose strings can silently overflow/truncate), or the stack-image site would ignore it and hand every Linux child the empty environment again while every other §5.2 clause stays green"
 fi
 if grep -qF 'pub const TAG_ARGENV: u16 = 0x000E;' "$MANR" && \
-   grep -qF 'pub const MAX_ARGV: usize = 8;' "$MANR" && \
+   grep -qF 'pub const MAX_ARGV: usize = 12;' "$MANR" && \
    grep -qF 'pub const MAX_ENVP: usize = 16;' "$MANR" && \
    grep -qF 'pub const ARGENV_MAX_STR_BYTES: usize = 512;' "$MANR" && \
    grep -qF 'recs.push((TAG_ARGENV, p));' "$MANR" && \
@@ -689,8 +689,8 @@ if grep -qF 'pub const TAG_ARGENV: u16 = 0x000E;' "$MANR" && \
    grep -qF 'pub const LINUX_DEFAULT_ENV: &[&str] = &["PATH=/bin", "HOME=/root"];' "$LRS" && \
    grep -qF 'argenv: Some(ArgEnv::new(&[PROBE_NAME], LINUX_DEFAULT_ENV)),' "$LPRO" && \
    grep -qF 'argenv: Some(ArgEnv::new(&[CAND_NAME], LINUX_DEFAULT_ENV)),' "$CAND" && \
-   grep -qF 'argenv: Some(ArgEnv::new(&[USER_NAME], LINUX_DEFAULT_ENV)),' "$LFU"; then
-    ok "O7. the Rust format reference carries the record with the kernel's bounds and emits it, the environment crosses from one shared default list, and all three Linux spawn sites author the record (firstuser, probe and candidate — the pair stays a pair)"
+   grep -qF 'argenv: Some(ArgEnv::new(argv, LINUX_DEFAULT_ENV)),' "$LFU"; then
+    ok "O7. the Rust format reference carries the record with the kernel's bounds and emits it, the environment crosses from one shared default list, and all three Linux spawn sites author the record (firstuser with the gate's command line or v1's { name }, probe and candidate — the pair stays a pair)"
 else
     bad "O7. the record's Rust half or a spawn site is gone — the format reference would refuse its own record as unknown, the two halves of the wire format would drift apart silently, or a Linux child would cross with no record at all and be handed the empty environment while its sibling gets a real one"
 fi
@@ -1171,6 +1171,92 @@ if grep -qF 'fn hex_into' "$LRS" && \
     ok "V8. the instrument carries every mmap answer — a grant shows the address the ledger gave (hex: an address is unreadable in decimal), every refusal shows the request's words with the errno it became, and the increment-15 ENOSYS line is unchanged behind it"
 else
     bad "V8. an mmap answer line is gone — the run's proof would be a reconstruction again (the increment-14/15 instrument rule)"
+fi
+
+# ─── W. E7 increment 20: the task in the record, its state in the payload ──
+# B6/B7 were the named blockers: the record's kind existed but nothing filled
+# it, and the payload SKIPPED the Linux task in all three loops. These
+# clauses hold the three halves that make the tenant checkpointable — the
+# identity the manager names, the kernel facts the spawn stamps, and the
+# bytes + permissions the capture files — plus the one form the blob can
+# honestly resume (USER), refused by name otherwise.
+EPH=kernel/env_payload.h
+EPC=kernel/env_payload.c
+ECKH=kernel/env_ckpt.h
+ECKC=kernel/env_ckpt.c
+IEM=user/init/src/env_manager.rs
+ENVP=user/proto/src/env_proto.rs
+EPHUT=tests/env_payload_host_test.c
+ECKHUT=tests/env_ckpt_host_test.c
+if grep -qF '#define ENV_PAYLOAD_REC_VERSION 2u' "$EPH" && \
+   grep -qF '#define EP_PAGE_ENTRY_BYTES 16u' "$EPH" && \
+   grep -qF 'uint64_t linux_regs[20];' "$EPH" && \
+   grep -qF 'uint64_t linux_args[6]; /* rdi, rsi, rdx, r10, r8, r9 at the capture */' "$EPH" && \
+   grep -qF 'uint64_t fs_base;' "$EPH" && \
+   grep -qF 'uint64_t brk_cur;' "$EPH" && \
+   grep -qF 'uint64_t mmap_top;' "$EPH" && \
+   grep -qF 'uint64_t heap_limit;' "$EPH" && \
+   grep -qF 'uint64_t stack_bottom;' "$EPH" && \
+   grep -qF 'uint64_t image_hi;' "$EPH" && \
+   grep -qF '#define ENV_PAYLOAD_FORM_USER    2u' "$EPH"; then
+    ok "W1. the payload is v2: EnvPayloadTask carries the Linux task's FULL context (20-word TaskContext), its six argument registers, fs_base, both cursors, the heap and stack ranges and the image span, and every page index entry is 16 bytes with a permission word"
+else
+    bad "W1. the Linux half of EnvPayloadTask or the permission-carrying page entry is gone — the capture could file pages a restore cannot map, and a v1-shaped blob would be misread entry by entry"
+fi
+if grep -qF 'static int ep_linux_page(const struct EnvCkptRecord* rec, uint32_t t,' "$EPC" && \
+   grep -qF 'if (tk->stack_bottom && vaddr >= tk->stack_bottom &&' "$EPC" && \
+   grep -qF 'if (pd->linux_image_lo && vaddr >= pd->linux_image_lo &&' "$EPC" && \
+   grep -qF 'if (pd->linux_heap_base && vaddr >= pd->linux_heap_base &&' "$EPC" && \
+   grep -qF 'return ep_in_image_window(vaddr) || ep_in_regions(rec, vaddr);' "$EPC" && \
+   grep -qF 'if (!ep_task_page(rec, t, pds[t], v)) continue;' "$EPC" && \
+   grep -qF 'static uint32_t ep_perm_of(uint64_t e)' "$EPC" && \
+   grep -qF 'ep_perms[pi] = perm;' "$EPC"; then
+    ok "W2. the capture walks the Linux CR3 with a PER-TASK predicate — its own image span, the record's own stack bounds and its budget span (never the parent's image window, which the child's cloned table also contains), resolving each page's permissions from the live PTE"
+else
+    bad "W2. the Linux page predicate or the per-page permission resolve is gone — the walk would either miss the tenant's bytes or capture the PARENT's cloned image pages under the child, and the blob would carry no permissions to check"
+fi
+if [ "$(awk '/^uint32_t env_payload_capture_all\(void\) \{/,/^\}/' "$EPC" | grep -c 'kind == ENV_CKPT_TASK_LINUX) continue')" -eq 0 ] && \
+   grep -qF 'struct ProcessDescriptor* pd = ep_find_proc(rec->tasks[t].name);' "$EPC" && \
+   grep -qF 'missing ? "named task has no live process" : "no tasks"' "$EPC"; then
+    ok "W3. the capture no longer skips the Linux task: every named task must resolve, and a checkpoint taken before the tenant is spawned skips the ENVIRONMENT by name instead of writing a third slot with no bytes"
+else
+    bad "W3. the capture still skips the Linux kind (or names a missing task without saying so) — a checkpoint of a live gate environment would silently omit its tenant while the record claims three tasks"
+fi
+if grep -qF 'case EP_REFUSE_PERM:' "$EPC" && \
+   grep -qF 'case EP_REFUSE_FORM:' "$EPC" && \
+   grep -qF 'if ((live_perm & EP_PAGE_PERM_MASK) !=' "$EPC" && \
+   grep -qF 'ep_refuse(EP_REFUSE_PERM, t, pi);' "$EPC" && \
+   grep -qF 'if (tk.form != ENV_PAYLOAD_FORM_USER &&' "$EPC" && \
+   grep -qF 'tk.form != ENV_PAYLOAD_FORM_ENTRY) {' "$EPC" && \
+   grep -qF 'pd->has_ring3_ctx  = 1;' "$EPC" && \
+   grep -qF 'pd->linux_mmap_top = tk.mmap_top;' "$EPC"; then
+    ok "W4. the restore proves the page's live permissions against the captured ones before a byte moves, resumes only the two resumable Linux forms (the pause's USER and increment 21's held ENTRY stop — PARKED and RUNNING refused by name, their queued/mid-compute state not being in the blob), and carries the captured ring3_ctx with its fs_base and both cursors"
+else
+    bad "W4. the restore's Linux arm is gone — a page could be poured into a map with different permissions, a parked task's stale context would be resumed, a non-held task could be poured over, or the task would restart at its entry"
+fi
+if grep -qF 'pub const LINUX_TASK_NAME: &str = "e7.gate.user.0";' "$ENVP" && \
+   grep -qF 'r.set_task(2, LINUX_TASK_NAME, TASK_LINUX);' "$IEM" && \
+   grep -qF 'let gate = cfg!(feature = "e7_gate") && index == 1;' "$IEM" && \
+   grep -qF 'pub const GATE_TASK_NAME: &str = aerosls_proto::env_proto::LINUX_TASK_NAME;' "$LFU" && \
+   grep -qF 'if (rec->tasks[i].entry == 0 &&' "$ECKC" && \
+   grep -qF 'rec->tasks[i].kind != ENV_CKPT_TASK_LINUX)' "$ECKC" && \
+   grep -qF 'int env_ckpt_linux_task_stamp(' "$ECKC" && \
+   grep -qF '(void)env_ckpt_linux_task_stamp(parent->partition_id, parent->name,' "$CAPC" && \
+   grep -qF 'stack_base + (uint64_t)stk_pages * 4096,' "$CAPC" && \
+   grep -qF 'bib_n_caps);' "$CAPC"; then
+    ok "W5. registration is settled: the manager names the third task from the SAME gate bit that selected the manifest (so a replay's create names the same list), the sidecar spawns that one name, the record accepts a Linux entry of 0 until the spawn, and the kernel stamps entry/stack/caps at the create — the only place they are known"
+else
+    bad "W5. the registration chain has a hole — the record would name a task nobody spawns (or vice versa), a Linux slot's not-yet-spawned entry would refuse the whole registration, or the stamped entry/stack/caps would never reach the record"
+fi
+if grep -qF 'LINUX: the gate environment (sidecar + Linux tenant) captures as one payload' "$EPHUT" && \
+   grep -qF 'LINUX: the full ring3_ctx — rip, rsp and the six argument registers — is the captured one' "$EPHUT" && \
+   grep -qF 'PERM: a captured RX image page that is writable at the destination refuses the whole pour' "$EPHUT" && \
+   grep -qF 'FORM: a parked Linux tenant is refused by name' "$EPHUT" && \
+   grep -qF 'the stamp fills the Linux slot' "$ECKHUT" && \
+   grep -qF 'a replay whose create names the same three tasks IS the same environment' "$ECKHUT"; then
+    ok "W6. both host tests drive the increment: the payload round trip (bytes, perms, context, the perm and form teeth) and the record layer's stamp/identity clauses — each claim runs against the real kernel file, not a model of it"
+else
+    bad "W6. a host-test clause for increment 20 is missing — the capture, the stamp or the identity comparison would be a claim no test runs"
 fi
 
 echo

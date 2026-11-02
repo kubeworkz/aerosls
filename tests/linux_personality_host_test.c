@@ -1414,6 +1414,48 @@ int main(void)
               "      kernel itself computes must contradict on the wire");
     }
 
+    {   /* increment 19: the time source's 16-byte destination, and the
+         * zero-byte successes EOF and end-of-directory turn on */
+        uint64_t a[6] = { 0, 0, 0, 0, 0, 0 };
+        struct LinuxFdReplyPlan r;
+
+        a[1] = 0x7000;
+        r = linux_fd_reply_plan(LINUX_CLOCK_GETTIME, a);
+        CHECK(r.dst == 0x7000 && r.len == LINUX_TIMESPEC_BYTES &&
+              r.aux == LINUX_TIMESPEC_BYTES && r.kind == LINUX_STAGE_RAW &&
+              r.refuse == 0,
+              "clock_gettime plans one raw 16-byte timespec at args[1] —\n"
+              "      the copy the deliver performs on a 0-reply success\n");
+
+        a[1] = 0;
+        r = linux_fd_reply_plan(LINUX_CLOCK_GETTIME, a);
+        CHECK(r.refuse == -LINUX_EFAULT,
+              "a NULL timespec is -EFAULT at the FIRST trap — Linux's own\n"
+              "      answer, before any channel post\n");
+
+        a[1] = 0xFFFF800000000000ULL;
+        r = linux_fd_reply_plan(LINUX_CLOCK_GETTIME, a);
+        CHECK(r.refuse == -LINUX_EFAULT,
+              "a non-canonical timespec is likewise refused before post\n");
+
+        CHECK(linux_reply_shape_ok(LINUX_CLOCK_GETTIME, 0, 16) == 1 &&
+              linux_reply_shape_ok(LINUX_CLOCK_GETTIME, 0, 8) == 0 &&
+              linux_reply_shape_ok(LINUX_CLOCK_GETTIME, 16, 16) == 0,
+              "the clock's shape is success with EXACTLY 16 bytes — a short\n"
+              "      payload or a non-zero rax is refused before any write\n");
+
+        /* The live run's last read: EOF (0 bytes) on a staged destination
+         * is a success, while a staged fixed-struct number keeps the
+         * shape-1 refusal. */
+        CHECK(linux_reply_zero_ok(LINUX_READ) == 1 &&
+              linux_reply_zero_ok(LINUX_GETDENTS64) == 1 &&
+              linux_reply_zero_ok(LINUX_STAT) == 0 &&
+              linux_reply_zero_ok(LINUX_CLOCK_GETTIME) == 0 &&
+              linux_reply_zero_ok(LINUX_RT_SIGACTION) == 0,
+              "EOF and end-of-directory are 0-byte successes; a staged\n"
+              "      struct number still refuses a payloadless success");
+    }
+
     printf("linux_personality_host_test: %d passed, %d failed\n",
            checks_passed, checks_failed);
     return checks_failed == 0 ? 0 : 1;

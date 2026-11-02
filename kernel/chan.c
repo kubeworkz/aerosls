@@ -958,7 +958,13 @@ uint64_t k_linux_deliver(uint32_t pid, uint16_t ch_r, uint64_t expect_num) {
                         + 64; /* offsetof(SLSLinuxSyscallRequest, status) */
                     for (i = 0; i < 4; i++)
                         status |= (int32_t)((uint32_t)sb[i] << (8 * i));
-                    if (status == 0)
+                    /* …unless zero bytes IS the whole answer: read at EOF
+                     * and getdents64 at end-of-directory are count-truth
+                     * successes whose count is 0 (linux_reply_zero_ok).
+                     * The rule then bites only where a fixed struct was
+                     * owed and none arrived. */
+                    if (status == 0 &&
+                        !linux_reply_zero_ok(expect_num))
                         return (uint64_t)(int64_t)linux_errno_from_cap(
                             CAP_ERR_PROTO);
                 }

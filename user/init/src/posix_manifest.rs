@@ -7,7 +7,7 @@
 
 use aerosls_proto::manifest::{
     Bootstrap, Budget, CapKind, Cpu, Image, Limits, Manifest, ManifestCap,
-    build_manifest, crc32, HEADER_LEN,
+    build_manifest, crc32, FLAG_GATE, HEADER_LEN,
 };
 use alloc::vec::Vec;
 
@@ -214,6 +214,39 @@ pub fn build_posix_manifest_tenant(
     image_size: u32,
     heap_base: u64,
 ) -> Vec<u8> {
+    build_posix_manifest_tenant_profile(
+        name, ramdisk_peer, image_kaddr, image_size, heap_base, false,
+    )
+}
+
+/// The E7 gate profile: the same tenant manifest with the header's
+/// `FLAG_GATE` bit set. The bit grants no authority and adds no cap, so the
+/// tenant hardware gate is untouched; the kernel copies it into the BIB
+/// (`BOOT_INFO_FLAG_GATE`), which is where the sidecar selects the profile.
+/// A marker CAP was tried first and is refused as an overlap: any MEM cap
+/// inside the tenant budget duplicates the budget object's pages, and every
+/// other cap class would either add authority or need a peer that does not
+/// exist.
+pub fn build_posix_manifest_tenant_gate(
+    name: &str,
+    ramdisk_peer: &str,
+    image_kaddr: u64,
+    image_size: u32,
+    heap_base: u64,
+) -> Vec<u8> {
+    build_posix_manifest_tenant_profile(
+        name, ramdisk_peer, image_kaddr, image_size, heap_base, true,
+    )
+}
+
+fn build_posix_manifest_tenant_profile(
+    name: &str,
+    ramdisk_peer: &str,
+    image_kaddr: u64,
+    image_size: u32,
+    heap_base: u64,
+    gate: bool,
+) -> Vec<u8> {
     let heap_size = 4 * 1024 * 1024; // 4 MiB — matches the system profile's heap
     let caps = [
         Some(ManifestCap {
@@ -277,12 +310,13 @@ pub fn build_posix_manifest_tenant(
             },
         }),
         None, None, None, None, None,
-        None, None, None, None, None, None,
+        None, None, None, None, None,
+        None,
     ];
     let m = Manifest {
         version_major: 1,
         version_minor: 0,
-        flags: 0,
+        flags: if gate { FLAG_GATE } else { 0 },
         name: Some(name),
         personality: Some("aerosls.posix.v1"),
         image: Some(Image { offset: 0, size: image_size, entry: 0 }),

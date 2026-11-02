@@ -703,6 +703,18 @@ struct LinuxFdReplyPlan linux_fd_reply_plan(uint64_t num, const uint64_t args[6]
         p.aux  = args[2] < LINUX_DIRENT_USER_CAP
                      ? (uint32_t)args[2] : LINUX_DIRENT_USER_CAP;
         p.kind = LINUX_STAGE_DENTS;
+    } else if (num == LINUX_CLOCK_GETTIME) {
+        /* clock_gettime(clockid, tp) — one struct timespec back. The
+         * out-pointer is args[1] and the shape is fixed (16 bytes: tv_sec
+         * i64, tv_nsec i64). NULL is -EFAULT at the first trap, before
+         * any post; a non-canonical span falls to the shared check
+         * below. The VALUE is the sidecar's (a pinned epoch); this plan
+         * only says where the bytes land. */
+        p.dst  = args[1];
+        p.len  = LINUX_TIMESPEC_BYTES;
+        p.aux  = LINUX_TIMESPEC_BYTES;
+        p.kind = LINUX_STAGE_RAW;
+        if (args[1] == 0) p.refuse = -LINUX_EFAULT;
     } else if (num == LINUX_READ) {
         /* read(fd, buf, count) — count-truth's own rule, mirrored from
          * write: a count-0 read plans NOTHING before canonicality,
@@ -896,6 +908,22 @@ int linux_dirent_pack(const uint8_t *src, uint32_t n, uint32_t count_cap,
     return (int)packed;
 }
 
+/* Does a ZERO-byte success answer this number honestly? The shape-1 rule
+ * in chan.c refuses a success on a request that staged an owed payload —
+ * "answering 0 while the caller's out-pointer keeps stack garbage is the
+ * silent lie the seam exists to prevent". But for a COUNT-TRUTH number the
+ * count is the answer: read at end-of-file returns 0, and getdents64 at
+ * end-of-directory packs 0 bytes. Refusing those would make EOF an error
+ * (caught live: the gate's backup copy died on its last read with EPROTO).
+ * Every other staged number owes a FIXED struct, so zero bytes there is
+ * still the lie the rule names. Total; the twin of payload_bound's
+ * per-number arm on the sidecar side. */
+int linux_reply_zero_ok(uint64_t num)
+{
+    if (num == LINUX_READ || num == LINUX_GETDENTS64) return 1;
+    return 0;
+}
+
 int linux_reply_shape_ok(uint64_t num, uint64_t ret, uint32_t n)
 {
     if (num == LINUX_READ) return ret == (uint64_t)n;
@@ -909,6 +937,10 @@ int linux_reply_shape_ok(uint64_t num, uint64_t ret, uint32_t n)
      * here and the deliver overwrites rax with what was packed. */
     if (num == LINUX_GETDENTS64)
         return ret == 0 && n <= LINUX_DENTS_PAYLOAD_CAP;
+    /* clock_gettime: success and exactly one timespec — a success with no
+     * payload (or the wrong size) is refused before any byte is written. */
+    if (num == LINUX_CLOCK_GETTIME)
+        return ret == 0 && n == LINUX_TIMESPEC_BYTES;
     return ret == 0;
 }
 

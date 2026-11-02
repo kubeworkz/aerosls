@@ -119,6 +119,20 @@ static void proc_clear_resume_state(struct ProcessDescriptor* pd) {
      * create call (cap_create_sidecar_in_personality), so no window exists
      * where a schedulable task carries the wrong personality. */
     pd->personality = PROC_PERSONALITY_SLS;
+    /* E7 increment 21: the restore's hold is per-boot spawn state, like the
+     * personality — a reused slot must never stay shielded from the
+     * scheduler because its predecessor was held for a pour. The gate
+     * stop's three fields are the same shape: a reused slot that inherited
+     * 'gate_profile' would stop some other tenant's read, and one that
+     * inherited 'gate_stopped' would be captured in a form it never was. */
+    pd->restore_held = 0;
+    pd->gate_profile      = 0;
+    pd->gate_read_pending = 0;
+    pd->gate_stopped      = 0;
+    pd->gate_bytes        = 0;
+    /* E7 increment 22: a reused slot must not inherit a gate tooth either —
+     * a stale one would break the next occupant's next read. */
+    pd->tooth             = 0;
     /* E7 §5.3: the same rule for TLS as for personality — a reused slot's
      * stale fs_base would point the next occupant's %fs at someone else's
      * address space the instant the switch-in wrote it to the MSR. The
@@ -146,6 +160,11 @@ static void proc_clear_resume_state(struct ProcessDescriptor* pd) {
     pd->linux_heap_limit = 0;
     pd->linux_brk_cur = 0;
     pd->linux_mmap_top = 0;
+    /* E7 increment 20: the image range clears with the span for the same
+     * reason — a reused slot's capture would otherwise walk (and pour) the
+     * previous occupant's image pages as if they were this task's own. */
+    pd->linux_image_lo = 0;
+    pd->linux_image_hi = 0;
     pd->mem_stage_num = 0;
     pd->mem_stage_a0 = 0;
     pd->mem_stage_a1 = 0;
@@ -1150,6 +1169,12 @@ static void proc_build_resume_frame(struct ProcessDescriptor* next, uint64_t* f)
      * other's TLS and every other task returns to base 0 rather than a
      * leftover. No personality branch: the invariant is the mechanism. */
     user_write_fs_base(next->fs_base);
+    /* E7 increment 21 (hardening): the switch-TO ledger, at the one builder
+     * every switch path honours — the wait for the replayed sidecars' parked
+     * posture reads it as "this environment is still being scheduled", so
+     * boot I/O that keeps a driver runnable no longer looks like a posture
+     * that will never arrive (process.h's field comment). */
+    next->switches++;
     for (int i = 0; i < 15; i++) f[i] = 0;
     if (next->resume_sysret) {
         next->resume_sysret = 0;
@@ -1867,6 +1892,74 @@ int cap_wait_chans(const uint32_t* chan_ids, uint32_t n, void* req,
     }
     kernel_switch_next(next);   /* noreturn */
     return 1;   /* unreachable */
+}
+
+/* ─── E7 increment 21: the gate workload's stop ──────────────────────────
+ * B9's instant, made deterministic: the sysret that follows the read whose
+ * replies have returned PROC_GATE_SRC_OFF bytes. The trap path calls this
+ * from the resume-sentinel branch AFTER the reply was applied, so `ret` is
+ * the value the sysret would deliver and `park_ctx` still holds the entry
+ * registers of the read's own trap — the frame the resume arm rebuilds.
+ *
+ * Saving it here is not a guess about the libc: the kernel is the party that
+ * issued the sysret, the reply is already in the user buffer, the sidecar's
+ * fd offset is the bytes its replies declared, and the next trap is the one
+ * the payload re-runs. Nothing is queued: the forward closed at delivery
+ * (park_syscall cleared) and the syscall's own frame was the last entry. */
+int proc_gate_stop_at_sysret(uint64_t ret) {
+    struct ProcessDescriptor* cur = process_find_current();
+    if (!cur || !cur->gate_profile) return 0;
+
+    const struct CapParkCtx* p = &cur->park_ctx;
+    uint64_t* c = (uint64_t*)&cur->ring3_ctx;
+    c[0]  = p->r15;  c[1]  = p->r14;  c[2]  = p->r13;  c[3]  = p->r12;
+    c[4]  = p->r11;                        /* r11 (the syscall's rflags slot) */
+    c[5]  = p->linux_args[3];              /* r10 */
+    c[6]  = p->linux_args[5];              /* r9  */
+    c[7]  = p->linux_args[4];              /* r8  */
+    c[8]  = p->rbp;
+    c[9]  = p->linux_args[0];              /* rdi */
+    c[10] = p->linux_args[1];              /* rsi */
+    c[11] = p->linux_args[2];              /* rdx */
+    c[12] = p->rcx;                        /* rcx: the sysret target */
+    c[13] = p->rbx;
+    c[14] = ret;                           /* rax: the reply the read received */
+    c[15] = p->rcx;                        /* rip: where sysret would return */
+    c[16] = 0x23;                          /* ring-3 code */
+    c[17] = p->r11;                        /* rflags */
+    c[18] = p->user_rsp;
+    c[19] = 0x1B;                          /* ring-3 data */
+
+    cur->has_ring3_ctx = 1;
+    cur->user_rip      = p->rcx;
+    cur->user_rsp      = p->user_rsp;
+    cur->gate_stopped  = 1;
+    cur->park_syscall  = 0;
+    cur->waiting_chan  = CAP_NONE;
+    cur->waiting_nchans = 0;
+    cur->waiting_deadline = 0;
+    cur->state         = PROC_HELD;
+
+    kernel_serial_printf(
+        "[E7-GATE] held at the copy continuation: pid=%u '%s' src_off=%lu "
+        "rip=0x%llx rsp=0x%llx ret=%lu -- the next read is the one the "
+        "payload resumes INTO\n",
+        cur->pid, cur->name, (unsigned long)cur->gate_bytes,
+        (unsigned long long)cur->user_rip,
+        (unsigned long long)cur->user_rsp, (unsigned long)ret);
+
+    struct ProcessDescriptor* next = pick_next_runnable();
+    if (!next) {
+        /* Nothing else is runnable. Do not strand the only task: undo the
+         * stop and let the caller sysret as if this hook were not here. */
+        cur->state        = PROC_RUNNING;
+        cur->gate_stopped = 0;
+        kernel_serial_printf(
+            "[E7-GATE] stop undone: no other runnable task\n");
+        return 0;
+    }
+    kernel_switch_next(next);   /* noreturn */
+    return 1;                   /* unreachable */
 }
 
 /* Strong override of cap.c's weak hook: return the current process's

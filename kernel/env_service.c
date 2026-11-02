@@ -332,6 +332,42 @@ void env_service_set_restore_payload(int on) {
     es_restore_payload = on ? 1 : 0;
 }
 
+/* E7 increment 22: the tooth this pass installs (env_payload.h). The route
+ * sets it per invocation, the pour arms the adopted Linux task with it, and
+ * it goes back to NONE as soon as the pass is over — the descriptor's own
+ * copy is what the task's later forwards consult. */
+static int es_restore_tooth = ENV_PAYLOAD_TOOTH_NONE;
+
+void env_service_set_restore_tooth(int tooth) {
+    es_restore_tooth = tooth;
+}
+
+/* E7 increment 21: the Linux half of a replay's lifecycle.
+ *
+ * `es_record_has_linux` decides whether the create needs the hold armed at
+ * all — a two-task record's create is byte-for-byte the pre-21 path.
+ *
+ * `es_release_held_linux` is the OTHER end of that hold, and it runs on every
+ * path out of a pour: success, refusal, and the metadata-only skip. A child
+ * the create held and nothing released would never be scheduled again, which
+ * is a worse failure than the second _start the hold exists to prevent. The
+ * record is re-found by identity because the create's own registration is
+ * what the pass just upserted. */
+static int es_record_has_linux(const struct EnvCkptRecord* rec) {
+    if (!rec) return 0;
+    for (uint32_t t = 0; t < rec->n_tasks && t < ENV_CKPT_MAX_TASKS; t++)
+        if (rec->tasks[t].kind == ENV_CKPT_TASK_LINUX) return 1;
+    return 0;
+}
+
+static void es_release_held_linux(const struct EnvCkptRecord* rec) {
+    if (!rec) return;
+    for (uint32_t t = 0; t < rec->n_tasks && t < ENV_CKPT_MAX_TASKS; t++) {
+        if (rec->tasks[t].kind != ENV_CKPT_TASK_LINUX) continue;
+        (void)cap_linux_restore_release(rec->tasks[t].name);
+    }
+}
+
 int env_service_restore_pending(struct EnvSvcRestoreReport* out) {
     if (!out) return -1;
     out->n_pending   = env_ckpt_restore_pending();
@@ -381,14 +417,26 @@ int env_service_restore_pending(struct EnvSvcRestoreReport* out) {
             continue;
         }
 
+        /* E7 increment 21: arm the hold BEFORE the create reaches the sidecar.
+         * The child is spawned by the sidecar's boot, which happens while the
+         * create round trip (or the parked wait below) yields — so the arm
+         * must cover both, and the disarm waits for this environment's pour.
+         * Only a record that names a Linux task arms anything. */
+        int has_linux = es_record_has_linux(&w);
+        if (has_linux) cap_linux_restore_arm(p);
+
         uint16_t status = ENV_ERR_INVAL;
         uint32_t new_id = 0;
         int rc = env_service_create(p, idx, &status, &new_id);
         if (rc != 0) {
+            es_release_held_linux(&w);
+            if (has_linux) cap_linux_restore_disarm(p);
             env_ckpt_restore_refuse(p, idx, ENV_CKPT_REFUSE_CREATE, idx, 0);
             continue;
         }
         if (status != ENV_OK) {
+            es_release_held_linux(&w);
+            if (has_linux) cap_linux_restore_disarm(p);
             env_ckpt_restore_refuse(p, idx, ENV_CKPT_REFUSE_CREATE, idx, status);
             continue;
         }
@@ -401,6 +449,11 @@ int env_service_restore_pending(struct EnvSvcRestoreReport* out) {
             // first, so the destroy's own record bookkeeping finds nothing
             // pending to undo.
             env_ckpt_restore_refuse(p, idx, ENV_CKPT_REFUSE_IDENTITY, idx, new_id);
+            /* The held child is in the partition, not the environment the
+             * destroy ends: release it first so a refused replay cannot
+             * leave a task the scheduler never sees again. */
+            es_release_held_linux(&w);
+            if (has_linux) cap_linux_restore_disarm(p);
             uint16_t dst = ENV_ERR_INVAL;
             uint32_t d_id = 0, d_part = 0;
             (void)env_service_destroy(new_id, p, &dst, &d_id, &d_part);
@@ -443,13 +496,20 @@ int env_service_restore_pending(struct EnvSvcRestoreReport* out) {
      * snapshot recorded. Straight-line and NO yield from here to the last
      * memcpy (env_payload.h's rule): Ring-3 runs only while the control
      * plane yields, so nothing can execute over the memory being poured. */
+    env_payload_set_tooth(es_restore_tooth);
     for (uint32_t d = 0; d < n_done; d++) {
+        const struct EnvCkptRecord* replayed = env_ckpt_find(done[d].p,
+                                                             done[d].idx);
         if (!es_restore_payload) {
             out->n_payload_skips++;
             kernel_serial_printf(
                 "[ENV_PAYLOAD] restore asked for metadata only (partition %u, "
                 "index %u): the replay stands, the contents are withheld\n",
                 (unsigned)done[d].p, (unsigned)done[d].idx);
+            /* A held child of a metadata-only replay is released at once:
+             * its create ran, and nothing will pour a context into it. */
+            es_release_held_linux(replayed);
+            cap_linux_restore_disarm(done[d].p);
             continue;
         }
         uint32_t pages = 0, cons = 0;
@@ -466,7 +526,15 @@ int env_service_restore_pending(struct EnvSvcRestoreReport* out) {
                 "index %u): %s -- the replay stands; contents are not claimed\n",
                 (unsigned)done[d].p, (unsigned)done[d].idx, why);
         }
+        /* The hold's other end, on BOTH outcomes: a successful pour has
+         * installed the captured context, and a refused one has not — but
+         * either way this task must become schedulable again. The release
+         * line names the rip the task will execute, so the transcript says
+         * which of the two happened. */
+        es_release_held_linux(replayed);
+        cap_linux_restore_disarm(done[d].p);
     }
+    env_payload_set_tooth(ENV_PAYLOAD_TOOTH_NONE);
 
     out->n_remaining = env_ckpt_restore_pending();
     out->n_refused   = env_ckpt_restore_refused() - refused_before;

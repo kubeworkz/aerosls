@@ -23,7 +23,7 @@ use std::path::PathBuf;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: aerosls-bootimage --init <init.bin> --dm <dm.bin> --posix <posix.bin> \\\n         --ramdisk <ramdisk.bin> --net <net.bin> --e1000 <e1000.bin> \\\n         -o sidecars.cpio \\\n         [--init-entry <off>] [--dm-entry <off>] [--posix-entry <off>] [--net-entry <off>] \\\n         [--base-phys <addr>]\n\n\
+        "usage: aerosls-bootimage --init <init.bin> --dm <dm.bin> --posix <posix.bin> \\\n         --ramdisk <ramdisk.bin> --net <net.bin> --e1000 <e1000.bin> \\\n         -o sidecars.cpio \\\n         [--init-entry <off>] [--dm-entry <off>] [--posix-entry <off>] [--net-entry <off>] \\\n         [--base-phys <addr>] [--quiet-init]\n\n\
          aerosls-bootimage flatten --input <init.elf> --output <init.bin> \n         [--load-vaddr <hex>]  (default 0x400000000000 = USER_PROC_CODE_BASE)"
     );
     std::process::exit(2);
@@ -108,6 +108,7 @@ fn cmd_build(mut args: impl Iterator<Item = String>) {
     let mut net_entry = 0u64;
     let mut e1000_entry = 0u64;
     let mut base_phys = None;
+    let mut quiet_init = false;
 
     while let Some(a) = args.next() {
         let mut next = || args.next().unwrap_or_else(|| {
@@ -129,6 +130,9 @@ fn cmd_build(mut args: impl Iterator<Item = String>) {
             "--net-entry" => net_entry = parse_hex(&next(), &a),
             "--e1000-entry" => e1000_entry = parse_hex(&next(), &a),
             "--base-phys" => base_phys = Some(parse_hex(&next(), &a)),
+            // The E7 gate image's quiet /etc/init.rc: the demo applets'
+            // IRQ storm owns the serial port while the gate tenant runs.
+            "--quiet-init" => quiet_init = true,
             "-h" | "--help" => usage(),
             other => {
                 eprintln!("unknown argument: {other}");
@@ -163,6 +167,7 @@ fn cmd_build(mut args: impl Iterator<Item = String>) {
     spec.ramdisk_entry = ramdisk_entry;
     spec.net_entry = net_entry;
     spec.e1000_entry = e1000_entry;
+    spec.quiet_init = quiet_init;
     if let Some(b) = base_phys {
         spec.base_phys = b;
     }
