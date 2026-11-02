@@ -3240,23 +3240,37 @@ resumed tenant's address space comes back whole and goes back whole. The
 serial capture is `evidence/e7_gate_reboot.log` (both boots plus the harness
 transcript).
 
-**Run record — B7 under the teeth (2026-11-02).** The teeth arm was re-run with
-the stack clause in place, one invocation and no retries: the teeth build
-(`E7_TOOTH=1`, build id 20261102150403), the capture, then the control and the
-three breaks. All seven expected reds landed where they did in increment 22
-(`descriptor` B2/B3/B4, `no-fd` B3/B4, `no-heap` B4/B5), the control stayed
-green, and B7 was green on all four recordings — with a different reading in
-each, which is the point. The control measured 3,488 bytes below the entry
-`%rsp` with 57,424 untouched (the stop's 2,648 plus 840 from the resumed tail).
-`descriptor` never adopted the tenant, so B7 validated the restarted child's own
-exit scan (byte-identical to the control's, because it re-runs the same
-workload) and did not compare it to the stop. `no-fd`'s adopted tenant exited
-exactly as deep as the stop, which the clause accepts because the monotonic
-check is `>=` — a faithful restore cannot be shallower than the capture, but it
-need not go deeper. `no-heap` left by fault through `process_exit`, which the
-exit report does not ride, so B7 says so by name and checks the stop alone. Each
-tooth directory now carries the capture's `boot1.log` and replays standalone
-with the same line. Evidence: `evidence/e7_gate_teeth_b7.log`.
+**Run records — B7 under the teeth (2026-11-02, two runs).** The first run
+(build id 20261102150403) put the clause over the teeth for the first time: one
+invocation and no retries, the capture, then the control and the three breaks.
+All seven expected reds landed where increment 22 put them (`descriptor`
+B2/B3/B4, `no-fd` B3/B4, `no-heap` B4/B5), the control stayed green, and B7 was
+green on all four recordings — with a different reading in each. The control
+measured 3,488 bytes below the entry `%rsp` with 57,424 untouched (the stop's
+2,648 plus 840 from the resumed tail). `descriptor` never adopted the tenant, so
+B7 validated the restarted child's own exit scan (byte-identical to the
+control's, because it re-runs the same workload) and did not compare it to the
+stop. `no-fd`'s adopted tenant exited exactly as deep as the stop, which the
+clause accepts because the monotonic check is `>=` — a faithful restore cannot
+be shallower than the capture, but it need not go deeper. The run also exposed
+the one gap: `no-heap` left by fault through `process_exit`, whose teardown the
+exit report did not ride, so B7 could check only the stop and name the missing
+scan.
+
+The report now sits in both teardown paths — `process_kill` for a normal
+kill/exit, `process_exit` for a fault — called before
+`proc_clear_resume_state()` drops the poison identity. The second run (build id
+20261102153754) is otherwise the same invocation: rc=0, the same seven reds,
+the control green. The `no-heap` recording now carries `stack hwm (exit): …
+deepest=2648`, exactly as deep as its stop, B7 compares it like any adopted
+tenant (tail 0 deeper), and every recording carries exactly one exit line — the
+clause counts them, so a task that reported twice would redden rather than be
+read as one. B7's fault carve-out is gone: a recording whose adopted
+tenant has no exit line reddens by name, which was checked against the first
+run's `no-heap` recording and a control with its exit line removed. Each tooth
+directory carries the capture's `boot1.log` and replays standalone. Evidence:
+`evidence/e7_gate_teeth_b7.log` (first run),
+`evidence/e7_gate_teeth_exitpass.log` (fault-path scan).
 
 ---
 
@@ -3282,7 +3296,7 @@ Everything this document asserts about the tree, with its source:
 | The errno map is total over both families and the `CAP_NONE` sentinel, with the reverse defined only on unique preimages | `kernel/linux_abi.h`/`.c`; `tests/linux_errno_map_host_test.c` (51 checks, §10.5) |
 | Every census number — traced and vDSO-declared — has a dispatch class, and the SLS overlaps 105/160/320 are UNKNOWN | `tests/linux_syscall_table_host_test.c` (42 checks) over `tools/linux_syscall_census.txt` |
 | The initial stack builder emits the canonical psABI image with §5.2's AT_* set, no `AT_SYSINFO_EHDR`, and refuses by returning 0 | `tests/linux_initial_stack_host_test.c` (46 checks, the current run; 40 before Q2's scan checks) |
-| The gate workload's stack high-water, from the gate profile's 0xA5 poison and scan: 3,488 bytes below the entry `%rsp` at its deepest, lowest touched `0x4000000a9050`, 57,424 of 65,536 bytes untouched — green on the control and all three tooth replays (§10.14) | `kernel/cap.c` (the create-time arm); `kernel/process.c` (`linux_stack_hwm_report`, at the stop and at teardown); `tests/linux_initial_stack_host_test.c`; `tests/e7_gate_check.sh` (B7 re-derives both lines and holds the 32 KiB floor); `evidence/e7_stack_hwm.log` |
+| The gate workload's stack high-water, from the gate profile's 0xA5 poison and scan: 3,488 bytes below the entry `%rsp` at its deepest, lowest touched `0x4000000a9050`, 57,424 of 65,536 bytes untouched — green on the control and all three tooth replays, the fault path included (§10.14) | `kernel/cap.c` (the create-time arm); `kernel/process.c` (`linux_stack_hwm_report`, at the stop and at teardown); `tests/linux_initial_stack_host_test.c`; `tests/e7_gate_check.sh` (B7 re-derives both lines and holds the 32 KiB floor); `evidence/e7_stack_hwm.log` |
 | A Linux-personality task's trap describes-and-refuses before any number chain, from arguments captured before any call | `kernel/syscall_dispatch.c` (`do_syscall`'s first branch); `arch/x86/syscall.asm`'s `[gs:0x50..0x80)` stores; `tests/linux_personality_check.sh` clauses C/C1/D |
 | The personality is explicit at spawn (328), stamped inside the create, gated by E2's `sidecar_authority`, and reset at every slot reuse | `kernel/cap.c` — `cap_create_sidecar_in_personality()`, `sys_sls_linux_spawn()`; `kernel/process.c` — `proc_clear_resume_state()`; guard clauses E/F |
 | The frozen per-CPU offsets are a BUILD error to move, and the request ABI is pinned as literals | `arch/x86/user_paging.h` static asserts; `tests/linux_personality_host_test.c` (210 checks, the current run; 19 at increment 2) |

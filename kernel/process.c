@@ -774,6 +774,21 @@ static void proc_free_syscall_stack(struct ProcessDescriptor* pd) {
 // with the other cap hooks below (static, so they need an in-file prototype).
 static struct ProcessDescriptor* pick_next_runnable(void);
 __attribute__((noreturn)) static void kernel_switch_next(struct ProcessDescriptor* next);
+
+/* Q2: the stack report is defined with the gate's stop, below; both teardown
+ * paths (this one and process_kill) call it through this name. */
+static void linux_stack_hwm_report(struct ProcessDescriptor *pd, const char *where);
+
+/* One rule for every teardown: a Linux task's stack is scanned when it
+ * leaves, keyed on the poison identity rather than gate_profile — the pour
+ * spends that one-shot flag at the stop, and it is exactly the resumed task's
+ * exit that has to be measured. Both paths must call this BEFORE
+ * proc_clear_resume_state(), which drops the identity. */
+static void linux_stack_maybe_report(struct ProcessDescriptor *pd, const char *where) {
+    if (pd && pd->personality == PROC_PERSONALITY_LINUX && pd->linux_stack_poison)
+        linux_stack_hwm_report(pd, where);
+}
+
 void process_exit(uint32_t exit_code) {
     for (int i = 0; i < PROC_MAX; i++) {
         struct ProcessDescriptor* pd = &proc_table[i];
@@ -790,6 +805,14 @@ void process_exit(uint32_t exit_code) {
         kernel_serial_printf(
             "[PROC] PID %u '%s' exited (code=%u).\n",
             pd->pid, pd->name, exit_code);
+
+        /* Q2: the exit scan, on the same rule as process_kill's. A task that
+         * faults leaves through here (stubs.c's #PF handler calls
+         * process_exit), so this is the path that measures a tenant killed by
+         * a bad page — the no-heap tooth's shape. The frames are still mapped
+         * and the poison identity is still set; proc_clear_resume_state()
+         * below is what drops it. */
+        linux_stack_maybe_report(pd, "exit");
 
         /* Phase 2: resume/teardown flags on a process that exits normally
          * are moot — the full teardown below reclaims everything anyway.
@@ -1907,9 +1930,12 @@ int cap_wait_chans(const uint32_t* chan_ids, uint32_t n, void* req,
  * leading untouched run from the region's base. Measured twice: at the stop
  * (boot 1's work half) and at teardown (boot 2's continuation — the captured
  * pages carried the same poison through the checkpoint, so the scan sees the
- * deepest point of BOTH boots). `alloc` is the whole region; `poison-span`
- * is what the create armed below the entry %rsp; `deepest` is how much of
- * that the workload wrote; `lowest` is the lowest address it touched. */
+ * deepest point of BOTH boots). Teardown has two paths, process_kill for a
+ * normal kill/exit and process_exit for a task that dies on the fault path;
+ * both report, so a tenant killed by a bad page is still measured. `alloc` is
+ * the whole region; `poison-span` is what the create armed below the entry
+ * %rsp; `deepest` is how much of that the workload wrote; `lowest` is the
+ * lowest address it touched. */
 static void linux_stack_hwm_report(struct ProcessDescriptor *pd,
                                    const char *where) {
     size_t headroom;
@@ -2378,10 +2404,10 @@ void process_kill(uint32_t pid) {
         if (!proc_table[i].active || proc_table[i].pid != pid) continue;
         /* Q2: the report keys on the poison identity, NOT gate_profile — the
          * pour spends the stop by clearing gate_profile (one-shot), and the
-         * resumed task's teardown is exactly the scan that covers boot 2. */
-        if (proc_table[i].personality == PROC_PERSONALITY_LINUX &&
-            proc_table[i].linux_stack_poison)
-            linux_stack_hwm_report(&proc_table[i], "exit");
+         * resumed task's teardown is exactly the scan that covers boot 2.
+         * process_exit reports on the same rule; a task leaves through one
+         * path or the other, never both. */
+        linux_stack_maybe_report(&proc_table[i], "exit");
         kernel_serial_printf("[PROC] PID %u terminated.\n", pid);
         if (proc_table[i].state == PROC_RUNNING) {
             /* Self-kill (SYS_SLS_PROC_KILL with one's own pid) or any

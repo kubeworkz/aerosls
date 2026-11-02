@@ -95,10 +95,10 @@
 # teeth cover the three breaks increment 22 names (descriptor, fd, heap page);
 # the restart and stale-`fs_base` teeth the design also lists are NOT here —
 # the restart is what `descriptor` produces as a consequence and is asserted as
-# B3/B4, and `fs_base` has no arm yet. B7's exit scan rides the process_kill
-# teardown, so a tenant that dies by fault (the `no-heap` tooth, and any crash)
-# is measured at its stop only; the clause says so by name instead of passing
-# silently on a missing line.
+# B3/B4, and `fs_base` has no arm yet. B7's exit scan rides BOTH teardown
+# paths — process_kill for a normal kill/exit and process_exit for a task that
+# dies on the fault path — so the `no-heap` recording carries an exit line too,
+# and an adopted tenant that produces none reddens the clause by name.
 #
 # GUARD-KIND: host (the source clauses need only bash; the live/teeth arms add
 # make + QEMU and are the only modes that build anything).
@@ -340,8 +340,10 @@ p_b6() {   # the tenant's frames came back
 # ─── Q2: the stack's high-water measurement, checked instead of quoted ─────
 # The gate profile poisons the span below the entry %rsp at create, and the
 # kernel reports it twice: at the stop (boot 1's work half) and at the resumed
-# tenant's teardown (boot 2). A line is only evidence if its numbers agree, so
-# the clause re-derives them: the budget is the gate's 64 KiB, the poisoned
+# tenant's teardown (boot 2), on whichever teardown path the tenant leaves by.
+# The two paths are exclusive, so the clause also counts the exit lines and
+# refuses a doubled one. A line is only evidence if its numbers agree, so the
+# clause re-derives them: the budget is the gate's 64 KiB, the poisoned
 # span is inside it, headroom + deepest is that span, the lowest touched
 # address sits exactly `headroom` past a page-aligned base, and the headroom
 # clears a floor. The floor is half the region: the measured run leaves 57,424
@@ -412,13 +414,18 @@ p_b7() {   # the stack was measured at both boots, and its headroom holds
 
     grep -aqF "[ENV_PAYLOAD] linux task 'e7.gate.user.0' adopted at" "$b2" && adopted=1
     exitl=$(grep -aF "[E7-GATE] stack hwm (exit):" "$b2" 2>/dev/null | tail -1)
+    exit_count=$(grep -acF "[E7-GATE] stack hwm (exit):" "$b2" 2>/dev/null)
+    if [ "${exit_count:-0}" -gt 1 ]; then
+        CM="the teardown reported the stack $exit_count times — process_kill and process_exit must not both fire for one task, or the scan is running twice on one exit"
+        return 1
+    fi
 
     if [ -z "$exitl" ]; then
-        if [ "$adopted" -eq 1 ] && grep -aqE '\[PROC\] PID [0-9]+ terminated\.' "$b2"; then
-            CM="boot 1 measured the stack (deepest $stop_deep, headroom $stop_hr) but the resumed tenant's teardown has no exit scan — the tenant left through process_kill, which is the path the report rides"
+        if [ "$adopted" -eq 1 ]; then
+            CM="boot 1 measured the stack (deepest $stop_deep, headroom $stop_hr) but the resumed tenant's teardown has no exit scan — the report rides process_kill and process_exit, so an adopted tenant produces one on either path, fault included"
             return 1
         fi
-        CM="boot 1 measured the stack (deepest $stop_deep, headroom $stop_hr of $HWM_ALLOC); this recording's tenant left by fault or was never adopted, so its teardown has no exit scan to compare"
+        CM="boot 1 measured the stack (deepest $stop_deep, headroom $stop_hr of $HWM_ALLOC); this recording never adopted the tenant, so there is no resumed stack to scan at exit"
         return 0
     fi
 
