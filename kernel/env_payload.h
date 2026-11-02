@@ -303,7 +303,7 @@ uint32_t env_payload_capture_all(void);
  * (env_payload_build_has_teeth()), so a request cannot talk a shipped kernel
  * into breaking an environment.
  *
- * The three teeth and the clause each one is aimed at:
+ * The four teeth and the clause each one is aimed at:
  *
  *   descriptor  the payload's Linux task RECORD is dropped: no adoption, no
  *               pages for it, no context; the sidecars pour normally. Aimed
@@ -327,6 +327,20 @@ uint32_t env_payload_capture_all(void);
  *               signature separating "the read never happened" from "the
  *               page was gone", which is what the tooth exists to prove the
  *               harness can tell apart.
+ *   fs_base     the ADOPTED context's TLS base is re-stamped one page off the
+ *               capture's — into the page below it, chosen from the record's
+ *               own page list and only when that page's captured grant is
+ *               writable, so the replay is not asked for an address no
+ *               captured map backs. Aimed at B2, which now compares the
+ *               adopted `fs_base=` with the capture's: adoption still
+ *               happens (rip/rsp/brk/mtop and every page are untouched) and
+ *               the continuation read is issued, so B3 stays green — then
+ *               musl uses a pointer read from the wrong TCB and the tenant
+ *               dies, which is why the tooth's declared reds are B2 and the
+ *               B4/B5 consequences of that death, not B2 alone. It is the
+ *               complement of `descriptor` — there the tenant never adopts
+ *               and B3 restarts at zero; here it adopts, reads the captured
+ *               continuation, and dies on a TLS base one page over.
  *
  * A tooth never crashes the kernel: each break lands on a path the shipped
  * code already has (a name that resolves to no process, a fd the table does
@@ -340,6 +354,7 @@ uint32_t env_payload_capture_all(void);
 #define ENV_PAYLOAD_TOOTH_DESCRIPTOR 1
 #define ENV_PAYLOAD_TOOTH_NO_FD      2
 #define ENV_PAYLOAD_TOOTH_NO_HEAP    3
+#define ENV_PAYLOAD_TOOTH_FS_BASE    4
 
 /* The fd the no-fd tooth substitutes: past every table this repo has, so the
  * sidecar's lookup answers EBADF instead of reaching an empty-but-in-range
@@ -349,9 +364,9 @@ uint32_t env_payload_capture_all(void);
 /* 1 only in a teeth build; the route refuses a named tooth otherwise. */
 int env_payload_build_has_teeth(void);
 
-/* "descriptor" | "no-fd" | "no-heap" -> code; -1 for anything else (the
- * route refuses a typo by name: a misspelt tooth must not silently run the
- * control and look green). */
+/* "descriptor" | "no-fd" | "no-heap" | "fs_base" -> code; -1 for anything
+ * else (the route refuses a typo by name: a misspelt tooth must not silently
+ * run the control and look green). */
 int env_payload_tooth_from_name(const char* name);
 
 /* The canonical name of a code ("none" for NONE), never NULL. */

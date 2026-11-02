@@ -140,6 +140,10 @@ int env_payload_tooth_from_name(const char* name) {
         name[3] == 'h' && name[4] == 'e' && name[5] == 'a' &&
         name[6] == 'p' && name[7] == '\0')
         return ENV_PAYLOAD_TOOTH_NO_HEAP;
+    if (name[0] == 'f' && name[1] == 's' && name[2] == '_' &&
+        name[3] == 'b' && name[4] == 'a' && name[5] == 's' &&
+        name[6] == 'e' && name[7] == '\0')
+        return ENV_PAYLOAD_TOOTH_FS_BASE;
     return -1;
 }
 
@@ -148,6 +152,7 @@ const char* env_payload_tooth_name(int tooth) {
     case ENV_PAYLOAD_TOOTH_DESCRIPTOR: return "descriptor";
     case ENV_PAYLOAD_TOOTH_NO_FD:      return "no-fd";
     case ENV_PAYLOAD_TOOTH_NO_HEAP:    return "no-heap";
+    case ENV_PAYLOAD_TOOTH_FS_BASE:    return "fs_base";
     default:                           return "none";
     }
 }
@@ -156,7 +161,8 @@ void env_payload_set_tooth(int tooth) {
 #if E7G_TOOTH
     ep_tooth = (tooth == ENV_PAYLOAD_TOOTH_DESCRIPTOR ||
                 tooth == ENV_PAYLOAD_TOOTH_NO_FD ||
-                tooth == ENV_PAYLOAD_TOOTH_NO_HEAP)
+                tooth == ENV_PAYLOAD_TOOTH_NO_HEAP ||
+                tooth == ENV_PAYLOAD_TOOTH_FS_BASE)
                    ? tooth : ENV_PAYLOAD_TOOTH_NONE;
 #else
     (void)tooth;   /* no arms in this build: the route refuses the request */
@@ -246,6 +252,25 @@ static uint32_t ep_perms[EP_MAX_PAGES];             /* capture: per-page PTE per
  * File-static because a restore is one straight-line pass; the tooth's
  * effect on the TENANT travels on ProcessDescriptor.tooth, not from here. */
 static uint8_t  ep_skip[EP_MAX_PAGES];
+
+/* The `fs_base` tooth's admissibility test, over the record's own page block:
+ * the arm may only move the TLS base to a page the blob says will be mapped,
+ * and only when its captured grant is writable — a TLS block is written (the
+ * errno slot, the canary) as well as read, so a read-only neighbour would
+ * turn the tooth into a fault instead of a wrong value. */
+static int ep_page_recorded_writable(const uint8_t* block, uint32_t np,
+                                     uint64_t vpage) {
+    for (uint32_t k = 0; k < np; k++) {
+        const uint8_t* e = block + (uint64_t)k * EP_PAGE_ENTRY_BYTES;
+        uint64_t v = 0;
+        for (uint32_t b = 0; b < 8; b++) v |= ((uint64_t)e[b]) << (8u * b);
+        if ((v & ~0xfffull) != vpage) continue;
+        uint32_t perm = (uint32_t)e[12] | ((uint32_t)e[13] << 8) |
+                        ((uint32_t)e[14] << 16) | ((uint32_t)e[15] << 24);
+        return (perm & EP_PAGE_PERM_WRITE) != 0;
+    }
+    return 0;
+}
 #endif
 static uint8_t  ep_stage[EP_STAGE_BYTES] __attribute__((aligned(4096)));
 static uint8_t  ep_page[4096] __attribute__((aligned(4096)));
@@ -860,11 +885,13 @@ uint32_t env_payload_capture_all(void) {
             }
             kernel_serial_printf(
                 "[ENV_PAYLOAD] capture: task %u '%s' kind=%u form=%u "
-                "park_syscall=%u nchans=%u user_rip=0x%llx user_rsp=0x%llx\n",
+                "park_syscall=%u nchans=%u user_rip=0x%llx user_rsp=0x%llx "
+                "fs_base=0x%llx\n",
                 (unsigned)t, tk.name, (unsigned)tk.kind, (unsigned)tk.form,
                 (unsigned)tk.park_syscall, (unsigned)tk.waiting_nchans,
                 (unsigned long long)tk.user_rip,
-                (unsigned long long)tk.user_rsp);
+                (unsigned long long)tk.user_rsp,
+                (unsigned long long)tk.fs_base);
             task_form[t] = tk.form;
             ep_copy(ep_stage + used, &tk, (uint32_t)sizeof(tk));
             used += (uint32_t)sizeof(tk);
@@ -1651,6 +1678,9 @@ int env_payload_restore(uint32_t partition, uint32_t index,
             u += (uint32_t)sizeof(tk);
             struct ProcessDescriptor* pd = pds[t];
             if (tk.kind == ENV_CKPT_TASK_LINUX) {
+                /* B2 compares this value against the capture's; the `fs_base`
+                 * tooth is what makes the two differ. */
+                uint64_t adopted_fs = tk.fs_base;
 #if E7G_TOOTH
                 if (!pd) continue;   /* descriptor tooth: nothing to adopt */
                 /* The fd/heap teeth travel on the descriptor: the forward
@@ -1658,13 +1688,57 @@ int env_payload_restore(uint32_t partition, uint32_t index,
                 pd->tooth = (uint8_t)((ep_tooth == ENV_PAYLOAD_TOOTH_NO_FD ||
                                        ep_tooth == ENV_PAYLOAD_TOOTH_NO_HEAP)
                                           ? ep_tooth : ENV_PAYLOAD_TOOTH_NONE);
+                /* The `fs_base` tooth (increment 23): move the TLS base one
+                 * page off the capture's, into a page the record itself says
+                 * will be mapped writable — the page below first (the RW
+                 * LOAD's own). Nothing else about the context moves, so the
+                 * tenant adopts and the copy reads through; the only wrong
+                 * fact at the pour is B2's `fs_base=`, and the stale TCB is
+                 * what the later B4/B5 reds record. A tooth with no such
+                 * neighbour is loudly NOT armed:
+                 * the harness then sees B2 green where it must redden and
+                 * fails the run, which is better than a silent control. */
+                if (ep_tooth == ENV_PAYLOAD_TOOTH_FS_BASE) {
+                    uint32_t np = (uint32_t)ep_stage[block_off[t]] |
+                                  ((uint32_t)ep_stage[block_off[t] + 1] << 8) |
+                                  ((uint32_t)ep_stage[block_off[t] + 2] << 16) |
+                                  ((uint32_t)ep_stage[block_off[t] + 3] << 24);
+                    const uint8_t* block = ep_stage + block_off[t] + 4u;
+                    uint64_t base = tk.fs_base & ~0xfffull;
+                    uint64_t near = 0;
+                    if (base >= 4096ull &&
+                        ep_page_recorded_writable(block, np, base - 4096ull))
+                        near = base - 4096ull;
+                    else if (ep_page_recorded_writable(block, np,
+                                                       base + 4096ull))
+                        near = base + 4096ull;
+                    if (!near) {
+                        kernel_serial_printf(
+                            "[E7-GATE] tooth fs_base: no recorded writable "
+                            "page beside fs_base=0x%llx -- the tooth is NOT "
+                            "armed\n",
+                            (unsigned long long)tk.fs_base);
+                    } else {
+                        adopted_fs = near | (tk.fs_base & 0xfffull);
+                        kernel_serial_printf(
+                            "[E7-GATE] tooth fs_base: the record's fs_base "
+                            "0x%llx is re-stamped 0x%llx (capture=0x%llx "
+                            "restored=0x%llx) -- adoption happens, the "
+                            "pages are poured, only the TLS base is one "
+                            "page off\n",
+                            (unsigned long long)tk.fs_base,
+                            (unsigned long long)adopted_fs,
+                            (unsigned long long)tk.fs_base,
+                            (unsigned long long)adopted_fs);
+                    }
+                }
 #endif
                 uint64_t* c = (uint64_t*)&pd->ring3_ctx;
                 for (uint32_t r = 0; r < 20; r++) c[r] = tk.linux_regs[r];
                 pd->has_ring3_ctx  = 1;
                 pd->user_rip       = tk.user_rip;
                 pd->user_rsp       = tk.user_rsp;
-                pd->fs_base        = tk.fs_base;
+                pd->fs_base        = adopted_fs;
                 pd->linux_brk_cur  = tk.brk_cur;
                 pd->linux_mmap_top = tk.mmap_top;
                 /* E7 increment 21: the stop is ONE-SHOT, and FORM_ENTRY is
@@ -1696,7 +1770,7 @@ int env_payload_restore(uint32_t partition, uint32_t index,
                     "form=%u held=%u stop=%s\n",
                     tk.name, (unsigned long long)tk.user_rip,
                     (unsigned long long)tk.user_rsp,
-                    (unsigned long long)tk.fs_base,
+                    (unsigned long long)pd->fs_base,
                     (unsigned long long)tk.brk_cur,
                     (unsigned long long)tk.mmap_top,
                     (unsigned)tk.form, (unsigned)pd->restore_held,

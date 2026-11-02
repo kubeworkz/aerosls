@@ -13,7 +13,8 @@
 #   * the restore reports payloads=1, payload_skips=0 (the contents came back,
 #     they were not refused by name);
 #   * the Linux tenant was ADOPTED at a captured context (`form=3`,
-#     `stop=spent`) and the copy RESUMED at the captured source offset — its
+#     `stop=spent`) at the capture's own `fs_base`, and the copy RESUMED at
+#     the captured source offset — its
 #     FIRST post-restore read is `off=0x30000`, and there is no second
 #     `Copying`, which would mean it restarted;
 #   * exactly one `[backup] Done:` line, no `[FAULT]`, and the tenant's exit
@@ -40,17 +41,23 @@
 #
 # ─── The TEETH are part of it too (increment 22) ───────────────────────────
 # A gate clause is only worth its failure side. `--teeth` captures ONE
-# checkpoint, then replays it FOUR times against sparse copies of the same
-# NVMe image: the control (no tooth, must be green) and the three breaks
+# checkpoint, then replays it FIVE times against sparse copies of the same
+# NVMe image: the control (no tooth, must be green) and the four breaks
 # kernel/env_payload.h documents — `descriptor` (the payload's Linux task
 # record dropped: no adoption, the child restarts), `no-fd` (the
 # continuation's read forwarded as a descriptor the sidecar's table does not
-# carry: EBADF, no offset line, no Done) and `no-heap` (the reply's
+# carry: EBADF, no offset line, no Done), `no-heap` (the reply's
 # destination page unmapped before the forward: the read IS issued at the
 # captured offset, the deliver refuses its bytes -EFAULT, and the tenant's own
 # free of that 64 KiB buffer then faults INSIDE the withheld page — so B3
 # stays green while B4/B5 redden, which is how the harness tells "the read
-# never happened" from "the page was gone"). Each tooth declares the clauses it
+# never happened" from "the page was gone"), and `fs_base` (the adopted
+# context's TLS base re-stamped one page off the capture's, into a page the
+# record itself says is mapped writable — adoption happens and the
+# continuation read is issued, then musl dereferences a pointer read from the
+# wrong TCB and the tenant dies: B2 red by name, B4/B5 as the stale base's
+# consequence; the complement of `descriptor`, where the tenant never adopts
+# and B3 restarts from zero). Each tooth declares the clauses it
 # MUST redden and the ones it MUST leave green; a mismatch in either
 # direction is a failure, so the teeth cannot pass by breaking everything.
 # The teeth image is a separate build (`E7_TOOTH=1`, a different ISO name) and
@@ -64,7 +71,7 @@
 #   (no arguments)     the SOURCE clauses over this tree only (no build, no QEMU)
 #   --live             the source clauses, then the build + the two-boot run
 #   --teeth            the source clauses, then the teeth build + ONE capture
-#                      + four replays (control + the three breaks)
+#                      + five replays (control + the four breaks)
 #   --selfkill         the source clauses, then the self-kill build + ONE boot:
 #                      the gate tenant asks for its own death at the stop while
 #                      RUNNING, the deferred teardown scans its stack, and no
@@ -96,11 +103,10 @@
 # ─── What this does NOT claim ──────────────────────────────────────────────
 # It does not run in CI: the source clauses do (they need only bash), but
 # --live and --teeth need make + QEMU and take ~15 and ~40 minutes on this host
-# (the 512 KiB firstuser build is the slow part; the four replays are ~3). The
-# teeth cover the three breaks increment 22 names (descriptor, fd, heap page);
-# the restart and stale-`fs_base` teeth the design also lists are NOT here —
-# the restart is what `descriptor` produces as a consequence and is asserted as
-# B3/B4, and `fs_base` has no arm yet. B7's exit scan rides BOTH teardown
+# (the 512 KiB firstuser build is the slow part; the five replays are ~4). The
+# teeth cover all four breaks increment 22/23 name (descriptor, fd, heap page,
+# TLS base); the restart tooth is not a separate arm — it is what `descriptor`
+# produces as a consequence and is asserted as B3/B4. B7's exit scan rides BOTH teardown
 # paths — process_kill for a normal kill/exit and process_exit for a task that
 # dies on the fault path — so the `no-heap` recording carries an exit line too,
 # and an adopted tenant that produces none reddens the clause by name.
@@ -233,14 +239,16 @@ else
 fi
 
 # G6. The teeth: a build-time profile, selected per restore, compiled out of
-#     every other build — and the three arms land on paths the shipped code
-#     already refuses by name (a name with no process, a fd the table does not
-#     carry, an unmapped destination), never on a fault of their own.
+#     every other build — and the four arms land on paths the shipped code
+#     already has (a name with no process, a fd the table does not carry, an
+#     unmapped destination, a TLS base moved only to a page the record says is
+#     mapped writable), never on a fault of their own.
 teeth_missing=""
 has kernel/env_payload.h "#define E7G_TOOTH 0" || teeth_missing="$teeth_missing default-off"
 has kernel/env_payload.h 'ENV_PAYLOAD_TOOTH_DESCRIPTOR 1' || teeth_missing="$teeth_missing descriptor-code"
 has kernel/env_payload.h 'ENV_PAYLOAD_TOOTH_NO_FD      2' || teeth_missing="$teeth_missing no-fd-code"
 has kernel/env_payload.h 'ENV_PAYLOAD_TOOTH_NO_HEAP    3' || teeth_missing="$teeth_missing no-heap-code"
+has kernel/env_payload.h 'ENV_PAYLOAD_TOOTH_FS_BASE    4' || teeth_missing="$teeth_missing fs-base-code"
 has Makefile 'E7_TOOTH ?=' || teeth_missing="$teeth_missing makefile-knob"
 has Makefile 'AB_DEFS += -DE7G_TOOTH=1' || teeth_missing="$teeth_missing makefile-define"
 has kernel/env_payload.c '[E7-GATE] tooth descriptor:' || teeth_missing="$teeth_missing descriptor-arm"
@@ -250,6 +258,9 @@ has kernel/syscall_dispatch.c '[E7-GATE] tooth no-fd:' || teeth_missing="$teeth_
 has kernel/syscall_dispatch.c 'largs[0] = ENV_PAYLOAD_TOOTH_DEAD_FD;' || teeth_missing="$teeth_missing no-fd-substitute"
 has kernel/syscall_dispatch.c '[E7-GATE] tooth no-heap:' || teeth_missing="$teeth_missing no-heap-arm"
 has kernel/syscall_dispatch.c 'user_unmap_page(cur->cr3, pv);' || teeth_missing="$teeth_missing no-heap-unmap"
+has kernel/env_payload.c '[E7-GATE] tooth fs_base:' || teeth_missing="$teeth_missing fs-base-arm"
+has kernel/env_payload.c 'ep_page_recorded_writable(block, np' || teeth_missing="$teeth_missing fs-base-choice"
+has kernel/env_payload.c 'pd->fs_base        = adopted_fs;' || teeth_missing="$teeth_missing fs-base-install"
 has net/http.c 'env_payload_build_has_teeth()' || teeth_missing="$teeth_missing route-gate"
 has net/http.c 'this image was not built with the gate teeth' || teeth_missing="$teeth_missing route-refusal"
 has net/http.c 'jb_str(&j,"tooth", env_payload_tooth_name(tooth));' || teeth_missing="$teeth_missing route-report"
@@ -261,7 +272,7 @@ else
     if ! has kernel/env_payload.h "#ifndef E7G_TOOTH"; then
         bad "G6. E7G_TOOTH has no default — a build that never passes the define would not compile the arms out deterministically"
     else
-        ok "G6. the teeth are a build-time profile (E7_TOOTH -> AB_DEFS, default off) selected per restore and refused by name elsewhere; all three arms land on the shipped refusals (dropped record, EBADF lookup, unmapped destination), guarded by $shipped E7G_TOOTH conditions"
+        ok "G6. the teeth are a build-time profile (E7_TOOTH -> AB_DEFS, default off) selected per restore and refused by name elsewhere; all four arms land on paths the shipped kernel already has (dropped record, EBADF lookup, unmapped destination, a TLS base chosen from the record's own writable pages), guarded by $shipped E7G_TOOTH conditions"
     fi
 fi
 
@@ -284,12 +295,24 @@ p_b1() {   # the payload landed
     return 1
 }
 
-p_b2() {   # the Linux tenant was adopted at a captured context
-    local d="$1" b2="$d/boot2.log"
-    if grep -aqF "[ENV_PAYLOAD] linux task 'e7.gate.user.0' adopted at" "$b2" && \
-       grep -aq "form=3 .*stop=spent" "$b2"; then
-        CM="the Linux tenant was adopted from the captured context (form=3, stop=spent) — not restarted at _start, and the one-shot stop was spent by the pour"
-        return 0
+p_b2() {   # the Linux tenant was adopted at a captured context, TLS base included
+    local d="$1" b1="$d/boot1.log" b2="$d/boot2.log"
+    local ad cap_fs ad_fs
+    ad=$(grep -aF "[ENV_PAYLOAD] linux task 'e7.gate.user.0' adopted at" "$b2" 2>/dev/null | tail -1)
+    cap_fs=$(grep -aF "capture: task" "$b1" 2>/dev/null | grep -aF "'e7.gate.user.0'" | \
+                 tail -1 | sed -n 's/.*fs_base=0x\([0-9a-fA-F]*\).*/\1/p')
+    ad_fs=$(printf '%s\n' "$ad" | sed -n 's/.*fs_base=0x\([0-9a-fA-F]*\).*/\1/p')
+    if [ -n "$ad" ] && printf '%s\n' "$ad" | grep -q "form=3 .*stop=spent"; then
+        if [ -z "$cap_fs" ] || [ -z "$ad_fs" ]; then
+            CM="the tenant was adopted but the TLS base cannot be compared: the capture names fs_base='${cap_fs:-none}', the adoption '${ad_fs:-none}' — a recording from before the capture line carried it cannot show which base came back"
+            return 1
+        fi
+        if [ "$ad_fs" = "$cap_fs" ]; then
+            CM="the Linux tenant was adopted from the captured context (form=3, stop=spent) at the capture's fs_base=0x$cap_fs — the TLS base came back with it, and the copy was not restarted"
+            return 0
+        fi
+        CM="the tenant was adopted (form=3, stop=spent) but at fs_base=0x$ad_fs, not the capture's 0x$cap_fs — the context carried one TLS base and installed another"
+        return 1
     fi
     CM="no adopted-context line for the tenant (form=3, stop=spent) — the replay either lost the task or left its stop armed"
     return 1
@@ -488,7 +511,9 @@ expected_red() {
     case "$1" in
         ""|none)    echo "" ;;
         descriptor) echo "B2 B3 B4" ;;
-        no-fd)      echo "B3 B4" ;;        no-heap)   echo "B4 B5" ;;
+        no-fd)      echo "B3 B4" ;;
+        no-heap)    echo "B4 B5" ;;
+        fs_base)    echo "B2 B4 B5" ;;
 
         *)          echo "?" ;;
     esac
@@ -545,6 +570,35 @@ tooth_evidence() {   # <dir> <tooth> -> 0 and CM, or 1 and CM
                 return 1
             fi
             CM="the forward names the withheld page 0x$page and the tenant's free of its 64 KiB buffer faults inside it (addr=0x$addr) — the deliver refused the bytes, the hole is the tenant's own"
+            return 0 ;;
+        fs_base)
+            local line restored capture adopted
+            line=$(grep -aF "[E7-GATE] tooth fs_base:" "$b2" | head -1)
+            if [ -z "$line" ]; then
+                CM="the re-stamped-TLS-base line ('[E7-GATE] tooth fs_base: ...') is missing — the recording cannot say which break produced the B2 red"
+                return 1
+            fi
+            if printf '%s\n' "$line" | grep -q "NOT armed"; then
+                CM="the tooth refused to arm ($line) — a B2 red from a walk that never happened would prove nothing"
+                return 1
+            fi
+            restored=$(printf '%s\n' "$line" | sed -n 's/.*restored=0x\([0-9a-fA-F]*\).*/\1/p')
+            capture=$(printf '%s\n' "$line" | sed -n 's/.*capture=0x\([0-9a-fA-F]*\).*/\1/p')
+            adopted=$(grep -aF "[ENV_PAYLOAD] linux task 'e7.gate.user.0' adopted at" "$b2" | tail -1 | \
+                          sed -n 's/.*fs_base=0x\([0-9a-fA-F]*\).*/\1/p')
+            if [ -z "$restored" ] || [ -z "$capture" ] || [ -z "$adopted" ]; then
+                CM="the tooth line or the adoption does not carry both bases (capture='${capture:-?}', restored='${restored:-?}', adopted='${adopted:-?}') — the red is not attributable"
+                return 1
+            fi
+            if [ "$restored" = "$capture" ]; then
+                CM="the tooth line names the same base twice (0x$capture) — the arm printed a re-stamp it did not make"
+                return 1
+            fi
+            if [ "$adopted" != "$restored" ]; then
+                CM="the adoption reports fs_base=0x$adopted, the tooth stamped 0x$restored — the value B2 reddens on is not the one installed"
+                return 1
+            fi
+            CM="the record's fs_base=0x$capture was re-stamped 0x$restored and that is what the adoption installed — the TLS base is one page off the capture's, and the B2 red is the tooth's own"
             return 0 ;;
         *)
             CM="the recording names an unknown tooth ('$t') — it cannot be validated against an expectation"
@@ -765,8 +819,8 @@ power_off() {
 
 # Boot 1: create the designated environment, run the workload to the copy
 # continuation, checkpoint, power off. Sets PID. Shared by --live and --teeth
-# so the two arms capture the SAME thing (one capture, four replays, is what
-# makes the teeth a comparison rather than four unrelated runs).
+# so the two arms capture the SAME thing (one capture, five replays, is what
+# makes the teeth a comparison rather than five unrelated runs).
 gate_capture() {
     echo "=== boot 1: create, workload to the stop, checkpoint ==="
     boot "$L1" one
@@ -835,6 +889,28 @@ gate_replay() {   # gate_replay <log> <tag> <body> <artifact-dir>
         *'"ok":"true"'*) : ;;
         *) fail "the restore route refused the request: $(cat "$ard/restore.json")" ;;
     esac
+
+    # A restore that poured nothing has no resumed workload to wait for: the
+    # refusal (a create that could not reach its manager, or the P1a posture
+    # window) is the CALLER's cue to retry on a fresh copy, and sitting out
+    # E7G_WORKLOAD_S first would bury that retry under fifteen minutes of a
+    # boot with no tenant in it. The report is the authority: payloads=0 means
+    # no bytes were applied, whatever a background heal may try later.
+    if [ "$(jval "$ard/restore.json" payloads)" = "0" ]; then
+        # A recording even when nothing poured: facts are what the retry note
+        # and a --replay read, and an attempt with no facts is indistinguishable
+        # from a broken directory.
+        {
+            echo "payloads=0"
+            echo "payload_skips=$(jval "$ard/restore.json" payload_skips)"
+            echo "tooth=$(jval "$ard/restore.json" tooth)"
+            echo "partition=$PID"
+        } > "$ard/facts"
+        echo "note: the restore poured nothing (payloads=0) — nothing to wait for; powering off"
+        sleep 2
+        power_off
+        return 0
+    fi
 
     local i
     for i in $(seq 1 $((WINDOW_S * 2))); do
@@ -977,16 +1053,16 @@ if [ "$LIVE" -eq 1 ]; then
 fi
 
 # ─── The teeth arm ─────────────────────────────────────────────────────────
-# One capture, then four replays over SPARSE COPIES of the post-checkpoint
+# One capture, then five replays over SPARSE COPIES of the post-checkpoint
 # image: the control must be fully green (the arms do not fire unselected) and
 # each tooth must redden exactly its declared set, with its own line in the
 # transcript. The copy is `--sparse=always` so the 10 GiB image costs its
-# allocated extents, not ten gigabytes multiplied by five.
+# allocated extents, not ten gigabytes multiplied by six.
 rm -f "$IMG"
 truncate -s 10G "$IMG" || fail "could not make the NVMe image"
 gate_capture
 
-echo "=== the teeth: one capture, four replays ==="
+echo "=== the teeth: one capture, five replays ==="
 TC="$ART/teeth"
 mkdir -p "$TC" || fail "cannot create $TC"
 # The capture is the SOURCE for every copy: a replay must not be asked to
@@ -995,14 +1071,15 @@ mkdir -p "$TC" || fail "cannot create $TC"
 SRC_IMG="$IMG"
 retries=0
 
-# A replay whose pour was REFUSED never applied its tooth: all three breaks
-# live in the pour or in the forward path after it. The refusal seen here is
+# A replay whose pour was REFUSED never applied its tooth: all four breaks
+# live in the pour or in the forward path after it. The refusals seen here are
 # the P1a posture window (a sidecar still RUNNING when the wait's ceiling
-# expires — env_payload.h's account of run 12), not a tooth's red, so this arm
-# retries that boot ON A FRESH COPY and prints the attempt. The retry is
-# bounded and visible; a replay that never gets its contents injected can
-# never be counted as a pass for any tooth, and a pour that refuses EVERY
-# attempt fails the run instead of being retried away.
+# expires — env_payload.h's account of run 12) and a replay whose create could
+# not reach the environment manager it boots with; neither is a tooth's red,
+# so this arm retries that boot ON A FRESH COPY, prints the attempt and the
+# recorded reason. The retry is bounded and visible; a replay that never gets
+# its contents injected can never be counted as a pass for any tooth, and a
+# pour that refuses EVERY attempt fails the run instead of being retried away.
 replay_for_tooth() {   # <name> <tag-base> <body> -> 0 when the pour landed
     local name="$1" tag="$2" body="$3" try payloads skips
     for try in 1 2 3; do
@@ -1020,13 +1097,15 @@ replay_for_tooth() {   # <name> <tag-base> <body> -> 0 when the pour landed
         payloads=$(fact "$TC/$name" payloads)
         skips=$(fact "$TC/$name" payload_skips)
         if [ "$payloads" = "1" ]; then return 0; fi
-        echo "note: $name attempt $try got no pour (payloads=${payloads:-?}, payload_skips=${skips:-?}) — the P1a posture window, not this tooth; retrying on a fresh copy"
+        reason=$(grep -aF "[ENV_RESTORE] last refusal:" "$TC/$name/boot2.log" 2>/dev/null | \
+                     tail -1 | sed 's/.*last refusal: //')
+        echo "note: $name attempt $try got no pour (payloads=${payloads:-?}, payload_skips=${skips:-?}) — ${reason:-a restore refusal, not this tooth}; retrying on a fresh copy"
     done
     return 1
 }
 
 i=0
-for tooth in control descriptor no-fd no-heap; do
+for tooth in control descriptor no-fd no-heap fs_base; do
     i=$((i + 1))
     case "$tooth" in
         control)   body='{}' ;;
@@ -1038,7 +1117,7 @@ done
 IMG="$SRC_IMG"
 
 echo "=== teeth clauses (each recording is reusable with --replay) ==="
-for tooth in control descriptor no-fd no-heap; do
+for tooth in control descriptor no-fd no-heap fs_base; do
     echo "--- $tooth"
     assert_artifacts "$TC/$tooth"
 done
@@ -1048,7 +1127,7 @@ if [ "$fails" -ne 0 ]; then
     exit 1
 fi
 if [ "$retries" -gt 0 ]; then
-    echo "e7_gate_check: $retries replay(s) were retried for the P1a posture window (a pour refusal, not a tooth's red); the recordings kept are the ones that poured"
+    echo "e7_gate_check: $retries replay(s) were retried for a restore refusal (a create that could not reach its manager, or the P1a posture window) — not a tooth's red; the recordings kept are the ones that poured"
 fi
-echo "e7_gate_check: the teeth redden by name — $red_count clause(s) red across descriptor/no-fd/no-heap, each exactly where its tooth says, the control green; artifacts in $ART"
+echo "e7_gate_check: the teeth redden by name — $red_count clause(s) red across descriptor/no-fd/no-heap/fs_base, each exactly where its tooth says, the control green; artifacts in $ART"
 exit 0

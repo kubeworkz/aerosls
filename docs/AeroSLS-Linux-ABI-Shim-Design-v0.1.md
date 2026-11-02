@@ -428,7 +428,7 @@ The inherited gate is "a static binary doing the first user's actual work, runni
 - **What must be captured and restored:** the environment's sidecar address space, its capability table, its channels, its ramdisk contents (v0.2 §12 item 1), **plus** the Linux task's address space, its register/stack state, its `fs_base` (§5.3) and its single channel endpoint. E3's per-environment region is contiguous and partition-charged, which helps: it is one describable span, not a scattered set of allocations.
 - **Why forwarding reduces the problem:** a task parked in a forwarded syscall is already in a fully-saved, well-defined state — `struct CapParkCtx` plus `park_req`/`park_syscall`/`resume_sysret` are exactly the values needed to re-run that syscall after restore. A checkpoint does not have to invent a way to save a task mid-operation: it can **serialize a parked task and restore it parked**, and the resume path that already exists finishes the syscall. A blocking-syscall design would have to solve this from scratch; a park-based one inherits the solution.
 - **The gate test, concretely:** the first user's static binary runs its actual work inside an environment; the system checkpoints; the environment is restored (reboot or reload); the binary's work **continues and completes**, with its open descriptors still open and its heap still consistent. Passing means both halves — the work and the cycle — observed in one run, in the same spirit as E6's guard, which refused to accept "two empty streams" as isolation.
-- **What became of that split:** the mechanism was v0.2's, and P1a landed it — `CKPT_REGION_ENV` (bit 17), the versioned record array and the payload (§2.6). E7's share was the Linux task's place in that record: increment 20 put `entry`/stack/caps, the 20-word context, `fs_base`, both cursors and every page's permission into the record and payload; increment 21 replayed them through a reboot and the tenant resumed at the captured `rip`/`rsp`, finishing the copy with its descriptors and heap intact; increment 22's harness runs both halves in one invocation and its three live breaks redden by name (§10.14, `evidence/e7_gate_reboot.log`, `evidence/e7_gate_teeth.log`). The split survives as **reporting**, not as schedule: §10.4 still reports the two halves separately rather than blurring them. What is not automated is narrower than "v0.2 has not landed": the boots are manual invocations and the stale-`fs_base` tooth is still unarmed (§10.14).
+- **What became of that split:** the mechanism was v0.2's, and P1a landed it — `CKPT_REGION_ENV` (bit 17), the versioned record array and the payload (§2.6). E7's share was the Linux task's place in that record: increment 20 put `entry`/stack/caps, the 20-word context, `fs_base`, both cursors and every page's permission into the record and payload; increment 21 replayed them through a reboot and the tenant resumed at the captured `rip`/`rsp`, finishing the copy with its descriptors and heap intact; increment 22's harness runs both halves in one invocation and its live breaks redden by name — four arms after the `fs_base` tooth landed (§10.14, `evidence/e7_gate_reboot.log`, `evidence/e7_gate_teeth.log`, `evidence/e7_gate_teeth_fsbase.log`). The split survives as **reporting**, not as schedule: §10.4 still reports the two halves separately rather than blurring them. What is not automated is narrower than "v0.2 has not landed": the boots are manual invocations.
 
 ---
 
@@ -3113,13 +3113,14 @@ ticks. The drill now pins the posture (`running=[12]/2` at the bound) and uses
 the pure burst, so a future re-run that lands in a parked moment, or a host
 fast enough to finish the burst early, is a red rather than a pass.
 
-**Run record — increment 22, the teeth (2026-11-01).** This retires B10. The
-gate's clauses were asserted positively and their failure side was unproven:
-a harness that has never watched a broken environment redden is a claim. The
-run is one invocation over one capture and four replays, and it is the first
-time the gate's own clauses were made to fail on purpose.
+**Run record — increment 22's teeth, and the fourth arm (2026-11-01/02).**
+This retires B10. The gate's clauses were asserted positively and their
+failure side was unproven: a harness that has never watched a broken
+environment redden is a claim. The run is one invocation over one capture and
+five replays — three breaks at increment 22, the fourth added with `fs_base` —
+and it is the first time the gate's own clauses were made to fail on purpose.
 
-*The arms are a build profile, never a shipped one.* Three fault-injection
+*The arms are a build profile, never a shipped one.* Four fault-injection
 arms live behind `E7G_TOOTH` in `kernel/env_payload.{h,c}` and
 `kernel/syscall_dispatch.c`, selected per restore by the route's body
 (`{"tooth":"descriptor"}`) and compiled only by
@@ -3129,22 +3130,24 @@ their own flags, so without the stamp a "teeth" run would silently relink the
 previous build's objects and be the control wearing a different filename).
 Every other build refuses a named tooth by name — `this image was not built
 with the gate teeth` — and refuses a misspelt one too (`unknown tooth
-(descriptor|no-fd|no-heap)`), so a request can neither arm a shipped kernel nor
-fall back to the control and look green. The route reports `tooth:<name>`, and
+(descriptor|no-fd|no-heap|fs_base)`), so a request can neither arm a shipped
+kernel nor fall back to the control and look green. The route reports `tooth:<name>`, and
 the recording carries it in `facts`, so a `--replay` of a tooth run is judged
 under the expectation it was produced with rather than against the green set it
 was made to redden.
 
-*One capture, four replays.* `tests/e7_gate_check.sh --teeth` captures the gate
+*One capture, five replays.* `tests/e7_gate_check.sh --teeth` captures the gate
 environment exactly as `--live` does (boot 1: create, workload to the copy
-continuation, checkpoint), then replays it four times over
+continuation, checkpoint), then replays it five times over
 `cp --sparse=always` copies of the post-checkpoint NVMe image: the control (no
 tooth, which must be fully green — the arms do not fire unselected) and the
-three breaks. The clause probes, the expectation table and the recording
-format are shared with `--live` and `--replay`, so the three modes cannot
-drift. Each tooth declares the clauses it MUST redden and, by omission, the
-ones it MUST leave green; a tooth that reddens outside its set fails the run,
-which is what keeps a tooth from passing by breaking everything.
+four breaks. The clause probes, the expectation table and the recording
+format are shared with `--live` and `--replay`, so the three recording modes
+cannot drift. `--selfkill` is the exception by design: its boot takes no
+checkpoint, so it has its own five clauses rather than a recording. Each tooth
+declares the clauses it MUST redden and, by omission, the ones it MUST leave
+green; a tooth that reddens outside its set fails the run, which is what keeps
+a tooth from passing by breaking everything.
 
 *Every replay gets its own copy, and a refused pour is never a tooth's red.*
 The first attempt to fold this into one invocation hit the P1a posture window on
@@ -3154,25 +3157,33 @@ on (`[backup]` writes the checkpointed storage image and prunes three generation
 of it), so an attempt cannot simply be run again on the same disk: each replay is
 `--sparse=always`-copied from the capture immediately before it runs, and a
 refused attempt is repeated from the capture, printed as
-`note: <tooth> attempt N got no pour (payloads=..., payload_skips=...) — the P1a
-posture window, not this tooth; retrying on a fresh copy`. The repeat is bounded
-at three, and each one is reported as it happens and then counted in a line the
+`note: <tooth> attempt N got no pour (payloads=..., payload_skips=...) — <the
+refusal the boot recorded>; retrying on a fresh copy`. The repeat is bounded at
+three, and each one is reported as it happens and then counted in a line the
 run prints before its closing verdict; a tooth whose pour refuses every attempt
 fails the invocation (`no attempt got the payload poured — the run cannot measure
-this tooth`) rather than being retried into a pass. The invocation recorded in
-this section needed no repeat — the fix removed the failure mode the earlier
-attempt had exposed, without hiding it when it recurs.
+this tooth`) rather than being retried into a pass. A restore that poured
+nothing also stops the harness waiting: `payloads=0` means there is no resumed
+tenant whose conclusion could be waited on, so the attempt powers off and
+retries instead of sitting out the workload window. The four-tooth invocation
+below needed two repeats, both restore refusals — the first a create round trip
+that could not reach its manager, the second the P1a posture window — each
+printed with its recorded reason, and neither counted as a tooth's red.
 
 | Tooth | The break | Must redden | Must stay green (the specificity) | Named evidence |
 |---|---|---|---|---|
 | `descriptor` | the payload's Linux task record is dropped at the pour: no adoption, no pages, no context; the sidecars pour normally | B2 (no adopted line), B3 (first read `0x0`), B4 (a second `Copying`) | B1 `payloads=1, skips=0`, B5, B6 | `[E7-GATE] tooth descriptor: ... is DROPPED`; the released child restarts from `_start` and copies 512 KiB again (513 reads, `exit_group status=0`, 172 frames freed) |
 | `no-fd` | the continuation's `read(3)` is forwarded with fd 120, which the sidecar's 16-slot table does not carry, so the REAL lookup answers `-EBADF` | B3 (the read never reaches the VFS: no offset line), B4 (no `Done`) | B1, B2 (adopted, `stop=spent`), B5 (no fault), B6 | the forward line names fd 120; the tenant's own error names EBADF (`Bad file descriptor`), `exit_group status=1`, 168 frames freed |
 | `no-heap` | the reply's destination page — the child's own 64 KiB copy buffer — is unmapped just before the read is forwarded | B4, B5 (a `#PF` inside the withheld page) | B1, B2, B3 (the read IS issued at `off=0x30000`) | the forward line names the page; the deliver refuses the bytes `-EFAULT`; the tenant's `free` of that buffer then takes the `#PF` at `addr=0x...d803d`, `rip=0x8052f39` (`__libc_free`) |
+| `fs_base` | the record's TLS base is re-stamped one page off the capture's, into the page below it chosen from the record's own page list and admitted only with a writable captured grant | B2 (the adopted line's `fs_base=` is not the capture's), B4, B5 (the stale TCB kills the tenant in the next phase) | B1 `payloads=1, skips=0`, B3 (the first read IS at `0x30000` and the copy reads through `0x7FC00`), B6, B7 | the tooth line names `capture=0x807c208 restored=0x807b208`; the adopted line carries `restored`; the first post-restore read is `0x30000`; the fault is `#PF error=0x5 addr=0x34 rip=0x80530b3`, after the whole copy and before any `[backup]` line |
 
-The control's clauses were all green and the three teeth reddened exactly
-seven clauses between them — `7 clause(s) red across descriptor/no-fd/no-heap,
-each exactly where its tooth says, the control green`. The serial evidence is
-`evidence/e7_gate_teeth.log`.
+The increment-22 control's clauses were all green and its three teeth reddened
+exactly seven clauses between them — `7 clause(s) red across
+descriptor/no-fd/no-heap, each exactly where its tooth says, the control green`
+(`evidence/e7_gate_teeth.log`). The four-tooth invocation of 2026-11-02 is the
+same shape with `fs_base` added: ten reds across the four teeth, the control
+green, and two restore refusals retried rather than counted
+(`evidence/e7_gate_teeth_fsbase.log`).
 
 **The teeth corrected a gate clause, which is the point of having them.** B3
 used to assert that SOME read at `off=0x30000` appears in the replay boot. The
@@ -3198,7 +3209,7 @@ B3 red is "the read never happened".
 The expectation machinery itself was checked against negatives before the live
 run: a tooth recording that leaves its clause green fails, one that reddens
 outside its set fails, and one naming an unknown tooth is refused rather than
-judged. The same checks ran on the four real recordings through `--replay`.
+judged. The same checks ran on the five real recordings through `--replay`.
 
 **The shipped build has no arms, proven two ways.** `make x86-iso-e3 ...
 E7_TOOTH=` (the default) rebuilt the plain gate image with an EMPTY config
@@ -3208,22 +3219,20 @@ ISO contains one. Booted, the plain image answered
 "tooth":"descriptor"}` to a named tooth, `unknown tooth` to a typo, and the
 ordinary restore report (`{"ok":"true",..."tooth":"none"}`) to `{}`.
 
-The teeth named here are three of the five B10 lists. The restart tooth is
+The teeth named here are four of the five B10 lists. The restart tooth is
 not a separate arm: `descriptor` produces a restart as its consequence and
-B3/B4 are asserted on it. The stale-`fs_base` tooth has no arm yet — the
-adopted context's `fs_base` is carried and stamped, but nothing breaks it
-deliberately, and that is the one named gap this record leaves open.
+B3/B4 are asserted on it. The fifth is `fs_base`, armed below.
 
-**The gate's check harness has four modes, so the gate is checked even where
+**The gate's check harness has five modes, so the gate is checked even where
 QEMU is not.** Its default mode is the G1–G6 source clauses — the drill is a
 build-time feature inside the gate branch; the wait's two bounds and the
 switch-in ledger; the outlived line gated on an open window and naming the
 running posture; the designated tenant, staged image and continuation; the
 wait-before-repause and pour-after ordering with the report's counters; and the
-teeth's build profile, three arms, route gate and report — and those run in the
+teeth's build profile, four arms, route gate and report — and those run in the
 ordinary `tests/*_check.sh` sweep, with no build and no QEMU. `--live` adds the
 drill build and the two boots; `--teeth` adds the teeth build, one capture and
-four replays; `--selfkill` adds the self-kill build and one boot that observes
+five replays; `--selfkill` adds the self-kill build and one boot that observes
 the deferred teardown; `--replay DIR` re-runs the exact assertion function the
 live arm ends with, over a recording, and that function has teeth: a recording with
 `payloads=0` reddens B1, one with the outlived line removed or `stretch-done`
@@ -3295,6 +3304,31 @@ interrupt, so a target that parks before the tick is torn down on the next
 pass instead of waiting to be scheduled. Evidence:
 `evidence/e7_gate_selfkill.log`.
 
+**Run record — the `fs_base` tooth, and the consequence it measured
+(2026-11-02).** B10's fifth tooth had no arm. It is a restore-time rewrite like
+the other three, but it cannot pick its page by hope: a TLS block is written as
+well as read, so the arm chooses the shifted base from the record's OWN page
+list and requires the captured grant to be writable
+(`ep_page_recorded_writable`), printing both values. The run — the same ISO,
+`E7G_BUILD=0`, one capture, five replays — carries the sample line
+`[E7-GATE] tooth fs_base: the record's fs_base 0x807c208 is re-stamped
+0x807b208 (capture=0x807c208 restored=0x807b208) …`; the adoption then reports
+`fs_base=0x807b208`, and B2 reddens by name because the capture's boot-1 line
+carries `fs_base=0x807c208`. What the tooth measured is more than this design
+predicted: the continuation read is issued at `0x30000` and the copy reads
+through the file to its `0x80000` EOF probe, and the tenant then dies in the next phase at
+a pointer musl read out of the wrong TCB (`#PF error=0x5 addr=0x34
+rip=0x80530b3`), before any `[backup]` line. The tooth's declared reds are
+therefore B2 and the B4/B5 consequences of that death, with B3 green — which is
+exactly what separates it from `descriptor`, where the tenant never adopts and
+the copy restarts at `0x0`. The design pass expected the tenant to survive; the
+run corrected that expectation rather than the clause, because the fact B2
+certifies is the base, and the tenant's death is what a wrong TCB does. All
+five recordings replay standalone under the same expectation (`--replay`),
+which is how the corrected set was checked without a second boot. The
+invocation itself needed two repeats for restore refusals (above), neither a
+tooth's red.
+
 ---
 
 ## 11. Open questions for review
@@ -3363,12 +3397,12 @@ Everything this document asserts about the tree, with its source:
 | The SSE gate: the pure CR0/CR4/CPUID arithmetic at the SDM's own bit positions, the enable's CPUID → CR4 → CR0 → `fninit` → `ldmxcsr` order, the BSP call ahead of `syscall_gate_init`, the intact vector-7 chain, and the lazy path still dormant (no caller of `perform_lazy_context_switch`) | `arch/x86/fpu_enable.h`; `arch/x86/lazy_fpu.c` (`fpu_enable_sse`); `kernel/kernel.c` 4b; `tests/fpu_enable_host_test.c` (40 checks); guard clause Q, teeth t70–t75 (§10.13's step 2) |
 | The signal seam: the plan's three first-trap refusals (width, out-pointer, span) ahead of any channel post, the sidecar's dispositions/mask/pending with handler installs refused by name and tkill scoped to its own tid, and every default-terminate converging on one attributed no-reply kill | `kernel/linux_abi.{h,c}` (`linux_sig_copy_plan`, `LSC_SIG`); `kernel/syscall_dispatch.c`; `user/sidecar/src/linux.rs` (`SigState`, the 13/14/200 arms, `Answer::SignalKill`); `tests/linux_personality_host_test.c` (210 checks, the current run; 98 at the signal seam) + linux.rs unit tests (11); guard clause R, teeth t76–t83 (§10.13's step 2) |
 | The E7 gate's resume half ran in the guest: one invocation, two boots of the same NVMe image, the tenant adopted at `rip=0x8057ab7 rsp=0x4000000a9778` (`stop=spent`), its copy finishing after the reboot — one `Copying`, one `Done (524288 bytes, 504 sparse holes, 4 kept)`, no `[FAULT]` — and its `exit_group` reaped by name (`[TORE] address space … 172 frame(s) freed`, the work-half count) | `evidence/e7_gate_reboot.log`; `tests/env_payload_host_test.c` (81 checks: the one-shot stop, the held replay's page mapping, and the stall-bounded wait's three outcomes); `tests/cap_create_sidecar_host_test.c` (the caller's-partition resolve) |
-| The gate's failure side is observed, not assumed: one invocation, one capture and four replays — the control green, `descriptor` reddening B2/B3/B4, `no-fd` B3/B4, `no-heap` B4/B5 (the 64 KiB buffer's `free` faulting inside the withheld page) — with each tooth's own line in the transcript and the shipped image refusing a named tooth by name | `evidence/e7_gate_teeth.log`; `tests/e7_gate_check.sh --teeth`; `kernel/env_payload.h`'s `E7G_TOOTH` block and `Makefile`'s `E7_TOOTH` (both compiled out by default) |
+| The gate's failure side is observed, not assumed: one invocation, one capture and five replays — the control green, `descriptor` reddening B2/B3/B4, `no-fd` B3/B4, `no-heap` B4/B5 (the 64 KiB buffer's `free` faulting inside the withheld page), `fs_base` B2/B4/B5 (the adopted TLS base one page off, the copy running to the end of the file and the tenant dying at a pointer read from the wrong TCB) — with each tooth's own line in the transcript and the shipped image refusing a named tooth by name | `evidence/e7_gate_teeth.log`, `evidence/e7_gate_teeth_fsbase.log`; `tests/e7_gate_check.sh --teeth`; `kernel/env_payload.h`'s `E7G_TOOTH` block and `Makefile`'s `E7_TOOTH` (both compiled out by default) |
 | The run's last ENOSYS answer retires: poll (7)'s zero-timeout probe answered 0 events with the array never read and revents never written, a WAITING poll refused at both ends before any post, and the firstuser's first output (its own fatal SIGPIPE assert) performed by the fd class | `kernel/linux_abi.{h,c}` (`linux_poll_refuses_blocking`, `LINUX_POLL`); `kernel/syscall_dispatch.c` (the first-trap refusal); `user/sidecar/src/linux.rs` (the 7 arm); `tests/linux_personality_host_test.c` (210 checks, the current run; 105 at the poll coda) + linux.rs unit tests (12); guard clause S, teeth t84–t89 (§10.13's poll coda) |
 
 ## Appendix B — Named gaps, each with its destination
 
-**Register checked 2026-11-01, after increment 22.** A row's third cell says **LANDED** only when the gap is closed in the tree and the cell names the section, test and evidence that closed it. Three remainders stay visible inside landed rows rather than being swept: `munmap` (§5.4), `xsetbv`/`CR4.OSXSAVE` (§5.3) and the stale-`fs_base` tooth (§10.14). The gaps still open are the thread group, ARM64 userspace and console input.
+**Register checked 2026-11-02, after the `fs_base` tooth.** A row's third cell says **LANDED** only when the gap is closed in the tree and the cell names the section, test and evidence that closed it. Two remainders stay visible inside landed rows rather than being swept: `munmap` (§5.4) and `xsetbv`/`CR4.OSXSAVE` (§5.3). The gaps still open are the thread group, ARM64 userspace and console input.
 
 | Gap | Consequence if unaddressed | Destination |
 |---|---|---|
@@ -3389,7 +3423,10 @@ Everything this document asserts about the tree, with its source:
 | The Linux tenant resumes at its captured `rip`/`rsp` after a reboot | without it a restore either re-enters `_start` or holds the copy forever, and the cycle half never completes | **LANDED** — increment 21 (§10.14): one invocation, two boots, adopted at `rip=0x8057ab7 rsp=0x4000000a9778 stop=spent`, the copy finishing after the reboot with one `Copying`, one `Done (524288 bytes, 504 sparse holes, 4 kept)` and no `[FAULT]`; `evidence/e7_gate_reboot.log` |
 | `sys_sls_sidecar_pid` read a 0 partition as PARTITION_SYSTEM, so a tenant sidecar's name→pid resolve answered 0 for its own child and `exit_group`'s reap refused by name (measured on increment 21's resumed tenant) | a replay that leaks an address space could be counted as a clean cycle, and a tenant could also enumerate PARTITION_SYSTEM's names | **LANDED** — 0 now means the caller's own partition (the ABI's reading everywhere else), which is also tighter than the old scoping; `tests/cap_create_sidecar_host_test.c` pins both halves, and the resumed tenant's exit returns `172 frame(s) freed` (§10.14) |
 | The pre-pour wait bounded ELAPSED time, so a sidecar still serving the replay's own boot I/O when a fixed 30 s deadline expired was reported as a posture that never came — a healthy environment reading as one whose contents were refused (measured once in four boots: `payload_skips:1`, `drv.ramdisk.1` running) | a slow-but-working boot is indistinguishable from a wedged one, and the transcript blames the capture | **LANDED** — the bound is a stall window (3,000 ticks, restarted by any switch-in on the record's sidecar tasks or the `[env-id]` announcement) with an absolute ceiling (18,000), and `ProcessDescriptor.switches` is the progress signal; `tests/env_payload_host_test.c` pins all three outcomes, and `tests/e7_gate_check.sh --live` exercises the extension live as part of the gate — the wait outlived the fixed bound at 3,005 ticks with a sidecar RUNNING (`running=1/2`, `quiet 0`, `announced=0`), never answered, and the pour still landed (`payloads:1, payload_skips:0`) (§10.14) |
-| No gate harness or teeth: the E7 clauses were asserted positively and their failure side was unproven | a harness that has never seen a broken environment redden cannot say its green run means anything | **LANDED** — increment 22 (§10.14): `tests/e7_gate_check.sh` (source clauses, `--live`, `--teeth`, `--replay`), a build-gated tooth profile (`E7_TOOTH`, selected per restore and refused by name elsewhere), and three live breaks whose reds are asserted by name — `descriptor` (B2/B3/B4), `no-fd` (B3/B4), `no-heap` (B4/B5) — with the control green; `evidence/e7_gate_teeth.log`. **Remainder:** the stale-`fs_base` tooth is still unarmed |
+| No gate harness or teeth: the E7 clauses were asserted positively and their failure side was unproven | a harness that has never seen a broken environment redden cannot say its green run means anything | **LANDED** — increment 22 (§10.14) and the clause/deferred work after it: `tests/e7_gate_check.sh` (source clauses, `--live`, `--teeth`, `--selfkill`, `--replay`), a build-gated tooth profile (`E7_TOOTH`, selected per restore and refused by name elsewhere), and four live breaks whose reds are asserted by name — `descriptor` (B2/B3/B4), `no-fd` (B3/B4), `no-heap` (B4/B5), `fs_base` (B2/B4/B5) — with the control green. B7 re-derives the stack high-water from both boots, requires the exit scan on either teardown path and counts it; `--selfkill` observes the deferred teardown live, and `fs_base` arms the fifth B10 tooth. Evidence: `evidence/e7_gate_teeth.log`, `evidence/e7_gate_teeth_b7.log`, `evidence/e7_gate_teeth_exitpass.log`, `evidence/e7_gate_teeth_fsbase.log`, `evidence/e7_gate_selfkill.log`. No remainder: all five teeth are accounted for (four arms plus `descriptor`'s restart) |
+| B2 certified adoption by `form` and `stop` but never compared the TLS base the pour installed with the one the capture carried | a restore could install any `fs_base` and the gate would stay green; the one field of the resumed context the clause exists to check was unmeasured | **LANDED** — the capture line carries `fs_base=0x…`, B2 compares it with the adopted line's, and the `fs_base` arm (gate-only `E7_TOOTH=1`, selected per restore) re-stamps the record's base one page into a page the record says is writable; one invocation, ten reds across four teeth and the control green (§10.14, `evidence/e7_gate_teeth_fsbase.log`) |
+| The gate's stack measurement was a quoted number with no clause | a drift in the poison, the budget or the workload's depth would stay invisible in a green run | **LANDED** — B7 in `tests/e7_gate_check.sh`: the stop and exit lines are re-derived (budget, poisoned span, headroom + deepest, the lowest address against a page-aligned base, a 32 KiB floor), the exit scan is required on either teardown path and counted so a doubled report reddens; two teeth runs with the fault path included, plus the duplicated-exit replay that reddens by name (`evidence/e7_gate_teeth_b7.log`, `evidence/e7_gate_teeth_exitpass.log`) |
+| A deferred kill's teardown was compiled only — every recorded kill hit a parked task — and a target that parked before the tick could stay pending | the scan-at-teardown claim rested on code that had never run, and a kill could wait indefinitely for the task to be scheduled | **LANDED** — `--selfkill` (gate-only `E7_SELFKILL=1`) makes the stop ask for the running tenant's death; `schedule_ring3` sweeps non-running pending targets and both paths share `proc_deferred_teardown()`; one boot observes the request, the deferral, the teardown and exactly one scan after it (§10.14, `evidence/e7_gate_selfkill.log`) |
 | No reply payload: `read` and the file class never cross back (§10.10's named gap) | the first user cannot open, read, stat, list, rename or prune — its file work never leaves the sidecar (§5.6) | **LANDED** — increments 17–18 (§10.13's step 4): the thirteen census numbers cross through the VFS, the measured flag contract, path/stat/dirent reply plans and the sidecar fd table. The guest workload run is §10.14 increment 19 |
 | No time source across the sidecar's ABI | `clock_gettime` (228) refuses; the no-vDSO proof (§5.5) shows the first user makes this call | **LANDED** — increment 19 (§10.14): REALTIME/MONOTONIC answered by the sidecar through the 16-byte copy-out with the 2026-01-07 epoch pinned, so the gate's filename is the seam's value and not the host's; `tests/linux_personality_host_test.c` pins the reply shape and that a zero count there is not "success with no payload" (unlike `read`) |
 | No console-input state, so a WAITING `poll` cannot answer | a zero-timeout probe is answered (0 events, increment 11), but `poll` (census ×1) with a timeout, and a blocking read, still refuse by name | the input class, unscoped (named §10.13) |
