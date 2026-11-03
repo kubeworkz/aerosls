@@ -201,11 +201,17 @@ order_ok() {
 # clause failed; the FAIL lines above it are already prefixed with the id.
 clause() { [ "$fail" -eq "$1" ] && ok "$2. $3"; }
 
-TENANT="$(fn_body "$MF" 'pub fn build_posix_manifest_tenant(')"
+# The cap records live in the profile helper: E7's gate variant turned
+# build_posix_manifest_tenant() into a one-line delegation, so scanning the
+# wrapper's body finds no caps. Read the helper and pin the delegation.
+TENANT="$(fn_body "$MF" 'fn build_posix_manifest_tenant_profile(')"
+TENANTSHIM="$(fn_body "$MF" 'pub fn build_posix_manifest_tenant(')"
 SYSTEM="$(fn_body "$MF" 'pub fn build_posix_manifest(')"
 
 # ── N1. the tenant manifest's network cap, and the rotated pin ────────────
 c1=$fail
+hasstr "$TENANTSHIM" 'build_posix_manifest_tenant_profile(' ||
+    bad "N1. tenant manifest: build_posix_manifest_tenant() no longer delegates to the profile helper — the caps checked here would not be the ones it returns"
 hasstr "$TENANT" 'peer: Some("kernel.net.socket"),' ||
     bad "N1. tenant manifest: the network cap's peer must be exactly kernel.net.socket"
 printf '%s\n' "$TENANT" | grep -A2 -F 'name: "network"' | grep -qF 'rights: 0x7' ||
