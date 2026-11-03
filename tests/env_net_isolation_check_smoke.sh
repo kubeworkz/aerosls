@@ -42,7 +42,20 @@
 #   P2_TOOTH=no-ci-order       — the step reordered ahead of its ISO build;
 #                              N17b reddens alone while N17 holds green (the
 #                              order half bites by itself).
-#   plus one tooth per clause — every other clause N1-N17b reddens when the
+#   P2_TOOTH=no-birth-default  — §11 Q4's default leaves the mint: the
+#                              partition is created unbounded again, and N18
+#                              names the mint site while N19 holds green (the
+#                              default and the authority are different teeth).
+#   P2_TOOTH=no-restore-default — the restore path stops re-applying it: the
+#                              two partition lifetimes disagree (a rebooted
+#                              tenant unbounded, a fresh one capped), N18.
+#   P2_TOOTH=no-birth-line     — the kernel's birth line stops naming the
+#                              default; N18 reddens on the evidence N19b reads.
+#   P2_TOOTH=ungated-quota-set — the 277 arm stops checking the caller's
+#                              partition: a tenant could undo the default, N19.
+#   P2_TOOTH=no-quota-role     — the HTTP route stops requiring DB_ADMIN: the
+#                              kernel-context path is ungated, N19.
+#   plus one tooth per clause — every other clause N1-N19 reddens when the
 #                              single property it carries is removed.
 #
 # ─── What a teeth smoke is for ─────────────────────────────────────────────
@@ -79,7 +92,8 @@ case "$TOOTH_SET" in
     no-register|no-skip|no-tick|no-makefile|no-refusal|no-hosttest|\
     no-attribution|no-admit-counter|no-listener-verbs|no-accept-attribution|\
     no-bind-port|descriptor-conn-id|no-quota-surface|no-quota|\
-    no-ci-live|no-ci-order) ;;
+    no-ci-live|no-ci-order|no-birth-default|no-restore-default|\
+    no-birth-line|ungated-quota-set|no-quota-role) ;;
     *) echo "ABORT: unknown P2_TOOTH='$TOOTH_SET' — see this file's header for the list" >&2; exit 2 ;;
 esac
 want_tooth() { [ -z "$TOOTH_SET" ] || [ "$TOOTH_SET" = "$1" ]; }
@@ -104,6 +118,9 @@ SEED_FILES=(
     net/tcp_quota.h
     net/http.c
     kernel/syscall_dispatch.c
+    kernel/partition.c
+    kernel/partition.h
+    kernel/persist.c
     user/shell.c
     Makefile
     tests/net_socket_service_host_test.c
@@ -407,6 +424,70 @@ if want_tooth no-ci-order; then
         printf '%s\n' "$out" | sed 's/^/      /'
         failed=$((failed + 1))
     fi
+fi
+
+# ── P2 increment 5 / §11 Q4's default and authority ───────────────────────
+
+# N18. the default leaves the MINT — a partition created after boot is
+# unbounded again while a restored one keeps its ceiling. N19 must hold
+# green: the authority rule is a different property with its own tooth.
+if want_tooth no-birth-default; then
+    seed "$W/nbd"
+    replace "$W/nbd/kernel/partition.c" \
+        'pq_born_bounded((uint32_t)i);' \
+        '(void)0;   /* the mint no longer bounds the partition */'
+    out="$(bash "$GUARD" "$W/nbd" 2>&1)"; rc=$?
+    if [ "$rc" -eq 1 ] && printf '%s\n' "$out" | grep -q "^FAIL: N18\." && \
+       ! printf '%s\n' "$out" | grep -q "^FAIL: N19\."; then
+        echo "ok:   P2_TOOTH=no-birth-default: the mint drops the tenant default — N18 reddens while N19 (who may change it) stays green"
+        passed=$((passed + 1))
+    else
+        echo "FAIL: P2_TOOTH=no-birth-default did NOT bite as attributed — exit $rc (want 1, 'FAIL: N18.', no 'FAIL: N19.')"
+        printf '%s\n' "$out" | sed 's/^/      /'
+        failed=$((failed + 1))
+    fi
+fi
+
+# N18. the default leaves the RESTORE path — the other way a partition comes
+# into existence (persist_restore_all() reads the table directly). A rebooted
+# tenant unbounded while a fresh one is capped is the split this tooth makes.
+if want_tooth no-restore-default; then
+    seed "$W/nrd"
+    replace "$W/nrd/kernel/persist.c" \
+        'partition_apply_conn_quota_defaults();' \
+        '(void)0;   /* the restore path no longer re-applies the default */'
+    tooth no-restore-default N18 "the restore path stops re-applying the tenant default" "$W/nrd"
+fi
+
+# N18. the birth line stops naming the default — the property still holds,
+# but the evidence N19b reads (and an operator's boot log) goes silent.
+if want_tooth no-birth-line; then
+    seed "$W/nbl"
+    replace "$W/nbl/net/tcp_quota.c" \
+        '(tenant default; 0 = explicitly unlimited)' \
+        '(default)'
+    tooth no-birth-line N18 "the birth line stops naming the default" "$W/nbl"
+fi
+
+# N19. the 277 arm stops checking the caller's partition — the arm shipped
+# with no check at all, so this is the regression to watch for: the default
+# is set and then immediately undoable by the tenant it bounds.
+if want_tooth ungated-quota-set; then
+    seed "$W/uqs"
+    replace "$W/uqs/kernel/syscall_dispatch.c" \
+        'caller->partition_id != PARTITION_SYSTEM' \
+        '0   /* the caller check was removed */'
+    tooth ungated-quota-set N19 "the conn-quota arm stops checking the caller's partition" "$W/uqs"
+fi
+
+# N19. the HTTP route stops requiring DB_ADMIN — kernel context has no
+# process, so this is the one path the dispatch check cannot cover.
+if want_tooth no-quota-role; then
+    seed "$W/nqr"
+    replace "$W/nqr/net/http.c" \
+        'req_role > ROLE_DB_ADMIN' \
+        '0 > 1   /* the role gate was removed */'
+    tooth no-quota-role N19 "the connquota POST stops requiring DB_ADMIN" "$W/nqr"
 fi
 
 # ── the vacuity control: the REAL tree must be GREEN ───────────────────────

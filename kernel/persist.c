@@ -1389,6 +1389,14 @@ void persist_restore_all(void) {
                         "[PERSIST] Partition ownership: snapshot predates Phase 2 (or size "
                         "mismatch) -- ownership left at boot defaults.\n");
                 }
+
+                /* POSIX-Environments v0.2 §11 Q4: the rows just read bypassed
+                 * partition_create() (the same bypass the ownership comment
+                 * above describes), so without this every partition that
+                 * survived a reboot would come back with NO connection ceiling
+                 * while a freshly minted one is born at the tenant default.
+                 * One policy, both lifetimes. */
+                partition_apply_conn_quota_defaults();
             } else {
                 kernel_serial_print("[PERSIST] Partitions: struct size mismatch — cold start.\n");
             }

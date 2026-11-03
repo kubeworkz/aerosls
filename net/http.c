@@ -3929,8 +3929,20 @@ static int api_partition_connquotas_list(char* buf, int max) {
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
 
-static int api_partition_connquota_post(const char* body, char* buf, int max) {
+static int api_partition_connquota_post(const char* body, char* buf, int max,
+                                        SLSRole req_role) {
     JSONBuf j = { buf, 0, max };
+    /* POSIX-Environments v0.2 §11 Q4: changing a partition's connection
+     * quota is a control-plane decision, the same weight as creating the
+     * partition. The syscall arm below this requires PARTITION_SYSTEM; this
+     * route runs in kernel context (where that arm has no caller), so its
+     * gate is the role the route already resolves -- the same one
+     * /api/partitions requires. */
+    if (req_role > ROLE_DB_ADMIN) {
+        jb_obj_open(&j,0); jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","requires DB_ADMIN or higher");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
     if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
     struct SLSPartitionConnQuotaSetRequest req;
     req.partition_id = (uint32_t)json_int(body, "partition_id");
@@ -6611,7 +6623,7 @@ static void http_route(int conn, char* req) {
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         if (!strcmp(path, "/api/partition/connquota")) {
-            blen = api_partition_connquota_post(body_ptr, resp_body, (int)sizeof(resp_body));
+            blen = api_partition_connquota_post(body_ptr, resp_body, (int)sizeof(resp_body), req_role);
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         // ── Cluster formation: POST /api/cluster/init, /api/cluster/peer ───────

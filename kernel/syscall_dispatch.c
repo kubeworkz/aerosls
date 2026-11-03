@@ -1327,8 +1327,23 @@ uint64_t do_syscall(uint64_t num, void* arg) {
         sys_sls_partition_storage_quota_list(); return 0;
 
     // ─── Network Fairness Phase 2 (277-278) ──────────────────────────────────
-    case SYS_SLS_PARTITION_CONN_QUOTA_SET:
+    // POSIX-Environments v0.2 §11 Q4 — who may change a quota. The mechanism
+    // shipped with no authority check on this arm at all, so any ring-3 caller
+    // could zero its own ceiling or a neighbour's; a default set at the mint
+    // would have been decorative. PARTITION_SYSTEM is the operator (init, the
+    // system shell, the control plane); kernel context has no current process
+    // and is the HTTP route's own path, which requires DB_ADMIN above this.
+    case SYS_SLS_PARTITION_CONN_QUOTA_SET: {
+        struct ProcessDescriptor* caller = process_find_current();
+        if (caller && caller->partition_id != PARTITION_SYSTEM) {
+            kernel_serial_printf(
+                "[TCP-QUOTA] set refused: pid=%u (partition %u) may not change "
+                "a connection quota — only PARTITION_SYSTEM may\n",
+                (unsigned)caller->pid, (unsigned)caller->partition_id);
+            return (uint64_t)(int64_t)CAP_EPERM;
+        }
         return sys_sls_partition_conn_quota_set((struct SLSPartitionConnQuotaSetRequest*)arg);
+    }
     case SYS_SLS_PARTITION_CONN_QUOTA_LIST:
         sys_sls_partition_conn_quota_list(); return 0;
 

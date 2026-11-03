@@ -81,7 +81,16 @@
 #       the phase exists;
 #   N17/N17b. the flood evidence's wiring: ci.yml invokes this guard's
 #       --live arm, ordered AFTER the ISO build (P1b's S13/S13b shape —
-#       deleting or reordering the step reddens the guard by name).
+#       deleting or reordering the step reddens the guard by name);
+#   N18. §11 Q4's default: a partition is BORN at
+#       PARTITION_TENANT_CONN_QUOTA_DEFAULT — applied at the mint in
+#       partition_create(), re-applied on the restore path that bypasses it,
+#       with PARTITION_SYSTEM exempt. Deleting either site leaves one of the
+#       two partition lifetimes unbounded;
+#   N19. §11 Q4's authority: the 277 arm refuses a non-SYSTEM caller by name
+#       before touching the table (the arm had NO check at all), and the HTTP
+#       route that reaches the same setter from kernel context requires
+#       DB_ADMIN. N19b proves the birth line on a booted node.
 #
 # ─── The live arm (--live) ────────────────────────────────────────────────
 #   L1. the created tenant environment's channel registers under the
@@ -108,9 +117,13 @@
 #       A through POST /api/partition/connquota, a second environment in A
 #       whose loopback client+listener push A to its quota, and the EXCESS
 #       accept refused BY NAME (closed, charged to nobody) — while partition
-#       B, quota 0 (unlimited), serves a client of its own throughout: the
-#       B-keeps-serving clause that is the whole point of the phase, plus the
-#       0=unlimited half read back off B.
+#       B, untouched by A's setting, serves a client of its own throughout:
+#       the B-keeps-serving clause that is the whole point of the phase.
+#   L5a. §11 Q4's default, live: A is read back BEFORE this arm configures
+#       anything and holds 96, and the kernel's own `[TCP-QUOTA] partition N:
+#       born bounded at 96` line agrees with it. B holds the same default
+#       after A's quota is set to 1, which is what proves the arm changed
+#       ONE partition. N19b is this clause's name in the transcript.
 #
 # Teeth: tests/env_net_isolation_check_smoke.sh proves every clause above
 # reddens when the property it carries is removed (P2_TOOTH=system-peer is
@@ -166,11 +179,14 @@ CIW="$ROOT/.github/workflows/ci.yml"
 MKF="$ROOT/Makefile"
 TST="$ROOT/tests/net_socket_service_host_test.c"
 PROTO="$ROOT/user/proto/src/env_proto.rs"
+PART="$ROOT/kernel/partition.c"
+PARTH="$ROOT/kernel/partition.h"
+PERSIST="$ROOT/kernel/persist.c"
 
 # Precondition: every file the clauses read. Missing is a refusal to evaluate
 # (exit 2), not a pass and not a finding — the same rule the restore guard's
 # smoke pins with its arm A.
-for f in "$MF" "$INITE" "$ENVM" "$CAP" "$SVC" "$SVCH" "$CONS" "$MMK" "$TQ" "$TQH" "$SYSD" "$HTTP" "$USH" "$CIW" "$MKF" "$TST" "$PROTO"; do
+for f in "$MF" "$INITE" "$ENVM" "$CAP" "$SVC" "$SVCH" "$CONS" "$MMK" "$TQ" "$TQH" "$SYSD" "$HTTP" "$USH" "$CIW" "$MKF" "$TST" "$PROTO" "$PART" "$PARTH" "$PERSIST"; do
     [ -f "$f" ] || { echo "ABORT: ${f#"$ROOT"/} missing — the guard cannot be evaluated" >&2; exit 2; }
 done
 
@@ -493,6 +509,54 @@ else
         bad "N17b. ci.yml's live arm does not run AFTER the ISO build — a boot guard ahead of its image aborts before booting and proves nothing about the flood"
     fi
 fi
+
+# ── N18. a partition is BORN bounded — §11 Q4's default ──────
+# The mechanism existed and defaulted to 0, so `env create` produced a tenant
+# with no ceiling at all. The value now lives in the partition lifecycle, not
+# in a create caller: the mint applies it, and the restore path — which reads
+# partition_table[] directly and never calls partition_create(), the same
+# bypass the ownership rows hit — re-applies it. Both sites matter: delete
+# either and one of the two partition lifetimes comes back unbounded. SYSTEM
+# is exempt, because the number is sized so four bounded tenants still leave
+# the control plane 112 slots.
+c18=$fail
+has "$PARTH" '#define PARTITION_TENANT_CONN_QUOTA_DEFAULT 96' ||
+    bad "N18. kernel/partition.h: PARTITION_TENANT_CONN_QUOTA_DEFAULT is gone — a freshly created environment would be born unbounded again (§11 Q4)"
+hasstr "$(fn_body "$PART" 'uint32_t partition_create(')" 'pq_born_bounded((uint32_t)i);' ||
+    bad "N18. kernel/partition.c: partition_create() no longer applies the default at the mint — a partition created after boot has no ceiling (restored ones would, and the two lifetimes would disagree)"
+has "$PART" 'void partition_apply_conn_quota_defaults(void) {' ||
+    bad "N18. kernel/partition.c: the restore-path entry point (partition_apply_conn_quota_defaults) is gone"
+has "$PERSIST" 'partition_apply_conn_quota_defaults();' ||
+    bad "N18. kernel/persist.c: the restore path no longer re-applies the tenant default — every partition that survived a reboot would come back unbounded while a fresh one is capped"
+hasstr "$(fn_body "$TQ" 'void tcp_partition_born_bounded(')" 'partition_id == PARTITION_SYSTEM' ||
+    bad "N18. net/tcp_quota.c: the birth hook no longer exempts PARTITION_SYSTEM — the control plane would be capped by the tenant default"
+has "$TQ" '(tenant default; 0 = explicitly unlimited)' ||
+    bad "N18. net/tcp_quota.c: the birth line is gone — the live arm (N19b) has nothing to read, and a bounded partition would be invisible in the boot log"
+has "$TQH" 'void tcp_partition_born_bounded(uint32_t partition_id);' ||
+    bad "N18. net/tcp_quota.h: the birth hook is undeclared — the kernel's call would not compile, so the default would be unreachable"
+clause "$c18" N18 "a partition is born at the tenant default: applied at the mint, re-applied on the restore path, PARTITION_SYSTEM exempt"
+
+# ── N19. who may change a quota — §11 Q4's authority half ────────────────
+# The default is only worth setting if a tenant cannot undo it. The 277 arm
+# shipped with no authority check at all, so any ring-3 caller could zero its
+# own ceiling or a neighbour's; the arm now refuses a non-SYSTEM caller by
+# name BEFORE the setter, and the HTTP route — kernel context, where the arm
+# has no caller — carries the same role gate as /api/partitions.
+c19=$fail
+has "$SYSD" 'caller->partition_id != PARTITION_SYSTEM' ||
+    bad "N19. kernel/syscall_dispatch.c: the conn-quota arm no longer checks the caller's partition — a tenant could raise its own ceiling or lower a neighbour's, and §11 Q4's default would be decorative"
+has "$SYSD" 'may not change' ||
+    bad "N19. kernel/syscall_dispatch.c: the refusal is no longer named — a denied operator would see an unexplained CAP_EPERM"
+order_ok "$SYSD" 'may not change' 'sys_sls_partition_conn_quota_set(' ||
+    bad "N19. kernel/syscall_dispatch.c: the authority check no longer precedes the setter — a refused caller would still change the table"
+CQPOST="$(fn_body "$HTTP" 'static int api_partition_connquota_post(')"
+hasstr "$CQPOST" 'req_role > ROLE_DB_ADMIN' ||
+    bad "N19. net/http.c: the connquota POST no longer requires DB_ADMIN — an unauthenticated POST would change any partition's quota"
+hasstr "$CQPOST" 'SLSRole req_role' ||
+    bad "N19. net/http.c: the connquota handler no longer takes the resolved role, so it cannot be gated"
+has "$HTTP" 'api_partition_connquota_post(body_ptr, resp_body, (int)sizeof(resp_body), req_role)' ||
+    bad "N19. net/http.c: the route does not pass req_role into the handler — the gate would read a parameter that was never threaded"
+clause "$c19" N19 "only PARTITION_SYSTEM reaches the setter (refused by name, before the table), and the HTTP route requires DB_ADMIN"
 
 # ── the live arm ──────────────────────────────────────────────────────────
 if [ "$LIVE" -eq 1 ]; then
@@ -1016,6 +1080,30 @@ PY
         cons_send "$pid" "$E2" "nc -l 8082" || exit 1
         sleep 4   # the applet's socket/bind/listen round is silent on serial; settle before the client dials
 
+        # ── N19b (§11 Q4): A was BORN bounded, before this arm configures ──
+        # The source clause (N18) can see that the mint calls the hook; only a
+        # running node can show that a partition created through the API comes
+        # back bounded. Both halves are asserted: the kernel's own birth line,
+        # and the control plane's readback of the same number.
+        # cq_field() reads $W/cq.json (its one readback file, shared with L5).
+        api "$W/cq.json" "$BASE/api/partition/connquotas" || true
+        AQ0="$(cq_field "$pid" quota)"
+        if [ "$AQ0" != "96" ]; then
+            echo "FAILED: N19b. a freshly created partition reads conn_quota='$AQ0', expected the tenant default 96 — it was born unbounded (§11 Q4)" >&2
+            exit 1
+        fi
+        BIRTH="[TCP-QUOTA] partition $pid: born bounded at 96"
+        for i in $(seq 1 $((WAIT_S * 2))); do
+            grep -aqF "$BIRTH" "$LOG" 2>/dev/null && break
+            kill -0 "$QPID" 2>/dev/null || break
+            sleep 0.5
+        done
+        if ! grep -aqF "$BIRTH" "$LOG" 2>/dev/null; then
+            echo "FAILED: N19b. no birth line for partition $pid — the API readback shows the default but the kernel's own account does not" >&2
+            exit 1
+        fi
+        echo "ok:   N19b. partition $pid was born bounded at 96 (the kernel's line and the API's readback agree)"
+
         # ── set A's quota to 1 and read BOTH partitions back ──────────────
         python3 - "$pid" > "$W/cqset_body.json" <<'PY'
 import json, sys
@@ -1032,11 +1120,11 @@ PY
             exit 1
         fi
         BQ="$(cq_field "$pidb" quota)"
-        if [ -n "$BQ" ] && [ "$BQ" != "0" ]; then
-            echo "FAILED: L5. B was expected to hold NO quota (0 = unlimited), read back '$BQ'" >&2
+        if [ "$BQ" != "96" ]; then
+            echo "FAILED: L5. B was expected to hold the tenant default (96), read back '$BQ' — the birth default did not apply to B" >&2
             exit 1
         fi
-        echo "ok:   L5. quota set on A (=1) and read back; B holds none (0 = unlimited, unchanged)"
+        echo "ok:   L5. quota set on A (=1) and read back; B holds the tenant default (96), untouched by A's quota"
 
         # ── A's flood: the client connect is ADMITTED, the accept is the ──
         # excess and must be refused BY NAME. The refusal is logged under
@@ -1061,8 +1149,9 @@ PY
         echo "ok:   L5. A's excess accept was refused BY NAME while A sat at its quota (charged to nobody)"
 
         # ── B keeps serving throughout: a B client connects and its accept ──
-        # SUCCEEDS while A is quota-blocked. B holds no quota (0 = unlimited,
-        # read back above), so the observable is B's conn usage going LIVE:
+        # SUCCEEDS while A is quota-blocked. B holds the tenant default (96,
+        # read back above — A's setting touched only A), so the observable is
+        # B's conn usage going LIVE:
         # the outbound conn plus the listener's accepted conn, both charged to
         # B and held open by the two relaying endpoints.
         cons_send "$pidb" "$EB2" "nc 10.0.2.15 8081" || exit 1
@@ -1085,7 +1174,7 @@ PY
             exit 1
         fi
         echo "ok:   L5. B kept serving throughout (conn_usage=$BU live while A's flood was refused; B never refused)"
-        echo "ok:   L5. the bounds are measured — quota on A enforced BY NAME, B (0 = unlimited) untouched: §10's P2 gate, live"
+        echo "ok:   L5. the bounds are measured — quota on A enforced BY NAME, B (tenant default 96) untouched: §10's P2 gate, live"
         :
     fi
 fi

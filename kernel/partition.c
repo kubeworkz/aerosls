@@ -26,6 +26,28 @@ struct SLSPartitionEntry  partition_table[PARTITION_MAX];
 struct SLSPartitionAssign partition_assign_table[PARTITION_ASSIGN_MAX];
 struct SLSPartitionOwner  partition_owner_table[PARTITION_MAX];
 
+/* net/tcp_quota.c's birth hook for PARTITION_TENANT_CONN_QUOTA_DEFAULT.
+ *
+ * WEAK for the same reason kernel_io.h's arch hooks are weak: twenty-nine
+ * host tests link this file (partition bookkeeping, migration, persistence,
+ * tenant creation) without the net layer, and a strong call would break every
+ * one of their own `gcc` lines for a policy those tests do not assert. The
+ * kernel always links net/tcp_quota.c, so the call always resolves there; a
+ * host test that does not link it gets a null symbol, and pq_born_bounded()'s
+ * null-check skips the policy rather than crashing. Declared here rather than
+ * by including net/tcp_quota.h so this file keeps one weak declaration of the
+ * one function it calls, and so the header's strong prototype never meets a
+ * weak redeclaration in the same TU. */
+extern void tcp_partition_born_bounded(uint32_t partition_id) __attribute__((weak));
+
+/* The policy both partition lifetimes use. PARTITION_SYSTEM is exempt: it is
+ * the control plane, and the number is sized so four bounded tenants still
+ * leave it 112 slots (partition.h's derivation). */
+static void pq_born_bounded(uint32_t partition_id) {
+    if (partition_id == PARTITION_SYSTEM) return;
+    if (tcp_partition_born_bounded) tcp_partition_born_bounded(partition_id);
+}
+
 /* Phase 14 (LPAR): pause/resume state. Deliberately kept as separate,
  * ephemeral runtime state rather than a field on struct SLSPartitionEntry
  * -- it's scheduling state, not partition identity, so it doesn't survive
@@ -107,6 +129,12 @@ uint32_t partition_create(const char* name) {
             partition_owner_table[i].node_id      = cluster_local_node_id();
             partition_owner_table[i].active       = 1;
 
+            /* v0.2 §11 Q4: a partition is born bounded, at the mint and not in
+             * the create caller -- so every path that mints one (shell, HTTP,
+             * tenant_create) gets the same ceiling without having to remember
+             * it. The operator can still lift it by setting 0 explicitly. */
+            pq_born_bounded((uint32_t)i);
+
             kernel_serial_printf("[PARTITION] created '%s' (id=%u, owner node=%u).\n",
                                  name, (unsigned)i, (unsigned)partition_owner_table[i].node_id);
             persist_partitions();   // Phase 10 (now also covers partition_owner_table[], Phase 2)
@@ -120,6 +148,18 @@ uint32_t partition_create(const char* name) {
     }
     kernel_serial_print("[PARTITION] ERROR: partition table full.\n");
     return 0xFFFFFFFFu;
+}
+
+void partition_apply_conn_quota_defaults(void) {
+    /* The second way a partition comes into existence: persist_restore_all()
+     * writes partition_table[] directly, exactly the bypass the owner rows hit
+     * in Multi-Node Phase 2 (see that restore block's comment). Without this,
+     * every environment that survived a reboot would come back unbounded while
+     * a freshly created one was capped -- the two lifetimes disagreeing is
+     * worse than either rule alone. */
+    for (uint32_t i = 1; i < PARTITION_MAX; i++) {
+        if (partition_table[i].active) pq_born_bounded(i);
+    }
 }
 
 static int partition_id_valid(uint32_t partition_id) {
