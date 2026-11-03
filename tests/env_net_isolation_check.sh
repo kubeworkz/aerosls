@@ -98,7 +98,12 @@
 #       non-SYSTEM caller by name BEFORE the operation, and the five HTTP
 #       routes that reach them from kernel context require DB_ADMIN. 211 is
 #       included because an ungated assign can put a tenant's own uid into
-#       partition 0 — the gate's own door.
+#       partition 0 — the gate's own door;
+#   N21. the last two arms: 210 (create) and 218 (migrate) refuse a
+#       non-SYSTEM caller by name before the operation, and /api/partitions —
+#       the only route reaching 210, which had never been asserted —
+#       requires DB_ADMIN. With these, every partition-wide arm in the
+#       dispatcher asks the same question of its caller.
 #
 # ─── The live arm (--live) ────────────────────────────────────────────────
 #   L1. the created tenant environment's channel registers under the
@@ -632,6 +637,33 @@ for call in 'api_partition_quota_post(body_ptr, resp_body, (int)sizeof(resp_body
         bad "N20. net/http.c: a partition-lifecycle route does not pass req_role into its handler ($call) — the gate would read a parameter that was never threaded"
 done
 clause "$c20" N20 "only PARTITION_SYSTEM reaches the frame quota, assign, destroy, pause and resume (refused by name, before the operation), and their HTTP routes require DB_ADMIN"
+
+# ── N21. the last two: minting a partition, and moving one ───────────────
+# 210 and 218 were the remainder increment 7 recorded rather than closed.
+# Create is the arm with the most direct misuse: it claims a share of the
+# frame pool and a table slot every later operation looks up. Migrate is the
+# arm whose own guard covers the TARGET (PARTITION_SYSTEM never moves) and
+# not the CALLER — the pair is the same distinction partition_destroy()'s
+# SYSTEM refusal draws. With these two, every partition-wide arm in this
+# file asks the same question of its caller.
+c21=$fail
+for pair in 'PARTITION|create a partition|sys_sls_partition_create(' \
+            'PARTITION|migrate a partition|sys_sls_partition_migrate('; do
+    tag="${pair%%|*}"; rest="${pair#*|}"; what="${rest%%|*}"; op="${rest#*|}"
+    has "$SYSD" "partition_control_may_act(\"$tag\", \"$what\")" ||
+        bad "N21. kernel/syscall_dispatch.c: the '$what' arm no longer asks the control-plane helper — any ring-3 caller could do it"
+    order_ok "$SYSD" "partition_control_may_act(\"$tag\", \"$what\")" "$op" ||
+        bad "N21. kernel/syscall_dispatch.c: the '$what' check no longer precedes the operation — a refused caller would still reach it"
+done
+# /api/partitions is the only route that reaches 210 (migrate has no HTTP
+# surface); it has carried DB_ADMIN since it was written, and until now no
+# clause asserted that — so the route could have lost its gate unremarked.
+CREATE="$(fn_body "$HTTP" 'static int api_partition_create_post(')"
+hasstr "$CREATE" 'req_role > ROLE_DB_ADMIN' ||
+    bad "N21. net/http.c: /api/partitions no longer requires DB_ADMIN — an unauthenticated POST could mint a partition"
+has "$HTTP" 'api_partition_create_post(body_ptr, resp_body, (int)sizeof(resp_body), req_role)' ||
+    bad "N21. net/http.c: the /api/partitions route does not pass req_role into its handler — the gate would read a parameter that was never threaded"
+clause "$c21" N21 "only PARTITION_SYSTEM may mint or move a partition (refused by name, before the operation), and /api/partitions requires DB_ADMIN"
 
 # ── the live arm ──────────────────────────────────────────────────────────
 if [ "$LIVE" -eq 1 ]; then

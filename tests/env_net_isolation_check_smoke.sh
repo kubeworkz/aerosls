@@ -74,7 +74,17 @@
 #                              is no second copy of the gate to remove, and a
 #                              tooth that claimed to remove one would be
 #                              asserting against nothing.
-#   plus one tooth per clause — every other clause N1-N20 reddens when the
+#   P2_TOOTH=ungated-create / ungated-migrate — the last two partition-wide
+#                              arms (210, 218) lose their caller check; N21.
+#                              Create's tooth is the one that proves a tenant
+#                              cannot mint a partition, migrate's that it
+#                              cannot move one.
+#   P2_TOOTH=no-create-route-role — /api/partitions stops requiring DB_ADMIN.
+#                              That gate existed from the route's first
+#                              version but no clause asserted it until N21,
+#                              so this is the tooth that makes the claim
+#                              falsifiable rather than merely true.
+#   plus one tooth per clause — every other clause N1-N21 reddens when the
 #                              single property it carries is removed.
 #
 # ─── What a teeth smoke is for ─────────────────────────────────────────────
@@ -116,7 +126,7 @@ case "$TOOTH_SET" in
     ungated-storage-quota|no-cpuweight-role|no-storage-role|\
     ungated-frame-quota|ungated-assign|ungated-destroy|ungated-pause|\
     ungated-resume|no-frame-quota-role|no-assign-role|no-destroy-role|\
-    no-pause-role) ;;
+    no-pause-role|ungated-create|ungated-migrate|no-create-route-role) ;;
     *) echo "ABORT: unknown P2_TOOTH='$TOOTH_SET' — see this file's header for the list" >&2; exit 2 ;;
 esac
 want_tooth() { [ -z "$TOOTH_SET" ] || [ "$TOOTH_SET" = "$1" ]; }
@@ -628,6 +638,35 @@ if want_tooth no-pause-role; then
 $'static int api_partition_pause_post(const char* body, char* buf, int max, int resume,\n                                    SLSRole req_role) {\n    JSONBuf j = { buf, 0, max };\n    if (req_role > ROLE_DB_ADMIN) {' \
 $'static int api_partition_pause_post(const char* body, char* buf, int max, int resume,\n                                    SLSRole req_role) {\n    JSONBuf j = { buf, 0, max };\n    if (0 > 1) {   /* the role gate was removed */'
     tooth no-pause-role N20 "the pause/resume POST stops requiring DB_ADMIN (both routes share this handler)" "$W/npr"
+fi
+
+# N21. the last two partition-wide arms. Create is the one a tenant had the
+# most direct use for (a frame-pool share and a table slot), and migrate is
+# the one whose own guard covers its target rather than its caller — remove
+# either check and the arm answers a ring-3 caller again.
+if want_tooth ungated-create; then
+    seed "$W/ucr"
+    replace "$W/ucr/kernel/syscall_dispatch.c" \
+        'if (!partition_control_may_act("PARTITION", "create a partition"))' \
+        'if (0)   /* the create arm lost its caller check */'
+    tooth ungated-create N21 "the create arm stops checking the caller's partition" "$W/ucr"
+fi
+if want_tooth ungated-migrate; then
+    seed "$W/umg"
+    replace "$W/umg/kernel/syscall_dispatch.c" \
+        'if (!partition_control_may_act("PARTITION", "migrate a partition"))' \
+        'if (0)   /* the migrate arm lost its caller check */'
+    tooth ungated-migrate N21 "the migrate arm stops checking the caller's partition" "$W/umg"
+fi
+
+# N21. /api/partitions loses the gate it has always had — the clause that
+# asserted it is new here, so this tooth is what keeps that assertion honest.
+if want_tooth no-create-route-role; then
+    seed "$W/ncr"
+    replace "$W/ncr/net/http.c" \
+$'static int api_partition_create_post(const char* body, char* buf, int max, SLSRole req_role) {\n    JSONBuf j = { buf, 0, max };\n    if (req_role > ROLE_DB_ADMIN) {' \
+$'static int api_partition_create_post(const char* body, char* buf, int max, SLSRole req_role) {\n    JSONBuf j = { buf, 0, max };\n    if (0 > 1) {   /* the role gate was removed */'
+    tooth no-create-route-role N21 "/api/partitions stops requiring DB_ADMIN" "$W/ncr"
 fi
 
 # ── the vacuity control: the REAL tree must be GREEN ───────────────────────

@@ -58,21 +58,24 @@ static uint32_t spawn_owner_uid(void) {
  * ONE rule for every arm here that acts on a partition as a whole rather than
  * on the caller's own work: the budget setters — frame quota (213), CPU
  * weight (273), storage quota (275) and connection quota (277) — the
- * lifecycle operations — destroy (214), pause (215) and resume (216) — and
- * assign (211), which is here because it can put a caller inside partition 0
- * (see its own comment). A
- * caller in any partition but PARTITION_SYSTEM is refused BY NAME before the
- * action runs, so a tenant can neither raise its own ceiling, lower a
- * neighbour's, nor freeze, resume or destroy a partition. Kernel context (no
- * current process) is the control plane's own path — the HTTP routes reach
- * these operations directly — and those routes carry DB_ADMIN instead, the
- * gate their sibling partition routes already had.
+ * lifecycle operations — create (210), assign (211), destroy (214), pause
+ * (215) and resume (216) — and cold migration (218). Assign and create are
+ * here because they decide which partition a caller's NEXT process lands in
+ * (see their own comments); the rest act on a partition's existence, schedule
+ * or resources. A caller in any partition but PARTITION_SYSTEM is refused BY
+ * NAME before the action runs, so a tenant can neither raise its own ceiling,
+ * lower a neighbour's, mint or move a partition, nor freeze, resume or
+ * destroy one. Kernel context (no current process) is the control plane's own
+ * path — the HTTP routes reach these operations directly — and those routes
+ * carry DB_ADMIN instead, the gate their sibling partition routes already
+ * had.
  *
  * The rule arrived one finding at a time: 277 shipped with no caller check at
  * all, which made §11 Q4's new default decorative; 273/275 had the same
- * absence; 213 and 214-216 had it again. Each increment named the remainder
- * rather than fixing it, and three names for one rule is how copies drift
- * apart — a ninth partition-wide operation has one obvious place to join.
+ * absence; 213 and 214-216 had it again; 210 and 218 were the last two, and
+ * closing them is why this comment can now say "every arm" rather than
+ * listing what is still open. Three names for one rule is how copies drift
+ * apart — an eleventh partition-wide operation has one obvious place to join.
  *
  * PARTITION_SYSTEM and PARTITION_DEFAULT are both 0, so this reads "partition
  * 0 may", not "uid 0 may": a process whose uid was never assigned resolves to
@@ -1134,6 +1137,15 @@ uint64_t do_syscall(uint64_t num, void* arg) {
 
     // ── Phase 8: LPAR groundwork (210–212) ────────────────────────────────────
     case SYS_SLS_PARTITION_CREATE:
+        // The last arm of this group to be gated, and the one a tenant had the
+        // most direct use for: minting a partition is claiming a share of the
+        // frame pool and a slot in the table every later operation looks up.
+        // Refused with the arm's OWN failure sentinel (0xFFFFFFFF), not EPERM:
+        // this syscall returns a partition id, and create's callers already
+        // branch on that sentinel — a refusal has to look like the failure the
+        // call site knows how to report. The line above it carries the reason.
+        if (!partition_control_may_act("PARTITION", "create a partition"))
+            return 0xFFFFFFFFu;
         return sys_sls_partition_create((struct SLSPartitionCreateRequest*)arg);
     case SYS_SLS_PARTITION_ASSIGN:
         // Not in the lifecycle group below, but the same rule and the reason
@@ -1186,7 +1198,14 @@ uint64_t do_syscall(uint64_t num, void* arg) {
         return sys_sls_partition_resume((uint32_t)(uintptr_t)arg);
 
     // ── Multi-Node Partition Scaling Roadmap, Phase 6: cold migration (218) ──
+    // Same rule: moving a partition to another node is an operator's decision
+    // about where a tenant lives, and partition_migrate()'s own guard covers
+    // the TARGET (PARTITION_SYSTEM never migrates) — this one covers the
+    // CALLER. The kernel's failover and environment-migration paths call
+    // partition_migrate() directly and are unaffected by construction.
     case SYS_SLS_PARTITION_MIGRATE:
+        if (!partition_control_may_act("PARTITION", "migrate a partition"))
+            return (uint64_t)(int64_t)CAP_EPERM;
         return sys_sls_partition_migrate((struct SLSPartitionMigrateRequest*)arg);
 
     // ── Multi-Node Partition Scaling Roadmap, Phase 7 addendum: operator-
