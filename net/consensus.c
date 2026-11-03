@@ -106,6 +106,7 @@ int cluster_init(uint32_t local_node_id) {
     local_cluster_state.role                    = ROLE_FOLLOWER;
     local_cluster_state.last_heartbeat_tick     = 0;
     local_cluster_state.last_beat_sent_tick     = 0;
+    local_cluster_state.last_liveness_sent_tick = 0;
     local_cluster_state.accumulated_votes       = 1;   /* self */
     s_leader_id                                = 0;   /* nobody known yet */
 
@@ -331,6 +332,33 @@ void check_consensus_heartbeat_tick(uint64_t now) {
          * A node that has never heard anything has last_heartbeat_tick 0,
          * so on a freshly booted node this elapses from boot -- which is
          * the intent: nobody is leading, somebody should campaign. */
+
+        /* The liveness beat (DSPP_CMD_LIVENESS) -- the half the failover
+         * death-watch was missing. The LEADER's heartbeat branch above is
+         * the only other frame that feeds failover_note_heartbeat(), so a
+         * demoted leader's watch entry on every peer aged to a DEAD
+         * declaration while it sat there alive, serving (live 3-node find,
+         * 2026-10-24: declared 301 ticks after its intent release, because
+         * a follower transmits nothing else). Every non-leader now proves
+         * existence at its own rate limit instead.
+         *
+         * Pumped mid-block like every other stream on the sweep --
+         * failover_sweep_keepalive() calls this function, and it calls the
+         * SAME branch a follower actually runs, so a blocked pour keeps
+         * beating too. */
+        if (now - local_cluster_state.last_liveness_sent_tick >=
+            LIVENESS_BEAT_TICKS) {
+            local_cluster_state.last_liveness_sent_tick = now;
+
+            struct DSPPPacketHeader lb;
+            lb.magic = DSPP_MAGIC;
+            lb.opcode = DSPP_CMD_LIVENESS;
+            lb.node_source_id = (uint16_t)local_cluster_state.node_id;
+            lb.transaction_id = local_cluster_state.current_term;
+
+            dspp_transmit_raw(&lb, sizeof(lb));
+        }
+
         uint64_t silent_for = now - local_cluster_state.last_heartbeat_tick;
 
         if (silent_for > consensus_election_timeout(local_cluster_state.node_id)) {
@@ -396,15 +424,32 @@ void process_consensus_packet(struct DSPPFullPagePacket* packet, uint64_t now) {
      * roster -- the early returns below would otherwise skip it. */
     cluster_note_peer_seen((uint32_t)packet->header.node_source_id);
 
+    if (packet->header.opcode == DSPP_CMD_LIVENESS) {
+        /* A non-leader's existence proof (see DSPP_CMD_LIVENESS in
+         * consensus.h). Noted for failover first, exactly like the
+         * HEARTBEAT arm below -- and then returned from WITHOUT touching
+         * last_heartbeat_tick, s_leader_id, the term or the role. These
+         * frames come from nodes that are explicitly not leader: letting
+         * them reset the election watchdog would mean follower chatter
+         * keeps a dead leader's authority alive (no campaign ever fires
+         * once followers beat at each other), and letting a high term on
+         * one adopt authority would hand a follower a crown by comment.
+         * Liveness without authority is the entire difference from the
+         * branch below. */
+        failover_note_heartbeat((uint32_t)packet->header.node_source_id, now);
+        return;
+    }
+
     if (packet->header.opcode == DSPP_CMD_HEARTBEAT) {
         uint32_t hb_term = packet->header.transaction_id;
         /* Liveness for the failover subsystem, noted BEFORE the stale-term
          * return for the same reason cluster_note_peer_seen() runs at the
          * top of this function: a stale-term heartbeat is still a node
-         * provably talking. The leader is the only heartbeat sender, so
-         * followers track the leader here; when it dies, the silence is
-         * what failover_tick() (net/http.c BSP sweep) turns into a DEAD
-         * declaration after FAILOVER_DEAD_TICKS. */
+         * provably talking. A leader is the only HEARTBEAT sender, so
+         * this arm tracks the leader; every non-leader is tracked by
+         * DSPP_CMD_LIVENESS above, and failover_tick() (net/http.c BSP
+         * sweep) turns silence from either source into a DEAD declaration
+         * after FAILOVER_DEAD_TICKS. */
         failover_note_heartbeat((uint32_t)packet->header.node_source_id, now);
         if (hb_term < local_cluster_state.current_term) return;   /* stale */
 

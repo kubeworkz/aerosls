@@ -1,0 +1,150 @@
+E7 gate - the teeth (increment 22). 2026-11-01.
+image:    sls_operating_system_e3_teeth.iso - make x86-iso-e3 E3_INIT_FEATURES=e3_envs,e7_gate
+          E7_TOOTH=1 E7_SLOW_BOOT=0 (the only build carrying the three arms)
+machine:  qemu-system-x86_64 -m 1G -smp 2 -accel tcg,thread=multi, 10 GiB NVMe
+invocation: tests/e7_gate_check.sh --teeth  (E7G_BUILD=0 reuses the image above)
+one capture (boot 1) then FOUR replays, each over its OWN sparse copy of the
+post-checkpoint image: control (no tooth), descriptor, no-fd, no-heap. Boot 2
+mutates the image it runs on, so a replay that has to be repeated gets a fresh
+copy; this invocation needed no repeat (`note:` lines would say so, and a pour
+that refuses every attempt fails the run rather than being retried away).
+Each recording is also --replay-able on its own (facts carries tooth=<name>,
+and the harness validates it under that expectation). The `--- key lines` under
+each recording are the transcript lines its clauses read, in the order they
+appear in the serial transcript (kernel and tenant share one line stream, so a
+merged line is two writers and not a reordering); the full boot2.log of each
+replay stays in the run's artifact directory.
+
+ok:   G1. the drill is a build-time feature (sidecar Cargo + Makefile knob) whose stretch runs in the gate profile between staging (line 602) and the tenant spawn (line 620)
+ok:   G2. the wait is bounded by EP_WAIT_TICKS (stall, restarted by progress) and EP_WAIT_CEIL_TICKS (absolute), and its progress signal is ProcessDescriptor.switches, bumped at proc_build_resume_frame
+ok:   G3. the wait reports crossing the old fixed bound once, only while the window is still open (progress restarted it), and names how many of the record's sidecars are RUNNING at that instant
+ok:   G4. the gate tenant is the designated 9-entry command line over the 512 KiB staged image, and the checkpoint's stop is the copy continuation at 196608
+ok:   G5. the restore pass waits before the repause and pours after it, and the route reports payloads and payload_skips by name
+ok:   G6. the teeth are a build-time profile (E7_TOOTH -> AB_DEFS, default off) selected per restore and refused by name elsewhere; all three arms land on the shipped refusals (dropped record, EBADF lookup, unmapped destination), guarded by 11 E7G_TOOTH conditions
+
+=== boot 1: create, workload to the stop, checkpoint ===
+up(one): control plane on 32001
+  [api] -X POST -d {"name":"e7gate"} http://127.0.0.1:32001/api/partitions -> HTTP 200 (body: {"ok":"true","partition_id":1})
+partition=1
+  [api] -X POST -d {"index":1} http://127.0.0.1:32001/api/partition/1/env -> HTTP 200 (body: {"ok":"true","env_id":1,"partition":1})
+create: {"ok":"true","env_id":1,"partition":1}
+[E7-GATE] held at the copy continuation: pid=105 'e7.gate.user.0' src_off=196608 rip=0x8057ab7 rsp=0x4000000a9778 ret=1024 -- the next read is the one the payload resumes INTO
+--- reads before the stop:
+[E7-GATE] read off=0002EC00 
+[E7-GATE] read off=0002F000 
+[E7-GATE] read off=0002F400 
+[E7-GATE] read off=0002F800 
+[E7-GATE] read off=0002FC00 
+  [api] -X POST http://127.0.0.1:32001/api/checkpoint -> HTTP 200 (body: {"status":0,"seq":1,"count":1})
+checkpoint: {"status":0,"seq":1,"count":1}
+[ENV_PAYLOAD] capture: task 0 'drv.ramdisk.1' kind=1 form=1 park_syscall=311 nchans=3 user_rip=0x400000000000 user_rsp=0x40000001cff0
+[ENV_PAYLOAD] capture: task 1 'aerosls.posix.1' kind=0 form=1 park_syscall=311 nchans=3 user_rip=0x400000000000 user_rsp=0x400000140ff0
+[ENV_PAYLOAD] capture: task 2 'e7.gate.user.0' kind=2 form=3 park_syscall=0 nchans=0 user_rip=0x8057ab7 user_rsp=0x4000000a9778
+=== power off (the checkpoint is on the NVMe image) ===
+
+===== control (facts)
+  drill=0
+  iso=sls_operating_system_e3_teeth.iso
+  payloads=1
+  payload_skips=0
+  tooth=none
+  partition=1
+  --- key lines:
+[ENV_PAYLOAD] linux task 'e7.gate.user.0' adopted at rip=0x8057ab7 rsp=0x4000000a9778 fs_base=0x807c208 brk=0x4000000ad000 mtop=0x4000000d8000 form=3 held=1 stop=spent
+[E7-GATE] read off=00030000 
+[E7-GATE] read off=00030400 
+[backup] Done: /tmp/e7-census/backups/hourly/sls_storage-20260107-000000.img (524288 bytes, 504 sparse holes, 4 kept)
+[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=118 |[backup] Done: /tmp/e7-c|
+[E7] linux: num=000000E7 child=e7.gate.user.0 exit_group status=0
+[TORE] address space 0x0000000012927000 destroyed: 172 frame(s) freed
+
+
+===== descriptor (facts)
+  drill=0
+  iso=sls_operating_system_e3_teeth.iso
+  payloads=1
+  payload_skips=0
+  tooth=descriptor
+  partition=1
+  --- key lines:
+[E7-GATE] tooth descriptor: the payload's linux task 'e7.gate.user.0' (task 2) is DROPPED -- no record, no pages, no context; the sidecars pour as usual
+[E7-GATE] read off=00000000 
+[E7-GATE] read off=00000400 
+[backup] Copying /tmp/e7-census/sls_storage.img -> /tmp/e7-census/backups/hourly
+[INIT] heartbeat 71[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=81 |[backup] Copying /tmp/e7|
+[backup] Done: /tmp/e7-census/backups/hourly/sls_storage-20260107-000000.img (524288 bytes, 504 sparse holes, 4 kept)
+[E7] linux: num=000000E7 child=e7.gate.user.0 exit_group status=0
+[TORE] address space 0x0000000012927000 destroyed: 172 frame(s) freed
+
+
+===== no-fd (facts)
+  drill=0
+  iso=sls_operating_system_e3_teeth.iso
+  payloads=1
+  payload_skips=0
+  tooth=no-fd
+  partition=1
+  --- key lines:
+[E7-GATE] tooth no-fd: the continuation's read(fd 3) is forwarded as fd 120, which the sidecar's table does not carry -- the real lookup answers EBADF
+[ENV_PAYLOAD] linux task 'e7.gate.user.0' adopted at rip=0x8057ab7 rsp=0x4000000a9778 fs_base=0x807c208 brk=0x4000000ad000 mtop=0x4000000d8000 form=3 held=1 stop=spent
+[backup] FAILED: [E7] linux: num=00000001 child=e7.gate.user.0 write ok len=17 |[backup] FAILED: |
+Bad file descriptor[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=19 |Bad file descriptor|
+[E7] linux: num=000000E7 child=e7.gate.user.0 exit_group status=1
+[TORE] address space 0x0000000012927000 destroyed: 168 frame(s) freed
+
+
+===== no-heap (facts)
+  drill=0
+  iso=sls_operating_system_e3_teeth.iso
+  payloads=1
+  payload_skips=0
+  tooth=no-heap
+  partition=1
+  --- key lines:
+[E7-GATE] tooth no-heap: the reply destination page 0x4000000d8000 (the child's copy buffer) is unmapped before the read is forwarded -- the deliver's checked copy answers EFAULT while this kernel doe
+[ENV_PAYLOAD] linux task 'e7.gate.user.0' adopted at rip=0x8057ab7 rsp=0x4000000a9778 fs_base=0x807c208 brk=0x4000000ad000 mtop=0x4000000d8000 form=3 held=1 stop=spent
+[E7-GATE] read off=00030000 
+[FAULT] Ring-3 #PF  error=0x4  addr=0x00004000000d803d  rip=0x0000000008052f39  rdi=0x00004000000d8040 — killing process.
+[TORE] address space 0x0000000012927000 destroyed: 167 frame(s) freed
+
+=== teeth clauses (each recording is reusable with --replay) ===
+--- control
+ok:   B1. the replay landed the payload (payloads=1, payload_skips=0) — the contents came back, they were not withheld or refused by name
+ok:   B2. the Linux tenant was adopted from the captured context (form=3, stop=spent) — not restarted at _start, and the one-shot stop was spent by the pour
+ok:   B3. the resumed copy's FIRST read is at the captured source offset (off=0x30000) — the task continued from the stop, it did not re-enter the copy
+ok:   B4. exactly the resumed workload completed: no second [backup] Copying, at least one [backup] Done:
+ok:   B5. no [FAULT] in the replay boot
+ok:   B6. the tenant's exit tore its address space down (frame(s) freed) — the resumed descriptors and heap were returned, not leaked
+ok:   D1. the drill clauses are not applicable: the recording says drill=0 (the plain gate image)
+--- descriptor
+--- tooth 'descriptor': this recording is EXPECTED to redden [B2 B3 B4] and to leave every other clause green
+ok:   B1. the replay landed the payload (payloads=1, payload_skips=0) — the contents came back, they were not withheld or refused by name
+red:  B2. no adopted-context line for the tenant (form=3, stop=spent) — the replay either lost the task or left its stop armed
+red:  B3. the first read after the restore is at off=0x00000000, not the captured 0x30000 — the copy resumed at the beginning of the file, not at the stop
+red:  B4. the workload did not resume cleanly (Copying=2, Done=2) — a second Copying is a restart, and no Done is an unfinished gate
+ok:   B5. no [FAULT] in the replay boot
+ok:   B6. the tenant's exit tore its address space down (frame(s) freed) — the resumed descriptors and heap were returned, not leaked
+ok:   D1. the drill clauses are not applicable: the recording says drill=0 (the plain gate image)
+ok:   T. the kernel's own line names the break ('[E7-GATE] tooth descriptor: ... is DROPPED'), and the reds above are its consequences
+--- no-fd
+--- tooth 'no-fd': this recording is EXPECTED to redden [B3 B4] and to leave every other clause green
+ok:   B1. the replay landed the payload (payloads=1, payload_skips=0) — the contents came back, they were not withheld or refused by name
+ok:   B2. the Linux tenant was adopted from the captured context (form=3, stop=spent) — not restarted at _start, and the one-shot stop was spent by the pour
+red:  B3. no read reached the file class after the restore — the resumed task never issued the continuation (the forward was refused before it, or the task never ran)
+red:  B4. the workload did not resume cleanly (Copying=0, Done=0) — a second Copying is a restart, and no Done is an unfinished gate
+ok:   B5. no [FAULT] in the replay boot
+ok:   B6. the tenant's exit tore its address space down (frame(s) freed) — the resumed descriptors and heap were returned, not leaked
+ok:   D1. the drill clauses are not applicable: the recording says drill=0 (the plain gate image)
+ok:   T. the forward names the substituted descriptor and the tenant's own error names EBADF ('Bad file descriptor')
+--- no-heap
+--- tooth 'no-heap': this recording is EXPECTED to redden [B4 B5] and to leave every other clause green
+ok:   B1. the replay landed the payload (payloads=1, payload_skips=0) — the contents came back, they were not withheld or refused by name
+ok:   B2. the Linux tenant was adopted from the captured context (form=3, stop=spent) — not restarted at _start, and the one-shot stop was spent by the pour
+ok:   B3. the resumed copy's FIRST read is at the captured source offset (off=0x30000) — the task continued from the stop, it did not re-enter the copy
+red:  B4. the workload did not resume cleanly (Copying=0, Done=0) — a second Copying is a restart, and no Done is an unfinished gate
+red:  B5. 2 [FAULT] line(s) in the replay boot — the resumed tenant (or its sidecars) faulted
+ok:   B6. the tenant's exit tore its address space down (frame(s) freed) — the resumed descriptors and heap were returned, not leaked
+ok:   D1. the drill clauses are not applicable: the recording says drill=0 (the plain gate image)
+ok:   T. the forward names the withheld page 0x4000000d8000 and the tenant's free of its 64 KiB buffer faults inside it (addr=0x00004000000d803d) — the deliver refused the bytes, the hole is the tenant's own
+e7_gate_check: the teeth redden by name — 7 clause(s) red across descriptor/no-fd/no-heap, each exactly where its tooth says, the control green; artifacts in /tmp/e7-teeth
+TEETH_EXIT=0

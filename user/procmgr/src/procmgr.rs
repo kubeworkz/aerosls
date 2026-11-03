@@ -51,6 +51,7 @@ use alloc::string::ToString;
 use alloc::vec::Vec;
 
 use aerosls_proto::kabi::Kernel;
+use aerosls_proto::catalops::CatalogOps;
 use aerosls_proto::sockops::SocketOps;
 use aerosls_vfs::{BufferAlloc, Errno, PollFd, SelectFdSet, SelectResult, TIOCSCTTY, Vfs, CLONE_FILES, O_RDONLY, AF_UNIX};
 
@@ -342,6 +343,12 @@ pub struct ProcManager<K: Kernel, A: BufferAlloc> {
     /// Optional network driver client for socket I/O. Set after boot
     /// when a network channel is available.
     pub net: Option<Box<dyn SocketOps>>,
+    /// Optional catalog client for §9.1's mediated, read-only view of the
+    /// object catalog. Set after boot when the manifest named the
+    /// `catalog` cap (peer `kernel.env.catalog`). Trait object for the
+    /// same reason `net` is one: this crate must not depend on the crate
+    /// that implements the wire.
+    pub catalog: Option<Box<dyn CatalogOps>>,
 }
 
 /// The execution context handed to a program's step: the manager, the
@@ -362,12 +369,21 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
             run: VecDeque::new(),
             applets: BTreeMap::new(),
             net: None,
+            catalog: None,
         }
     }
 
     /// Install a network driver client after boot.
     pub fn set_net(&mut self, net: Box<dyn SocketOps>) {
         self.net = Some(net);
+    }
+
+    /// Install the catalog client after boot (§9.1). A manifest without a
+    /// `catalog` cap leaves this `None`, and `ctx.catalog()` then answers
+    /// `None` — an applet reports "no catalog" rather than failing to
+    /// start, the same way `netcheck` reports a missing network channel.
+    pub fn set_catalog(&mut self, catalog: Box<dyn CatalogOps>) {
+        self.catalog = Some(catalog);
     }
 
     /// Register task 0 (the VFS's initial task) as init, with `program`.
@@ -1247,6 +1263,13 @@ impl<'a, K: Kernel, A: BufferAlloc> Ctx<'a, K, A> {
     /// Access the network driver client (if one was installed at boot).
     pub fn net(&mut self) -> Option<&mut Box<dyn SocketOps>> {
         self.pm.net.as_mut()
+    }
+
+    /// Access the catalog client (if the manifest declared the `catalog`
+    /// cap and boot installed one) — §9.1's four verbs, reached from any
+    /// task including fork children, exactly as `ctx.net()` is reached.
+    pub fn catalog(&mut self) -> Option<&mut Box<dyn CatalogOps>> {
+        self.pm.catalog.as_mut()
     }
 
     /// Set a socket option (delegates to the network driver).

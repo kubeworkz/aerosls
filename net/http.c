@@ -50,6 +50,7 @@
 #include "../kernel/frame_pool.h" // Gap Remediation Phase F -- GET /api/partition/quotas, POST /api/partition/quota
 #include "../kernel/storage_quota.h" // Storage Isolation Roadmap Phase 1 -- GET /api/partition/storagequotas, POST /api/partition/storagequota
 #include "../kernel/env_service.h"  // POSIX-Environments E4 -- POST /api/partition/{id}/env
+#include "../kernel/env_payload.h"  // E7 inc. 22 -- the gate teeth's names, and the build gate
 #include "../kernel/env_console.h"  // POSIX-Environments E6 -- attach to an environment's console
 #include "../kernel/env_proto.h"    // POSIX-Environments E4 -- ENV_* status codes
 #include "../kernel/env_migrate.h"  // POSIX-Environments P3 increment 4 -- staged-slot restore tick
@@ -3177,8 +3178,35 @@ static int api_env_restore_post(char* buf, int max, SLSRole req_role,
         with_payload = 0;
     env_service_set_restore_payload(with_payload);
 
+    /* E7 increment 22: the gate's TEETH (tests/e7_gate_check.sh --teeth).
+     * A body may name the break this replay injects into the gate tenant —
+     * one of env_payload.h's three. The name is refused BY NAME on every
+     * build that is not a teeth build (`make ... E7_TOOTH=1`), and a typo is
+     * refused too, so a request can neither arm a shipped kernel nor
+     * silently fall back to the control and look green. */
+    int tooth = ENV_PAYLOAD_TOOTH_NONE;
+    {
+        char tname[24];
+        tname[0] = '\0';
+        if (body) (void)json_str(body, "tooth", tname, (int)sizeof(tname));
+        if (tname[0]) {
+            int t = env_payload_tooth_from_name(tname);
+            if (t < 0 || !env_payload_build_has_teeth()) {
+                jb_obj_open(&j,0); jb_str(&j,"ok","false"); jb_putc(&j,',');
+                jb_str(&j,"error", t < 0
+                                  ? "unknown tooth (descriptor|no-fd|no-heap)"
+                                  : "this image was not built with the gate teeth");
+                jb_putc(&j,','); jb_str(&j,"tooth",tname);
+                jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+            }
+            tooth = t;
+        }
+    }
+    env_service_set_restore_tooth(tooth);
+
     struct EnvSvcRestoreReport rep;
     int rc = env_service_restore_pending(&rep);
+    env_service_set_restore_tooth(ENV_PAYLOAD_TOOTH_NONE);
 
     jb_obj_open(&j,0);
     if (rc != 0) {
@@ -3196,7 +3224,11 @@ static int api_env_restore_post(char* buf, int max, SLSRole req_role,
         jb_uint(&j,"resumed", rep.n_resumed); jb_putc(&j,',');
         jb_uint(&j,"repaused", rep.n_repaused); jb_putc(&j,',');
         jb_uint(&j,"payloads", rep.n_payloads); jb_putc(&j,',');
-        jb_uint(&j,"payload_skips", rep.n_payload_skips);
+        jb_uint(&j,"payload_skips", rep.n_payload_skips); jb_putc(&j,',');
+        /* E7 increment 22: the recording is self-describing — a recorded
+         * tooth run is re-validated with the expectation it was run under,
+         * never against the green set it was made to redden. */
+        jb_str(&j,"tooth", env_payload_tooth_name(tooth));
     }
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }

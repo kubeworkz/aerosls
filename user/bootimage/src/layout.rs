@@ -232,6 +232,10 @@ pub struct BootImageSpec {
     pub net_entry: u64,
     /// Entry-point offset within the e1000 driver binary.
     pub e1000_entry: u64,
+    /// Write the gate image's quiet /etc/init.rc (no demo applets).
+    /// False for every shipped and E3-default build; only the E7 gate
+    /// image sets it, from the build line's `--quiet-init`.
+    pub quiet_init: bool,
 }
 
 impl BootImageSpec {
@@ -266,6 +270,7 @@ impl BootImageSpec {
             ramdisk_entry: 0,
             net_entry: 0,
             e1000_entry: 0,
+            quiet_init: false,
         }
     }
 }
@@ -313,7 +318,9 @@ mod tests {
     use super::*;
 
     fn spec() -> BootImageSpec {
-        BootImageSpec::new(vec![0xAA; 0x2000], vec![0xBB; 0x4000], vec![0xCC; 0x8000], vec![0xDD; 0x1000], vec![0xEE; 0x1000], vec![0xEF; 0x2000])
+        let mut s = BootImageSpec::new(vec![0xAA; 0x2000], vec![0xBB; 0x4000], vec![0xCC; 0x8000], vec![0xDD; 0x1000], vec![0xEE; 0x1000], vec![0xEF; 0x2000]);
+        s.quiet_init = false;
+        s
     }
 
     #[test]

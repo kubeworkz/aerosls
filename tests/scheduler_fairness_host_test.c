@@ -556,6 +556,66 @@ int main(void) {
     CHECK(f10[9] == (uint64_t)&proc_table[4], "scenario 10: the frame's rdi carries 104's own descriptor (cap_recv_resume's argument)");
     CHECK(proc_table[4].resume_kernel == 0, "scenario 10: building the resume frame consumed resume_kernel — a second build falls back to ring3_ctx, so the flag cannot double-fire");
 
+    /* ── Scenario 11 (the stale pause bit): pause is PER-SLOT runtime state,
+     * so every path that installs or removes a row has to own it, or a
+     * reused id is born paused. Measured on a live cluster: the migration
+     * destination is left paused BY DESIGN (env_migrate.c), that partition
+     * was then destroyed and the id reused by a brand-new one, and the node
+     * refused every `env create` for the new partition with the kernel's own
+     * `[ALLOC_REGION] CAP_EPERM: target partition 1 is paused — cannot charge
+     * it` — while the shell boundary reported the same refusal as `frame pool
+     * exhausted`, because ENV_ERR_NOMEM is what env_manager maps any charge
+     * failure to. partition_destroy() already cleared the bit on the node
+     * running it; the four paths below did not.
+     *
+     * LAST, deliberately: it drives a real partition_destroy(), which kills
+     * every process in that partition — run before scenario 10's frame
+     * checks it would take 103/104 out from under them.
+     *
+     * Real partition_sync_upsert/_withdraw/_ownedset and
+     * partition_create() from the linked kernel/partition.c, driven with the
+     * arguments dspp.c's RX path actually uses (source == owner, since this
+     * test stubs cluster_local_node_id()/cluster_leader_id() to 0). ─────── */
+    partition_init();
+
+    partition_sync_upsert(11, 2, "learned-a", 2);
+    CHECK(partition_exists(11), "scenario 11: the announce apply creates the row (owner node 2, source node 2)");
+    CHECK(partition_pause(11) == 0, "scenario 11: pausing the live partition succeeds");
+    CHECK(partition_is_paused(11) == 1, "scenario 11: it reads paused while it is paused");
+
+    partition_sync_withdraw(11, 2);
+    CHECK(!partition_exists(11), "scenario 11: the owner's withdraw removes the row");
+    CHECK(partition_is_paused(11) == 0, "scenario 11: WITHDRAW clears the pause bit — a slot with no partition in it cannot still be paused");
+
+    partition_sync_upsert(11, 2, "learned-b", 2);
+    CHECK(partition_exists(11), "scenario 11: a later announce re-creates the id");
+    CHECK(partition_is_paused(11) == 0, "scenario 11: the partition that reuses id 11 is born RUNNING — it inherits nothing from the partition that used to occupy the slot (the live cluster failure)");
+
+    /* The bit must survive a re-announce of a row this node ALREADY has:
+     * the periodic re-announce fires every ~10s, so clearing on every
+     * upsert would silently resume whatever an operator paused. */
+    CHECK(partition_pause(11) == 0, "scenario 11: pausing it again succeeds");
+    partition_sync_upsert(11, 2, "learned-b", 2);
+    CHECK(partition_is_paused(11) == 1, "scenario 11: a re-announce of an EXISTING row leaves the operator's pause alone — otherwise every periodic re-announce would resume it");
+
+    partition_sync_ownedset(2, 1, NULL, 0);   /* node 2's complete owned set is empty -> id 11 is stale */
+    CHECK(!partition_exists(11), "scenario 11: the owned-set GC collects a row the source no longer owns");
+    CHECK(partition_is_paused(11) == 0, "scenario 11: the GC'd slot's pause bit leaves with the row too");
+
+    /* The exact shape a follower was left in BEFORE this fix, reached
+     * directly: a row deactivated without the destroy bookkeeping running
+     * (the pre-fix withdraw), then partition_create() taking that slot. */
+    uint32_t stale_slot = partition_create("pre-fix-leftover");
+    CHECK(stale_slot == 1, "scenario 11: the lowest free slot after the sweep is 1, so the stale-bit reuse is exercised there");
+    CHECK(partition_pause(stale_slot) == 0, "scenario 11: pausing it succeeds");
+    partition_table[stale_slot].active = 0;   /* pre-fix withdraw: row gone, bit left set */
+    CHECK(partition_is_paused(stale_slot) == 1, "scenario 11: the pre-condition is real — the slot is free but its pause bit is still set");
+    uint32_t fresh11 = partition_create("local-reuse");
+    CHECK(fresh11 == stale_slot, "scenario 11: partition_create takes the free slot that still carries the stale bit");
+    CHECK(partition_is_paused(fresh11) == 0, "scenario 11: taking that slot clears the inherited pause — a locally created partition is never born paused");
+    CHECK(partition_destroy(fresh11) == 0, "scenario 11: the reused partition destroys cleanly");
+    CHECK(partition_is_paused(fresh11) == 0, "scenario 11: destroy leaves the slot's bit clear for whoever lands there next");
+
     printf("\n%s\n", g_fail == 0 ? "ALL CHECKS PASSED" : "SOME CHECKS FAILED");
     return g_fail == 0 ? 0 : 1;
 }

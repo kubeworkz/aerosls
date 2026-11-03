@@ -16,6 +16,7 @@
 #include "workload.h"            // Orchestration Plan Phase 5
 #include "frame_pool.h"
 #include "storage_quota.h"   // Storage Isolation Roadmap Phase 1 -- SYS_SLS_PARTITION_STORAGE_QUOTA_SET/LIST
+#include "env_payload.h"     // E7 inc. 22: the gate teeth's codes (E7G_TOOTH compiles the arms out)
 #include "env_storage.h"     // POSIX-Environments Roadmap v0.2 Phase P1b -- durable environment stores
 #include "../net/tcp_quota.h" // Network Fairness Phase 2 -- SYS_SLS_PARTITION_CONN_QUOTA_SET/LIST
 #include "sql_exec.h"
@@ -132,6 +133,21 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                                    (uint64_t)(uintptr_t)arg);
                     cur->park_syscall = 0;  /* in-flight closes HERE — the
                                             * next stray refuses again */
+                    /* E7 increment 21: the gate workload's stop, at the
+                     * sysret that closes a read(fd 3). `rax` is the value
+                     * the sysret will deliver and park_ctx is the read's own
+                     * entry frame, so this is the instant B9 names — after
+                     * the reply is applied, before the next trap. The count
+                     * is the bytes the REPLIES declared, not a chunk shape:
+                     * the sidecar's 1 KiB granularity and the libc's 64 KiB
+                     * request reach the same offset. */
+                    if (cur->gate_read_pending) {
+                        cur->gate_read_pending = 0;
+                        if ((int64_t)rax > 0)
+                            cur->gate_bytes += (uint32_t)rax;
+                        if (cur->gate_bytes >= PROC_GATE_SRC_OFF)
+                            (void)proc_gate_stop_at_sysret(rax);
+                    }
                     /* E7 §5.3 apply half: the granted ARCH_SET_FS lands
                      * HERE — at the reply, inside this task's own trap,
                      * before the return below reaches the sysret into the
@@ -422,11 +438,60 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                  * — 8-aligned so k_linux_forward can read the header as a
                  * struct without a copy of its own. */
                 uint64_t fwd_words[(sizeof(struct SLSLinuxSyscallRequest)
-                                    + LINUX_FD_WRITE_CHUNK + 7u) / 8u];
+                                    + LINUX_FWD_ATTACH_CAP + 7u) / 8u];
                 uint8_t *fwd = (uint8_t *)fwd_words;
                 uint32_t fwd_len = (uint32_t)sizeof(struct SLSLinuxSyscallRequest);
                 int status;
                 proc_read_linux_args(largs);
+#if E7G_TOOTH
+                /* E7 increment 22 (tests/e7_gate_check.sh --teeth): the two
+                 * forward-path teeth, armed on the descriptor the pour
+                 * adopted and selected only by a teeth build's restore body.
+                 *
+                 * Both aim at the FIRST read after the console's stop — the
+                 * continuation — and both break something the shipped path
+                 * already handles by name, so the failure is one of the
+                 * gate's own refusals rather than a kernel fault:
+                 *
+                 *   no-fd    the descriptor the read names is replaced by one
+                 *            the sidecar's table does not carry, so the REAL
+                 *            lookup misses and answers -EBADF. The read never
+                 *            reaches the VFS: no offset line, no Done.
+                 *   no-heap  the reply's destination page — the child's own
+                 *            copy buffer — is unmapped just before the
+                 *            forward, so the sidecar's bytes arrive and the
+                 *            deliver's checked copy refuses them -EFAULT (the
+                 *            kernel does not fault). The read WAS issued at
+                 *            the captured offset, which is the signature that
+                 *            differs from no-fd. The tenant's own unwind then
+                 *            frees that 64 KiB buffer, and the allocator's
+                 *            header lives in the page's last bytes, so ITS
+                 *            #PF lands inside the withheld page — the address
+                 *            the check harness matches against this line. */
+                if (cur->tooth && num == LINUX_READ) {
+                    if (cur->tooth == ENV_PAYLOAD_TOOTH_NO_FD) {
+                        kernel_serial_printf(
+                            "[E7-GATE] tooth no-fd: the continuation's read"
+                            "(fd %lu) is forwarded as fd %u, which the sidecar's "
+                            "table does not carry -- the real lookup answers "
+                            "EBADF\n",
+                            (unsigned long)largs[0],
+                            (unsigned)ENV_PAYLOAD_TOOTH_DEAD_FD);
+                        largs[0] = ENV_PAYLOAD_TOOTH_DEAD_FD;
+                    } else if (cur->tooth == ENV_PAYLOAD_TOOTH_NO_HEAP) {
+                        uint64_t pv = largs[1] & ~0xFFFULL;
+                        user_unmap_page(cur->cr3, pv);
+                        kernel_serial_printf(
+                            "[E7-GATE] tooth no-heap: the reply destination "
+                            "page 0x%llx (the child's copy buffer) is unmapped "
+                            "before the read is forwarded -- the deliver's "
+                            "checked copy answers EFAULT while this kernel "
+                            "does not fault; the tenant's own free then takes "
+                            "the #PF in this page\n",
+                            (unsigned long long)pv);
+                    }
+                }
+#endif
                 /* E7 increment 12 (§10.13's step 3): the reply payload's
                  * staged destination clears FIRST — before any plan's
                  * refusal can return below — so every refusal path leaves
@@ -437,6 +502,8 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                 cur->reply_stage_num   = 0;
                 cur->reply_stage_va    = 0;
                 cur->reply_stage_len   = 0;
+                cur->reply_stage_kind  = 0;
+                cur->reply_stage_aux   = 0;
                 cur->reply_stage_valid = 0;
                 /* E7 increment 5, plan half: BEFORE the describe (the
                  * clamp must be IN the description) and before the
@@ -619,6 +686,27 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                         (long)(int32_t)largs[2]);
                     return (uint64_t)(int64_t)(-LINUX_ENOSYS);
                 }
+                /* E7 step 4 (the file class): the getdents64 cursor
+                 * rides IN the description — args[5], a word the child's
+                 * own 3-argument call never uses, is where the sidecar's
+                 * skip lives (the sidecar is stateless over it: it
+                 * slices its listing from the index this word names).
+                 * Any open resets the cursor: one listing at a time is
+                 * the named v1 boundary (two interleaved directory fds
+                 * would share this cursor), and a reused slot resets it
+                 * beside every other piece of per-task state. */
+                if (num == LINUX_OPEN)
+                    cur->linux_dir_pos = 0;
+                if (num == LINUX_GETDENTS64)
+                    largs[5] = cur->linux_dir_pos;
+                /* E7 increment 21: remember that the forward about to be
+                 * armed is the gate workload's read(fd 3), so the resume
+                 * sentinel can count the bytes its reply actually returns and
+                 * stop at the sysret that crosses src_off. No limit is acted
+                 * on here — stopping BEFORE the forward would leave the read
+                 * unissued and the fd short of the offset. */
+                if (cur->gate_profile && num == LINUX_READ && largs[0] == 3u)
+                    cur->gate_read_pending = 1;
                 linux_syscall_describe(&req, num, largs);
                 if (cap_linux_find_channels(cur->pid, &ch_w, &ch_r) != 0) {
                     kernel_serial_printf(
@@ -661,6 +749,66 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                         return (uint64_t)(int64_t)(-LINUX_EFAULT);
                     }
                     fwd_len += plan.len;
+                } else {
+                    /* E7 step 4 (the file class): the path numbers' own
+                     * attach — open/stat/lstat/unlink/mkdir carry one
+                     * NUL-terminated string behind the header, rename
+                     * TWO back to back (the sidecar splits at the first
+                     * NUL and validates the second's, its twin of these
+                     * bounds). Measured and copied HERE, where the cr3
+                     * is in scope, still before the post: a span ring 3
+                     * could not read is -EFAULT, a string with no NUL
+                     * within LINUX_PATH_CAP is -ENAMETOOLONG by name —
+                     * never a truncated path. A number with no path
+                     * plans nothing (the classifier's total function)
+                     * and this arm adds no bytes, as ever. */
+                    struct LinuxFdPathPlan pplan =
+                        linux_fd_path_plan(num, largs);
+                    if (pplan.src) {
+                        uint32_t plen1 = 0, plen2 = 0;
+                        int m = linux_path_measure(cur->cr3, pplan.src,
+                                                   LINUX_PATH_CAP, &plen1);
+                        if (m != 0) {
+                            kernel_serial_printf(
+                                "[E7] linux path (syscall %lu) refused "
+                                "before post: %s\n",
+                                (unsigned long)num,
+                                m == -LINUX_ENAMETOOLONG
+                                    ? "path over LINUX_PATH_CAP (no NUL)"
+                                    : "path span not user-readable (measure)");
+                            return (uint64_t)(int64_t)m;
+                        }
+                        if (linux_user_copy_out(
+                                fwd + sizeof(struct SLSLinuxSyscallRequest),
+                                cur->cr3, pplan.src, plen1) != 0) {
+                            kernel_serial_printf(
+                                "[E7] linux path (syscall %lu) refused "
+                                "before post: unmapped span (copy)\n",
+                                (unsigned long)num);
+                            return (uint64_t)(int64_t)(-LINUX_EFAULT);
+                        }
+                        fwd_len += plen1;
+                        if (pplan.two) {
+                            m = linux_path_measure(cur->cr3, pplan.src2,
+                                                   LINUX_PATH_CAP, &plen2);
+                            if (m != 0) {
+                                kernel_serial_printf(
+                                    "[E7] linux rename dst path refused "
+                                    "before post: %s\n",
+                                    m == -LINUX_ENAMETOOLONG
+                                        ? "path over LINUX_PATH_CAP (no NUL)"
+                                        : "path span not user-readable");
+                                return (uint64_t)(int64_t)m;
+                            }
+                            if (linux_user_copy_out(
+                                    fwd + sizeof(struct SLSLinuxSyscallRequest)
+                                        + plen1,
+                                    cur->cr3, pplan.src2, plen2) != 0) {
+                                return (uint64_t)(int64_t)(-LINUX_EFAULT);
+                            }
+                            fwd_len += plen2;
+                        }
+                    }
                 }
                 {
                     struct SLSLinuxSyscallRequest *fwd_req =
@@ -677,6 +825,8 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                     cur->reply_stage_num   = num;
                     cur->reply_stage_va    = rplan.dst;
                     cur->reply_stage_len   = rplan.len;
+                    cur->reply_stage_kind  = rplan.kind;
+                    cur->reply_stage_aux   = rplan.aux;
                     cur->reply_stage_valid = 1;
                 }
                 /* Arm BEFORE the post: cap_maybe_handoff (process.c) reads
@@ -692,6 +842,7 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                  * construction. Un-arm, then map the refusal into the
                  * units this task speaks (both CAP families, one table). */
                 cur->park_syscall = 0;
+                cur->gate_read_pending = 0;   /* no park: no reply is owed */
                 kernel_serial_printf(
                     "[E7] linux syscall %lu (class=%s) not delivered: "
                     "cap status %d\n",

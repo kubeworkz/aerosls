@@ -29,6 +29,7 @@
 #include "workload.h"            // Orchestration Plan Phase 5 -- workloads[]           // Multitenant Isolation Gap Analysis §5 item 1 -- tenants[]/tenant_next_id
 #include "env_ckpt.h"            // POSIX-Environments v0.2 Phase P1a -- env_ckpt_table[]
 #include "env_payload.h"        // POSIX-Environments v0.2 Phase P1a -- the payload capture
+#include "env_migrate.h"        // POSIX-Environments P3 -- the migrate-in-flight defer gate below
 #include "env_storage.h"         // POSIX-Environments v0.2 Phase P1b -- env_storage_table[]
 #include "checkpoint_delta.h"    // Step 4: incremental dirty tracking
 #include "../drivers/nvme_io.h"
@@ -1139,6 +1140,29 @@ void persist_environments(void) {
     ckpt_mark_dirty(CKPT_REGION_ENV);
     if (persist_defer_note(PERSIST_PEND_ENV)) return;
     if (!io_sq || !io_cq) return;
+
+    /* A migrate critical section owns the pause state and the flags of its
+     * partition. This sweep's quiesce marks FLAG_PARTITION_PAUSED on any
+     * record whose partition was ALREADY paused — and the migration's own
+     * Step-1 pause looks exactly like that — while the flag's meaning is
+     * "an operator's intent" (env_ckpt.h). If that mark lands between the
+     * send's freeze and its BEGIN, the staged record crosses carrying an
+     * operator pause nobody took: the destination restores the environment
+     * LIVE by the records but dead to the scheduler, its console accepting
+     * input nobody would ever read — P3 increment 10's live-console defect
+     * wearing an operator's intent. So the capture defers while THIS node
+     * has migration work in flight; the dirty markers above stand and the
+     * next sweep writes. The local gate is the only question: a PEER's
+     * migration never pauses a partition this node persists (the pause and
+     * the records meet only here, on the node holding them), and
+     * env_migrate_intent_begin() stamps the local gate BEFORE the pause,
+     * capture and send it exists to cover. Host worlds stand it in as
+     * never-in-flight (tests/payload_host_stubs.h), so this gate is inert
+     * off a live cluster. */
+    if (env_migrate_in_flight()) {
+        (void)persist_defer_note(PERSIST_PEND_ENV);
+        return;
+    }
 
     // P1a quiesce: freeze each captured environment's partition so what is
     // written down is a consistent instant rather than a moving target. It sits

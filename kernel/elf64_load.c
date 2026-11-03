@@ -66,6 +66,12 @@ int elf64_map_blob(const uint8_t* data, uint64_t size, uint64_t* pml4,
     const struct ELF64ProgramHeader* phdr;
     uint64_t ph_bytes;
     uint64_t phdr_vaddr = 0;
+    /* E7 increment 20: the outward-rounded page span of every PT_LOAD, kept
+     * here because this loop is where a segment's real extent is known. The
+     * checkpoint's page walk cannot re-derive it from a vaddr alone (a
+     * linked 0x400000 image sits inside the child's shared identity map, so
+     * "mapped" is not "this image's"). */
+    uint64_t load_lo = 0, load_hi = 0;
     uint16_t ph;
 
     if (!data || !pml4 || !info) return 0;
@@ -146,6 +152,16 @@ int elf64_map_blob(const uint8_t* data, uint64_t size, uint64_t* pml4,
                 (unsigned long long)s->p_vaddr,
                 (unsigned long long)(s->p_vaddr + s->p_memsz));
             return 0;
+        }
+        /* E7 increment 20: widen the image's own page span. Rounded OUTWARD
+         * from the page bases the map uses, so the capture names exactly the
+         * pages a LOAD can install (a non-aligned LOAD reaches back into its
+         * first page, elf64_map_blob's alignment rule above). */
+        {
+            uint64_t lo = s->p_vaddr & ~(uint64_t)4095u;
+            uint64_t hi = (s->p_vaddr + s->p_memsz + 4095u) & ~(uint64_t)4095u;
+            if (load_lo == 0 || lo < load_lo) load_lo = lo;
+            if (hi > load_hi) load_hi = hi;
         }
         /* The §5.2 AT_PHDR anchor: the table must live inside a LOAD. */
         if (phdr_vaddr == 0 &&
@@ -301,6 +317,8 @@ int elf64_map_blob(const uint8_t* data, uint64_t size, uint64_t* pml4,
     info->phdr_vaddr = phdr_vaddr;
     info->phnum     = ehdr->e_phnum;
     info->phent     = (uint16_t)sizeof(struct ELF64ProgramHeader);
+    info->load_lo   = load_lo;
+    info->load_hi   = load_hi;
     kernel_serial_printf("[LOADER] ELF64 loaded. Entry: 0x%016llx\n",
                          (unsigned long long)info->entry);
     return 1;

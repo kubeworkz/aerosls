@@ -165,6 +165,47 @@ bad()  { echo "FAIL: $*"; fail=1; }
 # has <file> <fixed string> -> 0 when present
 has() { grep -qF -- "$2" "$1" 2>/dev/null; }
 
+# ── The ENV family's dispatch range, read as a NUMBER ─────────────────────
+# dspp.c admits the family with `opcode >= DSPP_MIGRATE_ENV_BEGIN_REQ &&
+# opcode <= X`, and X — the range's written terminator — is what teeth S and
+# AB actually assert on: X's value must reach DSPP_MIGRATE_ENV_INTENT (24),
+# or the announce and the destination's word fall through to the stream
+# family and die unheard. So the guard resolves X from the source and looks
+# its value up in the enum, instead of grepping one spelling of it. The
+# replica increment legitimately extended X to DSPP_MIGRATE_ENV_REPLICA_
+# LIVE_ACK (27); a tooth pinned to the old spelling then reddened for a
+# CORRECT change, and a tooth that reds for growth is a tooth someone edits
+# away rather than a property the tree keeps.
+env_range_term_sym=$(awk '
+    /opcode >= DSPP_MIGRATE_ENV_BEGIN_REQ/ { seen = 1 }
+    seen && match($0, /opcode <= [A-Za-z_0-9]+/) {
+        s = substr($0, RSTART, RLENGTH)
+        sub(/^opcode <= /, "", s)
+        print s
+        exit
+    }' net/dspp.c 2>/dev/null)
+
+# dspp_enum_value <symbol> -> the number net/dspp.h assigns it ('' if absent)
+dspp_enum_value() {
+    awk -v sym="$1" 'match($0, sym "[ \t]*= *[0-9]+") {
+        s = substr($0, RSTART, RLENGTH)
+        sub(/.*= */, "", s)
+        print s
+        exit
+    }' net/dspp.h 2>/dev/null
+}
+
+env_intent_val=$(dspp_enum_value DSPP_MIGRATE_ENV_INTENT)
+env_range_term_val=""
+if [ -n "$env_range_term_sym" ]; then
+    env_range_term_val=$(dspp_enum_value "$env_range_term_sym")
+fi
+env_range_reaches_intent=0
+if [ -n "$env_intent_val" ] && [ -n "$env_range_term_val" ] &&
+   [ "$env_range_term_val" -ge "$env_intent_val" ] 2>/dev/null; then
+    env_range_reaches_intent=1
+fi
+
 # ── A. Preconditions ──────────────────────────────────────────────────────
 for f in kernel/partition.c kernel/env_migrate.c kernel/env_migrate.h \
          kernel/env_ckpt.c kernel/env_ckpt.h Makefile net/http.c \
@@ -413,8 +454,8 @@ if ! has net/dspp.h "DSPP_MIGRATE_ENV_LIVE_REQ"; then
     bad "S. net/dspp.h no longer defines the LIVE_REQ opcode — the source has no question to ask"
 elif ! has net/dspp.h "DSPP_MIGRATE_ENV_LIVE_ACK"; then
     bad "S. net/dspp.h no longer defines the LIVE_ACK opcode — the destination has no word to give"
-elif ! has net/dspp.c "opcode >= DSPP_MIGRATE_ENV_BEGIN_REQ && opcode <= DSPP_MIGRATE_ENV_INTENT"; then
-    bad "S. the ENV dispatch range no longer reaches LIVE_ACK (the range's written terminator must be at least DSPP_MIGRATE_ENV_INTENT=24, which passes LIVE_ACK=23) — the destination's word would be silently dropped on arrival"
+elif [ "$env_range_reaches_intent" -ne 1 ]; then
+    bad "S. the ENV dispatch range no longer reaches LIVE_ACK (its terminator ${env_range_term_sym:-<none>} = ${env_range_term_val:-<unresolved>} must be at least DSPP_MIGRATE_ENV_INTENT=${env_intent_val:-24}, which passes LIVE_ACK=23) — the destination's word would be silently dropped on arrival"
 elif ! has net/dspp.h "dspp_env_migrate_send_live("; then
     bad "S. net/dspp.h no longer declares the LIVE_REQ sender — the source could not ask even if it wanted to"
 elif ! has kernel/env_migrate.c "dspp_env_migrate_send_live("; then
@@ -551,8 +592,8 @@ ab_h=$(awk '/^void dspp_env_migrate_rx/{f=1} f && /env_migrate_recv_intent\(\(ui
 ab_f=$(awk '/^void dspp_env_migrate_rx/{f=1} f && /if \(h->node_dest_id != cluster_local_node_id\(\)\) return;/{print NR; exit}' net/dspp.c)
 if ! has net/dspp.h "DSPP_MIGRATE_ENV_INTENT"; then
     bad "AB. dspp.h no longer defines the intent opcode — sender and receiver cannot agree on the frame"
-elif ! has net/dspp.c "opcode <= DSPP_MIGRATE_ENV_INTENT"; then
-    bad "AB. dspp.c's dispatch no longer routes the intent opcode into the migrate RX — the announce falls through the dispatch unheard"
+elif [ "$env_range_reaches_intent" -ne 1 ]; then
+    bad "AB. dspp.c's dispatch no longer routes the intent opcode into the migrate RX (its terminator ${env_range_term_sym:-<none>} = ${env_range_term_val:-<unresolved>} stops short of DSPP_MIGRATE_ENV_INTENT=${env_intent_val:-24}) — the announce falls through the dispatch unheard"
 elif ! has kernel/env_migrate.c "dspp_env_migrate_send_intent"; then
     bad "AB. env_migrate.c no longer transmits the announce — a local gate alone cannot spare a THIRD node that holds no migration state"
 elif [ -z "$ab_h" ] || [ -z "$ab_f" ] || [ "$ab_h" -ge "$ab_f" ]; then
@@ -678,6 +719,48 @@ else
     else
         ok "AG. every announcing route releases the intent when its phase ends: local gate cleared, budget-0 broadcast, the peer's clamp yielding to it, pinned in the host test"
     fi
+fi
+
+# ── AH. The blocked sweep keeps beating (the death-during-create fix) ──────
+# The create round trip, the migrate ACK waits, the restore's parked wait
+# and the pour all run ON the BSP sweep -- the context that transmits the
+# consensus heartbeat. While any of them blocks, observers see only
+# silence: the 150-tick election watchdog deposes the busy leader, and as
+# a quiet follower (followers transmit nothing that feeds
+# last_seen_tick) it is declared DEAD 300 ticks after its own release.
+# Live 3-node find, 2026-10-23 (env_migrate_confirm_live's shape).
+# failover_sweep_keepalive() pumps both streams from inside the waits.
+if ! has kernel/failover.h "void failover_sweep_keepalive(void)"; then
+    bad "AH. failover.h no longer declares failover_sweep_keepalive() -- the blocking waits have nothing to pump"
+elif ! has kernel/failover.c "void failover_sweep_keepalive(void)"; then
+    bad "AH. failover.c no longer defines failover_sweep_keepalive() -- a declaration with no definition is a link error at best"
+elif ! awk '/^void failover_sweep_keepalive/{f=1} f && /check_consensus_heartbeat_tick\(now\)/{a=1} f && /failover_live_checkpoint_broadcast\(now\)/{b=1} END{exit !(a && b)}' kernel/failover.c; then
+    bad "AH. failover_sweep_keepalive() no longer pumps BOTH streams (the leader heartbeat and the checkpoint broadcast) -- either half missing re-creates a starvation face"
+elif ! has kernel/env_service.c "failover_sweep_keepalive();"; then
+    bad "AH. the create/destroy RPC wait (env_service.c) no longer pumps the keepalive -- the create round trip silences the leader mid-create, the exact live-found shape"
+elif ! has kernel/env_payload.c "failover_sweep_keepalive();"; then
+    bad "AH. the restore's parked wait (env_payload.c) no longer pumps the keepalive -- the wait blocks the restore's sweep"
+elif [ "$(grep -cF 'failover_sweep_keepalive();' kernel/env_migrate.c)" -lt 4 ]; then
+    bad "AH. env_migrate.c pumps the keepalive only $(grep -cF 'failover_sweep_keepalive();' kernel/env_migrate.c) time(s) -- both ACK waits and every pour loop (regions, image-window tail, extent) must pump it (floor of 4 sites)"
+else
+    ok "AH. every blocking wait on the sweep pumps the keepalive: the heartbeat and checkpoint streams keep flowing mid-block"
+fi
+
+# ── AI. An intent frame refreshes liveness -- it never CREATES a watch entry
+# recv_intent() stamps the sender's heartbeat so a release cannot resurrect
+# the accumulated silence (the release-vs-heartbeat race). But the stamp
+# may only REFRESH a peer already on the death-watch (whose heartbeats were
+# heard): a quiet follower whose intent armed a fresh entry would be
+# declared DEAD exactly 300 ticks after its own release -- the second half
+# of the same 2026-10-23 live find.
+if ! awk '/^void env_migrate_recv_intent/{f=1} f && /failover_peer_status\(node_id\) >= 0/{g=NR} f && /failover_note_heartbeat\(node_id, kernel_tick_counter\)/{h=NR} END{exit !(g && h && g < h)}' kernel/env_migrate.c; then
+    bad "AI. env_migrate_recv_intent() no longer gates its heartbeat refresh on failover_peer_status(node_id) >= 0 -- an intent frame would arm a death-watch entry for a follower that never beats, declaring it dead 300 ticks after its release"
+elif ! has tests/env_migrate_host_test.c "failover_peer_status"; then
+    bad "AI. env_migrate_host_test.c no longer models the watch table (failover_peer_status) -- the refresh-only contract is unpinned"
+elif ! has tests/env_migrate_host_test.c "an unwatched peer's release is a pure no-op"; then
+    bad "AI. env_migrate_host_test.c no longer pins the unwatched release no-op -- a regression back to create-on-intent would go unnoticed"
+else
+    ok "AI. an intent frame refreshes a watched peer's stamp and never creates a death-watch entry"
 fi
 
 echo

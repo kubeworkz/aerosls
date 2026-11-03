@@ -55,3 +55,22 @@ cluster/
 .build-config.stamp
 .build-id.stamp
 .sls-frontend.stamp
+
+# ─── Run scratch, not artefacts ──────────────────────────────────────────────
+# Redirected guard/build transcripts (live_run.out, rerun3.out, ...) and the
+# commit-message drafts kept beside them: records of past runs, read by
+# nobody but whoever ran them, and neither build inputs nor test fixtures.
+*.out
+commit_*_msg.txt
+
+# ─── Local-only helpers ──────────────────────────────────────────────────────
+# qemu: a symlink to a QEMU checkout OUTSIDE this repository (the build reads
+#   ../qemu, never ./qemu), so committing it would ship a dead absolute path.
+# probe_console_run.sh: self-declared "temporary, delete after use" — a
+#   diagnostic with this worktree's absolute path hardcoded in it.
+# tools/add_intent_standins.sh: the one-shot patcher that added the
+#   idle-observer stand-ins to the host tests; its output is committed in the
+#   tests themselves, so replaying it now would only append duplicates.
+/qemu
+/probe_console_run.sh
+/tools/add_intent_standins.sh

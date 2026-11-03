@@ -104,6 +104,15 @@ struct Elf64MapInfo {
     uint64_t phdr_vaddr;  /* vaddr of the mapped program-header table, or 0 */
     uint16_t phnum;
     uint16_t phent;
+    /* E7 increment 20: the page-aligned span every PT_LOAD contributes,
+     * [load_lo, load_hi). A static ET_EXEC links LOW (0x400000), so this is
+     * the only honest answer to "which pages are this image's" for the
+     * checkpoint's page walk — the 0x400000000000 image window is where the
+     * flat mapper and the child's stack live, not where a linked binary
+     * does. Page-rounded outward from the same segment spans the overlap
+     * gate above computes, so the range names whole mapped pages only. */
+    uint64_t load_lo;
+    uint64_t load_hi;
 };
 
 /* The path-dispatch predicate: 1 iff the blob BEGINS with the four ELF

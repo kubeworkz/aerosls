@@ -1,0 +1,65 @@
+E7 gate — B7 (the stack high-water clause) under the teeth. 2026-11-02.
+image:    sls_operating_system_e3_teeth.iso — make x86-iso-e3 E3_INIT_FEATURES=e3_envs,e7_gate
+          E7_SLOW_BOOT=0 E7_TOOTH=1 (build id 20261102150403)
+machine:  qemu-system-x86_64 -m 1G -smp 2 -accel tcg,thread=multi, 10 GiB NVMe
+invocation: E7G_ARTIFACTS=/tmp/e7-gate-teeth-hwm tests/e7_gate_check.sh --teeth
+result:   rc=0 — 7 clauses red across the three teeth, each exactly where its tooth
+          says; the control green; no retry (every replay was attempt 1).
+one capture (boot 1) then four replays over sparse copies of the checkpointed image:
+control (no tooth), descriptor, no-fd, no-heap. Each tooth directory carries the
+capture's boot1.log, so every recording replays standalone with the same B7 line.
+
+=== the kernel lines: one capture, four teardowns ===
+control/boot1.log:  [E7-GATE] stack hwm (stop): alloc=65536 poison-span=60912 headroom=58264 deepest=2648 lowest=0x4000000a9398
+control/boot2.log:  [E7-GATE] stack hwm (exit): alloc=65536 poison-span=60912 headroom=57424 deepest=3488 lowest=0x4000000a9050
+descriptor/boot1.log: [E7-GATE] stack hwm (stop): alloc=65536 poison-span=60912 headroom=58264 deepest=2648 lowest=0x4000000a9398
+descriptor/boot2.log: [E7-GATE] stack hwm (exit): alloc=65536 poison-span=60912 headroom=57424 deepest=3488 lowest=0x4000000a9050
+no-fd/boot1.log:     [E7-GATE] stack hwm (stop): alloc=65536 poison-span=60912 headroom=58264 deepest=2648 lowest=0x4000000a9398
+no-fd/boot2.log:     [E7-GATE] stack hwm (exit): alloc=65536 poison-span=60912 headroom=58264 deepest=2648 lowest=0x4000000a9398
+no-heap/boot1.log:   [E7-GATE] stack hwm (stop): alloc=65536 poison-span=60912 headroom=58264 deepest=2648 lowest=0x4000000a9398
+no-heap/boot2.log:   (no exit scan: the tenant left by #PF through process_exit)
+
+=== B7, as the harness prints it per recording ===
+control
+  ok: B7. the stack is measured at both boots: deepest 3488 bytes below the entry
+          %rsp (2648 at the stop, the resumed tail went 840 deeper), 57424 of
+          65536 bytes untouched — 87.6% above the 32768-byte floor
+descriptor
+  ok: B7. boot 1 measured the stack (deepest 2648, headroom 58264 of 65536); this
+          recording never adopted the tenant, so its exit scan (3488 bytes) is
+          not the resumed copy's and is not compared to the stop
+no-fd
+  ok: B7. the stack is measured at both boots: deepest 2648 bytes below the entry
+          %rsp (2648 at the stop, the resumed tail went 0 deeper), 58264 of
+          65536 bytes untouched — 88.9% above the 32768-byte floor
+no-heap
+  ok: B7. boot 1 measured the stack (deepest 2648, headroom 58264 of 65536); this
+          recording's tenant left by fault or was never adopted, so its teardown
+          has no exit scan to compare
+
+=== the reds B7 sat beside (unchanged from increment 22) ===
+descriptor: B2 (no adopted line), B3 (first read 0x0), B4 (second Copying)
+no-fd:      B3 (no read reaches the file class), B4 (no Done)
+no-heap:    B4 (no Done), B5 (the #PF inside the withheld page)
+7 red total.
+
+=== what each B7 reading means ===
+control — the resumed stack is the captured one, and boot 2 went 840 bytes deeper
+          than the stop; the checkpoint carried the poison and the writes.
+descriptor — the Linux task record was dropped, so no resumed stack exists. The
+          restarted child's own teardown DOES produce an exit scan, and it reads
+          byte-identically to the control's (3488/57424/0x4000000a9050) because
+          it re-runs the same workload from _start; B7 validates that line and
+          deliberately does not compare it to the stop.
+no-fd —   the adopted tenant exits during the refused read, at exactly the
+          depth the stop saw. The monotonic check is >=, not >: a faithful
+          restore cannot be shallower than the capture, but it need not go
+          deeper.
+no-heap — the tenant dies by #PF and leaves through process_exit, whose teardown
+          the exit report does not ride. B7 names the missing scan instead of
+          passing on it, and still checks the stop line.
+
+=== replaying the recordings ===
+tests/e7_gate_check.sh --replay /tmp/e7-gate-teeth-hwm/teeth/<name> returns the same
+B7 line for each of the four directories; the control exits 0 as a passing run, and
+each tooth exits 0 as a tooth run whose reds are exactly its declared set.

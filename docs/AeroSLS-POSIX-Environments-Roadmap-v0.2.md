@@ -1465,7 +1465,7 @@ attribution call is removed.
 - **Placement is a gate, not a preference.** v0.1 §7 already fixed placement at the write-lease holder. P3 extends the *refusal* discipline E4 built (a paused target is refused with `CAP_EPERM`, an absent one with `CAP_EINVAL`, and a refused placement allocates **nothing**) to cover the environment's full footprint: 1344 frames of regions, the two sidecars' image and stack frames, and P1b's durable storage extent. An environment that cannot be placed is refused *by name*, before anything is created, which is the property E4 Finding 1's fix established for regions and P3 must not lose for whole environments.
 - **Migration is checkpoint, transfer, restore, resume.** The payload is P1a's descriptor plus its extents; the transfer is the existing bulk path — `stream_migrate_send_partition()`'s page-by-page, per-page-acknowledged, source-retired-only-on-confirmation discipline (`kernel/stream.h`) for streams and storage, and the DSPP chunk family for the descriptor. The destination replays the descriptor through the environment-create path (P1a's rule 2), pours in the bytes, and resumes the partition there. The source frees the environment only after the destination confirms — the `streams_expected` vs `streams_relocated` rule, applied to an environment's *whole* state rather than to its streams.
 - **The write lease is what makes it safe.** `partition_migrate()` already steps the lease down before the move; P3 keeps that ordering and adds the environment to the same critical section: no syscall from a Linux task, and no file write from the POSIX sidecar, may land between the checkpoint and the resume. The pause is the mechanism (P1a's quiesce), and the lease is the cluster-level guarantee that no *other* node is serving the partition meanwhile.
-- **Failover is restore-or-refuse, never half.** `failover_recover_from()` adopts by ownership and comments plainly that "the checkpoint carries no names" — the leader's live broadcast (`failover_live_checkpoint_broadcast()`) is a serialized state tree, and `net/dspp_checkpoint.c`'s receive buffer is **24 KiB**. An environment's 5.5 MiB of regions does not fit that path, and P3 does not pretend it does. Two honest destinations, to be chosen in review: **(a)** extend the leader's broadcast to a bulk transfer of surviving environments (so a dead node's environments come back on the survivor), or **(b)** declare that failover adopts *partitions* and environments are restored only from their own durable storage (P1b) on the survivor, with the gap reported by name. (b) is the smaller, more honest first cut and it is consistent with `failover.c`'s existing "ownership only" posture; (a) is the real PASE-grade answer. The plan is written so either can land without the other.
+- **Failover is restore-or-refuse, never half.** `failover_recover_from()` adopts by ownership and comments plainly that "the checkpoint carries no names" — the leader's live broadcast (`failover_live_checkpoint_broadcast()`) is a serialized state tree, and `net/dspp_checkpoint.c`'s receive buffer is **24 KiB**. An environment's 5.5 MiB of regions does not fit that path, and P3 does not pretend it does. Two honest destinations, to be chosen in review: **(a)** extend the leader's broadcast to a bulk transfer of surviving environments (so a dead node's environments come back on the survivor), or **(b)** declare that failover adopts *partitions* and environments are restored only from their own durable storage (P1b) on the survivor, with the gap reported by name. (b) is the smaller, more honest first cut and it is consistent with `failover.c`'s existing "ownership only" posture; (a) is the real PASE-grade answer. The plan is written so either can land without the other. *(Settled in review 2026-10: (b) landed as increments 9 and 11 — adoption, the by-name report, then the restore half — and remains the classification base every outcome is counted against; (a) is now landing on top of it as the replica path, whose mechanism §11 Q5 states and whose increments the thirteenth addendum below itemises. (a) does not replace (b): a survivor with no replica falls back to the durable record, and with neither, the name — exactly the ladder (b) built.)*
 - **The console and the terminal follow.** E6's per-environment consoles are `(partition, env_id)`-keyed and partition-scoped (`kernel/env_console.h`). On the destination the environment must re-register its console and announce its identity (BIB v3's `[env-id] index=<index> pid=<pid>`) so an attached operator's stream does not silently become someone else's — the E6 guard's cross-partition witness is the test that this held.
 
 **Explicitly not in scope.**
@@ -1739,10 +1739,19 @@ and one gate the boot pass never needs:
   returned, so the local instance is the stale one — it is ended and what
   crossed is rebuilt, over a `NOENT`-as-good destroy.
 - **Placement is validated WHOLE before a byte.** Every staged region must
-  land at the base the staged record names and the durable extents must agree:
-  the sidecars' MEM regions are identity-mapped and their heaps hold RAW
-  POINTERS into them, so a fresh environment that landed anywhere else could
-  not receive these bytes without every interior pointer dangling silently.
+  land at the base the staged record names: the sidecars' MEM regions are
+  identity-mapped and their heaps hold RAW POINTERS into them, so a fresh
+  environment that landed anywhere else could not receive these bytes without
+  every interior pointer dangling silently. The durable extent is different
+  in kind — its coordinates are **node-local** (band slots come from each
+  node's own first-free history, persisted per node), so what the pour needs
+  is an extent THIS node owns of at least the staged size, and it writes
+  THERE. Cross-node LBA equality was never an invariant: measured live
+  (2026-10-23), staged slot 5 = LBA 1124352, fresh slot 7 = LBA 1128448, both
+  2048 sectors — a gate that demanded agreement refused every such restore,
+  and pouring at the record's LBA instead would have written into another
+  tenant's extent here. `ENV_MIGRATE_REFUSE_EXTENT` now means "no durable
+  extent of this node's own for the staged pages", not "the LBAs differ".
   Finding — the pause dance had to be *straight-line*: E4's placement gate
   refuses a paused target, so a record recorded as paused is resumed for the
   length of the create and put back by the ledger, and between the first
@@ -1964,6 +1973,60 @@ source re-ask, the refusal abandoned a healthy migrate mid-send ("a page
 never confirmed"). A re-BEGIN carrying the same identity-derived
 `transfer_id` AND the same record is now answered READY without touching
 the slot; a different record stays refused.
+
+**The frame itself is the liveness (2026-10-23, the release-vs-heartbeat
+race).** Dropping a latch is not resetting the silence. Found live by the
+`env_migrate_confirm_live` shape: the source announced intent and blocked
+in a PLAIN env-create for 435 ticks — the announce (both operator entries,
+since increment 7) covered the block itself — but when
+`env_migrate_intent_end()`'s RELEASE re-armed detection it only dropped the
+observer's latch, leaving `last_seen_tick` standing 435 ticks back, so the
+very next `failover_tick()` read that accumulated silence UNdeferred and
+declared the busy source DEAD, mid-create, from a node nobody had killed —
+exactly the declaration `env_migrate_confirm_live` and
+`failover_adoption_live` gate, and the window the budget-0 release opened:
+prompt, but stale. Every intent frame now does heartbeat work:
+`env_migrate_recv_intent()` feeds `failover_note_heartbeat()` BEFORE it
+branches on budget, so the announce and its release alike stamp the
+observer with the frame's own tick — the source's very next frame ends its
+silence, closing the gap between "the block ended" and "the next consensus
+heartbeat lands". Pinned in `tests/env_migrate_host_test.c` (a recording
+stub asserts BOTH faces refresh the stamp, the release stamped with its
+own tick).
+
+**Both halves were needed (same day, after the live re-run).** Refreshing
+the stamp at the release proved necessary but NOT sufficient: the same
+3-node shape then declared the source DEAD at `silent 304 ticks` — with
+the arithmetic proving the stamp WAS refreshed (pre-fix the same log line
+would have read ~790). The timeline named the real cause. The blocking
+phase does not merely stop the heartbeat STREAM, it stops the WATCHDOG:
+the election timeout (150 ticks) is shorter than the death threshold
+(300), so a create/migrate/restore block longer than ~150 ticks DEPOSES
+the busy node — and a deposed FOLLOWER transmits nothing that feeds
+`last_seen_tick` at all (only the leader sends `DSPP_CMD_HEARTBEAT`, and
+only consensus packets feed the failover table). Every announce therefore
+made the source a quiet follower at its own release, with 304 ticks of
+pre-block silence behind it. Two additions close the shape:
+
+- **The blocked sweep keeps beating.** `failover_sweep_keepalive()`
+  (failover.c) pumps BOTH streams — the leader heartbeat and the
+  checkpoint broadcast, each at its own existing rate limit — and every
+  wait that runs ON the sweep calls it: the create/destroy RPC wait
+  (env_service.c), the migrate send's BEGIN and per-page ACK waits and
+  both pour loops (env_migrate.c), and the restore's parked wait
+  (env_payload.c). A blocked phase no longer deposes its own node, so
+  nobody is deposed into the quiet-follower shape; the announce latch
+  stays as the backstop for a node that genuinely blocks past the budget.
+  Clause AH of `env_migration_check.sh` (three smoke teeth) holds every
+  site.
+- **An intent frame refreshes liveness; it never creates it.** The stamp
+  feed is gated on `failover_peer_status(node) >= 0`: the frame proves the
+  SENDER alive but must not put it on the death-watch — a follower whose
+  announce armed a fresh entry would be declared DEAD exactly 300 ticks
+  after its own release (the second half of the same live find). Clause AI
+  (one smoke tooth) holds the gate, and the host stub now models the watch
+  table: a first note watches, and an unwatched announce/release is a
+  pure no-op.
 
 **Increment 8 — the silence arithmetic saturates.** One `declaration
 DEFERRED` line was observed printing `silent 18446744073709551606 ticks`
@@ -2246,6 +2309,322 @@ surrender) with its `stale-region-base` smoke tooth, and pinned by
 
 ---
 
+### Findings addendum — what landed, increment 13 (P3 destination (a): the replica receive path)
+
+The first of destination (a)'s three increments: the RECEIVER. §11 Q5
+states what it must do; this is the half that makes "already here" true
+on disk.
+
+**The mechanism, as landed.** A new opcode —
+`DSPP_MIGRATE_ENV_REPLICA_BEGIN_REQ = 25` — carries a replica's BEGIN,
+and the shared PAGE family (20/21) follows it via
+`env_replica_holds()`. The separate opcode is not decoration:
+`transfer_id` is `((partition<<32)|index)` in BOTH the migration and the
+replica family, so routing a BEGIN by id would be a guess — and the
+wrong guess is not a refusal, it is the MIGRATE receiver staging a
+replica as a migration, after which its sweep would try to RESTORE it.
+The ACKs stay the family's own (19/21, matched by transfer_id), so the
+sender's wait is identical either way. `net/dspp.c` keeps three WEAK
+defaults for the receiver (`recv_begin`/`recv_page`/`holds`) so its
+dependency surface does not move: every existing host test that links
+the dispatcher without the replica subsystem keeps building, and the
+strong definitions in `kernel/env_replica.c` win the kernel link.
+
+**The receiver** is `env_migrate.c`'s twin on purpose — same staging
+discipline (top-down partition-charged frames so the placement
+watermark survives, per-page fragment assembly, re-BEGIN idempotence),
+same refusal-as-named-code contract — plus the half migration never
+needed: a destination for bytes that outlive the transfer.
+`env_replica_tick()`, called from `microkernel.c`'s service poll next to
+the other tenant-service ticks, finalizes a completed staging into this
+node's band in an order that IS the contract: completeness → invalidate
+the old directory entry → band write → publish. The invalidate-first
+step is what makes an in-place replacement safe (a reader sees ABSENT,
+never a mixed capture); entries-first/header-last keeps payload's
+torn-pair rule. The receiver computes its OWN crc over every staged
+page and stores it in the entry, so promotion and the guard can recompute
+and compare. A wedged staging drops by age (`STALE`, ~120 s) with its
+frames returned — bounded, never leaked.
+
+**The band.** `PERSIST_ENV_REPLICA_*` at 7760/7768 (under STREAM_DIR's
+8192) and a band at 1261568 = exactly the payload band's end, pinned by
+a `_Static_assert` against `env_payload.h`'s geometry — 8 slots × 8 MiB,
+keyed (partition, index), each entry storing the WHOLE record beside
+`seq`, page count, provenance (`src_node`) and the crc. Promotion needs
+no second fetch because the record crossed whole in the BEGIN.
+
+**The increments, and their teeth:**
+
+1. **This one — the receiver.** `kernel/env_replica.{c,h}`; the opcode
+   route, the PAGE routing and the tick wiring; the two `ENV_MIGRATE_IMAGE_MAX`
+   consolidation (the ceiling moved from `env_migrate.c`'s file-static to
+   `env_migrate.h`, so sender and replica receiver gate on ONE number).
+   Teeth: `tests/env_replica_host_test.c` — **62 checks**, driving the
+   receiver both directly and through the REAL `dspp_env_migrate_rx`
+   (opcode 25 → ACK → pages → finalize → byte-exact band read-back), and
+   asserting 12 of the 14 refusal codes BY NAME: partial never finalizes,
+   the ninth identity is refused NO_DISK_SLOT rather than silently
+   dropped, an older capture is SUPERSEDED, a wedged staging is STALE.
+   Static: `tests/env_replica_check.sh` — ten wiring claims (the route,
+   the weak defaults, the tick, the LBAs, the adjacency assert, the single
+   ceiling, the pinned codes), source-only, no skip available.
+2. **The sender** (owed next): the capture-side push — at the same
+   `env_payload_capture_all()` instant the owner writes its local band,
+   the record and pages go to the peers, reusing `env_migrate_send`'s
+   proven BEGIN + fragment + retransmit path in a replica mode. Its
+   open question: how the source LEARNS the finalize outcome (the ACKs
+   only prove staging landed, not the band write) — a LIVE-style poll or
+   the next capture's log; stated rather than assumed.
+3. **Promotion**: install the record into `env_ckpt_table` and pour the
+   contents through the replay driver destination (b) already proved,
+   with the band re-read through `env_replica_read_page` and the stored
+   crc verified — then the failover ladder checks (a) before falling back
+   to (b)'s durable record, and the classification names which rung was
+   taken.
+
+**Stated boundaries of increment 1.** The band holds 8 distinct
+identities; the ninth is refused BY NAME (no eviction policy — a fuller
+policy is a real decision, not a default). The 2048-page ceiling is the
+slot's size; a larger environment is refused TOO_MANY at BEGIN, never
+truncated. Nothing here has run on a live cluster yet — the host test
+and the static guard are this increment's evidence, and the live arm is
+owned with increment 2's sender (a receiver with no sender has nothing
+to receive).
+
+---
+
+### Findings addendum — what landed, increment 14 (the capture-side sender; the confirm question answered)
+
+Destination (a)'s increment 2 — and with it the answer to the thirteenth
+addendum's one open question: **how the source learns the finalize
+outcome. The answer: it asks.** A LIVE-style confirm pair (opcodes 26/27,
+the migration LIVE family's shape with its own opcodes so the two
+families' confirmations can never land on each other's entry): after
+every page is ACKed the source sends `REPLICA_LIVE_REQ` carrying
+`(partition, index, seq)` and the peer answers from its **disk
+directory** — `0` finalized (seq >= the asker's), `1` absent, `2` only an
+older capture stands. Four tries, fire-and-forget, each wait pumping the
+sweep keepalive. Staging is what the ACKs prove; finalization is what
+the poll proves — and a peer-side `NO_DISK_SLOT`/`SUPERSEDED`/`IO`
+refusal is now visible at the source by name instead of only in the
+peer's log.
+
+**The mechanism, as landed.** The push is not a fork of the migration
+sender — it is `env_migrate_send_stream()`, the migration's own
+BEGIN + fragment + retransmit body extracted with exactly two
+parameters: the **BEGIN opcode** (25 stages in the replica receiver, 18
+in the migration receiver; the page family stays shared and follows
+whichever table staged) and the **log tag** (a replica push must never
+read as an ownership handoff in an operator's grep). `env_replica_push()`
+calls it once per active roster peer — sequentially, because
+`transfer_id` is the identity in both families and two in-flight peers
+would share one ACK record — bracketed by `env_migrate_intent_begin/end`
+(the death-during-create sanction: the announce is on the wire before
+the first block, released the moment the loop ends).
+
+The hook is the thirteenth addendum's own sentence, literally:
+`env_payload_capture_all()` calls the push at the `captured++` site, so
+the record crosses at the same instant its payload lands on the local
+band, **inside** `env_ckpt_quiesce_for_capture`'s window — records
+QUIESCED, sidecars frozen PARKED, which is precisely the posture the
+stream's gates demand (an already-paused partition passes with
+`PARTITION_PAUSED`, the control plane's own records are refused
+`UNQUIESCED` by the same rule migration holds). `env_payload.c` keeps a
+**weak** default for the push so its host test links without the
+replica subsystem, exactly as dspp.c does.
+
+**Teeth.** `tests/env_replica_host_test.c` grew section I: **75 checks**,
+the whole path loop-backed through the real dispatch in one process —
+`push → stream → opcode 25 → staging → fragment ACKs → the peer's own
+tick finalizes → opcode 26 → confirm answer → push returns 1` — with the
+record's regions AND durable extent byte-exact in the peer's band (the
+full wire numbering), an unquiesced record refused at the door, and the
+confirm's honesty pinned both ways: a peer whose finalizer never ran
+answers *staged-but-not-finalized* and the push counts it ABSENT. The
+loopback delivers frames from the sender's own ACK wait (never from
+inside the transmit — `dspp_transmit_raw()` drops nested frames, and the
+real RX path delivers while a sender waits anyway). The static guard
+grew to **18 claims**: the hook, the weak default, the shared stream and
+its `begin_opcode` passthrough, both confirm opcodes and their routes,
+both weak defaults, the push arm in the test. Verified suites: the host
+suite and the guards green; `env_migrate_host_test` (285) and
+`env_payload_host_test` (46) re-run green across the extraction.
+
+**Stated boundary, settled by the live run (2026-10-28).** A 3-node TCG
+cluster on a fresh ISO: `partition create` + `env create` through
+`aeroslsctl`, then `POST /api/checkpoint`. Result — **eight `FINALIZED on
+node` lines** (every environment × both peers), zero "NOT finalized", both
+peers holding band slots 0–3 with the same `crc=0x0c5915fc` the source
+captured. The run found two defects the loopback could not see, each now
+fixed and pinned:
+
+1. **The dispatch gate.** `dspp_rx_dispatch()` routed only opcodes
+   `[ENV_BEGIN_REQ … ENV_INTENT]` = 18–24 into the ENV family: opcodes
+   25–27 fell through to the stream family and died silently. Every push
+   timed out at the BEGIN with the peers logging *nothing* — and no host
+   test could see it, because the test hand-delivered frames straight
+   into `dspp_env_migrate_rx()`, one call below the gate. The range now
+   ends at `DSPP_MIGRATE_ENV_REPLICA_LIVE_ACK`, the test delivers through
+   `dspp_rx_dispatch()` (the real entry), and guard tooth 3 greps the
+   gate itself.
+2. **The confirm ladder ended on its first answer.** The wait's
+   `return er_confirm_status` exited the whole function, so one honest
+   "not yet" meant exactly one question per push. Re-asking alone was
+   still not enough: 4 asks × 5 ticks ≈ 250 ms at HZ=100, versus the
+   peer's finalize being a *synchronous band write of the whole payload*
+   (1947 pages ≈ 7.6 MiB through emulated NVMe — seconds, not ticks).
+   The first checkpoint showed it precisely: peers answered `absent`
+   four times and published the entry a moment later. Only
+   "finalized here" is definitive now; anything else is paced and
+   re-asked (6 × 120 ticks ≈ 7 s total, small beside the page stream
+   already blocking inside the same freeze), and test claim **I11b**
+   pins that a "not yet" peer receives more than one question.
+
+The earlier boots also explained why the first two environments *looked*
+done at first ask: their directory entries were written by the previous
+boot, and a same-`seq` entry answers 0 — "this capture or a newer one" —
+which is the rule the protocol already states, and the byte-identical
+`crc` across boots shows the replica really was the same capture.
+
+---
+
+### Findings addendum — what landed, increment 15 (promotion: the survivor finds a copy instead of a hole)
+
+Destination (a)'s third increment, and the one that makes the first two
+mean something: increments 13 and 14 put the dead node's bytes on the
+peers' disks *before* anyone died; this increment is what the survivor
+DOES with them when it adopts the dead node's partition. Until now the
+adoption's per-environment classification had exactly one honest answer
+for an environment this survivor held no record for — "no durable record
+… recreate it" — while a byte-exact copy of it sat in this same node's
+replica band. Appendix B's row and §11 Q5's promise ("a survivor that
+later adopts the dead node's partition finds a replica instead of a
+hole") are this increment.
+
+**The mechanism, as landed.** A new entry in `kernel/env_replica.c` —
+`env_replica_promote(partition, index)` — is the band's only reader, and
+it does two things. First it STAGES: the device gate fires before even the
+directory lookup (a lookup that cannot read the disk would answer ABSENT
+about a disk it never saw, and "no replica is held here" is exactly the
+sentence that must not be a lie); then the directory entry's record is
+validated by the record layer's own `env_ckpt_valid()` and its page count
+against the range its own record names — both before a single frame is
+charged; then the band's pages are fed, in wire order, through the
+MIGRATION receiver's own entry points (`env_migrate_recv_begin` /
+`env_migrate_recv_page`, with the transfer id both families derive from
+the identity). One numbering, one reader: the band stores what the wire
+carried precisely so promotion could reuse the restore half that already
+speaks that numbering, rather than growing a second parser for a format
+(the payload blob) that never crossed the wire at all — its tasks and
+vaddrs are re-derived from the FRESH sidecars at restore, which
+`env_migrate_restore()` already does. Any failure inside the feed DROPS
+the half-built slot before returning its named code, so the migrate
+sweep's own restore loop can never later replay bytes this promotion did
+not finish laying down: refusal over partial application, made mechanical
+rather than promised.
+
+Second, `failover_recover_from()` classifies. Per environment of an
+adopted partition, and per outcome:
+
+- **a hole, a replica present** — promote, then `env_migrate_restore()`;
+  on success the line is `RESTORED from a replica held on this survivor
+  (capture seq …, provenance node …)`, and the record lands in
+  `env_ckpt_table` through the restore's own store step — §11 Q5's
+  "installs the record" happens, via the path the header chose;
+- **a hole, no replica** — the old line, extended: `no durable record for
+  it on this survivor and no replica of it is held here`;
+- **a record AND a replica — the NEWER capture wins**, which is the
+  receiver's own rule (a same-identity entry is superseded by a newer
+  seq, never an older one). An older replica is NAMED and not applied; a
+  newer replica whose promotion or replay then fails FALLS BACK to the
+  durable record, with a line saying so, and the staged slot is dropped
+  on the way so exactly one driver ever owns that environment's replay;
+- **promotion refused, or the replay refused** — named with its own code
+  (`env_replica_promotion_name` / `env_migrate_status_name`), counted
+  unrestored, never counted restored. Every path either falls through to
+  destination (b) or names a gap: (b) stays the floor under (a).
+
+**The two design texts, reconciled.** §11 Q5's settlement (written before
+any of this existed) said promotion would install "the record into
+`env_ckpt_table` and the blob into the local payload band";
+`env_replica.h`'s increment-1 header — written once the wire numbering
+was real — says promotion reuses migration's restore half. The header's
+refinement wins, and the difference is exactly one honest boundary: a
+promoted environment's contents live in the replica band and the regions
+the pour wrote, NOT yet in this survivor's payload band. The next
+checkpoint's own capture writes that entry (the normal path every
+environment takes), so until the first post-recovery checkpoint a reboot
+of the SURVIVOR would restore the promoted environment record without its
+payload — the same boundary migration's destination has always had, and
+the same one (b)'s summary line already states.
+
+**Verification.** The same three-layer shape as increments 13 and 14:
+
+- **Host:** `tests/checkpoint_recovery_host_test.c` grew Scenario 4d —
+  seven cases over the classification (hole+replica restored with the (b)
+  driver never armed; promotion refused → unrestored, replay never
+  attempted; replay refused → unrestored with the migrate status; no
+  replica → the old line and promotion never attempted; older replica →
+  (b) unchanged and the copy not applied; newer replica → wins and (b)
+  never arms; newer replica whose replay refuses → falls back to (b) with
+  the staged slot dropped). 87 checks. `tests/env_replica_host_test.c`
+  grew section J — promotion driven against section I's REAL band: staged
+  slot complete, every page byte-exact against the band, the restore
+  finding the staged slot (NO_SLOT never answerable), ABSENT and
+  device-down and table-full refusals by code with the latch, and the
+  directory-patch arm that gives PAGES and RECORD refusals the bytes an
+  operator's disk would actually hold. 101 checks, and the fixture's own
+  record had to become a record the record layer accepts (three regions,
+  a task entry) — promotion validates what the wire gates only counted.
+- **Guards:** `tests/env_failover_check.sh` gained clause N — the lookup,
+  the newer-wins comparison, the promotion call, the replay call, each
+  asserted as the call, plus three host-test pins; `tests/env_replica_check.sh`
+  gained claims 14–16 (the API on both halves, the feed through
+  `env_migrate`'s receiver with its three mid-feed drop sites and its
+  pre-feed gates, and the host test's named refusals). The failover smoke
+  grew six teeth — each link cut once, each reddening clause N and only N —
+  21 teeth, 0 lost, vacuity control green.
+- **Live:** the adoption guard's step 7.5 now accepts BOTH honest
+  classifications, keyed off the adopter's own `[ENV_REPLICA] PROMOTED`
+  line, each prohibiting the other's line — the old blanket prohibition of
+  any `RESTORED` line would have failed a genuine promotion. In this
+  guard's flow the absent branch is the one that fires, because nothing
+  there runs a payload capture (the leader's periodic broadcast carries
+  the state tree only; the push fires from `env_payload_capture_all()`),
+  and the fakes emit it unchanged. The promotion's own live arm is
+  settled below.
+
+**Stated boundary, settled by the live run (2026-10-29).** A 3-node TCG
+cluster on a fresh ISO: `partition create promo15` + `env create` through
+`aeroslsctl` on the leader (node 1), then `POST /api/checkpoint`. Result —
+the capture's 1947 pages reached BOTH peers: node 2 confirmed inside the
+ladder, and node 3's confirm answered "absent" while its synchronous
+7.6 MiB band write was still in flight, then finalized moments later —
+the pacing increment 14 already pinned, and here it cost nothing, because
+promotion reads the peer's DISK directory rather than the last packet it
+heard. Node 1 was then killed:
+
+1. **Exactly one adopter.** Node 2 declared node 1 DEAD (6000 ticks of
+   silence) and adopted partitions 1, 2 and 3; node 3 adopted none.
+2. **The promotion, on real metal.** `[ENV_REPLICA] PROMOTED replica
+   (partition 3, index 1): 1947 page(s), capture seq 0, provenance
+   node 1`, then the restore poured `1344 region page(s), 347
+   image-window page(s) and 256 extent page(s)` — the whole replica,
+   1947 = 1947 — and dropped the staged slot.
+3. **The classification it exists for.** `RESTORED from a replica held
+   on this survivor`, the both-sources summary line, and no
+   `NOT restored` line anywhere — with `shell env list` on the survivor
+   answering `env partition=3 env_id=1 index=1 posix_pid=104`: the
+   environment is running there, with its contents.
+
+The one branch this run did NOT exercise is the adoption guard's own
+replica branch — that guard's flow runs no payload capture (step 7.5's
+absent branch is the one its world produces, and the fakes emit it), so
+the guard change stays justified by review while the promotion itself is
+justified by this run.
+
+---
+
 ## 8. Capacity for the first cut
 
 v0.1 §11 sized M1 at **four concurrent environments per node** and named the ceilings: `PROC_MAX` 16 (two slots per environment), `SIDECAR_REGISTRY_MAX` 16, `ENV_CONSOLE_MAX` 8. v0.2 adds its own, all of which are new *persistent* consumers rather than new process slots:
@@ -2283,9 +2662,210 @@ Each excluded item has a stated destination, so none is silently dropped.
 - **The ARM64 userspace OS.** H2 item #1's work, and the reason E7 targets x86-64 first. Unchanged.
 - **A capacity phase** that raises `PROC_MAX`/`SIDECAR_REGISTRY_MAX` (§8).
 
-**A real design question, deliberately not answered here.**
+**Answered here — §9.1.**
 
-- **Native ↔ POSIX interop.** PASE programs share the IFS and Db2 with native ILE jobs; that sharing is arguably *more* of PASE's value than the binary compatibility itself. Today a Linux task in AeroSLS gets **exactly one capability — the channel to its own POSIX sidecar** (`AeroSLS-Linux-ABI-Shim-Design-v0.1.md` §3.5) — which is superb isolation and makes the environment a sealed box: it cannot see the SLS object catalog, the integrated DB, or a native SIMI program. Whether a *mediated* interop surface (the sidecar proxying specific requests to the catalog or the row store through the kernel's existing capability checks, so the tenant never gains authority the profile denies) is the right answer, and how narrow it should be, is the largest architectural question left in the project. v0.2 does not decide it — it records it, because P1b's durable storage and P2's brokered sockets are both inputs any answer would need, and deciding it before both exist would decide it on guesses.
+- **Native ↔ POSIX interop.** PASE programs share the IFS and Db2 with native ILE jobs; that sharing is arguably *more* of PASE's value than the binary compatibility itself. Today a Linux task in AeroSLS gets **exactly one capability — the channel to its own POSIX sidecar** (`AeroSLS-Linux-ABI-Shim-Design-v0.1.md` §3.5) — which is superb isolation and makes the environment a sealed box: it cannot see the SLS object catalog, the integrated DB, or a native SIMI program. This was the largest architectural question left in the project, and §9.1 now answers it: **yes to a mediated surface, read-only and partition-scoped, brokered by a second kernel service.** The two inputs v0.2 said it was waiting on — P1b's durable storage and P2's brokered sockets — both exist, so the answer is no longer decided on guesses.
+
+---
+
+## 9.1 Native ↔ POSIX interop: the mediated surface, answered
+
+§9 recorded this as "the largest architectural question left in the project"
+and deliberately left it open until P1b and P2 existed. Both exist. This
+section states the answer, the reasons it could have gone the other way, and
+what the first cut deliberately does not do.
+
+**The answer.** A POSIX environment reaches a **read-only, partition-scoped
+view of the object catalog**, brokered by a **second kernel-owned service**,
+`kernel.env.catalog`, reached through the same channel machinery P2 built for
+`kernel.net.socket`. Four verbs: `CAT_INFO` (the handshake), `CAT_LIST`,
+`CAT_STAT`, `CAT_READ`. No write verb exists in the table. *(A second
+increment adds a fifth, read-only verb — `CAT_QUERY`, the SQL path — with
+the five-verb table still carrying no writer: see the addendum at the end of
+this section.)*
+
+**Why a mediated surface at all, rather than the sealed box.** The sealed box
+is superb isolation and a poor operating system. §10.4's "first user" gate
+asks a POSIX environment to do real work, and real work means reading the
+system's data: a program that cannot see the catalog cannot read a table, and
+an environment that cannot read a table is a demo rather than a PASE. IBM i's
+own answer to this is the point of the mapping — a PASE program *shares* the
+IFS and Db2 with native jobs (§0.1's table) — so refusing interop outright
+would concede the half of PASE that §0.1 called "arguably more of PASE's
+value than the binary compatibility itself".
+
+**Why mediated rather than direct.** The alternative — handing the sidecar a
+catalog authority — is LPAR Phase 11 undone by an API call: the tenant would
+gain authority its profile denies, and the isolation boundary would move from
+a place the kernel enforces to a place a sidecar decides. §2's third design
+principle already forbids that in words (*"the kernel brokers; the partition
+bounds"*), and P2 proved the shape that satisfies it: the tenant names a
+kernel-owned peer, `cap_create_sidecar()` mints the kernel end, and the
+service answers against kernel state with the caller's identity attached.
+The catalog reuses that machinery unchanged, so a reviewer has one shape to
+check rather than two.
+
+**Why a second service rather than a wider first one.** P2's verbs run a
+tenant's traffic against the kernel stack (`tcp_quota`, attribution,
+admission). These verbs answer a name lookup. One channel answering two specs
+would mean the socket service's admission path and a catalog lookup sharing a
+switch, and the property §9 needs — that the partition a verb is filtered by
+is one the *kernel* verified — is easier to audit when it is the only thing a
+file does. Two small services with one wire discipline beat one service with
+two jobs.
+
+**The boundary, and the answer a foreign name gets.** Every verb is answered
+against `object_catalog[]` entries whose `SLSObjectEntry.partition_id` equals
+the partition the channel **registered with** — `pd->partition_id`, read off
+the process descriptor in `cap_create_sidecar()`, never a field the wire
+carries. A name in another partition is **not representable in the reply**: it
+is absent from `CAT_LIST`, and `CAT_STAT`/`CAT_READ` on it answer the same
+`CAT_ERR_NOENT` as a name that never existed. That choice of answer is the
+security property, not an omission. A `CAT_ERR_PERM` would confirm to a
+tenant that a name exists in some partition it cannot see, turning a list call
+into an existence oracle across the LPAR boundary. P2's own summary states the
+same property for sockets — *"a cross-partition socket is not representable at
+the wire"*; this is that statement applied to a catalog entry.
+
+**What is refused inside the partition, and why by name.** Two kinds answer a
+refusal instead of data, each for a reason the tree already states elsewhere:
+
+- `OBJ_TYPE_SYSTEM_METADATA` → `CAT_ERR_PERM`. `object_catalog.h`'s own role
+  table gives `APP_USER` no read on `SYSTEM_METADATA`. The catalog does not
+  re-derive that policy; it surfaces the refusal by name so the answer is
+  visible in a transcript instead of silent.
+- `uses_rowstore == 1` → `CAT_ERR_TYPE` on `CAT_READ`. Phase 24's guard in
+  `sys_sls_select()` names the SQL path for a row-set table, and `CAT_READ`
+  *is* the legacy record path, so it inherits that refusal verbatim. Routing
+  SQL through a mediated byte channel is a larger design than this first cut,
+  and saying so by name beats silently returning a legacy view of a table that
+  no longer keeps its rows there. `CAT_STAT` still answers for such an object:
+  its type and size are real metadata, and hiding them would make the refusal
+  unexplainable. *(That larger design is what the second increment built —
+  `CAT_QUERY` serves exactly this refused case, through the same channel,
+  with the refusal moved from "wrong path" to a real read; see the addendum
+  below.)*
+
+**Explicitly not in scope for this cut.**
+
+- **A write path, schema mutation, or any `CAT_*` verb that changes state.**
+  A read-only surface has no write-path permission question to get wrong,
+  which is exactly why it is the right first cut: the hard part of interop is
+  the isolation, and isolation is fully exercised by reading.
+- **A per-object ACL keyed on a uid.** A registered channel carries a
+  partition and a pid, not a uid. Inventing an ACL the caller's identity
+  cannot support would be worse than not having one. Row-level policy is the
+  SQL path's job (`rowstore.c`'s `catalog_check_access`) and stays there.
+- **Cross-partition federation, shared stores, and reaching a native SIMI
+  program.** P1b already scoped shared storage out with the note that it
+  "needs the object catalog's authority model in front of it, not just a
+  format"; this cut puts a first, narrow slice of that model in front of the
+  catalog and no more.
+- **The tenant-side client and its shell command** — built, in this same
+  increment: `user/proto`'s `CatFrame` and `CatalogOps`, the sidecar's
+  `CatalogClient`, the fifth tenant cap, and the `catalog` applet. What is
+  still out of scope is its **live arm**: the command reaches the wire only
+  inside a booted environment, so the client's guard is a source guard too
+  (C1/C2 below) and an end-to-end run — `env attach … "catalog info"` against
+  a created environment — is the natural next increment, needing E6's attach
+  surface as its harness rather than a new design decision.
+
+**Verification.** `kernel/env_catalog.c` compiles into the kernel; the
+service is registered by `cap_create_sidecar()` under the kernel-owned name
+`kernel.env.catalog`, its kernel slot is skipped by `console_service_tick()`
+so `CAT_*` frames never reach the shared serial transcript, and its tick runs
+in `microkernel_service_poll()` beside `net_socket_service_tick()`.
+`tests/env_catalog_broker_check.sh` guards each of those five wires plus the
+boundary itself — and `tests/env_catalog_broker_check_smoke.sh` reddens every
+one of those teeth on a copy of the tree, so the guard's green run is one whose
+failure mode has been observed — and `tests/env_catalog_host_test.c` links the real service
+and executes the verbs against a seeded two-partition catalog — including the
+clause that a name present in partition 2 is answered `CAT_ERR_NOENT` by a
+channel registered in partition 1, which is the property this section exists
+to establish.
+
+The tenant half is guarded the same way, in the same file: **C1** pins the
+fifth tenant cap (`catalog`, rights 0x7, peer exactly `kernel.env.catalog`,
+*n counted* by `n_caps`, absent from the SYSTEM profile, asserted by its own
+pin test) and **C2** pins the client — the `CAT_MAGIC` source of truth, the
+four `CatalogOps` verbs, the status word read off every reply, the rendered
+refusal surfaced to the caller, and the chain manifest → BIB → boot →
+procmgr → the `catalog` applet. Each has teeth in the smoke above, and the
+client's own bytes are executed by `user/sidecar`'s catalog tests against a
+scripted kernel: a two-object `CAT_LIST` whose first body word is 2 must read
+as OK rather than PERM — the offset bug the kernel header records, checked
+from the other side of the wire — and a refusal must arrive with the service's
+own text so the applet can print it verbatim.
+
+### §9.1 second increment — `CAT_QUERY`: the SQL path, read-only
+
+**What landed, and which refusal it answers.** The first cut refused
+`uses_rowstore` objects on `CAT_READ` with a name and a reason — *"Routing SQL
+through a mediated byte channel is a larger design than this first cut"* —
+and left that design as the stated next step. This increment is that design.
+A fifth verb, `CAT_QUERY` (verb 5, status `CAT_ERR_QUERY` 5, mirrored
+byte-for-byte in `user/proto`), takes `{sql_len, page, limit, flags,
+sql[sql_len]}` and returns one page of rows: the head, the column names the
+engine reported, and the cells. The table still contains **no write verb** —
+the increment's whole posture is that a fifth *read* does not reopen the
+question the first cut settled, and the guard's Q3 clause counts the verbs to
+keep it that way.
+
+**The gate order is the design, and it is asserted by position.** The
+statement is parsed before any name is resolved; the single FROM table is
+resolved by `cat_find(name, len, e->partition)` — the channel's registered
+partition, never a wire field; a name outside it answers `CAT_ERR_NOENT`
+with no `why`, preserving §9.1's anti-oracle rule verbatim; the caller's uid
+is read off `proc_table[]` by the channel's pid (and its partition re-checked
+against the channel's) rather than off any field the caller controls;
+`catalog_check_access(uid, table, PERM_READ)` runs **before** execution, so a
+denial is a `CAT_ERR_PERM` answer instead of an empty result — the same
+"denied and empty must differ" rule the SQL layer already paid for twice; and
+only then does `sql_execute()` run. Only a plain single-table `SELECT`
+reaches execution: `kind != SELECT`, a JOIN, a set operator, a CTE and a
+subquery are each refused by name, because every other form can name a
+*second* table that the one-partition lookup cannot account for. The
+statement text is bounded (`CAT_SQL_MAX`), NUL-scanned (an embedded NUL
+would make the engine parse a prefix the caller never wrote) and the page is
+bounded by `CAT_QUERY_ROWS_MAX`; the reply is sent at `g.off` — the cursor's
+own offset after delivering rows — not the pre-fetch `off`, which would hand
+a client a head promising rows its bytes do not carry.
+
+**Verification.** The same three-layer shape the first cut used:
+
+- **Host:** `tests/env_catalog_host_test.c` grew a section that seeds a
+  row-set table in partition 1 and executes the verb against the real
+  service — the happy page, the projection map, each shape refusal, the
+  foreign-table `NOENT`, the short/oversized/NUL statement shapes, the
+  read-only belt, and the send length (`g.off` — the offset bug this test
+  caught first, before any cluster ran it).
+- **Guard:** `tests/env_catalog_broker_check.sh` gained **Q1** (the verb and
+  status exist on both halves with matching numbers, encoder/decoder present,
+  `catalog sql` reachable), **Q2** (the gate order above, each link asserted
+  by line position *inside the QUERY arm* — a gate moved after execution
+  still compiles and still looks like a gate), and **Q3** (exactly one
+  execution site, exactly five verbs, the unknown-verb refusal intact, the
+  reply sent at `g.off`).
+- **Teeth:** eleven new arms in `env_catalog_broker_check_smoke.sh` — the
+  parse/lookup pair genuinely swapped, the policy check and the pid/partition
+  check deleted, the verb number changed on one side only, the table entry,
+  the subcommand and the trait method removed, the send length rewound, a
+  sixth verb added, a second execution site added, the unknown refusal
+  removed. 51 teeth, 0 lost, on both controls.
+- **Live:** `tests/env_catalog_live_check.sh` gained section 8: seed a table
+  the documented three-step way under the bearer uid (valloc → schema set →
+  table create → `INSERT`), then through `env attach` — the page carrying the
+  run-unique cell value and its own `page 0: 1 row(s), 1 total` head; a
+  `DROP TABLE` refused by name with *"only SELECT is served on this
+  surface"* **and the row still there afterwards** (a refusal that executed
+  first would look identical in a transcript that shows only the refusal);
+  and a foreign table answered `NOENT` — not `PERM`, not rows. This is also
+  the first live exercise of the policy check, which only this verb runs.
+
+The first cut's own "live arm" bullet is settled by the same increment: the
+client now reaches the wire inside a created environment, driven by E6's
+attach surface, and the guard's C2 covers the source half while
+`env_catalog_live_check.sh` covers the running half.
 
 ---
 
@@ -2316,7 +2896,9 @@ E7's own gate — *"a static binary doing the first user's actual work, running 
 2. **P1a: is quiescing the whole partition the right granularity, or should an environment pause alone?** Today `partition_pause()` is the only pause mechanism, and it stops the tenant's other work too. If environments are the unit of checkpointing, a per-environment pause may be the correct primitive — but it is a new scheduling concept and it should be argued for rather than assumed.
 3. **P1b: does the durable format replace aerofs-lite or extend it?** *(Settled by P1b's first increment, §5: the rule is implemented as **read v1, write v2, refuse the rest by name** — v2 is a version bump, no existing image is rewritten, and the rootfs builder deliberately stays v1.)* The rule was written down before it was implemented, as this question asked; the durable region it is for landed with P1b's second increment (the extent band), and its reboot evidence is re-made in CI on every push since the third.
 4. **P2: what is a tenant partition's *recommended* connection quota?** The mechanism defaults to 0 = unlimited for backward compatibility; a fresh tenant that never opts in is exactly the starvation case `tcp_quota.h` documents. Should the environment-create path set a non-zero default as part of its budget, and if so, what number is defensible?
-5. **P3: failover destination (a) or (b)?** Bulk-transfer surviving environments during failover (the PASE-grade answer, a much larger lift) or restore them from their own durable storage on the survivor and report the gap by name (the smaller, consistent-with-`failover.c` first cut). The plan is written to admit either; the decision is a product one about what "a cluster that doesn't lose your environments" has to mean in this window.
+5. **P3: failover destination (a) or (b)?** Bulk-transfer surviving environments during failover (the PASE-grade answer, a much larger lift) or restore them from their own durable storage on the survivor and report the gap by name (the smaller, consistent-with-`failover.c` first cut). The plan is written to admit either; the decision is a product one about what "a cluster that doesn't lose your environments" has to mean in this window. *(Settled 2026-10: **both, in that order — (b) landed as increments 9 and 11 and stays the classification base; (a) now lands on top of it as the replica path**, because (b) answered "where does the survivor look?" and could not answer "where do the bytes come from when the node holding them is gone?" At declaration time the answer is nowhere — a dead node sends nothing, which is why the transfer cannot be bolted onto the failure and must be a PROACTIVE REPLICA: at the same instant `env_payload_capture_all()` writes the owner's local payload band, the captured record and its payload pages are pushed to the peers over the wire migration already proved (`DSPP_MIGRATE_ENV_BEGIN` carries the record whole; the page family moves 1 KiB fragments with a per-fragment ACK and a retransmit of only what did not land). The receiver stages them and finalizes into a per-environment replica slot — its own band, keyed `(partition, index, seq)` — so the copy is a fact the survivor holds before it needs it. A survivor that later adopts the dead node's partition finds a replica instead of a hole: promotion installs the record into `env_ckpt_table` and the blob into the local payload band, and the replay driver (b) already reuses — create round trip, identity check, pause ledger, pour — brings the environment back WITH its contents. The 24 KiB broadcast never grows: the state tree stays small, and the payload rides the fragment family that already moves 5.5 MiB for migration. A replica that is absent, stale or partial is named by the same three-way classification (b) already reports — refusal over partial application, applied to the replica. The increments and their teeth are in §7's thirteenth-increment addendum;
+the third increment — the survivor PROMOTING a replica instead of finding
+a hole, with (b) as the floor under it — is §7's fifteenth.)*
 6. **§9's interop question.** Should a Linux-POSIX task be able to reach the SLS catalog or the integrated DB through a mediated service, and if so, is that service part of the sidecar it already talks to or a second kernel-brokered service in the `kernel.env.console` shape? This is the question that decides whether AeroSLS's POSIX environments are PASE-with-IFS or a sealed compatibility box, and it is deliberately left open here rather than answered by omission.
 
 ---
@@ -2387,6 +2969,6 @@ Everything this document asserts about the tree, with its source.
 | No per-partition bound on a tenant's simultaneous connections | one environment starves its neighbours without tripping the rate limiter | P2 |
 | `partition_migrate()` does not move an environment | migration leaves the environment on the source (orphaned or destroyed) | P3 *(closed — increments 3–5)* |
 | `failover_recover_from()` adopts ownership only | a dead node's environments vanish with no name in the report | P3 *(report landed as increment 9; the restore half — the survivor replaying what its own durable storage still holds — as increment 11)* |
-| The failover broadcast path is 24 KiB | a 5.5 MiB environment cannot ride it; the gap must be stated, not implied | P3 (destination (a) or (b)) *((b) as built: named by increment 9, restored from durable storage by increment 11; (a) remains the PASE-grade answer)* |
+| The failover broadcast path is 24 KiB | a 5.5 MiB environment cannot ride it; the gap must be stated, not implied | P3 (destination (a) or (b)) *((b) as built: named by increment 9, restored from durable storage by increment 11; (a) now building as the replica path — §11 Q5, P3 increment 13 onward)* |
 | No thread groups / `clone` / `futex` | Go, threaded CPython and Node are out | unscoped — §9 |
 | No mediated native↔POSIX interop | environments are a sealed box, not PASE-with-IFS | §9, §11 Q6 |

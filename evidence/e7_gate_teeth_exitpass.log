@@ -1,0 +1,63 @@
+E7 gate — B7 under the teeth, second run: the exit scan on process_exit. 2026-11-02.
+image:    sls_operating_system_e3_teeth.iso — make x86-iso-e3 E3_INIT_FEATURES=e3_envs,e7_gate
+          E7_SLOW_BOOT=0 E7_TOOTH=1 (build id 20261102153754)
+machine:  qemu-system-x86_64 -m 1G -smp 2 -accel tcg,thread=multi, 10 GiB NVMe
+invocation: E7G_ARTIFACTS=/tmp/e7-gate-teeth-exit tests/e7_gate_check.sh --teeth
+result:   rc=0 — 7 clauses red across the three teeth, each exactly where its
+          tooth says; the control green; no retry.
+
+What changed: the report is now one rule for both teardown paths, called before
+proc_clear_resume_state() drops the poison identity — process_kill (normal
+kill/exit) and process_exit (the #PF path, and SYS_SLS_EXIT). B7's carve-out for
+fault exits is gone: an adopted tenant that produces no exit line now reddens
+the clause.
+
+=== the exit lines: exactly one per recording ===
+control    [E7-GATE] stack hwm (exit): alloc=65536 poison-span=60912 headroom=57424 deepest=3488 lowest=0x4000000a9050
+descriptor [E7-GATE] stack hwm (exit): alloc=65536 poison-span=60912 headroom=57424 deepest=3488 lowest=0x4000000a9050
+no-fd      [E7-GATE] stack hwm (exit): alloc=65536 poison-span=60912 headroom=58264 deepest=2648 lowest=0x4000000a9398
+no-heap    [E7-GATE] stack hwm (exit): alloc=65536 poison-span=60912 headroom=58264 deepest=2648 lowest=0x4000000a9398
+  (the first run's no-heap had no exit line: the report did not ride
+   process_exit, which is the path its #PF takes — evidence/e7_gate_teeth_b7.log)
+
+=== B7 per recording ===
+control
+  ok: the stack is measured at both boots: deepest 3488 bytes below the entry
+      %rsp (2648 at the stop, the resumed tail went 840 deeper), 57424 of
+      65536 bytes untouched — 87.6% above the 32768-byte floor
+descriptor
+  ok: boot 1 measured the stack (deepest 2648, headroom 58264 of 65536); this
+      recording never adopted the tenant, so its exit scan (3488 bytes) is not
+      the resumed copy's and is not compared to the stop
+no-fd
+  ok: the stack is measured at both boots: deepest 2648 bytes below the entry
+      %rsp (2648 at the stop, the resumed tail went 0 deeper), 58264 of
+      65536 bytes untouched — 88.9% above the 32768-byte floor
+no-heap
+  ok: the stack is measured at both boots: deepest 2648 bytes below the entry
+      %rsp (2648 at the stop, the resumed tail went 0 deeper), 58264 of
+      65536 bytes untouched — 88.9% above the 32768-byte floor
+
+=== the reds (unchanged from increment 22) ===
+descriptor: B2 (no adopted line), B3 (first read 0x0), B4 (second Copying)
+no-fd:      B3 (no read reaches the file class), B4 (no Done)
+no-heap:    B4 (no Done), B5 (the #PF inside the withheld page)
+7 red total; the control fully green.
+
+=== the clause's failure side after the tightening ===
+Before this run, the tightened clause was replayed against two recordings whose
+tenant was adopted and which had no exit line: the FIRST run's no-heap
+recording and the control with its exit line removed. Both reddened with the
+same sentence — "the resumed tenant's teardown has no exit scan — the report
+rides process_kill and process_exit, so an adopted tenant produces one on
+either path, fault included" — so the carve-out is now covered by a named red,
+not by a pass.
+
+After the run, the control recording with its exit line duplicated reddened the
+same clause with "the teardown reported the stack 2 times" — the two paths are
+kept exclusive by B7's count, not only by the kernel's structure.
+
+=== replaying ===
+tests/e7_gate_check.sh --replay /tmp/e7-gate-teeth-exit/teeth/<name> reproduces
+each line above; the control exits 0 as a passing run, and each tooth exits 0
+as a tooth run with exactly its declared reds.

@@ -11,32 +11,95 @@
 #include "process.h"   /* E1: kernel_yield_to_ring3 (the unified boot's hand-over) */
 #include "checkpoint_mgr.h"   /* P1a: the checkpoint sequence a registration belongs to */
 #include "env_payload.h"     /* P1a: the payload pour that follows a replay */
+#include "failover.h"        /* failover_sweep_keepalive() — the blocked RPC wait keeps the heartbeat stream alive */
 
 extern volatile uint64_t kernel_tick_counter;   /* ~10 ms per tick (net_event.c) */
 
 #define ENV_SLOT_NONE 0xFFFFu
-/* A generous wall-clock deadline: creating an environment has init allocate
- * three frame-pool regions and create two sidecars (each copies a shared
- * image), so it is not instantaneous — but a stuck/dead env manager must never
- * hang the HTTP server, so the round trip is bounded. ~10 ms/tick → ~3 s. */
-#define ENV_CREATE_TIMEOUT_TICKS 300u
+/* The round trip's bound is a STALL window, not a fixed wall clock.
+ *
+ * The create is init's work: three frame-pool regions, two sidecars, and the
+ * environment's durable store (P1b). The fixed 300-tick (~3 s) deadline this
+ * replaces was measured on a loaded TCG host on 2026-11-02: one create was
+ * still running at 945 ticks when the deadline expired, so the replay pass
+ * refused a create whose manager was mid-work — and the environment's own
+ * sidecars were wired immediately AFTER the refusal line. The manager was
+ * never absent; the kernel stopped looking. The same boot saw the sibling
+ * ENV_REGISTER answer require 344 ticks, normally a 3-tick call.
+ *
+ * So the window restarts on every observed switch-in of the manager process
+ * (ProcessDescriptor.switches, the same progress signal the P1a payload wait
+ * reads), and ENV_RPC_CEIL_TICKS is the absolute stop that keeps a manager
+ * that keeps running but never answers from holding the HTTP server open.
+ * 1,200 ticks is ~12 s of quiet: four times the worst measured create (284
+ * ticks) and above the 945-tick uninterrupted stretch, so a boot that is slow
+ * all by itself still answers; a manager that has genuinely stopped being
+ * scheduled does not. */
+#define ENV_RPC_STALL_TICKS 1200u
+#define ENV_RPC_CEIL_TICKS  (ENV_RPC_STALL_TICKS * 5u)   /* ~60 s absolute */
 
 static uint16_t g_env_k_rd = ENV_SLOT_NONE;
 static uint16_t g_env_k_wr = ENV_SLOT_NONE;
 static int      g_env_ready = 0;
 static uint32_t g_env_tag = 1;
+/* The process that owns the far end of the control channel — init's env
+ * manager. Its switch-in count is the wait's progress signal; 0 when the
+ * channel was wired by a caller that did not name one (host tests). */
+static uint32_t g_env_mgr_pid = 0;
 
-void env_service_register(uint16_t kernel_chan_r, uint16_t kernel_chan_w) {
+void env_service_register(uint16_t kernel_chan_r, uint16_t kernel_chan_w,
+                          uint32_t manager_pid) {
     g_env_k_rd = kernel_chan_r;
     g_env_k_wr = kernel_chan_w;
+    g_env_mgr_pid = manager_pid;
     g_env_ready = 1;
     kernel_serial_printf(
         "[ENV] control channel wired: kernel ends rd=%u wr=%u\n",
         (unsigned)kernel_chan_r, (unsigned)kernel_chan_w);
 }
 
+/* The manager's switch-in count. Returns 0 when there is no descriptor to
+ * read (the pid is not in the table): that is not progress, and the wait
+ * then falls back to the quiet window rather than treating an absent pid as
+ * a running manager. */
+static int env_service_manager_switches(uint32_t* out) {
+    if (!out) return 0;
+    *out = 0;
+    if (!g_env_mgr_pid) return 0;
+    for (int i = 0; i < PROC_MAX; i++) {
+        if (proc_table[i].active && proc_table[i].pid == g_env_mgr_pid) {
+            *out = proc_table[i].switches;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int env_service_reply_slot(uint16_t slot) {
     return g_env_ready && slot == g_env_k_rd;
+}
+
+/* One non-blocking look at the reply channel. 1 = a usable reply copied into
+ * `out`; 0 = nothing there; -1 = a frame arrived but is not usable as an
+ * answer (malformed or oversized — consumed, not fatal: the manager may still
+ * answer, so the wait keeps going). */
+static int env_service_take_reply(uint8_t* out, uint32_t out_cap,
+                                  uint32_t* out_len) {
+    uint8_t reply[ENV_REPLY_MAX];
+    uint32_t plen = 0, rtag = 0, flags = 0;
+    uint16_t n_caps = 0;
+    uint32_t cap = out_cap < (uint32_t)sizeof(reply) ? out_cap
+                                                     : (uint32_t)sizeof(reply);
+    if (cap_recv_msg(0, g_env_k_rd, reply, cap, &plen, 0, 0, &n_caps,
+                     &rtag, &flags) != 0)
+        return 0;
+    if (plen < ENV_FRAME_SIZE) return -1;
+    uint16_t rty = 0;
+    if (!env_frame_parse(reply, plen, &rty)) return -1;
+    if (plen > out_cap) return -1;
+    for (uint32_t i = 0; i < plen; i++) out[i] = reply[i];
+    if (out_len) *out_len = plen;
+    return 1;
 }
 
 /* One ENV round trip, the raw form: send `ty` with `body`, wait for the reply,
@@ -69,29 +132,38 @@ static int env_service_rpc_raw(uint16_t ty, const uint8_t* body, uint32_t body_l
     if (cap_send_msg(0, g_env_k_wr, req, ENV_FRAME_SIZE + body_len, 0, 0, tag, 0) != 0)
         return -1;
 
-    /* Poll for the reply, handing the CPU to Ring-3 while we wait (below). The
-     * send woke init; the yield lets it run, process the request, and reply.
-     * The deadline keeps a stuck env manager from blocking the HTTP server. */
-    uint64_t deadline = kernel_tick_counter + ENV_CREATE_TIMEOUT_TICKS;
-    while ((int64_t)(kernel_tick_counter - deadline) < 0) {
-        uint8_t reply[ENV_REPLY_MAX];
-        uint32_t plen = 0, rtag = 0, flags = 0;
-        uint16_t n_caps = 0;
-        uint32_t cap = out_cap < (uint32_t)sizeof(reply) ? out_cap : (uint32_t)sizeof(reply);
-        int r = cap_recv_msg(0, g_env_k_rd, reply, cap,
-                             &plen, 0, 0, &n_caps, &rtag, &flags);
-        if (r == 0 && plen >= ENV_FRAME_SIZE) {
-            uint16_t rty = 0;
-            if (env_frame_parse(reply, plen, &rty)) {
-                // The channel is single-flight (one request in flight, drained
-                // above), so the frame that parses IS this request's answer;
-                // how much of it is usable is the caller's question.
-                if (plen > out_cap) return -1;
-                for (uint32_t i = 0; i < plen; i++) out[i] = reply[i];
-                if (out_len) *out_len = plen;
-                return 0;
-            }
+    /* Poll for the reply, handing the CPU to Ring-3 while we wait. The send
+     * woke init; the yield lets it run, process the request, and reply.
+     *
+     * The bound is a STALL window, not a wall clock: it restarts on each
+     * switch-in of the manager process (the create can be one long,
+     * uninterrupted stretch on a loaded TCG host — 945 ticks measured), and
+     * ENV_RPC_CEIL_TICKS stops a manager that keeps running without ever
+     * answering. A manager that has genuinely stopped being scheduled is
+     * still bounded by ENV_RPC_STALL_TICKS, so a dead env manager cannot hang
+     * the HTTP server. */
+    uint64_t start          = kernel_tick_counter;
+    uint64_t stall_deadline = start + ENV_RPC_STALL_TICKS;
+    uint64_t ceiling        = start + ENV_RPC_CEIL_TICKS;
+    uint64_t last_progress  = start;
+    uint32_t last_switch    = 0;
+    (void)env_service_manager_switches(&last_switch);   /* the baseline */
+    int ceiling_hit = 0;
+    for (;;) {
+        /* The channel is single-flight (one request in flight, drained above),
+         * so the frame that parses IS this request's answer; how much of it
+         * is usable is the caller's question. */
+        if (env_service_take_reply(out, out_cap, out_len) > 0) return 0;
+        uint64_t now = kernel_tick_counter;
+        uint32_t sw = 0;
+        if (env_service_manager_switches(&sw) && sw != last_switch) {
+            last_switch = sw;
+            last_progress = now;
+            stall_deadline = now + ENV_RPC_STALL_TICKS;
+            if (stall_deadline > ceiling) stall_deadline = ceiling;
         }
+        if (now >= ceiling) { ceiling_hit = 1; break; }
+        if (now >= stall_deadline) break;
         /* Keep the kernel's periodic service work ticking while we wait, then
          * hand the CPU to Ring-3.
          *
@@ -99,20 +171,37 @@ static int env_service_rpc_raw(uint16_t ty, const uint8_t* body, uint32_t body_l
          * schedules — Ring-3 work runs only while the control plane yields —
          * and smp_uniprocessor_tick() is a no-op once an AP is online, so
          * without this call the spin below is a hole in the cooperative
-         * schedule: init cannot even read the request just queued, the
-         * deadline expires, and its reply arrives after we stopped looking.
+         * schedule: init cannot even read the request just queued, the wait
+         * runs out, and its reply arrives after we stopped looking.
          * That is exactly what the deferred E4 boot check found (6.25 M polls,
          * 0 messages received, with init's own trace printing `req recv'd /
          * reply built / send OK` only after the deadline line). Ring-3 answers
-         * within a few budgets when it is alive; a dead env manager never
-         * answers, which is what the deadline is for. Same call the shell and
-         * HTTP loops' idle points make, and a no-op on every non-unified
-         * boot. */
+         * within a few budgets when it is alive; a manager that stops being
+         * scheduled never answers, which is what the quiet window is for.
+         * Same call the shell and HTTP loops' idle points make, and a no-op on
+         * every non-unified boot. */
         smp_uniprocessor_tick();
+        failover_sweep_keepalive();   /* THIS wait is the create/destroy round trip
+                                      * running on the sweep: without this the
+                                      * leader's heartbeat stream dies here, observers
+                                      * depose it at 150 ticks and — as a quiet
+                                      * follower — it is declared dead after release
+                                      * (the death-during-create race, 2026-10-23) */
         kernel_yield_to_ring3(PROC_CONTROL_PLANE_BUDGET_TICKS);
         __asm__ volatile("pause");
     }
-    return -1;   /* init did not reply before the deadline */
+    /* The last yield may have run the manager for longer than the window —
+     * exactly the 945-tick create above — so a reply that landed while the
+     * control plane was away is an answer, not a timeout. */
+    if (env_service_take_reply(out, out_cap, out_len) > 0) return 0;
+    kernel_serial_printf(
+        "[ENV] no reply to ty=%u after %llu tick(s): %s (last manager "
+        "switch-in %llu tick(s) before the stop)\n",
+        (unsigned)ty, (unsigned long long)(kernel_tick_counter - start),
+        ceiling_hit ? "the absolute ceiling expired"
+                    : "the manager stopped being scheduled",
+        (unsigned long long)(kernel_tick_counter - last_progress));
+    return -1;   /* init did not reply before the bound */
 }
 
 /* The uniform-reply form: the create and destroy paths both answer with
@@ -325,6 +414,42 @@ void env_service_set_restore_payload(int on) {
     es_restore_payload = on ? 1 : 0;
 }
 
+/* E7 increment 22: the tooth this pass installs (env_payload.h). The route
+ * sets it per invocation, the pour arms the adopted Linux task with it, and
+ * it goes back to NONE as soon as the pass is over — the descriptor's own
+ * copy is what the task's later forwards consult. */
+static int es_restore_tooth = ENV_PAYLOAD_TOOTH_NONE;
+
+void env_service_set_restore_tooth(int tooth) {
+    es_restore_tooth = tooth;
+}
+
+/* E7 increment 21: the Linux half of a replay's lifecycle.
+ *
+ * `es_record_has_linux` decides whether the create needs the hold armed at
+ * all — a two-task record's create is byte-for-byte the pre-21 path.
+ *
+ * `es_release_held_linux` is the OTHER end of that hold, and it runs on every
+ * path out of a pour: success, refusal, and the metadata-only skip. A child
+ * the create held and nothing released would never be scheduled again, which
+ * is a worse failure than the second _start the hold exists to prevent. The
+ * record is re-found by identity because the create's own registration is
+ * what the pass just upserted. */
+static int es_record_has_linux(const struct EnvCkptRecord* rec) {
+    if (!rec) return 0;
+    for (uint32_t t = 0; t < rec->n_tasks && t < ENV_CKPT_MAX_TASKS; t++)
+        if (rec->tasks[t].kind == ENV_CKPT_TASK_LINUX) return 1;
+    return 0;
+}
+
+static void es_release_held_linux(const struct EnvCkptRecord* rec) {
+    if (!rec) return;
+    for (uint32_t t = 0; t < rec->n_tasks && t < ENV_CKPT_MAX_TASKS; t++) {
+        if (rec->tasks[t].kind != ENV_CKPT_TASK_LINUX) continue;
+        (void)cap_linux_restore_release(rec->tasks[t].name);
+    }
+}
+
 int env_service_restore_pending(struct EnvSvcRestoreReport* out) {
     if (!out) return -1;
     out->n_pending   = env_ckpt_restore_pending();
@@ -374,14 +499,26 @@ int env_service_restore_pending(struct EnvSvcRestoreReport* out) {
             continue;
         }
 
+        /* E7 increment 21: arm the hold BEFORE the create reaches the sidecar.
+         * The child is spawned by the sidecar's boot, which happens while the
+         * create round trip (or the parked wait below) yields — so the arm
+         * must cover both, and the disarm waits for this environment's pour.
+         * Only a record that names a Linux task arms anything. */
+        int has_linux = es_record_has_linux(&w);
+        if (has_linux) cap_linux_restore_arm(p);
+
         uint16_t status = ENV_ERR_INVAL;
         uint32_t new_id = 0;
         int rc = env_service_create(p, idx, &status, &new_id);
         if (rc != 0) {
+            es_release_held_linux(&w);
+            if (has_linux) cap_linux_restore_disarm(p);
             env_ckpt_restore_refuse(p, idx, ENV_CKPT_REFUSE_CREATE, idx, 0);
             continue;
         }
         if (status != ENV_OK) {
+            es_release_held_linux(&w);
+            if (has_linux) cap_linux_restore_disarm(p);
             env_ckpt_restore_refuse(p, idx, ENV_CKPT_REFUSE_CREATE, idx, status);
             continue;
         }
@@ -394,6 +531,11 @@ int env_service_restore_pending(struct EnvSvcRestoreReport* out) {
             // first, so the destroy's own record bookkeeping finds nothing
             // pending to undo.
             env_ckpt_restore_refuse(p, idx, ENV_CKPT_REFUSE_IDENTITY, idx, new_id);
+            /* The held child is in the partition, not the environment the
+             * destroy ends: release it first so a refused replay cannot
+             * leave a task the scheduler never sees again. */
+            es_release_held_linux(&w);
+            if (has_linux) cap_linux_restore_disarm(p);
             uint16_t dst = ENV_ERR_INVAL;
             uint32_t d_id = 0, d_part = 0;
             (void)env_service_destroy(new_id, p, &dst, &d_id, &d_part);
@@ -436,13 +578,20 @@ int env_service_restore_pending(struct EnvSvcRestoreReport* out) {
      * snapshot recorded. Straight-line and NO yield from here to the last
      * memcpy (env_payload.h's rule): Ring-3 runs only while the control
      * plane yields, so nothing can execute over the memory being poured. */
+    env_payload_set_tooth(es_restore_tooth);
     for (uint32_t d = 0; d < n_done; d++) {
+        const struct EnvCkptRecord* replayed = env_ckpt_find(done[d].p,
+                                                             done[d].idx);
         if (!es_restore_payload) {
             out->n_payload_skips++;
             kernel_serial_printf(
                 "[ENV_PAYLOAD] restore asked for metadata only (partition %u, "
                 "index %u): the replay stands, the contents are withheld\n",
                 (unsigned)done[d].p, (unsigned)done[d].idx);
+            /* A held child of a metadata-only replay is released at once:
+             * its create ran, and nothing will pour a context into it. */
+            es_release_held_linux(replayed);
+            cap_linux_restore_disarm(done[d].p);
             continue;
         }
         uint32_t pages = 0, cons = 0;
@@ -459,7 +608,15 @@ int env_service_restore_pending(struct EnvSvcRestoreReport* out) {
                 "index %u): %s -- the replay stands; contents are not claimed\n",
                 (unsigned)done[d].p, (unsigned)done[d].idx, why);
         }
+        /* The hold's other end, on BOTH outcomes: a successful pour has
+         * installed the captured context, and a refused one has not — but
+         * either way this task must become schedulable again. The release
+         * line names the rip the task will execute, so the transcript says
+         * which of the two happened. */
+        es_release_held_linux(replayed);
+        cap_linux_restore_disarm(done[d].p);
     }
+    env_payload_set_tooth(ENV_PAYLOAD_TOOTH_NONE);
 
     out->n_remaining = env_ckpt_restore_pending();
     out->n_refused   = env_ckpt_restore_refused() - refused_before;

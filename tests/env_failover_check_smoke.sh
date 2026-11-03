@@ -52,6 +52,10 @@
 #   * `tracker-shift-broken` — env_ckpt.c's drop() stops shifting the
 #     refused mark, so after a drop it points at a different environment
 #     and a healthy one is reported refused.
+#   * the six N teeth — destination (a)'s promotion wired out one link at
+#     a time (the lookup, the newer-wins ordering, the promotion call, the
+#     replay call) and its classification unpinned from the host test twice
+#     (the hole-to-replica restore, the fallback's dropped slot).
 #
 # The vacuity control is last and mandatory: the guard must be GREEN on the
 # real, unmutated tree. Without it, a guard that always failed would pass
@@ -236,6 +240,37 @@ tooth "restored-not-pinned: the host test asserts the restored count only >= 0 (
 seed "$W/shift"
 sed -i '/ec_restore_refused_slot\[i\] = ec_restore_refused_slot\[i + 1\];/d' "$W/shift/kernel/env_ckpt.c"
 tooth "tracker-shift-broken: drop() no longer shifts the refused mark (after a drop it describes a different environment)" "M" "$W/shift" kernel/env_ckpt.c "$ROOT/kernel/env_ckpt.c"
+
+# ── N: destination (a)'s third increment — the replica fills the hole ──────
+# Four ways the promotion can be present in the source and absent from the
+# wiring, plus two ways its CLASSIFICATION can quietly stop being a property.
+# Each reddens clause N and nothing about the older (b) clauses, which is
+# the point: (a) landed on top of (b), and a reader deleting (a) must be
+# told they deleted (a).
+
+seed "$W/nocons"
+sed -i '/env_replica_lookup(part_id, env_idx, \&rep)/d' "$W/nocons/kernel/failover.c"
+tooth "replica-not-consulted: the survivor never looks in its replica band (a fillable hole is named 'no durable record' again)" "N" "$W/nocons" kernel/failover.c "$ROOT/kernel/failover.c"
+
+seed "$W/noorder"
+sed -i 's/(uint64_t)rec->sequence < rep.seq/(uint64_t)0 < rep.seq/' "$W/noorder/kernel/failover.c"
+tooth "newer-wins-gone: the capture-seq comparison between record and replica removed (the older source could be applied over the newer)" "N" "$W/noorder" kernel/failover.c "$ROOT/kernel/failover.c"
+
+seed "$W/nopromote"
+sed -i 's/env_replica_promote(part_id, env_idx)/env_promote_GONE(part_id, env_idx)/' "$W/nopromote/kernel/failover.c"
+tooth "no-promotion: a found replica is never staged (destination (a) without its third increment)" "N" "$W/nopromote" kernel/failover.c "$ROOT/kernel/failover.c"
+
+seed "$W/noreplay"
+sed -i 's/env_migrate_restore(part_id, env_idx)/env_migrate_RESTORE_GONE(part_id, env_idx)/' "$W/noreplay/kernel/failover.c"
+tooth "no-replay-of-replica: the promoted replica is never replayed through env_migrate_restore() (staged bytes, no classifier)" "N" "$W/noreplay" kernel/failover.c "$ROOT/kernel/failover.c"
+
+seed "$W/rpin2"
+sed -i 's/both hole environments came back from the REPLICA/both hole environments came back somehow/' "$W/rpin2/tests/checkpoint_recovery_host_test.c"
+tooth "replica-restore-not-pinned: the host test no longer pins the hole-to-replica restore (the count is a serial claim again)" "N" "$W/rpin2" tests/checkpoint_recovery_host_test.c "$ROOT/tests/checkpoint_recovery_host_test.c"
+
+seed "$W/fbpin"
+sed -i 's/the staged slot was dropped on the way/the staged slot was left standing/' "$W/fbpin/tests/checkpoint_recovery_host_test.c"
+tooth "fallback-not-pinned: the fallback arm stops asserting the staged slot was dropped (a double-drive under (b) reads as a plain gap)" "N" "$W/fbpin" tests/checkpoint_recovery_host_test.c "$ROOT/tests/checkpoint_recovery_host_test.c"
 
 # ── The vacuity control: green on the real tree ───────────────────────────
 out="$(bash "$GUARD" 2>&1)"; rc=$?

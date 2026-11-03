@@ -99,9 +99,12 @@ enum EnvMigrateStatus {
                                           * leave every interior pointer dangling —
                                           * env_payload's EP_REFUSE_PLACEMENT rule,
                                           * applied to bytes that arrived by wire */
-    ENV_MIGRATE_REFUSE_EXTENT      = 17, /* the fresh record's durable extent disagrees
-                                          * with the staged one — the pages crossed for
-                                          * an LBA this node did not allocate */
+    ENV_MIGRATE_REFUSE_EXTENT      = 17, /* this node has no durable extent able to
+                                          * receive the staged pages — extent
+                                          * coordinates are node-local (band slots
+                                          * come from each node's own history), so the
+                                          * gate is existence and size, never cross-node
+                                          * LBA equality */
     ENV_MIGRATE_REFUSE_PARKED      = 18, /* the sidecars never reached the parked posture
                                           * the pour may restore into */
 };
@@ -132,7 +135,7 @@ static inline const char* env_migrate_status_name(int status) {
     case ENV_MIGRATE_REFUSE_CREATE:      return "the destination's create round trip failed";
     case ENV_MIGRATE_REFUSE_IDENTITY:    return "what came back is not what crossed";
     case ENV_MIGRATE_REFUSE_PLACEMENT:   return "fresh environment landed off the staged bases";
-    case ENV_MIGRATE_REFUSE_EXTENT:      return "durable extent disagrees with the staged one";
+    case ENV_MIGRATE_REFUSE_EXTENT:      return "no durable extent here for the staged pages";
     case ENV_MIGRATE_REFUSE_PARKED:      return "sidecars never reached the parked posture";
     default:                             return "unknown status";
     }
@@ -152,6 +155,17 @@ static inline const char* env_migrate_status_name(int status) {
  * being staged is refused rather than clobbering the slot in flight. */
 int env_migrate_send(uint32_t partition_id, uint32_t index, uint32_t dest_node_id);
 
+/* The page stream BOTH senders stand on (env_migrate.c owns the body —
+ * posture gates, the BEGIN round trip, the fragment retransmit ladder).
+ * begin_opcode picks the receiver's table (18 migration / 25 replica) and
+ * family tags every log line, so a replica push never reads as an ownership
+ * handoff in an operator's grep. Returns ENV_MIGRATE_* by name; does NOT
+ * touch env_migrate_last_status() — the caller stores what it needs.
+ * The caller holds the freeze over the sidecars this reads. */
+int env_migrate_send_stream(const struct EnvCkptRecord* rec,
+                            uint32_t dest_node_id, uint16_t begin_opcode,
+                            const char* family);
+
 /* The status of the most recent env_migrate_send() on this node. */
 int env_migrate_last_status(void);
 
@@ -159,9 +173,34 @@ int env_migrate_last_status(void);
  * region's frames, plus the durable extent's pages (8 NVMe sectors per
  * 4 KiB page, the stream family's own sector geometry). Both sides compute
  * this from the SAME record — the one that crossed in the BEGIN — and the
- * destination REFUSES a BEGIN whose declared count disagrees, so the page
- * numbering cannot silently drift between the two kernels. */
+ * destination REFUSES a BEGIN whose declared total carries fewer payload
+ * pages than the record names (or an image tail past the ceiling), so the
+ * page numbering cannot silently drift between the two kernels. The
+ * staged total may carry the image-window tail beyond these payload pages:
+ * its count is the difference, and the restore validates it against this
+ * node's own fresh sidecars' windows (env_payload.h's shared order). */
 uint32_t env_migrate_payload_pages(const struct EnvCkptRecord* rec);
+
+/* The image-window tail the staged payload carries after the payload
+ * pages (region frames + durable extent). The reboot payload has always
+ * captured the sidecars' image-window frames — the boot stack and the
+ * .data/.bss the resumed context RUNS on; a staged payload with only the
+ * region frames pours a source heap under a destination sidecar whose own
+ * stack frame slots hold different locals, and the restored environment
+ * #PF'd on its first console input (live find, 2026-10-23). Collected on
+ * the send side from the FROZEN sidecars and re-derived on the restore
+ * side from the FRESH sidecars, in env_payload.h's shared canonical order —
+ * so no vaddrs cross the wire, and the page count that crossed is what
+ * validates the halves. Ceiling: a POSIX sidecar image is ~305 pages and a
+ * ramdisk sidecar's ~26; 1024 is generous headroom under the receive
+ * side's 4096-page staging ceiling.
+ *
+ * Exported here (was env_migrate.c's private define) because this is the
+ * ONE number both wire receivers gate a BEGIN on: a declared total outside
+ * [payload_pages, payload_pages + this] is refused by name on either side,
+ * so the replica receiver (kernel/env_replica.c) must see the same ceiling
+ * this file sends under. */
+#define ENV_MIGRATE_IMAGE_MAX 1024u
 
 /* ─── The migration's environment step (P3 increment 3) ─────────────────────
  * Everything partition_migrate() needs from this module, in one call, so the
@@ -326,8 +365,11 @@ int env_migrate_in_flight(void);
 
 /* The deferral's bounds. A staging slot defers death detection for at most
  * SLOT_GRACE after its BEGIN — the restore's attempt budget (tries x
- * (create RTT + the 30 s parked-posture wait)) with room for a slow TCG
- * pour. A migration's RESOLUTION also keeps a tail: both points where a
+ * (create RTT + the parked-posture wait, which is stall-bounded: a 30 s
+ * quiet window that restarts while the environment is still being scheduled,
+ * under a ~3 min ceiling — env_payload.h) with room for a slow TCG pour.
+ * The ceiling is deliberately below THIS grace, since the wait runs inside a
+ * restore the sweep is already covering. A migration's RESOLUTION also keeps a tail: both points where a
  * migration ends on this node — the destination's slot drop (the SOURCE's
  * confirmation walk, its LIVE polls and destroy round trip, can block the
  * source's own sweep for seconds AFTER the drop) and the source's own
@@ -336,9 +378,25 @@ int env_migrate_in_flight(void);
  * Without it the live 2-node runs of 2026-10-13 declared a live
  * counterparty DEAD and adopted it (the destination after the drop, the
  * source after its walk completed) — a false positive that survived every
- * gate the confirmation guard itself checks. */
+ * gate the confirmation guard itself checks.
+ *
+ * Sized to the window the tail actually defends, NOT to the intent
+ * budget: by the time either resolution point fires, every multi-period
+ * block either side can enter is already announced by its OWN intent
+ * (partition_migrate's announce covers the source's send; the restore
+ * loop's second-half announce covers the destination's restore). What is
+ * left unannounced is one sweep's resume latency — the counterparty's
+ * sweep finishing its current slice and reaching the heartbeat it owes —
+ * so the tail is one sweep period (the ~10 s the confirm walk polls on)
+ * plus margin. The old 300 s matched the intent budget from BEFORE the
+ * intent arm existed; it cost the adoption guard its whole wait on the
+ * 2026-10-24 runtime-suite run: the destination's drop stamped the tail,
+ * and for the next five minutes the surviving LEADER deferred every
+ * death declaration — including a SIGKILLed node's — so nothing was ever
+ * adopted. A blind leader for five minutes is a worse failure than the
+ * one this tail exists to prevent. */
 #define ENV_MIGRATE_SLOT_GRACE_TICKS        60000ull  /* 600 s at ~100 Hz */
-#define ENV_MIGRATE_RESOLVED_GRACE_TICKS     30000ull  /* 300 s */
+#define ENV_MIGRATE_RESOLVED_GRACE_TICKS     1500ull  /* 15 s: one sweep period + margin */
 
 /* ─── Migration intent (the idle-observer arm) ──────────────────────────────
  * The three grace faces above cover only a node that HOLDS migration state:

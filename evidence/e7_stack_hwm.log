@@ -1,0 +1,35 @@
+E7 gate — the Linux task's stack high-water (Q2). 2026-11-01.
+image:    sls_operating_system_e3_gate.iso — make x86-iso-e3
+          E3_INIT_FEATURES=e3_envs,e7_gate E7_SLOW_BOOT=0 E7_TOOTH= (empty:
+          the control profile; the make knob is empty-or-1 and refuses 0)
+machine:  qemu-system-x86_64 -m 1G -smp 2 -accel tcg,thread=multi, 10 GiB NVMe
+invocation: E7G_DRILL=0 E7G_BUILD=0 \
+            E7G_ISO=sls_operating_system_e3_gate.iso \
+            tests/e7_gate_check.sh --live
+method:   the gate profile fills [stack base, entry %rsp) with 0xA5 at create
+          and scans the leading untouched run at the stop (boot 1) and at
+          teardown (boot 2, whose captured pages carried the pattern through
+          the checkpoint). alloc is the whole region; poison-span is the bytes
+          below the entry %rsp; headroom is the untouched prefix;
+          deepest = poison-span - headroom; lowest = base + headroom.
+
+=== boot 1, at the stop (the work half) ===
+[E7-GATE] stack hwm (stop): alloc=65536 poison-span=60912 headroom=58264 deepest=2648 lowest=0x4000000a9398
+
+=== boot 2, at the resumed tenant's teardown (the full run) ===
+[E7-GATE] stack hwm (exit): alloc=65536 poison-span=60912 headroom=57424 deepest=3488 lowest=0x4000000a9050
+
+The deepest point of the two boots is 3,488 bytes below the entry %rsp at
+lowest=0x4000000a9050: 8,112 bytes used from the region's top (4,096 of them
+the BIB page, plus the initial image), 57,424 bytes untouched — 87.6% of the
+64 KiB budget. The stop alone saw 2,648 bytes; the resumed tail went 840 bytes
+deeper, which is why the full-run number is the teardown one.
+
+The same run's gate clauses all pass (B1–B6; D1/D2 are not applicable because
+the plain control image has no drill): "e7_gate_check: the gate run passes —
+artifacts in /tmp/e7-gate-256108". The drill-image run from the same tree
+(built by the harness before the exit scan existed) reported the same stop
+number: headroom=58264 deepest=2648 (artifacts /tmp/e7-gate-245023).
+
+Reproduce: build the control image as above, then the invocation line; the two
+lines above are in boot1.log and boot2.log of the artifact directory.

@@ -44,6 +44,9 @@
 //! - `net_client` — `NetClient`: NET_* protocol client for socket I/O
 //!   (handshake, connect, send/recv over a channel endpoint to the network
 //!   driver sidecar).
+//! - `catalog_client` — `CatalogClient`: CAT_* protocol client for §9.1's
+//!   mediated, read-only, partition-scoped catalog (info/list/stat/read
+//!   over a channel endpoint to `kernel.env.catalog`).
 //! - `entry`      — the real `extern "C"` entry point (feature `target`).
 //!
 //! Like every crate in the chain, `boot` is generic over
@@ -58,6 +61,7 @@ extern crate alloc;
 pub mod allocator;
 pub mod applets;
 pub mod boot;
+pub mod catalog_client;
 pub mod e7_candidate;
 pub mod e7_firstuser;
 pub mod e7_probe;

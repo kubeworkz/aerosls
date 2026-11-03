@@ -12,9 +12,9 @@
 use aerosls_proto::env_proto::{
     self, EnvFrame, RegisterRegion, RegisterReply, ENV_CREATE, ENV_DESTROY, ENV_ERR_CAPACITY,
     ENV_ERR_FULL, ENV_ERR_INVAL, ENV_ERR_NOENT, ENV_ERR_NOMEM, ENV_ERR_PART, ENV_ERR_QUOTA,
-    ENV_OK, ENV_REGISTER,
-    REGION_POSIX_HEAP, REGION_RD_HEAP, REGION_RD_STORAGE, TASK_POSIX_SIDECAR,
-    TASK_RAMDISK_SIDECAR,
+    ENV_OK, ENV_REGISTER, LINUX_TASK_NAME,
+    REGION_POSIX_HEAP, REGION_RD_HEAP, REGION_RD_STORAGE, TASK_LINUX,
+    TASK_POSIX_SIDECAR, TASK_RAMDISK_SIDECAR,
 };
 use aerosls_proto::kabi::{
     Kernel, ERR_NOMEM, ENV_STORAGE_ERR_IO, ENV_STORAGE_ERR_NOSLOT,
@@ -55,6 +55,13 @@ pub struct EnvImages {
 pub struct Environment {
     pub partition: u32,
     pub index: u32,
+    /// E7 increment 20: this environment carries the gate profile (the
+    /// `e7_gate` build's designated index). It selects the manifest's
+    /// FLAG_GATE bit AND the record's third task — the Linux tenant the
+    /// sidecar spawns under `LINUX_TASK_NAME`. Kept on the environment
+    /// because the registration reply is answered long after the create's
+    /// local `gate` decision, and a restore must name the same task list.
+    pub gate: bool,
     /// The three private regions this environment owns, kept per-environment
     /// from E5: a destroy has to hand each of them back individually (E4 only
     /// ever needed the ramdisk heap's base at create time), so all three bases
@@ -209,13 +216,31 @@ pub fn create_environment<K: Kernel>(
 
     // Tenant POSIX: tenant profile (no hardware/network — E2), wired to THIS
     // environment's ramdisk, placed in the same partition.
-    let px_manifest = posix_manifest::build_posix_manifest_tenant(
-        px_name.as_str(),
-        rd_name.as_str(),
-        images.posix_kaddr,
-        images.posix_size,
-        px_heap,
-    );
+    //
+    // E7 increment 20: on an `e7_gate` build, environment index 1 is the gate
+    // profile — the SAME designation the E3 boot makes for its env 1
+    // (`entry::spawn_e3_tenant_envs`), so a control-plane create of the
+    // designated index produces the environment the gate harness can
+    // checkpoint. Every other index (and every other build) gets the plain
+    // tenant manifest, byte for byte.
+    let gate = cfg!(feature = "e7_gate") && index == 1;
+    let px_manifest = if gate {
+        posix_manifest::build_posix_manifest_tenant_gate(
+            px_name.as_str(),
+            rd_name.as_str(),
+            images.posix_kaddr,
+            images.posix_size,
+            px_heap,
+        )
+    } else {
+        posix_manifest::build_posix_manifest_tenant(
+            px_name.as_str(),
+            rd_name.as_str(),
+            images.posix_kaddr,
+            images.posix_size,
+            px_heap,
+        )
+    };
     let (posix_r, posix_w) = k.create_sidecar_in(&px_manifest, partition).map_err(|e| {
         // P3 inc. 1: the ramdisk already exists under its name — END it
         // first and confirm the kernel finished the job (kernel/process.c
@@ -242,6 +267,7 @@ pub fn create_environment<K: Kernel>(
     Ok(Environment {
         partition,
         index,
+        gate,
         rd_heap,
         rd_storage,
         px_heap,
@@ -303,6 +329,17 @@ pub fn environment_register_reply(env_id: u32, env: &Environment) -> RegisterRep
     let px = posix_name(env.index);
     r.set_task(0, rd.as_str(), TASK_RAMDISK_SIDECAR);
     r.set_task(1, px.as_str(), TASK_POSIX_SIDECAR);
+    // E7 increment 20: the gate profile's third task. The NAME is identity
+    // (the sidecar spawns exactly this tenant, and the kernel's stamp at that
+    // spawn requires the name to match); the ENTRY/STACK are not init's to
+    // state — the task does not exist yet — so the kernel fills them
+    // (env_ckpt_linux_task_stamp) before any checkpoint can write the record.
+    // Naming it HERE, from the same `gate` bit that selected the manifest, is
+    // what makes a replay's create name the same task list: both boots derive
+    // it from the profile, never from whatever happened to be spawned.
+    if env.gate {
+        r.set_task(2, LINUX_TASK_NAME, TASK_LINUX);
+    }
     r
 }
 
@@ -629,6 +666,40 @@ impl EnvManager {
                     Some(v) => v,
                     None => return self.reply(reply, ENV_CREATE, ENV_ERR_INVAL, 0, 0),
                 };
+                // Idempotent by identity: an environment at (partition, index)
+                // that already stands IS the answer to this create.
+                //
+                // The caller cannot tell "created" from "created, but my reply
+                // missed the deadline": env_service_create() returns -1 either
+                // way (kernel/env_service.c drains the stale reply and retries on
+                // the next sweep), and the migrate restore's REFUSE_CREATE arm
+                // then retried ENV_CREATE on the following period — under load on
+                // the 3-node TCG cluster that first reply did arrive late, so the
+                // retry reached here with the environment already built. Without
+                // this arm it built a SECOND one at the same identity: two
+                // sidecars both named aerosls.posix.<index> (the later one
+                // shadowing the first in cap's name registry), ~1700 frames
+                // charged twice, and — because placement on this OS is a
+                // deterministic function of the ascending frame watermark — the
+                // retry's regions landed one environment past the staged bases,
+                // where the restore's placement gate refused every remaining
+                // attempt ("fresh environment landed off the staged bases",
+                // guard env_migrate_confirm_live, 2026-10-26). Answering with the
+                // environment that already exists makes the retry converge on the
+                // same frames instead of allocating past them.
+                //
+                // Nothing stale can be handed back: `forget_dead_environments`
+                // ran above, so an entry here has live sidecars. Placed before
+                // the capacity check because an identity that already exists
+                // needs no new room.
+                if let Some(pos) = self
+                    .envs
+                    .iter()
+                    .position(|(_, e)| e.partition == partition && e.index == index)
+                {
+                    let id = self.envs[pos].0;
+                    return self.reply(reply, ENV_CREATE, ENV_OK, id, partition);
+                }
                 if self.envs.len() >= self.max_envs {
                     return self.reply(reply, ENV_CREATE, ENV_ERR_FULL, 0, partition);
                 }
@@ -1028,6 +1099,51 @@ mod tests {
         let n2 = mgr.handle_request(&k, &create_req(7, 1), &mut reply);
         assert_eq!(reply_status(&reply, n2).1, 2);
         assert_eq!(mgr.environments().len(), 2);
+    }
+
+    /// The lost-reply retry: a create for an identity that already stands
+    /// answers with THAT environment instead of building a second one at the
+    /// same (partition, index).
+    ///
+    /// The caller this protects cannot distinguish "nothing was created" from
+    /// "created, but my reply missed the deadline" (env_service_create returns
+    /// -1 for both), and the migrate restore's sweep retries the round trip on
+    /// its next period. Built twice, the identity would grow two pairs of
+    /// sidecars under one name — the second shadowing the first — and, because
+    /// regions are placed at the ascending frame watermark, the retry's
+    /// environment would land a whole environment past the staged bases the
+    /// restore's placement gate requires (the live refusal, 2026-10-26).
+    #[test]
+    fn a_second_create_for_an_identity_that_exists_answers_with_it_and_builds_nothing() {
+        let k = SimKernel::new();
+        let mut mgr = EnvManager::new(images(), 8);
+        let mut reply = [0u8; 64];
+        let n1 = mgr.handle_request(&k, &create_req(6, 1), &mut reply);
+        let first = reply_status(&reply, n1).1;
+
+        let n2 = mgr.handle_request(&k, &create_req(6, 1), &mut reply);
+        assert_eq!(reply_status(&reply, n2), (ENV_OK, first, 6),
+                   "the retry is answered with the environment that already stands");
+        assert_eq!(mgr.environments().len(), 1,
+                   "one identity, one environment — the retry did not duplicate it");
+        assert_eq!(k.created().len(), 2,
+                   "still just the first create's two sidecars");
+        assert_eq!(k.regions().len(), 3,
+                   "the retry took no frames — the watermark must not move");
+
+        // A different index is a different environment, and a full manager that
+        // already holds THIS identity still answers it (the identity check sits
+        // ahead of the capacity check).
+        let mut full = EnvManager::new(images(), 1);
+        let mut r2 = [0u8; 64];
+        let m1 = full.handle_request(&k, &create_req(7, 1), &mut r2);
+        let held = reply_status(&r2, m1).1;
+        let m2 = full.handle_request(&k, &create_req(7, 1), &mut r2);
+        assert_eq!(reply_status(&r2, m2), (ENV_OK, held, 7),
+                   "an identity that exists is not refused for lack of room");
+        let m3 = full.handle_request(&k, &create_req(7, 2), &mut r2);
+        assert_eq!(reply_status(&r2, m3).0, ENV_ERR_FULL,
+                   "a NEW identity at capacity is still refused");
     }
 
     #[test]

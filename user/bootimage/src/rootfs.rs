@@ -13,7 +13,12 @@ use aerosls_vfs::aerofs::ImageBuilder;
 /// - `/etc/init.rc` — boot script (run by the `init` applet)
 /// - `/bin/` directory (for future applets)
 /// - `/tmp` directory (mounted as ramfs by the sidecar)
-pub fn build_rootfs() -> Vec<u8> {
+///
+/// `quiet` selects the gate image's script: the demo applets' IRQ storm
+/// owns the serial port and starves the E7 gate tenant's own evidence, so
+/// the gate build drops them. The default image keeps the full script —
+/// the flag comes from the build line, so `make x86-iso` is unchanged.
+pub fn build_rootfs(quiet: bool) -> Vec<u8> {
     let mut b = ImageBuilder::new();
 
     // Root directory structure
@@ -23,9 +28,10 @@ pub fn build_rootfs() -> Vec<u8> {
     b.add_dir("/dev", 0o755);
 
     // Boot script — the `init` applet reads this and forks one child per line.
-    b.add_file(
-        "/etc/init.rc",
-        b"echo AeroSLS Phase 5 booting\n\
+    // The gate profile's line set stops at `caps`: no netcheck/nettest/irqtest/
+    // devtest, whose IRQ storm and respawn churn the serial port while the
+    // gate's own workload is running.
+    const FULL_RC: &[u8] = b"echo AeroSLS Phase 5 booting\n\
           echo Root filesystem mounted\n\
           ls /\n\
           echo Testing network...\n\
@@ -36,7 +42,17 @@ pub fn build_rootfs() -> Vec<u8> {
           caps\n\
           echo System ready\n\
           echo\n\
-          sh\n",
+          sh\n";
+    const GATE_RC: &[u8] = b"echo AeroSLS Phase 5 booting\n\
+          echo Root filesystem mounted\n\
+          ls /\n\
+          caps\n\
+          echo System ready\n\
+          echo\n\
+          sh\n";
+    b.add_file(
+        "/etc/init.rc",
+        if quiet { GATE_RC } else { FULL_RC },
         0o644,
     );
 

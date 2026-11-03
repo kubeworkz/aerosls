@@ -128,7 +128,17 @@ void kernel_serial_printf(const char* fmt, ...) {
             if (p[0]=='E'&&p[1]=='R'&&p[2]=='R'&&p[3]=='O'&&p[4]=='R') { serial_error_lines++; break; } }
 }
 void update_page_table_permissions_globally(uint32_t force_read_only) { (void)force_read_only; }
-void failover_note_heartbeat(uint32_t node_id, uint64_t now) { (void)node_id; (void)now; }
+/* Recording stub: Scenario 21b asserts that a received DSPP_CMD_LIVENESS
+ * reaches the failover refresher (and reaches nothing else). Recording is
+ * harmless to every other scenario -- they drive this as a void call and
+ * assert on consensus state, never on this counter. */
+uint32_t g_failover_hb_calls = 0;
+uint32_t g_failover_hb_node  = 0;
+void failover_note_heartbeat(uint32_t node_id, uint64_t now) {
+    (void)now;
+    g_failover_hb_calls++;
+    g_failover_hb_node = node_id;
+}
 
 /* Phase 4: call-tracked, unlike the global stub above -- Scenario 13 below
  * needs to prove partition_lease_trigger_election()/the quorum-achieved
@@ -580,8 +590,65 @@ int main(void) {
         for (int i = 0; i < 10000; i++) check_consensus_heartbeat_tick(now_ticks);
         CHECK(local_cluster_state.current_term == term_before,
               "*** 10000 ticks at a FROZEN clock cause no campaign -- the timeout is elapsed time, not call count ***");
-        CHECK(transmit_call_count == 0, "...and nothing is transmitted");
+        CHECK(transmit_call_count == 1,
+              "*** 10000 frozen-clock calls transmit exactly ONE frame -- the follower's rate-limited liveness beat, never a campaign ***");
+        CHECK(((struct DSPPPacketHeader*)last_packet)->opcode == DSPP_CMD_LIVENESS,
+              "...and that one frame is DSPP_CMD_LIVENESS");
         CHECK(local_cluster_state.role == ROLE_FOLLOWER, "...and the node stays FOLLOWER");
+    }
+
+    /* Scenario 21b: the liveness beat -- rate-limited TX, authority-free RX.
+     *
+     * The ex-leader hole (live 3-node find, 2026-10-24): a demoted follower
+     * transmitted nothing that fed failover_note_heartbeat() on any peer,
+     * so its watch entry aged past the death threshold while it was alive
+     * and serving -- declared DEAD 301 ticks after its intent release,
+     * because the release was the last frame it would ever send. Two halves
+     * pinned: every non-leader beat is rate-limited (a busy loop must not
+     * become a broadcast storm), and receiving one refreshes failover
+     * liveness WITHOUT touching the election watchdog -- follower chatter
+     * that reset the timer would keep a dead leader's authority alive and
+     * elections would never fire. */
+    {
+        cluster_init(1);
+        now_ticks = 40000;
+        local_cluster_state.role = ROLE_FOLLOWER;
+        local_cluster_state.last_heartbeat_tick = now_ticks;
+        local_cluster_state.last_liveness_sent_tick = 0;
+
+        transmit_call_count = 0;
+        check_consensus_heartbeat_tick(now_ticks);
+        CHECK(transmit_call_count == 1,
+              "*** a FOLLOWER's first tick transmits its liveness beat ***");
+        CHECK(((struct DSPPPacketHeader*)last_packet)->opcode == DSPP_CMD_LIVENESS,
+              "*** ...and the frame is DSPP_CMD_LIVENESS, not a campaign or an authority beat ***");
+        for (int i = 0; i < 1000; i++) check_consensus_heartbeat_tick(now_ticks);
+        CHECK(transmit_call_count == 1,
+              "1000 further calls inside one interval send NOTHING -- the beat is rate-limited like the leader's");
+        now_ticks += LIVENESS_BEAT_TICKS;
+        check_consensus_heartbeat_tick(now_ticks);
+        CHECK(transmit_call_count == 2,
+              "...and the next interval beats again -- the limiter does not latch shut");
+
+        /* RX: refreshes failover liveness, never the election machinery. */
+        uint64_t hb_before    = local_cluster_state.last_heartbeat_tick;
+        uint32_t term_before  = local_cluster_state.current_term;
+        uint32_t calls_before = g_failover_hb_calls;
+        struct DSPPFullPagePacket lb;
+        memset(&lb, 0, sizeof(lb));
+        lb.header.magic          = DSPP_MAGIC;
+        lb.header.opcode         = DSPP_CMD_LIVENESS;
+        lb.header.node_source_id = 2;
+        lb.header.transaction_id = local_cluster_state.current_term + 9;
+        process_consensus_packet(&lb, now_ticks);
+        CHECK(g_failover_hb_calls == calls_before + 1,
+              "*** a received LIVENESS beat notes failover liveness for its sender ***");
+        CHECK(g_failover_hb_node == 2, "...naming the node that sent it");
+        CHECK(local_cluster_state.last_heartbeat_tick == hb_before,
+              "*** ...but does NOT reset the election watchdog -- liveness is not authority ***");
+        CHECK(local_cluster_state.current_term == term_before &&
+              local_cluster_state.role == ROLE_FOLLOWER,
+              "...and a term on the frame adopts nothing: term and role untouched");
     }
 
     /* Scenario 22: one call after the timeout DOES campaign. The mirror of
@@ -1029,6 +1096,17 @@ int main(void) {
         }
         partition_lease_heartbeat_tick(43, now_ticks);
         CHECK(last_packet_size + 14 <= 1500, "*** PARTITION_HEARTBEAT fits ***");
+
+        /* 7. DSPP_CMD_LIVENESS -- a new send site, proven like item 3 was
+         *    rather than assumed: bare header, no payload, and no campaign
+         *    racing it (the watchdog is stamped so this call stays quiet). */
+        local_cluster_state.role = ROLE_FOLLOWER;
+        local_cluster_state.last_heartbeat_tick = now_ticks;
+        local_cluster_state.last_liveness_sent_tick = 0;
+        check_consensus_heartbeat_tick(now_ticks);
+        CHECK(last_packet_size + 14 <= 1500, "*** DSPP_CMD_LIVENESS fits ***");
+        CHECK(((struct DSPPPacketHeader*)last_packet)->opcode == DSPP_CMD_LIVENESS,
+              "...and the frame that fit was the liveness beat itself");
     }
 
     /* ═══════════════════════════════════════════════════════════════════════

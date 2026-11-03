@@ -60,7 +60,9 @@
 #include "env_service.h"
 #include "env_console.h"
 #include "env_storage.h"   // POSIX-Environments Roadmap v0.2 Phase P1b
+#include "env_ckpt.h"       // E7 increment 20: the Linux task's record stamp at spawn
 #include "net_socket_service.h"  // POSIX-Environments P2 first increment
+#include "env_catalog.h"        // POSIX-Environments §9 interop surface
 #include "../arch/x86/user_paging.h"
 #include <stddef.h>
 
@@ -3295,6 +3297,82 @@ static uint32_t bib_flags = 0;
 
 void cap_set_bib_flags(uint32_t flags) { bib_flags = flags; }
 
+/* ─── E7 increment 21: the restore's hold (cap.h) ───────────────────────────
+ * A small array of partitions, not a single slot: one restore pass replays
+ * every pending record through its own create, and a later arm must not
+ * erase an earlier one whose sidecar has not booted (and spawned its
+ * tenant) yet. Eight is the record layer's own per-pass ceiling.
+ *
+ * The hold is checked at the ONE place every sidecar create passes through
+ * — step 10's release — and only for a LINUX child, so an SLS sidecar's
+ * release is byte-for-byte what it was. */
+#define CAP_LINUX_RESTORE_HOLD_MAX 8u
+static uint32_t cap_linux_hold_partitions[CAP_LINUX_RESTORE_HOLD_MAX];
+static uint32_t cap_linux_hold_count = 0;
+
+void cap_linux_restore_arm(uint32_t partition_id) {
+    for (uint32_t i = 0; i < cap_linux_hold_count; i++)
+        if (cap_linux_hold_partitions[i] == partition_id) return;
+    if (cap_linux_hold_count >= CAP_LINUX_RESTORE_HOLD_MAX) {
+        kernel_serial_printf(
+            "[CS] restore hold table full — partition %u's spawns will not be "
+            "held for the pour\n", (unsigned)partition_id);
+        return;
+    }
+    cap_linux_hold_partitions[cap_linux_hold_count++] = partition_id;
+    kernel_serial_printf(
+        "[CS] restore hold armed for partition %u — a Linux child born now is "
+        "held until the payload's pour adopts it\n", (unsigned)partition_id);
+}
+
+void cap_linux_restore_disarm(uint32_t partition_id) {
+    for (uint32_t i = 0; i < cap_linux_hold_count; i++) {
+        if (cap_linux_hold_partitions[i] != partition_id) continue;
+        for (uint32_t j = i + 1; j < cap_linux_hold_count; j++)
+            cap_linux_hold_partitions[j - 1] = cap_linux_hold_partitions[j];
+        cap_linux_hold_count--;
+        return;
+    }
+}
+
+static int cap_linux_hold_has(uint32_t partition_id) {
+    for (uint32_t i = 0; i < cap_linux_hold_count; i++)
+        if (cap_linux_hold_partitions[i] == partition_id) return 1;
+    return 0;
+}
+
+static int cap_name_eq(const char* a, const char* b) {
+    for (uint32_t i = 0; i < PROC_NAME_LEN; i++) {
+        if (a[i] != b[i]) return 0;
+        if (a[i] == '\0') return 1;
+    }
+    return 0;
+}
+
+int cap_linux_restore_release(const char* name) {
+    if (!name) return 0;
+    for (int i = 0; i < PROC_MAX; i++) {
+        if (!proc_table[i].active || !proc_table[i].restore_held) continue;
+        if (!cap_name_eq(proc_table[i].name, name)) continue;
+        proc_table[i].restore_held = 0;
+        /* HELD is the state the create left it in; a pour that succeeded
+         * has already stamped ring3_ctx, so the next schedule switch-in
+         * resumes at the captured rip — never _start. A pour that refused
+         * has not, and this releases the fresh spawn exactly as an ordinary
+         * create would (the named "empty replay" outcome). */
+        if (proc_table[i].state == PROC_HELD)
+            proc_table[i].state = PROC_SUSPENDED;
+        kernel_serial_printf(
+            "[SIDECAR] PID %u '%s' released after the restore pour — first "
+            "instruction rip=0x%llx rsp=0x%llx\n",
+            proc_table[i].pid, proc_table[i].name,
+            (unsigned long long)proc_table[i].user_rip,
+            (unsigned long long)proc_table[i].user_rsp);
+        return 1;
+    }
+    return 0;
+}
+
 int cap_create_sidecar_in_personality(uint32_t parent_pid,
                           const void* manifest, uint32_t manifest_len,
                           uint16_t parent_ch_w, uint16_t console_ch_w,
@@ -3351,6 +3429,10 @@ int cap_create_sidecar_in_personality(uint32_t parent_pid,
     for (uint32_t i = 0; i < (uint32_t)(sizeof(m)); i++)
         ((uint8_t*)&m)[i] = 0;
     m.record_count = hdr->record_count;
+    /* Increment 19: the header's flags word survives the parse. Bit 0 is
+     * the parser's tolerate-unknown-records switch (below); bit 1 is the
+     * E7 gate profile, which the BIB write below turns into a BIB flag. */
+    m.flags = hdr->flags;
 
     uint32_t off = SIDECAR_MANIFEST_HEADER_LEN;
     for (uint16_t rec = 0; rec < hdr->record_count; rec++) {
@@ -3897,6 +3979,16 @@ int cap_create_sidecar_in_personality(uint32_t parent_pid,
                              + ((m.budget_mem_bytes + 4095ULL) / 4096ULL)
                                * 4096ULL;
         pd->linux_brk_cur    = pd->linux_heap_base;
+        /* E7 increment 20: a linked ET_EXEC's image pages are at their
+         * p_vaddr (0x400000 for the census/firstuser builds), inside the
+         * child's shared identity map — NOT in the flat mapper's image
+         * window. The checkpoint's page walk needs this range to tell the
+         * image's pages from the rest of that map; the flat path leaves it
+         * zero, because there the window IS the image. */
+        if (image_is_elf) {
+            pd->linux_image_lo = elfinfo.load_lo;
+            pd->linux_image_hi = elfinfo.load_hi;
+        }
         /* E7 increment 16: the anonymous-map cursor is born at the
          * span's top — the sidecar ledger's mtop is the policy twin —
          * so brk grows up from the base and a granted mmap descends
@@ -4037,6 +4129,24 @@ int cap_create_sidecar_in_personality(uint32_t parent_pid,
             return CAP_EINVAL;
         }
         pd->user_rsp = built_rsp;
+        /* ── Q2: arm the gate stack's high-water measurement ──────────────
+         * The builder wrote the initial image upward from argc_off, so
+         * [region base, built_rsp) is stack the workload has not touched
+         * yet. Poison it — gate profile only, so no shipped environment
+         * carries the pattern — and remember the region's identity for the
+         * scan at the stop and at teardown. The span is below %rsp, which
+         * the psABI already treats as dead; the top page (the BIB) and the
+         * image above %rsp are outside it by construction. */
+        if (m.flags & SIDECAR_MANIFEST_FLAG_GATE) {
+            uint64_t poison_bytes = built_rsp - stack_base;
+            uint8_t* p = (uint8_t*)(uintptr_t)linux_stack_phys;
+            uint64_t b;
+            for (b = 0; b < poison_bytes; b++) p[b] = LINUX_STACK_POISON;
+            pd->linux_stack_base   = stack_base;
+            pd->linux_stack_phys   = linux_stack_phys;
+            pd->linux_stack_pages  = stk_pages;
+            pd->linux_stack_poison = (uint32_t)poison_bytes;
+        }
     }
     pd->owner_uid  = parent->owner_uid;
     pd->parent_pid = parent_pid;
@@ -4045,6 +4155,19 @@ int cap_create_sidecar_in_personality(uint32_t parent_pid,
                                    * themselves sidecars and may spawn more
                                    * (init spawns DM; DM spawns drivers). */
     pd->state      = PROC_HELD;   /* HELD: parent provisions before release */
+    /* E7 increment 21: the gate profile's stop, stamped from the manifest
+     * header the sidecar already selects the profile with (FLAG_GATE). The
+     * kernel's copy is the same bit the BIB carries, so the profile the
+     * sidecar acts on and the profile the trap path acts on cannot drift.
+     * Only a Linux child can be stopped; every SLS create keeps 0 here. */
+    pd->gate_profile      = (personality == PROC_PERSONALITY_LINUX &&
+                             (m.flags & SIDECAR_MANIFEST_FLAG_GATE)) ? 1 : 0;
+    pd->gate_read_pending = 0;
+    pd->gate_bytes        = 0;
+    pd->gate_stopped      = 0;
+    /* E7 increment 22: a freshly created child carries no tooth; the pour is
+     * the only thing that stamps one (and only in a teeth build). */
+    pd->tooth             = 0;
     pd->priority   = PROC_PRIO_NORMAL;
     pd->active     = 1;
     pd->pending_teardown = 0;
@@ -4175,7 +4298,9 @@ int cap_create_sidecar_in_personality(uint32_t parent_pid,
                  * plane can round-trip ENV_CREATE to init's env manager, and so
                  * console_service leaves init's ENV replies for it (not serial). */
                 if (sidecar_prefix(sc->peer_name, "kernel.env.control")) {
-                    env_service_register(k_rd, k_wr);
+                    /* `pd` owns the far end: its switch-ins are the round
+                     * trip's progress signal (env_service.h). */
+                    env_service_register(k_rd, k_wr, pd->pid);
                 }
                 /* POSIX-Environments E6: this is a tenant POSIX environment's
                  * console, not the shared kernel one. Register the kernel ends
@@ -4213,6 +4338,28 @@ int cap_create_sidecar_in_personality(uint32_t parent_pid,
                                                      pd->pid, pd->name)) {
                         kernel_serial_printf(
                             "[SIDECAR] PID %u '%s': socket service peer '%s' "
+                            "left unregistered (registry full)\n",
+                            pd->pid, pd->name, sc->peer_name);
+                    }
+                }
+                /* POSIX-Environments §9: the mediated interop surface — a
+                 * read-only, partition-scoped view of the object catalog,
+                 * brokered by the SECOND kernel-owned service. Same shape as
+                 * the arm above it, and for the same reason the boundary
+                 * holds: "kernel.env.catalog" is kernel-owned, so the kernel
+                 * end minted above is THIS service's end, registered HERE
+                 * with the caller's already-verified partition. A manifest
+                 * cannot point a catalog channel at another tenant, because
+                 * the partition every verb is filtered by is pd->partition_id
+                 * — state the kernel read off the process descriptor, never
+                 * a field the wire carries. See env_catalog.h for what the
+                 * surface exposes and what it deliberately refuses. */
+                if (sidecar_prefix(sc->peer_name, "kernel.env.catalog")) {
+                    if (!env_catalog_service_register(k_rd, k_wr,
+                                                      pd->partition_id,
+                                                      pd->pid, pd->name)) {
+                        kernel_serial_printf(
+                            "[SIDECAR] PID %u '%s': catalog service peer '%s' "
                             "left unregistered (registry full)\n",
                             pd->pid, pd->name, sc->peer_name);
                     }
@@ -4428,7 +4575,8 @@ int cap_create_sidecar_in_personality(uint32_t parent_pid,
      * to stay off the hardware — the kernel owns the NICs and the console in
      * that boot, so the sidecar world must not try to drive either. */
     *(uint32_t*)(bib_buf + bib_off) = bib_flags |
-        (env_console_wired ? SIDECAR_BIB_FLAG_ENV_CONSOLE : 0u);
+        (env_console_wired ? SIDECAR_BIB_FLAG_ENV_CONSOLE : 0u) |
+        ((m.flags & SIDECAR_MANIFEST_FLAG_GATE) ? SIDECAR_BIB_FLAG_GATE : 0u);
     bib_off += 4;
     /* E6 (BIB v3): the sidecar's OWN identity — its pid and, when its NAME is
      * an environment's name, the index the console registry will file it
@@ -4604,17 +4752,55 @@ int cap_create_sidecar_in_personality(uint32_t parent_pid,
     uint8_t* dst = (uint8_t*)(uintptr_t)bib_paddr;
     for (uint32_t i = 0; i < bib_off; i++) dst[i] = bib_buf[i];
 
-    /* ── 10. Release child from HELD state ───────────────────────────── */
+    /* ── 10. Release child from HELD state ───────────────────────────────
+     * E7 increment 21: a restore's create does NOT release its Linux child.
+     * The hold is armed around the replay (cap_linux_restore_arm), and the
+     * child — born HELD by step 5 — stays non-schedulable until the payload's
+     * pour has mapped its pages and installed its captured ring3_ctx. The
+     * release line is its own evidence, so a reviewer can tell a held child
+     * from a replayed one by reading the boot log, not by inferring it from
+     * the absence of a second _start. Every non-Linux child takes the
+     * ordinary path below. */
+    int restore_held = (personality == PROC_PERSONALITY_LINUX) &&
+                       cap_linux_hold_has(child_partition);
     for (int i = 0; i < PROC_MAX; i++) {
         if (proc_table[i].active && proc_table[i].pid == pd->pid
             && proc_table[i].state == PROC_HELD) {
-            proc_table[i].state = PROC_SUSPENDED;
-            kernel_serial_printf(
-                "[SIDECAR] PID %u '%s' released — runs on next schedule "
-                "(BIB at 0x%016lx, entry 0x%016lx)\n",
-                pd->pid, pd->name, bib_vaddr, pd->user_rip);
+            if (restore_held) {
+                proc_table[i].restore_held = 1;
+                kernel_serial_printf(
+                    "[SIDECAR] PID %u '%s' HELD for the restore pour — runs "
+                    "only after the payload adopts it (BIB at 0x%016lx, "
+                    "entry 0x%016lx)\n",
+                    pd->pid, pd->name, bib_vaddr, pd->user_rip);
+            } else {
+                proc_table[i].state = PROC_SUSPENDED;
+                kernel_serial_printf(
+                    "[SIDECAR] PID %u '%s' released — runs on next schedule "
+                    "(BIB at 0x%016lx, entry 0x%016lx)\n",
+                    pd->pid, pd->name, bib_vaddr, pd->user_rip);
+            }
             break;
         }
+    }
+
+    /* ── 11. E7 increment 20: stamp the Linux task into its environment's
+     * checkpoint record ────────────────────────────────────────────────
+     * The manager NAMED this task at registration (the record's third slot,
+     * kind LINUX); only this create knows where the task actually is. The
+     * stamp fills entry/stack/caps and marks the record dirty, so the next
+     * checkpoint writes a record that can place the task — never the
+     * zeros registration had to leave there (the task did not exist yet).
+     * Silent when no record names it: the boot's own Linux children (the
+     * census pair and the system firstuser) run in an environment that is
+     * not in the checkpoint registry, and their absence from a record is
+     * the truth, not a failure. */
+    if (personality == PROC_PERSONALITY_LINUX && parent) {
+        (void)env_ckpt_linux_task_stamp(parent->partition_id, parent->name,
+                                        pd->name, pd->user_rip,
+                                        stack_base,
+                                        stack_base + (uint64_t)stk_pages * 4096,
+                                        bib_n_caps);
     }
 
     /* Return the parent's CHAN_R (for receiving the child's first reply). */
@@ -4953,6 +5139,21 @@ uint32_t sys_sls_sidecar_pid(struct SLSSidecarPidRequest* req) {
         return 0;
     }
     if (req->partition >= PARTITION_MAX) return 0;
+    /* 0 = THE CALLER'S OWN PARTITION, this ABI's standing reading of a
+     * request partition (alloc_region_in, free_region_in, create_sidecar_in's
+     * target). It was not that here, and the consequence was measured: a
+     * sidecar's Linux children are spawned with target_partition 0 — they live
+     * where the sidecar lives — while the sidecar records 0 as the task's
+     * partition (user/sidecar/src/linux.rs `track`). Read as "PARTITION_SYSTEM"
+     * this lookup answered 0 for every child of a TENANT sidecar, so the exit
+     * forward's reap refused by name (`exit_group: NOT-FOUND`), no teardown ran, 
+     * and the tenant's 172 frames were never returned — increment 21's live run
+     * showed it on the resumed tenant, where the work-half run (environment in
+     * partition 0) reaped normally. Read as "the caller's", the same request
+     * resolves where the child actually is; and it is TIGHTER than before, not
+     * looser: a tenant (partition 1) that passed 0 used to search
+     * PARTITION_SYSTEM's names, i.e. across the E2 scoping boundary. */
+    uint32_t scope = req->partition ? req->partition : caller->partition_id;
 
     char name[SIDECAR_REGISTRY_NAME_LEN];
     uint32_t max = SIDECAR_REGISTRY_NAME_LEN - 1;
@@ -4963,7 +5164,7 @@ uint32_t sys_sls_sidecar_pid(struct SLSSidecarPidRequest* req) {
     name[i] = '\0';
     if (i == 0) return 0;   /* an empty name matches nothing */
 
-    return sidecar_registry_resolve(name, req->partition);
+    return sidecar_registry_resolve(name, scope);
 }
 
 /* ─── sys_sls_env_storage_attach (323) / _restore (324) / _write (325) /

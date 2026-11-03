@@ -12,6 +12,13 @@
 #include "syscall_dispatch.h"   /* Seed Kernel Phase 1.5: do_syscall() from cap_recv_resume() */
 #include "linux_abi.h"   /* E7 increment 2: PROC_PERSONALITY_* for proc_clear_resume_state() */
 
+/* E7_SELFKILL: the gate's deferred-kill arm (`make x86-iso-e3 E7_SELFKILL=1`,
+ * never a shipped build). The Makefile puts the define in AB_DEFS, so it is
+ * part of the build-config stamp. */
+#ifndef E7G_SELFKILL
+#define E7G_SELFKILL 0
+#endif
+
 /* Seed Kernel Phase 1.5: the resume path iretq's into cap_recv_resume(),
  * which re-runs the parked recv and then jumps to the syscall stub's shared
  * return path (`.syscall_return` in arch/x86/syscall.asm, exported here). */
@@ -119,6 +126,20 @@ static void proc_clear_resume_state(struct ProcessDescriptor* pd) {
      * create call (cap_create_sidecar_in_personality), so no window exists
      * where a schedulable task carries the wrong personality. */
     pd->personality = PROC_PERSONALITY_SLS;
+    /* E7 increment 21: the restore's hold is per-boot spawn state, like the
+     * personality — a reused slot must never stay shielded from the
+     * scheduler because its predecessor was held for a pour. The gate
+     * stop's three fields are the same shape: a reused slot that inherited
+     * 'gate_profile' would stop some other tenant's read, and one that
+     * inherited 'gate_stopped' would be captured in a form it never was. */
+    pd->restore_held = 0;
+    pd->gate_profile      = 0;
+    pd->gate_read_pending = 0;
+    pd->gate_stopped      = 0;
+    pd->gate_bytes        = 0;
+    /* E7 increment 22: a reused slot must not inherit a gate tooth either —
+     * a stale one would break the next occupant's next read. */
+    pd->tooth             = 0;
     /* E7 §5.3: the same rule for TLS as for personality — a reused slot's
      * stale fs_base would point the next occupant's %fs at someone else's
      * address space the instant the switch-in wrote it to the MSR. The
@@ -146,6 +167,19 @@ static void proc_clear_resume_state(struct ProcessDescriptor* pd) {
     pd->linux_heap_limit = 0;
     pd->linux_brk_cur = 0;
     pd->linux_mmap_top = 0;
+    /* E7 increment 20: the image range clears with the span for the same
+     * reason — a reused slot's capture would otherwise walk (and pour) the
+     * previous occupant's image pages as if they were this task's own. */
+    pd->linux_image_lo = 0;
+    pd->linux_image_hi = 0;
+    /* Q2: the gate stack's measurement identity clears with the span for the
+     * same reason — a reused slot must not scan (or report) its predecessor's
+     * freed frames, and the poison count is what says whether a measurement
+     * was ever armed for THIS occupant. */
+    pd->linux_stack_base = 0;
+    pd->linux_stack_phys = 0;
+    pd->linux_stack_pages = 0;
+    pd->linux_stack_poison = 0;
     pd->mem_stage_num = 0;
     pd->mem_stage_a0 = 0;
     pd->mem_stage_a1 = 0;
@@ -163,6 +197,14 @@ static void proc_clear_resume_state(struct ProcessDescriptor* pd) {
     pd->reply_stage_va = 0;
     pd->reply_stage_len = 0;
     pd->reply_stage_valid = 0;
+    /* E7 step 4 (the file class): the stage's KIND and child-side clamp
+     * clear with the rest of the stage, and the getdents64 cursor dies
+     * with the slot — a successor task starts no listing its predecessor
+     * began (one cursor per slot, reset where every other piece of
+     * per-task state resets). */
+    pd->reply_stage_kind = 0;
+    pd->reply_stage_aux = 0;
+    pd->linux_dir_pos = 0;
 }
 
 /* E7 (increment 2): read this CPU's captured Linux argument registers.
@@ -739,6 +781,21 @@ static void proc_free_syscall_stack(struct ProcessDescriptor* pd) {
 // with the other cap hooks below (static, so they need an in-file prototype).
 static struct ProcessDescriptor* pick_next_runnable(void);
 __attribute__((noreturn)) static void kernel_switch_next(struct ProcessDescriptor* next);
+
+/* Q2: the stack report is defined with the gate's stop, below; both teardown
+ * paths (this one and process_kill) call it through this name. */
+static void linux_stack_hwm_report(struct ProcessDescriptor *pd, const char *where);
+
+/* One rule for every teardown: a Linux task's stack is scanned when it
+ * leaves, keyed on the poison identity rather than gate_profile — the pour
+ * spends that one-shot flag at the stop, and it is exactly the resumed task's
+ * exit that has to be measured. Both paths must call this BEFORE
+ * proc_clear_resume_state(), which drops the identity. */
+static void linux_stack_maybe_report(struct ProcessDescriptor *pd, const char *where) {
+    if (pd && pd->personality == PROC_PERSONALITY_LINUX && pd->linux_stack_poison)
+        linux_stack_hwm_report(pd, where);
+}
+
 void process_exit(uint32_t exit_code) {
     for (int i = 0; i < PROC_MAX; i++) {
         struct ProcessDescriptor* pd = &proc_table[i];
@@ -755,6 +812,14 @@ void process_exit(uint32_t exit_code) {
         kernel_serial_printf(
             "[PROC] PID %u '%s' exited (code=%u).\n",
             pd->pid, pd->name, exit_code);
+
+        /* Q2: the exit scan, on the same rule as process_kill's. A task that
+         * faults leaves through here (stubs.c's #PF handler calls
+         * process_exit), so this is the path that measures a tenant killed by
+         * a bad page — the no-heap tooth's shape. The frames are still mapped
+         * and the poison identity is still set; proc_clear_resume_state()
+         * below is what drops it. */
+        linux_stack_maybe_report(pd, "exit");
 
         /* Phase 2: resume/teardown flags on a process that exits normally
          * are moot — the full teardown below reclaims everything anyway.
@@ -1142,6 +1207,12 @@ static void proc_build_resume_frame(struct ProcessDescriptor* next, uint64_t* f)
      * other's TLS and every other task returns to base 0 rather than a
      * leftover. No personality branch: the invariant is the mechanism. */
     user_write_fs_base(next->fs_base);
+    /* E7 increment 21 (hardening): the switch-TO ledger, at the one builder
+     * every switch path honours — the wait for the replayed sidecars' parked
+     * posture reads it as "this environment is still being scheduled", so
+     * boot I/O that keeps a driver runnable no longer looks like a posture
+     * that will never arrive (process.h's field comment). */
+    next->switches++;
     for (int i = 0; i < 15; i++) f[i] = 0;
     if (next->resume_sysret) {
         next->resume_sysret = 0;
@@ -1438,6 +1509,23 @@ static void proc_strand_diag_tick(void) {
 // Partition-fair round-robin (Phase 12) between RUNNING/SUSPENDED Ring-3
 // processes — see pick_next_partition()/pick_next_process_in_partition()
 // above for the algorithm. Writes the chosen process's context to the
+// The one teardown a deferred kill gets, wherever the scheduler catches the
+// task. The stack report runs BEFORE proc_clear_resume_state() drops the
+// poison identity, and the three teardown steps mirror process_kill()'s for a
+// target that is not executing.
+static void proc_deferred_teardown(struct ProcessDescriptor* pd) {
+    kernel_serial_printf(
+        "[PROC] PID %u '%s' deferred teardown (killed while running)\n",
+        pd->pid, pd->name);
+    linux_stack_maybe_report(pd, "exit");
+    proc_clear_resume_state(pd);
+    cap_table_teardown(pd->pid);
+    user_destroy_page_table(pd->cr3);
+    proc_free_syscall_stack(pd);
+    pd->active = 0;
+    proc_count--;
+}
+
 // interrupt stack and returns ctx_rsp (same pointer; caller pops GPRs +
 // iretq from the updated stack).
 uint64_t schedule_ring3(uint64_t ctx_rsp) {
@@ -1474,15 +1562,20 @@ uint64_t schedule_ring3(uint64_t ctx_rsp) {
      * in between (single CPU, IF=0 inside the timer ISR). Making the
      * process inactive now also excludes it from the pick below. */
     if (current->pending_teardown) {
-        proc_clear_resume_state(current);
-        kernel_serial_printf(
-            "[PROC] PID %u '%s' deferred teardown (killed while running)\n",
-            current->pid, current->name);
-        cap_table_teardown(current->pid);
-        user_destroy_page_table(current->cr3);
-        proc_free_syscall_stack(current);
-        current->active = 0;
-        proc_count--;
+        proc_deferred_teardown(current);
+    }
+
+    /* A deferred kill is a property of the kill, not of which task the timer
+     * happened to interrupt. The target can park in a syscall, be held, or be
+     * switched away before the tick that would have found it RUNNING, so sweep
+     * the rest of the table here — the one place that runs with a saved
+     * context and a stable page table, before the next pick. The current task
+     * was handled above; a RUNNING entry here would be it (single CPU), so the
+     * state check is also the double-teardown guard. */
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct ProcessDescriptor* pd = &proc_table[i];
+        if (!pd->active || !pd->pending_teardown || pd->state == PROC_RUNNING) continue;
+        proc_deferred_teardown(pd);
     }
 
     // Phase 12: pick a partition first (round-robin, skipping ones with
@@ -1859,6 +1952,128 @@ int cap_wait_chans(const uint32_t* chan_ids, uint32_t n, void* req,
     }
     kernel_switch_next(next);   /* noreturn */
     return 1;   /* unreachable */
+}
+
+/* ─── Q2: the gate stack's high-water report ─────────────────────────────
+ * The create poisoned the span below the entry %rsp, so the headroom is the
+ * leading untouched run from the region's base. Measured twice: at the stop
+ * (boot 1's work half) and at teardown (boot 2's continuation — the captured
+ * pages carried the same poison through the checkpoint, so the scan sees the
+ * deepest point of BOTH boots). Teardown has three sites: process_kill for a
+ * non-running target, schedule_ring3's deferred branch for one killed while
+ * running, and process_exit for a fault; all report, so a tenant killed by a
+ * bad page is still measured. `alloc` is the whole region; `poison-span` is
+ * what the create armed below the entry %rsp; `deepest` is how much of that
+ * the workload wrote; `lowest` is the lowest address it touched. */
+static void linux_stack_hwm_report(struct ProcessDescriptor *pd,
+                                   const char *where) {
+    size_t headroom;
+    uint64_t alloc;
+    if (!pd || !pd->linux_stack_poison || !pd->linux_stack_phys) return;
+    headroom = linux_stack_hwm_headroom(
+        (const uint8_t *)(uintptr_t)pd->linux_stack_phys,
+        (size_t)pd->linux_stack_poison, LINUX_STACK_POISON);
+    alloc = (uint64_t)pd->linux_stack_pages * 4096;
+    kernel_serial_printf(
+        "[E7-GATE] stack hwm (%s): alloc=%lu poison-span=%lu headroom=%lu "
+        "deepest=%lu lowest=0x%llx\n",
+        where,
+        (unsigned long)alloc,
+        (unsigned long)pd->linux_stack_poison,
+        (unsigned long)headroom,
+        (unsigned long)((size_t)pd->linux_stack_poison - headroom),
+        (unsigned long long)(pd->linux_stack_base + (uint64_t)headroom));
+}
+
+/* ─── E7 increment 21: the gate workload's stop ──────────────────────────
+ * B9's instant, made deterministic: the sysret that follows the read whose
+ * replies have returned PROC_GATE_SRC_OFF bytes. The trap path calls this
+ * from the resume-sentinel branch AFTER the reply was applied, so `ret` is
+ * the value the sysret would deliver and `park_ctx` still holds the entry
+ * registers of the read's own trap — the frame the resume arm rebuilds.
+ *
+ * Saving it here is not a guess about the libc: the kernel is the party that
+ * issued the sysret, the reply is already in the user buffer, the sidecar's
+ * fd offset is the bytes its replies declared, and the next trap is the one
+ * the payload re-runs. Nothing is queued: the forward closed at delivery
+ * (park_syscall cleared) and the syscall's own frame was the last entry. */
+int proc_gate_stop_at_sysret(uint64_t ret) {
+    struct ProcessDescriptor* cur = process_find_current();
+    if (!cur || !cur->gate_profile) return 0;
+
+#if E7G_SELFKILL
+    /* Gate-only, never a shipped build. The stop is the one instant a poisoned
+     * Linux task is provably RUNNING inside its own trap, so this is where the
+     * kernel can ask for its death the way a self-kill would: process_kill()
+     * sees PROC_RUNNING and defers, and the next scheduler pass tears the task
+     * down and scans its stack. Return to the caller so the sysret proceeds —
+     * the task keeps running until that pass, which is the point. gate_stopped
+     * makes the arm one-shot even if the copy reaches the offset again. */
+    if (!cur->gate_stopped) {
+        cur->gate_stopped = 1;
+        linux_stack_hwm_report(cur, "stop");
+        kernel_serial_printf(
+            "[E7-GATE] self-kill: process_kill(pid=%u) requested while RUNNING\n",
+            cur->pid);
+        process_kill(cur->pid);
+    }
+    /* This build never holds the tenant at the stop: the kill is the case, and
+     * every later reach of the offset returns straight to the sysret. */
+    return 0;
+#endif
+
+    const struct CapParkCtx* p = &cur->park_ctx;
+    uint64_t* c = (uint64_t*)&cur->ring3_ctx;
+    c[0]  = p->r15;  c[1]  = p->r14;  c[2]  = p->r13;  c[3]  = p->r12;
+    c[4]  = p->r11;                        /* r11 (the syscall's rflags slot) */
+    c[5]  = p->linux_args[3];              /* r10 */
+    c[6]  = p->linux_args[5];              /* r9  */
+    c[7]  = p->linux_args[4];              /* r8  */
+    c[8]  = p->rbp;
+    c[9]  = p->linux_args[0];              /* rdi */
+    c[10] = p->linux_args[1];              /* rsi */
+    c[11] = p->linux_args[2];              /* rdx */
+    c[12] = p->rcx;                        /* rcx: the sysret target */
+    c[13] = p->rbx;
+    c[14] = ret;                           /* rax: the reply the read received */
+    c[15] = p->rcx;                        /* rip: where sysret would return */
+    c[16] = 0x23;                          /* ring-3 code */
+    c[17] = p->r11;                        /* rflags */
+    c[18] = p->user_rsp;
+    c[19] = 0x1B;                          /* ring-3 data */
+
+    cur->has_ring3_ctx = 1;
+    cur->user_rip      = p->rcx;
+    cur->user_rsp      = p->user_rsp;
+    cur->gate_stopped  = 1;
+    cur->park_syscall  = 0;
+    cur->waiting_chan  = CAP_NONE;
+    cur->waiting_nchans = 0;
+    cur->waiting_deadline = 0;
+    cur->state         = PROC_HELD;
+
+    kernel_serial_printf(
+        "[E7-GATE] held at the copy continuation: pid=%u '%s' src_off=%lu "
+        "rip=0x%llx rsp=0x%llx ret=%lu -- the next read is the one the "
+        "payload resumes INTO\n",
+        cur->pid, cur->name, (unsigned long)cur->gate_bytes,
+        (unsigned long long)cur->user_rip,
+        (unsigned long long)cur->user_rsp, (unsigned long)ret);
+
+    linux_stack_hwm_report(cur, "stop");
+
+    struct ProcessDescriptor* next = pick_next_runnable();
+    if (!next) {
+        /* Nothing else is runnable. Do not strand the only task: undo the
+         * stop and let the caller sysret as if this hook were not here. */
+        cur->state        = PROC_RUNNING;
+        cur->gate_stopped = 0;
+        kernel_serial_printf(
+            "[E7-GATE] stop undone: no other runnable task\n");
+        return 0;
+    }
+    kernel_switch_next(next);   /* noreturn */
+    return 1;                   /* unreachable */
 }
 
 /* Strong override of cap.c's weak hook: return the current process's
@@ -2250,8 +2465,18 @@ void process_kill(uint32_t pid) {
             kernel_serial_printf(
                 "[PROC] PID %u kill deferred (running) — teardown at next "
                 "schedule\n", pid);
+            /* No report here: the stack is still live and may grow before the
+             * deferred teardown runs. schedule_ring3 scans it at that point. */
             return;
         }
+        /* Q2: the report keys on the poison identity, NOT gate_profile — the
+         * pour spends the stop by clearing gate_profile (one-shot), and the
+         * resumed task's teardown is exactly the scan that covers boot 2.
+         * This target is not running, so the teardown is here and so is the
+         * scan; a RUNNING one defers and is scanned in schedule_ring3's
+         * deferred branch, and process_exit reports on the same rule. A task
+         * leaves through one of the three sites, never more than one. */
+        linux_stack_maybe_report(&proc_table[i], "exit");
         proc_table[i].state  = PROC_ZOMBIE;
         /* Phase 2 teardown, same three steps and same ordering as
          * process_exit(): the target is not executing (its CR3 is not

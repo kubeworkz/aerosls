@@ -7,6 +7,7 @@
 
 #include "env_ckpt.h"
 #include "checkpoint_delta.h"
+#include "kernel_io.h"   /* E7 increment 20: the Linux stamp's one visible line */
 #include "env_storage.h"   /* P1b: the descriptor names the durable store */
 #include "partition.h"   /* P1a quiesce: partition_pause/_resume/_is_paused/_exists */
 
@@ -117,7 +118,20 @@ int env_ckpt_valid(const struct EnvCkptRecord* rec) {
     for (uint32_t i = 0; i < rec->n_tasks; i++) {
         if (!ec_task_kind_ok(rec->tasks[i].kind))      return ENV_CKPT_REFUSE_BAD_TASK;
         if (!ec_name_ok(rec->tasks[i].name))           return ENV_CKPT_REFUSE_BAD_TASK;
-        if (rec->tasks[i].entry == 0)                  return ENV_CKPT_REFUSE_BAD_TASK;
+        /* A sidecar's entry is resolved from the kernel's own process table at
+         * registration, so a zero means the name did not resolve and the
+         * record cannot be restored -- refused. A LINUX task is different:
+         * the manager names it before the sidecar has spawned it (the create
+         * returns long before the tenant exists), and its entry/stack are
+         * stamped at that spawn (env_ckpt_linux_task_stamp below). A zero
+         * here is the honest "not spawned yet", NOT an unresolvable target:
+         * the payload is what carries the task's state, and a capture with no
+         * live Linux process cannot reach the write at all (the capture
+         * skips an environment whose named tasks do not resolve), so a
+         * zero-entry Linux slot can never be mistaken for a restorable one. */
+        if (rec->tasks[i].entry == 0 &&
+            rec->tasks[i].kind != ENV_CKPT_TASK_LINUX)
+                                                       return ENV_CKPT_REFUSE_BAD_TASK;
     }
     // The three regions are required, not optional: an environment without its
     // ramdisk storage is a different object, and silently restoring a partial
@@ -256,6 +270,72 @@ int env_ckpt_register_from(const struct EnvCkptRegister* reg,
     }
 
     return env_ckpt_record(&rec);
+}
+
+// ─── E7 increment 20: the Linux task's kernel-side stamp ─────────────────────
+// The record's third slot is named by the manager at registration (it is
+// identity: the gate profile's tenant has a fixed name), but the entry, the
+// stack bounds and the cap count are facts only the create knows. They are
+// stamped HERE, at the spawn, into the record that already names the task.
+//
+// The lookup is by NAME, not by a field the record would have to grow: the
+// parent is the environment's POSIX sidecar, and a sidecar's registry name
+// already spells (partition, index) -- so "the record whose POSIX task is this
+// parent's name" is exactly "the environment this spawn belongs to". A record
+// with no Linux slot, or one whose slot names a different child, is left
+// ALONE (the stamp never invents or renames a task); the caller logs the miss.
+//
+// Marking the region dirty is the "before the write" half of the increment:
+// the record was written at registration with zeros in these fields, so a
+// capture that ran before this stamp would persist an unplaceable task. The
+// dirty mark makes the next checkpoint rewrite the region with the stamped
+// values; and a capture cannot outrun the spawn, because the tenant it
+// describes does not exist until after it.
+static int ec_name_eq(const char* a, const char* b) {
+    for (uint32_t i = 0; i < ENV_CKPT_NAME_LEN; i++) {
+        if (a[i] != b[i]) return 0;
+        if (a[i] == '\0') return 1;
+    }
+    return 0;
+}
+
+int env_ckpt_linux_task_stamp(uint32_t partition_id,
+                              const char* parent_name,
+                              const char* child_name,
+                              uint64_t entry,
+                              uint64_t stack_bottom, uint64_t stack_top,
+                              uint32_t cap_count) {
+    if (!parent_name || !child_name || entry == 0) return 0;
+    for (uint32_t i = 0; i < env_ckpt_count; i++) {
+        struct EnvCkptRecord* rec = &env_ckpt_table[i];
+        if (rec->magic != ENV_CKPT_REC_MAGIC) continue;
+        if (rec->partition_id != partition_id) continue;
+        int parent_slot = -1, linux_slot = -1;
+        for (uint32_t t = 0; t < rec->n_tasks && t < ENV_CKPT_MAX_TASKS; t++) {
+            if (rec->tasks[t].kind == ENV_CKPT_TASK_LINUX) {
+                if (linux_slot >= 0) { linux_slot = -1; break; }  /* two slots: no single task to stamp */
+                linux_slot = (int)t;
+            } else if (ec_name_eq(rec->tasks[t].name, parent_name)) {
+                parent_slot = (int)t;
+            }
+        }
+        if (parent_slot < 0 || linux_slot < 0) continue;
+        struct EnvCkptTask* tk = &rec->tasks[linux_slot];
+        if (!ec_name_eq(tk->name, child_name)) continue;
+        tk->entry        = entry;
+        tk->stack_bottom = stack_bottom;
+        tk->stack_top    = stack_top;
+        tk->cap_count    = cap_count;
+        ckpt_mark_dirty(CKPT_REGION_ENV);
+        kernel_serial_printf(
+            "[ENV_CKPT] linux task '%s' stamped into partition=%u index=%u "
+            "entry=0x%llx stack=0x%llx..0x%llx caps=%u\n",
+            child_name, (unsigned)rec->partition_id, (unsigned)rec->index,
+            (unsigned long long)entry, (unsigned long long)stack_bottom,
+            (unsigned long long)stack_top, (unsigned)cap_count);
+        return 1;
+    }
+    return 0;
 }
 
 int env_ckpt_drop(uint32_t partition_id, uint32_t index) {

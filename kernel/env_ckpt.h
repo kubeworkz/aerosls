@@ -58,7 +58,8 @@
 
 #define ENV_CKPT_NAME_LEN     24u
 #define ENV_CKPT_MAX_REGIONS  3u    /* POSIX heap + ramdisk heap + ramdisk storage */
-#define ENV_CKPT_MAX_TASKS    4u    /* the two sidecars, plus the hook E7 fills */
+#define ENV_CKPT_MAX_TASKS    4u    /* the two sidecars, E7's Linux tenant (increment
+                                     * 20), and one spare slot */
 #define ENV_CKPT_MAX_CHANS    4u    /* init's messenger endpoints */
 
 /* Region kinds — the three cap regions E4 charges to the target partition.
@@ -69,9 +70,11 @@
 #define ENV_CKPT_REGION_RD_HEAP    2u
 #define ENV_CKPT_REGION_RD_STORAGE 3u
 
-/* Task kinds. 2 is reserved and deliberately unused today: the Linux task is
- * E7's, and v0.2 §4 leaves the hook (the list exists, with the two sidecars
- * in it). Storing a kind the restore does not know is a refusal, not a skip. */
+/* Task kinds. 2 is E7's Linux task (increment 20): the environment manager
+ * names it in the registration when the environment is the gate profile, and
+ * the kernel fills its `entry`/`stack_*` the instant the sidecar spawns it
+ * (env_ckpt_linux_task_stamp below). A kind the restore does not know is a
+ * refusal, not a skip. */
 #define ENV_CKPT_TASK_POSIX_SIDECAR   0u
 #define ENV_CKPT_TASK_RAMDISK_SIDECAR 1u
 #define ENV_CKPT_TASK_LINUX           2u
@@ -152,8 +155,10 @@ struct EnvCkptRecord {
  * What is deliberately NOT here: magic/version/size/sequence (this build's
  * format, not init's), console_id (the kernel binds the console), and each
  * task's `entry`/`stack_*` (kernel-assigned: `image_vbase + image_entry` and
- * the user stack cap.c mapped). A restore re-enters a sidecar where the KERNEL
- * put it, so those cannot come from init even in principle. */
+ * the user stack cap.c mapped; a Linux task's are stamped when the sidecar
+ * spawns it, because the task does not exist at registration time). A restore
+ * re-enters a task where the KERNEL put it, so those cannot come from init
+ * even in principle. */
 struct EnvCkptRegister {
     uint32_t partition_id;
     uint32_t index;
@@ -241,6 +246,32 @@ int env_ckpt_record(const struct EnvCkptRecord* rec);
 int env_ckpt_register_from(const struct EnvCkptRegister* reg,
                            const uint64_t task_entry[ENV_CKPT_MAX_TASKS],
                            uint32_t console_id, uint64_t sequence);
+
+/* ─── E7 increment 20: the Linux task's kernel-side half ─────────────────────
+ * The manager can NAME a Linux task (it is identity: the gate profile's tenant
+ * has a fixed name and kind), but only the kernel knows where it actually put
+ * it — the entry, the stack bounds and how many caps the create granted. Those
+ * are stamped here, at the spawn, into the record that already names the task:
+ * the record's third slot is filled by init at registration, and this call
+ * makes it complete before any checkpoint can write it (it marks the region
+ * dirty, so the next capture persists the stamped values, never the zeros).
+ *
+ * `parent_name` is the sidecar that spawned the task: the record is found by
+ * that sidecar's NAME within its OWN partition, because (partition, index) is
+ * the identity a sidecar's registry name already spells. The caller (cap.c,
+ * which owns the process table) passes the child's already-resolved facts, so
+ * this layer keeps its record-only dependencies and the host tests that link
+ * it need no process table. Returns 1 when a record with a matching Linux slot
+ * was stamped, 0 when there is no such record (an environment outside the
+ * checkpoint registry — the boot-time E3 tenants — is not an error) and 0 when
+ * the child's name does not match the slot the manager named (the stamp never
+ * invents a task). */
+int env_ckpt_linux_task_stamp(uint32_t partition_id,
+                              const char* parent_name,
+                              const char* child_name,
+                              uint64_t entry,
+                              uint64_t stack_bottom, uint64_t stack_top,
+                              uint32_t cap_count);
 
 /* Drop the record for (partition_id, index), if any. */
 int env_ckpt_drop(uint32_t partition_id, uint32_t index);

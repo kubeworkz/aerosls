@@ -1,0 +1,45 @@
+E7 gate — the deferred teardown, observed live (the self-kill arm). 2026-11-02.
+image:    sls_operating_system_e3_selfkill.iso — make x86-iso-e3
+          E3_INIT_FEATURES=e3_envs,e7_gate E7_SELFKILL=1 (the only build carrying
+          the gate stop's self-kill arm; every other build compiles it out)
+machine:  qemu-system-x86_64 -m 1G -smp 2 -accel tcg,thread=multi, 10 GiB NVMe
+invocation: E7G_ARTIFACTS=/tmp/e7-selfkill-run tests/e7_gate_check.sh --selfkill
+result:   rc=0 — all five clauses green.
+
+Why this case exists: process_kill() defers a RUNNING target and the scheduler
+tears it down on its next pass, but every other gate run kills a parked task, so
+that branch had only ever been compiled. Here the stop — the one instant a
+poisoned Linux task is provably RUNNING in its own trap — asks for the running
+tenant's death. No checkpoint is taken.
+
+=== the transcript (boot1.log lines 2069-2079) ===
+2069  [E7-GATE] stack hwm (stop): alloc=65536 poison-span=60912 headroom=58264 deepest=2648 lowest=0x4000000a9398
+2070  [E7-GATE] self-kill: process_kill(pid=105) requested while RUNNING
+2071  [PROC] PID 105 terminated.
+2072  [PROC] PID 105 kill deferred (running) — teardown at next schedule
+2078  [PROC] PID 105 'e7.gate.user.0' deferred teardown (killed while running)
+2079  [E7-GATE] stack hwm (exit): alloc=65536 poison-span=60912 headroom=58264 deepest=2648 lowest=0x4000000a9398
+
+=== the clauses ===
+S1 ok — the kill was requested while the tenant was RUNNING and process_kill()
+        deferred it (self-kill: process_kill(pid=105)).
+S2 ok — the scheduler's deferred branch tore the tenant down
+        ([PROC] PID 105 'e7.gate.user.0' deferred teardown).
+S3 ok — exactly one stack scan, and it follows the deferred-teardown line
+        (line 2079 after 2078): the scan happens at the teardown, not at the
+        request.
+S4 ok — the deferred scan re-measures the same stack: deepest 2648 below the
+        entry %rsp (2648 at the stop), 58264 of 65536 untouched — 88.9% above
+        the 32768-byte floor. The poisoned span is the stop's 60912.
+S5 ok — no [backup] Done: the tenant was taken down mid-copy.
+
+Between lines 2072 and 2078 the tenant ran on (the arm returns to the sysret),
+which is what makes this the deferred case rather than an immediate kill; the
+scheduler caught it with the pending flag and swept it. The sweep is part of the
+change: a deferred kill is a property of the kill, not of which task the timer
+happened to interrupt, so a target that parks before the tick is torn down on
+the next pass too.
+
+Recorded from the first passing run; an earlier attempt failed in the harness
+itself (the probe's local initializer read an unset variable), not in the
+kernel.

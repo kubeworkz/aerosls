@@ -26,6 +26,24 @@
  * runs from the yield stub), so on the pre-fix loop the reply can never arrive
  * and check 2/3 fail on the deadline.
  *
+ * ─── 2026-11-02: the fixed deadline was still a wall clock ─────────────────
+ * The yield was necessary and not sufficient. The bound stayed a fixed 300
+ * ticks, and a create is init's work — three regions, two sidecars and the
+ * environment's durable store. On a loaded TCG host one create was still
+ * running at 945 ticks when that deadline expired: the replay pass recorded
+ * `the create for record 1 failed (status 0)` while init was MID-CREATE, and
+ * the environment's own sidecars were wired immediately after the refusal.
+ * The manager had not missed anything; the kernel had stopped looking.
+ *
+ * The wait is now a STALL window (ENV_RPC_STALL_TICKS) that restarts on every
+ * observed switch-in of the manager process, with ENV_RPC_CEIL_TICKS as the
+ * absolute stop. A manager that is still being scheduled therefore answers
+ * no matter how long its create takes (checks 7a/7b below, the 900-tick
+ * answer that the old 300-tick bound refused), while a manager that stops
+ * being scheduled is bounded exactly as before (check 7c), and one that keeps
+ * running without answering cannot hold the HTTP server past the ceiling
+ * (check 7d).
+ *
  * ─── What this test asserts ────────────────────────────────────────────────
  *   1. an unregistered service is refused without sending (registry guard);
  *   2. reply_slot() marks only the registered reply channel — the skip
@@ -33,12 +51,18 @@
  *   3. a manager that only progresses when the control plane yields still
  *      answers: rc == 0, ENV_OK, the env id from the reply (THE DISCRIMINATOR);
  *   4. the wait therefore yielded at least once before the reply arrived,
- *      and finished well inside the deadline (the timeout path was not taken);
+ *      and finished well inside the quiet window (the timeout path was not
+ *      taken);
  *   5. the request really is the E4 create frame: ENV_CREATE + (partition,
  *      index) in the body;
  *   6. the wait polls only its own reply channel;
- *   7. a DEAD manager cannot hang the HTTP server: the deadline still bounds
- *      it, tick for tick, and the bounded wait keeps yielding to Ring-3;
+ *  7a. a manager that keeps being scheduled answers even when the create runs
+ *      PAST the old fixed 300-tick bound (the 2026-11-02 regression);
+ *  7b. that answer is the create's own (status/env id from the reply);
+ *  7c. a DEAD manager cannot hang the HTTP server: the quiet window still
+ *      bounds it, tick for tick, and the wait keeps yielding to Ring-3;
+ *  7d. a manager that keeps running but never answers is stopped by the
+ *      absolute ceiling, not by the quiet window;
  *   8. a stale reply left by an earlier timed-out request is drained, not
  *      mistaken for this request's answer;
  *   9. a reply shorter than frame+body is not accepted as success;
@@ -87,20 +111,38 @@
  * the deadline is deterministic (one iteration == one tick). */
 volatile uint64_t kernel_tick_counter = 0;
 
-/* The service's own deadline (kernel/env_service.c). Mirrored so the bound can
- * be asserted exactly; if that constant moves, this line moves with it. */
-#define ENV_CREATE_TIMEOUT_TICKS 300u
+/* The service's own bounds (kernel/env_service.c). Mirrored so each can be
+ * asserted exactly; if a constant moves, this line moves with it. */
+#define ENV_RPC_STALL_TICKS 1200u
+#define ENV_RPC_CEIL_TICKS  6000u
+/* The bound this test retires: the create that ran past it is the regression
+ * the quiet window exists for. */
+#define OLD_FIXED_BOUND_TICKS 300u
+/* A create that answers only after this many switch-ins: past the old bound,
+ * well inside the quiet window, so the old loop refuses it and the new one
+ * answers it. */
+#define SLOW_ANSWER_AFTER 900u
 
 #define ENV_K_RD 2u
 #define ENV_K_WR 3u
+#define ENV_MGR_PID 0x50u
 #define ENV_ENV_ID 4242u
 #define STALE_ENV_ID 999u
 
-enum manager_mode { MANAGER_ALIVE, MANAGER_DEAD, MANAGER_TRUNCATED };
+enum manager_mode {
+    MANAGER_ALIVE,      /* answers, after g_answer_after_yields switch-ins */
+    MANAGER_DEAD,       /* never scheduled and never answers                */
+    MANAGER_SPINNING,   /* keeps being scheduled, never answers             */
+    MANAGER_TRUNCATED,  /* answers with a frame-only (unusable) reply       */
+};
 
 static int      g_mode = MANAGER_ALIVE;
 static int      g_sends = 0;
 static int      g_yields = 0;
+/* How many switch-ins the slow manager needs before it answers. 1 for every
+ * ordinary case, so the manager still answers on the first yield there. */
+static uint32_t g_answer_after_yields = 1;
+static uint32_t g_yields_at_reply = 0;
 static int      g_foreign_polls = 0;
 static uint8_t  g_req[ENV_REQ_MAX];
 static uint32_t g_req_len = 0;
@@ -157,6 +199,8 @@ static void reset_manager(int mode) {
     g_reply_ty = ENV_CREATE;
     g_sends = 0;
     g_yields = 0;
+    g_answer_after_yields = 1;
+    g_yields_at_reply = 0;
     g_foreign_polls = 0;
     g_req_len = 0;
     g_req_tag = 0;
@@ -231,7 +275,12 @@ static void enqueue_register_reply(uint32_t env_id, uint32_t partition, uint32_t
  * the bug, not the system. */
 static void manager_step(void) {
     if (g_req_len == 0 || g_req_tag == g_answered_tag) return;  /* one reply per request */
-    if (g_mode == MANAGER_DEAD) return;                        /* a wedged env manager */
+    if (g_mode == MANAGER_DEAD || g_mode == MANAGER_SPINNING) return;
+    /* A manager still creating: it is being scheduled (the yield stub counts
+     * the switch-ins) but has not finished. The slow case is the regression:
+     * the reply lands after the old fixed bound, and the quiet window must
+     * have kept the kernel listening. */
+    if ((uint32_t)g_yields < g_answer_after_yields) return;
     uint16_t ty = 0;
     if (env_frame_parse(g_req, g_req_len, &ty) && ty == ENV_REGISTER) {
         uint32_t eid = 0, part = 0;
@@ -250,6 +299,7 @@ static void manager_step(void) {
         enqueue_reply(ENV_ENV_ID, g_req_tag, g_mode == MANAGER_TRUNCATED);
     }
     g_answered_tag = g_req_tag;
+    g_yields_at_reply = (uint32_t)g_yields;
 }
 
 /* ─── kernel seams ──────────────────────────────────────────────────────── */
@@ -298,9 +348,22 @@ void smp_uniprocessor_tick(void) {
     kernel_tick_counter++;   /* stands in for the timer ISR */
 }
 
+/* kernel/failover.c's sweep keepalive: the RPC wait below runs ON the sweep
+ * (the create round trip), so it pumps the heartbeat/checkpoint streams
+ * while it spins -- without it the leader's heartbeat stream dies here,
+ * observers depose it at the 150-tick election timeout, and as a quiet
+ * follower it is declared DEAD after its own release (death-during-create,
+ * 2026-10-23). Counted so the wait can pin that it really pumps. */
+static int g_keepalive_pumps = 0;
+void failover_sweep_keepalive(void) { g_keepalive_pumps++; }
+
 void kernel_yield_to_ring3(uint32_t budget_ticks) {
     (void)budget_ticks;
     g_yields++;
+    /* The scheduler switched to the manager. This is the progress the RPC
+     * wait's quiet window resets on; a DEAD manager never gets one, and a
+     * SPINNING one gets it without ever answering. */
+    if (g_mode != MANAGER_DEAD) proc_table[2].switches++;
     manager_step();
 }
 
@@ -309,11 +372,26 @@ void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 /* POSIX-Environments E6: env_service_create() binds the created environment's
  * console (kernel/env_console.c) once the manager's reply names it. This test
  * links the REAL kernel/env_service.c but not the console registry — its
- * subject is the create round trip's yield-and-deadline, and no console exists
+ * subject is the create round trip's yield-and-bound, and no console exists
  * in host context, so the binding is an inert stand-in. Its own behaviour is
  * covered by tests/env_console_host_test.c. */
 int env_console_bind_env(uint32_t partition, uint32_t index, uint32_t env_id) {
     (void)partition; (void)index; (void)env_id;
+    return 0;
+}
+
+/* E7 increment 21: the replay's create holds a Linux child while it runs. No
+ * fake record in this test names a Linux task, so the hold's three ends are
+ * inert here — the wait's read of the manager's pid is the subject, not the
+ * hold. */
+__attribute__((weak)) void cap_linux_restore_arm(uint32_t partition_id) {
+    (void)partition_id;
+}
+__attribute__((weak)) void cap_linux_restore_disarm(uint32_t partition_id) {
+    (void)partition_id;
+}
+__attribute__((weak)) int cap_linux_restore_release(const char* name) {
+    (void)name;
     return 0;
 }
 
@@ -350,6 +428,9 @@ static void seat_sidecars(void) {
     proc_table[0].user_rip = FAKE_RD_ENTRY;
     proc_table[1].pid = FAKE_PX_PID; proc_table[1].active = 1;
     proc_table[1].user_rip = FAKE_PX_ENTRY;
+    /* The manager itself: the RPC wait reads this descriptor's switch-ins as
+     * its progress signal, exactly as cap.c's registration names init. */
+    proc_table[2].pid = ENV_MGR_PID; proc_table[2].active = 1;
 }
 
 /* ─── the test ──────────────────────────────────────────────────────────── */
@@ -383,7 +464,7 @@ int main(void) {
     CHECK(env_service_create(1, 0, &status, &env_id) == -1 && g_sends == 0,
           "an unregistered env service is refused without sending a request");
 
-    env_service_register((uint16_t)ENV_K_RD, (uint16_t)ENV_K_WR);
+    env_service_register((uint16_t)ENV_K_RD, (uint16_t)ENV_K_WR, ENV_MGR_PID);
 
     /* 2. only the reply channel is marked, so console_service_tick() skips
      *    exactly one slot. */
@@ -393,15 +474,15 @@ int main(void) {
           "reply_slot() marks only the registered reply channel");
 
     /* 3-6. THE DISCRIMINATOR: a manager that only runs when the control plane
-     *      yields still answers, inside the deadline. */
+     *      yields still answers, inside the old bound. */
     reset_manager(MANAGER_ALIVE);
     int rc = env_service_create(7, 3, &status, &env_id);
     CHECK(rc == 0 && status == ENV_OK && env_id == ENV_ENV_ID,
           "a manager that only progresses on a yield still answers (rc 0, ENV_OK)");
     CHECK(g_yields >= 1,
           "the wait handed the CPU to Ring-3 instead of polling a no-op tick");
-    CHECK(kernel_tick_counter < ENV_CREATE_TIMEOUT_TICKS,
-          "the reply arrived well inside the deadline (the timeout path was not taken)");
+    CHECK(kernel_tick_counter < OLD_FIXED_BOUND_TICKS,
+          "the reply arrived well inside the quiet window (the timeout path was not taken)");
     {
         /* The create is the FIRST of the two requests a create now sends. */
         uint16_t ty = 0;
@@ -416,15 +497,42 @@ int main(void) {
     CHECK(g_foreign_polls == 0,
           "the wait polls only its own reply channel");
 
-    /* 7. a wedged manager is still bounded by the deadline, tick for tick —
-     *    and the bounded wait keeps yielding. */
+    /* 7a/7b. THE REGRESSION: the create takes longer than the old fixed
+     *        bound, but the manager keeps being scheduled. The quiet window
+     *        must restart on those switch-ins and read the late reply. */
+    reset_manager(MANAGER_ALIVE);
+    g_answer_after_yields = SLOW_ANSWER_AFTER;
+    status = 0xFFFF; env_id = 0;
+    rc = env_service_create(1, 0, &status, &env_id);
+    CHECK(rc == 0 && status == ENV_OK && env_id == ENV_ENV_ID,
+          "a slow create answers: the manager was still being scheduled when the "
+          "old fixed bound expired");
+    CHECK(g_yields_at_reply >= SLOW_ANSWER_AFTER &&
+          kernel_tick_counter > OLD_FIXED_BOUND_TICKS &&
+          kernel_tick_counter < ENV_RPC_CEIL_TICKS,
+          "the reply really arrived past the old 300-tick bound, and before the "
+          "ceiling -- the regression is exercised, not assumed");
+
+    /* 7c. A manager that stops being scheduled is still bounded, tick for
+     *     tick, by the quiet window -- and the wait keeps yielding. */
     reset_manager(MANAGER_DEAD);
     CHECK(env_service_create(1, 0, &status, &env_id) == -1,
-          "a dead env manager cannot hang the HTTP server: the deadline still bounds it");
-    CHECK(kernel_tick_counter == ENV_CREATE_TIMEOUT_TICKS,
-          "the bounded wait ran exactly ENV_CREATE_TIMEOUT_TICKS ticks");
+          "a dead env manager cannot hang the HTTP server: the quiet window still bounds it");
+    CHECK(kernel_tick_counter == ENV_RPC_STALL_TICKS,
+          "the bounded wait ran exactly ENV_RPC_STALL_TICKS ticks of quiet");
     CHECK(g_yields >= 1,
-          "the bounded wait kept handing the CPU to Ring-3 on its way to the deadline");
+          "the bounded wait kept handing the CPU to Ring-3 on its way to the bound");
+    CHECK(g_keepalive_pumps > 0,
+          "the bounded wait pumped the sweep keepalive -- the create round trip "
+          "must not silence the leader (death-during-create, 2026-10-23)");
+
+    /* 7d. A manager that keeps running but never answers is bounded by the
+     *     absolute ceiling: progress alone must not hold the server forever. */
+    reset_manager(MANAGER_SPINNING);
+    CHECK(env_service_create(1, 0, &status, &env_id) == -1,
+          "a manager that keeps running but never answers is still refused");
+    CHECK(kernel_tick_counter == ENV_RPC_CEIL_TICKS,
+          "the absolute ceiling, not the quiet window, is what stopped it");
 
     /* 8. a reply left behind by an earlier timed-out request is drained, so it
      *    cannot be reported as THIS request's answer. */

@@ -484,6 +484,52 @@ node_iso()  { echo "$CLUSTER_DIR/node$1.iso"; }
 node_img()  { echo "$CLUSTER_DIR/node$1.img"; }
 node_log()  { echo "$CLUSTER_DIR/node$1.log"; }
 
+# ─── Where the BYTES of that log go, and why it is not cluster/ ────────────
+# QEMU's chardev logfile= is written SYNCHRONOUSLY, on the vCPU thread, once
+# per serial byte the guest emits: a guest that prints N bytes pays N writes
+# out of its OWN execution time. When cluster/ sits on the repo's filesystem
+# and that filesystem is 9p (WSL2's /mnt/c), every one of those writes is a
+# 9p round trip the guest waits for.
+#
+# Measured 2026-10-25 -- same ISO, same QEMU argv, only the logfile path
+# changed, quiet host (load ~1.3, 3-node cluster stopped):
+#
+#     logfile=cluster/node1.log on /mnt/c   2.94 init beats/s
+#                                           273 ms median gap (283 mean)
+#     logfile=/tmp/node1.log    on ext4     9.61 init beats/s
+#                                           100 ms median gap (104 mean)
+#                                           9.97 beats per 100 ticks
+#
+# init's heartbeat period is 100 ms (user/init/src/demo.rs HEARTBEAT_NS), so
+# the console's own storage path was stretching every guest deadline by 2.7x
+# -- and on a loaded host the same writes produced multi-second freezes in
+# which the guest made no progress at all: the reported "stops beating for
+# 1.4-3 s while the host sits idle". That shape is SEPARATE from the clock
+# bug kernel/timer.c fixes (a guessed 62.5 Hz LAPIC period plus a counter
+# that only counted serviced interrupts); both are load-bearing, and a
+# correct 100 Hz clock cannot help a guest whose serial line blocks it.
+#
+# The bytes go to a local filesystem; the PATH stays exactly where every
+# tool and guard reads it -- cluster/nodeN.log becomes a symlink, so grep,
+# `cp cluster/node*.log ...` and `rm -f cluster/node*.log` behave as before.
+LOG_STAGING_DIR="${AEROSLS_LOG_STAGING:-${TMPDIR:-/tmp}/aerosls-cluster-logs}"
+
+stage_console_log() {   # $1 = node id
+    local link="$CLUSTER_DIR/node$1.log"
+    local target="$LOG_STAGING_DIR/node$1.log"
+    mkdir -p "$LOG_STAGING_DIR"
+    # A real file written by an older launcher (or by tools that rm the path
+    # and let it come back) keeps its bytes: move it once rather than
+    # abandoning history in place and writing new bytes slowly beside it.
+    if [ -f "$link" ] && [ ! -L "$link" ]; then
+        mv -f "$link" "$target"
+    fi
+    # -n is load-bearing: without it ln dereferences an existing symlink and
+    # writes the link INTO its own target -- a self-referential file in /tmp
+    # and a cluster/ path that never becomes a symlink.
+    ln -sfn "$target" "$link"
+}
+
 # Prints the full QEMU argv for node $1, one argument per line, so both the
 # launcher and --dry-run render exactly the same command. Two code paths
 # that build the argv separately would be two things to keep in step.
@@ -668,6 +714,7 @@ echo
 # such ordering -- every node joins independently -- so serialising the
 # waits would cost N x SETTLE_SECS to learn nothing extra.
 for i in $(seq 1 "$NODES"); do
+    stage_console_log "$i"      # fast-path bytes, unchanged cluster/node$i.log path
     mapfile -t argv < <(node_argv "$i")
     "${argv[@]}" </dev/null 2>"$CLUSTER_DIR/node$i.stderr" &
     PIDS+=("$!"); IDS+=("$i")

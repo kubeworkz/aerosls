@@ -179,6 +179,14 @@ pub const TASK_POSIX_SIDECAR: u32 = 0;
 pub const TASK_RAMDISK_SIDECAR: u32 = 1;
 pub const TASK_LINUX: u32 = 2;
 
+/// E7 increment 20: the kernel name of the gate profile's Linux tenant — the
+/// task `user/sidecar/src/e7_firstuser.rs` spawns and the third task the
+/// registration above names. ONE constant, because the two halves must agree
+/// exactly: the kernel stamps entry/stack into the record slot whose name
+/// matches the spawned task, and a restore compares the names it re-creates
+/// against the ones it adopted. Fits `REGISTER_NAME_LEN` (24) with room.
+pub const LINUX_TASK_NAME: &str = "e7.gate.user.0";
+
 /// Byte offsets inside the reply body -- the layout, named rather than spelled
 /// inline, because these ARE the cross-language contract.
 pub const REG_OFF_PARTITION: usize = 0;

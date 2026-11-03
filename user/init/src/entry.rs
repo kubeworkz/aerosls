@@ -797,6 +797,21 @@ fn spawn_e3_tenant_envs(
         }
 
         // Tenant POSIX: tenant profile (no hardware/network), wired to its ramdisk.
+        // Increment 19's gate profile marks environment 1 with the manifest's
+        // FLAG_GATE bit; every other tenant (and the default E3 image, without
+        // the feature) stays plain.
+        #[cfg(feature = "e7_gate")]
+        let px_manifest = if i == 1 {
+            log(console, "[INIT] E7 gate: env 1 is the gate profile");
+            posix_manifest::build_posix_manifest_tenant_gate(
+                px_name, rd_name, posix_kaddr, posix_size, px_heap,
+            )
+        } else {
+            posix_manifest::build_posix_manifest_tenant(
+                px_name, rd_name, posix_kaddr, posix_size, px_heap,
+            )
+        };
+        #[cfg(not(feature = "e7_gate"))]
         let px_manifest = posix_manifest::build_posix_manifest_tenant(
             px_name, rd_name, posix_kaddr, posix_size, px_heap,
         );

@@ -33,7 +33,7 @@
 # ─── The source clauses ───────────────────────────────────────────────────
 #   N1. the tenant manifest: `network`, rights 0x7, peer EXACTLY
 #       kernel.net.socket (never drv.network.0 — the system-peer tooth pinned
-#       at the source), n_caps 4, the rotated pin test, and BOTH callers (E3
+#       at the source), n_caps 5, the rotated pin test, and BOTH callers (E3
 #       boot spawn, control-plane ENV_CREATE) grant the tenant manifest;
 #   N2. the SYSTEM profile is untouched: its own network -> drv.network.0
 #       stays where it was (only the tenant profile was to change);
@@ -210,13 +210,13 @@ hasstr "$TENANT" 'peer: Some("kernel.net.socket"),' ||
     bad "N1. tenant manifest: the network cap's peer must be exactly kernel.net.socket"
 printf '%s\n' "$TENANT" | grep -A2 -F 'name: "network"' | grep -qF 'rights: 0x7' ||
     bad "N1. tenant manifest: the network cap's rights must be 0x7 (R|W|send, beside console and ramdisk)"
-hasstr "$TENANT" 'n_caps: 4,' ||
-    bad "N1. tenant manifest: n_caps must count the fourth (network) cap"
+hasstr "$TENANT" 'n_caps: 5,' ||
+    bad "N1. tenant manifest: n_caps must count all five tenant caps (network, and §9.1's catalog)"
 if hasstr "$TENANT" 'peer: Some("drv.network.0"),'; then
     bad "N1. tenant manifest: the network cap must never peer at drv.network.0 — the system partition's sidecar (the system-peer tooth)"
 fi
-has "$MF" 'fn tenant_profile_is_budget_console_ramdisk_and_kernel_socket(' ||
-    bad "N1. the pin test must be renamed to count caps and name the kernel socket"
+has "$MF" 'fn tenant_profile_is_budget_console_ramdisk_and_kernel_services(' ||
+    bad "N1. the pin test must be renamed to count caps and name the kernel services"
 has "$MF" 'assert_eq!(peer, "kernel.net.socket",' ||
     bad "N1. the pin test must assert the peer is exactly kernel.net.socket (the positive half of the rotated pin)"
 ALINE="$(grep -F 'for absent in [' "$MF" | head -1)"
@@ -231,7 +231,7 @@ has "$INITE" 'build_posix_manifest_tenant(' ||
     bad "N1. the E3 boot spawn no longer grants the tenant manifest"
 has "$ENVM" 'build_posix_manifest_tenant(' ||
     bad "N1. the control plane's ENV_CREATE no longer grants the tenant manifest"
-clause "$c1" N1 "tenant manifest: network, rights 0x7, peer kernel.net.socket, n_caps 4, pinned, both callers grant it"
+clause "$c1" N1 "tenant manifest: network, rights 0x7, peer kernel.net.socket, n_caps 5, pinned, both callers grant it"
 
 # ── N2. the SYSTEM profile is untouched ───────────────────────────────────
 c2=$fail

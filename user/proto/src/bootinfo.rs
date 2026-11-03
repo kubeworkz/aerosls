@@ -72,6 +72,12 @@ pub const BOOT_INFO_FLAG_UNIFIED: u32 = 1 << 0;
 /// statement.
 pub const BOOT_INFO_FLAG_ENV_CONSOLE: u32 = 1 << 1;
 
+/// E7 increment 19: this sidecar was created from a manifest whose header
+/// carried `FLAG_GATE`. It is a profile selector, not a grant: the manifest
+/// adds no cap, so a gate tenant has exactly the authority every other
+/// tenant has. The default E3 image never sets it.
+pub const BOOT_INFO_FLAG_GATE: u32 = 1 << 2;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BootErr {
     BadMagic,
@@ -259,6 +265,11 @@ impl<'a> BootInfo<'a> {
     /// (one the attach surface serves)? See `BOOT_INFO_FLAG_ENV_CONSOLE`.
     pub fn is_env_console(&self) -> bool {
         self.flags & BOOT_INFO_FLAG_ENV_CONSOLE != 0
+    }
+
+    /// E7 increment 19: was this environment created with the gate profile?
+    pub fn is_gate_profile(&self) -> bool {
+        self.flags & BOOT_INFO_FLAG_GATE != 0
     }
 
     /// POSIX-Environments E6: this sidecar's own identity `(index, pid)` — the

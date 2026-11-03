@@ -226,6 +226,42 @@ static uint32_t g_fake_local_node_id = 0;
 uint32_t cluster_local_node_id(void) { return g_fake_local_node_id; }
 uint32_t cluster_leader_id(void) { return 0; }
 
+/* kernel/failover.c's liveness stamp, reached from env_migrate_recv_intent()
+ * (an intent frame is the same liveness evidence a heartbeat is — the
+ * release-vs-heartbeat race this records). A recording stub, not a no-op:
+ * the intent tests below assert that BOTH the announce and the release
+ * refresh the observer's last-seen stamp, which is what keeps a just-
+ * unblocked source from being declared DEAD on the silence its own create
+ * accumulated (found live 2026-10-23 on a 3-node cluster). The stubs MODEL
+ * the real table: a first heartbeat note WATCHES the peer, and
+ * failover_peer_status() answers -1 for a node never noted -- which is how
+ * the intent tests below can pin that recv_intent refreshes a WATCHED
+ * peer's stamp and never CREATES a watch entry. */
+#define FAKE_PEERS_MAX 8
+static int      g_watched[FAKE_PEERS_MAX + 1];
+static uint32_t g_hb_last_node = 0;
+static uint64_t g_hb_last_now  = 0;
+static int      g_hb_calls     = 0;
+static void fake_watch(uint32_t node_id) {
+    if (node_id && node_id <= FAKE_PEERS_MAX) g_watched[node_id] = 1;
+}
+void failover_note_heartbeat(uint32_t node_id, uint64_t now) {
+    fake_watch(node_id);
+    g_hb_last_node = node_id;
+    g_hb_last_now  = now;
+    g_hb_calls++;
+}
+int failover_peer_status(uint32_t node_id) {
+    /* PEER_ALIVE (0) for a watched node; -1 (unknown) for one never noted. */
+    return (node_id && node_id <= FAKE_PEERS_MAX && g_watched[node_id]) ? 0 : -1;
+}
+/* kernel/failover.c's sweep keepalive, pumped by every blocking wait that
+ * runs on the sweep (the death-during-create fix: a blocked create/migrate/
+ * restore must not silence the leader's heartbeat stream). Counted so the
+ * send phases below can pin that the ACK waits really pump it. */
+static int g_keepalive_calls = 0;
+void failover_sweep_keepalive(void) { g_keepalive_calls++; }
+
 /* net/net.c's real global -- not linked; only the src MAC dspp_transmit_raw
  * stamps into the Ethernet header reads it. */
 MACAddr net_my_mac;
@@ -538,6 +574,52 @@ int env_payload_wait_parked(const struct EnvCkptRecord* rec) {
     (void)rec; return g_parked;
 }
 
+/* The image-window helpers the migrate path shares with the payload layer
+ * (env_payload.h's P3 block). This test's world has NO live sidecar
+ * processes by default, so the list answers with an empty tail and err=0 —
+ * exactly the page stream the pre-image migrate always sent, which keeps
+ * every phase's page counts and orderings below unchanged. G1b raises
+ * g_img_tail to a REAL tail, so the restore's tail arithmetic (the count is
+ * the slot's declared total minus the record's payload), its pour order
+ * (regions, extent, then tail — the sender's own numbering) and its
+ * halves-agreement gate are all exercised against a declared total of
+ * payload + tail. */
+static uint32_t g_img_tail = 0;
+static uint8_t  g_img_frame[4][4096] __attribute__((aligned(4096)));
+/* The fake sidecar the stub hands back. ProcessDescriptor is complete only
+ * in the kernel's translation units — this file never touches its fields,
+ * it just has to be a non-NULL pointer the restore can carry and pass back
+ * to env_payload_resolve_vaddr, so an aligned opaque blob is the honest
+ * spelling here. */
+static uint64_t g_img_pd_words[32] __attribute__((aligned(16)));
+#define G_IMG_PD ((struct ProcessDescriptor*)(void*)g_img_pd_words)
+#define G_IMG_VBASE 0x400000000000ull   /* env_payload.c's EP_IMAGE_VBASE */
+
+uint32_t env_payload_image_window_list(const struct EnvCkptRecord* rec,
+                                       uint64_t* vaddrs,
+                                       struct ProcessDescriptor** pds,
+                                       uint32_t cap, uint32_t* err) {
+    (void)rec;
+    if (err) *err = 0;
+    if (g_img_tail > cap) { if (err) *err = 2; return 0; }
+    for (uint32_t k = 0; k < g_img_tail; k++) {
+        vaddrs[k] = G_IMG_VBASE + (uint64_t)k * 4096ull;
+        pds[k]    = G_IMG_PD;
+    }
+    return g_img_tail;
+}
+int env_payload_proc_parked(const struct ProcessDescriptor* pd) {
+    (void)pd; return 1;
+}
+int env_payload_resolve_vaddr(uint64_t cr3, uint64_t vaddr, uint64_t* out_phys) {
+    (void)cr3;
+    if (vaddr < G_IMG_VBASE) return 0;
+    uint64_t k = (vaddr - G_IMG_VBASE) / 4096ull;
+    if (k >= sizeof g_img_frame / sizeof g_img_frame[0]) return 0;
+    *out_phys = (uint64_t)(uintptr_t)&g_img_frame[k][0];
+    return 1;
+}
+
 /* ── Phase G's own world: the destination's regions and pages ──────────
  * The staged record names the bases the payload crossed FOR (the placement
  * both kernels must agree on); the fake create registers the destination's
@@ -550,7 +632,7 @@ static uint8_t g_live_r2[1][4096] __attribute__((aligned(4096)));
 static uint8_t g_other_r0[2][4096] __attribute__((aligned(4096)));
 static uint8_t g_other_r1[1][4096] __attribute__((aligned(4096)));
 static uint8_t g_other_r2[1][4096] __attribute__((aligned(4096)));
-static uint8_t g_pages[6][4096] __attribute__((aligned(4096)));
+static uint8_t g_pages[8][4096] __attribute__((aligned(4096)));   /* 6 payload + up to 2 tail */
 
 #define G_FILLS { 0x31, 0x32, 0x33, 0x34, 0x41, 0x42 }   /* 4 region pages, 2 extent */
 
@@ -646,6 +728,7 @@ static void g_reset_fakes(void) {
     g_destroy_env_id = 0;
     g_destroy_rc = 0;
     g_parked = 1;
+    g_img_tail = 0;   /* the fake image windows hold nothing again */
     memset(&g_create_record, 0, sizeof g_create_record);
 }
 
@@ -880,9 +963,20 @@ int main(void) {
           "...and the local intent is bounded: past its budget the gate re-arms");
 
     /* The peer half: what every OBSERVER latches from that broadcast. */
+    g_hb_calls = 0; g_hb_last_node = 0;
+    /* An UNWATCHED peer (a follower -- it has never been heard beating):
+     * the announce latches, but the frame must NOT create a death-watch
+     * entry. A watch entry for a quiet follower would be declared DEAD
+     * exactly 300 ticks after its own release (the 2026-10-23 live find). */
     env_migrate_recv_intent(5, (uint32_t)ENV_MIGRATE_INTENT_GRACE_TICKS);
     CHECK(env_migrate_peer_in_flight(5) == 1,
           "*** peer intent: an announced budget latches on every node ***");
+    CHECK(g_hb_calls == 0,
+          "*** ...but a never-beaten (follower) announce creates NO death-watch entry: no heartbeat noted ***");
+    fake_watch(5);   /* the observer has now heard node 5 beat, as it would a leader */
+    env_migrate_recv_intent(5, (uint32_t)ENV_MIGRATE_INTENT_GRACE_TICKS);
+    CHECK(g_hb_calls == 1 && g_hb_last_node == 5,
+          "*** a WATCHED announcing peer's stamp IS refreshed by the announce (liveness evidence) ***");
     env_migrate_recv_intent(5, 0x7fffffffu);   /* a peer cannot shield itself past the cap */
     kernel_tick_counter += ENV_MIGRATE_INTENT_GRACE_TICKS + 1;
     CHECK(env_migrate_peer_in_flight(5) == 0,
@@ -927,12 +1021,34 @@ int main(void) {
     env_migrate_recv_intent(6, (uint32_t)ENV_MIGRATE_INTENT_GRACE_TICKS);
     CHECK(env_migrate_peer_in_flight(6) == 1,
           "the peer latch stands before its owner releases it");
+    fake_watch(6);   /* the observer has heard node 6 beat, as it would the leader */
+    g_hb_calls = 0; g_hb_last_node = 0; g_hb_last_now = 0;
     env_migrate_recv_intent(6, 0);
     CHECK(env_migrate_peer_in_flight(6) == 0,
           "*** recv_intent's budget-0 release drops a peer's latch at once -- death detection is re-armed ***");
+    /* The release-vs-heartbeat race (found live 2026-10-23 on a 3-node
+     * cluster, env_migrate_confirm_live): the source's create blocked its
+     * sweep for 435 ticks, then intent_end() fired the release. The release
+     * dropped the latch but did NOT refresh last_seen_tick, so the very next
+     * failover_tick still saw 435 ticks of silence — now UNdeferred — and
+     * declared the just-resurrected source DEAD, adopting its partitions
+     * mid-create. The release is the source's own frame: it is proof of
+     * life, so it must refresh the stamp the same way the announce does. */
+    CHECK(g_hb_calls == 1 && g_hb_last_node == 6,
+          "*** the RELEASE is proof of life too: it refreshes the observer's last-seen stamp ***");
+    CHECK(g_hb_last_now == kernel_tick_counter,
+          "...stamped with the release's own tick, so the silence the create accrued is forgiven at once");
     env_migrate_recv_intent(6, 0);
     CHECK(env_migrate_peer_in_flight(6) == 0,
           "a release for a node with no latch is a no-op, not an error");
+    {
+        /* Same asymmetry as the announce: an unwatched (never-beaten) peer's
+         * release drops a latch that never existed and creates no watch entry. */
+        g_hb_calls = 0;
+        env_migrate_recv_intent(7, 0);
+        CHECK(env_migrate_peer_in_flight(7) == 0 && g_hb_calls == 0,
+              "*** an unwatched peer's release is a pure no-op: no latch, no death-watch entry ***");
+    }
     {
         /* The release is gated on the local stamp: the sweep's restore loop
          * calls end() after EVERY attempt, and a period with no begin must
@@ -1556,6 +1672,88 @@ int main(void) {
                   "exactly one create, no destroy: nothing was torn down to get here");
         }
 
+        /* ── G1b: the image-window tail the BEGIN declared crosses too ───
+         * The tail's page count is the slot's DECLARED total minus the
+         * record's payload. It used to be derived from the record alone,
+         * which made it identically ZERO on every restore — found live on
+         * the 3-node suite (2026-10-24): "1344 region page(s), 0 image-
+         * window page(s) and 256 extent page(s) poured" while the source had
+         * just sent a real tail, so the tail was staged, never validated
+         * against the fresh windows, never poured, and the count agreement
+         * guarding both halves was never tested. This pins the tail's bytes
+         * landing — and, because the sender numbers regions, extent, then
+         * tail, that the extent still lands in NVMe rather than in the
+         * sidecars' image frames. */
+        {
+            env_ckpt_reset(); env_migrate_reset(); host_partition_stubs_reset();
+            host_partition_define(G_PART); g_fake_local_node_id = 2; g_reset_fakes();
+            g_fill_pages();
+            memset(g_pages[6], 0xC1, 4096);        /* tail page 0 */
+            memset(g_pages[7], 0xC2, 4096);        /* tail page 1 */
+            memset(g_img_frame, 0xEE, sizeof g_img_frame);
+            g_img_tail = 2;                        /* this node's fresh windows hold 2 */
+
+            struct EnvCkptRecord staged =
+                g_record(G_PART, 0, g_live_r0, g_live_r1, g_live_r2);
+            g_create_record = staged;              /* placement matched */
+            g_stage(G_PART, 0, &staged, 8);        /* 6 payload + 2 tail */
+            const struct EnvMigrateStaging* st = env_migrate_recv_find(G_PART, 0);
+            CHECK(st && st->complete && st->total_pages == 8,
+                  "setup: a slot staged with the record's 6 payload pages PLUS a 2-page tail declared");
+
+            int rc = env_migrate_restore(G_PART, 0);
+            CHECK(rc == ENV_MIGRATE_OK,
+                  "*** a declared tail crosses: a total past the record's payload restores cleanly ***");
+            CHECK(memcmp(g_img_frame[0], g_pages[6], 4096) == 0 &&
+                  memcmp(g_img_frame[1], g_pages[7], 4096) == 0,
+                  "*** ...and the tail's bytes are in the fresh sidecars' image frames "
+                  "(the count came from the SLOT, not from the record) ***");
+            CHECK(memcmp(g_live_r0[0], g_pages[0], 4096) == 0 &&
+                  memcmp(g_live_r0[1], g_pages[1], 4096) == 0 &&
+                  memcmp(g_live_r1[0], g_pages[2], 4096) == 0 &&
+                  memcmp(g_live_r2[0], g_pages[3], 4096) == 0,
+                  "the region pages are still poured first, byte-for-byte");
+            {
+                uint8_t pg[4096];
+                CHECK(nvme_read_sync(STATE_LBA + 0, pg) == 0 &&
+                      memcmp(pg, g_pages[4], 4096) == 0 &&
+                      nvme_read_sync(STATE_LBA + 8, pg) == 0 &&
+                      memcmp(pg, g_pages[5], 4096) == 0,
+                      "*** and the EXTENT still landed in NVMe: the pour reads regions, "
+                      "extent, THEN tail — the sender's own numbering ***");
+            }
+            CHECK(env_migrate_staging_count() == 0,
+                  "the slot — tail pages included — is dropped after the pour");
+        }
+
+        /* ── G1c: a tail THIS node's windows cannot reproduce is refused ─
+         * The halves-agreement gate at 4b' only ever runs when a tail
+         * actually crossed, so G1b is what makes it reachable; this is its
+         * teeth: a wire count the fresh sidecars' windows cannot match names
+         * both halves and refuses rather than pouring a half-environment. */
+        {
+            env_ckpt_reset(); env_migrate_reset(); host_partition_stubs_reset();
+            host_partition_define(G_PART); g_fake_local_node_id = 2; g_reset_fakes();
+            g_fill_pages();
+            memset(g_pages[6], 0xC1, 4096);
+            memset(g_pages[7], 0xC2, 4096);
+            g_img_tail = 0;                        /* nothing mapped here */
+
+            struct EnvCkptRecord staged =
+                g_record(G_PART, 0, g_live_r0, g_live_r1, g_live_r2);
+            g_create_record = staged;
+            g_stage(G_PART, 0, &staged, 8);        /* the wire still carries 8 */
+
+            int rc = env_migrate_restore(G_PART, 0);
+            CHECK(rc == ENV_MIGRATE_REFUSE_PLACEMENT,
+                  "*** a wire tail this node's fresh windows cannot reproduce is REFUSED by name ***");
+            CHECK(env_migrate_last_refusal()->a == 2,
+                  "...with the WIRE's page count as the operand (a=2), not this node's 0");
+            CHECK(env_migrate_staging_count() == 0,
+                  "...and the slot is dropped: the environment exists as an empty replay, never a half-poured one");
+            g_img_tail = 0;
+        }
+
         /* ── G2: no slot, and an incomplete one ────────────────────────── */
         env_ckpt_reset(); env_migrate_reset(); host_partition_stubs_reset();
         host_partition_define(G_PART); g_fake_local_node_id = 2; g_reset_fakes();
@@ -1736,21 +1934,65 @@ int main(void) {
             env_ckpt_reset();
         }
 
-        /* ── G10: the durable extents must agree ───────────────────────── */
+        /* ── G10: extent coordinates are NODE-LOCAL ────────────────────
+         * The record's LBA is a fact about the SOURCE (measured live:
+         * staged slot 5 = LBA 1124352, fresh slot 7 = LBA 1128448, both
+         * 2048 sectors). The pour lands in THIS node's extent -- never the
+         * record's slot number, which may hold another tenant's store here. */
         env_migrate_reset(); host_partition_stubs_reset();
         host_partition_define(G_PART); g_reset_fakes();
         {
             struct EnvCkptRecord staged =
                 g_record(G_PART, 0, g_live_r0, g_live_r1, g_live_r2);
             g_create_record = staged;
-            g_create_record.state_lba = STATE_LBA + 64;  /* a different extent */
+            g_create_record.state_lba = STATE_LBA + 64;  /* this node's band slot differs */
+            uint8_t pg[4096]; memset(pg, 0xBB, 4096);
+            nvme_write_sync(STATE_LBA + 0, pg);  /* the record's LBA -- another store here */
+            g_stage(G_PART, 0, &staged, 6);
+            int rc = env_migrate_restore(G_PART, 0);
+            CHECK(rc == ENV_MIGRATE_OK,
+                  "*** a fresh extent at THIS node's own coordinates restores -- the "
+                  "source's slot number is not a fact about this node ***");
+            nvme_read_sync(STATE_LBA + 0, pg);
+            {
+                int bb = 1; for (uint32_t b = 0; b < 4096; b++) if (pg[b] != 0xBB) bb = 0;
+                CHECK(bb, "...and the record's LBA -- another store's extent here -- "
+                          "holds not one poured byte");
+            }
+            CHECK(nvme_read_sync(STATE_LBA + 64 + 0, pg) == 0 &&
+                  memcmp(pg, g_pages[4], 4096) == 0 &&
+                  nvme_read_sync(STATE_LBA + 64 + 8, pg) == 0 &&
+                  memcmp(pg, g_pages[5], 4096) == 0,
+                  "*** the staged extent pages landed in THIS node's extent, byte-for-byte ***");
+            CHECK(env_migrate_staging_count() == 0 && env_ckpt_find(G_PART, 0) != 0,
+                  "slot dropped, environment stands");
+            env_ckpt_reset();
+        }
+
+        /* ── G10b: no durable extent HERE refuses by name ─────────────────
+         * The gate that replaced cross-node LBA equality: a destination
+         * whose store never became durable (the record layer's "0 until
+         * then") has nothing to pour into, and the staged extent must not
+         * land in RAM's fiction. */
+        env_migrate_reset(); host_partition_stubs_reset();
+        host_partition_define(G_PART); g_reset_fakes();
+        {
+            struct EnvCkptRecord staged =
+                g_record(G_PART, 0, g_live_r0, g_live_r1, g_live_r2);
+            g_create_record = staged;
+            g_create_record.state_lba     = 0;
+            g_create_record.state_sectors = 0;
+            g_create_record.state_bytes   = 0;
             uint8_t pg[4096]; memset(pg, 0xBB, 4096);
             nvme_write_sync(STATE_LBA + 0, pg);
             g_stage(G_PART, 0, &staged, 6);
             int rc = env_migrate_restore(G_PART, 0);
             CHECK(rc == ENV_MIGRATE_REFUSE_EXTENT,
-                  "*** extents that disagree refuse by name -- the pages crossed for an "
-                  "LBA this node did not allocate ***");
+                  "*** a destination with no durable extent of its own refuses the staged "
+                  "pages by name -- 0-until-then is a gate, not a pour target ***");
+            CHECK(env_migrate_last_refusal() &&
+                  env_migrate_last_refusal()->a == (uint32_t)STATE_SECTORS,
+                  "...operand a = the staged extent's size that had nowhere to land");
             nvme_read_sync(STATE_LBA + 0, pg);
             {
                 int bb = 1; for (uint32_t b = 0; b < 4096; b++) if (pg[b] != 0xBB) bb = 0;
@@ -2119,6 +2361,14 @@ int main(void) {
      * dspp_tx_reentrant_dropped is the guard that would have silently eaten
      * an ACK had any phase nested a transmit inside a transmit; zero is the
      * evidence that the ACK path is the one this test thinks it is. */
+    /* The death-during-create fix, last: every phase above that blocked on
+     * the wire (the ACK waits, the pour) runs ON the sweep in the real
+     * kernel, so each pump of failover_sweep_keepalive() keeps the
+     * heartbeat/checkpoint streams alive mid-block. Counted, not stubbed
+     * silently: a wait loop that forgot the pump would leave this at 0. */
+    CHECK(g_keepalive_calls > 0,
+          "*** the blocking waits (ACK waits, pour) pumped the sweep keepalive: "
+          "a blocked send keeps the heartbeat stream alive (death-during-create) ***");
     CHECK(dspp_tx_reentrant_dropped == 0,
           "*** no DSPP frame was ever dropped for re-entering the transmit path ***");
     CHECK(dspp_tx_oversize_dropped == oversize_before,

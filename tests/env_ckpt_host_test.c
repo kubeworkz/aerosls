@@ -57,6 +57,10 @@ void ckpt_mark_dirty(uint32_t region) {
 
 static int checks_passed = 0;
 static int checks_failed = 0;
+/* E7 increment 20: env_ckpt.c's Linux-task stamp logs the one line an
+ * operator needs (the task's name and the entry it was stamped with). This
+ * test links the record layer without kernel_io.c, so the sink is here. */
+void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 #define CHECK(cond, msg) do { \
     if (!(cond)) { printf("FAIL: %s\n", msg); checks_failed++; } \
     else         { printf("ok:   %s\n", msg); checks_passed++; } \
@@ -687,6 +691,68 @@ int main(void) {
           "...and if it is gone by then, the repause skips it and still clears the ledger");
     CHECK(env_ckpt_restore_resume_for_create(8) == -1 && env_ckpt_restore_resumed() == 0,
           "a partition that is gone is never resumed, and is NOT entered in the ledger (refused, not attempted)");
+
+    /* ── 26. E7 increment 20: the Linux task's slot, stamp and identity ─────
+     * The manager can name the tenant at registration; only the spawn knows
+     * where it is. These clauses hold the two halves together: a Linux slot
+     * may be registered with NO entry (the task does not exist yet) while a
+     * sidecar slot still may not; the stamp fills exactly that slot, for the
+     * spawning parent in its OWN partition, and refuses to guess at a name
+     * it was not told; and the replay's identity comparison treats the
+     * three-task list as identity -- the create must name the same one. */
+    {
+        struct EnvCkptRecord r = good_record(9, 1);
+        r.n_tasks = 3;
+        strcpy(r.tasks[2].name, "e7.gate.user.0");
+        r.tasks[2].kind = ENV_CKPT_TASK_LINUX;
+        r.tasks[2].entry = 0;         /* not spawned yet -- init cannot know */
+        CHECK(env_ckpt_valid(&r) == ENV_CKPT_REFUSE_NONE,
+              "a Linux slot registered with entry 0 is valid: the task is stamped at its spawn, not at registration");
+
+        bad = r;
+        bad.tasks[0].entry = 0;       /* a SIDECAR with no entry is still refused */
+        CHECK(env_ckpt_valid(&bad) == ENV_CKPT_REFUSE_BAD_TASK,
+              "but a sidecar slot with entry 0 is still refused -- the exception is the Linux kind's, not registration's");
+
+        env_ckpt_reset();
+        CHECK(env_ckpt_record(&r) == 0 && env_ckpt_count_live() == 1,
+              "(setup) the three-task gate record is stored");
+        CHECK(env_ckpt_linux_task_stamp(9, "aerosls.posix.0", "e7.gate.user.0",
+                                        0x400000ull, 0x500000ull, 0x504000ull, 1) == 1,
+              "the spawn stamp lands on the record whose POSIX task names the parent, in the parent's own partition");
+        {
+            const struct EnvCkptRecord* got = env_ckpt_find(9, 1);
+            CHECK(got && got->tasks[2].entry == 0x400000ull &&
+                  got->tasks[2].stack_bottom == 0x500000ull &&
+                  got->tasks[2].stack_top == 0x504000ull &&
+                  got->tasks[2].cap_count == 1,
+                  "the stamp fills the Linux slot's entry, stack bounds and cap count -- the gate tenant's one cap");
+            CHECK(env_ckpt_valid(got) == ENV_CKPT_REFUSE_NONE,
+                  "the stamped record still validates (the entry the create supplied is a real one)");
+        }
+        CHECK(env_ckpt_linux_task_stamp(9, "aerosls.posix.0", "e7.gate.user.9",
+                                        0x400000ull, 0, 0, 1) == 0,
+              "a child whose name is not the one the record named is NOT stamped (the stamp never invents a task)");
+        CHECK(env_ckpt_linux_task_stamp(9, "aerosls.posix.7", "e7.gate.user.0",
+                                        0x400000ull, 0, 0, 1) == 0,
+              "nor one whose spawning parent has no record in that partition");
+        CHECK(env_ckpt_linux_task_stamp(9, "aerosls.posix.0", "e7.gate.user.0",
+                                        0, 0, 0, 1) == 0,
+              "and an entry of 0 is not a stamp: a task that cannot be re-entered is never written down");
+
+        /* The replay's identity comparison: the create's record names the
+         * same three tasks, at entry 0 because ITS tenant has not spawned. */
+        struct EnvCkptRecord want = *env_ckpt_find(9, 1);
+        struct EnvCkptRecord got2 = good_record(9, 1);
+        got2.n_tasks = 3;
+        strcpy(got2.tasks[2].name, "e7.gate.user.0");
+        got2.tasks[2].kind = ENV_CKPT_TASK_LINUX;
+        CHECK(env_ckpt_restore_same_identity(&want, &got2) == 1,
+              "a replay whose create names the same three tasks IS the same environment (entry is not identity)");
+        got2.n_tasks = 2;
+        CHECK(env_ckpt_restore_same_identity(&want, &got2) == 0,
+              "a two-task create is refused: an allowance for \"the Linux task arrived late\" is a second restore path");
+    }
 
     printf("\n%d passed, %d failed\n", checks_passed, checks_failed);
     return checks_failed == 0 ? 0 : 1;

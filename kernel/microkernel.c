@@ -9,6 +9,8 @@
 #include "console_service.h"
 #include "env_console.h"
 #include "net_socket_service.h"
+#include "env_catalog.h"
+#include "env_replica.h"
 
 extern void tier_mgr_init(void);
 extern void tier_mgr_tick(void);
@@ -311,6 +313,19 @@ void microkernel_service_poll(void) {
     // refuses every verb by name. Same single-writer argument as the tick
     // above it (see net_socket_service.h).
     net_socket_service_tick();
+    // POSIX-Environments §9: the same context drains each tenant's catalog
+    // channel — the mediated, read-only, partition-scoped view of the
+    // object system the environment is running on top of. Same single-writer
+    // argument as the ticks above it (see env_catalog.h), and it runs after
+    // net_socket_service_tick for no stronger reason than that it is newer.
+    env_catalog_service_tick();
+    // POSIX-Environments P3 destination (a): the same context finalizes any
+    // replica whose page staging completed — validate the staged instant,
+    // write the band slot, publish the directory entry (env_replica.c owns
+    // the order; NVMe writes are synchronous, same never-from-the-timer-IRQ
+    // argument as the ticks above). Sender-driven once increment 2 lands;
+    // until a replica is staged this is a scan of empty slots.
+    env_replica_tick();
     // (E) Fire any scheduled agent runs
     agent_scheduler_tick();
 }

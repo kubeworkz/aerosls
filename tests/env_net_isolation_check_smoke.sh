@@ -206,8 +206,8 @@ if want_tooth network-rights; then
 fi
 if want_tooth n-caps; then
     seed "$W/n"
-    sed -i 's/n_caps: 4,/n_caps: 3,/' "$W/n/user/init/src/posix_manifest.rs"
-    tooth n-caps N1 "n_caps stops counting the network cap" "$W/n"
+    sed -i 's/n_caps: 5,/n_caps: 4,/' "$W/n/user/init/src/posix_manifest.rs"
+    tooth n-caps N1 "n_caps stops counting one of the five tenant caps" "$W/n"
 fi
 if want_tooth pin-peer; then
     seed "$W/pp"

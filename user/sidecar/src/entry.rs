@@ -304,7 +304,7 @@ pub(crate) fn klog(tag: &[u8], val: u32, extra: &[u8]) {
 /// Raw serial write: send `data` directly to kernel serial via
 /// SYS_SLS_SERIAL_WRITE (165).  Same syscall as klog but without the
 /// tag/hex/extra framing - just raw bytes.
-fn serial_write_raw(data: &[u8]) {
+pub(crate) fn serial_write_raw(data: &[u8]) {
     // The kernel's 165 handler is kernel_serial_print((const char*)arg) —
     // a strlen. Bound it EXACTLY: copy the payload then write an explicit
     // NUL terminator. Without it, an elided memset leaves stale stack
@@ -327,6 +327,69 @@ fn serial_write_raw(data: &[u8]) {
         SYSCALL_COOKIE = rax;
     }
     touch_cookie();
+}
+
+/// E7 §10.14's STALL DRILL (`e7_slow_boot`, gate profile only): keep THIS
+/// sidecar's boot unfinished — and RUNNING, not parked — past the pour's old
+/// fixed bound, so the live arm reproduces the failure the stall window was
+/// added for: at the old deadline the sidecar is switched in, serving its own
+/// boot, and a fixed clock answers "the posture never arrived" and the pour
+/// refuses a healthy environment by name.
+///
+/// One pure compute burst, deliberately parked-nowhere: the RUNNING state is
+/// the point. A stretch built from timed waits would leave the sidecar parked
+/// at most samples, and the pour would then land under the OLD code too — it
+/// would prove the wait extended, but not the refusal being fixed.
+///
+/// Duration: a serial multiply-add chain, measured on this drill host at
+/// ~6.7M iterations per timer tick (a 6.0G attempt spanned heartbeats 66→156,
+/// ~900 ticks, and ended BEFORE the old bound — the drill's own assertion
+/// caught it). 45G iterations is ~6,700 ticks (~67 s) nominal: above
+/// EP_WAIT_TICKS (3,000 / ~30 s) with ~2.2x of tolerance on the fast side and
+/// under EP_WAIT_CEIL_TICKS (18,000 / ~3 min) with ~2.5x on the slow side.
+/// The burst is sized in iterations and not in wall time because the guest
+/// has no clock to read.
+///
+/// The announcement (`[env-id]`) is written by the main loop after this
+/// returns, so `announced=0` holds throughout and no posture inside the
+/// burst can make the wait's predicate look ready.
+///
+/// This is a DRILL: it exists for the run's transcript, is compiled only when
+/// the feature is on, and is never enabled by a shipped image.
+#[cfg(feature = "e7_slow_boot")]
+fn gate_boot_stretch(k: &RealKernel, console_r: Option<u32>) {
+    const BURST: u64 = 45_000_000_000;
+    const TAIL_CYCLES: u32 = 10;
+    const TAIL_NS: u64 = 100_000_000;
+
+    /* klog truncates its tag at 24 bytes: keep both markers inside it. */
+    klog(b"[E7-GATE] stretch-start", (BURST / 1_000_000) as u32, b"Miters");
+    let mut acc: u64 = 0x9E37_79B9_7F4A_7C15;
+    for i in 0..BURST {
+        acc = acc.wrapping_mul(6364136223846793005)
+                 .wrapping_add(i ^ 0xA5A5);
+    }
+    /* Volatile so the burst cannot be folded away with the accumulator it
+     * feeds. */
+    unsafe { core::ptr::read_volatile(&acc as *const u64); }
+
+    /* A short parked tail, not a pacing mechanism: it keeps the done marker
+     * after a real park and gives the replay's wait a clean transition out of
+     * the burst. If the console end is absent the burst still ran, and the
+     * marker says so rather than pretending the drill did not. */
+    match console_r {
+        Some(cr) => {
+            let mut buf = [0u8; 64];
+            let mut slots = [aerosls_proto::kabi::GrantedCap::default(); 1];
+            for _ in 0..TAIL_CYCLES {
+                if k.wait(&[cr], TAIL_NS).is_ok() {
+                    let _ = k.recv(cr, &mut buf, &mut slots);
+                }
+            }
+        }
+        None => klog(b"[E7-GATE] stretch-nochan", 0, b"skipped"),
+    }
+    klog(b"[E7-GATE] stretch-done", (BURST / 1_000_000) as u32, b"Miters");
 }
 
 #[no_mangle]
@@ -416,6 +479,13 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     if let Some(nc) = booted.net.take() {
         booted.proc.set_net(alloc::boxed::Box::new(nc));
     }
+    // Install the catalog client into the ProcManager so applets can call
+    // ctx.catalog() for §9.1's mediated, read-only, partition-scoped view
+    // of the object catalog. Absent when the manifest named no `catalog`
+    // cap — then `ctx.catalog()` is None and the applet says so.
+    if let Some(cc) = booted.catalog.take() {
+        booted.proc.set_catalog(alloc::boxed::Box::new(cc));
+    }
 
     // The console channel's WRITE endpoint (CHAN_R is `caps.console_chan`).
     // Applet/init stdout lands in the in-memory console (CharNode); the
@@ -445,77 +515,148 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     // watchdog respawn) keeps the proof and leaves each tenant's wire as
     // quiet as it was before increment 7.
     let census_host = bib.find_cap(CAP_TYPE_DEV, "nic0.bar0").is_some();
-    if census_host {
-        // E7 boot proof (Linux ABI Shim Design §3.3 steps 5-7): spawn the
-        // Linux-personality probe from THIS sidecar — the design-true creator
-        // (§3.5: its one capability is the channel back to us, and the answers
-        // in linux::service below are the only path by which its syscalls
-        // succeed or fail). Failures are logged, never fatal: the proof is a
-        // proof, not a dependency of this sidecar's own boot.
-        match crate::e7_probe::spawn(&RealKernel, caps.budget_base, caps.budget_len) {
-            Ok(sp) => {
-                if crate::linux::track(
-                    sp.ch_r,
-                    sp.ch_w,
-                    crate::e7_probe::PROBE_NAME,
-                    0,
-                    sp.heap_base,
-                    sp.heap_limit,
-                ) {
-                    klog(b"[E7] probe: spawned ch_r=", sp.ch_r, b"");
-                } else {
-                    klog(b"[E7] probe: spawned but TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+    // Increment 19: the gate profile is the BIB's FLAG_GATE bit, copied by
+    // the create from the tenant manifest's header flags. It is a profile
+    // selector, not a grant: the tenant's caps are exactly the plain
+    // profile's, and the BIB is the one thing every sidecar already reads.
+    let gate = bib.is_gate_profile();
+    if census_host || gate {
+        if !gate {
+            // E7 boot proof (Linux ABI Shim Design §3.3 steps 5-7): spawn the
+            // Linux-personality probe from THIS sidecar — the design-true creator
+            // (§3.5: its one capability is the channel back to us, and the answers
+            // in linux::service below are the only path by which its syscalls
+            // succeed or fail). Failures are logged, never fatal: the proof is a
+            // proof, not a dependency of this sidecar's own boot.
+            match crate::e7_probe::spawn(&RealKernel, caps.budget_base, caps.budget_len) {
+                Ok(sp) => {
+                    /* E7 step 4: each Linux child gets its own VFS task —
+                     * the table the file-class arms operate over (a failure
+                     * is logged, never fatal, like every other spawn step:
+                     * an untracked child parks unanswered, and its guard
+                     * line says so). */
+                    match booted.proc.vfs.add_task() {
+                        Ok(vt) => {
+                            if crate::linux::track(
+                                sp.ch_r,
+                                sp.ch_w,
+                                crate::e7_probe::PROBE_NAME,
+                                0,
+                                sp.heap_base,
+                                sp.heap_limit,
+                                vt,
+                                false,
+                            ) {
+                                klog(b"[E7] probe: spawned ch_r=", sp.ch_r, b"");
+                            } else {
+                                klog(b"[E7] probe: spawned but TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+                            }
+                        }
+                        Err(_) => klog(b"[E7] probe: VFS task alloc FAILED ch_r=", sp.ch_r, b""),
+                    }
                 }
+                Err(rc) => klog(b"[E7] probe: spawn FAILED rc=", rc as u32, b""),
             }
-            Err(rc) => klog(b"[E7] probe: spawn FAILED rc=", rc as u32, b""),
-        }
 
-        // E7 increment 7 (§5.1/§5.2): the SAME create over a REAL ELF64 image
-        // — the census candidate fixture, segments at their linked vaddrs and
-        // entry at e_entry — a controlled pair with the .flat probe above:
-        // identical machine code, only the IMAGE FORMAT differs, so the serial
-        // log measures exactly how far a real ELF gets (§10.12 records the
-        // run). Like the probe: logged, never fatal.
-        match crate::e7_candidate::spawn(&RealKernel, caps.budget_base, caps.budget_len) {
-            Ok(sp) => {
-                if crate::linux::track(
-                    sp.ch_r,
-                    sp.ch_w,
-                    crate::e7_candidate::CAND_NAME,
-                    0,
-                    sp.heap_base,
-                    sp.heap_limit,
-                ) {
-                    klog(b"[E7] candidate: spawned ch_r=", sp.ch_r, b"");
-                } else {
-                    klog(b"[E7] candidate: spawned but TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+            // E7 increment 7 (§5.1/§5.2): the SAME create over a REAL ELF64 image
+            // — the census candidate fixture, segments at their linked vaddrs and
+            // entry at e_entry — a controlled pair with the .flat probe above:
+            // identical machine code, only the IMAGE FORMAT differs, so the serial
+            // log measures exactly how far a real ELF gets (§10.12 records the
+            // run). Like the probe: logged, never fatal.
+            match crate::e7_candidate::spawn(&RealKernel, caps.budget_base, caps.budget_len) {
+                Ok(sp) => {
+                    match booted.proc.vfs.add_task() {
+                        Ok(vt) => {
+                            if crate::linux::track(
+                                sp.ch_r,
+                                sp.ch_w,
+                                crate::e7_candidate::CAND_NAME,
+                                0,
+                                sp.heap_base,
+                                sp.heap_limit,
+                                vt,
+                                false,
+                            ) {
+                                klog(b"[E7] candidate: spawned ch_r=", sp.ch_r, b"");
+                            } else {
+                                klog(b"[E7] candidate: spawned but TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+                            }
+                        }
+                        Err(_) => klog(b"[E7] candidate: VFS task alloc FAILED ch_r=", sp.ch_r, b""),
+                    }
                 }
+                Err(rc) => klog(b"[E7] candidate: spawn FAILED rc=", rc as u32, b""),
             }
-            Err(rc) => klog(b"[E7] candidate: spawn FAILED rc=", rc as u32, b""),
         }
 
         // The designated first user (§10.12's named boundary): backup/
         // aerobackup's OWN static musl binary (tools/linux_abi_candidate.
         // conf), embedded as built — ET_EXEC, unmodified, the census target
-        // finally executing instead of being straced on the host. argv is
-        // v1 (`argv = { name }`), so it runs WITHOUT its flags: the run
-        // measures how far an unmodified real libc binary gets — crt, TLS,
-        // the §5.2 stack image and auxv, then wherever it stops (a usage
-        // write and exit_group, the first -ENOSYS name, or a fault). Like
-        // the pair above: logged, never fatal.
-        match crate::e7_firstuser::spawn(&RealKernel, caps.budget_base, caps.budget_len) {
+        // finally executing instead of being straced on the host. The gate
+        // profile stages its source image and six old backups first, then
+        // crosses the real nine-entry command line; the system POSIX keeps
+        // v1's `argv = { name }` measurement. Like the pair above: logged,
+        // never fatal.
+        let firstuser = if gate {
+            match crate::e7_firstuser::stage_gate(&mut booted.proc.vfs, 0) {
+                Ok(()) => {
+                    let used = unsafe { HEAP.used() };
+                    let remaining = unsafe { HEAP.remaining() };
+                    klog(b"[E7-GATE] stage", crate::e7_firstuser::GATE_IMAGE_BYTES as u32, b"bytes");
+                    klog(b"[E7-GATE] heap-used", used as u32, b"");
+                    klog(b"[E7-GATE] heap-free", remaining as u32, b"");
+                    let need = (crate::e7_firstuser::USER_RESERVE + 4096) as usize;
+                    if remaining < need {
+                        klog(b"[E7-GATE] no-headroom", remaining as u32, b"refused");
+                        Err(-2)
+                    } else {
+                        /* E7 §10.14's drill build only: stretch the boot
+                         * BEFORE the tenant exists, so the replay's sidecar is
+                         * still working when the pour's wait passes the old
+                         * fixed bound (see gate_boot_stretch). */
+                        #[cfg(feature = "e7_slow_boot")]
+                        gate_boot_stretch(&RealKernel, caps.console_chan);
+                        crate::e7_firstuser::spawn_gate(
+                            &RealKernel,
+                            caps.budget_base,
+                            caps.budget_len,
+                        )
+                    }
+                }
+                Err(e) => {
+                    klog(b"[E7-GATE] stage-fail", e.code() as u32, b"errno");
+                    Err(-3)
+                }
+            }
+        } else {
+            crate::e7_firstuser::spawn(&RealKernel, caps.budget_base, caps.budget_len)
+        };
+
+        match firstuser {
             Ok(sp) => {
-                if crate::linux::track(
-                    sp.ch_r,
-                    sp.ch_w,
-                    crate::e7_firstuser::USER_NAME,
-                    0,
-                    sp.heap_base,
-                    sp.heap_limit,
-                ) {
-                    klog(b"[E7] firstuser: spawned ch_r=", sp.ch_r, b"");
-                } else {
-                    klog(b"[E7] firstuser: spawned but TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+                match booted.proc.vfs.add_task() {
+                    Ok(vt) => {
+                        if crate::linux::track(
+                            sp.ch_r,
+                            sp.ch_w,
+                            if gate {
+                                crate::e7_firstuser::GATE_TASK_NAME
+                            } else {
+                                crate::e7_firstuser::USER_NAME
+                            },
+                            0,
+                            sp.heap_base,
+                            sp.heap_limit,
+                            vt,
+                            gate,
+                        ) {
+                            klog(b"[E7] firstuser: spawned ch_r=", sp.ch_r, b"");
+                        } else {
+                            klog(b"[E7] firstuser: spawned but TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+                        }
+                    }
+                    Err(_) => klog(b"[E7] firstuser: VFS task alloc FAILED ch_r=", sp.ch_r, b""),
                 }
             }
             Err(rc) => klog(b"[E7] firstuser: spawn FAILED rc=", rc as u32, b""),
@@ -523,6 +664,17 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     }
 
     let mut boot_stats_sent = false;
+    /* Increment 21: the gate profile still owes the kernel ONE console line.
+     * boot.rs writes the `[env-id]` announcement before init runs, and the
+     * restore's wait (kernel/env_payload.c's env_payload_wait_parked) reads
+     * exactly that line out of this environment's console to tell "finished
+     * booting and parked" from "parked mid-boot in the ramdisk handshake".
+     * The drain below is dropped in the gate profile to keep this sidecar off
+     * the environment console (the child's own stdout is mirrored to serial in
+     * the write arm), but dropping the announcement too made that wait
+     * unsatisfiable: it burned its whole bound and poured at an arbitrary
+     * instant. So the announcement alone still goes, once. */
+    let mut gate_identity_sent = false;
     loop {
         // ── Console input: recv from kernel, push into ConsoleIo ──
         // The kernel's console_service_tick polls serial input and sends
@@ -544,8 +696,30 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         // drains every tick, so this is simple flow control, not a stall.
         if let Some(cw) = console_w {
             let out = booted.console.console_io().drain_output();
-            for chunk in out.chunks(1024) {
-                let _ = RealKernel.send(cw, 0, 0, chunk, &[], TIMEOUT_NONE);
+            /* Increment 19: the gate tenant's console is an ENVIRONMENT
+             * console with no attach surface in this run, and the boot's
+             * own serial storm can hold the port. Posting there (or
+             * mirroring there) parks the sidecar and it never reaches
+             * linux::service; the child's stdout is already mirrored
+             * byte-for-byte in the write arm, so the gate profile drops
+             * this sidecar-console drain entirely. The default path keeps
+             * its env console untouched. */
+            if !gate {
+                for chunk in out.chunks(1024) {
+                    let _ = RealKernel.send(cw, 0, 0, chunk, &[], TIMEOUT_NONE);
+                }
+            } else if !gate_identity_sent {
+                /* Exactly the announcement line — never the rest of the
+                 * buffer. One message of one line cannot park this sidecar,
+                 * and it is the only byte the restore's predicate reads. */
+                let m = crate::boot::IDENTITY_MARKER.as_bytes();
+                if let Some(at) = out.windows(m.len()).position(|w| w == m) {
+                    if let Some(rel) = out[at..].iter().position(|&b| b == b'\n') {
+                        let line = &out[at..at + rel + 1];
+                        let _ = RealKernel.send(cw, 0, 0, line, &[], TIMEOUT_NONE);
+                        gate_identity_sent = true;
+                    }
+                }
             }
         }
         // E7 increment 3: answer any Linux-personality child's forwarded
@@ -554,7 +728,7 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         // the parked sidecar's quiesce wait set includes these channels
         // (linux::append_wait), so a forward wakes this loop instead of
         // spinning it.
-        crate::linux::service(&RealKernel, &booted.console);
+        crate::linux::service(&RealKernel, &booted.console, &mut booted.proc.vfs);
         booted.proc.drain_wakes();
         // One-shot boot diagnostic: report what task 0 (init) did and how
         // many tasks are live, so a quiet boot can be told apart from a

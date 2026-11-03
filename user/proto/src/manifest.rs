@@ -76,11 +76,17 @@ pub const TAG_NAME: u16 = 0x000A;
 pub const TAG_ARGENV: u16 = 0x000E;
 /// Reserved for Phase 3 signed manifests; ignored by v1.
 pub const TAG_SIGNATURE: u16 = 0x7F00;
+/// Increment 19's gate-profile bit in the manifest header's flags word
+/// (kernel/cap.h `SIDECAR_MANIFEST_FLAG_GATE`). It grants no authority; the
+/// kernel copies it into the BIB as `BOOT_INFO_FLAG_GATE`, and the sidecar
+/// selects the E7 gate profile from that bit. Bit 0 of the same word is
+/// the parser's tolerate-unknown-records switch and must not be reused.
+pub const FLAG_GATE: u16 = 0x0002;
 
 /// Per-list bounds of one `ARGENV` record — the kernel's own
 /// (cap.h `SIDECAR_MANIFEST_MAX_ARGV`/`MAX_ENVP`), mirrored so a record
 /// this side builds is one the kernel will parse.
-pub const MAX_ARGV: usize = 8;
+pub const MAX_ARGV: usize = 12;
 pub const MAX_ENVP: usize = 16;
 /// Total NUL-terminated string bytes one record may carry (cap.h
 /// `SIDECAR_MANIFEST_ARGENV_BYTES` — the create copies them into a fixed

@@ -184,6 +184,32 @@ struct ProcessDescriptor {
                                        // min(limit, mtop)) so a map can never
                                        // overwrite a frame either side already
                                        // handed out.
+    uint64_t   linux_image_lo;         // E7 increment 20: the ET_EXEC image's
+                                       // own page span, [lo, hi) — the PT_LOAD
+                                       // extent elf64_map_blob actually mapped
+                                       // (page-rounded outward), stamped at
+                                       // the create and zeroed at slot reuse.
+                                       // A linked static image sits at 0x400000
+                                       // inside the child's shared identity
+                                       // map, so the checkpoint's page walk
+                                       // cannot use the image window alone to
+                                       // say which pages carry the image; this
+                                       // is the range that can. A flat image
+                                       // leaves it 0 (its pages are the image
+                                       // window, which the walk knows).
+    uint64_t   linux_image_hi;
+    // ── Q2: the gate stack's high-water measurement ──────────────────────
+    // The gate profile poisons the unused span below the entry %rsp at
+    // create and scans it at the stop and at teardown. These four fields
+    // are the region's identity: its child-vaddr base, the contiguous
+    // physical base (linux_stack_phys — one allocation, which is what makes
+    // the scan possible), its page count, and how many bytes below the entry
+    // %rsp carry the poison. Zeroed at slot reuse beside the heap/image
+    // fields; a non-gate create leaves them 0 and no scan runs.
+    uint64_t   linux_stack_base;
+    uint64_t   linux_stack_phys;
+    uint32_t   linux_stack_pages;
+    uint32_t   linux_stack_poison;      // bytes below entry %rsp (0 = no measurement)
     uint64_t   mem_stage_num;          // §5.4: a brk captured at the first trap
                                        // (a break only means something against the
                                        // break the FIRST trap saw) — held for the
@@ -218,6 +244,23 @@ struct ProcessDescriptor {
                                        // top of every first-trap block, consumed
                                        // and cleared at the apply, and cleared at
                                        // slot reuse beside the other stages.
+    uint8_t    reply_stage_kind;       // E7 step 4 (the file class): LINUX_STAGE_*
+                                       // — what the deliver does with the payload
+                                       // before the copy-in (RAW verbatim, STAT
+                                       // serialized, DENTS packed). Consumed and
+                                       // cleared with the rest of the stage.
+    uint32_t   reply_stage_aux;        // the CHILD-side clamp the plan staged
+                                       // (bytes the deliver may write at
+                                       // reply_stage_va — 144 for stat, the
+                                       // child's count for getdents64)
+    uint64_t   linux_dir_pos;          // step 4's getdents64 cursor: the ENTRY
+                                       // INDEX the next call starts at, advanced
+                                       // by the deliver only by records actually
+                                       // packed (a short getdents is POSIX-legal;
+                                       // the caller loops). Reset when this task
+                                       // opens a new path (one listing at a time
+                                       // — named v1 boundary) and at slot reuse.
+                                       // SLS and non-Linux tasks never read it.
     uint64_t   user_rip;              // entry point in user space
     uint64_t   user_rsp;              // current user-space stack pointer
     uint64_t   user_stack_vaddr;      // vaddr base of the 8-page user stack
@@ -259,6 +302,16 @@ struct ProcessDescriptor {
                                        // Stamped at spawn (cap_create_sidecar_in),
                                        // reset by proc_clear_resume_state() so a
                                        // reused slot can never inherit it.
+    /* E7 increment 21 (§10.14 B8): a Linux task the RESTORE's create spawned
+     * but deliberately did not release. It is born PROC_HELD and stays
+     * non-schedulable until the payload's pour has mapped its pages and
+     * installed its captured ring3_ctx — the one seam that makes "adopt the
+     * spawn before it runs" a fact rather than a race. A held child has no
+     * context of its own yet (its entry is _start), so the pour is the only
+     * writer of what it executes first; cap_linux_restore_release() is what
+     * puts it back on the scheduler afterwards. Cleared at slot reuse beside
+     * personality, so a stale hold can never pin a later occupant. */
+    uint8_t    restore_held;
     ProcState  state;
     ProcPriority priority;             // Navigator-Parity Gap Roadmap Phase 4:
                                        // defaults to PROC_PRIO_NORMAL at spawn
@@ -336,6 +389,23 @@ struct ProcessDescriptor {
                                        // (send, yield) had simply taken a while. Set
                                        // by cap_maybe_handoff()/sys_sls_yield(),
                                        // consumed by schedule_ring3()/kernel_switch_next().
+    // ── E7 increment 21: the gate workload's deterministic stop ──────────────
+    // The form the payload can resume (FORM_ENTRY) is a Linux task stopped AT
+    // the sysret that follows its third 64 KiB read: the reply is applied, no
+    // request is in flight, no trap has been entered since, and the sidecar's
+    // fd offset is exactly the continuation (src_off=196608). The stop is
+    // named by the workload's own shape — the gate profile copies its image
+    // from fd 3 — and the counter is the bytes the replies actually returned,
+    // so a 1 KiB-granular sidecar and a 64 KiB-granular libc reach the same
+    // instant. Stopping here is B9's "checkpoint at the next sysret".
+    uint8_t    gate_profile;          // created from a manifest carrying FLAG_GATE
+    uint8_t    gate_read_pending;     // this forward is a read(fd 3) awaiting its reply
+    uint8_t    gate_stopped;          // held at the copy continuation (FORM_ENTRY)
+    uint8_t    tooth;                 // E7 inc. 22: the fault this task's forwards inject
+                                      // (env_payload.h's ENV_PAYLOAD_TOOTH_*; 0 in every
+                                      // shipped image — the arms are compiled out and no
+                                      // route can select one)
+    uint32_t   gate_bytes;            // bytes those reads have returned so far
     struct ProcessDescriptor* handoff_target;  // Phase 1.5: the process this one
                                        // just WOKE with cap_wake_chan() — the send
                                        // hands the CPU to it immediately
@@ -380,6 +450,22 @@ struct ProcessDescriptor {
                                        // Explicitly cleared at every non-sidecar
                                        // spawn — a reused slot must not inherit it.
     uint8_t    active;
+    uint32_t   switches;              // E7 increment 21 (hardening): how many times the
+                                      // scheduler has switched TO this task, incremented
+                                      // in proc_build_resume_frame so every switch path
+                                      // (timer schedule_ring3, kernel_switch_next, the
+                                      // control plane's yield) counts exactly once. This
+                                      // is the PROGRESS signal env_payload_wait_parked()
+                                      // reads: a sidecar that is still being scheduled is
+                                      // still working, and a wait that gave up on it after
+                                      // a fixed wall clock would report a healthy, slow
+                                      // boot as a posture the pour must refuse (the live
+                                      // arm's run-12 failure: the wait's 30 s bound
+                                      // expired while drv.ramdisk.1 was serving the
+                                      // replay's own boot I/O). Monotone, wraps harmlessly
+                                      // (readers compare inequality, never order), never
+                                      // reset at slot reuse — a reused slot must not look
+                                      // like a task that just ran.
 };
 
 // ─── Syscall numbers ──────────────────────────────────────────────────────────
@@ -598,6 +684,23 @@ void process_exit(uint32_t exit_code);
 // kernel_enter_ring3). Returns NULL if no Ring-3 process is currently
 // running (e.g. a call made from pure kernel context).
 struct ProcessDescriptor* process_find_current(void);
+
+/* E7 increment 21: stop the current Linux gate task AT the sysret that closes
+ * a forwarded read(fd 3), once the replies have returned 196608 bytes. Called
+ * from the resume-sentinel trap AFTER the reply is applied and every staged
+ * apply half has run, so `ret` is the value the sysret would deliver. Returns
+ * 0 when the task was not stopped (not the current process, or no other
+ * runnable task) — the caller then returns `ret` as usual. Never returns when
+ * it stops: ring3_ctx becomes the exact sysret frame the payload will install
+ * (rip = the park's rcx, rax = `ret`), and the task is left PROC_HELD so no
+ * further trap can run. */
+int proc_gate_stop_at_sysret(uint64_t ret);
+
+/* The continuation's byte offset in the designated first user's copy: the
+ * third 64 KiB read leaves the fd there, and the fourth (never issued in the
+ * capturing boot) starts there. One constant for the kernel's stop and the
+ * design's acceptance line. */
+#define PROC_GATE_SRC_OFF 196608u
 
 /* E7 (increment 2): read this CPU's captured Linux argument registers
  * (arch/x86/syscall.asm's sibling block at [gs:0x50..0x80)) into out[6]

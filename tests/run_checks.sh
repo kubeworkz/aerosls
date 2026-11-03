@@ -232,6 +232,7 @@ if [ "$skip" -gt 0 ]; then
         echo "    tests/partition_ownedset_gc_live_check.sh"
         echo "    tests/failover_adoption_live_check.sh"
         echo "    tests/failover_2node_live_check.sh"
+        echo "    tests/env_catalog_live_check.sh"
         echo "    tests/partition_ownedset_gc_live_check.sh"
     fi
 fi

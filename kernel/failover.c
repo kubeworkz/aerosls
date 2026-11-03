@@ -8,9 +8,11 @@
 #include "env_migrate.h"    /* env_migrate_in_flight() — the migration deferral gate */
 #include "env_ckpt.h"       /* P3 increment 11: the durable records the restore half replays from */
 #include "env_service.h"    /* P3 increment 11: env_service_restore_pending(), the standard replay driver */
+#include "env_replica.h"     /* P3 destination (a) increment 3: env_replica_promote() — the survivor's replica band */
 #include "state_tree.h"
 #include "partition.h"
 #include "kernel_io.h"
+#include "timer.h"           /* kernel_tick_counter — failover_sweep_keepalive()'s now */
 #include "../net/dspp.h"
 #include "../net/consensus.h"
 
@@ -41,6 +43,23 @@ static uint32_t last_adopted = 0;
 static uint32_t last_unrestored_envs = 0;
 static uint32_t last_restored_envs = 0;
 
+/* THIS node's relaunch grace (see FAILOVER_RELAUNCH_GRACE_TICKS): 0 when
+ * disarmed. Reset by failover_init(), armed by failover_note_relaunch_grace()
+ * from the boot path — kept apart from init so a host test can arm it
+ * explicitly and pin both halves of the window. */
+static uint64_t fo_relaunch_grace_until = 0;
+
+/* Silence before this tick is not counted. Set to the grace's expiry when
+ * the grace is armed, so a peer's silence is measured from the end of OUR
+ * boot rather than from wherever it happened to stop beating. Declaring at
+ * the instant the grace lifted was the live 2026-10-24 find: node 1 and
+ * node 3 both printed "Node 2 declared DEAD (silent 302/304 ticks)" within
+ * lines of their own grace expiring — the silence they measured had
+ * accrued ACROSS their boot, the exact window the grace exists to excuse
+ * (our restore burst is what stalled that peer). 0 when no grace was ever
+ * armed, which leaves every pre-existing silence arithmetic untouched. */
+static uint64_t fo_watch_from = 0;
+
 /* The armed set of ONE recovery (P3 increment 11): the (partition, index)
  * pairs whose durable records this pass put into the replay's pending set,
  * so the driver's outcome can be classified PER RECORD afterwards. File
@@ -55,7 +74,19 @@ static uint32_t fo_armed_count = 0;
 void failover_init(void) {
     fo_memset(peers, 0, sizeof(peers));
     last_adopted = 0;
+    fo_relaunch_grace_until = 0;
+    fo_watch_from = 0;
     kernel_serial_print("[FAILOVER] Subsystem initialised.\n");
+}
+
+void failover_note_relaunch_grace(uint64_t now) {
+    fo_relaunch_grace_until = now + FAILOVER_RELAUNCH_GRACE_TICKS;
+    fo_watch_from = fo_relaunch_grace_until;
+    kernel_serial_printf(
+        "[FAILOVER] relaunch grace: this node just came up -- no peer is "
+        "declared DEAD for %u ticks (until tick %llu).\n",
+        (unsigned)FAILOVER_RELAUNCH_GRACE_TICKS,
+        (unsigned long long)fo_relaunch_grace_until);
 }
 
 static struct PeerLiveness* find_peer(uint32_t node_id) {
@@ -71,6 +102,13 @@ static struct PeerLiveness* alloc_peer(uint32_t node_id) {
             peers[i].node_id = node_id;
             peers[i].active  = 1;
             peers[i].status  = PEER_ALIVE;
+            /* Per-episode state must be this peer's own, never the previous
+             * occupant's: a recycled slot carrying a stale grace_until_tick
+             * would defer declarations against a node that was never
+             * relaunched, and a stale grace_noted would swallow its line. */
+            peers[i].defer_noted     = 0;
+            peers[i].grace_noted     = 0;
+            peers[i].grace_until_tick = 0;
             return &peers[i];
         }
     }
@@ -86,13 +124,36 @@ void failover_note_heartbeat(uint32_t node_id, uint64_t now) {
 
     p->last_seen_tick = now;
     p->defer_noted = 0;   /* seen: a later silence earns its own DEFERRED line */
+    p->grace_noted = 0;   /* ...and its own silence-grace line */
     if (p->status == PEER_DEAD) {
         kernel_serial_printf("[FAILOVER] Node %u came back (was dead)\n", node_id);
+        /* The peer half of the relaunch grace: a node that returns from DEAD
+         * is the relaunched one, and its first seconds are its own
+         * restore — both its beats and its peers' stability are in question
+         * for exactly that window. One window per episode (re-armed here,
+         * never by an ordinary beat: re-arming on every beat would excuse a
+         * peer that stopped beating entirely, which is the one case this
+         * gate exists for). */
+        p->grace_until_tick = now + FAILOVER_RELAUNCH_GRACE_TICKS;
+        kernel_serial_printf(
+            "[FAILOVER] relaunch grace: node %u just came back -- no "
+            "declaration against it for %u ticks (until tick %llu).\n",
+            node_id, (unsigned)FAILOVER_RELAUNCH_GRACE_TICKS,
+            (unsigned long long)p->grace_until_tick);
     }
     p->status = PEER_ALIVE;
 }
 
 void failover_tick(uint64_t now) {
+    /* This node's own relaunch grace: a node that has just booted is
+     * restoring its durable state on this very sweep and its boot's I/O is
+     * stalling the peers it is rejoining, so everything below would fire on
+     * a silence it caused. The silence keeps accruing meanwhile — the grace
+     * ends and the declaration fires on the first tick after it (the
+     * per-peer half below pins that pairing; this early return is the same
+     * delay, applied to the whole pass). */
+    if (now < fo_relaunch_grace_until) return;
+
     for (int i = 0; i < FAILOVER_MAX_PEERS; i++) {
         if (!peers[i].active) continue;
         if (peers[i].status == PEER_DEAD) continue;
@@ -114,7 +175,37 @@ void failover_tick(uint64_t now) {
          * at least as recently as this sample: silence is zero. */
         uint64_t silence = (now > peers[i].last_seen_tick)
                          ? now - peers[i].last_seen_tick : 0;
+        /* ...except the part of it that accrued across OUR relaunch grace.
+         * The grace defers declarations, but on its own it only moves the
+         * firing to the expiry tick: the silence a peer looked to have was
+         * silence measured against a boot of ours that was stalling it, and
+         * the live run showed exactly that (both survivors declared the
+         * same healthy peer within lines of their grace lifting, at 302 and
+         * 304 ticks). Re-basing on the grace's expiry says the honest thing
+         * — our watch starts when our own settle window ends — and it is a
+         * no-op the moment fo_watch_from is 0, so a node that never armed a
+         * grace keeps the arithmetic it always had. A peer that stops
+         * beating AFTER the expiry is declared on the normal terms. */
+        if (fo_watch_from > peers[i].last_seen_tick && now >= fo_watch_from)
+            silence = now - fo_watch_from;
         if (silence >= FAILOVER_DEAD_TICKS) {
+            /* The relaunch grace (see FAILOVER_RELAUNCH_GRACE_TICKS): a peer
+             * that just came back is NOT declared dead while its window
+             * stands, whatever the silence says. Checked first — it is the
+             * newest fact about the peer, and the two migration gates below
+             * are bounded by their own budgets anyway. One DEFERRED line per
+             * silent episode, the flag an ordinary beat resets. */
+            if (now < peers[i].grace_until_tick) {
+                if (!peers[i].defer_noted) {
+                    peers[i].defer_noted = 1;
+                    kernel_serial_printf(
+                        "[FAILOVER] Node %u silent %llu ticks -- declaration "
+                        "DEFERRED: relaunch grace (it came back at tick %llu)\n",
+                        peers[i].node_id, (unsigned long long)silence,
+                        (unsigned long long)peers[i].last_seen_tick);
+                }
+                continue;
+            }
             /* P3 live arm (2026-10-13): a silence this node's OWN
              * environment migration produced is not a death. The source's
              * synchronous payload send and the destination's restore (create
@@ -162,6 +253,29 @@ void failover_tick(uint64_t now) {
                         "DEFERRED: an environment migration is in flight on "
                         "this node\n",
                         peers[i].node_id, (unsigned long long)silence);
+                }
+                continue;
+            }
+            /* The silence grace (FAILOVER_SILENCE_GRACE_TICKS): the LAST
+             * gate, immediately before the declaration, and only when no
+             * other arm has already deferred this sweep. Every other reason
+             * above is more specific and keeps precedence; this one is the
+             * catch-all that says "300 ticks is suspicion, not proof" on a
+             * cluster whose peers stall for whole seconds. One line per
+             * episode (grace_noted, reset by an ordinary beat exactly like
+             * defer_noted), and silence keeps accruing across it, so a peer
+             * that is really gone is declared on the first tick past
+             * FAILOVER_DECLARE_TICKS. */
+            if (silence < FAILOVER_DECLARE_TICKS) {
+                if (!peers[i].grace_noted) {
+                    peers[i].grace_noted = 1;
+                    kernel_serial_printf(
+                        "[FAILOVER] Node %u silent %llu ticks -- declaration "
+                        "DEFERRED: silence grace (%u ticks of it still to run, "
+                        "declaring at %u)\n",
+                        peers[i].node_id, (unsigned long long)silence,
+                        (unsigned)(FAILOVER_DECLARE_TICKS - silence),
+                        (unsigned)FAILOVER_DECLARE_TICKS);
                 }
                 continue;
             }
@@ -328,12 +442,123 @@ int failover_recover_from(uint32_t dead_node_id) {
                 break;
             }
         }
-        if (!rec) {
+
+        /* P3 destination (a), increment 3: PROMOTION. The record above is
+         * (b)'s source — this survivor's own durable store. The replica is
+         * the copy the dead node's capture pushed here while it lived, and
+         * it is consulted in exactly two shapes:
+         *
+         *   a HOLE (no record) — the replica is the only copy that can
+         *     exist on this disk, so it is promoted when present; its
+         *     absence folds into the same honest "no durable record" line
+         *     the report has always printed;
+         *   a record AND a replica — the NEWER capture wins, which is the
+         *     receiver's own rule (a same-identity entry is superseded by
+         *     a newer seq, never an older one). The loser is NAMED either
+         *     way: an older replica left unapplied, or a newer replica
+         *     whose promotion failed falling back to the record (b) knows
+         *     how to replay — (b) stays the floor under (a).
+         *
+         * Every refusal path counts the environment unrestored WITH its
+         * reason, or falls through to (b): no path is silent, and no path
+         * claims a restore the bytes cannot back. */
+        struct EnvReplicaDirEntry rep;
+        int has_rep = env_replica_lookup(part_id, env_idx, &rep);
+        int use_replica = 0;
+        if (has_rep && (!rec || (uint64_t)rec->sequence < rep.seq)) {
+            use_replica = 1;
+        } else if (has_rep) {
+            kernel_serial_printf(
+                "[FAILOVER] environment index %llu (partition %u): a replica "
+                "of capture seq %llu is held here, but this survivor's durable "
+                "record is capture seq %llu -- the older copy is not applied\n",
+                (unsigned long long)env_idx, part_id,
+                (unsigned long long)rep.seq,
+                (unsigned long long)rec->sequence);
+        }
+
+        if (!rec && !has_rep) {
             last_unrestored_envs++;
             kernel_serial_printf(
                 "[FAILOVER] environment index %llu (partition %u, %llu region(s)) "
-                "was NOT restored -- no durable record for it on this survivor; "
-                "recreate it\n",
+                "was NOT restored -- no durable record for it on this survivor "
+                "and no replica of it is held here; recreate it\n",
+                (unsigned long long)env_idx, part_id,
+                (unsigned long long)nodes[i].size);
+            continue;
+        }
+
+        if (use_replica) {
+            int prc = env_replica_promote(part_id, env_idx);
+            if (prc == ENV_REPLICA_PROMOTE_OK) {
+                int mrc = env_migrate_restore(part_id, env_idx);
+                if (mrc == ENV_MIGRATE_OK) {
+                    last_restored_envs++;
+                    kernel_serial_printf(
+                        "[FAILOVER] environment index %llu (partition %u) RESTORED "
+                        "from a replica held on this survivor (capture seq %llu, "
+                        "provenance node %u), replayed through the migration "
+                        "restore path\n",
+                        (unsigned long long)env_idx, part_id,
+                        (unsigned long long)rep.seq, (unsigned)rep.src_node);
+                    continue;
+                }
+                if (!rec) {
+                    last_unrestored_envs++;
+                    kernel_serial_printf(
+                        "[FAILOVER] environment index %llu (partition %u, %llu region(s)) "
+                        "was NOT restored -- its replica staged on this survivor but "
+                        "the replay refused it (%s); recreate it\n",
+                        (unsigned long long)env_idx, part_id,
+                        (unsigned long long)nodes[i].size,
+                        env_migrate_status_name(mrc));
+                    continue;
+                }
+                kernel_serial_printf(
+                    "[FAILOVER] environment index %llu (partition %u): the newer "
+                    "replica staged but its replay refused (%s) -- falling back to "
+                    "this survivor's durable record (capture seq %llu)\n",
+                    (unsigned long long)env_idx, part_id,
+                    env_migrate_status_name(mrc),
+                    (unsigned long long)rec->sequence);
+            } else {
+                if (!rec) {
+                    last_unrestored_envs++;
+                    kernel_serial_printf(
+                        "[FAILOVER] environment index %llu (partition %u, %llu region(s)) "
+                        "was NOT restored -- no durable record for it on this survivor, "
+                        "and the replica held here could not be applied (%s): refusal "
+                        "over partial application, nothing applied; recreate it\n",
+                        (unsigned long long)env_idx, part_id,
+                        (unsigned long long)nodes[i].size,
+                        env_replica_promotion_name((uint32_t)prc));
+                    continue;
+                }
+                kernel_serial_printf(
+                    "[FAILOVER] environment index %llu (partition %u): the newer "
+                    "replica could not be staged (%s) -- falling back to this "
+                    "survivor's durable record (capture seq %llu)\n",
+                    (unsigned long long)env_idx, part_id,
+                    env_replica_promotion_name((uint32_t)prc),
+                    (unsigned long long)rec->sequence);
+            }
+            /* Fell back to (b). Any slot this attempt staged would be
+             * replayed later by the migrate sweep's own restore loop — over
+             * the record the report just chose. Drop it so exactly one
+             * driver owns this environment's replay. */
+            env_migrate_recv_drop(part_id, env_idx);
+        }
+
+        if (!rec) {
+            /* Defensive: every hole path above continues. An environment
+             * that reaches the arm with no record would be arming nothing —
+             * refused by env_ckpt_restore_arm() and named by the branch
+             * below, but say it here rather than rely on a callee's gate. */
+            last_unrestored_envs++;
+            kernel_serial_printf(
+                "[FAILOVER] environment index %llu (partition %u, %llu region(s)) "
+                "was NOT restored -- no durable record for it on this survivor "
+                "and no replica of it is held here; recreate it\n",
                 (unsigned long long)env_idx, part_id,
                 (unsigned long long)nodes[i].size);
             continue;
@@ -406,21 +631,27 @@ int failover_recover_from(uint32_t dead_node_id) {
     if (last_unrestored_envs > 0) {
         kernel_serial_printf(
             "[FAILOVER] %u environment(s) of the adopted partitions were NOT "
-            "restored (named above) -- their payload lived on node %u's own "
-            "storage and does not follow ownership\n",
+            "restored (named above) -- each line names which source this "
+            "survivor lacked or could not apply: its own durable record, or "
+            "the replica node %u's capture pushed here\n",
             (unsigned)last_unrestored_envs, dead_node_id);
     }
     if (last_restored_envs > 0) {
         // Contents, honestly scoped: the replay brings the ENVIRONMENT back
         // (identity, sidecars, bindings). Its bytes follow only as far as
-        // the durable extent is readable on this survivor, and the payload
-        // layer names that refusal itself ([ENV_PAYLOAD]) — so this line
-        // claims the environment, never the contents.
+        // the chosen source can back them -- the durable extent readable on
+        // this survivor, or the replica band the capture pushed here -- and
+        // the pour names any refusal itself ([ENV_PAYLOAD] / [ENV_MIGRATE])
+        // -- so this line claims the environment, never the contents. The
+        // count mixes both sources on purpose: an operator counting restores
+        // wants one number, and each per-environment line above says which
+        // source it came from.
         kernel_serial_printf(
             "[FAILOVER] %u environment(s) of the adopted partitions were "
-            "restored from durable storage; contents follow only as far as "
-            "each durable extent is readable on this survivor ([ENV_PAYLOAD] "
-            "names what is not)\n",
+            "restored -- from this survivor's durable records or from a "
+            "replica of the dead node's capture (each line above says which); "
+            "contents follow only as far as that source is readable here "
+            "([ENV_PAYLOAD] / [ENV_MIGRATE] name what is not)\n",
             (unsigned)last_restored_envs);
     }
 
@@ -448,6 +679,23 @@ uint32_t failover_last_restored_envs(void) { return last_restored_envs; }
 
 /* ─── Live checkpoint broadcast (leader -> followers) ────────────────── */
 static uint64_t failover_last_ckpt_tick = 0;
+
+void failover_sweep_keepalive(void) {
+    /* The sweep's two liveness streams, driven from the middle of a
+     * blocking wait: the heartbeat (election watchdogs + last_seen_tick on
+     * every observer) and the checkpoint broadcast (the adoption payload).
+     * Both gates live in the callees, so calling this at spin rate is a
+     * no-op almost always — and a no-op is the point: a create/migrate/
+     * restore block that keeps these flowing never deposes its own node,
+     * and a node never deposed never turns into the quiet follower that
+     * this subsystem would misdeclare dead (the release-vs-heartbeat race,
+     * 2026-10-23). Read the tick here rather than trusting a caller's
+     * sampled `now`: waits call this precisely because their notion of
+     * "later" is frozen at loop entry. */
+    uint64_t now = kernel_tick_counter;
+    check_consensus_heartbeat_tick(now);
+    failover_live_checkpoint_broadcast(now);
+}
 
 void failover_live_checkpoint_broadcast(uint64_t now) {
     /* Only the leader produces checkpoints: it is the only node whose

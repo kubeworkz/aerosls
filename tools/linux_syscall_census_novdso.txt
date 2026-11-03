@@ -3,7 +3,7 @@
 # provenance: backup/backup.sh
 # binary: backup/aerobackup/target/x86_64-unknown-linux-musl/release/aerobackup
 # target: x86_64-unknown-linux-musl
-# sha256: 5c878b1efc99271e5fd011134b29f281bf34b2d7ebdeca2338da20cbb6e673a6
+# sha256: 611ba645931c7c4337549fa7ec708387ac3c0c503dd186b28ffd9a27d11141cc
 # census: tools/linux_syscall_census.txt
 # launcher: tools/e7_stack_launcher.c
 # launcher-sha256: 57788ed169e474141e57f652c5dad20a9486ca54fe53b607d0dcacc4314aaa49
@@ -11,7 +11,7 @@
 # method: strace -f, candidate started by the launcher on a stack it built; rows are the target's own
 # split: the launcher's write(2) of its entry marker; its own execve is above that line, not in these rows
 # host: Linux 6.18.33.2-microsoft-standard-WSL2 x86_64
-# date: 2026-09-29T00:52:34Z
+# date: 2026-10-23T14:03:00Z
 # columns: <syscall-number> <name> <count>
 # vdso-proved: 228 clock_gettime plain=0 novdso=1
 0 read 1025
@@ -24,7 +24,7 @@
 8 lseek 2
 9 mmap 8
 10 mprotect 1
-11 munmap 7
+11 munmap 6
 12 brk 2
 13 rt_sigaction 5
 14 rt_sigprocmask 1
@@ -34,7 +34,7 @@
 82 rename 1
 83 mkdir 1
 87 unlink 3
-131 sigaltstack 3
+131 sigaltstack 2
 158 arch_prctl 1
 217 getdents64 2
 218 set_tid_address 1

@@ -664,7 +664,7 @@ pub fn build_boot_image(spec: &BootImageSpec) -> BootImage {
     let net_manifest_ph = build_net_manifest(spec, &layout, 0);
 
     // Build the rootfs image (aerofs-lite) for the ramdisk storage region.
-    let rootfs_img = crate::rootfs::build_rootfs();
+    let rootfs_img = crate::rootfs::build_rootfs(spec.quiet_init);
 
     // All entries in order; each entry's span is
     // 110 (header) + padded name + padded data.
@@ -779,7 +779,9 @@ mod tests {
     }
 
     fn spec() -> BootImageSpec {
-        BootImageSpec::new(vec![0xAA; 0x2000], vec![0xBB; 0x4000], vec![0xCC; 0x8000], vec![0xDD; 0x1000], vec![0xEE; 0x1000], vec![0xEF; 0x2000])
+        let mut s = BootImageSpec::new(vec![0xAA; 0x2000], vec![0xBB; 0x4000], vec![0xCC; 0x8000], vec![0xDD; 0x1000], vec![0xEE; 0x1000], vec![0xEF; 0x2000]);
+        s.quiet_init = false;
+        s
     }
 
     fn built() -> BootImage {

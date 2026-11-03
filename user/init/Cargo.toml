@@ -35,3 +35,7 @@ target = ["aerosls-proto/target"]
 # dedicated E3 boot check builds with this on. Implies `target` (it uses the
 # real kernel ABI).
 e3_envs = ["target"]
+# E7 increment 19: mark environment 1 as the gate profile (a marker MEM
+# cap in its manifest). Only meaningful with `e3_envs`; off by default so
+# the ordinary E3 image keeps its two plain tenant environments.
+e7_gate = ["e3_envs"]
