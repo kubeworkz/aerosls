@@ -1,0 +1,608 @@
+ok:   G1. the drill is a build-time feature (sidecar Cargo + Makefile knob) whose stretch runs in the gate profile between staging (line 602) and the tenant spawn (line 620)
+ok:   G2. the wait is bounded by EP_WAIT_TICKS (stall, restarted by progress) and EP_WAIT_CEIL_TICKS (absolute), and its progress signal is ProcessDescriptor.switches, bumped at proc_build_resume_frame
+ok:   G3. the wait reports crossing the old fixed bound once, only while the window is still open (progress restarted it), and names how many of the record's sidecars are RUNNING at that instant
+ok:   G4. the gate tenant is the designated 9-entry command line over the 512 KiB staged image, and the checkpoint's stop is the copy continuation at 196608
+ok:   G5. the restore pass waits before the repause and pours after it, and the route reports payloads and payload_skips by name
+ok:   G6. the teeth are a build-time profile (E7_TOOTH -> AB_DEFS, default off) selected per restore and refused by name elsewhere; all four arms land on paths the shipped kernel already has (dropped record, EBADF lookup, unmapped destination, a TLS base chosen from the record's own writable pages), guarded by 11 E7G_TOOTH conditions
+=== build: x86-iso-e3 E3_INIT_FEATURES=e3_envs,e7_gate E7_SLOW_BOOT=0 E7_TOOTH=1 X86_E3_ISO=sls_operating_system_e3_teeth.iso ===
+make[1]: Entering directory '/mnt/c/Users/kubew/.freebuff/worktrees/ae23729b/aerosls2'
+[SELFHOST] building the init + DM + POSIX + ramdisk + network + e1000_driver sidecars for x86_64-unknown-none...
+warning: unnecessary `unsafe` block
+    --> proto/src/kabi.rs:1465:22
+     |
+1465 |             let rc = unsafe {
+     |                      ^^^^^^ unnecessary `unsafe` block
+     |
+     = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
+
+warning: creating a mutable reference to mutable static
+  --> network/src/entry.rs:87:54
+   |
+87 |         core::ptr::copy_nonoverlapping(msg.as_ptr(), TRACE_BUF.as_mut_ptr(), n);
+   |                                                      ^^^^^^^^^^^^^^^^^^^^^^ mutable reference to mutable static
+   |
+   = note: mutable references to mutable statics are dangerous; it's undefined behavior if any other pointer to the static is used or if any other reference is created for the static while the mutable reference lives
+   = help: use a type that relies on "interior mutability" instead; to read more on this, visit <https://doc.rust-lang.org/reference/interior-mutability.html>
+   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/static-mut-references.html>
+   = note: `#[warn(static_mut_refs)]` (part of `#[warn(rust_2024_compatibility)]`) on by default
+
+warning: creating a shared reference to mutable static
+  --> network/src/entry.rs:92:30
+   |
+92 |             inlateout("rdi") TRACE_BUF.as_ptr() => _,
+   |                              ^^^^^^^^^^^^^^^^^^ shared reference to mutable static
+   |
+   = note: shared references to mutable statics are dangerous; it's undefined behavior if the static is mutated or if a mutable reference is created for it while the shared reference lives
+   = help: use a type that relies on "interior mutability" instead; to read more on this, visit <https://doc.rust-lang.org/reference/interior-mutability.html>
+   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/static-mut-references.html>
+
+warning: creating a shared reference to mutable static
+   --> network/src/entry.rs:111:30
+    |
+111 |             inlateout("rdi") DIGIT_BUF.as_ptr() => _,
+    |                              ^^^^^^^^^^^^^^^^^^ shared reference to mutable static
+    |
+    = note: shared references to mutable statics are dangerous; it's undefined behavior if the static is mutated or if a mutable reference is created for it while the shared reference lives
+    = help: use a type that relies on "interior mutability" instead; to read more on this, visit <https://doc.rust-lang.org/reference/interior-mutability.html>
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/static-mut-references.html>
+
+warning: creating a shared reference to mutable static
+   --> network/src/entry.rs:135:30
+    |
+135 |             inlateout("rdi") HEX_BUF.as_ptr() => _,
+    |                              ^^^^^^^^^^^^^^^^ shared reference to mutable static
+    |
+    = note: shared references to mutable statics are dangerous; it's undefined behavior if the static is mutated or if a mutable reference is created for it while the shared reference lives
+    = help: use a type that relies on "interior mutability" instead; to read more on this, visit <https://doc.rust-lang.org/reference/interior-mutability.html>
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/static-mut-references.html>
+
+warning: unused import: `ERR_BUDGET`
+  --> sidecar/src/allocator.rs:15:36
+   |
+15 | use aerosls_proto::kabi::{SendCap, ERR_BUDGET};
+   |                                    ^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused doc comment
+    --> sidecar/src/applets.rs:5795:1
+     |
+5795 | / /// Real-kernel shims (provided by aerosls-proto, feature `target`). Host
+5796 | | /// builds get failing stubs below — irqtest only runs on the target.
+     | |_____________________________________________________________________^
+5797 |   #[cfg(feature = "target")]
+5798 | / extern "C" {
+5799 | |     fn k_irq_bind(handle: u32, budget: u32, out_chan_r: *mut u16) -> i32;
+5800 | |     fn k_irq_unbind(chan_r: u16) -> i32;
+5801 | |     fn k_irq_mask(chan_r: u16, mask: u8) -> i32;
+...    |
+5817 | |     fn posix_serial_print(data: *const u8, len: u32);
+5818 | | }
+     | |_- rustdoc does not generate documentation for extern blocks
+     |
+     = help: use `//` for a plain comment
+     = note: `#[warn(unused_doc_comments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `e`
+    --> sidecar/src/applets.rs:4902:13
+     |
+4902 |         Err(e) => {
+     |             ^ help: if this is intentional, prefix it with an underscore: `_e`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `e`
+    --> sidecar/src/applets.rs:4908:16
+     |
+4908 |     if let Err(e) = net.bind(lsn, 0, 9999) {
+     |                ^ help: if this is intentional, prefix it with an underscore: `_e`
+
+warning: unused variable: `e`
+    --> sidecar/src/applets.rs:4914:16
+     |
+4914 |     if let Err(e) = net.listen(lsn) {
+     |                ^ help: if this is intentional, prefix it with an underscore: `_e`
+
+warning: unused variable: `e`
+    --> sidecar/src/applets.rs:4925:13
+     |
+4925 |         Err(e) => {
+     |             ^ help: if this is intentional, prefix it with an underscore: `_e`
+
+warning: unused variable: `e`
+    --> sidecar/src/applets.rs:4934:13
+     |
+4934 |         Err(e) => {
+     |             ^ help: if this is intentional, prefix it with an underscore: `_e`
+
+warning: unused variable: `e`
+    --> sidecar/src/applets.rs:4946:13
+     |
+4946 |         Err(e) => {
+     |             ^ help: if this is intentional, prefix it with an underscore: `_e`
+
+warning: unused variable: `t`
+    --> sidecar/src/applets.rs:5163:17
+     |
+5163 |                 t => {
+     |                 ^ help: if this is intentional, prefix it with an underscore: `_t`
+
+warning: unused variable: `rr`
+   --> sidecar/src/net_client.rs:143:14
+    |
+143 |         let (rr, body) = self.recv_reply_owned(tag, NET_INFO)?;
+    |              ^^ help: if this is intentional, prefix it with an underscore: `_rr`
+
+warning: value assigned to `out` is never read
+   --> sidecar/src/entry.rs:137:19
+    |
+137 |     let mut out = RecvOut { kind: 0, flags: 0, tag: 0, len: 0, n_caps: 0, needed: 0 };
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this value is reassigned later and never used
+...
+140 |         out = RecvOut { kind: 0, flags: 0, tag: 0, len: 0, n_caps: 0, needed: 0 };
+    |         ------------------------------------------------------------------------- `out` is overwritten here before the previous value is read
+    |
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `wo` is never read
+   --> sidecar/src/entry.rs:138:18
+    |
+138 |     let mut wo = WaitOut { idx: 0, kind: 0, pad: 0 };
+    |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this value is reassigned later and never used
+...
+164 |         wo = WaitOut { idx: 0, kind: 0, pad: 0 };
+    |         ---------------------------------------- `wo` is overwritten here before the previous value is read
+
+warning: unnecessary `unsafe` block
+   --> sidecar/src/entry.rs:474:18
+    |
+474 |         let rc = unsafe { posix_net_info_handshake(net_w, net_r) };
+    |                  ^^^^^^ unnecessary `unsafe` block
+    |
+    = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `off` is never read
+   --> sidecar/src/entry.rs:449:27
+    |
+449 |         msg[off] = b'\n'; off += 1;
+    |                           ^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: function `k_yield` is never used
+  --> sidecar/src/entry.rs:36:8
+   |
+36 |     fn k_yield();
+   |        ^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: creating a shared reference to mutable static
+    --> sidecar/src/applets.rs:5054:13
+     |
+5054 |             &HX
+     |             ^^^ shared reference to mutable static
+     |
+     = note: shared references to mutable statics are dangerous; it's undefined behavior if the static is mutated or if a mutable reference is created for it while the shared reference lives
+     = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/static-mut-references.html>
+     = note: `#[warn(static_mut_refs)]` (part of `#[warn(rust_2024_compatibility)]`) on by default
+help: use `&raw const` instead to create a raw pointer
+     |
+5054 |             &raw const HX
+     |              +++++++++
+
+warning: creating a shared reference to mutable static
+   --> sidecar/src/entry.rs:265:39
+    |
+265 |     unsafe { core::ptr::read_volatile(&SYSCALL_COOKIE); }
+    |                                       ^^^^^^^^^^^^^^^ shared reference to mutable static
+    |
+    = note: shared references to mutable statics are dangerous; it's undefined behavior if the static is mutated or if a mutable reference is created for it while the shared reference lives
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/static-mut-references.html>
+help: use `&raw const` instead to create a raw pointer
+    |
+265 |     unsafe { core::ptr::read_volatile(&raw const SYSCALL_COOKIE); }
+    |                                        +++++++++
+
+warning: `k_chan_recv` redeclared with a different signature
+    --> sidecar/src/entry.rs:31:5
+     |
+  31 | /     fn k_chan_recv(chan: u32, buf: *mut u8, buf_len: u32,
+  32 | |                    slots: *mut core::ffi::c_void, n_slots: u32,
+  33 | |                    out: *mut core::ffi::c_void) -> i32;
+     | |_______________________________________________________^ this signature doesn't match the previous declaration
+     |
+    ::: sidecar/src/applets.rs:5803:5
+     |
+5803 | /     fn k_chan_recv(
+5804 | |         chan: u32,
+5805 | |         buf: *mut u8,
+5806 | |         buf_len: u32,
+...    |
+5809 | |         out: *mut IrqRecvOut,
+5810 | |     ) -> i32;
+     | |_____________- `k_chan_recv` previously declared here
+     |
+     = note: expected `unsafe extern "C" fn(u32, *mut u8, u32, *mut u8, u32, *mut IrqRecvOut) -> i32`
+                found `unsafe extern "C" fn(u32, *mut u8, u32, *mut c_void, u32, *mut c_void) -> i32`
+     = note: `#[warn(clashing_extern_declarations)]` on by default
+
+warning: `k_chan_wait` redeclared with a different signature
+    --> sidecar/src/entry.rs:34:5
+     |
+  34 | /     fn k_chan_wait(chans: *const u32, n: u32, timeout_ns: u64,
+  35 | |                    out: *mut core::ffi::c_void) -> i32;
+     | |_______________________________________________________^ this signature doesn't match the previous declaration
+     |
+    ::: sidecar/src/applets.rs:5802:5
+     |
+5802 |       fn k_chan_wait(chans: *const u32, n: u32, timeout_ns: u64, out: *mut IrqWaitOut) -> i32;
+     |       ---------------------------------------------------------------------------------------- `k_chan_wait` previously declared here
+     |
+     = note: expected `unsafe extern "C" fn(*const u32, u32, u64, *mut IrqWaitOut) -> i32`
+                found `unsafe extern "C" fn(*const u32, u32, u64, *mut c_void) -> i32`
+
+warning: unnecessary `unsafe` block
+    --> proto/src/kabi.rs:1465:22
+     |
+1465 |             let rc = unsafe {
+     |                      ^^^^^^ unnecessary `unsafe` block
+     |
+     = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> init/src/entry.rs:601:9
+    |
+601 |     let mut handle_env = |req: &[u8], reply: &mut [u8]| -> usize {
+    |         ----^^^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `budget_size`
+   --> init/src/entry.rs:688:5
+    |
+688 |     budget_size: u64,
+    |     ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_budget_size`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+[BOOTIMAGE] flattened user/target/x86_64-unknown-none/release/init -> user/target/x86_64-unknown-none/release/init.bin (139280 bytes, entry offset 0x0)
+[BOOTIMAGE] flattened user/target/x86_64-unknown-none/release/dm -> user/target/x86_64-unknown-none/release/dm.bin (106512 bytes, entry offset 0x0)
+[BOOTIMAGE] flattened user/target/x86_64-unknown-none/release/posix -> user/target/x86_64-unknown-none/release/posix.bin (1244328 bytes, entry offset 0x0)
+[BOOTIMAGE] flattened user/target/x86_64-unknown-none/release/ramdisk -> user/target/x86_64-unknown-none/release/ramdisk.bin (94224 bytes, entry offset 0x0)
+[BOOTIMAGE] flattened user/target/x86_64-unknown-none/release/network -> user/target/x86_64-unknown-none/release/network.bin (295056 bytes, entry offset 0x0)
+[BOOTIMAGE] flattened user/target/x86_64-unknown-none/release/e1000_driver -> user/target/x86_64-unknown-none/release/e1000_driver.bin (37272 bytes, entry offset 0x0)
+cargo run --quiet --manifest-path user/Cargo.toml -p aerosls-bootimage -- \
+	--init "user/target/x86_64-unknown-none/release/init.bin" --dm "user/target/x86_64-unknown-none/release/dm.bin" \
+	--posix "user/target/x86_64-unknown-none/release/posix.bin" --ramdisk "user/target/x86_64-unknown-none/release/ramdisk.bin" \
+	--net "user/target/x86_64-unknown-none/release/network.bin" --e1000 "user/target/x86_64-unknown-none/release/e1000_driver.bin" -o "sidecars_e3.cpio" \
+	--quiet-init
+[BOOTIMAGE] sidecars_e3.cpio (1925608 bytes, newc initrd)
+[BOOTIMAGE] base phys 0x20000000
+[BOOTIMAGE]   region init.image  0x0000000020000000 + 0x22010
+[BOOTIMAGE]   region init.heap   0x0000000020023000 + 0x1000000
+[BOOTIMAGE]   region dm.image    0x0000000021023000 + 0x1a010
+[BOOTIMAGE]   region dm.heap     0x000000002103e000 + 0x40000
+[BOOTIMAGE]   region posix.image 0x000000002107e000 + 0x12fca8
+[BOOTIMAGE]   region posix.heap  0x00000000211ae000 + 0x400000
+[BOOTIMAGE]   region ramdisk.image 0x00000000215ae000 + 0x17010
+[BOOTIMAGE]   region ramdisk.heap 0x00000000215c6000 + 0x40000
+[BOOTIMAGE]   region storage     0x0000000021606000 + 0x1000000
+[BOOTIMAGE]   region net.image   0x0000000022606000 + 0x48090
+[BOOTIMAGE]   region net.heap    0x000000002264f000 + 0x80000
+[BOOTIMAGE]   region e1000.image 0x00000000226cf000 + 0x9198
+[BOOTIMAGE]   region e1000.heap  0x00000000226d9000 + 0x80000
+[BOOTIMAGE]   region registry    0x0000000022759000 + 0x1000
+[BOOTIMAGE] reserved span: 0x20000000..0x2275a000 (40296 KiB)
+[BOOTIMAGE]   init manifest -> boot/init.manifest (image @ 0x20000000)
+[BOOTIMAGE]   dm   manifest -> boot/dm.manifest   (image @ 0x21023000)
+[BOOTIMAGE]   posix manifest -> boot/posix.manifest (image @ 0x2107e000)
+[SELFHOST] boot image: sidecars_e3.cpio (load as an initrd at the bootloader's module path)
+[SELFHOST] stamp record: sidecars_e3.cpio.stamps (sources + archive bytes + the six packed binaries, verified against the flattened outputs -- the stamps below are views of this file)
+[SELFHOST] stamp: sidecars_e3.cpio.digest (the digest of the user/ sources the packed binaries were built from; x86-iso verifies it)
+[SELFHOST] stamp: sidecars_e3.cpio.sha256 (sha256 of the archive's own bytes -- a repack or swap out of band changes them; x86-iso verifies it too)
+make[1]: Leaving directory '/mnt/c/Users/kubew/.freebuff/worktrees/ae23729b/aerosls2'
+make[1]: Entering directory '/mnt/c/Users/kubew/.freebuff/worktrees/ae23729b/aerosls2'
+x86_64-elf-gcc -ffreestanding -O2 -Wall -Wextra -mcmodel=small -mno-red-zone -mno-sse -mno-sse2 -mno-mmx -fno-pie -fno-pic -fno-tree-vectorize -Wframe-larger-than=16384 -DE7G_TOOTH=1 -DAEROSLS_BUILD_ID='"20261103012651"' -DSLS_BUILD_EPOCH=1793669211ull -c kernel/kernel.c -o kernel/kernel.x86.o
+kernel/kernel.c: In function ‘kernel_main’:
+kernel/kernel.c:482:25: warning: implicit declaration of function ‘init_nvme_controller’ [-Wimplicit-function-declaration]
+  482 |                     if (init_nvme_controller(nvme_mmio)) {
+      |                         ^~~~~~~~~~~~~~~~~~~~
+kernel/kernel.c:491:29: warning: implicit declaration of function ‘nvme_io_init’ [-Wimplicit-function-declaration]
+  491 |                         if (nvme_io_init()) {
+      |                             ^~~~~~~~~~~~
+x86_64-elf-gcc -ffreestanding -O2 -Wall -Wextra -mcmodel=small -mno-red-zone -mno-sse -mno-sse2 -mno-mmx -fno-pie -fno-pic -fno-tree-vectorize -Wframe-larger-than=16384 -DE7G_TOOTH=1 -DAEROSLS_BUILD_ID='"20261103012651"' -DSLS_BUILD_EPOCH=1793669211ull -c kernel/rtc.c -o kernel/rtc.x86.o
+x86_64-elf-gcc -ffreestanding -O2 -Wall -Wextra -mcmodel=small -mno-red-zone -mno-sse -mno-sse2 -mno-mmx -fno-pie -fno-pic -fno-tree-vectorize -Wframe-larger-than=16384 -DE7G_TOOTH=1 -DAEROSLS_BUILD_ID='"20261103012651"' -DSLS_BUILD_EPOCH=1793669211ull -c kernel/checkpoint_mgr.c -o kernel/checkpoint_mgr.x86.o
+In file included from kernel/checkpoint_mgr.c:20:
+kernel/../kernel/dashboard.h:14:28: warning: ‘global_telemetry’ defined but not used [-Wunused-variable]
+   14 | static struct SLSTelemetry global_telemetry = {0};
+      |                            ^~~~~~~~~~~~~~~~
+x86_64-elf-gcc -ffreestanding -O2 -Wall -Wextra -mcmodel=small -mno-red-zone -mno-sse -mno-sse2 -mno-mmx -fno-pie -fno-pic -fno-tree-vectorize -Wframe-larger-than=16384 -DE7G_TOOTH=1 -DAEROSLS_BUILD_ID='"20261103012651"' -DSLS_BUILD_EPOCH=1793669211ull -c kernel/qemu_sls_mmu.c -o kernel/qemu_sls_mmu.x86.o
+x86_64-elf-gcc -ffreestanding -O2 -Wall -Wextra -mcmodel=small -mno-red-zone -mno-sse -mno-sse2 -mno-mmx -fno-pie -fno-pic -fno-tree-vectorize -Wframe-larger-than=16384 -DE7G_TOOTH=1 -DAEROSLS_BUILD_ID='"20261103012651"' -DSLS_BUILD_EPOCH=1793669211ull -c kernel/qemu_sls_tcache.c -o kernel/qemu_sls_tcache.x86.o
+x86_64-elf-gcc -ffreestanding -O2 -Wall -Wextra -mcmodel=small -mno-red-zone -mno-sse -mno-sse2 -mno-mmx -fno-pie -fno-pic -fno-tree-vectorize -Wframe-larger-than=16384 -DE7G_TOOTH=1 -DAEROSLS_BUILD_ID='"20261103012651"' -DSLS_BUILD_EPOCH=1793669211ull -c kernel/qemu_sls_pgo.c -o kernel/qemu_sls_pgo.x86.o
+x86_64-elf-gcc -ffreestanding -O2 -Wall -Wextra -mcmodel=small -mno-red-zone -mno-sse -mno-sse2 -mno-mmx -fno-pie -fno-pic -fno-tree-vectorize -Wframe-larger-than=16384 -DE7G_TOOTH=1 -DAEROSLS_BUILD_ID='"20261103012651"' -DSLS_BUILD_EPOCH=1793669211ull -c kernel/qemu_sls_vm.c -o kernel/qemu_sls_vm.x86.o
+x86_64-elf-ld -T arch/x86/linker.ld -nostdlib --no-warn-rwx-segments arch/x86/boot.x86.o arch/x86/interrupt.x86.o arch/x86/switch_lazy.x86.o arch/x86/syscall.x86.o arch/x86/vector_crypto.x86.o arch/x86/process_enter.x86.o kernel/kernel.x86.o arch/x86/idt.x86.o arch/x86/gdt.x86.o arch/x86/vga.x86.o kernel/scheduler.x86.o arch/x86/lazy_fpu.x86.o arch/x86/walk_page_tables_x86.x86.o kernel/lockfree_map.x86.o drivers/ahci.x86.o drivers/pci.x86.o drivers/nvme.x86.o drivers/nvme_admin.x86.o kernel/frame_pool.x86.o kernel/dashboard.x86.o user/shell.x86.o kernel/smp.x86.o drivers/io_prio.x86.o net/consensus.x86.o net/dspp.x86.o net/dspp_checkpoint.x86.o net/prefetch.x86.o kernel/secure_api.x86.o kernel/pte_migrate.x86.o kernel/timer.x86.o kernel/flush_daemon.x86.o kernel/kernel_io.x86.o kernel/syscall_dispatch.x86.o kernel/object_catalog.x86.o kernel/transaction.x86.o kernel/ipc.x86.o kernel/microkernel.x86.o kernel/tier_mgr.x86.o kernel/query_engine.x86.o net/net.x86.o net/arp.x86.o net/ipv4.x86.o net/tcp.x86.o net/tcp_quota.x86.o net/http.x86.o net/http_rate_limit.x86.o net/e1000.x86.o net/udp.x86.o net/dhcp.x86.o net/inference.x86.o net/ollama_client.x86.o kernel/process.x86.o arch/x86/user_paging.x86.o arch/x86/device_irq.x86.o arch/x86/ioapic.x86.o kernel/cap.x86.o kernel/chan.x86.o kernel/partition.x86.o kernel/boot_params.x86.o kernel/node_reset.x86.o kernel/console.x86.o kernel/console_service.x86.o kernel/env_service.x86.o kernel/env_console.x86.o kernel/net_socket_service.x86.o kernel/env_catalog.x86.o kernel/boot_image.x86.o kernel/loader.x86.o kernel/elf64_load.x86.o kernel/simi_x86.x86.o kernel/simi_runtime.x86.o kernel/simi_translate.x86.o kernel/simi_interp.x86.o kernel/simi_ckpt.x86.o kernel/simi_ctx_migrate.x86.o kernel/service_registry.x86.o kernel/service_mesh.x86.o kernel/workload.x86.o kernel/workload_ctx.x86.o kernel/webapp.x86.o kernel/webapp_bundle.x86.o kernel/journal.x86.o kernel/lock_mgr.x86.o kernel/index_mgr.x86.o kernel/constraint.x86.o kernel/cursor.x86.o kernel/aggregate.x86.o kernel/mqt.x86.o kernel/stream.x86.o kernel/persist.x86.o kernel/rowstore.x86.o kernel/row_index.x86.o kernel/predicate.x86.o kernel/sql_parser.x86.o kernel/sql_exec.x86.o kernel/mvcc.x86.o kernel/row_constraint.x86.o kernel/row_journal.x86.o kernel/vecstore.x86.o kernel/vec_index.x86.o kernel/sha256.x86.o kernel/entropy.x86.o kernel/rtc.x86.o kernel/tls_platform.x86.o kernel/tls_cert.x86.o kernel/tls_store.x86.o kernel/tls_server.x86.o kernel/vec_join.x86.o kernel/agent.x86.o kernel/agent_tools.x86.o kernel/checkpoint_mgr.x86.o kernel/checkpoint_delta.x86.o kernel/env_ckpt.x86.o kernel/env_storage.x86.o kernel/env_payload.x86.o kernel/env_migrate.x86.o kernel/env_replica.x86.o kernel/linux_abi.x86.o kernel/state_tree.x86.o kernel/failover.x86.o drivers/nvme_io.x86.o kernel/net_event.x86.o kernel/auth.x86.o kernel/group_profile.x86.o kernel/authlist.x86.o kernel/database.x86.o kernel/tenant.x86.o kernel/usage_metering.x86.o kernel/storage_quota.x86.o kernel/view.x86.o kernel/security_audit.x86.o kernel/msgqueue.x86.o kernel/qemu_sls_mmu.x86.o kernel/qemu_sls_tcache.x86.o kernel/qemu_sls_pgo.x86.o kernel/qemu_sls_vm.x86.o kernel/stubs.x86.o arch/x86/trampoline.o tcg-objs/sls-runtime.x86.o tcg-objs/sls-launcher.x86.o tcg-objs/sls-elf64-loader.x86.o tcg-objs/sls-x86-frontend.x86.o tcg-objs/sls-tcg-wrappers.x86.o tcg-objs/tcg.x86.o tcg-objs/tcg-common.x86.o tcg-objs/tcg-op.x86.o tcg-objs/tcg-op-ldst.x86.o tcg-objs/tcg-op-vec.x86.o tcg-objs/tcg-op-gvec.x86.o tcg-objs/optimize.x86.o tcg-objs/region.x86.o tcg-objs/tcg-runtime.x86.o tcg-objs/tcg-runtime-gvec.x86.o tcg-objs/sls-helper-stubs.x86.o tcg-objs/i386-translate.x86.o tcg-objs/translator.x86.o tcg-objs/i386-helper-stubs.x86.o tcg-objs/i386-codefetch.x86.o tcg-objs/i386-stub-class.x86.o vendor/mbedtls/library/aes.x86.o vendor/mbedtls/library/aesce.x86.o vendor/mbedtls/library/aesni.x86.o vendor/mbedtls/library/aria.x86.o vendor/mbedtls/library/asn1parse.x86.o vendor/mbedtls/library/asn1write.x86.o vendor/mbedtls/library/base64.x86.o vendor/mbedtls/library/bignum.x86.o vendor/mbedtls/library/bignum_core.x86.o vendor/mbedtls/library/bignum_mod.x86.o vendor/mbedtls/library/bignum_mod_raw.x86.o vendor/mbedtls/library/block_cipher.x86.o vendor/mbedtls/library/camellia.x86.o vendor/mbedtls/library/ccm.x86.o vendor/mbedtls/library/chacha20.x86.o vendor/mbedtls/library/chachapoly.x86.o vendor/mbedtls/library/cipher.x86.o vendor/mbedtls/library/cipher_wrap.x86.o vendor/mbedtls/library/cmac.x86.o vendor/mbedtls/library/constant_time.x86.o vendor/mbedtls/library/ctr_drbg.x86.o vendor/mbedtls/library/debug.x86.o vendor/mbedtls/library/des.x86.o vendor/mbedtls/library/dhm.x86.o vendor/mbedtls/library/ecdh.x86.o vendor/mbedtls/library/ecdsa.x86.o vendor/mbedtls/library/ecjpake.x86.o vendor/mbedtls/library/ecp.x86.o vendor/mbedtls/library/ecp_curves.x86.o vendor/mbedtls/library/ecp_curves_new.x86.o vendor/mbedtls/library/entropy.x86.o vendor/mbedtls/library/entropy_poll.x86.o vendor/mbedtls/library/gcm.x86.o vendor/mbedtls/library/hkdf.x86.o vendor/mbedtls/library/hmac_drbg.x86.o vendor/mbedtls/library/lmots.x86.o vendor/mbedtls/library/lms.x86.o vendor/mbedtls/library/md.x86.o vendor/mbedtls/library/md5.x86.o vendor/mbedtls/library/memory_buffer_alloc.x86.o vendor/mbedtls/library/mps_reader.x86.o vendor/mbedtls/library/mps_trace.x86.o vendor/mbedtls/library/net_sockets.x86.o vendor/mbedtls/library/nist_kw.x86.o vendor/mbedtls/library/oid.x86.o vendor/mbedtls/library/padlock.x86.o vendor/mbedtls/library/pem.x86.o vendor/mbedtls/library/pk.x86.o vendor/mbedtls/library/pk_ecc.x86.o vendor/mbedtls/library/pk_wrap.x86.o vendor/mbedtls/library/pkcs12.x86.o vendor/mbedtls/library/pkcs5.x86.o vendor/mbedtls/library/pkcs7.x86.o vendor/mbedtls/library/pkparse.x86.o vendor/mbedtls/library/pkwrite.x86.o vendor/mbedtls/library/platform.x86.o vendor/mbedtls/library/platform_util.x86.o vendor/mbedtls/library/poly1305.x86.o vendor/mbedtls/library/psa_crypto.x86.o vendor/mbedtls/library/psa_crypto_aead.x86.o vendor/mbedtls/library/psa_crypto_cipher.x86.o vendor/mbedtls/library/psa_crypto_client.x86.o vendor/mbedtls/library/psa_crypto_driver_wrappers_no_static.x86.o vendor/mbedtls/library/psa_crypto_ecp.x86.o vendor/mbedtls/library/psa_crypto_ffdh.x86.o vendor/mbedtls/library/psa_crypto_hash.x86.o vendor/mbedtls/library/psa_crypto_mac.x86.o vendor/mbedtls/library/psa_crypto_pake.x86.o vendor/mbedtls/library/psa_crypto_random.x86.o vendor/mbedtls/library/psa_crypto_rsa.x86.o vendor/mbedtls/library/psa_crypto_se.x86.o vendor/mbedtls/library/psa_crypto_slot_management.x86.o vendor/mbedtls/library/psa_crypto_storage.x86.o vendor/mbedtls/library/psa_its_file.x86.o vendor/mbedtls/library/psa_util.x86.o vendor/mbedtls/library/ripemd160.x86.o vendor/mbedtls/library/rsa.x86.o vendor/mbedtls/library/rsa_alt_helpers.x86.o vendor/mbedtls/library/sha1.x86.o vendor/mbedtls/library/sha256.x86.o vendor/mbedtls/library/sha3.x86.o vendor/mbedtls/library/sha512.x86.o vendor/mbedtls/library/ssl_cache.x86.o vendor/mbedtls/library/ssl_ciphersuites.x86.o vendor/mbedtls/library/ssl_client.x86.o vendor/mbedtls/library/ssl_cookie.x86.o vendor/mbedtls/library/ssl_debug_helpers_generated.x86.o vendor/mbedtls/library/ssl_msg.x86.o vendor/mbedtls/library/ssl_ticket.x86.o vendor/mbedtls/library/ssl_tls.x86.o vendor/mbedtls/library/ssl_tls12_client.x86.o vendor/mbedtls/library/ssl_tls12_server.x86.o vendor/mbedtls/library/ssl_tls13_client.x86.o vendor/mbedtls/library/ssl_tls13_generic.x86.o vendor/mbedtls/library/ssl_tls13_keys.x86.o vendor/mbedtls/library/ssl_tls13_server.x86.o vendor/mbedtls/library/threading.x86.o vendor/mbedtls/library/timing.x86.o vendor/mbedtls/library/version.x86.o vendor/mbedtls/library/x509.x86.o vendor/mbedtls/library/x509_create.x86.o vendor/mbedtls/library/x509_crl.x86.o vendor/mbedtls/library/x509_crt.x86.o vendor/mbedtls/library/x509_csr.x86.o vendor/mbedtls/library/x509write.x86.o vendor/mbedtls/library/x509write_crt.x86.o vendor/mbedtls/library/x509write_csr.x86.o /usr/lib/gcc/x86_64-linux-gnu/13/libgcc.a -o my_sls_kernel.bin
+x86_64-elf-ld: warning: arch/x86/trampoline.o: missing .note.GNU-stack section implies executable stack
+x86_64-elf-ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
+# ── Refuse to ship a sidecar archive that is not from THESE sources ─────
+# `sidecars.cpio` is tracked, so this recipe usually ships an archive packed
+# in an earlier session, and a `user/` change that was never re-packed is
+# invisible until boot time -- where it does NOT look like a packaging
+# problem, it looks like a kernel bug (P1a's create round trip answered by
+# an init with no ENV_REGISTER arm: "reply carries 28 bytes, short of the
+# 216-byte registration"). The archive carries the digest of what it was
+# packed from; a mismatch stops the build HERE. The rule is a digest and not
+# "is the archive older than user/*.rs" (a fresh clone writes the index in
+# path order, so every clean checkout would refuse); the tool explains.
+# The archive's own BYTES are checked as well (the archive-bytes tool against
+# the bytes stamp): the source digest cannot see a repack or a swap done out
+# of band -- user/ untouched, only the archive changed. And the RECORD is
+# checked too, so the stamps cannot have been refreshed independently of
+# each other: with only the two per-subject checks, a `user/` edit plus a
+# hand-run source digest over the old archive turned the first one green
+# while the old binaries still shipped. All three files come from one
+# `make selfhost-bootimage` run, and the record is what proves it.
+# And the archive's six binaries are checked against this tree's own BUILD
+# OUTPUT where the flattened `.bin` files exist: a record and its two stamps
+# can all be rewritten from a stale archive, but the build output is the one
+# half a hand cannot rewrite. (The e3_envs pack rebuilds all six sidecars and
+# overwrites the shared flattened paths, so any file named by a packed-variant
+# record is skipped -- not just init.)
+sidecar_build_output_check: sidecars_e3.cpio holds all 6 flattened sidecar outputs present in this tree
+[ISO] sidecars_e3.cpio is from the user/ sources in this tree (fbc1d459b80440a3bfb37d6926e6f9059857c8f6a2cd46df2351756030ca34b6), its bytes are the stamped ones (44701b037d7cd59478561fe2e1c03e8ed3d921afc9c6aa74719534d85b9aa191), both stamps are one packer run's record, and its six binaries are this tree's flattened outputs where those exist
+mkdir -p isodir/boot/grub
+cp my_sls_kernel.bin isodir/boot/
+# Phase 5: when the sidecars initrd exists, ship it so the Phase 5
+# GRUB menuentry can load it as a Multiboot2 module (build it with
+# `make selfhost-bootimage`). Without it, the ISO is byte-identical to
+# the pre-Phase-5 image and boots exactly as before.
+# The initrd is always embedded at the canonical name grub.cfg loads
+# (/boot/sidecars.cpio), whatever sidecars_e3.cpio's basename is — so the
+# E3 image (SIDECAR_CPIO=sidecars_e3.cpio) boots the Phase 5 entry too.
+[ISO] including sidecars_e3.cpio as /boot/sidecars.cpio
+cp grub.cfg isodir/boot/grub/
+grub-mkrescue --modules="normal multiboot multiboot2 iso9660 gfxterm font serial elf" \
+              -o sls_operating_system_e3_teeth.iso isodir
+xorriso 1.5.6 : RockRidge filesystem manipulator, libburnia project.
+
+Drive current: -outdev 'stdio:sls_operating_system_e3_teeth.iso'
+Media current: stdio file, overwriteable
+Media status : is blank
+Media summary: 0 sessions, 0 data blocks, 0 data, 98.0g free
+Added to ISO image: directory '/'='/tmp/grub.Y5QmY3'
+xorriso : UPDATE :     588 files added in 1 seconds
+Added to ISO image: directory '/'='/mnt/c/Users/kubew/.freebuff/worktrees/ae23729b/aerosls2/isodir'
+xorriso : UPDATE :     593 files added in 1 seconds
+xorriso : NOTE : Copying to System Area: 512 bytes from file '/usr/lib/grub/i386-pc/boot_hybrid.img'
+xorriso : UPDATE :  3.72% done
+xorriso : UPDATE :  82.53% done
+ISO image produced: 9218 sectors
+Written to medium : 9218 sectors at LBA 0
+Writing to 'stdio:sls_operating_system_e3_teeth.iso' completed successfully.
+
+rm -rf isodir
+make[1]: Leaving directory '/mnt/c/Users/kubew/.freebuff/worktrees/ae23729b/aerosls2'
+[ISO-E3] sls_operating_system_e3_teeth.iso — init built with e3_envs,e7_gate
+=== boot 1: create, workload to the stop, checkpoint ===
+up(one): control plane on 32001
+  [api] -X POST -d {"name":"e7gate"} http://127.0.0.1:32001/api/partitions -> HTTP 200 (body: {"ok":"true","partition_id":1})
+partition=1
+  [api] -X POST -d {"index":1} http://127.0.0.1:32001/api/partition/1/env -> HTTP 200 (body: {"ok":"true","env_id":1,"partition":1})
+create: {"ok":"true","env_id":1,"partition":1}
+[E7-GATE] held at the copy continuation: pid=105 'e7.gate.user.0' src_off=196608 rip=0x8057ab7 rsp=0x4000000a9778 ret=1024 -- the next read is the one the payload resumes INTO
+--- reads before the stop:
+[E7-GATE] read off=0002EC00 
+[E7-GATE] read off=0002F000 
+[E7-GATE] read off=0002F400 
+[E7-GATE] read off=0002F800 
+[E7-GATE] read off=0002FC00 
+  [api] -X POST http://127.0.0.1:32001/api/checkpoint -> HTTP 200 (body: {"status":0,"seq":1,"count":1})
+checkpoint: {"status":0,"seq":1,"count":1}
+[ENV_PAYLOAD] capture: task 0 'drv.ramdisk.1' kind=1 form=1 park_syscall=311 nchans=3 user_rip=0x400000000000 user_rsp=0x40000001cff0 fs_base=0x0
+[ENV_PAYLOAD] capture: task 1 'aerosls.posix.1' kind=0 form=1 park_syscall=311 nchans=3 user_rip=0x400000000000 user_rsp=0x400000140ff0 fs_base=0x0
+[ENV_PAYLOAD] capture: task 2 'e7.gate.user.0' kind=2 form=3 park_syscall=0 nchans=0 user_rip=0x8057ab7 user_rsp=0x4000000a9778 fs_base=0x807c208
+=== power off (the checkpoint is on the NVMe image) ===
+=== the teeth: one capture, five replays ===
+=== boot 2 (t1r1): adopt + replay body={} ===
+up(t1r1): control plane on 32001
+--- adopted records:
+[ENV_CKPT] Restored 1 environment checkpoint record(s) (0 partition(s) re-paused).
+[DM]   adopt [0]  class=06:00 vendor=8086 dev=1237 bar=0x00000000[DM]   adopt [1]  class=06:01 vendor=8086 dev=7000 bar=0x00000000[DM]   adopt [2]  class=03:00 vendor=1234 dev=1111 bar=0xfd000000[DM]   adopt [3] drv.nvme.0 class=01:08 vendor=1b36 dev=0010 bar=0xfebb0000[DM]   adopt [4]  class=02:00 vendor=8086 dev=100e bar=0xfeb80000[DM] registry: 5 device(s) adopted[INIT] env manager on control channel (CHAN_R=11 CHAN_W=12)[INIT] unified boot: entering the heartbeat loop (DM watchdog + env control, no POSIX subject)[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+  [api] -X POST -d {} http://127.0.0.1:32001/api/env/restore -> HTTP 200 (body: {"ok":"true","pending":1,"replayed":1,"refused":0,"remaining":0,"resumed":0,"repaused":0,"payloads":1,"payload_skips":0,"tooth":"none"})
+restore: {"ok":"true","pending":1,"replayed":1,"refused":0,"remaining":0,"resumed":0,"repaused":0,"payloads":1,"payload_skips":0,"tooth":"none"}
+--- restore lines:
+[ENV_RESTORE] record (partition 1, index 1) replayed through create: env 1 -> 1, identity intact
+[ENV_RESTORE] 1 pending, 1 replayed, 0 refused, 0 still pending (0 partition(s) resumed for a create, 0 re-paused).
+--- payload lines:
+[ENV_PAYLOAD] mapped a missing Linux page task=2 vaddr=0x4000000e7000 perm=0x5 for the replay's fresh address space
+[ENV_PAYLOAD] mapped a missing Linux page task=2 vaddr=0x4000000e8000 perm=0x5 for the replay's fresh address space
+[ENV_PAYLOAD] mapped a missing Linux page task=2 vaddr=0x4000000e9000 perm=0x5 for the replay's fresh address space
+[ENV_PAYLOAD] mapped a missing Linux page task=2 vaddr=0x4000000ea000 perm=0x5 for the replay's fresh address space
+[ENV_PAYLOAD] linux task 'e7.gate.user.0' adopted at rip=0x8057ab7 rsp=0x4000000a9778 fs_base=0x807c208 brk=0x4000000ad000 mtop=0x4000000d8000 form=3 held=1 stop=spent
+[ENV_PAYLOAD] restored partition=1 index=1 env=1 pages=1854 console=25 bytes
+--- tenant lines (boot 2):
+[backup] pruned /tmp/e7-census/backups/hourly/sls_storage-20260103-000000.img
+[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=78 |[backup] pruned /tmp/e7-|
+[backup] pruned /tmp/e7-census/backups/hourly/sls_storage-20260102-000000.img
+[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=78 |[backup] pruned /tmp/e7-|
+[backup] pruned /tmp/e7-census/backups/hourly/sls_storage-20260101-000000.img
+[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=78 |[backup] pruned /tmp/e7-|
+[backup] Done: /tmp/e7-census/backups/hourly/sls_storage-20260107-000000.img (524288 bytes, 504 sparse holes, 4 kept)
+[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=118 |[backup] Done: /tmp/e7-c|
+[E7] linux: num=0000000B child=e7.gate.user.0 -> ENOSYS
+[E7] linux: num=0000000B child=e7.gate.user.0 -> ENOSYS
+[E7] linux: num=0000000B child=e7.gate.user.0 -> ENOSYS
+[E7] linux: num=000000E7 child=e7.gate.user.0 exit_group status=0
+--- copies (boot 2): 0  done (boot 2): 2  faults (boot 2): 0
+=== boot 2 (t2r1): adopt + replay body={"tooth":"descriptor"} ===
+up(t2r1): control plane on 32001
+--- adopted records:
+[ENV_CKPT] Restored 1 environment checkpoint record(s) (0 partition(s) re-paused).
+[INIT]   ramdisk messenger: CHAN_R=8 CHAN_W=3[INIT] UNIFIED boot (BIB flag): the kernel owns the NICs and the console; keeping the software-only spawn chain[INIT] e1000 BAR0 @ 0xfeb80000 → POSIX manifest DEV cap 'nic0.bar0'[INIT] unified boot: the network driver and the system POSIX sidecar stay unspawned (kernel-owned hardware)[INIT] ── Phase 5 init sidecar complete ──[INIT] system ready for POSIX sidecar creation.[INIT] entering the event loop (blocking wait + watchdog respawn)...[INIT] env manager on control channel (CHAN_R=11 CHAN_W=12)[INIT] unified boot: entering the heartbeat loop (DM watchdog + env control, no POSIX subject)[DM]   adopt [0]  class=06:00 vendor=8086 dev=1237 bar=0x00000000[DM]   adopt [1]  class=06:01 vendor=8086 dev=7000 bar=0x00000000[DM]   adopt [2]  class=03:00 vendor=1234 dev=1111 bar=0xfd000000[DM]   adopt [3] drv.nvme.0 class=01:08 vendor=1b36 dev=0010 bar=0xfebb0000[DM]   adopt [4]  class=02:00 vendor=8086 dev=100e bar=0xfeb80000[DM] registry: 5 device(s) adopted[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+  [api] -X POST -d {"tooth":"descriptor"} http://127.0.0.1:32001/api/env/restore -> HTTP 200 (body: {"ok":"true","pending":1,"replayed":1,"refused":0,"remaining":0,"resumed":0,"repaused":0,"payloads":1,"payload_skips":0,"tooth":"descriptor"})
+restore: {"ok":"true","pending":1,"replayed":1,"refused":0,"remaining":0,"resumed":0,"repaused":0,"payloads":1,"payload_skips":0,"tooth":"descriptor"}
+--- restore lines:
+[ENV_RESTORE] record (partition 1, index 1) replayed through create: env 1 -> 1, identity intact
+[ENV_RESTORE] 1 pending, 1 replayed, 0 refused, 0 still pending (0 partition(s) resumed for a create, 0 re-paused).
+--- payload lines:
+[ENV_PAYLOAD] wait: task 0 'drv.ramdisk.1' kind=1 live=yes parked=yes syscall=311 nchans=3
+[ENV_PAYLOAD] wait: task 1 'aerosls.posix.1' kind=0 live=yes parked=no syscall=0 nchans=0
+[ENV_PAYLOAD] wait: task 2 'e7.gate.user.0' kind=2 (linux, skipped)
+[ENV_PAYLOAD] restored partition=1 index=1 env=1 pages=1693 console=25 bytes
+--- tenant lines (boot 2):
+[backup] pruned /tmp/e7-census/backups/hourly/sls_storage-20260103-000000.img
+[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=78 |[backup] pruned /tmp/e7-|
+[backup] pruned /tmp/e7-census/backups/hourly/sls_storage-20260102-000000.img
+[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=78 |[backup] pruned /tmp/e7-|
+[backup] pruned /tmp/e7-census/backups/hourly/sls_storage-20260101-000000.img
+[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=78 |[backup] pruned /tmp/e7-|
+[backup] Done: /tmp/e7-census/backups/hourly/sls_storage-20260107-000000.img (524288 bytes, 504 sparse holes, 4 kept)
+[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=118 |[backup] Done: /tmp/e7-c|
+[E7] linux: num=0000000B child=e7.gate.user.0 -> ENOSYS
+[E7] linux: num=0000000B child=e7.gate.user.0 -> ENOSYS
+[E7] linux: num=0000000B child=e7.gate.user.0 -> ENOSYS
+[E7] linux: num=000000E7 child=e7.gate.user.0 exit_group status=0
+--- copies (boot 2): 2  done (boot 2): 2  faults (boot 2): 0
+=== boot 2 (t3r1): adopt + replay body={"tooth":"no-fd"} ===
+up(t3r1): control plane on 32001
+--- adopted records:
+[ENV_CKPT] Restored 1 environment checkpoint record(s) (0 partition(s) re-paused).
+[DM]   adopt [0]  class=06:00 vendor=8086 dev=1237 bar=0x00000000[DM]   adopt [1]  class=06:01 vendor=8086 dev=7000 bar=0x00000000[DM]   adopt [2]  class=03:00 vendor=1234 dev=1111 bar=0xfd000000[DM]   adopt [3] drv.nvme.0 class=01:08 vendor=1b36 dev=0010 bar=0xfebb0000[DM]   adopt [4]  class=02:00 vendor=8086 dev=100e bar=0xfeb80000[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[DM] registry: 5 device(s) adopted[PROC] PID 100 yielded to PID 102
+  [api] -X POST -d {"tooth":"no-fd"} http://127.0.0.1:32001/api/env/restore -> HTTP 200 (body: {"ok":"true","pending":1,"replayed":1,"refused":0,"remaining":0,"resumed":0,"repaused":0,"payloads":1,"payload_skips":0,"tooth":"no-fd"})
+restore: {"ok":"true","pending":1,"replayed":1,"refused":0,"remaining":0,"resumed":0,"repaused":0,"payloads":1,"payload_skips":0,"tooth":"no-fd"}
+--- restore lines:
+[INIT] heartbeat 66[INIT] heartbeat 67[ENV_RESTORE] record (partition 1, index 1) replayed through create: env 1 -> 1, identity intact
+[ENV_RESTORE] 1 pending, 1 replayed, 0 refused, 0 still pending (0 partition(s) resumed for a create, 0 re-paused).
+--- payload lines:
+[ENV_PAYLOAD] mapped a missing Linux page task=2 vaddr=0x4000000e7000 perm=0x5 for the replay's fresh address space
+[ENV_PAYLOAD] mapped a missing Linux page task=2 vaddr=0x4000000e8000 perm=0x5 for the replay's fresh address space
+[ENV_PAYLOAD] mapped a missing Linux page task=2 vaddr=0x4000000e9000 perm=0x5 for the replay's fresh address space
+[ENV_PAYLOAD] mapped a missing Linux page task=2 vaddr=0x4000000ea000 perm=0x5 for the replay's fresh address space
+[ENV_PAYLOAD] linux task 'e7.gate.user.0' adopted at rip=0x8057ab7 rsp=0x4000000a9778 fs_base=0x807c208 brk=0x4000000ad000 mtop=0x4000000d8000 form=3 held=1 stop=spent
+[ENV_PAYLOAD] restored partition=1 index=1 env=1 pages=1854 console=25 bytes
+--- tenant lines (boot 2):
+[E7] linux: num=00000057 child=e7.gate.user.0 ok
+[backup] FAILED: [E7] linux: num=00000001 child=e7.gate.user.0 write ok len=17 |[backup] FAILED: |
+copying /tmp/e7-census/sls_storage.img -> /tmp/e7-census/backups/hourly/sls_storage-20260107-000000.img.partial[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=111 |copying /tmp/e7-census/s|
+: [E7] linux: num=00000001 child=e7.gate.user.0 write ok len=2 |: |
+Bad file descriptor[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=19 |Bad file descriptor|
+ (os error [E7] linux: num=00000001 child=e7.gate.user.0 write ok len=11 | (os error |
+9[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=1 |9|
+)[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=1 |)|
+[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=1 |.|
+[E7] linux: num=0000000B child=e7.gate.user.0 -> ENOSYS
+[E7] linux: num=0000000B child=e7.gate.user.0 -> ENOSYS
+[E7] linux: num=000000E7 child=e7.gate.user.0 exit_group status=1
+--- copies (boot 2): 0  done (boot 2): 0  faults (boot 2): 0
+=== boot 2 (t4r1): adopt + replay body={"tooth":"no-heap"} ===
+up(t4r1): control plane on 32001
+--- adopted records:
+[ENV_CKPT] Restored 1 environment checkpoint record(s) (0 partition(s) re-paused).
+[INIT] sending device registry to Device Manager...[INIT] waiting for Device Manager to initialise devices...[DM] budget: 256 KiB heap[DM] waiting for the device registry from init...[DM]   adopt [0]  class=06:00 vendor=8086 dev=1237 bar=0x00000000[DM]   adopt [1]  class=06:01 vendor=8086 dev=7000 bar=0x00000000[DM]   adopt [2]  class=03:00 vendor=1234 dev=1111 bar=0xfd000000[DM]   adopt [3] drv.nvme.0 class=01:08 vendor=1b36 dev=0010 bar=0xfebb0000[DM]   adopt [4]  class=02:00 vendor=8086 dev=100e bar=0xfeb80000[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[DM] registry: 5 device(s) adopted[CAP] woken PID 101 (channel 3)
+  [api] -X POST -d {"tooth":"no-heap"} http://127.0.0.1:32001/api/env/restore -> HTTP 200 (body: {"ok":"true","pending":1,"replayed":1,"refused":0,"remaining":0,"resumed":0,"repaused":0,"payloads":1,"payload_skips":0,"tooth":"no-heap"})
+restore: {"ok":"true","pending":1,"replayed":1,"refused":0,"remaining":0,"resumed":0,"repaused":0,"payloads":1,"payload_skips":0,"tooth":"no-heap"}
+--- restore lines:
+[ENV_RESTORE] record (partition 1, index 1) replayed through create: env 1 -> 1, identity intact
+[ENV_RESTORE] 1 pending, 1 replayed, 0 refused, 0 still pending (0 partition(s) resumed for a create, 0 re-paused).
+--- payload lines:
+[ENV_PAYLOAD] mapped a missing Linux page task=2 vaddr=0x4000000e7000 perm=0x5 for the replay's fresh address space
+[ENV_PAYLOAD] mapped a missing Linux page task=2 vaddr=0x4000000e8000 perm=0x5 for the replay's fresh address space
+[ENV_PAYLOAD] mapped a missing Linux page task=2 vaddr=0x4000000e9000 perm=0x5 for the replay's fresh address space
+[ENV_PAYLOAD] mapped a missing Linux page task=2 vaddr=0x4000000ea000 perm=0x5 for the replay's fresh address space
+[ENV_PAYLOAD] linux task 'e7.gate.user.0' adopted at rip=0x8057ab7 rsp=0x4000000a9778 fs_base=0x807c208 brk=0x4000000ad000 mtop=0x4000000d8000 form=3 held=1 stop=spent
+[ENV_PAYLOAD] restored partition=1 index=1 env=1 pages=1854 console=25 bytes
+--- tenant lines (boot 2):
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+[FAULT] Ring-3 #PF  error=0x4  addr=0x00004000000d803d  rip=0x0000000008052f39  rdi=0x00004000000d8040 — killing process.
+[FAULT] user rsp=0x00004000000a9790 stack: -08:0x0000000000000000 -07:0x0000000000000000 -06:0x0000000000000000 -05:0x0000000000000000 
+--- copies (boot 2): 0  done (boot 2): 0  faults (boot 2): 2
+=== boot 2 (t5r1): adopt + replay body={"tooth":"fs_base"} ===
+up(t5r1): control plane on 32001
+--- adopted records:
+[ENV_CKPT] Restored 1 environment checkpoint record(s) (0 partition(s) re-paused).
+[DM]   adopt [0]  class=06:00 vendor=8086 dev=1237 bar=0x00000000[DM]   adopt [1]  class=06:01 vendor=8086 dev=7000 bar=0x00000000[DM]   adopt [2]  class=03:00 vendor=1234 dev=1111 bar=0xfd000000[DM]   adopt [3] drv.nvme.0 class=01:08 vendor=1b36 dev=0010 bar=0xfebb0000[DM]   adopt [4]  class=02:00 vendor=8086 dev=100e bar=0xfeb80000[DM] registry: 5 device(s) adopted[CAP] woken PID 101 (channel 3)
+  [api] -X POST -d {"tooth":"fs_base"} http://127.0.0.1:32001/api/env/restore -> HTTP 200 (body: {"ok":"true","pending":1,"replayed":1,"refused":0,"remaining":0,"resumed":0,"repaused":0,"payloads":1,"payload_skips":0,"tooth":"fs_base"})
+restore: {"ok":"true","pending":1,"replayed":1,"refused":0,"remaining":0,"resumed":0,"repaused":0,"payloads":1,"payload_skips":0,"tooth":"fs_base"}
+--- restore lines:
+[INIT] heartbeat 69[INIT] heartbeat 70[INIT] heartbeat 71[INIT] heartbeat 72[ENV_RESTORE] record (partition 1, index 1) replayed through create: env 1 -> 1, identity intact
+[ENV_RESTORE] 1 pending, 1 replayed, 0 refused, 0 still pending (0 partition(s) resumed for a create, 0 re-paused).
+--- payload lines:
+[ENV_PAYLOAD] mapped a missing Linux page task=2 vaddr=0x4000000e7000 perm=0x5 for the replay's fresh address space
+[ENV_PAYLOAD] mapped a missing Linux page task=2 vaddr=0x4000000e8000 perm=0x5 for the replay's fresh address space
+[ENV_PAYLOAD] mapped a missing Linux page task=2 vaddr=0x4000000e9000 perm=0x5 for the replay's fresh address space
+[ENV_PAYLOAD] mapped a missing Linux page task=2 vaddr=0x4000000ea000 perm=0x5 for the replay's fresh address space
+[ENV_PAYLOAD] linux task 'e7.gate.user.0' adopted at rip=0x8057ab7 rsp=0x4000000a9778 fs_base=0x807b208 brk=0x4000000ad000 mtop=0x4000000d8000 form=3 held=1 stop=spent
+[ENV_PAYLOAD] restored partition=1 index=1 env=1 pages=1854 console=25 bytes
+--- tenant lines (boot 2):
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+[E7] linux: num=00000008 child=e7.gate.user.0 ok
+[E7] linux: num=0000004D child=e7.gate.user.0 ok
+[E7] linux: num=0000004A child=e7.gate.user.0 ok
+[FAULT] Ring-3 #PF  error=0x5  addr=0x0000000000000034  rip=0x00000000080530b3  rdi=0x00004000000d8000 — killing process.
+[FAULT] user rsp=0x00004000000a9790 stack: -08:0x0000000000000000 -07:0x0000000000000000 -06:0x0000000000000000 -05:0x0000000000000000 
+--- copies (boot 2): 0  done (boot 2): 0  faults (boot 2): 2
+=== teeth clauses (each recording is reusable with --replay) ===
+--- control
+ok:   B1. the replay landed the payload (payloads=1, payload_skips=0) — the contents came back, they were not withheld or refused by name
+ok:   B2. the Linux tenant was adopted from the captured context (form=3, stop=spent) at the capture's fs_base=0x807c208 — the TLS base came back with it, and the copy was not restarted
+ok:   B3. the resumed copy's FIRST read is at the captured source offset (off=0x30000) — the task continued from the stop, it did not re-enter the copy
+ok:   B4. exactly the resumed workload completed: no second [backup] Copying, at least one [backup] Done:
+ok:   B5. no [FAULT] in the replay boot
+ok:   B6. the tenant's exit tore its address space down (frame(s) freed) — the resumed descriptors and heap were returned, not leaked
+ok:   B7. the stack is measured at both boots: deepest 3488 bytes below the entry %rsp (2648 at the stop, the resumed tail went 840 deeper), 57424 of 65536 bytes untouched — 87.6% above the 32768-byte floor
+ok:   D1. the drill clauses are not applicable: the recording says drill=0 (the plain gate image)
+--- descriptor
+--- tooth 'descriptor': this recording is EXPECTED to redden [B2 B3 B4] and to leave every other clause green
+ok:   B1. the replay landed the payload (payloads=1, payload_skips=0) — the contents came back, they were not withheld or refused by name
+red:  B2. no adopted-context line for the tenant (form=3, stop=spent) — the replay either lost the task or left its stop armed
+red:  B3. the first read after the restore is at off=0x00000000, not the captured 0x30000 — the copy resumed at the beginning of the file, not at the stop
+red:  B4. the workload did not resume cleanly (Copying=2, Done=2) — a second Copying is a restart, and no Done is an unfinished gate
+ok:   B5. no [FAULT] in the replay boot
+ok:   B6. the tenant's exit tore its address space down (frame(s) freed) — the resumed descriptors and heap were returned, not leaked
+ok:   B7. boot 1 measured the stack (deepest 2648, headroom 58264 of 65536); this recording never adopted the tenant, so its exit scan (3488 bytes) is not the resumed copy's and is not compared to the stop
+ok:   D1. the drill clauses are not applicable: the recording says drill=0 (the plain gate image)
+ok:   T. the kernel's own line names the break ('[E7-GATE] tooth descriptor: ... is DROPPED'), and the reds above are its consequences
+--- no-fd
+--- tooth 'no-fd': this recording is EXPECTED to redden [B3 B4] and to leave every other clause green
+ok:   B1. the replay landed the payload (payloads=1, payload_skips=0) — the contents came back, they were not withheld or refused by name
+ok:   B2. the Linux tenant was adopted from the captured context (form=3, stop=spent) at the capture's fs_base=0x807c208 — the TLS base came back with it, and the copy was not restarted
+red:  B3. no read reached the file class after the restore — the resumed task never issued the continuation (the forward was refused before it, or the task never ran)
+red:  B4. the workload did not resume cleanly (Copying=0, Done=0) — a second Copying is a restart, and no Done is an unfinished gate
+ok:   B5. no [FAULT] in the replay boot
+ok:   B6. the tenant's exit tore its address space down (frame(s) freed) — the resumed descriptors and heap were returned, not leaked
+ok:   B7. the stack is measured at both boots: deepest 2648 bytes below the entry %rsp (2648 at the stop, the resumed tail went 0 deeper), 58264 of 65536 bytes untouched — 88.9% above the 32768-byte floor
+ok:   D1. the drill clauses are not applicable: the recording says drill=0 (the plain gate image)
+ok:   T. the forward names the substituted descriptor and the tenant's own error names EBADF ('Bad file descriptor')
+--- no-heap
+--- tooth 'no-heap': this recording is EXPECTED to redden [B4 B5] and to leave every other clause green
+ok:   B1. the replay landed the payload (payloads=1, payload_skips=0) — the contents came back, they were not withheld or refused by name
+ok:   B2. the Linux tenant was adopted from the captured context (form=3, stop=spent) at the capture's fs_base=0x807c208 — the TLS base came back with it, and the copy was not restarted
+ok:   B3. the resumed copy's FIRST read is at the captured source offset (off=0x30000) — the task continued from the stop, it did not re-enter the copy
+red:  B4. the workload did not resume cleanly (Copying=0, Done=0) — a second Copying is a restart, and no Done is an unfinished gate
+red:  B5. 2 [FAULT] line(s) in the replay boot — the resumed tenant (or its sidecars) faulted
+ok:   B6. the tenant's exit tore its address space down (frame(s) freed) — the resumed descriptors and heap were returned, not leaked
+ok:   B7. the stack is measured at both boots: deepest 2648 bytes below the entry %rsp (2648 at the stop, the resumed tail went 0 deeper), 58264 of 65536 bytes untouched — 88.9% above the 32768-byte floor
+ok:   D1. the drill clauses are not applicable: the recording says drill=0 (the plain gate image)
+ok:   T. the forward names the withheld page 0x4000000d8000 and the tenant's free of its 64 KiB buffer faults inside it (addr=0x00004000000d803d) — the deliver refused the bytes, the hole is the tenant's own
+--- fs_base
+--- tooth 'fs_base': this recording is EXPECTED to redden [B2 B4 B5] and to leave every other clause green
+ok:   B1. the replay landed the payload (payloads=1, payload_skips=0) — the contents came back, they were not withheld or refused by name
+red:  B2. the tenant was adopted (form=3, stop=spent) but at fs_base=0x807b208, not the capture's 0x807c208 — the context carried one TLS base and installed another
+ok:   B3. the resumed copy's FIRST read is at the captured source offset (off=0x30000) — the task continued from the stop, it did not re-enter the copy
+red:  B4. the workload did not resume cleanly (Copying=0, Done=0) — a second Copying is a restart, and no Done is an unfinished gate
+red:  B5. 2 [FAULT] line(s) in the replay boot — the resumed tenant (or its sidecars) faulted
+ok:   B6. the tenant's exit tore its address space down (frame(s) freed) — the resumed descriptors and heap were returned, not leaked
+ok:   B7. the stack is measured at both boots: deepest 2648 bytes below the entry %rsp (2648 at the stop, the resumed tail went 0 deeper), 58264 of 65536 bytes untouched — 88.9% above the 32768-byte floor
+ok:   D1. the drill clauses are not applicable: the recording says drill=0 (the plain gate image)
+ok:   T. the record's fs_base=0x807c208 was re-stamped 0x807b208 and that is what the adoption installed — the TLS base is one page off the capture's, and the B2 red is the tooth's own
+e7_gate_check: the teeth redden by name — 10 clause(s) red across descriptor/no-fd/no-heap/fs_base, each exactly where its tooth says, the control green; artifacts in /tmp/e7-gate-retry

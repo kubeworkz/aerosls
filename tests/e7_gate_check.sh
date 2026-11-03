@@ -871,7 +871,7 @@ gate_capture() {
 # tooth's failure is only over when the task is reaped, and the replayed
 # console bytes can echo an old `Done:` before the run has done anything.
 gate_replay() {   # gate_replay <log> <tag> <body> <artifact-dir>
-    local log="$1" tag="$2" body="$3" ard="$4"
+    local log="$1" tag="$2" body="$3" ard="$4" refused_lines
     # The serial log IS the recording's boot2.log, and boot() opens it for
     # writing before anything else — so its directory has to exist first.
     mkdir -p "$ard" "$(dirname "$log")" || fail "cannot create $ard"
@@ -891,11 +891,10 @@ gate_replay() {   # gate_replay <log> <tag> <body> <artifact-dir>
     esac
 
     # A restore that poured nothing has no resumed workload to wait for: the
-    # refusal (a create that could not reach its manager, or the P1a posture
-    # window) is the CALLER's cue to retry on a fresh copy, and sitting out
-    # E7G_WORKLOAD_S first would bury that retry under fifteen minutes of a
-    # boot with no tenant in it. The report is the authority: payloads=0 means
-    # no bytes were applied, whatever a background heal may try later.
+    # caller retries on a fresh copy, and sitting out E7G_WORKLOAD_S first
+    # would bury that retry under fifteen minutes of a boot with no tenant in
+    # it. The report is the authority: payloads=0 means no bytes were applied,
+    # whatever a background heal may try later.
     if [ "$(jval "$ard/restore.json" payloads)" = "0" ]; then
         # A recording even when nothing poured: facts are what the retry note
         # and a --replay read, and an attempt with no facts is indistinguishable
@@ -906,6 +905,17 @@ gate_replay() {   # gate_replay <log> <tag> <body> <artifact-dir>
             echo "tooth=$(jval "$ard/restore.json" tooth)"
             echo "partition=$PID"
         } > "$ard/facts"
+        # The kernel names the reason in the transcript: a withheld pour in
+        # env_service.c's "[ENV_PAYLOAD] contents not restored ...", a refused
+        # record in "[ENV_RESTORE] last refusal: ...". Echo both into the run's
+        # log now, so the reason survives in the evidence even if the kept
+        # attempt directory is later moved or pruned.
+        refused_lines=$({ grep -aF "[ENV_PAYLOAD] contents not restored" "$log" | tail -2
+                          grep -aF "[ENV_RESTORE] last refusal:" "$log" | tail -1; } 2>/dev/null)
+        if [ -n "$refused_lines" ]; then
+            echo "--- the attempt's refusal lines:"
+            printf '%s\n' "$refused_lines"
+        fi
         echo "note: the restore poured nothing (payloads=0) — nothing to wait for; powering off"
         sleep 2
         power_off
@@ -1072,16 +1082,31 @@ SRC_IMG="$IMG"
 retries=0
 
 # A replay whose pour was REFUSED never applied its tooth: all four breaks
-# live in the pour or in the forward path after it. The refusals seen here are
-# the P1a posture window (a sidecar still RUNNING when the wait's ceiling
-# expires — env_payload.h's account of run 12) and a replay whose create could
-# not reach the environment manager it boots with; neither is a tooth's red,
-# so this arm retries that boot ON A FRESH COPY, prints the attempt and the
-# recorded reason. The retry is bounded and visible; a replay that never gets
-# its contents injected can never be counted as a pass for any tooth, and a
-# pour that refuses EVERY attempt fails the run instead of being retried away.
+# live in the pour or in the forward path after it. Such a boot is not a
+# tooth's red, so this arm retries it ON A FRESH COPY — bounded, and printed
+# with the reason the transcript names. Attribution is part of the retry: the
+# kernel states a withheld pour in "[ENV_PAYLOAD] contents not restored ..."
+# and a refused record in "[ENV_RESTORE] last refusal: ...", and the attempt's
+# own transcript is kept under $TC/refused/ before the next attempt's
+# directory replaces it, so the counters are never the only account of why a
+# replay came back empty. A pour that refuses EVERY attempt fails the run
+# instead of being retried away.
+pour_refusal() {   # pour_refusal <boot log> -> the named reason on one line, or empty
+    local log="$1" line
+    line=$(grep -aF "[ENV_PAYLOAD] contents not restored" "$log" 2>/dev/null | tail -1)
+    if [ -z "$line" ]; then
+        line=$(grep -aF "[ENV_RESTORE] last refusal:" "$log" 2>/dev/null | tail -1)
+    fi
+    [ -n "$line" ] || return 0
+    printf '%s\n' "$line" | sed \
+        -e 's/^.*contents not restored for (partition [0-9][0-9]*, index [0-9][0-9]*): //' \
+        -e 's/^.*last refusal: //' \
+        -e 's/ -- the replay stands.*$//' \
+        -e 's/\.$//'
+}
+
 replay_for_tooth() {   # <name> <tag-base> <body> -> 0 when the pour landed
-    local name="$1" tag="$2" body="$3" try payloads skips
+    local name="$1" tag="$2" body="$3" try payloads skips reason kept kept_rel
     for try in 1 2 3; do
         [ "$try" -gt 1 ] && retries=$((retries + 1))
         cp --sparse=always "$SRC_IMG" "$TC/$name.img" || \
@@ -1097,9 +1122,21 @@ replay_for_tooth() {   # <name> <tag-base> <body> -> 0 when the pour landed
         payloads=$(fact "$TC/$name" payloads)
         skips=$(fact "$TC/$name" payload_skips)
         if [ "$payloads" = "1" ]; then return 0; fi
-        reason=$(grep -aF "[ENV_RESTORE] last refusal:" "$TC/$name/boot2.log" 2>/dev/null | \
-                     tail -1 | sed 's/.*last refusal: //')
-        echo "note: $name attempt $try got no pour (payloads=${payloads:-?}, payload_skips=${skips:-?}) — ${reason:-a restore refusal, not this tooth}; retrying on a fresh copy"
+        reason=$(pour_refusal "$TC/$name/boot2.log")
+        # Keep the refused attempt's evidence before the loop's next
+        # `rm -rf "$TC/$name"` — boot2.log is where the reason is written, and
+        # the facts and the route's report are what a --replay reader needs to
+        # see that this attempt was refused rather than absent.
+        kept="$TC/refused/$name.r$try"
+        kept_rel="${kept#$ART/}"
+        mkdir -p "$kept" || fail "cannot keep the refused $name attempt"
+        for f in boot2.log facts restore.json; do
+            if [ -f "$TC/$name/$f" ]; then
+                cp "$TC/$name/$f" "$kept/$f" || fail "cannot keep $name's $f"
+            fi
+        done
+        printf '%s\n' "${reason:-no refusal line in the transcript}" > "$kept/reason"
+        echo "note: $name attempt $try got no pour (payloads=${payloads:-?}, payload_skips=${skips:-?}) — ${reason:-no refusal line in the transcript}; kept in $kept_rel; retrying on a fresh copy"
     done
     return 1
 }
@@ -1127,7 +1164,7 @@ if [ "$fails" -ne 0 ]; then
     exit 1
 fi
 if [ "$retries" -gt 0 ]; then
-    echo "e7_gate_check: $retries replay(s) were retried for a restore refusal (a create that could not reach its manager, or the P1a posture window) — not a tooth's red; the recordings kept are the ones that poured"
+    echo "e7_gate_check: $retries replay(s) were retried for a refused restore — each attempt's named reason is printed above and its transcript kept under $TC/refused/ — not a tooth's red; the recordings kept are the ones that poured"
 fi
 echo "e7_gate_check: the teeth redden by name — $red_count clause(s) red across descriptor/no-fd/no-heap/fs_base, each exactly where its tooth says, the control green; artifacts in $ART"
 exit 0

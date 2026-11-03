@@ -3165,10 +3165,78 @@ fails the invocation (`no attempt got the payload poured — the run cannot meas
 this tooth`) rather than being retried into a pass. A restore that poured
 nothing also stops the harness waiting: `payloads=0` means there is no resumed
 tenant whose conclusion could be waited on, so the attempt powers off and
-retries instead of sitting out the workload window. The four-tooth invocation
-below needed two repeats, both restore refusals — the first a create round trip
-that could not reach its manager, the second the P1a posture window — each
-printed with its recorded reason, and neither counted as a tooth's red.
+retries instead of sitting out the workload window. The pre-fix four-tooth invocation
+below needed two repeats, both restore refusals — the first a create that
+outran the round trip's fixed 300-tick bound while init was still building the
+environment, the second the P1a posture window — each printed with its
+recorded reason, and neither counted as a tooth's red.
+
+*The first of those refusals was misdiagnosed by its own text.* The create
+round trip carried a fixed 300-tick (~3 s) deadline, and the refusal recorded
+`the create for record 1 failed (status 0)` — where `0` is the kernel's "no
+reply" placeholder, not a manager status. Instrumenting the RPC on 2026-11-02
+(eight replay boots of the captured image) showed the manager was never
+missing: sends did not fail, successful creates answered in 57–284 ticks, and
+one create was still running at 945 ticks when the deadline expired — the
+next log lines were that create's own `drv.ramdisk.1` and `aerosls.posix.1`
+being wired, so init was mid-create when the pass stopped listening. The same
+boot saw the sibling `ENV_REGISTER` go unanswered for 344 ticks against a
+3-tick norm. The round trip is now a quiet window (`ENV_RPC_STALL_TICKS`,
+1,200 ticks) that restarts on every switch-in of the manager process
+(`ProcessDescriptor.switches`, the P1a payload wait's own progress signal),
+with an absolute ceiling (`ENV_RPC_CEIL_TICKS`, 6,000 ticks), and it takes
+one last look at the reply after the final yield. The refusal's status field
+is unchanged, but a timeout now logs which bound expired and how long the
+manager had been quiet, so the transcript no longer reads as a manager
+answer. `tests/env_service_wait_host_test.c` pins all three outcomes: a
+manager that answers at 900 ticks (past the old bound) is answered, one that
+stops being scheduled is bounded at 1,200 ticks, and one that keeps running
+without answering is stopped at the ceiling.
+
+*The gate itself was then re-run with the fix in place.* The four-tooth
+invocation of 2026-11-02 (`evidence/e7_gate_teeth_stallfix.log`) ended with ten
+clauses red across `descriptor`/`no-fd`/`no-heap`/`fs_base`, each exactly where
+its tooth says, and the control green. It still retried three replays —
+`control`, `descriptor` and `no-heap` — because those attempts' restore poured
+nothing (`payloads=0, payload_skips=1`); every retry poured on its fresh copy
+(`payloads=1, payload_skips=0`). The retry count therefore did not fall, but
+the old cause is gone: no boot in the run recorded `create for record`, and no
+wait logged `no reply to ty`, so the round trip's bound refused nothing. The
+three retries are pour-side refusals. That run could not name their reason,
+and both causes were in the harness, not the kernel: a withheld pour is
+rendered by `env_service.c` as `[ENV_PAYLOAD] contents not restored for
+(partition P, index I): <why> -- ...`, while the retry note read only
+`[ENV_RESTORE] last refusal:` — a line that reports RECORD refusals and is
+absent when only the contents were withheld — and the retry's `rm -rf` of the
+attempt directory replaced the transcript that carried the first line. The
+harness now closes both gaps: `gate_replay` echoes an empty attempt's
+`[ENV_PAYLOAD] contents not restored` and `[ENV_RESTORE] last refusal:` lines
+into the run's log, and `replay_for_tooth` reads the named reason with
+`pour_refusal()` and keeps the attempt's `boot2.log`, `facts` and
+`restore.json` (plus a `reason` file) under `teeth/refused/<tooth>.r<try>/`
+before the next copy's directory replaces it. The retry note now reads the
+kernel's sentence (for example `the capture caught a sidecar mid-compute, not
+parked ...`), and its fallback is `no refusal line in the transcript` rather
+than the old "a restore refusal, not this tooth", which asserted a category
+the note had not read. The host test remains the deterministic regression;
+this run is the boot-level confirmation that a slow create no longer looks
+refused; a withheld pour now names itself in the run log and keeps its
+transcript.
+
+*The first invocation after that change retried nothing.* A second four-tooth
+run on 2026-11-02 (`evidence/e7_gate_teeth_retry_named.log`, 608 lines) — made
+after the harness change and with no kernel edit — recorded `payloads=1,
+payload_skips=0` for all five replays (`control`, `descriptor`, `no-fd`,
+`no-heap`, `fs_base`), each on its **first** attempt. The run printed no
+`note:` line, no `create for record` and no `no reply to ty`, and
+`teeth/refused/` was never created. The verdict was unchanged: ten clauses red
+across the four teeth, each exactly where its tooth says, and the control
+green. So the pour refusal that cost the previous run three replays did not
+recur, and there was none for the harness to name; the kept-attempt path is
+verified by the stubbed-arm exercise (a named pour refusal printed, the
+transcript and facts kept before the retry, an empty transcript printing no
+header), not by a live refusal. Both runs' invocation logs are under
+`evidence/`.
 
 | Tooth | The break | Must redden | Must stay green (the specificity) | Named evidence |
 |---|---|---|---|---|
@@ -3180,7 +3248,7 @@ printed with its recorded reason, and neither counted as a tooth's red.
 The increment-22 control's clauses were all green and its three teeth reddened
 exactly seven clauses between them — `7 clause(s) red across
 descriptor/no-fd/no-heap, each exactly where its tooth says, the control green`
-(`evidence/e7_gate_teeth.log`). The four-tooth invocation of 2026-11-02 is the
+(`evidence/e7_gate_teeth.log`). The pre-fix four-tooth invocation of 2026-11-02 is the
 same shape with `fs_base` added: ten reds across the four teeth, the control
 green, and two restore refusals retried rather than counted
 (`evidence/e7_gate_teeth_fsbase.log`).
