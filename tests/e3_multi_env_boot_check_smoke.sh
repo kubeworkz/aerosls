@@ -14,6 +14,11 @@
 # ─── The arms, and the ONE reason each may fail ─────────────────────────────
 #   three-live     -> PASS  the property, as the real boot reports it
 #   two-live       -> FAIL  a tenant never reached a live rootfs
+#   overflow-lost  -> FAIL  two live rootfs AND the kernel's loopback overflow
+#                           line: the verdict must NAME the evidence loss, not
+#                           report `2/3` (the misattribution this clause stops)
+#   overflow-full  -> FAIL  three live rootfs AND an overflow: a full count does
+#                           not excuse a log the kernel admits it truncated
 #   shared-storage -> FAIL  both tenants handed the same region (not isolated)
 #   marker-lost    -> PASS  the hardening tooth: the sidecar console dropped
 #                           init's marker, and the boot is still correct. This
@@ -24,15 +29,15 @@
 #                           rootfs: the gate must NOT be satisfiable by init's
 #                           own account of itself.
 #   no-iso         -> ABORT rc=2  a missing image is a prerequisite failure, not
-#                           a pass: the guard fails closed, which is why arms
-#                           1–6 hand it a placeholder ISO.
+#                           a pass: the guard fails closed, which is why every
+#                           canned-log arm hands it a placeholder ISO.
 #   shipped-iso    -> FAIL  the real negative control (only when the shipped ISO
 #                           exists): that image never spawns tenants, so the
 #                           guard must go red rather than quietly skip.
 #
 # Exit: 0 if every arm behaves as named, 1 otherwise, 2 on a missing prerequisite
-# (bash only; arms 1–6 need no image at all — see $DUMMY_ISO — and the last arm
-# is skipped with a note when the shipped ISO is absent).
+# (bash only; every canned-log arm needs no image at all — see $DUMMY_ISO — and
+# the last arm is skipped with a note when the shipped ISO is absent).
 set -u
 
 cd "$(dirname "$0")/.."   # repo root
@@ -78,9 +83,10 @@ STUB
 chmod +x "$WORK/stubqemu"
 
 # A canned boot log: $1 = how many live-rootfs lines, $2 = storage addresses
-# ('same' shares one address), $3 = include init's done-marker (yes/no).
+# ('same' shares one address), $3 = include init's done-marker (yes/no),
+# $4 = output file, $5 = emit the kernel's overflow line (yes/no).
 mklog() {
-    local n="$1" mode="$2" marker="$3" out="$4"
+    local n="$1" mode="$2" marker="$3" out="$4" overflow="${5:-no}"
     {
         echo "[SIDECAR] PID 104 'aerosls.posix.0': wired chan 'console' to kernel service 'kernel.debug.console' (slots 3/4, kernel end 14/15)"
         echo "[POSIX] boot: rw=06 rr=05 cw=03 nw=08"
@@ -108,13 +114,19 @@ mklog() {
             fi
             echo "[POSIX] aero state=00000000 "
         done
+        # The kernel's own line, printed at replay when its deferral ring could
+        # not hold the window's output. Shape copied from kernel_io.c verbatim,
+        # because that is what the guard greps for on a real boot.
+        [ "$overflow" = yes ] && \
+            echo "[serial] loopback window overflow: 0x45c byte(s) dropped"
         echo "System ready"
         echo "\$ "
     } > "$out"
 }
 
-arm() {   # $1 = label, $2 = expected rc, $3 = expected stdout/stderr substring
-    local label="$1" want="$2" needle="$3" got out
+arm() {   # $1 = label, $2 = expected rc, $3 = expected substring,
+          # ${4:-} = a substring the verdict must NOT contain
+    local label="$1" want="$2" needle="$3" forbidden="${4:-}" got out
     out="$("$WORK/run" 2>&1)"
     got=$?
     if [ "$got" -ne "$want" ]; then
@@ -125,6 +137,13 @@ arm() {   # $1 = label, $2 = expected rc, $3 = expected stdout/stderr substring
     fi
     if ! printf '%s' "$out" | grep -qF "$needle"; then
         echo "FAIL  $label: rc=$want as expected, but the verdict never said '$needle'" >&2
+        echo "$out" | sed 's/^/      /' >&2
+        fail=$((fail + 1))
+        return
+    fi
+    if [ -n "$forbidden" ] && printf '%s' "$out" | grep -qF "$forbidden"; then
+        echo "FAIL  $label: rc and '$needle' were right, but the verdict also said" >&2
+        echo "      '$forbidden' — the misattribution this arm exists to stop" >&2
         echo "$out" | sed 's/^/      /' >&2
         fail=$((fail + 1))
         return
@@ -152,6 +171,34 @@ chmod +x "$WORK/run"
 # The count is named by the gate itself: with fewer than three lines the gate
 # never opens, and the verdict carries the number it did see.
 arm "only two live rootfs -> FAIL" 1 "live rootfs: 2/3"
+
+# ─── Arm 2b: the same short count, but the kernel says it dropped bytes ────
+# This is the boot that made the guard lie: 2 lines seen, and the reason is
+# that the deferral ring overflowed — not that a tenant failed to start. The
+# verdict must name the evidence loss and must NOT report a `2/3` boot failure.
+mklog 2 distinct yes "$WORK/overflow.log" yes
+cat > "$WORK/run" <<EOF
+#!/usr/bin/env bash
+E3_ISO="$DUMMY_ISO" E3_QEMU="$WORK/stubqemu" E3_STUB_LOG="$WORK/overflow.log" bash $GUARD
+EOF
+chmod +x "$WORK/run"
+arm "two live rootfs + kernel overflow -> FAIL named as evidence loss" 1 \
+    "serial evidence was lost during a loopback window" \
+    "3 live rootfs never seen"
+
+# ─── Arm 2c: a full count does not make a truncated log trustworthy ───────
+# Three lines survived, but the ring still overflowed: the drop landed on some
+# other writer, and none of this guard's parses can be read as a complete
+# account. Integrity gates the evidence, not just the headline count.
+mklog 3 distinct yes "$WORK/overflow-full.log" yes
+cat > "$WORK/run" <<EOF
+#!/usr/bin/env bash
+E3_ISO="$DUMMY_ISO" E3_QEMU="$WORK/stubqemu" E3_STUB_LOG="$WORK/overflow-full.log" bash $GUARD
+EOF
+chmod +x "$WORK/run"
+arm "three live rootfs + kernel overflow -> FAIL named as evidence loss" 1 \
+    "serial evidence was lost during a loopback window" \
+    "no serial evidence was dropped"
 
 # ─── Arm 3: the hardening tooth — the console lost init's marker ───────────
 # Before the gate was narrowed to the drop-proof evidence, this boot FAILED.
