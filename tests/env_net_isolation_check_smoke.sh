@@ -55,6 +55,12 @@
 #                              partition: a tenant could undo the default, N19.
 #   P2_TOOTH=no-quota-role     — the HTTP route stops requiring DB_ADMIN: the
 #                              kernel-context path is ungated, N19.
+#   P2_TOOTH=ungated-cpu-weight / ungated-storage-quota — the sibling setters
+#                              (273, 275) stop asking the same authority
+#                              helper; the class of finding N19 now covers is
+#                              reopened one setter at a time, N19.
+#   P2_TOOTH=no-cpuweight-role / no-storage-role — the matching HTTP routes
+#                              stop requiring DB_ADMIN, N19.
 #   plus one tooth per clause — every other clause N1-N19 reddens when the
 #                              single property it carries is removed.
 #
@@ -93,7 +99,8 @@ case "$TOOTH_SET" in
     no-attribution|no-admit-counter|no-listener-verbs|no-accept-attribution|\
     no-bind-port|descriptor-conn-id|no-quota-surface|no-quota|\
     no-ci-live|no-ci-order|no-birth-default|no-restore-default|\
-    no-birth-line|ungated-quota-set|no-quota-role) ;;
+    no-birth-line|ungated-quota-set|no-quota-role|ungated-cpu-weight|\
+    ungated-storage-quota|no-cpuweight-role|no-storage-role) ;;
     *) echo "ABORT: unknown P2_TOOTH='$TOOTH_SET' — see this file's header for the list" >&2; exit 2 ;;
 esac
 want_tooth() { [ -z "$TOOTH_SET" ] || [ "$TOOTH_SET" = "$1" ]; }
@@ -488,6 +495,42 @@ if want_tooth no-quota-role; then
         'req_role > ROLE_DB_ADMIN' \
         '0 > 1   /* the role gate was removed */'
     tooth no-quota-role N19 "the connquota POST stops requiring DB_ADMIN" "$W/nqr"
+fi
+
+# N19. the sibling setters (273 CPU weight, 275 storage quota) stop asking
+# the same authority helper. One tooth each, so the class cannot be reopened
+# one setter at a time without a named red.
+if want_tooth ungated-cpu-weight; then
+    seed "$W/ucw"
+    replace "$W/ucw/kernel/syscall_dispatch.c" \
+        'if (!partition_budget_may_change("SCHED", "a CPU weight"))' \
+        'if (0)   /* the CPU-weight arm lost its caller check */'
+    tooth ungated-cpu-weight N19 "the CPU-weight setter stops checking the caller's partition" "$W/ucw"
+fi
+if want_tooth ungated-storage-quota; then
+    seed "$W/usq"
+    replace "$W/usq/kernel/syscall_dispatch.c" \
+        'if (!partition_budget_may_change("STORAGE-QUOTA", "a storage quota"))' \
+        'if (0)   /* the storage-quota arm lost its caller check */'
+    tooth ungated-storage-quota N19 "the storage-quota setter stops checking the caller's partition" "$W/usq"
+fi
+
+# N19. the matching control-plane routes stop requiring DB_ADMIN. Each
+# mutation is anchored to its own handler's signature, so the tooth cannot
+# redden by removing a different route's gate.
+if want_tooth no-cpuweight-role; then
+    seed "$W/ncwr"
+    replace "$W/ncwr/net/http.c" \
+$'static int api_partition_cpuweight_post(const char* body, char* buf, int max,\n                                        SLSRole req_role) {\n    JSONBuf j = { buf, 0, max };\n    if (req_role > ROLE_DB_ADMIN) {' \
+$'static int api_partition_cpuweight_post(const char* body, char* buf, int max,\n                                        SLSRole req_role) {\n    JSONBuf j = { buf, 0, max };\n    if (0 > 1) {   /* the role gate was removed */'
+    tooth no-cpuweight-role N19 "the CPU-weight POST stops requiring DB_ADMIN" "$W/ncwr"
+fi
+if want_tooth no-storage-role; then
+    seed "$W/nsr"
+    replace "$W/nsr/net/http.c" \
+$'static int api_partition_storagequota_post(const char* body, char* buf, int max,\n                                           SLSRole req_role) {\n    JSONBuf j = { buf, 0, max };\n    if (req_role > ROLE_DB_ADMIN) {' \
+$'static int api_partition_storagequota_post(const char* body, char* buf, int max,\n                                           SLSRole req_role) {\n    JSONBuf j = { buf, 0, max };\n    if (0 > 1) {   /* the role gate was removed */'
+    tooth no-storage-role N19 "the storage-quota POST stops requiring DB_ADMIN" "$W/nsr"
 fi
 
 # ── the vacuity control: the REAL tree must be GREEN ───────────────────────

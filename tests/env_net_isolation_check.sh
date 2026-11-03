@@ -87,10 +87,12 @@
 #       partition_create(), re-applied on the restore path that bypasses it,
 #       with PARTITION_SYSTEM exempt. Deleting either site leaves one of the
 #       two partition lifetimes unbounded;
-#   N19. §11 Q4's authority: the 277 arm refuses a non-SYSTEM caller by name
-#       before touching the table (the arm had NO check at all), and the HTTP
-#       route that reaches the same setter from kernel context requires
-#       DB_ADMIN. N19b proves the birth line on a booted node.
+#   N19. §11 Q4's authority, on every partition-budget setter the dispatcher
+#       owns: 273 (CPU weight), 275 (storage quota) and 277 (connection
+#       quota) all refuse a non-SYSTEM caller by name BEFORE the setter (the
+#       arms had NO check at all), and the three HTTP routes that reach those
+#       setters from kernel context require DB_ADMIN. N19b proves the birth
+#       line on a booted node.
 #
 # ─── The live arm (--live) ────────────────────────────────────────────────
 #   L1. the created tenant environment's channel registers under the
@@ -543,20 +545,38 @@ clause "$c18" N18 "a partition is born at the tenant default: applied at the min
 # name BEFORE the setter, and the HTTP route — kernel context, where the arm
 # has no caller — carries the same role gate as /api/partitions.
 c19=$fail
+# The rule itself, in one place: the helper every arm calls.
 has "$SYSD" 'caller->partition_id != PARTITION_SYSTEM' ||
-    bad "N19. kernel/syscall_dispatch.c: the conn-quota arm no longer checks the caller's partition — a tenant could raise its own ceiling or lower a neighbour's, and §11 Q4's default would be decorative"
+    bad "N19. kernel/syscall_dispatch.c: the budget-authority helper no longer checks the caller's partition — a tenant could raise its own ceiling or lower a neighbour's, and §11 Q4's default would be decorative"
 has "$SYSD" 'may not change' ||
     bad "N19. kernel/syscall_dispatch.c: the refusal is no longer named — a denied operator would see an unexplained CAP_EPERM"
-order_ok "$SYSD" 'may not change' 'sys_sls_partition_conn_quota_set(' ||
-    bad "N19. kernel/syscall_dispatch.c: the authority check no longer precedes the setter — a refused caller would still change the table"
-CQPOST="$(fn_body "$HTTP" 'static int api_partition_connquota_post(')"
-hasstr "$CQPOST" 'req_role > ROLE_DB_ADMIN' ||
-    bad "N19. net/http.c: the connquota POST no longer requires DB_ADMIN — an unauthenticated POST would change any partition's quota"
-hasstr "$CQPOST" 'SLSRole req_role' ||
-    bad "N19. net/http.c: the connquota handler no longer takes the resolved role, so it cannot be gated"
-has "$HTTP" 'api_partition_connquota_post(body_ptr, resp_body, (int)sizeof(resp_body), req_role)' ||
-    bad "N19. net/http.c: the route does not pass req_role into the handler — the gate would read a parameter that was never threaded"
-clause "$c19" N19 "only PARTITION_SYSTEM reaches the setter (refused by name, before the table), and the HTTP route requires DB_ADMIN"
+# All three arms must route through it, and each check must precede its setter.
+for pair in 'SCHED|a CPU weight|sys_sls_partition_cpu_weight_set(' \
+            'STORAGE-QUOTA|a storage quota|sys_sls_partition_storage_quota_set(' \
+            'TCP-QUOTA|a connection quota|sys_sls_partition_conn_quota_set('; do
+    tag="${pair%%|*}"; rest="${pair#*|}"; what="${rest%%|*}"; setter="${rest#*|}"
+    has "$SYSD" "partition_budget_may_change(\"$tag\", \"$what\")" ||
+        bad "N19. kernel/syscall_dispatch.c: the $tag arm no longer asks the budget-authority helper — that setter is reachable by any ring-3 caller"
+    order_ok "$SYSD" "partition_budget_may_change(\"$tag\"" "$setter" ||
+        bad "N19. kernel/syscall_dispatch.c: the $tag arm's authority check no longer precedes its setter — a refused caller would still change the budget"
+done
+# The control-plane routes: kernel context has no process for the arm above.
+for h in 'static int api_partition_connquota_post(' \
+         'static int api_partition_cpuweight_post(' \
+         'static int api_partition_storagequota_post('; do
+    body="$(fn_body "$HTTP" "$h")"
+    hasstr "$body" 'req_role > ROLE_DB_ADMIN' ||
+        bad "N19. net/http.c: $h no longer requires DB_ADMIN — an unauthenticated POST could change a partition budget"
+    hasstr "$body" 'SLSRole req_role' ||
+        bad "N19. net/http.c: $h no longer takes the resolved role, so it cannot be gated"
+done
+for call in 'api_partition_connquota_post(body_ptr, resp_body, (int)sizeof(resp_body), req_role)' \
+            'api_partition_cpuweight_post(body_ptr, resp_body, (int)sizeof(resp_body), req_role)' \
+            'api_partition_storagequota_post(body_ptr, resp_body, (int)sizeof(resp_body), req_role)'; do
+    has "$HTTP" "$call" ||
+        bad "N19. net/http.c: a policy route does not pass req_role into its handler ($call) — the gate would read a parameter that was never threaded"
+done
+clause "$c19" N19 "only PARTITION_SYSTEM reaches the three budget setters (refused by name, before the table), and their HTTP routes require DB_ADMIN"
 
 # ── the live arm ──────────────────────────────────────────────────────────
 if [ "$LIVE" -eq 1 ]; then

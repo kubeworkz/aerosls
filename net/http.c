@@ -3422,8 +3422,18 @@ static int api_partition_cpuweights_list(char* buf, int max) {
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
 
-static int api_partition_cpuweight_post(const char* body, char* buf, int max) {
+static int api_partition_cpuweight_post(const char* body, char* buf, int max,
+                                        SLSRole req_role) {
     JSONBuf j = { buf, 0, max };
+    if (req_role > ROLE_DB_ADMIN) {
+        jb_obj_open(&j,0); jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","requires DB_ADMIN or higher");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
+    /* POSIX-Environments v0.2 §11 Q4's authority rule, on the CPU weight's
+     * own route: the dispatcher refuses a non-SYSTEM caller, and this path
+     * (kernel context, where that arm has no caller) carries the same
+     * DB_ADMIN gate /api/partitions and the connquota route take. */
     if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
     struct SLSPartitionCpuWeightSetRequest req;
     req.partition_id = (uint32_t)json_int(body, "partition_id");
@@ -3460,8 +3470,17 @@ static int api_partition_storagequotas_list(char* buf, int max) {
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
 
-static int api_partition_storagequota_post(const char* body, char* buf, int max) {
+static int api_partition_storagequota_post(const char* body, char* buf, int max,
+                                           SLSRole req_role) {
     JSONBuf j = { buf, 0, max };
+    if (req_role > ROLE_DB_ADMIN) {
+        jb_obj_open(&j,0); jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","requires DB_ADMIN or higher");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
+    /* Same §11 Q4 rule as the CPU-weight and connquota routes: a disk quota
+     * is a control-plane decision, and the dispatcher's PARTITION_SYSTEM
+     * check has no caller on this kernel-context path. */
     if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
     struct SLSPartitionStorageQuotaSetRequest req;
     req.partition_id = (uint32_t)json_int(body, "partition_id");
@@ -6615,11 +6634,11 @@ static void http_route(int conn, char* req) {
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         if (!strcmp(path, "/api/partition/cpuweight")) {
-            blen = api_partition_cpuweight_post(body_ptr, resp_body, (int)sizeof(resp_body));
+            blen = api_partition_cpuweight_post(body_ptr, resp_body, (int)sizeof(resp_body), req_role);
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         if (!strcmp(path, "/api/partition/storagequota")) {
-            blen = api_partition_storagequota_post(body_ptr, resp_body, (int)sizeof(resp_body));
+            blen = api_partition_storagequota_post(body_ptr, resp_body, (int)sizeof(resp_body), req_role);
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         if (!strcmp(path, "/api/partition/connquota")) {

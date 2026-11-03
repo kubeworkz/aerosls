@@ -53,6 +53,33 @@ static uint32_t spawn_owner_uid(void) {
     return cur ? cur->owner_uid : 0;
 }
 
+/* ─── Partition-budget authority (POSIX-Environments v0.2 §11 Q4) ──────────
+ * ONE rule for every arm here that changes a partition's budget: CPU weight
+ * (273), storage quota (275) and connection quota (277). A caller in any
+ * partition but PARTITION_SYSTEM is refused BY NAME before the setter runs,
+ * so a tenant can neither raise its own ceiling nor lower a neighbour's.
+ * Kernel context (no current process) is the control plane's own path — the
+ * HTTP routes reach these setters directly — and those routes carry DB_ADMIN
+ * instead, the gate their sibling partition routes already had.
+ *
+ * The first of the three to get this check was 277 (§11 Q4's connection
+ * quota, whose default would have been decorative without it); the same
+ * absence on 273/275 was recorded as the same class of finding, and this
+ * helper is that class closed once rather than three copies drifting apart.
+ * Returns 1 when the caller may proceed. */
+static int partition_budget_may_change(const char* tag, const char* what) {
+    struct ProcessDescriptor* caller = process_find_current();
+    if (!caller) return 1;
+    if (caller->partition_id != PARTITION_SYSTEM) {
+        kernel_serial_printf(
+            "[%s] %s refused: pid=%u (partition %u) may not change a "
+            "partition budget — only PARTITION_SYSTEM may\n",
+            tag, what, (unsigned)caller->pid, (unsigned)caller->partition_id);
+        return 0;
+    }
+    return 1;
+}
+
 // ─── sys_sls_allocate — legacy direct-address allocation (syscall 105) ────────
 // Returns the base virtual address of the named object, or 0 if not found.
 static uint64_t sls_legacy_allocate(void* arg) {
@@ -1315,13 +1342,22 @@ uint64_t do_syscall(uint64_t num, void* arg) {
         sys_sls_usage_report(); return 0;
 
     // ─── Multitenant Isolation Gap Analysis §5 item 8 / §7 item 8 (273-274) ──
+    // §11 Q4's authority rule (see partition_budget_may_change() above): a
+    // tenant may not retune its own or a neighbour's CPU weight.
     case SYS_SLS_PARTITION_CPU_WEIGHT_SET:
+        if (!partition_budget_may_change("SCHED", "a CPU weight"))
+            return (uint64_t)(int64_t)CAP_EPERM;
         return sys_sls_partition_cpu_weight_set((struct SLSPartitionCpuWeightSetRequest*)arg);
     case SYS_SLS_PARTITION_CPU_WEIGHT_LIST:
         sys_sls_partition_cpu_weight_list(); return 0;
 
     // ─── Storage Isolation Roadmap Phase 1 (275-276) ─────────────────────────
+    // Same rule: raising or zeroing another partition's disk quota is the
+    // control plane's decision, and a tenant zeroing its OWN quota would be
+    // a self-inflicted denial it could then blame on the store.
     case SYS_SLS_PARTITION_STORAGE_QUOTA_SET:
+        if (!partition_budget_may_change("STORAGE-QUOTA", "a storage quota"))
+            return (uint64_t)(int64_t)CAP_EPERM;
         return sys_sls_partition_storage_quota_set((struct SLSPartitionStorageQuotaSetRequest*)arg);
     case SYS_SLS_PARTITION_STORAGE_QUOTA_LIST:
         sys_sls_partition_storage_quota_list(); return 0;
@@ -1333,17 +1369,10 @@ uint64_t do_syscall(uint64_t num, void* arg) {
     // would have been decorative. PARTITION_SYSTEM is the operator (init, the
     // system shell, the control plane); kernel context has no current process
     // and is the HTTP route's own path, which requires DB_ADMIN above this.
-    case SYS_SLS_PARTITION_CONN_QUOTA_SET: {
-        struct ProcessDescriptor* caller = process_find_current();
-        if (caller && caller->partition_id != PARTITION_SYSTEM) {
-            kernel_serial_printf(
-                "[TCP-QUOTA] set refused: pid=%u (partition %u) may not change "
-                "a connection quota — only PARTITION_SYSTEM may\n",
-                (unsigned)caller->pid, (unsigned)caller->partition_id);
+    case SYS_SLS_PARTITION_CONN_QUOTA_SET:
+        if (!partition_budget_may_change("TCP-QUOTA", "a connection quota"))
             return (uint64_t)(int64_t)CAP_EPERM;
-        }
         return sys_sls_partition_conn_quota_set((struct SLSPartitionConnQuotaSetRequest*)arg);
-    }
     case SYS_SLS_PARTITION_CONN_QUOTA_LIST:
         sys_sls_partition_conn_quota_list(); return 0;
 
