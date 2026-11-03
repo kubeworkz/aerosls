@@ -335,11 +335,19 @@ clause "$c7" B2 "the host test links the real service, pins the indistinguishabl
 # granted), and the SYSTEM profile stays without one — only the tenant
 # profile was to change, same reason as env_net_isolation's N2.
 c8=$fail
-TENANT="$(fn_body "$MAN" 'pub fn build_posix_manifest_tenant(')"
+# The cap records live in the profile helper: when E7 added the gate variant,
+# build_posix_manifest_tenant() and ..._tenant_gate() became one-line
+# delegations to build_posix_manifest_tenant_profile(), so a scan of the
+# wrapper's body sees none of the caps it returns. Read the helper, and pin
+# the delegation so the public builder cannot be unhooked from it.
+TENANT="$(fn_body "$MAN" 'fn build_posix_manifest_tenant_profile(')"
+TENANTSHIM="$(fn_body "$MAN" 'pub fn build_posix_manifest_tenant(')"
 SYSTEMMF="$(fn_body "$MAN" 'pub fn build_posix_manifest(')"
-if [ -z "$TENANT" ] || [ -z "$SYSTEMMF" ]; then
+if [ -z "$TENANT" ] || [ -z "$TENANTSHIM" ] || [ -z "$SYSTEMMF" ]; then
     bad "C1. posix_manifest.rs: a profile builder is gone — the boundary cannot be evaluated"
 fi
+hasstr "$TENANTSHIM" 'build_posix_manifest_tenant_profile(' ||
+    bad "C1. tenant manifest: build_posix_manifest_tenant() no longer delegates to the profile helper — the caps checked here would not be the ones it returns"
 hasstr "$TENANT" 'peer: Some("kernel.env.catalog"),' ||
     bad "C1. tenant manifest: no cap peers at kernel.env.catalog — the service would register nobody in a real boot"
 printf '%s\n' "$TENANT" | grep -A2 -F 'name: "catalog"' | grep -qF 'rights: 0x7' ||
