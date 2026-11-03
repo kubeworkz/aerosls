@@ -230,7 +230,14 @@ order_ok() {
 # clause failed; the FAIL lines above it are already prefixed with the id.
 clause() { [ "$fail" -eq "$1" ] && ok "$2. $3"; }
 
-TENANT="$(fn_body "$MF" 'pub fn build_posix_manifest_tenant(')"
+# The caps live in the shared profile builder, not in the two thin wrappers
+# that select it: `build_posix_manifest_tenant()` and
+# `build_posix_manifest_tenant_gate()` differ only in the gate flag they pass,
+# so reading either wrapper finds a six-line body and no caps at all. This is
+# the line main's §9.1 catalog change (#77) left behind — the builder was
+# split and the extraction was not — which is why every check below it failed
+# against a manifest that was in fact correct.
+TENANT="$(fn_body "$MF" 'fn build_posix_manifest_tenant_profile(')"
 SYSTEM="$(fn_body "$MF" 'pub fn build_posix_manifest(')"
 
 # ── N1. the tenant manifest's network cap, and the rotated pin ────────────
