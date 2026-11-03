@@ -34,6 +34,7 @@
 #include "usage_metering.h" // Multitenant Isolation Gap Analysis §5 item 6 -- SYS_SLS_USAGE_REPORT
 #include "../net/consensus.h" // Multi-Node Partition Scaling Roadmap Phase 7 addendum -- SYS_SLS_CLUSTER_INIT/STATUS
 #include "cap.h"            // Seed Kernel Phase 1 -- SYS_SLS_CAP_* (289-297)
+#include "kernel_io.h"      // kernel_serial_print/printf -- the control-plane refusal lines
 #include "linux_abi.h"      // E7 increment 2 -- the Linux-personality branch (§3.3)
 #include "../arch/x86/user_paging.h"  // E7 §5.3 (the plan's inc 4) -- user_write_fs_base,
                                       // the MSR write of a granted ARCH_SET_FS
@@ -53,28 +54,41 @@ static uint32_t spawn_owner_uid(void) {
     return cur ? cur->owner_uid : 0;
 }
 
-/* ─── Partition-budget authority (POSIX-Environments v0.2 §11 Q4) ──────────
- * ONE rule for every arm here that changes a partition's budget: CPU weight
- * (273), storage quota (275) and connection quota (277). A caller in any
- * partition but PARTITION_SYSTEM is refused BY NAME before the setter runs,
- * so a tenant can neither raise its own ceiling nor lower a neighbour's.
- * Kernel context (no current process) is the control plane's own path — the
- * HTTP routes reach these setters directly — and those routes carry DB_ADMIN
- * instead, the gate their sibling partition routes already had.
+/* ─── Partition control-plane authority (POSIX-Environments v0.2 §11 Q4) ───
+ * ONE rule for every arm here that acts on a partition as a whole rather than
+ * on the caller's own work: the budget setters — frame quota (213), CPU
+ * weight (273), storage quota (275) and connection quota (277) — the
+ * lifecycle operations — destroy (214), pause (215) and resume (216) — and
+ * assign (211), which is here because it can put a caller inside partition 0
+ * (see its own comment). A
+ * caller in any partition but PARTITION_SYSTEM is refused BY NAME before the
+ * action runs, so a tenant can neither raise its own ceiling, lower a
+ * neighbour's, nor freeze, resume or destroy a partition. Kernel context (no
+ * current process) is the control plane's own path — the HTTP routes reach
+ * these operations directly — and those routes carry DB_ADMIN instead, the
+ * gate their sibling partition routes already had.
  *
- * The first of the three to get this check was 277 (§11 Q4's connection
- * quota, whose default would have been decorative without it); the same
- * absence on 273/275 was recorded as the same class of finding, and this
- * helper is that class closed once rather than three copies drifting apart.
+ * The rule arrived one finding at a time: 277 shipped with no caller check at
+ * all, which made §11 Q4's new default decorative; 273/275 had the same
+ * absence; 213 and 214-216 had it again. Each increment named the remainder
+ * rather than fixing it, and three names for one rule is how copies drift
+ * apart — a ninth partition-wide operation has one obvious place to join.
+ *
+ * PARTITION_SYSTEM and PARTITION_DEFAULT are both 0, so this reads "partition
+ * 0 may", not "uid 0 may": a process whose uid was never assigned resolves to
+ * partition 0 (partition_get_for_uid()) and passes. That is the kernel's own
+ * resolution rather than a hole in it — a tenant's processes are placed by
+ * the env manager's assignment, so an unassigned uid is the system
+ * partition's default path, not a tenant that lost its row.
  * Returns 1 when the caller may proceed. */
-static int partition_budget_may_change(const char* tag, const char* what) {
+static int partition_control_may_act(const char* tag, const char* what) {
     struct ProcessDescriptor* caller = process_find_current();
     if (!caller) return 1;
     if (caller->partition_id != PARTITION_SYSTEM) {
         kernel_serial_printf(
-            "[%s] %s refused: pid=%u (partition %u) may not change a "
-            "partition budget — only PARTITION_SYSTEM may\n",
-            tag, what, (unsigned)caller->pid, (unsigned)caller->partition_id);
+            "[%s] refused: pid=%u (partition %u) may not %s — only "
+            "PARTITION_SYSTEM may\n",
+            tag, (unsigned)caller->pid, (unsigned)caller->partition_id, what);
         return 0;
     }
     return 1;
@@ -1122,12 +1136,26 @@ uint64_t do_syscall(uint64_t num, void* arg) {
     case SYS_SLS_PARTITION_CREATE:
         return sys_sls_partition_create((struct SLSPartitionCreateRequest*)arg);
     case SYS_SLS_PARTITION_ASSIGN:
+        // Not in the lifecycle group below, but the same rule and the reason
+        // the four gates beside it hold: partition_assign_uid() accepts any
+        // non-zero uid for any valid partition, and partition 0 IS
+        // PARTITION_SYSTEM, so an ungated assign is a way into the gate —
+        // assign a uid you control to partition 0, spawn, and the caller
+        // check on the other arms reads "system". Gating the operations
+        // while leaving this arm open would be a gate with a door in it.
+        if (!partition_control_may_act("PARTITION", "assign a uid to a partition"))
+            return (uint64_t)(int64_t)CAP_EPERM;
         return sys_sls_partition_assign((struct SLSPartitionAssignRequest*)arg);
     case SYS_SLS_PARTITION_LIST:
         sys_sls_partition_list(); return 0;
 
     // ── Phase 13: LPAR physical memory quotas (213) ─────────────────────────
+    // §11 Q4's authority rule (partition_control_may_act() above): the frame
+    // quota is this partition's share of RAM, so a tenant raising its own is
+    // the same starvation the connection quota's default exists to prevent.
     case SYS_SLS_PARTITION_QUOTA_SET:
+        if (!partition_control_may_act("FRAME-QUOTA", "change a frame quota"))
+            return (uint64_t)(int64_t)CAP_EPERM;
         return sys_sls_partition_quota_set((struct SLSPartitionQuotaSetRequest*)arg);
 
     // ── Gap Remediation Phase F: sys_sls_partition_quota_list() was fully
@@ -1137,11 +1165,24 @@ uint64_t do_syscall(uint64_t num, void* arg) {
         sys_sls_partition_quota_list(); return 0;
 
     // ── Phase 14: LPAR partition lifecycle (214-216) ────────────────────────
+    // The same rule on the operations that act on a partition's existence and
+    // schedule: a tenant that could destroy, pause or resume a neighbour
+    // would own it without ever being granted its resources. Refused before
+    // the operation, so a denied caller never reaches the process kill the
+    // destroy path starts with. partition_destroy() still refuses
+    // PARTITION_SYSTEM on its own; that is a different guard (the target), not
+    // this one (the caller).
     case SYS_SLS_PARTITION_DESTROY:
+        if (!partition_control_may_act("PARTITION", "destroy a partition"))
+            return (uint64_t)(int64_t)CAP_EPERM;
         return sys_sls_partition_destroy((uint32_t)(uintptr_t)arg);
     case SYS_SLS_PARTITION_PAUSE:
+        if (!partition_control_may_act("PARTITION", "pause a partition"))
+            return (uint64_t)(int64_t)CAP_EPERM;
         return sys_sls_partition_pause((uint32_t)(uintptr_t)arg);
     case SYS_SLS_PARTITION_RESUME:
+        if (!partition_control_may_act("PARTITION", "resume a partition"))
+            return (uint64_t)(int64_t)CAP_EPERM;
         return sys_sls_partition_resume((uint32_t)(uintptr_t)arg);
 
     // ── Multi-Node Partition Scaling Roadmap, Phase 6: cold migration (218) ──
@@ -1342,10 +1383,10 @@ uint64_t do_syscall(uint64_t num, void* arg) {
         sys_sls_usage_report(); return 0;
 
     // ─── Multitenant Isolation Gap Analysis §5 item 8 / §7 item 8 (273-274) ──
-    // §11 Q4's authority rule (see partition_budget_may_change() above): a
+    // §11 Q4's authority rule (see partition_control_may_act() above): a
     // tenant may not retune its own or a neighbour's CPU weight.
     case SYS_SLS_PARTITION_CPU_WEIGHT_SET:
-        if (!partition_budget_may_change("SCHED", "a CPU weight"))
+        if (!partition_control_may_act("SCHED", "change a CPU weight"))
             return (uint64_t)(int64_t)CAP_EPERM;
         return sys_sls_partition_cpu_weight_set((struct SLSPartitionCpuWeightSetRequest*)arg);
     case SYS_SLS_PARTITION_CPU_WEIGHT_LIST:
@@ -1356,7 +1397,7 @@ uint64_t do_syscall(uint64_t num, void* arg) {
     // control plane's decision, and a tenant zeroing its OWN quota would be
     // a self-inflicted denial it could then blame on the store.
     case SYS_SLS_PARTITION_STORAGE_QUOTA_SET:
-        if (!partition_budget_may_change("STORAGE-QUOTA", "a storage quota"))
+        if (!partition_control_may_act("STORAGE-QUOTA", "change a storage quota"))
             return (uint64_t)(int64_t)CAP_EPERM;
         return sys_sls_partition_storage_quota_set((struct SLSPartitionStorageQuotaSetRequest*)arg);
     case SYS_SLS_PARTITION_STORAGE_QUOTA_LIST:
@@ -1370,7 +1411,7 @@ uint64_t do_syscall(uint64_t num, void* arg) {
     // system shell, the control plane); kernel context has no current process
     // and is the HTTP route's own path, which requires DB_ADMIN above this.
     case SYS_SLS_PARTITION_CONN_QUOTA_SET:
-        if (!partition_budget_may_change("TCP-QUOTA", "a connection quota"))
+        if (!partition_control_may_act("TCP-QUOTA", "change a connection quota"))
             return (uint64_t)(int64_t)CAP_EPERM;
         return sys_sls_partition_conn_quota_set((struct SLSPartitionConnQuotaSetRequest*)arg);
     case SYS_SLS_PARTITION_CONN_QUOTA_LIST:

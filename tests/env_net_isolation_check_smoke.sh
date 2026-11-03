@@ -61,7 +61,20 @@
 #                              reopened one setter at a time, N19.
 #   P2_TOOTH=no-cpuweight-role / no-storage-role — the matching HTTP routes
 #                              stop requiring DB_ADMIN, N19.
-#   plus one tooth per clause — every other clause N1-N19 reddens when the
+#   P2_TOOTH=ungated-frame-quota / ungated-assign / ungated-destroy /
+#            ungated-pause / ungated-resume — the partition-wide arms (213,
+#                              211, 214, 215, 216) stop asking the same
+#                              authority helper; N20 names the arm that lost
+#                              it. One per arm, because a class that can be
+#                              reopened one operation at a time is not gated.
+#   P2_TOOTH=no-frame-quota-role / no-assign-role / no-destroy-role /
+#            no-pause-role — the matching HTTP routes stop requiring DB_ADMIN,
+#                              N20. Pause and resume share one handler, so its
+#                              gate has one tooth covering both routes — there
+#                              is no second copy of the gate to remove, and a
+#                              tooth that claimed to remove one would be
+#                              asserting against nothing.
+#   plus one tooth per clause — every other clause N1-N20 reddens when the
 #                              single property it carries is removed.
 #
 # ─── What a teeth smoke is for ─────────────────────────────────────────────
@@ -100,7 +113,10 @@ case "$TOOTH_SET" in
     no-bind-port|descriptor-conn-id|no-quota-surface|no-quota|\
     no-ci-live|no-ci-order|no-birth-default|no-restore-default|\
     no-birth-line|ungated-quota-set|no-quota-role|ungated-cpu-weight|\
-    ungated-storage-quota|no-cpuweight-role|no-storage-role) ;;
+    ungated-storage-quota|no-cpuweight-role|no-storage-role|\
+    ungated-frame-quota|ungated-assign|ungated-destroy|ungated-pause|\
+    ungated-resume|no-frame-quota-role|no-assign-role|no-destroy-role|\
+    no-pause-role) ;;
     *) echo "ABORT: unknown P2_TOOTH='$TOOTH_SET' — see this file's header for the list" >&2; exit 2 ;;
 esac
 want_tooth() { [ -z "$TOOTH_SET" ] || [ "$TOOTH_SET" = "$1" ]; }
@@ -482,8 +498,8 @@ fi
 if want_tooth ungated-quota-set; then
     seed "$W/uqs"
     replace "$W/uqs/kernel/syscall_dispatch.c" \
-        'caller->partition_id != PARTITION_SYSTEM' \
-        '0   /* the caller check was removed */'
+        'if (!partition_control_may_act("TCP-QUOTA", "change a connection quota"))' \
+        'if (0)   /* the conn-quota arm lost its caller check */'
     tooth ungated-quota-set N19 "the conn-quota arm stops checking the caller's partition" "$W/uqs"
 fi
 
@@ -491,10 +507,17 @@ fi
 # process, so this is the one path the dispatch check cannot cover.
 if want_tooth no-quota-role; then
     seed "$W/nqr"
+    # Anchored to this handler's own signature, the same discipline the
+    # sibling route teeth use: since the lifecycle routes took the same gate,
+    # a bare 'req_role > ROLE_DB_ADMIN' replacement would remove every route's
+    # gate at once and prove nothing about this one. The mutation is the role
+    # parameter itself (this handler carries a comment between its JSONBuf and
+    # its gate, so the gate line is not reachable by a span anchored on the
+    # signature) — the gate cannot be judged if the role never arrives.
     replace "$W/nqr/net/http.c" \
-        'req_role > ROLE_DB_ADMIN' \
-        '0 > 1   /* the role gate was removed */'
-    tooth no-quota-role N19 "the connquota POST stops requiring DB_ADMIN" "$W/nqr"
+$'static int api_partition_connquota_post(const char* body, char* buf, int max,\n                                        SLSRole req_role) {' \
+$'static int api_partition_connquota_post(const char* body, char* buf, int max) {   /* the role never arrives */'
+    tooth no-quota-role N19 "the connquota handler stops taking the resolved role, so it cannot be gated" "$W/nqr"
 fi
 
 # N19. the sibling setters (273 CPU weight, 275 storage quota) stop asking
@@ -503,14 +526,14 @@ fi
 if want_tooth ungated-cpu-weight; then
     seed "$W/ucw"
     replace "$W/ucw/kernel/syscall_dispatch.c" \
-        'if (!partition_budget_may_change("SCHED", "a CPU weight"))' \
+        'if (!partition_control_may_act("SCHED", "change a CPU weight"))' \
         'if (0)   /* the CPU-weight arm lost its caller check */'
     tooth ungated-cpu-weight N19 "the CPU-weight setter stops checking the caller's partition" "$W/ucw"
 fi
 if want_tooth ungated-storage-quota; then
     seed "$W/usq"
     replace "$W/usq/kernel/syscall_dispatch.c" \
-        'if (!partition_budget_may_change("STORAGE-QUOTA", "a storage quota"))' \
+        'if (!partition_control_may_act("STORAGE-QUOTA", "change a storage quota"))' \
         'if (0)   /* the storage-quota arm lost its caller check */'
     tooth ungated-storage-quota N19 "the storage-quota setter stops checking the caller's partition" "$W/usq"
 fi
@@ -531,6 +554,80 @@ if want_tooth no-storage-role; then
 $'static int api_partition_storagequota_post(const char* body, char* buf, int max,\n                                           SLSRole req_role) {\n    JSONBuf j = { buf, 0, max };\n    if (req_role > ROLE_DB_ADMIN) {' \
 $'static int api_partition_storagequota_post(const char* body, char* buf, int max,\n                                           SLSRole req_role) {\n    JSONBuf j = { buf, 0, max };\n    if (0 > 1) {   /* the role gate was removed */'
     tooth no-storage-role N19 "the storage-quota POST stops requiring DB_ADMIN" "$W/nsr"
+fi
+
+# N20. the partition-wide arms (213 frame quota, 211 assign, 214 destroy,
+# 215 pause, 216 resume) stop asking the authority helper. One tooth each: a
+# class that can be reopened one operation at a time without a named red is
+# not closed, and 211's tooth is the one that proves the gate's own door is
+# shut (an ungated assign puts a tenant's uid in partition 0).
+if want_tooth ungated-frame-quota; then
+    seed "$W/ufq"
+    replace "$W/ufq/kernel/syscall_dispatch.c" \
+        'if (!partition_control_may_act("FRAME-QUOTA", "change a frame quota"))' \
+        'if (0)   /* the frame-quota arm lost its caller check */'
+    tooth ungated-frame-quota N20 "the frame-quota arm stops checking the caller's partition" "$W/ufq"
+fi
+if want_tooth ungated-assign; then
+    seed "$W/uas"
+    replace "$W/uas/kernel/syscall_dispatch.c" \
+        'if (!partition_control_may_act("PARTITION", "assign a uid to a partition"))' \
+        'if (0)   /* the assign arm lost its caller check */'
+    tooth ungated-assign N20 "the assign arm stops checking the caller's partition (the gate's door)" "$W/uas"
+fi
+if want_tooth ungated-destroy; then
+    seed "$W/uds"
+    replace "$W/uds/kernel/syscall_dispatch.c" \
+        'if (!partition_control_may_act("PARTITION", "destroy a partition"))' \
+        'if (0)   /* the destroy arm lost its caller check */'
+    tooth ungated-destroy N20 "the destroy arm stops checking the caller's partition" "$W/uds"
+fi
+if want_tooth ungated-pause; then
+    seed "$W/upa"
+    replace "$W/upa/kernel/syscall_dispatch.c" \
+        'if (!partition_control_may_act("PARTITION", "pause a partition"))' \
+        'if (0)   /* the pause arm lost its caller check */'
+    tooth ungated-pause N20 "the pause arm stops checking the caller's partition" "$W/upa"
+fi
+if want_tooth ungated-resume; then
+    seed "$W/ure"
+    replace "$W/ure/kernel/syscall_dispatch.c" \
+        'if (!partition_control_may_act("PARTITION", "resume a partition"))' \
+        'if (0)   /* the resume arm lost its caller check */'
+    tooth ungated-resume N20 "the resume arm stops checking the caller's partition" "$W/ure"
+fi
+
+# N20. the matching routes stop requiring DB_ADMIN, each mutation anchored to
+# its own handler's signature so it cannot redden by removing a neighbour's
+# gate. Pause and resume share api_partition_pause_post(), so one tooth covers
+# both routes: there is no second gate to delete.
+if want_tooth no-frame-quota-role; then
+    seed "$W/nfqr"
+    replace "$W/nfqr/net/http.c" \
+$'static int api_partition_quota_post(const char* body, char* buf, int max,\n                                    SLSRole req_role) {\n    JSONBuf j = { buf, 0, max };\n    if (req_role > ROLE_DB_ADMIN) {' \
+$'static int api_partition_quota_post(const char* body, char* buf, int max,\n                                    SLSRole req_role) {\n    JSONBuf j = { buf, 0, max };\n    if (0 > 1) {   /* the role gate was removed */'
+    tooth no-frame-quota-role N20 "the frame-quota POST stops requiring DB_ADMIN" "$W/nfqr"
+fi
+if want_tooth no-assign-role; then
+    seed "$W/nasr"
+    replace "$W/nasr/net/http.c" \
+$'static int api_partition_assign_post(const char* body, char* buf, int max,\n                                     SLSRole req_role) {\n    JSONBuf j = { buf, 0, max };\n    if (req_role > ROLE_DB_ADMIN) {' \
+$'static int api_partition_assign_post(const char* body, char* buf, int max,\n                                     SLSRole req_role) {\n    JSONBuf j = { buf, 0, max };\n    if (0 > 1) {   /* the role gate was removed */'
+    tooth no-assign-role N20 "the assign POST stops requiring DB_ADMIN" "$W/nasr"
+fi
+if want_tooth no-destroy-role; then
+    seed "$W/ndr"
+    replace "$W/ndr/net/http.c" \
+$'static int api_partition_destroy_post(const char* body, char* buf, int max,\n                                      SLSRole req_role) {\n    JSONBuf j = { buf, 0, max };\n    if (req_role > ROLE_DB_ADMIN) {' \
+$'static int api_partition_destroy_post(const char* body, char* buf, int max,\n                                      SLSRole req_role) {\n    JSONBuf j = { buf, 0, max };\n    if (0 > 1) {   /* the role gate was removed */'
+    tooth no-destroy-role N20 "the destroy POST stops requiring DB_ADMIN" "$W/ndr"
+fi
+if want_tooth no-pause-role; then
+    seed "$W/npr"
+    replace "$W/npr/net/http.c" \
+$'static int api_partition_pause_post(const char* body, char* buf, int max, int resume,\n                                    SLSRole req_role) {\n    JSONBuf j = { buf, 0, max };\n    if (req_role > ROLE_DB_ADMIN) {' \
+$'static int api_partition_pause_post(const char* body, char* buf, int max, int resume,\n                                    SLSRole req_role) {\n    JSONBuf j = { buf, 0, max };\n    if (0 > 1) {   /* the role gate was removed */'
+    tooth no-pause-role N20 "the pause/resume POST stops requiring DB_ADMIN (both routes share this handler)" "$W/npr"
 fi
 
 # ── the vacuity control: the REAL tree must be GREEN ───────────────────────

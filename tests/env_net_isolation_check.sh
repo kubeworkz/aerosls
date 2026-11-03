@@ -92,7 +92,13 @@
 #       quota) all refuse a non-SYSTEM caller by name BEFORE the setter (the
 #       arms had NO check at all), and the three HTTP routes that reach those
 #       setters from kernel context require DB_ADMIN. N19b proves the birth
-#       line on a booted node.
+#       line on a booted node;
+#   N20. the same rule on the partition as a whole: 213 (frame quota), 211
+#       (assign), 214 (destroy), 215 (pause) and 216 (resume) all refuse a
+#       non-SYSTEM caller by name BEFORE the operation, and the five HTTP
+#       routes that reach them from kernel context require DB_ADMIN. 211 is
+#       included because an ungated assign can put a tenant's own uid into
+#       partition 0 — the gate's own door.
 #
 # ─── The live arm (--live) ────────────────────────────────────────────────
 #   L1. the created tenant environment's channel registers under the
@@ -547,17 +553,18 @@ clause "$c18" N18 "a partition is born at the tenant default: applied at the min
 c19=$fail
 # The rule itself, in one place: the helper every arm calls.
 has "$SYSD" 'caller->partition_id != PARTITION_SYSTEM' ||
-    bad "N19. kernel/syscall_dispatch.c: the budget-authority helper no longer checks the caller's partition — a tenant could raise its own ceiling or lower a neighbour's, and §11 Q4's default would be decorative"
-has "$SYSD" 'may not change' ||
-    bad "N19. kernel/syscall_dispatch.c: the refusal is no longer named — a denied operator would see an unexplained CAP_EPERM"
-# All three arms must route through it, and each check must precede its setter.
-for pair in 'SCHED|a CPU weight|sys_sls_partition_cpu_weight_set(' \
-            'STORAGE-QUOTA|a storage quota|sys_sls_partition_storage_quota_set(' \
-            'TCP-QUOTA|a connection quota|sys_sls_partition_conn_quota_set('; do
+    bad "N19. kernel/syscall_dispatch.c: the control-plane helper no longer checks the caller's partition — a tenant could raise its own ceiling or lower a neighbour's, and §11 Q4's default would be decorative"
+has "$SYSD" 'may not %s' ||
+    bad "N19. kernel/syscall_dispatch.c: the refusal is no longer named — the line would not say what the caller was refused, and a denied operator would see only an opaque CAP_EPERM"
+# All three budget arms must route through it, and each check must precede its
+# own setter.
+for pair in 'SCHED|change a CPU weight|sys_sls_partition_cpu_weight_set(' \
+            'STORAGE-QUOTA|change a storage quota|sys_sls_partition_storage_quota_set(' \
+            'TCP-QUOTA|change a connection quota|sys_sls_partition_conn_quota_set('; do
     tag="${pair%%|*}"; rest="${pair#*|}"; what="${rest%%|*}"; setter="${rest#*|}"
-    has "$SYSD" "partition_budget_may_change(\"$tag\", \"$what\")" ||
-        bad "N19. kernel/syscall_dispatch.c: the $tag arm no longer asks the budget-authority helper — that setter is reachable by any ring-3 caller"
-    order_ok "$SYSD" "partition_budget_may_change(\"$tag\"" "$setter" ||
+    has "$SYSD" "partition_control_may_act(\"$tag\", \"$what\")" ||
+        bad "N19. kernel/syscall_dispatch.c: the $tag arm no longer asks the control-plane helper — that setter is reachable by any ring-3 caller"
+    order_ok "$SYSD" "partition_control_may_act(\"$tag\", \"$what\")" "$setter" ||
         bad "N19. kernel/syscall_dispatch.c: the $tag arm's authority check no longer precedes its setter — a refused caller would still change the budget"
 done
 # The control-plane routes: kernel context has no process for the arm above.
@@ -577,6 +584,54 @@ for call in 'api_partition_connquota_post(body_ptr, resp_body, (int)sizeof(resp_
         bad "N19. net/http.c: a policy route does not pass req_role into its handler ($call) — the gate would read a parameter that was never threaded"
 done
 clause "$c19" N19 "only PARTITION_SYSTEM reaches the three budget setters (refused by name, before the table), and their HTTP routes require DB_ADMIN"
+
+# ── N20. the same rule on the partition as a whole — 213 and the lifecycle ──
+# N19 asked who may change a budget. This is the same question for the arms
+# that act on a partition's EXISTENCE and SCHEDULE: the frame quota (213),
+# destroy (214), pause (215) and resume (216). A tenant that could destroy a
+# neighbour would own it without ever being granted its resources; one that
+# could pause it would hold it hostage without breaking into it.
+#
+# 211 (assign) is in this list although it is neither a budget nor a
+# lifecycle operation, because leaving it out would make the other five
+# decorative: partition_assign_uid() accepts any non-zero uid for any valid
+# partition, and partition 0 IS PARTITION_SYSTEM — an ungated assign is a
+# way INTO the gate (assign a uid you control to partition 0, spawn, and the
+# caller check reads "system"). The clause therefore covers the operations
+# this increment was scoped to plus the door beside them.
+c20=$fail
+for pair in 'FRAME-QUOTA|change a frame quota|sys_sls_partition_quota_set(' \
+            'PARTITION|destroy a partition|sys_sls_partition_destroy(' \
+            'PARTITION|pause a partition|sys_sls_partition_pause(' \
+            'PARTITION|resume a partition|sys_sls_partition_resume(' \
+            'PARTITION|assign a uid to a partition|sys_sls_partition_assign('; do
+    tag="${pair%%|*}"; rest="${pair#*|}"; what="${rest%%|*}"; op="${rest#*|}"
+    has "$SYSD" "partition_control_may_act(\"$tag\", \"$what\")" ||
+        bad "N20. kernel/syscall_dispatch.c: the $what arm no longer asks the control-plane helper — any ring-3 caller could $what on a partition that is not theirs"
+    order_ok "$SYSD" "partition_control_may_act(\"$tag\", \"$what\")" "$op" ||
+        bad "N20. kernel/syscall_dispatch.c: the '$what' authority check no longer precedes the operation — a refused caller would still reach it"
+done
+# The five routes that reach these operations from kernel context, where the
+# dispatcher's check has no caller to inspect.
+for h in 'static int api_partition_quota_post(' \
+         'static int api_partition_destroy_post(' \
+         'static int api_partition_pause_post(' \
+         'static int api_partition_assign_post('; do
+    body="$(fn_body "$HTTP" "$h")"
+    hasstr "$body" 'req_role > ROLE_DB_ADMIN' ||
+        bad "N20. net/http.c: $h no longer requires DB_ADMIN — a tenant holding a token below it could act on another partition's lifecycle"
+    hasstr "$body" 'SLSRole req_role' ||
+        bad "N20. net/http.c: $h no longer takes the resolved role, so it cannot be gated"
+done
+for call in 'api_partition_quota_post(body_ptr, resp_body, (int)sizeof(resp_body), req_role)' \
+            'api_partition_destroy_post(body_ptr, resp_body, (int)sizeof(resp_body), req_role)' \
+            'api_partition_assign_post(body_ptr, resp_body, (int)sizeof(resp_body), req_role)' \
+            'api_partition_pause_post(body_ptr, resp_body, (int)sizeof(resp_body), 0, req_role)' \
+            'api_partition_pause_post(body_ptr, resp_body, (int)sizeof(resp_body), 1, req_role)'; do
+    has "$HTTP" "$call" ||
+        bad "N20. net/http.c: a partition-lifecycle route does not pass req_role into its handler ($call) — the gate would read a parameter that was never threaded"
+done
+clause "$c20" N20 "only PARTITION_SYSTEM reaches the frame quota, assign, destroy, pause and resume (refused by name, before the operation), and their HTTP routes require DB_ADMIN"
 
 # ── the live arm ──────────────────────────────────────────────────────────
 if [ "$LIVE" -eq 1 ]; then
