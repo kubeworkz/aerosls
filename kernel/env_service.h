@@ -18,8 +18,14 @@
  * asks env_service_reply_slot() and skips the env channel's CHAN_R. */
 
 /* cap.c calls this when it wires the "kernel.env.control" channel: the kernel
- * (pid 0) CHAN_R (init's replies arrive here) and CHAN_W (requests go to init). */
-void env_service_register(uint16_t kernel_chan_r, uint16_t kernel_chan_w);
+ * (pid 0) CHAN_R (init's replies arrive here) and CHAN_W (requests go to init).
+ * `manager_pid` is the process owning the far end — init's env manager. The
+ * round trip's bound is a quiet window that restarts on that process's
+ * switch-ins (process.h's `switches`), so the wait can tell a slow manager
+ * from a wedged one; a caller with no process to name may pass 0, and the
+ * wait then falls back to the window's fixed length. */
+void env_service_register(uint16_t kernel_chan_r, uint16_t kernel_chan_w,
+                          uint32_t manager_pid);
 
 /* 1 if `slot` is the env-control reply CHAN_R in the pid-0 cap table, so
  * console_service_tick() leaves init's ENV replies for env_service_create(). */
@@ -28,7 +34,8 @@ int env_service_reply_slot(uint16_t slot);
 /* Create an environment with `index` in `partition` by round-tripping
  * ENV_CREATE to init. On a reply, returns 0 and sets *out_status (ENV_OK or an
  * ENV_ERR_* from env_proto.h) and, on ENV_OK, *out_env_id. Returns -1 if the
- * channel is not wired or init did not reply before the deadline. */
+ * channel is not wired or init did not reply before the wait's bound — the
+ * quiet window with no manager switch-in, or the absolute ceiling. */
 int env_service_create(uint32_t partition, uint32_t index,
                        uint16_t* out_status, uint32_t* out_env_id);
 

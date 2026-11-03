@@ -173,7 +173,7 @@ __attribute__((weak)) uint64_t frame_pool_free_count(void) {
  * links, so these weak inert stubs close the link: register is a no-op (no env
  * service in host context) and reply_slot returns 0 (no slot is the env reply
  * slot, so the console tick drains every slot exactly as before E4). */
-__attribute__((weak)) void env_service_register(uint16_t kernel_chan_r, uint16_t kernel_chan_w) { (void)kernel_chan_r; (void)kernel_chan_w; }
+__attribute__((weak)) void env_service_register(uint16_t kernel_chan_r, uint16_t kernel_chan_w, uint32_t manager_pid) { (void)kernel_chan_r; (void)kernel_chan_w; (void)manager_pid; }
 __attribute__((weak)) int env_service_reply_slot(uint16_t slot) { (void)slot; return 0; }
 
 /* ─── POSIX-Environments E6: per-environment consoles ───────────────────────

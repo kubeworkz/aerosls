@@ -4298,7 +4298,9 @@ int cap_create_sidecar_in_personality(uint32_t parent_pid,
                  * plane can round-trip ENV_CREATE to init's env manager, and so
                  * console_service leaves init's ENV replies for it (not serial). */
                 if (sidecar_prefix(sc->peer_name, "kernel.env.control")) {
-                    env_service_register(k_rd, k_wr);
+                    /* `pd` owns the far end: its switch-ins are the round
+                     * trip's progress signal (env_service.h). */
+                    env_service_register(k_rd, k_wr, pd->pid);
                 }
                 /* POSIX-Environments E6: this is a tenant POSIX environment's
                  * console, not the shared kernel one. Register the kernel ends

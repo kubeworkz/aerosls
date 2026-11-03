@@ -44,6 +44,10 @@ __attribute__((weak)) int env_payload_wait_parked(const struct EnvCkptRecord* re
     return 1;
 }
 
+/* E7 increment 22: the restore pass selects the replay's tooth before it runs.
+ * A host test that does not link env_payload.c has no arms to select. */
+__attribute__((weak)) void env_payload_set_tooth(int tooth) { (void)tooth; }
+
 __attribute__((weak)) int env_payload_restore(uint32_t partition, uint32_t index,
                                               uint32_t new_env_id, uint64_t want_seq,
                                               uint32_t* out_pages, uint32_t* out_console) {
