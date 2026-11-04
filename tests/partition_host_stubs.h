@@ -59,6 +59,17 @@ __attribute__((weak)) int partition_resume(uint32_t partition_id) {
     return 0;
 }
 
+/* Persist's restore re-bound (POSIX-Environments v0.2 §11 Q4). The partition
+ * rows read back from the snapshot bypassed partition_create(), so
+ * persist_restore_all() re-applies the tenant connection default through this
+ * call — otherwise a partition that survived a reboot would come back with no
+ * ceiling while a freshly minted one is born bounded. In a host world the
+ * table above IS the partition model and there is no connection quota to
+ * re-bound, so the stand-in touches nothing: the same answer a boot with no
+ * tenant partitions would give. Weak like the rest — a test that links the
+ * real kernel/partition.c keeps the real re-bound. */
+__attribute__((weak)) void partition_apply_conn_quota_defaults(void) { }
+
 /* Test-side conveniences. Weak like everything else so a test is free to
  * replace them, even though in practice only the tests below call them. */
 

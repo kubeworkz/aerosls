@@ -30,6 +30,7 @@
  */
 #include "kernel/cap.h"
 #include "tests/process_host_stubs.h"
+#include "tests/env_ckpt_host_stubs.h"    /* cap.c stamps Linux children into the record layer */
 
 #include <stdio.h>
 #include <string.h>

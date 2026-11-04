@@ -41,6 +41,7 @@
  */
 #include "kernel/cap.h"
 #include "tests/process_host_stubs.h"   /* stack_bottom/stack_top (frame_pool_init reservation bounds) */
+#include "tests/env_ckpt_host_stubs.h"    /* cap.c stamps Linux children into the record layer */
 
 #include <stdio.h>
 #include <string.h>
