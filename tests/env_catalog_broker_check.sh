@@ -335,7 +335,14 @@ clause "$c7" B2 "the host test links the real service, pins the indistinguishabl
 # granted), and the SYSTEM profile stays without one — only the tenant
 # profile was to change, same reason as env_net_isolation's N2.
 c8=$fail
-TENANT="$(fn_body "$MAN" 'pub fn build_posix_manifest_tenant(')"
+# The caps live in the shared profile builder, not in the two thin wrappers
+# that select it: `build_posix_manifest_tenant()` and
+# `build_posix_manifest_tenant_gate()` differ only in the gate flag they pass,
+# so reading either wrapper finds a six-line body and no caps at all. This is
+# the same line main's §9.1 catalog change (#77) left behind — the builder was
+# split and this extraction was not — which is why all three C1 checks below
+# failed against a manifest that was in fact correct.
+TENANT="$(fn_body "$MAN" 'fn build_posix_manifest_tenant_profile(')"
 SYSTEMMF="$(fn_body "$MAN" 'pub fn build_posix_manifest(')"
 if [ -z "$TENANT" ] || [ -z "$SYSTEMMF" ]; then
     bad "C1. posix_manifest.rs: a profile builder is gone — the boundary cannot be evaluated"

@@ -122,9 +122,10 @@ static void uart_queue(const char* s) {
  * uses it. This is how "was the byte echoed to the operator" is asserted —
  * echo is the operator's only feedback about which keystrokes were
  * accepted, so bytes discarded silently must not echo either. */
-static char     g_cap[8192];   /* must hold a whole window's replayed batch:
-                                 * the defer buffer is 2 KiB (test 7 asserts the
-                                 * overflow report lands after all of it) */
+/* Must hold a whole window's replayed batch PLUS the overflow report: sized off
+ * the real bound (kernel_io.h) so raising the ring cannot silently truncate the
+ * very replay this test reads. */
+static char     g_cap[SERIAL_LB_DEFER_CAP + 256];
 static void     cap_start(void) { kernel_serial_capture_start(g_cap, sizeof g_cap); }
 static void     cap_stop_expect(const char* expect, const char* msg) {
     size_t n = kernel_serial_capture_stop();
@@ -278,30 +279,34 @@ int main(void) {
     /* ═══ 7: the defer buffer is bounded, and says so ═══════════════════ */
     /* A writer that exceeds the window's buffer must not grow kernel .bss
      * without limit, and must not lose bytes SILENTLY — the overflow count is
-     * reported on the way out, where a boot log can see it. */
+     * reported on the way out, where a boot log can see it. Sized off the REAL
+     * bound: a copy of the old 2048 would have written less than the ring holds
+     * and passed a test of nothing. */
     printf("\n-- 7: an overflowing window is bounded and reported --\n");
     {
-        char big[2100];
+        enum { EXCESS = 63 };
+        static char big[SERIAL_LB_DEFER_CAP + EXCESS + 1];
         memset(big, 'A', sizeof big - 1);
         big[sizeof big - 1] = '\0';
         uart_reset();
         g_mcr_loopback = 1;
         CHECK(serial_console_poll(out, sizeof(out)) == 0, "ownership taken");
         cap_start();
-        kernel_serial_print(big);          /* 2099 bytes into a 2048-byte window */
+        kernel_serial_print(big);          /* CAP+63 bytes into a CAP-byte window */
         CHECK(kernel_serial_capture_stop() == 0, "still nothing on the wire");
         g_mcr_loopback = 0;
         cap_start();
         CHECK(serial_console_poll(out, sizeof(out)) == 0, "release poll");
         size_t n = kernel_serial_capture_stop();
-        CHECK(n > 2048,
-              "*** the 2048 deferred bytes are replayed, plus the overflow report ***");
-        CHECK(strncmp(g_cap, big, 2048) == 0,
+        CHECK(n > SERIAL_LB_DEFER_CAP,
+              "*** the whole deferred batch is replayed, plus the overflow report ***");
+        CHECK(strncmp(g_cap, big, SERIAL_LB_DEFER_CAP) == 0,
               "*** in order, capped at the buffer size (nothing beyond it) ***");
         CHECK(strstr(g_cap, "overflow") != NULL,
               "*** and the loss is STATED, not silent ***");
-        CHECK(strstr(g_cap, "0x0000000000000033") != NULL,
-              "*** with the exact number of bytes it could not hold (51) ***");
+        /* 63 = 0x3f, padded to the 16 hex digits print_hex64 emits. */
+        CHECK(strstr(g_cap, "0x000000000000003f") != NULL,
+              "*** with the exact number of bytes it could not hold (63) ***");
     }
 
     printf("\n=== %d passed, %d failed ===\n", checks_passed, checks_failed);

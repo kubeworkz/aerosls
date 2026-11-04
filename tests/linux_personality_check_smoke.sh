@@ -58,11 +58,54 @@ FILES=(
     tests/fpu_enable_host_test.c
     # R (the signal seam) reads the plan's host test, same rule.
     tests/linux_personality_host_test.c
+    # W (increment 20) reads the capture, the record, the task's name on the
+    # wire, the manager that names it, and both host tests that drive them —
+    # same rule as O8/Q/R above, and the reason the coverage check below now
+    # exists: these eight were added to the guard in #77 and not to this
+    # list, so W1–W6 failed on the copy while passing on the real tree.
+    kernel/env_payload.h
+    kernel/env_payload.c
+    kernel/env_ckpt.h
+    kernel/env_ckpt.c
+    user/proto/src/env_proto.rs
+    user/init/src/env_manager.rs
+    tests/env_payload_host_test.c
+    tests/env_ckpt_host_test.c
 )
 
 for f in "${FILES[@]}" "$GUARD"; do
     [ -f "$f" ] || { echo "ABORT: $f missing." >&2; exit 2; }
 done
+
+# ─── The seed covers every file the GUARD reads ────────────────────────────
+# A seeded copy is only faithful if it carries the inputs every clause reads,
+# and this list is maintained by hand while the guard's reads are not: W1–W6
+# went into the guard in #77 and not into FILES, so all six ran against a copy
+# with the file absent. grep on a missing file is a non-zero exit, so six
+# clauses failed on the COPY while passing on the real tree, and the baseline
+# aborted with the reason truncated to its first five lines. The guard
+# declares every file it reads as a plain `NAME=path` line at the head of its
+# section (ROOT is the sole assignment that is not a path), so the seed can be
+# held to that declaration instead of to a second hand-kept list. A read added
+# to the guard without a line above now fails BY NAME, before any tooth runs.
+unseeded=""
+seeded=" ${FILES[*]} "
+for p in $(grep -E '^[A-Z][A-Z0-9_]*=[a-z]' "$GUARD" | cut -d= -f2); do
+    # A case glob over the joined list, for the same pipefail reason as
+    # tooth() below: `printf | grep -q` can take SIGPIPE and report a seeded
+    # path as unseeded, which would abort this smoke for the wrong cause.
+    case "$seeded" in
+        *" $p "*) ;;
+        *) unseeded="$unseeded $p" ;;
+    esac
+done
+if [ -n "$unseeded" ]; then
+    echo "ABORT: the seed does not carry every file the guard reads:$unseeded" >&2
+    echo "       Add them to FILES above: a clause whose input the copy lacks" >&2
+    echo "       fails on the copy and passes on the real tree — which is how" >&2
+    echo "       W1–W6 went unnoticed until CI ran this smoke." >&2
+    exit 2
+fi
 
 W="$(mktemp -d)" || { echo "ABORT: mktemp failed." >&2; exit 2; }
 cleanup() { rm -rf "$W"; return 0; }
@@ -88,9 +131,20 @@ fail=0
 # stays green under its own mutation is the vacuous pass this file exists to
 # refuse.
 tooth() {
-    local name="$1" clause="$2" desc="$3" d="$4" out rc
+    local name="$1" clause="$2" desc="$3" d="$4" out rc named=0
     out="$(run_guard "$d")"; rc=$?
-    if [ "$rc" -eq 1 ] && printf '%s\n' "$out" | grep -q "FAIL: $clause\."; then
+    # The verdict is a CASE, not `printf | grep -q`. This file runs under
+    # `set -o pipefail`, and grep -q exits at its FIRST match, so the printf
+    # feeding it can take SIGPIPE and the pipeline reports 141 — the tooth is
+    # then scored un-bitten although the guard named the clause. It is not
+    # theoretical: a full runner pass reported capture-removed (C) and
+    # fd-copy-user-check-gone (M4) as "rc=1, clause named 1 time(s)" and
+    # failed them, while both passed when run alone. A case glob reads the
+    # text bash already holds, so there is no writer to kill.
+    case "$out" in
+        *"FAIL: $clause."*) named=1 ;;
+    esac
+    if [ "$rc" -eq 1 ] && [ "$named" -eq 1 ]; then
         echo "TOOTH OK   $name — guard exited 1 naming $clause"
         pass=$((pass+1))
     else
@@ -219,8 +273,15 @@ tooth echo-check-dropped J2 "the num-echo refusal is gone from apply_reply" "$W/
 
 # K: the service call unhooked — requests stay queued while their task
 # parks forever, and the wait set never learns to wake the sidecar.
+#
+# The call gained a third argument (the VFS the file class needs) after this
+# tooth was written, so its pattern matched nothing and the sed was a no-op:
+# a mutation that never happened reads exactly like one that happened and
+# was caught, and only this tooth's own verdict distinguishes them. It and
+# three others (M6, O7, T5) had gone stale this way against the current
+# sources, unseen because the baseline aborted before any tooth could run.
 seed "$W/t14"
-sed -i 's/crate::linux::service(\&RealKernel, \&booted\.console);//' "$W/t14/user/sidecar/src/entry.rs"
+sed -i 's/crate::linux::service(\&RealKernel, \&booted\.console, \&mut booted\.proc\.vfs);//' "$W/t14/user/sidecar/src/entry.rs"
 tooth service-unhooked K "the entry loop no longer services the Linux children" "$W/t14"
 
 # K1: the default arm becomes a silent success — §11 Q5's forbidden answer
@@ -340,8 +401,12 @@ tooth fd-ebadf-drifted M5 "the sidecar's E_BADF no longer pins CAP_EBADF (-2)" "
 # M6: the payload invariant neutralised — bytes that are not the ones the
 # task wrote (or a count that disagrees with the header) would be performed
 # on the console without a check.
+#
+# The single `!= expected` test became the range arm (a path number carries
+# two strings' bytes, so the bound is lo..hi); this mutation dead-codes THAT
+# check, which is the same "cannot happen" edit the tooth has always made.
 seed "$W/t31"
-sed -i 's/if rr.len != expected {/if false {/' "$W/t31/user/sidecar/src/linux.rs"
+sed -i 's/if rr.len < lo || rr.len > hi {/if false {/' "$W/t31/user/sidecar/src/linux.rs"
 tooth fd-payload-check-off M6 "the request-length invariant is dead-coded" "$W/t31"
 
 # ─── Increment-6 teeth (the mem class: the budget span, the W^X refusal) ──
@@ -489,8 +554,12 @@ tooth argenv-parse-loosened O6 "the ARGENV parse no longer refuses trailing byte
 # t51 (O7): the firstuser's record dropped — the designated first user
 # (the only child that READS its environment) would cross with none, and
 # the boot would read green because argc is still { name } either way.
+#
+# The firstuser's argv moved from the literal { USER_NAME } to the gate's own
+# command line, so the mutation follows `argv`: what the tooth breaks is the
+# record crossing, not any one spelling of who the first user is.
 seed "$W/t51"
-sed -i 's/argenv: Some(ArgEnv::new(\&\[USER_NAME\], LINUX_DEFAULT_ENV)),/argenv: None,/' "$W/t51/user/sidecar/src/e7_firstuser.rs"
+sed -i 's/argenv: Some(ArgEnv::new(argv, LINUX_DEFAULT_ENV)),/argenv: None,/' "$W/t51/user/sidecar/src/e7_firstuser.rs"
 tooth firstuser-argenv-gone O7 "the firstuser no longer crosses the ARGENV record" "$W/t51"
 
 # t52 (O7): the shared default-environment list renamed out from under
@@ -717,8 +786,12 @@ tooth copyin-writable-check-gone T4 "the copy-IN writes wherever the chain is pr
 # t96: the sidecar's bound inverted — ReplyBytes would send whatever it
 # likes, and only the kernel's staged clamp would still be holding the
 # line (one end load-bearing, which is exactly what T5 forbids).
+#
+# The sidecar's two conditions became one predicate (payload_bound, the
+# per-number clamp) plus the byte-availability test; the mutation disables
+# that pair, which is the same "send whatever was staged" defect.
 seed "$W/t96"
-sed -i 's/if args\[2\] == 0 || len != want || len > bytes.len() {/if false {/' "$W/t96/user/sidecar/src/linux.rs"
+sed -i 's/if !payload_bound(num, &args, len) || len > bytes.len() {/if false {/' "$W/t96/user/sidecar/src/linux.rs"
 tooth reply-bytes-unbounded T5 "the sidecar sends a payload no out-pointer asked for (or the wrong size)" "$W/t96"
 
 # t97: the payload never sent — an arm answers ReplyBytes and service

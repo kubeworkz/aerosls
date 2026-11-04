@@ -69,11 +69,29 @@
  * (its channel registration carries it) and calls the partition form, so
  * no uid is invented for a tenant that has none.
  *
- * ─── Why 0 = unlimited by default ──────────────────────────────────────
- * Same convention as storage_quota.h/frame_pool.c/http_rate_limit.h's own
- * BSS-zero-safe posture: every partition starts unrestricted (today's
- * existing behavior, unchanged until an operator explicitly opts a
- * partition into a cap), and a fresh boot needs no explicit init step.
+ * ─── 0 = unlimited, but 0 is no longer where a partition BEGINS ────────
+ * The mechanism started with the same BSS-zero-safe posture as
+ * storage_quota.h/frame_pool.c/http_rate_limit.h: every partition
+ * unrestricted until an operator opts it into a cap. P2's own guard then
+ * measured what that meant in practice -- `env create` never set one, so a
+ * fresh environment was born with NO ceiling, which is the starvation case
+ * the mechanism exists to close, left open by default. Roadmap v0.2 §11 Q4
+ * asked for the number; kernel/partition.h now carries it
+ * (PARTITION_TENANT_CONN_QUOTA_DEFAULT, with the arithmetic against
+ * TCP_INBOUND_MAX_CONNS and §8's four-environment ceiling) and a partition
+ * is BORN at it -- at partition_create() and again on the restore path that
+ * bypasses partition_create(). 0 still means "explicitly unlimited" and the
+ * admittance rule is unchanged; only the starting value moved.
+ *
+ * ─── Who may change a quota (v0.2 §11 Q4) ──────────────────────────────
+ * Syscall 277 is PARTITION_SYSTEM-only: the dispatch layer refuses a caller in
+ * any other partition by name, so a tenant cannot raise its own ceiling or
+ * lower a neighbour's (the arm previously had no authority check at all -- a
+ * gap this default would have made pointless to set). Kernel context, where
+ * no process is current, is the control-plane path. The HTTP surface
+ * (POST /api/partition/connquota) requires DB_ADMIN or higher, the same gate
+ * every other partition-policy route already carries. The operator shell runs
+ * in PARTITION_SYSTEM, so it is unaffected.
  */
 
 // Sentinel meaning "this inbound conn_id slot has not been attributed to
@@ -133,9 +151,20 @@ int tcp_conn_attribute(int conn_id, uint32_t uid);
 // releases here too).
 void tcp_conn_release(int conn_id);
 
+// Applies PARTITION_TENANT_CONN_QUOTA_DEFAULT to a partition that has just
+// come into existence. Called by kernel/partition.c at the mint
+// (partition_create()) and by partition_apply_conn_quota_defaults() over the
+// restored table, never by a create caller, and never for PARTITION_SYSTEM
+// (the control plane stays unlimited). Prints the birth line the guards read:
+// `[TCP-QUOTA] partition N: born bounded at 96 (tenant default; 0 = explicitly
+// unlimited)`. A no-op for PARTITION_SYSTEM and for an out-of-range id.
+void tcp_partition_born_bounded(uint32_t partition_id);
+
 // Sets partition_id's concurrent inbound connection quota. 0 = unlimited
-// (the default for every partition until this is called). Returns 0 on
-// success, 1 if partition_id is out of range ([0, PARTITION_MAX)).
+// (the operator's explicit choice; a partition begins at the tenant default
+// above, not at 0). Returns 0 on success, 1 if partition_id is out of range
+// ([0, PARTITION_MAX)). PARTITION_SYSTEM-only at the syscall boundary -- see
+// this header's "Who may change a quota" block.
 int tcp_partition_set_conn_quota(uint32_t partition_id, uint16_t quota);
 
 // Introspection. Both return 0xFFFF for an out-of-range partition_id,
