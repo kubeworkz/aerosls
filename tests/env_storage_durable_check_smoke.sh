@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # tests/env_storage_durable_check_smoke.sh — the TEETH for
 # tests/env_storage_durable_check.sh: the four teeth v0.2 §5 names, plus the
-# stale-region-base tooth the live env_migrate_confirm failure earned:
+# stale-region-base tooth the live env_migrate_confirm failure earned and the
+# slow-read tooth that pins the read path's device-request budget:
 #
 #   P1B_TOOTH=ram-backed          — the store loses its extent (durable flag
 #                                   off) but keeps its directory entry
@@ -19,6 +20,10 @@
 #                                   after the array read, or the clear
 #                                   inside it) — the live REFUSE_PARKED
 #                                   restore-denial loop's exact shape
+#   P1B_TOOTH=slow-read           — the read phase records 3,000 handoffs
+#                                   against its 600 budget (the bytes are
+#                                   untouched): the run-read path regressed
+#                                   to one request per block
 #
 # ─── What a teeth smoke is for, and why this one is source-level ──────────
 # A guard that has never been seen to fail is a guard nobody can trust. Each
@@ -46,9 +51,9 @@
 #     artifact set shaped exactly like what a live run records (identity,
 #     boot1/boot2 serial slices, the two console fingerprints, the four
 #     quota numbers, the refusal's own serial slice). The ram-backed,
-#     unquotaed and format-v1-only teeth each get a replay fixture with
-#     exactly one shape of damage, so D2c/D3/D4/D5 are each proven to bite
-#     without a boot. bad-format-version is source-only by nature: its
+#     unquotaed, format-v1-only and slow-read teeth each get a replay fixture
+#     with exactly one shape of damage, so D2c/D3/D4/D5 are each proven to
+#     bite without a boot. bad-format-version is source-only by nature: its
 #     mutation lives in the mount's source, not in any recorded artifact.
 #
 # The hermetic seam for the source half is the guard's own optional root
@@ -64,7 +69,7 @@
 #
 # Usage:  bash tests/env_storage_durable_check_smoke.sh [P1B_TOOTH=<name>]
 #         P1B_TOOTH=<name> bash tests/env_storage_durable_check_smoke.sh
-#         (default: all five groups, in the order above)
+#         (default: all six groups, in the order above)
 #
 # Exit: 0 every tooth bit, 1 a tooth did not, 2 misuse/precondition missing.
 set -u
@@ -76,8 +81,8 @@ GUARD="$ROOT/tests/env_storage_durable_check.sh"
 
 TOOTH_SET="${1:-${P1B_TOOTH:-}}"
 case "$TOOTH_SET" in
-    ""|ram-backed|unquotaed|format-v1-only|bad-format-version|stale-region-base) ;;
-    *) echo "ABORT: unknown P1B_TOOTH='$TOOTH_SET' — expected ram-backed, unquotaed, format-v1-only, bad-format-version or stale-region-base" >&2; exit 2 ;;
+    ""|ram-backed|unquotaed|format-v1-only|bad-format-version|stale-region-base|slow-read) ;;
+    *) echo "ABORT: unknown P1B_TOOTH='$TOOTH_SET' — expected ram-backed, unquotaed, format-v1-only, bad-format-version, stale-region-base or slow-read" >&2; exit 2 ;;
 esac
 want_tooth() { [ -z "$TOOTH_SET" ] || [ "$TOOTH_SET" = "$1" ]; }
 
@@ -432,6 +437,9 @@ FPR
     cp "$d/big_pre.txt" "$d/big_post.txt"
     printf 'p1b-small-payload\n' > "$d/small_pre.txt"
     cp "$d/small_pre.txt" "$d/small_post.txt"
+    # The read phase's device-request cost: the run path measured 53
+    # handoffs on the live suite; D3c compares the count with the budget.
+    printf '53 600\n' > "$d/read_handoffs.txt"
     # The quota's four numbers, as the live arm records them: usage before
     # (0 — a new store charges on first touch), after (the 128 894-byte big
     # file ≈ 31 pages + the small file's 1 = 33), after the reboot (the
@@ -552,6 +560,30 @@ if want_tooth format-v1-only; then
         passed=$((passed + 1))
     else
         echo "FAIL: P1B_TOOTH=format-v1-only: D3b did NOT hold green — exit $rc"
+        printf '%s\n' "$out" | sed 's/^/      /'
+        failed=$((failed + 1))
+    fi
+else
+    skipped=$((skipped + 1))
+fi
+
+# ── P1B_TOOTH=slow-read: the replay half ──────────────────────────────────
+# The read path regressed to one device request per block: every byte is
+# still correct (D3a holds green) but the recorded cost is 3,000 handoffs
+# against the 600 budget. D3c must be the clause that names it — a budget
+# that only fired alongside a correctness failure would not be measuring
+# the read path at all.
+if want_tooth slow-read; then
+    cp -a "$W/art-good" "$W/art-slow"
+    printf '3000 600\n' > "$W/art-slow/read_handoffs.txt"
+    printf 'slow-read\n' > "$W/art-slow/tooth.txt"
+    replay_tooth slow-read D3c "the replay takes D3c (3,000 handoffs against a 600 budget) red — the read path is back to one request per block" "$W/art-slow"
+    out="$(bash "$GUARD" --replay "$W/art-slow" 2>&1)"; rc=$?
+    if [ "$rc" -eq 1 ] && printf '%s\n' "$out" | grep -q "^ok:   D3a\."; then
+        echo "ok:   P1B_TOOTH=slow-read: D3a (the bytes) holds green — the cost is what reddened, not the content"
+        passed=$((passed + 1))
+    else
+        echo "FAIL: P1B_TOOTH=slow-read: D3a did NOT hold green — exit $rc"
         printf '%s\n' "$out" | sed 's/^/      /'
         failed=$((failed + 1))
     fi
