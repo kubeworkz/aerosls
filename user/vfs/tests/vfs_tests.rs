@@ -825,6 +825,63 @@ fn misaligned_whole_line_writes_read_back_exactly() {
 }
 
 #[test]
+fn a_sequential_read_fetches_runs_not_blocks() {
+    // wc's shape: a 16-byte buffer, so the VFS sees one block per call. A
+    // sequential file must still be fetched in runs — one RD_READ per eight
+    // contiguous blocks — and its indirect block must be read once, not once
+    // per data block.
+    let (_fake, client, t) = boot_writable(vec![0u8; V2_STORE_BYTES]);
+    let rw = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let cache = BlockCache::connect(
+        KWrap(Arc::new(FlushCounter {
+            inner: client.clone(),
+            flushes: Arc::new(AtomicU64::new(0)),
+            rw: rw.clone(),
+        })),
+        0,
+        0,
+        AWrap(Arc::new(Mutex::new(FakeAlloc(client.clone())))),
+    )
+    .unwrap();
+    let mut vfs: Vfs<FlushCounter, FakeAlloc> = Vfs::new();
+    assert!(vfs.mount_aerofs_or_format("/", cache).unwrap());
+    vfs.mount_ramfs("/tmp").unwrap();
+
+    // 80 blocks: ten direct, then the rest through one indirect block.
+    let data: Vec<u8> = (0..40_960).map(|i| (i % 251) as u8).collect();
+    let fd = vfs.open(0, "/runs", O_CREAT | O_RDWR, 0o644).unwrap();
+    for chunk in data.chunks(4096) {
+        assert_eq!(vfs.write(0, fd, chunk).unwrap(), chunk.len());
+    }
+    rw.lock().unwrap().clear();
+    vfs.lseek(0, fd, 0, SEEK_SET).unwrap();
+
+    let mut got = Vec::with_capacity(data.len());
+    let mut buf = [0u8; 16];
+    loop {
+        let n = vfs.read(0, fd, &mut buf).unwrap();
+        if n == 0 {
+            break;
+        }
+        got.extend_from_slice(&buf[..n]);
+    }
+    assert_eq!(got, data, "the run reads return the file byte-for-byte");
+
+    let reads = rw.lock().unwrap().iter().filter(|(w, _)| !w).count();
+    // 80 data blocks in runs of at most eight is 11 requests (the direct/
+    // indirect boundary splits one run), plus at most the indirect block
+    // itself once. A per-block path would issue ~80 data reads and ~80
+    // indirect reads.
+    assert!(
+        (10..=12).contains(&reads),
+        "the read fetched runs, not blocks ({reads} RD_READs)"
+    );
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
+
+#[test]
 fn v2_large_file_survives_a_reboot() {
     // Power-on #1: format, then write both files.
     let (_fake, client, t) = boot_writable(vec![0u8; V2_STORE_BYTES]);

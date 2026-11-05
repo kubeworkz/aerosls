@@ -1103,18 +1103,11 @@ ok "L8. storage quota before: partition $PID usage=$BEFORE pages"
 # read-modify-write, an inode write and a flush against the ramdisk driver,
 # and under QEMU+TCG a per-line producer overran this window (measured: ~5.6
 # lines/s, so the big-file write never reached its END sentinel).
-#
-# The reads downstream of the write are the reason their windows are much
-# wider than the file suggests: each of the file's ~174 blocks is one device
-# round trip, plus an indirect-block read as the cache evicts it, and a
-# loaded QEMU+TCG host has measured this read over 30 s (the previous 30 s
-# window passed only by a few seconds). The byte count is the clause; the
-# window only decides how long the guard waits for it.
 cons_xcapture "seq 1000000000000000000 1000000000000004444 > /p1b_big" "P1B-W1" 420 "$WD/write1.txt" || \
     boot_fail "the big-file write never completed through the console"
 cons_xcapture "echo p1b-small-payload > /p1b_small" "P1B-W2" 60 "$WD/write2.txt" || \
     boot_fail "the small-file write never completed through the console"
-cons_xcapture "wc /p1b_big" "P1B-WC" 120 "$WD/wc_raw.txt" || \
+cons_xcapture "wc /p1b_big" "P1B-WC" 30 "$WD/wc_raw.txt" || \
     boot_fail "wc /p1b_big never answered after the console write"
 BIG_WC="$(wc_bytes "$WD/wc_raw.txt" /p1b_big)"
 if [ -z "$BIG_WC" ] || [ "$BIG_WC" -lt 71200 ]; then
@@ -1125,9 +1118,9 @@ ok "L9. /p1b_big is $BIG_WC bytes (> 71 168 — the v2 ceiling admitted it)"
 
 # The fingerprints, bracketed by the SAME sentinels the reboot will use, so
 # the two captures are the same bracket of lines.
-cons_xcapture "head -n 20 /p1b_big" "P1B-H1" 90 "$WD/big_head.txt" || \
+cons_xcapture "head -n 20 /p1b_big" "P1B-H1" 30 "$WD/big_head.txt" || \
     boot_fail "the head fingerprint never completed through the console"
-cons_xcapture "tail -n 20 /p1b_big" "P1B-T1" 90 "$WD/big_tail.txt" || \
+cons_xcapture "tail -n 20 /p1b_big" "P1B-T1" 30 "$WD/big_tail.txt" || \
     boot_fail "the tail fingerprint never completed through the console"
 { echo "wc=$BIG_WC"; echo "-- head -n 20"; cat "$WD/big_head.txt"; \
   echo "-- tail -n 20"; cat "$WD/big_tail.txt"; } > "$ART/big_pre.txt"
@@ -1222,12 +1215,12 @@ cons_wait "[env-id] index=$INDEX" 90 || \
 cons_xcapture "true" "P1B-P2" 20 "$WD/probe2.txt" || \
     boot_fail "the post-reboot console would not accept input (the shell never ran the probe line)"
 
-cons_xcapture "wc /p1b_big" "P1B-WC" 120 "$WD/wc_raw2.txt" || \
+cons_xcapture "wc /p1b_big" "P1B-WC" 30 "$WD/wc_raw2.txt" || \
     boot_fail "wc /p1b_big never answered after the reboot"
 BIG_WC2="$(wc_bytes "$WD/wc_raw2.txt" /p1b_big)"
-cons_xcapture "head -n 20 /p1b_big" "P1B-H1" 90 "$WD/big_head2.txt" || \
+cons_xcapture "head -n 20 /p1b_big" "P1B-H1" 30 "$WD/big_head2.txt" || \
     boot_fail "the head fingerprint never completed after the reboot"
-cons_xcapture "tail -n 20 /p1b_big" "P1B-T1" 90 "$WD/big_tail2.txt" || \
+cons_xcapture "tail -n 20 /p1b_big" "P1B-T1" 30 "$WD/big_tail2.txt" || \
     boot_fail "the tail fingerprint never completed after the reboot"
 { echo "wc=$BIG_WC2"; echo "-- head -n 20"; cat "$WD/big_head2.txt"; \
   echo "-- tail -n 20"; cat "$WD/big_tail2.txt"; } > "$ART/big_post.txt"

@@ -34,7 +34,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 
-use aerosls_blockcache::{BlockCache, BufferAlloc, Error as CacheError};
+use aerosls_blockcache::{BlockCache, BufferAlloc, Error as CacheError, NCACHE};
 use aerosls_proto::kabi::Kernel;
 use aerosls_proto::{R, W, RD_ERR_QUOTA};
 
@@ -687,6 +687,26 @@ impl<K: Kernel, A: BufferAlloc> AerofsFs<K, A> {
             let in_blk = (pos % bs as u64) as usize;
             let take = core::cmp::min(bs - in_blk, n - done);
             let addr = self.block_addr(&inode, blk)?;
+            // A small caller buffer (wc uses 16 bytes) would otherwise pay
+            // one device round trip per file block. On a miss, walk the
+            // file's physically contiguous blocks ahead of this one and
+            // fetch the run in ONE request — one 4 KiB grant, and exactly
+            // the NCACHE slots a run occupies, so the following reads hit.
+            if !self.cache.contains(addr as u64) {
+                let total = (inode.size as u64).div_ceil(bs as u64);
+                let mut run = 1u64;
+                while run < NCACHE as u64 && blk + run < total {
+                    match self.block_addr_opt(&inode, blk + run)? {
+                        Some(next) if next == addr + run as u32 => run += 1,
+                        _ => break, // fragmented (or a hole): fetch what is there
+                    }
+                }
+                if run > 1 {
+                    self.cache
+                        .read_run(addr as u64, run as usize)
+                        .map_err(map_cache_err)?;
+                }
+            }
             let mut scratch = [0u8; BS];
             self.cache
                 .read_block(addr as u64, &mut scratch)
@@ -799,7 +819,7 @@ impl<K: Kernel, A: BufferAlloc> AerofsFs<K, A> {
         }
         let mut ib = [0u8; BS];
         self.cache
-            .read_block(indirect as u64, &mut ib)
+            .read_block_hot(indirect as u64, &mut ib)
             .map_err(map_cache_err)?;
         if idx >= crate::aerofs::NINDIRECT {
             return Err(Errno::EInval);
@@ -948,7 +968,7 @@ impl<K: Kernel, A: BufferAlloc> AerofsFs<K, A> {
             }
             let mut ib = [0u8; BS];
             self.cache
-                .read_block(ind as u64, &mut ib)
+                .read_block_hot(ind as u64, &mut ib)
                 .map_err(map_cache_err)?;
             for blk in lo..hi {
                 let idx = (blk - base) as usize * 4;
@@ -1118,7 +1138,7 @@ impl<K: Kernel, A: BufferAlloc> AerofsFs<K, A> {
         let ib_addr = *ind;
         let mut ib = [0u8; BS];
         self.cache
-            .read_block(ib_addr as u64, &mut ib)
+            .read_block_hot(ib_addr as u64, &mut ib)
             .map_err(map_cache_err)?;
         let ptr = u32::from_le_bytes([ib[idx * 4], ib[idx * 4 + 1], ib[idx * 4 + 2], ib[idx * 4 + 3]]);
         if ptr != 0 {
