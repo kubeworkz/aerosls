@@ -6,11 +6,12 @@
 //! replacement, exactly as the device half of the respawn state machine
 //! prescribes (respawn decision §5, §6).
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use aerosls_blockcache::{BlockCache, BufferAlloc};
 use aerosls_kernel_sim::{FakeClient, FakeKernel, DRIVER_CONSOLE, DRIVER_STORAGE};
-use aerosls_proto::kabi::SendCap;
+use aerosls_proto::kabi::{CapInfo, GrantedCap, Kernel, RecvResult, SendCap};
 use aerosls_proto::kwrap::{AWrap, KWrap};
 use aerosls_proto::*;
 use aerosls_ramdisk::endpoints::EndpointSet;
@@ -88,6 +89,70 @@ impl BufferAlloc for FakeAlloc {
             },
             info.base,
         ))
+    }
+}
+
+/// A `Kernel` that delegates to the fake client and counts `RD_FLUSH`
+/// frames. `FakeKernel::driver_requests` counts messages, not their type,
+/// and the flush count is exactly what a single VFS write is allowed to
+/// spend: one, however many blocks the write allocates.
+#[derive(Clone)]
+struct FlushCounter {
+    inner: FakeClient,
+    flushes: Arc<AtomicU64>,
+    /// Every RD_READ/RD_WRITE as (is_write, lba), so a test can isolate the
+    /// allocation map by its extent instead of counting all device traffic.
+    rw: Arc<std::sync::Mutex<Vec<(bool, u64)>>>,
+}
+
+impl Kernel for FlushCounter {
+    fn wait(&self, chans: &[u32], timeout_ns: u64) -> Result<(usize, u16), i32> {
+        <FakeClient as Kernel>::wait(&self.inner, chans, timeout_ns)
+    }
+
+    fn recv(
+        &self,
+        chan: u32,
+        buf: &mut [u8],
+        slots: &mut [GrantedCap],
+    ) -> Result<RecvResult, i32> {
+        <FakeClient as Kernel>::recv(&self.inner, chan, buf, slots)
+    }
+
+    fn send(
+        &self,
+        chan: u32,
+        tag: u32,
+        flags: u16,
+        payload: &[u8],
+        caps: &[SendCap],
+        timeout_ns: u64,
+    ) -> Result<(), i32> {
+        if let Some(f) = RdFrame::parse(payload) {
+            if f.ty == RD_FLUSH {
+                self.flushes.fetch_add(1, Ordering::SeqCst);
+            }
+            // RD_READ/RD_WRITE carry `{lba u64, count u32}` after the frame
+            // header; the LBA is what puts a request on the allocation map.
+            if f.ty == RD_READ || f.ty == RD_WRITE {
+                if let Some((lba, _)) = parse_rw_body(&payload[RdFrame::SIZE..]) {
+                    self.rw.lock().unwrap().push((f.ty == RD_WRITE, lba));
+                }
+            }
+        }
+        <FakeClient as Kernel>::send(&self.inner, chan, tag, flags, payload, caps, timeout_ns)
+    }
+
+    fn close(&self, chan: u32, reason: u16, detail: u32) -> Result<(), i32> {
+        <FakeClient as Kernel>::close(&self.inner, chan, reason, detail)
+    }
+
+    fn cap_info(&self, handle: u32) -> Result<CapInfo, i32> {
+        <FakeClient as Kernel>::cap_info(&self.inner, handle)
+    }
+
+    fn poll(&self, chan: u32) -> Result<u16, i32> {
+        <FakeClient as Kernel>::poll(&self.inner, chan)
     }
 }
 
@@ -463,6 +528,113 @@ fn block_cache_is_used_under_the_vfs() {
     t.join().unwrap();
 }
 
+/// A write's metadata cost is per OPERATION, not per block: eight fresh
+/// blocks still buy one inode update, one flush, and one pass over the
+/// allocation map. Before the flush moved to the operation's end,
+/// `store_alloc_map` flushed on every allocation, so this 4 KiB write spent
+/// nine flushes — eight of them pure bookkeeping. Before the map reservation,
+/// it also read and rewrote the bitmap once per block.
+#[test]
+fn one_write_issues_one_flush_however_many_blocks_it_allocates() {
+    // The writable tenant store, so the mount is v2 and every write here is
+    // a real allocation path rather than a read-only refusal.
+    let (_fake, client, t) = boot_writable(vec![0u8; V2_STORE_BYTES]);
+    let flushes = Arc::new(AtomicU64::new(0));
+    let rw = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let cache = BlockCache::connect(
+        KWrap(Arc::new(FlushCounter {
+            inner: client.clone(),
+            flushes: flushes.clone(),
+            rw: rw.clone(),
+        })),
+        0,
+        0,
+        AWrap(Arc::new(Mutex::new(FakeAlloc(client.clone())))),
+    )
+    .unwrap();
+    let mut vfs: Vfs<FlushCounter, FakeAlloc> = Vfs::new();
+    assert!(vfs.mount_aerofs_or_format("/", cache).unwrap());
+    vfs.mount_ramfs("/tmp").unwrap();
+
+    // Where the allocation map lives, from the store's own superblock: the
+    // write's map traffic is the RD_READ/RD_WRITE set whose LBA is in here.
+    let sb = aerosls_vfs::aerofs::parse_superblock(&client.storage_bytes()[..512])
+        .expect("the formatted store has a v2 superblock");
+    let map = sb.alloc_start as u64..(sb.alloc_start + sb.alloc_blocks) as u64;
+    let map_io = |from: usize| -> (usize, usize) {
+        let events = rw.lock().unwrap();
+        let mut reads = 0usize;
+        let mut writes = 0usize;
+        for &(write, lba) in &events[from..] {
+            if map.contains(&lba) {
+                if write {
+                    writes += 1;
+                } else {
+                    reads += 1;
+                }
+            }
+        }
+        (reads, writes)
+    };
+    let map_blocks = sb.alloc_blocks as usize;
+
+    let fd = vfs.open(0, "/batchy", O_CREAT | O_RDWR, 0o644).unwrap();
+    let buf = [0x5au8; 4096];
+
+    let before = flushes.load(Ordering::SeqCst);
+    let events = rw.lock().unwrap().len();
+    assert_eq!(vfs.write(0, fd, &buf).unwrap(), buf.len());
+    assert_eq!(
+        flushes.load(Ordering::SeqCst) - before,
+        1,
+        "the first 4 KiB write allocates eight blocks and must still flush once"
+    );
+    let (reads, writes) = map_io(events);
+    assert_eq!(
+        writes, map_blocks,
+        "the first write rewrites the allocation map once, not once per block"
+    );
+    assert!(
+        reads <= map_blocks,
+        "the first write reads the allocation map once, not once per block ({reads} reads)"
+    );
+
+    // A second 4 KiB write at the end allocates eight MORE blocks.
+    let before = flushes.load(Ordering::SeqCst);
+    let events = rw.lock().unwrap().len();
+    assert_eq!(vfs.write(0, fd, &buf).unwrap(), buf.len());
+    assert_eq!(
+        flushes.load(Ordering::SeqCst) - before,
+        1,
+        "the second 4 KiB write allocates eight more blocks and flushes once"
+    );
+    let (reads, writes) = map_io(events);
+    assert_eq!(writes, map_blocks, "the second write rewrites the map once");
+    assert!(reads <= map_blocks, "the second write reads the map once");
+
+    // Overwriting blocks that are already allocated is one flush too, and
+    // allocates nothing — so it touches no allocation map at all.
+    assert_eq!(vfs.lseek(0, fd, 0, SEEK_SET).unwrap(), 0);
+    let before = flushes.load(Ordering::SeqCst);
+    let events = rw.lock().unwrap().len();
+    assert_eq!(vfs.write(0, fd, &buf).unwrap(), buf.len());
+    assert_eq!(flushes.load(Ordering::SeqCst) - before, 1);
+    assert_eq!(
+        map_io(events),
+        (0, 0),
+        "an overwrite allocates nothing and must not touch the map"
+    );
+
+    // The bytes are there: the batching is bookkeeping only.
+    assert_eq!(vfs.lseek(0, fd, 0, SEEK_SET).unwrap(), 0);
+    let mut got = [0u8; 64];
+    assert_eq!(vfs.read(0, fd, &mut got).unwrap(), got.len());
+    assert_eq!(got, [0x5au8; 64]);
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
+
 #[test]
 fn mount_table_rejects_duplicates_and_longest_prefix_wins() {
     let (fake, client, t) = boot(sample_image());
@@ -619,6 +791,35 @@ fn v2_empty_store_formats_writable() {
         "the format wrote v2"
     );
 
+    client.kill_driver(0);
+    t.join().unwrap();
+}
+
+#[test]
+fn misaligned_whole_line_writes_read_back_exactly() {
+    // The live probe's shape: `seq` writes whole 20-byte lines in batches
+    // capped at 4 KiB, so successive writes start mid-block. 4,445 lines is
+    // 88,900 bytes.
+    let (_fake, client, t) = boot_writable(vec![0u8; V2_STORE_BYTES]);
+    let (mut vfs, _) = mount_root_or_format(&client);
+    let fd = vfs.open(0, "/liveish", O_CREAT | O_RDWR, 0o644).unwrap();
+    let mut data = Vec::new();
+    for i in 0..4445u64 {
+        data.extend_from_slice(format!("{:019}\n", 1_000_000_000_000_000_000u64 + i).as_bytes());
+    }
+    assert_eq!(data.len(), 88_900);
+    for chunk in data.chunks(4080) {
+        assert_eq!(vfs.write(0, fd, chunk).unwrap(), chunk.len());
+    }
+    vfs.lseek(0, fd, 0, SEEK_SET).unwrap();
+    let mut got = vec![0u8; data.len()];
+    let mut off = 0usize;
+    while off < got.len() {
+        let n = vfs.read(0, fd, &mut got[off..]).unwrap();
+        assert!(n > 0, "premature EOF at {off}");
+        off += n;
+    }
+    assert_eq!(got, data);
     client.kill_driver(0);
     t.join().unwrap();
 }

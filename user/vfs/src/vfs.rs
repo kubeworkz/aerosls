@@ -546,6 +546,32 @@ pub struct AerofsFs<K: Kernel, A: BufferAlloc> {
     writable: bool,
 }
 
+/// Blocks one operation claimed with a single read-modify-write of the
+/// allocation map. `alloc_block` hands these out before falling back to the
+/// block-at-a-time path, so a write that needs eight blocks reads the map
+/// once and rewrites it once. An empty reservation is the fallback (nothing
+/// was claimed) — what a zero-block overwrite, or a request the store cannot
+/// satisfy whole, leaves behind.
+#[derive(Default)]
+struct Reserved {
+    blocks: Vec<u32>,
+    next: usize,
+}
+
+impl Reserved {
+    fn take(&mut self) -> Option<u32> {
+        let b = *self.blocks.get(self.next)?;
+        self.next += 1;
+        Some(b)
+    }
+
+    /// Blocks still unclaimed. A write that counted its needs correctly ends
+    /// with none, which the write path asserts in debug builds.
+    fn unused(&self) -> usize {
+        self.blocks.len() - self.next
+    }
+}
+
 impl<K: Kernel, A: BufferAlloc> AerofsFs<K, A> {
     /// Mount: read the superblock through the cache and validate it. On
     /// success the fs owns the (already-connected) cache and records the
@@ -857,9 +883,14 @@ impl<K: Kernel, A: BufferAlloc> AerofsFs<K, A> {
         Ok(map)
     }
 
-    /// Write the allocation map back and flush. The flush is the point: a bit
-    /// that claims a block must be on the device before the block's contents
-    /// are relied on, or a crash could hand one block to two files.
+    /// Write the allocation map back, without flushing: durability is the
+    /// operation's to end. One flush after the last bit this operation set
+    /// makes all of it durable, where a flush per map write spent a device
+    /// round trip on bookkeeping each time. The map-before-contents ordering
+    /// the crash argument needs still holds here because every `RD_WRITE` is
+    /// completed, and on the P1b store written through, before its reply: the
+    /// bit is on the device before the block it claims is sent. A buffered
+    /// backend would have to flush between the map and the contents again.
     fn store_alloc_map(&mut self, map: &[u8]) -> Result<(), Errno> {
         for b in 0..self.sb.alloc_blocks as u64 {
             let mut blk = [0u8; BS];
@@ -868,7 +899,7 @@ impl<K: Kernel, A: BufferAlloc> AerofsFs<K, A> {
                 .write_block(self.sb.alloc_start as u64 + b, &blk)
                 .map_err(map_cache_err)?;
         }
-        self.cache.flush().map_err(map_cache_err)
+        Ok(())
     }
 
     /// Where the block bitmap ends and the inode bitmap begins in the map.
@@ -876,11 +907,110 @@ impl<K: Kernel, A: BufferAlloc> AerofsFs<K, A> {
         v2_block_bitmap_len(self.sb.total_blocks)
     }
 
-    /// Allocate one data block: the first clear bit of the block bitmap,
-    /// zeroed on the device so nothing from a reused store can leak into a
-    /// file that only ever writes part of it.
-    fn alloc_block(&mut self) -> Result<u32, Errno> {
+    /// How many blocks `ensure_block` would allocate for file blocks
+    /// `first..last`: holes among the direct pointers, indirect blocks that
+    /// do not exist yet (which bring every hole in their range with them),
+    /// and holes among an existing indirect block's entries. An indirect
+    /// block is read at most once per range. This is the count that lets a
+    /// write claim everything it needs in one map pass.
+    fn blocks_to_allocate(
+        &mut self,
+        inode: &Inode,
+        first: u64,
+        last: u64,
+    ) -> Result<usize, Errno> {
+        let mut n = 0usize;
+        for blk in first..core::cmp::min(last, NDIRECT_V2 as u64) {
+            if inode.blocks[blk as usize] == 0 {
+                n += 1;
+            }
+        }
+        let indirect2_base = (NDIRECT_V2 + NINDIRECT) as u64;
+        for (ind, base, lo, hi) in [
+            (
+                inode.indirect,
+                NDIRECT_V2 as u64,
+                NDIRECT_V2 as u64,
+                indirect2_base,
+            ),
+            (inode.indirect2, indirect2_base, indirect2_base, MAX_BLOCKS_V2),
+        ] {
+            let lo = core::cmp::max(first, lo);
+            let hi = core::cmp::min(last, hi);
+            if lo >= hi {
+                continue;
+            }
+            if ind == 0 {
+                // A fresh indirect block is allocated too, and every entry
+                // it will hold starts as a hole (alloc_block zeroes it).
+                n += (hi - lo) as usize + 1;
+                continue;
+            }
+            let mut ib = [0u8; BS];
+            self.cache
+                .read_block(ind as u64, &mut ib)
+                .map_err(map_cache_err)?;
+            for blk in lo..hi {
+                let idx = (blk - base) as usize * 4;
+                if u32::from_le_bytes([ib[idx], ib[idx + 1], ib[idx + 2], ib[idx + 3]]) == 0 {
+                    n += 1;
+                }
+            }
+        }
+        Ok(n)
+    }
+
+    /// Claim `want` free blocks in one pass — one read of the allocation map,
+    /// one rewrite with every bit set, and a zero fill per block — and hand
+    /// them back as a reservation. If the store cannot satisfy the whole
+    /// request this returns an EMPTY reservation and stores nothing, so the
+    /// caller falls back to the block-at-a-time path and the quota edge
+    /// behaves exactly as before (write what fits, then ENOSPC).
+    fn reserve_blocks(&mut self, want: usize) -> Result<Reserved, Errno> {
+        if want == 0 {
+            return Ok(Reserved::default());
+        }
+        let split = self.alloc_bitmap_split();
+        let mut map = self.alloc_map()?;
+        let mut blocks = Vec::with_capacity(want);
+        let mut from = 0u64;
+        while blocks.len() < want {
+            let Some(b) = bitmap_find_clear(&map[..split], from, self.sb.total_blocks as u64) else {
+                return Ok(Reserved::default());
+            };
+            bitmap_set(&mut map[..split], b);
+            blocks.push(b as u32);
+            from = b + 1;
+        }
+        self.store_alloc_map(&map)?;
+        let zero = [0u8; BS];
+        for &b in &blocks {
+            if let Err(e) = self.cache.write_block(b as u64, &zero) {
+                // The bits were stored before the zero fill, so a refusal here
+                // (the quota's, typically) must put them back: leaking a whole
+                // write's worth of blocks on "disk full" would eat free space
+                // that no file owns. The map block is already charged, so this
+                // rewrite cannot itself be a new charge; if it also fails the
+                // error that caused this one is the one worth returning.
+                for &b in &blocks {
+                    bitmap_clear(&mut map[..split], b as u64);
+                }
+                let _ = self.store_alloc_map(&map);
+                return Err(map_cache_err(e));
+            }
+        }
+        Ok(Reserved { blocks, next: 0 })
+    }
+
+    /// Allocate one data block: a block a reservation already claimed and
+    /// zeroed, else the first clear bit of the block bitmap, zeroed on the
+    /// device so nothing from a reused store can leak into a file that only
+    /// ever writes part of it.
+    fn alloc_block(&mut self, reserved: &mut Reserved) -> Result<u32, Errno> {
         self.op_guard()?;
+        if let Some(b) = reserved.take() {
+            return Ok(b);
+        }
         let split = self.alloc_bitmap_split();
         let mut map = self.alloc_map()?;
         let b = bitmap_find_clear(&map[..split], 0, self.sb.total_blocks as u64)
@@ -957,11 +1087,16 @@ impl<K: Kernel, A: BufferAlloc> AerofsFs<K, A> {
     /// zero) whatever does not exist yet, so an offset past the current end
     /// reads back as zeroes rather than stale bytes. Indirect blocks are
     /// allocated the first time their range is touched.
-    fn ensure_block(&mut self, inode: &mut Inode, blk: u64) -> Result<u32, Errno> {
+    fn ensure_block(
+        &mut self,
+        inode: &mut Inode,
+        blk: u64,
+        reserved: &mut Reserved,
+    ) -> Result<u32, Errno> {
         if blk < NDIRECT_V2 as u64 {
             let slot = &mut inode.blocks[blk as usize];
             if *slot == 0 {
-                *slot = self.alloc_block()?;
+                *slot = self.alloc_block(reserved)?;
             }
             return Ok(*slot);
         }
@@ -978,7 +1113,7 @@ impl<K: Kernel, A: BufferAlloc> AerofsFs<K, A> {
         if *ind == 0 {
             // A fresh indirect block: alloc_block() zeroes it, so every
             // pointer in it starts out as a hole.
-            *ind = self.alloc_block()?;
+            *ind = self.alloc_block(reserved)?;
         }
         let ib_addr = *ind;
         let mut ib = [0u8; BS];
@@ -989,7 +1124,7 @@ impl<K: Kernel, A: BufferAlloc> AerofsFs<K, A> {
         if ptr != 0 {
             return Ok(ptr);
         }
-        let fresh = self.alloc_block()?;
+        let fresh = self.alloc_block(reserved)?;
         ib[idx * 4..idx * 4 + 4].copy_from_slice(&fresh.to_le_bytes());
         self.cache
             .write_block(ib_addr as u64, &ib)
@@ -1021,13 +1156,14 @@ impl<K: Kernel, A: BufferAlloc> AerofsFs<K, A> {
     /// Read-modify-write `bytes` at `offset` in a file, allocating blocks as
     /// needed: the one primitive directory data is written through.
     fn write_at(&mut self, inode: &mut Inode, offset: usize, bytes: &[u8]) -> Result<(), Errno> {
+        let mut reserved = Reserved::default();
         let mut done = 0usize;
         while done < bytes.len() {
             let pos = offset + done;
             let blk = (pos / BS) as u64;
             let in_blk = pos % BS;
             let take = core::cmp::min(BS - in_blk, bytes.len() - done);
-            let addr = self.ensure_block(inode, blk)?;
+            let addr = self.ensure_block(inode, blk, &mut reserved)?;
             let mut scratch = [0u8; BS];
             self.cache
                 .read_block(addr as u64, &mut scratch)
@@ -1140,13 +1276,24 @@ impl<K: Kernel, A: BufferAlloc> AerofsFs<K, A> {
         if end > MAX_FILE_BYTES_V2 {
             return Err(Errno::EFbig);
         }
+        // Count what this write will add, then claim it all at once: one map
+        // read and one rewrite for the operation, however many blocks it
+        // allocates. Overwriting only still costs one count and no map I/O.
+        let first = offset / BS as u64;
+        let last = if buf.is_empty() {
+            first
+        } else {
+            end.div_ceil(BS as u64)
+        };
+        let need = self.blocks_to_allocate(&inode, first, last)?;
+        let mut reserved = self.reserve_blocks(need)?;
         let mut done = 0usize;
         while done < buf.len() {
             let pos = offset + done as u64;
             let blk = pos / BS as u64;
             let in_blk = (pos % BS as u64) as usize;
             let take = core::cmp::min(BS - in_blk, buf.len() - done);
-            let addr = self.ensure_block(&mut inode, blk)?;
+            let addr = self.ensure_block(&mut inode, blk, &mut reserved)?;
             let mut scratch = [0u8; BS];
             self.cache
                 .read_block(addr as u64, &mut scratch)
@@ -1157,6 +1304,11 @@ impl<K: Kernel, A: BufferAlloc> AerofsFs<K, A> {
                 .map_err(map_cache_err)?;
             done += take;
         }
+        debug_assert_eq!(
+            reserved.unused(),
+            0,
+            "the write claimed exactly the blocks it allocated"
+        );
         if end > inode.size as u64 {
             inode.size = end as u32;
         }
@@ -1200,9 +1352,10 @@ impl<K: Kernel, A: BufferAlloc> AerofsFs<K, A> {
             }
         } else {
             // grow (or no-op): allocate through the new end, zeroed.
+            let mut reserved = Reserved::default();
             let mut blk = old_size.div_ceil(BS as u64);
             while blk < len.div_ceil(BS as u64) {
-                self.ensure_block(&mut inode, blk)?;
+                self.ensure_block(&mut inode, blk, &mut reserved)?;
                 blk += 1;
             }
         }
@@ -1293,7 +1446,10 @@ impl<K: Kernel, A: BufferAlloc> AerofsFs<K, A> {
         if inode.indirect2 != 0 {
             self.free_block(inode.indirect2)?;
         }
-        self.free_inode(ino)
+        self.free_inode(ino)?;
+        // The frees above wrote the allocation map without a flush of their
+        // own; this is the unlink's one flush, after the last metadata write.
+        self.cache.flush().map_err(map_cache_err)
     }
 
     /// `rmdir(2)`: directories only, and only empty ones — "empty" means no
@@ -1334,7 +1490,9 @@ impl<K: Kernel, A: BufferAlloc> AerofsFs<K, A> {
         if dir.indirect2 != 0 {
             self.free_block(dir.indirect2)?;
         }
-        self.free_inode(ino)
+        self.free_inode(ino)?;
+        // As in unlink: the map writes above share this operation's flush.
+        self.cache.flush().map_err(map_cache_err)
     }
 
     /// `rename(2)` within a v2 store. An existing destination is refused
