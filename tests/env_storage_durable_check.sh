@@ -65,8 +65,10 @@
 #                    came back WITH the reboot's own serial evidence (the
 #                    directory reloaded, the extent read back from NVMe), the
 #                    files' bytes survived the reboot as read through the
-#                    environment's own console, quota usage moved by the
-#                    file's size, and an over-quota write was refused by the
+#                    environment's own console, the reads' device-request
+#                    cost stayed within budget on both sides of it, quota
+#                    usage moved by the file's size, and an over-quota write
+#                    was refused by the
 #                    QUOTA's own line with the usage pinned at the ceiling and
 #                    no frame-pool denial anywhere near it.
 #
@@ -664,22 +666,28 @@ else:
 
 # ── D3c. the reads stayed on the run path, under a device-request budget ──
 # The live arm counts the kernel's channel handoffs across the three console
-# reads of /p1b_big and records `<count> <budget>`. A per-block read costs
-# roughly 27x the run path, so a regression back to it cannot hide inside
-# the budget; a fragmented file that splits a few runs still fits.
-rh = read("read_handoffs.txt")
-if rh is None:
-    bad("D3c. read_handoffs.txt missing — the big-file reads' device-request cost was never recorded")
-else:
+# reads of /p1b_big and records `<count> <budget>` for each read phase: the
+# first boot and the reboot. A per-block read costs roughly 27x the run path,
+# so a regression back to it cannot hide inside the budget; a fragmented file
+# that splits a few runs still fits. Both phases are checked: a cache that
+# only falls back after the reboot must not pass on the first phase's record.
+def read_cost(name, phase):
+    rh = read(name)
+    if rh is None:
+        bad("D3c. %s missing — the big-file reads' device-request cost %s was never recorded" % (name, phase))
+        return
     m = re.match(r"\s*(\d+)\s+(\d+)\s*$", rh)
     if not m:
-        bad("D3c. read_handoffs.txt is malformed (%r) — expected '<count> <budget>'" % rh.strip()[:60])
+        bad("D3c. %s is malformed (%r) — expected '<count> <budget>'" % (name, rh.strip()[:60]))
     elif int(m.group(1)) > int(m.group(2)):
-        bad("D3c. the big-file reads cost %s ramdisk handoffs, over their %s budget — the block cache fell back to one request per block"
-            % (m.group(1), m.group(2)))
+        bad("D3c. the big-file reads %s cost %s ramdisk handoffs, over their %s budget — the block cache fell back to one request per block"
+            % (phase, m.group(1), m.group(2)))
     else:
-        ok("D3c. the big-file reads stayed within their device-request budget (%s <= %s handoffs)"
-           % (m.group(1), m.group(2)))
+        ok("D3c. the big-file reads %s stayed within their device-request budget (%s <= %s handoffs)"
+           % (phase, m.group(1), m.group(2)))
+
+read_cost("read_handoffs.txt", "before the reboot")
+read_cost("read_handoffs_boot2.txt", "after the reboot")
 
 # ── D4. quota usage moved by the file's size, and the occupancy survived ──
 def ival(name):
@@ -1251,6 +1259,10 @@ cons_wait "[env-id] index=$INDEX" 90 || \
 cons_xcapture "true" "P1B-P2" 20 "$WD/probe2.txt" || \
     boot_fail "the post-reboot console would not accept input (the shell never ran the probe line)"
 
+# The same budget on the reboot's reads: a block cache that only falls
+# back to one request per block after the reboot would otherwise pass on
+# the first boot's record alone.
+READ2_SERIAL_BEFORE=$(wc -l < "$LOG")
 cons_xcapture "wc /p1b_big" "P1B-WC" 30 "$WD/wc_raw2.txt" || \
     boot_fail "wc /p1b_big never answered after the reboot"
 BIG_WC2="$(wc_bytes "$WD/wc_raw2.txt" /p1b_big)"
@@ -1258,8 +1270,15 @@ cons_xcapture "head -n 20 /p1b_big" "P1B-H1" 30 "$WD/big_head2.txt" || \
     boot_fail "the head fingerprint never completed after the reboot"
 cons_xcapture "tail -n 20 /p1b_big" "P1B-T1" 30 "$WD/big_tail2.txt" || \
     boot_fail "the tail fingerprint never completed after the reboot"
+READ2_SERIAL_AFTER=$(wc -l < "$LOG")
+READ2_HANDOFFS=$(sed -n "$(( READ2_SERIAL_BEFORE + 1 )),${READ2_SERIAL_AFTER}p" "$LOG" | grep -acF "send handoff" || true)
+READ2_HANDOFFS=${READ2_HANDOFFS:-0}
+[ "$READ2_HANDOFFS" -le "$READ_BUDGET" ] || \
+    boot_fail "reading /p1b_big after the reboot cost $READ2_HANDOFFS ramdisk handoffs (budget $READ_BUDGET) — the block cache is issuing one request per block again"
+printf '%s %s\n' "$READ2_HANDOFFS" "$READ_BUDGET" > "$ART/read_handoffs_boot2.txt"
 { echo "wc=$BIG_WC2"; echo "-- head -n 20"; cat "$WD/big_head2.txt"; \
   echo "-- tail -n 20"; cat "$WD/big_tail2.txt"; } > "$ART/big_post.txt"
+ok "L16b. the same three reads after the reboot cost $READ2_HANDOFFS ramdisk handoffs (budget $READ_BUDGET)"
 
 cons_xcapture "cat /p1b_small" "P1B-C1" 30 "$ART/small_post.txt" || \
     boot_fail "the small file never came back after the reboot"
