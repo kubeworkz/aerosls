@@ -1096,11 +1096,13 @@ BEFORE="$(cat "$WD/pages_before")"
 ok "L8. storage quota before: partition $PID usage=$BEFORE pages"
 
 # ─── The files, through the environment's own console ──────────────────────
-# The big file is written with 19-digit seq lines on purpose: this stack
-# write-throughs the STORE once per VFS write() (the applets write a line at
-# a time), and under QEMU+TCG one round trip is ~40 ms — 20 000 short lines
-# would take ~13 minutes, 4 445 long ones ~3 minutes. 4,445 × 20 B =
-# 88 900 bytes: above v1's 71 168 ceiling, which is the point of the clause.
+# The big file is written with 19-digit seq lines on purpose: 4,445 × 20 B
+# = 88 900 bytes, above v1's 71 168 ceiling, which is the point of the
+# clause. seq emits whole-line batches (4 KiB), so this is a few dozen VFS
+# writes rather than 4,445 of them — each VFS write is a block
+# read-modify-write, an inode write and a flush against the ramdisk driver,
+# and under QEMU+TCG a per-line producer overran this window (measured: ~5.6
+# lines/s, so the big-file write never reached its END sentinel).
 cons_xcapture "seq 1000000000000000000 1000000000000004444 > /p1b_big" "P1B-W1" 420 "$WD/write1.txt" || \
     boot_fail "the big-file write never completed through the console"
 cons_xcapture "echo p1b-small-payload > /p1b_small" "P1B-W2" 60 "$WD/write2.txt" || \
