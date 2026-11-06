@@ -412,8 +412,18 @@ tooth "AD-b. env_service_create no longer binds the new env_id to the console (l
 # Without the wait the captured bytes land on a sidecar still inside its
 # first boot, erasing the [env-id] announcement that identifies it — the
 # operator's history arrives and the identity it is keyed by never does.
+#
+# The mutation bites the CONSUMER of the sample, not the call. The identity
+# question is still asked and still printed (`int announced =
+# env_console_identity_seen(...)`, and `announced=%d` on every timeout line);
+# only the readiness test stops winding `ready` back. That is the plausible
+# edit — "the announcement is a diagnostic, the sidecar always announces" —
+# and it is precisely the shape a bare symbol grep cannot see. This tooth was
+# VACUOUS until the clause was tightened to the two lines that make the gate:
+# CI on a76c697 reported "43 teeth bit, 1 did not", with the guard green
+# because three other call sites of the symbol were still in the file.
 seed "$W/ae"
-sed -i 's/env_console_identity_seen(rec->partition_id, rec->index)/1 \/\* MUTATED: identity wait removed \*\//' "$W/ae/kernel/env_payload.c"
+sed -i 's/if (ready && !announced) ready = 0;/if (ready \&\& !0) ready = 0;  \/* MUTATED: the announcement no longer gates *\//' "$W/ae/kernel/env_payload.c"
 tooth "AE. the pour no longer waits for the destination's own [env-id] announcement (the bytes erase the identity they are keyed by)" "AE" "$W/ae"
 
 # ── G (increment 12). The conditional marking removed — the defect verbatim ─

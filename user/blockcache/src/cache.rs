@@ -6,11 +6,13 @@
 //!
 //! - **Handshake**: the first message on the endpoint is `RD_INFO` (the
 //!   driver's implicit-handshake rule); the reply fixes the device geometry.
-//! - **`RD_READ`/`RD_WRITE`**: one block per request (matching the Phase 2
-//!   §3.4 walkthrough), with a transient MEM grant of a client-owned buffer
-//!   — W-only for read buffers (the driver writes into them), R-only for
-//!   write buffers (the driver reads from them). The kernel mints, bounds,
-//!   and auto-revokes the grants; the driver re-checks rights and size.
+//! - **`RD_READ`/`RD_WRITE`**: a transient MEM grant of a client-owned
+//!   buffer — W-only for read buffers (the driver writes into them), R-only
+//!   for write buffers (the driver reads from them). Writes are one block
+//!   per request; a read may ask for a contiguous RUN (`read_run`) so a
+//!   sequential file does not pay one round trip per block. The kernel
+//!   mints, bounds, and auto-revokes the grants; the driver re-checks
+//!   rights and size (it bounds a request at `MAX_IO` blocks).
 //! - **`RD_MAP`**: a durable view of the whole device, used as the Phase 2
 //!   §5.2 fast path for whole-file reads.
 //! - **Stale handling**: a close event (peer dead / protocol) or a failed
@@ -135,6 +137,14 @@ pub struct BlockCache<K: Kernel, A: BufferAlloc> {
     state: State,
     view: Option<MappedView>,
     slots: [Slot; NCACHE],
+    /// One block pinned outside the direct-mapped slots. The VFS resolves an
+    /// indirect block for every data block it reads, and the data reads it
+    /// serves evict that indirect block from `slots`; keeping a copy here
+    /// makes the walk one device read per indirect block, not one per data
+    /// block. A write to the block clears it by LBA, so a block that is freed
+    /// and reallocated (which always zero-fills it) can never be served from
+    /// the old contents.
+    hot: Option<(u64, [u8; BLOCK_SIZE as usize])>,
 }
 
 impl<K: Kernel, A: BufferAlloc> BlockCache<K, A> {
@@ -156,6 +166,7 @@ impl<K: Kernel, A: BufferAlloc> BlockCache<K, A> {
             state: State::Live,
             view: None,
             slots: [Slot::new(); NCACHE],
+            hot: None,
         };
         let tag = bc.next_tag();
         bc.k
@@ -223,11 +234,76 @@ impl<K: Kernel, A: BufferAlloc> BlockCache<K, A> {
             dst.copy_from_slice(&self.slots[idx].data);
             return Ok(());
         }
+        let mut block = [0u8; BLOCK_SIZE as usize];
+        self.fetch(lba, 1, &mut block)?;
+        self.slots[idx] = Slot {
+            lba,
+            valid: true,
+            data: block,
+        };
+        dst.copy_from_slice(&block);
+        Ok(())
+    }
 
-        let (grant, base) = self
-            .alloc
-            .alloc(BLOCK_SIZE as usize)
-            .map_err(Error::Kernel)?;
+    /// Read a block the filesystem walks over and over (an indirect block,
+    /// resolved once per data block) through the one-entry pinned copy.
+    /// `read_block` still fills a normal slot, so this is purely an extra
+    /// hit path; a write to the LBA clears the pinned copy.
+    pub fn read_block_hot(
+        &mut self,
+        lba: u64,
+        dst: &mut [u8; BLOCK_SIZE as usize],
+    ) -> Result<(), Error> {
+        self.ensure_live()?;
+        if let Some((hot_lba, data)) = &self.hot {
+            if *hot_lba == lba {
+                dst.copy_from_slice(data);
+                return Ok(());
+            }
+        }
+        self.read_block(lba, dst)?;
+        self.hot = Some((lba, *dst));
+        Ok(())
+    }
+
+    /// Read `n` whole blocks (`1..=NCACHE`) in ONE `RD_READ`, filling the
+    /// cache slots directly. One request carries `n * BLOCK_SIZE` bytes —
+    /// at most a 4 KiB grant — so a sequential file pays one round trip per
+    /// run instead of one per block. `n` is capped at the slot count because
+    /// a longer run could not be kept in the direct-mapped cache anyway.
+    pub fn read_run(&mut self, lba: u64, n: usize) -> Result<(), Error> {
+        self.ensure_live()?;
+        if n == 0 || n > NCACHE {
+            return Err(Error::Status(RD_ERR_INVAL));
+        }
+        self.check_range(lba, n as u64)?;
+        let mut data = [0u8; BLOCK_SIZE as usize * NCACHE];
+        self.fetch(lba, n, &mut data[..n * BLOCK_SIZE as usize])?;
+        for i in 0..n {
+            let off = i * BLOCK_SIZE as usize;
+            let slot = ((lba + i as u64) % NCACHE as u64) as usize;
+            self.slots[slot].lba = lba + i as u64;
+            self.slots[slot].valid = true;
+            self.slots[slot]
+                .data
+                .copy_from_slice(&data[off..off + BLOCK_SIZE as usize]);
+        }
+        Ok(())
+    }
+
+    /// Whether `lba` is resident right now, without touching the device.
+    /// Readahead uses this to avoid prefetching a block that just arrived.
+    pub fn contains(&self, lba: u64) -> bool {
+        let idx = (lba % NCACHE as u64) as usize;
+        self.slots[idx].valid && self.slots[idx].lba == lba
+    }
+
+    /// The one request body: `n` blocks at `lba` into `out` (exactly
+    /// `n * BLOCK_SIZE` bytes). The grant buffer is the allocator's; the
+    /// reply's returned cap is re-adopted for the next window=1 request.
+    fn fetch(&mut self, lba: u64, n: usize, out: &mut [u8]) -> Result<(), Error> {
+        debug_assert_eq!(out.len(), n * BLOCK_SIZE as usize);
+        let (grant, base) = self.alloc.alloc(out.len()).map_err(Error::Kernel)?;
         let grant = SendCap {
             rights: W,
             ..grant
@@ -235,7 +311,7 @@ impl<K: Kernel, A: BufferAlloc> BlockCache<K, A> {
         let tag = self.next_tag();
         let mut req = [0u8; 28];
         req[..16].copy_from_slice(&RdFrame::new(RD_READ, false).encode());
-        req[16..28].copy_from_slice(&encode_rw_body(lba, 1));
+        req[16..28].copy_from_slice(&encode_rw_body(lba, n as u32));
         self.k
             .send(self.chan_w, tag, 0, &req, &[grant], TIMEOUT_NONE)
             .map_err(|e| self.kernel_fail(e))?;
@@ -255,17 +331,14 @@ impl<K: Kernel, A: BufferAlloc> BlockCache<K, A> {
             // Driver error reply (e.g. RD_ERR_RANGE): device is alive.
             return Err(Error::Status(status));
         }
-        if bytes != BLOCK_SIZE as u64 {
+        if bytes != out.len() as u64 {
             return Err(self.proto_fail());
         }
-        // The driver wrote the block into our buffer; copy it into the slot
+        // The driver wrote the blocks into our buffer; copy them out
         // (memmove semantics — in shared space the buffer could alias the
-        // cache slot in principle).
-        // Safety: `base` is the allocator's buffer; `BLOCK_SIZE` bytes.
-        unsafe { copy::copy_from(base, &mut self.slots[idx].data) };
-        self.slots[idx].lba = lba;
-        self.slots[idx].valid = true;
-        dst.copy_from_slice(&self.slots[idx].data);
+        // destination in principle).
+        // Safety: `base` is the allocator's buffer; `out.len()` bytes.
+        unsafe { copy::copy_from(base, out) };
         Ok(())
     }
 
@@ -323,6 +396,9 @@ impl<K: Kernel, A: BufferAlloc> BlockCache<K, A> {
             return Err(Error::Status(status));
         }
         self.slots[(lba % NCACHE as u64) as usize].valid = false;
+        if matches!(&self.hot, Some((h, _)) if *h == lba) {
+            self.hot = None;
+        }
         Ok(())
     }
 
@@ -551,5 +627,6 @@ impl<K: Kernel, A: BufferAlloc> BlockCache<K, A> {
     fn mark_stale(&mut self, reason: u16, detail: u32) {
         self.state = State::Stale { reason, detail };
         self.view = None;
+        self.hot = None;
     }
 }

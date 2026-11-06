@@ -88,6 +88,19 @@ void tcp_conn_release(int conn_id) {
     tcp_conn_partition[conn_id] = TCP_CONN_PARTITION_NONE;
 }
 
+void tcp_partition_born_bounded(uint32_t partition_id) {
+    /* v0.2 §11 Q4. Overwrites whatever the slot held: a destroyed partition's
+     * id can be handed to the next tenant (P3 destroys and re-creates them),
+     * and a reused slot is a NEW tenant whose ceiling is the default, not the
+     * previous occupant's. The operator can still set 0 afterwards. */
+    if (partition_id >= PARTITION_MAX || partition_id == PARTITION_SYSTEM) return;
+    partition_conn_quota[partition_id] = PARTITION_TENANT_CONN_QUOTA_DEFAULT;
+    kernel_serial_printf("[TCP-QUOTA] partition %u: born bounded at %u "
+                         "(tenant default; 0 = explicitly unlimited)\n",
+                         (unsigned)partition_id,
+                         (unsigned)PARTITION_TENANT_CONN_QUOTA_DEFAULT);
+}
+
 int tcp_partition_set_conn_quota(uint32_t partition_id, uint16_t quota) {
     if (partition_id >= PARTITION_MAX) return 1;
     partition_conn_quota[partition_id] = quota;

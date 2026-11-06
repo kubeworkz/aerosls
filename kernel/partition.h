@@ -47,6 +47,35 @@
 #define PARTITION_ASSIGN_MAX  4096 /* uid -> partition assignments, ~16 users/tenant average across 256 tenants */
 #define PARTITION_NAME_LEN    32
 
+/* ─── The tenant connection quota a partition is BORN with (v0.2 §11 Q4) ───
+ * net/tcp_quota.h's per-partition bound existed since P2 and defaulted to 0
+ * (unlimited) for every partition, which meant a freshly created environment
+ * had no ceiling at all until an operator set one -- exactly the starvation
+ * case tcp_quota.h documents, left open by default. Roadmap v0.2 §11 Q4 asked
+ * for a defensible number rather than a mechanism, and this is it. The policy
+ * lives here, in the partition lifecycle, because it is applied where a
+ * partition comes into existence (partition_create(), and the restore path
+ * that bypasses it) and not in the create caller -- so no environment, from
+ * any create path, can be born unbounded.
+ *
+ * The derivation, from the constants the pool is actually built from:
+ * TCP_INBOUND_MAX_CONNS is 496 (TCP_MAX_CONNS 512 minus the 16-slots-and-more
+ * outbound reserve), and §8's capacity ceiling is FOUR concurrent environments
+ * per node. A quarter each -- 124 -- is the obvious split and the wrong one:
+ * four tenants at their cap would consume the whole inbound pool and the
+ * system partition's control plane could not accept a connection during a
+ * tenant flood. Five shares instead (four tenants + the system partition):
+ * 496/5 = 99.2, floored to 96. Four tenants at 96 hold 384 slots and leave
+ * 112 for PARTITION_SYSTEM and any other partition -- the control plane still
+ * answers in the worst case, which is the property the number exists to buy.
+ * 96 is also comfortably above what one environment's sidecar opens in the
+ * gate runs (a handful), so the default refuses normal work only when a
+ * tenant is actually flooding -- confirmed live by the guard's clause N19b.
+ *
+ * 0 still means "explicitly unlimited": an operator may lift the cap, and the
+ * default changes no admittance rule -- only what a partition starts with. */
+#define PARTITION_TENANT_CONN_QUOTA_DEFAULT 96
+
 struct SLSPartitionEntry {
     uint32_t partition_id;
     char     name[PARTITION_NAME_LEN];
@@ -80,6 +109,17 @@ extern struct SLSPartitionOwner partition_owner_table[PARTITION_MAX];
  * existing behavior to keep working, see the top comment. Called once
  * from kernel.c's init sequence, near process_init(). */
 void partition_init(void);
+
+/* Re-applies PARTITION_TENANT_CONN_QUOTA_DEFAULT to every active non-system
+ * partition. partition_create() applies it at mint for a partition created
+ * during this boot; persist_restore_all() restores partition_table[] DIRECTLY
+ * and bypasses partition_create() entirely -- the same trap the ownership rows
+ * hit in Multi-Node Phase 2 (see that restore block's comment) -- so the
+ * restore path calls this once after the table is read back, or every
+ * partition that survived a reboot would come back unbounded. Called from
+ * kernel/persist.c only; kept here so the two lifetimes (minted, restored)
+ * share one definition of "born bounded" instead of two copies of the loop. */
+void partition_apply_conn_quota_defaults(void);
 
 /* Defines a new partition, returns its id, or 0xFFFFFFFF if the table is
  * full or `name` doesn't fit PARTITION_NAME_LEN-1 bytes. Ids are handed

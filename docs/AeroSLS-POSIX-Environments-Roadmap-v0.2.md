@@ -1190,7 +1190,7 @@ scope, as §5's scope said.
 - **A kernel-brokered socket service.** The tenant's manifest gains a `network` Chan cap whose peer is a **kernel service** (`kernel.net.socket`), not `drv.network.0`. The difference is the whole design: `drv.network.0` is a sidecar in some partition, and pointing a tenant at it would cross the LPAR Phase 11 IPC boundary; a kernel service is reached through E2's kernel-owned-name allowlist, which is exactly how `kernel.env.console` and `kernel.env.control` already reach a tenant (`kernel/env_console.h`). The mechanism is *copied*, deliberately, so a reviewer has one shape to check rather than two.
 - **NICs stay kernel-owned.** E1's device-ownership decision put the NICs in the kernel (control plane on the management NIC, DSPP on the cluster NIC) and gave `init` no network driver. P2 does not revisit that; the kernel's own stack (`net/ipv4.c`, `net/tcp.c`, `net/udp.c`) is what the brokered service fronts.
 - **Every partition's share is bounded, by the mechanisms that already exist.** The brokered service admits a connection only after `tcp_conn_attribute(conn_id, uid)` has attributed it to the caller's partition and the partition's quota admitted it (`net/tcp_quota.h`, `SYS_SLS_PARTITION_CONN_QUOTA_SET/LIST` 277/278, `GET/POST /api/partition/connquota(s)`), and the request family is subject to the existing per-partition rate limiting (`net/http_rate_limit.c`). The *reason* this is a phase and not a knob is the failure mode `tcp_quota.h` documents: a partition whose clients hold many simultaneous slow connections starves neighbours without ever tripping a time-window rate limit. That is the hazard an environment must not reintroduce, and it is already solved one layer down.
-- **The quota's default stays 0 = unlimited**, following the module's own BSS-zero-safe convention, so a fresh boot needs no init step and existing behaviour is unchanged until an operator opts a partition in. P2 states the *recommended* default for a tenant partition (non-zero) as an open question (§11) rather than changing it here.
+- **The quota's default is the tenant's, set where the partition is minted** (P2's fifth increment, §11 Q4). The first four increments shipped the mechanism with 0 = unlimited, deliberately: they made the quota *enforceable* and left its number to a decision. The decision then fell out of the mechanism's own measurements — `env create` never set a quota, so every environment was born with no ceiling at all, which is the starvation case the mechanism exists to close. A partition is now born at `PARTITION_TENANT_CONN_QUOTA_DEFAULT` (96, derived in `kernel/partition.h` from `TCP_INBOUND_MAX_CONNS` 496 and §8's four-environment ceiling), applied by `partition_create()` and re-applied by the restore path that bypasses it, with `PARTITION_SYSTEM` exempt. 0 still means *explicitly unlimited* and the admit rule is unchanged; only the starting value moved. Changing a quota is a control-plane action: syscall 277 refuses a caller outside `PARTITION_SYSTEM` by name before it touches the table (the arm shipped with **no** authority check), and `POST /api/partition/connquota` requires `DB_ADMIN`, the gate this file's sibling policy routes already carry.
 - **The surface, scoped honestly.** TCP client and listener first — the syscalls the E7 census and the eliminated monitoring candidate both name (`socket`, `connect`, `send`/`sendto`, `recv`/`recvfrom`, `shutdown`, `close`). UDP and name resolution are *named* as following, because `net/udp.c`, `net/arp.c`, `net/dhcp.c` and `net/ipv4.c` exist but exposing a resolver's cache and lifecycle to a tenant is its own design. The Linux shim's socket path (excluded from E7 in `AeroSLS-Linux-ABI-Shim-Design-v0.1.md` §9 as "v0.2 item 2's") becomes forwardable to this same service, with no second implementation.
 - **The descriptor angle, stated once.** Networking does not survive a checkpoint and should not pretend to: a checkpointed environment's sockets are closed and its listener is re-established on resume, because a connection is a property of a running peer and a half-open socket is not a thing to restore. The descriptor carries the *listener configuration*, not the connections, and P2 says so explicitly so P1a's reviewers are not asked to capture TCP state.
 
@@ -1349,6 +1349,219 @@ total, all biting with the vacuity control green; ci.yml parses as YAML and
 carries the step after the ISO build. §11 Q4 stays open, exactly as the
 prose above requires: these increments make the quota enforceable, not its
 number prescribed.
+
+### Findings addendum — what landed, increment 5 (§11 Q4: born bounded, and who may change it)
+
+The decision, and the two things it turned out to need beyond the number.
+
+- **The number: 96, derived rather than chosen.** `TCP_INBOUND_MAX_CONNS` is
+  496 (512 total minus the outbound reserve) and §8's ceiling is four
+  concurrent environments per node. A quarter each — 124 — is the obvious
+  split and the wrong one: four tenants at their cap would consume the whole
+  inbound pool and the system partition's control plane could not accept a
+  connection during a tenant flood. Five shares instead (four tenants + the
+  system partition): 496/5 = 99.2, floored to 96. Four bounded tenants hold
+  384 slots and leave **112** for `PARTITION_SYSTEM` and any other partition.
+  96 is also far above what one environment's sidecar opens in the gate runs,
+  so the default refuses normal work only when a tenant is actually
+  flooding.
+- **The default is applied where the partition is BORN, not by the create
+  caller.** `partition_create()` calls `tcp_partition_born_bounded()`; no
+  create path — shell, HTTP, `tenant_create()` — can forget it, and a reused
+  partition id (P3 destroys and re-creates them) is born bounded again
+  rather than inheriting the previous occupant's ceiling. That call is a
+  **weak** symbol in `partition.c`, the same host-link idiom `kernel_io.h`'s
+  arch hooks established: twenty-nine host tests link `partition.c` without
+  the net layer, and a strong call would break every one of their link
+  lines for a policy they do not assert.
+- **The restore path was the trap.** `persist_restore_all()` writes
+  `partition_table[]` directly and never calls `partition_create()` — the
+  same bypass the ownership rows hit in Multi-Node Phase 2. Without a second
+  application site, every partition that survived a reboot would come back
+  unbounded while a freshly minted one was capped. The block now calls
+  `partition_apply_conn_quota_defaults()` after the table is read, so both
+  lifetimes share one definition of "born bounded".
+- **Who may change it was a real hole, not a formality.** The 277 arm had no
+  authority check at all: any ring-3 caller could zero its own ceiling or a
+  neighbour's, which would have made the default decorative. The arm now
+  resolves the caller's partition and refuses a non-`PARTITION_SYSTEM`
+  caller by name *before* the setter (`CAP_EPERM`, with the pid and partition
+  in the line). Kernel context — where no process is current — is the HTTP
+  route's own path, so that route carries the role gate instead: `POST
+  /api/partition/connquota` now requires `DB_ADMIN`, the same gate partition
+  create takes. `PARTITION_SYSTEM` stays unlimited; 0 remains the operator's
+  explicit escape hatch.
+- **What this increment left open, and the next one closed.** The same
+  missing authority check existed on the sibling policy setters — 273
+  (`CPU_WEIGHT_SET`) and 275 (`STORAGE_QUOTA_SET`) — which this increment
+  deliberately did not touch. Increment 6 is that class closed once (below),
+  not three copies drifting apart, rather than a finding recorded as covered
+  when it was not.
+
+**Verification.** `tests/tcp_quota_host_test.c` scenario 7b executes the
+birth hook against the real module: the default reads back, exactly 96
+connections are admitted and the 97th refused (the default is *enforced*, not
+just stored), a reused slot is re-bounded, `PARTITION_SYSTEM` is exempt, and
+an operator can still set 0. The guard grew **N18** (the mint, the restore
+site, the exemption and the birth line) and **N19** (the dispatch gate before
+the setter, and the route's role gate) — with five teeth, each reddening its
+own clause: `no-birth-default`, `no-restore-default`, `no-birth-line`,
+`ungated-quota-set`, `no-quota-role`. The live arm's **N19b** reads a freshly
+created partition back through `GET /api/partition/connquotas` **before**
+configuring anything and requires 96, with the kernel's own `[TCP-QUOTA]
+partition N: born bounded at 96` line agreeing; L5's partition B assertion
+changed with it (B holds 96, not "no quota").
+
+**Run record — increment 5's live arm (2026-11-03).** `make x86-iso` then
+`tests/env_net_isolation_check.sh --live` on that image, one invocation. The
+guard's source clauses N1–N19 were green first, then the boot: `[TCP-QUOTA]
+partition 1: born bounded at 96 (tenant default; 0 = explicitly unlimited)`
+and the same line for partition 2 in the serial transcript; `ok: N19b.
+partition 1 was born bounded at 96 (the kernel's line and the API's readback
+agree)` — the readback taken BEFORE the arm configured anything; then
+`ok: L5. quota set on A (=1) and read back; B holds the tenant default (96),
+untouched by A's quota`, `ok: L5. A's excess accept was refused BY NAME while
+A sat at its quota (charged to nobody)`, and `ok: L5. B kept serving
+throughout (conn_usage=1 live while A's flood was refused; B never refused)`.
+The arm's first attempt failed **by name** at N19b with an empty readback —
+not the default (the kernel's line was already on the wire) but the arm
+fetching into a file its readback helper does not read; the fix is the one
+line above, and the assertion is what caught it rather than a silent pass.
+
+### Findings addendum — what landed, increment 6 (the same hole on the sibling setters)
+
+Increment 5 closed §11 Q4's authority for the connection quota and named,
+rather than fixed, the identical absence on 273 (CPU weight) and 275
+(storage quota). This increment closes the class.
+
+- **One rule, in one place.** `partition_budget_may_change(tag, what)` in the
+  dispatcher now holds the check (renamed `partition_control_may_act()` in
+  increment 7, when the rule reached beyond budgets): a caller in any
+  partition but `PARTITION_SYSTEM` is refused by name before the setter runs,
+  and kernel context (no current process) is the control plane's path. All
+  three arms call it, and increment 5's inline copy for 277 was folded into it
+  — so a fourth budget setter has one obvious place to join and the three
+  cannot drift apart.
+- **The routes.** `POST /api/partition/cpuweight` and `POST
+  /api/partition/storagequota` now require `DB_ADMIN`, the same gate the
+  connquota route and `/api/partitions` take. Without it the dispatcher's
+  check would be bypassed from kernel context — the one path with no caller
+  to inspect.
+- **No behaviour change for the operator.** `init`, the system shell and the
+  control plane are all `PARTITION_SYSTEM` or kernel context; the refusals
+  name pid and partition, so a denied tenant is visible rather than silent.
+
+**Verification.** N19 now asserts all three arms (each helper call, each
+before its own setter) and all three routes (the role parameter, the gate and
+the call site). Four teeth split the class back open one at a time —
+`ungated-cpu-weight`, `ungated-storage-quota`, `no-cpuweight-role`,
+`no-storage-role` — 34 teeth, 0 lost, vacuity control green. The live arm
+re-ran on the rebuilt ISO: the connquota POST still sets A's quota to 1 from
+kernel context, N19b still reads a fresh partition at 96, and B still holds
+96 while serving — the refactor moved 277 through the shared helper without
+changing what the live path does.
+
+### Findings addendum — what landed, increment 7 (the same rule on the partition itself)
+
+Increment 6 closed the budget setters and left 213 (frame quota) and
+214-216 (destroy, pause, resume) named but open. This increment is those
+four — and the one beside them that would have made them decorative.
+
+- **The helper stops saying "budget".** `partition_control_may_act(tag,
+  what)` is the same check with the verb passed in, so a refusal reads
+  `[PARTITION] refused: pid=104 (partition 1) may not destroy a partition`
+  rather than repeating "a budget" at a destroy. Eight arms now call it, and
+  the rename is deliberate: the rule was never only about budgets, and a
+  name that says otherwise is how the next partition-wide operation fails to
+  find it.
+- **211 (assign) is in scope although it was not asked for.**
+  `partition_assign_uid()` accepts any non-zero uid for any valid partition,
+  and `PARTITION_SYSTEM` *is* partition 0 — so an ungated assign is a way
+  into the gate: assign a uid you control to partition 0, spawn, and every
+  caller check in this file reads "system". Gating the five while leaving
+  that door open would have been a gate with a door in it, and the same
+  argument is why the teeth include one for the assign arm by name.
+- **The routes.** `/api/partition/{destroy,pause,resume,quota,assign}` now
+  require `DB_ADMIN`, the gate their create and budget siblings took. The
+  dispatch check cannot cover them: kernel context has no current process,
+  which is the one path where "the caller is SYSTEM" is vacuously true.
+- **The operator's path is unchanged.** The system shell runs as uid 0, which
+  resolves to partition 0, so its `partition` subcommands (destroy, pause,
+  resume, quota, assign) still work; and the kernel's own callers (the
+  checkpoint quiesce, migration, failover) call `partition_pause()`,
+  `partition_resume()` and `partition_destroy()` directly, below these arms
+  — unaffected by construction, not by exemption.
+
+**What this increment left open, and increment 8 closed.** 210
+(`PARTITION_CREATE`) and 218 (`PARTITION_MIGRATE`) were partition-wide
+operations a ring-3 caller could still reach. Neither could put a caller
+inside partition 0 — create stamps a fresh non-zero id and migrate refuses
+SYSTEM as its destination — so neither reopened this gate, but both were the
+same class of decision. They are the last two, and the next increment is
+them (below), which is why this document can stop hedging on the word
+"every".
+
+**Verification.** The guard is 21/21, with N20 naming the five arms and the
+five routes and asserting each arm's check precedes its own operation. Nine
+teeth split the class back open one at a time — `ungated-frame-quota`,
+`ungated-assign`, `ungated-destroy`, `ungated-pause`, `ungated-resume`, plus
+`no-frame-quota-role`, `no-assign-role`, `no-destroy-role`, `no-pause-role` —
+43 teeth total, 0 lost, vacuity control green. Pause and resume share one
+handler, so their gate has one tooth covering both routes; a tenth tooth
+claiming to remove a second copy would be asserting against nothing. The
+connquota teeth were re-anchored to their own handler's signature in the same
+pass, because a bare `req_role > ROLE_DB_ADMIN` replacement would now remove
+every route's gate at once and prove nothing about the one it names.
+
+The `--live` arm re-ran on the rebuilt ISO (38 clauses, exit 0) and still sets
+A's connection quota to 1 through `POST /api/partition/connquota` with the
+`DB_ADMIN` token — which is the regression this increment most needed to
+rule out: the new role gates close the routes to a lesser token, and the
+control plane's own path still works. The boot also logs no refusal from any
+new arm, so the added checks are not firing on the operator's own work.
+
+### Findings addendum — what landed, increment 8 (the class closed — mint and move)
+
+The last two partition-wide arms, and the end of this thread. Increments 5-7
+gated eight; this one gates 210 (create) and 218 (migrate) and can therefore
+say the rule holds for every arm in the dispatcher that acts on a partition
+rather than on the caller's own work.
+
+- **Create is the arm a tenant had the most direct use for.** Minting a
+  partition claims a share of the frame pool and a slot in the table every
+  later operation looks up. It is refused with the arm's own failure
+  sentinel (`0xFFFFFFFF`) rather than `CAP_EPERM`, deliberately: this
+  syscall returns a partition id and its callers already branch on that
+  sentinel, so a refusal has to look like the failure the call site knows
+  how to report. The named line above it carries the reason.
+- **Migrate is the arm whose existing guard covers the wrong end.**
+  `partition_migrate()` already refuses to move `PARTITION_SYSTEM` — that is
+  a guard on the target, the same distinction `partition_destroy()` draws —
+  and it says nothing about who may move a tenant. The arm now answers both
+  questions: not the system partition, and not from a non-system caller.
+- **The route was already gated and never asserted.** `/api/partitions` has
+  required `DB_ADMIN` since it was written, but no clause checked it, so the
+  gate could have been deleted with the suite green. It is asserted now, in
+  the same clause as the two arms, and has its own tooth — a claim that is
+  merely true is not the same as a claim that can go red.
+- **The class, stated once.** Ten arms, one helper, one question: is the
+  caller `PARTITION_SYSTEM`? Kernel context passes because it *is* the
+  control plane, and every route that reaches an arm from that context
+  carries `DB_ADMIN` instead. A future partition-wide operation now has one
+  place to join and a clause that will notice if it does not.
+
+**Verification.** The guard is 22/22, with N21 over both arms (each check
+ordered before its own operation) and the `/api/partitions` route. Three
+teeth — `ungated-create`, `ungated-migrate`, `no-create-route-role` — 46 in
+total, 0 lost, vacuity control green. `make x86-iso` rc=0 and the `--live`
+arm passes on that image (39 clauses, exit 0). That run is the interesting
+half here rather than a formality: the arm defines a partition through
+`POST /api/partitions` with the `DB_ADMIN` token, so it exercises BOTH parts
+of the new gate on the operator's own path — kernel context (no caller, the
+check passes) and the role gate (DB_ADMIN, accepted) — and the boot log
+carries zero refusal lines, so gating 210 cost the control plane nothing.
+Migrate has no live surface (the shell is its only caller), so its arm is
+proven by the source clause and the teeth, not by a boot.
 
 ### Findings addendum — what landed, increment 3 (the listener, the isolation, and the descriptor's line)
 
@@ -2634,7 +2847,7 @@ v0.1 §11 sized M1 at **four concurrent environments per node** and named the ce
 | Descriptor record | a few hundred bytes | small-record band (§4) | one entry per environment, checksummed |
 | Bulk payload | ~1344 frames (5.25 MiB) + two address spaces | NVMe bulk area | the reason a descriptor and a payload are two mechanisms |
 | Durable storage | 1 MiB in the first cut | partition storage quota | grows with the format (P1b) |
-| Sockets | the partition's quota | `tcp_quota.h` (`PARTITION_MAX` 256) | 0 = unlimited until an operator says otherwise |
+| Sockets | 96 concurrent connections (§11 Q4's default, `PARTITION_TENANT_CONN_QUOTA_DEFAULT`) | `tcp_quota.h` (`PARTITION_MAX` 256) | born at 96 at the partition's mint and re-applied on restore; `PARTITION_SYSTEM` unlimited; 0 = explicitly unlimited |
 | Consoles | 1 | `ENV_CONSOLE_MAX` 8 | unchanged from E6 |
 | Process slots | 2 | `PROC_MAX` 16 | unchanged from v0.1 §11 |
 
@@ -2871,7 +3084,7 @@ attach surface, and the guard's C2 covers the source half while
 
 ## 10. Suggested execution order
 
-P1a is unblocked and is the thing E7 waits on, so it starts first. P2 has no dependency on P1 and should run **in parallel** — it is the phase most independent of the others, and serialising it behind persistence would idle a second pair of hands. §6 breaks it into four increments — the wire, the outbound path, the listener and the descriptor's line, and the measured bounds — each carrying one of the guard's teeth, so the parallel lane starts at a named first PR. P1b follows P1a because its descriptor field is P1a's. P3 starts only once P1a, P1b and P2 are all in, because every one of them is part of its payload, and a migration that is missing one of the three is exactly the "two nodes that disagree" failure the phase exists to prevent.
+P1a is unblocked and is the thing E7 waits on, so it starts first. P2 has no dependency on P1 and should run **in parallel** — it is the phase most independent of the others, and serialising it behind persistence would idle a second pair of hands. §6 breaks it into four increments — the wire, the outbound path, the listener and the descriptor's line, and the measured bounds — each carrying one of the guard's teeth, so the parallel lane starts at a named first PR. A fifth landed on top once the mechanism's own measurement showed `env create` was producing tenants with no ceiling at all: §11 Q4's default, applied where the partition is minted (§6's increment-5 addendum). P1b follows P1a because its descriptor field is P1a's. P3 starts only once P1a, P1b and P2 are all in, because every one of them is part of its payload, and a migration that is missing one of the three is exactly the "two nodes that disagree" failure the phase exists to prevent.
 
 | Order | Phase | Gate to leave it |
 |---|---|---|
@@ -2895,7 +3108,7 @@ E7's own gate — *"a static binary doing the first user's actual work, running 
 1. **P1b: is an environment's storage *a stream*, or its own LBA region?** *(Settled by P1b's second increment, §5: a **dedicated per-environment LBA extent band** — streams are fixed 64 MiB slots deliberately excluded from the storage quota, so a stream-backed store would get persistence at the cost of the phase's central requirement; the band reuses persist.c's checksummed-region story without inheriting a stream's semantics, and its extent is exactly the region it mirrors, page for page. The reasons are recorded in §5's second-increment addendum.)* A stream gains migration, quota and persistence for free (`stream_persist_directory()`, `stream_migrate_*`) but carries a stream's own size and directory semantics; a dedicated region is simpler to size per environment and duplicates the persistence story. This is the same class of choice v0.1 §14 Q2 left open (ramdisk sidecar vs in-process ramfs), and it was settled the way this question asked — by implementation, with the reasons written down.
 2. **P1a: is quiescing the whole partition the right granularity, or should an environment pause alone?** Today `partition_pause()` is the only pause mechanism, and it stops the tenant's other work too. If environments are the unit of checkpointing, a per-environment pause may be the correct primitive — but it is a new scheduling concept and it should be argued for rather than assumed.
 3. **P1b: does the durable format replace aerofs-lite or extend it?** *(Settled by P1b's first increment, §5: the rule is implemented as **read v1, write v2, refuse the rest by name** — v2 is a version bump, no existing image is rewritten, and the rootfs builder deliberately stays v1.)* The rule was written down before it was implemented, as this question asked; the durable region it is for landed with P1b's second increment (the extent band), and its reboot evidence is re-made in CI on every push since the third.
-4. **P2: what is a tenant partition's *recommended* connection quota?** The mechanism defaults to 0 = unlimited for backward compatibility; a fresh tenant that never opts in is exactly the starvation case `tcp_quota.h` documents. Should the environment-create path set a non-zero default as part of its budget, and if so, what number is defensible?
+4. **P2: what is a tenant partition's *recommended* connection quota?** *(Settled by P2's fifth increment, §6: **96, applied where the partition is minted** — `PARTITION_TENANT_CONN_QUOTA_DEFAULT` in `kernel/partition.h`, derived from `TCP_INBOUND_MAX_CONNS` 496 and this document's own four-environment ceiling: five shares (four tenants + the system partition) is 496/5 = 99.2, floored to 96, so four bounded tenants hold 384 slots and the control plane keeps 112. A quarter each — 124 — is the split that looks right and starves the system partition when all four tenants sit at their cap. The question said "as part of its budget"; the answer is one level lower — `partition_create()` applies it and the restore path re-applies it, so no create caller can produce an unbounded environment, and a reused id is re-bounded rather than inheriting the last occupant's ceiling. Changing a quota is a control-plane action: the 277 syscall refuses a caller outside `PARTITION_SYSTEM` by name (the arm had no authority check at all, which made the default decorative), and the HTTP route requires `DB_ADMIN`. `PARTITION_SYSTEM` stays unlimited and 0 remains the explicit escape hatch. The same missing check on 273/275 was closed in the next increment (§6's increment-6 addendum): all three budget setters share one authority helper, which increments 7 and 8 extended to the frame quota (213), assign (211), the lifecycle arms (214-216), create (210) and migrate (218) — every partition-wide arm in the dispatcher.)* The question as first written: the mechanism defaults to 0 = unlimited for backward compatibility; a fresh tenant that never opts in is exactly the starvation case `tcp_quota.h` documents.
 5. **P3: failover destination (a) or (b)?** Bulk-transfer surviving environments during failover (the PASE-grade answer, a much larger lift) or restore them from their own durable storage on the survivor and report the gap by name (the smaller, consistent-with-`failover.c` first cut). The plan is written to admit either; the decision is a product one about what "a cluster that doesn't lose your environments" has to mean in this window. *(Settled 2026-10: **both, in that order — (b) landed as increments 9 and 11 and stays the classification base; (a) now lands on top of it as the replica path**, because (b) answered "where does the survivor look?" and could not answer "where do the bytes come from when the node holding them is gone?" At declaration time the answer is nowhere — a dead node sends nothing, which is why the transfer cannot be bolted onto the failure and must be a PROACTIVE REPLICA: at the same instant `env_payload_capture_all()` writes the owner's local payload band, the captured record and its payload pages are pushed to the peers over the wire migration already proved (`DSPP_MIGRATE_ENV_BEGIN` carries the record whole; the page family moves 1 KiB fragments with a per-fragment ACK and a retransmit of only what did not land). The receiver stages them and finalizes into a per-environment replica slot — its own band, keyed `(partition, index, seq)` — so the copy is a fact the survivor holds before it needs it. A survivor that later adopts the dead node's partition finds a replica instead of a hole: promotion installs the record into `env_ckpt_table` and the blob into the local payload band, and the replay driver (b) already reuses — create round trip, identity check, pause ledger, pour — brings the environment back WITH its contents. The 24 KiB broadcast never grows: the state tree stays small, and the payload rides the fragment family that already moves 5.5 MiB for migration. A replica that is absent, stale or partial is named by the same three-way classification (b) already reports — refusal over partial application, applied to the replica. The increments and their teeth are in §7's thirteenth-increment addendum;
 the third increment — the survivor PROMOTING a replica instead of finding
 a hole, with (b) as the floor under it — is §7's fifteenth.)*
@@ -2931,7 +3144,10 @@ Everything this document asserts about the tree, with its source.
 | The two CONTENTS clauses are assertions fed through the environment's own console, and the tooth withholds the payload rather than the descriptor | `tests/env_checkpoint_restore_check.sh` — clauses B10/B11, live clauses L4b/L11, T7; `tests/env_checkpoint_restore_check_smoke.sh` — the `payload` tooth group (9 teeth) and the `no-restore` split |
 | The pour waits for parked **and** announced, the flag can only come from this boot's drained `[env-id]`, and a timeout proceeds by name instead of refusing | `kernel/env_payload.c` — `env_payload_wait_parked()`, `EP_WAIT_TICKS` 3000, the `announced=` timeout log; `kernel/env_console.c` — the `identity` flag, `ec_sees_identity()`, `env_console_identity_seen()`; `tests/env_payload_host_test.c` (44 checks); source clause T7 in `tests/env_checkpoint_restore_check.sh` |
 | The kernel brokers a tenant-reachable service through a `kernel.*` name, keyed to `(partition, index)` | `kernel/env_console.h` — `env_console_register()`, `env_console_name_index()`; `kernel/env_service.c` (`kernel.env.control`) |
-| Per-partition connection quotas exist, with syscalls and an HTTP surface, and 0 means unlimited | `net/tcp_quota.h` — `tcp_conn_attribute()`, `tcp_partition_set_conn_quota()`, `SYS_SLS_PARTITION_CONN_QUOTA_SET/LIST`; `net/http.c` — `api_partition_connquotas_list()` |
+| Per-partition connection quotas exist, with syscalls and an HTTP surface, and 0 means explicitly unlimited | `net/tcp_quota.h` — `tcp_conn_attribute()`, `tcp_partition_set_conn_quota()`, `SYS_SLS_PARTITION_CONN_QUOTA_SET/LIST`; `net/http.c` — `api_partition_connquotas_list()` |
+| A partition is BORN at the tenant default (§11 Q4): applied at the mint, re-applied on the restore path that bypasses `partition_create()`, `PARTITION_SYSTEM` exempt | `kernel/partition.h` — `PARTITION_TENANT_CONN_QUOTA_DEFAULT` 96; `kernel/partition.c` — `partition_create()`'s `pq_born_bounded()`, `partition_apply_conn_quota_defaults()`; `kernel/persist.c`'s partition-restore block; `net/tcp_quota.c` — `tcp_partition_born_bounded()` |
+| Acting on a partition as a whole is a control-plane action: 210, 211, 213, 214, 215, 216, 218, 273, 275 and 277 all refuse a non-`PARTITION_SYSTEM` caller by name before the operation, and every HTTP route reaching them requires `DB_ADMIN` | `kernel/syscall_dispatch.c` — `partition_control_may_act()` and the ten arms that call it; `net/http.c` — the role gate in `api_partition_{create,connquota,cpuweight,storagequota,quota,assign,destroy,pause}_post()`; the class is closed at ten arms, recorded in §6's increment-8 addendum |
+| The default is executed, enforced and made red when removed: 96 admitted then refused, reused slots re-bounded, SYSTEM exempt; five teeth over clauses N18/N19 | `tests/tcp_quota_host_test.c` (scenario 7b); `tests/env_net_isolation_check.sh` — N18/N19 (live N19b); `tests/env_net_isolation_check_smoke.sh` — `no-birth-default`, `no-restore-default`, `no-birth-line`, `ungated-quota-set`, `no-quota-role` |
 | The starvation failure mode the quota closes is documented, not assumed | `net/tcp_quota.h`'s "Why this is a genuinely different mechanism" block |
 | A live computation already serialises, crosses nodes and resumes | `kernel/simi_ctx_migrate.h` — `simi_ctx_migrate_send()`, `SimiCtxMigStatus` |
 | Bulk data moves page-by-page with per-page ACKs, and the source is retired only on confirmation | `kernel/stream.h` — `stream_migrate_send_partition()`, `stream_migrate_recv_begin()/_page()`, `stream_count_for_partition()` |
@@ -2966,7 +3182,7 @@ Everything this document asserts about the tree, with its source.
 | Durable storage is not quota-charged to the partition | a tenant's disk is unbounded and unmetered | P1b |
 | The tenant profile has no network cap at all | the environment cannot be PASE-for-real; E7's socket path stays unroutable | P2 |
 | No kernel-brokered socket service | reaching networking would require a cross-partition channel, violating LPAR Phase 11 | P2 |
-| No per-partition bound on a tenant's simultaneous connections | one environment starves its neighbours without tripping the rate limiter | P2 |
+| No per-partition bound on a tenant's simultaneous connections | one environment starves its neighbours without tripping the rate limiter | P2 — the mechanism landed in increments 2–4; the **default** that closes the never-opts-in case is P2's fifth increment (§11 Q4): every partition is born at 96 and only the control plane may change it |
 | `partition_migrate()` does not move an environment | migration leaves the environment on the source (orphaned or destroyed) | P3 *(closed — increments 3–5)* |
 | `failover_recover_from()` adopts ownership only | a dead node's environments vanish with no name in the report | P3 *(report landed as increment 9; the restore half — the survivor replaying what its own durable storage still holds — as increment 11)* |
 | The failover broadcast path is 24 KiB | a 5.5 MiB environment cannot ride it; the gap must be stated, not implied | P3 (destination (a) or (b)) *((b) as built: named by increment 9, restored from durable storage by increment 11; (a) now building as the replica path — §11 Q5, P3 increment 13 onward)* |

@@ -59,7 +59,14 @@ static volatile int g_serial_loopback_owned = 0;
 // stream -- and keeps the evidence. Bounded, so a pathological writer cannot
 // balloon kernel .bss; the overflow count is reported once, on the way out,
 // rather than silently.
-#define SERIAL_LB_DEFER_CAP 2048
+//
+// SERIAL_LB_DEFER_CAP is declared in kernel_io.h with its sizing evidence
+// (2048 dropped 1116 bytes of tenant boot diagnostics on an E3 boot; 16 KiB is
+// 5x the largest measured demand and replayed both batches untouched). Cost is
+// .bss -- the buffer below plus the replay scratch, 32 KiB total. Still bounded,
+// and the bound is ASSERTED, not assumed: the E3 check fails BY NAME if the
+// overflow line ever appears, so a future workload that outgrows this ring
+// reddens a check instead of quietly deleting evidence.
 static char   lb_defer_buf[SERIAL_LB_DEFER_CAP];
 static size_t lb_defer_len;
 static size_t lb_defer_dropped;

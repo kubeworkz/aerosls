@@ -124,14 +124,85 @@ fn rdtsc() -> u64 {
 /// ratio is 1.0 and the ns output stays correct.
 static CYCLES_PER_NS: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
 
+/// Calibration shape: five trials of 2 ms — the same ~10 ms of startup the
+/// single 10 ms window cost, split so that one preemption cannot poison the
+/// factor for the whole leg.
+const TSC_CAL_TRIALS: usize = 5;
+const TSC_CAL_TRIAL_MS: u64 = 2;
+
+/// Plausibility window for the factor: 0.05-50 cycles/ns (50 MHz - 50 GHz).
+/// A real x86 TSC is single-digit GHz and the non-x86 fallback lands at ~1.0,
+/// so only a delta that cannot be a clock — a zero-length window, a wrapped
+/// counter — falls outside; the bound is there so a garbage ratio can never
+/// win the maximum below.
+const TSC_MIN_CYCLES_PER_NS: f64 = 0.05;
+const TSC_MAX_CYCLES_PER_NS: f64 = 50.0;
+
+/// The calibration rule, separated from the clock reads so it can be tested
+/// without sleeping.
+///
+/// Each sample is one trial whose cycle reads sit INSIDE its wall-clock reads
+/// (`Instant`, `rdtsc`, sleep, `rdtsc`, `Instant`). A preemption can then only
+/// stretch the wall interval beyond the cycle interval, never the reverse, so
+/// every trial is a lower bound on the true factor and their maximum is the
+/// best estimate.
+///
+/// That bracketing is the fix. The previous code read `rdtsc` BEFORE the
+/// `Instant` at each end, so a scheduling gap landing in either seam measured
+/// a different interval for the cycles than for the wall time — skewing the
+/// ratio in either direction — and because `CYCLES_PER_NS` is calibrated once
+/// per process, a single skewed seam corrupted every number that leg reported.
+/// CI run
+/// 41853350556 shows the result: the shm leg implied 3.727 cycles/ns against
+/// 2.566 on the tcp leg of the same run (each leg is its own process), a 45%
+/// skew that under-reported that leg's ns and clamped the compute-dominant
+/// shm sqrt split to 0.
+///
+/// The estimate errs LOW by construction, approaching the true factor from
+/// below as trials are added. That is the safe direction: a low factor
+/// inflates every reported ns by one common proportion, so a transport gate
+/// with 6x headroom still passes, whereas a high factor shortens totals
+/// against a Lisp-side compute it cannot compress.
+fn calibration_factor(samples: impl IntoIterator<Item = (u64, f64)>) -> f64 {
+    let mut best = 0.0_f64;
+    for (cycles, ns) in samples {
+        if !(ns > 0.0) {
+            continue;
+        }
+        let factor = cycles as f64 / ns;
+        if factor.is_finite()
+            && (TSC_MIN_CYCLES_PER_NS..=TSC_MAX_CYCLES_PER_NS).contains(&factor)
+            && factor > best
+        {
+            best = factor;
+        }
+    }
+    best
+}
+
 fn calibrate_tsc() -> f64 {
-    let t0 = rdtsc();
-    let i0 = std::time::Instant::now();
-    std::thread::sleep(std::time::Duration::from_millis(10));
-    let t1 = rdtsc();
-    let i1 = std::time::Instant::now();
-    let dt_ns = i1.duration_since(i0).as_nanos() as f64;
-    t1.wrapping_sub(t0) as f64 / dt_ns
+    let mut samples = Vec::with_capacity(TSC_CAL_TRIALS);
+    for _ in 0..TSC_CAL_TRIALS {
+        // Wall reads outermost, cycle reads innermost: see calibration_factor.
+        let i0 = std::time::Instant::now();
+        let t0 = rdtsc();
+        std::thread::sleep(std::time::Duration::from_millis(TSC_CAL_TRIAL_MS));
+        let t1 = rdtsc();
+        let i1 = std::time::Instant::now();
+        samples.push((
+            t1.wrapping_sub(t0),
+            i1.duration_since(i0).as_nanos() as f64,
+        ));
+    }
+    let factor = calibration_factor(samples);
+    if factor > 0.0 {
+        factor
+    } else {
+        // No trial produced a usable ratio: the counter is broken rather than
+        // the host slow. Fall back to the non-x86 factor so the run continues
+        // with visibly inflated ns instead of dividing by zero.
+        1.0
+    }
 }
 
 /// Convert a cycle-count delta to nanoseconds (wall clock, via calibration).
@@ -166,9 +237,17 @@ fn cycles_to_ns(cycles: u64) -> u64 {
 /// cross-domain error, ~90us on a 10ms interval, against a ~4us ring
 /// transport. That floor is not an ordering artifact; removing it needs the
 /// clocks reconciled or the subtraction avoided (e.g. a transport-only
-/// reference timed in this process's own clock). The gated legs sit nowhere
-/// near it: their computes are 1-264us, so ~0.9% is 0.01-2.4us against
-/// transports of 4-870us.
+/// reference timed in this process's own clock).
+///
+/// The gated legs are not all clear of it. Five of the six keep a transport
+/// far above the documented ratio error (0.01-2.4us against transports of
+/// 4-870us), but shm sqrt is compute-dominant: ~27us of transport against a
+/// ~150us compute whose measured total carries a ~65us stddev, so a host
+/// episode can clamp it with both fields live. CI run 41853350556 did
+/// (total 132200 ns against compute 151000 ns). The e2e therefore reads a
+/// saturated clamp on that leg as the floor rather than a dead split,
+/// bounded to a quarter of the reported compute; every other leg keeps the
+/// strict transport > 0 rule.
 fn median_transport_ns(total_cy: &[u64], compute_ns: &[u64]) -> u64 {
     debug_assert_eq!(
         total_cy.len(),
@@ -1149,7 +1228,9 @@ fn main() {
 }
 #[cfg(test)]
 mod tests {
-    use super::{calibrate_tsc, cycles_to_ns, median_transport_ns, CYCLES_PER_NS};
+    use super::{
+        calibration_factor, calibrate_tsc, cycles_to_ns, median_transport_ns, CYCLES_PER_NS,
+    };
 
     /// A cycle count whose `cycles_to_ns` is `ns`, to within rounding — so the
     /// tests assert on nanoseconds without knowing this host's TSC rate.
@@ -1224,5 +1305,45 @@ mod tests {
     #[test]
     fn empty_input_is_zero() {
         assert_eq!(median_transport_ns(&[], &[]), 0);
+    }
+
+    /// The three trials below cover the same 1 ms wall window. Because the
+    /// cycle reads are bracketed by the wall reads, a preemption can only
+    /// lengthen the wall side: the clean trial is the maximum, the other two
+    /// are lower bounds shaped by a seam gap at each end.
+    #[test]
+    fn calibration_takes_the_least_preempted_trial() {
+        let factor = calibration_factor([
+            (2_000_000, 1_000_000.0), // 4 ms of the window was a gap before t0
+            (2_560_000, 1_000_000.0), // clean: 2.56 cycles/ns
+            (1_830_000, 1_000_000.0), // gap after t1
+        ]);
+        assert!(
+            (factor - 2.56).abs() < 1e-9,
+            "the clean trial must win the maximum, got {factor}"
+        );
+    }
+
+    #[test]
+    fn calibration_rejects_trials_that_cannot_be_a_clock() {
+        // A zero-length wall window would divide by zero, and a wrapped or
+        // bogus cycle delta would otherwise win the maximum outright — either
+        // would poison every number the leg reports.
+        let factor = calibration_factor([
+            (1_000, 0.0),
+            (u64::MAX, 1.0),
+            (2_560, 1_000.0),
+        ]);
+        assert!(
+            (factor - 2.56).abs() < 1e-9,
+            "only the usable trial should count, got {factor}"
+        );
+    }
+
+    #[test]
+    fn calibration_of_no_usable_trial_is_zero() {
+        // calibrate_tsc turns this into its documented 1.0 fallback; the rule
+        // itself reports "nothing usable" rather than inventing a factor.
+        assert_eq!(calibration_factor([(1_000, 0.0), (0, 5.0)]), 0.0);
     }
 }
