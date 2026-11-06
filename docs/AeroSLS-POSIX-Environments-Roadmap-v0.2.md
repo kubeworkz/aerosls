@@ -1179,6 +1179,115 @@ host remains how an operator obtains a fresh artifacts directory.
 Migration of a durable store (P3) and snapshotting one remain out of
 scope, as §5's scope said.
 
+### Fourth increment — the read path, measured
+
+**What exists now.** A durable store that survives a reboot but pays one
+device request per 512-byte block is durable and unusable. This increment is
+the read path that makes it a filesystem — a sequential file is read in
+physically contiguous runs, an indirect block is resolved once per file rather
+than once per data block, and the guard now measures the path's
+device-request cost on both sides of the reboot. The same change set also
+collapsed the allocation map's bookkeeping to one pass per allocating write,
+which kept the write phase from dominating the run that measures the read.
+
+Landed, and verified:
+
+- **`user/blockcache/src/cache.rs` — `read_run` and the pinned indirect
+  block.** `RD_READ` always carried a block count, but the cache asked for
+  one block at a time. `read_run` now fetches up to `NCACHE` (eight)
+  physically contiguous blocks in one request into a 4 KiB grant and fills
+  the slots directly; `read_block` keeps the single-block path, and
+  `read_block_hot` keeps one indirect block in a copy outside the
+  direct-mapped slots, because the VFS resolves that block for every data
+  block and the data reads evict it. A write to the pinned LBA clears the
+  copy, so a freed and reallocated (zero-filled) block can never be served
+  from the old contents.
+- **`user/vfs/src/vfs.rs` — runs from the file's own layout.** On a cache
+  miss, the read path walks the file's following blocks while they are
+  physically contiguous (`block_addr_opt`), up to `NCACHE`, and fetches the
+  run in one request. A hole or a fragmented next block ends the run and
+  falls back to the single-block fetch: correctness never depends on the
+  layout, only the request count does. Directory and indirect walks use the
+  pinned reader.
+- **`user/vfs/src/vfs.rs` — one allocation-map pass per allocating write.**
+  A v2 write formerly claimed each missing block with its own
+  read-modify-write of the allocation bitmap — eight map round trips of
+  bookkeeping for a 4 KiB write, on top of the data. `blocks_to_allocate()`
+  counts the holes the range will fill (including a fresh indirect block and
+  every entry in its range), and `reserve_blocks()` claims exactly that many
+  in one map read and one rewrite, zero-fills each, and hands them out
+  through `Reserved`. `alloc_block()` remains the single-block path for
+  `truncate`/`write_at` and the fallback when the store cannot satisfy the
+  whole request, so the quota edge still writes what fits and then answers
+  `ENOSPC` (D5d's 16,320 bytes unchanged). A zero-fill refusal clears the
+  claimed bits and stores the map again, so a failed write leaks nothing;
+  `store_alloc_map()` no longer flushes per map write because the operation
+  ends with one flush and every `RD_WRITE` completes before its reply.
+- **`tests/env_storage_durable_check.sh` — `L9b` and `L16b`.** The live arm
+  brackets the three console reads of `/p1b_big` (`wc`, `head -n 20`,
+  `tail -n 20`) with serial line counts, counts the kernel's `send handoff`
+  lines between them, and compares the count with a **600** budget — before
+  the reboot (`L9b`) and again after it (`L16b`). An overrun is a `boot_fail`
+  naming the phase and the count; each phase records `<count> <budget>` in
+  the artifact (`read_handoffs.txt`, `read_handoffs_boot2.txt`). The count is
+  host-speed independent: the read windows had to be widened on a loaded
+  host and returned to 30 s once the run path landed, while the handoff count
+  is the path's own property.
+- **`tests/env_storage_durable_check.sh` — `D3c`, two records.** The replay
+  clause reads both `<count> <budget>` files. A missing, malformed or
+  over-budget record reddens `D3c` naming the phase ("before the reboot" /
+  "after the reboot"); each green line names its count and budget. A cache
+  that only falls back after the reboot therefore cannot pass on the first
+  phase's record.
+- **`tests/env_storage_durable_check_smoke.sh` — `P1B_TOOTH=slow-read`.**
+  The well-formed artifact is copied twice: one with the first boot's record
+  rewritten to `3000 600`, one with the reboot's. Each replay must exit 1
+  naming `D3c`; the first also asserts `D3a` stays green, so the tooth proves
+  the budget reddens on cost alone while every byte remains correct. The
+  smoke is 20 checks now.
+
+**The measurements this increment stands on.** The live arm on this host's
+TCG run (a fresh 10G NVMe image) measured **54** handoffs before the reboot
+and **53** after, against the 600 budget; the per-block path this replaces
+measured **2,926** in the same window. The budget is not a tight timing bound
+— it is roughly eleven times the measured run path and roughly a fifth of the
+per-block path — because a fragmented file legitimately splits runs, and the
+point is to admit that while refusing a return to one request per block.
+
+**The decisions this increment made**, and the reason for each:
+
+- **A request budget, not a latency budget.** Wall-clock time on this host
+  moved with load (the per-block read first needed 120/90 s windows; the run
+  path reads the same file inside the original 30 s), so a time bound would
+  measure the host. The kernel's `send handoff` lines are the store's own
+  cost, and counting them makes the verdict the same on a TCG workstation
+  and a KVM build host.
+- **Both sides of the reboot.** The reboot is where a durable store is most
+  likely to lose its cache state and fall back; measuring only the first boot
+  would leave that half unasserted. `L16b`/`read_handoffs_boot2.txt` close it,
+  and `D3c` treats the two records as one clause with two phases rather than
+  two clauses that can drift apart.
+- **The budget is deliberately loose.** 600 is about eleven times the
+  measured path. A fragmented file may split a run at every layout boundary
+  the file forces, and a budget near 54 would redden on a legal layout; a
+  budget near the per-block cost would admit the regression. The gap between
+  54 and 2,926 is wide enough that the order of magnitude, not the exact
+  count, is what the clause asserts.
+- **The tooth separates cost from correctness.** `slow-read` rewrites the
+  count and leaves the bytes untouched, then requires `D3a` green. A budget
+  that only fired alongside a correctness failure would not be measuring the
+  read path at all, and the tooth is what makes that distinction assertable.
+
+**What this increment does not claim.** It does not bound wall-clock latency
+or throughput; a slow host can still take longer for the same request count.
+It does not make a fragmented file cheap — fragmentation ends runs by design,
+and the 600 budget admits the resulting split. It does not change the store's
+size (1 MiB), its snapshot story (still out of scope, as §5 says), or P3's
+migration of the extent. The 54/53 figures are this host's live arm on a TCG
+image; a different host may land a few requests either side, which is why the
+budget is the order-of-magnitude bound and the artifact records the exact
+count.
+
 ---
 
 ## 6. Phase P2 — Networking inside environments
@@ -3093,7 +3202,7 @@ P1a is unblocked and is the thing E7 waits on, so it starts first. P2 has no dep
 | 2 | P1b — durable storage | a file larger than 71 168 bytes survives a reboot and is charged to the partition |
 | 3 | P3 — placement/migration/failover | an environment moves with its data, its console and its lease, or is refused by name |
 
-Step 2's three increments have landed: the format layer — the writable aerofs v2 — first (§5), then the durable device itself — the extent band, the persisted directory and the first-touch quota charge (§5's second-increment addendum), then the boot evidence itself: `tests/env_storage_durable_check.sh --live` runs in CI's `kernel-guards` job — the build host that has the ISO — re-making the gate on every push (write past 71 168 bytes, reboot, re-read through the environment's console, quota re-charged, over-quota refused by the quota's own error), with the wiring pinned by the guard's S13 clause (§5's third-increment addendum). Step 1's gate — an environment survives a reboot with its file and its shell variable, via its own console — is now measured rather than owed: the payload increment (§4's sixth) made the two CONTENTS clauses B10/B11 in the guard that already re-made the descriptor half, and the gate closes on that arm's first green live run. The payload's first
+Step 2's four increments have landed: the format layer — the writable aerofs v2 — first (§5), then the durable device itself — the extent band, the persisted directory and the first-touch quota charge (§5's second-increment addendum), then the boot evidence itself: `tests/env_storage_durable_check.sh --live` runs in CI's `kernel-guards` job — the build host that has the ISO — re-making the gate on every push (write past 71 168 bytes, reboot, re-read through the environment's console, quota re-charged, over-quota refused by the quota's own error), with the wiring pinned by the guard's S13 clause (§5's third-increment addendum). The fourth measures the read path itself: the three `/p1b_big` reads before and after the reboot, under a device-request budget (§5's fourth-increment addendum). Step 1's gate — an environment survives a reboot with its file and its shell variable, via its own console — is now measured rather than owed: the payload increment (§4's sixth) made the two CONTENTS clauses B10/B11 in the guard that already re-made the descriptor half, and the gate closes on that arm's first green live run. The payload's first
 CI run then found the restore path pouring onto a freshly replayed sidecar
 blocked mid-boot; §4's announce-gate repair closes that, and P1b's live arm
 re-makes it on every push — the identity wait it runs before clause L16 reads
