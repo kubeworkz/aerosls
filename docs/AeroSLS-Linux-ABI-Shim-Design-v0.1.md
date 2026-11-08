@@ -3450,6 +3450,38 @@ write carries `E7MEM-MUNMAP-OK`. The same boot's real firstuser
 `E7MEM-MMAP-OK` still appears. No marker-404 line (`num=00000194`) exists.
 Evidence: `evidence/e7_munmap_live.log`.
 
+**Run record — the drill's tenant-spawn wait follows host progress
+(2026-11-08).** The default `--live` drill could reach D1–D2 only once the
+tenant spawned inside the harness's fixed 120 s window. On a slower host
+the 45G gate-boot stretch was still RUNNING at that bound — 318,476 serial
+bytes and growing — so the harness stopped before the drill could exercise
+the wait it exists to test: a host-speed false failure, not a posture that
+never came. The drill's spawn wait is now progress-bounded. Any growth in
+`boot1.log` restarts a 120 s no-progress stall, and a 900 s absolute ceiling
+still bounds a boot that never spawns (`E7G_SPAWN_STALL_S` and
+`E7G_SPAWN_CEIL_S`, defaults 120/900). The plain gate keeps its original
+fixed 120 s total, so a plain boot that never spawns still fails promptly.
+This changes the harness that reaches the drill, not the kernel wait under
+test: D1–D2 still exercise the pre-pour wait, whose old fixed bound was
+30 s and whose `running`/`wait ended` semantics are unchanged.
+
+The full default `--live` run then passed. The harness printed the extension
+note, the stretch completed, the tenant spawned and reached the copy
+continuation, and the gate returned to the same boot-2 assertions:
+
+```
+note: drill tenant-spawn wait extended past 120s — guest still progressing
+(318476 log bytes); stall=120s ceiling=900s
+[E7-GATE] stretch-done  0000AFC8 Miters
+[E7] firstuser: spawned 0000000B
+ok:   D1. the wait outlived the old fixed bound with a sidecar RUNNING (running=1/2)
+ok:   D2. the wait never answered (no 'wait ended' line) and the pour still landed
+```
+
+B1–B7 stayed green, `payloads=1` and `payload_skips=0`, and a replay of the
+same recording passed all clauses. Evidence:
+`evidence/e7_gate_drill_adaptive/`; commit `f3c1d19`.
+
 ---
 
 ## 11. Open questions for review
@@ -3519,6 +3551,7 @@ Everything this document asserts about the tree, with its source:
 | The signal seam: the plan's three first-trap refusals (width, out-pointer, span) ahead of any channel post, the sidecar's dispositions/mask/pending with handler installs refused by name and tkill scoped to its own tid, and every default-terminate converging on one attributed no-reply kill | `kernel/linux_abi.{h,c}` (`linux_sig_copy_plan`, `LSC_SIG`); `kernel/syscall_dispatch.c`; `user/sidecar/src/linux.rs` (`SigState`, the 13/14/200 arms, `Answer::SignalKill`); `tests/linux_personality_host_test.c` (210 checks, the current run; 98 at the signal seam) + linux.rs unit tests (11); guard clause R, teeth t76–t83 (§10.13's step 2) |
 | The E7 gate's resume half ran in the guest: one invocation, two boots of the same NVMe image, the tenant adopted at `rip=0x8057ab7 rsp=0x4000000a9778` (`stop=spent`), its copy finishing after the reboot — one `Copying`, one `Done (524288 bytes, 504 sparse holes, 4 kept)`, no `[FAULT]` — and its `exit_group` reaped by name (`[TORE] address space … 172 frame(s) freed`, the work-half count) | `evidence/e7_gate_reboot.log`; `tests/env_payload_host_test.c` (81 checks: the one-shot stop, the held replay's page mapping, and the stall-bounded wait's three outcomes); `tests/cap_create_sidecar_host_test.c` (the caller's-partition resolve) |
 | The gate's failure side is observed, not assumed: one invocation, one capture and five replays — the control green, `descriptor` reddening B2/B3/B4, `no-fd` B3/B4, `no-heap` B4/B5 (the 64 KiB buffer's `free` faulting inside the withheld page), `fs_base` B2/B4/B5 (the adopted TLS base one page off, the copy running to the end of the file and the tenant dying at a pointer read from the wrong TCB) — with each tooth's own line in the transcript and the shipped image refusing a named tooth by name | `evidence/e7_gate_teeth.log`, `evidence/e7_gate_teeth_fsbase.log`; `tests/e7_gate_check.sh --teeth`; `kernel/env_payload.h`'s `E7G_TOOTH` block and `Makefile`'s `E7_TOOTH` (both compiled out by default) |
+| The drill's tenant-spawn wait follows host progress, and the full default `--live` gate passes B1–B7 plus D1–D2 when the 45G stretch crosses the old 120 s bound: the wait extended at 318,476 serial bytes, D1 saw the pre-pour wait outlive its old 30 s bound with a sidecar RUNNING (`running=1/2`), D2 saw no `wait ended` and the pour land (`payloads=1, payload_skips=0`); the plain gate keeps its fixed 120 s total | `tests/e7_gate_check.sh` (`E7G_SPAWN_STALL_S`/`E7G_SPAWN_CEIL_S`); `evidence/e7_gate_drill_adaptive/`; commit `f3c1d19` |
 | Console reads and poll: buffered input is served, an empty buffer PARKS the read until input or close, poll scans the task's fd table plus the console and rewrites revents, and a timed or infinite wait parks until readiness or a real deadline — a timeout answers zero revents | `user/sidecar/src/linux.rs` (`console_read_answer`, `Answer::{ReadWait,PollWait}`, `poll_scan`, `poll_answer`, `next_wait_ns`, the `PENDING_*` state and `service`'s pending block); `kernel/linux_abi.{h,c}` (the poll IN/OUT plans and reply shape); `kernel/syscall_dispatch.{h,c}` (`SYS_SLS_NOW_NS` 329, write-only clamp); `user/proto/src/kabi.rs`; `tests/linux_personality_host_test.c` (the poll crossings/shape) + linux.rs unit tests (27); guard clauses S/S1–S4, teeth t84–t89, t121–t122 (§10.13's poll coda) |
 | `munmap` (11) crosses the channel in a live E3 boot: the probe unmaps its arena twice (1 page freed, then 0 freed/1 already absent), the below-break call is refused before the post, and a 16-byte write carries `E7MEM-MUNMAP-OK`; the real firstuser also unmaps its own pages, and no marker-404 syscall line appears | `evidence/e7_munmap_live.log`; `tests/e3_multi_env_boot_check.sh`; guard clause X |
 
