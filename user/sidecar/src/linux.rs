@@ -80,10 +80,15 @@
 //!     first-trap ladder repeated as this side's twin, and the kernel's
 //!     verdict re-checks every grant against its own span and its own
 //!     cursors, so neither end is load-bearing alone;
+//!   - `munmap` (11, the mem class's last seam — E7 increment 25,
+//!     §5.4): the sidecar answers WHETHER (a page-aligned, nonzero,
+//!     non-overflowing range inside the stamped span and at or above
+//!     the break), and the kernel's page tables decide which pages are
+//!     PRESENT — a double unmap is success, the frames return to the
+//!     partition, and neither cursor moves (a freed range is never
+//!     re-handed in v1);
 //!   - everything else — `open`/`close`/`lseek` and the rest of the fd
-//!     class (Phase 2 §3-§4), `munmap` (frames return through the
-//!     partition at the task's teardown; unmapping through the channel
-//!     is its own seam), any mprotect whose prot is not
+//!     class (Phase 2 §3-§4), any mprotect whose prot is not
 //!     W|X (real permission changes are not landed), `clock_gettime`
 //!     (needs the clock plus
 //!     a child-buffer write) and any number outside the census —
@@ -172,6 +177,10 @@ const LINUX_TKILL: u64 = 200;
 /// numbers (addr/len/prot/flags) so "the allocator asked for X and this
 /// shim answered Y" is read off the line, never reconstructed.
 const LINUX_MMAP: u64 = 9;
+/// munmap(11) — E7 increment 25 (§5.4's last memory seam): the 11 arm
+/// answers WHETHER over the ledger's span and break; the kernel's page
+/// tables decide which pages are present, so a double unmap is success.
+const LINUX_MUNMAP: u64 = 11;
 /// clock_gettime (228) — the census's vDSO-backstopped row, and a REAL
 /// trap here because this kernel ships no vDSO (§5.5). The reply is one
 /// Linux `struct timespec` (two LE i64s) at args[1]; the kernel's plan
@@ -724,16 +733,43 @@ fn answer(
                 }
             }
         }
+        /* munmap (11, LSC_MEM — E7 increment 25, §5.4's last memory
+         * seam): the sidecar answers WHETHER, and its ladder is the
+         * kernel's first-trap refusal repeated as this side's own twin
+         * (guard clause X pins both). The kernel's page tables are the
+         * truth about which pages are PRESENT, so a double unmap is
+         * success; no mapping ledger is kept here. v1's policy: a
+         * page-aligned, nonzero, non-overflowing range inside the
+         * stamped span and at or above the current break — the break's
+         * pages belong to brk. Either cursor moving would be a
+         * re-hand, so neither does. */
+        11 => {
+            let (addr, len) = (args[0], args[1]);
+            let len_r = match len.checked_add(0xFFF) {
+                Some(v) if len != 0 => v & !0xFFFu64,
+                _ => return Answer::Reply(0, E_INVAL),
+            };
+            if addr & 0xFFF != 0 {
+                Answer::Reply(0, E_INVAL)
+            } else if addr < brk.base || addr > brk.limit
+                   || len_r > brk.limit - addr {
+                Answer::Reply(0, E_INVAL)
+            } else if addr < brk.cur {
+                Answer::Reply(0, E_INVAL)
+            } else {
+                Answer::Reply(0, STATUS_OK)
+            }
+        }
         /* mprotect (10, LSC_MEM — §5.4's W^X): only the refusal exists
          * in v1 — simultaneous write+execute (prot & 0x2 & 0x4) is
          * refused EPERM, the twin of linux_mprotect_refuses_wx (the
          * kernel refuses it first-trap, before any post; both ends
          * exist so neither alone is the load-bearing refusal — guard
          * clause N3 pins both). Any other prot is ENOSYS with the
-         * number logged: real permission changes are not landed, and
-         * munmap's channel-side seam is its own increment (frames
-         * return through the partition at the task's teardown) — a
-         * fake grant here would be a page the kernel never mapped. */
+         * number logged: real permission changes are not landed. (The
+         * mem class's last seam, munmap (11), sits beside this arm at
+         * increment 25; a fake grant here would still be a page the
+         * kernel never mapped.) */
         10 => {
             if args[2] & 0x2 != 0 && args[2] & 0x4 != 0 {
                 Answer::Reply(0, E_PERM)
@@ -2343,6 +2379,34 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                     off = hex_into(&mut ex, off, ret);
                     off = push_bytes(&mut ex, off, b"\n");
                     enosys_log(num as u32, &name_buf[..nlen], &ex[..off]);
+                } else if num == LINUX_MUNMAP && status != STATUS_OK {
+                    /* Munmap's refusal family (increment 25): EINVAL is
+                     * the only arm a well-formed request reaches — the
+                     * span, the alignment, the break or the length,
+                     * with the request's own words on the line. */
+                    let mut ex = [0u8; 96];
+                    let mut off = push_bytes(&mut ex, 0, b" -> ");
+                    off = push_bytes(&mut ex, off,
+                        if status == E_INVAL { b"EINVAL munmap(addr=0x" }
+                        else               { b"refused munmap(addr=0x" });
+                    off = hex_into(&mut ex, off, args[0]);
+                    off = push_bytes(&mut ex, off, b", len=");
+                    off = dec_into(&mut ex, off, args[1]);
+                    off = push_bytes(&mut ex, off, b")\n");
+                    enosys_log(num as u32, &name_buf[..nlen], &ex[..off]);
+                } else if num == LINUX_MUNMAP {
+                    /* Both success and a double unmap land here: the
+                     * kernel's page tables are the truth, and 0 is the
+                     * answer either way. The request words ride the
+                     * line so the run's proof names the range, not the
+                     * arm (increment 14/15's rule). */
+                    let mut ex = [0u8; 96];
+                    let mut off = push_bytes(&mut ex, 0, b" ok munmap addr=0x");
+                    off = hex_into(&mut ex, off, args[0]);
+                    off = push_bytes(&mut ex, off, b" len=");
+                    off = dec_into(&mut ex, off, args[1]);
+                    off = push_bytes(&mut ex, off, b"\n");
+                    enosys_log(num as u32, &name_buf[..nlen], &ex[..off]);
                 } else if num == LINUX_TKILL {
                     /* tkill's SIG rides its line (increment 14): WHICH
                      * signal was asked for is the fact the pending →
@@ -3260,6 +3324,52 @@ mod tests {
         assert!(matches!(a, Answer::Reply(r, STATUS_OK)
                          if r == SPAN_LIMIT - 0x1000),
                 "the last page is the arena's: {:?}", a);
+    }
+
+    #[test]
+    fn munmap_frees_only_the_span_above_the_break_without_rewinding_the_cursor() {
+        let mut b = span();
+        b.cur = SPAN_BASE + 0x2000;
+        let mtop = b.mtop;
+        let a = answer(11, &[SPAN_BASE + 0x2000, 0x1000, 0, 0, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(0, STATUS_OK)),
+                "the arena above the break unmaps: {:?}", a);
+        assert_eq!((b.cur, b.mtop), (SPAN_BASE + 0x2000, mtop),
+                   "munmap moves neither the break nor the map cursor");
+        /* POSIX: a second unmap of the same range is success — the
+         * kernel's page tables, not a sidecar ledger, are the truth */
+        let a = answer(11, &[SPAN_BASE + 0x2000, 0x1000, 0, 0, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(0, STATUS_OK)),
+                "a double unmap is success: {:?}", a);
+        /* the page-round is the caller's byte length: the last page of
+         * the span, one byte long, still frees one page */
+        let a = answer(11, &[SPAN_LIMIT - 0x1000, 1, 0, 0, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(0, STATUS_OK)),
+                "a one-byte tail still names its page: {:?}", a);
+        /* below the break: EINVAL — v1 keeps the break's pages with brk */
+        let a = answer(11, &[SPAN_BASE, 0x1000, 0, 0, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(0, E_INVAL)),
+                "the break's pages are not munmap's: {:?}", a);
+        /* every malformed span is EINVAL, and a refusal moves nothing */
+        for args in [
+            [SPAN_BASE + 0x2001, 0x1000, 0, 0, 0, 0], /* unaligned      */
+            [SPAN_BASE + 0x2000, 0, 0, 0, 0, 0],      /* zero length    */
+            [SPAN_BASE + 0x2000, u64::MAX, 0, 0, 0, 0], /* overflow     */
+            [SPAN_BASE - 0x1000, 0x1000, 0, 0, 0, 0], /* below the span */
+            [SPAN_LIMIT, 0x1000, 0, 0, 0, 0],         /* at the limit   */
+            [SPAN_LIMIT - 0x1000, 0x2000, 0, 0, 0, 0], /* over the end  */
+        ] {
+            let before = (b.cur, b.mtop);
+            let a = answer(11, &args, &fds(), &mut b, &mut fresh(), &[]);
+            assert!(matches!(a, Answer::Reply(0, E_INVAL)),
+                    "refused munmap shape {:?}: {:?}", args, a);
+            assert_eq!((b.cur, b.mtop), before,
+                       "a refused munmap moves no cursor");
+        }
     }
 
     #[test]

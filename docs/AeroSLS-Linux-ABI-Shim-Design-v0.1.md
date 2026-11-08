@@ -3416,6 +3416,40 @@ increment. The new unit test drives buffered bytes, empty/EAGAIN, zero-length
 success and close/EOF. It has not yet been exercised by a live boot; the
 gate's console writers are unaffected.
 
+**Increment 25 — `munmap`, the memory class's last seam (2026-11-08).**
+`munmap` (11) now crosses the same channel brk and mmap use. The kernel's
+first trap refuses a zero or overflowed length, an unaligned address, a
+range outside the create's stamped span, or one that starts below the
+current break — `-EINVAL` before any post, with the request's words on the
+line. A pass stages `addr`/`len`; at the reply the pure verdict re-runs
+that ladder against the kernel's OWN span and break and names the page
+range, and the apply walks it: every present USER 4 KiB leaf is unmapped,
+its translation shot down with `invlpg`, and its frame returned to the
+partition. An absent page is already unmapped (a double unmap is success),
+and neither `brk_cur` nor `linux_mmap_top` moves — v1 never re-hands a
+freed virtual range, so the range waits for teardown while the frames
+return. The sidecar's 11 arm is the ladder's twin (guard clause X), answers
+0 or `EINVAL`, and keeps no mapping ledger: the kernel's page tables are
+the truth. The host test drives every refusal branch, the negative-reply
+no-op and the non-zero malformed reply; the sidecar unit test drives the
+span/break/alignment/overflow shapes and asserts both cursors stand still;
+the probe munmaps the granted arena twice, requires `-EINVAL` below the
+break, writes `E7MEM-MUNMAP-OK\n` and marks any other outcome 404 (asserted
+absent). Guard clause X/X1–X6 and teeth t123–t128 pin the first trap, the
+verdict, the apply, the sidecar arm, the host test, the fixture and both
+instrument lines.
+
+**Measured (2026-11-08).** The E3 image was rebuilt (`make x86-iso-e3`) with
+the 888-byte payload and booted through `tests/e3_multi_env_boot_check.sh`
+(RC=0; 4 live-rootfs lines, no serial drops). The probe's sequence is on the
+wire twice — the system POSIX and its watchdog respawn: the arena's first
+`munmap` frees one page, the second reports `0 page(s) freed, 1 already
+absent`, the below-break call is refused before the post, and the 16-byte
+write carries `E7MEM-MUNMAP-OK`. The same boot's real firstuser
+(`e7.linux.user.0`) also unmaps its own pages one at a time, and
+`E7MEM-MMAP-OK` still appears. No marker-404 line (`num=00000194`) exists.
+Evidence: `evidence/e7_munmap_live.log`.
+
 ---
 
 ## 11. Open questions for review
@@ -3486,10 +3520,11 @@ Everything this document asserts about the tree, with its source:
 | The E7 gate's resume half ran in the guest: one invocation, two boots of the same NVMe image, the tenant adopted at `rip=0x8057ab7 rsp=0x4000000a9778` (`stop=spent`), its copy finishing after the reboot — one `Copying`, one `Done (524288 bytes, 504 sparse holes, 4 kept)`, no `[FAULT]` — and its `exit_group` reaped by name (`[TORE] address space … 172 frame(s) freed`, the work-half count) | `evidence/e7_gate_reboot.log`; `tests/env_payload_host_test.c` (81 checks: the one-shot stop, the held replay's page mapping, and the stall-bounded wait's three outcomes); `tests/cap_create_sidecar_host_test.c` (the caller's-partition resolve) |
 | The gate's failure side is observed, not assumed: one invocation, one capture and five replays — the control green, `descriptor` reddening B2/B3/B4, `no-fd` B3/B4, `no-heap` B4/B5 (the 64 KiB buffer's `free` faulting inside the withheld page), `fs_base` B2/B4/B5 (the adopted TLS base one page off, the copy running to the end of the file and the tenant dying at a pointer read from the wrong TCB) — with each tooth's own line in the transcript and the shipped image refusing a named tooth by name | `evidence/e7_gate_teeth.log`, `evidence/e7_gate_teeth_fsbase.log`; `tests/e7_gate_check.sh --teeth`; `kernel/env_payload.h`'s `E7G_TOOTH` block and `Makefile`'s `E7_TOOTH` (both compiled out by default) |
 | Console reads and poll: buffered input is served, an empty buffer PARKS the read until input or close, poll scans the task's fd table plus the console and rewrites revents, and a timed or infinite wait parks until readiness or a real deadline — a timeout answers zero revents | `user/sidecar/src/linux.rs` (`console_read_answer`, `Answer::{ReadWait,PollWait}`, `poll_scan`, `poll_answer`, `next_wait_ns`, the `PENDING_*` state and `service`'s pending block); `kernel/linux_abi.{h,c}` (the poll IN/OUT plans and reply shape); `kernel/syscall_dispatch.{h,c}` (`SYS_SLS_NOW_NS` 329, write-only clamp); `user/proto/src/kabi.rs`; `tests/linux_personality_host_test.c` (the poll crossings/shape) + linux.rs unit tests (27); guard clauses S/S1–S4, teeth t84–t89, t121–t122 (§10.13's poll coda) |
+| `munmap` (11) crosses the channel in a live E3 boot: the probe unmaps its arena twice (1 page freed, then 0 freed/1 already absent), the below-break call is refused before the post, and a 16-byte write carries `E7MEM-MUNMAP-OK`; the real firstuser also unmaps its own pages, and no marker-404 syscall line appears | `evidence/e7_munmap_live.log`; `tests/e3_multi_env_boot_check.sh`; guard clause X |
 
 ## Appendix B — Named gaps, each with its destination
 
-**Register checked 2026-11-08, after the waiting-input increment.** A row's third cell says **LANDED** only when the gap is closed in the tree and the cell names the section, test and evidence that closed it. Two remainders stay visible inside landed rows rather than being swept: `munmap` (§5.4) and `xsetbv`/`CR4.OSXSAVE` (§5.3). The gaps still open are the thread group and ARM64 userspace; console reads and poll's waiting half land at increments 23–24.
+**Register checked 2026-11-08, after the munmap increment.** A row's third cell says **LANDED** only when the gap is closed in the tree and the cell names the section, test and evidence that closed it. One remainder stays visible inside a landed row rather than being swept: `xsetbv`/`CR4.OSXSAVE` (§5.3). The gaps still open are the thread group and ARM64 userspace; console reads and poll's waiting half land at increments 23–24, and the memory class's last seam (`munmap`) at increment 25.
 
 | Gap | Consequence if unaddressed | Destination |
 |---|---|---|
@@ -3497,7 +3532,7 @@ Everything this document asserts about the tree, with its source:
 | Six argument registers not captured by the trap path | every forwarded syscall gets wrong arguments (§3.4) | **LANDED** — increments 2 and 13: `PerCPUData.linux_args[6]` at `[gs:0x50..0x80)` is written by `syscall_entry_stub` before its first call with the offsets frozen by `_Static_assert`s (§10.6), and `syscall_return_path` restores all six before `sysret` (§10.13's register wall); `tests/linux_personality_host_test.c` pins the request ABI as literals, guard clauses C/C1 |
 | No initial stack/auxv builder | static libc start-up fails before `main` (§5.2) | **LANDED** — increment 7 (§10.12): `linux_initial_stack_build()` writes the argc/argv/envp/auxv image with child-vaddr pointers into one partition-charged region (8 KiB floor, entropy refusal rather than a zero-filled `AT_RANDOM`); `tests/linux_initial_stack_host_test.c` (40 checks), clauses O3/O4 with teeth t44–t46, and the later `ARGENV` record carried the real argv (clauses O6/O7) |
 | No `MSR_IA32_FS_BASE` handling | TLS setup fails; musl/glibc binaries die early (§5.3) | **LANDED** — increment 4 (§10.9): `ProcessDescriptor.fs_base` with its stage/grant, `user_write_fs_base()` as the only writer after the gate's zero baseline, loaded on every switch-in and cleared at slot reuse; host test 52 checks at increment 4 (210 today), guard set L (36 clauses) with teeth t18–t24, live proof `evidence/e7_fs_base_shipped.log` |
-| No `brk`/`mmap` → budget mapping (`brk` landed, increment 6, §10.11; the anonymous-map half **LANDED** at increment 16; `munmap` remains) | `munmap` still refuses by name (frames return through the partition at the task's teardown — §5.6) | E7, §5.4 — **LANDED** at increment 16 (§10.13): the measured allocator's guard page (FIXED PROT_NONE, replace + invlpg) and its RW arenas (the descending cursor, both ends re-checking) are answered from the budget span, and the firstuser runs its real workload to a clean `exit_group`. **Remainder:** `munmap` through the channel — its own seam |
+| No `brk`/`mmap`/`munmap` → budget mapping (`brk` landed, increment 6, §10.11; the anonymous-map half at increment 16; `munmap` at increment 25) | a freed arena would keep its frames until teardown, and a malformed range could walk pages this task never owned | E7, §5.4 — **LANDED**: increment 16 answered the measured allocator's guard page (FIXED PROT_NONE, replace + invlpg) and its RW arenas (the descending cursor, both ends re-checking) from the budget span, and increment 25 answers `munmap` with the same first-trap/verdict discipline — the apply frees every present USER leaf back to the partition, a double unmap is success, and neither cursor moves. The on-target probe block ran in a real E3 boot (the 16-byte marker, with no marker-404 line; `evidence/e7_munmap_live.log`), so no remainder |
 | `elf64_map_blob` assumes every PT_LOAD's `p_vaddr` is page-aligned | a libc-linked binary with a non-aligned RW LOAD reads every global in it 0x370 bytes off and dies at `rip=0x28` before `main` — measured, §10.13's step 0 | **LANDED** — increment 8's step 1: page-base anchor + lead-offset copy, host teeth E8a, guard clause O8 with teeth t53/t54, measured past `main` |
 | No `CR4.OSFXSR` written anywhere (the IDT's vector-7 gate existed all along — `idt.c`, SIMI Phase 10; `vecstore.c`'s comment saying otherwise is stale), no `xsetbv` | any ring-3 SSE instruction is #UD — every real libc and every Rust binary dies at its first vector op (measured: musl `abort`'s `pxor`, §10.13's step-1 run) | **LANDED** — increment 9: `CR4.OSFXSR\|OSXMMEXCPT` + `CR0.MP` armed on the BSP ahead of the trap gate, `fninit` + 0x1F80 `ldmxcsr`, CPUID refusal by name; host teeth `tests/fpu_enable_host_test.c` (40 checks), guard clause Q with teeth t70–t75, measured past `pxor` into `abort`'s tail (§10.13's step 2). **Remainder:** `xsetbv`/`CR4.OSXSAVE` are absent by decision — named, and dormant with the lazy path |
 | `rt_sigprocmask` (14), `rt_sigaction` (13) and `tkill` (200) refuse | `abort()` cannot die at its first `raise(SIGABRT)`, so its tail runs and faults on `hlt` (`rip=0x805260c`) — the firstuser's run ends there, ten attributed traps deep (§10.13's step 2; `rt_sigaction` newly visible) | **LANDED** — increment 10: the kernel's copy plan with all three refusals by name at the first trap, the sidecar's dispositions/mask/pending and the `SignalKill` delivery; host teeth (98 + 11 checks), guard clause R with teeth t76–t83; measured: both firstuser runs end at their first `tkill` with the kill attribution and NO `[FAULT]` (§10.13's step 2). §10.10's copy-IN gap then stayed as the named wall — retired at **increment 12**: the reply payload carries oldact/oldset back through the staged destination, measured (§10.13's step 3) |

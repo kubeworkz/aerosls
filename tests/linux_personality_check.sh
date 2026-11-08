@@ -1263,6 +1263,78 @@ else
     bad "W6. a host-test clause for increment 20 is missing — the capture, the stamp or the identity comparison would be a claim no test runs"
 fi
 
+# ─── X. E7 increment 25: munmap, the memory class's last seam ─────────────
+# The contract (X), the first trap before any post (X1), the reply's
+# page-table walk and frame return (X2), the sidecar's twin (X3), the
+# host test's branches (X4), the probe's on-target proof (X5) and the
+# instrument lines (X6): each is a claim the seam rests on.
+if grep -qF 'struct LinuxMunmapReq {' kernel/linux_abi.h && \
+   grep -qF 'int linux_mem_munmap_refusal(const struct LinuxMunmapReq *req,' kernel/linux_abi.h && \
+   grep -qF 'linux_mem_munmap_verdict(uint64_t heap_base, uint64_t heap_limit,' kernel/linux_abi.h && \
+   grep -qF 'int linux_mem_munmap_refusal(const struct LinuxMunmapReq *req,' kernel/linux_abi.c && \
+   grep -qF 'linux_mem_munmap_verdict(uint64_t heap_base, uint64_t heap_limit,' kernel/linux_abi.c; then
+    ok "X. the munmap seam is a named pure contract at both ends — the request, the first-trap refusal (zero/overflowing length, unaligned address, outside the stamped span, below the current break) and the reply verdict that re-checks a success against the kernel's own span and names the page range"
+else
+    bad "X. the munmap contract is missing — the kernel would have no named refusal or verdict to reason about, and the seam would be a page-table walk with no policy"
+fi
+munmap_ref=$(grep -nF 'mref = linux_mem_munmap_refusal(&mreq,' kernel/syscall_dispatch.c | head -1 | cut -d: -f1)
+if [ -n "$munmap_ref" ] && \
+   sed -n "$((munmap_ref - 3)),$((munmap_ref + 26))p" kernel/syscall_dispatch.c | grep -qF 'refused before post' && \
+   sed -n "$((munmap_ref - 3)),$((munmap_ref + 26))p" kernel/syscall_dispatch.c | grep -qF 'return (uint64_t)(int64_t)mref;' && \
+   sed -n "$((munmap_ref - 3)),$((munmap_ref + 26))p" kernel/syscall_dispatch.c | grep -qF 'cur->mem_stage_num   = num;' && \
+   sed -n "$((munmap_ref - 3)),$((munmap_ref + 26))p" kernel/syscall_dispatch.c | grep -qF 'cur->mem_stage_a1    = largs[1];'; then
+    ok "X1. munmap's first trap runs before any post: the refusal logs its words and returns its errno on the line; a pass stages addr and len for the reply's verdict"
+else
+    bad "X1. the munmap first trap is gone or no longer precedes the post — a malformed range would reach the channel, or a pass would lose the words the verdict re-checks"
+fi
+munmap_v=$(grep -nF 'v = linux_mem_munmap_verdict(' kernel/syscall_dispatch.c | head -1 | cut -d: -f1)
+munmap_apply="$(sed -n "$((munmap_v - 3)),$((munmap_v + 70))p" kernel/syscall_dispatch.c)"
+if [ -n "$munmap_v" ] && \
+   grep -qF 'cur->linux_brk_cur' <<< "$munmap_apply" && \
+   grep -qF 'linux_user_page_frame(' <<< "$munmap_apply" && \
+   grep -qF 'user_unmap_page(pml4, va);' <<< "$munmap_apply" && \
+   grep -qF 'user_invlpg(va);' <<< "$munmap_apply" && \
+   grep -qF 'free_physical_ram_frame_for_partition' <<< "$munmap_apply" && \
+   grep -qF 'v.unmap_pages' <<< "$munmap_apply"; then
+    ok "X2. the reply's apply walks exactly the verdict's page range, frees every present USER frame back to the partition, shoots down each touched translation, and leaves both cursors alone — an absent page is already unmapped, not an error"
+else
+    bad "X2. the munmap apply is missing or no longer walks the verdict's range — a success would unmap nothing (or free a frame without invlpg / return it without unmapping)"
+fi
+munmap_arm=$(grep -nF '        11 => {' user/sidecar/src/linux.rs | head -1 | cut -d: -f1)
+munmap_arm_body="$(sed -n "$((munmap_arm + 1)),$((munmap_arm + 40))p" user/sidecar/src/linux.rs)"
+if [ -n "$munmap_arm" ] && \
+   grep -qF 'checked_add(0xFFF)' <<< "$munmap_arm_body" && \
+   grep -qF 'addr & 0xFFF' <<< "$munmap_arm_body" && \
+   grep -qF 'addr < brk.cur' <<< "$munmap_arm_body" && \
+   grep -qF 'Answer::Reply(0, STATUS_OK)' <<< "$munmap_arm_body" && \
+   grep -qF 'Answer::Reply(0, E_INVAL)' <<< "$munmap_arm_body"; then
+    ok "X3. the sidecar's 11 arm repeats the kernel's ladder as its own twin — nonzero non-overflowing length, aligned address, inside the span, at or above the break — and answers 0 without moving either cursor"
+else
+    bad "X3. the sidecar's munmap arm is gone or no longer mirrors the ladder — the kernel's first trap would be the only refusal, and a malformed range could get a fake success"
+fi
+if grep -qF 'linux_mem_munmap_refusal(&req, BASE, LIMIT, BASE)' tests/linux_personality_host_test.c && \
+   grep -qF 'linux_mem_munmap_verdict(BASE, LIMIT, BASE,' tests/linux_personality_host_test.c && \
+   grep -qF 'v.unmap_pages == 1' tests/linux_personality_host_test.c; then
+    ok "X4. the host test drives the refusal and the verdict: the span/break/alignment/overflow branches, the negative-reply no-op, the non-zero malformed reply and the exact page range"
+else
+    bad "X4. the host test no longer drives munmap — every branch above would be reachable only at boot (t83/t117's rule)"
+fi
+if grep -qF 'E7MEM-MUNMAP-OK' user/sidecar/fixtures/e7_linux_probe.S && \
+   grep -qF 'mov     $11, %eax' user/sidecar/fixtures/e7_linux_probe.S && \
+   grep -qF 'mov     $404, %eax' user/sidecar/fixtures/e7_linux_probe.S && \
+   grep -qF '.Lmunmap_bad:' user/sidecar/fixtures/e7_linux_probe.S; then
+    ok "X5. the probe carries the on-target proof: two successful unmaps of the arena (the second is POSIX's already-unmapped success), the below-the-break -EINVAL, the E7MEM-MUNMAP-OK bytes out, and MARKER 404 for any wrong outcome (asserted absent)"
+else
+    bad "X5. the probe's munmap block is gone or gutted — the shipped boot would prove nothing about the seam while reading exactly as green"
+fi
+if grep -qF ' ok munmap addr=0x' user/sidecar/src/linux.rs && \
+   grep -qF 'EINVAL munmap(addr=0x' user/sidecar/src/linux.rs && \
+   grep -qF 'munmap addr=0x%lx len=%lu' kernel/syscall_dispatch.c; then
+    ok "X6. the run's proof is on the lines: the granted range and its words, the refusal's EINVAL with the range, and the kernel's per-page free count — WHICH range and HOW MANY pages, not reconstructed from which arms ran"
+else
+    bad "X6. a munmap instrument line is missing — the seam would run but the log would not name the range it freed (increment 14/15's rule)"
+fi
+
 echo
 if [ "$fails" -eq 0 ]; then
     echo "linux_personality_check: all clauses hold"

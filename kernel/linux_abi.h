@@ -300,7 +300,9 @@ int linux_user_copy_out(uint8_t *dst, uint64_t root, uint64_t va, uint32_t n);
 #define LINUX_MPROTECT   10u           /* the census's mprotect row        */
 #define LINUX_MMAP        9u           /* the census's mmap row — the      */
 #define LINUX_MUNMAP     11u           /* anonymous-map half landed at     */
-                                       /* increment 16; munmap still named */
+                                       /* increment 16; its munmap seam at */
+                                       /* increment 25 (the memory class's */
+                                       /* last one)                        */
 #define LINUX_PROT_NONE  0x0u          /* Linux mman.h PROT_* bits — ABI  */
 #define LINUX_PROT_READ  0x1u          /* (the sidecar's twin repeats them */
 #define LINUX_PROT_WRITE 0x2u          /*  as literals; guard N3 pins it)  */
@@ -417,6 +419,41 @@ struct LinuxMemBrkVerdict linux_mem_brk_verdict(uint64_t heap_base,
                                                 uint64_t mmap_top,
                                                 uint64_t brk_cur,
                                                 uint64_t req, uint64_t rax);
+
+/* ─── E7 increment 25: munmap, the memory class's last seam ─────────────
+ * The request is two words, but the decisions are the same both-ends
+ * pattern brk/mmap use. The FIRST trap refuses a shape no page-table
+ * walk can honestly serve — a zero or overflowed length, an unaligned
+ * address, a range outside the stamped span, or one that starts below
+ * the current break (v1 keeps the break's pages the brk seam's). The
+ * REPLY verdict re-checks a success (rax 0; a negative errno unmaps
+ * nothing) against the kernel's OWN span and break, then names the
+ * exact page range the apply walks. The sidecar answers WHETHER; the
+ * kernel's page tables are the truth about which pages are present, so
+ * a double unmap is success and no sidecar mapping ledger is needed.
+ * The two cursors never move: a freed virtual range is not re-handed by
+ * a later mmap in v1 (frames return; the range waits for teardown). */
+struct LinuxMunmapReq {
+    uint64_t addr;   /* args[0] as captured — the page-aligned start     */
+    uint64_t len;    /* args[1] as captured — bytes, rounded up to pages */
+};
+
+int linux_mem_munmap_refusal(const struct LinuxMunmapReq *req,
+                             uint64_t span_base, uint64_t span_limit,
+                             uint64_t brk_cur);
+
+struct LinuxMemMunmapVerdict {
+    int      malformed;    /* 1: a success reply that is not this
+                            * request's page range — unmap nothing      */
+    uint64_t unmap_va;     /* the first page to walk (valid iff > 0)    */
+    uint64_t unmap_pages;  /* pages in the rounded range — absent pages
+                            * are skipped by the apply, not an error    */
+};
+
+struct LinuxMemMunmapVerdict
+linux_mem_munmap_verdict(uint64_t heap_base, uint64_t heap_limit,
+                         uint64_t brk_cur,
+                         const struct LinuxMunmapReq *req, uint64_t rax);
 
 /* The 4 KiB frame behind a user mapping, walked read-only under the
  * copy's boundaries; 0 when any level refuses (absent, supervisor, huge).

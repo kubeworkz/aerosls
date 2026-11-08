@@ -171,6 +171,9 @@ echo "two-phase writable copy and the stage's four-place lifecycle"
 echo "and increment 16's anonymous-map seam (clause set V) — the"
 echo "first-trap ladder, the verdict's two-cursor re-check, the FIXED"
 echo "replace's frame return and invlpg, and the fixture's map block"
+echo "and increment 25's munmap seam (clause set X) — the first-trap"
+echo "range refusal, the verdict's page walk and frame return, the"
+echo "sidecar's below-break twin, and the probe's E7MEM-MUNMAP-OK proof"
 echo "========================================================================"
 echo
 
@@ -983,6 +986,50 @@ tooth mmap-grant-address-not-logged V8 "a granted map's answer line no longer ca
 seed "$W/t120"
 sed -i 's/^                        } else if (snum == LINUX_MMAP) {/                            } else if (snum == LINUX_MMAP) {/' "$W/t120/kernel/syscall_dispatch.c"
 tooth mmap-apply-unreachable V2 "the mmap apply is chained inside the brk verdict's arm — unreachable for LINUX_MMAP" "$W/t120"
+
+# ─── X teeth (increment 25: munmap's range seam) ───────────────────────────
+
+# t123: the first trap's call deleted — the shape check would be gone
+# while the staging below still compiles as a comma expression and the
+# request posts to a sidecar that cannot see the kernel's span.
+seed "$W/t123"
+sed -i '/mref = linux_mem_munmap_refusal(&mreq,/d' "$W/t123/kernel/syscall_dispatch.c"
+tooth munmap-first-trap-gone X1 "the kernel no longer refuses a malformed munmap before the post" "$W/t123"
+
+# t124: the reply's verdict call deleted — the apply's page walk would
+# run on an uninitialized verdict (or not at all), and the kernel would
+# have no re-check of the sidecar's success against its own span.
+seed "$W/t124"
+sed -i '/v = linux_mem_munmap_verdict(/d' "$W/t124/kernel/syscall_dispatch.c"
+tooth munmap-verdict-gone X2 "the reply no longer re-checks the success against the kernel's span" "$W/t124"
+
+# t125: the sidecar arm renamed away — munmap falls to the default
+# ENOSYS while the kernel's first trap stays green, the increment-15
+# wall back by name for the one syscall this increment lands.
+seed "$W/t125"
+sed -i 's/^        11 => {$/        1100 => {/' "$W/t125/user/sidecar/src/linux.rs"
+tooth munmap-arm-gone X3 "the sidecar no longer answers munmap (11)" "$W/t125"
+
+# t126: the host-test section deleted — the refusal's branches and the
+# verdict's total-on-any-input rule would be argued from these greps
+# alone, every one reachable only at boot (t83/t117's rule).
+seed "$W/t126"
+sed -i '/linux_mem_munmap_/d' "$W/t126/tests/linux_personality_host_test.c"
+tooth munmap-unhosttested X4 "the host test no longer drives munmap's refusal or verdict" "$W/t126"
+
+# t127: the probe's positive marker deleted — the seam would have no
+# on-target proof: a regression would read as a quiet run with the map
+# block still green beside it.
+seed "$W/t127"
+sed -i '/E7MEM-MUNMAP-OK/d' "$W/t127/user/sidecar/fixtures/e7_linux_probe.S"
+tooth munmap-fixture-marker-gone X5 "the probe no longer carries the E7MEM-MUNMAP-OK proof" "$W/t127"
+
+# t128: the granted range stripped from the answer line — the run's
+# proof that the unmap named a real range goes back to a reconstruction
+# from which arms ran (increment 14/15's rule).
+seed "$W/t128"
+sed -i 's/ ok munmap addr=0x//' "$W/t128/user/sidecar/src/linux.rs"
+tooth munmap-range-not-logged X6 "a granted munmap's answer line no longer carries the range" "$W/t128"
 
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"

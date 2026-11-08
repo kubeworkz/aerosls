@@ -604,6 +604,69 @@ linux_mem_mmap_verdict(uint64_t heap_base, uint64_t heap_limit,
     return v;
 }
 
+/* ─── E7 increment 25 — munmap, the memory class's last seam ───────────── */
+int linux_mem_munmap_refusal(const struct LinuxMunmapReq *req,
+                             uint64_t span_base, uint64_t span_limit,
+                             uint64_t brk_cur)
+{
+    uint64_t len_r;
+
+    if (req->len == 0) return -LINUX_EINVAL;
+    if (req->addr & (LINUX_PAGE_SIZE - 1)) return -LINUX_EINVAL;
+    if (req->len > UINT64_MAX - (LINUX_PAGE_SIZE - 1))
+        return -LINUX_EINVAL;
+    len_r = (req->len + LINUX_PAGE_SIZE - 1)
+          & ~((uint64_t)LINUX_PAGE_SIZE - 1);
+
+    /* The span is the kernel's OWN budget, not a policy hint: a range
+     * outside it would walk pages this task never owned. Starting below
+     * the current break is v1's deliberate limit — those pages are the
+     * brk seam's (munmap never rewinds either cursor). Linux's own
+     * invalid-range answer is EINVAL; this is not a budget-exhaustion
+     * ENOMEM because the request is malformed, not merely too large. */
+    if (req->addr < span_base || req->addr > span_limit)
+        return -LINUX_EINVAL;
+    if (len_r > span_limit - req->addr)
+        return -LINUX_EINVAL;
+    if (req->addr < brk_cur)
+        return -LINUX_EINVAL;
+    return 0;
+}
+
+struct LinuxMemMunmapVerdict
+linux_mem_munmap_verdict(uint64_t heap_base, uint64_t heap_limit,
+                         uint64_t brk_cur,
+                         const struct LinuxMunmapReq *req, uint64_t rax)
+{
+    struct LinuxMemMunmapVerdict v;
+    uint64_t len_r;
+
+    v.malformed = 0;
+    v.unmap_va = 0;
+    v.unmap_pages = 0;
+
+    /* A negative reply is the sidecar's refusal: nothing unmaps, and its
+     * errno rides the §5.7 map as usual. Munmap's success value is 0, so
+     * any other non-negative answer is a lie the kernel must not act on
+     * (the request's page range is not what the reply claimed). */
+    if ((int64_t)rax < 0) return v;
+    if (rax != 0) {
+        v.malformed = 1;
+        return v;
+    }
+    if (linux_mem_munmap_refusal(req, heap_base, heap_limit,
+                                 brk_cur) != 0) {
+        v.malformed = 1;
+        return v;
+    }
+
+    len_r = (req->len + LINUX_PAGE_SIZE - 1)
+          & ~((uint64_t)LINUX_PAGE_SIZE - 1);
+    v.unmap_va = req->addr;
+    v.unmap_pages = len_r / LINUX_PAGE_SIZE;
+    return v;
+}
+
 uint64_t linux_user_page_frame(uint64_t root, uint64_t va)
 {
     uint64_t leaf = 0;

@@ -463,6 +463,84 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                             v.new_mmap_top;
                                     }
                                 }
+                            } else if (snum == LINUX_MUNMAP) {
+                                /* E7 increment 25 apply half (§5.4): the
+                                 * staged munmap is resolved HERE, at the
+                                 * reply, inside this task's own trap.
+                                 * The sidecar's 11 arm decided WHETHER
+                                 * (and its verdict re-runs against this
+                                 * create's span and break); the kernel's
+                                 * page tables are the truth about which
+                                 * pages are PRESENT, so the walk frees
+                                 * exactly the USER 4 KiB leaves it finds
+                                 * and treats an absent page as already
+                                 * unmapped (POSIX: a double unmap is
+                                 * success). Every freed frame returns to
+                                 * the partition, and every touched
+                                 * translation — ring-3 may have run on
+                                 * the arena — is shot down with invlpg.
+                                 *
+                                 * The two cursors do NOT move: brk_cur is
+                                 * the break's, and mmap_top keeps
+                                 * descending, so v1 never re-hands a
+                                 * freed virtual range to a later mmap
+                                 * (frames return; the range waits for
+                                 * teardown). A malformed success reply
+                                 * answers -EINVAL with nothing unmapped.
+                                 */
+                                struct LinuxMunmapReq mreq;
+                                struct LinuxMemMunmapVerdict v;
+                                mreq.addr = sa0;
+                                mreq.len  = sa1;
+                                v = linux_mem_munmap_verdict(
+                                    cur->linux_heap_base,
+                                    cur->linux_heap_limit,
+                                    cur->linux_brk_cur, &mreq, rax);
+                                if (v.malformed) {
+                                    kernel_serial_printf(
+                                        "[E7] munmap reply 0x%lx for "
+                                        "request addr=0x%lx len=%lu "
+                                        "(span 0x%lx..0x%lx, brk 0x%lx) "
+                                        "is not success - nothing "
+                                        "unmapped\n",
+                                        (unsigned long)rax,
+                                        (unsigned long)sa0,
+                                        (unsigned long)sa1,
+                                        (unsigned long)cur->linux_heap_base,
+                                        (unsigned long)cur->linux_heap_limit,
+                                        (unsigned long)cur->linux_brk_cur);
+                                    rax = (uint64_t)(int64_t)
+                                          (-LINUX_EINVAL);
+                                } else if (v.unmap_pages) {
+                                    uint64_t *pml4 =
+                                        (uint64_t *)(uintptr_t)cur->cr3;
+                                    uint64_t va = v.unmap_va;
+                                    uint64_t idx = 0, freed = 0;
+                                    while (idx < v.unmap_pages) {
+                                        uint64_t f =
+                                            linux_user_page_frame(
+                                                cur->cr3, va);
+                                        if (f) {
+                                            user_unmap_page(pml4, va);
+                                            user_invlpg(va);
+                                            free_physical_ram_frame_for_partition(
+                                                (void *)(uintptr_t)f,
+                                                cur->partition_id);
+                                            freed++;
+                                        }
+                                        va += 4096;
+                                        idx++;
+                                    }
+                                    kernel_serial_printf(
+                                        "[E7] munmap addr=0x%lx len=%lu: "
+                                        "%lu page(s) freed, %lu already "
+                                        "absent\n",
+                                        (unsigned long)sa0,
+                                        (unsigned long)sa1,
+                                        (unsigned long)freed,
+                                        (unsigned long)(v.unmap_pages -
+                                                        freed));
+                                }
                             }
                         }
                     return rax;
@@ -706,6 +784,40 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                     cur->mem_stage_a1    = largs[1];
                     cur->mem_stage_a2    = largs[2];
                     cur->mem_stage_a3    = largs[3];
+                } else if (num == LINUX_MUNMAP) {
+                    /* E7 increment 25 (§5.4): munmap's first trap is
+                     * the same shape rule as its brk/mmap siblings — a
+                     * malformed length, an unaligned address, a range
+                     * outside THIS create's stamped span, or one that
+                     * starts below the current break is refused before
+                     * any post, with the words on the line. A pass
+                     * stages the two words the reply's verdict re-checks;
+                     * the sidecar's 11 arm repeats the rule as its twin
+                     * (guard clause X), so neither end is load-bearing
+                     * alone. */
+                    struct LinuxMunmapReq mreq;
+                    int mref;
+                    mreq.addr = largs[0];
+                    mreq.len  = largs[1];
+                    mref = linux_mem_munmap_refusal(&mreq,
+                            cur->linux_heap_base, cur->linux_heap_limit,
+                            cur->linux_brk_cur);
+                    if (mref) {
+                        kernel_serial_printf(
+                            "[E7] linux munmap addr=0x%lx len=%lu "
+                            "refused before post: %s\n",
+                            (unsigned long)largs[0],
+                            (unsigned long)largs[1],
+                            mref == -LINUX_EINVAL
+                                ? "malformed, outside the stamped span, "
+                                  "or below the current break"
+                                : "refused");
+                        return (uint64_t)(int64_t)mref;
+                    }
+                    cur->mem_stage_valid = 1;
+                    cur->mem_stage_num   = num;
+                    cur->mem_stage_a0    = largs[0];
+                    cur->mem_stage_a1    = largs[1];
                 } else if (num == LINUX_MPROTECT &&
                            linux_mprotect_refuses_wx(largs[2])) {
                     kernel_serial_printf(

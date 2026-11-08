@@ -778,6 +778,72 @@ int main(void)
               "      ladder is re-run, the verdict is total on any input");
     }
 
+    /* ─── the munmap seam (E7 increment 25, §5.4) ─────────────────────── */
+    {   const uint64_t BASE  = 0x0000400000100000ULL;
+        const uint64_t LIMIT = BASE + 0x10000;
+        struct LinuxMunmapReq req;
+        struct LinuxMemMunmapVerdict v;
+
+        req.addr = BASE + 0x2000; req.len = 0x1000;
+        CHECK(linux_mem_munmap_refusal(&req, BASE, LIMIT, BASE) == 0,
+              "a page-aligned heap range above the break passes the "
+              "      first trap");
+        req.addr = BASE + 0x2001;
+        CHECK(linux_mem_munmap_refusal(&req, BASE, LIMIT, BASE) == -LINUX_EINVAL,
+              "an unaligned address is EINVAL — no page walk can serve "
+              "      half a page");
+        req.addr = BASE + 0x2000; req.len = 0;
+        CHECK(linux_mem_munmap_refusal(&req, BASE, LIMIT, BASE) == -LINUX_EINVAL,
+              "a zero length is EINVAL — munmap names pages, not nothing");
+        req.len = 0xFFFFFFFFFFFFFFFFULL;
+        CHECK(linux_mem_munmap_refusal(&req, BASE, LIMIT, BASE) == -LINUX_EINVAL,
+              "a length whose page-round overflows is EINVAL, not a "
+              "      wrapped range");
+        req.len = 0x1000; req.addr = BASE - 0x1000;
+        CHECK(linux_mem_munmap_refusal(&req, BASE, LIMIT, BASE) == -LINUX_EINVAL,
+              "a range below the stamped span is EINVAL — the walk would "
+              "      leave this task's pages");
+        req.addr = LIMIT;
+        CHECK(linux_mem_munmap_refusal(&req, BASE, LIMIT, BASE) == -LINUX_EINVAL,
+              "a range at the span's limit is EINVAL — there is no page "
+              "      there to free");
+        req.addr = LIMIT - 0x1000; req.len = 0x2000;
+        CHECK(linux_mem_munmap_refusal(&req, BASE, LIMIT, BASE) == -LINUX_EINVAL,
+              "a range crossing the span's limit is EINVAL — the whole "
+              "      round must fit");
+        req.addr = BASE + 0x2000; req.len = 0x1000;
+        CHECK(linux_mem_munmap_refusal(&req, BASE, LIMIT, BASE + 0x3000)
+                  == -LINUX_EINVAL,
+              "a range below the current break is refused — the break's "
+              "      pages are the brk seam's");
+        CHECK(linux_mem_munmap_refusal(&req, BASE, LIMIT, BASE + 0x2000) == 0,
+              "a range exactly at the break is allowed — that page is "
+              "      the arena's, not the break's");
+        req.len = 1;
+        CHECK(linux_mem_munmap_refusal(&req, BASE, LIMIT, BASE) == 0,
+              "a one-byte tail still names its page after the round");
+
+        req.addr = BASE + 0x2000; req.len = 0x1000;
+        v = linux_mem_munmap_verdict(BASE, LIMIT, BASE, &req, 0);
+        CHECK(v.malformed == 0 && v.unmap_va == BASE + 0x2000 &&
+                  v.unmap_pages == 1,
+              "a success reply names the request's own page range");
+        v = linux_mem_munmap_verdict(BASE, LIMIT, BASE, &req,
+                                     (uint64_t)(int64_t)(-LINUX_EINVAL));
+        CHECK(v.malformed == 0 && v.unmap_pages == 0 && v.unmap_va == 0,
+              "a negative reply unmaps nothing and is not malformed — "
+              "      the errno rides the §5.7 map");
+        v = linux_mem_munmap_verdict(BASE, LIMIT, BASE, &req, 1);
+        CHECK(v.malformed == 1 && v.unmap_pages == 0,
+              "munmap's success is 0; any other non-negative reply is "
+              "      malformed and unmaps nothing");
+        req.addr = BASE + 0x2001;
+        v = linux_mem_munmap_verdict(BASE, LIMIT, BASE, &req, 0);
+        CHECK(v.malformed == 1 && v.unmap_pages == 0,
+              "a success for a request the first trap would refuse is "
+              "      malformed — the verdict is total on any input");
+    }
+
     /* ─── the frame reader: the unwind's read-back ────────────────────── */
     {   static uint64_t p_pml4[512] __attribute__((aligned(4096)));
         static uint64_t p_pdpt[512] __attribute__((aligned(4096)));
