@@ -1,0 +1,3302 @@
+[H[J[1;1H[?25l[m[H[J[1;1H[2;30HGNU GRUB  version 2.12
+
+[m[4;2H+----------------------------------------------------------------------------+[5;2H|[5;79H|[6;2H|[6;79H|[7;2H|[7;79H|[8;2H|[8;79H|[9;2H|[9;79H|[10;2H|[10;79H|[11;2H|[11;79H|[12;2H|[12;79H|[13;2H|[13;79H|[14;2H|[14;79H|[15;2H|[15;79H|[16;2H|[16;79H|[17;2H+----------------------------------------------------------------------------+[m[18;2H[19;2H[m     Use the ^ and v keys to select which entry is highlighted.          
+      Press enter to boot the selected OS, `e' to edit the commands       
+      before booting or `c' for a command-line.                           [5;80H [7m[5;3H*AeroSLS ? Phase 5 self-hosted (initrd sidecars)                            [m[5;78H[m[m[6;3H AeroSLS ? kernel only                                                      [m[6;78H[m[m[7;3H AeroSLS ? unified (control plane + sidecars)                               [m[7;78H[m[m[8;3H GRUB shell                                                                 [m[8;78H[m[m[9;3H                                                                            [m[9;78H[m[m[10;3H                                                                            [m[10;78H[m[m[11;3H                                                                            [m[11;78H[m[m[12;3H                                                                            [m[12;78H[m[m[13;3H                                                                            [m[13;78H[m[m[14;3H                                                                            [m[14;78H[m[m[15;3H                                                                            [m[15;78H[m[m[16;3H                                                                            [m[16;78H[m[16;80H [5;78H[22;1H   The highlighted entry will be executed automatically in 3s.                 [5;78H[22;1H                                                                               [23;1H                                                                               [5;78H[m[5;3H AeroSLS ? Phase 5 self-hosted (initrd sidecars)                            [m[5;78H[m[7m[6;3H*AeroSLS ? kernel only                                                      [m[6;78H[m[m[6;3H AeroSLS ? kernel only                                                      [m[6;78H[m[7m[7;3H*AeroSLS ? unified (control plane + sidecars)                               [m[7;78H[m[?25h[H[J[1;1H[H[J[1;1H[AEROSLS BOOT LOGGER V1.0.0 RUNNING]
+----------------------------------------------------------------------------------
+[BSP] Loading GDT and IDT...
+[FRAME] bootstrap stack [0xe0c89a0,0xe1c89a0) confirmed inside the reserved region -- frames 57544..57800 are the kernel's own stack and are not allocatable.
+[FRAME] reserved 57801 frames (225 MiB) below the kernel image end 0xe1c9000 -- allocator now starts above the kernel.
+[SIDECAR] multiboot v1 detected, flags=0x1a6f phys=0x10000
+[SIDECAR] v1 mods_count=1 mods_addr=0x100c4
+[SIDECAR] v1 initrd module at 0xe231000..0xe40b6a8 (1943208 bytes)
+[HW] Multiboot v1: mem_upper=1047388 KiB, top=0x3ffd7000
+[FRAME] reserved 786473 frames above 0x3ffd7000 -- that memory does not exist.
+[CAP] shared-memory arena: 64 MiB physically contiguous at 0xe200000 (16384 frames).
+[CAP] Seed kernel capability layer online: 512-slot tables, 1024-object ceiling, holders, channels, arena, message transport, syscalls 289-304.
+[QEMU-SLS MMU] shadow PML4=0x000000000e1c9000 (kernel PT inherited)
+[TIMER] tick calibrated: tsc=2641265270 Hz, lapic=62528106 Hz, ticr=625281, tick=10000000 ns
+[BSP] LAPIC and IRQ0 timer online.
+[BSP] Round-robin task scheduler initialised.
+[FPU] SSE/SSE2 enabled for ring 3 — CR4.OSFXSR|OSXMMEXCPT, CR0.MP; EM/TS clear, CR0.TS not armed
+[SYSCALL] Gate initialised. STAR=0x0010000800000000  LSTAR=0x0000000000102bd0
+[PROC] Ring-3 process manager initialised.
+[BOOT] command line: "unified=1 nic0=both nic1=none"
+[PARTITION] LPAR groundwork initialised (1 partition: system).
+[SERVICE] service registry initialised (0 registrations).
+[MESH] circuit breakers initialised (all closed).
+[WORKLOAD] declarative workloads initialised (reconciler OFF).
+[WLCTX] context pool initialised (8 slots).
+[FAILOVER] Subsystem initialised.
+[FAILOVER] relaunch grace: this node just came up -- no peer is declared DEAD for 6000 ticks (until tick 6000).
+[LOADER] Service binary store ready. Built-in demo: 26 bytes.
+[WEBAPP] Asset store ready. Built-in Navigator page: 2059 bytes.
+[ENTROPY] seeded.
+[RTC] CMOS clock accepted.
+[TLS] memory pool initialised (512 KiB, fixed).
+[AUTH] Token Registry
+ Email                           UID   Role          Token                             Password
+ -------------------------------  ----  ------------  --------------------------------  --------
+ dave@gridworkz.com  uid=1000  DB_ADMIN  deadbeef01234567cafebabe76543210  demo-dave
+ bob@vance.com  uid=1001  APP_USER  cafebabe7654321089abcdef01234567  demo-bob
+ carol@gridworkz.com  uid=1002  DB_ADMIN  feedf00dabcdef0112345678deadc0de  demo-carol
+ guest@sandbox.com  uid=1003  GUEST  deadc0de9988776655443322aabbccdd  demo-guest
+
+[JOURNAL] Subsystem initialised.
+[LOCK] Row-level lock manager initialised.
+[INDEX] Secondary index manager initialised.
+[CONSTRAINT] Engine initialised.
+[CURSOR] Server-side cursor engine initialised.
+[MQT] Materialized query table engine initialised.
+[ROWSTORE] Row-set storage engine initialised.
+[ROW_INDEX] B-tree row index engine initialised.
+[VECSTORE] Vector store engine initialised.
+[AGENT] Agent engine initialised (max agents=8, max workflows=4)
+[MK] Microkernel booted successfully. Ring-0 primitives online.
+[IPC] Message Passing interface configured (Port bounds 0x1001 - 0x1007).
+[MK] registering services
+[MK] Service ONLINE: VirtualMemoryMgr  PID=101
+[MK] Service ONLINE: ObjectSecurityMgr  PID=102
+[MK] Service ONLINE: NativeDbStoreMgr  PID=103
+[MK] Service ONLINE: StorageTierMgr  PID=104
+[MK] Service ONLINE: RecoveryLogVerifier  PID=105
+[MK] Service ONLINE: AgentRuntimeMgr  PID=106
+[MK] Service ONLINE: CheckpointMgr  PID=107
+[MK] Fault Isolation Daemon active. Poll interval: 100ms.
+[TIER] Storage Tier Manager initialized.
+[TIER] Thresholds: promote=8 accesses/tick  demote=30 idle ticks.
+[CKPT] CheckpointMgr initialised.
+[BSP] Waking Core 1...
+[SMP] AP at APIC id 1 online.
+[BSP] Core 1 online.
+[NET] PCI scanning for e1000...
+[NET] e1000 #0 at PCI slot 4 MMIO 0xfeb80000
+[NET] NIC roles taken from the command line.
+[E1000] nic0 MAC 52:54:00:12:34:07  roles: mgmt cluster
+[NET] Packet buffer pool ready (64 x 2 KB).
+[ARP] Announced 10.0.2.15 -> 52:54:00:12:34:07
+[DHCP] Starting DISCOVER...
+[DHCP] Bound: 10.0.2.15  gw 10.0.2.2  subnet 255.255.255.0
+[NET] 1 e1000 interface(s) online, 0 reserved for user drivers.
+[NVME] Controller at PCI slot 3 MMIO 0xfebb0000
+[NVME] Admin queue ready.
+[NVME] Identify Namespace 1: NCAP=2314885530819524197 blocks (~4415293752846 MB assuming 512B LBA)
+[NVME_IO] Creating CQ: prp1=0xe1cf000 cdw10=0x3f0001
+[NVME_IO] Create CQ done, status=0x0
+[NVME_IO] PRP list page ready (multi-page transfers enabled).
+[NVME_IO] I/O queue pair 1 ready (64 entries, 4-KiB PRP).
+[PERSIST] Catalog restored: 0 entries.
+[PERSIST] Records restored from NVMe.
+[PERSIST] Schemas restored from NVMe.
+[PERSIST] Programs restored: 0 binaries.
+[PERSIST] Partitions restored from NVMe.
+[PERSIST] Partition ownership restored from NVMe.
+[TCP-QUOTA] partition 1: born bounded at 96 (tenant default; 0 = explicitly unlimited)
+[PERSIST] Row-store table headers + per-partition page cursors restored from NVMe.
+[PERSIST] Row constraints restored: 0 defined.
+[PERSIST] Row indexes rebuilt from NVMe-persisted definitions: 0 of 0.
+[PERSIST] Vecstore collection headers + per-partition page cursors restored from NVMe.
+[PERSIST] HNSW vector indexes rebuilt from NVMe-persisted definitions: 0 of 0.
+[PERSIST] Row journal restored: 0 entries (seq), 0 attachment(s).
+[PERSIST] Databases restored: 0 defined, next_id=1.
+[PERSIST] Views restored: 0 defined.
+[PERSIST] Tenants restored: 0 defined, next_id=1.
+[PERSIST] Service registry restored: 0 registration(s).
+[PERSIST] Workloads restored: 0 declaration(s) (reconciler stays OFF).
+[ENV_CKPT] Restored 1 environment checkpoint record(s) (0 partition(s) re-paused).
+[PERSIST] Environment storage directory restored (1 store(s)).
+[STREAM] No directory on NVMe — cold start.
+[STREAM] Stream store ready (frame-pool + NVMe persistence).
+[QEMU-SLS TCACHE] warm start — codebuf_used=0, codebuf=0x0000000007c51000
+[QEMU-SLS PGO] hot threshold=1000, scan interval=1000 ticks
+[QEMU-SLS VM] no snapshot -- Phase 4 save/restore has no callers (scaffolding, awaiting a launcher resume path)
+[SECURITY] UID 1000 role updated to DB_ADMIN.
+[AUDIT] #1 uid=1000 action=ROLE_CHANGE detail=DB_ADMIN granted=1
+[PERSIST] Catalog snapshot written.
+[SECURITY] UID 1001 role updated to APP_USER.
+[AUDIT] #2 uid=1001 action=ROLE_CHANGE detail=APP_USER granted=1
+[PERSIST] Catalog snapshot written.
+[SECURITY] UID 1002 role updated to DB_ADMIN.
+[AUDIT] #3 uid=1002 action=ROLE_CHANGE detail=DB_ADMIN granted=1
+[PERSIST] Catalog snapshot written.
+[SECURITY] UID 1003 role updated to GUEST.
+[AUDIT] #4 uid=1003 action=ROLE_CHANGE detail=GUEST granted=1
+[PERSIST] Catalog snapshot written.
+[AUTH] Default demo account roles seeded in object-catalog role_table.
+[BOOT] unified boot requested (unified=1) — the Ring-0 control plane and the sidecar world will share this boot.
+[E1] control plane planted as PID 1 'kplane' in PARTITION_SYSTEM (proc slot 15; slot 0 belongs to the boot parent)
+[E1] BIB v3 flags=0x1 (UNIFIED) written into every sidecar's boot info block
+[CONSOLE] sidecar input forwarding disabled (kernel owns the console)
+[SIDECAR] boot image: init @0x20000000 (139280 B) dm @0x21023000 (106512 B) posix @0x2107e000 (1261928 B) ramdisk @0x215b3000 (94224 B) net @0x2260b000 (295056 B) e1000 @0x226d4000 (37272 B) registry @0x2275e000 (4096 B)
+[SIDECAR] rootfs: 4096 bytes @ 0x2160b000
+[SIDECAR] device registry: 5 device(s) @0x2275e000
+[SIDECAR] boot parent planted: slot0 pid=99 active=1 state=4
+[PAGING] New user PML4 at 0x000000000e1d1000
+[SIDECAR] PID 100 'aerosls.init.0': wired chan 'console' to kernel service 'kernel.debug.console' (slots 9/10, kernel end 0/1)
+[SIDECAR] PID 100 'aerosls.init.0': wired chan 'env' to kernel service 'kernel.env.control' (slots 11/12, kernel end 2/3)
+[ENV] control channel wired: kernel ends rd=2 wr=3
+[SIDECAR] PID 100 'aerosls.init.0' released — runs on next schedule (BIB at 0x0000400000043000, entry 0x0000400000000000)
+[E1] init sidecar created (PID 100, messenger CHAN_R 0) and left RUNNABLE — unified boot: control plane and sidecars share this boot
+----------------------------------------------------------------------------------
+[SLS] System ready. Launching secure shell...
+----------------------------------------------------------------------------------
+
+--- Multi-User SLS Secure Shell Active ---
+Type 'help' for available commands.
+
+uid:1000> [HTTP] Listening on port 3000. GET http://10.0.2.15:3000/api/scan
+[TLS] CA loaded from disk, 1824 day(s) left. An existing import is still good.
+[TLS] server ready: TLS 1.3, P-256. leaf 473 bytes, CA 452 bytes.
+[TLS] import the CA (not the leaf) to trust this node.
+[TLS] Listening on port 8443. https://10.0.2.15:8443/
+[NET] hb TX: 1 heartbeat/liveness frame(s) handed to the NIC
+[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 1
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[PAGING] New user PML4 at 0x0000000012227000
+[SIDECAR] PID 101 'drv.device_manager.0': wired chan 'console' to kernel service 'kernel.debug.console' (slots 3/4, kernel end 4/5)
+[SIDECAR] PID 101 'drv.device_manager.0' released — runs on next schedule (BIB at 0x000040000001f000, entry 0x0000400000000000)
+[INIT] ── AeroSLS init sidecar booting ──[INIT] budget: 16 MiB[INIT] found 5 PCI device(s)[INIT]   [0]  class=06:00 vendor=8086 dev=1237 bar=0x00000000[INIT]   [1]  class=06:01 vendor=8086 dev=7000 bar=0x00000000[INIT]   [2]  class=03:00 vendor=1234 dev=1111 bar=0xfd000000[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT]   [3] drv.nvme.0 class=01:08 vendor=1b36 dev=0010 bar=0xfebb0000[INIT]   [4]  class=02:00 vendor=8086 dev=100e bar=0xfeb80000[INIT] spawning Device Manager...[INIT]   (create_sidecar: drv.device_manager.0 image @ 0x21023000, 106512 bytes)[INIT]   messenger: CHAN_R=13 CHAN_W=14[PROC] PID 100 yielded to PID 101
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[CAP] woken PID 100 (channel 3)
+[CAP] send handoff: PID 101 -> 100
+[INIT] sending device registry to Device Manager...[INIT] waiting for Device Manager to initialise devices...[DM] ── AeroSLS Device Manager booting ──[DM] budget: 256 KiB heap[DM] waiting for the device registry from init...[PAGING] New user PML4 at 0x0000000012250000
+[SIDECAR] PID 102 'drv.ramdisk.0': wired chan 'console' to kernel service 'kernel.debug.console' (slots 4/5, kernel end 6/7)
+[SIDECAR] PID 102 'drv.ramdisk.0' released — runs on next schedule (BIB at 0x000040000001c000, entry 0x0000400000000000)
+[INIT] all devices ready.[INIT] spawning ramdisk driver...[INIT]   ramdisk budget @ 0x215cb000, storage @ 0x2160b000 (16 MiB)[INIT]   (create_sidecar: drv.ramdisk.0 image @ 0x215b3000, 94224 bytes)[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 101
+[INIT]   ramdisk messenger: CHAN_R=8 CHAN_W=3[INIT] UNIFIED boot (BIB flag): the kernel owns the NICs and the console; keeping the software-only spawn chain[INIT] e1000 BAR0 @ 0xfeb80000 → POSIX manifest DEV cap 'nic0.bar0'[INIT] unified boot: the network driver and the system POSIX sidecar stay unspawned (kernel-owned hardware)[INIT] ── Phase 5 init sidecar complete ──[INIT] system ready for POSIX sidecar creation.[INIT] entering the event loop (blocking wait + watchdog respawn)...[INIT] env manager on control channel (CHAN_R=11 CHAN_W=12)[INIT] unified boot: entering the heartbeat loop (DM watchdog + env control, no POSIX subject)[DM]   adopt [0]  class=06:00 vendor=8086 dev=1237 bar=0x00000000[DM]   adopt [1]  class=06:01 vendor=8086 dev=7000 bar=0x00000000[DM]   adopt [2]  class=03:00 vendor=1234 dev=1111 bar=0xfd000000[DM]   adopt [3] drv.nvme.0 class=01:08 vendor=1b36 dev=0010 bar=0xfebb0000[DM]   adopt [4]  class=02:00 vendor=8086 dev=100e bar=0xfeb80000[DM] registry: 5 device(s) adopted[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 1[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[INIT] heartbeat 2[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 3[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 4[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 5[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 6[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 7[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 8[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 9[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 10[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 11[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 12[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 13[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 2
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 14[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 15[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 16[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 17[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 18[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 19[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 20[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 21[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 22[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 23[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 24[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 25[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 26[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 27[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 28[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 29[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 3
+[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 30[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 31[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 32[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 33[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 34[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 35[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 36[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 37[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 38[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 39[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 40[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 41[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 42[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 43[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 44[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 4
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 45[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 46[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 47[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 48[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 49[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 50[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 51[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 52[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 53[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 54[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 55[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 56[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 57[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 58[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 59[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 5
+[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 60[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 61[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 62[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 63[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 64[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 65[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 66[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 67[CS] restore hold armed for partition 1 — a Linux child born now is held until the payload's pour adopts it
+[CAP] woken PID 100 (channel 2)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[PERSIST] Environment storage directory written (1 store(s)).
+[ENV-STORAGE] attach partition=1 index=1 base=304865280 bytes=1048576 slot=0 durable=1 charged=2 (reattach)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[PAGING] New user PML4 at 0x00000000127be000
+[SIDECAR] PID 103 'drv.ramdisk.1': wired chan 'console' to kernel service 'kernel.debug.console' (slots 4/5, kernel end 8/9)
+[SIDECAR] PID 103 'drv.ramdisk.1' released — runs on next schedule (BIB at 0x000040000001c000, entry 0x0000400000000000)
+[ENV-STORAGE] restore partition=1 index=1 slot=0 pages=256 loaded from LBA 1114112
+[E1] yield: control plane -> PID 103 'drv.ramdisk.1' (budget 2 ticks)
+[PAGING] New user PML4 at 0x00000000127e3000
+[SIDECAR] PID 104 'aerosls.posix.1': wired chan 'console' to kernel service 'kernel.env.console' (slots 3/4, kernel end 10/11)
+[ENV-CONSOLE] environment (partition 1, index 1) console wired: posix pid 104, kernel ends rd=10 wr=11
+[SIDECAR] PID 104 'aerosls.posix.1': wired chan 'ramdisk' to sidecar 'drv.ramdisk.1' (PID 103, slots 5/6 peer_slots 6/7)
+[SIDECAR] PID 104 'aerosls.posix.1': wired chan 'network' to kernel service 'kernel.net.socket' (slots 7/8, kernel end 12/13)
+[NET-SOCKET] aerosls.posix.1 (partition 1, pid 104) wired: kernel ends rd=12 wr=13 — client + listener open (P2 increment 3)
+[SIDECAR] PID 104 'aerosls.posix.1': wired chan 'catalog' to kernel service 'kernel.env.catalog' (slots 9/10, kernel end 14/15)
+[ENV-CATALOG] aerosls.posix.1 (partition 1, pid 104) wired: kernel ends rd=14 wr=15 — read-only catalog view open (§9)
+[SIDECAR] PID 104 'aerosls.posix.1' released — runs on next schedule (BIB at 0x0000400000145000, entry 0x0000400000000000)
+[POSIX] boot: rw=06 rr=05 cw=03 nw=08
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[CAP] woken PID 100 (channel 2)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[CAP] woken PID 100 (channel 2)
+[ENV] checkpoint record registered: env 1 (partition 1, index 1) regions=3 chans=4 tasks=3 console=1
+[ENV_PAYLOAD] wait: task 0 'drv.ramdisk.1' kind=1 live=yes parked=yes syscall=311 nchans=2
+[ENV_PAYLOAD] wait: task 1 'aerosls.posix.1' kind=0 live=yes parked=yes syscall=311 nchans=1
+[ENV_PAYLOAD] wait: task 2 'e7.gate.user.0' kind=2 (linux, skipped)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 50 ticks)
+[INIT] heartbeat 68[CAP] woken PID 104 (channel 11)
+[CAP] send handoff: PID 103 -> 104
+[CAP] woken PID 104 (channel 11)
+[CAP] send handoff: PID 103 -> 104
+[CAP] woken PID 104 (channel 12)
+[E7-GATE] stage00080000 bytes
+[E7-GATE] heap-used0008C5BD 
+[E7-GATE] heap-free00273A43 
+[E7-GATE] stretch-start0000AFC8 Miters
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 69[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 70[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 71[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 72[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 73[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 74[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 75[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 76[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 6
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 77[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 78[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 79[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 80[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 81[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 82[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 83[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 84[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 85[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 86[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 87[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 88[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 89[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 90[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 91[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 92[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 93[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 94[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 7
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 95[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 96[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 97[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 98[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 99[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 100[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 101[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 102[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 103[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 104[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 105[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 106[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 107[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 108[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 109[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 110[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 111[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 112[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 8
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 113[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 114[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 115[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 116[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 117[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 118[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 119[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 120[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 121[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 122[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 123[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 124[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 125[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 126[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 127[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 128[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 129[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 130[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 9
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 131[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 132[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 133[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 134[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 135[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 136[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 137[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 138[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 139[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 140[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 141[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 142[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 143[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 144[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 145[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 146[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 147[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 148[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 10
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 149[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 150[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 151[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 152[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 153[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 154[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 155[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 156[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 157[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 158[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 159[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 160[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 161[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 162[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 163[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 164[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 165[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 166[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 11
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 167[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 168[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 169[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 170[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 171[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 172[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 173[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 174[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 175[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 176[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 177[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 178[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 179[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 180[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 181[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 182[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 183[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 184[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 12
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 185[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 186[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 187[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 188[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 189[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 190[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 191[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 192[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 193[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 194[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 195[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 196[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 197[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 198[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 199[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 200[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 201[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 202[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 13
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 203[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 204[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 205[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 206[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 207[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 208[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 209[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 210[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 211[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 212[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 213[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 214[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 215[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 216[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 217[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 218[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 219[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 220[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 14
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 221[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 222[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 223[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 224[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 225[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 226[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 227[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 228[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 229[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 230[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 231[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 232[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 233[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 234[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 235[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 236[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 237[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 238[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 15
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 239[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 240[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 241[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 242[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 243[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 244[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 245[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 246[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 247[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 248[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 249[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 250[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 251[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 252[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 253[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 254[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 255[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 256[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 16
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 257[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 258[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 259[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 260[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 261[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 262[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 263[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 264[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 265[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 266[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 267[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 268[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 269[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 270[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 271[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 272[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 273[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 274[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 17
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 275[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 276[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 277[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 278[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 279[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 280[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 281[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 282[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 283[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 284[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 285[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 286[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 287[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 288[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 289[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 290[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 291[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 292[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 18
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 293[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 294[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 295[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 296[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 297[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 298[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 299[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 300[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 301[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 302[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 303[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 304[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 305[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 306[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 307[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 308[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 309[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 310[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 19
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 311[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 312[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 313[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 314[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 315[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 316[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 317[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 318[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 319[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 320[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 321[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 322[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 323[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 324[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 325[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 326[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 327[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 328[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 20
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 329[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 330[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 331[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 332[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 333[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 334[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 335[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 336[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 337[ENV_PAYLOAD] wait: outlived the fixed bound (partition=1 index=1): 3001 ticks elapsed, quiet 0, announced=0, running=1/2 -- still being scheduled, so the window was extended, not expired
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 338[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 339[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 340[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 341[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 342[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 343[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 344[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 345[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 346[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 21
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 347[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 348[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 349[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 350[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 351[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 352[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 353[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 354[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 355[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 356[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 357[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 358[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 359[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 360[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 361[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 362[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 363[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 364[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 22
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 365[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 366[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 367[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 368[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 369[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 370[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 371[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 372[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 373[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 374[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 375[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 376[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 377[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 378[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 23
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 379[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 380[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 381[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 382[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 383[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 384[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 385[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 386[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 387[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 388[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 389[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 390[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 391[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 392[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 393[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 394[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 395[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 396[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 24
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 397[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 398[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 399[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 400[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 401[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 402[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 403[INIT] heartbeat 404[PROC] PID 100 yielded to PID 104
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 405[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 406[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 407[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 408[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 409[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 410[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 411[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 412[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 413[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 414[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 25
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 415[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 416[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 417[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 418[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 419[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 420[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 421[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 422[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 423[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 424[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 425[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 426[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 427[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 428[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 429[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 430[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 431[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 432[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 26
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 433[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 434[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 435[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 436[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 437[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 438[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 439[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 440[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 441[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 442[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 443[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 444[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 445[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 446[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 447[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 448[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 449[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 27
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 450[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 451[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 452[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 453[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 454[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 455[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 456[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 457[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 458[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 459[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 460[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 461[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 462[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 463[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 464[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 465[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 466[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 467[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 28
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 468[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 469[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 470[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 471[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 472[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 473[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 474[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 475[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 476[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 477[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 478[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 479[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 480[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 481[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 482[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 483[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 484[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 485[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 486[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 29
+[E1] yield: control plane -> PID 103 'drv.ramdisk.1' (budget 50 ticks)
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 487[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 488[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 489[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 490[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 491[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 50 ticks)
+[E7-GATE] stretch-done0000AFC8 Miters
+[PAGING] New user PML4 at 0x0000000012933000
+[LOADER] ELF segment: vaddr=0x0000000008000000  filesz=20096  memsz=20096  flags=R--
+[LOADER] ELF segment: vaddr=0x0000000008005000  filesz=370102  memsz=370102  flags=R-X
+[LOADER] ELF segment: vaddr=0x0000000008060000  filesz=90356  memsz=90356  flags=R--
+[LOADER] ELF segment: vaddr=0x0000000008077370  filesz=14320  memsz=20528  flags=RW-
+[LOADER] segment vaddr 0x8077370 is 0x370 into its page; frames anchored at 0x8077000
+[LOADER] ELF64 loaded. Entry: 0x000000000800ab76
+[SIDECAR] PID 105 'e7.gate.user.0' HELD for the restore pour — runs only after the payload adopts it (BIB at 0x00004000000aa000, entry 0x000000000800ab76)
+[ENV_CKPT] linux task 'e7.gate.user.0' stamped into partition=1 index=1 entry=0x800ab76 stack=0x40000009b000..0x4000000ab000 caps=2
+[PROC] PID 100 yielded to PID 104
+[E7] firstuser: spawned 0000000B 
+[INIT] heartbeat 492[POSIX] loop exit0=0000FEED 
+[POSIX] loop tasks=00000001 
+[CAP] woken PID 103 (channel 11)
+[CAP] send handoff: PID 104 -> 103
+[CAP] woken PID 103 (channel 11)
+[CAP] woken PID 103 (channel 11)
+[CAP] send handoff: PID 104 -> 103
+[CAP] woken PID 103 (channel 11)
+[POSIX] rc open err=00000002 
+[POSIX] aero state=00000000 
+[INIT] heartbeat 493[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 494[INIT] heartbeat 495[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 496[ENV_RESTORE] record (partition 1, index 1) replayed through create: env 1 -> 1, identity intact
+[ENV_PAYLOAD] mapped a missing Linux page task=2 vaddr=0x4000000ac000 perm=0x5 for the replay's fresh address space
+[ENV_PAYLOAD] mapped a missing Linux page task=2 vaddr=0x4000000d8000 perm=0x5 for the replay's fresh address space
+[ENV_PAYLOAD] mapped a missing Linux page task=2 vaddr=0x4000000d9000 perm=0x5 for the replay's fresh address space
+[ENV_PAYLOAD] mapped a missing Linux page task=2 vaddr=0x4000000da000 perm=0x5 for the replay's fresh address space
+[ENV_PAYLOAD] mapped a missing Linux page task=2 vaddr=0x4000000db000 perm=0x5 for the replay's fresh address space
+[ENV_PAYLOAD] mapped a missing Linux page task=2 vaddr=0x4000000dc000 perm=0x5 for the replay's fresh address space
+[ENV_PAYLOAD] mapped a missing Linux page task=2 vaddr=0x4000000dd000 perm=0x5 for the replay's fresh address space
+[ENV_PAYLOAD] mapped a missing Linux page task=2 vaddr=0x4000000de000 perm=0x5 for the replay's fresh address space
+[ENV_PAYLOAD] mapped a missing Linux page task=2 vaddr=0x4000000df000 perm=0x5 for the replay's fresh address space
+[ENV_PAYLOAD] mapped a missing Linux page task=2 vaddr=0x4000000e0000 perm=0x5 for the replay's fresh address space
+[ENV_PAYLOAD] mapped a missing Linux page task=2 vaddr=0x4000000e1000 perm=0x5 for the replay's fresh address space
+[ENV_PAYLOAD] mapped a missing Linux page task=2 vaddr=0x4000000e2000 perm=0x5 for the replay's fresh address space
+[ENV_PAYLOAD] mapped a missing Linux page task=2 vaddr=0x4000000e3000 perm=0x5 for the replay's fresh address space
+[ENV_PAYLOAD] mapped a missing Linux page task=2 vaddr=0x4000000e4000 perm=0x5 for the replay's fresh address space
+[ENV_PAYLOAD] mapped a missing Linux page task=2 vaddr=0x4000000e5000 perm=0x5 for the replay's fresh address space
+[ENV_PAYLOAD] mapped a missing Linux page task=2 vaddr=0x4000000e6000 perm=0x5 for the replay's fresh address space
+[ENV_PAYLOAD] mapped a missing Linux page task=2 vaddr=0x4000000e7000 perm=0x5 for the replay's fresh address space
+[ENV_PAYLOAD] mapped a missing Linux page task=2 vaddr=0x4000000e8000 perm=0x5 for the replay's fresh address space
+[ENV_PAYLOAD] mapped a missing Linux page task=2 vaddr=0x4000000e9000 perm=0x5 for the replay's fresh address space
+[ENV_PAYLOAD] mapped a missing Linux page task=2 vaddr=0x4000000ea000 perm=0x5 for the replay's fresh address space
+[ENV_PAYLOAD] linux task 'e7.gate.user.0' adopted at rip=0x8057ab7 rsp=0x4000000a9778 fs_base=0x807c208 brk=0x4000000ad000 mtop=0x4000000d8000 form=3 held=1 stop=spent
+[ENV_PAYLOAD] restored partition=1 index=1 env=1 pages=1859 console=25 bytes
+[SIDECAR] PID 105 'e7.gate.user.0' released after the restore pour — first instruction rip=0x8057ab7 rsp=0x4000000a9778
+[ENV_RESTORE] 1 pending, 1 replayed, 0 refused, 0 still pending (0 partition(s) resumed for a create, 0 re-paused).
+[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 30
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 104 (channel 14)
+[PROC] PID 100 yielded to PID 103
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00030000 
+[INIT] heartbeat 497[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00030400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00030800 
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7-GATE] read off=00030C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[PROC] PID 100 yielded to PID 104
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00031000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[INIT] heartbeat 498[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00031400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00031800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00031C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00032000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00032400 
+[PROC] PID 100 yielded to PID 105
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[INIT] heartbeat 499[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00032800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00032C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00033000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[PROC] PID 100 yielded to PID 105
+[E7-GATE] read off=00033400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[INIT] heartbeat 500[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00033800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7-GATE] read off=00033C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00034000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 103 'drv.ramdisk.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00034400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[PROC] PID 100 yielded to PID 105
+[INIT] heartbeat 501[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[E7-GATE] read off=00034800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7-GATE] read off=00034C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00035000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7-GATE] read off=00035400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00035800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00035C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00036000 
+[PROC] PID 100 yielded to PID 105
+[INIT] heartbeat 502[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00036400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00036800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00036C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 103 'drv.ramdisk.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00037000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00037400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00037800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00037C00 
+[PROC] PID 100 yielded to PID 105
+[INIT] heartbeat 503[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00038000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7-GATE] read off=00038400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00038800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00038C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00039000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00039400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[PROC] PID 100 yielded to PID 104
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00039800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[INIT] heartbeat 504[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00039C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7-GATE] read off=0003A000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0003A400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0003A800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0003AC00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0003B000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[PROC] PID 100 yielded to PID 105
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[INIT] heartbeat 505[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7-GATE] read off=0003B400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0003B800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0003BC00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0003C000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0003C400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0003C800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 103
+[E7-GATE] read off=0003CC00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[INIT] heartbeat 506[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0003D000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0003D400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0003D800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7-GATE] read off=0003DC00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0003E000 
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[PROC] PID 100 yielded to PID 105
+[E7-GATE] read off=0003E400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[INIT] heartbeat 507[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0003E800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0003EC00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0003F000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7-GATE] read off=0003F400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0003F800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 103
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[INIT] heartbeat 508[E7-GATE] read off=0003FC00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00040000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7] linux: num=00000008 child=e7.gate.user.0 ok
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7] linux: num=00000001 child=e7.gate.user.0 ok
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7-GATE] read off=00040400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[PROC] PID 100 yielded to PID 104
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7] linux: num=00000001 child=e7.gate.user.0 ok
+
+[INIT] heartbeat 509[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00040800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7] linux: num=00000001 child=e7.gate.user.0 ok
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00040C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7] linux: num=00000001 child=e7.gate.user.0 ok
+
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00041000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00041400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[PROC] PID 100 yielded to PID 105
+[INIT] heartbeat 510[E1] yield: control plane -> PID 103 'drv.ramdisk.1' (budget 2 ticks)
+[E7-GATE] read off=00041800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00041C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00042000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 31
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00042400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00042800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00042C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00043000 
+[PROC] PID 100 yielded to PID 105
+[INIT] heartbeat 511[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00043400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00043800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[E7-GATE] read off=00043C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00044000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 103 'drv.ramdisk.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00044400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00044800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[PROC] PID 100 yielded to PID 105
+[INIT] heartbeat 512[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[E7-GATE] read off=00044C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00045000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00045400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00045800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00045C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00046000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[PROC] PID 100 yielded to PID 105
+[INIT] heartbeat 513[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[E7-GATE] read off=00046400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7-GATE] read off=00046800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00046C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 103 'drv.ramdisk.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00047000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00047400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7-GATE] read off=00047800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00047C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[PROC] PID 100 yielded to PID 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[E7-GATE] read off=00048000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[INIT] heartbeat 514[E7-GATE] read off=00048400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00048800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00048C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00049000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00049400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7-GATE] read off=00049800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[PROC] PID 100 yielded to PID 104
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00049C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[INIT] heartbeat 515[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0004A000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0004A400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0004A800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0004AC00 
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0004B000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0004B400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[PROC] PID 100 yielded to PID 104
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0004B800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[INIT] heartbeat 516[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0004BC00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0004C000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7-GATE] read off=0004C400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0004C800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[PROC] PID 100 yielded to PID 105
+[E7-GATE] read off=0004CC00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[INIT] heartbeat 517[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0004D000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7-GATE] read off=0004D400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0004D800 
+[PROC] PID 100 yielded to PID 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[INIT] heartbeat 518[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0004DC00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0004E000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0004E400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0004E800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0004EC00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[PROC] PID 100 yielded to PID 105
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[INIT] heartbeat 519[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0004F000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0004F400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0004F800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0004FC00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[PROC] PID 100 yielded to PID 105
+[INIT] heartbeat 520[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[E7-GATE] read off=00050000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7-GATE] read off=00050400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00050800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00050C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00051000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00051400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00051800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[PROC] PID 100 yielded to PID 104
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00051C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[INIT] heartbeat 521[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00052000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7-GATE] read off=00052400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00052800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00052C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00053000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7-GATE] read off=00053400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[PROC] PID 100 yielded to PID 104
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00053800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[INIT] heartbeat 522[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00053C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 103 'drv.ramdisk.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00054000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00054400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00054800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00054C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7-GATE] read off=00055000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[PROC] PID 100 yielded to PID 104
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00055400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[INIT] heartbeat 523[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00055800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7-GATE] read off=00055C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00056000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 32
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00056400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00056800 
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[PROC] PID 100 yielded to PID 105
+[E7-GATE] read off=00056C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[INIT] heartbeat 524[E1] yield: control plane -> PID 103 'drv.ramdisk.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00057000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00057400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00057800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00057C00 
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00058000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[PROC] PID 100 yielded to PID 105
+[INIT] heartbeat 525[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[E7-GATE] read off=00058400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00058800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00058C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00059000 
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00059400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00059800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00059C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 526[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0005A000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0005A400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0005A800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0005AC00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0005B000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0005B400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0005B800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[PROC] PID 100 yielded to PID 104
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0005BC00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[INIT] heartbeat 527[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0005C000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0005C400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0005C800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0005CC00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0005D000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[PROC] PID 100 yielded to PID 105
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[INIT] heartbeat 528[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7-GATE] read off=0005D400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0005D800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0005DC00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7-GATE] read off=0005E000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0005E400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[PROC] PID 100 yielded to PID 104
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0005E800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[INIT] heartbeat 529[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0005EC00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7-GATE] read off=0005F000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0005F400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0005F800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0005FC00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00060000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[PROC] PID 100 yielded to PID 104
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00060400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[INIT] heartbeat 530[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00060800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00060C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00061000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00061400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00061800 
+[PROC] PID 100 yielded to PID 105
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[INIT] heartbeat 531[E1] yield: control plane -> PID 103 'drv.ramdisk.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00061C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00062000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00062400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00062800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00062C00 
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 104
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[INIT] heartbeat 532[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00063000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00063400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00063800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00063C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00064000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 104
+[E7-GATE] read off=00064400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[INIT] heartbeat 533[E1] yield: control plane -> PID 103 'drv.ramdisk.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00064800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00064C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00065000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00065400 
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[PROC] PID 100 yielded to PID 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[E7-GATE] read off=00065800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[INIT] heartbeat 534[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00065C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00066000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00066400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7-GATE] read off=00066800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 103 'drv.ramdisk.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00066C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00067000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[PROC] PID 100 yielded to PID 105
+[INIT] heartbeat 535[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00067400 
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7-GATE] read off=00067800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00067C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7-GATE] read off=00068000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00068400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[PROC] PID 100 yielded to PID 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[E7-GATE] read off=00068800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[INIT] heartbeat 536[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00068C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00069000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00069400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00069800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 103 'drv.ramdisk.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00069C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0006A000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 33
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0006A400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[PROC] PID 100 yielded to PID 104
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0006A800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[INIT] heartbeat 537[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0006AC00 
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7-GATE] read off=0006B000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0006B400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0006B800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[E7-GATE] read off=0006BC00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[PROC] PID 100 yielded to PID 104
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0006C000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[INIT] heartbeat 538[E1] yield: control plane -> PID 103 'drv.ramdisk.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0006C400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0006C800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0006CC00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0006D000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0006D400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0006D800 
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[PROC] PID 100 yielded to PID 105
+[E7-GATE] read off=0006DC00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[INIT] heartbeat 539[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0006E000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0006E400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0006E800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0006EC00 
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0006F000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[PROC] PID 100 yielded to PID 105
+[INIT] heartbeat 540[E1] yield: control plane -> PID 103 'drv.ramdisk.1' (budget 2 ticks)
+[E7-GATE] read off=0006F400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0006F800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0006FC00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00070000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00070400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00070800 
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[PROC] PID 100 yielded to PID 105
+[E7-GATE] read off=00070C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[INIT] heartbeat 541[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00071000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00071400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00071800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00071C00 
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00072000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[PROC] PID 100 yielded to PID 105
+[INIT] heartbeat 542[E1] yield: control plane -> PID 103 'drv.ramdisk.1' (budget 2 ticks)
+[E7-GATE] read off=00072400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00072800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00072C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00073000 
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00073400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7-GATE] read off=00073800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[PROC] PID 100 yielded to PID 104
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00073C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[INIT] heartbeat 543[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00074000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00074400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00074800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00074C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00075000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00075400 
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00075800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[PROC] PID 100 yielded to PID 104
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00075C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[INIT] heartbeat 544[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00076000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7-GATE] read off=00076400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00076800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00076C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00077000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7-GATE] read off=00077400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[PROC] PID 100 yielded to PID 104
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00077800 
+[INIT] heartbeat 545[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00077C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00078000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00078400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7-GATE] read off=00078800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00078C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00079000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[PROC] PID 100 yielded to PID 104
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00079400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[INIT] heartbeat 546[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00079800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00079C00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0007A000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7-GATE] read off=0007A400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[PROC] PID 100 yielded to PID 104
+[CAP] woken PID 105 (channel 14)
+[INIT] heartbeat 547[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7-GATE] read off=0007A800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0007AC00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0007B000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0007B400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[PROC] PID 100 yielded to PID 104
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0007B800 
+[INIT] heartbeat 548[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0007BC00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0007C000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0007C400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0007C800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[PROC] PID 100 yielded to PID 104
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[INIT] heartbeat 549[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0007CC00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0007D000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 34
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0007D400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0007D800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0007DC00 
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 104
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[INIT] heartbeat 550[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0007E000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 103 'drv.ramdisk.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0007E400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7-GATE] read off=0007E800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0007EC00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0007F000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0007F400 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0007F800 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[PROC] PID 100 yielded to PID 104
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=0007FC00 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[INIT] heartbeat 551[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7-GATE] read off=00080000 
+[E7] linux: num=00000000 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7] linux: num=00000008 child=e7.gate.user.0 ok
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7] linux: num=0000004D child=e7.gate.user.0 ok
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 104 (channel 14)
+[CAP] woken PID 105 (channel 14)
+[E7] linux: num=0000004A child=e7.gate.user.0 ok
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7] linux: num=0000000B child=e7.gate.user.0 ok munmap addr=0x00004000000d8000 len=69632
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[E7] munmap addr=0x4000000d8000 len=69632: 17 page(s) freed, 0 already absent
+[PROC] PID 100 yielded to PID 104
+[CAP] woken PID 105 (channel 14)
+[E7] linux: num=00000003 child=e7.gate.user.0 ok
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[INIT] heartbeat 552[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7] linux: num=00000003 child=e7.gate.user.0 ok
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7] linux: num=00000052 child=e7.gate.user.0 ok
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7] linux: num=00000002 child=e7.gate.user.0 ok
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7] linux: num=00000048 child=e7.gate.user.0 ok
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[E7] linux: num=00000009 child=e7.gate.user.0 ok mmap -> 0x00004000000d6000
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[PROC] PID 100 yielded to PID 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[E7] linux: num=000000D9 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[INIT] heartbeat 553[CAP] woken PID 105 (channel 14)
+[E7] linux: num=00000006 child=e7.gate.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7] linux: num=00000006 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7] linux: num=00000006 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7] linux: num=00000006 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7] linux: num=00000006 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7] linux: num=00000009 child=e7.gate.user.0 ok mmap -> 0x00004000000d5000
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 104
+[E7] linux: num=00000006 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[INIT] heartbeat 554[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7] linux: num=0000000B child=e7.gate.user.0 ok munmap addr=0x00004000000d5000 len=4096
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[E7] munmap addr=0x4000000d5000 len=4096: 1 page(s) freed, 0 already absent
+[CAP] woken PID 105 (channel 14)
+[E7] linux: num=00000009 child=e7.gate.user.0 ok mmap -> 0x00004000000d4000
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7] linux: num=00000006 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7] linux: num=000000D9 child=e7.gate.user.0 ok + payload
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7] linux: num=00000003 child=e7.gate.user.0 ok
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E7] linux: num=0000000B child=e7.gate.user.0 ok munmap addr=0x00004000000d6000 len=8192
+
+[PROC] PID 100 yielded to PID 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[E7] munmap addr=0x4000000d6000 len=8192: 2 page(s) freed, 0 already absent
+[CAP] woken PID 105 (channel 14)
+[INIT] heartbeat 555[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7] linux: num=00000057 child=e7.gate.user.0 ok
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 103 'drv.ramdisk.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7] linux: num=00000057 child=e7.gate.user.0 ok
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7] linux: num=00000057 child=e7.gate.user.0 ok
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[backup] Pruning hourly backups (keeping newest 4)...
+[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=54 |[backup] Pruning hourly |
+[PROC] PID 100 yielded to PID 105
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[backup] pruned /tmp/e7-census/backups/hourly/sls_storage-20260103-000000.img
+[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=78 |[backup] pruned /tmp/e7-|
+[INIT] heartbeat 556[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[backup] pruned /tmp/e7-census/backups/hourly/sls_storage-20260102-000000.img
+[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=78 |[backup] pruned /tmp/e7-|
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[backup] pruned /tmp/e7-census/backups/hourly/sls_storage-20260101-000000.img
+[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=78 |[backup] pruned /tmp/e7-|
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 105 (channel 14)
+[backup] Done: /tmp/e7-census/backups/hourly/sls_storage-20260107-000000.img (524288 bytes, 504 sparse holes, 4 kept)
+[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=118 |[backup] Done: /tmp/e7-c|
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[E7] linux: num=0000000B child=e7.gate.user.0 ok munmap addr=0x00004000000d4000 len=4096
+
+[PROC] PID 100 yielded to PID 105
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[E7] munmap addr=0x4000000d4000 len=4096: 1 page(s) freed, 0 already absent
+[CAP] woken PID 105 (channel 14)
+[INIT] heartbeat 557[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[E7] linux: num=0000000B child=e7.gate.user.0 ok munmap addr=0x00004000000ea000 len=4096
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[E7] munmap addr=0x4000000ea000 len=4096: 1 page(s) freed, 0 already absent
+[CAP] woken PID 105 (channel 14)
+[E7] linux: num=0000000B child=e7.gate.user.0 ok munmap addr=0x00004000000e9000 len=4096
+
+[E1] yield: control plane -> PID 105 'e7.gate.user.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[E7] munmap addr=0x4000000e9000 len=4096: 1 page(s) freed, 0 already absent
+[CAP] woken PID 105 (channel 14)
+[E7] linux: num=000000E7 child=e7.gate.user.0 exit_group status=0
+
+[PROC] PID 105 terminated.
+[E7-GATE] stack hwm (exit): alloc=65536 poison-span=60912 headroom=57424 deepest=3488 lowest=0x4000000a9050
+[TORE] PID 105 teardown: 2 cap(s) dropped, 0 object(s) destroyed, 0 arena frame(s) returned, table 7 unbound
+[TORE] address space 0x0000000012933000 destroyed: 149 frame(s) freed
+[E1] yield: control plane -> PID 104 'aerosls.posix.1' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 1
+[INIT] heartbeat 558[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 559[E1] yield: control plane -> PID 103 'drv.ramdisk.1' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 560[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 561[E1] yield: control plane -> PID 103 'drv.ramdisk.1' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 562[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 563[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 35
+[E1] yield: control plane -> PID 103 'drv.ramdisk.1' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 564[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 565[E1] yield: control plane -> PID 103 'drv.ramdisk.1' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 566[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 567[E1] yield: control plane -> PID 103 'drv.ramdisk.1' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 568[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 569[E1] yield: control plane -> PID 103 'drv.ramdisk.1' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 570[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 571[E1] yield: control plane -> PID 103 'drv.ramdisk.1' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 572[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 573[E1] yield: control plane -> PID 103 'drv.ramdisk.1' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 574[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 575[E1] yield: control plane -> PID 103 'drv.ramdisk.1' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 576[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 577[E1] yield: control plane -> PID 103 'drv.ramdisk.1' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 578[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 36
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 579
