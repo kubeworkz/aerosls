@@ -459,7 +459,7 @@ arm_l5=$(grep -n 'cur->park_syscall = SYS_LINUX_TRAP_RESUME;' "$DISP" | head -1 
 if [ -n "$plan_l" ] && [ -n "$desc_l" ] && [ -n "$copy_l" ] && \
    [ -n "$arm_l5" ] && [ "$plan_l" -lt "$desc_l" ] && \
    [ "$copy_l" -lt "$arm_l5" ] && \
-   grep -qF 'if (plan.len) largs[2] = plan.len;' "$DISP" && \
+   grep -qF 'if (num == LINUX_WRITE && plan.len) largs[2] = plan.len;' "$DISP" && \
    grep -qF 'return (uint64_t)(int64_t)plan.refuse;' "$DISP" && \
    grep -qF 'return (uint64_t)(int64_t)(-LINUX_EFAULT);' "$DISP" && \
    grep -qF 'k_linux_forward(cur->pid, ch_w, ch_r, fwd, fwd_len);' "$DISP"; then
@@ -860,57 +860,61 @@ else
     bad "R8. the attribution is gone — the alloc-failure text would exist only in the merged console drain (any child of the environment could have written it) and the mmap refusal goes back to a bare ENOSYS with no request to name (the proven chain becomes an inference again)"
 fi
 
-# ─── S. poll (7) — the run's LAST ENOSYS answer (§10.13's step-2 coda) ────
-# The firstuser's num=00000007 line is POLL, not munmap — §10.13's log
-# annotation mislabelled it from the census row's COUNT (`11 munmap 7`):
-# munmap is 11 and never fires before the kill, while Rust std's
-# lang_start_internal polls fds {0,1,2} with a ZERO timeout before it
-# installs any signal handler, and an errno outside its tolerated set
-# (EAGAIN/ENOMEM/EINVAL, its own bitmask) aborts the task — which is why
-# the run died at raise(SIGABRT) four traps in. The answer is
-# deliberately small: a zero-timeout poll reports 0 events (this shim
-# has no console-input readiness state — under-reporting readiness can
-# only send a caller back to its own loop, never into an action built
-# on readiness nobody claimed), a poll that would WAIT is refused by
-# name at BOTH ends (it needs a wake against state that does not exist),
-# and no bytes cross either way (a count of 0 promises no revents —
-# the copy-IN that would carry them stays increment 8's named gap).
-# Every clause below is a way that answer silently becomes a lie while
-# the rest of this guard stays green: the predicate rewritten until it
-# refuses every poll (the wall back by name) or grants a wait whose
-# wake cannot come, the first-trap refusal deleted (the waiting poll
-# posts and parks), the sidecar arm gutted, or the pure half untested.
+# ─── S. poll (7) — readiness and timed wakeups (E7 increment 24) ───────────
+# The firstuser's last ENOSYS answer is now a REAL call. The kernel copies
+# the caller's pollfd array out and the rewritten array back into the SAME
+# span; the sidecar scans the task's fd table and the console, answers a
+# ready or zero-timeout poll at once, and PARKS a timed or infinite poll
+# until readiness or the deadline. A timed-out poll answers zero revents —
+# never invented readiness — and a blocking console read parks the same way.
+# Every clause below is a way that becomes a silent lie while the rest of
+# the guard stays green: an array one side never carries, the write clamp
+# eating poll's timeout, a parked request nothing ever wakes, a timeout
+# that never expires, or a pure half no host test drives.
 if grep -qF '#define LINUX_POLL  7u' "$LABH" && \
-   grep -qF 'int linux_poll_refuses_blocking(uint64_t num, uint64_t timeout);' "$LABH" && \
-   grep -qF 'int linux_poll_refuses_blocking(uint64_t num, uint64_t timeout)' "$LABC" && \
-   grep -qF 'return num == LINUX_POLL && (int32_t)timeout != 0;' "$LABC"; then
-    ok "S. poll's waiting refusal is the named pure contract — the census's own number, Linux's INT timeout (the low 32 bits, sign-extended), refused iff the call would WAIT, declared where the dispatcher and the host test both read it"
+   grep -qF '#define LINUX_POLL_MAX_FDS 16u' "$LABH" && \
+   grep -qF '#define LINUX_POLLFD_BYTES 8u' "$LABH" && \
+   grep -qF 'if (num == LINUX_POLL) {' "$LABC" && \
+   grep -qF 'p.len = (uint32_t)(nfds * LINUX_POLLFD_BYTES);' "$LABC" && \
+   grep -qF '} else if (num == LINUX_POLL) {' "$LABC" && \
+   grep -qF 'n % LINUX_POLLFD_BYTES == 0' "$LABC"; then
+    ok "S. poll's crossings are named pure contracts at the kernel end — the capped array IN (write plan), the SAME array back OUT (reply plan), and a reply shape that keeps the ready count inside nfds"
 else
-    bad "S. the poll contract is gone or rewritten — the dispatcher has no predicate to consult (a waiting poll parks a task whose wake cannot come) and a rewritten one can only be argued from prose while the host test bites a function nothing calls"
+    bad "S. one half of poll's byte crossing is gone — without the IN plan revents cannot be computed from the caller's array, without the OUT plan the rewritten array never lands, and without the shape rule a ready count can contradict it"
 fi
-poll_ref=$(grep -nF 'linux_poll_refuses_blocking(num, largs[2]))' "$DISP" | head -1 | cut -d: -f1)
-if [ -n "$poll_ref" ] && \
-   sed -n "$((poll_ref + 1)),$((poll_ref + 6))p" "$DISP" | grep -qF 'console-input state' && \
-   sed -n "$((poll_ref + 1)),$((poll_ref + 6))p" "$DISP" | grep -qF -- '(uint64_t)(int64_t)(-LINUX_ENOSYS);'; then
-    ok "S1. the FIRST TRAP refuses a waiting poll before any post — a request property (a timeout word), so no channel is needed to say it (mprotect's posture), logged by name with its trigger, returning -ENOSYS in the task's own units"
+if grep -qF 'if (num == LINUX_WRITE && plan.len) largs[2] = plan.len;' "$DISP"; then
+    ok "S1. the description's clamp is WRITE-only — poll's args[2] is its TIMEOUT, so the array's byte length must never ride that word (an unconditional clamp would answer a 5 s poll on the array's byte count — 24 ms for three fds — not on its timeout)"
 else
-    bad "S1. the dispatcher's poll refusal is gone or no longer returns from the first trap — a waiting poll would post and park on a channel whose wake cannot come (no console-input state), and the sidecar twin would then be the only wall left"
+    bad "S1. poll's timeout word is being overwritten by the write clamp (or the write clamp is gone) — a 5 s poll would return after ~24 ms with nothing ready, its timeout silently ignored"
 fi
-poll_arm=$(grep -nF 'if (args[2] as i32) == 0 {' "$LRS" | head -1 | cut -d: -f1)
-if grep -qF '        7 => {' "$LRS" && \
-   [ -n "$poll_arm" ] && \
-   sed -n "$((poll_arm + 1))p" "$LRS" | grep -qF 'Answer::Reply(0, STATUS_OK)' && \
-   sed -n "$((poll_arm + 3))p" "$LRS" | grep -qF 'Answer::Reply(0, E_NOSYS)'; then
-    ok "S2. the sidecar's 7 arm answers the ZERO-timeout probe 0 events and the waiting poll ENOSYS by name — its twin of the first-trap refusal (N3's both-ends posture), the zero timeout decided at the arm's own literal"
+if grep -qF 'const PENDING_READ: u8 = 1;' "$LRS" && \
+   grep -qF 'const PENDING_POLL: u8 = 2;' "$LRS" && \
+   grep -qF 'LINUX_POLL => poll_answer(fds, console, payload, args, now_ns,' "$LRS" && \
+   grep -qF 'return Answer::ReadWait(want);' "$LRS" && \
+   grep -qF 'Answer::PollWait(arr, len, poll_deadline(now_ns, timeout_ms))' "$LRS" && \
+   grep -qF 'poll_expired(deadline, now_ns)' "$LRS" && \
+   grep -qF 'deadline != 0 && now_ns >= deadline' "$LRS" && \
+   grep -qF 'tasks()[i].pending = PENDING_POLL;' "$LRS" && \
+   grep -qF 'tasks()[i].pending = PENDING_READ;' "$LRS"; then
+    ok "S2. the sidecar's waiting half is wired — a console read with no input returns ReadWait, a timed poll returns PollWait with its deadline, service PARKS both, re-scans on every pass, and answers on readiness or expiry"
 else
-    bad "S2. the poll arm is gone or either answer changed — a granted wait (a wake that can never come, or a five-second poll answered 0 into the caller's own loop) or an ENOSYS for the probe (the firstuser's measured wall, back by name)"
+    bad "S2. the sidecar's park/wake half is gone or degraded — a blocking read would answer EAGAIN, a timed poll would answer 0 immediately, or a parked request would sit with nothing to resolve it"
 fi
-if grep -qF 'LINUX_POLL == 7' "$PHUT" && \
-   grep -qF 'linux_poll_refuses_blocking(LINUX_POLL, 0)' "$PHUT" && \
-   grep -qF '0x100000000ULL' "$PHUT"; then
-    ok "S3. the predicate is host-tested against the REAL kernel/linux_abi.c — the zero-timeout probe, the timed and infinite refusals, the int-width rule (0x1_00000000 is a zero timeout) and the total number space (run_all compiles and runs it)"
+if grep -qF 'let timeout = crate::linux::next_wait_ns(&RealKernel);' user/sidecar/src/entry.rs && \
+   grep -qF 'pub fn next_wait_ns<K: Kernel>(k: &K) -> u64' "$LRS" && \
+   grep -qF 't.pending == PENDING_POLL && t.pending_deadline != 0' "$LRS"; then
+    ok "S3. the entry loop waits with the nearest finite poll deadline — a timed poll wakes the parked sidecar at its own timeout instead of waiting for an unrelated channel, and a read/forever-poll keeps the old block-forever shape"
 else
-    bad "S3. the host test no longer drives the predicate — the run's last-ENOSYS fix would be argued from the guard's greps alone, every branch reachable only at boot"
+    bad "S3. the quiesce wait no longer carries poll's deadline — a 5 s poll would sleep until some other channel happened to wake the loop, and its timeout would be decided by unrelated traffic"
+fi
+if grep -qF 'linux_fd_write_plan(LINUX_POLL, a)' "$PHUT" && \
+   grep -qF 'linux_fd_reply_plan(LINUX_POLL, a)' "$PHUT" && \
+   grep -qF 'linux_reply_shape_ok(LINUX_POLL, 2, 3 * LINUX_POLLFD_BYTES)' "$PHUT" && \
+   grep -qF 'LINUX_POLL_MAX_FDS + 1' "$PHUT" && \
+   grep -qF '0x00007FFFFFFFF000ULL' "$PHUT"; then
+    ok "S4. the host test drives both plans against the REAL kernel/linux_abi.c — the in/out crossings, nfds 0, the cap, the NULL array, the span crossing the user max, and the reply shape"
+else
+    bad "S4. the host test no longer drives poll's plans — the crossings and refusals would be argued from this guard's greps alone, every branch reachable only at boot"
 fi
 
 # ─── T: the reply payload's copy-IN (E7 increment 12, §10.13's step 3) ────

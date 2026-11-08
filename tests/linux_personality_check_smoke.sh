@@ -162,9 +162,9 @@ echo "the ONE ELF mapper, the §5.2 stack and its environment-crossing"
 echo "record (clause set O, including O6/O7)"
 echo "and increment 10's signal seam (clause set R) — the three-number"
 echo "answers, the plan's first-trap refusals and the SignalKill delivery"
-echo "and increment 11's poll answer (clause set S) — the run's LAST"
-echo "ENOSYS: a zero-timeout probe answered 0, a waiting poll refused"
-echo "at both ends before any post"
+echo "and increments 23–24's input class (clause set S) — buffered"
+echo "console reads, the parked read, poll's rewritten array and its"
+echo "timed wakeup"
 echo "and increment 12's reply payload (clause set T) — the copy-IN's"
 echo "first-trap destination plan, the deliver's three shapes, the"
 echo "two-phase writable copy and the stage's four-place lifecycle"
@@ -694,51 +694,60 @@ seed "$W/t83"
 sed -i '/linux_sig_copy_plan(/d' "$W/t83/tests/linux_personality_host_test.c"
 tooth sigplan-unhosttested R6 "the host test no longer drives linux_sig_copy_plan" "$W/t83"
 
-# ─── S teeth (increment 11: poll (7), the run's last ENOSYS answer) ────────
+# ─── S teeth (increment 24: poll's readiness and timed wakeups) ────────────
 
-# t84: the predicate neutered to "refuse every poll" — a plausible
-# "simplification" that puts the firstuser's wall straight back (the
-# zero-timeout probe refuses again) while the dispatcher's wiring and the
-# sidecar's arm both stay exactly as they were.
+# t84: the write plan's array length zeroed — the kernel copies no pollfd
+# array to the sidecar, so every scan sees an empty snapshot and revents
+# can only be invented or left alone.
 seed "$W/t84"
-sed -i 's/return num == LINUX_POLL && (int32_t)timeout != 0;/return num == LINUX_POLL;/' "$W/t84/kernel/linux_abi.c"
-tooth poll-predicate-neutered S "linux_poll_refuses_blocking no longer distinguishes the probe from the wait" "$W/t84"
+sed -i 's/p.len = (uint32_t)(nfds \* LINUX_POLLFD_BYTES);/p.len = 0;/' "$W/t84/kernel/linux_abi.c"
+tooth poll-array-not-carried S "the poll IN plan no longer carries the caller's array" "$W/t84"
 
-# t85: the first-trap refusal block deleted — the waiting poll now posts
-# and parks a task whose wake cannot come (no console-input state), and
-# the sidecar's twin would be the only wall left, answering AFTER the
-# park instead of the first trap refusing before any channel.
+# t85: the clamp made unconditional — poll's args[2] is its timeout, so
+# the array's byte length overwrites it and a five-second poll returns on
+# 24 ms (three fds) instead of the timeout it asked for.
 seed "$W/t85"
-sed -i '/else if (linux_poll_refuses_blocking(num, largs\[2\])) {/,/(-LINUX_ENOSYS);/d' "$W/t85/kernel/syscall_dispatch.c"
-tooth poll-refusal-not-first-trap S1 "the dispatcher no longer refuses a waiting poll before any post" "$W/t85"
+sed -i 's/if (num == LINUX_WRITE && plan.len) largs\[2\] = plan.len;/if (plan.len) largs[2] = plan.len;/' "$W/t85/kernel/syscall_dispatch.c"
+tooth poll-timeout-clamped-away S1 "the write clamp overwrites poll's timeout word" "$W/t85"
 
-# t86: the sidecar arm renamed away — the zero-timeout probe falls to the
-# default ENOSYS arm, so the firstuser's measured wall (num=00000007)
-# returns by name while the kernel's first-trap half stays green.
+# t86: the sidecar arm renamed away — poll falls to the default ENOSYS
+# while the kernel's two plans stay green; the firstuser's line returns.
 seed "$W/t86"
-sed -i 's/^        7 => {$/        700 => {/' "$W/t86/user/sidecar/src/linux.rs"
-tooth poll-arm-gone S2 "the sidecar no longer answers poll (7)" "$W/t86"
+sed -i 's/LINUX_POLL => poll_answer(fds, console, payload, args, now_ns,/LINUX_POLLX => poll_answer(fds, console, payload, args, now_ns,/' "$W/t86/user/sidecar/src/linux.rs"
+tooth poll-arm-gone S2 "the sidecar no longer routes poll (7) to its scanner" "$W/t86"
 
-# t87: the arm's condition inverted — the probe now refuses ENOSYS (the
-# wall back) and the waiting poll is granted 0, both lies in one edit.
+# t87: the wait answered 0 at once — a timed poll returns immediately
+# with nothing ready, exactly the lie the pending state exists to avoid.
 seed "$W/t87"
-sed -i 's/if (args\[2\] as i32) == 0 {/if (args[2] as i32) != 0 {/' "$W/t87/user/sidecar/src/linux.rs"
-tooth poll-answers-inverted S2 "the probe and the wait answer each other's results" "$W/t87"
+sed -i 's/Answer::PollWait(arr, len, poll_deadline(now_ns, timeout_ms))/Answer::Reply(0, STATUS_OK)/' "$W/t87/user/sidecar/src/linux.rs"
+tooth poll-wait-granted S2 "a timed poll answers 0 immediately instead of parking" "$W/t87"
 
-# t88: the arm made unconditional — every poll, including a five-second
-# wait, is answered 0 events into the caller's own loop (the silent lie
-# the by-name refusal exists to prevent).
+# t88: the blocking read back to EAGAIN — a console read with no input
+# returns an error instead of waiting for the next typed byte.
 seed "$W/t88"
-sed -i 's/if (args\[2\] as i32) == 0 {/if true {/' "$W/t88/user/sidecar/src/linux.rs"
-tooth poll-wait-granted S2 "a waiting poll is granted 0 events instead of refused by name" "$W/t88"
+sed -i 's/return Answer::ReadWait(want);/return Answer::Reply(0, E_AGAIN);/' "$W/t88/user/sidecar/src/linux.rs"
+tooth console-read-eagain S2 "a console read no longer parks for input" "$W/t88"
 
-# t89: the predicate's host-test section deleted — the pure half would
-# then be argued from the guard's greps alone, the int-width rule and
-# the sign-extension case reachable only at boot (t83's rule, one seam
-# along).
+# t89: the deadline made eternal — a parked poll's expiry test always
+# false, so a five-second wait parks until some unrelated channel wakes
+# the loop (and answers nothing when it does).
 seed "$W/t89"
-sed -i '/linux_poll_refuses_blocking(/d' "$W/t89/tests/linux_personality_host_test.c"
-tooth poll-unhosttested S3 "the host test no longer drives linux_poll_refuses_blocking" "$W/t89"
+sed -i 's/deadline != 0 && now_ns >= deadline/false/' "$W/t89/user/sidecar/src/linux.rs"
+tooth poll-deadline-never-expires S2 "a parked poll's timeout can never fire" "$W/t89"
+
+# t121: the entry loop's deadline dropped — the parked sidecar waits on
+# channel events alone, so a timed poll's wake is decided by unrelated
+# traffic instead of its own timeout.
+seed "$W/t121"
+sed -i 's/let timeout = crate::linux::next_wait_ns(&RealKernel);/let timeout = TIMEOUT_NONE;/' "$W/t121/user/sidecar/src/entry.rs"
+tooth poll-deadline-not-waited S3 "the quiesce park no longer carries poll's deadline" "$W/t121"
+
+# t122: the reply plan's host-test lines deleted — the OUT crossing
+# would then be argued from the guard's greps alone, its dst/len/kind
+# reachable only at boot (t83's rule, one seam along).
+seed "$W/t122"
+sed -i '/linux_fd_reply_plan(LINUX_POLL/d' "$W/t122/tests/linux_personality_host_test.c"
+tooth poll-outplan-unhosttested S4 "the host test no longer drives poll's reply plan" "$W/t122"
 
 # ─── T: the reply payload's copy-IN (increment 12, §10.13's step 3) ────────
 

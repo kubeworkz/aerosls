@@ -226,7 +226,34 @@ struct LinuxFdWritePlan linux_fd_write_plan(uint64_t num,
     p.src = 0;
     p.len = 0;
     p.refuse = 0;
-    if (num != LINUX_WRITE || !args) return p;   /* nothing to attach */
+    if (!args) return p;                         /* nothing to attach */
+
+    /* poll(2): the array is the IN direction's byte crossing. The sidecar
+     * holds the request pending until an fd is ready or the timeout fires,
+     * and returns a rewritten array; this plan only carries the snapshot
+     * out. A zero-nfds poll is a pure sleep and attaches nothing. */
+    if (num == LINUX_POLL) {
+        uint64_t nfds = args[1];
+        if (nfds > LINUX_POLL_MAX_FDS) {
+            p.refuse = -LINUX_EINVAL;
+            return p;
+        }
+        if (nfds == 0) return p;
+        if (args[0] == 0) {
+            p.refuse = -LINUX_EFAULT;
+            return p;
+        }
+        p.src = args[0];
+        p.len = (uint32_t)(nfds * LINUX_POLLFD_BYTES);
+        span_end = p.src + (uint64_t)p.len;
+        if (!linux_fs_addr_is_user_canonical(p.src) || span_end < p.src ||
+            (span_end - 1) > LINUX_USER_ADDR_MAX) {
+            p.refuse = -LINUX_EFAULT;
+        }
+        return p;
+    }
+
+    if (num != LINUX_WRITE) return p;             /* nothing to attach */
 
     count = args[2];
     if (count == 0) return p;                    /* nothing to copy, and
@@ -380,11 +407,6 @@ struct LinuxSigCopyPlan linux_sig_copy_plan(uint64_t num, const uint64_t args[6]
  * and 5000 (ms) refuse, 0 and 0x1_00000000 (which truncates to 0) do
  * not. Total over (num, timeout): a number that is not poll never waits
  * as one. */
-int linux_poll_refuses_blocking(uint64_t num, uint64_t timeout)
-{
-    return num == LINUX_POLL && (int32_t)timeout != 0;
-}
-
 /* ─── E7 increment 6 (the mem class, §5.4) — the budget span ──────────────
  * The two decisions the resume arm's brk apply makes, and the one read it
  * needs, as the pure functions the host test drives. Nothing below reads
@@ -715,6 +737,21 @@ struct LinuxFdReplyPlan linux_fd_reply_plan(uint64_t num, const uint64_t args[6]
         p.aux  = LINUX_TIMESPEC_BYTES;
         p.kind = LINUX_STAGE_RAW;
         if (args[1] == 0) p.refuse = -LINUX_EFAULT;
+    } else if (num == LINUX_POLL) {
+        /* poll(2): the reply is the same array with revents rewritten. */
+        if (args[1] > LINUX_POLL_MAX_FDS) {
+            p.refuse = -LINUX_EINVAL;
+            return p;
+        }
+        if (args[1] == 0) return p;
+        if (args[0] == 0) {
+            p.refuse = -LINUX_EFAULT;
+            return p;
+        }
+        p.dst  = args[0];
+        p.len  = (uint32_t)(args[1] * LINUX_POLLFD_BYTES);
+        p.aux  = p.len;
+        p.kind = LINUX_STAGE_RAW;
     } else if (num == LINUX_READ) {
         /* read(fd, buf, count) — count-truth's own rule, mirrored from
          * write: a count-0 read plans NOTHING before canonicality,
@@ -927,6 +964,9 @@ int linux_reply_zero_ok(uint64_t num)
 int linux_reply_shape_ok(uint64_t num, uint64_t ret, uint32_t n)
 {
     if (num == LINUX_READ) return ret == (uint64_t)n;
+    /* poll: n is the full pollfd array, ret is the ready count. */
+    if (num == LINUX_POLL)
+        return n % LINUX_POLLFD_BYTES == 0 && ret <= (uint64_t)(n / LINUX_POLLFD_BYTES);
     /* stat/lstat: success with EXACTLY the compact Stat — a payload the
      * serializer cannot parse is a protocol break, refused before any
      * byte is written (the twin of service()'s own bound). */

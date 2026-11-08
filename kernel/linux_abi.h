@@ -225,11 +225,12 @@ struct LinuxFdWritePlan {
                         * BEFORE any post (first-trap refusal discipline)  */
 };
 
-/* Plan one write's byte crossing. For any number other than LINUX_WRITE
- * the plan is empty (no attach, no refusal) — the rest of the fd class
- * still forwards as the plain 72-byte description it was. Pure: the host
- * test drives every branch, including count==0 ignoring a non-canonical
- * buffer and the wrap-around span. */
+/* Plan one write's or poll's byte crossing. For a number that is neither
+ * LINUX_WRITE nor LINUX_POLL the plan is empty (no attach, no refusal) —
+ * the rest of the fd class still forwards as the plain 72-byte
+ * description it was. Pure: the host test drives every branch, including
+ * count==0 ignoring a non-canonical buffer, nfds==0 planning nothing, the
+ * poll cap and the wrap-around span. */
 struct LinuxFdWritePlan linux_fd_write_plan(uint64_t num,
                                             const uint64_t args[6]);
 
@@ -240,29 +241,19 @@ struct LinuxFdWritePlan linux_fd_write_plan(uint64_t num,
  * may be 0). dst must hold n bytes; the caller owns it. */
 int linux_user_copy_out(uint8_t *dst, uint64_t root, uint64_t va, uint32_t n);
 
-/* ─── E7 increment 11 (§10.13's step-2 coda) — poll (7): the waiting-poll refusal ──
- * The firstuser's LAST ENOSYS answer, and the number §10.13's log
- * annotation once mislabelled munmap (munmap is 11 and never fires in
- * that run — measured): Rust std's lang_start_internal polls fds
- * {0,1,2} with a ZERO timeout before it installs any signal handler, and
- * an errno outside its tolerated set (EAGAIN/ENOMEM/EINVAL, its own
- * bitmask) aborts the task. That abort is why the run died at
- * raise(SIGABRT) four traps in.
- *
- * The split is mprotect's posture over a timeout word instead of a prot
- * word: a poll that would WAIT is refused HERE, at the first trap and
- * before any channel post, because waiting needs a sleep/wake against
- * console-input state this v1 has never had (§10.13's named input-class
- * gap) — and a request property needs no object to say no. A ZERO-timeout
- * poll is not refused: it is the snapshot the sidecar's 7 arm answers
- * (0 events), and the sidecar carries this same refusal as its twin so
- * neither end alone is load-bearing (guard clause S).
- *
- * The timeout is Linux's int (ms > 0, 0 = return now, < 0 = forever), so
- * the LOW 32 BITS decide, sign-extended — exactly how the syscall passes
- * it. Total over (num, timeout). */
+/* ─── E7 increment 24 — poll (7): readiness and waiting ────────────────────
+ * The firstuser's LAST ENOSYS answer. Rust std's lang_start_internal polls
+ * fds {0,1,2} before it installs any signal handler, and an errno outside
+ * its tolerated set aborts the task. A timeout is now part of the request,
+ * so the KERNEL copies the pollfd array out and the reply's rewritten
+ * array back in; the SIDECAR owns readiness, the pending wait, and the
+ * timeout decision. The array is capped at LINUX_POLL_MAX_FDS so one call
+ * cannot make either side's frame unbounded. A NULL array with nfds > 0,
+ * a non-canonical span, or nfds above the cap is a first-trap refusal. */
 #define LINUX_POLL  7u             /* the census's poll row (§5.6)       */
-int linux_poll_refuses_blocking(uint64_t num, uint64_t timeout);
+#define LINUX_POLL_MAX_FDS 16u
+#define LINUX_POLLFD_BYTES 8u       /* struct pollfd: fd, events, revents  */
+#define LINUX_POLL_PAYLOAD_BYTES (LINUX_POLL_MAX_FDS * LINUX_POLLFD_BYTES)
 
 
 /* ─── E7 increment 6 (the mem class, §5.4) — the budget span ──────────────

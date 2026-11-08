@@ -921,45 +921,78 @@ int main(void)
               "a NULL args array is the zero plan — total, no fault");
     }
 
-    /* ═══ E7 increment 11 (§10.13's step-2 coda): poll (7) — the run's
-     * LAST ENOSYS answer ═════════════════════════════════════════════
-     * The firstuser's num=00000007 line is POLL, not munmap (11 never
-     * fires before the kill — §10.13's annotation took the census row's
-     * COUNT, `11 munmap 7`, for the number). Rust std's
-     * lang_start_internal polls fds {0,1,2} with a ZERO timeout before
-     * any signal handler exists, and an errno outside its tolerated set
-     * aborts the task — which is why the run died at raise(SIGABRT).
-     * The pure refusal below is the first trap's half (a WAITING poll
-     * is refused before any post); the sidecar's 7 arm carries the
-     * same rule as its twin and answers the zero-timeout probe 0
-     * events. Every case below is a way that refusal drifts into either
-     * silent lie: granting a wait whose wake can never come, or
-     * refusing the probe (the wall back by name). ═════════════════ */
+    /* ═══ E7 increment 23: poll (7) — readiness and timed wakeups ══════
+     * The firstuser's LAST ENOSYS answer is now a real call: the kernel
+     * copies the caller's pollfd array IN and the reply's rewritten array
+     * BACK OUT, and the sidecar owns readiness plus the pending wait. A
+     * zero-timeout poll still answers immediately (the firstuser's own
+     * shape), while a timed poll PARKS until an fd is ready or the
+     * deadline passes — no refusal, no invented readiness. Every case
+     * below is a way that becomes a silent lie: an array one side never
+     * crosses, a cap that lets one call grow a frame, a bad span that
+     * posts anyway, or a reply whose ready count contradicts its array. */
     CHECK(LINUX_POLL == 7,
           "poll is Linux's own number 7 (the census's poll row) — the "
           "      number §10.13's log line carried, once mislabelled munmap");
     CHECK(linux_syscall_class(LINUX_POLL) == LSC_FD,
           "poll is the fd class — it forwards to the sidecar's fd table, "
           "      never a mem-class stage");
-    CHECK(linux_poll_refuses_blocking(LINUX_POLL, 0) == 0,
-          "a zero-timeout poll is NOT refused — the snapshot the sidecar "
-          "      answers 0 events (the firstuser's own call shape)");
-    CHECK(linux_poll_refuses_blocking(LINUX_POLL, 1) == 1 &&
-              linux_poll_refuses_blocking(LINUX_POLL, 5000) == 1,
-          "a timed poll is refused — waiting needs console-input state "
-          "      this v1 has never had (§10.13's named input class)");
-    CHECK(linux_poll_refuses_blocking(LINUX_POLL,
-                                     (uint64_t)(int64_t)-1) == 1,
-          "an infinite poll (-1, sign-extended as the register carries "
-          "      it) is refused — the same wait, with no end to it");
-    CHECK(linux_poll_refuses_blocking(LINUX_POLL, 0x100000000ULL) == 0,
-          "the timeout is Linux's INT: the low 32 bits decide "
-          "      (0x1_00000000 truncates to a zero timeout — allowed)");
-    CHECK(linux_poll_refuses_blocking(LINUX_BRK, 7) == 0 &&
-              linux_poll_refuses_blocking(218, 7) == 0 &&
-              linux_poll_refuses_blocking(0, (uint64_t)(int64_t)-1) == 0,
-          "a number that is not poll never waits as one — the predicate "
-          "      is total over the number space (brk's break, 218's echo)");
+
+    {   /* the two crossings: the caller's array in, the rewritten array out */
+        uint64_t a[6];
+        struct LinuxFdWritePlan in;
+        struct LinuxFdReplyPlan out;
+
+        memset(a, 0, sizeof a);
+        a[0] = 0x00007FFFFFFFE000ULL;
+        a[1] = 3;
+        in = linux_fd_write_plan(LINUX_POLL, a);
+        CHECK(in.refuse == 0 && in.src == a[0] &&
+              in.len == 3 * LINUX_POLLFD_BYTES,
+              "a poll's array is the IN crossing — three pollfds ride to "
+              "      the sidecar inside LINUX_POLL_MAX_FDS");
+        out = linux_fd_reply_plan(LINUX_POLL, a);
+        CHECK(out.refuse == 0 && out.dst == a[0] &&
+              out.len == 3 * LINUX_POLLFD_BYTES &&
+              out.kind == LINUX_STAGE_RAW,
+              "the SAME array comes back — the deliver rewrites revents in "
+              "      the span the first trap staged, verbatim");
+
+        a[1] = 0;   /* a pure sleep: no fds, no bytes, no destination */
+        CHECK(linux_fd_write_plan(LINUX_POLL, a).len == 0 &&
+              linux_fd_write_plan(LINUX_POLL, a).refuse == 0 &&
+              linux_fd_reply_plan(LINUX_POLL, a).len == 0 &&
+              linux_fd_reply_plan(LINUX_POLL, a).kind == LINUX_STAGE_NONE,
+              "nfds 0 is a pure sleep — neither direction carries bytes, "
+              "      and the timeout alone decides when it wakes");
+
+        a[1] = LINUX_POLL_MAX_FDS + 1;
+        CHECK(linux_fd_write_plan(LINUX_POLL, a).refuse == -LINUX_EINVAL &&
+              linux_fd_reply_plan(LINUX_POLL, a).refuse == -LINUX_EINVAL,
+              "an array above the cap is EINVAL at BOTH plans — one call "
+              "      cannot grow either frame unbounded");
+
+        a[1] = 2;
+        a[0] = 0;
+        CHECK(linux_fd_write_plan(LINUX_POLL, a).refuse == -LINUX_EFAULT &&
+              linux_fd_reply_plan(LINUX_POLL, a).refuse == -LINUX_EFAULT,
+              "a NULL array with nfds > 0 is EFAULT before any post — the "
+              "      first trap refuses it, the sidecar never sees it");
+
+        a[0] = 0x00007FFFFFFFF000ULL;   /* 2 fds: 16 bytes cross the max */
+        CHECK(linux_fd_write_plan(LINUX_POLL, a).refuse == -LINUX_EFAULT &&
+              linux_fd_reply_plan(LINUX_POLL, a).refuse == -LINUX_EFAULT,
+              "an array span crossing the user-canonical max is EFAULT — "
+              "      checked on the whole span, not its first byte");
+    }
+
+    CHECK(linux_reply_shape_ok(LINUX_POLL, 2, 3 * LINUX_POLLFD_BYTES),
+          "poll's reply shape accepts a full array and a ready count "
+          "      inside its fd count");
+    CHECK(!linux_reply_shape_ok(LINUX_POLL, 4, 3 * LINUX_POLLFD_BYTES) &&
+          !linux_reply_shape_ok(LINUX_POLL, 0, 3),
+          "a ready count above nfds, or an array whose length is not a "
+          "      whole pollfd, is refused before any revents is written");
 
     /* ═══ E7 increment 12 (the reply payload, §10.13's step 3): the copy-IN ═
      * The reply half of the fd class's byte crossing — §10.10's named

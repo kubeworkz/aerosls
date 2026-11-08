@@ -18,4 +18,8 @@ uint64_t do_syscall(uint64_t num, void* arg);
 #define SYS_SLS_CHMOD      107
 #define SYS_SLS_SET_USER   108
 
+/* E7 increment 24: monotonic nanoseconds since boot, for the sidecar's
+ * timed console poll. No capability is involved; this is a clock read. */
+#define SYS_SLS_NOW_NS 329
+
 #endif /* SYSCALL_DISPATCH_H */

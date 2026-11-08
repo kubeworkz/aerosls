@@ -36,6 +36,7 @@
 #include "cap.h"            // Seed Kernel Phase 1 -- SYS_SLS_CAP_* (289-297)
 #include "kernel_io.h"      // kernel_serial_print/printf -- the control-plane refusal lines
 #include "linux_abi.h"      // E7 increment 2 -- the Linux-personality branch (§3.3)
+#include "timer.h"         // E7 increment 24 -- SYS_SLS_NOW_NS
 #include "../arch/x86/user_paging.h"  // E7 §5.3 (the plan's inc 4) -- user_write_fs_base,
                                       // the MSR write of a granted ARCH_SET_FS
 
@@ -553,9 +554,10 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                  * clamp must be IN the description) and before the
                  * channel lookup (a refusal the first trap can produce
                  * alone, §3.3 — no channel needed to say -EFAULT). A
-                 * write's bytes are planned here; every other number's
-                 * plan is empty and the forward below stays the plain
-                 * 72-byte description it has always been. */
+                 * write's bytes and a poll's pollfd array are planned
+                 * here; every other number's plan is empty and the
+                 * forward below stays the plain 72-byte description it
+                 * has always been. */
                 plan = linux_fd_write_plan(num, largs);
                 if (plan.refuse) {
                     kernel_serial_printf(
@@ -565,12 +567,14 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                         (unsigned long)largs[1]);
                     return (uint64_t)(int64_t)plan.refuse;
                 }
-                if (plan.len) largs[2] = plan.len;   /* the clamp rides IN
-                                                     * the description:
-                                                     * header, payload and
-                                                     * the count the task
-                                                     * will see are one
-                                                     * truth */
+                /* E7 increment 24: the clamp rides IN the description for
+                 * WRITE only — args[2] is that number's count. poll's
+                 * args[2] is the TIMEOUT, so overwriting it with the array
+                 * length would answer a 5 s poll on the array's byte count
+                 * (24 ms for the std probe's three fds), not on its timeout.
+                 * The array's length is derived by both ends from args[1],
+                 * so poll needs no clamp word. */
+                if (num == LINUX_WRITE && plan.len) largs[2] = plan.len;
                 /* E7 increment 10 (the signal seam): the act/set byte
                  * crossing — the write plan's twin for the sig class,
                  * computed after it (one number is one plan) and BEFORE
@@ -710,26 +714,6 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                         "(§5.4)\n", (unsigned long)largs[2]);
                     return (uint64_t)(int64_t)(-LINUX_EPERM);
                 }
-                /* E7 increment 11 (§10.13's step-2 coda): poll's
-                 * waiting-timeout refusal, the mprotect posture over a
-                 * timeout word. A poll that would WAIT is refused HERE,
-                 * before any post — it needs a wake against console-input
-                 * state this v1 has never had, and a task parked on a
-                 * channel whose wake cannot come is exactly the strand
-                 * the refusal-by-name discipline exists to prevent. A
-                 * zero-timeout probe is not refused: it forwards, and
-                 * the sidecar's 7 arm answers it 0 events (its twin of
-                 * this refusal is guard clause S). The timeout word is
-                 * Linux's int — the low 32 bits, printed as the caller
-                 * means it. */
-                else if (linux_poll_refuses_blocking(num, largs[2])) {
-                    kernel_serial_printf(
-                        "[E7] linux poll timeout=%ld refused before "
-                        "post: a waiting poll needs console-input state "
-                        "(input class)\n",
-                        (long)(int32_t)largs[2]);
-                    return (uint64_t)(int64_t)(-LINUX_ENOSYS);
-                }
                 /* E7 step 4 (the file class): the getdents64 cursor
                  * rides IN the description — args[5], a word the child's
                  * own 3-argument call never uses, is where the sidecar's
@@ -861,7 +845,7 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                 }
                 /* E7 increment 12: stage the reply payload's destination
                  * HERE — after every first-trap refusal has had its say
-                 * (no channel, bad attach, W|X, waiting poll — each
+                 * (no channel, bad attach, W|X, bad poll span — each
                  * returns with the stage still clear) and immediately
                  * before the arm, so the window between staging and the
                  * deliver is exactly the forward's in-flight life. */
@@ -1508,6 +1492,10 @@ uint64_t do_syscall(uint64_t num, void* arg) {
     // gated identically.
     case SYS_SLS_LINUX_SPAWN:
         return sys_sls_linux_spawn((struct SLSCreateSidecarRequest*)arg);
+
+    /* E7 increment 24: a monotonic clock for the sidecar's timed poll. */
+    case SYS_SLS_NOW_NS:
+        return (uint64_t)kernel_tick_counter * (uint64_t)KERNEL_TICK_NS;
 
     // ─── POSIX-Environments E3: allocate a contiguous physical region (320)
     // charged to the caller's partition, for a POSIX environment's private
