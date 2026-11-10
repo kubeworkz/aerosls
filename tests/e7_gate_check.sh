@@ -99,10 +99,6 @@
 #   E7G_ARTIFACTS      where boot1.log/boot2.log/facts/JSON land
 #                      (default /tmp/e7-gate-$$, printed at the end)
 #   E7G_WORKLOAD_S     seconds to wait for the resumed workload (default 900)
-#   E7G_SPAWN_STALL_S  the DRILL's tenant-spawn no-progress window (default
-#                      120); any growth in the serial log restarts it, so a
-#                      slower host is not failed for being slow
-#   E7G_SPAWN_CEIL_S   the DRILL's absolute tenant-spawn ceiling (default 900)
 #
 # ─── What this does NOT claim ──────────────────────────────────────────────
 # It does not run in CI: the source clauses do (they need only bash), but
@@ -718,8 +714,6 @@ TOOTH_BUILD="${E7G_TOOTH:-$TEETH}"
 BUILD="${E7G_BUILD:-1}"
 ENTRY="${E7G_BOOT_ENTRY:-3}"
 WINDOW_S="${E7G_WORKLOAD_S:-900}"
-SPAWN_STALL_S="${E7G_SPAWN_STALL_S:-120}"
-SPAWN_CEIL_S="${E7G_SPAWN_CEIL_S:-900}"
 ART="${E7G_ARTIFACTS:-/tmp/e7-gate-$$}"
 TOKEN=deadbeef01234567cafebabe76543210
 IMG="$ART/nvme.img"
@@ -745,14 +739,6 @@ fi
 if [ "$TOOTH_BUILD" != "0" ] && [ "$TOOTH_BUILD" != "1" ]; then
     fail "E7G_TOOTH must be 0 or 1 (got '$TOOTH_BUILD')"
 fi
-case "$SPAWN_STALL_S" in
-    ''|*[!0-9]*|0) fail "E7G_SPAWN_STALL_S must be a positive integer (got '$SPAWN_STALL_S')" ;;
-esac
-case "$SPAWN_CEIL_S" in
-    ''|*[!0-9]*|0) fail "E7G_SPAWN_CEIL_S must be a positive integer (got '$SPAWN_CEIL_S')" ;;
-esac
-[ "$SPAWN_CEIL_S" -ge "$SPAWN_STALL_S" ] || \
-    fail "E7G_SPAWN_CEIL_S ($SPAWN_CEIL_S) must be at least E7G_SPAWN_STALL_S ($SPAWN_STALL_S)"
 # The Makefile's knob is EMPTY-or-1: 0 is refused by name (it cannot be told
 # apart from an unset value in the config stamp). The control build therefore
 # passes the empty string; only the teeth build passes 1.
@@ -849,43 +835,11 @@ gate_capture() {
     echo "create: $(cat "$WD/create.json")"
 
     local spawned=0 held=0 i
-    if [ "$DRILL" = "1" ]; then
-        # The drill's boot stretch is a pure compute burst, not a hang: a
-        # fixed 120 s total failed a slower host while the sidecar was still
-        # RUNNING. Extend the drill's spawn wait while the serial log grows;
-        # a no-progress stall and an absolute ceiling still bound it. The
-        # plain gate keeps the old fixed 120 s total, so a plain boot that
-        # never spawns still fails promptly.
-        local start_s last_progress_s last_bytes now bytes extended=0
-        start_s=$(date +%s)
-        last_progress_s=$start_s
-        last_bytes=0
-        while :; do
-            grep -aqF "[E7] firstuser: spawned" "$L1" && { spawned=1; break; }
-            kill -0 "$QPID" 2>/dev/null || fail "QEMU exited before the tenant spawned"
-            now=$(date +%s)
-            bytes=$(wc -c < "$L1" 2>/dev/null || echo 0)
-            if [ "$bytes" -gt "$last_bytes" ]; then
-                last_bytes=$bytes
-                last_progress_s=$now
-            fi
-            if [ "$extended" -eq 0 ] && [ "$now" -ge "$((start_s + 120))" ]; then
-                echo "note: drill tenant-spawn wait extended past 120s — guest still progressing ($bytes log bytes); stall=${SPAWN_STALL_S}s ceiling=${SPAWN_CEIL_S}s"
-                extended=1
-            fi
-            [ "$((now - last_progress_s))" -lt "$SPAWN_STALL_S" ] || \
-                fail "the gate tenant never spawned (no guest progress for ${SPAWN_STALL_S}s; $bytes log bytes; ceiling ${SPAWN_CEIL_S}s)"
-            [ "$((now - start_s))" -lt "$SPAWN_CEIL_S" ] || \
-                fail "the gate tenant never spawned (${SPAWN_CEIL_S}s ceiling; last progress $((now - last_progress_s))s ago)"
-            sleep 0.5
-        done
-    else
-        for i in $(seq 1 240); do
-            grep -aqF "[E7] firstuser: spawned" "$L1" && { spawned=1; break; }
-            kill -0 "$QPID" 2>/dev/null || fail "QEMU exited before the tenant spawned"
-            sleep 0.5
-        done
-    fi
+    for i in $(seq 1 240); do
+        grep -aqF "[E7] firstuser: spawned" "$L1" && { spawned=1; break; }
+        kill -0 "$QPID" 2>/dev/null || fail "QEMU exited before the tenant spawned"
+        sleep 0.5
+    done
     [ "$spawned" -eq 1 ] || fail "the gate tenant never spawned"
 
     # The checkpoint is armed at the tenant's OWN continuation (the fourth

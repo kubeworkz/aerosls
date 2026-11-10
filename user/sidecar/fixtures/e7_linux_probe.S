@@ -67,15 +67,6 @@
  *       guard did not echo the base), 402 (mmap's W|X was not refused),
  *       403 (the over-budget arena was not -ENOMEM) — asserted ABSENT,
  *       the 391/392 discipline.
- *   11 (munmap, the mem class) — E7 increment 25's last memory seam
- *       (§5.4): munmap(arena, 0x1000) must succeed (rax 0), a second
- *       call over the same range must also succeed (POSIX: the kernel's
- *       page tables are the truth, and there is nothing left to free),
- *       and munmap(base, 0x1000) below the current break must be
- *       exactly -EINVAL (-22) — v1 keeps the break's pages with brk.
- *       The successful unmap writes "E7MEM-MUNMAP-OK\n" (16 bytes)
- *       through increment 5's seam; any wrong outcome issues MARKER 404,
- *       asserted ABSENT with the map block's.
  *   231 (exit_group) — the sidecar reaps; no reply is owed and this task
  *       never runs again (the hang below is unreachable by design).
  *
@@ -301,40 +292,7 @@ _start:
     syscall
     cmp     $14, %rax
     jne     .Lmmap_bad           /* the arena write failed or short   */
-    /* 5j. munmap(arena, 0x1000) — E7 increment 25: the arena's frame
-     *    returns through the channel; rax must be 0. A second call over
-     *    the same range is success (POSIX): the kernel's page tables are
-     *    the truth, so there is nothing left to free. */
-    mov     %r14, %rdi
-    mov     $0x1000, %esi
-    mov     $11, %eax
-    syscall
-    test    %rax, %rax
-    jne     .Lmunmap_bad
-    mov     %r14, %rdi
-    mov     $0x1000, %esi
-    mov     $11, %eax
-    syscall
-    test    %rax, %rax
-    jne     .Lmunmap_bad
-    /* 5k. munmap(base, 0x1000) — below the current break: v1 refuses
-     *    EINVAL (-22); the break's pages are brk's seam. */
-    mov     %r12, %rdi
-    mov     $0x1000, %esi
-    mov     $11, %eax
-    syscall
-    cmp     $-22, %rax
-    jne     .Lmunmap_bad
-    /* 5l. the on-target marker: "E7MEM-MUNMAP-OK\n" (16 bytes) through
-     *    the same fd seam. */
-    lea     .Lmunmap_msg(%rip), %rsi
-    mov     $1, %edi
-    mov     $16, %edx
-    mov     $1, %eax
-    syscall
-    cmp     $16, %rax
-    jne     .Lmunmap_bad
-    /* 5m. mmap(base, 0x1000, PROT_NONE, FIXED|ANON|PRIVATE) — the
+    /* 5j. mmap(base, 0x1000, PROT_NONE, FIXED|ANON|PRIVATE) — the
      *    measured allocator's guard page, landing ON the brk heap's
      *    first page: Linux MAP_FIXED REPLACES (the old frame returns,
      *    PROT_NONE backs none), and the reply must echo the address
@@ -350,7 +308,7 @@ _start:
     syscall
     cmp     %r12, %rax
     jne     .Lmmap_fixed_bad
-    /* 5n. mmap(NULL, 0x1000, PROT_WRITE|PROT_EXEC, ANON|PRIVATE) —
+    /* 5k. mmap(NULL, 0x1000, PROT_WRITE|PROT_EXEC, ANON|PRIVATE) —
      *    §5.4's W^X refusal must come back exactly -EPERM (-1): the
      *    same rule 5g measured over mprotect, over a prot word that
      *    arrives with a mapping ask. */
@@ -364,7 +322,7 @@ _start:
     syscall
     cmp     $-1, %rax
     jne     .Lmmap_wx_bad
-    /* 5o. mmap(NULL, 1 MiB, RW, ANON|PRIVATE) — the whole ask is 16x
+    /* 5l. mmap(NULL, 1 MiB, RW, ANON|PRIVATE) — the whole ask is 16x
      *    the span, so the answer must be exactly -ENOMEM (-12): the
      *    cursor cannot fit it, and unlike brk's denial echo, mmap's
      *    failure shape IS an errno. */
@@ -400,10 +358,6 @@ _start:
     mov     $403, %eax           /* MARKER: over-budget not -ENOMEM    */
     syscall
     jmp     .Lmem_done
-.Lmunmap_bad:
-    mov     $404, %eax           /* MARKER: the munmap seam lied         */
-    syscall
-    jmp     .Lmem_done
 .Lmem_bad:
     mov     $395, %eax           /* MARKER: the brk seam lied (base/echo) */
     syscall
@@ -426,9 +380,6 @@ _start:
     /* The fd class's positive marker: printed on the console only if the
      * whole seam performed it (build_probe.sh keeps this in .text — one
      * section, _start at offset 0). */
-.Lmunmap_msg:
-    .ascii  "E7MEM-MUNMAP-OK\n"
-
 .Lmsg:
     .ascii  "E7FD-WRITE-OK\n"
 .Lmsgend:

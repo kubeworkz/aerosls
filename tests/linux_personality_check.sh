@@ -459,7 +459,7 @@ arm_l5=$(grep -n 'cur->park_syscall = SYS_LINUX_TRAP_RESUME;' "$DISP" | head -1 
 if [ -n "$plan_l" ] && [ -n "$desc_l" ] && [ -n "$copy_l" ] && \
    [ -n "$arm_l5" ] && [ "$plan_l" -lt "$desc_l" ] && \
    [ "$copy_l" -lt "$arm_l5" ] && \
-   grep -qF 'if (num == LINUX_WRITE && plan.len) largs[2] = plan.len;' "$DISP" && \
+   grep -qF 'if (plan.len) largs[2] = plan.len;' "$DISP" && \
    grep -qF 'return (uint64_t)(int64_t)plan.refuse;' "$DISP" && \
    grep -qF 'return (uint64_t)(int64_t)(-LINUX_EFAULT);' "$DISP" && \
    grep -qF 'k_linux_forward(cur->pid, ch_w, ch_r, fwd, fwd_len);' "$DISP"; then
@@ -860,61 +860,57 @@ else
     bad "R8. the attribution is gone — the alloc-failure text would exist only in the merged console drain (any child of the environment could have written it) and the mmap refusal goes back to a bare ENOSYS with no request to name (the proven chain becomes an inference again)"
 fi
 
-# ─── S. poll (7) — readiness and timed wakeups (E7 increment 24) ───────────
-# The firstuser's last ENOSYS answer is now a REAL call. The kernel copies
-# the caller's pollfd array out and the rewritten array back into the SAME
-# span; the sidecar scans the task's fd table and the console, answers a
-# ready or zero-timeout poll at once, and PARKS a timed or infinite poll
-# until readiness or the deadline. A timed-out poll answers zero revents —
-# never invented readiness — and a blocking console read parks the same way.
-# Every clause below is a way that becomes a silent lie while the rest of
-# the guard stays green: an array one side never carries, the write clamp
-# eating poll's timeout, a parked request nothing ever wakes, a timeout
-# that never expires, or a pure half no host test drives.
+# ─── S. poll (7) — the run's LAST ENOSYS answer (§10.13's step-2 coda) ────
+# The firstuser's num=00000007 line is POLL, not munmap — §10.13's log
+# annotation mislabelled it from the census row's COUNT (`11 munmap 7`):
+# munmap is 11 and never fires before the kill, while Rust std's
+# lang_start_internal polls fds {0,1,2} with a ZERO timeout before it
+# installs any signal handler, and an errno outside its tolerated set
+# (EAGAIN/ENOMEM/EINVAL, its own bitmask) aborts the task — which is why
+# the run died at raise(SIGABRT) four traps in. The answer is
+# deliberately small: a zero-timeout poll reports 0 events (this shim
+# has no console-input readiness state — under-reporting readiness can
+# only send a caller back to its own loop, never into an action built
+# on readiness nobody claimed), a poll that would WAIT is refused by
+# name at BOTH ends (it needs a wake against state that does not exist),
+# and no bytes cross either way (a count of 0 promises no revents —
+# the copy-IN that would carry them stays increment 8's named gap).
+# Every clause below is a way that answer silently becomes a lie while
+# the rest of this guard stays green: the predicate rewritten until it
+# refuses every poll (the wall back by name) or grants a wait whose
+# wake cannot come, the first-trap refusal deleted (the waiting poll
+# posts and parks), the sidecar arm gutted, or the pure half untested.
 if grep -qF '#define LINUX_POLL  7u' "$LABH" && \
-   grep -qF '#define LINUX_POLL_MAX_FDS 16u' "$LABH" && \
-   grep -qF '#define LINUX_POLLFD_BYTES 8u' "$LABH" && \
-   grep -qF 'if (num == LINUX_POLL) {' "$LABC" && \
-   grep -qF 'p.len = (uint32_t)(nfds * LINUX_POLLFD_BYTES);' "$LABC" && \
-   grep -qF '} else if (num == LINUX_POLL) {' "$LABC" && \
-   grep -qF 'n % LINUX_POLLFD_BYTES == 0' "$LABC"; then
-    ok "S. poll's crossings are named pure contracts at the kernel end — the capped array IN (write plan), the SAME array back OUT (reply plan), and a reply shape that keeps the ready count inside nfds"
+   grep -qF 'int linux_poll_refuses_blocking(uint64_t num, uint64_t timeout);' "$LABH" && \
+   grep -qF 'int linux_poll_refuses_blocking(uint64_t num, uint64_t timeout)' "$LABC" && \
+   grep -qF 'return num == LINUX_POLL && (int32_t)timeout != 0;' "$LABC"; then
+    ok "S. poll's waiting refusal is the named pure contract — the census's own number, Linux's INT timeout (the low 32 bits, sign-extended), refused iff the call would WAIT, declared where the dispatcher and the host test both read it"
 else
-    bad "S. one half of poll's byte crossing is gone — without the IN plan revents cannot be computed from the caller's array, without the OUT plan the rewritten array never lands, and without the shape rule a ready count can contradict it"
+    bad "S. the poll contract is gone or rewritten — the dispatcher has no predicate to consult (a waiting poll parks a task whose wake cannot come) and a rewritten one can only be argued from prose while the host test bites a function nothing calls"
 fi
-if grep -qF 'if (num == LINUX_WRITE && plan.len) largs[2] = plan.len;' "$DISP"; then
-    ok "S1. the description's clamp is WRITE-only — poll's args[2] is its TIMEOUT, so the array's byte length must never ride that word (an unconditional clamp would answer a 5 s poll on the array's byte count — 24 ms for three fds — not on its timeout)"
+poll_ref=$(grep -nF 'linux_poll_refuses_blocking(num, largs[2]))' "$DISP" | head -1 | cut -d: -f1)
+if [ -n "$poll_ref" ] && \
+   sed -n "$((poll_ref + 1)),$((poll_ref + 6))p" "$DISP" | grep -qF 'console-input state' && \
+   sed -n "$((poll_ref + 1)),$((poll_ref + 6))p" "$DISP" | grep -qF -- '(uint64_t)(int64_t)(-LINUX_ENOSYS);'; then
+    ok "S1. the FIRST TRAP refuses a waiting poll before any post — a request property (a timeout word), so no channel is needed to say it (mprotect's posture), logged by name with its trigger, returning -ENOSYS in the task's own units"
 else
-    bad "S1. poll's timeout word is being overwritten by the write clamp (or the write clamp is gone) — a 5 s poll would return after ~24 ms with nothing ready, its timeout silently ignored"
+    bad "S1. the dispatcher's poll refusal is gone or no longer returns from the first trap — a waiting poll would post and park on a channel whose wake cannot come (no console-input state), and the sidecar twin would then be the only wall left"
 fi
-if grep -qF 'const PENDING_READ: u8 = 1;' "$LRS" && \
-   grep -qF 'const PENDING_POLL: u8 = 2;' "$LRS" && \
-   grep -qF 'LINUX_POLL => poll_answer(fds, console, payload, args, now_ns,' "$LRS" && \
-   grep -qF 'return Answer::ReadWait(want);' "$LRS" && \
-   grep -qF 'Answer::PollWait(arr, len, poll_deadline(now_ns, timeout_ms))' "$LRS" && \
-   grep -qF 'poll_expired(deadline, now_ns)' "$LRS" && \
-   grep -qF 'deadline != 0 && now_ns >= deadline' "$LRS" && \
-   grep -qF 'tasks()[i].pending = PENDING_POLL;' "$LRS" && \
-   grep -qF 'tasks()[i].pending = PENDING_READ;' "$LRS"; then
-    ok "S2. the sidecar's waiting half is wired — a console read with no input returns ReadWait, a timed poll returns PollWait with its deadline, service PARKS both, re-scans on every pass, and answers on readiness or expiry"
+poll_arm=$(grep -nF 'if (args[2] as i32) == 0 {' "$LRS" | head -1 | cut -d: -f1)
+if grep -qF '        7 => {' "$LRS" && \
+   [ -n "$poll_arm" ] && \
+   sed -n "$((poll_arm + 1))p" "$LRS" | grep -qF 'Answer::Reply(0, STATUS_OK)' && \
+   sed -n "$((poll_arm + 3))p" "$LRS" | grep -qF 'Answer::Reply(0, E_NOSYS)'; then
+    ok "S2. the sidecar's 7 arm answers the ZERO-timeout probe 0 events and the waiting poll ENOSYS by name — its twin of the first-trap refusal (N3's both-ends posture), the zero timeout decided at the arm's own literal"
 else
-    bad "S2. the sidecar's park/wake half is gone or degraded — a blocking read would answer EAGAIN, a timed poll would answer 0 immediately, or a parked request would sit with nothing to resolve it"
+    bad "S2. the poll arm is gone or either answer changed — a granted wait (a wake that can never come, or a five-second poll answered 0 into the caller's own loop) or an ENOSYS for the probe (the firstuser's measured wall, back by name)"
 fi
-if grep -qF 'let timeout = crate::linux::next_wait_ns(&RealKernel);' user/sidecar/src/entry.rs && \
-   grep -qF 'pub fn next_wait_ns<K: Kernel>(k: &K) -> u64' "$LRS" && \
-   grep -qF 't.pending == PENDING_POLL && t.pending_deadline != 0' "$LRS"; then
-    ok "S3. the entry loop waits with the nearest finite poll deadline — a timed poll wakes the parked sidecar at its own timeout instead of waiting for an unrelated channel, and a read/forever-poll keeps the old block-forever shape"
+if grep -qF 'LINUX_POLL == 7' "$PHUT" && \
+   grep -qF 'linux_poll_refuses_blocking(LINUX_POLL, 0)' "$PHUT" && \
+   grep -qF '0x100000000ULL' "$PHUT"; then
+    ok "S3. the predicate is host-tested against the REAL kernel/linux_abi.c — the zero-timeout probe, the timed and infinite refusals, the int-width rule (0x1_00000000 is a zero timeout) and the total number space (run_all compiles and runs it)"
 else
-    bad "S3. the quiesce wait no longer carries poll's deadline — a 5 s poll would sleep until some other channel happened to wake the loop, and its timeout would be decided by unrelated traffic"
-fi
-if grep -qF 'linux_fd_write_plan(LINUX_POLL, a)' "$PHUT" && \
-   grep -qF 'linux_fd_reply_plan(LINUX_POLL, a)' "$PHUT" && \
-   grep -qF 'linux_reply_shape_ok(LINUX_POLL, 2, 3 * LINUX_POLLFD_BYTES)' "$PHUT" && \
-   grep -qF 'LINUX_POLL_MAX_FDS + 1' "$PHUT" && \
-   grep -qF '0x00007FFFFFFFF000ULL' "$PHUT"; then
-    ok "S4. the host test drives both plans against the REAL kernel/linux_abi.c — the in/out crossings, nfds 0, the cap, the NULL array, the span crossing the user max, and the reply shape"
-else
-    bad "S4. the host test no longer drives poll's plans — the crossings and refusals would be argued from this guard's greps alone, every branch reachable only at boot"
+    bad "S3. the host test no longer drives the predicate — the run's last-ENOSYS fix would be argued from the guard's greps alone, every branch reachable only at boot"
 fi
 
 # ─── T: the reply payload's copy-IN (E7 increment 12, §10.13's step 3) ────
@@ -1261,78 +1257,6 @@ if grep -qF 'LINUX: the gate environment (sidecar + Linux tenant) captures as on
     ok "W6. both host tests drive the increment: the payload round trip (bytes, perms, context, the perm and form teeth) and the record layer's stamp/identity clauses — each claim runs against the real kernel file, not a model of it"
 else
     bad "W6. a host-test clause for increment 20 is missing — the capture, the stamp or the identity comparison would be a claim no test runs"
-fi
-
-# ─── X. E7 increment 25: munmap, the memory class's last seam ─────────────
-# The contract (X), the first trap before any post (X1), the reply's
-# page-table walk and frame return (X2), the sidecar's twin (X3), the
-# host test's branches (X4), the probe's on-target proof (X5) and the
-# instrument lines (X6): each is a claim the seam rests on.
-if grep -qF 'struct LinuxMunmapReq {' kernel/linux_abi.h && \
-   grep -qF 'int linux_mem_munmap_refusal(const struct LinuxMunmapReq *req,' kernel/linux_abi.h && \
-   grep -qF 'linux_mem_munmap_verdict(uint64_t heap_base, uint64_t heap_limit,' kernel/linux_abi.h && \
-   grep -qF 'int linux_mem_munmap_refusal(const struct LinuxMunmapReq *req,' kernel/linux_abi.c && \
-   grep -qF 'linux_mem_munmap_verdict(uint64_t heap_base, uint64_t heap_limit,' kernel/linux_abi.c; then
-    ok "X. the munmap seam is a named pure contract at both ends — the request, the first-trap refusal (zero/overflowing length, unaligned address, outside the stamped span, below the current break) and the reply verdict that re-checks a success against the kernel's own span and names the page range"
-else
-    bad "X. the munmap contract is missing — the kernel would have no named refusal or verdict to reason about, and the seam would be a page-table walk with no policy"
-fi
-munmap_ref=$(grep -nF 'mref = linux_mem_munmap_refusal(&mreq,' kernel/syscall_dispatch.c | head -1 | cut -d: -f1)
-if [ -n "$munmap_ref" ] && \
-   sed -n "$((munmap_ref - 3)),$((munmap_ref + 26))p" kernel/syscall_dispatch.c | grep -qF 'refused before post' && \
-   sed -n "$((munmap_ref - 3)),$((munmap_ref + 26))p" kernel/syscall_dispatch.c | grep -qF 'return (uint64_t)(int64_t)mref;' && \
-   sed -n "$((munmap_ref - 3)),$((munmap_ref + 26))p" kernel/syscall_dispatch.c | grep -qF 'cur->mem_stage_num   = num;' && \
-   sed -n "$((munmap_ref - 3)),$((munmap_ref + 26))p" kernel/syscall_dispatch.c | grep -qF 'cur->mem_stage_a1    = largs[1];'; then
-    ok "X1. munmap's first trap runs before any post: the refusal logs its words and returns its errno on the line; a pass stages addr and len for the reply's verdict"
-else
-    bad "X1. the munmap first trap is gone or no longer precedes the post — a malformed range would reach the channel, or a pass would lose the words the verdict re-checks"
-fi
-munmap_v=$(grep -nF 'v = linux_mem_munmap_verdict(' kernel/syscall_dispatch.c | head -1 | cut -d: -f1)
-munmap_apply="$(sed -n "$((munmap_v - 3)),$((munmap_v + 70))p" kernel/syscall_dispatch.c)"
-if [ -n "$munmap_v" ] && \
-   grep -qF 'cur->linux_brk_cur' <<< "$munmap_apply" && \
-   grep -qF 'linux_user_page_frame(' <<< "$munmap_apply" && \
-   grep -qF 'user_unmap_page(pml4, va);' <<< "$munmap_apply" && \
-   grep -qF 'user_invlpg(va);' <<< "$munmap_apply" && \
-   grep -qF 'free_physical_ram_frame_for_partition' <<< "$munmap_apply" && \
-   grep -qF 'v.unmap_pages' <<< "$munmap_apply"; then
-    ok "X2. the reply's apply walks exactly the verdict's page range, frees every present USER frame back to the partition, shoots down each touched translation, and leaves both cursors alone — an absent page is already unmapped, not an error"
-else
-    bad "X2. the munmap apply is missing or no longer walks the verdict's range — a success would unmap nothing (or free a frame without invlpg / return it without unmapping)"
-fi
-munmap_arm=$(grep -nF '        11 => {' user/sidecar/src/linux.rs | head -1 | cut -d: -f1)
-munmap_arm_body="$(sed -n "$((munmap_arm + 1)),$((munmap_arm + 40))p" user/sidecar/src/linux.rs)"
-if [ -n "$munmap_arm" ] && \
-   grep -qF 'checked_add(0xFFF)' <<< "$munmap_arm_body" && \
-   grep -qF 'addr & 0xFFF' <<< "$munmap_arm_body" && \
-   grep -qF 'addr < brk.cur' <<< "$munmap_arm_body" && \
-   grep -qF 'Answer::Reply(0, STATUS_OK)' <<< "$munmap_arm_body" && \
-   grep -qF 'Answer::Reply(0, E_INVAL)' <<< "$munmap_arm_body"; then
-    ok "X3. the sidecar's 11 arm repeats the kernel's ladder as its own twin — nonzero non-overflowing length, aligned address, inside the span, at or above the break — and answers 0 without moving either cursor"
-else
-    bad "X3. the sidecar's munmap arm is gone or no longer mirrors the ladder — the kernel's first trap would be the only refusal, and a malformed range could get a fake success"
-fi
-if grep -qF 'linux_mem_munmap_refusal(&req, BASE, LIMIT, BASE)' tests/linux_personality_host_test.c && \
-   grep -qF 'linux_mem_munmap_verdict(BASE, LIMIT, BASE,' tests/linux_personality_host_test.c && \
-   grep -qF 'v.unmap_pages == 1' tests/linux_personality_host_test.c; then
-    ok "X4. the host test drives the refusal and the verdict: the span/break/alignment/overflow branches, the negative-reply no-op, the non-zero malformed reply and the exact page range"
-else
-    bad "X4. the host test no longer drives munmap — every branch above would be reachable only at boot (t83/t117's rule)"
-fi
-if grep -qF 'E7MEM-MUNMAP-OK' user/sidecar/fixtures/e7_linux_probe.S && \
-   grep -qF 'mov     $11, %eax' user/sidecar/fixtures/e7_linux_probe.S && \
-   grep -qF 'mov     $404, %eax' user/sidecar/fixtures/e7_linux_probe.S && \
-   grep -qF '.Lmunmap_bad:' user/sidecar/fixtures/e7_linux_probe.S; then
-    ok "X5. the probe carries the on-target proof: two successful unmaps of the arena (the second is POSIX's already-unmapped success), the below-the-break -EINVAL, the E7MEM-MUNMAP-OK bytes out, and MARKER 404 for any wrong outcome (asserted absent)"
-else
-    bad "X5. the probe's munmap block is gone or gutted — the shipped boot would prove nothing about the seam while reading exactly as green"
-fi
-if grep -qF ' ok munmap addr=0x' user/sidecar/src/linux.rs && \
-   grep -qF 'EINVAL munmap(addr=0x' user/sidecar/src/linux.rs && \
-   grep -qF 'munmap addr=0x%lx len=%lu' kernel/syscall_dispatch.c; then
-    ok "X6. the run's proof is on the lines: the granted range and its words, the refusal's EINVAL with the range, and the kernel's per-page free count — WHICH range and HOW MANY pages, not reconstructed from which arms ran"
-else
-    bad "X6. a munmap instrument line is missing — the seam would run but the log would not name the range it freed (increment 14/15's rule)"
 fi
 
 echo

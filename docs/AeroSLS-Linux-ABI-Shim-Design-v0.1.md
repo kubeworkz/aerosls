@@ -1,9 +1,9 @@
 # AeroSLS Static-Binary Linux ABI Shim — Design v0.1 (Phase E7)
 
-**Status:** Design and implementation record; the gate's two halves are observed live and manually, not yet a one-command automated gate.
+**Status:** Draft for review.
 **Scope:** The design pass Phase E7 is gated on (`AeroSLS-POSIX-Environments-Roadmap-v0.1.md` §10, §13), plus the two items that document parks here — its Q5 (§14) and dynamic linking (§12, "Belongs to E7's design pass").
 **Resolves:** (1) **syscall routing** — kernel-side Linux-personality dispatch, or forwarding to the owning POSIX sidecar core; (2) **architecture** — x86-64 or ARM64 first; (3) dynamic linking; (4) the shape of the inherited gate.
-**Does not do:** claim the gate is automated. The design pass is implemented in place; §10 records each increment and its evidence, and Appendix B keeps the remaining gaps named.
+**Does not do:** implement anything. This document is the pass; §10 says nothing is built before it.
 
 ---
 
@@ -1799,42 +1799,36 @@ eighteen calls later, behind `mmap`s this shim has never answered.
 run's last ENOSYS could never have been its; §5.4's second half stays
 the named gap it was, waiting for the anonymous-map increment.
 
-The answer is now the whole call, not a refusal (increment 24 closes the
-waiting half the coda used to name). A poll copies the caller's pollfd
-array IN, scans it against the task's fd table and the console, and
-copies the rewritten array back into the SAME span: a zero-timeout poll
-is the snapshot the firstuser's std init calls (`poll(fds {0,1,2}, 0)`),
-a ready descriptor answers at once with its POLLIN/POLLOUT/POLLNVAL
-bits, and a timed poll PARKS the request until readiness or its own
-deadline — a timeout answers zero revents, never an invented readiness.
-POSIX's -1 parks with no deadline. The array is capped at
-`LINUX_POLL_MAX_FDS` (16) so one call cannot grow either frame
-unbounded; a NULL array with nfds > 0, a non-canonical span, or nfds
-above the cap is a first-trap refusal. The SIDECAR owns readiness and
-the wait; the KERNEL owns both copies. A blocking console read takes
-the same shape: no buffered input parks the request (`Answer::ReadWait`)
-until typed input or the console's close, instead of EAGAIN.
+The answer is deliberately the smallest honest one. A ZERO-timeout
+poll reports 0 events: this shim has no console-input readiness state
+(§10.13's named input class), so "nothing ready" is the whole truth it
+can tell, and UNDER-reporting readiness can only send a caller back to
+its own loop — never into an action built on readiness nobody claimed.
+The pollfd ARRAY is never read and revents never written: a count of 0
+promises neither (POSIX defines revents only for ready fds), so no
+copy crosses in either direction — the copy-IN that would carry
+revents stays increment 8's named gap. A poll that would WAIT (ms > 0,
+or -1's forever) is refused at the FIRST trap, before any channel
+post, by `linux_poll_refuses_blocking` (`kernel/linux_abi.{h,c}`):
+Linux's timeout is an int, so the low 32 bits decide sign-extended —
+-1 and 5000 refuse, 0 and 0x1_00000000 do not — and the sidecar's
+7 arm carries the same rule as its twin (mprotect's both-ends posture
+over a timeout word instead of a prot word): waiting needs a wake
+against input state that does not exist, and answering 0 to a 5000 ms
+poll would make the caller spin its five seconds inside its own loop
+on a lie.
 
-The deadline is real, not a spin: `SYS_SLS_NOW_NS` (329) exposes the
-kernel's monotonic tick counter, a parked poll stores an absolute
-deadline, and `linux::next_wait_ns` gives the entry loop the nearest
-finite one so `Kernel::wait` wakes at that timeout. The clamp that
-carries a write's count in the description is WRITE-only: poll's
-`args[2]` is its timeout, and an unconditional clamp would answer a
-5 s poll on the array's byte count (24 ms for the std probe's three
-fds), not on its timeout.
-
-Host teeth: `tests/linux_personality_host_test.c`'s poll section — both
-crossings (in/out), nfds 0 as a pure sleep, the cap, the NULL array, the
-span crossing the user max, and the reply shape — and
-`user/sidecar/src/linux.rs`'s unit tests, **27 green** (the waiting
-tests: park without readiness, serve on input, a real deadline,
-POLLNVAL, ignored negative fds, a pure sleep, and the events-mask /
-revents split). Guard clauses **S, S1–S4** with teeth **t84–t89 and
-t121–t122**: the array plan neutered, the write clamp eating poll's
-timeout, the sidecar arm renamed away, the wait answered 0 immediately,
-a blocking read back to EAGAIN, an expiry that never fires, the entry
-loop's deadline dropped, and the host test's reply plan deleted.
+Host teeth: `tests/linux_personality_host_test.c`, **105 checks
+green** — the predicate's probe, the timed and infinite refusals, the
+int-width rule, the total number space — and
+`user/sidecar/src/linux.rs`'s unit tests, **12 green** (the new poll
+test: the probe's 0, nfds-irrelevance, both refusals, both int-width
+directions). Guard clause **S** (S1–S3) with teeth **t84–t89**: the
+predicate neutered to "refuse every poll" (the wall back by name), the
+first-trap refusal block deleted (the waiting poll posts and parks),
+the arm renamed away, the arm's two answers inverted, a waiting poll
+granted 0, and the predicate's host-test section deleted. Smoke
+**75/75**.
 
 The measurement — same E3 harness, `e3_multi_env_boot_check.sh` RC=0,
 both of the boot's firstuser runs identical:
@@ -2019,9 +2013,8 @@ host-tested here, but no fd number stages a payload yet, and the path
 class (`open`/`stat`/`unlink`/…) rides the OUT direction's plan as
 step 4's bridge. A user HANDLER is still refused ENOSYS by name —
 this increment writes the old disposition BACK, it does not create
-signal frames (§10.13 step 2's rule stands). The waiting half of the input
-class now lands with increments 23–24: a read with no buffered input parks,
-and a timed poll parks against readiness with a real deadline (clause S).
+signal frames (§10.13 step 2's rule stands). The input class is
+untouched: a waiting poll is still refused at both ends (clause S).
 And the payload bound is exact — the deliver's clamp and service()'s
 `len != want` arm refuse every size a first trap did not allow;
 `FD_PAYLOAD_CAP`'s widening (read's count) is step 4's decision to
@@ -2481,11 +2474,12 @@ lines. `execve`(1) stays refused by name, as below; `poll`(1)'s
 zero-timeout probe is now answered (the coda above) and its WAITING
 half refused by name.
 
-**What this increment is NOT.** `execve` — the spawn class. (The
-paragraph that stood here about `poll`'s waiting half is retired:
-increment 24 landed the rewritten array, console readiness and the
-timed park, so a poll that blocks is answered by readiness or its own
-deadline, not refused.)
+**What this increment is NOT.** `poll`'s WAITING half — its revents
+are a copy-in of a REWRITTEN array plus console-input state this shim
+has never had; a poll that would block or time out belongs to the
+input class, unscoped, refused by name at BOTH ends (only the
+zero-timeout probe — which reads nothing and writes nothing — is
+answered). `execve` — the spawn class.
 `clock_gettime` — the time seam named above. File-backed `mmap`.
 Permissions reported but never enforced — mode comes from the VFS's
 own metadata, and the first refusal a real workload meets is where
@@ -3403,85 +3397,6 @@ which is how the corrected set was checked without a second boot. The
 invocation itself needed two repeats for restore refusals (above), neither a
 tooth's red.
 
-**Increment 23 — console read, the first half of the input class
-(2026-11-08).** `answer_file` now takes the entry loop's `CharNode`, and a
-console descriptor drains bytes that loop has already pushed from the
-kernel's console channel. An empty buffer is still `EAGAIN`; a closed
-channel is EOF; `read(fd, buf, 0)` succeeds without consuming anything. The
-arm is deliberately non-waiting — it never holds the sidecar's single
-service thread — so `poll` with a timeout, and a blocking read, still refuse
-by name at both ends. The kernel already stages fd reads and copies the
-reply payload under its first-trap clamp, so this is a sidecar-only
-increment. The new unit test drives buffered bytes, empty/EAGAIN, zero-length
-success and close/EOF. It has not yet been exercised by a live boot; the
-gate's console writers are unaffected.
-
-**Increment 25 — `munmap`, the memory class's last seam (2026-11-08).**
-`munmap` (11) now crosses the same channel brk and mmap use. The kernel's
-first trap refuses a zero or overflowed length, an unaligned address, a
-range outside the create's stamped span, or one that starts below the
-current break — `-EINVAL` before any post, with the request's words on the
-line. A pass stages `addr`/`len`; at the reply the pure verdict re-runs
-that ladder against the kernel's OWN span and break and names the page
-range, and the apply walks it: every present USER 4 KiB leaf is unmapped,
-its translation shot down with `invlpg`, and its frame returned to the
-partition. An absent page is already unmapped (a double unmap is success),
-and neither `brk_cur` nor `linux_mmap_top` moves — v1 never re-hands a
-freed virtual range, so the range waits for teardown while the frames
-return. The sidecar's 11 arm is the ladder's twin (guard clause X), answers
-0 or `EINVAL`, and keeps no mapping ledger: the kernel's page tables are
-the truth. The host test drives every refusal branch, the negative-reply
-no-op and the non-zero malformed reply; the sidecar unit test drives the
-span/break/alignment/overflow shapes and asserts both cursors stand still;
-the probe munmaps the granted arena twice, requires `-EINVAL` below the
-break, writes `E7MEM-MUNMAP-OK\n` and marks any other outcome 404 (asserted
-absent). Guard clause X/X1–X6 and teeth t123–t128 pin the first trap, the
-verdict, the apply, the sidecar arm, the host test, the fixture and both
-instrument lines.
-
-**Measured (2026-11-08).** The E3 image was rebuilt (`make x86-iso-e3`) with
-the 888-byte payload and booted through `tests/e3_multi_env_boot_check.sh`
-(RC=0; 4 live-rootfs lines, no serial drops). The probe's sequence is on the
-wire twice — the system POSIX and its watchdog respawn: the arena's first
-`munmap` frees one page, the second reports `0 page(s) freed, 1 already
-absent`, the below-break call is refused before the post, and the 16-byte
-write carries `E7MEM-MUNMAP-OK`. The same boot's real firstuser
-(`e7.linux.user.0`) also unmaps its own pages one at a time, and
-`E7MEM-MMAP-OK` still appears. No marker-404 line (`num=00000194`) exists.
-Evidence: `evidence/e7_munmap_live.log`.
-
-**Run record — the drill's tenant-spawn wait follows host progress
-(2026-11-08).** The default `--live` drill could reach D1–D2 only once the
-tenant spawned inside the harness's fixed 120 s window. On a slower host
-the 45G gate-boot stretch was still RUNNING at that bound — 318,476 serial
-bytes and growing — so the harness stopped before the drill could exercise
-the wait it exists to test: a host-speed false failure, not a posture that
-never came. The drill's spawn wait is now progress-bounded. Any growth in
-`boot1.log` restarts a 120 s no-progress stall, and a 900 s absolute ceiling
-still bounds a boot that never spawns (`E7G_SPAWN_STALL_S` and
-`E7G_SPAWN_CEIL_S`, defaults 120/900). The plain gate keeps its original
-fixed 120 s total, so a plain boot that never spawns still fails promptly.
-This changes the harness that reaches the drill, not the kernel wait under
-test: D1–D2 still exercise the pre-pour wait, whose old fixed bound was
-30 s and whose `running`/`wait ended` semantics are unchanged.
-
-The full default `--live` run then passed. The harness printed the extension
-note, the stretch completed, the tenant spawned and reached the copy
-continuation, and the gate returned to the same boot-2 assertions:
-
-```
-note: drill tenant-spawn wait extended past 120s — guest still progressing
-(318476 log bytes); stall=120s ceiling=900s
-[E7-GATE] stretch-done  0000AFC8 Miters
-[E7] firstuser: spawned 0000000B
-ok:   D1. the wait outlived the old fixed bound with a sidecar RUNNING (running=1/2)
-ok:   D2. the wait never answered (no 'wait ended' line) and the pour still landed
-```
-
-B1–B7 stayed green, `payloads=1` and `payload_skips=0`, and a replay of the
-same recording passed all clauses. Evidence:
-`evidence/e7_gate_drill_adaptive/`; commit `f3c1d19`.
-
 ---
 
 ## 11. Open questions for review
@@ -3551,13 +3466,11 @@ Everything this document asserts about the tree, with its source:
 | The signal seam: the plan's three first-trap refusals (width, out-pointer, span) ahead of any channel post, the sidecar's dispositions/mask/pending with handler installs refused by name and tkill scoped to its own tid, and every default-terminate converging on one attributed no-reply kill | `kernel/linux_abi.{h,c}` (`linux_sig_copy_plan`, `LSC_SIG`); `kernel/syscall_dispatch.c`; `user/sidecar/src/linux.rs` (`SigState`, the 13/14/200 arms, `Answer::SignalKill`); `tests/linux_personality_host_test.c` (210 checks, the current run; 98 at the signal seam) + linux.rs unit tests (11); guard clause R, teeth t76–t83 (§10.13's step 2) |
 | The E7 gate's resume half ran in the guest: one invocation, two boots of the same NVMe image, the tenant adopted at `rip=0x8057ab7 rsp=0x4000000a9778` (`stop=spent`), its copy finishing after the reboot — one `Copying`, one `Done (524288 bytes, 504 sparse holes, 4 kept)`, no `[FAULT]` — and its `exit_group` reaped by name (`[TORE] address space … 172 frame(s) freed`, the work-half count) | `evidence/e7_gate_reboot.log`; `tests/env_payload_host_test.c` (81 checks: the one-shot stop, the held replay's page mapping, and the stall-bounded wait's three outcomes); `tests/cap_create_sidecar_host_test.c` (the caller's-partition resolve) |
 | The gate's failure side is observed, not assumed: one invocation, one capture and five replays — the control green, `descriptor` reddening B2/B3/B4, `no-fd` B3/B4, `no-heap` B4/B5 (the 64 KiB buffer's `free` faulting inside the withheld page), `fs_base` B2/B4/B5 (the adopted TLS base one page off, the copy running to the end of the file and the tenant dying at a pointer read from the wrong TCB) — with each tooth's own line in the transcript and the shipped image refusing a named tooth by name | `evidence/e7_gate_teeth.log`, `evidence/e7_gate_teeth_fsbase.log`; `tests/e7_gate_check.sh --teeth`; `kernel/env_payload.h`'s `E7G_TOOTH` block and `Makefile`'s `E7_TOOTH` (both compiled out by default) |
-| The drill's tenant-spawn wait follows host progress, and the full default `--live` gate passes B1–B7 plus D1–D2 when the 45G stretch crosses the old 120 s bound: the wait extended at 318,476 serial bytes, D1 saw the pre-pour wait outlive its old 30 s bound with a sidecar RUNNING (`running=1/2`), D2 saw no `wait ended` and the pour land (`payloads=1, payload_skips=0`); the plain gate keeps its fixed 120 s total | `tests/e7_gate_check.sh` (`E7G_SPAWN_STALL_S`/`E7G_SPAWN_CEIL_S`); `evidence/e7_gate_drill_adaptive/`; commit `f3c1d19` |
-| Console reads and poll: buffered input is served, an empty buffer PARKS the read until input or close, poll scans the task's fd table plus the console and rewrites revents, and a timed or infinite wait parks until readiness or a real deadline — a timeout answers zero revents | `user/sidecar/src/linux.rs` (`console_read_answer`, `Answer::{ReadWait,PollWait}`, `poll_scan`, `poll_answer`, `next_wait_ns`, the `PENDING_*` state and `service`'s pending block); `kernel/linux_abi.{h,c}` (the poll IN/OUT plans and reply shape); `kernel/syscall_dispatch.{h,c}` (`SYS_SLS_NOW_NS` 329, write-only clamp); `user/proto/src/kabi.rs`; `tests/linux_personality_host_test.c` (the poll crossings/shape) + linux.rs unit tests (27); guard clauses S/S1–S4, teeth t84–t89, t121–t122 (§10.13's poll coda) |
-| `munmap` (11) crosses the channel in a live E3 boot: the probe unmaps its arena twice (1 page freed, then 0 freed/1 already absent), the below-break call is refused before the post, and a 16-byte write carries `E7MEM-MUNMAP-OK`; the real firstuser also unmaps its own pages, and no marker-404 syscall line appears | `evidence/e7_munmap_live.log`; `tests/e3_multi_env_boot_check.sh`; guard clause X |
+| The run's last ENOSYS answer retires: poll (7)'s zero-timeout probe answered 0 events with the array never read and revents never written, a WAITING poll refused at both ends before any post, and the firstuser's first output (its own fatal SIGPIPE assert) performed by the fd class | `kernel/linux_abi.{h,c}` (`linux_poll_refuses_blocking`, `LINUX_POLL`); `kernel/syscall_dispatch.c` (the first-trap refusal); `user/sidecar/src/linux.rs` (the 7 arm); `tests/linux_personality_host_test.c` (210 checks, the current run; 105 at the poll coda) + linux.rs unit tests (12); guard clause S, teeth t84–t89 (§10.13's poll coda) |
 
 ## Appendix B — Named gaps, each with its destination
 
-**Register checked 2026-11-08, after the munmap increment.** A row's third cell says **LANDED** only when the gap is closed in the tree and the cell names the section, test and evidence that closed it. One remainder stays visible inside a landed row rather than being swept: `xsetbv`/`CR4.OSXSAVE` (§5.3). The gaps still open are the thread group and ARM64 userspace; console reads and poll's waiting half land at increments 23–24, and the memory class's last seam (`munmap`) at increment 25.
+**Register checked 2026-11-02, after the `fs_base` tooth.** A row's third cell says **LANDED** only when the gap is closed in the tree and the cell names the section, test and evidence that closed it. Two remainders stay visible inside landed rows rather than being swept: `munmap` (§5.4) and `xsetbv`/`CR4.OSXSAVE` (§5.3). The gaps still open are the thread group, ARM64 userspace and console input.
 
 | Gap | Consequence if unaddressed | Destination |
 |---|---|---|
@@ -3565,7 +3478,7 @@ Everything this document asserts about the tree, with its source:
 | Six argument registers not captured by the trap path | every forwarded syscall gets wrong arguments (§3.4) | **LANDED** — increments 2 and 13: `PerCPUData.linux_args[6]` at `[gs:0x50..0x80)` is written by `syscall_entry_stub` before its first call with the offsets frozen by `_Static_assert`s (§10.6), and `syscall_return_path` restores all six before `sysret` (§10.13's register wall); `tests/linux_personality_host_test.c` pins the request ABI as literals, guard clauses C/C1 |
 | No initial stack/auxv builder | static libc start-up fails before `main` (§5.2) | **LANDED** — increment 7 (§10.12): `linux_initial_stack_build()` writes the argc/argv/envp/auxv image with child-vaddr pointers into one partition-charged region (8 KiB floor, entropy refusal rather than a zero-filled `AT_RANDOM`); `tests/linux_initial_stack_host_test.c` (40 checks), clauses O3/O4 with teeth t44–t46, and the later `ARGENV` record carried the real argv (clauses O6/O7) |
 | No `MSR_IA32_FS_BASE` handling | TLS setup fails; musl/glibc binaries die early (§5.3) | **LANDED** — increment 4 (§10.9): `ProcessDescriptor.fs_base` with its stage/grant, `user_write_fs_base()` as the only writer after the gate's zero baseline, loaded on every switch-in and cleared at slot reuse; host test 52 checks at increment 4 (210 today), guard set L (36 clauses) with teeth t18–t24, live proof `evidence/e7_fs_base_shipped.log` |
-| No `brk`/`mmap`/`munmap` → budget mapping (`brk` landed, increment 6, §10.11; the anonymous-map half at increment 16; `munmap` at increment 25) | a freed arena would keep its frames until teardown, and a malformed range could walk pages this task never owned | E7, §5.4 — **LANDED**: increment 16 answered the measured allocator's guard page (FIXED PROT_NONE, replace + invlpg) and its RW arenas (the descending cursor, both ends re-checking) from the budget span, and increment 25 answers `munmap` with the same first-trap/verdict discipline — the apply frees every present USER leaf back to the partition, a double unmap is success, and neither cursor moves. The on-target probe block ran in a real E3 boot (the 16-byte marker, with no marker-404 line; `evidence/e7_munmap_live.log`), so no remainder |
+| No `brk`/`mmap` → budget mapping (`brk` landed, increment 6, §10.11; the anonymous-map half **LANDED** at increment 16; `munmap` remains) | `munmap` still refuses by name (frames return through the partition at the task's teardown — §5.6) | E7, §5.4 — **LANDED** at increment 16 (§10.13): the measured allocator's guard page (FIXED PROT_NONE, replace + invlpg) and its RW arenas (the descending cursor, both ends re-checking) are answered from the budget span, and the firstuser runs its real workload to a clean `exit_group`. **Remainder:** `munmap` through the channel — its own seam |
 | `elf64_map_blob` assumes every PT_LOAD's `p_vaddr` is page-aligned | a libc-linked binary with a non-aligned RW LOAD reads every global in it 0x370 bytes off and dies at `rip=0x28` before `main` — measured, §10.13's step 0 | **LANDED** — increment 8's step 1: page-base anchor + lead-offset copy, host teeth E8a, guard clause O8 with teeth t53/t54, measured past `main` |
 | No `CR4.OSFXSR` written anywhere (the IDT's vector-7 gate existed all along — `idt.c`, SIMI Phase 10; `vecstore.c`'s comment saying otherwise is stale), no `xsetbv` | any ring-3 SSE instruction is #UD — every real libc and every Rust binary dies at its first vector op (measured: musl `abort`'s `pxor`, §10.13's step-1 run) | **LANDED** — increment 9: `CR4.OSFXSR\|OSXMMEXCPT` + `CR0.MP` armed on the BSP ahead of the trap gate, `fninit` + 0x1F80 `ldmxcsr`, CPUID refusal by name; host teeth `tests/fpu_enable_host_test.c` (40 checks), guard clause Q with teeth t70–t75, measured past `pxor` into `abort`'s tail (§10.13's step 2). **Remainder:** `xsetbv`/`CR4.OSXSAVE` are absent by decision — named, and dormant with the lazy path |
 | `rt_sigprocmask` (14), `rt_sigaction` (13) and `tkill` (200) refuse | `abort()` cannot die at its first `raise(SIGABRT)`, so its tail runs and faults on `hlt` (`rip=0x805260c`) — the firstuser's run ends there, ten attributed traps deep (§10.13's step 2; `rt_sigaction` newly visible) | **LANDED** — increment 10: the kernel's copy plan with all three refusals by name at the first trap, the sidecar's dispositions/mask/pending and the `SignalKill` delivery; host teeth (98 + 11 checks), guard clause R with teeth t76–t83; measured: both firstuser runs end at their first `tkill` with the kill attribution and NO `[FAULT]` (§10.13's step 2). §10.10's copy-IN gap then stayed as the named wall — retired at **increment 12**: the reply payload carries oldact/oldset back through the staged destination, measured (§10.13's step 3) |
@@ -3584,4 +3497,4 @@ Everything this document asserts about the tree, with its source:
 | A deferred kill's teardown was compiled only — every recorded kill hit a parked task — and a target that parked before the tick could stay pending | the scan-at-teardown claim rested on code that had never run, and a kill could wait indefinitely for the task to be scheduled | **LANDED** — `--selfkill` (gate-only `E7_SELFKILL=1`) makes the stop ask for the running tenant's death; `schedule_ring3` sweeps non-running pending targets and both paths share `proc_deferred_teardown()`; one boot observes the request, the deferral, the teardown and exactly one scan after it (§10.14, `evidence/e7_gate_selfkill.log`) |
 | No reply payload: `read` and the file class never cross back (§10.10's named gap) | the first user cannot open, read, stat, list, rename or prune — its file work never leaves the sidecar (§5.6) | **LANDED** — increments 17–18 (§10.13's step 4): the thirteen census numbers cross through the VFS, the measured flag contract, path/stat/dirent reply plans and the sidecar fd table. The guest workload run is §10.14 increment 19 |
 | No time source across the sidecar's ABI | `clock_gettime` (228) refuses; the no-vDSO proof (§5.5) shows the first user makes this call | **LANDED** — increment 19 (§10.14): REALTIME/MONOTONIC answered by the sidecar through the 16-byte copy-out with the 2026-01-07 epoch pinned, so the gate's filename is the seam's value and not the host's; `tests/linux_personality_host_test.c` pins the reply shape and that a zero count there is not "success with no payload" (unlike `read`) |
-| No console-input state, so a WAITING `poll` cannot answer | a timed `poll` (census ×1) and a read on an empty buffer would either refuse by name or spin the caller's own loop | **LANDED** — increments 23–24: buffered reads plus the pending `Answer::ReadWait`; poll's array IN/OUT plans, `poll_scan`, `Answer::PollWait` with a real deadline (`SYS_SLS_NOW_NS` 329, `next_wait_ns`), and revents rewritten on every reply; guard clause S (§10.13's poll coda) |
+| No console-input state, so a WAITING `poll` cannot answer | a zero-timeout probe is answered (0 events, increment 11), but `poll` (census ×1) with a timeout, and a blocking read, still refuse by name | the input class, unscoped (named §10.13) |

@@ -234,14 +234,6 @@ LEASE_ATTEMPTS="${AEROSLS_FAILOVER_LEASE_ATTEMPTS:-3}"
 # AEROSLS_FAILOVER_ANNOUNCE_ATTEMPTS=1 restores the old single-window
 # behaviour (the smokes' learnlost1/ckptlost1 control teeth pin that).
 ANNOUNCE_ATTEMPTS="${AEROSLS_FAILOVER_ANNOUNCE_ATTEMPTS:-3}"
-# How many times step 10 may start the relaunched leader when the boot
-# process DIES before answering. The 2026-11-10 full-suite run lost the
-# prekillchurn tooth after the churn/adoption had passed because the
-# relaunched Python fake hit ENOMEM during import; the next boot had the
-# memory. Only a process that died is retried -- a live-but-slow boot keeps
-# its single WAIT_BOOT and is never relaunched over. The bound is loud, and
-# AEROSLS_FAILOVER_RELAUNCH_ATTEMPTS=1 pins the old single-attempt RED.
-RELAUNCH_ATTEMPTS="${AEROSLS_FAILOVER_RELAUNCH_ATTEMPTS:-3}"
 
 die()  { echo; echo "ABORT: $*" >&2; exit 2; }
 fail() { echo; echo "FAIL  $*"; exit 1; }
@@ -1304,44 +1296,25 @@ L_LOG="$LOG_DIR/node$leader.log"
 L_PORT=$((HTTP_BASE + leader))
 
 echo "==> relaunching the dead leader node $leader to prove the resurrected-owner conflict resolves"
-boot_attempt=0
-up=0
-while [ "$boot_attempt" -lt "$RELAUNCH_ATTEMPTS" ]; do
-    boot_attempt=$((boot_attempt + 1))
-    echo "   relaunch attempt $boot_attempt/$RELAUNCH_ATTEMPTS"
-    setsid "${L_ARGV[@]}" </dev/null >/dev/null 2>"$LOG_DIR/node$leader.stderr" &
-    NEW_L_PID=$!
-    echo "   relaunched as pid $NEW_L_PID"
-    awk -v n="$leader" -v p="$NEW_L_PID" \
-        '$1==n {print n, p; next} {print}' "$PID_FILE" \
-        > "$PID_FILE.new" && mv "$PID_FILE.new" "$PID_FILE"
+setsid "${L_ARGV[@]}" </dev/null >/dev/null 2>"$LOG_DIR/node$leader.stderr" &
+NEW_L_PID=$!
+echo "   relaunched as pid $NEW_L_PID"
+awk -v n="$leader" -v p="$NEW_L_PID" \
+    '$1==n {print n, p; next} {print}' "$PID_FILE" \
+    > "$PID_FILE.new" && mv "$PID_FILE.new" "$PID_FILE"
 
-    echo "==> waiting for node $leader to come back up (up to ${WAIT_BOOT}s, attempt $boot_attempt/$RELAUNCH_ATTEMPTS)"
-    up=0
-    died=0
-    deadline=$(( $(date +%s) + WAIT_BOOT ))
-    while :; do
-        if get200 "$L_PORT" /api/cluster; then up=1; break; fi
-        if ! kill -0 "$NEW_L_PID" 2>/dev/null; then died=1; break; fi
-        [ "$(date +%s)" -ge "$deadline" ] && break
-        sleep "$POLL"
-    done
-    [ "$up" -eq 1 ] && break
-    if [ "$died" -eq 1 ] && [ "$boot_attempt" -lt "$RELAUNCH_ATTEMPTS" ]; then
-        wait "$NEW_L_PID" 2>/dev/null || true
-        echo "   note: relaunch attempt $boot_attempt/$RELAUNCH_ATTEMPTS died before answering; retrying"
-        sed 's/^/       /' "$LOG_DIR/node$leader.stderr" | tail -5
-        sleep "$POLL"
-        continue
-    fi
-    if [ "$died" -eq 1 ]; then
-        die "node $leader died during relaunch boot after $boot_attempt attempt(s) (bound $RELAUNCH_ATTEMPTS). stderr:
+echo "==> waiting for node $leader to come back up (up to ${WAIT_BOOT}s)"
+up=0
+deadline=$(( $(date +%s) + WAIT_BOOT ))
+while :; do
+    if get200 "$L_PORT" /api/cluster; then up=1; break; fi
+    kill -0 "$NEW_L_PID" 2>/dev/null || die "node $leader died during relaunch boot. stderr:
 $(sed 's/^/       /' "$LOG_DIR/node$leader.stderr" | tail -5)"
-    fi
-    die "relaunched node $leader never answered on port $L_PORT within ${WAIT_BOOT}s (attempt $boot_attempt/$RELAUNCH_ATTEMPTS)"
+    [ "$(date +%s)" -ge "$deadline" ] && break
+    sleep "$POLL"
 done
-[ "$up" -eq 1 ] || die "relaunched node $leader never came up after $boot_attempt attempt(s)"
-echo "   node $leader is back up (attempt $boot_attempt/$RELAUNCH_ATTEMPTS)"
+[ "$up" -eq 1 ] || die "relaunched node $leader never answered on port $L_PORT within ${WAIT_BOOT}s"
+echo "   node $leader is back up"
 
 echo "==> waiting for the resurrected-owner conflict to log and resolve (up to ${WAIT_CLAIM}s; the re-announce period is 1000 ticks)"
 restored=0; rej_s=0; rej_o=0; lw=0

@@ -183,13 +183,6 @@ pub trait Kernel {
     /// Introspect one of the caller's own caps (capability-layer spec §3.5).
     fn cap_info(&self, handle: u32) -> Result<CapInfo, i32>;
 
-    /// Monotonic nanoseconds since boot (`SYS_SLS_NOW_NS`). The sidecar's
-    /// timed console poll uses this for its deadline; fakes default to 0
-    /// and simply never expire a wait.
-    fn now_ns(&self) -> u64 {
-        0
-    }
-
     /// Non-blocking peek: is a message or control event already queued on
     /// `chan`? Returns the head's kind (`CH_KIND_*`, or `CH_KIND_NONE`).
     /// Peeks only — the event is consumed by the next `recv`. This is how
@@ -451,7 +444,6 @@ mod abi {
     const SYS_PLACEMENT_CAN_HOLD: u64 = 327;
     // E7 (Linux ABI Shim Design §3.3): the LINUX-personality create.
     const SYS_LINUX_SPAWN: u64 = 328;
-    const SYS_NOW_NS: u64 = 329;
     const SYS_SIDECAR_PID: u64 = 322;
     const SYS_ENV_STORAGE_ATTACH: u64 = 323;
     const SYS_ENV_STORAGE_RESTORE: u64 = 324;
@@ -955,11 +947,6 @@ mod abi {
     }
 
     #[no_mangle]
-    pub extern "C" fn k_now_ns() -> u64 {
-        unsafe { sls_syscall(SYS_NOW_NS, 0) }
-    }
-
-    #[no_mangle]
     pub extern "C" fn k_yield() {
         unsafe {
             sls_syscall(SYS_YIELD, 0);
@@ -1285,10 +1272,6 @@ mod abi {
     pub struct RealKernel;
 
     impl Kernel for RealKernel {
-        fn now_ns(&self) -> u64 {
-            k_now_ns()
-        }
-
         fn wait(&self, chans: &[u32], timeout_ns: u64) -> Result<(usize, u16), i32> {
             let mut out = WaitOut {
                 idx: 0,
