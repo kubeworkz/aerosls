@@ -1,9 +1,9 @@
 # AeroSLS POSIX Environments Roadmap v0.2 — environment persistence, in-environment networking, and placement
 
-**Status:** Draft for review; P1a–P3 are implemented. §11 Q2 remains open. Two evidence caveats stay visible: the P2 live L5 arm is not recorded as booted, and the P3 adoption guard has one replica branch not exercised live.
+**Status:** Draft for review.
 **Scope:** the three items `AeroSLS-POSIX-Environments-Roadmap-v0.1.md` §12 deferred to v0.2, in the order that section fixed: **(1) environment checkpoint/restore and durable storage**, **(2) networking inside environments**, **(3) cluster placement, migration and failover**. v0.1 §12 is explicit that they are one plan rather than three because each depends on the one before it.
 **Resolves:** the prerequisites v0.1 §10 and §13 named — environment checkpoint/restore is E7's gate, durable storage is what makes an environment worth migrating, and the cluster items are what have to wait for both.
-**Does not do:** design the E7 shim (that is `AeroSLS-Linux-ABI-Shim-Design-v0.1.md`), scope threads, signals or dynamic linking (§9 names their destinations). This is the plan and its findings; implementation records land as addenda in place, the way v0.1's did.
+**Does not do:** design the E7 shim (that is `AeroSLS-Linux-ABI-Shim-Design-v0.1.md`), scope threads, signals or dynamic linking (§9 names their destinations), or build anything. This is the plan; findings land as addenda in place, the way v0.1's did.
 
 ---
 
@@ -3221,7 +3221,7 @@ E7's own gate — *"a static binary doing the first user's actual work, running 
 5. **P3: failover destination (a) or (b)?** Bulk-transfer surviving environments during failover (the PASE-grade answer, a much larger lift) or restore them from their own durable storage on the survivor and report the gap by name (the smaller, consistent-with-`failover.c` first cut). The plan is written to admit either; the decision is a product one about what "a cluster that doesn't lose your environments" has to mean in this window. *(Settled 2026-10: **both, in that order — (b) landed as increments 9 and 11 and stays the classification base; (a) now lands on top of it as the replica path**, because (b) answered "where does the survivor look?" and could not answer "where do the bytes come from when the node holding them is gone?" At declaration time the answer is nowhere — a dead node sends nothing, which is why the transfer cannot be bolted onto the failure and must be a PROACTIVE REPLICA: at the same instant `env_payload_capture_all()` writes the owner's local payload band, the captured record and its payload pages are pushed to the peers over the wire migration already proved (`DSPP_MIGRATE_ENV_BEGIN` carries the record whole; the page family moves 1 KiB fragments with a per-fragment ACK and a retransmit of only what did not land). The receiver stages them and finalizes into a per-environment replica slot — its own band, keyed `(partition, index, seq)` — so the copy is a fact the survivor holds before it needs it. A survivor that later adopts the dead node's partition finds a replica instead of a hole: promotion installs the record into `env_ckpt_table` and the blob into the local payload band, and the replay driver (b) already reuses — create round trip, identity check, pause ledger, pour — brings the environment back WITH its contents. The 24 KiB broadcast never grows: the state tree stays small, and the payload rides the fragment family that already moves 5.5 MiB for migration. A replica that is absent, stale or partial is named by the same three-way classification (b) already reports — refusal over partial application, applied to the replica. The increments and their teeth are in §7's thirteenth-increment addendum;
 the third increment — the survivor PROMOTING a replica instead of finding
 a hole, with (b) as the floor under it — is §7's fifteenth.)*
-6. **§9's interop question — settled by §9.1.** Should a Linux-POSIX task be able to reach the SLS catalog or the integrated DB through a mediated service, and if so, is that service part of the sidecar it already talks to or a second kernel-brokered service in the `kernel.env.console` shape? This is the question that decides whether AeroSLS's POSIX environments are PASE-with-IFS or a sealed compatibility box. §9.1 answers it: a read-only, partition-scoped catalog surface plus `CAT_QUERY`, in the sidecar the task already talks to rather than a second kernel service.
+6. **§9's interop question.** Should a Linux-POSIX task be able to reach the SLS catalog or the integrated DB through a mediated service, and if so, is that service part of the sidecar it already talks to or a second kernel-brokered service in the `kernel.env.console` shape? This is the question that decides whether AeroSLS's POSIX environments are PASE-with-IFS or a sealed compatibility box, and it is deliberately left open here rather than answered by omission.
 
 ---
 
@@ -3279,23 +3279,21 @@ Everything this document asserts about the tree, with its source.
 
 ## Appendix B — Named gaps, each with its destination
 
-**Register checked 2026-11-08.** A row is marked **LANDED** only when the gap is closed in the tree and the cell names where. The two evidence caveats in the status line stay visible rather than being swept into a green row.
-
 | Gap | Consequence if unaddressed | Destination |
 |---|---|---|
-| No environment in the checkpoint region set | every environment dies on reboot; E7 cannot pass its gate (§8) | P1a — **LANDED** |
-| No quiesce before capture | a checkpoint of two sidecars is internally inconsistent | P1a — **LANDED** |
-| No descriptor version/checksum/refusal | a stale checkpoint is half-applied instead of refused | P1a — **LANDED** |
-| The payload is never captured or poured — a replayed environment comes back empty | the file-bytes and shell-variable clauses cannot be asserted; "the environment came back" is measured but "came back with its contents" is not | P1a — **LANDED** (sixth increment) |
-| The pour lands on a freshly replayed sidecar's half-finished boot, so the environment never announces its identity after the resume | the durable guard's post-reboot identity wait times out against a console nothing is running to write to, and a restored environment's boot is erased by its own restore | P1a — **LANDED** (the announce gate) |
-| Environment storage is a RAM region | files do not survive reboot; the durable-storage claim is false | P1b — **LANDED** |
-| aerofs-lite is read-only with a 71 168-byte file cap | a durable tenant filesystem would ship an unusable ceiling | P1b — **LANDED** |
-| Durable storage is not quota-charged to the partition | a tenant's disk is unbounded and unmetered | P1b — **LANDED** |
-| The tenant profile has no network cap at all | the environment cannot be PASE-for-real; E7's socket path stays unroutable | P2 — **LANDED** |
-| No kernel-brokered socket service | reaching networking would require a cross-partition channel, violating LPAR Phase 11 | P2 — **LANDED** |
-| No per-partition bound on a tenant's simultaneous connections | one environment starves its neighbours without tripping the rate limiter | P2 — **LANDED** (mechanism at increments 2–4; the **default** that closes the never-opts-in case at increment 5, §11 Q4: every partition is born at 96 and only the control plane may change it). **Evidence caveat:** the live L5 arm is not recorded as booted |
-| `partition_migrate()` does not move an environment | migration leaves the environment on the source (orphaned or destroyed) | P3 — **LANDED** (increments 3–5) |
-| `failover_recover_from()` adopts ownership only | a dead node's environments vanish with no name in the report | P3 — **LANDED** (report at increment 9; survivor restore at increment 11) |
-| The failover broadcast path is 24 KiB | a 5.5 MiB environment cannot ride it; the gap must be stated, not implied | P3 — **LANDED** ((b) at increments 9 and 11; (a) as the replica path from increment 13 — §11 Q5). **Evidence caveat:** one adoption-guard replica branch was not exercised live |
+| No environment in the checkpoint region set | every environment dies on reboot; E7 cannot pass its gate (§8) | P1a |
+| No quiesce before capture | a checkpoint of two sidecars is internally inconsistent | P1a |
+| No descriptor version/checksum/refusal | a stale checkpoint is half-applied instead of refused | P1a |
+| The payload is never captured or poured — a replayed environment comes back empty | the file-bytes and shell-variable clauses cannot be asserted; "the environment came back" is measured but "came back with its contents" is not | P1a (sixth increment) |
+| The pour lands on a freshly replayed sidecar's half-finished boot, so the environment never announces its identity after the resume | the durable guard's post-reboot identity wait times out against a console nothing is running to write to, and a restored environment's boot is erased by its own restore | P1a (the announce gate) |
+| Environment storage is a RAM region | files do not survive reboot; the durable-storage claim is false | P1b |
+| aerofs-lite is read-only with a 71 168-byte file cap | a durable tenant filesystem would ship an unusable ceiling | P1b |
+| Durable storage is not quota-charged to the partition | a tenant's disk is unbounded and unmetered | P1b |
+| The tenant profile has no network cap at all | the environment cannot be PASE-for-real; E7's socket path stays unroutable | P2 |
+| No kernel-brokered socket service | reaching networking would require a cross-partition channel, violating LPAR Phase 11 | P2 |
+| No per-partition bound on a tenant's simultaneous connections | one environment starves its neighbours without tripping the rate limiter | P2 — the mechanism landed in increments 2–4; the **default** that closes the never-opts-in case is P2's fifth increment (§11 Q4): every partition is born at 96 and only the control plane may change it |
+| `partition_migrate()` does not move an environment | migration leaves the environment on the source (orphaned or destroyed) | P3 *(closed — increments 3–5)* |
+| `failover_recover_from()` adopts ownership only | a dead node's environments vanish with no name in the report | P3 *(report landed as increment 9; the restore half — the survivor replaying what its own durable storage still holds — as increment 11)* |
+| The failover broadcast path is 24 KiB | a 5.5 MiB environment cannot ride it; the gap must be stated, not implied | P3 (destination (a) or (b)) *((b) as built: named by increment 9, restored from durable storage by increment 11; (a) now building as the replica path — §11 Q5, P3 increment 13 onward)* |
 | No thread groups / `clone` / `futex` | Go, threaded CPython and Node are out | unscoped — §9 |
-| No mediated native↔POSIX interop | environments are a sealed box, not PASE-with-IFS | **LANDED** — §9.1 |
+| No mediated native↔POSIX interop | environments are a sealed box, not PASE-with-IFS | §9, §11 Q6 |
