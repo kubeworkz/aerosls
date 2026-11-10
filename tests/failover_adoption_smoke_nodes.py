@@ -480,7 +480,19 @@ def leader_alive(target=None):
                 f"http://127.0.0.1:{port - node_id + nid}/api/health",
                 timeout=0.5):
             return True
-    except Exception:
+    except Exception as e:
+        # A timeout is a busy leader, NOT silence: the health handler can
+        # queue behind the guard's own requests, and counting that as death
+        # made a follower transition while the leader was alive -- the guard
+        # then read the handoff row as "never learned" (the pre-kill
+        # migrate_stable flake). Only a refused/reset connection, i.e. the
+        # port actually gone, advances DEAD_SILENCE.
+        reason = getattr(e, "reason", e)
+        for err in (reason, e):
+            if isinstance(err, (ConnectionRefusedError, ConnectionResetError)):
+                return False
+            if isinstance(err, TimeoutError):
+                return True
         return False
 
 
@@ -1050,12 +1062,12 @@ if mode == "prekillchurn" and not created_preexisting:
                    for r in read_list(extra)):
                 break
             time.sleep(0.05)
-        # Land mid-create, like the live runs: after the -env partition
-        # exists (the guard's env create follows it immediately) but before
-        # its post-create checkpoint gate has counted anything -- node 2's
-        # RX cadence is now paused by the leader deferral, so its gain in
-        # the gate's window is 0 or 1, never the 2 the gate wants.
-        time.sleep(0.3)
+        # Land mid-create, like the live runs: the -env row exists while
+        # the env create is still in flight, so flipping now pauses node 2's
+        # RX cadence before the guard's post-create checkpoint gate can
+        # count its two fresh frames. The old 0.3s sleep let a fast gate
+        # pass first; the guard then killed the pre-churn leader, nobody
+        # adopted, and the prekillchurn tooth flaked post-kill.
         write_leader(2)
 
     threading.Thread(target=churn_thread, daemon=True).start()
