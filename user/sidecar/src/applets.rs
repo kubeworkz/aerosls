@@ -1190,77 +1190,98 @@ pub fn sort<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
 /// `Writable`, waking to `EPIPE` if the reader leaves early
 /// (`seq 10000 | head -n 3`). `FIRST > LAST` prints nothing and exits 0;
 /// an unparsable value or a zero STEP (which would never terminate) exits
-/// 2. v1: non-negative integers only. Data layout: `[phase, i u64 LE,
-/// last u64 LE, step u64 LE, done, pending_len, pending...]` — a line
-/// left by a short pipe write survives the parks, and `done` stops the
-/// loop if advancing past `u64::MAX`.
+/// 2. v1: non-negative integers only. Output is emitted in whole-line
+/// BATCHES of up to `SEQ_BATCH` bytes: one `write(2)` per line is a
+/// syscall storm on a synchronous store, where every write is a block
+/// read-modify-write, an inode write and a flush — and a P1b durable
+/// store adds a page of write-through to each. Data layout: `[i u64 LE,
+/// last u64 LE, step u64 LE, done, buffered_len u16 LE, buffered whole
+/// lines...]` — a batch left by a short pipe write survives the parks,
+/// and `done` stops the loop if advancing past `u64::MAX`.
+const SEQ_BATCH: usize = 4096;
+
+/// The applet state before the buffered lines: i, last, step (8 bytes
+/// each), the done flag, and the buffered byte count (u16 LE) — 27 bytes.
+const SEQ_HDR: usize = 27;
+
+/// Fill `out` with whole `seq` lines from `i` while they fit in one
+/// `SEQ_BATCH`. Returns the next `i` and whether the range ended (an
+/// advance past `u64::MAX` also ends it, instead of wrapping).
+fn seq_fill_batch(out: &mut Vec<u8>, mut i: u64, last: u64, step: u64) -> (u64, bool) {
+    let mut done = false;
+    while i <= last {
+        let text = alloc::format!("{}\n", i);
+        if out.len() + text.len() > SEQ_BATCH {
+            break;
+        }
+        out.extend_from_slice(text.as_bytes());
+        i = match i.checked_add(step) {
+            Some(next) => next,
+            None => {
+                done = true;
+                break;
+            }
+        };
+    }
+    (i, done)
+}
+
 pub fn seq<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
     if ctx.data.is_empty() {
         let (first, last, step) = match parse_seq_args(ctx.argv()) {
             Some(x) => x,
             None => return Step::Exit(2),
         };
-        ctx.data.push(1); // phase
         ctx.data.extend_from_slice(&first.to_le_bytes());
         ctx.data.extend_from_slice(&last.to_le_bytes());
         ctx.data.extend_from_slice(&step.to_le_bytes());
         ctx.data.push(0); // done
-        ctx.data.push(0); // pending_len
+        ctx.data.extend_from_slice(&0u16.to_le_bytes()); // buffered len
     }
     loop {
-        let i = read_u64(&ctx.data, 1);
-        let last = read_u64(&ctx.data, 9);
-        if ctx.data[25] == 1 || i > last {
-            return Step::Exit(0);
-        }
-        if ctx.data[26] > 0 {
-            // Finish a line left by a short write; advancing happens
-            // only once the whole line is out.
-            let pending = ctx.data[27..].to_vec();
-            let plen = ctx.data[26] as usize;
-            match ctx.write_blocking(1, &pending) {
-                WriteBlock::Data(k) => {
-                    if k == plen {
-                        ctx.data.truncate(27);
-                        ctx.data[26] = 0;
-                        advance_seq(&mut ctx.data);
-                    } else {
-                        ctx.data.drain(27..27 + k);
-                        ctx.data[26] -= k as u8;
-                    }
-                }
-                WriteBlock::WouldBlock => return Step::Blocked(BlockReason::Writable(1)),
-                WriteBlock::Err(_) => return Step::Exit(2),
-            }
-        } else {
-            let text = alloc::format!("{}\n", i);
-            let n = text.len();
-            match ctx.write_blocking(1, text.as_bytes()) {
-                WriteBlock::Data(k) => {
-                    if k == n {
-                        advance_seq(&mut ctx.data);
-                    } else {
-                        // A short write (unreachable for lines ≤ 21 B in
-                        // a 4 KiB pipe, but kept correct): stash the tail.
-                        ctx.data[26] = (n - k) as u8;
-                        ctx.data.extend_from_slice(&text.as_bytes()[k..n]);
-                    }
-                }
-                WriteBlock::WouldBlock => return Step::Blocked(BlockReason::Writable(1)),
-                WriteBlock::Err(_) => return Step::Exit(2),
-            }
-        }
-    }
-}
+        let i = read_u64(&ctx.data, 0);
+        let last = read_u64(&ctx.data, 8);
+        let step = read_u64(&ctx.data, 16);
+        let buffered = u16::from_le_bytes([ctx.data[25], ctx.data[26]]) as usize;
 
-/// Advance `seq`'s counter by its step; if the addition would overflow
-/// `u64`, set the `done` flag instead so the next loop stops.
-fn advance_seq(data: &mut Vec<u8>) {
-    let i = read_u64(data, 1);
-    let step = read_u64(data, 17);
-    match i.checked_add(step) {
-        Some(next) => data[1..9].copy_from_slice(&next.to_le_bytes()),
-        None => data[25] = 1,
+        if buffered == 0 {
+            if ctx.data[24] == 1 || i > last {
+                return Step::Exit(0);
+            }
+            // A fresh batch of whole lines. Whole lines matter: a short
+            // write drops the bytes it sent, and a split line would have
+            // to be stitched back together from the middle of the buffer.
+            let mut batch: Vec<u8> = Vec::new();
+            let (next, done) = seq_fill_batch(&mut batch, i, last, step);
+            if batch.is_empty() {
+                return Step::Exit(0);
+            }
+            ctx.data[0..8].copy_from_slice(&next.to_le_bytes());
+            if done {
+                ctx.data[24] = 1;
+            }
+            ctx.data.extend_from_slice(&batch);
+            ctx.data[25..27].copy_from_slice(&(batch.len() as u16).to_le_bytes());
+        }
+
+        // Write the batch whole. A short write retries the remainder and a
+        // full pipe parks the task with the bytes still in `ctx.data` —
+        // the same park/retry contract as the old line-at-a-time producer,
+        // at a few dozen writes instead of one per line.
+        let pending = ctx.data[SEQ_HDR..].to_vec();
+        match ctx.write_blocking(1, &pending) {
+            WriteBlock::Data(k) if k == pending.len() => {
+                ctx.data.truncate(SEQ_HDR);
+                ctx.data[25..27].copy_from_slice(&0u16.to_le_bytes());
+            }
+            WriteBlock::Data(k) => {
+                ctx.data.drain(SEQ_HDR..SEQ_HDR + k);
+                let left = pending.len() - k;
+                ctx.data[25..27].copy_from_slice(&(left as u16).to_le_bytes());
+            }
+            WriteBlock::WouldBlock => return Step::Blocked(BlockReason::Writable(1)),
+            WriteBlock::Err(_) => return Step::Exit(2),
+        }
     }
 }
 
@@ -6679,6 +6700,55 @@ mod tests {
         assert_eq!(parse_seq_args(&av(&["seq", "1", "0", "5"])), None);
         // Negative values are rejected (v1 is non-negative integers).
         assert_eq!(parse_seq_args(&av(&["seq", "-5"])), None);
+    }
+
+    #[test]
+    fn seq_batches_whole_lines_and_keeps_every_byte() {
+        use super::{seq_fill_batch, SEQ_BATCH};
+        let last = 10_000u64;
+        let mut all = Vec::new();
+        let mut i = 1u64;
+        let mut batches = 0usize;
+        loop {
+            let mut b = Vec::new();
+            let (next, done) = seq_fill_batch(&mut b, i, last, 1);
+            if b.is_empty() {
+                break;
+            }
+            assert!(b.len() <= SEQ_BATCH, "a batch must fit one write");
+            assert_eq!(b.last(), Some(&b'\n'), "a batch ends on a line boundary");
+            all.extend_from_slice(&b);
+            batches += 1;
+            i = next;
+            if done || i > last {
+                break;
+            }
+        }
+        let mut want = Vec::new();
+        for n in 1..=last {
+            want.extend_from_slice(alloc::format!("{}\n", n).as_bytes());
+        }
+        assert_eq!(all, want, "every line, in order, exactly once");
+        assert!(
+            batches <= want.len() / SEQ_BATCH + 2,
+            "batched ({} batches for {} bytes), not one write per line",
+            batches,
+            want.len()
+        );
+        assert!(batches > 1, "the range must exercise more than one batch");
+
+        // A range that ends mid-batch, an empty range, and an advance that
+        // would wrap: the last line is emitted, then the loop stops.
+        let mut b = Vec::new();
+        assert_eq!(seq_fill_batch(&mut b, 1, 5, 1), (6, false));
+        assert_eq!(b, b"1\n2\n3\n4\n5\n".to_vec());
+        let mut b = Vec::new();
+        assert_eq!(seq_fill_batch(&mut b, 9, 5, 1), (9, false));
+        assert!(b.is_empty());
+        let mut b = Vec::new();
+        let (_, done) = seq_fill_batch(&mut b, u64::MAX, u64::MAX, 1);
+        assert!(done);
+        assert_eq!(b, alloc::format!("{}\n", u64::MAX).into_bytes());
     }
 
     #[test]
