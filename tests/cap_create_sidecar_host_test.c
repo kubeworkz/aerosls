@@ -133,6 +133,9 @@
                                 * gate's link stub */
 #include "kernel/elf64_load.h"  /* increment 8 step 1: elf64_map_blob is driven
                                  * directly by E8a's mid-page PT_LOAD case */
+/* E7 increment 20's stamp is this test's own, observed by call count (below):
+ * opt out of the header's inert stand-in. */
+#define HOST_STUBS_ENV_CKPT_STAMP_LOCAL 1
 #include "tests/process_host_stubs.h"   /* per_cpu_data (weak), etc. */
 
 #include <stdio.h>

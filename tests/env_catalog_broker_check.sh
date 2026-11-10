@@ -343,10 +343,13 @@ c8=$fail
 # split and this extraction was not — which is why all three C1 checks below
 # failed against a manifest that was in fact correct.
 TENANT="$(fn_body "$MAN" 'fn build_posix_manifest_tenant_profile(')"
+TENANTSHIM="$(fn_body "$MAN" 'pub fn build_posix_manifest_tenant(')"
 SYSTEMMF="$(fn_body "$MAN" 'pub fn build_posix_manifest(')"
-if [ -z "$TENANT" ] || [ -z "$SYSTEMMF" ]; then
+if [ -z "$TENANT" ] || [ -z "$TENANTSHIM" ] || [ -z "$SYSTEMMF" ]; then
     bad "C1. posix_manifest.rs: a profile builder is gone — the boundary cannot be evaluated"
 fi
+hasstr "$TENANTSHIM" 'build_posix_manifest_tenant_profile(' ||
+    bad "C1. tenant manifest: build_posix_manifest_tenant() no longer delegates to the profile helper — the caps checked here would not be the ones it returns"
 hasstr "$TENANT" 'peer: Some("kernel.env.catalog"),' ||
     bad "C1. tenant manifest: no cap peers at kernel.env.catalog — the service would register nobody in a real boot"
 printf '%s\n' "$TENANT" | grep -A2 -F 'name: "catalog"' | grep -qF 'rights: 0x7' ||

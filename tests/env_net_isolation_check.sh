@@ -238,10 +238,13 @@ clause() { [ "$fail" -eq "$1" ] && ok "$2. $3"; }
 # split and the extraction was not — which is why every check below it failed
 # against a manifest that was in fact correct.
 TENANT="$(fn_body "$MF" 'fn build_posix_manifest_tenant_profile(')"
+TENANTSHIM="$(fn_body "$MF" 'pub fn build_posix_manifest_tenant(')"
 SYSTEM="$(fn_body "$MF" 'pub fn build_posix_manifest(')"
 
 # ── N1. the tenant manifest's network cap, and the rotated pin ────────────
 c1=$fail
+hasstr "$TENANTSHIM" 'build_posix_manifest_tenant_profile(' ||
+    bad "N1. tenant manifest: build_posix_manifest_tenant() no longer delegates to the profile helper — the caps checked here would not be the ones it returns"
 hasstr "$TENANT" 'peer: Some("kernel.net.socket"),' ||
     bad "N1. tenant manifest: the network cap's peer must be exactly kernel.net.socket"
 printf '%s\n' "$TENANT" | grep -A2 -F 'name: "network"' | grep -qF 'rights: 0x7' ||

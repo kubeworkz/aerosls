@@ -177,6 +177,42 @@ __attribute__((weak)) uint64_t frame_pool_free_count(void) {
 __attribute__((weak)) void env_service_register(uint16_t kernel_chan_r, uint16_t kernel_chan_w, uint32_t manager_pid) { (void)kernel_chan_r; (void)kernel_chan_w; (void)manager_pid; }
 __attribute__((weak)) int env_service_reply_slot(uint16_t slot) { (void)slot; return 0; }
 
+/* ─── POSIX-Environments E7: the checkpoint record's Linux slot ─────────────
+ * cap.c stamps a newly created Linux child into its environment's checkpoint
+ * record (env_ckpt_linux_task_stamp, kernel/env_ckpt.c). No cap.c host test
+ * links the record layer, and 0 is the answer that layer gives when no record
+ * names the child — the same answer the kernel's own boot-time children get,
+ * because their environment is outside the checkpoint registry. A test that
+ * wants to observe the call opts out (HOST_STUBS_ENV_CKPT_STAMP_LOCAL) and
+ * defines its own. */
+#ifndef HOST_STUBS_ENV_CKPT_STAMP_LOCAL
+__attribute__((weak)) int env_ckpt_linux_task_stamp(uint32_t partition_id,
+                                                    const char* parent_name,
+                                                    const char* child_name,
+                                                    uint64_t entry,
+                                                    uint64_t stack_bottom,
+                                                    uint64_t stack_top,
+                                                    uint32_t cap_count) {
+    (void)partition_id; (void)parent_name; (void)child_name; (void)entry;
+    (void)stack_bottom; (void)stack_top; (void)cap_count;
+    return 0;
+}
+#endif /* !HOST_STUBS_ENV_CKPT_STAMP_LOCAL */
+
+/* ─── E7: the stack high-water scan's primitive ──────────────────────────────
+ * process.c's teardown reports the Linux stack's headroom
+ * (linux_stack_hwm_headroom, kernel/linux_abi.c, which the gate build's
+ * poisoning feeds). Host tests include process.c as source without linking
+ * the personality layer. A never-poisoned region is all "untouched", so the
+ * inert answer is the full span with nothing below it; the report is silent
+ * unless the poison identity was armed, which no host test does. */
+__attribute__((weak)) size_t linux_stack_hwm_headroom(const uint8_t* region,
+                                                      size_t bytes,
+                                                      uint8_t poison) {
+    (void)poison;
+    return region ? bytes : 0;
+}
+
 /* ─── POSIX-Environments E6: per-environment consoles ───────────────────────
  * cap.c's "kernel.*" wiring calls env_console_register() when it wires a
  * tenant's kernel.env.console peer, and console_service_tick() asks
