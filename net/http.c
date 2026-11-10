@@ -3343,8 +3343,14 @@ static int api_partition_env_console_post(const char* body, char* buf, int max,
 
 // ─── POST /api/partition/assign — Gap Remediation Phase F ─────────────────────
 // Body: {"uid": N, "partition_id": N}.
-static int api_partition_assign_post(const char* body, char* buf, int max) {
+static int api_partition_assign_post(const char* body, char* buf, int max,
+                                     SLSRole req_role) {
     JSONBuf j = { buf, 0, max };
+    if (req_role > ROLE_DB_ADMIN) {
+        jb_obj_open(&j,0); jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","requires DB_ADMIN or higher");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
     if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
     struct SLSPartitionAssignRequest req;
     req.uid          = (uint32_t)json_int(body, "uid");
@@ -3357,8 +3363,14 @@ static int api_partition_assign_post(const char* body, char* buf, int max) {
 
 // ─── POST /api/partition/destroy — Gap Remediation Phase F ────────────────────
 // Body: {"partition_id": N}.
-static int api_partition_destroy_post(const char* body, char* buf, int max) {
+static int api_partition_destroy_post(const char* body, char* buf, int max,
+                                      SLSRole req_role) {
     JSONBuf j = { buf, 0, max };
+    if (req_role > ROLE_DB_ADMIN) {
+        jb_obj_open(&j,0); jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","requires DB_ADMIN or higher");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
     if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
     uint32_t partition_id = (uint32_t)json_int(body, "partition_id");
     uint64_t rc = sys_sls_partition_destroy(partition_id);
@@ -3372,8 +3384,14 @@ static int api_partition_destroy_post(const char* body, char* buf, int max) {
 // Body: {"partition_id": N}. `resume` selects sys_sls_partition_resume()
 // instead of sys_sls_partition_pause() -- same one-function-two-routes shape
 // api_tx_post() already established for commit/rollback.
-static int api_partition_pause_post(const char* body, char* buf, int max, int resume) {
+static int api_partition_pause_post(const char* body, char* buf, int max, int resume,
+                                    SLSRole req_role) {
     JSONBuf j = { buf, 0, max };
+    if (req_role > ROLE_DB_ADMIN) {
+        jb_obj_open(&j,0); jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","requires DB_ADMIN or higher");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
     if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
     uint32_t partition_id = (uint32_t)json_int(body, "partition_id");
     uint64_t rc = resume ? sys_sls_partition_resume(partition_id)
@@ -3387,8 +3405,17 @@ static int api_partition_pause_post(const char* body, char* buf, int max, int re
 // Body: {"partition_id": N, "frame_quota": N}. frame_quota=0 means unlimited
 // (frame_pool.h's own convention) -- passing it explicitly re-uncaps a
 // previously-limited partition, not just an omission default.
-static int api_partition_quota_post(const char* body, char* buf, int max) {
+static int api_partition_quota_post(const char* body, char* buf, int max,
+                                    SLSRole req_role) {
     JSONBuf j = { buf, 0, max };
+    if (req_role > ROLE_DB_ADMIN) {
+        jb_obj_open(&j,0); jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","requires DB_ADMIN or higher");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
+    /* The dispatcher's caller check is the other half of this gate: these
+     * routes run in kernel context, where there is no current process for
+     * partition_control_may_act() to inspect (kernel/syscall_dispatch.c). */
     if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
     struct SLSPartitionQuotaSetRequest req;
     req.partition_id = (uint32_t)json_int(body, "partition_id");
@@ -3422,8 +3449,18 @@ static int api_partition_cpuweights_list(char* buf, int max) {
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
 
-static int api_partition_cpuweight_post(const char* body, char* buf, int max) {
+static int api_partition_cpuweight_post(const char* body, char* buf, int max,
+                                        SLSRole req_role) {
     JSONBuf j = { buf, 0, max };
+    if (req_role > ROLE_DB_ADMIN) {
+        jb_obj_open(&j,0); jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","requires DB_ADMIN or higher");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
+    /* POSIX-Environments v0.2 §11 Q4's authority rule, on the CPU weight's
+     * own route: the dispatcher refuses a non-SYSTEM caller, and this path
+     * (kernel context, where that arm has no caller) carries the same
+     * DB_ADMIN gate /api/partitions and the connquota route take. */
     if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
     struct SLSPartitionCpuWeightSetRequest req;
     req.partition_id = (uint32_t)json_int(body, "partition_id");
@@ -3460,8 +3497,17 @@ static int api_partition_storagequotas_list(char* buf, int max) {
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
 
-static int api_partition_storagequota_post(const char* body, char* buf, int max) {
+static int api_partition_storagequota_post(const char* body, char* buf, int max,
+                                           SLSRole req_role) {
     JSONBuf j = { buf, 0, max };
+    if (req_role > ROLE_DB_ADMIN) {
+        jb_obj_open(&j,0); jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","requires DB_ADMIN or higher");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
+    /* Same §11 Q4 rule as the CPU-weight and connquota routes: a disk quota
+     * is a control-plane decision, and the dispatcher's PARTITION_SYSTEM
+     * check has no caller on this kernel-context path. */
     if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
     struct SLSPartitionStorageQuotaSetRequest req;
     req.partition_id = (uint32_t)json_int(body, "partition_id");
@@ -3929,8 +3975,20 @@ static int api_partition_connquotas_list(char* buf, int max) {
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
 }
 
-static int api_partition_connquota_post(const char* body, char* buf, int max) {
+static int api_partition_connquota_post(const char* body, char* buf, int max,
+                                        SLSRole req_role) {
     JSONBuf j = { buf, 0, max };
+    /* POSIX-Environments v0.2 §11 Q4: changing a partition's connection
+     * quota is a control-plane decision, the same weight as creating the
+     * partition. The syscall arm below this requires PARTITION_SYSTEM; this
+     * route runs in kernel context (where that arm has no caller), so its
+     * gate is the role the route already resolves -- the same one
+     * /api/partitions requires. */
+    if (req_role > ROLE_DB_ADMIN) {
+        jb_obj_open(&j,0); jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","requires DB_ADMIN or higher");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
     if (!body) { jb_obj_open(&j,0); jb_str(&j,"error","missing body"); jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos; }
     struct SLSPartitionConnQuotaSetRequest req;
     req.partition_id = (uint32_t)json_int(body, "partition_id");
@@ -6537,7 +6595,10 @@ static void http_route(int conn, char* req) {
         // ── Gap Remediation Phase F: partition create/assign/destroy/pause/
         // resume/quota — every one of these syscalls was already correctly
         // wired at the dispatch layer; this is the first HTTP surface for any
-        // of them. ────────────────────────────────────────────────────────────
+        // of them. All six require DB_ADMIN: the dispatch layer's caller
+        // check has no caller to inspect on this path (kernel context), so
+        // the role gate is what keeps a tenant with a token below DB_ADMIN
+        // off a neighbour's lifecycle. ───────────────────────────────────────
         if (!strcmp(path, "/api/partitions")) {
             blen = api_partition_create_post(body_ptr, resp_body, (int)sizeof(resp_body), req_role);
             http_respond(conn, 200, "application/json", resp_body, blen); return;
@@ -6583,35 +6644,35 @@ static void http_route(int conn, char* req) {
             }
         }
         if (!strcmp(path, "/api/partition/assign")) {
-            blen = api_partition_assign_post(body_ptr, resp_body, (int)sizeof(resp_body));
+            blen = api_partition_assign_post(body_ptr, resp_body, (int)sizeof(resp_body), req_role);
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         if (!strcmp(path, "/api/partition/destroy")) {
-            blen = api_partition_destroy_post(body_ptr, resp_body, (int)sizeof(resp_body));
+            blen = api_partition_destroy_post(body_ptr, resp_body, (int)sizeof(resp_body), req_role);
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         if (!strcmp(path, "/api/partition/pause")) {
-            blen = api_partition_pause_post(body_ptr, resp_body, (int)sizeof(resp_body), 0);
+            blen = api_partition_pause_post(body_ptr, resp_body, (int)sizeof(resp_body), 0, req_role);
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         if (!strcmp(path, "/api/partition/resume")) {
-            blen = api_partition_pause_post(body_ptr, resp_body, (int)sizeof(resp_body), 1);
+            blen = api_partition_pause_post(body_ptr, resp_body, (int)sizeof(resp_body), 1, req_role);
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         if (!strcmp(path, "/api/partition/quota")) {
-            blen = api_partition_quota_post(body_ptr, resp_body, (int)sizeof(resp_body));
+            blen = api_partition_quota_post(body_ptr, resp_body, (int)sizeof(resp_body), req_role);
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         if (!strcmp(path, "/api/partition/cpuweight")) {
-            blen = api_partition_cpuweight_post(body_ptr, resp_body, (int)sizeof(resp_body));
+            blen = api_partition_cpuweight_post(body_ptr, resp_body, (int)sizeof(resp_body), req_role);
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         if (!strcmp(path, "/api/partition/storagequota")) {
-            blen = api_partition_storagequota_post(body_ptr, resp_body, (int)sizeof(resp_body));
+            blen = api_partition_storagequota_post(body_ptr, resp_body, (int)sizeof(resp_body), req_role);
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         if (!strcmp(path, "/api/partition/connquota")) {
-            blen = api_partition_connquota_post(body_ptr, resp_body, (int)sizeof(resp_body));
+            blen = api_partition_connquota_post(body_ptr, resp_body, (int)sizeof(resp_body), req_role);
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         // ── Cluster formation: POST /api/cluster/init, /api/cluster/peer ───────

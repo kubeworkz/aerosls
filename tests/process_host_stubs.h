@@ -44,6 +44,7 @@
 #ifndef PROCESS_HOST_STUBS_H
 #define PROCESS_HOST_STUBS_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "arch/x86/user_paging.h"
@@ -269,6 +270,25 @@ __attribute__((weak)) int env_console_name_index(const char* name, uint32_t* out
  * "the drain ran" stays observable and the link stays closed. */
 __attribute__((weak)) void console_service_deferred_tick(void) { }
 __attribute__((weak)) void cap_irq_drain_pending(void)         { }
+
+/* ─── Q2's stack high-water scan ─────────────────────────────────────────── */
+/* kernel/process.c's teardown report (linux_stack_hwm_report) asks
+ * kernel/linux_abi.c how much of a gate stack's poisoned span the workload
+ * never touched. The three tests that compile process.c in (scheduler_fairness,
+ * syscall_stack_pair, workmgmt_phase4) link neither linux_abi.c nor a stand-in,
+ * so the teardown report failed to link the moment the report was added. No
+ * host test arms linux_stack_poison (it is a GATE-profile field), so the call
+ * is never reached; the scan below is the real one's five lines rather than a
+ * 0, so a test that ever does arm it measures the same bytes the kernel would.
+ * Weak: a test that links kernel/linux_abi.c keeps the strong definition. */
+__attribute__((weak)) size_t linux_stack_hwm_headroom(const uint8_t *region,
+                                                      size_t bytes,
+                                                      uint8_t poison) {
+    size_t i = 0;
+    if (!region) return 0;
+    while (i < bytes && region[i] == poison) i++;
+    return i;
+}
 
 /* NB: the frame-pool allocators (allocate_physical_ram_frame_for_partition,
  * allocate_contiguous_frames_for_partition, free_contiguous_frames_for_

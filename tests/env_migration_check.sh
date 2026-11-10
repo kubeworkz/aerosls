@@ -657,7 +657,18 @@ fi
 # to announce [env-id]. Without that wait the pour lands on a half-booted
 # sidecar, its own boot announcement is erased by its own restore, and the
 # identity the attach stream is keyed by can never be written.
-if ! has kernel/env_payload.c "env_console_identity_seen"; then
+#
+# The clause pins the GATE, not the symbol. env_console_identity_seen has four
+# call sites in env_payload.c: the readiness sample below, and three
+# `announced=%d` diagnostics in the timeout lines. A bare symbol grep is
+# satisfied by the diagnostics alone, so this clause stayed green after the
+# wait stopped gating readiness — and its tooth could not bite, because the
+# mutation it made (the call site replaced) left the other three in place.
+# Two lines make the gate: the sample that asks, and the test that winds
+# `ready` back when the answer is still no. Both are required; either one gone
+# is the same defect.
+if ! has kernel/env_payload.c "int announced = env_console_identity_seen(rec->partition_id," ||
+   ! has kernel/env_payload.c "if (ready && !announced) ready = 0;"; then
     bad "AE. the pour's posture gate no longer waits for the destination's [env-id] announcement — the captured bytes would land on a sidecar still inside its first boot, erasing the very announcement that identifies it"
 elif ! has tests/env_payload_host_test.c "env_console_identity_seen"; then
     bad "AE. the payload host test no longer drives the identity wait — the gate's behaviour would be asserted by nobody"

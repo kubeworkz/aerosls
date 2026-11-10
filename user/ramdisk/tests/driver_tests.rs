@@ -3,10 +3,13 @@
 //! and drives it from the client end, then tears the driver down with
 //! `kill_driver` (which makes the driver's wait return and the thread join).
 
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+
 use aerosls_kernel_sim::{FakeClient, FakeKernel, DRIVER_CONSOLE, DRIVER_STORAGE};
+use aerosls_proto::kabi::{CapInfo, GrantedCap, Kernel, RecvResult, SendCap};
 use aerosls_proto::*;
 use aerosls_ramdisk::endpoints::EndpointSet;
-use aerosls_ramdisk::kapi::{GrantedCap, SendCap};
 use aerosls_ramdisk::server::{self, Device};
 
 /// Deterministic, non-trivial storage content: blocks of 512 bytes.
@@ -29,9 +32,142 @@ fn boot_driver(fake: FakeKernel) -> std::thread::JoinHandle<()> {
     for h in fake.initial_chan_caps() {
         eps.adopt(h);
     }
+    boot_driver_with(fake, dev, eps)
+}
+
+/// Boot a driver over any `Kernel` implementation. The plain tests use
+/// `FakeKernel` directly; `window_one_enforced` wraps it in `GatedKernel`.
+fn boot_driver_with<K: Kernel + Send + 'static>(
+    kernel: K,
+    dev: Device,
+    mut eps: EndpointSet,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        let _ = server::run(&fake, &mut eps, &dev);
+        let _ = server::run(&kernel, &mut eps, &dev);
     })
+}
+
+/// A one-shot gate for the driver's reply to a chosen tag.
+///
+/// `window_one_enforced` needs its second request attempted while the flush
+/// is still outstanding. The driver is otherwise free to send the flush reply
+/// first — which is legal, reopens the window, and makes the assertion a
+/// scheduling race. `park` signals that the reply has been reached, then
+/// blocks until the test has attempted the second send.
+#[derive(Default)]
+struct GateState {
+    reached: bool,
+    released: bool,
+}
+
+struct ReplyGate {
+    state: Mutex<GateState>,
+    cv: Condvar,
+}
+
+impl ReplyGate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(GateState::default()),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn park(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.reached = true;
+        self.cv.notify_all();
+        while !state.released {
+            state = self.cv.wait(state).unwrap();
+        }
+    }
+
+    fn wait_until_parked(&self) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut state = self.state.lock().unwrap();
+        while !state.reached {
+            let now = Instant::now();
+            assert!(
+                now < deadline,
+                "driver did not reach the flush-reply gate within 5s"
+            );
+            let (guard, _) = self.cv.wait_timeout(state, deadline - now).unwrap();
+            state = guard;
+        }
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.released = true;
+        self.cv.notify_all();
+    }
+}
+
+/// A transparent `Kernel` wrapper that parks the driver's reply to `gated_tag`.
+struct GatedKernel {
+    inner: FakeKernel,
+    gate: Arc<ReplyGate>,
+    gated_tag: u32,
+}
+
+impl Kernel for GatedKernel {
+    fn wait(&self, chans: &[u32], timeout_ns: u64) -> Result<(usize, u16), i32> {
+        self.inner.wait(chans, timeout_ns)
+    }
+
+    fn recv(&self, chan: u32, buf: &mut [u8], slots: &mut [GrantedCap]) -> Result<RecvResult, i32> {
+        self.inner.recv(chan, buf, slots)
+    }
+
+    fn send(
+        &self,
+        chan: u32,
+        tag: u32,
+        flags: u16,
+        payload: &[u8],
+        caps: &[SendCap],
+        timeout_ns: u64,
+    ) -> Result<(), i32> {
+        if flags & F_REPLY != 0 && tag == self.gated_tag {
+            self.gate.park();
+        }
+        self.inner.send(chan, tag, flags, payload, caps, timeout_ns)
+    }
+
+    fn close(&self, chan: u32, reason: u16, detail: u32) -> Result<(), i32> {
+        self.inner.close(chan, reason, detail)
+    }
+
+    fn cap_info(&self, handle: u32) -> Result<CapInfo, i32> {
+        self.inner.cap_info(handle)
+    }
+
+    fn poll(&self, chan: u32) -> Result<u16, i32> {
+        self.inner.poll(chan)
+    }
+}
+
+fn boot_driver_gated(fake: FakeKernel, gate: Arc<ReplyGate>) -> std::thread::JoinHandle<()> {
+    let (base, len) = fake.storage_info();
+    let dev = Device {
+        storage_slot: DRIVER_STORAGE,
+        storage_base: base,
+        storage_len: len,
+        storage_writable: false,
+    };
+    let mut eps = EndpointSet::new(DRIVER_CONSOLE);
+    for h in fake.initial_chan_caps() {
+        eps.adopt(h);
+    }
+    boot_driver_with(
+        GatedKernel {
+            inner: fake,
+            gate,
+            gated_tag: 2,
+        },
+        dev,
+        eps,
+    )
 }
 
 fn frame(ty: u16) -> [u8; 16] {
@@ -494,7 +630,8 @@ fn aliasing_grant_uses_memmove_semantics() {
 #[test]
 fn window_one_enforced() {
     let (fake, client) = FakeKernel::new(storage_image(8), 1);
-    let t = boot_driver(fake);
+    let gate = Arc::new(ReplyGate::new());
+    let t = boot_driver_gated(fake, gate.clone());
 
     client.send(0, 1, 0, &frame(RD_INFO), &[]).unwrap();
     let mut buf = [0u8; 64];
@@ -502,9 +639,18 @@ fn window_one_enforced() {
     let _ = client.recv(0, &mut buf, &mut caps).unwrap();
 
     // A second request while the first is outstanding is rejected (window=1,
-    // capability-layer spec §4.3).
+    // capability-layer spec §4.3). Park the driver immediately before its
+    // flush reply, so the window cannot reopen before the second send: without
+    // that synchronization the driver may answer first and this assertion is
+    // a scheduling race.
     client.send(0, 2, 0, &frame(RD_FLUSH), &[]).unwrap();
-    assert!(client.send(0, 3, 0, &frame(RD_INFO), &[]).is_err());
+    gate.wait_until_parked();
+    let second = client.send(0, 3, 0, &frame(RD_INFO), &[]);
+    gate.release();
+    assert!(
+        second.is_err(),
+        "window=1 accepted a second request before the flush reply"
+    );
     let (_, status, _) = recv_status(&client, 0, &mut buf, &mut caps);
     assert_eq!(status, RD_OK);
     // Window reopened: next request works.

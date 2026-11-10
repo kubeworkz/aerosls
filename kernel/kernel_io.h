@@ -116,15 +116,25 @@ void console_reset_line(void);
  * host builds never set the flag.
  *
  * While the port is owned, kernel TX is DEFERRED, not discarded: the bytes
- * are buffered (bounded, 2 KiB) and written at release, when loopback is
- * off. Dropping them was worse than it looked — a window is not a property
- * of the writer, so ANY process printing during the demo lost its line, and
- * a guard reading the log could not tell a swallowed line from one that was
- * never written. Measured live: the E3 multi-instance boot's two tenant
- * POSIX sidecars each emitted their four boot diagnostics inside the irqtest
- * serial window, and the boot check failed on a machine that had reported
- * the very property it asserts. The overflow (a writer exceeding the buffer
- * inside one window) is counted and reported on the way out, never silently. */
+ * are buffered (bounded, SERIAL_LB_DEFER_CAP) and written at release, when
+ * loopback is off. Dropping them was worse than it looked — a window is not a
+ * property of the writer, so ANY process printing during the demo lost its
+ * line, and a guard reading the log could not tell a swallowed line from one
+ * that was never written. Measured live: the E3 multi-instance boot's two
+ * tenant POSIX sidecars each emitted their four boot diagnostics inside the
+ * irqtest serial window, and the boot check failed on a machine that had
+ * reported the very property it asserts. The overflow (a writer exceeding the
+ * buffer inside one window) is counted and reported on the way out, never
+ * silently — and tests/e3_multi_env_boot_check.sh turns that report into a
+ * named evidence-loss failure, so a future cap that is too small reddens a
+ * check instead of quietly deleting evidence. */
+/* The bound. 2048 was measured too small: a multi-environment E3 boot dropped
+ * 1116 bytes — exactly the tenants' `[POSIX] aero state=` lines — and the boot
+ * check reported a `2/3` boot failure for a log failure. 16 KiB is 5x the
+ * largest measured demand (>= 3.1 KiB) and replayed both batches untouched on
+ * the same boot. Lives in the header so the host test asserts the REAL bound
+ * instead of keeping a second copy that can drift from it. */
+#define SERIAL_LB_DEFER_CAP 16384
 /* Weak declarations: the state lives in kernel_io.c, but arch TUs that
  * consume the hooks (cap_io_write's MCR hand-off) are also linked by host
  * tests WITHOUT kernel_io.c — the same host-link pattern cap.c's arch

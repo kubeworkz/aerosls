@@ -42,6 +42,20 @@
 # this guard's own comment used to get wrong: pointed at the SHIPPED ISO (no
 # tenant spawns) this check must FAIL — it is not a SKIP.
 #
+# ─── Deferral is bounded, and the bound is its own clause ───────────────────
+# Deferral makes the evidence drop-proof only up to the kernel's ring
+# (SERIAL_LB_DEFER_CAP). One E3 boot overflowed the old 2048-byte ring and the
+# kernel said so on the wire — `[serial] loopback window overflow: 0x45c
+# byte(s) dropped` — and this check reported that boot as `live rootfs: 2/3`,
+# i.e. as a boot failure the machine had never reported. The ring is 16 KiB now
+# (16x the observed loss, and the 16 KiB boot replayed both tenants' batches
+# untouched), and ANY overflow line is treated as its own named failure —
+# serial evidence lost — BEFORE the count is read as an outcome. A dropped byte
+# makes this log a LOWER BOUND: it cannot distinguish two live instances from
+# three-with-one-line-thrown-away, so the count is not evidence at that point.
+# Unlike the deferral itself this clause is checked, not assumed; the teeth
+# drive it with a canned log carrying the kernel's exact line.
+#
 # Prerequisite: the E3 ISO, which is NOT the shipped image — build it with
 #   make x86-iso-e3
 # (init compiled --features e3_envs, packed into sidecars_e3.cpio, embedded in
@@ -91,7 +105,10 @@ QPID=$!
 # console-derived: each is a SYS_SLS_SERIAL_WRITE (165) straight to the UART,
 # per line, under the kernel TX lock, and kernel TX during a loopback window is
 # no longer discarded (deferred and replayed at release — kernel/kernel_io.c),
-# so this evidence is now drop-proof at both ends.
+# so this evidence is drop-proof up to the kernel's ring bound. Past that bound
+# the log is a lower bound, not an absence, and this check says so by name
+# instead of reporting a `2/3` boot verdict (the evidence-integrity clause
+# below reads the kernel's overflow line before the count means anything).
 #
 # The marker's absence is still stated in the verdict, because silently
 # tolerating it would hide a real init regression behind a shrug.
@@ -116,9 +133,29 @@ done
 kill "$QPID" 2>/dev/null || true
 wait "$QPID" 2>/dev/null || true
 
+# ─── Evidence integrity, read before the count is allowed to mean anything ──
+# The kernel prints this once, at replay, carrying the byte count it could not
+# hold. Its presence proves the log lost machine output, so every later count is
+# a LOWER BOUND rather than a measurement of the boot.
+overflow_line="$(grep -aE '\[serial\] loopback window overflow: 0x[0-9a-fA-F]+ byte\(s\) dropped' "$LOG" 2>/dev/null | head -1)"
+evidence_lost=0
+[ -n "$overflow_line" ] && evidence_lost=1
+
 if [ "$booted" -eq 0 ]; then
     live_n=$(grep -acE "$live_re" "$LOG" 2>/dev/null); live_n=${live_n:-0}
-    if [ "$qemu_alive" -eq 0 ]; then
+    if [ "$evidence_lost" -eq 1 ]; then
+        # Takes precedence over BOTH other shapes: a truncated log cannot be
+        # read as a boot outcome, and reporting `2/3` here is the exact lie this
+        # clause exists to stop (the machine may well have brought every
+        # instance up; the kernel dropped its proof on the wire).
+        echo "FAIL  serial evidence was lost during a loopback window — the live-rootfs" >&2
+        echo "      count is a LOWER BOUND, not a boot outcome (the machine may still have" >&2
+        echo "      brought every instance up; the kernel dropped its proof on the wire):" >&2
+        echo "      $overflow_line" >&2
+        echo "      live rootfs seen: $live_n/3 (>= 3 is the property, so this boot is unproven)" >&2
+        [ "$qemu_alive" -eq 0 ] && \
+            echo "      note: QEMU also exited before the gate opened — see the tail below" >&2
+    elif [ "$qemu_alive" -eq 0 ]; then
         echo "FAIL  QEMU exited before both tenant environments came up (live rootfs: $live_n/3)" >&2
     else
         echo "FAIL  within ${WINDOW_S}s: 3 live rootfs never seen (live rootfs: $live_n/3)" >&2
@@ -129,6 +166,17 @@ if [ "$booted" -eq 0 ]; then
 fi
 
 fail=0
+
+# Evidence first: if the kernel dropped bytes, none of the lines below is a
+# complete account of the boot, so the check fails by name before crediting
+# anything it happened to keep. This is the clause that keeps a `2/3` reading
+# from being reported as a boot failure when it is a log failure.
+if [ "$evidence_lost" -eq 1 ]; then
+    echo "FAIL  serial evidence was lost during a loopback window: $overflow_line" >&2
+    echo "      the log is a LOWER BOUND on what the machine reported — its losses land on" >&2
+    echo "      whichever writer was mid-line, so the surviving lines are not a full account" >&2
+    fail=1
+fi
 
 # No allocation may have failed — every tenant region must come from the pool.
 if grep -aqE "\[INIT\] E3 env [0-9]+: alloc_region FAILED" "$LOG"; then
@@ -200,6 +248,10 @@ fi
 # at the gate (see tests/e3_multi_env_boot_check_smoke.sh arm 'two-live').
 echo "ok:   $live_n live-rootfs lines (>= 3: system POSIX + both tenants; the system's"
 echo "      watchdog respawn reports one more, which is why this can read 4)"
+
+if [ "$evidence_lost" -eq 0 ]; then
+    echo "ok:   no serial evidence was dropped (the loopback deferral ring did not overflow)"
+fi
 
 if [ "$fail" -ne 0 ]; then
     echo "FAIL  E3 multi-instance boot check failed" >&2

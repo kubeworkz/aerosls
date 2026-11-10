@@ -67,7 +67,7 @@ int main(void) {
         }
         CHECK(admitted == 50, "s1: with no quota configured, every distinct connection for partition 5 is admitted");
         CHECK(tcp_partition_get_conn_usage(5) == 50, "s1: partition 5's live usage count reflects all 50 attributed connections");
-        CHECK(tcp_partition_get_conn_quota(5) == 0, "s1: partition 5's quota reads back 0 (unlimited), the default");
+        CHECK(tcp_partition_get_conn_quota(5) == 0, "s1: a partition that was never born bounded reads back 0 (unlimited) -- the birth default is scenario 7b's");
         for (int conn_id = 0; conn_id < 50; conn_id++) tcp_conn_release(conn_id);
         CHECK(tcp_partition_get_conn_usage(5) == 0, "s1: releasing every attributed connection brings usage back to 0");
     }
@@ -136,6 +136,51 @@ int main(void) {
               "s6: a conn_id at/past TCP_INBOUND_MAX_CONNS (the outbound-reserved range) is rejected -- this module never attributes outbound slots");
         tcp_conn_release(TCP_INBOUND_MAX_CONNS + 1);   // also must not crash
         CHECK(1, "s6: releasing an out-of-range conn_id does not crash");
+    }
+
+    /* ── Scenario 7b (v0.2 §11 Q4): a partition is BORN at the tenant default,
+     * and the default is ENFORCED -- not just stored. The live guard's clause
+     * N19b proves the birth line on a booted node; this proves the arithmetic
+     * the number was chosen for, without QEMU. ──────────────────────────── */
+    {
+        fake_set_partition(700, 40);
+        tcp_partition_born_bounded(40);
+        CHECK(tcp_partition_get_conn_quota(40) == PARTITION_TENANT_CONN_QUOTA_DEFAULT,
+              "s7b: a partition born bounded reads back the tenant default, not 0");
+        CHECK(PARTITION_TENANT_CONN_QUOTA_DEFAULT < TCP_INBOUND_MAX_CONNS / 4,
+              "s7b: the default is below a quarter of the inbound pool -- four tenants at their cap cannot consume it all (the derivation in partition.h)");
+
+        /* conn_ids 200..303: never used by an earlier scenario (100-105, 150,
+         * 400 and 450 are), so every id here is a fresh attribution -- an
+         * already-attributed conn_id would answer 1 without counting, which
+         * is the idempotence scenario 4 proves, not this one. */
+        int admitted = 0, denied = 0;
+        for (int i = 0; i < PARTITION_TENANT_CONN_QUOTA_DEFAULT + 8; i++) {
+            if (tcp_conn_attribute(200 + i, 700)) admitted++; else denied++;
+        }
+        CHECK(admitted == PARTITION_TENANT_CONN_QUOTA_DEFAULT,
+              "s7b: exactly the default number of connections are admitted before the birth quota refuses one");
+        CHECK(denied == 8, "s7b: every connection past the default is denied -- the birth quota is enforced by the admit path");
+        for (int i = 0; i < PARTITION_TENANT_CONN_QUOTA_DEFAULT + 8; i++) tcp_conn_release(200 + i);
+
+        /* The operator's escape hatch survives: 0 still means explicitly
+         * unlimited, which is what N16 pins at the source. */
+        CHECK(tcp_partition_set_conn_quota(40, 0) == 0, "s7b: an operator can still set 0 (explicitly unlimited)");
+        CHECK(tcp_conn_attribute(200, 700) == 1, "s7b: with 0 set, admission resumes -- the default changes the starting value, not the rule");
+        tcp_conn_release(200);
+
+        /* A reused slot is a NEW tenant: the id P3 destroys and re-creates is
+         * born bounded again, never inheriting the previous occupant's cap. */
+        CHECK(tcp_partition_set_conn_quota(40, 3) == 0, "s7b: setup -- the previous occupant had a tight quota of 3");
+        tcp_partition_born_bounded(40);
+        CHECK(tcp_partition_get_conn_quota(40) == PARTITION_TENANT_CONN_QUOTA_DEFAULT,
+              "s7b: a reused partition id is born bounded at the default, not at the old occupant's quota");
+
+        tcp_partition_born_bounded(PARTITION_SYSTEM);
+        CHECK(tcp_partition_get_conn_quota(PARTITION_SYSTEM) == 0,
+              "s7b: PARTITION_SYSTEM is exempt -- the control plane keeps the whole pool");
+        tcp_partition_born_bounded(99999);   /* out of range: must not index out of bounds */
+        CHECK(1, "s7b: an out-of-range id is refused quietly rather than indexing out of bounds");
     }
 
     /* ── Scenario 7: the defensive out-of-range partition_id guard --

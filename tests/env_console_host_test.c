@@ -57,6 +57,7 @@
 #include "kernel/env_console.h"
 #include "kernel/kernel_io.h"
 #include "tests/process_host_stubs.h"   /* per_cpu_data (weak), etc. */
+#include "tests/env_ckpt_host_stubs.h"    /* cap.c stamps Linux children into the record layer */
 
 #include <stdio.h>
 #include <stdlib.h>

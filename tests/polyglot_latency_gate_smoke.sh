@@ -490,6 +490,86 @@ fi
 mv -f "$SNAP_LISP4" "$LISP_GEN"
 trap - EXIT
 
+# ─── teeth: a shm sqrt two-clock clamp is the floor, not a dead split ──────
+# The split guard derives transport = total - compute across two clock
+# domains, so on the one compute-dominant leg (shm sqrt: compute ~85% of its
+# total, ~27us of transport against a total whose own stddev is ~65us) the
+# subtraction can saturate and clamp to 0 with both fields live. CI run
+# 41853350556 hit exactly that (total 132200 ns against compute 151000 ns)
+# and the liveness check read the clamp as a dead split, reddening
+# kernel-guards on a tree whose polyglot job passed.
+#
+# The guard now admits a clamp only where the saturation is itself visible
+# (total < compute), only within a quarter of the reported compute, and only
+# on shm sqrt. These three teeth pin all three sides of that rule: the clamp
+# is read as the floor where it is real, and the same clamp is still a dead
+# split on the same bench over tcp and when the gap outgrows the budget. Each
+# plants a clamp as a fixed fraction of the measured total, so the tooth's
+# shape does not drift with host speed.
+SIDECAR=user/polyglot/src/bin/wasm_sidecar.rs
+[ -f "$SIDECAR" ] || { bad "missing $SIDECAR"; exit 1; }
+
+# clamp_tooth <transport> <num> <den> <pass|fail> <label> — rewrite the
+# sidecar's split print so <transport>'s SQRT leg reports transport 0 and a
+# compute <num>/<den> above its measured total, then rebuild, run the e2e and
+# assert the verdict. The mutation is anchored on the one transport-derivation
+# line print_bench_split owns (the sweep uses a different call), so it cannot
+# leak into another leg's numbers.
+clamp_tooth() {
+    local transport="$1" num="$2" den="$3" expect="$4" label="$5"
+    local snap="${SIDECAR}.clamp.bak" out rc
+    cp "$SIDECAR" "$snap" || { bad "cannot snapshot $SIDECAR"; exit 1; }
+    trap "mv -f \"$snap\" \"$SIDECAR\" 2>/dev/null; rm -f \"$snap\"" EXIT
+    # (j) the clamp itself: transport 0 (the saturated subtraction) and the
+    #     compute reported as a fixed fraction over the measured total.
+    sed -i "s@let median_transport = median_transport_ns(total_cy, compute_ns);@let median_transport = if tag == \"SQRT\" \&\& transport == \"$transport\" { 0 } else { median_transport_ns(total_cy, compute_ns) }; let cp50 = if tag == \"SQRT\" \&\& transport == \"$transport\" { p50_ns + p50_ns * $num / $den } else { cp50 };@" "$SIDECAR"
+    if cmp -s "$SIDECAR" "$snap"; then
+        bad "tooth: the $label mutation did not apply — the print pattern no longer matches, so this tooth is testing nothing."
+        mv -f "$snap" "$SIDECAR"; trap - EXIT
+        return
+    fi
+    if ! build_sidecars; then
+        bad "tooth: the $label mutation does not compile — the tooth is invalid, not a guard check."
+        mv -f "$snap" "$SIDECAR"; trap - EXIT
+        return
+    fi
+    out="$(run_e2e)"; rc=$?
+    mv -f "$snap" "$SIDECAR"; trap - EXIT
+    if [ "$expect" = pass ]; then
+        if [ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep -q "\[floor\] BENCH_SQRT on $transport"; then
+            ok "tooth: $label — the clamp is read as the floor on $transport and the verdict stays green"
+        else
+            bad "tooth: $label — the clamp was not read as a floor (rc=$rc, floor line $(printf '%s\n' "$out" | grep -c "\[floor\] BENCH_SQRT on $transport") time(s)):"
+            printf '%s\n' "$out" | grep -aE 'BENCH_SQRT|split is dead|\[floor\]' | head -6 | sed 's/^/        /'
+        fi
+    else
+        if [ "$rc" -ne 0 ] && printf '%s\n' "$out" | grep -q 'split is dead: compute_ns=[0-9]* transport_ns=0'; then
+            ok "tooth: $label — the clamp is still a dead split, named as such"
+        else
+            bad "tooth: $label — the clamp was NOT reported as a dead split (rc=$rc):"
+            printf '%s\n' "$out" | grep -aE 'BENCH_SQRT|split is dead|\[floor\]' | head -6 | sed 's/^/        /'
+        fi
+    fi
+}
+
+echo
+echo "=== tooth: a shm sqrt two-clock clamp is read as the floor, not a dead split ==="
+clamp_tooth shm 1 20 pass "shm sqrt clamp within budget"
+
+echo
+echo "=== tooth: the same clamp on tcp sqrt is still a dead split (the floor is shm-sqrt-only) ==="
+clamp_tooth tcp 1 20 fail "tcp sqrt clamp"
+
+echo
+echo "=== tooth: a shm sqrt clamp beyond a quarter of the compute is still a dead split ==="
+clamp_tooth shm 1 2 fail "shm sqrt clamp over budget"
+
+# The teeth above leave the last mutated binary in place; rebuild the pristine
+# sidecars so every later tooth runs against the real tree.
+if ! build_sidecars; then
+    bad "the sidecar does not rebuild after the clamp teeth were removed"
+fi
+
 # ─── ninth tooth: the split-aware drift warning ───────────────────────────
 # The CI drift step compares each leg's median AND compute/transport split
 # against the previous run's baseline (tests/polyglot_drift_check.py) and
