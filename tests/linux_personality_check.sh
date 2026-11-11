@@ -911,7 +911,7 @@ if grep -qF 'linux_fd_write_plan(LINUX_POLL, a)' "$PHUT" && \
    grep -qF 'linux_fd_reply_plan(LINUX_POLL, a)' "$PHUT" && \
    grep -qF 'linux_reply_shape_ok(LINUX_POLL, 2, 3 * LINUX_POLLFD_BYTES)' "$PHUT" && \
    grep -qF 'LINUX_POLL_MAX_FDS + 1' "$PHUT" && \
-   grep -qF '0x00007FFFFFFFF000ULL' "$PHUT"; then
+   grep -qF '0x00007FFFFFFFFFF8ULL' "$PHUT"; then
     ok "S4. the host test drives both plans against the REAL kernel/linux_abi.c — the in/out crossings, nfds 0, the cap, the NULL array, the span crossing the user max, and the reply shape"
 else
     bad "S4. the host test no longer drives poll's plans — the crossings and refusals would be argued from this guard's greps alone, every branch reachable only at boot"

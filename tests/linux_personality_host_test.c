@@ -1045,7 +1045,7 @@ int main(void)
               "a NULL array with nfds > 0 is EFAULT before any post — the "
               "      first trap refuses it, the sidecar never sees it");
 
-        a[0] = 0x00007FFFFFFFF000ULL;   /* 2 fds: 16 bytes cross the max */
+        a[0] = 0x00007FFFFFFFFFF8ULL;   /* 2 fds: 16 bytes cross the max */
         CHECK(linux_fd_write_plan(LINUX_POLL, a).refuse == -LINUX_EFAULT &&
               linux_fd_reply_plan(LINUX_POLL, a).refuse == -LINUX_EFAULT,
               "an array span crossing the user-canonical max is EFAULT — "
