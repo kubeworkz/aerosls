@@ -1,0 +1,6 @@
+drill=1
+iso=sls_operating_system_e3_drill.iso
+payloads=1
+payload_skips=0
+tooth=none
+partition=1

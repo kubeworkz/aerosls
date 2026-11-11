@@ -818,7 +818,13 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                     // No wired channels: spin (v1 debug only).
                     continue;
                 }
-                let _ = RealKernel.wait(&chans[..n], TIMEOUT_NONE);
+                // E7 increment 24: a parked poll's finite deadline must
+                // wake this loop even when no channel event arrives. The
+                // helper returns TIMEOUT_NONE when nothing is pending on a
+                // clock (blocking console reads and POSIX's -1), so the
+                // quiesce park keeps its old shape in every other case.
+                let timeout = crate::linux::next_wait_ns(&RealKernel);
+                let _ = RealKernel.wait(&chans[..n], timeout);
             }
         }
     }

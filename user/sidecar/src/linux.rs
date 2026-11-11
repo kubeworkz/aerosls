@@ -24,6 +24,14 @@
 //!     in this kernel), GET_FS/GET_GS (the value lives in the kernel's field,
 //!     not here, and neither is in the census), unknown cmd words — is
 //!     answered ENOSYS with its number logged, honest by the rule below;
+//!   - `read`/`poll` (0/7 — E7 increment 24, the input class's waiting
+//!     half): a console read with no buffered input PARKS its request
+//!     until typed input (or the console's close) arrives; poll scans the
+//!     caller's fd array against the task's table and the console, answers
+//!     at once when a descriptor is ready or the timeout is 0, and
+//!     otherwise holds the array until readiness or the deadline. A
+//!     rewritten array crosses back on every poll that has one — a timeout
+//!     answers zero revents, never an invented readiness;
 //!   - `write` (1, the fd class's byte crossing — E7 increment 5): the
 //!     bytes live in the CHILD's address space (a separate cr3 by §3.5),
 //!     so the KERNEL copied them out into the message behind this
@@ -72,10 +80,15 @@
 //!     first-trap ladder repeated as this side's twin, and the kernel's
 //!     verdict re-checks every grant against its own span and its own
 //!     cursors, so neither end is load-bearing alone;
+//!   - `munmap` (11, the mem class's last seam — E7 increment 25,
+//!     §5.4): the sidecar answers WHETHER (a page-aligned, nonzero,
+//!     non-overflowing range inside the stamped span and at or above
+//!     the break), and the kernel's page tables decide which pages are
+//!     PRESENT — a double unmap is success, the frames return to the
+//!     partition, and neither cursor moves (a freed range is never
+//!     re-handed in v1);
 //!   - everything else — `open`/`close`/`lseek` and the rest of the fd
-//!     class (Phase 2 §3-§4), `munmap` (frames return through the
-//!     partition at the task's teardown; unmapping through the channel
-//!     is its own seam), any mprotect whose prot is not
+//!     class (Phase 2 §3-§4), any mprotect whose prot is not
 //!     W|X (real permission changes are not landed), `clock_gettime`
 //!     (needs the clock plus
 //!     a child-buffer write) and any number outside the census —
@@ -90,7 +103,8 @@
 use aerosls_blockcache::BufferAlloc;
 use aerosls_proto::kabi::{GrantedCap, Kernel};
 use aerosls_vfs::aerofs::FileType;
-use aerosls_vfs::{CharNode, DirEnt, Errno, Stat, Vfs}; /* E7 increment 5: the fd
+use aerosls_vfs::{CharNode, DirEnt, Errno, PollFd, Stat, Vfs,
+    POLLIN, POLLNVAL, POLLOUT}; /* E7 increment 5: the fd
                               * table's console slot — service() holds the
                               * handle because only the entry loop has the
                               * CharNode. Step 4 (the file class): the VFS
@@ -163,6 +177,10 @@ const LINUX_TKILL: u64 = 200;
 /// numbers (addr/len/prot/flags) so "the allocator asked for X and this
 /// shim answered Y" is read off the line, never reconstructed.
 const LINUX_MMAP: u64 = 9;
+/// munmap(11) — E7 increment 25 (§5.4's last memory seam): the 11 arm
+/// answers WHETHER over the ledger's span and break; the kernel's page
+/// tables decide which pages are present, so a double unmap is success.
+const LINUX_MUNMAP: u64 = 11;
 /// clock_gettime (228) — the census's vDSO-backstopped row, and a REAL
 /// trap here because this kernel ships no vDSO (§5.5). The reply is one
 /// Linux `struct timespec` (two LE i64s) at args[1]; the kernel's plan
@@ -237,6 +255,23 @@ const LINUX_RENAME: u64 = 82;
 const LINUX_MKDIR: u64 = 83;
 const LINUX_UNLINK: u64 = 87;
 const LINUX_GETDENTS64: u64 = 217;
+
+/// poll (7) — E7 increment 24: the array's shape is the kernel's too
+/// (kernel/linux_abi.h's LINUX_POLL_MAX_FDS / LINUX_POLLFD_BYTES). The
+/// Rust side cannot include that header, so the literals repeat as twins:
+/// struct pollfd is fd: i32, events: i16, revents: i16; 16 entries cap
+/// one call so neither end's frame can grow unbounded.
+const LINUX_POLL: u64 = 7;
+const LINUX_POLL_MAX_FDS: usize = 16;
+const LINUX_POLLFD_BYTES: usize = 8;
+const LINUX_POLL_PAYLOAD_BYTES: usize = LINUX_POLL_MAX_FDS * LINUX_POLLFD_BYTES;
+
+/// What a parked task's pending exchange is (E7 increment 24): the
+/// request has been read and its reply is deliberately NOT sent yet —
+/// the child is parked awaiting it, so no second request can arrive.
+const PENDING_NONE: u8 = 0;
+const PENDING_READ: u8 = 1;
+const PENDING_POLL: u8 = 2;
 
 /// The path cap — the twin of kernel/linux_abi.h's LINUX_PATH_CAP and
 /// the shim's NAMED divergence from PATH_MAX 4096 (the kernel refuses a
@@ -317,8 +352,9 @@ const E_NOTEMPTY: i32 = -19;
 const E_ROFS: i32 = -17;
 const E_SPIPE: i32 = -18;
 const E_NAMETOOLONG: i32 = -20;
-const E_AGAIN: i32 = -3;      /* CAP_EAGAIN  -> -EAGAIN (read with no
-                               * console-input state — the input class)  */
+const E_AGAIN: i32 = -3;      /* CAP_EAGAIN  -> -EAGAIN (a read with
+                               * nothing buffered; console reads park
+                               * since increment 24)                   */
 const E_NOSPC: i32 = -8;      /* CAP_ENOSPC  -> -ENOSPC                   */
 const E_TABLEFULL: i32 = -4;  /* CAP_ETABLEFULL -> -ENFILE                */
 
@@ -367,6 +403,16 @@ enum Answer {
     /// never leave this side, and payload_bound is the per-number bound
     /// over it).
     ReplyBytes(u64, usize, [u8; FD_PAYLOAD_CAP]),
+    /// read(0) on the console with no buffered input (E7 increment 24):
+    /// hold the request until input arrives or the console closes. The
+    /// count is the caller's (already clamped by the kernel). `service`
+    /// keeps it pending and answers from the bytes that actually arrive.
+    ReadWait(usize),
+    /// poll(7) with a timeout that allows waiting (increment 24): the fd
+    /// array snapshot, its byte length, and the absolute deadline in
+    /// nanoseconds (0 = POSIX's -1, wait forever). `service` re-scans the
+    /// array on every pass; readiness or the deadline answers it.
+    PollWait([u8; LINUX_POLL_PAYLOAD_BYTES], usize, u64),
     /// exit_group: reap the task, reply nothing.
     Exit,
     /// E7 increment 10 (the signal seam): a signal's DEFAULT ACTION ran —
@@ -554,9 +600,10 @@ fn answer(
          * errno outside its tolerated set aborts the task). The timeout
          * word is Linux's int in args[2], so the low 32 bits decide.
          *
-         * timeout 0 — the probe — answers 0 EVENTS: this shim has no
-         * console-input readiness state (§10.13's named input class), so
-         * "nothing ready" is the whole truth it can tell, and
+         * timeout 0 — the probe — answers 0 EVENTS: this shim can read
+         * buffered console input but has no waiting/poll readiness state
+         * (§10.13's named input class), so "nothing ready" is the whole
+         * truth it can tell, and
          * UNDER-reporting readiness can only send a caller back to its
          * own loop — never into an action built on readiness nobody
          * claimed. The array is never read and revents never written: a
@@ -568,16 +615,13 @@ fn answer(
          * a WAITING poll (ms > 0 or the -1 of forever) is ENOSYS by
          * name — the TWIN of the kernel's first-trap refusal (guard
          * clause S; mprotect's both-ends posture over a timeout word):
-         * waiting needs a wake against input state that does not exist,
+         * waiting needs a wake against input readiness state that does not exist,
          * and answering 0 to a 5000 ms poll would make the caller spin
          * its five seconds inside its own loop on a lie. */
-        7 => {
-            if (args[2] as i32) == 0 {
-                Answer::Reply(0, STATUS_OK)
-            } else {
-                Answer::Reply(0, E_NOSYS)
-            }
-        }
+        /* poll (7) is no longer answered here: E7 increment 24 routed it
+         * through answer_file, where the fd table and the console live. A
+         * poll that somehow reached this pure arm without a task's table
+         * falls to the default ENOSYS rather than inventing readiness. */
         /* arch_prctl (158, LSC_MSR, §5.3): the POLICY side of the one
          * kernel semantic — mirror of kernel/linux_abi.h's bound (the Rust
          * side cannot include that header, so the literals are repeated,
@@ -689,16 +733,43 @@ fn answer(
                 }
             }
         }
+        /* munmap (11, LSC_MEM — E7 increment 25, §5.4's last memory
+         * seam): the sidecar answers WHETHER, and its ladder is the
+         * kernel's first-trap refusal repeated as this side's own twin
+         * (guard clause X pins both). The kernel's page tables are the
+         * truth about which pages are PRESENT, so a double unmap is
+         * success; no mapping ledger is kept here. v1's policy: a
+         * page-aligned, nonzero, non-overflowing range inside the
+         * stamped span and at or above the current break — the break's
+         * pages belong to brk. Either cursor moving would be a
+         * re-hand, so neither does. */
+        11 => {
+            let (addr, len) = (args[0], args[1]);
+            let len_r = match len.checked_add(0xFFF) {
+                Some(v) if len != 0 => v & !0xFFFu64,
+                _ => return Answer::Reply(0, E_INVAL),
+            };
+            if addr & 0xFFF != 0 {
+                Answer::Reply(0, E_INVAL)
+            } else if addr < brk.base || addr > brk.limit
+                   || len_r > brk.limit - addr {
+                Answer::Reply(0, E_INVAL)
+            } else if addr < brk.cur {
+                Answer::Reply(0, E_INVAL)
+            } else {
+                Answer::Reply(0, STATUS_OK)
+            }
+        }
         /* mprotect (10, LSC_MEM — §5.4's W^X): only the refusal exists
          * in v1 — simultaneous write+execute (prot & 0x2 & 0x4) is
          * refused EPERM, the twin of linux_mprotect_refuses_wx (the
          * kernel refuses it first-trap, before any post; both ends
          * exist so neither alone is the load-bearing refusal — guard
          * clause N3 pins both). Any other prot is ENOSYS with the
-         * number logged: real permission changes are not landed, and
-         * munmap's channel-side seam is its own increment (frames
-         * return through the partition at the task's teardown) — a
-         * fake grant here would be a page the kernel never mapped. */
+         * number logged: real permission changes are not landed. (The
+         * mem class's last seam, munmap (11), sits beside this arm at
+         * increment 25; a fake grant here would still be a page the
+         * kernel never mapped.) */
         10 => {
             if args[2] & 0x2 != 0 && args[2] & 0x4 != 0 {
                 Answer::Reply(0, E_PERM)
@@ -996,6 +1067,13 @@ fn alloc_fd(fds: &mut [FdSlot], kind: u8, vfs_fd: u32, flags: u32) -> Result<u64
 fn expected_req_len(num: u64, args: &[u64; 6]) -> usize {
     match num {
         LINUX_WRITE => LINUX_SYSCALL_REQ_BYTES + args[2] as usize,
+        /* poll: the caller's whole array rides behind the header. An nfds
+         * above the cap is the kernel's first-trap EINVAL; this side keeps
+         * the arithmetic total by expecting the plain header for it (the
+         * arm then refuses the shape EINVAL rather than reading bytes it
+         * did not expect). */
+        LINUX_POLL if args[1] <= LINUX_POLL_MAX_FDS as u64 =>
+            LINUX_SYSCALL_REQ_BYTES + args[1] as usize * LINUX_POLLFD_BYTES,
         LINUX_RT_SIGACTION if args[1] != 0 => LINUX_SYSCALL_REQ_BYTES + SIGACT_BYTES,
         LINUX_RT_SIGPROCMASK if args[1] != 0 => LINUX_SYSCALL_REQ_BYTES + SIGSET_BYTES as usize,
         _ => LINUX_SYSCALL_REQ_BYTES,
@@ -1037,6 +1115,11 @@ fn payload_bound(num: u64, args: &[u64; 6], len: usize) -> bool {
             && len <= FD_PAYLOAD_CAP,
         LINUX_GETDENTS64 => args[1] != 0 && len <= DENTS_PAYLOAD_CAP,
         LINUX_CLOCK_GETTIME => args[1] != 0 && len == TIMESPEC_BYTES,
+        /* poll: the full array comes back so the kernel can rewrite the
+         * caller's revents in place; a partial array would leave the tail
+         * carrying pre-call garbage. */
+        LINUX_POLL => args[1] != 0 && args[1] <= LINUX_POLL_MAX_FDS as u64
+            && len == args[1] as usize * LINUX_POLLFD_BYTES,
         _ => false,
     }
 }
@@ -1046,10 +1129,12 @@ fn payload_bound(num: u64, args: &[u64; 6], len: usize) -> bool {
 /// (cap_of), vfs results into the reply's own shape. `fds` is the
 /// caller's local copy of the task's table, written back by service
 /// like brk's ledger; `vt` is this task's VFS task. The console kind
-/// keeps its rule: write performs on the handle (service's own arm),
-/// read answers EAGAIN — this v1 has no console-input state (§10.13's
-/// named input class), and under-reporting readiness sends a caller
-/// back to its own loop rather than into an action built on a lie.
+/// keeps its rule: write performs on the handle (service's own arm);
+/// read drains whatever the entry loop has already pushed into the
+/// console, and answers EAGAIN when the buffer is empty. Waiting for
+/// input is still the named input-class remainder (§10.13): this arm
+/// never fabricates readiness or holds the sidecar's single service
+/// thread on a future byte.
 fn answer_file<K: Kernel, A: BufferAlloc>(
     num: u64,
     args: &[u64; 6],
@@ -1057,6 +1142,10 @@ fn answer_file<K: Kernel, A: BufferAlloc>(
     vt: u32,
     vfs: &mut Vfs<K, A>,
     payload: &[u8],
+    console: &CharNode,
+    now_ns: u64,  /* increment 24: the monotonic clock a poll deadline
+                   * is measured from (the KERNEL's SYS_SLS_NOW_NS; a fake
+                   * kernel's 0 simply never expires a finite wait) */
     gate: bool,   /* increment 21: this is the gate profile's first user */
 ) -> Answer {
     /* The descriptor each fd-numbered arm looks up once: EBADF by the
@@ -1068,6 +1157,25 @@ fn answer_file<K: Kernel, A: BufferAlloc>(
         fd_slot(fds, fd).copied().ok_or(E_BADF)
     }
     match num {
+        /* poll (7, LSC_FD — E7 increment 24, the waiting half): the
+         * KERNEL copied the caller's pollfd array in (linux_fd_write_plan)
+         * and will copy the rewritten array back into the same span. This
+         * side decides readiness: the task's fd table names each
+         * descriptor, the console's own read_ready() answers its slots,
+         * and the VFS answers a file-backed slot with its POLLIN/POLLOUT/
+         * POLLNVAL word. A ready descriptor or a zero timeout answers at
+         * once; otherwise Answer::PollWait parks the array until service()
+         * sees readiness or the deadline passes. Only revents is written —
+         * the caller's events mask is never changed, and a negative fd is
+         * ignored with revents 0 (POSIX's own rule). */
+        LINUX_POLL => poll_answer(fds, console, payload, args, now_ns,
+            |vfs_fd, events| {
+                let mut pf = [PollFd { fd: vfs_fd, events, revents: 0 }];
+                match vfs.poll(vt, &mut pf) {
+                    Ok(_) => Some(pf[0].revents),
+                    Err(_) => None,
+                }
+            }),
         /* write (1): the file-class half of increment 5's console write.
          * The bytes arrived behind the request (the kernel's copy-out),
          * the fd table decides the destination, and the VFS's own write
@@ -1086,14 +1194,18 @@ fn answer_file<K: Kernel, A: BufferAlloc>(
             Ok(_) => Answer::Reply(0, E_NOSYS),
             Err(x) => Answer::Reply(0, x),
         },
-        /* read (0): file data crosses back as the reply's PAYLOAD —
+        /* read (0): data crosses back as the reply's PAYLOAD —
          * count-truth, the twin of write's attach (the kernel stages
          * the destination at the first trap and copies only within the
          * clamp; the deliver's rax is the payload's own length). The
          * clamp rides IN the description (args[2]), so header, payload
-         * and the count the task sees are one truth. */
+         * and the count the task sees are one truth. A console fd reads
+         * the entry loop's already-buffered input; empty input is EAGAIN
+         * (or EOF once the console channel has closed), never a invented
+         * zero-byte success. */
         LINUX_READ => match slot_of(fds, args[0]) {
-            Ok(s) if s.kind == FD_KIND_CONSOLE => Answer::Reply(0, E_AGAIN),
+            Ok(s) if s.kind == FD_KIND_CONSOLE =>
+                console_read_answer(console, args[2] as usize),
             Ok(s) => {
                 let want = (args[2] as usize).min(FD_PAYLOAD_CAP);
                 /* E7 increment 21: the continuation's evidence. The offset
@@ -1355,6 +1467,156 @@ fn answer_file<K: Kernel, A: BufferAlloc>(
     }
 }
 
+/// The console half of read(0): the entry loop has already pushed whatever
+/// arrived from the kernel's console channel into this node, so the arm can
+/// answer from bytes that exist now. A zero-byte request is a success even
+/// when the buffer is empty; an empty buffer PARKS the request, and a closed console
+/// channel is EOF. The kernel's reply shape carries the count as both rax and
+/// payload length, so `n` is the whole truth here as well.
+fn console_read_answer(console: &CharNode, want: usize) -> Answer {
+    let want = want.min(FD_PAYLOAD_CAP);
+    if want == 0 {
+        return Answer::ReplyBytes(0, 0, [0u8; FD_PAYLOAD_CAP]);
+    }
+    /* E7 increment 24: no buffered input means the request WAITS — the
+     * child is parked awaiting this exchange, so parking the request here
+     * is the blocking read POSIX describes, not a busy loop and not a
+     * fabricated zero-byte EOF. A closed console is ready (EOF), so the
+     * read below answers 0 for it. */
+    if !console.read_ready() {
+        return Answer::ReadWait(want);
+    }
+    let mut buf = [0u8; FD_PAYLOAD_CAP];
+    match console.read(&mut buf[..want]) {
+        Ok(n) => Answer::ReplyBytes(n as u64, n, buf),
+        Err(e) => Answer::Reply(0, cap_of(e)),
+    }
+}
+
+/// E7 increment 24: the absolute deadline of a poll wait. POSIX's -1 is
+/// "no deadline" (0 here — the sentinel poll_expired never treats as
+/// elapsed), and any non-negative millisecond count becomes now plus that
+/// many nanoseconds, saturating rather than wrapping a huge ask.
+fn poll_deadline(now_ns: u64, timeout_ms: i32) -> u64 {
+    if timeout_ms < 0 {
+        0
+    } else {
+        now_ns.saturating_add((timeout_ms as u64).saturating_mul(1_000_000))
+    }
+}
+
+/// Has a poll wait's deadline passed? A zero deadline is POSIX's forever:
+/// no elapsed clock can expire it.
+fn poll_expired(deadline: u64, now_ns: u64) -> bool {
+    deadline != 0 && now_ns >= deadline
+}
+
+/// Scan one pollfd array against a task's fd table and the console,
+/// rewriting each entry's revents. Pure over the table, the console and
+/// the closure that answers a VFS-backed descriptor (`Some(revents)` from
+/// Vfs::poll, `None` for a descriptor the VFS cannot name — POLLNVAL).
+///
+/// POSIX's rules this implements literally: a negative fd is ignored
+/// (revents 0, not an error); a descriptor with no slot is POLLNVAL
+/// whatever was asked; the console reads ready when input is buffered or
+/// the channel has closed, and never blocks a write; events the caller did
+/// not ask for are not reported, except the error bits the VFS's own poll
+/// already treats as always-reported. Returns the count of fds with
+/// non-zero revents — the value Linux returns.
+fn poll_scan<F>(
+    fds: &[FdSlot],
+    arr: &mut [u8; LINUX_POLL_PAYLOAD_BYTES],
+    nfds: usize,
+    console: &CharNode,
+    file_revents: &mut F,
+) -> usize
+where
+    F: FnMut(u32, u16) -> Option<u16>,
+{
+    let mut ready = 0usize;
+    for i in 0..nfds {
+        let off = i * LINUX_POLLFD_BYTES;
+        let fd = i32::from_le_bytes([
+            arr[off], arr[off + 1], arr[off + 2], arr[off + 3],
+        ]);
+        let events = u16::from_le_bytes([arr[off + 4], arr[off + 5]]);
+        let revents: u16 = if fd < 0 {
+            0 /* POSIX: a negative fd is ignored */
+        } else {
+            match fd_slot(fds, fd as u64) {
+                None => POLLNVAL,
+                Some(s) if s.kind == FD_KIND_CONSOLE => {
+                    let mut r = 0u16;
+                    if events & POLLIN != 0 && console.read_ready() {
+                        r |= POLLIN;
+                    }
+                    /* A console's write side never blocks. */
+                    if events & POLLOUT != 0 {
+                        r |= POLLOUT;
+                    }
+                    r
+                }
+                Some(s) => match file_revents(s.vfs_fd, events) {
+                    Some(r) => r,
+                    None => POLLNVAL,
+                },
+            }
+        };
+        arr[off + 6..off + 8].copy_from_slice(&revents.to_le_bytes());
+        if revents != 0 {
+            ready += 1;
+        }
+    }
+    ready
+}
+
+/// The poll(7) answer for one request (E7 increment 24): readiness now, a
+/// zero-timeout snapshot, or a parked wait with its deadline. `payload` is
+/// the array the kernel copied in; nfds and the timeout come from the
+/// forwarded words, never from the payload's length alone. The full array
+/// crosses back on every reply that has fds, because the kernel writes it
+/// into the caller's own span and a partial array would leave the tail
+/// carrying pre-call revents.
+fn poll_answer<F>(
+    fds: &[FdSlot],
+    console: &CharNode,
+    payload: &[u8],
+    args: &[u64; 6],
+    now_ns: u64,
+    mut file_revents: F,
+) -> Answer
+where
+    F: FnMut(u32, u16) -> Option<u16>,
+{
+    let nfds = args[1] as usize;
+    if nfds > LINUX_POLL_MAX_FDS {
+        return Answer::Reply(0, E_INVAL);
+    }
+    let len = nfds * LINUX_POLLFD_BYTES;
+    if payload.len() < len {
+        /* The service range already made the attach length the kernel
+         * plan's twin; a mismatch here is malformed, never read past. */
+        return Answer::Reply(0, E_NOSYS);
+    }
+    let mut arr = [0u8; LINUX_POLL_PAYLOAD_BYTES];
+    arr[..len].copy_from_slice(&payload[..len]);
+    let ready = poll_scan(fds, &mut arr, nfds, console, &mut file_revents);
+    let timeout_ms = args[2] as i32;
+    if ready > 0 || timeout_ms == 0 {
+        if nfds == 0 {
+            Answer::Reply(0, STATUS_OK)
+        } else {
+            /* ReplyBytes' buffer is the fd class's general 1024-byte
+             * payload; only the poll array's own len crosses. */
+            let mut out = [0u8; FD_PAYLOAD_CAP];
+            out[..len].copy_from_slice(&arr[..len]);
+            Answer::ReplyBytes(ready as u64, len, out)
+        }
+    } else {
+        Answer::PollWait(arr, len, poll_deadline(now_ns, timeout_ms))
+    }
+}
+
 /// Translate a Linux open-flag word into (vfs flags, cloexec, dir-open
 /// selector) — the MEASURED contract (qemu -strace on the real
 /// candidate), pure so the guard suite can pin it without a boot:
@@ -1498,6 +1760,18 @@ struct LinuxTask {
                     /* its console bytes are mirrored to the serial log  */
                     /* so the work-half measurement is not trapped in an */
                     /* environment console nobody attached to           */
+    /* E7 increment 24 (the waiting half): a console read or a timed poll
+     * whose reply is deliberately NOT sent yet. The child is parked in
+     * the kernel awaiting this exchange, so `pending` also means "no
+     * further request can arrive"; `service` checks readiness and the
+     * deadline before it polls the channel. Nothing here is inherited by
+     * a reused slot (track() resets all of it). */
+    pending: u8,      /* PENDING_NONE / PENDING_READ / PENDING_POLL       */
+    pending_tag: u32, /* the tag the reply must echo                            */
+    pending_arg: u64, /* read: the clamped count; poll: nfds                    */
+    pending_len: usize, /* poll: array bytes (nfds * 8; 0 for a pure sleep)     */
+    pending_deadline: u64, /* poll: absolute ns, 0 = wait forever              */
+    pending_bytes: [u8; LINUX_POLL_PAYLOAD_BYTES], /* poll: the snapshot     */
 }
 
 const MAX_LINUX_TASKS: usize = 8;
@@ -1519,6 +1793,12 @@ fn tasks() -> &'static mut [LinuxTask; MAX_LINUX_TASKS] {
         brk_mtop: 0,
         sig: SigState::new(),
         gate: false,
+        pending: PENDING_NONE,
+        pending_tag: 0,
+        pending_arg: 0,
+        pending_len: 0,
+        pending_deadline: 0,
+        pending_bytes: [0; LINUX_POLL_PAYLOAD_BYTES],
     }; MAX_LINUX_TASKS];
     unsafe { &mut TABLE }
 }
@@ -1578,6 +1858,15 @@ pub fn track(
          * next child, which is the stale-state failure this reset exists
          * to refuse (proc_clear_resume_state's discipline, sidecar side). */
         t.sig = SigState::new();
+        /* A reused slot must not inherit a parked exchange either: the
+         * tag belongs to a child that is gone, and answering it would put
+         * a reply on the next child's channel. Same discipline as sig. */
+        t.pending = PENDING_NONE;
+        t.pending_tag = 0;
+        t.pending_arg = 0;
+        t.pending_len = 0;
+        t.pending_deadline = 0;
+        t.pending_bytes = [0; LINUX_POLL_PAYLOAD_BYTES];
         /* The fd table is born with the task: fds 0, 1, 2 — its console,
          * registered at spawn like every process's stdio. All three
          * accept writes (a tty is bidirectional; write(0) is not EBADF
@@ -1605,6 +1894,28 @@ pub fn append_wait(chans: &mut [u32], n: &mut usize) {
             *n += 1;
         }
     }
+}
+
+/// E7 increment 24: the nearest finite poll deadline, in nanoseconds from
+/// `now`, or TIMEOUT_NONE when no parked poll has one (a blocking console
+/// read and POSIX's -1 poll wait on readiness alone). The entry loop hands
+/// this to `Kernel::wait`, so a timed poll wakes the sidecar when it
+/// expires; without it a 5000 ms poll would sleep until some unrelated
+/// channel woke the loop, which is not the timeout the caller asked for.
+/// The kernel clock is ~10 ms granular, so a short deadline lands within
+/// one tick — a resolver, not a real-time guarantee.
+pub fn next_wait_ns<K: Kernel>(k: &K) -> u64 {
+    let now = k.now_ns();
+    let mut best = aerosls_proto::kabi::TIMEOUT_NONE;
+    for t in tasks().iter() {
+        if t.used && t.pending == PENDING_POLL && t.pending_deadline != 0 {
+            let rem = t.pending_deadline.saturating_sub(now);
+            if rem < best {
+                best = rem;
+            }
+        }
+    }
+    best
 }
 
 /// Little-endian read — the wire is the kernel's x86-64 struct, so LE is
@@ -1768,6 +2079,27 @@ fn enosys_log(tag_num: u32, child: &[u8], extra: &[u8]) {
     }
 }
 
+/// A parked child's endpoint went away while its request was pending
+/// (E7 increment 24): the exchange can never be answered, so the slot goes
+/// with the task — the recv CLOSE arm's own teardown, reached through a
+/// PEEK because the pending request means `service` deliberately skips the
+/// recv that would consume the close. Without this, a child killed while
+/// blocked on a console read or a poll would leave a used slot and its VFS
+/// task behind forever.
+fn reap_pending_if_closed<K: Kernel, A: BufferAlloc>(
+    k: &K,
+    i: usize,
+    vfs: &mut Vfs<K, A>,
+) {
+    if let Ok(kind) = k.poll(tasks()[i].ch_r) {
+        if kind == aerosls_proto::CH_KIND_CLOSE {
+            let vt = tasks()[i].vfs_task;
+            let _ = vfs.exit_task(vt);
+            tasks()[i].used = false;
+        }
+    }
+}
+
 /// Drain every tracked child's channel: answer what is queued, reap what
 /// exited. One non-blocking recv per child per pass — the same poll shape
 /// as the console arm of the entry loop — so it is safe to call from the
@@ -1783,6 +2115,10 @@ pub fn service<K: Kernel, A: BufferAlloc>(
     console: &CharNode,
     vfs: &mut Vfs<K, A>,
 ) {
+    /* One clock sample per pass (E7 increment 24): every parked poll's
+     * deadline below is measured against the same now, so two waits that
+     * expire together resolve in the same pass. */
+    let now_ns = k.now_ns();
     for i in 0..MAX_LINUX_TASKS {
         if !tasks()[i].used {
             continue;
@@ -1793,6 +2129,78 @@ pub fn service<K: Kernel, A: BufferAlloc>(
         let mut name_buf = [0u8; 48];
         let nlen = tasks()[i].name_len;
         name_buf[..nlen].copy_from_slice(&tasks()[i].name[..nlen]);
+
+        /* E7 increment 24 (the waiting half): a parked exchange has no
+         * queued request — the child is blocked in the kernel awaiting
+         * this reply — so readiness and the deadline are checked BEFORE
+         * the recv. Still not resolvable: stay parked (a finite poll's
+         * wake comes from the entry loop's next_wait_ns deadline; a
+         * blocking read's from console input on the channel set). */
+        match tasks()[i].pending {
+            PENDING_READ => {
+                let tag = tasks()[i].pending_tag;
+                let want = tasks()[i].pending_arg as usize;
+                match console_read_answer(console, want) {
+                    Answer::ReadWait(_) => {} /* still empty: stay parked */
+                    Answer::ReplyBytes(ret, len, bytes) => {
+                        tasks()[i].pending = PENDING_NONE;
+                        enosys_log(LINUX_READ as u32, &name_buf[..nlen],
+                                   b" ok + payload (waited)\n");
+                        reply_bytes(k, ch_w, tag, LINUX_READ, ret,
+                                    &bytes[..len]);
+                    }
+                    Answer::Reply(ret, status) => {
+                        tasks()[i].pending = PENDING_NONE;
+                        enosys_log(LINUX_READ as u32, &name_buf[..nlen],
+                                   b" read wait failed\n");
+                        reply(k, ch_w, tag, LINUX_READ, ret, status);
+                    }
+                    _ => {
+                        tasks()[i].pending = PENDING_NONE;
+                        reply(k, ch_w, tag, LINUX_READ, 0, E_NOSYS);
+                    }
+                }
+                if tasks()[i].pending != PENDING_NONE {
+                    reap_pending_if_closed(k, i, vfs);
+                    continue;
+                }
+            }
+            PENDING_POLL => {
+                let tag = tasks()[i].pending_tag;
+                let nfds = tasks()[i].pending_arg as usize;
+                let len = tasks()[i].pending_len;
+                let deadline = tasks()[i].pending_deadline;
+                let vt = tasks()[i].vfs_task;
+                let fds_copy = tasks()[i].fds;
+                let mut arr = tasks()[i].pending_bytes;
+                let ready = poll_scan(&fds_copy, &mut arr, nfds, console,
+                    &mut |vfs_fd, events| {
+                        let mut pf = [PollFd { fd: vfs_fd, events,
+                                              revents: 0 }];
+                        match vfs.poll(vt, &mut pf) {
+                            Ok(_) => Some(pf[0].revents),
+                            Err(_) => None,
+                        }
+                    });
+                if ready > 0 || poll_expired(deadline, now_ns) {
+                    tasks()[i].pending = PENDING_NONE;
+                    if len == 0 {
+                        enosys_log(LINUX_POLL as u32, &name_buf[..nlen],
+                                   b" poll timeout (no fds)\n");
+                        reply(k, ch_w, tag, LINUX_POLL, 0, STATUS_OK);
+                    } else {
+                        enosys_log(LINUX_POLL as u32, &name_buf[..nlen],
+                                   b" poll wake\n");
+                        reply_bytes(k, ch_w, tag, LINUX_POLL,
+                                    ready as u64, &arr[..len]);
+                    }
+                } else {
+                    reap_pending_if_closed(k, i, vfs);
+                    continue;
+                }
+            }
+            _ => {}
+        }
 
         /* The recv buffer now carries the fd class's attached bytes
          * behind the header: 72 + the mirror of LINUX_FD_WRITE_CHUNK.
@@ -1894,9 +2302,9 @@ pub fn service<K: Kernel, A: BufferAlloc>(
             LINUX_READ | LINUX_WRITE | LINUX_OPEN | LINUX_CLOSE | LINUX_STAT
             | LINUX_LSTAT | LINUX_LSEEK | LINUX_FCNTL | LINUX_FSYNC
             | LINUX_FTRUNCATE | LINUX_RENAME | LINUX_MKDIR | LINUX_UNLINK
-            | LINUX_GETDENTS64 =>
+            | LINUX_GETDENTS64 | LINUX_POLL =>
                 answer_file(num, &args, &mut fds, tasks()[i].vfs_task, vfs,
-                            payload, tasks()[i].gate),
+                            payload, console, now_ns, tasks()[i].gate),
             _ => answer(num, &args, &fds, &mut mem, &mut sigstate, payload),
         };
         tasks()[i].fds = fds;
@@ -1969,6 +2377,34 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                     let mut ex = [0u8; 40];
                     let mut off = push_bytes(&mut ex, 0, b" ok mmap -> 0x");
                     off = hex_into(&mut ex, off, ret);
+                    off = push_bytes(&mut ex, off, b"\n");
+                    enosys_log(num as u32, &name_buf[..nlen], &ex[..off]);
+                } else if num == LINUX_MUNMAP && status != STATUS_OK {
+                    /* Munmap's refusal family (increment 25): EINVAL is
+                     * the only arm a well-formed request reaches — the
+                     * span, the alignment, the break or the length,
+                     * with the request's own words on the line. */
+                    let mut ex = [0u8; 96];
+                    let mut off = push_bytes(&mut ex, 0, b" -> ");
+                    off = push_bytes(&mut ex, off,
+                        if status == E_INVAL { b"EINVAL munmap(addr=0x" }
+                        else               { b"refused munmap(addr=0x" });
+                    off = hex_into(&mut ex, off, args[0]);
+                    off = push_bytes(&mut ex, off, b", len=");
+                    off = dec_into(&mut ex, off, args[1]);
+                    off = push_bytes(&mut ex, off, b")\n");
+                    enosys_log(num as u32, &name_buf[..nlen], &ex[..off]);
+                } else if num == LINUX_MUNMAP {
+                    /* Both success and a double unmap land here: the
+                     * kernel's page tables are the truth, and 0 is the
+                     * answer either way. The request words ride the
+                     * line so the run's proof names the range, not the
+                     * arm (increment 14/15's rule). */
+                    let mut ex = [0u8; 96];
+                    let mut off = push_bytes(&mut ex, 0, b" ok munmap addr=0x");
+                    off = hex_into(&mut ex, off, args[0]);
+                    off = push_bytes(&mut ex, off, b" len=");
+                    off = dec_into(&mut ex, off, args[1]);
                     off = push_bytes(&mut ex, off, b"\n");
                     enosys_log(num as u32, &name_buf[..nlen], &ex[..off]);
                 } else if num == LINUX_TKILL {
@@ -2075,6 +2511,37 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                     }
                 }
             }
+            Answer::ReadWait(want) => {
+                /* The console has no input yet (increment 24): park the
+                 * request. Nothing is replied — the child is blocked in
+                 * the kernel awaiting exactly this exchange — and the
+                 * console channel is already in the entry loop's wait set,
+                 * so the next typed byte wakes the sidecar and the pending
+                 * block above answers from it. */
+                tasks()[i].pending = PENDING_READ;
+                tasks()[i].pending_tag = rr.tag;
+                tasks()[i].pending_arg = want as u64;
+                tasks()[i].pending_deadline = 0;
+                enosys_log(num as u32, &name_buf[..nlen],
+                           b" wait (console read)\n");
+            }
+            Answer::PollWait(arr, len, deadline) => {
+                /* Nothing ready and the timeout allows waiting (increment
+                 * 23): park the array and its deadline. The entry loop
+                 * passes next_wait_ns to Kernel::wait, so a finite deadline
+                 * wakes this loop; an infinite one wakes on console input
+                 * like the read above. On wake the reply is the array with
+                 * the revents this side actually observed (a timeout's
+                 * array carries zeros — never invented readiness). */
+                tasks()[i].pending = PENDING_POLL;
+                tasks()[i].pending_tag = rr.tag;
+                tasks()[i].pending_arg = args[1];
+                tasks()[i].pending_len = len;
+                tasks()[i].pending_bytes = arr;
+                tasks()[i].pending_deadline = deadline;
+                enosys_log(num as u32, &name_buf[..nlen],
+                           b" wait (poll)\n");
+            }
             Answer::Exit => {
                 /* Visible like every other answer: exit_group is the one
                  * forward that gets NO reply, so without this line the
@@ -2153,6 +2620,22 @@ mod tests {
     fn fds() -> [FdSlot; LINUX_MAX_FDS] {
         [FdSlot { used: false, kind: 0, vfs_fd: 0, flags: 0 }; LINUX_MAX_FDS]
     }
+    /* E7 increment 23: the three console descriptors every task is born
+     * with (track() registers them), for the poll/read waiting tests. */
+    fn console_fds() -> [FdSlot; LINUX_MAX_FDS] {
+        let mut f = fds();
+        for s in f.iter_mut().take(3) {
+            s.used = true;
+            s.kind = FD_KIND_CONSOLE;
+        }
+        f
+    }
+    fn pollfd(fd: i32, events: u16) -> [u8; LINUX_POLLFD_BYTES] {
+        let mut b = [0u8; LINUX_POLLFD_BYTES];
+        b[0..4].copy_from_slice(&fd.to_le_bytes());
+        b[4..6].copy_from_slice(&events.to_le_bytes());
+        b
+    }
     fn ledger() -> MemBrk {
         MemBrk { base: 0, limit: 0, cur: 0, mtop: 0 }
     }
@@ -2224,6 +2707,13 @@ mod tests {
         assert_eq!(expected_req_len(LINUX_WRITE, &a), 72);
         a[2] = 512;
         assert_eq!(expected_req_len(LINUX_WRITE, &a), 72 + 512);
+        /* poll: the whole array rides behind the header; an nfds above
+         * the cap keeps the arithmetic total (the arm refuses it EINVAL). */
+        a = [0; 6];
+        a[1] = 3;
+        assert_eq!(expected_req_len(LINUX_POLL, &a), 72 + 24);
+        a[1] = (LINUX_POLL_MAX_FDS + 1) as u64;
+        assert_eq!(expected_req_len(LINUX_POLL, &a), 72);
         a = [0; 6];
         a[1] = 0x1000; /* an act/set pointer is present */
         assert_eq!(expected_req_len(LINUX_RT_SIGACTION, &a), 72 + SIGACT_BYTES);
@@ -2523,36 +3013,110 @@ mod tests {
     }
 
     #[test]
-    fn poll_answers_the_zero_timeout_probe_and_refuses_to_wait() {
-        /* The firstuser's ACTUAL call — poll(fds, 3, 0) from Rust std's
-         * lang_start_internal: zero timeout, answered 0 events, the
-         * array pointer never touched (no payload, no copy either way). */
-        let a = answer(7, &[0x7FFF_FFFF_E000, 3, 0, 0, 0, 0],
-                       &fds(), &mut ledger(), &mut fresh(), &[]);
-        assert!(matches!(a, Answer::Reply(0, STATUS_OK)),
-                "the zero-timeout probe answers 0: {:?}", a);
-        /* nfds does not change the answer: nothing is read, and a
-         * negative timeout is the -1 of forever (i32 truncation). */
-        let a = answer(7, &[0x1234, 0, 0, 0, 0, 0],
-                       &fds(), &mut ledger(), &mut fresh(), &[]);
-        assert!(matches!(a, Answer::Reply(0, STATUS_OK)),
-                "nfds 0, timeout 0: {:?}", a);
-        /* A waiting poll — ms or forever — is ENOSYS by name, the twin
-         * of the kernel's first-trap refusal; the u64 sign-extension
-         * path (-1 as musl passes it) is the one that must not read as
-         * a zero timeout. */
-        for t in [1u64, 5000, 0xFFFF_FFFF_FFFF_FFFF] {
-            let a = answer(7, &[0x7FFF_FFFF_E000, 3, t, 0, 0, 0],
-                           &fds(), &mut ledger(), &mut fresh(), &[]);
-            assert!(matches!(a, Answer::Reply(0, E_NOSYS)),
-                    "a waiting poll (timeout {}) is refused: {:?}", t, a);
+    fn poll_parks_without_readiness_and_reports_it_when_input_arrives() {
+        let console = CharNode::console();
+        let f = console_fds();
+        let mut payload = [0u8; LINUX_POLL_PAYLOAD_BYTES];
+        payload[..8].copy_from_slice(&pollfd(0, POLLIN));
+        let args = [0x1000u64, 1, 5000, 0, 0, 0];
+        /* Nothing buffered, 5 s timeout: the request WAITS, and the
+         * parked array is the caller's own bytes (revents untouched until
+         * a readiness decision is real). */
+        match poll_answer(&f, &console, &payload[..8], &args, 100,
+                          |_, _| None) {
+            Answer::PollWait(arr, len, deadline) => {
+                assert_eq!(len, 8);
+                assert_eq!(deadline, 100 + 5_000 * 1_000_000,
+                           "the deadline is now + the caller's ms");
+                assert_eq!(&arr[..6], &payload[..6]);
+            }
+            other => panic!("waiting poll: {:?}", other),
         }
-        /* Linux's int width, the other direction: 0x1_00000000
-         * truncates to a zero timeout and must NOT be refused. */
-        let a = answer(7, &[0x7FFF_FFFF_E000, 3, 0x1_0000_0000, 0, 0, 0],
-                       &fds(), &mut ledger(), &mut fresh(), &[]);
-        assert!(matches!(a, Answer::Reply(0, STATUS_OK)),
-                "int width: {:?}", a);
+        /* The timeout's whole decision: at the deadline the wait expires
+         * (and the reply carries zero revents — never invented input). */
+        assert!(poll_expired(100 + 5_000 * 1_000_000,
+                             100 + 5_000 * 1_000_000));
+        assert!(!poll_expired(100 + 5_000 * 1_000_000, 100));
+        /* A typed byte makes the same entry ready; the caller's events
+         * mask is never rewritten, only revents. */
+        console.console_io().push_input(b"x");
+        match poll_answer(&f, &console, &payload[..8], &args, 200,
+                          |_, _| None) {
+            Answer::ReplyBytes(ret, len, arr) => {
+                assert_eq!((ret, len), (1, 8), "one ready fd, full array");
+                assert_eq!(u16::from_le_bytes([arr[4], arr[5]]), POLLIN,
+                           "events is the caller's mask");
+                assert_eq!(u16::from_le_bytes([arr[6], arr[7]]), POLLIN,
+                           "revents is the observed readiness");
+            }
+            other => panic!("ready poll: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn poll_timeout_shapes_bad_descriptors_and_file_ready_are_posix() {
+        let console = CharNode::console();
+        let f = console_fds();
+        let mut payload = [0u8; LINUX_POLL_PAYLOAD_BYTES];
+        let zero = [0x1000u64, 1, 0, 0, 0, 0];
+        payload[..8].copy_from_slice(&pollfd(0, POLLIN));
+        /* Timeout 0 is the snapshot: 0 ready, but the full array still
+         * crosses back (the kernel writes it into the caller's span). */
+        match poll_answer(&f, &console, &payload[..8], &zero, 0,
+                          |_, _| None) {
+            Answer::ReplyBytes(ret, len, arr) => {
+                assert_eq!((ret, len), (0, 8));
+                assert_eq!(arr[6..8], [0, 0]);
+            }
+            other => panic!("zero timeout: {:?}", other),
+        }
+        /* An fd with no slot is POLLNVAL and READY — a bad descriptor is
+         * an error to report, not a wait. */
+        payload[..8].copy_from_slice(&pollfd(9, POLLIN));
+        let timed = [0x1000u64, 1, 50, 0, 0, 0];
+        match poll_answer(&f, &console, &payload[..8], &timed, 0,
+                          |_, _| None) {
+            Answer::ReplyBytes(ret, _, arr) => {
+                assert_eq!(ret, 1);
+                assert_eq!(u16::from_le_bytes([arr[6], arr[7]]), POLLNVAL);
+            }
+            other => panic!("POLLNVAL: {:?}", other),
+        }
+        /* A VFS-backed slot is answered by the VFS closure; the console
+         * slots never consult it. */
+        let mut file_fds = console_fds();
+        file_fds[3] = FdSlot { used: true, kind: FD_KIND_FILE, vfs_fd: 7,
+                               flags: 0 };
+        payload[..8].copy_from_slice(&pollfd(3, POLLIN));
+        match poll_answer(&file_fds, &console, &payload[..8], &timed, 0,
+                          |vfd, ev| {
+                              assert_eq!((vfd, ev), (7, POLLIN));
+                              Some(POLLIN)
+                          }) {
+            Answer::ReplyBytes(ret, _, arr) => {
+                assert_eq!(ret, 1);
+                assert_eq!(u16::from_le_bytes([arr[6], arr[7]]), POLLIN);
+            }
+            other => panic!("file readiness: {:?}", other),
+        }
+        /* A negative fd is ignored: revents 0 and it cannot make a wait
+         * ready (POSIX's own rule). */
+        payload[..8].copy_from_slice(&pollfd(-1, POLLIN));
+        match poll_answer(&f, &console, &payload[..8], &timed, 0,
+                          |_, _| None) {
+            Answer::PollWait(arr, ..) => assert_eq!(arr[6..8], [0, 0]),
+            other => panic!("negative fd: {:?}", other),
+        }
+        /* nfds 0 with timeout -1 is a pure sleep: parked with no array
+         * and no deadline (0 is "forever", never "already expired"). */
+        match poll_answer(&f, &console, &[], &[0, 0, u64::MAX, 0, 0, 0],
+                          0, |_, _| None) {
+            Answer::PollWait(_, 0, 0) => {}
+            other => panic!("infinite sleep: {:?}", other),
+        }
+        assert!(!poll_expired(0, u64::MAX));
+        assert_eq!(poll_deadline(10, -1), 0);
+        assert_eq!(poll_deadline(10, 2), 10 + 2_000_000);
     }
 
     #[test]
@@ -2602,6 +3166,36 @@ mod tests {
                        &fds(), &mut b, &mut fresh(), &[]);
         assert!(matches!(a, Answer::Reply(_, STATUS_OK)),
                 "NORESERVE hint: {:?}", a);
+    }
+
+    #[test]
+    fn console_read_serves_buffered_input_and_never_invents_readiness() {
+        let console = CharNode::console();
+        console.console_io().push_input(b"ls\n");
+
+        let a = console_read_answer(&console, 8);
+        match a {
+            Answer::ReplyBytes(ret, len, bytes) => {
+                assert_eq!((ret, len), (3, 3), "the count is the payload length");
+                assert_eq!(&bytes[..3], b"ls\n", "the typed bytes came back whole");
+            }
+            other => panic!("buffered console read: {:?}", other),
+        }
+        assert!(matches!(console_read_answer(&console, 8),
+                         Answer::ReadWait(8)),
+                "a second read finds the buffer empty and PARKS — never a fabricated zero-byte EOF, and never EAGAIN on a blocking descriptor");
+        console.console_io().push_input(b"x");
+        assert!(matches!(console_read_answer(&console, 8),
+                         Answer::ReplyBytes(1, 1, _)),
+                "the parked read is served by the next typed byte");
+        assert!(matches!(console_read_answer(&console, 0),
+                         Answer::ReplyBytes(0, 0, _)),
+                "read(fd, buf, 0) succeeds without consuming or claiming data");
+
+        console.console_io().close();
+        assert!(matches!(console_read_answer(&console, 8),
+                         Answer::ReplyBytes(0, 0, _)),
+                "a closed console is EOF after its buffered input is drained");
     }
 
     #[test]
@@ -2733,6 +3327,52 @@ mod tests {
     }
 
     #[test]
+    fn munmap_frees_only_the_span_above_the_break_without_rewinding_the_cursor() {
+        let mut b = span();
+        b.cur = SPAN_BASE + 0x2000;
+        let mtop = b.mtop;
+        let a = answer(11, &[SPAN_BASE + 0x2000, 0x1000, 0, 0, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(0, STATUS_OK)),
+                "the arena above the break unmaps: {:?}", a);
+        assert_eq!((b.cur, b.mtop), (SPAN_BASE + 0x2000, mtop),
+                   "munmap moves neither the break nor the map cursor");
+        /* POSIX: a second unmap of the same range is success — the
+         * kernel's page tables, not a sidecar ledger, are the truth */
+        let a = answer(11, &[SPAN_BASE + 0x2000, 0x1000, 0, 0, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(0, STATUS_OK)),
+                "a double unmap is success: {:?}", a);
+        /* the page-round is the caller's byte length: the last page of
+         * the span, one byte long, still frees one page */
+        let a = answer(11, &[SPAN_LIMIT - 0x1000, 1, 0, 0, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(0, STATUS_OK)),
+                "a one-byte tail still names its page: {:?}", a);
+        /* below the break: EINVAL — v1 keeps the break's pages with brk */
+        let a = answer(11, &[SPAN_BASE, 0x1000, 0, 0, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(0, E_INVAL)),
+                "the break's pages are not munmap's: {:?}", a);
+        /* every malformed span is EINVAL, and a refusal moves nothing */
+        for args in [
+            [SPAN_BASE + 0x2001, 0x1000, 0, 0, 0, 0], /* unaligned      */
+            [SPAN_BASE + 0x2000, 0, 0, 0, 0, 0],      /* zero length    */
+            [SPAN_BASE + 0x2000, u64::MAX, 0, 0, 0, 0], /* overflow     */
+            [SPAN_BASE - 0x1000, 0x1000, 0, 0, 0, 0], /* below the span */
+            [SPAN_LIMIT, 0x1000, 0, 0, 0, 0],         /* at the limit   */
+            [SPAN_LIMIT - 0x1000, 0x2000, 0, 0, 0, 0], /* over the end  */
+        ] {
+            let before = (b.cur, b.mtop);
+            let a = answer(11, &args, &fds(), &mut b, &mut fresh(), &[]);
+            assert!(matches!(a, Answer::Reply(0, E_INVAL)),
+                    "refused munmap shape {:?}: {:?}", args, a);
+            assert_eq!((b.cur, b.mtop), before,
+                       "a refused munmap moves no cursor");
+        }
+    }
+
+    #[test]
     fn hex_into_writes_fixed_width_lowercase() {
         let mut buf = [0u8; 20];
         let n = hex_into(&mut buf, 0, 0x807f000);
@@ -2840,6 +3480,11 @@ mod tests {
         assert!(!payload_bound(LINUX_GETDENTS64,
                                &[3, 0x7000, 2048, 0, 0, 0],
                                DENTS_PAYLOAD_CAP + 1));
+        /* poll: the full array (nfds * 8), and only when there is one. */
+        let pa = [0u64, 3, 5000, 0, 0, 0];
+        assert!(payload_bound(LINUX_POLL, &pa, 24));
+        assert!(!payload_bound(LINUX_POLL, &pa, 23));
+        assert!(!payload_bound(LINUX_POLL, &[0, 0, 5000, 0, 0, 0], 0));
         /* a number that owes no payload is total-false. */
         assert!(!payload_bound(231, &[0, 0, 0, 0, 0, 0], 0));
     }
