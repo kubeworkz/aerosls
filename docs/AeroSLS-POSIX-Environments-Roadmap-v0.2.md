@@ -1,9 +1,9 @@
 # AeroSLS POSIX Environments Roadmap v0.2 — environment persistence, in-environment networking, and placement
 
-**Status:** Draft for review; P1a–P3 are implemented. §11 Q2 remains open. Two evidence caveats stay visible: the P2 live L5 arm is not recorded as booted, and the P3 adoption guard has one replica branch not exercised live.
+**Status:** Draft for review; P1a–P3 are implemented. §11 Q2 remains open. **M0 Linux-shape decision accepted 2026-11-11** (`AeroSLS-PASE-Linux-Shape-Decision-v0.1.md`). One evidence caveat remains: the P3 adoption guard has one replica branch not exercised live. The P2 live L5 arm was recorded green in run `43072501848` (2026-11-11).
 **Scope:** the three items `AeroSLS-POSIX-Environments-Roadmap-v0.1.md` §12 deferred to v0.2, in the order that section fixed: **(1) environment checkpoint/restore and durable storage**, **(2) networking inside environments**, **(3) cluster placement, migration and failover**. v0.1 §12 is explicit that they are one plan rather than three because each depends on the one before it.
 **Resolves:** the prerequisites v0.1 §10 and §13 named — environment checkpoint/restore is E7's gate, durable storage is what makes an environment worth migrating, and the cluster items are what have to wait for both.
-**Does not do:** design the E7 shim (that is `AeroSLS-Linux-ABI-Shim-Design-v0.1.md`), scope threads, signals or dynamic linking (§9 names their destinations). This is the plan and its findings; implementation records land as addenda in place, the way v0.1's did.
+**Does not do:** design the E7 shim (that is `AeroSLS-Linux-ABI-Shim-Design-v0.1.md`); threads, signals and dynamic linking are scoped by the Linux-shape decision record and its M2–M4 milestones. This is the plan and its findings; implementation records land as addenda in place, the way v0.1's did.
 
 ---
 
@@ -28,6 +28,8 @@ v0.1 §0.1 mapped PASE onto "a POSIX environment inside a partition, created on 
 | A workload moving between LPARs; VIOS sharing I/O without nested virtualization | Work moves *across* kernel instances, never by nesting one inside another | Environment migration and failover across nodes — a whole environment leaving one node and resuming on another | P3 |
 
 Two boundaries are stated now so they cannot drift later. **Nesting is still closed** (v0.1 §12, for the same structural reason LPAR roadmap §9 gives). And **P3 moves environments across nodes, not partitions inside a node** — the in-kernel `partition_id` mechanism E1–E6 built is the isolation boundary; migration is the same environment leaving one kernel instance for another, which is LPAR roadmap §9's answer applied to environments rather than partitions.
+
+> **M0 decision — Linux shape (2026-11-11).** AeroSLS targets a PASE-shaped Linux runtime, not AIX/PASE binary compatibility. The Linux ABI shim remains the compatibility layer; AIX binaries, Power and a literal PASE target are out of scope. The M1–M6 roadmap and its ownership are in `AeroSLS-PASE-Linux-Shape-Decision-v0.1.md`.
 
 ---
 
@@ -3279,7 +3281,7 @@ Everything this document asserts about the tree, with its source.
 
 ## Appendix B — Named gaps, each with its destination
 
-**Register checked 2026-11-08.** A row is marked **LANDED** only when the gap is closed in the tree and the cell names where. The two evidence caveats in the status line stay visible rather than being swept into a green row.
+**Register checked 2026-11-11.** A row is marked **LANDED** only when the gap is closed in the tree and the cell names where. Rows marked **M1–M6** are planned in the Linux-shape decision record, not landed. The one remaining evidence caveat in the status line stays visible rather than being swept into a green row.
 
 | Gap | Consequence if unaddressed | Destination |
 |---|---|---|
@@ -3293,9 +3295,16 @@ Everything this document asserts about the tree, with its source.
 | Durable storage is not quota-charged to the partition | a tenant's disk is unbounded and unmetered | P1b — **LANDED** |
 | The tenant profile has no network cap at all | the environment cannot be PASE-for-real; E7's socket path stays unroutable | P2 — **LANDED** |
 | No kernel-brokered socket service | reaching networking would require a cross-partition channel, violating LPAR Phase 11 | P2 — **LANDED** |
-| No per-partition bound on a tenant's simultaneous connections | one environment starves its neighbours without tripping the rate limiter | P2 — **LANDED** (mechanism at increments 2–4; the **default** that closes the never-opts-in case at increment 5, §11 Q4: every partition is born at 96 and only the control plane may change it). **Evidence caveat:** the live L5 arm is not recorded as booted |
+| No per-partition bound on a tenant's simultaneous connections | one environment starves its neighbours without tripping the rate limiter | P2 — **LANDED** (mechanism at increments 2–4; the **default** that closes the never-opts-in case at increment 5, §11 Q4: every partition is born at 96 and only the control plane may change it). **Evidence:** the live L5 arm ran green in `43072501848` (2026-11-11). |
 | `partition_migrate()` does not move an environment | migration leaves the environment on the source (orphaned or destroyed) | P3 — **LANDED** (increments 3–5) |
 | `failover_recover_from()` adopts ownership only | a dead node's environments vanish with no name in the report | P3 — **LANDED** (report at increment 9; survivor restore at increment 11) |
 | The failover broadcast path is 24 KiB | a 5.5 MiB environment cannot ride it; the gap must be stated, not implied | P3 — **LANDED** ((b) at increments 9 and 11; (a) as the replica path from increment 13 — §11 Q5). **Evidence caveat:** one adoption-guard replica branch was not exercised live |
-| No thread groups / `clone` / `futex` | Go, threaded CPython and Node are out | unscoped — §9 |
-| No mediated native↔POSIX interop | environments are a sealed box, not PASE-with-IFS | **LANDED** — §9.1 |
+| No thread groups / `clone` / `futex` | Go, threaded CPython and Node are out | M4 — planned in the Linux-shape roadmap; §9 still records the structural blocker |
+| No mediated native↔POSIX interop | environments are a sealed box, not PASE-with-IFS | **PARTIAL** — read-only catalog + `CAT_QUERY` landed (§9.1); writes, IFS-like sharing, identity/ACL and native SIMI are M5 — planned. |
+| Linux networking syscalls are not wired into the Linux ABI shim | Linux binaries still get `ENOSYS` for `socket`/`connect`; P2 serves the sidecar applet path, not the Linux personality | M1 — planned |
+| Dynamic linking is refused (static non-PIE `ET_EXEC` only) | most existing Linux binaries cannot start; `ld.so`, `.so` and `dlopen` are absent | M2 — planned |
+| Signals are accepted and recorded but never delivered | POSIX handlers, masks and `sigaltstack` do not run; only default actions are honest | M3 — planned |
+| Four-environment ceiling; fixed `PROC_MAX` 16 and 16-entry sidecar registry | not enough for a production PASE workload; P3 placement refuses over-capacity | M6 — planned |
+| P3 promotion loses the survivor payload-band boundary; partition DB pages do not move | a reboot before the next checkpoint restores the record without payload; environment migration does not move all partition data | M6 — planned |
+| P3 replica adoption branch remains unexercised live | one verification caveat remains after the failover replica path landed | M6 — evidence closure |
+| AIX/PASE binary compatibility | not a Linux-shape gap; AIX, Power and literal PASE are outside this product | **Out of scope** — M0 decision |
