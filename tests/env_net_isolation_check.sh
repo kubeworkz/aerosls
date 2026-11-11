@@ -1049,6 +1049,9 @@ PY
             exit 1
         fi
         echo "ok:   L4. partition B's listener armed on :$LISTEN_PORT ($SIDE_B, partition $pidb)"
+        # The applet's socket/bind/listen round is silent on serial; settle
+        # before A dials, exactly as L5 does after E2's listener.
+        sleep 4
 
         # ── A reaches for B's listener: the cross-partition refusal ─────────
         # A's `nc <GUEST_IP> <port>` resolves to B's listener from inside the
