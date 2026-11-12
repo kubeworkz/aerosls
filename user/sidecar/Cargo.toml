@@ -35,3 +35,7 @@ target = ["aerosls-proto/target"]
 # refused. Enabled only by `make x86-iso-e3 ... E7_SLOW_BOOT=1`; a default
 # build compiles none of it (the call site is cfg'd, not runtime-branched).
 e7_slow_boot = []
+# M1's live Linux TCP probe — a build-time feature, enabled only by
+# `make x86-iso-e3 ... M1_NET_PROBE=1` for the QEMU gate run. A default
+# build compiles neither the module nor the spawn call.
+m1_net_probe = []

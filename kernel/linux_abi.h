@@ -65,6 +65,19 @@
 #define LINUX_ENOBUFS    105
 #define LINUX_ETIMEDOUT  110
 #define LINUX_EALREADY   114
+#define LINUX_EPIPE       32
+#define LINUX_EDESTADDRREQ 89
+#define LINUX_EMSGSIZE     90
+#define LINUX_EAFNOSUPPORT 97
+#define LINUX_EADDRINUSE   98
+#define LINUX_EADDRNOTAVAIL 99
+#define LINUX_ENETDOWN     100
+#define LINUX_ENETUNREACH  101
+#define LINUX_ECONNRESET   104
+#define LINUX_EISCONN      106
+#define LINUX_ENOTCONN     107
+#define LINUX_ECONNREFUSED 111
+#define LINUX_EHOSTUNREACH 113
 /* The file class's own errnos (E7 step 4): the VFS failures §5.7's map
  * must be able to name — each is the twin of a cap.h CAP_E* code added
  * with this increment, and of the sidecar's vfs::Errno code() values
@@ -80,8 +93,11 @@
 
 /* ─── The syscall classification table (§5.6) ──────────────────────────────
  * The census artifact (tools/linux_syscall_census.txt) is the specification:
- * 27 numbers the designated first user actually calls. Every one gets a
- * class naming WHERE its semantics live, and — this is the number-space
+ * 27 numbers the designated first user actually calls. M1's network bridge
+ * adds the eight socket numbers it names (41-45, 48-50) as a second
+ * declared set; the census and the bridge set together are the table's
+ * specification. Every one gets a class naming WHERE its semantics live,
+ * and — this is the number-space
  * property that makes D1 structural — a Linux number that is NOT in the
  * table is LSC_UNKNOWN, and a Linux-personality task's dispatch may only
  * refuse it. The SLS numbers this candidate's ABI overlaps (105, 160, 320;
@@ -91,6 +107,9 @@
 enum LinuxSyscallClass {
     LSC_UNKNOWN = 0,   /* not in the census: refused by name, never dispatched */
     LSC_FD,            /* sidecar fd table + path resolution (Phase 2 §3-§4) */
+    LSC_NET,           /* M1: the socket fd class — its eight numbers forward
+                        * to the sidecar's SocketOps/NetClient (workspace
+                        * owned, no new kernel-side network stack)         */
     LSC_MEM,           /* §5.4 budget-backed memory: brk/mmap/munmap/mprotect */
     LSC_SIG,           /* recorded at the sidecar, and delivered ONLY as
                         * tkill's default action (§10.13's step 2); a user
@@ -234,6 +253,13 @@ struct LinuxFdWritePlan {
 struct LinuxFdWritePlan linux_fd_write_plan(uint64_t num,
                                             const uint64_t args[6]);
 
+/* Decode the 16 bytes copied from a sendto destination. `sa` is the Linux
+ * sockaddr_in layout: family in host order, port/address network order;
+ * ip and port come back in host order. A non-AF_INET family is EAFNOSUPPORT
+ * and an absent/short shape is EINVAL — both first-trap refusals. Pure, so
+ * the host test can drive every byte without a page table. */
+int linux_sendto_dest_decode(const uint8_t *sa, uint32_t *ip, uint16_t *port);
+
 /* Copy n bytes from a task's user VA into dst, walking root's page tables
  * read-only. Returns 0, or -LINUX_EFAULT — never a fault: every level is
  * checked before the bytes are read, and a span crossing a page boundary
@@ -254,6 +280,54 @@ int linux_user_copy_out(uint8_t *dst, uint64_t root, uint64_t va, uint32_t n);
 #define LINUX_POLL_MAX_FDS 16u
 #define LINUX_POLLFD_BYTES 8u       /* struct pollfd: fd, events, revents  */
 #define LINUX_POLL_PAYLOAD_BYTES (LINUX_POLL_MAX_FDS * LINUX_POLLFD_BYTES)
+
+/* ─── M1 — the Linux network bridge ───────────────────────────────────────
+ * The eight x86-64 numbers the M1 gate names. Their semantics are NOT
+ * re-implemented here: the sidecar owns the fd table and the SocketOps
+ * client, exactly as it owns the file class's VFS, and the kernel performs
+ * only the crossings the child's address space forces (the same split as
+ * write's buffer and the file class's reply payloads).
+ *
+ *   socket(41)   socket(domain, type, protocol)      -> fd
+ *   connect(42)  connect(fd, addr, addrlen)          -> 0
+ *   accept(43)   accept(fd, addr, addrlen)           -> new fd
+ *   sendto(44)   sendto(fd, buf, len, flags, addr, addrlen)
+ *   recvfrom(45) recvfrom(fd, buf, len, flags, addr, addrlen)
+ *   shutdown(48) shutdown(fd, how)                   -> 0
+ *   bind(49)     bind(fd, addr, addrlen)             -> 0
+ *   listen(50)   listen(fd, backlog)                 -> 0
+ *
+ * The kernel's share of each is a PLAN: connect/bind attach the 16-byte
+ * sockaddr_in; sendto attaches its data exactly as write does; accept and
+ * recvfrom stage destinations for the reply payload. A sockaddr_in is the
+ * Linux ABI's 16-byte IPv4 shape — the sidecar parses it (family, port,
+ * address) and hands Host-order values to NetClient, which owns the P2
+ * wire's own encoding. Only AF_INET is served in v1; any other family is
+ * refused by the SIDEcar (EINVAL) rather than guessed at here. */
+#define LINUX_SOCKET       41u
+#define LINUX_CONNECT      42u
+#define LINUX_ACCEPT       43u
+#define LINUX_SENDTO       44u
+#define LINUX_RECVFROM     45u
+#define LINUX_SHUTDOWN     48u
+#define LINUX_BIND         49u
+#define LINUX_LISTEN       50u
+
+#define LINUX_SOCKADDR_IN_BYTES 16u  /* sizeof(struct sockaddr_in), IPv4   */
+#define LINUX_NET_ADDR_BYTES    20u  /* 16-byte sockaddr_in + addrlen u32  */
+#define LINUX_AF_INET            2u  /* the only family this bridge serves */
+/* sendto(fd, buf, len, flags, addr, addrlen) normally forwards args[4] as
+ * the caller's pointer. The kernel copies that 16-byte sockaddr_in at the
+ * first trap, decodes it, and replaces args[4] with {ip << 16 | port} and
+ * args[5] with this marker. The sidecar therefore sees the destination
+ * without a second grant; a NULL destination keeps args[4]==0/args[5]==0,
+ * and any other addrlen is refused before the post. */
+#define LINUX_SENDTO_DEST_MARKER 1u
+/* recvfrom's data clamp: the reply payload must fit the one 1 KiB byte
+ * buffer both ends already reserve (LINUX_FD_WRITE_CHUNK), and the fixed
+ * 20-byte address trailer rides behind the data. A short receive is
+ * POSIX-legal; the caller loops. */
+#define LINUX_NET_RECV_CAP (LINUX_FD_WRITE_CHUNK - LINUX_NET_ADDR_BYTES)
 
 
 /* ─── E7 increment 6 (the mem class, §5.4) — the budget span ──────────────
@@ -577,6 +651,12 @@ struct LinuxSigCopyPlan linux_sig_copy_plan(uint64_t num,
 #define LINUX_STAGE_RAW   1u
 #define LINUX_STAGE_STAT  2u
 #define LINUX_STAGE_DENTS 3u
+/* M1: the network reply shapes. ACCEPT's payload is one 20-byte trailer
+ * (sockaddr_in then addrlen); RECVFROM's is data followed by that same
+ * trailer. The kernel owns the split because only it can write the three
+ * child destinations; the sidecar owns the bytes. */
+#define LINUX_STAGE_ACCEPT   4u
+#define LINUX_STAGE_RECVFROM 5u
 
 /* `struct stat`, musl x86-64 (144 bytes): field offsets the golden test
  * pins and the probe reads back on-target (§5.6). The sidecar's payload
@@ -615,7 +695,14 @@ struct LinuxFdReplyPlan {
                         * write at dst (LINUX_STAT_BYTES for stat — the
                         * serialized form is larger than the payload;
                         * min(count, LINUX_DIRENT_USER_CAP) for
-                        * getdents64; == len for the RAW family)        */
+                        * getdents64; == len for the RAW family; the data
+                        * clamp for recvfrom)                            */
+    uint64_t dst2;     /* M1: accept's addrlen destination (args[2]) or
+                        * recvfrom's sockaddr_in destination (args[4]);
+                        * 0 = the caller passed no address              */
+    uint32_t len2;     /* bytes for dst2: 4 (addrlen) or 16 (sockaddr)  */
+    uint64_t dst3;     /* M1: recvfrom's addrlen destination (args[5]);
+                        * 0 = no source-address update was asked for    */
     uint8_t  kind;     /* LINUX_STAGE_*: what the deliver does with the
                         * payload before the copy-in                   */
     int32_t  refuse;   /* 0 = proceed; else the Linux errno to return

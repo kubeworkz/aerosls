@@ -304,6 +304,13 @@ void tcp_close(int conn_id) {
     g_tcp_last_conn = conn_id;
 }
 
+/* The service's SHUT_WR half-close uses the stack's existing flag sender;
+ * this stub satisfies the link and lets the host flow observe the call. */
+void tcp_send_flags(struct TCPConn* c, uint8_t flags, const void* data,
+                    uint16_t dlen) {
+    (void)c; (void)flags; (void)data; (void)dlen;
+}
+
 /* The far end sends a raw payload WITH a moved MEM grant (the send/recv
  * data buffer). The descriptor's slot is a cap-table slot in the FAR pid's
  * table; the service resolves it in the KERNEL's table, so this mirrors the
@@ -672,6 +679,23 @@ int main(void) {
         CHECK(memcmp(rbuf, "world", 5) == 0,
               "the W-grant buffer was filled with the stack's reply");
 
+        /* shutdown(SHUT_WR): a half-close, not a socket teardown. The
+         * service keeps the receive side and the attribution alive, but
+         * marks the send side so a later send answers NET_ERR_PIPE. */
+        uint16_t usage_before_shut = tcp_partition_get_conn_usage(1);
+        uint8_t shut_req[16 + 5];
+        net_frame(shut_req, 9);                /* NET_SHUTDOWN */
+        shut_req[16] = (uint8_t)sock_a; shut_req[17] = 0; shut_req[18] = 0; shut_req[19] = 0;
+        shut_req[20] = 1;                      /* SHUT_WR */
+        CHECK(far_send(&a2, shut_req, 21, 54) == 0,
+              "the sidecar sends NET_SHUTDOWN(SHUT_WR)");
+        net_socket_service_tick();
+        n = far_recv(&a2, reply, sizeof reply, &tag);
+        CHECK(n == 26 && reply_u16(reply, 16) == 0,
+              "SHUT_WR is admitted without tearing down the socket");
+        CHECK(tcp_partition_get_conn_usage(1) == usage_before_shut,
+              "the half-closed conn stays attributed until CLOSE");
+
         /* Idle-ESTABLISHED recv tooth: an idle conn must answer
          * NET_ERR_WOULDBLOCK WITHOUT entering the stack. tcp_recv() spins
          * in net_event_hlt_wait() until data or close, and this service
@@ -839,8 +863,8 @@ int main(void) {
         CHECK(far_send(&a2, acc_req, 20, 73) == 0, "the sidecar sends NET_ACCEPT (nothing pending)");
         net_socket_service_tick();
         n = far_recv(&a2, reply, sizeof reply, &tag);
-        CHECK(n == 26 && reply_u16(reply, 12) == 0x0001 && reply_u16(reply, 16) == 11,
-              "an accept with nothing pending answers NET_EAGAIN (status 11)");
+        CHECK(n == 26 && reply_u16(reply, 12) == 0x0001 && reply_u16(reply, 16) == 10,
+              "an accept with nothing pending answers NET_ERR_WOULDBLOCK (status 10)");
         uint32_t refusals_before = net_socket_refusals();
         uint32_t admits_baseline = net_socket_admits();
         CHECK(net_socket_admits() == admits_baseline,
@@ -853,6 +877,8 @@ int main(void) {
         tcp_conns[planted].active = 1;
         tcp_conns[planted].state = TCP_ESTABLISHED;
         tcp_conns[planted].local_port = 8080;
+        tcp_conns[planted].remote_ip = 0x0100007Fu;   /* 127.0.0.1 in network order */
+        tcp_conns[planted].remote_port = 8000;
         uint16_t usage_before_acc = tcp_partition_get_conn_usage(1);
 
         /* accept() with the planted conn: returns a NEW socket id, the conn
@@ -860,9 +886,13 @@ int main(void) {
         CHECK(far_send(&a2, acc_req, 20, 74) == 0, "the sidecar sends NET_ACCEPT (conn ready)");
         net_socket_service_tick();
         n = far_recv(&a2, reply, sizeof reply, &tag);
-        CHECK(n == 26 && reply_u16(reply, 16) == 0,
+        CHECK(n == 26 && reply_u16(reply, 12) == 0,
               "the ready accept is admitted (no error)");
-        uint32_t accepted = reply_u32(reply, 18);
+        uint32_t accepted = reply_u32(reply, 16);
+        CHECK((uint8_t)reply[20] == 0x7F && (uint8_t)reply[21] == 0x00 &&
+              (uint8_t)reply[22] == 0x00 && (uint8_t)reply[23] == 0x01 &&
+              (uint8_t)reply[24] == 0x1F && (uint8_t)reply[25] == 0x40,
+              "the accept reply carries the peer sockaddr (127.0.0.1:8000)");
         CHECK(accepted < NSS_MAX_SOCKS && accepted != lst,
               "the accept hands back a NEW socket id, not the listener's");
         CHECK(net_socket_admits() == admits_baseline + 1, "one accept counted admitted");
@@ -882,7 +912,7 @@ int main(void) {
         CHECK(far_send(&a2, acc_req, 20, 75) == 0, "the sidecar sends NET_ACCEPT again");
         net_socket_service_tick();
         n = far_recv(&a2, reply, sizeof reply, &tag);
-        CHECK(n == 26 && reply_u16(reply, 16) == 0,
+        CHECK(n == 26 && reply_u16(reply, 12) == 0,
               "the listener is still listening — a second accept succeeds again");
         CHECK(net_socket_admits() == admits_baseline + 2,
               "the second accept is counted admitted too (the listener was not consumed)");

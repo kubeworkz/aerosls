@@ -100,8 +100,14 @@
 //! every semantic decision (the §3.3 step-6 contract — there is exactly one
 //! POSIX implementation and it is not in the kernel).
 
+use alloc::boxed::Box;
 use aerosls_blockcache::BufferAlloc;
 use aerosls_proto::kabi::{GrantedCap, Kernel};
+use aerosls_proto::sockops::SocketOps;
+use aerosls_proto::{NET_ERR_ADDRINUSE, NET_ERR_ADDRNOTAVAIL, NET_ERR_CAP,
+    NET_ERR_CONNRESET, NET_ERR_INUSE, NET_ERR_INVAL, NET_ERR_IO,
+    NET_ERR_MSGSIZE, NET_ERR_NOMEM, NET_ERR_NOTCONN, NET_ERR_PIPE,
+    NET_ERR_PROTO, NET_ERR_WOULDBLOCK};
 use aerosls_vfs::aerofs::FileType;
 use aerosls_vfs::{CharNode, DirEnt, Errno, PollFd, Stat, Vfs,
     POLLIN, POLLNVAL, POLLOUT}; /* E7 increment 5: the fd
@@ -256,12 +262,42 @@ const LINUX_MKDIR: u64 = 83;
 const LINUX_UNLINK: u64 = 87;
 const LINUX_GETDENTS64: u64 = 217;
 
+/// M1 — the Linux network bridge. The eight numbers are kernel/linux_abi.h's
+/// LSC_NET rows; the literals repeat there because this side cannot include
+/// that header (the same twin discipline as the fd class's numbers). Their
+/// SEMANTICS are not repeated: every arm below is a translation onto the
+/// SocketOps trait, exactly as the file class's arms translate onto the VFS.
+const LINUX_SOCKET: u64 = 41;
+const LINUX_CONNECT: u64 = 42;
+const LINUX_ACCEPT: u64 = 43;
+const LINUX_SENDTO: u64 = 44;
+const LINUX_RECVFROM: u64 = 45;
+const LINUX_SHUTDOWN: u64 = 48;
+const LINUX_SENDTO_DEST_MARKER: u64 = 1;
+const LINUX_BIND: u64 = 49;
+const LINUX_LISTEN: u64 = 50;
+
+/// The Linux ABI's IPv4 shapes, and the one transform this side owns: a
+/// sockaddr_in carries sin_family in HOST order but sin_port/sin_addr in
+/// NETWORK order, while SocketOps takes both as Host-order values. The
+/// kernel attaches exactly 16 bytes for connect/bind; recvfrom/accept reply
+/// with a 20-byte trailer (the 16-byte struct then the u32 addrlen) so the
+/// kernel can write all of the caller's destinations from one payload.
+const LINUX_SOCKADDR_IN_BYTES: usize = 16;
+const LINUX_NET_ADDR_BYTES: usize = 20;
+const NET_RECV_MAX: usize = FD_PAYLOAD_CAP - LINUX_NET_ADDR_BYTES;
+const AF_INET: u16 = 2;
+const SOCK_STREAM: u16 = 1;
+const O_RDWR: u32 = 2;
+const O_NONBLOCK: u32 = 0x800;
+
 /// poll (7) — E7 increment 24: the array's shape is the kernel's too
 /// (kernel/linux_abi.h's LINUX_POLL_MAX_FDS / LINUX_POLLFD_BYTES). The
 /// Rust side cannot include that header, so the literals repeat as twins:
 /// struct pollfd is fd: i32, events: i16, revents: i16; 16 entries cap
 /// one call so neither end's frame can grow unbounded.
 const LINUX_POLL: u64 = 7;
+const POLLERR: u16 = 0x0008;
 const LINUX_POLL_MAX_FDS: usize = 16;
 const LINUX_POLLFD_BYTES: usize = 8;
 const LINUX_POLL_PAYLOAD_BYTES: usize = LINUX_POLL_MAX_FDS * LINUX_POLLFD_BYTES;
@@ -352,6 +388,22 @@ const E_NOTEMPTY: i32 = -19;
 const E_ROFS: i32 = -17;
 const E_SPIPE: i32 = -18;
 const E_NAMETOOLONG: i32 = -20;
+/* M1 network errno family (kernel/cap.h's CAP_E* twins). Distinct codes
+ * matter here: a TCP caller branches on ECONNRESET vs ETIMEDOUT vs
+ * ENOTCONN, and collapsing them into EIO loses the only recoverable
+ * information the bridge can give it. */
+const E_ADDRINUSE: i32 = -21;
+const E_ADDRNOTAVAIL: i32 = -22;
+const E_CONNRESET: i32 = -23;
+const E_NOTCONN: i32 = -24;
+const E_ISCONN: i32 = -25;
+const E_DESTADDRREQ: i32 = -26;
+const E_MSGSIZE: i32 = -27;
+const E_PIPE: i32 = -28;
+const E_CONNREFUSED: i32 = -29;
+const E_NETUNREACH: i32 = -30;
+const E_HOSTUNREACH: i32 = -31;
+const E_AFNOSUPPORT: i32 = -32;
 const E_AGAIN: i32 = -3;      /* CAP_EAGAIN  -> -EAGAIN (a read with
                                * nothing buffered; console reads park
                                * since increment 24)                   */
@@ -987,7 +1039,9 @@ struct FdSlot {
     kind: u8,
     /// E7 step 4: for the File kind, the VFS fd this descriptor names
     /// (the VFS table is the task model's own — one VFS task per Linux
-    /// task, allocated at spawn). Console slots leave it 0.
+    /// task, allocated at spawn). M1: for the Socket kind, the P2
+    /// driver's socket id from SocketOps — the same backing-id role, one
+    /// table over both object families. Console slots leave it 0.
     vfs_fd: u32,
     /// The LINUX open flags this descriptor answers F_GETFL with, and
     /// whose O_CLOEXEC bit is F_GETFD/F_SETFD's own state (the VFS's
@@ -999,6 +1053,7 @@ struct FdSlot {
 
 const FD_KIND_CONSOLE: u8 = 0;
 const FD_KIND_FILE: u8 = 1;
+const FD_KIND_SOCKET: u8 = 2;
 const LINUX_MAX_FDS: usize = 16;
 
 /// Linux's own open-flag numbers as x86-64 musl hands them (measured by
@@ -1066,7 +1121,11 @@ fn alloc_fd(fds: &mut [FdSlot], kind: u8, vfs_fd: u32, flags: u32) -> Result<u64
 /// file's end; guard clause R pins it against the kernel's plan.
 fn expected_req_len(num: u64, args: &[u64; 6]) -> usize {
     match num {
-        LINUX_WRITE => LINUX_SYSCALL_REQ_BYTES + args[2] as usize,
+        LINUX_WRITE | LINUX_SENDTO =>
+            LINUX_SYSCALL_REQ_BYTES + args[2] as usize,
+        /* M1: connect/bind's one attached shape is the 16-byte sockaddr. */
+        LINUX_CONNECT | LINUX_BIND =>
+            LINUX_SYSCALL_REQ_BYTES + LINUX_SOCKADDR_IN_BYTES,
         /* poll: the caller's whole array rides behind the header. An nfds
          * above the cap is the kernel's first-trap EINVAL; this side keeps
          * the arithmetic total by expecting the plain header for it (the
@@ -1115,6 +1174,16 @@ fn payload_bound(num: u64, args: &[u64; 6], len: usize) -> bool {
             && len <= FD_PAYLOAD_CAP,
         LINUX_GETDENTS64 => args[1] != 0 && len <= DENTS_PAYLOAD_CAP,
         LINUX_CLOCK_GETTIME => args[1] != 0 && len == TIMESPEC_BYTES,
+        /* M1: accept's reply is the fixed 20-byte address trailer when
+         * the caller asked for an address; recvfrom's is its data plus
+         * that trailer, and the data count is the return value (the
+         * kernel's shape rule checks ret == len - 20). */
+        LINUX_ACCEPT => args[1] != 0 && args[2] != 0 &&
+            len == LINUX_NET_ADDR_BYTES,
+        LINUX_RECVFROM => args[1] != 0 && args[2] != 0 &&
+            len >= LINUX_NET_ADDR_BYTES &&
+            len - LINUX_NET_ADDR_BYTES <=
+                (args[2] as usize).min(NET_RECV_MAX),
         /* poll: the full array comes back so the kernel can rewrite the
          * caller's revents in place; a partial array would leave the tail
          * carrying pre-call garbage. */
@@ -1141,6 +1210,7 @@ fn answer_file<K: Kernel, A: BufferAlloc>(
     fds: &mut [FdSlot],
     vt: u32,
     vfs: &mut Vfs<K, A>,
+    net: &mut Option<&mut Box<dyn SocketOps>>,
     payload: &[u8],
     console: &CharNode,
     now_ns: u64,  /* increment 24: the monotonic clock a poll deadline
@@ -1168,7 +1238,7 @@ fn answer_file<K: Kernel, A: BufferAlloc>(
          * sees readiness or the deadline passes. Only revents is written —
          * the caller's events mask is never changed, and a negative fd is
          * ignored with revents 0 (POSIX's own rule). */
-        LINUX_POLL => poll_answer(fds, console, payload, args, now_ns,
+        LINUX_POLL => poll_answer(fds, net, console, payload, args, now_ns,
             |vfs_fd, events| {
                 let mut pf = [PollFd { fd: vfs_fd, events, revents: 0 }];
                 match vfs.poll(vt, &mut pf) {
@@ -1191,6 +1261,15 @@ fn answer_file<K: Kernel, A: BufferAlloc>(
                     Err(e) => Answer::Reply(0, cap_of(e)),
                 }
             }
+            /* M1: write on a socket is send — the Linux fd class's one
+             * table, a second backing family. */
+            Ok(s) if s.kind == FD_KIND_SOCKET => match net.as_deref_mut() {
+                Some(n) => match n.send(s.vfs_fd, payload) {
+                    Ok(got) => Answer::Reply(got as u64, STATUS_OK),
+                    Err(e) => Answer::Reply(0, net_status(e)),
+                },
+                None => Answer::Reply(0, E_NOSYS),
+            },
             Ok(_) => Answer::Reply(0, E_NOSYS),
             Err(x) => Answer::Reply(0, x),
         },
@@ -1206,6 +1285,24 @@ fn answer_file<K: Kernel, A: BufferAlloc>(
         LINUX_READ => match slot_of(fds, args[0]) {
             Ok(s) if s.kind == FD_KIND_CONSOLE =>
                 console_read_answer(console, args[2] as usize),
+            /* M1: read on a socket is recv; data crosses back as the
+             * reply's payload, count-truth like the file arm. */
+            Ok(s) if s.kind == FD_KIND_SOCKET => {
+                let want = (args[2] as usize).min(FD_PAYLOAD_CAP);
+                if want == 0 {
+                    return Answer::ReplyBytes(0, 0, [0u8; FD_PAYLOAD_CAP]);
+                }
+                match net.as_deref_mut() {
+                    Some(n) => {
+                        let mut buf = [0u8; FD_PAYLOAD_CAP];
+                        match n.recv(s.vfs_fd, &mut buf[..want]) {
+                            Ok(got) => Answer::ReplyBytes(got as u64, got, buf),
+                            Err(e) => Answer::Reply(0, net_status(e)),
+                        }
+                    }
+                    None => Answer::Reply(0, E_NOSYS),
+                }
+            }
             Ok(s) => {
                 let want = (args[2] as usize).min(FD_PAYLOAD_CAP);
                 /* E7 increment 21: the continuation's evidence. The offset
@@ -1286,6 +1383,15 @@ fn answer_file<K: Kernel, A: BufferAlloc>(
             if s.kind == FD_KIND_FILE {
                 if let Err(e) = vfs.close(vt, s.vfs_fd) {
                     return Answer::Reply(0, cap_of(e));
+                }
+            } else if s.kind == FD_KIND_SOCKET {
+                /* M1: the descriptor's two halves close together — the
+                 * Linux slot here, the P2 driver's socket on the other
+                 * side of SocketOps. */
+                if let Some(n) = net.as_deref_mut() {
+                    if let Err(e) = n.close_socket(s.vfs_fd) {
+                        return Answer::Reply(0, net_status(e));
+                    }
                 }
             }
             fds[i].used = false;
@@ -1467,6 +1573,234 @@ fn answer_file<K: Kernel, A: BufferAlloc>(
     }
 }
 
+/// M1 — the socket lookup: a Linux fd resolves to the P2 driver's socket
+/// id only when the slot names the Socket kind. A missing slot and a
+/// non-socket descriptor both answer EBADF here (the fd table's own
+/// refusal; ENOTSOCK is a refinement M1 does not need).
+fn socket_id(fds: &[FdSlot], fd: u64) -> Result<u32, i32> {
+    match fd_slot(fds, fd) {
+        Some(s) if s.kind == FD_KIND_SOCKET => Ok(s.vfs_fd),
+        _ => Err(E_BADF),
+    }
+}
+
+/// Map a NET_ERR_* status onto the CAP code whose kernel-side arm delivers
+/// the matching Linux errno. The network family is deliberately not
+/// collapsed: EADDRINUSE, ECONNRESET, ENOTCONN, EMSGSIZE and EPIPE each
+/// have a distinct CAP twin (kernel/cap.h), so a caller's error path sees
+/// the same number Linux would have given it. NET_ERR_INUSE remains EBUSY;
+/// it is the service's "socket already in use" shape, not EADDRINUSE.
+fn net_status(e: u16) -> i32 {
+    match e {
+        NET_ERR_INVAL | NET_ERR_PROTO => E_INVAL,
+        NET_ERR_ADDRINUSE => E_ADDRINUSE,
+        NET_ERR_ADDRNOTAVAIL => E_ADDRNOTAVAIL,
+        NET_ERR_CONNRESET => E_CONNRESET,
+        NET_ERR_NOTCONN => E_NOTCONN,
+        NET_ERR_MSGSIZE => E_MSGSIZE,
+        NET_ERR_PIPE => E_PIPE,
+        NET_ERR_INUSE => E_CONFLICT,
+        NET_ERR_IO => E_REVOKED,
+        NET_ERR_NOMEM => E_NOMEM,
+        NET_ERR_CAP => E_PERM,
+        NET_ERR_WOULDBLOCK => E_AGAIN,
+        _ => E_REVOKED,
+    }
+}
+
+/// Parse the 16 bytes the kernel attached for connect/bind: sin_family is
+/// Host order, sin_port and sin_addr are network order. Only AF_INET is
+/// served; a shorter span or another family is EINVAL (the kernel already
+/// refused a non-16-byte addrlen at the first trap).
+fn parse_sockaddr_in(payload: &[u8]) -> Result<(u32, u16), i32> {
+    if payload.len() < LINUX_SOCKADDR_IN_BYTES {
+        return Err(E_INVAL);
+    }
+    let family = u16::from_le_bytes([payload[0], payload[1]]);
+    if family != AF_INET {
+        return Err(E_INVAL);
+    }
+    let port = u16::from_be_bytes([payload[2], payload[3]]);
+    let ip = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+    Ok((ip, port))
+}
+
+/// M1 — the eight network arms, translated onto SocketOps. The fd table is
+/// the caller's local copy (written back by service, like the file class);
+/// `net` is the manifest's network client, and its ABSENCE is ENOSYS by
+/// name — an environment without a `network` cap cannot pretend to have a
+/// network stack. The kernel has already copied out the sockaddr/data the
+/// child's address space forced; every semantic decision is here.
+fn answer_net(
+    net: &mut Option<&mut Box<dyn SocketOps>>,
+    num: u64,
+    args: &[u64; 6],
+    fds: &mut [FdSlot],
+    payload: &[u8],
+) -> Answer {
+    let Some(net) = net.as_deref_mut() else {
+        return Answer::Reply(0, E_NOSYS); /* no network cap in the manifest */
+    };
+    match num {
+        /* socket(domain, type, protocol): AF_INET + SOCK_STREAM only, with
+         * Linux's own type-flag word (CLOEXEC kept, NONBLOCK kept as the
+         * client's own non-waiting behavior). A protocol of 0 or TCP is
+         * the same stream. Every other shape is refused EINVAL by name. */
+        LINUX_SOCKET => {
+            let ty = args[1] as u32;
+            if args[0] != AF_INET as u64 || (ty & 0xf) != SOCK_STREAM as u32 {
+                return Answer::Reply(0, E_INVAL);
+            }
+            if args[2] != 0 && args[2] != 6 {
+                return Answer::Reply(0, E_INVAL); /* non-TCP protocol */
+            }
+            if ty & !(0xf | LO_CLOEXEC | O_NONBLOCK) != 0 {
+                return Answer::Reply(0, E_NOSYS); /* flag not named */
+            }
+            match net.socket(SOCK_STREAM) {
+                Ok(id) => match alloc_fd(fds, FD_KIND_SOCKET, id,
+                                         O_RDWR | (ty & (LO_CLOEXEC | O_NONBLOCK))) {
+                    Ok(fd) => Answer::Reply(fd, STATUS_OK),
+                    Err(x) => {
+                        let _ = net.close_socket(id);
+                        Answer::Reply(0, x)
+                    }
+                },
+                Err(e) => Answer::Reply(0, net_status(e)),
+            }
+        }
+        LINUX_CONNECT | LINUX_BIND => {
+            let id = match socket_id(fds, args[0]) {
+                Ok(id) => id,
+                Err(x) => return Answer::Reply(0, x),
+            };
+            let (ip, port) = match parse_sockaddr_in(payload) {
+                Ok(v) => v,
+                Err(x) => return Answer::Reply(0, x),
+            };
+            let r = if num == LINUX_CONNECT {
+                net.connect(id, ip, port)
+            } else {
+                net.bind(id, ip, port)
+            };
+            match r {
+                Ok(()) => Answer::Reply(0, STATUS_OK),
+                Err(e) => Answer::Reply(0, net_status(e)),
+            }
+        }
+        LINUX_LISTEN => {
+            let id = match socket_id(fds, args[0]) {
+                Ok(id) => id,
+                Err(x) => return Answer::Reply(0, x),
+            };
+            /* backlog is a hint this driver does not consume (the same
+             * no-op Linux permits); the call still means "start listening". */
+            match net.listen(id) {
+                Ok(()) => Answer::Reply(0, STATUS_OK),
+                Err(e) => Answer::Reply(0, net_status(e)),
+            }
+        }
+        LINUX_ACCEPT => {
+            let id = match socket_id(fds, args[0]) {
+                Ok(id) => id,
+                Err(x) => return Answer::Reply(0, x),
+            };
+            match net.accept_peer(id) {
+                Ok((new_id, rip, rport)) => match alloc_fd(fds, FD_KIND_SOCKET, new_id, O_RDWR) {
+                    Ok(fd) => {
+                        if args[1] == 0 {
+                            /* addr (and therefore addrlen) was NULL: the
+                             * kernel staged no payload, so the new fd is
+                             * the whole answer. */
+                            Answer::Reply(fd, STATUS_OK)
+                        } else {
+                            let mut b = [0u8; FD_PAYLOAD_CAP];
+                            b[0..2].copy_from_slice(&AF_INET.to_le_bytes());
+                            b[2..4].copy_from_slice(&rport.to_be_bytes());
+                            b[4..8].copy_from_slice(&rip.to_be_bytes());
+                            b[16..20].copy_from_slice(
+                                &(LINUX_SOCKADDR_IN_BYTES as u32).to_le_bytes());
+                            Answer::ReplyBytes(fd, LINUX_NET_ADDR_BYTES, b)
+                        }
+                    }
+                    Err(x) => {
+                        let _ = net.close_socket(new_id);
+                        Answer::Reply(0, x)
+                    }
+                },
+                Err(e) => Answer::Reply(0, net_status(e)),
+            }
+        }
+        /* sendto on a connected TCP socket is send; Linux ignores the
+         * destination address in that shape. The kernel packed a non-NULL
+         * destination into args[4]/args[5] at the first trap; decode it
+         * here only to reject a malformed bridge request, then let
+         * NetClient decide whether the socket state makes the send legal. */
+        LINUX_SENDTO => {
+            let id = match socket_id(fds, args[0]) {
+                Ok(id) => id,
+                Err(x) => return Answer::Reply(0, x),
+            };
+            let dest = if args[4] != 0 {
+                if args[5] != LINUX_SENDTO_DEST_MARKER {
+                    return Answer::Reply(0, E_INVAL);
+                }
+                Some(((args[4] >> 16) as u32, (args[4] & 0xffff) as u16))
+            } else {
+                None
+            };
+            match net.send_to(id, payload, dest) {
+                Ok(n) => Answer::Reply(n as u64, STATUS_OK),
+                Err(e) => Answer::Reply(0, net_status(e)),
+            }
+        }
+        /* recvfrom: data first, then the 20-byte trailer. NetClient keeps
+         * the peer for connected and accepted sockets; fill the source
+         * address from it so recvfrom reports the sender, not zeroes. */
+        LINUX_RECVFROM => {
+            let id = match socket_id(fds, args[0]) {
+                Ok(id) => id,
+                Err(x) => return Answer::Reply(0, x),
+            };
+            let want = (args[2] as usize).min(NET_RECV_MAX);
+            if want == 0 {
+                return Answer::Reply(0, STATUS_OK); /* zero-length receive */
+            }
+            let peer = net.peer_addr(id);
+            let mut b = [0u8; FD_PAYLOAD_CAP];
+            match net.recv(id, &mut b[..want]) {
+                Ok(got) => {
+                    let t = got;
+                    b[t..t + 2].copy_from_slice(&AF_INET.to_le_bytes());
+                    if let Some((ip, port)) = peer {
+                        b[t + 2..t + 4].copy_from_slice(&port.to_be_bytes());
+                        b[t + 4..t + 8].copy_from_slice(&ip.to_be_bytes());
+                    }
+                    b[t + 16..t + 20].copy_from_slice(
+                        &(LINUX_SOCKADDR_IN_BYTES as u32).to_le_bytes());
+                    Answer::ReplyBytes(got as u64,
+                                       got + LINUX_NET_ADDR_BYTES, b)
+                }
+                Err(e) => Answer::Reply(0, net_status(e)),
+            }
+        }
+        LINUX_SHUTDOWN => {
+            let id = match socket_id(fds, args[0]) {
+                Ok(id) => id,
+                Err(x) => return Answer::Reply(0, x),
+            };
+            if args[1] > 2 {
+                return Answer::Reply(0, E_INVAL);
+            }
+            match net.shutdown(id, args[1] as u8) {
+                Ok(()) => Answer::Reply(0, STATUS_OK),
+                Err(e) => Answer::Reply(0, net_status(e)),
+            }
+        }
+        _ => Answer::Reply(0, E_NOSYS),
+    }
+}
+
 /// The console half of read(0): the entry loop has already pushed whatever
 /// arrived from the kernel's console channel into this node, so the arm can
 /// answer from bytes that exist now. A zero-byte request is a success even
@@ -1525,6 +1859,7 @@ fn poll_expired(deadline: u64, now_ns: u64) -> bool {
 /// non-zero revents — the value Linux returns.
 fn poll_scan<F>(
     fds: &[FdSlot],
+    net: &mut Option<&mut Box<dyn SocketOps>>,
     arr: &mut [u8; LINUX_POLL_PAYLOAD_BYTES],
     nfds: usize,
     console: &CharNode,
@@ -1556,6 +1891,20 @@ where
                     }
                     r
                 }
+                Some(s) if s.kind == FD_KIND_SOCKET => {
+                    match net.as_deref_mut() {
+                        Some(n) => match n.poll(s.vfs_fd) {
+                            Ok(ev) => {
+                                let mut r = 0u16;
+                                if events & POLLIN != 0 && ev & 0x1 != 0 { r |= POLLIN; }
+                                if events & POLLOUT != 0 && ev & 0x4 != 0 { r |= POLLOUT; }
+                                r
+                            }
+                            Err(_) => POLLERR,
+                        },
+                        None => POLLNVAL,
+                    }
+                }
                 Some(s) => match file_revents(s.vfs_fd, events) {
                     Some(r) => r,
                     None => POLLNVAL,
@@ -1579,6 +1928,7 @@ where
 /// carrying pre-call revents.
 fn poll_answer<F>(
     fds: &[FdSlot],
+    net: &mut Option<&mut Box<dyn SocketOps>>,
     console: &CharNode,
     payload: &[u8],
     args: &[u64; 6],
@@ -1600,7 +1950,7 @@ where
     }
     let mut arr = [0u8; LINUX_POLL_PAYLOAD_BYTES];
     arr[..len].copy_from_slice(&payload[..len]);
-    let ready = poll_scan(fds, &mut arr, nfds, console, &mut file_revents);
+    let ready = poll_scan(fds, net, &mut arr, nfds, console, &mut file_revents);
     let timeout_ms = args[2] as i32;
     if ready > 0 || timeout_ms == 0 {
         if nfds == 0 {
@@ -2114,11 +2464,15 @@ pub fn service<K: Kernel, A: BufferAlloc>(
     k: &K,
     console: &CharNode,
     vfs: &mut Vfs<K, A>,
+    net: Option<&mut Box<dyn SocketOps>>,
 ) {
     /* One clock sample per pass (E7 increment 24): every parked poll's
      * deadline below is measured against the same now, so two waits that
      * expire together resolve in the same pass. */
     let now_ns = k.now_ns();
+    /* M1: reborrowed per task, never held across an iteration, so every
+     * Linux task's network arm reaches the one manifest-owned client. */
+    let mut net = net;
     for i in 0..MAX_LINUX_TASKS {
         if !tasks()[i].used {
             continue;
@@ -2173,7 +2527,7 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                 let vt = tasks()[i].vfs_task;
                 let fds_copy = tasks()[i].fds;
                 let mut arr = tasks()[i].pending_bytes;
-                let ready = poll_scan(&fds_copy, &mut arr, nfds, console,
+                let ready = poll_scan(&fds_copy, &mut net, &mut arr, nfds, console,
                     &mut |vfs_fd, events| {
                         let mut pf = [PollFd { fd: vfs_fd, events,
                                               revents: 0 }];
@@ -2299,12 +2653,18 @@ pub fn service<K: Kernel, A: BufferAlloc>(
          * module, so the fd class's read arm cannot stay kernel-side
          * (its data crosses back as the reply's payload, count-truth). */
         let ans = match num {
+            /* M1: the network class's eight numbers route to their own
+             * translation over SocketOps; the file class below is
+             * unchanged. */
+            LINUX_SOCKET | LINUX_CONNECT | LINUX_ACCEPT | LINUX_SENDTO
+            | LINUX_RECVFROM | LINUX_SHUTDOWN | LINUX_BIND | LINUX_LISTEN =>
+                answer_net(&mut net, num, &args, &mut fds, payload),
             LINUX_READ | LINUX_WRITE | LINUX_OPEN | LINUX_CLOSE | LINUX_STAT
             | LINUX_LSTAT | LINUX_LSEEK | LINUX_FCNTL | LINUX_FSYNC
             | LINUX_FTRUNCATE | LINUX_RENAME | LINUX_MKDIR | LINUX_UNLINK
             | LINUX_GETDENTS64 | LINUX_POLL =>
                 answer_file(num, &args, &mut fds, tasks()[i].vfs_task, vfs,
-                            payload, console, now_ns, tasks()[i].gate),
+                            &mut net, payload, console, now_ns, tasks()[i].gate),
             _ => answer(num, &args, &fds, &mut mem, &mut sigstate, payload),
         };
         tasks()[i].fds = fds;
@@ -2616,6 +2976,173 @@ pub fn service<K: Kernel, A: BufferAlloc>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M1: a SocketOps implementation whose answers are fixed, so the
+    /// eight arms' TRANSLATION is what the test observes — the fd table,
+    /// the return shapes and the 20-byte trailer, never a driver.
+    struct FakeNet;
+
+    impl SocketOps for FakeNet {
+        fn socket(&mut self, _: u16) -> Result<u32, u16> { Ok(1) }
+        fn connect(&mut self, _: u32, _: u32, _: u16) -> Result<(), u16> { Ok(()) }
+        fn send(&mut self, _: u32, data: &[u8]) -> Result<usize, u16> {
+            Ok(data.len())
+        }
+        fn recv(&mut self, _: u32, buf: &mut [u8]) -> Result<usize, u16> {
+            let n = buf.len().min(5);
+            buf[..n].copy_from_slice(&b"hello"[..n]);
+            Ok(n)
+        }
+        fn bind(&mut self, _: u32, _: u32, _: u16) -> Result<(), u16> { Ok(()) }
+        fn listen(&mut self, _: u32) -> Result<(), u16> { Ok(()) }
+        fn accept(&mut self, _: u32) -> Result<u32, u16> { Ok(2) }
+        fn accept_peer(&mut self, _: u32) -> Result<(u32, u32, u16), u16> {
+            Ok((2, 0x7F00_0001, 8080))
+        }
+        fn peer_addr(&self, _: u32) -> Option<(u32, u16)> {
+            Some((0x7F00_0001, 8080))
+        }
+        fn close_socket(&mut self, _: u32) -> Result<(), u16> { Ok(()) }
+        fn poll(&mut self, _: u32) -> Result<u16, u16> { Ok(1) }
+        fn shutdown(&mut self, _: u32, _: u8) -> Result<(), u16> { Ok(()) }
+    }
+
+    /// M1: every one of the eight numbers reaches SocketOps through the
+    /// fd table, and the replies carry the shapes the kernel stages (a
+    /// socket fd, a zero for the control calls, and the 20-byte address
+    /// trailer for accept/recvfrom). This is the sidecar's half of the
+    /// bridge, driven without a channel or a boot.
+    #[test]
+    fn m1_network_arms_translate_onto_socketops() {
+        let mut fds = fds();
+        let mut boxed: Box<dyn SocketOps> = Box::new(FakeNet);
+        let mut net = Some(&mut boxed);
+
+        let fd = match answer_net(&mut net, LINUX_SOCKET,
+                                  &[AF_INET as u64, SOCK_STREAM as u64,
+                                    0, 0, 0, 0], &mut fds, &[]) {
+            Answer::Reply(fd, 0) => fd,
+            _ => panic!("socket did not answer a fd"),
+        };
+        assert_eq!(fds[fd as usize].kind, FD_KIND_SOCKET);
+        assert_eq!(fds[fd as usize].vfs_fd, 1);
+
+        let sa = [2u8, 0, 0x1f, 0x90, 127, 0, 0, 1,
+                  0, 0, 0, 0, 0, 0, 0, 0];
+        match answer_net(&mut net, LINUX_CONNECT,
+                         &[fd, 0, 16, 0, 0, 0], &mut fds, &sa) {
+            Answer::Reply(0, 0) => {}
+            _ => panic!("connect did not answer 0"),
+        }
+        match answer_net(&mut net, LINUX_BIND,
+                         &[fd, 0, 16, 0, 0, 0], &mut fds, &sa) {
+            Answer::Reply(0, 0) => {}
+            _ => panic!("bind did not answer 0"),
+        }
+        match answer_net(&mut net, LINUX_LISTEN,
+                         &[fd, 16, 0, 0, 0, 0], &mut fds, &[]) {
+            Answer::Reply(0, 0) => {}
+            _ => panic!("listen did not answer 0"),
+        }
+        match answer_net(&mut net, LINUX_SENDTO,
+                         &[fd, 0, 2, 0, 0, 0], &mut fds, b"hi") {
+            Answer::Reply(2, 0) => {}
+            _ => panic!("sendto did not answer its byte count"),
+        }
+        /* A destination is packed by the kernel into args[4] with the
+         * marker in args[5]; the sidecar decodes it and invokes send_to. */
+        let packed = ((0x0A00_020Fu64) << 16) | 9999u64;
+        match answer_net(&mut net, LINUX_SENDTO,
+                         &[fd, 0, 2, 0, packed, LINUX_SENDTO_DEST_MARKER],
+                         &mut fds, b"hi") {
+            Answer::Reply(2, 0) => {}
+            _ => panic!("sendto with a destination did not answer"),
+        }
+        assert!(matches!(answer_net(&mut net, LINUX_SENDTO,
+                                     &[fd, 0, 2, 0, packed, 0], &mut fds, b"hi"),
+                         Answer::Reply(0, E_INVAL)));
+
+        let (ret, n, b) = match answer_net(&mut net, LINUX_ACCEPT,
+                                           &[fd, 0x1000, 0x2000, 0, 0, 0],
+                                           &mut fds, &[]) {
+            Answer::ReplyBytes(r, l, b) => (r, l, b),
+            _ => panic!("accept did not carry the address trailer"),
+        };
+        assert_eq!(ret, 1);          /* the next fd the table mints */
+        assert_eq!(n, LINUX_NET_ADDR_BYTES);
+        assert_eq!(&b[0..2], &AF_INET.to_le_bytes());
+        assert_eq!(&b[2..4], &8080u16.to_be_bytes());
+        assert_eq!(&b[4..8], &0x7F00_0001u32.to_be_bytes());
+        assert_eq!(&b[16..20], &16u32.to_le_bytes());
+
+        let (ret, n, b) = match answer_net(&mut net, LINUX_RECVFROM,
+                                           &[fd, 0x3000, 8, 0, 0x4000, 0x5000],
+                                           &mut fds, &[]) {
+            Answer::ReplyBytes(r, l, b) => (r, l, b),
+            _ => panic!("recvfrom did not carry data plus the trailer"),
+        };
+        assert_eq!(ret, 5);
+        assert_eq!(n, 5 + LINUX_NET_ADDR_BYTES);
+        assert_eq!(&b[..5], b"hello");
+        assert_eq!(&b[5..7], &AF_INET.to_le_bytes());
+        assert_eq!(&b[7..9], &8080u16.to_be_bytes());
+        assert_eq!(&b[9..13], &0x7F00_0001u32.to_be_bytes());
+        assert_eq!(&b[21..25], &16u32.to_le_bytes());
+
+        match answer_net(&mut net, LINUX_SHUTDOWN,
+                         &[fd, 1, 0, 0, 0, 0], &mut fds, &[]) {
+            Answer::Reply(0, 0) => {}
+            other => panic!("shutdown did not answer 0: {:?}", other),
+        }
+        assert!(matches!(answer_net(&mut net, LINUX_SHUTDOWN,
+                                    &[fd, 3, 0, 0, 0, 0], &mut fds, &[]),
+                         Answer::Reply(0, E_INVAL)));
+    }
+
+    #[test]
+    fn socket_poll_maps_service_events_and_unknown_fds() {
+        let console = CharNode::console();
+        let mut fds = fds();
+        fds[3] = FdSlot { used: true, kind: FD_KIND_SOCKET, vfs_fd: 9, flags: 0 };
+        let mut boxed: Box<dyn SocketOps> = Box::new(FakeNet);
+        let mut net = Some(&mut boxed);
+        let mut payload = [0u8; LINUX_POLL_PAYLOAD_BYTES];
+        payload[..8].copy_from_slice(&pollfd(3, POLLIN | POLLOUT));
+        let args = [0x1000u64, 1, 0, 0, 0, 0];
+        match poll_answer(&fds, &mut net, &console, &payload[..8], &args, 0,
+                          |_, _| panic!("a socket must not reach the VFS")) {
+            Answer::ReplyBytes(ret, len, arr) => {
+                assert_eq!((ret, len), (1, 8));
+                assert_eq!(u16::from_le_bytes([arr[6], arr[7]]), POLLIN);
+            }
+            other => panic!("socket poll: {:?}", other),
+        }
+        assert_eq!(net_status(NET_ERR_CONNRESET), E_CONNRESET);
+        assert_eq!(net_status(NET_ERR_ADDRINUSE), E_ADDRINUSE);
+        assert_eq!(net_status(NET_ERR_NOTCONN), E_NOTCONN);
+        assert_eq!(net_status(NET_ERR_PIPE), E_PIPE);
+    }
+
+    /// M1: the sockaddr transform and the network request/reply bounds —
+    /// the pure halves both ends of the seam derive independently. A
+    /// sockaddr_in is host-order family, network-order port/address; the
+    /// attach lengths and reply shapes are the kernel plan's twins.
+    #[test]
+    fn m1_network_sockaddr_and_bounds() {
+        let sa = [2u8, 0, 0x1f, 0x90, 127, 0, 0, 1,
+                  0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(parse_sockaddr_in(&sa), Ok((0x7F00_0001, 8080)));
+        assert_eq!(parse_sockaddr_in(&sa[..8]), Err(E_INVAL));
+        assert_eq!(expected_req_len(LINUX_CONNECT,
+                                    &[0, 0, 16, 0, 0, 0]),
+                   LINUX_SYSCALL_REQ_BYTES + LINUX_SOCKADDR_IN_BYTES);
+        assert_eq!(expected_req_len(LINUX_SENDTO, &[0, 0, 7, 0, 0, 0]),
+                   LINUX_SYSCALL_REQ_BYTES + 7);
+        assert!(payload_bound(LINUX_ACCEPT, &[0, 1, 1, 0, 0, 0], 20));
+        assert!(!payload_bound(LINUX_ACCEPT, &[0, 0, 1, 0, 0, 0], 20));
+        assert!(payload_bound(LINUX_RECVFROM, &[0, 1, 32, 0, 0, 0], 20));
+        assert!(!payload_bound(LINUX_RECVFROM, &[0, 1, 32, 0, 0, 0], 53));
+    }
 
     fn fds() -> [FdSlot; LINUX_MAX_FDS] {
         [FdSlot { used: false, kind: 0, vfs_fd: 0, flags: 0 }; LINUX_MAX_FDS]
@@ -3022,7 +3549,7 @@ mod tests {
         /* Nothing buffered, 5 s timeout: the request WAITS, and the
          * parked array is the caller's own bytes (revents untouched until
          * a readiness decision is real). */
-        match poll_answer(&f, &console, &payload[..8], &args, 100,
+        match poll_answer(&f, &mut None, &console, &payload[..8], &args, 100,
                           |_, _| None) {
             Answer::PollWait(arr, len, deadline) => {
                 assert_eq!(len, 8);
@@ -3040,7 +3567,7 @@ mod tests {
         /* A typed byte makes the same entry ready; the caller's events
          * mask is never rewritten, only revents. */
         console.console_io().push_input(b"x");
-        match poll_answer(&f, &console, &payload[..8], &args, 200,
+        match poll_answer(&f, &mut None, &console, &payload[..8], &args, 200,
                           |_, _| None) {
             Answer::ReplyBytes(ret, len, arr) => {
                 assert_eq!((ret, len), (1, 8), "one ready fd, full array");
@@ -3062,7 +3589,7 @@ mod tests {
         payload[..8].copy_from_slice(&pollfd(0, POLLIN));
         /* Timeout 0 is the snapshot: 0 ready, but the full array still
          * crosses back (the kernel writes it into the caller's span). */
-        match poll_answer(&f, &console, &payload[..8], &zero, 0,
+        match poll_answer(&f, &mut None, &console, &payload[..8], &zero, 0,
                           |_, _| None) {
             Answer::ReplyBytes(ret, len, arr) => {
                 assert_eq!((ret, len), (0, 8));
@@ -3074,7 +3601,7 @@ mod tests {
          * an error to report, not a wait. */
         payload[..8].copy_from_slice(&pollfd(9, POLLIN));
         let timed = [0x1000u64, 1, 50, 0, 0, 0];
-        match poll_answer(&f, &console, &payload[..8], &timed, 0,
+        match poll_answer(&f, &mut None, &console, &payload[..8], &timed, 0,
                           |_, _| None) {
             Answer::ReplyBytes(ret, _, arr) => {
                 assert_eq!(ret, 1);
@@ -3088,7 +3615,7 @@ mod tests {
         file_fds[3] = FdSlot { used: true, kind: FD_KIND_FILE, vfs_fd: 7,
                                flags: 0 };
         payload[..8].copy_from_slice(&pollfd(3, POLLIN));
-        match poll_answer(&file_fds, &console, &payload[..8], &timed, 0,
+        match poll_answer(&file_fds, &mut None, &console, &payload[..8], &timed, 0,
                           |vfd, ev| {
                               assert_eq!((vfd, ev), (7, POLLIN));
                               Some(POLLIN)
@@ -3102,14 +3629,14 @@ mod tests {
         /* A negative fd is ignored: revents 0 and it cannot make a wait
          * ready (POSIX's own rule). */
         payload[..8].copy_from_slice(&pollfd(-1, POLLIN));
-        match poll_answer(&f, &console, &payload[..8], &timed, 0,
+        match poll_answer(&f, &mut None, &console, &payload[..8], &timed, 0,
                           |_, _| None) {
             Answer::PollWait(arr, ..) => assert_eq!(arr[6..8], [0, 0]),
             other => panic!("negative fd: {:?}", other),
         }
         /* nfds 0 with timeout -1 is a pure sleep: parked with no array
          * and no deadline (0 is "forever", never "already expired"). */
-        match poll_answer(&f, &console, &[], &[0, 0, u64::MAX, 0, 0, 0],
+        match poll_answer(&f, &mut None, &console, &[], &[0, 0, u64::MAX, 0, 0, 0],
                           0, |_, _| None) {
             Answer::PollWait(_, 0, 0) => {}
             other => panic!("infinite sleep: {:?}", other),

@@ -627,6 +627,9 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                 cur->reply_stage_len   = 0;
                 cur->reply_stage_kind  = 0;
                 cur->reply_stage_aux   = 0;
+                cur->reply_stage_va2   = 0;
+                cur->reply_stage_len2  = 0;
+                cur->reply_stage_va3   = 0;
                 cur->reply_stage_valid = 0;
                 /* E7 increment 5, plan half: BEFORE the describe (the
                  * clamp must be IN the description) and before the
@@ -653,6 +656,40 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                  * The array's length is derived by both ends from args[1],
                  * so poll needs no clamp word. */
                 if (num == LINUX_WRITE && plan.len) largs[2] = plan.len;
+                /* M1: sendto's count is the same one-truth clamp — the
+                 * kernel's attach length rides in args[2] so header,
+                 * payload and the count the task sees cannot disagree. */
+                if (num == LINUX_SENDTO && plan.len) largs[2] = plan.len;
+                /* M1 fidelity: sendto's destination is a second user span.
+                 * The write plan cannot attach two disjoint buffers, so
+                 * copy the 16-byte sockaddr_in here, decode its Host-order
+                 * ip/port, and forward them packed in args[4] with the
+                 * marker in args[5]. A NULL destination is unaffected; a
+                 * non-16 addrlen was already refused by the plan. */
+                if (num == LINUX_SENDTO && largs[4] != 0) {
+                    uint8_t dest_addr[LINUX_SOCKADDR_IN_BYTES];
+                    uint32_t dest_ip = 0;
+                    uint16_t dest_port = 0;
+                    int dest_ret;
+                    if (linux_user_copy_out(dest_addr, cur->cr3, largs[4],
+                                            LINUX_SOCKADDR_IN_BYTES) != 0) {
+                        kernel_serial_printf(
+                            "[M1] sendto destination 0x%lx refused before "
+                            "post: unmapped or non-user span\n",
+                            (unsigned long)largs[4]);
+                        return (uint64_t)(int64_t)(-LINUX_EFAULT);
+                    }
+                    dest_ret = linux_sendto_dest_decode(dest_addr, &dest_ip,
+                                                        &dest_port);
+                    if (dest_ret) {
+                        kernel_serial_printf(
+                            "[M1] sendto destination refused before post: "
+                            "non-AF_INET family\n");
+                        return (uint64_t)(int64_t)dest_ret;
+                    }
+                    largs[4] = ((uint64_t)dest_ip << 16) | dest_port;
+                    largs[5] = LINUX_SENDTO_DEST_MARKER;
+                }
                 /* E7 increment 10 (the signal seam): the act/set byte
                  * crossing — the write plan's twin for the sig class,
                  * computed after it (one number is one plan) and BEFORE
@@ -967,6 +1004,9 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                     cur->reply_stage_len   = rplan.len;
                     cur->reply_stage_kind  = rplan.kind;
                     cur->reply_stage_aux   = rplan.aux;
+                    cur->reply_stage_va2   = rplan.dst2;
+                    cur->reply_stage_len2  = rplan.len2;
+                    cur->reply_stage_va3   = rplan.dst3;
                     cur->reply_stage_valid = 1;
                 }
                 /* Arm BEFORE the post: cap_maybe_handoff (process.c) reads

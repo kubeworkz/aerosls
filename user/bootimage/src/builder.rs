@@ -40,8 +40,13 @@ pub const ENV_CONTROL_PEER: &str = "kernel.env.control";
 /// Ramdisk driver peer — the POSIX sidecar's block device endpoint.
 pub const RAMDISK_PEER: &str = "drv.ramdisk.0";
 
-/// Network driver peer — the POSIX sidecar's network socket endpoint.
+/// Network driver peer — for sidecars that share the driver's partition.
 pub const NET_PEER: &str = "drv.network.0";
+
+/// Kernel-owned socket service peer — the POSIX tenant's bridge endpoint.
+/// kernel/cap.c wires this name into net_socket_service_register(), so the
+/// tenant gets its own channel/replies instead of sharing the driver's.
+pub const NET_SOCKET_PEER: &str = "kernel.net.socket";
 
 /// The whole archive entry list, in order. The registry region is NOT an
 /// entry: it is implicit memory the loader reserves and zeroes (devreg.rs
@@ -333,9 +338,9 @@ fn build_posix_manifest(spec: &BootImageSpec, layout: &BootLayout, blob_offset: 
         }),
         Some(ManifestCap {
             name: "network",
-            rights: 0x7, // R | W | send — network socket channel to the network driver
+            rights: 0x7, // R | W | send — tenant socket channel to the kernel stack
             kind: CapKind::Chan {
-                peer: Some(NET_PEER),
+                peer: Some(NET_SOCKET_PEER),
                 flags: 0,
             },
         }),

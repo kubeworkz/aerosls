@@ -331,7 +331,7 @@ fi
 # entry loop must actually call the service arm, the answers must be the
 # census's honest set (§11 Q5), and the reply must be the exact struct the
 # kernel's apply will accept or every exchange dies -EPROTO.
-if grep -qF 'crate::linux::service(&RealKernel, &booted.console, &mut booted.proc.vfs);' "$LRE" && \
+if grep -qF 'crate::linux::service(&RealKernel, &booted.console, vfs, net);' "$LRE" && \
    grep -qF 'crate::linux::append_wait(' "$LRE"; then
     ok "K. the entry loop services the Linux children (with the VFS the file class now needs) AND adds their channels to the quiesce wait set (a forward wakes the sidecar, not an idle pass)"
 else
@@ -499,7 +499,7 @@ if grep -qF 'let (lo, hi) = expected_req_range(num, &args);' "$LRS" && \
    grep -qF 'if rr.len < lo || rr.len > hi {' "$LRS" && \
    grep -qF 'const FD_PAYLOAD_CAP: usize = 1024;' "$LRS" && \
    grep -qF 'match console.write(&payload[..len]) {' "$LRS" && \
-   grep -qF 'crate::linux::service(&RealKernel, &booted.console, &mut booted.proc.vfs);' "$LRE"; then
+   grep -qF 'crate::linux::service(&RealKernel, &booted.console, vfs, net);' "$LRE"; then
     ok "M6. the sidecar checks EVERY request's attached bytes against expected_req_range — exact for write/sig (the kernel's attach twin), a cap-bounded range for the path numbers (rename carries two strings) — a drifted attach arrives only as a wrong length and dies -EPROTO, the write chunk cap is intact, the perform happens on the loop's console, and service is handed that console (plus the VFS)"
 else
     bad "M6. the payload invariant, the chunk cap, the console perform, or the service's console hand-off is gone — bytes the task did not write could be performed, or a write could never reach the serial log it exists to prove"
@@ -889,7 +889,7 @@ else
 fi
 if grep -qF 'const PENDING_READ: u8 = 1;' "$LRS" && \
    grep -qF 'const PENDING_POLL: u8 = 2;' "$LRS" && \
-   grep -qF 'LINUX_POLL => poll_answer(fds, console, payload, args, now_ns,' "$LRS" && \
+   grep -qF 'LINUX_POLL => poll_answer(fds, net, console, payload, args, now_ns,' "$LRS" && \
    grep -qF 'return Answer::ReadWait(want);' "$LRS" && \
    grep -qF 'Answer::PollWait(arr, len, poll_deadline(now_ns, timeout_ms))' "$LRS" && \
    grep -qF 'poll_expired(deadline, now_ns)' "$LRS" && \

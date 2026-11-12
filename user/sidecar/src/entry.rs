@@ -99,9 +99,9 @@ pub extern "C" fn posix_net_info_handshake(net_w: u32, net_r: u32) -> u32 {
     // ── IMPORTANT: send NET_INFO exactly ONCE ───────────────────────────
     // The network server replies to every NET_INFO it receives.  If we
     // re-sent on each retry (old behavior), the queue would accumulate
-    // stale tag=1 replies, and the NetClient (whose tag counter also
-    // starts at 1) would consume a stale reply for `socket()`, then get
-    // the *socket* reply for `bind()` — a tag mismatch Protocol error.
+    // stale tag=1 replies; NetClient now starts at tag 2, reserving 1
+    // for this handshake, so a late reply is skipped by the matcher
+    // instead of being consumed as socket()'s reply.
     // So: send once, and only retry the RECV (the server processes the
     // single queued message as soon as it adopts our channel).
     let send_rc = unsafe {
@@ -663,6 +663,42 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         }
     }
 
+    // M1: the live Linux TCP round trip. Compiled only into an image built
+    // with M1_NET_PROBE=1; the child is spawned by the initial POSIX sidecar
+    // (no E3 identity), whose `network` cap is the live driver path the
+    // system nettest exercises. The E3 tenant's kernel.net.socket channel is
+    // registered but its NET_INFO/socket replies do not reach the sidecar
+    // yet, so it cannot host the probe. One environment binds :9999. The
+    // track flag mirrors the child's own write(1) markers to serial — the
+    // tenant console has no attach surface in this boot.
+    #[cfg(feature = "m1_net_probe")]
+    {
+        if !gate && caps.identity.is_none() {
+            match crate::m1_net_probe::spawn(&RealKernel, caps.budget_base, caps.budget_len) {
+                Ok(sp) => match booted.proc.vfs.add_task() {
+                    Ok(vt) => {
+                        if crate::linux::track(
+                            sp.ch_r,
+                            sp.ch_w,
+                            crate::m1_net_probe::PROBE_NAME,
+                            0,
+                            sp.heap_base,
+                            sp.heap_limit,
+                            vt,
+                            true,
+                        ) {
+                            klog(b"[M1] net probe: spawned ch_r=", sp.ch_r, b"");
+                        } else {
+                            klog(b"[M1] net probe: TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+                        }
+                    }
+                    Err(_) => klog(b"[M1] net probe: VFS task alloc FAILED ch_r=", sp.ch_r, b""),
+                },
+                Err(rc) => klog(b"[M1] net probe: spawn FAILED rc=", rc as u32, b""),
+            }
+        }
+    }
+
     let mut boot_stats_sent = false;
     /* Increment 21: the gate profile still owes the kernel ONE console line.
      * boot.rs writes the `[env-id]` announcement before init runs, and the
@@ -728,7 +764,8 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         // the parked sidecar's quiesce wait set includes these channels
         // (linux::append_wait), so a forward wakes this loop instead of
         // spinning it.
-        crate::linux::service(&RealKernel, &booted.console, &mut booted.proc.vfs);
+        let (vfs, net) = booted.proc.vfs_and_net();
+        crate::linux::service(&RealKernel, &booted.console, vfs, net);
         booted.proc.drain_wakes();
         // One-shot boot diagnostic: report what task 0 (init) did and how
         // many tasks are live, so a quiet boot can be told apart from a

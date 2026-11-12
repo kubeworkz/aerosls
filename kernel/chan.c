@@ -900,6 +900,9 @@ uint64_t k_linux_deliver(uint32_t pid, uint16_t ch_r, uint64_t expect_num) {
             uint32_t slen = 0;
             uint8_t skind = 0;   /* step 4: LINUX_STAGE_* — what the    */
             uint32_t saux = 0;   /* payload IS before the copy-in       */
+            uint64_t sva2 = 0;   /* M1: the network reply's second      */
+            uint32_t slen2 = 0;  /* destination (accept addrlen /       */
+            uint64_t sva3 = 0;   /* recvfrom sockaddr) and third        */
 
             if (out.kind == CH_KIND_CLOSE) {
                 /* The sidecar closed the endpoint or died (its teardown
@@ -932,6 +935,9 @@ uint64_t k_linux_deliver(uint32_t pid, uint16_t ch_r, uint64_t expect_num) {
                 slen = pd->reply_stage_len;
                 skind = pd->reply_stage_kind;
                 saux = pd->reply_stage_aux;
+                sva2 = pd->reply_stage_va2;
+                slen2 = pd->reply_stage_len2;
+                sva3 = pd->reply_stage_va3;
             }
             if (pd) {
                 pd->reply_stage_valid = 0;
@@ -940,6 +946,9 @@ uint64_t k_linux_deliver(uint32_t pid, uint16_t ch_r, uint64_t expect_num) {
                 pd->reply_stage_len = 0;
                 pd->reply_stage_kind = 0;
                 pd->reply_stage_aux = 0;
+                pd->reply_stage_va2 = 0;
+                pd->reply_stage_len2 = 0;
+                pd->reply_stage_va3 = 0;
             }
 
             if (n == 0) {
@@ -1007,6 +1016,7 @@ uint64_t k_linux_deliver(uint32_t pid, uint16_t ch_r, uint64_t expect_num) {
                                                 SLSLinuxSyscallRequest));
                 const uint8_t *pay = rbuf +
                     (uint32_t)sizeof(struct SLSLinuxSyscallRequest);
+                uint32_t dlen;
                 /* apply re-enforces the echo (J2's order is untouched);
                  * its only refusal in this shape is -EPROTO, and a copy
                  * must never run for a reply apply did not accept. */
@@ -1027,6 +1037,47 @@ uint64_t k_linux_deliver(uint32_t pid, uint16_t ch_r, uint64_t expect_num) {
                  * never the sidecar's — and the cursor advances only by
                  * entries actually packed (a short getdents is legal; the
                  * caller loops, and end-of-directory is 0 bytes, 0 entries). */
+                if (skind == LINUX_STAGE_ACCEPT) {
+                    /* M1: 16-byte sockaddr_in at the staged address,
+                     * then the u32 addrlen at the second destination.
+                     * The sidecar always sends the full trailer; the
+                     * shape rule already refused any other length. */
+                    if (n != LINUX_NET_ADDR_BYTES ||
+                        (sva2 && slen2 != 4))
+                        return (uint64_t)(int64_t)(-LINUX_EPROTO);
+                    if (linux_user_copy_in(pay, pd->cr3, sva,
+                                           LINUX_SOCKADDR_IN_BYTES) != 0)
+                        return (uint64_t)(int64_t)(-LINUX_EFAULT);
+                    if (sva2 && linux_user_copy_in(
+                            pay + LINUX_SOCKADDR_IN_BYTES, pd->cr3,
+                            sva2, 4) != 0)
+                        return (uint64_t)(int64_t)(-LINUX_EFAULT);
+                    return rax;
+                }
+                if (skind == LINUX_STAGE_RECVFROM) {
+                    /* M1: data first, then the same 20-byte trailer.
+                     * ret is the data count (shape-checked), so the
+                     * kernel only has to refuse a payload whose split
+                     * disagrees with the stage, then write each part. */
+                    if (n < LINUX_NET_ADDR_BYTES ||
+                        (sva2 && slen2 != LINUX_SOCKADDR_IN_BYTES))
+                        return (uint64_t)(int64_t)(-LINUX_EPROTO);
+                    dlen = n - LINUX_NET_ADDR_BYTES;
+                    if (dlen > saux)
+                        return (uint64_t)(int64_t)(-LINUX_EPROTO);
+                    if (dlen != 0 &&
+                        linux_user_copy_in(pay, pd->cr3, sva, dlen) != 0)
+                        return (uint64_t)(int64_t)(-LINUX_EFAULT);
+                    if (sva2 && linux_user_copy_in(
+                            pay + dlen, pd->cr3, sva2,
+                            LINUX_SOCKADDR_IN_BYTES) != 0)
+                        return (uint64_t)(int64_t)(-LINUX_EFAULT);
+                    if (sva3 && linux_user_copy_in(
+                            pay + dlen + LINUX_SOCKADDR_IN_BYTES, pd->cr3,
+                            sva3, 4) != 0)
+                        return (uint64_t)(int64_t)(-LINUX_EFAULT);
+                    return rax;
+                }
                 if (skind == LINUX_STAGE_STAT) {
                     uint8_t sbuf[LINUX_STAT_BYTES];
                     if (n != LINUX_STAT_PAYLOAD_BYTES)

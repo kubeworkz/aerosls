@@ -3276,12 +3276,13 @@ Everything this document asserts about the tree, with its source.
 | E6's console guard, its cross-partition witness and its vacuity control | `AeroSLS-POSIX-Environments-Roadmap-v0.1.md` §9; `tests/env_console_attach_check.sh` |
 | The Linux task's capability table holds exactly one entry, and per-partition page indexing is unbuilt | `AeroSLS-Linux-ABI-Shim-Design-v0.1.md` §3.5; `kernel/partition.c`'s Storage Isolation Phase 1 reference |
 | E7's gate, its two-halves reporting rule, and the monitoring candidate eliminated by its need for sockets | `AeroSLS-Linux-ABI-Shim-Design-v0.1.md` §8, §10.4, §5.5.1 |
+| M1's eight socket-class calls cross the Linux trap to P2's service, and the live probe completes a TCP round trip | `kernel/linux_abi.{h,c}`; `user/sidecar/src/linux.rs`; `tests/linux_net_bridge_host_test.c` (27 checks); `tests/m1_net_probe_check.sh`; `evidence/m1_net_probe_gate.log` |
 | Signals are accepted and never delivered, and the candidate calls them | `AeroSLS-Linux-ABI-Shim-Design-v0.1.md` §5.6; `tools/linux_syscall_census.txt` |
 | Threads/`clone`/`futex` are unscoped and are Go's gate | `AeroSLS-Linux-ABI-Shim-Design-v0.1.md` §7 |
 
 ## Appendix B — Named gaps, each with its destination
 
-**Register checked 2026-11-11.** A row is marked **LANDED** only when the gap is closed in the tree and the cell names where. Rows marked **M1–M6** are planned in the Linux-shape decision record, not landed. The one remaining evidence caveat in the status line stays visible rather than being swept into a green row.
+**Register checked 2026-11-12.** A row is marked **LANDED** only when the gap is closed in the tree and the cell names where. Rows marked **M2–M6** are planned in the Linux-shape decision record, not landed; M1 is landed below, with its live coverage boundary visible in the row. The one remaining P3 evidence caveat in the status line stays visible rather than being swept into a green row.
 
 | Gap | Consequence if unaddressed | Destination |
 |---|---|---|
@@ -3301,7 +3302,7 @@ Everything this document asserts about the tree, with its source.
 | The failover broadcast path is 24 KiB | a 5.5 MiB environment cannot ride it; the gap must be stated, not implied | P3 — **LANDED** ((b) at increments 9 and 11; (a) as the replica path from increment 13 — §11 Q5). **Evidence caveat:** one adoption-guard replica branch was not exercised live |
 | No thread groups / `clone` / `futex` | Go, threaded CPython and Node are out | M4 — planned in the Linux-shape roadmap; §9 still records the structural blocker |
 | No mediated native↔POSIX interop | environments are a sealed box, not PASE-with-IFS | **PARTIAL** — read-only catalog + `CAT_QUERY` landed (§9.1); writes, IFS-like sharing, identity/ACL and native SIMI are M5 — planned. |
-| Linux networking syscalls are not wired into the Linux ABI shim | Linux binaries still get `ENOSYS` for `socket`/`connect`; P2 serves the sidecar applet path, not the Linux personality | M1 — planned |
+| Linux networking syscalls are not wired into the Linux ABI shim | Linux binaries still get `ENOSYS` for `socket`/`connect`; P2 serves the sidecar applet path, not the Linux personality | M1 — **LANDED** (2026-11-12): `socket`/`connect`/`accept`/`sendto`/`recvfrom`/`shutdown`/`bind`/`listen` cross the Linux trap to P2's socket service. `tests/linux_net_bridge_host_test.c` covers the kernel plan (27 checks); `tests/m1_net_probe_check.sh` boots `sls_operating_system_m1net.iso`, asserts all eight calls, and observed 2 executions with no `M1-NET FAIL`; evidence `evidence/m1_net_probe_gate.log`. **Coverage boundary:** the probe's peer is the guest's own 10.0.2.15 address (kernel loopback), not a host/NIC peer; UDP, IPv6, external connect failures, `CLOEXEC`/nonblocking variants, and `SHUT_RDWR` are not live-tested. |
 | Dynamic linking is refused (static non-PIE `ET_EXEC` only) | most existing Linux binaries cannot start; `ld.so`, `.so` and `dlopen` are absent | M2 — planned |
 | Signals are accepted and recorded but never delivered | POSIX handlers, masks and `sigaltstack` do not run; only default actions are honest | M3 — planned |
 | Four-environment ceiling; fixed `PROC_MAX` 16 and 16-entry sidecar registry | not enough for a production PASE workload; P3 placement refuses over-capacity | M6 — planned |

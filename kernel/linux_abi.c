@@ -65,6 +65,21 @@ int32_t linux_errno_from_cap(int32_t cap_code)
     case CAP_ENOTEMPTY:              return -LINUX_ENOTEMPTY;
     case CAP_ENAMETOOLONG:           return -LINUX_ENAMETOOLONG;
     case CAP_EPERM:                  return -LINUX_EPERM;
+    /* M1 network class: statuses the P2 socket service can distinguish.
+     * Every one keeps its own Linux errno; none is collapsed into EIO or
+     * EBUSY, because a TCP caller branches on the difference. */
+    case CAP_EADDRINUSE:             return -LINUX_EADDRINUSE;
+    case CAP_EADDRNOTAVAIL:          return -LINUX_EADDRNOTAVAIL;
+    case CAP_ECONNRESET:             return -LINUX_ECONNRESET;
+    case CAP_ENOTCONN:               return -LINUX_ENOTCONN;
+    case CAP_EISCONN:                return -LINUX_EISCONN;
+    case CAP_EDESTADDRREQ:           return -LINUX_EDESTADDRREQ;
+    case CAP_EMSGSIZE:               return -LINUX_EMSGSIZE;
+    case CAP_EPIPE:                  return -LINUX_EPIPE;
+    case CAP_ECONNREFUSED:           return -LINUX_ECONNREFUSED;
+    case CAP_ENETUNREACH:            return -LINUX_ENETUNREACH;
+    case CAP_EHOSTUNREACH:           return -LINUX_EHOSTUNREACH;
+    case CAP_EAFNOSUPPORT:           return -LINUX_EAFNOSUPPORT;
     default:
         /* CAP_NONE (0xFFFF, the out-param sentinel) and anything else that
          * is not an enumerated code: translated, never leaked (§5.7). */
@@ -102,12 +117,25 @@ int32_t cap_code_from_linux_errno(int32_t linux_errno)
     case -LINUX_ESPIPE:    return CAP_ESPIPE;
     case -LINUX_ENOTEMPTY: return CAP_ENOTEMPTY;
     case -LINUX_ENAMETOOLONG: return CAP_ENAMETOOLONG;
+    case -LINUX_EADDRINUSE:    return CAP_EADDRINUSE;
+    case -LINUX_EADDRNOTAVAIL: return CAP_EADDRNOTAVAIL;
+    case -LINUX_ECONNRESET:    return CAP_ECONNRESET;
+    case -LINUX_ENOTCONN:      return CAP_ENOTCONN;
+    case -LINUX_EISCONN:       return CAP_EISCONN;
+    case -LINUX_EDESTADDRREQ:  return CAP_EDESTADDRREQ;
+    case -LINUX_EMSGSIZE:      return CAP_EMSGSIZE;
+    case -LINUX_EPIPE:         return CAP_EPIPE;
+    case -LINUX_ECONNREFUSED:  return CAP_ECONNREFUSED;
+    case -LINUX_ENETUNREACH:   return CAP_ENETUNREACH;
+    case -LINUX_EHOSTUNREACH:  return CAP_EHOSTUNREACH;
+    case -LINUX_EAFNOSUPPORT:  return CAP_EAFNOSUPPORT;
     default:               return 0;   /* no unique preimage (or not an error) */
     }
 }
 
 /* ─── The syscall classification table (§5.6) ──────────────────────────────
- * Built FROM tools/linux_syscall_census.txt: 27 rows, sorted by number.
+ * Built FROM tools/linux_syscall_census.txt: its 27 rows plus M1's eight
+ * network rows, sorted by number.
  * The class names where the semantics live, per §5.6's destination table;
  * the flag pins §5.4's W^X refusal against the census's own mprotect row.
  *
@@ -132,6 +160,16 @@ const struct LinuxSyscallEntry linux_syscall_table[] = {
     {  12, LSC_MEM,    0 },   /* brk — §5.4 bump pointer in the budget */
     {  13, LSC_SIG,    0 },   /* rt_sigaction — recorded; handler installs refused */
     {  14, LSC_SIG,    0 },   /* rt_sigprocmask — recorded; unblock delivers (step 2) */
+    /* M1 — the network bridge's eight numbers. Their semantics are the
+     * sidecar's SocketOps, exactly as the fd class's are the VFS's. */
+    {  41, LSC_NET,    0 },   /* socket */
+    {  42, LSC_NET,    0 },   /* connect */
+    {  43, LSC_NET,    0 },   /* accept */
+    {  44, LSC_NET,    0 },   /* sendto */
+    {  45, LSC_NET,    0 },   /* recvfrom */
+    {  48, LSC_NET,    0 },   /* shutdown */
+    {  49, LSC_NET,    0 },   /* bind */
+    {  50, LSC_NET,    0 },   /* listen */
     {  59, LSC_SPAWN,  0 },   /* execve — the spawn path */
     {  72, LSC_FD,     0 },   /* fcntl */
     {  74, LSC_FD,     0 },   /* fsync */
@@ -173,6 +211,7 @@ const char *linux_syscall_class_name(enum LinuxSyscallClass cls)
 {
     switch (cls) {
     case LSC_FD:     return "fd";
+    case LSC_NET:    return "net";
     case LSC_MEM:    return "mem";
     case LSC_SIG:    return "sig";
     case LSC_MSR:    return "msr";
@@ -204,6 +243,22 @@ int linux_fs_addr_is_user_canonical(uint64_t addr)
 int linux_arch_prctl_is_set_fs(uint64_t num, uint64_t cmd)
 {
     return num == LINUX_ARCH_PRCTL && cmd == LINUX_ARCH_SET_FS;
+}
+
+/* M1 sendto destination: the first trap copies the caller's 16 bytes here;
+ * this pure decoder owns the byte-order transform. The family is host order
+ * (Linux's sockaddr_in contract), while the port and address are network
+ * order — the sidecar's parse_sockaddr_in uses the same rule. */
+int linux_sendto_dest_decode(const uint8_t *sa, uint32_t *ip, uint16_t *port)
+{
+    uint16_t family;
+    if (!sa || !ip || !port) return -LINUX_EINVAL;
+    family = (uint16_t)(sa[0] | ((uint16_t)sa[1] << 8));
+    if (family != LINUX_AF_INET) return -LINUX_EAFNOSUPPORT;
+    *port = (uint16_t)(((uint16_t)sa[2] << 8) | sa[3]);
+    *ip = ((uint32_t)sa[4] << 24) | ((uint32_t)sa[5] << 16)
+        | ((uint32_t)sa[6] << 8) | (uint32_t)sa[7];
+    return 0;
 }
 
 /* ─── E7 increment 5 (the fd class) — the plan, and the copy ───────────────
@@ -253,7 +308,38 @@ struct LinuxFdWritePlan linux_fd_write_plan(uint64_t num,
         return p;
     }
 
-    if (num != LINUX_WRITE) return p;             /* nothing to attach */
+    /* M1: connect/bind's one crossing is the 16-byte sockaddr_in. The
+     * length is Linux's ABI word: IPv4's sockaddr is exactly 16 bytes,
+     * and any other length is a shape this bridge does not serve (the
+     * sidecar's parser would refuse it too, but a first-trap EINVAL is
+     * the honest place: no channel is needed to say the request is not
+     * an IPv4 address). The span rules are write's own. */
+    if (num == LINUX_CONNECT || num == LINUX_BIND) {
+        if (args[2] != LINUX_SOCKADDR_IN_BYTES) {
+            p.refuse = -LINUX_EINVAL;
+            return p;
+        }
+        p.src = args[1];
+        p.len = LINUX_SOCKADDR_IN_BYTES;
+        span_end = p.src + (uint64_t)p.len;
+        if (!linux_fs_addr_is_user_canonical(p.src) || span_end < p.src ||
+            (span_end - 1) > LINUX_USER_ADDR_MAX) {
+            p.refuse = -LINUX_EFAULT;
+        }
+        return p;
+    }
+
+    /* sendto shares write's buffer/count words exactly (buf args[1],
+     * count args[2]); only the destination address differs. A non-NULL
+     * destination must be a full sockaddr_in: any other addrlen is EINVAL
+     * before the post, and the first trap then copies/decodes those bytes
+     * into args[4]/args[5]. A NULL destination stays a plain send. */
+    if (num != LINUX_WRITE && num != LINUX_SENDTO) return p;
+    if (num == LINUX_SENDTO && args[4] != 0 &&
+        args[5] != LINUX_SOCKADDR_IN_BYTES) {
+        p.refuse = -LINUX_EINVAL;
+        return p;
+    }
 
     count = args[2];
     if (count == 0) return p;                    /* nothing to copy, and
@@ -750,6 +836,9 @@ struct LinuxFdReplyPlan linux_fd_reply_plan(uint64_t num, const uint64_t args[6]
     p.dst = 0;
     p.len = 0;
     p.aux = 0;
+    p.dst2 = 0;
+    p.len2 = 0;
+    p.dst3 = 0;
     p.kind = LINUX_STAGE_NONE;
     p.refuse = 0;
     if (!args) return p;
@@ -815,6 +904,58 @@ struct LinuxFdReplyPlan linux_fd_reply_plan(uint64_t num, const uint64_t args[6]
         p.len  = (uint32_t)(args[1] * LINUX_POLLFD_BYTES);
         p.aux  = p.len;
         p.kind = LINUX_STAGE_RAW;
+    } else if (num == LINUX_ACCEPT) {
+        /* accept(fd, addr, addrlen): the reply is the new fd in rax and
+         * one 20-byte trailer — a 16-byte sockaddr_in then the u32
+         * addrlen — written to the caller's two destinations. Linux
+         * ignores addrlen when addr is NULL, so that shape owes no
+         * payload; addr non-NULL with a NULL addrlen is EFAULT before
+         * any post. The saved address is zero-family/zero-port when the
+         * P2 accept reply does not carry the peer (NetClient's own named
+         * limitation) — but the LENGTH is always 16, so a caller's
+         * initialized socklen is never left lying. */
+        if (args[1] == 0) return p;
+        if (args[2] == 0) {
+            p.refuse = -LINUX_EFAULT;
+            return p;
+        }
+        p.dst  = args[1];
+        p.dst2 = args[2];
+        p.len2 = 4;
+        p.len  = LINUX_NET_ADDR_BYTES;
+        p.aux  = LINUX_SOCKADDR_IN_BYTES;
+        p.kind = LINUX_STAGE_ACCEPT;
+    } else if (num == LINUX_RECVFROM) {
+        /* recvfrom(fd, buf, len, flags, addr, addrlen): data first, then
+         * the SAME 20-byte trailer. A zero-length receive plans nothing
+         * (Linux does not fault a buffer it need not touch); src non-NULL
+         * with a NULL addrlen is EFAULT; src NULL means the trailer is
+         * sent but no address is written back. The data clamp is
+         * LINUX_NET_RECV_CAP so data+trailer fits the one 1 KiB reply
+         * buffer; the kernel returns the data count, count-truth like
+         * read. */
+        uint64_t count = args[2];
+        uint32_t data_cap;
+        if (count == 0) return p;
+        if (args[1] == 0) {
+            p.refuse = -LINUX_EFAULT;
+            return p;
+        }
+        if (args[4] != 0 && args[5] == 0) {
+            p.refuse = -LINUX_EFAULT;
+            return p;
+        }
+        data_cap = count > LINUX_NET_RECV_CAP
+                     ? (uint32_t)LINUX_NET_RECV_CAP : (uint32_t)count;
+        p.dst  = args[1];
+        p.len  = data_cap + LINUX_NET_ADDR_BYTES;
+        p.aux  = data_cap;
+        p.kind = LINUX_STAGE_RECVFROM;
+        if (args[4] != 0) {
+            p.dst2 = args[4];
+            p.len2 = LINUX_SOCKADDR_IN_BYTES;
+            p.dst3 = args[5];
+        }
     } else if (num == LINUX_READ) {
         /* read(fd, buf, count) — count-truth's own rule, mirrored from
          * write: a count-0 read plans NOTHING before canonicality,
@@ -845,6 +986,24 @@ struct LinuxFdReplyPlan linux_fd_reply_plan(uint64_t num, const uint64_t args[6]
         uint64_t span_end = p.dst + span_bytes;
         if (!linux_fs_addr_is_user_canonical(p.dst) || span_end < p.dst ||
             (span_bytes && (span_end - 1) > LINUX_USER_ADDR_MAX)) {
+            p.refuse = -LINUX_EFAULT;
+        }
+    }
+    /* M1: the secondary destinations are separate spans with their own
+     * lengths (accept's addrlen; recvfrom's sockaddr and addrlen). Each
+     * is checked whole before the post — a bad one is a first-trap
+     * -EFAULT and no reply bytes are ever aimed at it. */
+    if (p.dst2) {
+        uint64_t span_end = p.dst2 + p.len2;
+        if (!linux_fs_addr_is_user_canonical(p.dst2) || span_end < p.dst2 ||
+            (p.len2 && (span_end - 1) > LINUX_USER_ADDR_MAX)) {
+            p.refuse = -LINUX_EFAULT;
+        }
+    }
+    if (p.dst3) {
+        uint64_t span_end = p.dst3 + 4u;
+        if (!linux_fs_addr_is_user_canonical(p.dst3) || span_end < p.dst3 ||
+            (span_end - 1) > LINUX_USER_ADDR_MAX) {
             p.refuse = -LINUX_EFAULT;
         }
     }
@@ -1020,13 +1179,22 @@ int linux_dirent_pack(const uint8_t *src, uint32_t n, uint32_t count_cap,
  * per-number arm on the sidecar side. */
 int linux_reply_zero_ok(uint64_t num)
 {
-    if (num == LINUX_READ || num == LINUX_GETDENTS64) return 1;
+    if (num == LINUX_READ || num == LINUX_GETDENTS64 ||
+        num == LINUX_RECVFROM) return 1;
     return 0;
 }
 
 int linux_reply_shape_ok(uint64_t num, uint64_t ret, uint32_t n)
 {
     if (num == LINUX_READ) return ret == (uint64_t)n;
+    /* M1: accept returns the new fd, and its payload is exactly the
+     * 20-byte trailer; recvfrom returns the DATA count, with the same
+     * trailer behind it — count-truth extended to the network shapes. */
+    if (num == LINUX_ACCEPT)
+        return n == LINUX_NET_ADDR_BYTES;
+    if (num == LINUX_RECVFROM)
+        return n >= LINUX_NET_ADDR_BYTES &&
+               ret == (uint64_t)(n - LINUX_NET_ADDR_BYTES);
     /* poll: n is the full pollfd array, ret is the ready count. */
     if (num == LINUX_POLL)
         return n % LINUX_POLLFD_BYTES == 0 && ret <= (uint64_t)(n / LINUX_POLLFD_BYTES);

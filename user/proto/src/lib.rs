@@ -343,6 +343,7 @@ pub const NET_ERR_CAP: u16 = 9;
 pub const NET_ERR_WOULDBLOCK: u16 = 10;
 pub const NET_ERR_INUSE: u16 = 11;
 pub const NET_ERR_PROTO: u16 = 12;
+pub const NET_ERR_PIPE: u16 = 13;
 
 /// Socket types.
 pub const SOCK_STREAM: u16 = 1;
@@ -456,10 +457,14 @@ pub fn parse_sockaddr(p: &[u8]) -> Option<(u32, u16)> {
 /// (Reuses sockaddr encoding.)
 
 /// NET_ACCEPT reply body: `{new_sock_id u32, addr: [u8; 6]}` (10 bytes).
+/// The address is returned in Linux sockaddr_in byte order: the IPv4 bytes
+/// are network order and the port is big-endian, so the sidecar can copy
+/// them straight into the caller's sockaddr_in without an invented peer.
 pub fn encode_net_accept_body(sock_id: u32, ip: u32, port: u16) -> [u8; 10] {
     let mut b = [0u8; 10];
     put_u32(&mut b, 0, sock_id);
-    b[4..10].copy_from_slice(&encode_sockaddr(ip, port));
+    b[4..8].copy_from_slice(&ip.to_be_bytes());
+    b[8..10].copy_from_slice(&port.to_be_bytes());
     b
 }
 
@@ -467,7 +472,9 @@ pub fn parse_net_accept_body(p: &[u8]) -> Option<(u32, u32, u16)> {
     if p.len() < 10 {
         return None;
     }
-    Some((read_u32(p, 0), read_u32(p, 4), read_u16(p, 8)))
+    let ip = u32::from_be_bytes([p[4], p[5], p[6], p[7]]);
+    let port = u16::from_be_bytes([p[8], p[9]]);
+    Some((read_u32(p, 0), ip, port))
 }
 
 /// NET_SHUTDOWN request body: `{sock_id u32, how u8}` (5 bytes).

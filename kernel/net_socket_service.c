@@ -30,6 +30,8 @@
 #define NSS_STATUS_CAP 9u    /* NET_ERR_CAP: the capability-shaped refusal
                               * for the verbs this increment does not build */
 #define NSS_STATUS_OK 0u
+#define NSS_STATUS_INVAL 1u
+#define NSS_STATUS_PIPE 13u       /* NET_ERR_PIPE */
 #define NSS_MTU 1500u
 #define NSS_TEXT_CAP 192u    /* room for the longest rendered refusal */
 
@@ -67,6 +69,8 @@ struct NetSock {
                             * && lport != 0), so the accept poll matches ESTAB-
                             * LISHED conns whose local_port == lport. */
     uint32_t partition;    /* the partition this socket is charged to */
+    uint8_t  shut_rd;      /* SHUT_RD seen: local reads are at EOF */
+    uint8_t  shut_wr;      /* SHUT_WR seen: further sends are EPIPE */
 };
 
 struct NetSockSvc {
@@ -325,6 +329,42 @@ static void nss_reply_ok(struct NetSockSvc* e, uint16_t ty, uint32_t tag,
     nss_send(e, reply, (uint32_t)sizeof reply, tag);
 }
 
+/* A non-error status reply (the accept EAGAIN shape and shutdown's EPIPE
+ * shape): the frame carries the error flag and a NET_ERR_* status, but no
+ * refusal text and no counter bump — the verb was admitted; the socket's
+ * state is the answer. */
+static void nss_reply_status(struct NetSockSvc* e, uint16_t ty, uint32_t tag,
+                             uint16_t status) {
+    uint8_t reply[16 + 10];
+    for (uint32_t i = 0; i < 8; i++) reply[i] = nss_buf[i];
+    nss_wire_u16(reply + 8, 1);
+    nss_wire_u16(reply + 10, ty);
+    nss_wire_u16(reply + 12, NSS_ERR_FLAG);
+    nss_wire_u16(reply + 14, 0);
+    nss_wire_u16(reply + 16, status);
+    for (uint32_t i = 0; i < 8; i++) reply[18 + i] = 0;
+    nss_send(e, reply, (uint32_t)sizeof reply, tag);
+}
+
+/* The accept reply is the proto's rich body: {new_id u32, addr [u8;6]}.
+ * The kernel's IPv4Addr is stored in network byte order, so nss_wire_u32
+ * writes the address bytes directly; the port is host-order and is written
+ * big-endian to complete the sockaddr_in contract. */
+static void nss_reply_accept(struct NetSockSvc* e, uint16_t ty, uint32_t tag,
+                             uint32_t new_id, uint32_t ip, uint16_t port) {
+    uint8_t reply[16 + 10];
+    for (uint32_t i = 0; i < 8; i++) reply[i] = nss_buf[i];
+    nss_wire_u16(reply + 8, 1);
+    nss_wire_u16(reply + 10, ty);
+    nss_wire_u16(reply + 12, 0);
+    nss_wire_u16(reply + 14, 0);
+    nss_wire_u32(reply + 16, new_id);
+    nss_wire_u32(reply + 20, ip);
+    reply[24] = (uint8_t)(port >> 8);
+    reply[25] = (uint8_t)(port & 0xFFu);
+    nss_send(e, reply, (uint32_t)sizeof reply, tag);
+}
+
 /* An error reply carrying a rendered reason by name — increment 1's shape,
  * now reserved only for an out-of-table verb type and the malformed-argument
  * arms of an admitted verb (a listen() on an unbound socket, an accept() on
@@ -431,6 +471,8 @@ static void nss_handle(struct NetSockSvc* e, uint32_t plen, uint32_t tag) {
             e->socks[s].used = 1;
             e->socks[s].conn_id = -1;          /* not connected yet */
             e->socks[s].partition = e->partition;
+            e->socks[s].shut_rd = 0;
+            e->socks[s].shut_wr = 0;
             nss_reply_ok(e, ty, tag, s);
             return;
         }
@@ -507,6 +549,7 @@ static void nss_handle(struct NetSockSvc* e, uint32_t plen, uint32_t tag) {
                      | ((uint32_t)nss_buf[NSS_HDR + 3] << 24);
         struct NetSock* sk = nss_sock(e, sid);
         if (!sk || sk->conn_id < 0) { nss_refuse(e, ty, tag, NSS_STATUS_CAP, 0); return; }
+        if (sk->shut_wr) { nss_reply_status(e, ty, tag, NSS_STATUS_PIPE); return; }
         uint32_t dlen = 0;
         void* data = nss_grant_ptr(nss_out_caps, nss_out_n_caps,
                                    NSS_RIGHT_R, &dlen);
@@ -524,6 +567,7 @@ static void nss_handle(struct NetSockSvc* e, uint32_t plen, uint32_t tag) {
                      | ((uint32_t)nss_buf[NSS_HDR + 3] << 24);
         struct NetSock* sk = nss_sock(e, sid);
         if (!sk || sk->conn_id < 0) { nss_refuse(e, ty, tag, NSS_STATUS_CAP, 0); return; }
+        if (sk->shut_rd) { nss_reply_ok(e, ty, tag, 0); return; } /* local EOF */
         uint32_t blen = 0;
         void* buf = nss_grant_ptr(nss_out_caps, nss_out_n_caps,
                                   NSS_RIGHT_W, &blen);
@@ -561,8 +605,7 @@ static void nss_handle(struct NetSockSvc* e, uint32_t plen, uint32_t tag) {
         nss_reply_ok(e, ty, tag, (uint64_t)(uint32_t)got);
         return;
     }
-    case NSS_VERB_CLOSE:
-    case NSS_VERB_SHUTDOWN: {
+    case NSS_VERB_CLOSE: {
         if (plen < NSS_HDR + 4) { nss_refuse(e, ty, tag, NSS_STATUS_CAP, 0); return; }
         uint32_t sid = (uint32_t)nss_buf[NSS_HDR]
                      | ((uint32_t)nss_buf[NSS_HDR + 1] << 8)
@@ -575,7 +618,43 @@ static void nss_handle(struct NetSockSvc* e, uint32_t plen, uint32_t tag) {
             tcp_conn_release(sk->conn_id);   /* the attribution's other half */
             sk->conn_id = -1;
         }
-        if (ty == NSS_VERB_CLOSE) sk->used = 0;
+        sk->used = 0;
+        sk->shut_rd = 0;
+        sk->shut_wr = 0;
+        nss_reply_ok(e, ty, tag, sid);
+        return;
+    }
+    case NSS_VERB_SHUTDOWN: {
+        /* {sock_id u32, how u8}. SHUT_RD/SHUT_WR are local half-close
+         * markers: reads see EOF or sends report EPIPE without freeing the
+         * socket. SHUT_RDWR is the full close, so the connection and its
+         * attribution are released once, exactly as CLOSE does. */
+        if (plen < NSS_HDR + 5) { nss_refuse(e, ty, tag, NSS_STATUS_CAP, 0); return; }
+        uint32_t sid = (uint32_t)nss_buf[NSS_HDR]
+                     | ((uint32_t)nss_buf[NSS_HDR + 1] << 8)
+                     | ((uint32_t)nss_buf[NSS_HDR + 2] << 16)
+                     | ((uint32_t)nss_buf[NSS_HDR + 3] << 24);
+        uint8_t how = nss_buf[NSS_HDR + 4];
+        struct NetSock* sk = nss_sock(e, sid);
+        if (!sk) { nss_refuse(e, ty, tag, NSS_STATUS_CAP, 0); return; }
+        if (how > 2u) {
+            nss_reply_status(e, ty, tag, NSS_STATUS_INVAL);
+            return;
+        }
+        if (how == 0u || how == 2u) sk->shut_rd = 1;
+        if (how == 1u && !sk->shut_wr && sk->conn_id >= 0) {
+            /* SHUT_WR is a real TCP half-close: put FIN on the wire while
+             * keeping the receive side (and the attribution) alive. A
+             * second SHUT_WR must not put a second FIN on the wire. */
+            tcp_send_flags(&tcp_conns[sk->conn_id],
+                           TCP_FLAG_FIN | TCP_FLAG_ACK, 0, 0);
+        }
+        if (how == 1u || how == 2u) sk->shut_wr = 1;
+        if (how == 2u && sk->conn_id >= 0) {
+            tcp_close(sk->conn_id);
+            tcp_conn_release(sk->conn_id);
+            sk->conn_id = -1;
+        }
         nss_reply_ok(e, ty, tag, sid);
         return;
     }
@@ -666,18 +745,10 @@ static void nss_handle(struct NetSockSvc* e, uint32_t plen, uint32_t tag) {
                 c->local_port == sk->lport) { found = i; break; }
         }
         if (found < 0) {
-            /* Nothing pending — NET_EAGAIN (11), not an error: the caller
-             * retries. The refusal renderer is NOT used (this is a status,
-             * not a refusal-by-name), so the counters stay honest. */
-            uint8_t reply[16 + 10];
-            for (uint32_t i = 0; i < 8; i++) reply[i] = nss_buf[i];
-            nss_wire_u16(reply + 8, 1);
-            nss_wire_u16(reply + 10, NSS_VERB_ACCEPT);
-            nss_wire_u16(reply + 12, NSS_ERR_FLAG);
-            nss_wire_u16(reply + 14, 0);
-            nss_wire_u16(reply + 16, 11u);      /* NET_EAGAIN */
-            for (uint32_t i = 0; i < 8; i++) reply[18 + i] = 0;
-            nss_send(e, reply, 26, tag);
+            /* Nothing pending — NET_ERR_WOULDBLOCK (10), not an error: the
+             * caller retries. This is a status, not a refusal-by-name, so
+             * the refusal counters stay honest. */
+            nss_reply_status(e, ty, tag, 10u);  /* NET_ERR_WOULDBLOCK */
             return;
         }
         /* Attribute the accepted connection NOW — the inbound half of the
@@ -693,8 +764,13 @@ static void nss_handle(struct NetSockSvc* e, uint32_t plen, uint32_t tag) {
         e->socks[ns].conn_id = found;
         e->socks[ns].lport = 0;                /* an accepted conn is not bound */
         e->socks[ns].partition = e->partition;
+        e->socks[ns].shut_rd = 0;
+        e->socks[ns].shut_wr = 0;
         nss_admits_total++;
-        nss_reply_ok(e, ty, tag, ns);           /* value = the NEW socket id */
+        {
+            struct TCPConn* pc = &tcp_conns[found];
+            nss_reply_accept(e, ty, tag, ns, pc->remote_ip, pc->remote_port);
+        }
         return;
     }
     case NSS_VERB_POLL: {
@@ -728,9 +804,12 @@ static void nss_handle(struct NetSockSvc* e, uint32_t plen, uint32_t tag) {
                     p->local_port == sk->lport) { events |= 0x01u; break; }
             }
         } else if (c) {
-            if (c->rbuf_used > 0) events |= 0x01u;
-            if (c->state == TCP_CLOSE_WAIT || c->state == TCP_CLOSED)
+            if (!sk->shut_rd && c->rbuf_used > 0) events |= 0x01u;
+            if (!sk->shut_rd &&
+                (c->state == TCP_CLOSE_WAIT || c->state == TCP_CLOSED))
                 events |= 0x01u;   /* EOF is readable */
+            if (!sk->shut_wr && c->state == TCP_ESTABLISHED)
+                events |= 0x04u;   /* the send side is writable */
         }
         /* else: bound-but-not-listening / not-connected — honest 0. */
         uint8_t reply[16 + 6];
