@@ -566,6 +566,24 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                 uint32_t fwd_len = (uint32_t)sizeof(struct SLSLinuxSyscallRequest);
                 int status;
                 proc_read_linux_args(largs);
+#ifdef M1_TOOTH_BYPASS_CONNECT
+                /* M1 tooth (tests/m1_net_probe_check.sh
+                 * M1_GATE_TOOTH=bypass-connect): the ONLY build that carries
+                 * this arm is `make ... M1_TOOTH=bypass-connect`. Refuse the
+                 * probe's connect HERE, before the channel check, the arm,
+                 * or any post, so the image demonstrates a live red that is
+                 * the named bypass rather than a sidecar or transport fault.
+                 * The marker is part of the contract: the gate requires
+                 * `[M1-TOOTH] bypass-connect`, a stage-5 probe exit, zero
+                 * forwarded connects, and no successful execution. A shipped
+                 * build never defines this macro. */
+                if (num == LINUX_CONNECT) {
+                    kernel_serial_printf(
+                        "[M1-TOOTH] bypass-connect: connect(42) returned "
+                        "-ENOSYS before any sidecar post\n");
+                    return (uint64_t)(int64_t)(-LINUX_ENOSYS);
+                }
+#endif
 #if E7G_TOOTH
                 /* E7 increment 22 (tests/e7_gate_check.sh --teeth): the two
                  * forward-path teeth, armed on the descriptor the pour

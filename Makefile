@@ -141,6 +141,23 @@ ifneq ($(ENV_CKPT_TEST_HOOKS),)
   AB_DEFS += -DENV_CKPT_TEST_HOOKS=1
 endif
 
+# ─── M1_TOOTH: the network bridge's break arm, never a shipped build ────────
+# tests/m1_net_probe_check.sh with M1_GATE_TOOTH=bypass-connect boots the only
+# build that carries kernel/syscall_dispatch.c's connect bypass. The arm
+# refuses a Linux connect before k_linux_forward, so the probe dies at stage 5
+# and the gate has a named, live red. Empty here, so every ordinary build
+# compiles it out entirely. It joins AB_DEFS for the same reason E7_TOOTH does:
+# the define has to be in the configuration stamp, or a flip would silently
+# relink the previous build's objects and the "tooth" run would be the control
+# wearing a different filename.
+M1_TOOTH ?=
+ifneq ($(M1_TOOTH),)
+  ifneq ($(M1_TOOTH),bypass-connect)
+    $(error M1_TOOTH must be empty or bypass-connect (got '$(M1_TOOTH)'))
+  endif
+  AB_DEFS += -DM1_TOOTH_BYPASS_CONNECT=1
+endif
+
 # ─── Rebuild when the CONFIGURATION changes, not only when sources do ────────
 # make compares source timestamps against object timestamps. It has no idea
 # that X86_CFLAGS or TCG_CFLAGS changed, so `make x86-iso SLS_SOFTMMU=on` over

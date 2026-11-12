@@ -1,0 +1,440 @@
+[H[J[1;1H[?25l[m[H[J[1;1H[2;30HGNU GRUB  version 2.12
+
+[m[4;2H+----------------------------------------------------------------------------+[5;2H|[5;79H|[6;2H|[6;79H|[7;2H|[7;79H|[8;2H|[8;79H|[9;2H|[9;79H|[10;2H|[10;79H|[11;2H|[11;79H|[12;2H|[12;79H|[13;2H|[13;79H|[14;2H|[14;79H|[15;2H|[15;79H|[16;2H|[16;79H|[17;2H+----------------------------------------------------------------------------+[m[18;2H[19;2H[m     Use the ^ and v keys to select which entry is highlighted.          
+      Press enter to boot the selected OS, `e' to edit the commands       
+      before booting or `c' for a command-line.                           [5;80H [7m[5;3H*AeroSLS ? Phase 5 self-hosted (initrd sidecars)                            [m[5;78H[m[m[6;3H AeroSLS ? kernel only                                                      [m[6;78H[m[m[7;3H AeroSLS ? unified (control plane + sidecars)                               [m[7;78H[m[m[8;3H GRUB shell                                                                 [m[8;78H[m[m[9;3H                                                                            [m[9;78H[m[m[10;3H                                                                            [m[10;78H[m[m[11;3H                                                                            [m[11;78H[m[m[12;3H                                                                            [m[12;78H[m[m[13;3H                                                                            [m[13;78H[m[m[14;3H                                                                            [m[14;78H[m[m[15;3H                                                                            [m[15;78H[m[m[16;3H                                                                            [m[16;78H[m[16;80H [5;78H[22;1H   The highlighted entry will be executed automatically in 3s.                 [5;78H[22;1H   The highlighted entry will be executed automatically in 2s.                 [5;78H[22;1H   The highlighted entry will be executed automatically in 1s.                 [5;78H[22;1H   The highlighted entry will be executed automatically in 0s.                 [5;78H[?25h[H[J[1;1H[H[J[1;1H[AEROSLS BOOT LOGGER V1.0.0 RUNNING]
+----------------------------------------------------------------------------------
+[BSP] Loading GDT and IDT...
+[FRAME] bootstrap stack [0xe0ca9a0,0xe1ca9a0) confirmed inside the reserved region -- frames 57546..57802 are the kernel's own stack and are not allocatable.
+[FRAME] reserved 57803 frames (225 MiB) below the kernel image end 0xe1cb000 -- allocator now starts above the kernel.
+[SIDECAR] multiboot v1 detected, flags=0x1a6f phys=0x10000
+[SIDECAR] v1 mods_count=1 mods_addr=0x100b8
+[SIDECAR] v1 initrd module at 0xe233000..0xe40f6ac (1951404 bytes)
+[HW] Multiboot v1: mem_upper=3144576 KiB, top=0xbffe0000
+[FRAME] reserved 262176 frames above 0xbffe0000 -- that memory does not exist.
+[CAP] shared-memory arena: 64 MiB physically contiguous at 0xe200000 (16384 frames).
+[CAP] Seed kernel capability layer online: 512-slot tables, 1024-object ceiling, holders, channels, arena, message transport, syscalls 289-304.
+[QEMU-SLS MMU] shadow PML4=0x000000000e1cb000 (kernel PT inherited)
+[TIMER] tick calibrated: tsc=2324394859 Hz, lapic=62551233 Hz, ticr=625512, tick=10000000 ns
+[BSP] LAPIC and IRQ0 timer online.
+[BSP] Round-robin task scheduler initialised.
+[FPU] SSE/SSE2 enabled for ring 3 — CR4.OSFXSR|OSXMMEXCPT, CR0.MP; EM/TS clear, CR0.TS not armed
+[SYSCALL] Gate initialised. STAR=0x0010000800000000  LSTAR=0x0000000000102bd0
+[PROC] Ring-3 process manager initialised.
+[BOOT] command line: "nic0=both nic1=none"
+[PARTITION] LPAR groundwork initialised (1 partition: system).
+[SERVICE] service registry initialised (0 registrations).
+[MESH] circuit breakers initialised (all closed).
+[WORKLOAD] declarative workloads initialised (reconciler OFF).
+[WLCTX] context pool initialised (8 slots).
+[FAILOVER] Subsystem initialised.
+[FAILOVER] relaunch grace: this node just came up -- no peer is declared DEAD for 6000 ticks (until tick 6074).
+[LOADER] Service binary store ready. Built-in demo: 26 bytes.
+[WEBAPP] Asset store ready. Built-in Navigator page: 2059 bytes.
+[ENTROPY] seeded.
+[RTC] CMOS clock accepted.
+[TLS] memory pool initialised (512 KiB, fixed).
+[AUTH] Token Registry
+ Email                           UID   Role          Token                             Password
+ -------------------------------  ----  ------------  --------------------------------  --------
+ dave@gridworkz.com  uid=1000  DB_ADMIN  deadbeef01234567cafebabe76543210  demo-dave
+ bob@vance.com  uid=1001  APP_USER  cafebabe7654321089abcdef01234567  demo-bob
+ carol@gridworkz.com  uid=1002  DB_ADMIN  feedf00dabcdef0112345678deadc0de  demo-carol
+ guest@sandbox.com  uid=1003  GUEST  deadc0de9988776655443322aabbccdd  demo-guest
+
+[JOURNAL] Subsystem initialised.
+[LOCK] Row-level lock manager initialised.
+[INDEX] Secondary index manager initialised.
+[CONSTRAINT] Engine initialised.
+[CURSOR] Server-side cursor engine initialised.
+[MQT] Materialized query table engine initialised.
+[ROWSTORE] Row-set storage engine initialised.
+[ROW_INDEX] B-tree row index engine initialised.
+[VECSTORE] Vector store engine initialised.
+[AGENT] Agent engine initialised (max agents=8, max workflows=4)
+[MK] Microkernel booted successfully. Ring-0 primitives online.
+[IPC] Message Passing interface configured (Port bounds 0x1001 - 0x1007).
+[MK] registering services
+[MK] Service ONLINE: VirtualMemoryMgr  PID=101
+[MK] Service ONLINE: ObjectSecurityMgr  PID=102
+[MK] Service ONLINE: NativeDbStoreMgr  PID=103
+[MK] Service ONLINE: StorageTierMgr  PID=104
+[MK] Service ONLINE: RecoveryLogVerifier  PID=105
+[MK] Service ONLINE: AgentRuntimeMgr  PID=106
+[MK] Service ONLINE: CheckpointMgr  PID=107
+[MK] Fault Isolation Daemon active. Poll interval: 100ms.
+[TIER] Storage Tier Manager initialized.
+[TIER] Thresholds: promote=8 accesses/tick  demote=30 idle ticks.
+[CKPT] CheckpointMgr initialised.
+[BSP] Waking Core 1...
+[SMP] AP at APIC id 1 online.
+[BSP] Core 1 online.
+[NET] PCI scanning for e1000...
+[NET] e1000 #0 at PCI slot 3 MMIO 0xfeb80000
+[NET] NIC roles taken from the command line.
+[E1000] nic0 MAC 52:54:00:12:34:01  roles: mgmt cluster
+[NET] Packet buffer pool ready (64 x 2 KB).
+[ARP] Announced 10.0.2.15 -> 52:54:00:12:34:01
+[DHCP] Starting DISCOVER...
+[DHCP] Bound: 10.0.2.15  gw 10.0.2.2  subnet 255.255.255.0
+[NET] 1 e1000 interface(s) online, 0 reserved for user drivers.
+[QEMU-SLS TCACHE] NVMe unavailable — cold start
+[QEMU-SLS PGO] hot threshold=1000, scan interval=1000 ticks
+[QEMU-SLS VM] no snapshot -- Phase 4 save/restore has no callers (scaffolding, awaiting a launcher resume path)
+[SECURITY] UID 1000 assigned role DB_ADMIN.
+[AUDIT] #1 uid=1000 action=ROLE_CHANGE detail=DB_ADMIN granted=1
+[SECURITY] UID 1001 assigned role APP_USER.
+[AUDIT] #2 uid=1001 action=ROLE_CHANGE detail=APP_USER granted=1
+[SECURITY] UID 1002 assigned role DB_ADMIN.
+[AUDIT] #3 uid=1002 action=ROLE_CHANGE detail=DB_ADMIN granted=1
+[SECURITY] UID 1003 assigned role GUEST.
+[AUDIT] #4 uid=1003 action=ROLE_CHANGE detail=GUEST granted=1
+[AUTH] Default demo account roles seeded in object-catalog role_table.
+[SIDECAR] boot image: init @0x20000000 (139280 B) dm @0x21023000 (106512 B) posix @0x2107e000 (1270120 B) ramdisk @0x215b5000 (94224 B) net @0x2260d000 (295056 B) e1000 @0x226d6000 (37272 B) registry @0x22760000 (4096 B)
+[SIDECAR] rootfs: 4096 bytes @ 0x2160d000
+[SIDECAR] device registry: 4 device(s) @0x22760000
+[SIDECAR] boot parent planted: slot0 pid=99 active=1 state=4
+[PAGING] New user PML4 at 0x000000000e1cd000
+[SIDECAR] PID 100 'aerosls.init.0': wired chan 'console' to kernel service 'kernel.debug.console' (slots 9/10, kernel end 0/1)
+[SIDECAR] PID 100 'aerosls.init.0': wired chan 'env' to kernel service 'kernel.env.control' (slots 11/12, kernel end 2/3)
+[ENV] control channel wired: kernel ends rd=2 wr=3
+[SIDECAR] PID 100 'aerosls.init.0' released — runs on next schedule (BIB at 0x0000400000043000, entry 0x0000400000000000)
+[SIDECAR] init sidecar created (PID 100, messenger CHAN_R 0) — entering ring 3
+[INIT] ── AeroSLS init sidecar booting ──[INIT] budget: 16 MiB[INIT] found 4 PCI device(s)[INIT]   [0]  class=06:00 vendor=8086 dev=1237 bar=0x00000000[INIT]   [1]  class=06:01 vendor=8086 dev=7000 bar=0x00000000[INIT]   [2]  class=03:00 vendor=1234 dev=1111 bar=0xfd000000[INIT]   [3]  class=02:00 vendor=8086 dev=100e bar=0xfeb80000[INIT] spawning Device Manager...[INIT]   (create_sidecar: drv.device_manager.0 image @ 0x21023000, 106512 bytes)[PAGING] New user PML4 at 0x0000000012223000
+[SIDECAR] PID 101 'drv.device_manager.0': wired chan 'console' to kernel service 'kernel.debug.console' (slots 3/4, kernel end 4/5)
+[SIDECAR] PID 101 'drv.device_manager.0' released — runs on next schedule (BIB at 0x000040000001f000, entry 0x0000400000000000)
+[CAP] woken PID 101 (channel 3)
+[CAP] send handoff: PID 100 -> 101
+[INIT]   messenger: CHAN_R=13 CHAN_W=14[INIT] sending device registry to Device Manager...[DM] ── AeroSLS Device Manager booting ──[DM] budget: 256 KiB heap[DM] waiting for the device registry from init...[CAP] woken PID 101 (channel 3)
+[INIT] waiting for Device Manager to initialise devices...[DM]   adopt [0]  class=06:00 vendor=8086 dev=1237 bar=0x00000000[DM]   adopt [1]  class=06:01 vendor=8086 dev=7000 bar=0x00000000[DM]   adopt [2]  class=03:00 vendor=1234 dev=1111 bar=0xfd000000[PAGING] New user PML4 at 0x000000001224c000
+[DM]   adopt [3]  class=02:00 vendor=8086 dev=100e bar=0xfeb80000[DM] registry: 4 device(s) adopted[SIDECAR] PID 102 'drv.ramdisk.0': wired chan 'console' to kernel service 'kernel.debug.console' (slots 4/5, kernel end 6/7)
+[SIDECAR] PID 102 'drv.ramdisk.0' released — runs on next schedule (BIB at 0x000040000001c000, entry 0x0000400000000000)
+[INIT] all devices ready.[INIT] spawning ramdisk driver...[INIT]   ramdisk budget @ 0x215cd000, storage @ 0x2160d000 (16 MiB)[INIT]   (create_sidecar: drv.ramdisk.0 image @ 0x215b5000, 94224 bytes)[PROC] PID 100 yielded to PID 102
+[INIT]   ramdisk messenger: CHAN_R=8 CHAN_W=3[PAGING] New user PML4 at 0x000000001227a000
+[SIDECAR] PID 103 'drv.network.0': wired chan 'console' to kernel service 'kernel.debug.console' (slots 3/4, kernel end 8/9)
+[SIDECAR] PID 103 'drv.network.0' released — runs on next schedule (BIB at 0x000040000004d000, entry 0x0000400000000000)
+[INIT] e1000 BAR0 @ 0xfeb80000 → POSIX manifest DEV cap 'nic0.bar0'[INIT] spawning network driver...[INIT]   net.heap computed @ 0x22656000[INIT]   (create_sidecar: drv.network.0 image @ 0x2260d000, 295056 bytes)[NET] rust_entry entered
+[PROC] PID 100 yielded to PID 103
+[INIT]   network messenger: CHAN_R=15 CHAN_W=16[NET] BIB ptr=[PROC] PID 100 yielded to PID 103
+[PROC] PID 100 yielded to PID 103
+[INIT] spawning POSIX sidecar...41 45 52 53 4c 53 42 31X
+[INIT]   posix.heap computed @ 0x211b5000[INIT]   (create_sidecar: aerosls.posix.0 image @ 0x2107e000, 1270120 bytes)[NET] BIB raw:[PAGING] New user PML4 at 0x00000000122d0000
+[SIDECAR] PID 104 'aerosls.posix.0': wired chan 'console' to kernel service 'kernel.debug.console' (slots 3/4, kernel end 10/11)
+[SIDECAR] PID 104 'aerosls.posix.0': wired chan 'ramdisk' to sidecar 'drv.ramdisk.0' (PID 102, slots 5/6 peer_slots 6/7)
+[SIDECAR] PID 104 'aerosls.posix.0': wired chan 'network' to sidecar 'drv.network.0' (PID 103, slots 7/8 peer_slots 5/6)
+[SIDECAR] PID 104 'aerosls.posix.0': irq cap 'irq.timer.0' vector 32 slot 9
+[SIDECAR] PID 104 'aerosls.posix.0': irq cap 'irq.serial.0' vector 36 slot 10
+[SIDECAR] PID 104 'aerosls.posix.0': io cap 'uart' ports 0x3f8+8 slot 11
+[SIDECAR] PID 104 'aerosls.posix.0': dev cap 'nic0.bar0' phys 0xfeb80000+131072 slot 12
+[SIDECAR] PID 104 'aerosls.posix.0' released — runs on next schedule (BIB at 0x0000400000147000, entry 0x0000400000000000)
+41 45 52 53 4c 53 42 31X
+[PROC] PID 100 yielded to PID 103
+[POSIX] boot: rw=06 rr=05 cw=03 nw=08
+[INIT]   POSIX messenger: CHAN_R=17 CHAN_W=18[PROC] PID 100 yielded to PID 103
+[PROC] PID 100 yielded to PID 102
+[CAP] woken PID 104 (channel 11)
+[NET] BIB parsed
+[PAGING] New user PML4 at 0x0000000012962000
+[SIDECAR] PID 105 'drv.ramdisk.1': wired chan 'console' to kernel service 'kernel.debug.console' (slots 4/5, kernel end 12/13)
+[SIDECAR] PID 105 'drv.ramdisk.1' released — runs on next schedule (BIB at 0x000040000001c000, entry 0x0000400000000000)
+[INIT] E3: spawning tenant POSIX environments...[NET] n_caps=[INIT] E3 env 1: drv.ramdisk.1 storage @ 0x12462000, aerosls.posix.1 heap @ 0x12562000[CAP] woken PID 104 (channel 11)
+[CAP] send handoff: PID 102 -> 104
+5
+
+[NET] cap0=[PROC] PID 100 yielded to PID 102
+[INIT] E3 env 1: drv.ramdisk.1 spawnedname='[PROC] PID 100 yielded to PID 102
+' ty=[PROC] PID 100 yielded to PID 102
+2
+ slot=0
+[PAGING] New user PML4 at 0x0000000012987000
+[SIDECAR] PID 106 'aerosls.posix.1': wired chan 'console' to kernel service 'kernel.env.console' (slots 3/4, kernel end 14/15)
+[ENV-CONSOLE] environment (partition 0, index 1) console wired: posix pid 106, kernel ends rd=14 wr=15
+[SIDECAR] PID 106 'aerosls.posix.1': wired chan 'ramdisk' to sidecar 'drv.ramdisk.1' (PID 105, slots 5/6 peer_slots 6/7)
+[SIDECAR] PID 106 'aerosls.posix.1': wired chan 'network' to kernel service 'kernel.net.socket' (slots 7/8, kernel end 16/17)
+[NET-SOCKET] aerosls.posix.1 (partition 0, pid 106) wired: kernel ends rd=16 wr=17 — client + listener open (P2 increment 3)
+[SIDECAR] PID 106 'aerosls.posix.1': wired chan 'catalog' to kernel service 'kernel.env.catalog' (slots 9/10, kernel end 18/19)
+[ENV-CATALOG] aerosls.posix.1 (partition 0, pid 106) wired: kernel ends rd=18 wr=19 — read-only catalog view open (§9)
+[SIDECAR] PID 106 'aerosls.posix.1' released — runs on next schedule (BIB at 0x0000400000147000, entry 0x0000400000000000)
+[CAP] woken PID 104 (channel 11)
+0
+0
+[POSIX] boot: rw=06 rr=05 cw=03 nw=08
+[PROC] PID 100 yielded to PID 102
+[INIT] E3 env 1: aerosls.posix.1 spawned[CAP] woken PID 105 (channel 17)
+[CAP] send handoff: PID 106 -> 105
+[PROC] PID 100 yielded to PID 102
+
+[CAP] woken PID 105 (channel 17)
+[PROC] PID 100 yielded to PID 102
+[NET] budget cap found
+[CAP] woken PID 105 (channel 17)
+[CAP] send handoff: PID 106 -> 105
+[PAGING] New user PML4 at 0x000000001301a000
+[SIDECAR] PID 107 'drv.ramdisk.2': wired chan 'console' to kernel service 'kernel.debug.console' (slots 4/5, kernel end 20/21)
+[SIDECAR] PID 107 'drv.ramdisk.2' released — runs on next schedule (BIB at 0x000040000001c000, entry 0x0000400000000000)
+[INIT] E3 env 2: drv.ramdisk.2 storage @ 0x12b1a000, aerosls.posix.2 heap @ 0x12c1a000[CAP] woken PID 104 (channel 11)
+[CAP] send handoff: PID 102 -> 104
+[NET] heap initialized
+[CAP] woken PID 105 (channel 17)
+[PROC] PID 100 yielded to PID 102
+[INIT] E3 env 2: drv.ramdisk.2 spawned[CAP] woken PID 105 (channel 17)
+[CAP] send handoff: PID 106 -> 105
+[PROC] PID 100 yielded to PID 102
+[NET] console cap found
+[CAP] woken PID 105 (channel 17)
+[PROC] PID 100 yielded to PID 102
+[NET] EndpointSet created
+[CAP] woken PID 105 (channel 17)
+[CAP] send handoff: PID 106 -> 105
+[PAGING] New user PML4 at 0x0000000013040000
+[SIDECAR] PID 108 'aerosls.posix.2': wired chan 'console' to kernel service 'kernel.env.console' (slots 3/4, kernel end 22/23)
+[ENV-CONSOLE] environment (partition 0, index 2) console wired: posix pid 108, kernel ends rd=22 wr=23
+[SIDECAR] PID 108 'aerosls.posix.2': wired chan 'ramdisk' to sidecar 'drv.ramdisk.2' (PID 107, slots 5/6 peer_slots 6/7)
+[SIDECAR] PID 108 'aerosls.posix.2': wired chan 'network' to kernel service 'kernel.net.socket' (slots 7/8, kernel end 24/25)
+[NET-SOCKET] aerosls.posix.2 (partition 0, pid 108) wired: kernel ends rd=24 wr=25 — client + listener open (P2 increment 3)
+[SIDECAR] PID 108 'aerosls.posix.2': wired chan 'catalog' to kernel service 'kernel.env.catalog' (slots 9/10, kernel end 26/27)
+[ENV-CATALOG] aerosls.posix.2 (partition 0, pid 108) wired: kernel ends rd=26 wr=27 — read-only catalog view open (§9)
+[SIDECAR] PID 108 'aerosls.posix.2' released — runs on next schedule (BIB at 0x0000400000147000, entry 0x0000400000000000)
+[NET] MockNetwork created
+[CAP] woken PID 105 (channel 17)
+[POSIX] boot: rw=06 rr=05 cw=03 nw=08
+[PROC] PID 100 yielded to PID 103
+[INIT] E3 env 2: aerosls.posix.2 spawned[PROC] PID 100 yielded to PID 103
+[CAP] woken PID 105 (channel 17)
+[CAP] send handoff: PID 106 -> 105
+[PROC] PID 100 yielded to PID 102
+[NET] entering server loop
+[CAP] woken PID 105 (channel 17)
+[CAP] woken PID 107 (channel 24)
+[CAP] send handoff: PID 108 -> 107
+[PAGING] New user PML4 at 0x0000000013192000
+[SIDECAR] PID 109 'e7.linux.probe.0' released — runs on next schedule (BIB at 0x0000400000005000, entry 0x0000400000000000)
+[INIT] E3: tenant environments spawned.[INIT] ── Phase 5 init sidecar complete ──[INIT] system ready for POSIX sidecar creation.[INIT] entering the event loop (blocking wait + watchdog respawn)...[INIT] env manager on control channel (CHAN_R=11 CHAN_W=12)[CAP] woken PID 107 (channel 24)
+[E7] probe: spawned ch_r0000000D 
+[CAP] woken PID 105 (channel 17)
+[CAP] send handoff: PID 106 -> 105
+[CAP] woken PID 107 (channel 24)
+[CAP] send handoff: PID 108 -> 107
+[PAGING] New user PML4 at 0x000000001319d000
+[LOADER] ELF segment: vaddr=0x00000000003ff000  filesz=176  memsz=176  flags=R--
+[LOADER] ELF segment: vaddr=0x0000000000400000  filesz=420  memsz=420  flags=R-X
+[LOADER] ELF64 loaded. Entry: 0x0000000000400000
+[SIDECAR] PID 110 'e7.linux.cand.0' released — runs on next schedule (BIB at 0x0000400000006000, entry 0x0000000000400000)
+[CAP] woken PID 105 (channel 17)
+[CAP] woken PID 107 (channel 24)
+[E7] candidate: spawned 0000000F 
+[CAP] woken PID 107 (channel 24)
+[CAP] send handoff: PID 108 -> 107
+[PAGING] New user PML4 at 0x00000000131ad000
+[LOADER] ELF segment: vaddr=0x0000000008000000  filesz=20096  memsz=20096  flags=R--
+[LOADER] ELF segment: vaddr=0x0000000008005000  filesz=370102  memsz=370102  flags=R-X
+[LOADER] ELF segment: vaddr=0x0000000008060000  filesz=90356  memsz=90356  flags=R--
+[LOADER] ELF segment: vaddr=0x0000000008077370  filesz=14320  memsz=20528  flags=RW-
+[LOADER] segment vaddr 0x8077370 is 0x370 into its page; frames anchored at 0x8077000
+[LOADER] ELF64 loaded. Entry: 0x000000000800ab76
+[SIDECAR] PID 111 'e7.linux.user.0' released — runs on next schedule (BIB at 0x00004000000aa000, entry 0x000000000800ab76)
+[CAP] woken PID 105 (channel 17)
+[CAP] send handoff: PID 106 -> 105
+[CAP] woken PID 107 (channel 24)
+[E7] firstuser: spawned 00000011 
+[CAP] woken PID 105 (channel 17)
+[CAP] woken PID 107 (channel 24)
+[CAP] send handoff: PID 108 -> 107
+[PAGING] New user PML4 at 0x0000000013243000
+[SIDECAR] PID 112 'm1.net.probe.0' released — runs on next schedule (BIB at 0x0000400000005000, entry 0x0000400000000000)
+[CAP] woken PID 105 (channel 17)
+[CAP] send handoff: PID 106 -> 105
+[CAP] woken PID 107 (channel 24)
+[M1] net probe: spawned 00000013 
+[CAP] woken PID 105 (channel 17)
+[CAP] woken PID 107 (channel 24)
+[CAP] send handoff: PID 108 -> 107
+[CAP] woken PID 107 (channel 24)
+[CAP] woken PID 109 (channel 27)
+[CAP] woken PID 107 (channel 24)
+[CAP] send handoff: PID 108 -> 107
+[E7] linux: num=000000DA child=e7.linux.probe.0 ok
+
+[CAP] woken PID 107 (channel 24)
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+[CAP] woken PID 107 (channel 24)
+[CAP] send handoff: PID 108 -> 107
+[CAP] woken PID 110 (channel 28)
+[CAP] woken PID 107 (channel 24)
+[E7] linux: num=000000DA child=e7.linux.cand.0 ok
+
+[CAP] woken PID 107 (channel 24)
+[CAP] send handoff: PID 108 -> 107
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[CAP] woken PID 107 (channel 24)
+[CAP] woken PID 111 (channel 29)
+[POSIX] loop exit0=0000FEED 
+[E7] linux: num=0000009E child=e7.linux.user.0 ok
+
+[POSIX] loop tasks=00000001 
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 104 -> 111
+[CAP] woken PID 105 (channel 17)
+[CAP] send handoff: PID 106 -> 105
+[CAP] woken PID 112 (channel 30)
+[CAP] woken PID 105 (channel 17)
+[CAP] woken PID 103 (channel 12)
+[CAP] send handoff: PID 104 -> 103
+[CAP] woken PID 105 (channel 17)
+[CAP] send handoff: PID 106 -> 105
+[CAP] woken PID 103 (channel 12)
+[CAP] woken PID 105 (channel 17)
+[E7] linux: num=00000029 child=m1.net.probe.0 ok
+
+[POSIX] rc open err=00000002 
+[CAP] woken PID 112 (channel 30)
+[CAP] send handoff: PID 104 -> 112
+[POSIX] aero state=00000000 
+[POSIX] loop exit0=0000FEED 
+[POSIX] loop tasks=00000001 
+[CAP] woken PID 102 (channel 11)
+[CAP] send handoff: PID 104 -> 102
+[CAP] woken PID 108 (channel 25)
+[CAP] woken PID 108 (channel 25)
+[CAP] woken PID 102 (channel 11)
+[POSIX] loop exit0=0000FEED 
+[CAP] woken PID 102 (channel 11)
+[CAP] send handoff: PID 104 -> 102
+[POSIX] loop tasks=00000001 
+[CAP] woken PID 102 (channel 11)
+[CAP] woken PID 107 (channel 24)
+[CAP] send handoff: PID 108 -> 107
+[CAP] woken PID 102 (channel 11)
+[CAP] send handoff: PID 104 -> 102
+[CAP] woken PID 107 (channel 24)
+[CAP] woken PID 102 (channel 11)
+[CAP] woken PID 107 (channel 24)
+[CAP] send handoff: PID 108 -> 107
+[CAP] woken PID 102 (channel 11)
+[CAP] send handoff: PID 104 -> 102
+[CAP] woken PID 107 (channel 24)
+[CAP] woken PID 102 (channel 11)
+[POSIX] rc read=00000080 
+[POSIX] rc open err=00000002 
+[POSIX] aero state=00000000 
+[POSIX] aero state=00000000 
+[CAP] woken PID 109 (channel 27)
+[E7] linux: num=00000027 child=e7.linux.probe.0 -> ENOSYS
+
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+[CAP] woken PID 110 (channel 28)
+[E7] linux: num=00000027 child=e7.linux.cand.0 -> ENOSYS
+
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[CAP] woken PID 111 (channel 29)
+[E7] linux: num=000000DA child=e7.linux.user.0 ok
+
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 104 -> 111
+[CAP] woken PID 112 (channel 30)
+[CAP] woken PID 103 (channel 12)
+[CAP] send handoff: PID 104 -> 103
+[CAP] woken PID 103 (channel 12)
+[E7] linux: num=00000031 child=m1.net.probe.0 ok
+
+[CAP] woken PID 112 (channel 30)
+[CAP] send handoff: PID 104 -> 112
+[CAP] woken PID 109 (channel 27)
+[E7] linux: num=00000028 child=e7.linux.probe.0 -> ENOSYS
+
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+[CAP] woken PID 110 (channel 28)
+[E7] linux: num=00000028 child=e7.linux.cand.0 -> ENOSYS
+
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[CAP] woken PID 111 (channel 29)
+[E7] linux: num=00000007 child=e7.linux.user.0 ok + payload
+
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 104 -> 111
+[CAP] woken PID 112 (channel 30)
+[CAP] woken PID 103 (channel 12)
+[CAP] send handoff: PID 104 -> 103
+[CAP] woken PID 103 (channel 12)
+[E7] linux: num=00000032 child=m1.net.probe.0 ok
+
+[CAP] woken PID 112 (channel 30)
+[CAP] send handoff: PID 104 -> 112
+[CAP] woken PID 109 (channel 27)
+[E7] linux: num=0000009E child=e7.linux.probe.0 ok
+
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+[CAP] woken PID 110 (channel 28)
+[E7] linux: num=0000009E child=e7.linux.cand.0 ok
+
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[CAP] woken PID 111 (channel 29)
+[E7] linux: num=0000000D child=e7.linux.user.0 ok + payload
+
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 104 -> 111
+[CAP] woken PID 112 (channel 30)
+[CAP] woken PID 103 (channel 12)
+[CAP] send handoff: PID 104 -> 103
+[CAP] woken PID 103 (channel 12)
+[E7] linux: num=00000029 child=m1.net.probe.0 ok
+
+[CAP] woken PID 112 (channel 30)
+[CAP] send handoff: PID 104 -> 112
+[M1-TOOTH] bypass-connect: connect(42) returned -ENOSYS before any sidecar post
+[CAP] woken PID 109 (channel 27)
+AeroSLS Phase 5 booting
+[E7] linux: num=000000BB child=e7.linux.probe.0 -> ENOSYS
+
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+[CAP] woken PID 110 (channel 28)
+[E7] linux: num=000000BB child=e7.linux.cand.0 -> ENOSYS
+
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[CAP] woken PID 111 (channel 29)
+[E7] linux: num=0000000D child=e7.linux.user.0 ok + payload
+
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 104 -> 111
+[MK] svc crash: Service '(null)' not found.
+[CAP] woken PID 112 (channel 30)
+M1-NET FAIL
+[E7] linux: num=00000001 child=m1.net.probe.0 write ok len=12 |M1-NET FAIL.|
+[CAP] woken PID 112 (channel 30)
+[CAP] send handoff: PID 104 -> 112
+[CAP] woken PID 109 (channel 27)
+M1-NET FAIL
+[E7] linux: num=00000001 child=e7.linux.probe.0 write ok len=14 |E7FD-WRITE-OK.|
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+[CAP] woken PID 110 (channel 28)
+[E7] linux: num=00000001 child=e7.linux.cand.0 write ok len=14 |E7FD-WRITE-OK.|
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[CAP] woken PID 111 (channel 29)
+[E7] linux: num=0000000E child=e7.linux.user.0 ok
+
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 104 -> 111
+[CAP] woken PID 112 (channel 30)
+[E7] linux: num=000000E7 child=m1.net.probe.0 exit_group status=5
+
+[PROC] PID 112 terminated.
+[TORE] PID 112 teardown: 2 cap(s) dropped, 0 object(s) destroyed, 0 arena frame(s) returned, table 14 unbound
+[TORE] address space 0x0000000013243000 destroyed: 9 frame(s) freed
+[CAP] woken PID 109 (channel 27)
+E7FD-WRITE-OK
+E7FD-WRITE-OK
+[E7] linux: num=00000001 child=e7.linux.probe.0 ok
+
+[CAP] woken PID 109 (channel 

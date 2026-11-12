@@ -27,6 +27,14 @@
 #   M1_GATE_KEEP     keep the serial log on success (default: 0)
 #   M1_GATE_LOG      serial log path     (default: /tmp/m1_net_probe_gate.$$.log)
 #   M1_GATE_REPLAY   validate an existing log instead of booting QEMU
+#   M1_GATE_TOOTH    named test-only sabotage expected from the image:
+#                    `bypass-connect` requires the kernel marker
+#                    `[M1-TOOTH] bypass-connect`, a stage-5 probe failure,
+#                    zero forwarded connects, and zero successful executions.
+#                    The command exits 0 only when that red is observed.
+#
+# A normal image must contain no M1-TOOTH marker. If one appears, the ordinary
+# gate fails and names it, so a tooth image cannot masquerade as a green run.
 #
 # Exit: 0 pass, 1 assertion failure, 2 missing prerequisite.
 set -u
@@ -39,6 +47,7 @@ WINDOW_S="${M1_GATE_WINDOW_S:-150}"
 REPLAY="${M1_GATE_REPLAY:-}"
 KEEP="${M1_GATE_KEEP:-0}"
 LOG="${M1_GATE_LOG:-/tmp/m1_net_probe_gate.$$.log}"
+TOOTH="${M1_GATE_TOOTH:-}"
 QERR="${LOG}.qemuerr"
 QPID=""
 STARTED="0"
@@ -46,6 +55,14 @@ STARTED="0"
 case "$WINDOW_S" in
     ''|*[!0-9]*|0)
         echo "ABORT: M1_GATE_WINDOW_S must be a positive integer (got '$WINDOW_S')" >&2
+        exit 2
+        ;;
+esac
+
+case "$TOOTH" in
+    ''|bypass-connect) ;;
+    *)
+        echo "ABORT: M1_GATE_TOOTH must be empty or bypass-connect (got '$TOOTH')" >&2
         exit 2
         ;;
 esac
@@ -64,6 +81,12 @@ trap cleanup EXIT
 count() {
     local n
     n=$(grep -ac -- "$1" "$LOG" 2>/dev/null || true)
+    printf '%s\n' "${n:-0}"
+}
+
+count_fixed() {
+    local n
+    n=$(grep -aFc -- "$1" "$LOG" 2>/dev/null || true)
     printf '%s\n' "${n:-0}"
 }
 
@@ -132,6 +155,8 @@ sendto=$(count 'num=0000002C child=m1.net.probe.0')
 recvfrom=$(count 'num=0000002D child=m1.net.probe.0')
 shutdown=$(count 'num=00000030 child=m1.net.probe.0')
 close=$(count 'num=00000003 child=m1.net.probe.0')
+tooth_hits=$(count 'M1-TOOTH')
+tooth_names=$(grep -ao '\[M1-TOOTH\] [a-z-]*' "$LOG" 2>/dev/null | sort -u | tr '\n' ' ' | sed 's/ *$//' || true)
 
 expected_socket=$((passes * 2))
 expected_bind=$passes
@@ -144,8 +169,66 @@ expected_recvfrom=$((passes * 2))
 expected_shutdown=$((passes * 3))
 expected_close=$((passes * 3))
 
+if [ -n "$TOOTH" ]; then
+    # The negative arm: the image must fail for the reason it was built to
+    # fail, not merely fail. `exit_group status=5` is the probe's connect-stage
+    # unwind (the probe exits with its stage number); a forwarded connect is
+    # still visible as `[E7] num=0000002A ...`, so zero is the proof that the
+    # sidecar was bypassed rather than broken.
+    attempts=$(count 'm1.net.probe.0 exit_group status=5')
+    tooth_exact=$(count_fixed "[M1-TOOTH] $TOOTH")
+    expected_socket=$((attempts * 2))
+    expected_bind=$attempts
+    expected_listen=$attempts
+    problem=""
+    if [ "$tooth_exact" -lt 1 ]; then
+        problem="expected named marker '[M1-TOOTH] $TOOTH' was absent"
+    elif [ "$tooth_exact" -lt "$attempts" ]; then
+        problem="named marker count $tooth_exact is below the $attempts stage-5 execution(s)"
+    elif [ "$attempts" -lt 1 ]; then
+        problem="no stage-5 probe exit (exit_group status=5) after the tooth"
+    elif [ "$passes" -ne 0 ]; then
+        problem="probe still passed $passes time(s) despite the tooth"
+    elif [ "$fail_markers" -lt 1 ]; then
+        problem="no 'M1-NET FAIL' marker after the tooth"
+    elif [ "$connect" -ne 0 ]; then
+        problem="connect was forwarded $connect time(s); the tooth did not bypass the sidecar"
+    elif [ "$socket" -ne "$expected_socket" ]; then
+        problem="socket coverage $socket, expected $expected_socket for $attempts tooth execution(s)"
+    elif [ "$bind" -ne "$expected_bind" ]; then
+        problem="bind coverage $bind, expected $expected_bind for $attempts tooth execution(s)"
+    elif [ "$listen" -ne "$expected_listen" ]; then
+        problem="listen coverage $listen, expected $expected_listen for $attempts tooth execution(s)"
+    elif [ "$accept" -ne 0 ] || [ "$poll" -ne 0 ] || [ "$sendto" -ne 0 ] ||
+         [ "$recvfrom" -ne 0 ] || [ "$shutdown" -ne 0 ] || [ "$close" -ne 0 ]; then
+        problem="calls after the refused connect: accept=$accept poll=$poll sendto=$sendto recvfrom=$recvfrom shutdown=$shutdown close=$close"
+    fi
+
+    if [ -n "$problem" ]; then
+        echo "FAIL: M1 sabotage tooth '$TOOTH' did not redden as named: $problem" >&2
+        echo "  executions: passed=$passes fail_markers=$fail_markers stage5=$attempts tooth_marker=$tooth_exact" >&2
+        echo "  coverage: socket=$socket bind=$bind listen=$listen connect=$connect accept=$accept poll=$poll sendto=$sendto recvfrom=$recvfrom shutdown=$shutdown close=$close" >&2
+        if [ -f "$LOG" ]; then
+            echo "  last 40 serial lines ($LOG):" >&2
+            tail -40 "$LOG" >&2
+        else
+            echo "  serial log was not created: $LOG" >&2
+        fi
+        exit 1
+    fi
+
+    echo "OK: M1 sabotage tooth '$TOOTH' reddened by name: $attempts stage-5 execution(s), $fail_markers fail marker(s), $tooth_exact named marker(s), 0 forwarded connect(s), 0 pass(es)"
+    echo "    coverage: socket=$socket bind=$bind listen=$listen connect=$connect accept=$accept poll=$poll sendto=$sendto recvfrom=$recvfrom shutdown=$shutdown close=$close"
+    if [ "$KEEP" = "1" ]; then
+        echo "    serial log: $LOG"
+    fi
+    exit 0
+fi
+
 problem=""
-if [ "$fail_markers" -gt 0 ]; then
+if [ "$tooth_hits" -gt 0 ]; then
+    problem="serial log contains $tooth_hits 'M1-TOOTH' marker(s)${tooth_names:+: $tooth_names}"
+elif [ "$fail_markers" -gt 0 ]; then
     problem="serial log contains $fail_markers 'M1-NET FAIL' marker(s)"
 elif [ "$passes" -lt 1 ]; then
     problem="no successful m1.net.probe.0 execution (exit_group status=0)"
@@ -175,6 +258,7 @@ if [ -n "$problem" ]; then
     echo "FAIL: M1 live network probe: $problem" >&2
     echo "  executions: passed=$passes fail_markers=$fail_markers" >&2
     echo "  coverage: socket=$socket bind=$bind listen=$listen connect=$connect accept=$accept poll=$poll sendto=$sendto recvfrom=$recvfrom shutdown=$shutdown close=$close" >&2
+    [ -n "$tooth_names" ] && echo "  sabotage marker(s): $tooth_names" >&2
     echo "  expected: socket=$expected_socket bind=$expected_bind listen=$expected_listen connect=$expected_connect accept=$expected_accept poll=$expected_poll sendto=$expected_sendto recvfrom>=$expected_recvfrom shutdown=$expected_shutdown close=$expected_close" >&2
     if [ -f "$LOG" ]; then
         echo "  last 40 serial lines ($LOG):" >&2

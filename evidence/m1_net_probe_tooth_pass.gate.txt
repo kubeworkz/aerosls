@@ -1,0 +1,3 @@
+OK: M1 sabotage tooth 'bypass-connect' reddened by name: 1 stage-5 execution(s), 3 fail marker(s), 1 named marker(s), 0 forwarded connect(s), 0 pass(es)
+    coverage: socket=2 bind=1 listen=1 connect=0 accept=0 poll=0 sendto=0 recvfrom=0 shutdown=0 close=0
+    serial log: /mnt/c/Users/kubew/.freebuff/worktrees/084fe97c/aerosls2/.freebuff/worktrees/m1-linux-network/evidence/m1_net_probe_tooth_pass.log

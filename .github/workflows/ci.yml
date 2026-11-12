@@ -907,8 +907,22 @@ jobs:
         run: make X86_CC=gcc X86_LD=ld x86-iso-e3 M1_NET_PROBE=1 X86_E3_ISO=sls_operating_system_m1net.iso
         working-directory: aerosls2
 
+      # The tooth image must carry a different configuration stamp from the
+      # clean gate image. Build it separately; ordinary builds leave M1_TOOTH
+      # empty and compile the arm out.
+      - name: Build the M1 sabotage-tooth ISO
+        run: make X86_CC=gcc X86_LD=ld x86-iso-e3 M1_NET_PROBE=1 M1_TOOTH=bypass-connect X86_E3_ISO=sls_operating_system_m1net_tooth.iso
+        working-directory: aerosls2
+
       - name: Run all guards with --require-all (every build-run guard must pass)
         run: bash tests/run_checks.sh --require-all
+        working-directory: aerosls2
+
+      - name: M1 sabotage tooth reddens by name
+        env:
+          M1_ISO: sls_operating_system_m1net_tooth.iso
+          M1_GATE_TOOTH: bypass-connect
+        run: bash tests/m1_net_probe_check.sh
         working-directory: aerosls2
 
       - name: Run all guard smokes (every guard proven able to fail)
