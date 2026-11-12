@@ -3251,13 +3251,9 @@ static int api_env_restore_post(char* buf, int max, SLSRole req_role,
 // only when env_ckpt_find(partition, index) names THIS env_id (the record's
 // per-boot identity), and that is the same table state_tree_build() walks when
 // it emits ST_NODE_ENVIRONMENT. The failover guard gates on this field, so
-// unrelated growth in a checkpoint payload cannot satisfy it.
-//
-// Under ENV_CKPT_TEST_HOOKS the field instead reports TABLE MEMBERSHIP, with
-// the record's own id still in `checkpoint_env_id`. The test build injects a
-// stale id in kernel/env_ckpt.c; exposing membership is what lets the real
-// guard see `checkpointed=true` beside a mismatched id and name the identity
-// mismatch. Shipping builds keep the exact-identity meaning above.
+// unrelated growth in a checkpoint payload cannot satisfy it. When a record
+// exists at the index but names another env_id, `checkpoint_env_id` still
+// carries that stale identity; the guard diagnoses the mismatch from it.
 static int api_partition_env_list_get(char* buf, int max, uint32_t partition) {
     JSONBuf j = { buf, 0, max };
     jb_obj_open(&j, 0);
@@ -3273,15 +3269,12 @@ static int api_partition_env_list_get(char* buf, int max, uint32_t partition) {
         if (shown) jb_putc(&j, ',');
         jb_obj_open(&j, 0);
         const struct EnvCkptRecord* rec = env_ckpt_find(partition, idx);
-        int has_record = rec != 0 && rec->env_id == id;
-#ifdef ENV_CKPT_TEST_HOOKS
-        has_record = rec != 0;   /* test-only: expose membership, not identity */
-#endif
+        int exact = rec != 0 && rec->env_id == id;
         jb_uint(&j, "env_id", id); jb_putc(&j, ',');
         jb_uint(&j, "index", idx); jb_putc(&j, ',');
         jb_uint(&j, "posix_pid", pid); jb_putc(&j, ',');
         jb_uint(&j, "dropped", env_console_dropped(partition, id)); jb_putc(&j, ',');
-        jb_str(&j, "checkpointed", has_record ? "true" : "false");
+        jb_str(&j, "checkpointed", exact ? "true" : "false");
         if (rec) {
             jb_putc(&j, ',');
             jb_uint(&j, "checkpoint_env_id", rec->env_id); jb_putc(&j, ',');

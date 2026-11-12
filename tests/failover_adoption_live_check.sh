@@ -331,14 +331,17 @@ PY
 
 # env_checkpointed <body> <partition> <index> <env_id>
 #   Exact table evidence: the leader's GET /api/partition/{id}/env marks an
-#   entry checkpointed only when env_ckpt_find(partition, index) returns a
-#   record whose env_id matches the live environment -- the same table
-#   state_tree_build() walks for ST_NODE_ENVIRONMENT. This is not a
-#   payload-size inference.
-#   Exit 0 for that exact entry. Exit 4 when the live entry says
-#   checkpointed=true but carries a DIFFERENT checkpoint_env_id; in that
-#   case the mismatched id is printed so the abort can name it. Exit 1 for
-#   anything else (missing record, not checkpointed, malformed).
+#   entry checkpointed when env_ckpt_find(partition, index) names THIS env_id
+#   -- the same table state_tree_build() walks for ST_NODE_ENVIRONMENT -- and
+#   reports that record's env_id separately as checkpoint_env_id. This helper
+#   accepts only when checkpointed is true AND the reported record env_id
+#   equals the live one. This is not a payload-size inference.
+#   Exit 0 for that exact entry. Exit 4 when the live entry reports a
+#   DIFFERENT checkpoint_env_id, even when checkpointed is false: a stale
+#   record is visible as `checkpointed=false` plus its real id on the real API,
+#   and collapsing that into a generic "not checkpointed" abort loses the
+#   identity diagnosis. The mismatched id is printed so the abort can name it.
+#   Exit 1 for anything else (missing record, not checkpointed, malformed).
 env_checkpointed() {
     python3 - "$1" "$2" "$3" "$4" <<'PY'
 import json, sys
@@ -355,13 +358,20 @@ except Exception:
 for e in d.get("envs", []):
     try:
         if (int(e.get("index", -1)) == want_index
-                and int(e.get("env_id", -1)) == want_env
-                and str(e.get("checkpointed", "")).lower() == "true"):
-            checkpoint_env_id = int(e.get("checkpoint_env_id", -1))
-            if checkpoint_env_id != want_env:
-                print(checkpoint_env_id)
+                and int(e.get("env_id", -1)) == want_env):
+            checkpointed = str(e.get("checkpointed", "")).lower() == "true"
+            if "checkpoint_env_id" in e:
+                checkpoint_env_id = int(e["checkpoint_env_id"])
+                if checkpoint_env_id != want_env:
+                    print(checkpoint_env_id)
+                    sys.exit(4)
+            elif checkpointed:
+                # A true claim without the record's identity cannot be exact.
+                print(-1)
                 sys.exit(4)
-            sys.exit(0)
+            if checkpointed:
+                sys.exit(0)
+            sys.exit(1)
     except Exception:
         continue
 sys.exit(1)
@@ -777,9 +787,12 @@ echo "   the environment is live on the leader"
 # ignores env_service_register_env()'s result, so a successful create can
 # leave env_ckpt_table empty and the leader's state tree without the name.
 # Query the exact table, not payload size: GET /api/partition/{id}/env marks
-# the (index, env_id) entry `checkpointed` only when env_ckpt_find() returns
-# a record for that same env_id. Then require two fresh frames AFTER that
-# record exists; the
+# the (index, env_id) entry `checkpointed` only when env_ckpt_find() names the
+# same env_id, and reports the record's own env_id separately as
+# checkpoint_env_id. A stale record is therefore `checkpointed=false` with a
+# mismatched checkpoint_env_id; the helper treats that id mismatch as the
+# identity diagnosis even before it considers the boolean. Then require two
+# fresh frames AFTER that exact record exists; the
 # state-tree builder reads the same table, so those frames carry the node.
 ENV_LEADER_LOG="$LOG_DIR/node$leader.log"
 L_ENV_INDEX="$(printf '%s\n' "$env_list" \
@@ -812,7 +825,7 @@ while :; do
 done
 if [ -z "$env_ckpt_ok" ]; then
     if [ -n "$env_ckpt_mismatch" ]; then
-        die "node $leader's environment env_id=$L_ENV_ID (partition $PART_ID2, index $L_ENV_INDEX) is live, but GET /api/partition/$PART_ID2/env reported checkpointed=true with checkpoint_env_id=$env_ckpt_mismatch -- a checkpoint identity mismatch (the live env_id is $L_ENV_ID). The environment is live but NOT checkpointable; no held checkpoint can carry its name, so step 7.5 would falsely blame adoption. Last table response:
+        die "node $leader's environment env_id=$L_ENV_ID (partition $PART_ID2, index $L_ENV_INDEX) is live, but GET /api/partition/$PART_ID2/env reported checkpoint_env_id=$env_ckpt_mismatch -- a checkpoint identity mismatch (the live env_id is $L_ENV_ID). The environment is live but NOT checkpointable; no held checkpoint can carry its name, so step 7.5 would falsely blame adoption. Last table response:
 $(printf '%s' "$env_ckpt_body" | tail -3 | sed 's/^/       /')
        Leader [ENV] lines:
 $(grep -F '[ENV]' "$ENV_LEADER_LOG" | tail -6 | sed 's/^/       /')"

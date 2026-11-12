@@ -3,15 +3,18 @@
 # mismatch, against a REAL 3-node kernel cluster and the REAL HTTP route.
 #
 # ─── What this checks ───────────────────────────────────────────────────────
-# The API reports `checkpointed` from env_ckpt_find(partition, index) table
-# membership and reports the record's own `env_id` separately. A stale record
-# at the same (partition, index) must therefore be visible as
+# The API reports `checkpointed` only when env_ckpt_find(partition, index)
+# names the live `env_id`, and reports the record's own `env_id` separately as
+# `checkpoint_env_id`. A stale record at the same (partition, index) is
+# therefore visible as
 #
-#     checkpointed=true, checkpoint_env_id=<record id>, env_id=<live id>
+#     checkpointed=false, checkpoint_env_id=<record id>, env_id=<live id>
 #
-# rather than being collapsed into checkpointed=false. The failover guard must
-# then abort with "checkpoint identity mismatch" and "NOT checkpointable"
-# BEFORE it kills the leader.
+# The failover guard must treat that reported-id mismatch as a checkpoint
+# identity mismatch and abort with "checkpoint identity mismatch" and "NOT
+# checkpointable" BEFORE it kills the leader. This is the real production API
+# shape: the boolean is false because the record is not exact, but the
+# reported record identity is still present.
 #
 # The stale record is injected by the kernel itself under the test-only
 # ENV_CKPT_TEST_HOOKS build profile (Makefile -> AB_DEFS -> env_ckpt.c): the
@@ -117,14 +120,17 @@ if len(rows) != 1:
     sys.exit("ABORT: GET /api/partition/%d/env did not list env_id=%d: %s"
              % (partition, live, body))
 row = rows[0]
-if str(row.get("checkpointed", "")).lower() != "true":
-    sys.exit("FAIL: real API reported checkpointed=%r for live env %d: %s"
+if str(row.get("checkpointed", "")).lower() != "false":
+    sys.exit("FAIL: real API reported checkpointed=%r for stale env %d; the exact-identity API must report false here: %s"
              % (row.get("checkpointed"), live, body))
-checkpoint_id = int(row.get("checkpoint_env_id", -1))
+if "checkpoint_env_id" not in row:
+    sys.exit("FAIL: real API withheld checkpoint_env_id for live env %d, so the stale record is not diagnosable: %s"
+             % (live, body))
+checkpoint_id = int(row["checkpoint_env_id"])
 if checkpoint_id != live + 1000:
     sys.exit("FAIL: real API reported checkpoint_env_id=%d, expected the injected stale id %d (live %d): %s"
              % (checkpoint_id, live + 1000, live, body))
-print("API OK: checkpointed=true, env_id=%d, checkpoint_env_id=%d (stale record)" %
+print("API OK: checkpointed=false, env_id=%d, checkpoint_env_id=%d (real stale-record mismatch)" %
       (live, checkpoint_id))
 PY
 }
@@ -244,8 +250,10 @@ json_assert_env "$api_body" "$partition_id" "$live_env_id"
 
 # The guard creates its own partition and environment. Because the test kernel
 # injects the stale id at env_ckpt_record(), ITS environment also lands in the
-# table with env_id + 1000; the exact-identity gate must abort there, before the
-# leader-killing step, and must not fall back to the fake-node path (FAKE=0).
+# table with env_id + 1000; the API reports checkpointed=false with that
+# mismatched checkpoint_env_id, and the guard's exact-identity probe must still
+# diagnose the mismatch before the leader-killing step. It must not fall back
+# to the fake-node path (FAKE=0).
 echo "==> running the real failover guard against the live test cluster"
 guard_out="$(
     AEROSLS_FAILOVER_FAST=1 \

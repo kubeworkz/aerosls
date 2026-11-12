@@ -127,9 +127,9 @@ endif
 # tests/env_api_identity_check.sh builds its live cluster with
 # `ENV_CKPT_TEST_HOOKS=1 ./run-cluster.sh --nodes 3`. The ONLY arm this adds
 # writes an env checkpoint record's env_id with a fixed offset, so the live
-# kernel's GET /api/partition/{id}/env can report table membership with a
-# checkpoint_env_id that differs from the environment's live id -- the exact
-# shape the failover guard's identity-mismatch branch must diagnose. An
+# kernel's GET /api/partition/{id}/env reports checkpointed=false while still
+# naming that different checkpoint_env_id -- the exact shape the failover
+# guard's identity-mismatch branch must diagnose. An
 # ordinary build compiles the arm out entirely; the flag joins AB_DEFS so the
 # configuration stamp makes a flip rebuild, rather than silently relinking the
 # previous identity-clean objects.
