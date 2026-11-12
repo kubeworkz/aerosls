@@ -334,7 +334,11 @@ PY
 #   entry checkpointed only when env_ckpt_find(partition, index) returns a
 #   record whose env_id matches the live environment -- the same table
 #   state_tree_build() walks for ST_NODE_ENVIRONMENT. This is not a
-#   payload-size inference. Returns 0 only for that exact entry.
+#   payload-size inference.
+#   Exit 0 for that exact entry. Exit 4 when the live entry says
+#   checkpointed=true but carries a DIFFERENT checkpoint_env_id; in that
+#   case the mismatched id is printed so the abort can name it. Exit 1 for
+#   anything else (missing record, not checkpointed, malformed).
 env_checkpointed() {
     python3 - "$1" "$2" "$3" "$4" <<'PY'
 import json, sys
@@ -352,8 +356,11 @@ for e in d.get("envs", []):
     try:
         if (int(e.get("index", -1)) == want_index
                 and int(e.get("env_id", -1)) == want_env
-                and int(e.get("checkpoint_env_id", -1)) == want_env
                 and str(e.get("checkpointed", "")).lower() == "true"):
+            checkpoint_env_id = int(e.get("checkpoint_env_id", -1))
+            if checkpoint_env_id != want_env:
+                print(checkpoint_env_id)
+                sys.exit(4)
             sys.exit(0)
     except Exception:
         continue
@@ -785,13 +792,18 @@ $(printf '%s' "$env_list" | tail -5 | sed 's/^/       /')"
 echo "==> waiting for the environment's exact checkpoint-table record on node $leader (up to ${WAIT_LEARN}s)"
 env_ckpt_ok=""
 env_ckpt_body=""
+env_ckpt_mismatch=""
 deadline=$(( $(date +%s) + WAIT_LEARN ))
 while :; do
     if get200 "$L_PORT" "/api/partition/$PART_ID2/env"; then
         env_ckpt_body="$FETCH_BODY"
-        if env_checkpointed "$env_ckpt_body" "$PART_ID2" "$L_ENV_INDEX" "$L_ENV_ID"; then
-            env_ckpt_ok=1; break
-        fi
+        env_ckpt_probe="$(env_checkpointed "$env_ckpt_body" "$PART_ID2" "$L_ENV_INDEX" "$L_ENV_ID")"
+        env_ckpt_rc=$?
+        case "$env_ckpt_rc" in
+            0) env_ckpt_ok=1; break ;;
+            4) env_ckpt_mismatch="$env_ckpt_probe" ;;
+            *) env_ckpt_mismatch="" ;;
+        esac
     else
         env_ckpt_body="$FETCH_BODY"
     fi
@@ -799,6 +811,12 @@ while :; do
     sleep "$POLL"
 done
 if [ -z "$env_ckpt_ok" ]; then
+    if [ -n "$env_ckpt_mismatch" ]; then
+        die "node $leader's environment env_id=$L_ENV_ID (partition $PART_ID2, index $L_ENV_INDEX) is live, but GET /api/partition/$PART_ID2/env reported checkpointed=true with checkpoint_env_id=$env_ckpt_mismatch -- a checkpoint identity mismatch (the live env_id is $L_ENV_ID). The environment is live but NOT checkpointable; no held checkpoint can carry its name, so step 7.5 would falsely blame adoption. Last table response:
+$(printf '%s' "$env_ckpt_body" | tail -3 | sed 's/^/       /')
+       Leader [ENV] lines:
+$(grep -F '[ENV]' "$ENV_LEADER_LOG" | tail -6 | sed 's/^/       /')"
+    fi
     die "node $leader's environment env_id=$L_ENV_ID (partition $PART_ID2, index $L_ENV_INDEX) is live, but its exact record never appeared in env_ckpt_table -- GET /api/partition/$PART_ID2/env did not mark it checkpointed within ${WAIT_LEARN}s. The environment is live but NOT checkpointable; no held checkpoint can carry its name, so step 7.5 would falsely blame adoption. Last table response:
 $(printf '%s' "$env_ckpt_body" | tail -3 | sed 's/^/       /')
        Leader [ENV] lines:

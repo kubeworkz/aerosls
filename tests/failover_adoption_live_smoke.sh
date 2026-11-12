@@ -37,8 +37,9 @@
 #                         is killed)
 #   envckptwrongid -> ABORT (the env API reports checkpointed=true for the
 #                         live index, but checkpoint_env_id names a different
-#                         environment: the exact-identity gate must abort
-#                         NOT checkpointable before the leader is killed)
+#                         environment: the exact-identity gate must name the
+#                         checkpoint identity mismatch and abort NOT
+#                         checkpointable before the leader is killed)
 #   splitbrain  -> FAIL  (BOTH survivors become leader at once; the guard
 #                         must detect the split and fail loudly)
 #   observeradopts -> FAIL (the observer ALSO prints the Adopted line
@@ -436,6 +437,37 @@ tooth() {
                 return ;;
         esac
     fi
+    # envckptwrongid must not pass on a generic abort: the guard has to name
+    # both halves of the identity mismatch and report both ids. Derive the ids
+    # from the abort so the assertion checks the guard's actual report rather
+    # than hard-coded fake values; the fake deliberately reports live+1000.
+    if [ "$mode" = "envckptwrongid" ]; then
+        local why="" live_id="" mismatch_id=""
+        live_id="$(printf '%s\n' "$out" \
+            | sed -n 's/.*environment env_id=\([0-9][0-9]*\) (partition .*/\1/p' \
+            | head -1)"
+        mismatch_id="$(printf '%s\n' "$out" \
+            | sed -n 's/.*checkpoint_env_id=\([0-9][0-9]*\).*/\1/p' \
+            | head -1)"
+        if ! printf '%s\n' "$out" | grep -qF "checkpoint identity mismatch"; then
+            why="the abort did not say 'checkpoint identity mismatch'"
+        elif ! printf '%s\n' "$out" | grep -qF "NOT checkpointable"; then
+            why="the abort did not say 'NOT checkpointable'"
+        elif [ -z "$live_id" ]; then
+            why="the abort did not report the live env_id"
+        elif [ -z "$mismatch_id" ]; then
+            why="the abort did not report checkpoint_env_id"
+        elif [ "$mismatch_id" -ne "$((live_id + 1000))" ]; then
+            why="checkpoint_env_id=$mismatch_id is not the fake's live+1000 for env_id=$live_id"
+        fi
+        if [ -n "$why" ]; then
+            echo "TOOTH FAIL $label — exact-identity abort was incomplete: $why (live env_id=${live_id:-missing}, checkpoint_env_id=${mismatch_id:-missing})"
+            printf '%s\n' "$out" | sed 's/^/           /'
+            dump_fake_err
+            fails=$((fails + 1))
+            return
+        fi
+    fi
     # prekillchurn's PASS must mean the churn really churned: the node
     # that won the election (node 2) must be REALLY KILLED by the guard
     # (its original pid is dead -- the guard's step 6), and the guard must
@@ -483,7 +515,7 @@ tooth notadopted       1 "never adopted" "notadopted -> FAIL (the leader leads b
 tooth nolearn          1 "never learned" "nolearn -> FAIL (the create announce did not arrive)"
 tooth nockpt           1 "no checkpoint" "nockpt -> FAIL (the checkpoint never carried the row)"
 tooth envckptlost      2 "NOT checkpointable" "envckptlost -> ABORT (the environment is live and checkpoints keep flowing, but the exact table never marks it checkpointed: the guard must report the distinct not-checkpointable diagnosis, not blame adoption, and must not kill the leader; this tooth checks its pid is still alive after the abort)"
-tooth envckptwrongid   2 "NOT checkpointable" "envckptwrongid -> ABORT (the env API marks the live index checkpointed, but checkpoint_env_id names a different environment: the exact-identity gate must report NOT checkpointable, not blame adoption, and must not kill the leader; this tooth checks its pid is still alive after the abort)"
+tooth envckptwrongid   2 "checkpoint identity mismatch" "envckptwrongid -> ABORT (the env API marks the live index checkpointed, but checkpoint_env_id names a different environment: the exact-identity gate must name the identity mismatch with both reported ids and report NOT checkpointable, not blame adoption, and must not kill the leader; this tooth checks its pid is still alive after the abort)"
 tooth splitbrain       1 "split-brain"   "splitbrain -> FAIL (both survivors claim LEADER at once)"
 tooth observeradopts   1 "ALSO recovered" "observeradopts -> FAIL (a follower that recovered must be caught by step 9)"
 tooth lateflip         1 "flipped to LEADER" "lateflip -> FAIL (the late flip to LEADER must be caught by step 9)"
