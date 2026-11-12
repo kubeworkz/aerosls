@@ -378,6 +378,17 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
         self.net = Some(net);
     }
 
+    /// Split the VFS and the installed SocketOps out of ONE mutable
+    /// borrow. The Linux service pass answers file and network syscalls in
+    /// the same iteration; two `&mut self` field accesses through a method
+    /// call cannot coexist, so the split is explicit here rather than a
+    /// second borrow the compiler has to reject.
+    pub fn vfs_and_net(
+        &mut self,
+    ) -> (&mut Vfs<K, A>, Option<&mut Box<dyn SocketOps>>) {
+        (&mut self.vfs, self.net.as_mut())
+    }
+
     /// Install the catalog client after boot (§9.1). A manifest without a
     /// `catalog` cap leaves this `None`, and `ctx.catalog()` then answers
     /// `None` — an applet reports "no catalog" rather than failing to

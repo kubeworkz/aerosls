@@ -8,7 +8,7 @@
 //! with the client's tag echoed.
 
 use crate::endpoints::{EndpointSet, EndpointState};
-use crate::kapi::{self, GrantedCap, Kernel};
+use crate::kapi::{self, GrantedCap, Kernel, SendCap};
 use crate::mock::{Addr, MockNetwork, SockType};
 use aerosls_proto::*;
 
@@ -199,6 +199,34 @@ fn reply_status<K: Kernel>(k: &K, handle: u32, tag: u32, ty: u16, status: u16) {
     p[..16].copy_from_slice(&net_reply_frame(ty, status != NET_OK));
     p[16..].copy_from_slice(&encode_status_body(status, 0));
     let _ = k.send(handle, tag, F_REPLY, &p, &[], kapi::TIMEOUT_NONE);
+}
+
+/// Reply to a request that carried a transient grant. The transport MOVES
+/// the client's budget cap into this driver; returning it in the reply
+/// (move-return) lets the window=1 allocator re-adopt a live slot for the
+/// next send/recv. Without this, the first data operation consumes the
+/// only source cap and every later one fails CAP_ERR_TYPE.
+fn reply_with_grant<K: Kernel>(
+    k: &K,
+    handle: u32,
+    tag: u32,
+    ty: u16,
+    status: u16,
+    value: u64,
+    grant: Option<&GrantedCap>,
+) {
+    let mut p = [0u8; 16 + 10];
+    p[..16].copy_from_slice(&net_reply_frame(ty, status != NET_OK));
+    p[16..].copy_from_slice(&encode_status_body(status, value));
+    let send_cap = [SendCap {
+        slot: grant.map_or(u32::MAX, |g| g.handle),
+        offset: 0,
+        len: grant.map_or(0, |g| g.len as u32),
+        rights: grant.map_or(0, |g| g.rights),
+        flags: 0,
+    }];
+    let caps: &[SendCap] = grant.map_or(&[], |_| &send_cap);
+    let _ = k.send(handle, tag, F_REPLY, &p, caps, kapi::TIMEOUT_NONE);
 }
 
 /// Read a u32 LE value from the payload starting at `offset`.
@@ -392,14 +420,12 @@ fn handle_send<K: Kernel>(
 
     match net.send(sock_id, data) {
         Ok(n) => {
-            let mut p = [0u8; 16 + 10];
-            p[..16].copy_from_slice(&net_reply_frame(NET_SEND, false));
-            p[16..].copy_from_slice(&encode_status_body(NET_OK, n as u64));
-            let _ = k.send(handle, tag, F_REPLY, &p, &[], kapi::TIMEOUT_NONE);
+            reply_with_grant(k, handle, tag, NET_SEND, NET_OK, n as u64,
+                             Some(grant));
             Ok(())
         }
         Err(e) => {
-            reply_status(k, handle, tag, NET_SEND, e);
+            reply_with_grant(k, handle, tag, NET_SEND, e, 0, Some(grant));
             Ok(())
         }
     }
@@ -431,14 +457,12 @@ fn handle_recv<K: Kernel>(
 
     match net.recv(sock_id, buf) {
         Ok(n) => {
-            let mut p = [0u8; 16 + 10];
-            p[..16].copy_from_slice(&net_reply_frame(NET_RECV, false));
-            p[16..].copy_from_slice(&encode_status_body(NET_OK, n as u64));
-            let _ = k.send(handle, tag, F_REPLY, &p, &[], kapi::TIMEOUT_NONE);
+            reply_with_grant(k, handle, tag, NET_RECV, NET_OK, n as u64,
+                             Some(grant));
             Ok(())
         }
         Err(e) => {
-            reply_status(k, handle, tag, NET_RECV, e);
+            reply_with_grant(k, handle, tag, NET_RECV, e, 0, Some(grant));
             Ok(())
         }
     }

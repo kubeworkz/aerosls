@@ -174,6 +174,21 @@
                                  * (ENOTEMPTY)                              */
 #define CAP_ENAMETOOLONG (-20)  /* a path over LINUX_PATH_CAP — this shim's
                                  * named divergence from PATH_MAX (§5.6)    */
+/* M1 network errno family. Each code has exactly one Linux preimage, so
+ * linux_errno_from_cap can keep the caller's branch intact: EADDRINUSE is
+ * not a generic EBUSY, ECONNRESET is not EIO, and ENOTCONN is not EPERM. */
+#define CAP_EADDRINUSE     (-21)
+#define CAP_EADDRNOTAVAIL  (-22)
+#define CAP_ECONNRESET     (-23)
+#define CAP_ENOTCONN       (-24)
+#define CAP_EISCONN        (-25)
+#define CAP_EDESTADDRREQ   (-26)
+#define CAP_EMSGSIZE       (-27)
+#define CAP_EPIPE          (-28)
+#define CAP_ECONNREFUSED   (-29)
+#define CAP_ENETUNREACH    (-30)
+#define CAP_EHOSTUNREACH   (-31)
+#define CAP_EAFNOSUPPORT   (-32)
 #define CAP_EINVAL      (-1)
 #define CAP_EBADF       (-2)
 #define CAP_EAGAIN      (-3)

@@ -30,6 +30,20 @@
 #   nockpt      -> FAIL  (followers learn but no checkpoint flows; the
 #                         checkpoint gate must bite -- without it the held
 #                         checkpoint predates the create)
+#   envckptlost -> ABORT (checkpoints keep flowing after the environment
+#                         create, but the exact table never marks the live
+#                         environment checkpointed: it is NOT checkpointable.
+#                         The gate must abort distinctly before the leader
+#                         is killed)
+#   envckptwrongid -> ABORT (the env API reports checkpointed=true for the
+#                         live index, but checkpoint_env_id names a different
+#                         environment: the exact-identity gate must name the
+#                         checkpoint identity mismatch and abort NOT
+#                         checkpointable before the leader is killed)
+#   envckptwrongidfalse -> ABORT (the same wrong id with checkpointed=false,
+#                         the production stale-record shape: the guard must
+#                         reach the same identity diagnosis without relying
+#                         on the boolean)
 #   splitbrain  -> FAIL  (BOTH survivors become leader at once; the guard
 #                         must detect the split and fail loudly)
 #   observeradopts -> FAIL (the observer ALSO prints the Adopted line
@@ -407,6 +421,117 @@ tooth() {
             return
         fi
     fi
+    # The exact-table abort teeth must abort BEFORE the guard's kill. Assert
+    # on the real fake leader process (not the pid file, which cleanup owns),
+    # while it is still unreaped: a zombie counts as dead here. A guard that
+    # kills the leader before diagnosing the missing/mismatched exact record
+    # would otherwise satisfy the exit code and phrase while violating the
+    # tooth's contract.
+    if { [ "$mode" = "envckptlost" ] || [ "$mode" = "envckptwrongid" ] \
+            || [ "$mode" = "envckptwrongidfalse" ]; } \
+            && [ "$rc" -eq 2 ] \
+            && printf '%s\n' "$out" | grep -q "NOT checkpointable"; then
+        local leader_state=""
+        leader_state="$(ps -o stat= -p "$lpid" 2>/dev/null || true)"
+        case "$leader_state" in
+            ""|Z*)
+                echo "TOOTH FAIL $label — guard exited 2 with NOT checkpointable, but the leader was killed before the abort (pid $lpid state: ${leader_state:-gone})"
+                printf '%s\n' "$out" | sed 's/^/           /'
+                dump_fake_err
+                fails=$((fails + 1))
+                return ;;
+        esac
+    fi
+    # envckptwrongid must not pass on a generic abort: the guard has to name
+    # both halves of the identity mismatch and report both ids. Derive the ids
+    # from the abort so the assertion checks the guard's actual report rather
+    # than hard-coded fake values; the fake deliberately reports live+1000.
+    if [ "$mode" = "envckptwrongid" ] \
+            || [ "$mode" = "envckptwrongidfalse" ]; then
+        local why="" live_id="" mismatch_id="" env_partition=""
+        live_id="$(printf '%s\n' "$out" \
+            | sed -n 's/.*environment env_id=\([0-9][0-9]*\) (partition .*/\1/p' \
+            | head -1)"
+        mismatch_id="$(printf '%s\n' "$out" \
+            | sed -n 's/.*checkpoint_env_id=\([0-9][0-9]*\).*/\1/p' \
+            | head -1)"
+        env_partition="$(printf '%s\n' "$out" \
+            | sed -n 's/.*environment env_id=[0-9][0-9]* (partition \([0-9][0-9]*\), index .*/\1/p' \
+            | head -1)"
+        if ! printf '%s\n' "$out" | grep -qF "checkpoint identity mismatch"; then
+            why="the abort did not say 'checkpoint identity mismatch'"
+        elif ! printf '%s\n' "$out" | grep -qF "NOT checkpointable"; then
+            why="the abort did not say 'NOT checkpointable'"
+        elif [ -z "$live_id" ]; then
+            why="the abort did not report the live env_id"
+        elif [ -z "$mismatch_id" ]; then
+            why="the abort did not report checkpoint_env_id"
+        elif [ "$mismatch_id" -ne "$((live_id + 1000))" ]; then
+            why="checkpoint_env_id=$mismatch_id is not the fake's live+1000 for env_id=$live_id"
+        fi
+        if [ -n "$why" ]; then
+            echo "TOOTH FAIL $label — exact-identity abort was incomplete: $why (live env_id=${live_id:-missing}, checkpoint_env_id=${mismatch_id:-missing})"
+            printf '%s\n' "$out" | sed 's/^/           /'
+            dump_fake_err
+            fails=$((fails + 1))
+            return
+        fi
+
+        # The false-mismatch tooth must prove the FAKE API really served the
+        # production shape. Otherwise a mode that still reports
+        # checkpointed=true would exercise the old true-mismatch path and let
+        # this tooth pass without covering the false branch. Query the fake
+        # API after the abort and inspect the actual row.
+        if [ "$mode" = "envckptwrongidfalse" ]; then
+            local fake_env_body="" fake_env_shape="" fake_env_rc=0
+            if [ -z "$env_partition" ]; then
+                echo "TOOTH FAIL $label — could not identify the environment's partition from the abort, so the fake API shape cannot be checked"
+                printf '%s\n' "$out" | sed 's/^/           /'
+                dump_fake_err
+                fails=$((fails + 1))
+                return
+            fi
+            fake_env_body="$(curl -sS --max-time 3 \
+                "http://127.0.0.1:$((BASE+1))/api/partition/$env_partition/env" 2>&1)" || true
+            fake_env_shape="$(python3 - "$fake_env_body" "$env_partition" "$live_id" "$mismatch_id" <<'PY'
+import json, sys
+body, part, live, stale = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+try:
+    d = json.loads(body)
+except Exception as exc:
+    print("response is not JSON: %s" % exc)
+    sys.exit(1)
+rows = [e for e in d.get("envs", [])
+        if int(e.get("partition", part)) == part
+        and int(e.get("env_id", -1)) == live]
+if len(rows) != 1:
+    print("expected exactly one row for env_id=%d, got %d (%s)" % (live, len(rows), body))
+    sys.exit(1)
+row = rows[0]
+if str(row.get("checkpointed", "")).lower() != "false":
+    print("checkpointed=%r, expected false (%s)" % (row.get("checkpointed"), body))
+    sys.exit(1)
+if "checkpoint_env_id" not in row:
+    print("checkpoint_env_id is missing (%s)" % body)
+    sys.exit(1)
+reported = int(row["checkpoint_env_id"])
+if reported != stale:
+    print("checkpoint_env_id=%d, expected the abort's stale id %d (%s)"
+          % (reported, stale, body))
+    sys.exit(1)
+print("checkpointed=false, checkpoint_env_id=%d" % reported)
+PY
+)"
+            fake_env_rc=$?
+            if [ "$fake_env_rc" -ne 0 ]; then
+                echo "TOOTH FAIL $label — the fake env API did not return checkpointed=false with the stale checkpoint_env_id: $fake_env_shape"
+                printf '%s\n' "$out" | sed 's/^/           /'
+                dump_fake_err
+                fails=$((fails + 1))
+                return
+            fi
+        fi
+    fi
     # prekillchurn's PASS must mean the churn really churned: the node
     # that won the election (node 2) must be REALLY KILLED by the guard
     # (its original pid is dead -- the guard's step 6), and the guard must
@@ -453,6 +578,9 @@ tooth adopted          0 "PASS"      "leadergap -> PASS (the leader was unreacha
 tooth notadopted       1 "never adopted" "notadopted -> FAIL (the leader leads but the adoption never fires)"
 tooth nolearn          1 "never learned" "nolearn -> FAIL (the create announce did not arrive)"
 tooth nockpt           1 "no checkpoint" "nockpt -> FAIL (the checkpoint never carried the row)"
+tooth envckptlost      2 "NOT checkpointable" "envckptlost -> ABORT (the environment is live and checkpoints keep flowing, but the exact table never marks it checkpointed: the guard must report the distinct not-checkpointable diagnosis, not blame adoption, and must not kill the leader; this tooth checks its pid is still alive after the abort)"
+tooth envckptwrongid   2 "checkpoint identity mismatch" "envckptwrongid -> ABORT (the env API marks the live index checkpointed, but checkpoint_env_id names a different environment: the exact-identity gate must name the identity mismatch with both reported ids and report NOT checkpointable, not blame adoption, and must not kill the leader; this tooth checks its pid is still alive after the abort)"
+tooth envckptwrongidfalse 2 "checkpoint identity mismatch" "envckptwrongidfalse -> ABORT (the env API reports checkpointed=false for the live index while checkpoint_env_id names a different environment -- the production stale-record shape: the exact-identity gate must name the identity mismatch with both reported ids and report NOT checkpointable, not blame adoption, and must not kill the leader; this tooth checks its pid is still alive and the fake env API itself returned checkpointed=false with the stale checkpoint_env_id after the abort)"
 tooth splitbrain       1 "split-brain"   "splitbrain -> FAIL (both survivors claim LEADER at once)"
 tooth observeradopts   1 "ALSO recovered" "observeradopts -> FAIL (a follower that recovered must be caught by step 9)"
 tooth lateflip         1 "flipped to LEADER" "lateflip -> FAIL (the late flip to LEADER must be caught by step 9)"

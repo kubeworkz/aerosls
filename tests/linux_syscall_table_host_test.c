@@ -96,6 +96,23 @@ int main(void)
               "every census number — traced and declared — has a non-UNKNOWN class");
     }
 
+    /* ─── M1's eight network numbers: a second declared set ───────────────
+     * The census artifact stays the E7 backup candidate's 27 rows; M1's
+     * bridge names its own eight, and the table is their union. Each must
+     * carry LSC_NET, or a Linux TCP caller meets LSC_UNKNOWN and is
+     * refused before a single byte reaches SocketOps. */
+    {
+        static const uint64_t net_nums[] = { 41, 42, 43, 44, 45, 48, 49, 50 };
+        size_t j;
+        int bad = 0;
+        for (j = 0; j < sizeof(net_nums) / sizeof(net_nums[0]); j++) {
+            if (linux_syscall_class(net_nums[j]) != LSC_NET)
+                bad++;
+        }
+        CHECK(bad == 0,
+              "M1's eight socket numbers all classify as LSC_NET");
+    }
+
     /* ─── The class of each number is the destination §5.6 names ────────── */
     struct { uint64_t num; enum LinuxSyscallClass cls; const char *name; } want[] = {
         {   0, LSC_FD,    "read" },
@@ -112,6 +129,14 @@ int main(void)
         {  12, LSC_MEM,   "brk" },
         {  13, LSC_SIG,   "rt_sigaction" },
         {  14, LSC_SIG,   "rt_sigprocmask" },
+        {  41, LSC_NET,   "socket" },
+        {  42, LSC_NET,   "connect" },
+        {  43, LSC_NET,   "accept" },
+        {  44, LSC_NET,   "sendto" },
+        {  45, LSC_NET,   "recvfrom" },
+        {  48, LSC_NET,   "shutdown" },
+        {  49, LSC_NET,   "bind" },
+        {  50, LSC_NET,   "listen" },
         {  59, LSC_SPAWN, "execve" },
         {  72, LSC_FD,    "fcntl" },
         {  74, LSC_FD,    "fsync" },
@@ -173,7 +198,7 @@ int main(void)
         CHECK(strcmp(linux_syscall_class_name(LSC_UNKNOWN), "unknown") == 0,
               "LSC_UNKNOWN's name is \"unknown\" (the refusal line's wording)");
         CHECK(linux_syscall_table_len == sizeof(want) / sizeof(want[0]),
-              "the table's length equals the census's row count");
+              "the table's length equals the census's 27 rows plus M1's eight network numbers");
     }
 
     printf("linux_syscall_table_host_test: %d passed, %d failed\n",

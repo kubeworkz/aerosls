@@ -897,6 +897,16 @@ jobs:
         run: make X86_CC=gcc X86_LD=ld x86-iso-e3
         working-directory: aerosls2
 
+      # The M1 network gate boots a separate image whose tenant sidecar is
+      # built with the m1_net_probe feature. Build it BEFORE the guards step so
+      # run_checks.sh finds the ISO and runs tests/m1_net_probe_check.sh for
+      # real instead of reporting an owed runtime skip. The E3 ISO above is
+      # already built, so rebuilding the shared E3 cpio for this feature does
+      # not change that image.
+      - name: Build the M1 network-probe ISO for the live network gate
+        run: make X86_CC=gcc X86_LD=ld x86-iso-e3 M1_NET_PROBE=1 X86_E3_ISO=sls_operating_system_m1net.iso
+        working-directory: aerosls2
+
       - name: Run all guards with --require-all (every build-run guard must pass)
         run: bash tests/run_checks.sh --require-all
         working-directory: aerosls2

@@ -204,6 +204,12 @@ static void proc_clear_resume_state(struct ProcessDescriptor* pd) {
      * per-task state resets). */
     pd->reply_stage_kind = 0;
     pd->reply_stage_aux = 0;
+    /* M1: the network reply's secondary destinations die with the slot
+     * for the same reason — a reused descriptor must never aim a
+     * successor's accept/recvfrom payload at its predecessor's pages. */
+    pd->reply_stage_va2 = 0;
+    pd->reply_stage_len2 = 0;
+    pd->reply_stage_va3 = 0;
     pd->linux_dir_pos = 0;
 }
 

@@ -67,6 +67,8 @@ pub mod e7_firstuser;
 pub mod e7_probe;
 pub mod heap;
 pub mod linux;
+#[cfg(feature = "m1_net_probe")]
+pub mod m1_net_probe;
 pub mod net_client;
 
 #[cfg(feature = "target")]

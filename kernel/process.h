@@ -253,6 +253,10 @@ struct ProcessDescriptor {
                                        // (bytes the deliver may write at
                                        // reply_stage_va — 144 for stat, the
                                        // child's count for getdents64)
+    uint64_t   reply_stage_va2;        // M1: the SECOND destination — accept's
+                                       // addrlen, recvfrom's sockaddr_in
+    uint32_t   reply_stage_len2;       // bytes for va2 (4 or 16; 0 = none)
+    uint64_t   reply_stage_va3;        // M1: recvfrom's addrlen destination
     uint64_t   linux_dir_pos;          // step 4's getdents64 cursor: the ENTRY
                                        // INDEX the next call starts at, advanced
                                        // by the deliver only by records actually

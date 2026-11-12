@@ -28,6 +28,15 @@ pub trait SocketOps {
     /// Send data on a connected socket. Returns bytes accepted.
     fn send(&mut self, id: u32, data: &[u8]) -> Result<usize, u16>;
 
+    /// sendto on a stream socket. The destination is present only when the
+    /// caller supplied a non-NULL sockaddr; Linux ignores it on a connected
+    /// stream, while an unconnected stream still fails as a send would. The
+    /// default preserves the old client behavior for simple test doubles.
+    fn send_to(&mut self, id: u32, data: &[u8], dest: Option<(u32, u16)>) -> Result<usize, u16> {
+        let _ = dest;
+        self.send(id, data)
+    }
+
     /// Receive data from a socket. Returns bytes read.
     fn recv(&mut self, id: u32, buf: &mut [u8]) -> Result<usize, u16>;
 
@@ -40,10 +49,26 @@ pub trait SocketOps {
     /// Accept a pending connection. Returns a new socket ID.
     fn accept(&mut self, id: u32) -> Result<u32, u16>;
 
+    /// Accept and return the new socket ID plus the peer's Host-order IPv4
+    /// address and port. Implementations that do not know the peer keep the
+    /// old accept behavior with a zero address; NetClient overrides this so
+    /// accept(2) can fill its sockaddr_in instead of a zero trailer.
+    fn accept_peer(&mut self, id: u32) -> Result<(u32, u32, u16), u16> {
+        self.accept(id).map(|new_id| (new_id, 0, 0))
+    }
+
+    /// The peer address of a connected/accepted socket, if the client knows
+    /// it. recvfrom uses this to report the source instead of zeroes.
+    fn peer_addr(&self, id: u32) -> Option<(u32, u16)> {
+        let _ = id;
+        None
+    }
+
     /// Close a socket on the driver side.
     fn close_socket(&mut self, id: u32) -> Result<(), u16>;
 
     /// Poll a socket for readability/writability (POLLIN=0x1, POLLOUT=0x4).
+    /// A service may report only readability; the sidecar maps what it gets.
     fn poll(&mut self, id: u32) -> Result<u16, u16>;
 
     /// Shutdown part of a socket: 0=SHUT_RD, 1=SHUT_WR, 2=SHUT_RDWR.

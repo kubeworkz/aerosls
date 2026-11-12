@@ -116,6 +116,29 @@ int main(void)
           -LINUX_EACCES != -LINUX_EPERM,
           "file class forward: EACCES stays 13 — it must not collapse into EPERM (1)");
 
+    /* ─── M1 network class: one code per branchable Linux errno ─────────── */
+    struct { int32_t cap; int32_t want; const char *why; } fwd6[] = {
+        { CAP_EADDRINUSE,    -LINUX_EADDRINUSE,    "bind on a used address" },
+        { CAP_EADDRNOTAVAIL, -LINUX_EADDRNOTAVAIL, "the local address is not ours" },
+        { CAP_ECONNRESET,    -LINUX_ECONNRESET,    "the peer reset the connection" },
+        { CAP_ENOTCONN,      -LINUX_ENOTCONN,      "the stream is not connected" },
+        { CAP_EISCONN,       -LINUX_EISCONN,       "the stream is already connected" },
+        { CAP_EDESTADDRREQ,  -LINUX_EDESTADDRREQ,  "a destination is required" },
+        { CAP_EMSGSIZE,      -LINUX_EMSGSIZE,      "the datagram is too large" },
+        { CAP_EPIPE,         -LINUX_EPIPE,         "the peer is gone on send" },
+        { CAP_ECONNREFUSED,  -LINUX_ECONNREFUSED,  "the peer refused the connection" },
+        { CAP_ENETUNREACH,   -LINUX_ENETUNREACH,   "the network is unreachable" },
+        { CAP_EHOSTUNREACH,  -LINUX_EHOSTUNREACH,  "the host is unreachable" },
+        { CAP_EAFNOSUPPORT,  -LINUX_EAFNOSUPPORT,  "the address family is unsupported" },
+    };
+    for (i = 0; i < sizeof(fwd6) / sizeof(fwd6[0]); i++) {
+        int32_t got = linux_errno_from_cap(fwd6[i].cap);
+        char msg[160];
+        snprintf(msg, sizeof(msg), "network forward: %d -> %d (%s)",
+                 (int)fwd6[i].cap, (int)fwd6[i].want, fwd6[i].why);
+        CHECK(got == fwd6[i].want, msg);
+    }
+
     /* ─── Status 0 is success, in the forward map ────────────────────────── */
     CHECK(linux_errno_from_cap(0) == 0, "forward: status 0 is 0 (success), not an errno");
 
@@ -142,7 +165,8 @@ int main(void)
         int32_t probe;
         int32_t specials[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
                                (int32_t)CAP_NONE, 99, -99, 65536, -1, -12,
-                               -13, -20 };  /* the file class's new codes */
+                               -13, -20, -21, -22, -23, -24, -25, -26,
+                               -27, -28, -29, -30, -31, -32 };
         for (i = 0; i < sizeof(specials) / sizeof(specials[0]); i++) {
             int32_t got = linux_errno_from_cap(specials[i]);
             if (got != 0 && (got < -4095 || got > -1))
@@ -179,6 +203,18 @@ int main(void)
         { -LINUX_ESPIPE,    CAP_ESPIPE },
         { -LINUX_ENOTEMPTY, CAP_ENOTEMPTY },
         { -LINUX_ENAMETOOLONG, CAP_ENAMETOOLONG },
+        { -LINUX_EADDRINUSE,    CAP_EADDRINUSE },
+        { -LINUX_EADDRNOTAVAIL, CAP_EADDRNOTAVAIL },
+        { -LINUX_ECONNRESET,    CAP_ECONNRESET },
+        { -LINUX_ENOTCONN,      CAP_ENOTCONN },
+        { -LINUX_EISCONN,       CAP_EISCONN },
+        { -LINUX_EDESTADDRREQ,  CAP_EDESTADDRREQ },
+        { -LINUX_EMSGSIZE,      CAP_EMSGSIZE },
+        { -LINUX_EPIPE,         CAP_EPIPE },
+        { -LINUX_ECONNREFUSED,  CAP_ECONNREFUSED },
+        { -LINUX_ENETUNREACH,   CAP_ENETUNREACH },
+        { -LINUX_EHOSTUNREACH,  CAP_EHOSTUNREACH },
+        { -LINUX_EAFNOSUPPORT,  CAP_EAFNOSUPPORT },
     };
     for (i = 0; i < sizeof(rev) / sizeof(rev[0]); i++) {
         int32_t got = cap_code_from_linux_errno(rev[i].linux_errno);

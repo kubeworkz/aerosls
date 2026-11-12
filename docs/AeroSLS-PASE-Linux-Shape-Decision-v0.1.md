@@ -40,7 +40,7 @@ One operator means one active implementation milestone. Owners are Gridworkz thr
 | Priority | Milestone | Rough effort | Exit gate |
 |---|---|---:|---|
 | P0 | **M0 — Record the Linux-shape decision** | 1–2 weeks | This record accepted; v0.2 Appendix B corrected; `.github/CODEOWNERS` names the Gridworkz account. |
-| P1 | **M1 — Linux network bridge** | 3–4 weeks | `socket`/`connect`/`bind`/`listen`/`accept`/`sendto`/`recvfrom` forward through the sidecar to P2's socket service; a network-using Linux candidate completes a live TCP round trip. |
+| P1 | **M1 — Linux network bridge** | 3–4 weeks | `socket`/`connect`/`bind`/`listen`/`accept`/`sendto`/`recvfrom`/`shutdown` forward through the sidecar to P2's socket service; a network-using Linux candidate completes a live TCP round trip. **LANDED 2026-11-12** — see the closure note below. |
 | P1 | **M2 — Dynamic linking** | 6–8 weeks | Guest `ld.so` runs: `PT_INTERP`, shared-object mapping, `AT_PHDR`/`AT_BASE`, relocations and the required syscalls; a dynamically linked musl or glibc candidate starts and completes work. |
 | P1 | **M3 — Signal delivery** | 3–4 weeks | Handlers, blocked/pending masks, `sigaltstack` and `rt_sigreturn` work; default actions remain correct; signal state survives checkpoint/restore. |
 | P2 | **M4 — Threads and thread groups** | 10–16 weeks | `clone`, `futex`, shared address spaces, per-thread stacks and thread-aware checkpoint/restore; a static Go or threaded Rust candidate survives the gate. A one-week design spike runs during M0; implementation waits for M2. |
@@ -52,12 +52,14 @@ One operator means one active implementation milestone. Owners are Gridworkz thr
 
 **MVP boundary.** M0–M3 is the first useful runtime: networked, dynamically linked, signal-capable and single-threaded. M4 is the modern-runtime gate. M5 is PASE data parity. M6 is production capacity and recovery.
 
+**M1 closure (2026-11-12).** The eight socket-class numbers cross the Linux trap through the sidecar to P2's socket service. The kernel-side plan has 27 host checks in `tests/linux_net_bridge_host_test.c`; the live QEMU gate `tests/m1_net_probe_check.sh` boots `sls_operating_system_m1net.iso`, asserts all eight calls, and observed two successful probe executions with no `M1-NET FAIL` (`evidence/m1_net_probe_gate.log`). The live probe's peer is the guest's own 10.0.2.15 address (kernel loopback), not a host/NIC peer; UDP, IPv6, external connect failures, `CLOEXEC`/nonblocking variants and `SHUT_RDWR` remain outside this gate.
+
 ## Gap-register consequences
 
 The v0.2 register now records:
 
 - the P2 live L5 arm as green in CI run `43072501848` (2026-11-11), removing the old boot-evidence caveat;
-- the Linux networking gap as **M1**, not as an unowned gap;
+- the Linux networking gap as **M1**, now landed, not as an unowned gap;
 - native interop as **PARTIAL**, not “LANDED”; the read-only catalog/`CAT_QUERY` slice is real, but writes, IFS-like sharing, identity/ACL and native SIMI remain M5;
 - threads as **M4**, dynamic linking as **M2**, signal delivery as **M3**, and capacity/P3 durability as **M6**;
 - AIX binary compatibility as **out of scope by this decision**, not as a planned gap;

@@ -123,6 +123,24 @@ ifneq ($(E7_SELFKILL),)
   AB_DEFS += -DE7G_SELFKILL=1
 endif
 
+# ─── ENV_CKPT_TEST_HOOKS: the stale-identity injection, never a shipped build ─
+# tests/env_api_identity_check.sh builds its live cluster with
+# `ENV_CKPT_TEST_HOOKS=1 ./run-cluster.sh --nodes 3`. The ONLY arm this adds
+# writes an env checkpoint record's env_id with a fixed offset, so the live
+# kernel's GET /api/partition/{id}/env reports checkpointed=false while still
+# naming that different checkpoint_env_id -- the exact shape the failover
+# guard's identity-mismatch branch must diagnose. An
+# ordinary build compiles the arm out entirely; the flag joins AB_DEFS so the
+# configuration stamp makes a flip rebuild, rather than silently relinking the
+# previous identity-clean objects.
+ENV_CKPT_TEST_HOOKS ?=
+ifneq ($(ENV_CKPT_TEST_HOOKS),)
+  ifneq ($(ENV_CKPT_TEST_HOOKS),1)
+    $(error ENV_CKPT_TEST_HOOKS must be empty or 1 (got '$(ENV_CKPT_TEST_HOOKS)'))
+  endif
+  AB_DEFS += -DENV_CKPT_TEST_HOOKS=1
+endif
+
 # ─── Rebuild when the CONFIGURATION changes, not only when sources do ────────
 # make compares source timestamps against object timestamps. It has no idea
 # that X86_CFLAGS or TCG_CFLAGS changed, so `make x86-iso SLS_SOFTMMU=on` over
@@ -1111,6 +1129,11 @@ BOOTIMAGE_QUIET = $(if $(findstring e7_gate,$(INIT_FEATURES)),--quiet-init)
 # extends. Enabled only by the drill (see .e7g_stall_drill.sh); empty here.
 E7_SLOW_BOOT ?=
 SIDECAR_SLOW_BOOT = $(if $(filter 1,$(E7_SLOW_BOOT)),--features aerosls-sidecar/e7_slow_boot)
+# M1's live Linux TCP probe: a build-time feature, never in a shipped image.
+# `make x86-iso-e3 M1_NET_PROBE=1` builds the tenant sidecar with the probe
+# module and spawn call; an unset knob compiles both out.
+M1_NET_PROBE ?=
+SIDECAR_M1_NET_PROBE = $(if $(filter 1,$(M1_NET_PROBE)),--features aerosls-sidecar/m1_net_probe)
 SIDECAR_INIT_ELF   ?= user/target/x86_64-unknown-none/release/init
 SIDECAR_DM_ELF     ?= user/target/x86_64-unknown-none/release/dm
 SIDECAR_POSIX_ELF ?= user/target/x86_64-unknown-none/release/posix
@@ -1171,7 +1194,7 @@ selfhost-bootimage:
 	@# aerosls-bootimage directly; a stamp is only for an archive this target
 	@# built.) tests/sidecar_stamp_check.sh clause G holds this line.
 	@$(CARGO) build --quiet --manifest-path user/Cargo.toml -p aerosls-dm -p aerosls-sidecar -p aerosls-ramdisk -p aerosls-network -p aerosls-e1000-driver \
-		--features target $(SIDECAR_SLOW_BOOT) --target x86_64-unknown-none --release \
+		--features target $(SIDECAR_SLOW_BOOT) $(SIDECAR_M1_NET_PROBE) --target x86_64-unknown-none --release \
 		--bin dm --bin posix --bin ramdisk --bin network --bin e1000_driver \
 		|| { echo "[SELFHOST] REFUSING to pack and stamp: the sidecars did not build for x86_64-unknown-none." >&2; \
 		     echo "           The stamp attests the packed binaries, and reusing existing ones would make it a lie." >&2; \

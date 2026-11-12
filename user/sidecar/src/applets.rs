@@ -4949,9 +4949,9 @@ pub fn nettest<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
             return Step::Exit(1);
         }
     };
-    swrite(b"[nettest] client: connect(127.0.0.1:9999)\n");
-    match net.connect(cln, 0x7F000001, 9999) {
-        Ok(()) => swrite(b"[nettest] PASS: connect(127.0.0.1:9999)\n"),
+    swrite(b"[nettest] client: connect(10.0.2.15:9999)\n");
+    match net.connect(cln, 0x0A00020F, 9999) {
+        Ok(()) => swrite(b"[nettest] PASS: connect(10.0.2.15:9999)\n"),
         Err(e) => {
             swrite(b"[nettest] FAIL: connect()\n");
             net.close_socket(cln).ok();
@@ -4960,15 +4960,25 @@ pub fn nettest<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
         }
     }
 
-    // Accept the pending connection on the listener.
+    // Accept the pending connection on the listener. The accepted
+    // socket owns the listener's local address, so it must be closed
+    // too: leaving it live keeps :9999 bound after this test and makes
+    // the next bind (the M1 probe's watchdog rerun) fail EADDRINUSE.
     swrite(b"[nettest] listener: accept()\n");
+    let mut accepted = None;
     match net.accept(lsn) {
-        Ok(_peer) => swrite(b"[nettest] PASS: accept()\n"),
+        Ok(peer) => {
+            accepted = Some(peer);
+            swrite(b"[nettest] PASS: accept()\n");
+        }
         Err(e) => {
             swrite(b"[nettest] FAIL: accept()\n");
         }
     }
 
+    if let Some(peer) = accepted {
+        net.close_socket(peer).ok();
+    }
     net.close_socket(cln).ok();
     net.close_socket(lsn).ok();
     swrite(b"[nettest] PASS: shutdown+close\n");

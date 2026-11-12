@@ -66,6 +66,9 @@ pub struct NetClient<K: Kernel, A: BufferAlloc> {
     mtu: u32,
     /// Local socket table (client-side mirror).
     socks: BTreeMap<u32, ClientSocket>,
+    /// The grant handle returned by the last data reply, if any. The
+    /// window=1 budget allocator adopts it on the next data request.
+    last_reply_cap: Option<u32>,
 }
 
 /// Error from a NET_* RPC.
@@ -90,10 +93,22 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
             chan_w,
             chan_r,
             alloc,
-            next_tag: 1,
+            // Tag 1 belongs to entry.rs's one-shot NET_INFO handshake.
+            // Reserving it keeps a late handshake reply queued, where
+            // recv_reply_owned's (kind, tag, type) matcher discards it
+            // instead of feeding it to the first socket() call.
+            next_tag: 2,
             max_sockets: 0,
             mtu: 0,
             socks: BTreeMap::new(),
+            last_reply_cap: None,
+        }
+    }
+
+    /// Re-adopt a grant the driver moved back in its reply.
+    fn reclaim_reply_cap(&mut self) {
+        if let Some(slot) = self.last_reply_cap.take() {
+            self.alloc.reclaim(slot);
         }
     }
 
@@ -211,12 +226,17 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
 
         let (_rr, body) = self.recv_reply_owned(tag, NET_BIND)?;
         let status = Self::status_of(&body)?;
-        if status == NET_OK {
-            if let Some(s) = self.socks.get_mut(&id) {
-                s.local_ip = ip;
-                s.local_port = port;
-                s.state = SockState::Bound;
-            }
+        /* The status is the service's verdict. Swallowing a non-OK
+         * reply made a refused bind/listen/connect look successful and
+         * moved the failure to accept, where it was unreadable; M1's
+         * live probe is the caller that caught it. */
+        if status != NET_OK {
+            return Err(NetError::Status(status));
+        }
+        if let Some(s) = self.socks.get_mut(&id) {
+            s.local_ip = ip;
+            s.local_port = port;
+            s.state = SockState::Bound;
         }
         Ok(())
     }
@@ -236,12 +256,13 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
 
         let (_rr, body) = self.recv_reply_owned(tag, NET_CONNECT)?;
         let status = Self::status_of(&body)?;
-        if status == NET_OK {
-            if let Some(s) = self.socks.get_mut(&id) {
-                s.remote_ip = ip;
-                s.remote_port = port;
-                s.state = SockState::Connected;
-            }
+        if status != NET_OK {
+            return Err(NetError::Status(status));
+        }
+        if let Some(s) = self.socks.get_mut(&id) {
+            s.remote_ip = ip;
+            s.remote_port = port;
+            s.state = SockState::Connected;
         }
         Ok(())
     }
@@ -260,10 +281,11 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
 
         let (_rr, body) = self.recv_reply_owned(tag, NET_LISTEN)?;
         let status = Self::status_of(&body)?;
-        if status == NET_OK {
-            if let Some(s) = self.socks.get_mut(&id) {
-                s.state = SockState::Listening;
-            }
+        if status != NET_OK {
+            return Err(NetError::Status(status));
+        }
+        if let Some(s) = self.socks.get_mut(&id) {
+            s.state = SockState::Listening;
         }
         Ok(())
     }
@@ -289,18 +311,12 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
                 .unwrap_or(NET_ERR_PROTO);
             return Err(NetError::Status(status));
         }
-        // The kernel's accept reply is the shared status body
-        // {status u16, value u64} with value = the NEW socket id
-        // (nss_reply_ok's contract; the host test reads the id from the
-        // same value field), not the rich {id, sockaddr} body this
-        // crate's doc comment describes — SocketOps drops the remote
-        // address anyway, so parse what the wire actually carries and
-        // hand the caller a usable id.
-        let (_status, value) =
-            parse_status_body(&body[NetFrame::SIZE..]).ok_or(NetError::Protocol)?;
-        let new_id = value as u32;
-        let rip = 0u32;
-        let rport = 0u16;
+        // The service now sends the rich accept body: {new_id u32,
+        // addr [u8;6]} where addr is sockaddr_in byte order. Parse it so
+        // the accepted socket carries its peer and accept(2) can fill a
+        // real sockaddr_in instead of a zero trailer.
+        let (new_id, rip, rport) =
+            parse_net_accept_body(&body[NetFrame::SIZE..]).ok_or(NetError::Protocol)?;
 
         self.socks.insert(
             new_id,
@@ -347,7 +363,9 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
             .send(self.chan_w, tag, 0, &payload, &[send_cap], TIMEOUT_NONE)
             .map_err(NetError::Kernel)?;
 
-        let (_rr, body) = self.recv_reply_owned(tag, NET_SEND)?;
+        let reply = self.recv_reply_owned(tag, NET_SEND);
+        self.reclaim_reply_cap();
+        let (_rr, body) = reply?;
         let status = Self::status_of(&body)?;
         if status != NET_OK {
             return Err(NetError::Status(status));
@@ -382,7 +400,9 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
             .send(self.chan_w, tag, 0, &payload, &[send_cap], TIMEOUT_NONE)
             .map_err(NetError::Kernel)?;
 
-        let (_rr, body) = self.recv_reply_owned(tag, NET_RECV)?;
+        let reply = self.recv_reply_owned(tag, NET_RECV);
+        self.reclaim_reply_cap();
+        let (_rr, body) = reply?;
         let status = Self::status_of(&body)?;
         if status != NET_OK {
             return Err(NetError::Status(status));
@@ -440,14 +460,14 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
 
         let (_rr, body) = self.recv_reply_owned(tag, NET_SHUTDOWN)?;
         let status = Self::status_of(&body)?;
-        if status == NET_OK {
-            if let Some(s) = self.socks.get_mut(&id) {
-                s.state = match how {
-                    0 => SockState::HalfClosed,
-                    1 => SockState::HalfClosed,
-                    _ => SockState::Closed,
-                };
-            }
+        if status != NET_OK {
+            return Err(NetError::Status(status));
+        }
+        if let Some(s) = self.socks.get_mut(&id) {
+            s.state = match how {
+                0 | 1 => SockState::HalfClosed,
+                _ => SockState::Closed,
+            };
         }
         Ok(())
     }
@@ -492,6 +512,7 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
     /// Receive a reply and return the body bytes (everything after the
     /// NetFrame header) as an owned Vec.
     fn recv_reply_owned(&mut self, expected_tag: u32, expected_ty: u16) -> Result<(RecvResult, alloc::vec::Vec<u8>), NetError> {
+        self.last_reply_cap = None;
         // Retry recv, PARKING on the reply channel with a deadline between
         // attempts. A bare k_yield loop gives the kernel's
         // net_socket_service_tick() zero wall time: once this sidecar is
@@ -528,6 +549,9 @@ impl<K: Kernel, A: BufferAlloc> NetClient<K, A> {
                         // yields a garbage sock_id and bind() INVAL).
                         if let Some(f) = NetFrame::parse(&buf[..rr.len]) {
                             if f.ty == expected_ty {
+                                if rr.n_caps > 0 {
+                                    self.last_reply_cap = Some(caps[0].handle);
+                                }
                                 return Ok((rr, alloc::vec::Vec::from(&buf[..rr.len])));
                             }
                         }
@@ -580,6 +604,23 @@ impl<K: Kernel, A: BufferAlloc> aerosls_proto::sockops::SocketOps for NetClient<
         })
     }
 
+    fn send_to(&mut self, id: u32, data: &[u8], dest: Option<(u32, u16)>) -> Result<usize, u16> {
+        // Linux ignores a destination on a connected stream. On an
+        // unconnected stream the send itself fails; reporting EPIPE here
+        // matches the live Linux probe without inventing an implicit
+        // connect for a shape TCP does not support.
+        if dest.is_some() {
+            match self.get_socket(id) {
+                Some(s) if matches!(s.state, SockState::Connected | SockState::HalfClosed) => {}
+                _ => return Err(NET_ERR_PIPE),
+            }
+        }
+        NetClient::send(self, id, data).map_err(|e| match e {
+            NetError::Status(s) => s,
+            _ => NET_ERR_IO,
+        })
+    }
+
     fn recv(&mut self, id: u32, buf: &mut [u8]) -> Result<usize, u16> {
         NetClient::recv(self, id, buf).map_err(|e| match e {
             NetError::Status(s) => s,
@@ -602,12 +643,18 @@ impl<K: Kernel, A: BufferAlloc> aerosls_proto::sockops::SocketOps for NetClient<
     }
 
     fn accept(&mut self, id: u32) -> Result<u32, u16> {
-        NetClient::accept(self, id)
-            .map(|(new_id, _, _)| new_id)
-            .map_err(|e| match e {
-                NetError::Status(s) => s,
-                _ => NET_ERR_IO,
-            })
+        self.accept_peer(id).map(|(new_id, _, _)| new_id)
+    }
+
+    fn accept_peer(&mut self, id: u32) -> Result<(u32, u32, u16), u16> {
+        NetClient::accept(self, id).map_err(|e| match e {
+            NetError::Status(s) => s,
+            _ => NET_ERR_IO,
+        })
+    }
+
+    fn peer_addr(&self, id: u32) -> Option<(u32, u16)> {
+        self.get_socket(id).map(|s| (s.remote_ip, s.remote_port))
     }
 
     fn close_socket(&mut self, id: u32) -> Result<(), u16> {

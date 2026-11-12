@@ -63,7 +63,10 @@ cd "$REPO_ROOT"
 
 QEMU="qemu-system-x86_64"
 X86_BIN="my_sls_kernel.bin"            # must match the Makefile's own $(X86_BIN)
-CLUSTER_DIR="cluster"
+# A caller that needs an isolated cluster (a live test that must not disturb
+# the operator's cluster) can point this at a private directory. Relative
+# paths remain relative to REPO_ROOT, where this script cd's above.
+CLUSTER_DIR="${AEROSLS_CLUSTER_DIR:-cluster}"
 PID_FILE="$CLUSTER_DIR/cluster.pids"
 
 MCAST_GROUP="${AEROSLS_MCAST:-239.192.152.40}"
@@ -112,7 +115,8 @@ usage: run-cluster.sh [options]
   -h, --help    this
 
 environment: AEROSLS_MCAST, AEROSLS_MCAST_PORT, AEROSLS_CON_BASE,
-             AEROSLS_RAM, AEROSLS_SMP, AEROSLS_DISPLAY, AEROSLS_SETTLE
+             AEROSLS_RAM, AEROSLS_SMP, AEROSLS_DISPLAY, AEROSLS_SETTLE,
+             AEROSLS_CLUSTER_DIR
 
 capacity overrides (also how the sizing is tested):
              AEROSLS_HOST_CORES, AEROSLS_HOST_MEM_MB, AEROSLS_HOST_DISK_MB,

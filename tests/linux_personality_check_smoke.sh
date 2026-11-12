@@ -277,14 +277,15 @@ tooth echo-check-dropped J2 "the num-echo refusal is gone from apply_reply" "$W/
 # K: the service call unhooked — requests stay queued while their task
 # parks forever, and the wait set never learns to wake the sidecar.
 #
-# The call gained a third argument (the VFS the file class needs) after this
-# tooth was written, so its pattern matched nothing and the sed was a no-op:
-# a mutation that never happened reads exactly like one that happened and
-# was caught, and only this tooth's own verdict distinguishes them. It and
-# three others (M6, O7, T5) had gone stale this way against the current
-# sources, unseen because the baseline aborted before any tooth could run.
+# The call gained a fourth argument (the SocketOps client M1's network
+# bridge needs) after this tooth was written, so its pattern must be kept
+# in step with the source: a mutation that never happened reads exactly
+# like one that happened and was caught, and only this tooth's verdict
+# distinguishes them. It and three others (M6, O7, T5) had gone stale this
+# way against earlier source changes, unseen because the baseline aborted
+# before any tooth could run.
 seed "$W/t14"
-sed -i 's/crate::linux::service(\&RealKernel, \&booted\.console, \&mut booted\.proc\.vfs);//' "$W/t14/user/sidecar/src/entry.rs"
+sed -i 's/crate::linux::service(\&RealKernel, \&booted\.console, vfs, net);//' "$W/t14/user/sidecar/src/entry.rs"
 tooth service-unhooked K "the entry loop no longer services the Linux children" "$W/t14"
 
 # K1: the default arm becomes a silent success — §11 Q5's forbidden answer
@@ -718,7 +719,7 @@ tooth poll-timeout-clamped-away S1 "the write clamp overwrites poll's timeout wo
 # t86: the sidecar arm renamed away — poll falls to the default ENOSYS
 # while the kernel's two plans stay green; the firstuser's line returns.
 seed "$W/t86"
-sed -i 's/LINUX_POLL => poll_answer(fds, console, payload, args, now_ns,/LINUX_POLLX => poll_answer(fds, console, payload, args, now_ns,/' "$W/t86/user/sidecar/src/linux.rs"
+sed -i 's/LINUX_POLL => poll_answer(fds, net, console, payload, args, now_ns,/LINUX_POLLX => poll_answer(fds, net, console, payload, args, now_ns,/' "$W/t86/user/sidecar/src/linux.rs"
 tooth poll-arm-gone S2 "the sidecar no longer routes poll (7) to its scanner" "$W/t86"
 
 # t87: the wait answered 0 at once — a timed poll returns immediately
