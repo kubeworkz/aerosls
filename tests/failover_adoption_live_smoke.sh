@@ -30,6 +30,15 @@
 #   nockpt      -> FAIL  (followers learn but no checkpoint flows; the
 #                         checkpoint gate must bite -- without it the held
 #                         checkpoint predates the create)
+#   envckptlost -> ABORT (checkpoints keep flowing after the environment
+#                         create, but the exact table never marks the live
+#                         environment checkpointed: it is NOT checkpointable.
+#                         The gate must abort distinctly before the leader
+#                         is killed)
+#   envckptwrongid -> ABORT (the env API reports checkpointed=true for the
+#                         live index, but checkpoint_env_id names a different
+#                         environment: the exact-identity gate must abort
+#                         NOT checkpointable before the leader is killed)
 #   splitbrain  -> FAIL  (BOTH survivors become leader at once; the guard
 #                         must detect the split and fail loudly)
 #   observeradopts -> FAIL (the observer ALSO prints the Adopted line
@@ -407,6 +416,26 @@ tooth() {
             return
         fi
     fi
+    # The exact-table abort teeth must abort BEFORE the guard's kill. Assert
+    # on the real fake leader process (not the pid file, which cleanup owns),
+    # while it is still unreaped: a zombie counts as dead here. A guard that
+    # kills the leader before diagnosing the missing/mismatched exact record
+    # would otherwise satisfy the exit code and phrase while violating the
+    # tooth's contract.
+    if { [ "$mode" = "envckptlost" ] || [ "$mode" = "envckptwrongid" ]; } \
+            && [ "$rc" -eq 2 ] \
+            && printf '%s\n' "$out" | grep -q "NOT checkpointable"; then
+        local leader_state=""
+        leader_state="$(ps -o stat= -p "$lpid" 2>/dev/null || true)"
+        case "$leader_state" in
+            ""|Z*)
+                echo "TOOTH FAIL $label — guard exited 2 with NOT checkpointable, but the leader was killed before the abort (pid $lpid state: ${leader_state:-gone})"
+                printf '%s\n' "$out" | sed 's/^/           /'
+                dump_fake_err
+                fails=$((fails + 1))
+                return ;;
+        esac
+    fi
     # prekillchurn's PASS must mean the churn really churned: the node
     # that won the election (node 2) must be REALLY KILLED by the guard
     # (its original pid is dead -- the guard's step 6), and the guard must
@@ -453,6 +482,8 @@ tooth adopted          0 "PASS"      "leadergap -> PASS (the leader was unreacha
 tooth notadopted       1 "never adopted" "notadopted -> FAIL (the leader leads but the adoption never fires)"
 tooth nolearn          1 "never learned" "nolearn -> FAIL (the create announce did not arrive)"
 tooth nockpt           1 "no checkpoint" "nockpt -> FAIL (the checkpoint never carried the row)"
+tooth envckptlost      2 "NOT checkpointable" "envckptlost -> ABORT (the environment is live and checkpoints keep flowing, but the exact table never marks it checkpointed: the guard must report the distinct not-checkpointable diagnosis, not blame adoption, and must not kill the leader; this tooth checks its pid is still alive after the abort)"
+tooth envckptwrongid   2 "NOT checkpointable" "envckptwrongid -> ABORT (the env API marks the live index checkpointed, but checkpoint_env_id names a different environment: the exact-identity gate must report NOT checkpointable, not blame adoption, and must not kill the leader; this tooth checks its pid is still alive after the abort)"
 tooth splitbrain       1 "split-brain"   "splitbrain -> FAIL (both survivors claim LEADER at once)"
 tooth observeradopts   1 "ALSO recovered" "observeradopts -> FAIL (a follower that recovered must be caught by step 9)"
 tooth lateflip         1 "flipped to LEADER" "lateflip -> FAIL (the late flip to LEADER must be caught by step 9)"

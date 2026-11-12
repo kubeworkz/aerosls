@@ -62,6 +62,16 @@ Modes (written to <statedir>/mode by the smoke):
                   learn gate
     nockpt        followers learn but no checkpoint flows -> guard FAIL at
                   the checkpoint gate
+    envckptlost   checkpoints keep flowing after the environment create but
+                  the exact table never marks the live environment
+                  checkpointed (the live-but-not-checkpointable shape) ->
+                  guard ABORT with the distinct NOT checkpointable diagnosis,
+                  before killing the leader
+    envckptwrongid
+                  the env API reports checkpointed=true for the live index,
+                  but checkpoint_env_id names a different environment -> the
+                  exact-identity gate must ABORT NOT checkpointable before the
+                  leader is killed
     learnlost1    the FIRST announce's packet is LOST on the wire for BOTH
                   followers: they only ever see the row on the owner's next
                   periodic re-announce pass (~10 s later), so the
@@ -251,7 +261,11 @@ REANNOUNCE_PERIOD = 10.0   # models 1000 ticks ~= 10 s; see the block below
 # did before step 4.5 existed) leaves that gate at 0 forever no matter how
 # long it waits, so followers now log one per period -- same shape, same
 # line, bounded by the guard's own windows. 2 s keeps two lines inside one
-# FAST 6 s window with margin on a loaded host.
+# FAST 6 s window with margin on a loaded host. The payload is 448 + 40 per
+# environment to model a state-tree node; the guard gates on the exact table,
+# not this delta, and envckptlost reports checkpointed=false instead. Both
+# exact-table failure modes keep that size so the abort cannot be satisfied
+# by a size increase.
 CKPT_PERIOD = 2.0
 # Test-only knob for the smoke's "leadergap" tooth: when <state>/health_gap
 # holds a number, the LEADER answers /api/health only after that many
@@ -559,6 +573,22 @@ if role == "leader":
 learned = False
 
 
+def ckpt_size():
+    """Checkpoint bytes after the environment create.
+
+    A real state-tree node is ~40 bytes, so registered base modes model that
+    payload shape (448 -> 488). This is realism only: the guard now gates on
+    the exact checkpoint-table record, never on this size. envckptlost keeps
+    the size at 448 and reports checkpointed=false from the env API.
+    """
+    if mode in ("envckptlost", "envckptwrongid"):
+        return 448
+    # One state-tree node per environment: a guard self-restart creates a
+    # SECOND env, so prekillchurn's post-restart baseline is already 488 and
+    # its next frame must grow to 528.
+    return 448 + 40 * len(read_envs())
+
+
 def rx_thread():
     global learned
     if role != "follower" and mode != "prekillchurn":
@@ -660,7 +690,7 @@ def rx_thread():
             # with margins that only close if step 3 itself nearly timed out.
             time.sleep(2.0)
         if mode != "nockpt":
-            log("[DSPP-CKPT] RX: COMPLETE seq=1000 (448 bytes)")
+            log("[DSPP-CKPT] RX: COMPLETE seq=1000 (%d bytes)" % ckpt_size())
             # Periodic broadcast from here on: this is the follower's RX
             # clock, so it stops with this thread (which is life-bounded) and
             # never runs on a node that did not learn. ckptlost1 (above) delays
@@ -669,7 +699,8 @@ def rx_thread():
             seq = 1001
             while True:
                 time.sleep(CKPT_PERIOD)
-                log("[DSPP-CKPT] RX: COMPLETE seq=%d (448 bytes)" % seq)
+                log("[DSPP-CKPT] RX: COMPLETE seq=%d (%d bytes)"
+                    % (seq, ckpt_size()))
                 seq += 1
                 # A row can land long after this thread's first pass (the
                 # guard's -env partition, the restarted run's '-1'): learn
@@ -1493,6 +1524,29 @@ class H(http.server.BaseHTTPRequestHandler):
                              "quorum_threshold": 2})
         elif self.path == "/api/partitions":
             self._json(200, self._partitions())
+        elif self.path.startswith("/api/partition/") and self.path.endswith("/env"):
+            # The exact checkpoint-table evidence the guard gates on: a live
+            # console is not enough; the (partition, index, env_id) record
+            # must be in env_ckpt_table. Base modes model a registered
+            # environment; envckptlost reports no record, and envckptwrongid
+            # reports a record for the right live index but the wrong id.
+            pid = int(self.path[len("/api/partition/"):-len("/env")]
+                      .strip("/") or 0)
+            mine = [e for e in read_envs() if int(e["partition"]) == pid]
+            rows = []
+            for e in mine:
+                env_id = int(e["env_id"])
+                rows.append({"env_id": env_id,
+                             "index": int(e["index"]),
+                             "posix_pid": 100 + env_id,
+                             "dropped": 0,
+                             "checkpointed": "false" if mode == "envckptlost"
+                                             else "true",
+                             "checkpoint_env_id": env_id + 1000
+                                                  if mode == "envckptwrongid"
+                                                  else env_id})
+            self._json(200, {"ok": "true", "partition": pid,
+                             "live": len(rows), "envs": rows})
         elif self.path.startswith("/api/service/resolve/"):
             name = self.path[len("/api/service/resolve/"):]
             if svc_local:

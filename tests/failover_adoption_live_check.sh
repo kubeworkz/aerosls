@@ -61,9 +61,10 @@
 #     checkpoint carried the environment NAME (state_tree.c) and the
 #     survivor classified it per record against its OWN durable store
 #     (per-node disks hold nothing for it, so it is named with that
-#     reason). Step 4.5 guarantees the environment exists on the leader
-#     before the kill, so this line cannot be vacuous; step 7.5 requires
-#     it AFTER the adoption line, so an old run's line cannot satisfy it.
+#     reason). Step 4.5 queries env_ckpt_table for the exact (partition,
+#     index, env_id) record and then waits for fresh frames, so this line
+#     cannot be vacuous; step 7.5 requires it AFTER the adoption line, so an
+#     old run's line cannot satisfy it.
 #   * `[FAILOVER] <n> environment(s) of the adopted partitions were NOT
 #     restored` -- the countable summary of the same walk.
 #
@@ -325,6 +326,38 @@ try:
 except Exception:
     d = {}
 print(d.get(sys.argv[2], ""))
+PY
+}
+
+# env_checkpointed <body> <partition> <index> <env_id>
+#   Exact table evidence: the leader's GET /api/partition/{id}/env marks an
+#   entry checkpointed only when env_ckpt_find(partition, index) returns a
+#   record whose env_id matches the live environment -- the same table
+#   state_tree_build() walks for ST_NODE_ENVIRONMENT. This is not a
+#   payload-size inference. Returns 0 only for that exact entry.
+env_checkpointed() {
+    python3 - "$1" "$2" "$3" "$4" <<'PY'
+import json, sys
+try:
+    d = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(3)
+try:
+    if int(d.get("partition", -1)) != int(sys.argv[2]):
+        sys.exit(3)
+    want_index, want_env = int(sys.argv[3]), int(sys.argv[4])
+except Exception:
+    sys.exit(3)
+for e in d.get("envs", []):
+    try:
+        if (int(e.get("index", -1)) == want_index
+                and int(e.get("env_id", -1)) == want_env
+                and int(e.get("checkpoint_env_id", -1)) == want_env
+                and str(e.get("checkpointed", "")).lower() == "true"):
+            sys.exit(0)
+    except Exception:
+        continue
+sys.exit(1)
 PY
 }
 
@@ -696,13 +729,6 @@ if [ -z "$PART_ID2" ]; then
        $_hp)."
 fi
 
-# The checkpoint counters are captured BEFORE the create, so "2 fresh
-# COMPLETEs" is provably post-create: the FIRST fresh one may be a frame
-# already in flight when the record landed, the second was built after it
-# (the tree is rebuilt from the live table every broadcast period).
-ck_pre1="$(grep -c 'DSPP-CKPT] RX: COMPLETE' "$F1_LOG" 2>/dev/null)"; ck_pre1="${ck_pre1:-0}"
-ck_pre2="$(grep -c 'DSPP-CKPT] RX: COMPLETE' "$F2_LOG" 2>/dev/null)"; ck_pre2="${ck_pre2:-0}"
-
 # The response is echoed on BOTH failure paths: the command's own non-zero
 # exit used to die with 'output above' while the output sat unprinted in
 # $env_resp -- a guard that hides the reason it failed made three live runs
@@ -730,7 +756,7 @@ deadline=$(( $(date +%s) + WAIT_LEARN ))
 while :; do
     env_list="$("$CTL" --host "localhost:$L_PORT" "${TOKEN_ARGS[@]}" shell env list "$PART_ID2" 2>&1)"
     case "$env_list" in
-        *"env partition=$PART_ID2 env_id="*) env_live=1; break ;;
+        *"env partition=$PART_ID2 env_id=$L_ENV_ID index="*) env_live=1; break ;;
     esac
     [ "$(date +%s)" -ge "$deadline" ] && break
     sleep "$POLL"
@@ -739,6 +765,51 @@ done
        ('env list $PART_ID2' never showed it within ${WAIT_LEARN}s). Output:
 $(printf '%s' "$env_list" | tail -3 | sed 's/^/       /')"
 echo "   the environment is live on the leader"
+
+# A live environment is not necessarily checkpointable: env_service_create()
+# ignores env_service_register_env()'s result, so a successful create can
+# leave env_ckpt_table empty and the leader's state tree without the name.
+# Query the exact table, not payload size: GET /api/partition/{id}/env marks
+# the (index, env_id) entry `checkpointed` only when env_ckpt_find() returns
+# a record for that same env_id. Then require two fresh frames AFTER that
+# record exists; the
+# state-tree builder reads the same table, so those frames carry the node.
+ENV_LEADER_LOG="$LOG_DIR/node$leader.log"
+L_ENV_INDEX="$(printf '%s\n' "$env_list" \
+    | sed -n "s/.*env_id=$L_ENV_ID index=\([0-9]*\).*/\1/p" | head -1)"
+[ -n "$L_ENV_INDEX" ] || die "the environment env_id=$L_ENV_ID (partition $PART_ID2) is live,
+       but 'env list' did not report its index, so its exact checkpoint-table
+       record cannot be identified. Output:
+$(printf '%s' "$env_list" | tail -5 | sed 's/^/       /')"
+
+echo "==> waiting for the environment's exact checkpoint-table record on node $leader (up to ${WAIT_LEARN}s)"
+env_ckpt_ok=""
+env_ckpt_body=""
+deadline=$(( $(date +%s) + WAIT_LEARN ))
+while :; do
+    if get200 "$L_PORT" "/api/partition/$PART_ID2/env"; then
+        env_ckpt_body="$FETCH_BODY"
+        if env_checkpointed "$env_ckpt_body" "$PART_ID2" "$L_ENV_INDEX" "$L_ENV_ID"; then
+            env_ckpt_ok=1; break
+        fi
+    else
+        env_ckpt_body="$FETCH_BODY"
+    fi
+    [ "$(date +%s)" -ge "$deadline" ] && break
+    sleep "$POLL"
+done
+if [ -z "$env_ckpt_ok" ]; then
+    die "node $leader's environment env_id=$L_ENV_ID (partition $PART_ID2, index $L_ENV_INDEX) is live, but its exact record never appeared in env_ckpt_table -- GET /api/partition/$PART_ID2/env did not mark it checkpointed within ${WAIT_LEARN}s. The environment is live but NOT checkpointable; no held checkpoint can carry its name, so step 7.5 would falsely blame adoption. Last table response:
+$(printf '%s' "$env_ckpt_body" | tail -3 | sed 's/^/       /')
+       Leader [ENV] lines:
+$(grep -F '[ENV]' "$ENV_LEADER_LOG" | tail -6 | sed 's/^/       /')"
+fi
+echo "   the exact checkpoint-table record for env $L_ENV_ID (partition $PART_ID2, index $L_ENV_INDEX) is present"
+
+# Counts are taken AFTER the exact table record exists, so the two frames the
+# checkpoint wait demands are built by state_tree_build() from that record.
+ck_pre1="$(grep -c 'DSPP-CKPT] RX: COMPLETE' "$F1_LOG" 2>/dev/null)"; ck_pre1="${ck_pre1:-0}"
+ck_pre2="$(grep -c 'DSPP-CKPT] RX: COMPLETE' "$F2_LOG" 2>/dev/null)"; ck_pre2="${ck_pre2:-0}"
 
 # The wait is RE-DRIVEN, exactly like the two learn gates above: each attempt
 # is a fresh WAIT_CKPT window, admitted only while the leader this guard
@@ -752,7 +823,7 @@ echo "   the environment is live on the leader"
 # A leader that stops answering, or stops holding the row, is not that, and
 # falls through to the FAIL, which now also reports who the cluster believes
 # leads -- the diagnosis that turn needed.
-echo "==> waiting for 2 fresh checkpoints (post-create) to reach both survivors"
+echo "==> waiting for 2 fresh post-record checkpoints on both survivors"
 ckpt_env_ok=0
 ckpt_attempt=0
 while :; do
@@ -857,8 +928,7 @@ if [ "$ckpt_env_ok" -ne 1 ]; then
        it the adoption below proves only the partition half again, and the
        increment-9/11 arm cannot fire. The cluster now looks like:$roles_now"
 fi
-echo "   the held checkpoints now carry '$ENV_NAME' and its environment's name"
-echo "   the held checkpoints now carry '$ENV_NAME' and its environment's name"
+echo "   2 fresh post-record checkpoints reached both survivors after the exact table record appeared"
 
 # ─── 5. capture the leader's identity BEFORE killing it ───────────────────
 L_PID="$(awk -v n="$leader" '$1==n{print $2}' "$PID_FILE")"
@@ -1052,9 +1122,11 @@ done
        (partition $PART_ID2' line after the adopt_line at $adopt_line within
        ${WAIT_ADOPT}s -- neither the no-record classification nor the
        RESTORED-from-a-replica one, with its [ENV_REPLICA] promotion, appeared).
-       Step 4.5 proved the environment was live on the leader and
-       carried in the held checkpoints, so the adoption DROPPED the name -- the
-       increment-9 silent-failover defect, live. The adopter's FAILOVER lines hold:
+       Step 4.5 proved the environment was live, its exact env_ckpt_table
+       record existed, and two fresh frames followed that record (the
+       environment node was in the held checkpoint), so the adoption DROPPED
+       the name -- the increment-9 silent-failover defect, live. The adopter's
+       FAILOVER lines hold:
 $(grep -F 'FAILOVER]' "$CAN_LOG" | tail -10 | sed 's/^/       /')"
 
 if [ "$env_outcome" = "replica" ]; then

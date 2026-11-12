@@ -52,6 +52,7 @@
 #include "../kernel/env_service.h"  // POSIX-Environments E4 -- POST /api/partition/{id}/env
 #include "../kernel/env_payload.h"  // E7 inc. 22 -- the gate teeth's names, and the build gate
 #include "../kernel/env_console.h"  // POSIX-Environments E6 -- attach to an environment's console
+#include "../kernel/env_ckpt.h"    // P3 (b) -- exact checkpoint-table membership for the env listing
 #include "../kernel/env_proto.h"    // POSIX-Environments E4 -- ENV_* status codes
 #include "../kernel/env_migrate.h"  // POSIX-Environments P3 increment 4 -- staged-slot restore tick
 #include "../drivers/nvme_admin.h" // Navigator-Parity Gap Roadmap Phase 2 -- nvme_get_capacity_bytes()
@@ -3245,6 +3246,12 @@ static int api_env_restore_post(char* buf, int max, SLSRole req_role,
 // for a console no manager bound — an E3 boot spawn, which is therefore listed
 // but not addressable by id. `index` is the environment's identity within its
 // partition, which is what its sidecar names carry.
+//
+// `checkpointed` is the exact state-tree source, not an inference: it is true
+// only when env_ckpt_find(partition, index) names THIS env_id (the record's
+// per-boot identity), and that is the same table state_tree_build() walks when
+// it emits ST_NODE_ENVIRONMENT. The failover guard gates on this field, so
+// unrelated growth in a checkpoint payload cannot satisfy it.
 static int api_partition_env_list_get(char* buf, int max, uint32_t partition) {
     JSONBuf j = { buf, 0, max };
     jb_obj_open(&j, 0);
@@ -3259,10 +3266,19 @@ static int api_partition_env_list_get(char* buf, int max, uint32_t partition) {
         if (p != partition) continue;
         if (shown) jb_putc(&j, ',');
         jb_obj_open(&j, 0);
+        const struct EnvCkptRecord* rec = env_ckpt_find(partition, idx);
+        int exact = rec != 0 && rec->env_id == id;
         jb_uint(&j, "env_id", id); jb_putc(&j, ',');
         jb_uint(&j, "index", idx); jb_putc(&j, ',');
         jb_uint(&j, "posix_pid", pid); jb_putc(&j, ',');
-        jb_uint(&j, "dropped", env_console_dropped(partition, id));
+        jb_uint(&j, "dropped", env_console_dropped(partition, id)); jb_putc(&j, ',');
+        jb_str(&j, "checkpointed", exact ? "true" : "false");
+        if (rec) {
+            jb_putc(&j, ',');
+            jb_uint(&j, "checkpoint_env_id", rec->env_id); jb_putc(&j, ',');
+            jb_uint(&j, "checkpoint_regions", rec->n_regions); jb_putc(&j, ',');
+            jb_uint(&j, "checkpoint_tasks", rec->n_tasks);
+        }
         jb_obj_close(&j);
         shown++;
     }
