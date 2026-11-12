@@ -72,6 +72,12 @@ Modes (written to <statedir>/mode by the smoke):
                   but checkpoint_env_id names a different environment -> the
                   exact-identity gate must ABORT NOT checkpointable before the
                   leader is killed
+    envckptwrongidfalse
+                  the env API reports checkpointed=false for the live index,
+                  while checkpoint_env_id names a different environment -- the
+                  production stale-record shape -> the exact-identity gate
+                  must still ABORT NOT checkpointable before the leader is
+                  killed
     learnlost1    the FIRST announce's packet is LOST on the wire for BOTH
                   followers: they only ever see the row on the owner's next
                   periodic re-announce pass (~10 s later), so the
@@ -263,7 +269,7 @@ REANNOUNCE_PERIOD = 10.0   # models 1000 ticks ~= 10 s; see the block below
 # line, bounded by the guard's own windows. 2 s keeps two lines inside one
 # FAST 6 s window with margin on a loaded host. The payload is 448 + 40 per
 # environment to model a state-tree node; the guard gates on the exact table,
-# not this delta, and envckptlost reports checkpointed=false instead. Both
+# not this delta, and envckptlost reports checkpointed=false instead. The
 # exact-table failure modes keep that size so the abort cannot be satisfied
 # by a size increase.
 CKPT_PERIOD = 2.0
@@ -581,7 +587,7 @@ def ckpt_size():
     the exact checkpoint-table record, never on this size. envckptlost keeps
     the size at 448 and reports checkpointed=false from the env API.
     """
-    if mode in ("envckptlost", "envckptwrongid"):
+    if mode in ("envckptlost", "envckptwrongid", "envckptwrongidfalse"):
         return 448
     # One state-tree node per environment: a guard self-restart creates a
     # SECOND env, so prekillchurn's post-restart baseline is already 488 and
@@ -1528,8 +1534,9 @@ class H(http.server.BaseHTTPRequestHandler):
             # The exact checkpoint-table evidence the guard gates on: a live
             # console is not enough; the (partition, index, env_id) record
             # must be in env_ckpt_table. Base modes model a registered
-            # environment; envckptlost reports no record, and envckptwrongid
-            # reports a record for the right live index but the wrong id.
+            # environment; envckptlost reports no record, and envckptwrongid /
+            # envckptwrongidfalse report a record for the right live index but
+            # the wrong id.
             pid = int(self.path[len("/api/partition/"):-len("/env")]
                       .strip("/") or 0)
             mine = [e for e in read_envs() if int(e["partition"]) == pid]
@@ -1540,10 +1547,13 @@ class H(http.server.BaseHTTPRequestHandler):
                              "index": int(e["index"]),
                              "posix_pid": 100 + env_id,
                              "dropped": 0,
-                             "checkpointed": "false" if mode == "envckptlost"
+                             "checkpointed": "false"
+                                             if mode in ("envckptlost",
+                                                         "envckptwrongidfalse")
                                              else "true",
                              "checkpoint_env_id": env_id + 1000
-                                                  if mode == "envckptwrongid"
+                                                  if mode in ("envckptwrongid",
+                                                              "envckptwrongidfalse")
                                                   else env_id})
             self._json(200, {"ok": "true", "partition": pid,
                              "live": len(rows), "envs": rows})
