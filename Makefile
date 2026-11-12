@@ -123,6 +123,24 @@ ifneq ($(E7_SELFKILL),)
   AB_DEFS += -DE7G_SELFKILL=1
 endif
 
+# ─── ENV_CKPT_TEST_HOOKS: the stale-identity injection, never a shipped build ─
+# tests/env_api_identity_check.sh builds its live cluster with
+# `ENV_CKPT_TEST_HOOKS=1 ./run-cluster.sh --nodes 3`. The ONLY arm this adds
+# writes an env checkpoint record's env_id with a fixed offset, so the live
+# kernel's GET /api/partition/{id}/env can report table membership with a
+# checkpoint_env_id that differs from the environment's live id -- the exact
+# shape the failover guard's identity-mismatch branch must diagnose. An
+# ordinary build compiles the arm out entirely; the flag joins AB_DEFS so the
+# configuration stamp makes a flip rebuild, rather than silently relinking the
+# previous identity-clean objects.
+ENV_CKPT_TEST_HOOKS ?=
+ifneq ($(ENV_CKPT_TEST_HOOKS),)
+  ifneq ($(ENV_CKPT_TEST_HOOKS),1)
+    $(error ENV_CKPT_TEST_HOOKS must be empty or 1 (got '$(ENV_CKPT_TEST_HOOKS)'))
+  endif
+  AB_DEFS += -DENV_CKPT_TEST_HOOKS=1
+endif
+
 # ─── Rebuild when the CONFIGURATION changes, not only when sources do ────────
 # make compares source timestamps against object timestamps. It has no idea
 # that X86_CFLAGS or TCG_CFLAGS changed, so `make x86-iso SLS_SOFTMMU=on` over

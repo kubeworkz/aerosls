@@ -174,6 +174,20 @@ int env_ckpt_record(const struct EnvCkptRecord* rec) {
     int rc = env_ckpt_valid(rec);
     if (rc != ENV_CKPT_REFUSE_NONE) { ec_refuse((uint32_t)rc, 0, 0); return rc; }
 
+#ifdef ENV_CKPT_TEST_HOOKS
+    /* Test-only stale-identity injection (tests/env_api_identity_check.sh).
+     * The live registration path reaches this function with the environment's
+     * real manager id; keeping a different id in the table is the only way a
+     * real GET /api/partition/{id}/env can show checkpointed=true with a
+     * mismatched checkpoint_env_id. The arm is compiled only under
+     * ENV_CKPT_TEST_HOOKS, which the Makefile puts in AB_DEFS and ordinary
+     * builds never define. The validated copy is otherwise untouched, so the
+     * record remains believable to the API and to the guard. */
+    struct EnvCkptRecord test_rec = *rec;
+    test_rec.env_id += 1000u;
+    rec = &test_rec;
+#endif
+
     int slot = ec_find_slot(rec->partition_id, rec->index);
     if (slot < 0) {
         if (env_ckpt_count >= ENV_CKPT_MAX) {
