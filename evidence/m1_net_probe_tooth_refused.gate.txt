@@ -4,6 +4,26 @@ FAIL: M1 live network probe: serial log contains 1 'M1-TOOTH' marker(s): [M1-TOO
   sabotage marker(s): [M1-TOOTH] bypass-connect
   expected: socket=0 bind=0 listen=0 connect=0 accept=0 poll=0 sendto=0 recvfrom>=0 shutdown=0 close=0
   last 40 serial lines (/mnt/c/Users/kubew/.freebuff/worktrees/084fe97c/aerosls2/.freebuff/worktrees/m1-linux-network/evidence/m1_net_probe_tooth_refused.log):
+AeroSLS Phase 5 booting
+[E7] linux: num=000000BB child=e7.linux.probe.0 -> ENOSYS
+
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+[CAP] woken PID 110 (channel 28)
+[E7] linux: num=000000BB child=e7.linux.cand.0 -> ENOSYS
+
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[CAP] woken PID 111 (channel 29)
+[E7] linux: num=0000000D child=e7.linux.user.0 ok + payload
+
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 104 -> 111
+[MK] svc crash: Service '(null)' not found.
+[CAP] woken PID 112 (channel 30)
+M1-NET FAIL
+[E7] linux: num=00000001 child=m1.net.probe.0 write ok len=12 |M1-NET FAIL.|
+[CAP] woken PID 112 (channel 30)
 [CAP] send handoff: PID 104 -> 112
 [CAP] woken PID 109 (channel 27)
 M1-NET FAIL
@@ -23,24 +43,5 @@ M1-NET FAIL
 [E7] linux: num=000000E7 child=m1.net.probe.0 exit_group status=5
 
 [PROC] PID 112 terminated.
-[TORE] PID 112 teardown: 2 cap(s) dropped, 0 object(s) destroyed, 0 arena frame(s) returned, table 14 unbound
-[TORE] address space 0x0000000013243000 destroyed: 9 frame(s) freed
-[CAP] woken PID 109 (channel 27)
-E7FD-WRITE-OK
-E7FD-WRITE-OK
-[E7] linux: num=00000001 child=e7.linux.probe.0 ok
-
-[CAP] woken PID 109 (channel 27)
-[CAP] send handoff: PID 104 -> 109
-[CAP] woken PID 110 (channel 28)
-[E7] linux: num=00000001 child=e7.linux.cand.0 ok
-
-[CAP] woken PID 110 (channel 28)
-[CAP] send handoff: PID 104 -> 110
-[CAP] woken PID 111 (channel 29)
-[E7] linux: num=0000000D child=e7.linux.user.0 -> ENOSYS
-
-[CAP] woken PID 111 (channel 29)
-[CAP] send handoff: PID 104 -> 111
-[CAP] woken PID 109 (channel 27)
-[E7] linux: num=0000000C child=e7.linux.probe.0
+[TORE] PID 112 teardown: 2 cap(s) drop  qemu stderr:
+qemu-system-x86_64: terminating on signal 15 from pid 3000696 (bash)
