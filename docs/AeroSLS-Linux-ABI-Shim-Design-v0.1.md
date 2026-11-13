@@ -1,9 +1,9 @@
 # AeroSLS Static-Binary Linux ABI Shim — Design v0.1 (Phase E7)
 
-**Status:** Design and implementation record; the gate's two halves are observed live and manually, not yet a one-command automated gate.
+**Status:** Design and implementation record; the gate runs end-to-end from one command (`make e7-gate`) and captures its own evidence.
 **Scope:** The design pass Phase E7 is gated on (`AeroSLS-POSIX-Environments-Roadmap-v0.1.md` §10, §13), plus the two items that document parks here — its Q5 (§14) and dynamic linking (§12, "Belongs to E7's design pass").
 **Resolves:** (1) **syscall routing** — kernel-side Linux-personality dispatch, or forwarding to the owning POSIX sidecar core; (2) **architecture** — x86-64 or ARM64 first; (3) dynamic linking; (4) the shape of the inherited gate.
-**Does not do:** claim the gate is automated. The design pass is implemented in place; §10 records each increment and its evidence, and Appendix B keeps the remaining gaps named.
+**Does not do:** run the full gate on every push. The one-command gate builds three images and takes about an hour; the source clauses and the committed-replay guard run in CI on every push. The design pass is implemented in place; §10 records each increment and its evidence, and Appendix B keeps the remaining gaps named.
 
 ---
 
@@ -2507,10 +2507,14 @@ capture, 21 the replay that resumes the tenant at its captured `rip`/`rsp`, and
 22 the harness that makes the run one invocation — with the three live breaks
 that turn its failure side from an assumption into an observation. The gate's
 two halves have each now been observed on the real machine (19 the work, 21 the
-work continuing through a cycle) and 22 makes that observation re-runnable from
-one command; what it is not is automated: only the harness's source clauses run
-on a push, the boots are manual invocations, and the `fs_base` break is still
-unarmed. The contract it was scoped against is kept as written. It takes as
+work continuing through a cycle) and the harness makes that observation
+re-runnable from one command. The operational path is now one command too:
+`make e7-gate` runs the source clauses, the live drill, the teeth and the
+self-kill arm and writes a curated evidence directory. It is not in the
+per-push CI sweep — it builds three images and takes about an hour — so only
+the source clauses and the committed-replay guard run on a push; the full gate
+is a local/release invocation. The contract it was scoped against is kept as
+written. It takes as
 given the file class landed at increments 17–18 (`4fbe386`, `baf0469`) — the
 thirteen census numbers crossing through the VFS, the flag contract measured
 from the real opens, the reply payload's STAT/DENTS kinds (§10.13's plan text
@@ -3314,6 +3318,19 @@ deleted reddens D1, one with a `wait ended` line injected reddens D2, and a
 tooth recording is judged against the tooth it names — each with its own
 message and a non-zero exit, not a generic failure.
 
+**The operational path is now one command.** `make e7-gate` runs
+`tests/e7_gate_all.sh`: the source clauses once, then `--live`, `--teeth` and
+`--selfkill`, each in its own build profile. The driver writes a new
+`evidence/e7_gate_<UTC>/` bundle — `source.log`, each arm's `harness.log`, the
+boot logs, `facts` and replay records, and a `manifest.txt` with the commit,
+per-arm exit status and ISO sha256. Sparse NVMe images are deliberately not
+copied; every replayable text artifact is. The driver stops at the first red
+arm; that arm's `harness.log` and every completed arm's evidence are already
+in the bundle. `E7_GATE_EVIDENCE` selects the
+directory and refuses an existing path; `E7_GATE_CHECK` is the test seam used by
+`tests/e7_gate_all_smoke.sh`. The full run still needs make, cargo and QEMU, so
+it remains a local/release command rather than a per-push CI step.
+
 The wait's own line is part of the change, not just the drill: a wait that
 crosses 30 s while still being scheduled now says so once, because the
 difference between "extended" and "expired" was otherwise only the absence
@@ -3502,6 +3519,7 @@ Everything this document asserts about the tree, with its source:
 
 | Claim | Source |
 |---|---|
+| The E7 gate is one operational command with an owned evidence path | `tests/e7_gate_all.sh` (source + live + teeth + selfkill; curated `evidence/e7_gate_<UTC>/` and `manifest.txt`); `Makefile`'s `e7-gate`; `tests/e7_gate_all_smoke.sh` (all green, one red arm, default relative evidence path, sparse image excluded) |
 | Trap entry, `swapgs`, per-CPU scratch, asm number chain, `.unknown_syscall` → `do_syscall` | `arch/x86/syscall.asm` |
 | The errno map is total over both families and the `CAP_NONE` sentinel, with the reverse defined only on unique preimages | `kernel/linux_abi.h`/`.c`; `tests/linux_errno_map_host_test.c` (51 checks, §10.5) |
 | Every census number — traced and vDSO-declared — has a dispatch class, and the SLS overlaps 105/160/320 are UNKNOWN | `tests/linux_syscall_table_host_test.c` (42 checks) over `tools/linux_syscall_census.txt` |

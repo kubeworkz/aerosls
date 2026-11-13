@@ -1347,6 +1347,20 @@ x86-iso-e3: selfhost-bootimage-e3
 	@$(MAKE) x86-iso SIDECAR_CPIO="$(SIDECAR_E3_CPIO)" X86_ISO="$(X86_E3_ISO)"
 	@echo "[ISO-E3] $(X86_E3_ISO) — init built with $(E3_INIT_FEATURES)"
 
+# ── E7 gate: one command, one evidence bundle ────────────────────────────────
+# The E7 gate has three live build profiles (the drill, the teeth and the
+# deferred self-kill) plus the source clauses. Running them by hand meant
+# choosing a profile, remembering its ISO name, and then copying the right
+# files out of /tmp into evidence/. This target runs them in order until one
+# fails and writes evidence/e7_gate_<UTC>/ with the harness logs, boot logs,
+# facts and a
+# manifest that records each arm's exit and the built ISO's sha256. The sparse
+# NVMe images are inputs, not evidence, and are not copied. Needs make, cargo
+# and QEMU; it is intentionally not part of the per-push guard sweep.
+.PHONY: e7-gate
+e7-gate:
+	bash tests/e7_gate_all.sh
+
 # ── SIMI host toolchain ─────────────────────────────────────────────────────
 # Assembler/interpreter/disassembler/JIT-test for SIMI bytecode (tools/simi/).
 # Builds with the host cc — no cross-compiler needed. See tools/simi/README.md.
