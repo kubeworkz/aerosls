@@ -274,6 +274,22 @@ struct ProcessDescriptor {
                                        // opens a new path (one listing at a time
                                        // — named v1 boundary) and at slot reuse.
                                        // SLS and non-Linux tasks never read it.
+    /* ── M4.1: thread-group identity ──────────────────────────────────────
+     * A Linux task is not a stand-alone address space any more: every
+     * Linux task belongs to exactly one group, and the group owns the PML4
+     * lifetime. `linux_tgid` is the 1-based group id, not a PID (0 means
+     * "no group" — the legacy single-owner path, and every non-Linux task).
+     * `linux_tid` is the task's own identity, initially its pid; a clone
+     * child will get its own TID while sharing the leader's TGID.
+     * `linux_is_thread` is 0 for the leader and 1 for an attached thread,
+     * so the M4.2 clone path can refuse a second leader by name.
+     * `linux_clear_child_tid` is the user address the future CLONE_CHILD_
+     * CLEARTID exit path will zero and wake; 0 means none. All four are
+     * cleared at slot reuse and by linux_thread_group_detach(). */
+    uint32_t   linux_tgid;
+    uint32_t   linux_tid;
+    uint64_t   linux_clear_child_tid;
+    uint8_t    linux_is_thread;
     uint64_t   user_rip;              // entry point in user space
     uint64_t   user_rsp;              // current user-space stack pointer
     uint64_t   user_stack_vaddr;      // vaddr base of the 8-page user stack

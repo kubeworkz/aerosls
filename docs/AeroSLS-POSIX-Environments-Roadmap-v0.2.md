@@ -2979,9 +2979,9 @@ Each excluded item has a stated destination, so none is silently dropped.
 - **The Linux personality, its six-argument capture, the initial stack and auxv, `fs_base`/TLS, the errno map and the `brk`/`mmap` budget mapping.** All of it is `AeroSLS-Linux-ABI-Shim-Design-v0.1.md` §3 and §5. P1a leaves the descriptor's "extra tasks" hook for it; nothing else in v0.2 needs E7 to exist.
 - **Signal *delivery*.** The E7 census shows the designated candidate calls `rt_sigaction`, `rt_sigprocmask` and `sigaltstack`, while the design records them and never delivers them. That tension is E7's to resolve, and it is recorded here because it is a live gap in a document that is otherwise settled — not because v0.2 solves it.
 
-**Needs its own phase, unscoped.**
+**Needs its own phase; scoped by M4.0/M4.1, full phase not landed.**
 
-- **Threads (`clone`/`CLONE_VM`, `futex`, thread groups, a shared address space).** The structural blocker behind Go, threaded CPython, Node, and most AIX-era daemons; the ABI design (§7) names it as Go's gate and does not scope it. It is a kernel phase the size of the ARM64 port, and it is *not* a v0.2 item because P1a's checkpoint of a single-threaded pair is a prerequisite for doing it safely, not a substitute for it.
+- **Threads (`clone`/`CLONE_VM`, `futex`, thread groups, a shared address space).** The structural blocker behind Go, threaded CPython, Node, and most AIX-era daemons; the ABI design (§7) names it as Go's gate. It is now scoped by `AeroSLS-M4-Threads-Design-v0.1.md` (M4.0 design spike) and begun under M4.1, which landed the group object and shared-PML4 reference count, but the full gap is **not landed**: the tree has no clone, futex, or second Linux execution context, and Go/threaded runtimes remain out until the live M4.7 gate is evidenced. It is a kernel phase the size of the ARM64 port, and it is *not* a v0.2 item because P1a's checkpoint of a single-threaded pair is a prerequisite for doing it safely, not a substitute for it.
 - **Dynamic linking.** Refused in v1 (`AeroSLS-Linux-ABI-Shim-Design-v0.1.md` §6) with a named falsifiable trigger. Unchanged.
 - **The ARM64 userspace OS.** H2 item #1's work, and the reason E7 targets x86-64 first. Unchanged.
 - **A capacity phase** that raises `PROC_MAX`/`SIDECAR_REGISTRY_MAX` (§8).
@@ -3278,11 +3278,11 @@ Everything this document asserts about the tree, with its source.
 | E7's gate, its two-halves reporting rule, and the monitoring candidate eliminated by its need for sockets | `AeroSLS-Linux-ABI-Shim-Design-v0.1.md` §8, §10.4, §5.5.1 |
 | M1's eight socket-class calls cross the Linux trap to P2's service, and the live probe completes a TCP round trip | `kernel/linux_abi.{h,c}`; `user/sidecar/src/linux.rs`; `tests/linux_net_bridge_host_test.c` (27 checks); `tests/m1_net_probe_check.sh`; `evidence/m1_net_probe_gate.log` |
 | Signals have ordinary and `SA_SIGINFO` handler frames, alternate stacks, return-time redelivery and the first asynchronous producer, SIGPIPE from an EPIPE send (M3.2–M3.5), and the candidate's `signal()`/`rt_sigaction` path is measured | `AeroSLS-Linux-ABI-Shim-Design-v0.1.md` §5.6, §10.15; `tools/linux_syscall_census.txt`; `evidence/m3_signal_live.log`; `E7PIPE-OK` in the M1 live gate |
-| Threads/`clone`/`futex` are unscoped and are Go's gate | `AeroSLS-Linux-ABI-Shim-Design-v0.1.md` §7 |
+| Threads/`clone`/`futex` are scoped by M4.0 with M4.1 group/refcount landed, but clone/futex/second-context and the M4.7 gate are not landed; they remain Go's gate | `AeroSLS-Linux-ABI-Shim-Design-v0.1.md` §7; `AeroSLS-M4-Threads-Design-v0.1.md`; `kernel/linux_threads.{h,c}`; `tests/linux_thread_group_host_test.c`; `tests/m4_threads_wall_check.sh` |
 
 ## Appendix B — Named gaps, each with its destination
 
-**Register checked 2026-11-13.** A row is marked **LANDED** only when the gap is closed in the tree and the cell names where. Rows marked **M2–M6** are planned in the Linux-shape decision record, not landed; M1 is landed below, with its live coverage boundary and named sabotage arm visible in the row, and M3 is landed through M3.5 with its cross-task/timer boundary still named. The one remaining P3 evidence caveat in the status line stays visible rather than being swept into a green row.
+**Register checked 2026-11-14.** A row is marked **LANDED** only when the gap is closed in the tree and the cell names where. Rows marked **M2–M6** are planned in the Linux-shape decision record, not landed; M1 is landed below, with its live coverage boundary and named sabotage arm visible in the row, and M3 is landed through M3.5 with its cross-task/timer boundary still named. M4 is scoped by its M4.0 design spike and M4.1's group/refcount has landed, but clone/futex/second-context and the M4.7 gate are not landed, so Go and every threaded runtime remain out. The one remaining P3 evidence caveat in the status line stays visible rather than being swept into a green row.
 
 | Gap | Consequence if unaddressed | Destination |
 |---|---|---|

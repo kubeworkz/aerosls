@@ -231,7 +231,7 @@ X86_C_SRC   = kernel/kernel.c arch/x86/idt.c arch/x86/gdt.c arch/x86/vga.c kerne
               kernel/tier_mgr.c kernel/query_engine.c \
               net/net.c net/arp.c net/ipv4.c net/tcp.c net/tcp_quota.c net/http.c net/http_rate_limit.c net/e1000.c net/udp.c net/dhcp.c net/inference.c \
               net/ollama_client.c \
-              kernel/process.c arch/x86/user_paging.c arch/x86/device_irq.c arch/x86/ioapic.c kernel/cap.c kernel/chan.c \
+              kernel/process.c kernel/linux_threads.c arch/x86/user_paging.c arch/x86/device_irq.c arch/x86/ioapic.c kernel/cap.c kernel/chan.c \
               kernel/partition.c \
               kernel/boot_params.c kernel/node_reset.c \
               kernel/console.c kernel/console_service.c \
@@ -489,7 +489,7 @@ kernel/persist.x86.o kernel/qemu_sls_tcache.x86.o: kernel/checkpoint_delta.h
 # arch/x86/user_paging.h joins for its PerCPUData layout asserts and the §5.3
 # MSR declarations -- a header whose silent reorder is a desync with
 # syscall.asm's [gs:0xNN] literals that no compiler can see.
-$(X86_C_SRC:.c=.x86.o): kernel/process.h kernel/linux_abi.h arch/x86/user_paging.h
+$(X86_C_SRC:.c=.x86.o): kernel/process.h kernel/linux_abi.h kernel/linux_threads.h arch/x86/user_paging.h
 
 # ── kernel/tls_platform.c needs the vendored mbedTLS headers ───────────────
 # An explicit rule rather than adding these to X86_CFLAGS, so vendor/mbedtls's

@@ -11,6 +11,7 @@
 #include "console_service.h"  /* deferred console drain (single-CPU park-wake cadence) */
 #include "syscall_dispatch.h"   /* Seed Kernel Phase 1.5: do_syscall() from cap_recv_resume() */
 #include "linux_abi.h"   /* E7 increment 2: PROC_PERSONALITY_* for proc_clear_resume_state() */
+#include "linux_threads.h" /* M4.1: the Linux thread group owns the shared PML4 */
 
 /* E7_SELFKILL: the gate's deferred-kill arm (`make x86-iso-e3 E7_SELFKILL=1`,
  * never a shipped build). The Makefile puts the define in AB_DEFS, so it is
@@ -220,6 +221,14 @@ static void proc_clear_resume_state(struct ProcessDescriptor* pd) {
             sf[i] = 0;
     }
     pd->linux_dir_pos = 0;
+    /* M4.1: the group identity is per-thread state and must not survive a
+     * slot's previous occupant. teardown paths detach the group BEFORE this
+     * clear, so a last detach still sees the group id; a spawn path starts
+     * at zero and linux_thread_group_create() stamps the new leader. */
+    pd->linux_tgid = 0;
+    pd->linux_tid = 0;
+    pd->linux_clear_child_tid = 0;
+    pd->linux_is_thread = 0;
 }
 
 /* E7 (increment 2): read this CPU's captured Linux argument registers.
@@ -260,6 +269,9 @@ uint64_t proc_read_user_rsp(void) {
 // ─── process_init ─────────────────────────────────────────────────────────────
 void process_init(void) {
     for (int i = 0; i < PROC_MAX; i++) proc_table[i].active = 0;
+    /* M4.1: the group table is static; a boot starts with no Linux group
+     * live, so no slot can inherit a previous boot's shared PML4. */
+    linux_thread_groups_reset();
     // Phase 12: -1 = "never scheduled from this partition yet" for every
     // partition's round-robin cursor (BSS zero-init would give 0, a real
     // proc_table[] index, not a sentinel — must be set explicitly).
@@ -846,6 +858,14 @@ void process_exit(uint32_t exit_code) {
          * below is what drops it. */
         linux_stack_maybe_report(pd, "exit");
 
+        /* M4.1: release the thread-group reference BEFORE the descriptor's
+         * per-thread fields are cleared. The page table is NOT destroyed
+         * here unless this was the last reference; if it was, the destroy
+         * waits until after cap_table_teardown(), which still walks the
+         * live CR3. A non-Linux task returns 0 and takes the legacy path. */
+        uint64_t linux_dead_cr3 = 0;
+        int linux_grouped = linux_thread_group_detach(pd, &linux_dead_cr3);
+
         /* Phase 2: resume/teardown flags on a process that exits normally
          * are moot — the full teardown below reclaims everything anyway.
          * Cleared (including any stale resume_sysret/resume_kernel/park_ctx
@@ -874,7 +894,11 @@ void process_exit(uint32_t exit_code) {
          * cap_proc_cr3(pid) (used by the teardown's unmap walk) requires
          * an active descriptor. */
         cap_table_teardown(pd->pid);
-        user_destroy_page_table(pd->cr3);
+        if (linux_dead_cr3) {
+            user_destroy_page_table(linux_dead_cr3);
+        } else if (!linux_grouped) {
+            user_destroy_page_table(pd->cr3);
+        }
         proc_free_syscall_stack(pd);
 
         pd->active = 0;
@@ -1543,9 +1567,15 @@ static void proc_deferred_teardown(struct ProcessDescriptor* pd) {
         "[PROC] PID %u '%s' deferred teardown (killed while running)\n",
         pd->pid, pd->name);
     linux_stack_maybe_report(pd, "exit");
+    uint64_t linux_dead_cr3 = 0;
+    int linux_grouped = linux_thread_group_detach(pd, &linux_dead_cr3);
     proc_clear_resume_state(pd);
     cap_table_teardown(pd->pid);
-    user_destroy_page_table(pd->cr3);
+    if (linux_dead_cr3) {
+        user_destroy_page_table(linux_dead_cr3);
+    } else if (!linux_grouped) {
+        user_destroy_page_table(pd->cr3);
+    }
     proc_free_syscall_stack(pd);
     pd->active = 0;
     proc_count--;
@@ -2555,9 +2585,16 @@ void process_kill(uint32_t pid) {
          * (cap_proc_cr3 requires it). Clear the resume state FIRST so a
          * reused slot never inherits the killed process's stale
          * resume_sysret/park_ctx (caught live — see proc_clear_resume_state). */
+        uint64_t linux_dead_cr3 = 0;
+        int linux_grouped =
+            linux_thread_group_detach(&proc_table[i], &linux_dead_cr3);
         proc_clear_resume_state(&proc_table[i]);
         cap_table_teardown(proc_table[i].pid);
-        user_destroy_page_table(proc_table[i].cr3);
+        if (linux_dead_cr3) {
+            user_destroy_page_table(linux_dead_cr3);
+        } else if (!linux_grouped) {
+            user_destroy_page_table(proc_table[i].cr3);
+        }
         proc_free_syscall_stack(&proc_table[i]);
         proc_table[i].active = 0;
         proc_count--;

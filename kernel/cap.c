@@ -61,6 +61,7 @@
 #include "env_console.h"
 #include "env_storage.h"   // POSIX-Environments Roadmap v0.2 Phase P1b
 #include "env_ckpt.h"       // E7 increment 20: the Linux task's record stamp at spawn
+#include "linux_threads.h"   // M4.1: one group per Linux address space, with cr3 refs
 #include "net_socket_service.h"  // POSIX-Environments P2 first increment
 #include "env_catalog.h"        // POSIX-Environments §9 interop surface
 #include "../arch/x86/user_paging.h"
@@ -4761,6 +4762,26 @@ int cap_create_sidecar_in_personality(uint32_t parent_pid,
      * from a replayed one by reading the boot log, not by inferring it from
      * the absence of a second _start. Every non-Linux child takes the
      * ordinary path below. */
+    /* M4.1: a Linux task is born into a group even though no clone path
+     * exists yet. The group owns the PML4 reference; the create's own
+     * reference is released by process_exit/process_kill/deferred teardown,
+     * and only the last release destroys the address space. A group-table
+     * failure is unreachable while every active Linux task owns one group
+     * and the table covers PROC_MAX. If a leaked group ever makes it
+     * reachable, the child is still HELD and has no group of its own, so
+     * process_kill() performs the same complete teardown every other exit
+     * uses: cap table, channels, PML4 and syscall stack. Do not hand-roll a
+     * partial cleanup here. */
+    if (personality == PROC_PERSONALITY_LINUX) {
+        if (linux_thread_group_create(pd, new_cr3) == 0) {
+            kernel_serial_printf(
+                "[SIDECAR] CAP_ETABLEFULL: Linux thread-group table full "
+                "for PID %u '%s'\n", pd->pid, pd->name);
+            process_kill(pd->pid);
+            return CAP_ETABLEFULL;
+        }
+    }
+
     int restore_held = (personality == PROC_PERSONALITY_LINUX) &&
                        cap_linux_hold_has(child_partition);
     for (int i = 0; i < PROC_MAX; i++) {
