@@ -427,8 +427,10 @@ static int ep_in_image_window(uint64_t vaddr) {
  *   - the budget span `linux_heap_base..limit`, which holds BOTH brk growth
  *     (up from the base) and anonymous maps (down from the limit).
  *
- * A PROT_NONE guard has no frame, so the walk never sees it: the payload
- * carries the pages that exist, not the ranges that were reserved. */
+ * A parked PROT_NONE guard is non-present (its frame is retained for a
+ * later mprotect, not for a ring-3 access), so this walk never sees it:
+ * the payload carries the pages that exist, not the ranges that were
+ * reserved. */
 static int ep_linux_page(const struct EnvCkptRecord* rec, uint32_t t,
                          const struct ProcessDescriptor* pd, uint64_t vaddr) {
     const struct EnvCkptTask* tk = &rec->tasks[t];

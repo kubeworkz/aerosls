@@ -160,6 +160,15 @@
 #                                the wrong process.
 #   AEROSLS_FAILOVER_FAST=1      scale every wait down to seconds. Used by
 #                                the smoke; never for a real cluster.
+#   AEROSLS_FAILOVER_HEADER      header the live observer deadline is read
+#                                from (default: kernel/failover.h).
+#   AEROSLS_CONSENSUS_HEADER    header supplying CONSENSUS_TICK_HZ (default:
+#                                net/consensus.h).
+#   AEROSLS_FAILOVER_PRINT_DEADLINE=1
+#                                test-only: print the computed observer
+#                                window and exit 0 without requiring a
+#                                cluster. Used by
+#                                tests/failover_2node_deadline_smoke.sh.
 #   AEROSLS_FAILOVER_LEASE_ATTEMPTS
 #                                how many campaigns the step-11 lease-row
 #                                gate may drive before it accuses the
@@ -216,7 +225,11 @@ SVC="svc-$NAME"                      # the service-registry twin: registered on 
 if [ "$FAST" = "1" ]; then
     POLL=0.5; WAIT_NODES=10; WAIT_LEARN=6; WAIT_CKPT=6; WAIT_ADOPT=10; WAIT_HANDOFF=6; WAIT_OBSERVER=5; WAIT_BOOT=10; WAIT_CLAIM=8; WAIT_CONV=8; WAIT_MIGRATE=8; WAIT_TRANSFER=8; WAIT_LEASE=8; STILL_READ=8
 else
-    POLL=2;   WAIT_NODES=240; WAIT_LEARN=30; WAIT_CKPT=60; WAIT_ADOPT=240; WAIT_HANDOFF=120; WAIT_OBSERVER=60; WAIT_BOOT=240; WAIT_CLAIM=240; WAIT_CONV=180; WAIT_MIGRATE=120; WAIT_TRANSFER=120; WAIT_LEASE=120; STILL_READ=30
+    # WAIT_OBSERVER is derived below from the kernel's failover grace
+    # constants; WAIT_ADOPT is the adoption budget and is kept at least as
+    # long as that derived death watch. The fast path keeps its short fixed
+    # values because it does not model kernel timing at all.
+    POLL=2;   WAIT_NODES=240; WAIT_LEARN=30; WAIT_CKPT=60; WAIT_ADOPT=240; WAIT_HANDOFF=120; WAIT_BOOT=240; WAIT_CLAIM=240; WAIT_CONV=180; WAIT_MIGRATE=120; WAIT_TRANSFER=120; WAIT_LEASE=120; STILL_READ=30
 fi
 # How many campaigns the step-11 lease-row gate may drive before it accuses
 # the observer's RX path (see step 11a). One acquire is one campaign; a
@@ -247,9 +260,88 @@ RELAUNCH_ATTEMPTS="${AEROSLS_FAILOVER_RELAUNCH_ATTEMPTS:-3}"
 die()  { echo; echo "ABORT: $*" >&2; exit 2; }
 fail() { echo; echo "FAIL  $*"; exit 1; }
 
+# tick_constant <header> <NAME>
+#   Resolve a simple integer #define from a kernel header, following the
+#   names it references. This is the same derivation the 2-node guard uses:
+#   the live observer window must follow the kernel's graces, not a literal
+#   copied into this shell. Python is already a prerequisite for the /api
+#   JSON parsing below.
+tick_constant() {
+    python3 - "$1" "$2" <<'PY'
+import re
+import sys
+
+path, want = sys.argv[1], sys.argv[2]
+try:
+    text = open(path, encoding="utf-8").read()
+except OSError as exc:
+    sys.exit(f"cannot read {path}: {exc}")
+
+defs = {}
+for line in text.splitlines():
+    match = re.match(r"\s*#\s*define\s+([A-Za-z_]\w*)\s+(.*)", line)
+    if not match:
+        continue
+    name, body = match.groups()
+    body = re.sub(r"/\*.*?\*/", " ", body)
+    body = body.split("//", 1)[0].strip()
+    if body:
+        defs[name] = body
+
+def resolve(name, stack=()):
+    if name in stack:
+        sys.exit(f"cyclic #define while resolving {name} in {path}")
+    if name not in defs:
+        sys.exit(f"{name} is not defined in {path}")
+    expr = defs[name]
+    expr = re.sub(
+        r"[A-Za-z_]\w*",
+        lambda m: f"({resolve(m.group(0), stack + (name,))})"
+        if m.group(0) in defs else m.group(0),
+        expr,
+    )
+    expr = re.sub(r"(?<=\d)[uUlL]+\b", "", expr)
+    if not re.fullmatch(r"[\d\s()+\-*/%]+", expr):
+        sys.exit(f"unsupported expression for {name} in {path}: {defs[name]}")
+    try:
+        return int(eval(expr, {"__builtins__": {}}, {}))
+    except Exception as exc:
+        sys.exit(f"cannot evaluate {name} in {path}: {defs[name]} ({exc})")
+
+print(resolve(want))
+PY
+}
+
 command -v python3 >/dev/null 2>&1 || die "python3 is needed to parse the /api JSON."
 command -v curl    >/dev/null 2>&1 || die "curl not found."
 [ -f "$CTL" ] || die "$CTL not found -- run from the repo root"
+
+if [ "$FAST" != "1" ]; then
+    FAILOVER_H="${AEROSLS_FAILOVER_HEADER:-kernel/failover.h}"
+    CONSENSUS_H="${AEROSLS_CONSENSUS_HEADER:-net/consensus.h}"
+    FAILOVER_RELAUNCH_GRACE_TICKS=$(tick_constant "$FAILOVER_H" FAILOVER_RELAUNCH_GRACE_TICKS) \
+        || die "cannot read FAILOVER_RELAUNCH_GRACE_TICKS from $FAILOVER_H"
+    FAILOVER_DECLARE_TICKS=$(tick_constant "$FAILOVER_H" FAILOVER_DECLARE_TICKS) \
+        || die "cannot read FAILOVER_DECLARE_TICKS from $FAILOVER_H"
+    CONSENSUS_TICK_HZ=$(tick_constant "$CONSENSUS_H" CONSENSUS_TICK_HZ) \
+        || die "cannot read CONSENSUS_TICK_HZ from $CONSENSUS_H"
+    [ "$CONSENSUS_TICK_HZ" -gt 0 ] || die "CONSENSUS_TICK_HZ must be positive"
+
+    # Worst case: the leader dies at the start of the observer's boot grace,
+    # so the declaration waits for the whole relaunch grace and then a full
+    # FAILOVER_DECLARE_TICKS of silence. Round the tick window up to seconds
+    # and leave a margin for TCG scheduling and the guard's poll interval.
+    OBSERVER_MARGIN_SECS=60
+    WAIT_OBSERVER=$(( (FAILOVER_RELAUNCH_GRACE_TICKS + FAILOVER_DECLARE_TICKS + CONSENSUS_TICK_HZ - 1) / CONSENSUS_TICK_HZ + OBSERVER_MARGIN_SECS ))
+    [ "$WAIT_ADOPT" -ge "$WAIT_OBSERVER" ] || WAIT_ADOPT=$WAIT_OBSERVER
+fi
+
+# The deadline self-test needs the value without a cluster. This exits after
+# the same derivation the live run uses.
+if [ "${AEROSLS_FAILOVER_PRINT_DEADLINE:-0}" = "1" ]; then
+    printf '%s\n' "$WAIT_OBSERVER"
+    exit 0
+fi
 
 TOKEN_ARGS=()
 [ -n "$TOKEN" ] && TOKEN_ARGS=(--token "$TOKEN")
@@ -421,6 +513,7 @@ PY
 last_line() {
     grep -n "$2" "$1" 2>/dev/null | tail -n1 | cut -d: -f1
 }
+
 
 row_id() {
     python3 - "$1" "$2" <<'PY'
@@ -895,7 +988,8 @@ while :; do
         break
     fi
     echo "   note: the survivors gained $((ck1 - ck_pre1))/$((ck2 - ck_pre2)) checkpoints
-       in ${WAIT_CKPT}s -- re-driving the wait (attempt $((ckpt_attempt + 1)) of $ANNOUNCE_ATTEMPTS)"
+       in ${WAIT_CKPT}s -- re-driving the wait
+       (attempt $((ckpt_attempt + 1)) of $ANNOUNCE_ATTEMPTS)"
 done
 if [ "$ckpt_env_ok" -ne 1 ]; then
     # ── CHURN: the precondition for the whole pre-kill phase is that the

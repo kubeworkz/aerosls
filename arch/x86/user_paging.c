@@ -401,7 +401,27 @@ static uint32_t user_free_subtree(uint64_t* tbl, int depth, uint32_t* seen) {
     uint32_t freed = 0;
     for (int i = 0; i < 512; i++) {
         uint64_t e = tbl[i];
-        if (!(e & USER_PTE_PRESENT)) continue;
+        if (!(e & USER_PTE_PRESENT)) {
+            /* E7 mprotect parks a PROT_NONE leaf as frame|PARKED: the
+             * frame is still this process's property, but it is not
+             * PRESENT, so the ordinary U/S leaf walk below would skip it
+             * and leak it at teardown. Free it here, under exactly the
+             * same refusal/SIMI checks as a present leaf. Only a depth-3
+             * leaf can be parked; a stray marker on an intermediate table
+             * is left alone and the table itself is freed normally. */
+            if (depth >= 3 && (e & USER_PTE_PARKED) &&
+                (e & ~(USER_PTE_FRAME_MASK | USER_PTE_PARKED)) == 0) {
+                uint64_t pa = e & USER_PTE_FRAME_MASK;
+                if (pa && !user_frame_refused(pa) &&
+                    !simi_frame_is_cached(pa, seen) &&
+                    free_physical_ram_frame_for_partition(
+                        (void*)(uintptr_t)pa,
+                        frame_pool_frame_owner(pa / 4096)) == 0) {
+                    freed++;
+                }
+            }
+            continue;
+        }
         /* Kernel-half slots are shared by pointer with the kernel
          * (clone_kernel_slots; own_table(copy_existing=1) also copies kernel
          * entries into the child's own tables) and are NEVER this process's

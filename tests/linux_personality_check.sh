@@ -176,6 +176,39 @@ else
     bad "D2. the branch no longer refuses with -LINUX_ENOSYS — a CAP_E* negative in a Linux task's error path is a value no errno can produce (§5.7)"
 fi
 
+# D3/D4: the WHOLE overlap, not just 131.  A number chosen in the entry
+# stub decides for a Linux task before its personality can be read; the
+# 131 incident was one member of a 27-number block.  The stub must carry
+# no SLS number chain, and the C legacy switch must still own every number
+# that chain used to name.
+if ! grep -qE 'cmp[[:space:]]+rax,[[:space:]]*[0-9]+' "$ASM" && \
+   ! grep -q '\.do_sls_' "$ASM" && \
+   [ "$(grep -c 'jmp .unknown_syscall' "$ASM")" -eq 1 ]; then
+    ok "D3. syscall.asm has no SLS number chain — every number reaches .unknown_syscall, so do_syscall can apply the personality before any SLS arm"
+else
+    bad "D3. an SLS number chain is back in syscall.asm — the stub decides what an overlapping number means before do_syscall can ask the task's personality (the 131 class of bug, generalized to the whole block)"
+fi
+legacy_missing=""
+for sym in SYS_SLS_ALLOCATE SYS_SLS_VALLOC SYS_SLS_VFREE SYS_SLS_OBJ_STAT \
+           SYS_SLS_OBJ_LIST SYS_SLS_ROLE_SET SYS_SLS_GRANT SYS_SLS_SELECT \
+           SYS_SLS_UPDATE SYS_SLS_INSERT SYS_SLS_TX_BEGIN SYS_SLS_TX_COMMIT \
+           SYS_SLS_TX_ROLLBACK SYS_SLS_TX_RECOVER SYS_SLS_SVC_LIST \
+           SYS_SLS_SVC_CRASH SYS_SLS_SVC_RESTART SYS_SLS_IPC_STAT \
+           SYS_SLS_IPC_POST SYS_SLS_TIER_LIST SYS_SLS_TIER_PROMOTE \
+           SYS_SLS_TIER_DEMOTE SYS_SLS_DELETE SYS_SLS_SCHEMA_SET \
+           SYS_SLS_SCHEMA_SHOW SYS_SLS_QUERY SYS_SLS_QUERY_SCAN; do
+    if [ "$sym" = SYS_SLS_ALLOCATE ]; then
+        grep -q 'case 105:' "$DISP" || legacy_missing="$legacy_missing $sym"
+    else
+        grep -q "case $sym:" "$DISP" || legacy_missing="$legacy_missing $sym"
+    fi
+done
+if [ -z "$legacy_missing" ]; then
+    ok "D4. the C legacy switch still owns all 27 numbers the removed asm table named (105, 110–124, 130–134, 140–145, 150–151)"
+else
+    bad "D4. removing the asm table orphaned:$legacy_missing — the SLS task would fall to default instead of its legacy arm"
+fi
+
 # ─── E. The slot reset: a reused slot must not inherit a personality ──────
 if grep -q 'pd->personality = PROC_PERSONALITY_SLS;' "$PDC"; then
     ok "E. proc_clear_resume_state() resets personality to SLS (spawn init AND every teardown path)"
@@ -830,12 +863,15 @@ if grep -qF 'LINUX_RT_SIGACTION => {' "$LRS" && \
 else
     bad "R4. an arm or the SignalKill convergence is gone — raise(SIGABRT) would refuse or reply successfully, abort() would walk on into its hlt, and the boot would show [FAULT] at 0x805260c again (§10.13's step-1 wall)"
 fi
-if grep -qF 'E_NOSYS), /* handler install not landed' "$LRS" && \
+if grep -qF 'DISPO_HANDLER' "$LRS" && \
+   grep -qF 'sig.act[i] = SigAct { handler, flags, restorer, mask };' "$LRS" && \
+   grep -qF 'SIG_UNBLOCKABLE' "$LRS" && \
+   grep -qF '& !SIG_UNBLOCKABLE' "$LRS" && \
    grep -qF 'if sig.tid == 0 || args[0] as u32 != sig.tid as u32 {' "$LRS" && \
    grep -qF 'sig.pending |= 1u64 << (args[1] - 1);' "$LRS"; then
-    ok "R5. the seam's honesty lines hold: a handler install refuses ENOSYS by name BEFORE any mutation (v1 has no signal frames to deliver one on), tkill's tid is the set_tid_address echo at u32 width (ESRCH otherwise — never silently re-targeted), and a blocked signal PENDS so the unblock arm is where it delivers"
+    ok "R5. M3 keeps the seam's honesty while adding handlers: the action is recorded with its address/flags/restorer/mask, every requested mask drops the unblockable SIGKILL/SIGSTOP bits, tkill's tid is the set_tid_address echo at u32 width (ESRCH otherwise — never silently re-targeted), and a blocked signal PENDS so the unblock arm is where it delivers"
 else
-    bad "R5. one of the seam's honesty lines is gone — a handler install would record a disposition this shim can never invoke (every later delivery a coin flip), a tid mismatch could kill a task that never asked, or a blocked raise() would be lost outright instead of pending"
+    bad "R5. M3's handler record or one of the seam's honesty lines is gone — a handler install would not carry the action the frame needs, SIGKILL/SIGSTOP could be blocked, a tid mismatch could kill a task that never asked, or a blocked raise() would be lost outright instead of pending"
 fi
 if grep -qF 'linux_sig_copy_plan(' "$PHUT" && \
    grep -qF 'p.refuse == -LINUX_EINVAL && p.len == 0' "$PHUT"; then
@@ -858,6 +894,76 @@ if grep -qF 'fmt_sig_line(&mut ex, b" write ok len=",' "$LRS" && \
     ok "R8. the SIGABRT reading's instrument holds: the workload's own console bytes ride its write lines (len + a 24-byte excerpt, child-attributed) and mmap refusals carry their request (len/prot/flags) — 'alloc failed after ENOSYS' is read off the E7 stream, never inferred from a merged console drain whose order is the flush, not the writer"
 else
     bad "R8. the attribution is gone — the alloc-failure text would exist only in the merged console drain (any child of the environment could have written it) and the mmap refusal goes back to a bare ENOSYS with no request to name (the proven chain becomes an inference again)"
+fi
+
+# ─── R9. M3: the frame, the trailer and the return path ───────────────────
+# A handler install is only honest if the bytes can be delivered and the
+# interrupted context can be restored. The trailer is the one new wire
+# shape; the frame is the kernel's private record; rt_sigreturn is a normal
+# sidecar request for the mask plus a kernel-side context restore. Each
+# grep below is a seam whose absence would turn a recorded handler into a
+# silent kill, a lost register, or a handler that never returns.
+if grep -qF 'SignalHandler(SignalDelivery)' "$LRS" && \
+   grep -qF 'fn deliver_handler(' "$LRS" && \
+   grep -qF 'fn signal_delivery_payload(' "$LRS" && \
+   grep -qF 'LINUX_SIGNAL_DELIVERY_MAGIC' "$LRS" && \
+   grep -qF 'LINUX_RT_SIGRETURN => restore_and_redeliver(sig, args[0]),' "$LRS" && \
+   grep -qF 'fn restore_and_redeliver(' "$LRS" && \
+   grep -qF 'SA_RESETHAND' "$LRS" && \
+   grep -qF 'LINUX_SIGALTSTACK => {' "$LRS" && \
+   grep -qF 'fn read_stack_t(' "$LRS"; then
+    ok "R9. the sidecar owns the semantic half of M3.2–M3.4: a handler delivery carries signo/handler/flags/restorer/old mask and the optional alternate stack in the 72-byte trailer; sigaltstack (131) records/query/disables a 24-byte stack_t; SA_RESETHAND resets before entry; and rt_sigreturn (15) restores the mask, decrements the alt-stack depth and redelivers the next unblocked pending handler — no frame layout or register is invented on the Rust side"
+else
+    bad "R9. the sidecar's M3.2–M3.4 half is missing — a recorded handler would have no trailer or alt-stack record, SA_RESETHAND would leave its action installed for a nested delivery, or rt_sigreturn would leave the handler's blocked mask in force and drop a pending handler"
+fi
+if grep -qF 'struct LinuxSignalDelivery {' "$LABH" && \
+   grep -qF 'struct LinuxSignalFrame {' "$LABH" && \
+   grep -qF 'struct LinuxSignalImage {' "$LABH" && \
+   grep -qF 'LINUX_SIGFRAME_MAGIC' "$LABH" && \
+   grep -qF 'LINUX_USER_RFLAGS_MASK' "$LABH" && \
+   grep -qF 'LINUX_USER_RFLAGS_FIXED' "$LABH" && \
+   grep -qF 'linux_signal_delivery_parse(' "$LABC" && \
+   grep -qF 'linux_signal_frame_build(' "$LABC" && \
+   grep -qF 'linux_signal_frame_restore(' "$LABC" && \
+   grep -qF 'linux_signal_info_build(' "$LABC" && \
+   grep -qF 'linux_signal_ucontext_build(' "$LABC" && \
+   grep -qF 'alt_sp' "$LABH" && \
+   grep -qF '{  15, LSC_SIG,' "$LABC"; then
+    ok "R10. the kernel's M3.2–M3.4 record layer is named and host-testable: the 72-byte trailer (alt_sp/alt_size), the [restorer][frame][siginfo][ucontext] image, frame build/restore with the ring-3 RFLAGS bound, siginfo/ucontext builders, and the 15 row are all pure declarations before the boot mechanism uses them"
+else
+    bad "R10. the kernel's M3 record layer is incomplete — the trailer, image or frame would be an undocumented struct, the sigreturn RFLAGS bound would be gone, or 15 would fall off the class table"
+fi
+if grep -qF 'static uint64_t linux_signal_deliver(' "$CANC" && \
+   grep -qF 'int linux_sigreturn_forward(' "$CANC" && \
+   grep -qF 'struct LinuxSignalImage img;' "$CANC" && \
+   grep -qF 'linux_user_copy_in((const uint8_t *)&img, pd->cr3, base - 8,' "$CANC" && \
+   grep -qF 'pd->park_ctx.user_rsp = base - 8;' "$CANC" && \
+   grep -qF 'linux_signal_frame_restore(sf, sregs, &srip, &srflags, &srsp)' "$CANC" && \
+   grep -qF 'linux_signal_frame_restore(' "$DISP" && \
+   grep -qF 'int sret = linux_sigreturn_forward(cur->pid);' "$DISP" && \
+   grep -qF 'const struct LinuxSignalFrame *from' "$CANC" && \
+   grep -qF 'M3: the reply may have changed park_ctx' "$PDC"; then
+    ok "R11. the mechanism is wired: delivery writes the named [restorer][frame][siginfo][ucontext] image at base-8, places an SA_ONSTACK frame in the recorded alternate region, passes siginfo/ucontext to an SA_SIGINFO handler, and seeds a return-time pending delivery from the already-validated frame instead of the restorer's syscall; rt_sigreturn validates the frame before posting num=15, the resume restores the saved register file, and cap_recv_resume re-stamps the already-pushed sysret frame from park_ctx after the reply"
+else
+    bad "R11. an M3 mechanism link is gone — the [restorer][frame] buffer may be written at the wrong base (ret would pop zero and fault at rip=0, measured), rt_sigreturn would not reach the sidecar, or the resume would sysret with the pre-delivery pushed frame"
+fi
+
+# ─── R12. checkpoint survival rides the capture, not a second copy ───────────
+EPC=${EPC:-kernel/env_payload.c}
+# SigState lives in the sidecar's static LinuxTask table (the sidecar image
+# window the payload walks), and every saved frame/alt-stack byte lives on
+# the Linux task's own captured stack. The clause pins those two carriers so a
+# future "helpful" move of signal state into a heap object, or a capture that
+# stops walking the sidecar/Linux stack, cannot silently make a restored
+# handler forget its action, mask or pending bit.
+if grep -qF 'static mut TABLE: [LinuxTask; MAX_LINUX_TASKS]' "$LRS" && \
+   grep -qF 'sig: SigState,' "$LRS" && \
+   grep -qF 'return ep_in_image_window(vaddr) || ep_in_regions(rec, vaddr);' "$EPC" && \
+   grep -qF 'if (tk->stack_bottom && vaddr >= tk->stack_bottom &&' "$EPC" && \
+   grep -qF 'if (!ep_task_page(rec, t, pds[t], v)) continue;' "$EPC"; then
+    ok "R12. M3 signal state survives a checkpoint by construction: actions/mask/pending are fields of the sidecar's static LinuxTask table (captured with the sidecar's image window), and the saved frame/alternate stack are bytes on the Linux task's captured stack — no parallel signal snapshot exists to drift from them"
+else
+    bad "R12. a checkpoint carrier moved out of the captured set — signal state in a heap object or a frame outside the captured stack would restore a task whose handler action, mask or pending bits silently vanished"
 fi
 
 # ─── S. poll (7) — readiness and timed wakeups (E7 increment 24) ───────────
@@ -973,8 +1079,9 @@ if [ -n "$deliver_buf" ] && \
 else
     bad "T3. a shape arm is gone — a payload would be copied for a number that staged none, beyond the clamp, past a refusal, or with a ret its number contradicts (the one-truth rule with bytes attached)"
 fi
-if grep -qF 'int require_rw)' "$LABC" && \
+if grep -qF 'int require_rw, int allow_parked)' "$LABC" && \
    grep -qF 'if (require_rw && !(e & LAB_PTE_RW)) return -LINUX_EFAULT;' "$LABC" && \
+   grep -qF 'allow_parked && lvl == 3 && !require_rw' "$LABC" && \
    grep -qF '#define LAB_PTE_RW' "$LABC" && \
    grep -qF 'Phase 1 — validate the WHOLE span' "$LABC" && \
    grep -qF 'Phase 2 — write.' "$LABC"; then
@@ -1266,8 +1373,9 @@ fi
 # ─── X. E7 increment 25: munmap, the memory class's last seam ─────────────
 # The contract (X), the first trap before any post (X1), the reply's
 # page-table walk and frame return (X2), the sidecar's twin (X3), the
-# host test's branches (X4), the probe's on-target proof (X5) and the
-# instrument lines (X6): each is a claim the seam rests on.
+# host test's branches (X4), the probe's on-target proof (X5), the
+# instrument lines (X6) and the probe's PROT_NONE round trip (X7): each is
+# a claim the seam rests on.
 if grep -qF 'struct LinuxMunmapReq {' kernel/linux_abi.h && \
    grep -qF 'int linux_mem_munmap_refusal(const struct LinuxMunmapReq *req,' kernel/linux_abi.h && \
    grep -qF 'linux_mem_munmap_verdict(uint64_t heap_base, uint64_t heap_limit,' kernel/linux_abi.h && \
@@ -1291,12 +1399,12 @@ munmap_v=$(grep -nF 'v = linux_mem_munmap_verdict(' kernel/syscall_dispatch.c | 
 munmap_apply="$(sed -n "$((munmap_v - 3)),$((munmap_v + 70))p" kernel/syscall_dispatch.c)"
 if [ -n "$munmap_v" ] && \
    grep -qF 'cur->linux_brk_cur' <<< "$munmap_apply" && \
-   grep -qF 'linux_user_page_frame(' <<< "$munmap_apply" && \
+   grep -qF 'linux_user_leaf(' <<< "$munmap_apply" && \
    grep -qF 'user_unmap_page(pml4, va);' <<< "$munmap_apply" && \
    grep -qF 'user_invlpg(va);' <<< "$munmap_apply" && \
    grep -qF 'free_physical_ram_frame_for_partition' <<< "$munmap_apply" && \
    grep -qF 'v.unmap_pages' <<< "$munmap_apply"; then
-    ok "X2. the reply's apply walks exactly the verdict's page range, frees every present USER frame back to the partition, shoots down each touched translation, and leaves both cursors alone — an absent page is already unmapped, not an error"
+    ok "X2. the reply's apply walks exactly the verdict's page range, frees every present or parked USER frame back to the partition, shoots down each touched translation, and leaves both cursors alone — an absent page is already unmapped, not an error"
 else
     bad "X2. the munmap apply is missing or no longer walks the verdict's range — a success would unmap nothing (or free a frame without invlpg / return it without unmapping)"
 fi
@@ -1333,6 +1441,54 @@ if grep -qF ' ok munmap addr=0x' user/sidecar/src/linux.rs && \
     ok "X6. the run's proof is on the lines: the granted range and its words, the refusal's EINVAL with the range, and the kernel's per-page free count — WHICH range and HOW MANY pages, not reconstructed from which arms ran"
 else
     bad "X6. a munmap instrument line is missing — the seam would run but the log would not name the range it freed (increment 14/15's rule)"
+fi
+
+# ─── X7. The PROT_NONE -> RW round trip must stay in the probe ────────────
+# The E3 live boot is the behaviour proof, but it is minutes of QEMU and its
+# fixture can be edited between boots. This clause reads the fixture itself:
+# the block is extracted between its two labels, so a deletion cannot be
+# hidden by a similar mprotect call elsewhere (the W|X refusal at 5g uses the
+# same syscall number). It pins the ORDER too: PROT_NONE must precede
+# PROT_READ|PROT_WRITE, and the 18-byte positive marker must source its bytes
+# from the heap pointer in %rsi after the restore. It also pins the same page
+# in both calls, all three content comparisons, the writability byte, the
+# return to the mmap block, and markers 412–415.
+mp_block="$(sed -n '/^\.Lmprotect:/,/^\.Lmmap:/p' "$FIX")"
+mp_mprotects="$(printf '%s\n' "$mp_block" | grep -cF 'mov     $10, %eax' || true)"
+mp_same_page="$(printf '%s\n' "$mp_block" | grep -cF 'mov     %r12, %rdi' || true)"
+mp_content_branches="$(printf '%s\n' "$mp_block" | grep -cF 'jne     .Lmprotect_content_bad' || true)"
+mp_none_line="$(printf '%s\n' "$mp_block" | grep -nF 'xor     %edx, %edx' | head -1 | cut -d: -f1)"
+mp_rw_line="$(printf '%s\n' "$mp_block" | grep -nF 'mov     $3, %edx' | head -1 | cut -d: -f1)"
+mp_src_line="$(printf '%s\n' "$mp_block" | grep -nF 'mov     %r12, %rsi' | head -1 | cut -d: -f1)"
+mp_len_line="$(printf '%s\n' "$mp_block" | grep -nF 'mov     $18, %edx' | head -1 | cut -d: -f1)"
+if [ -n "$mp_block" ] && \
+   grep -qF '.Lmmap:' <<< "$mp_block" && \
+   [ "$mp_mprotects" -eq 2 ] && [ "$mp_same_page" -eq 2 ] && \
+   [ "$mp_content_branches" -eq 4 ] && \
+   [ -n "$mp_none_line" ] && [ -n "$mp_rw_line" ] && \
+   [ "$mp_none_line" -lt "$mp_rw_line" ] && \
+   [ -n "$mp_src_line" ] && [ "$mp_rw_line" -lt "$mp_src_line" ] && \
+   [ -n "$mp_len_line" ] && [ "$mp_src_line" -lt "$mp_len_line" ] && \
+   grep -qF 'movabs  $0x504D2D4D454D3745' <<< "$mp_block" && \
+   grep -qF 'movabs  $0x4F2D544345544F52' <<< "$mp_block" && \
+   grep -qF 'movabs  $0x0000000000000A4B' <<< "$mp_block" && \
+   grep -qF 'xor     %edx, %edx' <<< "$mp_block" && \
+   grep -qF 'mov     $3, %edx' <<< "$mp_block" && \
+   grep -qF 'cmp     %rax, (%r12)' <<< "$mp_block" && \
+   grep -qF 'cmp     %rax, 8(%r12)' <<< "$mp_block" && \
+   grep -qF 'cmp     %rax, 16(%r12)' <<< "$mp_block" && \
+   grep -qF 'movb    $0x21, 18(%r12)' <<< "$mp_block" && \
+   grep -qF 'cmpb    $0x21, 18(%r12)' <<< "$mp_block" && \
+   grep -qF 'mov     $18, %edx' <<< "$mp_block" && \
+   grep -qF 'cmp     $18, %rax' <<< "$mp_block" && \
+   grep -qF 'jmp     .Lmmap' <<< "$mp_block" && \
+   grep -qF 'mov     $412, %eax' "$FIX" && \
+   grep -qF 'mov     $413, %eax' "$FIX" && \
+   grep -qF 'mov     $414, %eax' "$FIX" && \
+   grep -qF 'mov     $415, %eax' "$FIX"; then
+    ok "X7. the probe carries the PROT_NONE round trip in order on one heap page: NONE before READ|WRITE, two mprotect calls on %r12, three content reads, a writability byte, the 18-byte positive marker sourced from %r12 in %rsi, and markers 412–415 for a refused park/restore, changed contents, or short output"
+else
+    bad "X7. the probe's mprotect round-trip block is gone, gutted, or out of order — the E3 live boot would still pass from older evidence or another task's marker, while the fixture no longer proves PROT_NONE parked the page, RW restored it, and the marker's bytes came from that heap page"
 fi
 
 echo

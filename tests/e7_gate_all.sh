@@ -9,7 +9,8 @@
 # replayable files into evidence/e7_gate_<UTC>/ (the sparse NVMe images are
 # excluded). It stops at the first red arm; that arm's harness.log and every
 # completed arm's evidence are already in the bundle. manifest.txt records the
-# commit, each arm's exit status and the built ISO hashes.
+# full and short commit, whether the tree was clean or dirty when the run
+# started, each arm's exit status and the built ISO hashes.
 #
 # Env:
 #   E7_GATE_EVIDENCE  evidence directory; must not exist (default timestamped)
@@ -25,6 +26,45 @@ cd "$ROOT" || exit 2
 
 CHECK="${E7_GATE_CHECK:-$ROOT/tests/e7_gate_check.sh}"
 [ -f "$CHECK" ] || { echo "ABORT: no E7 harness at $CHECK" >&2; exit 2; }
+
+# A Git worktree created from Windows (the WSL development path this gate is
+# normally run from) writes an absolute `C:/...` path into `.git`. Native WSL
+# git then refuses it as "not a git repository", so the one-command run would
+# record head=unknown even though the checkout is identifiable. Translate that
+# one path shape to /mnt/<drive>/...; a normal Linux checkout has a real .git
+# directory and is untouched.
+if [ -f "$ROOT/.git" ]; then
+    _gitdir=$(sed -n 's/^gitdir: //p' "$ROOT/.git" | head -1)
+    case "$_gitdir" in
+        [A-Za-z]:/*)
+            _drive=$(printf '%s' "$_gitdir" | cut -d: -f1 | tr '[:upper:]' '[:lower:]')
+            _rest=${_gitdir#*:}
+            _gitdir="/mnt/$_drive/${_rest#/}"
+            if [ -f "$_gitdir/HEAD" ]; then
+                export GIT_DIR="$_gitdir"
+                export GIT_WORK_TREE="$ROOT"
+            fi
+            ;;
+    esac
+fi
+
+# Capture identity BEFORE the evidence directory or any build artifact exists:
+# the manifest describes the source tree the run started from, not the files
+# the run itself generated. A clean CI checkout must read clean here even
+# though the run later writes ISO/sidecar/evidence files.
+START_HEAD=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
+START_HEAD_FULL=$(git rev-parse HEAD 2>/dev/null || echo unknown)
+START_TREE_STATUS=unknown
+START_TREE_CHANGED=unknown
+if _changed=$(git status --porcelain 2>/dev/null); then
+    _changed=$(printf '%s\n' "$_changed" | sed '/^$/d' | wc -l | tr -d ' ')
+    START_TREE_CHANGED="$_changed"
+    if [ "$_changed" -eq 0 ]; then
+        START_TREE_STATUS=clean
+    else
+        START_TREE_STATUS=dirty
+    fi
+fi
 
 RUN_DIR="${E7_GATE_EVIDENCE:-evidence/e7_gate_$(date -u +%Y%m%dT%H%M%SZ)}"
 [ ! -e "$RUN_DIR" ] || { echo "ABORT: evidence path already exists: $RUN_DIR" >&2; exit 2; }
@@ -62,7 +102,10 @@ write_manifest() {
     {
         echo "started=$STARTED"
         echo "finished=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        echo "head=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+        echo "head=$START_HEAD"
+        echo "head_full=$START_HEAD_FULL"
+        echo "tree_status=$START_TREE_STATUS"
+        echo "tree_changed=$START_TREE_CHANGED"
         echo "source.rc=${RC[source]:-not-run}"
         for mode in "${MODES[@]}"; do
             echo "$mode.rc=${RC[$mode]:-not-run}"

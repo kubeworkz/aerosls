@@ -218,6 +218,19 @@ seed "$W/t5"
 sed -i 's/if (cur \&\& linux_personality_intercepts(cur->personality)) {/if (0) {/' "$W/t5/kernel/syscall_dispatch.c"
 tooth branch-removed D "the personality branch is dead-coded away" "$W/t5"
 
+# D3: an SLS fast-path compare reintroduced for one overlap — the
+# 131-class bug generalized: the stub answers 105 before personality is
+# read, so a Linux setuid becomes an SLS allocate (or vice versa).
+seed "$W/t129"
+sed -i '/jmp .unknown_syscall/i\    cmp rax, 105\n    je .do_sls_allocate' "$W/t129/arch/x86/syscall.asm"
+tooth asm-sls-chain-back D3 "one overlapping number is decided by the entry stub again" "$W/t129"
+
+# D4: a legacy case removed with the fast path — the SLS task would fall
+# to the default instead of its old arm.
+seed "$W/t130"
+sed -i '/case SYS_SLS_VALLOC:/d' "$W/t130/kernel/syscall_dispatch.c"
+tooth legacy-case-orphaned D4 "the C switch no longer owns a former fast-path number" "$W/t130"
+
 # F1: the spawn syscall passes SLS — a Linux-named spawn creating a plain
 # SLS task; the mismatch would be silent until the task's first trap.
 seed "$W/t6"
@@ -674,12 +687,13 @@ seed "$W/t79"
 sed -i 's/ACT_TERMINATE => Answer::SignalKill(args\[1\]),/ACT_TERMINATE => Answer::Reply(0, STATUS_OK),/' "$W/t79/user/sidecar/src/linux.rs"
 tooth terminate-answers-success R4 "a default-terminate signal no longer converges on SignalKill" "$W/t79"
 
-# t80: the handler-install refusal answered 0 — v1 has no signal frames,
-# so a recorded handler would never run while its caller believes the
-# install succeeded.
+# t80: the handler action is no longer recorded — the install still answers
+# 0, so the caller believes a handler is installed, but delivery has no
+# handler address/flags/restorer/mask to put in the frame (a silent kill at
+# the next tkill, not the refused install it would have been pre-M3).
 seed "$W/t80"
-sed -i 's|_ => Answer::Reply(0, E_NOSYS), /\* handler install not landed \*/|_ => Answer::Reply(0, STATUS_OK), /* handler install silently kept */|' "$W/t80/user/sidecar/src/linux.rs"
-tooth handler-install-answered-0 R5 "a handler install is no longer refused by name before any mutation" "$W/t80"
+sed -i '/sig.act\[i\] = SigAct { handler, flags, restorer, mask };/d' "$W/t80/user/sidecar/src/linux.rs"
+tooth handler-action-not-recorded R5 "an accepted handler install no longer records its action" "$W/t80"
 
 # t81: tkill's tid scope deleted — any sender may signal any tid through
 # this arm, silently re-targeted instead of answered ESRCH.
@@ -1033,6 +1047,14 @@ tooth munmap-fixture-marker-gone X5 "the probe no longer carries the E7MEM-MUNMA
 seed "$W/t128"
 sed -i 's/ ok munmap addr=0x//' "$W/t128/user/sidecar/src/linux.rs"
 tooth munmap-range-not-logged X6 "a granted munmap's answer line no longer carries the range" "$W/t128"
+
+# t129: the probe's PROT_NONE -> RW round-trip block deleted — the live E3
+# boot could still pass from an older log or another task's marker, while the
+# fixture edit silently removed the parked-frame restore proof. The guard
+# must redden by X7 from source alone, before any boot.
+seed "$W/t129"
+sed -i '/^\.Lmprotect:/,/^\.Lmmap:/{/^\.Lmmap:/!d}' "$W/t129/user/sidecar/fixtures/e7_linux_probe.S"
+tooth mprotect-round-trip-gone X7 "the probe no longer carries the PROT_NONE round-trip block" "$W/t129"
 
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"

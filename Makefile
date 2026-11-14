@@ -1351,14 +1351,20 @@ x86-iso-e3: selfhost-bootimage-e3
 # The E7 gate has three live build profiles (the drill, the teeth and the
 # deferred self-kill) plus the source clauses. Running them by hand meant
 # choosing a profile, remembering its ISO name, and then copying the right
-# files out of /tmp into evidence/. This target runs them in order until one
-# fails and writes evidence/e7_gate_<UTC>/ with the harness logs, boot logs,
-# facts and a
-# manifest that records each arm's exit and the built ISO's sha256. The sparse
-# NVMe images are inputs, not evidence, and are not copied. Needs make, cargo
-# and QEMU; it is intentionally not part of the per-push guard sweep.
+# files out of /tmp into evidence/. This target is the operational path:
+# first the driver's own source-only teeth and the committed replay guard (so
+# a broken evidence path is caught before an hour of QEMU), then all four arms
+# in order until one fails. The driver writes evidence/e7_gate_<UTC>/ with the
+# harness logs, boot logs, facts and a manifest that records the tree identity,
+# each arm's exit and the built ISO's sha256. The sparse NVMe images are
+# inputs, not evidence, and are not copied. Needs make, cargo and QEMU; the
+# scheduled/manual GitHub workflow .github/workflows/e7-gate.yml invokes this
+# same target and uploads the bundle. It is intentionally not part of the
+# per-push guard sweep.
 .PHONY: e7-gate
 e7-gate:
+	bash tests/e7_gate_all_smoke.sh
+	bash tests/e7_gate_evidence_check.sh
 	bash tests/e7_gate_all.sh
 
 # ── SIMI host toolchain ─────────────────────────────────────────────────────

@@ -778,6 +778,170 @@ int main(void)
               "      ladder is re-run, the verdict is total on any input");
     }
 
+    /* ─── the mprotect seam: the Rust guard-page shape ─────────────────── */
+    {   const uint64_t BASE  = 0x0000400000100000ULL;
+        const uint64_t LIMIT = BASE + 0x10000;
+        const uint64_t GUARD = LIMIT - 0x1000;
+        struct LinuxMprotectReq req;
+        struct LinuxMemMprotectVerdict v;
+
+        /* The exact E7 failure: Rust std maps its alternate stack and
+         * protects the first page with PROT_NONE. This shape must pass
+         * the first trap and name its one page at the reply. */
+        req.addr = GUARD; req.len = 0x1000; req.prot = LINUX_PROT_NONE;
+        CHECK(linux_mem_mprotect_refusal(&req, BASE, LIMIT) == 0,
+              "the Rust guard-page shape (PROT_NONE, page-aligned, in "
+              "      the span) passes the first trap");
+        v = linux_mem_mprotect_verdict(BASE, LIMIT, &req, 0);
+        CHECK(v.malformed == 0 && v.range_va == GUARD &&
+                  v.range_pages == 1 && v.prot == LINUX_PROT_NONE,
+              "the success reply names exactly the guard page and its "
+              "      PROT_NONE word — the kernel has a page to clear");
+
+        /* Read-only and RW are the same served class: the kernel keeps
+         * the frame and installs the new leaf flags. */
+        for (uint64_t prot = LINUX_PROT_READ;
+             prot <= (LINUX_PROT_READ | LINUX_PROT_WRITE); prot++) {
+            req.prot = prot;
+            CHECK(linux_mem_mprotect_refusal(&req, BASE, LIMIT) == 0,
+                  "the guard page can be made read-only or read/write");
+        }
+
+        /* W|X is the §5.4 refusal; executable-only is ENOSYS by name, as
+         * mmap already answers; unknown prot bits are EINVAL. */
+        req.prot = LINUX_PROT_WRITE | LINUX_PROT_EXEC;
+        CHECK(linux_mem_mprotect_refusal(&req, BASE, LIMIT) == -LINUX_EPERM,
+              "W|X is refused EPERM at the mprotect first trap");
+        req.prot = LINUX_PROT_EXEC;
+        CHECK(linux_mem_mprotect_refusal(&req, BASE, LIMIT) == -LINUX_ENOSYS,
+              "executable-only protection is refused ENOSYS by name");
+        req.prot = 0x8;
+        CHECK(linux_mem_mprotect_refusal(&req, BASE, LIMIT) == -LINUX_EINVAL,
+              "an unknown prot bit is EINVAL");
+
+        /* The range ladder: no page walk can serve any of these. */
+        req.prot = LINUX_PROT_NONE; req.addr = GUARD + 1;
+        CHECK(linux_mem_mprotect_refusal(&req, BASE, LIMIT) == -LINUX_EINVAL,
+              "an unaligned address is EINVAL");
+        req.addr = GUARD; req.len = 0;
+        CHECK(linux_mem_mprotect_refusal(&req, BASE, LIMIT) == -LINUX_EINVAL,
+              "a zero length is EINVAL");
+        req.len = 0xFFFFFFFFFFFFFFFFULL;
+        CHECK(linux_mem_mprotect_refusal(&req, BASE, LIMIT) == -LINUX_EINVAL,
+              "a length whose page-round overflows is EINVAL");
+        req.len = 0x1000; req.addr = BASE - 0x1000;
+        CHECK(linux_mem_mprotect_refusal(&req, BASE, LIMIT) == -LINUX_EINVAL,
+              "a range below the stamped span is EINVAL");
+        req.addr = LIMIT;
+        CHECK(linux_mem_mprotect_refusal(&req, BASE, LIMIT) == -LINUX_EINVAL,
+              "a range at the span's limit is EINVAL");
+        req.addr = LIMIT - 0x1000; req.len = 0x2000;
+        CHECK(linux_mem_mprotect_refusal(&req, BASE, LIMIT) == -LINUX_EINVAL,
+              "a range crossing the span's limit is EINVAL");
+
+        /* Verdict totality: a negative reply changes nothing; a non-zero
+         * success and a request the first trap would refuse are malformed
+         * and must not mutate the page table. */
+        req.addr = GUARD; req.len = 0x1000; req.prot = LINUX_PROT_NONE;
+        v = linux_mem_mprotect_verdict(BASE, LIMIT, &req,
+                                       (uint64_t)(int64_t)(-LINUX_ENOMEM));
+        CHECK(v.malformed == 0 && v.range_pages == 0 && v.range_va == 0,
+              "a negative mprotect reply changes nothing and is not "
+              "      malformed — the errno rides the §5.7 map");
+        v = linux_mem_mprotect_verdict(BASE, LIMIT, &req, 1);
+        CHECK(v.malformed == 1 && v.range_pages == 0,
+              "mprotect's success is 0; any other non-negative reply is "
+              "      malformed");
+        req.prot = LINUX_PROT_WRITE | LINUX_PROT_EXEC;
+        v = linux_mem_mprotect_verdict(BASE, LIMIT, &req, 0);
+        CHECK(v.malformed == 1 && v.range_pages == 0,
+              "a success for a W|X request is malformed — the verdict "
+              "      is total on any input");
+    }
+
+    /* ─── PROT_NONE must preserve the frame for a legitimate reprotection ─
+     * The first shim freed the guard-page frame at PROT_NONE. A later
+     * mprotect(PROT_READ|PROT_WRITE) on that same range then found no
+     * present leaf and answered -ENOMEM — a valid reprotection broken by
+     * the guard itself. The parked leaf keeps the frame without making it
+     * ring-3 readable; this is the exact transition the kernel apply uses. */
+    {   const uint64_t VA = 0x0000400000100000ULL;
+        const uint64_t FRAME = 0x0000000012345000ULL;
+        _Alignas(4096) uint64_t pml4[512] = {0}, pdpt[512] = {0};
+        _Alignas(4096) uint64_t pd[512] = {0}, pt[512] = {0};
+        uint64_t leaf = 0, parked = 0, restored = 0, again = 0;
+
+        pml4[(VA >> 39) & 0x1FF] =
+            (uint64_t)(uintptr_t)pdpt | LINUX_PTE_PRESENT |
+            LINUX_PTE_WRITE | LINUX_PTE_USER;
+        pdpt[(VA >> 30) & 0x1FF] =
+            (uint64_t)(uintptr_t)pd | LINUX_PTE_PRESENT |
+            LINUX_PTE_WRITE | LINUX_PTE_USER;
+        pd[(VA >> 21) & 0x1FF] =
+            (uint64_t)(uintptr_t)pt | LINUX_PTE_PRESENT |
+            LINUX_PTE_WRITE | LINUX_PTE_USER;
+        pt[(VA >> 12) & 0x1FF] = FRAME | LINUX_PTE_PRESENT |
+                                 LINUX_PTE_USER | LINUX_PTE_NOEXEC;
+
+        CHECK(linux_user_leaf((uint64_t)(uintptr_t)pml4, VA, &leaf) == 0 &&
+                  (leaf & LINUX_PTE_FRAME_MASK) == FRAME &&
+                  (leaf & LINUX_PTE_PRESENT) && (leaf & LINUX_PTE_USER),
+              "the present user leaf is found with its frame");
+        CHECK(linux_user_page_frame((uint64_t)(uintptr_t)pml4, VA) == FRAME,
+              "the ordinary copy frame is the same frame");
+
+        CHECK(linux_mprotect_leaf_transition(leaf, LINUX_PROT_NONE,
+                                             &parked) == 0 &&
+                  !(parked & LINUX_PTE_PRESENT) &&
+                  (parked & LINUX_PTE_PARKED) &&
+                  (parked & LINUX_PTE_FRAME_MASK) == FRAME,
+              "PROT_NONE parks the frame instead of freeing it");
+
+        pt[(VA >> 12) & 0x1FF] = parked;   /* the kernel apply's write */
+        CHECK(linux_user_page_frame((uint64_t)(uintptr_t)pml4, VA) == 0,
+              "a parked guard has no present frame for a copy");
+        CHECK(linux_user_leaf((uint64_t)(uintptr_t)pml4, VA, &leaf) == 0 &&
+                  leaf == parked,
+              "mprotect can still find the parked leaf");
+
+        CHECK(linux_mprotect_leaf_transition(parked, LINUX_PROT_READ,
+                                             &restored) == 0 &&
+                  (restored & LINUX_PTE_PRESENT) &&
+                  (restored & LINUX_PTE_USER) &&
+                  !(restored & LINUX_PTE_WRITE) &&
+                  (restored & LINUX_PTE_FRAME_MASK) == FRAME,
+              "PROT_READ restores the parked frame read-only");
+
+        CHECK(linux_mprotect_leaf_transition(
+                  parked, LINUX_PROT_READ | LINUX_PROT_WRITE,
+                  &restored) == 0 &&
+                  (restored & LINUX_PTE_PRESENT) &&
+                  (restored & LINUX_PTE_USER) &&
+                  (restored & LINUX_PTE_WRITE) &&
+                  !(restored & LINUX_PTE_PARKED) &&
+                  (restored & LINUX_PTE_FRAME_MASK) == FRAME,
+              "PROT_READ|PROT_WRITE restores the same frame — the "
+              "      reprotection that used to see ENOMEM");
+
+        pt[(VA >> 12) & 0x1FF] = restored;
+        CHECK(linux_user_leaf((uint64_t)(uintptr_t)pml4, VA, &leaf) == 0 &&
+                  leaf == restored &&
+                  linux_user_page_frame((uint64_t)(uintptr_t)pml4, VA) == FRAME,
+              "after the restore the page is a normal present user mapping");
+
+        CHECK(linux_mprotect_leaf_transition(parked, LINUX_PROT_NONE,
+                                             &again) == 0 &&
+                  again == parked,
+              "PROT_NONE over an already-parked guard is idempotent");
+
+        again = 0;
+        CHECK(linux_mprotect_leaf_transition(0, LINUX_PROT_READ,
+                                             &again) == -LINUX_ENOMEM &&
+                  again == 0,
+              "an absent leaf is still ENOMEM — preservation never invents "
+              "      a frame");
+    }
+
     /* ─── the munmap seam (E7 increment 25, §5.4) ─────────────────────── */
     {   const uint64_t BASE  = 0x0000400000100000ULL;
         const uint64_t LIMIT = BASE + 0x10000;
@@ -1511,6 +1675,111 @@ int main(void)
               linux_reply_shape_ok(LINUX_GETDENTS64, 7, 100) == 0,
               "getdents64: a success within the list cap — a ret the\n"
               "      kernel itself computes must contradict on the wire");
+    }
+
+    {   /* M3: the signal trailer and the frame are record layers, so the
+         * host test drives both against the real linux_abi.c before any
+         * boot can lose a register in them. */
+        uint8_t d[LINUX_SIGNAL_DELIVERY_BYTES];
+        struct LinuxSignalDelivery sd;
+        struct LinuxSignalFrame fr, back;
+        struct LinuxSignalInfo si;
+        struct LinuxUContext uc;
+        uint64_t regs[15], rregs[15], rip = 0, rflags = 0, rsp = 0;
+        uint64_t words[9] = { LINUX_SIGNAL_DELIVERY_MAGIC, 6, 0x401000,
+                              0x08000004, 0x402000, 0x11, 0x22,
+                              0x7fff0000, 0x2000 };
+        int i;
+
+        for (i = 0; i < 9; i++) {
+            int b;
+            for (b = 0; b < 8; b++)
+                d[i * 8 + b] = (uint8_t)(words[i] >> (8 * b));
+        }
+        CHECK(linux_signal_delivery_parse(d, sizeof d, &sd) == 0 &&
+              sd.signo == 6 && sd.handler == 0x401000 &&
+              sd.flags == 0x08000004 && sd.restorer == 0x402000 &&
+              sd.old_mask == 0x11 && sd.oldset == 0x22 &&
+              sd.alt_sp == 0x7fff0000 && sd.alt_size == 0x2000,
+              "M3.1 the 72-byte delivery trailer parses field-for-field,\n"
+              "      including the alt-stack pair —\n"
+              "      the sidecar and kernel cannot silently disagree on a\n"
+              "      handler, restorer or mask");
+        CHECK(linux_signal_delivery_parse(d, sizeof d - 1, &sd) ==
+              -LINUX_EPROTO,
+              "M3.2 a short trailer is refused before any frame is built");
+        d[0] ^= 0xFF;
+        CHECK(linux_signal_delivery_parse(d, sizeof d, &sd) ==
+              -LINUX_EPROTO,
+              "M3.3 a wrong magic is refused — a file payload of the same\n"
+              "      length cannot be mistaken for a handler request");
+
+        for (i = 0; i < 15; i++) regs[i] = 0x1000 + (uint64_t)i;
+        linux_signal_frame_build(&fr, regs, 0x401000, 0x202, 0x7fff0000,
+                                 6, 0x55);
+        CHECK(fr.magic == LINUX_SIGFRAME_MAGIC && fr.signo == 6 &&
+              fr.old_mask == 0x55 && fr.rip == 0x401000 &&
+              fr.rflags == 0x202 && fr.rsp == 0x7fff0000 &&
+              fr.regs[0] == 0x1000 && fr.regs[14] == 0x100e,
+              "M3.4 the frame records every saved word and the interrupt\n"
+              "      context rt_sigreturn must restore");
+        CHECK(linux_signal_frame_restore(&fr, rregs, &rip, &rflags,
+                                         &rsp) == 0 &&
+              rregs[0] == 0x1000 && rregs[14] == 0x100e &&
+              rip == 0x401000 && rflags == 0x202 && rsp == 0x7fff0000,
+              "M3.5 restore returns the same register file and RIP/RSP/\n"
+              "      RFLAGS — the round trip is not lossy");
+        back = fr;
+        back.magic = 0;
+        CHECK(linux_signal_frame_restore(&back, rregs, &rip, &rflags,
+                                         &rsp) == -LINUX_EINVAL,
+              "M3.6 a frame without the magic is refused — userspace bytes\n"
+              "      can never steer a sysret without the kernel's marker");
+        back = fr;
+        back.rip = 0xFFFF800000000000ULL;
+        CHECK(linux_signal_frame_restore(&back, rregs, &rip, &rflags,
+                                         &rsp) == -LINUX_EINVAL,
+              "M3.7 a non-canonical saved RIP is refused — a forged frame\n"
+              "      cannot turn the sigreturn sysret into a ring-0 #GP");
+        back = fr;
+        back.rsp = LINUX_USER_ADDR_MAX + 1;
+        CHECK(linux_signal_frame_restore(&back, rregs, &rip, &rflags,
+                                         &rsp) == -LINUX_EINVAL,
+              "M3.8 a non-user saved RSP is refused with the same bound");
+        back = fr;
+        back.rflags = ~0ULL;
+        CHECK(linux_signal_frame_restore(&back, rregs, &rip, &rflags,
+                                         &rsp) == 0 &&
+              rflags == LINUX_USER_RFLAGS_MASK,
+              "M3.9 restore masks RFLAGS to the ring-3 set — a forged VM/\n"
+              "      NT/RF/IOPL word cannot make the sigreturn sysret fault\n"
+              "      in ring 0");
+        back = fr;
+        back.rflags = 0;
+        CHECK(linux_signal_frame_restore(&back, rregs, &rip, &rflags,
+                                         &rsp) == 0 &&
+              rflags == LINUX_USER_RFLAGS_FIXED,
+              "M3.10 a cleared IF comes back set — a forged frame cannot\n"
+              "      leave a ring-3 task running with maskable interrupts off");
+        linux_signal_frame_build(&back, regs, 0x401000, ~0ULL, 0x7fff0000,
+                                 6, 0);
+        CHECK(back.rflags == LINUX_USER_RFLAGS_MASK,
+              "M3.11 the frame BUILD applies the same bound, so the handler\n"
+              "      enters with sanitized flags — not only the sigreturn\n"
+              "      restore");
+        linux_signal_info_build(&si, 10, 42);
+        CHECK(si.si_signo == 10 && si.si_errno == 0 &&
+              si.si_code == LINUX_SI_TKILL && si.si_pid == 42 &&
+              si.si_uid == 0,
+              "M3.12 the SA_SIGINFO siginfo names the tkill origin, signo\n"
+              "      and pid in the Linux 128-byte leading layout");
+        linux_signal_ucontext_build(&uc, &fr, 0x7fff0000, 0x2000, 1);
+        CHECK(uc.uc_stack_sp == 0x7fff0000 && uc.uc_stack_size == 0x2000 &&
+              uc.uc_stack_flags == 1 && uc.uc_mcontext[8] == fr.regs[9] &&
+              uc.uc_mcontext[15] == fr.rsp && uc.uc_mcontext[16] == fr.rip &&
+              uc.uc_sigmask == fr.old_mask,
+              "M3.13 the SA_SIGINFO ucontext carries the alt-stack record and\n"
+              "      the Linux sigcontext order for the saved frame");
     }
 
     {   /* increment 19: the time source's 16-byte destination, and the

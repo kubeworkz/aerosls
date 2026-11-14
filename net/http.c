@@ -5569,12 +5569,11 @@ static int api_workflow_addstep_post(const char* body, char* buf, int max) {
 // Body: {"name","payload"}. Legacy raw heap write -- finds the object's
 // mapped base_vaddr and writes the payload string directly into that
 // address. shell.c's "write" command reaches this via
-// do_syscall(SYS_SLS_ALLOCATE, ...), which syscall_dispatch.c actually
-// routes to its own `static sls_legacy_allocate()` (NOT kernel/stubs.c's
-// sys_sls_allocate() -- that function is undeclared in any header and
-// appears to be dead from this call path, reachable only via the raw
-// assembly syscall trampoline). sls_legacy_allocate() is itself `static`
-// with no header declaration, so its object_id-lookup body is replicated
+// do_syscall(SYS_SLS_ALLOCATE, ...), which syscall_dispatch.c routes to
+// its own `static sls_legacy_allocate()` -- the single implementation now
+// that the old kernel/stubs.c sys_sls_allocate() copy has been removed.
+// sls_legacy_allocate() is itself `static` with no header declaration, so
+// its object_id-lookup body is replicated
 // inline here rather than called, matching this file's established
 // "inline manipulation of extern kernel state when no proper function
 // exists" pattern (see api_chmod_post, api_workflow_addstep_post). Since

@@ -389,20 +389,6 @@ void handle_ring3_fault(unsigned long error_code, unsigned long saved_cs, unsign
     for (;;) __asm__ volatile("hlt");
 }
 
-// ─── Legacy SLS allocation (syscall 105) ─────────────────────────────────────
-// Called directly from the syscall assembly stub.  Delegates to the object
-// catalog lookup introduced in Phase 1.
-void* sys_sls_allocate(void* arg) {
-    if (!arg) return 0;
-    struct { uint64_t object_id; uint64_t size; uint32_t flags; }* req = arg;
-    for (uint32_t i = 0; i < object_catalog_count; i++) {
-        if (object_catalog[i].active &&
-            object_catalog[i].object_id == req->object_id)
-            return (void*)(uintptr_t)object_catalog[i].base_vaddr;
-    }
-    return 0;
-}
-
 // ─── FNV-1a hash (used by lockfree_map.c) ────────────────────────────────────
 uint64_t generate_unique_object_id(const char* key, size_t length) {
     uint64_t h = 0xcbf29ce484222325ULL;

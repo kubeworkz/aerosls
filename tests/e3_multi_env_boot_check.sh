@@ -74,7 +74,7 @@ ISO="${E3_ISO:-sls_operating_system_e3.iso}"
 QEMU="${E3_QEMU:-qemu-system-x86_64}"   # overridable so the teeth can feed a
                                           # canned boot log without an ISO
 LOG=/tmp/aerosls_e3_multi_env.log
-WINDOW_S=120              # the tenant envs are spawned last (after the system
+WINDOW_S="${E3_WINDOW_S:-120}"   # the tenant envs are spawned last (after the system
                           # POSIX's network boot), so give the whole chain room
 
 [ -f "$ISO" ] || { echo "ABORT: $ISO missing — build it with: make x86-iso-e3" >&2; exit 2; }
@@ -122,7 +122,23 @@ for _i in $(seq 1 $((WINDOW_S / 2))); do
     grep -aqF "$done_marker" "$LOG" 2>/dev/null && marker_seen=1
     if [ "$live_n" -ge 3 ]; then
         booted=1
-        break
+        # The live-rootfs line appears as soon as each tenant boots, before
+        # the system POSIX probe's signal block runs. Keep the boot alive
+        # until the probe's own positive markers land (or the window ends),
+        # so a larger probe/image is not killed by the rootfs gate's early
+        # break. A probe that genuinely fails still reaches the M3 assertion
+        # below with its failure marker in the log.
+        sig_info_n=$(grep -acF 'E7SIG-INFO' "$LOG" 2>/dev/null); sig_info_n=${sig_info_n:-0}
+        sig_ok_n=$(grep -acF 'E7SIG-OK' "$LOG" 2>/dev/null); sig_ok_n=${sig_ok_n:-0}
+        sig_ret_n=$(grep -acF 'E7SIG-RET' "$LOG" 2>/dev/null); sig_ret_n=${sig_ret_n:-0}
+        ov_lnx_n=$(grep -acF 'E7SIG-LNX-105-OK' "$LOG" 2>/dev/null); ov_lnx_n=${ov_lnx_n:-0}
+        ov_sls_n=$(grep -acF 'E7SIG-SLS-105-OK' "$LOG" 2>/dev/null); ov_sls_n=${ov_sls_n:-0}
+        mp_n=$(grep -acF '[E7] linux: num=00000001 child=e7.linux.probe.0 write ok len=18 |E7MEM-MPROTECT-OK.|' "$LOG" 2>/dev/null); mp_n=${mp_n:-0}
+        if [ "$sig_info_n" -gt 0 ] && [ "$sig_ok_n" -gt 0 ] && [ "$sig_ret_n" -gt 0 ] && \
+           [ "$ov_lnx_n" -gt 0 ] && [ "$ov_sls_n" -gt 0 ] && \
+           [ "$mp_n" -gt 0 ]; then
+            break
+        fi
     fi
     if ! kill -0 "$QPID" 2>/dev/null; then
         qemu_alive=0
@@ -248,6 +264,43 @@ fi
 # at the gate (see tests/e3_multi_env_boot_check_smoke.sh arm 'two-live').
 echo "ok:   $live_n live-rootfs lines (>= 3: system POSIX + both tenants; the system's"
 echo "      watchdog respawn reports one more, which is why this can read 4)"
+
+# M3.2–M3.4 ride the same system POSIX probe: sigaltstack installs a 4 KiB
+# alternate stack, SA_SIGINFO/SA_ONSTACK put the handler on it with
+# siginfo/ucontext, and the handler writes E7SIG-INFO + E7SIG-OK through
+# SYS_SLS_SERIAL_WRITE; E7SIG-RET follows only after the restored-mask query.
+# The same boot also carries the whole-overlap regression: 105 is Linux
+# setuid AND SLS SYS_SLS_ALLOCATE.  The Linux probe's 105 must be -ENOSYS
+# (E7SIG-LNX-105-OK); this SLS POSIX sidecar's raw 105 must take the legacy
+# arm (E7SIG-SLS-105-OK).  Two tasks, one number, opposite answers.
+# These are kernel-TX lines under the same lock as the live-rootfs proof, so
+# they are not console-derived. The probe's own failure paths exit 405
+# (install/tkill), 406 (mask did not restore), 407 (siginfo/alt shape), 408
+# (sigaltstack), 409 (tkill), 410 (sigaltstack EINVAL) or 411 (105 took
+# the SLS arm); the absence check is an assertion on those exit statuses,
+# not on any arbitrary number in output.
+sig_info_n=$(grep -acF 'E7SIG-INFO' "$LOG" 2>/dev/null); sig_info_n=${sig_info_n:-0}
+sig_ok_n=$(grep -acF 'E7SIG-OK' "$LOG" 2>/dev/null); sig_ok_n=${sig_ok_n:-0}
+sig_ret_n=$(grep -acF 'E7SIG-RET' "$LOG" 2>/dev/null); sig_ret_n=${sig_ret_n:-0}
+ov_lnx_n=$(grep -acF 'E7SIG-LNX-105-OK' "$LOG" 2>/dev/null); ov_lnx_n=${ov_lnx_n:-0}
+ov_sls_n=$(grep -acF 'E7SIG-SLS-105-OK' "$LOG" 2>/dev/null); ov_sls_n=${ov_sls_n:-0}
+mp_n=$(grep -acF '[E7] linux: num=00000001 child=e7.linux.probe.0 write ok len=18 |E7MEM-MPROTECT-OK.|' "$LOG" 2>/dev/null); mp_n=${mp_n:-0}
+sig_bad=0
+grep -aqE 'status=0*4(0[5-9]|1[01])([^0-9]|$)' "$LOG" 2>/dev/null && sig_bad=1
+mp_bad=0
+grep -aqE 'num=0*19[CDEF]([^0-9A-Fa-f]|$)' "$LOG" 2>/dev/null && mp_bad=1
+if [ "$sig_info_n" -ge 1 ] && [ "$sig_ok_n" -ge 1 ] && [ "$sig_ret_n" -ge 1 ] && \
+   [ "$ov_lnx_n" -ge 1 ] && [ "$ov_sls_n" -ge 1 ] && [ "$sig_bad" -eq 0 ] && \
+   [ "$mp_n" -ge 1 ] && [ "$mp_bad" -eq 0 ]; then
+    echo "ok:   M3.2–M3.4 alt-stack + SA_SIGINFO handler ran (E7SIG-INFO, E7SIG-OK, E7SIG-RET; no 405–411)"
+    echo "ok:   105 is personality-routed: Linux=-ENOSYS (E7SIG-LNX-105-OK), SLS=legacy 0 (E7SIG-SLS-105-OK)"
+    echo "ok:   mprotect(PROT_NONE) parked the heap page and PROT_READ|PROT_WRITE restored it with its contents intact (E7MEM-MPROTECT-OK; no 412–415)"
+else
+    echo "FAIL  the M3.2–M3.4 probe did not complete its handler round trip, the 105 overlap pair, or the mprotect round trip" >&2
+    echo "      E7SIG-INFO=$sig_info_n E7SIG-OK=$sig_ok_n E7SIG-RET=$sig_ret_n LNX105=$ov_lnx_n SLS105=$ov_sls_n MPROTECT=$mp_n failure-exit=$sig_bad mp-failure=$mp_bad" >&2
+    grep -aE "E7SIG|E7MEM-MPROTECT|rt_sig|handler -> frame" "$LOG" | tail -20 >&2
+    fail=1
+fi
 
 if [ "$evidence_lost" -eq 0 ]; then
     echo "ok:   no serial evidence was dropped (the loopback deferral ring did not overflow)"

@@ -98,7 +98,7 @@ static int partition_control_may_act(const char* tag, const char* what) {
     return 1;
 }
 
-// ─── sys_sls_allocate — legacy direct-address allocation (syscall 105) ────────
+// ─── sls_legacy_allocate — direct-address allocation (syscall 105) ───────────
 // Returns the base virtual address of the named object, or 0 if not found.
 static uint64_t sls_legacy_allocate(void* arg) {
     if (!arg) return 0;
@@ -178,6 +178,44 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                                    (uint64_t)(uintptr_t)arg);
                     cur->park_syscall = 0;  /* in-flight closes HERE — the
                                             * next stray refuses again */
+                    /* M3: rt_sigreturn's reply restores the mask in the
+                     * sidecar and the saved register file here. The frame
+                     * was validated at the first trap; a non-zero reply
+                     * (sidecar refusal) leaves the handler's context alone
+                     * and returns that error, which is the most honest
+                     * answer a restorer can receive. */
+                    if (cur->sigreturn_stage_valid) {
+                        uint64_t sregs[15], srip = 0, srflags = 0, srsp = 0;
+                        int srok;
+                        cur->sigreturn_stage_valid = 0;
+                        srok = rax == 0
+                            ? linux_signal_frame_restore(
+                                  &cur->sigreturn_frame, sregs, &srip,
+                                  &srflags, &srsp)
+                            : -1;
+                        if (srok == 0) {
+                            cur->park_ctx.r15 = sregs[0];
+                            cur->park_ctx.r14 = sregs[1];
+                            cur->park_ctx.r13 = sregs[2];
+                            cur->park_ctx.r12 = sregs[3];
+                            cur->park_ctx.rbp = sregs[8];
+                            cur->park_ctx.rbx = sregs[13];
+                            cur->park_ctx.rcx = srip;
+                            cur->park_ctx.r11 = srflags;
+                            cur->park_ctx.user_rsp = srsp;
+                            cur->park_ctx.linux_args[0] = sregs[9];  /* rdi */
+                            cur->park_ctx.linux_args[1] = sregs[10]; /* rsi */
+                            cur->park_ctx.linux_args[2] = sregs[11]; /* rdx */
+                            cur->park_ctx.linux_args[3] = sregs[5];  /* r10 */
+                            cur->park_ctx.linux_args[4] = sregs[7];  /* r8  */
+                            cur->park_ctx.linux_args[5] = sregs[6];  /* r9  */
+                            cur->user_rip = srip;
+                            cur->user_rsp = srsp;
+                            rax = sregs[14];  /* saved rax */
+                        } else if (rax == 0) {
+                            rax = (uint64_t)(int64_t)(-LINUX_EINVAL);
+                        }
+                    }
                     /* E7 increment 21: the gate workload's stop, at the
                      * sysret that closes a read(fd 3). `rax` is the value
                      * the sysret will deliver and park_ctx is the read's own
@@ -412,9 +450,13 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                             }
                                         }
                                         if (v.replace) {
-                                            uint64_t old =
-                                                linux_user_page_frame(
-                                                    cur->cr3, va);
+                                            uint64_t oldleaf = 0;
+                                            uint64_t old = 0;
+                                            if (linux_user_leaf(
+                                                    cur->cr3, va,
+                                                    &oldleaf) == 0)
+                                                old = oldleaf &
+                                                      USER_PTE_FRAME_MASK;
                                             user_unmap_page(pml4, va);
                                             if (old) free_physical_ram_frame_for_partition(
                                                 (void *)(uintptr_t)old,
@@ -471,11 +513,12 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                  * (and its verdict re-runs against this
                                  * create's span and break); the kernel's
                                  * page tables are the truth about which
-                                 * pages are PRESENT, so the walk frees
-                                 * exactly the USER 4 KiB leaves it finds
-                                 * and treats an absent page as already
-                                 * unmapped (POSIX: a double unmap is
-                                 * success). Every freed frame returns to
+                                 * pages are PRESENT or parked, so the walk
+                                 * frees exactly the USER 4 KiB leaves it
+                                 * finds (including a PROT_NONE-parked
+                                 * frame) and treats an absent page as
+                                 * already unmapped (POSIX: a double unmap
+                                 * is success). Every freed frame returns to
                                  * the partition, and every touched
                                  * translation — ring-3 may have run on
                                  * the arena — is shot down with invlpg.
@@ -517,9 +560,11 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                     uint64_t va = v.unmap_va;
                                     uint64_t idx = 0, freed = 0;
                                     while (idx < v.unmap_pages) {
-                                        uint64_t f =
-                                            linux_user_page_frame(
-                                                cur->cr3, va);
+                                        uint64_t leaf = 0;
+                                        uint64_t f = 0;
+                                        if (linux_user_leaf(cur->cr3, va,
+                                                             &leaf) == 0)
+                                            f = leaf & USER_PTE_FRAME_MASK;
                                         if (f) {
                                             user_unmap_page(pml4, va);
                                             user_invlpg(va);
@@ -540,6 +585,108 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                         (unsigned long)freed,
                                         (unsigned long)(v.unmap_pages -
                                                         freed));
+                                }
+                            } else if (snum == LINUX_MPROTECT) {
+                                /* mprotect's apply half: the verdict
+                                 * re-checks the staged range against the
+                                 * kernel's own span, then the page tables
+                                 * are the truth about presence. Every page
+                                 * and its transition are checked BEFORE the
+                                 * first mutation, so an unmapped page answers
+                                 * -ENOMEM with nothing changed. PROT_NONE PARKS the
+                                 * frame in a non-present leaf (the Rust
+                                 * guard page's whole shape): ring 3 faults,
+                                 * and the same frame can be restored by a
+                                 * later PROT_READ/PROT_WRITE on the range.
+                                 * READ/WRITE restore or re-flag that same
+                                 * frame. The frame is released only by
+                                 * munmap, a FIXED replacement, or teardown.
+                                 * Both cursors stay put. */
+                                struct LinuxMprotectReq mreq;
+                                struct LinuxMemMprotectVerdict v;
+                                mreq.addr = sa0;
+                                mreq.len  = sa1;
+                                mreq.prot = sa2;
+                                v = linux_mem_mprotect_verdict(
+                                    cur->linux_heap_base,
+                                    cur->linux_heap_limit, &mreq, rax);
+                                if (v.malformed) {
+                                    kernel_serial_printf(
+                                        "[E7] mprotect reply 0x%lx for "
+                                        "request addr=0x%lx len=%lu "
+                                        "prot=0x%lx (span 0x%lx..0x%lx) "
+                                        "is not success - nothing "
+                                        "changed\n",
+                                        (unsigned long)rax,
+                                        (unsigned long)sa0,
+                                        (unsigned long)sa1,
+                                        (unsigned long)sa2,
+                                        (unsigned long)cur->linux_heap_base,
+                                        (unsigned long)cur->linux_heap_limit);
+                                    rax = (uint64_t)(int64_t)
+                                          (-LINUX_EINVAL);
+                                } else if (v.range_pages) {
+                                    uint64_t *pml4 =
+                                        (uint64_t *)(uintptr_t)cur->cr3;
+                                    uint64_t va = v.range_va;
+                                    uint64_t idx = 0;
+                                    uint64_t leaf = 0;
+                                    uint64_t next = 0;
+                                    int missing = 0;
+                                    while (idx < v.range_pages) {
+                                        if (linux_user_leaf(
+                                                cur->cr3, va, &leaf) != 0 ||
+                                            linux_mprotect_leaf_transition(
+                                                leaf, v.prot, &next) != 0) {
+                                            missing = 1;
+                                            break;
+                                        }
+                                        va += 4096;
+                                        idx++;
+                                    }
+                                    if (missing) {
+                                        kernel_serial_printf(
+                                            "[E7] mprotect addr=0x%lx "
+                                            "len=%lu: page at 0x%lx is "
+                                            "not present - -ENOMEM, "
+                                            "nothing changed\n",
+                                            (unsigned long)sa0,
+                                            (unsigned long)sa1,
+                                            (unsigned long)va);
+                                        rax = (uint64_t)(int64_t)
+                                              (-LINUX_ENOMEM);
+                                    } else {
+                                        va = v.range_va;
+                                        idx = 0;
+                                        while (idx < v.range_pages) {
+                                            uint64_t frame;
+                                            uint64_t flags;
+                                            (void)linux_user_leaf(
+                                                cur->cr3, va, &leaf);
+                                            (void)linux_mprotect_leaf_transition(
+                                                leaf, v.prot, &next);
+                                            frame = next &
+                                                    USER_PTE_FRAME_MASK;
+                                            flags = next &
+                                                    ~USER_PTE_FRAME_MASK;
+                                            user_map_page(pml4, va,
+                                                          frame, flags);
+                                            user_invlpg(va);
+                                            va += 4096;
+                                            idx++;
+                                        }
+                                        kernel_serial_printf(
+                                            "[E7] mprotect addr=0x%lx "
+                                            "len=%lu prot=0x%lx: %lu "
+                                            "page(s) %s\n",
+                                            (unsigned long)sa0,
+                                            (unsigned long)sa1,
+                                            (unsigned long)v.prot,
+                                            (unsigned long)v.range_pages,
+                                            v.prot == LINUX_PROT_NONE
+                                                ? "parked (PROT_NONE guard)"
+                                                : "re-protected");
+                                    }
                                 }
                             }
                         }
@@ -649,6 +796,17 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                 cur->reply_stage_len2  = 0;
                 cur->reply_stage_va3   = 0;
                 cur->reply_stage_valid = 0;
+                cur->sigreturn_stage_valid = 0;
+                /* M3: rt_sigreturn is not a generic forward. Its saved
+                 * frame lives at the interrupted RSP, and the mask it
+                 * restores must reach the sidecar before the saved
+                 * context does. Capture and validate the frame HERE, then
+                 * post num=15 with the old mask; the resume arm applies
+                 * the saved registers after the sidecar's reply. */
+                if (num == LINUX_RT_SIGRETURN) {
+                    int sret = linux_sigreturn_forward(cur->pid);
+                    return (uint64_t)(int64_t)sret;
+                }
                 /* E7 increment 5, plan half: BEFORE the describe (the
                  * clamp must be IN the description) and before the
                  * channel lookup (a refusal the first trap can produce
@@ -873,13 +1031,49 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                     cur->mem_stage_num   = num;
                     cur->mem_stage_a0    = largs[0];
                     cur->mem_stage_a1    = largs[1];
-                } else if (num == LINUX_MPROTECT &&
-                           linux_mprotect_refuses_wx(largs[2])) {
-                    kernel_serial_printf(
-                        "[E7] linux mprotect prot=0x%lx refused before "
-                        "post: write+execute is refused by the shim "
-                        "(§5.4)\n", (unsigned long)largs[2]);
-                    return (uint64_t)(int64_t)(-LINUX_EPERM);
+                } else if (num == LINUX_MPROTECT) {
+                    /* mprotect's first trap is the W|X rule first (the
+                     * refusal this seam has always carried), then the
+                     * guard-page shape the Rust runtime actually asks
+                     * for: a page-aligned range in this create's stamped
+                     * span with PROT_NONE. A valid request is staged so
+                     * the reply can re-check it against the kernel's own
+                     * span and visible page table; the sidecar's 10 arm
+                     * repeats the word rules as its own twin. */
+                    struct LinuxMprotectReq mreq;
+                    int mref;
+                    if (linux_mprotect_refuses_wx(largs[2])) {
+                        kernel_serial_printf(
+                            "[E7] linux mprotect prot=0x%lx refused before "
+                            "post: write+execute is refused by the shim "
+                            "(§5.4)\n", (unsigned long)largs[2]);
+                        return (uint64_t)(int64_t)(-LINUX_EPERM);
+                    }
+                    mreq.addr = largs[0];
+                    mreq.len  = largs[1];
+                    mreq.prot = largs[2];
+                    mref = linux_mem_mprotect_refusal(&mreq,
+                            cur->linux_heap_base, cur->linux_heap_limit);
+                    if (mref) {
+                        kernel_serial_printf(
+                            "[E7] linux mprotect addr=0x%lx len=%lu "
+                            "prot=0x%lx refused before post: %s\n",
+                            (unsigned long)largs[0],
+                            (unsigned long)largs[1],
+                            (unsigned long)largs[2],
+                            mref == -LINUX_EPERM
+                                ? "write+execute is refused (§5.4)"
+                                : mref == -LINUX_ENOSYS
+                                ? "executable-only protection is not served"
+                                : "malformed or outside the stamped span");
+                        return (uint64_t)(int64_t)mref;
+                    }
+                    cur->mem_stage_valid = 1;
+                    cur->mem_stage_num   = num;
+                    cur->mem_stage_a0    = largs[0];
+                    cur->mem_stage_a1    = largs[1];
+                    cur->mem_stage_a2    = largs[2];
+                    cur->mem_stage_a3    = 0;
                 }
                 /* E7 step 4 (the file class): the getdents64 cursor
                  * rides IN the description — args[5], a word the child's

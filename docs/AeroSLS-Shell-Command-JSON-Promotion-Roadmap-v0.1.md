@@ -98,16 +98,16 @@ structurally unreachable dead code, not just unused.
   depth via `ipc_queue_depth()`, which had no JSON route at all before this
   pass. A more honest promotion than a byte-for-byte alias mirror would
   have been.
-- **`sys_sls_allocate()` (kernel/stubs.c) is dead code from this call
-  path.** The legacy `write` route's first draft called this function
+- **`sys_sls_allocate()` (kernel/stubs.c) was dead code from this call
+  path; it has since been removed, leaving the C 105 arm's
+  `sls_legacy_allocate()` as the single implementation.** The legacy `write` route's first draft called this function
   directly (matching a surface-level reading of shell.c's own comment about
   `SYS_SLS_ALLOCATE`), but it turned out `stubs.c`'s `sys_sls_allocate()` is
   never declared in any header and — more importantly — isn't even what
   syscall 105 actually dispatches to. `syscall_dispatch.c` has its own
-  separate `static sls_legacy_allocate()` doing the identical
-  object_id→base_vaddr lookup; `stubs.c`'s copy appears reachable only via
-  the raw assembly syscall trampoline, a different calling convention than
-  a C-level HTTP handler should use. `api_write_post()` was rewritten to
+  separate `static sls_legacy_allocate()` doing the   identical object_id→base_vaddr lookup; the removed `stubs.c` copy was
+  reachable only via the raw assembly syscall trampoline, a different
+  calling convention than a C-level HTTP handler should use. `api_write_post()` was rewritten to
   inline `sls_legacy_allocate()`'s own lookup logic directly (that function
   is itself `static` with no header declaration), matching this codebase's
   established "inline manipulation of extern kernel state when no proper
@@ -131,9 +131,9 @@ done:
    `strcmp`/`strlen` via implicit declaration but had never called
    `strncpy`). Replaced with a manual bounded char-copy loop instead of
    adding a new implicit-declaration dependency.
-3. `api_write_post()`'s wrong-function-call bug described above (dead
-   `sys_sls_allocate()`, plus a resulting `cast to pointer from integer of
-   different size` warning). Fixed by inlining `sls_legacy_allocate()`'s
+3. `api_write_post()`'s wrong-function-call bug described above (the dead
+   `sys_sls_allocate()`, since removed, plus a resulting `cast to pointer
+   from integer of different size` warning). Fixed by inlining `sls_legacy_allocate()`'s
    logic directly, as described above.
 
 Post-fix, `gcc -fsyntax-only -std=c11 -I . -I net -I kernel net/http.c`

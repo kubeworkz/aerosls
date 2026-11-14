@@ -46,10 +46,15 @@
 //!     create), so a growth inside the span is granted and echoed as the
 //!     new break, and everything else answers the UNCHANGED current
 //!     break — Linux's own brk failure shape, never an errno;
-//!   - `mprotect` (10, §5.4's W^X refusal): write+execute together is
-//!     refused EPERM — the refusal H2's Node exclusion IS, and the twin
-//!     of the kernel's first-trap refusal (both ends exist so neither
-//!     alone is load-bearing);
+//!   - `mprotect` (10, §5.4's protection seam): write+execute together
+//!     is refused EPERM — the refusal H2's Node exclusion IS, and the
+//!     twin of the kernel's first-trap refusal (both ends exist so
+//!     neither alone is load-bearing). PROT_NONE and read-only/RW are
+//!     served as word rules; the kernel applies them only to present
+//!     leaves, and PROT_NONE parks the guard page's frame (non-present,
+//!     frame retained) so the page faults and a later PROT_READ/PROT_WRITE
+//!     can restore the same words — the Rust stack-overflow path's exact
+//!     shape;
 //!   - `rt_sigaction` (13) / `rt_sigprocmask` (14) / `tkill` (200) — the
 //!     signal seam (§10.13's step 2): the act/set bytes arrive ATTACHED
 //!     (the kernel copied them out of the child; this side never reads
@@ -88,9 +93,8 @@
 //!     partition, and neither cursor moves (a freed range is never
 //!     re-handed in v1);
 //!   - everything else — `open`/`close`/`lseek` and the rest of the fd
-//!     class (Phase 2 §3-§4), any mprotect whose prot is not
-//!     W|X (real permission changes are not landed), `clock_gettime`
-//!     (needs the clock plus
+//!     class (Phase 2 §3-§4), executable-only mprotect (ENOSYS by name),
+//!     `clock_gettime` (needs the clock plus
 //!     a child-buffer write) and any number outside the census —
 //!     is answered `ENOSYS` with its number logged, §11 Q5's recommended
 //!     policy: visible and cheap, never a silent success.
@@ -176,6 +180,8 @@ const E_TARGET: i32 = 7; /* CAP_ERR_TARGET -> -ESRCH (§5.7) */
 /// same words: num and args[1] != 0).
 const LINUX_RT_SIGACTION: u64 = 13;
 const LINUX_RT_SIGPROCMASK: u64 = 14;
+const LINUX_RT_SIGRETURN: u64 = 15;
+const LINUX_SIGALTSTACK: u64 = 131;
 const LINUX_TKILL: u64 = 200;
 /// mmap(9) — armed since E7 increment 16 (§5.4's anonymous-map half):
 /// the 9 arm below answers the measured allocator's shapes from the
@@ -200,19 +206,74 @@ const TIMESPEC_BYTES: usize = 16;
 const GATE_EPOCH_SECS: u64 = 1_767_744_000;
 const SIGACT_BYTES: usize = 32; /* kernel-ABI struct sigaction: four u64s */
 const SIGSET_BYTES: u64 = 8;    /* the sigset this seam crosses            */
+const STACK_T_BYTES: usize = 24; /* ss_sp u64, ss_flags u32 + pad, ss_size u64 */
+const SS_ONSTACK: u32 = 1;
+const SS_DISABLE: u32 = 2;
+const MINSIGSTKSZ: u64 = 2048;
+
+/// M3: the reply trailer that asks the kernel to build a signal frame.
+/// Eight little-endian words; the kernel twin is
+/// `struct LinuxSignalDelivery` in kernel/linux_abi.h.
+const LINUX_SIGNAL_DELIVERY_MAGIC: u64 = 0x5349_4744; /* "SIGD" */
+const LINUX_SIGNAL_DELIVERY_BYTES: usize = 72;
 
 /// How far a signal number may run: Linux x86-64 signals are 1..=64
 /// (1..31 standard, 32..64 real-time; 0 is tkill's existence probe and
 /// rt_sigaction's EINVAL case, never an index).
 const SIG_MAX: usize = 64;
+/// SIGKILL (9) and SIGSTOP (19) can never be blocked. Linux silently
+/// drops those bits from every mask, including a handler's mask and the
+/// mask rt_sigreturn restores.
+const SIG_UNBLOCKABLE: u64 = (1u64 << 8) | (1u64 << 18);
 
-/// Dispositions this v1 can honestly hold: SIG_DFL and SIG_IGN. A handler
-/// address is never stored — installation is refused before any mutation
-/// (no signal frames exist to invoke it with, so recording it would make
-/// every later delivery a coin flip between a silent kill and a silent
-/// nothing).
+/// Dispositions this v1 can honestly hold: SIG_DFL, SIG_IGN, and (M3) a
+/// user handler. The handler's address, flags, restorer and sa_mask are
+/// stored with it; the KERNEL owns the frame/register mechanism and this
+/// side owns every semantic decision over them (D1's split).
 const DISPO_DFL: u8 = 0;
 const DISPO_IGN: u8 = 1;
+const DISPO_HANDLER: u8 = 2;
+
+/// Linux x86-64 sa_flags this increment can honour. Anything outside the
+/// set changes the handler's calling convention or stack selection, so it
+/// is refused by name at install rather than silently approximated.
+const SA_SIGINFO: u64 = 0x4;
+const SA_ONSTACK: u64 = 0x0800_0000;
+const SA_RESTORER: u64 = 0x0400_0000;
+const SA_NODEFER: u64 = 0x4000_0000;
+const SA_RESETHAND: u64 = 0x8000_0000;
+const SA_SUPPORTED: u64 = SA_SIGINFO | SA_ONSTACK | SA_RESTORER
+    | SA_NODEFER | SA_RESETHAND;
+
+#[derive(Clone, Copy)]
+struct SigAct {
+    handler: u64,
+    flags: u64,
+    restorer: u64,
+    mask: u64,
+}
+
+impl SigAct {
+    const fn new() -> Self {
+        SigAct { handler: 0, flags: 0, restorer: 0, mask: 0 }
+    }
+}
+
+/// M3: the handler-delivery request the kernel turns into a frame plus a
+/// sysret into the handler. `oldset` is the pre-call mask the kernel writes
+/// to rt_sigprocmask's staged out-pointer (ignored for tkill).
+#[cfg_attr(test, derive(Debug))]
+#[derive(Clone, Copy)]
+struct SignalDelivery {
+    signo: u64,
+    handler: u64,
+    flags: u64,
+    restorer: u64,
+    old_mask: u64,
+    oldset: u64,
+    alt_sp: u64,
+    alt_size: u64,
+}
 
 /// A signal's DEFAULT action as POSIX defines it per signal number. The
 /// three v1 outcomes are each honest: IGNORE — the default has no
@@ -477,6 +538,10 @@ enum Answer {
     /// 14): the kill line prints `sig=<N>`, so WHICH signal killed the task
     /// is read off the line rather than reconstructed from which arms ran.
     SignalKill(u64),
+    /// M3: a recorded handler is delivered. The kernel builds the x86-64
+    /// signal frame and sysrets into `handler`; `rt_sigreturn` comes back
+    /// as a normal num=15 request so this side restores the saved mask.
+    SignalHandler(SignalDelivery),
 }
 
 /// One Linux task's §5.4 heap ledger: the budget span the create stamped
@@ -516,7 +581,14 @@ struct SigState {
     tid: u64,
     mask: u64,                /* blocked signals, bit (sig - 1), signals 1..=64 */
     pending: u64,             /* blocked signals that have arrived              */
-    dispo: [u8; SIG_MAX + 1], /* indexed by signal number: DFL / IGN only       */
+    dispo: [u8; SIG_MAX + 1], /* indexed by signal number: DFL / IGN / HANDLER  */
+    act: [SigAct; SIG_MAX + 1], /* handler details, valid iff dispo == HANDLER  */
+    alt_sp: u64,              /* sigaltstack: ss_sp, 0 when disabled            */
+    alt_size: u64,            /* sigaltstack: ss_size                           */
+    alt_flags: u32,           /* 0 / SS_DISABLE / SS_ONSTACK (query only)       */
+    alt_depth: u32,           /* handlers currently running on the alt stack    */
+    alt_trace: u64,           /* bit d: handler depth d was entered on the alt  */
+    handler_depth: u8,        /* nested handler returns: which trace bit is next */
 }
 
 impl SigState {
@@ -526,24 +598,37 @@ impl SigState {
             mask: 0,
             pending: 0,
             dispo: [DISPO_DFL; SIG_MAX + 1],
+            act: [SigAct::new(); SIG_MAX + 1],
+            alt_sp: 0,
+            alt_size: 0,
+            alt_flags: SS_DISABLE,
+            alt_depth: 0,
+            alt_trace: 0,
+            handler_depth: 0,
         }
     }
 }
 
 /// The bytes an oldact reply payload carries (E7 increment 12, §10.13's
 /// step 3) — the kernel-ABI struct sigaction as THIS state records it:
-/// the handler word at offset 0 (SIG_DFL 0 / SIG_IGN 1 — the only two
-/// dispositions v1 stores; `no` is range-checked by every caller), and
-/// every other field ZERO — sa_flags, sa_restorer and sa_mask were never
-/// stored (a handler install is refused before mutation, so nothing may
-/// depend on bytes this side declined to keep), and zero IS the honest
-/// answer rather than a default invented for the reply. Twin of the
-/// kernel's staged clamp (32 bytes — LINUX_SIGACT_BYTES), which the
-/// deliver bounds the copy against.
+/// the exact four words this state stores. SIG_DFL/SIG_IGN report the
+/// reserved handler word and zero flags/restorer/mask; a real handler
+/// reports exactly what was installed. Twin of the kernel's staged clamp
+/// (32 bytes — LINUX_SIGACT_BYTES), which the deliver bounds the copy
+/// against.
 fn old_act_bytes(sig: &SigState, no: u64) -> [u8; FD_PAYLOAD_CAP] {
     let mut b = [0u8; FD_PAYLOAD_CAP];
-    let handler: u64 = if sig.dispo[no as usize] == DISPO_IGN { 1 } else { 0 };
+    let i = no as usize;
+    let (handler, flags, restorer, mask) = match sig.dispo[i] {
+        DISPO_IGN => (1, 0, 0, 0),
+        DISPO_HANDLER => (sig.act[i].handler, sig.act[i].flags,
+                          sig.act[i].restorer, sig.act[i].mask),
+        _ => (0, 0, 0, 0),
+    };
     b[0..8].copy_from_slice(&handler.to_le_bytes());
+    b[8..16].copy_from_slice(&flags.to_le_bytes());
+    b[16..24].copy_from_slice(&restorer.to_le_bytes());
+    b[24..32].copy_from_slice(&mask.to_le_bytes());
     b
 }
 
@@ -570,6 +655,142 @@ fn sig_ok(args: &[u64; 6], old: [u8; FD_PAYLOAD_CAP]) -> Answer {
 fn sigset_payload(mask: u64) -> [u8; FD_PAYLOAD_CAP] {
     let mut b = [0u8; FD_PAYLOAD_CAP];
     b[..SIGSET_BYTES as usize].copy_from_slice(&mask.to_le_bytes());
+    b
+}
+
+/// The Linux stack_t bytes for sigaltstack: ss_sp, ss_flags (u32 plus the
+/// ABI's padding), ss_size. A disabled stack carries ss_sp=0, ss_size=0.
+fn stack_t_payload(sp: u64, flags: u32, size: u64) -> [u8; FD_PAYLOAD_CAP] {
+    let mut b = [0u8; FD_PAYLOAD_CAP];
+    b[0..8].copy_from_slice(&sp.to_le_bytes());
+    b[8..12].copy_from_slice(&flags.to_le_bytes());
+    b[16..24].copy_from_slice(&size.to_le_bytes());
+    b
+}
+
+fn read_stack_t(buf: &[u8]) -> (u64, u32, u64) {
+    (read_u64(buf, 0),
+     u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
+     read_u64(buf, 16))
+}
+
+/// M3: the mask in force while a handler runs — the old mask, the
+/// action's sa_mask, and the signal itself unless SA_NODEFER. SIGKILL and
+/// SIGSTOP can never be blocked; Linux silently drops those bits.
+fn handler_mask(sig: &SigState, no: u64) -> u64 {
+    let i = no as usize;
+    let mut m = sig.mask | sig.act[i].mask;
+    if sig.act[i].flags & SA_NODEFER == 0 {
+        m |= 1u64 << (no - 1);
+    }
+    m & !SIG_UNBLOCKABLE
+}
+
+/// M3: commit the handler-disposition decision. The sidecar's mask moves to
+/// the handler mask BEFORE the reply crosses; the kernel's frame carries the
+/// old mask, and `rt_sigreturn` sends it back through num=15. `oldset` is
+/// the pre-call mask for rt_sigprocmask's out-pointer.
+fn deliver_handler(sig: &mut SigState, no: u64, oldset: u64) -> SignalDelivery {
+    let i = no as usize;
+    let old_mask = sig.mask;
+    let flags = sig.act[i].flags;
+    let handler = sig.act[i].handler;
+    let restorer = sig.act[i].restorer;
+    sig.mask = handler_mask(sig, no);
+    let use_alt = flags & SA_ONSTACK != 0
+        && sig.alt_flags != SS_DISABLE
+        && sig.alt_sp != 0 && sig.alt_size >= 4096;
+    let (alt_sp, alt_size) = if use_alt {
+        (sig.alt_sp, sig.alt_size)
+    } else {
+        (0, 0)
+    };
+    let depth = sig.handler_depth as u32;
+    if use_alt {
+        sig.alt_depth = sig.alt_depth.saturating_add(1);
+    }
+    /* A mixed nesting (an ordinary handler delivered inside an alternate-
+     * stack handler) must not make the ordinary return pop the alt depth.
+     * The trace records which depth used the alternate stack; sigreturn pops
+     * exactly the handler that is returning. */
+    if depth < 64 {
+        if use_alt {
+            sig.alt_trace |= 1u64 << depth;
+        } else {
+            sig.alt_trace &= !(1u64 << depth);
+        }
+        sig.handler_depth = sig.handler_depth.saturating_add(1);
+    }
+    /* SA_RESETHAND resets before the handler runs, so a nested delivery
+     * of the same signal sees SIG_DFL — Linux's order. */
+    if flags & SA_RESETHAND != 0 {
+        sig.dispo[i] = DISPO_DFL;
+        sig.act[i] = SigAct::new();
+    }
+    SignalDelivery {
+        signo: no,
+        handler,
+        flags,
+        restorer,
+        old_mask,
+        oldset,
+        alt_sp,
+        alt_size,
+    }
+}
+
+/// M3.3: restore the mask saved by the handler frame and apply Linux's
+/// return-time pending rule — the next unblocked pending signal is
+/// delivered before the interrupted context resumes. One handler is
+/// delivered per sigreturn; its own return runs this arm again, so a
+/// chain of pending handlers unwinds in order. Ignore-default pending
+/// bits are consumed, a terminate-default kills, and a stop-default is
+/// still refused by name (the one default this shim cannot perform).
+fn restore_and_redeliver(sig: &mut SigState, old_mask: u64) -> Answer {
+    sig.mask = old_mask & !SIG_UNBLOCKABLE;
+    if sig.handler_depth != 0 {
+        sig.handler_depth -= 1;
+        let depth = sig.handler_depth as u32;
+        if sig.alt_trace & (1u64 << depth) != 0 {
+            sig.alt_trace &= !(1u64 << depth);
+            sig.alt_depth = sig.alt_depth.saturating_sub(1);
+        }
+    }
+    let mut pending = sig.pending & !sig.mask;
+    while pending != 0 {
+        let bit = pending.trailing_zeros();
+        pending &= !(1u64 << bit);
+        let no = bit + 1;
+        if sig.dispo[no as usize] == DISPO_IGN
+            || default_action(no as u64) == ACT_IGNORE {
+            sig.pending &= !(1u64 << bit);
+            continue;
+        }
+        if sig.dispo[no as usize] == DISPO_HANDLER {
+            sig.pending &= !(1u64 << bit);
+            return Answer::SignalHandler(deliver_handler(sig, no as u64, 0));
+        }
+        if default_action(no as u64) == ACT_TERMINATE {
+            return Answer::SignalKill(no as u64);
+        }
+        return Answer::Reply(0, E_NOSYS);
+    }
+    Answer::Reply(0, STATUS_OK)
+}
+
+/// The reply payload the kernel parses into a signal frame. Field order is
+/// the kernel struct's; changing either side alone is a protocol break.
+fn signal_delivery_payload(d: &SignalDelivery) -> [u8; LINUX_SIGNAL_DELIVERY_BYTES] {
+    let mut b = [0u8; LINUX_SIGNAL_DELIVERY_BYTES];
+    b[0..8].copy_from_slice(&LINUX_SIGNAL_DELIVERY_MAGIC.to_le_bytes());
+    b[8..16].copy_from_slice(&d.signo.to_le_bytes());
+    b[16..24].copy_from_slice(&d.handler.to_le_bytes());
+    b[24..32].copy_from_slice(&d.flags.to_le_bytes());
+    b[32..40].copy_from_slice(&d.restorer.to_le_bytes());
+    b[40..48].copy_from_slice(&d.old_mask.to_le_bytes());
+    b[48..56].copy_from_slice(&d.oldset.to_le_bytes());
+    b[56..64].copy_from_slice(&d.alt_sp.to_le_bytes());
+    b[64..72].copy_from_slice(&d.alt_size.to_le_bytes());
     b
 }
 
@@ -812,21 +1033,36 @@ fn answer(
                 Answer::Reply(0, STATUS_OK)
             }
         }
-        /* mprotect (10, LSC_MEM — §5.4's W^X): only the refusal exists
-         * in v1 — simultaneous write+execute (prot & 0x2 & 0x4) is
-         * refused EPERM, the twin of linux_mprotect_refuses_wx (the
-         * kernel refuses it first-trap, before any post; both ends
-         * exist so neither alone is the load-bearing refusal — guard
-         * clause N3 pins both). Any other prot is ENOSYS with the
-         * number logged: real permission changes are not landed. (The
-         * mem class's last seam, munmap (11), sits beside this arm at
-         * increment 25; a fake grant here would still be a page the
-         * kernel never mapped.) */
+        /* mprotect (10, LSC_MEM — §5.4's W^X and the guard-page seam):
+         * the word rules are this side's twin of the kernel's first trap.
+         * Simultaneous write+execute is EPERM; executable-only remains
+         * ENOSYS by name (the same v1 boundary as mmap); unknown prot
+         * bits, a zero/overflowing length, an unaligned address or a
+         * range outside the stamped span are EINVAL. A valid request
+         * answers success and lets the kernel change the PRESENT leaf:
+         * PROT_NONE parks the frame (present cleared), READ/WRITE restore
+         * or replace the PTE flags on that same frame.
+         * The kernel owns page presence, so this arm never fabricates a
+         * grant for a page the page tables do not carry. */
         10 => {
-            if args[2] & 0x2 != 0 && args[2] & 0x4 != 0 {
+            let (addr, len, prot) = (args[0], args[1], args[2]);
+            let len_r = match len.checked_add(0xFFF) {
+                Some(v) if len != 0 => v & !0xFFFu64,
+                _ => return Answer::Reply(0, E_INVAL),
+            };
+            if prot & !0x7 != 0 {
+                Answer::Reply(0, E_INVAL)
+            } else if args[2] & 0x2 != 0 && args[2] & 0x4 != 0 {
                 Answer::Reply(0, E_PERM)
-            } else {
+            } else if prot & 0x4 != 0 {
                 Answer::Reply(0, E_NOSYS)
+            } else if addr & 0xFFF != 0 {
+                Answer::Reply(0, E_INVAL)
+            } else if addr < brk.base || addr > brk.limit
+                   || len_r > brk.limit - addr {
+                Answer::Reply(0, E_INVAL)
+            } else {
+                Answer::Reply(0, STATUS_OK)
             }
         }
         /* exit_group (231, LSC_EXIT): the sidecar reaps, the frames return
@@ -846,14 +1082,12 @@ fn answer(
          * reply's payload — captured BEFORE any mutation below (oldact is
          * the disposition as it WAS, and a refusal arm returns with the
          * plain reply, no bytes: the deliver only copies on success). The
-         * DISPOSITION records DFL/IGN only: a handler address is ENOSYS by
-         * name BEFORE any mutation — v1 has no signal frames, so
-         * installing a handler this shim can never invoke would make every
-         * later delivery a coin flip; sa_flags and sa_mask are
-         * deliberately NOT stored (they can only ride with a handler
-         * install, which was just refused — nothing may depend on bytes
-         * this side declined to keep — and zero in the oldact payload IS
-         * that truth). */
+         * M3 records a real handler too. The ordinary sa_handler form is
+         * extended by SA_SIGINFO (siginfo/ucontext), SA_ONSTACK (the
+         * recorded alternate stack) and SA_RESETHAND (reset before entry);
+         * each is accepted only when the kernel's matching frame shape is
+         * present. sa_mask and SA_NODEFER are honoured by the mask the
+         * handler runs under. */
         LINUX_RT_SIGACTION => {
             if args[3] != SIGSET_BYTES {
                 Answer::Reply(0, E_INVAL)
@@ -885,13 +1119,86 @@ fn answer(
                 match read_u64(payload, 0) {
                     0 => {
                         sig.dispo[args[0] as usize] = DISPO_DFL;
+                        sig.act[args[0] as usize] = SigAct::new();
                         sig_ok(args, old)
                     }
                     1 => {
                         sig.dispo[args[0] as usize] = DISPO_IGN;
+                        sig.act[args[0] as usize] = SigAct::new();
                         sig_ok(args, old)
                     }
-                    _ => Answer::Reply(0, E_NOSYS), /* handler install not landed */
+                    handler => {
+                        let flags = read_u64(payload, 8);
+                        let restorer = read_u64(payload, 16);
+                        let mask = read_u64(payload, 24);
+                        if flags & !SA_SUPPORTED != 0 {
+                            /* A flag outside the handler convention this
+                             * seam can honour (SA_RESTART and the
+                             * process-wide child flags included) is
+                             * refused by name before mutation. */
+                            Answer::Reply(0, E_NOSYS)
+                        } else if restorer == 0 ||
+                                  flags & SA_RESTORER == 0 {
+                            /* x86-64 handlers return through a restorer
+                             * that invokes rt_sigreturn; without one the
+                             * handler has no return path. */
+                            Answer::Reply(0, E_NOSYS)
+                        } else {
+                            let i = args[0] as usize;
+                            sig.dispo[i] = DISPO_HANDLER;
+                            sig.act[i] = SigAct { handler, flags, restorer, mask };
+                            sig_ok(args, old)
+                        }
+                    }
+                }
+            }
+        }
+        /* sigaltstack (131, LSC_SIG — M3.2): the alternate-stack record.
+         * `ss` NULL is a query; otherwise the 24-byte Linux stack_t rides
+         * behind the request. A query returns the current record through
+         * args[1]'s staged out-pointer; a successful set returns the OLD
+         * record the same way. SS_ONSTACK is a query-only flag and changing
+         * the stack while a handler is on it is EPERM, matching Linux. */
+        LINUX_SIGALTSTACK => {
+            let old_bytes = stack_t_payload(
+                sig.alt_sp,
+                if sig.alt_depth != 0 { SS_ONSTACK } else { sig.alt_flags },
+                sig.alt_size);
+            if args[0] == 0 {
+                if args[1] != 0 {
+                    Answer::ReplyBytes(0, STACK_T_BYTES as usize, old_bytes)
+                } else {
+                    Answer::Reply(0, STATUS_OK)
+                }
+            } else if payload.len() < STACK_T_BYTES {
+                Answer::Reply(0, E_NOSYS)
+            } else {
+                let (sp, flags, size) = read_stack_t(payload);
+                if flags & !(SS_ONSTACK | SS_DISABLE) != 0 ||
+                    flags & SS_ONSTACK != 0 {
+                    Answer::Reply(0, E_INVAL)
+                } else if sig.alt_depth != 0 {
+                    Answer::Reply(0, E_PERM)
+                } else if flags & SS_DISABLE == 0 &&
+                          (sp == 0 || size < MINSIGSTKSZ ||
+                           sp.checked_add(size).is_none() ||
+                           sp + size - 1 > 0x0000_7fff_ffff_ffff) {
+                    Answer::Reply(0, E_INVAL)
+                } else {
+                    if flags & SS_DISABLE != 0 {
+                        sig.alt_sp = 0;
+                        sig.alt_size = 0;
+                        sig.alt_flags = SS_DISABLE;
+                    } else {
+                        sig.alt_sp = sp;
+                        sig.alt_size = size;
+                        sig.alt_flags = 0;
+                    }
+                    if args[1] != 0 {
+                        Answer::ReplyBytes(0, STACK_T_BYTES as usize, old_bytes)
+                    } else {
+                        Answer::Reply(0, STATUS_OK)
+                    }
                 }
             }
         }
@@ -935,7 +1242,7 @@ fn answer(
                             0 => old | set,  /* SIG_BLOCK    */
                             1 => old & !set, /* SIG_UNBLOCK  */
                             _ => set,        /* SIG_SETMASK  */
-                        };
+                        } & !SIG_UNBLOCKABLE;
                         /* Pass 1: what does the new mask REVEAL? Discards
                          * (an IGN disposition, or an ignore-by-default
                          * signal) are invisible either way; a
@@ -944,11 +1251,13 @@ fn answer(
                          * a default-stop signal refuses the CALL before
                          * anything moves (not even the mask). */
                         let mut revealed = sig.pending & !new_mask;
-                        let mut verdict = 0u8; /* 0 proceed, 1 kill, 2 refuse */
+                        let mut verdict = 0u8; /* 0 proceed, 1 kill, 2 refuse,
+                                                * 3 handler delivery */
                         let mut kill_sig = 0u64; /* WHICH revealed signal earns
                                                   * the kill — carried on the
                                                   * Answer so the line names it
                                                   * (increment 14) */
+                        let mut deliver_sig = 0u64;
                         while revealed != 0 && verdict == 0 {
                             let bit = revealed.trailing_zeros();
                             revealed &= !(1u64 << bit);
@@ -957,6 +1266,13 @@ fn answer(
                                 || default_action(sig_no as u64) == ACT_IGNORE
                             {
                                 continue; /* discard — its delivery is a no-op */
+                            } else if sig.dispo[sig_no as usize] == DISPO_HANDLER {
+                                /* The handler's mask will block this signal
+                                 * again; the kernel frame carries the
+                                 * post-unblock mask, so rt_sigreturn restores
+                                 * exactly the completed call's state. */
+                                verdict = 3;
+                                deliver_sig = sig_no as u64;
                             } else if default_action(sig_no as u64) == ACT_TERMINATE {
                                 verdict = 1;
                                 kill_sig = sig_no as u64;
@@ -967,6 +1283,12 @@ fn answer(
                         match verdict {
                             1 => Answer::SignalKill(kill_sig),
                             2 => Answer::Reply(0, E_NOSYS),
+                            3 => {
+                                sig.pending &= !(1u64 << (deliver_sig - 1));
+                                sig.mask = new_mask;
+                                Answer::SignalHandler(deliver_handler(
+                                    sig, deliver_sig, old))
+                            }
                             _ => {
                                 /* Pass 2: apply — the revealed discards
                                  * leave the pending set (pending &= mask
@@ -990,6 +1312,13 @@ fn answer(
                 }
             }
         }
+        /* rt_sigreturn (15, LSC_SIG — M3): the restorer's syscall after a
+         * handler returns. The KERNEL owns the frame and restores every
+         * saved register; this arm restores the one semantic piece the
+         * kernel does not own: the signal mask. args[0] is the frame's
+         * saved mask, so the state after return is exactly the mask that
+         * was in force when the handler was entered. */
+        LINUX_RT_SIGRETURN => restore_and_redeliver(sig, args[0]),
         /* tkill (200 — the seam's DELIVERY): the tid must be the one this
          * task's own set_tid_address answer declared, compared at u32
          * width (musl stores that echo into pt->tid as an int32 and tkill
@@ -1014,6 +1343,8 @@ fn answer(
             } else if sig.mask & (1u64 << (args[1] - 1)) != 0 {
                 sig.pending |= 1u64 << (args[1] - 1);
                 Answer::Reply(0, STATUS_OK) /* blocked: arrives as pending */
+            } else if sig.dispo[args[1] as usize] == DISPO_HANDLER {
+                Answer::SignalHandler(deliver_handler(sig, args[1], 0))
             } else {
                 match default_action(args[1]) {
                     ACT_TERMINATE => Answer::SignalKill(args[1]),
@@ -1135,6 +1466,7 @@ fn expected_req_len(num: u64, args: &[u64; 6]) -> usize {
             LINUX_SYSCALL_REQ_BYTES + args[1] as usize * LINUX_POLLFD_BYTES,
         LINUX_RT_SIGACTION if args[1] != 0 => LINUX_SYSCALL_REQ_BYTES + SIGACT_BYTES,
         LINUX_RT_SIGPROCMASK if args[1] != 0 => LINUX_SYSCALL_REQ_BYTES + SIGSET_BYTES as usize,
+        LINUX_SIGALTSTACK if args[0] != 0 => LINUX_SYSCALL_REQ_BYTES + STACK_T_BYTES,
         _ => LINUX_SYSCALL_REQ_BYTES,
     }
 }
@@ -1169,6 +1501,7 @@ fn payload_bound(num: u64, args: &[u64; 6], len: usize) -> bool {
     match num {
         LINUX_RT_SIGACTION => args[2] != 0 && len == SIGACT_BYTES,
         LINUX_RT_SIGPROCMASK => args[2] != 0 && len == SIGSET_BYTES as usize,
+        LINUX_SIGALTSTACK => args[1] != 0 && len == STACK_T_BYTES,
         LINUX_STAT | LINUX_LSTAT => args[1] != 0 && len == STAT_PAYLOAD_BYTES,
         LINUX_READ => args[1] != 0 && len <= args[2] as usize
             && len <= FD_PAYLOAD_CAP,
@@ -2961,6 +3294,20 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                     tasks()[i].used = false;
                 }
             }
+            Answer::SignalHandler(d) => {
+                /* M3: the sidecar has already moved its mask to the
+                 * handler mask; the kernel builds the frame from this
+                 * trailer and sysrets into the handler. The oldset word
+                 * is the pre-call mask for rt_sigprocmask's staged
+                 * out-pointer; tkill has no stage and the kernel ignores
+                 * it there. */
+                let bytes = signal_delivery_payload(&d);
+                let mut ex = [0u8; 56];
+                let n = fmt_sig_line(&mut ex, b" sig=", d.signo,
+                                     b" handler -> frame\n");
+                enosys_log(num as u32, &name_buf[..nlen], &ex[..n]);
+                reply_bytes(k, ch_w, rr.tag, num, 0, &bytes);
+            }
         }
     }
 }
@@ -3188,8 +3535,24 @@ mod tests {
         p[..8].copy_from_slice(&handler.to_le_bytes());
         p
     }
+    fn handler_payload(handler: u64, flags: u64, restorer: u64,
+                       mask: u64) -> [u8; SIGACT_BYTES] {
+        let mut p = [0u8; SIGACT_BYTES];
+        p[0..8].copy_from_slice(&handler.to_le_bytes());
+        p[8..16].copy_from_slice(&flags.to_le_bytes());
+        p[16..24].copy_from_slice(&restorer.to_le_bytes());
+        p[24..32].copy_from_slice(&mask.to_le_bytes());
+        p
+    }
     fn set_payload(set: u64) -> [u8; SIGSET_BYTES as usize] {
         set.to_le_bytes()
+    }
+    fn stack_payload(sp: u64, flags: u32, size: u64) -> [u8; STACK_T_BYTES] {
+        let mut b = [0u8; STACK_T_BYTES];
+        b[0..8].copy_from_slice(&sp.to_le_bytes());
+        b[8..12].copy_from_slice(&flags.to_le_bytes());
+        b[16..24].copy_from_slice(&size.to_le_bytes());
+        b
     }
 
     #[test]
@@ -3366,6 +3729,11 @@ mod tests {
         assert_eq!(sig.mask, 0b111, "BLOCK");
         assert!(matches!(run(&mut sig, 1, 0b001), Answer::Reply(0, STATUS_OK)));
         assert_eq!(sig.mask, 0b110, "UNBLOCK");
+        /* SIGKILL/SIGSTOP are silently dropped from a requested mask. */
+        assert!(matches!(run(&mut sig, 2, SIG_UNBLOCKABLE | 0b1000),
+                         Answer::Reply(0, STATUS_OK)));
+        assert_eq!(sig.mask, 0b1000, "SIGKILL/SIGSTOP cannot be blocked");
+        assert!(matches!(run(&mut sig, 2, 0b110), Answer::Reply(0, STATUS_OK)));
         /* twins of the kernel's first-trap refusals, and the mask must
          * not move on either */
         let before = sig.mask;
@@ -3388,7 +3756,8 @@ mod tests {
             }
             other => panic!("oldset twin: {:?}", other),
         }
-        assert_eq!(sig.mask, !0, "and the SETMASK itself landed");
+        assert_eq!(sig.mask, !0 & !SIG_UNBLOCKABLE,
+                   "and the SETMASK itself landed, minus the unblockable bits");
         let before = sig.mask;
         /* a `how` Linux does not have */
         let a = answer(14, &[9, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
@@ -3473,6 +3842,231 @@ mod tests {
         let a = answer(200, &[TID, 20, 0, 0, 0, 0],
                        &fds(), &mut ledger(), &mut sig, &[]);
         assert!(matches!(a, Answer::Reply(0, E_NOSYS)), "TSTP: {:?}", a);
+    }
+
+    #[test]
+    fn handler_install_delivers_a_frame_and_sigreturn_restores_the_mask() {
+        let mut sig = fresh();
+        let p = handler_payload(0x401000, SA_RESTORER, 0x402000, 1 << 2);
+        let a = answer(13, &[6, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
+                       &mut sig, &p);
+        assert!(matches!(a, Answer::Reply(0, STATUS_OK)), "install: {:?}", a);
+        assert_eq!(sig.dispo[6], DISPO_HANDLER);
+        assert_eq!(sig.act[6].handler, 0x401000);
+        assert_eq!(sig.act[6].flags, SA_RESTORER);
+        assert_eq!(sig.act[6].restorer, 0x402000);
+        assert_eq!(sig.act[6].mask, 1 << 2);
+
+        /* tkill with the signal unblocked delivers NOW. The handler mask
+         * is the old mask plus the action's sa_mask plus the signal itself
+         * (no SA_NODEFER), and the frame saves the old mask for 15. */
+        let d = match answer(200, &[TID, 6, 0, 0, 0, 0], &fds(),
+                             &mut ledger(), &mut sig, &[]) {
+            Answer::SignalHandler(d) => d,
+            other => panic!("handler delivery: {:?}", other),
+        };
+        assert_eq!(d.signo, 6);
+        assert_eq!(d.handler, 0x401000);
+        assert_eq!(d.restorer, 0x402000);
+        assert_eq!(d.old_mask, 0);
+        assert_eq!(sig.mask, (1 << 5) | (1 << 2));
+        let restored = answer(15, &[d.old_mask, 0, 0, 0, 0, 0], &fds(),
+                              &mut ledger(), &mut sig, &[]);
+        assert!(matches!(restored, Answer::Reply(0, STATUS_OK)));
+        assert_eq!(sig.mask, 0, "rt_sigreturn restores the saved mask");
+    }
+
+    #[test]
+    fn sigaltstack_round_trips_and_refuses_a_stack_change_while_in_use() {
+        let mut sig = fresh();
+        let q = answer(131, &[0, 0x5000, 0, 0, 0, 0], &fds(),
+                       &mut ledger(), &mut sig, &[]);
+        match q {
+            Answer::ReplyBytes(ret, len, b) => {
+                assert_eq!((ret, len), (0, STACK_T_BYTES));
+                assert_eq!(read_stack_t(&b), (0, SS_DISABLE, 0));
+            }
+            other => panic!("disabled query: {:?}", other),
+        }
+        let set = answer(131, &[0x4000, 0x5000, 0, 0, 0, 0], &fds(),
+                         &mut ledger(), &mut sig,
+                         &stack_payload(0x800000, 0, 8192));
+        assert!(matches!(set, Answer::ReplyBytes(0, 24, _)),
+                "set: {:?}", set);
+        assert_eq!((sig.alt_sp, sig.alt_size, sig.alt_flags),
+                   (0x800000, 8192, 0));
+        let q = answer(131, &[0, 0x5000, 0, 0, 0, 0], &fds(),
+                       &mut ledger(), &mut sig, &[]);
+        match q {
+            Answer::ReplyBytes(_, _, b) =>
+                assert_eq!(read_stack_t(&b), (0x800000, 0, 8192)),
+            other => panic!("enabled query: {:?}", other),
+        }
+        /* A handler on the alternate stack cannot change it underneath
+         * itself; Linux answers EPERM. */
+        let p = handler_payload(0x401000,
+                                SA_RESTORER | SA_ONSTACK, 0x402000, 0);
+        answer(13, &[6, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
+               &mut sig, &p);
+        let d = match answer(200, &[TID, 6, 0, 0, 0, 0], &fds(),
+                             &mut ledger(), &mut sig, &[]) {
+            Answer::SignalHandler(d) => d,
+            other => panic!("alt delivery: {:?}", other),
+        };
+        assert_eq!((d.alt_sp, d.alt_size), (0x800000, 8192));
+        assert_eq!(sig.alt_depth, 1);
+        let change = answer(131, &[0x4000, 0, 0, 0, 0, 0], &fds(),
+                            &mut ledger(), &mut sig,
+                            &stack_payload(0x900000, 0, 8192));
+        assert!(matches!(change, Answer::Reply(0, E_PERM)),
+                "change while on alt stack: {:?}", change);
+        let _ = answer(15, &[d.old_mask, 0, 0, 0, 0, 0], &fds(),
+                       &mut ledger(), &mut sig, &[]);
+        assert_eq!(sig.alt_depth, 0);
+        let disable = answer(131, &[0x4000, 0, 0, 0, 0, 0], &fds(),
+                             &mut ledger(), &mut sig,
+                             &stack_payload(0, SS_DISABLE, 0));
+        assert!(matches!(disable, Answer::Reply(0, STATUS_OK)));
+        assert_eq!((sig.alt_sp, sig.alt_size, sig.alt_flags),
+                   (0, 0, SS_DISABLE));
+    }
+
+    #[test]
+    fn nested_alt_and_normal_returns_pop_their_own_depth() {
+        let mut sig = fresh();
+        let set = answer(131, &[0x4000, 0, 0, 0, 0, 0], &fds(),
+                         &mut ledger(), &mut sig,
+                         &stack_payload(0x800000, 0, 8192));
+        assert!(matches!(set, Answer::Reply(0, STATUS_OK)), "set: {:?}", set);
+        /* 6 is ordinary; 10 carries SA_ONSTACK. Deliver 6 first, then 10
+         * inside it: the ordinary return must not consume the alt depth. */
+        let pn = handler_payload(0x401000, SA_RESTORER, 0x402000, 0);
+        answer(13, &[6, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
+               &mut sig, &pn);
+        let pa = handler_payload(0x411000,
+                                 SA_RESTORER | SA_ONSTACK, 0x412000, 0);
+        answer(13, &[10, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
+               &mut sig, &pa);
+        let dn = match answer(200, &[TID, 6, 0, 0, 0, 0], &fds(),
+                              &mut ledger(), &mut sig, &[]) {
+            Answer::SignalHandler(d) => d,
+            other => panic!("normal delivery: {:?}", other),
+        };
+        assert_eq!(sig.handler_depth, 1);
+        assert_eq!(sig.alt_depth, 0);
+        let da = match answer(200, &[TID, 10, 0, 0, 0, 0], &fds(),
+                              &mut ledger(), &mut sig, &[]) {
+            Answer::SignalHandler(d) => d,
+            other => panic!("nested alt delivery: {:?}", other),
+        };
+        assert_eq!((sig.handler_depth, sig.alt_depth), (2, 1));
+        assert!(matches!(answer(15, &[da.old_mask, 0, 0, 0, 0, 0],
+                                &fds(), &mut ledger(), &mut sig, &[]),
+                         Answer::Reply(0, STATUS_OK)));
+        assert_eq!((sig.handler_depth, sig.alt_depth), (1, 0));
+        assert!(matches!(answer(15, &[dn.old_mask, 0, 0, 0, 0, 0],
+                                &fds(), &mut ledger(), &mut sig, &[]),
+                         Answer::Reply(0, STATUS_OK)));
+        assert_eq!((sig.handler_depth, sig.alt_depth), (0, 0));
+    }
+
+    #[test]
+    fn sa_resethand_resets_the_action_before_entry() {
+        let mut sig = fresh();
+        let p = handler_payload(0x401000,
+                                SA_RESTORER | SA_RESETHAND, 0x402000, 0);
+        answer(13, &[6, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
+               &mut sig, &p);
+        let d = match answer(200, &[TID, 6, 0, 0, 0, 0], &fds(),
+                             &mut ledger(), &mut sig, &[]) {
+            Answer::SignalHandler(d) => d,
+            other => panic!("handler: {:?}", other),
+        };
+        assert_eq!(sig.dispo[6], DISPO_DFL,
+                   "SA_RESETHAND lands before the handler runs");
+        let _ = answer(15, &[d.old_mask, 0, 0, 0, 0, 0], &fds(),
+                       &mut ledger(), &mut sig, &[]);
+        assert!(matches!(answer(200, &[TID, 6, 0, 0, 0, 0], &fds(),
+                                &mut ledger(), &mut sig, &[]),
+                         Answer::SignalKill(6)));
+    }
+
+    #[test]
+    fn sigreturn_redelivers_the_next_pending_handler_on_the_restored_mask() {
+        let mut sig = fresh();
+        let p = handler_payload(0x401000, SA_RESTORER, 0x402000, 0);
+        answer(13, &[6, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
+               &mut sig, &p);
+        let first = match answer(200, &[TID, 6, 0, 0, 0, 0], &fds(),
+                                 &mut ledger(), &mut sig, &[]) {
+            Answer::SignalHandler(d) => d,
+            other => panic!("first: {:?}", other),
+        };
+        /* The handler mask blocks SIGABRT; a second self-signal pends. */
+        assert!(matches!(answer(200, &[TID, 6, 0, 0, 0, 0], &fds(),
+                                &mut ledger(), &mut sig, &[]),
+                         Answer::Reply(0, STATUS_OK)));
+        assert_ne!(sig.pending & (1 << 5), 0);
+        match answer(15, &[first.old_mask, 0, 0, 0, 0, 0], &fds(),
+                     &mut ledger(), &mut sig, &[]) {
+            Answer::SignalHandler(d) => assert_eq!(d.signo, 6),
+            other => panic!("pending redelivery: {:?}", other),
+        }
+        assert_eq!(sig.pending & (1 << 5), 0,
+                   "the redelivered signal left pending");
+    }
+
+    #[test]
+    fn unblocking_a_pending_handler_signal_delivers_with_the_oldset() {
+        let mut sig = fresh();
+        let p = handler_payload(0x401000, SA_RESTORER, 0x402000, 0);
+        answer(13, &[6, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
+               &mut sig, &p);
+        /* Block SIGABRT, post it, then unblock: raise()'s exact shape. */
+        answer(14, &[2, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
+               &mut sig, &set_payload(1 << 5));
+        let pending = answer(200, &[TID, 6, 0, 0, 0, 0], &fds(),
+                             &mut ledger(), &mut sig, &[]);
+        assert!(matches!(pending, Answer::Reply(0, STATUS_OK)));
+        let d = match answer(14, &[1, 0x4000, 0x5000, 8, 0, 0], &fds(),
+                             &mut ledger(), &mut sig,
+                             &set_payload(1 << 5)) {
+            Answer::SignalHandler(d) => d,
+            other => panic!("revealed handler: {:?}", other),
+        };
+        assert_eq!(d.signo, 6);
+        assert_eq!(d.old_mask, 0, "the completed unblock's mask is saved");
+        assert_eq!(d.oldset, 1 << 5, "oldset is the pre-call mask");
+        assert_eq!(sig.pending, 0, "the delivered signal left pending");
+        assert_eq!(sig.mask, 1 << 5, "handler mask blocks SIGABRT");
+    }
+
+    #[test]
+    fn handler_install_refuses_unsupported_flags_before_mutation() {
+        let mut sig = fresh();
+        let unsupported = SA_SUPPORTED | (1u64 << 28); /* SA_RESTART */
+        let p = handler_payload(0x401000, unsupported, 0x402000, 0);
+        let a = answer(13, &[6, 0x4000, 0, 8, 0, 0], &fds(),
+                       &mut ledger(), &mut sig, &p);
+        assert!(matches!(a, Answer::Reply(0, E_NOSYS)),
+                "unsupported flag: {:?}", a);
+        assert_eq!(sig.dispo[6], DISPO_DFL);
+        for flags in [SA_RESTORER | SA_SIGINFO, SA_RESTORER | SA_ONSTACK,
+                      SA_RESTORER | SA_RESETHAND] {
+            let mut supported = fresh();
+            let p = handler_payload(0x401000, flags, 0x402000, 0);
+            let a = answer(13, &[6, 0x4000, 0, 8, 0, 0], &fds(),
+                           &mut ledger(), &mut supported, &p);
+            assert!(matches!(a, Answer::Reply(0, STATUS_OK)),
+                    "flags 0x{:x}: {:?}", flags, a);
+            assert_eq!(supported.dispo[6], DISPO_HANDLER);
+        }
+        /* A handler with no x86-64 restorer has no return path. */
+        let p = handler_payload(0x401000, SA_RESTORER, 0, 0);
+        let a = answer(13, &[6, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
+                       &mut sig, &p);
+        assert!(matches!(a, Answer::Reply(0, E_NOSYS)));
+        assert_eq!(sig.dispo[6], DISPO_DFL);
     }
 
     #[test]
@@ -3723,6 +4317,50 @@ mod tests {
         assert!(matches!(console_read_answer(&console, 8),
                          Answer::ReplyBytes(0, 0, _)),
                 "a closed console is EOF after its buffered input is drained");
+    }
+
+    #[test]
+    fn mprotect_serves_the_rust_guard_page_and_keeps_the_word_rules() {
+        /* The E7 gate tenant's Rust std maps its alternate stack, then
+         * calls mprotect(first_page, 4096, PROT_NONE) for the guard. That
+         * exact shape must be a success at this end; ENOSYS here is what
+         * aborted the tenant before its copy continuation. */
+        let mut b = span();
+        let guard = SPAN_LIMIT - 0x1000;
+        let a = answer(10, &[guard, 0x1000, 0, 0, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(0, STATUS_OK)),
+                "PROT_NONE guard: {:?}", a);
+        /* Read-only and RW are the same word rules; they are answered
+         * for the kernel to install on the present leaf. */
+        for prot in [1u64, 2, 3] {
+            let a = answer(10, &[guard, 0x1000, prot, 0, 0, 0],
+                           &fds(), &mut b, &mut fresh(), &[]);
+            assert!(matches!(a, Answer::Reply(0, STATUS_OK)),
+                    "prot {}: {:?}", prot, a);
+        }
+        /* W|X keeps the shim's §5.4 refusal; executable-only remains
+         * ENOSYS by name; unknown bits are EINVAL. */
+        let a = answer(10, &[guard, 0x1000, 6, 0, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(0, E_PERM)), "W|X: {:?}", a);
+        let a = answer(10, &[guard, 0x1000, 4, 0, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(0, E_NOSYS)), "exec: {:?}", a);
+        let a = answer(10, &[guard, 0x1000, 8, 0, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(0, E_INVAL)), "prot bits: {:?}", a);
+        /* malformed ranges are first-trap refusals, never a fake grant */
+        for addr_len in [(guard + 1, 0x1000), (guard, 0),
+                         (SPAN_BASE - 0x1000, 0x1000),
+                         (SPAN_LIMIT, 0x1000)] {
+            let a = answer(10, &[addr_len.0, addr_len.1, 0, 0, 0, 0],
+                           &fds(), &mut b, &mut fresh(), &[]);
+            assert!(matches!(a, Answer::Reply(0, E_INVAL)),
+                    "range {:#x}/{:#x}: {:?}", addr_len.0, addr_len.1, a);
+        }
+        assert_eq!((b.cur, b.mtop), (SPAN_BASE, SPAN_LIMIT),
+                   "mprotect never moves a heap cursor");
     }
 
     #[test]

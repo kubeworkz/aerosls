@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "scheduler.h"   /* struct TaskContext */
+#include "linux_abi.h"   /* M3: struct LinuxSignalFrame (stdint-only) */
 
 /* Phase 5 wait park: the maximum number of channel endpoints one
  * k_chan_wait may poll/park on. cap.h defines the same constant, but it
@@ -257,6 +258,14 @@ struct ProcessDescriptor {
                                        // addrlen, recvfrom's sockaddr_in
     uint32_t   reply_stage_len2;       // bytes for va2 (4 or 16; 0 = none)
     uint64_t   reply_stage_va3;        // M1: recvfrom's addrlen destination
+    struct LinuxSignalFrame sigreturn_frame; // M3: the frame captured at
+                                       // rt_sigreturn's first trap. The
+                                       // sidecar request restores the mask;
+                                       // this record restores every saved
+                                       // register and the return RIP/RSP.
+    uint8_t    sigreturn_stage_valid;  // 1 between rt_sigreturn's first
+                                       // trap and its reply; cleared on
+                                       // refusal and at slot reuse.
     uint64_t   linux_dir_pos;          // step 4's getdents64 cursor: the ENTRY
                                        // INDEX the next call starts at, advanced
                                        // by the deliver only by records actually
@@ -714,6 +723,8 @@ int proc_gate_stop_at_sysret(uint64_t ret);
  * 1 if a capture was read, 0 if called from a context with no per-CPU
  * syscall scratch (pure kernel context). */
 int proc_read_linux_args(uint64_t out[6]);
+uint64_t proc_read_user_rsp(void);   /* M3: current syscall entry's RSP */
+int linux_sigreturn_forward(uint32_t pid); /* M3: capture/post num=15 */
 
 uint32_t sys_sls_getppid(void);
 uint32_t sys_sls_yield(void);   /* SYS_SLS_YIELD (300) — Phase 1.5 immediate-wake handback */

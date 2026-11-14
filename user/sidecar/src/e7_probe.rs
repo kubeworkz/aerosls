@@ -63,6 +63,37 @@ const HEAP_GUARD_BYTES: u64 = 4096;        /* cap.c: one guard page */
 const MEM_BUDGET_BYTES: u64 = 64 * 1024;   /* the BUDGET record's mem_bytes */
 const STACK_BUDGET_BYTES: u64 = 16 * 1024; /* stack_bytes; kernel floor 4096 */
 
+/// Regression probe for the number-space overlap: 105 is both Linux
+/// `setuid` and `SYS_SLS_ALLOCATE`.  This sidecar is an SLS task, so the
+/// legacy arm must answer 0 for a NULL request.  The Linux probe's 105
+/// (fixtures/e7_linux_probe.S) must answer -ENOSYS instead; the pair is
+/// the live proof that the trap path asks the personality before any
+/// number chain.  Raw `syscall`, not the Kernel facade: the facade would
+/// test a Rust wrapper, while this tests the real entry stub.  The `entry`
+/// module (and therefore the raw serial writer) exists only in the target
+/// build; host unit tests need no marker and must not pull in bare metal.
+#[cfg(feature = "target")]
+fn probe_sls_105() {
+    let mut rax: u64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") 105u64 => rax,
+            inlateout("rdi") 0u64 => _,
+            lateout("rcx") _, lateout("r11") _, lateout("rsi") _,
+            lateout("rdx") _, lateout("r8") _, lateout("r9") _,
+            lateout("r10") _,
+            options(nostack),
+        );
+    }
+    let msg: &[u8] = if rax == 0 {
+        b"E7SIG-SLS-105-OK\n"
+    } else {
+        b"E7SIG-SLS-105-BAD\n"
+    };
+    crate::entry::serial_write_raw(msg);
+}
+
 /// The caller's channel endpoints and the child's §5.4 span, as
 /// `linux::track` wants them (the ledger is born with these).
 pub struct Spawned {
@@ -81,6 +112,8 @@ pub fn spawn<K: aerosls_proto::kabi::Kernel>(
     budget_base: u64,
     budget_len: u64,
 ) -> Result<Spawned, i32> {
+    #[cfg(feature = "target")]
+    probe_sls_105();
     if budget_len < PROBE_RESERVE + 0x1000 {
         return Err(-1);
     }

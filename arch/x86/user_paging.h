@@ -12,6 +12,13 @@
 #define USER_PTE_DIRTY    (1ULL << 6)
 #define USER_PTE_PWT      (1ULL << 3)  // write-through (device WC)
 #define USER_PTE_PCD      (1ULL << 4)  // cache-disabled (device uncached)
+// Bit 58 is outside the 4 KiB frame mask (bits 12-51) and below NX; the CPU
+// ignores it in a non-present entry, and it does not collide with bit 9's
+// SLS_PTE_SLS_DISK marker. E7 mprotect parks a PROT_NONE leaf as
+// (frame | USER_PTE_PARKED), so the frame is retained for a later
+// PROT_READ/PROT_WRITE restore while ring 3 still faults. Must match
+// LINUX_PTE_PARKED in kernel/linux_abi.h.
+#define USER_PTE_PARKED   (1ULL << 58)
 // NX bit: bit 63. We define EXEC as absence of NX.
 #define USER_PTE_EXEC     0ULL          // no NX bit set = executable
 #define USER_PTE_NOEXEC   (1ULL << 63)  // NX bit set = non-executable

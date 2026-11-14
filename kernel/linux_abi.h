@@ -382,6 +382,21 @@ int linux_user_copy_out(uint8_t *dst, uint64_t root, uint64_t va, uint32_t n);
 #define LINUX_PROT_WRITE 0x2u          /*  as literals; guard N3 pins it)  */
 #define LINUX_PROT_EXEC  0x4u
 
+/* The x86-64 4 KiB PTE bits this seam edits. They are repeated here as
+ * literals because linux_abi.c is compiled into the host test without the
+ * arch headers; kernel/syscall_dispatch.c and arch/x86/user_paging.c use
+ * the same bits through their own names. Bit 58 is outside the 4 KiB frame
+ * mask (bits 12-51) and below NX; the CPU ignores it in a non-present
+ * entry, and it does not collide with SLS_PTE_SLS_DISK's bit 9. The bit
+ * marks a leaf whose frame is retained while PROT_NONE keeps the page
+ * inaccessible. */
+#define LINUX_PTE_PRESENT   (1ULL << 0)
+#define LINUX_PTE_WRITE     (1ULL << 1)
+#define LINUX_PTE_USER      (1ULL << 2)
+#define LINUX_PTE_PARKED    (1ULL << 58)
+#define LINUX_PTE_NOEXEC    (1ULL << 63)
+#define LINUX_PTE_FRAME_MASK 0x000FFFFFFFFFF000ULL
+
 /* The mmap flag bits this shim's v1 knows by name (Linux mman.h). The
  * allowlist is closed: anything outside it is refused by name at BOTH
  * ends, with the flags on the answer line. FIXED is honored; NORESERVE
@@ -529,11 +544,71 @@ linux_mem_munmap_verdict(uint64_t heap_base, uint64_t heap_limit,
                          uint64_t brk_cur,
                          const struct LinuxMunmapReq *req, uint64_t rax);
 
+/* ─── mprotect: the guard-page protection seam ───────────────────────────
+ * mprotect is the one memory-class request that changes an EXISTING leaf
+ * instead of installing or removing one. Its first trap refuses the shapes
+ * that cannot be served (unaligned address, zero/overflowing length,
+ * unknown prot bits, W|X, executable-only, or a range outside the stamped
+ * span) before any post. The sidecar's 10 arm repeats those word rules as
+ * its own twin; the reply verdict accepts only success (0), and the apply
+ * reads the present or parked leaf before changing it. A missing page is
+ * ENOMEM: Linux's own answer for an unmapped range, never a fabricated
+ * success.
+ *
+ * PROT_NONE is the Rust guard-page shape: the apply PARKS that leaf's
+ * frame (a non-present PTE carrying LINUX_PTE_PARKED) instead of freeing
+ * it, so the page faults exactly as PROT_NONE promises and a later
+ * mprotect(PROT_READ/PROT_WRITE) on the same range can restore the same
+ * frame. The parked frame is released by munmap, a FIXED replacement, or
+ * the task's teardown — never by the protection change itself. Read-only/RW
+ * protections restore or re-flag that same frame. The two heap cursors
+ * never move. */
+struct LinuxMprotectReq {
+    uint64_t addr;   /* args[0] as captured — page-aligned start         */
+    uint64_t len;    /* args[1] as captured — bytes, rounded up to pages */
+    uint64_t prot;   /* args[2] as captured — PROT_* word               */
+};
+
+int linux_mem_mprotect_refusal(const struct LinuxMprotectReq *req,
+                               uint64_t span_base, uint64_t span_limit);
+
+struct LinuxMemMprotectVerdict {
+    int      malformed;    /* 1: a success that is not this request's
+                            * zero reply — change nothing                 */
+    uint64_t range_va;     /* the first page to protect (valid iff
+                            * range_pages > 0)                           */
+    uint64_t range_pages;  /* pages in the rounded range                  */
+    uint64_t prot;         /* the staged PROT_* word to install           */
+};
+
+struct LinuxMemMprotectVerdict
+linux_mem_mprotect_verdict(uint64_t span_base, uint64_t span_limit,
+                           const struct LinuxMprotectReq *req, uint64_t rax);
+
+/* One mprotect leaf transition, without touching a page table. `leaf` is a
+ * present USER 4 KiB leaf or a parked leaf this seam made. `out_leaf` is
+ * the replacement PTE, never a freed frame:
+ *   - PROT_NONE parks the frame (present cleared, LINUX_PTE_PARKED set), so
+ *     ring 3 cannot read it and a later mprotect can restore the same words;
+ *   - READ/WRITE restores or re-flags the SAME frame, with USER access and
+ *     the shim's NX invariant.
+ * Returns -LINUX_ENOMEM for an absent/foreign leaf and -LINUX_EINVAL for a
+ * prot word the mprotect first trap would not have sent. */
+int linux_mprotect_leaf_transition(uint64_t leaf, uint64_t prot,
+                                   uint64_t *out_leaf);
+
+/* The leaf behind a user mapping, including a parked PROT_NONE leaf whose
+ * frame is retained. Ancestors must be present USER tables; a present leaf
+ * must carry USER, a non-present leaf must be exactly frame|PARKED. Returns
+ * 0 with the leaf or -LINUX_ENOMEM. Used by the mprotect apply and the
+ * munmap/replace paths so a parked mapping is still owned by this task. */
+int linux_user_leaf(uint64_t root, uint64_t va, uint64_t *leaf_out);
+
 /* The 4 KiB frame behind a user mapping, walked read-only under the
- * copy's boundaries; 0 when any level refuses (absent, supervisor, huge).
- * The unwind's read-back — and only that: a kernel address or a missing
- * page reads as 0, so a walker refusal can never free a frame that was
- * not mapped by this path. */
+ * copy's boundaries; 0 when any level refuses (absent, supervisor, huge,
+ * or parked). The unwind's read-back — and only that: a kernel address or
+ * a missing page reads as 0, so a walker refusal can never free a frame
+ * that was not mapped by this path. */
 uint64_t linux_user_page_frame(uint64_t root, uint64_t va);
 
 /* ─── E7 increment 10 (the signal seam, §10.13's step 2) — the sig class's byte crossing ──
@@ -562,6 +637,9 @@ uint64_t linux_user_page_frame(uint64_t root, uint64_t va);
  * branch (tests/linux_personality_host_test.c). */
 #define LINUX_RT_SIGACTION   13u          /* the census's sigaction row   */
 #define LINUX_RT_SIGPROCMASK 14u          /* the census's sigprocmask row */
+#define LINUX_RT_SIGRETURN   15u          /* M3: handler return + mask    */
+#define LINUX_SIGALTSTACK    131u         /* M3.2: alternate signal stack */
+#define LINUX_STACK_T_BYTES  24u          /* ss_sp, ss_flags + pad, ss_size */
 #define LINUX_SIGACT_BYTES   32u          /* kernel-ABI struct sigaction:
                                            * sa_handler, sa_flags, sa_mask,
                                            * sa_restorer — four u64s       */
@@ -579,6 +657,133 @@ struct LinuxSigCopyPlan {
  * none). Total: any other number plans nothing and refuses nothing. */
 struct LinuxSigCopyPlan linux_sig_copy_plan(uint64_t num,
                                             const uint64_t args[6]);
+
+/* ─── M3: signal-frame delivery ───────────────────────────────────────────
+ * The sidecar decides WHICH handler runs and with which mask; the kernel
+ * owns the x86-64 mechanism: write a frame on the signal stack, put the
+ * restorer word at the handler's return address, sysret into the handler,
+ * and on rt_sigreturn restore the saved userspace context. The reply
+ * trailer below is the only new wire shape; it is validated before a
+ * single user byte is written.
+ *
+ * The handler form is the ordinary sa_handler convention (one `int`
+ * argument), extended by SA_SIGINFO with siginfo/ucontext records.
+ * SA_ONSTACK selects the alternate stack the sidecar records; SA_RESETHAND
+ * resets the action before entry. */
+#define LINUX_SIGNAL_DELIVERY_MAGIC 0x53494744u /* "SIGD" */
+#define LINUX_SIGNAL_DELIVERY_BYTES 72u
+#define LINUX_SIGINFO_BYTES         128u
+#define LINUX_UCONTEXT_BYTES        256u
+#define LINUX_UCONTEXT_GREGS        26u
+#define LINUX_SI_TKILL              (-6)
+#define LINUX_SIGFRAME_MAGIC        0x53494746u /* "SIGF" */
+/* The RFLAGS bits a ring-3 task may carry through sigreturn. Reserved,
+ * IOPL, NT, RF, VM and the virtual-interrupt bits are cleared; TF/DF/AC/
+ * ID and the arithmetic flags stay, so single-step and alignment checking
+ * survive a handler. Bit 1 is the architectural fixed bit. */
+#define LINUX_USER_RFLAGS_MASK      0x00240FD7ULL
+#define LINUX_USER_RFLAGS_FIXED     0x00000202ULL /* bit 1 + IF */
+
+struct LinuxSignalDelivery {
+    uint64_t magic;      /* LINUX_SIGNAL_DELIVERY_MAGIC */
+    uint64_t signo;      /* 1..64 */
+    uint64_t handler;    /* user RIP */
+    uint64_t flags;      /* sa_flags; SA_SIGINFO/SA_ONSTACK/SA_RESETHAND */
+    uint64_t restorer;   /* user address placed at [handler_rsp] */
+    uint64_t old_mask;   /* mask saved in the frame, restored by 15 */
+    uint64_t oldset;     /* rt_sigprocmask's pre-call mask, if staged */
+    uint64_t alt_sp;     /* sigaltstack ss_sp, 0 when normal-stack */
+    uint64_t alt_size;   /* sigaltstack ss_size, 0 when normal-stack */
+};
+
+_Static_assert(sizeof(struct LinuxSignalDelivery) ==
+               LINUX_SIGNAL_DELIVERY_BYTES,
+               "the delivery trailer must stay 72 bytes on the wire");
+
+/* Register order is TaskContext's first fifteen words: r15, r14, r13,
+ * r12, r11, r10, r9, r8, rbp, rdi, rsi, rdx, rcx, rbx, rax. */
+struct LinuxSignalFrame {
+    uint64_t magic;
+    uint64_t signo;
+    uint64_t old_mask;
+    uint64_t regs[15];
+    uint64_t rip;
+    uint64_t rflags;
+    uint64_t rsp;
+};
+
+/* Linux x86-64 siginfo_t's leading kill payload. The rest of the 128-byte
+ * union is zeroed: a self-tkill carries si_code=SI_TKILL, this task's pid
+ * and uid 0. */
+struct LinuxSignalInfo {
+    int32_t  si_signo;
+    int32_t  si_errno;
+    int32_t  si_code;
+    uint32_t si_pad;
+    uint32_t si_pid;
+    uint32_t si_uid;
+    uint8_t  si_rest[LINUX_SIGINFO_BYTES - 24u];
+};
+_Static_assert(sizeof(struct LinuxSignalInfo) == LINUX_SIGINFO_BYTES,
+               "siginfo_t is 128 bytes on this ABI");
+
+/* The ucontext leading layout Linux hands a SA_SIGINFO handler: flags,
+ * link, stack_t, the 26-word sigcontext and the saved mask. The fpstate
+ * and reserved tail are zeroed; the saved general registers, RIP, RSP and
+ * flags are the fields a handler can inspect and the frame already owns. */
+struct LinuxUContext {
+    uint64_t uc_flags;
+    uint64_t uc_link;
+    uint64_t uc_stack_sp;
+    uint32_t uc_stack_flags;
+    uint32_t uc_stack_pad;
+    uint64_t uc_stack_size;
+    uint64_t uc_mcontext[LINUX_UCONTEXT_GREGS];
+    uint64_t uc_sigmask;
+};
+_Static_assert(sizeof(struct LinuxUContext) == LINUX_UCONTEXT_BYTES,
+               "the ucontext leading record must stay 256 bytes");
+
+/* The bytes written at the handler's entry RSP: the restorer word first,
+ * then the frame at the 16-aligned base the restorer's rt_sigreturn reads,
+ * followed by the SA_SIGINFO payload. Keeping the whole record as one
+ * object removes hand-built offsets from the delivery path. */
+struct LinuxSignalImage {
+    uint64_t restorer;
+    struct LinuxSignalFrame frame;
+    struct LinuxSignalInfo info;
+    struct LinuxUContext ucontext;
+};
+
+_Static_assert(sizeof(struct LinuxSignalImage) ==
+               8u + sizeof(struct LinuxSignalFrame) +
+               sizeof(struct LinuxSignalInfo) +
+               sizeof(struct LinuxUContext),
+               "the signal image must be restorer + frame + info + ucontext");
+
+/* Parse a 72-byte delivery trailer. Returns 0 or -LINUX_EPROTO. */
+int linux_signal_delivery_parse(const uint8_t *p, uint32_t n,
+                                struct LinuxSignalDelivery *out);
+
+/* Build/restore the kernel-private frame. Both are pure; the caller owns
+ * the user-memory copy. Build applies the ring-3 RFLAGS bound before the
+ * handler can enter; restore re-applies it because the frame came back
+ * from user memory. Restore returns 0 or -LINUX_EINVAL. */
+void linux_signal_frame_build(struct LinuxSignalFrame *f,
+                              const uint64_t regs[15], uint64_t rip,
+                              uint64_t rflags, uint64_t rsp,
+                              uint64_t signo, uint64_t old_mask);
+int linux_signal_frame_restore(const struct LinuxSignalFrame *f,
+                               uint64_t regs[15], uint64_t *rip,
+                               uint64_t *rflags, uint64_t *rsp);
+
+/* The SA_SIGINFO side records, pure over the same saved frame. */
+void linux_signal_info_build(struct LinuxSignalInfo *si, uint64_t signo,
+                             uint32_t pid);
+void linux_signal_ucontext_build(struct LinuxUContext *uc,
+                                 const struct LinuxSignalFrame *f,
+                                 uint64_t alt_sp, uint64_t alt_size,
+                                 int on_altstack);
 
 /* ─── E7 increment 12 (the reply payload, §10.13's step 3) — the copy-IN ───
  * The reply half of the fd class's byte crossing: increment 5 taught the

@@ -158,8 +158,9 @@ const struct LinuxSyscallEntry linux_syscall_table[] = {
     {  10, LSC_MEM,    LSC_F_REFUSES_WX }, /* mprotect — W|X refused (§5.4) */
     {  11, LSC_MEM,    0 },   /* munmap */
     {  12, LSC_MEM,    0 },   /* brk — §5.4 bump pointer in the budget */
-    {  13, LSC_SIG,    0 },   /* rt_sigaction — recorded; handler installs refused */
-    {  14, LSC_SIG,    0 },   /* rt_sigprocmask — recorded; unblock delivers (step 2) */
+    {  13, LSC_SIG,    0 },   /* rt_sigaction — DFL/IGN/handler recorded */
+    {  14, LSC_SIG,    0 },   /* rt_sigprocmask — unblock delivers handlers too */
+    {  15, LSC_SIG,    0 },   /* rt_sigreturn — M3: restore mask + context */
     /* M1 — the network bridge's eight numbers. Their semantics are the
      * sidecar's SocketOps, exactly as the fd class's are the VFS's. */
     {  41, LSC_NET,    0 },   /* socket */
@@ -177,7 +178,7 @@ const struct LinuxSyscallEntry linux_syscall_table[] = {
     {  82, LSC_FD,     0 },   /* rename — the .img.partial -> final swap */
     {  83, LSC_FD,     0 },   /* mkdir */
     {  87, LSC_FD,     0 },   /* unlink */
-    { 131, LSC_SIG,    0 },   /* sigaltstack — recorded, never delivered */
+    { 131, LSC_SIG,    0 },   /* sigaltstack — M3.2 alternate-stack record */
     { 158, LSC_MSR,    0 },   /* arch_prctl(ARCH_SET_FS) — §5.3's one MSR */
     { 217, LSC_FD,     0 },   /* getdents64 */
     { 218, LSC_LOCAL,  0 },   /* set_tid_address — single-threaded: stored and ignored */
@@ -365,7 +366,17 @@ struct LinuxFdWritePlan linux_fd_write_plan(uint64_t num,
                                   * writability boundary */
 #define LAB_PTE_USER     0x4ULL
 #define LAB_PTE_PS       0x80ULL
+#define LAB_PTE_PARKED   LINUX_PTE_PARKED
 #define LAB_PTE_FRAME    0x000FFFFFFFFFF000ULL
+
+/* Bit 9 is SLS_PTE_SLS_DISK (include/sls_mmu.h), and the parked marker
+ * must stay outside the physical frame mask. Both are load-bearing: the
+ * page-table/migration readers key on bit 9, and a frame bit would collide
+ * with a real address. */
+_Static_assert((LINUX_PTE_PARKED & (1ULL << 9)) == 0,
+               "parked PTE bit must not collide with SLS_PTE_SLS_DISK");
+_Static_assert((LINUX_PTE_PARKED & LINUX_PTE_FRAME_MASK) == 0,
+               "parked PTE bit must stay outside the frame mask");
 
 /* The copy. Read-ONLY by construction: every level is checked before the
  * next pointer is followed, and nothing anywhere writes a table — the
@@ -391,11 +402,13 @@ struct LinuxFdWritePlan linux_fd_write_plan(uint64_t num,
  * too — effective writability is the conjunction of all four entries,
  * and a writable leaf under a read-only directory would let the copy-in
  * launder a write through a page the child itself could not write.
+ * allow_parked adds the one exception at the 4 KiB leaf: a non-present
+ * frame|PARKED entry is returned to mprotect/munmap, never to a copy.
  *
  * Frame -> pointer is the identity map's own claim (boot.asm: "the
  * physical addr = virtual addr"). */
 static int lab_walk_leaf(uint64_t root, uint64_t va, uint64_t *leaf_out,
-                         int require_rw)
+                         int require_rw, int allow_parked)
 {
     const uint64_t *tbl = (const uint64_t *)(uintptr_t)(root & LAB_PTE_FRAME);
     uint64_t leaf = 0;
@@ -404,7 +417,18 @@ static int lab_walk_leaf(uint64_t root, uint64_t va, uint64_t *leaf_out,
     for (lvl = 0; lvl < 4; lvl++) {
         unsigned shift = 39u - 9u * lvl;
         uint64_t e = tbl[(va >> shift) & 0x1FF];
-        if (!(e & LAB_PTE_PRESENT)) return -LINUX_EFAULT;
+        if (!(e & LAB_PTE_PRESENT)) {
+            /* Only the parked-aware caller may follow a parked leaf; the
+             * copy walkers must refuse it exactly as ring 3 would. */
+            if (allow_parked && lvl == 3 && !require_rw &&
+                (e & LAB_PTE_PARKED) &&
+                (e & ~(LAB_PTE_FRAME | LAB_PTE_PARKED)) == 0 &&
+                (e & LAB_PTE_FRAME)) {
+                if (leaf_out) *leaf_out = e;
+                return 0;
+            }
+            return -LINUX_EFAULT;
+        }
         if ((lvl == 1 || lvl == 2) && (e & LAB_PTE_PS))
             return -LINUX_EFAULT;   /* a huge page is not this shim's
                                      * user shape; refused by name */
@@ -422,7 +446,8 @@ int linux_user_copy_out(uint8_t *dst, uint64_t root, uint64_t va, uint32_t n)
     if (!dst) return -LINUX_EFAULT;
     while (n) {
         uint64_t leaf = 0;
-        if (lab_walk_leaf(root, va, &leaf, 0) != 0) return -LINUX_EFAULT;
+        if (lab_walk_leaf(root, va, &leaf, 0, 0) != 0)
+            return -LINUX_EFAULT;
         {
             uint32_t off = (uint32_t)(va & (LINUX_PAGE_SIZE - 1u));
             uint32_t page_left = LINUX_PAGE_SIZE - off;
@@ -461,6 +486,18 @@ struct LinuxSigCopyPlan linux_sig_copy_plan(uint64_t num, const uint64_t args[6]
     p.src = 0;
     p.len = 0;
     p.refuse = 0;
+    if (num == LINUX_SIGALTSTACK) {
+        /* sigaltstack's new stack_t is 24 bytes; there is no sigsetsize
+         * argument, so the generic sig-class check below must not run. */
+        if (!args || args[0] == 0) return p;
+        p.src = args[0];
+        p.len = LINUX_STACK_T_BYTES;
+        span_end = p.src + (uint64_t)p.len;
+        if (!linux_fs_addr_is_user_canonical(p.src) || span_end < p.src ||
+            (span_end - 1) > LINUX_USER_ADDR_MAX)
+            p.refuse = -LINUX_EFAULT;
+        return p;
+    }
     if (num != LINUX_RT_SIGACTION && num != LINUX_RT_SIGPROCMASK)
         return p;   /* not a sig-class crossing */
     if (!args) return p;
@@ -483,6 +520,134 @@ struct LinuxSigCopyPlan linux_sig_copy_plan(uint64_t num, const uint64_t args[6]
         p.refuse = -LINUX_EFAULT;
     }
     return p;
+}
+
+/* ─── M3: the signal-frame record ──────────────────────────────────────────
+ * The trailer crosses the channel as bytes (no alignment promise), so both
+ * readers below assemble little-endian words byte-wise, exactly as
+ * linux_syscall_apply_reply and k_linux_deliver already do. Nothing here
+ * touches user memory: the frame builder is pure over the register array
+ * the caller seeds, and the caller uses linux_user_copy_in for the write. */
+static uint64_t linux_sig_le64(const uint8_t *p)
+{
+    uint64_t v = 0;
+    uint32_t i;
+    for (i = 0; i < 8; i++) v |= (uint64_t)p[i] << (8u * i);
+    return v;
+}
+
+int linux_signal_delivery_parse(const uint8_t *p, uint32_t n,
+                                struct LinuxSignalDelivery *out)
+{
+    if (!p || !out || n != LINUX_SIGNAL_DELIVERY_BYTES)
+        return -LINUX_EPROTO;
+    out->magic    = linux_sig_le64(p + 0);
+    out->signo    = linux_sig_le64(p + 8);
+    out->handler  = linux_sig_le64(p + 16);
+    out->flags    = linux_sig_le64(p + 24);
+    out->restorer = linux_sig_le64(p + 32);
+    out->old_mask = linux_sig_le64(p + 40);
+    out->oldset   = linux_sig_le64(p + 48);
+    out->alt_sp   = linux_sig_le64(p + 56);
+    out->alt_size = linux_sig_le64(p + 64);
+    if (out->magic != LINUX_SIGNAL_DELIVERY_MAGIC ||
+        out->signo == 0 || out->signo > 64 ||
+        out->handler == 0 || out->restorer == 0)
+        return -LINUX_EPROTO;
+    return 0;
+}
+
+void linux_signal_frame_build(struct LinuxSignalFrame *f,
+                              const uint64_t regs[15], uint64_t rip,
+                              uint64_t rflags, uint64_t rsp,
+                              uint64_t signo, uint64_t old_mask)
+{
+    uint32_t i;
+    if (!f) return;
+    f->magic = LINUX_SIGFRAME_MAGIC;
+    f->signo = signo;
+    f->old_mask = old_mask;
+    for (i = 0; i < 15; i++) f->regs[i] = regs ? regs[i] : 0;
+    f->rip = rip;
+    f->rflags = (rflags & LINUX_USER_RFLAGS_MASK) | LINUX_USER_RFLAGS_FIXED;
+    f->rsp = rsp;
+}
+
+void linux_signal_info_build(struct LinuxSignalInfo *si, uint64_t signo,
+                             uint32_t pid)
+{
+    uint32_t i;
+    if (!si) return;
+    si->si_signo = (int32_t)signo;
+    si->si_errno = 0;
+    si->si_code = LINUX_SI_TKILL;
+    si->si_pad = 0;
+    si->si_pid = pid;
+    si->si_uid = 0;
+    for (i = 0; i < (uint32_t)sizeof si->si_rest; i++) si->si_rest[i] = 0;
+}
+
+void linux_signal_ucontext_build(struct LinuxUContext *uc,
+                                 const struct LinuxSignalFrame *f,
+                                 uint64_t alt_sp, uint64_t alt_size,
+                                 int on_altstack)
+{
+    uint32_t i;
+    if (!uc || !f) return;
+    uc->uc_flags = 0;
+    uc->uc_link = 0;
+    uc->uc_stack_sp = alt_sp;
+    uc->uc_stack_flags = on_altstack ? 1u : 0u;  /* SS_ONSTACK when in use */
+    uc->uc_stack_pad = 0;
+    uc->uc_stack_size = alt_size;
+    for (i = 0; i < LINUX_UCONTEXT_GREGS; i++) uc->uc_mcontext[i] = 0;
+    /* Linux x86-64 sigcontext order. */
+    uc->uc_mcontext[0]  = f->regs[7];  /* r8  */
+    uc->uc_mcontext[1]  = f->regs[6];  /* r9  */
+    uc->uc_mcontext[2]  = f->regs[5];  /* r10 */
+    uc->uc_mcontext[3]  = f->regs[4];  /* r11 */
+    uc->uc_mcontext[4]  = f->regs[3];  /* r12 */
+    uc->uc_mcontext[5]  = f->regs[2];  /* r13 */
+    uc->uc_mcontext[6]  = f->regs[1];  /* r14 */
+    uc->uc_mcontext[7]  = f->regs[0];  /* r15 */
+    uc->uc_mcontext[8]  = f->regs[9];  /* rdi */
+    uc->uc_mcontext[9]  = f->regs[10]; /* rsi */
+    uc->uc_mcontext[10] = f->regs[8];  /* rbp */
+    uc->uc_mcontext[11] = f->regs[13]; /* rbx */
+    uc->uc_mcontext[12] = f->regs[11]; /* rdx */
+    uc->uc_mcontext[13] = f->regs[14]; /* rax */
+    uc->uc_mcontext[14] = f->regs[12]; /* rcx */
+    uc->uc_mcontext[15] = f->rsp;
+    uc->uc_mcontext[16] = f->rip;
+    uc->uc_mcontext[17] = f->rflags;
+    uc->uc_mcontext[18] = 0x33u;       /* cs  */
+    uc->uc_mcontext[19] = 0;           /* gs  */
+    uc->uc_mcontext[20] = 0;           /* fs  (live base is separate) */
+    uc->uc_mcontext[21] = 0x2bu;       /* ss  */
+    uc->uc_mcontext[22] = 0;           /* err */
+    uc->uc_mcontext[23] = 0;           /* trapno */
+    uc->uc_mcontext[24] = f->old_mask;
+    uc->uc_mcontext[25] = 0;           /* cr2 */
+    uc->uc_sigmask = f->old_mask;
+}
+
+int linux_signal_frame_restore(const struct LinuxSignalFrame *f,
+                               uint64_t regs[15], uint64_t *rip,
+                               uint64_t *rflags, uint64_t *rsp)
+{
+    uint32_t i;
+    if (!f || !regs || !rip || !rflags || !rsp)
+        return -LINUX_EINVAL;
+    if (f->magic != LINUX_SIGFRAME_MAGIC || f->signo == 0 ||
+        f->signo > 64 ||
+        !linux_fs_addr_is_user_canonical(f->rip) ||
+        !linux_fs_addr_is_user_canonical(f->rsp))
+        return -LINUX_EINVAL;
+    for (i = 0; i < 15; i++) regs[i] = f->regs[i];
+    *rip = f->rip;
+    *rflags = (f->rflags & LINUX_USER_RFLAGS_MASK) | LINUX_USER_RFLAGS_FIXED;
+    *rsp = f->rsp;
+    return 0;
 }
 
 /* ─── E7 increment 11 (§10.13's step-2 coda) — poll (7): the waiting-poll refusal ──
@@ -753,11 +918,124 @@ linux_mem_munmap_verdict(uint64_t heap_base, uint64_t heap_limit,
     return v;
 }
 
+/* ─── mprotect — the guard-page seam ─────────────────────────────────────── */
+int linux_mem_mprotect_refusal(const struct LinuxMprotectReq *req,
+                               uint64_t span_base, uint64_t span_limit)
+{
+    uint64_t len_r;
+
+    if (!req) return -LINUX_EINVAL;
+    if (req->len == 0) return -LINUX_EINVAL;
+    if (req->addr & (LINUX_PAGE_SIZE - 1)) return -LINUX_EINVAL;
+    if (req->len > UINT64_MAX - (LINUX_PAGE_SIZE - 1))
+        return -LINUX_EINVAL;
+    len_r = (req->len + LINUX_PAGE_SIZE - 1)
+          & ~((uint64_t)LINUX_PAGE_SIZE - 1);
+
+    if (req->prot & ~(LINUX_PROT_READ | LINUX_PROT_WRITE |
+                      LINUX_PROT_EXEC)) return -LINUX_EINVAL;
+    if (linux_mprotect_refuses_wx(req->prot)) return -LINUX_EPERM;
+    if (req->prot & LINUX_PROT_EXEC) return -LINUX_ENOSYS;
+
+    /* The stamped span is the kernel's own budget. mprotect may protect
+     * any present page in it — including the brk heap below the current
+     * break and the anonymous-map region above it. It never reaches the
+     * task's image/stack, which live outside this span. */
+    if (req->addr < span_base || req->addr > span_limit)
+        return -LINUX_EINVAL;
+    if (len_r > span_limit - req->addr) return -LINUX_EINVAL;
+    return 0;
+}
+
+struct LinuxMemMprotectVerdict
+linux_mem_mprotect_verdict(uint64_t span_base, uint64_t span_limit,
+                           const struct LinuxMprotectReq *req, uint64_t rax)
+{
+    struct LinuxMemMprotectVerdict v;
+    uint64_t len_r;
+
+    v.malformed = 0;
+    v.range_va = 0;
+    v.range_pages = 0;
+    v.prot = req ? req->prot : 0;
+
+    /* A negative reply is the sidecar's refusal: nothing changes and its
+     * errno rides the §5.7 map as usual. mprotect's success value is 0,
+     * so any other non-negative answer is a lie the kernel must not act
+     * on. */
+    if ((int64_t)rax < 0) return v;
+    if (rax != 0) {
+        v.malformed = 1;
+        return v;
+    }
+    if (linux_mem_mprotect_refusal(req, span_base, span_limit) != 0) {
+        v.malformed = 1;
+        return v;
+    }
+
+    len_r = (req->len + LINUX_PAGE_SIZE - 1)
+          & ~((uint64_t)LINUX_PAGE_SIZE - 1);
+    v.range_va = req->addr;
+    v.range_pages = len_r / LINUX_PAGE_SIZE;
+    v.prot = req->prot;
+    return v;
+}
+
+/* The protection transition itself. The frame is the one word mprotect
+ * must not lose: PROT_NONE parks it in a non-present PTE (bit 58 is
+ * software-only, so ring 3 still faults), and READ/WRITE restores the same
+ * frame. Nothing here frees or allocates. */
+int linux_mprotect_leaf_transition(uint64_t leaf, uint64_t prot,
+                                   uint64_t *out_leaf)
+{
+    uint64_t frame;
+    uint64_t flags;
+
+    if (!out_leaf) return -LINUX_EINVAL;
+    if (prot & ~(LINUX_PROT_READ | LINUX_PROT_WRITE))
+        return -LINUX_EINVAL;
+
+    if (leaf & LINUX_PTE_PRESENT) {
+        if (!(leaf & LINUX_PTE_USER)) return -LINUX_ENOMEM;
+    } else {
+        /* A parked leaf is exactly (frame | PARKED): no present bit, no
+         * user bit, and no unrelated software bit pretending to be one. */
+        if (!(leaf & LINUX_PTE_PARKED) ||
+            (leaf & ~(LINUX_PTE_FRAME_MASK | LINUX_PTE_PARKED)) != 0)
+            return -LINUX_ENOMEM;
+    }
+
+    frame = leaf & LINUX_PTE_FRAME_MASK;
+    if (!frame) return -LINUX_ENOMEM;
+
+    if (prot == LINUX_PROT_NONE) {
+        *out_leaf = frame | LINUX_PTE_PARKED;
+        return 0;
+    }
+
+    flags = LINUX_PTE_PRESENT | LINUX_PTE_USER | LINUX_PTE_NOEXEC;
+    if (prot & LINUX_PROT_WRITE) flags |= LINUX_PTE_WRITE;
+    *out_leaf = frame | flags;
+    return 0;
+}
+
+/* The parked-aware entry to the one leaf walk. A PROT_NONE leaf is not
+ * present, so the copy callers (allow_parked=0) refuse it exactly as ring 3
+ * would; mprotect and munmap use this wrapper to find the frame they own.
+ * The walker's refusals stay -EFAULT; this seam's contract says -ENOMEM. */
+int linux_user_leaf(uint64_t root, uint64_t va, uint64_t *leaf_out)
+{
+    if (lab_walk_leaf(root, va, leaf_out, 0, 1) != 0)
+        return -LINUX_ENOMEM;
+    return 0;
+}
+
 uint64_t linux_user_page_frame(uint64_t root, uint64_t va)
 {
     uint64_t leaf = 0;
-    if (lab_walk_leaf(root, va, &leaf, 0) != 0) return 0;
-    return leaf & LAB_PTE_FRAME;
+    if (linux_user_leaf(root, va, &leaf) != 0) return 0;
+    if (!(leaf & LINUX_PTE_PRESENT)) return 0;   /* parked: no PRESENT frame */
+    return leaf & LINUX_PTE_FRAME_MASK;
 }
 
 /* ─── E7 increment 12 (the reply payload, §10.13's step 3) — the copy-IN ───
@@ -772,7 +1050,7 @@ uint64_t linux_user_page_frame(uint64_t root, uint64_t va)
  * validate EVERY page of the span before a single byte moves. */
 static int lab_walk_leaf_rw(uint64_t root, uint64_t va, uint64_t *leaf_out)
 {
-    return lab_walk_leaf(root, va, leaf_out, 1);
+    return lab_walk_leaf(root, va, leaf_out, 1, 0);
 }
 
 int linux_user_copy_in(const uint8_t *src, uint64_t root, uint64_t va,
@@ -845,7 +1123,13 @@ struct LinuxFdReplyPlan linux_fd_reply_plan(uint64_t num, const uint64_t args[6]
 
     /* The sig class — increment 12's copy-IN, unchanged in shape, now
      * named as the RAW family (the payload lands verbatim). */
-    if (num == LINUX_RT_SIGACTION || num == LINUX_RT_SIGPROCMASK) {
+    if (num == LINUX_SIGALTSTACK) {
+        if (args[1] == 0) return p;   /* no old stack_t: nothing owed */
+        p.dst  = args[1];
+        p.len  = LINUX_STACK_T_BYTES;
+        p.aux  = p.len;
+        p.kind = LINUX_STAGE_RAW;
+    } else if (num == LINUX_RT_SIGACTION || num == LINUX_RT_SIGPROCMASK) {
         if (args[2] == 0) return p;   /* no out-pointer: nothing owed */
         p.dst  = args[2];
         p.len  = (num == LINUX_RT_SIGACTION) ? LINUX_SIGACT_BYTES

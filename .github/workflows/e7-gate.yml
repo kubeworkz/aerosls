@@ -1,0 +1,93 @@
+name: E7 operational gate
+
+# The per-push CI job runs the source clauses and the committed replay guard;
+# it cannot afford the full gate. This workflow is the operational evidence
+# path: one scheduled/manual run invokes the same `make e7-gate` target,
+# builds the drill/teeth/selfkill profiles, boots QEMU, and uploads the
+# curated evidence directory. The schedule is weekly because the gate builds
+# three images and takes about an hour; dispatch it for a release check.
+#
+# A red arm still uploads the completed evidence and the failed arm's
+# harness.log/manifest entry (the upload step is `if: always()`).
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 4 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e7-gate
+  cancel-in-progress: false
+
+jobs:
+  e7-gate:
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: aerosls2
+
+      - name: Keep the host awake for this job
+        run: bash tests/runner_host_keep_awake.sh start
+        working-directory: aerosls2
+
+      - name: Require the qemu-sls checkout credential
+        env:
+          QEMU_SLS_PAT: ${{ secrets.QEMU_SLS_PAT }}
+        run: |
+          set -e
+          if [ -z "${QEMU_SLS_PAT:-}" ]; then
+            echo "::error::QEMU_SLS_PAT is not configured; the kernel link needs the private qemu-sls checkout."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          repository: kubeworkz/qemu-sls
+          path: qemu
+          token: ${{ secrets.QEMU_SLS_PAT }}
+          fetch-depth: 1
+
+      - name: Kernel build tools (nasm, grub, qemu)
+        run: sudo apt-get update && sudo apt-get install -y nasm grub-pc-bin mtools xorriso qemu-system-x86
+
+      - name: Ensure the Rust bare-metal toolchain (cargo + x86_64-unknown-none)
+        run: |
+          set -e
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup show active-toolchain >/dev/null 2>&1 || rustup default stable
+          cargo --version
+          rustup target add x86_64-unknown-none
+          rustup target list --installed
+
+      - name: Run the one-command E7 gate
+        working-directory: aerosls2
+        env:
+          X86_CC: gcc
+          X86_LD: ld
+          E7_GATE_EVIDENCE: evidence/e7_gate_ci_${{ github.run_id }}_${{ github.run_attempt }}
+        # X86_CC/X86_LD the way kernel-guards builds on this runner. The
+        # driver reserves its own evidence path; the run's stdout/stderr and
+        # each arm's harness.log both land under that path.
+        run: make e7-gate
+
+      - name: Upload the E7 evidence bundle
+        # always() is deliberate: a red arm's partial evidence must still be
+        # retained. The exact path is the one E7_GATE_EVIDENCE hands to the
+        # driver; if-no-files-found:error means a green run with no bundle
+        # fails the job instead of producing a green artifact-less run.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e7-gate-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: aerosls2/evidence/e7_gate_ci_${{ github.run_id }}_${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 30

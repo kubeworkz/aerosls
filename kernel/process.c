@@ -210,6 +210,15 @@ static void proc_clear_resume_state(struct ProcessDescriptor* pd) {
     pd->reply_stage_va2 = 0;
     pd->reply_stage_len2 = 0;
     pd->reply_stage_va3 = 0;
+    /* M3: an unanswered rt_sigreturn frame must not survive into a reused
+     * slot — restoring it would sysret the next occupant into its
+     * predecessor's handler context. */
+    pd->sigreturn_stage_valid = 0;
+    {
+        uint64_t* sf = (uint64_t*)&pd->sigreturn_frame;
+        for (int i = 0; i < (int)(sizeof(pd->sigreturn_frame) / sizeof(uint64_t)); i++)
+            sf[i] = 0;
+    }
     pd->linux_dir_pos = 0;
 }
 
@@ -236,6 +245,16 @@ int proc_read_linux_args(uint64_t out[6]) {
                      :
                      : "memory");
     return 1;
+}
+
+/* M3: the current syscall entry's user RSP. rt_sigreturn must find its
+ * frame at the RSP the restorer's `syscall` instruction left there; that
+ * value is the per-CPU scratch at [gs:0], not park_ctx (which is only
+ * populated when a forward actually parks). */
+uint64_t proc_read_user_rsp(void) {
+    uint64_t v;
+    __asm__ volatile("movq %%gs:0, %0" : "=r"(v) : : "memory");
+    return v;
 }
 
 // ─── process_init ─────────────────────────────────────────────────────────────
@@ -2433,7 +2452,49 @@ void cap_recv_resume(struct ProcessDescriptor* pd) {
         "movq %%rax, %%gs:0x78\n\t"   /* r9 */
         "mov %2, %%rsi\n\t"  /* arg = parked request (recv or chan wait) */
         "mov %3, %%edi\n\t"  /* num = pd->park_syscall (recv or chan wait) */
+        "pushq %%r12\n\t"          /* preserve C's callee-saved r12 */
+        "movq %1, %%r12\n\t"       /* park_ctx pointer survives the call */
         "call do_syscall\n\t"
+        /* M3: the reply may have changed park_ctx into a SIGNAL HANDLER
+         * entry or an rt_sigreturn restore. The frame above was pushed
+         * BEFORE the call, so re-stamp it (and the per-CPU user RSP and
+         * argument block) from park_ctx now. r12 is callee-saved through
+         * do_syscall; save it, hold the park_ctx pointer there, and use
+         * the kernel stack below the already-pushed frame as scratch. A
+         * normal reply writes back identical values. */
+        "pushq %%rax\n\t"          /* save do_syscall's return value */
+        "movq 0(%%r12), %%rax\n\t"
+        "movq %%rax, 16(%%rsp)\n\t" /* pushed r11 */
+        "movq 8(%%r12), %%rax\n\t"
+        "movq %%rax, 24(%%rsp)\n\t" /* pushed rcx (RIP) */
+        "movq 16(%%r12), %%rax\n\t"
+        "movq %%rax, 32(%%rsp)\n\t" /* pushed r15 */
+        "movq 24(%%r12), %%rax\n\t"
+        "movq %%rax, 40(%%rsp)\n\t" /* pushed r14 */
+        "movq 32(%%r12), %%rax\n\t"
+        "movq %%rax, 48(%%rsp)\n\t" /* pushed r13 */
+        "movq 40(%%r12), %%rax\n\t"
+        "movq %%rax, 56(%%rsp)\n\t" /* pushed r12 */
+        "movq 48(%%r12), %%rax\n\t"
+        "movq %%rax, 64(%%rsp)\n\t" /* pushed rbx */
+        "movq 56(%%r12), %%rax\n\t"
+        "movq %%rax, 72(%%rsp)\n\t" /* pushed rbp */
+        "movq 64(%%r12), %%rax\n\t"
+        "movq %%rax, %%gs:0\n\t"   /* user RSP for syscall_return_path */
+        "movq 72(%%r12), %%rax\n\t"
+        "movq %%rax, %%gs:0x50\n\t"
+        "movq 80(%%r12), %%rax\n\t"
+        "movq %%rax, %%gs:0x58\n\t"
+        "movq 88(%%r12), %%rax\n\t"
+        "movq %%rax, %%gs:0x60\n\t"
+        "movq 96(%%r12), %%rax\n\t"
+        "movq %%rax, %%gs:0x68\n\t"
+        "movq 104(%%r12), %%rax\n\t"
+        "movq %%rax, %%gs:0x70\n\t"
+        "movq 112(%%r12), %%rax\n\t"
+        "movq %%rax, %%gs:0x78\n\t"
+        "popq %%rax\n\t"
+        "popq %%r12\n\t"
         "jmp syscall_return_path\n\t"
         :
         : "r"(top), "r"(p), "r"(req), "r"(pd->park_syscall)

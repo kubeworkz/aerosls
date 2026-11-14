@@ -877,6 +877,173 @@ int k_linux_forward(uint32_t pid, uint16_t ch_w, uint16_t ch_r,
  * Frame note: the buffer is ~1 KiB on this resume path by the contract's
  * own arithmetic; the per-frame local (never a static) is what keeps SMP
  * deliveries independent, and stack_frame_budget_check is the teeth. */
+/* M3: turn a validated delivery trailer into the handler's entry state.
+ * The saved frame is built from the syscall-entry register snapshot BEFORE
+ * park_ctx is overwritten, so rt_sigreturn can restore the interrupted
+ * call exactly. The frame sits below the interrupted RSP with the restorer
+ * word at the handler's return address; base is 16-aligned, so the
+ * handler sees x86-64's required RSP % 16 == 8 on entry. */
+static uint64_t linux_signal_deliver(struct ProcessDescriptor *pd,
+                                     const struct LinuxSignalDelivery *d,
+                                     int staged, uint64_t sva, uint32_t slen,
+                                     uint8_t skind,
+                                     const struct LinuxSignalFrame *from) {
+    struct LinuxSignalImage img;
+    uint64_t regs[15];
+    uint64_t base, old_rsp, old_rip, old_rflags;
+    int on_alt = 0;
+
+    if (!pd || !d) return (uint64_t)(int64_t)(-LINUX_EPROTO);
+    if (!linux_fs_addr_is_user_canonical(d->handler) ||
+        !linux_fs_addr_is_user_canonical(d->restorer))
+        return (uint64_t)(int64_t)(-LINUX_EPROTO);
+
+    /* A normal delivery seeds the saved context from the syscall that the
+     * sidecar answered. A return-time pending delivery (`from` non-NULL)
+     * seeds it from the frame rt_sigreturn already validated: the nested
+     * handler must return to the ORIGINAL interrupted context, not to the
+     * restorer's own syscall. */
+    if (from) {
+        uint32_t i;
+        for (i = 0; i < 15; i++) regs[i] = from->regs[i];
+        old_rip = from->rip;
+        old_rflags = from->rflags;
+        old_rsp = from->rsp;
+    } else {
+        /* The handler's prologue sees the interrupted syscall's post-return
+         * registers: r15..r12/rbx/rbp from the park, r10/r8/r9/rdi/rsi/rdx
+         * from the captured argument block, rcx/r11 from the syscall frame,
+         * and rax = 0 (the tkill/procmask return the handler will eventually
+         * resume into). */
+        regs[0] = pd->park_ctx.r15;
+        regs[1] = pd->park_ctx.r14;
+        regs[2] = pd->park_ctx.r13;
+        regs[3] = pd->park_ctx.r12;
+        regs[4] = pd->park_ctx.r11;             /* saved r11 (rflags) */
+        regs[5] = pd->park_ctx.linux_args[3];   /* r10 */
+        regs[6] = pd->park_ctx.linux_args[5];   /* r9  */
+        regs[7] = pd->park_ctx.linux_args[4];   /* r8  */
+        regs[8] = pd->park_ctx.rbp;
+        regs[9] = pd->park_ctx.linux_args[0];   /* rdi */
+        regs[10] = pd->park_ctx.linux_args[1];  /* rsi */
+        regs[11] = pd->park_ctx.linux_args[2];  /* rdx */
+        regs[12] = pd->park_ctx.rcx;            /* rcx (return RIP) */
+        regs[13] = pd->park_ctx.rbx;
+        regs[14] = 0;                           /* rax at handler entry */
+        old_rip = pd->park_ctx.rcx;
+        old_rflags = pd->park_ctx.r11;
+        old_rsp = pd->park_ctx.user_rsp;
+    }
+
+    img.restorer = d->restorer;
+    linux_signal_frame_build(&img.frame, regs, old_rip, old_rflags,
+                             old_rsp, d->signo, d->old_mask);
+    linux_signal_info_build(&img.info, d->signo, pd->pid);
+    if (old_rsp < sizeof img + 8) return (uint64_t)(int64_t)(-LINUX_EFAULT);
+    if ((d->flags & 0x08000000u) && d->alt_sp != 0 && d->alt_size != 0) {
+        uint64_t alt_end = d->alt_sp + d->alt_size;
+        if (!linux_fs_addr_is_user_canonical(d->alt_sp) ||
+            alt_end < d->alt_sp || alt_end > LINUX_USER_ADDR_MAX ||
+            d->alt_size < sizeof img + 16)
+            return (uint64_t)(int64_t)(-LINUX_EFAULT);
+        base = (alt_end - (uint64_t)sizeof img) & ~0xFULL;
+        if (base < d->alt_sp + 8)
+            return (uint64_t)(int64_t)(-LINUX_EFAULT);
+        on_alt = 1;
+    } else {
+        base = (old_rsp - (uint64_t)sizeof img) & ~0xFULL;
+        if (base < 8) return (uint64_t)(int64_t)(-LINUX_EFAULT);
+    }
+    linux_signal_ucontext_build(&img.ucontext, &img.frame,
+                                on_alt ? d->alt_sp : 0,
+                                on_alt ? d->alt_size : 0, on_alt);
+
+    /* rt_sigprocmask's staged oldset is owed even though the handler runs
+     * first: Linux writes it before returning to the handler, and the
+     * handler may inspect the caller's buffer. The stage's shape was
+     * validated by the first trap; only the RAW 8-byte form is legal. */
+    if (staged) {
+        if (skind != LINUX_STAGE_RAW || slen < LINUX_SIGSET_BYTES)
+            return (uint64_t)(int64_t)(-LINUX_EPROTO);
+        if (linux_user_copy_in((const uint8_t *)&d->oldset, pd->cr3, sva,
+                               LINUX_SIGSET_BYTES) != 0)
+            return (uint64_t)(int64_t)(-LINUX_EFAULT);
+    }
+    /* The image is [restorer][frame][info][ucontext]: write it at base-8 so
+     * the restorer
+     * is the word at the handler's entry RSP and the frame begins at the
+     * 16-aligned base the restorer's rt_sigreturn will read after ret. */
+    if (linux_user_copy_in((const uint8_t *)&img, pd->cr3, base - 8,
+                           (uint32_t)sizeof img) != 0)
+        return (uint64_t)(int64_t)(-LINUX_EFAULT);
+
+    pd->park_ctx.rcx = d->handler;
+    pd->park_ctx.r11 = img.frame.rflags; /* the frame's sanitized user flags */
+    pd->park_ctx.user_rsp = base - 8;   /* restorer word at [rsp] */
+    pd->park_ctx.linux_args[0] = d->signo; /* int signo */
+    if (d->flags & 0x4u) {
+        uint64_t img_va = base - 8;
+        pd->park_ctx.linux_args[1] = img_va +
+            (uint64_t)((const uint8_t *)&img.info - (const uint8_t *)&img);
+        pd->park_ctx.linux_args[2] = img_va +
+            (uint64_t)((const uint8_t *)&img.ucontext - (const uint8_t *)&img);
+    } else {
+        pd->park_ctx.linux_args[1] = 0;
+        pd->park_ctx.linux_args[2] = 0;
+    }
+    pd->user_rip = d->handler;
+    pd->user_rsp = base - 8;
+    return 0;   /* the handler's eventual rt_sigreturn restores rax */
+}
+
+/* M3: capture, validate and forward an rt_sigreturn frame. Kept here (not
+ * inline in the dispatcher) because it owns the same arm/post/park shape
+ * as k_linux_forward and the guard's order checks should still read the
+ * generic first-trap arm, not this one. Returns only on a refusal; on a
+ * park the task is gone and the resume arm applies the saved context. */
+int linux_sigreturn_forward(uint32_t pid) {
+    struct ProcessDescriptor *pd = 0;
+    struct LinuxSignalFrame *sf;
+    struct SLSLinuxSyscallRequest req;
+    uint64_t largs[6] = {0, 0, 0, 0, 0, 0};
+    uint64_t sregs[15], srip, srflags, srsp;
+    uint64_t frame_rsp;
+    uint16_t ch_w = CAP_NONE, ch_r = CAP_NONE;
+    int st;
+    uint32_t i;
+
+    for (i = 0; i < (uint32_t)PROC_MAX; i++) {
+        if (proc_table[i].active && proc_table[i].pid == pid) {
+            pd = &proc_table[i];
+            break;
+        }
+    }
+    if (!pd) return -LINUX_EINVAL;
+    sf = &pd->sigreturn_frame;
+    frame_rsp = proc_read_user_rsp();
+    if (linux_user_copy_out((uint8_t *)sf, pd->cr3, frame_rsp,
+                            (uint32_t)sizeof *sf) != 0 ||
+        linux_signal_frame_restore(sf, sregs, &srip, &srflags, &srsp) != 0) {
+        kernel_serial_printf(
+            "[E7] rt_sigreturn refused before post: bad frame at user "
+            "RSP 0x%lx\n", (unsigned long)frame_rsp);
+        return -LINUX_EINVAL;
+    }
+    pd->sigreturn_stage_valid = 1;
+    largs[0] = sf->old_mask;
+    if (cap_linux_find_channels(pid, &ch_w, &ch_r) != 0) {
+        pd->sigreturn_stage_valid = 0;
+        return -LINUX_ENOSYS;
+    }
+    linux_syscall_describe(&req, LINUX_RT_SIGRETURN, largs);
+    pd->park_syscall = SYS_LINUX_TRAP_RESUME;
+    st = k_linux_forward(pid, ch_w, ch_r, &req, (uint32_t)sizeof req);
+    pd->park_syscall = 0;
+    pd->sigreturn_stage_valid = 0;
+    kernel_serial_printf("[E7] rt_sigreturn not delivered: cap status %d\n", st);
+    return linux_errno_from_cap(st);
+}
+
 uint64_t k_linux_deliver(uint32_t pid, uint16_t ch_r, uint64_t expect_num) {
     uint32_t chan_id;
     int dir;
@@ -949,6 +1116,42 @@ uint64_t k_linux_deliver(uint32_t pid, uint16_t ch_r, uint64_t expect_num) {
                 pd->reply_stage_va2 = 0;
                 pd->reply_stage_len2 = 0;
                 pd->reply_stage_va3 = 0;
+            }
+
+            /* M3: a handler delivery is a reply trailer, not an ordinary
+             * payload. Only the two signal numbers that can deliver may
+             * carry it; the magic is checked BEFORE the normal shape
+             * rules so a malformed trailer falls through to their own
+             * -EPROTO rather than being mistaken for file bytes. */
+            if (n == LINUX_SIGNAL_DELIVERY_BYTES &&
+                (expect_num == LINUX_RT_SIGPROCMASK ||
+                 expect_num == 200u ||
+                 expect_num == LINUX_RT_SIGRETURN)) {
+                uint64_t hn = 0;
+                int32_t hs = 0;
+                struct LinuxSignalDelivery sd;
+                const struct LinuxSignalFrame *from = 0;
+                for (i = 0; i < 8; i++)
+                    hn |= (uint64_t)rbuf[i] << (8 * i);
+                for (i = 0; i < 4; i++)
+                    hs |= (int32_t)((uint32_t)rbuf[64 + i] << (8 * i));
+                if (hn == expect_num && hs == 0 &&
+                    linux_signal_delivery_parse(
+                        rbuf + sizeof(struct SLSLinuxSyscallRequest), n,
+                        &sd) == 0) {
+                    if (expect_num == LINUX_RT_SIGRETURN) {
+                        /* A return-time pending delivery replaces the
+                         * restored context; the validated frame is its
+                         * saved context, and the normal resume must not
+                         * apply that context afterward. */
+                        if (!pd || !pd->sigreturn_stage_valid)
+                            return (uint64_t)(int64_t)(-LINUX_EPROTO);
+                        from = &pd->sigreturn_frame;
+                        pd->sigreturn_stage_valid = 0;
+                    }
+                    return linux_signal_deliver(pd, &sd, staged, sva, slen,
+                                                skind, from);
+                }
             }
 
             if (n == 0) {

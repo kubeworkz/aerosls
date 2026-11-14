@@ -50,6 +50,14 @@
  *       grant echo), 396 (a fresh heap page was not zero), 397 (the
  *       budget refusal moved the break anyway), 398 (W|X was not
  *       refused) — all asserted ABSENT, the 391/392 discipline.
+ *   5g-bis. mprotect(PROT_NONE) then mprotect(PROT_READ|PROT_WRITE) on
+ *       the SAME heap page: the page must fault while parked, then read and
+ *       write again with its 18-byte contents unchanged. The pattern
+ *       "E7MEM-MPROTECT-OK\n" is written to the page, parked, restored,
+ *       compared byte for byte, and finally written out through fd 1 — so
+ *       the marker's presence proves the restore returned the same frame and
+ *       the bytes survived. A failed park, restore, comparison or output
+ *       issues MARKER 412, 413, 414 or 415 respectively (asserted ABSENT).
  *   9 (mmap, the mem class) — E7 increment 16's anonymous-map half
  *       (§5.4): mmap(NULL, 4096, RW, ANON|PRIVATE) must come back
  *       page-aligned, nonzero and INSIDE the span (the ledger's cursor
@@ -109,6 +117,27 @@ _start:
     mov     $392, %eax          /* MARKER: the reply status was not mapped */
     syscall
 .Lenosys_ok:
+    /* 2b. 105 is Linux setuid AND SLS SYS_SLS_ALLOCATE.  This task is
+     *     Linux-personality, so the answer must be -ENOSYS (-38), the
+     *     census refusal; 0 would be the SLS allocation arm answering for
+     *     it.  The SLS sidecar prints E7SIG-SLS-105-OK from the same
+     *     number, so the two markers are one two-personality regression. */
+    xor     %rdi, %rdi
+    mov     $105, %eax
+    syscall
+    cmp     $-38, %rax
+    jne     .Llnx105_bad
+    lea     .Llnx105_msg(%rip), %rsi
+    mov     $1, %edi
+    mov     $.Llnx105_end-.Llnx105_msg, %edx
+    mov     $1, %eax
+    syscall
+    cmp     $.Llnx105_end-.Llnx105_msg, %rax
+    je      .Llnx105_done
+.Llnx105_bad:
+    mov     $411, %eax           /* MARKER: 105 took the SLS arm */
+    syscall
+.Llnx105_done:
     /* 3. a third round trip: 40 must ARRIVE (the sidecar logs it). */
     mov     $40, %eax
     syscall
@@ -250,10 +279,63 @@ _start:
     mov     $10, %eax
     syscall
     cmp     $-1, %rax
-    je      .Lmmap               /* the W|X twin passed: the map block  */
+    je      .Lmprotect           /* the W|X twin passed: the round trip */
     mov     $398, %eax           /* MARKER: W|X was not refused as -EPERM */
     syscall
     jmp     .Lmem_done
+
+    /* 5g-bis. The SAME heap page crosses PROT_NONE and back. The first
+     *    mprotect parks the present leaf's frame; the second restores that
+     *    frame READ|WRITE. The comparisons below are reads through the
+     *    restored translation, and the byte write at offset 18 is the
+     *    writability half; the 18-byte pattern goes out through fd 1 from
+     *    the page itself. r12 is the heap base throughout. */
+.Lmprotect:
+    movabs  $0x504D2D4D454D3745, %rax    /* "E7MEM-MP" little-endian */
+    mov     %rax, (%r12)
+    movabs  $0x4F2D544345544F52, %rax    /* "ROTECT-O" little-endian */
+    mov     %rax, 8(%r12)
+    movabs  $0x0000000000000A4B, %rax    /* "K\n" + NULs             */
+    mov     %rax, 16(%r12)
+
+    mov     %r12, %rdi
+    mov     $0x1000, %esi
+    xor     %edx, %edx             /* PROT_NONE                       */
+    mov     $10, %eax
+    syscall
+    test    %rax, %rax
+    jnz     .Lmprotect_park_bad
+
+    mov     %r12, %rdi
+    mov     $0x1000, %esi
+    mov     $3, %edx               /* PROT_READ|PROT_WRITE            */
+    mov     $10, %eax
+    syscall
+    test    %rax, %rax
+    jnz     .Lmprotect_rw_bad
+
+    movabs  $0x504D2D4D454D3745, %rax
+    cmp     %rax, (%r12)
+    jne     .Lmprotect_content_bad
+    movabs  $0x4F2D544345544F52, %rax
+    cmp     %rax, 8(%r12)
+    jne     .Lmprotect_content_bad
+    movabs  $0x0000000000000A4B, %rax
+    cmp     %rax, 16(%r12)
+    jne     .Lmprotect_content_bad
+
+    movb    $0x21, 18(%r12)         /* a byte past the marker          */
+    cmpb    $0x21, 18(%r12)
+    jne     .Lmprotect_content_bad
+
+    mov     %r12, %rsi
+    mov     $1, %edi
+    mov     $18, %edx
+    mov     $1, %eax
+    syscall
+    cmp     $18, %rax
+    jne     .Lmprotect_write_bad
+    jmp     .Lmmap
 
     /* 5h. mmap(NULL, 0x1000, PROT_READ|PROT_WRITE, ANON|PRIVATE) — the
      *    measured allocator's arena shape (increment 16). The answer
@@ -404,6 +486,22 @@ _start:
     mov     $404, %eax           /* MARKER: the munmap seam lied         */
     syscall
     jmp     .Lmem_done
+.Lmprotect_park_bad:
+    mov     $412, %eax           /* MARKER: PROT_NONE was not accepted   */
+    syscall
+    jmp     .Lmem_done
+.Lmprotect_rw_bad:
+    mov     $413, %eax           /* MARKER: PROT_READ|WRITE not accepted */
+    syscall
+    jmp     .Lmem_done
+.Lmprotect_content_bad:
+    mov     $414, %eax           /* MARKER: contents or write changed    */
+    syscall
+    jmp     .Lmem_done
+.Lmprotect_write_bad:
+    mov     $415, %eax           /* MARKER: the pattern write was short  */
+    syscall
+    jmp     .Lmem_done
 .Lmem_bad:
     mov     $395, %eax           /* MARKER: the brk seam lied (base/echo) */
     syscall
@@ -416,6 +514,147 @@ _start:
     mov     $397, %eax           /* MARKER: the budget refusal moved it */
     syscall
 .Lmem_done:
+    /* 5p. M3: install a real handler, deliver a self-signal through
+     *    tkill, and return through rt_sigreturn. The act struct lives on
+     *    the stack only until the call; the handler's own frame is built
+     *    by the kernel below the RSP in force at tkill.
+     *
+     *    POSITIVE markers: "E7SIG-OK\n" is written ONLY by the handler,
+     *    so its presence proves the kernel entered the user address with
+     *    the restorer word at [rsp]; "E7SIG-RET\n" is written after the
+     *    handler returns, so its presence proves rt_sigreturn restored
+     *    the interrupted RIP/RSP. The mask query after that must read 0 —
+     *    the handler's blocked SIGUSR1 must not survive the return. A
+     *    failed install or a tkill error issues MARKER 405; a mask that
+     *    did not restore issues 406. */
+    sub     $64, %rsp
+    /* M3.2/M3.4: a 4 KiB alternate stack just below this frame, and the
+     * handler carries SA_ONSTACK|SA_SIGINFO. r14/r13 are callee-saved, so
+     * the handler sees the exact bounds after the tkill park. */
+    lea     (%rsp), %r13           /* alt_end = the frame base          */
+    lea     -4096(%rsp), %r14      /* alt_sp                            */
+    mov     %r14, 32(%rsp)          /* stack_t.ss_sp                     */
+    movl    $0, 40(%rsp)            /* stack_t.ss_flags                  */
+    mov     $4096, %rax
+    mov     %rax, 48(%rsp)          /* stack_t.ss_size                   */
+    lea     32(%rsp), %rdi
+    xor     %esi, %esi              /* no old stack_t                    */
+    mov     $131, %eax              /* sigaltstack                       */
+    syscall
+    test    %rax, %rax
+    jz      .Lsig_alt_ok
+    cmp     $-22, %rax
+    je      .Lsig_alt_einval
+    jmp     .Lsig_alt_bad
+.Lsig_alt_ok:
+    lea     .Lhandler(%rip), %rax
+    mov     %rax, 0(%rsp)          /* sa_handler */
+    movq    $0x0c000004, 8(%rsp)   /* SA_RESTORER|SA_ONSTACK|SA_SIGINFO */
+    lea     .Lrestorer(%rip), %rax
+    mov     %rax, 16(%rsp)         /* sa_restorer */
+    movq    $0, 24(%rsp)           /* sa_mask */
+    mov     $10, %edi              /* SIGUSR1 */
+    mov     %rsp, %rsi
+    xor     %edx, %edx             /* no oldact */
+    mov     $8, %r10d
+    mov     $13, %eax              /* rt_sigaction */
+    syscall
+    add     $64, %rsp
+    test    %rax, %rax
+    jnz     .Lsig_bad
+
+    /* Refresh this task's tid (the heap block reused r12), then tkill
+     * ourselves with SIGUSR1. An unblocked handler-disposed signal is
+     * delivered INSIDE this syscall, so the next instruction is reached
+     * only after the handler's rt_sigreturn. */
+    lea     .Lmsg(%rip), %rdi
+    mov     $218, %eax
+    syscall
+    mov     %rax, %r12
+    mov     %r12, %rdi
+    mov     $10, %esi
+    mov     $200, %eax
+    syscall
+    test    %rax, %rax
+    jnz     .Lsig_tkill_bad
+
+    /* The handler blocked SIGUSR1 while it ran. The completed tkill's
+     * mask was 0, so rt_sigreturn must have restored 0. */
+    sub     $8, %rsp
+    xor     %edi, %edi             /* how is ignored when set == NULL */
+    xor     %esi, %esi
+    mov     %rsp, %rdx
+    mov     $8, %r10d
+    mov     $14, %eax              /* rt_sigprocmask query */
+    syscall
+    mov     (%rsp), %rax
+    add     $8, %rsp
+    test    %rax, %rax
+    jnz     .Lsig_mask_bad
+
+    lea     .Lsig_ret_msg(%rip), %rsi
+    mov     $1, %edi
+    mov     $.Lsig_ret_end-.Lsig_ret_msg, %edx
+    mov     $1, %eax
+    syscall
+    jmp     .Lexit
+.Lsig_bad:
+    mov     $405, %eax
+    syscall
+    jmp     .Lexit
+.Lsig_alt_bad:
+    mov     $408, %eax
+    syscall
+    jmp     .Lexit
+.Lsig_alt_einval:
+    mov     $410, %eax
+    syscall
+    jmp     .Lexit
+.Lsig_tkill_bad:
+    mov     $409, %eax
+    syscall
+    jmp     .Lexit
+.Lsig_mask_bad:
+    mov     $406, %eax
+    syscall
+    jmp     .Lexit
+
+    /* The handler runs with the kernel's frame below the interrupted RSP;
+     * its only job is the positive marker, then the restorer returns. */
+.Lhandler:
+    /* SA_SIGINFO: rsi=&siginfo, rdx=&ucontext. SA_ONSTACK: the entry RSP
+     * must be inside the 4 KiB alternate region saved in r14..r13. */
+    test    %rsi, %rsi
+    jz      .Lsig_info_bad
+    cmpl    $10, (%rsi)             /* si_signo == SIGUSR1 */
+    jne     .Lsig_info_bad
+    test    %rdx, %rdx
+    jz      .Lsig_info_bad
+    cmp     %r14, %rsp
+    jb      .Lsig_info_bad
+    cmp     %r13, %rsp
+    jae     .Lsig_info_bad
+    lea     .Lsig_info_msg(%rip), %rsi
+    mov     $1, %edi
+    mov     $.Lsig_info_end-.Lsig_info_msg, %edx
+    mov     $1, %eax
+    syscall
+    lea     .Lsig_ok_msg(%rip), %rsi
+    mov     $1, %edi
+    mov     $.Lsig_ok_end-.Lsig_ok_msg, %edx
+    mov     $1, %eax
+    syscall
+    ret
+.Lsig_info_bad:
+    mov     $407, %eax              /* MARKER: SA_SIGINFO/alt-stack shape */
+    syscall
+    ret
+.Lrestorer:
+    mov     $15, %eax              /* rt_sigreturn */
+    syscall
+    jmp     .Lhang                 /* the restorer never returns on success */
+
+.Lexit:
     /* 6. exit_group(42): the sidecar reaps this task. */
     mov     $42, %edi
     mov     $231, %eax
@@ -432,3 +671,17 @@ _start:
 .Lmsg:
     .ascii  "E7FD-WRITE-OK\n"
 .Lmsgend:
+
+.Lsig_ok_msg:
+    .ascii  "E7SIG-OK\n"
+.Lsig_ok_end:
+.Lsig_ret_msg:
+    .ascii  "E7SIG-RET\n"
+.Lsig_ret_end:
+.Lsig_info_msg:
+    .ascii  "E7SIG-INFO\n"
+.Lsig_info_end:
+
+.Llnx105_msg:
+    .ascii  "E7SIG-LNX-105-OK\n"
+.Llnx105_end:

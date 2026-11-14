@@ -64,6 +64,9 @@ done
 for m in source live teeth selfkill; do
     grep -q "^$m.rc=0$" "$ev/manifest.txt" && ok "manifest records $m.rc=0" || bad "manifest does not record $m.rc=0"
 done
+grep -q '^head_full=' "$ev/manifest.txt" && ok "manifest records the full commit" || bad "manifest does not record head_full"
+grep -Eq '^tree_status=(clean|dirty|unknown)$' "$ev/manifest.txt" && ok "manifest records the tree state" || bad "manifest does not record tree_status"
+grep -Eq '^tree_changed=([0-9]+|unknown)$' "$ev/manifest.txt" && ok "manifest records the changed-file count" || bad "manifest does not record tree_changed"
 grep -q 'e7_gate_all: PASS' "$TMP/green.out" && ok "the driver prints its PASS verdict" || bad "no PASS verdict"
 
 if run "$TMP/red" "$TMP/red.out" E7_GATE_STUB_FAIL=--teeth; then

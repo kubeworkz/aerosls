@@ -28,6 +28,8 @@
 #   marker-only    -> FAIL  init finished spawning and no POSIX reported a live
 #                           rootfs: the gate must NOT be satisfiable by init's
 #                           own account of itself.
+#   mprotect-lost  -> FAIL  the live probe's PROT_NONE/reprotect round trip is
+#                           missing: the marker's absence is a red, not a note.
 #   no-iso         -> ABORT rc=2  a missing image is a prerequisite failure, not
 #                           a pass: the guard fails closed, which is why every
 #                           canned-log arm hands it a placeholder ISO.
@@ -43,6 +45,10 @@ set -u
 cd "$(dirname "$0")/.."   # repo root
 
 GUARD=tests/e3_multi_env_boot_check.sh
+# Every stub arm is a canned log; keep the guard's real 120 s probe wait out
+# of the failure teeth (a missing-marker arm would otherwise sleep the whole
+# window before asserting the failure it was built to show).
+export E3_WINDOW_S=10
 WORK=$(mktemp -d /tmp/e3_teeth.XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
 
@@ -73,10 +79,12 @@ for a in "$@"; do
     prev="$a"
 done
 [ -n "$log" ] || { echo "stubqemu: no -serial file: argument" >&2; exit 9; }
+# Write the canned boot FIRST, then stay alive: the guard's shortened smoke
+# window must see the log before it polls the liveness of this stand-in.
+cp "$E3_STUB_LOG" "$log"
 # A few seconds so the guard polls a LIVE qemu (it treats an exited one as a
 # different failure mode, which is not what these arms are about).
 sleep 6
-cp "$E3_STUB_LOG" "$log"
 sleep 6
 exit 0
 STUB
@@ -117,6 +125,15 @@ mklog() {
         # The kernel's own line, printed at replay when its deferral ring could
         # not hold the window's output. Shape copied from kernel_io.c verbatim,
         # because that is what the guard greps for on a real boot.
+        # M3.2–M3.4's live markers ride the system POSIX probe on the same boot.
+        if [ "$n" -ge 3 ]; then
+            echo "[E7] linux: num=00000001 child=e7.linux.probe.0 write ok len=11 |E7SIG-INFO.|"
+            echo "[E7] linux: num=00000001 child=e7.linux.probe.0 write ok len=9 |E7SIG-OK.|"
+            echo "[E7] linux: num=00000001 child=e7.linux.probe.0 write ok len=10 |E7SIG-RET.|"
+            echo "[E7] linux: num=00000001 child=e7.linux.probe.0 write ok len=17 |E7SIG-LNX-105-OK.|"
+            echo "[E7] linux: num=00000001 child=e7.linux.probe.0 write ok len=18 |E7MEM-MPROTECT-OK.|"
+            echo "[POSIX] E7SIG-SLS-105-OK"
+        fi
         [ "$overflow" = yes ] && \
             echo "[serial] loopback window overflow: 0x45c byte(s) dropped"
         echo "System ready"
@@ -160,6 +177,49 @@ E3_ISO="$DUMMY_ISO" E3_QEMU="$WORK/stubqemu" E3_STUB_LOG="$WORK/three.log" bash 
 EOF
 chmod +x "$WORK/run"
 arm "three live rootfs + init marker -> PASS" 0 "live-rootfs lines (>= 3: system POSIX + both tenants"
+
+# ─── Arm 1b: the M3.2–M3.4 live arm is an assertion, not a note ───────────
+# The same boot without the handler's three bytes is not a boot whose signal
+# delivery can be credited; the guard must redden by name.
+grep -avF 'E7SIG-' "$WORK/three.log" > "$WORK/three-nosig.log"
+cat > "$WORK/run" <<EOF
+#!/usr/bin/env bash
+E3_ISO="$DUMMY_ISO" E3_QEMU="$WORK/stubqemu" E3_STUB_LOG="$WORK/three-nosig.log" bash $GUARD
+EOF
+arm "three live rootfs but no handler round trip -> FAIL" 1 "M3.2–M3.4 probe did not complete"
+# The SA_SIGINFO/alt-stack half is separately observable: a handler that ran
+# without E7SIG-INFO is not a handler whose SA_SIGINFO shape passed.
+grep -avF 'E7SIG-INFO' "$WORK/three.log" > "$WORK/three-noinfo.log"
+cat > "$WORK/run" <<EOF
+#!/usr/bin/env bash
+E3_ISO="$DUMMY_ISO" E3_QEMU="$WORK/stubqemu" E3_STUB_LOG="$WORK/three-noinfo.log" bash $GUARD
+EOF
+arm "handler ran but no SA_SIGINFO marker -> FAIL" 1 "M3.2–M3.4 probe did not complete"
+
+# Arm 1c/1d: the whole-overlap pair has teeth in BOTH directions.  Removing
+# either personality's 105 marker must redden; a single marker would let the
+# other side regress silently.
+grep -avF 'E7SIG-LNX-105-OK' "$WORK/three.log" > "$WORK/three-nolnx105.log"
+cat > "$WORK/run" <<EOF
+#!/usr/bin/env bash
+E3_ISO="$DUMMY_ISO" E3_QEMU="$WORK/stubqemu" E3_STUB_LOG="$WORK/three-nolnx105.log" bash $GUARD
+EOF
+arm "Linux 105 marker missing -> FAIL" 1 "105 overlap pair"
+grep -avF 'E7SIG-SLS-105-OK' "$WORK/three.log" > "$WORK/three-nosls105.log"
+cat > "$WORK/run" <<EOF
+#!/usr/bin/env bash
+E3_ISO="$DUMMY_ISO" E3_QEMU="$WORK/stubqemu" E3_STUB_LOG="$WORK/three-nosls105.log" bash $GUARD
+EOF
+arm "SLS 105 marker missing -> FAIL" 1 "105 overlap pair"
+
+# The mprotect round trip is separately observable: a probe that never parked
+# and restored the heap page cannot be credited from the signal markers alone.
+grep -avF 'E7MEM-MPROTECT-OK' "$WORK/three.log" > "$WORK/three-nomp.log"
+cat > "$WORK/run" <<EOF
+#!/usr/bin/env bash
+E3_ISO="$DUMMY_ISO" E3_QEMU="$WORK/stubqemu" E3_STUB_LOG="$WORK/three-nomp.log" bash $GUARD
+EOF
+arm "mprotect round-trip marker missing -> FAIL" 1 "mprotect round trip"
 
 # ─── Arm 2: one tenant never reached a live rootfs ─────────────────────────
 mklog 2 distinct yes "$WORK/two.log"
@@ -249,6 +309,12 @@ arm "init reports both spawns, no live rootfs -> FAIL" 1 "live rootfs: 0/3"
     echo "[POSIX] aero state=00000000 "
     echo "[POSIX] aero state=00000000 "
     echo "[POSIX] aero state=00000000 "
+    echo "[E7] linux: num=00000001 child=e7.linux.probe.0 write ok len=11 |E7SIG-INFO.|"
+    echo "[E7] linux: num=00000001 child=e7.linux.probe.0 write ok len=9 |E7SIG-OK.|"
+    echo "[E7] linux: num=00000001 child=e7.linux.probe.0 write ok len=10 |E7SIG-RET.|"
+    echo "[E7] linux: num=00000001 child=e7.linux.probe.0 write ok len=17 |E7SIG-LNX-105-OK.|"
+    echo "[E7] linux: num=00000001 child=e7.linux.probe.0 write ok len=18 |E7MEM-MPROTECT-OK.|"
+    echo "[POSIX] E7SIG-SLS-105-OK"
 } > "$WORK/coalesced.log"
 cat > "$WORK/run" <<EOF
 #!/usr/bin/env bash
