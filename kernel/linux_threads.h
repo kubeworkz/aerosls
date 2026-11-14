@@ -93,6 +93,18 @@ uint32_t linux_thread_group_tgid(uint32_t group_id);
 uint64_t linux_thread_group_cr3(uint32_t group_id);
 int      linux_thread_group_used(uint32_t group_id);
 
+/* M4.5: resolve a leader PID to its group id (0 when no live group has that
+ * TGID). The exit_group sweep accepts the Linux-visible tgid, not the
+ * kernel's private group slot. */
+uint32_t linux_thread_group_id_by_tgid(uint32_t tgid);
+
+/* Host-test seam: when LINUX_THREAD_GROUP_TEST_SEAM is defined the module
+ * supplies linux_user_copy_in() over one explicitly mapped word, so the
+ * clear-child-tid exit rule can be driven without a boot or page tables. */
+#ifdef LINUX_THREAD_GROUP_TEST_SEAM
+void linux_thread_test_clear_tid_target(uint64_t va, uint32_t *host);
+#endif
+
 #ifdef LINUX_THREAD_GROUP_TEST_SEAM
 /* Host-test only: force the two counters apart so detach's half-torn refusal
  * is reachable without corrupting the production API. Not compiled into the

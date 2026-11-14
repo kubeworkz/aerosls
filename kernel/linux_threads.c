@@ -21,6 +21,28 @@
 #include "process.h"
 #include "linux_abi.h"
 
+#ifdef LINUX_THREAD_GROUP_TEST_SEAM
+#include <string.h>
+static uint64_t g_test_ctid_va;
+static uint32_t *g_test_ctid_host;
+
+void linux_thread_test_clear_tid_target(uint64_t va, uint32_t *host) {
+    g_test_ctid_va = va;
+    g_test_ctid_host = host;
+}
+
+/* The seam's one mapped user word. Every other VA is a refused copy, which
+ * is the same silent outcome a live unmapped ctid produces. */
+int linux_user_copy_in(const uint8_t *src, uint64_t root, uint64_t va,
+                       uint32_t n) {
+    (void)root;
+    if (!g_test_ctid_host || va != g_test_ctid_va || n != sizeof(uint32_t))
+        return -1;
+    memcpy(g_test_ctid_host, src, n);
+    return 0;
+}
+#endif
+
 _Static_assert(LINUX_THREAD_GROUP_MAX >= PROC_MAX,
                "the group table must cover every process slot");
 
@@ -32,6 +54,21 @@ static void thread_fields_clear(struct ProcessDescriptor *pd) {
     pd->linux_tid = 0;
     pd->linux_clear_child_tid = 0;
     pd->linux_is_thread = 0;
+}
+
+/* M4.5: Linux's clear_child_tid exit rule, mechanism half. The word is
+ * zeroed through the same present+user+writable walk as every other kernel
+ * write, before the descriptor leaves the group and while the shared PML4 is
+ * still live. A child that unmapped the word (or a clone whose ctid was
+ * never mappable) gets no fabrication: the copy refusal is silent because
+ * the exit itself must still complete. The wake half belongs to the sidecar,
+ * which owns the futex queue and learns the address from the same clone. */
+static void clear_child_tid_word(struct ProcessDescriptor *pd) {
+    uint32_t zero = 0;
+    if (!pd || pd->linux_clear_child_tid == 0 || pd->cr3 == 0) return;
+    (void)linux_user_copy_in((const uint8_t *)&zero, pd->cr3,
+                             pd->linux_clear_child_tid, sizeof(zero));
+    pd->linux_clear_child_tid = 0;
 }
 
 static struct LinuxThreadGroup *group_get(uint32_t group_id) {
@@ -150,6 +187,8 @@ int linux_thread_group_detach(struct ProcessDescriptor *pd,
     if (cr3_to_destroy) *cr3_to_destroy = 0;
     if (!pd || pd->linux_tgid == 0) return 0;
 
+    clear_child_tid_word(pd);
+
     uint32_t group_id = pd->linux_tgid;
     struct LinuxThreadGroup *g = group_get(group_id);
     if (!g) {
@@ -197,6 +236,15 @@ uint32_t linux_thread_group_live(uint32_t group_id) {
 uint32_t linux_thread_group_tgid(uint32_t group_id) {
     struct LinuxThreadGroup *g = group_get(group_id);
     return g ? g->tgid : 0;
+}
+
+uint32_t linux_thread_group_id_by_tgid(uint32_t tgid) {
+    if (tgid == 0) return 0;
+    for (uint32_t i = 0; i < LINUX_THREAD_GROUP_MAX; i++) {
+        if (g_groups[i].used && g_groups[i].tgid == tgid)
+            return i + 1;
+    }
+    return 0;
 }
 
 uint64_t linux_thread_group_cr3(uint32_t group_id) {

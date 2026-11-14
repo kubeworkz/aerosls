@@ -172,6 +172,13 @@ const STATUS_OK: i32 = 0;      /* CAP_ERR_OK: the reply carries a real `ret` */
 /// the task as -ESRCH through §5.7, never as an invented number.
 const E_TARGET: i32 = 7; /* CAP_ERR_TARGET -> -ESRCH (§5.7) */
 
+/* M4.5: how many times the exit_group sweep may yield and retry when the
+ * kernel reports a runnable member (CAP_EAGAIN). Each retry is one scheduler
+ * slice, so a CPU-bound sibling is preempted and the next sweep can prove it
+ * dead; a target that never stops running is reported as a failure rather
+ * than reaped from under its own execution. */
+const GROUP_SWEEP_ATTEMPTS: u32 = 64;
+
 /// The sig seam's numbers and sizes — twins of kernel/linux_abi.h's
 /// LINUX_RT_SIGACTION / LINUX_RT_SIGPROCMASK / LINUX_SIGACT_BYTES /
 /// LINUX_SIGSET_BYTES (the Rust side cannot include that header, so the
@@ -183,6 +190,7 @@ const LINUX_RT_SIGPROCMASK: u64 = 14;
 const LINUX_RT_SIGRETURN: u64 = 15;
 const LINUX_SIGALTSTACK: u64 = 131;
 const LINUX_TKILL: u64 = 200;
+const LINUX_EXIT_GROUP: u64 = 231;
 /// mmap(9) — armed since E7 increment 16 (§5.4's anonymous-map half):
 /// the 9 arm below answers the measured allocator's shapes from the
 /// ledger, and every refusal's LOG line carries the request's own
@@ -389,6 +397,9 @@ const LINUX_POLL: u64 = 7;
 /// named follow-ons and are refused ENOSYS rather than guessed. The kernel
 /// attaches the observed word and optional relative timespec; this side
 /// owns the queue and every policy decision (D6).
+const LINUX_GETPID: u64 = 39;
+const LINUX_EXIT: u64 = 60;
+const LINUX_GETTID: u64 = 186;
 const LINUX_FUTEX: u64 = 202;
 const FUTEX_WAIT: u64 = 0;
 const FUTEX_WAKE: u64 = 1;
@@ -572,10 +583,12 @@ enum Answer {
     /// M4.4: FUTEX_WAKE removed these waiters, oldest first. `service` sends
     /// each one the deferred zero reply and answers the waker with the count.
     FutexWake(FutexWake),
-    /// exit_group: reap the task, reply nothing.
-    Exit,
+    /// M4.5: exit(60) ends only the calling thread; reply nothing.
+    ExitThread,
+    /// M4.5: exit_group(231) sweeps the whole thread group; reply nothing.
+    ExitGroup,
     /// E7 increment 10 (the signal seam): a signal's DEFAULT ACTION ran —
-    /// reap the task through exit_group's own path and reply nothing. On
+    /// reap the task through the same exit path and reply nothing. On
     /// real Linux the process dies inside the delivering syscall and never
     /// returns to its caller, so "no reply" is the faithful shape; the
     /// variant is distinct from `Exit` only so the serial log names WHICH
@@ -634,7 +647,9 @@ struct MemBrk {
 /// which the two ends can be the same number.
 #[derive(Clone, Copy)]
 struct SigState {
-    tid: u64,
+    tid: u64,                 /* M4.5: the kernel-assigned TID (gettid)       */
+    tgid: u64,                /* M4.5: the leader's TID (getpid)             */
+    clear_tid: u64,           /* M4.5: set_tid_address/CLONE_CHILD_CLEARTID  */
     mask: u64,                /* blocked signals, bit (sig - 1), signals 1..=64 */
     pending: u64,             /* blocked signals that have arrived              */
     dispo: [u8; SIG_MAX + 1], /* indexed by signal number: DFL / IGN / HANDLER  */
@@ -651,6 +666,8 @@ impl SigState {
     const fn new() -> Self {
         SigState {
             tid: 0,
+            tgid: 0,
+            clear_tid: 0,
             mask: 0,
             pending: 0,
             dispo: [DISPO_DFL; SIG_MAX + 1],
@@ -908,9 +925,17 @@ fn answer(
          * return into pt->tid as an int32 and tkill hands its low 32 bits
          * back — so the answer is also RECORDED here: the seam's whole
          * notion of "this task" for tkill's match (SigState's note). */
+        /* M4.5: the real identities the kernel assigned. getpid is the
+         * leader's TID (TGID); gettid is this thread's own TID. Neither is
+         * the set_tid_address pointer. */
+        LINUX_GETPID => Answer::Reply(sig.tgid, STATUS_OK),
+        LINUX_GETTID => Answer::Reply(sig.tid, STATUS_OK),
         218 => {
-            sig.tid = args[0];
-            Answer::Reply(args[0], STATUS_OK)
+            /* set_tid_address stores the user word; Linux returns the
+             * caller's TID, and the kernel records the same word so the
+             * exit path can zero it. */
+            sig.clear_tid = args[0];
+            Answer::Reply(sig.tid, STATUS_OK)
         }
         /* clock_gettime (228, LSC_LOCAL — E7 increment 19): the seam has
          * no vDSO to backstop it, so the sidecar answers the call itself.
@@ -1156,7 +1181,8 @@ fn answer(
         }
         /* exit_group (231, LSC_EXIT): the sidecar reaps, the frames return
          * (§5.6) — handled by service(), which owns the pid lookup. */
-        231 => Answer::Exit,
+        LINUX_EXIT => Answer::ExitThread,
+        LINUX_EXIT_GROUP => Answer::ExitGroup,
         /* rt_sigaction (13, LSC_SIG — E7 increment 10, §10.13's step 2;
          * the out-pointer half landed in increment 12): the KERNEL copied
          * `act` out of the child (32 bytes behind the header), so nothing
@@ -1446,6 +1472,49 @@ fn answer(
          * number, never a silent success and never a fabricated value. */
         _ => Answer::Reply(0, E_NOSYS),
     }
+}
+
+/// M4.5: tkill addressed to a SIBLING by its real TID. Linux signal
+/// targeting is per-thread, so a TID must resolve inside this group (a TID
+/// in another group is ESRCH, not a cross-group delivery). This path is
+/// deliberately narrow: existence, ignored dispositions and blocked signals
+/// are exact; a handler or default action for another thread would need a
+/// frame in that thread's context, which this v1 cannot build. Those answer
+/// ENOSYS, named—never a fabricated delivery. The caller's own TID keeps the
+/// existing answer() path and its handler/frame semantics.
+fn answer_tkill_sibling(gid: usize, self_tid: u64,
+                        args: &[u64; 6]) -> Option<Answer> {
+    if args[0] == 0 || args[0] == self_tid {
+        return None;
+    }
+    let target = args[0] as u32;
+    let mut found: Option<usize> = None;
+    for j in 0..MAX_LINUX_TASKS {
+        if tasks()[j].used && tasks()[j].group == gid &&
+            tasks()[j].sig.tid as u32 == target {
+            found = Some(j);
+            break;
+        }
+    }
+    let Some(j) = found else {
+        return Some(Answer::Reply(0, E_TARGET));
+    };
+    if args[1] == 0 {
+        return Some(Answer::Reply(0, STATUS_OK));
+    }
+    if args[1] > SIG_MAX as u64 {
+        return Some(Answer::Reply(0, E_INVAL));
+    }
+    let s = args[1] as usize;
+    let t = &mut tasks()[j].sig;
+    if t.dispo[s] == DISPO_IGN {
+        return Some(Answer::Reply(0, STATUS_OK));
+    }
+    if t.mask & (1u64 << (s - 1)) != 0 {
+        t.pending |= 1u64 << (s - 1);
+        return Some(Answer::Reply(0, STATUS_OK));
+    }
+    Some(Answer::Reply(0, E_NOSYS))
 }
 
 /// One slot of a Linux task's fd table (E7 increment 5 — the fd class's
@@ -2524,6 +2593,7 @@ const MAX_FUTEX_WAITERS: usize = 8;
 struct LinuxGroup {
     used: bool,
     threads: u16,
+    tgid: u64,                /* M4.5: the leader's kernel TID             */
     partition: u32,
     gate: bool,
     fds: [FdSlot; LINUX_MAX_FDS],
@@ -2542,6 +2612,7 @@ impl LinuxGroup {
         LinuxGroup {
             used: false,
             threads: 0,
+            tgid: 0,
             partition: 0,
             gate: false,
             fds: [FdSlot { used: false, kind: 0, vfs_fd: 0, flags: 0 };
@@ -2654,6 +2725,8 @@ pub fn track(
     vfs_task: u32,   /* step 4: the VFS task id the file-class arms
                       * operate over — allocated by the spawn path
                       * (it owns the ProcManager) before the track   */
+    leader_tid: u64, /* M4.5: the kernel PID/TID of this leader — the
+                      * value getpid/gettid and tkill use              */
     gate: bool,      /* increment 19: this is the gate profile's first
                       * user — mirror its console output to the serial
                       * log (the tenant console is otherwise unobserved) */
@@ -2674,6 +2747,7 @@ pub fn track(
     let g = &mut groups()[gslot];
     g.used = true;
     g.threads = 1;
+    g.tgid = leader_tid;
     g.partition = partition;
     g.gate = gate;
     g.brk_base = heap_base;
@@ -2702,6 +2776,8 @@ pub fn track(
      * alternate stack (proc_clear_resume_state's discipline, sidecar
      * side). The disposition cache starts at the group's DFL table. */
     t.sig = SigState::new();
+    t.sig.tid = leader_tid;
+    t.sig.tgid = leader_tid;
     t.sig.dispo = g.sig_dispo;
     t.sig.act = g.sig_act;
     /* A reused slot must not inherit a parked exchange either: the tag
@@ -2738,6 +2814,8 @@ pub fn track_thread(
     parent: usize,
     vfs_task: u32,
     share_fds: bool,
+    tid: u64,
+    clear_tid: u64,
 ) -> Option<u32> {
     if parent >= MAX_LINUX_TASKS || !tasks()[parent].used {
         return None;
@@ -2771,6 +2849,9 @@ pub fn track_thread(
      * thread's blocked mask, no pending signals, no ALT stack and no tid
      * declaration. Dispositions remain the group's authoritative copy. */
     t.sig = SigState::new();
+    t.sig.tid = tid;
+    t.sig.tgid = g.tgid;
+    t.sig.clear_tid = clear_tid;
     t.sig.mask = parent_mask;
     t.sig.dispo = g.sig_dispo;
     t.sig.act = g.sig_act;
@@ -2814,6 +2895,24 @@ fn release_task<K: Kernel, A: BufferAlloc>(i: usize, vfs: &mut Vfs<K, A>) {
     if let Some(vt) = drop_task_state(i) {
         let _ = vfs.exit_task(vt);
     }
+}
+
+/// M4.5: is this sidecar record's kernel task gone? `sidecar_pid` resolves
+/// only an ACTIVE process, so 0 is the liveness test the sweep uses before
+/// it may reap a record. A slot that is already unused is dead by definition.
+fn task_is_dead<K: Kernel>(k: &K, i: usize, partition: u32) -> bool {
+    if i >= MAX_LINUX_TASKS || !tasks()[i].used {
+        return true;
+    }
+    let n = tasks()[i].name_len;
+    let mut name_buf = [0u8; 48];
+    name_buf[..n].copy_from_slice(&tasks()[i].name[..n]);
+    let name = core::str::from_utf8(&name_buf[..n]).unwrap_or("");
+    k.sidecar_pid(name, partition) == 0
+}
+
+fn group_live_records<K: Kernel>(k: &K, members: &[usize], partition: u32) -> usize {
+    members.iter().filter(|&&j| !task_is_dead(k, j, partition)).count()
 }
 
 /// M4.4: remove a task's queued FUTEX_WAIT. Called on every release before
@@ -2884,6 +2983,40 @@ fn futex_wake(g: &mut LinuxGroup, uaddr: u64, want: usize) -> FutexWake {
         g.futex[i] = FutexWaiter { used: false, task: 0, uaddr: 0, seq: 0 };
     }
     out
+}
+
+/// M4.5: send the deferred zero replies for a wake produced by a thread
+/// exit's clear-child-tid rule. This is the same reply shape as a FUTEX_WAKE
+/// answer; the wake itself is already committed to the group queue.
+fn futex_wake_reply<K: Kernel>(k: &K, gid: usize, uaddr: u64, want: usize) {
+    let w = futex_wake(&mut groups()[gid], uaddr, want);
+    for &idx in w.tasks[..w.n as usize].iter() {
+        let j = idx as usize;
+        if j >= MAX_LINUX_TASKS || !tasks()[j].used ||
+            tasks()[j].pending != PENDING_FUTEX {
+            continue;
+        }
+        let wake_tag = tasks()[j].pending_tag;
+        let wake_ch = tasks()[j].ch_w;
+        tasks()[j].pending = PENDING_NONE;
+        reply(k, wake_ch, wake_tag, LINUX_FUTEX, 0, STATUS_OK);
+    }
+}
+
+/// M4.5: a thread left (exit, signal kill, or channel close). The kernel has
+/// already zeroed its CLONE_CHILD_CLEARTID/set_tid_address word through the
+/// checked copy-in; this side owns the futex queue, so it wakes one waiter
+/// on that address before the task index can be reused. A task with no
+/// clear-tid word is a no-op, and `release_task` clears the stored address.
+fn wake_clear_tid<K: Kernel>(k: &K, gid: usize, i: usize) {
+    if i >= MAX_LINUX_TASKS || !tasks()[i].used {
+        return;
+    }
+    let ctid = tasks()[i].sig.clear_tid;
+    if ctid != 0 {
+        futex_wake_reply(k, gid, ctid, 1);
+        tasks()[i].sig.clear_tid = 0;
+    }
 }
 
 /// M4.4's pure futex arm. The group owns the queue; `task` is the caller's
@@ -3211,6 +3344,8 @@ fn answer_clone<K: Kernel, A: BufferAlloc>(
         i,
         vt,
         share_fds,
+        child_tid as u64,
+        if flags & CLONE_CHILD_CLEARTID != 0 { args[3] } else { 0 },
     ) {
         Some(gid) => gid,
         None => {
@@ -3264,6 +3399,8 @@ fn reap_pending_if_closed<K: Kernel, A: BufferAlloc>(
 ) {
     if let Ok(kind) = k.poll(tasks()[i].ch_r) {
         if kind == aerosls_proto::CH_KIND_CLOSE {
+            let gid = tasks()[i].group as usize;
+            wake_clear_tid(k, gid, i);
             release_task(i, vfs);
         }
     }
@@ -3418,9 +3555,11 @@ pub fn service<K: Kernel, A: BufferAlloc>(
              * so a respawned child re-registers fresh. */
             aerosls_proto::CH_KIND_CLOSE => {
                 /* The thread's end is gone: release its VFS task and its
-                 * group reference. A sibling still holds the group and
-                 * the shared CLONE_FILES table alive; the last release
-                 * retires both. */
+                 * group reference. The kernel has already zeroed its
+                 * clear-child-tid word; wake the joiner before the slot can
+                 * be reused. A sibling still holds the group and the shared
+                 * CLONE_FILES table alive; the last release retires both. */
+                wake_clear_tid(k, gid, i);
                 release_task(i, vfs);
                 continue;
             }
@@ -3525,8 +3664,22 @@ pub fn service<K: Kernel, A: BufferAlloc>(
             | LINUX_GETDENTS64 | LINUX_POLL =>
                 answer_file(num, &args, &mut fds, tasks()[i].vfs_task, vfs,
                             &mut net, payload, console, now_ns, groups()[gid].gate),
+            LINUX_TKILL => match answer_tkill_sibling(gid, sigstate.tid, &args) {
+                Some(a) => a,
+                None => answer(num, &args, &fds, &mut mem, &mut sigstate, payload),
+            },
             _ => answer(num, &args, &fds, &mut mem, &mut sigstate, payload),
         };
+        /* M4.5: set_tid_address(218) also records the word on the kernel
+         * descriptor. The sidecar stores it for the join wake; the kernel
+         * owns the actual zero at exit, through the checked copy-in. */
+        if num == 218 {
+            let name = core::str::from_utf8(&name_buf[..nlen]).unwrap_or("");
+            let pid = k.sidecar_pid(name, partition);
+            if pid != 0 {
+                let _ = k.linux_set_clear_tid(pid, args[0]);
+            }
+        }
         /* M3.5: a send that the socket service refused with EPIPE is the
          * first asynchronous signal producer. The SIGPIPE decision runs
          * after the network arm and before the state is written back, so
@@ -3798,35 +3951,127 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                 enosys_log(num as u32, &name_buf[..nlen], b" wake (futex)\n");
                 reply(k, ch_w, rr.tag, num, w.n as u64, STATUS_OK);
             }
-            Answer::Exit => {
-                /* Visible like every other answer: exit_group is the one
-                 * forward that gets NO reply, so without this line the
-                 * reap would be invisible in the log. */
+            Answer::ExitThread => {
+                /* M4.5: exit(60) ends only this thread. The kernel's
+                 * teardown zeroes clear_child_tid through its checked
+                 * copy-in; the sidecar then wakes the join futex and drops
+                 * only this task, leaving siblings and the group alive. */
+                let mut ex = [0u8; 48];
+                let n = fmt_sig_line(&mut ex, b" exit status=",
+                                     args[0], b"\n");
+                enosys_log(num as u32, &name_buf[..nlen], &ex[..n]);
+                let name = core::str::from_utf8(&name_buf[..nlen]).unwrap_or("");
+                let pid = k.sidecar_pid(name, partition);
+                if pid == 0 {
+                    enosys_log(num as u32, &name_buf[..nlen], b" exit: NOT-FOUND\n");
+                    reply(k, ch_w, rr.tag, num, 0, E_CONFLICT);
+                } else {
+                    k.proc_kill(pid);
+                    wake_clear_tid(k, gid, i);
+                    release_task(i, vfs);
+                }
+            }
+            Answer::ExitGroup => {
+                /* M4.5: exit_group(231) is a GROUP sweep, not a pid loop.
+                 * The kernel resolves the TGID, terminates every member,
+                 * and zeroes each clear-tid word; this side then wakes the
+                 * joiners and retires every sidecar/VFS record. No reply:
+                 * the caller is one of the tasks the sweep just ended. */
                 let mut ex = [0u8; 48];
                 let n = fmt_sig_line(&mut ex, b" exit_group status=",
                                      args[0], b"\n");
                 enosys_log(num as u32, &name_buf[..nlen], &ex[..n]);
-                /* exit_group: reap through the same name->pid lookup the
-                 * environment destroy path uses (sidecar_pid is the
-                 * liveness test — a name that no longer resolves is a
-                 * task whose teardown already ran, so there is nothing
-                 * left to kill and nothing owed). */
-                let name = core::str::from_utf8(&name_buf[..nlen]).unwrap_or("");
-                let pid = k.sidecar_pid(name, partition);
-                if pid == 0 {
-                    /* Cannot find it: answer rather than strand the task
-                     * parked forever on a reply nobody will send. */
-                    enosys_log(num as u32, &name_buf[..nlen], b" exit_group: NOT-FOUND (reap refused)\n");
-                    reply(k, ch_w, rr.tag, num, 0, E_CONFLICT);
-                } else {
-                    /* The task is PROC_BLOCKED awaiting this very exchange
-                     * (never RUNNING), so the kill is an immediate teardown
-                     * — frames return to the partition (§5.6's exit class).
-                     * No reply: the task will never run again, and its
-                     * channel goes with its table. */
-                    k.proc_kill(pid);
-                    release_task(i, vfs);
+
+                let tgid = groups()[gid].tgid;
+                let mut members = [0usize; MAX_LINUX_TASKS];
+                let mut nm = 0usize;
+                for j in 0..MAX_LINUX_TASKS {
+                    if tasks()[j].used && tasks()[j].group == gid {
+                        members[nm] = j;
+                        nm += 1;
+                    }
                 }
+                /* Death proof before reap. The kernel's sweep returns
+                 * CAP_EAGAIN while any member is runnable or a kill
+                 * deferred; yield and retry so a CPU-bound sibling gets
+                 * preempted. Success is only accepted when BOTH the
+                 * kernel's live count reached zero (its success log) and
+                 * every sidecar record resolve fails. A record that still
+                 * resolves is never released: the group stays live and the
+                 * caller is answered with EBUSY instead of being told the
+                 * group was swept. */
+                let mut dead = 0usize;
+                let mut failed = false;
+                for attempt in 0..GROUP_SWEEP_ATTEMPTS {
+                    match k.linux_group_sweep(tgid as u32) {
+                        Ok(_) => {
+                            dead = nm - group_live_records(k, &members[..nm], partition);
+                            if dead == nm {
+                                break;
+                            }
+                            enosys_log(num as u32, &name_buf[..nlen],
+                                       b" group sweep: kernel success but live record\n");
+                        }
+                        Err(E_AGAIN) => {
+                            /* A runnable member or a deferred kill: yield so
+                             * it is preempted, then prove again. */
+                        }
+                        Err(_) => {
+                            /* A stale TGID can mean an earlier partial sweep
+                             * already retired the group; the record check is
+                             * the only honest success test in that case. */
+                            dead = nm - group_live_records(k, &members[..nm], partition);
+                            if dead == nm {
+                                break;
+                            }
+                            failed = true;
+                            break;
+                        }
+                    }
+                    if attempt + 1 == GROUP_SWEEP_ATTEMPTS {
+                        failed = true;
+                    } else {
+                        k.sched_yield();
+                    }
+                }
+                if dead != nm {
+                    failed = true;
+                }
+                if failed {
+                    enosys_log(num as u32, &name_buf[..nlen],
+                               b" group sweep FAILED: live member not reaped\n");
+                    /* Answer the caller, which is still parked on 231 and
+                     * still owns a live record. Do not release live records:
+                     * doing so would be the false kill this arm exists to
+                     * prevent. Dead records may still be retired. */
+                    reply(k, ch_w, rr.tag, num, 0, E_CONFLICT);
+                    for &j in members[..nm].iter() {
+                        if task_is_dead(k, j, partition) {
+                            wake_clear_tid(k, gid, j);
+                            release_task(j, vfs);
+                        }
+                    }
+                    let mut ex = [0u8; 64];
+                    let mut off = push_bytes(&mut ex, 0, b" group sweep FAILED live=");
+                    off = dec_into(&mut ex, off, (nm - dead) as u64);
+                    off = push_bytes(&mut ex, off, b" not reaped\n");
+                    enosys_log(num as u32, &name_buf[..nlen], &ex[..off]);
+                    continue;
+                }
+                for &j in members[..nm].iter() {
+                    wake_clear_tid(k, gid, j);
+                    release_task(j, vfs);
+                }
+                let mut ex = [0u8; 64];
+                let mut off = push_bytes(&mut ex, 0, b" group swept=");
+                off = dec_into(&mut ex, off, nm as u64);
+                off = push_bytes(&mut ex, off, b" dead=");
+                off = dec_into(&mut ex, off, dead as u64);
+                off = push_bytes(&mut ex, off, b" live=0\n");
+                enosys_log(num as u32, &name_buf[..nlen], &ex[..off]);
+                /* Every record (including the caller's) was just released;
+                 * do not fall through to the per-task state write-back. */
+                continue;
             }
             Answer::SignalKill(kill_sig) => {
                 /* E7 increment 10 (§10.13's step 2): a signal's default
@@ -3852,6 +4097,7 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                     reply(k, ch_w, rr.tag, num, 0, E_CONFLICT);
                 } else {
                     k.proc_kill(pid);
+                    wake_clear_tid(k, gid, i);
                     release_task(i, vfs);
                 }
             }
@@ -4088,7 +4334,7 @@ mod tests {
     const TID: u64 = 0x807c398;
 
     fn fresh() -> SigState {
-        SigState { tid: TID, ..SigState::new() }
+        SigState { tid: TID, tgid: TID, ..SigState::new() }
     }
 
     fn act_payload(handler: u64) -> [u8; SIGACT_BYTES] {
@@ -4737,12 +4983,26 @@ mod tests {
     }
 
     #[test]
-    fn set_tid_address_records_the_tid_through_its_own_arm() {
-        let mut sig = SigState::new();
-        let a = answer(218, &[TID, 0, 0, 0, 0, 0], &fds(), &mut ledger(),
+    fn set_tid_address_records_the_pointer_but_returns_the_real_tid() {
+        let mut sig = fresh();
+        let a = answer(218, &[0x5000, 0, 0, 0, 0, 0], &fds(), &mut ledger(),
                        &mut sig, &[]);
-        assert!(matches!(a, Answer::Reply(TID, STATUS_OK)), "echo: {:?}", a);
-        assert_eq!(sig.tid, TID, "the echo IS the recorded tid");
+        assert!(matches!(a, Answer::Reply(TID, STATUS_OK)), "tid: {:?}", a);
+        assert_eq!(sig.tid, TID, "the kernel TID did not become the pointer");
+        assert_eq!(sig.clear_tid, 0x5000, "the word is recorded for exit");
+    }
+
+    #[test]
+    fn getpid_and_gettid_are_per_thread_identities() {
+        let mut sig = fresh();
+        sig.tgid = 0x1111;
+        sig.tid = 0x2222;
+        assert!(matches!(answer(39, &[0; 6], &fds(), &mut ledger(),
+                                 &mut sig, &[]),
+                         Answer::Reply(0x1111, STATUS_OK)));
+        assert!(matches!(answer(186, &[0; 6], &fds(), &mut ledger(),
+                                  &mut sig, &[]),
+                         Answer::Reply(0x2222, STATUS_OK)));
     }
 
     #[test]
@@ -5410,8 +5670,10 @@ mod tests {
     fn clone_tracking_shares_group_state_and_last_release_retires_it() {
         reset_registry();
         assert!(track(0x10, 0x11, "m4.3.leader", 0,
-                      0x80_0000, 0x81_0000, 7, false));
+                      0x80_0000, 0x81_0000, 7, 0x7000, false));
         let gid = tasks()[0].group;
+        assert_eq!(tasks()[0].sig.tid, 0x7000, "the leader's real TID");
+        assert_eq!(tasks()[0].sig.tgid, 0x7000, "the leader is the TGID");
         assert!(groups()[gid].used);
         assert_eq!(groups()[gid].threads, 1);
         assert!(!tasks()[0].owns_fds, "the leader reads the group table");
@@ -5423,8 +5685,12 @@ mod tests {
                                              restorer: 0, mask: 0 };
         tasks()[0].sig.mask = 1 << 5; /* SIGABRT blocked */
 
-        assert_eq!(track_thread(0x20, 0x21, "m4.3.leader.t20", 0, 8, true),
+        assert_eq!(track_thread(0x20, 0x21, "m4.3.leader.t20", 0, 8, true,
+                                0x7001, 0x9000),
                    Some(gid as u32));
+        assert_eq!(tasks()[1].sig.tid, 0x7001);
+        assert_eq!(tasks()[1].sig.tgid, 0x7000);
+        assert_eq!(tasks()[1].sig.clear_tid, 0x9000);
         assert_eq!(groups()[gid].threads, 2);
         assert_eq!(tasks()[1].group, gid);
         assert!(!tasks()[1].owns_fds, "CLONE_FILES shares the group table");
@@ -5441,7 +5707,8 @@ mod tests {
         assert_eq!(tasks()[1].sig.pending, 0,
                    "pending signals are per-thread and start clear");
 
-        assert_eq!(track_thread(0x30, 0x31, "m4.3.leader.t30", 0, 9, false),
+        assert_eq!(track_thread(0x30, 0x31, "m4.3.leader.t30", 0, 9, false,
+                                0x7002, 0),
                    Some(gid as u32));
         assert!(tasks()[2].owns_fds, "no CLONE_FILES: private table copy");
         assert_eq!(tasks()[2].fds[3].vfs_fd, 9,
@@ -5480,14 +5747,16 @@ mod tests {
     #[test]
     fn futex_wait_wake_is_group_keyed_fifo_with_timeout_and_release() {
         reset_registry();
-        assert!(track(0x10, 0x11, "m4.4.leader", 0, 0x80_0000, 0x81_0000, 7, false));
+        assert!(track(0x10, 0x11, "m4.4.leader", 0, 0x80_0000, 0x81_0000,
+                      7, 0x7000, false));
         let gid = tasks()[0].group;
         for (i, (ch_r, ch_w, name)) in [
             (0x20, 0x21, "m4.4.leader.t20"),
             (0x30, 0x31, "m4.4.leader.t30"),
             (0x40, 0x41, "m4.4.leader.t40"),
         ].iter().enumerate() {
-            assert_eq!(track_thread(*ch_r, *ch_w, name, 0, 8 + i as u32, true),
+            assert_eq!(track_thread(*ch_r, *ch_w, name, 0, 8 + i as u32, true,
+                                    0x7001 + i as u64, 0),
                        Some(gid as u32));
         }
         let uaddr = 0x7000_1000u64;

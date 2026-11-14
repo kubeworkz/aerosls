@@ -371,10 +371,13 @@ else
     bad "K. the entry loop no longer services or wait-qualifies the Linux children — every forwarded syscall sits unanswered in the channel queue while its task parks forever"
 fi
 if grep -qF '218 => {' "$LRS" && \
-   grep -qF 'sig.tid = args[0];' "$LRS" && \
-   grep -qF '231 => Answer::Exit,' "$LRS" && \
+   grep -qF 'sig.clear_tid = args[0];' "$LRS" && \
+   grep -qF 'Answer::Reply(sig.tid, STATUS_OK)' "$LRS" && \
+   grep -qF 'LINUX_GETPID => Answer::Reply(sig.tgid, STATUS_OK),' "$LRS" && \
+   grep -qF 'LINUX_GETTID => Answer::Reply(sig.tid, STATUS_OK),' "$LRS" && \
+   grep -qF 'LINUX_EXIT_GROUP => Answer::ExitGroup,' "$LRS" && \
    grep -qF '_ => Answer::Reply(0, E_NOSYS),' "$LRS"; then
-    ok "K1. the answers are the census's core: set_tid_address echoes AND records the tid the seam's tkill matches against, exit_group reaps, the default arm still refuses ENOSYS with its number logged (the sig class's own answers are clause R)"
+    ok "K1. the answers are the census's core: set_tid_address records the clear-tid word and returns the real TID, getpid/gettid return TGID/TID, exit_group sweeps the group, and the default arm still refuses ENOSYS with its number logged (the sig class's own answers are clause R)"
 else
     bad "K1. an answer arm changed shape — worst is the default arm: a silent success for an unimplemented syscall is the answer §11 Q5's policy forbids"
 fi

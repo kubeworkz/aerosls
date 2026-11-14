@@ -165,6 +165,7 @@ const struct LinuxSyscallEntry linux_syscall_table[] = {
     {  15, LSC_SIG,    0 },   /* rt_sigreturn — M3: restore mask + context */
     /* M1 — the network bridge's eight numbers. Their semantics are the
      * sidecar's SocketOps, exactly as the fd class's are the VFS's. */
+    {  39, LSC_LOCAL,  0 },   /* getpid — M4.5: the group leader's TID */
     {  41, LSC_NET,    0 },   /* socket */
     {  42, LSC_NET,    0 },   /* connect */
     {  43, LSC_NET,    0 },   /* accept */
@@ -174,6 +175,7 @@ const struct LinuxSyscallEntry linux_syscall_table[] = {
     {  49, LSC_NET,    0 },   /* bind */
     {  50, LSC_NET,    0 },   /* listen */
     {  59, LSC_SPAWN,  0 },   /* execve — the spawn path */
+    {  60, LSC_EXIT,   0 },   /* exit — M4.5: end this thread only */
     {  72, LSC_FD,     0 },   /* fcntl */
     {  74, LSC_FD,     0 },   /* fsync */
     {  77, LSC_FD,     0 },   /* ftruncate */
@@ -182,6 +184,8 @@ const struct LinuxSyscallEntry linux_syscall_table[] = {
     {  87, LSC_FD,     0 },   /* unlink */
     { 131, LSC_SIG,    0 },   /* sigaltstack — M3.2 alternate-stack record */
     { 158, LSC_MSR,    0 },   /* arch_prctl(ARCH_SET_FS) — §5.3's one MSR */
+    { 186, LSC_LOCAL,  0 },   /* gettid — M4.5: this thread's own PID */
+    { 200, LSC_SIG,    0 },   /* tkill — matched against the real TID */
     { 202, LSC_FUTEX,  0 },   /* M4.4 futex — the sidecar's wait/wake queue */
     { 217, LSC_FD,     0 },   /* getdents64 */
     { 218, LSC_LOCAL,  0 },   /* set_tid_address — single-threaded: stored and ignored */

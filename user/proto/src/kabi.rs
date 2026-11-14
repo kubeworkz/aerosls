@@ -77,6 +77,17 @@ pub const TIMEOUT_NONE: u64 = u64::MAX;
 /// kernel/cap.h. The sidecar fills the IN fields, the kernel validates and
 /// fills the OUT fields; `status` carries a negative CAP code on failure (the
 /// kernel's own rax does too, but the request is what the Kabi layer reads).
+/// M4.5 set_tid_address request — the twin of `SLSLinuxClearTidRequest` in
+/// kernel/cap.h. The sidecar answers the Linux call, then records the user
+/// word on the task descriptor so every exit path can zero it.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct LinuxClearTidReq {
+    pub pid: u32,
+    pub reserved: u32,
+    pub va: u64,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct LinuxCloneThreadReq {
@@ -410,6 +421,26 @@ pub trait Kernel {
         let _ = req;
         Err(ERR_NOTFOUND)
     }
+
+    /// M4.5: terminate every thread in the Linux group led by `tgid`
+    /// (`SYS_SLS_LINUX_GROUP_SWEEP`, 331). Returns the number of group
+    /// threads the kernel swept **only after** the group's live-thread count
+    /// and descriptor scan are both zero — `process_kill` defers a RUNNING
+    /// target, so a return from the kill is not proof of death. `CAP_EAGAIN`
+    /// means a member is runnable or a teardown deferred; yield and retry.
+    /// On success the caller may reap records only after confirming each
+    /// name no longer resolves. The caller must be the owning sidecar.
+    fn linux_group_sweep(&self, tgid: u32) -> Result<u32, i32> {
+        let _ = tgid;
+        Err(ERR_NOTFOUND)
+    }
+
+    /// M4.5: record this thread's clear-child-tid word
+    /// (`SYS_SLS_LINUX_SET_CLEAR_TID`, 332). `va == 0` clears it.
+    fn linux_set_clear_tid(&self, pid: u32, va: u64) -> Result<(), i32> {
+        let _ = (pid, va);
+        Err(ERR_NOTFOUND)
+    }
 }
 
 // ── Real kernel ABI (feature `target`) ───────────────────────────────────────
@@ -489,6 +520,9 @@ mod abi {
     const SYS_NOW_NS: u64 = 329;
     // M4.2: the held Linux thread-create primitive.
     const SYS_LINUX_CLONE_THREAD: u64 = 330;
+    // M4.5: exit_group's group sweep and set_tid_address's kernel pointer.
+    const SYS_LINUX_GROUP_SWEEP: u64 = 331;
+    const SYS_LINUX_SET_CLEAR_TID: u64 = 332;
     const SYS_SIDECAR_PID: u64 = 322;
     const SYS_ENV_STORAGE_ATTACH: u64 = 323;
     const SYS_ENV_STORAGE_RESTORE: u64 = 324;
@@ -1296,6 +1330,22 @@ mod abi {
         unsafe { sls_syscall(SYS_LINUX_CLONE_THREAD, req as u64) as i64 }
     }
 
+    /// `k_linux_group_sweep`: syscall 331 — M4.5's exit_group sweep. Returns
+    /// the number of threads terminated, or a negative CAP code.
+    #[no_mangle]
+    pub extern "C" fn k_linux_group_sweep(tgid: u32) -> i64 {
+        unsafe { sls_syscall(SYS_LINUX_GROUP_SWEEP, tgid as u64) as i64 }
+    }
+
+    /// `k_linux_set_clear_tid`: syscall 332 — record (or clear, with va=0)
+    /// a task's set_tid_address word. Returns 0 or a negative CAP code.
+    #[no_mangle]
+    pub extern "C" fn k_linux_set_clear_tid(pid: u32, va: u64) -> i64 {
+        let req = LinuxClearTidReq { pid, reserved: 0, va };
+        unsafe { sls_syscall(SYS_LINUX_SET_CLEAR_TID,
+                             &req as *const LinuxClearTidReq as u64) as i64 }
+    }
+
     /// Watchdog-respawn introspection (SYS_SLS_BOOT_GEN = 319): the
     /// current process's per-name boot generation — 0 on its first boot,
     /// 1+ after a watchdog respawn (a fresh process created from the same
@@ -1571,6 +1621,16 @@ mod abi {
 
         fn sidecar_pid(&self, name: &str, partition: u32) -> u32 {
             k_sidecar_pid(name.as_ptr(), name.len() as u32, partition)
+        }
+
+        fn linux_group_sweep(&self, tgid: u32) -> Result<u32, i32> {
+            let rc = k_linux_group_sweep(tgid);
+            if rc >= 0 { Ok(rc as u32) } else { Err(rc as i32) }
+        }
+
+        fn linux_set_clear_tid(&self, pid: u32, va: u64) -> Result<(), i32> {
+            let rc = k_linux_set_clear_tid(pid, va);
+            if rc == 0 { Ok(()) } else { Err(rc as i32) }
         }
 
         fn proc_kill(&self, pid: u32) {

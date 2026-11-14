@@ -545,6 +545,7 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                                 sp.heap_base,
                                 sp.heap_limit,
                                 vt,
+                                RealKernel.sidecar_pid(crate::e7_probe::PROBE_NAME, 0) as u64,
                                 false,
                             ) {
                                 klog(b"[E7] probe: spawned ch_r=", sp.ch_r, b"");
@@ -576,6 +577,7 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                                 sp.heap_base,
                                 sp.heap_limit,
                                 vt,
+                                RealKernel.sidecar_pid(crate::e7_candidate::CAND_NAME, 0) as u64,
                                 false,
                             ) {
                                 klog(b"[E7] candidate: spawned ch_r=", sp.ch_r, b"");
@@ -649,6 +651,9 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                             sp.heap_base,
                             sp.heap_limit,
                             vt,
+                            RealKernel.sidecar_pid(
+                                if gate { crate::e7_firstuser::GATE_TASK_NAME }
+                                else { crate::e7_firstuser::USER_NAME }, 0) as u64,
                             gate,
                         ) {
                             klog(b"[E7] firstuser: spawned ch_r=", sp.ch_r, b"");
@@ -684,6 +689,7 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                             sp.heap_base,
                             sp.heap_limit,
                             vt,
+                            RealKernel.sidecar_pid(crate::m4_thread_probe::PROBE_NAME, 0) as u64,
                             true,
                         ) {
                             klog(b"[M4.2] thread probe: spawned ch_r=", sp.ch_r, b"");
@@ -718,6 +724,7 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                             sp.heap_base,
                             sp.heap_limit,
                             vt,
+                            RealKernel.sidecar_pid(crate::m4_group_probe::PROBE_NAME, 0) as u64,
                             true,
                         ) {
                             klog(b"[M4.3] group probe: spawned ch_r=", sp.ch_r, b"");
@@ -751,6 +758,7 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                             sp.heap_base,
                             sp.heap_limit,
                             vt,
+                            RealKernel.sidecar_pid(crate::m4_futex_probe::PROBE_NAME, 0) as u64,
                             true,
                         ) {
                             klog(b"[M4.4] futex probe: spawned ch_r=", sp.ch_r, b"");
@@ -761,6 +769,40 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                     Err(_) => klog(b"[M4.4] futex probe: VFS task alloc FAILED ch_r=", sp.ch_r, b""),
                 },
                 Err(rc) => klog(b"[M4.4] futex probe: spawn FAILED rc=", rc as u32, b""),
+            }
+        }
+    }
+
+    // M4.5: the live identity, thread-exit and exit_group sweep proof. The
+    // fixture checks getpid/gettid, tkill by real TID, set_tid_address's
+    // return, the clear-child-tid zero+wake after exit(60), and finally
+    // exit_group's kernel sweep. Built only with M4_EXIT_PROBE=1.
+    #[cfg(feature = "m4_exit_probe")]
+    {
+        if !gate && caps.identity.is_none() {
+            match crate::m4_exit_probe::spawn(&RealKernel, caps.budget_base,
+                                              caps.budget_len) {
+                Ok(sp) => match booted.proc.vfs.add_task() {
+                    Ok(vt) => {
+                        if crate::linux::track(
+                            sp.ch_r,
+                            sp.ch_w,
+                            crate::m4_exit_probe::PROBE_NAME,
+                            0,
+                            sp.heap_base,
+                            sp.heap_limit,
+                            vt,
+                            RealKernel.sidecar_pid(crate::m4_exit_probe::PROBE_NAME, 0) as u64,
+                            true,
+                        ) {
+                            klog(b"[M4.5] exit probe: spawned ch_r=", sp.ch_r, b"");
+                        } else {
+                            klog(b"[M4.5] exit probe: TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+                        }
+                    }
+                    Err(_) => klog(b"[M4.5] exit probe: VFS task alloc FAILED ch_r=", sp.ch_r, b""),
+                },
+                Err(rc) => klog(b"[M4.5] exit probe: spawn FAILED rc=", rc as u32, b""),
             }
         }
     }
@@ -787,6 +829,7 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                             sp.heap_base,
                             sp.heap_limit,
                             vt,
+                            RealKernel.sidecar_pid(crate::m1_net_probe::PROBE_NAME, 0) as u64,
                             true,
                         ) {
                             klog(b"[M1] net probe: spawned ch_r=", sp.ch_r, b"");

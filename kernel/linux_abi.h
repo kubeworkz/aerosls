@@ -236,6 +236,19 @@ static inline int linux_clone_flags_verdict(uint64_t flags)
 #define LINUX_FUTEX_CMD_MASK        0x7fu
 #define LINUX_FUTEX_WAIT_PAYLOAD_BYTES 24u
 
+/* ─── M4.5 — identity and thread exit ─────────────────────────────────────
+ * getpid/gettid are answered by the sidecar from the kernel-assigned
+ * identities: the TGID is the leader's PID, the TID is the task's own PID.
+ * exit(60) ends one thread; exit_group(231) sweeps the whole thread group.
+ * tkill(200) is matched against the real TID, never against the
+ * set_tid_address pointer.
+ */
+#define LINUX_GETPID                 39u
+#define LINUX_EXIT                   60u
+#define LINUX_GETTID                186u
+#define LINUX_TKILL                 200u
+#define LINUX_EXIT_GROUP            231u
+
 struct LinuxFutexPlan {
     uint64_t observed_src;   /* child VA of the 4-byte observed word */
     uint64_t timeout_src;    /* child VA of the 16-byte timespec, or 0 */

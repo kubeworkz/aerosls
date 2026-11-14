@@ -1899,6 +1899,11 @@ uint64_t do_syscall(uint64_t num, void* arg) {
         return sys_sls_linux_spawn((struct SLSCreateSidecarRequest*)arg);
 
     /* M4.2: the sidecar's held thread-create primitive (330). */
+    case SYS_SLS_LINUX_GROUP_SWEEP:
+        return sys_sls_linux_group_sweep((uint32_t)(uintptr_t)arg);
+    case SYS_SLS_LINUX_SET_CLEAR_TID:
+        return sys_sls_linux_set_clear_tid(
+            (struct SLSLinuxClearTidRequest*)arg);
     case SYS_SLS_LINUX_CLONE_THREAD:
         return sys_sls_linux_clone_thread(
             (struct SLSLinuxCloneThreadRequest*)arg);

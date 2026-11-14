@@ -4,15 +4,15 @@
 # M4 is the modern-runtime gate: Go, threaded Rust, threaded CPython, Node
 # and every other threaded runtime need `clone`, `futex`, a shared address
 # space and a thread group. The tree has M4.1's group object and refcount,
-# M4.2's clone/thread-create path, M4.3's shared group/thread state and
-# M4.4's group-keyed futex queue, but no group exit or runtime gate. This
-# guard has four jobs:
+# M4.2's clone/thread-create path, M4.3's shared group/thread state,
+# M4.4's group-keyed futex queue and M4.5's real identity/exit sweep, but no
+# thread-aware checkpoint or live runtime gate. This guard has four jobs:
 #
 #   1. While all three mechanisms are absent, the design/roadmap surfaces
 #      must keep Go and the threaded runtimes OUT.
 #   2. A documented, ordered partial stage is allowed: M4.1 (group only),
-#      M4.2 (clone + group), M4.3 (shared sidecar state) and M4.4 (futex
-#      wait/wake without group exit or a runtime gate) are named in the
+#      M4.2 (clone + group), M4.3 (shared sidecar state), M4.4 (futex
+#      wait/wake) and M4.5 (identity/exit without a checkpoint or gate) are named in the
 #      design and must still keep every runtime out. `futex` without
 #      clone/group, or clone without a group, is out of order and fails.
 #   3. All three mechanisms present is still not enough for a runtime claim:
@@ -145,13 +145,16 @@ m43_hits="$(grep -nE 'struct LinuxGroup|track_thread|release_task|drop_task_stat
     "$LINUX_RS" 2>/dev/null || true)"
 m44_hits="$(grep -nE 'struct FutexWaiter|fn answer_futex|PENDING_FUTEX|FUTEX_WAKE' \
     "$LINUX_RS" 2>/dev/null || true)"
+m45_hits="$(grep -nE 'LINUX_GETPID|LINUX_GETTID|LINUX_EXIT_GROUP|linux_group_sweep|wake_clear_tid|linux_thread_group_id_by_tgid' \
+    "$ABI_C" "$ABI_H" "$DISPATCH" "$LINUX_RS" "$LINUX_THREADS_H" 2>/dev/null || true)"
 
-clone=0; futex=0; group=0; m43=0; m44=0
+clone=0; futex=0; group=0; m43=0; m44=0; m45=0
 [ -n "$clone_hits" ] && clone=1
 [ -n "$futex_hits" ] && futex=1
 [ -n "$group_hits" ] && group=1
 [ -n "$m43_hits" ] && m43=1
 [ -n "$m44_hits" ] && m44=1
+[ -n "$m45_hits" ] && m45=1
 support=$((clone + futex + group))
 
 # The live M4.7 artifact is the ONLY thing that can unlock a runtime claim.
@@ -182,7 +185,7 @@ elif [ "$group" -eq 1 ] && [ "$clone" -eq 1 ] && [ "$futex" -eq 0 ]; then
     stage=2
 elif [ "$group" -eq 1 ] && [ "$clone" -eq 1 ] && [ "$futex" -eq 1 ]; then
     if [ "$m44" -eq 1 ]; then
-        ok "F4. M4.4 is the landed stage: clone, futex, groups and the sidecar wait queue present"
+        ok "F4. M4.5 is the landed stage: clone, futex, groups, identity/exit and the sidecar wait queue present"
     else
         ok "F4. clone, futex and thread groups are all present in the source census"
     fi
@@ -219,7 +222,7 @@ if [ "$stage" -eq 3 ]; then
     if [ "$gate_ok" -eq 1 ]; then
         ok "F8. the live M4.7 gate artifact carries GO, FUTEX, CHECKPOINT and PASS with no FAIL"
     elif [ "$m44" -eq 1 ]; then
-        ok "F8. M4.4's futex source stage is present without the M4.7 artifact; G1 checks the docs, so the wall stays"
+            ok "F8. M4.4/M4.5 source stages are present without the M4.7 artifact; G1 checks the docs, so the wall stays"
     else
         bad "F8. all three mechanisms are present but neither the live M4.7 gate artifact nor the M4.4 sidecar queue is in force"
     fi
@@ -268,10 +271,12 @@ case "$stage" in
         elif [ "$m44" -eq 1 ] &&
              grep -q 'M4\.3 landed' "$PASE" &&
              grep -q 'M4\.4 landed' "$PASE" &&
+             { [ "$m45" -eq 0 ] || grep -q 'M4\.5 landed' "$PASE"; } &&
+             grep -q 'M4\.5 landed' "$DOC" &&
              grep -q 'M4\.7 gate not evidenced' "$PASE" "$DOC" &&
              ! grep -qE 'M4\.7 gate LANDED|Go is supported|threaded runtimes are supported' \
                  "$DOC" "$PASE" "$LINUX" "$POSIX" 2>/dev/null; then
-            ok "G1. M4.4 is documented as landed with M4.5/M4.6 and the M4.7 gate not evidenced"
+            ok "G1. M4.4/M4.5 are documented as landed with M4.6 and the M4.7 gate not evidenced"
         else
             bad "G1. all mechanisms are present and the docs claim the M4.7 gate/runtime without a live gate artifact — a doc line is not evidence"
         fi

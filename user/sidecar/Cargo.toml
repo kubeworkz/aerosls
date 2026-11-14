@@ -51,3 +51,7 @@ m4_group_probe = []
 # M4_FUTEX_PROBE=1`. Default builds compile neither the module nor its
 # spawn call.
 m4_futex_probe = []
+# M4.5's live identity/thread-exit/exit_group probe — enabled only by
+# `make x86-iso ... M4_EXIT_PROBE=1`. Default builds compile neither the
+# module nor its spawn call.
+m4_exit_probe = []

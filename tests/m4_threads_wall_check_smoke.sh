@@ -112,7 +112,7 @@ fi
 
 # ─── Documentation teeth ──────────────────────────────────────────────────
 D="$W/t1"; seed "$D" || exit 2
-sed -i 's/^Status: M4\.4 landed; M4\.7 gate not evidenced; runtime wall in force\.$/Status: M4.4 landed; M4.7 gate landed; runtime supported./' \
+sed -i 's/^Status: M4\.5 landed; M4\.7 gate not evidenced; runtime wall in force\.$/Status: M4.5 landed; M4.7 gate landed; runtime supported./' \
     "$D/docs/AeroSLS-M4-Threads-Design-v0.1.md"
 tooth status-landed B1 "the design starts claiming implementation" "$D"
 
@@ -169,7 +169,7 @@ tooth false-landed G4 "a roadmap claims the M4.7 gate landed while the mechanism
 D="$W/t11"; seed "$D" || exit 2
 sed -i 's/M4\.3 landed/M4.3 not started/g; s/M4\.4 landed/M4.4 not started/g' \
     "$D/docs/AeroSLS-PASE-Linux-Shape-Decision-v0.1.md"
-sed -i 's/^Status: M4\.4 landed; M4\.7 gate not evidenced; runtime wall in force\.$/Status: M4.2 landed; M4.3 not started; M4.4 not started; M4.7 gate not evidenced; runtime wall in force./' \
+sed -i 's/^Status: M4\.5 landed; M4\.7 gate not evidenced; runtime wall in force\.$/Status: M4.2 landed; M4.3 not started; M4.4 not started; M4.5 not started; M4.7 gate not evidenced; runtime wall in force./' \
     "$D/docs/AeroSLS-M4-Threads-Design-v0.1.md"
 tooth clone-without-m43-docs G1 \
     "clone+group+split is the M4.3 stage, but the docs still say M4.3 not started" "$D"
@@ -177,6 +177,12 @@ tooth clone-without-m43-docs G1 \
 D="$W/t11b"; seed "$D" || exit 2
 expect_pass m44-stage \
     "the landed clone+futex stage with M4.4 documented and the runtime wall in force" "$D"
+
+D="$W/t11c"; seed "$D" || exit 2
+sed -i 's/M4\.5 landed/M4.5 not started/g' \
+    "$D/docs/AeroSLS-PASE-Linux-Shape-Decision-v0.1.md"
+tooth m45-source-without-doc G1 \
+    "M4.5 identity/exit source lands but the Linux-shape record does not say so" "$D"
 
 D="$W/t12"; seed "$D" || exit 2
 # Start from the group-only shape by removing every source-census clone hit,

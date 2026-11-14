@@ -2640,7 +2640,6 @@ uint32_t sys_sls_getppid(void) {
 void process_kill(uint32_t pid) {
     for (int i = 0; i < PROC_MAX; i++) {
         if (!proc_table[i].active || proc_table[i].pid != pid) continue;
-        kernel_serial_printf("[PROC] PID %u terminated.\n", pid);
         if (proc_table[i].state == PROC_RUNNING) {
             /* Self-kill (SYS_SLS_PROC_KILL with one's own pid) or any
              * hypothetical cross-CPU kill: the target is executing RIGHT
@@ -2650,6 +2649,8 @@ void process_kill(uint32_t pid) {
              * tick still finds it as "current", saves its context, runs
              * the full teardown, and switches away (schedule_ring3). */
             proc_table[i].pending_teardown = 1;
+            /* No "terminated" line on this path: the target is still
+             * executing. The deferred teardown site reports the real end. */
             kernel_serial_printf(
                 "[PROC] PID %u kill deferred (running) — teardown at next "
                 "schedule\n", pid);
@@ -2666,6 +2667,7 @@ void process_kill(uint32_t pid) {
          * leaves through one of the three sites, never more than one. */
         linux_stack_maybe_report(&proc_table[i], "exit");
         proc_table[i].state  = PROC_ZOMBIE;
+        kernel_serial_printf("[PROC] PID %u terminated.\n", pid);
         /* Phase 2 teardown, same three steps and same ordering as
          * process_exit(): the target is not executing (its CR3 is not
          * active — in this kernel a process is only RUNNING on the BSP and

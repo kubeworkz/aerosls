@@ -188,3 +188,134 @@ uint64_t sys_sls_linux_clone_thread(struct SLSLinuxCloneThreadRequest *req) {
         parent->pid, child_pid, req->tgid);
     return 0;
 }
+
+/* M4.5: exit_group(231)'s group sweep. The sidecar owns the Linux policy
+ * and calls this only after its own request is parked. The group id is
+ * resolved from the Linux-visible TGID (the leader's PID), not accepted from
+ * the sidecar as an internal slot.
+ *
+ * Death is a precondition of the report, not an assumption. process_kill()
+ * DEFERS a RUNNING target (it only marks pending_teardown and leaves the
+ * descriptor active until the next schedule); returning a killed count after
+ * that would let the sidecar reap a task that can still execute. So:
+ *
+ *   1. preflight the whole snapshot. If any member is PROC_RUNNING, return
+ *      CAP_EAGAIN before the first kill: the sidecar must yield and retry.
+ *   2. snapshot the member PIDs (process_kill mutates proc_table and the
+ *      last teardown may recycle a slot).
+ *   3. revalidate each PID after every teardown. A pid no longer in THIS
+ *      group is skipped, never killed as a stale entry.
+ *   4. only report success after both the group's live-thread count and a
+ *      fresh descriptor scan are zero. Anything still live (including a
+ *      kill that deferred) returns CAP_EAGAIN and no success count.
+ *
+ * The caller is expected to retry on CAP_EAGAIN after sched_yield(). The
+ * sweep is idempotent: a retry re-snapshots what remains. */
+static int group_sweep_preflight(struct ProcessDescriptor *caller,
+                                 uint32_t tgid, uint32_t group_id,
+                                 uint32_t *pids, uint32_t *out_n) {
+    uint32_t n = 0;
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct ProcessDescriptor *pd = &proc_table[i];
+        if (!pd->active || pd->linux_tgid != group_id) continue;
+        /* The group is confined to the caller's partition: a sidecar may
+         * sweep its own Linux tasks, never another partition's. Validate
+         * the whole snapshot before the first kill, so a refusal cannot
+         * leave a half-swept group. */
+        if (pd->partition_id != caller->partition_id)
+            return CAP_EPERM;
+        /* The sweep runs in the sidecar's syscall context. A member that is
+         * PROC_RUNNING is therefore not this CPU's current task; it is a
+         * target process_kill would defer. Refuse before killing anything
+         * and let the sidecar yield/retry until it is no longer running. */
+        if (pd->state == PROC_RUNNING) {
+            kernel_serial_printf(
+                "[PROC] M4.5 group sweep tgid=%u group=%u busy pid=%u (running)\n",
+                tgid, group_id, pd->pid);
+            return CAP_EAGAIN;
+        }
+        if (n < PROC_MAX) pids[n++] = pd->pid;
+    }
+    *out_n = n;
+    return 0;
+}
+
+static uint32_t group_sweep_active_members(uint32_t group_id) {
+    uint32_t live = 0;
+    for (int i = 0; i < PROC_MAX; i++) {
+        if (proc_table[i].active && proc_table[i].linux_tgid == group_id)
+            live++;
+    }
+    return live;
+}
+
+uint64_t sys_sls_linux_group_sweep(uint32_t tgid) {
+    struct ProcessDescriptor *caller = process_find_current();
+    if (!caller || !caller->active || !caller->sidecar_authority)
+        return (uint64_t)(int64_t)CAP_EPERM;
+
+    uint32_t group_id = linux_thread_group_id_by_tgid(tgid);
+    if (group_id == 0)
+        return (uint64_t)(int64_t)CAP_ERR_NOTFOUND;
+
+    uint32_t pids[PROC_MAX];
+    uint32_t n = 0;
+    int verdict = group_sweep_preflight(caller, tgid, group_id, pids, &n);
+    if (verdict != 0)
+        return (uint64_t)(int64_t)verdict;
+
+    uint32_t killed = 0;
+    for (uint32_t k = 0; k < n; k++) {
+        struct ProcessDescriptor *pd = clone_find_pid(pids[k]);
+        if (pd && pd->active && pd->linux_tgid == group_id) {
+            process_kill(pids[k]);
+            /* process_kill returns after DEFERRING a RUNNING target. Do not
+             * count it as killed: the liveness proof below is the report,
+             * not this call's return. */
+            struct ProcessDescriptor *after = clone_find_pid(pids[k]);
+            if (after && after->active && after->linux_tgid == group_id) {
+                kernel_serial_printf(
+                    "[PROC] M4.5 group sweep tgid=%u group=%u deferred pid=%u\n",
+                    tgid, group_id, pids[k]);
+                return (uint64_t)(int64_t)CAP_EAGAIN;
+            }
+            killed++;
+        }
+    }
+
+    uint32_t live = linux_thread_group_live(group_id);
+    uint32_t active = group_sweep_active_members(group_id);
+    if (live != 0 || active != 0) {
+        kernel_serial_printf(
+            "[PROC] M4.5 group sweep tgid=%u group=%u INCOMPLETE killed=%u live=%u active=%u\n",
+            tgid, group_id, killed, live, active);
+        return (uint64_t)(int64_t)CAP_EAGAIN;
+    }
+
+    kernel_serial_printf(
+        "[PROC] M4.5 group sweep tgid=%u group=%u killed=%u live=0\n",
+        tgid, group_id, killed);
+    return killed;
+}
+
+/* M4.5: set_tid_address(218)'s kernel half. The sidecar answers the Linux
+ * call and then names the task and word here; the descriptor owns the
+ * pointer so every teardown path (exit, signal kill, fault, group sweep)
+ * clears it through the one checked copy-in in linux_threads.c. */
+uint64_t sys_sls_linux_set_clear_tid(struct SLSLinuxClearTidRequest *req) {
+    struct ProcessDescriptor *caller = process_find_current();
+    if (!caller || !caller->active || !caller->sidecar_authority)
+        return (uint64_t)(int64_t)CAP_EPERM;
+    if (!req) return (uint64_t)(int64_t)CAP_EINVAL;
+
+    struct ProcessDescriptor *pd = clone_find_pid(req->pid);
+    if (!pd || !pd->active || pd->personality != PROC_PERSONALITY_LINUX ||
+        pd->linux_tgid == 0 || pd->partition_id != caller->partition_id)
+        return (uint64_t)(int64_t)CAP_ERR_NOTFOUND;
+    if (req->va != 0 &&
+        linux_user_range_writable(pd->cr3, req->va,
+                                  (uint32_t)sizeof(uint32_t)) != 0)
+        return (uint64_t)(int64_t)CAP_EFAULT;
+    pd->linux_clear_child_tid = req->va;
+    return 0;
+}

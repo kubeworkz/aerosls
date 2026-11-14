@@ -75,6 +75,8 @@ pub mod m4_thread_probe;
 pub mod m4_group_probe;
 #[cfg(feature = "m4_futex_probe")]
 pub mod m4_futex_probe;
+#[cfg(feature = "m4_exit_probe")]
+pub mod m4_exit_probe;
 pub mod net_client;
 
 #[cfg(feature = "target")]

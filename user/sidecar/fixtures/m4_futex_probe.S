@@ -7,9 +7,11 @@
  * then performs a timed FUTEX_WAIT with no waker and requires -ETIMEDOUT
  * before writing M4-FUTEX-OK and M4-FUTEX-TIMEOUT-OK.
  *
- * This is a raw assembly join SHAPE, not a libc pthread: the kernel's
- * clear_child_tid zero+wake on thread exit is M4.5. The two waits are
- * private futexes on the shared stack page, so the sidecar queue key is
+ * This is a raw assembly join SHAPE, not a libc pthread: M4.4 predates the
+ * clear_child_tid join arm, which M4.5 adds (and the exit probe exercises).
+ * The child uses exit(60), not exit_group, so the parent survives to print
+ * its markers. The two waits are private futexes on the shared stack page,
+ * so the sidecar queue key is
  * (group, uaddr); the timeout record exercises the kernel's observed word
  * and relative timespec copy.
  *
@@ -171,7 +173,9 @@ _start:
     movq $FUTEX_WAKE_OP, %rsi
     movq $1, %rdx
     syscall
-    movq $231, %rax
+    /* M4.5: exit(60) ends only this thread. exit_group here would sweep
+     * the parent before it could publish M4-FUTEX-OK. */
+    movq $60, %rax
     xorq %rdi, %rdi
     syscall
     ud2
@@ -189,7 +193,7 @@ _start:
     leaq .Lfail_msg(%rip), %rsi
     movq $.Lfail_len, %rdx
     syscall
-    movq $231, %rax
+    movq $60, %rax
     movq $1, %rdi
     syscall
     ud2

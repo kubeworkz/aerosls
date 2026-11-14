@@ -80,6 +80,10 @@ static void test_multi_thread_lifecycle(void) {
     CHECK(linux_thread_group_refs(1) == 1, "a fresh group has one cr3 reference");
     CHECK(linux_thread_group_live(1) == 1, "a fresh group has one live thread");
     CHECK(linux_thread_group_tgid(1) == 100, "the group TGID is the leader pid");
+    CHECK(linux_thread_group_id_by_tgid(100) == 1,
+          "the group id resolves from the Linux-visible TGID");
+    CHECK(linux_thread_group_id_by_tgid(999) == 0,
+          "an unknown TGID resolves to no group");
     CHECK(linux_thread_group_cr3(1) == 0x1000, "the group stores the leader cr3");
 
     pd_init(&thread1, 101, 0x1000);
@@ -405,6 +409,44 @@ static void test_clone_context_and_flags(void) {
           "the verdict is total over arbitrary flag words");
 }
 
+/* M4.5: the kernel half of clear_child_tid. The sidecar owns the wake, but
+ * the zero must happen at exit through the checked copy path, before the
+ * descriptor leaves the group and while the shared PML4 is still live. The
+ * seam maps exactly one word, so both outcomes are visible: a mapped ctid
+ * is cleared; an unmapped one is silent and never blocks the detach. */
+static void test_clear_child_tid_zero(void) {
+    struct ProcessDescriptor leader, thread;
+    uint64_t dead = 0;
+    uint32_t word = 0xA5A5A5A5u;
+
+    linux_thread_groups_reset();
+    pd_init(&leader, 800, 0xB000);
+    CHECK(linux_thread_group_create(&leader, 0xB000) == 1,
+          "clear-tid test group is created");
+    pd_init(&thread, 801, 0xB000);
+    CHECK(linux_thread_group_attach(&thread, 1, 801) == 1,
+          "clear-tid thread attaches");
+    thread.linux_clear_child_tid = 0x900100;
+    linux_thread_test_clear_tid_target(0x900100, &word);
+    CHECK(linux_thread_group_detach(&thread, &dead) == 1,
+          "the clear-tid thread detaches");
+    CHECK(word == 0, "the mapped clear-child-tid word is zeroed at exit");
+    CHECK(thread.linux_clear_child_tid == 0,
+          "the descriptor's clear-tid is consumed");
+
+    pd_init(&thread, 802, 0xB000);
+    CHECK(linux_thread_group_attach(&thread, 1, 802) == 1,
+          "second clear-tid thread attaches");
+    thread.linux_clear_child_tid = 0x900200; /* not the seam's mapped word */
+    CHECK(linux_thread_group_detach(&thread, &dead) == 1,
+          "an unmapped clear-tid still detaches");
+    CHECK(thread.linux_clear_child_tid == 0,
+          "the refused zero does not strand the exit path");
+    CHECK(linux_thread_group_detach(&leader, &dead) == 1 && dead == 0xB000,
+          "the same group still reaches its last-reference destroy");
+    linux_thread_test_clear_tid_target(0, 0);
+}
+
 int main(void) {
     printf("linux_thread_group_host_test — M4.1 shared-CR3 lifetime + M4.2 context\n");
     test_multi_thread_lifecycle();
@@ -414,6 +456,7 @@ int main(void) {
     test_table_bound();
     test_reset_clears_live_groups();
     test_clone_context_and_flags();
+    test_clear_child_tid_zero();
 
     printf("%d checks, %d failure(s)\n", checks, failures);
     if (failures != 0) {

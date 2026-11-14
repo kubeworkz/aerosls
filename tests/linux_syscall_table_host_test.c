@@ -130,6 +130,7 @@ int main(void)
         {  13, LSC_SIG,   "rt_sigaction" },
         {  14, LSC_SIG,   "rt_sigprocmask" },
         {  15, LSC_SIG,   "rt_sigreturn" },
+        {  39, LSC_LOCAL, "getpid" },
         {  41, LSC_NET,   "socket" },
         {  42, LSC_NET,   "connect" },
         {  43, LSC_NET,   "accept" },
@@ -139,6 +140,7 @@ int main(void)
         {  49, LSC_NET,   "bind" },
         {  50, LSC_NET,   "listen" },
         {  59, LSC_SPAWN, "execve" },
+        {  60, LSC_EXIT,  "exit" },
         {  72, LSC_FD,    "fcntl" },
         {  74, LSC_FD,    "fsync" },
         {  77, LSC_FD,    "ftruncate" },
@@ -147,6 +149,8 @@ int main(void)
         {  87, LSC_FD,    "unlink" },
         { 131, LSC_SIG,   "sigaltstack" },
         { 158, LSC_MSR,   "arch_prctl" },
+        { 186, LSC_LOCAL, "gettid" },
+        { 200, LSC_SIG,   "tkill" },
         { 202, LSC_FUTEX, "futex" },
         { 217, LSC_FD,    "getdents64" },
         { 218, LSC_LOCAL, "set_tid_address" },
@@ -177,7 +181,7 @@ int main(void)
           "160 (SLS SYS_SLS_PROC_CREATE) is UNKNOWN");
     CHECK(linux_syscall_class(320) == LSC_UNKNOWN,
           "320 (SLS SYS_SLS_ALLOC_REGION / Linux kexec_file_load) is UNKNOWN");
-    CHECK(linux_syscall_class(200) == LSC_UNKNOWN,
+    CHECK(linux_syscall_class(201) == LSC_UNKNOWN,
           "any number outside the census is UNKNOWN — refusal by name, never dispatch");
 
     /* ─── Table hygiene: sorted, self-consistent, total names ───────────── */
@@ -200,7 +204,7 @@ int main(void)
         CHECK(strcmp(linux_syscall_class_name(LSC_UNKNOWN), "unknown") == 0,
               "LSC_UNKNOWN's name is \"unknown\" (the refusal line's wording)");
         CHECK(linux_syscall_table_len == sizeof(want) / sizeof(want[0]),
-              "the table's length equals the census's 27 rows, M1's eight network numbers and M4.4's futex row");
+              "the table's length equals the census's 27 rows plus M1, M4.4 and M4.5's declared rows");
     }
 
     printf("linux_syscall_table_host_test: %d passed, %d failed\n",

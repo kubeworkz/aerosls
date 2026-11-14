@@ -1167,6 +1167,33 @@ int cap_create_sidecar(uint32_t parent_pid,
  * mechanism, not the full clone state model. */
 #define SYS_SLS_LINUX_CLONE_THREAD 330
 
+/* ─── SYS_SLS_LINUX_GROUP_SWEEP (331) — M4.5 ──────────────────────────────
+ * The sidecar's kernel primitive for exit_group(231): given the leader's
+ * PID/TGID, terminate every live thread in that group. It is intentionally
+ * group-scoped (not a pid loop in the sidecar) so a caller can never leave
+ * one thread holding the shared PML4 after exit_group returned. The sidecar
+ * is the only caller: caller->sidecar_authority is checked. The sweep
+ * refuses a runnable member with CAP_EAGAIN before killing anything, and
+ * returns its count only after both the group's live-thread count and a
+ * descriptor scan are zero; an unknown TGID is CAP_ERR_NOTFOUND. */
+#define SYS_SLS_LINUX_GROUP_SWEEP 331
+
+/* ─── SYS_SLS_LINUX_SET_CLEAR_TID (332) — M4.5 ────────────────────────────
+ * set_tid_address(218) stores a user pointer in the kernel descriptor so
+ * thread exit can zero it and the sidecar can wake the join futex. The
+ * address is checked writable here; the actual zero still runs through the
+ * checked copy-in at exit, so an unmapped later page is silent, not fatal. */
+#define SYS_SLS_LINUX_SET_CLEAR_TID 332
+
+struct SLSLinuxClearTidRequest {
+    uint32_t pid;           /* IN: the Linux task changing its clear-tid */
+    uint32_t reserved;      /* zero */
+    uint64_t va;            /* IN: the user word, or 0 to clear it */
+};
+
+uint64_t sys_sls_linux_group_sweep(uint32_t tgid);
+uint64_t sys_sls_linux_set_clear_tid(struct SLSLinuxClearTidRequest *req);
+
 struct SLSLinuxCloneThreadRequest {
     uint32_t status;        /* OUT: 0 or a negative CAP_E* */
     uint32_t parent_pid;    /* IN: the Linux task issuing clone */
