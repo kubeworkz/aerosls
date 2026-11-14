@@ -732,6 +732,39 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         }
     }
 
+    // M4.4: the live futex wait/wake proof. The parent and its clone child
+    // handshake through the same shared stack page: FUTEX_WAKE releases the
+    // child, the child's done wake releases the parent, and a timed wait
+    // proves -ETIMEDOUT. Built only with M4_FUTEX_PROBE=1.
+    #[cfg(feature = "m4_futex_probe")]
+    {
+        if !gate && caps.identity.is_none() {
+            match crate::m4_futex_probe::spawn(&RealKernel, caps.budget_base,
+                                               caps.budget_len) {
+                Ok(sp) => match booted.proc.vfs.add_task() {
+                    Ok(vt) => {
+                        if crate::linux::track(
+                            sp.ch_r,
+                            sp.ch_w,
+                            crate::m4_futex_probe::PROBE_NAME,
+                            0,
+                            sp.heap_base,
+                            sp.heap_limit,
+                            vt,
+                            true,
+                        ) {
+                            klog(b"[M4.4] futex probe: spawned ch_r=", sp.ch_r, b"");
+                        } else {
+                            klog(b"[M4.4] futex probe: TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+                        }
+                    }
+                    Err(_) => klog(b"[M4.4] futex probe: VFS task alloc FAILED ch_r=", sp.ch_r, b""),
+                },
+                Err(rc) => klog(b"[M4.4] futex probe: spawn FAILED rc=", rc as u32, b""),
+            }
+        }
+    }
+
     // M1: the live Linux TCP round trip. Compiled only into an image built
     // with M1_NET_PROBE=1; the child is spawned by the initial POSIX sidecar
     // (no E3 identity), whose `network` cap is the live driver path the

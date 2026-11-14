@@ -112,7 +112,7 @@ fi
 
 # ─── Documentation teeth ──────────────────────────────────────────────────
 D="$W/t1"; seed "$D" || exit 2
-sed -i 's/^Status: M4\.3 landed; M4\.7 gate not evidenced; runtime wall in force\.$/Status: M4.3 landed; M4.7 gate landed; runtime supported./' \
+sed -i 's/^Status: M4\.4 landed; M4\.7 gate not evidenced; runtime wall in force\.$/Status: M4.4 landed; M4.7 gate landed; runtime supported./' \
     "$D/docs/AeroSLS-M4-Threads-Design-v0.1.md"
 tooth status-landed B1 "the design starts claiming implementation" "$D"
 
@@ -141,7 +141,7 @@ sed -i '/M4\.5 — Identity/d' "$D/docs/AeroSLS-M4-Threads-Design-v0.1.md"
 tooth missing-m45 E5 "the exit/identity increment disappears" "$D"
 
 D="$W/t6"; seed "$D" || exit 2
-sed -i 's/M4\.1 landed 2026-11-14//g; s/M4\.2 landed 2026-11-14//g; s/M4\.2 landed//g; s/M4\.3 landed 2026-11-14//g; s/M4\.3 landed//g' \
+sed -i 's/M4\.1 landed 2026-11-14//g; s/M4\.2 landed 2026-11-14//g; s/M4\.2 landed//g; s/M4\.3 landed 2026-11-14//g; s/M4\.3 landed//g; s/M4\.4 landed 2026-11-14//g; s/M4\.4 landed//g' \
     "$D/docs/AeroSLS-PASE-Linux-Shape-Decision-v0.1.md"
 tooth pase-status-gone G1 "the Linux-shape record loses the spike status" "$D"
 
@@ -167,16 +167,16 @@ tooth false-landed G4 "a roadmap claims the M4.7 gate landed while the mechanism
 
 # ─── Source-census teeth ──────────────────────────────────────────────────
 D="$W/t11"; seed "$D" || exit 2
-sed -i 's/M4\.3 landed/M4.3 not started/g' \
+sed -i 's/M4\.3 landed/M4.3 not started/g; s/M4\.4 landed/M4.4 not started/g' \
     "$D/docs/AeroSLS-PASE-Linux-Shape-Decision-v0.1.md"
-sed -i 's/^Status: M4\.3 landed; M4\.7 gate not evidenced; runtime wall in force\.$/Status: M4.2 landed; M4.3 not started; M4.7 gate not evidenced; runtime wall in force./' \
+sed -i 's/^Status: M4\.4 landed; M4\.7 gate not evidenced; runtime wall in force\.$/Status: M4.2 landed; M4.3 not started; M4.4 not started; M4.7 gate not evidenced; runtime wall in force./' \
     "$D/docs/AeroSLS-M4-Threads-Design-v0.1.md"
 tooth clone-without-m43-docs G1 \
     "clone+group+split is the M4.3 stage, but the docs still say M4.3 not started" "$D"
 
 D="$W/t11b"; seed "$D" || exit 2
-expect_pass m43-stage \
-    "the landed clone+group+split stage with M4.3 documented and the runtime wall in force" "$D"
+expect_pass m44-stage \
+    "the landed clone+futex stage with M4.4 documented and the runtime wall in force" "$D"
 
 D="$W/t12"; seed "$D" || exit 2
 # Start from the group-only shape by removing every source-census clone hit,
@@ -188,8 +188,12 @@ tooth futex-only F5 "futex appears without clone and a group" "$D"
 
 D="$W/t13"; seed "$D" || exit 2
 printf '\n#define LINUX_CLONE 56\n#define LINUX_FUTEX 202\n' >> "$D/kernel/linux_abi.h"
+sed -i 's/struct FutexWaiter/struct FutexSlot/g; s/fn answer_futex/fn answer_wait/g; s/PENDING_FUTEX/PENDING_WAIT/g; s/FUTEX_WAKE/FUTEX_UP/g' \
+    "$D/user/sidecar/src/linux.rs"
+sed -i 's/M4\.4 landed/M4.4 not started/g' \
+    "$D/docs/AeroSLS-PASE-Linux-Shape-Decision-v0.1.md"
 tooth all-present-no-evidence F8 \
-    "all three mechanisms appear without the live gate artifact" "$D"
+    "all three mechanisms appear without the documented M4.4 stage or live artifact" "$D"
 
 D="$W/t13b"; seed "$D" || exit 2
 printf '\n#define LINUX_CLONE 56\n#define LINUX_FUTEX 202\n' >> "$D/kernel/linux_abi.h"

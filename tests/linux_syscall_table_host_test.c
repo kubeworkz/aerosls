@@ -129,6 +129,7 @@ int main(void)
         {  12, LSC_MEM,   "brk" },
         {  13, LSC_SIG,   "rt_sigaction" },
         {  14, LSC_SIG,   "rt_sigprocmask" },
+        {  15, LSC_SIG,   "rt_sigreturn" },
         {  41, LSC_NET,   "socket" },
         {  42, LSC_NET,   "connect" },
         {  43, LSC_NET,   "accept" },
@@ -146,6 +147,7 @@ int main(void)
         {  87, LSC_FD,    "unlink" },
         { 131, LSC_SIG,   "sigaltstack" },
         { 158, LSC_MSR,   "arch_prctl" },
+        { 202, LSC_FUTEX, "futex" },
         { 217, LSC_FD,    "getdents64" },
         { 218, LSC_LOCAL, "set_tid_address" },
         { 228, LSC_LOCAL, "clock_gettime" },
@@ -198,7 +200,7 @@ int main(void)
         CHECK(strcmp(linux_syscall_class_name(LSC_UNKNOWN), "unknown") == 0,
               "LSC_UNKNOWN's name is \"unknown\" (the refusal line's wording)");
         CHECK(linux_syscall_table_len == sizeof(want) / sizeof(want[0]),
-              "the table's length equals the census's 27 rows plus M1's eight network numbers");
+              "the table's length equals the census's 27 rows, M1's eight network numbers and M4.4's futex row");
     }
 
     printf("linux_syscall_table_host_test: %d passed, %d failed\n",

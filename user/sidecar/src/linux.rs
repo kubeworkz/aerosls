@@ -384,6 +384,17 @@ const O_NONBLOCK: u32 = 0x800;
 /// struct pollfd is fd: i32, events: i16, revents: i16; 16 entries cap
 /// one call so neither end's frame can grow unbounded.
 const LINUX_POLL: u64 = 7;
+/// futex(202) — M4.4's group-keyed wait/wake. Only the private wait and
+/// wake operations are served; requeue, PI, robust lists and bitsets are
+/// named follow-ons and are refused ENOSYS rather than guessed. The kernel
+/// attaches the observed word and optional relative timespec; this side
+/// owns the queue and every policy decision (D6).
+const LINUX_FUTEX: u64 = 202;
+const FUTEX_WAIT: u64 = 0;
+const FUTEX_WAKE: u64 = 1;
+const FUTEX_PRIVATE: u64 = 128;
+const FUTEX_WAIT_PAYLOAD_BYTES: usize = 24;
+const NS_PER_SEC: u64 = 1_000_000_000;
 const POLLERR: u16 = 0x0008;
 const LINUX_POLL_MAX_FDS: usize = 16;
 const LINUX_POLLFD_BYTES: usize = 8;
@@ -395,6 +406,7 @@ const LINUX_POLL_PAYLOAD_BYTES: usize = LINUX_POLL_MAX_FDS * LINUX_POLLFD_BYTES;
 const PENDING_NONE: u8 = 0;
 const PENDING_READ: u8 = 1;
 const PENDING_POLL: u8 = 2;
+const PENDING_FUTEX: u8 = 3;
 
 /// The path cap — the twin of kernel/linux_abi.h's LINUX_PATH_CAP and
 /// the shim's NAMED divergence from PATH_MAX 4096 (the kernel refuses a
@@ -488,6 +500,7 @@ const E_DESTADDRREQ: i32 = -26;
 const E_MSGSIZE: i32 = -27;
 const E_PIPE: i32 = -28;
 const E_CONNREFUSED: i32 = -29;
+const E_TIMEOUT: i32 = 13;      /* CAP_ERR_TIMEOUT -> -ETIMEDOUT */
 const E_NETUNREACH: i32 = -30;
 const E_HOSTUNREACH: i32 = -31;
 const E_AFNOSUPPORT: i32 = -32;
@@ -552,6 +565,13 @@ enum Answer {
     /// nanoseconds (0 = POSIX's -1, wait forever). `service` re-scans the
     /// array on every pass; readiness or the deadline answers it.
     PollWait([u8; LINUX_POLL_PAYLOAD_BYTES], usize, u64),
+    /// M4.4: FUTEX_WAIT matched the observed word. The task is enqueued in
+    /// its group's FIFO wait list and parked until a FUTEX_WAKE or the
+    /// deadline (0 = forever). No reply crosses on this arm.
+    FutexWait(u64, u64),
+    /// M4.4: FUTEX_WAKE removed these waiters, oldest first. `service` sends
+    /// each one the deferred zero reply and answers the waker with the count.
+    FutexWake(FutexWake),
     /// exit_group: reap the task, reply nothing.
     Exit,
     /// E7 increment 10 (the signal seam): a signal's DEFAULT ACTION ran —
@@ -568,6 +588,16 @@ enum Answer {
     /// signal frame and sysrets into `handler`; `rt_sigreturn` comes back
     /// as a normal num=15 request so this side restores the saved mask.
     SignalHandler(SignalDelivery),
+}
+
+/// M4.4: the bounded set a FUTEX_WAKE selected. The count is the Linux
+/// return value; the task indices are the waiters whose deferred replies
+/// `service` sends after the queue transition.
+#[cfg_attr(test, derive(Debug))]
+#[derive(Clone, Copy)]
+struct FutexWake {
+    n: u8,
+    tasks: [u8; MAX_FUTEX_WAITERS],
 }
 
 /// One Linux task's §5.4 heap ledger: the budget span the create stamped
@@ -1526,6 +1556,11 @@ fn expected_req_len(num: u64, args: &[u64; 6]) -> usize {
         LINUX_RT_SIGACTION if args[1] != 0 => LINUX_SYSCALL_REQ_BYTES + SIGACT_BYTES,
         LINUX_RT_SIGPROCMASK if args[1] != 0 => LINUX_SYSCALL_REQ_BYTES + SIGSET_BYTES as usize,
         LINUX_SIGALTSTACK if args[0] != 0 => LINUX_SYSCALL_REQ_BYTES + STACK_T_BYTES,
+        /* M4.4: only the private WAIT shape carries the 24-byte observed/
+         * timeout record. A WAKE and every unsupported operation are the
+         * plain header, which the sidecar's named refusal can answer. */
+        LINUX_FUTEX if args[1] == (FUTEX_WAIT | FUTEX_PRIVATE) =>
+            LINUX_SYSCALL_REQ_BYTES + FUTEX_WAIT_PAYLOAD_BYTES,
         _ => LINUX_SYSCALL_REQ_BYTES,
     }
 }
@@ -2464,6 +2499,20 @@ fn dents_payload(ents: &[DirEnt], buf: &mut [u8; FD_PAYLOAD_CAP]) -> usize {
     off
 }
 
+/// M4.4: one parked FUTEX_WAIT. The queue is bounded by the task table,
+/// because a task can hold at most one parked request and every waiter is
+/// therefore a live `LinuxTask`. `seq` gives FIFO wake order independent of
+/// slot reuse; `task` is the sidecar table index whose reply the wake sends.
+#[derive(Clone, Copy)]
+struct FutexWaiter {
+    used: bool,
+    task: u8,
+    uaddr: u64,
+    seq: u64,
+}
+
+const MAX_FUTEX_WAITERS: usize = 8;
+
 /// M4.3: the state `CLONE_VM`/`CLONE_FILES`/`CLONE_SIGHAND` make shared.
 /// A Linux thread group owns exactly one of these; every task in the group
 /// points at it. The fd table, the §5.4 heap ledger and the signal
@@ -2484,6 +2533,8 @@ struct LinuxGroup {
     brk_mtop: u64,
     sig_dispo: [u8; SIG_MAX + 1],
     sig_act: [SigAct; SIG_MAX + 1],
+    futex: [FutexWaiter; MAX_FUTEX_WAITERS],
+    futex_seq: u64,
 }
 
 impl LinuxGroup {
@@ -2501,6 +2552,9 @@ impl LinuxGroup {
             brk_mtop: 0,
             sig_dispo: [DISPO_DFL; SIG_MAX + 1],
             sig_act: [SigAct::new(); SIG_MAX + 1],
+            futex: [FutexWaiter { used: false, task: 0, uaddr: 0, seq: 0 };
+                    MAX_FUTEX_WAITERS],
+            futex_seq: 0,
         }
     }
 }
@@ -2540,7 +2594,8 @@ struct LinuxTask {
      * further request can arrive"; `service` checks readiness and the
      * deadline before it polls the channel. Nothing here is inherited by
      * a reused slot (track() resets all of it). */
-    pending: u8,      /* PENDING_NONE / PENDING_READ / PENDING_POLL       */
+    pending: u8,      /* PENDING_NONE / PENDING_READ / PENDING_POLL /     */
+                      /* PENDING_FUTEX                                    */
     pending_tag: u32, /* the tag the reply must echo                            */
     pending_arg: u64, /* read: the clamped count; poll: nfds                    */
     pending_len: usize, /* poll: array bytes (nfds * 8; 0 for a pure sleep)     */
@@ -2743,6 +2798,7 @@ fn drop_task_state(i: usize) -> Option<u32> {
     tasks()[i].used = false;
     if gid < MAX_LINUX_GROUPS && groups()[gid].used {
         let g = &mut groups()[gid];
+        futex_remove(g, i);
         g.threads = g.threads.saturating_sub(1);
         if g.threads == 0 {
             *g = LinuxGroup::new();
@@ -2760,6 +2816,116 @@ fn release_task<K: Kernel, A: BufferAlloc>(i: usize, vfs: &mut Vfs<K, A>) {
     }
 }
 
+/// M4.4: remove a task's queued FUTEX_WAIT. Called on every release before
+/// the group count drops, so a killed waiter can never be answered later by
+/// a wake that selected a stale task index.
+fn futex_remove(g: &mut LinuxGroup, task: usize) {
+    for w in g.futex.iter_mut() {
+        if w.used && w.task as usize == task {
+            *w = FutexWaiter { used: false, task: 0, uaddr: 0, seq: 0 };
+        }
+    }
+}
+
+/// Parse the fixed wait record's relative timespec. 0 means no timeout;
+/// a zero relative timespec is Linux's immediate ETIMEDOUT; a negative or
+/// out-of-range value is EINVAL. The addition is checked, so a tenant's
+/// huge timeout cannot wrap into an accidental early wake.
+fn futex_deadline(payload: &[u8], now: u64) -> Result<u64, i32> {
+    if payload.len() != FUTEX_WAIT_PAYLOAD_BYTES {
+        return Err(E_NOSYS);
+    }
+    let has = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+    if has == 0 {
+        return Ok(0);
+    }
+    let sec = read_u64(payload, 8) as i64;
+    let nsec = read_u64(payload, 16);
+    if sec < 0 || nsec >= NS_PER_SEC {
+        return Err(E_INVAL);
+    }
+    let rel = (sec as u64).checked_mul(NS_PER_SEC)
+        .and_then(|s| s.checked_add(nsec))
+        .ok_or(E_INVAL)?;
+    if rel == 0 {
+        return Err(E_TIMEOUT);
+    }
+    now.checked_add(rel).ok_or(E_INVAL)
+}
+
+fn futex_enqueue(g: &mut LinuxGroup, task: usize, uaddr: u64) -> bool {
+    if let Some(w) = g.futex.iter_mut().find(|w| !w.used) {
+        w.used = true;
+        w.task = task as u8;
+        w.uaddr = uaddr;
+        w.seq = g.futex_seq;
+        g.futex_seq = g.futex_seq.wrapping_add(1);
+        true
+    } else {
+        false
+    }
+}
+
+fn futex_wake(g: &mut LinuxGroup, uaddr: u64, want: usize) -> FutexWake {
+    let mut out = FutexWake { n: 0, tasks: [0; MAX_FUTEX_WAITERS] };
+    while (out.n as usize) < want {
+        let mut pick: Option<usize> = None;
+        for (i, w) in g.futex.iter().enumerate() {
+            if !w.used || w.uaddr != uaddr {
+                continue;
+            }
+            if pick.map_or(true, |p| w.seq < g.futex[p].seq) {
+                pick = Some(i);
+            }
+        }
+        let Some(i) = pick else { break };
+        out.tasks[out.n as usize] = g.futex[i].task;
+        out.n += 1;
+        g.futex[i] = FutexWaiter { used: false, task: 0, uaddr: 0, seq: 0 };
+    }
+    out
+}
+
+/// M4.4's pure futex arm. The group owns the queue; `task` is the caller's
+/// table index (recorded in the wait entry) and `now` is the service pass's
+/// one clock sample. WAIT compares the kernel's observed word with the
+/// caller's expected value before enqueueing; WAKE removes the oldest
+/// matching entries up to the requested count and reports them back for the
+/// deferred replies. Both operations are private-only in this increment.
+fn answer_futex(
+    g: &mut LinuxGroup,
+    task: usize,
+    args: &[u64; 6],
+    payload: &[u8],
+    now: u64,
+) -> Answer {
+    let op = args[1];
+    if op == (FUTEX_WAIT | FUTEX_PRIVATE) {
+        if payload.len() != FUTEX_WAIT_PAYLOAD_BYTES {
+            return Answer::Reply(0, E_NOSYS);
+        }
+        let observed = u32::from_le_bytes([payload[0], payload[1],
+                                            payload[2], payload[3]]);
+        if observed != args[2] as u32 {
+            return Answer::Reply(0, E_AGAIN);
+        }
+        let deadline = match futex_deadline(payload, now) {
+            Ok(d) => d,
+            Err(E_TIMEOUT) => return Answer::Reply(0, E_TIMEOUT),
+            Err(e) => return Answer::Reply(0, e),
+        };
+        if !futex_enqueue(g, task, args[0]) {
+            return Answer::Reply(0, E_TABLEFULL);
+        }
+        Answer::FutexWait(args[0], deadline)
+    } else if op == (FUTEX_WAKE | FUTEX_PRIVATE) {
+        let want = args[2].min(MAX_FUTEX_WAITERS as u64) as usize;
+        Answer::FutexWake(futex_wake(g, args[0], want))
+    } else {
+        Answer::Reply(0, E_NOSYS)
+    }
+}
+
 /// Append every tracked child's recv channel to a wait set (the entry
 /// loop's quiesce park): a child's forward must WAKE the sidecar, not spin
 /// it. Silent no-op when `chans` is full — the service() poll in the loop
@@ -2774,19 +2940,21 @@ pub fn append_wait(chans: &mut [u32], n: &mut usize) {
     }
 }
 
-/// E7 increment 24: the nearest finite poll deadline, in nanoseconds from
-/// `now`, or TIMEOUT_NONE when no parked poll has one (a blocking console
-/// read and POSIX's -1 poll wait on readiness alone). The entry loop hands
-/// this to `Kernel::wait`, so a timed poll wakes the sidecar when it
-/// expires; without it a 5000 ms poll would sleep until some unrelated
-/// channel woke the loop, which is not the timeout the caller asked for.
-/// The kernel clock is ~10 ms granular, so a short deadline lands within
-/// one tick — a resolver, not a real-time guarantee.
+/// E7 increment 24 / M4.4: the nearest finite poll or futex deadline, in
+/// nanoseconds from `now`, or TIMEOUT_NONE when no parked request has one
+/// (a blocking console read and POSIX's -1 poll/futex wait on readiness or
+/// wake alone). The entry loop hands this to `Kernel::wait`, so a timed
+/// request wakes the sidecar when it expires; without it a 5000 ms poll or
+/// a futex timeout would sleep until some unrelated channel woke the loop,
+/// which is not the timeout the caller asked for. The kernel clock is ~10 ms
+/// granular, so a short deadline lands within one tick — a resolver, not a
+/// real-time guarantee.
 pub fn next_wait_ns<K: Kernel>(k: &K) -> u64 {
     let now = k.now_ns();
     let mut best = aerosls_proto::kabi::TIMEOUT_NONE;
     for t in tasks().iter() {
-        if t.used && t.pending == PENDING_POLL && t.pending_deadline != 0 {
+        if t.used && (t.pending == PENDING_POLL || t.pending == PENDING_FUTEX)
+            && t.pending_deadline != 0 {
             let rem = t.pending_deadline.saturating_sub(now);
             if rem < best {
                 best = rem;
@@ -3215,6 +3383,20 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                     continue;
                 }
             }
+            PENDING_FUTEX => {
+                let tag = tasks()[i].pending_tag;
+                let deadline = tasks()[i].pending_deadline;
+                if deadline != 0 && poll_expired(deadline, now_ns) {
+                    tasks()[i].pending = PENDING_NONE;
+                    futex_remove(&mut groups()[gid], i);
+                    enosys_log(LINUX_FUTEX as u32, &name_buf[..nlen],
+                               b" wait timed out\n");
+                    reply(k, ch_w, tag, LINUX_FUTEX, 0, E_TIMEOUT);
+                } else {
+                    reap_pending_if_closed(k, i, vfs);
+                    continue;
+                }
+            }
             _ => {}
         }
 
@@ -3326,6 +3508,11 @@ pub fn service<K: Kernel, A: BufferAlloc>(
              * it needs the kernel primitive, and it is the only arm that
              * grows the sidecar's task table from inside service(). */
             LINUX_CLONE => answer_clone(k, i, &args, vfs),
+            /* M4.4: the group-keyed wait/wake queue. The observed word and
+             * relative timeout are the kernel's attached record; the group
+             * owns the queue, and the deferred replies are sent below. */
+            LINUX_FUTEX => answer_futex(&mut groups()[gid], i, &args,
+                                        payload, now_ns),
             /* M1: the network class's eight numbers route to their own
              * translation over SocketOps; the file class below is
              * unchanged. */
@@ -3587,6 +3774,29 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                 tasks()[i].pending_deadline = deadline;
                 enosys_log(num as u32, &name_buf[..nlen],
                            b" wait (poll)\n");
+            }
+            Answer::FutexWait(uaddr, deadline) => {
+                tasks()[i].pending = PENDING_FUTEX;
+                tasks()[i].pending_tag = rr.tag;
+                tasks()[i].pending_arg = uaddr;
+                tasks()[i].pending_deadline = deadline;
+                enosys_log(num as u32, &name_buf[..nlen],
+                           b" wait (futex)\n");
+            }
+            Answer::FutexWake(w) => {
+                for &idx in w.tasks[..w.n as usize].iter() {
+                    let j = idx as usize;
+                    if j >= MAX_LINUX_TASKS || !tasks()[j].used ||
+                        tasks()[j].pending != PENDING_FUTEX {
+                        continue;
+                    }
+                    let wake_tag = tasks()[j].pending_tag;
+                    let wake_ch = tasks()[j].ch_w;
+                    tasks()[j].pending = PENDING_NONE;
+                    reply(k, wake_ch, wake_tag, LINUX_FUTEX, 0, STATUS_OK);
+                }
+                enosys_log(num as u32, &name_buf[..nlen], b" wake (futex)\n");
+                reply(k, ch_w, rr.tag, num, w.n as u64, STATUS_OK);
             }
             Answer::Exit => {
                 /* Visible like every other answer: exit_group is the one
@@ -3962,6 +4172,10 @@ mod tests {
         a[1] = 0; /* NULL act/set: the plain 72-byte description */
         assert_eq!(expected_req_len(LINUX_RT_SIGACTION, &a), 72);
         assert_eq!(expected_req_len(LINUX_TKILL, &a), 72);
+        a = [0x7000, FUTEX_WAIT | FUTEX_PRIVATE, 1, 0, 0, 0];
+        assert_eq!(expected_req_len(LINUX_FUTEX, &a), 72 + 24);
+        a[1] = FUTEX_WAKE | FUTEX_PRIVATE;
+        assert_eq!(expected_req_len(LINUX_FUTEX, &a), 72);
         assert_eq!(expected_req_len(999, &a), 72);
     }
 
@@ -5250,5 +5464,110 @@ mod tests {
         assert_eq!(drop_task_state(2), None, "release is idempotent");
         assert!(!tasks()[0].used && !tasks()[1].used && !tasks()[2].used);
         assert!(can_track_thread());
+    }
+
+    fn futex_payload(observed: u32, timeout: Option<(u64, u64)>) -> [u8; 24] {
+        let mut b = [0u8; 24];
+        b[0..4].copy_from_slice(&observed.to_le_bytes());
+        if let Some((sec, nsec)) = timeout {
+            b[4] = 1;
+            b[8..16].copy_from_slice(&sec.to_le_bytes());
+            b[16..24].copy_from_slice(&nsec.to_le_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn futex_wait_wake_is_group_keyed_fifo_with_timeout_and_release() {
+        reset_registry();
+        assert!(track(0x10, 0x11, "m4.4.leader", 0, 0x80_0000, 0x81_0000, 7, false));
+        let gid = tasks()[0].group;
+        for (i, (ch_r, ch_w, name)) in [
+            (0x20, 0x21, "m4.4.leader.t20"),
+            (0x30, 0x31, "m4.4.leader.t30"),
+            (0x40, 0x41, "m4.4.leader.t40"),
+        ].iter().enumerate() {
+            assert_eq!(track_thread(*ch_r, *ch_w, name, 0, 8 + i as u32, true),
+                       Some(gid as u32));
+        }
+        let uaddr = 0x7000_1000u64;
+        let other = uaddr + 8;
+        let args = [uaddr, FUTEX_WAIT | FUTEX_PRIVATE, 7, 0, 0, 0];
+        match answer_futex(&mut groups()[gid], 1, &args,
+                           &futex_payload(7, None), 1_000) {
+            Answer::FutexWait(got, deadline) => {
+                assert_eq!((got, deadline), (uaddr, 0));
+            }
+            other => panic!("wait did not park: {:?}", other),
+        }
+        assert!(groups()[gid].futex[0].used);
+        assert_eq!(groups()[gid].futex[0].task, 1);
+
+        let mismatch = [uaddr, FUTEX_WAIT | FUTEX_PRIVATE, 7, 0, 0, 0];
+        assert!(matches!(answer_futex(&mut groups()[gid], 2, &mismatch,
+                                      &futex_payload(8, None), 1_000),
+                         Answer::Reply(0, E_AGAIN)));
+        assert_eq!(groups()[gid].futex.iter().filter(|w| w.used).count(), 1,
+                   "a mismatched expected value must not enqueue");
+
+        assert!(matches!(answer_futex(&mut groups()[gid], 2, &args,
+                                      &futex_payload(7, None), 1_000),
+                         Answer::FutexWait(_, 0)));
+        let args_other = [other, FUTEX_WAIT | FUTEX_PRIVATE, 0, 0, 0, 0];
+        assert!(matches!(answer_futex(&mut groups()[gid], 3, &args_other,
+                                      &futex_payload(0, None), 1_000),
+                         Answer::FutexWait(_, 0)));
+
+        let two = match answer_futex(&mut groups()[gid], 0,
+                                     &[uaddr, FUTEX_WAKE | FUTEX_PRIVATE, 2, 0, 0, 0],
+                                     &[], 1_000) {
+            Answer::FutexWake(w) => w,
+            other => panic!("wake did not report waiters: {:?}", other),
+        };
+        assert_eq!(two.n, 2);
+        assert_eq!(&two.tasks[..2], &[1, 2], "FIFO by the group's sequence");
+        assert_eq!(groups()[gid].futex.iter().filter(|w| w.used).count(), 1);
+
+        let one = match answer_futex(&mut groups()[gid], 0,
+                                     &[other, FUTEX_WAKE | FUTEX_PRIVATE, 1, 0, 0, 0],
+                                     &[], 1_000) {
+            Answer::FutexWake(w) => w,
+            other => panic!("wake did not report the other key: {:?}", other),
+        };
+        assert_eq!(one.n, 1);
+        assert_eq!(one.tasks[0], 3);
+
+        let timed = [uaddr, FUTEX_WAIT | FUTEX_PRIVATE, 7, 0x1234, 0, 0];
+        match answer_futex(&mut groups()[gid], 1, &timed,
+                           &futex_payload(7, Some((0, 10_000_000))), 1_000) {
+            Answer::FutexWait(_, deadline) => {
+                assert_eq!(deadline, 1_000 + 10_000_000);
+                assert!(poll_expired(deadline, deadline));
+            }
+            other => panic!("timed wait did not park: {:?}", other),
+        }
+        assert!(matches!(answer_futex(&mut groups()[gid], 2, &timed,
+                                      &futex_payload(7, Some((0, 0))), 1_000),
+                         Answer::Reply(0, E_TIMEOUT)));
+        assert!(matches!(answer_futex(&mut groups()[gid], 2, &timed,
+                                      &futex_payload(7, Some((0, 1_000_000_000))), 1_000),
+                         Answer::Reply(0, E_INVAL)));
+
+        /* A released waiter is removed from the queue before its slot is
+         * reused; a later wake must not answer a dead task index. */
+        assert_eq!(drop_task_state(1), Some(8));
+        assert_eq!(groups()[gid].futex.iter().filter(|w| w.used).count(), 0);
+        let none = match answer_futex(&mut groups()[gid], 0,
+                                      &[uaddr, FUTEX_WAKE | FUTEX_PRIVATE, 8, 0, 0, 0],
+                                      &[], 1_000) {
+            Answer::FutexWake(w) => w,
+            other => panic!("wake after release: {:?}", other),
+        };
+        assert_eq!(none.n, 0);
+
+        assert_eq!(drop_task_state(2), Some(9));
+        assert_eq!(drop_task_state(3), Some(10));
+        assert_eq!(drop_task_state(0), Some(7));
+        assert!(!groups()[gid].used);
     }
 }

@@ -73,6 +73,8 @@ pub mod m1_net_probe;
 pub mod m4_thread_probe;
 #[cfg(feature = "m4_group_probe")]
 pub mod m4_group_probe;
+#[cfg(feature = "m4_futex_probe")]
+pub mod m4_futex_probe;
 pub mod net_client;
 
 #[cfg(feature = "target")]

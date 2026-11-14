@@ -182,6 +182,7 @@ const struct LinuxSyscallEntry linux_syscall_table[] = {
     {  87, LSC_FD,     0 },   /* unlink */
     { 131, LSC_SIG,    0 },   /* sigaltstack — M3.2 alternate-stack record */
     { 158, LSC_MSR,    0 },   /* arch_prctl(ARCH_SET_FS) — §5.3's one MSR */
+    { 202, LSC_FUTEX,  0 },   /* M4.4 futex — the sidecar's wait/wake queue */
     { 217, LSC_FD,     0 },   /* getdents64 */
     { 218, LSC_LOCAL,  0 },   /* set_tid_address — single-threaded: stored and ignored */
     { 228, LSC_LOCAL,  0 },   /* clock_gettime — vDSO-backstopped (§5.5): a real trap here */
@@ -216,6 +217,7 @@ const char *linux_syscall_class_name(enum LinuxSyscallClass cls)
     case LSC_FD:     return "fd";
     case LSC_NET:    return "net";
     case LSC_MEM:    return "mem";
+    case LSC_FUTEX:  return "futex";
     case LSC_SIG:    return "sig";
     case LSC_MSR:    return "msr";
     case LSC_SPAWN:  return "spawn";
@@ -246,6 +248,63 @@ int linux_fs_addr_is_user_canonical(uint64_t addr)
 int linux_arch_prctl_is_set_fs(uint64_t num, uint64_t cmd)
 {
     return num == LINUX_ARCH_PRCTL && cmd == LINUX_ARCH_SET_FS;
+}
+
+/* M4.4: the futex word and optional relative timeout are two disjoint
+ * child spans. The plan is pure and first-trap: a bad span is -EFAULT
+ * before the channel is resolved or a request posted. The observed word is
+ * the kernel's snapshot; the sidecar compares that snapshot with the
+ * expected argument (D6). Only the private WAIT shape attaches bytes — a
+ * WAKE only names the queue key, and an unsupported operation is left for
+ * the sidecar's named refusal. */
+struct LinuxFutexPlan linux_futex_plan(uint64_t num, const uint64_t args[6])
+{
+    struct LinuxFutexPlan p;
+    uint64_t span_end;
+
+    p.observed_src = 0;
+    p.timeout_src = 0;
+    p.payload_len = 0;
+    p.refuse = 0;
+    if (num != LINUX_FUTEX || !args) return p;
+
+    if (args[1] == (LINUX_FUTEX_WAIT | LINUX_FUTEX_PRIVATE_FLAG)) {
+        if (args[0] == 0) {
+            p.refuse = -LINUX_EFAULT;
+            return p;
+        }
+        span_end = args[0] + 4u;
+        if (!linux_fs_addr_is_user_canonical(args[0]) ||
+            span_end < args[0] || (span_end - 1u) > LINUX_USER_ADDR_MAX) {
+            p.refuse = -LINUX_EFAULT;
+            return p;
+        }
+        p.observed_src = args[0];
+        p.payload_len = LINUX_FUTEX_WAIT_PAYLOAD_BYTES;
+        if (args[3] != 0) {
+            span_end = args[3] + LINUX_TIMESPEC_BYTES;
+            if (!linux_fs_addr_is_user_canonical(args[3]) ||
+                span_end < args[3] ||
+                (span_end - 1u) > LINUX_USER_ADDR_MAX) {
+                p.refuse = -LINUX_EFAULT;
+                return p;
+            }
+            p.timeout_src = args[3];
+        }
+        return p;
+    }
+
+    if (args[1] == (LINUX_FUTEX_WAKE | LINUX_FUTEX_PRIVATE_FLAG)) {
+        if (args[0] == 0) {
+            p.refuse = -LINUX_EFAULT;
+            return p;
+        }
+        span_end = args[0] + 4u;
+        if (!linux_fs_addr_is_user_canonical(args[0]) ||
+            span_end < args[0] || (span_end - 1u) > LINUX_USER_ADDR_MAX)
+            p.refuse = -LINUX_EFAULT;
+    }
+    return p;
 }
 
 /* M1 sendto destination: the first trap copies the caller's 16 bytes here;

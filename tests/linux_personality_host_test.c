@@ -350,6 +350,67 @@ int main(void)
               "      own pointer never crosses §5.7's CAP map");
     }
 
+    /* ═══ M4.4 (futex): the observed-word and timeout plan ════════════
+     * The queue itself is host-tested in the sidecar; here the kernel owns
+     * only the two child spans it copies before the post. A WAIT attaches
+     * the fixed 24-byte record, a WAKE attaches nothing, and a bad word or
+     * timespec is a first-trap -EFAULT with no channel traffic. */
+    {
+        uint64_t fa[6];
+        struct LinuxFutexPlan fp;
+
+        memset(fa, 0, sizeof fa);
+        fa[0] = 0x00007FFFFFFFE000ULL;
+        fa[1] = LINUX_FUTEX_WAIT | LINUX_FUTEX_PRIVATE_FLAG;
+        fa[2] = 7;
+        fa[3] = 0x00007FFFFFFFE100ULL;
+        fp = linux_futex_plan(LINUX_FUTEX, fa);
+        CHECK(fp.refuse == 0 && fp.observed_src == fa[0] &&
+              fp.timeout_src == fa[3] &&
+              fp.payload_len == LINUX_FUTEX_WAIT_PAYLOAD_BYTES,
+              "a private FUTEX_WAIT plans the observed word and the relative\n"
+              "      timespec into the fixed 24-byte wait record");
+
+        fa[3] = 0;
+        fp = linux_futex_plan(LINUX_FUTEX, fa);
+        CHECK(fp.refuse == 0 && fp.timeout_src == 0 &&
+              fp.payload_len == LINUX_FUTEX_WAIT_PAYLOAD_BYTES,
+              "a WAIT with no timeout still carries the observed word and a\n"
+              "      zero has_timeout flag");
+
+        fa[0] = 0;
+        fp = linux_futex_plan(LINUX_FUTEX, fa);
+        CHECK(fp.refuse == -LINUX_EFAULT,
+              "a NULL futex word is -EFAULT at the first trap");
+
+        fa[0] = 0x00007FFFFFFFE000ULL;
+        fa[3] = 0x00007FFFFFFFFFFFULL - 8;
+        fp = linux_futex_plan(LINUX_FUTEX, fa);
+        CHECK(fp.refuse == -LINUX_EFAULT,
+              "a timespec span crossing the user range is -EFAULT before\n"
+              "      any queue state can be touched");
+
+        fa[3] = 0;
+        fa[1] = LINUX_FUTEX_WAKE | LINUX_FUTEX_PRIVATE_FLAG;
+        fa[2] = 1;
+        fp = linux_futex_plan(LINUX_FUTEX, fa);
+        CHECK(fp.refuse == 0 && fp.payload_len == 0 &&
+              fp.observed_src == 0 && fp.timeout_src == 0,
+              "a private FUTEX_WAKE plans no bytes — its uaddr is only the\n"
+              "      queue key, and the count is the caller's word");
+
+        fa[1] = 0xDEAD;
+        fp = linux_futex_plan(LINUX_FUTEX, fa);
+        CHECK(fp.refuse == 0 && fp.payload_len == 0,
+              "an operation this increment does not serve is left as a plain\n"
+              "      description for the sidecar's named refusal");
+
+        fp = linux_futex_plan(1, fa);
+        CHECK(fp.refuse == 0 && fp.payload_len == 0 &&
+              fp.observed_src == 0 && fp.timeout_src == 0,
+              "a non-futex number plans nothing — the function is total");
+    }
+
     {   /* the copy: fake page tables, 4 KiB-aligned like the real ones.
          * Host addresses stand in for physical frames — the walker masks
          * them with the same frame mask the identity map implies, and

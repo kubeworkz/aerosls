@@ -111,6 +111,7 @@ enum LinuxSyscallClass {
                         * to the sidecar's SocketOps/NetClient (workspace
                         * owned, no new kernel-side network stack)         */
     LSC_MEM,           /* §5.4 budget-backed memory: brk/mmap/munmap/mprotect */
+    LSC_FUTEX,         /* M4.4: the sidecar's group-keyed wait/wake queue */
     LSC_SIG,           /* recorded at the sidecar, and delivered ONLY as
                         * tkill's default action (§10.13's step 2); a user
                         * HANDLER is still never invoked — installation is
@@ -209,6 +210,46 @@ static inline int linux_clone_flags_verdict(uint64_t flags)
         return -LINUX_EINVAL;
     return 0;
 }
+
+/* ─── M4.4 — futex wait/wake and the observed-word copy ───────────────────
+ * The queue itself is the sidecar's (D6): one group-keyed queue, FIFO wake,
+ * expected-value comparison and a per-wait timeout. The kernel owns the
+ * one thing the sidecar cannot do — read the child's 4-byte word and (when
+ * present) the relative `struct timespec` — and attaches a fixed 24-byte
+ * record behind the request header:
+ *
+ *     u32 observed   (the value at uaddr)
+ *     u32 has_timeout (1 iff args[3] was non-NULL)
+ *     u64 tv_sec     (relative, zero when has_timeout == 0)
+ *     u64 tv_nsec
+ *
+ * Only `FUTEX_WAIT|FUTEX_PRIVATE_FLAG` attaches the record. `FUTEX_WAKE|
+ * FUTEX_PRIVATE_FLAG` needs no bytes: its uaddr is the queue key. Other
+ * operation words are forwarded as the plain 72-byte description and the
+ * sidecar refuses them by name, exactly as it owns every other policy
+ * decision. The private flag is the M4.4 scope; process-shared futexes,
+ * requeue, PI and bitsets are named follow-ons, not silent acceptances. */
+#define LINUX_FUTEX                 202u
+#define LINUX_FUTEX_WAIT            0u
+#define LINUX_FUTEX_WAKE            1u
+#define LINUX_FUTEX_PRIVATE_FLAG    128u
+#define LINUX_FUTEX_CMD_MASK        0x7fu
+#define LINUX_FUTEX_WAIT_PAYLOAD_BYTES 24u
+
+struct LinuxFutexPlan {
+    uint64_t observed_src;   /* child VA of the 4-byte observed word */
+    uint64_t timeout_src;    /* child VA of the 16-byte timespec, or 0 */
+    uint32_t payload_len;    /* 24 for private WAIT, 0 otherwise     */
+    int32_t  refuse;         /* 0, or the first-trap Linux errno     */
+};
+
+/* Plan the futex word/timeout crossing. Pure over (num, args). A NULL or
+ * non-canonical uaddr is -EFAULT before any post; a timeout pointer, when
+ * present, must cover a whole timespec. A WAKE has no payload, but its
+ * uaddr is still checked as a queue key. Other operation words plan
+ * nothing and are left for the sidecar's named refusal. */
+struct LinuxFutexPlan linux_futex_plan(uint64_t num,
+                                       const uint64_t args[6]);
 
 /* ─── E7 increment 19: the time source across the seam ────────────────────
  * clock_gettime (228) is in the census but vDSO-backstopped on Linux; this
@@ -887,6 +928,11 @@ void linux_signal_ucontext_build(struct LinuxUContext *uc,
  * back to back in one payload, so the attach ceiling is two caps. */
 #define LINUX_PATH_CAP        1024u
 #define LINUX_FWD_ATTACH_CAP  (2u * (LINUX_PATH_CAP + 1u))
+
+/* M4.4's wait record is fixed-size and smaller than every other attach; it
+ * rides the same forward buffer as the path/sig/fd crossings. */
+_Static_assert(LINUX_FUTEX_WAIT_PAYLOAD_BYTES < LINUX_FWD_ATTACH_CAP,
+               "the futex wait record must fit the forward attach buffer");
 
 /* What a staged reply payload IS — the apply/deliver's dispatch over the
  * three reply shapes this increment adds to increment 12's copy-IN.

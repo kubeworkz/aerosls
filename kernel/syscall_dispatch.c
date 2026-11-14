@@ -702,6 +702,7 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                 uint64_t largs[6];
                 struct SLSLinuxSyscallRequest req;
                 struct LinuxFdWritePlan plan;
+                struct LinuxFutexPlan fplan;
                 struct LinuxFdReplyPlan rplan;
                 /* E7 increment 5 (the fd class): the message that crosses
                  * is the 72-byte description plus, for a write, its bytes
@@ -815,6 +816,15 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                  * here; every other number's plan is empty and the
                  * forward below stays the plain 72-byte description it
                  * has always been. */
+                fplan = linux_futex_plan(num, largs);
+                if (fplan.refuse) {
+                    kernel_serial_printf(
+                        "[E7] linux futex op=%lu uaddr=0x%lx refused "
+                        "before post: bad user span (futex plan)\n",
+                        (unsigned long)largs[1],
+                        (unsigned long)largs[0]);
+                    return (uint64_t)(int64_t)fplan.refuse;
+                }
                 plan = linux_fd_write_plan(num, largs);
                 if (plan.refuse) {
                     kernel_serial_printf(
@@ -1125,7 +1135,38 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                  * no arm to un-arm. linux_user_copy_out reads only this
                  * task's own user pages (present, user, 4 KiB) or refuses
                  * -LINUX_EFAULT; it never faults over a tenant pointer. */
-                if (plan.len) {
+                if (fplan.payload_len) {
+                    /* M4.4: the fixed 24-byte wait record. observed at 0,
+                     * has_timeout at 4, then the relative timespec at 8.
+                     * The bytes are copied before the post, through the
+                     * same checked read-only walker as every other attach;
+                     * an unmapped word is -EFAULT with no channel traffic. */
+                    uint8_t *fp = fwd + sizeof(struct SLSLinuxSyscallRequest);
+                    uint32_t fi;
+                    for (fi = 0; fi < LINUX_FUTEX_WAIT_PAYLOAD_BYTES; fi++)
+                        fp[fi] = 0;
+                    if (linux_user_copy_out(fp, cur->cr3,
+                                            fplan.observed_src, 4) != 0) {
+                        kernel_serial_printf(
+                            "[E7] linux futex observed word 0x%lx refused "
+                            "before post: unmapped or non-user span\n",
+                            (unsigned long)fplan.observed_src);
+                        return (uint64_t)(int64_t)(-LINUX_EFAULT);
+                    }
+                    if (fplan.timeout_src) {
+                        fp[4] = 1; /* has_timeout, little-endian u32 */
+                        if (linux_user_copy_out(fp + 8, cur->cr3,
+                                                fplan.timeout_src,
+                                                LINUX_TIMESPEC_BYTES) != 0) {
+                            kernel_serial_printf(
+                                "[E7] linux futex timeout 0x%lx refused "
+                                "before post: unmapped or non-user span\n",
+                                (unsigned long)fplan.timeout_src);
+                            return (uint64_t)(int64_t)(-LINUX_EFAULT);
+                        }
+                    }
+                    fwd_len += LINUX_FUTEX_WAIT_PAYLOAD_BYTES;
+                } else if (plan.len) {
                     if (linux_user_copy_out(fwd + sizeof(struct SLSLinuxSyscallRequest),
                                             cur->cr3, plan.src,
                                             plan.len) != 0) {
