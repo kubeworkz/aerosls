@@ -379,7 +379,7 @@ The measured set, by destination:
 | 4, 6 | `stat`, `lstat` | sidecar (retention reads mtimes; the tier listing stats every entry) |
 | 74, 77, 82, 83, 87 | `fsync`, `ftruncate`, `rename`, `mkdir`, `unlink` | sidecar + §5.4's budget; `rename` is what makes the `.img.partial` → final swap atomic |
 | 9, 10, 11, 12 | `mmap`, `mprotect`, `munmap`, `brk` | §5.4, budget-backed; `W|X` refused |
-| 13, 14, 15, 131 | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack` | M3.1–M3.4 deliver ordinary and `SA_SIGINFO` handlers, on the normal or a recorded alternate stack; `rt_sigreturn` restores the mask/register file and redelivers a pending handler; `SA_RESETHAND` resets before entry (§10.15). Cross-task/async producers remain the named boundary. Default actions and E5's `env destroy` are unchanged |
+| 13, 14, 15, 131 | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack` | M3.1–M3.5 deliver ordinary and `SA_SIGINFO` handlers, on the normal or a recorded alternate stack; `rt_sigreturn` restores the mask/register file and redelivers a pending handler; `SA_RESETHAND` resets before entry; an EPIPE send produces SIGPIPE and returns EPIPE after its handler (§10.15). Cross-task signals and timer/device producers remain the named boundary. Default actions and E5's `env destroy` are unchanged |
 | 158 | `arch_prctl(ARCH_SET_FS)` | §5.3's kernel MSR — the one kernel-side semantic, measured with its argument |
 | 218, 231 | `set_tid_address`, `exit_group` | sidecar-local; on exit the sidecar reaps and the frames return to the partition |
 | 59, 7, 72 | `execve`, `poll`, `fcntl` | the spawn path and std's own plumbing |
@@ -444,7 +444,7 @@ The inherited gate is "a static binary doing the first user's actual work, runni
 - **The environment checkpoint/restore mechanism** (§8) — v0.2 item 1's, and landed as P1a: the capture, the versioned record and the payload are not E7's to build. E7's share of it — the Linux task's entry in that record, its per-page permissions and its resumed `rip`/`rsp` — is in scope and landed (§10.14, increments 20–21).
 - **A translator** (§4.5) — QEMU-SLS's, and the line that keeps the two from competing.
 - **Nested environments** — already closed in the POSIX roadmap §12 for the same reason LPAR §9 closed nested partitions.
-- **Signal delivery to Linux tasks** (§5.6) — M3.1–M3.4 deliver ordinary and `SA_SIGINFO` actions, alternate stacks, masks, `rt_sigreturn` and return-time pending redelivery (§10.15). Cross-task/async producers remain named boundaries; signal state survives a checkpoint by riding the sidecar image window and the Linux task's captured stack.
+- **Signal delivery to Linux tasks** (§5.6) — M3.1–M3.5 deliver ordinary and `SA_SIGINFO` actions, alternate stacks, masks, `rt_sigreturn`, return-time pending redelivery and the SIGPIPE producer (§10.15). Cross-task signals and timer/device producers remain named boundaries; signal state survives a checkpoint by riding the sidecar image window and the Linux task's captured stack.
 - **Networking syscalls** (`socket`, `connect`, …) — v0.2 item 2's, and H2 §2 item #2 does not require them for the first user.
 
 ---
@@ -3506,13 +3506,14 @@ same recording passed all clauses. Evidence:
 
 ---
 
-### 10.15 What has landed — M3.2–M3.4, alternate stacks, SA_SIGINFO and return-time delivery
+### 10.15 What has landed — M3.2–M3.5, alternate stacks, SA_SIGINFO, return-time delivery and SIGPIPE
 
 The shape decision's M3 exit gate is handlers, blocked/pending masks,
 `sigaltstack`, `rt_sigreturn`, correct defaults and checkpoint survival.
-M3.1 built the ordinary handler mechanism. **M3.2–M3.4** now build the
+M3.1 built the ordinary handler mechanism. **M3.2–M3.4** build the
 alternate-stack record, the `SA_SIGINFO` frame and the return-time pending
-rule. The live arm exercises the alternate stack and `SA_SIGINFO` together:
+rule; **M3.5** adds the first asynchronous producer, SIGPIPE from an EPIPE
+send. The live arm exercises the alternate stack and `SA_SIGINFO` together:
 `sigaltstack` installs a 4 KiB alternate stack, `SA_ONSTACK|SA_SIGINFO` enters
 the handler there with `siginfo`/`ucontext`, and `rt_sigreturn` restores the
 saved mask and the interrupted stack. `SA_RESETHAND` and return-time pending
@@ -3546,9 +3547,9 @@ handler).
 - **Delivery.** `tkill` 200 of an unblocked handler-disposed signal and the
   pending reveal inside `rt_sigprocmask` 14 both answer `Answer::SignalHandler`.
   The sidecar moves its mask to `old | sa_mask | (1 << (sig-1))` (the last
-  unless `SA_NODEFER`) before the reply, and sends a 72-byte trailer
+  unless `SA_NODEFER`) before the reply, and sends an 80-byte trailer
   (`"SIGD"`) carrying signo, handler, flags, restorer, old mask, the
-  pre-call oldset and `alt_sp`/`alt_size`. The trailer is not a generic
+  pre-call oldset, `alt_sp`/`alt_size` and the saved syscall return. The trailer is not a generic
   payload: only the signal answers may carry it, and the kernel validates
   magic, signo, handler/restorer addresses and the alternate-stack bounds
   before writing a user byte.
@@ -3583,6 +3584,17 @@ handler).
   sysret frame from `park_ctx` after `do_syscall`, because the frame was
   built before the reply; without that re-stamp a signal delivery would
   sysret with the pre-delivery registers.
+- **SIGPIPE producer (M3.5).** The `sendto` arm runs
+  `sigpipe_after_epipe` after the socket answer. `NET_ERR_PIPE` becomes a
+  SIGPIPE decision: `SIG_IGN` leaves the plain `-EPIPE` reply; a blocked
+  SIGPIPE is pended for the next unblock; a handler disposition returns the
+  `SIGD` delivery with saved syscall return `-EPIPE`; and `SIG_DFL`
+  terminates through the one `SignalKill` path. The saved return is the
+  trailer's ninth word (the trailer grew from 72 to 80 bytes), so the
+  handler's `rt_sigreturn` restores `-EPIPE`, not the ordinary 0. The live
+  backend's `MockNetwork` now distinguishes a `SHUT_WR` half-close from never
+  being connected: a later send answers `NET_ERR_PIPE`, not
+  `NET_ERR_NOTCONN`.
 - **`SA_RESETHAND`.** The action is reset to `SIG_DFL` before handler entry,
   so a nested delivery of the same signal sees the default, as Linux does;
   the reset happens before the frame is built, not on return.
@@ -3595,10 +3607,11 @@ handler).
   cross-task signal-wake channel, so this is a policy boundary, not a
   half-implemented delivery path.
 - **Asynchronous timer/device signals and job-control stop/continue.** No
-  kernel timer/device event injects a signal into a Linux task; `tkill` and
-  the unblock reveal are the only producers. A stop-default signal remains
-  refused `ENOSYS` by name, and a terminate-default still converges on one
-  attributed no-reply `SignalKill`.
+  kernel timer/device event injects a signal into a Linux task, and the one
+  I/O producer is narrow: an EPIPE `sendto` raises SIGPIPE (M3.5), while
+  `tkill` and the unblock reveal remain the other producers. A stop-default
+  signal remains refused `ENOSYS` by name, and a terminate-default still
+  converges on one attributed no-reply `SignalKill`.
 - **Checkpoint survival is inherited, not a second mechanism.** `SigState`
   (tid, mask, pending, dispositions, actions, alt-stack record) is a field of
   the sidecar's static `LinuxTask` table, so it rides the sidecar's captured
@@ -3611,15 +3624,15 @@ handler).
 - Core dumps remain absent (as before); a terminate-default signal still
   kills without one.
 
-**Evidence (2026-11-13).**
+**Evidence (2026-11-13; M3.5 live 2026-11-14).**
 
-- `cargo test --manifest-path user/Cargo.toml -p aerosls-sidecar --lib`: 78
+- `cargo test --manifest-path user/Cargo.toml -p aerosls-sidecar --lib`: 80
   passed, including the handler install, direct `tkill` delivery, pending
   unblock delivery, `SA_*` acceptance, the `sigaltstack` round trip/EPERM,
-  `SA_RESETHAND` before entry, return-time pending redelivery and mixed
-  alternate/normal nesting depth.
-- `gcc ... tests/linux_personality_host_test.c kernel/linux_abi.c`: 240
-  checks, including the 72-byte trailer parse (field-for-field, short and
+  `SA_RESETHAND` before entry, return-time pending redelivery, mixed
+  alternate/normal nesting depth and the SIGPIPE producer.
+- `gcc ... tests/linux_personality_host_test.c kernel/linux_abi.c`: 267
+  checks, including the 80-byte trailer parse (field-for-field, short and
   bad-magic refusals, alt fields), the 560-byte image, frame build/restore
   round trip, the siginfo/ucontext records, and the non-canonical RIP/RSP,
   RFLAGS-mask and forced-IF refusals (M3.1–M3.13).
@@ -3649,23 +3662,43 @@ handler).
   serial excerpt is checked in at `evidence/m3_signal_live.log`; the probe
   block is in `user/sidecar/fixtures/e7_linux_probe.S` and the flat image is
   rebuilt by its `build_probe.sh`.
+- M3.5 live (`tests/m1_net_probe_check.sh`, 2026-11-14): `make x86-iso-e3
+  M1_NET_PROBE=1` built `sls_operating_system_m1net.iso`; the M1 probe
+  completed one execution with `sendto=3`, `shutdown=3`, `close=3` and
+  `pipe=3`, no `M1-NET FAIL`. The third send after `SHUT_WR` produced:
+
+  ```
+  [E7] linux: num=0000002C child=m1.net.probe.0 sig=13 handler -> frame
+  E7PIPE-OK
+  [E7] linux: num=000000E7 child=m1.net.probe.0 exit_group status=0
+  ```
+
+  The probe writes `E7PIPE-OK` only from the SIGPIPE handler, and the
+  kernel's `sig=13 handler -> frame` line proves the delivery arm. The live
+  network backend's `MockNetwork::send` now reports `NET_ERR_PIPE` for a
+  `SHUT_WR` half-close instead of `NET_ERR_NOTCONN`. Two host-level
+  regressions cover it without QEMU: `mock::tests::shutdown_write_makes_send_epipe`
+  asserts the backend transition, and `driver_tests::send_after_shutdown_write_returns_pipe`
+  drives `NET_SHUTDOWN(SHUT_WR)` then `NET_SEND` through `server::run` and
+  asserts the reply is `NET_ERR_PIPE` (8 network unit + 9 driver tests green).
 - `make e7-gate` (evidence `evidence/e7_gate_m3_review_20261113/`): source,
   live, teeth and selfkill all exit 0; the existing E7 gate was not weakened
   by the M3 changes. That run predates M3.2–M3.4; the live arm above was
   re-run after it. That older bundle's `head=unknown` is the known WSL
   worktree-path limitation, not an empty run; the current driver records
   `head_full`, `tree_status` and `tree_changed` as well.
-- Source guard: `tests/linux_personality_check.sh` clauses R9–R12 pin the
+- Source guard: `tests/linux_personality_check.sh` clauses R9–R13 pin the
   sidecar trailer, the kernel record, the 15 table row, delivery/return, the
-  post-call re-stamp, the asm 131/personality split and the two checkpoint
-  carriers; the probe's markers are the live arm.
+  post-call re-stamp, the asm 131/personality split, the two checkpoint
+  carriers and the SIGPIPE producer; the probe's markers are the live arm.
 
-The M3 mechanism is therefore landed through M3.4: actions (including
+The M3 mechanism is therefore landed through M3.5: actions (including
 `SA_ONSTACK`/`SA_SIGINFO`/`SA_RESETHAND`), alternate stack, frames,
-`siginfo`/`ucontext`, mask restore and return-time pending redelivery. The
-remaining M3 boundary is the named one above — cross-task/async producers and
-a signal-specific live checkpoint arm. A full-M3 claim should name that
-boundary rather than count it as delivered.
+`siginfo`/`ucontext`, mask restore, return-time pending redelivery and the
+first asynchronous producer, SIGPIPE from an EPIPE send. The remaining M3
+boundary is the named one above — cross-task delivery, timer/device producers,
+job-control stop/continue and a signal-specific live checkpoint arm. A full-M3
+claim should name that boundary rather than count it as delivered.
 
 ---
 
@@ -3735,7 +3768,7 @@ Everything this document asserts about the tree, with its source:
 | The §5.2 image through the real create: child-vaddr pointers (`region_vaddr`), BIB-page reservation, 8 KiB floor, `AT_RANDOM` = entropy or `CAP_ECONFLICT` with the region returned | `kernel/cap.c` (steps 6–7); `kernel/linux_abi.{h,c}`; host tests L1/L2/E7c (377 checks); clauses O3/O4, teeth t44/t45/t46 (§10.12) |
 | §5.2's argv/envp cross on the spawn request as the `ARGENV` record, with the empty-environment v1 fallback when it is absent and by-name refusals instead of truncation | `kernel/cap.h`/`cap.c` (`SIDECAR_TAG_ARGENV`, the parse arena, the §5.2 site); `user/proto/src/manifest.rs` (`ArgEnv`, `argenv_wire_bytes_golden`); `tests/cap_create_sidecar_host_test.c` L3/L4; guard clauses O6/O7, teeth t49–t52 |
 | The SSE gate: the pure CR0/CR4/CPUID arithmetic at the SDM's own bit positions, the enable's CPUID → CR4 → CR0 → `fninit` → `ldmxcsr` order, the BSP call ahead of `syscall_gate_init`, the intact vector-7 chain, and the lazy path still dormant (no caller of `perform_lazy_context_switch`) | `arch/x86/fpu_enable.h`; `arch/x86/lazy_fpu.c` (`fpu_enable_sse`); `kernel/kernel.c` 4b; `tests/fpu_enable_host_test.c` (40 checks); guard clause Q, teeth t70–t75 (§10.13's step 2) |
-| The signal seam through M3.4: the plan's three first-trap refusals (width, out-pointer, span) ahead of any channel post; the sidecar's dispositions/mask/pending with `tkill` scoped to its own tid; ordinary and `SA_SIGINFO` handler delivery with the 72-byte `SIGD` trailer, `[restorer][frame][siginfo][ucontext]` image and alternate-stack placement; `SA_RESETHAND`; `rt_sigreturn` 15 restoring mask/registers and redelivering pending handlers; and every default-terminate still converging on one attributed no-reply kill | `kernel/linux_abi.{h,c}` (`linux_sig_copy_plan`, `LSC_SIG`, the delivery/frame/siginfo/ucontext contracts, table rows 15/131); `kernel/chan.c` (`linux_signal_deliver`, `linux_sigreturn_forward`); `kernel/syscall_dispatch.c`; `kernel/process.c` (post-call re-stamp); `arch/x86/syscall.asm` (no SLS number chain at all; every trap → `do_syscall`); `user/sidecar/src/linux.rs` (`SigState`, `SigAct`, the 13/14/15/131/200 arms, `Answer::{SignalKill,SignalHandler}`); `tests/linux_personality_host_test.c` M3.1–M3.13 (240 checks); linux.rs unit tests (78 total); guard clauses R9–R12 and D3/D4; live `E7SIG-INFO`/`E7SIG-OK`/`E7SIG-RET` and `E7SIG-LNX-105-OK`/`E7SIG-SLS-105-OK` (§10.15) |
+| The signal seam through M3.5: the plan's three first-trap refusals (width, out-pointer, span) ahead of any channel post; the sidecar's dispositions/mask/pending with `tkill` scoped to its own tid; ordinary and `SA_SIGINFO` handler delivery with the 80-byte `SIGD` trailer, `[restorer][frame][siginfo][ucontext]` image and alternate-stack placement; `SA_RESETHAND`; `rt_sigreturn` 15 restoring mask/registers and redelivering pending handlers; an EPIPE send producing SIGPIPE with the saved `-EPIPE` return; and every default-terminate still converging on one attributed no-reply kill | `kernel/linux_abi.{h,c}` (`linux_sig_copy_plan`, `LSC_SIG`, the delivery/frame/siginfo/ucontext contracts, table rows 15/131); `kernel/chan.c` (`linux_signal_deliver`, `linux_sigreturn_forward`); `kernel/syscall_dispatch.c`; `kernel/process.c` (post-call re-stamp); `arch/x86/syscall.asm` (no SLS number chain at all; every trap → `do_syscall`); `user/sidecar/src/linux.rs` (`SigState`, `SigAct`, the 13/14/15/131/200 arms, `Answer::{SignalKill,SignalHandler}`); `tests/linux_personality_host_test.c` M3.1–M3.13 (267 checks); linux.rs unit tests (80 total); guard clauses R9–R13 and D3/D4; live `E7SIG-INFO`/`E7SIG-OK`/`E7SIG-RET`, `E7SIG-LNX-105-OK`/`E7SIG-SLS-105-OK` and `E7PIPE-OK` (§10.15) |
 | The E7 gate's resume half ran in the guest: one invocation, two boots of the same NVMe image, the tenant adopted at `rip=0x8057ab7 rsp=0x4000000a9778` (`stop=spent`), its copy finishing after the reboot — one `Copying`, one `Done (524288 bytes, 504 sparse holes, 4 kept)`, no `[FAULT]` — and its `exit_group` reaped by name (`[TORE] address space … 172 frame(s) freed`, the work-half count) | `evidence/e7_gate_reboot.log`; `tests/env_payload_host_test.c` (81 checks: the one-shot stop, the held replay's page mapping, and the stall-bounded wait's three outcomes); `tests/cap_create_sidecar_host_test.c` (the caller's-partition resolve) |
 | The gate's failure side is observed, not assumed: one invocation, one capture and five replays — the control green, `descriptor` reddening B2/B3/B4, `no-fd` B3/B4, `no-heap` B4/B5 (the 64 KiB buffer's `free` faulting inside the withheld page), `fs_base` B2/B4/B5 (the adopted TLS base one page off, the copy running to the end of the file and the tenant dying at a pointer read from the wrong TCB) — with each tooth's own line in the transcript and the shipped image refusing a named tooth by name | `evidence/e7_gate_teeth.log`, `evidence/e7_gate_teeth_fsbase.log`; `tests/e7_gate_check.sh --teeth`; `kernel/env_payload.h`'s `E7G_TOOTH` block and `Makefile`'s `E7_TOOTH` (both compiled out by default) |
 | The drill's tenant-spawn wait follows host progress, and the full default `--live` gate passes B1–B7 plus D1–D2 when the 45G stretch crosses the old 120 s bound: the wait extended at 318,476 serial bytes, D1 saw the pre-pour wait outlive its old 30 s bound with a sidecar RUNNING (`running=1/2`), D2 saw no `wait ended` and the pour land (`payloads=1, payload_skips=0`); the plain gate keeps its fixed 120 s total | `tests/e7_gate_check.sh` (`E7G_SPAWN_STALL_S`/`E7G_SPAWN_CEIL_S`); `evidence/e7_gate_drill_adaptive/`; commit `f3c1d19` |
@@ -3744,7 +3777,7 @@ Everything this document asserts about the tree, with its source:
 
 ## Appendix B — Named gaps, each with its destination
 
-**Register checked 2026-11-13, after M3.4.** A row's third cell says **LANDED** only when the gap is closed in the tree and the cell names the section, test and evidence that closed it. Reminders stay visible inside landed rows rather than being swept: `xsetbv`/`CR4.OSXSAVE` (§5.3), and M3's named boundary — cross-task/async signal producers and a signal-specific live checkpoint arm — after the alt-stack/`SA_SIGINFO`/redelivery arm (§10.15). The gaps still open are the thread group and ARM64 userspace.
+**Register checked 2026-11-14, after M3.5.** A row's third cell says **LANDED** only when the gap is closed in the tree and the cell names the section, test and evidence that closed it. Reminders stay visible inside landed rows rather than being swept: `xsetbv`/`CR4.OSXSAVE` (§5.3), and M3's named boundary — cross-task/timer signal producers and a signal-specific live checkpoint arm — after the alt-stack/`SA_SIGINFO`/redelivery/SIGPIPE arms (§10.15). The gaps still open are the thread group and ARM64 userspace.
 
 | Gap | Consequence if unaddressed | Destination |
 |---|---|---|
@@ -3755,7 +3788,7 @@ Everything this document asserts about the tree, with its source:
 | No `brk`/`mmap`/`munmap` → budget mapping (`brk` landed, increment 6, §10.11; the anonymous-map half at increment 16; `munmap` at increment 25) | a freed arena would keep its frames until teardown, and a malformed range could walk pages this task never owned | E7, §5.4 — **LANDED**: increment 16 answered the measured allocator's guard page (FIXED PROT_NONE, replace + invlpg) and its RW arenas (the descending cursor, both ends re-checking) from the budget span, and increment 25 answers `munmap` with the same first-trap/verdict discipline — the apply frees every present USER leaf back to the partition, a double unmap is success, and neither cursor moves. The on-target probe block ran in a real E3 boot (the 16-byte marker, with no marker-404 line; `evidence/e7_munmap_live.log`), so no remainder |
 | `elf64_map_blob` assumes every PT_LOAD's `p_vaddr` is page-aligned | a libc-linked binary with a non-aligned RW LOAD reads every global in it 0x370 bytes off and dies at `rip=0x28` before `main` — measured, §10.13's step 0 | **LANDED** — increment 8's step 1: page-base anchor + lead-offset copy, host teeth E8a, guard clause O8 with teeth t53/t54, measured past `main` |
 | No `CR4.OSFXSR` written anywhere (the IDT's vector-7 gate existed all along — `idt.c`, SIMI Phase 10; `vecstore.c`'s comment saying otherwise is stale), no `xsetbv` | any ring-3 SSE instruction is #UD — every real libc and every Rust binary dies at its first vector op (measured: musl `abort`'s `pxor`, §10.13's step-1 run) | **LANDED** — increment 9: `CR4.OSFXSR\|OSXMMEXCPT` + `CR0.MP` armed on the BSP ahead of the trap gate, `fninit` + 0x1F80 `ldmxcsr`, CPUID refusal by name; host teeth `tests/fpu_enable_host_test.c` (40 checks), guard clause Q with teeth t70–t75, measured past `pxor` into `abort`'s tail (§10.13's step 2). **Remainder:** `xsetbv`/`CR4.OSXSAVE` are absent by decision — named, and dormant with the lazy path |
-| `rt_sigprocmask` (14), `rt_sigaction` (13) and `tkill` (200) refuse | `abort()` cannot die at its first `raise(SIGABRT)`, so its tail runs and faults on `hlt` (`rip=0x805260c`) — the firstuser's run ends there, ten attributed traps deep (§10.13's step 2; `rt_sigaction` newly visible) | **LANDED → M3.4** — increment 10 closed the copy plan, masks/pending and default kill; increment 12 closed the oldact/oldset copy-out; M3.1 installed an ordinary handler; M3.2–M3.4 add `sigaltstack`/`SA_ONSTACK`, `SA_SIGINFO`/ucontext, `SA_RESETHAND` and return-time pending redelivery (§10.15). **Boundary:** cross-task/async producers are named; signal state survives a checkpoint by riding captured sidecar/stack bytes |
+| `rt_sigprocmask` (14), `rt_sigaction` (13) and `tkill` (200) refuse | `abort()` cannot die at its first `raise(SIGABRT)`, so its tail runs and faults on `hlt` (`rip=0x805260c`) — the firstuser's run ends there, ten attributed traps deep (§10.13's step 2; `rt_sigaction` newly visible) | **LANDED → M3.5** — increment 10 closed the copy plan, masks/pending and default kill; increment 12 closed the oldact/oldset copy-out; M3.1 installed an ordinary handler; M3.2–M3.4 add `sigaltstack`/`SA_ONSTACK`, `SA_SIGINFO`/ucontext, `SA_RESETHAND` and return-time pending redelivery; M3.5 adds the EPIPE→SIGPIPE producer with a saved `-EPIPE` return (§10.15). **Boundary:** cross-task/timer producers are named; signal state survives a checkpoint by riding captured sidecar/stack bytes |
 | No `CAP_E*` → Linux errno table (and a `CAP_NONE` sentinel in returns) | silent wrong errors (§5.7) | **LANDED** — increment 1 (§10.5): `linux_errno_from_cap()`/`cap_code_from_linux_errno()` total over all twelve `CAP_E*`, the `CAP_ERR_*` family and the `CAP_NONE` sentinel, applied only at the reply; `tests/linux_errno_map_host_test.c` (51 checks, exhaustive both ways), and the flipped-mapping tooth reddens the forward clause |
 | Target designated, but no candidate binary and therefore no artifact | the table is still unmeasured; `--check` reports a named skip rather than a pass | **LANDED** — `backup/aerobackup/` (static musl, 27 tests, no dependencies) is designated in `tools/linux_abi_candidate.conf` and censused at `tools/linux_syscall_census.txt` (26 traced syscalls plus the proved vDSO backstop, §5.5); `tests/linux_syscall_table_host_test.c` (42 checks) and the source-only `tests/linux_abi_census_check.sh` with its smoke hold the artifact and the anti-placeholder refusals |
 | No thread groups / `clone` / `futex` | Go and every threaded runtime are out (§7) | named as Go's gate; unscoped |

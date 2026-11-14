@@ -55,27 +55,27 @@
 //!     frame retained) so the page faults and a later PROT_READ/PROT_WRITE
 //!     can restore the same words — the Rust stack-overflow path's exact
 //!     shape;
-//!   - `rt_sigaction` (13) / `rt_sigprocmask` (14) / `tkill` (200) — the
-//!     signal seam (§10.13's step 2): the act/set bytes arrive ATTACHED
+//!   - `rt_sigaction` (13) / `rt_sigprocmask` (14) / `rt_sigreturn` (15)
+//!     / `sigaltstack` (131) / `tkill` (200) — the signal seam (§10.13's
+//!     step 2, landed through M3.4): the act/set bytes arrive ATTACHED
 //!     (the kernel copied them out of the child; this side never reads
-//!     the child's memory), dispositions record DFL/IGN only — a handler
-//!     install is ENOSYS by name BEFORE any mutation (no signal frames in
-//!     v1), the mask records BLOCK/UNBLOCK/SETMASK exactly, and delivery
-//!     is REAL: a tkill to the task's own tid whose signal is unblocked
-//!     with a default-terminate action kills the task through exit_group's
-//!     own reap path (no reply — it never runs again), while a blocked
-//!     signal pends and is delivered when a later rt_sigprocmask's new
-//!     mask reveals it — which is exactly how musl's `raise()` dies on
-//!     real Linux (block → tkill → unblock → the default action runs).
-//!     Refused by name with the number logged: handler invocation (no
-//!     frames/sigreturn), stop-by-default delivery, and a tid that is not
-//!     this task's own (ESRCH — cross-task signals are unscoped, never
-//!     silently re-targeted at the sender). The oldact/oldset out-pointer
-//!     is NO LONGER refused: E7 increment 12 landed §10.10's copy-IN gap —
-//!     the old disposition/mask travels back as this reply's PAYLOAD
-//!     (Answer::ReplyBytes), the kernel copies it into the span its own
-//!     first trap validated, and service() bounds the bytes against the
-//!     forwarded out-pointer before anything is sent;
+//!     the child's memory), dispositions record DFL/IGN/handler with the
+//!     handler address, flags, restorer and sa_mask, and the mask records
+//!     BLOCK/UNBLOCK/SETMASK exactly. Delivery is REAL: a tkill to the
+//!     task's own tid or an unblock reveal enters the recorded handler on
+//!     the normal or alternate stack, `rt_sigreturn` restores the saved
+//!     mask/context and redelivers the next pending handler, and a default
+//!     terminate still converges on exit_group's own reap path. M3.5 adds
+//!     the first asynchronous producer: a send that returns EPIPE consults
+//!     the SIGPIPE disposition, and a handler's return carries -EPIPE back
+//!     to the interrupted send. Refused by name: stop-by-default delivery
+//!     and a tid that is not this task's own (ESRCH — cross-task signals
+//!     are unscoped, never silently re-targeted at the sender). The
+//!     oldact/oldset out-pointer is NO LONGER refused: E7 increment 12
+//!     landed §10.10's copy-IN gap — the old disposition/mask travels back
+//!     as this reply's PAYLOAD (Answer::ReplyBytes), the kernel copies it
+//!     into the span its own first trap validated, and service() bounds the
+//!     bytes against the forwarded out-pointer before anything is sent;
 //!   - `mmap` (9, the mem class's anonymous-map half — E7 increment 16,
 //!     §5.4): the ledger's cursor decides the address for an anonymous
 //!     private map inside the budget span (or the caller's own FIXED
@@ -212,10 +212,15 @@ const SS_DISABLE: u32 = 2;
 const MINSIGSTKSZ: u64 = 2048;
 
 /// M3: the reply trailer that asks the kernel to build a signal frame.
-/// Eight little-endian words; the kernel twin is
+/// Ten little-endian words; the kernel twin is
 /// `struct LinuxSignalDelivery` in kernel/linux_abi.h.
 const LINUX_SIGNAL_DELIVERY_MAGIC: u64 = 0x5349_4744; /* "SIGD" */
-const LINUX_SIGNAL_DELIVERY_BYTES: usize = 72;
+const LINUX_SIGNAL_DELIVERY_BYTES: usize = 80;
+/// Linux's EPIPE, the value a SIGPIPE-producing send/write must return
+/// after its handler returns. The CAP status this side answers with is
+/// E_PIPE (-28); the kernel maps it to this Linux number.
+const LINUX_EPIPE: i64 = 32;
+const SIGPIPE: u64 = 13;
 
 /// How far a signal number may run: Linux x86-64 signals are 1..=64
 /// (1..31 standard, 32..64 real-time; 0 is tkill's existence probe and
@@ -273,6 +278,10 @@ struct SignalDelivery {
     oldset: u64,
     alt_sp: u64,
     alt_size: u64,
+    /// Saved rax restored by rt_sigreturn. Ordinary deliveries leave 0;
+    /// SIGPIPE's send/write producer sets -EPIPE so the handler returns
+    /// into the interrupted syscall with the errno Linux owes it.
+    sysret: u64,
 }
 
 /// A signal's DEFAULT action as POSIX defines it per signal number. The
@@ -736,6 +745,7 @@ fn deliver_handler(sig: &mut SigState, no: u64, oldset: u64) -> SignalDelivery {
         oldset,
         alt_sp,
         alt_size,
+        sysret: 0,
     }
 }
 
@@ -791,7 +801,39 @@ fn signal_delivery_payload(d: &SignalDelivery) -> [u8; LINUX_SIGNAL_DELIVERY_BYT
     b[48..56].copy_from_slice(&d.oldset.to_le_bytes());
     b[56..64].copy_from_slice(&d.alt_sp.to_le_bytes());
     b[64..72].copy_from_slice(&d.alt_size.to_le_bytes());
+    b[72..80].copy_from_slice(&d.sysret.to_le_bytes());
     b
+}
+
+/// M3.5: the first asynchronous producer. Linux raises SIGPIPE when a
+/// write/send reports EPIPE (unless the disposition is SIG_IGN). The
+/// syscall still completes with EPIPE after a handler returns, so a
+/// delivered handler's saved rax is -EPIPE, not the ordinary 0. A blocked
+/// SIGPIPE pends and is delivered by the next unblock; a default action
+/// kills through the one SignalKill path; SIG_IGN leaves the EPIPE reply
+/// untouched. This is deliberately the send path only — the shim has no
+/// pipe descriptors yet, and sendto is the one measured producer.
+fn sigpipe_after_epipe(sig: &mut SigState, ans: Answer) -> Answer {
+    if !matches!(ans, Answer::Reply(_, status) if status == E_PIPE) {
+        return ans;
+    }
+    let bit = 1u64 << (SIGPIPE - 1);
+    if sig.dispo[SIGPIPE as usize] == DISPO_IGN {
+        return ans; /* ignored: EPIPE is the whole observable result */
+    }
+    if sig.mask & bit != 0 {
+        sig.pending |= bit; /* blocked: arrive at the next unblock */
+        return ans;
+    }
+    if sig.dispo[SIGPIPE as usize] == DISPO_HANDLER {
+        let mut d = deliver_handler(sig, SIGPIPE, 0);
+        d.sysret = (-LINUX_EPIPE) as u64;
+        return Answer::SignalHandler(d);
+    }
+    match default_action(SIGPIPE) {
+        ACT_TERMINATE => Answer::SignalKill(SIGPIPE),
+        _ => ans, /* SIGPIPE has no ignore/stop default */
+    }
 }
 
 /// The census's first answers (see the module header for the honest
@@ -2985,7 +3027,7 @@ pub fn service<K: Kernel, A: BufferAlloc>(
          * read (0) joins the bridge here — the fd table lives in this
          * module, so the fd class's read arm cannot stay kernel-side
          * (its data crosses back as the reply's payload, count-truth). */
-        let ans = match num {
+        let mut ans = match num {
             /* M1: the network class's eight numbers route to their own
              * translation over SocketOps; the file class below is
              * unchanged. */
@@ -3000,6 +3042,14 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                             &mut net, payload, console, now_ns, tasks()[i].gate),
             _ => answer(num, &args, &fds, &mut mem, &mut sigstate, payload),
         };
+        /* M3.5: a send that the socket service refused with EPIPE is the
+         * first asynchronous signal producer. The SIGPIPE decision runs
+         * after the network arm and before the state is written back, so
+         * a delivered handler's mask and a pended signal are both part
+         * of the same exchange. */
+        if num == LINUX_SENDTO {
+            ans = sigpipe_after_epipe(&mut sigstate, ans);
+        }
         tasks()[i].fds = fds;
         /* The ledger survives the reply: only a granted growth moves it
          * (the arm's own rule), and the KERNEL's brk_cur is its own
@@ -3874,6 +3924,53 @@ mod tests {
                               &mut ledger(), &mut sig, &[]);
         assert!(matches!(restored, Answer::Reply(0, STATUS_OK)));
         assert_eq!(sig.mask, 0, "rt_sigreturn restores the saved mask");
+    }
+
+    #[test]
+    fn sigpipe_is_produced_by_epipe_with_the_right_action_and_return() {
+        /* A handler is delivered for an unblocked EPIPE, and the saved rax
+         * is -EPIPE: the send completes with the errno Linux owes after
+         * the handler returns, not the ordinary syscall-interrupt 0. */
+        let mut sig = fresh();
+        let p = handler_payload(0x401000, SA_RESTORER, 0x402000, 0);
+        let a = answer(13, &[13, 0x4000, 0, 8, 0, 0], &fds(),
+                       &mut ledger(), &mut sig, &p);
+        assert!(matches!(a, Answer::Reply(0, STATUS_OK)), "install: {:?}", a);
+        let d = match sigpipe_after_epipe(&mut sig, Answer::Reply(0, E_PIPE)) {
+            Answer::SignalHandler(d) => d,
+            other => panic!("SIGPIPE handler: {:?}", other),
+        };
+        assert_eq!(d.signo, SIGPIPE);
+        assert_eq!(d.handler, 0x401000);
+        assert_eq!(d.sysret, (-LINUX_EPIPE) as u64);
+        assert_eq!(sig.mask & (1 << (SIGPIPE - 1)), 1 << (SIGPIPE - 1),
+                   "the handler mask blocks SIGPIPE while it runs");
+        let restored = answer(15, &[d.old_mask, 0, 0, 0, 0, 0], &fds(),
+                              &mut ledger(), &mut sig, &[]);
+        assert!(matches!(restored, Answer::Reply(0, STATUS_OK)));
+
+        /* A blocked SIGPIPE pends and the EPIPE answer stands. */
+        let mut blocked = fresh();
+        answer(14, &[2, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
+               &mut blocked, &set_payload(1u64 << (SIGPIPE - 1)));
+        let a = sigpipe_after_epipe(&mut blocked, Answer::Reply(0, E_PIPE));
+        assert!(matches!(a, Answer::Reply(0, E_PIPE)), "blocked: {:?}", a);
+        assert_eq!(blocked.pending & (1 << (SIGPIPE - 1)),
+                   1 << (SIGPIPE - 1));
+
+        /* SIG_IGN leaves the EPIPE reply untouched; the default kills. */
+        let mut ignored = fresh();
+        answer(13, &[13, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
+               &mut ignored, &act_payload(1));
+        let a = sigpipe_after_epipe(&mut ignored, Answer::Reply(0, E_PIPE));
+        assert!(matches!(a, Answer::Reply(0, E_PIPE)), "ignored: {:?}", a);
+        let mut dfl = fresh();
+        let a = sigpipe_after_epipe(&mut dfl, Answer::Reply(0, E_PIPE));
+        assert!(matches!(a, Answer::SignalKill(SIGPIPE)), "default: {:?}", a);
+
+        /* A non-EPIPE answer never produces a signal. */
+        let a = sigpipe_after_epipe(&mut fresh(), Answer::Reply(4, STATUS_OK));
+        assert!(matches!(a, Answer::Reply(4, STATUS_OK)));
     }
 
     #[test]

@@ -929,7 +929,12 @@ static uint64_t linux_signal_deliver(struct ProcessDescriptor *pd,
         regs[11] = pd->park_ctx.linux_args[2];  /* rdx */
         regs[12] = pd->park_ctx.rcx;            /* rcx (return RIP) */
         regs[13] = pd->park_ctx.rbx;
-        regs[14] = 0;                           /* rax at handler entry */
+        /* rt_sigreturn's restored rax. Ordinary deliveries answer 0
+         * (the interrupted syscall's success shape); a producer that
+         * generated the signal from a failing syscall supplies its
+         * Linux errno — SIGPIPE's send/write must return -EPIPE after
+         * the handler returns, exactly as Linux does. */
+        regs[14] = d->sysret;
         old_rip = pd->park_ctx.rcx;
         old_rflags = pd->park_ctx.r11;
         old_rsp = pd->park_ctx.user_rsp;
@@ -1126,6 +1131,7 @@ uint64_t k_linux_deliver(uint32_t pid, uint16_t ch_r, uint64_t expect_num) {
             if (n == LINUX_SIGNAL_DELIVERY_BYTES &&
                 (expect_num == LINUX_RT_SIGPROCMASK ||
                  expect_num == 200u ||
+                 expect_num == LINUX_SENDTO ||
                  expect_num == LINUX_RT_SIGRETURN)) {
                 uint64_t hn = 0;
                 int32_t hs = 0;

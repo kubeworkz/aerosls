@@ -671,7 +671,7 @@ struct LinuxSigCopyPlan linux_sig_copy_plan(uint64_t num,
  * SA_ONSTACK selects the alternate stack the sidecar records; SA_RESETHAND
  * resets the action before entry. */
 #define LINUX_SIGNAL_DELIVERY_MAGIC 0x53494744u /* "SIGD" */
-#define LINUX_SIGNAL_DELIVERY_BYTES 72u
+#define LINUX_SIGNAL_DELIVERY_BYTES 80u
 #define LINUX_SIGINFO_BYTES         128u
 #define LINUX_UCONTEXT_BYTES        256u
 #define LINUX_UCONTEXT_GREGS        26u
@@ -694,11 +694,15 @@ struct LinuxSignalDelivery {
     uint64_t oldset;     /* rt_sigprocmask's pre-call mask, if staged */
     uint64_t alt_sp;     /* sigaltstack ss_sp, 0 when normal-stack */
     uint64_t alt_size;   /* sigaltstack ss_size, 0 when normal-stack */
+    uint64_t sysret;     /* rax restored by rt_sigreturn: 0 for the
+                          * ordinary syscall-interrupt shape, a Linux
+                          * errno for a signal produced BY a failing
+                          * syscall (SIGPIPE's write/send -> -EPIPE) */
 };
 
 _Static_assert(sizeof(struct LinuxSignalDelivery) ==
                LINUX_SIGNAL_DELIVERY_BYTES,
-               "the delivery trailer must stay 72 bytes on the wire");
+               "the delivery trailer must stay 80 bytes on the wire");
 
 /* Register order is TaskContext's first fifteen words: r15, r14, r13,
  * r12, r11, r10, r9, r8, rbp, rdi, rsi, rdx, rcx, rbx, rax. */
@@ -761,7 +765,7 @@ _Static_assert(sizeof(struct LinuxSignalImage) ==
                sizeof(struct LinuxUContext),
                "the signal image must be restorer + frame + info + ucontext");
 
-/* Parse a 72-byte delivery trailer. Returns 0 or -LINUX_EPROTO. */
+/* Parse an 80-byte delivery trailer. Returns 0 or -LINUX_EPROTO. */
 int linux_signal_delivery_parse(const uint8_t *p, uint32_t n,
                                 struct LinuxSignalDelivery *out);
 

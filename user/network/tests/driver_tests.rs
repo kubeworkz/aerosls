@@ -241,6 +241,83 @@ fn stream_connect_send_recv() {
     t.join().unwrap();
 }
 
+/// The live M1 SIGPIPE path sent after `SHUT_WR` and expected the driver to
+/// report EPIPE. Test the service boundary directly: a closed write side is
+/// not the same shape as a never-connected socket, and returning NOTCONN here
+/// would suppress the sidecar's SIGPIPE producer.
+#[test]
+fn send_after_shutdown_write_returns_pipe() {
+    let (fake, client) = FakeKernel::new(vec![0u8; 1024], 1);
+    let t = boot_driver(fake);
+    let mut buf = [0u8; 1024];
+    let mut caps = [GrantedCap::default(); 8];
+
+    // Handshake.
+    client.send(0, 1, 0, &frame(NET_INFO), &[]).unwrap();
+    let _ = client.recv(0, &mut buf, &mut caps).unwrap();
+
+    // Listener.
+    let mut payload = [0u8; 20];
+    payload[..16].copy_from_slice(&frame(NET_SOCKET));
+    payload[16..20].copy_from_slice(&encode_net_socket_body(SOCK_STREAM, 0));
+    client.send(0, 2, 0, &payload, &[]).unwrap();
+    let (_, status, server_id) = recv_status(&client, 0, &mut buf, &mut caps);
+    assert_eq!(status, NET_OK);
+
+    let bind_payload = sock_id_req(NET_BIND, server_id as u32, &encode_sockaddr(0, 8081));
+    client.send(0, 3, 0, &bind_payload, &[]).unwrap();
+    assert_eq!(recv_status(&client, 0, &mut buf, &mut caps).1, NET_OK);
+
+    let listen_payload = sock_id_req(NET_LISTEN, server_id as u32, &[]);
+    client.send(0, 4, 0, &listen_payload, &[]).unwrap();
+    assert_eq!(recv_status(&client, 0, &mut buf, &mut caps).1, NET_OK);
+
+    // Connected client.
+    let mut payload = [0u8; 20];
+    payload[..16].copy_from_slice(&frame(NET_SOCKET));
+    payload[16..20].copy_from_slice(&encode_net_socket_body(SOCK_STREAM, 0));
+    client.send(0, 5, 0, &payload, &[]).unwrap();
+    let (_, status, client_id) = recv_status(&client, 0, &mut buf, &mut caps);
+    assert_eq!(status, NET_OK);
+
+    let connect_payload = sock_id_req(NET_CONNECT, client_id as u32, &encode_sockaddr(0, 8081));
+    client.send(0, 6, 0, &connect_payload, &[]).unwrap();
+    assert_eq!(recv_status(&client, 0, &mut buf, &mut caps).1, NET_OK);
+
+    let accept_payload = sock_id_req(NET_ACCEPT, server_id as u32, &[]);
+    client.send(0, 7, 0, &accept_payload, &[]).unwrap();
+    let rr = client.recv(0, &mut buf, &mut caps).unwrap();
+    let accept_frame = NetFrame::parse(&buf[..rr.len]).unwrap();
+    assert_eq!(accept_frame.ty, NET_ACCEPT);
+    assert!(!accept_frame.is_error());
+    assert!(parse_net_accept_body(&buf[16..rr.len]).is_some());
+
+    // SHUT_WR, then send on the same socket: the write side is closed, so
+    // this must be EPIPE (the condition that raises SIGPIPE), not NOTCONN.
+    let shutdown_payload = sock_id_req(NET_SHUTDOWN, client_id as u32, &[1u8]);
+    client.send(0, 8, 0, &shutdown_payload, &[]).unwrap();
+    let (ty, status, _) = recv_status(&client, 0, &mut buf, &mut caps);
+    assert_eq!((ty, status), (NET_SHUTDOWN, NET_OK));
+
+    let data_region = client.new_region(b"x".to_vec(), R);
+    let grant = SendCap {
+        slot: data_region,
+        offset: 0,
+        len: 1,
+        rights: R,
+        flags: 0,
+    };
+    let send_payload = sock_id_req(NET_SEND, client_id as u32, &[]);
+    client.send(0, 9, 0, &send_payload, &[grant]).unwrap();
+    let (ty, status, bytes) = recv_status(&client, 0, &mut buf, &mut caps);
+    assert_eq!(ty, NET_SEND);
+    assert_eq!(status, NET_ERR_PIPE);
+    assert_eq!(bytes, 0);
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
+
 // ── error paths ─────────────────────────────────────────────────────────────
 
 #[test]

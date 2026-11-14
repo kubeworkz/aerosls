@@ -1686,12 +1686,12 @@ int main(void)
         struct LinuxSignalInfo si;
         struct LinuxUContext uc;
         uint64_t regs[15], rregs[15], rip = 0, rflags = 0, rsp = 0;
-        uint64_t words[9] = { LINUX_SIGNAL_DELIVERY_MAGIC, 6, 0x401000,
-                              0x08000004, 0x402000, 0x11, 0x22,
-                              0x7fff0000, 0x2000 };
+        uint64_t words[10] = { LINUX_SIGNAL_DELIVERY_MAGIC, 6, 0x401000,
+                               0x08000004, 0x402000, 0x11, 0x22,
+                               0x7fff0000, 0x2000, 0x33 };
         int i;
 
-        for (i = 0; i < 9; i++) {
+        for (i = 0; i < 10; i++) {
             int b;
             for (b = 0; b < 8; b++)
                 d[i * 8 + b] = (uint8_t)(words[i] >> (8 * b));
@@ -1700,9 +1700,11 @@ int main(void)
               sd.signo == 6 && sd.handler == 0x401000 &&
               sd.flags == 0x08000004 && sd.restorer == 0x402000 &&
               sd.old_mask == 0x11 && sd.oldset == 0x22 &&
-              sd.alt_sp == 0x7fff0000 && sd.alt_size == 0x2000,
-              "M3.1 the 72-byte delivery trailer parses field-for-field,\n"
-              "      including the alt-stack pair —\n"
+              sd.alt_sp == 0x7fff0000 && sd.alt_size == 0x2000 &&
+              sd.sysret == 0x33,
+              "M3.1 the 80-byte delivery trailer parses field-for-field,\n"
+              "      including the alt-stack pair and the saved syscall\n"
+              "      return that SIGPIPE restores as -EPIPE —\n"
               "      the sidecar and kernel cannot silently disagree on a\n"
               "      handler, restorer or mask");
         CHECK(linux_signal_delivery_parse(d, sizeof d - 1, &sd) ==

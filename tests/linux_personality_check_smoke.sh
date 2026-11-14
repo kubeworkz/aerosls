@@ -40,6 +40,7 @@ FILES=(
     user/sidecar/src/e7_firstuser.rs
     user/proto/src/manifest.rs
     user/sidecar/fixtures/e7_linux_probe.S
+    user/sidecar/fixtures/m1_net_probe.S
     user/sidecar/fixtures/build_candidate.sh
     kernel/elf64_load.h
     kernel/elf64_load.c
@@ -1055,6 +1056,14 @@ tooth munmap-range-not-logged X6 "a granted munmap's answer line no longer carri
 seed "$W/t129"
 sed -i '/^\.Lmprotect:/,/^\.Lmmap:/{/^\.Lmmap:/!d}' "$W/t129/user/sidecar/fixtures/e7_linux_probe.S"
 tooth mprotect-round-trip-gone X7 "the probe no longer carries the PROT_NONE round-trip block" "$W/t129"
+
+# t130: the SIGPIPE producer disconnected — an EPIPE send still answers EPIPE
+# to the caller, but no disposition runs: a handler is silently skipped and a
+# default-terminate send leaves the task alive. The source guard must redden
+# by R13 without needing the live socket probe.
+seed "$W/t130"
+sed -i 's/if num == LINUX_SENDTO {/if false {/' "$W/t130/user/sidecar/src/linux.rs"
+tooth sigpipe-producer-gone R13 "service() no longer routes an EPIPE send through the SIGPIPE producer" "$W/t130"
 
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"

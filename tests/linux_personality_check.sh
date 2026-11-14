@@ -906,13 +906,15 @@ fi
 if grep -qF 'SignalHandler(SignalDelivery)' "$LRS" && \
    grep -qF 'fn deliver_handler(' "$LRS" && \
    grep -qF 'fn signal_delivery_payload(' "$LRS" && \
+   grep -qF 'fn sigpipe_after_epipe(' "$LRS" && \
+   grep -qF 'd.sysret = (-LINUX_EPIPE) as u64;' "$LRS" && \
    grep -qF 'LINUX_SIGNAL_DELIVERY_MAGIC' "$LRS" && \
    grep -qF 'LINUX_RT_SIGRETURN => restore_and_redeliver(sig, args[0]),' "$LRS" && \
    grep -qF 'fn restore_and_redeliver(' "$LRS" && \
    grep -qF 'SA_RESETHAND' "$LRS" && \
    grep -qF 'LINUX_SIGALTSTACK => {' "$LRS" && \
    grep -qF 'fn read_stack_t(' "$LRS"; then
-    ok "R9. the sidecar owns the semantic half of M3.2–M3.4: a handler delivery carries signo/handler/flags/restorer/old mask and the optional alternate stack in the 72-byte trailer; sigaltstack (131) records/query/disables a 24-byte stack_t; SA_RESETHAND resets before entry; and rt_sigreturn (15) restores the mask, decrements the alt-stack depth and redelivers the next unblocked pending handler — no frame layout or register is invented on the Rust side"
+    ok "R9. the sidecar owns the semantic half of M3.2–M3.5: a handler delivery carries signo/handler/flags/restorer/old mask, the optional alternate stack and the saved syscall return in the 80-byte trailer; sigaltstack (131) records/query/disables a 24-byte stack_t; SA_RESETHAND resets before entry; rt_sigreturn (15) restores the mask, decrements the alt-stack depth and redelivers the next unblocked pending handler; and an EPIPE send produces SIGPIPE with -EPIPE as the restored return — no frame layout or register is invented on the Rust side"
 else
     bad "R9. the sidecar's M3.2–M3.4 half is missing — a recorded handler would have no trailer or alt-stack record, SA_RESETHAND would leave its action installed for a nested delivery, or rt_sigreturn would leave the handler's blocked mask in force and drop a pending handler"
 fi
@@ -928,8 +930,9 @@ if grep -qF 'struct LinuxSignalDelivery {' "$LABH" && \
    grep -qF 'linux_signal_info_build(' "$LABC" && \
    grep -qF 'linux_signal_ucontext_build(' "$LABC" && \
    grep -qF 'alt_sp' "$LABH" && \
+   grep -qF 'sysret' "$LABH" && \
    grep -qF '{  15, LSC_SIG,' "$LABC"; then
-    ok "R10. the kernel's M3.2–M3.4 record layer is named and host-testable: the 72-byte trailer (alt_sp/alt_size), the [restorer][frame][siginfo][ucontext] image, frame build/restore with the ring-3 RFLAGS bound, siginfo/ucontext builders, and the 15 row are all pure declarations before the boot mechanism uses them"
+    ok "R10. the kernel's M3.2–M3.5 record layer is named and host-testable: the 80-byte trailer (alt_sp/alt_size/sysret), the [restorer][frame][siginfo][ucontext] image, frame build/restore with the ring-3 RFLAGS bound, siginfo/ucontext builders, and the 15 row are all pure declarations before the boot mechanism uses them"
 else
     bad "R10. the kernel's M3 record layer is incomplete — the trailer, image or frame would be an undocumented struct, the sigreturn RFLAGS bound would be gone, or 15 would fall off the class table"
 fi
@@ -964,6 +967,25 @@ if grep -qF 'static mut TABLE: [LinuxTask; MAX_LINUX_TASKS]' "$LRS" && \
     ok "R12. M3 signal state survives a checkpoint by construction: actions/mask/pending are fields of the sidecar's static LinuxTask table (captured with the sidecar's image window), and the saved frame/alternate stack are bytes on the Linux task's captured stack — no parallel signal snapshot exists to drift from them"
 else
     bad "R12. a checkpoint carrier moved out of the captured set — signal state in a heap object or a frame outside the captured stack would restore a task whose handler action, mask or pending bits silently vanished"
+fi
+
+# ─── R13. the first asynchronous producer: SIGPIPE from an EPIPE send ───────
+# M3.5 closes one named M3 boundary without adding threads: a send after the
+# peer's read half is gone must run the SIGPIPE disposition, and a handler's
+# return must leave the interrupted send carrying -EPIPE. The producer, the
+# saved return, the trailer's new word, the kernel's restored rax and the
+# live marker are five links; any one absent turns the send into a silent
+# EPIPE answer or a handler that returns the wrong value.
+if grep -qF 'fn sigpipe_after_epipe(' "$LRS" && \
+   grep -qF 'if num == LINUX_SENDTO {' "$LRS" && \
+   grep -qF 'd.sysret = (-LINUX_EPIPE) as u64;' "$LRS" && \
+   grep -qF 'expect_num == LINUX_SENDTO ||' "$CANC" && \
+   grep -qF 'regs[14] = d->sysret;' "$CANC" && \
+   grep -qF 'E7PIPE-OK' user/sidecar/fixtures/m1_net_probe.S && \
+   grep -qF 'cmpq    $-32, %rax' user/sidecar/fixtures/m1_net_probe.S; then
+    ok "R13. M3.5's asynchronous producer is wired: an EPIPE send consults the SIGPIPE disposition, a handler delivery carries -EPIPE in the saved syscall return, the kernel restores that word through rt_sigreturn, and the live probe proves the handler ran before the send returned EPIPE"
+else
+    bad "R13. the SIGPIPE producer is incomplete — the EPIPE decision, the handler's saved -EPIPE return, the kernel's restored rax, or the live marker is missing; the send would either ignore the signal or return the wrong value after the handler"
 fi
 
 # ─── S. poll (7) — readiness and timed wakeups (E7 increment 24) ───────────

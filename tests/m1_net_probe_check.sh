@@ -6,17 +6,19 @@
 # The M1 probe (user/sidecar/fixtures/m1_net_probe.S) runs inside the initial
 # POSIX sidecar. A passing execution performs exactly:
 #     socket=2  bind=1  listen=1  connect=1  accept=1
-#     poll=1    sendto=2  recvfrom=2  shutdown=3  close=3
-# and exits through `exit_group status=0`. The image runs the probe from the
-# watchdog path, so more than one successful execution is normal. `M1-NET
-# PASS` is printed several times per execution by the serial logger and is
-# therefore NOT an execution counter; `exit_group status=0` is.
+#     poll=1    sendto=3  recvfrom=2  shutdown=3  close=3
+# plus one `E7PIPE-OK` handler marker from the post-shutdown send, and exits
+# through `exit_group status=0`. The image runs the probe from the watchdog
+# path, so more than one successful execution is normal. `M1-NET PASS` is
+# printed several times per execution by the serial logger and is therefore
+# NOT an execution counter; `exit_group status=0` is.
 #
 # This gate FAILS on:
 #   * any `M1-NET FAIL` in the serial log,
 #   * zero successful probe executions,
 #   * any of socket/bind/listen/connect/accept/poll/sendto/shutdown/close
-#     other than the per-execution constants above,
+#     other than the per-execution constants above, or a missing E7PIPE-OK
+#     marker for any successful execution,
 #   * recvfrom below 2 per execution (an EAGAIN retry may legitimately add
 #     another recvfrom, so this is a floor rather than an exact count).
 #
@@ -154,6 +156,7 @@ poll=$(count 'num=00000007 child=m1.net.probe.0')
 sendto=$(count 'num=0000002C child=m1.net.probe.0')
 recvfrom=$(count 'num=0000002D child=m1.net.probe.0')
 shutdown=$(count 'num=00000030 child=m1.net.probe.0')
+pipe=$(count 'E7PIPE-OK')
 close=$(count 'num=00000003 child=m1.net.probe.0')
 tooth_hits=$(count 'M1-TOOTH')
 tooth_names=$(grep -ao '\[M1-TOOTH\] [a-z-]*' "$LOG" 2>/dev/null | sort -u | tr '\n' ' ' | sed 's/ *$//' || true)
@@ -164,7 +167,7 @@ expected_listen=$passes
 expected_connect=$passes
 expected_accept=$passes
 expected_poll=$passes
-expected_sendto=$((passes * 2))
+expected_sendto=$((passes * 3))
 expected_recvfrom=$((passes * 2))
 expected_shutdown=$((passes * 3))
 expected_close=$((passes * 3))
@@ -246,6 +249,8 @@ elif [ "$poll" -ne "$expected_poll" ]; then
     problem="poll coverage $poll, expected $expected_poll for $passes execution(s)"
 elif [ "$sendto" -ne "$expected_sendto" ]; then
     problem="sendto coverage $sendto, expected $expected_sendto for $passes execution(s)"
+elif [ "$pipe" -lt "$passes" ]; then
+    problem="SIGPIPE marker E7PIPE-OK seen $pipe time(s), expected at least $passes"
 elif [ "$recvfrom" -lt "$expected_recvfrom" ]; then
     problem="recvfrom coverage $recvfrom, expected at least $expected_recvfrom for $passes execution(s)"
 elif [ "$shutdown" -ne "$expected_shutdown" ]; then
@@ -257,7 +262,7 @@ fi
 if [ -n "$problem" ]; then
     echo "FAIL: M1 live network probe: $problem" >&2
     echo "  executions: passed=$passes fail_markers=$fail_markers" >&2
-    echo "  coverage: socket=$socket bind=$bind listen=$listen connect=$connect accept=$accept poll=$poll sendto=$sendto recvfrom=$recvfrom shutdown=$shutdown close=$close" >&2
+    echo "  coverage: socket=$socket bind=$bind listen=$listen connect=$connect accept=$accept poll=$poll sendto=$sendto recvfrom=$recvfrom shutdown=$shutdown close=$close pipe=$pipe" >&2
     [ -n "$tooth_names" ] && echo "  sabotage marker(s): $tooth_names" >&2
     echo "  expected: socket=$expected_socket bind=$expected_bind listen=$expected_listen connect=$expected_connect accept=$expected_accept poll=$expected_poll sendto=$expected_sendto recvfrom>=$expected_recvfrom shutdown=$expected_shutdown close=$expected_close" >&2
     if [ -f "$LOG" ]; then
@@ -274,7 +279,7 @@ if [ -n "$problem" ]; then
 fi
 
 echo "OK: M1 live network probe: $passes execution(s); no M1-NET FAIL"
-echo "    coverage: socket=$socket bind=$bind listen=$listen connect=$connect accept=$accept poll=$poll sendto=$sendto recvfrom=$recvfrom shutdown=$shutdown close=$close"
+echo "    coverage: socket=$socket bind=$bind listen=$listen connect=$connect accept=$accept poll=$poll sendto=$sendto recvfrom=$recvfrom shutdown=$shutdown close=$close pipe=$pipe"
 if [ "$KEEP" = "1" ] || [ -n "$REPLAY" ]; then
     echo "    serial log: $LOG"
 fi

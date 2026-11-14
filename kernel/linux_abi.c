@@ -550,6 +550,7 @@ int linux_signal_delivery_parse(const uint8_t *p, uint32_t n,
     out->oldset   = linux_sig_le64(p + 48);
     out->alt_sp   = linux_sig_le64(p + 56);
     out->alt_size = linux_sig_le64(p + 64);
+    out->sysret   = linux_sig_le64(p + 72);
     if (out->magic != LINUX_SIGNAL_DELIVERY_MAGIC ||
         out->signo == 0 || out->signo > 64 ||
         out->handler == 0 || out->restorer == 0)

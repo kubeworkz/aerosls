@@ -11,7 +11,8 @@
  *   -> accept(43) [peer sockaddr] -> sendto(44) [non-NULL destination]
  *   -> poll(7) [POLLIN] -> recvfrom(45) [same peer sockaddr]
  *   -> sendto(44) -> recvfrom(45) -> shutdown(48; EINVAL, SHUT_WR, SHUT_RD)
- *   -> close(3) x3 -> write(1) -> exit_group(231)
+ *   -> rt_sigaction(SIGPIPE) -> sendto(44) [EPIPE -> SIGPIPE] -> close(3)
+ *   x3 -> write(1) -> exit_group(231)
  *
  * The peer address is the GUEST'S OWN address (10.0.2.15), not 127.0.0.1:
  * net/ipv4.c's loopback hook fires only for NET_MY_IP, and it hands the
@@ -255,6 +256,37 @@ _start:
     testq   %rax, %rax
     jne     .Lfail
 
+    /* M3.5: install a SIGPIPE handler, then send after our write half is
+     * shut. The socket service answers EPIPE; the sidecar must turn that
+     * into a delivered SIGPIPE whose handler runs before sendto returns
+     * -EPIPE. The marker is written ONLY by the handler. */
+    movl    $16, %r15d              /* stage: SIGPIPE */
+    lea     .Lpipe_handler(%rip), %rax
+    movq    %rax, 0(%rsp)           /* sa_handler */
+    movq    $0x04000000, 8(%rsp)    /* SA_RESTORER */
+    lea     .Lpipe_restorer(%rip), %rax
+    movq    %rax, 16(%rsp)          /* sa_restorer */
+    movq    $0, 24(%rsp)            /* sa_mask */
+    movl    $13, %edi               /* SIGPIPE */
+    movq    %rsp, %rsi
+    xorl    %edx, %edx              /* no oldact */
+    movl    $8, %r10d
+    movl    $13, %eax               /* rt_sigaction */
+    syscall
+    testq   %rax, %rax
+    jne     .Lfail
+
+    movq    %r13, %rdi              /* the client, write half shut */
+    lea     .Lping(%rip), %rsi
+    movl    $1, %edx
+    xorl    %r10d, %r10d
+    xorl    %r8d, %r8d
+    xorl    %r9d, %r9d
+    movl    $44, %eax               /* sendto -> EPIPE -> SIGPIPE */
+    syscall
+    cmpq    $-32, %rax              /* Linux EPIPE after the handler */
+    jne     .Lfail
+
     /* close(client), close(peer), close(listener) */
     movq    %r13, %rdi
     movl    $3, %eax
@@ -311,6 +343,20 @@ _start:
     movl    %r15d, %edi
     syscall
 
+.Lpipe_handler:
+    movl    $1, %eax                /* write(1, "E7PIPE-OK\n", 10) */
+    movl    $1, %edi
+    lea     .Lpipe_msg(%rip), %rsi
+    movl    $.Lpipe_end-.Lpipe_msg, %edx
+    syscall
+    ret                             /* [rsp] is the restorer word */
+.Lpipe_restorer:
+    movl    $15, %eax               /* rt_sigreturn */
+    syscall
+    /* Unreachable: rt_sigreturn restores the interrupted context. */
+    movl    $16, %r15d
+    jmp     .Lfail
+
 .Lping:
     .ascii  "ping"
 .Lpong:
@@ -321,3 +367,6 @@ _start:
 .Lfailmsg:
     .ascii  "M1-NET FAIL\n"
     .set    .Lfail_len, . - .Lfailmsg
+.Lpipe_msg:
+    .ascii  "E7PIPE-OK\n"
+    .set    .Lpipe_end, . - .Lpipe_msg

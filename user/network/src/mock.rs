@@ -316,6 +316,12 @@ impl MockNetwork {
     pub fn send(&mut self, id: u32, buf: &[u8]) -> Result<usize, u16> {
         let (peer_id, sock_type) = {
             let sock = self.get(id).ok_or(NET_ERR_INVAL)?;
+            /* SHUT_WR leaves the socket open for recv but closes the send
+             * side; Linux reports EPIPE (and raises SIGPIPE) on the next
+             * send. A socket that was never connected is ENOTCONN. */
+            if sock.state == SockState::HalfClosed {
+                return Err(NET_ERR_PIPE);
+            }
             if sock.state != SockState::Connected {
                 return Err(NET_ERR_NOTCONN);
             }
@@ -508,6 +514,25 @@ mod tests {
         let mut buf = [0u8; 64];
         let n = net.recv(b, &mut buf).unwrap();
         assert_eq!(&buf[..n], b"ping");
+    }
+
+    #[test]
+    fn shutdown_write_makes_send_epipe() {
+        let mut net = MockNetwork::new();
+        let server = net.socket(SockType::Stream).unwrap();
+        net.bind(server, Addr { ip: 0, port: 82 }).unwrap();
+        net.listen(server).unwrap();
+
+        let client = net.socket(SockType::Stream).unwrap();
+        net.connect(client, Addr { ip: 0x7F000001, port: 82 }).unwrap();
+        let (accepted, _) = net.accept(server).unwrap();
+
+        net.shutdown(client, 1).unwrap();          /* SHUT_WR */
+        assert_eq!(net.send(client, b"x"), Err(NET_ERR_PIPE));
+        let mut buf = [0u8; 8];
+        assert_eq!(net.recv(accepted, &mut buf).unwrap(), 0); /* EOF */
+        assert_eq!(net.send(accepted, b"y"), Ok(1));
+        assert_eq!(net.recv(client, &mut buf).unwrap(), 1); /* recv still open */
     }
 
     #[test]
