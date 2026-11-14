@@ -114,7 +114,7 @@ use aerosls_proto::{NET_ERR_ADDRINUSE, NET_ERR_ADDRNOTAVAIL, NET_ERR_CAP,
     NET_ERR_PROTO, NET_ERR_WOULDBLOCK};
 use aerosls_vfs::aerofs::FileType;
 use aerosls_vfs::{CharNode, DirEnt, Errno, PollFd, Stat, Vfs,
-    POLLIN, POLLNVAL, POLLOUT}; /* E7 increment 5: the fd
+    CLONE_FILES as VFS_CLONE_FILES, POLLIN, POLLNVAL, POLLOUT}; /* E7 increment 5: the fd
                               * table's console slot — service() holds the
                               * handle because only the entry loop has the
                               * CharNode. Step 4 (the file class): the VFS
@@ -2464,11 +2464,56 @@ fn dents_payload(ents: &[DirEnt], buf: &mut [u8; FD_PAYLOAD_CAP]) -> usize {
     off
 }
 
-/// One Linux-personality child whose forwards this sidecar answers. The
-/// registry is the spawn path's bookkeeping, not the kernel's: syscall 328
-/// hands back only the CALLER's channel handles, and the reaper needs a
-/// name to resolve a pid (`sidecar_pid`) — the kernel keeps no process-name
-/// authority decision here that its own gates do not already own.
+/// M4.3: the state `CLONE_VM`/`CLONE_FILES`/`CLONE_SIGHAND` make shared.
+/// A Linux thread group owns exactly one of these; every task in the group
+/// points at it. The fd table, the §5.4 heap ledger and the signal
+/// dispositions live here because Linux shares them at thread creation,
+/// not because this side happens to have one table per tracked child. The
+/// thread count is the group's reference count: the last release retires
+/// the group and its tables together.
+#[derive(Clone, Copy)]
+struct LinuxGroup {
+    used: bool,
+    threads: u16,
+    partition: u32,
+    gate: bool,
+    fds: [FdSlot; LINUX_MAX_FDS],
+    brk_base: u64,
+    brk_limit: u64,
+    brk_cur: u64,
+    brk_mtop: u64,
+    sig_dispo: [u8; SIG_MAX + 1],
+    sig_act: [SigAct; SIG_MAX + 1],
+}
+
+impl LinuxGroup {
+    const fn new() -> Self {
+        LinuxGroup {
+            used: false,
+            threads: 0,
+            partition: 0,
+            gate: false,
+            fds: [FdSlot { used: false, kind: 0, vfs_fd: 0, flags: 0 };
+                  LINUX_MAX_FDS],
+            brk_base: 0,
+            brk_limit: 0,
+            brk_cur: 0,
+            brk_mtop: 0,
+            sig_dispo: [DISPO_DFL; SIG_MAX + 1],
+            sig_act: [SigAct::new(); SIG_MAX + 1],
+        }
+    }
+}
+
+/// One tracked Linux thread. M4.3 splits the old single record: the group
+/// owns fds/heap/dispositions, while this record owns the channel, the
+/// name-to-PID registry entry, the VFS task, and the thread's own signal
+/// mask, pending bits, tid and alternate stack. `owns_fds` is true only
+/// for a clone without `CLONE_FILES`; a normal pthread-style clone leaves
+/// it false and reads the group's table. The per-thread `sig` keeps the
+/// group disposition fields as a scratch copy so the existing pure answer
+/// seam keeps its shape; `service` loads and stores the authoritative
+/// group copy around every request.
 #[derive(Clone, Copy)]   /* Copy so the table can be a const-initialized
                          * static array ([..; N] repeat needs it) */
 struct LinuxTask {
@@ -2482,26 +2527,13 @@ struct LinuxTask {
                       * kernel's reading of a 0 request partition. It is
                       * not "PARTITION_SYSTEM": the child is spawned with
                       * target 0 (inherit), so it lives where we live. */
-    vfs_task: u32,  /* step 4: this task's VFS task id — the table the
-                     * thirteen file-class arms operate over. Allocated
-                     * at spawn (track's caller: the spawn path owns a
-                     * ProcManager), freed at exit beside the slot.     */
-    fds: [FdSlot; LINUX_MAX_FDS],   /* increment 5: the task's fd table  */
-    brk_base: u64,  /* increment 6: the §5.4 ledger — the span this side */
-    brk_limit: u64, /* authored into the manifest and the kernel stamped */
-    brk_cur: u64,   /* into its own descriptor, and the bump pointer     */
-                    /* this side moves (the kernel's brk_cur is the      */
-                    /* mechanism's twin — the probe proves they agree)   */
-    brk_mtop: u64,  /* increment 16: the anonymous-map cursor — born at  */
-                    /* the limit, descending by every granted non-FIXED  */
-                    /* mmap (the kernel's linux_mmap_top is its twin)    */
-    sig: SigState,  /* increment 10: the signal seam's per-task state —  */
-                    /* dispositions, mask, pending, and the tid tkill    */
-                    /* matches (recorded from this task's OWN 218 echo)  */
-    gate: bool,     /* increment 19: the tenant gate profile's child —   */
-                    /* its console bytes are mirrored to the serial log  */
-                    /* so the work-half measurement is not trapped in an */
-                    /* environment console nobody attached to           */
+    group: usize,    /* index into groups(); the group owns shared state  */
+    vfs_task: u32,   /* this thread's VFS task; its fd table is shared
+                      * with the group's siblings when CLONE_FILES      */
+    owns_fds: bool,  /* clone without CLONE_FILES: this thread's own     */
+    fds: [FdSlot; LINUX_MAX_FDS], /* private table when owns_fds      */
+    sig: SigState,   /* per-thread mask/pending/tid/alt stack; the      */
+                     /* disposition fields are a service-loaded cache   */
     /* E7 increment 24 (the waiting half): a console read or a timed poll
      * whose reply is deliberately NOT sent yet. The child is parked in
      * the kernel awaiting this exchange, so `pending` also means "no
@@ -2517,6 +2549,14 @@ struct LinuxTask {
 }
 
 const MAX_LINUX_TASKS: usize = 8;
+const MAX_LINUX_GROUPS: usize = MAX_LINUX_TASKS;
+
+#[allow(static_mut_refs)]   /* single-threaded sidecar, entry-loop confined */
+fn groups() -> &'static mut [LinuxGroup; MAX_LINUX_GROUPS] {
+    static mut TABLE: [LinuxGroup; MAX_LINUX_GROUPS] = [LinuxGroup::new();
+                                                         MAX_LINUX_GROUPS];
+    unsafe { &mut TABLE }
+}
 
 #[allow(static_mut_refs)]   /* single-threaded sidecar, entry-loop confined */
 fn tasks() -> &'static mut [LinuxTask; MAX_LINUX_TASKS] {
@@ -2527,14 +2567,11 @@ fn tasks() -> &'static mut [LinuxTask; MAX_LINUX_TASKS] {
         name: [0; 48],
         name_len: 0,
         partition: 0,
+        group: 0,
         vfs_task: 0,
+        owns_fds: false,
         fds: [FdSlot { used: false, kind: 0, vfs_fd: 0, flags: 0 }; LINUX_MAX_FDS],
-        brk_base: 0,
-        brk_limit: 0,
-        brk_cur: 0,
-        brk_mtop: 0,
         sig: SigState::new(),
-        gate: false,
         pending: PENDING_NONE,
         pending_tag: 0,
         pending_arg: 0,
@@ -2545,13 +2582,13 @@ fn tasks() -> &'static mut [LinuxTask; MAX_LINUX_TASKS] {
     unsafe { &mut TABLE }
 }
 
-/// Register a spawned Linux child so `service()` answers it. The spawn
-/// caller (`Kernel::linux_spawn`) records the returned handles here — before
-/// or after the child first runs, both safe: the child's forward parks
-/// until a reply, and its message simply waits in the channel queue until
-/// the next `service()` pass drains it. Returns false when the table is
-/// full (the child then parks unanswered, which its first forward's
-/// -EAGAIN/… never happens — it stays parked; a spawn path SHOULD check).
+/// Register a spawned Linux child as the leader of a new thread group.
+/// The spawn caller (`Kernel::linux_spawn`) records the returned handles
+/// here — before or after the child first runs, both safe: the child's
+/// forward parks until a reply, and its message simply waits in the
+/// channel queue until the next `service()` pass drains it. Returns false
+/// when either table is full (the child then parks unanswered; a spawn
+/// path SHOULD check).
 pub fn track(
     ch_r: u32,
     ch_w: u32,
@@ -2567,61 +2604,160 @@ pub fn track(
                       * log (the tenant console is otherwise unobserved) */
 ) -> bool {
     let nlen = name.len().min(48);
-    for t in tasks().iter_mut() {
-        if t.used {
-            continue;
-        }
-        t.used = true;
-        t.ch_r = ch_r;
-        t.ch_w = ch_w;
-        t.name[..nlen].copy_from_slice(&name.as_bytes()[..nlen]);
-        t.name_len = nlen;
-        t.partition = partition;
-        t.vfs_task = vfs_task;
-        /* The §5.4 ledger is born with the task: the span the spawn
-         * caller derived from the manifest it authored (the kernel's
-         * create stamped its own copy from the same record — the two
-         * are one truth, mirrored because the Rust side cannot include
-         * kernel/linux_abi.h). The break starts at the span's base:
-         * nothing is mapped above the stack until a brk grants it. */
-        t.brk_base = heap_base;
-        t.brk_limit = heap_limit;
-        t.brk_cur = heap_base;
-        /* The anonymous-map cursor is born at the span's top (increment
-         * 16): brk grows up from the base, a granted mmap descends from
-         * the limit, and the two can never meet — the kernel stamps
-         * linux_mmap_top from the same manifest record. */
-        t.brk_mtop = heap_limit;
-        t.gate = gate;
-        /* The signal state is born with the task, like the fd table and
-         * the ledger below: a reused registry slot must not inherit its
-         * predecessor's dispositions, mask, pending bits or TID — an
-         * inherited tid would answer ESRCH-vs-deliver wrongly for the
-         * next child, which is the stale-state failure this reset exists
-         * to refuse (proc_clear_resume_state's discipline, sidecar side). */
-        t.sig = SigState::new();
-        /* A reused slot must not inherit a parked exchange either: the
-         * tag belongs to a child that is gone, and answering it would put
-         * a reply on the next child's channel. Same discipline as sig. */
-        t.pending = PENDING_NONE;
-        t.pending_tag = 0;
-        t.pending_arg = 0;
-        t.pending_len = 0;
-        t.pending_deadline = 0;
-        t.pending_bytes = [0; LINUX_POLL_PAYLOAD_BYTES];
-        /* The fd table is born with the task: fds 0, 1, 2 — its console,
-         * registered at spawn like every process's stdio. All three
-         * accept writes (a tty is bidirectional; write(0) is not EBADF
-         * on Linux), and the slots are what later increments grow by
-         * open()'s hand. */
-        t.fds = [FdSlot { used: false, kind: 0, vfs_fd: 0, flags: 0 }; LINUX_MAX_FDS];
-        for slot in t.fds.iter_mut().take(3) {
-            slot.used = true;
-            slot.kind = FD_KIND_CONSOLE;
-        }
-        return true;
+    let Some(tslot) = tasks().iter().position(|t| !t.used) else {
+        return false;
+    };
+    let Some(gslot) = groups().iter().position(|g| !g.used) else {
+        return false;
+    };
+
+    /* The group is born with the leader. fds 0, 1, 2 are its console,
+     * registered at spawn like every process's stdio; all three accept
+     * writes (a tty is bidirectional; write(0) is not EBADF on Linux).
+     * The §5.4 span and the signal dispositions belong to the group too,
+     * because CLONE_VM/CLONE_SIGHAND make them siblings' shared state. */
+    let g = &mut groups()[gslot];
+    g.used = true;
+    g.threads = 1;
+    g.partition = partition;
+    g.gate = gate;
+    g.brk_base = heap_base;
+    g.brk_limit = heap_limit;
+    g.brk_cur = heap_base;
+    g.brk_mtop = heap_limit;
+    g.sig_dispo = [DISPO_DFL; SIG_MAX + 1];
+    g.sig_act = [SigAct::new(); SIG_MAX + 1];
+    for slot in g.fds.iter_mut().take(3) {
+        slot.used = true;
+        slot.kind = FD_KIND_CONSOLE;
     }
-    false
+
+    let t = &mut tasks()[tslot];
+    t.used = true;
+    t.ch_r = ch_r;
+    t.ch_w = ch_w;
+    t.name[..nlen].copy_from_slice(&name.as_bytes()[..nlen]);
+    t.name_len = nlen;
+    t.partition = partition;
+    t.group = gslot;
+    t.vfs_task = vfs_task;
+    t.owns_fds = false;
+    /* The signal state is born with the thread: a reused registry slot
+     * must not inherit its predecessor's mask, pending bits, TID or
+     * alternate stack (proc_clear_resume_state's discipline, sidecar
+     * side). The disposition cache starts at the group's DFL table. */
+    t.sig = SigState::new();
+    t.sig.dispo = g.sig_dispo;
+    t.sig.act = g.sig_act;
+    /* A reused slot must not inherit a parked exchange either: the tag
+     * belongs to a child that is gone, and answering it would put a
+     * reply on the next child's channel. */
+    t.pending = PENDING_NONE;
+    t.pending_tag = 0;
+    t.pending_arg = 0;
+    t.pending_len = 0;
+    t.pending_deadline = 0;
+    t.pending_bytes = [0; LINUX_POLL_PAYLOAD_BYTES];
+    true
+}
+
+/// A cloned thread needs one free task slot; checked before the kernel
+/// create so a full sidecar table refuses without leaving a released child
+/// to kill.
+pub fn can_track_thread() -> bool {
+    tasks().iter().any(|t| !t.used)
+}
+
+/// M4.3: register a clone child in its parent's group. The group id is
+/// returned for the serial line; the child's shared fds/heap/dispositions
+/// come from the group, while its channel, name, VFS task and signal
+/// mask/pending/tid are its own. `share_fds` mirrors `CLONE_FILES`: a
+/// thread without it gets a private copy of the group table, exactly as
+/// Linux gives it its own files_struct. Returns None only when a slot is
+/// full or the parent/group is no longer live, and increments the group's
+/// reference count only after every field has landed.
+pub fn track_thread(
+    ch_r: u32,
+    ch_w: u32,
+    name: &str,
+    parent: usize,
+    vfs_task: u32,
+    share_fds: bool,
+) -> Option<u32> {
+    if parent >= MAX_LINUX_TASKS || !tasks()[parent].used {
+        return None;
+    }
+    let gid = tasks()[parent].group;
+    if gid >= MAX_LINUX_GROUPS || !groups()[gid].used {
+        return None;
+    }
+    let tslot = tasks().iter().position(|t| !t.used)?;
+    let nlen = name.len().min(48);
+    let parent_mask = tasks()[parent].sig.mask;
+    let g = &mut groups()[gid];
+
+    let t = &mut tasks()[tslot];
+    t.used = true;
+    t.ch_r = ch_r;
+    t.ch_w = ch_w;
+    t.name[..nlen].copy_from_slice(&name.as_bytes()[..nlen]);
+    t.name_len = nlen;
+    t.partition = g.partition;
+    t.group = gid;
+    t.vfs_task = vfs_task;
+    t.owns_fds = !share_fds;
+    if share_fds {
+        t.fds = [FdSlot { used: false, kind: 0, vfs_fd: 0, flags: 0 };
+                 LINUX_MAX_FDS];
+    } else {
+        t.fds = g.fds;
+    }
+    /* pthread-style inheritance: a new thread starts with the creating
+     * thread's blocked mask, no pending signals, no ALT stack and no tid
+     * declaration. Dispositions remain the group's authoritative copy. */
+    t.sig = SigState::new();
+    t.sig.mask = parent_mask;
+    t.sig.dispo = g.sig_dispo;
+    t.sig.act = g.sig_act;
+    t.pending = PENDING_NONE;
+    t.pending_tag = 0;
+    t.pending_arg = 0;
+    t.pending_len = 0;
+    t.pending_deadline = 0;
+    t.pending_bytes = [0; LINUX_POLL_PAYLOAD_BYTES];
+    g.threads = g.threads.saturating_add(1);
+    Some(gid as u32)
+}
+
+/// Drop one task's sidecar record and release its group reference. The
+/// returned VFS task is the caller's to `exit_task`; doing the filesystem
+/// teardown outside this pure state transition keeps the host test able to
+/// drive group lifetime without constructing a Vfs. The group (and its
+/// fds/heap/dispositions) retires only when the last thread releases it.
+fn drop_task_state(i: usize) -> Option<u32> {
+    if i >= MAX_LINUX_TASKS || !tasks()[i].used {
+        return None;
+    }
+    let gid = tasks()[i].group;
+    let vt = tasks()[i].vfs_task;
+    tasks()[i].used = false;
+    if gid < MAX_LINUX_GROUPS && groups()[gid].used {
+        let g = &mut groups()[gid];
+        g.threads = g.threads.saturating_sub(1);
+        if g.threads == 0 {
+            *g = LinuxGroup::new();
+        }
+    }
+    Some(vt)
+}
+
+/// The VFS half of release: its `exit_task` already keeps a CLONE_FILES
+/// table alive while a sibling still holds it, so every thread calls it and
+/// the last one clears the table.
+fn release_task<K: Kernel, A: BufferAlloc>(i: usize, vfs: &mut Vfs<K, A>) {
+    if let Some(vt) = drop_task_state(i) {
+        let _ = vfs.exit_task(vt);
+    }
 }
 
 /// Append every tracked child's recv channel to a wait set (the entry
@@ -2819,8 +2955,23 @@ fn answer_clone<K: Kernel, A: BufferAlloc>(
         flags & CLONE_SIGHAND == 0 {
         return Answer::Reply(0, E_INVAL);
     }
+    /* A thread created without CLONE_FILES has a private table. M4.3's
+     * group record models the shared-table shape; refusing a further clone
+     * from a private task is honest, rather than copying the GROUP's table
+     * and silently giving the grandchild the wrong descriptors. */
+    if tasks()[i].owns_fds {
+        return Answer::Reply(0, E_NOSYS);
+    }
+    /* Refuse a full sidecar table before the kernel allocates a child: the
+     * failure then costs no release/kill dance and cannot leave a running
+     * thread whose forwards nobody answers. */
+    if !can_track_thread() {
+        return Answer::Reply(0, E_NOMEM);
+    }
 
     let nlen = tasks()[i].name_len;
+    let parent_vt = tasks()[i].vfs_task;
+    let share_fds = flags & CLONE_FILES != 0;
     let mut pname = [0u8; 48];
     pname[..nlen].copy_from_slice(&tasks()[i].name[..nlen]);
     let partition = tasks()[i].partition;
@@ -2867,7 +3018,14 @@ fn answer_clone<K: Kernel, A: BufferAlloc>(
     let mut off = push_bytes(&mut cname, 0, &pname[..nlen]);
     off = push_bytes(&mut cname, off, b".t");
     off = dec_into(&mut cname, off, child_tid as u64);
-    let vt = match vfs.add_task() {
+    /* The VFS task is the thread's own task record, but `CLONE_FILES`
+     * makes it share the parent's fd-table object: close/open/dup in one
+     * thread is then visible in every sibling, which is exactly what the
+     * sidecar group's one Linux fd table models. Without CLONE_FILES the
+     * VFS helper copies the table, and the private Linux slots below copy
+     * too — the flag is honoured rather than treated as always-on. */
+    let clone_flags = if share_fds { VFS_CLONE_FILES } else { 0 };
+    let vt = match vfs.clone_task(parent_vt, clone_flags) {
         Ok(vt) => vt,
         Err(_) => {
             k.proc_kill(child_tid);
@@ -2875,25 +3033,30 @@ fn answer_clone<K: Kernel, A: BufferAlloc>(
         }
     };
     let cname_str = core::str::from_utf8(&cname[..off]).unwrap_or("");
-    /* track stores OUR ends (the sidecar's receive/send handles), exactly
-     * like linux_spawn's return values — the child's own slots are already
-     * in the child's table and are not the sidecar's to read. */
-    let tracked = track(
+    /* track_thread stores OUR ends (the sidecar's receive/send handles),
+     * exactly like linux_spawn's return values — the child's own slots are
+     * already in the child's table and are not the sidecar's to read. */
+    let gid = match track_thread(
         req.sidecar_r as u32,
         req.sidecar_w as u32,
         cname_str,
-        partition,
-        tasks()[i].brk_base,
-        tasks()[i].brk_limit,
+        i,
         vt,
-        tasks()[i].gate,
-    );
-    if !tracked {
-        let _ = vfs.exit_task(vt);
-        k.proc_kill(child_tid);
-        return Answer::Reply(0, E_NOMEM);
-    }
-    enosys_log(LINUX_CLONE as u32, &pname[..nlen], b" ok thread\n");
+        share_fds,
+    ) {
+        Some(gid) => gid,
+        None => {
+            let _ = vfs.exit_task(vt);
+            k.proc_kill(child_tid);
+            return Answer::Reply(0, E_NOMEM);
+        }
+    };
+    let mut ex = [0u8; 48];
+    let mut off = push_bytes(&mut ex, 0, b" clone group=");
+    off = dec_into(&mut ex, off, gid as u64);
+    off = push_bytes(&mut ex, off, if share_fds { b" files shared\n" }
+                                          else { b" files copied\n" });
+    enosys_log(LINUX_CLONE as u32, &pname[..nlen], &ex[..off]);
     Answer::Reply(child_tid as u64, STATUS_OK)
 }
 
@@ -2933,9 +3096,7 @@ fn reap_pending_if_closed<K: Kernel, A: BufferAlloc>(
 ) {
     if let Ok(kind) = k.poll(tasks()[i].ch_r) {
         if kind == aerosls_proto::CH_KIND_CLOSE {
-            let vt = tasks()[i].vfs_task;
-            let _ = vfs.exit_task(vt);
-            tasks()[i].used = false;
+            release_task(i, vfs);
         }
     }
 }
@@ -2965,6 +3126,13 @@ pub fn service<K: Kernel, A: BufferAlloc>(
     let mut net = net;
     for i in 0..MAX_LINUX_TASKS {
         if !tasks()[i].used {
+            continue;
+        }
+        let gid = tasks()[i].group;
+        if gid >= MAX_LINUX_GROUPS || !groups()[gid].used {
+            /* A live task without its group cannot share anything; drop
+             * the orphan rather than answer from a retired table. */
+            tasks()[i].used = false;
             continue;
         }
         let ch_r = tasks()[i].ch_r;
@@ -3015,7 +3183,11 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                 let len = tasks()[i].pending_len;
                 let deadline = tasks()[i].pending_deadline;
                 let vt = tasks()[i].vfs_task;
-                let fds_copy = tasks()[i].fds;
+                let fds_copy = if tasks()[i].owns_fds {
+                    tasks()[i].fds
+                } else {
+                    groups()[gid].fds
+                };
                 let mut arr = tasks()[i].pending_bytes;
                 let ready = poll_scan(&fds_copy, &mut net, &mut arr, nfds, console,
                     &mut |vfs_fd, events| {
@@ -3063,13 +3235,11 @@ pub fn service<K: Kernel, A: BufferAlloc>(
              * come, and its channel slot is spent. Drop the registry entry
              * so a respawned child re-registers fresh. */
             aerosls_proto::CH_KIND_CLOSE => {
-                /* The child's end is gone: its VFS task goes with the
-                 * slot (step 4) — a respawned child re-registers and
-                 * re-allocates fresh, like every other piece of state. */
-                if let Some(vt) = tasks().get(i).filter(|t| t.used).map(|t| t.vfs_task) {
-                    let _ = vfs.exit_task(vt);
-                }
-                tasks()[i].used = false;
+                /* The thread's end is gone: release its VFS task and its
+                 * group reference. A sibling still holds the group and
+                 * the shared CLONE_FILES table alive; the last release
+                 * retires both. */
+                release_task(i, vfs);
                 continue;
             }
             aerosls_proto::CH_KIND_MSG => {}
@@ -3123,15 +3293,24 @@ pub fn service<K: Kernel, A: BufferAlloc>(
         }
         let payload: &[u8] = &buf[LINUX_SYSCALL_REQ_BYTES..rr.len];
 
-        let mut fds = tasks()[i].fds;
-        let mut mem = MemBrk {
-            base: tasks()[i].brk_base,
-            limit: tasks()[i].brk_limit,
-            cur: tasks()[i].brk_cur,
-            mtop: tasks()[i].brk_mtop,
+        /* M4.3: the group is the authority for fds, heap and signal
+         * dispositions. A thread without CLONE_FILES reads its private
+         * table instead; every other task reads the one group table. */
+        let mut fds = if tasks()[i].owns_fds {
+            tasks()[i].fds
+        } else {
+            groups()[gid].fds
         };
-        let mut sigstate = tasks()[i].sig; /* Copy — the seam's ledger, */
-                                           /* written back like brk's   */
+        let mut mem = MemBrk {
+            base: groups()[gid].brk_base,
+            limit: groups()[gid].brk_limit,
+            cur: groups()[gid].brk_cur,
+            mtop: groups()[gid].brk_mtop,
+        };
+        let mut sigstate = tasks()[i].sig; /* per-thread half: mask, */
+                                           /* pending, tid, alt stack */
+        sigstate.dispo = groups()[gid].sig_dispo;
+        sigstate.act = groups()[gid].sig_act;
 
         /* E7 step 4 (the file class): the thirteen numbers route to the
          * VFS bridge — every DECISION (rights, flags, errno) is the
@@ -3158,7 +3337,7 @@ pub fn service<K: Kernel, A: BufferAlloc>(
             | LINUX_FTRUNCATE | LINUX_RENAME | LINUX_MKDIR | LINUX_UNLINK
             | LINUX_GETDENTS64 | LINUX_POLL =>
                 answer_file(num, &args, &mut fds, tasks()[i].vfs_task, vfs,
-                            &mut net, payload, console, now_ns, tasks()[i].gate),
+                            &mut net, payload, console, now_ns, groups()[gid].gate),
             _ => answer(num, &args, &fds, &mut mem, &mut sigstate, payload),
         };
         /* M3.5: a send that the socket service refused with EPIPE is the
@@ -3169,22 +3348,27 @@ pub fn service<K: Kernel, A: BufferAlloc>(
         if num == LINUX_SENDTO {
             ans = sigpipe_after_epipe(&mut sigstate, ans);
         }
-        tasks()[i].fds = fds;
+        if tasks()[i].owns_fds {
+            tasks()[i].fds = fds;
+        } else {
+            groups()[gid].fds = fds;
+        }
         /* The ledger survives the reply: only a granted growth moves it
          * (the arm's own rule), and the KERNEL's brk_cur is its own
          * twin — the probe's denial-echo check is what proves the two
          * never drift. The same holds for mtop (increment 16): only the
          * mmap arm descends it, and linux_mmap_top is its twin. The
          * base and limit are never written here: they are the span,
-         * decided once, at spawn. */
-        tasks()[i].brk_cur = mem.cur;
-        tasks()[i].brk_mtop = mem.mtop;
-        /* E7 increment 10: the signal state survives the reply the same
-         * way — tid, mask, pending and dispositions are each written only
-         * by the arm that owns them, and a refusal arm mutated nothing
-         * (refusal-before-mutation), so this unconditional write-back
-         * carries exactly the change that was granted. A SignalKill then
-         * spends the whole entry below — the state goes with the slot. */
+         * decided once, at spawn. The group owns all four numbers now. */
+        groups()[gid].brk_cur = mem.cur;
+        groups()[gid].brk_mtop = mem.mtop;
+        /* E7 increment 10: the per-thread signal state survives the reply
+         * the same way — mask, pending, tid and alt stack are each written
+         * only by the arm that owns them. Dispositions are the group's:
+         * they leave this thread's scratch copy and return to the group so
+         * a sibling sees an rt_sigaction installed by any thread. */
+        groups()[gid].sig_dispo = sigstate.dispo;
+        groups()[gid].sig_act = sigstate.act;
         tasks()[i].sig = sigstate;
 
         match ans {
@@ -3330,7 +3514,7 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                          * (Copying / Done / pruned) is observed, not inferred
                          * from a buffered stream nobody drained. */
                         #[cfg(feature = "target")]
-                        if tasks()[i].gate {
+                        if groups()[gid].gate {
                             crate::entry::serial_write_raw(&payload[..len]);
                         }
                         /* Attribution — the SIGABRT reading's instrument:
@@ -3431,8 +3615,7 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                      * No reply: the task will never run again, and its
                      * channel goes with its table. */
                     k.proc_kill(pid);
-                    let _ = vfs.exit_task(tasks()[i].vfs_task);
-                    tasks()[i].used = false;
+                    release_task(i, vfs);
                 }
             }
             Answer::SignalKill(kill_sig) => {
@@ -3459,8 +3642,7 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                     reply(k, ch_w, rr.tag, num, 0, E_CONFLICT);
                 } else {
                     k.proc_kill(pid);
-                    let _ = vfs.exit_task(tasks()[i].vfs_task);
-                    tasks()[i].used = false;
+                    release_task(i, vfs);
                 }
             }
             Answer::SignalHandler(d) => {
@@ -4994,5 +5176,79 @@ mod tests {
         let p = path_pair(b"/old.partial\0/new.img\0").expect("pair");
         assert_eq!(p, ("/old.partial", "/new.img"));
         assert!(path_pair(b"/old.partial\0/no-second-nul").is_none());
+    }
+
+    /* M4.3: the sidecar table split, driven without a Vfs. The group owns
+     * the fds/heap/dispositions, the thread owns its channel/name/private
+     * table, and the LAST release retires the group exactly once. A private
+     * clone (no CLONE_FILES) starts from a copy and cannot mutate the
+     * group's table; a shared clone sees every slot the leader opened. */
+    fn reset_registry() {
+        for t in tasks().iter_mut() {
+            t.used = false;
+        }
+        for g in groups().iter_mut() {
+            *g = LinuxGroup::new();
+        }
+    }
+
+    #[test]
+    fn clone_tracking_shares_group_state_and_last_release_retires_it() {
+        reset_registry();
+        assert!(track(0x10, 0x11, "m4.3.leader", 0,
+                      0x80_0000, 0x81_0000, 7, false));
+        let gid = tasks()[0].group;
+        assert!(groups()[gid].used);
+        assert_eq!(groups()[gid].threads, 1);
+        assert!(!tasks()[0].owns_fds, "the leader reads the group table");
+        groups()[gid].fds[3] = FdSlot { used: true, kind: FD_KIND_FILE,
+                                      vfs_fd: 9, flags: 0 };
+        groups()[gid].brk_cur = 0x80_3000;
+        groups()[gid].sig_dispo[10] = DISPO_HANDLER;
+        groups()[gid].sig_act[10] = SigAct { handler: 0x401000, flags: 0,
+                                             restorer: 0, mask: 0 };
+        tasks()[0].sig.mask = 1 << 5; /* SIGABRT blocked */
+
+        assert_eq!(track_thread(0x20, 0x21, "m4.3.leader.t20", 0, 8, true),
+                   Some(gid as u32));
+        assert_eq!(groups()[gid].threads, 2);
+        assert_eq!(tasks()[1].group, gid);
+        assert!(!tasks()[1].owns_fds, "CLONE_FILES shares the group table");
+        assert_eq!(groups()[gid].fds[3].vfs_fd, 9,
+                   "the sibling sees the leader's open fd");
+        assert_eq!(groups()[gid].brk_cur, 0x80_3000,
+                   "the sibling sees the group's break");
+        assert_eq!(tasks()[1].sig.dispo[10], DISPO_HANDLER,
+                   "the sibling sees the group's disposition");
+        assert_eq!(tasks()[1].sig.act[10].handler, 0x401000,
+                   "the handler details are the group's");
+        assert_eq!(tasks()[1].sig.mask, 1 << 5,
+                   "the new thread inherits the creator's blocked mask");
+        assert_eq!(tasks()[1].sig.pending, 0,
+                   "pending signals are per-thread and start clear");
+
+        assert_eq!(track_thread(0x30, 0x31, "m4.3.leader.t30", 0, 9, false),
+                   Some(gid as u32));
+        assert!(tasks()[2].owns_fds, "no CLONE_FILES: private table copy");
+        assert_eq!(tasks()[2].fds[3].vfs_fd, 9,
+                   "the private clone starts from the group's slots");
+        tasks()[2].fds[3].vfs_fd = 10;
+        tasks()[2].fds[3].used = false;
+        assert_eq!(groups()[gid].fds[3].vfs_fd, 9,
+                   "a private close cannot spend the group's slot");
+        assert_eq!(groups()[gid].threads, 3);
+
+        assert_eq!(drop_task_state(0), Some(7));
+        assert!(groups()[gid].used, "the group survives the leader");
+        assert_eq!(groups()[gid].threads, 2);
+        assert_eq!(drop_task_state(1), Some(8));
+        assert!(groups()[gid].used, "the group survives the first thread");
+        assert_eq!(groups()[gid].threads, 1);
+        assert_eq!(drop_task_state(2), Some(9));
+        assert!(!groups()[gid].used, "the last release retires the group");
+        assert_eq!(groups()[gid].threads, 0);
+        assert_eq!(drop_task_state(2), None, "release is idempotent");
+        assert!(!tasks()[0].used && !tasks()[1].used && !tasks()[2].used);
+        assert!(can_track_thread());
     }
 }

@@ -1156,6 +1156,11 @@ SIDECAR_M1_NET_PROBE = $(if $(filter 1,$(M1_NET_PROBE)),--features aerosls-sidec
 # the raw clone fixture and its spawn call; an unset knob compiles both out.
 M4_THREAD_PROBE ?=
 SIDECAR_M4_THREAD_PROBE = $(if $(filter 1,$(M4_THREAD_PROBE)),--features aerosls-sidecar/m4_thread_probe)
+# M4.3's live shared-group probe: a build-time feature, never in a shipped
+# image. `make x86-iso M4_GROUP_PROBE=1` compiles the group fixture and its
+# spawn call into the initial POSIX sidecar; an unset knob compiles both out.
+M4_GROUP_PROBE ?=
+SIDECAR_M4_GROUP_PROBE = $(if $(filter 1,$(M4_GROUP_PROBE)),--features aerosls-sidecar/m4_group_probe)
 SIDECAR_INIT_ELF   ?= user/target/x86_64-unknown-none/release/init
 SIDECAR_DM_ELF     ?= user/target/x86_64-unknown-none/release/dm
 SIDECAR_POSIX_ELF ?= user/target/x86_64-unknown-none/release/posix
@@ -1216,7 +1221,7 @@ selfhost-bootimage:
 	@# aerosls-bootimage directly; a stamp is only for an archive this target
 	@# built.) tests/sidecar_stamp_check.sh clause G holds this line.
 	@$(CARGO) build --quiet --manifest-path user/Cargo.toml -p aerosls-dm -p aerosls-sidecar -p aerosls-ramdisk -p aerosls-network -p aerosls-e1000-driver \
-		--features target $(SIDECAR_SLOW_BOOT) $(SIDECAR_M1_NET_PROBE) $(SIDECAR_M4_THREAD_PROBE) --target x86_64-unknown-none --release \
+		--features target $(SIDECAR_SLOW_BOOT) $(SIDECAR_M1_NET_PROBE) $(SIDECAR_M4_THREAD_PROBE) $(SIDECAR_M4_GROUP_PROBE) --target x86_64-unknown-none --release \
 		--bin dm --bin posix --bin ramdisk --bin network --bin e1000_driver \
 		|| { echo "[SELFHOST] REFUSING to pack and stamp: the sidecars did not build for x86_64-unknown-none." >&2; \
 		     echo "           The stamp attests the packed binaries, and reusing existing ones would make it a lie." >&2; \

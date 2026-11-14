@@ -3,15 +3,17 @@
 #
 # M4 is the modern-runtime gate: Go, threaded Rust, threaded CPython, Node
 # and every other threaded runtime need `clone`, `futex`, a shared address
-# space and a thread group. The tree has M4.1's group object and refcount and
-# M4.2's clone/thread-create path, but no futex. This guard has four jobs:
+# space and a thread group. The tree has M4.1's group object and refcount,
+# M4.2's clone/thread-create path and M4.3's shared group/thread state, but
+# no futex. This guard has four jobs:
 #
 #   1. While all three mechanisms are absent, the design/roadmap surfaces
 #      must keep Go and the threaded runtimes OUT.
-#   2. A documented, ordered partial stage is allowed: M4.1 (group only) and
-#      M4.2 (clone + group, no futex yet) are named in the design and must
-#      still keep every runtime out. `futex` without clone/group, or clone
-#      without a group, is out of order and fails.
+#   2. A documented, ordered partial stage is allowed: M4.1 (group only),
+#      M4.2 (clone + group) and M4.3 (shared sidecar group/thread state, no
+#      futex yet) are named in the design and must still keep every runtime
+#      out. `futex` without clone/group, or clone without a group, is out of
+#      order and fails.
 #   3. All three mechanisms present is still not enough for a runtime claim:
 #      the live M4.7 gate artifact must exist and carry its markers. F8
 #      refuses an all-present tree with no artifact; a doc sentence is not
@@ -86,7 +88,7 @@ fi
 if grep -qF 'An undocumented or out-of-order partial implementation is a failure, not a milestone' "$DOC"; then
     ok "B3. the design refuses undocumented or out-of-order partial support"
 else
-    bad "B3. the design lost its partial-implementation rule — only the named M4.1/M4.2 stages may land early"
+    bad "B3. the design lost its partial-implementation rule — only the named M4.1/M4.2/M4.3 stages may land early"
 fi
 
 # ─── C. The decisions are the contract ───────────────────────────────────
@@ -138,11 +140,14 @@ futex_hits="$(grep -nE 'LINUX_FUTEX|SYS_LINUX_FUTEX|^[[:space:]]*\{[[:space:]]*2
     "$ABI_C" "$ABI_H" "$DISPATCH" "$LINUX_RS" 2>/dev/null || true)"
 group_hits="$(grep -nE 'LinuxThreadGroup|linux_tgid|thread_group_id|linux_thread_group' \
     "$PROC_H" "$PROC_C" "$CAP_C" "$LINUX_THREADS_H" 2>/dev/null || true)"
+m43_hits="$(grep -nE 'struct LinuxGroup|track_thread|release_task|drop_task_state' \
+    "$LINUX_RS" 2>/dev/null || true)"
 
-clone=0; futex=0; group=0
+clone=0; futex=0; group=0; m43=0
 [ -n "$clone_hits" ] && clone=1
 [ -n "$futex_hits" ] && futex=1
 [ -n "$group_hits" ] && group=1
+[ -n "$m43_hits" ] && m43=1
 support=$((clone + futex + group))
 
 # The live M4.7 artifact is the ONLY thing that can unlock a runtime claim.
@@ -165,13 +170,17 @@ elif [ "$group" -eq 1 ] && [ "$clone" -eq 0 ] && [ "$futex" -eq 0 ]; then
     ok "F2. M4.1 is the landed stage: group/refcount present, clone and futex absent"
     stage=1
 elif [ "$group" -eq 1 ] && [ "$clone" -eq 1 ] && [ "$futex" -eq 0 ]; then
-    ok "F3. M4.2 is the landed stage: clone and group present, futex absent"
+    if [ "$m43" -eq 1 ]; then
+        ok "F3. M4.3 is the landed stage: clone, group and the sidecar group/thread split present, futex absent"
+    else
+        ok "F3. M4.2 is the landed stage: clone and group present, futex absent"
+    fi
     stage=2
 elif [ "$group" -eq 1 ] && [ "$clone" -eq 1 ] && [ "$futex" -eq 1 ]; then
     ok "F4. clone, futex and thread groups are all present in the source census"
     stage=3
 else
-    bad "F5. M4 is out of order (clone=$clone futex=$futex group=$group) — futex requires clone+group and clone requires a group; only the documented M4.1/M4.2 stages may be partial"
+    bad "F5. M4 is out of order (clone=$clone futex=$futex group=$group) — futex requires clone+group and clone requires a group; only the documented M4.1/M4.2/M4.3 stages may be partial"
     stage=-1
 fi
 
@@ -229,11 +238,14 @@ case "$stage" in
         fi
         ;;
     2)
-        if grep -q 'M4\.2 landed' "$PASE" &&
+        if [ "$m43" -eq 1 ] && grep -q 'M4\.3 landed' "$PASE" &&
            grep -q 'M4\.7 gate not evidenced' "$PASE" "$DOC"; then
+            ok "G1. M4.3 is documented as landed with the M4.7 gate not evidenced"
+        elif [ "$m43" -eq 0 ] && grep -q 'M4\.2 landed' "$PASE" &&
+             grep -q 'M4\.7 gate not evidenced' "$PASE" "$DOC"; then
             ok "G1. M4.2 is documented as landed with the M4.7 gate not evidenced"
         else
-            bad "G1. clone+group are present but the docs do not state M4.2 landed and the M4.7 gate not evidenced"
+            bad "G1. clone+group are present but the docs do not state the landed M4.3 (or M4.2) stage and the M4.7 gate not evidenced"
         fi
         ;;
     3)

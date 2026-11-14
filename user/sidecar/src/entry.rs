@@ -698,6 +698,40 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         }
     }
 
+    // M4.3: the live shared-group proof. The leader opens a file and clones
+    // with CLONE_FILES; the child writes that descriptor and publishes a
+    // shared stack word. Built only with M4_GROUP_PROBE=1, and spawned by
+    // the same initial POSIX sidecar as the M4.2 probe (gate=true mirrors
+    // both tasks' console bytes to serial).
+    #[cfg(feature = "m4_group_probe")]
+    {
+        if !gate && caps.identity.is_none() {
+            match crate::m4_group_probe::spawn(&RealKernel, caps.budget_base,
+                                               caps.budget_len) {
+                Ok(sp) => match booted.proc.vfs.add_task() {
+                    Ok(vt) => {
+                        if crate::linux::track(
+                            sp.ch_r,
+                            sp.ch_w,
+                            crate::m4_group_probe::PROBE_NAME,
+                            0,
+                            sp.heap_base,
+                            sp.heap_limit,
+                            vt,
+                            true,
+                        ) {
+                            klog(b"[M4.3] group probe: spawned ch_r=", sp.ch_r, b"");
+                        } else {
+                            klog(b"[M4.3] group probe: TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+                        }
+                    }
+                    Err(_) => klog(b"[M4.3] group probe: VFS task alloc FAILED ch_r=", sp.ch_r, b""),
+                },
+                Err(rc) => klog(b"[M4.3] group probe: spawn FAILED rc=", rc as u32, b""),
+            }
+        }
+    }
+
     // M1: the live Linux TCP round trip. Compiled only into an image built
     // with M1_NET_PROBE=1; the child is spawned by the initial POSIX sidecar
     // (no E3 identity), whose `network` cap is the live driver path the
