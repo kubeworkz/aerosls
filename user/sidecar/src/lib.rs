@@ -69,6 +69,8 @@ pub mod heap;
 pub mod linux;
 #[cfg(feature = "m1_net_probe")]
 pub mod m1_net_probe;
+#[cfg(feature = "m4_thread_probe")]
+pub mod m4_thread_probe;
 pub mod net_client;
 
 #[cfg(feature = "target")]

@@ -1857,6 +1857,11 @@ uint64_t do_syscall(uint64_t num, void* arg) {
     case SYS_SLS_LINUX_SPAWN:
         return sys_sls_linux_spawn((struct SLSCreateSidecarRequest*)arg);
 
+    /* M4.2: the sidecar's held thread-create primitive (330). */
+    case SYS_SLS_LINUX_CLONE_THREAD:
+        return sys_sls_linux_clone_thread(
+            (struct SLSLinuxCloneThreadRequest*)arg);
+
     /* E7 increment 24: a monotonic clock for the sidecar's timed poll. */
     case SYS_SLS_NOW_NS:
         return (uint64_t)kernel_tick_counter * (uint64_t)KERNEL_TICK_NS;

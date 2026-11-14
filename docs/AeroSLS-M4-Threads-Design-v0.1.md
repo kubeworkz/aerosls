@@ -1,15 +1,16 @@
 # AeroSLS M4 — Threads and Thread Groups (Design Spike v0.1)
 
-Status: M4.1 landed; M4.2 not started; runtime wall in force.
+Status: M4.2 landed; M4.7 gate not evidenced; runtime wall in force.
 
 Date: 2026-11-14. Owner: Gridworkz. Scope: M4 in
 `AeroSLS-PASE-Linux-Shape-Decision-v0.1.md`.
 
 **This document does not claim thread support.** M4.1 landed the group
-object and the shared-PML4 reference count, but the tree still has no
-`clone` (56), no `clone3` (435), no `futex` (202), no second execution context
-in a Linux group, and no live M4.7 gate. Until the increments in §5 are
-implemented and evidenced, **Go, threaded Rust, threaded CPython, Node, and every other threaded runtime remain out**. An undocumented or out-of-order partial implementation is a failure, not a milestone: a `clone` that copies a page table is not threads, and a futex that cannot wake another thread is not futex. M4.1 is allowed to land alone because it adds no user-visible thread surface; M4.2 may land before futex only because it is explicitly staged here, and it still leaves every runtime out.
+object and the shared-PML4 reference count; M4.2 landed the held thread
+create, per-thread syscall stack, post-syscall context, messenger pair and
+ptid/ctid writes. The tree still has no `clone3` (435), no `futex` (202), no
+group/thread sidecar registry (M4.3), no `exit_group` group sweep, and no live
+M4.7 gate. Until the increments in §5 are implemented and evidenced, **Go, threaded Rust, threaded CPython, Node, and every other threaded runtime remain out**. An undocumented or out-of-order partial implementation is a failure, not a milestone: a `clone` that copies a page table is not threads, and a futex that cannot wake another thread is not futex. M4.1 is allowed to land alone because it adds no user-visible thread surface; M4.2 may land before futex only because it is explicitly staged here, and it still leaves every runtime out.
 
 ## 0. The wall, measured in the tree
 
@@ -18,12 +19,12 @@ checked against the current source rather than inferred from a document.
 
 | Component | Current fact | Why it blocks threads |
 |---|---|---|
-| `clone` / `clone3` | absent from `kernel/linux_abi.c`'s class table and `user/sidecar/src/linux.rs`'s arms; unknown Linux numbers reach the default `ENOSYS` | there is no way to create a second execution context |
-| Address space | `cap_create_sidecar_in_personality()` still calls `user_clone_page_table()` (`kernel/cap.c`); M4.1 gives each Linux task a group, but there is no clone path that lets a second task share that group's PML4 | threads must share one PML4; a copied address space cannot share a mutex word, a heap, or a Go scheduler's globals |
-| Page-table lifetime | M4.1 makes the group own the PML4 (`kernel/linux_threads.c`), and process_exit/process_kill/deferred teardown destroy it only on the last reference; before M4.1 the first exiting thread would have freed the address space its siblings were still executing in | the lifetime rule is now in place, but no second thread exists yet to exercise it |
-| Process identity | `struct ProcessDescriptor` now carries `linux_tgid`, `linux_tid`, `linux_clear_child_tid`, and `linux_is_thread` (`kernel/process.h`), but no clone path writes a non-leader TID or a clear-child-tid address | `getpid`, `gettid`, `tkill`, `exit_group`, and signal routing cannot yet observe two threads |
-| Kernel stacks | each process has one dedicated `syscall_stack_top`; there is no thread-create path that allocates a second one | two threads trapping at once need two kernel stacks and two saved user contexts |
-| Sidecar task state | `struct LinuxTask` carries one fd table, one `MemBrk`, and one `SigState` per tracked child (`user/sidecar/src/linux.rs`) | fds, the heap ledger, signal dispositions, and the futex word must be shared; masks/pending/tid must be per-thread |
+| `clone` / `clone3` | M4.2 routes Linux 56 to `SYS_SLS_LINUX_CLONE_THREAD` (330) after the sidecar validates the documented thread subset; `clone3` (435) remains absent and unknown numbers reach the default `ENOSYS` | the tree can now create a second execution context in an existing group, but not a new address space and not the full clone state model |
+| Address space | M4.2's `proc_create_linux_thread()` assigns `parent->cr3` and never calls `user_clone_page_table()`; `cap_create_sidecar_in_personality()` still clones for a NEW task | a thread shares one PML4; an independently created task still does not |
+| Page-table lifetime | M4.1 makes the group own the PML4 (`kernel/linux_threads.c`), and process_exit/process_kill/deferred teardown destroy it only on the last reference; M4.2 attaches the clone child before release and its live probe faults one child while the parent still runs | the lifetime rule is exercised by a second context, but group exit and futex join are not implemented |
+| Process identity | `struct ProcessDescriptor` carries `linux_tgid`, `linux_tid`, `linux_clear_child_tid`, and `linux_is_thread` (`kernel/process.h`); M4.2's `linux_thread_group_attach()` writes the child's TID and the clone syscall writes ptid/ctid | `getpid`, `gettid`, `tkill`, `exit_group`, and signal routing still do not distinguish the two threads |
+| Kernel stacks | M4.2's create allocates a dedicated `syscall_stack_top` for the child and its `ring3_ctx` resumes on the caller's stack | two threads have independent kernel stacks and saved user contexts, but rendezvous/join is still absent |
+| Sidecar task state | M4.2 adds a minimal tracked `LinuxTask` for each clone child (own channel, own VFS task, console fds) but does not yet split group vs thread state; `struct LinuxTask` still carries one fd table, one `MemBrk`, and one `SigState` (`user/sidecar/src/linux.rs`) | M4.3 must share fds/heap/dispositions and make masks/pending/tid per-thread; until then a threaded runtime cannot run |
 | `futex` | absent from both the kernel class table and the sidecar | `pthread_join`, mutexes, Go's scheduler, and every condition variable would spin or fail |
 | `exit_group` | reaps one task by sidecar name through `proc_kill` | it must terminate every thread in the group, then release the shared address space once |
 | `set_tid_address` | stores the user pointer and uses it as the sidecar's tid (`user/sidecar/src/linux.rs`) | a real TID must be a kernel identity, distinct from the clear-child-tid address |
@@ -141,27 +142,30 @@ copy is the exact bug that makes a `pthread` file descriptor look duplicated.
 1. The parent traps 56 (or 435) and the kernel builds the existing 72-byte
    description. It validates the child stack pointer and the `ptid`/`ctid`
    user ranges before any post, exactly as the M1/M3 copy plans do.
-2. The sidecar validates the flag word. M4.1 accepts
+2. The sidecar validates the flag word. M4.2's implemented path accepts
    `CLONE_VM | CLONE_THREAD | CLONE_SIGHAND | CLONE_FILES | CLONE_FS |
    CLONE_SYSVSEM | CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_SETTID |
    CLONE_CHILD_CLEARTID`. It refuses `CLONE_NEW*`, `CLONE_VFORK`,
    `CLONE_PIDFD`, `CLONE_PARENT`, and `CLONE_THREAD` without `CLONE_VM` by
    name. Unsupported flags are `ENOSYS`; malformed combinations are
    `EINVAL`; neither is silently dropped.
-3. The sidecar calls `SYS_SLS_LINUX_CLONE_THREAD` (new, next free number).
-   The request carries the parent's sidecar receive slot, child stack, TLS,
-   ptid/ctid, and the accepted flag subset. The kernel resolves the parent
-   from the channel, checks the parent is Linux and belongs to a live group,
-   and refuses a cross-partition or cross-sidecar parent.
+3. The sidecar calls `SYS_SLS_LINUX_CLONE_THREAD` (330, next free after
+   `SYS_NOW_NS`). The request carries the parent's sidecar CHAN_W slot,
+   child stack, TLS, ptid/ctid, and the accepted flag subset. The kernel
+   resolves the parent from that channel, checks the parent is Linux and
+   belongs to a live group, and refuses a cross-partition or cross-sidecar
+   parent.
 4. The kernel allocates a process slot and a dedicated syscall stack, takes a
    reference on the group's `cr3`, copies the parent's saved callee-saved
    state, sets `rax = 0`, `rip = parent's post-syscall RIP`, `rsp = child
    stack`, and the requested `fs_base`, and writes ptid/ctid if requested.
    The child is born `PROC_HELD` with only its two messenger channel caps.
-5. The kernel returns the sidecar's channel slots and the child TID. The
-   sidecar creates the thread record in the parent's group, then returns
-   `0` to the parent and releases the child. The child never runs before its
-   group record and channel exist.
+5. The kernel writes the requested ptid/ctid, releases the child, and
+   returns both sides' channel slots and the child TID. The sidecar tracks
+   its own ends (`sidecar_r`/`sidecar_w`) and replies `0` to the parent. The
+   child cannot run before its group membership and channel exist; a
+   tracking failure kills it. M4.2's sidecar record is the minimal one —
+   group/thread state sharing is M4.3.
 
 ### 2.4 Exit and join
 
@@ -252,15 +256,32 @@ required, and a live arm where it is. No increment may claim the next one.
   `process_kill()` rather than a partial cleanup, and `detach` treats
   mismatched counters as half-torn: it clears the descriptor, returns no
   PML4, and leaks the slot rather than freeing a live address space.
-  `tests/linux_thread_group_host_test.c` (128 checks)
-  drives a leader plus two attached threads, a leader exiting first, a
+  `tests/linux_thread_group_host_test.c` (the M4.1 cases run inside the
+  now-166-check binary) drives a leader plus two attached threads, a leader exiting first, a
   non-last exit, the last-reference destroy, double detach, slot reuse,
-  table exhaustion, and the non-Linux legacy path. No user-visible `clone`.
-- **M4.2 — Kernel thread creation.** Add the held thread create, per-thread
-  syscall stack, post-syscall child context, channel pair, ptid/ctid writes,
-  and a raw assembly probe that creates one thread and writes a shared word.
-  This stage is permitted to land before futex, but it still leaves Go and
-  every threaded runtime out: a create without a join is not a runtime.
+  table exhaustion, the half-torn detach refusal, and the non-Linux legacy
+  path. `tests/cap_create_sidecar_host_test.c` fills the group table and
+  proves the resulting create failure reaches `process_kill()` and unbinds
+  the failed child's cap table. No user-visible `clone`.
+- **M4.2 — Kernel thread creation.** **Landed 2026-11-14.**
+  `kernel/linux_clone.c` implements `SYS_SLS_LINUX_CLONE_THREAD` (330):
+  flag/address validation before any allocation, the held descriptor and
+  per-thread syscall stack (`proc_create_linux_thread`), the post-syscall
+  context helper (`linux_thread_clone_context`), group attach, a messenger
+  pair from the sidecar to the child, ptid/ctid writes, and release. A
+  failure after create tears the child down through `process_kill`/
+  `proc_discard_linux_thread`, never the parent's PML4. The sidecar's
+  `clone` (56) arm validates the same subset, calls the kernel primitive,
+  tracks the child's channel/VFS task, and answers `0`/TID. The raw probe
+  (`user/sidecar/fixtures/m4_thread_probe.S`, `M4_THREAD_PROBE=1`) creates
+  one thread, writes `M4-THREAD-OK` through its own tracked channel, then
+  publishes a shared word; the parent writes `M4-THREAD-PARENT-OK`.
+  `tests/linux_thread_group_host_test.c` (166 checks) adds the context and
+  flag-verdict teeth, and `tests/m4_thread_probe_check.sh` boots the
+  `M4_THREAD_PROBE=1` image and requires the child marker before the parent
+  marker with no failure marker. This stage is permitted to land before futex and
+  leaves Go and every threaded runtime out: a create without a join or
+  shared sidecar state is not a runtime.
 - **M4.3 — Sidecar clone and thread registry.** Split `LinuxTask` into group
   and thread records, add flag validation, track/release, and a static
   pthread probe that observes a shared counter.
@@ -292,7 +313,9 @@ required, and a live arm where it is. No increment may claim the next one.
   tree with and without the artifact.
 - **Kernel host tests:** address-space reference prevents destruction; child
   context has `rax = 0`, the parent's post-syscall RIP, the requested RSP/TLS;
-  `exit_group` sweeps every thread; the last exit frees exactly once.
+  `exit_group` sweeps every thread; the last exit frees exactly once; a
+  half-torn group returns no PML4; and a group-table-full create reaches
+  `process_kill()` with its cap table unbound.
 - **Sidecar host tests:** group fd/heap/signal sharing, per-thread mask/TID,
   futex expected-value mismatch (`EAGAIN`), FIFO wake count, timeout, and a
   closed channel reaping its waiter.

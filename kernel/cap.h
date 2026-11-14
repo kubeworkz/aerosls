@@ -203,6 +203,10 @@
 #define CAP_EPERM       (-12)   /* caller lacks authority for the operation
                                  * (e.g. a non-sidecar process calling
                                  * SYS_SLS_CREATE_SIDECAR — POSIX-Environments E2) */
+#define CAP_EFAULT      (-33)   /* an address the kernel cannot use for the
+                                 * requested user write (M4.2 clone's stack or
+                                 * ptid/ctid words); distinct from EINVAL so a
+                                 * malformed clone is not disguised as EFAULT */
 
 /* ─── Data structures ─────────────────────────────────────────────────────── */
 
@@ -1148,6 +1152,48 @@ int cap_create_sidecar(uint32_t parent_pid,
  * byte the one it already knows. 328 is next after PLACEMENT_CAN_HOLD
  * (327); confirmed via grep across every kernel header defining SYS_SLS_*. */
 #define SYS_SLS_LINUX_SPAWN 328
+
+/* ─── SYS_SLS_LINUX_CLONE_THREAD (330) — M4.2 ─────────────────────────────
+ * The sidecar's one kernel primitive for Linux clone(56). It creates a second
+ * execution context in an existing LinuxThreadGroup: the child descriptor
+ * shares parent->cr3 (no new page table), is born PROC_HELD, and is attached
+ * to the parent's group before this syscall returns. The child's messenger
+ * channel is minted from THIS sidecar (the caller) to the child, so the
+ * child's table keeps the exactly-one-R/one-W shape linux forwarding needs;
+ * the parent's own sidecar channel is untouched. The syscall validates the
+ * raw clone flag word and every user address before creating anything, then
+ * writes ptid/ctid, releases the child, and returns its PID. It does NOT
+ * copy memory, files, signal handlers, or futexes — M4.2 is the thread-create
+ * mechanism, not the full clone state model. */
+#define SYS_SLS_LINUX_CLONE_THREAD 330
+
+struct SLSLinuxCloneThreadRequest {
+    uint32_t status;        /* OUT: 0 or a negative CAP_E* */
+    uint32_t parent_pid;    /* IN: the Linux task issuing clone */
+    uint64_t flags;         /* IN: raw clone flags, validated as M4.2 subset */
+    uint64_t child_stack;   /* IN: child RSP */
+    uint64_t tls;           /* IN: child FS base when CLONE_SETTLS */
+    uint64_t ptid;          /* IN: parent ptid out-word, or 0 */
+    uint64_t ctid;          /* IN: child ctid word, or 0 */
+    uint32_t child_tid;     /* OUT: the new child's PID/TID */
+    uint16_t child_r;       /* OUT: child's CHAN_R slot */
+    uint16_t child_w;       /* OUT: child's CHAN_W slot */
+    uint16_t sidecar_r;     /* OUT: caller's CHAN_R slot for this child */
+    uint16_t sidecar_w;     /* OUT: caller's CHAN_W slot for this child */
+    uint16_t sidecar_ch_w;  /* IN: caller's existing CHAN_W to the parent */
+    uint16_t reserved16;    /* alignment, zero */
+    uint64_t tgid;          /* OUT: the child's thread group id */
+};
+
+uint64_t sys_sls_linux_clone_thread(struct SLSLinuxCloneThreadRequest* req);
+
+/* Resolve a messenger CHAN_W slot in `sidecar_pid`'s table to the Linux
+ * parent that owns the CHAN_R end. Used only by the M4.2 clone request,
+ * whose parent_pid is supplied by the sidecar: a stale/wrong number must not
+ * let the sidecar clone a task it does not own. Returns 1 and fills
+ * *out_parent on success, 0 on any malformed/revoked/mismatched pair. */
+int cap_linux_clone_parent(uint32_t sidecar_pid, uint16_t ch_w,
+                           uint32_t* out_parent);
 
 int cap_create_sidecar_in_personality(uint32_t parent_pid,
                           const void* manifest, uint32_t manifest_len,

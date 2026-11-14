@@ -3,8 +3,8 @@
 #
 # M4 is the modern-runtime gate: Go, threaded Rust, threaded CPython, Node
 # and every other threaded runtime need `clone`, `futex`, a shared address
-# space and a thread group. The tree has M4.1's group object and refcount,
-# but no clone and no futex. This guard has four jobs:
+# space and a thread group. The tree has M4.1's group object and refcount and
+# M4.2's clone/thread-create path, but no futex. This guard has four jobs:
 #
 #   1. While all three mechanisms are absent, the design/roadmap surfaces
 #      must keep Go and the threaded runtimes OUT.
@@ -265,7 +265,7 @@ if [ "$runtime_unlocked" -eq 1 ]; then
 else
     if grep -q 'AeroSLS-M4-Threads-Design-v0\.1\.md' "$LINUX" &&
        grep -qF 'not implemented' "$LINUX"; then
-        ok "G2. the Linux ABI design points at the M4 design and says clone/futex/threads are not implemented"
+        ok "G2. the Linux ABI design points at the M4 design and says the remaining mechanisms are not implemented"
     else
         bad "G2. the Linux ABI design does not point at the M4 design or no longer says the unbuilt mechanisms are not implemented"
     fi

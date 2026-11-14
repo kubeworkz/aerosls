@@ -106,7 +106,7 @@
 
 use alloc::boxed::Box;
 use aerosls_blockcache::BufferAlloc;
-use aerosls_proto::kabi::{GrantedCap, Kernel};
+use aerosls_proto::kabi::{GrantedCap, Kernel, LinuxCloneThreadReq};
 use aerosls_proto::sockops::SocketOps;
 use aerosls_proto::{NET_ERR_ADDRINUSE, NET_ERR_ADDRNOTAVAIL, NET_ERR_CAP,
     NET_ERR_CONNRESET, NET_ERR_INUSE, NET_ERR_INVAL, NET_ERR_IO,
@@ -189,6 +189,23 @@ const LINUX_TKILL: u64 = 200;
 /// numbers (addr/len/prot/flags) so "the allocator asked for X and this
 /// shim answered Y" is read off the line, never reconstructed.
 const LINUX_MMAP: u64 = 9;
+/// clone(56) — M4.2's thread create. Only the documented thread subset is
+/// accepted; a fork-shaped word is ENOSYS by name (the kernel repeats the
+/// same check, so neither end is load-bearing alone).
+const LINUX_CLONE: u64 = 56;
+const CLONE_VM: u64 = 0x0000_0100;
+const CLONE_FS: u64 = 0x0000_0200;
+const CLONE_FILES: u64 = 0x0000_0400;
+const CLONE_SIGHAND: u64 = 0x0000_0800;
+const CLONE_THREAD: u64 = 0x0001_0000;
+const CLONE_SYSVSEM: u64 = 0x0004_0000;
+const CLONE_SETTLS: u64 = 0x0008_0000;
+const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
+const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+const CLONE_M4_ALLOW: u64 = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND
+    | CLONE_THREAD | CLONE_SYSVSEM | CLONE_SETTLS | CLONE_PARENT_SETTID
+    | CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID;
 /// munmap(11) — E7 increment 25 (§5.4's last memory seam): the 11 arm
 /// answers WHETHER over the ledger's span and break; the kernel's page
 /// tables decide which pages are present, so a double unmap is success.
@@ -2782,6 +2799,104 @@ fn gate_read_log(off: u64) {
     }
 }
 
+/// M4.2: clone(56)'s answer. The kernel does the mechanism; this function
+/// owns the policy seam — validate the same flag subset, ask the kernel for
+/// a held thread, allocate the sidecar-side tracking slot, and only then
+/// tell the child it exists. The child is already released by the kernel
+/// when this returns; a tracking failure kills it rather than leaving an
+/// untracked Linux task parked forever.
+fn answer_clone<K: Kernel, A: BufferAlloc>(
+    k: &K,
+    i: usize,
+    args: &[u64; 6],
+    vfs: &mut Vfs<K, A>,
+) -> Answer {
+    let flags = args[0];
+    if flags & !CLONE_M4_ALLOW != 0 {
+        return Answer::Reply(0, E_NOSYS);
+    }
+    if flags & CLONE_VM == 0 || flags & CLONE_THREAD == 0 ||
+        flags & CLONE_SIGHAND == 0 {
+        return Answer::Reply(0, E_INVAL);
+    }
+
+    let nlen = tasks()[i].name_len;
+    let mut pname = [0u8; 48];
+    pname[..nlen].copy_from_slice(&tasks()[i].name[..nlen]);
+    let partition = tasks()[i].partition;
+    let pname_str = match core::str::from_utf8(&pname[..nlen]) {
+        Ok(s) => s,
+        Err(_) => return Answer::Reply(0, E_INVAL),
+    };
+    let parent_pid = k.sidecar_pid(pname_str, partition);
+    if parent_pid == 0 {
+        return Answer::Reply(0, E_TARGET);
+    }
+
+    let mut req = LinuxCloneThreadReq {
+        status: 0,
+        parent_pid,
+        flags,
+        child_stack: args[1],
+        tls: args[4],
+        ptid: args[2],
+        ctid: args[3],
+        child_tid: 0,
+        child_r: 0,
+        child_w: 0,
+        sidecar_r: 0,
+        sidecar_w: 0,
+        sidecar_ch_w: tasks()[i].ch_w as u16,
+        reserved16: 0,
+        tgid: 0,
+    };
+    let child_tid = match k.linux_clone_thread(&mut req) {
+        Ok(t) => t,
+        Err(cap) => {
+            /* The kernel's error is already a CAP code; `reply` carries
+             * status through the same §5.7 map as every other arm, so it
+             * must stay in that family. Mapping it to a Linux errno here
+             * would make the kernel map an already-mapped value (EINVAL
+             * -22 has no CAP preimage and would arrive as EIO). */
+            enosys_log(LINUX_CLONE as u32, &pname[..nlen], b" clone refused\n");
+            return Answer::Reply(0, cap);
+        }
+    };
+
+    let mut cname = [0u8; 48];
+    let mut off = push_bytes(&mut cname, 0, &pname[..nlen]);
+    off = push_bytes(&mut cname, off, b".t");
+    off = dec_into(&mut cname, off, child_tid as u64);
+    let vt = match vfs.add_task() {
+        Ok(vt) => vt,
+        Err(_) => {
+            k.proc_kill(child_tid);
+            return Answer::Reply(0, E_NOMEM);
+        }
+    };
+    let cname_str = core::str::from_utf8(&cname[..off]).unwrap_or("");
+    /* track stores OUR ends (the sidecar's receive/send handles), exactly
+     * like linux_spawn's return values — the child's own slots are already
+     * in the child's table and are not the sidecar's to read. */
+    let tracked = track(
+        req.sidecar_r as u32,
+        req.sidecar_w as u32,
+        cname_str,
+        partition,
+        tasks()[i].brk_base,
+        tasks()[i].brk_limit,
+        vt,
+        tasks()[i].gate,
+    );
+    if !tracked {
+        let _ = vfs.exit_task(vt);
+        k.proc_kill(child_tid);
+        return Answer::Reply(0, E_NOMEM);
+    }
+    enosys_log(LINUX_CLONE as u32, &pname[..nlen], b" ok thread\n");
+    Answer::Reply(child_tid as u64, STATUS_OK)
+}
+
 fn enosys_log(tag_num: u32, child: &[u8], extra: &[u8]) {
     #[cfg(feature = "target")]
     {
@@ -3028,6 +3143,10 @@ pub fn service<K: Kernel, A: BufferAlloc>(
          * module, so the fd class's read arm cannot stay kernel-side
          * (its data crosses back as the reply's payload, count-truth). */
         let mut ans = match num {
+            /* M4.2: the thread-create seam. It is deliberately its own arm:
+             * it needs the kernel primitive, and it is the only arm that
+             * grows the sidecar's task table from inside service(). */
+            LINUX_CLONE => answer_clone(k, i, &args, vfs),
             /* M1: the network class's eight numbers route to their own
              * translation over SocketOps; the file class below is
              * unchanged. */

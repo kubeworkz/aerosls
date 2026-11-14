@@ -4926,6 +4926,65 @@ int cap_linux_find_channels(uint32_t pid, uint16_t* out_ch_w,
     return 0;
 }
 
+/* ─── cap_linux_clone_parent (M4.2) ─────────────────────────────────────────
+ * The clone request names a parent PID; this resolves that name against the
+ * sidecar's OWN messenger channel rather than trusting the number. The
+ * caller must hold a CHAN_W whose channel's end0 is the sidecar, end1 is the
+ * named task, and the named task's table must hold a matching CHAN_R with
+ * RECV. A stale PID, a revoked channel, or a sidecar trying to name a child
+ * whose messenger it does not hold is refused. The scan is unlocked for the
+ * same single-CPU reason as cap_linux_find_channels: the caller is executing
+ * its own syscall and no other task mutates these tables concurrently. */
+int cap_linux_clone_parent(uint32_t sidecar_pid, uint16_t ch_w,
+                           uint32_t* out_parent) {
+    if (!out_parent || ch_w >= CAP_TABLE_ENTRIES) return 0;
+    int ti = cap_table_index(sidecar_pid);
+    if (ti < 0) return 0;
+    uint64_t w = cap_tables[ti].slots[ch_w].word;
+    if (!cap_word_valid(w)) return 0;
+    if (((w >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK) != CAP_TYPE_CHAN_W)
+        return 0;
+    if (!((w >> CAP_PERM_SHIFT) & CAP_PERM_SEND)) return 0;
+    uint32_t obj_id = (uint32_t)((w >> CAP_OBJ_SHIFT) & CAP_OBJ_MASK);
+    struct CapObject* obj = cap_object_get(obj_id);
+    if (!obj || obj->kind != CAP_OBJ_KIND_CHAN) return 0;
+    struct CapChannel* ch = &cap_channels[obj->chan_id];
+    /* cap_chan_create was called by the sidecar when it spawned the Linux
+     * child, so end0 is the sidecar and end1 is the child. The sidecar holds
+     * the end0 CHAN_W; the child holds the end1 CHAN_R. */
+    if (!ch->active || ch->end0_pid != (uint16_t)sidecar_pid ||
+        ch->end1_pid == 0 || ch->end1_pid == (uint16_t)sidecar_pid)
+        return 0;
+    uint32_t parent = ch->end1_pid;
+
+    int pti = cap_table_index(parent);
+    if (pti < 0) return 0;
+    int found_r = 0;
+    for (int si = 0; si < CAP_TABLE_ENTRIES; si++) {
+        uint64_t pw = cap_tables[pti].slots[si].word;
+        if (!cap_word_valid(pw)) continue;
+        if (((pw >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK) != CAP_TYPE_CHAN_R)
+            continue;
+        if (!((pw >> CAP_PERM_SHIFT) & CAP_PERM_RECV)) continue;
+        if (((pw >> CAP_OBJ_SHIFT) & CAP_OBJ_MASK) == obj_id) {
+            found_r = 1;
+            break;
+        }
+    }
+    if (!found_r) return 0;
+
+    int active = 0;
+    for (int i = 0; i < PROC_MAX; i++) {
+        if (proc_table[i].active && proc_table[i].pid == parent) {
+            active = 1;
+            break;
+        }
+    }
+    if (!active) return 0;
+    *out_parent = parent;
+    return 1;
+}
+
 /* ─── sys_sls_create_sidecar ──────────────────────────────────────────────── */
 /* The personality-carrying create IS the create: the legacy wrapper passes
  * PROC_PERSONALITY_SLS, so every pre-E7 caller's child is byte-for-byte

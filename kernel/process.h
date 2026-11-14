@@ -579,6 +579,25 @@ uint32_t alloc_pid(void);  // returns a fresh PID (no collision with existing ac
 // and must have their own syscall stack before their first syscall).
 uint64_t alloc_proc_syscall_stack(uint32_t partition_id);
 
+/* M4.2: create a second execution context in a Linux leader's address space.
+ * The child is born PROC_HELD, with its own descriptor, per-thread syscall
+ * stack and ring3_ctx built from `parent`'s parked post-syscall frame; it is
+ * NOT attached to the group, given a capability table, or released here.
+ * The caller validates all user addresses FIRST (linux_user_range_writable),
+ * then attaches the descriptor (linux_thread_group_attach), then mints its
+ * channel, then process_release(). Returns the new PID, or 0 when the process
+ * table/syscall stack is full or the arguments/context are unusable. Never
+ * calls user_clone_page_table(): the child shares `parent->cr3`. */
+uint32_t proc_create_linux_thread(struct ProcessDescriptor *parent,
+                                  uint64_t child_stack, uint64_t flags,
+                                  uint64_t tls, uint64_t ctid);
+
+/* Roll back a descriptor from proc_create_linux_thread() that was never
+ * attached/released (the clone syscall's create-failure path). The descriptor
+ * owns no capability table at that point, so only its syscall stack is
+ * returned. */
+void proc_discard_linux_thread(uint32_t pid);
+
 uint32_t process_create(struct ProcCreateRequest* req);  // returns PID or 0
 uint32_t program_spawn_nb(const char* object_name, uint32_t owner_uid);
 

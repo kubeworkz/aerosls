@@ -73,6 +73,30 @@ pub const ERR_SHUTDOWN: i32 = 14;
 /// Block forever (real kernel) / wait without a deadline.
 pub const TIMEOUT_NONE: u64 = u64::MAX;
 
+/// M4.2 clone request — the twin of `SLSLinuxCloneThreadRequest` in
+/// kernel/cap.h. The sidecar fills the IN fields, the kernel validates and
+/// fills the OUT fields; `status` carries a negative CAP code on failure (the
+/// kernel's own rax does too, but the request is what the Kabi layer reads).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct LinuxCloneThreadReq {
+    pub status: i32,
+    pub parent_pid: u32,
+    pub flags: u64,
+    pub child_stack: u64,
+    pub tls: u64,
+    pub ptid: u64,
+    pub ctid: u64,
+    pub child_tid: u32,
+    pub child_r: u16,
+    pub child_w: u16,
+    pub sidecar_r: u16,
+    pub sidecar_w: u16,
+    pub sidecar_ch_w: u16,
+    pub reserved16: u16,
+    pub tgid: u64,
+}
+
 /// A capability a sidecar received on a message, already minted in its own
 /// table by the kernel (capability-layer spec §4.1).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -375,6 +399,17 @@ pub trait Kernel {
     fn proc_kill(&self, pid: u32) {
         let _ = pid;
     }
+
+    /// M4.2: create a held thread in `req.parent_pid`'s LinuxThreadGroup
+    /// (`SYS_SLS_LINUX_CLONE_THREAD`, 330). The kernel validates the flags,
+    /// stack and ptid/ctid addresses, attaches the child to the group, mints
+    /// its messenger pair and releases it; this call returns the child's
+    /// PID. The caller must track the returned `child_r`/`child_w` before
+    /// the child's first forward can be served. Default: unsupported.
+    fn linux_clone_thread(&self, req: &mut LinuxCloneThreadReq) -> Result<u32, i32> {
+        let _ = req;
+        Err(ERR_NOTFOUND)
+    }
 }
 
 // ── Real kernel ABI (feature `target`) ───────────────────────────────────────
@@ -452,6 +487,8 @@ mod abi {
     // E7 (Linux ABI Shim Design §3.3): the LINUX-personality create.
     const SYS_LINUX_SPAWN: u64 = 328;
     const SYS_NOW_NS: u64 = 329;
+    // M4.2: the held Linux thread-create primitive.
+    const SYS_LINUX_CLONE_THREAD: u64 = 330;
     const SYS_SIDECAR_PID: u64 = 322;
     const SYS_ENV_STORAGE_ATTACH: u64 = 323;
     const SYS_ENV_STORAGE_RESTORE: u64 = 324;
@@ -1248,6 +1285,17 @@ mod abi {
         unsafe { sls_syscall(SYS_PROC_KILL, pid as u64) };
     }
 
+    /// `k_linux_clone_thread`: syscall 330 — the M4.2 held thread create.
+    /// Returns the kernel's raw result: 0 on success, a negative CAP code on
+    /// failure. The per-request `status` carries the same CAP code for
+    /// callers that prefer the struct; the child fields are valid only on 0.
+    #[no_mangle]
+    pub extern "C" fn k_linux_clone_thread(
+        req: *mut LinuxCloneThreadReq,
+    ) -> i64 {
+        unsafe { sls_syscall(SYS_LINUX_CLONE_THREAD, req as u64) as i64 }
+    }
+
     /// Watchdog-respawn introspection (SYS_SLS_BOOT_GEN = 319): the
     /// current process's per-name boot generation — 0 on its first boot,
     /// 1+ after a watchdog respawn (a fresh process created from the same
@@ -1527,6 +1575,15 @@ mod abi {
 
         fn proc_kill(&self, pid: u32) {
             k_proc_kill(pid)
+        }
+
+        fn linux_clone_thread(&self, req: &mut LinuxCloneThreadReq) -> Result<u32, i32> {
+            let rc = k_linux_clone_thread(req);
+            if rc == 0 {
+                Ok(req.child_tid)
+            } else {
+                Err(req.status)
+            }
         }
     }
 }

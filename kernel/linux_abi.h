@@ -170,6 +170,46 @@ const char *linux_syscall_class_name(enum LinuxSyscallClass cls);
                                                 (not in the census)    */
 #define LINUX_USER_ADDR_MAX   0x00007FFFFFFFFFFFULL
 
+/* ─── M4.2 — clone (56) and the thread-create flag contract ───────────────
+ * M4.2 is deliberately narrower than Linux clone: it creates a THREAD in an
+ * existing LinuxThreadGroup, never a new address space. The accepted word
+ * is the documented subset in AeroSLS-M4-Threads-Design-v0.1.md §2.3.
+ * Anything outside it is ENOSYS, not silently dropped; a word that asks for
+ * a thread without the two flags that make a thread a thread (VM and
+ * SIGHAND) is EINVAL. The sidecar repeats these literals as its own twin;
+ * the kernel re-checks the word so neither end alone is load-bearing. */
+#define LINUX_CLONE             56u
+#define LINUX_CLONE_VM          0x00000100ULL
+#define LINUX_CLONE_FS          0x00000200ULL
+#define LINUX_CLONE_FILES       0x00000400ULL
+#define LINUX_CLONE_SIGHAND     0x00000800ULL
+#define LINUX_CLONE_THREAD      0x00010000ULL
+#define LINUX_CLONE_SYSVSEM     0x00040000ULL
+#define LINUX_CLONE_SETTLS      0x00080000ULL
+#define LINUX_CLONE_PARENT_SETTID 0x00100000ULL
+#define LINUX_CLONE_CHILD_CLEARTID 0x00200000ULL
+#define LINUX_CLONE_CHILD_SETTID 0x01000000ULL
+
+#define LINUX_CLONE_ALLOW (LINUX_CLONE_VM | LINUX_CLONE_FS | \
+                           LINUX_CLONE_FILES | LINUX_CLONE_SIGHAND | \
+                           LINUX_CLONE_THREAD | LINUX_CLONE_SYSVSEM | \
+                           LINUX_CLONE_SETTLS | LINUX_CLONE_PARENT_SETTID | \
+                           LINUX_CLONE_CHILD_CLEARTID | \
+                           LINUX_CLONE_CHILD_SETTID)
+
+/* 0 = accepted; -EINVAL for a malformed thread request; -ENOSYS for a
+ * flag this increment does not serve. Total over every uint64_t word.
+ * Inline so the pure host test can call it without linking linux_abi.c. */
+static inline int linux_clone_flags_verdict(uint64_t flags)
+{
+    if ((flags & LINUX_CLONE_ALLOW) != flags)
+        return -LINUX_ENOSYS;
+    if (!(flags & LINUX_CLONE_VM) || !(flags & LINUX_CLONE_THREAD) ||
+        !(flags & LINUX_CLONE_SIGHAND))
+        return -LINUX_EINVAL;
+    return 0;
+}
+
 /* ─── E7 increment 19: the time source across the seam ────────────────────
  * clock_gettime (228) is in the census but vDSO-backstopped on Linux; this
  * kernel ships no vDSO, so the call really traps here. The reply is one
@@ -965,6 +1005,15 @@ struct LinuxFdReplyPlan linux_fd_reply_plan(uint64_t num,
  * hold n bytes; the caller owns it. */
 int linux_user_copy_in(const uint8_t *src, uint64_t root, uint64_t va,
                        uint32_t n);
+
+/* Validate that `n` bytes at `va` are writable user pages in `root`, without
+ * writing anything. M4.2's clone uses this for the child stack and for the
+ * ptid/ctid words BEFORE it allocates the child: a bad pointer is EFAULT and
+ * leaves no half-created thread behind. The walk is the copy-in walker's own
+ * (present, USER and WRITE at every level, no huge page, every page in the
+ * span checked), so validation and the later write cannot disagree about
+ * what a legal destination is. */
+int linux_user_range_writable(uint64_t root, uint64_t va, uint32_t n);
 
 /* Is this reply payload's `ret` the right shape for `num`? The one-truth
  * rule applied to the IN direction: a count-truth number (LINUX_READ —

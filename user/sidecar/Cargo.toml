@@ -39,3 +39,7 @@ e7_slow_boot = []
 # `make x86-iso-e3 ... M1_NET_PROBE=1` for the QEMU gate run. A default
 # build compiles neither the module nor the spawn call.
 m1_net_probe = []
+# M4.2's live clone probe — a build-time feature, enabled only by
+# `make x86-iso-e3 M4_THREAD_PROBE=1`. Default builds compile neither the
+# module nor its spawn call.
+m4_thread_probe = []

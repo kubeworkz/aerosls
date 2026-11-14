@@ -65,6 +65,7 @@ int32_t linux_errno_from_cap(int32_t cap_code)
     case CAP_ENOTEMPTY:              return -LINUX_ENOTEMPTY;
     case CAP_ENAMETOOLONG:           return -LINUX_ENAMETOOLONG;
     case CAP_EPERM:                  return -LINUX_EPERM;
+    case CAP_EFAULT:                 return -LINUX_EFAULT;
     /* M1 network class: statuses the P2 socket service can distinguish.
      * Every one keeps its own Linux errno; none is collapsed into EIO or
      * EBUSY, because a TCP caller branches on the difference. */
@@ -107,6 +108,7 @@ int32_t cap_code_from_linux_errno(int32_t linux_errno)
     case -LINUX_ENOBUFS:   return CAP_ERR_SPACE;
     case -LINUX_EPROTO:    return CAP_ERR_PROTO;
     case -LINUX_ETIMEDOUT: return CAP_ERR_TIMEOUT;
+    case -LINUX_EFAULT:    return CAP_EFAULT;
     /* E7 file class: each new code has exactly ONE preimage, so each
      * reverse is defined — the round-trip the host test pins. */
     case -LINUX_EEXIST:    return CAP_EEXIST;
@@ -1103,6 +1105,30 @@ int linux_user_copy_in(const uint8_t *src, uint64_t root, uint64_t va,
         /* root is NOT reassigned: the next iteration re-walks all four
          * levels from the PML4 (copy_out's own rule — a leaf frame is
          * not a table base). */
+    }
+    return 0;
+}
+
+/* M4.2: the validation half of the clone's user-pointer writes. It walks
+ * every page in the span with the copy-in leaf rule (present, USER, WRITE,
+ * no huge page) and performs no store, so a refused clone cannot have
+ * written a ptid/ctid word on its way to failing. */
+int linux_user_range_writable(uint64_t root, uint64_t va, uint32_t n)
+{
+    if (n == 0) return 0;
+    if (!root || va > LINUX_USER_ADDR_MAX ||
+        (uint64_t)n > LINUX_USER_ADDR_MAX - va + 1ULL)
+        return -LINUX_EFAULT;
+    while (n) {
+        uint64_t leaf = 0;
+        uint64_t page = va & ~((uint64_t)LINUX_PAGE_SIZE - 1ULL);
+        uint32_t off = (uint32_t)(va - page);
+        uint32_t take = LINUX_PAGE_SIZE - off;
+        if (take > n) take = n;
+        if (lab_walk_leaf(root, va, &leaf, 1, 0) != 0)
+            return -LINUX_EFAULT;
+        va += take;
+        n  -= take;
     }
     return 0;
 }

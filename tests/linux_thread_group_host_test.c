@@ -13,12 +13,14 @@
  *   last thread exits            -> exactly one PML4 returned for destroy;
  *   double detach                -> handled 0, nothing destroyed twice;
  *   group slot reuse             -> only after refs/live reach zero.
+ *   half-torn counters           -> detach returns no PML4 and frees nothing.
  *
  * The test also pins the group table bound, the leader/tid fields, the
  * cr3 mismatch refusal, and the non-Linux legacy path (detach returns 0).
  *
  * Build and run:
  *   gcc -no-pie -std=c11 -Wall -Wextra -I . -I kernel \
+ *       -DLINUX_THREAD_GROUP_TEST_SEAM \
  *       -o /tmp/linux_thread_group_host_test \
  *       tests/linux_thread_group_host_test.c kernel/linux_threads.c
  *   /tmp/linux_thread_group_host_test
@@ -172,6 +174,61 @@ static void test_second_group_and_slot_reuse(void) {
           "group B still tears down its own cr3");
 }
 
+static void test_half_torn_detach(void) {
+    struct ProcessDescriptor leader, thread, probe;
+    uint64_t dead = 0x77;
+
+    linux_thread_groups_reset();
+    pd_init(&leader, 600, 0xB000);
+    CHECK(linux_thread_group_create(&leader, 0xB000) == 1,
+          "half-torn: the group is created normally");
+
+    /* A mismatch must be refused as a whole: no counter is guessed down, and
+     * the live thread's PML4 is never handed to the caller for destruction. */
+    CHECK(linux_thread_group_test_force_counters(1, 1, 2) == 1,
+          "half-torn: the test seam can put the counters out of step");
+    CHECK(linux_thread_group_detach(&leader, &dead) == 1,
+          "half-torn: detach reports the descriptor handled");
+    CHECK(dead == 0,
+          "half-torn: detach returns no PML4 while live_threads disagrees");
+    CHECK(leader.linux_tgid == 0 && leader.linux_tid == 0 &&
+          leader.linux_clear_child_tid == 0 && leader.linux_is_thread == 0,
+          "half-torn: only the descriptor's group fields are cleared");
+    CHECK(linux_thread_group_used(1) == 1,
+          "half-torn: the group slot is not freed");
+    CHECK(linux_thread_group_refs(1) == 1 &&
+          linux_thread_group_live(1) == 2,
+          "half-torn: the counters are left exactly as found");
+    CHECK(linux_thread_group_cr3(1) == 0xB000,
+          "half-torn: the shared PML4 is retained");
+
+    pd_init(&thread, 601, 0xB000);
+    CHECK(linux_thread_group_attach(&thread, 1, 601) == 0,
+          "half-torn: attach refuses to extend the broken group");
+    CHECK(thread.linux_tgid == 0 && thread.linux_tid == 0,
+          "half-torn: a refused attach leaves the descriptor ungrouped");
+
+    /* A zero cr3_refs with live members is the other half-torn shape. */
+    CHECK(linux_thread_group_test_force_counters(1, 0, 2) == 1,
+          "half-torn: the seam can force the address-space count to zero");
+    pd_init(&probe, 602, 0xB000);
+    probe.linux_tgid = 1;   /* the descriptor still names the broken group */
+    probe.linux_tid = 602;
+    dead = 0x99;
+    CHECK(linux_thread_group_detach(&probe, &dead) == 1,
+          "half-torn: a descriptor naming the zero-ref group is handled");
+    CHECK(dead == 0,
+          "half-torn: zero cr3_refs does not authorize a PML4 destroy while live remains");
+    CHECK(linux_thread_group_used(1) == 1 &&
+          linux_thread_group_refs(1) == 0 &&
+          linux_thread_group_live(1) == 2,
+          "half-torn: the group still holds its state for diagnosis");
+
+    linux_thread_groups_reset();
+    CHECK(linux_thread_group_used(1) == 0,
+          "half-torn: reset is the explicit recovery boundary");
+}
+
 static void test_refusals_and_non_linux_path(void) {
     struct ProcessDescriptor leader, thread, plain;
     uint64_t dead = 0x99;
@@ -261,13 +318,102 @@ static void test_reset_clears_live_groups(void) {
     CHECK(dead == 0, "reset does not fabricate a destroy request");
 }
 
+/* ─── M4.2: the pure context constructor ──────────────────────────────────
+ * This is the half of clone that can be measured without a boot: the child
+ * must resume at the parent's post-syscall RIP, return 0 in rax, use the
+ * caller's stack and FS base (or CLONE_SETTLS's), and carry the parent's
+ * callee-saved registers. The flag verdict is the same contract at the words
+ * the kernel accepts. */
+static void test_clone_context_and_flags(void) {
+    struct ProcessDescriptor parent, child;
+    const uint64_t flags = LINUX_CLONE_VM | LINUX_CLONE_THREAD |
+                           LINUX_CLONE_SIGHAND;
+
+    memset(&parent, 0, sizeof(parent));
+    memset(&child, 0, sizeof(child));
+    parent.pid = 700;
+    parent.cr3 = 0xDEAD000;
+    parent.owner_uid = 3;
+    parent.partition_id = 2;
+    parent.fs_base = 0x7000;
+    parent.park_ctx.rcx = 0x401234;   /* post-syscall user RIP */
+    parent.park_ctx.r11 = 0x246;
+    parent.park_ctx.r15 = 15;
+    parent.park_ctx.r14 = 14;
+    parent.park_ctx.r13 = 13;
+    parent.park_ctx.r12 = 12;
+    parent.park_ctx.rbx = 0xB;
+    parent.park_ctx.rbp = 0xBB;
+    parent.ring3_ctx.rdi = 0x1111;
+    parent.ring3_ctx.rsi = 0x2222;
+
+    CHECK(linux_thread_clone_context(&child, &parent, 0x800000, flags, 0, 0) == 0,
+          "a well-formed clone context is accepted");
+    CHECK(child.cr3 == parent.cr3, "the child shares the parent's PML4");
+    CHECK(child.user_rip == 0x401234, "the child resumes after the parent's syscall");
+    CHECK(child.ring3_ctx.rip == 0x401234 && child.ring3_ctx.rax == 0,
+          "the child's first user instruction returns clone's 0");
+    CHECK(child.user_rsp == 0x800000 && child.ring3_ctx.rsp == 0x800000,
+          "the child starts on the caller-provided stack");
+    CHECK(child.ring3_ctx.r15 == 15 && child.ring3_ctx.r14 == 14 &&
+          child.ring3_ctx.r13 == 13 && child.ring3_ctx.r12 == 12 &&
+          child.ring3_ctx.rbx == 0xB && child.ring3_ctx.rbp == 0xBB,
+          "the child inherits the parent's callee-saved registers");
+    CHECK(child.ring3_ctx.cs == 0x23 && child.ring3_ctx.ss == 0x1B &&
+          child.ring3_ctx.rflags == 0x202,
+          "the child's ring-3 segment/rflags context is the user shape");
+    CHECK(child.fs_base == parent.fs_base, "without SETTLS the child inherits FS base");
+    CHECK(child.linux_clear_child_tid == 0, "without CLEARTID no ctid word is recorded");
+    CHECK(child.personality == PROC_PERSONALITY_LINUX,
+          "a clone child is Linux-personality by construction");
+
+    memset(&child, 0, sizeof(child));
+    CHECK(linux_thread_clone_context(&child, &parent, 0x900000,
+                                     flags | LINUX_CLONE_SETTLS |
+                                     LINUX_CLONE_CHILD_CLEARTID,
+                                     0x12345000, 0x900100) == 0,
+          "SETTLS/CLEARTID context is accepted");
+    CHECK(child.fs_base == 0x12345000, "SETTLS selects the requested FS base");
+    CHECK(child.linux_clear_child_tid == 0x900100,
+          "CLEARTID records the child's clear-tid address");
+    CHECK(child.fs_base != parent.fs_base, "SETTLS does not silently inherit");
+
+    memset(&child, 0, sizeof(child));
+    CHECK(linux_thread_clone_context(&child, &parent, 0, flags, 0, 0) == -1,
+          "a zero child stack is refused");
+    CHECK(linux_thread_clone_context(&child, &parent,
+                                     LINUX_USER_ADDR_MAX + 1, flags, 0, 0) == -1,
+          "a non-canonical child stack is refused");
+    CHECK(linux_thread_clone_context(&child, &parent, 0x800000,
+                                     flags | LINUX_CLONE_SETTLS,
+                                     LINUX_USER_ADDR_MAX + 1, 0) == -1,
+          "a non-canonical SETTLS base is refused");
+    parent.park_ctx.rcx = 0;
+    CHECK(linux_thread_clone_context(&child, &parent, 0x800000, flags, 0, 0) == -1,
+          "a missing parent return RIP is refused");
+    parent.park_ctx.rcx = 0x401234;
+
+    CHECK(linux_clone_flags_verdict(flags) == 0,
+          "VM|THREAD|SIGHAND is the accepted M4.2 shape");
+    CHECK(linux_clone_flags_verdict(LINUX_CLONE_VM | LINUX_CLONE_THREAD) ==
+          -LINUX_EINVAL, "THREAD without SIGHAND is malformed");
+    CHECK(linux_clone_flags_verdict(LINUX_CLONE_THREAD | LINUX_CLONE_SIGHAND) ==
+          -LINUX_EINVAL, "THREAD without VM is malformed");
+    CHECK(linux_clone_flags_verdict(flags | 0x40ULL) == -LINUX_ENOSYS,
+          "an unserved clone flag is ENOSYS, not silently dropped");
+    CHECK(linux_clone_flags_verdict(0xFFFFFFFFFFFFFFFFULL) == -LINUX_ENOSYS,
+          "the verdict is total over arbitrary flag words");
+}
+
 int main(void) {
-    printf("linux_thread_group_host_test — M4.1 shared-CR3 lifetime\n");
+    printf("linux_thread_group_host_test — M4.1 shared-CR3 lifetime + M4.2 context\n");
     test_multi_thread_lifecycle();
     test_second_group_and_slot_reuse();
+    test_half_torn_detach();
     test_refusals_and_non_linux_path();
     test_table_bound();
     test_reset_clears_live_groups();
+    test_clone_context_and_flags();
 
     printf("%d checks, %d failure(s)\n", checks, failures);
     if (failures != 0) {

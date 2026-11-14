@@ -111,7 +111,7 @@ fi
 
 # ─── Documentation teeth ──────────────────────────────────────────────────
 D="$W/t1"; seed "$D" || exit 2
-sed -i 's/^Status: M4\.1 landed; M4\.2 not started; runtime wall in force\.$/Status: M4.1 landed; M4.2 landed; runtime supported./' \
+sed -i 's/^Status: M4\.2 landed; M4\.7 gate not evidenced; runtime wall in force\.$/Status: M4.2 landed; M4.7 gate landed; runtime supported./' \
     "$D/docs/AeroSLS-M4-Threads-Design-v0.1.md"
 tooth status-landed B1 "the design starts claiming implementation" "$D"
 
@@ -140,7 +140,8 @@ sed -i '/M4\.5 — Identity/d' "$D/docs/AeroSLS-M4-Threads-Design-v0.1.md"
 tooth missing-m45 E5 "the exit/identity increment disappears" "$D"
 
 D="$W/t6"; seed "$D" || exit 2
-sed -i 's/M4\.1 landed 2026-11-14//g' "$D/docs/AeroSLS-PASE-Linux-Shape-Decision-v0.1.md"
+sed -i 's/M4\.1 landed 2026-11-14//g; s/M4\.2 landed 2026-11-14//g; s/M4\.2 landed//g' \
+    "$D/docs/AeroSLS-PASE-Linux-Shape-Decision-v0.1.md"
 tooth pase-status-gone G1 "the Linux-shape record loses the spike status" "$D"
 
 D="$W/t7"; seed "$D" || exit 2
@@ -165,20 +166,22 @@ tooth false-landed G4 "a roadmap claims the M4.7 gate landed while the mechanism
 
 # ─── Source-census teeth ──────────────────────────────────────────────────
 D="$W/t11"; seed "$D" || exit 2
-printf '\n#define LINUX_CLONE 56\n' >> "$D/kernel/linux_abi.h"
+sed -i 's/M4\.2 landed/M4.2 not started/g' \
+    "$D/docs/AeroSLS-PASE-Linux-Shape-Decision-v0.1.md"
+sed -i 's/^Status: M4\.2 landed; M4\.7 gate not evidenced; runtime wall in force\.$/Status: M4.1 landed; M4.2 not started; runtime wall in force./' \
+    "$D/docs/AeroSLS-M4-Threads-Design-v0.1.md"
 tooth clone-without-m42-docs G1 \
     "clone+group is the M4.2 stage, but the docs still say M4.2 not started" "$D"
 
 D="$W/t11b"; seed "$D" || exit 2
-printf '\n#define LINUX_CLONE 56\n' >> "$D/kernel/linux_abi.h"
-sed -i 's/M4\.2 not started/M4.2 landed/g' \
-    "$D/docs/AeroSLS-PASE-Linux-Shape-Decision-v0.1.md"
-sed -i 's/^Status: M4\.1 landed; M4\.2 not started; runtime wall in force\.$/Status: M4.2 landed; M4.3 not started; runtime wall in force./' \
-    "$D/docs/AeroSLS-M4-Threads-Design-v0.1.md"
 expect_pass m42-stage \
-    "clone+group with M4.2 documented and the runtime wall still in force" "$D"
+    "the landed clone+group stage with M4.2 documented and the runtime wall in force" "$D"
 
 D="$W/t12"; seed "$D" || exit 2
+# Start from the M4.1 shape by removing every source-census clone hit, then
+# add futex: that is the out-of-order combination F5 must refuse.
+sed -i '/LINUX_CLONE/d' "$D/kernel/linux_abi.h" "$D/kernel/syscall_dispatch.c" \
+    "$D/user/sidecar/src/linux.rs"
 printf '\n#define LINUX_FUTEX 202\n' >> "$D/kernel/linux_abi.h"
 tooth futex-only F5 "futex appears without clone and a group" "$D"
 

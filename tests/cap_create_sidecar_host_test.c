@@ -123,7 +123,7 @@
  *       -o /tmp/cap_create_sidecar_host_test \
  *       tests/cap_create_sidecar_host_test.c kernel/cap.c kernel/chan.c \
  *           kernel/console_service.c kernel/env_console.c kernel/linux_abi.c \
- *           kernel/elf64_load.c
+ *           kernel/elf64_load.c kernel/linux_threads.c
  *   /tmp/cap_create_sidecar_host_test
  */
 #include "kernel/cap.h"
@@ -133,6 +133,9 @@
                                 * gate's link stub */
 #include "kernel/elf64_load.h"  /* increment 8 step 1: elf64_map_blob is driven
                                  * directly by E8a's mid-page PT_LOAD case */
+#include "kernel/linux_threads.h" /* M4.1: the group table the Linux create
+                                   * must join before it can land */
+#include "kernel/env_console.h"   /* env_console_count/entry used by section 18 */
 #include "tests/process_host_stubs.h"   /* per_cpu_data (weak), etc. */
 
 #include <stdio.h>
@@ -289,6 +292,20 @@ static void kill_sidecar(uint32_t pid) {
     }
 }
 
+/* M4.1's group-table-full create failure calls the kernel's process_kill().
+ * process.c is not in this link set, so this strong stub records the call and
+ * runs the same cap-table/slot cleanup the real function performs. The page
+ * table and syscall-stack halves of process_kill() are covered by the
+ * process host tests; this arm is about the create reaching the complete
+ * teardown entry point instead of hand-rolling a partial cleanup. */
+static int      g_process_kill_calls = 0;
+static uint32_t g_process_kill_pid = 0;
+void process_kill(uint32_t pid) {
+    g_process_kill_calls++;
+    g_process_kill_pid = pid;
+    kill_sidecar(pid);
+}
+
 uint32_t alloc_pid(void) {
     uint32_t best = 0;
     for (int i = 0; i < PROC_MAX; i++)
@@ -306,6 +323,11 @@ uint64_t alloc_proc_syscall_stack(uint32_t partition_id) {
     (void)partition_id;
     return 0x400000007000ULL;
 }
+
+/* chan.c's Linux sigreturn path reads the trapped user RSP through this
+ * process.c primitive. This test never executes a syscall; the stub only
+ * closes the link so the real create path can be exercised. */
+uint64_t proc_read_user_rsp(void) { return 0; }
 
 /* ─── Frame stubs: real host memory (see file header) ──────────────────────
  * malloc + manual 4 KiB alignment instead of aligned_alloc() (C11, absent
@@ -3305,6 +3327,67 @@ int main(void) {
             CHECK(bibp && memcmp(bibp, SIDECAR_BIB_MAGIC, 8) == 0,
                   "L1: the BIB sits at the stack-top page WITHOUT clobbering the §5.2 image");
         }
+    }
+
+    /* ── 18b. M4.1 group-table-full create failure ────────────────────────
+     * Fill every remaining group slot with standalone descriptors (L1's
+     * Linux child already owns one), then ask the real create for another
+     * Linux child. The create must fail by name and reach process_kill();
+     * the old partial path left the cap table bound and the syscall stack
+     * behind. The wall is unchanged: this is an error path, not thread
+     * support. */
+    {
+        struct ProcessDescriptor fill[LINUX_THREAD_GROUP_MAX];
+        uint32_t gids[LINUX_THREAD_GROUP_MAX];
+        uint64_t gcr3s[LINUX_THREAD_GROUP_MAX];
+        uint32_t made = 0;
+        uint64_t gimage = image_kaddr;
+        struct Blob gb;
+        uint16_t gch = CAP_NONE;
+        uint32_t before = proc_count;
+        int grc;
+
+        CHECK(linux_thread_group_used(1) == 1,
+              "L1b: the L1 Linux child already owns a group");
+        for (uint32_t i = 0; i < LINUX_THREAD_GROUP_MAX; i++) {
+            uint32_t id;
+            memset(&fill[i], 0, sizeof(fill[i]));
+            fill[i].pid = 700 + i;
+            fill[i].cr3 = 0x900000ULL + (uint64_t)i * 0x1000ULL;
+            id = linux_thread_group_create(&fill[i], fill[i].cr3);
+            if (id == 0) break;
+            gids[made] = id;
+            gcr3s[made] = fill[i].cr3;
+            made++;
+        }
+        CHECK(made == LINUX_THREAD_GROUP_MAX - 1,
+              "L1b: exactly the 15 free group slots are filled");
+        build_valid_blob(&gb, gimage, 0);
+        g_process_kill_calls = 0;
+        g_process_kill_pid = 0;
+        grc = cap_create_sidecar_in_personality(100, gb.data, gb.len,
+                                  CAP_NONE, CAP_NONE, &gch, 0,
+                                  PROC_PERSONALITY_LINUX);
+        CHECK(grc == CAP_ETABLEFULL,
+              "L1b: a full group table refuses the Linux create by name");
+        CHECK(g_process_kill_calls == 1 && g_process_kill_pid != 0,
+              "L1b: the failure reaches process_kill(), not a partial cleanup");
+        CHECK(proc_count == before,
+              "L1b: process_kill() restores proc_count");
+        CHECK(table_for_pid(g_process_kill_pid) < 0,
+              "L1b: the failed child's cap table is unbound");
+        CHECK(gch == CAP_NONE,
+              "L1b: no messenger channel is handed back for the failed child");
+        for (uint32_t i = 0; i < made; i++) {
+            uint64_t dead = 0;
+            CHECK(linux_thread_group_used(gids[i]) == 1,
+                  "L1b: the failed create consumes no group slot");
+            CHECK(linux_thread_group_detach(&fill[i], &dead) == 1 &&
+                  dead == gcr3s[i],
+                  "L1b: the fill group releases its own PML4 on cleanup");
+        }
+        CHECK(linux_thread_group_used(1) == 1,
+              "L1b: the L1 child's group is untouched by the failure path");
     }
 
     /* ── 19. the AT_RANDOM gate (§5.2: refuse, never substitute) ───────────

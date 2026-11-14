@@ -2,10 +2,13 @@
 #define LINUX_THREADS_H
 
 /*
- * linux_threads.h — M4.1: the kernel's Linux thread-group object.
+ * linux_threads.h — M4.1/M4.2: the kernel's Linux thread-group object and
+ * the pure context construction the clone path uses.
  *
- * This increment deliberately does NOT create threads. It establishes the
- * object every later clone path must use:
+ * M4.1 establishes the object every thread-create path must use; M4.2 adds
+ * the held-descriptor create in process.c and the context helper below. The
+ * group object itself still owns no policy: it counts references, and the
+ * sidecar decides when a clone is allowed.
  *
  *   - one group per Linux address space, with the leader's PID as TGID;
  *   - a reference count on the shared PML4, so the last thread (not the
@@ -53,6 +56,20 @@ void linux_thread_groups_reset(void);
  * 0 when the table is full or the arguments are invalid. */
 uint32_t linux_thread_group_create(struct ProcessDescriptor *pd, uint64_t cr3);
 
+/* M4.2: build the child's initial user context from the parent's post-syscall
+ * park context. The child returns to the instruction after the parent's
+ * syscall (parent->park_ctx.rcx), with rax = 0 — exactly Linux's clone return
+ * convention — on `child_stack`, with the parent's callee-saved registers and
+ * RFLAGS. `flags` is the already-validated clone word: CLONE_SETTLS selects
+ * `tls` for the child's FS base, otherwise the parent's FS base is inherited;
+ * CLONE_CHILD_CLEARTID records `ctid` on the child. The child is not attached
+ * to a group here. Returns 0, or -1 for a non-canonical stack/TLS/RIP or a
+ * missing parent park context. Pure: no allocations, no scheduler calls. */
+int linux_thread_clone_context(struct ProcessDescriptor *child,
+                               const struct ProcessDescriptor *parent,
+                               uint64_t child_stack, uint64_t flags,
+                               uint64_t tls, uint64_t ctid);
+
 /* M4.2 seam: join `pd` (already carrying the shared `cr3`) to an existing
  * group. Sets the per-thread fields, increments both counters, and refuses
  * a group/cr3 mismatch. Returns the group id, or 0 on refusal. */
@@ -75,5 +92,14 @@ uint32_t linux_thread_group_live(uint32_t group_id);
 uint32_t linux_thread_group_tgid(uint32_t group_id);
 uint64_t linux_thread_group_cr3(uint32_t group_id);
 int      linux_thread_group_used(uint32_t group_id);
+
+#ifdef LINUX_THREAD_GROUP_TEST_SEAM
+/* Host-test only: force the two counters apart so detach's half-torn refusal
+ * is reachable without corrupting the production API. Not compiled into the
+ * kernel image. */
+int linux_thread_group_test_force_counters(uint32_t group_id,
+                                           uint16_t cr3_refs,
+                                           uint16_t live_threads);
+#endif
 
 #endif /* LINUX_THREADS_H */

@@ -810,6 +810,97 @@ static void proc_free_syscall_stack(struct ProcessDescriptor* pd) {
     pd->syscall_stack_top = 0;
 }
 
+/* M4.2: a Linux thread's descriptor. It is the one create path that shares
+ * the parent's PML4, so it must never call user_clone_page_table() — the
+ * group's reference count, not a new address space, owns that lifetime. The
+ * descriptor is born HELD and is not reachable by the scheduler until the
+ * caller attaches it and releases it. */
+uint32_t proc_create_linux_thread(struct ProcessDescriptor *parent,
+                                  uint64_t child_stack, uint64_t flags,
+                                  uint64_t tls, uint64_t ctid) {
+    if (!parent || !parent->active || parent->cr3 == 0 ||
+        parent->personality != PROC_PERSONALITY_LINUX ||
+        parent->linux_tgid == 0)
+        return 0;
+
+    int slot = -1;
+    for (int i = 0; i < PROC_MAX; i++) {
+        if (!proc_table[i].active) { slot = i; break; }
+    }
+    if (slot < 0) return 0;
+    struct ProcessDescriptor *pd = &proc_table[slot];
+
+    /* Start from a clean slot. proc_clear_resume_state resets every staged
+     * and per-task field; the ownership/identity fields it does not touch
+     * are set explicitly below so a reused slot cannot inherit a kernel
+     * continuation or an old stack. */
+    proc_clear_resume_state(pd);
+    pd->pid          = alloc_pid();
+    if (pd->pid == 0) return 0;
+    pd->cr3          = parent->cr3;
+    pd->kernel_rsp   = 0;
+    pd->kernel_cr3   = 0;
+    pd->user_stack_vaddr = 0;
+    pd->user_stack_phys  = 0;
+    pd->parent_user_rsp  = 0;
+    pd->priority     = parent->priority;
+    pd->state        = PROC_HELD;
+    pd->restore_held = 0;
+
+    /* A name that is stable for the sidecar's registry and unique in the
+     * process table: the parent's name plus the child's pid. */
+    {
+        size_t n = pr_strlen(parent->name);
+        char digits[12];
+        int nd = 0;
+        uint32_t v = pd->pid;
+        do { digits[nd++] = (char)('0' + (v % 10u)); v /= 10u; } while (v);
+        if (n > PROC_NAME_LEN - 1u - (size_t)(nd + 2)) {
+            n = PROC_NAME_LEN - 1u - (size_t)(nd + 2);
+        }
+        for (size_t i = 0; i < n; i++) pd->name[i] = parent->name[i];
+        pd->name[n++] = '.';
+        pd->name[n++] = 't';
+        while (nd) pd->name[n++] = digits[--nd];
+        pd->name[n] = '\0';
+    }
+
+    if (linux_thread_clone_context(pd, parent, child_stack, flags, tls,
+                                   ctid) != 0) {
+        pd->name[0] = '\0';
+        return 0;
+    }
+
+    pd->syscall_stack_top = alloc_proc_syscall_stack(parent->partition_id);
+    if (pd->syscall_stack_top == 0) {
+        pd->has_ring3_ctx = 0;
+        pd->name[0] = '\0';
+        return 0;
+    }
+
+    pd->active = 1;
+    proc_count++;
+    kernel_serial_printf("[PROC] M4.2 thread %u '%s' created (held, tgid=%u).\n",
+                         pd->pid, pd->name, parent->linux_tgid);
+    return pd->pid;
+}
+
+void proc_discard_linux_thread(uint32_t pid) {
+    if (pid == 0) return;
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct ProcessDescriptor *pd = &proc_table[i];
+        if (!pd->active || pd->pid != pid) continue;
+        uint64_t dead_cr3 = 0;
+        (void)linux_thread_group_detach(pd, &dead_cr3);
+        proc_free_syscall_stack(pd);
+        proc_clear_resume_state(pd);
+        pd->cr3 = 0;
+        pd->active = 0;
+        proc_count--;
+        return;
+    }
+}
+
 // ─── process_exit ────────────────────────────────────────────────────────────
 // Called from SYS_SLS_EXIT dispatch.  Finds the running Ring-3 process,
 // marks it ZOMBIE, restores the kernel's RSP and CR3 saved by

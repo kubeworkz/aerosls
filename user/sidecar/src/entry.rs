@@ -663,6 +663,41 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         }
     }
 
+    // M4.2: the live clone/thread-create proof. Compiled only into an image
+    // built with M4_THREAD_PROBE=1; the parent is spawned by the initial
+    // POSIX sidecar and its clone child's console output is mirrored to the
+    // serial log (track gate=true) because the tenant console has no attach
+    // surface in this boot. The child inherits that mirror flag through
+    // answer_clone's track call.
+    #[cfg(feature = "m4_thread_probe")]
+    {
+        if !gate && caps.identity.is_none() {
+            match crate::m4_thread_probe::spawn(&RealKernel, caps.budget_base,
+                                                caps.budget_len) {
+                Ok(sp) => match booted.proc.vfs.add_task() {
+                    Ok(vt) => {
+                        if crate::linux::track(
+                            sp.ch_r,
+                            sp.ch_w,
+                            crate::m4_thread_probe::PROBE_NAME,
+                            0,
+                            sp.heap_base,
+                            sp.heap_limit,
+                            vt,
+                            true,
+                        ) {
+                            klog(b"[M4.2] thread probe: spawned ch_r=", sp.ch_r, b"");
+                        } else {
+                            klog(b"[M4.2] thread probe: TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+                        }
+                    }
+                    Err(_) => klog(b"[M4.2] thread probe: VFS task alloc FAILED ch_r=", sp.ch_r, b""),
+                },
+                Err(rc) => klog(b"[M4.2] thread probe: spawn FAILED rc=", rc as u32, b""),
+            }
+        }
+    }
+
     // M1: the live Linux TCP round trip. Compiled only into an image built
     // with M1_NET_PROBE=1; the child is spawned by the initial POSIX sidecar
     // (no E3 identity), whose `network` cap is the live driver path the

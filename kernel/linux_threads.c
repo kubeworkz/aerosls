@@ -19,6 +19,7 @@
 
 #include "linux_threads.h"
 #include "process.h"
+#include "linux_abi.h"
 
 _Static_assert(LINUX_THREAD_GROUP_MAX >= PROC_MAX,
                "the group table must cover every process slot");
@@ -65,6 +66,65 @@ uint32_t linux_thread_group_create(struct ProcessDescriptor *pd, uint64_t cr3) {
         pd->linux_clear_child_tid = 0;
         return i + 1;
     }
+    return 0;
+}
+
+/* M4.2's context construction. Kept in this file, beside the group object,
+ * because it is the other half of "a thread is a descriptor plus a shared
+ * address space": the descriptor's ring3_ctx is what the scheduler will
+ * iret into, and this is the only place that writes a brand-new one from a
+ * parent's parked syscall frame. No allocation and no scheduling decision
+ * happens here, so the host test can drive it directly. */
+int linux_thread_clone_context(struct ProcessDescriptor *child,
+                               const struct ProcessDescriptor *parent,
+                               uint64_t child_stack, uint64_t flags,
+                               uint64_t tls, uint64_t ctid) {
+    uint64_t rip, fs_base;
+    if (!child || !parent) return -1;
+    if (child_stack == 0 || child_stack > LINUX_USER_ADDR_MAX) return -1;
+    rip = parent->park_ctx.rcx;
+    if (rip == 0 || rip > LINUX_USER_ADDR_MAX) return -1;
+    if (flags & LINUX_CLONE_SETTLS) {
+        if (tls > LINUX_USER_ADDR_MAX) return -1;
+        fs_base = tls;
+    } else {
+        fs_base = parent->fs_base;
+        if (fs_base > LINUX_USER_ADDR_MAX) return -1;
+    }
+
+    child->cr3         = parent->cr3;
+    child->fs_base     = fs_base;
+    child->user_rip    = rip;
+    child->user_rsp    = child_stack;
+    child->parent_pid  = parent->pid;
+    child->owner_uid   = parent->owner_uid;
+    child->partition_id = parent->partition_id;
+    child->personality = PROC_PERSONALITY_LINUX;
+    child->linux_clear_child_tid =
+        (flags & LINUX_CLONE_CHILD_CLEARTID) ? ctid : 0;
+    child->linux_is_thread = 0;   /* attach() stamps the group membership */
+
+    /* The child's first instruction is the one after the parent's clone. The
+     * register set is Linux's: rax is the child's zero return, the caller's
+     * callee-saved values survive the syscall, and the caller-saved argument
+     * registers are left as the trap captured them. RFLAGS is the normal
+     * user word rather than the parked value's IOPL-adjacent bits. */
+    child->ring3_ctx = parent->ring3_ctx;
+    child->ring3_ctx.r15 = parent->park_ctx.r15;
+    child->ring3_ctx.r14 = parent->park_ctx.r14;
+    child->ring3_ctx.r13 = parent->park_ctx.r13;
+    child->ring3_ctx.r12 = parent->park_ctx.r12;
+    child->ring3_ctx.rbx = parent->park_ctx.rbx;
+    child->ring3_ctx.rbp = parent->park_ctx.rbp;
+    child->ring3_ctx.rcx = rip;       /* Linux leaves the return RIP in rcx */
+    child->ring3_ctx.r11 = 0x202;     /* and the user RFLAGS in r11 */
+    child->ring3_ctx.rax = 0;         /* clone's child return value */
+    child->ring3_ctx.rip = rip;
+    child->ring3_ctx.cs  = 0x23;
+    child->ring3_ctx.rflags = 0x202;
+    child->ring3_ctx.rsp = child_stack;
+    child->ring3_ctx.ss  = 0x1B;
+    child->has_ring3_ctx = 1;
     return 0;
 }
 
@@ -147,3 +207,15 @@ uint64_t linux_thread_group_cr3(uint32_t group_id) {
 int linux_thread_group_used(uint32_t group_id) {
     return group_get(group_id) != 0;
 }
+
+#ifdef LINUX_THREAD_GROUP_TEST_SEAM
+int linux_thread_group_test_force_counters(uint32_t group_id,
+                                           uint16_t cr3_refs,
+                                           uint16_t live_threads) {
+    struct LinuxThreadGroup *g = group_get(group_id);
+    if (!g) return 0;
+    g->cr3_refs = cr3_refs;
+    g->live_threads = live_threads;
+    return 1;
+}
+#endif
