@@ -1197,6 +1197,10 @@ void persist_environments(void) {
     struct EnvCkptQuiesce q;
     env_ckpt_quiesce_for_capture(&q);
 
+    /* M4.6: the record's group entry must describe the group the payload is
+     * about to capture. The payload capture runs after this write, so this is
+     * the only point where the first checkpoint can persist the thread array. */
+    env_payload_refresh_records();
     uint32_t bytes = (uint32_t)sizeof(env_ckpt_table);
     stage_hdr(PERSIST_ENV_CKPT_HDR_LBA, PERSIST_MAGIC_ENV_CKPT,
               env_ckpt_count, (uint32_t)sizeof(struct EnvCkptRecord),

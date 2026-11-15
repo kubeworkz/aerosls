@@ -133,6 +133,22 @@ int env_ckpt_valid(const struct EnvCkptRecord* rec) {
             rec->tasks[i].kind != ENV_CKPT_TASK_LINUX)
                                                        return ENV_CKPT_REFUSE_BAD_TASK;
     }
+    /* M4.6: the shared-address-space entry. Zero is the registration-time
+     * "not spawned yet" shape; once populated it must name at least the
+     * leader and no more contexts than the payload can carry. A nonzero
+     * group without a Linux task is a record whose thread half has no task
+     * to attach to, so it is refused too. */
+    if (rec->linux_group.n_threads > ENV_CKPT_MAX_THREADS)
+        return ENV_CKPT_REFUSE_THREADS;
+    if (rec->linux_group.n_threads > 0) {
+        int linux_slots = 0;
+        for (uint32_t i = 0; i < rec->n_tasks; i++)
+            if (rec->tasks[i].kind == ENV_CKPT_TASK_LINUX) linux_slots++;
+        if (linux_slots != 1) return ENV_CKPT_REFUSE_THREADS;
+        for (uint32_t i = 0; i < rec->linux_group.n_threads; i++)
+            if (rec->linux_group.tids[i] == 0)
+                return ENV_CKPT_REFUSE_THREADS;
+    }
     // The three regions are required, not optional: an environment without its
     // ramdisk storage is a different object, and silently restoring a partial
     // one is the failure this gate exists to prevent.
@@ -898,6 +914,10 @@ void env_ckpt_refusal_text(const struct EnvCkptRefusal* r, char* out, uint32_t c
             ec_put(&p, end, "the create for record "); ec_put_u32(&p, end, r->a);
             ec_put(&p, end, " failed (status ");      ec_put_u32(&p, end, r->b);
             ec_put(&p, end, ")"); break;
+        case ENV_CKPT_REFUSE_THREADS:
+            ec_put(&p, end, "record ");               ec_put_u32(&p, end, r->a);
+            ec_put(&p, end, " has a Linux thread-group entry this build cannot "
+                            "restore"); break;
         default: ec_put(&p, end, "unclassified refusal"); break;
     }
     *p = '\0';

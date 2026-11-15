@@ -1,16 +1,17 @@
-//! m4_ckpt_probe.rs — M4.6 increment 1's live checkpoint probe.
+//! m4_ckpt_probe.rs — M4.6's live thread-group checkpoint probe.
 //!
 //! The gate profile is the one live Linux tenant whose task name is already
 //! in an `EnvCkptRecord`, so this profile replaces the E7 firstuser with a
-//! fixture that creates a real two-thread LinuxThreadGroup and then keeps both
-//! threads alive. A checkpoint of that environment must reach the capture
-//! boundary and refuse with `EP_REFUSE_THREADS`; no payload for the group may
-//! be written.
+//! fixture that creates a real two-thread LinuxThreadGroup and parks both
+//! members in private futex waits. The checkpoint carries the shared address
+//! space and both contexts; the replay's parent timeout wakes the parent,
+//! which wakes the child's restored untimed waiter.
 //!
 //! The fixture is `fixtures/m4_ckpt_probe.flat`. Its parent waits for the
-//! child's `M4.6-THREAD-OK` write to be answered, then writes
-//! `M4.6-CKPT-READY` and spins; the child spins too. Both are in the same
-//! address space and group when the harness triggers the checkpoint.
+//! child's `M4.6-THREAD-OK` write and READY word, then writes
+//! `M4.6-CKPT-READY` and parks on a timed futex; the child is already parked
+//! on an untimed one. Both are in the same address space and group when the
+//! harness triggers the checkpoint.
 //!
 //! Spawned only when the gate sidecar is built with `m4_ckpt_probe`; default
 //! builds compile neither this module nor its spawn path.

@@ -105,6 +105,42 @@ static unsigned g_keepalive_pumps = 0;
 void failover_sweep_keepalive(void) { g_keepalive_pumps++; }
 struct ProcessDescriptor proc_table[PROC_MAX];
 
+/* M4.6: the payload layer asks cap.c for the captured channel pair and for a
+ * restored sibling. The host test has neither a real capability table nor a
+ * scheduler; the scan is a settable stub so one focused case can make the
+ * fresh pair land on different sidecar slots than the capture recorded. */
+static uint16_t g_chan_r = 0;
+static uint16_t g_chan_w = 1;
+static uint32_t g_chan_id = 7;
+int cap_linux_thread_chans(uint32_t sidecar_pid, uint32_t child_pid,
+                           uint16_t* out_r, uint16_t* out_w,
+                           uint32_t* out_chan_id) {
+    (void)sidecar_pid; (void)child_pid;
+    if (out_r) *out_r = g_chan_r;
+    if (out_w) *out_w = g_chan_w;
+    if (out_chan_id) *out_chan_id = g_chan_id;
+    return 0;
+}
+int cap_linux_restore_thread(struct CapLinuxRestoreThread* req) {
+    (void)req;
+    return -1;
+}
+int cap_wake_sidecar_channels(uint32_t sidecar_pid,
+                              const uint32_t* exclude, uint32_t n_exclude) {
+    (void)sidecar_pid; (void)exclude; (void)n_exclude;
+    return 0;
+}
+int cap_chan_create(uint32_t pid, uint32_t far_pid,
+                    uint16_t* rd, uint16_t* wr,
+                    uint16_t* frd, uint16_t* fwr) {
+    (void)pid; (void)far_pid;
+    if (rd) *rd = CAP_NONE;
+    if (wr) *wr = CAP_NONE;
+    if (frd) *frd = CAP_NONE;
+    if (fwr) *fwr = CAP_NONE;
+    return -1;
+}
+
 /* M4.6 increment 1: env_payload.c reads the live member count of a Linux
  * task's group. The real group table is kernel/linux_threads.c's; this host
  * test links the payload layer alone, so the live count and address-space refs
@@ -495,6 +531,7 @@ static uint32_t setup_and_capture_linux_group(int linux_ctx, uint32_t live_threa
 
     struct ProcessDescriptor* px = &proc_table[0];
     px->active = 1;
+    px->pid = 100;
     strcpy(px->name, "aerosls.posix.2");
     px->cr3 = (uint64_t)(uintptr_t)g_pml4;
     px->waiting_chan = 3u;
@@ -505,9 +542,11 @@ static uint32_t setup_and_capture_linux_group(int linux_ctx, uint32_t live_threa
 
     struct ProcessDescriptor* lx = &proc_table[1];
     lx->active = 1;
+    lx->pid = 101;
     strcpy(lx->name, "e7.gate.user.0");
     lx->cr3 = (uint64_t)(uintptr_t)g_pml4_l;
     lx->linux_tgid = 1;         /* a live group; its count is the stub above */
+    lx->linux_tid  = 1;
     lx->state = PROC_SUSPENDED;
     lx->waiting_chan = CAP_NONE;   /* a user-space stop is not a park */
     lx->has_ring3_ctx = 1;
@@ -518,6 +557,29 @@ static uint32_t setup_and_capture_linux_group(int linux_ctx, uint32_t live_threa
     lx->linux_heap_limit = L_HEAP + 0x10000ull;
     lx->linux_image_lo = L_IMG;
     lx->linux_image_hi = L_IMG + 0x2000ull;
+    if (live_threads >= 2) {
+        struct ProcessDescriptor* sx = &proc_table[2];
+        sx->active = 1;
+        sx->pid = 102;
+        strcpy(sx->name, "e7.gate.user.0.t2");
+        sx->cr3 = (uint64_t)(uintptr_t)g_pml4_l;
+        sx->linux_tgid = 1;
+        sx->linux_tid = 2;
+        sx->linux_is_thread = 1;
+        sx->state = PROC_SUSPENDED;
+        sx->waiting_chan = CAP_NONE;
+        sx->has_ring3_ctx = 1;
+        sx->fs_base = 0x700000ull;
+        sx->linux_heap_base = L_HEAP;
+        sx->linux_heap_limit = L_HEAP + 0x10000ull;
+        sx->linux_image_lo = L_IMG;
+        sx->linux_image_hi = L_IMG + 0x2000ull;
+        uint64_t* c = (uint64_t*)&sx->ring3_ctx;
+        c[15] = L_IMG + 0x50;
+        c[18] = L_STACK + 0x1800;
+        sx->user_rip = c[15];
+        sx->user_rsp = c[18];
+    }
     if (linux_ctx == 2) {
         /* The stop: HELD, no park, and ring3_ctx built as the stop builds it
          * — rip at the syscall instruction, rax = the number it will re-run,
@@ -553,6 +615,7 @@ static uint32_t setup_and_capture_linux_group(int linux_ctx, uint32_t live_threa
     } else {
         lx->waiting_chan = 4u;
         lx->park_syscall = SYS_LINUX_TRAP_RESUME;
+        lx->park_req = LINUX_FUTEX;
         lx->park_ctx.r11 = 222;
         lx->park_ctx.rcx = L_IMG + 0x80;
         for (int a = 0; a < 6; a++) lx->park_ctx.linux_args[a] = (uint64_t)(0xB0 + a);
@@ -818,35 +881,35 @@ int main(void) {
     CHECK(proc_table[0].park_ctx.r11 == 111,
           "LINUX: the sidecar task in the SAME payload still gets its park frame (the sidecar path is unchanged)");
 
-    /* M4.6 increment 1: refuse a live thread group instead of capturing only
-     * its leader. The payload has one EnvCkptTask slot for the tenant; a
-     * two-thread group would otherwise replay as a lone leader with no sibling
-     * and no parked futex waiter. */
-    CHECK(setup_and_capture_linux_group(1, 2) == 0,
-          "THREADS: a Linux task with one live sibling is refused at capture, not saved as only its leader");
-    CHECK(env_payload_present(L_PART, L_IDX) == 0,
-          "THREADS: the refused group wrote no payload for its environment");
-    CHECK(env_payload_last_refusal().code == EP_REFUSE_THREADS &&
-          env_payload_last_refusal().a == 1 &&
-          env_payload_last_refusal().b == 2,
-          "THREADS: the refusal names the Linux task and the live member count");
+    /* M4.6: a healthy N-member group is now the capturable shape. The
+     * record carries the shared-address-space entry and the payload's v3
+     * thread array; only a half-torn group is refused. */
+    CHECK(setup_and_capture_linux_group(1, 2) == 1,
+          "THREADS: a two-thread Linux group captures as one payload");
+    CHECK(env_payload_present(L_PART, L_IDX) == 1,
+          "THREADS: the two-thread capture wrote a discoverable payload");
+    CHECK(env_ckpt_find(L_PART, L_IDX)->linux_group.n_threads == 2 &&
+          env_ckpt_find(L_PART, L_IDX)->linux_group.tgid == 1 &&
+          env_ckpt_find(L_PART, L_IDX)->linux_group.tids[0] == 1 &&
+          env_ckpt_find(L_PART, L_IDX)->linux_group.tids[1] == 2,
+          "THREADS: the record carries the shared address space and both thread ids");
     CHECK(setup_and_capture_linux_group(1, 1) == 1,
           "THREADS: the one-member group is still the capturable shape");
     CHECK(env_payload_present(L_PART, L_IDX) == 1,
           "THREADS: the one-member capture wrote a discoverable payload");
-    /* Same disk, no reset: the previous single-thread payload is still in
-     * its slot. A refused re-capture must drop the directory entry rather
-     * than leave it for a later replay to serve as current. */
+    /* Same disk, no reset: the previous payload is still in its slot. A
+     * half-torn re-capture must drop the directory entry rather than leave
+     * it for a later replay to serve as current. */
     g_live_threads = 2;
-    g_live_refs = 2;
+    g_live_refs = 1;
     CHECK(env_payload_capture_all() == 0,
-          "THREADS: a second capture refuses once a live sibling exists");
+          "THREADS: a group whose live count and address-space refs disagree is refused");
     CHECK(env_payload_present(L_PART, L_IDX) == 0,
-          "THREADS: the refused re-capture drops the old single-thread entry, so a replay cannot serve it");
+          "THREADS: the refused re-capture drops the old entry, so a replay cannot serve it");
     CHECK(env_payload_last_refusal().code == EP_REFUSE_THREADS &&
           env_payload_last_refusal().a == 1 &&
           env_payload_last_refusal().b == 2,
-          "THREADS: the re-capture refusal names the task and both members again");
+          "THREADS: the half-torn refusal names the task and the live count");
     CHECK(setup_and_capture_linux_group(1, 0) == 0,
           "THREADS: a named group with no live member is refused as half-torn");
     CHECK(env_payload_present(L_PART, L_IDX) == 0,
@@ -912,11 +975,20 @@ int main(void) {
           "ENTRY: the stop is spent at the pour — the resumed read is forwarded, not held a second time");
 
     CHECK(setup_and_capture_linux(0) == 1,
-          "LINUX: a tenant parked in its forwarded syscall still captures (the form is recorded, not skipped)");
-    CHECK(env_payload_restore(L_PART, L_IDX, 22, L_SEQ, &pages, &cons)
-              == EP_REFUSE_FORM,
-          "FORM: a parked Linux tenant is refused by name — its queued request is state this blob does not carry");
-
+          "LINUX: a tenant parked in its forwarded syscall captures with the parked form");
+    simulate_fresh_boot_linux();
+    proc_table[1].state = PROC_HELD;
+    proc_table[1].restore_held = 1;
+    proc_table[1].has_ring3_ctx = 0;
+    pages = 0; cons = 0;
+    rc = env_payload_restore(L_PART, L_IDX, 22, L_SEQ, &pages, &cons);
+    CHECK(rc == EP_REFUSE_NONE,
+          "FORM: a parked Linux tenant is restored parked — the queued reply is carried by the sidecar's own state");
+    CHECK(proc_table[1].state == PROC_BLOCKED &&
+          proc_table[1].waiting_chan == 7 &&
+          proc_table[1].park_req == LINUX_FUTEX &&
+          proc_table[1].park_syscall == SYS_LINUX_TRAP_RESUME,
+          "FORM: the restored kernel task is blocked on this boot's channel with the captured expected reply number");
     /* ── 5b. E7 increment 21: a HELD replay maps what the spawn never did ──
      * The replay's create holds its Linux child (cap_linux_restore_arm), so
      * the fresh child has no ring3_ctx and its heap pages — mapped LAZILY by
@@ -961,6 +1033,35 @@ int main(void) {
     CHECK(env_payload_restore(L_PART, L_IDX, 22, L_SEQ, &pages, &cons)
               == EP_REFUSE_NOT_PARKED,
           "ADOPT: a Linux task neither held nor carrying a context is refused by name — the hold is what makes the pour's target a task that has not run");
+
+    /* ── 5c. M4.6: the restored sidecar table's channel slots are part of the
+     * blob's contract. A captured parked leader names sidecar handles 0/1;
+     * if this boot's pair lands on 8/9, resuming it would wait for a reply the
+     * restored table sends to a channel this boot never minted. The refusal
+     * must land before the pour, so no destination page moves. ── */
+    CHECK(setup_and_capture_linux(0) == 1,
+          "CHANNEL: a parked leader with captured sidecar handles captures");
+    simulate_fresh_boot_linux();
+    proc_table[1].state = PROC_HELD;
+    proc_table[1].restore_held = 1;
+    proc_table[1].has_ring3_ctx = 0;
+    g_chan_r = 8;                 /* the fresh pair, on other sidecar slots */
+    g_chan_w = 9;
+    g_chan_id = 9;
+    g_l_img[0][0] = 0xA5;         /* a pour would replace this with 0x40 */
+    pages = 0; cons = 0;
+    rc = env_payload_restore(L_PART, L_IDX, 22, L_SEQ, &pages, &cons);
+    CHECK(rc == EP_REFUSE_CHANNEL,
+          "CHANNEL: a captured sidecar-handle mismatch refuses the restore instead of resuming on this boot's channel");
+    CHECK(env_payload_last_refusal().code == EP_REFUSE_CHANNEL &&
+          env_payload_last_refusal().a == 1 &&
+          env_payload_last_refusal().b == 0,
+          "CHANNEL: the refusal names the Linux task slot and the leader thread index");
+    CHECK(pages == 0 && g_l_img[0][0] == 0xA5 && g_l_heap[0][0] == 0,
+          "CHANNEL: the refusal happens before the pour — no captured page is written");
+    g_chan_r = 0;
+    g_chan_w = 1;
+    g_chan_id = 7;
 
     printf("\n%d passed, %d failed\n", checks_passed, checks_failed);
     return checks_failed ? 1 : 0;

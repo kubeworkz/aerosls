@@ -1324,7 +1324,7 @@ IEM=user/init/src/env_manager.rs
 ENVP=user/proto/src/env_proto.rs
 EPHUT=tests/env_payload_host_test.c
 ECKHUT=tests/env_ckpt_host_test.c
-if grep -qF '#define ENV_PAYLOAD_REC_VERSION 2u' "$EPH" && \
+if grep -qF '#define ENV_PAYLOAD_REC_VERSION 3u' "$EPH" && \
    grep -qF '#define EP_PAGE_ENTRY_BYTES 16u' "$EPH" && \
    grep -qF 'uint64_t linux_regs[20];' "$EPH" && \
    grep -qF 'uint64_t linux_args[6]; /* rdi, rsi, rdx, r10, r8, r9 at the capture */' "$EPH" && \
@@ -1334,10 +1334,12 @@ if grep -qF '#define ENV_PAYLOAD_REC_VERSION 2u' "$EPH" && \
    grep -qF 'uint64_t heap_limit;' "$EPH" && \
    grep -qF 'uint64_t stack_bottom;' "$EPH" && \
    grep -qF 'uint64_t image_hi;' "$EPH" && \
+   grep -qF 'struct EnvPayloadThread {' "$EPH" && \
+   grep -qF 'uint32_t n_threads;' "$EPH" && \
    grep -qF '#define ENV_PAYLOAD_FORM_USER    2u' "$EPH"; then
-    ok "W1. the payload is v2: EnvPayloadTask carries the Linux task's FULL context (20-word TaskContext), its six argument registers, fs_base, both cursors, the heap and stack ranges and the image span, and every page index entry is 16 bytes with a permission word"
+    ok "W1. the payload is v3: EnvPayloadTask carries the Linux task's FULL context (20-word TaskContext), its six argument registers, fs_base, both cursors, the heap and stack ranges and the image span, every page index entry is 16 bytes with a permission word, and the header names the N-thread block"
 else
-    bad "W1. the Linux half of EnvPayloadTask or the permission-carrying page entry is gone — the capture could file pages a restore cannot map, and a v1-shaped blob would be misread entry by entry"
+    bad "W1. the Linux half of EnvPayloadTask or the permission-carrying page entry is gone, or the payload version no longer names the thread block — the capture could file pages a restore cannot map, and a v2-shaped blob would be misread entry by entry"
 fi
 if grep -qF 'static int ep_linux_page(const struct EnvCkptRecord* rec, uint32_t t,' "$EPC" && \
    grep -qF 'if (tk->stack_bottom && vaddr >= tk->stack_bottom &&' "$EPC" && \
@@ -1363,22 +1365,27 @@ if grep -qF 'case EP_REFUSE_PERM:' "$EPC" && \
    grep -qF 'if ((live_perm & EP_PAGE_PERM_MASK) !=' "$EPC" && \
    grep -qF 'ep_refuse(EP_REFUSE_PERM, t, pi);' "$EPC" && \
    grep -qF 'if (tk.form != ENV_PAYLOAD_FORM_USER &&' "$EPC" && \
-   grep -qF 'tk.form != ENV_PAYLOAD_FORM_ENTRY) {' "$EPC" && \
+   grep -qF 'tk.form != ENV_PAYLOAD_FORM_ENTRY &&' "$EPC" && \
+   grep -qF 'tk.form != ENV_PAYLOAD_FORM_PARKED) {' "$EPC" && \
    grep -qF 'pd->has_ring3_ctx  = 1;' "$EPC" && \
    grep -qF 'pd->linux_mmap_top = tk.mmap_top;' "$EPC"; then
-    ok "W4. the restore proves the page's live permissions against the captured ones before a byte moves, resumes only the two resumable Linux forms (the pause's USER and increment 21's held ENTRY stop — PARKED and RUNNING refused by name, their queued/mid-compute state not being in the blob), and carries the captured ring3_ctx with its fs_base and both cursors"
+    ok "W4. the restore proves the page's live permissions against the captured ones before a byte moves, resumes the resumable Linux forms (the pause's USER, increment 21's held ENTRY stop, and M4.6's PARKED forward — RUNNING refused by name), and carries the captured ring3_ctx with its fs_base and both cursors"
 else
     bad "W4. the restore's Linux arm is gone — a page could be poured into a map with different permissions, a parked task's stale context would be resumed, a non-held task could be poured over, or the task would restart at its entry"
 fi
 if grep -qF '#define EP_REFUSE_THREADS' "$EPH" && \
    grep -qF 'linux_thread_group_live(pds[t]->linux_tgid)' "$EPC" && \
    grep -qF 'linux_thread_group_refs(pds[t]->linux_tgid)' "$EPC" && \
-   grep -qF 'live == 1u && refs == 1u' "$EPC" && \
+   grep -qF 'live == 0 || live > ENV_PAYLOAD_MAX_THREADS || refs != live' "$EPC" && \
+   grep -qF 'ep_group_members(leader->linux_tgid, leader->pid, members,' "$EPC" && \
+   grep -qF 'n_threads = live;' "$EPC" && \
+   grep -qF 'head.n_threads = n_threads;' "$EPC" && \
+   grep -qF 'cap_linux_restore_thread(&req)' "$EPC" && \
    grep -qF 'if (group_refused) continue;' "$EPC" && \
    grep -qF 'EP_REFUSE_THREADS' "$EPHUT"; then
-    ok "W5a. M4.6 increment 1: capture reads the live thread-group count and address-space refs and refuses a Linux task that is not exactly one healthy member, naming the task and count, instead of saving only the leader"
+    ok "W5a. M4.6: capture reads the live thread-group count and address-space refs, permits one to eight healthy members, refuses only a half-torn or oversize group by name, and records the N contexts the restore recreates as held siblings"
 else
-    bad "W5a. the thread-group capture refusal is gone — a multi-thread or half-torn environment could checkpoint its leader alone and replay a group that silently lost every sibling (and any parked futex waiter)"
+    bad "W5a. the thread-group capture is gone — a half-torn group could checkpoint, or a healthy N-thread group could replay its leader alone and silently lose every sibling (and any parked futex waiter)"
 fi
 if grep -qF 'pub const LINUX_TASK_NAME: &str = "e7.gate.user.0";' "$ENVP" && \
    grep -qF 'r.set_task(2, LINUX_TASK_NAME, TASK_LINUX);' "$IEM" && \
@@ -1397,12 +1404,12 @@ fi
 if grep -qF 'LINUX: the gate environment (sidecar + Linux tenant) captures as one payload' "$EPHUT" && \
    grep -qF 'LINUX: the full ring3_ctx — rip, rsp and the six argument registers — is the captured one' "$EPHUT" && \
    grep -qF 'PERM: a captured RX image page that is writable at the destination refuses the whole pour' "$EPHUT" && \
-   grep -qF 'FORM: a parked Linux tenant is refused by name' "$EPHUT" && \
+   grep -qF 'FORM: a parked Linux tenant is restored parked' "$EPHUT" && \
    grep -qF 'the stamp fills the Linux slot' "$ECKHUT" && \
    grep -qF 'a replay whose create names the same three tasks IS the same environment' "$ECKHUT"; then
-    ok "W6. both host tests drive the increment: the payload round trip (bytes, perms, context, the perm and form teeth) and the record layer's stamp/identity clauses — each claim runs against the real kernel file, not a model of it"
+    ok "W6. both host tests drive the increment: the payload round trip (bytes, perms, context, the perm tooth, the restored PARKED form) and the record layer's stamp/identity clauses — each claim runs against the real kernel file, not a model of it"
 else
-    bad "W6. a host-test clause for increment 20 is missing — the capture, the stamp or the identity comparison would be a claim no test runs"
+    bad "W6. a host-test clause for the Linux checkpoint is missing — the capture, the restored park, the stamp or the identity comparison would be a claim no test runs"
 fi
 
 # ─── X. E7 increment 25: munmap, the memory class's last seam ─────────────

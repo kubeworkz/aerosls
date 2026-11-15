@@ -885,6 +885,52 @@ uint32_t proc_create_linux_thread(struct ProcessDescriptor *parent,
     return pd->pid;
 }
 
+/* M4.6 restore sibling: allocate the descriptor and syscall stack, share the
+ * leader's PML4, but do not touch user memory. The captured thread's pages
+ * are poured into that shared address space later, so the normal create's
+ * `linux_user_range_writable(child_stack)` check would refuse a legitimate
+ * restore (the fresh address space has no frame yet). The caller attaches
+ * the group reference and installs the context after the pour. */
+uint32_t proc_create_linux_thread_restore(struct ProcessDescriptor *parent,
+                                          const char *name, uint32_t tid) {
+    if (!parent || !parent->active || parent->cr3 == 0 ||
+        parent->personality != PROC_PERSONALITY_LINUX ||
+        parent->linux_tgid == 0 || !name)
+        return 0;
+    int slot = -1;
+    for (int i = 0; i < PROC_MAX; i++) {
+        if (!proc_table[i].active) { slot = i; break; }
+    }
+    if (slot < 0) return 0;
+    struct ProcessDescriptor *pd = &proc_table[slot];
+    proc_clear_resume_state(pd);
+    pd->pid = alloc_pid();
+    if (pd->pid == 0) return 0;
+    pd->cr3          = parent->cr3;
+    pd->partition_id = parent->partition_id;
+    pd->owner_uid    = parent->owner_uid;
+    pd->priority     = parent->priority;
+    pd->personality  = PROC_PERSONALITY_LINUX;
+    pd->state        = PROC_HELD;
+    pd->restore_held = 1;
+    pd->linux_tid    = tid ? tid : pd->pid;
+    pd->linux_is_thread = 1;
+    uint32_t n = 0;
+    while (name[n] && n + 1 < PROC_NAME_LEN) { pd->name[n] = name[n]; n++; }
+    pd->name[n] = '\0';
+    pd->syscall_stack_top = alloc_proc_syscall_stack(parent->partition_id);
+    if (pd->syscall_stack_top == 0) {
+        pd->name[0] = '\0';
+        return 0;
+    }
+    pd->active = 1;
+    proc_count++;
+    kernel_serial_printf(
+        "[PROC] M4.6 restore thread %u '%s' created (held, shared cr3).\n",
+        pd->pid, pd->name);
+    return pd->pid;
+}
+
 void proc_discard_linux_thread(uint32_t pid) {
     if (pid == 0) return;
     for (int i = 0; i < PROC_MAX; i++) {

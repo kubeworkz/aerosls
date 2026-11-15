@@ -592,6 +592,15 @@ uint32_t proc_create_linux_thread(struct ProcessDescriptor *parent,
                                   uint64_t child_stack, uint64_t flags,
                                   uint64_t tls, uint64_t ctid);
 
+/* M4.6: the restore's sibling create. Same descriptor/group machinery as
+ * proc_create_linux_thread(), but WITHOUT the user-address validation and
+ * initial context build: the shared address space's pages are poured after
+ * this descriptor exists, so `child_stack` is not mapped yet, and the
+ * payload installs the captured context after the pour. The caller attaches
+ * the group reference, mints the channel and sets restore_held. */
+uint32_t proc_create_linux_thread_restore(struct ProcessDescriptor *parent,
+                                          const char *name, uint32_t tid);
+
 /* Roll back a descriptor from proc_create_linux_thread() that was never
  * attached/released (the clone syscall's create-failure path). The descriptor
  * owns no capability table at that point, so only its syscall stack is

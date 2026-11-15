@@ -33,7 +33,7 @@ checked against the current source rather than inferred from a document.
 | `futex` | M4.4 lands private `FUTEX_WAIT`/`FUTEX_WAKE` only: the kernel copies the observed word and optional relative timespec, the sidecar owns a group-keyed FIFO queue, and timeout is `ETIMEDOUT` | `FUTEX_WAIT_BITSET`, requeue, PI, robust lists, process-shared futexes and signal-interrupted waits are named follow-ons; `clear_child_tid` zero+wake is M4.5, and a joinable runtime still needs M4.6's checkpoint |
 | `exit_group` | M4.5 routes 231 to the kernel's TGID sweep (`SYS_SLS_LINUX_GROUP_SWEEP`, 331), which refuses a runnable member with `CAP_EAGAIN`, kills only non-running members, and reports success only after the group's live count and descriptor scan reach zero; the sidecar retries/yields, verifies every record is gone, then wakes each stored clear-tid and releases every group record | the group's address space is released once, on the last detach; `exit(60)` is the single-thread path |
 | `set_tid_address` | stores the user pointer and uses it as the sidecar's tid (`user/sidecar/src/linux.rs`) | a real TID must be a kernel identity, distinct from the clear-child-tid address |
-| Checkpoint record | `ENV_CKPT_MAX_TASKS` is four, and a Linux task's share is one descriptor/context (`kernel/env_ckpt.h`) | a thread group needs one shared-address-space record plus N thread records, with parked futex waiters restored parked |
+| Checkpoint record | v2: `ENV_CKPT_MAX_TASKS` is four; the Linux task slot owns the shared pages and `EnvCkptLinuxGroup` names up to eight TIDs, while payload v3 carries one `EnvPayloadThread` per context (`kernel/env_ckpt.h`, `kernel/env_payload.h`) | parked futex waiters are restored with their captured park frame and woken by the sidecar's restored queue; the runtime gate is still M4.7 |
 
 A runtime is not unblocked by making the number stop returning `ENOSYS`.
 It is unblocked only when two threads can share one address space, enter the
@@ -374,34 +374,57 @@ required, and a live arm where it is. No increment may claim the next one.
 - **M4.6 — Thread-aware checkpoint/restore.** Extend the record and payload,
   restore one shared address space plus N threads, and prove a parked futex
   waiter survives a reboot.
-  **Increment 1 live (2026-11-14), not an M4.6 landing:** the existing payload
-  has one Linux task slot and no group entry. `env_payload_capture_all()` asks
-  the live thread group for its member count and address-space reference count
-  and refuses (`EP_REFUSE_THREADS`) any named Linux task whose group is not
-  exactly one live member with one reference; a half-torn group (the counters
-  disagree, or there is no live member) is refused for the same reason. This is
-  the refusal-over-partial-application edge: before the record and payload
-  carry a shared-address-space entry plus N per-thread entries, a checkpoint of
-  a two-thread group would otherwise save the leader and lose the sibling
-  (including a parked futex waiter). A refused re-capture also writes a
-  directory built only from successful entries, so the identity's previous
-  payload entry is dropped rather than left for a later replay to serve.
+  **Increment 2 live (2026-11-15): record v2 and payload v3 carry the group.**
+  `EnvCkptRecord` now ends in one `EnvCkptLinuxGroup` — `n_threads`, the
+  leader's TGID, the shared image/heap/brk/mmap/stack bounds, and up to eight
+  TIDs — while the Linux `EnvCkptTask` still owns the pages once. The v3
+  payload header adds `n_threads` and indexes an `EnvPayloadThread` array after
+  the task descriptors. Each entry carries the complete 20-word context, the
+  six argument registers, `fs_base`, both cursors, `clear_child_tid`, the
+  captured `CapParkCtx` frame, the expected forwarded reply number, TID, clone
+  flags, and the captured sidecar channel handles (the child slots are reserved).
+  A healthy group of one to
+  eight members is capturable; `EP_REFUSE_THREADS` remains only for a half-torn
+  group (zero members, a live/refs disagreement, more members than the array).
+  Capture records the group itself through `env_payload_refresh_records()`
+  before `persist_environments()` writes the record array; without that pass the
+  first checkpoint would persist an empty group.
+  Restore recreates the N-1 siblings with
+  `proc_create_linux_thread_restore()`/`cap_linux_restore_thread()` as HELD
+  tasks sharing the leader's PML4, before the pour. The leader's channel pair
+  is the fresh create's pair (verified against the captured sidecar slots), and
+  each sibling gets a newly minted pair that must land on the captured sidecar
+  slots; a mismatch refuses with `EP_REFUSE_CHANNEL` rather than pouring a
+  restored sidecar table that names a channel this boot did not mint. Parked
+  threads are re-armed from the captured `CapParkCtx`, `park_num` and
+  `park_syscall=SYS_LINUX_TRAP_RESUME`; `waiting_chan` is this boot's channel.
+  The restored sidecar's boot-time wait set predates the siblings, so the
+  restore wakes it on an unrelated receive channel (console/ramdisk) to rebuild
+  `append_wait`; it must not wake a task channel, because that would resume a
+  parked forward before its reply exists. All tasks are released together by
+  group. A restored park also gets `kernel_rsp = syscall_stack_top` — a parked
+  descriptor has neither a saved kernel frame nor a ring3 frame until its first
+  wake, and `process_find_current()` must resolve it when `cap_recv_resume`
+  re-runs `do_syscall` (the live bug this increment fixed).
   The live half is `tests/m4_ckpt_probe_check.sh`. It builds the gate profile
   with `E3_INIT_FEATURES=e3_envs,e7_gate,m4_ckpt_probe M4_CKPT_PROBE=1`, which
-  swaps the E7 firstuser for `fixtures/m4_ckpt_probe.S`: the parent clones a
-  real thread, the child's `write(1)` must be answered before the parent
-  publishes `M4.6-CKPT-READY`, and both contexts then spin. The harness creates
-  partition 1 / environment 1, waits for `M4.6-THREAD-OK` and
-  `M4.6-CKPT-READY`, and POSTs `/api/checkpoint`. Observed on 2026-11-14:
-  checkpoint answered `{"status":0,"seq":1,"count":1}`; the serial log carried
-  `capture refused (EP_REFUSE_THREADS) ... Linux task 2 'm4.ckpt.probe.0' has 2
-  live thread(s) and 2 address-space ref(s)`; there was no
-  `captured partition=1 index=1` line and no
-  `capture: task ... m4.ckpt.probe.0` line, so no payload for the group was
-  written; the host test also proves a refused re-capture drops a previous
-  single-thread directory entry. The next increment is the record v2 / payload v3 shape with
-  that group entry and thread array; only then can restore recreate N held
-  tasks and release them together. The runtime wall is unchanged.
+  swaps the E7 firstuser for `fixtures/m4_ckpt_probe.S`: the child writes
+  `M4.6-THREAD-OK`, sets READY and parks in an untimed private FUTEX_WAIT; the
+  parent writes `M4.6-CKPT-READY` and parks in a 30-second private FUTEX_WAIT.
+  The harness checkpoints only after both sidecars log `wait (futex)`, powers
+  off, reboots, and POSTs `/api/env/restore`. Observed on 2026-11-15:
+  boot 1 answered `{"status":0,"seq":1,"count":1}` and logged
+  `linux group 'm4.ckpt.probe.0' threads=2 tids=105..106 forms=1/1` plus
+  `capture: task 2 ... form=1`; boot 2 answered `payloads=1, payload_skips=0`,
+  logged `restored group ... 2 held task(s)`, restored both threads PARKED on
+  channels 14/15, and printed `M4.6-FUTEX-PARENT-WAKE`, `M4.6-FUTEX-WOKE`, and
+  `M4.6-RESTORED-OK`. The E7 live gate was rerun on the same build and passed
+  B1–B7 and D1–D2 (`payloads=1, payload_skips=0`; no fault; exit_group swept
+  the resumed tenant). The host payload suite is 103/103, including a focused
+  `EP_REFUSE_CHANNEL` case where the fresh sidecar pair lands on different
+  slots than the capture recorded: the restore refuses before the first page
+  moves. The runtime wall is
+  unchanged.
 - **M4.7 — The runtime gate.** A static Go candidate (or threaded Rust)
   creates threads, joins them, shares a heap and fd, and survives the
   checkpoint/restore cycle. Only this increment may remove the M4 wall from

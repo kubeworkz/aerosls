@@ -91,18 +91,20 @@ struct EnvCkptRecord;
  * refused as identity in env_ckpt.h); it does not snapshot anything outside
  * the environment's own tasks (the two sidecars and, E7 increment 20, their
  * Linux tenant — no kernel state, that is checkpoint_mgr's sixteen regions);
- * it does not carry a parked Linux task's queued request (B9: the gate's
- * restorable form is USER); and it does not claim cross-node restore (P3).
+ * it carries a parked Linux task's captured park frame and expected reply
+ * number (the queued request itself is the restored sidecar's own state); and
+ * it does not claim cross-node restore (P3).
  *
- * M4.6 increment 1: this blob has ONE task slot for the Linux tenant, not a
- * shared-address-space entry plus N per-thread entries. A capture therefore
- * refuses (EP_REFUSE_THREADS) any Linux task whose live group is not exactly
- * one member with one address-space reference, rather than writing a payload
- * that a replay would restore as a lone leader. A half-torn group (the two
- * counters disagree, or there is no live member) is refused for the same
- * reason. The refusal is the honest boundary until the record and payload
- * carry the thread group (M4.6's next increment), and it is deliberately not
- * an M4.6 landing claim.
+ * M4.6 v3: one Linux EnvCkptTask owns the group's shared pages, and the
+ * header's n_threads indexes `EnvPayloadThread` entries after the task
+ * descriptors. A healthy group of one to ENV_PAYLOAD_MAX_THREADS members is
+ * captured; EP_REFUSE_THREADS is reserved for a half-torn group (zero live
+ * members, a live/refs disagreement, or more members than the array). A
+ * parked member carries its CapParkCtx frame, park_syscall sentinel and
+ * park_num, so restore can re-arm it on this boot's channel and let the
+ * restored sidecar queue own the wake. A restored sidecar table names the
+ * captured channel handles, so a fresh pair at different slots refuses with
+ * EP_REFUSE_CHANNEL instead of resuming a task nobody can answer.
  */
 
 /* Directory + blob format. Bumped by the WRITER whenever the layout
@@ -112,8 +114,12 @@ struct EnvCkptRecord;
  * (12 -> 16 bytes per entry, EP_PAGE_PERM_* below) and EnvPayloadTask
  * carries the Linux task's full context, fs_base, cursors and page range.
  * A v1 blob is refused, not misread: the reader's layout walk would place
- * every page entry 4 bytes early and pour the wrong frame's bytes. */
-#define ENV_PAYLOAD_REC_VERSION 2u
+ * every page entry 4 bytes early and pour the wrong frame's bytes.
+ * v3 (M4.6): the header adds n_threads and the index zone adds N
+ * EnvPayloadThread entries after the task descriptors. A v2 blob is refused
+ * for the same reason: its data offset is one thread array short. */
+#define ENV_PAYLOAD_REC_VERSION 3u
+#define ENV_PAYLOAD_MAX_THREADS  8u   /* mirrors ENV_CKPT_MAX_THREADS */
 #define ENV_PAYLOAD_DIR_MAGIC   0x534C53504C4F4131ULL  /* "SLSPLOA1" */
 #define ENV_PAYLOAD_BLOB_MAGIC  0x534C5350424C4F31ULL  /* "SLSPBLO1" */
 
@@ -189,12 +195,14 @@ struct EnvCkptRecord;
 #define EP_REFUSE_FORM       14  /* a=task index, b=form; a Linux task whose captured form this blob cannot resume (parked/queued) */
 #define EP_REFUSE_SHAPE      15  /* a=task index; a captured task's kind is not what its slot claims (Linux vs sidecar) */
 #define EP_REFUSE_THREADS    16  /* a=task index, b=live group members; M4.6's
-                                  * N-thread shape is not representable yet, so
-                                  * capture refuses instead of saving only the
-                                  * leader. Exactly one live member AND one
-                                  * address-space ref is the single-thread shape
-                                  * this blob can restore; the serial line also
-                                  * reports the ref count. */
+                                  * live group is half-torn (zero members, more
+                                  * members than the payload can carry, or a
+                                  * live/refs disagreement), so the capture
+                                  * refuses instead of flattening it. A healthy
+                                  * N-member group is representable by v3. */
+#define EP_REFUSE_CHANNEL    17  /* a=task index, b=thread index; a recreated
+                                  * thread's channel handles are not the ones
+                                  * the captured sidecar table names. */
 
 struct EnvPayloadRefusal {
     uint32_t code;
@@ -240,7 +248,7 @@ struct EnvPayloadHead {
     uint32_t n_pages;
     uint32_t console_len;
     uint32_t crc32;         /* over every byte after the head, in write order */
-    uint32_t _pad;
+    uint32_t n_threads;     /* v3: N per-thread contexts in the index zone */
 };
 
 struct EnvPayloadRegion {   /* the captured placement, for the placement rule */
@@ -286,6 +294,35 @@ struct EnvPayloadTask {
     uint64_t image_hi;
 };
 
+/* v3: one context in the Linux group. The leader's copy mirrors the Linux
+ * half of EnvPayloadTask (kept for the E7 path and cross-checked on restore);
+ * siblings exist only here. `park_num` is the expected reply number a parked
+ * forwarded syscall re-runs, and the captured sidecar handles name the channel
+ * the restored table will use. `child_r/child_w` are reserved (the fresh
+ * create's returned endpoints); the sidecar slots are what the comparison
+ * checks, so a restored table never names a channel this boot did not mint. */
+struct EnvPayloadThread {
+    char     name[24];          /* mirrors ENV_CKPT_NAME_LEN */
+    uint64_t linux_regs[20];    /* TaskContext, for USER/ENTRY */
+    uint64_t linux_args[6];     /* rdi, rsi, rdx, r10, r8, r9 */
+    uint64_t fs_base;
+    uint64_t user_rip;
+    uint64_t user_rsp;
+    uint64_t clear_child_tid;
+    uint64_t park[9];           /* CapParkCtx order, for PARKED */
+    uint64_t park_num;          /* expected reply number (SYS_LINUX_TRAP_RESUME) */
+    uint32_t tid;               /* Linux TID at the capture */
+    uint32_t flags;             /* clone flags needed to recreate the context */
+    uint32_t park_syscall;
+    uint8_t  form;
+    uint8_t  is_leader;
+    uint16_t sidecar_r;
+    uint16_t sidecar_w;
+    uint16_t child_r;
+    uint16_t child_w;
+    uint32_t _pad;
+};
+
 /* ─── Public API ────────────────────────────────────────────────────────────*/
 
 /* Capture every live record's payload into its band slot and write the
@@ -296,6 +333,12 @@ struct EnvPayloadTask {
  * logged and leaves that entry invalid (the record still lands — a replay
  * without a payload is an empty environment, not a failed checkpoint). */
 uint32_t env_payload_capture_all(void);
+
+/* M4.6: fill each record's shared-address-space entry from the live group
+ * before persist_environments() writes the record array. The payload capture
+ * runs after that write, so without this refresh the first checkpoint would
+ * persist a group the capture had just proven. */
+void env_payload_refresh_records(void);
 
 /* The wait's two bounds, in timer ticks (timer.h: ~100 Hz). EP_WAIT_TICKS is
  * the STALL window — it restarts on every observed bit of progress, so it

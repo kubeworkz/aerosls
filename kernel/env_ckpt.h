@@ -49,7 +49,7 @@
  * as the writing build saw it, which is the field that catches a same-version
  * rebuild with a different compiler/packing. All three are checked on adopt. */
 #define ENV_CKPT_REC_MAGIC    0x534C53454E564B31ULL   /* "SLSENVK1" */
-#define ENV_CKPT_REC_VERSION  1u
+#define ENV_CKPT_REC_VERSION  2u
 
 /* Environments per node in the first cut. v0.2 §8 sizes the node at four
  * environments; eight is the headroom, and the whole array must stay inside
@@ -61,6 +61,7 @@
 #define ENV_CKPT_MAX_TASKS    4u    /* the two sidecars, E7's Linux tenant (increment
                                      * 20), and one spare slot */
 #define ENV_CKPT_MAX_CHANS    4u    /* init's messenger endpoints */
+#define ENV_CKPT_MAX_THREADS  8u    /* M4.6: one shared address space, N contexts */
 
 /* Region kinds — the three cap regions E4 charges to the target partition.
  * Named rather than positional, because a restore that reattaches the POSIX
@@ -104,6 +105,27 @@ struct EnvCkptTask {
     uint64_t stack_top;
 };
 
+/* M4.6: the shared-address-space half of one Linux thread group. The group's
+ * pages are carried once by the Linux EnvCkptTask slot; this entry names the
+ * N execution contexts that share them. `tids` are the Linux-visible thread
+ * ids captured from the live group (leader first), and the address-space
+ * fields are the leader's own — every member shares exactly these ledgers.
+ * A zero n_threads is the pre-spawn/unpopulated shape; the capture fills it
+ * before the record is written, and a restored group must have N >= 1. */
+struct EnvCkptLinuxGroup {
+    uint32_t n_threads;
+    uint32_t tgid;          /* the leader's Linux TID (getpid's answer) */
+    uint64_t image_lo;
+    uint64_t image_hi;
+    uint64_t heap_base;
+    uint64_t heap_limit;
+    uint64_t brk_cur;
+    uint64_t mmap_top;
+    uint64_t stack_bottom;
+    uint64_t stack_top;
+    uint32_t tids[ENV_CKPT_MAX_THREADS];  /* leader first, then siblings */
+};
+
 struct EnvCkptRecord {
     uint64_t magic;
     uint32_t version;
@@ -125,6 +147,7 @@ struct EnvCkptRecord {
     uint32_t _pad;
     struct EnvCkptRegion regions[ENV_CKPT_MAX_REGIONS];
     struct EnvCkptTask   tasks[ENV_CKPT_MAX_TASKS];
+    struct EnvCkptLinuxGroup linux_group;   /* M4.6: shared address space + N ids */
     /* Deliberately absent: pids. They are not stable across a boot and are
      * not identity — the E5 teardown already resolves pids by name for
      * exactly this reason, and v0.2 §4 makes it an assertable property that a
@@ -202,6 +225,7 @@ struct EnvCkptRegister {
 #define ENV_CKPT_REFUSE_NO_PARTITION 14  /* a=record index; the partition it names is gone */
 #define ENV_CKPT_REFUSE_IDENTITY     15  /* a=record index; the create produced a different environment */
 #define ENV_CKPT_REFUSE_CREATE       16  /* a=record index; b=the ENV_* status or rc the create answered */
+#define ENV_CKPT_REFUSE_THREADS      17  /* a=record index; a Linux group count out of range */
 
 struct EnvCkptRefusal {
     uint32_t code;

@@ -35,7 +35,7 @@
  */
 #include "env_payload.h"
 #include "env_ckpt.h"
-#include "linux_threads.h"   /* M4.6 increment 1: the live group count a capture must not flatten */
+#include "linux_threads.h"   /* M4.6: the live group count and members a capture must not flatten */
 #include "env_console.h"
 #include "persist.h"
 #include "process.h"
@@ -191,7 +191,8 @@ void env_payload_refusal_text(const struct EnvPayloadRefusal* r,
     case EP_REFUSE_PERM:       t = "a captured page's live permissions are not the captured ones"; break;
     case EP_REFUSE_FORM:       t = "the Linux task was captured parked (queued state this blob does not carry)"; break;
     case EP_REFUSE_SHAPE:      t = "a captured task's kind does not match the slot it was filed under"; break;
-    case EP_REFUSE_THREADS:    t = "the Linux thread group is not one healthy member; N threads cannot be restored"; break;
+    case EP_REFUSE_THREADS:    t = "the Linux thread group is half-torn or larger than the payload can carry"; break;
+    case EP_REFUSE_CHANNEL:    t = "a recreated thread's channels are not the ones the captured sidecar table names"; break;
     default:                   t = "unknown payload refusal"; break;
     }
     uint32_t i = 0;
@@ -469,6 +470,173 @@ static struct ProcessDescriptor* ep_find_proc(const char* name) {
     return 0;
 }
 
+static int ep_name_eq(const char* a, const char* b) {
+    if (!a || !b) return 0;
+    for (uint32_t i = 0; i < ENV_CKPT_NAME_LEN; i++) {
+        if (a[i] != b[i]) return 0;
+        if (a[i] == '\0') return 1;
+    }
+    return 1;
+}
+
+/* M4.6: the live members of one Linux group, leader first. A group is
+ * confined to one partition and one cr3; a member that disagrees on either
+ * is a half-torn group the capture must not flatten. */
+static uint32_t ep_group_members(uint32_t tgid, uint32_t leader_pid,
+                                 struct ProcessDescriptor** out, uint32_t cap) {
+    uint32_t n = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < PROC_MAX && n < cap; i++) {
+            struct ProcessDescriptor* pd = &proc_table[i];
+            if (!pd->active || pd->linux_tgid != tgid) continue;
+            if (pass == 0 && pd->pid != leader_pid) continue;
+            if (pass == 1 && pd->pid == leader_pid) continue;
+            out[n++] = pd;
+        }
+    }
+    return n;
+}
+
+static void ep_capture_thread(struct EnvPayloadThread* th,
+                              const struct ProcessDescriptor* pd,
+                              uint32_t sidecar_pid, int is_leader) {
+    ep_memset(th, 0, (uint32_t)sizeof(*th));
+    uint32_t n = 0;
+    while (pd->name[n] && n + 1 < ENV_CKPT_NAME_LEN) {
+        th->name[n] = pd->name[n];
+        n++;
+    }
+    th->name[n] = '\0';
+    th->tid = pd->linux_tid ? pd->linux_tid : pd->pid;
+    th->is_leader = (uint8_t)(is_leader ? 1 : 0);
+    th->clear_child_tid = pd->linux_clear_child_tid;
+    th->fs_base = pd->fs_base;
+    th->flags = (uint32_t)(LINUX_CLONE_VM | LINUX_CLONE_SIGHAND |
+                           LINUX_CLONE_THREAD);
+    if (pd->linux_clear_child_tid)
+        th->flags |= (uint32_t)LINUX_CLONE_CHILD_CLEARTID;
+    th->sidecar_r = th->sidecar_w = th->child_r = th->child_w = CAP_NONE;
+    if (sidecar_pid) {
+        uint16_t r = CAP_NONE, w = CAP_NONE;
+        if (cap_linux_thread_chans(sidecar_pid, pd->pid, &r, &w, 0) == 0) {
+            th->sidecar_r = r;
+            th->sidecar_w = w;
+        }
+    }
+    if (pd->gate_stopped) {
+        const uint64_t* c = (const uint64_t*)&pd->ring3_ctx;
+        th->form = ENV_PAYLOAD_FORM_ENTRY;
+        for (uint32_t r = 0; r < 20; r++) th->linux_regs[r] = c[r];
+        th->linux_args[0] = c[9]; th->linux_args[1] = c[10];
+        th->linux_args[2] = c[11]; th->linux_args[3] = c[5];
+        th->linux_args[4] = c[7]; th->linux_args[5] = c[6];
+        th->user_rip = pd->user_rip;
+        th->user_rsp = pd->user_rsp;
+    } else if (ep_proc_parked(pd) &&
+               pd->park_syscall == SYS_LINUX_TRAP_RESUME) {
+        th->form = ENV_PAYLOAD_FORM_PARKED;
+        th->park_syscall = pd->park_syscall;
+        th->park_num = pd->park_req;
+        th->park[0] = pd->park_ctx.r11; th->park[1] = pd->park_ctx.rcx;
+        th->park[2] = pd->park_ctx.r15; th->park[3] = pd->park_ctx.r14;
+        th->park[4] = pd->park_ctx.r13; th->park[5] = pd->park_ctx.r12;
+        th->park[6] = pd->park_ctx.rbx; th->park[7] = pd->park_ctx.rbp;
+        th->park[8] = pd->park_ctx.user_rsp;
+        th->user_rip = pd->user_rip;
+        th->user_rsp = pd->user_rsp;
+        for (uint32_t a = 0; a < 6; a++)
+            th->linux_args[a] = pd->park_ctx.linux_args[a];
+    } else if (pd->has_ring3_ctx) {
+        const uint64_t* c = (const uint64_t*)&pd->ring3_ctx;
+        th->form = ENV_PAYLOAD_FORM_USER;
+        for (uint32_t r = 0; r < 20; r++) th->linux_regs[r] = c[r];
+        th->linux_args[0] = c[9]; th->linux_args[1] = c[10];
+        th->linux_args[2] = c[11]; th->linux_args[3] = c[5];
+        th->linux_args[4] = c[7]; th->linux_args[5] = c[6];
+        th->user_rip = c[15];
+        th->user_rsp = c[18];
+    } else {
+        th->form = ENV_PAYLOAD_FORM_RUNNING;
+    }
+}
+
+static struct EnvPayloadThread ep_threads[ENV_PAYLOAD_MAX_THREADS];
+
+/* M4.6: the leader's channel pair is normally minted by the sidecar's own
+ * first-user spawn. A replay's create holds the tenant before that spawn can
+ * run, so the pair may not exist yet. Mint it here, BEFORE the sibling pairs:
+ * the fresh sidecar's table is then at the same allocation point as the
+ * captured table was, and the two captured sidecar slots line up. A mismatch
+ * is refused by name rather than re-pointing the restored Rust task table. */
+static int ep_ensure_leader_chans(uint32_t sidecar_pid,
+                                  struct ProcessDescriptor* leader,
+                                  const struct EnvPayloadThread* th) {
+    uint16_t r = CAP_NONE, w = CAP_NONE;
+    uint32_t chan_id = 0;
+    if (cap_linux_thread_chans(sidecar_pid, leader->pid, &r, &w, &chan_id) == 0) {
+        /* The restored Rust task table names the CAPTURED sidecar slots. A
+         * fresh pair at other slots is not that table's channel. */
+        if (th->sidecar_r != CAP_NONE &&
+            (r != th->sidecar_r || w != th->sidecar_w)) {
+            kernel_serial_printf(
+                "[ENV_PAYLOAD] leader channel mismatch for '%s': fresh "
+                "sidecar=%u/%u captured=%u/%u\n",
+                th->name, (unsigned)r, (unsigned)w,
+                (unsigned)th->sidecar_r, (unsigned)th->sidecar_w);
+            return -1;
+        }
+        return 0;
+    }
+    uint16_t sr = CAP_NONE, sw = CAP_NONE, cr = CAP_NONE, cw = CAP_NONE;
+    if (cap_chan_create(sidecar_pid, leader->pid, &sr, &sw, &cr, &cw) < 0)
+        return -1;
+    (void)cap_linux_thread_chans(sidecar_pid, leader->pid, &r, &w, &chan_id);
+    kernel_serial_printf(
+        "[ENV_PAYLOAD] leader channel minted for '%s': pid=%u sidecar=%u/%u "
+        "child=%u/%u chan=%u (captured sidecar=%u/%u)\n",
+        th->name, (unsigned)leader->pid, (unsigned)sr, (unsigned)sw,
+        (unsigned)cr, (unsigned)cw, (unsigned)chan_id,
+        (unsigned)th->sidecar_r, (unsigned)th->sidecar_w);
+    if (sr != th->sidecar_r || sw != th->sidecar_w) return -1;
+    return 0;
+}
+
+/* M4.6: refresh one record's shared-address-space entry from the live group.
+ * Returns the live member count (0 when the named Linux task has no process
+ * or no group). */
+static uint32_t ep_refresh_record_group(struct EnvCkptRecord* rec) {
+    if (!rec || rec->magic != ENV_CKPT_REC_MAGIC) return 0;
+    for (uint32_t t = 0; t < rec->n_tasks && t < ENV_CKPT_MAX_TASKS; t++) {
+        if (rec->tasks[t].kind != ENV_CKPT_TASK_LINUX) continue;
+        struct ProcessDescriptor* leader = ep_find_proc(rec->tasks[t].name);
+        if (!leader || !leader->linux_tgid) return 0;
+        struct ProcessDescriptor* members[ENV_PAYLOAD_MAX_THREADS];
+        uint32_t n = ep_group_members(leader->linux_tgid, leader->pid, members,
+                                      ENV_PAYLOAD_MAX_THREADS);
+        if (n == 0 || n > ENV_PAYLOAD_MAX_THREADS) return n;
+        rec->linux_group.n_threads = n;
+        rec->linux_group.tgid = leader->linux_tid ? leader->linux_tid : leader->pid;
+        rec->linux_group.image_lo = leader->linux_image_lo;
+        rec->linux_group.image_hi = leader->linux_image_hi;
+        rec->linux_group.heap_base = leader->linux_heap_base;
+        rec->linux_group.heap_limit = leader->linux_heap_limit;
+        rec->linux_group.brk_cur = leader->linux_brk_cur;
+        rec->linux_group.mmap_top = leader->linux_mmap_top;
+        rec->linux_group.stack_bottom = rec->tasks[t].stack_bottom;
+        rec->linux_group.stack_top = rec->tasks[t].stack_top;
+        for (uint32_t i = 0; i < n; i++)
+            rec->linux_group.tids[i] = members[i]->linux_tid ?
+                                       members[i]->linux_tid : members[i]->pid;
+        return n;
+    }
+    return 0;
+}
+
+void env_payload_refresh_records(void) {
+    for (uint32_t i = 0; i < env_ckpt_count; i++)
+        (void)ep_refresh_record_group(&env_ckpt_table[i]);
+}
+
 /* ─── The image-window list, shared with the migrate path (P3) ────────────
  * The canonical order both restore paths derive independently: the record's
  * sidecar tasks in record order (E7's Linux tasks skipped, exactly as the
@@ -550,9 +718,10 @@ int env_payload_resolve_vaddr(uint64_t cr3, uint64_t vaddr,
 /* The index-zone size the restore must reproduce exactly (it places the
  * data zone): regions + tasks + per-task blocks + console. */
 static uint32_t ep_index_bytes(uint32_t n_tasks, const uint32_t* task_npages,
-                               uint32_t console_len) {
+                               uint32_t console_len, uint32_t n_threads) {
     uint32_t n = 3u * (uint32_t)sizeof(struct EnvPayloadRegion);
     n += n_tasks * (uint32_t)sizeof(struct EnvPayloadTask);
+    n += n_threads * (uint32_t)sizeof(struct EnvPayloadThread);
     for (uint32_t t = 0; t < n_tasks; t++)
         n += 4u + task_npages[t] * EP_PAGE_ENTRY_BYTES;
     n += console_len;
@@ -616,38 +785,76 @@ uint32_t env_payload_capture_all(void) {
             continue;
         }
 
-        /* M4.6 increment 1: one EnvCkptTask slot is one Linux task, not a
-         * shared address space plus N thread contexts. Capturing a group
-         * with a live sibling would save only the leader and a replay would
-         * resume a group that looks valid but lost its other threads; the
-         * group's parked futex waiter is exactly the state the design says
-         * must never be silently dropped. Refuse the whole environment by
-         * name instead. A Linux task with no group id is the legacy
-         * single-owner shape and is still capturable; live==0 for a named
-         * group is a half-torn group and is refused for the same reason.
-         * The address-space reference count is checked with the live count:
-         * the two move together in a healthy group, so a disagreement is a
-         * half-torn group the capture must not flatten either. */
+        /* M4.6: one EnvCkptTask slot is the Linux GROUP. Its shared pages are
+         * walked once through the leader's cr3; the N execution contexts are
+         * carried by the v3 thread array. A group that disagrees with its own
+         * counters is still refused by name — that is a half-torn group, not
+         * an N-thread one. */
         int group_refused = 0;
+        uint32_t n_threads = 0;
+        struct ProcessDescriptor* sidecar_pd = 0;
         for (uint32_t t = 0; t < np; t++) {
-            if (rec->tasks[t].kind != ENV_CKPT_TASK_LINUX) continue;
-            if (!pds[t]->linux_tgid) continue;
+            if (rec->tasks[t].kind != ENV_CKPT_TASK_LINUX) {
+                if (!sidecar_pd) sidecar_pd = (struct ProcessDescriptor*)pds[t];
+                continue;
+            }
+            if (!pds[t]->linux_tgid) { n_threads = 1; continue; }
             uint32_t live = linux_thread_group_live(pds[t]->linux_tgid);
             uint32_t refs = linux_thread_group_refs(pds[t]->linux_tgid);
-            if (live == 1u && refs == 1u) continue;
+            if (live == 0 || live > ENV_PAYLOAD_MAX_THREADS || refs != live) {
             ep_refuse(EP_REFUSE_THREADS, t, live);
             kernel_serial_printf(
                 "[ENV_PAYLOAD] capture refused (EP_REFUSE_THREADS) for partition=%u "
                 "index=%u: Linux task %u '%s' has %u live thread(s) and %u "
-                "address-space ref(s); M4.6 cannot restore a thread group yet, "
-                "so it is refused rather than saved as only its leader\n",
+                "address-space ref(s); a half-torn group is not restorable\n",
                 (unsigned)rec->partition_id, (unsigned)rec->index,
                 (unsigned)t, rec->tasks[t].name, (unsigned)live,
                 (unsigned)refs);
             group_refused = 1;
             break;
+            }
+            n_threads = live;
         }
         if (group_refused) continue;
+
+        if (n_threads) {
+            struct ProcessDescriptor* leader = (struct ProcessDescriptor*)pds[0];
+            for (uint32_t t = 0; t < np; t++)
+                if (rec->tasks[t].kind == ENV_CKPT_TASK_LINUX) {
+                    leader = (struct ProcessDescriptor*)pds[t];
+                    break;
+                }
+            struct ProcessDescriptor* members[ENV_PAYLOAD_MAX_THREADS];
+            uint32_t got = leader->linux_tgid
+                ? ep_group_members(leader->linux_tgid, leader->pid, members,
+                                   ENV_PAYLOAD_MAX_THREADS)
+                : 0;
+            if (got == 0) { members[0] = leader; got = 1; }
+            if (got != n_threads || got > ENV_PAYLOAD_MAX_THREADS) {
+                ep_refuse(EP_REFUSE_THREADS, 0, got);
+                kernel_serial_printf(
+                    "[ENV_PAYLOAD] capture refused (EP_REFUSE_THREADS): the "
+                    "group reports %u member(s), the descriptor scan found %u\n",
+                    (unsigned)n_threads, (unsigned)got);
+                continue;
+            }
+            for (uint32_t i = 0; i < got; i++)
+                ep_capture_thread(&ep_threads[i], members[i],
+                                  leader->parent_pid
+                                      ? leader->parent_pid
+                                      : (sidecar_pd ? sidecar_pd->pid : 0),
+                                  i == 0);
+            kernel_serial_printf(
+                "[ENV_PAYLOAD] linux group '%s' threads=%u tids=%u..%u "
+                "forms=%u/%u\n", leader->name, (unsigned)got,
+                (unsigned)ep_threads[0].tid,
+                (unsigned)ep_threads[got - 1].tid,
+                (unsigned)ep_threads[0].form,
+                (unsigned)ep_threads[got - 1].form);
+            /* Keep the record's shared-address-space entry in step with the
+             * same live group the payload just captured. */
+            (void)ep_refresh_record_group((struct EnvCkptRecord*)rec);
+        }
 
         /* Collect the pages: image/stack window + private regions, per
          * task. Shared-arena and lazily-granted frames are deliberately
@@ -720,7 +927,8 @@ uint32_t env_payload_capture_all(void) {
                                  ep_console, EP_CONSOLE_MAX, &console_len) != 1)
             console_len = 0;
 
-        uint32_t index_bytes = ep_index_bytes(np, task_npages, console_len);
+        uint32_t index_bytes = ep_index_bytes(np, task_npages, console_len,
+                                              n_threads);
         if (index_bytes > EP_STAGE_BYTES) {
             kernel_serial_printf(
                 "[ENV_PAYLOAD] capture refused for partition=%u index=%u: "
@@ -937,6 +1145,13 @@ uint32_t env_payload_capture_all(void) {
             ep_copy(ep_stage + used, &tk, (uint32_t)sizeof(tk));
             used += (uint32_t)sizeof(tk);
         }
+        /* v3: the N thread contexts follow the task descriptors, before the
+         * per-task page blocks. */
+        for (uint32_t th = 0; th < n_threads && th < ENV_PAYLOAD_MAX_THREADS; th++) {
+            ep_copy(ep_stage + used, &ep_threads[th],
+                    (uint32_t)sizeof(struct EnvPayloadThread));
+            used += (uint32_t)sizeof(struct EnvPayloadThread);
+        }
         for (uint32_t t = 0; t < np; t++) {
             uint32_t n = task_npages[t];
             ep_stage[used + 0] = (uint8_t)(n & 0xff);
@@ -990,6 +1205,7 @@ uint32_t env_payload_capture_all(void) {
         head.n_tasks = np;
         head.n_pages = n_pages;
         head.console_len = console_len;
+        head.n_threads = n_threads;
         head.crc32 = crc_index;
         ep_memset(ep_page, 0, 4096);
         ep_copy(ep_page, &head, (uint32_t)sizeof(head));
@@ -1273,10 +1489,14 @@ int env_payload_wait_parked(const struct EnvCkptRecord* rec) {
  * through the caller's array (used by the restore's later passes). Returns
  * 0 when the layout does not self-consistently fit. */
 static int ep_index_blocks(uint32_t n_tasks, uint32_t n_pages,
+                           uint32_t n_threads,
                            uint32_t* out_block_off, uint32_t* out_console_off,
-                           uint32_t* out_total) {
+                           uint32_t* out_total, uint32_t* out_thread_off) {
     uint32_t u = 3u * (uint32_t)sizeof(struct EnvPayloadRegion) +
                  n_tasks * (uint32_t)sizeof(struct EnvPayloadTask);
+    if (out_thread_off) *out_thread_off = u;
+    if (n_threads > ENV_PAYLOAD_MAX_THREADS) return 0;
+    u += n_threads * (uint32_t)sizeof(struct EnvPayloadThread);
     if (u > EP_STAGE_BYTES) return 0;
     uint32_t seen = 0;
     for (uint32_t t = 0; t < n_tasks; t++) {
@@ -1343,6 +1563,7 @@ int env_payload_restore(uint32_t partition, uint32_t index,
     if (seq != want_seq) { ep_refuse(EP_REFUSE_SEQ, 0, 0); return EP_REFUSE_SEQ; }
     if (head.n_pages == 0 || head.n_pages > EP_MAX_PAGES ||
         head.n_tasks == 0 || head.n_tasks > EP_MAX_TASKS ||
+        head.n_threads > ENV_PAYLOAD_MAX_THREADS ||
         head.console_len > EP_CONSOLE_MAX) {
         ep_refuse(EP_REFUSE_FORMAT, 2, head.n_pages);
         return EP_REFUSE_FORMAT;
@@ -1352,7 +1573,7 @@ int env_payload_restore(uint32_t partition, uint32_t index,
      * The zone size is derived from the entries themselves, so the read is
      * bounded by the same ceiling the capture was. */
     uint32_t block_off[EP_MAX_TASKS];
-    uint32_t console_off = 0, total = 0;
+    uint32_t console_off = 0, total = 0, thread_off = 0;
     /* First frame always; the rest follow the layout walk. */
     if (nvme_read_sync(slot_lba + 8ull, ep_stage) != 0) {
         ep_refuse(EP_REFUSE_IO, 1, 0);
@@ -1363,8 +1584,8 @@ int env_payload_restore(uint32_t partition, uint32_t index,
     {
         uint32_t max_frames = EP_STAGE_BYTES / 4096u;
         for (uint32_t f = 1; f < max_frames; f++) {
-            if (ep_index_blocks(head.n_tasks, head.n_pages, block_off,
-                                &console_off, &total) &&
+            if (ep_index_blocks(head.n_tasks, head.n_pages, head.n_threads,
+                                block_off, &console_off, &total, &thread_off) &&
                 total + head.console_len <= f * 4096u)
                 break;                            /* everything needed is in */
             if (f + 1u >= max_frames) {
@@ -1380,8 +1601,8 @@ int env_payload_restore(uint32_t partition, uint32_t index,
             ep_copy(ep_stage + f * 4096u, ep_page, 4096u);
         }
     }
-    if (!ep_index_blocks(head.n_tasks, head.n_pages, block_off,
-                         &console_off, &total) ||
+    if (!ep_index_blocks(head.n_tasks, head.n_pages, head.n_threads,
+                         block_off, &console_off, &total, &thread_off) ||
         total + head.console_len > EP_STAGE_BYTES) {
         ep_refuse(EP_REFUSE_FORMAT, 4, 0);
         return EP_REFUSE_FORMAT;
@@ -1428,6 +1649,40 @@ int env_payload_restore(uint32_t partition, uint32_t index,
      * the tenant is refused here, by name, rather than poured over). */
     struct ProcessDescriptor* pds[EP_MAX_TASKS];
     uint8_t task_kind[EP_MAX_TASKS];
+    uint32_t sidecar_pid = 0;
+    struct ProcessDescriptor* thread_pds[ENV_PAYLOAD_MAX_THREADS];
+    uint32_t thread_chan[ENV_PAYLOAD_MAX_THREADS];
+    uint32_t group_sidecar_pid = 0;
+    for (uint32_t i = 0; i < ENV_PAYLOAD_MAX_THREADS; i++) {
+        thread_pds[i] = 0;
+        thread_chan[i] = CAP_NONE;
+    }
+    /* v3: the N per-thread contexts are a contiguous block after the task
+     * descriptors. They are parsed once here and used by the create and the
+     * final install below. */
+    for (uint32_t i = 0; i < head.n_threads && i < ENV_PAYLOAD_MAX_THREADS; i++)
+        ep_copy(&ep_threads[i], ep_stage + thread_off +
+                i * (uint32_t)sizeof(struct EnvPayloadThread),
+                (uint32_t)sizeof(struct EnvPayloadThread));
+    if (head.n_threads > 0) {
+        int linux_tasks = 0;
+        for (uint32_t t = 0; t < head.n_tasks; t++) {
+            struct EnvPayloadTask tk;
+            ep_copy(&tk, ep_stage + 3u * (uint32_t)sizeof(struct EnvPayloadRegion) +
+                    t * (uint32_t)sizeof(struct EnvPayloadTask),
+                    (uint32_t)sizeof(struct EnvPayloadTask));
+            if (tk.kind == ENV_CKPT_TASK_LINUX) linux_tasks++;
+        }
+        if (linux_tasks != 1) {
+            ep_refuse(EP_REFUSE_THREADS, 0, head.n_threads);
+            return EP_REFUSE_THREADS;
+        }
+    }
+    uint32_t record_threads = cur->linux_group.n_threads;
+    if (record_threads && record_threads != head.n_threads) {
+        ep_refuse(EP_REFUSE_THREADS, 0, head.n_threads);
+        return EP_REFUSE_THREADS;
+    }
     {
         uint32_t u = 3u * (uint32_t)sizeof(struct EnvPayloadRegion);
         for (uint32_t t = 0; t < head.n_tasks; t++) {
@@ -1473,6 +1728,7 @@ int env_payload_restore(uint32_t partition, uint32_t index,
             struct ProcessDescriptor* pd = ep_find_proc(tk.name);
             if (!pd) { ep_refuse(EP_REFUSE_NO_PROCESS, t, 0); return EP_REFUSE_NO_PROCESS; }
             int is_linux = tk.kind == ENV_CKPT_TASK_LINUX;
+            if (!is_linux && !sidecar_pid) sidecar_pid = pd->pid;
             if (is_linux) {
                 /* E7 increment 21: two resumable forms, one install path.
                  * USER is a task the pause caught in ring 3; ENTRY is the
@@ -1482,15 +1738,20 @@ int env_payload_restore(uint32_t partition, uint32_t index,
                  * named refusal: a forwarded request is queued state this
                  * blob does not carry (B9). */
                 if (tk.form != ENV_PAYLOAD_FORM_USER &&
-                    tk.form != ENV_PAYLOAD_FORM_ENTRY) {
-                    /* PARKED is a queued request this blob does not carry;
-                     * RUNNING is a capture that never had a restorable
-                     * instant. Both are refused by their own name. */
-                    ep_refuse(tk.form == ENV_PAYLOAD_FORM_PARKED
-                                  ? EP_REFUSE_FORM : EP_REFUSE_RUNNING,
-                              t, tk.form);
-                    return tk.form == ENV_PAYLOAD_FORM_PARKED
-                               ? EP_REFUSE_FORM : EP_REFUSE_RUNNING;
+                    tk.form != ENV_PAYLOAD_FORM_ENTRY &&
+                    tk.form != ENV_PAYLOAD_FORM_PARKED) {
+                    ep_refuse(EP_REFUSE_RUNNING, t, tk.form);
+                    return EP_REFUSE_RUNNING;
+                }
+                if (head.n_threads > 0) {
+                    if (ep_threads[0].form != tk.form ||
+                        !ep_name_eq(ep_threads[0].name, tk.name)) {
+                        ep_refuse(EP_REFUSE_FORMAT, t, ep_threads[0].form);
+                        return EP_REFUSE_FORMAT;
+                    }
+                } else if (tk.form == ENV_PAYLOAD_FORM_PARKED) {
+                    ep_refuse(EP_REFUSE_FORM, t, tk.form);
+                    return EP_REFUSE_FORM;
                 }
                 /* E7 increment 21: the replay's create holds its Linux child
                  * (cap_linux_restore_arm), so it is PROC_HELD with no context
@@ -1633,6 +1894,88 @@ int env_payload_restore(uint32_t partition, uint32_t index,
                     return EP_REFUSE_PERM;
                 }
                 ep_scratch.dest[pi] = phys;
+            }
+        }
+    }
+
+    /* M4.6: recreate the N-1 sibling contexts as HELD tasks BEFORE the pour.
+     * Their pages are the leader's shared pages (one address space), so the
+     * destination validation above is complete for all of them; the create
+     * deliberately does not touch user memory. The leader is the task the
+     * replay's create held; its channel is this boot's own. */
+    if (head.n_threads > 0) {
+        struct ProcessDescriptor* leader_pd = 0;
+        uint32_t linux_slot = 0;
+        for (uint32_t t = 0; t < head.n_tasks; t++)
+            if (task_kind[t] == ENV_CKPT_TASK_LINUX) { leader_pd = pds[t]; linux_slot = t; break; }
+        if (!leader_pd) {
+            ep_refuse(EP_REFUSE_NO_PROCESS, linux_slot, 0);
+            return EP_REFUSE_NO_PROCESS;
+        }
+        /* The POSIX sidecar that owns the Linux group is the leader's
+         * parent. The first non-Linux task in the record is often the
+         * ramdisk driver, whose table has no tenant channels at all. */
+        uint32_t sc_pid = leader_pd->parent_pid ? leader_pd->parent_pid
+                                                : sidecar_pid;
+        group_sidecar_pid = sc_pid;
+        thread_pds[0] = leader_pd;
+        thread_chan[0] = CAP_NONE;
+        if (sc_pid && ep_threads[0].sidecar_r != CAP_NONE &&
+            ep_ensure_leader_chans(sc_pid, leader_pd, &ep_threads[0]) != 0) {
+            ep_refuse(EP_REFUSE_CHANNEL, linux_slot, 0);
+            return EP_REFUSE_CHANNEL;
+        }
+        if (sc_pid)
+            (void)cap_linux_thread_chans(sc_pid, leader_pd->pid, 0, 0,
+                                         &thread_chan[0]);
+        if (head.n_threads > 1 && !sc_pid) {
+            ep_refuse(EP_REFUSE_NO_PROCESS, linux_slot, 0);
+            return EP_REFUSE_NO_PROCESS;
+        }
+        for (uint32_t i = 1; i < head.n_threads; i++) {
+            struct CapLinuxRestoreThread req;
+            ep_memset(&req, 0, (uint32_t)sizeof(req));
+            req.leader_pid = leader_pd->pid;
+            req.sidecar_pid = sc_pid;
+            for (uint32_t k = 0; k < ENV_CKPT_NAME_LEN; k++)
+                req.name[k] = ep_threads[i].name[k];
+            req.tid = ep_threads[i].tid;
+            req.clear_child_tid = ep_threads[i].clear_child_tid;
+            req.want_sidecar_r = ep_threads[i].sidecar_r;
+            req.want_sidecar_w = ep_threads[i].sidecar_w;
+            req.want_child_r   = ep_threads[i].child_r;
+            req.want_child_w   = ep_threads[i].child_w;
+            int crc = cap_linux_restore_thread(&req);
+            if (crc != 0) {
+                ep_refuse(EP_REFUSE_CHANNEL, linux_slot, i);
+                kernel_serial_printf(
+                    "[ENV_PAYLOAD] restore refused the sibling '%s': "
+                    "cap_linux_restore_thread=%d (captured channels %u/%u "
+                    "%u/%u)\n",
+                    req.name, crc, (unsigned)req.want_sidecar_r,
+                    (unsigned)req.want_sidecar_w, (unsigned)req.want_child_r,
+                    (unsigned)req.want_child_w);
+                return EP_REFUSE_CHANNEL;
+            }
+            thread_pds[i] = ep_find_proc(req.name);
+            thread_chan[i] = req.chan_id;
+            if (!thread_pds[i]) {
+                ep_refuse(EP_REFUSE_NO_PROCESS, linux_slot, i);
+                return EP_REFUSE_NO_PROCESS;
+            }
+        }
+        kernel_serial_printf(
+            "[ENV_PAYLOAD] restored group for '%s': %u held task(s), "
+            "leader pid=%u\n", leader_pd->name, (unsigned)head.n_threads,
+            (unsigned)leader_pd->pid);
+        for (uint32_t i = 0; i < head.n_threads; i++) {
+            if (ep_threads[i].form != ENV_PAYLOAD_FORM_PARKED) continue;
+            if (thread_chan[i] == CAP_NONE) {
+                ep_refuse(EP_REFUSE_CHANNEL, linux_slot, i);
+                kernel_serial_printf(
+                    "[ENV_PAYLOAD] parked thread '%s' has no channel to wake "
+                    "on — refused before the pour\n", ep_threads[i].name);
+                return EP_REFUSE_CHANNEL;
             }
         }
     }
@@ -1830,6 +2173,80 @@ int env_payload_restore(uint32_t partition, uint32_t index,
             pd->user_rip          = tk.user_rip;
             pd->user_rsp          = tk.user_rsp;
         }
+    }
+
+    /* M4.6: install every captured context, leader included. A USER/ENTRY
+     * thread gets its ring3_ctx; a PARKED thread is re-armed as the kernel
+     * task a forwarded syscall parks: its captured entry frame, the expected
+     * reply number and THIS boot's channel id. The sidecar's restored memory
+     * already holds the matching FUTEX pending entry, so the wake is a normal
+     * sidecar reply — no special restore path. */
+    if (head.n_threads > 0) {
+        for (uint32_t i = 0; i < head.n_threads; i++) {
+            struct ProcessDescriptor* pd = thread_pds[i];
+            const struct EnvPayloadThread* th = &ep_threads[i];
+            if (!pd) continue;
+            pd->fs_base = th->fs_base;
+            pd->linux_clear_child_tid = th->clear_child_tid;
+            if (th->form == ENV_PAYLOAD_FORM_PARKED) {
+                pd->park_ctx.r11      = th->park[0];
+                pd->park_ctx.rcx      = th->park[1];
+                pd->park_ctx.r15      = th->park[2];
+                pd->park_ctx.r14      = th->park[3];
+                pd->park_ctx.r13      = th->park[4];
+                pd->park_ctx.r12      = th->park[5];
+                pd->park_ctx.rbx      = th->park[6];
+                pd->park_ctx.rbp      = th->park[7];
+                pd->park_ctx.user_rsp = th->park[8];
+                for (uint32_t a = 0; a < 6; a++)
+                    pd->park_ctx.linux_args[a] = th->linux_args[a];
+                pd->park_req     = th->park_num;
+                pd->park_syscall = th->park_syscall;
+                pd->waiting_chan = (uint16_t)thread_chan[i];
+                pd->waiting_chans[0] = (uint16_t)thread_chan[i];
+                pd->waiting_nchans = 1;
+                pd->waiting_deadline = 0;
+                pd->has_ring3_ctx = 0;
+                pd->resume_kernel = 0;
+                /* process_find_current() only calls a RUNNING descriptor
+                 * current when it has a kernel stack or a ring3 frame. A
+                 * restored park has neither until its first wake, and the
+                 * wake's cap_recv_resume re-runs do_syscall — which must
+                 * resolve this descriptor as the caller. Its fresh syscall
+                 * stack is exactly the kernel stack that resume will use. */
+                pd->kernel_rsp = pd->syscall_stack_top;
+                pd->state = PROC_BLOCKED;
+                pd->user_rip = th->user_rip;
+                pd->user_rsp = th->user_rsp;
+                kernel_serial_printf(
+                    "[ENV_PAYLOAD] thread '%s' restored PARKED on channel %u "
+                    "(expect num=%llu) — the sidecar's restored queue owns "
+                    "the wake\n", th->name, (unsigned)thread_chan[i],
+                    (unsigned long long)th->park_num);
+            } else {
+                uint64_t* c = (uint64_t*)&pd->ring3_ctx;
+                for (uint32_t r = 0; r < 20; r++) c[r] = th->linux_regs[r];
+                pd->has_ring3_ctx = 1;
+                pd->resume_kernel = 0;
+                pd->user_rip = th->user_rip;
+                pd->user_rsp = th->user_rsp;
+                pd->gate_profile = 0;
+            }
+        }
+        kernel_serial_printf(
+            "[ENV_PAYLOAD] group contexts installed: %u thread(s), "
+            "leader='%s' rip=0x%llx form=%u\n",
+            (unsigned)head.n_threads, ep_threads[0].name,
+            (unsigned long long)ep_threads[0].user_rip,
+            (unsigned)ep_threads[0].form);
+        /* The sidecar booted before the siblings existed and its wait set is
+         * therefore stale. Wake it on an unrelated receive channel so its
+         * entry loop rebuilds append_wait and starts polling the restored
+         * task channels; waking one of those here would resume a parked
+         * forward before its reply is in the queue. */
+        if (group_sidecar_pid)
+            (void)cap_wake_sidecar_channels(group_sidecar_pid, thread_chan,
+                                            head.n_threads);
     }
 
     if (out_pages) *out_pages = pages_poured;

@@ -3352,25 +3352,173 @@ static int cap_name_eq(const char* a, const char* b) {
 
 int cap_linux_restore_release(const char* name) {
     if (!name) return 0;
+    /* M4.6: the record names the leader; every held sibling shares its group.
+     * Release the WHOLE group, because a pour that failed after creating the
+     * siblings must not leave them frozen forever. */
+    uint32_t tgid = 0;
     for (int i = 0; i < PROC_MAX; i++) {
         if (!proc_table[i].active || !proc_table[i].restore_held) continue;
         if (!cap_name_eq(proc_table[i].name, name)) continue;
+        tgid = proc_table[i].linux_tgid;
+        break;
+    }
+    if (tgid == 0) return 0;
+    int released = 0;
+    for (int i = 0; i < PROC_MAX; i++) {
+        if (!proc_table[i].active || !proc_table[i].restore_held) continue;
+        if (proc_table[i].linux_tgid != tgid) continue;
         proc_table[i].restore_held = 0;
         /* HELD is the state the create left it in; a pour that succeeded
-         * has already stamped ring3_ctx, so the next schedule switch-in
-         * resumes at the captured rip — never _start. A pour that refused
-         * has not, and this releases the fresh spawn exactly as an ordinary
-         * create would (the named "empty replay" outcome). */
+         * has already stamped ring3_ctx (or a parked frame), so the next
+         * schedule resumes at the captured point — never _start. A blocked
+         * futex waiter keeps PROC_BLOCKED and is woken by its sidecar reply. */
         if (proc_table[i].state == PROC_HELD)
             proc_table[i].state = PROC_SUSPENDED;
         kernel_serial_printf(
             "[SIDECAR] PID %u '%s' released after the restore pour — first "
-            "instruction rip=0x%llx rsp=0x%llx\n",
+            "instruction rip=0x%llx rsp=0x%llx state=%u\n",
             proc_table[i].pid, proc_table[i].name,
             (unsigned long long)proc_table[i].user_rip,
-            (unsigned long long)proc_table[i].user_rsp);
-        return 1;
+            (unsigned long long)proc_table[i].user_rsp,
+            (unsigned)proc_table[i].state);
+        released++;
     }
+    return released;
+}
+
+/* M4.6: find the messenger pair whose ends are (sidecar_pid, child_pid). The
+ * sidecar's table names the two handles the captured LinuxTask record will
+ * use; the channel id is what the kernel parks a restored forward on. */
+int cap_linux_thread_chans(uint32_t sidecar_pid, uint32_t child_pid,
+                           uint16_t* out_r, uint16_t* out_w,
+                           uint32_t* out_chan_id) {
+    if (out_r) *out_r = CAP_NONE;
+    if (out_w) *out_w = CAP_NONE;
+    if (out_chan_id) *out_chan_id = CAP_CHAN_NONE;
+    int ti = cap_table_find(sidecar_pid);
+    if (ti < 0) return -1;
+    struct CapTable* t = &cap_tables[ti];
+    uint16_t found_r = CAP_NONE, found_w = CAP_NONE;
+    uint32_t found_id = CAP_CHAN_NONE;
+    cap_lock(&t->lock);
+    for (uint16_t i = 0; i < CAP_TABLE_ENTRIES; i++) {
+        uint64_t w = t->slots[i].word;
+        if (!cap_word_valid(w)) continue;
+        uint32_t ty = (uint32_t)((w >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK);
+        if (ty != CAP_TYPE_CHAN_R && ty != CAP_TYPE_CHAN_W) continue;
+        uint32_t obj_id = (uint32_t)((w >> CAP_OBJ_SHIFT) & CAP_OBJ_MASK);
+        struct CapObject* o = cap_object_get(obj_id);
+        if (!o || o->kind != CAP_OBJ_KIND_CHAN || o->chan_id >= CAP_CHAN_MAX)
+            continue;
+        struct CapChannel* ch = &cap_channels[o->chan_id];
+        int match = ((ch->end0_pid == sidecar_pid && ch->end1_pid == child_pid) ||
+                     (ch->end1_pid == sidecar_pid && ch->end0_pid == child_pid));
+        if (!match) continue;
+        if (ty == CAP_TYPE_CHAN_R) { found_r = i; found_id = o->chan_id; }
+        else                       { found_w = i; }
+    }
+    cap_unlock(&t->lock);
+    if (found_r == CAP_NONE || found_w == CAP_NONE) return -1;
+    if (out_r) *out_r = found_r;
+    if (out_w) *out_w = found_w;
+    if (out_chan_id) *out_chan_id = found_id;
+    return 0;
+}
+
+int cap_wake_sidecar_channels(uint32_t sidecar_pid,
+                              const uint32_t* exclude, uint32_t n_exclude) {
+    int ti = cap_table_find(sidecar_pid);
+    if (ti < 0) return 0;
+    uint32_t ids[CAP_CHAN_MAX];
+    uint32_t n = 0;
+    struct CapTable* t = &cap_tables[ti];
+    cap_lock(&t->lock);
+    for (uint16_t i = 0; i < CAP_TABLE_ENTRIES && n < CAP_CHAN_MAX; i++) {
+        uint64_t w = t->slots[i].word;
+        if (!cap_word_valid(w)) continue;
+        uint32_t ty = (uint32_t)((w >> CAP_TYPE_SHIFT) & CAP_TYPE_MASK);
+        if (ty != CAP_TYPE_CHAN_R) continue;
+        uint32_t obj_id = (uint32_t)((w >> CAP_OBJ_SHIFT) & CAP_OBJ_MASK);
+        struct CapObject* o = cap_object_get(obj_id);
+        if (!o || o->kind != CAP_OBJ_KIND_CHAN || o->chan_id >= CAP_CHAN_MAX)
+            continue;
+        uint32_t id = o->chan_id;
+        int skip = 0;
+        for (uint32_t k = 0; k < n_exclude; k++)
+            if (exclude[k] == id) { skip = 1; break; }
+        if (skip) continue;
+        int dup = 0;
+        for (uint32_t k = 0; k < n; k++) if (ids[k] == id) { dup = 1; break; }
+        if (!dup) ids[n++] = id;
+    }
+    cap_unlock(&t->lock);
+    for (uint32_t k = 0; k < n; k++) cap_wake_chan(ids[k]);
+    return (int)n;
+}
+
+/* M4.6: the restore's sibling create. The descriptor shares the leader's cr3
+ * and is born HELD; the group attach gives it its captured TID and the second
+ * address-space reference. The messenger pair is minted here (the same shape
+ * linux_clone.c uses) and the sidecar slots are checked against the captured
+ * table before the task can be released. */
+int cap_linux_restore_thread(struct CapLinuxRestoreThread* req) {
+    if (!req || req->leader_pid == 0 || req->name[0] == '\0') return CAP_EINVAL;
+    struct ProcessDescriptor* leader = 0;
+    for (int i = 0; i < PROC_MAX; i++)
+        if (proc_table[i].active && proc_table[i].pid == req->leader_pid) {
+            leader = &proc_table[i];
+            break;
+        }
+    if (!leader || !leader->linux_tgid || leader->cr3 == 0) return CAP_EINVAL;
+    uint32_t pid = proc_create_linux_thread_restore(leader, req->name, req->tid);
+    if (pid == 0) return CAP_ENOMEM;
+    struct ProcessDescriptor* child = 0;
+    for (int i = 0; i < PROC_MAX; i++)
+        if (proc_table[i].active && proc_table[i].pid == pid) {
+            child = &proc_table[i];
+            break;
+        }
+    if (!child) { proc_discard_linux_thread(pid); return CAP_ERR_STATE; }
+    if (linux_thread_group_attach(child, leader->linux_tgid,
+                                  req->tid ? req->tid : pid) == 0) {
+        proc_discard_linux_thread(pid);
+        return CAP_ERR_STATE;
+    }
+    child->linux_clear_child_tid = req->clear_child_tid;
+
+    uint16_t sr = CAP_NONE, sw = CAP_NONE, cr = CAP_NONE, cw = CAP_NONE;
+    uint32_t sidecar_pid = req->sidecar_pid ? req->sidecar_pid
+                                            : leader->parent_pid;
+    if (!sidecar_pid) { process_kill(pid); return CAP_EINVAL; }
+    int rc = cap_chan_create(sidecar_pid, pid, &sr, &sw, &cr, &cw);
+    if (rc < 0) { process_kill(pid); return rc; }
+    if (req->want_sidecar_r != CAP_NONE || req->want_sidecar_w != CAP_NONE) {
+        if (sr != req->want_sidecar_r || sw != req->want_sidecar_w) {
+            kernel_serial_printf(
+                "[SIDECAR] M4.6 thread channel mismatch '%s': new r=%u w=%u, "
+                "captured r=%u w=%u\n",
+                req->name, (unsigned)sr, (unsigned)sw,
+                (unsigned)req->want_sidecar_r, (unsigned)req->want_sidecar_w);
+            process_kill(pid);
+            return CAP_ERR_STATE;
+        }
+    }
+    if (sidecar_registry_register(child->name, pid, child->partition_id) < 0) {
+        process_kill(pid);
+        return CAP_ETABLEFULL;
+    }
+    req->sidecar_r = sr; req->sidecar_w = sw;
+    req->child_r = cr; req->child_w = cw;
+    req->pid = pid;
+    uint32_t new_chan = 0;
+    (void)cap_linux_thread_chans(sidecar_pid, pid, 0, 0, &new_chan);
+    req->chan_id = new_chan;
+    kernel_serial_printf(
+        "[SIDECAR] M4.6 restore thread '%s' pid=%u tid=%u group=%u "
+        "chan=%u sidecar=%u/%u child=%u/%u (held)\n",
+        req->name, (unsigned)pid, (unsigned)req->tid,
+        (unsigned)leader->linux_tgid, (unsigned)req->chan_id,
+        (unsigned)sr, (unsigned)sw, (unsigned)cr, (unsigned)cw);
     return 0;
 }
 

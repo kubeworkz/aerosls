@@ -1261,6 +1261,46 @@ void cap_linux_restore_disarm(uint32_t partition_id);
  * (a spill, a failed spawn, or an already-released task). */
 int cap_linux_restore_release(const char* name);
 
+/* M4.6: recreate one captured sibling as a HELD task in the leader's group.
+ * The descriptor is created by proc_create_linux_thread_restore() (no user
+ * validation: the shared pages are poured later), attached to the leader's
+ * group with the captured TID, given a fresh messenger pair, and registered
+ * under the captured name. `want_sidecar_r/w` are the captured sidecar slots;
+ * when both are CAP_NONE (a host world with no real channels) the comparison
+ * is skipped, otherwise a mismatch is refused by name rather than pouring a
+ * sidecar table that names a channel this boot did not mint. The child fields
+ * carry the fresh create's returned handles. Returns 0, or a negative CAP_E*
+ * code. */
+struct CapLinuxRestoreThread {
+    uint32_t leader_pid;
+    uint32_t sidecar_pid;
+    char     name[24];
+    uint32_t tid;
+    uint64_t clear_child_tid;
+    uint16_t want_sidecar_r, want_sidecar_w;
+    uint16_t want_child_r, want_child_w;
+    uint16_t sidecar_r, sidecar_w, child_r, child_w;
+    uint32_t chan_id;
+    uint32_t pid;
+};
+int cap_linux_restore_thread(struct CapLinuxRestoreThread* req);
+
+/* The sidecar's two handles and the channel id for the messenger pair whose
+ * far end is `child_pid`. Returns 0 and fills all three, or -1 when the pair
+ * is absent or ambiguous. Used by the M4.6 capture to record what the sidecar
+ * table will name, and by the restore to install a parked task's channel. */
+int cap_linux_thread_chans(uint32_t sidecar_pid, uint32_t child_pid,
+                           uint16_t* out_r, uint16_t* out_w,
+                           uint32_t* out_chan_id);
+
+/* M4.6: a restored sidecar's task table names channels its boot-time wait
+ * set never saw. Wake it on one of its OTHER receive channels (console,
+ * ramdisk, ...) so the entry loop rebuilds `append_wait` and services the
+ * restored parked frames. Channels in `exclude` are the Linux task channels:
+ * waking those would resume a parked forward before its reply exists. */
+int cap_wake_sidecar_channels(uint32_t sidecar_pid,
+                              const uint32_t* exclude, uint32_t n_exclude);
+
 /* ─── E7 increment 3 (Linux ABI Shim Design §3.3 steps 5-7) ────────────────
  * The forward path's three seams, each in the file that can see what it
  * needs: the TABLE scan lives in cap.c (only cap.c sees cap_tables), the
