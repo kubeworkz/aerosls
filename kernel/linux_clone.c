@@ -234,7 +234,7 @@ static int group_sweep_preflight(struct ProcessDescriptor *caller,
                 tgid, group_id, pd->pid);
             return CAP_EAGAIN;
         }
-        if (n < PROC_MAX) pids[n++] = pd->pid;
+        pids[n++] = pd->pid;
     }
     *out_n = n;
     return 0;

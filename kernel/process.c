@@ -1657,6 +1657,9 @@ static void proc_deferred_teardown(struct ProcessDescriptor* pd) {
     kernel_serial_printf(
         "[PROC] PID %u '%s' deferred teardown (killed while running)\n",
         pd->pid, pd->name);
+    /* The immediate path marks ZOMBIE before its teardown; this path must
+     * leave the same state on an inactive slot, not a stale RUNNING. */
+    pd->state = PROC_ZOMBIE;
     linux_stack_maybe_report(pd, "exit");
     uint64_t linux_dead_cr3 = 0;
     int linux_grouped = linux_thread_group_detach(pd, &linux_dead_cr3);

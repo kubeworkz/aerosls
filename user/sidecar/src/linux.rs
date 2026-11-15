@@ -3994,50 +3994,48 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                 /* Death proof before reap. The kernel's sweep returns
                  * CAP_EAGAIN while any member is runnable or a kill
                  * deferred; yield and retry so a CPU-bound sibling gets
-                 * preempted. Success is only accepted when BOTH the
-                 * kernel's live count reached zero (its success log) and
-                 * every sidecar record resolve fails. A record that still
-                 * resolves is never released: the group stays live and the
-                 * caller is answered with EBUSY instead of being told the
+                 * preempted. Success needs the kernel's proof AND every
+                 * sidecar record resolve failing; a stale-TGID error is
+                 * acceptable only when every record is already gone (an
+                 * earlier partial sweep retired the group). A record that
+                 * still resolves is never released: the group stays live and
+                 * the caller is answered with EBUSY instead of being told the
                  * group was swept. */
                 let mut dead = 0usize;
-                let mut failed = false;
+                let mut proved = false;
                 for attempt in 0..GROUP_SWEEP_ATTEMPTS {
-                    match k.linux_group_sweep(tgid as u32) {
+                    let result = k.linux_group_sweep(tgid as u32);
+                    dead = nm - group_live_records(k, &members[..nm], partition);
+                    match result {
                         Ok(_) => {
-                            dead = nm - group_live_records(k, &members[..nm], partition);
-                            if dead == nm {
-                                break;
+                            proved = true;
+                            if dead != nm {
+                                enosys_log(num as u32, &name_buf[..nlen],
+                                           b" group sweep: kernel success but live record\n");
                             }
-                            enosys_log(num as u32, &name_buf[..nlen],
-                                       b" group sweep: kernel success but live record\n");
                         }
                         Err(E_AGAIN) => {
-                            /* A runnable member or a deferred kill: yield so
-                             * it is preempted, then prove again. */
+                            /* A runnable member or a deferred kill: the
+                             * kernel has not proved the group dead, whatever
+                             * the records say. Yield and try again. */
+                            proved = false;
                         }
                         Err(_) => {
                             /* A stale TGID can mean an earlier partial sweep
-                             * already retired the group; the record check is
-                             * the only honest success test in that case. */
-                            dead = nm - group_live_records(k, &members[..nm], partition);
-                            if dead == nm {
-                                break;
-                            }
-                            failed = true;
+                             * already retired the group; the records are the
+                             * only remaining proof in that case. */
+                            proved = dead == nm;
                             break;
                         }
                     }
-                    if attempt + 1 == GROUP_SWEEP_ATTEMPTS {
-                        failed = true;
-                    } else {
+                    if proved && dead == nm {
+                        break;
+                    }
+                    if attempt + 1 < GROUP_SWEEP_ATTEMPTS {
                         k.sched_yield();
                     }
                 }
-                if dead != nm {
-                    failed = true;
-                }
-                if failed {
+                if dead != nm || !proved {
                     enosys_log(num as u32, &name_buf[..nlen],
                                b" group sweep FAILED: live member not reaped\n");
                     /* Answer the caller, which is still parked on 231 and

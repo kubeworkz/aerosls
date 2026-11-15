@@ -3391,7 +3391,9 @@ stop's stack line; `[E7-GATE] self-kill: process_kill(pid=105) requested while
 RUNNING`; `[PROC] PID 105 terminated.`; `[PROC] PID 105 kill deferred (running)
 — teardown at next schedule`; then the scheduler's `[PROC] PID 105
 'e7.gate.user.0' deferred teardown (killed while running)` immediately followed
-by `[E7-GATE] stack hwm (exit): … deepest=2648`. The deferred scan re-measures
+by `[E7-GATE] stack hwm (exit): … deepest=2648`. That transcript predates
+the logging move: current builds omit the `terminated` line on the deferred
+path, where the deferred-teardown line is the real end. The deferred scan re-measures
 the same span (60,912 bytes) and the same deepest point as the stop (2,648,
 88.9% headroom), exactly once, and no `[backup] Done:` appears — the tenant was
 taken down mid-copy. The sweep this needed is part of the change: a deferred
