@@ -255,6 +255,7 @@ const LINUX_SIGNAL_DELIVERY_BYTES: usize = 80;
 /// E_PIPE (-28); the kernel maps it to this Linux number.
 const LINUX_EPIPE: i64 = 32;
 const SIGPIPE: u64 = 13;
+pub const LINUX_EINTR: i64 = 4;
 
 /// How far a signal number may run: Linux x86-64 signals are 1..=64
 /// (1..31 standard, 32..64 real-time; 0 is tkill's existence probe and

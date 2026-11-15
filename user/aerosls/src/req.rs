@@ -32,6 +32,7 @@ pub const CAP_ENOSPC: i32 = -8;
 pub const CAP_ERANGE: i32 = -9;
 pub const CAP_ENOSYS: i32 = -10;
 pub const CAP_ECONFLICT: i32 = -11;
+pub const CAP_EINTR: i32 = -34;
 
 /// ── Capability permissions (kernel/cap.h CAP_PERM_*) ──────────────────────
 pub const CAP_PERM_R: u8 = 0x01;

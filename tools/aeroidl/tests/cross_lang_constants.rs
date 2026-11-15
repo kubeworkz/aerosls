@@ -1161,6 +1161,7 @@ fn error_codes_consistent() {
         ("CAP_ERANGE", -9),
         ("CAP_ENOSYS", -10),
         ("CAP_ECONFLICT", -11),
+        ("CAP_EINTR", -34),
     ];
     for (file, kind) in [
         ("kernel/cap.h", "c"),
@@ -1175,6 +1176,32 @@ fn error_codes_consistent() {
                 .find(|(n, _)| n == name)
                 .unwrap_or_else(|| panic!("{file}: missing error code {name}"));
             assert_eq!(got.1, *want, "{file}: {name} = {} != kernel {want}", got.1);
+        }
+    }
+}
+
+#[test]
+fn linux_errno_constants_consistent() {
+    // The Linux ABI header owns the tenant-visible errno; the sidecar's
+    // private twin must agree because it builds the signal trailer's saved
+    // rax. EINTR is the stop/SIGCONT resume value (M4.10).
+    let expected: &[(&str, i64)] = &[("LINUX_EINTR", 4)];
+    for (file, kind) in [
+        ("kernel/linux_abi.h", "c"),
+        ("user/sidecar/src/linux.rs", "rust"),
+    ] {
+        let text = read_repo(file);
+        let defs = if kind == "c" {
+            extract_c_ints(&text)
+        } else {
+            extract_rust_ints(&text)
+        };
+        for (name, want) in expected {
+            let got = defs
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("{file}: missing Linux constant {name}"));
+            assert_eq!(got.1, *want, "{file}: {name} = {} != {want}", got.1);
         }
     }
 }

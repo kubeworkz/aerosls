@@ -78,6 +78,7 @@ static const int    kern_e_nospc    = CAP_ENOSPC;
 static const int    kern_e_range    = CAP_ERANGE;
 static const int    kern_e_nosys    = CAP_ENOSYS;
 static const int    kern_e_conflict = CAP_ECONFLICT;
+static const int    kern_e_intr     = CAP_EINTR;
 
 /* Syscall numbers: kernel names them SYS_SLS_CAP_*, the SDK SLS_SYS_CAP_*
  * (different identifiers, same numbers — no undef needed, only equality). */
@@ -111,6 +112,7 @@ static const int    kern_sys_arena_free = SYS_SLS_CAP_ARENA_FREE;
 #undef CAP_ERANGE
 #undef CAP_ENOSYS
 #undef CAP_ECONFLICT
+#undef CAP_EINTR
 
 #include "../user/libaerocap/aerocap.h"
 #include "../user/libaerocap/aerosls_cap.h"   /* Phase 3 message transport */
@@ -279,6 +281,7 @@ int main(void) {
     CHECK(CAP_ERANGE      == kern_e_range,    "CAP_ERANGE");
     CHECK(CAP_ENOSYS      == kern_e_nosys,    "CAP_ENOSYS");
     CHECK(CAP_ECONFLICT   == kern_e_conflict, "CAP_ECONFLICT");
+    CHECK(CAP_EINTR       == kern_e_intr,     "CAP_EINTR");
 
     /* ── syscall numbers ────────────────────────────────────────────────── */
     CHECK(SLS_SYS_CAP_CREATE_MEM  == kern_sys_create, "SYS_SLS_CAP_CREATE_MEM");

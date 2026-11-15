@@ -81,6 +81,7 @@ typedef int32_t cap_t;
 #define CAP_ERANGE      (-9)
 #define CAP_ENOSYS      (-10)
 #define CAP_ECONFLICT   (-11)
+#define CAP_EINTR       (-34)   /* a parked exchange interrupted by a stop/SIGCONT */
 
 /* ── Request structs — layout MUST be identical to kernel/cap.h ────────────── */
 struct sls_cap_create_mem_req {
