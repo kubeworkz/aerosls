@@ -211,9 +211,11 @@ const CLONE_SETTLS: u64 = 0x0008_0000;
 const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
 const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
 const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+/// Deprecated and ignored by Linux, but still set by musl's pthread_create.
+const CLONE_DETACHED: u64 = 0x0040_0000;
 const CLONE_M4_ALLOW: u64 = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND
     | CLONE_THREAD | CLONE_SYSVSEM | CLONE_SETTLS | CLONE_PARENT_SETTID
-    | CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID;
+    | CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID | CLONE_DETACHED;
 /// munmap(11) — E7 increment 25 (§5.4's last memory seam): the 11 arm
 /// answers WHETHER over the ledger's span and break; the kernel's page
 /// tables decide which pages are present, so a double unmap is success.
@@ -403,6 +405,8 @@ const LINUX_GETTID: u64 = 186;
 const LINUX_FUTEX: u64 = 202;
 const FUTEX_WAIT: u64 = 0;
 const FUTEX_WAKE: u64 = 1;
+const FUTEX_WAIT_BITSET: u64 = 9;
+const FUTEX_WAKE_BITSET: u64 = 10;
 const FUTEX_PRIVATE: u64 = 128;
 const FUTEX_WAIT_PAYLOAD_BYTES: usize = 24;
 const NS_PER_SEC: u64 = 1_000_000_000;
@@ -1628,7 +1632,9 @@ fn expected_req_len(num: u64, args: &[u64; 6]) -> usize {
         /* M4.4: only the private WAIT shape carries the 24-byte observed/
          * timeout record. A WAKE and every unsupported operation are the
          * plain header, which the sidecar's named refusal can answer. */
-        LINUX_FUTEX if args[1] == (FUTEX_WAIT | FUTEX_PRIVATE) =>
+        LINUX_FUTEX
+            if args[1] == (FUTEX_WAIT | FUTEX_PRIVATE) ||
+               args[1] == (FUTEX_WAIT_BITSET | FUTEX_PRIVATE) =>
             LINUX_SYSCALL_REQ_BYTES + FUTEX_WAIT_PAYLOAD_BYTES,
         _ => LINUX_SYSCALL_REQ_BYTES,
     }
@@ -2578,6 +2584,7 @@ struct FutexWaiter {
     task: u8,
     uaddr: u64,
     seq: u64,
+    bitset: u32,
 }
 
 const MAX_FUTEX_WAITERS: usize = 8;
@@ -2623,7 +2630,8 @@ impl LinuxGroup {
             brk_mtop: 0,
             sig_dispo: [DISPO_DFL; SIG_MAX + 1],
             sig_act: [SigAct::new(); SIG_MAX + 1],
-            futex: [FutexWaiter { used: false, task: 0, uaddr: 0, seq: 0 };
+            futex: [FutexWaiter { used: false, task: 0, uaddr: 0, seq: 0,
+                                 bitset: 0 };
                     MAX_FUTEX_WAITERS],
             futex_seq: 0,
         }
@@ -2921,7 +2929,8 @@ fn group_live_records<K: Kernel>(k: &K, members: &[usize], partition: u32) -> us
 fn futex_remove(g: &mut LinuxGroup, task: usize) {
     for w in g.futex.iter_mut() {
         if w.used && w.task as usize == task {
-            *w = FutexWaiter { used: false, task: 0, uaddr: 0, seq: 0 };
+            *w = FutexWaiter { used: false, task: 0, uaddr: 0, seq: 0,
+                               bitset: 0 };
         }
     }
 }
@@ -2930,7 +2939,7 @@ fn futex_remove(g: &mut LinuxGroup, task: usize) {
 /// a zero relative timespec is Linux's immediate ETIMEDOUT; a negative or
 /// out-of-range value is EINVAL. The addition is checked, so a tenant's
 /// huge timeout cannot wrap into an accidental early wake.
-fn futex_deadline(payload: &[u8], now: u64) -> Result<u64, i32> {
+fn futex_deadline(payload: &[u8], now: u64, absolute: bool) -> Result<u64, i32> {
     if payload.len() != FUTEX_WAIT_PAYLOAD_BYTES {
         return Err(E_NOSYS);
     }
@@ -2949,15 +2958,26 @@ fn futex_deadline(payload: &[u8], now: u64) -> Result<u64, i32> {
     if rel == 0 {
         return Err(E_TIMEOUT);
     }
-    now.checked_add(rel).ok_or(E_INVAL)
+    if absolute {
+        // FUTEX_WAIT_BITSET's timespec is absolute against the same clock
+        // that produced `now` (the service pass's monotonic sample).
+        if rel <= now {
+            return Err(E_TIMEOUT);
+        }
+        Ok(rel)
+    } else {
+        now.checked_add(rel).ok_or(E_INVAL)
+    }
 }
 
-fn futex_enqueue(g: &mut LinuxGroup, task: usize, uaddr: u64) -> bool {
+fn futex_enqueue(g: &mut LinuxGroup, task: usize, uaddr: u64,
+                 bitset: u32) -> bool {
     if let Some(w) = g.futex.iter_mut().find(|w| !w.used) {
         w.used = true;
         w.task = task as u8;
         w.uaddr = uaddr;
         w.seq = g.futex_seq;
+        w.bitset = bitset;
         g.futex_seq = g.futex_seq.wrapping_add(1);
         true
     } else {
@@ -2965,12 +2985,13 @@ fn futex_enqueue(g: &mut LinuxGroup, task: usize, uaddr: u64) -> bool {
     }
 }
 
-fn futex_wake(g: &mut LinuxGroup, uaddr: u64, want: usize) -> FutexWake {
+fn futex_wake(g: &mut LinuxGroup, uaddr: u64, want: usize,
+              bitset: u32) -> FutexWake {
     let mut out = FutexWake { n: 0, tasks: [0; MAX_FUTEX_WAITERS] };
     while (out.n as usize) < want {
         let mut pick: Option<usize> = None;
         for (i, w) in g.futex.iter().enumerate() {
-            if !w.used || w.uaddr != uaddr {
+            if !w.used || w.uaddr != uaddr || w.bitset & bitset == 0 {
                 continue;
             }
             if pick.map_or(true, |p| w.seq < g.futex[p].seq) {
@@ -2980,7 +3001,8 @@ fn futex_wake(g: &mut LinuxGroup, uaddr: u64, want: usize) -> FutexWake {
         let Some(i) = pick else { break };
         out.tasks[out.n as usize] = g.futex[i].task;
         out.n += 1;
-        g.futex[i] = FutexWaiter { used: false, task: 0, uaddr: 0, seq: 0 };
+        g.futex[i] = FutexWaiter { used: false, task: 0, uaddr: 0, seq: 0,
+                                   bitset: 0 };
     }
     out
 }
@@ -2989,7 +3011,7 @@ fn futex_wake(g: &mut LinuxGroup, uaddr: u64, want: usize) -> FutexWake {
 /// exit's clear-child-tid rule. This is the same reply shape as a FUTEX_WAKE
 /// answer; the wake itself is already committed to the group queue.
 fn futex_wake_reply<K: Kernel>(k: &K, gid: usize, uaddr: u64, want: usize) {
-    let w = futex_wake(&mut groups()[gid], uaddr, want);
+    let w = futex_wake(&mut groups()[gid], uaddr, want, u32::MAX);
     for &idx in w.tasks[..w.n as usize].iter() {
         let j = idx as usize;
         if j >= MAX_LINUX_TASKS || !tasks()[j].used ||
@@ -3033,7 +3055,8 @@ fn answer_futex(
     now: u64,
 ) -> Answer {
     let op = args[1];
-    if op == (FUTEX_WAIT | FUTEX_PRIVATE) {
+    if op == (FUTEX_WAIT | FUTEX_PRIVATE) ||
+       op == (FUTEX_WAIT_BITSET | FUTEX_PRIVATE) {
         if payload.len() != FUTEX_WAIT_PAYLOAD_BYTES {
             return Answer::Reply(0, E_NOSYS);
         }
@@ -3042,18 +3065,34 @@ fn answer_futex(
         if observed != args[2] as u32 {
             return Answer::Reply(0, E_AGAIN);
         }
-        let deadline = match futex_deadline(payload, now) {
+        // WAKE_BITSET's match word is args[5]; a plain WAIT is MATCH_ANY.
+        // Linux refuses an empty bitset rather than treating it as MATCH_ANY.
+        let bitset = if op == (FUTEX_WAIT_BITSET | FUTEX_PRIVATE) {
+            if args[5] == 0 { return Answer::Reply(0, E_INVAL); }
+            args[5] as u32
+        } else {
+            u32::MAX
+        };
+        let absolute = op == (FUTEX_WAIT_BITSET | FUTEX_PRIVATE);
+        let deadline = match futex_deadline(payload, now, absolute) {
             Ok(d) => d,
             Err(E_TIMEOUT) => return Answer::Reply(0, E_TIMEOUT),
             Err(e) => return Answer::Reply(0, e),
         };
-        if !futex_enqueue(g, task, args[0]) {
+        if !futex_enqueue(g, task, args[0], bitset) {
             return Answer::Reply(0, E_TABLEFULL);
         }
         Answer::FutexWait(args[0], deadline)
-    } else if op == (FUTEX_WAKE | FUTEX_PRIVATE) {
+    } else if op == (FUTEX_WAKE | FUTEX_PRIVATE) ||
+              op == (FUTEX_WAKE_BITSET | FUTEX_PRIVATE) {
         let want = args[2].min(MAX_FUTEX_WAITERS as u64) as usize;
-        Answer::FutexWake(futex_wake(g, args[0], want))
+        let bitset = if op == (FUTEX_WAKE_BITSET | FUTEX_PRIVATE) {
+            if args[5] == 0 { return Answer::Reply(0, E_INVAL); }
+            args[5] as u32
+        } else {
+            u32::MAX
+        };
+        Answer::FutexWake(futex_wake(g, args[0], want, bitset))
     } else {
         Answer::Reply(0, E_NOSYS)
     }
@@ -5836,5 +5875,61 @@ mod tests {
         assert_eq!(drop_task_state(3), Some(10));
         assert_eq!(drop_task_state(0), Some(7));
         assert!(!groups()[gid].used);
+    }
+
+    #[test]
+    fn futex_bitset_matches_only_intersecting_wakes_and_is_absolute() {
+        /* A local group keeps this queue test independent of the global task
+         * registry, so the parallel unit suite cannot make its records race. */
+        let mut g = LinuxGroup::new();
+        let uaddr = 0x7000_2000u64;
+        let wait_a = [uaddr, FUTEX_WAIT_BITSET | FUTEX_PRIVATE, 7, 0, 0, 0b01];
+        let wait_b = [uaddr, FUTEX_WAIT_BITSET | FUTEX_PRIVATE, 7, 0, 0, 0b10];
+        assert!(matches!(answer_futex(&mut g, 1, &wait_a,
+                                      &futex_payload(7, None), 1_000),
+                         Answer::FutexWait(_, 0)));
+        assert!(matches!(answer_futex(&mut g, 2, &wait_b,
+                                      &futex_payload(7, None), 1_000),
+                         Answer::FutexWait(_, 0)));
+        assert_eq!(g.futex.iter().filter(|w| w.used).count(), 2);
+
+        let one = match answer_futex(&mut g, 0,
+                                     &[uaddr, FUTEX_WAKE_BITSET | FUTEX_PRIVATE,
+                                       8, 0, 0, 0b01],
+                                     &[], 1_000) {
+            Answer::FutexWake(w) => w,
+            other => panic!("bitset wake did not report waiters: {:?}", other),
+        };
+        assert_eq!(one.n, 1, "only the intersecting bitset is woken");
+        assert_eq!(one.tasks[0], 1);
+        assert_eq!(g.futex.iter().filter(|w| w.used).count(), 1);
+
+        let one = match answer_futex(&mut g, 0,
+                                     &[uaddr, FUTEX_WAKE_BITSET | FUTEX_PRIVATE,
+                                       8, 0, 0, 0b10],
+                                     &[], 1_000) {
+            Answer::FutexWake(w) => w,
+            other => panic!("second bitset wake did not report a waiter: {:?}", other),
+        };
+        assert_eq!(one.n, 1);
+        assert_eq!(one.tasks[0], 2);
+        assert_eq!(g.futex.iter().filter(|w| w.used).count(), 0);
+
+        /* WAIT_BITSET's timespec is absolute; a zero deadline is already
+         * expired and must not enqueue. */
+        assert!(matches!(answer_futex(&mut g, 1, &wait_a,
+                                      &futex_payload(7, Some((0, 0))), 1_000),
+                         Answer::Reply(0, E_TIMEOUT)));
+        assert_eq!(g.futex.iter().filter(|w| w.used).count(), 0);
+
+        /* Linux refuses the empty bitset on both sides; it is not MATCH_ANY. */
+        let empty = [uaddr, FUTEX_WAIT_BITSET | FUTEX_PRIVATE, 7, 0, 0, 0];
+        assert!(matches!(answer_futex(&mut g, 1, &empty,
+                                      &futex_payload(7, None), 1_000),
+                         Answer::Reply(0, E_INVAL)));
+        let empty_wake = [uaddr, FUTEX_WAKE_BITSET | FUTEX_PRIVATE, 8, 0, 0, 0];
+        assert!(matches!(answer_futex(&mut g, 0, &empty_wake, &[], 1_000),
+                         Answer::Reply(0, E_INVAL)));
+        assert_eq!(g.futex.iter().filter(|w| w.used).count(), 0);
     }
 }

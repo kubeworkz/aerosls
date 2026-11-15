@@ -1179,6 +1179,11 @@ SIDECAR_M4_EXIT_PROBE = $(if $(filter 1,$(M4_EXIT_PROBE)),--features aerosls-sid
 # both out.
 M4_CKPT_PROBE ?=
 SIDECAR_M4_CKPT_PROBE = $(if $(filter 1,$(M4_CKPT_PROBE)),--features aerosls-sidecar/m4_ckpt_probe)
+# M4.7's live runtime gate: the static threaded Rust candidate replaces the
+# gate profile's firstuser. Enabled only by
+# `make x86-iso-e3 M4_RUNTIME_PROBE=1 E3_INIT_FEATURES=e3_envs,e7_gate`.
+M4_RUNTIME_PROBE ?=
+SIDECAR_M4_RUNTIME_PROBE = $(if $(filter 1,$(M4_RUNTIME_PROBE)),--features aerosls-sidecar/m4_runtime_probe)
 SIDECAR_INIT_ELF   ?= user/target/x86_64-unknown-none/release/init
 SIDECAR_DM_ELF     ?= user/target/x86_64-unknown-none/release/dm
 SIDECAR_POSIX_ELF ?= user/target/x86_64-unknown-none/release/posix
@@ -1239,7 +1244,7 @@ selfhost-bootimage:
 	@# aerosls-bootimage directly; a stamp is only for an archive this target
 	@# built.) tests/sidecar_stamp_check.sh clause G holds this line.
 	@$(CARGO) build --quiet --manifest-path user/Cargo.toml -p aerosls-dm -p aerosls-sidecar -p aerosls-ramdisk -p aerosls-network -p aerosls-e1000-driver \
-		--features target $(SIDECAR_SLOW_BOOT) $(SIDECAR_M1_NET_PROBE) $(SIDECAR_M4_THREAD_PROBE) $(SIDECAR_M4_GROUP_PROBE) $(SIDECAR_M4_FUTEX_PROBE) $(SIDECAR_M4_EXIT_PROBE) $(SIDECAR_M4_CKPT_PROBE) --target x86_64-unknown-none --release \
+		--features target $(SIDECAR_SLOW_BOOT) $(SIDECAR_M1_NET_PROBE) $(SIDECAR_M4_THREAD_PROBE) $(SIDECAR_M4_GROUP_PROBE) $(SIDECAR_M4_FUTEX_PROBE) $(SIDECAR_M4_EXIT_PROBE) $(SIDECAR_M4_CKPT_PROBE) $(SIDECAR_M4_RUNTIME_PROBE) --target x86_64-unknown-none --release \
 		--bin dm --bin posix --bin ramdisk --bin network --bin e1000_driver \
 		|| { echo "[SELFHOST] REFUSING to pack and stamp: the sidecars did not build for x86_64-unknown-none." >&2; \
 		     echo "           The stamp attests the packed binaries, and reusing existing ones would make it a lie." >&2; \

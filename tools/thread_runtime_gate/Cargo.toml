@@ -1,0 +1,12 @@
+[package]
+name = "thread_runtime_gate"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "M4.7 runtime gate: two OS threads sharing a heap and an fd across checkpoint/restore"
+
+[[bin]]
+name = "thread_runtime_gate"
+path = "src/main.rs"
+
+[dependencies]

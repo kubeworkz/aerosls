@@ -61,3 +61,8 @@ m4_exit_probe = []
 # stays live while the checkpoint captures it. Default builds compile neither
 # the module nor its spawn path.
 m4_ckpt_probe = []
+# M4.7's live runtime gate — enabled only by
+# `make x86-iso-e3 M4_RUNTIME_PROBE=1 E3_INIT_FEATURES=e3_envs,e7_gate`.
+# It replaces the gate profile's firstuser with the static threaded Rust
+# probe. Default builds compile neither the module nor its spawn path.
+m4_runtime_probe = []

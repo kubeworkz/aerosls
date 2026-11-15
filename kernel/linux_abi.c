@@ -272,7 +272,8 @@ struct LinuxFutexPlan linux_futex_plan(uint64_t num, const uint64_t args[6])
     p.refuse = 0;
     if (num != LINUX_FUTEX || !args) return p;
 
-    if (args[1] == (LINUX_FUTEX_WAIT | LINUX_FUTEX_PRIVATE_FLAG)) {
+    if (args[1] == (LINUX_FUTEX_WAIT | LINUX_FUTEX_PRIVATE_FLAG) ||
+        args[1] == (LINUX_FUTEX_WAIT_BITSET | LINUX_FUTEX_PRIVATE_FLAG)) {
         if (args[0] == 0) {
             p.refuse = -LINUX_EFAULT;
             return p;
@@ -298,7 +299,8 @@ struct LinuxFutexPlan linux_futex_plan(uint64_t num, const uint64_t args[6])
         return p;
     }
 
-    if (args[1] == (LINUX_FUTEX_WAKE | LINUX_FUTEX_PRIVATE_FLAG)) {
+    if (args[1] == (LINUX_FUTEX_WAKE | LINUX_FUTEX_PRIVATE_FLAG) ||
+        args[1] == (LINUX_FUTEX_WAKE_BITSET | LINUX_FUTEX_PRIVATE_FLAG)) {
         if (args[0] == 0) {
             p.refuse = -LINUX_EFAULT;
             return p;

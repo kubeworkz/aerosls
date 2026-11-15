@@ -190,13 +190,18 @@ const char *linux_syscall_class_name(enum LinuxSyscallClass cls);
 #define LINUX_CLONE_PARENT_SETTID 0x00100000ULL
 #define LINUX_CLONE_CHILD_CLEARTID 0x00200000ULL
 #define LINUX_CLONE_CHILD_SETTID 0x01000000ULL
+/* M4.7: glibc/musl pthread_create still sets this deprecated no-op flag.
+ * Linux accepts and ignores it; refusing it made a real Rust thread fail
+ * before its first instruction. */
+#define LINUX_CLONE_DETACHED     0x00400000ULL
 
 #define LINUX_CLONE_ALLOW (LINUX_CLONE_VM | LINUX_CLONE_FS | \
                            LINUX_CLONE_FILES | LINUX_CLONE_SIGHAND | \
                            LINUX_CLONE_THREAD | LINUX_CLONE_SYSVSEM | \
                            LINUX_CLONE_SETTLS | LINUX_CLONE_PARENT_SETTID | \
                            LINUX_CLONE_CHILD_CLEARTID | \
-                           LINUX_CLONE_CHILD_SETTID)
+                           LINUX_CLONE_CHILD_SETTID | \
+                           LINUX_CLONE_DETACHED)
 
 /* 0 = accepted; -EINVAL for a malformed thread request; -ENOSYS for a
  * flag this increment does not serve. Total over every uint64_t word.
@@ -232,6 +237,10 @@ static inline int linux_clone_flags_verdict(uint64_t flags)
 #define LINUX_FUTEX                 202u
 #define LINUX_FUTEX_WAIT            0u
 #define LINUX_FUTEX_WAKE            1u
+/* M4.7: Rust's std join uses FUTEX_WAIT_BITSET_PRIVATE. The bitset is the
+ * sixth argument; a plain FUTEX_WAKE is MATCH_ANY over it. */
+#define LINUX_FUTEX_WAIT_BITSET     9u
+#define LINUX_FUTEX_WAKE_BITSET     10u
 #define LINUX_FUTEX_PRIVATE_FLAG    128u
 #define LINUX_FUTEX_CMD_MASK        0x7fu
 #define LINUX_FUTEX_WAIT_PAYLOAD_BYTES 24u

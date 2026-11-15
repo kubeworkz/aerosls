@@ -73,6 +73,7 @@ ok "A. every file this guard reads exists"
 
 # ─── B. The design exists and states the wall ─────────────────────────────
 if grep -qE '^Status: M4\.[0-9]+ landed; M4\.[0-9]+ .*runtime wall in force\.$' "$DOC" ||
+   grep -qE '^Status: M4\.7 gate landed for the static threaded-Rust gate shape; std pthread and Go runtime remain out\.$' "$DOC" ||
    grep -qE '^Status: M4\.7 gate landed; runtime wall lifted\.$' "$DOC"; then
     ok "B1. the design status names the landed increment and the correct wall posture"
 else
@@ -80,6 +81,7 @@ else
 fi
 
 if grep -qF 'Go, threaded Rust, threaded CPython, Node, and every other threaded runtime remain out' "$DOC" ||
+   grep -qF 'The static threaded-Rust gate is evidenced; std pthread and Go runtime remain out' "$DOC" ||
    grep -qF 'Go and every threaded runtime are supported' "$DOC"; then
     ok "B2. the design states the runtime posture (wall, or full gate with evidence)"
 else

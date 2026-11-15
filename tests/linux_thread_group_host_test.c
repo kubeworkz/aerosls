@@ -403,6 +403,9 @@ static void test_clone_context_and_flags(void) {
           -LINUX_EINVAL, "THREAD without SIGHAND is malformed");
     CHECK(linux_clone_flags_verdict(LINUX_CLONE_THREAD | LINUX_CLONE_SIGHAND) ==
           -LINUX_EINVAL, "THREAD without VM is malformed");
+    CHECK(linux_clone_flags_verdict(flags | LINUX_CLONE_DETACHED) == 0,
+          "CLONE_DETACHED is the deprecated no-op musl still sets; accepting\n"
+          "      it is Linux's behaviour, not a second create path");
     CHECK(linux_clone_flags_verdict(flags | 0x40ULL) == -LINUX_ENOSYS,
           "an unserved clone flag is ENOSYS, not silently dropped");
     CHECK(linux_clone_flags_verdict(0xFFFFFFFFFFFFFFFFULL) == -LINUX_ENOSYS,

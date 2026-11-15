@@ -74,3 +74,6 @@ commit_*_msg.txt
 /qemu
 /probe_console_run.sh
 /tools/add_intent_standins.sh
+
+# M4.7 gate build output (source + Cargo.lock are tracked)
+tools/thread_runtime_gate/target/

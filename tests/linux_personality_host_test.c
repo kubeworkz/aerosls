@@ -399,7 +399,28 @@ int main(void)
               "a private FUTEX_WAKE plans no bytes — its uaddr is only the\n"
               "      queue key, and the count is the caller's word");
 
+        /* M4.7: Rust's std join uses FUTEX_WAIT_BITSET_PRIVATE. Its sixth
+         * word names the bitset; the kernel's copy plan is the same observed
+         * word + timespec record, and a bitset wake carries no payload. */
+        fa[1] = LINUX_FUTEX_WAIT_BITSET | LINUX_FUTEX_PRIVATE_FLAG;
+        fa[3] = 0;
+        fa[5] = 0x80000001ULL;
+        fp = linux_futex_plan(LINUX_FUTEX, fa);
+        CHECK(fp.refuse == 0 && fp.observed_src == fa[0] &&
+              fp.timeout_src == 0 &&
+              fp.payload_len == LINUX_FUTEX_WAIT_PAYLOAD_BYTES,
+              "a private FUTEX_WAIT_BITSET plans the same observed-word record\n"
+              "      as WAIT; the bitset stays in the sixth argument");
+
+        fa[1] = LINUX_FUTEX_WAKE_BITSET | LINUX_FUTEX_PRIVATE_FLAG;
+        fp = linux_futex_plan(LINUX_FUTEX, fa);
+        CHECK(fp.refuse == 0 && fp.payload_len == 0 &&
+              fp.observed_src == 0 && fp.timeout_src == 0,
+              "a private FUTEX_WAKE_BITSET is a queue key plus a match word,\n"
+              "      never a copied payload");
+
         fa[1] = 0xDEAD;
+        fa[3] = 0;
         fp = linux_futex_plan(LINUX_FUTEX, fa);
         CHECK(fp.refuse == 0 && fp.payload_len == 0,
               "an operation this increment does not serve is left as a plain\n"
