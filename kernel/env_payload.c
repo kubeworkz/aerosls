@@ -35,6 +35,7 @@
  */
 #include "env_payload.h"
 #include "env_ckpt.h"
+#include "linux_threads.h"   /* M4.6 increment 1: the live group count a capture must not flatten */
 #include "env_console.h"
 #include "persist.h"
 #include "process.h"
@@ -190,6 +191,7 @@ void env_payload_refusal_text(const struct EnvPayloadRefusal* r,
     case EP_REFUSE_PERM:       t = "a captured page's live permissions are not the captured ones"; break;
     case EP_REFUSE_FORM:       t = "the Linux task was captured parked (queued state this blob does not carry)"; break;
     case EP_REFUSE_SHAPE:      t = "a captured task's kind does not match the slot it was filed under"; break;
+    case EP_REFUSE_THREADS:    t = "the Linux thread group is not one healthy member; N threads cannot be restored"; break;
     default:                   t = "unknown payload refusal"; break;
     }
     uint32_t i = 0;
@@ -559,6 +561,10 @@ static uint32_t ep_index_bytes(uint32_t n_tasks, const uint32_t* task_npages,
 
 /* ─── capture ─────────────────────────────────────────────────────────────── */
 uint32_t env_payload_capture_all(void) {
+    /* A capture-side refusal is latched for the evidence line and for the
+     * host test; a later successful capture must not leave a stale refusal
+     * behind. The restore path clears its own latch at entry. */
+    env_payload_clear_refusal();
     if (!ep_io_ready()) {
         kernel_serial_printf(
             "[ENV_PAYLOAD] capture skipped: no NVMe queue this boot "
@@ -609,6 +615,39 @@ uint32_t env_payload_capture_all(void) {
                 missing ? missing_name : "");
             continue;
         }
+
+        /* M4.6 increment 1: one EnvCkptTask slot is one Linux task, not a
+         * shared address space plus N thread contexts. Capturing a group
+         * with a live sibling would save only the leader and a replay would
+         * resume a group that looks valid but lost its other threads; the
+         * group's parked futex waiter is exactly the state the design says
+         * must never be silently dropped. Refuse the whole environment by
+         * name instead. A Linux task with no group id is the legacy
+         * single-owner shape and is still capturable; live==0 for a named
+         * group is a half-torn group and is refused for the same reason.
+         * The address-space reference count is checked with the live count:
+         * the two move together in a healthy group, so a disagreement is a
+         * half-torn group the capture must not flatten either. */
+        int group_refused = 0;
+        for (uint32_t t = 0; t < np; t++) {
+            if (rec->tasks[t].kind != ENV_CKPT_TASK_LINUX) continue;
+            if (!pds[t]->linux_tgid) continue;
+            uint32_t live = linux_thread_group_live(pds[t]->linux_tgid);
+            uint32_t refs = linux_thread_group_refs(pds[t]->linux_tgid);
+            if (live == 1u && refs == 1u) continue;
+            ep_refuse(EP_REFUSE_THREADS, t, live);
+            kernel_serial_printf(
+                "[ENV_PAYLOAD] capture refused (EP_REFUSE_THREADS) for partition=%u "
+                "index=%u: Linux task %u '%s' has %u live thread(s) and %u "
+                "address-space ref(s); M4.6 cannot restore a thread group yet, "
+                "so it is refused rather than saved as only its leader\n",
+                (unsigned)rec->partition_id, (unsigned)rec->index,
+                (unsigned)t, rec->tasks[t].name, (unsigned)live,
+                (unsigned)refs);
+            group_refused = 1;
+            break;
+        }
+        if (group_refused) continue;
 
         /* Collect the pages: image/stack window + private regions, per
          * task. Shared-arena and lazily-granted frames are deliberately

@@ -12,10 +12,12 @@
 use aerosls_proto::env_proto::{
     self, EnvFrame, RegisterRegion, RegisterReply, ENV_CREATE, ENV_DESTROY, ENV_ERR_CAPACITY,
     ENV_ERR_FULL, ENV_ERR_INVAL, ENV_ERR_NOENT, ENV_ERR_NOMEM, ENV_ERR_PART, ENV_ERR_QUOTA,
-    ENV_OK, ENV_REGISTER, LINUX_TASK_NAME,
+    ENV_OK, ENV_REGISTER,
     REGION_POSIX_HEAP, REGION_RD_HEAP, REGION_RD_STORAGE, TASK_LINUX,
     TASK_POSIX_SIDECAR, TASK_RAMDISK_SIDECAR,
 };
+#[cfg(not(feature = "m4_ckpt_probe"))]
+use aerosls_proto::env_proto::LINUX_TASK_NAME;
 use aerosls_proto::kabi::{
     Kernel, ERR_NOMEM, ENV_STORAGE_ERR_IO, ENV_STORAGE_ERR_NOSLOT,
     ENV_STORAGE_ERR_QUOTA,
@@ -338,6 +340,9 @@ pub fn environment_register_reply(env_id: u32, env: &Environment) -> RegisterRep
     // what makes a replay's create name the same task list: both boots derive
     // it from the profile, never from whatever happened to be spawned.
     if env.gate {
+        #[cfg(feature = "m4_ckpt_probe")]
+        r.set_task(2, aerosls_proto::env_proto::M4_CKPT_TASK_NAME, TASK_LINUX);
+        #[cfg(not(feature = "m4_ckpt_probe"))]
         r.set_task(2, LINUX_TASK_NAME, TASK_LINUX);
     }
     r

@@ -39,3 +39,7 @@ e3_envs = ["target"]
 # cap in its manifest). Only meaningful with `e3_envs`; off by default so
 # the ordinary E3 image keeps its two plain tenant environments.
 e7_gate = ["e3_envs"]
+# M4.6 increment 1: the gate profile's third task is the live checkpoint probe
+# instead of the E7 firstuser. Only meaningful with `e7_gate`; off by default
+# so the normal gate image names exactly the task it has always named.
+m4_ckpt_probe = ["e7_gate"]

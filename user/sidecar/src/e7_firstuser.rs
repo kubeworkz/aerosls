@@ -79,6 +79,9 @@ pub const USER_RESERVE: u64 = 1024 * 1024;
 /// E7 increment 20: one constant for both halves of the record — the spawn
 /// here and the registration the kernel stores (user/proto's env_proto). A
 /// drift between them is a record whose Linux slot the stamp can never fill.
+#[cfg(feature = "m4_ckpt_probe")]
+pub const GATE_TASK_NAME: &str = aerosls_proto::env_proto::M4_CKPT_TASK_NAME;
+#[cfg(not(feature = "m4_ckpt_probe"))]
 pub const GATE_TASK_NAME: &str = aerosls_proto::env_proto::LINUX_TASK_NAME;
 pub const GATE_STORAGE: &str = "/tmp/e7-census/sls_storage.img";
 pub const GATE_BACKUP_DIR: &str = "/tmp/e7-census/backups";

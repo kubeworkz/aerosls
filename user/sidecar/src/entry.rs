@@ -600,6 +600,13 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         // crosses the real nine-entry command line; the system POSIX keeps
         // v1's `argv = { name }` measurement. Like the pair above: logged,
         // never fatal.
+        #[cfg(feature = "m4_ckpt_probe")]
+        let firstuser = if gate {
+            crate::m4_ckpt_probe::spawn(&RealKernel, caps.budget_base, caps.budget_len)
+        } else {
+            crate::e7_firstuser::spawn(&RealKernel, caps.budget_base, caps.budget_len)
+        };
+        #[cfg(not(feature = "m4_ckpt_probe"))]
         let firstuser = if gate {
             match crate::e7_firstuser::stage_gate(&mut booted.proc.vfs, 0) {
                 Ok(()) => {

@@ -1370,6 +1370,16 @@ if grep -qF 'case EP_REFUSE_PERM:' "$EPC" && \
 else
     bad "W4. the restore's Linux arm is gone — a page could be poured into a map with different permissions, a parked task's stale context would be resumed, a non-held task could be poured over, or the task would restart at its entry"
 fi
+if grep -qF '#define EP_REFUSE_THREADS' "$EPH" && \
+   grep -qF 'linux_thread_group_live(pds[t]->linux_tgid)' "$EPC" && \
+   grep -qF 'linux_thread_group_refs(pds[t]->linux_tgid)' "$EPC" && \
+   grep -qF 'live == 1u && refs == 1u' "$EPC" && \
+   grep -qF 'if (group_refused) continue;' "$EPC" && \
+   grep -qF 'EP_REFUSE_THREADS' "$EPHUT"; then
+    ok "W5a. M4.6 increment 1: capture reads the live thread-group count and address-space refs and refuses a Linux task that is not exactly one healthy member, naming the task and count, instead of saving only the leader"
+else
+    bad "W5a. the thread-group capture refusal is gone — a multi-thread or half-torn environment could checkpoint its leader alone and replay a group that silently lost every sibling (and any parked futex waiter)"
+fi
 if grep -qF 'pub const LINUX_TASK_NAME: &str = "e7.gate.user.0";' "$ENVP" && \
    grep -qF 'r.set_task(2, LINUX_TASK_NAME, TASK_LINUX);' "$IEM" && \
    grep -qF 'let gate = cfg!(feature = "e7_gate") && index == 1;' "$IEM" && \

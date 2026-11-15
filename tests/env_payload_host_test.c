@@ -38,6 +38,7 @@
 #include "kernel/env_ckpt.h"
 #include "kernel/env_console.h"
 #include "kernel/process.h"
+#include "kernel/linux_threads.h"   /* M4.6 increment 1: the live group count the capture reads */
 #include "kernel/cap.h"
 #include "kernel/linux_abi.h"      /* E7 increment 20: SYS_LINUX_TRAP_RESUME, the parked Linux form */
 #include "kernel/env_storage.h"   /* env_storage_extent_of link stub, as env_ckpt_host_test's */
@@ -103,6 +104,22 @@ void smp_uniprocessor_tick(void) { g_service_pumps++; }
 static unsigned g_keepalive_pumps = 0;
 void failover_sweep_keepalive(void) { g_keepalive_pumps++; }
 struct ProcessDescriptor proc_table[PROC_MAX];
+
+/* M4.6 increment 1: env_payload.c reads the live member count of a Linux
+ * task's group. The real group table is kernel/linux_threads.c's; this host
+ * test links the payload layer alone, so the live count and address-space refs
+ * are the seams it stubs. The single-thread default keeps every pre-M4.6
+ * Linux case unchanged. */
+static uint32_t g_live_threads = 1;
+static uint32_t g_live_refs = 1;
+uint32_t linux_thread_group_live(uint32_t group_id) {
+    (void)group_id;
+    return g_live_threads;
+}
+uint32_t linux_thread_group_refs(uint32_t group_id) {
+    (void)group_id;
+    return g_live_refs;
+}
 
 /* ─── The device: a sparse RAM disk keyed by LBA ───────────────────────────── */
 void* io_sq = (void*)1;
@@ -443,7 +460,7 @@ static void make_record_linux(void) {
  * increment-21 gate stop: PROC_HELD at a `syscall` it has not executed
  * (gate_stopped), which is also resumable and is the form the live run
  * relies on to name src_off=196608 deterministically. */
-static uint32_t setup_and_capture_linux(int linux_ctx) {
+static uint32_t setup_and_capture_linux_group(int linux_ctx, uint32_t live_threads) {
     disk_reset();
     map_reset();
     lmap_reset();
@@ -451,6 +468,8 @@ static uint32_t setup_and_capture_linux(int linux_ctx) {
     memset(proc_table, 0, sizeof proc_table);
     g_snap_ret = 1; g_snap_len = 0; g_inject_ret = 1;
     g_identity_seen = 1;
+    g_live_threads = live_threads;
+    g_live_refs = live_threads;
 
     fill_pattern((uint8_t*)g_region_buf, 4096, 0x11);
     fill_pattern((uint8_t*)g_rdheap_buf, 4096, 0x22);
@@ -488,6 +507,7 @@ static uint32_t setup_and_capture_linux(int linux_ctx) {
     lx->active = 1;
     strcpy(lx->name, "e7.gate.user.0");
     lx->cr3 = (uint64_t)(uintptr_t)g_pml4_l;
+    lx->linux_tgid = 1;         /* a live group; its count is the stub above */
     lx->state = PROC_SUSPENDED;
     lx->waiting_chan = CAP_NONE;   /* a user-space stop is not a park */
     lx->has_ring3_ctx = 1;
@@ -540,6 +560,10 @@ static uint32_t setup_and_capture_linux(int linux_ctx) {
         lx->user_rsp = L_STACK + 0x1000;
     }
     return env_payload_capture_all();
+}
+
+static uint32_t setup_and_capture_linux(int linux_ctx) {
+    return setup_and_capture_linux_group(linux_ctx, 1);
 }
 
 static void simulate_fresh_boot_linux(void) {
@@ -793,6 +817,59 @@ int main(void) {
           "LINUX: the task resumes at the captured rip/rsp, not at its entry");
     CHECK(proc_table[0].park_ctx.r11 == 111,
           "LINUX: the sidecar task in the SAME payload still gets its park frame (the sidecar path is unchanged)");
+
+    /* M4.6 increment 1: refuse a live thread group instead of capturing only
+     * its leader. The payload has one EnvCkptTask slot for the tenant; a
+     * two-thread group would otherwise replay as a lone leader with no sibling
+     * and no parked futex waiter. */
+    CHECK(setup_and_capture_linux_group(1, 2) == 0,
+          "THREADS: a Linux task with one live sibling is refused at capture, not saved as only its leader");
+    CHECK(env_payload_present(L_PART, L_IDX) == 0,
+          "THREADS: the refused group wrote no payload for its environment");
+    CHECK(env_payload_last_refusal().code == EP_REFUSE_THREADS &&
+          env_payload_last_refusal().a == 1 &&
+          env_payload_last_refusal().b == 2,
+          "THREADS: the refusal names the Linux task and the live member count");
+    CHECK(setup_and_capture_linux_group(1, 1) == 1,
+          "THREADS: the one-member group is still the capturable shape");
+    CHECK(env_payload_present(L_PART, L_IDX) == 1,
+          "THREADS: the one-member capture wrote a discoverable payload");
+    /* Same disk, no reset: the previous single-thread payload is still in
+     * its slot. A refused re-capture must drop the directory entry rather
+     * than leave it for a later replay to serve as current. */
+    g_live_threads = 2;
+    g_live_refs = 2;
+    CHECK(env_payload_capture_all() == 0,
+          "THREADS: a second capture refuses once a live sibling exists");
+    CHECK(env_payload_present(L_PART, L_IDX) == 0,
+          "THREADS: the refused re-capture drops the old single-thread entry, so a replay cannot serve it");
+    CHECK(env_payload_last_refusal().code == EP_REFUSE_THREADS &&
+          env_payload_last_refusal().a == 1 &&
+          env_payload_last_refusal().b == 2,
+          "THREADS: the re-capture refusal names the task and both members again");
+    CHECK(setup_and_capture_linux_group(1, 0) == 0,
+          "THREADS: a named group with no live member is refused as half-torn");
+    CHECK(env_payload_present(L_PART, L_IDX) == 0,
+          "THREADS: the zero-live-member refusal wrote no payload");
+    CHECK(env_payload_last_refusal().code == EP_REFUSE_THREADS &&
+          env_payload_last_refusal().a == 1 &&
+          env_payload_last_refusal().b == 0,
+          "THREADS: the half-torn refusal names the task and the zero live count");
+    CHECK(setup_and_capture_linux_group(1, 1) == 1,
+          "THREADS: a healthy one-member group is capturable again");
+    g_live_refs = 2;   /* live stays 1: the counters disagree */
+    CHECK(env_payload_capture_all() == 0,
+          "THREADS: a group whose live count and address-space refs disagree is refused");
+    CHECK(env_payload_present(L_PART, L_IDX) == 0,
+          "THREADS: the mismatched-refs refusal wrote no payload");
+    CHECK(env_payload_last_refusal().code == EP_REFUSE_THREADS &&
+          env_payload_last_refusal().a == 1 &&
+          env_payload_last_refusal().b == 1,
+          "THREADS: the mismatched-refs refusal names the one live member");
+    CHECK(setup_and_capture_linux_group(1, 1) == 1,
+          "THREADS: the healthy shape captures after the mismatched-refs refusal");
+    CHECK(env_payload_last_refusal().code == EP_REFUSE_NONE,
+          "THREADS: a successful capture clears the previous refusal latch");
 
     CHECK(setup_and_capture_linux(1) == 1,
           "LINUX: re-capture for the permission tooth");

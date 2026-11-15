@@ -374,6 +374,34 @@ required, and a live arm where it is. No increment may claim the next one.
 - **M4.6 — Thread-aware checkpoint/restore.** Extend the record and payload,
   restore one shared address space plus N threads, and prove a parked futex
   waiter survives a reboot.
+  **Increment 1 live (2026-11-14), not an M4.6 landing:** the existing payload
+  has one Linux task slot and no group entry. `env_payload_capture_all()` asks
+  the live thread group for its member count and address-space reference count
+  and refuses (`EP_REFUSE_THREADS`) any named Linux task whose group is not
+  exactly one live member with one reference; a half-torn group (the counters
+  disagree, or there is no live member) is refused for the same reason. This is
+  the refusal-over-partial-application edge: before the record and payload
+  carry a shared-address-space entry plus N per-thread entries, a checkpoint of
+  a two-thread group would otherwise save the leader and lose the sibling
+  (including a parked futex waiter). A refused re-capture also writes a
+  directory built only from successful entries, so the identity's previous
+  payload entry is dropped rather than left for a later replay to serve.
+  The live half is `tests/m4_ckpt_probe_check.sh`. It builds the gate profile
+  with `E3_INIT_FEATURES=e3_envs,e7_gate,m4_ckpt_probe M4_CKPT_PROBE=1`, which
+  swaps the E7 firstuser for `fixtures/m4_ckpt_probe.S`: the parent clones a
+  real thread, the child's `write(1)` must be answered before the parent
+  publishes `M4.6-CKPT-READY`, and both contexts then spin. The harness creates
+  partition 1 / environment 1, waits for `M4.6-THREAD-OK` and
+  `M4.6-CKPT-READY`, and POSTs `/api/checkpoint`. Observed on 2026-11-14:
+  checkpoint answered `{"status":0,"seq":1,"count":1}`; the serial log carried
+  `capture refused (EP_REFUSE_THREADS) ... Linux task 2 'm4.ckpt.probe.0' has 2
+  live thread(s) and 2 address-space ref(s)`; there was no
+  `captured partition=1 index=1` line and no
+  `capture: task ... m4.ckpt.probe.0` line, so no payload for the group was
+  written; the host test also proves a refused re-capture drops a previous
+  single-thread directory entry. The next increment is the record v2 / payload v3 shape with
+  that group entry and thread array; only then can restore recreate N held
+  tasks and release them together. The runtime wall is unchanged.
 - **M4.7 — The runtime gate.** A static Go candidate (or threaded Rust)
   creates threads, joins them, shares a heap and fd, and survives the
   checkpoint/restore cycle. Only this increment may remove the M4 wall from

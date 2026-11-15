@@ -187,6 +187,13 @@ pub const TASK_LINUX: u32 = 2;
 /// against the ones it adopted. Fits `REGISTER_NAME_LEN` (24) with room.
 pub const LINUX_TASK_NAME: &str = "e7.gate.user.0";
 
+/// M4.6 increment 1's live probe task. It is the SAME third task slot as
+/// `LINUX_TASK_NAME`, selected by the `m4_ckpt_probe` build profile; the
+/// sidecar spawns it and init's registration names it under the same profile.
+/// The name is the identity the kernel's spawn stamp resolves, so these two
+/// halves must not drift. Fits `REGISTER_NAME_LEN` (24) with room.
+pub const M4_CKPT_TASK_NAME: &str = "m4.ckpt.probe.0";
+
 /// Byte offsets inside the reply body -- the layout, named rather than spelled
 /// inline, because these ARE the cross-language contract.
 pub const REG_OFF_PARTITION: usize = 0;

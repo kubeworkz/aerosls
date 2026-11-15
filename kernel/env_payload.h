@@ -93,6 +93,16 @@ struct EnvCkptRecord;
  * Linux tenant — no kernel state, that is checkpoint_mgr's sixteen regions);
  * it does not carry a parked Linux task's queued request (B9: the gate's
  * restorable form is USER); and it does not claim cross-node restore (P3).
+ *
+ * M4.6 increment 1: this blob has ONE task slot for the Linux tenant, not a
+ * shared-address-space entry plus N per-thread entries. A capture therefore
+ * refuses (EP_REFUSE_THREADS) any Linux task whose live group is not exactly
+ * one member with one address-space reference, rather than writing a payload
+ * that a replay would restore as a lone leader. A half-torn group (the two
+ * counters disagree, or there is no live member) is refused for the same
+ * reason. The refusal is the honest boundary until the record and payload
+ * carry the thread group (M4.6's next increment), and it is deliberately not
+ * an M4.6 landing claim.
  */
 
 /* Directory + blob format. Bumped by the WRITER whenever the layout
@@ -178,6 +188,13 @@ struct EnvCkptRecord;
 #define EP_REFUSE_PERM       13  /* a=task index, b=page index; the live PTE's permissions are not the captured ones */
 #define EP_REFUSE_FORM       14  /* a=task index, b=form; a Linux task whose captured form this blob cannot resume (parked/queued) */
 #define EP_REFUSE_SHAPE      15  /* a=task index; a captured task's kind is not what its slot claims (Linux vs sidecar) */
+#define EP_REFUSE_THREADS    16  /* a=task index, b=live group members; M4.6's
+                                  * N-thread shape is not representable yet, so
+                                  * capture refuses instead of saving only the
+                                  * leader. Exactly one live member AND one
+                                  * address-space ref is the single-thread shape
+                                  * this blob can restore; the serial line also
+                                  * reports the ref count. */
 
 struct EnvPayloadRefusal {
     uint32_t code;
