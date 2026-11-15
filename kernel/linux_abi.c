@@ -66,6 +66,7 @@ int32_t linux_errno_from_cap(int32_t cap_code)
     case CAP_ENAMETOOLONG:           return -LINUX_ENAMETOOLONG;
     case CAP_EPERM:                  return -LINUX_EPERM;
     case CAP_EFAULT:                 return -LINUX_EFAULT;
+    case CAP_EINTR:                  return -LINUX_EINTR;
     /* M1 network class: statuses the P2 socket service can distinguish.
      * Every one keeps its own Linux errno; none is collapsed into EIO or
      * EBUSY, because a TCP caller branches on the difference. */
@@ -109,6 +110,7 @@ int32_t cap_code_from_linux_errno(int32_t linux_errno)
     case -LINUX_EPROTO:    return CAP_ERR_PROTO;
     case -LINUX_ETIMEDOUT: return CAP_ERR_TIMEOUT;
     case -LINUX_EFAULT:    return CAP_EFAULT;
+    case -LINUX_EINTR:     return CAP_EINTR;
     /* E7 file class: each new code has exactly ONE preimage, so each
      * reverse is defined — the round-trip the host test pins. */
     case -LINUX_EEXIST:    return CAP_EEXIST;

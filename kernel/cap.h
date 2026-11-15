@@ -207,6 +207,10 @@
                                  * requested user write (M4.2 clone's stack or
                                  * ptid/ctid words); distinct from EINVAL so a
                                  * malformed clone is not disguised as EFAULT */
+#define CAP_EINTR       (-34)   /* a parked exchange interrupted by a
+                                 * sibling stop/SIGCONT (M4.10); distinct
+                                 * from EAGAIN so a resumed syscall does not
+                                 * look retryable */
 
 /* ─── Data structures ─────────────────────────────────────────────────────── */
 

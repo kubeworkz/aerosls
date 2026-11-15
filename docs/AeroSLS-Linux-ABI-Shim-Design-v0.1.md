@@ -497,12 +497,13 @@ increment consumes. They landed together as `kernel/linux_abi.h` /
 `kernel/linux_abi.c` (in the x86 image's `X86_C_SRC`), each with the host
 test §10.1 named:
 
-- `tests/linux_errno_map_host_test.c` — 51 checks, exhaustive over both
-  families (all twelve `CAP_E*`, all fourteen `CAP_ERR_*` including the
-  `CAP_ERR_OK` success arm), the `CAP_NONE` sentinel's translation to
-  `-EIO` (§5.7's "translated, never leaked"), the range law (every result
-  is 0 or inside `[-4095, -1]`, musl's errno window), and the reverse map
-  **exactly where it is defined**: the twelve unique-preimage codes
+- `tests/linux_errno_map_host_test.c` — 96 checks, exhaustive over both
+  families (all thirty-four `CAP_E*` including `CAP_EINTR`, all fourteen
+  `CAP_ERR_*` including the `CAP_ERR_OK` success arm), the `CAP_NONE`
+  sentinel's translation to `-EIO` (§5.7's "translated, never leaked"),
+  the range law (every result is 0 or inside `[-4095, -1]`, musl's errno
+  window), and the reverse map **exactly where it is defined**: the
+  thirty-four unique-preimage codes
   round-trip, and the five collapse errnos (`EPERM`, `ENOMEM`, `EINVAL`,
   `EIO`, `EBUSY`, which two or three CAP codes each map onto) return 0
   rather than guess which kernel-side truth the errno no longer carries.
@@ -3724,7 +3725,7 @@ Everything this document asserts about the tree, with its source:
 |---|---|
 | The E7 gate is one operational command with an owned, self-checked evidence path | `tests/e7_gate_all.sh` (source + live + teeth + selfkill; curated `evidence/e7_gate_<UTC>/`; `manifest.txt` with full/short commit and clean-or-dirty tree); `Makefile`'s `e7-gate` (driver smoke + committed replay preflight); `tests/e7_gate_all_smoke.sh`; `tests/e7_gate_evidence_check.sh`; `.github/workflows/e7-gate.yml` (weekly/manual full run + artifact upload) |
 | Trap entry, `swapgs`, per-CPU scratch, and `.unknown_syscall` → `do_syscall` for every number (no SLS number chain in the stub) | `arch/x86/syscall.asm`; guard clauses D3/D4 |
-| The errno map is total over both families and the `CAP_NONE` sentinel, with the reverse defined only on unique preimages | `kernel/linux_abi.h`/`.c`; `tests/linux_errno_map_host_test.c` (51 checks, §10.5) |
+| The errno map is total over both families and the `CAP_NONE` sentinel, with the reverse defined only on unique preimages | `kernel/linux_abi.h`/`.c`; `tests/linux_errno_map_host_test.c` (96 checks, §10.5) |
 | Every census number — traced and vDSO-declared — has a dispatch class, and the SLS overlaps 105/160/320 are UNKNOWN | `tests/linux_syscall_table_host_test.c` (42 checks) over `tools/linux_syscall_census.txt` |
 | The initial stack builder emits the canonical psABI image with §5.2's AT_* set, no `AT_SYSINFO_EHDR`, and refuses by returning 0 | `tests/linux_initial_stack_host_test.c` (46 checks, the current run; 40 before Q2's scan checks) |
 | The gate workload's stack high-water, from the gate profile's 0xA5 poison and scan: 3,488 bytes below the entry `%rsp` at its deepest, lowest touched `0x4000000a9050`, 57,424 of 65,536 bytes untouched — green on the control and all three tooth replays, the fault path included (§10.14) | `kernel/cap.c` (the create-time arm); `kernel/process.c` (`linux_stack_hwm_report`, at the stop and at teardown); `tests/linux_initial_stack_host_test.c`; `tests/e7_gate_check.sh` (B7 re-derives both lines and holds the 32 KiB floor); `evidence/e7_stack_hwm.log` |
@@ -3791,7 +3792,7 @@ Everything this document asserts about the tree, with its source:
 | `elf64_map_blob` assumes every PT_LOAD's `p_vaddr` is page-aligned | a libc-linked binary with a non-aligned RW LOAD reads every global in it 0x370 bytes off and dies at `rip=0x28` before `main` — measured, §10.13's step 0 | **LANDED** — increment 8's step 1: page-base anchor + lead-offset copy, host teeth E8a, guard clause O8 with teeth t53/t54, measured past `main` |
 | No `CR4.OSFXSR` written anywhere (the IDT's vector-7 gate existed all along — `idt.c`, SIMI Phase 10; `vecstore.c`'s comment saying otherwise is stale), no `xsetbv` | any ring-3 SSE instruction is #UD — every real libc and every Rust binary dies at its first vector op (measured: musl `abort`'s `pxor`, §10.13's step-1 run) | **LANDED** — increment 9: `CR4.OSFXSR\|OSXMMEXCPT` + `CR0.MP` armed on the BSP ahead of the trap gate, `fninit` + 0x1F80 `ldmxcsr`, CPUID refusal by name; host teeth `tests/fpu_enable_host_test.c` (40 checks), guard clause Q with teeth t70–t75, measured past `pxor` into `abort`'s tail (§10.13's step 2). **Remainder:** `xsetbv`/`CR4.OSXSAVE` are absent by decision — named, and dormant with the lazy path |
 | `rt_sigprocmask` (14), `rt_sigaction` (13) and `tkill` (200) refuse | `abort()` cannot die at its first `raise(SIGABRT)`, so its tail runs and faults on `hlt` (`rip=0x805260c`) — the firstuser's run ends there, ten attributed traps deep (§10.13's step 2; `rt_sigaction` newly visible) | **LANDED → M3.5** — increment 10 closed the copy plan, masks/pending and default kill; increment 12 closed the oldact/oldset copy-out; M3.1 installed an ordinary handler; M3.2–M3.4 add `sigaltstack`/`SA_ONSTACK`, `SA_SIGINFO`/ucontext, `SA_RESETHAND` and return-time pending redelivery; M3.5 adds the EPIPE→SIGPIPE producer with a saved `-EPIPE` return (§10.15). **Boundary:** cross-task/timer producers are named; signal state survives a checkpoint by riding captured sidecar/stack bytes |
-| No `CAP_E*` → Linux errno table (and a `CAP_NONE` sentinel in returns) | silent wrong errors (§5.7) | **LANDED** — increment 1 (§10.5): `linux_errno_from_cap()`/`cap_code_from_linux_errno()` total over all twelve `CAP_E*`, the `CAP_ERR_*` family and the `CAP_NONE` sentinel, applied only at the reply; `tests/linux_errno_map_host_test.c` (51 checks, exhaustive both ways), and the flipped-mapping tooth reddens the forward clause |
+| No `CAP_E*` → Linux errno table (and a `CAP_NONE` sentinel in returns) | silent wrong errors (§5.7) | **LANDED** — increment 1 (§10.5): `linux_errno_from_cap()`/`cap_code_from_linux_errno()` total over all thirty-four `CAP_E*` including `CAP_EINTR`, the `CAP_ERR_*` family and the `CAP_NONE` sentinel, applied only at the reply; `tests/linux_errno_map_host_test.c` (96 checks, exhaustive both ways), and the flipped-mapping tooth reddens the forward clause |
 | Target designated, but no candidate binary and therefore no artifact | the table is still unmeasured; `--check` reports a named skip rather than a pass | **LANDED** — `backup/aerobackup/` (static musl, 27 tests, no dependencies) is designated in `tools/linux_abi_candidate.conf` and censused at `tools/linux_syscall_census.txt` (26 traced syscalls plus the proved vDSO backstop, §5.5); `tests/linux_syscall_table_host_test.c` (42 checks) and the source-only `tests/linux_abi_census_check.sh` with its smoke hold the artifact and the anti-placeholder refusals |
 | No full thread groups / join wake (M4.1–M4.6 landed) | std pthread and Go are out; the static threaded-Rust gate is evidenced (§7) | `AeroSLS-M4-Threads-Design-v0.1.md` (M4.0) with M4.1 group/refcount, M4.2 clone/thread-create, M4.3 sidecar group state, M4.4 private futex wait/wake, M4.5 identity/exit, M4.6 thread-aware checkpoint and M4.7 static threaded-Rust gate landed; std pthread/Go remain out on the PROT_NONE stack reservation |
 | No ARM64 userspace OS | E7 cannot run there (§4.1) | H2 item #1 |

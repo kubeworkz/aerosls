@@ -51,6 +51,8 @@
 #define LINUX_EPERM        1
 #define LINUX_ENOENT       2
 #define LINUX_ESRCH        3
+#define LINUX_EINTR        4           /* M4.10: stop/SIGCONT resumes a
+                                         * parked syscall with EINTR */
 #define LINUX_EIO          5
 #define LINUX_EBADF        9
 #define LINUX_EAGAIN      11

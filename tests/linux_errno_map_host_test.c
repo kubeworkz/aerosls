@@ -52,6 +52,8 @@ int main(void)
         { CAP_ENOSYS,        -LINUX_ENOSYS,   "same word, same meaning" },
         { CAP_ECONFLICT,     -LINUX_EBUSY,    "state conflict reads as busy to a POSIX caller" },
         { CAP_EPERM,         -LINUX_EPERM,    "same word, same meaning" },
+        { CAP_EFAULT,        -LINUX_EFAULT,   "a user address the kernel cannot use" },
+        { CAP_EINTR,         -LINUX_EINTR,    "a parked exchange interrupted by stop/SIGCONT" },
     };
     size_t i;
     for (i = 0; i < sizeof(fwd) / sizeof(fwd[0]); i++) {
@@ -166,7 +168,7 @@ int main(void)
         int32_t specials[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
                                (int32_t)CAP_NONE, 99, -99, 65536, -1, -12,
                                -13, -20, -21, -22, -23, -24, -25, -26,
-                               -27, -28, -29, -30, -31, -32 };
+                               -27, -28, -29, -30, -31, -32, -33, -34 };
         for (i = 0; i < sizeof(specials) / sizeof(specials[0]); i++) {
             int32_t got = linux_errno_from_cap(specials[i]);
             if (got != 0 && (got < -4095 || got > -1))
@@ -215,6 +217,8 @@ int main(void)
         { -LINUX_ENETUNREACH,   CAP_ENETUNREACH },
         { -LINUX_EHOSTUNREACH,  CAP_EHOSTUNREACH },
         { -LINUX_EAFNOSUPPORT,  CAP_EAFNOSUPPORT },
+        { -LINUX_EFAULT,        CAP_EFAULT },
+        { -LINUX_EINTR,         CAP_EINTR },
     };
     for (i = 0; i < sizeof(rev) / sizeof(rev[0]); i++) {
         int32_t got = cap_code_from_linux_errno(rev[i].linux_errno);
@@ -256,7 +260,8 @@ int main(void)
                                   CAP_ERR_SPACE, CAP_ERR_PROTO, CAP_ERR_TIMEOUT,
                                   CAP_EEXIST, CAP_ENOTDIR, CAP_EISDIR,
                                   CAP_EACCES, CAP_EROFS, CAP_ESPIPE,
-                                  CAP_ENOTEMPTY, CAP_ENAMETOOLONG };
+                                  CAP_ENOTEMPTY, CAP_ENAMETOOLONG,
+                                  CAP_EFAULT, CAP_EINTR };
         for (i = 0; i < sizeof(defined_set) / sizeof(defined_set[0]); i++) {
             int32_t c = defined_set[i];
             if (cap_code_from_linux_errno(linux_errno_from_cap(c)) != c)
