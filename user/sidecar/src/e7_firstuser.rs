@@ -55,14 +55,14 @@ use crate::linux::LINUX_DEFAULT_ENV;
 /// binary (see the module doc). §5.1's gate applies unchanged: ET_EXEC only —
 /// and this build already is one, which is why the fixture is committed as
 /// built rather than linked by a script like the probe pair.
-#[cfg(not(feature = "m4_runtime_probe"))]
+#[cfg(not(any(feature = "m4_runtime_probe", feature = "m4_hardening_probe")))]
 static FIRSTUSER: &[u8] = include_bytes!("../fixtures/aerobackup.musl.elf");
 /* M4.7's gate image carries the threaded runtime candidate instead. The
  * backup fixture is not executed in that profile, and keeping both 600 KiB
  * payloads in the sidecar image pushes its stack into the image's upper
  * pages. An empty slice keeps the fallback path compiled without the
  * payload. */
-#[cfg(feature = "m4_runtime_probe")]
+#[cfg(any(feature = "m4_runtime_probe", feature = "m4_hardening_probe"))]
 static FIRSTUSER: &[u8] = &[];
 
 /// The child's name — registered at create (the manifest's NAME record),

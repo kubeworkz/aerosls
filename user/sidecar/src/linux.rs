@@ -191,6 +191,11 @@ const LINUX_RT_SIGRETURN: u64 = 15;
 const LINUX_SIGALTSTACK: u64 = 131;
 const LINUX_TKILL: u64 = 200;
 const LINUX_EXIT_GROUP: u64 = 231;
+const LINUX_KILL: u64 = 62;
+const LINUX_TGKILL: u64 = 234;
+const LINUX_SET_ROBUST_LIST: u64 = 273;
+const LINUX_GET_ROBUST_LIST: u64 = 274;
+const LINUX_ROBUST_LIST_HEAD_BYTES: u64 = 24;
 /// mmap(9) — armed since E7 increment 16 (§5.4's anonymous-map half):
 /// the 9 arm below answers the measured allocator's shapes from the
 /// ledger, and every refusal's LOG line carries the request's own
@@ -201,6 +206,8 @@ const LINUX_MMAP: u64 = 9;
 /// accepted; a fork-shaped word is ENOSYS by name (the kernel repeats the
 /// same check, so neither end is load-bearing alone).
 const LINUX_CLONE: u64 = 56;
+const LINUX_CLONE3: u64 = 435;
+const LINUX_CLONE_ARGS_BYTES: usize = 88;
 const CLONE_VM: u64 = 0x0000_0100;
 const CLONE_FS: u64 = 0x0000_0200;
 const CLONE_FILES: u64 = 0x0000_0400;
@@ -405,10 +412,13 @@ const LINUX_GETTID: u64 = 186;
 const LINUX_FUTEX: u64 = 202;
 const FUTEX_WAIT: u64 = 0;
 const FUTEX_WAKE: u64 = 1;
+const FUTEX_REQUEUE: u64 = 3;
+const FUTEX_CMP_REQUEUE: u64 = 4;
 const FUTEX_WAIT_BITSET: u64 = 9;
 const FUTEX_WAKE_BITSET: u64 = 10;
 const FUTEX_PRIVATE: u64 = 128;
 const FUTEX_WAIT_PAYLOAD_BYTES: usize = 24;
+const FUTEX_REQUEUE_PAYLOAD_BYTES: usize = 4;
 const NS_PER_SEC: u64 = 1_000_000_000;
 const POLLERR: u16 = 0x0008;
 const LINUX_POLL_MAX_FDS: usize = 16;
@@ -587,6 +597,10 @@ enum Answer {
     /// M4.4: FUTEX_WAKE removed these waiters, oldest first. `service` sends
     /// each one the deferred zero reply and answers the waker with the count.
     FutexWake(FutexWake),
+    /// M4.8: FUTEX_REQUEUE woke this prefix and moved the rest to `uaddr`.
+    /// `service` sends the deferred replies for `FutexWake` only; the moved
+    /// waiters stay in PENDING_FUTEX under their original tags.
+    FutexRequeue(FutexWake, u64, usize),
     /// M4.5: exit(60) ends only the calling thread; reply nothing.
     ExitThread,
     /// M4.5: exit_group(231) sweeps the whole thread group; reply nothing.
@@ -601,6 +615,13 @@ enum Answer {
     /// 14): the kill line prints `sig=<N>`, so WHICH signal killed the task
     /// is read off the line rather than reconstructed from which arms ran.
     SignalKill(u64),
+    /// M4.8: a default-terminate signal addressed to a SIBLING. `service`
+    /// reaps that task, wakes its clear/robust futexes, and answers the
+    /// sender 0 (the target, not the caller, dies).
+    SignalKillTask(u32, u64),
+    /// M4.8: a group-directed default-terminate signal. `service` folds this
+    /// into the existing exit_group sweep, so no caller reply is fabricated.
+    SignalGroupKill(u64),
     /// M3: a recorded handler is delivered. The kernel builds the x86-64
     /// signal frame and sysrets into `handler`; `rt_sigreturn` comes back
     /// as a normal num=15 request so this side restores the saved mask.
@@ -654,6 +675,8 @@ struct SigState {
     tid: u64,                 /* M4.5: the kernel-assigned TID (gettid)       */
     tgid: u64,                /* M4.5: the leader's TID (getpid)             */
     clear_tid: u64,           /* M4.5: set_tid_address/CLONE_CHILD_CLEARTID  */
+    robust_head: u64,         /* M4.8: struct robust_list_head VA, or 0      */
+    robust_len: u64,          /* M4.8: the size passed to set_robust_list    */
     mask: u64,                /* blocked signals, bit (sig - 1), signals 1..=64 */
     pending: u64,             /* blocked signals that have arrived              */
     dispo: [u8; SIG_MAX + 1], /* indexed by signal number: DFL / IGN / HANDLER  */
@@ -672,6 +695,8 @@ impl SigState {
             tid: 0,
             tgid: 0,
             clear_tid: 0,
+            robust_head: 0,
+            robust_len: 0,
             mask: 0,
             pending: 0,
             dispo: [DISPO_DFL; SIG_MAX + 1],
@@ -1438,6 +1463,21 @@ fn answer(
          * saved mask, so the state after return is exactly the mask that
          * was in force when the handler was entered. */
         LINUX_RT_SIGRETURN => restore_and_redeliver(sig, args[0]),
+        /* M4.8: set_robust_list(273). The kernel walker owns the actual
+         * exit-time owner-died write; this side records the head and the
+         * size so every teardown path can name it. get_robust_list(274)
+         * would need a sibling's out-pointer context, so it stays a named
+         * ENOSYS rather than a fabricated self-only answer. */
+        LINUX_SET_ROBUST_LIST => {
+            if args[1] != LINUX_ROBUST_LIST_HEAD_BYTES || args[0] == 0 {
+                Answer::Reply(0, E_INVAL)
+            } else {
+                sig.robust_head = args[0];
+                sig.robust_len = args[1];
+                Answer::Reply(0, STATUS_OK)
+            }
+        }
+        LINUX_GET_ROBUST_LIST => Answer::Reply(0, E_NOSYS),
         /* tkill (200 — the seam's DELIVERY): the tid must be the one this
          * task's own set_tid_address answer declared, compared at u32
          * width (musl stores that echo into pt->tid as an int32 and tkill
@@ -1492,33 +1532,116 @@ fn answer_tkill_sibling(gid: usize, self_tid: u64,
         return None;
     }
     let target = args[0] as u32;
-    let mut found: Option<usize> = None;
-    for j in 0..MAX_LINUX_TASKS {
-        if tasks()[j].used && tasks()[j].group == gid &&
-            tasks()[j].sig.tid as u32 == target {
-            found = Some(j);
-            break;
-        }
-    }
+    let found = task_by_tid(gid, target);
     let Some(j) = found else {
         return Some(Answer::Reply(0, E_TARGET));
     };
-    if args[1] == 0 {
-        return Some(Answer::Reply(0, STATUS_OK));
+    Some(signal_task(gid, j, args[1]))
+}
+
+fn task_by_tid(gid: usize, tid: u32) -> Option<usize> {
+    if tid == 0 { return None; }
+    for j in 0..MAX_LINUX_TASKS {
+        if tasks()[j].used && tasks()[j].group == gid &&
+            tasks()[j].sig.tid as u32 == tid {
+            return Some(j);
+        }
     }
-    if args[1] > SIG_MAX as u64 {
-        return Some(Answer::Reply(0, E_INVAL));
+    None
+}
+
+/// M4.8: deliver to a SIBLING task. Ignored dispositions and blocked signals
+/// are exact; a recorded handler or a stop default still needs a frame in the
+/// sibling's context, which this v1 cannot build, so those are named ENOSYS.
+/// A terminate default is the one action whose context is not the sibling's:
+/// the kernel tears it down and the sender gets Linux's 0.
+fn signal_task(gid: usize, j: usize, sig: u64) -> Answer {
+    if sig == 0 {
+        return Answer::Reply(0, STATUS_OK);
     }
-    let s = args[1] as usize;
+    if sig > SIG_MAX as u64 {
+        return Answer::Reply(0, E_INVAL);
+    }
+    let s = sig as usize;
+    if groups()[gid].sig_dispo[s] == DISPO_IGN {
+        return Answer::Reply(0, STATUS_OK);
+    }
     let t = &mut tasks()[j].sig;
-    if t.dispo[s] == DISPO_IGN {
-        return Some(Answer::Reply(0, STATUS_OK));
-    }
     if t.mask & (1u64 << (s - 1)) != 0 {
         t.pending |= 1u64 << (s - 1);
-        return Some(Answer::Reply(0, STATUS_OK));
+        return Answer::Reply(0, STATUS_OK);
     }
-    Some(Answer::Reply(0, E_NOSYS))
+    if groups()[gid].sig_dispo[s] == DISPO_HANDLER {
+        return Answer::Reply(0, E_NOSYS);
+    }
+    match default_action(sig) {
+        ACT_TERMINATE => Answer::SignalKillTask(t.tid as u32, sig),
+        ACT_IGNORE => Answer::Reply(0, STATUS_OK),
+        _ => Answer::Reply(0, E_NOSYS),
+    }
+}
+
+/// M4.8: tgkill(234) names both the group and the target TID. Self keeps the
+/// caller's own answer() path (handlers/frames are legal there); a sibling
+/// goes through signal_task.
+fn answer_tgkill(gid: usize, self_tid: u64,
+                 args: &[u64; 6]) -> Option<Answer> {
+    if args[0] == 0 || args[0] != groups()[gid].tgid {
+        return Some(Answer::Reply(0, E_TARGET));
+    }
+    if args[1] == 0 {
+        return Some(Answer::Reply(0, E_TARGET));
+    }
+    if args[1] == self_tid {
+        return None;
+    }
+    let Some(j) = task_by_tid(gid, args[1] as u32) else {
+        return Some(Answer::Reply(0, E_TARGET));
+    };
+    Some(signal_task(gid, j, args[2]))
+}
+
+/// M4.8: kill(62). A TID names one task (self or a sibling); the TGID names
+/// the whole group. process-group id 0/-1 and cross-group targets are refused
+/// by name: this v1 has no process-group namespace and never retargets a
+/// signal outside the caller's own group.
+fn answer_kill(gid: usize, self_tid: u64,
+               args: &[u64; 6]) -> Option<Answer> {
+    let pid = args[0];
+    if pid == 0 || pid > u32::MAX as u64 {
+        return Some(Answer::Reply(0, E_NOSYS));
+    }
+    let target = pid as u32;
+    if target == groups()[gid].tgid as u32 {
+        return Some(answer_group_signal(gid, args[1]));
+    }
+    if target == self_tid as u32 {
+        return None;
+    }
+    let Some(j) = task_by_tid(gid, target) else {
+        return Some(Answer::Reply(0, E_TARGET));
+    };
+    Some(signal_task(gid, j, args[1]))
+}
+
+/// M4.8: a group-directed default action. IGN is a 0 reply; TERMINATE folds
+/// into the existing exit_group sweep (no reply — the caller is one of the
+/// dead); a group-wide HANDLER frame is not landed and stops by name.
+fn answer_group_signal(gid: usize, sig: u64) -> Answer {
+    if sig == 0 { return Answer::Reply(0, STATUS_OK); }
+    if sig > SIG_MAX as u64 { return Answer::Reply(0, E_INVAL); }
+    let s = sig as usize;
+    if groups()[gid].sig_dispo[s] == DISPO_IGN {
+        return Answer::Reply(0, STATUS_OK);
+    }
+    if groups()[gid].sig_dispo[s] == DISPO_HANDLER {
+        return Answer::Reply(0, E_NOSYS);
+    }
+    match default_action(sig) {
+        ACT_TERMINATE => Answer::SignalGroupKill(sig),
+        ACT_IGNORE => Answer::Reply(0, STATUS_OK),
+        _ => Answer::Reply(0, E_NOSYS),
+    }
 }
 
 /// One slot of a Linux task's fd table (E7 increment 5 — the fd class's
@@ -1636,6 +1759,9 @@ fn expected_req_len(num: u64, args: &[u64; 6]) -> usize {
             if args[1] == (FUTEX_WAIT | FUTEX_PRIVATE) ||
                args[1] == (FUTEX_WAIT_BITSET | FUTEX_PRIVATE) =>
             LINUX_SYSCALL_REQ_BYTES + FUTEX_WAIT_PAYLOAD_BYTES,
+        LINUX_FUTEX if args[1] == (FUTEX_CMP_REQUEUE | FUTEX_PRIVATE) =>
+            LINUX_SYSCALL_REQ_BYTES + FUTEX_REQUEUE_PAYLOAD_BYTES,
+        LINUX_CLONE3 => LINUX_SYSCALL_REQ_BYTES + LINUX_CLONE_ARGS_BYTES,
         _ => LINUX_SYSCALL_REQ_BYTES,
     }
 }
@@ -3007,6 +3133,38 @@ fn futex_wake(g: &mut LinuxGroup, uaddr: u64, want: usize,
     out
 }
 
+/// M4.8: FUTEX_REQUEUE's queue transition. Wake the oldest `nr_wake` waiters
+/// on `from`, then move the oldest remaining `nr_requeue` waiters to `to`
+/// without replying to them. Returns the wake set and the number moved; the
+/// Linux return value is only the wake count. FIFO order is the `seq` field,
+/// exactly as a plain wake reads it.
+fn futex_requeue(g: &mut LinuxGroup, from: u64, to: u64,
+                 nr_wake: usize, nr_requeue: usize,
+                 bitset: u32) -> (FutexWake, usize) {
+    let w = futex_wake(g, from, nr_wake.min(MAX_FUTEX_WAITERS), bitset);
+    let mut moved = 0usize;
+    while moved < nr_requeue {
+        let mut pick: Option<usize> = None;
+        for (i, q) in g.futex.iter().enumerate() {
+            if !q.used || q.uaddr != from || q.bitset & bitset == 0 {
+                continue;
+            }
+            if pick.map_or(true, |p| q.seq < g.futex[p].seq) {
+                pick = Some(i);
+            }
+        }
+        let Some(i) = pick else { break };
+        g.futex[i].uaddr = to;
+        /* Linux appends the moved waiters to the destination's tail. A new
+         * sequence (rather than the source's old one) keeps that order when
+         * a destination waiter already exists and was enqueued earlier. */
+        g.futex[i].seq = g.futex_seq;
+        g.futex_seq = g.futex_seq.wrapping_add(1);
+        moved += 1;
+    }
+    (w, moved)
+}
+
 /// M4.5: send the deferred zero replies for a wake produced by a thread
 /// exit's clear-child-tid rule. This is the same reply shape as a FUTEX_WAKE
 /// answer; the wake itself is already committed to the group queue.
@@ -3038,6 +3196,45 @@ fn wake_clear_tid<K: Kernel>(k: &K, gid: usize, i: usize) {
     if ctid != 0 {
         futex_wake_reply(k, gid, ctid, 1);
         tasks()[i].sig.clear_tid = 0;
+    }
+}
+
+/// M4.8: collect one exiting thread's robust-list futex words. The kernel
+/// does the checked child-memory walk and ORs FUTEX_OWNER_DIED; this side
+/// only remembers the addresses until after the kill/teardown so a failed
+/// sweep cannot wake waiters on a still-live group. The head is consumed
+/// once, whether the walk succeeds or not.
+fn robust_exit_collect<K: Kernel>(k: &K, i: usize) -> ([u64; 8], usize) {
+    let mut out = [0u64; 8];
+    if i >= MAX_LINUX_TASKS || !tasks()[i].used {
+        return (out, 0);
+    }
+    let head = tasks()[i].sig.robust_head;
+    let len = tasks()[i].sig.robust_len;
+    tasks()[i].sig.robust_head = 0;
+    if head == 0 || len != LINUX_ROBUST_LIST_HEAD_BYTES {
+        return (out, 0);
+    }
+    let n = tasks()[i].name_len;
+    let mut name_buf = [0u8; 48];
+    name_buf[..n].copy_from_slice(&tasks()[i].name[..n]);
+    let name = core::str::from_utf8(&name_buf[..n]).unwrap_or("");
+    let pid = k.sidecar_pid(name, tasks()[i].partition);
+    if pid == 0 {
+        return (out, 0);
+    }
+    match k.linux_robust_exit(pid, head, len, &mut out) {
+        Ok(n) => (out, n.min(out.len())),
+        Err(_) => (out, 0),
+    }
+}
+
+/// M4.8: wake every queue named by a robust walk. The owner-died bit is
+/// already in the child word; the wake is what releases FUTEX_WAIT's
+/// deferred reply, exactly like clear-child-tid's join wake.
+fn robust_wake<K: Kernel>(k: &K, gid: usize, addrs: &[u64; 8], n: usize) {
+    for &uaddr in addrs[..n].iter() {
+        futex_wake_reply(k, gid, uaddr, 1);
     }
 }
 
@@ -3093,6 +3290,33 @@ fn answer_futex(
             u32::MAX
         };
         Answer::FutexWake(futex_wake(g, args[0], want, bitset))
+    } else if op == (FUTEX_REQUEUE | FUTEX_PRIVATE) ||
+              op == (FUTEX_CMP_REQUEUE | FUTEX_PRIVATE) {
+        /* M4.8: move waiters from args[0] to args[4]. Plain REQUEUE has
+         * no payload; CMP_REQUEUE carries the kernel's four-byte snapshot
+         * of the destination word and refuses with EAGAIN when the
+         * caller's expected word no longer matches. A zero destination or
+         * the same queue on both ends is EINVAL, as Linux's futex code
+         * names it. */
+        let cmp = op == (FUTEX_CMP_REQUEUE | FUTEX_PRIVATE);
+        if cmp && payload.len() != FUTEX_REQUEUE_PAYLOAD_BYTES {
+            return Answer::Reply(0, E_NOSYS);
+        }
+        if args[4] == 0 || args[4] == args[0] {
+            return Answer::Reply(0, E_INVAL);
+        }
+        if cmp {
+            let observed = u32::from_le_bytes([payload[0], payload[1],
+                                                payload[2], payload[3]]);
+            if observed != args[5] as u32 {
+                return Answer::Reply(0, E_AGAIN);
+            }
+        }
+        let nr_wake = args[2].min(MAX_FUTEX_WAITERS as u64) as usize;
+        let nr_requeue = args[3].min(MAX_FUTEX_WAITERS as u64) as usize;
+        let (w, moved) = futex_requeue(g, args[0], args[4], nr_wake,
+                                        nr_requeue, u32::MAX);
+        Answer::FutexRequeue(w, args[4], moved)
     } else {
         Answer::Reply(0, E_NOSYS)
     }
@@ -3286,6 +3510,7 @@ fn answer_clone<K: Kernel, A: BufferAlloc>(
     i: usize,
     args: &[u64; 6],
     vfs: &mut Vfs<K, A>,
+    num: u64,
 ) -> Answer {
     let flags = args[0];
     if flags & !CLONE_M4_ALLOW != 0 {
@@ -3349,7 +3574,7 @@ fn answer_clone<K: Kernel, A: BufferAlloc>(
              * must stay in that family. Mapping it to a Linux errno here
              * would make the kernel map an already-mapped value (EINVAL
              * -22 has no CAP preimage and would arrive as EIO). */
-            enosys_log(LINUX_CLONE as u32, &pname[..nlen], b" clone refused\n");
+            enosys_log(num as u32, &pname[..nlen], b" clone refused\n");
             return Answer::Reply(0, cap);
         }
     };
@@ -3398,8 +3623,47 @@ fn answer_clone<K: Kernel, A: BufferAlloc>(
     off = dec_into(&mut ex, off, gid as u64);
     off = push_bytes(&mut ex, off, if share_fds { b" files shared\n" }
                                           else { b" files copied\n" });
-    enosys_log(LINUX_CLONE as u32, &pname[..nlen], &ex[..off]);
+    enosys_log(num as u32, &pname[..nlen], &ex[..off]);
     Answer::Reply(child_tid as u64, STATUS_OK)
+}
+
+/// M4.8: clone3(435)'s answer. The kernel copied the 88-byte v1
+/// `struct clone_args`; this function applies field policy and reuses the
+/// clone(56) mechanism/policy seam. Every unsupported extension is refused
+/// by NAME (ENOSYS) rather than silently ignored; a non-thread exit signal
+/// or a size the kernel already rejected is EINVAL.
+fn answer_clone3<K: Kernel, A: BufferAlloc>(
+    k: &K,
+    i: usize,
+    payload: &[u8],
+    vfs: &mut Vfs<K, A>,
+) -> Answer {
+    if payload.len() != LINUX_CLONE_ARGS_BYTES {
+        return Answer::Reply(0, E_NOSYS);
+    }
+    let flags = read_u64(payload, 0);
+    let pidfd = read_u64(payload, 8);
+    let child_tid = read_u64(payload, 16);
+    let parent_tid = read_u64(payload, 24);
+    let exit_signal = read_u64(payload, 32);
+    let stack = read_u64(payload, 40);
+    let stack_size = read_u64(payload, 48);
+    let tls = read_u64(payload, 56);
+    let set_tid = read_u64(payload, 64);
+    let set_tid_size = read_u64(payload, 72);
+    let cgroup = read_u64(payload, 80);
+
+    if pidfd != 0 || stack_size != 0 || set_tid != 0 ||
+        set_tid_size != 0 || cgroup != 0 {
+        return Answer::Reply(0, E_NOSYS);
+    }
+    /* A thread's exit_signal is ignored by Linux; glibc still passes
+     * SIGCHLD in its clone3 shape, so accept 0 and SIGCHLD only. */
+    if exit_signal != 0 && exit_signal != 17 {
+        return Answer::Reply(0, E_INVAL);
+    }
+    let args = [flags, stack, parent_tid, child_tid, tls, 0];
+    answer_clone(k, i, &args, vfs, LINUX_CLONE3)
 }
 
 fn enosys_log(tag_num: u32, child: &[u8], extra: &[u8]) {
@@ -3685,7 +3949,8 @@ pub fn service<K: Kernel, A: BufferAlloc>(
             /* M4.2: the thread-create seam. It is deliberately its own arm:
              * it needs the kernel primitive, and it is the only arm that
              * grows the sidecar's task table from inside service(). */
-            LINUX_CLONE => answer_clone(k, i, &args, vfs),
+            LINUX_CLONE => answer_clone(k, i, &args, vfs, LINUX_CLONE),
+            LINUX_CLONE3 => answer_clone3(k, i, payload, vfs),
             /* M4.4: the group-keyed wait/wake queue. The observed word and
              * relative timeout are the kernel's attached record; the group
              * owns the queue, and the deferred replies are sent below. */
@@ -3706,6 +3971,18 @@ pub fn service<K: Kernel, A: BufferAlloc>(
             LINUX_TKILL => match answer_tkill_sibling(gid, sigstate.tid, &args) {
                 Some(a) => a,
                 None => answer(num, &args, &fds, &mut mem, &mut sigstate, payload),
+            },
+            LINUX_TGKILL => match answer_tgkill(gid, sigstate.tid, &args) {
+                Some(a) => a,
+                None => answer(LINUX_TKILL,
+                               &[sigstate.tid, args[2], 0, 0, 0, 0],
+                               &fds, &mut mem, &mut sigstate, payload),
+            },
+            LINUX_KILL => match answer_kill(gid, sigstate.tid, &args) {
+                Some(a) => a,
+                None => answer(LINUX_TKILL,
+                               &[sigstate.tid, args[1], 0, 0, 0, 0],
+                               &fds, &mut mem, &mut sigstate, payload),
             },
             _ => answer(num, &args, &fds, &mut mem, &mut sigstate, payload),
         };
@@ -3749,6 +4026,18 @@ pub fn service<K: Kernel, A: BufferAlloc>(
         groups()[gid].sig_dispo = sigstate.dispo;
         groups()[gid].sig_act = sigstate.act;
         tasks()[i].sig = sigstate;
+
+        /* M4.8: a group-directed default-terminate signal is the existing
+         * exit_group decision, not a second sweep implementation. The log
+         * names the signal before the fold so the serial line attributes
+         * the death to kill(2), not to an unrelated exit_group. */
+        if let Answer::SignalGroupKill(gsig) = &ans {
+            let mut ex = [0u8; 48];
+            let n = fmt_sig_line(&mut ex, b" group sig=", *gsig,
+                                 b" -> exit_group sweep\n");
+            enosys_log(num as u32, &name_buf[..nlen], &ex[..n]);
+            ans = Answer::ExitGroup;
+        }
 
         match ans {
             Answer::Reply(ret, status) => {
@@ -3972,8 +4261,15 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                 tasks()[i].pending_tag = rr.tag;
                 tasks()[i].pending_arg = uaddr;
                 tasks()[i].pending_deadline = deadline;
-                enosys_log(num as u32, &name_buf[..nlen],
-                           b" wait (futex)\n");
+                let mut ex = [0u8; 56];
+                let mut off = push_bytes(&mut ex, 0, b" wait (futex) uaddr=0x");
+                off = hex_into(&mut ex, off, uaddr);
+                off = push_bytes(&mut ex, off, b" q=");
+                off = dec_into(&mut ex, off,
+                               groups()[gid].futex.iter()
+                                   .filter(|w| w.used).count() as u64);
+                off = push_bytes(&mut ex, off, b"\n");
+                enosys_log(num as u32, &name_buf[..nlen], &ex[..off]);
             }
             Answer::FutexWake(w) => {
                 for &idx in w.tasks[..w.n as usize].iter() {
@@ -3990,6 +4286,31 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                 enosys_log(num as u32, &name_buf[..nlen], b" wake (futex)\n");
                 reply(k, ch_w, rr.tag, num, w.n as u64, STATUS_OK);
             }
+            Answer::FutexRequeue(w, to, moved) => {
+                for &idx in w.tasks[..w.n as usize].iter() {
+                    let j = idx as usize;
+                    if j >= MAX_LINUX_TASKS || !tasks()[j].used ||
+                        tasks()[j].pending != PENDING_FUTEX {
+                        continue;
+                    }
+                    let wake_tag = tasks()[j].pending_tag;
+                    let wake_ch = tasks()[j].ch_w;
+                    tasks()[j].pending = PENDING_NONE;
+                    reply(k, wake_ch, wake_tag, LINUX_FUTEX, 0, STATUS_OK);
+                }
+                let mut ex = [0u8; 48];
+                let mut off = push_bytes(&mut ex, 0, b" requeue from=0x");
+                off = hex_into(&mut ex, off, args[0]);
+                off = push_bytes(&mut ex, off, b" -> 0x");
+                off = hex_into(&mut ex, off, to);
+                off = push_bytes(&mut ex, off, b" woke=");
+                off = dec_into(&mut ex, off, w.n as u64);
+                off = push_bytes(&mut ex, off, b" moved=");
+                off = dec_into(&mut ex, off, moved as u64);
+                off = push_bytes(&mut ex, off, b"\n");
+                enosys_log(num as u32, &name_buf[..nlen], &ex[..off]);
+                reply(k, ch_w, rr.tag, num, w.n as u64, STATUS_OK);
+            }
             Answer::ExitThread => {
                 /* M4.5: exit(60) ends only this thread. The kernel's
                  * teardown zeroes clear_child_tid through its checked
@@ -4001,12 +4322,14 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                 enosys_log(num as u32, &name_buf[..nlen], &ex[..n]);
                 let name = core::str::from_utf8(&name_buf[..nlen]).unwrap_or("");
                 let pid = k.sidecar_pid(name, partition);
+                let (raddr, rn) = robust_exit_collect(k, i);
                 if pid == 0 {
                     enosys_log(num as u32, &name_buf[..nlen], b" exit: NOT-FOUND\n");
                     reply(k, ch_w, rr.tag, num, 0, E_CONFLICT);
                 } else {
                     k.proc_kill(pid);
                     wake_clear_tid(k, gid, i);
+                    robust_wake(k, gid, &raddr, rn);
                     release_task(i, vfs);
                 }
             }
@@ -4023,10 +4346,15 @@ pub fn service<K: Kernel, A: BufferAlloc>(
 
                 let tgid = groups()[gid].tgid;
                 let mut members = [0usize; MAX_LINUX_TASKS];
+                let mut robust = [[0u64; 8]; MAX_LINUX_TASKS];
+                let mut robust_n = [0usize; MAX_LINUX_TASKS];
                 let mut nm = 0usize;
                 for j in 0..MAX_LINUX_TASKS {
                     if tasks()[j].used && tasks()[j].group == gid {
                         members[nm] = j;
+                        let (a, n) = robust_exit_collect(k, j);
+                        robust[nm] = a;
+                        robust_n[nm] = n;
                         nm += 1;
                     }
                 }
@@ -4085,6 +4413,8 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                     for &j in members[..nm].iter() {
                         if task_is_dead(k, j, partition) {
                             wake_clear_tid(k, gid, j);
+                            let pos = members[..nm].iter().position(|&m| m == j).unwrap_or(0);
+                            robust_wake(k, gid, &robust[pos], robust_n[pos]);
                             release_task(j, vfs);
                         }
                     }
@@ -4095,8 +4425,9 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                     enosys_log(num as u32, &name_buf[..nlen], &ex[..off]);
                     continue;
                 }
-                for &j in members[..nm].iter() {
+                for (pos, &j) in members[..nm].iter().enumerate() {
                     wake_clear_tid(k, gid, j);
+                    robust_wake(k, gid, &robust[pos], robust_n[pos]);
                     release_task(j, vfs);
                 }
                 let mut ex = [0u8; 64];
@@ -4129,14 +4460,47 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                 enosys_log(num as u32, &name_buf[..nlen], &ex[..n]);
                 let name = core::str::from_utf8(&name_buf[..nlen]).unwrap_or("");
                 let pid = k.sidecar_pid(name, partition);
+                let (raddr, rn) = robust_exit_collect(k, i);
                 if pid == 0 {
                     enosys_log(num as u32, &name_buf[..nlen], b" sig kill: NOT-FOUND (reap refused)\n");
                     reply(k, ch_w, rr.tag, num, 0, E_CONFLICT);
                 } else {
                     k.proc_kill(pid);
                     wake_clear_tid(k, gid, i);
+                    robust_wake(k, gid, &raddr, rn);
                     release_task(i, vfs);
                 }
+            }
+            Answer::SignalKillTask(tid, kill_sig) => {
+                /* M4.8: tgkill/kill addressed a SIBLING. The target's own
+                 * robust list and clear-tid are consumed before its record
+                 * is released; the sender receives 0 because the kernel's
+                 * signal delivery did not kill the sender. */
+                let Some(j) = task_by_tid(gid, tid) else {
+                    reply(k, ch_w, rr.tag, num, 0, E_TARGET);
+                    continue;
+                };
+                let name = core::str::from_utf8(&name_buf[..nlen]).unwrap_or("");
+                let pid = k.sidecar_pid(name, partition);
+                if pid == 0 {
+                    reply(k, ch_w, rr.tag, num, 0, E_TARGET);
+                    continue;
+                }
+                let (raddr, rn) = robust_exit_collect(k, j);
+                k.proc_kill(tid);
+                wake_clear_tid(k, gid, j);
+                robust_wake(k, gid, &raddr, rn);
+                release_task(j, vfs);
+                let mut ex = [0u8; 48];
+                let n = fmt_sig_line(&mut ex, b" sibling sig=", kill_sig,
+                                     b" -> kill\n");
+                enosys_log(num as u32, &name_buf[..nlen], &ex[..n]);
+                reply(k, ch_w, rr.tag, num, 0, STATUS_OK);
+            }
+            Answer::SignalGroupKill(_) => {
+                /* The pre-match transform below folds this into ExitGroup;
+                 * this arm is unreachable but keeps the match total. */
+                reply(k, ch_w, rr.tag, num, 0, E_CONFLICT);
             }
             Answer::SignalHandler(d) => {
                 /* M3: the sidecar has already moved its mask to the
@@ -5931,5 +6295,64 @@ mod tests {
         assert!(matches!(answer_futex(&mut g, 0, &empty_wake, &[], 1_000),
                          Answer::Reply(0, E_INVAL)));
         assert_eq!(g.futex.iter().filter(|w| w.used).count(), 0);
+    }
+
+    #[test]
+    fn m4_8_requeue_moves_the_oldest_remainder_and_cmp_checks_the_destination() {
+        let mut g = LinuxGroup::new();
+        let from = 0x7000_3000u64;
+        let to = 0x7000_4000u64;
+        for t in 0..3u8 {
+            assert!(futex_enqueue(&mut g, t as usize, from, u32::MAX));
+        }
+        let (w, moved) = futex_requeue(&mut g, from, to, 1, 1, u32::MAX);
+        assert_eq!((w.n, w.tasks[0], moved), (1, 0, 1));
+        assert_eq!(g.futex.iter().filter(|q| q.used && q.uaddr == to).count(), 1);
+        assert_eq!(g.futex.iter().filter(|q| q.used && q.uaddr == from).count(), 1);
+        assert_eq!(g.futex.iter().filter(|q| q.used).count(), 2);
+
+        /* CMP_REQUEUE's attached word is compared before any queue move; a
+         * mismatch is EAGAIN and leaves the queue untouched. */
+        let cmp = [from, FUTEX_CMP_REQUEUE | FUTEX_PRIVATE, 0, 1, to, 7];
+        let payload = 8u32.to_le_bytes();
+        assert!(matches!(answer_futex(&mut g, 0, &cmp, &payload, 1_000),
+                         Answer::Reply(0, E_AGAIN)));
+        assert_eq!(g.futex.iter().filter(|q| q.used).count(), 2);
+        let payload = 7u32.to_le_bytes();
+        match answer_futex(&mut g, 0, &cmp, &payload, 1_000) {
+            Answer::FutexRequeue(_, dst, moved) => {
+                assert_eq!((dst, moved), (to, 1));
+            }
+            other => panic!("CMP_REQUEUE did not move: {:?}", other),
+        }
+        assert_eq!(g.futex.iter().filter(|q| q.used && q.uaddr == to).count(), 2);
+        assert_eq!(g.futex.iter().filter(|q| q.used).count(), 2);
+    }
+
+    #[test]
+    fn m4_8_requeue_appends_moved_waiters_to_destination_tail() {
+        let mut g = LinuxGroup::new();
+        let from = 0x7000_5000u64;
+        let to = 0x7000_6000u64;
+        assert!(futex_enqueue(&mut g, 0, from, u32::MAX));
+        assert!(futex_enqueue(&mut g, 1, to, u32::MAX));
+        let (_, moved) = futex_requeue(&mut g, from, to, 0, 1, u32::MAX);
+        assert_eq!(moved, 1);
+        /* The destination's existing waiter (1) was enqueued first and must
+         * be woken before the moved source waiter (0). */
+        let w = futex_wake(&mut g, to, 2, u32::MAX);
+        assert_eq!((w.n, w.tasks[0], w.tasks[1]), (2, 1, 0));
+    }
+
+    #[test]
+    fn m4_8_expected_lengths_include_clone3_and_cmp_requeue() {
+        let mut a = [0u64; 6];
+        assert_eq!(expected_req_len(LINUX_CLONE3, &a),
+                   LINUX_SYSCALL_REQ_BYTES + LINUX_CLONE_ARGS_BYTES);
+        a[1] = FUTEX_CMP_REQUEUE | FUTEX_PRIVATE;
+        assert_eq!(expected_req_len(LINUX_FUTEX, &a),
+                   LINUX_SYSCALL_REQ_BYTES + FUTEX_REQUEUE_PAYLOAD_BYTES);
+        a[1] = FUTEX_REQUEUE | FUTEX_PRIVATE;
+        assert_eq!(expected_req_len(LINUX_FUTEX, &a), LINUX_SYSCALL_REQ_BYTES);
     }
 }

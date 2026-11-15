@@ -81,6 +81,8 @@ pub mod m4_exit_probe;
 pub mod m4_ckpt_probe;
 #[cfg(feature = "m4_runtime_probe")]
 pub mod m4_runtime_probe;
+#[cfg(feature = "m4_hardening_probe")]
+pub mod m4_hardening_probe;
 pub mod net_client;
 
 #[cfg(feature = "target")]

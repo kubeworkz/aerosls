@@ -1,0 +1,12 @@
+[package]
+name = "m4_hardening_gate"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "M4.8 live hardening gate: clone3, requeue, robust futex and tgkill"
+
+[[bin]]
+name = "m4_hardening_gate"
+path = "src/main.rs"
+
+[dependencies]

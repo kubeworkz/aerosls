@@ -195,6 +195,13 @@ const char *linux_syscall_class_name(enum LinuxSyscallClass cls);
  * before its first instruction. */
 #define LINUX_CLONE_DETACHED     0x00400000ULL
 
+/* M4.8: clone3 (435) and the 88-byte clone_args v1 structure. The kernel
+ * copies the struct at the first trap (the child's address space is not the
+ * sidecar's); the sidecar owns the field policy. A size other than 88 is
+ * EINVAL by name: a future clone_args extension is not silently truncated. */
+#define LINUX_CLONE3             435u
+#define LINUX_CLONE_ARGS_BYTES    88u
+
 #define LINUX_CLONE_ALLOW (LINUX_CLONE_VM | LINUX_CLONE_FS | \
                            LINUX_CLONE_FILES | LINUX_CLONE_SIGHAND | \
                            LINUX_CLONE_THREAD | LINUX_CLONE_SYSVSEM | \
@@ -216,7 +223,7 @@ static inline int linux_clone_flags_verdict(uint64_t flags)
     return 0;
 }
 
-/* ─── M4.4 — futex wait/wake and the observed-word copy ───────────────────
+/* ─── M4.4/M4.8 — futex wait/wake, requeue and the word copies ────────────
  * The queue itself is the sidecar's (D6): one group-keyed queue, FIFO wake,
  * expected-value comparison and a per-wait timeout. The kernel owns the
  * one thing the sidecar cannot do — read the child's 4-byte word and (when
@@ -241,9 +248,30 @@ static inline int linux_clone_flags_verdict(uint64_t flags)
  * sixth argument; a plain FUTEX_WAKE is MATCH_ANY over it. */
 #define LINUX_FUTEX_WAIT_BITSET     9u
 #define LINUX_FUTEX_WAKE_BITSET     10u
+#define LINUX_FUTEX_REQUEUE         3u
+#define LINUX_FUTEX_CMP_REQUEUE     4u
 #define LINUX_FUTEX_PRIVATE_FLAG    128u
 #define LINUX_FUTEX_CMD_MASK        0x7fu
 #define LINUX_FUTEX_WAIT_PAYLOAD_BYTES 24u
+#define LINUX_FUTEX_REQUEUE_PAYLOAD_BYTES 4u
+
+/* M4.8: robust futex lists. The head is Linux's three-word
+ * struct robust_list_head; the kernel reads it and each entry at thread
+ * exit, sets FUTEX_OWNER_DIED on the entry's futex word, and returns the
+ * addresses so the sidecar can wake its group queue. */
+#define LINUX_SET_ROBUST_LIST       273u
+#define LINUX_GET_ROBUST_LIST       274u
+#define LINUX_ROBUST_LIST_HEAD_BYTES 24u
+#define LINUX_ROBUST_MAX_ENTRIES      8u
+#define LINUX_FUTEX_OWNER_DIED   0x40000000u
+#define LINUX_FUTEX_WAITERS      0x80000000u
+
+/* M4.8: group-directed signals. kill(62) addresses a TID or a TGID;
+ * tgkill(234) names both. The sidecar resolves a target inside one
+ * Linux group and answers ESRCH/ENOSYS by name when it cannot honestly
+ * deliver to a sibling context. */
+#define LINUX_KILL                  62u
+#define LINUX_TGKILL               234u
 
 /* ─── M4.5 — identity and thread exit ─────────────────────────────────────
  * getpid/gettid are answered by the sidecar from the kernel-assigned
@@ -264,6 +292,24 @@ struct LinuxFutexPlan {
     uint32_t payload_len;    /* 24 for private WAIT, 0 otherwise     */
     int32_t  refuse;         /* 0, or the first-trap Linux errno     */
 };
+
+/* M4.8: clone3's first-trap copy plan. `size` must be exactly
+ * LINUX_CLONE_ARGS_BYTES; `src` must cover the whole structure. The
+ * sidecar parses the bytes and applies the same thread-create policy as
+ * clone(56). Total over (num, args). */
+struct LinuxClone3Plan {
+    uint64_t src;            /* child VA of struct clone_args */
+    uint32_t payload_len;    /* 88 for clone3, 0 otherwise     */
+    int32_t  refuse;         /* 0, or the first-trap errno     */
+};
+
+struct LinuxClone3Plan linux_clone3_plan(uint64_t num,
+                                         const uint64_t args[6]);
+
+/* M4.8: the checked arithmetic behind a robust-list entry: entry + signed
+ * futex_offset, or 0 when the result is not a canonical user address. Pure
+ * so the kernel walker and the host test share one rule. */
+uint64_t linux_robust_futex_addr(uint64_t entry, int64_t futex_offset);
 
 /* Plan the futex word/timeout crossing. Pure over (num, args). A NULL or
  * non-canonical uaddr is -EFAULT before any post; a timeout pointer, when
@@ -955,6 +1001,8 @@ void linux_signal_ucontext_build(struct LinuxUContext *uc,
  * rides the same forward buffer as the path/sig/fd crossings. */
 _Static_assert(LINUX_FUTEX_WAIT_PAYLOAD_BYTES < LINUX_FWD_ATTACH_CAP,
                "the futex wait record must fit the forward attach buffer");
+_Static_assert(LINUX_CLONE_ARGS_BYTES < LINUX_FWD_ATTACH_CAP,
+               "clone_args must fit the forward attach buffer");
 
 /* What a staged reply payload IS — the apply/deliver's dispatch over the
  * three reply shapes this increment adds to increment 12's copy-IN.

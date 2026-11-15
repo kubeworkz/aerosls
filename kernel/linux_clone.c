@@ -319,3 +319,72 @@ uint64_t sys_sls_linux_set_clear_tid(struct SLSLinuxClearTidRequest *req) {
     pd->linux_clear_child_tid = req->va;
     return 0;
 }
+
+/* M4.8: one robust-list entry. Read its futex word, OR in OWNER_DIED, write
+ * it back through the checked child copy, and remember the address so the
+ * sidecar can wake that queue. A bad address stops the walk silently: Linux's
+ * exit path does not fault on a corrupt robust list. */
+static int robust_fix_entry(uint64_t cr3, uint64_t entry, int64_t off,
+                            struct SLSLinuxRobustExitRequest *req)
+{
+    uint64_t futex = linux_robust_futex_addr(entry, off);
+    uint32_t word;
+    uint32_t i;
+
+    if (futex == 0) return -1;
+    for (i = 0; i < req->count; i++)
+        if (req->futexes[i] == futex) return 0;
+    if (linux_user_copy_out(&word, cr3, futex, sizeof(word)) != 0)
+        return -1;
+    word |= LINUX_FUTEX_OWNER_DIED;
+    if (linux_user_copy_in(&word, cr3, futex, sizeof(word)) != 0)
+        return -1;
+    if (req->count < req->max)
+        req->futexes[req->count++] = futex;
+    return 0;
+}
+
+uint64_t sys_sls_linux_robust_exit(struct SLSLinuxRobustExitRequest *req) {
+    struct ProcessDescriptor *caller = process_find_current();
+    uint64_t head[3];              /* next, futex_offset, list_op_pending */
+    uint64_t entry;
+    uint64_t pending;
+    int64_t offset;
+    uint32_t steps = 0;
+
+    if (!caller || !caller->active || !caller->sidecar_authority)
+        return (uint64_t)(int64_t)CAP_EPERM;
+    if (!req) return (uint64_t)(int64_t)CAP_EINVAL;
+    req->count = 0;
+    req->status = 0;
+    if (req->max == 0 || req->max > SLS_LINUX_ROBUST_MAX)
+        return (uint64_t)(int64_t)(req->status = CAP_EINVAL);
+    if (req->head == 0)
+        return 0;
+    if (req->len != LINUX_ROBUST_LIST_HEAD_BYTES)
+        return (uint64_t)(int64_t)(req->status = CAP_EINVAL);
+
+    struct ProcessDescriptor *pd = clone_find_pid(req->pid);
+    if (!pd || !pd->active || pd->personality != PROC_PERSONALITY_LINUX ||
+        pd->linux_tgid == 0 || pd->partition_id != caller->partition_id)
+        return (uint64_t)(int64_t)(req->status = CAP_ERR_NOTFOUND);
+    if (linux_user_copy_out(head, pd->cr3, req->head, sizeof(head)) != 0)
+        return (uint64_t)(int64_t)(req->status = CAP_EFAULT);
+
+    offset = (int64_t)head[1];
+    pending = head[2];
+    if (pending != 0)
+        (void)robust_fix_entry(pd->cr3, pending, offset, req);
+
+    entry = head[0];
+    while (entry != 0 && entry != req->head && steps < req->max) {
+        uint64_t next;
+        steps++;
+        if (linux_user_copy_out(&next, pd->cr3, entry, sizeof(next)) != 0)
+            break;
+        if (robust_fix_entry(pd->cr3, entry, offset, req) != 0)
+            break;
+        entry = next;
+    }
+    return 0;
+}

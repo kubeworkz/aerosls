@@ -74,6 +74,7 @@ ok "A. every file this guard reads exists"
 # ─── B. The design exists and states the wall ─────────────────────────────
 if grep -qE '^Status: M4\.[0-9]+ landed; M4\.[0-9]+ .*runtime wall in force\.$' "$DOC" ||
    grep -qE '^Status: M4\.7 gate landed for the static threaded-Rust gate shape; std pthread and Go runtime remain out\.$' "$DOC" ||
+   grep -qE '^Status: M4\.8 hardening landed for clone3, robust futex lists, futex requeue and group-directed signals; std pthread and Go runtime remain out\.$' "$DOC" ||
    grep -qE '^Status: M4\.7 gate landed; runtime wall lifted\.$' "$DOC"; then
     ok "B1. the design status names the landed increment and the correct wall posture"
 else
@@ -149,19 +150,23 @@ m44_hits="$(grep -nE 'struct FutexWaiter|fn answer_futex|PENDING_FUTEX|FUTEX_WAK
     "$LINUX_RS" 2>/dev/null || true)"
 m45_hits="$(grep -nE 'LINUX_GETPID|LINUX_GETTID|LINUX_EXIT_GROUP|linux_group_sweep|wake_clear_tid|linux_thread_group_id_by_tgid' \
     "$ABI_C" "$ABI_H" "$DISPATCH" "$LINUX_RS" "$LINUX_THREADS_H" 2>/dev/null || true)"
+m48_hits="$(grep -nE 'LINUX_CLONE3|SYS_SLS_LINUX_ROBUST_EXIT|LINUX_FUTEX_REQUEUE|LINUX_KILL|LINUX_TGKILL' \
+    "$ABI_C" "$ABI_H" "$DISPATCH" "$CAP_C" "$LINUX_RS" 2>/dev/null || true)"
 
-clone=0; futex=0; group=0; m43=0; m44=0; m45=0
+clone=0; futex=0; group=0; m43=0; m44=0; m45=0; m48=0
 [ -n "$clone_hits" ] && clone=1
 [ -n "$futex_hits" ] && futex=1
 [ -n "$group_hits" ] && group=1
 [ -n "$m43_hits" ] && m43=1
 [ -n "$m44_hits" ] && m44=1
 [ -n "$m45_hits" ] && m45=1
+[ -n "$m48_hits" ] && m48=1
 support=$((clone + futex + group))
 
 # The live M4.7 artifact is the ONLY thing that can unlock a runtime claim.
 # It must be a real file with every positive marker and no failure marker.
 M4_EVIDENCE="${M4_EVIDENCE:-evidence/m4_runtime_gate.log}"
+M48_EVIDENCE="${M48_EVIDENCE:-evidence/m4_hardening_gate.log}"
 gate_ok=0
 if [ -s "$M4_EVIDENCE" ] &&
    grep -q 'M4-GO-OK' "$M4_EVIDENCE" &&
@@ -170,6 +175,17 @@ if [ -s "$M4_EVIDENCE" ] &&
    grep -q 'M4-RUNTIME-GATE-PASS' "$M4_EVIDENCE" &&
    ! grep -q 'M4-RUNTIME-GATE-FAIL' "$M4_EVIDENCE"; then
     gate_ok=1
+fi
+
+m48_ok=0
+if [ -s "$M48_EVIDENCE" ] &&
+   grep -q 'M4-CLONE3-B-OK' "$M48_EVIDENCE" &&
+   grep -q 'M4-REQUEUE-PARENT-OK' "$M48_EVIDENCE" &&
+   grep -q 'M4-ROBUST-BIT=1073741824' "$M48_EVIDENCE" &&
+   grep -q 'M4-TGKILL-OK' "$M48_EVIDENCE" &&
+   grep -q 'M4-HARDENING-PASS' "$M48_EVIDENCE" &&
+   ! grep -q 'M4-HARDENING-FAIL' "$M48_EVIDENCE"; then
+    m48_ok=1
 fi
 
 if [ "$support" -eq 0 ]; then
@@ -349,6 +365,14 @@ if grep -q 'ENV_CKPT_MAX_TASKS' "$CKPT_H" && grep -q 'ENV_CKPT_MAX_TASKS' "$DOC"
     ok "H2. the checkpoint task bound is named on both the source and the design side"
 else
     bad "H2. the checkpoint task bound is not named on both sides — a thread group cannot be restored through the one-task shape"
+fi
+
+# ─── I. M4.8 hardening is source-backed and live-gated ─────────────────────
+if [ "$m48" -eq 1 ] && [ "$m48_ok" -eq 1 ] &&
+   grep -q 'M4\.8 hardening landed' "$DOC"; then
+    ok "I1. M4.8's clone3/robust/requeue/group-signal surface and its live hardening evidence are present"
+else
+    bad "I1. M4.8 is documented but the source surface or evidence/m4_hardening_gate.log is missing a required marker (m48=$m48 evidence=$m48_ok)"
 fi
 
 echo

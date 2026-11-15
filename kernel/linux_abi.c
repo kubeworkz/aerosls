@@ -176,6 +176,7 @@ const struct LinuxSyscallEntry linux_syscall_table[] = {
     {  50, LSC_NET,    0 },   /* listen */
     {  59, LSC_SPAWN,  0 },   /* execve — the spawn path */
     {  60, LSC_EXIT,   0 },   /* exit — M4.5: end this thread only */
+    {  62, LSC_SIG,    0 },   /* kill — M4.8: group-directed signal */
     {  72, LSC_FD,     0 },   /* fcntl */
     {  74, LSC_FD,     0 },   /* fsync */
     {  77, LSC_FD,     0 },   /* ftruncate */
@@ -191,6 +192,10 @@ const struct LinuxSyscallEntry linux_syscall_table[] = {
     { 218, LSC_LOCAL,  0 },   /* set_tid_address — single-threaded: stored and ignored */
     { 228, LSC_LOCAL,  0 },   /* clock_gettime — vDSO-backstopped (§5.5): a real trap here */
     { 231, LSC_EXIT,   0 },   /* exit_group — the sidecar reaps, frames return */
+    { 234, LSC_SIG,    0 },   /* tgkill — M4.8: sibling signal by TGID+TID */
+    { 273, LSC_SIG,    0 },   /* set_robust_list — M4.8 exit-time owner-died */
+    { 274, LSC_SIG,    0 },   /* get_robust_list — named refusal (no sibling read) */
+    { 435, LSC_LOCAL,  0 },   /* clone3 — M4.8: v1 clone_args, 88 bytes */
 };
 const size_t linux_syscall_table_len =
     sizeof(linux_syscall_table) / sizeof(linux_syscall_table[0]);
@@ -310,7 +315,85 @@ struct LinuxFutexPlan linux_futex_plan(uint64_t num, const uint64_t args[6])
             span_end < args[0] || (span_end - 1u) > LINUX_USER_ADDR_MAX)
             p.refuse = -LINUX_EFAULT;
     }
+
+    /* M4.8: FUTEX_REQUEUE / FUTEX_CMP_REQUEUE move waiters from uaddr to
+     * uaddr2. Both ends are checked at the first trap; CMP_REQUEUE also
+     * attaches the four-byte snapshot of uaddr2's word so the sidecar can
+     * compare it without a second child-memory read. */
+    if (args[1] == (LINUX_FUTEX_REQUEUE | LINUX_FUTEX_PRIVATE_FLAG) ||
+        args[1] == (LINUX_FUTEX_CMP_REQUEUE | LINUX_FUTEX_PRIVATE_FLAG)) {
+        if (args[0] == 0 || args[4] == 0) {
+            p.refuse = -LINUX_EFAULT;
+            return p;
+        }
+        span_end = args[0] + 4u;
+        if (!linux_fs_addr_is_user_canonical(args[0]) ||
+            span_end < args[0] || (span_end - 1u) > LINUX_USER_ADDR_MAX) {
+            p.refuse = -LINUX_EFAULT;
+            return p;
+        }
+        span_end = args[4] + 4u;
+        if (!linux_fs_addr_is_user_canonical(args[4]) ||
+            span_end < args[4] || (span_end - 1u) > LINUX_USER_ADDR_MAX) {
+            p.refuse = -LINUX_EFAULT;
+            return p;
+        }
+        if (args[1] == (LINUX_FUTEX_CMP_REQUEUE | LINUX_FUTEX_PRIVATE_FLAG)) {
+            p.observed_src = args[4];
+            p.payload_len = LINUX_FUTEX_REQUEUE_PAYLOAD_BYTES;
+        }
+    }
     return p;
+}
+
+/* M4.8: clone3's first-trap plan. The child's struct clone_args is copied
+ * whole and only for the one v1 size this ABI knows. A larger future
+ * struct is EINVAL rather than a silent prefix parse. */
+struct LinuxClone3Plan linux_clone3_plan(uint64_t num,
+                                         const uint64_t args[6])
+{
+    struct LinuxClone3Plan p;
+    uint64_t span_end;
+
+    p.src = 0;
+    p.payload_len = 0;
+    p.refuse = 0;
+    if (num != LINUX_CLONE3 || !args) return p;
+    if (args[1] != LINUX_CLONE_ARGS_BYTES) {
+        p.refuse = -LINUX_EINVAL;
+        return p;
+    }
+    if (args[0] == 0) {
+        p.refuse = -LINUX_EFAULT;
+        return p;
+    }
+    span_end = args[0] + LINUX_CLONE_ARGS_BYTES;
+    if (!linux_fs_addr_is_user_canonical(args[0]) ||
+        span_end < args[0] || (span_end - 1u) > LINUX_USER_ADDR_MAX) {
+        p.refuse = -LINUX_EFAULT;
+        return p;
+    }
+    p.src = args[0];
+    p.payload_len = LINUX_CLONE_ARGS_BYTES;
+    return p;
+}
+
+/* M4.8: robust-list futex address. Linux's ABI stores the offset as a signed
+ * word; a negative offset is legal (the futex can sit before the entry). */
+uint64_t linux_robust_futex_addr(uint64_t entry, int64_t futex_offset)
+{
+    uint64_t addr;
+    if (futex_offset < 0) {
+        uint64_t back = (uint64_t)(-(futex_offset + 1)) + 1u;
+        if (entry < back) return 0;
+        addr = entry - back;
+    } else {
+        addr = entry + (uint64_t)futex_offset;
+        if (addr < entry) return 0;
+    }
+    if (!linux_fs_addr_is_user_canonical(addr)) return 0;
+    if (addr + 4u < addr) return 0;
+    return addr;
 }
 
 /* M1 sendto destination: the first trap copies the caller's 16 bytes here;

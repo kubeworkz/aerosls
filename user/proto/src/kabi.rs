@@ -88,6 +88,23 @@ pub struct LinuxClearTidReq {
     pub va: u64,
 }
 
+/// M4.8 robust-list exit request — the twin of
+/// `SLSLinuxRobustExitRequest`. The sidecar passes the target and its
+/// recorded head; the kernel reads the head/entries from the target's own
+/// address space, sets FUTEX_OWNER_DIED, and returns the changed words so
+/// the sidecar can wake its group queue.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LinuxRobustExitReq {
+    pub pid: u32,
+    pub max: u32,
+    pub head: u64,
+    pub len: u64,
+    pub futexes: [u64; 8],
+    pub count: u32,
+    pub status: u32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct LinuxCloneThreadReq {
@@ -441,6 +458,15 @@ pub trait Kernel {
         let _ = (pid, va);
         Err(ERR_NOTFOUND)
     }
+
+    /// M4.8: walk this thread's robust futex list at exit and return the
+    /// changed futex words (`SYS_SLS_LINUX_ROBUST_EXIT`, 333). A corrupt
+    /// list is silent: the returned count covers the words already fixed.
+    fn linux_robust_exit(&self, pid: u32, head: u64, len: u64,
+                         out: &mut [u64]) -> Result<usize, i32> {
+        let _ = (pid, head, len, out);
+        Err(ERR_NOTFOUND)
+    }
 }
 
 // ── Real kernel ABI (feature `target`) ───────────────────────────────────────
@@ -523,6 +549,7 @@ mod abi {
     // M4.5: exit_group's group sweep and set_tid_address's kernel pointer.
     const SYS_LINUX_GROUP_SWEEP: u64 = 331;
     const SYS_LINUX_SET_CLEAR_TID: u64 = 332;
+    const SYS_LINUX_ROBUST_EXIT: u64 = 333;
     const SYS_SIDECAR_PID: u64 = 322;
     const SYS_ENV_STORAGE_ATTACH: u64 = 323;
     const SYS_ENV_STORAGE_RESTORE: u64 = 324;
@@ -1346,6 +1373,30 @@ mod abi {
                              &req as *const LinuxClearTidReq as u64) as i64 }
     }
 
+    /// `k_linux_robust_exit`: syscall 333 — M4.8's exit-time robust-futex
+    /// walk. Returns the count of changed futex words, or a negative CAP code.
+    #[no_mangle]
+    pub extern "C" fn k_linux_robust_exit(pid: u32, head: u64, len: u64,
+                                           out: *mut u64, max: u32) -> i64 {
+        let mut req = LinuxRobustExitReq {
+            pid,
+            max,
+            head,
+            len,
+            futexes: [0; 8],
+            count: 0,
+            status: 0,
+        };
+        let rc = unsafe { sls_syscall(SYS_LINUX_ROBUST_EXIT,
+                                      &mut req as *mut LinuxRobustExitReq as u64) as i64 };
+        if rc < 0 { return rc; }
+        let n = core::cmp::min(req.count, max) as usize;
+        if !out.is_null() {
+            unsafe { core::ptr::copy_nonoverlapping(req.futexes.as_ptr(), out, n); }
+        }
+        n as i64
+    }
+
     /// Watchdog-respawn introspection (SYS_SLS_BOOT_GEN = 319): the
     /// current process's per-name boot generation — 0 on its first boot,
     /// 1+ after a watchdog respawn (a fresh process created from the same
@@ -1631,6 +1682,13 @@ mod abi {
         fn linux_set_clear_tid(&self, pid: u32, va: u64) -> Result<(), i32> {
             let rc = k_linux_set_clear_tid(pid, va);
             if rc == 0 { Ok(()) } else { Err(rc as i32) }
+        }
+
+        fn linux_robust_exit(&self, pid: u32, head: u64, len: u64,
+                             out: &mut [u64]) -> Result<usize, i32> {
+            let max = core::cmp::min(out.len(), 8) as u32;
+            let rc = k_linux_robust_exit(pid, head, len, out.as_mut_ptr(), max);
+            if rc >= 0 { Ok(rc as usize) } else { Err(rc as i32) }
         }
 
         fn proc_kill(&self, pid: u32) {

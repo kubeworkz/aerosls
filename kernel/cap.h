@@ -1194,6 +1194,29 @@ struct SLSLinuxClearTidRequest {
 uint64_t sys_sls_linux_group_sweep(uint32_t tgid);
 uint64_t sys_sls_linux_set_clear_tid(struct SLSLinuxClearTidRequest *req);
 
+/* ─── SYS_SLS_LINUX_ROBUST_EXIT (333) — M4.8 ──────────────────────────────
+ * The sidecar's exit-time robust-futex walk. Given one thread's Linux robust
+ * list head, walk at most SLS_LINUX_ROBUST_MAX entries, set FUTEX_OWNER_DIED
+ * in each entry's futex word, and return the word addresses in `futexes` so
+ * the sidecar can wake the waiters. The sidecar is the only caller; caller
+ * authority and the target's partition/personality are checked. A bad head
+ * or entry stops the walk (Linux's exit path is silent on a corrupt list),
+ * but the addresses already fixed are still returned. */
+#define SYS_SLS_LINUX_ROBUST_EXIT 333
+#define SLS_LINUX_ROBUST_MAX 8
+
+struct SLSLinuxRobustExitRequest {
+    uint32_t pid;           /* IN: the exiting Linux task */
+    uint32_t max;           /* IN: capacity of futexes (<= 8) */
+    uint64_t head;          /* IN: struct robust_list_head VA, or 0 */
+    uint64_t len;           /* IN: head size, must be 24 */
+    uint64_t futexes[SLS_LINUX_ROBUST_MAX]; /* OUT: changed futex words */
+    uint32_t count;         /* OUT: entries written */
+    uint32_t status;        /* OUT: 0, or a negative CAP_E* */
+};
+
+uint64_t sys_sls_linux_robust_exit(struct SLSLinuxRobustExitRequest *req);
+
 struct SLSLinuxCloneThreadRequest {
     uint32_t status;        /* OUT: 0 or a negative CAP_E* */
     uint32_t parent_pid;    /* IN: the Linux task issuing clone */

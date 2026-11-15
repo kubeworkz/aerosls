@@ -141,6 +141,7 @@ int main(void)
         {  50, LSC_NET,   "listen" },
         {  59, LSC_SPAWN, "execve" },
         {  60, LSC_EXIT,  "exit" },
+        {  62, LSC_SIG,   "kill" },
         {  72, LSC_FD,    "fcntl" },
         {  74, LSC_FD,    "fsync" },
         {  77, LSC_FD,    "ftruncate" },
@@ -156,6 +157,10 @@ int main(void)
         { 218, LSC_LOCAL, "set_tid_address" },
         { 228, LSC_LOCAL, "clock_gettime" },
         { 231, LSC_EXIT,  "exit_group" },
+        { 234, LSC_SIG,   "tgkill" },
+        { 273, LSC_SIG,   "set_robust_list" },
+        { 274, LSC_SIG,   "get_robust_list" },
+        { 435, LSC_LOCAL, "clone3" },
     };
     size_t i;
     for (i = 0; i < sizeof(want) / sizeof(want[0]); i++) {

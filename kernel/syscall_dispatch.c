@@ -703,6 +703,7 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                 struct SLSLinuxSyscallRequest req;
                 struct LinuxFdWritePlan plan;
                 struct LinuxFutexPlan fplan;
+                struct LinuxClone3Plan c3plan;
                 struct LinuxFdReplyPlan rplan;
                 /* E7 increment 5 (the fd class): the message that crosses
                  * is the 72-byte description plus, for a write, its bytes
@@ -824,6 +825,15 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                         (unsigned long)largs[1],
                         (unsigned long)largs[0]);
                     return (uint64_t)(int64_t)fplan.refuse;
+                }
+                c3plan = linux_clone3_plan(num, largs);
+                if (c3plan.refuse) {
+                    kernel_serial_printf(
+                        "[E7] linux clone3 size=%lu args=0x%lx refused "
+                        "before post: bad size or user span\n",
+                        (unsigned long)largs[1],
+                        (unsigned long)largs[0]);
+                    return (uint64_t)(int64_t)c3plan.refuse;
                 }
                 plan = linux_fd_write_plan(num, largs);
                 if (plan.refuse) {
@@ -1165,7 +1175,18 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                             return (uint64_t)(int64_t)(-LINUX_EFAULT);
                         }
                     }
-                    fwd_len += LINUX_FUTEX_WAIT_PAYLOAD_BYTES;
+                    fwd_len += fplan.payload_len;
+                } else if (c3plan.payload_len) {
+                    if (linux_user_copy_out(fwd + sizeof(struct SLSLinuxSyscallRequest),
+                                            cur->cr3, c3plan.src,
+                                            c3plan.payload_len) != 0) {
+                        kernel_serial_printf(
+                            "[E7] linux clone3 args 0x%lx refused before "
+                            "post: unmapped or non-user span\n",
+                            (unsigned long)c3plan.src);
+                        return (uint64_t)(int64_t)(-LINUX_EFAULT);
+                    }
+                    fwd_len += c3plan.payload_len;
                 } else if (plan.len) {
                     if (linux_user_copy_out(fwd + sizeof(struct SLSLinuxSyscallRequest),
                                             cur->cr3, plan.src,
@@ -1904,6 +1925,9 @@ uint64_t do_syscall(uint64_t num, void* arg) {
     case SYS_SLS_LINUX_SET_CLEAR_TID:
         return sys_sls_linux_set_clear_tid(
             (struct SLSLinuxClearTidRequest*)arg);
+    case SYS_SLS_LINUX_ROBUST_EXIT:
+        return sys_sls_linux_robust_exit(
+            (struct SLSLinuxRobustExitRequest*)arg);
     case SYS_SLS_LINUX_CLONE_THREAD:
         return sys_sls_linux_clone_thread(
             (struct SLSLinuxCloneThreadRequest*)arg);

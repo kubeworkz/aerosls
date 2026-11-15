@@ -1,0 +1,1210 @@
+[H[J[1;1H[?25l[m[H[J[1;1H[2;30HGNU GRUB  version 2.12
+
+[m[4;2H+----------------------------------------------------------------------------+[5;2H|[5;79H|[6;2H|[6;79H|[7;2H|[7;79H|[8;2H|[8;79H|[9;2H|[9;79H|[10;2H|[10;79H|[11;2H|[11;79H|[12;2H|[12;79H|[13;2H|[13;79H|[14;2H|[14;79H|[15;2H|[15;79H|[16;2H|[16;79H|[17;2H+----------------------------------------------------------------------------+[m[18;2H[19;2H[m     Use the ^ and v keys to select which entry is highlighted.          
+      Press enter to boot the selected OS, `e' to edit the commands       
+      before booting or `c' for a command-line.                           [5;80H [7m[5;3H*AeroSLS ? Phase 5 self-hosted (initrd sidecars)                            [m[5;78H[m[m[6;3H AeroSLS ? kernel only                                                      [m[6;78H[m[m[7;3H AeroSLS ? unified (control plane + sidecars)                               [m[7;78H[m[m[8;3H GRUB shell                                                                 [m[8;78H[m[m[9;3H                                                                            [m[9;78H[m[m[10;3H                                                                            [m[10;78H[m[m[11;3H                                                                            [m[11;78H[m[m[12;3H                                                                            [m[12;78H[m[m[13;3H                                                                            [m[13;78H[m[m[14;3H                                                                            [m[14;78H[m[m[15;3H                                                                            [m[15;78H[m[m[16;3H                                                                            [m[16;78H[m[16;80H [5;78H[22;1H   The highlighted entry will be executed automatically in 3s.                 [5;78H[22;1H   The highlighted entry will be executed automatically in 2s.                 [5;78H[22;1H   The highlighted entry will be executed automatically in 1s.                 [5;78H[22;1H   The highlighted entry will be executed automatically in 0s.                 [5;78H[?25h[H[J[1;1H[H[J[1;1H[AEROSLS BOOT LOGGER V1.0.0 RUNNING]
+----------------------------------------------------------------------------------
+[BSP] Loading GDT and IDT...
+[FRAME] bootstrap stack [0xe0d39a0,0xe1d39a0) confirmed inside the reserved region -- frames 57555..57811 are the kernel's own stack and are not allocatable.
+[FRAME] reserved 57812 frames (225 MiB) below the kernel image end 0xe1d4000 -- allocator now starts above the kernel.
+[SIDECAR] multiboot v1 detected, flags=0x1a6f phys=0x10000
+[SIDECAR] v1 mods_count=1 mods_addr=0x100b8
+[SIDECAR] v1 initrd module at 0xe23c000..0xe410664 (1918564 bytes)
+[HW] Multiboot v1: mem_upper=3144576 KiB, top=0xbffe0000
+[FRAME] reserved 262176 frames above 0xbffe0000 -- that memory does not exist.
+[CAP] shared-memory arena: 64 MiB physically contiguous at 0xe200000 (16384 frames).
+[CAP] Seed kernel capability layer online: 512-slot tables, 1024-object ceiling, holders, channels, arena, message transport, syscalls 289-304.
+[QEMU-SLS MMU] shadow PML4=0x000000000e1d4000 (kernel PT inherited)
+[TIMER] tick calibrated: tsc=2437803189 Hz, lapic=62570364 Hz, ticr=625703, tick=10000000 ns
+[BSP] LAPIC and IRQ0 timer online.
+[BSP] Round-robin task scheduler initialised.
+[FPU] SSE/SSE2 enabled for ring 3 — CR4.OSFXSR|OSXMMEXCPT, CR0.MP; EM/TS clear, CR0.TS not armed
+[SYSCALL] Gate initialised. STAR=0x0010000800000000  LSTAR=0x0000000000102bd0
+[PROC] Ring-3 process manager initialised.
+[BOOT] command line: "nic0=both nic1=none"
+[PARTITION] LPAR groundwork initialised (1 partition: system).
+[SERVICE] service registry initialised (0 registrations).
+[MESH] circuit breakers initialised (all closed).
+[WORKLOAD] declarative workloads initialised (reconciler OFF).
+[WLCTX] context pool initialised (8 slots).
+[FAILOVER] Subsystem initialised.
+[FAILOVER] relaunch grace: this node just came up -- no peer is declared DEAD for 6000 ticks (until tick 6001).
+[LOADER] Service binary store ready. Built-in demo: 26 bytes.
+[WEBAPP] Asset store ready. Built-in Navigator page: 2059 bytes.
+[ENTROPY] seeded.
+[RTC] CMOS clock accepted.
+[TLS] memory pool initialised (512 KiB, fixed).
+[AUTH] Token Registry
+ Email                           UID   Role          Token                             Password
+ -------------------------------  ----  ------------  --------------------------------  --------
+ dave@gridworkz.com  uid=1000  DB_ADMIN  deadbeef01234567cafebabe76543210  demo-dave
+ bob@vance.com  uid=1001  APP_USER  cafebabe7654321089abcdef01234567  demo-bob
+ carol@gridworkz.com  uid=1002  DB_ADMIN  feedf00dabcdef0112345678deadc0de  demo-carol
+ guest@sandbox.com  uid=1003  GUEST  deadc0de9988776655443322aabbccdd  demo-guest
+
+[JOURNAL] Subsystem initialised.
+[LOCK] Row-level lock manager initialised.
+[INDEX] Secondary index manager initialised.
+[CONSTRAINT] Engine initialised.
+[CURSOR] Server-side cursor engine initialised.
+[MQT] Materialized query table engine initialised.
+[ROWSTORE] Row-set storage engine initialised.
+[ROW_INDEX] B-tree row index engine initialised.
+[VECSTORE] Vector store engine initialised.
+[AGENT] Agent engine initialised (max agents=8, max workflows=4)
+[MK] Microkernel booted successfully. Ring-0 primitives online.
+[IPC] Message Passing interface configured (Port bounds 0x1001 - 0x1007).
+[MK] registering services
+[MK] Service ONLINE: VirtualMemoryMgr  PID=101
+[MK] Service ONLINE: ObjectSecurityMgr  PID=102
+[MK] Service ONLINE: NativeDbStoreMgr  PID=103
+[MK] Service ONLINE: StorageTierMgr  PID=104
+[MK] Service ONLINE: RecoveryLogVerifier  PID=105
+[MK] Service ONLINE: AgentRuntimeMgr  PID=106
+[MK] Service ONLINE: CheckpointMgr  PID=107
+[MK] Fault Isolation Daemon active. Poll interval: 100ms.
+[TIER] Storage Tier Manager initialized.
+[TIER] Thresholds: promote=8 accesses/tick  demote=30 idle ticks.
+[CKPT] CheckpointMgr initialised.
+[BSP] Waking Core 1...
+[SMP] AP at APIC id 1 online.
+[BSP] Core 1 online.
+[NET] PCI scanning for e1000...
+[NET] e1000 #0 at PCI slot 3 MMIO 0xfeb80000
+[NET] NIC roles taken from the command line.
+[E1000] nic0 MAC 52:54:00:12:34:56  roles: mgmt cluster
+[NET] Packet buffer pool ready (64 x 2 KB).
+[ARP] Announced 10.0.2.15 -> 52:54:00:12:34:56
+[DHCP] Starting DISCOVER...
+[DHCP] Bound: 10.0.2.15  gw 10.0.2.2  subnet 255.255.255.0
+[NET] 1 e1000 interface(s) online, 0 reserved for user drivers.
+[QEMU-SLS TCACHE] NVMe unavailable — cold start
+[QEMU-SLS PGO] hot threshold=1000, scan interval=1000 ticks
+[QEMU-SLS VM] no snapshot -- Phase 4 save/restore has no callers (scaffolding, awaiting a launcher resume path)
+[SECURITY] UID 1000 assigned role DB_ADMIN.
+[AUDIT] #1 uid=1000 action=ROLE_CHANGE detail=DB_ADMIN granted=1
+[SECURITY] UID 1001 assigned role APP_USER.
+[AUDIT] #2 uid=1001 action=ROLE_CHANGE detail=APP_USER granted=1
+[SECURITY] UID 1002 assigned role DB_ADMIN.
+[AUDIT] #3 uid=1002 action=ROLE_CHANGE detail=DB_ADMIN granted=1
+[SECURITY] UID 1003 assigned role GUEST.
+[AUDIT] #4 uid=1003 action=ROLE_CHANGE detail=GUEST granted=1
+[AUTH] Default demo account roles seeded in object-catalog role_table.
+[SIDECAR] boot image: init @0x20000000 (139280 B) dm @0x21023000 (106512 B) posix @0x2107e000 (1237280 B) ramdisk @0x215ad000 (94224 B) net @0x22605000 (295056 B) e1000 @0x226ce000 (37272 B) registry @0x22758000 (4096 B)
+[SIDECAR] rootfs: 4096 bytes @ 0x21605000
+[SIDECAR] device registry: 4 device(s) @0x22758000
+[SIDECAR] boot parent planted: slot0 pid=99 active=1 state=4
+[PAGING] New user PML4 at 0x000000000e1d6000
+[SIDECAR] PID 100 'aerosls.init.0': wired chan 'console' to kernel service 'kernel.debug.console' (slots 9/10, kernel end 0/1)
+[SIDECAR] PID 100 'aerosls.init.0': wired chan 'env' to kernel service 'kernel.env.control' (slots 11/12, kernel end 2/3)
+[ENV] control channel wired: kernel ends rd=2 wr=3
+[SIDECAR] PID 100 'aerosls.init.0' released — runs on next schedule (BIB at 0x0000400000043000, entry 0x0000400000000000)
+[SIDECAR] init sidecar created (PID 100, messenger CHAN_R 0) — entering ring 3
+[INIT] ── AeroSLS init sidecar booting ──[INIT] budget: 16 MiB[INIT] found 4 PCI device(s)[INIT]   [0]  class=06:00 vendor=8086 dev=1237 bar=0x00000000[PAGING] New user PML4 at 0x000000001222c000
+[INIT]   [1]  class=06:01 vendor=8086 dev=7000 bar=0x00000000[INIT]   [2]  class=03:00 vendor=1234 dev=1111 bar=0xfd000000[INIT]   [3]  class=02:00 vendor=8086 dev=100e bar=0xfeb80000[INIT] spawning Device Manager...[INIT]   (create_sidecar: drv.device_manager.0 image @ 0x21023000, 106512 bytes)[SIDECAR] PID 101 'drv.device_manager.0': wired chan 'console' to kernel service 'kernel.debug.console' (slots 3/4, kernel end 4/5)
+[SIDECAR] PID 101 'drv.device_manager.0' released — runs on next schedule (BIB at 0x000040000001f000, entry 0x0000400000000000)
+[CAP] woken PID 101 (channel 3)
+[CAP] send handoff: PID 100 -> 101
+[INIT]   messenger: CHAN_R=13 CHAN_W=14[INIT] sending device registry to Device Manager...[DM] ── AeroSLS Device Manager booting ──[DM] budget: 256 KiB heap[DM] waiting for the device registry from init...[PAGING] New user PML4 at 0x0000000012255000
+[SIDECAR] PID 102 'drv.ramdisk.0': wired chan 'console' to kernel service 'kernel.debug.console' (slots 4/5, kernel end 6/7)
+[SIDECAR] PID 102 'drv.ramdisk.0' released — runs on next schedule (BIB at 0x000040000001c000, entry 0x0000400000000000)
+[INIT] waiting for Device Manager to initialise devices...[INIT] all devices ready.[INIT] spawning ramdisk driver...[INIT]   ramdisk budget @ 0x215c5000, storage @ 0x21605000 (16 MiB)[INIT]   (create_sidecar: drv.ramdisk.0 image @ 0x215ad000, 94224 bytes)[INIT]   ramdisk messenger: CHAN_R=8 CHAN_W=3[DM]   adopt [0]  class=06:00 vendor=8086 dev=1237 bar=0x00000000[DM]   adopt [1]  class=06:01 vendor=8086 dev=7000 bar=0x00000000[PROC] PID 100 yielded to PID 102
+[DM]   adopt [2]  class=03:00 vendor=1234 dev=1111 bar=0xfd000000[DM]   adopt [3]  class=02:00 vendor=8086 dev=100e bar=0xfeb80000[DM] registry: 4 device(s) adopted[PAGING] New user PML4 at 0x0000000012283000
+[SIDECAR] PID 103 'drv.network.0': wired chan 'console' to kernel service 'kernel.debug.console' (slots 3/4, kernel end 8/9)
+[SIDECAR] PID 103 'drv.network.0' released — runs on next schedule (BIB at 0x000040000004d000, entry 0x0000400000000000)
+[INIT] e1000 BAR0 @ 0xfeb80000 → POSIX manifest DEV cap 'nic0.bar0'[INIT] spawning network driver...[INIT]   net.heap computed @ 0x2264e000[INIT]   (create_sidecar: drv.network.0 image @ 0x22605000, 295056 bytes)[NET] rust_entry entered
+[PROC] PID 100 yielded to PID 103
+[INIT]   network messenger: CHAN_R=15 CHAN_W=16[NET] BIB ptr=[PROC] PID 100 yielded to PID 103
+[PROC] PID 100 yielded to PID 103
+41 45 52 53 4c 53 42 31X
+[NET] BIB raw:41 45 52 53 4c 53 42 31X
+[INIT] spawning POSIX sidecar...[INIT]   posix.heap computed @ 0x211ad000[INIT]   (create_sidecar: aerosls.posix.0 image @ 0x2107e000, 1237280 bytes)[PAGING] New user PML4 at 0x00000000122d9000
+[SIDECAR] PID 104 'aerosls.posix.0': wired chan 'console' to kernel service 'kernel.debug.console' (slots 3/4, kernel end 10/11)
+[SIDECAR] PID 104 'aerosls.posix.0': wired chan 'ramdisk' to sidecar 'drv.ramdisk.0' (PID 102, slots 5/6 peer_slots 6/7)
+[SIDECAR] PID 104 'aerosls.posix.0': wired chan 'network' to sidecar 'drv.network.0' (PID 103, slots 7/8 peer_slots 5/6)
+[SIDECAR] PID 104 'aerosls.posix.0': irq cap 'irq.timer.0' vector 32 slot 9
+[SIDECAR] PID 104 'aerosls.posix.0': irq cap 'irq.serial.0' vector 36 slot 10
+[SIDECAR] PID 104 'aerosls.posix.0': io cap 'uart' ports 0x3f8+8 slot 11
+[SIDECAR] PID 104 'aerosls.posix.0': dev cap 'nic0.bar0' phys 0xfeb80000+131072 slot 12
+[SIDECAR] PID 104 'aerosls.posix.0' released — runs on next schedule (BIB at 0x000040000013f000, entry 0x0000400000000000)
+[NET] BIB parsed
+[POSIX] boot: rw=06 rr=05 cw=03 nw=08
+[PROC] PID 100 yielded to PID 103
+[NET] n_caps=5
+[INIT]   POSIX messenger: CHAN_R=17 CHAN_W=18[PROC] PID 100 yielded to PID 103
+
+[PROC] PID 100 yielded to PID 103
+[CAP] woken PID 102 (channel 11)
+[CAP] send handoff: PID 104 -> 102
+[PAGING] New user PML4 at 0x0000000012963000
+[SIDECAR] PID 105 'drv.ramdisk.1': wired chan 'console' to kernel service 'kernel.debug.console' (slots 4/5, kernel end 12/13)
+[SIDECAR] PID 105 'drv.ramdisk.1' released — runs on next schedule (BIB at 0x000040000001c000, entry 0x0000400000000000)
+[INIT] E3: spawning tenant POSIX environments...[INIT] E3 env 1: drv.ramdisk.1 storage @ 0x12463000, aerosls.posix.1 heap @ 0x12563000[NET] cap0=[CAP] woken PID 102 (channel 11)
+name='' ty=2
+[CAP] woken PID 102 (channel 11)
+[CAP] send handoff: PID 104 -> 102
+[PROC] PID 100 yielded to PID 103
+[CAP] woken PID 102 (channel 11)
+[INIT] E3 env 1: drv.ramdisk.1 spawned[PROC] PID 100 yielded to PID 102
+ slot=[PROC] PID 100 yielded to PID 103
+[PAGING] New user PML4 at 0x0000000012989000
+[SIDECAR] PID 106 'aerosls.posix.1': wired chan 'console' to kernel service 'kernel.env.console' (slots 3/4, kernel end 14/15)
+[ENV-CONSOLE] environment (partition 0, index 1) console wired: posix pid 106, kernel ends rd=14 wr=15
+[SIDECAR] PID 106 'aerosls.posix.1': wired chan 'ramdisk' to sidecar 'drv.ramdisk.1' (PID 105, slots 5/6 peer_slots 6/7)
+[SIDECAR] PID 106 'aerosls.posix.1': wired chan 'network' to kernel service 'kernel.net.socket' (slots 7/8, kernel end 16/17)
+[NET-SOCKET] aerosls.posix.1 (partition 0, pid 106) wired: kernel ends rd=16 wr=17 — client + listener open (P2 increment 3)
+[SIDECAR] PID 106 'aerosls.posix.1': wired chan 'catalog' to kernel service 'kernel.env.catalog' (slots 9/10, kernel end 18/19)
+[ENV-CATALOG] aerosls.posix.1 (partition 0, pid 106) wired: kernel ends rd=18 wr=19 — read-only catalog view open (§9)
+[SIDECAR] PID 106 'aerosls.posix.1' released — runs on next schedule (BIB at 0x000040000013f000, entry 0x0000400000000000)
+[INIT] E7 gate: env 1 is the gate profile0
+[POSIX] boot: rw=06 rr=05 cw=03 nw=08
+[PROC] PID 100 yielded to PID 102
+0
+0
+[INIT] E3 env 1: aerosls.posix.1 spawned
+[PROC] PID 100 yielded to PID 103
+[CAP] woken PID 105 (channel 17)
+[CAP] send handoff: PID 106 -> 105
+[PROC] PID 100 yielded to PID 103
+[NET] budget cap found
+[CAP] woken PID 105 (channel 17)
+[CAP] send handoff: PID 106 -> 105
+[NET] heap initialized
+[NET] console cap found
+[CAP] woken PID 105 (channel 17)
+[PAGING] New user PML4 at 0x0000000013013000
+[SIDECAR] PID 107 'drv.ramdisk.2': wired chan 'console' to kernel service 'kernel.debug.console' (slots 4/5, kernel end 20/21)
+[SIDECAR] PID 107 'drv.ramdisk.2' released — runs on next schedule (BIB at 0x000040000001c000, entry 0x0000400000000000)
+[INIT] E3 env 2: drv.ramdisk.2 storage @ 0x12b13000, aerosls.posix.2 heap @ 0x12c13000[NET] EndpointSet created
+[CAP] woken PID 105 (channel 17)
+[CAP] send handoff: PID 106 -> 105
+[PROC] PID 100 yielded to PID 102
+[INIT] E3 env 2: drv.ramdisk.2 spawned[NET] MockNetwork created
+[CAP] woken PID 105 (channel 17)
+[CAP] send handoff: PID 106 -> 105
+[PROC] PID 100 yielded to PID 103
+[CAP] woken PID 105 (channel 17)
+[CAP] send handoff: PID 106 -> 105
+[PROC] PID 100 yielded to PID 103
+[CAP] woken PID 105 (channel 17)
+[PAGING] New user PML4 at 0x0000000013039000
+[SIDECAR] PID 108 'aerosls.posix.2': wired chan 'console' to kernel service 'kernel.env.console' (slots 3/4, kernel end 22/23)
+[ENV-CONSOLE] environment (partition 0, index 2) console wired: posix pid 108, kernel ends rd=22 wr=23
+[SIDECAR] PID 108 'aerosls.posix.2': wired chan 'ramdisk' to sidecar 'drv.ramdisk.2' (PID 107, slots 5/6 peer_slots 6/7)
+[SIDECAR] PID 108 'aerosls.posix.2': wired chan 'network' to kernel service 'kernel.net.socket' (slots 7/8, kernel end 24/25)
+[NET-SOCKET] aerosls.posix.2 (partition 0, pid 108) wired: kernel ends rd=24 wr=25 — client + listener open (P2 increment 3)
+[SIDECAR] PID 108 'aerosls.posix.2': wired chan 'catalog' to kernel service 'kernel.env.catalog' (slots 9/10, kernel end 26/27)
+[ENV-CATALOG] aerosls.posix.2 (partition 0, pid 108) wired: kernel ends rd=26 wr=27 — read-only catalog view open (§9)
+[SIDECAR] PID 108 'aerosls.posix.2' released — runs on next schedule (BIB at 0x000040000013f000, entry 0x0000400000000000)
+[NET] entering server loop
+[CAP] woken PID 105 (channel 17)
+[CAP] send handoff: PID 106 -> 105
+[POSIX] boot: rw=06 rr=05 cw=03 nw=08
+[PROC] PID 100 yielded to PID 103
+[INIT] E3 env 2: aerosls.posix.2 spawned[CAP] woken PID 105 (channel 17)
+[PROC] PID 100 yielded to PID 103
+[CAP] woken PID 104 (channel 12)
+[CAP] woken PID 107 (channel 24)
+[CAP] send handoff: PID 108 -> 107
+[PROC] PID 100 yielded to PID 103
+[CAP] woken PID 104 (channel 12)
+[CAP] send handoff: PID 103 -> 104
+E7SIG-SLS-105-OK
+[CAP] woken PID 105 (channel 17)
+[CAP] send handoff: PID 106 -> 105
+[CAP] woken PID 107 (channel 24)
+[INIT] E3: tenant environments spawned.[CAP] woken PID 105 (channel 17)
+[INIT] ── Phase 5 init sidecar complete ──[INIT] system ready for POSIX sidecar creation.[CAP] woken PID 107 (channel 24)
+[CAP] send handoff: PID 108 -> 107
+[INIT] entering the event loop (blocking wait + watchdog respawn)...[INIT] env manager on control channel (CHAN_R=11 CHAN_W=12)[PAGING] New user PML4 at 0x0000000013183000
+[SIDECAR] PID 109 'e7.linux.probe.0' released — runs on next schedule (BIB at 0x0000400000005000, entry 0x0000400000000000)
+[CAP] woken PID 105 (channel 17)
+[CAP] send handoff: PID 106 -> 105
+[CAP] woken PID 107 (channel 24)
+[E7] probe: spawned ch_r0000000D 
+[CAP] woken PID 105 (channel 17)
+[CAP] woken PID 107 (channel 24)
+[CAP] send handoff: PID 108 -> 107
+[PAGING] New user PML4 at 0x000000001318e000
+[LOADER] ELF segment: vaddr=0x00000000003ff000  filesz=176  memsz=176  flags=R--
+[LOADER] ELF segment: vaddr=0x0000000000400000  filesz=1624  memsz=1624  flags=R-X
+[LOADER] ELF64 loaded. Entry: 0x0000000000400000
+[SIDECAR] PID 110 'e7.linux.cand.0' released — runs on next schedule (BIB at 0x0000400000006000, entry 0x0000000000400000)
+[CAP] woken PID 107 (channel 24)
+[CAP] send handoff: PID 108 -> 107
+[E7] candidate: spawned 0000000F 
+[CAP] woken PID 107 (channel 24)
+[CAP] send handoff: PID 108 -> 107
+[CS] CAP_EINVAL image_size==0 (records=9)
+[CAP] woken PID 107 (channel 24)
+[CAP] send handoff: PID 108 -> 107
+[E7] firstuser: spawn FAFFFFFFFF 
+[CAP] woken PID 109 (channel 27)
+[CAP] woken PID 107 (channel 24)
+[CAP] woken PID 106 (channel 18)
+[E7] linux: num=000000DA child=e7.linux.probe.0 ok
+
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+[PAGING] New user PML4 at 0x000000001319e000
+[LOADER] ELF segment: vaddr=0x0000000040000000  filesz=604  memsz=604  flags=R--
+[LOADER] ELF segment: vaddr=0x0000000040001000  filesz=323734  memsz=323734  flags=R-X
+[LOADER] ELF segment: vaddr=0x0000000040051000  filesz=78984  memsz=78984  flags=R--
+[LOADER] ELF segment: vaddr=0x0000000040065dd0  filesz=11664  memsz=149104  flags=RW-
+[LOADER] segment vaddr 0x40065dd0 is 0xdd0 into its page; frames anchored at 0x40065000
+[LOADER] ELF64 loaded. Entry: 0x0000000040006596
+[SIDECAR] PID 111 'e7.gate.user.0' released — runs on next schedule (BIB at 0x0000400000093000, entry 0x0000000040006596)
+[CAP] woken PID 107 (channel 24)
+[CAP] send handoff: PID 108 -> 107
+[CAP] woken PID 110 (channel 28)
+[E7] linux: num=000000DA child=e7.linux.cand.0 ok
+
+[CAP] woken PID 107 (channel 24)
+[CAP] send handoff: PID 108 -> 107
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[E7] firstuser: spawned 0000000B 
+[CAP] woken PID 107 (channel 24)
+[POSIX] loop exit0=0000FEED 
+[CAP] woken PID 111 (channel 29)
+[POSIX] loop tasks=00000001 
+[E7] linux: num=0000009E child=e7.gate.user.0 ok
+
+[CAP] woken PID 102 (channel 11)
+[CAP] send handoff: PID 104 -> 102
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 102 (channel 11)
+[CAP] woken PID 108 (channel 25)
+[CAP] woken PID 108 (channel 25)
+[CAP] woken PID 102 (channel 11)
+[CAP] send handoff: PID 104 -> 102
+[POSIX] loop exit0=0000FEED 
+[POSIX] loop tasks=00000001 
+[CAP] woken PID 102 (channel 11)
+[CAP] woken PID 105 (channel 17)
+[CAP] send handoff: PID 106 -> 105
+[POSIX] loop exit0=0000FEED 
+[CAP] woken PID 102 (channel 11)
+[CAP] send handoff: PID 104 -> 102
+[CAP] woken PID 105 (channel 17)
+[CAP] send handoff: PID 106 -> 105
+[POSIX] loop tasks=00000001 
+[CAP] woken PID 102 (channel 11)
+[CAP] woken PID 105 (channel 17)
+[CAP] woken PID 107 (channel 24)
+[CAP] send handoff: PID 108 -> 107
+[CAP] woken PID 102 (channel 11)
+[CAP] send handoff: PID 104 -> 102
+[POSIX] rc open err=00000002 
+[CAP] woken PID 107 (channel 24)
+[CAP] woken PID 102 (channel 11)
+[POSIX] rc read=0000005E 
+[POSIX] aero state=00000000 
+[CAP] woken PID 107 (channel 24)
+[CAP] send handoff: PID 108 -> 107
+[CAP] woken PID 111 (channel 29)
+[CAP] woken PID 107 (channel 24)
+[POSIX] rc open err=00000002 
+[POSIX] aero state=00000000 
+[E7] linux: num=000000DA child=e7.gate.user.0 ok
+
+[CAP] woken PID 109 (channel 27)
+[E7] linux: num=00000187 child=e7.linux.probe.0 -> ENOSYS
+
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[POSIX] aero state=00000000 
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+[CAP] woken PID 111 (channel 29)
+[CAP] woken PID 110 (channel 28)
+[E7] linux: num=00000187 child=e7.linux.cand.0 -> ENOSYS
+
+[E7] linux: num=00000007 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 111 (channel 29)
+[E7] linux: num=0000000D child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 109 (channel 27)
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[E7] linux: num=00000027 child=e7.linux.probe.0 ok
+
+[CAP] woken PID 111 (channel 29)
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+[E7] linux: num=0000000D child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 110 (channel 28)
+[E7] linux: num=00000027 child=e7.linux.cand.0 ok
+
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[CAP] woken PID 111 (channel 29)
+[CAP] woken PID 109 (channel 27)
+[E7] linux: num=00000188 child=e7.linux.probe.0 -> ENOSYS
+
+[E7] linux: num=00000083 child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 110 (channel 28)
+[CAP] woken PID 111 (channel 29)
+[E7] linux: num=00000188 child=e7.linux.cand.0 -> ENOSYS
+
+[E7] linux: num=00000009 child=e7.gate.user.0 ok mmap -> 0x0000400000891000
+
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 109 (channel 27)
+AeroSLS Phase 5 booting
+[CAP] woken PID 111 (channel 29)
+[E7] linux: num=00000069 child=e7.linux.probe.0 -> ENOSYS
+
+[E7] linux: num=0000000A child=e7.gate.user.0 ok
+
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[E7] mprotect addr=0x400000891000 len=4096 prot=0x0: 1 page(s) parked (PROT_NONE guard)
+[CAP] woken PID 110 (channel 28)
+[E7] linux: num=00000069 child=e7.linux.cand.0 -> ENOSYS
+
+[CAP] woken PID 111 (channel 29)
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[E7] linux: num=00000083 child=e7.gate.user.0 ok
+
+[CAP] woken PID 109 (channel 27)
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[E7] linux: num=00000001 child=e7.linux.probe.0 write ok len=17 |E7SIG-LNX-105-OK.|
+[CAP] woken PID 111 (channel 29)
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+[E7] linux: num=0000000E child=e7.gate.user.0 ok
+
+[CAP] woken PID 110 (channel 28)
+[E7] linux: num=00000001 child=e7.linux.cand.0 write ok len=17 |E7SIG-LNX-105-OK.|
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[CAP] woken PID 111 (channel 29)
+[E7] linux: num=0000000D child=e7.gate.user.0 ok
+
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 111 (channel 29)
+[E7] linux: num=0000000D child=e7.gate.user.0 ok + payload
+
+[CAP] woken PID 109 (channel 27)
+[E7] linux: num=00000028 child=e7.linux.probe.0 -> ENOSYS
+
+E7SIG-LNX-105-OK
+E7SIG-LNX-105-OK
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+[CAP] woken PID 111 (channel 29)
+[CAP] woken PID 110 (channel 28)
+[E7] linux: num=00000028 child=e7.linux.cand.0 -> ENOSYS
+
+[E7] linux: num=0000000D child=e7.gate.user.0 ok
+
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 109 (channel 27)
+[CAP] woken PID 111 (channel 29)
+M4-HARDENING-START[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=18 |M4-HARDENING-START|
+[E7] linux: num=0000009E child=e7.linux.probe.0 ok
+
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 110 (channel 28)
+[CAP] woken PID 111 (channel 29)
+
+[E7] linux: num=0000009E child=e7.linux.cand.0 ok
+
+[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=1 |.|
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 109 (channel 27)
+Root filesystem mounted
+[CAP] woken PID 111 (channel 29)
+[E7] linux: num=000000BB child=e7.linux.probe.0 -> ENOSYS
+
+[E7] linux: num=00000027 child=e7.gate.user.0 ok
+
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 110 (channel 28)
+[E7] linux: num=000000BB child=e7.linux.cand.0 -> ENOSYS
+
+[CAP] woken PID 111 (channel 29)
+M4-HARDENING-TGID=[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=18 |M4-HARDENING-TGID=|
+[CAP] woken PID 109 (channel 27)
+[E7] linux: num=00000001 child=e7.linux.probe.0 write ok len=14 |E7FD-WRITE-OK.|
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+[CAP] woken PID 111 (channel 29)
+[CAP] woken PID 110 (channel 28)
+[E7] linux: num=00000001 child=e7.linux.cand.0 write ok len=14 |E7FD-WRITE-OK.|
+111[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=3 |111|
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[CAP] woken PID 111 (channel 29)
+
+[CAP] woken PID 109 (channel 27)
+E7FD-WRITE-OK
+E7FD-WRITE-OK
+[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=1 |.|
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[E7] linux: num=00000001 child=e7.linux.probe.0 ok
+
+[CAP] woken PID 111 (channel 29)
+[PROC] M4.2 thread 112 'e7.gate.user.0.t112' created (held, tgid=3).
+[PROC] PID 112 released.
+[PROC] M4.2 clone: parent 111 -> child 112 (tgid=3) released.
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+[CAP] woken PID 110 (channel 28)
+[E7] linux: num=00000001 child=e7.linux.cand.0 ok
+
+[E7] linux: num=000001B3 child=e7.gate.user.0 clone group=0 files shared
+
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[E7] linux: num=000001B3 child=e7.gate.user.0 ok
+
+[CAP] woken PID 109 (channel 27)
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[E7] linux: num=0000000C child=e7.linux.probe.0 ok
+
+[CAP] woken PID 112 (channel 30)
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+[E7] linux: num=000000BA child=e7.gate.user.0.t112 ok
+
+[CAP] woken PID 110 (channel 28)
+[CAP] woken PID 112 (channel 30)
+[CAP] send handoff: PID 106 -> 112
+[E7] linux: num=0000000C child=e7.linux.cand.0 ok
+
+[CAP] woken PID 111 (channel 29)
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+M4-CLONE3-OK=[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=13 |M4-CLONE3-OK=|
+[CAP] woken PID 109 (channel 27)
+  .
+  ..
+  etc
+  bin
+  tmp
+  dev
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[E7] linux: num=0000000C child=e7.linux.probe.0 ok
+
+[CAP] woken PID 112 (channel 30)
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+M4-WORKER-A-TID=[E7] linux: num=00000001 child=e7.gate.user.0.t112 write ok len=16 |M4-WORKER-A-TID=|
+[CAP] woken PID 110 (channel 28)
+[E7] linux: num=0000000C child=e7.linux.cand.0 ok
+
+[CAP] woken PID 112 (channel 30)
+[CAP] send handoff: PID 106 -> 112
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[CAP] woken PID 111 (channel 29)
+112[CAP] woken PID 109 (channel 27)
+[E7] linux: num=00000001 child=e7.linux.probe.0 write ok len=13 |E7MEM-BRK-OK.|
+[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=3 |112|
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 110 (channel 28)
+[E7] linux: num=00000001 child=e7.linux.cand.0 write ok len=13 |E7MEM-BRK-OK.|
+[CAP] woken PID 112 (channel 30)
+112[E7] linux: num=00000001 child=e7.gate.user.0.t112 write ok len=3 |112|
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[CAP] woken PID 112 (channel 30)
+[CAP] send handoff: PID 106 -> 112
+[CAP] woken PID 109 (channel 27)
+[E7] linux: num=0000000C child=e7.linux.probe.0 ok
+
+E7MEM-BRK-OK
+E7MEM-BRK-OK
+[CAP] woken PID 111 (channel 29)
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+[E7] linux mprotect prot=0x6 refused before post: write+execute is refused by the shim (§5.4)
+
+[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=1 |.|
+[CAP] woken PID 110 (channel 28)
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[E7] linux: num=0000000C child=e7.linux.cand.0 ok
+
+[CAP] woken PID 112 (channel 30)
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[E7] linux mprotect prot=0x6 refused before post: write+execute is refused by the shim (§5.4)
+
+[E7] linux: num=00000001 child=e7.gate.user.0.t112 write ok len=1 |.|
+[CAP] woken PID 109 (channel 27)
+[CAP] woken PID 112 (channel 30)
+[CAP] send handoff: PID 106 -> 112
+[E7] linux: num=0000000A child=e7.linux.probe.0 ok
+
+[CAP] woken PID 111 (channel 29)
+M4-CLONE3-CTID=[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+[E7] mprotect addr=0x400000006000 len=4096 prot=0x0: 1 page(s) parked (PROT_NONE guard)
+[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=15 |M4-CLONE3-CTID=|
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 110 (channel 28)
+[E7] linux: num=0000000A child=e7.linux.cand.0 ok
+
+[CAP] woken PID 112 (channel 30)
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[E7] mprotect addr=0x400000007000 len=4096 prot=0x0: 1 page(s) parked (PROT_NONE guard)
+[E7] linux: num=000000CA child=e7.gate.user.0.t112 requeue from=0x0000000040068c60 -> 0x0000000
+i[caps] dumping cap tables
+
+[CAP] Capability tables:
+  table 0 (pid 0): 28 live cap(s)
+    [0] type=2 obj=8 perms=0x02
+    [1] type=3 obj=8 perms=0x01
+    [2] type=2 obj=9 perms=0x02
+    [3] type=3 obj=9 perms=0x01
+    [4] type=2 obj=12 perms=0x02
+    [5] type=3 obj=12 perms=0x01
+    [6] type=2 obj=16 perms=0x02
+    [7] type=3 obj=16 perms=0x01
+    [8] type=2 obj=19 perms=0x02
+    [9] type=3 obj=19 perms=0x01
+    [10] type=2 obj=22 perms=0x02
+    [11] type=3 obj=22 perms=0x01
+    [12] type=2 obj=29 perms=0x02
+    [13] type=3 obj=29 perms=0x01
+    [14] type=2 obj=32 perms=0x02
+    [15] type=3 obj=32 perms=0x01
+    [16] type=2 obj=34 perms=0x02
+    [17] type=3 obj=34 perms=0x01
+    [18] type=2 obj=35 perms=0x02
+    [19] type=3 obj=35 perms=0x01
+    [20] type=2 obj=39 perms=0x02
+    [21] type=3 obj=39 perms=0x01
+    [22] type=2 obj=42 perms=0x02
+    [23] type=3 obj=42 perms=0x01
+    [24] type=2 obj=44 perms=0x02
+    [25] type=3 obj=44 perms=0x01
+    [26] type=2 obj=45 perms=0x02
+    [27] type=3 obj=45 perms=0x01
+  table 1 (pid 100): 27 live cap(s)
+    [0] type=2 obj=0 perms=0x02
+    [1] type=3 obj=0 perms=0x01
+    [2] type=1 obj=1 perms=0x0b
+    [3] type=3 obj=13 perms=0x01
+    [4] type=1 obj=3 perms=0x09
+    [5] type=1 obj=4 perms=0x09
+    [6] type=1 obj=5 perms=0x09
+    [7] type=1 obj=6 perms=0x09
+    [8] type=2 obj=13 perms=0x02
+    [9] type=2 obj=8 perms=0x02
+    [10] type=3 obj=8 perms=0x01
+    [11] type=2 obj=9 perms=0x02
+    [12] type=3 obj=9 perms=0x01
+    [13] type=2 obj=10 perms=0x02
+    [14] type=3 obj=10 perms=0x01
+    [15] type=2 obj=17 perms=0x02
+    [16] type=3 obj=17 perms=0x01
+    [17] type=2 obj=20 perms=0x02
+    [18] type=3 obj=20 perms=0x01
+    [19] type=2 obj=26 perms=0x02
+    [20] type=3 obj=26 perms=0x01
+    [21] type=2 obj=30 perms=0x02
+    [22] type=3 obj=30 perms=0x01
+    [23] type=2 obj=36 perms=0x02
+    [24] type=3 obj=36 perms=0x01
+    [25] type=2 obj=40 perms=0x02
+    [26] type=3 obj=40 perms=0x01
+  table 2 (pid 99): 2 live cap(s)
+    [0] type=2 obj=0 perms=0x02
+    [1] type=3 obj=0 perms=0x01
+  table 3 (pid 101): 7 live cap(s)
+    [0] type=2 obj=10 perms=0x02
+    [1] type=3 obj=10 perms=0x01
+    [2] type=1 obj=11 perms=0x0b
+    [3] type=2 obj=12 perms=0x02
+    [4] type=3 obj=12 perms=0x01
+    [5] type=1 obj=2 perms=0x09
+    [6] type=1 obj=7 perms=0x09
+  table 4 (pid 102): 8 live cap(s)
+    [0] type=2 obj=13 perms=0x02
+    [1] type=3 obj=13 perms=0x01
+    [2] type=1 obj=14 perms=0x0b
+    [3] type=1 obj=15 perms=0x09
+    [4] type=2 obj=16 perms=0x02
+    [5] type=3 obj=16 perms=0x01
+    [6] type=2 obj=23 perms=0x02
+    [7] type=3 obj=23 perms=0x01
+  table 5 (pid 103): 7 live cap(s)
+    [0] type=2 obj=17 perms=0x02
+    [1] type=3 obj=17 perms=0x01
+    [2] type=1 obj=18 perms=0x0b
+    [3] type=2 obj=19 perms=0x02
+    [4] type=3 obj=19 perms=0x01
+    [5] type=2 obj=24 perms=0x02
+    [6] type=3 obj=24 perms=0x01
+  table 6 (pid 104): 17 live cap(s)
+    [0] type=2 obj=20 perms=0x02
+    [1] type=3 obj=20 perms=0x01
+    [2] type=1 obj=21 perms=0x0b
+    [3] type=2 obj=22 perms=0x02
+    [4] type=3 obj=22 perms=0x01
+    [5] type=2 obj=23 perms=0x02
+    [6] type=3 obj=23 perms=0x01
+    [7] type=2 obj=24 perms=0x02
+    [8] type=3 obj=24 perms=0x01
+    [9] type=7 obj=32 perms=0x01
+    [10] type=7 obj=36 perms=0x01
+    [11] type=6 obj=1016 perms=0x03
+    [12] type=5 obj=25 perms=0x03
+    [13] type=2 obj=46 perms=0x02
+    [14] type=3 obj=46 perms=0x01
+    [15] type=2 obj=47 perms=0x02
+    [16] type=3 obj=47 perms=0x01
+  table 7 (pid 105): 8 live cap(s)
+    [0] type=2 obj=26 perms=0x02
+    [1] type=3 obj=26 perms=0x01
+    [2] type=1 obj=27 perms=0x0b
+    [3] type=1 obj=28 perms=0x0b
+    [4] type=2 obj=29 perms=0x02
+    [5] type=3 obj=29 perms=0x01
+    [6] type=2 obj=33 perms=0x02
+    [7] type=3 obj=33 perms=0x01
+  table 8 (pid 106): 15 live cap(s)
+    [0] type=2 obj=30 perms=0x02
+    [1] type=3 obj=30 perms=0x01
+    [2] type=1 obj=31 perms=0x0b
+    [3] type=2 obj=32 perms=0x02
+    [4] type=3 obj=32 perms=0x01
+    [5] type=2 obj=33 perms=0x02
+    [6] type=3 obj=33 perms=0x01
+    [7] type=2 obj=34 perms=0x02
+    [8] type=3 obj=34 perms=0x01
+    [9] type=2 obj=35 perms=0x02
+    [10] type=3 obj=35 perms=0x01
+    [11] type=2 obj=48 perms=0x02
+    [12] type=3 obj=48 perms=0x01
+    [13] type=2 obj=49 perms=0x02
+    [14] type=3 obj=49 perms=0x01
+  table 9 (pid 107): 8 live cap(s)
+    [0] type=2 obj=36 perms=0x02
+    [1] type=3 obj=36 perms=0x01
+    [2] type=1 obj=37 perms=0x0b
+    [3] type=1 obj=38 perms=0x0b
+    [4] type=2 obj=39 perms=0x02
+    [5] type=3 obj=39 perms=0x01
+    [6] type=2 obj=43 perms=0x02
+    [7] type=3 obj=43 perms=0x01
+  table 10 (pid 108): 11 live cap(s)
+    [0] type=2 obj=40 perms=0x02
+    [1] type=3 obj=40 perms=0x01
+    [2] type=1 obj=41 perms=0x0b
+    [3] type=2 obj=42 perms=0x02
+    [4] type=3 obj=42 perms=0x01
+    [5] type=2 obj=43 perms=0x02
+    [6] type=3 obj=43 perms=0x01
+    [7] type=2 obj=44 perms=0x02
+    [8] type=3 obj=44 perms=0x01
+    [9] type=2 obj=45 perms=0x02
+    [10] type=3 obj=45 perms=0x01
+  table 11 (pid 109): 2 live cap(s)
+    [0] type=2 obj=46 perms=0x02
+    [1] type=3 obj=46 perms=0x01
+  table 12 (pid 110): 2 live cap(s)
+    [0] type=2 obj=47 perms=0x02
+    [1] type=3 obj=47 perms=0x01
+  table 13 (pid 111): 2 live cap(s)
+    [0] type=2 obj=48 perms=0x02
+    [1] type=3 obj=48 perms=0x01
+  table 14 (pid 112): 2 live cap(s)
+    [0] type=2 obj=49 perms=0x02
+    [1] type=3 obj=49 perms=0x01
+[CAP] objects active=50/1024  arena free=16384/16384 frames
+[CAP] woken PID 112 (channel 30)
+[CAP] send handoff: PID 106 -> 112
+[CAP] woken PID 109 (channel 27)
+[CAP] woken PID 111 (channel 29)
+[E7] linux: num=0000000A child=e7.linux.probe.0 ok
+
+112[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=3 |112|
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+[E7] mprotect addr=0x400000006000 len=4096 prot=0x3: 1 page(s) re-protected
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 110 (channel 28)
+[CAP] woken PID 112 (channel 30)
+[E7] linux: num=0000000A child=e7.linux.cand.0 ok
+
+[E7] linux: num=000000CA child=e7.gate.user.0.t112 wake (futex)
+
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[E7] mprotect addr=0x400000007000 len=4096 prot=0x3: 1 page(s) re-protected
+[CAP] woken PID 112 (channel 30)
+[CAP] send handoff: PID 106 -> 112
+[CAP] woken PID 109 (channel 27)
+[CAP] woken PID 111 (channel 29)
+
+[E7] linux: num=00000001 child=e7.linux.probe.0 write ok len=18 |E7MEM-MPROTECT-OK.|
+[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=1 |.|
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 110 (channel 28)
+[CAP] woken PID 112 (channel 30)
+[E7] linux: num=00000001 child=e7.linux.cand.0 write ok len=18 |E7MEM-MPROTECT-OK.|
+[E7] linux: num=00000018 child=e7.gate.user.0.t112 -> ENOSYS
+
+[CAP] woken PID 112 (channel 30)
+[CAP] send handoff: PID 106 -> 112
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[CAP] woken PID 111 (channel 29)
+[CAP] woken PID 109 (channel 27)
+E7MEM-MPROTECT-OK
+E7MEM-MPROTECT-OK
+[E7] linux: num=000000CA child=e7.gate.user.0 wait (futex) uaddr=0x0000000040068c60 q=1
+
+[CAP] woken PID 112 (channel 30)
+[E7] linux: num=000000CA child=e7.gate.user.0.t112 requeue from=0x0000000040068c60 -> 0x0000000
+i[E7] linux: num=00000009 child=e7.linux.probe.0 ok mmap -> 0x0000400000015000
+
+[CAP] woken PID 112 (channel 30)
+[CAP] send handoff: PID 106 -> 112
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+[CAP] woken PID 112 (channel 30)
+[CAP] woken PID 110 (channel 28)
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[E7] linux: num=00000009 child=e7.linux.cand.0 ok mmap -> 0x0000400000016000
+
+[E7] linux: num=000000CA child=e7.gate.user.0.t112 wake (futex)
+
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[CAP] woken PID 112 (channel 30)
+[CAP] send handoff: PID 106 -> 112
+[CAP] woken PID 109 (channel 27)
+[CAP] woken PID 111 (channel 29)
+[E7] linux: num=00000001 child=e7.linux.probe.0 write ok len=14 |E7MEM-MMAP-OK.|
+M4-REQUEUE-PARENT-OK[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=20 |M4-REQUEUE-PARENT-OK|
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 110 (channel 28)
+[CAP] woken PID 112 (channel 30)
+[E7] linux: num=00000001 child=e7.linux.cand.0 write ok len=14 |E7MEM-MMAP-OK.|
+M4-REQUEUE-WORKER-WOKE=[E7] linux: num=00000001 child=e7.gate.user.0.t112 write ok len=23 |M4-REQUEUE-WORKER-WOKE=|
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[CAP] woken PID 112 (channel 30)
+[CAP] send handoff: PID 106 -> 112
+E7MEM-MMAP-OK
+E7MEM-MMAP-OK
+System ready
+[CAP] woken PID 111 (channel 29)
+[CAP] woken PID 109 (channel 27)
+[E7] linux: num=0000000B child=e7.linux.probe.0 ok munmap addr=0x0000400000015000 len=4096
+
+
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+[E7] munmap addr=0x400000015000 len=4096: 1 page(s) freed, 0 already absent
+[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=1 |.|
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 110 (channel 28)
+[E7] linux: num=0000000B child=e7.linux.cand.0 ok munmap addr=0x0000400000016000 len=4096
+
+[CAP] woken PID 112 (channel 30)
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[E7] munmap addr=0x400000016000 len=4096: 1 page(s) freed, 0 already absent
+1[E7] linux: num=00000001 child=e7.gate.user.0.t112 write ok len=1 |1|
+[CAP] woken PID 109 (channel 27)
+[E7] linux: num=0000000B child=e7.linux.probe.0 ok munmap addr=0x0000400000015000 len=4096
+
+[CAP] woken PID 112 (channel 30)
+[CAP] send handoff: PID 106 -> 112
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+[E7] munmap addr=0x400000015000 len=4096: 0 page(s) freed, 1 already absent
+[E7] linux munmap addr=0x400000006000 len=4096 refused before post: malformed, outside the stamped span, or below the current break
+[CAP] woken PID 111 (channel 29)
+[CAP] woken PID 110 (channel 28)
+[PROC] M4.2 thread 113 'e7.gate.user.0.t113' created (held, tgid=3).
+[PROC] PID 113 released.
+[PROC] M4.2 clone: parent 111 -> child 113 (tgid=3) released.
+[E7] linux: num=0000000B child=e7.linux.cand.0 ok munmap addr=0x0000400000016000 len=4096
+
+[E7] linux: num=000001B3 child=e7.gate.user.0 clone group=0 files shared
+
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[E7] munmap addr=0x400000016000 len=4096: 0 page(s) freed, 1 already absent
+[E7] linux munmap addr=0x400000007000 len=4096 refused before post: malformed, outside the stamped span, or below the current break
+[E7] linux: num=000001B3 child=e7.gate.user.0 ok
+
+[CAP] woken PID 109 (channel 27)
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[E7] linux: num=00000001 child=e7.linux.probe.0 write ok len=16 |E7MEM-MUNMAP-OK.|
+[CAP] woken PID 112 (channel 30)
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+
+[CAP] woken PID 110 (channel 28)
+[E7] linux: num=00000001 child=e7.gate.user.0.t112 write ok len=1 |.|
+[E7] linux: num=00000001 child=e7.linux.cand.0 write ok len=16 |E7MEM-MUNMAP-OK.|
+[CAP] woken PID 112 (channel 30)
+[CAP] send handoff: PID 106 -> 112
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[CAP] woken PID 113 (channel 31)
+[CAP] woken PID 109 (channel 27)
+[E7] linux: num=00000111 child=e7.gate.user.0.t113 ok
+
+[CAP] woken PID 113 (channel 31)
+[CAP] send handoff: PID 106 -> 113
+E7MEM-MUNMAP-OK
+E7MEM-MUNMAP-OK
+[E7] linux: num=00000009 child=e7.linux.probe.0 ok mmap -> 0x0000400000006000
+
+[CAP] woken PID 111 (channel 29)
+M4-CLONE3-B-OK=[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=15 |M4-CLONE3-B-OK=|
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+[E7] linux mmap addr=0x0 len=4096 prot=6 flags=0x22 refused before post: write+execute is refused (§5.4)
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 110 (channel 28)
+[CAP] woken PID 112 (channel 30)
+[E7] linux: num=00000009 child=e7.linux.cand.0 ok mmap -> 0x0000400000007000
+
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[E7] linux mmap addr=0x0 len=4096 prot=6 flags=0x22 refused before post: write+execute is refused (§5.4)
+M4-REQUEUE-OK[E7] linux: num=00000001 child=e7.gate.user.0.t112 write ok len=13 |M4-REQUEUE-OK|
+[CAP] woken PID 109 (channel 27)
+[CAP] woken PID 112 (channel 30)
+[CAP] send handoff: PID 106 -> 112
+
+[E7] linux: num=00000009 child=e7.linux.probe.0 -> ENOMEM mmap(len=1048576, prot=3, flags=34)
+[CAP] woken PID 113 (channel 31)
+M4-ROBUST-SET=[E7] linux: num=00000001 child=e7.gate.user.0.t113 write ok len=14 |M4-ROBUST-SET=|
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+[CAP] woken PID 113 (channel 31)
+[CAP] send handoff: PID 106 -> 113
+[CAP] woken PID 110 (channel 28)
+[CAP] woken PID 111 (channel 29)
+[E7] linux: num=00000009 child=e7.linux.cand.0 -> ENOMEM mmap(len=1048576, prot=3, flags=34)
+113[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=3 |113|
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 109 (channel 27)
+[E7] linux: num=00000083 child=e7.linux.probe.0 ok
+
+[CAP] woken PID 112 (channel 30)
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+
+[E7] linux: num=00000001 child=e7.gate.user.0.t112 write ok len=1 |.|
+[CAP] woken PID 110 (channel 28)
+[E7] linux: num=00000083 child=e7.linux.cand.0 ok
+
+[CAP] woken PID 112 (channel 30)
+[CAP] send handoff: PID 106 -> 112
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[CAP] woken PID 113 (channel 31)
+0[E7] linux: num=00000001 child=e7.gate.user.0.t113 write ok len=1 |0|
+[CAP] woken PID 109 (channel 27)
+[E7] linux: num=0000000D child=e7.linux.probe.0 ok
+
+[CAP] woken PID 113 (channel 31)
+[CAP] send handoff: PID 106 -> 113
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+[CAP] woken PID 111 (channel 29)
+
+[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=1 |.|
+[CAP] woken PID 110 (channel 28)
+[E7] linux: num=0000000D child=e7.linux.cand.0 ok
+
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[CAP] woken PID 112 (channel 30)
+[CAP] woken PID 109 (channel 27)
+[E7] linux: num=000000DA child=e7.linux.probe.0 ok
+
+[CAP] send handoff: PID 104 -> 109
+[E7] linux: num=000000CA child=e7.gate.user.0.t112 wait (futex) uaddr=0x0000000040088c78 q=1
+
+[CAP] woken PID 110 (channel 28)
+[CAP] woken PID 113 (channel 31)
+[E7] linux: num=000000DA child=e7.linux.cand.0 ok
+
+
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[E7] linux: num=00000001 child=e7.gate.user.0.t113 write ok len=1 |.|
+[CAP] woken PID 109 (channel 27)
+[CAP] woken PID 113 (channel 31)
+[CAP] send handoff: PID 106 -> 113
+[E7] linux: num=000000C8 child=e7.linux.probe.0 sig=10 handler -> frame
+
+[CAP] woken PID 111 (channel 29)
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+[E7] linux: num=00000018 child=e7.gate.user.0 -> ENOSYS
+
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 110 (channel 28)
+[CAP] woken PID 113 (channel 31)
+[E7] linux: num=000000CA child=e7.gate.user.0.t113 wait (futex) uaddr=0x0000000040088c70 q=2
+
+[E7] linux: num=000000C8 child=e7.linux.cand.0 sig=10 handler -> frame
+
+[CAP] woken PID 111 (channel 29)
+[CAP] woken PID 113 (channel 31)
+[CAP] send handoff: PID 106 -> 113
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[E7] linux: num=000000CA child=e7.gate.user.0 wake (futex)
+
+[CAP] woken PID 109 (channel 27)
+[E7] linux: num=00000001 child=e7.linux.probe.0 write ok len=11 |E7SIG-INFO.|
+$ [CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+[CAP] woken PID 113 (channel 31)
+[CAP] woken PID 110 (channel 28)
+M4-ROBUST-WORKER-EXIT[E7] linux: num=00000001 child=e7.gate.user.0.t113 write ok len=21 |M4-ROBUST-WORKER-EXIT|
+[E7] linux: num=00000001 child=e7.linux.cand.0 write ok len=11 |E7SIG-INFO.|
+[CAP] woken PID 113 (channel 31)
+[CAP] send handoff: PID 106 -> 113
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[CAP] woken PID 111 (channel 29)
+[E7] linux: num=000000CA child=e7.gate.user.0 wait (futex) uaddr=0x0000000040068c38 q=2
+
+[CAP] woken PID 109 (channel 27)
+[E7] linux: num=00000001 child=e7.linux.probe.0 write ok len=9 |E7SIG-OK.|
+[CAP] woken PID 113 (channel 31)
+E7SIG-INFO
+E7SIG-INFO
+
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+[E7] linux: num=00000001 child=e7.gate.user.0.t113 write ok len=1 |.|
+[CAP] woken PID 110 (channel 28)
+[E7] linux: num=00000001 child=e7.linux.cand.0 write ok len=9 |E7SIG-OK.|
+[CAP] woken PID 113 (channel 31)
+[CAP] send handoff: PID 106 -> 113
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[E7] linux: num=000000CA child=e7.gate.user.0 wait timed out
+
+[CAP] woken PID 109 (channel 27)
+E7SIG-OK
+E7SIG-OK
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 111 (channel 29)
+[E7] linux: num=000000CA child=e7.gate.user.0 wait (futex) uaddr=0x0000000040068c38 q=2
+
+[E7] linux: num=0000000F child=e7.linux.probe.0 ok
+
+[CAP] woken PID 113 (channel 31)
+[E7] linux: num=0000003C child=e7.gate.user.0.t113 exit status=0
+
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+[PROC] PID 113 terminated.
+[TORE] PID 113 teardown: 2 cap(s) dropped, 0 object(s) destroyed, 0 arena frame(s) returned, table 15 unbound
+[CAP] woken PID 110 (channel 28)
+[E7] linux: num=0000000F child=e7.linux.cand.0 ok
+
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[CAP] woken PID 111 (channel 29)
+M4-ROBUST-BIT=1073741824
+[CAP] woken PID 109 (channel 27)
+[E7] linux: num=0000000E child=e7.linux.probe.0 ok + payload
+
+[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=25 |M4-ROBUST-BIT=1073741824|
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 110 (channel 28)
+[CAP] woken PID 111 (channel 29)
+[E7] linux: num=0000000E child=e7.linux.cand.0 ok + payload
+
+M4-ROBUST-OK=[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=13 |M4-ROBUST-OK=|
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 109 (channel 27)
+[CAP] woken PID 111 (channel 29)
+1073741824[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=10 |1073741824|
+[E7] linux: num=00000001 child=e7.linux.probe.0 write ok len=10 |E7SIG-RET.|
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 109 (channel 27)
+[CAP] send handoff: PID 104 -> 109
+[CAP] woken PID 111 (channel 29)
+
+[CAP] woken PID 110 (channel 28)
+[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=1 |.|
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[E7] linux: num=00000001 child=e7.linux.cand.0 write ok len=10 |E7SIG-RET.|
+[CAP] woken PID 110 (channel 28)
+[CAP] send handoff: PID 104 -> 110
+[CAP] woken PID 111 (channel 29)
+[PROC] PID 112 terminated.
+[TORE] PID 112 teardown: 2 cap(s) dropped, 0 object(s) destroyed, 0 arena frame(s) returned, table 14 unbound
+[CAP] woken PID 109 (channel 27)
+[E7] linux: num=000000E7 child=e7.linux.probe.0 exit_group status=42
+
+E7SIG-RET
+E7SIG-RET
+[E7] linux: num=000000EA child=e7.gate.user.0 sibling sig=15 -> kill
+
+[PROC] PID 109 terminated.
+[TORE] PID 109 teardown: 2 cap(s) dropped, 0 object(s) destroyed, 0 arena frame(s) returned, table 11 unbound
+[TORE] address space 0x0000000013183000 destroyed: 10 frame(s) freed
+[PROC] M4.5 group sweep tgid=109 group=1 killed=1 live=0
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[E7] linux: num=000000E7 child=e7.linux.probe.0 group swept=1 dead=1 live=0
+
+[CAP] woken PID 111 (channel 29)
+[CAP] woken PID 110 (channel 28)
+[E7] linux: num=000000E7 child=e7.linux.cand.0 exit_group status=42
+
+M4-TGKILL-SENT=[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=15 |M4-TGKILL-SENT=|
+[PROC] PID 110 terminated.
+[TORE] PID 110 teardown: 2 cap(s) dropped, 0 object(s) destroyed, 0 arena frame(s) returned, table 12 unbound
+[TORE] address space 0x000000001318e000 destroyed: 15 frame(s) freed
+[PROC] M4.5 group sweep tgid=110 group=2 killed=1 live=0
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[E7] linux: num=000000E7 child=e7.linux.cand.0 group swept=1 dead=1 live=0
+
+[CAP] woken PID 111 (channel 29)
+0[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=1 |0|
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 111 (channel 29)
+
+[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=1 |.|
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 111 (channel 29)
+[E7] linux: num=000000EA child=e7.gate.user.0 ok
+
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 111 (channel 29)
+M4-TGKILL-OK[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=12 |M4-TGKILL-OK|
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 111 (channel 29)
+
+[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=1 |.|
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 111 (channel 29)
+M4-HARDENING-PASS[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=17 |M4-HARDENING-PASS|
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 111 (channel 29)
+
+[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=1 |.|
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 111 (channel 29)
+M4-GROUP-KILL-SENT[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=18 |M4-GROUP-KILL-SENT|
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 111 (channel 29)
+
+[E7] linux: num=00000001 child=e7.gate.user.0 write ok len=1 |.|
+[CAP] woken PID 111 (channel 29)
+[CAP] send handoff: PID 106 -> 111
+[CAP] woken PID 111 (channel 29)
+[E7] linux: num=0000003E child=e7.gate.user.0 group sig=15 -> exit_group sweep
+
+[E7] linux: num=0000003E child=e7.gate.user.0 exit_group status=111
+
+[PROC] PID 111 terminated.
+[TORE] PID 111 teardown: 2 cap(s) dropped, 0 object(s) destroyed, 0 arena frame(s) returned, table 13 unbound
+[TORE] address space 0x000000001319e000 destroyed: 166 frame(s) freed
+[PROC] M4.5 group sweep tgid=111 group=3 killed=1 live=0
+[E7] linux: num=0000003E child=e7.gate.user.0 group swept=1 dead=1 live=0
+

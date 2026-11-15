@@ -66,3 +66,7 @@ m4_ckpt_probe = []
 # It replaces the gate profile's firstuser with the static threaded Rust
 # probe. Default builds compile neither the module nor its spawn path.
 m4_runtime_probe = []
+# M4.8's live clone3/requeue/robust/signal gate — enabled only by
+# the E3 gate profile with M4_HARDENING_PROBE=1. Default builds compile neither the
+# module nor its spawn path.
+m4_hardening_probe = []
