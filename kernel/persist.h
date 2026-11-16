@@ -51,7 +51,9 @@
 //  LBA 5792  PERSIST_PART_HDR_LBA    1 frame  — partitions header
 //  LBA 5800  PERSIST_PART_ENT_LBA    3 frames — partition_table[256]        (10,240 B = 40 B * 256)
 //  LBA 5824  PERSIST_PART_ASSIGN_LBA 12 frames — partition_assign_table[4096] (49,152 B = 12 B * 4096, exact)
-//  LBA 5920  PERSIST_PART_OWNER_LBA  1 frame  — partition_owner_table[256]  (3,072 B = 12 B * 256)
+//  LBA 5920  PERSIST_PART_OWNER_LBA  1 frame  — partition_owner_table[256]  (4,096 B = 16 B * 256;
+//                                                    includes the ownership epoch added for
+//                                                    stale-reannounce rejection)
 //            (Multi-Node Partition Scaling Roadmap Phase 2's own region,
 //            resized in place for the capacity-sizing pass above)
 //  (end LBA 5928, +1 frame safety gap -> next region starts LBA 5936)

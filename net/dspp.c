@@ -16,6 +16,21 @@
 #include "../kernel/env_replica.h"  // POSIX-Environments P3 destination (a) -- env_replica_recv_begin()/_page(), env_replica_holds()
 #include "../kernel/kernel_io.h"
 
+/* ─── Ownership-epoch boundary defaults ────────────────────────────────
+ * kernel/partition.c owns the strong definitions; these weak ones keep the
+ * historical host tests that link THIS dispatcher with a stubbed partition
+ * layer linking unchanged. The kernel link always takes the strong pair. */
+__attribute__((weak)) uint32_t partition_get_owner_epoch(uint32_t partition_id) {
+    (void)partition_id;
+    return 0;
+}
+__attribute__((weak)) void partition_sync_upsert_epoch(
+    uint32_t partition_id, uint32_t owner_node_id, const char* name,
+    uint32_t source_node_id, uint32_t owner_epoch) {
+    (void)owner_epoch;   /* no epoch state in the stubbed layer */
+    partition_sync_upsert(partition_id, owner_node_id, name, source_node_id);
+}
+
 /* ─── P3 destination (a): the replica receiver's WEAK defaults ─────────────
  * kernel/env_replica.c owns the strong definitions; these keep THIS file's
  * dependency surface at its historical boundary — every host test that
@@ -468,9 +483,15 @@ static volatile uint8_t  ack_begin_seen  = 0;
 static volatile uint8_t  ack_frag_seen[DSPP_MIGRATE_FRAGS_PER_PAGE];
 static volatile uint32_t ack_frag_count  = 0;
 static volatile uint8_t  ack_nack_seen   = 0;   /* a non-zero status arrived */
+static volatile uint16_t ack_peer_id     = 0;   /* 0 = accept any source */
+
+void dspp_migrate_arm_peer(uint16_t peer_id) {
+    ack_peer_id = peer_id;
+}
 
 void dspp_migrate_arm_begin(uint64_t transfer_id) {
     ack_armed = 0;
+    ack_peer_id = 0;   /* stream migration accepts any peer; env re-pins below */
     ack_transfer_id = transfer_id;
     ack_begin_seen  = 0;
     ack_nack_seen   = 0;
@@ -509,6 +530,19 @@ void dspp_migrate_note_ack(uint64_t transfer_id, uint16_t opcode,
         ack_frag_seen[frag_index] = 1;
         ack_frag_count++;
     }
+}
+
+void dspp_migrate_note_ack_from(uint64_t transfer_id, uint16_t opcode,
+                                uint32_t page_index, uint32_t frag_index,
+                                uint8_t status, uint16_t from_node) {
+    /* A replica push sends the SAME transfer id to every peer in turn. The
+     * page/fragment numbers therefore collide across peers: without this
+     * source check, a late ACK from the peer just pushed can satisfy the
+     * next peer's fragment wait, and the source moves on with fragments the
+     * new peer never staged. The receiver then stays incomplete forever and
+     * answers "absent" to the confirm poll -- the live 2026-11-15 run. */
+    if (ack_peer_id != 0 && from_node != ack_peer_id) return;
+    dspp_migrate_note_ack(transfer_id, opcode, page_index, frag_index, status);
 }
 
 int dspp_migrate_page_acked(void)  { return ack_frag_count >= DSPP_MIGRATE_FRAGS_PER_PAGE; }
@@ -561,8 +595,8 @@ void dspp_migrate_rx(struct DSPPMigratePagePacket* packet, uint16_t len) {
      * BSP could not otherwise make progress, since it is the thread doing
      * the waiting. Hence `volatile` on the record below. */
     if (h->opcode == DSPP_MIGRATE_BEGIN_ACK || h->opcode == DSPP_MIGRATE_PAGE_ACK) {
-        dspp_migrate_note_ack(h->transfer_id, h->opcode, h->page_index,
-                              h->frag_index, h->status);
+        dspp_migrate_note_ack_from(h->transfer_id, h->opcode, h->page_index,
+                                   h->frag_index, h->status, h->node_source_id);
         return;
     }
 }
@@ -1179,7 +1213,8 @@ void dspp_service_rx(struct DSPPServiceHeader* h, uint16_t len) {
 
 /* ─── Partition-table replication send side ──────────────────────────── */
 static void dspp_part_send(uint16_t opcode, uint32_t partition_id,
-                           const char* name, uint32_t owner_node_id) {
+                           const char* name, uint32_t owner_node_id,
+                           uint32_t owner_epoch) {
     struct DSPPPartitionSyncHeader h;
     h.magic          = DSPP_MIGRATE_MAGIC;
     h.opcode         = opcode;
@@ -1187,7 +1222,7 @@ static void dspp_part_send(uint16_t opcode, uint32_t partition_id,
     h.node_dest_id   = 0;              /* broadcast -- everyone applies this */
     h.transfer_id    = 0;
     h.partition_id   = partition_id;
-    h.chunk_index    = 0;
+    h.owner_epoch    = owner_epoch;
     h.status         = 0;
     h.owner_node_id  = owner_node_id;
     dspp_strncpy(h.partition_name, name ? name : "", sizeof(h.partition_name));
@@ -1201,12 +1236,13 @@ void dspp_partition_announce(uint32_t partition_id, const char* name,
      * family: announcing from node 0 would teach the segment a partition
      * owned by a node that does not exist. */
     if (cluster_local_node_id() == 0) return;
-    dspp_part_send(DSPP_PARTITION_ANNOUNCE, partition_id, name, owner_node_id);
+    dspp_part_send(DSPP_PARTITION_ANNOUNCE, partition_id, name, owner_node_id,
+                   partition_get_owner_epoch(partition_id));
 }
 
 void dspp_partition_withdraw(uint32_t partition_id) {
     if (cluster_local_node_id() == 0) return;
-    dspp_part_send(DSPP_PARTITION_WITHDRAW, partition_id, "", 0);
+    dspp_part_send(DSPP_PARTITION_WITHDRAW, partition_id, "", 0, 0);
 }
 
 void dspp_partition_rx(struct DSPPPartitionSyncHeader* h, uint16_t len) {
@@ -1218,8 +1254,9 @@ void dspp_partition_rx(struct DSPPPartitionSyncHeader* h, uint16_t len) {
     if (h->node_source_id == (uint16_t)cluster_local_node_id()) return;
 
     if (h->opcode == DSPP_PARTITION_ANNOUNCE) {
-        partition_sync_upsert(h->partition_id, h->owner_node_id,
-                              h->partition_name, h->node_source_id);
+        partition_sync_upsert_epoch(h->partition_id, h->owner_node_id,
+                                    h->partition_name, h->node_source_id,
+                                    h->owner_epoch);
     } else if (h->opcode == DSPP_PARTITION_WITHDRAW) {
         partition_sync_withdraw(h->partition_id, h->node_source_id);
     }

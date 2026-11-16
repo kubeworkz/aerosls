@@ -591,7 +591,10 @@ struct DSPPPartitionSyncHeader {
     uint32_t node_dest_id;      /* 0 == broadcast to the segment */
     uint64_t transfer_id;       /* unused; keeps the prefix identical */
     uint32_t partition_id;
-    uint32_t chunk_index;       /* unused */
+    uint32_t owner_epoch;       /* ANNOUNCE: the owner row's monotonic epoch;
+                                 * unused (0) for WITHDRAW. A lower epoch than
+                                 * the receiver's row is stale and must not
+                                 * move ownership. */
     uint8_t  status;
     /* ── Partition-specific tail ──────────────────────────────────── */
     uint32_t owner_node_id;     /* ANNOUNCE: who owns the partition now */
@@ -801,6 +804,10 @@ void dspp_migrate_send_begin(uint64_t transfer_id, uint32_t node_dest_id,
  * the old note named: a lost BEGIN is now retransmitted rather than causing
  * every subsequent page to be refused. */
 void dspp_migrate_arm_begin(uint64_t transfer_id);
+/* Pin the ACK record to one peer. A replica push sends the same transfer id
+ * to each peer in turn, so without this a delayed ACK from the peer just
+ * pushed can satisfy the next peer's fragment wait (live 2026-11-15). */
+void dspp_migrate_arm_peer(uint16_t peer_id);
 int  dspp_migrate_begin_acked(void);
 void dspp_migrate_arm_page(uint64_t transfer_id, uint32_t page_index);
 void dspp_migrate_note_ack(uint64_t transfer_id, uint16_t opcode,

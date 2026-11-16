@@ -103,6 +103,7 @@ void partition_init(void) {
      * default rather than a fabricated claim of real ownership. */
     partition_owner_table[0].partition_id = PARTITION_SYSTEM;
     partition_owner_table[0].node_id      = cluster_local_node_id();
+    partition_owner_table[0].epoch        = 1;
     partition_owner_table[0].active       = 1;
 
     kernel_serial_print("[PARTITION] LPAR groundwork initialised (1 partition: system).\n");
@@ -127,6 +128,12 @@ uint32_t partition_create(const char* name) {
              * is a correct no-op for single-node deployments. */
             partition_owner_table[i].partition_id = (uint32_t)i;
             partition_owner_table[i].node_id      = cluster_local_node_id();
+            /* Never reset the epoch on slot reuse: a stale node can still
+             * hold the destroyed partition's old row and re-announce it
+             * with the old epoch. Advancing past it keeps the new
+             * partition's first owner newer than that ghost. */
+            partition_owner_table[i].epoch++;
+            if (partition_owner_table[i].epoch == 0) partition_owner_table[i].epoch = 1;
             partition_owner_table[i].active       = 1;
 
             /* v0.2 §11 Q4: a partition is born bounded, at the mint and not in
@@ -229,6 +236,14 @@ uint32_t partition_get_owner_node(uint32_t partition_id) {
     return 0;   /* no ownership row -- see partition.h's comment on why 0 is the honest answer */
 }
 
+uint32_t partition_get_owner_epoch(uint32_t partition_id) {
+    for (int i = 0; i < PARTITION_MAX; i++) {
+        if (partition_owner_table[i].active && partition_owner_table[i].partition_id == partition_id)
+            return partition_owner_table[i].epoch;
+    }
+    return 0;
+}
+
 int partition_set_owner_node(uint32_t partition_id, uint32_t node_id) {
     if (!partition_id_valid(partition_id)) {
         kernel_serial_printf(
@@ -239,6 +254,8 @@ int partition_set_owner_node(uint32_t partition_id, uint32_t node_id) {
     for (int i = 0; i < PARTITION_MAX; i++) {
         if (partition_owner_table[i].active && partition_owner_table[i].partition_id == partition_id) {
             partition_owner_table[i].node_id = node_id;
+            partition_owner_table[i].epoch++;
+            if (partition_owner_table[i].epoch == 0) partition_owner_table[i].epoch = 1;
             kernel_serial_printf("[PARTITION] partition %u ownership set to node %u.\n",
                                  (unsigned)partition_id, (unsigned)node_id);
             persist_partitions();
@@ -257,6 +274,7 @@ int partition_set_owner_node(uint32_t partition_id, uint32_t node_id) {
         if (!partition_owner_table[i].active) {
             partition_owner_table[i].partition_id = partition_id;
             partition_owner_table[i].node_id      = node_id;
+            partition_owner_table[i].epoch        = 1;
             partition_owner_table[i].active       = 1;
             kernel_serial_printf("[PARTITION] partition %u ownership row created, set to node %u.\n",
                                  (unsigned)partition_id, (unsigned)node_id);
@@ -854,13 +872,15 @@ void sys_sls_partition_list(void) {
 // partition table, whose rows are the cluster view a node must keep across
 // a reboot.)
 static volatile uint8_t partition_persist_dirty = 0;
-void partition_sync_upsert(uint32_t partition_id, uint32_t owner_node_id,
-                           const char* name, uint32_t source_node_id) {
+void partition_sync_upsert_epoch(uint32_t partition_id, uint32_t owner_node_id,
+                                 const char* name, uint32_t source_node_id,
+                                 uint32_t owner_epoch) {
     if (partition_id == PARTITION_SYSTEM || partition_id >= PARTITION_MAX) return;
     if (!name || !name[0] || owner_node_id == 0 || source_node_id == 0) return;
 
     int had = partition_exists(partition_id);
     uint32_t cur = had ? partition_get_owner_node(partition_id) : 0;
+    uint32_t cur_epoch = had ? partition_get_owner_epoch(partition_id) : 0;
     if (had && cur != 0 && cur != owner_node_id) {
         /* Two nodes claiming one partition id. The old rule -- "last
          * announce wins", mirroring the duplicate-service-name rule --
@@ -874,10 +894,12 @@ void partition_sync_upsert(uint32_t partition_id, uint32_t owner_node_id,
          *   * source == current owner  -- an owner-initiated transfer
          *     (partition_migrate()): the owner is handing the row off,
          *     apply it.
-         *   * source == owner == the cluster leader -- the leader's own
-         *     claim (failover adoption via partition_set_owner_node, or a
-         *     leader re-assert): the leader's view is authoritative,
-         *     apply it.
+         *   * source == the cluster leader -- the leader's view of the
+         *     row is authoritative, whether or not the leader owns it.
+         *     This is the adoption handoff when the adopter later lost
+         *     leadership (a follower owns the partition, the observer
+         *     won the next election), and it is what the leader's
+         *     periodic re-announce uses to teach a resurrected owner.
          *   * anything else -- a non-owner, non-leader self-claim
          *     colliding with a live owner: the resurrected-owner shape.
          *     KEEP the live owner and reject the stale claim, so an
@@ -888,12 +910,27 @@ void partition_sync_upsert(uint32_t partition_id, uint32_t owner_node_id,
          * error (ids are local slot numbers, so two creators can
          * collide), but it must resolve deterministically in the
          * failover-safe direction, not by arrival order. */
-        if (source_node_id == cur) {
+        if (owner_epoch != 0 && cur_epoch != 0 && owner_epoch < cur_epoch) {
+            /* The leader's periodic full-table re-announce can carry the row
+             * it last learned. If the current owner has already transferred
+             * it, that row is older than this receiver's: applying it would
+             * flap ownership back. Reject by epoch, before the owner's
+             * transfer class and the leader's otherwise-authoritative claim
+             * class, because either can carry a delayed older packet. The
+             * leader converges when the newer announce reaches it. */
+            kernel_serial_printf(
+                "[PARTITION] sync: partition %u claimed by node %u and node %u -- "
+                "keeping node %u (live owner), rejecting the stale claim "
+                "(epoch %u < %u).\n",
+                (unsigned)partition_id, (unsigned)cur, (unsigned)owner_node_id,
+                (unsigned)cur, (unsigned)owner_epoch, (unsigned)cur_epoch);
+            return;
+        } else if (source_node_id == cur) {
             kernel_serial_printf(
                 "[PARTITION] sync: partition %u claimed by node %u and node %u -- "
                 "owner-initiated transfer, applying.\n",
                 (unsigned)partition_id, (unsigned)cur, (unsigned)owner_node_id);
-        } else if (owner_node_id == source_node_id &&
+        } else if (cluster_leader_id() != 0 &&
                    cluster_leader_id() == source_node_id) {
             kernel_serial_printf(
                 "[PARTITION] sync: partition %u claimed by node %u and node %u -- "
@@ -933,6 +970,8 @@ void partition_sync_upsert(uint32_t partition_id, uint32_t owner_node_id,
         if (partition_owner_table[i].active &&
             partition_owner_table[i].partition_id == partition_id) {
             partition_owner_table[i].node_id = owner_node_id;
+            if (owner_epoch > partition_owner_table[i].epoch)
+                partition_owner_table[i].epoch = owner_epoch;
             found = 1;
             break;
         }
@@ -942,6 +981,7 @@ void partition_sync_upsert(uint32_t partition_id, uint32_t owner_node_id,
             if (!partition_owner_table[i].active) {
                 partition_owner_table[i].partition_id = partition_id;
                 partition_owner_table[i].node_id      = owner_node_id;
+                partition_owner_table[i].epoch        = owner_epoch;
                 partition_owner_table[i].active       = 1;
                 break;
             }
@@ -956,6 +996,15 @@ void partition_sync_upsert(uint32_t partition_id, uint32_t owner_node_id,
         "[PARTITION] sync: partition %u '%s' (owner node %u) learned from node %u.\n",
         (unsigned)partition_id, partition_table[partition_id].name,
         (unsigned)owner_node_id, (unsigned)source_node_id);
+}
+
+/* Unversioned compatibility entry point for host tests and any in-kernel
+ * caller that predates epochs. The DSPP receive path calls the epoch-aware
+ * form; zero skips the version checks and retains the claim-class rules. */
+void partition_sync_upsert(uint32_t partition_id, uint32_t owner_node_id,
+                           const char* name, uint32_t source_node_id) {
+    partition_sync_upsert_epoch(partition_id, owner_node_id, name,
+                                source_node_id, 0);
 }
 
 void partition_sync_withdraw(uint32_t partition_id, uint32_t source_node_id) {
@@ -1100,16 +1149,32 @@ void partition_reannounce_tick(uint64_t now) {
 
     uint32_t me = cluster_local_node_id();
     if (me == 0) return;   /* unclustered: nothing to converge and nobody to tell */
+    /* The leader re-announces the WHOLE table, not only the rows it owns.
+     * Adoption is done by whichever survivor was leader at the death, and
+     * that adopter can lose the next election to the other survivor. The
+     * row then has a FOLLOWER owner, so the owner's own re-announce is
+     * rejected by a resurrected stale node (source != leader). Only the
+     * current leader's view can break that tie; it must therefore publish
+     * rows it does not own too. Non-leaders keep the narrow owned-only
+     * re-announce -- a follower's claim about another node's row carries
+     * no authority. */
+    uint32_t leader = cluster_leader_id();
+    int am_leader = (leader != 0 && leader == me);
 
     uint32_t owned_count = 0;
     for (int i = 0; i < PARTITION_MAX; i++) {
         if (!partition_owner_table[i].active) continue;
         uint32_t part_id = partition_owner_table[i].partition_id;
         if (part_id == PARTITION_SYSTEM || part_id >= PARTITION_MAX) continue;
-        if (partition_owner_table[i].node_id != me) continue;
         if (!partition_table[part_id].active) continue;   /* owner row without a table row is not a real partition */
-        dspp_partition_announce(part_id, partition_table[part_id].name, me);
-        partition_ownedset_ids[owned_count++] = part_id;
+        uint32_t owner = partition_owner_table[i].node_id;
+        if (owner == 0) continue;
+        if (owner == me) {
+            dspp_partition_announce(part_id, partition_table[part_id].name, me);
+            partition_ownedset_ids[owned_count++] = part_id;
+        } else if (am_leader) {
+            dspp_partition_announce(part_id, partition_table[part_id].name, owner);
+        }
     }
 
     partition_reannounce_periods++;

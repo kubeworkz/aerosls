@@ -100,6 +100,12 @@ extern struct SLSPartitionAssign partition_assign_table[PARTITION_ASSIGN_MAX];
 struct SLSPartitionOwner {
     uint32_t partition_id;
     uint32_t node_id;
+    /* Monotonic ownership epoch. It moves on every local handoff and on
+     * every accepted remote owner change. A stale leader re-announce can
+     * therefore not overwrite a newer transfer just because its table still
+     * carries the old owner: the old claim's epoch is lower. Persisted with
+     * the row; a pre-epoch snapshot is rejected by persist.c's size check. */
+    uint32_t epoch;
     uint8_t  active;
 };
 extern struct SLSPartitionOwner partition_owner_table[PARTITION_MAX];
@@ -167,6 +173,10 @@ void sys_sls_partition_list(void);
  * own never-fails posture). */
 uint32_t partition_get_owner_node(uint32_t partition_id);
 
+/* The row's ownership epoch, or 0 when it has no owner row. See struct
+ * SLSPartitionOwner. */
+uint32_t partition_get_owner_epoch(uint32_t partition_id);
+
 /* Sets/overwrites which node owns partition_id. Returns 0 on success, 1
  * if partition_id isn't a currently-active, defined partition. This is
  * deliberately just a table write -- no side effects (killing processes,
@@ -197,6 +207,13 @@ int partition_is_local(uint32_t partition_id);
  * partition -- the service family's source-scoped forget rule). */
 void partition_sync_upsert(uint32_t partition_id, uint32_t owner_node_id,
                            const char* name, uint32_t source_node_id);
+/* Epoch-aware form used by the DSPP receive path. An incoming epoch lower
+ * than the local row's epoch is stale and must not move ownership, even
+ * when the claim comes from the leader or the current owner. The existing
+ * claim-class gates decide every other conflict. */
+void partition_sync_upsert_epoch(uint32_t partition_id, uint32_t owner_node_id,
+                                 const char* name, uint32_t source_node_id,
+                                 uint32_t owner_epoch);
 void partition_sync_withdraw(uint32_t partition_id, uint32_t source_node_id);
 
 /* Owned-set reconciliation RX: the source's COMPLETE owned partition-id

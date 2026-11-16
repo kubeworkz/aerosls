@@ -14,9 +14,13 @@
  *
  *   * source == current owner           -> owner-initiated transfer
  *     (partition_migrate()): apply.
- *   * source == owner == cluster leader -> the leader's own claim (the
- *     failover adoption announce, or a leader re-assert): apply — the
- *     leader's view is authoritative.
+ *   * source == cluster leader          -> the leader's view (the failover
+ *     adoption announce, a leader re-assert, or the leader teaching a
+ *     resurrected owner a row it does not own): apply — the leader's view
+ *     is authoritative, UNLESS its ownership epoch is older than the
+ *     receiver's row. That epoch check is what stops the leader's periodic
+ *     full-table re-announce from reverting an owner-initiated transfer
+ *     while the leader's table still carries the pre-transfer owner.
  *   * anything else (a non-owner, non-leader self-claim colliding with a
  *     live owner — the resurrected-owner shape): REJECT, keep the live
  *     owner, transmit nothing.
@@ -181,6 +185,22 @@ int main(void) {
           "concurrent creator: non-leader self-claim rejected, owner stays 4");
     CHECK(g_announce_count == 0, "concurrent creator: reject path silent");
 
+    /* ─── 5b. the leader re-announces a row it does NOT own ──────────── */
+    /* The adoption happened on node 2, then node 3 won the next election.
+     * The row belongs to follower 2 but the leader's periodic re-announce
+     * is what teaches a resurrected stale node (owner 1) the truth. The
+     * claim's source is the leader (3), its owner is 2: it must apply. */
+    g_fake_leader_id = 1;
+    g_fake_local_node_id = 1;                 /* the resurrected stale node */
+    uint32_t pid_lv = partition_create("conflict-lv");   /* stale local row */
+    g_fake_leader_id = 3;
+    g_announce_count = 0;
+    partition_sync_upsert(pid_lv, 4, "conflict-lv", 3);
+    CHECK(partition_get_owner_node(pid_lv) == 4,
+          "leader re-announce of a row it does not own applies its view");
+    CHECK(g_announce_count == 0, "leader view apply transmits nothing");
+    g_fake_leader_id = 2;
+
     /* ─── 6. adoption claim when the leader is UNKNOWN at the receiver ── */
     /* A receiver that has not yet heard the new leader's heartbeat sees
      * leader id 0; the conservative outcome is to reject rather than
@@ -195,9 +215,89 @@ int main(void) {
 
     /* ─── 7. a fresh learn (no local row) is unaffected ───────────────── */
     g_announce_count = 0;
-    partition_sync_upsert(pid + 1, 3, "fresh-b", 3);
-    CHECK(partition_get_owner_node(pid + 1) == 3,
+    partition_sync_upsert(pid + 5, 3, "fresh-b", 3);
+    CHECK(partition_get_owner_node(pid + 5) == 3,
           "fresh learn with no local row applies unconditionally");
+
+    /* ─── 8. the leader's periodic re-announce publishes the whole table ─ */
+    /* A follower-owned row must be re-announced BY THE LEADER so a
+     * resurrected stale owner can converge. A non-leader must stay
+     * narrow: it re-announces only the rows it owns. */
+    g_fake_local_node_id = 3;
+    g_fake_leader_id = 3;
+    partition_create("conflict-c");            /* owner 3, owned row */
+    g_announce_count = 0;
+    g_last_announce_owner = 0;
+    partition_reannounce_tick(1000);   /* one PARTITION_REANNOUNCE_TICKS */
+    CHECK(g_announce_count >= 2,
+          "leader re-announce publishes owned AND follower-owned rows");
+    CHECK(g_last_announce_owner == 3 || g_last_announce_owner == 4,
+          "leader re-announce carries the row's real owner, not the leader");
+
+    g_fake_local_node_id = 2;
+    g_fake_leader_id = 3;
+    g_announce_count = 0;
+    partition_reannounce_tick(2000);   /* the next re-announce period */
+    CHECK(g_announce_count == 0,
+          "non-leader re-announce stays silent for rows it does not own");
+
+    /* ─── 9. a stale leader re-announce cannot revert a transfer ───────── */
+    /* The receiver holds the transferred owner (4, epoch 3). The leader's
+     * periodic full-table re-announce still carries the pre-transfer owner
+     * (1, epoch 2) because it has not yet received the transfer announce.
+     * Trusting the leader by role alone would flap ownership back to 1;
+     * the epoch must reject the older claim. */
+    g_fake_local_node_id = 2;
+    g_fake_leader_id = 3;
+    uint32_t pid_ep = partition_create("conflict-epoch");   /* owner 2, epoch 1 */
+    CHECK(partition_set_owner_node(pid_ep, 1) == 0,
+          "epoch scenario: owner row moved to node 1 (epoch 2)");
+    partition_sync_upsert_epoch(pid_ep, 4, "conflict-epoch", 1, 3);
+    CHECK(partition_get_owner_node(pid_ep) == 4,
+          "epoch scenario: owner 1's transfer to 4 applied (epoch 3)");
+    CHECK(partition_get_owner_epoch(pid_ep) == 3,
+          "epoch scenario: the transfer advanced the local epoch to 3");
+
+    g_announce_count = 0;
+    partition_sync_upsert_epoch(pid_ep, 1, "conflict-epoch", 3, 2);
+    CHECK(partition_get_owner_node(pid_ep) == 4,
+          "stale leader re-announce does NOT revert the transfer");
+    CHECK(partition_get_owner_epoch(pid_ep) == 3,
+          "stale leader re-announce does not lower the ownership epoch");
+    CHECK(g_announce_count == 0,
+          "stale leader re-announce reject path transmits nothing");
+
+    partition_sync_upsert_epoch(pid_ep, 4, "conflict-epoch", 3, 3);
+    CHECK(partition_get_owner_node(pid_ep) == 4,
+          "leader catch-up to the transferred owner applies as a re-assert");
+
+    /* A later transfer back to 1 (epoch 4) is the current state. A delayed
+     * copy of the OLD owner-initiated transfer (source 1, owner 4, epoch 3)
+     * still looks like "source == current owner"; the epoch must reject it
+     * before that claim class, or a delayed packet could revert the newer
+     * transfer. */
+    partition_sync_upsert_epoch(pid_ep, 1, "conflict-epoch", 4, 4);
+    CHECK(partition_get_owner_node(pid_ep) == 1 &&
+              partition_get_owner_epoch(pid_ep) == 4,
+          "epoch scenario: a later transfer back to 1 applied (epoch 4)");
+    g_announce_count = 0;
+    partition_sync_upsert_epoch(pid_ep, 4, "conflict-epoch", 1, 3);
+    CHECK(partition_get_owner_node(pid_ep) == 1 &&
+              partition_get_owner_epoch(pid_ep) == 4,
+          "delayed old transfer packet cannot undo the newer transfer");
+    CHECK(g_announce_count == 0,
+          "delayed old transfer reject path transmits nothing");
+
+    /* The epoch is an additional proof, not a replacement for the existing
+     * non-owner/non-leader gate: a node that is neither the current owner
+     * nor the leader cannot claim a high epoch into existence. */
+    g_announce_count = 0;
+    partition_sync_upsert_epoch(pid_ep, 9, "conflict-epoch", 9, 99);
+    CHECK(partition_get_owner_node(pid_ep) == 1 &&
+              partition_get_owner_epoch(pid_ep) == 4,
+          "non-owner/non-leader high-epoch self-claim is still rejected");
+    CHECK(g_announce_count == 0,
+          "high-epoch reject path transmits nothing");
 
     if (g_failures == 0) {
         printf("\npartition_conflict_host_test: all checks passed\n");
