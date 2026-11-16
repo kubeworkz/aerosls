@@ -16,16 +16,22 @@
 # command with one pass/fail verdict, suitable for a CI gate
 # (.github/workflows/ci.yml calls this).
 #
-# ─── This file does NOT run the *_check.sh guards ──────────────────────────
+# ─── This file runs the host tests plus one source-only guard ─────────────
 # The loop below globs tests/*_host_test.c. tests/*_check.sh are shell
 # scripts and are not matched, which is why five of them -- including
 # stack_frame_budget_check.sh and kernel_image_end_check.sh -- ran under
 # nothing at all for as long as they existed, while reading as though the
 # suite covered them.
 #
-# They now have their own runner: tests/run_checks.sh, also called by CI.
-# This cross-reference exists so that discovering one leads to the other;
-# their invisibility was most of why they went unrun.
+# The remaining guards have their own runner: tests/run_checks.sh, also
+# called by CI. One exception runs here as well: sidecar_stamp_check.sh,
+# because sidecars.cpio and its stamps are tracked release inputs. A user/
+# source change that was committed without repacking is invisible to the
+# host-test glob, and this is the full regression command people run before
+# committing. The check is source-only and cheap; run_checks.sh still runs
+# it too, so CI gets the same property even when this script is not used.
+# This cross-reference exists so that discovering one runner leads to the
+# other; their invisibility was most of why they went unrun.
 set -u
 cd "$(dirname "$0")/.."   # repo root, so each file's own -I paths (kernel, drivers, net, ...) resolve
 
@@ -162,10 +168,28 @@ for src in tests/*_host_test.c; do
     pass=$((pass + 1))
 done
 
+# ─── Tracked sidecar archive/stamp preflight ───────────────────────────────
+# This is the one guard that protects a tracked release input rather than
+# a source invariant. Run it after the host-test loop so the summary below
+# still reports both halves, and fail the whole regression on any mismatch.
+# The guard exits 2 when the archive/stamps cannot be inspected; that is a
+# failure here just like it is in run_checks.sh's fail-closed policy.
+echo ""
+if out="$(bash tests/sidecar_stamp_check.sh 2>&1)"; then
+    echo "PASS  sidecar_stamp_check (tracked archive and stamps match the committed user/ sources)"
+    pass=$((pass + 1))
+else
+    rc=$?
+    echo "FAIL  sidecar_stamp_check (exit $rc)"
+    echo "$out" | sed 's/^/      /'
+    fail=$((fail + 1))
+fi
+
 echo ""
 echo "$pass passed, $fail failed, $skip skipped"
 echo ""
-echo "Note: this covers tests/*_host_test.c only. The tests/*_check.sh guards"
-echo "      (stack frame budget, kernel image end, TLS relocations, Makefile"
-echo "      sources, COMMANDS.md) have their own runner: tests/run_checks.sh"
+echo "Note: this covers tests/*_host_test.c plus the tracked-sidecar stamp"
+echo "      preflight. The other tests/*_check.sh guards (stack frame budget,"
+echo "      kernel image end, TLS relocations, Makefile sources, COMMANDS.md)"
+echo "      have their own runner: tests/run_checks.sh"
 [ "$fail" -eq 0 ]

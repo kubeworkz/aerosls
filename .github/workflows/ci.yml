@@ -177,6 +177,16 @@ jobs:
           token: ${{ secrets.QEMU_SLS_PAT }}
           fetch-depth: 1
 
+      # The tracked sidecar archive and its stamps are release inputs. This
+      # check is source-only and also runs inside run_all.sh/run_checks.sh;
+      # naming it as its own step means a stale sidecars.cpio fails CI even
+      # if either runner's glob or call site changes. It runs before the host
+      # suite so a stale archive is named immediately, rather than after a
+      # long test sweep.
+      - name: Sidecar archive and stamp consistency
+        run: bash tests/sidecar_stamp_check.sh
+        working-directory: aerosls2
+
       - name: Host test suite (tests/*_host_test.c)
         run: bash tests/run_all.sh
         working-directory: aerosls2
