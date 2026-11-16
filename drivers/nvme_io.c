@@ -25,6 +25,13 @@ extern void* allocate_physical_ram_frame(void);
 // on every single steady-state disk write would block unrelated IRQ
 // handling (e.g. the network stack) for the duration -- worse than the
 // problem being fixed.
+/* 500M pause iterations: a lost completion must cost one band write, not
+ * the node's liveness. The replica finalizer writes the band in bounded
+ * chunks and treats a timeout as a named refusal, so the bound has to stay
+ * well inside failover's 6,000-tick declaration grace even under QEMU TCG.
+ * The old 2B bound let one missing completion keep the BSP inside this poll
+ * long enough for the other survivor to declare this node dead. A real
+ * controller answers far inside this budget. */
 #define NVME_IO_TIMEOUT 500000000UL
 
 // ─── I/O queue state ─────────────────────────────────────────────────────────
@@ -263,6 +270,76 @@ int nvme_flush_sync(void) {
     return nvme_io_submit_sync(&cmd);
 }
 
+// ─── recover a lost I/O completion ───────────────────────────────────────
+// A completion that never lands leaves io_cq_head pointing at an entry the
+// controller will never publish again; every later I/O poll then times out
+// behind it. The admin queue is independent and still healthy, so delete and
+// recreate this queue pair there -- the spec's own recovery ordering, SQ
+// first then CQ, create CQ first then SQ -- and reset the consumer state.
+// The caller still gets 0xFF for the command that timed out; this only makes
+// the NEXT operation possible instead of wedging every NVMe path, including
+// the replica directory's GET.
+static int nvme_io_recover_queue(void) {
+    if (!io_sq || !io_cq) return 0;
+
+    struct NVMeCmd cmd;
+    uint32_t* p = (uint32_t*)&cmd;
+    for (int i = 0; i < 16; i++) p[i] = 0;
+    cmd.opcode = NVME_ADMIN_CMD_DELETE_SQ;
+    cmd.cdw10  = NVME_IO_QUEUE_ID;
+    struct NVMeCqe cqe = nvme_submit_admin_cmd(cmd);
+    if ((cqe.status >> 1) & 0xFF)
+        kernel_serial_printf("[NVME_IO] recover: delete SQ status=0x%x\n",
+                             (unsigned)(cqe.status >> 1) & 0xFF);
+
+    p = (uint32_t*)&cmd;
+    for (int i = 0; i < 16; i++) p[i] = 0;
+    cmd.opcode = NVME_ADMIN_CMD_DELETE_CQ;
+    cmd.cdw10  = NVME_IO_QUEUE_ID;
+    cqe = nvme_submit_admin_cmd(cmd);
+    if ((cqe.status >> 1) & 0xFF)
+        kernel_serial_printf("[NVME_IO] recover: delete CQ status=0x%x\n",
+                             (unsigned)(cqe.status >> 1) & 0xFF);
+
+    uint32_t* q = (uint32_t*)io_sq;
+    for (int i = 0; i < 4096/4; i++) q[i] = 0;
+    q = (uint32_t*)io_cq;
+    for (int i = 0; i < 4096/4; i++) q[i] = 0;
+
+    p = (uint32_t*)&cmd;
+    for (int i = 0; i < 16; i++) p[i] = 0;
+    cmd.opcode = NVME_ADMIN_CMD_CREATE_CQ;
+    cmd.prp1   = (uint64_t)(uintptr_t)io_cq;
+    cmd.cdw10  = (uint32_t)(((NVME_IO_QUEUE_SIZE - 1) << 16) | NVME_IO_QUEUE_ID);
+    cmd.cdw11  = 0x00000001u;
+    cqe = nvme_submit_admin_cmd(cmd);
+    if ((cqe.status >> 1) & 0xFF) {
+        kernel_serial_printf("[NVME_IO] recover: create CQ failed, status=0x%x\n",
+                             (unsigned)(cqe.status >> 1) & 0xFF);
+        return 0;
+    }
+
+    p = (uint32_t*)&cmd;
+    for (int i = 0; i < 16; i++) p[i] = 0;
+    cmd.opcode = NVME_ADMIN_CMD_CREATE_SQ;
+    cmd.prp1   = (uint64_t)(uintptr_t)io_sq;
+    cmd.cdw10  = (uint32_t)(((NVME_IO_QUEUE_SIZE - 1) << 16) | NVME_IO_QUEUE_ID);
+    cmd.cdw11  = (uint32_t)((NVME_IO_QUEUE_ID << 16) | 0x00000001u);
+    cqe = nvme_submit_admin_cmd(cmd);
+    if ((cqe.status >> 1) & 0xFF) {
+        kernel_serial_printf("[NVME_IO] recover: create SQ failed, status=0x%x\n",
+                             (unsigned)(cqe.status >> 1) & 0xFF);
+        return 0;
+    }
+
+    io_sq_tail  = 0;
+    io_cq_head  = 0;
+    io_cq_phase = 1;
+    io_cmd_id   = 0x80;
+    kernel_serial_printf("[NVME_IO] I/O queue 1 recovered after a lost completion.\n");
+    return 1;
+}
+
 // ─── submit one I/O command and poll for completion ───────────────────────────
 // Gap fix: this poll loop used to be unbounded (`while (...) pause();` with
 // no exit condition other than the completion actually showing up) -- see
@@ -301,6 +378,9 @@ static int nvme_io_submit_sync(struct NVMeCmd* cmd) {
                 "[NVME_IO] I/O cmd 0x%x timeout (sq_tail=%u cq_head=%u phase=%u) -- "
                 "failing request instead of hanging.\n",
                 (unsigned)cmd->opcode, io_sq_tail, io_cq_head, (unsigned)io_cq_phase);
+            if (!nvme_io_recover_queue())
+                kernel_serial_printf("[NVME_IO] WARNING: queue recovery failed; "
+                                     "later NVMe I/O may time out.\n");
             return 0xFF;   // distinct out-of-band status -- never a real NVMe status-code byte
         }
     }

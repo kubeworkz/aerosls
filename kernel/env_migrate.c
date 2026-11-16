@@ -268,6 +268,7 @@ int env_migrate_send_stream(const struct EnvCkptRecord* rec,
      * the source may believe anything moved. */
     int begin_ok = 0;
     dspp_migrate_arm_begin(transfer_id);
+    dspp_migrate_arm_peer((uint16_t)dest_node_id);
     for (uint32_t attempt = 0; attempt < DSPP_MIGRATE_MAX_ATTEMPTS; attempt++) {
         /* Send at the TOP of each attempt, exactly as stream.c does: the
          * first send happens here rather than before the loop, so the last

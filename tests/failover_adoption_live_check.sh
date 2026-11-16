@@ -160,6 +160,14 @@
 #                                the wrong process.
 #   AEROSLS_FAILOVER_FAST=1      scale every wait down to seconds. Used by
 #                                the smoke; never for a real cluster.
+#   AEROSLS_FAILOVER_CAPTURE=1   take a real POST /api/checkpoint before the
+#                                kill, then poll both survivors' own
+#                                GET /api/env/replicas directories until the
+#                                finalized entry is visible, and require step
+#                                7.5 to classify through the replica branch.
+#                                This is the P3 destination (a) live arm.
+#   AEROSLS_FAILOVER_CAPTURE_SECS
+#                                directory-poll bound (default 600).
 #   AEROSLS_FAILOVER_HEADER      header the live observer deadline is read
 #                                from (default: kernel/failover.h).
 #   AEROSLS_CONSENSUS_HEADER    header supplying CONSENSUS_TICK_HZ (default:
@@ -208,6 +216,12 @@ HTTP_BASE="${AEROSLS_HTTP_BASE:-3000}"
 TOKEN="${AEROSLS_TOKEN:-}"
 FAKE="${AEROSLS_FAILOVER_FAKE:-0}"
 FAST="${AEROSLS_FAILOVER_FAST:-0}"
+# P3 destination (a), increment 15's missing live arm: when set, take a
+# real payload capture before killing the leader, wait until both survivors
+# confirm the replica finalized, and REQUIRE step 7.5 to classify the
+# environment through the replica branch. Default 0 keeps the historic
+# absent-branch flow (the fakes model that one).
+CAPTURE="${AEROSLS_FAILOVER_CAPTURE:-0}"
 CTL="tools/aeroslsctl"
 CLUSTER_DIR="${AEROSLS_CLUSTER_DIR:-cluster}"
 LOG_DIR="${AEROSLS_LOG_DIR:-$CLUSTER_DIR}"
@@ -229,7 +243,11 @@ else
     # constants; WAIT_ADOPT is the adoption budget and is kept at least as
     # long as that derived death watch. The fast path keeps its short fixed
     # values because it does not model kernel timing at all.
-    POLL=2;   WAIT_NODES=240; WAIT_LEARN=30; WAIT_CKPT=60; WAIT_ADOPT=240; WAIT_HANDOFF=120; WAIT_BOOT=240; WAIT_CLAIM=240; WAIT_CONV=180; WAIT_MIGRATE=120; WAIT_TRANSFER=120; WAIT_LEASE=120; STILL_READ=30
+    # WAIT_ADOPT is wall-clock, but the 6000-tick declaration grace is not:
+    # under QEMU TCG the effective tick rate is well below the nominal
+    # CONSENSUS_TICK_HZ, and a live 2026-11-16 run adopted only just after
+    # the old 240 s deadline. Keep the gate, give the declared grace room.
+    POLL=2;   WAIT_NODES=240; WAIT_LEARN=30; WAIT_CKPT=60; WAIT_ADOPT=480; WAIT_HANDOFF=120; WAIT_BOOT=240; WAIT_CLAIM=240; WAIT_CONV=180; WAIT_MIGRATE=120; WAIT_TRANSFER=120; WAIT_LEASE=120; STILL_READ=30
 fi
 # How many campaigns the step-11 lease-row gate may drive before it accuses
 # the observer's RX path (see step 11a). One acquire is one campaign; a
@@ -372,6 +390,22 @@ get200() {   # $1 = port, $2 = path
     esac
 }
 
+# The payload capture is synchronous for the page stream: checkpoint_trigger()
+# writes the local band and env_replica_push() moves the same record and pages
+# to every peer, but its confirm is deliberately bounded (2 asks), so this
+# returns once staging is done -- not once the peer's band write lands. The
+# guard polls GET /api/env/replicas afterward for that final fact. The 3 s
+# metadata budget above is still too short for the page stream, so this has
+# its own timeout and reports HTTP status the same way fetch() does.
+post_checkpoint() {   # $1 = port
+    local out
+    out="$(curl -s --max-time 300 -w '\n%{http_code}' "${CURL_EXTRA[@]}" \
+                -X POST "http://127.0.0.1:$1/api/checkpoint" 2>/dev/null)"
+    FETCH_STATUS="$(printf '%s' "$out" | tail -n1)"
+    FETCH_BODY="$(printf '%s' "$out" | sed '$d')"
+    [ "$FETCH_STATUS" = 200 ]
+}
+
 # ─── the split-brain detector ─────────────────────────────────────────────
 # split_brain_now <adopter> <observer> -- true when the observer serves
 # '$NAME' as its OWN while the adopter still serves it as its own: two
@@ -408,6 +442,59 @@ fail_split_brain() {   # $1 = adopter, $2 = the survivor that claimed it too
        owner can derail -- it must never masquerade as a lost handoff or an
        unresolved service. $2's list held:
 $(dump_rows "$SB_CLAIM_BODY")"
+}
+
+# replica_entry <body> <partition> <index> <seq> -- the peer's own directory
+# entry, never the source's confirm line. Prints one evidence line (seq/pages/
+# src/crc) when a finalized entry exists for this identity at or after the
+# capture's sequence; prints nothing otherwise.
+replica_entry() {
+    python3 - "$1" "$2" "$3" "$4" <<'PY'
+import json, sys
+try:
+    d = json.loads(sys.argv[1])
+except Exception:
+    d = {}
+try:
+    p, idx, seq = int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+except Exception:
+    sys.exit(0)
+for r in d.get("replicas", []):
+    try:
+        if (int(r.get("partition_id", -1)) == p and
+                int(r.get("index", -1)) == idx and
+                int(r.get("seq", -1)) >= seq):
+            print("seq=%s pages=%s src_node=%s crc=%s" %
+                  (r.get("seq"), r.get("pages"), r.get("src_node"), r.get("blob_crc")))
+            break
+    except Exception:
+        pass
+PY
+}
+
+# replica_staging <body> <partition> <index> -- the in-flight half, for a
+# failure that names whether pages were missing or the band write was pending.
+replica_staging() {
+    python3 - "$1" "$2" "$3" <<'PY'
+import json, sys
+try:
+    d = json.loads(sys.argv[1])
+except Exception:
+    d = {}
+try:
+    p, idx = int(sys.argv[2]), int(sys.argv[3])
+except Exception:
+    sys.exit(0)
+for s in d.get("staging", []):
+    try:
+        if int(s.get("partition_id", -1)) == p and int(s.get("index", -1)) == idx:
+            print("pages_staged=%s/%s complete=%s src_node=%s" %
+                  (s.get("pages_staged"), s.get("total_pages"),
+                   s.get("complete"), s.get("src_node")))
+            break
+    except Exception:
+        pass
+PY
 }
 
 jget() {
@@ -510,8 +597,54 @@ if not rows:
 PY
 }
 
+# stale_guard_partitions <body> <prefix> <exclude> <exclude> <local_node> --
+# partitions a previous guard run created and that THIS node owns, one
+# 'id<TAB>name' per line. The cluster images persist across restarts, so a
+# prior guard run's base and '-env' partitions survive with it. They occupy
+# frames on the same nodes this run captures its environment on; a survivor
+# carrying a different allocator history cannot reproduce the source's bases
+# and the placement gate correctly refuses. The gate is not relaxed: every
+# stale guard partition is ended before the capture so the survivor's
+# allocator history is the clean one the restored bases describe. The owner
+# filter keeps a replicated row seen on a follower from being destroyed
+# through the wrong node; the two excludes are this run's base partition and
+# its (not yet created) environment partition.
+stale_guard_partitions() {
+    python3 - "$1" "$2" "$3" "$4" "$5" <<'PY'
+import json, sys
+try:
+    rows = json.loads(sys.argv[1]).get("partitions", [])
+except Exception:
+    rows = []
+prefix, exclude_base, exclude_env, local = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+for p in rows:
+    name = p.get("name", "")
+    if (name.startswith(prefix) and name not in (exclude_base, exclude_env)
+            and str(p.get("owner_node")) == local):
+        print("%s\t%s" % (p.get("id"), name))
+PY
+}
+
 last_line() {
     grep -n "$2" "$1" 2>/dev/null | tail -n1 | cut -d: -f1
+}
+
+# restore_refused_line <log> <partition> <adopt_line>
+# Print the line number of a promoted-replica restore that the placement gate
+# refused, when both the promotion and the refusal are AFTER <adopt_line> and
+# the promotion comes first. Empty and non-zero otherwise. A function keeps
+# this exact classifier reachable by the fixture regression test without a
+# live cluster.
+restore_refused_line() {
+    local log="$1" part="$2" after="$3" promote refused
+    promote="$(grep -n "ENV_REPLICA] PROMOTED replica (partition $part" "$log" 2>/dev/null \
+        | tail -n1 | cut -d: -f1)"
+    refused="$(grep -n "FAILOVER] environment index 1 (partition $part, [0-9]* region(s)) was NOT restored -- its replica staged on this survivor but the replay refused it" "$log" 2>/dev/null \
+        | tail -n1 | cut -d: -f1)"
+    if [ -z "$refused" ] || [ "$refused" -le "$after" ]; then return 1; fi
+    if [ -z "$promote" ] || [ "$promote" -le "$after" ]; then return 1; fi
+    if [ "$promote" -ge "$refused" ]; then return 1; fi
+    printf '%s\n' "$refused"
 }
 
 
@@ -805,6 +938,34 @@ echo "   checkpoint carrying '$NAME' held by both survivors"
 # partition is adopted like any other (the adoption walk does not care
 # which) and stays with the adopter for the rest of the run.
 ENV_NAME="$NAME-env"
+# A churn restart re-execs this guard against the same cluster. The aborted
+# attempt's own environment is still live on the node that led then, and it
+# holds one environment's frames. If that node is a survivor, the capture's
+# fresh environment lands one environment past the source's recorded bases and
+# the placement gate refuses -- correctly, because the source's range is not
+# free there. End this run's earlier guard environments BEFORE creating the
+# capture one, so the survivor's allocator history is the clean one the
+# replica's bases describe. Only '$NAME's own prefix and '-env' partitions are
+# touched; the current ENV_NAME does not exist yet.
+echo "==> clearing environments left by earlier attempts of this guard run"
+for _pn in "$L_PORT" "$F1_PORT" "$F2_PORT"; do
+    get200 "$_pn" /api/partitions || continue
+    _part_body="$FETCH_BODY"
+    while IFS="$(printf '\t')" read -r _sid _sname; do
+        [ -n "$_sid" ] || continue
+        _env_list="$("$CTL" --host "localhost:$_pn" "${TOKEN_ARGS[@]}" \
+            shell env list "$_sid" 2>&1)"
+        for _eid in $(printf '%s\n' "$_env_list" \
+            | sed -n 's/.*env_id=\([0-9][0-9]*\).*/\1/p'); do
+            "$CTL" --host "localhost:$_pn" "${TOKEN_ARGS[@]}" \
+                shell env destroy "$_sid" "$_eid" >/dev/null 2>&1 || true
+        done
+        if "$CTL" --host "localhost:$_pn" "${TOKEN_ARGS[@]}" \
+                shell partition destroy "$_sid" >/dev/null 2>&1; then
+            echo "   cleared partition $_sid '$_sname' from an earlier attempt"
+        fi
+    done < <(stale_guard_partitions "$_part_body" "guard-failover-" "$NAME" "$ENV_NAME" "$(( _pn - HTTP_BASE ))")
+done
 echo "==> creating partition '$ENV_NAME' on node $leader and an environment inside it"
 "$CTL" --host "localhost:$L_PORT" "${TOKEN_ARGS[@]}" \
     shell partition create "$ENV_NAME" >/dev/null \
@@ -1055,6 +1216,70 @@ if [ "$ckpt_env_ok" -ne 1 ]; then
 fi
 echo "   2 fresh post-record checkpoints reached both survivors after the exact table record appeared"
 
+# ─── 4.6. optional: put the capture's replica on both survivors ──────────
+# The live run recorded in increment 15 exercised PROMOTION, but step 7.5's
+# replica classification was never reached: this guard's normal flow only
+# waits for the periodic state-tree broadcast, and env_replica_push() fires
+# only from env_payload_capture_all(). With AEROSLS_FAILOVER_CAPTURE=1 the
+# guard takes the real POST /api/checkpoint before the kill and requires the
+# leader's own log to show both peers answering FINALIZED -- the source's
+# confirm poll reads the peer's disk directory, not the last packet. That is
+# the precondition the promotion below needs; without it the replica branch
+# would be asserted vacuously.
+if [ "$CAPTURE" = "1" ]; then
+    cap_secs="${AEROSLS_FAILOVER_CAPTURE_SECS:-600}"
+    echo "==> capturing payload and polling each survivor's replica directory (up to ${cap_secs}s)"
+    post_checkpoint "$L_PORT" || die "POST /api/checkpoint failed on node $leader
+       (HTTP $FETCH_STATUS). The replica branch cannot be exercised without a
+       capture; last response:
+$(printf '%s' "$FETCH_BODY" | tail -3 | sed 's/^/       /')"
+    cap_seq="$(jget "$FETCH_BODY" seq)"
+    case "$cap_seq" in ''|*[!0-9]*) cap_seq=0 ;; esac
+    cap_ok=0; rep1=""; rep2=""; st1=""; st2=""; r1body=""; r2body=""
+    cap_deadline=$(( $(date +%s) + cap_secs ))
+    while :; do
+        # The source's confirm is deliberately short. The peer's DIRECTORY is
+        # the fact: poll the same endpoint promotion/failover reads, after the
+        # capture returns, so a slow band write no longer holds the capture's
+        # freeze or becomes a false "absent" verdict.
+        if get200 "$F1_PORT" /api/env/replicas; then
+            # The directory's seq is the environment record's own sequence;
+            # /api/checkpoint's seq is the checkpoint manager's global one and
+            # need not equal it (live: capture seq 0, directory seq 0, POST
+            # seq > 0, so the >= filter never matched a real finalized entry).
+            # Every guard run creates a NEW partition id, so partition+index
+            # already cannot collide with a stale entry here.
+            rep1="$(replica_entry "$FETCH_BODY" "$PART_ID2" "$L_ENV_INDEX" 0)"
+            st1="$(replica_staging "$FETCH_BODY" "$PART_ID2" "$L_ENV_INDEX")"
+            r1body="$FETCH_BODY"
+        fi
+        if get200 "$F2_PORT" /api/env/replicas; then
+            rep2="$(replica_entry "$FETCH_BODY" "$PART_ID2" "$L_ENV_INDEX" 0)"
+            st2="$(replica_staging "$FETCH_BODY" "$PART_ID2" "$L_ENV_INDEX")"
+            r2body="$FETCH_BODY"
+        fi
+        # One finalized peer is enough to exercise the branch; requiring both
+        # made a single peer's band IO failure hide the other peer's real
+        # replica (live 2026-11-16: node 2 held both, node 3 dropped on band
+        # page 490). The adopter check below refuses to call the branch proved
+        # unless the node that actually adopts is one that listed the entry.
+        if [ -n "$rep1" ] || [ -n "$rep2" ]; then cap_ok=1; break; fi
+        [ "$(date +%s)" -ge "$cap_deadline" ] && break
+        sleep "$POLL"
+    done
+    if [ "$cap_ok" -ne 1 ]; then
+        fail "the capture on node $leader produced no finalized replica in either
+       survivor's directory within ${cap_secs}s (capture seq $cap_seq, partition
+       $PART_ID2 index $L_ENV_INDEX). This is the peer's own GET /api/env/replicas,
+       not the source's bounded confirm. Node $f1: ${rep1:-absent}${st1:+, staging $st1};
+       node $f2: ${rep2:-absent}${st2:+, staging $st2}. Raw directories:
+       node $f1: $(printf '%s' "${r1body:-<no answer>}" | tail -c 600)
+       node $f2: $(printf '%s' "${r2body:-<no answer>}" | tail -c 600)"
+    fi
+    echo "   node $f1 directory: ${rep1:-absent}${st1:+, staging $st1}"
+    echo "   node $f2 directory: ${rep2:-absent}${st2:+, staging $st2}"
+fi
+
 # ─── 5. capture the leader's identity BEFORE killing it ───────────────────
 L_PID="$(awk -v n="$leader" '$1==n{print $2}' "$PID_FILE")"
 [ -n "$L_PID" ] || die "no pid for node $leader in $PID_FILE"
@@ -1093,41 +1318,30 @@ done
 #   * its log to show the death declaration THEN the adoption, and
 #   * its partition list to hold '$NAME' with owner = that survivor.
 echo "==> waiting for a survivor to adopt '$NAME' from the dead leader (up to ${WAIT_ADOPT}s; declared after FAILOVER_DECLARE_TICKS of silence)"
-adopter=""; observer=""
+adopter=""; observer=""; adopter_role=""
 deadline=$(( $(date +%s) + WAIT_ADOPT ))
 while :; do
-    adopt1=""; adopt2=""; seen1=0; seen2=0
+    seen1=0; seen2=0; role1=""; role2=""
     if get200 "$F1_PORT" /api/cluster; then
         seen1=1
-        r1="$(jget "$FETCH_BODY" role)"
-        [ "$r1" = "LEADER" ] && adopt1=1
+        role1="$(jget "$FETCH_BODY" role)"
     fi
     if get200 "$F2_PORT" /api/cluster; then
         seen2=1
-        r2="$(jget "$FETCH_BODY" role)"
-        [ "$r2" = "LEADER" ] && adopt2=1
+        role2="$(jget "$FETCH_BODY" role)"
     fi
-    if [ -n "$adopt1" ] && [ -n "$adopt2" ]; then
-        # Two ROLES is not yet two OWNERS. This is the same distinction
-        # split_brain_now() below already makes for every later gate (see
-        # its comment): a poll that straddles a follower's LATE flip reads
-        # two LEADERs while only the adopter actually serves '$NAME' as its
-        # own -- observed live in the smoke's lateflip tooth, where the
-        # observer's 1.5 s delayed flip landed between the adopter's
-        # evidence and the poll that would have accepted it, and the step-9
-        # message the tooth is looking for was never reached. Ownership is
-        # durable and cannot un-happen, so a REAL split-brain (both serving
-        # themselves as owner) still fails here immediately, on evidence,
-        # while a role straddle is left to resolve on the next pass.
-        if split_brain_now "$f1" "$f2"; then
-            fail_split_brain "$f1" "$f2"
-        fi
-    fi
-    if [ -n "$adopt1" ] || [ -n "$adopt2" ]; then
-        can=""; ob=""; other_seen=0
-        if [ -n "$adopt1" ]; then can="$f1"; ob="$f2"; other_seen="$seen2"
-        else can="$f2"; ob="$f1"; other_seen="$seen1"; fi
-        CAN_LOG="$LOG_DIR/node$can.log"
+    # A candidate is the survivor whose OWN log carries the complete
+    # adoption evidence (declaration -> Adopted -> recovery rc=0) AND whose
+    # live partition list names it the owner of '$NAME'. Its current
+    # consensus role is deliberately not part of the test: the 2026-11-16
+    # live run had node 2 adopt and restore the replica while node 3 later
+    # won term 5, leaving the adopter a FOLLOWER. Requiring the candidate
+    # to be LEADER at poll time made the guard report "never adopted" over
+    # a log that already said RESTORED.
+    cand=""; cand_log=""; cand_owned=""; cand_dead=""; cand_adopt=""; cand_rec=""
+    cand_other=""; cand_other_seen=0
+    for _c in "$f1" "$f2"; do
+        _log="$LOG_DIR/node$_c.log"
         # "declared DEA" not "declared DEAD": the kernel's serial TX lock is
         # bounded-wait by design (kernel_io.c — on expiry the waiter's bytes
         # go out anyway), so under contention a line can be clobbered
@@ -1135,33 +1349,54 @@ while :; do
         # DEA[DSPP-CKPT] RX: BEGIN ...". The four-character anchor matches
         # both the intact and the clobbered form; the clobber would have to
         # land INSIDE the anchor to hide the declaration.
-        dead_line="$(last_line "$CAN_LOG" "FAILOVER] Node $leader declared DEA")"
-        adopt_line="$(last_line "$CAN_LOG" "FAILOVER] Adopted partition.*dead node $leader")"
-        rec_line="$(last_line "$CAN_LOG" "FAILOVER] recovery for dead node $leader: rc=0")"
-        owned=""
-        if get200 "$((HTTP_BASE + can))" /api/partitions; then
-            owned="$(row_if "$FETCH_BODY" "$NAME" "$can")"
+        _dead="$(last_line "$_log" "FAILOVER] Node $leader declared DEA")"
+        _adopt="$(last_line "$_log" "FAILOVER] Adopted partition.*dead node $leader")"
+        _rec="$(last_line "$_log" "FAILOVER] recovery for dead node $leader: rc=0")"
+        [ -n "$_dead" ] && [ -n "$_adopt" ] && [ -n "$_rec" ] \
+            && [ "$_adopt" -gt "$_dead" ] && [ "$_rec" -gt "$_adopt" ] || continue
+        # Only a survivor whose log already carries the whole adoption is
+        # asked for its live list. Polling BOTH survivors' /api/partitions on
+        # every pass multiplied the HTTP load on the node that had nothing
+        # to say and wedged its server on the 2026-11-16 run (many CLOSE-WAIT
+        # sockets, then every role read timed out).
+        _port=$((HTTP_BASE + _c))
+        get200 "$_port" /api/partitions || continue
+        _owned="$(row_if "$FETCH_BODY" "$NAME" "$_c")"
+        [ -n "$_owned" ] || continue
+        if [ -n "$cand" ]; then
+            fail "both survivors ($f1, $f2) show a complete adoption of '$NAME'
+       from dead node $leader and each names itself the owner. That is two
+       owners of one partition -- a split-brain, not a role race."
         fi
-        # Accept the candidate only when the OTHER survivor's role was
-        # actually READ this pass and was not LEADER. An unreadable role is
-        # not evidence of "no second leader": accepting a candidate on a
-        # transient fetch failure is exactly how a real split-brain slips
-        # past this gate and surfaces at a LATER step with the wrong message
-        # (observed: the splitbrain smoke tooth failed at the service gate
-        # instead of here). Until the other side is readable the loop keeps
-        # polling, which is what the deadline is for.
-        if [ -n "$dead_line" ] && [ -n "$adopt_line" ] \
-           && [ "$adopt_line" -gt "$dead_line" ] && [ -n "$rec_line" ] \
-           && [ -n "$owned" ] && [ "$other_seen" -eq 1 ]; then
-            adopter="$can"; observer="$ob"; break
+        cand="$_c"; cand_log="$_log"; cand_owned="$_owned"
+        cand_dead="$_dead"; cand_adopt="$_adopt"; cand_rec="$_rec"
+        if [ "$_c" = "$f1" ]; then
+            cand_other="$f2"; cand_other_seen="$seen2"
+        else
+            cand_other="$f1"; cand_other_seen="$seen1"
         fi
+    done
+    # The other survivor must have answered /api/cluster this pass (so an
+    # unreadable peer is not mistaken for "not a leader") but its role may
+    # be either one. Its ownership was checked by split_brain_now above and
+    # is checked again by the observer gate below.
+    if [ -n "$cand" ] && [ "${cand_other_seen:-0}" -eq 1 ]; then
+        # The durable split-brain question is asked once, now that a complete
+        # candidate exists: two nodes serving '$NAME' as their OWN. Role is
+        # not part of it -- a later election may have moved LEADER.
+        split_brain_now "$cand" "$cand_other" && fail_split_brain "$cand" "$cand_other"
+        adopter="$cand"; observer="$cand_other"
+        CAN_LOG="$cand_log"; dead_line="$cand_dead"; adopt_line="$cand_adopt"
+        rec_line="$cand_rec"; owned="$cand_owned"
+        if [ "$adopter" = "$f1" ]; then adopter_role="$role1"; else adopter_role="$role2"; fi
+        break
     fi
     [ "$(date +%s)" -ge "$deadline" ] && break
     sleep "$POLL"
 done
 
 if [ -z "$adopter" ]; then
-    # Distinguish "nobody became leader" from "leader but no adoption".
+    # Distinguish "no leader at all" from "a leader but no complete adoption".
     any_leader=""
     get200 "$F1_PORT" /api/cluster && [ "$(jget "$FETCH_BODY" role)" = "LEADER" ] && any_leader=1
     get200 "$F2_PORT" /api/cluster && [ "$(jget "$FETCH_BODY" role)" = "LEADER" ] && any_leader=1
@@ -1170,31 +1405,32 @@ if [ -z "$adopter" ]; then
        $leader died. The election did not converge -- is the cluster's
        consensus heartbeating? (The adoption needs a leader.)"
     fi
-    fail "a survivor became leader but never adopted '$NAME' within ${WAIT_ADOPT}s.
-       Check for 'FAILOVER] Node $leader declared DEA' and 'FAILOVER] Adopted
-       partition ... from dead node $leader' (rc=0) in $LOG_DIR/node*.log. A
-       leader that never recovers means failover_recover_from() is broken or
+    fail "a survivor became leader but never adopted '$NAME' with COMPLETE
+       evidence within ${WAIT_ADOPT}s: its own log needs 'FAILOVER] Node
+       $leader declared DEA', then 'FAILOVER] Adopted partition ... dead node
+       $leader', then 'FAILOVER] recovery for dead node $leader: rc=0', and its
+       live /api/partitions must name it the owner. Check $LOG_DIR/node*.log.
+       A leader that never recovers means failover_recover_from() is broken or
        the held checkpoint did not carry the row."
 fi
-echo "   $adopter became leader, declared node $leader DEAD, and adopted $owned"
+echo "   $adopter adopted $owned (role now ${adopter_role:-unknown}); node $observer is the other survivor"
 
 # ─── 7.5. the adoption NAMES its environment and classifies it (P3 9+11+15) ─
 # The survivor adopted the partitions; what it must not do is be SILENT
-# about the environment that came with one of them. Two lines, each from
-# exactly one code site in kernel/failover.c: the per-environment name
-# (the tree carried it) and the classification against what THIS survivor
-# can back, plus the countable summary. Every line is required to be AFTER
-# the adopt_line, so a line from an earlier run on the same cluster dir
-# cannot satisfy the gate.
+# about the environment that came with one of them. The absent and replica
+# classifications each require the per-environment name (the tree carried
+# it), the classification against what THIS survivor can back, and the
+# countable summary. Every line is required to be AFTER the adopt_line, so
+# a line from an earlier run on the same cluster dir cannot satisfy the gate.
 #
 # The defect, verbatim, is the increment-9 `silent-failover` tooth: the
 # adoption completes and says nothing about the environments. The
 # increment-11 companion is `refused-as-restored`'s live shadow -- here a
 # RESTORED claim this per-node store cannot back must never print.
 #
-# Since P3 (a) increment 15 there are TWO honest classifications, and this
-# step accepts exactly one of them per run, keyed off evidence in the
-# adopter's own log:
+# Since P3 (a) increment 15 there are three honest outcomes, and this step
+# accepts exactly one of them per run, keyed off evidence in the adopter's
+# own log:
 #
 #   * absent -- no durable record AND no replica of it in this survivor's
 #     replica band: the "no durable record ... and no replica" line. This
@@ -1209,13 +1445,21 @@ echo "   $adopter became leader, declared node $leader DEAD, and adopted $owned"
 #     the honest answer. The old blanket prohibition of ANY RESTORED line
 #     would have failed a genuine promotion -- the check catching the
 #     feature rather than a lie.
+#   * restore-refused -- a replica WAS promoted, but env_migrate's placement
+#     gate refused the fresh environment because it did not land on the
+#     staged bases. This is a different failure from "never named": the
+#     adopter did name and classify it, and the capture/transport worked.
+#     It is a hard failure of the restore, so the loop classifies it and
+#     fails immediately with the refusal line rather than waiting out
+#     WAIT_ADOPT and claiming the environment disappeared.
 #
-# Each branch still prohibits the OTHER branch's line, so the lie check
-# bites in both worlds: a RESTORED claim with no replica promotion behind
-# it, or a no-record claim printed after this node's own promotion.
+# The absent and replica outcomes still prohibit each other's line, so the
+# lie check bites in both worlds: a RESTORED claim with no replica promotion
+# behind it, or a no-record claim printed after this node's own promotion.
 echo "==> waiting for the adopter to name and classify partition $PART_ID2's environment (up to ${WAIT_ADOPT}s)"
 env_named=""; env_outcome=""
 env_line=""; env_res_line=""; env_sum_line=""; env_restored_line=""; env_sum_ok_line=""; promote_line=""
+env_refused_line=""
 deadline=$(( $(date +%s) + WAIT_ADOPT ))
 while :; do
     env_line="$(last_line "$CAN_LOG" "FAILOVER] environment index 1 (partition $PART_ID2")"
@@ -1228,6 +1472,13 @@ while :; do
     env_restored_line="$(last_line "$CAN_LOG" "FAILOVER] environment index 1 (partition $PART_ID2) RESTORED from a replica held on this survivor")"
     env_sum_ok_line="$(last_line "$CAN_LOG" "FAILOVER] [0-9]* environment(s) of the adopted partitions were restored -- from")"
     promote_line="$(last_line "$CAN_LOG" "ENV_REPLICA] PROMOTED replica (partition $PART_ID2")"
+    # Promotion and refusal are the two facts that make this outcome. The
+    # helper requires both AFTER the adoption and in that order; the refusal
+    # line is itself an environment line, so no separate env_line guard is
+    # needed. This is terminal evidence: break now, do not wait out WAIT_ADOPT.
+    if env_refused_line="$(restore_refused_line "$CAN_LOG" "$PART_ID2" "$adopt_line")"; then
+        env_named=1; env_outcome="restore-refused"; break
+    fi
     if [ -n "$env_line" ] && [ "$env_line" -gt "$adopt_line" ]; then
         if [ -n "$env_res_line" ] && [ "$env_res_line" -gt "$adopt_line" ] \
            && [ -n "$env_sum_line" ] && [ "$env_sum_line" -gt "$adopt_line" ]; then
@@ -1253,6 +1504,48 @@ done
        the name -- the increment-9 silent-failover defect, live. The adopter's
        FAILOVER lines hold:
 $(grep -F 'FAILOVER]' "$CAN_LOG" | tail -10 | sed 's/^/       /')"
+
+# A promoted replica that the placement gate refuses is NOT the silent-name
+# defect above. The adopter named the environment and did use the replica;
+# env_migrate then refused to pour it. Quote the refusal verbatim and fail at
+# once; the line itself carries the placement reason.
+if [ "$env_outcome" = "restore-refused" ]; then
+    env_refused_text="$(sed -n "${env_refused_line}p" "$CAN_LOG" | cut -d: -f2- | sed 's/^ *//')"
+    fail "node $adopter promoted the replica for partition $PART_ID2's environment
+       at line $promote_line, but the migration replay REFUSED it at line
+       $env_refused_line. The refusal is terminal: this adoption has no
+       successful restore. This is a placement failure -- not a missing name
+       or an absent replica. Adopter's exact line:
+       $env_refused_text"
+fi
+
+# The capture arm may pass with ONE finalized peer; the branch is only
+# exercised if the node that actually adopts is that peer. Ask the adopter's
+# own directory (the same GET the guard polled) before judging its choice.
+if [ "$CAPTURE" = "1" ]; then
+    adopter_rep=""
+    case "$adopter" in
+        "$f1") adopter_rep="$rep1" ;;
+        "$f2") adopter_rep="$rep2" ;;
+    esac
+    [ -n "$adopter_rep" ] || fail "node $adopter adopted partition $PART_ID2 after the kill, but
+       its own /api/env/replicas directory held no finalized replica for
+       (partition $PART_ID2, index $L_ENV_INDEX, seq $cap_seq) at capture time.
+       Node $f1 had: ${rep1:-absent}; node $f2 had: ${rep2:-absent}. This run
+       cannot prove the replica-adoption branch from an adopter that did not
+       hold the replica; the next attempt must make the replica-holding peer
+       the election winner."
+    echo "   adopter node $adopter held the finalized replica: $adopter_rep"
+fi
+
+if [ "$CAPTURE" = "1" ] && [ "$env_outcome" != "replica" ]; then
+    fail "AEROSLS_FAILOVER_CAPTURE=1 took a real payload capture and node $adopter's
+       /api/env/replicas directory listed the finalized replica, but it
+       classified partition $PART_ID2's environment through the ABSENT branch.
+       The replica was present and the promotion path did not use it -- the exact
+       branch this run exists to prove. Adopter's [FAILOVER]/[ENV_REPLICA] lines:
+$(grep -E 'FAILOVER]|ENV_REPLICA]' "$CAN_LOG" | tail -12 | sed 's/^/       /')"
+fi
 
 if [ "$env_outcome" = "replica" ]; then
     # The promotion line is the evidence that a copy existed; without it a
@@ -1328,8 +1621,9 @@ echo "   '$SVC' resolves to node $adopter on the survivors"
 
 # ─── 8. the owner handoff must replicate to the other survivor ────────────
 # partition_set_owner_node() announces the new owner, and the observer's
-# partition_sync_upsert() logs the learn. The observer never adopted (only
-# the leader does), so a learned row with owner = adopter is the handoff.
+# partition_sync_upsert() logs the learn. The observer never adopted, so a
+# learned row with owner = adopter is the handoff (its current consensus
+# role may have moved to LEADER in a later term; ownership is the gate).
 OBS_LOG="$LOG_DIR/node$observer.log"
 echo "==> waiting for the owner handoff to reach node $observer (up to ${WAIT_HANDOFF}s)"
 handoff=""
@@ -1353,29 +1647,30 @@ done
        replication of the handoff is broken. $observer's list held:
 $(get200 "$((HTTP_BASE + observer))" /api/partitions && dump_rows "$FETCH_BODY")"
 
-# ─── 9. the loser must stay FOLLOWER and never adopt ──────────────────────
+# ─── 9. the loser must never adopt, and must never own the partition ─────
 # The step-7 loop breaks the moment ONE survivor's adoption evidence is
 # complete, so a misbehaviour that lands after that -- a follower that ALSO
-# recovers, or a late flip to LEADER -- would otherwise slip past. Both are
-# the other half of the split-brain property, and they pin the two gates:
+# recovers, or a second owner -- would otherwise slip past. The gates:
 #   * cluster_is_leader() in failover_tick(): every node that observes the
 #     death evaluates it (the observer's log must carry its own evidence --
 #     a declaration, or a bounded-grace DEFERRED line), but only the leader
 #     calls failover_recover_from(). An Adopted or recovery line on the
 #     OBSERVER at or after this run's observation mark means a follower
 #     recovered too: two owners of one partition.
-#   * the election: the loser's consensus role must stay FOLLOWER. A flip
-#     to LEADER after the adoption window is a late split-brain -- two
-#     leaders, two owners.
+#   * ownership: the observer's own live list must not serve '$NAME' with
+#     itself as owner. Its consensus ROLE is deliberately not a gate: the
+#     2026-11-16 run had node 2 adopt and restore the replica while node 3
+#     later won term 5, leaving the adopter a FOLLOWER. A later LEADER that
+#     does not own '$NAME' is not a split-brain.
 OBS_PORT=$((HTTP_BASE + observer))
-echo "==> watching node $observer stay FOLLOWER and never adopt (up to ${WAIT_OBSERVER}s)"
+echo "==> watching node $observer never adopt or own '$NAME' (up to ${WAIT_OBSERVER}s)"
 # The watch HOLDS THE FULL WINDOW: it must not break on the first clean
 # poll, or a late misbehaviour -- a follower that recovers after the
-# adoption, or a flip to LEADER that lands a moment later -- would slip
-# past. It passes only if EVERY poll observed the loser as FOLLOWER and no
+# adoption, or a second owner -- would slip past. It passes only if every
+# poll read the observer without finding '$NAME' as its own and no
 # Adopted/recovery line ever appeared at or after this run's observation
 # mark. A transient fetch failure does NOT fail the watch -- only a 200
-# that says LEADER, or a late Adopted line, does.
+# that lists '$NAME' as the observer's own, or a late Adopted line, does.
 #
 # ─── The observation mark: three defects the suite run found (2026-10-24) ──
 # Run against a cluster shared by six guards in a row, this step failed
@@ -1407,12 +1702,18 @@ loser_ok=1
 loser_why=""
 obs_seen=0
 obs_mark=0
+obs_role=""
 deadline=$(( $(date +%s) + WAIT_OBSERVER ))
 while :; do
-    # 9a. role: must be FOLLOWER at EVERY poll. Once flipped, the loser is
-    # out -- a second LEADER means a second owner of '$NAME'.
+    # 9a. role is diagnostic only; ownership is the gate. A later election
+    # may make the observer LEADER without moving '$NAME' to it.
     if get200 "$OBS_PORT" /api/cluster; then
-        [ "$(jget "$FETCH_BODY" role)" = "FOLLOWER" ] || { loser_ok=0; loser_why="flipped to LEADER"; }
+        obs_role="$(jget "$FETCH_BODY" role)"
+    fi
+    if get200 "$OBS_PORT" /api/partitions; then
+        if [ -n "$(row_if "$FETCH_BODY" "$NAME" "$observer")" ]; then
+            loser_ok=0; loser_why="serves '$NAME' as its OWN"
+        fi
     fi
     # 9b. observation mark: this run's DECLARATION (fragment anchor, so an
     # interleaving-split prefix still matches) or its bounded-grace
@@ -1439,11 +1740,12 @@ done
 [ "$obs_seen" -eq 1 ] || { loser_ok=0; loser_why="never observed the death (no declaration or deferral for node $leader in $OBS_LOG)"; }
 if [ "$loser_ok" -ne 1 ]; then
     # Which gate failed? Report the specific violation.
-    if get200 "$OBS_PORT" /api/cluster && [ "$(jget "$FETCH_BODY" role)" != "FOLLOWER" ]; then
-        fail "node $observer flipped to $(jget "$FETCH_BODY" role) after node $adopter
-       adopted -- a late split-brain. The surviving pair must elect exactly
-       one leader and the loser stays FOLLOWER; a second leader means two
-       owners of '$NAME'. Stop the cluster and inspect the consensus logs."
+    if get200 "$OBS_PORT" /api/partitions \
+       && [ -n "$(row_if "$FETCH_BODY" "$NAME" "$observer")" ]; then
+        fail "node $observer also serves '$NAME' as its OWN after node $adopter
+       adopted -- two owners of one partition. Its role is
+       ${obs_role:-unknown}; role is not the defect, the second owner is.
+       Stop the cluster and inspect the partition and consensus logs."
     fi
     # Windowed diagnosis, same mark as the watch above: recovery lines from
     # BEFORE this run's observation are earlier guards' legal history on the
@@ -1462,11 +1764,11 @@ if [ "$loser_ok" -ne 1 ]; then
 $(grep -hn "FAILOVER] Adopted partition.*dead node $leader\|FAILOVER] recovery for dead node $leader" "$OBS_LOG" 2>/dev/null | awk -F: -v m="$obs_mark" '$1 >= m' | tail -2 | sed 's/^/         /')
        Two Adopted lines means two owners of '$NAME'."
     fi
-    fail "node $observer neither stayed FOLLOWER nor observed the death cleanly
-       (role check / observation check failed: ${loser_why:-unknown}) within
+    fail "node $observer neither stayed a non-owner nor observed the death cleanly
+       (ownership / observation check failed: ${loser_why:-unknown}) within
        ${WAIT_OBSERVER}s. Inspect $OBS_LOG."
 fi
-echo "   node $observer stayed FOLLOWER and never adopted (observed the death only)"
+echo "   node $observer never adopted and does not own '$NAME' (role now ${obs_role:-unknown}; observed the death only)"
 
 # ─── 10. the resurrected owner: the conflict must log and resolve ────────
 # The partition id is needed for the claim-class evidence below: the
@@ -2151,7 +2453,9 @@ echo
 echo
 echo "PASS  node $leader was killed; node $adopter adopted '$NAME' from the held"
 echo "      checkpoint, the owner handoff replicated to node $observer, and the"
-echo "      loser stayed FOLLOWER without adopting. Relaunching node $leader"
+echo "      observer never adopted or owned the partition (its later role may be"
+echo "      LEADER; ownership, not the role label, is the split-brain gate)."
+echo "      Relaunching node $leader"
 echo "      mid-adoption: its stale re-announce was REJECTED by both survivors,"
 echo "      the partition did not flap, and the leader converged to the new owner."
 echo "      Then node $adopter migrated '$NAME' back to node $leader: the"

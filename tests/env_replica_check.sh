@@ -134,11 +134,10 @@ fi
 
 # 9. The refusal-by-name contract is PINNED BY NAME in the host test: a
 #    code that exists only in the enum is a code nobody can regress
-#    quietly. The two codes the test cannot provoke (IO needs a
-#    write-failing device fake, INCOMPLETE is the defensive re-check) are
-#    the only ones allowed to be absent.
+#    quietly. The one code the test cannot provoke (INCOMPLETE, the
+#    defensive re-check) is the only one allowed to be absent.
 required_codes="NO_RECORD RECORD_LEN PAGE_COUNT TOO_MANY SLOT_EXISTS TABLE_FULL
-                NO_DISK_SLOT SUPERSEDED UNKNOWN RANGE ALLOC STALE"
+                NO_DISK_SLOT SUPERSEDED UNKNOWN RANGE ALLOC STALE IO"
 unpinned=""
 for code in $required_codes; do
     grep -q "ENV_REPLICA_REFUSE_${code}" tests/env_replica_host_test.c ||

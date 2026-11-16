@@ -76,6 +76,7 @@ extern uint64_t dspp_tx_oversize_dropped;   /* net/dspp.c */
 #include "../kernel/msgqueue.h"       // Navigator-Parity Gap Roadmap Phase 4 -- GET /api/workmgmt/msgqueues
 #include "../kernel/ipc.h"            // Shell-Command JSON-Promotion Roadmap -- IPCStats/IPCPostRequest/ipc_post()
 #include "../kernel/checkpoint_mgr.h" // Core Backup Strategies Step 1 -- POST /api/checkpoint
+#include "../kernel/env_replica.h"    // P3 destination (a) -- GET /api/env/replicas
 #include "../kernel/secure_api.h"     // Shell-Command JSON-Promotion Roadmap -- struct SLSSealRequest
 
 // ─── Simple JSON builder ──────────────────────────────────────────────────────
@@ -2804,6 +2805,53 @@ static int api_partitions_list(char* buf, int max) {
     }
     jb_arr_close(&j);
     jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+}
+
+// ─── GET /api/env/replicas — POSIX-Environments P3 destination (a) ─────────────
+// The receiver's own directory and staging table, exposed so a liveness guard
+// can verify a replica the source's bounded confirm no longer waits for. The
+// capture stays short (it must not hold the environment's freeze for a whole
+// band write); the peer's finalize runs on its service poll and becomes
+// visible here the moment the directory entry is published. `replicas` is the
+// finalized fact promotion/failover read; `staging` is the in-flight half, so
+// a poll can distinguish "pages are still missing" from "complete, waiting on
+// the band write" instead of inferring either from a log line.
+static int api_env_replicas(char* buf, int max) {
+    JSONBuf j = { buf, 0, max };
+    struct EnvReplicaDirEntry e[ENV_REPLICA_MAX];
+    struct EnvReplicaStagingView s[ENV_REPLICA_STAGING_MAX];
+    uint32_t n  = env_replica_dir_snapshot(e, ENV_REPLICA_MAX);
+    uint32_t ns = env_replica_staging_snapshot(s, ENV_REPLICA_STAGING_MAX);
+    jb_obj_open(&j, 0);
+    jb_arr_open(&j, "replicas");
+    for (uint32_t i = 0; i < n; i++) {
+        if (i) jb_putc(&j, ',');
+        jb_obj_open(&j, 0);
+        jb_uint(&j, "partition_id", e[i].partition_id); jb_putc(&j, ',');
+        jb_uint(&j, "index", e[i].index); jb_putc(&j, ',');
+        jb_uint(&j, "seq", e[i].seq); jb_putc(&j, ',');
+        jb_uint(&j, "pages", e[i].pages); jb_putc(&j, ',');
+        jb_uint(&j, "src_node", e[i].src_node); jb_putc(&j, ',');
+        jb_uint(&j, "blob_crc", e[i].blob_crc); jb_putc(&j, ',');
+        jb_uint(&j, "slot", e[i].slot);
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j); jb_putc(&j, ',');
+    jb_arr_open(&j, "staging");
+    for (uint32_t i = 0; i < ns; i++) {
+        if (i) jb_putc(&j, ',');
+        jb_obj_open(&j, 0);
+        jb_uint(&j, "partition_id", s[i].partition_id); jb_putc(&j, ',');
+        jb_uint(&j, "index", s[i].index); jb_putc(&j, ',');
+        jb_uint(&j, "pages_staged", s[i].pages_staged); jb_putc(&j, ',');
+        jb_uint(&j, "total_pages", s[i].total_pages); jb_putc(&j, ',');
+        jb_uint(&j, "src_node", s[i].src_node); jb_putc(&j, ',');
+        jb_uint(&j, "complete", (uint32_t)s[i].complete); jb_putc(&j, ',');
+        jb_uint(&j, "opened_tick", s[i].opened_tick);
+        jb_obj_close(&j);
+    }
+    jb_arr_close(&j);
+    jb_obj_close(&j); j.buf[j.pos] = '\0'; return j.pos;
 }
 
 // ─── GET /api/partition/quotas — Gap Remediation Phase F ───────────────────────
@@ -5805,6 +5853,10 @@ static void http_route(int conn, char* req) {
         }
         if (!strcmp(path, "/api/health")) {
             blen = api_health(resp_body, (int)sizeof(resp_body));
+            http_respond(conn, 200, "application/json", resp_body, blen); return;
+        }
+        if (!strcmp(path, "/api/env/replicas")) {
+            blen = api_env_replicas(resp_body, (int)sizeof(resp_body));
             http_respond(conn, 200, "application/json", resp_body, blen); return;
         }
         if (!strcmp(path, "/api/checkpoints")) {

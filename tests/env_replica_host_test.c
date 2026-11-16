@@ -76,11 +76,13 @@ void kernel_serial_printf(const char* fmt, ...) {
 }
 volatile uint64_t kernel_tick_counter = 0;
 
+static int g_frames_live = 0;
 void* allocate_physical_ram_frame_for_partition(uint32_t partition_id) {
     (void)partition_id;
     void* p = aligned_alloc(4096, FRAME_SIZE);
     if (!p) return 0;
     memset(p, 0, FRAME_SIZE);
+    g_frames_live++;
     return p;
 }
 /* Top-down staging (frame_pool.h): the replica receiver takes its staging
@@ -93,6 +95,7 @@ void* allocate_physical_ram_frame_for_partition_top(uint32_t partition_id) {
 }
 int free_physical_ram_frame_for_partition(void* frame, uint32_t partition_id) {
     (void)partition_id;
+    g_frames_live--;
     free(frame);
     return 0;
 }
@@ -230,7 +233,9 @@ int nvme_read_sync(uint64_t slba, void* buf) {
     memcpy(buf, fake_page[idx], 4096);
     return 0;
 }
+static uint64_t g_write_fail_lba = UINT64_MAX;
 int nvme_write_sync(uint64_t slba, const void* buf) {
+    if (slba == g_write_fail_lba) return -1;
     int idx = fake_find(slba);
     if (idx < 0) {
         if (fake_count >= FAKE_NVME_MAX_PAGES) return -1;
@@ -240,9 +245,30 @@ int nvme_write_sync(uint64_t slba, const void* buf) {
     memcpy(fake_page[idx], buf, 4096);
     return 0;
 }
+static int g_gather_calls = 0;
+static int g_gather_fail_call = 0;
+static int g_gather_fail_after = 0;
+int nvme_write_pages_gather_sync(uint64_t slba, const void* const* pages,
+                                 uint32_t page_count) {
+    int call = ++g_gather_calls;
+    for (uint32_t i = 0; i < page_count; i++) {
+        /* A test can make one gather fail partway through its PRP list,
+         * exactly where a real controller can lose a completion. */
+        if (g_gather_fail_call == call &&
+            (int)i == g_gather_fail_after) return -1;
+        if (nvme_write_sync(slba + (uint64_t)i * 8ull, pages[i]) != 0) return -1;
+    }
+    return 0;
+}
 /* A clean device: no directory, no band — the wire-arm section starts from
  * "this node has never held a replica". */
-static void nvme_fake_reset(void) { fake_count = 0; }
+static void nvme_fake_reset(void) {
+    fake_count = 0;
+    g_gather_calls = 0;
+    g_gather_fail_call = 0;
+    g_gather_fail_after = 0;
+    g_write_fail_lba = UINT64_MAX;
+}
 
 /* ─── Capture of whatever the receiver transmits (its ACKs) ───────────────
  * This test never runs the SENDER (that is increment 2) — it hand-builds
@@ -399,14 +425,26 @@ static void feed_page(uint64_t tid, uint32_t page, uint8_t fill) {
     for (uint32_t k = 0; k < DSPP_MIGRATE_FRAGS_PER_PAGE; k++)
         env_replica_recv_page(tid, page, order[k], frag);
 }
-static void feed_all(uint64_t tid, uint8_t fill_base) {
-    for (uint32_t p = 0; p < PAYLOAD_PAGES; p++)
+static void feed_pages(uint64_t tid, uint32_t pages, uint8_t fill_base) {
+    for (uint32_t p = 0; p < pages; p++)
         feed_page(tid, p, (uint8_t)(fill_base + p));
+}
+static void feed_all(uint64_t tid, uint8_t fill_base) {
+    feed_pages(tid, PAYLOAD_PAGES, fill_base);
 }
 static int page_holds(uint32_t partition, uint32_t index, uint32_t page,
                       uint8_t fill) {
     static uint8_t buf[4096];
     if (env_replica_read_page(partition, index, page, buf) != 0) return 0;
+    for (int b = 0; b < 4096; b++) if (buf[b] != fill) return 0;
+    return 1;
+}
+/* Read the band without the directory, so a test can observe a slice that
+ * has landed but is not yet published. */
+static int raw_band_page_holds(uint32_t slot, uint32_t page, uint8_t fill) {
+    static uint8_t buf[4096];
+    if (nvme_read_sync(ENV_REPLICA_SLOT_LBA(slot) + (uint64_t)page * 8ull,
+                       buf) != 0) return 0;
     for (int b = 0; b < 4096; b++) if (buf[b] != fill) return 0;
     return 1;
 }
@@ -477,15 +515,15 @@ int main(void) {
     {   /* a record whose payload alone exceeds the band slot's page capacity */
         struct EnvCkptRecord big = mk_record(PART_A, 1, 7, 101);
         big.n_regions = 3;
-        big.regions[0].frames = 1100;
-        big.regions[1].frames = 500;
-        big.regions[2].frames = 500;   /* 2100 payload pages, no tail needed */
+        big.regions[0].frames = 1600;
+        big.regions[1].frames = 1300;
+        big.regions[2].frames = 1200;  /* 4100 payload pages, no tail needed */
         big.state_sectors = 0;
-        CHECK(env_migrate_payload_pages(&big) == 2100,
-              "B5: the shared arithmetic sees 2100 payload pages");
-        CHECK(env_replica_recv_begin(tid, PART_A, 1, 2100, &big,
+        CHECK(env_migrate_payload_pages(&big) == 4100,
+              "B5: the shared arithmetic sees 4100 payload pages");
+        CHECK(env_replica_recv_begin(tid, PART_A, 1, 4100, &big,
                                      sizeof big, 2) ==
-              ENV_REPLICA_REFUSE_TOO_MANY, "B6: over the band slot -> TOO_MANY");
+              ENV_REPLICA_REFUSE_TOO_MANY, "B6: over the 4032-page band slot -> TOO_MANY");
     }
     CHECK(env_replica_staging_count() == 0, "B7: no refusal staged a slot");
     CHECK(!env_replica_present(PART_A, 1), "B8: no refusal produced a replica");
@@ -955,6 +993,152 @@ int main(void) {
                 env_migrate_recv_drop(79, 0);
             }
         }
+    }
+
+    /* ── K: a finalize larger than one service-poll slice ──────────────────
+     * The finalizer writes 16 pages per tick and publishes only after the
+     * last slice. Every intermediate tick must leave the directory ABSENT;
+     * the entry may appear only when the final slice and its publish have
+     * both completed. */
+    printf("-- K: multi-slice finalize, absent until publish --\n");
+    env_replica_reset();
+    env_migrate_reset();
+    nvme_fake_reset();
+    {
+        enum { BIG_PAGES = 40, BIG_PART = 92 };
+        struct EnvCkptRecord big = mk_record(BIG_PART, 0, 21, 1200);
+        big.regions[0].frames = 24;
+        big.regions[1].frames = 14;
+        big.state_sectors = 16;   /* 24 + 14 region pages + 2 extent pages */
+        uint64_t bt = ((uint64_t)BIG_PART << 32) | 0;
+        int frames_before = g_frames_live;
+
+        CHECK(env_migrate_payload_pages(&big) == BIG_PAGES,
+              "K0: the record declares 40 pages — more than two 16-page slices");
+        CHECK(env_replica_recv_begin(bt, BIG_PART, 0, BIG_PAGES, &big,
+                                     sizeof big, 2) == 0,
+              "K1: the 40-page transfer stages");
+        feed_pages(bt, BIG_PAGES, 0xA0);
+        CHECK(g_frames_live - frames_before == BIG_PAGES,
+              "K2: every staged page owns one frame");
+        CHECK(env_replica_tick() == 0,
+              "K3: the first 16-page slice writes, but does not publish");
+        CHECK(!env_replica_present(BIG_PART, 0),
+              "K4: the entry is absent after only one slice");
+        CHECK(raw_band_page_holds(0, 0, 0xA0) &&
+              raw_band_page_holds(0, 15, 0xAF) &&
+              !raw_band_page_holds(0, 16, 0xB0),
+              "K5: exactly the first slice reached band slot 0");
+        CHECK(env_replica_tick() == 0,
+              "K6: the second 16-page slice writes, but still does not publish");
+        CHECK(!env_replica_present(BIG_PART, 0),
+              "K7: the entry is absent after two slices");
+        CHECK(raw_band_page_holds(0, 16, 0xB0) &&
+              raw_band_page_holds(0, 31, 0xBF) &&
+              !raw_band_page_holds(0, 32, 0xC0),
+              "K8: exactly the second slice reached the band");
+        CHECK(env_replica_tick() == 1,
+              "K9: the last slice writes and the publish completes");
+        CHECK(env_replica_present(BIG_PART, 0),
+              "K10: the entry is visible only after every slice and the publish");
+        CHECK(page_holds(BIG_PART, 0, 0, 0xA0) &&
+              page_holds(BIG_PART, 0, 15, 0xAF) &&
+              page_holds(BIG_PART, 0, 16, 0xB0) &&
+              page_holds(BIG_PART, 0, 31, 0xBF) &&
+              page_holds(BIG_PART, 0, 32, 0xC0) &&
+              page_holds(BIG_PART, 0, 39, 0xC7),
+              "K11: all 40 pages are byte-exact through the published entry");
+        CHECK(g_frames_live == frames_before,
+              "K12: the successful finalize returned every staged frame");
+    }
+
+    /* ── K (failure): a mid-chunk write failure must drop everything ─────── */
+    printf("-- K: mid-slice write failure drops the staged finalize --\n");
+    env_replica_reset();
+    env_migrate_reset();
+    nvme_fake_reset();
+    {
+        enum { BIG_PAGES = 40, BIG_PART = 93 };
+        struct EnvCkptRecord big = mk_record(BIG_PART, 0, 22, 1201);
+        big.regions[0].frames = 24;
+        big.regions[1].frames = 14;
+        big.state_sectors = 16;
+        uint64_t bt = ((uint64_t)BIG_PART << 32) | 0;
+        int frames_before = g_frames_live;
+
+        CHECK(env_replica_recv_begin(bt, BIG_PART, 0, BIG_PAGES, &big,
+                                     sizeof big, 2) == 0,
+              "K13: the 40-page transfer stages for the failure arm");
+        feed_pages(bt, BIG_PAGES, 0xA0);
+        CHECK(g_frames_live - frames_before == BIG_PAGES,
+              "K14: every staged page owns one frame before the write");
+        g_gather_fail_call = 2;   /* the second service-poll gather */
+        g_gather_fail_after = 7;  /* seven pages into its 16-page chunk */
+        CHECK(env_replica_tick() == 0,
+              "K15: the first slice succeeds");
+        CHECK(!env_replica_present(BIG_PART, 0),
+              "K16: the entry is still absent after the first slice");
+        CHECK(env_replica_tick() == 0,
+              "K17: the second slice's gather fails mid-chunk");
+        CHECK(last_refusal() == ENV_REPLICA_REFUSE_IO,
+              "K18: the failure is named IO");
+        CHECK(env_replica_last_refusal().a == 16 &&
+              env_replica_last_refusal().b == BIG_PAGES,
+              "K19: the refusal names the failed slice's first page and total");
+        CHECK(env_replica_staging_count() == 0,
+              "K20: the failed finalize dropped its staging slot");
+        CHECK(g_frames_live == frames_before,
+              "K21: ...and returned every staged frame");
+        CHECK(!env_replica_present(BIG_PART, 0) && env_replica_count() == 0,
+              "K22: no replica was recorded");
+        CHECK(raw_band_page_holds(0, 16, 0xB0) &&
+              raw_band_page_holds(0, 22, 0xB6) &&
+              !raw_band_page_holds(0, 23, 0xB7),
+              "K23: the gather stopped seven pages into the second slice");
+        g_gather_fail_call = 0;
+        g_gather_fail_after = 0;
+        env_replica_reset();
+    }
+
+    /* ── K (publish): every slice lands, but publish does not complete ───── */
+    printf("-- K: failed publish leaves the entry absent --\n");
+    env_replica_reset();
+    env_migrate_reset();
+    nvme_fake_reset();
+    {
+        enum { BIG_PAGES = 40, BIG_PART = 94 };
+        struct EnvCkptRecord big = mk_record(BIG_PART, 0, 23, 1202);
+        big.regions[0].frames = 24;
+        big.regions[1].frames = 14;
+        big.state_sectors = 16;
+        uint64_t bt = ((uint64_t)BIG_PART << 32) | 0;
+        int frames_before = g_frames_live;
+
+        CHECK(env_replica_recv_begin(bt, BIG_PART, 0, BIG_PAGES, &big,
+                                     sizeof big, 2) == 0,
+              "K24: the 40-page transfer stages for the publish arm");
+        feed_pages(bt, BIG_PAGES, 0xA0);
+        CHECK(g_frames_live - frames_before == BIG_PAGES,
+              "K25: every staged page owns one frame");
+        CHECK(env_replica_tick() == 0,
+              "K26: the first slice writes");
+        CHECK(env_replica_tick() == 0,
+              "K27: the second slice writes");
+        g_write_fail_lba = PERSIST_ENV_REPLICA_HDR_LBA;
+        CHECK(env_replica_tick() == 0,
+              "K28: the last slice writes, but the directory publish fails");
+        CHECK(last_refusal() == ENV_REPLICA_REFUSE_IO &&
+              env_replica_last_refusal().a == 3,
+              "K29: the failure is named IO at the publish step");
+        CHECK(!env_replica_present(BIG_PART, 0) && env_replica_count() == 0,
+              "K30: no entry is visible while publish is incomplete");
+        CHECK(raw_band_page_holds(0, 32, 0xC0) &&
+              raw_band_page_holds(0, 39, 0xC7),
+              "K31: every remaining slice reached the band before the failed publish");
+        CHECK(g_frames_live == frames_before,
+              "K32: the failed publish dropped every staged frame");
+        g_write_fail_lba = UINT64_MAX;
+        env_replica_reset();
     }
 
     printf("\n%d passed, %d failed\n", checks_passed, checks_failed);

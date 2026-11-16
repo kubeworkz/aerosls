@@ -4,8 +4,10 @@
 #include <stdint.h>
 
 // Admin Opcodes
-#define NVME_ADMIN_CMD_CREATE_CQ 0x05
+#define NVME_ADMIN_CMD_DELETE_SQ 0x00
 #define NVME_ADMIN_CMD_CREATE_SQ 0x01
+#define NVME_ADMIN_CMD_DELETE_CQ 0x04
+#define NVME_ADMIN_CMD_CREATE_CQ 0x05
 #define NVME_ADMIN_CMD_IDENTIFY  0x06
 
 // 64-byte generic layout for NVMe Admin/IO commands

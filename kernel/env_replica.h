@@ -147,6 +147,21 @@ struct EnvReplicaRefusal {
     uint32_t b;
 };
 
+/* Read-only views for the host-visible /api/env/replicas route. The
+ * directory view is the finalized fact (what promotion and failover read);
+ * the staging view is the in-flight half, so an observer can tell "the peer
+ * never got every page" from "every page is staged and the finalizer has
+ * not written the band yet" without guessing from a log line. */
+struct EnvReplicaStagingView {
+    uint32_t partition_id;
+    uint32_t index;
+    uint32_t pages_staged;
+    uint32_t total_pages;
+    uint32_t src_node;
+    uint8_t  complete;
+    uint64_t opened_tick;
+};
+
 /* ─── Wire entries (net/dspp.c's dispatch calls these) ──────────────────────
  * Both mirror env_migrate.c's receiver: 0 = accepted, nonzero = refused (the
  * value is the code above, which dspp.c puts in the ACK's status and logs
@@ -179,6 +194,12 @@ int env_replica_read_page(uint32_t partition_id, uint32_t index,
                           uint32_t page, uint8_t* buf);   /* 0 = read, nonzero = absent/short */
 uint32_t env_replica_count(void);          /* live directory entries */
 uint32_t env_replica_staging_count(void);  /* active staging slots */
+/* Snapshot helpers for the HTTP status surface: copy up to `max` VALID
+ * directory entries / active staging slots. They read the same on-disk
+ * directory and the same staging table the promotion and finalize paths
+ * use, so a poll sees the real state rather than an inferred one. */
+uint32_t env_replica_dir_snapshot(struct EnvReplicaDirEntry* out, uint32_t max);
+uint32_t env_replica_staging_snapshot(struct EnvReplicaStagingView* out, uint32_t max);
 
 /* The refusal latch: the last gate that fired, with its number. The host
  * test and the guard assert on the CODE — a named refusal, never a bare

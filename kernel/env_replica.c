@@ -64,6 +64,10 @@ _Static_assert((uint64_t)ENV_REPLICA_MAX_PAGES * 8ull <=
 struct EnvReplicaSlot {
     uint8_t  active;
     uint8_t  complete;
+    uint8_t  finalizing;     /* prepared; band write in progress */
+    uint32_t band_slot;      /* slot chosen before the first band write */
+    uint32_t write_page;     /* next page to write (finalizing only) */
+    uint32_t final_crc;      /* receiver checksum, computed at prepare */
     uint32_t partition_id;
     uint32_t index;
     uint64_t transfer_id;
@@ -174,6 +178,10 @@ static void er_slot_drop(struct EnvReplicaSlot* s) {
     }
     s->active       = 0;
     s->complete     = 0;
+    s->finalizing   = 0;
+    s->band_slot    = 0;
+    s->write_page   = 0;
+    s->final_crc    = 0;
     s->pages_staged = 0;
 }
 
@@ -393,7 +401,15 @@ static int er_dir_write(const struct EnvReplicaDirEntry* e, uint32_t count) {
  * The crc is computed HERE, over the bytes as staged: the receiver's own
  * checksum of what actually crossed, stored for whoever reads the slot
  * back (promotion and the guard recompute and compare). */
-static int er_finalize(struct EnvReplicaSlot* s) {
+/* One prepare leaves a slot finalizing; the band write itself is bounded
+ * per service-poll pass. The old whole-band loop blocked the BSP for the
+ * 1,970-page capture and, under TCG, could outlast the 6,000-tick failover
+ * declaration grace: the node was then declared dead while its peer was
+ * still staging the duplicate. Sixteen pages per pass keeps heartbeats and
+ * HTTP service alive between writes without changing the publish contract. */
+#define ENV_REPLICA_FINALIZE_PAGES_PER_TICK 16u
+
+static int er_finalize_begin(struct EnvReplicaSlot* s) {
     if (!er_io_ready()) return 0;   /* device not up yet: not a refusal, retry */
 
     for (uint32_t p = 0; p < s->total_pages; p++) {
@@ -440,7 +456,9 @@ static int er_finalize(struct EnvReplicaSlot* s) {
 
     /* Choose the band slot: a replacement keeps its own slot (step 2 has
      * already made it absent, so in-place cannot show mixed captures); a new
-     * identity takes a slot no valid entry names. */
+     * identity takes a slot no valid entry names. Only one slot finalizes at
+     * a time (env_replica_tick), so a prepare that chose a slot is not
+     * racing another prepare's identical choice. */
     uint32_t slot = 0;
     int have_slot = 0;
     if (existing >= 0) {
@@ -489,24 +507,55 @@ static int er_finalize(struct EnvReplicaSlot* s) {
     for (uint32_t p = 0; p < s->total_pages; p++)
         crc = er_crc(crc, s->pages[p], 4096);
 
-    /* Step 3: the band. Page p at slot_lba + p*8 sectors (4 KiB = 8 x 512). */
-    for (uint32_t p = 0; p < s->total_pages; p++) {
-        if (nvme_write_sync(ENV_REPLICA_SLOT_LBA(slot) + (uint64_t)p * 8ull,
-                            s->pages[p]) != 0) {
-            er_refuse(ENV_REPLICA_REFUSE_IO, p, s->total_pages);
+    s->band_slot  = slot;
+    s->write_page = 0;
+    s->final_crc  = crc;
+    s->finalizing = 1;
+    return 1;
+}
+
+static int er_finalize_step(struct EnvReplicaSlot* s) {
+    /* Step 3: the band, a bounded slice per service-poll pass. Page p at
+     * slot_lba + p*8 sectors (4 KiB = 8 x 512). */
+    uint32_t stop = s->write_page + ENV_REPLICA_FINALIZE_PAGES_PER_TICK;
+    if (stop > s->total_pages) stop = s->total_pages;
+    if (stop > s->write_page) {
+        /* One gather command per pass, not one command per page: the band's
+         * frames are already page-aligned, and nvme_write_pages_gather_sync
+         * describes them with a PRP list (the same path migration uses). It
+         * keeps the emulated controller's command queue shallow while the
+         * band is being filled. */
+        const void* const* pages =
+            (const void* const*)&s->pages[s->write_page];
+        if (nvme_write_pages_gather_sync(
+                ENV_REPLICA_SLOT_LBA(s->band_slot) +
+                    (uint64_t)s->write_page * 8ull,
+                pages, stop - s->write_page) != 0) {
+            er_refuse(ENV_REPLICA_REFUSE_IO, s->write_page, s->total_pages);
             kernel_serial_printf(
                 "[ENV_REPLICA] finalize (partition %u, index %u): %s (band page %u "
                 "of %u) -- staged frames dropped; no replica is recorded.\n",
                 (unsigned)s->partition_id, (unsigned)s->index,
                 env_replica_refusal_name(ENV_REPLICA_REFUSE_IO),
-                (unsigned)p, (unsigned)s->total_pages);
+                (unsigned)s->write_page, (unsigned)s->total_pages);
             er_slot_drop(s);
             return 0;
         }
     }
+    s->write_page = stop;
+    if (s->write_page < s->total_pages) return 0;   /* more passes to come */
 
-    /* Step 4: publish the entry (or append the new one). */
-    int32_t pub = existing;
+    /* Step 4: publish the entry (or replace the invalidated one). */
+    struct EnvReplicaDirHead h;
+    struct EnvReplicaDirEntry e[ENV_REPLICA_MAX];
+    int n = er_dir_read(&h, e);
+    uint32_t count = (n > 0) ? (uint32_t)n : 0;
+    int32_t pub = -1;
+    for (uint32_t i = 0; i < count; i++)
+        if (e[i].partition_id == s->partition_id && e[i].index == s->index) {
+            pub = (int32_t)i;
+            break;
+        }
     if (pub < 0) {
         if (count >= ENV_REPLICA_MAX) {          /* defensive: BEGIN checked too */
             er_refuse(ENV_REPLICA_REFUSE_NO_DISK_SLOT, count, 1);
@@ -519,12 +568,12 @@ static int er_finalize(struct EnvReplicaSlot* s) {
     }
     e[pub].partition_id = s->partition_id;
     e[pub].index        = s->index;
-    e[pub].slot         = slot;
+    e[pub].slot         = s->band_slot;
     e[pub].flags        = ENV_REPLICA_F_VALID;
     e[pub].seq          = s->record.sequence;
     e[pub].pages        = s->total_pages;
     e[pub].src_node     = s->src_node;
-    e[pub].blob_crc     = crc;
+    e[pub].blob_crc     = s->final_crc;
     e[pub]._pad         = 0;
     e[pub].record       = s->record;
     if (er_dir_write(e, count) != 0) {
@@ -543,7 +592,7 @@ static int er_finalize(struct EnvReplicaSlot* s) {
         "crc=0x%08x -> band slot %u, from node %u\n",
         (unsigned)s->partition_id, (unsigned)s->index,
         (unsigned)s->record.sequence, (unsigned)s->total_pages,
-        (unsigned)crc, (unsigned)slot, (unsigned)s->src_node);
+        (unsigned)s->final_crc, (unsigned)s->band_slot, (unsigned)s->src_node);
 
     er_slot_drop(s);
     return 1;
@@ -551,31 +600,43 @@ static int er_finalize(struct EnvReplicaSlot* s) {
 
 /* ─── The finalize pass (microkernel.c's service poll) ───────────────────── */
 int env_replica_tick(void) {
-    int done = 0;
+    /* Drop only the incomplete stagers here; a completed one is either
+     * waiting for its turn or has a band write in progress. */
     for (uint32_t i = 0; i < ENV_REPLICA_STAGING_MAX; i++) {
         struct EnvReplicaSlot* s = &er_staging[i];
-        if (!s->active) continue;
-        if (!s->complete) {
-            /* A transfer whose sender vanished holds partition frames for
-             * nothing: bounded by age (env_replica.h's contract), dropped
-             * and named — the retry that never came is not our retry to
-             * invent. */
-            if (kernel_tick_counter - s->opened_tick > ENV_REPLICA_STALE_TICKS) {
-                kernel_serial_printf(
-                    "[ENV_REPLICA] staging (partition %u, index %u) STALE after "
-                    "%u tick(s): %u/%u page(s) staged -- frames returned to the "
-                    "partition; no replica is recorded.\n",
-                    (unsigned)s->partition_id, (unsigned)s->index,
-                    (unsigned)(kernel_tick_counter - s->opened_tick),
-                    (unsigned)s->pages_staged, (unsigned)s->total_pages);
-                er_refuse(ENV_REPLICA_REFUSE_STALE, s->pages_staged, s->total_pages);
-                er_slot_drop(s);
-            }
-            continue;
+        if (!s->active || s->complete) continue;
+        /* A transfer whose sender vanished holds partition frames for
+         * nothing: bounded by age (env_replica.h's contract), dropped
+         * and named — the retry that never came is not our retry to
+         * invent. */
+        if (kernel_tick_counter - s->opened_tick > ENV_REPLICA_STALE_TICKS) {
+            kernel_serial_printf(
+                "[ENV_REPLICA] staging (partition %u, index %u) STALE after "
+                "%u tick(s): %u/%u page(s) staged -- frames returned to the "
+                "partition; no replica is recorded.\n",
+                (unsigned)s->partition_id, (unsigned)s->index,
+                (unsigned)(kernel_tick_counter - s->opened_tick),
+                (unsigned)s->pages_staged, (unsigned)s->total_pages);
+            er_refuse(ENV_REPLICA_REFUSE_STALE, s->pages_staged, s->total_pages);
+            er_slot_drop(s);
         }
-        done += er_finalize(s);
     }
-    return done;
+
+    /* One band write at a time: a prepared slot owns the selected band slot
+     * until its publish or refusal, so a second prepare cannot choose the
+     * same as-yet-unpublished slot. Advance only that slot this pass. */
+    for (uint32_t i = 0; i < ENV_REPLICA_STAGING_MAX; i++) {
+        struct EnvReplicaSlot* s = &er_staging[i];
+        if (s->active && s->complete && s->finalizing)
+            return er_finalize_step(s);
+    }
+
+    for (uint32_t i = 0; i < ENV_REPLICA_STAGING_MAX; i++) {
+        struct EnvReplicaSlot* s = &er_staging[i];
+        if (!s->active || !s->complete) continue;
+        if (er_finalize_begin(s)) return er_finalize_step(s);
+    }
+    return 0;
 }
 
 /* ─── The finder ──────────────────────────────────────────────────────────── */
@@ -608,6 +669,38 @@ uint32_t env_replica_count(void) {
     for (int i = 0; i < n; i++)
         if (e[i].flags & ENV_REPLICA_F_VALID) live++;
     return live;
+}
+
+uint32_t env_replica_dir_snapshot(struct EnvReplicaDirEntry* out,
+                                  uint32_t max) {
+    if (!out || max == 0) return 0;
+    struct EnvReplicaDirHead h;
+    struct EnvReplicaDirEntry e[ENV_REPLICA_MAX];
+    int n = er_dir_read(&h, e);
+    if (n <= 0) return 0;
+    uint32_t copied = 0;
+    for (int i = 0; i < n && copied < max; i++)
+        if (e[i].flags & ENV_REPLICA_F_VALID) out[copied++] = e[i];
+    return copied;
+}
+
+uint32_t env_replica_staging_snapshot(struct EnvReplicaStagingView* out,
+                                      uint32_t max) {
+    if (!out || max == 0) return 0;
+    uint32_t copied = 0;
+    for (uint32_t i = 0; i < ENV_REPLICA_STAGING_MAX && copied < max; i++) {
+        struct EnvReplicaSlot* s = &er_staging[i];
+        if (!s->active) continue;
+        out[copied].partition_id = s->partition_id;
+        out[copied].index        = s->index;
+        out[copied].pages_staged = s->pages_staged;
+        out[copied].total_pages  = s->total_pages;
+        out[copied].src_node     = s->src_node;
+        out[copied].complete     = s->complete;
+        out[copied].opened_tick  = s->opened_tick;
+        copied++;
+    }
+    return copied;
 }
 
 int env_replica_read_page(uint32_t partition_id, uint32_t index,
@@ -802,15 +895,17 @@ int env_replica_live_query(uint32_t partition_id, uint32_t index,
  * finalized, 1 the peer answered not-finalized/older on every ask, 2 never
  * answered. The pace between asks spans the peer's service poll — the same
  * period the migration's confirmation walk gets for free by asking once per
- * sweep period — and the ladder's TOTAL span (6 × 120 ticks ≈ 7 s at
- * HZ=100) has to cover the peer's finalize itself: a synchronous band
- * write of the whole payload (1947 pages ≈ 7.6 MiB through emulated NVMe,
- * seconds — not ticks). Live run, 2026-10-28: at 4 × 5 ticks the ladder
- * exhausted in ~250 ms while the band write was still in flight — four
- * honest "absent" answers for a replica that landed moments later. The
- * block this adds sits inside capture's freeze, where the page stream
- * already spends minutes: bounded, and small beside it. */
-#define ENV_REPLICA_CONFIRM_TRIES 6u
+ * sweep period — and the ladder stays deliberately SHORT. A synchronous band
+ * write (1947 pages ≈ 7.6 MiB through emulated NVMe) can outlast any useful
+ * confirm window: live runs on 2026-10-28 and 2026-11-15 finalized AFTER the
+ * source had given up, and the 2026-11-15 run showed the opposite cost of
+ * waiting longer — the capture held its freeze for no gain while the peer
+ * still had not published. The source therefore asks twice and reports
+ * "staged but NOT finalized" honestly; the peer's own directory is the
+ * long-lived evidence. GET /api/env/replicas surfaces that directory (and
+ * the staging counts) so a guard can poll until the entry is really there,
+ * without either side pretending a bounded confirm is a finality proof. */
+#define ENV_REPLICA_CONFIRM_TRIES 2u
 #define ENV_REPLICA_CONFIRM_PACE_TICKS 120u
 static int er_confirm_finalized(uint32_t partition_id, uint32_t index,
                                 uint64_t seq, uint32_t dest) {
