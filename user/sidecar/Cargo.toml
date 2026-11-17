@@ -70,6 +70,10 @@ m4_runtime_probe = []
 # the E3 gate profile with M4_HARDENING_PROBE=1. Default builds compile neither the
 # module nor its spawn path.
 m4_hardening_probe = []
+# M4.9's real std::thread gate: musl's PROT_NONE stack reservation is backed
+# by mprotect and the restored std::thread joins. Default builds compile
+# neither the module nor its spawn path.
+m4_std_thread_probe = []
 # M5.2's live Linux-personality CAT_EXEC probe — enabled only by
 # `make x86-iso-e3 ... M5_CATALOG_PROBE=1`. Default builds compile neither
 # the module nor its spawn path.

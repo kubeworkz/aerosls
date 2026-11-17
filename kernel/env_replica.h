@@ -41,10 +41,10 @@
  * entries-first-header-last so a torn pair points at unchanged entries,
  * never the reverse) and a band of per-environment slots:
  *
- *   ENV_REPLICA_SLOT_LBA(slot) = 1261568 + slot * 16384
+ *   ENV_REPLICA_SLOT_LBA(slot) = 1392640 + slot * 32768
  *
- * 1261568 is exactly the payload band's end (asserted at compile time):
- * this band is the payload band's neighbour, 8 slots x 8 MiB, clear of
+ * 1392640 is exactly the payload band's end (asserted at compile time):
+ * this band is the payload band's neighbour, 8 slots x 16 MiB, clear of
  * ROWSTORE_LBA_BASE 2000000. Each slot holds the staged pages in wire
  * order (4 KiB per page, page p at slot_lba + p*8) — NOT the payload blob
  * format: the replica stores what the wire carried, and promotion (the
@@ -64,8 +64,8 @@
  * never silently dropped — the classification ladder destination (b)
  * reports against must be able to name "no replica" honestly.
  *
- * Band capacity is a stated boundary, not an accident: 8 slots x 8 MiB.
- * An environment larger than 2048 payload pages is refused at BEGIN
+ * Band capacity is a stated boundary, not an accident: 8 slots x 16 MiB.
+ * An environment larger than 4032 payload pages is refused at BEGIN
  * (ER_REFUSE_TOO_MANY) rather than truncated.
  */
 #ifndef ENV_REPLICA_H
@@ -76,11 +76,11 @@
 
 /* ─── The band ─────────────────────────────────────────────────────────────── */
 #define ENV_REPLICA_MAX           8u          /* slots = distinct replicas kept */
-#define ENV_REPLICA_SLOT_SECTORS  16384ULL    /* 8 MiB, same slot size as a payload */
-#define ENV_REPLICA_DATA_LBA_BASE 1261568ULL  /* = payload band's end; asserted in env_replica.c */
+#define ENV_REPLICA_SLOT_SECTORS  32768ULL    /* 16 MiB, same slot size as a payload */
+#define ENV_REPLICA_DATA_LBA_BASE 1392640ULL  /* = payload band's end; asserted in env_replica.c */
 #define ENV_REPLICA_SLOT_LBA(slot) \
     (ENV_REPLICA_DATA_LBA_BASE + ((uint64_t)(slot) * ENV_REPLICA_SLOT_SECTORS))
-#define ENV_REPLICA_MAX_PAGES     2048u       /* a slot's pages (16384 sectors / 8) */
+#define ENV_REPLICA_MAX_PAGES     4032u       /* mirrors the payload's data-page ceiling */
 
 /* ─── Runtime staging ────────────────────────────────────────────────────────
  * One slot per peer in flight: the sender is synchronous (one replica at a

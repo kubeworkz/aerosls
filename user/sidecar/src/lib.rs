@@ -83,6 +83,8 @@ pub mod m4_ckpt_probe;
 pub mod m4_runtime_probe;
 #[cfg(feature = "m4_hardening_probe")]
 pub mod m4_hardening_probe;
+#[cfg(feature = "m4_std_thread_probe")]
+pub mod m4_std_thread_probe;
 #[cfg(feature = "m5_catalog_probe")]
 pub mod m5_catalog_probe;
 pub mod net_client;

@@ -1,6 +1,6 @@
 # AeroSLS M4 — Threads and Thread Groups (Design Spike v0.1)
 
-Status: M4.8 hardening landed for clone3, robust futex lists, futex requeue and group-directed signals; std pthread and Go runtime remain out.
+Status: M4.9 std::thread gate landed for musl pthread_create; Go, threaded CPython and Node remain out.
 
 Date: 2026-11-14. Owner: Gridworkz. Scope: M4 in
 `AeroSLS-PASE-Linux-Shape-Decision-v0.1.md`.
@@ -15,7 +15,7 @@ queue, FIFO wake, expected-value check and a bounded relative timeout. M4.5
 added the real `getpid`/`gettid` identities, per-thread `tkill` matching,
 the kernel `exit_group` group sweep, the checked `clear_child_tid` zero at
 thread exit and the sidecar wake on that word. M4.8 adds `clone3` (435),
-robust-list exit, private futex requeue and group-directed signals. M4.6 landed the thread-aware checkpoint/restore, and M4.7 passed the live runtime gate with the static threaded-Rust candidate: two OS threads share a heap object and the inherited console fd, park on the group's private futex, survive the two-boot checkpoint/restore, and join. **The static threaded-Rust gate is evidenced; std pthread and Go runtime remain out** because musl's `pthread_create` reserves its stack with `mmap(PROT_NONE)` and then `mprotect`s the usable range, while this kernel's documented PROT_NONE contract backs no frames and answers a protection change over an absent page with `ENOMEM`. Threaded CPython, Node and Go use larger runtime surfaces and remain out with std pthread. An undocumented or out-of-order partial implementation is a failure, not a milestone: a `clone` that copies a page table is not threads, and a futex that cannot wake another thread is not futex (the M4.4 live gate proves the wake, not a runtime). M4.1 is allowed to land alone because it adds no user-visible thread surface; M4.2 and M4.3 may land before futex only because they are explicitly staged here, and M4.4 may land before exit/identity and checkpoint only because it is likewise staged; all of them still leave every runtime out. M4.8 adds the hardening surface a real runtime exercises next: `clone3` (435), the robust-list exit walk, private `FUTEX_REQUEUE`/`FUTEX_CMP_REQUEUE`, and default-action group-directed `kill`/`tgkill`. Priority inheritance, process-shared futexes and the second-architecture audit remain open, and the runtime wall does not move.
+robust-list exit, private futex requeue and group-directed signals. M4.6 landed the thread-aware checkpoint/restore, and M4.7 passed the live runtime gate with the static threaded-Rust candidate: two OS threads share a heap object and the inherited console fd, park on the group's private futex, survive the two-boot checkpoint/restore, and join. M4.9 closes the `PROT_NONE` reservation hole that kept musl pthread out: `mmap(PROT_NONE)` installs a non-present reservation PTE, and a later `mprotect(PROT_READ|PROT_WRITE)` backs those pages with fresh zero frames (no frame is allocated at reservation time), so `pthread_create`'s 2 MiB stack works. **The static threaded-Rust gate and a real `std::thread::spawn`/join gate are both evidenced**; `evidence/m4_std_thread_gate.log` carries `STD-THREAD-PASS` after checkpoint/restore. Threaded CPython, Node and Go use larger runtime surfaces (signal handlers, process-shared state, more threads) and remain out; the runtime wall is now a Go/runtime wall, not a pthread-creation wall. An undocumented or out-of-order partial implementation is a failure, not a milestone: a `clone` that copies a page table is not threads, and a futex that cannot wake another thread is not futex (the M4.4 live gate proves the wake, not a runtime). M4.1 is allowed to land alone because it adds no user-visible thread surface; M4.2 and M4.3 may land before futex only because they are explicitly staged here, and M4.4 may land before exit/identity and checkpoint only because it is likewise staged; all of them still leave every runtime out. M4.8 adds the hardening surface a real runtime exercises next: `clone3` (435), the robust-list exit walk, private `FUTEX_REQUEUE`/`FUTEX_CMP_REQUEUE`, and default-action group-directed `kill`/`tgkill`. Priority inheritance, process-shared futexes and the second-architecture audit remain open.
 
 ## 0. The wall, measured in the tree
 
@@ -29,8 +29,8 @@ checked against the current source rather than inferred from a document.
 | Page-table lifetime | M4.1 makes the group own the PML4 (`kernel/linux_threads.c`), and process_exit/process_kill/deferred teardown destroy it only on the last reference; M4.2 attaches the clone child before release and its live probe faults one child while the parent still runs | M4.5's `exit_group` sweep and checked `clear_child_tid` zero run before the last reference; M4.6's checkpoint/restore carries the shared PML4 once and restores N thread contexts |
 | Process identity | `struct ProcessDescriptor` carries `linux_tgid`, `linux_tid`, `linux_clear_child_tid`, and `linux_is_thread` (`kernel/process.h`); M4.2's `linux_thread_group_attach()` writes the child's TID and the clone syscall writes ptid/ctid | M4.5 makes `getpid` return the TGID, `gettid` the calling TID, `tkill` match that real TID, and `exit_group` sweep by TGID. M4.8 adds `kill` (62) and `tgkill` (234): a self-directed signal reuses the M4.5 tkill path, a sibling default-terminate target is delivered as `SignalKillTask`, and a group default-terminate target runs the existing TGID sweep; handler/stop fan-out is still out |
 | Kernel stacks | M4.2's create allocates a dedicated `syscall_stack_top` for the child and its `ring3_ctx` resumes on the caller's stack | two threads have independent kernel stacks and saved user contexts; M4.5's `clear_child_tid` zero+wake supplies the join rendezvous; M4.6's payload v3 restores each thread's captured park frame |
-| Sidecar task state | M4.3 adds `LinuxGroup` beside `LinuxTask`: the group owns the Linux fd table, the §5.4 heap ledger, the signal dispositions and (M4.4) the bounded futex wait queue; each thread owns its channel, name, VFS task (sharing the VFS table under `CLONE_FILES`), mask/pending/tid/alt stack, robust-list head and parked request. `track_thread` joins a clone to the parent's group; the last `release_task` retires the group. M4.5's exit/signal/close paths wake the stored clear-tid word and `exit_group` reaps every group record; M4.6 captures the group and its per-thread parked requests. M4.8 stores the robust-list head, walks it at thread exit and ORs `FUTEX_OWNER_DIED` into the owner word before waking the futex queue | group state is shared and reference-counted, the group can be swept, and identity, checkpoint, the static threaded-Rust gate and the M4.8 hardening gate are evidenced; std pthread/Go remain out on the PROT_NONE stack reservation |
-| `futex` | M4.4 lands private `FUTEX_WAIT`/`FUTEX_WAKE`: the kernel copies the observed word and optional timespec, the sidecar owns a group-keyed FIFO queue, and timeout is `ETIMEDOUT`. M4.7 adds private `FUTEX_WAIT_BITSET`/`FUTEX_WAKE_BITSET` with a non-empty match word and an absolute deadline. M4.8 adds private `FUTEX_REQUEUE`/`FUTEX_CMP_REQUEUE`: CMP's expected snapshot is copied by the kernel, FIFO order is preserved, and the moved waiters stay parked with the original timeout | PI, process-shared futexes, signal-interrupted waits and a robust-list owner-exit protocol for non-terminating owners are named follow-ons; the M4.8 exit walk is the terminating-owner case, and std pthread/Go remain out |
+| Sidecar task state | M4.3 adds `LinuxGroup` beside `LinuxTask`: the group owns the Linux fd table, the §5.4 heap ledger, the signal dispositions and (M4.4) the bounded futex wait queue; each thread owns its channel, name, VFS task (sharing the VFS table under `CLONE_FILES`), mask/pending/tid/alt stack, robust-list head and parked request. `track_thread` joins a clone to the parent's group; the last `release_task` retires the group. M4.5's exit/signal/close paths wake the stored clear-tid word and `exit_group` reaps every group record; M4.6 captures the group and its per-thread parked requests. M4.8 stores the robust-list head, walks it at thread exit and ORs `FUTEX_OWNER_DIED` into the owner word before waking the futex queue | group state is shared and reference-counted, the group can be swept, and identity, checkpoint, the static threaded-Rust gate, the M4.8 hardening gate and the M4.9 std::thread gate are evidenced; Go remains out on its larger runtime surface |
+| `futex` | M4.4 lands private `FUTEX_WAIT`/`FUTEX_WAKE`: the kernel copies the observed word and optional timespec, the sidecar owns a group-keyed FIFO queue, and timeout is `ETIMEDOUT`. M4.7 adds private `FUTEX_WAIT_BITSET`/`FUTEX_WAKE_BITSET` with a non-empty match word and an absolute deadline. M4.8 adds private `FUTEX_REQUEUE`/`FUTEX_CMP_REQUEUE`: CMP's expected snapshot is copied by the kernel, FIFO order is preserved, and the moved waiters stay parked with the original timeout | PI, process-shared futexes, signal-interrupted waits and a robust-list owner-exit protocol for non-terminating owners are named follow-ons; the M4.8 exit walk is the terminating-owner case. std::thread's private futexes are evidenced by M4.9; Go remains out |
 | `exit_group` | M4.5 routes 231 to the kernel's TGID sweep (`SYS_SLS_LINUX_GROUP_SWEEP`, 331), which refuses a runnable member with `CAP_EAGAIN`, kills only non-running members, and reports success only after the group's live count and descriptor scan reach zero; the sidecar retries/yields, verifies every record is gone, then wakes each stored clear-tid and releases every group record | the group's address space is released once, on the last detach; `exit(60)` is the single-thread path |
 | `set_tid_address` | stores the user pointer and uses it as the sidecar's tid (`user/sidecar/src/linux.rs`) | a real TID must be a kernel identity, distinct from the clear-child-tid address |
 | Checkpoint record | v2: `ENV_CKPT_MAX_TASKS` is four; the Linux task slot owns the shared pages and `EnvCkptLinuxGroup` names up to eight TIDs, while payload v3 carries one `EnvPayloadThread` per context (`kernel/env_ckpt.h`, `kernel/env_payload.h`) | parked futex waiters are restored with their captured park frame and woken by the sidecar's restored queue; the M4.7 two-boot gate exercised both parked threads and the shared heap/fd |
@@ -449,14 +449,16 @@ required, and a live arm where it is. No increment may claim the next one.
   accepts private `WAIT_BITSET`/`WAKE_BITSET` with a non-empty match word and
   an absolute deadline; the gate itself joins with plain private wake.
   Evidence: `evidence/m4_runtime_gate.log`.
-  **Boundary:** the gate deliberately does not use musl pthread. Rust
-  `std::thread` (and therefore Go, threaded CPython and Node) remains out:
+  **Boundary (updated by M4.9):** the M4.7 gate itself still deliberately
+  uses raw `clone(56)`, but the pthread-creation exclusion it named is gone.
   `pthread_create` reserves the stack with `mmap(PROT_NONE)` and then
-  `mprotect`s the usable range, while M4.7's PROT_NONE contract backs no
-  frames and answers a protection change over an absent page with `ENOMEM`.
-  That is a named runtime-shaped follow-on, not a silent success; the gate is
-  the raw clone/futex/share/checkpoint shape a Go runtime itself uses.
-- **M4.8 — Hardening.** `clone3` (435), robust futex lists
+  `mprotect`s the usable range; M4.9 records that reservation as non-present
+  PTEs and backs only the reserved pages on mprotect, so a default 2 MiB musl
+  pthread stack now works. The raw-clone gate remains the proof for the
+  context/checkpoint shape; the separate `std::thread` gate is the proof that
+  musl's own thread stack path reaches it. Go, threaded CPython and Node
+  remain out on their larger runtime surfaces, not on `pthread_create`.
+- **M4.8 — Hardening.** M4.8 hardening landed 2026-11-15: `clone3` (435), robust futex lists
   (`set_robust_list` 273, `get_robust_list` 274 ENOSYS, and the kernel
   `SYS_SLS_LINUX_ROBUST_EXIT` 333 exit walk), private `FUTEX_REQUEUE` (3)
   and `FUTEX_CMP_REQUEUE` (4), and default-action group-directed `kill`
@@ -477,10 +479,31 @@ required, and a live arm where it is. No increment may claim the next one.
   with no failure marker. Evidence: `evidence/m4_hardening_gate.log`.
   The focused host suites are `tests/m4_hardening_host_test.c` (17 checks),
   `tests/linux_syscall_table_host_test.c` (the 62-row Linux table) and the
-  existing `tests/linux_thread_group_host_test.c`. The runtime wall does not
-  move: musl pthread still reserves its stack with `PROT_NONE` and the
-  second-architecture audit and priority inheritance are not part of this
-  increment.
+  existing `tests/linux_thread_group_host_test.c`. The second-architecture
+  audit and priority inheritance are not part of this increment.
+
+- **M4.9 — The musl pthread/std::thread gate.** `mmap(PROT_NONE)` installs a
+  non-present `USER_PTE_RESERVED` leaf (bit 57) per page and allocates no
+  frame, preserving the measured contract that a reservation consumes no
+  frames. A later `mprotect(PROT_READ|PROT_WRITE)` allocates fresh zero
+  frames only for reservation leaves and installs accessible PTEs; mprotect
+  over genuinely absent pages still answers `ENOMEM`, and a quota failure
+  rolls back only the frames this mprotect allocated. The fixture is
+  `tools/std_thread_gate`, a static musl Rust binary whose
+  `std::thread::spawn` reaches musl `pthread_create`, shares a static
+  `AtomicUsize` and
+  the inherited fd, parks the worker on a private futex and the parent on a
+  timed private futex, and joins after restore.
+  `tests/m4_std_thread_probe_check.sh` checkpoints after both waiters park,
+  boots a second time, and
+  requires `STD-THREAD-PASS`, `STD-JOIN-OK`, `STD-SHARED=7`, no
+  `STD-THREAD-FAIL` and no `[FAULT]`. Evidence:
+  `evidence/m4_std_thread_gate.log`. The checkpoint band is now 16 MiB /
+  4,032 pages per slot (the
+  M4.7 capture was 1,835 pages; the default pthread stack adds 513) and the
+  replica band moved with it. Threaded CPython, Node and Go remain out; this
+  increment proves the pthread creation/stack path and the
+  checkpoint/restore of that group, not those runtimes.
 
 ## 6. Verification plan
 

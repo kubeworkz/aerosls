@@ -913,6 +913,15 @@ uint32_t proc_create_linux_thread_restore(struct ProcessDescriptor *parent,
     pd->personality  = PROC_PERSONALITY_LINUX;
     pd->state        = PROC_HELD;
     pd->restore_held = 1;
+    /* The ledger belongs to the shared address space. The payload pour
+     * overwrites each captured task's fields afterwards, but a sibling that
+     * runs before its record is applied must not see a zero span. */
+    pd->linux_heap_base  = parent->linux_heap_base;
+    pd->linux_heap_limit = parent->linux_heap_limit;
+    pd->linux_brk_cur    = parent->linux_brk_cur;
+    pd->linux_mmap_top   = parent->linux_mmap_top;
+    pd->linux_image_lo   = parent->linux_image_lo;
+    pd->linux_image_hi   = parent->linux_image_hi;
     pd->linux_tid    = tid ? tid : pd->pid;
     pd->linux_is_thread = 1;
     uint32_t n = 0;

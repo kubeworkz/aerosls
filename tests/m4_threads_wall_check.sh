@@ -5,8 +5,9 @@
 # and every other threaded runtime need `clone`, `futex`, a shared address
 # space and a thread group. The tree has M4.1's group object and refcount,
 # M4.2's clone/thread-create path, M4.3's shared group/thread state,
-# M4.4's group-keyed futex queue and M4.5's real identity/exit sweep, but no
-# thread-aware checkpoint or live runtime gate. This guard has four jobs:
+# M4.4's group-keyed futex queue, M4.5's real identity/exit sweep,
+# M4.6's thread-aware checkpoint, M4.7's static threaded-Rust gate, M4.8's
+# hardening and M4.9's real std::thread gate. This guard has four jobs:
 #
 #   1. While all three mechanisms are absent, the design/roadmap surfaces
 #      must keep Go and the threaded runtimes OUT.
@@ -75,6 +76,7 @@ ok "A. every file this guard reads exists"
 if grep -qE '^Status: M4\.[0-9]+ landed; M4\.[0-9]+ .*runtime wall in force\.$' "$DOC" ||
    grep -qE '^Status: M4\.7 gate landed for the static threaded-Rust gate shape; std pthread and Go runtime remain out\.$' "$DOC" ||
    grep -qE '^Status: M4\.8 hardening landed for clone3, robust futex lists, futex requeue and group-directed signals; std pthread and Go runtime remain out\.$' "$DOC" ||
+   grep -qE '^Status: M4\.9 std::thread gate landed for musl pthread_create; Go, threaded CPython and Node remain out\.$' "$DOC" ||
    grep -qE '^Status: M4\.7 gate landed; runtime wall lifted\.$' "$DOC"; then
     ok "B1. the design status names the landed increment and the correct wall posture"
 else
@@ -83,6 +85,7 @@ fi
 
 if grep -qF 'Go, threaded Rust, threaded CPython, Node, and every other threaded runtime remain out' "$DOC" ||
    grep -qF 'The static threaded-Rust gate is evidenced; std pthread and Go runtime remain out' "$DOC" ||
+   grep -qF 'The static threaded-Rust gate and a real' "$DOC" ||
    grep -qF 'Go and every threaded runtime are supported' "$DOC"; then
     ok "B2. the design states the runtime posture (wall, or full gate with evidence)"
 else
@@ -123,7 +126,7 @@ for pair in \
 done
 
 # ─── E. The increment plan cannot skip the gate ──────────────────────────
-for n in 0 1 2 3 4 5 6 7 8; do
+for n in 0 1 2 3 4 5 6 7 8 9; do
     if grep -qE "M4\.$n — " "$DOC"; then
         ok "E$n. M4.$n is planned"
     else
@@ -167,6 +170,7 @@ support=$((clone + futex + group))
 # It must be a real file with every positive marker and no failure marker.
 M4_EVIDENCE="${M4_EVIDENCE:-evidence/m4_runtime_gate.log}"
 M48_EVIDENCE="${M48_EVIDENCE:-evidence/m4_hardening_gate.log}"
+M49_EVIDENCE="${M49_EVIDENCE:-evidence/m4_std_thread_gate.log}"
 gate_ok=0
 if [ -s "$M4_EVIDENCE" ] &&
    grep -q 'M4-GO-OK' "$M4_EVIDENCE" &&
@@ -186,6 +190,18 @@ if [ -s "$M48_EVIDENCE" ] &&
    grep -q 'M4-HARDENING-PASS' "$M48_EVIDENCE" &&
    ! grep -q 'M4-HARDENING-FAIL' "$M48_EVIDENCE"; then
     m48_ok=1
+fi
+
+m49_ok=0
+if [ -s "$M49_EVIDENCE" ] &&
+   grep -q 'STD-THREAD-START' "$M49_EVIDENCE" &&
+   grep -q 'STD-WORKER-FD-OK' "$M49_EVIDENCE" &&
+   grep -q 'STD-SHARED=7' "$M49_EVIDENCE" &&
+   grep -q 'STD-JOIN-OK' "$M49_EVIDENCE" &&
+   grep -q 'STD-THREAD-PASS' "$M49_EVIDENCE" &&
+   ! grep -q 'STD-THREAD-FAIL' "$M49_EVIDENCE" &&
+   ! grep -q '\[FAULT\]' "$M49_EVIDENCE"; then
+    m49_ok=1
 fi
 
 if [ "$support" -eq 0 ]; then
@@ -373,6 +389,14 @@ if [ "$m48" -eq 1 ] && [ "$m48_ok" -eq 1 ] &&
     ok "I1. M4.8's clone3/robust/requeue/group-signal surface and its live hardening evidence are present"
 else
     bad "I1. M4.8 is documented but the source surface or evidence/m4_hardening_gate.log is missing a required marker (m48=$m48 evidence=$m48_ok)"
+fi
+
+if [ "$m49_ok" -eq 1 ] &&
+   grep -q 'M4\.9 std::thread gate landed' "$DOC" &&
+   grep -q 'STD-THREAD-PASS' "$M49_EVIDENCE"; then
+    ok "I2. M4.9's std::thread checkpoint/restore evidence is present and the design records the gate"
+else
+    bad "I2. M4.9's std::thread gate evidence is missing a required marker, a fault, or the design's landing line (evidence=$m49_ok)"
 fi
 
 echo

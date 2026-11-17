@@ -137,22 +137,43 @@ int linux_thread_clone_context(struct ProcessDescriptor *child,
     child->owner_uid   = parent->owner_uid;
     child->partition_id = parent->partition_id;
     child->personality = PROC_PERSONALITY_LINUX;
+    /* The memory ledger is address-space state, not per-task state: a new
+     * thread must start from the parent's current heap span, break and mmap
+     * cursor or its first mmap is checked against a zero span (the std::
+     * thread Rust runtime's alternate-signal-stack mmap, observed as E7's
+     * "neither the grant nor the refusal" reply). */
+    child->linux_heap_base  = parent->linux_heap_base;
+    child->linux_heap_limit = parent->linux_heap_limit;
+    child->linux_brk_cur    = parent->linux_brk_cur;
+    child->linux_mmap_top   = parent->linux_mmap_top;
+    child->linux_image_lo   = parent->linux_image_lo;
+    child->linux_image_hi   = parent->linux_image_hi;
     child->linux_clear_child_tid =
         (flags & LINUX_CLONE_CHILD_CLEARTID) ? ctid : 0;
     child->linux_is_thread = 0;   /* attach() stamps the group membership */
 
     /* The child's first instruction is the one after the parent's clone. The
-     * register set is Linux's: rax is the child's zero return, the caller's
-     * callee-saved values survive the syscall, and the caller-saved argument
-     * registers are left as the trap captured them. RFLAGS is the normal
-     * user word rather than the parked value's IOPL-adjacent bits. */
+     * whole register set comes from the parent's SYSCALL-ENTRY capture, not
+     * its ring3_ctx: musl's __clone passes the start routine in r9 and the
+     * argument word on the child stack, and both must survive the clone.
+     * (The earlier callee-saved-only copy left r9 as whatever the parent's
+     * last resumed frame held — on a std::thread that was zero, so the child
+     * reached `call *%r9` with RIP 0.) Linux clears rax for the child, leaves
+     * the return RIP in rcx and RFLAGS in r11, and keeps every other GPR. */
+    const struct CapParkCtx *p = &parent->park_ctx;
     child->ring3_ctx = parent->ring3_ctx;
-    child->ring3_ctx.r15 = parent->park_ctx.r15;
-    child->ring3_ctx.r14 = parent->park_ctx.r14;
-    child->ring3_ctx.r13 = parent->park_ctx.r13;
-    child->ring3_ctx.r12 = parent->park_ctx.r12;
-    child->ring3_ctx.rbx = parent->park_ctx.rbx;
-    child->ring3_ctx.rbp = parent->park_ctx.rbp;
+    child->ring3_ctx.r15 = p->r15;
+    child->ring3_ctx.r14 = p->r14;
+    child->ring3_ctx.r13 = p->r13;
+    child->ring3_ctx.r12 = p->r12;
+    child->ring3_ctx.rbx = p->rbx;
+    child->ring3_ctx.rbp = p->rbp;
+    child->ring3_ctx.rdi = p->linux_args[0];
+    child->ring3_ctx.rsi = p->linux_args[1];
+    child->ring3_ctx.rdx = p->linux_args[2];
+    child->ring3_ctx.r10 = p->linux_args[3];
+    child->ring3_ctx.r8  = p->linux_args[4];
+    child->ring3_ctx.r9  = p->linux_args[5];
     child->ring3_ctx.rcx = rip;       /* Linux leaves the return RIP in rcx */
     child->ring3_ctx.r11 = 0x202;     /* and the user RFLAGS in r11 */
     child->ring3_ctx.rax = 0;         /* clone's child return value */

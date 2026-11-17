@@ -67,16 +67,17 @@ __attribute__((weak)) int env_replica_push(const struct EnvCkptRecord* rec) {
 #define EP_IMAGE_VBASE   0x400000000000ULL
 #define EP_IMAGE_WINDOW  0x40000000ULL      /* 1 GiB — image, guard page, stack; nothing else maps here */
 
-#define EP_MAX_PAGES     2048u
+#define EP_MAX_PAGES     4032u
 /* The index zone's frame ceiling. Six frames was the sidecar-only shape;
  * E7 increment 20's live gate capture measured 31,012 index bytes — three
  * tasks (the Linux tenant's EnvPayloadTask is 408 bytes), ~1,845 page
  * entries at 16 bytes and the console — so six frames refused an
- * environment that fits the band. Sixteen frames keeps the ceiling above
- * the slot's own limit: a 16-frame index leaves 2,031 data pages in an
- * 8 MiB slot, and the slot check below refuses a larger capture by name
- * before the index can grow past this buffer. */
-#define EP_STAGE_BYTES   (4096u * 16u)
+ * environment that fits the band. M4.9's default musl pthread stack adds
+ * 513 present pages, so the band and this index grew together: a 32-frame
+ * index leaves 4,032 data pages in a 16 MiB slot, and the slot check below
+ * refuses a larger capture by name before the index can grow past this
+ * buffer. */
+#define EP_STAGE_BYTES   (4096u * 32u)
 #define EP_MAX_TASKS     4u
 /* EP_WAIT_TICKS / EP_WAIT_CEIL_TICKS live in env_payload.h: the wait's two
  * bounds are part of its contract now, and the host test asserts WHICH of the
@@ -918,6 +919,21 @@ uint32_t env_payload_capture_all(void) {
                 (unsigned)rec->index,
                 overflow ? "more pages than the blob ceiling" : "nothing mapped",
                 (unsigned)n_pages);
+            for (uint32_t t = 0; t < np; t++) {
+                kernel_serial_printf(
+                    "[ENV_PAYLOAD]   task=%u '%s' kind=%u pages=%u "
+                    "image=0x%llx..0x%llx heap=0x%llx..0x%llx "
+                    "stack=0x%llx..0x%llx\n",
+                    (unsigned)t, rec->tasks[t].name,
+                    (unsigned)rec->tasks[t].kind,
+                    (unsigned)task_npages[t],
+                    (unsigned long long)pds[t]->linux_image_lo,
+                    (unsigned long long)pds[t]->linux_image_hi,
+                    (unsigned long long)pds[t]->linux_heap_base,
+                    (unsigned long long)pds[t]->linux_heap_limit,
+                    (unsigned long long)rec->tasks[t].stack_bottom,
+                    (unsigned long long)rec->tasks[t].stack_top);
+            }
             continue;
         }
 

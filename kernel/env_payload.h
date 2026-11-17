@@ -127,13 +127,15 @@ struct EnvCkptRecord;
  * index, exactly like P1b's extent slot == its directory slot. */
 #define ENV_PAYLOAD_MAX         8u
 
-/* The band: 16 384 sectors (8 MiB) per slot, starting where P1b's extent
- * band ends (1 114 112 + 16 384 = 1 130 496), ending at 1 261 568 — well
- * under ROWSTORE_LBA_BASE 2 000 000. 8 MiB is the itemised payload (three
- * 1 MiB regions + two images + two 64 KiB stacks) with headroom; a blob
+/* The band: 32 768 sectors (16 MiB) per slot, starting where P1b's extent
+ * band ends (1 114 112 + 16 384 = 1 130 496), ending at 1 392 640 — still
+ * clear of the replica band and ROWSTORE_LBA_BASE 2 000 000. M4.9 raised
+ * the slot from 8 MiB because a default musl pthread stack backs 513
+ * present pages (2 MiB) after its PROT_NONE reservation is mprotected; the
+ * old 8 MiB band left only 213 pages over M4.7's 1,835-page capture. A blob
  * that does not fit its slot is refused by name (EP_REFUSE_TOO_BIG), never
  * truncated. */
-#define ENV_PAYLOAD_SLOT_SECTORS 16384ULL
+#define ENV_PAYLOAD_SLOT_SECTORS 32768ULL
 #define ENV_PAYLOAD_DATA_LBA_BASE 1130496ULL
 #define ENV_PAYLOAD_SLOT_LBA(slot) \
     (ENV_PAYLOAD_DATA_LBA_BASE + ((uint64_t)(slot) * ENV_PAYLOAD_SLOT_SECTORS))

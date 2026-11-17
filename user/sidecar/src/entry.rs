@@ -600,26 +600,38 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         // crosses the real nine-entry command line; the system POSIX keeps
         // v1's `argv = { name }` measurement. Like the pair above: logged,
         // never fatal.
-        #[cfg(feature = "m4_hardening_probe")]
+        #[cfg(feature = "m4_std_thread_probe")]
+        let firstuser = if gate {
+            crate::m4_std_thread_probe::spawn(&RealKernel, caps.budget_base, caps.budget_len)
+        } else {
+            crate::e7_firstuser::spawn(&RealKernel, caps.budget_base, caps.budget_len)
+        };
+        #[cfg(all(not(feature = "m4_std_thread_probe"),
+                  feature = "m4_hardening_probe"))]
         let firstuser = if gate {
             crate::m4_hardening_probe::spawn(&RealKernel, caps.budget_base, caps.budget_len)
         } else {
             crate::e7_firstuser::spawn(&RealKernel, caps.budget_base, caps.budget_len)
         };
-        #[cfg(all(not(feature = "m4_hardening_probe"), feature = "m4_runtime_probe"))]
+        #[cfg(all(not(any(feature = "m4_std_thread_probe",
+                          feature = "m4_hardening_probe")),
+                  feature = "m4_runtime_probe"))]
         let firstuser = if gate {
             crate::m4_runtime_probe::spawn(&RealKernel, caps.budget_base, caps.budget_len)
         } else {
             crate::e7_firstuser::spawn(&RealKernel, caps.budget_base, caps.budget_len)
         };
-        #[cfg(all(not(any(feature = "m4_hardening_probe", feature = "m4_runtime_probe")),
+        #[cfg(all(not(any(feature = "m4_std_thread_probe",
+                          feature = "m4_hardening_probe",
+                          feature = "m4_runtime_probe")),
                   feature = "m4_ckpt_probe"))]
         let firstuser = if gate {
             crate::m4_ckpt_probe::spawn(&RealKernel, caps.budget_base, caps.budget_len)
         } else {
             crate::e7_firstuser::spawn(&RealKernel, caps.budget_base, caps.budget_len)
         };
-        #[cfg(not(any(feature = "m4_hardening_probe", feature = "m4_runtime_probe",
+        #[cfg(not(any(feature = "m4_std_thread_probe",
+                      feature = "m4_hardening_probe", feature = "m4_runtime_probe",
                       feature = "m4_ckpt_probe")))]
         let firstuser = if gate {
             match crate::e7_firstuser::stage_gate(&mut booted.proc.vfs, 0) {

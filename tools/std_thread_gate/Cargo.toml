@@ -1,0 +1,12 @@
+[package]
+name = "std_thread_gate"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "M4.9 live gate: real std::thread across checkpoint/restore"
+
+[[bin]]
+name = "std_thread_gate"
+path = "src/main.rs"
+
+[dependencies]
