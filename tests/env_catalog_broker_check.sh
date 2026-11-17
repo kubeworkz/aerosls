@@ -29,7 +29,8 @@
 #   W1. the Makefile compiles kernel/env_catalog.c into the kernel;
 #   W2. cap_create_sidecar() REACHES the registration — the two-hop chain
 #       (cap_create_sidecar -> cap_create_sidecar_in ->
-#       cap_create_sidecar_in_personality) and the register call itself;
+#       cap_create_sidecar_in_personality) and the owner-bound register call
+#       itself (M5.0: pd->owner_uid, never the inherited boot uid);
 #   W3. the arm is gated on the KERNEL-owned name: after the "kernel."
 #       branch opens, before the tenant-resolvable registry fallback, and
 #       the service answers under that same name in its refusals;
@@ -191,8 +192,10 @@ has "$CAP" 'return cap_create_sidecar_in(parent_pid, manifest, manifest_len,' ||
     bad "W2. cap.c: cap_create_sidecar() no longer delegates to cap_create_sidecar_in() — the chain to the registration is broken"
 has "$CAP" 'return cap_create_sidecar_in_personality(parent_pid, manifest, manifest_len,' ||
     bad "W2. cap.c: cap_create_sidecar_in() no longer calls cap_create_sidecar_in_personality(), the function the arm lives in"
-has "$CAP" 'env_catalog_service_register(k_rd, k_wr,' ||
+has "$CAP" 'env_catalog_service_register_owned(k_rd, k_wr,' ||
     bad "W2. cap.c: the catalog arm no longer registers the channel with the service — an unreachable service no environment could use"
+has "$CAP" 'pd->owner_uid)) {' ||
+    bad "W2. cap.c: the catalog arm no longer binds the environment owner — CAT_QUERY would fall back to the inherited process uid"
 clause "$c2" W2 "cap_create_sidecar() reaches the registration, hop by hop"
 
 # ── W3. the arm is gated on the kernel-owned name ────────────────────────

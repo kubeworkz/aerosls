@@ -6,7 +6,7 @@
 //! magic/version/type frame — the payload of a channel MSG envelope — followed
 //! by a per-opcode body.
 //!
-//! A request carries `ENV_CREATE { partition, index }` or
+//! A request carries `ENV_CREATE { partition, index, owner_uid }` or
 //! `ENV_DESTROY { env_id, partition }`; the reply echoes the frame type and a
 //! uniform `{ status, env_id, partition }` body (env_id meaningful only on an
 //! `ENV_OK` create). The C control plane mirrors these constants (E4 part 3).
@@ -100,22 +100,26 @@ impl EnvFrame {
     }
 }
 
-/// `ENV_CREATE` request body: `{ partition u32, index u32 }` (8 bytes). `index`
-/// is the environment's identity within its partition — the sidecar names
-/// `drv.ramdisk.<index>` / `aerosls.posix.<index>` derive from it, and a
-/// human-readable name maps to an index at the control plane.
-pub fn encode_create_body(partition: u32, index: u32) -> [u8; 8] {
-    let mut b = [0u8; 8];
+/// `ENV_CREATE` request body: `{ partition u32, index u32, owner_uid u32 }`
+/// (12 bytes). `index` is the environment's identity within its partition —
+/// the sidecar names `drv.ramdisk.<index>` / `aerosls.posix.<index>` derive
+/// from it, and a human-readable name maps to an index at the control plane.
+/// `owner_uid` is the authenticated identity the kernel resolved from its
+/// session or bearer token; a zero preserves the pre-M5 inheritance rule for
+/// boot-internal creates.
+pub fn encode_create_body(partition: u32, index: u32, owner_uid: u32) -> [u8; 12] {
+    let mut b = [0u8; 12];
     put_u32(&mut b, 0, partition);
     put_u32(&mut b, 4, index);
+    put_u32(&mut b, 8, owner_uid);
     b
 }
 
-pub fn parse_create_body(p: &[u8]) -> Option<(u32, u32)> {
-    if p.len() < 8 {
+pub fn parse_create_body(p: &[u8]) -> Option<(u32, u32, u32)> {
+    if p.len() < 12 {
         return None;
     }
-    Some((read_u32(p, 0), read_u32(p, 4)))
+    Some((read_u32(p, 0), read_u32(p, 4), read_u32(p, 8)))
 }
 
 /// `ENV_DESTROY` request body: `{ env_id u32, partition u32 }` (8 bytes).
@@ -208,9 +212,14 @@ pub const REG_OFF_N_TASKS: usize = REG_OFF_CHANS + REGISTER_MAX_CHANS * 4;
 pub const REG_OFF_TASK_NAMES: usize = REG_OFF_N_TASKS + 4;
 pub const REG_OFF_TASK_KINDS: usize =
     REG_OFF_TASK_NAMES + REGISTER_MAX_TASKS * REGISTER_NAME_LEN;
+pub const REG_OFF_OWNER_UID: usize = REG_OFF_TASK_KINDS + REGISTER_MAX_TASKS * 4;
+/// Tail padding kept explicit so the wire body and the C struct agree on a
+/// size that is a multiple of 8 (the alignment `regions[].base` requires).
+pub const REG_OFF_RESERVED: usize = REG_OFF_OWNER_UID + 4;
 
-/// The reply body's length. 16 + 3*16 + 4 + 4*4 + 4 + 4*24 + 4*4 = 200.
-pub const REGISTER_REPLY_BODY_SIZE: usize = REG_OFF_TASK_KINDS + REGISTER_MAX_TASKS * 4;
+/// The reply body's length.
+/// 16 + 3*16 + 4 + 4*4 + 4 + 4*24 + 4*4 + 4 + 4 = 208.
+pub const REGISTER_REPLY_BODY_SIZE: usize = REG_OFF_RESERVED + 4;
 
 /// The largest reply the kernel's `env_service` will accept (frame + the widest
 /// body). init's dispatch loop sizes its reply buffer with this.
@@ -247,6 +256,11 @@ pub struct RegisterReply {
     pub n_tasks: u32,
     pub task_names: [[u8; REGISTER_NAME_LEN]; REGISTER_MAX_TASKS],
     pub task_kinds: [u32; REGISTER_MAX_TASKS],
+    /// M5.0: the authenticated owner uid, carried into the checkpoint record
+    /// so a restore rebuilds the environment with the same catalog identity.
+    pub owner_uid: u32,
+    /// Explicit tail padding (see `REG_OFF_RESERVED`); always 0.
+    pub _reserved: u32,
 }
 
 impl RegisterReply {
@@ -264,6 +278,8 @@ impl RegisterReply {
             n_tasks: 0,
             task_names: [[0u8; REGISTER_NAME_LEN]; REGISTER_MAX_TASKS],
             task_kinds: [0; REGISTER_MAX_TASKS],
+            owner_uid: 0,
+            _reserved: 0,
         }
     }
 
@@ -313,6 +329,8 @@ impl RegisterReply {
         for i in 0..REGISTER_MAX_TASKS {
             put_u32(&mut b, REG_OFF_TASK_KINDS + i * 4, self.task_kinds[i]);
         }
+        put_u32(&mut b, REG_OFF_OWNER_UID, self.owner_uid);
+        put_u32(&mut b, REG_OFF_RESERVED, 0);
         b
     }
 }
@@ -373,7 +391,8 @@ mod tests {
 
     #[test]
     fn bodies_round_trip() {
-        assert_eq!(parse_create_body(&encode_create_body(7, 3)), Some((7, 3)));
+        assert_eq!(parse_create_body(&encode_create_body(7, 3, 1001)), Some((7, 3, 1001)));
+        assert_eq!(parse_create_body(&encode_create_body(7, 3, 1001)[..8]), None);
         assert_eq!(parse_destroy_body(&encode_destroy_body(42, 7)), Some((42, 7)));
         assert_eq!(parse_reply_body(&encode_reply_body(ENV_OK, 9, 7)), Some((ENV_OK, 9, 7)));
     }
@@ -398,9 +417,9 @@ mod tests {
     fn register_reply_struct_is_the_wire_layout() {
         use core::mem::size_of;
         assert_eq!(size_of::<RegisterRegion>(), 16);
-        assert_eq!(REGISTER_REPLY_BODY_SIZE, 200);
+        assert_eq!(REGISTER_REPLY_BODY_SIZE, 208);
         assert_eq!(size_of::<RegisterReply>(), REGISTER_REPLY_BODY_SIZE);
-        assert_eq!(REPLY_MAX, 216);
+        assert_eq!(REPLY_MAX, 224);
     }
 
     #[test]
@@ -423,6 +442,7 @@ mod tests {
         r.chans = [11, 12, 13, 14];
         r.set_task(0, "drv.ramdisk.3", TASK_RAMDISK_SIDECAR);
         r.set_task(1, "aerosls.posix.3", TASK_POSIX_SIDECAR);
+        r.owner_uid = 1001;
         let b = r.encode();
 
         assert_eq!(read_u32(&b, REG_OFF_PARTITION), 6);
@@ -444,6 +464,7 @@ mod tests {
         assert_eq!(&b[REG_OFF_TASK_NAMES + 24..REG_OFF_TASK_NAMES + 39], b"aerosls.posix.3");
         assert_eq!(read_u32(&b, REG_OFF_TASK_KINDS), TASK_RAMDISK_SIDECAR);
         assert_eq!(read_u32(&b, REG_OFF_TASK_KINDS + 4), TASK_POSIX_SIDECAR);
+        assert_eq!(read_u32(&b, REG_OFF_OWNER_UID), 1001);
     }
 
     /// A name with no room for a terminator is truncated to fit, never allowed

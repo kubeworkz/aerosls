@@ -3094,7 +3094,8 @@ static int api_partition_create_post(const char* body, char* buf, int max, SLSRo
 // reading the console and a client reading JSON are told the same thing.
 
 static int api_partition_env_create_post(const char* body, char* buf, int max,
-                                         SLSRole req_role, uint32_t partition) {
+                                         SLSRole req_role, uint32_t req_uid,
+                                         uint32_t partition) {
     JSONBuf j = { buf, 0, max };
     if (req_role > ROLE_DB_ADMIN) {
         jb_obj_open(&j,0); jb_str(&j,"ok","false"); jb_putc(&j,',');
@@ -3120,7 +3121,10 @@ static int api_partition_env_create_post(const char* body, char* buf, int max,
      * boot replay (kernel/env_service.c) deliberately do not — the first is
      * already covered by its staging slot, the second has no cluster yet. */
     env_migrate_intent_begin();
-    int rc = env_service_create(partition, index, &status, &env_id);
+    /* M5.0: bind the environment to the AUTHENTICATED caller, not the boot
+     * uid the sidecar would otherwise inherit. req_uid is resolved from the
+     * request's session/token by the HTTP layer before dispatch. */
+    int rc = env_service_create(partition, index, req_uid, &status, &env_id);
     /* The create RPC returned — success or refusal, the blocking phase is
      * over. Release the intent so every peer's latch ends NOW instead of at
      * the budget's end: an unreleased announce leaves a blind spot exactly
@@ -6691,7 +6695,7 @@ static void http_route(int conn, char* req) {
             while (*p >= '0' && *p <= '9') { pid = pid * 10u + (uint32_t)(*p - '0'); p++; }
             if (p != rest && !strcmp(p, "/env")) {
                 blen = api_partition_env_create_post(body_ptr, resp_body,
-                            (int)sizeof(resp_body), req_role, pid);
+                            (int)sizeof(resp_body), req_role, req_uid, pid);
                 http_respond(conn, 200, "application/json", resp_body, blen); return;
             }
             if (p != rest && !strcmp(p, "/env/destroy")) {

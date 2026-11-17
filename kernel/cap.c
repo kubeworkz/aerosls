@@ -64,6 +64,7 @@
 #include "linux_threads.h"   // M4.1: one group per Linux address space, with cr3 refs
 #include "net_socket_service.h"  // POSIX-Environments P2 first increment
 #include "env_catalog.h"        // POSIX-Environments §9 interop surface
+#include "partition.h"           // M5.0: owner-uid -> partition binding
 #include "../arch/x86/user_paging.h"
 #include <stddef.h>
 
@@ -3522,11 +3523,11 @@ int cap_linux_restore_thread(struct CapLinuxRestoreThread* req) {
     return 0;
 }
 
-int cap_create_sidecar_in_personality(uint32_t parent_pid,
+static int cap_create_sidecar_in_personality_owned(uint32_t parent_pid,
                           const void* manifest, uint32_t manifest_len,
                           uint16_t parent_ch_w, uint16_t console_ch_w,
                           uint16_t* out_ch_r, uint32_t target_partition,
-                          uint32_t personality) {
+                          uint32_t personality, uint32_t owner_uid) {
     if (out_ch_r) *out_ch_r = CAP_NONE;
     (void)console_ch_w;  /* reserved: parent sends console cap via messenger */
     if (!manifest || manifest_len < SIDECAR_MANIFEST_HEADER_LEN)
@@ -4297,7 +4298,7 @@ int cap_create_sidecar_in_personality(uint32_t parent_pid,
             pd->linux_stack_poison = (uint32_t)poison_bytes;
         }
     }
-    pd->owner_uid  = parent->owner_uid;
+    pd->owner_uid  = owner_uid ? owner_uid : parent->owner_uid;
     pd->parent_pid = parent_pid;
     pd->partition_id = child_partition;
     pd->sidecar_authority = 1;    /* E2: children of the creator tree are
@@ -4504,9 +4505,10 @@ int cap_create_sidecar_in_personality(uint32_t parent_pid,
                  * a field the wire carries. See env_catalog.h for what the
                  * surface exposes and what it deliberately refuses. */
                 if (sidecar_prefix(sc->peer_name, "kernel.env.catalog")) {
-                    if (!env_catalog_service_register(k_rd, k_wr,
-                                                      pd->partition_id,
-                                                      pd->pid, pd->name)) {
+                    if (!env_catalog_service_register_owned(k_rd, k_wr,
+                                                            pd->partition_id,
+                                                            pd->pid, pd->name,
+                                                            pd->owner_uid)) {
                         kernel_serial_printf(
                             "[SIDECAR] PID %u '%s': catalog service peer '%s' "
                             "left unregistered (registry full)\n",
@@ -4977,6 +4979,29 @@ int cap_create_sidecar_in_personality(uint32_t parent_pid,
     return 0;
 }
 
+/* Compatibility wrapper: every pre-M5 caller keeps the inherited owner. */
+int cap_create_sidecar_in_personality(uint32_t parent_pid,
+                          const void* manifest, uint32_t manifest_len,
+                          uint16_t parent_ch_w, uint16_t console_ch_w,
+                          uint16_t* out_ch_r, uint32_t target_partition,
+                          uint32_t personality) {
+    return cap_create_sidecar_in_personality_owned(
+        parent_pid, manifest, manifest_len, parent_ch_w, console_ch_w,
+        out_ch_r, target_partition, personality, 0);
+}
+
+/* M5.0: the environment-manager create. A nonzero owner is stamped onto the
+ * child before it is released; zero keeps the inherited owner. */
+int cap_create_sidecar_in_owner(uint32_t parent_pid,
+                                const void* manifest, uint32_t manifest_len,
+                                uint16_t parent_ch_w, uint16_t console_ch_w,
+                                uint16_t* out_ch_r, uint32_t target_partition,
+                                uint32_t owner_uid) {
+    return cap_create_sidecar_in_personality_owned(
+        parent_pid, manifest, manifest_len, parent_ch_w, console_ch_w,
+        out_ch_r, target_partition, PROC_PERSONALITY_SLS, owner_uid);
+}
+
 /* Inherit-only wrapper: create the child in the parent's own partition (the
  * boot tree's behaviour, and every caller before E4's partition-targeted
  * creation). */
@@ -5149,11 +5174,37 @@ int cap_create_sidecar_in(uint32_t parent_pid,
 
 uint64_t sys_sls_create_sidecar(struct SLSCreateSidecarRequest* req) {
     if (!req) return (uint64_t)(int64_t)CAP_EINVAL;
+    /* M5.0: a nonzero owner is an explicit identity binding. Only init (the
+     * PARTITION_SYSTEM tree) may state one, and only for a live target
+     * partition the owner is assigned to. A tenant sidecar cannot forge a uid
+     * here, because it never reaches this branch. */
+    if (req->owner_uid != 0) {
+        struct ProcessDescriptor* caller = sidecar_find_pid(cap_current_pid());
+        if (!caller || caller->partition_id != PARTITION_SYSTEM ||
+            req->target_partition == 0 ||
+            req->target_partition >= PARTITION_MAX ||
+            !partition_exists(req->target_partition) ||
+            partition_get_for_uid(req->owner_uid) != req->target_partition) {
+            kernel_serial_printf(
+                "[SIDECAR] CAP_EPERM: owner uid %u is not bound to target "
+                "partition %u by a PARTITION_SYSTEM caller (pid=%u, part=%u)\n",
+                (unsigned)req->owner_uid, (unsigned)req->target_partition,
+                (unsigned)cap_current_pid(),
+                (unsigned)(caller ? caller->partition_id : 0xFFFFFFFFu));
+            return (uint64_t)(int64_t)CAP_EPERM;
+        }
+    }
     uint16_t ch_r = CAP_NONE;
-    int r = cap_create_sidecar_in(cap_current_pid(),
-                                  req->manifest, req->manifest_len,
-                                  req->ch_w_idx, req->console_w_idx,
-                                  &ch_r, req->target_partition);
+    int r = req->owner_uid ?
+        cap_create_sidecar_in_owner(cap_current_pid(),
+                                    req->manifest, req->manifest_len,
+                                    req->ch_w_idx, req->console_w_idx,
+                                    &ch_r, req->target_partition,
+                                    req->owner_uid) :
+        cap_create_sidecar_in(cap_current_pid(),
+                              req->manifest, req->manifest_len,
+                              req->ch_w_idx, req->console_w_idx,
+                              &ch_r, req->target_partition);
     if (r < 0) return (uint64_t)(int64_t)r;
     req->out_ch_r = ch_r;
     req->out_ch_w = sidecar_find_parent_ch_w(cap_current_pid(), ch_r);

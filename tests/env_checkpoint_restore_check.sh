@@ -623,7 +623,7 @@ fi
 # replays it did not make is the failure this tooth names.
 if [ -n "$drv" ]; then
     missing=""
-    case "$drv" in *"env_service_create(p, idx, &status, &new_id)"*) ;; *) missing="$missing create";; esac
+    case "$drv" in *"env_service_create(p, idx, w.owner_uid, &status, &new_id)"*) ;; *) missing="$missing create";; esac
     case "$drv" in *"env_ckpt_restore_next(&p, &idx, &old_id)"*) ;; *) missing="$missing next";; esac
     case "$drv" in *"env_ckpt_restore_settle(p, idx)"*) ;; *) missing="$missing settle";; esac
     if printf '%s' "$drv" | grep -qF "cap_send_msg(" ; then
@@ -632,7 +632,7 @@ if [ -n "$drv" ]; then
     if [ -n "$missing" ]; then
         bad "T1. env_service_restore_pending() is missing:$missing — a restore must replay a record through the environment manager's existing create (env_service_create), and a driver that speaks the channel itself has grown the second create path v0.2 §2 forbids"
     else
-        cr_line=$(line_of "$drv" "env_service_create(p, idx, &status, &new_id)")
+        cr_line=$(line_of "$drv" "env_service_create(p, idx, w.owner_uid, &status, &new_id)")
         rp_line=$(line_of "$drv" "out->n_replayed++;")
         if [ -z "${cr_line:-}" ] || [ -z "${rp_line:-}" ]; then
             bad "T1. could not locate the driver's create or its replay counter — the guard's own anchors have moved"
@@ -723,7 +723,7 @@ fi
 # ── T3. leak-unpause: the pause is stepped out of, and put back ────────────
 if [ -n "$drv" ]; then
     res_line=$(line_of "$drv" "int can = env_ckpt_restore_resume_for_create(p);")
-    cr_line2=$(line_of "$drv" "env_service_create(p, idx, &status, &new_id)")
+    cr_line2=$(line_of "$drv" "env_service_create(p, idx, w.owner_uid, &status, &new_id)")
     rep_line=$(line_of "$drv" "out->n_repaused  = env_ckpt_restore_repause();")
     loop_line=$(line_of "$drv" "while (env_ckpt_restore_pending() > 0) {")
     if [ -z "${res_line:-}" ] || [ -z "${rep_line:-}" ]; then

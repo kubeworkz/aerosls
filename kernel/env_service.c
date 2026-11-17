@@ -11,6 +11,7 @@
 #include "process.h"   /* E1: kernel_yield_to_ring3 (the unified boot's hand-over) */
 #include "checkpoint_mgr.h"   /* P1a: the checkpoint sequence a registration belongs to */
 #include "env_payload.h"     /* P1a: the payload pour that follows a replay */
+#include "partition.h"       /* M5.0: bind the authenticated owner to its partition */
 #include "failover.h"        /* failover_sweep_keepalive() — the blocked RPC wait keeps the heartbeat stream alive */
 
 extern volatile uint64_t kernel_tick_counter;   /* ~10 ms per tick (net_event.c) */
@@ -223,10 +224,30 @@ static int env_service_rpc(uint16_t ty, const uint8_t* body, uint32_t body_len,
     return 0;
 }
 
-int env_service_create(uint32_t partition, uint32_t index,
+int env_service_create(uint32_t partition, uint32_t index, uint32_t owner_uid,
                        uint16_t* out_status, uint32_t* out_env_id) {
+    /* M5.0: the authenticated owner must resolve to the partition it is
+     * creating in. The assignment is persisted with the partition table, so a
+     * restore after a reboot still satisfies the sidecar create's gate. A zero
+     * owner is a boot-internal create and keeps the pre-M5 inheritance rule. */
+    if (owner_uid != 0 && partition_get_for_uid(owner_uid) != partition) {
+        if (partition_assign_uid(owner_uid, partition) != 0) {
+            if (out_status) *out_status = ENV_ERR_PART;
+            if (out_env_id) *out_env_id = 0;
+            kernel_serial_printf(
+                "[ENV] create partition=%u index=%u refused: owner uid %u "
+                "cannot be assigned to the target partition\n",
+                (unsigned)partition, (unsigned)index, (unsigned)owner_uid);
+            return 0;
+        }
+        kernel_serial_printf(
+            "[ENV] owner uid %u bound to partition %u for env create "
+            "(index %u)\n",
+            (unsigned)owner_uid, (unsigned)partition, (unsigned)index);
+    }
+
     uint8_t body[ENV_CREATE_BODY_SIZE];
-    env_create_body_encode(body, partition, index);
+    env_create_body_encode(body, partition, index, owner_uid);
     int rc = env_service_rpc(ENV_CREATE, body, (uint32_t)sizeof(body),
                              out_status, out_env_id, 0);
     /* POSIX-Environments E6: the environment's POSIX sidecar — and so its
@@ -509,7 +530,7 @@ int env_service_restore_pending(struct EnvSvcRestoreReport* out) {
 
         uint16_t status = ENV_ERR_INVAL;
         uint32_t new_id = 0;
-        int rc = env_service_create(p, idx, &status, &new_id);
+        int rc = env_service_create(p, idx, w.owner_uid, &status, &new_id);
         if (rc != 0) {
             es_release_held_linux(&w);
             if (has_linux) cap_linux_restore_disarm(p);

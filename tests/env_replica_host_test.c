@@ -122,9 +122,9 @@ void service_remote_forget(const char* name, uint32_t node_id) {
  * shared page-numbering arithmetic, is under use) but needed to link the
  * same translation unit the real BEGIN gate lives in. Faithful stand-ins:
  * a parked environment, an empty image tail, and identity answers. */
-int env_service_create(uint32_t partition, uint32_t index,
+int env_service_create(uint32_t partition, uint32_t index, uint32_t owner_uid,
                        uint16_t* out_status, uint32_t* out_env_id) {
-    (void)partition; (void)index;
+    (void)partition; (void)index; (void)owner_uid;
     if (out_status)  *out_status  = ENV_OK;
     if (out_env_id)  *out_env_id  = 1;
     return 0;

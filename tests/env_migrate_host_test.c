@@ -531,9 +531,10 @@ static uint32_t g_create_env_id = 500;
 static int      g_create_calls = 0;
 static struct EnvCkptRecord g_create_record;  /* what "init" registers on a successful create */
 
-int env_service_create(uint32_t partition, uint32_t index,
+int env_service_create(uint32_t partition, uint32_t index, uint32_t owner_uid,
                        uint16_t* out_status, uint32_t* out_env_id) {
     g_create_calls++;
+    (void)owner_uid;
     if (out_status) *out_status = g_create_status;
     if (out_env_id) *out_env_id = g_create_env_id;
     if (g_create_rc != 0) return g_create_rc;

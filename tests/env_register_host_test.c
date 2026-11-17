@@ -98,6 +98,7 @@ static struct EnvCkptRegister good_register(uint32_t partition, uint32_t index,
     r.task_kind[0] = ENV_CKPT_TASK_RAMDISK_SIDECAR;
     memcpy(r.task_name[1], "aerosls.posix.3", 16);
     r.task_kind[1] = ENV_CKPT_TASK_POSIX_SIDECAR;
+    r.owner_uid = 1001;
     return r;
 }
 
@@ -125,11 +126,11 @@ int env_storage_extent_of(uint32_t partition_id, uint32_t index,
 }
 
 int main(void) {
-    /* ── 1. The wire body and the struct are the same 200 bytes ─────────────
+    /* ── 1. The wire body and the struct are the same 208 bytes ─────────────
      * The struct is a padding-free image of the wire layout, which is what
      * makes the Rust encoder's output parseable as this struct at all. */
-    CHECK(ENV_REGISTER_REPLY_BODY_SIZE == 200u,
-          "the ENV_REGISTER reply body is 200 bytes");
+    CHECK(ENV_REGISTER_REPLY_BODY_SIZE == 208u,
+          "the ENV_REGISTER reply body is 208 bytes");
     CHECK(sizeof(struct EnvCkptRegister) == ENV_REGISTER_REPLY_BODY_SIZE,
           "sizeof(struct EnvCkptRegister) equals the wire body size (no padding hole)");
     CHECK((uint32_t)ENV_REG_OFF_TASK_KINDS == 184u &&
@@ -171,6 +172,8 @@ int main(void) {
         CHECK(env_read_u32(b, 184) == ENV_CKPT_TASK_RAMDISK_SIDECAR &&
               env_read_u32(b, 188) == ENV_CKPT_TASK_POSIX_SIDECAR,
               "offsets 184/188: the task kinds sit after every name");
+        CHECK(env_read_u32(b, 200) == 1001u,
+              "offset 200: the environment's authenticated owner");
     }
 
     /* ── 3. Encode → parse round-trips field for field ───────────────────── */

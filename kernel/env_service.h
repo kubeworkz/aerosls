@@ -32,11 +32,16 @@ void env_service_register(uint16_t kernel_chan_r, uint16_t kernel_chan_w,
 int env_service_reply_slot(uint16_t slot);
 
 /* Create an environment with `index` in `partition` by round-tripping
- * ENV_CREATE to init. On a reply, returns 0 and sets *out_status (ENV_OK or an
+ * ENV_CREATE to init. `owner_uid` is the authenticated caller's uid (the HTTP
+ * bearer identity, the shell session identity, or a restored record's owner);
+ * it is assigned to `partition` before the round trip and carried through so
+ * the environment's sidecars and catalog channel bind to it. A zero means a
+ * boot-internal create with no authenticated owner, preserving the pre-M5
+ * inheritance rule. On a reply, returns 0 and sets *out_status (ENV_OK or an
  * ENV_ERR_* from env_proto.h) and, on ENV_OK, *out_env_id. Returns -1 if the
  * channel is not wired or init did not reply before the wait's bound — the
  * quiet window with no manager switch-in, or the absolute ceiling. */
-int env_service_create(uint32_t partition, uint32_t index,
+int env_service_create(uint32_t partition, uint32_t index, uint32_t owner_uid,
                        uint16_t* out_status, uint32_t* out_env_id);
 
 /* End the environment `env_id` known to live in `partition` by round-tripping

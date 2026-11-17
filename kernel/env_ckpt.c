@@ -262,6 +262,7 @@ int env_ckpt_register_from(const struct EnvCkptRegister* reg,
     rec.partition_id = reg->partition_id;
     rec.index        = reg->index;
     rec.env_id       = reg->env_id;
+    rec.owner_uid    = reg->owner_uid;
     rec.n_regions    = reg->n_regions;
     for (uint32_t i = 0; i < reg->n_regions; i++) rec.regions[i] = reg->regions[i];
     rec.n_chans      = reg->n_chans;

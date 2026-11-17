@@ -898,7 +898,11 @@ int env_migrate_restore(uint32_t partition_id, uint32_t index) {
 
     uint16_t status = ENV_ERR_INVAL;
     uint32_t new_id = 0;
-    int rc = env_service_create(partition_id, index, &status, &new_id);
+    /* M5.0: the owner travels WITH the checkpoint record. A restore that
+     * created the environment under the destination's boot uid would hand a
+     * tenant's live state to the wrong identity. */
+    int rc = env_service_create(partition_id, index, staged.owner_uid,
+                                &status, &new_id);
     if (rc != 0 || status != ENV_OK) {
         env_ckpt_restore_refuse(partition_id, index, ENV_CKPT_REFUSE_CREATE,
                                 index, (rc != 0) ? 0u : (uint32_t)status);

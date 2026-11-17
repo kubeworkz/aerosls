@@ -380,6 +380,15 @@ int env_console_bind_env(uint32_t partition, uint32_t index, uint32_t env_id) {
     return 0;
 }
 
+/* M5.0: env_service_create() binds a nonzero owner to its target partition
+ * before the round trip. Every create in this test passes 0 (the boot-internal
+ * inheritance rule), so these are link-only stand-ins. */
+uint32_t partition_get_for_uid(uint32_t uid) { (void)uid; return 0; }
+int partition_assign_uid(uint32_t uid, uint32_t partition) {
+    (void)uid; (void)partition;
+    return 0;
+}
+
 /* E7 increment 21: the replay's create holds a Linux child while it runs. No
  * fake record in this test names a Linux task, so the hold's three ends are
  * inert here — the wait's read of the manager's pid is the subject, not the
@@ -461,7 +470,7 @@ int main(void) {
 
     /* 1. an unregistered service cannot round-trip anything. */
     reset_manager(MANAGER_ALIVE);
-    CHECK(env_service_create(1, 0, &status, &env_id) == -1 && g_sends == 0,
+    CHECK(env_service_create(1, 0, 0, &status, &env_id) == -1 && g_sends == 0,
           "an unregistered env service is refused without sending a request");
 
     env_service_register((uint16_t)ENV_K_RD, (uint16_t)ENV_K_WR, ENV_MGR_PID);
@@ -476,7 +485,7 @@ int main(void) {
     /* 3-6. THE DISCRIMINATOR: a manager that only runs when the control plane
      *      yields still answers, inside the old bound. */
     reset_manager(MANAGER_ALIVE);
-    int rc = env_service_create(7, 3, &status, &env_id);
+    int rc = env_service_create(7, 3, 0, &status, &env_id);
     CHECK(rc == 0 && status == ENV_OK && env_id == ENV_ENV_ID,
           "a manager that only progresses on a yield still answers (rc 0, ENV_OK)");
     CHECK(g_yields >= 1,
@@ -503,7 +512,7 @@ int main(void) {
     reset_manager(MANAGER_ALIVE);
     g_answer_after_yields = SLOW_ANSWER_AFTER;
     status = 0xFFFF; env_id = 0;
-    rc = env_service_create(1, 0, &status, &env_id);
+    rc = env_service_create(1, 0, 0, &status, &env_id);
     CHECK(rc == 0 && status == ENV_OK && env_id == ENV_ENV_ID,
           "a slow create answers: the manager was still being scheduled when the "
           "old fixed bound expired");
@@ -516,7 +525,7 @@ int main(void) {
     /* 7c. A manager that stops being scheduled is still bounded, tick for
      *     tick, by the quiet window -- and the wait keeps yielding. */
     reset_manager(MANAGER_DEAD);
-    CHECK(env_service_create(1, 0, &status, &env_id) == -1,
+    CHECK(env_service_create(1, 0, 0, &status, &env_id) == -1,
           "a dead env manager cannot hang the HTTP server: the quiet window still bounds it");
     CHECK(kernel_tick_counter == ENV_RPC_STALL_TICKS,
           "the bounded wait ran exactly ENV_RPC_STALL_TICKS ticks of quiet");
@@ -529,7 +538,7 @@ int main(void) {
     /* 7d. A manager that keeps running but never answers is bounded by the
      *     absolute ceiling: progress alone must not hold the server forever. */
     reset_manager(MANAGER_SPINNING);
-    CHECK(env_service_create(1, 0, &status, &env_id) == -1,
+    CHECK(env_service_create(1, 0, 0, &status, &env_id) == -1,
           "a manager that keeps running but never answers is still refused");
     CHECK(kernel_tick_counter == ENV_RPC_CEIL_TICKS,
           "the absolute ceiling, not the quiet window, is what stopped it");
@@ -539,13 +548,13 @@ int main(void) {
     reset_manager(MANAGER_ALIVE);
     enqueue_reply(STALE_ENV_ID, 0xDEADu, 0);
     status = 0xFFFF; env_id = 0;
-    rc = env_service_create(1, 0, &status, &env_id);
+    rc = env_service_create(1, 0, 0, &status, &env_id);
     CHECK(rc == 0 && env_id == ENV_ENV_ID,
           "a stale reply left by a timed-out request is drained, not mistaken for the answer");
 
     /* 9. a short/malformed reply is never taken as success. */
     reset_manager(MANAGER_TRUNCATED);
-    CHECK(env_service_create(1, 0, &status, &env_id) == -1,
+    CHECK(env_service_create(1, 0, 0, &status, &env_id) == -1,
           "a reply shorter than frame + body is not accepted as an answer");
 
     /* 10. E5: the destroy round trip shares the same wait (and therefore the
@@ -588,7 +597,7 @@ int main(void) {
      * checkpoint. */
     reset_manager(MANAGER_ALIVE);
     status = 0xFFFF; env_id = 0;
-    rc = env_service_create(7, 3, &status, &env_id);
+    rc = env_service_create(7, 3, 0, &status, &env_id);
     CHECK(rc == 0 && status == ENV_OK,
           "a create still answers as before with registration added");
     {

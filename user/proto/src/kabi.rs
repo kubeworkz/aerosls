@@ -275,6 +275,17 @@ pub trait Kernel {
         self.create_sidecar(manifest)
     }
 
+    /// M5.0: spawn into `target_partition` AND bind `owner_uid` as the child's
+    /// identity, before it runs. Only the PARTITION_SYSTEM caller (init) may
+    /// state a nonzero owner, and only for a partition that uid is assigned
+    /// to. `owner_uid == 0` keeps the inherited owner. Default: fall back to
+    /// the inherited-owner create so fakes keep working.
+    fn create_sidecar_owned(&self, manifest: &[u8], target_partition: u32,
+                            owner_uid: u32) -> Result<(u32, u32), i32> {
+        let _ = owner_uid;
+        self.create_sidecar_in(manifest, target_partition)
+    }
+
     /// Spawn a LINUX-personality child (`SYS_SLS_LINUX_SPAWN`, 328 — E7): the
     /// same manifest path and request struct as `create_sidecar`, stamped
     /// PROC_PERSONALITY_LINUX inside the kernel's create — and therefore
@@ -820,6 +831,9 @@ mod abi {
         console_w_idx: u16,
         out_ch_r: u16,
         out_ch_w: u16,
+        /// M5.0: explicit identity binding (0 = inherit). Appended so every
+        /// pre-M5 field keeps its offset; only init sets it.
+        owner_uid: u32,
     }
 
     /// Shared body for `k_create_sidecar` / `k_create_sidecar_in`: syscall 310
@@ -835,6 +849,7 @@ mod abi {
         manifest: *const u8,
         manifest_len: u32,
         target_partition: u32,
+        owner_uid: u32,
         out_r: *mut u32,
         out_w: *mut u32,
     ) -> i32 {
@@ -846,6 +861,7 @@ mod abi {
             console_w_idx: CAP_NONE,
             out_ch_r: CAP_NONE,
             out_ch_w: CAP_NONE,
+            owner_uid,
         };
         let rc = unsafe {
             sls_syscall(sysno, &mut req as *mut CreateSidecarReq as u64)
@@ -873,7 +889,7 @@ mod abi {
         out_r: *mut u32,
         out_w: *mut u32,
     ) -> i32 {
-        do_create_sidecar(SYS_CREATE_SIDECAR, manifest, manifest_len, 0, out_r, out_w)
+        do_create_sidecar(SYS_CREATE_SIDECAR, manifest, manifest_len, 0, 0, out_r, out_w)
     }
 
     /// `k_create_sidecar_in`: syscall 310, placing the child in
@@ -888,7 +904,24 @@ mod abi {
         out_r: *mut u32,
         out_w: *mut u32,
     ) -> i32 {
-        do_create_sidecar(SYS_CREATE_SIDECAR, manifest, manifest_len, target_partition, out_r, out_w)
+        do_create_sidecar(SYS_CREATE_SIDECAR, manifest, manifest_len, target_partition, 0, out_r, out_w)
+    }
+
+    /// `k_create_sidecar_owned`: syscall 310 with the M5.0 owner binding. The
+    /// kernel stamps `owner_uid` onto the child before releasing it, after
+    /// checking the caller is PARTITION_SYSTEM and the uid is assigned to
+    /// `target_partition`.
+    #[no_mangle]
+    pub extern "C" fn k_create_sidecar_owned(
+        manifest: *const u8,
+        manifest_len: u32,
+        target_partition: u32,
+        owner_uid: u32,
+        out_r: *mut u32,
+        out_w: *mut u32,
+    ) -> i32 {
+        do_create_sidecar(SYS_CREATE_SIDECAR, manifest, manifest_len,
+                          target_partition, owner_uid, out_r, out_w)
     }
 
     /// `k_linux_spawn`: syscall 328 — the same create as `k_create_sidecar_in`
@@ -905,7 +938,7 @@ mod abi {
         out_r: *mut u32,
         out_w: *mut u32,
     ) -> i32 {
-        do_create_sidecar(SYS_LINUX_SPAWN, manifest, manifest_len, target_partition, out_r, out_w)
+        do_create_sidecar(SYS_LINUX_SPAWN, manifest, manifest_len, target_partition, 0, out_r, out_w)
     }
 
     #[no_mangle]
@@ -1609,6 +1642,20 @@ mod abi {
             let mut w: u32 = 0;
             let rc = k_create_sidecar_in(manifest.as_ptr(), manifest.len() as u32,
                                          target_partition, &mut r, &mut w);
+            if rc != ERR_OK {
+                Err(rc)
+            } else {
+                Ok((r, w))
+            }
+        }
+
+        fn create_sidecar_owned(&self, manifest: &[u8], target_partition: u32,
+                                owner_uid: u32) -> Result<(u32, u32), i32> {
+            let mut r: u32 = 0;
+            let mut w: u32 = 0;
+            let rc = k_create_sidecar_owned(manifest.as_ptr(), manifest.len() as u32,
+                                            target_partition, owner_uid,
+                                            &mut r, &mut w);
             if rc != ERR_OK {
                 Err(rc)
             } else {

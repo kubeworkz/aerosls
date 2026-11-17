@@ -144,7 +144,13 @@ struct EnvCkptRecord {
     uint64_t state_lba;     /* durable storage extent (P1b); 0 until then */
     uint64_t state_sectors;
     uint32_t state_bytes;
-    uint32_t _pad;
+    uint32_t owner_uid;    /* M5.0: the authenticated owner the environment's
+                            * catalog channel is bound to. 0 means "not
+                            * recorded" (a pre-M5 record), and the restore
+                            * keeps the old inheritance rule for it. The
+                            * field occupies the old padding slot, so the
+                            * record's size and persisted layout do not
+                            * change; a pre-M5 writer simply left it 0. */
     struct EnvCkptRegion regions[ENV_CKPT_MAX_REGIONS];
     struct EnvCkptTask   tasks[ENV_CKPT_MAX_TASKS];
     struct EnvCkptLinuxGroup linux_group;   /* M4.6: shared address space + N ids */
@@ -198,8 +204,16 @@ struct EnvCkptRegister {
     uint32_t n_tasks;
     char     task_name[ENV_CKPT_MAX_TASKS][ENV_CKPT_NAME_LEN];
     uint32_t task_kind[ENV_CKPT_MAX_TASKS];
-    /* No padding hole anywhere, so sizeof() is field-sum and both sides can
-     * assert it: 16 + 3*16 + 4 + 4*4 + 4 + 4*24 + 4*4 = 200 bytes. */
+    /* M5.0: the authenticated owner uid init created the environment for.
+     * Kept on the wire so a restore replays the SAME identity rather than
+     * rebuilding the sidecars as init's boot uid 0. */
+    uint32_t owner_uid;
+    uint32_t _reserved;    /* explicit tail pad: 204 is not a multiple of the
+                            * 8-byte alignment `regions[].base` imposes, so
+                            * the body carries this word rather than relying
+                            * on compiler-inserted padding. Always 0. */
+    /* Field-sum, including the explicit tail word: 16 + 3*16 + 4 + 4*4 + 4 +
+     * 4*24 + 4*4 + 4 + 4 = 208 bytes. */
 };
 
 /* ─── Refusal reasons ────────────────────────────────────────────────────────

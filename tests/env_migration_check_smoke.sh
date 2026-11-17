@@ -399,7 +399,7 @@ tooth "AC. the silence arithmetic wraps again on a heartbeat stamped ahead of th
 # AD-a: the restore stops going through create — the sidecar is never
 # created on the destination at all, so no console is ever registered.
 seed "$W/ada"
-sed -i 's/env_service_create(partition_id, index, \&status, \&new_id)/env_service_create_MUTATED(partition_id, index, \&status, \&new_id)/' "$W/ada/kernel/env_migrate.c"
+sed -i 's/env_service_create(partition_id, index, staged.owner_uid,/env_service_create_MUTATED(partition_id, index, staged.owner_uid,/' "$W/ada/kernel/env_migrate.c"
 tooth "AD-a. the destination's restore no longer goes through env_service_create (no sidecar, so no console, on the destination)" "AD" "$W/ada"
 
 # AD-b: create stops binding the env_id — the environment is live on the

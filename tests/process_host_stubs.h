@@ -128,6 +128,13 @@ __attribute__((weak)) int partition_is_paused(uint32_t partition_id) {
     return partition_id == host_stub_partition_extra_id &&
            host_stub_partition_extra_paused != 0;
 }
+/* M5.0: sys_sls_create_sidecar's nonzero-owner gate. Host tests exercise the
+ * inherit path (owner 0), which never calls this, so "unassigned" is the
+ * honest inert answer and keeps a forged-owner create refused. */
+__attribute__((weak)) uint32_t partition_get_for_uid(uint32_t uid) {
+    (void)uid;
+    return 0;
+}
 
 /* ─── POSIX-Environments P3 increment 1: the placement gate's counters ─────
  * sys_sls_placement_can_hold (327) answers "can partition P hold N more
@@ -215,6 +222,7 @@ __attribute__((weak)) int net_socket_service_kernel_slot(uint16_t slot) { (void)
  * assertion in those tests measures. tests/env_catalog_host_test.c links the
  * real file, where the strong definitions win. */
 __attribute__((weak)) int env_catalog_service_register(uint16_t k_rd, uint16_t k_wr, uint32_t partition, uint32_t pid, const char* name) { (void)k_rd; (void)k_wr; (void)partition; (void)pid; (void)name; return 0; }
+__attribute__((weak)) int env_catalog_service_register_owned(uint16_t k_rd, uint16_t k_wr, uint32_t partition, uint32_t pid, const char* name, uint32_t owner_uid) { (void)owner_uid; return env_catalog_service_register(k_rd, k_wr, partition, pid, name); }
 __attribute__((weak)) int env_catalog_service_kernel_slot(uint16_t slot) { (void)slot; return 0; }
 
 /* E6's BIB v3 has cap.c ask the same identity question the console registry

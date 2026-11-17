@@ -159,6 +159,10 @@ pub struct SimKernel {
     /// target_partition)`, so tests see which partition a spawn targeted and
     /// what manifest it carried.
     created: UnsafeCell<Vec<(Vec<u8>, u32)>>,
+    /// M5.0: the owner uids of successful owner-bound creates, so a test can
+    /// prove the manager passed the authenticated uid through to the spawn
+    /// rather than letting the child inherit boot uid 0.
+    created_owners: UnsafeCell<Vec<u32>>,
     /// POSIX-Environments E5: the sim's sidecar registry as
     /// `(name, partition, pid, handle)`. The real kernel keeps one
     /// (`sidecar_registry_*`, name-scoped by partition since E2), and
@@ -220,6 +224,7 @@ impl SimKernel {
             sidecar_fail_after: UnsafeCell::new(-1),
             released_storage: UnsafeCell::new(Vec::new()),
             created: UnsafeCell::new(Vec::new()),
+            created_owners: UnsafeCell::new(Vec::new()),
             sidecars: UnsafeCell::new(Vec::new()),
             free_handles: UnsafeCell::new(Vec::new()),
             next_sim_pid: UnsafeCell::new(SIM_FIRST_PID),
@@ -242,6 +247,12 @@ impl SimKernel {
     pub fn created(&self) -> Vec<(Vec<u8>, u32)> {
         // SAFETY: single-threaded test harness only.
         unsafe { (*self.created.get()).clone() }
+    }
+
+    /// M5.0: the owner uid of each successful `create_sidecar_owned`.
+    pub fn created_owners(&self) -> Vec<u32> {
+        // SAFETY: single-threaded test harness only.
+        unsafe { (*self.created_owners.get()).clone() }
     }
 
     /// POSIX-Environments E5: the live registry as
@@ -737,6 +748,14 @@ impl Kernel for SimKernel {
             // SAFETY: single-threaded test harness only.
             unsafe { (*self.sidecars.get()).push((name, target_partition, pid, ends.0)) };
         }
+        Ok(ends)
+    }
+
+    fn create_sidecar_owned(&self, manifest: &[u8], target_partition: u32,
+                            owner_uid: u32) -> Result<(u32, u32), i32> {
+        let ends = self.create_sidecar_in(manifest, target_partition)?;
+        // SAFETY: single-threaded test harness only.
+        unsafe { (*self.created_owners.get()).push(owner_uid) };
         Ok(ends)
     }
 

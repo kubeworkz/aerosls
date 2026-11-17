@@ -243,6 +243,13 @@ int env_catalog_service_register(uint16_t k_rd, uint16_t k_wr,
                                  uint32_t partition, uint32_t pid,
                                  const char* name);
 
+/* M5.0: register the channel with the environment's authenticated owner uid.
+ * CAT_QUERY resolves policy against this binding, never against the sidecar's
+ * inherited boot uid. A zero owner preserves the old pid-derived fallback. */
+int env_catalog_service_register_owned(uint16_t k_rd, uint16_t k_wr,
+                                       uint32_t partition, uint32_t pid,
+                                       const char* name, uint32_t owner_uid);
+
 /* console_service_tick() asks this before draining a kernel-held CHAN_R
  * slot: this channel carries CAT_* frames, not console text. Same exclusion
  * shape as env_console_kernel_slot() and net_socket_service_kernel_slot(). */

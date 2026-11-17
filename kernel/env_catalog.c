@@ -56,6 +56,9 @@ struct EnvCatalogSvc {
     int      used;
     uint32_t partition;   /* the boundary every verb is computed against */
     uint32_t pid;
+    uint32_t owner_uid;   /* M5.0: the bound environment owner. CAT_QUERY runs
+                           * policy as this uid. Zero means "bind from the
+                           * process descriptor at query time" (pre-M5). */
     uint16_t k_rd;        /* kernel (pid 0) CHAN_R — requests arrive here */
     uint16_t k_wr;        /* kernel (pid 0) CHAN_W — replies leave here */
     char     name[32];    /* the caller's sidecar name: the refusal names it */
@@ -92,6 +95,12 @@ static uint32_t cat_served_total   = 0;
 int env_catalog_service_register(uint16_t k_rd, uint16_t k_wr,
                                  uint32_t partition, uint32_t pid,
                                  const char* name) {
+    return env_catalog_service_register_owned(k_rd, k_wr, partition, pid, name, 0);
+}
+
+int env_catalog_service_register_owned(uint16_t k_rd, uint16_t k_wr,
+                                       uint32_t partition, uint32_t pid,
+                                       const char* name, uint32_t owner_uid) {
     struct EnvCatalogSvc* e = 0;
     /* Same (partition, pid) re-registering (an environment recycled, a pid
      * reused): replace the stale entry rather than leaking it — the same
@@ -116,6 +125,7 @@ int env_catalog_service_register(uint16_t k_rd, uint16_t k_wr,
     e->used = 1;
     e->partition = partition;
     e->pid = pid;
+    e->owner_uid = owner_uid;
     e->k_rd = k_rd;
     e->k_wr = k_wr;
     uint32_t i = 0;
@@ -123,9 +133,9 @@ int env_catalog_service_register(uint16_t k_rd, uint16_t k_wr,
         for (; name[i] && i + 1 < sizeof(e->name); i++) e->name[i] = name[i];
     e->name[i] = '\0';
     kernel_serial_printf(
-        "[ENV-CATALOG] %s (partition %u, pid %u) wired: kernel ends rd=%u "
-        "wr=%u — read-only catalog view open (§9)\n",
-        e->name, (unsigned)partition, (unsigned)pid,
+        "[ENV-CATALOG] %s (partition %u, pid %u, owner uid %u) wired: "
+        "kernel ends rd=%u wr=%u — read-only catalog view open (§9)\n",
+        e->name, (unsigned)partition, (unsigned)pid, (unsigned)owner_uid,
         (unsigned)k_rd, (unsigned)k_wr);
     return 1;
 }
@@ -684,15 +694,16 @@ static void cat_handle(struct EnvCatalogSvc* e, uint32_t plen, uint32_t tag) {
             return;
         }
 
-        /* 7. THE UID: read off the process this channel was registered for,
-         *    never off the wire. The descriptor's own partition must be the
+        /* 7. THE UID: the owner bound to this channel at registration, never
+         *    off the wire. The descriptor's own partition must still be the
          *    channel's — defence in depth against a registration that outlived
-         *    the process it was minted for. */
-        uint32_t uid = 0;
+         *    the process it was minted for. The pid-derived uid is a fallback
+         *    only for a zero binding (pre-M5 registrations and host tests). */
+        uint32_t uid = e->owner_uid;
         int found = 0, same_partition = 0;
         for (uint32_t i = 0; i < (uint32_t)PROC_MAX; i++) {
             if (proc_table[i].active && proc_table[i].pid == e->pid) {
-                uid = proc_table[i].owner_uid;
+                if (uid == 0) uid = proc_table[i].owner_uid;
                 found = 1;
                 same_partition = (proc_table[i].partition_id == e->partition);
                 break;

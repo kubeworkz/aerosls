@@ -1122,6 +1122,11 @@ struct SLSCreateSidecarRequest {
     uint16_t     console_w_idx; /* console CHAN_W, or CAP_NONE */
     uint16_t     out_ch_r;     /* OUT: parent's messenger CHAN_R slot */
     uint16_t     out_ch_w;     /* OUT: parent's messenger CHAN_W slot */
+    uint32_t     owner_uid;   /* M5.0: authenticated owner uid for a
+                                * PARTITION_SYSTEM create, 0 = inherit the
+                                * caller's uid. Only init may set a nonzero
+                                * value; the kernel verifies the uid is
+                                * assigned to target_partition. */
 };
 
 /* Create a sidecar in `target_partition` (0 = inherit the parent's — the boot
@@ -1131,6 +1136,14 @@ int cap_create_sidecar_in(uint32_t parent_pid,
                           const void* manifest, uint32_t manifest_len,
                           uint16_t parent_ch_w, uint16_t console_ch_w,
                           uint16_t* out_ch_r, uint32_t target_partition);
+/* M5.0: the same create with an authenticated environment owner. A zero
+ * owner keeps the inherit rule; a nonzero owner is honoured only for a
+ * PARTITION_SYSTEM caller into that owner's assigned partition. */
+int cap_create_sidecar_in_owner(uint32_t parent_pid,
+                                const void* manifest, uint32_t manifest_len,
+                                uint16_t parent_ch_w, uint16_t console_ch_w,
+                                uint16_t* out_ch_r, uint32_t target_partition,
+                                uint32_t owner_uid);
 int cap_create_sidecar(uint32_t parent_pid,
                        const void* manifest, uint32_t manifest_len,
                        uint16_t parent_ch_w, uint16_t console_ch_w,

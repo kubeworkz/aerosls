@@ -1484,7 +1484,9 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
              * this node dead and adopts its partitions mid-create
              * (docs/AeroSLS-Idle-Observer-Adoption-Finding-v0.1.md). */
             env_migrate_intent_begin();
-            int r = env_service_create(part, index, &st, &id);
+            /* M5.0: the environment belongs to the authenticated shell user,
+             * not to whatever uid init's tree happens to run as. */
+            int r = env_service_create(part, index, current_session_uid, &st, &id);
             /* The create RPC returned: release the intent so this node is
              * declarable DEAD again immediately, not after the announce's
              * full 300 s budget (the release rides the same broadcast —

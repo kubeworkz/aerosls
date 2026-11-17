@@ -139,10 +139,21 @@ fail=0
 L_PORT=""
 NODE=""
 ENV_ID=""
+ENV2_ID=""
 PART_ID=""
 OUT_OBJ_CREATED=""
 VERB_OUT=""
 TEARDONE=0
+
+# M5.0 identity arm: bob's demo token (kernel/auth.c) is a real
+# low-privilege APP_USER. Its environment must not inherit the boot uid 0
+# through init's sidecar tree; the denial is proved against a table owned by
+# the bearer uid (dave) in the same partition. (The guest token exists but
+# every POST route, including /api/shell/exec, rejects ROLE_GUEST before
+# dispatch, so bob is the lowest-privilege identity the control plane lets
+# through.)
+PEER_TOKEN="${AEROSLS_PEER_TOKEN:-cafebabe7654321089abcdef01234567}"
+PEER_UID_EXPECTED=1001
 
 # ─── transport ────────────────────────────────────────────────────────────
 # A down QEMU hostfwd port accepts the TCP connect and then times out, so
@@ -219,6 +230,9 @@ teardown() {
     [ -n "$L_PORT" ] || return 0
     [ -n "$PART_ID" ] || return 0
     echo "==> teardown"
+    # M5.0: the low-privilege arm demotes bob to ROLE_GUEST for its duration;
+    # put the demo identity back so a rerun on the same cluster can create.
+    sh_exec "role set $PEER_UID_EXPECTED APP_USER" 2>/dev/null || true
     if [ -n "$ENV_ID" ]; then
         sh_exec "env destroy $PART_ID $ENV_ID" 2>/dev/null || true
         local i
@@ -231,6 +245,20 @@ teardown() {
             echo "note: env $ENV_ID still listed after 30s (the live failover guard owns that assertion)"
         else
             echo "ok:   env $ENV_ID left the listing"
+        fi
+    fi
+    if [ -n "$ENV2_ID" ]; then
+        sh_exec "env destroy $PART_ID $ENV2_ID" 2>/dev/null || true
+        local i
+        for i in $(seq 1 60); do
+            sh_exec "env list $PART_ID" 2>/dev/null || true
+            printf '%s' "$SHEL_OUT" | grep -Fq "env_id=$ENV2_ID" || break
+            sleep 0.5
+        done
+        if printf '%s' "$SHEL_OUT" | grep -Fq "env_id=$ENV2_ID"; then
+            echo "note: guest env $ENV2_ID still listed after 30s"
+        else
+            echo "ok:   guest env $ENV2_ID left the listing"
         fi
     fi
     sh_exec "partition destroy $PART_ID" 2>/dev/null || true
@@ -281,6 +309,19 @@ PY
     return 0
 }
 
+# Run one shell command as a DIFFERENT authenticated identity. The HTTP
+# shell session is reseeded from the bearer token on every call, so this is
+# the real guest session -- not dave relabelled.
+sh_exec_as() {   # $1 = token, $2 = command line
+    local tok="$1" cmd="$2" rc
+    local -a saved=("${CURL_EXTRA[@]}")
+    CURL_EXTRA=(-H "Authorization: Bearer $tok")
+    sh_exec "$cmd"
+    rc=$?
+    CURL_EXTRA=("${saved[@]}")
+    return $rc
+}
+
 # ─── env attach: send a line, drain the answer ────────────────────────────
 # `env attach <partition> <env> <line>` writes into the environment's OWN
 # console (the kernel appends the terminator — env_console.c: a line needs
@@ -290,15 +331,24 @@ PY
 # flow control), so the send retries exactly as
 # tests/env_shell_surface_check.sh's console_send does.
 ATTACH_OUT=""
+ATTACH_TOKEN=""
+ATTACH_ENV_ID=""
+attach_shell() {   # $1 = command line, as the current attach identity
+    if [ -n "$ATTACH_TOKEN" ]; then
+        sh_exec_as "$ATTACH_TOKEN" "$1"
+    else
+        sh_exec "$1"
+    fi
+}
 attach_drain() {
-    sh_exec "env attach $PART_ID $ENV_ID" || true
+    attach_shell "env attach $PART_ID ${ATTACH_ENV_ID:-$ENV_ID}" || true
     ATTACH_OUT="$ATTACH_OUT$SHEL_OUT"
 }
 
 attach_send() {   # $1 = the line
     local t
     for t in $(seq 1 20); do
-        sh_exec "env attach $PART_ID $ENV_ID $1" || true
+        attach_shell "env attach $PART_ID ${ATTACH_ENV_ID:-$ENV_ID} $1" || true
         case "$SHEL_OUT" in
             *"no such environment console"*)
                 die_fail "env attach could not reach the environment console for '$1'" ;;
@@ -654,6 +704,95 @@ if run_verb "catalog sql SELECT * FROM $OUT_OBJ" "CAT_QUERY refused by kernel.en
 else
     die_fail "\`catalog sql SELECT * FROM $OUT_OBJ\` was not refused in ${WAIT_VERB}s — a foreign name was either served or left silent"
 fi
+
+# ─── 8b. M5.0 identity — a low-privilege environment must not run as uid 0 ──
+# Before M5.0 every tenant sidecar copied init's boot owner (uid 0), so
+# CAT_QUERY read dave's table as ROLE_SYSTEM_KERNEL from a low-privilege
+# environment. This arm creates a SECOND environment in the same partition
+# through the low-privilege shell, then (after APP_USER's global table-read
+# grant would mask the bug) demotes its owner to ROLE_GUEST and requires
+# dave's row to be refused by row-level policy.
+echo "==> M5.0: low-privilege environment in partition $PART_ID"
+peer_who="$(curl -s --max-time 15 -H "Authorization: Bearer $PEER_TOKEN" \
+                  "http://127.0.0.1:$L_PORT/api/session/whoami" 2>/dev/null)"
+PEER_UID="$(jget "$peer_who" uid)"
+if [ "$PEER_UID" != "$PEER_UID_EXPECTED" ]; then
+    die_fail "the low-privilege token did not authenticate as uid $PEER_UID_EXPECTED (whoami said: $peer_who)"
+fi
+echo "ok:   low-privilege token authenticates as uid $PEER_UID (ROLE_APP_USER)"
+
+sh_exec_as "$PEER_TOKEN" "env create $PART_ID 2" \
+    || die_fail "low-privilege shell did not recognise 'env create $PART_ID 2'"
+case "$SHEL_OUT" in
+    *"-> ok env_id="*)
+        ENV2_ID="$(printf '%s' "$SHEL_OUT" | sed -n 's/.*env_id=\([0-9]*\).*/\1/p' | tail -1)" ;;
+    *)
+        die_fail "the low-privilege environment create did not succeed (shell said: $(printf '%s' "$SHEL_OUT" | tail -3 | tr '\n' ' '))" ;;
+esac
+if [ -z "$ENV2_ID" ] || [ "$ENV2_ID" = "0" ]; then
+    die_fail "the low-privilege environment create returned no usable env_id (shell said: $(printf '%s' "$SHEL_OUT" | tail -3 | tr '\n' ' '))"
+fi
+echo "ok:   low-privilege peer created env $ENV2_ID in partition $PART_ID (index 2)"
+
+# Wait for the guest environment's console, and tie it to the listing. The
+# attach itself is done by the guest: the transcript that follows is the
+# guest's own view, not dave's.
+LIST2_ROW=""; PX2_PID=""
+for i in $(seq 1 $((WAIT_ENVLIST * 2))); do
+    sh_exec "env list $PART_ID" || true
+    LIST2_ROW="$(printf '%s' "$SHEL_OUT" | grep -F "[ENV] env partition=$PART_ID env_id=$ENV2_ID " | head -1)"
+    [ -n "$LIST2_ROW" ] && break
+    sleep 0.5
+done
+if [ -z "$LIST2_ROW" ]; then
+    die_fail "\`env list $PART_ID\` never reported low-privilege env $ENV2_ID (last output: ${SHEL_OUT:-<none>})"
+fi
+PX2_PID="$(printf '%s' "$LIST2_ROW" | grep -o 'posix_pid=[0-9]*' | cut -d= -f2)"
+if [ -z "$PX2_PID" ] || [ "$PX2_PID" = "0" ]; then
+    die_fail "the low-privilege environment's listing row carried no usable posix_pid (row: $LIST2_ROW)"
+fi
+echo "ok:   low-privilege env $ENV2_ID is listed with posix_pid=$PX2_PID"
+
+# APP_USER is read-granted on DB_TABLE by catalog_role_grants(), so a bob
+# environment would legitimately read dave's table even after M5.0. Demote bob
+# to ROLE_GUEST for the assertion: a guessed/boot uid 0 still reads the row as
+# ROLE_SYSTEM_KERNEL, while the bound uid 1001 is denied by row-level policy.
+sh_exec "role set $PEER_UID_EXPECTED GUEST" >/dev/null 2>&1 \
+    || die_fail "could not demote uid $PEER_UID_EXPECTED to ROLE_GUEST for the denial arm"
+ATTACH_TOKEN="$TOKEN"
+ATTACH_ENV_ID="$ENV2_ID"
+ATTACH_OUT=""
+announce2=""
+for i in $(seq 1 $((WAIT_ENVLIST * 2))); do
+    attach_drain
+    announce2="$(printf '%s' "$ATTACH_OUT" | grep -o '\[env-id\] index=[0-9]* pid=[0-9]*' | head -1)"
+    [ -n "$announce2" ] && break
+    sleep 0.5
+done
+if [ "$announce2" = "[env-id] index=2 pid=$PX2_PID" ]; then
+    echo "ok:   peer attach reaches the low-privilege environment's own console ('$announce2')"
+else
+    die_fail "the peer's console does not state this environment's identity (expected '[env-id] index=2 pid=$PX2_PID', got '${announce2:-nothing}')"
+fi
+
+# THE ASSERTION: dave's row-set table is in the same partition, but its
+# owner is dave (uid $SEED_UID) and this environment's owner is bob
+# (uid $PEER_UID, now ROLE_GUEST). A catalog channel bound to the inherited
+# boot uid 0 is ROLE_SYSTEM_KERNEL and returns the row; a channel bound to
+# the owner uid is refused by name, with no page and no value.
+if run_verb "catalog sql SELECT * FROM $TBL" "CAT_QUERY refused by kernel.env.catalog"; then
+    expect "row-level policy denied this uid" \
+        "peer identity is bound to the catalog channel — dave's table is denied by row-level policy"
+    reject "$QVAL" "the low-privilege environment did not receive dave's row (no uid-0 inheritance)"
+    reject "row(s)" "the denial carried no result page"
+else
+    if printf '%s' "$VERB_OUT" | grep -Fq -- "$QVAL"; then
+        die_fail "low-privilege env $ENV2_ID read dave's seed value '$QVAL' — the catalog channel is still authorizing as inherited boot uid 0"
+    fi
+    die_fail "low-privilege env $ENV2_ID did not receive CAT_QUERY's policy refusal in ${WAIT_VERB}s (last output: ${VERB_OUT:-<nothing>})"
+fi
+ATTACH_TOKEN=""
+ATTACH_ENV_ID=""
 
 # ─── 9. teardown (the EXIT trap runs it from here either way) ─────────────
 [ "$fail" -eq 0 ] || report_and_exit

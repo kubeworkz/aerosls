@@ -57,6 +57,10 @@ pub struct EnvImages {
 pub struct Environment {
     pub partition: u32,
     pub index: u32,
+    /// M5.0: the authenticated owner this environment was created for. The
+    /// sidecars are stamped with it at create, and the catalog channel binds
+    /// it as the identity its queries run as.
+    pub owner_uid: u32,
     /// E7 increment 20: this environment carries the gate profile (the
     /// `e7_gate` build's designated index). It selects the manifest's
     /// FLAG_GATE bit AND the record's third task — the Linux tenant the
@@ -119,6 +123,22 @@ pub fn create_environment<K: Kernel>(
     k: &K,
     partition: u32,
     index: u32,
+    images: &EnvImages,
+) -> Result<Environment, i32> {
+    create_environment_owned(k, partition, index, 0, images)
+}
+
+/// M5.0: create an environment for `owner_uid`. The owner is stamped onto
+/// both sidecars before they run (the kernel refuses a nonzero owner unless
+/// the caller is PARTITION_SYSTEM and the uid is assigned to `partition`), so
+/// every kernel-visible identity the environment has — process owner, catalog
+/// channel, checkpoint record — is the authenticated user, never an inherited
+/// boot uid.
+pub fn create_environment_owned<K: Kernel>(
+    k: &K,
+    partition: u32,
+    index: u32,
+    owner_uid: u32,
     images: &EnvImages,
 ) -> Result<Environment, i32> {
     // P3 increment 1: the placement pre-flight — ask the kernel the
@@ -204,7 +224,14 @@ pub fn create_environment<K: Kernel>(
         RD_STORAGE_BYTES,
         0x3,
     );
-    let (ramdisk_r, ramdisk_w) = k.create_sidecar_in(&rd_manifest, partition).map_err(|e| {
+    let spawn = |manifest: &[u8]| -> Result<(u32, u32), i32> {
+        if owner_uid != 0 {
+            k.create_sidecar_owned(manifest, partition, owner_uid)
+        } else {
+            k.create_sidecar_in(manifest, partition)
+        }
+    };
+    let (ramdisk_r, ramdisk_w) = spawn(&rd_manifest).map_err(|e| {
         // P3 inc. 1: the store is attached and the regions are taken — give
         // them back, so a create refused HERE leaves nothing held anywhere
         // (the counterpart of the attach-refusal arm above; the attach
@@ -243,7 +270,7 @@ pub fn create_environment<K: Kernel>(
             px_heap,
         )
     };
-    let (posix_r, posix_w) = k.create_sidecar_in(&px_manifest, partition).map_err(|e| {
+    let (posix_r, posix_w) = spawn(&px_manifest).map_err(|e| {
         // P3 inc. 1: the ramdisk already exists under its name — END it
         // first and confirm the kernel finished the job (kernel/process.c
         // DEFERS a kill whose target is RUNNING, and freeing the heap a
@@ -269,6 +296,7 @@ pub fn create_environment<K: Kernel>(
     Ok(Environment {
         partition,
         index,
+        owner_uid,
         gate,
         rd_heap,
         rd_storage,
@@ -299,6 +327,7 @@ pub fn create_environment<K: Kernel>(
 /// tests/env_register_host_test.c drives the kernel's half against the same.
 pub fn environment_register_reply(env_id: u32, env: &Environment) -> RegisterReply {
     let mut r = RegisterReply::empty(env.partition, env.index, env_id);
+    r.owner_uid = env.owner_uid;
 
     r.n_regions = 3;
     r.regions[0] = RegisterRegion {
@@ -667,7 +696,7 @@ impl EnvManager {
         let body = &req[EnvFrame::SIZE..];
         match frame.ty {
             ENV_CREATE => {
-                let (partition, index) = match env_proto::parse_create_body(body) {
+                let (partition, index, owner_uid) = match env_proto::parse_create_body(body) {
                     Some(v) => v,
                     None => return self.reply(reply, ENV_CREATE, ENV_ERR_INVAL, 0, 0),
                 };
@@ -708,7 +737,7 @@ impl EnvManager {
                 if self.envs.len() >= self.max_envs {
                     return self.reply(reply, ENV_CREATE, ENV_ERR_FULL, 0, partition);
                 }
-                match create_environment(k, partition, index, &self.images) {
+                match create_environment_owned(k, partition, index, owner_uid, &self.images) {
                     Ok(env) => {
                         let id = self.next_id;
                         self.next_id = self.next_id.wrapping_add(1);
@@ -1065,10 +1094,14 @@ mod tests {
     }
 
     // ── EnvManager dispatch: the ENV_* request path ─────────────────────────
-    fn create_req(partition: u32, index: u32) -> alloc::vec::Vec<u8> {
+    fn create_req_owned(partition: u32, index: u32, owner_uid: u32) -> alloc::vec::Vec<u8> {
         let mut r = EnvFrame::new(ENV_CREATE, false).encode().to_vec();
-        r.extend_from_slice(&env_proto::encode_create_body(partition, index));
+        r.extend_from_slice(&env_proto::encode_create_body(partition, index, owner_uid));
         r
+    }
+
+    fn create_req(partition: u32, index: u32) -> alloc::vec::Vec<u8> {
+        create_req_owned(partition, index, 0)
     }
 
     fn reply_status(reply: &[u8], n: usize) -> (u16, u32, u32) {
@@ -1092,6 +1125,24 @@ mod tests {
         let created = k.created();
         assert_eq!(created.len(), 2);
         assert!(created.iter().all(|(_, p)| *p == 6));
+    }
+
+    /// M5.0: the create body's authenticated owner reaches BOTH spawns and is
+    /// kept on the environment, so the catalog channel can bind it instead of
+    /// inheriting boot uid 0.
+    #[test]
+    fn env_manager_stamps_the_authenticated_owner_on_every_sidecar() {
+        let k = SimKernel::new();
+        let mut mgr = EnvManager::new(images(), 8);
+        let mut reply = [0u8; 64];
+        let n = mgr.handle_request(&k, &create_req_owned(6, 2, 1001), &mut reply);
+        assert_eq!(reply_status(&reply, n).0, ENV_OK);
+        let env = mgr.environments()[0].1;
+        assert_eq!(env.owner_uid, 1001);
+        assert_eq!(k.created_owners(), alloc::vec![1001, 1001],
+                   "the ramdisk and POSIX creates both carry the owner");
+        assert_eq!(environment_register_reply(1, &env).owner_uid, 1001,
+                   "the checkpoint record persists the same owner");
     }
 
     #[test]

@@ -60,7 +60,13 @@
                              * anywhere; deliberately not NOMEM's mid-create one */
 
 #define ENV_FRAME_SIZE       16u
-#define ENV_CREATE_BODY_SIZE  8u
+#define ENV_CREATE_BODY_SIZE 12u
+/* { partition u32, index u32, owner_uid u32 }. `owner_uid` is the
+ * authenticated identity the control plane already resolved from its session
+ * or bearer token; init carries it through to the sidecar create so the
+ * environment's catalog channel is bound to that uid, never to the boot uid 0
+ * inherited from init's sidecar tree. A zero means "no authenticated owner"
+ * and preserves the pre-M5 inheritance rule for boot-internal creates. */
 /* { env_id u32, partition u32 }. The partition is carried so the control
  * plane's nested destroy route (`POST /api/partition/{id}/env/destroy`)
  * ENFORCES its own {id}: the env id alone identifies the environment globally,
@@ -94,8 +100,10 @@
 #define ENV_REG_TASK_NAME_STRIDE ENV_CKPT_NAME_LEN
 #define ENV_REG_OFF_TASK_KINDS \
     (ENV_REG_OFF_TASK_NAMES + ENV_CKPT_MAX_TASKS * ENV_REG_TASK_NAME_STRIDE)
-#define ENV_REGISTER_REPLY_BODY_SIZE \
+#define ENV_REG_OFF_OWNER_UID \
     (ENV_REG_OFF_TASK_KINDS + ENV_CKPT_MAX_TASKS * 4u)
+#define ENV_REG_OFF_RESERVED (ENV_REG_OFF_OWNER_UID + 4u)
+#define ENV_REGISTER_REPLY_BODY_SIZE (ENV_REG_OFF_RESERVED + 4u)
 
 /* The body is a padded-free image of the struct, so the two MUST describe the
  * same number of bytes. If a field is added to one and not the other this is a
@@ -146,10 +154,14 @@ static inline int env_frame_parse(const uint8_t* b, size_t len, uint16_t* ty) {
 }
 
 /* ── bodies ──────────────────────────────────────────────────────────────── */
-/* ENV_CREATE request body: { partition u32, index u32 } (8 bytes). */
-static inline void env_create_body_encode(uint8_t* b, uint32_t partition, uint32_t index) {
+/* ENV_CREATE request body: { partition u32, index u32, owner_uid u32 }
+ * (12 bytes). The owner is the caller's authenticated uid; the environment's
+ * catalog channel is bound to it at sidecar create. */
+static inline void env_create_body_encode(uint8_t* b, uint32_t partition,
+                                          uint32_t index, uint32_t owner_uid) {
     env_put_u32(b, 0, partition);
     env_put_u32(b, 4, index);
+    env_put_u32(b, 8, owner_uid);
 }
 
 /* ENV_DESTROY request body: { env_id u32, partition u32 } (8 bytes). */
@@ -204,6 +216,8 @@ static inline void env_register_reply_encode(uint8_t* b, const struct EnvCkptReg
     }
     for (uint32_t i = 0; i < ENV_CKPT_MAX_TASKS; i++)
         env_put_u32(b, (size_t)ENV_REG_OFF_TASK_KINDS + (size_t)i * 4u, r->task_kind[i]);
+    env_put_u32(b, ENV_REG_OFF_OWNER_UID, r->owner_uid);
+    env_put_u32(b, ENV_REG_OFF_RESERVED, r->_reserved);
 }
 
 /* Parse an ENV_REGISTER reply body into `out`; 1 on success, 0 if `len` is
@@ -235,6 +249,8 @@ static inline int env_register_reply_parse(const uint8_t* b, size_t len,
             out->task_name[i][c] = (char)b[o + c];
         out->task_kind[i] = env_read_u32(b, (size_t)ENV_REG_OFF_TASK_KINDS + (size_t)i * 4u);
     }
+    out->owner_uid = env_read_u32(b, ENV_REG_OFF_OWNER_UID);
+    out->_reserved  = env_read_u32(b, ENV_REG_OFF_RESERVED);
     return 1;
 }
 
