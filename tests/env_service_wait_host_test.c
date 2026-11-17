@@ -158,8 +158,11 @@ static uint32_t g_answered_tag = 0;
  * them — the entries the registration must NOT be able to supply itself. */
 #define FAKE_RD_PID   0x51u
 #define FAKE_PX_PID   0x52u
+#define FAKE_LX_PID   0x53u
 #define FAKE_RD_ENTRY 0x0000000040001000ull
 #define FAKE_PX_ENTRY 0x0000000040002000ull
+#define FAKE_LX_ENTRY 0x0000000040003000ull
+#define FAKE_LX_STACK 0x0000000040100000ull
 #define FAKE_SEQUENCE 7ull
 
 /* Every request sent since the last reset_manager(), in order. A create is
@@ -176,6 +179,11 @@ static int      g_log_n = 0;
  * disagrees with the one the console was bound under. */
 static uint32_t g_created_partition = 0;
 static uint32_t g_created_index = 0;
+/* M5.2b: when set, the fake manager answers ENV_REGISTER with the tenant
+ * profile's third task and the fake registry resolves it -- modelling the
+ * ordinary sidecar's Linux child already spawned before registration, which
+ * is exactly the window the post-registration reconciliation closes. */
+static int g_register_tenant = 0;
 /* The frame type the fake manager replies with — the service echoes the request
  * type, so a destroy round trip answers with an ENV_DESTROY frame. */
 static uint16_t g_reply_ty = ENV_CREATE;
@@ -211,6 +219,7 @@ static void reset_manager(int mode) {
     g_log_n = 0;
     g_created_partition = 0;
     g_created_index = 0;
+    g_register_tenant = 0;
     kernel_tick_counter = 0;
 }
 
@@ -257,6 +266,11 @@ static void enqueue_register_reply(uint32_t env_id, uint32_t partition, uint32_t
     r.task_kind[0] = ENV_CKPT_TASK_RAMDISK_SIDECAR;
     memcpy(r.task_name[1], "aerosls.posix.3", 16);
     r.task_kind[1] = ENV_CKPT_TASK_POSIX_SIDECAR;
+    if (g_register_tenant) {
+        r.n_tasks = 3;
+        memcpy(r.task_name[2], "m5.tenant.catalog.0", 20);
+        r.task_kind[2] = ENV_CKPT_TASK_LINUX;
+    }
 
     uint8_t f[ENV_REPLY_MAX];
     uint32_t len = ENV_FRAME_SIZE + ENV_REGISTER_REPLY_BODY_SIZE;
@@ -424,12 +438,17 @@ uint32_t sidecar_registry_resolve(const char* name, uint32_t partition_id) {
     (void)partition_id;
     if (strcmp(name, "drv.ramdisk.3") == 0) return FAKE_RD_PID;
     if (strcmp(name, "aerosls.posix.3") == 0) return FAKE_PX_PID;
+    if (g_register_tenant && strcmp(name, "m5.tenant.catalog.0") == 0)
+        return FAKE_LX_PID;
     return 0;
 }
 
 /* The process table: where the kernel RELEASED each sidecar. Only the fields
- * env_service_task_entry() reads are set — a parked sidecar's resume RIP lives
- * in park_ctx, so `user_rip` stays the entry point cap_create_sidecar set. */
+ * env_service_task_facts() reads are set — a parked sidecar's resume RIP lives
+ * in park_ctx, so `user_rip` stays the entry point cap_create_sidecar set.
+ * The tenant Linux child is seated from the start: it models the race where
+ * the sidecar's spawn beat registration, and the registry gate above decides
+ * whether the current registration names it. */
 struct ProcessDescriptor proc_table[PROC_MAX];
 static void seat_sidecars(void) {
     memset(proc_table, 0, sizeof proc_table);
@@ -437,6 +456,11 @@ static void seat_sidecars(void) {
     proc_table[0].user_rip = FAKE_RD_ENTRY;
     proc_table[1].pid = FAKE_PX_PID; proc_table[1].active = 1;
     proc_table[1].user_rip = FAKE_PX_ENTRY;
+    proc_table[3].pid = FAKE_LX_PID; proc_table[3].active = 1;
+    proc_table[3].user_rip = FAKE_LX_ENTRY;
+    proc_table[3].linux_stack_base = FAKE_LX_STACK;
+    proc_table[3].linux_stack_pages = 4;
+    proc_table[3].cap_count = 1;
     /* The manager itself: the RPC wait reads this descriptor's switch-ins as
      * its progress signal, exactly as cap.c's registration names init. */
     proc_table[2].pid = ENV_MGR_PID; proc_table[2].active = 1;
@@ -646,6 +670,37 @@ int main(void) {
                   "and is demonstrably not a region base the manager supplied");
         }
     }
+
+    /* ── P1a/M5.2b 15: the tenant child that beat registration is reconciled ─
+     * The sidecar begins booting inside ENV_CREATE, so its Linux child can be
+     * live before the record exists. The record's first facts lookup fills the
+     * entry it already knows; the post-registration pass must fill the stack
+     * bounds and cap count too, not leave the spawn stamp to a spawn that has
+     * already happened. */
+    reset_manager(MANAGER_ALIVE);
+    g_register_tenant = 1;
+    status = 0xFFFF; env_id = 0;
+    rc = env_service_create(7, 4, 0, &status, &env_id);
+    CHECK(rc == 0 && status == ENV_OK,
+          "the tenant-profile create still answers (three-task registration)");
+    CHECK(g_register_tenant == 1,
+          "(setup) the tenant registration was the one the fake manager answered");
+    {
+        const struct EnvCkptRecord* rec = env_ckpt_find(7, 4);
+        CHECK(rec && rec->n_tasks == 3,
+              "the create's record names the tenant Linux task as its third slot");
+        CHECK(rec && rec->tasks[2].kind == ENV_CKPT_TASK_LINUX &&
+              strcmp(rec->tasks[2].name, "m5.tenant.catalog.0") == 0,
+              "and the slot is the tenant task the sidecar spawns");
+        CHECK(rec && rec->tasks[2].entry == FAKE_LX_ENTRY &&
+              rec->tasks[2].stack_bottom == FAKE_LX_STACK &&
+              rec->tasks[2].stack_top == FAKE_LX_STACK + 4 * 4096ull &&
+              rec->tasks[2].cap_count == 1,
+              "the already-live Linux child's entry, stack bounds and cap count are stamped into the record");
+        CHECK(rec && env_ckpt_valid(rec) == ENV_CKPT_REFUSE_NONE,
+              "and the reconciled record passes the gate");
+    }
+    g_register_tenant = 0;
 
     printf("\n%d checks passed, %d failed\n", checks_passed, checks_failed);
     return checks_failed ? 1 : 0;

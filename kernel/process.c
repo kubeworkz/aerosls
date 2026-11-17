@@ -141,6 +141,14 @@ static void proc_clear_resume_state(struct ProcessDescriptor* pd) {
     /* E7 increment 22: a reused slot must not inherit a gate tooth either —
      * a stale one would break the next occupant's next read. */
     pd->tooth             = 0;
+    /* M5.2b: the create's cap count is per-occupant too. A stale count on a
+     * reused slot would be read into the next task's checkpoint record as if
+     * that task had been created there. The Linux stack base/page fields are
+     * cleared with the span in Q2 below; the physical base and poison count
+     * are deliberately NOT cleared here because a gate task's teardown scan
+     * still reads them, and the non-gate Linux create path clears them for
+     * the next occupant. */
+    pd->cap_count          = 0;
     /* E7 §5.3: the same rule for TLS as for personality — a reused slot's
      * stale fs_base would point the next occupant's %fs at someone else's
      * address space the instant the switch-in wrote it to the MSR. The
@@ -173,14 +181,13 @@ static void proc_clear_resume_state(struct ProcessDescriptor* pd) {
      * previous occupant's image pages as if they were this task's own. */
     pd->linux_image_lo = 0;
     pd->linux_image_hi = 0;
-    /* Q2: the gate stack's measurement identity clears with the span for the
+    /* Q2: the gate stack's base/page identity clears with the span for the
      * same reason — a reused slot must not scan (or report) its predecessor's
-     * freed frames, and the poison count is what says whether a measurement
-     * was ever armed for THIS occupant. */
+     * freed frames. The physical base and poison count are NOT cleared here:
+     * the teardown report needs them, and a non-gate Linux create clears both
+     * explicitly. */
     pd->linux_stack_base = 0;
-    pd->linux_stack_phys = 0;
     pd->linux_stack_pages = 0;
-    pd->linux_stack_poison = 0;
     pd->mem_stage_num = 0;
     pd->mem_stage_a0 = 0;
     pd->mem_stage_a1 = 0;
@@ -835,6 +842,11 @@ uint32_t proc_create_linux_thread(struct ProcessDescriptor *parent,
      * are set explicitly below so a reused slot cannot inherit a kernel
      * continuation or an old stack. */
     proc_clear_resume_state(pd);
+    /* Q2/M5.2b: a thread has no gate stack identity of its own. Slot reuse
+     * deliberately leaves the gate's physical base and poison count for its
+     * teardown scan, so this non-gate Linux create path clears them. */
+    pd->linux_stack_phys   = 0;
+    pd->linux_stack_poison = 0;
     pd->pid          = alloc_pid();
     if (pd->pid == 0) return 0;
     pd->cr3          = parent->cr3;
@@ -904,6 +916,11 @@ uint32_t proc_create_linux_thread_restore(struct ProcessDescriptor *parent,
     if (slot < 0) return 0;
     struct ProcessDescriptor *pd = &proc_table[slot];
     proc_clear_resume_state(pd);
+    /* Q2/M5.2b: the restored sibling shares the leader's address space and
+     * has no gate stack identity of its own; clear what slot reuse leaves for
+     * the gate's teardown scan. */
+    pd->linux_stack_phys   = 0;
+    pd->linux_stack_poison = 0;
     pd->pid = alloc_pid();
     if (pd->pid == 0) return 0;
     pd->cr3          = parent->cr3;
@@ -973,7 +990,9 @@ static void linux_stack_hwm_report(struct ProcessDescriptor *pd, const char *whe
  * leaves, keyed on the poison identity rather than gate_profile — the pour
  * spends that one-shot flag at the stop, and it is exactly the resumed task's
  * exit that has to be measured. Both paths must call this BEFORE
- * proc_clear_resume_state(), which drops the identity. */
+ * proc_clear_resume_state(), which drops the base/page fields the report
+ * prints (the physical base and poison count survive for the next create to
+ * clear). */
 static void linux_stack_maybe_report(struct ProcessDescriptor *pd, const char *where) {
     if (pd && pd->personality == PROC_PERSONALITY_LINUX && pd->linux_stack_poison)
         linux_stack_hwm_report(pd, where);
@@ -1000,8 +1019,8 @@ void process_exit(uint32_t exit_code) {
          * faults leaves through here (stubs.c's #PF handler calls
          * process_exit), so this is the path that measures a tenant killed by
          * a bad page — the no-heap tooth's shape. The frames are still mapped
-         * and the poison identity is still set; proc_clear_resume_state()
-         * below is what drops it. */
+         * and the poison identity is still set; the report runs before
+         * proc_clear_resume_state() clears the base/page fields it prints. */
         linux_stack_maybe_report(pd, "exit");
 
         /* M4.1: release the thread-group reference BEFORE the descriptor's
@@ -1706,8 +1725,9 @@ static void proc_strand_diag_tick(void) {
 // above for the algorithm. Writes the chosen process's context to the
 // The one teardown a deferred kill gets, wherever the scheduler catches the
 // task. The stack report runs BEFORE proc_clear_resume_state() drops the
-// poison identity, and the three teardown steps mirror process_kill()'s for a
-// target that is not executing.
+// base/page fields it prints (the physical base and poison count survive for
+// the next create to clear), and the three teardown steps mirror
+// process_kill()'s for a target that is not executing.
 static void proc_deferred_teardown(struct ProcessDescriptor* pd) {
     kernel_serial_printf(
         "[PROC] PID %u '%s' deferred teardown (killed while running)\n",

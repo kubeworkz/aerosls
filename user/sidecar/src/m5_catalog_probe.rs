@@ -25,8 +25,10 @@ static PROBE: &[u8] = include_bytes!("../fixtures/e7_catalog_probe.flat");
 
 pub const PROBE_NAME: &str = "m5.linux.catalog.0";
 /// M5.2a: the ordinary-tenant test probe. A distinct name keeps the tenant
-/// child out of the gate profile's identity and checkpoint vocabulary.
-pub const TENANT_PROBE_NAME: &str = "m5.tenant.catalog.0";
+/// child out of the gate profile's identity and checkpoint vocabulary; M5.2b
+/// shares it with init's registration through the proto constant, so the name
+/// the record carries is the name the sidecar spawns.
+pub const TENANT_PROBE_NAME: &str = aerosls_proto::env_proto::TENANT_LINUX_TASK_NAME;
 pub const PROBE_RESERVE: u64 = 64 * 1024;
 
 const IMAGE_VBASE: u64 = 0x4000_0000_0000; /* USER_PROC_CODE_BASE */

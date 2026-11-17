@@ -205,8 +205,11 @@ struct ProcessDescriptor {
     // are the region's identity: its child-vaddr base, the contiguous
     // physical base (linux_stack_phys — one allocation, which is what makes
     // the scan possible), its page count, and how many bytes below the entry
-    // %rsp carry the poison. Zeroed at slot reuse beside the heap/image
-    // fields; a non-gate create leaves them 0 and no scan runs.
+    // %rsp carry the poison. The base/page fields are zeroed at slot reuse
+    // beside the heap/image fields; the physical base and poison count are
+    // cleared by a non-gate Linux create instead, because a gate task's
+    // teardown scan still reads them. A non-gate create leaves them 0 and no
+    // scan runs.
     uint64_t   linux_stack_base;
     uint64_t   linux_stack_phys;
     uint32_t   linux_stack_pages;
@@ -434,6 +437,10 @@ struct ProcessDescriptor {
                                       // (env_payload.h's ENV_PAYLOAD_TOOTH_*; 0 in every
                                       // shipped image — the arms are compiled out and no
                                       // route can select one)
+    uint16_t   cap_count;             // M5.2b: caps granted at create (the BIB's
+                                      // cap_count). The checkpoint record's Linux
+                                      // slot carries it; 0 for a descriptor that
+                                      // never went through cap_create_sidecar.
     uint32_t   gate_bytes;            // bytes those reads have returned so far
     struct ProcessDescriptor* handoff_target;  // Phase 1.5: the process this one
                                        // just WOKE with cap_wake_chan() — the send

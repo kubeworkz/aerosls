@@ -18,6 +18,7 @@ use aerosls_proto::env_proto::{
 };
 #[cfg(not(feature = "m4_ckpt_probe"))]
 use aerosls_proto::env_proto::LINUX_TASK_NAME;
+use aerosls_proto::env_proto::TENANT_LINUX_TASK_NAME;
 use aerosls_proto::kabi::{
     Kernel, ERR_NOMEM, ENV_STORAGE_ERR_IO, ENV_STORAGE_ERR_NOSLOT,
     ENV_STORAGE_ERR_QUOTA,
@@ -73,6 +74,14 @@ pub struct Environment {
     /// because the registration reply is answered long after the create's
     /// local `gate` decision, and a restore must name the same task list.
     pub gate: bool,
+    /// M5.2b: this environment carries the ordinary-tenant Linux test profile
+    /// (`m5_tenant_probe`, designated index 3). It selects the manifest's
+    /// `FLAG_TENANT_LINUX` bit AND the record's third task — the Linux child
+    /// the sidecar spawns under `TENANT_LINUX_TASK_NAME`. Kept beside `gate`
+    /// because the registration reply is answered after the create's local
+    /// decision, and a restore must name the same task list. `gate` wins if a
+    /// hand-built manifest ever carries both profile bits.
+    pub tenant_linux: bool,
     /// The three private regions this environment owns, kept per-environment
     /// from E5: a destroy has to hand each of them back individually (E4 only
     /// ever needed the ramdisk heap's base at create time), so all three bases
@@ -258,10 +267,11 @@ pub fn create_environment_owned<K: Kernel>(
     // checkpoint. Every other index (and every other build) gets the plain
     // tenant manifest, byte for byte.
     let gate = cfg!(feature = "e7_gate") && index == 1;
-    // M5.2a: a build-time ordinary-tenant test profile, selected only for its
-    // designated index. It uses a distinct manifest bit and deliberately does
-    // not set `gate`, so it spawns the M5.2 catalog probe without the gate's
-    // stop/poison behavior and without a third checkpoint task.
+    // M5.2a/M5.2b: a build-time ordinary-tenant test profile, selected only for
+    // its designated index. It uses a distinct manifest bit and deliberately
+    // does not set `gate`, so it spawns the M5.2 catalog probe without the
+    // gate's stop/poison behavior. M5.2b DOES register its Linux task as the
+    // third checkpoint task — registration only, not capture/restore.
     let tenant_linux =
         cfg!(feature = "m5_tenant_probe") && index == M5_TENANT_ENV_INDEX;
     let px_manifest = if gate {
@@ -317,6 +327,7 @@ pub fn create_environment_owned<K: Kernel>(
         index,
         owner_uid,
         gate,
+        tenant_linux,
         rd_heap,
         rd_storage,
         px_heap,
@@ -392,6 +403,13 @@ pub fn environment_register_reply(env_id: u32, env: &Environment) -> RegisterRep
         r.set_task(2, aerosls_proto::env_proto::M4_CKPT_TASK_NAME, TASK_LINUX);
         #[cfg(not(feature = "m4_ckpt_probe"))]
         r.set_task(2, LINUX_TASK_NAME, TASK_LINUX);
+    } else if env.tenant_linux {
+        // M5.2b: the ordinary-tenant test profile's task. Naming it here, from
+        // the same profile bit that selected the manifest, is what makes a
+        // replay's create name the same task list — never whatever happened to
+        // be spawned. The kernel fills entry/stack at the spawn (and again at
+        // registration if the child won the create race).
+        r.set_task(2, TENANT_LINUX_TASK_NAME, TASK_LINUX);
     }
     r
 }
@@ -946,12 +964,13 @@ mod tests {
                    CapKind::Chan { peer: Some("kernel.net.socket"), flags: 0 });
     }
 
-    /// M5.2a: only the designated index gets the tenant-Linux test flag, and
-    /// the profile does not add a checkpoint task. The equality against
-    /// `cfg!(feature = ...)` keeps the test meaningful in both the default
-    /// build (flag absent) and the dedicated tenant build (flag present).
+    /// M5.2a/M5.2b: only the designated index gets the tenant-Linux test flag,
+    /// and (when the profile is compiled in) the registration names its Linux
+    /// task. The equality against `cfg!(feature = ...)` keeps the test
+    /// meaningful in both the default build (flag absent) and the dedicated
+    /// tenant build (flag present).
     #[test]
-    fn tenant_linux_profile_selects_only_its_index_and_registers_no_linux_task() {
+    fn tenant_linux_profile_selects_only_its_index_and_registers_its_linux_task() {
         let k = SimKernel::new();
         let env = create_environment(&k, 5, M5_TENANT_ENV_INDEX, &images()).unwrap();
         let created = k.created();
@@ -960,8 +979,15 @@ mod tests {
                    cfg!(feature = "m5_tenant_probe"));
         assert_eq!(px.flags & FLAG_GATE, 0);
         assert_eq!(px.n_caps, 5);
-        assert_eq!(environment_register_reply(1, &env).n_tasks, 2,
-                   "the short-lived test probe is not a checkpoint task");
+        let reply = environment_register_reply(1, &env);
+        let expected_tasks = if cfg!(feature = "m5_tenant_probe") { 3 } else { 2 };
+        assert_eq!(reply.n_tasks, expected_tasks);
+        if cfg!(feature = "m5_tenant_probe") {
+            let name = core::str::from_utf8(&reply.task_names[2]).unwrap_or("");
+            assert_eq!(name.trim_end_matches('\0'), TENANT_LINUX_TASK_NAME,
+                       "the designated tenant index registers the task the sidecar spawns");
+            assert_eq!(reply.task_kinds[2], TASK_LINUX);
+        }
 
         let other = SimKernel::new();
         let _ = create_environment(&other, 5, M5_TENANT_ENV_INDEX + 1, &images()).unwrap();
@@ -1606,14 +1632,21 @@ mod tests {
         assert_eq!(reg.n_chans, 4);
         assert_eq!(reg.chans, [env.ramdisk_r, env.ramdisk_w, env.posix_r, env.posix_w]);
 
-        // The two sidecars, by the very names create registered them under.
-        assert_eq!(reg.n_tasks, 2);
+        // The two sidecars, by the very names create registered them under;
+        // the tenant profile adds the Linux task it spawned as the third.
+        let expected_tasks = if cfg!(feature = "m5_tenant_probe") { 3 } else { 2 };
+        assert_eq!(reg.n_tasks, expected_tasks);
         assert_eq!(&reg.task_names[0][..13], b"drv.ramdisk.3");
         assert_eq!(reg.task_names[0][13], 0);
         assert_eq!(reg.task_kinds[0], TASK_RAMDISK_SIDECAR);
         assert_eq!(&reg.task_names[1][..15], b"aerosls.posix.3");
         assert_eq!(reg.task_names[1][15], 0);
         assert_eq!(reg.task_kinds[1], TASK_POSIX_SIDECAR);
+        if cfg!(feature = "m5_tenant_probe") {
+            assert_eq!(&reg.task_names[2][..19], b"m5.tenant.catalog.0");
+            assert_eq!(reg.task_names[2][19], 0);
+            assert_eq!(reg.task_kinds[2], TASK_LINUX);
+        }
     }
 
     /// The request path: an ENV_REGISTER for a live environment is answered with

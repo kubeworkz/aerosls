@@ -139,11 +139,13 @@ python3 - "$W/d3/user/proto/src/env_proto.rs" <<'PY'
 import sys
 p = sys.argv[1]
 s = open(p).read()
-s = s.replace("pub const REGISTER_REPLY_BODY_SIZE: usize = REG_OFF_TASK_KINDS + REGISTER_MAX_TASKS * 4;",
-              "pub const REGISTER_REPLY_BODY_SIZE: usize = REG_OFF_TASK_KINDS + REGISTER_MAX_TASKS * 8;")
+old = "pub const REGISTER_REPLY_BODY_SIZE: usize = REG_OFF_RESERVED + 4;"
+new = "pub const REGISTER_REPLY_BODY_SIZE: usize = REG_OFF_RESERVED + 8;"
+assert old in s, "body-size line missing"
+s = s.replace(old, new)
 open(p, "w").write(s)
 PY
-tooth "D. the Rust body-size formula counts the kind array twice over" "D" "$W/d3"
+tooth "D. the Rust body-size formula grows the tail padding" "D" "$W/d3"
 
 # ── E. The constants all agree and the FIELDS still move ──────────────────
 # The hard tooth: every offset formula and every scalar is unchanged; only the
@@ -205,8 +207,12 @@ sed -i 's/^    if (reg.partition_id != partition || reg.env_id != env_id ||$/   
 tooth "H. the reply's index is no longer checked against the one created" "H" "$W/h2"
 
 seed "$W/h3"
-sed -i 's/^            return proc_table\[i\].user_rip;$/            return 0;/' "$W/h3/kernel/env_service.c"
+sed -i 's/^        out->entry = proc_table\[i\].user_rip;$/        out->entry = 0;/' "$W/h3/kernel/env_service.c"
 tooth "H. the sidecar entry stops being read from the process table" "H" "$W/h3"
+
+seed "$W/h5"
+sed -i '/M5.2b: close the spawn-before-registration window/,/^    }$/d' "$W/h5/kernel/env_service.c"
+tooth "H. registration stops reconciling a Linux child that spawned first" "H" "$W/h5"
 
 seed "$W/h4"
 sed -i 's/                                    checkpoint_last_sequence());/                                    0);/' "$W/h4/kernel/env_service.c"

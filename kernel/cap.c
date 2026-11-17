@@ -4287,15 +4287,27 @@ static int cap_create_sidecar_in_personality_owned(uint32_t parent_pid,
          * scan at the stop and at teardown. The span is below %rsp, which
          * the psABI already treats as dead; the top page (the BIB) and the
          * image above %rsp are outside it by construction. */
+        /* M5.2b: the stack region's identity is stamped for EVERY Linux task,
+         * not only the gate profile — registration's task facts read it to
+         * fill the checkpoint record's stack bounds, and a tenant task must
+         * have them before any capture. The poison/scan remains gate-only: a
+         * shipped tenant carries no pattern. */
+        pd->linux_stack_base  = stack_base;
+        pd->linux_stack_pages = stk_pages;
         if (m.flags & SIDECAR_MANIFEST_FLAG_GATE) {
             uint64_t poison_bytes = built_rsp - stack_base;
             uint8_t* p = (uint8_t*)(uintptr_t)linux_stack_phys;
             uint64_t b;
             for (b = 0; b < poison_bytes; b++) p[b] = LINUX_STACK_POISON;
-            pd->linux_stack_base   = stack_base;
             pd->linux_stack_phys   = linux_stack_phys;
-            pd->linux_stack_pages  = stk_pages;
             pd->linux_stack_poison = (uint32_t)poison_bytes;
+        } else {
+            /* M5.2b: a non-gate Linux task carries no poison identity. Clear
+             * it here, not at slot reuse: a gate task's teardown scan still
+             * reads its own physical base and poison count after the
+             * descriptor has been reset for the next occupant. */
+            pd->linux_stack_phys   = 0;
+            pd->linux_stack_poison = 0;
         }
     }
     pd->owner_uid  = owner_uid ? owner_uid : parent->owner_uid;
@@ -4968,6 +4980,10 @@ static int cap_create_sidecar_in_personality_owned(uint32_t parent_pid,
      * census pair and the system firstuser) run in an environment that is
      * not in the checkpoint registry, and their absence from a record is
      * the truth, not a failure. */
+    /* M5.2b: the create's cap count is part of the task facts a checkpoint
+     * record carries. Stored on the descriptor for every child; the record
+     * layer reads it only for a LINUX task. */
+    pd->cap_count = (uint16_t)bib_n_caps;
     if (personality == PROC_PERSONALITY_LINUX && parent) {
         (void)env_ckpt_linux_task_stamp(parent->partition_id, parent->name,
                                         pd->name, pd->user_rip,

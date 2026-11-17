@@ -229,6 +229,16 @@ wait_for "$SPAWN_NEEDLE" 120 "$SPAWN_WHAT" || \
     fail "the sidecar never spawned the M5.2 probe"
 wait_for "M52-CATALOG-OK" "$SPAWN_WAIT" "the probe's success marker" || \
     fail "the probe did not report M52-CATALOG-OK"
+if [ "$PROFILE" = tenant ]; then
+    # M5.2b: the registration names this task, and the kernel stamps its
+    # entry/stack/caps into the record. This is the live assertion that the
+    # tenant stamp LANDS — it is NOT a checkpoint/restore claim (M5.2b does
+    # not capture or replay the tenant).
+    wait_for "[ENV_CKPT] linux task 'm5.tenant.catalog.0' stamped" 30 \
+        "the tenant Linux task's checkpoint stamp" || \
+        fail "the tenant Linux task was never stamped into a checkpoint record"
+    echo "ok:   the tenant Linux task is registered and its stamp landed (registration only; no tenant checkpoint/restore)"
+fi
 if grep -aqF "M52-CATALOG-FAIL" "$LOG"; then
     fail "the probe reported M52-CATALOG-FAIL"
 fi

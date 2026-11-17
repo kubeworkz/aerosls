@@ -191,6 +191,15 @@ pub const TASK_LINUX: u32 = 2;
 /// against the ones it adopted. Fits `REGISTER_NAME_LEN` (24) with room.
 pub const LINUX_TASK_NAME: &str = "e7.gate.user.0";
 
+/// M5.2b: the ordinary-tenant test profile's Linux task — the task
+/// `user/sidecar/src/m5_catalog_probe.rs` spawns under `M5_TENANT_ENV_INDEX` and
+/// the third task init's registration names for that profile. ONE constant,
+/// because the two halves must agree exactly: the kernel stamps entry/stack
+/// into the record slot whose name matches the spawned task, and a restore
+/// compares the names it re-creates against the ones it adopted. Fits
+/// `REGISTER_NAME_LEN` (24) with room.
+pub const TENANT_LINUX_TASK_NAME: &str = "m5.tenant.catalog.0";
+
 /// M4.6 increment 1's live probe task. It is the SAME third task slot as
 /// `LINUX_TASK_NAME`, selected by the `m4_ckpt_probe` build profile; the
 /// sidecar spawns it and init's registration names it under the same profile.

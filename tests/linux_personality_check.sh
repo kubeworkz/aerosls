@@ -1323,6 +1323,10 @@ ECKH=kernel/env_ckpt.h
 ECKC=kernel/env_ckpt.c
 IEM=user/init/src/env_manager.rs
 ENVP=user/proto/src/env_proto.rs
+M5CP=user/sidecar/src/m5_catalog_probe.rs
+SVC=kernel/env_service.c
+SVC_HUT=tests/env_service_wait_host_test.c
+M5LIVE=tests/m5_catalog_live_check.sh
 EPHUT=tests/env_payload_host_test.c
 ECKHUT=tests/env_ckpt_host_test.c
 if grep -qF '#define ENV_PAYLOAD_REC_VERSION 3u' "$EPH" && \
@@ -1401,6 +1405,32 @@ if grep -qF 'pub const LINUX_TASK_NAME: &str = "e7.gate.user.0";' "$ENVP" && \
     ok "W5. registration is settled: the manager names the third task from the SAME gate bit that selected the manifest (so a replay's create names the same list), the sidecar spawns that one name, the record accepts a Linux entry of 0 until the spawn, and the kernel stamps entry/stack/caps at the create — the only place they are known"
 else
     bad "W5. the registration chain has a hole — the record would name a task nobody spawns (or vice versa), a Linux slot's not-yet-spawned entry would refuse the whole registration, or the stamped entry/stack/caps would never reach the record"
+fi
+# ─── W5b. M5.2b: the ordinary tenant's task is registered with its facts ───
+# The tenant profile names the child init registers (one constant, so the
+# sidecar's spawn and the record cannot drift), the kernel stores the stack
+# bounds for every Linux task before any capture, and registration reconciles
+# a child that was already spawned when the record appeared. The live arm
+# asserts the stamp lands; this clause pins the wiring it depends on.
+if grep -qF 'pub const TENANT_LINUX_TASK_NAME: &str = "m5.tenant.catalog.0";' "$ENVP" && \
+   grep -qF 'pub const TENANT_PROBE_NAME: &str = aerosls_proto::env_proto::TENANT_LINUX_TASK_NAME;' "$M5CP" && \
+   grep -qF 'pub tenant_linux: bool,' "$IEM" && \
+   grep -qF 'cfg!(feature = "m5_tenant_probe") && index == M5_TENANT_ENV_INDEX;' "$IEM" && \
+   grep -qF '} else if env.tenant_linux {' "$IEM" && \
+   grep -qF 'pd->linux_stack_base  = stack_base;' "$CAPC" && \
+   grep -qF 'pd->linux_stack_pages = stk_pages;' "$CAPC" && \
+   grep -qF 'uint16_t   cap_count;' "$PDH" && \
+   grep -qF 'pd->cap_count          = 0;' "$PDC" && \
+   grep -qF 'struct EnvSvcTaskFacts {' "$SVC" && \
+   grep -qF 'out->stack_bottom = proc_table[i].linux_stack_base;' "$SVC" && \
+   grep -qF '(void)env_ckpt_linux_task_stamp(partition, parent_name,' "$SVC" && \
+   grep -qF "an ordinary-tenant Linux slot registered with entry 0 is valid, like the gate's" "$ECKHUT" && \
+   grep -qF "the tenant slot carries its entry, stack bounds and cap count -- the probe's zero caps" "$ECKHUT" && \
+   grep -qF "the already-live Linux child's entry, stack bounds and cap count are stamped into the record" "$SVC_HUT" && \
+   grep -qF "linux task 'm5.tenant.catalog.0' stamped" "$M5LIVE"; then
+    ok "W5b. M5.2b: init registers the tenant task from the same profile bit that selected its manifest, the sidecar spawns the same name, the kernel records stack bounds for every Linux task and cap counts at create, registration re-stamps a child that spawned first, and the live harness asserts the tenant stamp lands"
+else
+    bad "W5b. the ordinary tenant's task-facts chain has a hole — the record would name a task nobody spawns, a live child's stack bounds would stay zero, or a child that beat registration would never be stamped (the live assertion would then have nothing to find)"
 fi
 if grep -qF 'LINUX: the gate environment (sidecar + Linux tenant) captures as one payload' "$EPHUT" && \
    grep -qF 'LINUX: the full ring3_ctx — rip, rsp and the six argument registers — is the captured one' "$EPHUT" && \

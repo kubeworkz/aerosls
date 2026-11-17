@@ -1,0 +1,15 @@
+=== boot: sls_operating_system_e3_m52a.iso (grub entry 3) ===
+up: control plane on 32001
+partition=1
+uids: dave=1000 bob=1001 assigned to partition 1
+tables: m52_dave (dave), m52_bob (bob), m52_foreign (partition system)
+tenant env=1 (index 3, owner bob)
+ok:   the tenant Linux task is registered and its stamp landed (registration only; no tenant checkpoint/restore)
+ok:   the tenant probe ran without the gate profile (no [E7-GATE])
+ok:   the Linux task issued 334 and got the promised answers (M52-CATALOG-OK)
+ok:   native observer sees bob's committed UPDATE ('updated')
+ok:   dave's row is unchanged ('untouched', no 'denied') — the EPERM refusal did not execute
+ok:   the foreign table exists in the catalog; its ENOENT was the partition boundary
+M5.2 live tenant profile: PASS (partition=1 env=1)
+artifacts: /tmp/m52b_evidence
+EXIT=0

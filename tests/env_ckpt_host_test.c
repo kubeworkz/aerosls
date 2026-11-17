@@ -754,6 +754,45 @@ int main(void) {
               "a two-task create is refused: an allowance for \"the Linux task arrived late\" is a second restore path");
     }
 
+    /* ── 27. M5.2b: the ordinary-tenant Linux task is the same slot ─────────
+     * The tenant profile names a DIFFERENT third task (the ordinary sidecar's
+     * probe), but the record layer must treat it exactly like the gate
+     * tenant's: a Linux slot may start at entry 0, the spawn stamp fills it,
+     * and the kind -- not the profile -- is what earns the zero-entry
+     * exception. The identity comparison must also see the two names as
+     * different environments, or a gate replay could adopt a tenant record. */
+    {
+        struct EnvCkptRecord r = good_record(10, 3);
+        r.n_tasks = 3;
+        strcpy(r.tasks[2].name, "m5.tenant.catalog.0");
+        r.tasks[2].kind = ENV_CKPT_TASK_LINUX;
+        r.tasks[2].entry = 0;
+        CHECK(env_ckpt_valid(&r) == ENV_CKPT_REFUSE_NONE,
+              "an ordinary-tenant Linux slot registered with entry 0 is valid, like the gate's");
+
+        env_ckpt_reset();
+        CHECK(env_ckpt_record(&r) == 0 && env_ckpt_count_live() == 1,
+              "(setup) the three-task tenant record is stored");
+        CHECK(env_ckpt_linux_task_stamp(10, "aerosls.posix.0", "m5.tenant.catalog.0",
+                                        0x600000ull, 0x610000ull, 0x614000ull, 0) == 1,
+              "the tenant spawn stamp lands by name in the tenant's own partition");
+        {
+            const struct EnvCkptRecord* got = env_ckpt_find(10, 3);
+            CHECK(got && got->tasks[2].entry == 0x600000ull &&
+                  got->tasks[2].stack_bottom == 0x610000ull &&
+                  got->tasks[2].stack_top == 0x614000ull &&
+                  got->tasks[2].cap_count == 0,
+                  "the tenant slot carries its entry, stack bounds and cap count -- the probe's zero caps");
+            CHECK(env_ckpt_valid(got) == ENV_CKPT_REFUSE_NONE,
+                  "the stamped tenant record still validates");
+
+            struct EnvCkptRecord gate = *got;
+            strcpy(gate.tasks[2].name, "e7.gate.user.0");
+            CHECK(env_ckpt_restore_same_identity(got, &gate) == 0,
+                  "a gate record and a tenant record with different Linux task names are NOT the same environment");
+        }
+    }
+
     printf("\n%d passed, %d failed\n", checks_passed, checks_failed);
     return checks_failed == 0 ? 0 : 1;
 }

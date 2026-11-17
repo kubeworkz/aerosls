@@ -3374,7 +3374,8 @@ The report now sits at every teardown — `process_kill` for a non-running
 target, `schedule_ring3`'s deferred branch and its sweep of targets that parked
 before the tick (scanned where the kill is carried out, not at the request, when
 the stack could still grow), and `process_exit` for a fault — always before
-`proc_clear_resume_state()` drops the poison identity. The second run (build id
+`proc_clear_resume_state()` drops the base/page fields the report prints; the
+physical base and poison count are cleared by a non-gate Linux create. The second run (build id
 20261102153754) is otherwise the same invocation: rc=0, the same seven reds,
 the control green. The `no-heap` recording now carries `stack hwm (exit): …
 deepest=2648`, exactly as deep as its stop, B7 compares it like any adopted

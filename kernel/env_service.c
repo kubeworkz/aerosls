@@ -314,18 +314,39 @@ int env_service_destroy(uint32_t env_id, uint32_t partition,
     return rc;
 }
 
-/* P1a: where the kernel put the sidecar `name` registered under in `partition`
- * -- its entry point, read off the process descriptor cap_create_sidecar
- * populated (`user_rip = image_vbase + image_entry`, set at create and never
- * clobbered afterwards; a park saves the resume RIP in park_ctx, not here).
- * 0 when the name does not resolve, which the record layer refuses rather than
- * storing a task no restore could place. */
-static uint64_t env_service_task_entry(const char* name, uint32_t partition) {
+/* P1a/M5.2b: where the kernel put the task `name` registered under in
+ * `partition`, with the facts a checkpoint record's Linux slot carries.
+ * `entry` is cap_create_sidecar's `user_rip` (set at create and never
+ * clobbered afterwards; a park saves the resume RIP in park_ctx, not here),
+ * and the stack bounds are the region cap.c stamped for every Linux task.
+ * A name that does not resolve answers 0; a sidecar entry of 0 is refused by
+ * the record layer, while a LINUX entry of 0 is the honest "not spawned yet".
+ * One lookup for both halves, because a second scan of the process table is
+ * how the two ends' notions of "live" would drift apart. */
+struct EnvSvcTaskFacts {
+    uint64_t entry;
+    uint64_t stack_bottom;
+    uint64_t stack_top;
+    uint32_t cap_count;
+};
+
+static int env_service_task_facts(const char* name, uint32_t partition,
+                                  struct EnvSvcTaskFacts* out) {
+    if (!out) return 0;
+    out->entry = 0;
+    out->stack_bottom = 0;
+    out->stack_top = 0;
+    out->cap_count = 0;
     uint32_t pid = sidecar_registry_resolve(name, partition);
     if (pid == 0) return 0;
     for (int i = 0; i < PROC_MAX; i++) {
-        if (proc_table[i].active && proc_table[i].pid == pid)
-            return proc_table[i].user_rip;
+        if (!proc_table[i].active || proc_table[i].pid != pid) continue;
+        out->entry = proc_table[i].user_rip;
+        out->stack_bottom = proc_table[i].linux_stack_base;
+        out->stack_top = proc_table[i].linux_stack_base +
+                         (uint64_t)proc_table[i].linux_stack_pages * 4096ull;
+        out->cap_count = (uint32_t)proc_table[i].cap_count;
+        return 1;
     }
     return 0;
 }
@@ -386,8 +407,10 @@ int env_service_register_env(uint32_t partition, uint32_t index,
      * only for the tasks the manager named, so an unasked-for slot stays 0. */
     uint64_t entries[ENV_CKPT_MAX_TASKS];
     for (uint32_t i = 0; i < ENV_CKPT_MAX_TASKS; i++) {
-        entries[i] = (i < reg.n_tasks)
-                   ? env_service_task_entry(reg.task_name[i], partition) : 0;
+        struct EnvSvcTaskFacts facts;
+        entries[i] = (i < reg.n_tasks &&
+                      env_service_task_facts(reg.task_name[i], partition, &facts))
+                   ? facts.entry : 0;
     }
 
     int rc = env_ckpt_register_from(&reg, entries, console_id,
@@ -402,6 +425,37 @@ int env_service_register_env(uint32_t partition, uint32_t index,
             (unsigned)env_id, (unsigned)partition, (unsigned)index,
             (int)rc, why);
         return -1;
+    }
+
+    /* M5.2b: close the spawn-before-registration window. The sidecar starts
+     * booting inside ENV_CREATE, so its Linux child can exist before this
+     * record does -- and the spawn-time stamp (cap.c) then finds no record to
+     * stamp. Re-resolve every named Linux task AFTER the record is stored and
+     * stamp it here. A child that appears later is covered by the spawn-time
+     * stamp; a child that appeared earlier is covered by this pass; a child
+     * that appears between the two is covered by whichever sees the record
+     * first (the stamp is idempotent). */
+    {
+        const char* parent_name = 0;
+        for (uint32_t i = 0; i < reg.n_tasks && i < ENV_CKPT_MAX_TASKS; i++) {
+            if (reg.task_kind[i] == ENV_CKPT_TASK_POSIX_SIDECAR) {
+                parent_name = reg.task_name[i];
+                break;
+            }
+        }
+        if (parent_name) {
+            for (uint32_t i = 0; i < reg.n_tasks && i < ENV_CKPT_MAX_TASKS; i++) {
+                if (reg.task_kind[i] != ENV_CKPT_TASK_LINUX) continue;
+                struct EnvSvcTaskFacts facts;
+                if (!env_service_task_facts(reg.task_name[i], partition, &facts) ||
+                    facts.entry == 0)
+                    continue;
+                (void)env_ckpt_linux_task_stamp(partition, parent_name,
+                                                reg.task_name[i], facts.entry,
+                                                facts.stack_bottom, facts.stack_top,
+                                                facts.cap_count);
+            }
+        }
     }
     kernel_serial_printf(
         "[ENV] checkpoint record registered: env %u (partition %u, index %u) "

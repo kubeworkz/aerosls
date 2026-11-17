@@ -345,6 +345,43 @@ int main(void) {
               "and the refused one displaced nothing");
     }
 
+    /* ── 9. M5.2b: init can register the ordinary tenant's Linux task ──────
+     * The third slot is the same wire shape the gate profile uses; what
+     * changes is the name and the profile that selected it. The record must
+     * accept the tenant name at entry 0 (the task is not spawned yet) and the
+     * wire must carry it in slot 2 without disturbing the two sidecars. */
+    {
+        env_ckpt_reset();
+        struct EnvCkptRegister r = good_register(10, 3, 88);
+        r.n_tasks = 3;
+        memcpy(r.task_name[2], "m5.tenant.catalog.0", 20);
+        r.task_kind[2] = ENV_CKPT_TASK_LINUX;
+
+        uint8_t b[ENV_REGISTER_REPLY_BODY_SIZE];
+        env_register_reply_encode(b, &r);
+        CHECK(env_read_u32(b, 84) == 3u,
+              "the tenant registration's wire body reports three tasks");
+        CHECK(memcmp(b + 88 + 2 * 24, "m5.tenant.catalog.0", 20) == 0 &&
+              b[88 + 2 * 24 + 20] == 0,
+              "task 2's name sits in its own 24-byte stride, NUL-padded");
+        CHECK(env_read_u32(b, 184 + 2 * 4) == ENV_CKPT_TASK_LINUX,
+              "task 2's kind is LINUX, the kind the zero-entry exception belongs to");
+
+        uint64_t entries[ENV_CKPT_MAX_TASKS] = {
+            0x0000000040001000ull, 0x0000000040002000ull, 0, 0
+        };
+        CHECK(env_ckpt_register_from(&r, entries, 3, 12) == 0,
+              "the tenant registration becomes a record with its Linux task unspawned");
+        const struct EnvCkptRecord* rec = env_ckpt_find(10, 3);
+        CHECK(rec && rec->n_tasks == 3 &&
+              strcmp(rec->tasks[2].name, "m5.tenant.catalog.0") == 0 &&
+              rec->tasks[2].kind == ENV_CKPT_TASK_LINUX &&
+              rec->tasks[2].entry == 0,
+              "the record names the tenant task, keeps the kernel's two sidecar entries, and leaves the Linux entry for its spawn");
+        CHECK(rec && env_ckpt_valid(rec) == ENV_CKPT_REFUSE_NONE,
+              "and the three-task tenant record passes the gate");
+    }
+
     printf("\n%d checks passed, %d failed\n", checks_passed, checks_failed);
     if (checks_failed == 0) {
         printf("ALL PASS: the environment manager's registration becomes a record\n");

@@ -260,10 +260,12 @@ grep -qF 'r.chans = [env.ramdisk_r, env.ramdisk_w, env.posix_r, env.posix_w];' "
     || map_bad="$map_bad chans"
 grep -qF 'r.set_task(0, rd.as_str(), TASK_RAMDISK_SIDECAR);' "$R_MGR" || map_bad="$map_bad rd-task"
 grep -qF 'r.set_task(1, px.as_str(), TASK_POSIX_SIDECAR);' "$R_MGR" || map_bad="$map_bad px-task"
+grep -qF '} else if env.tenant_linux {' "$R_MGR" || map_bad="$map_bad tenant-branch"
+grep -qF 'r.set_task(2, TENANT_LINUX_TASK_NAME, TASK_LINUX);' "$R_MGR" || map_bad="$map_bad tenant-task"
 if [ -n "$map_bad" ]; then
     bad "G. init's registration is missing or mismapping:$map_bad — every one of these is a fact only init has, and a registration that drops one leaves the record describing some other environment"
 else
-    ok "G. init reports its three kind-labelled regions (POSIX heap from px_heap, the record's order, not the struct's), its four channels and both sidecar names"
+    ok "G. init reports its three kind-labelled regions (POSIX heap from px_heap, the record's order, not the struct's), its four channels, both sidecar names and the tenant profile's Linux task"
 fi
 
 # ── H. The kernel's create path reaches the registration ──────────────────
@@ -280,8 +282,12 @@ grep -qF "env_register_reply_parse(reply + ENV_FRAME_SIZE," "$C_SVC" \
     || reach_bad="$reach_bad no-reply-parse"
 grep -qF "sidecar_registry_resolve(name, partition)" "$C_SVC" \
     || reach_bad="$reach_bad no-sidecar-resolve"
-grep -qF "return proc_table[i].user_rip;" "$C_SVC" \
+grep -qF "out->entry = proc_table[i].user_rip;" "$C_SVC" \
     || reach_bad="$reach_bad no-user-rip"
+grep -qF "env_service_task_facts(reg.task_name[i], partition," "$C_SVC" \
+    || reach_bad="$reach_bad no-task-facts"
+grep -qF "(void)env_ckpt_linux_task_stamp(partition, parent_name," "$C_SVC" \
+    || reach_bad="$reach_bad no-post-register-stamp"
 grep -qF "checkpoint_last_sequence()" "$C_SVC" \
     || reach_bad="$reach_bad no-sequence"
 # The reply must be about the environment the request named, on all three
@@ -295,7 +301,7 @@ grep -qF "env_ckpt_register_from(&reg, entries, console_id," "$C_SVC" \
 if [ -n "$reach_bad" ]; then
     bad "H. the create path does not reach the registration:$reach_bad — an environment created without one is live, reachable, and invisible to a checkpoint"
 else
-    ok "H. env_service_create() registers every environment it creates: round trip, identity-checked reply, kernel-resolved sidecar entries, checkpoint-stamped record"
+    ok "H. env_service_create() registers every environment it creates: round trip, identity-checked reply, kernel-resolved task facts, checkpoint-stamped record, and a post-registration pass for a Linux child that spawned first"
 fi
 
 # ── I. init answers ENV_REGISTER, with room for the body ──────────────────
