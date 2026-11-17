@@ -524,8 +524,8 @@ if grep -qF 'const E_BADF: i32 = -2;' "$LRS" && \
    grep -qF '1 => match fd_kind(fds, args[0]) {' "$LRS" && \
    grep -qF 'None => Answer::Reply(0, E_BADF),' "$LRS" && \
    grep -qF 'fds: [FdSlot; LINUX_MAX_FDS],' "$LRS" && \
-   grep -qF 't.fds = [FdSlot { used: false, kind: 0, vfs_fd: 0, flags: 0 }; LINUX_MAX_FDS];' "$LRS" && \
-   grep -qF 't.fds.iter_mut().take(3)' "$LRS"; then
+   grep -qF 'fds: [FdSlot { used: false, kind: 0, vfs_fd: 0, flags: 0 }; LINUX_MAX_FDS],' "$LRS" && \
+   grep -qF 'g.fds.iter_mut().take(3)' "$LRS"; then
     ok "M5. the sidecar's fd table exists per task (console slots plus step 4's File kind carrying the VFS fd and flags), is born with console stdio (0/1/2), and an unknown descriptor is EBADF — CAP_EBADF pinned at -2 so §5.7 delivers 9"
 else
     bad "M5. the fd table or its EBADF arm is gone — a descriptor nobody registered would be performed (or fake-answered) instead of refused, and a drifted E_BADF would surface a different errno than the policy meant"
@@ -626,7 +626,7 @@ else
 fi
 if grep -qF 'if want > brk.cur && want <= brk.mtop {' "$LRS" && \
    grep -qF 'Answer::Reply(brk.cur, STATUS_OK)' "$LRS" && \
-   grep -qF 't.brk_cur = heap_base;' "$LRS"; then
+   grep -qF 'g.brk_cur = heap_base;' "$LRS"; then
     ok "N7. the sidecar's brk arm grants only inside the span CAPPED by the map cursor and answers the UNCHANGED current break otherwise — Linux's own failure shape, a value not an errno, so no libc's brk wrapper can be surprised, and never a page a granted map owns"
 else
     bad "N7. the brk arm changed shape — an errno on refusal (no libc's brk wrapper is written against it), a grant outside the span (the kernel's verdict then refuses and the two halves disagree on every reply), or a ledger not born at the span's base"
@@ -1033,7 +1033,8 @@ else
 fi
 if grep -qF 'let timeout = crate::linux::next_wait_ns(&RealKernel);' user/sidecar/src/entry.rs && \
    grep -qF 'pub fn next_wait_ns<K: Kernel>(k: &K) -> u64' "$LRS" && \
-   grep -qF 't.pending == PENDING_POLL && t.pending_deadline != 0' "$LRS"; then
+   grep -qF '(t.pending == PENDING_POLL || t.pending == PENDING_FUTEX)' "$LRS" &&
+   grep -qF 't.pending_deadline != 0' "$LRS"; then
     ok "S3. the entry loop waits with the nearest finite poll deadline — a timed poll wakes the parked sidecar at its own timeout instead of waiting for an unrelated channel, and a read/forever-poll keeps the old block-forever shape"
 else
     bad "S3. the quiesce wait no longer carries poll's deadline — a 5 s poll would sleep until some other channel happened to wake the loop, and its timeout would be decided by unrelated traffic"
@@ -1275,9 +1276,9 @@ if [ -n "$mmap_arm" ] && \
    sed -n "$((mmap_arm + 1)),$((mmap_arm + 60))p" "$LRS" | grep -qF 'checked_sub(len_r)' && \
    sed -n "$((mmap_arm + 1)),$((mmap_arm + 60))p" "$LRS" | grep -qF 'Answer::Reply(0, E_NOMEM)' && \
    grep -qF 'mtop: u64,' "$LRS" && \
-   grep -qF 't.brk_mtop = heap_limit;' "$LRS" && \
+   grep -qF 'g.brk_mtop = heap_limit;' "$LRS" && \
    grep -qF 'want > brk.cur && want <= brk.mtop' "$LRS" && \
-   grep -qF 'tasks()[i].brk_mtop = mem.mtop;' "$LRS"; then
+   grep -qF 'groups()[gid].brk_mtop = mem.mtop;' "$LRS"; then
     ok "V5. the sidecar's 9 arm is the ladder's twin and the ledger's policy — the closed allowlist, the overflow-checked page-round, the descending cursor with its checked subtract, ENOMEM when the gap cannot fit, mtop born at the span's top, survived across the reply, and brk's ceiling capped by it (neither end load-bearing alone)"
 else
     bad "V5. the arm, the ledger's mtop or brk's cap is gone — the cursor could hand the same arena out twice, land under the break, or a brk growth could map over an arena the other side granted"
