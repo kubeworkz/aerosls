@@ -520,6 +520,14 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     // selector, not a grant: the tenant's caps are exactly the plain
     // profile's, and the BIB is the one thing every sidecar already reads.
     let gate = bib.is_gate_profile();
+    // M5.2a: a separate profile bit, not a wider gate. It selects the same
+    // M5.2 catalog probe in an ordinary tenant without the gate's stop,
+    // stack poison or checkpoint task registration. Compiled only into the
+    // probe build; the default sidecar has no use for the bit. Gate wins if
+    // a hand-built manifest ever carries both profile bits: the gate path
+    // must not silently lose its stop/checkpoint posture.
+    #[cfg(feature = "m5_catalog_probe")]
+    let tenant_linux = !gate && bib.is_tenant_linux();
     if census_host || gate {
         if !gate {
             // E7 boot proof (Linux ABI Shim Design §3.3 steps 5-7): spawn the
@@ -701,33 +709,73 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         }
     }
 
-    // M5.2: the gate environment's Linux-personality CAT_EXEC probe. It is
-    // spawned only into the gate profile, which is the profile a live run can
-    // create with a bob-owned environment; ordinary tenant environments do
-    // not compile or spawn this arm. The child holds no catalog cap: 334 is
-    // forwarded to THIS sidecar and answered from `booted.proc.catalog`.
+    // M5.2/M5.2a: the Linux-personality CAT_EXEC probe. The gate profile
+    // spawns it under the gate identity; M5.2a's ordinary tenant profile
+    // spawns the SAME probe under its own tenant name. In both cases the
+    // child holds no catalog cap: 334 is forwarded to THIS sidecar and
+    // answered from `booted.proc.catalog`. The tenant arm is selected by the
+    // separate BIB bit, never by `gate`.
     #[cfg(feature = "m5_catalog_probe")]
     {
-        if gate {
-            match crate::m5_catalog_probe::spawn(
-                &RealKernel, caps.budget_base, caps.budget_len)
-            {
+        if gate || tenant_linux {
+            let probe_name = if tenant_linux {
+                crate::m5_catalog_probe::TENANT_PROBE_NAME
+            } else {
+                crate::m5_catalog_probe::PROBE_NAME
+            };
+            let spawned = if tenant_linux {
+                crate::m5_catalog_probe::spawn_tenant(
+                    &RealKernel, caps.budget_base, caps.budget_len)
+            } else {
+                crate::m5_catalog_probe::spawn(
+                    &RealKernel, caps.budget_base, caps.budget_len)
+            };
+            match spawned {
                 Ok(sp) => match booted.proc.vfs.add_task() {
                     Ok(vt) => {
-                        if crate::linux::track(
-                            sp.ch_r, sp.ch_w, crate::m5_catalog_probe::PROBE_NAME,
-                            0, sp.heap_base, sp.heap_limit, vt,
-                            RealKernel.sidecar_pid(crate::m5_catalog_probe::PROBE_NAME, 0) as u64,
-                            true,
-                        ) {
-                            klog(b"[M5.2] catalog probe: spawned ch_r=", sp.ch_r, b"");
+                        let tracked = if tenant_linux {
+                            crate::linux::track_mirrored(
+                                sp.ch_r, sp.ch_w, probe_name,
+                                0, sp.heap_base, sp.heap_limit, vt,
+                                RealKernel.sidecar_pid(probe_name, 0) as u64,
+                            )
                         } else {
-                            klog(b"[M5.2] catalog probe: TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+                            crate::linux::track(
+                                sp.ch_r, sp.ch_w, probe_name,
+                                0, sp.heap_base, sp.heap_limit, vt,
+                                RealKernel.sidecar_pid(probe_name, 0) as u64,
+                                true,
+                            )
+                        };
+                        if tracked {
+                            if tenant_linux {
+                                klog(b"[M5.2] tenant probe: spawned ch_r=", sp.ch_r, b"");
+                            } else {
+                                klog(b"[M5.2] catalog probe: spawned ch_r=", sp.ch_r, b"");
+                            }
+                        } else {
+                            if tenant_linux {
+                                klog(b"[M5.2] tenant probe: TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+                            } else {
+                                klog(b"[M5.2] catalog probe: TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+                            }
                         }
                     }
-                    Err(_) => klog(b"[M5.2] catalog probe: VFS task alloc FAILED ch_r=", sp.ch_r, b""),
+                    Err(_) => {
+                        if tenant_linux {
+                            klog(b"[M5.2] tenant probe: VFS task alloc FAILED ch_r=", sp.ch_r, b"");
+                        } else {
+                            klog(b"[M5.2] catalog probe: VFS task alloc FAILED ch_r=", sp.ch_r, b"");
+                        }
+                    }
                 },
-                Err(rc) => klog(b"[M5.2] catalog probe: spawn FAILED rc=", rc as u32, b""),
+                Err(rc) => {
+                    if tenant_linux {
+                        klog(b"[M5.2] tenant probe: spawn FAILED rc=", rc as u32, b"");
+                    } else {
+                        klog(b"[M5.2] catalog probe: spawn FAILED rc=", rc as u32, b"");
+                    }
+                }
             }
         }
     }

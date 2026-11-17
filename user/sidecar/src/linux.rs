@@ -3033,6 +3033,10 @@ struct LinuxGroup {
     tgid: u64,                /* M4.5: the leader's kernel TID             */
     partition: u32,
     gate: bool,
+    /// M5.2a: mirror console writes to the kernel serial log even when this
+    /// is not the gate profile. Set only by test-profile spawn paths; the
+    /// gate keeps its own `gate` bit for the stop/read instrument.
+    mirror_console: bool,
     fds: [FdSlot; LINUX_MAX_FDS],
     brk_base: u64,
     brk_limit: u64,
@@ -3052,6 +3056,7 @@ impl LinuxGroup {
             tgid: 0,
             partition: 0,
             gate: false,
+            mirror_console: false,
             fds: [FdSlot { used: false, kind: 0, vfs_fd: 0, flags: 0 };
                   LINUX_MAX_FDS],
             brk_base: 0,
@@ -3180,6 +3185,40 @@ pub fn track(
                       * user — mirror its console output to the serial
                       * log (the tenant console is otherwise unobserved) */
 ) -> bool {
+    track_mode(ch_r, ch_w, name, partition, heap_base, heap_limit, vfs_task,
+               leader_tid, gate, gate)
+}
+
+/// M5.2a: track an ordinary-tenant test child whose console must be visible
+/// on the serial log, without claiming the gate profile. `gate` stays false,
+/// so the gate read/stop instrument is not armed; only console mirroring is
+/// enabled.
+pub fn track_mirrored(
+    ch_r: u32,
+    ch_w: u32,
+    name: &str,
+    partition: u32,
+    heap_base: u64,
+    heap_limit: u64,
+    vfs_task: u32,
+    leader_tid: u64,
+) -> bool {
+    track_mode(ch_r, ch_w, name, partition, heap_base, heap_limit, vfs_task,
+               leader_tid, false, true)
+}
+
+fn track_mode(
+    ch_r: u32,
+    ch_w: u32,
+    name: &str,
+    partition: u32,
+    heap_base: u64,
+    heap_limit: u64,
+    vfs_task: u32,
+    leader_tid: u64,
+    gate: bool,
+    mirror_console: bool,
+) -> bool {
     let nlen = name.len().min(48);
     let Some(tslot) = tasks().iter().position(|t| !t.used) else {
         return false;
@@ -3199,6 +3238,7 @@ pub fn track(
     g.tgid = leader_tid;
     g.partition = partition;
     g.gate = gate;
+    g.mirror_console = mirror_console;
     g.brk_base = heap_base;
     g.brk_limit = heap_limit;
     g.brk_cur = heap_base;
@@ -4618,12 +4658,14 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                     Ok(n) => {
                         /* Increment 19: the gate tenant's console is its OWN
                          * environment console, which no attach surface is
-                         * reading in this run. Mirror the child's bytes to
-                         * the kernel serial log so the work-half measurement
-                         * (Copying / Done / pruned) is observed, not inferred
+                         * reading in this run. M5.2a's ordinary-tenant test
+                         * profile has the same observability problem. Mirror
+                         * the child's bytes to the kernel serial log so the
+                         * work-half measurement (Copying / Done / pruned) and
+                         * the tenant probe's marker are observed, not inferred
                          * from a buffered stream nobody drained. */
                         #[cfg(feature = "target")]
-                        if groups()[gid].gate {
+                        if groups()[gid].mirror_console {
                             crate::entry::serial_write_raw(&payload[..len]);
                         }
                         /* Attribution — the SIGABRT reading's instrument:

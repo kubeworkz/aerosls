@@ -1,8 +1,9 @@
 //! m5_catalog_probe.rs — M5.2's live Linux-personality CAT_EXEC probe.
 //!
-//! The gate profile already creates a bob-owned environment whose POSIX
-//! sidecar holds the one registered `kernel.env.catalog` channel. This module
-//! spawns one more Linux child into that environment; its flat payload
+//! The gate profile creates a bob-owned environment whose POSIX sidecar holds
+//! the one registered `kernel.env.catalog` channel. M5.2a's ordinary-tenant
+//! test profile creates the same environment without `FLAG_GATE`. This module
+//! spawns one more Linux child into either environment; its flat payload
 //! (`fixtures/e7_catalog_probe.flat`) issues `SYS_SLS_CATALOG_EXEC` (334)
 //! through the ordinary trap path. The child carries NO catalog capability:
 //! the kernel forwards the request to its sidecar, and the sidecar's
@@ -23,6 +24,9 @@ use crate::linux::LINUX_DEFAULT_ENV;
 static PROBE: &[u8] = include_bytes!("../fixtures/e7_catalog_probe.flat");
 
 pub const PROBE_NAME: &str = "m5.linux.catalog.0";
+/// M5.2a: the ordinary-tenant test probe. A distinct name keeps the tenant
+/// child out of the gate profile's identity and checkpoint vocabulary.
+pub const TENANT_PROBE_NAME: &str = "m5.tenant.catalog.0";
 pub const PROBE_RESERVE: u64 = 64 * 1024;
 
 const IMAGE_VBASE: u64 = 0x4000_0000_0000; /* USER_PROC_CODE_BASE */
@@ -41,6 +45,26 @@ pub fn spawn<K: aerosls_proto::kabi::Kernel>(
     k: &K,
     budget_base: u64,
     budget_len: u64,
+) -> Result<Spawned, i32> {
+    spawn_named(k, budget_base, budget_len, PROBE_NAME)
+}
+
+/// M5.2a: spawn the same probe into an ordinary tenant environment under its
+/// own identity. The payload, zero-cap manifest and syscall path are
+/// unchanged; only the child's name differs.
+pub fn spawn_tenant<K: aerosls_proto::kabi::Kernel>(
+    k: &K,
+    budget_base: u64,
+    budget_len: u64,
+) -> Result<Spawned, i32> {
+    spawn_named(k, budget_base, budget_len, TENANT_PROBE_NAME)
+}
+
+fn spawn_named<K: aerosls_proto::kabi::Kernel>(
+    k: &K,
+    budget_base: u64,
+    budget_len: u64,
+    name: &str,
 ) -> Result<Spawned, i32> {
     if budget_len < PROBE_RESERVE + 0x1000 {
         return Err(-1);
@@ -62,7 +86,7 @@ pub fn spawn<K: aerosls_proto::kabi::Kernel>(
         version_major: 1,
         version_minor: 0,
         flags: 0,
-        name: Some(PROBE_NAME),
+        name: Some(name),
         personality: Some("e7.linux.v1"),
         image: Some(Image {
             offset: 0,
@@ -90,7 +114,7 @@ pub fn spawn<K: aerosls_proto::kabi::Kernel>(
             log_level: 1,
         }),
         flags_value: Some(0),
-        argenv: Some(ArgEnv::new(&[PROBE_NAME], LINUX_DEFAULT_ENV)),
+        argenv: Some(ArgEnv::new(&[name], LINUX_DEFAULT_ENV)),
         signature: None,
     };
 
