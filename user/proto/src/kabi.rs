@@ -105,6 +105,22 @@ pub struct LinuxRobustExitReq {
     pub status: u32,
 }
 
+/// M4.11 running-sibling signal request — the twin of
+/// `SLSLinuxSignalTaskRequest`. The delivery bytes are the same 80-byte
+/// trailer M4.10 puts on a parked target's deferred reply; here the kernel
+/// installs the frame directly into the target's saved ring3 context.
+pub const LINUX_SIGNAL_DELIVERY_BYTES: usize = 80;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LinuxSignalTaskReq {
+    pub tgid: u32,
+    pub tid: u32,
+    pub delivery: [u8; LINUX_SIGNAL_DELIVERY_BYTES],
+    pub status: i32,
+    pub reserved: u32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct LinuxCloneThreadReq {
@@ -478,6 +494,30 @@ pub trait Kernel {
         let _ = (pid, head, len, out);
         Err(ERR_NOTFOUND)
     }
+
+    /// M4.11: install a recorded handler frame into a sibling that is not
+    /// parked. `delivery` is `signal_delivery_payload`'s 80 bytes; the
+    /// kernel validates it, checks the target belongs to `tgid` and the
+    /// caller's partition, and copies the frame into the target's saved
+    /// ring3 context. `CAP_EAGAIN` means the target is runnable or parked;
+    /// the caller yields and retries. Default: unsupported.
+    fn linux_signal_task(&self, tgid: u32, tid: u32,
+                         delivery: &[u8; LINUX_SIGNAL_DELIVERY_BYTES]) -> Result<(), i32> {
+        let _ = (tgid, tid, delivery);
+        Err(ERR_NOTFOUND)
+    }
+
+    /// M4.11: stop/resume a running sibling for a process-directed group
+    /// stop. `proc_hold` requires a SUSPENDED Linux task; a parked target
+    /// is already held by its own withheld reply. Default: unsupported.
+    fn proc_hold(&self, pid: u32) -> Result<(), i32> {
+        let _ = pid;
+        Err(ERR_NOTFOUND)
+    }
+    fn proc_release(&self, pid: u32) -> Result<(), i32> {
+        let _ = pid;
+        Err(ERR_NOTFOUND)
+    }
 }
 
 // ── Real kernel ABI (feature `target`) ───────────────────────────────────────
@@ -561,6 +601,9 @@ mod abi {
     const SYS_LINUX_GROUP_SWEEP: u64 = 331;
     const SYS_LINUX_SET_CLEAR_TID: u64 = 332;
     const SYS_LINUX_ROBUST_EXIT: u64 = 333;
+    const SYS_LINUX_SIGNAL_TASK: u64 = 335;
+    const SYS_PROC_HOLD: u64 = 245;
+    const SYS_PROC_RELEASE: u64 = 246;
     const SYS_SIDECAR_PID: u64 = 322;
     const SYS_ENV_STORAGE_ATTACH: u64 = 323;
     const SYS_ENV_STORAGE_RESTORE: u64 = 324;
@@ -1390,6 +1433,28 @@ mod abi {
         unsafe { sls_syscall(SYS_LINUX_CLONE_THREAD, req as u64) as i64 }
     }
 
+    /// `k_linux_signal_task`: syscall 335 — M4.11's direct ring3 frame
+    /// install for a sibling that has no parked reply. Returns 0 or a
+    /// negative CAP code; `req.status` carries the same code.
+    #[no_mangle]
+    pub extern "C" fn k_linux_signal_task(
+        req: *mut LinuxSignalTaskReq,
+    ) -> i64 {
+        unsafe { sls_syscall(SYS_LINUX_SIGNAL_TASK, req as u64) as i64 }
+    }
+
+    /// `k_proc_hold`/`k_proc_release`: syscalls 245/246 — the M4.11 group
+    /// stop uses the existing hold latch for a running sibling. Returns 0
+    /// on success, nonzero when the target is not SUSPENDED (or not HELD).
+    #[no_mangle]
+    pub extern "C" fn k_proc_hold(pid: u32) -> u64 {
+        unsafe { sls_syscall(SYS_PROC_HOLD, pid as u64) }
+    }
+    #[no_mangle]
+    pub extern "C" fn k_proc_release(pid: u32) -> u64 {
+        unsafe { sls_syscall(SYS_PROC_RELEASE, pid as u64) }
+    }
+
     /// `k_linux_group_sweep`: syscall 331 — M4.5's exit_group sweep. Returns
     /// the number of threads terminated, or a negative CAP code.
     #[no_mangle]
@@ -1749,6 +1814,23 @@ mod abi {
             } else {
                 Err(req.status)
             }
+        }
+
+        fn linux_signal_task(&self, tgid: u32, tid: u32,
+                             delivery: &[u8; LINUX_SIGNAL_DELIVERY_BYTES]) -> Result<(), i32> {
+            let mut req = LinuxSignalTaskReq {
+                tgid, tid, delivery: *delivery, status: 0, reserved: 0,
+            };
+            let rc = k_linux_signal_task(&mut req);
+            if rc == 0 { Ok(()) } else { Err(req.status) }
+        }
+
+        fn proc_hold(&self, pid: u32) -> Result<(), i32> {
+            if k_proc_hold(pid) == 0 { Ok(()) } else { Err(ERR_NOTFOUND) }
+        }
+
+        fn proc_release(&self, pid: u32) -> Result<(), i32> {
+            if k_proc_release(pid) == 0 { Ok(()) } else { Err(ERR_NOTFOUND) }
         }
     }
 }

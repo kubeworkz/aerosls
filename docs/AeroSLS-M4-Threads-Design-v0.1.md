@@ -1,6 +1,6 @@
 # AeroSLS M4 — Threads and Thread Groups (Design Spike v0.1)
 
-Status: M4.9 std::thread gate landed for musl pthread_create; Go, threaded CPython and Node remain out.
+Status: M4.10 landed; M4.11 running-sibling handler delivery, full group-stop broadcast and its transactional rollback landed; runtime wall in force.
 
 Date: 2026-11-14. Owner: Gridworkz. Scope: M4 in
 `AeroSLS-PASE-Linux-Shape-Decision-v0.1.md`.
@@ -195,7 +195,10 @@ Dispositions are group state. Masks, pending bits, alternate-stack state,
 and the current handler depth are per-thread. `tkill` and `tgkill` match the
 calling thread's TID; M4.8's `kill` accepts a TID or the group's TGID and a
 TGID target defaults to the group sweep; M4.10 fans a recorded handler or
-a stop-default out to a parked sibling, with SIGCONT releasing a stop. `fs_base` is per-thread and is written only by the existing canonicality-
+a stop-default out to a parked sibling, with SIGCONT releasing a stop.
+M4.11 delivers a handler to a sibling with no parked reply by installing
+its frame in the saved `ring3_ctx`, and broadcasts a stop to every
+non-caller sibling, holding non-parked targets via 245/246 until SIGCONT. `fs_base` is per-thread and is written only by the existing canonicality-
 checked `ARCH_SET_FS` path or the clone request's `CLONE_SETTLS`. A thread
 must never inherit a stale `fs_base` from a reused slot.
 
@@ -470,25 +473,36 @@ required, and a live arm where it is. No increment may claim the next one.
   as `SignalKillTask`; a group default-terminate target folds into the TGID
   exit sweep. M4.10 adds handler/stop fan-out to a parked sibling; the live
   gate's SIGUSR1 handler frame and its SIGSTOP/SIGCONT reply-withhold/resume
-  arms both pass. Priority inheritance and the second-architecture audit
-  remain out. The live gate is
+  arms both pass. M4.11 adds the two remaining pieces: a running/suspended
+  sibling's handler is installed directly into its saved `ring3_ctx` through
+  `SYS_SLS_LINUX_SIGNAL_TASK` (335), and a process-directed stop broadcasts
+  to every non-caller sibling, with the kernel hold latch (245/246) covering
+  targets that have no parked reply; SIGCONT releases both kinds. The
+  broadcast is transactional: if any hold is refused, previously held
+  targets are released, removed parked FUTEX_WAIT entries are restored, and
+  every stop latch is cleared before the caller gets E_CONFLICT. Priority
+  inheritance and the second-architecture audit remain out. The live gate is
   `tests/m4_hardening_probe_check.sh` over the E3 gate profile with a
   disposable `sidecars_m4_hardening_e3.cpio`/`sls_m4_hardening_e3.iso`:
   it requires `M4-CLONE3-OK`, `M4-CLONE3-B-OK`, `M4-REQUEUE-PARENT-OK`,
   `M4-REQUEUE-WORKER-WOKE`, `M4-REQUEUE-OK`, `M4-GROUP-HANDLER-PASS`,
+  `M4-RUNNING-HANDLER-PASS`, `M4-GROUP-STOP-BROADCAST-PASS`,
   `M4-GROUP-STOP-PASS`, `M4-ROBUST-SET`, `M4-ROBUST-WORKER-EXIT`,
   `M4-ROBUST-BIT=1073741824`, `M4-ROBUST-OK`, `M4-TGKILL-SENT`,
   `M4-TGKILL-OK`, `M4-GROUP-KILL-SENT`, `M4-HARDENING-PASS`, a sibling
-  `sig=10 handler -> frame`, a sibling `sig=19 -> stop`, a
-  `SIGCONT -> sibling resumed`, a sibling `sig=15 -> kill`, and the M4.5
-  group sweep with no failure marker.
+  `sig=10 handler -> frame`, a sibling `sig=12 handler -> running frame`, a
+  sibling `sig=19 -> stop (pending reply held)`, a sibling `sig=19 -> stop
+  (kernel hold)`, a `M4.11 group stop broadcast targets=2` line, a
+  `SIGCONT -> sibling resumed`, a `SIGCONT -> sibling released (kernel hold)`,
+  a sibling `sig=15 -> kill`, and the M4.5 group sweep with no failure marker.
   Evidence: `evidence/m4_hardening_gate.log`.
   The focused host suites are `tests/m4_hardening_host_test.c` (17 checks),
-  the two `m4_10_*` sidecar tests in `user/sidecar/src/linux.rs`,
-  `tests/linux_syscall_table_host_test.c` (the 62-row Linux table) and the
-  existing `tests/linux_thread_group_host_test.c`. The second-architecture
-  audit and priority inheritance are not part of this increment.
-- **M4.9 — The musl pthread/std::thread gate.** `mmap(PROT_NONE)` installs a
+  the two `m4_10_*` and four `m4_11_*` sidecar tests in
+  `user/sidecar/src/linux.rs` (including the hold-refusal rollback test), `tests/linux_syscall_table_host_test.c` (the
+  62-row Linux table) and the existing `tests/linux_thread_group_host_test.c`.
+  The second-architecture audit and priority inheritance are not part of this
+  increment.
+- **M4.9 — The musl pthread/std::thread gate.** M4.9 std::thread gate landed for musl pthread_create; `mmap(PROT_NONE)` installs a
   non-present `USER_PTE_RESERVED` leaf (bit 57) per page and allocates no
   frame, preserving the measured contract that a reservation consumes no
   frames. A later `mprotect(PROT_READ|PROT_WRITE)` allocates fresh zero
@@ -574,9 +588,10 @@ required, and a live arm where it is. No increment may claim the next one.
 - Whether a future group-handler signal chooses a thread or builds frames in
   every sibling context. M4.5 fixes per-thread `tkill` addressing and pends
   blocked sibling signals; M4.10 adds the parked-sibling handler/stop arms
-  (`SignalKillTask` for a sibling, the TGID sweep for a group target), so a
-  running-sibling handler delivery and full group-stop broadcast remain
-  explicit follow-ons.
+  (`SignalKillTask` for a sibling, the TGID sweep for a group target), and
+  M4.11 closes the running-sibling delivery and full group-stop broadcast
+  gaps: the direct `ring3_ctx` install covers a target with no parked reply,
+  and the broadcast latches every non-caller sibling.
 - The checkpoint record's growth from four tasks to a variable thread array;
   the version bump and backward-read rule are M4.6's, not this spike's.
 - Whether `clone` (56) or `clone3` (435) is the first user-visible surface.

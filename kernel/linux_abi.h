@@ -978,6 +978,15 @@ _Static_assert(sizeof(struct LinuxSignalImage) ==
 int linux_signal_delivery_parse(const uint8_t *p, uint32_t n,
                                 struct LinuxSignalDelivery *out);
 
+/* M4.11: install a delivery into a task that has no parked reply to carry
+ * it. The helper snapshots ring3_ctx into the park shape linux_signal_deliver
+ * already speaks, restores that snapshot's registers into the task's saved
+ * iret frame on success, and leaves park_ctx exactly as the timer saved it.
+ * Returns 0 or a negative LINUX_E*. */
+struct ProcessDescriptor;
+uint64_t linux_signal_deliver_running(struct ProcessDescriptor *pd,
+                                     const struct LinuxSignalDelivery *d);
+
 /* Build/restore the kernel-private frame. Both are pure; the caller owns
  * the user-memory copy. Build applies the ring-3 RFLAGS bound before the
  * handler can enter; restore re-applies it because the frame came back

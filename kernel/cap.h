@@ -1234,6 +1234,28 @@ struct SLSLinuxRobustExitRequest {
 
 uint64_t sys_sls_linux_robust_exit(struct SLSLinuxRobustExitRequest *req);
 
+/* ─── SYS_SLS_LINUX_SIGNAL_TASK (335) — M4.11 ─────────────────────────────
+ * The sidecar's way to put a recorded signal frame into a sibling that is
+ * NOT parked on a deferred reply. A parked sibling's trailer already rides
+ * its own reply; a running/suspended sibling has no such reply, so the
+ * sidecar parses the same 80-byte delivery and asks the kernel to install
+ * it directly into that task's saved ring3 context. The target must be
+ * Linux, non-runnable (SUSPENDED/HELD), share the caller's partition, and
+ * belong to `tgid`; a RUNNING target is CAP_EAGAIN so the sidecar can yield
+ * and retry, and a parked target is CAP_EAGAIN because its reply owns the
+ * delivery. */
+#define SYS_SLS_LINUX_SIGNAL_TASK 335
+
+struct SLSLinuxSignalTaskRequest {
+    uint32_t tgid;          /* IN: the Linux thread group */
+    uint32_t tid;           /* IN: the target task */
+    uint8_t  delivery[80];  /* IN: struct LinuxSignalDelivery bytes */
+    int32_t  status;        /* OUT: 0 or a negative CAP_E* */
+    uint32_t reserved;      /* zero */
+};
+
+uint64_t sys_sls_linux_signal_task(struct SLSLinuxSignalTaskRequest *req);
+
 struct SLSLinuxCloneThreadRequest {
     uint32_t status;        /* OUT: 0 or a negative CAP_E* */
     uint32_t parent_pid;    /* IN: the Linux task issuing clone */

@@ -2102,6 +2102,9 @@ uint64_t do_syscall(uint64_t num, void* arg) {
     case SYS_SLS_LINUX_ROBUST_EXIT:
         return sys_sls_linux_robust_exit(
             (struct SLSLinuxRobustExitRequest*)arg);
+    case SYS_SLS_LINUX_SIGNAL_TASK:
+        return sys_sls_linux_signal_task(
+            (struct SLSLinuxSignalTaskRequest*)arg);
     case SYS_SLS_LINUX_CLONE_THREAD:
         return sys_sls_linux_clone_thread(
             (struct SLSLinuxCloneThreadRequest*)arg);

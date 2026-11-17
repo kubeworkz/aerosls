@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# tests/m4_hardening_probe_check.sh — live QEMU gate for M4.8 hardening.
+# tests/m4_hardening_probe_check.sh — live QEMU gate for M4.8 hardening,
+# extended by M4.11's running-sibling handler and group-stop broadcast.
 #
 # GUARD-KIND: runtime (needs the built M4.8 ISO + QEMU)
 #
@@ -11,12 +12,18 @@
 #     and kill(TGID, SIGSTOP)/SIGCONT withholds then resumes its reply;
 #     the sidecar's -EINTR trailer contract is pinned by the focused host
 #     test in user/sidecar/src/linux.rs (M4.10);
+#   - tgkill(234) delivers a recorded handler to a running sibling through
+#     SYS_SLS_LINUX_SIGNAL_TASK's direct ring3_ctx install (M4.11);
+#   - the same SIGSTOP broadcast holds every non-caller sibling: the parked
+#     one keeps its reply and the running one is held by the kernel, with
+#     SIGCONT releasing both (M4.11);
 #   - tgkill(234) kills a parked sibling by TGID/TID and releases its join;
 #   - kill(TGID, SIGTERM) folds into the existing exit_group sweep.
 #
 # Markers: M4-CLONE3-OK, M4-REQUEUE-OK, M4-REQUEUE-PARENT-OK,
-# M4-GROUP-HANDLER-PASS, M4-GROUP-STOP-PASS, M4-ROBUST-OK, M4-TGKILL-OK,
-# M4-HARDENING-PASS, M4-GROUP-KILL-SENT.
+# M4-GROUP-HANDLER-PASS, M4-RUNNING-HANDLER-PASS,
+# M4-GROUP-STOP-BROADCAST-PASS, M4-GROUP-STOP-PASS, M4-ROBUST-OK,
+# M4-TGKILL-OK, M4-HARDENING-PASS, M4-GROUP-KILL-SENT.
 # Failures: M4-HARDENING-FAIL. A post-sweep marker is a failure.
 #
 # Environment:
@@ -147,6 +154,11 @@ requeue=$(count_fixed 'M4-REQUEUE-OK')
 parent=$(count_fixed 'M4-REQUEUE-PARENT-OK')
 robust=$(count_fixed 'M4-ROBUST-OK=')
 group_handler=$(count_fixed 'M4-GROUP-HANDLER-PASS')
+run_handler=$(count_fixed 'M4-RUNNING-HANDLER-PASS')
+run_handler_sig=$(count_fixed 'sibling sig=12 handler -> running frame')
+group_stop_broadcast=$(count_fixed 'M4-GROUP-STOP-BROADCAST-PASS')
+group_stop_broadcast_log=$(count_fixed 'M4.11 group stop broadcast targets=2')
+group_stop_held=$(count_fixed 'sibling sig=19 -> stop (kernel hold)')
 group_stop=$(count_fixed 'M4-GROUP-STOP-PASS')
 tgkill=$(count_fixed 'M4-TGKILL-OK')
 group_sent=$(count_fixed 'M4-GROUP-KILL-SENT')
@@ -175,8 +187,18 @@ elif [ "$group_handler" -lt 1 ]; then
     problem="no M4-GROUP-HANDLER-PASS marker (handler not delivered to the parked sibling)"
 elif [ "$group_handler_sig" -lt 1 ]; then
     problem="no sidecar sibling signal=10 handler line"
+elif [ "$run_handler" -lt 1 ]; then
+    problem="no M4-RUNNING-HANDLER-PASS marker (running sibling handler did not run)"
+elif [ "$run_handler_sig" -lt 1 ]; then
+    problem="no sidecar running-sibling handler frame line"
 elif [ "$group_stop" -lt 1 ]; then
     problem="no M4-GROUP-STOP-PASS marker (stop/SIGCONT did not resume the sibling)"
+elif [ "$group_stop_broadcast" -lt 1 ]; then
+    problem="no M4-GROUP-STOP-BROADCAST-PASS marker (running sibling did not resume)"
+elif [ "$group_stop_broadcast_log" -lt 1 ]; then
+    problem="no sidecar group-stop broadcast targets=2 line"
+elif [ "$group_stop_held" -lt 1 ]; then
+    problem="no sidecar kernel-hold line for the running sibling"
 elif [ "$group_stop_sig" -lt 1 ] || [ "$group_cont_sig" -lt 1 ]; then
     problem="no sidecar stop-latch/SIGCONT resume lines"
 elif [ "$robust" -lt 1 ] || [ "$robust_bit" -lt 1 ]; then
@@ -201,21 +223,23 @@ elif ! awk '
     /M4-CLONE3-OK=/ { c = NR }
     /M4-REQUEUE-OK/ && c && !r { r = NR }
     /M4-GROUP-HANDLER-PASS/ && r && !h { h = NR }
-    /M4-GROUP-STOP-PASS/ && h && !k { k = NR }
+    /M4-RUNNING-HANDLER-PASS/ && h && !rh { rh = NR }
+    /M4-GROUP-STOP-BROADCAST-PASS/ && rh && !rb { rb = NR }
+    /M4-GROUP-STOP-PASS/ && rb && !k { k = NR }
     /M4-ROBUST-OK=/ && k && !b { b = NR }
     /M4-TGKILL-OK/ && b && !t { t = NR }
     /M4-HARDENING-PASS/ && t && !p { p = NR }
     /M4-GROUP-KILL-SENT/ && p && !g { g = NR }
     /\[PROC\] M4\.5 group sweep/ && g && !s { s = NR }
-    END { exit (c && r && h && k && b && t && p && g && s) ? 0 : 1 }
+    END { exit (c && r && h && rh && rb && k && b && t && p && g && s) ? 0 : 1 }
 ' "$LOG"; then
-    problem="marker order was not clone3 -> requeue -> group-handler -> group-stop -> robust -> tgkill -> pass -> group-kill -> sweep"
+    problem="marker order was not clone3 -> requeue -> group-handler -> running-handler -> group-stop-broadcast -> group-stop -> robust -> tgkill -> pass -> group-kill -> sweep"
 fi
 
 if [ -n "$problem" ]; then
     echo "FAIL: M4.8 live hardening probe: $problem" >&2
     echo "  fail=$fail clone3=$clone3 clone3b=$clone3b requeue=$requeue parent=$parent group_handler=$group_handler group_stop=$group_stop robust=$robust bit=$robust_bit tgkill=$tgkill pass=$pass group_sent=$group_sent sweep=$sweep side_sweep=$side_sweep after=$after" >&2
-    echo "  clone_lines=$clone_lines sibling_sig=$sibling_sig group_handler_sig=$group_handler_sig group_stop_sig=$group_stop_sig group_cont_sig=$group_cont_sig group_sig=$group_sig" >&2
+    echo "  clone_lines=$clone_lines sibling_sig=$sibling_sig group_handler_sig=$group_handler_sig run_handler=$run_handler run_handler_sig=$run_handler_sig group_stop_broadcast=$group_stop_broadcast group_stop_broadcast_log=$group_stop_broadcast_log group_stop_held=$group_stop_held group_stop_sig=$group_stop_sig group_cont_sig=$group_cont_sig group_sig=$group_sig" >&2
     if [ -f "$LOG" ]; then
         echo "  last 80 serial lines ($LOG):" >&2
         tail -80 "$LOG" >&2
@@ -228,7 +252,7 @@ if [ -n "$problem" ]; then
 fi
 
 echo "OK: M4.8 live hardening probe: clone3=$clone3 clone3b=$clone3b requeue=$requeue parent=$parent group_handler=$group_handler group_stop=$group_stop robust=$robust bit=$robust_bit tgkill=$tgkill pass=$pass group_sent=$group_sent sweep=$sweep"
-echo "    clone_lines=$clone_lines sibling_sig=$sibling_sig group_handler_sig=$group_handler_sig group_stop_sig=$group_stop_sig group_cont_sig=$group_cont_sig group_sig=$group_sig after=0 fail=0"
+echo "    clone_lines=$clone_lines sibling_sig=$sibling_sig group_handler_sig=$group_handler_sig run_handler=$run_handler run_handler_sig=$run_handler_sig group_stop_broadcast=$group_stop_broadcast group_stop_broadcast_log=$group_stop_broadcast_log group_stop_held=$group_stop_held group_stop_sig=$group_stop_sig group_cont_sig=$group_cont_sig group_sig=$group_sig after=0 fail=0"
 if [ -n "$REPLAY" ]; then
     echo "    serial log: $LOG"
 fi

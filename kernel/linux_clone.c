@@ -298,6 +298,63 @@ uint64_t sys_sls_linux_group_sweep(uint32_t tgid) {
     return killed;
 }
 
+/* M4.11: install a signal frame into a sibling that is not parked on a
+ * deferred reply. The sidecar owns the disposition/mask decision; this is
+ * the mechanism that puts the frame into the target's saved ring3 context.
+ * A parked target is refused CAP_EAGAIN because its own reply is the only
+ * legal trailer path (M4.10), and a RUNNING target is refused so the caller
+ * can yield until the timer has saved it. */
+uint64_t sys_sls_linux_signal_task(struct SLSLinuxSignalTaskRequest *req) {
+    struct ProcessDescriptor *caller = process_find_current();
+    struct ProcessDescriptor *target;
+    struct LinuxSignalDelivery delivery;
+    uint32_t group_id;
+    int parsed;
+    uint64_t rc;
+
+    if (!req) return (uint64_t)(int64_t)CAP_EINVAL;
+    req->status = 0;
+    if (!caller || !caller->active || !caller->sidecar_authority)
+        return (uint64_t)(int64_t)CAP_EPERM;
+
+    group_id = linux_thread_group_id_by_tgid(req->tgid);
+    if (group_id == 0) {
+        req->status = CAP_ERR_NOTFOUND;
+        return (uint64_t)(int64_t)CAP_ERR_NOTFOUND;
+    }
+    target = clone_find_pid(req->tid);
+    if (!target || !target->active ||
+        target->personality != PROC_PERSONALITY_LINUX ||
+        target->linux_tgid != group_id ||
+        target->partition_id != caller->partition_id) {
+        req->status = CAP_ERR_NOTFOUND;
+        return (uint64_t)(int64_t)CAP_ERR_NOTFOUND;
+    }
+    if (target->state == PROC_RUNNING || target->state == PROC_BLOCKED ||
+        !target->has_ring3_ctx) {
+        /* RUNNING: the timer has not saved a context yet, yield and retry.
+         * BLOCKED: the target's deferred reply is the M4.10 trailer path. */
+        req->status = CAP_EAGAIN;
+        return (uint64_t)(int64_t)CAP_EAGAIN;
+    }
+
+    parsed = linux_signal_delivery_parse(req->delivery, 80, &delivery);
+    if (parsed != 0) {
+        req->status = CAP_EINVAL;
+        return (uint64_t)(int64_t)CAP_EINVAL;
+    }
+    rc = linux_signal_deliver_running(target, &delivery);
+    if (rc != 0) {
+        req->status = CAP_EFAULT;
+        return (uint64_t)(int64_t)CAP_EFAULT;
+    }
+    req->status = 0;
+    kernel_serial_printf(
+        "[PROC] M4.11 signal task tgid=%u tid=%u signo=%u -> ring3 frame\n",
+        req->tgid, req->tid, (unsigned)delivery.signo);
+    return 0;
+}
+
 /* M4.5: set_tid_address(218)'s kernel half. The sidecar answers the Linux
  * call and then names the task and word here; the descriptor owns the
  * pointer so every teardown path (exit, signal kill, fault, group sweep)

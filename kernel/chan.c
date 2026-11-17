@@ -1001,6 +1001,55 @@ static uint64_t linux_signal_deliver(struct ProcessDescriptor *pd,
     return 0;   /* the handler's eventual rt_sigreturn restores rax */
 }
 
+/* M4.11: a handler for a sibling that is not parked on a deferred reply.
+ * linux_signal_deliver() is written against the park shape because that is
+ * where every previous delivery came from; a timer-suspended task instead
+ * owns its state in ring3_ctx. Snapshot that context into park_ctx, deliver
+ * exactly once, then copy the handler entry state back into the iret frame
+ * and restore park_ctx. The interrupted registers live in the signal frame
+ * (built before park_ctx is overwritten), so rt_sigreturn still restores the
+ * instruction the sibling was running when the signal arrived. */
+uint64_t linux_signal_deliver_running(struct ProcessDescriptor *pd,
+                                     const struct LinuxSignalDelivery *d) {
+    struct CapParkCtx saved;
+    struct LinuxSignalDelivery tmp;
+    uint64_t rc;
+
+    if (!pd || !d || !pd->has_ring3_ctx) return (uint64_t)(int64_t)(-LINUX_EFAULT);
+    saved = pd->park_ctx;
+    tmp = *d;
+    tmp.sysret = pd->ring3_ctx.rax;
+
+    pd->park_ctx.r15 = pd->ring3_ctx.r15;
+    pd->park_ctx.r14 = pd->ring3_ctx.r14;
+    pd->park_ctx.r13 = pd->ring3_ctx.r13;
+    pd->park_ctx.r12 = pd->ring3_ctx.r12;
+    pd->park_ctx.rbx = pd->ring3_ctx.rbx;
+    pd->park_ctx.rbp = pd->ring3_ctx.rbp;
+    pd->park_ctx.r11 = pd->ring3_ctx.rflags;
+    pd->park_ctx.rcx = pd->ring3_ctx.rip;
+    pd->park_ctx.user_rsp = pd->ring3_ctx.rsp;
+    pd->park_ctx.linux_args[0] = pd->ring3_ctx.rdi;
+    pd->park_ctx.linux_args[1] = pd->ring3_ctx.rsi;
+    pd->park_ctx.linux_args[2] = pd->ring3_ctx.rdx;
+    pd->park_ctx.linux_args[3] = pd->ring3_ctx.r10;
+    pd->park_ctx.linux_args[4] = pd->ring3_ctx.r8;
+    pd->park_ctx.linux_args[5] = pd->ring3_ctx.r9;
+
+    rc = linux_signal_deliver(pd, &tmp, 0, 0, 0, 0, 0);
+    if (rc == 0) {
+        pd->ring3_ctx.rip = pd->user_rip;
+        pd->ring3_ctx.rsp = pd->user_rsp;
+        pd->ring3_ctx.rflags = pd->park_ctx.r11;
+        pd->ring3_ctx.rdi = pd->park_ctx.linux_args[0];
+        pd->ring3_ctx.rsi = pd->park_ctx.linux_args[1];
+        pd->ring3_ctx.rdx = pd->park_ctx.linux_args[2];
+        pd->ring3_ctx.rax = 0;
+    }
+    pd->park_ctx = saved;
+    return rc;
+}
+
 /* M3: capture, validate and forward an rt_sigreturn frame. Kept here (not
  * inline in the dispatcher) because it owns the same arm/post/park shape
  * as k_linux_forward and the guard's order checks should still read the

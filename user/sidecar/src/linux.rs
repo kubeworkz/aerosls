@@ -660,10 +660,19 @@ enum Answer {
     /// task's own pending reply; the kernel builds the frame in the
     /// target's saved syscall context.
     SignalHandlerTask(u32, SignalDelivery),
+    /// M4.11: a recorded handler addressed to a SIBLING that has no parked
+    /// reply (it is running/suspended between syscalls). `service` asks the
+    /// kernel to install the frame directly into its saved ring3 context.
+    SignalHandlerRun(u32, SignalDelivery),
     /// M4.10: a stop-default signal addressed to a parked SIBLING. The
     /// target's pending exchange is held (no reply) until SIGCONT resumes
     /// it with -EINTR.
     SignalStopTask(u32, u64),
+    /// M4.11: a process-directed stop broadcast. Every non-caller sibling is
+    /// latched; parked targets keep their reply until SIGCONT, and
+    /// non-parked targets are held by the kernel until SIGCONT releases
+    /// them. The fixed set is the sidecar's own bounded table.
+    SignalStopGroup(SignalStopGroup),
     /// M4.10: SIGCONT resumes the stopped sibling(s). The fixed set is the
     /// same bounded shape as FutexWake; `service` answers each parked
     /// target with -EINTR and clears the stop latch.
@@ -688,6 +697,22 @@ struct FutexWake {
 struct SignalContinue {
     n: u8,
     tasks: [u8; MAX_LINUX_TASKS],
+}
+
+/// M4.11: the bounded set a process-directed stop latched. `parked` targets
+/// already have a reply to withhold; `running` targets have none and must be
+/// held by the kernel until SIGCONT. `waiters` is the exact FUTEX_WAIT queue
+/// entry removed for each task, so a failed broadcast can put the parked
+/// target back in the queue instead of leaving it neither stopped nor
+/// wakeable.
+#[cfg_attr(test, derive(Debug))]
+#[derive(Clone, Copy)]
+struct SignalStopGroup {
+    sig: u64,
+    n: u8,
+    parked: u8,
+    tasks: [u8; MAX_LINUX_TASKS],
+    waiters: [FutexWaiter; MAX_LINUX_TASKS],
 }
 
 /// One Linux task's §5.4 heap ledger: the budget span the create stamped
@@ -1640,24 +1665,31 @@ fn signal_task(gid: usize, j: usize, sig: u64) -> Answer {
         return Answer::Reply(0, STATUS_OK);
     }
     if groups()[gid].sig_dispo[s] == DISPO_HANDLER {
-        /* The target must be parked on an exchange whose reply can carry
-         * the kernel's signal trailer. A running sibling has no saved
-         * context to build the frame from; named refusal, never a
-         * fabricated delivery. */
-        if t.pending == PENDING_NONE || t.stopped {
+        /* A stopped target must stay stopped until SIGCONT; piling a
+         * handler onto it now would run during the stop. A parked target
+         * carries the trailer on its own reply (M4.10); a sibling between
+         * syscalls has no reply, so M4.11 asks the kernel to install the
+         * frame into its saved ring3 context. */
+        if t.stopped {
             return Answer::Reply(0, E_NOSYS);
         }
+        let parked = t.pending != PENDING_NONE;
         t.sig.dispo = groups()[gid].sig_dispo;
         t.sig.act = groups()[gid].sig_act;
         let mut d = deliver_handler(&mut t.sig, sig, 0);
-        d.sysret = (-LINUX_EINTR) as u64;
+        if parked {
+            d.sysret = (-LINUX_EINTR) as u64;
+        }
         /* SA_RESETHAND is group-wide: the sibling's delivery must reset
          * the shared action too, or a later thread would see the handler
          * that this delivery already consumed. */
         groups()[gid].sig_dispo[s] = t.sig.dispo[s];
         groups()[gid].sig_act[s] = t.sig.act[s];
-        futex_remove(&mut groups()[gid], j);
-        return Answer::SignalHandlerTask(t.sig.tid as u32, d);
+        if parked {
+            futex_remove(&mut groups()[gid], j);
+            return Answer::SignalHandlerTask(t.sig.tid as u32, d);
+        }
+        return Answer::SignalHandlerRun(t.sig.tid as u32, d);
     }
     match default_action(sig) {
         ACT_TERMINATE => Answer::SignalKillTask(t.sig.tid as u32, sig),
@@ -1699,6 +1731,123 @@ fn parked_sibling(gid: usize, caller: usize, sig: u64) -> Option<usize> {
         }
     }
     fallback
+}
+
+/// M4.11: a process-directed handler's fallback when no sibling is parked.
+/// A target between syscalls has no reply, but the kernel can install the
+/// frame into its saved ring3 context. Stopped targets stay untouched until
+/// SIGCONT, and a blocked-but-not-sidecar-parked target is still selected:
+/// the service's kernel retry is what decides whether it can take the frame.
+fn running_sibling(gid: usize, caller: usize, sig: u64) -> Option<usize> {
+    let bit = if sig >= 1 && sig <= SIG_MAX as u64 {
+        1u64 << (sig - 1)
+    } else {
+        0
+    };
+    let mut fallback = None;
+    for j in 0..MAX_LINUX_TASKS {
+        if j == caller || !tasks()[j].used || tasks()[j].group != gid ||
+            tasks()[j].stopped || tasks()[j].pending != PENDING_NONE {
+            continue;
+        }
+        if bit == 0 || tasks()[j].sig.mask & bit == 0 {
+            return Some(j);
+        }
+        if fallback.is_none() {
+            fallback = Some(j);
+        }
+    }
+    fallback
+}
+
+/// M4.11: process-directed stop broadcast. The caller is deliberately left
+/// runnable so it can send SIGCONT; every OTHER sibling is latched. A
+/// target with a pending exchange keeps that reply for SIGCONT; a target
+/// between exchanges has no reply, so `service` holds its kernel task and
+/// releases it on the continue edge.
+fn stop_group(gid: usize, caller: usize, sig: u64) -> Answer {
+    let mut g = SignalStopGroup {
+        sig, n: 0, parked: 0,
+        tasks: [0; MAX_LINUX_TASKS],
+        waiters: [FutexWaiter { used: false, task: 0, uaddr: 0, seq: 0,
+                                bitset: 0 }; MAX_LINUX_TASKS],
+    };
+    for j in 0..MAX_LINUX_TASKS {
+        if j == caller || !tasks()[j].used || tasks()[j].group != gid ||
+            tasks()[j].stopped {
+            continue;
+        }
+        g.tasks[g.n as usize] = j as u8;
+        g.n += 1;
+        if tasks()[j].pending != PENDING_NONE {
+            g.parked += 1;
+            g.waiters[j] = futex_take(&mut groups()[gid], j);
+        }
+        tasks()[j].stopped = true;
+    }
+    if g.n == 0 {
+        Answer::Reply(0, STATUS_OK)
+    } else {
+        Answer::SignalStopGroup(g)
+    }
+}
+
+/// M4.11: undo a broadcast that could not be committed. Every task in the
+/// answer was latched by `stop_group`; release the ones the kernel already
+/// held, put any removed FUTEX_WAIT back in its queue, and clear the stop
+/// latch on all of them so no sibling is left half-stopped.
+fn rollback_stop_group<K: Kernel>(k: &K, gid: usize,
+                                  grp: &SignalStopGroup) -> u32 {
+    let mut released = 0u32;
+    for &idx in grp.tasks[..grp.n as usize].iter() {
+        let j = idx as usize;
+        if j >= MAX_LINUX_TASKS || !tasks()[j].used ||
+            tasks()[j].group != gid {
+            continue;
+        }
+        if tasks()[j].run_held {
+            let _ = k.proc_release(tasks()[j].sig.tid as u32);
+            tasks()[j].run_held = false;
+            released += 1;
+        }
+        if grp.waiters[j].used {
+            let _ = futex_restore(&mut groups()[gid], grp.waiters[j]);
+        }
+        tasks()[j].stopped = false;
+    }
+    released
+}
+
+/// M4.11: try to commit the hold half of a broadcast. Parked targets need
+/// no hold; every other candidate is retried across yields. If any target
+/// refuses, roll back the whole set before returning the error, so the
+/// caller never observes a partially stopped group.
+fn hold_stop_group<K: Kernel>(k: &K, gid: usize,
+                              grp: &SignalStopGroup) -> Result<u32, i32> {
+    let mut held = 0u32;
+    for &idx in grp.tasks[..grp.n as usize].iter() {
+        let j = idx as usize;
+        if j >= MAX_LINUX_TASKS || !tasks()[j].used ||
+            tasks()[j].group != gid || tasks()[j].pending != PENDING_NONE {
+            continue;
+        }
+        let tid = tasks()[j].sig.tid as u32;
+        let mut ok = false;
+        for _ in 0..64 {
+            match k.proc_hold(tid) {
+                Ok(()) => { ok = true; break; }
+                Err(E_AGAIN) => k.sched_yield(),
+                Err(_) => break,
+            }
+        }
+        if !ok {
+            let _ = rollback_stop_group(k, gid, grp);
+            return Err(E_CONFLICT);
+        }
+        tasks()[j].run_held = true;
+        held += 1;
+    }
+    Ok(held)
 }
 
 /// M4.10: collect the group's stopped tasks for SIGCONT. A stopped task
@@ -1779,17 +1928,15 @@ fn answer_group_signal(gid: usize, caller: usize, sig: u64) -> Answer {
         return Answer::Reply(0, STATUS_OK);
     }
     match groups()[gid].sig_dispo[s] {
-        DISPO_HANDLER => match parked_sibling(gid, caller, sig) {
+        DISPO_HANDLER => match parked_sibling(gid, caller, sig)
+            .or_else(|| running_sibling(gid, caller, sig)) {
             Some(j) => signal_task(gid, j, sig),
             None => Answer::Reply(0, E_NOSYS),
         },
         _ => match default_action(sig) {
             ACT_TERMINATE => Answer::SignalGroupKill(sig),
             ACT_IGNORE => Answer::Reply(0, STATUS_OK),
-            ACT_STOP => match parked_sibling(gid, caller, sig) {
-                Some(j) => signal_task(gid, j, sig),
-                None => Answer::Reply(0, E_NOSYS),
-            },
+            ACT_STOP => stop_group(gid, caller, sig),
             _ => Answer::Reply(0, E_NOSYS),
         },
     }
@@ -2860,6 +3007,7 @@ fn dents_payload(ents: &[DirEnt], buf: &mut [u8; FD_PAYLOAD_CAP]) -> usize {
 /// because a task can hold at most one parked request and every waiter is
 /// therefore a live `LinuxTask`. `seq` gives FIFO wake order independent of
 /// slot reuse; `task` is the sidecar table index whose reply the wake sends.
+#[cfg_attr(test, derive(Debug))]
 #[derive(Clone, Copy)]
 struct FutexWaiter {
     used: bool,
@@ -2961,8 +3109,11 @@ struct LinuxTask {
                        * signal trailer must echo THIS number, and it may
                        * be a futex/read/poll, not only a signal number */
     pending_tag: u32, /* the tag the reply must echo                            */
-    stopped: bool,    /* M4.10: a group-directed stop latched this parked
-                       * sibling; service holds its reply until SIGCONT */
+    stopped: bool,    /* M4.10: a group-directed stop latched this sibling,
+                       * parked or running; service holds the parked reply
+                       * or the kernel task until SIGCONT */
+    run_held: bool,    /* M4.11: `stopped` is backed by SYS_SLS_PROC_HOLD
+                       * rather than a withheld reply; SIGCONT releases it */
     pending_arg: u64, /* read: the clamped count; poll: nfds                    */
     pending_len: usize, /* poll: array bytes (nfds * 8; 0 for a pure sleep)     */
     pending_deadline: u64, /* poll: absolute ns, 0 = wait forever              */
@@ -2997,6 +3148,7 @@ fn tasks() -> &'static mut [LinuxTask; MAX_LINUX_TASKS] {
         pending_num: 0,
         pending_tag: 0,
         stopped: false,
+        run_held: false,
         pending_arg: 0,
         pending_len: 0,
         pending_deadline: 0,
@@ -3084,6 +3236,7 @@ pub fn track(
     t.pending_num = 0;
     t.pending_tag = 0;
     t.stopped = false;
+    t.run_held = false;
     t.pending_arg = 0;
     t.pending_len = 0;
     t.pending_deadline = 0;
@@ -3158,6 +3311,7 @@ pub fn track_thread(
     t.pending_num = 0;
     t.pending_tag = 0;
     t.stopped = false;
+    t.run_held = false;
     t.pending_arg = 0;
     t.pending_len = 0;
     t.pending_deadline = 0;
@@ -3216,15 +3370,44 @@ fn group_live_records<K: Kernel>(k: &K, members: &[usize], partition: u32) -> us
     members.iter().filter(|&&j| !task_is_dead(k, j, partition)).count()
 }
 
+/// M4.4: remove a task's queued FUTEX_WAIT and return the exact entry. A
+/// group-stop rollback uses the returned snapshot to restore the queue slot
+/// it removed; callers that only need removal can ignore it.
+fn futex_take(g: &mut LinuxGroup, task: usize) -> FutexWaiter {
+    let mut taken = FutexWaiter { used: false, task: 0, uaddr: 0, seq: 0,
+                                  bitset: 0 };
+    for w in g.futex.iter_mut() {
+        if w.used && w.task as usize == task {
+            taken = *w;
+            *w = FutexWaiter { used: false, task: 0, uaddr: 0, seq: 0,
+                               bitset: 0 };
+        }
+    }
+    taken
+}
+
 /// M4.4: remove a task's queued FUTEX_WAIT. Called on every release before
 /// the group count drops, so a killed waiter can never be answered later by
 /// a wake that selected a stale task index.
 fn futex_remove(g: &mut LinuxGroup, task: usize) {
-    for w in g.futex.iter_mut() {
-        if w.used && w.task as usize == task {
-            *w = FutexWaiter { used: false, task: 0, uaddr: 0, seq: 0,
-                               bitset: 0 };
-        }
+    let _ = futex_take(g, task);
+}
+
+/// M4.11: restore one exact waiter snapshot. The queue slot removed by
+/// `futex_take` is free again, so this normally succeeds; an already-present
+/// entry is left alone to keep rollback idempotent.
+fn futex_restore(g: &mut LinuxGroup, waiter: FutexWaiter) -> bool {
+    if !waiter.used {
+        return true;
+    }
+    if g.futex.iter().any(|w| w.used && w.task == waiter.task) {
+        return true;
+    }
+    if let Some(slot) = g.futex.iter_mut().find(|w| !w.used) {
+        *slot = waiter;
+        true
+    } else {
+        false
     }
 }
 
@@ -4790,6 +4973,39 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                 reply_bytes(k, target_ch, target_tag, target_num, 0, &bytes);
                 reply(k, ch_w, rr.tag, num, 0, STATUS_OK);
             }
+            Answer::SignalHandlerRun(tid, d) => {
+                /* M4.11: the target is between syscalls, so there is no
+                 * pending reply to carry the trailer. Ask the kernel to
+                 * install the frame into that task's saved ring3 context;
+                 * CAP_EAGAIN means the timer has not saved it yet. */
+                let Some(j) = task_by_tid(gid, tid) else {
+                    reply(k, ch_w, rr.tag, num, 0, E_TARGET);
+                    continue;
+                };
+                if tasks()[j].pending != PENDING_NONE || tasks()[j].stopped {
+                    reply(k, ch_w, rr.tag, num, 0, E_CONFLICT);
+                    continue;
+                }
+                let bytes = signal_delivery_payload(&d);
+                let tgid = groups()[gid].tgid as u32;
+                let mut delivered = false;
+                for _ in 0..64 {
+                    match k.linux_signal_task(tgid, tid, &bytes) {
+                        Ok(()) => { delivered = true; break; }
+                        Err(E_AGAIN) => k.sched_yield(),
+                        Err(_) => break,
+                    }
+                }
+                if !delivered {
+                    reply(k, ch_w, rr.tag, num, 0, E_CONFLICT);
+                    continue;
+                }
+                let mut ex = [0u8; 64];
+                let n = fmt_sig_line(&mut ex, b" sibling sig=", d.signo,
+                                     b" handler -> running frame\n");
+                enosys_log(num as u32, &name_buf[..nlen], &ex[..n]);
+                reply(k, ch_w, rr.tag, num, 0, STATUS_OK);
+            }
             Answer::SignalStopTask(tid, stop_sig) => {
                 /* The target's deferred reply is deliberately withheld:
                  * it is parked, and nothing may answer it until SIGCONT
@@ -4810,10 +5026,62 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                 enosys_log(num as u32, &name_buf[..nlen], &ex[..n]);
                 reply(k, ch_w, rr.tag, num, 0, STATUS_OK);
             }
+            Answer::SignalStopGroup(grp) => {
+                /* M4.11: every non-caller sibling was latched by
+                 * stop_group. A parked target's reply stays withheld; a
+                 * target between syscalls has no reply, so hold its kernel
+                 * task until SIGCONT. The hold is transactional: one refusal
+                 * rolls back every held and latched sibling before the
+                 * caller sees E_CONFLICT. */
+                let held = match hold_stop_group(k, gid, &grp) {
+                    Ok(h) => h,
+                    Err(status) => {
+                        let mut ex = [0u8; 64];
+                        let n = push_bytes(&mut ex, 0,
+                            b" M4.11 group stop refused -> rollback\n");
+                        enosys_log(num as u32, &name_buf[..nlen], &ex[..n]);
+                        reply(k, ch_w, rr.tag, num, 0, status);
+                        continue;
+                    }
+                };
+                for &idx in grp.tasks[..grp.n as usize].iter() {
+                    let j = idx as usize;
+                    if j >= MAX_LINUX_TASKS || !tasks()[j].used ||
+                        tasks()[j].group != gid ||
+                        tasks()[j].pending == PENDING_NONE {
+                        continue;
+                    }
+                    let mut ex = [0u8; 48];
+                    let n = fmt_sig_line(&mut ex, b" sibling sig=", grp.sig,
+                                         b" -> stop (pending reply held)\n");
+                    enosys_log(num as u32, &name_buf[..nlen], &ex[..n]);
+                }
+                for &idx in grp.tasks[..grp.n as usize].iter() {
+                    let j = idx as usize;
+                    if j >= MAX_LINUX_TASKS || !tasks()[j].used ||
+                        tasks()[j].group != gid || !tasks()[j].run_held {
+                        continue;
+                    }
+                    let mut ex = [0u8; 48];
+                    let n = fmt_sig_line(&mut ex, b" sibling sig=", grp.sig,
+                                         b" -> stop (kernel hold)\n");
+                    enosys_log(num as u32, &name_buf[..nlen], &ex[..n]);
+                }
+                let mut ex = [0u8; 96];
+                let mut off = push_bytes(&mut ex, 0, b" M4.11 group stop broadcast targets=");
+                off = dec_into(&mut ex, off, grp.n as u64);
+                off = push_bytes(&mut ex, off, b" parked=");
+                off = dec_into(&mut ex, off, grp.parked as u64);
+                off = push_bytes(&mut ex, off, b" held=");
+                off = dec_into(&mut ex, off, held as u64);
+                off = push_bytes(&mut ex, off, b"\n");
+                enosys_log(num as u32, &name_buf[..nlen], &ex[..off]);
+                reply(k, ch_w, rr.tag, num, 0, STATUS_OK);
+            }
             Answer::SignalContinue(c) => {
                 /* SIGCONT resumes each stopped target at its syscall
                  * boundary: a parked exchange is answered -EINTR, a task
-                 * stopped between requests is simply made runnable. */
+                 * held between requests is released by the kernel. */
                 for &idx in c.tasks[..c.n as usize].iter() {
                     let j = idx as usize;
                     if j >= MAX_LINUX_TASKS || !tasks()[j].used ||
@@ -4821,6 +5089,15 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                         continue;
                     }
                     tasks()[j].stopped = false;
+                    if tasks()[j].run_held {
+                        let tid = tasks()[j].sig.tid as u32;
+                        let _ = k.proc_release(tid);
+                        tasks()[j].run_held = false;
+                        let mut ex = [0u8; 48];
+                        let n = push_bytes(&mut ex, 0,
+                            b" SIGCONT -> sibling released (kernel hold)\n");
+                        enosys_log(num as u32, &name_buf[..nlen], &ex[..n]);
+                    }
                     if tasks()[j].pending != PENDING_NONE {
                         let target_tag = tasks()[j].pending_tag;
                         let target_ch = tasks()[j].ch_w;
@@ -6894,8 +7171,9 @@ mod tests {
 
         match answer_kill(gid, 0, 0x7100,
                           &[0x7100, 19, 0, 0, 0, 0]).unwrap() {
-            Answer::SignalStopTask(tid, sig) => {
-                assert_eq!((tid, sig), (0x7101, 19));
+            Answer::SignalStopGroup(g) => {
+                assert_eq!((g.n, g.tasks[0], g.sig, g.parked),
+                           (1, 1, 19, 1));
             }
             other => panic!("SIGSTOP did not stop the sibling: {:?}", other),
         }
@@ -6915,6 +7193,218 @@ mod tests {
         assert_eq!(tasks()[1].pending, PENDING_FUTEX,
                    "the held exchange is still the one to interrupt");
         assert_eq!(tasks()[1].pending_num, LINUX_FUTEX);
+    }
+
+    /* M4.11: a process-directed stop latches EVERY non-caller sibling, not
+     * just the first parked one. A parked target keeps its reply; a target
+     * between syscalls is represented in the same set so `service` can hold
+     * its kernel task until SIGCONT. */
+    #[test]
+    fn m4_11_group_stop_broadcasts_to_parked_and_running_siblings() {
+        let _guard = M4_10_TEST_LOCK.lock().unwrap();
+        reset_registry();
+        assert!(track(0x10, 0x11, "m4.11.stop.leader", 0,
+                      0x80_0000, 0x81_0000, 7, 0x7200, false));
+        let gid = tasks()[0].group;
+        assert_eq!(track_thread(0x20, 0x21, "m4.11.stop.leader.t20", 0, 8,
+                                true, 0x7201, 0),
+                   Some(gid as u32));
+        assert_eq!(track_thread(0x30, 0x31, "m4.11.stop.leader.t30", 0, 8,
+                                true, 0x7202, 0),
+                   Some(gid as u32));
+        tasks()[1].pending = PENDING_FUTEX;
+        tasks()[1].pending_num = LINUX_FUTEX;
+        tasks()[1].pending_tag = 0x77;
+        tasks()[2].pending = PENDING_NONE;
+
+        match answer_kill(gid, 0, 0x7200,
+                          &[0x7200, 19, 0, 0, 0, 0]).unwrap() {
+            Answer::SignalStopGroup(g) => {
+                assert_eq!(g.n, 2, "both siblings are in the broadcast");
+                assert_eq!(&g.tasks[..2], &[1, 2]);
+                assert_eq!((g.sig, g.parked), (19, 1));
+            }
+            other => panic!("group stop did not broadcast: {:?}", other),
+        }
+        assert!(tasks()[1].stopped && tasks()[2].stopped);
+        assert_eq!(tasks()[1].pending, PENDING_FUTEX,
+                   "the parked reply remains for SIGCONT");
+        assert_eq!(tasks()[2].pending, PENDING_NONE,
+                   "the running target has no reply to hold");
+
+        match answer_kill(gid, 0, 0x7200,
+                          &[0x7200, 18, 0, 0, 0, 0]).unwrap() {
+            Answer::SignalContinue(c) => {
+                assert_eq!(c.n, 2);
+                assert_eq!(&c.tasks[..2], &[1, 2]);
+            }
+            other => panic!("group SIGCONT did not resume: {:?}", other),
+        }
+        assert!(!tasks()[1].stopped && !tasks()[2].stopped);
+        assert_eq!(tasks()[1].pending, PENDING_FUTEX);
+    }
+
+    /* M4.11: a broadcast that cannot hold every running sibling is not
+     * committed. The one successful hold is released, the parked target's
+     * FUTEX_WAIT is restored, and every stop latch is cleared before the
+     * caller receives E_CONFLICT. */
+    struct StopHoldKernel {
+        fail_pid: u32,
+        releases: RefCell<Vec<u32>>,
+    }
+
+    impl Kernel for StopHoldKernel {
+        fn wait(&self, _: &[u32], _: u64) -> Result<(usize, u16), i32> {
+            Err(E_CONFLICT)
+        }
+        fn recv(&self, _: u32, _: &mut [u8], _: &mut [GrantedCap])
+            -> Result<aerosls_proto::kabi::RecvResult, i32> {
+            Err(E_CONFLICT)
+        }
+        fn send(&self, _: u32, _: u32, _: u16, _: &[u8],
+                _: &[aerosls_proto::kabi::SendCap], _: u64)
+            -> Result<(), i32> {
+            Err(E_CONFLICT)
+        }
+        fn close(&self, _: u32, _: u16, _: u32) -> Result<(), i32> {
+            Ok(())
+        }
+        fn cap_info(&self, _: u32)
+            -> Result<aerosls_proto::kabi::CapInfo, i32> {
+            Err(E_CONFLICT)
+        }
+        fn proc_hold(&self, pid: u32) -> Result<(), i32> {
+            if pid == self.fail_pid { Err(E_AGAIN) } else { Ok(()) }
+        }
+        fn proc_release(&self, pid: u32) -> Result<(), i32> {
+            self.releases.borrow_mut().push(pid);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn m4_11_group_stop_failure_rolls_back_held_and_latched_siblings() {
+        let _guard = M4_10_TEST_LOCK.lock().unwrap();
+        reset_registry();
+        assert!(track(0x10, 0x11, "m4.11.rollback.leader", 0,
+                      0x80_0000, 0x81_0000, 7, 0x7500, false));
+        let gid = tasks()[0].group;
+        for (ch, tid, name) in [
+            (0x20, 0x7501, "m4.11.rollback.leader.t20"),
+            (0x30, 0x7502, "m4.11.rollback.leader.t30"),
+            (0x40, 0x7503, "m4.11.rollback.leader.t40"),
+        ] {
+            assert_eq!(track_thread(ch, ch + 1, name, 0, 8, true, tid, 0),
+                       Some(gid as u32));
+        }
+
+        let uaddr = 0x7500_1000u64;
+        tasks()[1].pending = PENDING_FUTEX;
+        tasks()[1].pending_num = LINUX_FUTEX;
+        tasks()[1].pending_tag = 0x7501;
+        tasks()[1].pending_arg = uaddr;
+        assert!(futex_enqueue(&mut groups()[gid], 1, uaddr, u32::MAX));
+
+        let grp = match answer_kill(gid, 0, 0x7500,
+                                    &[0x7500, 19, 0, 0, 0, 0]).unwrap() {
+            Answer::SignalStopGroup(g) => g,
+            other => panic!("SIGSTOP did not broadcast: {:?}", other),
+        };
+        assert_eq!((grp.n, grp.parked), (3, 1));
+        assert!(tasks()[1].stopped && tasks()[2].stopped && tasks()[3].stopped);
+        assert_eq!(groups()[gid].futex.iter().filter(|w| w.used).count(), 0,
+                   "stop removes the parked waiter until commit");
+
+        let k = StopHoldKernel { fail_pid: 0x7503,
+                                 releases: RefCell::new(Vec::new()) };
+        match hold_stop_group(&k, gid, &grp) {
+            Err(E_CONFLICT) => {}
+            other => panic!("failed hold did not return a clean conflict: {:?}",
+                            other),
+        }
+        assert!(!tasks()[1].stopped && !tasks()[2].stopped &&
+                !tasks()[3].stopped,
+                "no sibling may remain latched after rollback");
+        assert!(!tasks()[1].run_held && !tasks()[2].run_held &&
+                !tasks()[3].run_held,
+                "no sibling may remain kernel-held after rollback");
+        assert_eq!(&*k.releases.borrow(), &[0x7502],
+                   "the successful hold was released exactly once");
+        assert_eq!(groups()[gid].futex.iter().filter(|w| w.used).count(), 1);
+        let restored = groups()[gid].futex.iter().find(|w| w.used).unwrap();
+        assert_eq!((restored.task, restored.uaddr, restored.bitset),
+                   (1, uaddr, u32::MAX));
+        assert_eq!(tasks()[1].pending, PENDING_FUTEX,
+                   "the parked exchange is still the one to wake");
+    }
+
+    /* M4.11: a handler for a sibling with no parked exchange is a direct
+     * ring3 install, not the parked-reply trailer. The sidecar must leave
+     * the sysret at 0 (the interrupted task resumes its own rax) and mark
+     * only the target's mask. */
+    #[test]
+    fn m4_11_running_sibling_handler_uses_direct_delivery() {
+        let _guard = M4_10_TEST_LOCK.lock().unwrap();
+        reset_registry();
+        assert!(track(0x10, 0x11, "m4.11.run.leader", 0,
+                      0x80_0000, 0x81_0000, 7, 0x7300, false));
+        let gid = tasks()[0].group;
+        assert_eq!(track_thread(0x20, 0x21, "m4.11.run.leader.t20", 0, 8,
+                                true, 0x7301, 0),
+                   Some(gid as u32));
+        groups()[gid].sig_dispo[12] = DISPO_HANDLER;
+        groups()[gid].sig_act[12] = SigAct { handler: 0x403000,
+                                             flags: SA_RESTORER,
+                                             restorer: 0x404000, mask: 0 };
+        assert_eq!(tasks()[1].pending, PENDING_NONE);
+
+        let a = answer_tgkill(gid, 0x7300,
+                              &[0x7300, 0x7301, 12, 0, 0, 0]).unwrap();
+        match a {
+            Answer::SignalHandlerRun(tid, d) => {
+                assert_eq!(tid, 0x7301);
+                assert_eq!(d.signo, 12);
+                assert_eq!(d.handler, 0x403000);
+                assert_eq!(d.sysret, 0,
+                           "a running sibling resumes its own rax, not -EINTR");
+            }
+            other => panic!("running sibling did not get a direct frame: {:?}",
+                            other),
+        }
+        assert_ne!(tasks()[1].sig.mask & (1u64 << 11), 0);
+        assert_eq!(tasks()[1].pending, PENDING_NONE,
+                   "no parked exchange was created");
+        assert_eq!(tasks()[0].sig.mask & (1u64 << 11), 0);
+    }
+
+    /* M4.11: the process-directed handler path also reaches a running
+     * sibling when no sibling is parked. This is the group-signal fallback,
+     * distinct from the explicit tkill case above. */
+    #[test]
+    fn m4_11_group_handler_falls_back_to_a_running_sibling() {
+        let _guard = M4_10_TEST_LOCK.lock().unwrap();
+        reset_registry();
+        assert!(track(0x10, 0x11, "m4.11.grouprun.leader", 0,
+                      0x80_0000, 0x81_0000, 7, 0x7400, false));
+        let gid = tasks()[0].group;
+        assert_eq!(track_thread(0x20, 0x21, "m4.11.grouprun.leader.t20", 0, 8,
+                                true, 0x7401, 0),
+                   Some(gid as u32));
+        groups()[gid].sig_dispo[10] = DISPO_HANDLER;
+        groups()[gid].sig_act[10] = SigAct { handler: 0x405000,
+                                             flags: SA_RESTORER,
+                                             restorer: 0x406000, mask: 0 };
+        assert_eq!(tasks()[1].pending, PENDING_NONE);
+
+        match answer_kill(gid, 0, 0x7400,
+                          &[0x7400, 10, 0, 0, 0, 0]).unwrap() {
+            Answer::SignalHandlerRun(tid, d) => {
+                assert_eq!(tid, 0x7401);
+                assert_eq!((d.signo, d.sysret), (10, 0));
+            }
+            other => panic!("group handler did not target the running sibling: {:?}",
+                            other),
+        }
     }
 
     #[test]

@@ -44,6 +44,7 @@ const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
 const CLONE_FLAGS: u64 = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND
     | CLONE_THREAD | CLONE_SYSVSEM | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID;
 const SIGUSR1: u64 = 10;
+const SIGUSR2: u64 = 12;
 const SIGTERM: u64 = 15;
 const SIGCONT: u64 = 18;
 const SIGSTOP: u64 = 19;
@@ -64,6 +65,10 @@ static GROUP_HANDLER_HIT: AtomicU64 = AtomicU64::new(0);
 static WORKER_RESUMED: AtomicU64 = AtomicU64::new(0);
 static WORKER_STOP_PARKED: AtomicU64 = AtomicU64::new(0);
 static WORKER_STOP_RESUMED: AtomicU64 = AtomicU64::new(0);
+static TID3: AtomicU64 = AtomicU64::new(0);
+static RUNNING_HANDLER_HIT: AtomicU64 = AtomicU64::new(0);
+static RUNNING_TICKS: AtomicU64 = AtomicU64::new(0);
+static RUNNING_GO_EXIT: AtomicU64 = AtomicU64::new(0);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -96,6 +101,7 @@ struct Stack(UnsafeCell<[u8; 64 * 1024]>);
 unsafe impl Sync for Stack {}
 static STACK1: Stack = Stack(UnsafeCell::new([0u8; 64 * 1024]));
 static STACK2: Stack = Stack(UnsafeCell::new([0u8; 64 * 1024]));
+static STACK3: Stack = Stack(UnsafeCell::new([0u8; 64 * 1024]));
 
 #[repr(C)]
 struct RobustEntry {
@@ -196,6 +202,11 @@ aerosls_sigreturn_restorer:
 extern "C" fn group_handler(_signo: i32) {
     GROUP_HANDLER_HIT.fetch_add(1, Ordering::SeqCst);
     write_bytes(b"M4-GROUP-HANDLER-OK\n");
+}
+
+extern "C" fn running_handler(_signo: i32) {
+    RUNNING_HANDLER_HIT.fetch_add(1, Ordering::SeqCst);
+    write_bytes(b"M4-RUNNING-HANDLER-OK\n");
 }
 
 fn futex(addr: *const AtomicU64, op: c_long, val: u64,
@@ -345,6 +356,22 @@ extern "C" fn worker_a() {
     exit_now();
 }
 
+extern "C" fn worker_c() {
+    TID3.store(gettid(), Ordering::SeqCst);
+    say(b"M4-RUNNING-TID=", TID3.load(Ordering::SeqCst));
+    // No syscall in this loop: the sidecar's target must be timer-suspended,
+    // not blocked on a forwarded request, when the parent's tkill arrives.
+    let mut n = 0u64;
+    while RUNNING_GO_EXIT.load(Ordering::SeqCst) == 0 {
+        n = n.wrapping_add(1);
+        if n & 0x3ff == 0 {
+            RUNNING_TICKS.store(n, Ordering::SeqCst);
+        }
+    }
+    say_msg(b"M4-RUNNING-EXIT");
+    exit_now();
+}
+
 extern "C" fn worker_b() {
     unsafe {
         let entry = &mut *ROBUST_ENTRY.0.get();
@@ -437,6 +464,48 @@ fn main() {
     }
     say_msg(b"M4-GROUP-HANDLER-PASS");
 
+    // M4.11 running-sibling arm: a sibling between syscalls has no parked
+    // reply to carry the trailer. tkill it with a second handler and let the
+    // kernel install the frame into its saved ring3 context.
+    let act2 = KernelSigaction {
+        handler: running_handler as *const () as u64,
+        flags: SA_RESTORER,
+        restorer: aerosls_sigreturn_restorer as *const () as u64,
+        mask: 0,
+    };
+    let sa2_rc = unsafe {
+        syscall(SYS_RT_SIGACTION, SIGUSR2 as c_long,
+                &act2 as *const KernelSigaction as c_long,
+                0 as c_long, 8 as c_long)
+    };
+    say(b"M4-RUNNING-SIGACTION=", sa2_rc as u64);
+    if sa2_rc != 0 { fail(b"running-sigaction"); }
+
+    let tid3 = spawn3(CLONE_FLAGS & !CLONE_CHILD_SETTID & !CLONE_CHILD_CLEARTID,
+                       stack_top(&STACK3), 0, worker_c);
+    if tid3 <= 0 { fail(b"clone3-c"); }
+    say(b"M4-CLONE3-C-OK=", tid3 as u64);
+    for _ in 0..64 { unsafe { syscall(SYS_YIELD); } }
+    let running_rc = unsafe {
+        syscall(SYS_TGKILL, tgid as c_long, tid3 as c_long, SIGUSR2 as c_long)
+    };
+    say(b"M4-RUNNING-HANDLER-SENT=", running_rc as u64);
+    if running_rc != 0 { fail(b"running-handler-send"); }
+    let mut running_seen = false;
+    for _ in 0..2_000_000 {
+        if RUNNING_HANDLER_HIT.load(Ordering::SeqCst) != 0 {
+            running_seen = true;
+            break;
+        }
+        unsafe { syscall(SYS_YIELD); }
+    }
+    if !running_seen {
+        say(b"M4-RUNNING-HANDLER-HIT=",
+            RUNNING_HANDLER_HIT.load(Ordering::SeqCst));
+        fail(b"running-handler");
+    }
+    say_msg(b"M4-RUNNING-HANDLER-PASS");
+
     // M4.10 stop arm. Retry until the worker is actually parked (the first
     // attempt can beat the futex), then continue the group; the sidecar's
     // stop latch holds the reply in between.
@@ -468,7 +537,23 @@ fn main() {
         unsafe { syscall(SYS_YIELD); }
     }
     if !stop_seen { fail(b"group-stop-resume"); }
+
+    // The group stop also held the running sibling. Its progress counter must
+    // move after SIGCONT and before we ask it to exit; the sidecar's broadcast
+    // log is the count proof, this is the live resume proof.
+    let run_before = RUNNING_TICKS.load(Ordering::SeqCst);
+    let mut running_resumed = false;
+    for _ in 0..2_000_000 {
+        if RUNNING_TICKS.load(Ordering::SeqCst) > run_before {
+            running_resumed = true;
+            break;
+        }
+        unsafe { syscall(SYS_YIELD); }
+    }
+    if !running_resumed { fail(b"group-stop-broadcast"); }
+    say_msg(b"M4-GROUP-STOP-BROADCAST-PASS");
     say_msg(b"M4-GROUP-STOP-PASS");
+    RUNNING_GO_EXIT.store(1, Ordering::SeqCst);
 
     // The second clone has no clear-tid; its robust list is the exit proof.
     let tid2 = spawn3(CLONE_FLAGS & !CLONE_CHILD_SETTID & !CLONE_CHILD_CLEARTID,
