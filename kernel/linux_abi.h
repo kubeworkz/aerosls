@@ -801,6 +801,18 @@ int linux_mprotect_leaf_transition(uint64_t leaf, uint64_t prot,
  * munmap/replace paths so a parked mapping is still owned by this task. */
 int linux_user_leaf(uint64_t root, uint64_t va, uint64_t *leaf_out);
 
+/* The two apply-time leaf classifications the reservation fixes rest on.
+ * Both take a leaf returned by linux_user_leaf and write the frame the
+ * caller must return to 0 when there is none:
+ *   - rollback: 1 iff this is the transient frame|PARKED|RESERVED leaf a
+ *     mprotect backing pass created. The apply restores its PTE to the
+ *     bare LINUX_PTE_RESERVED reservation, never clears it;
+ *   - munmap: 1 iff the leaf is a mapping to remove, including a bare
+ *     reservation with no frame. The old frame-only test left such a PTE
+ *     behind, so a later mprotect could resurrect a range munmap owned. */
+int linux_mprotect_rollback_leaf(uint64_t leaf, uint64_t *frame_out);
+int linux_munmap_leaf_action(uint64_t leaf, uint64_t *frame_out);
+
 /* The 4 KiB frame behind a user mapping, walked read-only under the
  * copy's boundaries; 0 when any level refuses (absent, supervisor, huge,
  * or parked). The unwind's read-back — and only that: a kernel address or

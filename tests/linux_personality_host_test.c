@@ -1064,6 +1064,35 @@ int main(void)
                   "the backed-reservation transition clears the marker and "
                   "      installs the requested present leaf");
         }
+
+        /* Regression coverage for the rollback fix: the filled state is
+         * exactly what phase 2 created, while a parked guard, a bare
+         * reservation, or a present leaf all predate or outlive the pass
+         * and must never be freed by its unwind. */
+        {
+            uint64_t f = 0;
+            uint64_t filled = FRAME | LINUX_PTE_PARKED |
+                              LINUX_PTE_RESERVED;
+            CHECK(linux_mprotect_rollback_leaf(filled, &f) == 1 &&
+                      f == FRAME,
+                  "rollback returns exactly the filled reservation's frame");
+            f = FRAME;
+            CHECK(linux_mprotect_rollback_leaf(parked, &f) == 0 && f == 0,
+                  "a parked guard is not a rollback candidate — its frame "
+                  "      predates this pass");
+            f = FRAME;
+            CHECK(linux_mprotect_rollback_leaf(LINUX_PTE_RESERVED, &f) == 0 &&
+                      f == 0,
+                  "a bare reservation is restored by rollback, never freed");
+            f = FRAME;
+            CHECK(linux_mprotect_rollback_leaf(restored, &f) == 0 && f == 0,
+                  "a present leaf is not a rollback candidate");
+            f = FRAME;
+            CHECK(linux_mprotect_rollback_leaf(
+                      FRAME | LINUX_PTE_RESERVED, &f) == 0 && f == 0,
+                  "a frame|RESERVED leaf without PARKED is malformed, not "
+                  "      freeable");
+        }
     }
 
     /* ─── the munmap seam (E7 increment 25, §5.4) ─────────────────────── */
@@ -1130,6 +1159,31 @@ int main(void)
         CHECK(v.malformed == 1 && v.unmap_pages == 0,
               "a success for a request the first trap would refuse is "
               "      malformed — the verdict is total on any input");
+
+        /* Regression coverage for the reservation-munmap fix: a bare
+         * reservation has no frame, but it is still a mapping the apply
+         * must clear; the frame reader alone would leave it behind. */
+        {
+            const uint64_t FR = 0x0000000012345000ULL;
+            uint64_t f = 0;
+            CHECK(linux_munmap_leaf_action(0, &f) == 0 && f == 0,
+                  "an absent leaf has nothing to unmap");
+            CHECK(linux_munmap_leaf_action(LINUX_PTE_RESERVED, &f) == 1 &&
+                      f == 0,
+                  "a bare PROT_NONE reservation is unmapped despite having "
+                  "      no frame");
+            CHECK(linux_munmap_leaf_action(
+                      FR | LINUX_PTE_PRESENT | LINUX_PTE_USER, &f) == 1 &&
+                      f == FR,
+                  "a present leaf returns its frame to the partition");
+            CHECK(linux_munmap_leaf_action(
+                      FR | LINUX_PTE_PARKED, &f) == 1 && f == FR,
+                  "a parked leaf returns its retained frame");
+            CHECK(linux_munmap_leaf_action(
+                      FR | LINUX_PTE_PARKED | LINUX_PTE_RESERVED,
+                      &f) == 1 && f == FR,
+                  "a transient filled reservation is unmapped and freed");
+        }
     }
 
     /* ─── the frame reader: the unwind's read-back ────────────────────── */

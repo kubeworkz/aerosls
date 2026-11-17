@@ -1223,6 +1223,32 @@ uint64_t linux_user_page_frame(uint64_t root, uint64_t va)
     return leaf & LINUX_PTE_FRAME_MASK;
 }
 
+int linux_mprotect_rollback_leaf(uint64_t leaf, uint64_t *frame_out)
+{
+    if (!frame_out) return 0;
+    *frame_out = 0;
+    /* The filled reservation is exactly frame|PARKED|RESERVED; any other
+     * bit means this is not the transient state phase 2 installs, so the
+     * rollback must not free its frame. */
+    if ((leaf & ~(LINUX_PTE_FRAME_MASK | LINUX_PTE_PARKED |
+                   LINUX_PTE_RESERVED)) != 0 ||
+        !(leaf & LINUX_PTE_RESERVED) ||
+        !(leaf & LINUX_PTE_PARKED) ||
+        !(leaf & LINUX_PTE_FRAME_MASK))
+        return 0;
+    *frame_out = leaf & LINUX_PTE_FRAME_MASK;
+    return 1;
+}
+
+int linux_munmap_leaf_action(uint64_t leaf, uint64_t *frame_out)
+{
+    if (!frame_out) return 0;
+    *frame_out = leaf & LINUX_PTE_FRAME_MASK;
+    /* A bare reservation has no frame to return, but it is still a mapping
+     * to remove; a frame-bearing present/parked/filled leaf is both. */
+    return (leaf & (LINUX_PTE_FRAME_MASK | LINUX_PTE_RESERVED)) != 0;
+}
+
 /* ─── E7 increment 12 (the reply payload, §10.13's step 3) — the copy-IN ───
  * The header names the split and the security property; these are its
  * three pure halves. Nothing below reads kernel state: the plan is

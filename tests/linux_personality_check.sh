@@ -1417,8 +1417,9 @@ fi
 # The contract (X), the first trap before any post (X1), the reply's
 # page-table walk and frame return (X2), the sidecar's twin (X3), the
 # host test's branches (X4), the probe's on-target proof (X5), the
-# instrument lines (X6) and the probe's PROT_NONE round trip (X7): each is
-# a claim the seam rests on.
+# instrument lines (X6), the probe's PROT_NONE round trip (X7), and the
+# reservation-fix regressions — rollback restore (X8) and bare-reservation
+# munmap (X9): each is a claim the seam rests on.
 if grep -qF 'struct LinuxMunmapReq {' kernel/linux_abi.h && \
    grep -qF 'int linux_mem_munmap_refusal(const struct LinuxMunmapReq *req,' kernel/linux_abi.h && \
    grep -qF 'linux_mem_munmap_verdict(uint64_t heap_base, uint64_t heap_limit,' kernel/linux_abi.h && \
@@ -1443,13 +1444,14 @@ munmap_apply="$(sed -n "$((munmap_v - 3)),$((munmap_v + 70))p" kernel/syscall_di
 if [ -n "$munmap_v" ] && \
    grep -qF 'cur->linux_brk_cur' <<< "$munmap_apply" && \
    grep -qF 'linux_user_leaf(' <<< "$munmap_apply" && \
+   grep -qF 'linux_munmap_leaf_action(' <<< "$munmap_apply" && \
    grep -qF 'user_unmap_page(pml4, va);' <<< "$munmap_apply" && \
    grep -qF 'user_invlpg(va);' <<< "$munmap_apply" && \
    grep -qF 'free_physical_ram_frame_for_partition' <<< "$munmap_apply" && \
    grep -qF 'v.unmap_pages' <<< "$munmap_apply"; then
-    ok "X2. the reply's apply walks exactly the verdict's page range, frees every present or parked USER frame back to the partition, shoots down each touched translation, and leaves both cursors alone — an absent page is already unmapped, not an error"
+    ok "X2. the reply's apply walks exactly the verdict's page range, classifies present, parked and bare-reservation leaves, returns real frames to the partition, shoots down each touched translation, and leaves both cursors alone — an absent page is already unmapped, not an error"
 else
-    bad "X2. the munmap apply is missing or no longer walks the verdict's range — a success would unmap nothing (or free a frame without invlpg / return it without unmapping)"
+    bad "X2. the munmap apply is missing or no longer walks the verdict's range — a success would unmap nothing (or free a frame without invlpg / return it without unmapping), and a bare reservation would survive"
 fi
 munmap_arm=$(grep -nF '        11 => {' user/sidecar/src/linux.rs | head -1 | cut -d: -f1)
 munmap_arm_body="$(sed -n "$((munmap_arm + 1)),$((munmap_arm + 40))p" user/sidecar/src/linux.rs)"
@@ -1532,6 +1534,44 @@ if [ -n "$mp_block" ] && \
     ok "X7. the probe carries the PROT_NONE round trip in order on one heap page: NONE before READ|WRITE, two mprotect calls on %r12, three content reads, a writability byte, the 18-byte positive marker sourced from %r12 in %rsi, and markers 412–415 for a refused park/restore, changed contents, or short output"
 else
     bad "X7. the probe's mprotect round-trip block is gone, gutted, or out of order — the E3 live boot would still pass from older evidence or another task's marker, while the fixture no longer proves PROT_NONE parked the page, RW restored it, and the marker's bytes came from that heap page"
+fi
+
+# ─── X8. Rollback must restore the reservation, not clear it ──────────────
+# The frame-exhaustion unwind is the one path the host test cannot execute
+# (syscall_dispatch.c is not host-linked), so its shape is held here: the
+# classifier is the host-tested action, and the block must map the bare
+# reservation back. A revert to user_unmap_page would lose the range and
+# make a retry answer ENOMEM forever; the smoke's t131 is that revert.
+rollback_block="$(sed -n '/Roll back exactly the/,/reservations restored/p' "$DISP")"
+if grep -qF 'int linux_mprotect_rollback_leaf(' "$LABH" && \
+   grep -qF 'int linux_mprotect_rollback_leaf(' "$LABC" && \
+   grep -qF 'linux_mprotect_rollback_leaf(' <<< "$rollback_block" && \
+   grep -qF 'rleaf, &f)' <<< "$rollback_block" && \
+   grep -qF 'user_map_page(pml4, rb, 0,' <<< "$rollback_block" && \
+   grep -qF 'USER_PTE_RESERVED);' <<< "$rollback_block" && \
+   ! grep -qF 'user_unmap_page(pml4, rb);' <<< "$rollback_block" && \
+   grep -qF 'linux_mprotect_rollback_leaf(filled, &f)' "$PHUT" && \
+   grep -qF 'a parked guard is not a rollback candidate' "$PHUT"; then
+    ok "X8. frame-exhaustion rollback frees only the filled-reservation frames and restores the bare USER_PTE_RESERVED leaf (the host test pins the classifier; the apply block must not call user_unmap_page)"
+else
+    bad "X8. the rollback lost its reservation restore or its classifier — a quota failure would clear the PTE, so a retry sees a hole instead of the reservation it may back"
+fi
+
+# ─── X9. Munmap must clear a bare reservation ────────────────────────────
+# A reservation has no frame, which is exactly why the old frame-only test
+# skipped it. The action is host-tested; this pins the helper's own
+# reservation arm and the apply's use of it. The smoke's t132 removes the
+# arm and requires this clause to redden.
+munmap_helper="$(sed -n '/int linux_munmap_leaf_action(/,/^}/p' "$LABC")"
+if grep -qF 'int linux_munmap_leaf_action(' "$LABH" && \
+   grep -qF 'int linux_munmap_leaf_action(' "$LABC" && \
+   grep -qF 'linux_munmap_leaf_action(' <<< "$munmap_apply" && \
+   grep -qF 'LINUX_PTE_FRAME_MASK | LINUX_PTE_RESERVED' <<< "$munmap_helper" && \
+   grep -qF 'linux_munmap_leaf_action(LINUX_PTE_RESERVED, &f)' "$PHUT" && \
+   grep -qF 'a bare PROT_NONE reservation is unmapped despite having' "$PHUT"; then
+    ok "X9. munmap's leaf action treats a bare RESERVED leaf as a mapping to remove even though frame_out is 0, and the host test drives that arm"
+else
+    bad "X9. the reservation-munmap arm is gone — munmap would skip a frame-less reservation, leaving a mapping the next mprotect could back after the caller believed it was gone"
 fi
 
 echo

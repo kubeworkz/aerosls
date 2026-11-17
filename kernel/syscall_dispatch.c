@@ -570,12 +570,9 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                         uint64_t leaf = 0;
                                         uint64_t f = 0;
                                         if (linux_user_leaf(cur->cr3, va,
-                                                             &leaf) == 0)
-                                            f = leaf & USER_PTE_FRAME_MASK;
-                                        /* A bare reservation has no frame
-                                         * to return, but it is still a
-                                         * mapping to remove. */
-                                        if (f || (leaf & USER_PTE_RESERVED)) {
+                                                             &leaf) == 0 &&
+                                            linux_munmap_leaf_action(
+                                                leaf, &f)) {
                                             user_unmap_page(pml4, va);
                                             user_invlpg(va);
                                             if (f)
@@ -736,15 +733,12 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                             uint64_t ri = 0;
                                             while (ri < v.range_pages) {
                                                 uint64_t rleaf = 0;
+                                                uint64_t f = 0;
                                                 if (linux_user_leaf(
                                                         cur->cr3, rb,
                                                         &rleaf) == 0 &&
-                                                    (rleaf & USER_PTE_RESERVED) &&
-                                                    (rleaf & USER_PTE_PARKED) &&
-                                                    (rleaf & USER_PTE_FRAME_MASK)) {
-                                                    uint64_t f =
-                                                        rleaf &
-                                                        USER_PTE_FRAME_MASK;
+                                                    linux_mprotect_rollback_leaf(
+                                                        rleaf, &f)) {
                                                     user_map_page(pml4, rb, 0,
                                                                   USER_PTE_RESERVED);
                                                     free_physical_ram_frame_for_partition(

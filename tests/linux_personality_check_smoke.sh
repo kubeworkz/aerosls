@@ -291,15 +291,15 @@ tooth echo-check-dropped J2 "the num-echo refusal is gone from apply_reply" "$W/
 # K: the service call unhooked — requests stay queued while their task
 # parks forever, and the wait set never learns to wake the sidecar.
 #
-# The call gained a fourth argument (the SocketOps client M1's network
-# bridge needs) after this tooth was written, so its pattern must be kept
-# in step with the source: a mutation that never happened reads exactly
-# like one that happened and was caught, and only this tooth's verdict
-# distinguishes them. It and three others (M6, O7, T5) had gone stale this
-# way against earlier source changes, unseen because the baseline aborted
-# before any tooth could run.
+# The call gained two arguments (the SocketOps and catalog clients M1's
+# network bridge needs) after this tooth was written, so its pattern must
+# be kept in step with the source: a mutation that never happened reads
+# exactly like one that happened and was caught, and only this tooth's
+# verdict distinguishes them. It and three others (M6, O7, T5) had gone
+# stale this way against earlier source changes, unseen because the baseline
+# aborted before any tooth could run.
 seed "$W/t14"
-sed -i 's/crate::linux::service(\&RealKernel, \&booted\.console, vfs, net);//' "$W/t14/user/sidecar/src/entry.rs"
+sed -i 's/crate::linux::service(\&RealKernel, \&booted\.console, vfs, net, catalog);//' "$W/t14/user/sidecar/src/entry.rs"
 tooth service-unhooked K "the entry loop no longer services the Linux children" "$W/t14"
 
 # K1: the default arm becomes a silent success — §11 Q5's forbidden answer
@@ -1064,6 +1064,37 @@ tooth mprotect-round-trip-gone X7 "the probe no longer carries the PROT_NONE rou
 seed "$W/t130"
 sed -i 's/if num == LINUX_SENDTO {/if false {/' "$W/t130/user/sidecar/src/linux.rs"
 tooth sigpipe-producer-gone R13 "service() no longer routes an EPIPE send through the SIGPIPE producer" "$W/t130"
+
+# t131: the rollback reverts to clearing the PTE — the original bug. A
+# frame-exhausted mprotect would return ENOMEM and lose the reservation, so
+# a retry could only ever answer ENOMEM. Guard clause X8 must redden by name.
+seed "$W/t131"
+python3 - "$W/t131/kernel/syscall_dispatch.c" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p, encoding='utf-8').read()
+old = """                                                    user_map_page(pml4, rb, 0,
+                                                                  USER_PTE_RESERVED);"""
+new = """                                                    user_unmap_page(pml4, rb);"""
+assert old in s, 'rollback restore block not found'
+open(p, 'w', encoding='utf-8').write(s.replace(old, new, 1))
+PY
+tooth rollback-clears-reservation X8 "the frame-exhaustion rollback clears the reservation PTE instead of restoring it" "$W/t131"
+
+# t132: the munmap helper falls back to the frame-only rule — the original
+# bug. A bare reservation would survive munmap and a later mprotect could
+# resurrect the range. Guard clause X9 must redden by name.
+seed "$W/t132"
+python3 - "$W/t132/kernel/linux_abi.c" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p, encoding='utf-8').read()
+old = 'return (leaf & (LINUX_PTE_FRAME_MASK | LINUX_PTE_RESERVED)) != 0;'
+new = 'return (leaf & LINUX_PTE_FRAME_MASK) != 0;'
+assert old in s, 'munmap reservation arm not found'
+open(p, 'w', encoding='utf-8').write(s.replace(old, new, 1))
+PY
+tooth munmap-skips-reservation X9 "the munmap leaf action reverted to frame-only, skipping bare reservations" "$W/t132"
 
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"
