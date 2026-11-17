@@ -1,14 +1,14 @@
-ok:   A. the tool answers with one stable sha256 line for this tree (f1cc90790ffcabeeaba49e764812db34c78bdb3a7a5e340977061bbfa656b5f1)
-ok:   B. sidecars.cpio is from the user/ sources in this tree — the committed stamp matches the committed sources (f1cc90790ffcabeeaba49e764812db34c78bdb3a7a5e340977061bbfa656b5f1)
+ok:   A. the tool answers with one stable sha256 line for this tree (08154622aced7eebdfcfb07fcee6bb08453e7db8434b927a4798b74a929d4860)
+ok:   B. sidecars.cpio is from the user/ sources in this tree — the committed stamp matches the committed sources (08154622aced7eebdfcfb07fcee6bb08453e7db8434b927a4798b74a929d4860)
 ok:   C. x86-iso calls the tool (line 26), compares it with $(SIDECAR_STAMP) and exits non-zero on a mismatch, all before it copies the archive (line 99)
 ok:   D. selfhost-bootimage packs sidecars.cpio and writes $(SIDECAR_STAMP) in the same run, projected from the record tools/sidecar_stamp_record.sh computes
 ok:   E. SIDECAR_STAMP derives from SIDECAR_CPIO, so each archive has its own stamp (the E3 image cannot be verified against the default one's)
 ok:   F. .gitignore lists all three build-artifact stamps (sidecars_e3.cpio.digest, sidecars_e3.cpio.sha256, sidecars_e3.cpio.stamps) and swallows neither sidecars.cpio.digest nor sidecars.cpio.sha256 nor sidecars.cpio.stamps, nor a pattern that would
 ok:   G. selfhost-bootimage builds the sidecars fatally and writes the run record (and the stamps projected from it) only afterwards, so no stamp covers binaries the run did not build
-ok:   H. the committed sidecars.cpio's own bytes are the stamped ones — sidecars.cpio.sha256 matches sha256sum (2a3d789965662fd92f2c2569b1002e1d8f3dbe6d2dd949cb871799bf42c385d5)
+ok:   H. the committed sidecars.cpio's own bytes are the stamped ones — sidecars.cpio.sha256 matches sha256sum (a08426adaefa64c091314dfbb55b4e570590f4b13479dae71cc2c228d6888d20)
 ok:   I. selfhost-bootimage packs sidecars.cpio and then writes $(SIDECAR_ARCHIVE_STAMP), per-archive ($(SIDECAR_CPIO).sha256), projected from the record whose writer hashes the bytes
 ok:   J. x86-iso hashes the archive's bytes (command 25), compares them with $(SIDECAR_ARCHIVE_STAMP) and exits non-zero on a mismatch, all before it copies the archive (command 35)
-ok:   K. sidecars.cpio, sidecars.cpio.digest and sidecars.cpio.sha256 all come from one pack run — the committed record matches a live recomputation of every half (f1cc90790ffcabeeaba49e764812db34c78bdb3a7a5e340977061bbfa656b5f1 / 2a3d789965662fd92f2c2569b1002e1d8f3dbe6d2dd949cb871799bf42c385d5 / the six binaries), it has the v2 shape, and each stamp is a field of it
+ok:   K. sidecars.cpio, sidecars.cpio.digest and sidecars.cpio.sha256 all come from one pack run — the committed record matches a live recomputation of every half (08154622aced7eebdfcfb07fcee6bb08453e7db8434b927a4798b74a929d4860 / a08426adaefa64c091314dfbb55b4e570590f4b13479dae71cc2c228d6888d20 / the six binaries), it has the v2 shape, and each stamp is a field of it
 ok:   L. the six binaries the record names are the archive's — every boot/*.bin entry matches both tools/sidecar_archive_entry_digest.sh and an independent coreutils extraction, so the record cannot misstate what is packed
 ok:   M. the archive's six binaries are this tree's flattened outputs wherever those exist — 6 compared, 0 skipped as a packed variant (files the anchored E3 record names), and x86-iso runs the check (command 25) before it copies the archive (command 35)
 ok:   N. no E3 pack in this tree (sidecars_e3.cpio and sidecars_e3.cpio.stamps are ignored build files; at least one of them is absent) — the E3 one-run rule is skipped, not assumed

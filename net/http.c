@@ -659,7 +659,12 @@ static const char* http_body(const char* req) {
     return 0;
 }
 
-// Extract "key": "value" from a JSON string; returns chars copied
+// Extract "key": "value" from a JSON string; returns chars copied.
+// Decodes the escapes jb_esc_str() emits (`\\` and `\"`) plus the other
+// one-character JSON escapes. This matters for POST /api/shell/exec: a
+// client's correctly escaped backslash used to arrive as TWO characters,
+// so `env attach`'s shell never saw the one backslash that makes `\'` a
+// quote. Other escapes (`\u…`) are copied through unchanged, as before.
 static int json_str(const char* json, const char* key, char* out, int max) {
     char srch[128]; int si = 0;
     srch[si++] = '"';
@@ -672,7 +677,30 @@ static int json_str(const char* json, const char* key, char* out, int max) {
     if (*p!='"') return 0;
     p++;
     int n = 0;
-    while (*p && *p!='"' && n<max-1) out[n++] = *p++;
+    while (*p && *p!='"' && n<max-1) {
+        if (*p == '\\' && p[1]) {
+            char d;
+            switch (p[1]) {
+                case '"':  d = '"';  break;
+                case '\\': d = '\\'; break;
+                case '/':  d = '/';  break;
+                case 'b':  d = '\b'; break;
+                case 'f':  d = '\f'; break;
+                case 'n':  d = '\n'; break;
+                case 'r':  d = '\r'; break;
+                case 't':  d = '\t'; break;
+                default:
+                    out[n++] = '\\';
+                    if (n < max-1) out[n++] = p[1];
+                    p += 2;
+                    continue;
+            }
+            out[n++] = d;
+            p += 2;
+            continue;
+        }
+        out[n++] = *p++;
+    }
     out[n] = '\0';
     return n;
 }

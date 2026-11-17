@@ -648,8 +648,13 @@ fi
 TBL="e91tbl_$RUN"
 QVAL="e91q-$RUN"
 WTBL="e91wtbl_$RUN"
-WVAL="$RUN"
-WVAL2=$((RUN + 1))
+# Text, not numeric: the SQL literal has to survive both the HTTP JSON
+# decoder and the environment shell. The JSON body carries one escaped
+# backslash (`\\`), which net/http.c decodes to the single backslash the
+# shell reads as "quote me", so the line reaches the applet as
+# `VALUES (\'text\')` and the native read-back can match the text exactly.
+WVAL="e91w-$RUN"
+WVAL2="e91w2-$RUN"
 
 sh_exec "valloc $TBL 1 1" \
     || die_fail "'valloc $TBL' was not recognised by the node shell"
@@ -848,7 +853,7 @@ ATTACH_TOKEN="$TOKEN"
 ATTACH_ENV_ID="$ENV2_ID"
 ATTACH_OUT=""
 
-if run_verb "catalog exec INSERT INTO $WTBL (note) VALUES ($WVAL)" "row(s) affected"; then
+if run_verb "catalog exec INSERT INTO $WTBL (note) VALUES (\\'$WVAL\\')" "row(s) affected"; then
     expect "1 row(s) affected" "CAT_EXEC INSERT succeeds for the channel's bound owner — the commit is acknowledged"
     reject "refused" "the owner's own table is not refused"
 else
@@ -868,7 +873,7 @@ fi
 
 # UPDATE and DELETE go through the same accepted statement and commit path;
 # the native observer must see each committed effect in turn.
-if run_verb "catalog exec UPDATE $WTBL SET note = $WVAL2" "row(s) affected"; then
+if run_verb "catalog exec UPDATE $WTBL SET note = \\'$WVAL2\\'" "row(s) affected"; then
     expect "1 row(s) affected" "CAT_EXEC UPDATE commits against the owner's table"
 else
     die_fail "\`catalog exec UPDATE $WTBL ...\` never answered through env attach in ${WAIT_VERB}s (last output: ${VERB_OUT:-<nothing>})"

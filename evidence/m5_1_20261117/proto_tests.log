@@ -1,64 +1,65 @@
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.54s
+   Compiling aerosls-proto v0.1.0 (/tmp/m51-clean2/user/proto)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.15s
      Running unittests src/lib.rs (target/debug/build/aerosls-proto/16a7f4ba57cba806/out/aerosls_proto-16a7f4ba57cba806)
 
 running 58 tests
-test bootinfo::tests::parse_rejects_garbage ... ok
-test bootinfo::tests::parse_rejects_truncated ... ok
 test bootinfo::tests::identity_survives_the_round_trip ... ok
 test bootinfo::tests::network_sidecar_bib_layout ... ok
+test bootinfo::tests::parse_ok_and_find ... ok
+test bootinfo::tests::parse_rejects_truncated ... ok
+test bootinfo::tests::parse_rejects_garbage ... ok
 test bootinfo::tests::unified_flag ... ok
 test devreg::tests::empty_registry ... ok
-test bootinfo::tests::parse_ok_and_find ... ok
 test devreg::tests::manifest_name_roundtrip ... ok
-test devreg::tests::parse_two_devices ... ok
-test devreg::tests::rejects_truncated ... ok
 test devreg::tests::find_by_class ... ok
+test devreg::tests::parse_two_devices ... ok
 test devreg::tests::rejects_too_short ... ok
-test env_proto::tests::bodies_round_trip ... ok
+test devreg::tests::rejects_truncated ... ok
 test env_proto::tests::destroy_body_refuses_a_partitionless_request ... ok
-test env_proto::tests::register_body_round_trips ... ok
-test env_proto::tests::register_reply_struct_is_the_wire_layout ... ok
-test env_proto::tests::register_reply_encodes_exact_offsets ... ok
-test env_proto::tests::overlong_task_name_stays_terminated ... ok
+test env_proto::tests::bodies_round_trip ... ok
 test env_proto::tests::frame_round_trips_and_rejects_foreign ... ok
-test manifest::tests::argenv_wire_bytes_golden ... ok
-test manifest::tests::argenv_parse_refuses_what_the_kernel_refuses ... ok
-test manifest::tests::cap_chan_wire_bytes_golden ... ok
-test manifest::tests::build_parse_roundtrip ... ok
-test manifest::tests::argenv_build_parse_roundtrip ... ok
+test env_proto::tests::overlong_task_name_stays_terminated ... ok
+test env_proto::tests::register_body_round_trips ... ok
+test env_proto::tests::register_reply_encodes_exact_offsets ... ok
+test env_proto::tests::register_reply_struct_is_the_wire_layout ... ok
 test manifest::tests::argenv_absent_is_the_v1_answer ... ok
+test manifest::tests::argenv_build_parse_roundtrip ... ok
+test manifest::tests::argenv_parse_refuses_what_the_kernel_refuses ... ok
+test manifest::tests::argenv_new_refuses_over_limit - should panic ... ok
+test manifest::tests::argenv_wire_bytes_golden ... ok
+test manifest::tests::build_parse_roundtrip ... ok
+test manifest::tests::cap_chan_wire_bytes_golden ... ok
 test manifest::tests::cap_dev_wire_bytes_golden ... ok
 test manifest::tests::cap_io_wire_bytes_golden ... ok
 test manifest::tests::cap_irq_wire_bytes_golden ... ok
-test manifest::tests::name_wire_bytes_golden ... ok
 test manifest::tests::cap_mem_wire_bytes_golden ... ok
 test manifest::tests::image_record_matches_kernel_parser_layout ... ok
+test manifest::tests::name_wire_bytes_golden ... ok
 test manifest::tests::rejects_corruption ... ok
 test manifest::tests::rejects_truncation ... ok
-test manifest::tests::signature_slot_is_ignored ... ok
 test manifest::tests::repo_manifest_names_emit_tag_name ... ok
-test tests::cap_descriptor_roundtrip ... ok
+test manifest::tests::signature_slot_is_ignored ... ok
 test manifest::tests::unknown_tags_respect_tolerate_flag ... ok
+test tests::cap_descriptor_roundtrip ... ok
 test tests::cat_exec_request_and_reply_pin_the_write_wire ... ok
 test tests::cat_frame_roundtrips_and_refuses_a_foreign_frame ... ok
 test tests::cat_info_answers_the_partition_the_boundary_computed_from ... ok
-test tests::cat_list_entries_come_out_of_the_fixed_slots ... ok
 test tests::cat_read_reply_roundtrips_key_and_value ... ok
-test tests::cat_request_bodies_refuse_what_the_service_would_answer_shape ... ok
 test tests::cat_stat_body_decodes_the_objects_own_metadata ... ok
-test tests::chan_header_roundtrip ... ok
 test tests::cat_status_is_read_from_the_status_word_not_the_first_body_word ... ok
-test tests::header_layout ... ok
+test tests::chan_header_roundtrip ... ok
+test tests::cat_list_entries_come_out_of_the_fixed_slots ... ok
 test tests::control_event_payloads ... ok
+test tests::cat_request_bodies_refuse_what_the_service_would_answer_shape ... ok
+test tests::header_layout ... ok
 test tests::info_body_roundtrip ... ok
+test tests::magic_bytes ... ok
 test tests::net_addr_roundtrip ... ok
 test tests::net_frame_roundtrip ... ok
 test tests::net_info_body_roundtrip ... ok
 test tests::net_socket_body_roundtrip ... ok
 test tests::rd_frame_roundtrip ... ok
-test manifest::tests::argenv_new_refuses_over_limit - should panic ... ok
-test tests::magic_bytes ... ok
 test tests::rw_body_roundtrip ... ok
 test tests::status_body_roundtrip ... ok
 
-test result: ok. 58 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 58 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s

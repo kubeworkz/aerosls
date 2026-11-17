@@ -1,4 +1,7 @@
-   Compiling aerosls-sidecar v0.1.0 (/mnt/c/Users/kubew/.freebuff/worktrees/084fe97c/aerosls2/.freebuff/worktrees/m1-linux-network/user/sidecar)
+   Compiling aerosls-ramdisk v0.1.0 (/tmp/m51-clean2/user/ramdisk)
+   Compiling aerosls-sidecar v0.1.0 (/tmp/m51-clean2/user/sidecar)
+   Compiling aerosls-procmgr v0.1.0 (/tmp/m51-clean2/user/procmgr)
+   Compiling aerosls-kernel-sim v0.1.0 (/tmp/m51-clean2/user/kernel-sim)
 warning: unused import: `ERR_BUDGET`
   --> sidecar/src/allocator.rs:15:36
    |
@@ -94,41 +97,41 @@ note: but type `IrqRecvOut` is only usable at visibility `pub(self)`
      | ^^^^^^^^^^^^^^^^^
 
 warning: constant `E_ISCONN` is never used
-   --> sidecar/src/linux.rs:528:7
+   --> sidecar/src/linux.rs:524:7
     |
-528 | const E_ISCONN: i32 = -25;
+524 | const E_ISCONN: i32 = -25;
     |       ^^^^^^^^
     |
     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
 
 warning: constant `E_DESTADDRREQ` is never used
-   --> sidecar/src/linux.rs:529:7
+   --> sidecar/src/linux.rs:525:7
     |
-529 | const E_DESTADDRREQ: i32 = -26;
+525 | const E_DESTADDRREQ: i32 = -26;
     |       ^^^^^^^^^^^^^
 
 warning: constant `E_CONNREFUSED` is never used
-   --> sidecar/src/linux.rs:532:7
+   --> sidecar/src/linux.rs:528:7
     |
-532 | const E_CONNREFUSED: i32 = -29;
+528 | const E_CONNREFUSED: i32 = -29;
     |       ^^^^^^^^^^^^^
 
 warning: constant `E_NETUNREACH` is never used
-   --> sidecar/src/linux.rs:534:7
+   --> sidecar/src/linux.rs:530:7
     |
-534 | const E_NETUNREACH: i32 = -30;
+530 | const E_NETUNREACH: i32 = -30;
     |       ^^^^^^^^^^^^
 
 warning: constant `E_HOSTUNREACH` is never used
-   --> sidecar/src/linux.rs:535:7
+   --> sidecar/src/linux.rs:531:7
     |
-535 | const E_HOSTUNREACH: i32 = -31;
+531 | const E_HOSTUNREACH: i32 = -31;
     |       ^^^^^^^^^^^^^
 
 warning: constant `E_AFNOSUPPORT` is never used
-   --> sidecar/src/linux.rs:536:7
+   --> sidecar/src/linux.rs:532:7
     |
-536 | const E_AFNOSUPPORT: i32 = -32;
+532 | const E_AFNOSUPPORT: i32 = -32;
     |       ^^^^^^^^^^^^^
 
 warning: creating a shared reference to mutable static
@@ -146,82 +149,82 @@ help: use `&raw const` instead to create a raw pointer
      |              +++++++++
 
 warning: `aerosls-sidecar` (lib test) generated 18 warnings (run `cargo fix --lib -p aerosls-sidecar --tests` to apply 9 suggestions)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 18.90s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.61s
      Running unittests src/lib.rs (target/debug/build/aerosls-sidecar/512136dcd5e929a8/out/aerosls_sidecar-512136dcd5e929a8)
 
-running 93 tests
-test applets::tests::drop_lines_trims_the_window ... ok
-test applets::tests::cut_line_selects_fields_and_chars ... ok
-test applets::tests::grep_matches_patterns ... ok
-test applets::tests::expand_set_expands_ranges_and_escapes ... ok
-test applets::tests::build_table_and_tr_chunk_translate_and_delete ... ok
+running 92 tests
 test applets::tests::count_lines_counts_newlines ... ok
-test applets::tests::exec_rejoins_the_statement_and_prints_the_committed_count ... ok
+test applets::tests::build_table_and_tr_chunk_translate_and_delete ... ok
+test applets::tests::cut_line_selects_fields_and_chars ... ok
+test applets::tests::drop_lines_trims_the_window ... ok
 test applets::tests::exec_refusal_is_the_services_own_line ... ok
+test applets::tests::exec_rejoins_the_statement_and_prints_the_committed_count ... ok
+test applets::tests::expand_set_expands_ranges_and_escapes ... ok
+test applets::tests::grep_matches_patterns ... ok
 test applets::tests::nc_parse_ip_shape_and_failures ... ok
 test applets::tests::parse_line_backslash_escapes ... ok
-test applets::tests::parse_cut_ranges_reads_lists ... ok
+test applets::tests::nc_parse_ip_round_trips_through_the_kernel_decode ... ok
 test applets::tests::parse_line_blank_and_stray_pipes ... ok
-test applets::tests::parse_line_expands_last_status ... ok
 test applets::tests::parse_line_expands_variables ... ok
 test applets::tests::parse_line_extracts_assignments ... ok
 test applets::tests::parse_line_extracts_redirects ... ok
-test applets::tests::nc_parse_ip_round_trips_through_the_kernel_decode ... ok
+test applets::tests::parse_line_quotes_are_literal ... ok
+test applets::tests::parse_cut_ranges_reads_lists ... ok
 test applets::tests::parse_line_quotes_group_whitespace ... ok
 test applets::tests::parse_line_splits_pipeline_stages ... ok
+test applets::tests::parse_line_expands_last_status ... ok
 test applets::tests::parse_n_reads_the_line_count ... ok
 test applets::tests::parse_seq_args_reads_the_range ... ok
-test applets::tests::sort_orders_lines_lexicographically ... ok
 test applets::tests::path_candidates_searches_path_dirs ... ok
-test applets::tests::parse_line_quotes_are_literal ... ok
+test applets::tests::shell_escaped_quotes_reach_exec_as_a_sql_text_literal ... ok
+test applets::tests::sort_orders_lines_lexicographically ... ok
 test applets::tests::split_lines_keeps_terminators_and_the_final_fragment ... ok
 test applets::tests::sql_a_refusal_is_printed_verbatim ... ok
-test applets::tests::sql_rejoins_the_split_statement_and_parses_its_flags ... ok
 test applets::tests::sql_usage_errors_never_reach_the_wire ... ok
+test applets::tests::sql_rejoins_the_split_statement_and_parses_its_flags ... ok
 test applets::tests::uniq_process_line_tracks_runs ... ok
 test applets::tests::uniq_run_output_formats_runs ... ok
 test applets::tests::wc_counts_across_chunk_boundaries ... ok
+test applets::tests::seq_batches_whole_lines_and_keeps_every_byte ... ok
 test catalog_client::tests::a_foreign_frame_is_a_protocol_error_not_a_status ... ok
+test catalog_client::tests::a_query_page_comes_back_with_its_columns_and_a_real_null ... ok
 test catalog_client::tests::a_refusal_carries_the_services_own_rendered_text ... ok
 test catalog_client::tests::a_truncated_query_body_is_a_protocol_error ... ok
-test catalog_client::tests::a_query_page_comes_back_with_its_columns_and_a_real_null ... ok
 test catalog_client::tests::a_two_object_list_reads_ok_not_perm ... ok
 test catalog_client::tests::an_unservable_argument_never_reaches_the_wire ... ok
-test applets::tests::seq_batches_whole_lines_and_keeps_every_byte ... ok
+test catalog_client::tests::an_unservable_statement_never_reaches_the_wire ... ok
 test catalog_client::tests::an_unservable_write_never_reaches_the_wire ... ok
 test catalog_client::tests::exec_sends_one_statement_and_reads_the_committed_count ... ok
-test catalog_client::tests::an_unservable_statement_never_reaches_the_wire ... ok
-test catalog_client::tests::the_trait_object_the_applet_reaches_dispatches_every_verb ... ok
 test catalog_client::tests::info_carries_the_registered_partition_and_sends_a_bare_frame ... ok
+test catalog_client::tests::the_trait_object_the_applet_reaches_dispatches_every_verb ... ok
 test linux::tests::cap_of_pins_every_vfs_errno_to_its_cap_code ... ok
 test linux::tests::clock_gettime_answers_the_pinned_epoch_and_zero_monotonic ... ok
+test linux::tests::clone_tracking_shares_group_state_and_last_release_retires_it ... ok
+test linux::tests::console_read_serves_buffered_input_and_never_invents_readiness ... ok
 test linux::tests::default_actions_match_posix ... ok
 test linux::tests::dents_payload_packs_names_inodes_and_types_for_the_kernel ... ok
 test linux::tests::expected_req_len_is_the_kernels_twin ... ok
 test linux::tests::expected_req_range_bounds_the_path_attaches ... ok
-test linux::tests::console_read_serves_buffered_input_and_never_invents_readiness ... ok
 test linux::tests::flag_contract_matches_the_measured_opens ... ok
-test linux::tests::clone_tracking_shares_group_state_and_last_release_retires_it ... ok
+test linux::tests::futex_bitset_matches_only_intersecting_wakes_and_is_absolute ... ok
+test linux::tests::futex_wait_wake_is_group_keyed_fifo_with_timeout_and_release ... ok
 test linux::tests::handler_install_delivers_a_frame_and_sigreturn_restores_the_mask ... ok
 test linux::tests::getpid_and_gettid_are_per_thread_identities ... ok
-test linux::tests::hex_into_writes_fixed_width_lowercase ... ok
 test linux::tests::handler_install_refuses_unsupported_flags_before_mutation ... ok
+test linux::tests::hex_into_writes_fixed_width_lowercase ... ok
 test linux::tests::m1_network_arms_translate_onto_socketops ... ok
 test linux::tests::m1_network_sockaddr_and_bounds ... ok
-test linux::tests::futex_bitset_matches_only_intersecting_wakes_and_is_absolute ... ok
-test linux::tests::m4_10_group_handler_targets_a_parked_sibling ... ok
-test linux::tests::m4_10_group_stop_holds_then_sigcont_resumes_the_sibling ... ok
 test linux::tests::m4_8_expected_lengths_include_clone3_and_cmp_requeue ... ok
 test linux::tests::m4_8_requeue_appends_moved_waiters_to_destination_tail ... ok
 test linux::tests::m4_8_requeue_moves_the_oldest_remainder_and_cmp_checks_the_destination ... ok
 test linux::tests::mmap_cannot_land_under_the_break_and_brk_cannot_map_an_arena ... ok
-test linux::tests::futex_wait_wake_is_group_keyed_fifo_with_timeout_and_release ... ok
 test linux::tests::mmap_fixed_echoes_the_address_inside_the_span_and_moves_no_cursor ... ok
-test linux::tests::mprotect_serves_the_rust_guard_page_and_keeps_the_word_rules ... ok
-test linux::tests::nested_alt_and_normal_returns_pop_their_own_depth ... ok
+test linux::tests::mmap_grants_anonymous_private_arenas_from_the_cursor ... ok
 test linux::tests::mmap_refuses_the_word_shapes_by_name_at_this_end_too ... ok
+test linux::tests::mprotect_serves_the_rust_guard_page_and_keeps_the_word_rules ... ok
+test linux::tests::munmap_frees_only_the_span_above_the_break_without_rewinding_the_cursor ... ok
+test linux::tests::nested_alt_and_normal_returns_pop_their_own_depth ... ok
 test linux::tests::path_args_validate_the_nul_rules_by_name ... ok
-test linux::tests::payload_bound_derives_each_numbers_own_clamp ... ok
 test linux::tests::poll_parks_without_readiness_and_reports_it_when_input_arrives ... ok
 test linux::tests::poll_timeout_shapes_bad_descriptors_and_file_ready_are_posix ... ok
 test linux::tests::raise_flow_block_tkill_unblock_kills ... ok
@@ -229,19 +232,18 @@ test linux::tests::sa_resethand_resets_the_action_before_entry ... ok
 test linux::tests::set_tid_address_records_the_pointer_but_returns_the_real_tid ... ok
 test linux::tests::sigaction_records_dfl_and_ign_but_refuses_handlers_before_mutation ... ok
 test linux::tests::sigaction_refuses_foreign_size_and_carries_oldact_back_as_payload ... ok
-test linux::tests::mmap_grants_anonymous_private_arenas_from_the_cursor ... ok
 test linux::tests::sigaltstack_round_trips_and_refuses_a_stack_change_while_in_use ... ok
-test linux::tests::munmap_frees_only_the_span_above_the_break_without_rewinding_the_cursor ... ok
 test linux::tests::sigpipe_is_produced_by_epipe_with_the_right_action_and_return ... ok
+test linux::tests::payload_bound_derives_each_numbers_own_clamp ... ok
 test linux::tests::sigprocmask_is_exact_posix_arithmetic ... ok
 test linux::tests::socket_poll_maps_service_events_and_unknown_fds ... ok
-test linux::tests::stat_payload_is_the_compact_24_the_kernel_reads_back ... ok
-test linux::tests::tkill_delivery_decisions ... ok
-test linux::tests::tkill_matches_the_recorded_tid_at_u32_width ... ok
-test linux::tests::unblock_discards_a_pending_default_ignore_signal ... ok
-test linux::tests::unblock_refuses_a_pending_stop_before_anything_moves ... ok
-test linux::tests::unblocking_a_pending_handler_signal_delivers_with_the_oldset ... ok
-test net_client::tests::client_creation ... ok
 test linux::tests::sigreturn_redelivers_the_next_pending_handler_on_the_restored_mask ... ok
+test linux::tests::stat_payload_is_the_compact_24_the_kernel_reads_back ... ok
+test linux::tests::tkill_matches_the_recorded_tid_at_u32_width ... ok
+test linux::tests::unblock_refuses_a_pending_stop_before_anything_moves ... ok
+test linux::tests::tkill_delivery_decisions ... ok
+test net_client::tests::client_creation ... ok
+test linux::tests::unblock_discards_a_pending_default_ignore_signal ... ok
+test linux::tests::unblocking_a_pending_handler_signal_delivers_with_the_oldset ... ok
 
-test result: ok. 93 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 92 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s

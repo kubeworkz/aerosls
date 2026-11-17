@@ -5940,6 +5940,12 @@ pub unsafe extern "C" fn posix_serial_print(_data: *const u8, _len: u32) {}
 ///                              only when its owner and PERM_WRITE gates pass
 /// ```
 ///
+/// A SQL text literal must escape its quotes for the environment shell:
+/// `catalog exec INSERT INTO t (note) VALUES (\'text\')`. The shell sees one
+/// backslash and emits the quote characters; a bare `'text'` is stripped
+/// before this applet runs. `env attach` forwards the line raw, so the same
+/// spelling is what an outer caller sends once its own quoting is resolved.
+///
 /// A refusal prints the service's OWN rendered line ("CAT_STAT refused by
 /// kernel.env.catalog: SYSTEM_METADATA is not tenant data") rather than a
 /// number: §9.1's contract is that a refusal is visible in the caller's
@@ -6227,7 +6233,7 @@ fn catalog_refusal(e: &CatRefusal) -> (i32, String) {
 }
 
 fn catalog_usage() -> &'static str {
-    "usage: catalog info | list [page] [page_size] | stat NAME | read NAME KEY\n  sql [--page N] [--limit N] <SELECT statement>\n  exec <INSERT|UPDATE|DELETE statement>\n"
+    "usage: catalog info | list [page] [page_size] | stat NAME | read NAME KEY\n  sql [--page N] [--limit N] <SELECT statement>\n  exec <INSERT|UPDATE|DELETE statement>\n    text literals: write \\'text\\' (the env shell strips bare quotes)\n"
 }
 
 pub fn register_default_applets<K: Kernel, A: BufferAlloc>(pm: &mut ProcManager<K, A>) {
@@ -7159,6 +7165,37 @@ mod tests {
         assert_eq!(code, 0, "{}", text);
         assert_eq!(c.exec_sql, b"UPDATE stock SET qty = '9'");
         assert!(text.contains("3 row(s) affected"), "{:?}", text);
+    }
+
+    /// A SQL text literal has to survive the environment shell's tokenizer:
+    /// `env attach` forwards the raw line, then `sh` strips quote syntax
+    /// before the applet ever sees argv. Escaping the quotes (`\'text\'`)
+    /// makes the shell put the quote characters back into the word; the
+    /// applet then rejoins that word into a SQL literal the parser accepts.
+    #[test]
+    fn shell_escaped_quotes_reach_exec_as_a_sql_text_literal() {
+        let stages = parse_line(
+            r"catalog exec INSERT INTO stock (note) VALUES (\'live-text-7\')",
+            0,
+        );
+        assert_eq!(stages.len(), 1, "one stage");
+        assert_eq!(
+            stages[0].argv,
+            argv_of(&[
+                "catalog",
+                "exec",
+                "INSERT",
+                "INTO",
+                "stock",
+                "(note)",
+                "VALUES",
+                "('live-text-7')",
+            ])
+        );
+        let mut c = fake();
+        let (code, text) = catalog_run(&mut c, &stages[0].argv);
+        assert_eq!(code, 0, "{}", text);
+        assert_eq!(c.exec_sql, b"INSERT INTO stock (note) VALUES ('live-text-7')");
     }
 
     #[test]
