@@ -7,11 +7,16 @@
 #   - clone3(435) creates two threads through the 88-byte clone_args copy;
 #   - FUTEX_REQUEUE moves a parked parent from A to B and a wake releases it;
 #   - set_robust_list + thread exit ORs FUTEX_OWNER_DIED and wakes the waiter;
+#   - kill(TGID, SIGUSR1) delivers a recorded handler to a parked sibling,
+#     and kill(TGID, SIGSTOP)/SIGCONT withholds then resumes its reply;
+#     the sidecar's -EINTR trailer contract is pinned by the focused host
+#     test in user/sidecar/src/linux.rs (M4.10);
 #   - tgkill(234) kills a parked sibling by TGID/TID and releases its join;
 #   - kill(TGID, SIGTERM) folds into the existing exit_group sweep.
 #
 # Markers: M4-CLONE3-OK, M4-REQUEUE-OK, M4-REQUEUE-PARENT-OK,
-# M4-ROBUST-OK, M4-TGKILL-OK, M4-HARDENING-PASS, M4-GROUP-KILL-SENT.
+# M4-GROUP-HANDLER-PASS, M4-GROUP-STOP-PASS, M4-ROBUST-OK, M4-TGKILL-OK,
+# M4-HARDENING-PASS, M4-GROUP-KILL-SENT.
 # Failures: M4-HARDENING-FAIL. A post-sweep marker is a failure.
 #
 # Environment:
@@ -141,12 +146,17 @@ clone3b=$(count_fixed 'M4-CLONE3-B-OK=')
 requeue=$(count_fixed 'M4-REQUEUE-OK')
 parent=$(count_fixed 'M4-REQUEUE-PARENT-OK')
 robust=$(count_fixed 'M4-ROBUST-OK=')
+group_handler=$(count_fixed 'M4-GROUP-HANDLER-PASS')
+group_stop=$(count_fixed 'M4-GROUP-STOP-PASS')
 tgkill=$(count_fixed 'M4-TGKILL-OK')
 group_sent=$(count_fixed 'M4-GROUP-KILL-SENT')
 sweep=$(count_fixed '[PROC] M4.5 group sweep')
 side_sweep=$(count_fixed 'group swept=')
 clone_lines=$(count_fixed '[PROC] M4.2 clone:')
 sibling_sig=$(count_fixed 'sibling sig=15 -> kill')
+group_handler_sig=$(count_fixed 'sibling sig=10 handler -> frame')
+group_stop_sig=$(count_fixed 'sibling sig=19 -> stop (pending reply held)')
+group_cont_sig=$(count_fixed 'SIGCONT -> sibling resumed')
 group_sig=$(count_fixed 'group sig=15 -> exit_group sweep')
 robust_bit=$(count_fixed 'M4-ROBUST-BIT=1073741824')
 
@@ -161,6 +171,14 @@ elif [ "$clone3b" -lt 1 ]; then
     problem="no M4-CLONE3-B-OK marker (clone3 did not create the robust-list thread)"
 elif [ "$requeue" -lt 1 ] || [ "$parent" -lt 1 ]; then
     problem="requeue did not move and release the parent"
+elif [ "$group_handler" -lt 1 ]; then
+    problem="no M4-GROUP-HANDLER-PASS marker (handler not delivered to the parked sibling)"
+elif [ "$group_handler_sig" -lt 1 ]; then
+    problem="no sidecar sibling signal=10 handler line"
+elif [ "$group_stop" -lt 1 ]; then
+    problem="no M4-GROUP-STOP-PASS marker (stop/SIGCONT did not resume the sibling)"
+elif [ "$group_stop_sig" -lt 1 ] || [ "$group_cont_sig" -lt 1 ]; then
+    problem="no sidecar stop-latch/SIGCONT resume lines"
 elif [ "$robust" -lt 1 ] || [ "$robust_bit" -lt 1 ]; then
     problem="no robust owner-died marker (set_robust_list/exit walk did not run)"
 elif [ "$tgkill" -lt 1 ]; then
@@ -182,20 +200,22 @@ elif [ "$group_sig" -lt 1 ]; then
 elif ! awk '
     /M4-CLONE3-OK=/ { c = NR }
     /M4-REQUEUE-OK/ && c && !r { r = NR }
-    /M4-ROBUST-OK=/ && r && !b { b = NR }
+    /M4-GROUP-HANDLER-PASS/ && r && !h { h = NR }
+    /M4-GROUP-STOP-PASS/ && h && !k { k = NR }
+    /M4-ROBUST-OK=/ && k && !b { b = NR }
     /M4-TGKILL-OK/ && b && !t { t = NR }
     /M4-HARDENING-PASS/ && t && !p { p = NR }
     /M4-GROUP-KILL-SENT/ && p && !g { g = NR }
     /\[PROC\] M4\.5 group sweep/ && g && !s { s = NR }
-    END { exit (c && r && b && t && p && g && s) ? 0 : 1 }
+    END { exit (c && r && h && k && b && t && p && g && s) ? 0 : 1 }
 ' "$LOG"; then
-    problem="marker order was not clone3 -> requeue -> robust -> tgkill -> pass -> group-kill -> sweep"
+    problem="marker order was not clone3 -> requeue -> group-handler -> group-stop -> robust -> tgkill -> pass -> group-kill -> sweep"
 fi
 
 if [ -n "$problem" ]; then
     echo "FAIL: M4.8 live hardening probe: $problem" >&2
-    echo "  fail=$fail clone3=$clone3 clone3b=$clone3b requeue=$requeue parent=$parent robust=$robust bit=$robust_bit tgkill=$tgkill pass=$pass group_sent=$group_sent sweep=$sweep side_sweep=$side_sweep after=$after" >&2
-    echo "  clone_lines=$clone_lines sibling_sig=$sibling_sig group_sig=$group_sig" >&2
+    echo "  fail=$fail clone3=$clone3 clone3b=$clone3b requeue=$requeue parent=$parent group_handler=$group_handler group_stop=$group_stop robust=$robust bit=$robust_bit tgkill=$tgkill pass=$pass group_sent=$group_sent sweep=$sweep side_sweep=$side_sweep after=$after" >&2
+    echo "  clone_lines=$clone_lines sibling_sig=$sibling_sig group_handler_sig=$group_handler_sig group_stop_sig=$group_stop_sig group_cont_sig=$group_cont_sig group_sig=$group_sig" >&2
     if [ -f "$LOG" ]; then
         echo "  last 80 serial lines ($LOG):" >&2
         tail -80 "$LOG" >&2
@@ -207,8 +227,8 @@ if [ -n "$problem" ]; then
     exit 1
 fi
 
-echo "OK: M4.8 live hardening probe: clone3=$clone3 clone3b=$clone3b requeue=$requeue parent=$parent robust=$robust bit=$robust_bit tgkill=$tgkill pass=$pass group_sent=$group_sent sweep=$sweep"
-echo "    clone_lines=$clone_lines sibling_sig=$sibling_sig group_sig=$group_sig after=0 fail=0"
+echo "OK: M4.8 live hardening probe: clone3=$clone3 clone3b=$clone3b requeue=$requeue parent=$parent group_handler=$group_handler group_stop=$group_stop robust=$robust bit=$robust_bit tgkill=$tgkill pass=$pass group_sent=$group_sent sweep=$sweep"
+echo "    clone_lines=$clone_lines sibling_sig=$sibling_sig group_handler_sig=$group_handler_sig group_stop_sig=$group_stop_sig group_cont_sig=$group_cont_sig group_sig=$group_sig after=0 fail=0"
 if [ -n "$REPLAY" ]; then
     echo "    serial log: $LOG"
 fi

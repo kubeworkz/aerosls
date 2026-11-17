@@ -158,6 +158,9 @@ const E_IO: i32 = 2;           /* CAP_ERR_REVOKED -> -EIO (§5.7): a catalog
                                 * call that failed under us / INTERNAL */
 const E_PROTO: i32 = 10;       /* CAP_ERR_PROTO -> -EPROTO (§5.7): a catalog
                                 * client reply that was not a reply */
+const E_INTR: i32 = -34;       /* CAP_EINTR   -> -EINTR   (§5.7): a
+                                * stopped parked exchange resumed by
+                                * SIGCONT */
 const E_CONFLICT: i32 = -11;   /* CAP_ECONFLICT -> -EBUSY: the reaper could not
                                 * resolve its own child — a state conflict, not
                                 * a permission or an absence of policy */
@@ -279,6 +282,7 @@ const LINUX_SIGNAL_DELIVERY_BYTES: usize = 80;
 /// E_PIPE (-28); the kernel maps it to this Linux number.
 const LINUX_EPIPE: i64 = 32;
 const SIGPIPE: u64 = 13;
+const SIGCONT: u64 = 18;
 pub const LINUX_EINTR: i64 = 4;
 
 /// How far a signal number may run: Linux x86-64 signals are 1..=64
@@ -651,6 +655,19 @@ enum Answer {
     /// signal frame and sysrets into `handler`; `rt_sigreturn` comes back
     /// as a normal num=15 request so this side restores the saved mask.
     SignalHandler(SignalDelivery),
+    /// M4.10: a recorded handler addressed to a parked SIBLING. The target
+    /// task index is carried so `service` can put the trailer on that
+    /// task's own pending reply; the kernel builds the frame in the
+    /// target's saved syscall context.
+    SignalHandlerTask(u32, SignalDelivery),
+    /// M4.10: a stop-default signal addressed to a parked SIBLING. The
+    /// target's pending exchange is held (no reply) until SIGCONT resumes
+    /// it with -EINTR.
+    SignalStopTask(u32, u64),
+    /// M4.10: SIGCONT resumes the stopped sibling(s). The fixed set is the
+    /// same bounded shape as FutexWake; `service` answers each parked
+    /// target with -EINTR and clears the stop latch.
+    SignalContinue(SignalContinue),
 }
 
 /// M4.4: the bounded set a FUTEX_WAKE selected. The count is the Linux
@@ -661,6 +678,16 @@ enum Answer {
 struct FutexWake {
     n: u8,
     tasks: [u8; MAX_FUTEX_WAITERS],
+}
+
+/// M4.10: the bounded set SIGCONT resumes. Same shape as FutexWake: the
+/// sidecar's table is fixed, so the answer carries indices, never an
+/// allocation.
+#[cfg_attr(test, derive(Debug))]
+#[derive(Clone, Copy)]
+struct SignalContinue {
+    n: u8,
+    tasks: [u8; MAX_LINUX_TASKS],
 }
 
 /// One Linux task's §5.4 heap ledger: the budget span the create stamped
@@ -1588,21 +1615,108 @@ fn signal_task(gid: usize, j: usize, sig: u64) -> Answer {
         return Answer::Reply(0, E_INVAL);
     }
     let s = sig as usize;
+
+    /* SIGCONT is the resume edge, not a normal disposition decision. A
+     * stopped parked sibling is released here; its interrupted syscall
+     * gets -EINTR from `service`, exactly as Linux resumes a stopped
+     * thread at the syscall boundary. */
+    if sig == SIGCONT {
+        if tasks()[j].stopped {
+            tasks()[j].stopped = false;
+            return Answer::SignalContinue(SignalContinue {
+                n: 1,
+                tasks: [j as u8; MAX_LINUX_TASKS],
+            });
+        }
+        return Answer::Reply(0, STATUS_OK);
+    }
+
     if groups()[gid].sig_dispo[s] == DISPO_IGN {
         return Answer::Reply(0, STATUS_OK);
     }
-    let t = &mut tasks()[j].sig;
-    if t.mask & (1u64 << (s - 1)) != 0 {
-        t.pending |= 1u64 << (s - 1);
+    let t = &mut tasks()[j];
+    if t.sig.mask & (1u64 << (s - 1)) != 0 {
+        t.sig.pending |= 1u64 << (s - 1);
         return Answer::Reply(0, STATUS_OK);
     }
     if groups()[gid].sig_dispo[s] == DISPO_HANDLER {
-        return Answer::Reply(0, E_NOSYS);
+        /* The target must be parked on an exchange whose reply can carry
+         * the kernel's signal trailer. A running sibling has no saved
+         * context to build the frame from; named refusal, never a
+         * fabricated delivery. */
+        if t.pending == PENDING_NONE || t.stopped {
+            return Answer::Reply(0, E_NOSYS);
+        }
+        t.sig.dispo = groups()[gid].sig_dispo;
+        t.sig.act = groups()[gid].sig_act;
+        let mut d = deliver_handler(&mut t.sig, sig, 0);
+        d.sysret = (-LINUX_EINTR) as u64;
+        /* SA_RESETHAND is group-wide: the sibling's delivery must reset
+         * the shared action too, or a later thread would see the handler
+         * that this delivery already consumed. */
+        groups()[gid].sig_dispo[s] = t.sig.dispo[s];
+        groups()[gid].sig_act[s] = t.sig.act[s];
+        futex_remove(&mut groups()[gid], j);
+        return Answer::SignalHandlerTask(t.sig.tid as u32, d);
     }
     match default_action(sig) {
-        ACT_TERMINATE => Answer::SignalKillTask(t.tid as u32, sig),
+        ACT_TERMINATE => Answer::SignalKillTask(t.sig.tid as u32, sig),
         ACT_IGNORE => Answer::Reply(0, STATUS_OK),
+        ACT_STOP => {
+            if t.pending == PENDING_NONE || t.stopped {
+                return Answer::Reply(0, E_NOSYS);
+            }
+            t.stopped = true;
+            futex_remove(&mut groups()[gid], j);
+            Answer::SignalStopTask(t.sig.tid as u32, sig)
+        }
         _ => Answer::Reply(0, E_NOSYS),
+    }
+}
+
+/// M4.10: choose a parked sibling for a process-directed signal. A handler
+/// prefers a sibling that does not block it; a blocked-only set still pends
+/// on the first parked sibling (Linux's process-directed rule). The caller
+/// is skipped so the new path is a SIBLING delivery, not a second spelling
+/// of tkill-to-self; the existing self path remains `answer()`.
+fn parked_sibling(gid: usize, caller: usize, sig: u64) -> Option<usize> {
+    let bit = if sig >= 1 && sig <= SIG_MAX as u64 {
+        1u64 << (sig - 1)
+    } else {
+        0
+    };
+    let mut fallback = None;
+    for j in 0..MAX_LINUX_TASKS {
+        if j == caller || !tasks()[j].used || tasks()[j].group != gid ||
+            tasks()[j].stopped || tasks()[j].pending == PENDING_NONE {
+            continue;
+        }
+        if bit == 0 || tasks()[j].sig.mask & bit == 0 {
+            return Some(j);
+        }
+        if fallback.is_none() {
+            fallback = Some(j);
+        }
+    }
+    fallback
+}
+
+/// M4.10: collect the group's stopped tasks for SIGCONT. A stopped task
+/// with no pending exchange (a stop latched between requests) is still
+/// cleared; the service arm sends -EINTR only where a reply is owed.
+fn continue_group(gid: usize) -> Answer {
+    let mut c = SignalContinue { n: 0, tasks: [0; MAX_LINUX_TASKS] };
+    for j in 0..MAX_LINUX_TASKS {
+        if tasks()[j].used && tasks()[j].group == gid && tasks()[j].stopped {
+            tasks()[j].stopped = false;
+            c.tasks[c.n as usize] = j as u8;
+            c.n += 1;
+        }
+    }
+    if c.n == 0 {
+        Answer::Reply(0, STATUS_OK)
+    } else {
+        Answer::SignalContinue(c)
     }
 }
 
@@ -1630,7 +1744,7 @@ fn answer_tgkill(gid: usize, self_tid: u64,
 /// the whole group. process-group id 0/-1 and cross-group targets are refused
 /// by name: this v1 has no process-group namespace and never retargets a
 /// signal outside the caller's own group.
-fn answer_kill(gid: usize, self_tid: u64,
+fn answer_kill(gid: usize, caller: usize, self_tid: u64,
                args: &[u64; 6]) -> Option<Answer> {
     let pid = args[0];
     if pid == 0 || pid > u32::MAX as u64 {
@@ -1638,7 +1752,7 @@ fn answer_kill(gid: usize, self_tid: u64,
     }
     let target = pid as u32;
     if target == groups()[gid].tgid as u32 {
-        return Some(answer_group_signal(gid, args[1]));
+        return Some(answer_group_signal(gid, caller, args[1]));
     }
     if target == self_tid as u32 {
         return None;
@@ -1649,23 +1763,35 @@ fn answer_kill(gid: usize, self_tid: u64,
     Some(signal_task(gid, j, args[1]))
 }
 
-/// M4.8: a group-directed default action. IGN is a 0 reply; TERMINATE folds
-/// into the existing exit_group sweep (no reply — the caller is one of the
-/// dead); a group-wide HANDLER frame is not landed and stops by name.
-fn answer_group_signal(gid: usize, sig: u64) -> Answer {
+/// M4.10: a group-directed signal. IGN is a 0 reply; TERMINATE folds into
+/// the existing exit_group sweep (no reply — the caller is one of the
+/// dead); a HANDLER or STOP is delivered to a parked SIBLING through that
+/// sibling's own deferred reply. The caller is left running so it can
+/// observe the result; full POSIX group-stop broadcast is not claimed.
+fn answer_group_signal(gid: usize, caller: usize, sig: u64) -> Answer {
     if sig == 0 { return Answer::Reply(0, STATUS_OK); }
     if sig > SIG_MAX as u64 { return Answer::Reply(0, E_INVAL); }
+    if sig == SIGCONT {
+        return continue_group(gid);
+    }
     let s = sig as usize;
     if groups()[gid].sig_dispo[s] == DISPO_IGN {
         return Answer::Reply(0, STATUS_OK);
     }
-    if groups()[gid].sig_dispo[s] == DISPO_HANDLER {
-        return Answer::Reply(0, E_NOSYS);
-    }
-    match default_action(sig) {
-        ACT_TERMINATE => Answer::SignalGroupKill(sig),
-        ACT_IGNORE => Answer::Reply(0, STATUS_OK),
-        _ => Answer::Reply(0, E_NOSYS),
+    match groups()[gid].sig_dispo[s] {
+        DISPO_HANDLER => match parked_sibling(gid, caller, sig) {
+            Some(j) => signal_task(gid, j, sig),
+            None => Answer::Reply(0, E_NOSYS),
+        },
+        _ => match default_action(sig) {
+            ACT_TERMINATE => Answer::SignalGroupKill(sig),
+            ACT_IGNORE => Answer::Reply(0, STATUS_OK),
+            ACT_STOP => match parked_sibling(gid, caller, sig) {
+                Some(j) => signal_task(gid, j, sig),
+                None => Answer::Reply(0, E_NOSYS),
+            },
+            _ => Answer::Reply(0, E_NOSYS),
+        },
     }
 }
 
@@ -2831,7 +2957,12 @@ struct LinuxTask {
      * a reused slot (track() resets all of it). */
     pending: u8,      /* PENDING_NONE / PENDING_READ / PENDING_POLL /     */
                       /* PENDING_FUTEX                                    */
+    pending_num: u64, /* the syscall number of the pending exchange: the
+                       * signal trailer must echo THIS number, and it may
+                       * be a futex/read/poll, not only a signal number */
     pending_tag: u32, /* the tag the reply must echo                            */
+    stopped: bool,    /* M4.10: a group-directed stop latched this parked
+                       * sibling; service holds its reply until SIGCONT */
     pending_arg: u64, /* read: the clamped count; poll: nfds                    */
     pending_len: usize, /* poll: array bytes (nfds * 8; 0 for a pure sleep)     */
     pending_deadline: u64, /* poll: absolute ns, 0 = wait forever              */
@@ -2863,7 +2994,9 @@ fn tasks() -> &'static mut [LinuxTask; MAX_LINUX_TASKS] {
         fds: [FdSlot { used: false, kind: 0, vfs_fd: 0, flags: 0 }; LINUX_MAX_FDS],
         sig: SigState::new(),
         pending: PENDING_NONE,
+        pending_num: 0,
         pending_tag: 0,
+        stopped: false,
         pending_arg: 0,
         pending_len: 0,
         pending_deadline: 0,
@@ -2948,7 +3081,9 @@ pub fn track(
      * belongs to a child that is gone, and answering it would put a
      * reply on the next child's channel. */
     t.pending = PENDING_NONE;
+    t.pending_num = 0;
     t.pending_tag = 0;
+    t.stopped = false;
     t.pending_arg = 0;
     t.pending_len = 0;
     t.pending_deadline = 0;
@@ -3020,7 +3155,9 @@ pub fn track_thread(
     t.sig.dispo = g.sig_dispo;
     t.sig.act = g.sig_act;
     t.pending = PENDING_NONE;
+    t.pending_num = 0;
     t.pending_tag = 0;
+    t.stopped = false;
     t.pending_arg = 0;
     t.pending_len = 0;
     t.pending_deadline = 0;
@@ -3848,6 +3985,12 @@ pub fn service<K: Kernel, A: BufferAlloc>(
             tasks()[i].used = false;
             continue;
         }
+        /* M4.10: a stop latched on a parked sibling holds its pending
+         * exchange. The target's channel is not polled until SIGCONT
+         * clears the latch and answers the interrupted syscall. */
+        if tasks()[i].stopped {
+            continue;
+        }
         let ch_r = tasks()[i].ch_r;
         let ch_w = tasks()[i].ch_w;
         let partition = tasks()[i].partition;
@@ -3869,6 +4012,7 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                     Answer::ReadWait(_) => {} /* still empty: stay parked */
                     Answer::ReplyBytes(ret, len, bytes) => {
                         tasks()[i].pending = PENDING_NONE;
+                        tasks()[i].pending_num = 0;
                         enosys_log(LINUX_READ as u32, &name_buf[..nlen],
                                    b" ok + payload (waited)\n");
                         reply_bytes(k, ch_w, tag, LINUX_READ, ret,
@@ -3876,12 +4020,14 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                     }
                     Answer::Reply(ret, status) => {
                         tasks()[i].pending = PENDING_NONE;
+                        tasks()[i].pending_num = 0;
                         enosys_log(LINUX_READ as u32, &name_buf[..nlen],
                                    b" read wait failed\n");
                         reply(k, ch_w, tag, LINUX_READ, ret, status);
                     }
                     _ => {
                         tasks()[i].pending = PENDING_NONE;
+                        tasks()[i].pending_num = 0;
                         reply(k, ch_w, tag, LINUX_READ, 0, E_NOSYS);
                     }
                 }
@@ -3913,6 +4059,7 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                     });
                 if ready > 0 || poll_expired(deadline, now_ns) {
                     tasks()[i].pending = PENDING_NONE;
+                    tasks()[i].pending_num = 0;
                     if len == 0 {
                         enosys_log(LINUX_POLL as u32, &name_buf[..nlen],
                                    b" poll timeout (no fds)\n");
@@ -3933,6 +4080,7 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                 let deadline = tasks()[i].pending_deadline;
                 if deadline != 0 && poll_expired(deadline, now_ns) {
                     tasks()[i].pending = PENDING_NONE;
+                    tasks()[i].pending_num = 0;
                     futex_remove(&mut groups()[gid], i);
                     enosys_log(LINUX_FUTEX as u32, &name_buf[..nlen],
                                b" wait timed out\n");
@@ -4088,7 +4236,7 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                                &[sigstate.tid, args[2], 0, 0, 0, 0],
                                &fds, &mut mem, &mut sigstate, payload),
             },
-            LINUX_KILL => match answer_kill(gid, sigstate.tid, &args) {
+            LINUX_KILL => match answer_kill(gid, i, sigstate.tid, &args) {
                 Some(a) => a,
                 None => answer(LINUX_TKILL,
                                &[sigstate.tid, args[1], 0, 0, 0, 0],
@@ -4343,6 +4491,7 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                  * so the next typed byte wakes the sidecar and the pending
                  * block above answers from it. */
                 tasks()[i].pending = PENDING_READ;
+                tasks()[i].pending_num = LINUX_READ;
                 tasks()[i].pending_tag = rr.tag;
                 tasks()[i].pending_arg = want as u64;
                 tasks()[i].pending_deadline = 0;
@@ -4358,6 +4507,7 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                  * the revents this side actually observed (a timeout's
                  * array carries zeros — never invented readiness). */
                 tasks()[i].pending = PENDING_POLL;
+                tasks()[i].pending_num = LINUX_POLL;
                 tasks()[i].pending_tag = rr.tag;
                 tasks()[i].pending_arg = args[1];
                 tasks()[i].pending_len = len;
@@ -4368,6 +4518,7 @@ pub fn service<K: Kernel, A: BufferAlloc>(
             }
             Answer::FutexWait(uaddr, deadline) => {
                 tasks()[i].pending = PENDING_FUTEX;
+                tasks()[i].pending_num = LINUX_FUTEX;
                 tasks()[i].pending_tag = rr.tag;
                 tasks()[i].pending_arg = uaddr;
                 tasks()[i].pending_deadline = deadline;
@@ -4611,6 +4762,77 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                 /* The pre-match transform below folds this into ExitGroup;
                  * this arm is unreachable but keeps the match total. */
                 reply(k, ch_w, rr.tag, num, 0, E_CONFLICT);
+            }
+            Answer::SignalHandlerTask(tid, d) => {
+                /* M4.10: the trailer rides the TARGET's pending reply, not
+                 * the caller's. `pending_num` is the parked syscall the
+                 * kernel will interrupt (futex/read/poll); the target's
+                 * saved park_ctx is what builds the handler frame. */
+                let Some(j) = task_by_tid(gid, tid) else {
+                    reply(k, ch_w, rr.tag, num, 0, E_TARGET);
+                    continue;
+                };
+                if tasks()[j].pending == PENDING_NONE || tasks()[j].stopped {
+                    reply(k, ch_w, rr.tag, num, 0, E_CONFLICT);
+                    continue;
+                }
+                let target_tag = tasks()[j].pending_tag;
+                let target_ch = tasks()[j].ch_w;
+                let target_num = tasks()[j].pending_num;
+                tasks()[j].pending = PENDING_NONE;
+                tasks()[j].pending_num = 0;
+                tasks()[j].stopped = false;
+                let bytes = signal_delivery_payload(&d);
+                let mut ex = [0u8; 56];
+                let n = fmt_sig_line(&mut ex, b" sibling sig=", d.signo,
+                                     b" handler -> frame\n");
+                enosys_log(num as u32, &name_buf[..nlen], &ex[..n]);
+                reply_bytes(k, target_ch, target_tag, target_num, 0, &bytes);
+                reply(k, ch_w, rr.tag, num, 0, STATUS_OK);
+            }
+            Answer::SignalStopTask(tid, stop_sig) => {
+                /* The target's deferred reply is deliberately withheld:
+                 * it is parked, and nothing may answer it until SIGCONT
+                 * releases the stop latch. */
+                let Some(j) = task_by_tid(gid, tid) else {
+                    reply(k, ch_w, rr.tag, num, 0, E_TARGET);
+                    continue;
+                };
+                if tasks()[j].pending == PENDING_NONE {
+                    reply(k, ch_w, rr.tag, num, 0, E_CONFLICT);
+                    continue;
+                }
+                tasks()[j].stopped = true;
+                futex_remove(&mut groups()[gid], j);
+                let mut ex = [0u8; 48];
+                let n = fmt_sig_line(&mut ex, b" sibling sig=", stop_sig,
+                                     b" -> stop (pending reply held)\n");
+                enosys_log(num as u32, &name_buf[..nlen], &ex[..n]);
+                reply(k, ch_w, rr.tag, num, 0, STATUS_OK);
+            }
+            Answer::SignalContinue(c) => {
+                /* SIGCONT resumes each stopped target at its syscall
+                 * boundary: a parked exchange is answered -EINTR, a task
+                 * stopped between requests is simply made runnable. */
+                for &idx in c.tasks[..c.n as usize].iter() {
+                    let j = idx as usize;
+                    if j >= MAX_LINUX_TASKS || !tasks()[j].used ||
+                        tasks()[j].group != gid {
+                        continue;
+                    }
+                    tasks()[j].stopped = false;
+                    if tasks()[j].pending != PENDING_NONE {
+                        let target_tag = tasks()[j].pending_tag;
+                        let target_ch = tasks()[j].ch_w;
+                        let target_num = tasks()[j].pending_num;
+                        tasks()[j].pending = PENDING_NONE;
+                        tasks()[j].pending_num = 0;
+                        reply(k, target_ch, target_tag, target_num, 0, E_INTR);
+                    }
+                }
+                enosys_log(num as u32, &name_buf[..nlen],
+                           b" SIGCONT -> sibling resumed (-EINTR)\n");
+                reply(k, ch_w, rr.tag, num, 0, STATUS_OK);
             }
             Answer::SignalHandler(d) => {
                 /* M3: the sidecar has already moved its mask to the
@@ -6604,6 +6826,95 @@ mod tests {
          * be woken before the moved source waiter (0). */
         let w = futex_wake(&mut g, to, 2, u32::MAX);
         assert_eq!((w.n, w.tasks[0], w.tasks[1]), (2, 1, 0));
+    }
+
+    /* M4.10: the two focused tests both drive the process-global task
+     * table; keep them from resetting each other's registry. */
+    static M4_10_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /* M4.10: a process-directed handler is not refused any more. The
+     * sidecar chooses a parked sibling and hands the caller the TARGET's
+     * tid plus a delivery whose sysret is -EINTR; the target's own reply
+     * carries the trailer with its real parked syscall number. */
+    #[test]
+    fn m4_10_group_handler_targets_a_parked_sibling() {
+        let _guard = M4_10_TEST_LOCK.lock().unwrap();
+        reset_registry();
+        assert!(track(0x10, 0x11, "m4.10.leader", 0,
+                      0x80_0000, 0x81_0000, 7, 0x7000, false));
+        let gid = tasks()[0].group;
+        assert_eq!(track_thread(0x20, 0x21, "m4.10.leader.t20", 0, 8, true,
+                                0x7001, 0x9000),
+                   Some(gid as u32));
+        groups()[gid].sig_dispo[10] = DISPO_HANDLER;
+        groups()[gid].sig_act[10] = SigAct { handler: 0x401000,
+                                             flags: SA_RESTORER,
+                                             restorer: 0x402000, mask: 0 };
+        tasks()[1].pending = PENDING_FUTEX;
+        tasks()[1].pending_num = LINUX_FUTEX;
+        tasks()[1].pending_tag = 0x55;
+
+        let a = answer_kill(gid, 0, 0x7000,
+                            &[0x7000, 10, 0, 0, 0, 0]).unwrap();
+        match a {
+            Answer::SignalHandlerTask(tid, d) => {
+                assert_eq!(tid, 0x7001, "the parked sibling, not the caller");
+                assert_eq!(d.signo, 10);
+                assert_eq!(d.handler, 0x401000);
+                assert_eq!(d.sysret, (-LINUX_EINTR) as u64,
+                           "the interrupted futex returns -EINTR");
+            }
+            other => panic!("handler was not delivered to the sibling: {:?}",
+                            other),
+        }
+        assert_ne!(tasks()[1].sig.mask & (1u64 << 9), 0,
+                   "the sibling's handler mask took the signal");
+        assert_eq!(tasks()[0].sig.mask & (1u64 << 9), 0,
+                   "the caller's mask was not touched");
+        assert_eq!(tasks()[1].pending, PENDING_FUTEX,
+                   "the service layer still owns clearing the pending slot");
+    }
+
+    /* M4.10: a stop-default group signal holds a parked sibling's reply,
+     * and SIGCONT releases it with the same pending exchange intact so the
+     * service can answer -EINTR. */
+    #[test]
+    fn m4_10_group_stop_holds_then_sigcont_resumes_the_sibling() {
+        let _guard = M4_10_TEST_LOCK.lock().unwrap();
+        reset_registry();
+        assert!(track(0x10, 0x11, "m4.10.stop.leader", 0,
+                      0x80_0000, 0x81_0000, 7, 0x7100, false));
+        let gid = tasks()[0].group;
+        assert_eq!(track_thread(0x20, 0x21, "m4.10.stop.leader.t20", 0, 8,
+                                true, 0x7101, 0),
+                   Some(gid as u32));
+        tasks()[1].pending = PENDING_FUTEX;
+        tasks()[1].pending_num = LINUX_FUTEX;
+        tasks()[1].pending_tag = 0x66;
+
+        match answer_kill(gid, 0, 0x7100,
+                          &[0x7100, 19, 0, 0, 0, 0]).unwrap() {
+            Answer::SignalStopTask(tid, sig) => {
+                assert_eq!((tid, sig), (0x7101, 19));
+            }
+            other => panic!("SIGSTOP did not stop the sibling: {:?}", other),
+        }
+        assert!(tasks()[1].stopped, "the stop latch is set");
+        assert_eq!(tasks()[1].pending, PENDING_FUTEX,
+                   "the parked reply is held, not answered");
+
+        match answer_kill(gid, 0, 0x7100,
+                          &[0x7100, 18, 0, 0, 0, 0]).unwrap() {
+            Answer::SignalContinue(c) => {
+                assert_eq!(c.n, 1);
+                assert_eq!(c.tasks[0], 1);
+            }
+            other => panic!("SIGCONT did not resume the sibling: {:?}", other),
+        }
+        assert!(!tasks()[1].stopped, "the stop latch is clear");
+        assert_eq!(tasks()[1].pending, PENDING_FUTEX,
+                   "the held exchange is still the one to interrupt");
+        assert_eq!(tasks()[1].pending_num, LINUX_FUTEX);
     }
 
     #[test]

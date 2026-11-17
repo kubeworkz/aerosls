@@ -186,6 +186,7 @@ int main(void)
                 { CAP_EINVAL,    -LINUX_EINVAL },
                 { CAP_EAGAIN,    -LINUX_EAGAIN },
                 { CAP_ENOSYS,    -LINUX_ENOSYS },
+                { CAP_EINTR,     -LINUX_EINTR },
                 { CAP_ERR_NOTFOUND, -LINUX_ENOENT },   /* the Phase-5 family */
                 { CAP_ERR_TIMEOUT,  -LINUX_ETIMEDOUT },
                 { CAP_NONE,      -LINUX_EIO },         /* the sentinel:\n translated, never leaked */

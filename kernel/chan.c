@@ -1132,7 +1132,13 @@ uint64_t k_linux_deliver(uint32_t pid, uint16_t ch_r, uint64_t expect_num) {
                 (expect_num == LINUX_RT_SIGPROCMASK ||
                  expect_num == 200u ||
                  expect_num == LINUX_SENDTO ||
-                 expect_num == LINUX_RT_SIGRETURN)) {
+                 expect_num == LINUX_RT_SIGRETURN ||
+                 /* M4.10: a process-directed handler interrupts a parked
+                  * futex/read/poll on a SIBLING; the target's saved
+                  * park_ctx is the frame's interrupted context. */
+                 expect_num == LINUX_FUTEX ||
+                 expect_num == LINUX_POLL ||
+                 expect_num == LINUX_READ)) {
                 uint64_t hn = 0;
                 int32_t hs = 0;
                 struct LinuxSignalDelivery sd;
