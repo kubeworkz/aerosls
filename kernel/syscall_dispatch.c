@@ -471,6 +471,13 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                                 (v.prot_write
                                                      ? USER_PTE_WRITE : 0));
                                             backed++;
+                                        } else if (v.prot_none) {
+                                            /* A reservation, not a backed
+                                             * page: the leaf carries no
+                                             * frame and ring 3 faults. A
+                                             * later mprotect backs it. */
+                                            user_map_page(pml4, va, 0,
+                                                          USER_PTE_RESERVED);
                                         }
                                         if (v.replace)
                                             user_invlpg(va);
@@ -565,12 +572,16 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                         if (linux_user_leaf(cur->cr3, va,
                                                              &leaf) == 0)
                                             f = leaf & USER_PTE_FRAME_MASK;
-                                        if (f) {
+                                        /* A bare reservation has no frame
+                                         * to return, but it is still a
+                                         * mapping to remove. */
+                                        if (f || (leaf & USER_PTE_RESERVED)) {
                                             user_unmap_page(pml4, va);
                                             user_invlpg(va);
-                                            free_physical_ram_frame_for_partition(
-                                                (void *)(uintptr_t)f,
-                                                cur->partition_id);
+                                            if (f)
+                                                free_physical_ram_frame_for_partition(
+                                                    (void *)(uintptr_t)f,
+                                                    cur->partition_id);
                                             freed++;
                                         }
                                         va += 4096;
@@ -633,11 +644,24 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                     uint64_t leaf = 0;
                                     uint64_t next = 0;
                                     int missing = 0;
+                                    int alloc_failed = 0;
+
+                                    /* Phase 1 — validate every page and
+                                     * its transition before the first
+                                     * mutation. A mmap(PROT_NONE) reservation
+                                     * is a leaf with no frame; a genuinely
+                                     * unmapped page is -ENOMEM, exactly as
+                                     * before. The bare reservation is the
+                                     * one transition phase 2 must supply a
+                                     * frame for first. */
+                                    va = v.range_va;
+                                    idx = 0;
                                     while (idx < v.range_pages) {
                                         if (linux_user_leaf(
                                                 cur->cr3, va, &leaf) != 0 ||
-                                            linux_mprotect_leaf_transition(
-                                                leaf, v.prot, &next) != 0) {
+                                            (leaf != USER_PTE_RESERVED &&
+                                             linux_mprotect_leaf_transition(
+                                                 leaf, v.prot, &next) != 0)) {
                                             missing = 1;
                                             break;
                                         }
@@ -655,16 +679,119 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                             (unsigned long)va);
                                         rax = (uint64_t)(int64_t)
                                               (-LINUX_ENOMEM);
-                                    } else {
+                                    } else if (v.prot != LINUX_PROT_NONE) {
+                                        /* Phase 2 — back every reservation
+                                         * with a zero-filled frame, but keep
+                                         * it PARKED/RESERVED until all of
+                                         * them exist. If the quota runs out,
+                                         * only this phase's frames are
+                                         * rolled back; present pages have
+                                         * not been touched yet. */
+                                        va = v.range_va;
+                                        idx = 0;
+                                        while (idx < v.range_pages) {
+                                            leaf = 0;
+                                            if (linux_user_leaf(
+                                                    cur->cr3, va, &leaf) != 0) {
+                                                va += 4096;
+                                                idx++;
+                                                continue;
+                                            }
+                                            if ((leaf & USER_PTE_RESERVED) &&
+                                                !(leaf & USER_PTE_FRAME_MASK)) {
+                                                void *frame =
+                                                    allocate_physical_ram_frame_for_partition(
+                                                        cur->partition_id);
+                                                if (!frame) {
+                                                    alloc_failed = 1;
+                                                    break;
+                                                }
+                                                {
+                                                    uint64_t *w =
+                                                        (uint64_t *)frame;
+                                                    int zi;
+                                                    for (zi = 0; zi < 512; zi++)
+                                                        w[zi] = 0;
+                                                }
+                                                user_map_page(
+                                                    pml4, va,
+                                                    (uint64_t)(uintptr_t)frame,
+                                                    USER_PTE_PARKED |
+                                                    USER_PTE_RESERVED);
+                                            }
+                                            va += 4096;
+                                            idx++;
+                                        }
+                                        if (alloc_failed) {
+                                            /* Roll back exactly the
+                                             * frames this pass installed:
+                                             * a filled reservation is the
+                                             * only leaf with both bits and
+                                             * a frame, and phase 2 creates
+                                             * it only from a bare
+                                             * reservation. Restore the
+                                             * bare reservation rather than
+                                             * clearing the PTE. */
+                                            uint64_t rb = v.range_va;
+                                            uint64_t ri = 0;
+                                            while (ri < v.range_pages) {
+                                                uint64_t rleaf = 0;
+                                                if (linux_user_leaf(
+                                                        cur->cr3, rb,
+                                                        &rleaf) == 0 &&
+                                                    (rleaf & USER_PTE_RESERVED) &&
+                                                    (rleaf & USER_PTE_PARKED) &&
+                                                    (rleaf & USER_PTE_FRAME_MASK)) {
+                                                    uint64_t f =
+                                                        rleaf &
+                                                        USER_PTE_FRAME_MASK;
+                                                    user_map_page(pml4, rb, 0,
+                                                                  USER_PTE_RESERVED);
+                                                    free_physical_ram_frame_for_partition(
+                                                        (void *)(uintptr_t)f,
+                                                        cur->partition_id);
+                                                }
+                                                rb += 4096;
+                                                ri++;
+                                            }
+                                            kernel_serial_printf(
+                                                "[E7] mprotect addr=0x%lx "
+                                                "len=%lu: frame exhaustion "
+                                                "while backing a PROT_NONE "
+                                                "reservation - -ENOMEM, "
+                                                "reservations restored\n",
+                                                (unsigned long)sa0,
+                                                (unsigned long)sa1);
+                                            rax = (uint64_t)(int64_t)
+                                                  (-LINUX_ENOMEM);
+                                        }
+                                    }
+
+                                    if (rax != (uint64_t)(int64_t)
+                                               (-LINUX_ENOMEM)) {
+                                        /* Phase 3 — every page now has a
+                                         * frame (or was already
+                                         * PROT_NONE), so the transitions
+                                         * cannot fail on a frame. */
                                         va = v.range_va;
                                         idx = 0;
                                         while (idx < v.range_pages) {
                                             uint64_t frame;
                                             uint64_t flags;
-                                            (void)linux_user_leaf(
-                                                cur->cr3, va, &leaf);
-                                            (void)linux_mprotect_leaf_transition(
-                                                leaf, v.prot, &next);
+                                            leaf = 0;
+                                            if (linux_user_leaf(
+                                                    cur->cr3, va, &leaf) != 0) {
+                                                va += 4096;
+                                                idx++;
+                                                continue;
+                                            }
+                                            next = leaf;
+                                            if (linux_mprotect_leaf_transition(
+                                                    leaf, v.prot, &next) != 0) {
+                                                va += 4096;
+                                                idx++;
+                                                continue;
+                                            }
                                             frame = next &
                                                     USER_PTE_FRAME_MASK;
                                             flags = next &

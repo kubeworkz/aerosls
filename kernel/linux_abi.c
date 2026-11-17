@@ -529,6 +529,7 @@ struct LinuxFdWritePlan linux_fd_write_plan(uint64_t num,
 #define LAB_PTE_USER     0x4ULL
 #define LAB_PTE_PS       0x80ULL
 #define LAB_PTE_PARKED   LINUX_PTE_PARKED
+#define LAB_PTE_RESERVED LINUX_PTE_RESERVED
 #define LAB_PTE_FRAME    0x000FFFFFFFFFF000ULL
 
 /* Bit 9 is SLS_PTE_SLS_DISK (include/sls_mmu.h), and the parked marker
@@ -580,12 +581,16 @@ static int lab_walk_leaf(uint64_t root, uint64_t va, uint64_t *leaf_out,
         unsigned shift = 39u - 9u * lvl;
         uint64_t e = tbl[(va >> shift) & 0x1FF];
         if (!(e & LAB_PTE_PRESENT)) {
-            /* Only the parked-aware caller may follow a parked leaf; the
-             * copy walkers must refuse it exactly as ring 3 would. */
+            /* Only the parked-aware caller may follow a parked or reserved
+             * leaf; the copy walkers must refuse both exactly as ring 3
+             * would. A reserved leaf has no frame yet; a filled leaf is the
+             * transient (frame|PARKED|RESERVED) state used while a mprotect
+             * backs a reservation. */
             if (allow_parked && lvl == 3 && !require_rw &&
-                (e & LAB_PTE_PARKED) &&
-                (e & ~(LAB_PTE_FRAME | LAB_PTE_PARKED)) == 0 &&
-                (e & LAB_PTE_FRAME)) {
+                (e & ~(LAB_PTE_FRAME | LAB_PTE_PARKED |
+                       LAB_PTE_RESERVED)) == 0 &&
+                (((e & LAB_PTE_FRAME) && (e & LAB_PTE_PARKED)) ||
+                 e == LAB_PTE_RESERVED)) {
                 if (leaf_out) *leaf_out = e;
                 return 0;
             }
@@ -953,6 +958,7 @@ linux_mem_mmap_verdict(uint64_t heap_base, uint64_t heap_limit,
     v.malformed = 0;
     v.replace = 0;
     v.prot_write = 0;
+    v.prot_none = 0;
     v.map_va = 0;
     v.range_pages = 0;
     v.map_pages = 0;
@@ -1013,6 +1019,7 @@ linux_mem_mmap_verdict(uint64_t heap_base, uint64_t heap_limit,
      * allocator's guard-page shape. */
     v.map_pages = (req->prot == LINUX_PROT_NONE)
                 ? 0 : v.range_pages;
+    v.prot_none = (req->prot == LINUX_PROT_NONE) ? 1 : 0;
     v.prot_write = (req->prot & LINUX_PROT_WRITE) ? 1 : 0;
     v.new_mmap_top = is_fixed ? mmap_top : rax;
     return v;
@@ -1161,11 +1168,26 @@ int linux_mprotect_leaf_transition(uint64_t leaf, uint64_t prot,
     if (leaf & LINUX_PTE_PRESENT) {
         if (!(leaf & LINUX_PTE_USER)) return -LINUX_ENOMEM;
     } else {
-        /* A parked leaf is exactly (frame | PARKED): no present bit, no
-         * user bit, and no unrelated software bit pretending to be one. */
-        if (!(leaf & LINUX_PTE_PARKED) ||
-            (leaf & ~(LINUX_PTE_FRAME_MASK | LINUX_PTE_PARKED)) != 0)
+        /* A parked leaf is exactly (frame | PARKED). A reservation is
+         * exactly RESERVED (no frame): PROT_NONE on it is already satisfied,
+         * while any accessible protection needs the caller to back it with
+         * a frame first. A filled reservation is (frame|PARKED|RESERVED),
+         * the transient state the apply uses during allocation. */
+        if (leaf & LINUX_PTE_RESERVED) {
+            if (!(leaf & LINUX_PTE_FRAME_MASK)) {
+                if (leaf != LINUX_PTE_RESERVED) return -LINUX_ENOMEM;
+                if (prot != LINUX_PROT_NONE) return -LINUX_ENOMEM;
+                *out_leaf = leaf;
+                return 0;
+            }
+            if (!(leaf & LINUX_PTE_PARKED) ||
+                (leaf & ~(LINUX_PTE_FRAME_MASK | LINUX_PTE_PARKED |
+                          LINUX_PTE_RESERVED)) != 0)
+                return -LINUX_ENOMEM;
+        } else if (!(leaf & LINUX_PTE_PARKED) ||
+                   (leaf & ~(LINUX_PTE_FRAME_MASK | LINUX_PTE_PARKED)) != 0) {
             return -LINUX_ENOMEM;
+        }
     }
 
     frame = leaf & LINUX_PTE_FRAME_MASK;

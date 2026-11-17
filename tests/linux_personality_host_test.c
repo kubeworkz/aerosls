@@ -798,9 +798,9 @@ int main(void)
         v = linux_mem_mmap_verdict(BASE, LIMIT, BASE, LIMIT - 0x1000,
                                    &req, LIMIT - 0x2000);
         CHECK(v.malformed == 0 && v.range_pages == 1 && v.map_pages == 0 &&
-                  v.prot_write == 0,
-              "a PROT_NONE grant backs no frames — a reservation whose "
-              "      every access faults is its whole contract");
+                  v.prot_none == 1 && v.prot_write == 0,
+              "a PROT_NONE grant backs no frames and marks a reservation — "
+              "      a leaf whose every access faults, with no frame to leak");
         req.prot = LINUX_PROT_READ | LINUX_PROT_WRITE;
 
         /* the forged grants: each is a lie the kernel must refuse */
@@ -831,7 +831,8 @@ int main(void)
                                    &req, BASE);
         CHECK(v.malformed == 0 && v.replace == 1 &&
                   v.map_va == BASE && v.range_pages == 1 &&
-                  v.map_pages == 0 && v.new_mmap_top == LIMIT,
+                  v.map_pages == 0 && v.prot_none == 1 &&
+                  v.new_mmap_top == LIMIT,
               "the guard echo: FIXED PROT_NONE at the brk heap's base "
               "      replaces one page, backs none, moves no cursor — "
               "      the measured allocator's guard, as Linux maps it");
@@ -1022,6 +1023,47 @@ int main(void)
                   again == 0,
               "an absent leaf is still ENOMEM — preservation never invents "
               "      a frame");
+
+        /* The mmap(PROT_NONE) reservation is a non-present leaf with no
+         * frame. PROT_NONE over it is a no-op; an accessible protection
+         * needs the apply to allocate a frame first, so the pure transition
+         * refuses it. The filled state is the transient frame|PARKED|
+         * RESERVED leaf the allocation phase installs. */
+        pt[(VA >> 12) & 0x1FF] = LINUX_PTE_RESERVED;
+        CHECK(linux_user_leaf((uint64_t)(uintptr_t)pml4, VA, &leaf) == 0 &&
+                  leaf == LINUX_PTE_RESERVED,
+              "mprotect finds an mmap(PROT_NONE) reservation leaf");
+        CHECK(linux_user_page_frame((uint64_t)(uintptr_t)pml4, VA) == 0,
+              "a reservation has no frame for a copy");
+        CHECK(linux_mprotect_leaf_transition(LINUX_PTE_RESERVED,
+                                             LINUX_PROT_NONE, &again) == 0 &&
+                  again == LINUX_PTE_RESERVED,
+              "PROT_NONE over a reservation is idempotent and allocates "
+              "      nothing");
+        CHECK(linux_mprotect_leaf_transition(LINUX_PTE_RESERVED,
+                                             LINUX_PROT_READ, &again)
+                  == -LINUX_ENOMEM,
+              "an accessible protection over an unbacked reservation asks "
+              "      the apply for a frame, not a fake mapping");
+
+        {
+            uint64_t filled = FRAME | LINUX_PTE_PARKED |
+                              LINUX_PTE_RESERVED;
+            pt[(VA >> 12) & 0x1FF] = filled;
+            CHECK(linux_user_leaf((uint64_t)(uintptr_t)pml4, VA, &leaf) == 0 &&
+                      leaf == filled,
+                  "mprotect finds the transient backed-reservation leaf");
+            CHECK(linux_mprotect_leaf_transition(
+                      filled, LINUX_PROT_READ | LINUX_PROT_WRITE,
+                      &restored) == 0 &&
+                      (restored & LINUX_PTE_PRESENT) &&
+                      (restored & LINUX_PTE_USER) &&
+                      (restored & LINUX_PTE_WRITE) &&
+                      !(restored & LINUX_PTE_RESERVED) &&
+                      (restored & LINUX_PTE_FRAME_MASK) == FRAME,
+                  "the backed-reservation transition clears the marker and "
+                  "      installs the requested present leaf");
+        }
     }
 
     /* ─── the munmap seam (E7 increment 25, §5.4) ─────────────────────── */

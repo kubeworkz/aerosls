@@ -580,11 +580,15 @@ int linux_user_copy_out(uint8_t *dst, uint64_t root, uint64_t va, uint32_t n);
  * mask (bits 12-51) and below NX; the CPU ignores it in a non-present
  * entry, and it does not collide with SLS_PTE_SLS_DISK's bit 9. The bit
  * marks a leaf whose frame is retained while PROT_NONE keeps the page
- * inaccessible. */
+ * inaccessible. Bit 57 marks an mmap(PROT_NONE) reservation: a non-present
+ * leaf with no frame that a later mprotect(PROT_READ|PROT_WRITE) may back
+ * with a fresh frame. (A reservation being backed carries both bits plus
+ * its frame until the transition clears RESERVED.) */
 #define LINUX_PTE_PRESENT   (1ULL << 0)
 #define LINUX_PTE_WRITE     (1ULL << 1)
 #define LINUX_PTE_USER      (1ULL << 2)
 #define LINUX_PTE_PARKED    (1ULL << 58)
+#define LINUX_PTE_RESERVED  (1ULL << 57)
 #define LINUX_PTE_NOEXEC    (1ULL << 63)
 #define LINUX_PTE_FRAME_MASK 0x000FFFFFFFFFF000ULL
 
@@ -649,14 +653,16 @@ struct LinuxMemMmapVerdict {
                             * range is unmapped first (frame returned),
                             * then the grant installs per prot        */
     int      prot_write;   /* 1: map the granted pages RW-NX; 0: RO-NX */
+    int      prot_none;    /* 1: install PROT_NONE reservation leaves  */
     uint64_t map_va;       /* the range's first page: the one to back
-                            * (map_pages > 0) or reserve (PROT_NONE)   */
+                            * (map_pages > 0) or reserve (prot_none)   */
     uint64_t range_pages;  /* pages in the granted range — the replace
                             * walk covers exactly these               */
     uint64_t map_pages;    /* pages to back with zero-filled frames — 0
-                            * for PROT_NONE (reservation only: every
-                            * access faults, which is PROT_NONE's whole
-                            * observable contract); always <= range_pages */
+                            * for PROT_NONE (reservation only: no frame is
+                            * allocated; prot_none is set so the apply
+                            * installs a RESERVED leaf that mprotect can
+                            * later back); always <= range_pages */
     uint64_t new_mmap_top; /* the kernel-side cursor after this grant: */
                             /* descends for non-FIXED, unchanged for   */
                             /* FIXED (last map wins, as Linux itself)  */

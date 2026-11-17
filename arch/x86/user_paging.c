@@ -410,7 +410,8 @@ static uint32_t user_free_subtree(uint64_t* tbl, int depth, uint32_t* seen) {
              * leaf can be parked; a stray marker on an intermediate table
              * is left alone and the table itself is freed normally. */
             if (depth >= 3 && (e & USER_PTE_PARKED) &&
-                (e & ~(USER_PTE_FRAME_MASK | USER_PTE_PARKED)) == 0) {
+                (e & ~(USER_PTE_FRAME_MASK | USER_PTE_PARKED |
+                       USER_PTE_RESERVED)) == 0) {
                 uint64_t pa = e & USER_PTE_FRAME_MASK;
                 if (pa && !user_frame_refused(pa) &&
                     !simi_frame_is_cached(pa, seen) &&

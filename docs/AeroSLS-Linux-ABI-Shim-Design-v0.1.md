@@ -2300,7 +2300,7 @@ the mechanism — exactly where brk's was (§5.4):
   granted is a page a brk growth may never map over (a re-map leaks
   the frame and zeros live bytes), and a non-FIXED mmap may never
   land under the break.
-- **MAP_FIXED replaces; PROT_NONE maps no frames.** The measured
+- **MAP_FIXED replaces; PROT_NONE reserves, mprotect backs.** The measured
   guard — `mmap(base, 4096, PROT_NONE, FIXED|ANON|PRIVATE)` landing
   on the page brk already mapped — is Linux's own semantics: the old
   page's frame returns to the partition, the new protection is
@@ -2308,9 +2308,15 @@ the mechanism — exactly where brk's was (§5.4):
   translation WAS present and ring-3 HAS run on it — `invlpg` for
   every touched page. A PROT_NONE mapping consumes no frames and
   every access faults; that is PROT_NONE's whole observable
-  contract. A granted anonymous map is zero-filled: partition-
-  charged frames, RW-NX or read-only, mapped eagerly — no demand
-  paging anywhere, so nothing lazy can be wrong.
+  contract. It is represented by a non-present reservation PTE
+  (`USER_PTE_RESERVED`/`LINUX_PTE_RESERVED`, bit 57) per page rather
+  than an absent translation: a later `mprotect(PROT_READ|WRITE)` over
+  that range allocates only the reservation pages' frames, zeroes
+  them, and installs accessible PTEs (with rollback on quota failure);
+  mprotect over a genuinely absent page still answers `ENOMEM`. A
+  granted anonymous map is zero-filled: partition-charged frames,
+  RW-NX or read-only, mapped eagerly — no demand paging anywhere, so
+  nothing lazy can be wrong.
 - **A failed FIXED replace leaves a hole, as Linux does.** If frame
   exhaustion unwinds a granted FIXED map midway, the pages already
   replaced stay replaced and already-mapped pages are returned to

@@ -19,6 +19,11 @@
 // PROT_READ/PROT_WRITE restore while ring 3 still faults. Must match
 // LINUX_PTE_PARKED in kernel/linux_abi.h.
 #define USER_PTE_PARKED   (1ULL << 58)
+// Bit 57 is the mmap(PROT_NONE) reservation marker: a non-present leaf with
+// no frame, installed by the anonymous-map apply. A later mprotect allocates
+// the frame and replaces it with a normal present leaf (or a parked frame on
+// its way there). Must match LINUX_PTE_RESERVED in kernel/linux_abi.h.
+#define USER_PTE_RESERVED (1ULL << 57)
 // NX bit: bit 63. We define EXEC as absence of NX.
 #define USER_PTE_EXEC     0ULL          // no NX bit set = executable
 #define USER_PTE_NOEXEC   (1ULL << 63)  // NX bit set = non-executable
