@@ -1,6 +1,6 @@
 # AeroSLS POSIX Environments Roadmap v0.2 — environment persistence, in-environment networking, and placement
 
-**Status:** Draft for review; P1a–P3 are implemented. §11 Q2 remains open. **M0 Linux-shape decision accepted 2026-11-11** (`AeroSLS-PASE-Linux-Shape-Decision-v0.1.md`). One evidence caveat remains: the P3 adoption guard has one replica branch not exercised live. The P2 live L5 arm was recorded green in run `43072501848` (2026-11-11).
+**Status:** Draft for review; P1a–P3 are implemented. §11 Q2 remains open. **M0 Linux-shape decision accepted 2026-11-11** (`AeroSLS-PASE-Linux-Shape-Decision-v0.1.md`). The P3 adoption guard's replica branch is live-exercised: node 1's finalized 1970-page replica was promoted and restored by the adopter. The P2 live L5 arm was recorded green in run `43072501848` (2026-11-11).
 **Scope:** the three items `AeroSLS-POSIX-Environments-Roadmap-v0.1.md` §12 deferred to v0.2, in the order that section fixed: **(1) environment checkpoint/restore and durable storage**, **(2) networking inside environments**, **(3) cluster placement, migration and failover**. v0.1 §12 is explicit that they are one plan rather than three because each depends on the one before it.
 **Resolves:** the prerequisites v0.1 §10 and §13 named — environment checkpoint/restore is E7's gate, durable storage is what makes an environment worth migrating, and the cluster items are what have to wait for both.
 **Does not do:** design the E7 shim (that is `AeroSLS-Linux-ABI-Shim-Design-v0.1.md`); threads, signals and dynamic linking are scoped by the Linux-shape decision record and its M2–M4 milestones. This is the plan and its findings; implementation records land as addenda in place, the way v0.1's did.
@@ -2941,11 +2941,11 @@ heard. Node 1 was then killed:
    answering `env partition=3 env_id=1 index=1 posix_pid=104`: the
    environment is running there, with its contents.
 
-The one branch this run did NOT exercise is the adoption guard's own
-replica branch — that guard's flow runs no payload capture (step 7.5's
-absent branch is the one its world produces, and the fakes emit it), so
-the guard change stays justified by review while the promotion itself is
-justified by this run.
+The one branch that run did NOT exercise — the adoption guard's own
+replica branch — is now live-exercised: node 1's finalized 1970-page
+replica was present in the adopter's directory, promoted after node 1
+was killed, and replayed as `RESTORED from a replica held on this
+survivor`.
 
 ---
 
@@ -3282,7 +3282,7 @@ Everything this document asserts about the tree, with its source.
 
 ## Appendix B — Named gaps, each with its destination
 
-**Register checked 2026-11-15.** A row is marked **LANDED** only when the gap is closed in the tree and the cell names where. Rows marked **M2–M6** are planned in the Linux-shape decision record, not landed; M1 is landed below, with its live coverage boundary and named sabotage arm visible in the row, and M3 is landed through M3.5 with its cross-task/timer boundary still named. M4 is scoped by its M4.0 design spike; M4.1's group/refcount, M4.2's clone/thread-create, M4.3's group/thread state, M4.4's private futex wait/wake, M4.5's identity/exit, M4.6's thread-aware checkpoint and M4.7 gate LANDED for the static threaded-Rust shape are evidenced, while std pthread and Go remain out on the `PROT_NONE` stack reservation. The one remaining P3 evidence caveat in the status line stays visible rather than being swept into a green row.
+**Register checked 2026-11-15.** A row is marked **LANDED** only when the gap is closed in the tree and the cell names where. Rows marked **M2–M6** are planned in the Linux-shape decision record, not landed; M1 is landed below, with its live coverage boundary and named sabotage arm visible in the row, and M3 is landed through M3.5 with its cross-task/timer boundary still named. M4 is scoped by its M4.0 design spike; M4.1's group/refcount, M4.2's clone/thread-create, M4.3's group/thread state, M4.4's private futex wait/wake, M4.5's identity/exit, M4.6's thread-aware checkpoint and M4.7 gate LANDED for the static threaded-Rust shape are evidenced, while std pthread and Go remain out on the `PROT_NONE` stack reservation. The P3 adoption guard's replica branch is now live-exercised, with its evidence recorded in the P3 rows below.
 
 | Gap | Consequence if unaddressed | Destination |
 |---|---|---|
@@ -3299,7 +3299,7 @@ Everything this document asserts about the tree, with its source.
 | No per-partition bound on a tenant's simultaneous connections | one environment starves its neighbours without tripping the rate limiter | P2 — **LANDED** (mechanism at increments 2–4; the **default** that closes the never-opts-in case at increment 5, §11 Q4: every partition is born at 96 and only the control plane may change it). **Evidence:** the live L5 arm ran green in `43072501848` (2026-11-11). |
 | `partition_migrate()` does not move an environment | migration leaves the environment on the source (orphaned or destroyed) | P3 — **LANDED** (increments 3–5) |
 | `failover_recover_from()` adopts ownership only | a dead node's environments vanish with no name in the report | P3 — **LANDED** (report at increment 9; survivor restore at increment 11) |
-| The failover broadcast path is 24 KiB | a 5.5 MiB environment cannot ride it; the gap must be stated, not implied | P3 — **LANDED** ((b) at increments 9 and 11; (a) as the replica path from increment 13 — §11 Q5). **Evidence caveat:** one adoption-guard replica branch was not exercised live |
+| The failover broadcast path is 24 KiB | a 5.5 MiB environment cannot ride it; the gap must be stated, not implied | P3 — **LANDED** ((b) at increments 9 and 11; (a) as the replica path from increment 13 — §11 Q5). **Evidence:** the adoption guard's replica branch is live-exercised — node 1's finalized 1970-page replica was promoted and restored by the adopter |
 | No full thread groups / join wake (M4.1–M4.6 landed; M4.7 static gate evidenced) | std pthread, Go, threaded CPython and Node are out | M4 — M4.3 shares the sidecar group, M4.4 has private wait/wake, M4.5 sweeps `exit_group`/identity/join, M4.6 restores the parked group and M4.7 passes the static threaded-Rust raw-clone gate; std pthread/Go remain out on the `PROT_NONE` stack reservation |
 | No mediated native↔POSIX interop | environments are a sealed box, not PASE-with-IFS | **PARTIAL** — read-only catalog + `CAT_QUERY` landed (§9.1); writes, IFS-like sharing, identity/ACL and native SIMI are M5 — planned. |
 | Linux networking syscalls are not wired into the Linux ABI shim | Linux binaries still get `ENOSYS` for `socket`/`connect`; P2 serves the sidecar applet path, not the Linux personality | M1 — **LANDED** (2026-11-12): `socket`/`connect`/`accept`/`sendto`/`recvfrom`/`shutdown`/`bind`/`listen` cross the Linux trap to P2's socket service. `tests/linux_net_bridge_host_test.c` covers the kernel plan (27 checks); `tests/m1_net_probe_check.sh` boots `sls_operating_system_m1net.iso`, asserts all eight calls, and observed 2 executions with no `M1-NET FAIL`; evidence `evidence/m1_net_probe_gate.log`. The same gate's negative arm (`M1_GATE_TOOTH=bypass-connect`, image built with `M1_TOOTH=bypass-connect`) observed `[M1-TOOTH] bypass-connect`, zero forwarded connects, and the stage-5 probe exit before the clean image reran green; evidence `evidence/m1_net_probe_tooth_refused.gate.txt`, `evidence/m1_net_probe_tooth_pass.gate.txt` (raw serial logs alongside). **Coverage boundary:** the probe's peer is the guest's own 10.0.2.15 address (kernel loopback), not a host/NIC peer; UDP, IPv6, external connect failures, `CLOEXEC`/nonblocking variants, and `SHUT_RDWR` are not live-tested. |
@@ -3307,5 +3307,5 @@ Everything this document asserts about the tree, with its source.
 | Signals have ordinary and `SA_SIGINFO` handler frames, including the first EPIPE→SIGPIPE producer, but cross-task/timer producers remain unnamed | `signal()` handlers run in-guest: install, `tkill`/unblock delivery, x86-64 frame, `rt_sigreturn` 15 and mask restore (M3.1), then `sigaltstack`/`SA_ONSTACK`, `SA_SIGINFO`/ucontext, `SA_RESETHAND` and return-time pending redelivery (M3.2–M3.4, 2026-11-13; `E7SIG-INFO`/`E7SIG-OK`/`E7SIG-RET` live), and an EPIPE `sendto` raising SIGPIPE with a saved `-EPIPE` (M3.5, 2026-11-14; `E7PIPE-OK` live). Signal state rides the captured sidecar image window and Linux stack. Boundary: cross-task signals are ESRCH, timer/device producers are absent, and no signal-specific live checkpoint arm was run | M3 — **LANDED through M3.5** (design §10.15) |
 | Four-environment ceiling; fixed `PROC_MAX` 16 and 16-entry sidecar registry | not enough for a production PASE workload; P3 placement refuses over-capacity | M6 — planned |
 | P3 promotion loses the survivor payload-band boundary; partition DB pages do not move | a reboot before the next checkpoint restores the record without payload; environment migration does not move all partition data | M6 — planned |
-| P3 replica adoption branch remains unexercised live | one verification caveat remains after the failover replica path landed | M6 — evidence closure |
+| The P3 replica adoption branch had no live exercise | one verification caveat remained after the failover replica path landed | P3 — **LIVE-EXERCISED**: node 1's finalized 1970-page replica was listed by the adopter, promoted, and restored |
 | AIX/PASE binary compatibility | not a Linux-shape gap; AIX, Power and literal PASE are outside this product | **Out of scope** — M0 decision |
