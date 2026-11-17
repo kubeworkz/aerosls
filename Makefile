@@ -1193,9 +1193,12 @@ SIDECAR_M4_HARDENING_PROBE = $(if $(filter 1,$(M4_HARDENING_PROBE)),--features a
 # reservation and the std::thread join across checkpoint/restore.
 M4_STD_THREAD_PROBE ?=
 SIDECAR_M4_STD_THREAD_PROBE = $(if $(filter 1,$(M4_STD_THREAD_PROBE)),--features aerosls-sidecar/m4_std_thread_probe)
-# M5.2's live Linux-personality CAT_EXEC probe. It is spawned only into the
-# gate profile; `make x86-iso-e3 M5_CATALOG_PROBE=1 ...` compiles the fixture
-# and spawn call, and an unset knob compiles both out.
+# M5.2/M5.2a's live Linux-personality CAT_EXEC probe. The gate profile spawns
+# it under the gate identity; the ordinary-tenant test profile (init feature
+# `m5_tenant_probe`, environment index 3) spawns the same fixture under
+# `m5.tenant.catalog.0` without `FLAG_GATE`. `make x86-iso-e3
+# M5_CATALOG_PROBE=1 ...` compiles the fixture and spawn call; an unset knob
+# compiles both out.
 M5_CATALOG_PROBE ?=
 SIDECAR_M5_CATALOG_PROBE = $(if $(filter 1,$(M5_CATALOG_PROBE)),--features aerosls-sidecar/m5_catalog_probe)
 SIDECAR_INIT_ELF   ?= user/target/x86_64-unknown-none/release/init

@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# tests/m5_catalog_live_check.sh — M5.2's live gate-profile proof.
+# tests/m5_catalog_live_check.sh — M5.2/M5.2a's live catalog probe proof.
 #
-# One QEMU boot of the E3 gate image built with M5_CATALOG_PROBE=1. The
-# harness creates a partition, a bob-owned table, a dave-owned table with a
-# known row, and a foreign table in PARTITION_SYSTEM, then creates the
-# gate-profile environment (index 1) AS BOB. The gate sidecar spawns
-# `m5.linux.catalog.0`, whose flat fixture issues SYS_SLS_CATALOG_EXEC (334):
+# One QEMU boot of the E3 image built with M5_CATALOG_PROBE=1. The harness
+# creates a partition, a bob-owned table, a dave-owned table with a known
+# row, and a foreign table in PARTITION_SYSTEM, then creates the selected
+# environment AS BOB. In the default gate arm that is environment index 1 and
+# the sidecar spawns `m5.linux.catalog.0`; with M52_PROFILE=tenant it is an
+# ordinary tenant environment index 3 with no FLAG_GATE, and the sidecar
+# spawns `m5.tenant.catalog.0`. The flat fixture issues SYS_SLS_CATALOG_EXEC
+# (334):
 #
 #   INSERT bob   -> success, then UPDATE bob -> success
 #   DROP bob     -> -EINVAL (DDL is outside the first cut)
@@ -18,12 +21,14 @@
 # pass). The foreign name must exist in GET /api/objects, so its ENOENT is a
 # boundary answer rather than a missing table.
 #
-# GUARD-KIND: runtime (make + QEMU + a live gate boot). The source guards are
+# GUARD-KIND: runtime (make + QEMU + a live boot). The source guards are
 # e7_gate_check.sh and linux_personality_check.sh; this is the live arm.
 #
 # Knobs:
+#   M52_PROFILE        gate (default) or tenant (M5.2a ordinary tenant)
 #   M52_BUILD=1        build the image (default); 0 reuses M52_ISO
-#   M52_ISO            default sls_operating_system_e3_m52.iso
+#   M52_ISO            default sls_operating_system_e3_m52.iso for gate,
+#                      sls_operating_system_e3_m52a.iso for tenant
 #   M52_BOOT_ENTRY     default 3
 #   M52_SPAWN_WAIT_S   default 300
 #   M52_TOKEN          default the tree's fixed dev token
@@ -39,7 +44,13 @@ set -u
 cd "$(dirname "$0")/.." || exit 2
 ROOT="$PWD"
 
-ISO="${M52_ISO:-sls_operating_system_e3_m52.iso}"
+PROFILE="${M52_PROFILE:-gate}"
+case "$PROFILE" in
+    gate)   DEFAULT_ISO=sls_operating_system_e3_m52.iso;  ENV_INDEX=1 ;;
+    tenant) DEFAULT_ISO=sls_operating_system_e3_m52a.iso; ENV_INDEX=3 ;;
+    *) echo "ABORT: M52_PROFILE must be 'gate' or 'tenant', got '$PROFILE'" >&2; exit 2 ;;
+esac
+ISO="${M52_ISO:-$DEFAULT_ISO}"
 BUILD="${M52_BUILD:-1}"
 ENTRY="${M52_BOOT_ENTRY:-3}"
 SPAWN_WAIT="${M52_SPAWN_WAIT_S:-300}"
@@ -58,9 +69,14 @@ command -v python3 >/dev/null 2>&1 || { echo "ABORT: python3 not found" >&2; exi
 mkdir -p "$ART" "$WD" || { echo "ABORT: cannot create $ART" >&2; exit 2; }
 
 if [ "$BUILD" = 1 ]; then
-    echo "=== build: x86-iso-e3 E3_INIT_FEATURES=e3_envs,e7_gate M5_CATALOG_PROBE=1 X86_E3_ISO=$ISO ==="
-    make x86-iso-e3 E3_INIT_FEATURES=e3_envs,e7_gate M5_CATALOG_PROBE=1 \
-        X86_E3_ISO="$ISO" || { echo "ABORT: the M5.2 gate image did not build" >&2; exit 2; }
+    if [ "$PROFILE" = gate ]; then
+        BUILD_FEATURES=e3_envs,e7_gate
+    else
+        BUILD_FEATURES=e3_envs,m5_tenant_probe
+    fi
+    echo "=== build: x86-iso-e3 E3_INIT_FEATURES=$BUILD_FEATURES M5_CATALOG_PROBE=1 X86_E3_ISO=$ISO ==="
+    make x86-iso-e3 E3_INIT_FEATURES="$BUILD_FEATURES" M5_CATALOG_PROBE=1 \
+        X86_E3_ISO="$ISO" || { echo "ABORT: the M5.2 image did not build" >&2; exit 2; }
 fi
 [ -f "$ROOT/$ISO" ] || { echo "ABORT: no image at $ISO (M52_BUILD=0 needs a prebuilt one)" >&2; exit 2; }
 
@@ -195,18 +211,37 @@ api POST /api/valloc '{"name":"m52_foreign","type":1,"pages":1}'
 [ "$API_CODE" = 200 ] || fail "foreign valloc: HTTP $API_CODE: $API_BODY"
 echo "tables: m52_dave (dave), m52_bob (bob), m52_foreign (partition system)"
 
-# ─── the gate profile, created AS BOB ─────────────────────────────────────
-sh_exec_as "$PEER_TOKEN" "env create $PART 1" || fail "bob 'env create $PART 1': $SHEL_OUT"
+# ─── the selected profile, created AS BOB ────────────────────────────────
+sh_exec_as "$PEER_TOKEN" "env create $PART $ENV_INDEX" || \
+    fail "bob 'env create $PART $ENV_INDEX': $SHEL_OUT"
 ENV_ID=$(printf '%s' "$SHEL_OUT" | sed -n 's/.*env_id=\([0-9]*\).*/\1/p' | tail -1)
 [ -n "$ENV_ID" ] && [ "$ENV_ID" != 0 ] || fail "bob env create returned no env_id: $SHEL_OUT"
-echo "gate env=$ENV_ID (index 1, owner bob)"
+echo "$PROFILE env=$ENV_ID (index $ENV_INDEX, owner bob)"
 
-wait_for "[M5.2] catalog probe: sp" 120 "the gate sidecar's M5.2 probe spawn" || \
-    fail "the gate sidecar never spawned the M5.2 probe"
+if [ "$PROFILE" = tenant ]; then
+    SPAWN_NEEDLE='[M5.2] tenant probe: sp'
+    SPAWN_WHAT="the ordinary tenant sidecar's M5.2 probe spawn"
+else
+    SPAWN_NEEDLE='[M5.2] catalog probe: sp'
+    SPAWN_WHAT="the gate sidecar's M5.2 probe spawn"
+fi
+wait_for "$SPAWN_NEEDLE" 120 "$SPAWN_WHAT" || \
+    fail "the sidecar never spawned the M5.2 probe"
 wait_for "M52-CATALOG-OK" "$SPAWN_WAIT" "the probe's success marker" || \
     fail "the probe did not report M52-CATALOG-OK"
 if grep -aqF "M52-CATALOG-FAIL" "$LOG"; then
     fail "the probe reported M52-CATALOG-FAIL"
+fi
+if [ "$PROFILE" = tenant ]; then
+    # M5.2a is an ORDINARY tenant arm: no gate manifest, no gate marker, no
+    # gate stop/checkpoint behavior. A leaked gate arm invalidates the claim.
+    if grep -aqF "[E7-GATE]" "$LOG"; then
+        fail "the tenant arm produced an [E7-GATE] marker"
+    fi
+    if grep -aqE "gate env=[0-9]+" "$LOG"; then
+        fail "the tenant arm created a gate environment"
+    fi
+    echo "ok:   the tenant probe ran without the gate profile (no [E7-GATE])"
 fi
 echo "ok:   the Linux task issued 334 and got the promised answers (M52-CATALOG-OK)"
 
@@ -229,5 +264,5 @@ printf '%s' "$API_BODY" | grep -Fq '"m52_foreign"' || \
     fail "the foreign table is not in GET /api/objects: $API_BODY"
 echo "ok:   the foreign table exists in the catalog; its ENOENT was the partition boundary"
 
-echo "M5.2 live gate profile: PASS (partition=$PART env=$ENV_ID)"
+echo "M5.2 live $PROFILE profile: PASS (partition=$PART env=$ENV_ID)"
 echo "artifacts: $ART"
