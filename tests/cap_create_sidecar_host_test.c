@@ -125,6 +125,11 @@
  *           kernel/console_service.c kernel/env_console.c kernel/linux_abi.c \
  *           kernel/elf64_load.c kernel/linux_threads.c
  *   /tmp/cap_create_sidecar_host_test
+ *
+ * The fixture supplies the two inert M4.6 restore/rollback stubs
+ * (proc_create_linux_thread_restore and proc_discard_linux_thread) that
+ * tests/env_catalog_host_test.c also defines, so this documented line needs
+ * no extra translation unit or -D flag.
  */
 #include "kernel/cap.h"
 #include "linux_abi.h"       /* E7 increment 7 (§5.2): PROC_PERSONALITY_LINUX
@@ -305,6 +310,18 @@ void process_kill(uint32_t pid) {
     g_process_kill_pid = pid;
     kill_sidecar(pid);
 }
+
+/* M4.6's restore-sibling create and rollback normally live in process.c,
+ * which this link set does not include. This fixture never restores a Linux
+ * thread, so the honest answers are inert — the same two stubs
+ * tests/env_catalog_host_test.c defines. They close the link for the
+ * documented build line above without pulling in process.c's world. */
+uint32_t proc_create_linux_thread_restore(struct ProcessDescriptor* parent,
+                                          const char* name, uint32_t tid) {
+    (void)parent; (void)name; (void)tid;
+    return 0;
+}
+void proc_discard_linux_thread(uint32_t pid) { (void)pid; }
 
 uint32_t alloc_pid(void) {
     uint32_t best = 0;
