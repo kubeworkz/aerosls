@@ -13,7 +13,8 @@
 //! 8       2     version_major  = 1
 //! 10      2     version_minor  = 0
 //! 12      2     record_count
-//! 14      2     flags          bit0 tolerate_unknown | bit1 strict_caps
+//! 14      2     flags          bit0 tolerate_unknown | bit1 strict_caps/gate
+//!                            | bit2 tenant-Linux test profile
 //! 16      4     total_len      (whole blob, for bounds checking)
 //! 20      4     body_crc32     (CRC-32 of the records, bytes 24..total_len)
 //! 24      ...   records        (record_count × TLV)
@@ -82,6 +83,14 @@ pub const TAG_SIGNATURE: u16 = 0x7F00;
 /// selects the E7 gate profile from that bit. Bit 0 of the same word is
 /// the parser's tolerate-unknown-records switch and must not be reused.
 pub const FLAG_GATE: u16 = 0x0002;
+/// M5.2a's tenant-Linux test-profile bit (kernel/cap.h
+/// `SIDECAR_MANIFEST_FLAG_TENANT_LINUX`). Like `FLAG_GATE`, it grants no
+/// authority: the kernel copies it into the BIB as
+/// `BOOT_INFO_FLAG_TENANT_LINUX`, and the sidecar spawns the M5.2 catalog
+/// probe from an ordinary tenant profile. It is deliberately separate from
+/// `FLAG_GATE` so a tenant does not inherit the gate's stop/poison/checkpoint
+/// semantics. The default E3 image never sets it.
+pub const FLAG_TENANT_LINUX: u16 = 0x0004;
 
 /// Per-list bounds of one `ARGENV` record — the kernel's own
 /// (cap.h `SIDECAR_MANIFEST_MAX_ARGV`/`MAX_ENVP`), mirrored so a record

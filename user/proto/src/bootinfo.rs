@@ -78,6 +78,14 @@ pub const BOOT_INFO_FLAG_ENV_CONSOLE: u32 = 1 << 1;
 /// tenant has. The default E3 image never sets it.
 pub const BOOT_INFO_FLAG_GATE: u32 = 1 << 2;
 
+/// M5.2a: this sidecar was created from a manifest whose header carried
+/// `FLAG_TENANT_LINUX`. This is the ordinary-tenant test profile: it carries
+/// no gate authority and deliberately does NOT share `BOOT_INFO_FLAG_GATE`,
+/// so the sidecar can spawn the M5.2 catalog probe without arming the gate's
+/// stop, stack poison, or checkpoint task registration. The default E3 image
+/// never sets it.
+pub const BOOT_INFO_FLAG_TENANT_LINUX: u32 = 1 << 3;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BootErr {
     BadMagic,
@@ -272,6 +280,12 @@ impl<'a> BootInfo<'a> {
         self.flags & BOOT_INFO_FLAG_GATE != 0
     }
 
+    /// M5.2a: is this an ordinary tenant carrying the test-only Linux spawn
+    /// profile? Separate from `is_gate_profile()` by construction.
+    pub fn is_tenant_linux(&self) -> bool {
+        self.flags & BOOT_INFO_FLAG_TENANT_LINUX != 0
+    }
+
     /// POSIX-Environments E6: this sidecar's own identity `(index, pid)` — the
     /// pair it announces on its own console at boot — or `None` when it has no
     /// identity to announce: `own_pid` 0 (a pre-v3 BIB or the host sim's
@@ -399,6 +413,21 @@ mod tests {
         assert!(uni.is_unified());
         // ...and the caps after the new header fields still parse.
         assert_eq!(uni.find_cap(2, "console").unwrap().rights, 0x7);
+    }
+
+    #[test]
+    fn tenant_linux_flag_is_distinct_from_gate() {
+        // M5.2a: the tenant test profile is its own BIB bit. If it ever
+        // aliases the gate bit, an ordinary tenant would silently acquire
+        // the gate's stop/poison/checkpoint behavior.
+        let bib = build_bib_flags(
+            &[("console", 2, 0x7, 0, 0)],
+            BOOT_INFO_FLAG_TENANT_LINUX,
+        );
+        let info = unsafe { BootInfo::from_raw(bib.as_ptr()) }.unwrap();
+        assert!(info.is_tenant_linux());
+        assert!(!info.is_gate_profile());
+        assert_ne!(BOOT_INFO_FLAG_TENANT_LINUX, BOOT_INFO_FLAG_GATE);
     }
 
     #[test]

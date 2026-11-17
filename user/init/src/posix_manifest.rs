@@ -7,7 +7,7 @@
 
 use aerosls_proto::manifest::{
     Bootstrap, Budget, CapKind, Cpu, Image, Limits, Manifest, ManifestCap,
-    build_manifest, crc32, FLAG_GATE, HEADER_LEN,
+    build_manifest, crc32, FLAG_GATE, FLAG_TENANT_LINUX, HEADER_LEN,
 };
 use alloc::vec::Vec;
 
@@ -215,7 +215,7 @@ pub fn build_posix_manifest_tenant(
     heap_base: u64,
 ) -> Vec<u8> {
     build_posix_manifest_tenant_profile(
-        name, ramdisk_peer, image_kaddr, image_size, heap_base, false,
+        name, ramdisk_peer, image_kaddr, image_size, heap_base, false, false,
     )
 }
 
@@ -235,7 +235,24 @@ pub fn build_posix_manifest_tenant_gate(
     heap_base: u64,
 ) -> Vec<u8> {
     build_posix_manifest_tenant_profile(
-        name, ramdisk_peer, image_kaddr, image_size, heap_base, true,
+        name, ramdisk_peer, image_kaddr, image_size, heap_base, true, false,
+    )
+}
+
+/// M5.2a's ordinary-tenant test profile: the same five-cap tenant manifest
+/// with the separate `FLAG_TENANT_LINUX` header bit set and `FLAG_GATE`
+/// clear. The bit grants no authority and adds no cap; the kernel copies it
+/// into the BIB, where the tenant sidecar spawns the M5.2 catalog probe. It
+/// deliberately does not select the gate's stop/poison/checkpoint behavior.
+pub fn build_posix_manifest_tenant_linux(
+    name: &str,
+    ramdisk_peer: &str,
+    image_kaddr: u64,
+    image_size: u32,
+    heap_base: u64,
+) -> Vec<u8> {
+    build_posix_manifest_tenant_profile(
+        name, ramdisk_peer, image_kaddr, image_size, heap_base, false, true,
     )
 }
 
@@ -246,6 +263,7 @@ fn build_posix_manifest_tenant_profile(
     image_size: u32,
     heap_base: u64,
     gate: bool,
+    tenant_linux: bool,
 ) -> Vec<u8> {
     let heap_size = 4 * 1024 * 1024; // 4 MiB — matches the system profile's heap
     let caps = [
@@ -316,7 +334,13 @@ fn build_posix_manifest_tenant_profile(
     let m = Manifest {
         version_major: 1,
         version_minor: 0,
-        flags: if gate { FLAG_GATE } else { 0 },
+        flags: if gate {
+            FLAG_GATE
+        } else if tenant_linux {
+            FLAG_TENANT_LINUX
+        } else {
+            0
+        },
         name: Some(name),
         personality: Some("aerosls.posix.v1"),
         image: Some(Image { offset: 0, size: image_size, entry: 0 }),
@@ -419,6 +443,35 @@ mod tests {
             assert!(m.find_cap(absent).is_none(),
                     "tenant profile must not carry '{absent}'");
         }
+    }
+
+    #[test]
+    fn tenant_linux_profile_sets_its_own_flag_and_keeps_the_five_caps() {
+        // M5.2a: the tenant test profile is the plain tenant manifest plus
+        // FLAG_TENANT_LINUX. It must not set FLAG_GATE, and it must not gain
+        // a capability — the Linux child's authority stays the sidecar's.
+        let blob = build_posix_manifest_tenant_linux(
+            "aerosls.posix.3", "drv.ramdisk.3",
+            0x3000_0000, 0x40000, 0x3040_0000);
+        let m = parse_manifest(&blob).unwrap();
+        assert_eq!(m.name, Some("aerosls.posix.3"));
+        assert_eq!(m.flags & FLAG_TENANT_LINUX, FLAG_TENANT_LINUX);
+        assert_eq!(m.flags & FLAG_GATE, 0);
+        assert_eq!(m.n_caps, 5);
+        for present in ["budget", "console", "ramdisk", "network", "catalog"] {
+            assert!(m.find_cap(present).is_some(),
+                    "tenant Linux profile lost '{present}'");
+        }
+        for absent in ["uart", "irq.timer.0", "irq.serial.0", "nic0.bar0"] {
+            assert!(m.find_cap(absent).is_none(),
+                    "tenant Linux profile must not carry '{absent}'");
+        }
+        let plain_blob = build_posix_manifest_tenant(
+            "aerosls.posix.3", "drv.ramdisk.3",
+            0x3000_0000, 0x40000, 0x3040_0000);
+        let plain = parse_manifest(&plain_blob).unwrap();
+        assert_eq!(plain.flags & FLAG_TENANT_LINUX, 0,
+                   "the ordinary tenant builder stayed byte-identical");
     }
 
     #[test]

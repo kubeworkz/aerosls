@@ -4727,7 +4727,9 @@ static int cap_create_sidecar_in_personality_owned(uint32_t parent_pid,
      * that boot, so the sidecar world must not try to drive either. */
     *(uint32_t*)(bib_buf + bib_off) = bib_flags |
         (env_console_wired ? SIDECAR_BIB_FLAG_ENV_CONSOLE : 0u) |
-        ((m.flags & SIDECAR_MANIFEST_FLAG_GATE) ? SIDECAR_BIB_FLAG_GATE : 0u);
+        ((m.flags & SIDECAR_MANIFEST_FLAG_GATE) ? SIDECAR_BIB_FLAG_GATE : 0u) |
+        ((m.flags & SIDECAR_MANIFEST_FLAG_TENANT_LINUX)
+             ? SIDECAR_BIB_FLAG_TENANT_LINUX : 0u);
     bib_off += 4;
     /* E6 (BIB v3): the sidecar's OWN identity — its pid and, when its NAME is
      * an environment's name, the index the console registry will file it

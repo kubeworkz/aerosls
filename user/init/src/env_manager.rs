@@ -39,6 +39,11 @@ pub const RD_HEAP_FRAMES: u64 = 64; //     256 KiB — build_ramdisk_manifest_na
 pub const RD_STORAGE_FRAMES: u64 = 256; // 1 MiB — the private block device
 const RD_STORAGE_BYTES: u64 = RD_STORAGE_FRAMES * 4096;
 
+/// M5.2a's designated ordinary-tenant test environment. It is deliberately
+/// separate from the gate's index 1, so the two profiles can coexist in one
+/// test image without one selecting the other's manifest or checkpoint task.
+pub const M5_TENANT_ENV_INDEX: u32 = 3;
+
 /// The shared, read-only sidecar images an environment instantiates (the boot
 /// image's `ramdisk.image` / `posix.image` MEM caps — each sidecar gets its
 /// own copy of the code; only heap and storage are per-instance, principle 2).
@@ -253,8 +258,22 @@ pub fn create_environment_owned<K: Kernel>(
     // checkpoint. Every other index (and every other build) gets the plain
     // tenant manifest, byte for byte.
     let gate = cfg!(feature = "e7_gate") && index == 1;
+    // M5.2a: a build-time ordinary-tenant test profile, selected only for its
+    // designated index. It uses a distinct manifest bit and deliberately does
+    // not set `gate`, so it spawns the M5.2 catalog probe without the gate's
+    // stop/poison behavior and without a third checkpoint task.
+    let tenant_linux =
+        cfg!(feature = "m5_tenant_probe") && index == M5_TENANT_ENV_INDEX;
     let px_manifest = if gate {
         posix_manifest::build_posix_manifest_tenant_gate(
+            px_name.as_str(),
+            rd_name.as_str(),
+            images.posix_kaddr,
+            images.posix_size,
+            px_heap,
+        )
+    } else if tenant_linux {
+        posix_manifest::build_posix_manifest_tenant_linux(
             px_name.as_str(),
             rd_name.as_str(),
             images.posix_kaddr,
@@ -861,7 +880,9 @@ impl EnvManager {
 mod tests {
     use super::*;
     use crate::sim::SimKernel;
-    use aerosls_proto::manifest::{parse_manifest, CapKind};
+    use aerosls_proto::manifest::{
+        parse_manifest, CapKind, FLAG_GATE, FLAG_TENANT_LINUX,
+    };
 
     fn images() -> EnvImages {
         EnvImages {
@@ -923,6 +944,31 @@ mod tests {
         }
         assert_eq!(px.find_cap("network").unwrap().kind,
                    CapKind::Chan { peer: Some("kernel.net.socket"), flags: 0 });
+    }
+
+    /// M5.2a: only the designated index gets the tenant-Linux test flag, and
+    /// the profile does not add a checkpoint task. The equality against
+    /// `cfg!(feature = ...)` keeps the test meaningful in both the default
+    /// build (flag absent) and the dedicated tenant build (flag present).
+    #[test]
+    fn tenant_linux_profile_selects_only_its_index_and_registers_no_linux_task() {
+        let k = SimKernel::new();
+        let env = create_environment(&k, 5, M5_TENANT_ENV_INDEX, &images()).unwrap();
+        let created = k.created();
+        let px = parse_manifest(&created[1].0).unwrap();
+        assert_eq!(px.flags & FLAG_TENANT_LINUX != 0,
+                   cfg!(feature = "m5_tenant_probe"));
+        assert_eq!(px.flags & FLAG_GATE, 0);
+        assert_eq!(px.n_caps, 5);
+        assert_eq!(environment_register_reply(1, &env).n_tasks, 2,
+                   "the short-lived test probe is not a checkpoint task");
+
+        let other = SimKernel::new();
+        let _ = create_environment(&other, 5, M5_TENANT_ENV_INDEX + 1, &images()).unwrap();
+        let other_created = other.created();
+        let other_px = parse_manifest(&other_created[1].0).unwrap();
+        assert_eq!(other_px.flags & FLAG_TENANT_LINUX, 0,
+                   "the test profile must not leak to an ordinary tenant index");
     }
 
     #[test]

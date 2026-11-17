@@ -1071,6 +1071,15 @@ struct SidecarManifest {
 #define SIDECAR_MANIFEST_FLAG_GATE 0x0002u
 #define SIDECAR_BIB_FLAG_GATE      0x4u
 
+/* M5.2a: the tenant-Linux test profile. This is a SECOND manifest profile
+ * bit, not a reuse of the gate bit, so a tenant can spawn the catalog probe
+ * without inheriting the gate's stop/poison/checkpoint behavior. It grants
+ * no authority and adds no cap; the create copies it into the BIB as
+ * SIDECAR_BIB_FLAG_TENANT_LINUX (BOOT_INFO_FLAG_TENANT_LINUX in
+ * user/proto/src/bootinfo.rs). The default E3 image never sets it. */
+#define SIDECAR_MANIFEST_FLAG_TENANT_LINUX 0x0004u
+#define SIDECAR_BIB_FLAG_TENANT_LINUX      0x8u
+
 /* E6: the sidecar's OWN identity, the third thing a sidecar cannot otherwise
  * observe. Until now a sidecar could not learn what the kernel called it: the
  * BIB carried cap NAMES ("console", "budget") but never the manifest's NAME

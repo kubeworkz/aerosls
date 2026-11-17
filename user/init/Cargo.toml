@@ -39,6 +39,13 @@ e3_envs = ["target"]
 # cap in its manifest). Only meaningful with `e3_envs`; off by default so
 # the ordinary E3 image keeps its two plain tenant environments.
 e7_gate = ["e3_envs"]
+# M5.2a: the ordinary-tenant Linux test profile. Environment index 3 gets a
+# manifest carrying FLAG_TENANT_LINUX; the tenant sidecar spawns the M5.2
+# catalog probe when its BIB reports that bit. It is not the gate profile and
+# registers no checkpoint task. Off by default so ordinary tenant images keep
+# their exact two-sidecar shape. It does not imply `e3_envs`: the live image
+# selects both explicitly, while host tests can exercise just the profile.
+m5_tenant_probe = []
 # M4.6 increment 1: the gate profile's third task is the live checkpoint probe
 # instead of the E7 firstuser. Only meaningful with `e7_gate`; off by default
 # so the normal gate image names exactly the task it has always named.
