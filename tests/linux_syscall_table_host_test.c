@@ -160,6 +160,7 @@ int main(void)
         { 234, LSC_SIG,   "tgkill" },
         { 273, LSC_SIG,   "set_robust_list" },
         { 274, LSC_SIG,   "get_robust_list" },
+        { 334, LSC_CATALOG, "SYS_SLS_CATALOG_EXEC" },
         { 435, LSC_LOCAL, "clone3" },
     };
     size_t i;
@@ -170,6 +171,18 @@ int main(void)
                  want[i].name, want[i].num, linux_syscall_class_name(want[i].cls));
         CHECK(got == want[i].cls, msg);
     }
+
+    /* ─── M5.2's project-private Linux number ─────────────────────────────
+     * It is outside the census on purpose: it exists for the environment's
+     * mediated CAT_EXEC surface, not for a general Linux binary. Its class
+     * is what makes the dispatcher describe it as a catalog call rather
+     * than treat it as an unknown census row. */
+    CHECK(linux_syscall_class(SYS_SLS_CATALOG_EXEC) == LSC_CATALOG,
+          "M5.2's SYS_SLS_CATALOG_EXEC (334) classifies as LSC_CATALOG");
+    CHECK(strcmp(linux_syscall_class_name(LSC_CATALOG), "catalog") == 0,
+          "the M5.2 class has a stable name for the refusal/log line");
+    CHECK(linux_syscall_flags(SYS_SLS_CATALOG_EXEC) == 0,
+          "the CAT_EXEC row carries no flags of its own");
 
     /* ─── §5.4's W^X refusal is pinned against the census's own row ─────── */
     CHECK((linux_syscall_flags(10) & LSC_F_REFUSES_WX) != 0,
@@ -209,7 +222,7 @@ int main(void)
         CHECK(strcmp(linux_syscall_class_name(LSC_UNKNOWN), "unknown") == 0,
               "LSC_UNKNOWN's name is \"unknown\" (the refusal line's wording)");
         CHECK(linux_syscall_table_len == sizeof(want) / sizeof(want[0]),
-              "the table's length equals the census's 27 rows plus M1, M4.4 and M4.5's declared rows");
+              "the table's length equals the census rows plus M1, M4.4, M4.5 and M5.2's declared rows");
     }
 
     printf("linux_syscall_table_host_test: %d passed, %d failed\n",

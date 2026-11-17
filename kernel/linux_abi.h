@@ -122,6 +122,9 @@ enum LinuxSyscallClass {
     LSC_SPAWN,         /* execve: the spawn path (the sidecar's to decide) */
     LSC_LOCAL,         /* sidecar-local: no fd, no memory, no kernel state */
     LSC_EXIT,          /* exit_group: the sidecar reaps, frames return */
+    LSC_CATALOG,       /* M5.2: the environment's CatalogOps::cat_exec — one
+                        * project-private number, forwarded like every other
+                        * Linux trap, with no uid or partition in its words  */
 };
 
 /* Per-entry flags. The one that exists today is a §5.4 contract: the shim's
@@ -148,6 +151,43 @@ enum LinuxSyscallClass linux_syscall_class(uint64_t num);
 
 /* Flags of a Linux syscall number, or 0 when the number is unknown. */
 uint32_t linux_syscall_flags(uint64_t num);
+
+/* ─── M5.2 — SYS_SLS_CATALOG_EXEC (334), the Linux-personality CAT_EXEC ────
+ * A Linux task's one write path to the environment's mediated catalog. The
+ * number is project-private and lives in the Linux table above, so only the
+ * Linux personality branch reaches it: a non-Linux SLS task that traps 334
+ * is refused by name in the legacy chain. The request is exactly three
+ * words — a bounded user pointer, its length, and a reserved flags word.
+ * It NEVER carries a uid, a partition, a capability or a second statement:
+ * identity is the sidecar channel's registered owner, and the sentinel
+ * words are refused before any post. The kernel copies the SQL into the
+ * existing forwarded message (the same attach buffer the path/fd classes
+ * use); linux::service calls its one CatalogOps::cat_exec, not a second
+ * client and not kernel.env.catalog directly. */
+#define SYS_SLS_CATALOG_EXEC   334u
+#define LINUX_CATALOG_SQL_MAX  512u   /* twin of env_catalog.h's CAT_SQL_MAX */
+
+struct LinuxCatalogExecPlan {
+    uint64_t src;      /* child VA of the SQL text (args[0])              */
+    uint32_t len;      /* bytes to attach: args[1], 1..CAT_SQL_MAX       */
+    int32_t  refuse;   /* 0 = proceed; else the first-trap Linux errno   */
+};
+
+/* Plan the bounded SQL copy. Pure over (num, args): a NULL or
+ * non-canonical pointer is -EFAULT, zero/over-cap length or any nonzero
+ * flags word is -EINVAL, and every other number plans nothing. The
+ * pointer's PAGES are validated by the copy walker, exactly as the fd
+ * class's write is. */
+struct LinuxCatalogExecPlan linux_catalog_exec_plan(uint64_t num,
+                                                    const uint64_t args[6]);
+
+/* The bytes' own verdict, after the checked copy: a NUL is -EINVAL and a
+ * semicolon outside a single-quoted string is -EINVAL — the first cut is
+ * one statement, so a request that would carry a second one never reaches
+ * a catalog call or a transaction. A semicolon inside a literal is data,
+ * not a separator. Pure, so the host test drives every branch without a
+ * boot. */
+int linux_catalog_sql_verdict(const uint8_t *sql, uint32_t len);
 
 /* Class name for logs and refusal lines ("fd", "mem", ..., "unknown").
  * Never NULL. */

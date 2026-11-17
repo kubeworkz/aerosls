@@ -9,6 +9,10 @@
  */
 #include "linux_abi.h"
 #include "cap.h"      /* CAP_E* (Phase-3 syscalls), CAP_ERR_* (Phase-5 k_chan), CAP_NONE */
+#include "env_catalog.h"   /* CAT_SQL_MAX — the M5.2 syscall's own cap is
+                            * one truth with the service's, asserted below */
+_Static_assert(LINUX_CATALOG_SQL_MAX == CAT_SQL_MAX,
+               "the Linux catalog syscall's SQL cap must equal CAT_SQL_MAX");
 
 /* ─── The errno map (§5.7) ─────────────────────────────────────────────────
  * Forward: CAP code -> Linux errno, total over both families and the
@@ -197,6 +201,11 @@ const struct LinuxSyscallEntry linux_syscall_table[] = {
     { 234, LSC_SIG,    0 },   /* tgkill — M4.8: sibling signal by TGID+TID */
     { 273, LSC_SIG,    0 },   /* set_robust_list — M4.8 exit-time owner-died */
     { 274, LSC_SIG,    0 },   /* get_robust_list — named refusal (no sibling read) */
+    /* M5.2 — the project-private Linux number. It is deliberately outside
+     * the census: a task uses it only because it was compiled for this
+     * environment's write surface, and the sidecar answers it with the
+     * SAME CatalogOps client its applets use. */
+    { SYS_SLS_CATALOG_EXEC, LSC_CATALOG, 0 },   /* CAT_EXEC write path */
     { 435, LSC_LOCAL,  0 },   /* clone3 — M4.8: v1 clone_args, 88 bytes */
 };
 const size_t linux_syscall_table_len =
@@ -234,6 +243,7 @@ const char *linux_syscall_class_name(enum LinuxSyscallClass cls)
     case LSC_SPAWN:  return "spawn";
     case LSC_LOCAL:  return "local";
     case LSC_EXIT:   return "exit";
+    case LSC_CATALOG: return "catalog";
     case LSC_UNKNOWN:
     default:         return "unknown";
     }
@@ -1941,4 +1951,73 @@ size_t linux_stack_hwm_headroom(const uint8_t *region, size_t bytes,
     if (!region) return 0;
     while (i < bytes && region[i] == poison) i++;
     return i;
+}
+
+/* ─── M5.2 — the Linux CAT_EXEC request ────────────────────────────────────
+ * The number's first trap, before the post and before any channel lookup.
+ * The request's words are the whole request: pointer, bounded length and a
+ * reserved flags word. There is deliberately no uid, partition or cap in
+ * them — the sidecar's channel registration is the identity, and the
+ * catalog service checks PERM_WRITE against that bound owner. A refusal
+ * here never reaches a sidecar, so it cannot open a catalog transaction. */
+struct LinuxCatalogExecPlan linux_catalog_exec_plan(uint64_t num,
+                                                    const uint64_t args[6])
+{
+    struct LinuxCatalogExecPlan p;
+    p.src = 0;
+    p.len = 0;
+    p.refuse = 0;
+    if (num != SYS_SLS_CATALOG_EXEC) return p;
+    if (!args || args[0] == 0) {
+        p.refuse = -LINUX_EFAULT;
+        return p;
+    }
+    if (args[2] != 0) {
+        p.refuse = -LINUX_EINVAL;   /* flags are reserved in this cut */
+        return p;
+    }
+    if (args[1] == 0 || args[1] > LINUX_CATALOG_SQL_MAX) {
+        p.refuse = -LINUX_EINVAL;
+        return p;
+    }
+    if (args[0] > LINUX_USER_ADDR_MAX ||
+        args[1] > LINUX_USER_ADDR_MAX - args[0] + 1ULL) {
+        p.refuse = -LINUX_EFAULT;
+        return p;
+    }
+    p.src = args[0];
+    p.len = (uint32_t)args[1];
+    return p;
+}
+
+/* One statement, no NUL, one bounded span. The semicolon scan tracks a
+ * single-quoted string and treats '' as an escaped quote, so a semicolon
+ * INSIDE a text literal is data while one outside it would hand the
+ * engine a second statement. The parser is still the authority on SQL;
+ * this is the first-cut shape rule the syscall boundary can enforce
+ * without running the engine, and it runs before any catalog call. */
+int linux_catalog_sql_verdict(const uint8_t *sql, uint32_t len)
+{
+    uint32_t i;
+    int in_quote = 0;
+
+    if (!sql || len == 0 || len > LINUX_CATALOG_SQL_MAX)
+        return -LINUX_EINVAL;
+    for (i = 0; i < len; i++) {
+        uint8_t c = sql[i];
+        if (c == 0) return -LINUX_EINVAL;
+        if (in_quote) {
+            if (c == '\'') {
+                if (i + 1 < len && sql[i + 1] == '\'')
+                    i++;              /* doubled quote: still inside */
+                else
+                    in_quote = 0;
+            }
+        } else if (c == '\'') {
+            in_quote = 1;
+        } else if (c == ';') {
+            return -LINUX_EINVAL;     /* a second statement's separator */
+        }
+    }
+    return 0;
 }

@@ -106,8 +106,16 @@
 
 use alloc::boxed::Box;
 use aerosls_blockcache::BufferAlloc;
+use aerosls_proto::catalops::CatalogOps;
 use aerosls_proto::kabi::{GrantedCap, Kernel, LinuxCloneThreadReq};
 use aerosls_proto::sockops::SocketOps;
+use aerosls_proto::catalops::{CAT_ECLOSED, CAT_EKERNEL, CAT_ENOCHAN, CAT_EPROTO};
+use aerosls_proto::{
+    CAT_ERR_BUSY,
+    CAT_ERR_CONFLICT, CAT_ERR_CONSTRAINT, CAT_ERR_INTERNAL, CAT_ERR_NOENT,
+    CAT_ERR_PERM, CAT_ERR_QUERY, CAT_ERR_SHAPE, CAT_ERR_TYPE,
+    CAT_ERR_UNKNOWN, CAT_SQL_MAX,
+};
 use aerosls_proto::{NET_ERR_ADDRINUSE, NET_ERR_ADDRNOTAVAIL, NET_ERR_CAP,
     NET_ERR_CONNRESET, NET_ERR_INUSE, NET_ERR_INVAL, NET_ERR_IO,
     NET_ERR_MSGSIZE, NET_ERR_NOMEM, NET_ERR_NOTCONN, NET_ERR_PIPE,
@@ -144,6 +152,12 @@ pub const LINUX_DEFAULT_ENV: &[&str] = &["PATH=/bin", "HOME=/root"];
 /// because linux_errno_from_cap maps every one of them into musl's errno
 /// window. Values pinned by tools/aeroidl/tests/cross_lang_constants.rs.
 const E_NOSYS: i32 = -10;      /* CAP_ENOSYS  -> -ENOSYS  (§5.7) */
+const E_NOENT: i32 = 1;        /* CAP_ERR_NOTFOUND -> -ENOENT (§5.7): the
+                                * catalog's NOENT is "not in your namespace" */
+const E_IO: i32 = 2;           /* CAP_ERR_REVOKED -> -EIO (§5.7): a catalog
+                                * call that failed under us / INTERNAL */
+const E_PROTO: i32 = 10;       /* CAP_ERR_PROTO -> -EPROTO (§5.7): a catalog
+                                * client reply that was not a reply */
 const E_CONFLICT: i32 = -11;   /* CAP_ECONFLICT -> -EBUSY: the reaper could not
                                 * resolve its own child — a state conflict, not
                                 * a permission or an absence of policy */
@@ -208,6 +222,16 @@ const LINUX_MMAP: u64 = 9;
 const LINUX_CLONE: u64 = 56;
 const LINUX_CLONE3: u64 = 435;
 const LINUX_CLONE_ARGS_BYTES: usize = 88;
+
+/// M5.2: the project-private Linux CAT_EXEC number (kernel/linux_abi.h's
+/// `SYS_SLS_CATALOG_EXEC`). It is NOT a census number; it rides the same
+/// forwarded 72-byte description, with the bounded SQL behind the header.
+/// The request carries no uid/partition — the kernel registration of THIS
+/// sidecar's channel is the identity the catalog service uses. A wrong
+/// personality never reaches this arm (the kernel refuses 334 in its legacy
+/// chain), and the existing E7 cap-table guard still sees the child holding
+/// exactly one channel.
+const SYS_SLS_CATALOG_EXEC: u64 = 334;
 const CLONE_VM: u64 = 0x0000_0100;
 const CLONE_FS: u64 = 0x0000_0200;
 const CLONE_FILES: u64 = 0x0000_0400;
@@ -1763,6 +1787,10 @@ fn expected_req_len(num: u64, args: &[u64; 6]) -> usize {
         LINUX_FUTEX if args[1] == (FUTEX_CMP_REQUEUE | FUTEX_PRIVATE) =>
             LINUX_SYSCALL_REQ_BYTES + FUTEX_REQUEUE_PAYLOAD_BYTES,
         LINUX_CLONE3 => LINUX_SYSCALL_REQ_BYTES + LINUX_CLONE_ARGS_BYTES,
+        /* M5.2: CAT_EXEC's SQL rides behind the header; args[1] is its
+         * length. The range below refuses zero and anything over the
+         * service's own cap before the arm runs. */
+        SYS_SLS_CATALOG_EXEC => LINUX_SYSCALL_REQ_BYTES + args[1] as usize,
         _ => LINUX_SYSCALL_REQ_BYTES,
     }
 }
@@ -1780,6 +1808,7 @@ fn expected_req_range(num: u64, args: &[u64; 6]) -> (usize, usize) {
         LINUX_OPEN | LINUX_STAT | LINUX_LSTAT | LINUX_UNLINK | LINUX_MKDIR =>
             (H + 1, H + LINUX_PATH_CAP + 1),
         LINUX_RENAME => (H + 2, H + RECV_ATTACH_CAP),
+        SYS_SLS_CATALOG_EXEC => (H + 1, H + CAT_SQL_MAX),
         _ => (expected_req_len(num, args), expected_req_len(num, args)),
     }
 }
@@ -3720,11 +3749,83 @@ fn reap_pending_if_closed<K: Kernel, A: BufferAlloc>(
 /// name it, this function performs on it (increment 5), and the loop's own
 /// pump drains what lands there to the kernel console channel on the next
 /// pass, so a write becomes serial output without a second path.
+/// M5.2: one CAT_EXEC request, answered through the ProcManager's installed
+/// `CatalogOps` — the same object `ctx.catalog()` reaches. The syscall's
+/// words carry no identity: the catalog client's channel registration is the
+/// bound owner the service checks. A refusal is translated to the CAP family
+/// the kernel's §5.7 map already understands, so the task sees a Linux errno
+/// and never a `CAT_ERR_*` number.
+fn catalog_status_to_cap(status: u16) -> i32 {
+    match status {
+        CAT_ERR_NOENT => E_NOENT,
+        CAT_ERR_PERM => E_PERM,
+        CAT_ERR_SHAPE | CAT_ERR_TYPE | CAT_ERR_QUERY | CAT_ERR_CONSTRAINT => E_INVAL,
+        CAT_ERR_CONFLICT | CAT_ERR_BUSY => E_CONFLICT,
+        CAT_ERR_INTERNAL | CAT_EKERNEL | CAT_ECLOSED => E_IO,
+        CAT_EPROTO => E_PROTO,
+        CAT_ERR_UNKNOWN | CAT_ENOCHAN => E_NOSYS,
+        _ => E_NOSYS,
+    }
+}
+
+/// The first cut is one statement. This is the sidecar's twin of the
+/// kernel's post-copy verdict: a semicolon outside a single-quoted string
+/// would name a second statement, while one inside a literal is data. The
+/// kernel refuses it before any post; this arm repeats the rule so neither
+/// end is load-bearing alone.
+fn catalog_sql_one_statement(sql: &[u8]) -> bool {
+    let mut in_quote = false;
+    let mut i = 0;
+    while i < sql.len() {
+        let c = sql[i];
+        if in_quote {
+            if c == b'\'' {
+                if i + 1 < sql.len() && sql[i + 1] == b'\'' {
+                    i += 1;             /* doubled quote: still inside */
+                } else {
+                    in_quote = false;
+                }
+            }
+        } else if c == b'\'' {
+            in_quote = true;
+        } else if c == b';' {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+fn answer_catalog_exec(
+    catalog: &mut Option<&mut Box<dyn CatalogOps>>,
+    args: &[u64; 6],
+    payload: &[u8],
+) -> Answer {
+    let len = args[1];
+    if args[2] != 0 || len == 0 || len > CAT_SQL_MAX as u64 ||
+        payload.len() != len as usize
+    {
+        return Answer::Reply(0, E_INVAL);
+    }
+    let sql = &payload[..len as usize];
+    if sql.contains(&0) || !catalog_sql_one_statement(sql) {
+        return Answer::Reply(0, E_INVAL);
+    }
+    let Some(client) = catalog.as_mut() else {
+        return Answer::Reply(0, E_NOSYS);
+    };
+    match client.cat_exec(sql) {
+        Ok(exec) => Answer::Reply(exec.affected_rows as u64, STATUS_OK),
+        Err(refusal) => Answer::Reply(0, catalog_status_to_cap(refusal.status)),
+    }
+}
+
 pub fn service<K: Kernel, A: BufferAlloc>(
     k: &K,
     console: &CharNode,
     vfs: &mut Vfs<K, A>,
     net: Option<&mut Box<dyn SocketOps>>,
+    catalog: Option<&mut Box<dyn CatalogOps>>,
 ) {
     /* One clock sample per pass (E7 increment 24): every parked poll's
      * deadline below is measured against the same now, so two waits that
@@ -3733,6 +3834,9 @@ pub fn service<K: Kernel, A: BufferAlloc>(
     /* M1: reborrowed per task, never held across an iteration, so every
      * Linux task's network arm reaches the one manifest-owned client. */
     let mut net = net;
+    /* M5.2: reborrowed per task exactly like `net`, so every CAT_EXEC
+     * reaches the one client the ProcManager installed at boot. */
+    let mut catalog = catalog;
     for i in 0..MAX_LINUX_TASKS {
         if !tasks()[i].used {
             continue;
@@ -3963,6 +4067,11 @@ pub fn service<K: Kernel, A: BufferAlloc>(
             LINUX_SOCKET | LINUX_CONNECT | LINUX_ACCEPT | LINUX_SENDTO
             | LINUX_RECVFROM | LINUX_SHUTDOWN | LINUX_BIND | LINUX_LISTEN =>
                 answer_net(&mut net, num, &args, &mut fds, payload),
+            /* M5.2: the Linux CAT_EXEC path. It uses the existing
+             * CatalogOps client through the environment's one catalog
+             * channel — no second client, no kernel.env.catalog reach. */
+            SYS_SLS_CATALOG_EXEC =>
+                answer_catalog_exec(&mut catalog, &args, payload),
             LINUX_READ | LINUX_WRITE | LINUX_OPEN | LINUX_CLOSE | LINUX_STAT
             | LINUX_LSTAT | LINUX_LSEEK | LINUX_FCNTL | LINUX_FSYNC
             | LINUX_FTRUNCATE | LINUX_RENAME | LINUX_MKDIR | LINUX_UNLINK
@@ -4532,6 +4641,158 @@ pub fn service<K: Kernel, A: BufferAlloc>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::rc::Rc;
+    use alloc::vec::Vec;
+    use core::cell::{Cell, RefCell};
+    use aerosls_proto::catalops::{CatPage, CatRefusal, CatResult};
+    use aerosls_proto::{CatExec, CatInfo, CatRows, CatStat, CatValue};
+
+    /// M5.2: one scripted CatalogOps. `calls` is the whole point — the
+    /// syscall arm must reach the ONE client the ProcManager installed, not
+    /// construct a second wire client. The recorded SQL lets the test pin
+    /// that the bytes the kernel copied are the bytes the service receives.
+    struct FakeCatalog {
+        calls: Rc<Cell<u32>>,
+        sql: Rc<RefCell<Vec<u8>>>,
+        reply: CatResult<CatExec>,
+    }
+
+    impl FakeCatalog {
+        fn ok(rows: u32, calls: Rc<Cell<u32>>, sql: Rc<RefCell<Vec<u8>>>) -> Self {
+            FakeCatalog {
+                calls,
+                sql,
+                reply: Ok(CatExec { affected_rows: rows, flags: 0 }),
+            }
+        }
+        fn err(status: u16, calls: Rc<Cell<u32>>, sql: Rc<RefCell<Vec<u8>>>) -> Self {
+            FakeCatalog {
+                calls,
+                sql,
+                reply: Err(CatRefusal::new(status, "fake refusal")),
+            }
+        }
+    }
+
+    impl CatalogOps for FakeCatalog {
+        fn cat_info(&mut self) -> CatResult<CatInfo> {
+            Err(CatRefusal::new(CAT_ERR_UNKNOWN, "not used"))
+        }
+        fn cat_list(&mut self, _: u16, _: u16) -> CatResult<CatPage> {
+            Err(CatRefusal::new(CAT_ERR_UNKNOWN, "not used"))
+        }
+        fn cat_stat(&mut self, _: &[u8]) -> CatResult<CatStat> {
+            Err(CatRefusal::new(CAT_ERR_UNKNOWN, "not used"))
+        }
+        fn cat_read(&mut self, _: &[u8], _: &[u8]) -> CatResult<CatValue> {
+            Err(CatRefusal::new(CAT_ERR_UNKNOWN, "not used"))
+        }
+        fn cat_query(&mut self, _: &[u8], _: u16, _: u8) -> CatResult<CatRows> {
+            Err(CatRefusal::new(CAT_ERR_UNKNOWN, "not used"))
+        }
+        fn cat_exec(&mut self, sql: &[u8]) -> CatResult<CatExec> {
+            self.calls.set(self.calls.get() + 1);
+            *self.sql.borrow_mut() = sql.to_vec();
+            self.reply
+        }
+    }
+
+    fn catalog_args(len: u64, flags: u64) -> [u64; 6] {
+        [0x1000, len, flags, 0, 0, 0]
+    }
+
+    /// M5.2: the syscall's sidecar arm calls the one CatalogOps client, and
+    /// every CAT_ERR_* becomes the CAP family code whose §5.7 map delivers
+    /// the Linux errno. A refused shape reaches NO client call.
+    #[test]
+    fn catalog_exec_reuses_one_client_and_maps_every_refusal() {
+        let sql = b"INSERT INTO m52_bob (id) VALUES (1)";
+        let calls = Rc::new(Cell::new(0));
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let mut boxed: Box<dyn CatalogOps> =
+            Box::new(FakeCatalog::ok(3, calls.clone(), seen.clone()));
+        let mut catalog = Some(&mut boxed);
+        match answer_catalog_exec(&mut catalog, &catalog_args(sql.len() as u64, 0), sql) {
+            Answer::Reply(3, 0) => {}
+            other => panic!("expected the fake's affected rows, got {:?}", other),
+        }
+        assert_eq!(calls.get(), 1, "the arm called the installed client once");
+        assert_eq!(&seen.borrow()[..], sql,
+                   "the copied bytes reached that client unchanged");
+
+        let cases = [
+            (CAT_ERR_NOENT, E_NOENT),
+            (CAT_ERR_PERM, E_PERM),
+            (CAT_ERR_SHAPE, E_INVAL),
+            (CAT_ERR_TYPE, E_INVAL),
+            (CAT_ERR_QUERY, E_INVAL),
+            (CAT_ERR_CONSTRAINT, E_INVAL),
+            (CAT_ERR_CONFLICT, E_CONFLICT),
+            (CAT_ERR_BUSY, E_CONFLICT),
+            (CAT_ERR_INTERNAL, E_IO),
+            (CAT_ERR_UNKNOWN, E_NOSYS),
+            (CAT_EPROTO, E_PROTO),
+            (CAT_EKERNEL, E_IO),
+            (CAT_ECLOSED, E_IO),
+            (CAT_ENOCHAN, E_NOSYS),
+        ];
+        for (status, want) in cases {
+            let calls = Rc::new(Cell::new(0));
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            let mut boxed: Box<dyn CatalogOps> =
+                Box::new(FakeCatalog::err(status, calls.clone(), seen.clone()));
+            let mut catalog = Some(&mut boxed);
+            match answer_catalog_exec(&mut catalog, &catalog_args(sql.len() as u64, 0), sql) {
+                Answer::Reply(0, got) => assert_eq!(got, want,
+                    "CAT_ERR status {} maps to CAP {} (then a Linux errno)", status, want),
+                other => panic!("status {} did not answer a refusal: {:?}", status, other),
+            }
+            assert_eq!(calls.get(), 1,
+                       "a received refusal is still one call to the same client");
+        }
+    }
+
+    /// M5.2: every malformed request is refused before the client is called.
+    /// This is the sidecar twin of the kernel's pre-post copy/verdict gate.
+    #[test]
+    fn catalog_exec_bad_shape_never_reaches_the_client() {
+        let sql = b"DELETE FROM m52_bob";
+        let calls = Rc::new(Cell::new(0));
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let mut boxed: Box<dyn CatalogOps> =
+            Box::new(FakeCatalog::ok(1, calls.clone(), seen.clone()));
+        let mut catalog = Some(&mut boxed);
+
+        for (args, payload, why) in [
+            (catalog_args(0, 0), &sql[..0], "zero length"),
+            (catalog_args(sql.len() as u64 + 1, 0), sql, "length mismatch"),
+            (catalog_args(sql.len() as u64, 1), sql, "reserved flags"),
+            (catalog_args(sql.len() as u64, 0), &sql[..sql.len() - 1], "short payload"),
+        ] {
+            match answer_catalog_exec(&mut catalog, &args, payload) {
+                Answer::Reply(0, E_INVAL) => {}
+                other => panic!("{} was not EINVAL: {:?}", why, other),
+            }
+        }
+        match answer_catalog_exec(&mut catalog, &catalog_args(2, 0), b"a\0b") {
+            Answer::Reply(0, E_INVAL) => {}
+            other => panic!("a NUL was not EINVAL: {:?}", other),
+        }
+        let two = b"INSERT INTO m52_bob (id) VALUES (1); DELETE FROM m52_bob";
+        match answer_catalog_exec(&mut catalog,
+                                  &catalog_args(two.len() as u64, 0), two) {
+            Answer::Reply(0, E_INVAL) => {}
+            other => panic!("a second statement was not EINVAL: {:?}", other),
+        }
+        assert_eq!(calls.get(), 0,
+                   "no malformed request may open a catalog call/transaction");
+
+        let mut none: Option<&mut Box<dyn CatalogOps>> = None;
+        match answer_catalog_exec(&mut none, &catalog_args(sql.len() as u64, 0), sql) {
+            Answer::Reply(0, E_NOSYS) => {}
+            other => panic!("a missing client was not ENOSYS: {:?}", other),
+        }
+    }
 
     /// M1: a SocketOps implementation whose answers are fixed, so the
     /// eight arms' TRANSLATION is what the test observes — the fd table,

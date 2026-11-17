@@ -689,6 +689,37 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         }
     }
 
+    // M5.2: the gate environment's Linux-personality CAT_EXEC probe. It is
+    // spawned only into the gate profile, which is the profile a live run can
+    // create with a bob-owned environment; ordinary tenant environments do
+    // not compile or spawn this arm. The child holds no catalog cap: 334 is
+    // forwarded to THIS sidecar and answered from `booted.proc.catalog`.
+    #[cfg(feature = "m5_catalog_probe")]
+    {
+        if gate {
+            match crate::m5_catalog_probe::spawn(
+                &RealKernel, caps.budget_base, caps.budget_len)
+            {
+                Ok(sp) => match booted.proc.vfs.add_task() {
+                    Ok(vt) => {
+                        if crate::linux::track(
+                            sp.ch_r, sp.ch_w, crate::m5_catalog_probe::PROBE_NAME,
+                            0, sp.heap_base, sp.heap_limit, vt,
+                            RealKernel.sidecar_pid(crate::m5_catalog_probe::PROBE_NAME, 0) as u64,
+                            true,
+                        ) {
+                            klog(b"[M5.2] catalog probe: spawned ch_r=", sp.ch_r, b"");
+                        } else {
+                            klog(b"[M5.2] catalog probe: TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+                        }
+                    }
+                    Err(_) => klog(b"[M5.2] catalog probe: VFS task alloc FAILED ch_r=", sp.ch_r, b""),
+                },
+                Err(rc) => klog(b"[M5.2] catalog probe: spawn FAILED rc=", rc as u32, b""),
+            }
+        }
+    }
+
     // M4.2: the live clone/thread-create proof. Compiled only into an image
     // built with M4_THREAD_PROBE=1; the parent is spawned by the initial
     // POSIX sidecar and its clone child's console output is mirrored to the
@@ -930,8 +961,8 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         // the parked sidecar's quiesce wait set includes these channels
         // (linux::append_wait), so a forward wakes this loop instead of
         // spinning it.
-        let (vfs, net) = booted.proc.vfs_and_net();
-        crate::linux::service(&RealKernel, &booted.console, vfs, net);
+        let (vfs, net, catalog) = booted.proc.vfs_net_catalog();
+        crate::linux::service(&RealKernel, &booted.console, vfs, net, catalog);
         booted.proc.drain_wakes();
         // One-shot boot diagnostic: report what task 0 (init) did and how
         // many tasks are live, so a quiet boot can be told apart from a

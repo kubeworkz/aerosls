@@ -389,6 +389,22 @@ impl<K: Kernel, A: BufferAlloc> ProcManager<K, A> {
         (&mut self.vfs, self.net.as_mut())
     }
 
+    /// M5.2: the three-way split the Linux service pass needs. Its catalog
+    /// arm answers `SYS_SLS_CATALOG_EXEC` through the SAME installed
+    /// `CatalogOps` object the applets' `ctx.catalog()` reaches — one client,
+    /// one channel, no second catalog cap. The service pass borrows the VFS,
+    /// the socket client and the catalog client for the same iteration, so
+    /// the split is explicit for the same reason `vfs_and_net` is.
+    pub fn vfs_net_catalog(
+        &mut self,
+    ) -> (
+        &mut Vfs<K, A>,
+        Option<&mut Box<dyn SocketOps>>,
+        Option<&mut Box<dyn CatalogOps>>,
+    ) {
+        (&mut self.vfs, self.net.as_mut(), self.catalog.as_mut())
+    }
+
     /// Install the catalog client after boot (§9.1). A manifest without a
     /// `catalog` cap leaves this `None`, and `ctx.catalog()` then answers
     /// `None` — an applet reports "no catalog" rather than failing to

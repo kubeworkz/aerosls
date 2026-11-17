@@ -704,6 +704,7 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                 struct LinuxFdWritePlan plan;
                 struct LinuxFutexPlan fplan;
                 struct LinuxClone3Plan c3plan;
+                struct LinuxCatalogExecPlan catplan;
                 struct LinuxFdReplyPlan rplan;
                 /* E7 increment 5 (the fd class): the message that crosses
                  * is the 72-byte description plus, for a write, its bytes
@@ -834,6 +835,23 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                         (unsigned long)largs[1],
                         (unsigned long)largs[0]);
                     return (uint64_t)(int64_t)c3plan.refuse;
+                }
+                /* M5.2: the CAT_EXEC request's first trap. Null/bad pointer,
+                 * zero/over-cap length and any nonzero flags word are refused
+                 * HERE — no sidecar post, so no catalog transaction. The
+                 * bytes' NUL/second-statement verdict runs after the checked
+                 * copy below, for the same reason. */
+                catplan = linux_catalog_exec_plan(num, largs);
+                if (catplan.refuse) {
+                    kernel_serial_printf(
+                        "[E7] linux catalog exec sql_len=%lu at 0x%lx "
+                        "refused before post: %s\n",
+                        (unsigned long)largs[1],
+                        (unsigned long)largs[0],
+                        catplan.refuse == -LINUX_EFAULT
+                            ? "bad user span"
+                            : "bad length or reserved flags");
+                    return (uint64_t)(int64_t)catplan.refuse;
                 }
                 plan = linux_fd_write_plan(num, largs);
                 if (plan.refuse) {
@@ -1187,6 +1205,33 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                         return (uint64_t)(int64_t)(-LINUX_EFAULT);
                     }
                     fwd_len += c3plan.payload_len;
+                } else if (catplan.len) {
+                    /* The SQL rides the SAME attach buffer as the fd/path
+                     * classes. The copy walker reads only this task's own
+                     * user pages, and the verdict is the first-cut single
+                     * statement rule; either refusal returns before the
+                     * post, so the sidecar never sees a request that could
+                     * open a catalog transaction. */
+                    uint8_t *cp = fwd + sizeof(struct SLSLinuxSyscallRequest);
+                    if (linux_user_copy_out(cp, cur->cr3, catplan.src,
+                                            catplan.len) != 0) {
+                        kernel_serial_printf(
+                            "[E7] linux catalog exec %lu bytes at 0x%lx "
+                            "refused before post: unmapped or non-user span "
+                            "(copy)\n",
+                            (unsigned long)catplan.len,
+                            (unsigned long)catplan.src);
+                        return (uint64_t)(int64_t)(-LINUX_EFAULT);
+                    }
+                    if (linux_catalog_sql_verdict(cp, catplan.len) != 0) {
+                        kernel_serial_printf(
+                            "[E7] linux catalog exec %lu bytes at 0x%lx "
+                            "refused before post: NUL or a second statement\n",
+                            (unsigned long)catplan.len,
+                            (unsigned long)catplan.src);
+                        return (uint64_t)(int64_t)(-LINUX_EINVAL);
+                    }
+                    fwd_len += catplan.len;
                 } else if (plan.len) {
                     if (linux_user_copy_out(fwd + sizeof(struct SLSLinuxSyscallRequest),
                                             cur->cr3, plan.src,
@@ -1918,6 +1963,14 @@ uint64_t do_syscall(uint64_t num, void* arg) {
     // gated identically.
     case SYS_SLS_LINUX_SPAWN:
         return sys_sls_linux_spawn((struct SLSCreateSidecarRequest*)arg);
+
+    /* M5.2: 334 is the Linux-personality CAT_EXEC. A non-Linux task that
+     * traps it is refused by name here — the number has no SLS arm and must
+     * never become a silent success just because it is not in the legacy
+     * jump table. The Linux branch above is the only path to the sidecar's
+     * CatalogOps. */
+    case SYS_SLS_CATALOG_EXEC:
+        return (uint64_t)(int64_t)(-CAP_ENOSYS);
 
     /* M4.2: the sidecar's held thread-create primitive (330). */
     case SYS_SLS_LINUX_GROUP_SWEEP:

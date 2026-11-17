@@ -364,9 +364,9 @@ fi
 # entry loop must actually call the service arm, the answers must be the
 # census's honest set (§11 Q5), and the reply must be the exact struct the
 # kernel's apply will accept or every exchange dies -EPROTO.
-if grep -qF 'crate::linux::service(&RealKernel, &booted.console, vfs, net);' "$LRE" && \
+if grep -qF 'crate::linux::service(&RealKernel, &booted.console, vfs, net, catalog);' "$LRE" && \
    grep -qF 'crate::linux::append_wait(' "$LRE"; then
-    ok "K. the entry loop services the Linux children (with the VFS the file class now needs) AND adds their channels to the quiesce wait set (a forward wakes the sidecar, not an idle pass)"
+    ok "K. the entry loop services the Linux children (with the VFS, socket client and catalog client the classes need) AND adds their channels to the quiesce wait set (a forward wakes the sidecar, not an idle pass)"
 else
     bad "K. the entry loop no longer services or wait-qualifies the Linux children — every forwarded syscall sits unanswered in the channel queue while its task parks forever"
 fi
@@ -535,8 +535,8 @@ if grep -qF 'let (lo, hi) = expected_req_range(num, &args);' "$LRS" && \
    grep -qF 'if rr.len < lo || rr.len > hi {' "$LRS" && \
    grep -qF 'const FD_PAYLOAD_CAP: usize = 1024;' "$LRS" && \
    grep -qF 'match console.write(&payload[..len]) {' "$LRS" && \
-   grep -qF 'crate::linux::service(&RealKernel, &booted.console, vfs, net);' "$LRE"; then
-    ok "M6. the sidecar checks EVERY request's attached bytes against expected_req_range — exact for write/sig (the kernel's attach twin), a cap-bounded range for the path numbers (rename carries two strings) — a drifted attach arrives only as a wrong length and dies -EPROTO, the write chunk cap is intact, the perform happens on the loop's console, and service is handed that console (plus the VFS)"
+   grep -qF 'crate::linux::service(&RealKernel, &booted.console, vfs, net, catalog);' "$LRE"; then
+    ok "M6. the sidecar checks EVERY request's attached bytes against expected_req_range — exact for write/sig (the kernel's attach twin), a cap-bounded range for the path and SQL attaches — a drifted attach arrives only as a wrong length and dies -EPROTO, the write chunk cap is intact, the perform happens on the loop's console, and service is handed that console (plus the VFS, socket and catalog clients)"
 else
     bad "M6. the payload invariant, the chunk cap, the console perform, or the service's console hand-off is gone — bytes the task did not write could be performed, or a write could never reach the serial log it exists to prove"
 fi
