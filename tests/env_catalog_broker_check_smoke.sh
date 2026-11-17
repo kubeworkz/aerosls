@@ -41,8 +41,11 @@
 #       boundary lookup each deleted once, and the parse/lookup pair
 #       genuinely SWAPPED (the mutation order teeth exist for: a gate
 #       moved still compiles and still looks like a gate);
-#   Q3. read-only posture: a sixth verb, a second execution site, the
-#       unknown-verb refusal, and the send length (g.off -> off).
+#   Q3. CAT_EXEC on both halves: number, encoder, and the exec applet;
+#   Q4. the EXEC arm's gates: PERM_WRITE, the commit check, parse order
+#       and the no-autocommit rule;
+#   Q5. one execution site, six verbs, the unknown-verb refusal, and the
+#       send length (g.off -> off).
 #
 # Mutations run on COPIES (seed() below): the real tree is never touched,
 # and the baseline run on an unmutated copy — plus the final run on the
@@ -136,7 +139,9 @@ echo "  C1. the cap: the tenant manifest names kernel.env.catalog (and the syste
 echo "  C2. the client: four verbs, the status word, the refusal text, and the wiring to a command"
 echo "  Q1. CAT_QUERY on both halves, with matching numbers and a reachable sql subcommand"
 echo "  Q2. the QUERY arm's gates in order (parse -> lookup -> uid -> policy -> execute)"
-echo "  Q3. read-only: five verbs, one execution site, and the reply sent at g.off"
+echo "  Q3. CAT_EXEC on both halves: verb 6/statuses, encoder, and catalog exec"
+echo "  Q4. the EXEC arm's gates in order, with commit checked before CAT_OK"
+echo "  Q5. one execution site, six verbs, and the query reply sent at g.off"
 echo "========================================================================"
 echo
 
@@ -171,7 +176,7 @@ sed -i 's/return cap_create_sidecar_in_personality(parent_pid, manifest, manifes
 tooth hop2-broken W2 "the delegation no longer reaches cap_create_sidecar_in_personality()" "$W/t4"
 
 seed "$W/t5"
-sed -i 's/if (!env_catalog_service_register(k_rd, k_wr,/if (!env_catalog_service_register(k_rd, kw,/' "$W/t5/kernel/cap.c"
+sed -i 's/env_catalog_service_register_owned(k_rd, k_wr,/env_catalog_service_register_owned(k_rd, kw,/' "$W/t5/kernel/cap.c"
 tooth register-call-gone W2 "the arm no longer registers the channel with the service" "$W/t5"
 
 # ─── W3. the gate on the kernel-owned name, and its two ORDER teeth ───────
@@ -427,24 +432,68 @@ awk '
 mv "$W/t46/kernel/env_catalog.c.new" "$W/t46/kernel/env_catalog.c"
 tooth parse-after-lookup Q2 "the statement now parses AFTER a name is resolved" "$W/t46"
 
-# ─── Q3. still read-only, and the reply is the cursor's own length ─────────
+# ─── Q3. CAT_EXEC on both halves ───────────────────────────────────────────
 seed "$W/t47"
-sed -i 's/cat_send(e, cat_reply, g.off, tag);/cat_send(e, cat_reply, off, tag);/' \
-    "$W/t47/kernel/env_catalog.c"
-tooth send-length-rewound Q3 "the reply would promise rows its bytes do not carry" "$W/t47"
+sed -i 's/pub const CAT_EXEC: u16 = 6;/pub const CAT_EXEC: u16 = 7;/' \
+    "$W/t47/user/proto/src/lib.rs"
+tooth exec-number-mismatch Q3 "proto's CAT_EXEC no longer carries the kernel's number 6" "$W/t47"
 
 seed "$W/t48"
-sed -i '/    { 5, "CAT_QUERY" },/a\    { 6, "CAT_WRITE" },' "$W/t48/kernel/env_catalog.c"
-tooth sixth-verb-added Q3 "the table grew a verb §9.1 did not answer for" "$W/t48"
+sed -i '/pub fn encode_cat_exec_body(/d' "$W/t48/user/proto/src/lib.rs"
+tooth exec-encoder-gone Q3 "the write request has no shared encoder" "$W/t48"
 
 seed "$W/t49"
-sed -i '/sql_execute(uid, (const char\*)cat_sql, &cat_result)/a\        sql_execute(uid, retry_sql, &cat_result); /* plausible re-run */' \
-    "$W/t49/kernel/env_catalog.c"
-tooth second-execution-site Q3 "a statement could run through a path the gate above never admitted" "$W/t49"
+sed -i '/"exec" => {/d' "$W/t49/user/sidecar/src/applets.rs"
+tooth exec-applet-gone Q3 "the write path has no user in a shell" "$W/t49"
 
+# ─── Q4. the EXEC arm's gates and its transaction ─────────────────────────
 seed "$W/t50"
-sed -i '/cat_refuse(e, ty, tag, CAT_ERR_UNKNOWN, 0);/d' "$W/t50/kernel/env_catalog.c"
-tooth unknown-refusal-gone Q3 "a verb outside the table would be answered something else" "$W/t50"
+sed -i 's/catalog_check_access(uid, table, PERM_WRITE)/catalog_check_access(uid, table, PERM_READ)/' \
+    "$W/t50/kernel/env_catalog.c"
+tooth write-policy-read-bit Q4 "the write now asks for the READ bit" "$W/t50"
+
+seed "$W/t51"
+sed -i '/if (sql_tx_commit(txn_id) != 0) {/d' "$W/t51/kernel/env_catalog.c"
+tooth commit-check-gone Q4 "a failed commit would still be reported as CAT_OK" "$W/t51"
+
+seed "$W/t52"
+awk '
+    index($0, "case CAT_VERB_EXEC:") { inx = 1 }
+    inx && !held && index($0, "if (sql_parse((const char*)cat_sql, &cat_stmt, perr,") == 9 {
+        p1 = $0; getline p2; held = 1; next
+    }
+    inx && held && index($0, "int idx = cat_find((const uint8_t*)table, tlen, e->partition);") {
+        print; print p1; print p2; held = 0; next
+    }
+    { print }
+    END { if (held) { print p1; print p2 } }
+' "$W/t52/kernel/env_catalog.c" > "$W/t52/kernel/env_catalog.c.new"
+mv "$W/t52/kernel/env_catalog.c.new" "$W/t52/kernel/env_catalog.c"
+tooth write-parse-after-lookup Q4 "the write now resolves its target before parsing" "$W/t52"
+
+seed "$W/t53"
+sed -i '/uint64_t txn_id = sql_tx_begin();/a\        sql_execute(uid, cat_sql, \&cat_result); /* plausible autocommit */' \
+    "$W/t53/kernel/env_catalog.c"
+tooth write-autocommit-site Q4 "the write arm runs through an autocommit path" "$W/t53"
+
+# ─── Q5. one execution site, six verbs, cursor's own length ────────────────
+seed "$W/t54"
+sed -i 's/cat_send(e, cat_reply, g.off, tag);/cat_send(e, cat_reply, off, tag);/' \
+    "$W/t54/kernel/env_catalog.c"
+tooth send-length-rewound Q5 "the reply would promise rows its bytes do not carry" "$W/t54"
+
+seed "$W/t55"
+sed -i '/    { 6, "CAT_EXEC" },/a\    { 7, "CAT_WRITE" },' "$W/t55/kernel/env_catalog.c"
+tooth seventh-verb-added Q5 "the table grew a verb the surface does not answer for" "$W/t55"
+
+seed "$W/t56"
+sed -i '/sql_execute_tx(txn_id, uid, (const char\*)cat_sql, &cat_result)/a\        sql_execute_tx(txn_id, uid, retry_sql, &cat_result); /* plausible re-run */' \
+    "$W/t56/kernel/env_catalog.c"
+tooth second-write-site Q5 "a statement could run through a path the gate above never admitted" "$W/t56"
+
+seed "$W/t57"
+sed -i '/cat_refuse(e, ty, tag, CAT_ERR_UNKNOWN, 0);/d' "$W/t57/kernel/env_catalog.c"
+tooth unknown-refusal-gone Q5 "a verb outside the table would be answered something else" "$W/t57"
 
 echo
 echo "────────────────────────────────────────────────────────────────────────"

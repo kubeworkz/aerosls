@@ -97,7 +97,7 @@ use alloc::vec::Vec;
 use aerosls_procmgr::{is_child, signal_exit_code, BlockReason, Ctx, ProcManager, ReadBlock, SIGCONT, SIGINT, SIGTSTP, Step, WaitOutcome, WriteBlock};
 use aerosls_proto::kabi::Kernel;
 use aerosls_proto::catalops::{CatalogOps, CatRefusal};
-use aerosls_proto::{CAT_ERR_UNKNOWN, CAT_LIST_PAGE_MAX, CAT_MAX_KEY, CAT_MAX_NAME, CAT_QUERY_ROWS_MAX, CAT_SQL_MAX};
+use aerosls_proto::{CAT_ERR_INTERNAL, CAT_LIST_PAGE_MAX, CAT_MAX_KEY, CAT_MAX_NAME, CAT_QUERY_ROWS_MAX, CAT_SQL_MAX};
 use aerosls_vfs::{BufferAlloc, Errno, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, Vfs};
 
 /// The boot script every POSIX sidecar init runs.
@@ -5935,6 +5935,9 @@ pub unsafe extern "C" fn posix_serial_print(_data: *const u8, _len: u32) {}
 /// catalog sql [--page N] [--limit N] SELECT ...
 ///                              a page of rows from a row-set table, run by
 ///                              the kernel's own SQL engine (limit 1..=4)
+/// catalog exec INSERT|UPDATE|DELETE ...
+///                              one mediated write, committed by the kernel
+///                              only when its owner and PERM_WRITE gates pass
 /// ```
 ///
 /// A refusal prints the service's OWN rendered line ("CAT_STAT refused by
@@ -6172,6 +6175,37 @@ fn catalog_run(cat: &mut dyn CatalogOps, argv: &[String]) -> (i32, String) {
             }
         }
 
+        "exec" => {
+            if argv.len() <= 2 {
+                return (
+                    2,
+                    alloc::format!("catalog: exec needs a statement\n{}", catalog_usage()),
+                );
+            }
+            let mut sql = String::new();
+            for (n, w) in argv[2..].iter().enumerate() {
+                if n > 0 {
+                    sql.push(' ');
+                }
+                sql.push_str(w);
+            }
+            if sql.is_empty() || sql.len() > CAT_SQL_MAX {
+                return (
+                    2,
+                    alloc::format!(
+                        "catalog: statement must be 1..={} bytes (this one is {})\n{}",
+                        CAT_SQL_MAX,
+                        sql.len(),
+                        catalog_usage()
+                    ),
+                );
+            }
+            match cat.cat_exec(sql.as_bytes()) {
+                Ok(r) => (0, alloc::format!("{} row(s) affected\n", r.affected_rows)),
+                Err(e) => catalog_refusal(&e),
+            }
+        }
+
         other => (
             2,
             alloc::format!("catalog: unknown subcommand '{}'\n{}", other, catalog_usage()),
@@ -6185,7 +6219,7 @@ fn catalog_run(cat: &mut dyn CatalogOps, argv: &[String]) -> (i32, String) {
 /// own statuses (0xFFxx — no channel answered) is prefixed so a reader can
 /// tell a service answer from a local failure.
 fn catalog_refusal(e: &CatRefusal) -> (i32, String) {
-    if e.status <= CAT_ERR_UNKNOWN {
+    if e.status <= CAT_ERR_INTERNAL {
         (1, alloc::format!("{}\n", e.as_str()))
     } else {
         (1, alloc::format!("catalog: {}\n", e.as_str()))
@@ -6193,7 +6227,7 @@ fn catalog_refusal(e: &CatRefusal) -> (i32, String) {
 }
 
 fn catalog_usage() -> &'static str {
-    "usage: catalog info | list [page] [page_size] | stat NAME | read NAME KEY\n  sql [--page N] [--limit N] <SELECT statement>\n"
+    "usage: catalog info | list [page] [page_size] | stat NAME | read NAME KEY\n  sql [--page N] [--limit N] <SELECT statement>\n  exec <INSERT|UPDATE|DELETE statement>\n"
 }
 
 pub fn register_default_applets<K: Kernel, A: BufferAlloc>(pm: &mut ProcManager<K, A>) {
@@ -6967,7 +7001,7 @@ mod tests {
 
     use super::catalog_run;
     use aerosls_proto::catalops::{CatPage, CatRefusal, CatResult, CatalogOps};
-    use aerosls_proto::{CatCell, CatInfo, CatRows, CatStat, CatValue, CAT_ERR_NOENT};
+    use aerosls_proto::{CatCell, CatExec, CatInfo, CatRows, CatStat, CatValue, CAT_ERR_NOENT};
 
     /// A catalog channel that RECORDS what the applet asked for and answers
     /// with a scripted page. This applet's whole job is argv -> request and
@@ -6978,6 +7012,8 @@ mod tests {
         page: u16,
         limit: u8,
         rows: CatRows,
+        exec_sql: Vec<u8>,
+        exec_affected: u32,
         refuse: Option<&'static str>,
     }
 
@@ -7019,6 +7055,16 @@ mod tests {
                 None => Ok(self.rows.clone()),
             }
         }
+        fn cat_exec(&mut self, sql: &[u8]) -> CatResult<CatExec> {
+            self.exec_sql = sql.to_vec();
+            match self.refuse {
+                Some(t) => Err(CatRefusal::new(CAT_ERR_NOENT, t)),
+                None => Ok(CatExec {
+                    affected_rows: self.exec_affected,
+                    flags: 0,
+                }),
+            }
+        }
     }
 
     fn fake() -> FakeCat {
@@ -7027,6 +7073,8 @@ mod tests {
             page: 0,
             limit: 0,
             rows: sql_page(),
+            exec_sql: Vec::new(),
+            exec_affected: 2,
             refuse: None,
         }
     }
@@ -7095,5 +7143,31 @@ mod tests {
         assert_eq!(code, 2, "a limit past the service's cap is a usage error");
         assert!(text.contains("--limit must be 1..=4"), "{:?}", text);
         assert!(c.sql.is_empty(), "nothing was sent");
+    }
+
+    /// `catalog exec` rejoins the shell's tokens into one statement and
+    /// prints the committed affected-row count — the only success body a
+    /// write has. No uid and no page are placed on the wire.
+    #[test]
+    fn exec_rejoins_the_statement_and_prints_the_committed_count() {
+        let mut c = fake();
+        c.exec_affected = 3;
+        let (code, text) = catalog_run(
+            &mut c,
+            &argv_of(&["catalog", "exec", "UPDATE", "stock", "SET", "qty", "=", "'9'"]),
+        );
+        assert_eq!(code, 0, "{}", text);
+        assert_eq!(c.exec_sql, b"UPDATE stock SET qty = '9'");
+        assert!(text.contains("3 row(s) affected"), "{:?}", text);
+    }
+
+    #[test]
+    fn exec_refusal_is_the_services_own_line() {
+        let mut c = fake();
+        c.refuse = Some("CAT_EXEC refused by kernel.env.catalog: row-level policy denied this uid PERM_WRITE");
+        let (code, text) = catalog_run(&mut c, &argv_of(&["catalog", "exec", "DELETE", "FROM", "stock"]));
+        assert_eq!(code, 1, "a refusal is not success: {:?}", text);
+        assert!(text.contains("CAT_EXEC refused by kernel.env.catalog"), "{:?}", text);
+        assert!(text.contains("PERM_WRITE"), "{:?}", text);
     }
 }

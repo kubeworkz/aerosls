@@ -52,7 +52,7 @@
 #   C1. THE CAP: the tenant manifest names kernel.env.catalog (rights 0x7,
 #       counted by n_caps, absent from the SYSTEM profile, pinned by its
 #       own test) — the half of reachability that lives in user/;
-#   C2. THE CLIENT: proto's CAT_* wire, the four original CatalogOps verbs, the
+#   C2. THE CLIENT: proto's CAT_* wire, the CatalogOps read verbs, the
 #       status-word discipline and the rendered refusal, and the chain
 #       manifest -> BIB -> boot -> procmgr -> the catalog applet.
 #   Q1. THE SQL PATH IS ON THE WIRE: verb 5 and status 5 exist on BOTH
@@ -66,11 +66,18 @@
 #       QUERY arm, because every one of these properties is a property of
 #       WHERE the line sits. A gate moved after execution still compiles
 #       and still looks like a gate;
-#   Q3. IT IS STILL READ-ONLY: exactly one sql_execute() call site, exactly
-#       five verbs in the table, the unknown-verb refusal intact, and the
-#       reply sent at the length the CURSOR wrote (g.off) — the last is the
-#       bug this clause set was written beside: sending the pre-fetch `off`
-#       hands a client a head that promises rows the bytes do not carry.
+#   Q3. THE WRITE PATH IS ON THE WIRE: verb 6, the four new statuses, the
+#       encoder/decoder, the trait method and the `catalog exec` subcommand
+#       all exist on both halves with the same numbers;
+#   Q4. THE ORDER of CAT_EXEC's gates — parse before lookup, the partition
+#       before the owner, the bound owner before PERM_WRITE, policy before
+#       the transaction, and begin -> execute_tx -> commit, with CAT_OK
+#       written only after the commit. The write arm must not call the
+#       autocommit sql_execute();
+#   Q5. ONE EXECUTION SITE, SIX VERBS: exactly one sql_execute_tx() write
+#       site, exactly six verbs in the table, the unknown-verb refusal
+#       intact, and the query reply sent at the length the CURSOR wrote
+#       (g.off).
 #
 # ─── What this guard does NOT do ──────────────────────────────────────────
 # It has no live arm: §9.1 names a source guard, and the verbs are executed
@@ -154,6 +161,14 @@ fn_body() {
 # class an ordering tooth exists to catch.
 q_arm() {
     awk 'index($0, "case CAT_VERB_QUERY:") { grab = 1 }
+         grab && /^    default:/ { exit }
+         grab { print }' "$1"
+}
+# x_arm <file> — the CAT_VERB_EXEC arm up to the default: that follows it.
+# Q4's positions are inside this slice, not the whole file, for the same
+# reason q_arm exists: another verb's identical line must not satisfy them.
+x_arm() {
+    awk 'index($0, "case CAT_VERB_EXEC:") { grab = 1 }
          grab && /^    default:/ { exit }
          grab { print }' "$1"
 }
@@ -494,27 +509,151 @@ else
 fi
 clause "$c11" Q2 "CAT_QUERY's gates run in order: parse, resolve inside the registered partition, uid off proc_table, policy, then execute"
 
-# ── Q3. STILL READ-ONLY, and the reply is the length the cursor wrote ─────
-# §9.1's whole first-cut argument is that a read-only surface has no
-# write-path permission question to get wrong. Three teeth keep it that
-# way, and the fourth keeps the page honest: the send length is g.off (the
-# offset the cursor advanced to), not the pre-fetch `off`, because a head
-# that reports rows the bytes do not carry is a parse failure waiting to be
-# blamed on the client.
+# ── Q3. THE MEDIATED WRITE PATH IS ON THE WIRE ───────────────────────────
+# CAT_EXEC is only reachable if BOTH halves carry it with the same numbers,
+# body shapes and statuses. The applet is the last hop: a verb no caller can
+# send is the same failure as a verb the kernel never answers.
 c12=$fail
+has "$HDR" '#define CAT_VERB_EXEC  6u' ||
+    bad "Q3. env_catalog.h: CAT_VERB_EXEC is gone — the kernel has no write verb"
+for s in 'CAT_ERR_CONFLICT 6u' 'CAT_ERR_CONSTRAINT 7u' 'CAT_ERR_BUSY 8u' 'CAT_ERR_INTERNAL 10u'; do
+    has "$HDR" "#define $s" ||
+        bad "Q3. env_catalog.h: $s is missing — a write refusal would have no status of its own"
+done
+has "$ENV" '{ 6, "CAT_EXEC" },' ||
+    bad "Q3. env_catalog.c: the verb table no longer names CAT_EXEC"
+has "$PROTO" 'pub const CAT_EXEC: u16 = 6;' ||
+    bad "Q3. proto: CAT_EXEC is not declared, or is not 6 — the two halves would disagree"
+has "$PROTO" 'pub const CAT_ERR_CONFLICT: u16 = 6;' ||
+    bad "Q3. proto: CAT_ERR_CONFLICT is not declared, or is not 6"
+has "$PROTO" 'pub const CAT_ERR_CONSTRAINT: u16 = 7;' ||
+    bad "Q3. proto: CAT_ERR_CONSTRAINT is not declared, or is not 7"
+has "$PROTO" 'pub const CAT_ERR_BUSY: u16 = 8;' ||
+    bad "Q3. proto: CAT_ERR_BUSY is not declared, or is not 8"
+has "$PROTO" 'pub const CAT_ERR_INTERNAL: u16 = 10;' ||
+    bad "Q3. proto: CAT_ERR_INTERNAL is not declared, or is not 10"
+has "$PROTO" 'pub fn encode_cat_exec_body(' ||
+    bad "Q3. proto: no encoder for CAT_EXEC's request body"
+has "$PROTO" 'pub fn parse_cat_exec_body(' ||
+    bad "Q3. proto: no decoder for CAT_EXEC's reply body"
+has "$PROTO" 'CAT_ERR_CONFLICT => "CONFLICT",' ||
+    bad "Q3. proto: the new statuses have no names — a truncated reply would print '?'"
+has "$CATOPS" 'fn cat_exec(&mut self' ||
+    bad "Q3. catalops.rs: the trait no longer offers cat_exec"
+has "$CLIENT" 'self.call(CAT_EXEC,' ||
+    bad "Q3. catalog_client.rs: the client no longer sends CAT_EXEC"
+has "$CLIENT" 'encode_cat_exec_body(sql, &mut body)' ||
+    bad "Q3. catalog_client.rs: the client no longer builds the request through the shared encoder"
+has "$CLIENT" 'parse_cat_exec_body(&reply[CAT_BODY..])' ||
+    bad "Q3. catalog_client.rs: the client no longer decodes the committed count"
+has "$APPLETS" '"exec" => {' ||
+    bad "Q3. applets.rs: the 'catalog exec' subcommand is gone — the write path has no user in a shell"
+has "$APPLETS" 'cat.cat_exec(sql.as_bytes())' ||
+    bad "Q3. applets.rs: the exec arm no longer calls cat_exec"
+has "$APPLETS" 'exec <INSERT|UPDATE|DELETE statement>' ||
+    bad "Q3. applets.rs: the usage line no longer documents exec"
+clause "$c12" Q3 "CAT_EXEC and its statuses exist on both halves, with an encoder/decoder and the 'catalog exec' command"
+
+# ── Q4. THE ORDER of CAT_EXEC's gates ────────────────────────────────────
+# The write arm adds an identity gate and a transaction to CAT_QUERY's order.
+# Each line below is a property of POSITION inside the CAT_EXEC arm: a policy
+# check after sql_tx_begin still denies, but only after a transaction exists;
+# a commit that is not checked would report OK for a write that never landed.
+c13=$fail
+XARM="$(x_arm "$ENV")"
+if [ -z "$XARM" ]; then
+    bad "Q4. env_catalog.c: the CAT_VERB_EXEC arm is gone"
+else
+    hasstr "$XARM" 'sql_parse((const char*)cat_sql, &cat_stmt, perr,' ||
+        bad "Q4. env_catalog.c: the EXEC arm no longer parses the statement"
+    hasstr "$XARM" 'int idx = cat_find((const uint8_t*)table, tlen, e->partition);' ||
+        bad "Q4. env_catalog.c: the write target is not resolved inside the registered partition"
+    hasstr "$XARM" 'uint32_t uid = e->owner_uid;' ||
+        bad "Q4. env_catalog.c: the write no longer uses the registration-bound owner"
+    hasstr "$XARM" 'if (uid == 0) {' ||
+        bad "Q4. env_catalog.c: a zero owner no longer has its own refusal — a write could fall back to a pid identity"
+    hasstr "$XARM" 'catalog_check_access(uid, table, PERM_WRITE)' ||
+        bad "Q4. env_catalog.c: the write policy check is gone, or no longer asks for PERM_WRITE"
+    hasstr "$XARM" 'if (cat_fk_connected(o->object_id)) {' ||
+        bad "Q4. env_catalog.c: the foreign-key-connected refusal is gone"
+    hasstr "$XARM" 'uint64_t txn_id = sql_tx_begin();' ||
+        bad "Q4. env_catalog.c: the write no longer opens an explicit transaction"
+    hasstr "$XARM" 'sql_execute_tx(txn_id, uid, (const char*)cat_sql, &cat_result)' ||
+        bad "Q4. env_catalog.c: the write no longer executes inside its explicit transaction"
+    hasstr "$XARM" 'if (sql_tx_commit(txn_id) != 0) {' ||
+        bad "Q4. env_catalog.c: the commit result is no longer checked"
+    hasstr "$XARM" 'cat_hdr(ty, CAT_OK, 0);' ||
+        bad "Q4. env_catalog.c: the success reply is gone"
+    if hasstr "$XARM" 'sql_execute(uid,'; then
+        bad "Q4. env_catalog.c: the write arm calls the autocommit sql_execute() — a commit failure would be unobservable"
+    fi
+    a="$(lines "$XARM" 'sql_parse((const char*)cat_sql, &cat_stmt, perr,')"
+    b="$(lines "$XARM" 'int idx = cat_find((const uint8_t*)table, tlen, e->partition);')"
+    if [ -z "$a" ] || [ -z "$b" ] || [ "$a" -ge "$b" ]; then
+        bad "Q4. env_catalog.c: the write must PARSE before any table name is resolved"
+    fi
+    a="$b"
+    b="$(lines "$XARM" 'uint32_t uid = e->owner_uid;')"
+    if [ -z "$a" ] || [ -z "$b" ] || [ "$a" -ge "$b" ]; then
+        bad "Q4. env_catalog.c: the partition lookup must come BEFORE the owner gate"
+    fi
+    a="$b"
+    b="$(lines "$XARM" 'if (uid == 0) {')"
+    if [ -z "$a" ] || [ -z "$b" ] || [ "$a" -ge "$b" ]; then
+        bad "Q4. env_catalog.c: the bound owner must be read BEFORE it is checked"
+    fi
+    a="$b"
+    b="$(lines "$XARM" 'catalog_check_access(uid, table, PERM_WRITE)')"
+    if [ -z "$a" ] || [ -z "$b" ] || [ "$a" -ge "$b" ]; then
+        bad "Q4. env_catalog.c: the owner gate must come BEFORE PERM_WRITE"
+    fi
+    a="$b"
+    b="$(lines "$XARM" 'uint64_t txn_id = sql_tx_begin();')"
+    if [ -z "$a" ] || [ -z "$b" ] || [ "$a" -ge "$b" ]; then
+        bad "Q4. env_catalog.c: PERM_WRITE must be checked BEFORE the transaction starts"
+    fi
+    a="$b"
+    b="$(lines "$XARM" 'sql_execute_tx(txn_id, uid, (const char*)cat_sql, &cat_result)')"
+    if [ -z "$a" ] || [ -z "$b" ] || [ "$a" -ge "$b" ]; then
+        bad "Q4. env_catalog.c: the transaction must begin BEFORE the statement executes"
+    fi
+    a="$b"
+    b="$(lines "$XARM" 'if (sql_tx_commit(txn_id) != 0) {')"
+    if [ -z "$a" ] || [ -z "$b" ] || [ "$a" -ge "$b" ]; then
+        bad "Q4. env_catalog.c: the statement must execute BEFORE its commit"
+    fi
+    a="$b"
+    b="$(lines "$XARM" 'cat_hdr(ty, CAT_OK, 0);')"
+    if [ -z "$a" ] || [ -z "$b" ] || [ "$a" -ge "$b" ]; then
+        bad "Q4. env_catalog.c: CAT_OK must be written only AFTER the commit succeeds"
+    fi
+fi
+clause "$c13" Q4 "CAT_EXEC runs parse -> partition -> bound owner -> PERM_WRITE -> begin -> execute_tx -> commit -> CAT_OK"
+
+# ── Q5. one execution site, six verbs, the query page's own length ───────
+# A second autocommit execution site would be a path that runs a statement
+# the gates never admitted; a second explicit write site would be a path that
+# can skip the commit check. Six verbs is the table's whole surface now, and
+# the page's send length stays g.off so a head cannot promise rows its bytes
+# do not carry.
+c14=$fail
 NSQL="$(grep -cF 'sql_execute(uid,' "$ENV" 2>/dev/null)"
 if [ "$NSQL" != "1" ]; then
-    bad "Q3. env_catalog.c: expected exactly ONE sql_execute() call site, found $NSQL — a second would be a path that runs a statement the gate above never admitted"
+    bad "Q5. env_catalog.c: expected exactly ONE sql_execute() call site, found $NSQL"
+fi
+NTX="$(grep -cF 'sql_execute_tx(txn_id, uid,' "$ENV" 2>/dev/null)"
+if [ "$NTX" != "1" ]; then
+    bad "Q5. env_catalog.c: expected exactly ONE sql_execute_tx() write site, found $NTX"
 fi
 NVERBS="$(grep -cE '\{ [0-9], "CAT_[A-Z]+" \},' "$ENV" 2>/dev/null)"
-if [ "$NVERBS" != "5" ]; then
-    bad "Q3. env_catalog.c: expected exactly FIVE verbs in the table, found $NVERBS — a sixth would be a surface §9.1 did not answer for"
+if [ "$NVERBS" != "6" ]; then
+    bad "Q5. env_catalog.c: expected exactly SIX verbs in the table, found $NVERBS"
 fi
 has "$ENV" 'cat_refuse(e, ty, tag, CAT_ERR_UNKNOWN, 0)' ||
-    bad "Q3. env_catalog.c: the unknown-verb refusal is gone — a verb outside the table would be answered something else"
+    bad "Q5. env_catalog.c: the unknown-verb refusal is gone"
 has "$ENV" 'cat_send(e, cat_reply, g.off, tag);' ||
-    bad "Q3. env_catalog.c: the CAT_QUERY reply is not sent at g.off — sending the pre-fetch offset hands back a head that promises rows the bytes do not carry"
-clause "$c12" Q3 "one execution site, five verbs, unknown still refused, and the reply sent at the cursor's own length"
+    bad "Q5. env_catalog.c: the CAT_QUERY reply is not sent at g.off"
+clause "$c14" Q5 "one autocommit site, one explicit write site, six verbs, unknown still refused, and the query reply sent at the cursor's own length"
 
 echo ""
 if [ "$fail" -eq 0 ]; then

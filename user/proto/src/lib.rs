@@ -570,6 +570,11 @@ pub const CAT_READ: u16 = 4;
 /// a SELECT is the only statement the service admits, so this verb's
 /// existence does not put a write verb in the table.
 pub const CAT_QUERY: u16 = 5;
+/// The mediated write path: one INSERT/UPDATE/DELETE against a row-set table
+/// this partition owns, run in an explicit transaction and answered only
+/// after the commit succeeds. The statement still carries no identity and
+/// no second table; the kernel binds both.
+pub const CAT_EXEC: u16 = 6;
 
 pub const CAT_FLAG_ERROR: u16 = 0x0001;
 
@@ -586,7 +591,19 @@ pub const CAT_ERR_TYPE: u16 = 4;
 /// refused the statement — the engine's own message arrives as the refusal
 /// text, so a caller sees the parse error rather than a number.
 pub const CAT_ERR_QUERY: u16 = 5;
+/// The write raced another transaction. Retryable only after this reply was
+/// received: a lost reply leaves the outcome unknown, not failed.
+pub const CAT_ERR_CONFLICT: u16 = 6;
+/// A UNIQUE / NOT NULL / RANGE / REFERENCE check refused the write.
+pub const CAT_ERR_CONSTRAINT: u16 = 7;
+/// The transaction could not start because the engine is at its active
+/// transaction ceiling. Retryable, with the same lost-reply caveat.
+pub const CAT_ERR_BUSY: u16 = 8;
 pub const CAT_ERR_UNKNOWN: u16 = 9;
+/// The transaction or commit failed after the statement was admitted. The
+/// outcome is not known to the caller from this status alone; re-read the
+/// table before retrying.
+pub const CAT_ERR_INTERNAL: u16 = 10;
 
 pub const CAT_MAX_NAME: usize = 64;   // OBJECT_NAME_LEN
 pub const CAT_MAX_KEY: usize = 64;    // RECORD_KEY_LEN
@@ -608,6 +625,8 @@ pub const CAT_TEXT_CAP: usize = 192;
 pub const CAT_SQL_MAX: usize = 512;
 pub const CAT_QUERY_ROWS_MAX: u8 = 4;
 pub const CAT_QUERY_BODY_MAX: usize = 3072;
+/// CAT_EXEC reply body: `{affected_rows u32, flags u16, reserved u16}`.
+pub const CAT_EXEC_BODY: usize = 8;
 
 /// The 16-byte CAT_* frame header — the payload of a channel MSG envelope.
 #[repr(C)]
@@ -757,7 +776,11 @@ pub fn cat_status_name(status: u16) -> &'static str {
         CAT_ERR_SHAPE => "SHAPE",
         CAT_ERR_TYPE => "TYPE",
         CAT_ERR_QUERY => "QUERY",
+        CAT_ERR_CONFLICT => "CONFLICT",
+        CAT_ERR_CONSTRAINT => "CONSTRAINT",
+        CAT_ERR_BUSY => "BUSY",
         CAT_ERR_UNKNOWN => "UNKNOWN",
+        CAT_ERR_INTERNAL => "INTERNAL",
         _ => "?",
     }
 }
@@ -888,6 +911,14 @@ pub struct CatRows {
     pub rows: alloc::vec::Vec<alloc::vec::Vec<CatCell>>,
 }
 
+/// CAT_EXEC's answer: the number of rows the committed transaction changed.
+/// `flags` is reserved for future write semantics and is zero in this cut.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CatExec {
+    pub affected_rows: u32,
+    pub flags: u16,
+}
+
 /// CAT_QUERY request body: `{sql_len u16, page u16, limit u8, flags u8,
 /// sql[sql_len]}`. Returns the body length, or None for a statement the wire
 /// cannot carry (empty, longer than CAT_SQL_MAX, a NUL inside it — a NUL
@@ -910,6 +941,38 @@ pub fn encode_cat_query_body(sql: &[u8], page: u16, limit: u8, out: &mut [u8]) -
     out[5] = 0; // flags: reserved, must be 0
     out[6..6 + sql.len()].copy_from_slice(sql);
     Some(6 + sql.len())
+}
+
+/// CAT_EXEC request body: `{sql_len u16, flags u16, sql[sql_len]}`. One DML
+/// statement, no identity and no page — the caller states neither its uid
+/// nor a second table. Refused locally for the same shape rules the service
+/// applies: empty, past `CAT_SQL_MAX`, or carrying a NUL (which would make
+/// the kernel parse a prefix of what the caller believes it sent).
+pub fn encode_cat_exec_body(sql: &[u8], out: &mut [u8]) -> Option<usize> {
+    if sql.is_empty()
+        || sql.len() > CAT_SQL_MAX
+        || sql.contains(&0)
+        || out.len() < 4 + sql.len()
+    {
+        return None;
+    }
+    put_u16(out, 0, sql.len() as u16);
+    put_u16(out, 2, 0); // flags: reserved, must be 0
+    out[4..4 + sql.len()].copy_from_slice(sql);
+    Some(4 + sql.len())
+}
+
+/// CAT_EXEC reply body: the engine's affected-row count and reserved flags.
+/// There is no cursor, no rows and no last-insert-id: a write's observable
+/// answer is how many rows it committed.
+pub fn parse_cat_exec_body(body: &[u8]) -> Option<CatExec> {
+    if body.len() < CAT_EXEC_BODY {
+        return None;
+    }
+    Some(CatExec {
+        affected_rows: read_u32(body, 0),
+        flags: read_u16(body, 4),
+    })
 }
 
 /// CAT_QUERY reply body (starting at CAT_BODY): the head, then the column
@@ -1253,6 +1316,31 @@ mod tests {
 
         assert_eq!(encode_cat_read_body(b"", &[b'k'], &mut out), None);
         assert_eq!(encode_cat_read_body(b"t", &[b'k'; 64], &mut out), None);
+    }
+
+    #[test]
+    fn cat_exec_request_and_reply_pin_the_write_wire() {
+        let mut out = [0u8; 4 + CAT_SQL_MAX];
+        assert_eq!(encode_cat_exec_body(b"", &mut out), None);
+        assert_eq!(encode_cat_exec_body(&[b'x'; CAT_SQL_MAX + 1], &mut out), None);
+        assert_eq!(encode_cat_exec_body(b"DELETE\0FROM t", &mut out), None);
+        let n = encode_cat_exec_body(b"DELETE FROM t", &mut out).unwrap();
+        assert_eq!(n, 4 + 13);
+        assert_eq!(read_u16(&out, 0), 13, "sql_len");
+        assert_eq!(read_u16(&out, 2), 0, "flags stay reserved");
+        assert_eq!(&out[4..n], b"DELETE FROM t");
+
+        let mut body = [0u8; CAT_EXEC_BODY];
+        put_u32(&mut body, 0, 3);
+        put_u16(&mut body, 4, 0);
+        put_u16(&mut body, 6, 0);
+        let r = parse_cat_exec_body(&body).unwrap();
+        assert_eq!((r.affected_rows, r.flags), (3, 0));
+        assert!(parse_cat_exec_body(&body[..CAT_EXEC_BODY - 1]).is_none());
+        assert_eq!(cat_status_name(CAT_ERR_CONFLICT), "CONFLICT");
+        assert_eq!(cat_status_name(CAT_ERR_CONSTRAINT), "CONSTRAINT");
+        assert_eq!(cat_status_name(CAT_ERR_BUSY), "BUSY");
+        assert_eq!(cat_status_name(CAT_ERR_INTERNAL), "INTERNAL");
     }
 
     #[test]

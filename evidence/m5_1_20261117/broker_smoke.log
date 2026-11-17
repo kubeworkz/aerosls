@@ -1,0 +1,83 @@
+env_catalog_broker_check_smoke — teeth for §9.1's five wires, its
+boundary, and the tenant half (cap + client) that makes it reachable:
+  W1. the Makefile compiles the service
+  W2. cap_create_sidecar() reaches the registration, hop by hop
+  W3. the arm is gated on kernel.env.catalog, in the right place, and answers under it
+  W4. console_service_tick() skips the catalog channel's kernel slot
+  W5. the tick runs in microkernel_service_poll(), after net_socket_service_tick()
+  B1. the boundary: filtered on the registered partition, as absence, unmovable by the wire
+  B2. the boundary's evidence: the host test links the real service and is RUN
+  C1. the cap: the tenant manifest names kernel.env.catalog (and the system one does not)
+  C2. the client: four verbs, the status word, the refusal text, and the wiring to a command
+  Q1. CAT_QUERY on both halves, with matching numbers and a reachable sql subcommand
+  Q2. the QUERY arm's gates in order (parse -> lookup -> uid -> policy -> execute)
+  Q3. CAT_EXEC on both halves: verb 6/statuses, encoder, and catalog exec
+  Q4. the EXEC arm's gates in order, with commit checked before CAT_OK
+  Q5. one execution site, six verbs, and the query reply sent at g.off
+========================================================================
+
+ok:   baseline — the seeded copy passes the guard unmutated
+
+TOOTH OK   makefile-line-gone — guard exited 1 naming W1
+TOOTH OK   entry-renamed — guard exited 1 naming W2
+TOOTH OK   hop1-broken — guard exited 1 naming W2
+TOOTH OK   hop2-broken — guard exited 1 naming W2
+TOOTH OK   register-call-gone — guard exited 1 naming W2
+TOOTH OK   gate-removed — guard exited 1 naming W3
+TOOTH OK   arm-left-branch — guard exited 1 naming W3
+TOOTH OK   arm-after-fallback — guard exited 1 naming W3
+TOOTH OK   refusal-unbranded — guard exited 1 naming W3
+TOOTH OK   console-include-gone — guard exited 1 naming W4
+TOOTH OK   console-skip-gone — guard exited 1 naming W4
+TOOTH OK   poll-include-gone — guard exited 1 naming W5
+TOOTH OK   poll-tick-gone — guard exited 1 naming W5
+TOOTH OK   tick-order-flipped — guard exited 1 naming W5
+TOOTH OK   lookup-filter-gone — guard exited 1 naming B1
+TOOTH OK   list-filter-gone — guard exited 1 naming B1
+TOOTH OK   count-predicate-loosened — guard exited 1 naming B1
+TOOTH OK   partition-store-gone — guard exited 1 naming B1
+TOOTH OK   partition-not-from-pd — guard exited 1 naming B1
+TOOTH OK   foreign-answered-perm — guard exited 1 naming B1
+TOOTH OK   perm-refusal-gone — guard exited 1 naming B1
+TOOTH OK   count-called-off-register — guard exited 1 naming B1
+TOOTH OK   test-not-real-service — guard exited 1 naming B2
+TOOTH OK   indistinguishable-clause-gone — guard exited 1 naming B2
+TOOTH OK   boundary-clause-gone — guard exited 1 naming B2
+TOOTH OK   no-extractable-build-line — guard exited 1 naming B2
+TOOTH OK   runner-glob-gone — guard exited 1 naming B2
+TOOTH OK   tenant-peer-rewritten — guard exited 1 naming C1
+TOOTH OK   cap-not-counted — guard exited 1 naming C1
+TOOTH OK   catalog-rights-shrunk — guard exited 1 naming C1
+TOOTH OK   system-gains-catalog — guard exited 1 naming C1
+TOOTH OK   pin-peer-rotated — guard exited 1 naming C1
+TOOTH OK   magic-collision — guard exited 1 naming C2
+TOOTH OK   verb-dropped — guard exited 1 naming C2
+TOOTH OK   status-skipped — guard exited 1 naming C2
+TOOTH OK   refusal-text-dropped — guard exited 1 naming C2
+TOOTH OK   bib-cap-unresolved — guard exited 1 naming C2
+TOOTH OK   client-not-installed — guard exited 1 naming C2
+TOOTH OK   applet-unregistered — guard exited 1 naming C2
+TOOTH OK   query-number-mismatch — guard exited 1 naming Q1
+TOOTH OK   query-not-in-table — guard exited 1 naming Q1
+TOOTH OK   sql-subcommand-gone — guard exited 1 naming Q1
+TOOTH OK   query-trait-method-gone — guard exited 1 naming Q1
+TOOTH OK   policy-check-gone — guard exited 1 naming Q2
+TOOTH OK   pid-partition-check-gone — guard exited 1 naming Q2
+TOOTH OK   parse-after-lookup — guard exited 1 naming Q2
+TOOTH OK   exec-number-mismatch — guard exited 1 naming Q3
+TOOTH OK   exec-encoder-gone — guard exited 1 naming Q3
+TOOTH OK   exec-applet-gone — guard exited 1 naming Q3
+TOOTH OK   write-policy-read-bit — guard exited 1 naming Q4
+TOOTH OK   commit-check-gone — guard exited 1 naming Q4
+TOOTH OK   write-parse-after-lookup — guard exited 1 naming Q4
+TOOTH OK   write-autocommit-site — guard exited 1 naming Q4
+TOOTH OK   send-length-rewound — guard exited 1 naming Q5
+TOOTH OK   seventh-verb-added — guard exited 1 naming Q5
+TOOTH OK   second-write-site — guard exited 1 naming Q5
+TOOTH OK   unknown-refusal-gone — guard exited 1 naming Q5
+
+────────────────────────────────────────────────────────────────────────
+tooth baseline on the REAL tree (seed fidelity, second control):
+ok:   baseline — the real tree passes the guard
+
+env_catalog_broker_check_smoke: 58 teeth held, 0 lost

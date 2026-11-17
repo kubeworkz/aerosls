@@ -240,6 +240,23 @@ impl<K: Kernel> CatalogClient<K> {
         parse_cat_rows(&reply[CAT_BODY..])
             .ok_or_else(|| CatRefusal::new(CAT_EPROTO, "catalog: CAT_QUERY body is short"))
     }
+
+    /// CAT_EXEC: one DML statement, run and committed by the kernel before
+    /// the reply is sent. The statement carries no uid and no second table;
+    /// the channel's bound owner and the kernel's PERM_WRITE check decide
+    /// whether it runs. Only an OK reply means the commit succeeded.
+    pub fn exec(&mut self, sql: &[u8]) -> CatResult<CatExec> {
+        let mut body = [0u8; 4 + CAT_SQL_MAX];
+        let n = encode_cat_exec_body(sql, &mut body).ok_or_else(|| {
+            CatRefusal::new(
+                CAT_ERR_SHAPE,
+                "CAT_EXEC statement must be 1..=512 bytes with no NUL",
+            )
+        })?;
+        let reply = self.call(CAT_EXEC, &body[..n])?;
+        parse_cat_exec_body(&reply[CAT_BODY..])
+            .ok_or_else(|| CatRefusal::new(CAT_EPROTO, "catalog: CAT_EXEC body is short"))
+    }
 }
 
 /// The trait procmgr and the applets see. Kept as inherent methods above so
@@ -260,6 +277,9 @@ impl<K: Kernel> CatalogOps for CatalogClient<K> {
     }
     fn cat_query(&mut self, sql: &[u8], page: u16, limit: u8) -> CatResult<CatRows> {
         self.query(sql, page, limit)
+    }
+    fn cat_exec(&mut self, sql: &[u8]) -> CatResult<CatExec> {
+        self.exec(sql)
     }
 }
 
@@ -581,6 +601,40 @@ mod tests {
         assert_eq!(e.status, CAT_EPROTO);
     }
 
+    /// CAT_EXEC: one statement and no page on the wire; the reply is only
+    /// the committed affected-row count. A zero-length or NUL-carrying
+    /// statement is refused locally, exactly as the service would.
+    #[test]
+    fn exec_sends_one_statement_and_reads_the_committed_count() {
+        let mut body = [0u8; CAT_EXEC_BODY];
+        body[0..4].copy_from_slice(&3u32.to_le_bytes());
+        let (k, mut client) = client_with(vec![reply(CAT_EXEC, 0, CAT_OK, &body)]);
+
+        let r = client.exec(b"DELETE FROM t").expect("committed");
+        assert_eq!((r.affected_rows, r.flags), (3, 0));
+        let sent = k.sent.lock();
+        assert_eq!(sent.len(), CatFrame::SIZE + 4 + 13);
+        assert_eq!(le16(&sent, 10), CAT_EXEC);
+        assert_eq!(le16(&sent, CAT_HDR), 13, "sql_len");
+        assert_eq!(le16(&sent, CAT_HDR + 2), 0, "reserved flags");
+        assert_eq!(&sent[CAT_HDR + 4..], b"DELETE FROM t");
+    }
+
+    #[test]
+    fn an_unservable_write_never_reaches_the_wire() {
+        let (k, mut client) = client_with(Vec::new());
+        assert_eq!(client.exec(b"").expect_err("empty").status, CAT_ERR_SHAPE);
+        assert_eq!(
+            client.exec(&[b'x'; CAT_SQL_MAX + 1]).expect_err("long").status,
+            CAT_ERR_SHAPE
+        );
+        assert_eq!(
+            client.exec(b"DELETE\0FROM t").expect_err("NUL").status,
+            CAT_ERR_SHAPE
+        );
+        assert!(k.sent.lock().is_empty());
+    }
+
     /// The trait object procmgr stores — the path `ctx.catalog()` takes and
     /// the `catalog` applet calls through — dispatches every verb, each
     /// answered by its own scripted reply.
@@ -614,6 +668,7 @@ mod tests {
                 CAT_ERR_NOENT,
                 b"CAT_QUERY refused by kernel.env.catalog",
             ),
+            reply(CAT_EXEC, 0, CAT_OK, &[2, 0, 0, 0, 0, 0, 0, 0]),
         ]);
 
         {
@@ -632,13 +687,14 @@ mod tests {
                 ops.cat_query(b"SELECT * FROM t", 0, 4).expect_err("NOENT").status,
                 CAT_ERR_NOENT
             );
+            assert_eq!(ops.cat_exec(b"DELETE FROM t").expect("committed").affected_rows, 2);
         }
         let sent = k.sent.lock();
         assert_eq!(
             sent.len(),
-            CatFrame::SIZE + 6 + 15,
-            "CAT_QUERY's body is head + statement"
+            CatFrame::SIZE + 4 + 13,
+            "CAT_EXEC's body is the length/flags head + statement"
         );
-        assert_eq!(le16(&sent, 10), CAT_QUERY, "the last verb on the wire");
+        assert_eq!(le16(&sent, 10), CAT_EXEC, "the last verb on the wire");
     }
 }

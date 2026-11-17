@@ -1,0 +1,70 @@
+==> waiting for the cluster to form (up to 180s)
+   node 3 answering on port 3003
+ok:   /api/health answers a live kernel body on node 3
+ok:   POST /api/partitions defined 'e91cat-1700420' as partition 3
+ok:   uid 1000 assigned to partition 3 (the seeded object's owner resolves here)
+ok:   the foreign object 'e91cat_out_1700420' exists in the global catalog (GET /api/objects names it)
+ok:   namespace seeded: 'e91cat_in_1700420'.k1 inside partition 3, 'e91cat_out_1700420' outside it
+ok:   POST /api/partition/3/env created env 11 in partition 3
+ok:   `env list 3` reports env 11 with posix_pid=104
+ok:   `env attach 3 11` carries the environment's own announcement ('[env-id] index=1 pid=104')
+ok:   CAT_INFO names partition 3 — the channel registered under the environment's own partition
+ok:   CAT_INFO carries the service's real ceilings
+ok:   the environment's manifest named the catalog cap (ctx.catalog() was Some)
+ok:   `catalog list 0 8` header is 'page 0: 1 of 1 objects (partition 3)'
+ok:   count 1 <= total 1 — the page is a slice of the namespace it reports
+ok:   the in-partition object is in the page
+ok:   the foreign object is NOT in the page (the boundary holds from inside)
+ok:   `catalog list 99 8` is empty (page 99: 0 of T) — the kernel skips by page*page_size
+ok:   the service says so in words, rather than returning a plausible page
+ok:   `catalog stat e91cat_in_1700420` returns the real metadata (type=6 tier=2 pages=1 owner=1000 database=0)
+ok:   the foreign name comes back as the service's OWN refusal, visible in this transcript
+ok:   …and with no data — a refusal is not a shaped answer
+ok:   CAT_READ returns the record field `insert` wrote, byte for byte
+ok:   a key that does not exist is refused by name rather than answered with an empty value
+ok:   table object 'e91tbl_1700420' exists in the catalog (GET /api/objects names it)
+ok:   `table create e91tbl_1700420` promoted it to a row-set table (uses_rowstore — what CAT_QUERY requires)
+ok:   the seed INSERT wrote one row carrying 'e91q-1700420'
+ok:   CAT_QUERY returns the row the seed INSERT wrote, through the boundary, on this environment's console
+ok:   the head reports exactly the one row the seed inserted (the cursor's own count)
+ok:   the column names the service reported travel with the page
+ok:   the in-partition read is served, not refused
+ok:   a DDL statement is refused BY NAME — the mediated surface admits SELECT alone
+ok:   …and with no page — a refusal is not a shaped answer
+ok:   the refused DROP never executed — the row is still there (deny-then-execute would have lost it)
+ok:   no page — a foreign table yields nothing
+ok:   the answer is absence (NOENT), not a PERM that names the object back
+ok:   certainly not this partition's data
+==> M5.0: low-privilege environment in partition 3
+ok:   low-privilege token authenticates as uid 1001 (ROLE_APP_USER)
+ok:   low-privilege peer created env 12 in partition 3 (index 2)
+ok:   low-privilege env 12 is listed with posix_pid=106
+ok:   peer attach reaches the low-privilege environment's own console ('[env-id] index=2 pid=106')
+ok:   peer identity is bound to the catalog channel — dave's table is denied by row-level policy
+ok:   the low-privilege environment did not receive dave's row (no uid-0 inheritance)
+ok:   the denial carried no result page
+==> M5.1: mediated writes in partition 3
+ok:   bob's uid 1001 is assigned to partition 3
+ok:   bob (1001) owns row-set table 'e91wtbl_1700420' in partition 3
+ok:   CAT_EXEC INSERT succeeds for the channel's bound owner — the commit is acknowledged
+ok:   the owner's own table is not refused
+ok:   native SQL observes bob's committed row '1700420' — CAT_OK meant committed
+ok:   CAT_EXEC UPDATE commits against the owner's table
+ok:   native SQL observes the committed UPDATE value '1700421'
+ok:   CAT_EXEC DELETE commits against the owner's table
+ok:   native SQL no longer sees '1700421' — the DELETE committed
+ok:   dave's table is read-only (perm_mask=0x4), so PERM_WRITE is the deciding gate
+ok:   a non-owner write is refused PERM_WRITE by name
+ok:   a refusal carries no affected-row body
+ok:   dave's row 'e91q-1700420' is still there — the refused DELETE did not execute
+ok:   a DDL statement is refused by name — CAT_EXEC is not ALTER
+ok:   no affected-row body is sent with the refusal
+ok:   a foreign write target is absence, not a PERM that confirms it
+ok:   the foreign object was never resolved far enough to describe its kind
+ok:   a foreign write produced no affected-row body
+OK: §9.1's catalog surface answered end to end — a partition and an environment created in it, info/list/stat/read/sql driven into that environment through `env attach`, every answer (all refusals included) came back on the environment's own console, and M5.1's CAT_EXEC committed the owner's write while refusing the non-owner's
+==> teardown
+ok:   env 11 left the listing
+ok:   guest env 12 left the listing
+ok:   partition 3 destroyed (its objects and the uid assignment went with it)
+ok:   the foreign object 'e91cat_out_1700420' was removed

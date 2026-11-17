@@ -1,0 +1,242 @@
+ok:   verb 1 is named CAT_INFO
+ok:   verb 2 is named CAT_LIST
+ok:   verb 3 is named CAT_STAT
+ok:   verb 4 is named CAT_READ
+ok:   verb 5 is named CAT_QUERY
+ok:   verb 6 is named CAT_EXEC
+ok:   verb 0 is outside the table
+ok:   verb 7 is outside the table (the table stops at CAT_EXEC)
+ok:   an absurd verb resolves to no name
+ok:   a known verb renders its name plus the one refusal text
+ok:   the renderer returns the length it wrote
+ok:   an unknown verb renders with its number, not nothing
+ok:   a small cap truncates and STILL terminates
+ok:   cap 1 yields the empty string, still terminated
+ok:   a null buffer writes nothing
+ok:   no channel is registered before cap.c wires one
+ok:   the kernel end of the tenant's catalog cap registers
+ok:   its kernel CHAN_R is claimed (console_service must skip it)
+ok:   the kernel CHAN_W is not a drain slot and is not claimed
+ok:   an unminted slot is not claimed
+ok:   a second sidecar registers — in a DIFFERENT partition
+ok:   both are live
+ok:   the same (partition, pid) re-registers (environment re-created)
+ok:   re-registering replaces instead of adding a stale entry
+ok:   the replaced entry's old kernel end is no longer claimed
+ok:   the new kernel end is the claimed one
+ok:   six more sidecars register (registry at capacity)
+ok:   the registry holds exactly ENV_CATALOG_SERVICE_MAX channels
+ok:   a ninth channel is refused — the registry is full
+ok:   the neighbour's row is attached to the neighbour's object (the leak clause below now has something to leak)
+ok:   and nothing is parked in an inactive slot
+ok:   the sidecar sends CAT_INFO
+ok:   CAT_INFO is answered with its full body
+ok:   the reply echoes the CAT_INFO verb
+ok:   the handshake is not an error
+ok:   status CAT_OK
+ok:   max_objects is the real CATALOG_MAX_OBJECTS
+ok:   max_name is the real cap
+ok:   max_value is the real cap
+ok:   the handshake answers partition 1 — the identity the boundary is computed from, so a tenant can verify it
+ok:   the sidecar sends CAT_LIST
+ok:   CAT_LIST is answered
+ok:   partition 1's namespace holds four objects
+ok:   the total matches the count on a single page
+ok:   the list reports its own partition
+ok:   every object in partition 1 is listed
+ok:   THE BOUNDARY: partition 2's object is absent from partition 1's list entirely — not listed-with-a-denial, ABSENT
+ok:   the first entry carries its object type
+ok:   page 0 of size 2
+ok:   a page of size 2 returns exactly 2
+ok:   the total is still 4 across pages
+ok:   page 1 of size 2
+ok:   page 1 returns the remaining 2
+ok:   page 2 (past the end)
+ok:   a page past the end answers an empty page, not an error
+ok:   page_size 0
+ok:   page_size 0 is refused CAT_ERR_SHAPE by name
+ok:   page_size 4095
+ok:   an over-large page_size is refused CAT_ERR_SHAPE
+ok:   the sidecar sends CAT_STAT
+ok:   CAT_STAT is answered with its full body
+ok:   CAT_STAT is not an error
+ok:   the type is the object's own
+ok:   the storage tier is the object's own
+ok:   the page count is the object's own
+ok:   the owner uid is the object's own (partition 1 + 1000)
+ok:   the sidecar sends CAT_STAT on the NEIGHBOUR's object
+ok:   THE BOUNDARY: a partition-2 object answers CAT_ERR_NOENT to a partition-1 channel — not CAT_ERR_PERM, which would confirm the name exists somewhere
+ok:   the sidecar sends CAT_STAT on a name that never existed
+ok:   a name that never existed answers CAT_ERR_NOENT too
+ok:   THE TWO ANSWERS ARE INDISTINGUISHABLE — the property §9.1 rests on, asserted rather than assumed
+ok:   the sidecar sends CAT_READ on the neighbour's row
+ok:   THE BOUNDARY: reading a partition-2 row through partition 1 answers NOENT, not the value
+ok:   the neighbour's value never appears in the reply
+ok:   the sidecar sends CAT_READ
+ok:   CAT_READ is not an error
+ok:   the reply echoes the key's length
+ok:   the reply echoes the key
+ok:   the value comes back byte-exact from the legacy record path
+ok:   a prefix key
+ok:   a key that is only a prefix of a real key answers NOENT
+ok:   a missing key
+ok:   a missing key on a real object answers NOENT
+ok:   a key on a record-less object
+ok:   a record-less object answers NOENT for any key
+ok:   the sidecar sends CAT_STAT on SYSTEM_METADATA
+ok:   SYSTEM_METADATA answers CAT_ERR_PERM — visibly different from the NOENT a foreign name gets
+ok:   the refusal is rendered BY NAME
+ok:   the sidecar sends CAT_READ on SYSTEM_METADATA
+ok:   CAT_READ on SYSTEM_METADATA is CAT_ERR_PERM too
+ok:   the sidecar sends CAT_STAT on the rowstore table
+ok:   CAT_STAT still answers for a rowstore table — hiding its metadata would make the READ refusal unexplainable
+ok:   the sidecar sends CAT_READ on the rowstore table
+ok:   CAT_READ on a rowstore table answers CAT_ERR_TYPE — Phase 24's own refusal, inherited by name
+ok:   the TYPE refusal is rendered by the verb's name too
+ok:   the sidecar sends verb 9 (a write verb that does not exist)
+ok:   an unknown verb is refused CAT_ERR_UNKNOWN — a write path is answered like any other unknown, not specially
+ok:   the unknown verb is rendered WITH ITS NUMBER
+ok:   the sidecar sends a NET_* frame on a catalog channel
+ok:   a NET_* frame is DROPPED, never answered as a verb
+ok:   a bodyless CAT_LIST
+ok:   a bodyless CAT_LIST is CAT_ERR_SHAPE
+ok:   a bodyless CAT_STAT
+ok:   a bodyless CAT_STAT is CAT_ERR_SHAPE
+ok:   a bodyless CAT_READ
+ok:   a bodyless CAT_READ is CAT_ERR_SHAPE
+ok:   a CAT_STAT whose name length exceeds the frame
+ok:   an over-long name length is CAT_ERR_SHAPE, not a buffer read
+ok:   a zero-length name
+ok:   a zero-length name is CAT_ERR_SHAPE
+ok:   the NEIGHBOUR sends CAT_LIST
+ok:   partition 2's namespace holds exactly one object
+ok:   and it reports partition 2
+ok:   partition 2's own object is the one it sees
+ok:   partition 1's names never appear in partition 2's list
+ok:   the neighbour reads partition 1's row
+ok:   the boundary holds in BOTH directions
+ok:   the sidecar sends CAT_QUERY
+ok:   a SELECT on this partition's own row-set table is SERVED
+ok:   the head reports 2 columns and 2 rows
+ok:   and the WHOLE result's row count, so a client can page
+ok:   the column names come from the result
+ok:   the first cell is the row's own value
+ok:   and the second row's second cell too
+ok:   the engine ran ONCE, as the uid proc_table[pid] holds — the wire states no identity, and this is where one came from
+ok:   catalog_check_access was asked PERM_READ for THIS table and THIS uid — the SQL path's own policy check, surfaced
+ok:   the result set's cursor is closed
+ok:   page 1 of the same query
+ok:   a page past the end is an EMPTY page with more=0, not an error
+ok:   limit 2 of 3 rows
+ok:   more=1 when the row bound stopped the page
+ok:   a row with a NULL cell
+ok:   NULL carries its own flag with no bytes — the distinction rowstore's null_mask exists to preserve
+ok:   a projected column
+ok:   a projection is served with one column
+ok:   the cell is the REQUESTED column's, mapped through the layout
+ok:   partition 3's channel SELECTs partition 4's table
+ok:   THE BOUNDARY: a foreign table answers CAT_ERR_NOENT
+ok:   and the engine never ran — no cross-partition row was read, not even transiently
+ok:   no foreign value of any kind reaches the reply
+ok:   a table that never existed
+ok:   and a name that never existed answers the SAME NOENT — the two are indistinguishable here too
+ok:   DELETE FROM stock
+ok:   refused BY NAME with the construct it refuses
+ok:   a refused shape never reaches the engine
+ok:   UPDATE stock SET qty = 1
+ok:   refused BY NAME with the construct it refuses
+ok:   a refused shape never reaches the engine
+ok:   CREATE TABLE x (a STRING)
+ok:   refused BY NAME with the construct it refuses
+ok:   a refused shape never reaches the engine
+ok:   SELECT * FROM stock JOIN kv3 ON stock.sku = kv3.sku
+ok:   refused BY NAME with the construct it refuses
+ok:   a refused shape never reaches the engine
+ok:   SELECT * FROM stock UNION SELECT * FROM stock
+ok:   refused BY NAME with the construct it refuses
+ok:   a refused shape never reaches the engine
+ok:   WITH x AS (SELECT * FROM stock) SELECT * FROM x
+ok:   refused BY NAME with the construct it refuses
+ok:   a refused shape never reaches the engine
+ok:   SELECT * FROM stock WHERE qty = (SELECT qty FROM stock)
+ok:   refused BY NAME with the construct it refuses
+ok:   a refused shape never reaches the engine
+ok:   a legacy KV table
+ok:   a non-rowstore table is refused BY NAME, pointing at the verb that does serve it
+ok:   SYSTEM_METADATA
+ok:   SYSTEM_METADATA answers PERM here too, before execution
+ok:   a query policy denies
+ok:   a policy denial is CAT_ERR_PERM BY NAME, not 0 rows
+ok:   and the engine never ran — denied and empty stay different answers
+ok:   partition 5's channel SELECTs its own table
+ok:   a descriptor whose partition != the channel's is PERM — the registration outlived the partition it was minted in
+ok:   partition 4's channel SELECTs its own table
+ok:   a pid with no live descriptor is PERM — no identity, no read
+ok:   a statement the engine refuses
+ok:   CAT_ERR_QUERY carries the ENGINE's own reason
+ok:   and the refusal still names its verb
+ok:   a statement that will not parse
+ok:   a PARSE failure is CAT_ERR_QUERY, and it happened before any name was resolved or any policy asked
+ok:   a dotted catalog name in FROM
+ok:   a dotted name answers the PARSER's own refusal, not NOENT — the object exists and is still visible to CAT_STAT
+ok:   limit 5
+ok:   a limit past CAT_QUERY_ROWS_MAX is CAT_ERR_SHAPE
+ok:   a statement past the cap
+ok:   a statement past CAT_SQL_MAX is CAT_ERR_SHAPE
+ok:   a statement with a NUL
+ok:   an embedded NUL is CAT_ERR_SHAPE — no prefix is ever parsed
+ok:   a bodyless CAT_QUERY
+ok:   a bodyless CAT_QUERY is CAT_ERR_SHAPE
+ok:   the sidecar sends CAT_EXEC for an UPDATE
+ok:   an UPDATE on the caller's own table is SERVED
+ok:   the reply carries the committed affected-row count and zero flags
+ok:   the write ran in an explicit transaction and committed once
+ok:   the engine and policy both ran as the REGISTRATION-BOUND uid, with PERM_WRITE on the named table
+ok:   CREATE TABLE x (a STRING)
+ok:   a non-DML or second-table write is TYPE, by name
+ok:   and it never opened a transaction
+ok:   SELECT * FROM stock
+ok:   a non-DML or second-table write is TYPE, by name
+ok:   and it never opened a transaction
+ok:   UPDATE stock SET qty = 1 WHERE qty = (SELECT qty FROM inv)
+ok:   a non-DML or second-table write is TYPE, by name
+ok:   and it never opened a transaction
+ok:   partition 3's channel writes partition 4's table
+ok:   THE BOUNDARY: a foreign write target answers NOENT before any identity or policy is consulted
+ok:   a write to SYSTEM_METADATA
+ok:   SYSTEM_METADATA answers PERM for a write too
+ok:   a write to the legacy KV table
+ok:   a non-row-set table is TYPE, before any write is attempted
+ok:   a channel is registered with a zero owner binding
+ok:   a channel with no bound owner attempts a write
+ok:   a zero owner is PERM BY NAME and never becomes a pid uid
+ok:   the owned channel is restored for the remaining write clauses
+ok:   the descriptor's owner differs from the channel binding
+ok:   the write runs as the BOUND owner — the descriptor cannot silently re-identify it
+ok:   policy denies PERM_WRITE
+ok:   a PERM_WRITE denial is PERM BY NAME and never reaches the engine
+ok:   a table with an OUTBOUND reference attempts a write
+ok:   an outbound FK edge is refused before the transaction
+ok:   a table another table REFERENCES attempts a write
+ok:   an INBOUND FK edge is refused too — a DELETE cannot cascade through a table the wire did not name
+ok:   the transaction table is full
+ok:   CAT_ERR_BUSY is answered before the statement runs
+ok:   a write conflict
+ok:   WRITE_CONFLICT is CAT_ERR_CONFLICT, and the transaction rolled back
+ok:   a constraint violation
+ok:   a constraint violation keeps its own status and the engine's reason
+ok:   the statement runs but the commit fails
+ok:   a failed commit is CAT_ERR_INTERNAL, never CAT_OK
+ok:   the failed transaction is rolled back and the caller is told the outcome is unknown
+ok:   a bodyless CAT_EXEC
+ok:   a bodyless CAT_EXEC is SHAPE
+ok:   a CAT_EXEC with reserved flags set
+ok:   nonzero reserved flags are SHAPE
+ok:   a CAT_EXEC with an embedded NUL
+ok:   an embedded NUL is SHAPE — no prefix is ever parsed
+ok:   a CAT_EXEC statement past CAT_SQL_MAX
+ok:   a statement past CAT_SQL_MAX is SHAPE
+ok:   the refusal counter counted the refusals above
+ok:   the drop counter counted exactly the one non-CAT frame
+
+env_catalog_host_test: 240 passed, 0 failed

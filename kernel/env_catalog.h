@@ -13,8 +13,9 @@
  * tenant reading another tenant's rows, which is LPAR Phase 11 undone by a
  * list call). This increment picks a third, and writes down why:
  *
- *   READ-ONLY, PARTITION-SCOPED, MEDIATED BY A SECOND KERNEL-BROKERED
- *   SERVICE — "kernel.env.catalog".
+ *   PARTITION-SCOPED, MEDIATED BY A SECOND KERNEL-BROKERED SERVICE —
+ *   "kernel.env.catalog" — with reads plus one explicit, owner-gated write
+ *   path (CAT_EXEC).
  *
  * WHY A SECOND SERVICE AND NOT A WIDER FIRST ONE.
  * net_socket_service.c proved the shape on the network side: a tenant's
@@ -44,14 +45,15 @@
  *   CAT_QUERY one SELECT -> a page of rows from a row-set table, through
  *             the REAL SQL engine (sql_parse/sql_execute), which is how a
  *             rowstore-backed table is read — see the CAT_QUERY section.
+ *   CAT_EXEC  one INSERT/UPDATE/DELETE -> the number of rows committed by an
+ *             explicit transaction, run only for the channel's bound owner
+ *             with PERM_WRITE on a row-set table in this partition.
  *
- * There is no write verb. Not "write is refused" — the verb does not exist
- * in the table, and a type outside the table is refused BY NAME with its
- * number, which is how P2's increment 1 already handles the verbs no
- * increment builds. A read-only surface has no write-path permission
- * question to get wrong, which is exactly why it is the right first cut:
- * the hard part of interop is the ISOLATION, and isolation is fully
- * exercised by reading.
+ * CAT_EXEC is deliberately one narrow step beyond the read-only first cut:
+ * one DML statement, one table, no DDL, no second table, no wire identity.
+ * The write's permission question is answered by the SAME two facts the
+ * read path already established — the channel's authenticated partition and
+ * its bound owner — not by anything the wire can assert.
  *
  * THE BOUNDARY: partition_id, and absence rather than denial.
  * Every verb is answered against object_catalog[] entries whose
@@ -130,7 +132,8 @@
  *                 a table with no matching rows. Refusing before executing
  *                 is what makes "denied" and "empty" different answers.
  *   9. EXECUTE  — sql_execute(uid, sql, ...), read-only: step 3 admitted
- *                 SELECT alone, so there is no write verb here either.
+ *                 SELECT alone. The write path is CAT_EXEC, below, and it
+ *                 never executes through this arm.
  *
  * The reply is one page: {ncols, nrows, more, truncated, page, total}, the
  * column names, then the rows' cells (each {flags u8, len u8, bytes[]} with
@@ -138,17 +141,51 @@
  * and CAT_QUERY_BODY_MAX by bytes — so a reply can never approach the
  * channel's 4 KiB payload bound, and `more` tells the client to ask again.
  *
+ * ─── CAT_EXEC: the mediated write path, and the order its gates run in ────
+ * M5.1's caller is a POSIX-sidecar task (`sh` -> `catalog exec`), not a
+ * Linux-personality task. The syscall-side write path is the named M5.2
+ * follow-up and shares this arm's CatalogOps method; it is not built here.
+ * A write runs one statement in an EXPLICIT transaction:
+ * sql_tx_begin(), sql_execute_tx(), sql_tx_commit(). CAT_OK is returned only
+ * after the commit succeeds, so a caller that receives OK knows the rows are
+ * committed; a lost reply or a commit failure is an unknown outcome and must
+ * be re-read before any retry. CONFLICT and BUSY are retryable only when the
+ * refusal itself was received.
+ *
+ *   1. SHAPE    — {sql_len u16, flags u16, sql[]}, sql_len <= CAT_SQL_MAX,
+ *                 flags 0, no embedded NUL.
+ *   2. PARSE    — sql_parse() before any catalog lookup; a parse error is
+ *                 CAT_ERR_QUERY with the parser's own message.
+ *   3. MEANING  — INSERT/UPDATE/DELETE only, one table, no subquery. DDL is
+ *                 CAT_ERR_TYPE, not a silent permission decision.
+ *   4. BOUNDARY — cat_find(table, THIS channel's partition); foreign and
+ *                 absent are the same CAT_ERR_NOENT.
+ *   5. KIND     — SYSTEM_METADATA is PERM; a non-row-set table is TYPE.
+ *   6. OWNER    — the channel's registration-bound owner uid must be nonzero
+ *                 (no pid-derived fallback for writes), its pid must still be
+ *                 live, and its descriptor must still be in this partition.
+ *   7. POLICY   — catalog_check_access(uid, table, PERM_WRITE), before the
+ *                 engine runs, so a denial is never an empty affected-count.
+ *   8. FK       — tables connected by any active REFERENCE constraint, in
+ *                 either direction, are refused PERM in this cut: a write
+ *                 may not trigger a cascade or touch a row another table's
+ *                 constraint can observe.
+ *   9. EXECUTE  — explicit transaction; on an engine error, roll back and
+ *                 map WRITE_CONFLICT -> CONFLICT, TXN_UNAVAILABLE -> BUSY,
+ *                 CONSTRAINT_VIOLATION -> CONSTRAINT, everything else QUERY.
+ *  10. COMMIT   — CAT_OK only after sql_tx_commit() returns 0; otherwise
+ *                 CAT_ERR_INTERNAL and no success reply is sent.
+ *
  * WHAT THIS INCREMENT IS NOT.
- * There is no write path, no schema mutation, no cross-partition federation
- * and no per-object ACL keyed on a uid — a registered channel carries a
- * partition and a pid, not a uid, and inventing an ACL the caller's
- * identity cannot support would be worse than not having one. The isolation
- * this service enforces is the partition, which is the boundary the rest of
- * the project already enforces. Row-level policy is the SQL path's job
- * (rowstore.c's catalog_check_access), and stays there: CAT_QUERY calls
- * that exact check with the uid it resolved from the channel rather than
- * re-deriving it, so the mediated surface and the direct SQL surface make
- * the same decision about the same caller.
+ * No DDL, no INSERT ... SELECT, no JOIN/subquery/CTE, no second table, no
+ * foreign-key-connected table, and no write to a channel whose owner was not
+ * authenticated at registration. There is still no cross-partition
+ * federation. The isolation this service enforces is the partition, which is
+ * the boundary the rest of the project already enforces. Row-level policy is
+ * the SQL path's job (rowstore.c's catalog_check_access), and stays there:
+ * both CAT_QUERY and CAT_EXEC call that exact check with the uid resolved
+ * from the channel rather than re-deriving it, so the mediated surface and
+ * the direct SQL surface make the same decision about the same caller.
  */
 
 #include <stdint.h>
@@ -186,6 +223,7 @@
 #define CAT_VERB_STAT  3u
 #define CAT_VERB_READ  4u
 #define CAT_VERB_QUERY 5u   /* the SQL path: a read of a row-set table */
+#define CAT_VERB_EXEC  6u   /* the mediated write path: one DML statement */
 
 #define CAT_FLAG_ERROR 0x0001u
 
@@ -205,11 +243,21 @@
  * refused by name in the arm that checks it. */
 #define CAT_ERR_TYPE 4u
 /* The verb and the table are both fine and the SQL ENGINE still refused the
- * statement: a parse error, an unknown column, a constraint. The engine's
- * own message renders after the refusal suffix, so the caller sees why. */
+ * statement: a parse error, an unknown column, an unsupported construct.
+ * The engine's own message renders after the refusal suffix, so the caller
+ * sees why. Constraint violations have their own status on CAT_EXEC. */
 #define CAT_ERR_QUERY 5u
+/* CAT_EXEC only: another transaction already superseded a matched row. */
+#define CAT_ERR_CONFLICT 6u
+/* CAT_EXEC only: a UNIQUE/NOT NULL/RANGE/REFERENCE check refused the write. */
+#define CAT_ERR_CONSTRAINT 7u
+/* CAT_EXEC only: the transaction could not start at the active-txn ceiling. */
+#define CAT_ERR_BUSY 8u
 /* The verb is outside the table entirely: refused by name, by number. */
 #define CAT_ERR_UNKNOWN 9u
+/* CAT_EXEC only: the transaction or its commit failed. Unknown outcome; the
+ * caller must re-read before retrying. */
+#define CAT_ERR_INTERNAL 10u
 
 #define CAT_MAX_NAME 64u    /* OBJECT_NAME_LEN */
 #define CAT_MAX_KEY 64u     /* RECORD_KEY_LEN  */
@@ -229,6 +277,8 @@
 #define CAT_SQL_MAX 512u
 #define CAT_QUERY_ROWS_MAX 4u
 #define CAT_QUERY_BODY_MAX 3072u
+/* CAT_EXEC's reply body: {affected_rows u32, flags u16, reserved u16}. */
+#define CAT_EXEC_BODY 8u
 
 #define CAT_TEXT_CAP 192u
 
@@ -245,7 +295,9 @@ int env_catalog_service_register(uint16_t k_rd, uint16_t k_wr,
 
 /* M5.0: register the channel with the environment's authenticated owner uid.
  * CAT_QUERY resolves policy against this binding, never against the sidecar's
- * inherited boot uid. A zero owner preserves the old pid-derived fallback. */
+ * inherited boot uid. CAT_EXEC REFUSES a zero owner: a write has no
+ * pid-derived fallback. Read paths keep the pre-M5 fallback for host fixtures
+ * and registrations made before M5.0. */
 int env_catalog_service_register_owned(uint16_t k_rd, uint16_t k_wr,
                                        uint32_t partition, uint32_t pid,
                                        const char* name, uint32_t owner_uid);

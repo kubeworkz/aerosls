@@ -33,11 +33,14 @@
  *     uid from proc_table, then catalog_check_access, then execution — plus
  *     the statement shapes the surface does not carry (non-SELECT, JOIN,
  *     set operator, CTE, subquery), each refused BY NAME.
- *   - An unknown verb is refused BY NUMBER with CAT_ERR_UNKNOWN, which is
- *     how a CAT_WRITE asking for a write path is answered: like any other
- *     unknown, not specially. Verb 5 is CAT_QUERY, which is why 6 is the
- *     first unknown — a READ-only surface that grew a query verb did not
- *     grow a write one.
+ *   - CAT_EXEC is the one write verb, and its gates are pinned in order:
+ *     one DML statement, parse before lookup, the channel's partition before
+ *     the kind checks, the registration-bound owner (never a pid fallback),
+ *     PERM_WRITE, foreign-key refusal, then an EXPLICIT transaction whose
+ *     commit must succeed before CAT_OK is sent. A commit failure answers
+ *     CAT_ERR_INTERNAL and never a success body.
+ *   - An unknown verb is refused BY NUMBER with CAT_ERR_UNKNOWN: verb 7 is
+ *     the first unknown beyond the six-verb table.
  *   - A non-CAT magic on a catalog channel is dropped, never answered.
  *
  * WHAT IS FAKED HERE, AND WHY THAT IS THE RIGHT THING TO PIN. The SQL
@@ -66,6 +69,7 @@
 #include "kernel/kernel_io.h"
 #include "kernel/object_catalog.h"   /* the REAL entry/record types */
 #include "kernel/rowstore.h"         /* table_headers + RowValues: what CAT_QUERY reads */
+#include "kernel/row_constraint.h"    /* REFERENCE edges: CAT_EXEC's foreign-key refusal */
 #include "kernel/sql_exec.h"         /* SqlResult — the engine's answer shape */
 #include "kernel/sql_parser.h"       /* sql_parse: the REAL parser, linked below */
 #include "kernel/cursor.h"           /* RowScanCb: the engine's row hand-off */
@@ -104,6 +108,26 @@ uint32_t alloc_pid(void) {
         if (proc_table[i].active && proc_table[i].pid > best)
             best = proc_table[i].pid;
     return best + 1;
+}
+
+/* The M4 Linux-thread restore/teardown calls in cap.c. This fixture has no
+ * Linux personality child and never creates or restores one; these close the
+ * link with the honest inert answer. */
+void process_kill(uint32_t pid) { (void)pid; }
+uint32_t proc_create_linux_thread_restore(struct ProcessDescriptor* parent,
+                                          const char* name, uint32_t tid) {
+    (void)parent; (void)name; (void)tid;
+    return 0;
+}
+void proc_discard_linux_thread(uint32_t pid) { (void)pid; }
+uint32_t linux_thread_group_create(struct ProcessDescriptor* pd, uint64_t cr3) {
+    (void)pd; (void)cr3;
+    return 0;
+}
+uint32_t linux_thread_group_attach(struct ProcessDescriptor* pd,
+                                   uint32_t group_id, uint32_t tid) {
+    (void)pd; (void)group_id; (void)tid;
+    return 0;
 }
 
 uint64_t alloc_proc_syscall_stack(uint32_t partition_id) {
@@ -210,6 +234,8 @@ struct SLSObjectRecord object_records[CATALOG_MAX_OBJECTS];
 struct SLSObjectSchema object_schemas[CATALOG_MAX_OBJECTS];
 struct SLSRoleEntry    role_table[ROLE_TABLE_MAX];
 uint32_t               object_catalog_count = 0;
+struct RowConstraintDef row_constraints[ROW_CONSTRAINT_MAX];
+uint32_t                row_constraint_count = 0;
 
 static void add_object(const char* name, SLSObjectType type,
                        uint32_t partition, uint32_t size_pages,
@@ -218,6 +244,7 @@ static void add_object(const char* name, SLSObjectType type,
     struct SLSObjectEntry* o = &object_catalog[i];
     memset(o, 0, sizeof *o);
     o->active = 1;
+    o->object_id = (uint64_t)i + 1u;
     o->type = type;
     o->partition_id = partition;
     o->size_pages = size_pages;
@@ -271,6 +298,18 @@ static struct RowValues g_q_rows[Q_MAX_ROWS];
 static uint32_t g_q_fetch_calls;
 static uint32_t g_q_close_calls;
 
+/* CAT_EXEC's explicit transaction, scripted. The service must use these
+ * calls — not sql_execute()'s autocommit wrapper — so a commit failure is
+ * observable and CAT_OK cannot precede it. */
+static int      g_tx_begin_calls;
+static int      g_tx_begin_fail;
+static int      g_exec_tx_calls;
+static int      g_commit_calls;
+static int      g_commit_fail;
+static int      g_rollback_calls;
+static uint32_t g_exec_affected;
+static SqlErrorCode g_exec_tx_error;
+
 static void q_reset(void) {
     g_exec_calls = 0;
     g_exec_uid = 0;
@@ -285,6 +324,14 @@ static void q_reset(void) {
     g_q_deliver = 0;
     g_q_fetch_calls = 0;
     g_q_close_calls = 0;
+    g_tx_begin_calls = 0;
+    g_tx_begin_fail = 0;
+    g_exec_tx_calls = 0;
+    g_commit_calls = 0;
+    g_commit_fail = 0;
+    g_rollback_calls = 0;
+    g_exec_affected = 1;
+    g_exec_tx_error = SQL_ERR_NONE;
     memset(g_q_rows, 0, sizeof g_q_rows);
 }
 
@@ -321,6 +368,45 @@ int sql_execute(uint32_t caller_uid, const char* sql_text, struct SqlResult* out
     out->row_count = g_q_total;
     out->column_count = g_q_ncols;
     memcpy(out->columns, g_q_cols, sizeof g_q_cols);
+    return 0;
+}
+
+uint64_t sql_tx_begin(void) {
+    g_tx_begin_calls++;
+    return g_tx_begin_fail ? 0 : 77;
+}
+
+int sql_execute_tx(uint64_t txn_id, uint32_t caller_uid, const char* sql_text,
+                   struct SqlResult* out) {
+    (void)txn_id;
+    g_exec_tx_calls++;
+    g_exec_uid = caller_uid;
+    strncpy(g_exec_sql, sql_text, sizeof g_exec_sql - 1);
+    g_exec_sql[sizeof g_exec_sql - 1] = '\0';
+    memset(out, 0, sizeof *out);
+    if (strncmp(sql_text, "INSERT", 6) == 0) out->kind = SQL_STMT_INSERT;
+    else if (strncmp(sql_text, "UPDATE", 6) == 0) out->kind = SQL_STMT_UPDATE;
+    else out->kind = SQL_STMT_DELETE;
+    if (g_exec_tx_error != SQL_ERR_NONE) {
+        out->error = g_exec_tx_error;
+        strncpy(out->error_msg, g_exec_fail ? g_exec_fail : "engine refused the write",
+                SQL_ERR_MSG_LEN - 1);
+        return 1;
+    }
+    out->error = SQL_ERR_NONE;
+    out->affected_rows = g_exec_affected;
+    return 0;
+}
+
+int sql_tx_commit(uint64_t txn_id) {
+    (void)txn_id;
+    g_commit_calls++;
+    return g_commit_fail ? 1 : 0;
+}
+
+int sql_tx_rollback(uint64_t txn_id, uint32_t caller_uid) {
+    (void)txn_id; (void)caller_uid;
+    g_rollback_calls++;
     return 0;
 }
 
@@ -479,6 +565,16 @@ static uint32_t query_req(uint8_t* f, const char* sql, uint16_t page,
     return 22 + sl;
 }
 
+/* A CAT_EXEC request: {sql_len u16, flags u16, sql[]}. */
+static uint32_t exec_req(uint8_t* f, const char* sql) {
+    cat_frame(f, 6);
+    uint32_t sl = (uint32_t)strlen(sql);
+    put_u16(f + 16, (uint16_t)sl);
+    put_u16(f + 18, 0);
+    for (uint32_t i = 0; i < sl; i++) f[20 + i] = (uint8_t)sql[i];
+    return 20 + sl;
+}
+
 /* Read one cell out of a CAT_QUERY reply: {head 12, names, rows}. Returns 0
  * on success, -1 if the reply does not hold what it claims — a caller CHECKs
  * that rather than reading past the buffer. */
@@ -543,9 +639,9 @@ int main(void) {
 
     /* ── 1. the verb table and the refusal renderer ─────────────────────── */
     {
-        const char* expect[5] = { "CAT_INFO", "CAT_LIST", "CAT_STAT",
-                                  "CAT_READ", "CAT_QUERY" };
-        for (uint32_t i = 0; i < 5; i++) {
+        const char* expect[6] = { "CAT_INFO", "CAT_LIST", "CAT_STAT",
+                                  "CAT_READ", "CAT_QUERY", "CAT_EXEC" };
+        for (uint32_t i = 0; i < 6; i++) {
             const char* got = env_catalog_verb_name((uint16_t)(i + 1));
             char msg[72];
             snprintf(msg, sizeof msg, "verb %u is named %s", i + 1,
@@ -553,8 +649,8 @@ int main(void) {
             CHECK(got && strcmp(got, expect[i]) == 0, msg);
         }
         CHECK(env_catalog_verb_name(0) == 0, "verb 0 is outside the table");
-        CHECK(env_catalog_verb_name(6) == 0,
-              "verb 6 is outside the table (a query verb is not a write verb)");
+        CHECK(env_catalog_verb_name(7) == 0,
+              "verb 7 is outside the table (the table stops at CAT_EXEC)");
         CHECK(env_catalog_verb_name(0xFFFFu) == 0,
               "an absurd verb resolves to no name");
 
@@ -623,10 +719,11 @@ int main(void) {
         int all = 1;
         for (uint32_t i = 0; i < 6; i++) {
             if (mint_pair(&g_fill[i], (uint32_t)(210 + i)) != 0 ||
-                env_catalog_service_register(g_fill[i].krd, g_fill[i].kw,
-                                             (uint32_t)(3 + i),
-                                             (uint32_t)(210 + i),
-                                             "aerosls.posix.f") != 1)
+                env_catalog_service_register_owned(g_fill[i].krd, g_fill[i].kw,
+                                                   (uint32_t)(3 + i),
+                                                   (uint32_t)(210 + i),
+                                                   "aerosls.posix.f",
+                                                   (uint32_t)(1003 + i)) != 1)
                 all = 0;
         }
         CHECK(all, "six more sidecars register (registry at capacity)");
@@ -1376,7 +1473,278 @@ int main(void) {
         g_policy = 1;
     }
 
-    /* ── 15. the service refuses nothing it should not have taken ───────── */
+    /* ── 15. CAT_EXEC: the mediated write path, gate by gate ──────────────
+     * The write uses the SAME partition lookup and bound identity as the
+     * query path, then adds the two things a write needs: PERM_WRITE and an
+     * explicit transaction whose commit is observed. Every refusal checks
+     * that no transaction was opened and no statement reached the engine. */
+    {
+        char reply[512];
+
+        /* (a) Served: UPDATE on this partition's own row-set table. */
+        q_reset();
+        g_policy = 1;
+        g_exec_affected = 2;
+        uint32_t len = exec_req(g_frame, "UPDATE stock SET qty = '9'");
+        CHECK(far_send(&g_fill[0], g_frame, len, 370) == 0,
+              "the sidecar sends CAT_EXEC for an UPDATE");
+        int n = far_recv(&g_fill[0], reply, sizeof reply, NULL);
+        CHECK(n == 26 && reply_u16(reply, 12) == 0 &&
+              reply_u16(reply, 16) == CAT_OK,
+              "an UPDATE on the caller's own table is SERVED");
+        CHECK(reply_u32(reply, 18) == 2 && reply_u16(reply, 22) == 0,
+              "the reply carries the committed affected-row count and zero flags");
+        CHECK(g_tx_begin_calls == 1 && g_exec_tx_calls == 1 &&
+              g_commit_calls == 1 && g_rollback_calls == 0,
+              "the write ran in an explicit transaction and committed once");
+        CHECK(g_exec_uid == 1003 &&
+              g_policy_uid == 1003 && g_policy_perm == PERM_WRITE &&
+              strcmp(g_policy_obj, "stock") == 0,
+              "the engine and policy both ran as the REGISTRATION-BOUND uid, "
+              "with PERM_WRITE on the named table");
+
+        /* (b) DDL, SELECT and subqueries are not this verb. */
+        static const struct { const char* sql; const char* why; } wrong[] = {
+            { "CREATE TABLE x (a STRING)", "only INSERT, UPDATE or DELETE" },
+            { "SELECT * FROM stock", "only INSERT, UPDATE or DELETE" },
+            { "UPDATE stock SET qty = 1 WHERE qty = (SELECT qty FROM inv)",
+              "a subquery" },
+        };
+        for (uint32_t i = 0; i < sizeof wrong / sizeof wrong[0]; i++) {
+            q_reset();
+            g_policy = 1;
+            len = exec_req(g_frame, wrong[i].sql);
+            CHECK(far_send(&g_fill[0], g_frame, len, (uint32_t)(371 + i)) == 0,
+                  wrong[i].sql);
+            n = far_recv(&g_fill[0], reply, sizeof reply, NULL);
+            CHECK(n > 0 && reply_u16(reply, 16) == CAT_ERR_TYPE &&
+                  strstr(reply + 18, wrong[i].why) != NULL,
+                  "a non-DML or second-table write is TYPE, by name");
+            CHECK(g_tx_begin_calls == 0 && g_exec_tx_calls == 0,
+                  "and it never opened a transaction");
+        }
+
+        /* (c) THE BOUNDARY: a foreign table is the same NOENT as absent. */
+        q_reset();
+        g_policy = 1;
+        len = exec_req(g_frame, "UPDATE inv SET sku = 'x'");
+        CHECK(far_send(&g_fill[0], g_frame, len, 374) == 0,
+              "partition 3's channel writes partition 4's table");
+        n = far_recv(&g_fill[0], reply, sizeof reply, NULL);
+        CHECK(n > 0 && reply_u16(reply, 16) == CAT_ERR_NOENT &&
+              g_tx_begin_calls == 0 && g_policy_calls == 0,
+              "THE BOUNDARY: a foreign write target answers NOENT before "
+              "any identity or policy is consulted");
+
+        /* (d) In-namespace kind refusals, before the owner gate. */
+        q_reset();
+        g_policy = 1;
+        len = exec_req(g_frame, "UPDATE sys3meta SET x = 'y'");
+        CHECK(far_send(&g_fill[0], g_frame, len, 375) == 0,
+              "a write to SYSTEM_METADATA");
+        n = far_recv(&g_fill[0], reply, sizeof reply, NULL);
+        CHECK(n > 0 && reply_u16(reply, 16) == CAT_ERR_PERM &&
+              g_tx_begin_calls == 0,
+              "SYSTEM_METADATA answers PERM for a write too");
+
+        q_reset();
+        g_policy = 1;
+        len = exec_req(g_frame, "UPDATE kv3 SET a = 'b'");
+        CHECK(far_send(&g_fill[0], g_frame, len, 376) == 0,
+              "a write to the legacy KV table");
+        n = far_recv(&g_fill[0], reply, sizeof reply, NULL);
+        CHECK(n > 0 && reply_u16(reply, 16) == CAT_ERR_TYPE &&
+              strstr(reply + 18, "not a row-set table") != NULL &&
+              g_tx_begin_calls == 0,
+              "a non-row-set table is TYPE, before any write is attempted");
+
+        /* (e) THE OWNER GATE: a channel registered without an owner binding.
+         *     A write REFUSES that zero; it never falls back to the pid. */
+        struct Pair zero_owner;
+        if (mint_pair(&zero_owner, 210) != 0) { printf("FAIL: mint zero-owner\n"); return 1; }
+        CHECK(env_catalog_service_register_owned(zero_owner.krd, zero_owner.kw,
+                                                 3, 210, "aerosls.posix.z", 0) == 1,
+              "a channel is registered with a zero owner binding");
+        q_reset();
+        g_policy = 1;
+        len = exec_req(g_frame, "UPDATE stock SET qty = '0'");
+        CHECK(far_send(&zero_owner, g_frame, len, 377) == 0,
+              "a channel with no bound owner attempts a write");
+        n = far_recv(&zero_owner, reply, sizeof reply, NULL);
+        CHECK(n > 0 && reply_u16(reply, 16) == CAT_ERR_PERM &&
+              strstr(reply + 18, "no bound owner") != NULL &&
+              g_exec_tx_calls == 0 && g_policy_calls == 0,
+              "a zero owner is PERM BY NAME and never becomes a pid uid");
+        CHECK(env_catalog_service_register_owned(g_fill[0].krd, g_fill[0].kw,
+                                                 3, 210, "aerosls.posix.f", 1003) == 1,
+              "the owned channel is restored for the remaining write clauses");
+
+        /* The bound uid, not the descriptor's, is what policy sees. */
+        q_reset();
+        g_policy = 1;
+        uint32_t saved_owner = proc_table[2].owner_uid;
+        proc_table[2].owner_uid = 9999;
+        len = exec_req(g_frame, "UPDATE stock SET qty = '1'");
+        CHECK(far_send(&g_fill[0], g_frame, len, 378) == 0,
+              "the descriptor's owner differs from the channel binding");
+        n = far_recv(&g_fill[0], reply, sizeof reply, NULL);
+        CHECK(n > 0 && reply_u16(reply, 16) == CAT_OK &&
+              g_exec_uid == 1003 && g_policy_uid == 1003,
+              "the write runs as the BOUND owner — the descriptor cannot "
+              "silently re-identify it");
+        proc_table[2].owner_uid = saved_owner;
+
+        /* (f) PERM_WRITE is a refusal, not an empty affected-count. */
+        q_reset();
+        g_policy = 0;
+        len = exec_req(g_frame, "DELETE FROM stock");
+        CHECK(far_send(&g_fill[0], g_frame, len, 379) == 0,
+              "policy denies PERM_WRITE");
+        n = far_recv(&g_fill[0], reply, sizeof reply, NULL);
+        CHECK(n > 0 && reply_u16(reply, 16) == CAT_ERR_PERM &&
+              strstr(reply + 18, "PERM_WRITE") != NULL &&
+              g_exec_tx_calls == 0,
+              "a PERM_WRITE denial is PERM BY NAME and never reaches the engine");
+        g_policy = 1;
+
+        /* (g) Foreign-key-connected tables are refused in BOTH directions:
+         *     outbound (this table references another) and inbound (another
+         *     table references this one). */
+        memset(&row_constraints[0], 0, sizeof row_constraints[0]);
+        row_constraints[0].active = 1;
+        row_constraints[0].kind = ROW_CONSTRAINT_REFERENCE;
+        row_constraints[0].table_object_id = object_catalog[5].object_id;
+        row_constraints[0].ref_table_object_id = object_catalog[8].object_id;
+        row_constraint_count = 1;
+        q_reset();
+        g_policy = 1;
+        len = exec_req(g_frame, "UPDATE stock SET qty = '2'");
+        CHECK(far_send(&g_fill[0], g_frame, len, 380) == 0,
+              "a table with an OUTBOUND reference attempts a write");
+        n = far_recv(&g_fill[0], reply, sizeof reply, NULL);
+        CHECK(n > 0 && reply_u16(reply, 16) == CAT_ERR_PERM &&
+              strstr(reply + 18, "foreign-key") != NULL &&
+              g_tx_begin_calls == 0,
+              "an outbound FK edge is refused before the transaction");
+
+        row_constraints[0].table_object_id = object_catalog[8].object_id;
+        row_constraints[0].ref_table_object_id = object_catalog[5].object_id;
+        q_reset();
+        g_policy = 1;
+        len = exec_req(g_frame, "DELETE FROM stock");
+        CHECK(far_send(&g_fill[0], g_frame, len, 381) == 0,
+              "a table another table REFERENCES attempts a write");
+        n = far_recv(&g_fill[0], reply, sizeof reply, NULL);
+        CHECK(n > 0 && reply_u16(reply, 16) == CAT_ERR_PERM &&
+              g_tx_begin_calls == 0,
+              "an INBOUND FK edge is refused too — a DELETE cannot cascade "
+              "through a table the wire did not name");
+        row_constraint_count = 0;
+
+        /* (h) Transaction begin failure is BUSY, retryable only because the
+         *     refusal was received. */
+        q_reset();
+        g_policy = 1;
+        g_tx_begin_fail = 1;
+        len = exec_req(g_frame, "UPDATE stock SET qty = '3'");
+        CHECK(far_send(&g_fill[0], g_frame, len, 382) == 0,
+              "the transaction table is full");
+        n = far_recv(&g_fill[0], reply, sizeof reply, NULL);
+        CHECK(n > 0 && reply_u16(reply, 16) == CAT_ERR_BUSY &&
+              g_exec_tx_calls == 0,
+              "CAT_ERR_BUSY is answered before the statement runs");
+        g_tx_begin_fail = 0;
+
+        /* (i) Engine refusals get actionable statuses, and every one rolls
+         *     back rather than leaving a half-applied statement. */
+        q_reset();
+        g_policy = 1;
+        g_exec_tx_error = SQL_ERR_WRITE_CONFLICT;
+        g_exec_fail = "another transaction already changed this row";
+        len = exec_req(g_frame, "UPDATE stock SET qty = '4'");
+        CHECK(far_send(&g_fill[0], g_frame, len, 383) == 0, "a write conflict");
+        n = far_recv(&g_fill[0], reply, sizeof reply, NULL);
+        CHECK(n > 0 && reply_u16(reply, 16) == CAT_ERR_CONFLICT &&
+              g_rollback_calls == 1 && g_commit_calls == 0,
+              "WRITE_CONFLICT is CAT_ERR_CONFLICT, and the transaction rolled back");
+
+        q_reset();
+        g_policy = 1;
+        g_exec_tx_error = SQL_ERR_CONSTRAINT_VIOLATION;
+        g_exec_fail = "UPDATE violates a UNIQUE constraint";
+        len = exec_req(g_frame, "UPDATE stock SET qty = '5'");
+        CHECK(far_send(&g_fill[0], g_frame, len, 384) == 0, "a constraint violation");
+        n = far_recv(&g_fill[0], reply, sizeof reply, NULL);
+        CHECK(n > 0 && reply_u16(reply, 16) == CAT_ERR_CONSTRAINT &&
+              strstr(reply + 18, "UNIQUE") != NULL &&
+              g_rollback_calls == 1,
+              "a constraint violation keeps its own status and the engine's reason");
+        g_exec_tx_error = SQL_ERR_NONE;
+        g_exec_fail = 0;
+
+        /* (j) COMMIT IS THE ACKNOWLEDGEMENT. A failed commit cannot be
+         *     reported as CAT_OK, even though the statement itself ran. */
+        q_reset();
+        g_policy = 1;
+        g_exec_affected = 7;
+        g_commit_fail = 1;
+        len = exec_req(g_frame, "UPDATE stock SET qty = '6'");
+        CHECK(far_send(&g_fill[0], g_frame, len, 385) == 0,
+              "the statement runs but the commit fails");
+        n = far_recv(&g_fill[0], reply, sizeof reply, NULL);
+        CHECK(n > 0 && reply_u16(reply, 12) == CAT_FLAG_ERROR &&
+              reply_u16(reply, 16) == CAT_ERR_INTERNAL &&
+              strstr(reply + 18, "re-read") != NULL,
+              "a failed commit is CAT_ERR_INTERNAL, never CAT_OK");
+        CHECK(g_commit_calls == 1 && g_rollback_calls == 1,
+              "the failed transaction is rolled back and the caller is told "
+              "the outcome is unknown");
+        g_commit_fail = 0;
+
+        /* (k) The request's own bounds, before parse and before any lookup. */
+        q_reset();
+        g_policy = 1;
+        cat_frame(g_frame, 6);
+        CHECK(far_send(&g_fill[0], g_frame, 16, 386) == 0, "a bodyless CAT_EXEC");
+        n = far_recv(&g_fill[0], reply, sizeof reply, NULL);
+        CHECK(n > 0 && reply_u16(reply, 16) == CAT_ERR_SHAPE &&
+              g_tx_begin_calls == 0,
+              "a bodyless CAT_EXEC is SHAPE");
+
+        cat_frame(g_frame, 6);
+        put_u16(g_frame + 16, 6);
+        put_u16(g_frame + 18, 1);          /* reserved flags must be 0 */
+        memcpy(g_frame + 20, "DELETE", 6);
+        CHECK(far_send(&g_fill[0], g_frame, 26, 387) == 0,
+              "a CAT_EXEC with reserved flags set");
+        n = far_recv(&g_fill[0], reply, sizeof reply, NULL);
+        CHECK(n > 0 && reply_u16(reply, 16) == CAT_ERR_SHAPE &&
+              g_tx_begin_calls == 0,
+              "nonzero reserved flags are SHAPE");
+
+        cat_frame(g_frame, 6);
+        put_u16(g_frame + 16, 12);
+        memcpy(g_frame + 20, "DELETE\0FROM", 12);
+        CHECK(far_send(&g_fill[0], g_frame, 32, 388) == 0,
+              "a CAT_EXEC with an embedded NUL");
+        n = far_recv(&g_fill[0], reply, sizeof reply, NULL);
+        CHECK(n > 0 && reply_u16(reply, 16) == CAT_ERR_SHAPE &&
+              g_tx_begin_calls == 0,
+              "an embedded NUL is SHAPE — no prefix is ever parsed");
+
+        cat_frame(g_frame, 6);
+        put_u16(g_frame + 16, CAT_SQL_MAX + 1u);
+        CHECK(far_send(&g_fill[0], g_frame, 20, 389) == 0,
+              "a CAT_EXEC statement past CAT_SQL_MAX");
+        n = far_recv(&g_fill[0], reply, sizeof reply, NULL);
+        CHECK(n > 0 && reply_u16(reply, 16) == CAT_ERR_SHAPE,
+              "a statement past CAT_SQL_MAX is SHAPE");
+
+        q_reset();
+        g_policy = 1;
+    }
+
+    /* ── 16. the service refuses nothing it should not have taken ───────── */
     CHECK(env_catalog_refusals() > 0,
           "the refusal counter counted the refusals above");
     CHECK(env_catalog_dropped() == 1,

@@ -22,9 +22,11 @@
 #include "sql_exec.h"
 #include "cursor.h"
 #include "rowstore.h"
+#include "row_constraint.h"     /* REFERENCE edges: the M5.1 write cut refuses them */
 #include "process.h"
-#include "../user/permissions.h"   /* PERM_READ — the policy bit CAT_QUERY checks */
+#include "../user/permissions.h"   /* PERM_READ / PERM_WRITE — the policy bits */
 #include <stddef.h>
+#include <string.h>
 
 /* The wire, spelled out in C. See env_catalog.h's wire section; the host
  * test pins these constants against the layout the client will speak. */
@@ -42,6 +44,7 @@ static const struct { uint16_t ty; const char* name; } cat_verbs[] = {
     { 3, "CAT_STAT" },
     { 4, "CAT_READ" },
     { 5, "CAT_QUERY" },
+    { 6, "CAT_EXEC" },
 };
 
 const char* env_catalog_verb_name(uint16_t ty) {
@@ -57,8 +60,9 @@ struct EnvCatalogSvc {
     uint32_t partition;   /* the boundary every verb is computed against */
     uint32_t pid;
     uint32_t owner_uid;   /* M5.0: the bound environment owner. CAT_QUERY runs
-                           * policy as this uid. Zero means "bind from the
-                           * process descriptor at query time" (pre-M5). */
+                           * policy as this uid; zero falls back to the pid for
+                           * pre-M5 registrations. CAT_EXEC refuses zero: a
+                           * write never gets a pid-derived identity. */
     uint16_t k_rd;        /* kernel (pid 0) CHAN_R — requests arrive here */
     uint16_t k_wr;        /* kernel (pid 0) CHAN_W — replies leave here */
     char     name[32];    /* the caller's sidecar name: the refusal names it */
@@ -134,7 +138,7 @@ int env_catalog_service_register_owned(uint16_t k_rd, uint16_t k_wr,
     e->name[i] = '\0';
     kernel_serial_printf(
         "[ENV-CATALOG] %s (partition %u, pid %u, owner uid %u) wired: "
-        "kernel ends rd=%u wr=%u — read-only catalog view open (§9)\n",
+        "kernel ends rd=%u wr=%u — mediated catalog view open (§9)\n",
         e->name, (unsigned)partition, (unsigned)pid, (unsigned)owner_uid,
         (unsigned)k_rd, (unsigned)k_wr);
     return 1;
@@ -209,7 +213,8 @@ static void cat_release(struct EnvCatalogSvc* e) {
      * frees the kernel's CHAN_R and destroys the channel, the same
      * close-aware teardown nss_release() performs. There is no per-channel
      * state to unwind here: this service holds no sockets, no connections
-     * and no attribution, which is a direct consequence of being read-only.
+     * and no per-channel transaction. A CAT_EXEC transaction is opened and
+     * closed inside its own arm, so teardown has nothing to roll back.
      */
     if (rd != 0xFFFFu) cap_revoke(0, rd);
     e->used = 0;
@@ -421,6 +426,39 @@ static void cat_query_row(struct RowId id, const struct RowValues* v, void* p) {
             g->out[g->off++] = (uint8_t)v->values[src][i];
     }
     g->written++;
+}
+
+/* ─── CAT_EXEC's two preflight questions ──────────────────────────────────
+ * Is this table connected by any active REFERENCE edge, in either direction?
+ * The first write cut refuses such a table outright: an outbound reference
+ * can reject an INSERT/UPDATE the engine has already admitted, an inbound one
+ * can make a DELETE cascade into a table the caller did not name, and BOTH
+ * mean a second table participates in a write the wire only named one table
+ * for. Refusing before the transaction starts is what keeps "one table per
+ * write" a property of the boundary rather than a hope about the engine. */
+static int cat_fk_connected(uint64_t object_id) {
+    uint32_t n = row_constraint_count;
+    if (n > ROW_CONSTRAINT_MAX) n = ROW_CONSTRAINT_MAX;
+    for (uint32_t i = 0; i < n; i++) {
+        const struct RowConstraintDef* rc = &row_constraints[i];
+        if (!rc->active || rc->kind != ROW_CONSTRAINT_REFERENCE) continue;
+        if (rc->table_object_id == object_id ||
+            rc->ref_table_object_id == object_id) return 1;
+    }
+    return 0;
+}
+
+/* An engine error's status on the write surface. The three retryable/actionable
+ * cases get their own names; everything else is the engine's refusal, with its
+ * message rendered after the verb's name. */
+static uint16_t cat_exec_status(SqlErrorCode error) {
+    switch (error) {
+    case SQL_ERR_WRITE_CONFLICT:      return CAT_ERR_CONFLICT;
+    case SQL_ERR_TXN_UNAVAILABLE:     return CAT_ERR_BUSY;
+    case SQL_ERR_CONSTRAINT_VIOLATION: return CAT_ERR_CONSTRAINT;
+    case SQL_ERR_INTERNAL:            return CAT_ERR_INTERNAL;
+    default:                          return CAT_ERR_QUERY;
+    }
 }
 
 /* Answer one drained frame. */
@@ -867,12 +905,177 @@ static void cat_handle(struct EnvCatalogSvc* e, uint32_t plen, uint32_t tag) {
         return;
     }
 
+    case CAT_VERB_EXEC: {
+        /* {sql_len u16, flags u16, sql[sql_len]} -> {affected_rows u32,
+         * flags u16, reserved u16}. One DML statement, one table, one
+         * explicit transaction. The gate order is env_catalog.h's CAT_EXEC
+         * section; it is the same reason CAT_QUERY's is fixed: nothing looks
+         * up a name until the statement parsed, nothing runs until the name
+         * resolved inside this partition, and nothing commits until the
+         * caller's bound owner passed PERM_WRITE. */
+
+        /* 1. SHAPE. */
+        if (plen < CAT_HDR + 4) { cat_refuse(e, ty, tag, CAT_ERR_SHAPE, 0); return; }
+        uint16_t slen = cat_get_u16(cat_buf + CAT_HDR);
+        int bad = (cat_get_u16(cat_buf + CAT_HDR + 2) != 0) || slen == 0 ||
+                  slen > CAT_SQL_MAX || plen < CAT_HDR + 4u + slen;
+        for (uint32_t i = 0; !bad && i < (uint32_t)slen; i++)
+            if (cat_buf[CAT_HDR + 4u + i] == 0) bad = 1;
+        if (bad) { cat_refuse(e, ty, tag, CAT_ERR_SHAPE, 0); return; }
+        for (uint32_t i = 0; i < (uint32_t)slen; i++)
+            cat_sql[i] = cat_buf[CAT_HDR + 4u + i];
+        cat_sql[slen] = '\0';
+
+        /* 2. PARSE, before any lookup. */
+        char perr[SQL_ERR_MSG_LEN];
+        perr[0] = '\0';
+        if (sql_parse((const char*)cat_sql, &cat_stmt, perr,
+                      (uint32_t)sizeof perr) != 0) {
+            cat_refuse(e, ty, tag, CAT_ERR_QUERY,
+                       perr[0] ? perr : "the statement did not parse");
+            return;
+        }
+
+        /* 3. MEANING: DML only, exactly one table. INSERT has no second-table
+         *    source in this parser (no INSERT ... SELECT), and UPDATE/DELETE
+         *    may not carry a subquery in WHERE. */
+        const char* table = 0;
+        switch (cat_stmt.kind) {
+        case SQL_STMT_INSERT:
+            table = cat_stmt.u.insert.table_name;
+            break;
+        case SQL_STMT_UPDATE:
+            if (cat_stmt.u.update.where.subquery_count) {
+                cat_refuse(e, ty, tag, CAT_ERR_TYPE,
+                           "a subquery is not served — one table per write");
+                return;
+            }
+            table = cat_stmt.u.update.table_name;
+            break;
+        case SQL_STMT_DELETE:
+            if (cat_stmt.u.del.where.subquery_count) {
+                cat_refuse(e, ty, tag, CAT_ERR_TYPE,
+                           "a subquery is not served — one table per write");
+                return;
+            }
+            table = cat_stmt.u.del.table_name;
+            break;
+        default:
+            cat_refuse(e, ty, tag, CAT_ERR_TYPE,
+                       "only INSERT, UPDATE or DELETE is served on this surface");
+            return;
+        }
+
+        /* 4. THE BOUNDARY. */
+        uint32_t tlen = cat_strnlen(table, OBJECT_NAME_LEN);
+        int idx = cat_find((const uint8_t*)table, tlen, e->partition);
+        if (idx < 0) { cat_refuse(e, ty, tag, CAT_ERR_NOENT, 0); return; }
+        const struct SLSObjectEntry* o = &object_catalog[idx];
+
+        /* 5. KIND. */
+        if (o->type == OBJ_TYPE_SYSTEM_METADATA) {
+            cat_refuse(e, ty, tag, CAT_ERR_PERM, "SYSTEM_METADATA is not tenant data");
+            return;
+        }
+        if (!o->uses_rowstore) {
+            cat_refuse(e, ty, tag, CAT_ERR_TYPE,
+                       "not a row-set table — use CAT_READ");
+            return;
+        }
+
+        /* 6. OWNER. The binding is mandatory for a write: there is no
+         *    pid-derived fallback here, unlike CAT_QUERY's pre-M5 path. */
+        uint32_t uid = e->owner_uid;
+        if (uid == 0) {
+            cat_refuse(e, ty, tag, CAT_ERR_PERM,
+                       "the channel carries no bound owner for a write");
+            return;
+        }
+        int found = 0, same_partition = 0;
+        for (uint32_t i = 0; i < (uint32_t)PROC_MAX; i++) {
+            if (proc_table[i].active && proc_table[i].pid == e->pid) {
+                found = 1;
+                same_partition = (proc_table[i].partition_id == e->partition);
+                break;
+            }
+        }
+        if (!found) {
+            cat_refuse(e, ty, tag, CAT_ERR_PERM,
+                       "the caller's pid no longer stands");
+            return;
+        }
+        if (!same_partition) {
+            cat_refuse(e, ty, tag, CAT_ERR_PERM,
+                       "the caller's process is not in this channel's partition");
+            return;
+        }
+
+        /* 7. POLICY: the SQL path's own check, with the WRITE bit. */
+        if (!catalog_check_access(uid, table, PERM_WRITE)) {
+            cat_refuse(e, ty, tag, CAT_ERR_PERM,
+                       "row-level policy denied this uid PERM_WRITE");
+            return;
+        }
+
+        /* 8. REFERENCE edges are a second-table write inside the engine; this
+         *    cut refuses them before opening a transaction. */
+        if (cat_fk_connected(o->object_id)) {
+            cat_refuse(e, ty, tag, CAT_ERR_PERM,
+                       "a foreign-key-connected table is not served by the first write cut");
+            return;
+        }
+
+        /* 9. EXECUTE, explicitly. No autocommit: the service must be able to
+         *    see a commit failure and must not report OK before it. */
+        uint64_t txn_id = sql_tx_begin();
+        if (txn_id == 0) {
+            cat_refuse(e, ty, tag, CAT_ERR_BUSY,
+                       "the engine has no transaction slot available");
+            return;
+        }
+        memset(&cat_result, 0, sizeof cat_result);
+        int rc = sql_execute_tx(txn_id, uid, (const char*)cat_sql, &cat_result);
+        if (rc != 0 || cat_result.error != SQL_ERR_NONE) {
+            const char* why = cat_result.error_msg[0]
+                                  ? cat_result.error_msg
+                                  : "the SQL engine refused the statement";
+            uint16_t status = cat_exec_status(cat_result.error);
+            if (sql_tx_rollback(txn_id, uid) != 0) {
+                status = CAT_ERR_INTERNAL;
+                why = "the transaction could not be rolled back after the engine refused the statement";
+            }
+            cat_refuse(e, ty, tag, status, why);
+            return;
+        }
+        if (cat_result.kind != cat_stmt.kind) {
+            sql_tx_rollback(txn_id, uid);
+            cat_refuse(e, ty, tag, CAT_ERR_INTERNAL,
+                       "the engine executed a different statement than the one admitted");
+            return;
+        }
+
+        /* 10. COMMIT. CAT_OK is written only after this succeeds. */
+        if (sql_tx_commit(txn_id) != 0) {
+            sql_tx_rollback(txn_id, uid);
+            cat_refuse(e, ty, tag, CAT_ERR_INTERNAL,
+                       "the transaction failed to commit; re-read the table before retrying");
+            return;
+        }
+
+        cat_hdr(ty, CAT_OK, 0);
+        cat_wire_u32(cat_reply + CAT_BODY + 0, cat_result.affected_rows);
+        cat_wire_u16(cat_reply + CAT_BODY + 4, 0);
+        cat_wire_u16(cat_reply + CAT_BODY + 6, 0);
+        cat_served_total++;
+        cat_send(e, cat_reply, CAT_BODY + CAT_EXEC_BODY, tag);
+        return;
+    }
+
     default:
         /* Any verb outside the table: refused by number — the same
          * contract P2's increment 1 keeps for the types no increment
-         * defines. There is no write verb in this table at all, which is
-         * the point of §9's first cut; a CAT_WRITE asking here is refused
-         * like any other unknown, not specially. */
+         * defines. CAT_EXEC is the one write verb; a type outside the table
+         * is refused like any other unknown, not specially. */
         cat_refuse(e, ty, tag, CAT_ERR_UNKNOWN, 0);
         return;
     }

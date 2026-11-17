@@ -6,7 +6,10 @@
 # environment through `env attach` — requiring every answer to come back on
 # the environment's own console — and then the fifth verb, `catalog sql`,
 # whose read-only promise (§9.1's first cut) is asserted where it can only
-# be asserted: live, with a real row-set table behind it.
+# be asserted: live, with a real row-set table behind it. M5.1 then drives
+# the one mediated write verb, CAT_EXEC, through a LOW-PRIVILEGE environment:
+# its owner's table accepts an INSERT that a native read observes, while the
+# bearer's table refuses the same environment PERM_WRITE and stays unchanged.
 #
 # ─── Why this exists ───────────────────────────────────────────────────────
 # tests/env_catalog_broker_check.sh proves the §9.1 wiring from the SOURCE:
@@ -80,6 +83,17 @@
 #          and not rows — the partition boundary, enforced on a name the
 #          SQL path resolved for itself rather than one this file typed
 #          into a CAT_LIST.
+#  10. `catalog exec` — the M5.1 mediated write path, end to end:
+#        · a table owned by the low-privilege (bob) uid is created in the
+#          same partition; a `catalog exec INSERT` from bob's environment
+#          succeeds with an affected-row body and a native `sql SELECT`
+#          observes the committed value (an OK reply really means committed);
+#        · the same environment's `catalog exec DELETE` on dave's table is
+#          refused PERM_WRITE by name, and a native read proves the row is
+#          unchanged — deny-then-execute cannot pass this clause;
+#        · DDL is refused by name as TYPE, and a foreign table is NOENT, so
+#          the write surface cannot be used as a DDL path or an existence
+#          oracle.
 #
 # Teeth: every assertion reads the answer out of the ENVIRONMENT's console.
 # A guard that never sent a verb, sent it to the node's own shell instead, or
@@ -633,6 +647,9 @@ fi
 # a row some earlier run inserted cannot satisfy the needle.
 TBL="e91tbl_$RUN"
 QVAL="e91q-$RUN"
+WTBL="e91wtbl_$RUN"
+WVAL="$RUN"
+WVAL2=$((RUN + 1))
 
 sh_exec "valloc $TBL 1 1" \
     || die_fail "'valloc $TBL' was not recognised by the node shell"
@@ -794,8 +811,144 @@ fi
 ATTACH_TOKEN=""
 ATTACH_ENV_ID=""
 
+# ─── 8c. M5.1 — the mediated write path, through bob's environment ────────
+# Bob was demoted to GUEST for the read denial above; restore APP_USER so
+# the write is decided by PERM_WRITE, not by the role's global read grant.
+# The table is owned by bob and lives in the same partition, so the ONLY
+# thing that lets this write through is the channel's bound owner.
+echo "==> M5.1: mediated writes in partition $PART_ID"
+sh_exec "role set $PEER_UID APP_USER" >/dev/null 2>&1 \
+    || die_fail "could not restore uid $PEER_UID to ROLE_APP_USER for the write arm"
+
+# Bob's valloc must resolve to THIS partition, or the table would land in
+# PARTITION_SYSTEM and the environment would correctly answer NOENT.
+post /api/partition/assign "{\"uid\":$PEER_UID,\"partition_id\":$PART_ID}"
+if [ "$POST_STATUS" = "200" ] && [ "$(jget "$POST_BODY" ok)" = "true" ]; then
+    echo "ok:   bob's uid $PEER_UID is assigned to partition $PART_ID"
+else
+    die_fail "could not assign bob's uid $PEER_UID to partition $PART_ID (HTTP $POST_STATUS: $POST_BODY)"
+fi
+
+sh_exec_as "$PEER_TOKEN" "valloc $WTBL 1 1" \
+    || die_fail "low-privilege shell did not recognise 'valloc $WTBL'"
+sh_exec_as "$PEER_TOKEN" "schema set $WTBL note STRING" \
+    || die_fail "low-privilege shell did not recognise 'schema set $WTBL note STRING'"
+sh_exec_as "$PEER_TOKEN" "table create $WTBL" \
+    || die_fail "low-privilege shell did not recognise 'table create $WTBL'"
+case "$SHEL_OUT" in
+    *"create '$WTBL' -> OK"*)
+        echo "ok:   bob ($PEER_UID) owns row-set table '$WTBL' in partition $PART_ID" ;;
+    *)
+        die_fail "'table create $WTBL' did not promote the object (shell said: $(printf '%s' "$SHEL_OUT" | tail -3 | tr '\n' ' '))" ;;
+esac
+
+# Attach to BOB's environment, still over the bearer's console transport: the
+# commands run in the environment, so the kernel binds them to bob's owner.
+ATTACH_TOKEN="$TOKEN"
+ATTACH_ENV_ID="$ENV2_ID"
+ATTACH_OUT=""
+
+if run_verb "catalog exec INSERT INTO $WTBL (note) VALUES ($WVAL)" "row(s) affected"; then
+    expect "1 row(s) affected" "CAT_EXEC INSERT succeeds for the channel's bound owner — the commit is acknowledged"
+    reject "refused" "the owner's own table is not refused"
+else
+    die_fail "\`catalog exec INSERT INTO $WTBL ...\` never answered through env attach in ${WAIT_VERB}s (last output: ${VERB_OUT:-<nothing>})"
+fi
+
+# The independent observer: dave's native SQL path, outside the mediated
+# service, must see the row. A CAT_EXEC that answered OK before its commit
+# would leave this read empty. The needle never appears in the command line.
+sh_exec "sql SELECT * FROM $WTBL" \
+    || die_fail "the native shell did not recognise 'sql SELECT * FROM $WTBL'"
+if printf '%s' "$SHEL_OUT" | grep -Fq -- "$WVAL"; then
+    echo "ok:   native SQL observes bob's committed row '$WVAL' — CAT_OK meant committed"
+else
+    die_fail "native SQL did not see '$WVAL' after CAT_EXEC reported success (shell said: $(printf '%s' "$SHEL_OUT" | tail -4 | tr '\n' ' '))"
+fi
+
+# UPDATE and DELETE go through the same accepted statement and commit path;
+# the native observer must see each committed effect in turn.
+if run_verb "catalog exec UPDATE $WTBL SET note = $WVAL2" "row(s) affected"; then
+    expect "1 row(s) affected" "CAT_EXEC UPDATE commits against the owner's table"
+else
+    die_fail "\`catalog exec UPDATE $WTBL ...\` never answered through env attach in ${WAIT_VERB}s (last output: ${VERB_OUT:-<nothing>})"
+fi
+
+sh_exec "sql SELECT * FROM $WTBL" \
+    || die_fail "the native shell did not recognise 'sql SELECT * FROM $WTBL' after the update"
+if printf '%s' "$SHEL_OUT" | grep -Fq -- "$WVAL2"; then
+    echo "ok:   native SQL observes the committed UPDATE value '$WVAL2'"
+else
+    die_fail "native SQL did not see '$WVAL2' after the committed CAT_EXEC UPDATE (shell said: $(printf '%s' "$SHEL_OUT" | tail -4 | tr '\n' ' '))"
+fi
+
+if run_verb "catalog exec DELETE FROM $WTBL" "row(s) affected"; then
+    expect "1 row(s) affected" "CAT_EXEC DELETE commits against the owner's table"
+else
+    die_fail "\`catalog exec DELETE FROM $WTBL\` never answered through env attach in ${WAIT_VERB}s (last output: ${VERB_OUT:-<nothing>})"
+fi
+
+sh_exec "sql SELECT * FROM $WTBL" \
+    || die_fail "the native shell did not recognise 'sql SELECT * FROM $WTBL' after the delete"
+if printf '%s' "$SHEL_OUT" | grep -Fq -- "$WVAL2"; then
+    die_fail "native SQL still sees '$WVAL2' after the committed CAT_EXEC DELETE (shell said: $(printf '%s' "$SHEL_OUT" | tail -4 | tr '\n' ' '))"
+else
+    echo "ok:   native SQL no longer sees '$WVAL2' — the DELETE committed"
+fi
+
+# The catalog's legacy default perm_mask carries WRITE, so APP_USER bob would
+# otherwise pass the object-level fallback on dave's table. Pin that table to
+# PERM_READ only: the next DELETE is then decided by the PERM_WRITE gate. The
+# native read proves the row was not deleted behind the refusal.
+post /api/chmod "{\"name\":\"$TBL\",\"mask\":\"0x4\"}"
+if [ "$POST_STATUS" = "200" ] && [ "$(jget "$POST_BODY" ok)" = "true" ]; then
+    echo "ok:   dave's table is read-only (perm_mask=0x4), so PERM_WRITE is the deciding gate"
+else
+    die_fail "could not pin dave's table to PERM_READ (HTTP $POST_STATUS: $POST_BODY)"
+fi
+
+# The same environment, the same verb, dave's read-only table: bob is APP_USER
+# and not the owner, so PERM_WRITE is refused BY NAME.
+if run_verb "catalog exec DELETE FROM $TBL" "CAT_EXEC refused by kernel.env.catalog"; then
+    expect "PERM_WRITE" "a non-owner write is refused PERM_WRITE by name"
+    reject "row(s) affected" "a refusal carries no affected-row body"
+else
+    die_fail "\`catalog exec DELETE FROM $TBL\` produced no refusal in ${WAIT_VERB}s — a non-owner write reached the engine or was left silent"
+fi
+
+sh_exec "sql SELECT * FROM $TBL" \
+    || die_fail "the native shell did not recognise 'sql SELECT * FROM $TBL' after the refused write"
+if printf '%s' "$SHEL_OUT" | grep -Fq -- "$QVAL"; then
+    echo "ok:   dave's row '$QVAL' is still there — the refused DELETE did not execute"
+else
+    die_fail "dave's row '$QVAL' vanished after a refused CAT_EXEC DELETE (shell said: $(printf '%s' "$SHEL_OUT" | tail -4 | tr '\n' ' '))"
+fi
+
+# The write surface is not a DDL path: the statement parses, then MEANING
+# refuses it by name before any lookup or transaction.
+if run_verb "catalog exec DROP TABLE $WTBL" "CAT_EXEC refused by kernel.env.catalog"; then
+    expect "only INSERT, UPDATE or DELETE" "a DDL statement is refused by name — CAT_EXEC is not ALTER"
+    reject "row(s) affected" "no affected-row body is sent with the refusal"
+else
+    die_fail "\`catalog exec DROP TABLE $WTBL\` produced no TYPE refusal in ${WAIT_VERB}s"
+fi
+
+# The boundary, on the write path: the foreign object exists in the same
+# catalog, in PARTITION_SYSTEM, so the answer is NOENT — the same absence a
+# name that never existed gets, not a PERM that confirms it.
+if run_verb "catalog exec INSERT INTO $OUT_OBJ (k) VALUES (1)" "CAT_EXEC refused by kernel.env.catalog"; then
+    reject "PERM_WRITE" "a foreign write target is absence, not a PERM that confirms it"
+    reject "not a row-set table" "the foreign object was never resolved far enough to describe its kind"
+    reject "row(s) affected" "a foreign write produced no affected-row body"
+else
+    die_fail "\`catalog exec INSERT INTO $OUT_OBJ ...\` produced no refusal in ${WAIT_VERB}s"
+fi
+
+ATTACH_TOKEN=""
+ATTACH_ENV_ID=""
+
 # ─── 9. teardown (the EXIT trap runs it from here either way) ─────────────
 [ "$fail" -eq 0 ] || report_and_exit
 
-echo "OK: §9.1's catalog surface answered end to end — a partition and an environment created in it, info/list/stat/read/sql driven into that environment through \`env attach\`, and every answer (all refusals included) came back on the environment's own console"
+echo "OK: §9.1's catalog surface answered end to end — a partition and an environment created in it, info/list/stat/read/sql driven into that environment through \`env attach\`, every answer (all refusals included) came back on the environment's own console, and M5.1's CAT_EXEC committed the owner's write while refusing the non-owner's"
 exit 0

@@ -1,0 +1,16 @@
+ok:   W1. kernel/env_catalog.c is compiled into the kernel
+ok:   W2. cap_create_sidecar() reaches the registration, hop by hop
+ok:   W3. the arm is gated on kernel.env.catalog, between the kernel-owned gate and the registry fallback, and answers under that name
+ok:   W4. console_service_tick() skips the catalog channel's kernel slot
+ok:   W5. env_catalog_service_tick() runs in microkernel_service_poll() after net_socket_service_tick()
+ok:   B1. the boundary: filtered on the registered partition as absence, sourced from pd->partition_id, unmovable by the wire
+ok:   B2. the host test links the real service, pins the indistinguishable-NOENT clause, and is built by run_all.sh
+ok:   C1. the tenant manifest names kernel.env.catalog with rights 0x7, n_caps counts it, the system profile does not carry it, and the pin test asserts it
+ok:   C2. the client speaks the four original verbs, reads the status word, surfaces the refusal text, and is wired manifest -> BIB -> boot -> procmgr -> applet
+ok:   Q1. CAT_QUERY exists on both halves with matching numbers, has an encoder/decoder, and is reachable as 'catalog sql'
+ok:   Q2. CAT_QUERY's gates run in order: parse, resolve inside the registered partition, uid off proc_table, policy, then execute
+ok:   Q3. CAT_EXEC and its statuses exist on both halves, with an encoder/decoder and the 'catalog exec' command
+ok:   Q4. CAT_EXEC runs parse -> partition -> bound owner -> PERM_WRITE -> begin -> execute_tx -> commit -> CAT_OK
+ok:   Q5. one autocommit site, one explicit write site, six verbs, unknown still refused, and the query reply sent at the cursor's own length
+
+env_catalog_broker_check: all clauses held

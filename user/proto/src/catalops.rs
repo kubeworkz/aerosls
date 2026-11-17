@@ -14,7 +14,7 @@
 //! back to a synthesized line where no service answered to render one.
 
 use crate::{
-    CatInfo, CatListEntry, CatListHead, CatRows, CatStat, CatValue,
+    CatExec, CatInfo, CatListEntry, CatListHead, CatRows, CatStat, CatValue,
     CAT_LIST_PAGE_MAX, CAT_TEXT_CAP,
 };
 
@@ -70,11 +70,9 @@ pub type CatResult<T> = Result<T, CatRefusal>;
 /// carry the reply with no allocation and no length negotiation.
 pub type CatPage = (CatListHead, [CatListEntry; CAT_LIST_PAGE_MAX as usize]);
 
-/// The verbs of §9.1's mediated surface. There is deliberately no write
-/// method: no such verb exists in the kernel's table, and a trait that
-/// offered one would be promising something the service answers
-/// CAT_ERR_UNKNOWN. `cat_query` reads, which is why it is here and an
-/// INSERT method is not — the service admits SELECT alone.
+/// The verbs of §9.1's mediated surface. `cat_exec` is the one write method:
+/// one DML statement per call, with identity and policy bound by the kernel.
+/// There is still no DDL, no second-table form and no wire uid.
 pub trait CatalogOps {
     /// CAT_INFO — the handshake: the real ceilings and the partition the
     /// kernel computed this caller's boundary from.
@@ -102,4 +100,12 @@ pub trait CatalogOps {
     /// never an empty result, which is the difference this verb exists to
     /// keep visible.
     fn cat_query(&mut self, sql: &[u8], page: u16, limit: u8) -> CatResult<CatRows>;
+
+    /// CAT_EXEC — one INSERT/UPDATE/DELETE, run in an explicit transaction
+    /// and acknowledged only after commit. The service binds the caller's
+    /// owner uid and checks PERM_WRITE before the engine runs; the statement
+    /// itself carries neither. A `CatErr` is a received refusal, so a
+    /// CONFLICT/BUSY may be retried only when this call returned it — a lost
+    /// reply is an unknown outcome and the caller must re-read first.
+    fn cat_exec(&mut self, sql: &[u8]) -> CatResult<CatExec>;
 }
