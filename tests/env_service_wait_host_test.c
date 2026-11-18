@@ -532,7 +532,7 @@ int main(void) {
 
     /* 1. an unregistered service cannot round-trip anything. */
     reset_manager(MANAGER_ALIVE);
-    CHECK(env_service_create(1, 0, 0, &status, &env_id) == -1 && g_sends == 0,
+    CHECK(env_service_create(1, 0, 0, ENV_PROFILE_NONE, &status, &env_id) == -1 && g_sends == 0,
           "an unregistered env service is refused without sending a request");
 
     env_service_register((uint16_t)ENV_K_RD, (uint16_t)ENV_K_WR, ENV_MGR_PID);
@@ -547,7 +547,7 @@ int main(void) {
     /* 3-6. THE DISCRIMINATOR: a manager that only runs when the control plane
      *      yields still answers, inside the old bound. */
     reset_manager(MANAGER_ALIVE);
-    int rc = env_service_create(7, 3, 0, &status, &env_id);
+    int rc = env_service_create(7, 3, 0, ENV_PROFILE_NONE, &status, &env_id);
     CHECK(rc == 0 && status == ENV_OK && env_id == ENV_ENV_ID,
           "a manager that only progresses on a yield still answers (rc 0, ENV_OK)");
     CHECK(g_yields >= 1,
@@ -561,12 +561,33 @@ int main(void) {
         const uint8_t* req = logged_request(0, &len);
         CHECK(req && env_frame_parse(req, len, &ty) && ty == ENV_CREATE &&
               env_read_u32(req, ENV_FRAME_SIZE) == 7 &&
-              env_read_u32(req, ENV_FRAME_SIZE + 4) == 3,
+              env_read_u32(req, ENV_FRAME_SIZE + 4) == 3 &&
+              env_read_u32(req, ENV_FRAME_SIZE + 12) == ENV_PROFILE_NONE,
               "the first request a create sends is the E4 create frame for "
-              "(partition 7, index 3)");
+              "(partition 7, index 3, default profile)");
     }
     CHECK(g_foreign_polls == 0,
           "the wait polls only its own reply channel");
+
+    /* 6b. M5.3: the profile selector is part of the SAME create frame, in the
+     * fourth u32 of its body. The manager still answers one create + register;
+     * this pins the wire the runtime-selected tenant rides on. */
+    reset_manager(MANAGER_ALIVE);
+    status = 0xFFFF; env_id = 0;
+    rc = env_service_create(7, 5, 0, ENV_PROFILE_TENANT_LINUX_CKPT,
+                            &status, &env_id);
+    CHECK(rc == 0 && status == ENV_OK,
+          "a runtime-profile create answers through the same wait");
+    {
+        uint16_t pty = 0;
+        uint32_t plen = 0;
+        const uint8_t* preq = logged_request(0, &plen);
+        CHECK(preq && env_frame_parse(preq, plen, &pty) && pty == ENV_CREATE &&
+              env_read_u32(preq, ENV_FRAME_SIZE + 12) ==
+                  ENV_PROFILE_TENANT_LINUX_CKPT,
+              "the create body carries the requested profile after owner_uid");
+    }
+    (void)env_ckpt_drop(7, 5);
 
     /* 7a/7b. THE REGRESSION: the create takes longer than the old fixed
      *        bound, but the manager keeps being scheduled. The quiet window
@@ -574,7 +595,7 @@ int main(void) {
     reset_manager(MANAGER_ALIVE);
     g_answer_after_yields = SLOW_ANSWER_AFTER;
     status = 0xFFFF; env_id = 0;
-    rc = env_service_create(1, 0, 0, &status, &env_id);
+    rc = env_service_create(1, 0, 0, ENV_PROFILE_NONE, &status, &env_id);
     CHECK(rc == 0 && status == ENV_OK && env_id == ENV_ENV_ID,
           "a slow create answers: the manager was still being scheduled when the "
           "old fixed bound expired");
@@ -587,7 +608,7 @@ int main(void) {
     /* 7c. A manager that stops being scheduled is still bounded, tick for
      *     tick, by the quiet window -- and the wait keeps yielding. */
     reset_manager(MANAGER_DEAD);
-    CHECK(env_service_create(1, 0, 0, &status, &env_id) == -1,
+    CHECK(env_service_create(1, 0, 0, ENV_PROFILE_NONE, &status, &env_id) == -1,
           "a dead env manager cannot hang the HTTP server: the quiet window still bounds it");
     CHECK(kernel_tick_counter == ENV_RPC_STALL_TICKS,
           "the bounded wait ran exactly ENV_RPC_STALL_TICKS ticks of quiet");
@@ -600,7 +621,7 @@ int main(void) {
     /* 7d. A manager that keeps running but never answers is bounded by the
      *     absolute ceiling: progress alone must not hold the server forever. */
     reset_manager(MANAGER_SPINNING);
-    CHECK(env_service_create(1, 0, 0, &status, &env_id) == -1,
+    CHECK(env_service_create(1, 0, 0, ENV_PROFILE_NONE, &status, &env_id) == -1,
           "a manager that keeps running but never answers is still refused");
     CHECK(kernel_tick_counter == ENV_RPC_CEIL_TICKS,
           "the absolute ceiling, not the quiet window, is what stopped it");
@@ -610,13 +631,13 @@ int main(void) {
     reset_manager(MANAGER_ALIVE);
     enqueue_reply(STALE_ENV_ID, 0xDEADu, 0);
     status = 0xFFFF; env_id = 0;
-    rc = env_service_create(1, 0, 0, &status, &env_id);
+    rc = env_service_create(1, 0, 0, ENV_PROFILE_NONE, &status, &env_id);
     CHECK(rc == 0 && env_id == ENV_ENV_ID,
           "a stale reply left by a timed-out request is drained, not mistaken for the answer");
 
     /* 9. a short/malformed reply is never taken as success. */
     reset_manager(MANAGER_TRUNCATED);
-    CHECK(env_service_create(1, 0, 0, &status, &env_id) == -1,
+    CHECK(env_service_create(1, 0, 0, ENV_PROFILE_NONE, &status, &env_id) == -1,
           "a reply shorter than frame + body is not accepted as an answer");
 
     /* 10. E5: the destroy round trip shares the same wait (and therefore the
@@ -659,7 +680,7 @@ int main(void) {
      * checkpoint. */
     reset_manager(MANAGER_ALIVE);
     status = 0xFFFF; env_id = 0;
-    rc = env_service_create(7, 3, 0, &status, &env_id);
+    rc = env_service_create(7, 3, 0, ENV_PROFILE_NONE, &status, &env_id);
     CHECK(rc == 0 && status == ENV_OK,
           "a create still answers as before with registration added");
     {
@@ -718,7 +739,7 @@ int main(void) {
     reset_manager(MANAGER_ALIVE);
     g_register_tenant = 1;
     status = 0xFFFF; env_id = 0;
-    rc = env_service_create(7, 4, 0, &status, &env_id);
+    rc = env_service_create(7, 4, 0, ENV_PROFILE_NONE, &status, &env_id);
     CHECK(rc == 0 && status == ENV_OK,
           "the tenant-profile create still answers (three-task registration)");
     CHECK(g_register_tenant == 1,

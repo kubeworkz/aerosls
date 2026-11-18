@@ -2,9 +2,11 @@
 # tests/m5_tenant_ckpt_probe_check.sh — M5.3's ordinary-tenant Linux
 # checkpoint/restore arm.
 #
-# The tenant profile is environment index 3, with the M5.2a tenant manifest bit
-# and no `e7_gate`. This build swaps the short-lived catalog probe for the
-# proven M4.6 two-thread fixture under `m5.tenant.ckpt.0`: the leader clones a
+# The tenant profile is selected at CREATE time by the `tenant-linux-ckpt`
+# profile (the harness creates it at index 4, which is deliberately not the
+# M5.2a probe-only index 3), with the M5.2a tenant manifest bit and no
+# `e7_gate`. This build swaps the short-lived catalog probe for the proven
+# M4.6 two-thread fixture under `m5.tenant.ckpt.0`: the leader clones a
 # thread, the child parks in an untimed private FUTEX_WAIT, the parent parks in
 # a timed private FUTEX_WAIT, and the harness checkpoints only after both
 # sidecars have logged `wait (futex)`.
@@ -37,7 +39,8 @@ L2="$ART/boot2.log"
 IMG="$ART/nvme.img"
 TOKEN=deadbeef01234567cafebabe76543210
 ENTRY="${M53_ENTRY:-3}"
-ENV_INDEX=3
+ENV_INDEX="${M53_ENV_INDEX:-4}"
+PROFILE="${M53_PROFILE:-tenant-linux-ckpt}"
 
 mkdir -p "$ART" || { echo "ABORT: cannot create $ART" >&2; exit 2; }
 
@@ -70,6 +73,10 @@ grep -qF 'm5_tenant_ckpt' user/init/Cargo.toml || \
     fail "init has no m5_tenant_ckpt feature"
 grep -qF 'm5_tenant_ckpt' user/sidecar/Cargo.toml || \
     fail "the sidecar has no m5_tenant_ckpt feature"
+grep -qF 'ENV_PROFILE_TENANT_LINUX_CKPT' kernel/env_proto.h || \
+    fail "the runtime profile selector is missing from the create wire"
+grep -qF 'env_profile_from_record' kernel/env_service.c || \
+    fail "the restore does not derive the profile from the record's task name"
 grep -qF 'crate::m4_ckpt_probe::spawn_tenant' user/sidecar/src/entry.rs || \
     fail "the sidecar does not select the tenant checkpoint spawn"
 [ -s user/sidecar/fixtures/m4_ckpt_probe.flat ] || \
@@ -141,11 +148,13 @@ api "$ART/pcreate.json" -X POST -d '{"name":"m53tenant"}' "$BASE/api/partitions"
 PID=$(jval "$ART/pcreate.json" partition_id)
 [ -n "$PID" ] && [ "$PID" != "0" ] || fail "no partition id"
 echo "partition=$PID"
-api "$ART/create.json" -X POST -d '{"index":3}' "$BASE/api/partition/$PID/env" || \
-    fail "POST env index 3"
+api "$ART/create.json" -X POST \
+    -d "{\"index\":$ENV_INDEX,\"profile\":\"$PROFILE\"}" \
+    "$BASE/api/partition/$PID/env" || \
+    fail "POST env index $ENV_INDEX with profile $PROFILE"
 ENV_ID=$(jval "$ART/create.json" env_id)
 [ -n "$ENV_ID" ] && [ "$ENV_ID" != "0" ] || fail "no tenant env id"
-echo "tenant env=$ENV_ID (index $ENV_INDEX)"
+echo "tenant env=$ENV_ID (index $ENV_INDEX, profile $PROFILE)"
 
 spawned=0
 for _ in $(seq 1 300); do

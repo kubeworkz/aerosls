@@ -159,7 +159,7 @@ if want_tooth no-restore; then
 import sys
 p = sys.argv[1]
 lines = open(p).read().split("\n")
-i = next(i for i, l in enumerate(lines) if "env_service_create(p, idx, w.owner_uid, &status, &new_id);" in l)
+i = next(i for i, l in enumerate(lines) if "env_service_create(p, idx, w.owner_uid, env_profile_from_record(&w), &status, &new_id);" in l)
 c = next(i for i, l in enumerate(lines) if "out->n_replayed++;" in l)
 # The counter moves above the create: the pass now claims replays it has not
 # made yet -- "an environment that comes back empty must not be described as

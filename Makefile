@@ -1203,8 +1203,10 @@ M5_CATALOG_PROBE ?=
 SIDECAR_M5_CATALOG_PROBE = $(if $(filter 1,$(M5_CATALOG_PROBE)),--features aerosls-sidecar/m5_catalog_probe)
 # M5.3: the ordinary-tenant checkpoint profile. `make x86-iso-e3
 # E3_INIT_FEATURES=e3_envs,m5_tenant_probe,m5_tenant_ckpt M5_TENANT_CKPT=1`
-# reuses the M4.6 two-thread fixture under `m5.tenant.ckpt.0` in environment
-# index 3, without `e7_gate`. Unset compiles the tenant spawn path out.
+# reuses the M4.6 two-thread fixture under `m5.tenant.ckpt.0`, without
+# `e7_gate`. The profile is selected at CREATE time by the runtime
+# `tenant-linux-ckpt` selector; the live harness creates it at index 4. Unset
+# compiles the tenant spawn path out.
 M5_TENANT_CKPT ?=
 SIDECAR_M5_TENANT_CKPT = $(if $(filter 1,$(M5_TENANT_CKPT)),--features aerosls-sidecar/m5_tenant_ckpt)
 SIDECAR_INIT_ELF   ?= user/target/x86_64-unknown-none/release/init

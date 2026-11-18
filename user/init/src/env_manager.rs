@@ -12,13 +12,14 @@
 use aerosls_proto::env_proto::{
     self, EnvFrame, RegisterRegion, RegisterReply, ENV_CREATE, ENV_DESTROY, ENV_ERR_CAPACITY,
     ENV_ERR_FULL, ENV_ERR_INVAL, ENV_ERR_NOENT, ENV_ERR_NOMEM, ENV_ERR_PART, ENV_ERR_QUOTA,
-    ENV_OK, ENV_REGISTER,
+    ENV_ERR_UNSUPP, ENV_OK, ENV_REGISTER, ENV_PROFILE_NONE, ENV_PROFILE_TENANT_LINUX_CKPT,
     REGION_POSIX_HEAP, REGION_RD_HEAP, REGION_RD_STORAGE, TASK_LINUX,
     TASK_POSIX_SIDECAR, TASK_RAMDISK_SIDECAR,
 };
 #[cfg(not(feature = "m4_ckpt_probe"))]
 use aerosls_proto::env_proto::LINUX_TASK_NAME;
-#[cfg(not(feature = "m5_tenant_ckpt"))]
+#[cfg(feature = "m5_tenant_ckpt")]
+use aerosls_proto::env_proto::TENANT_CKPT_TASK_NAME;
 use aerosls_proto::env_proto::TENANT_LINUX_TASK_NAME;
 use aerosls_proto::kabi::{
     Kernel, ERR_NOMEM, ENV_STORAGE_ERR_IO, ENV_STORAGE_ERR_NOSLOT,
@@ -75,14 +76,24 @@ pub struct Environment {
     /// because the registration reply is answered long after the create's
     /// local `gate` decision, and a restore must name the same task list.
     pub gate: bool,
-    /// M5.2b: this environment carries the ordinary-tenant Linux test profile
-    /// (`m5_tenant_probe`, designated index 3). It selects the manifest's
-    /// `FLAG_TENANT_LINUX` bit AND the record's third task — the Linux child
-    /// the sidecar spawns under `TENANT_LINUX_TASK_NAME`. Kept beside `gate`
-    /// because the registration reply is answered after the create's local
-    /// decision, and a restore must name the same task list. `gate` wins if a
-    /// hand-built manifest ever carries both profile bits.
+    /// M5.2a/M5.2b: this environment carries the ordinary-tenant Linux
+    /// manifest bit. The probe-only build sets it for designated index 3; the
+    /// runtime checkpoint profile sets it for profile 1. It selects the
+    /// manifest's `FLAG_TENANT_LINUX` bit; registration names the third task
+    /// from `profile` (the checkpoint fixture) or `TENANT_LINUX_TASK_NAME`
+    /// (the probe). Kept beside `gate` because the registration reply is
+    /// answered after the create's local decision, and a restore must name the
+    /// same task list. `gate` wins if a hand-built manifest ever carries both
+    /// profile bits.
     pub tenant_linux: bool,
+    /// M5.3: the runtime profile this environment was created with. Zero is the
+    /// default tenant shape; `ENV_PROFILE_TENANT_LINUX_CKPT` selects the
+    /// ordinary-tenant checkpoint fixture. Kept on the environment so a
+    /// duplicate create must ask for the same shape, and so registration names
+    /// its third task from the resolved request rather than from a build-time
+    /// index test. The record has no profile field: the task name is the
+    /// persisted selector a restore reads back.
+    pub profile: u32,
     /// The three private regions this environment owns, kept per-environment
     /// from E5: a destroy has to hand each of them back individually (E4 only
     /// ever needed the ramdisk heap's base at create time), so all three bases
@@ -140,7 +151,25 @@ pub fn create_environment<K: Kernel>(
     index: u32,
     images: &EnvImages,
 ) -> Result<Environment, i32> {
-    create_environment_owned(k, partition, index, 0, images)
+    create_environment_owned(k, partition, index, 0, ENV_PROFILE_NONE, images)
+}
+
+/// M5.3: resolve a wire profile against this build's capabilities and the
+/// gate's designated index. Profile 0 is always valid; profile 1 needs
+/// `m5_tenant_ckpt`, and the gate keeps its own build-time profile. Returning
+/// the resolved number (rather than only a bool) keeps the duplicate-create
+/// comparison and the registration naming the same value.
+fn resolve_profile(profile: u32, gate: bool) -> Result<(u32, bool), i32> {
+    let tenant_ckpt = match profile {
+        ENV_PROFILE_NONE => false,
+        ENV_PROFILE_TENANT_LINUX_CKPT if cfg!(feature = "m5_tenant_ckpt") => true,
+        ENV_PROFILE_TENANT_LINUX_CKPT => return Err(ENV_ERR_UNSUPP as i32),
+        _ => return Err(ENV_ERR_INVAL as i32),
+    };
+    if gate && tenant_ckpt {
+        return Err(ENV_ERR_UNSUPP as i32);
+    }
+    Ok((profile, tenant_ckpt))
 }
 
 /// M5.0: create an environment for `owner_uid`. The owner is stamped onto
@@ -154,8 +183,25 @@ pub fn create_environment_owned<K: Kernel>(
     partition: u32,
     index: u32,
     owner_uid: u32,
+    profile: u32,
     images: &EnvImages,
 ) -> Result<Environment, i32> {
+    // M5.3: resolve the requested profile BEFORE the placement pre-flight. A
+    // refused profile allocates nothing, exactly like a refused placement. The
+    // gate's designated index keeps its own build-time profile; combining it
+    // with the runtime tenant checkpoint profile is unsupported, not a second
+    // meaning for one environment. Profile 1 is a build capability too: a
+    // probe-only or default init refuses it by name instead of silently
+    // creating a plain tenant that a restore would then reject.
+    let gate = cfg!(feature = "e7_gate") && index == 1;
+    let (profile, tenant_ckpt) = resolve_profile(profile, gate)?;
+    // M5.2a keeps its build-time catalog probe ONLY in a build that does not
+    // have the checkpoint profile. A checkpoint build no longer selects the
+    // tenant fixture by index: profile 1 is the request's selector, so an
+    // index-3 create with profile 0 is an ordinary tenant.
+    let tenant_linux = tenant_ckpt ||
+        (cfg!(all(feature = "m5_tenant_probe", not(feature = "m5_tenant_ckpt"))) &&
+         index == M5_TENANT_ENV_INDEX);
     // P3 increment 1: the placement pre-flight — ask the kernel the
     // CAPACITY question BEFORE the first frame is taken (kernel/cap.h's
     // SYS_SLS_PLACEMENT_CAN_HOLD, 327): "can this partition hold the whole
@@ -261,20 +307,9 @@ pub fn create_environment_owned<K: Kernel>(
     // Tenant POSIX: tenant profile (no hardware/network — E2), wired to THIS
     // environment's ramdisk, placed in the same partition.
     //
-    // E7 increment 20: on an `e7_gate` build, environment index 1 is the gate
-    // profile — the SAME designation the E3 boot makes for its env 1
-    // (`entry::spawn_e3_tenant_envs`), so a control-plane create of the
-    // designated index produces the environment the gate harness can
-    // checkpoint. Every other index (and every other build) gets the plain
-    // tenant manifest, byte for byte.
-    let gate = cfg!(feature = "e7_gate") && index == 1;
-    // M5.2a/M5.2b: a build-time ordinary-tenant test profile, selected only for
-    // its designated index. It uses a distinct manifest bit and deliberately
-    // does not set `gate`, so it spawns the M5.2 catalog probe without the
-    // gate's stop/poison behavior. M5.2b DOES register its Linux task as the
-    // third checkpoint task — registration only, not capture/restore.
-    let tenant_linux =
-        cfg!(feature = "m5_tenant_probe") && index == M5_TENANT_ENV_INDEX;
+    // `gate`, the requested profile and the probe-only index arm were resolved
+    // before the placement pre-flight. The manifest branch below is the only
+    // place a profile becomes a build-time sidecar shape.
     let px_manifest = if gate {
         posix_manifest::build_posix_manifest_tenant_gate(
             px_name.as_str(),
@@ -329,6 +364,7 @@ pub fn create_environment_owned<K: Kernel>(
         owner_uid,
         gate,
         tenant_linux,
+        profile,
         rd_heap,
         rd_storage,
         px_heap,
@@ -404,17 +440,16 @@ pub fn environment_register_reply(env_id: u32, env: &Environment) -> RegisterRep
         r.set_task(2, aerosls_proto::env_proto::M4_CKPT_TASK_NAME, TASK_LINUX);
         #[cfg(not(feature = "m4_ckpt_probe"))]
         r.set_task(2, LINUX_TASK_NAME, TASK_LINUX);
-    } else if env.tenant_linux {
-        // M5.2b: the ordinary-tenant test profile's task. Naming it here, from
-        // the same profile bit that selected the manifest, is what makes a
-        // replay's create name the same task list — never whatever happened to
-        // be spawned. The kernel fills entry/stack at the spawn (and again at
-        // registration if the child won the create race). M5.3 swaps only the
-        // name (and therefore the fixture the sidecar spawns); the tenant
-        // profile bit and the record slot are unchanged.
+    } else if env.profile == ENV_PROFILE_TENANT_LINUX_CKPT {
+        // M5.3: the runtime profile's task. This name is the persisted
+        // selector: a restore reads it back from the record and asks for the
+        // same profile, so the name and the requested shape cannot drift.
         #[cfg(feature = "m5_tenant_ckpt")]
-        r.set_task(2, aerosls_proto::env_proto::TENANT_CKPT_TASK_NAME, TASK_LINUX);
-        #[cfg(not(feature = "m5_tenant_ckpt"))]
+        r.set_task(2, TENANT_CKPT_TASK_NAME, TASK_LINUX);
+    } else if env.tenant_linux {
+        // M5.2a/M5.2b: the probe-only build-time arm, kept for the catalog
+        // live check. A checkpoint build never reaches this branch: its
+        // tenant selector is the requested profile above.
         r.set_task(2, TENANT_LINUX_TASK_NAME, TASK_LINUX);
     }
     r
@@ -739,9 +774,19 @@ impl EnvManager {
         let body = &req[EnvFrame::SIZE..];
         match frame.ty {
             ENV_CREATE => {
-                let (partition, index, owner_uid) = match env_proto::parse_create_body(body) {
-                    Some(v) => v,
-                    None => return self.reply(reply, ENV_CREATE, ENV_ERR_INVAL, 0, 0),
+                let (partition, index, owner_uid, profile) =
+                    match env_proto::parse_create_body(body) {
+                        Some(v) => v,
+                        None => return self.reply(reply, ENV_CREATE, ENV_ERR_INVAL, 0, 0),
+                    };
+                // M5.3: resolve the profile before the idempotency check, so a
+                // retry that names an unsupported or unknown profile is still
+                // refused by name — an existing default environment must not
+                // make profile 1 look satisfied on a build without it.
+                let gate = cfg!(feature = "e7_gate") && index == 1;
+                let profile = match resolve_profile(profile, gate) {
+                    Ok((p, _)) => p,
+                    Err(e) => return self.reply(reply, ENV_CREATE, e as u16, 0, partition),
                 };
                 // Idempotent by identity: an environment at (partition, index)
                 // that already stands IS the answer to this create.
@@ -774,13 +819,21 @@ impl EnvManager {
                     .iter()
                     .position(|(_, e)| e.partition == partition && e.index == index)
                 {
+                    // A retry is the same create only when it asks for the same
+                    // resolved profile. Returning the existing environment to a
+                    // request for a different shape would make a plain tenant
+                    // look like a satisfied checkpoint-profile create (or the
+                    // reverse), and the caller would never learn the difference.
+                    if self.envs[pos].1.profile != profile {
+                        return self.reply(reply, ENV_CREATE, ENV_ERR_INVAL, 0, partition);
+                    }
                     let id = self.envs[pos].0;
                     return self.reply(reply, ENV_CREATE, ENV_OK, id, partition);
                 }
                 if self.envs.len() >= self.max_envs {
                     return self.reply(reply, ENV_CREATE, ENV_ERR_FULL, 0, partition);
                 }
-                match create_environment_owned(k, partition, index, owner_uid, &self.images) {
+                match create_environment_owned(k, partition, index, owner_uid, profile, &self.images) {
                     Ok(env) => {
                         let id = self.next_id;
                         self.next_id = self.next_id.wrapping_add(1);
@@ -788,6 +841,13 @@ impl EnvManager {
                         self.reply(reply, ENV_CREATE, ENV_OK, id, partition)
                     }
                     Err(ERR_NOMEM) => self.reply(reply, ENV_CREATE, ENV_ERR_NOMEM, 0, partition),
+                    // M5.3: the requested profile is known but not built here,
+                    // or it is combined with the gate's own profile.
+                    Err(e) if e == ENV_ERR_UNSUPP as i32 =>
+                        self.reply(reply, ENV_CREATE, ENV_ERR_UNSUPP, 0, partition),
+                    // M5.3: an unknown profile number is a malformed request.
+                    Err(e) if e == ENV_ERR_INVAL as i32 =>
+                        self.reply(reply, ENV_CREATE, ENV_ERR_INVAL, 0, partition),
                     // P3 inc. 1: the placement pre-flight refused BEFORE the
                     // first frame — its own code, so a caller can tell "this
                     // node/partition cannot hold another environment" from a
@@ -970,28 +1030,27 @@ mod tests {
                    CapKind::Chan { peer: Some("kernel.net.socket"), flags: 0 });
     }
 
-    /// M5.2a/M5.2b: only the designated index gets the tenant-Linux test flag,
+    /// M5.2a/M5.2b: the probe-only build still gets the designated index arm,
     /// and (when the profile is compiled in) the registration names its Linux
-    /// task. The equality against `cfg!(feature = ...)` keeps the test
-    /// meaningful in both the default build (flag absent) and the dedicated
-    /// tenant build (flag present).
+    /// task. A checkpoint build must NOT reach this arm: its tenant selector is
+    /// the runtime profile, not index 3.
     #[test]
-    fn tenant_linux_profile_selects_only_its_index_and_registers_its_linux_task() {
+    fn probe_only_tenant_linux_profile_selects_only_its_index_and_registers_its_linux_task() {
+        let probe_only = cfg!(all(feature = "m5_tenant_probe", not(feature = "m5_tenant_ckpt")));
         let k = SimKernel::new();
         let env = create_environment(&k, 5, M5_TENANT_ENV_INDEX, &images()).unwrap();
         let created = k.created();
         let px = parse_manifest(&created[1].0).unwrap();
-        assert_eq!(px.flags & FLAG_TENANT_LINUX != 0,
-                   cfg!(feature = "m5_tenant_probe"));
+        assert_eq!(px.flags & FLAG_TENANT_LINUX != 0, probe_only);
         assert_eq!(px.flags & FLAG_GATE, 0);
         assert_eq!(px.n_caps, 5);
         let reply = environment_register_reply(1, &env);
-        let expected_tasks = if cfg!(feature = "m5_tenant_probe") { 3 } else { 2 };
+        let expected_tasks = if probe_only { 3 } else { 2 };
         assert_eq!(reply.n_tasks, expected_tasks);
-        if cfg!(feature = "m5_tenant_probe") {
+        if probe_only {
             let name = core::str::from_utf8(&reply.task_names[2]).unwrap_or("");
             assert_eq!(name.trim_end_matches('\0'), TENANT_LINUX_TASK_NAME,
-                       "the designated tenant index registers the task the sidecar spawns");
+                       "the designated probe index registers the task the sidecar spawns");
             assert_eq!(reply.task_kinds[2], TASK_LINUX);
         }
 
@@ -1000,7 +1059,54 @@ mod tests {
         let other_created = other.created();
         let other_px = parse_manifest(&other_created[1].0).unwrap();
         assert_eq!(other_px.flags & FLAG_TENANT_LINUX, 0,
-                   "the test profile must not leak to an ordinary tenant index");
+                   "the build-time probe must not leak to an ordinary tenant index");
+    }
+
+    /// M5.3: the checkpoint profile is selected by the create request, not by
+    /// index 3, and the registration persists that choice as the task name a
+    /// restore reads back. The same test pins the two pre-create refusals: a
+    /// build without the feature cannot silently produce a plain tenant, and
+    /// the gate's designated index cannot carry the tenant profile too.
+    #[test]
+    fn runtime_ckpt_profile_is_the_selector_and_persists_in_the_task_name() {
+        let k = SimKernel::new();
+        if cfg!(feature = "m5_tenant_ckpt") {
+            let env = create_environment_owned(
+                &k, 5, M5_TENANT_ENV_INDEX + 1, 0,
+                ENV_PROFILE_TENANT_LINUX_CKPT, &images()).unwrap();
+            assert_eq!(env.profile, ENV_PROFILE_TENANT_LINUX_CKPT);
+            let created = k.created();
+            let px = parse_manifest(&created[1].0).unwrap();
+            assert_eq!(px.flags & FLAG_TENANT_LINUX, FLAG_TENANT_LINUX,
+                       "the runtime profile sets the ordinary-tenant Linux bit");
+            assert_eq!(px.flags & FLAG_GATE, 0);
+            let reply = environment_register_reply(1, &env);
+            assert_eq!(reply.n_tasks, 3);
+            let name = core::str::from_utf8(&reply.task_names[2]).unwrap_or("");
+            assert_eq!(name.trim_end_matches('\0'),
+                       aerosls_proto::env_proto::TENANT_CKPT_TASK_NAME,
+                       "the registration persists the selector as the Linux task name");
+            assert_eq!(reply.task_kinds[2], TASK_LINUX);
+
+            // Index 3 with no profile is no longer the checkpoint arm.
+            let plain = create_environment(&SimKernel::new(), 5, M5_TENANT_ENV_INDEX,
+                                           &images()).unwrap();
+            assert_eq!(plain.profile, ENV_PROFILE_NONE);
+            assert_eq!(environment_register_reply(1, &plain).n_tasks, 2);
+            assert_eq!(resolve_profile(ENV_PROFILE_TENANT_LINUX_CKPT, true),
+                       Err(ENV_ERR_UNSUPP as i32),
+                       "the gate's designated index cannot also carry profile 1");
+        } else {
+            assert_eq!(create_environment_owned(
+                           &k, 5, M5_TENANT_ENV_INDEX + 1, 0,
+                           ENV_PROFILE_TENANT_LINUX_CKPT, &images()),
+                       Err(ENV_ERR_UNSUPP as i32),
+                       "a build without m5_tenant_ckpt must refuse profile 1");
+        }
+        assert_eq!(create_environment_owned(
+                       &SimKernel::new(), 5, 2, 0, 99, &images()),
+                   Err(ENV_ERR_INVAL as i32),
+                   "an unknown profile is a malformed request");
     }
 
     #[test]
@@ -1172,10 +1278,16 @@ mod tests {
     }
 
     // ── EnvManager dispatch: the ENV_* request path ─────────────────────────
-    fn create_req_owned(partition: u32, index: u32, owner_uid: u32) -> alloc::vec::Vec<u8> {
+    fn create_req_profile(partition: u32, index: u32, owner_uid: u32,
+                          profile: u32) -> alloc::vec::Vec<u8> {
         let mut r = EnvFrame::new(ENV_CREATE, false).encode().to_vec();
-        r.extend_from_slice(&env_proto::encode_create_body(partition, index, owner_uid));
+        r.extend_from_slice(&env_proto::encode_create_body(
+            partition, index, owner_uid, profile));
         r
+    }
+
+    fn create_req_owned(partition: u32, index: u32, owner_uid: u32) -> alloc::vec::Vec<u8> {
+        create_req_profile(partition, index, owner_uid, ENV_PROFILE_NONE)
     }
 
     fn create_req(partition: u32, index: u32) -> alloc::vec::Vec<u8> {
@@ -1278,6 +1390,48 @@ mod tests {
         let m3 = full.handle_request(&k, &create_req(7, 2), &mut r2);
         assert_eq!(reply_status(&r2, m3).0, ENV_ERR_FULL,
                    "a NEW identity at capacity is still refused");
+    }
+
+    /// A retry that asks for a DIFFERENT profile is not the same create. The
+    /// existing plain tenant is not handed back as if the checkpoint profile
+    /// had been built, and no second environment is started.
+    #[cfg(feature = "m5_tenant_ckpt")]
+    #[test]
+    fn a_second_create_with_a_different_profile_is_refused_not_reused() {
+        let k = SimKernel::new();
+        let mut mgr = EnvManager::new(images(), 8);
+        let mut reply = [0u8; 64];
+        let n1 = mgr.handle_request(&k, &create_req(6, 2), &mut reply);
+        assert_eq!(reply_status(&reply, n1).0, ENV_OK);
+
+        let n2 = mgr.handle_request(&k,
+            &create_req_profile(6, 2, 0, ENV_PROFILE_TENANT_LINUX_CKPT), &mut reply);
+        assert_eq!(reply_status(&reply, n2).0, ENV_ERR_INVAL,
+                   "different profile, same identity: refused, not treated as a retry");
+        assert_eq!(mgr.environments().len(), 1);
+        assert_eq!(mgr.environments()[0].1.profile, ENV_PROFILE_NONE);
+        assert_eq!(k.created().len(), 2);
+    }
+
+    /// The request path carries the profile all the way to the registration:
+    /// the environment keeps it, and its Linux task name is the persisted
+    /// selector a restore reads back.
+    #[cfg(feature = "m5_tenant_ckpt")]
+    #[test]
+    fn env_manager_carries_the_runtime_profile_to_registration() {
+        let k = SimKernel::new();
+        let mut mgr = EnvManager::new(images(), 8);
+        let mut reply = [0u8; 64];
+        let n = mgr.handle_request(&k,
+            &create_req_profile(6, 2, 0, ENV_PROFILE_TENANT_LINUX_CKPT), &mut reply);
+        assert_eq!(reply_status(&reply, n).0, ENV_OK);
+        let env = mgr.environments()[0].1;
+        assert_eq!(env.profile, ENV_PROFILE_TENANT_LINUX_CKPT);
+        let reg = environment_register_reply(1, &env);
+        assert_eq!(reg.n_tasks, 3);
+        assert_eq!(reg.task_kinds[2], TASK_LINUX);
+        assert_eq!(&reg.task_names[2][..16], b"m5.tenant.ckpt.0");
+        assert_eq!(reg.task_names[2][16], 0);
     }
 
     #[test]
@@ -1639,8 +1793,9 @@ mod tests {
         assert_eq!(reg.chans, [env.ramdisk_r, env.ramdisk_w, env.posix_r, env.posix_w]);
 
         // The two sidecars, by the very names create registered them under;
-        // the tenant profile adds the Linux task it spawned as the third.
-        let expected_tasks = if cfg!(feature = "m5_tenant_probe") { 3 } else { 2 };
+        // the probe-only build adds its catalog Linux task as the third.
+        let probe_only = cfg!(all(feature = "m5_tenant_probe", not(feature = "m5_tenant_ckpt")));
+        let expected_tasks = if probe_only { 3 } else { 2 };
         assert_eq!(reg.n_tasks, expected_tasks);
         assert_eq!(&reg.task_names[0][..13], b"drv.ramdisk.3");
         assert_eq!(reg.task_names[0][13], 0);
@@ -1648,7 +1803,7 @@ mod tests {
         assert_eq!(&reg.task_names[1][..15], b"aerosls.posix.3");
         assert_eq!(reg.task_names[1][15], 0);
         assert_eq!(reg.task_kinds[1], TASK_POSIX_SIDECAR);
-        if cfg!(feature = "m5_tenant_probe") {
+        if probe_only {
             assert_eq!(&reg.task_names[2][..19], b"m5.tenant.catalog.0");
             assert_eq!(reg.task_names[2][19], 0);
             assert_eq!(reg.task_kinds[2], TASK_LINUX);

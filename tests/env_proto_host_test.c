@@ -39,9 +39,13 @@ int main(void) {
           ENV_ERR_PART == 3 && ENV_ERR_FULL == 4 && ENV_ERR_UNSUPP == 5 &&
           ENV_ERR_NOENT == 6,
           "status codes");
-    CHECK(ENV_FRAME_SIZE == 16 && ENV_CREATE_BODY_SIZE == 8 &&
+    CHECK(ENV_FRAME_SIZE == 16 && ENV_CREATE_BODY_SIZE == 16 &&
           ENV_DESTROY_BODY_SIZE == 8 && ENV_REPLY_BODY_SIZE == 12,
           "sizes");
+    CHECK(ENV_PROFILE_NONE == 0 && ENV_PROFILE_TENANT_LINUX_CKPT == 1 &&
+          strcmp(ENV_PROFILE_NAME_TENANT_LINUX_CKPT, "tenant-linux-ckpt") == 0 &&
+          strcmp(ENV_TENANT_CKPT_TASK_NAME, "m5.tenant.ckpt.0") == 0,
+          "the runtime profile constants and the persisted task name");
 
     /* ── P1a: ENV_REGISTER's sizes and the record they image ─────────────────
      * The reply body IS `struct EnvCkptRegister` (kernel/env_ckpt.h), so its
@@ -49,13 +53,14 @@ int main(void) {
      * layout itself is pinned field-for-field by tests/env_register_host_test.c
      * (literal byte offsets) and cross-language by
      * tests/env_register_pin_check.sh. */
-    CHECK(ENV_REGISTER_BODY_SIZE == 8 && ENV_REGISTER_REPLY_BODY_SIZE == 200,
+    CHECK(ENV_REGISTER_BODY_SIZE == 8 && ENV_REGISTER_REPLY_BODY_SIZE == 208,
           "register body sizes");
     CHECK(sizeof(struct EnvCkptRegister) == ENV_REGISTER_REPLY_BODY_SIZE,
           "the register body is a padding-free image of struct EnvCkptRegister");
     CHECK(ENV_REGISTER_REPLY_BODY_SIZE ==
               16 + ENV_CKPT_MAX_REGIONS * 16 + 4 + ENV_CKPT_MAX_CHANS * 4 +
-              4 + ENV_CKPT_MAX_TASKS * ENV_CKPT_NAME_LEN + ENV_CKPT_MAX_TASKS * 4,
+              4 + ENV_CKPT_MAX_TASKS * ENV_CKPT_NAME_LEN + ENV_CKPT_MAX_TASKS * 4 +
+              8,
           "the body is field-sum, so a count change on either side moves it");
     CHECK(ENV_REQ_MAX == ENV_FRAME_SIZE + ENV_CREATE_BODY_SIZE &&
           ENV_REPLY_MAX == ENV_FRAME_SIZE + ENV_REGISTER_REPLY_BODY_SIZE,
@@ -95,12 +100,35 @@ int main(void) {
     env_put_u16(bad, 8, 99);
     CHECK(env_frame_parse(bad, sizeof bad, &ty) == 0, "a wrong version is rejected");
 
-    /* ── ENV_CREATE body: { partition u32, index u32 } LE ─────────────────── */
+    /* ── ENV_CREATE body: { partition, index, owner_uid, profile } LE ─────── */
     uint8_t cb[ENV_CREATE_BODY_SIZE];
-    env_create_body_encode(cb, 0x11223344u, 0x55667788u);
-    CHECK(env_read_u32(cb, 0) == 0x11223344u && env_read_u32(cb, 4) == 0x55667788u,
-          "create body round-trips partition + index");
+    env_create_body_encode(cb, 0x11223344u, 0x55667788u, 0x99AABBCCu,
+                           ENV_PROFILE_TENANT_LINUX_CKPT);
+    CHECK(env_read_u32(cb, 0) == 0x11223344u && env_read_u32(cb, 4) == 0x55667788u &&
+          env_read_u32(cb, 8) == 0x99AABBCCu &&
+          env_read_u32(cb, 12) == ENV_PROFILE_TENANT_LINUX_CKPT,
+          "create body round-trips partition, index, owner and profile");
     CHECK(cb[0] == 0x44 && cb[3] == 0x11, "create body is little-endian");
+    CHECK(env_profile_from_name("") == (int)ENV_PROFILE_NONE &&
+          env_profile_from_name("tenant-linux-ckpt") ==
+              (int)ENV_PROFILE_TENANT_LINUX_CKPT &&
+          env_profile_from_name("tenant-linux-typo") == -1,
+          "the API name maps to the wire profile, and an unknown name is refused");
+    CHECK(strcmp(env_profile_name(ENV_PROFILE_TENANT_LINUX_CKPT),
+                 "tenant-linux-ckpt") == 0,
+          "the profile name is one definition used by the API and the logs");
+    {
+        struct EnvCkptRecord pr;
+        memset(&pr, 0, sizeof pr);
+        pr.n_tasks = 3;
+        pr.tasks[2].kind = ENV_CKPT_TASK_LINUX;
+        strcpy(pr.tasks[2].name, ENV_TENANT_CKPT_TASK_NAME);
+        CHECK(env_profile_from_record(&pr) == ENV_PROFILE_TENANT_LINUX_CKPT,
+              "the record's Linux task name is the persisted profile selector");
+        strcpy(pr.tasks[2].name, "m5.tenant.catalog.0");
+        CHECK(env_profile_from_record(&pr) == ENV_PROFILE_NONE,
+              "a catalog-probe record resolves to the default/probe path");
+    }
 
     /* ── ENV_DESTROY body: { env_id u32, partition u32 } LE ───────────────── */
     /* The partition is carried, not assumed: the control plane's destroy route

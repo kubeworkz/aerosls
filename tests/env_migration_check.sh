@@ -641,9 +641,12 @@ fi
 # answering "no such environment" on the destination — invisible in every
 # run where nobody attached. Both halves are pinned here.
 ad_rc=$(awk '/env_migrate_restore/{f=1} f && /env_service_create\(partition_id, index/{print NR; exit}' kernel/env_migrate.c)
+ad_profile=$(awk '/env_migrate_restore/{f=1} f && /env_profile_from_record\(&staged\)/{print NR; exit}' kernel/env_migrate.c)
 ad_bind=$(awk '/^int env_service_create/{f=1} f && /env_console_bind_env\(partition, index, \*out_env_id\)/{print NR; exit}' kernel/env_service.c)
 if [ -z "$ad_rc" ]; then
     bad "AD. the destination's restore no longer calls env_service_create() — the console would not be re-registered on the destination, so an operator's attach answers 'no such environment' for an environment that IS live there (§7's 'the console and the terminal follow')"
+elif [ -z "$ad_profile" ]; then
+    bad "AD. the destination's restore no longer derives the runtime profile from the staged record — a checkpoint-profile tenant would be rebuilt as a plain tenant and refused by the identity check"
 elif [ -z "$ad_bind" ]; then
     bad "AD. env_service_create() no longer binds the fresh env_id to the console — the environment exists and is live on the destination but is not addressable, which is G7's 'an environment you cannot reach is not an environment' reproduced on the migration path"
 else

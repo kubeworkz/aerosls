@@ -225,7 +225,8 @@ static int env_service_rpc(uint16_t ty, const uint8_t* body, uint32_t body_len,
 }
 
 int env_service_create(uint32_t partition, uint32_t index, uint32_t owner_uid,
-                       uint16_t* out_status, uint32_t* out_env_id) {
+                       uint32_t profile, uint16_t* out_status,
+                       uint32_t* out_env_id) {
     /* M5.0: the authenticated owner must resolve to the partition it is
      * creating in. The assignment is persisted with the partition table, so a
      * restore after a reboot still satisfies the sidecar create's gate. A zero
@@ -247,7 +248,7 @@ int env_service_create(uint32_t partition, uint32_t index, uint32_t owner_uid,
     }
 
     uint8_t body[ENV_CREATE_BODY_SIZE];
-    env_create_body_encode(body, partition, index, owner_uid);
+    env_create_body_encode(body, partition, index, owner_uid, profile);
     int rc = env_service_rpc(ENV_CREATE, body, (uint32_t)sizeof(body),
                              out_status, out_env_id, 0);
     /* POSIX-Environments E6: the environment's POSIX sidecar — and so its
@@ -732,7 +733,11 @@ int env_service_restore_pending(struct EnvSvcRestoreReport* out) {
 
         uint16_t status = ENV_ERR_INVAL;
         uint32_t new_id = 0;
-        int rc = env_service_create(p, idx, w.owner_uid, &status, &new_id);
+        /* The record's Linux task name is the persisted profile selector. A
+         * checkpoint-profile record asks init for that profile again; every
+         * other record asks for the default shape, preserving the probe-only
+         * build's index arm and refusing an identity mismatch honestly. */
+        int rc = env_service_create(p, idx, w.owner_uid, env_profile_from_record(&w), &status, &new_id);
         if (rc != 0) {
             es_release_held_linux(&w);
             if (has_linux) cap_linux_restore_disarm(p);

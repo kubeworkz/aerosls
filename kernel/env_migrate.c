@@ -902,6 +902,7 @@ int env_migrate_restore(uint32_t partition_id, uint32_t index) {
      * created the environment under the destination's boot uid would hand a
      * tenant's live state to the wrong identity. */
     int rc = env_service_create(partition_id, index, staged.owner_uid,
+                                env_profile_from_record(&staged),
                                 &status, &new_id);
     if (rc != 0 || status != ENV_OK) {
         env_ckpt_restore_refuse(partition_id, index, ENV_CKPT_REFUSE_CREATE,

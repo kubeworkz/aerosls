@@ -1466,17 +1466,26 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
         // drain; `env attach <partition> <env_id>` drains again. Repeat it to
         // continue the session — the streaming form is the web terminal's.
         else if (sh_starts(input_buffer, "env create ")) {
-            // env create <partition_id> [index] — index is the environment's
-            // identity within its partition (what its sidecar names carry),
-            // defaulting to 1 when omitted.
+            // env create <partition_id> [index] [profile] — index is the
+            // environment's identity within its partition (what its sidecar
+            // names carry), defaulting to 1 when omitted. The optional profile
+            // token is the same API name the HTTP route accepts; absent means
+            // the default shape.
             const char* p = input_buffer + 11;   /* strlen("env create ") */
-            char ptok[16], itok[16];
+            char ptok[16], itok[16], ftok[32];
             p = sh_token(p, ptok, sizeof(ptok));
             p = sh_token(p, itok, sizeof(itok));
+            p = sh_token(p, ftok, sizeof(ftok));
             uint32_t part  = sh_atoi(ptok);
             uint32_t index = itok[0] ? sh_atoi(itok) : 1u;
+            int profile = env_profile_from_name(ftok);
             uint16_t st = ENV_ERR_INVAL;
             uint32_t id = 0;
+            if (profile < 0) {
+                kernel_serial_printf(
+                    "[ENV] create partition=%u index=%u -> unknown profile '%s'\n",
+                    part, index, ftok);
+            } else {
             /* The create RPC below blocks this node's BSP sweep (sidecar
              * boot + the parked-posture wait) — and on the consensus leader
              * that sweep carries the only heartbeat stream. Announce the
@@ -1486,7 +1495,8 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
             env_migrate_intent_begin();
             /* M5.0: the environment belongs to the authenticated shell user,
              * not to whatever uid init's tree happens to run as. */
-            int r = env_service_create(part, index, current_session_uid, &st, &id);
+            int r = env_service_create(part, index, current_session_uid,
+                                       (uint32_t)profile, &st, &id);
             /* The create RPC returned: release the intent so this node is
              * declarable DEAD again immediately, not after the announce's
              * full 300 s budget (the release rides the same broadcast —
@@ -1504,6 +1514,7 @@ int sls_shell_execute(const char* input_buffer, struct ShellSession* sess,
             } else {
                 kernel_serial_printf("[ENV] create partition=%u index=%u -> %s\n",
                                      part, index, env_status_name(st));
+            }
             }
         }
         else if (sh_starts(input_buffer, "env list")) {

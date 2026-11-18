@@ -1,0 +1,860 @@
+[H[J[1;1H[?25l[m[H[J[1;1H[2;30HGNU GRUB  version 2.12
+
+
+[m[4;2H+----------------------------------------------------------------------------+[5;2H|[5;79H|[6;2H|[6;79H|[7;2H|[7;79H|[8;2H|[8;79H|[9;2H|[9;79H|[10;2H|[10;79H|[11;2H|[11;79H|[12;2H|[12;79H|[13;2H|[13;79H|[14;2H|[14;79H|[15;2H|[15;79H|[16;2H|[16;79H|[17;2H+----------------------------------------------------------------------------+[m[18;2H[19;2H[m     Use the ^ and v keys to select which entry is highlighted.
+
+      Press enter to boot the selected OS, `e' to edit the commands
+
+      before booting or `c' for a command-line.                           [5;80H [7m[5;3H*AeroSLS ? Phase 5 self-hosted (initrd sidecars)                            [m[5;78H[m[m[6;3H AeroSLS ? kernel only                                                      [m[6;78H[m[m[7;3H AeroSLS ? unified (control plane + sidecars)                               [m[7;78H[m[m[8;3H GRUB shell                                                                 [m[8;78H[m[m[9;3H                                                                            [m[9;78H[m[m[10;3H                                                                            [m[10;78H[m[m[11;3H                                                                            [m[11;78H[m[m[12;3H                                                                            [m[12;78H[m[m[13;3H                                                                            [m[13;78H[m[m[14;3H                                                                            [m[14;78H[m[m[15;3H                                                                            [m[15;78H[m[m[16;3H                                                                            [m[16;78H[m[16;80H [5;78H[22;1H   The highlighted entry will be executed automatically in 3s.                 [5;78H[22;1H                                                                               [23;1H                                                                               [5;78H[m[5;3H AeroSLS ? Phase 5 self-hosted (initrd sidecars)                            [m[5;78H[m[7m[6;3H*AeroSLS ? kernel only                                                      [m[6;78H[m[m[6;3H AeroSLS ? kernel only                                                      [m[6;78H[m[7m[7;3H*AeroSLS ? unified (control plane + sidecars)                               [m[7;78H[m[?25h[H[J[1;1H[H[J[1;1H[AEROSLS BOOT LOGGER V1.0.0 RUNNING]
+----------------------------------------------------------------------------------
+[BSP] Loading GDT and IDT...
+[FRAME] bootstrap stack [0xe1039a0,0xe2039a0) confirmed inside the reserved region -- frames 57603..57859 are the kernel's own stack and are not allocatable.
+[FRAME] reserved 57860 frames (226 MiB) below the kernel image end 0xe204000 -- allocator now starts above the kernel.
+[SIDECAR] multiboot v1 detected, flags=0x1a6f phys=0x10000
+[SIDECAR] v1 mods_count=1 mods_addr=0x100c4
+[SIDECAR] v1 initrd module at 0xe26c000..0xe459664 (2020964 bytes)
+[HW] Multiboot v1: mem_upper=1047388 KiB, top=0x3ffd7000
+[FRAME] reserved 786473 frames above 0x3ffd7000 -- that memory does not exist.
+[CAP] shared-memory arena: 64 MiB physically contiguous at 0xe400000 (16384 frames).
+[CAP] Seed kernel capability layer online: 512-slot tables, 1024-object ceiling, holders, channels, arena, message transport, syscalls 289-304.
+[QEMU-SLS MMU] shadow PML4=0x000000000e204000 (kernel PT inherited)
+[TIMER] tick calibrated: tsc=2641893871 Hz, lapic=62485449 Hz, ticr=624854, tick=10000000 ns
+[BSP] LAPIC and IRQ0 timer online.
+[BSP] Round-robin task scheduler initialised.
+[FPU] SSE/SSE2 enabled for ring 3 — CR4.OSFXSR|OSXMMEXCPT, CR0.MP; EM/TS clear, CR0.TS not armed
+[SYSCALL] Gate initialised. STAR=0x0010000800000000  LSTAR=0x0000000000102bd0
+[PROC] Ring-3 process manager initialised.
+[BOOT] command line: "unified=1 nic0=both nic1=none"
+[PARTITION] LPAR groundwork initialised (1 partition: system).
+[SERVICE] service registry initialised (0 registrations).
+[MESH] circuit breakers initialised (all closed).
+[WORKLOAD] declarative workloads initialised (reconciler OFF).
+[WLCTX] context pool initialised (8 slots).
+[FAILOVER] Subsystem initialised.
+[FAILOVER] relaunch grace: this node just came up -- no peer is declared DEAD for 6000 ticks (until tick 6002).
+[LOADER] Service binary store ready. Built-in demo: 26 bytes.
+[WEBAPP] Asset store ready. Built-in Navigator page: 2059 bytes.
+[ENTROPY] seeded.
+[RTC] CMOS clock accepted.
+[TLS] memory pool initialised (512 KiB, fixed).
+[AUTH] Token Registry
+ Email                           UID   Role          Token                             Password
+ -------------------------------  ----  ------------  --------------------------------  --------
+ dave@gridworkz.com  uid=1000  DB_ADMIN  deadbeef01234567cafebabe76543210  demo-dave
+ bob@vance.com  uid=1001  APP_USER  cafebabe7654321089abcdef01234567  demo-bob
+ carol@gridworkz.com  uid=1002  DB_ADMIN  feedf00dabcdef0112345678deadc0de  demo-carol
+ guest@sandbox.com  uid=1003  GUEST  deadc0de9988776655443322aabbccdd  demo-guest
+
+[JOURNAL] Subsystem initialised.
+[LOCK] Row-level lock manager initialised.
+[INDEX] Secondary index manager initialised.
+[CONSTRAINT] Engine initialised.
+[CURSOR] Server-side cursor engine initialised.
+[MQT] Materialized query table engine initialised.
+[ROWSTORE] Row-set storage engine initialised.
+[ROW_INDEX] B-tree row index engine initialised.
+[VECSTORE] Vector store engine initialised.
+[AGENT] Agent engine initialised (max agents=8, max workflows=4)
+[MK] Microkernel booted successfully. Ring-0 primitives online.
+[IPC] Message Passing interface configured (Port bounds 0x1001 - 0x1007).
+[MK] registering services
+[MK] Service ONLINE: VirtualMemoryMgr  PID=101
+[MK] Service ONLINE: ObjectSecurityMgr  PID=102
+[MK] Service ONLINE: NativeDbStoreMgr  PID=103
+[MK] Service ONLINE: StorageTierMgr  PID=104
+[MK] Service ONLINE: RecoveryLogVerifier  PID=105
+[MK] Service ONLINE: AgentRuntimeMgr  PID=106
+[MK] Service ONLINE: CheckpointMgr  PID=107
+[MK] Fault Isolation Daemon active. Poll interval: 100ms.
+[TIER] Storage Tier Manager initialized.
+[TIER] Thresholds: promote=8 accesses/tick  demote=30 idle ticks.
+[CKPT] CheckpointMgr initialised.
+[BSP] Waking Core 1...
+[SMP] AP at APIC id 1 online.
+[BSP] Core 1 online.
+[NET] PCI scanning for e1000...
+[NET] e1000 #0 at PCI slot 4 MMIO 0xfeb80000
+[NET] NIC roles taken from the command line.
+[E1000] nic0 MAC 52:54:00:12:34:07  roles: mgmt cluster
+[NET] Packet buffer pool ready (64 x 2 KB).
+[ARP] Announced 10.0.2.15 -> 52:54:00:12:34:07
+[DHCP] Starting DISCOVER...
+[DHCP] Bound: 10.0.2.15  gw 10.0.2.2  subnet 255.255.255.0
+[NET] 1 e1000 interface(s) online, 0 reserved for user drivers.
+[NVME] Controller at PCI slot 3 MMIO 0xfebb0000
+[NVME] Admin queue ready.
+[NVME] Identify Namespace 1: NCAP=2314885530819524197 blocks (~4415293752846 MB assuming 512B LBA)
+[NVME_IO] Creating CQ: prp1=0xe20a000 cdw10=0x3f0001
+[NVME_IO] Create CQ done, status=0x0
+[NVME_IO] PRP list page ready (multi-page transfers enabled).
+[NVME_IO] I/O queue pair 1 ready (64 entries, 4-KiB PRP).
+[PERSIST] Catalog restored: 0 entries.
+[PERSIST] Records restored from NVMe.
+[PERSIST] Schemas restored from NVMe.
+[PERSIST] Programs restored: 0 binaries.
+[PERSIST] Partitions restored from NVMe.
+[PERSIST] Partition ownership restored from NVMe.
+[TCP-QUOTA] partition 1: born bounded at 96 (tenant default; 0 = explicitly unlimited)
+[PERSIST] Row-store table headers + per-partition page cursors restored from NVMe.
+[PERSIST] Row constraints restored: 0 defined.
+[PERSIST] Row indexes rebuilt from NVMe-persisted definitions: 0 of 0.
+[PERSIST] Vecstore collection headers + per-partition page cursors restored from NVMe.
+[PERSIST] HNSW vector indexes rebuilt from NVMe-persisted definitions: 0 of 0.
+[PERSIST] Row journal restored: 0 entries (seq), 0 attachment(s).
+[PERSIST] Databases restored: 0 defined, next_id=1.
+[PERSIST] Views restored: 0 defined.
+[PERSIST] Tenants restored: 0 defined, next_id=1.
+[PERSIST] Service registry restored: 0 registration(s).
+[PERSIST] Workloads restored: 0 declaration(s) (reconciler stays OFF).
+[ENV_CKPT] Restored 1 environment checkpoint record(s) (0 partition(s) re-paused).
+[PERSIST] Environment storage directory restored (1 store(s)).
+[STREAM] No directory on NVMe — cold start.
+[STREAM] Stream store ready (frame-pool + NVMe persistence).
+[QEMU-SLS TCACHE] warm start — codebuf_used=0, codebuf=0x0000000007c8c000
+[QEMU-SLS PGO] hot threshold=1000, scan interval=1000 ticks
+[QEMU-SLS VM] no snapshot -- Phase 4 save/restore has no callers (scaffolding, awaiting a launcher resume path)
+[SECURITY] UID 1000 role updated to DB_ADMIN.
+[AUDIT] #1 uid=1000 action=ROLE_CHANGE detail=DB_ADMIN granted=1
+[PERSIST] Catalog snapshot written.
+[SECURITY] UID 1001 role updated to APP_USER.
+[AUDIT] #2 uid=1001 action=ROLE_CHANGE detail=APP_USER granted=1
+[PERSIST] Catalog snapshot written.
+[SECURITY] UID 1002 role updated to DB_ADMIN.
+[AUDIT] #3 uid=1002 action=ROLE_CHANGE detail=DB_ADMIN granted=1
+[PERSIST] Catalog snapshot written.
+[SECURITY] UID 1003 role updated to GUEST.
+[AUDIT] #4 uid=1003 action=ROLE_CHANGE detail=GUEST granted=1
+[PERSIST] Catalog snapshot written.
+[AUTH] Default demo account roles seeded in object-catalog role_table.
+[BOOT] unified boot requested (unified=1) — the Ring-0 control plane and the sidecar world will share this boot.
+[E1] control plane planted as PID 1 'kplane' in PARTITION_SYSTEM (proc slot 15; slot 0 belongs to the boot parent)
+[E1] BIB v3 flags=0x1 (UNIFIED) written into every sidecar's boot info block
+[CONSOLE] sidecar input forwarding disabled (kernel owns the console)
+[SIDECAR] boot image: init @0x20000000 (139280 B) dm @0x21023000 (106512 B) posix @0x2107e000 (1339680 B) ramdisk @0x215c6000 (94224 B) net @0x2261e000 (295056 B) e1000 @0x226e7000 (37272 B) registry @0x22771000 (4096 B)
+[SIDECAR] rootfs: 4096 bytes @ 0x2161e000
+[SIDECAR] device registry: 5 device(s) @0x22771000
+[SIDECAR] boot parent planted: slot0 pid=99 active=1 state=4
+[PAGING] New user PML4 at 0x000000000e20c000
+[SIDECAR] PID 100 'aerosls.init.0': wired chan 'console' to kernel service 'kernel.debug.console' (slots 9/10, kernel end 0/1)
+[SIDECAR] PID 100 'aerosls.init.0': wired chan 'env' to kernel service 'kernel.env.control' (slots 11/12, kernel end 2/3)
+[ENV] control channel wired: kernel ends rd=2 wr=3
+[SIDECAR] PID 100 'aerosls.init.0' released — runs on next schedule (BIB at 0x0000400000043000, entry 0x0000400000000000)
+[E1] init sidecar created (PID 100, messenger CHAN_R 0) and left RUNNABLE — unified boot: control plane and sidecars share this boot
+----------------------------------------------------------------------------------
+[SLS] System ready. Launching secure shell...
+----------------------------------------------------------------------------------
+
+--- Multi-User SLS Secure Shell Active ---
+Type 'help' for available commands.
+
+uid:1000> [HTTP] Listening on port 3000. GET http://10.0.2.15:3000/api/scan
+[TLS] CA loaded from disk, 1824 day(s) left. An existing import is still good.
+[TLS] server ready: TLS 1.3, P-256. leaf 475 bytes, CA 453 bytes.
+[TLS] import the CA (not the leaf) to trust this node.
+[TLS] Listening on port 8443. https://10.0.2.15:8443/
+[NET] hb TX: 1 heartbeat/liveness frame(s) handed to the NIC
+[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 1
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[PAGING] New user PML4 at 0x000000000e262000
+[SIDECAR] PID 101 'drv.device_manager.0': wired chan 'console' to kernel service 'kernel.debug.console' (slots 3/4, kernel end 4/5)
+[SIDECAR] PID 101 'drv.device_manager.0' released — runs on next schedule (BIB at 0x000040000001f000, entry 0x0000400000000000)
+[INIT] ── AeroSLS init sidecar booting ──[INIT] budget: 16 MiB[INIT] found 5 PCI device(s)[INIT]   [0]  class=06:00 vendor=8086 dev=1237 bar=0x00000000[INIT]   [1]  class=06:01 vendor=8086 dev=7000 bar=0x00000000[INIT]   [2]  class=03:00 vendor=1234 dev=1111 bar=0xfd000000[INIT]   [3] drv.nvme.0 class=01:08 vendor=1b36 dev=0010 bar=0xfebb0000[INIT]   [4]  class=02:00 vendor=8086 dev=100e bar=0xfeb80000[INIT] spawning Device Manager...[INIT]   (create_sidecar: drv.device_manager.0 image @ 0x21023000, 106512 bytes)[DM] ── AeroSLS Device Manager booting ──[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 101
+[INIT]   messenger: CHAN_R=13 CHAN_W=14[CAP] woken PID 100 (channel 3)
+[CAP] send handoff: PID 101 -> 100
+[INIT] sending device registry to Device Manager...[INIT] waiting for Device Manager to initialise devices...[DM] budget: 256 KiB heap[DM] waiting for the device registry from init...[PAGING] New user PML4 at 0x000000000e28b000
+[SIDECAR] PID 102 'drv.ramdisk.0': wired chan 'console' to kernel service 'kernel.debug.console' (slots 4/5, kernel end 6/7)
+[SIDECAR] PID 102 'drv.ramdisk.0' released — runs on next schedule (BIB at 0x000040000001c000, entry 0x0000400000000000)
+[INIT] all devices ready.[INIT] spawning ramdisk driver...[INIT]   ramdisk budget @ 0x215de000, storage @ 0x2161e000 (16 MiB)[INIT]   (create_sidecar: drv.ramdisk.0 image @ 0x215c6000, 94224 bytes)[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 101
+[INIT]   ramdisk messenger: CHAN_R=8 CHAN_W=3[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] UNIFIED boot (BIB flag): the kernel owns the NICs and the console; keeping the software-only spawn chain[INIT] e1000 BAR0 @ 0xfeb80000 → POSIX manifest DEV cap 'nic0.bar0'[INIT] unified boot: the network driver and the system POSIX sidecar stay unspawned (kernel-owned hardware)[INIT] ── Phase 5 init sidecar complete ──[INIT] system ready for POSIX sidecar creation.[INIT] entering the event loop (blocking wait + watchdog respawn)...[INIT] env manager on control channel (CHAN_R=11 CHAN_W=12)[INIT] unified boot: entering the heartbeat loop (DM watchdog + env control, no POSIX subject)[DM]   adopt [0]  class=06:00 vendor=8086 dev=1237 bar=0x00000000[DM]   adopt [1]  class=06:01 vendor=8086 dev=7000 bar=0x00000000[DM]   adopt [2]  class=03:00 vendor=1234 dev=1111 bar=0xfd000000[DM]   adopt [3] drv.nvme.0 class=01:08 vendor=1b36 dev=0010 bar=0xfebb0000[DM]   adopt [4]  class=02:00 vendor=8086 dev=100e bar=0xfeb80000[DM] registry: 5 device(s) adopted[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 1[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 2[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 3[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 4[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 5[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 6[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 7[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 8[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 9[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 10[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 11[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 12[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 13[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 2
+[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 14[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 15[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 16[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 17[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 18[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 19[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 20[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 21[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 22[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 23[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 24[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 25[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 26[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 27[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 28[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 3
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 29[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 30[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 31[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 32[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 33[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 34[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 35[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 36[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 37[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 38[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 39[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 40[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 41[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 42[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 43[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 4
+[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 44[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 45[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 46[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 47[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 48[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 49[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 50[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 51[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 52[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 53[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 54[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 55[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 56[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 57[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 58[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 5
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 59[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 60[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 61[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 62[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 63[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 64[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 65[CS] restore hold armed for partition 1 — a Linux child born now is held until the payload's pour adopts it
+[CAP] woken PID 100 (channel 2)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[PERSIST] Environment storage directory written (1 store(s)).
+[ENV-STORAGE] attach partition=1 index=4 base=237998080 bytes=1048576 slot=0 durable=1 charged=2 (reattach)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[PAGING] New user PML4 at 0x000000000e3f9000
+[SIDECAR] PID 103 'drv.ramdisk.4': wired chan 'console' to kernel service 'kernel.debug.console' (slots 4/5, kernel end 8/9)
+[SIDECAR] PID 103 'drv.ramdisk.4' released — runs on next schedule (BIB at 0x000040000001c000, entry 0x0000400000000000)
+[ENV-STORAGE] restore partition=1 index=4 slot=0 pages=256 loaded from LBA 1114112
+[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PAGING] New user PML4 at 0x000000001281e000
+[SIDECAR] PID 104 'aerosls.posix.4': wired chan 'console' to kernel service 'kernel.env.console' (slots 3/4, kernel end 10/11)
+[ENV-CONSOLE] environment (partition 1, index 4) console wired: posix pid 104, kernel ends rd=10 wr=11
+[SIDECAR] PID 104 'aerosls.posix.4': wired chan 'ramdisk' to sidecar 'drv.ramdisk.4' (PID 103, slots 5/6 peer_slots 6/7)
+[SIDECAR] PID 104 'aerosls.posix.4': wired chan 'network' to kernel service 'kernel.net.socket' (slots 7/8, kernel end 12/13)
+[NET-SOCKET] aerosls.posix.4 (partition 1, pid 104) wired: kernel ends rd=12 wr=13 — client + listener open (P2 increment 3)
+[SIDECAR] PID 104 'aerosls.posix.4': wired chan 'catalog' to kernel service 'kernel.env.catalog' (slots 9/10, kernel end 14/15)
+[ENV-CATALOG] aerosls.posix.4 (partition 1, pid 104, owner uid 1000) wired: kernel ends rd=14 wr=15 — mediated catalog view open (§9)
+[SIDECAR] PID 104 'aerosls.posix.4' released — runs on next schedule (BIB at 0x0000400000158000, entry 0x0000400000000000)
+[POSIX] boot: rw=06 rr=05 cw=03 nw=08
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[CAP] woken PID 100 (channel 2)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[CAP] woken PID 100 (channel 2)
+[ENV] checkpoint record registered: env 1 (partition 1, index 4) regions=3 chans=4 tasks=3 console=4
+[ENV_PAYLOAD] wait: task 0 'drv.ramdisk.4' kind=1 live=yes parked=yes syscall=311 nchans=2
+[ENV_PAYLOAD] wait: task 1 'aerosls.posix.4' kind=0 live=yes parked=yes syscall=311 nchans=1
+[ENV_PAYLOAD] wait: task 2 'm5.tenant.ckpt.0' kind=2 (linux, skipped)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 50 ticks)
+[CAP] woken PID 104 (channel 11)
+[CAP] send handoff: PID 103 -> 104
+[CAP] woken PID 104 (channel 11)
+[CAP] send handoff: PID 103 -> 104
+[PROC] PID 100 yielded to PID 104
+[INIT] heartbeat 66[CAP] woken PID 104 (channel 12)
+[PAGING] New user PML4 at 0x0000000012981000
+[SIDECAR] PID 105 'm5.tenant.ckpt.0' HELD for the restore pour — runs only after the payload adopts it (BIB at 0x0000400000005000, entry 0x0000400000000000)
+[ENV_CKPT] linux task 'm5.tenant.ckpt.0' stamped into partition=1 index=4 entry=0x400000000000 stack=0x400000002000..0x400000006000 caps=2
+[M5.3] tenant ckpt0000000B
+[POSIX] loop exit0=0000FEED
+[POSIX] loop tasks=00000001
+[CAP] woken PID 103 (channel 11)
+[CAP] send handoff: PID 104 -> 103
+[CAP] woken PID 103 (channel 11)
+[PROC] PID 100 yielded to PID 103
+[CAP] woken PID 103 (channel 11)
+[CAP] send handoff: PID 104 -> 103
+[CAP] woken PID 103 (channel 11)
+[INIT] heartbeat 67[POSIX] rc open err=00000002
+[POSIX] aero state=00000000
+[INIT] heartbeat 68[INIT] heartbeat 69[INIT] heartbeat 70[ENV_RESTORE] record (partition 1, index 4) replayed through create: env 1 -> 1, identity intact
+[ENV_PAYLOAD] wait: task 0 'drv.ramdisk.4' kind=1 live=yes parked=yes syscall=311 nchans=3
+[ENV_PAYLOAD] wait: task 1 'aerosls.posix.4' kind=0 live=yes parked=yes syscall=311 nchans=3
+[ENV_PAYLOAD] wait: task 2 'm5.tenant.ckpt.0' kind=2 (linux, skipped)
+[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 6
+[PARTITION] partition 1 paused -- excluded from scheduling rotation until resumed.
+[ENV_PAYLOAD] pour hold: partition 1 frozen with the parked posture verified -- deadline wakes are deferred until the pour is over
+[PROC] M4.6 restore thread 106 'm5.tenant.ckpt.0.t106' created (held, shared cr3).
+[SIDECAR] M4.6 restore thread 'm5.tenant.ckpt.0.t106' pid=106 tid=106 group=1 chan=15 sidecar=13/14 child=0/1 (held)
+[ENV_PAYLOAD] restored group for 'm5.tenant.ckpt.0': 2 held task(s), leader pid=105
+[ENV_PAYLOAD] linux task 'm5.tenant.ckpt.0' adopted at rip=0x400000000000 rsp=0x400000004ea0 fs_base=0x0 brk=0x400000006000 mtop=0x400000016000 form=1 held=1 stop=spent
+[ENV_PAYLOAD] thread 'm5.tenant.ckpt.0' restored PARKED on channel 14 (expect num=202) — the sidecar's restored queue owns the wake
+[ENV_PAYLOAD] thread 'm5.tenant.ckpt.0.t106' restored PARKED on channel 15 (expect num=202) — the sidecar's restored queue owns the wake
+[ENV_PAYLOAD] group contexts installed: 2 thread(s), leader='m5.tenant.ckpt.0' rip=0x400000000000 form=1
+[CAP] woken PID 104 (channel 10)
+[CAP] woken PID 103 (channel 11)
+[ENV_PAYLOAD] restored partition=1 index=4 env=1 pages=1721 console=0 bytes
+[SIDECAR] PID 105 'm5.tenant.ckpt.0' released after the restore pour — first instruction rip=0x400000000000 rsp=0x400000004ea0 state=4
+[SIDECAR] PID 106 'm5.tenant.ckpt.0.t106' released after the restore pour — first instruction rip=0x400000000069 rsp=0x400000004aa0 state=4
+[PARTITION] partition 1 resumed.
+[ENV_PAYLOAD] pour hold released: partition 1 resumed
+[ENV_RESTORE] 1 pending, 1 replayed, 0 refused, 0 still pending (0 partition(s) resumed for a create, 0 re-paused).
+[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 7
+[E1] yield: control plane -> PID 104 'aerosls.posix.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 103
+[INIT] heartbeat 71[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 72[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 73[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 74[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 75[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 76[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 77[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 78[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 79[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 80[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 81[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 82[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 83[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 84[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 85[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 8
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 86[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 87[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 88[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 89[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 90[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 91[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 92[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 93[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 94[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 95[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 96[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 97[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 98[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 99[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 100[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 101[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 9
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 102[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 103[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 104[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 105[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 106[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 107[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 108[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 109[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 110[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 111[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 112[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 113[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 114[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 115[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 116[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 10
+[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 117[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 118[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 119[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 120[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 121[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 122[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 123[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 124[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 125[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 126[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 127[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 128[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 129[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 130[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 131[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 11
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 132[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 133[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 134[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 135[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 136[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 137[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 138[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 139[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 140[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 141[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 142[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 143[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 144[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 145[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 146[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 12
+[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 147[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 148[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 149[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 150[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 151[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 152[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 153[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 154[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 155[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 156[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 157[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 158[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 159[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 160[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 161[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 13
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 162[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 163[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 164[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 165[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 166[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 167[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 168[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 169[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 170[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 171[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 172[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 173[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 174[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 175[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 176[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 14
+[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 177[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 178[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 179[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 180[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 181[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 182[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 183[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 184[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 185[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 186[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 187[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 188[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 189[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 190[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 191[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 15
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 192[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 193[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 194[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 195[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 196[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 197[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 198[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 199[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 200[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 201[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 202[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 203[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 204[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 205[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 16
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 206[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 207[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 208[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 209[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 210[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 211[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 212[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 213[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 214[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 215[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 216[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 217[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 218[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 219[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 220[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 17
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 221[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 222[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 223[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 224[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 225[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 226[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 227[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 228[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 229[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 230[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 231[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 232[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 233[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 234[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 235[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 18
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 236[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 237[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 238[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 239[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 240[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 241[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 242[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 243[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 244[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 245[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 246[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 247[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 248[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 249[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 250[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 19
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 251[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 252[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 253[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 254[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 255[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 256[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 257[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 258[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 259[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 260[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 261[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 262[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 263[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 264[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 265[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 266[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 20
+[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 267[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 268[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 269[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 270[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 271[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 272[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 273[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 274[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 275[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 276[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 277[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 278[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 279[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 280[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 281[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 21
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 282[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 283[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 284[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 285[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 286[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 287[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 288[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 289[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 290[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 291[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 292[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 293[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 294[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 295[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 296[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 22
+[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 297[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 298[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 299[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 300[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 301[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 302[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 303[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 304[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 305[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 306[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 307[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 308[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 309[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 310[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 311[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 23
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 312[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 313[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 314[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 315[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 316[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 317[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 318[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 319[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 320[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 321[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 322[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 323[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 324[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 325[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 326[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 24
+[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 327[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 328[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 329[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 330[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 331[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 332[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 333[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 334[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 335[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 336[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 337[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 338[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 339[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 340[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 341[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 25
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 342[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 343[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 344[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 345[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 346[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 347[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 348[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 349[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 350[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 351[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 352[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 353[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 354[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 355[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 356[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 26
+[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 357[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 358[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 359[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 360[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 361[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 362[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 363[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 364[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 365[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 366[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 367[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 368[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 104 'aerosls.posix.4' (budget 2 ticks)
+[E7] linux: num=000000CA child=m5.tenant.ckpt.0 wait timed out
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[PROC] PID 100 yielded to PID 104
+[CAP] woken PID 105 (channel 14)
+M4.6-FUTEX-PARENT-WAKE
+[INIT] heartbeat 369[E1] yield: control plane -> PID 105 'm5.tenant.ckpt.0' (budget 2 ticks)
+[E7] linux: num=00000001 child=m5.tenant.ckpt.0 write ok len=23 |M4.6-FUTEX-PARENT-WAKE.|
+[E1] yield: control plane -> PID 104 'aerosls.posix.4' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 104 'aerosls.posix.4' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] woken PID 106 (channel 15)
+[CAP] send handoff: PID 104 -> 106
+[E1] yield: control plane -> PID 105 'm5.tenant.ckpt.0' (budget 2 ticks)
+[E7] linux: num=000000CA child=m5.tenant.ckpt.0 wake (futex)
+
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[E1] yield: control plane -> PID 105 'm5.tenant.ckpt.0' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 103
+[CAP] woken PID 106 (channel 15)
+M4.6-FUTEX-WOKE
+[INIT] heartbeat 370[E1] yield: control plane -> PID 105 'm5.tenant.ckpt.0' (budget 2 ticks)
+[E7] linux: num=00000001 child=m5.tenant.ckpt.0.t106 write ok len=16 |M4.6-FUTEX-WOKE.|
+[CAP] woken PID 106 (channel 15)
+[CAP] send handoff: PID 104 -> 106
+[E1] yield: control plane -> PID 105 'm5.tenant.ckpt.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+M4.6-RESTORED-OK
+[E7] linux: num=00000001 child=m5.tenant.ckpt.0 write ok len=17 |M4.6-RESTORED-OK.|
+[E1] yield: control plane -> PID 105 'm5.tenant.ckpt.0' (budget 2 ticks)
+[CAP] woken PID 105 (channel 14)
+[CAP] send handoff: PID 104 -> 105
+[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 27
+[E1] yield: control plane -> PID 105 'm5.tenant.ckpt.0' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 106
+[INIT] heartbeat 371[E1] yield: control plane -> PID 104 'aerosls.posix.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 105 'm5.tenant.ckpt.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 103 'drv.ramdisk.4' (budget 2 ticks)
+[E1] yield: control plane -> PID 105 'm5.tenant.ckpt.0' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 106
+[INIT] heartbeat 372[E1] yield: control plane -> PID 105 'm5.tenant.ckpt.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 105 'm5.tenant.ckpt.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 105 'm5.tenant.ckpt.0' (budget 2 ticks)

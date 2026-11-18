@@ -6,7 +6,7 @@
 //! magic/version/type frame — the payload of a channel MSG envelope — followed
 //! by a per-opcode body.
 //!
-//! A request carries `ENV_CREATE { partition, index, owner_uid }` or
+//! A request carries `ENV_CREATE { partition, index, owner_uid, profile }` or
 //! `ENV_DESTROY { env_id, partition }`; the reply echoes the frame type and a
 //! uniform `{ status, env_id, partition }` body (env_id meaningful only on an
 //! `ENV_OK` create). The C control plane mirrors these constants (E4 part 3).
@@ -100,26 +100,43 @@ impl EnvFrame {
     }
 }
 
-/// `ENV_CREATE` request body: `{ partition u32, index u32, owner_uid u32 }`
-/// (12 bytes). `index` is the environment's identity within its partition —
-/// the sidecar names `drv.ramdisk.<index>` / `aerosls.posix.<index>` derive
-/// from it, and a human-readable name maps to an index at the control plane.
-/// `owner_uid` is the authenticated identity the kernel resolved from its
-/// session or bearer token; a zero preserves the pre-M5 inheritance rule for
-/// boot-internal creates.
-pub fn encode_create_body(partition: u32, index: u32, owner_uid: u32) -> [u8; 12] {
-    let mut b = [0u8; 12];
+/// M5.3: the runtime-selectable ordinary-tenant Linux checkpoint profile.
+/// Zero is the default tenant shape; profile 1 is accepted only when the
+/// `m5_tenant_ckpt` feature is compiled in. The resolved profile is persisted
+/// by the record's Linux task name (`TENANT_CKPT_TASK_NAME`), not by a new
+/// record field.
+pub const ENV_PROFILE_NONE: u32 = 0;
+pub const ENV_PROFILE_TENANT_LINUX_CKPT: u32 = 1;
+pub const ENV_PROFILE_NAME_TENANT_LINUX_CKPT: &str = "tenant-linux-ckpt";
+
+/// `ENV_CREATE` request body: `{ partition u32, index u32, owner_uid u32,
+/// profile u32 }` (16 bytes). `index` is the environment's identity within its
+/// partition — the sidecar names `drv.ramdisk.<index>` / `aerosls.posix.<index>`
+/// derive from it, and a human-readable name maps to an index at the control
+/// plane. `owner_uid` is the authenticated identity the kernel resolved from
+/// its session or bearer token; zero preserves the pre-M5 inheritance rule for
+/// boot-internal creates. `profile` is the runtime profile selector; zero is
+/// the default shape.
+pub fn encode_create_body(partition: u32, index: u32, owner_uid: u32,
+                          profile: u32) -> [u8; 16] {
+    let mut b = [0u8; 16];
     put_u32(&mut b, 0, partition);
     put_u32(&mut b, 4, index);
     put_u32(&mut b, 8, owner_uid);
+    put_u32(&mut b, 12, profile);
     b
 }
 
-pub fn parse_create_body(p: &[u8]) -> Option<(u32, u32, u32)> {
-    if p.len() < 12 {
+pub fn parse_create_body(p: &[u8]) -> Option<(u32, u32, u32, u32)> {
+    if p.len() < 16 {
         return None;
     }
-    Some((read_u32(p, 0), read_u32(p, 4), read_u32(p, 8)))
+    Some((
+        read_u32(p, 0),
+        read_u32(p, 4),
+        read_u32(p, 8),
+        read_u32(p, 12),
+    ))
 }
 
 /// `ENV_DESTROY` request body: `{ env_id u32, partition u32 }` (8 bytes).
@@ -203,7 +220,9 @@ pub const TENANT_LINUX_TASK_NAME: &str = "m5.tenant.catalog.0";
 /// M5.3: the ordinary-tenant checkpoint profile's Linux task. It reuses the
 /// proven M4.6 two-thread fixture, but under an ordinary tenant identity and
 /// without `FLAG_GATE`; init's registration names this slot and the tenant
-/// sidecar's checkpoint-profile spawn uses the same constant.
+/// sidecar's checkpoint-profile spawn uses the same constant. This name is
+/// also the persisted selector: a restore derives profile 1 from it, so the
+/// name and the requested shape cannot drift without a task-list mismatch.
 pub const TENANT_CKPT_TASK_NAME: &str = "m5.tenant.ckpt.0";
 
 /// M4.6 increment 1's live probe task. It is the SAME third task slot as
@@ -406,8 +425,14 @@ mod tests {
 
     #[test]
     fn bodies_round_trip() {
-        assert_eq!(parse_create_body(&encode_create_body(7, 3, 1001)), Some((7, 3, 1001)));
-        assert_eq!(parse_create_body(&encode_create_body(7, 3, 1001)[..8]), None);
+        assert_eq!(
+            parse_create_body(&encode_create_body(7, 3, 1001, ENV_PROFILE_TENANT_LINUX_CKPT)),
+            Some((7, 3, 1001, ENV_PROFILE_TENANT_LINUX_CKPT))
+        );
+        assert_eq!(
+            parse_create_body(&encode_create_body(7, 3, 1001, ENV_PROFILE_NONE)[..15]),
+            None
+        );
         assert_eq!(parse_destroy_body(&encode_destroy_body(42, 7)), Some((42, 7)));
         assert_eq!(parse_reply_body(&encode_reply_body(ENV_OK, 9, 7)), Some((ENV_OK, 9, 7)));
     }

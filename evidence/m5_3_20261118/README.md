@@ -1,5 +1,10 @@
 # M5.3 ordinary-tenant Linux checkpoint/restore (2026-11-18)
 
+> Historical build-time arm. The index-3 checkpoint arm has been replaced by
+the runtime `tenant-linux-ckpt` selector; its live two-boot evidence is
+`evidence/m5_3_runtime_20261118/` (create at index 4). This directory remains
+the record of the original index-3 fixture run.
+
 This records the first successful checkpoint/restore of a registered
 ordinary-tenant Linux task. The profile is build-time only: environment index
 3 carries the ordinary tenant manifest bit (`FLAG_TENANT_LINUX`) and **no**

@@ -260,12 +260,14 @@ grep -qF 'r.chans = [env.ramdisk_r, env.ramdisk_w, env.posix_r, env.posix_w];' "
     || map_bad="$map_bad chans"
 grep -qF 'r.set_task(0, rd.as_str(), TASK_RAMDISK_SIDECAR);' "$R_MGR" || map_bad="$map_bad rd-task"
 grep -qF 'r.set_task(1, px.as_str(), TASK_POSIX_SIDECAR);' "$R_MGR" || map_bad="$map_bad px-task"
+grep -qF '} else if env.profile == ENV_PROFILE_TENANT_LINUX_CKPT {' "$R_MGR" || map_bad="$map_bad runtime-profile-branch"
+grep -qF 'r.set_task(2, TENANT_CKPT_TASK_NAME, TASK_LINUX);' "$R_MGR" || map_bad="$map_bad runtime-profile-task"
 grep -qF '} else if env.tenant_linux {' "$R_MGR" || map_bad="$map_bad tenant-branch"
 grep -qF 'r.set_task(2, TENANT_LINUX_TASK_NAME, TASK_LINUX);' "$R_MGR" || map_bad="$map_bad tenant-task"
 if [ -n "$map_bad" ]; then
     bad "G. init's registration is missing or mismapping:$map_bad — every one of these is a fact only init has, and a registration that drops one leaves the record describing some other environment"
 else
-    ok "G. init reports its three kind-labelled regions (POSIX heap from px_heap, the record's order, not the struct's), its four channels, both sidecar names and the tenant profile's Linux task"
+    ok "G. init reports its three kind-labelled regions (POSIX heap from px_heap, the record's order, not the struct's), its four channels, both sidecar names, the runtime checkpoint task, and the probe-only tenant task"
 fi
 
 # ── H. The kernel's create path reaches the registration ──────────────────

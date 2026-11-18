@@ -711,9 +711,10 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
 
     // M5.3: the ordinary-tenant checkpoint profile. It is the M4.6 fixture
     // (a two-thread group parked in futex waits) under the tenant checkpoint
-    // identity, not the gate firstuser. Selected only by the build-time
-    // feature; the ordinary tenant's BIB bit is the only runtime input, and
-    // `gate` stays false so no gate stop/poison behavior is armed.
+    // identity, not the gate firstuser. The build-time feature compiles the
+    // fixture; the runtime selector is the create's `tenant-linux-ckpt`
+    // profile, whose manifest sets the ordinary tenant's BIB bit. `gate` stays
+    // false so no gate stop/poison behavior is armed.
     #[cfg(feature = "m5_tenant_ckpt")]
     {
         if tenant_linux {

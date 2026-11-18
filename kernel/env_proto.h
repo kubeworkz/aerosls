@@ -60,13 +60,30 @@
                              * anywhere; deliberately not NOMEM's mid-create one */
 
 #define ENV_FRAME_SIZE       16u
-#define ENV_CREATE_BODY_SIZE 12u
-/* { partition u32, index u32, owner_uid u32 }. `owner_uid` is the
- * authenticated identity the control plane already resolved from its session
- * or bearer token; init carries it through to the sidecar create so the
- * environment's catalog channel is bound to that uid, never to the boot uid 0
- * inherited from init's sidecar tree. A zero means "no authenticated owner"
- * and preserves the pre-M5 inheritance rule for boot-internal creates. */
+#define ENV_CREATE_BODY_SIZE 16u
+/* { partition u32, index u32, owner_uid u32, profile u32 }. `owner_uid` is
+ * the authenticated identity the control plane already resolved from its
+ * session or bearer token; init carries it through to the sidecar create so
+ * the environment's catalog channel is bound to that uid, never to the boot
+ * uid 0 inherited from init's sidecar tree. A zero means "no authenticated
+ * owner" and preserves the pre-M5 inheritance rule for boot-internal creates.
+ * `profile` is the runtime environment profile selector (`ENV_PROFILE_*`);
+ * zero is the default tenant shape, and the profile a create resolves to is
+ * persisted by the record's Linux task name, so a restore can ask for the
+ * same shape without a second record field. */
+
+/* M5.3: the runtime-selectable ordinary-tenant Linux checkpoint profile. The
+ * wire carries the number; the control plane accepts the name below. Profile
+ * 1 is refused by init when the `m5_tenant_ckpt` feature is not compiled in,
+ * and it is refused for the gate's designated index (the gate has its own
+ * build-time profile). */
+#define ENV_PROFILE_NONE               0u
+#define ENV_PROFILE_TENANT_LINUX_CKPT  1u
+#define ENV_PROFILE_NAME_TENANT_LINUX_CKPT "tenant-linux-ckpt"
+/* The record's Linux task name is the persisted selector. It is the same
+ * literal as user/proto/src/env_proto.rs's TENANT_CKPT_TASK_NAME and
+ * m5.tenant.ckpt.0; tests/linux_personality_check.sh pins the pair. */
+#define ENV_TENANT_CKPT_TASK_NAME "m5.tenant.ckpt.0"
 /* { env_id u32, partition u32 }. The partition is carried so the control
  * plane's nested destroy route (`POST /api/partition/{id}/env/destroy`)
  * ENFORCES its own {id}: the env id alone identifies the environment globally,
@@ -153,15 +170,59 @@ static inline int env_frame_parse(const uint8_t* b, size_t len, uint16_t* ty) {
     return 1;
 }
 
+/* ── profile selector ───────────────────────────────────────────────────── */
+/* Compare two NUL-terminated names without libc. */
+static inline int env_name_is(const char* a, const char* b) {
+    while (*a && *b) {
+        if (*a != *b) return 0;
+        a++; b++;
+    }
+    return *a == *b;
+}
+
+/* Parse the API's optional `profile` token. An absent/empty token is profile
+ * 0 (the default shape); a known name is its number; -1 is an unknown name, so
+ * the control plane can refuse it before any create is sent. */
+static inline int env_profile_from_name(const char* name) {
+    if (!name || !*name) return (int)ENV_PROFILE_NONE;
+    if (env_name_is(name, ENV_PROFILE_NAME_TENANT_LINUX_CKPT))
+        return (int)ENV_PROFILE_TENANT_LINUX_CKPT;
+    return -1;
+}
+
+static inline const char* env_profile_name(uint32_t profile) {
+    switch (profile) {
+        case ENV_PROFILE_NONE:              return "default";
+        case ENV_PROFILE_TENANT_LINUX_CKPT: return ENV_PROFILE_NAME_TENANT_LINUX_CKPT;
+        default:                            return "unknown";
+    }
+}
+
+/* The profile a checkpoint record replays under: its Linux task name is the
+ * persisted selector. A record with no tenant checkpoint task resolves to the
+ * default profile (the probe-only catalog arm, if this build has it, or a
+ * plain tenant that the identity check will refuse). */
+static inline uint32_t env_profile_from_record(const struct EnvCkptRecord* rec) {
+    if (!rec) return ENV_PROFILE_NONE;
+    for (uint32_t i = 0; i < rec->n_tasks && i < ENV_CKPT_MAX_TASKS; i++) {
+        if (rec->tasks[i].kind == ENV_CKPT_TASK_LINUX &&
+            env_name_is(rec->tasks[i].name, ENV_TENANT_CKPT_TASK_NAME))
+            return ENV_PROFILE_TENANT_LINUX_CKPT;
+    }
+    return ENV_PROFILE_NONE;
+}
+
 /* ── bodies ──────────────────────────────────────────────────────────────── */
-/* ENV_CREATE request body: { partition u32, index u32, owner_uid u32 }
- * (12 bytes). The owner is the caller's authenticated uid; the environment's
- * catalog channel is bound to it at sidecar create. */
+/* ENV_CREATE request body: { partition u32, index u32, owner_uid u32,
+ * profile u32 } (16 bytes). The owner is the caller's authenticated uid; the
+ * environment's catalog channel is bound to it at sidecar create. */
 static inline void env_create_body_encode(uint8_t* b, uint32_t partition,
-                                          uint32_t index, uint32_t owner_uid) {
+                                          uint32_t index, uint32_t owner_uid,
+                                          uint32_t profile) {
     env_put_u32(b, 0, partition);
     env_put_u32(b, 4, index);
     env_put_u32(b, 8, owner_uid);
+    env_put_u32(b, 12, profile);
 }
 
 /* ENV_DESTROY request body: { env_id u32, partition u32 } (8 bytes). */

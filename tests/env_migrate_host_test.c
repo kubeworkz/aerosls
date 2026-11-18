@@ -528,12 +528,15 @@ uint32_t partition_reclaim_all_frames(uint32_t partition_id) {
 static int      g_create_rc = 0;              /* -1 = the channel never answered */
 static uint16_t g_create_status = ENV_OK;     /* the ENV_* status the create reports */
 static uint32_t g_create_env_id = 500;
+static uint32_t g_create_profile = ENV_PROFILE_NONE;
 static int      g_create_calls = 0;
 static struct EnvCkptRecord g_create_record;  /* what "init" registers on a successful create */
 
 int env_service_create(uint32_t partition, uint32_t index, uint32_t owner_uid,
-                       uint16_t* out_status, uint32_t* out_env_id) {
+                       uint32_t profile, uint16_t* out_status,
+                       uint32_t* out_env_id) {
     g_create_calls++;
+    g_create_profile = profile;
     (void)owner_uid;
     if (out_status) *out_status = g_create_status;
     if (out_env_id) *out_env_id = g_create_env_id;
@@ -724,6 +727,7 @@ static void g_reset_fakes(void) {
     g_create_rc = 0;
     g_create_status = ENV_OK;
     g_create_env_id = 500;
+    g_create_profile = ENV_PROFILE_NONE;
     g_create_calls = 0;
     g_destroy_calls = 0;
     g_destroy_env_id = 0;
@@ -1671,6 +1675,8 @@ int main(void) {
                   "PAUSED: resume happens over here, by an operator, after the bytes land ***");
             CHECK(g_create_calls == 1 && g_destroy_calls == 0,
                   "exactly one create, no destroy: nothing was torn down to get here");
+            CHECK(g_create_profile == ENV_PROFILE_NONE,
+                  "a record with no tenant checkpoint task replays under the default profile");
         }
 
         /* ── G1b: the image-window tail the BEGIN declared crosses too ───

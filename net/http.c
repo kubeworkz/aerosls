@@ -3112,7 +3112,8 @@ static int api_partition_create_post(const char* body, char* buf, int max, SLSRo
 // ─── POST /api/partition/{id}/env — POSIX-Environments E4 ──────────────────────
 // Create a POSIX environment in partition {id}. Body: {"index": N} — the
 // environment's identity within the partition (its sidecar names
-// drv.ramdisk.<index>/aerosls.posix.<index> derive from it). This does NOT
+// drv.ramdisk.<index>/aerosls.posix.<index> derive from it) — plus an optional
+// "profile": "tenant-linux-ckpt" runtime selector. This does NOT
 // build the manifests in kernel C: it round-trips ENV_CREATE to init's
 // environment manager (env_service_create), which owns the Rust manifest
 // builders, and relays the result. Same DB_ADMIN+ gate as partition create —
@@ -3136,6 +3137,15 @@ static int api_partition_env_create_post(const char* body, char* buf, int max,
         j.buf[j.pos]='\0'; return j.pos;
     }
     uint32_t index = (uint32_t)json_int(body, "index");
+    char profile_name[32];
+    profile_name[0] = '\0';
+    json_str(body, "profile", profile_name, (int)sizeof(profile_name));
+    int profile = env_profile_from_name(profile_name);
+    if (profile < 0) {
+        jb_obj_open(&j,0); jb_str(&j,"ok","false"); jb_putc(&j,',');
+        jb_str(&j,"error","unknown environment profile");
+        jb_obj_close(&j); j.buf[j.pos]='\0'; return j.pos;
+    }
 
     uint16_t status = ENV_ERR_INVAL;
     uint32_t env_id = 0;
@@ -3152,7 +3162,8 @@ static int api_partition_env_create_post(const char* body, char* buf, int max,
     /* M5.0: bind the environment to the AUTHENTICATED caller, not the boot
      * uid the sidecar would otherwise inherit. req_uid is resolved from the
      * request's session/token by the HTTP layer before dispatch. */
-    int rc = env_service_create(partition, index, req_uid, &status, &env_id);
+    int rc = env_service_create(partition, index, req_uid, (uint32_t)profile,
+                                &status, &env_id);
     /* The create RPC returned — success or refusal, the blocking phase is
      * over. Release the intent so every peer's latch ends NOW instead of at
      * the budget's end: an unreleased announce leaves a blind spot exactly
