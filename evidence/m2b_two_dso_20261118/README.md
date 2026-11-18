@@ -9,8 +9,9 @@ relocation.
 
 **Result: the two-DSO hello does not run.** The live boot proves where the
 current path stops: musl's loader resolves the first non-libc `DT_NEEDED`,
-tries the file namespace four times, reports `ENOENT`, then reports
-unresolved `m2a_add`/`m2a_data` and exits 127. `M2B-OK` never prints.
+tries the path file and the three default library directories, gets
+`ENOENT` for each, then reports unresolved `m2a_add`/`m2a_data` and exits
+127. `M2B-OK` never prints.
 
 ## Pair shape
 
@@ -41,16 +42,20 @@ fixture. The restored hash is `be63cd4d…` (the Y5 pin).
 ```text
 [CS] dynamic image: main entry=0x4010a6 interp base=0x7f0000000000 entry=0x7f000007bf0e path='/lib/ld-musl-x86_64.so.1'
 [M2A] hello: spawned ch_00000013
-[E7] linux: num=00000002 child=m2a.linux.hello.0 ok      (x4)
+[E7] linux: num=00000002 child=m2a.linux.hello.0 -> ENOENT open /etc/ld-musl-x86_64.path
+[E7] linux: num=00000002 child=m2a.linux.hello.0 -> ENOENT open /lib/libm2a.so
+[E7] linux: num=00000002 child=m2a.linux.hello.0 -> ENOENT open /usr/local/lib/libm2a.so
+[E7] linux: num=00000002 child=m2a.linux.hello.0 -> ENOENT open /usr/lib/libm2a.so
 Error loading shared library libm2a.so: No such file or directory (needed by m2a.linux.hello.0)
 Error relocating m2a.linux.hello.0: m2a_add: symbol not found
 Error relocating m2a.linux.hello.0: m2a_data: symbol not found
 [E7] linux: num=000000E7 child=m2a.linux.hello.0 exit_group status=127
 ```
 
-The four `open` lines say `ok` because the sidecar's generic answer logger
-prints `ok` for **every non-ENOSYS status**; the loader's own message shows
-the actual answer was `ENOENT`. No `read`, `close`, or mmap follows.
+Each failed open now names its errno and the path it tried. (The sidecar's
+generic answer line previously printed `ok` for **every non-ENOSYS
+status**, which is why the first run of this probe looked like four
+successful opens.) No `read`, `close`, or mmap follows.
 
 ## Assumptions the current path breaks
 
@@ -75,9 +80,10 @@ the actual answer was `ENOENT`. No `read`, `close`, or mmap follows.
    the boot-generation gate, and sized into a fixed 1 MiB reserve/256 KiB
    memory budget. Arbitrary tenant-supplied dynamic payloads are not on this
    path.
-6. **The failure is not observable by name in the syscall log.** The
-   generic `ok` line hides a non-ENOSYS errno; diagnosing this probe needed
-   the loader's own stderr text, not the fd-class log.
+6. **Errno-accurate open logging was missing (fixed here).** The generic
+   answer line printed `ok` for every non-ENOSYS status; it now prints
+   `-> ENOENT open <path>`, so the failure names the path and error without
+   reading the loader's stderr.
 
 ## What M2b needs next
 
@@ -85,7 +91,8 @@ the actual answer was `ENOENT`. No `read`, `close`, or mmap follows.
   child can see `/lib/libm2a.so`.
 - A file-backed `mmap` arm (fd + offset + permissions) or a loader-specific
   pre-map/link-map injection that does not require one.
-- Errno-accurate open/close logging so the next failure names itself.
+- Close logging is still generic; open now names the errno and the failed
+  path (landed with this probe).
 
 ## Artifacts
 

@@ -4064,10 +4064,59 @@ fn answer_clone3<K: Kernel, A: BufferAlloc>(
     answer_clone(k, i, &args, vfs, LINUX_CLONE3)
 }
 
+/// The CAP code's errno NAME — the value §5.7 delivers, not the status
+/// word. The generic answer line used to print "ok" for every non-ENOSYS
+/// status, so the M2b probe's four failed opens looked like successes while
+/// the loader reported ENOENT. Name every code this sidecar can answer
+/// with; an unknown value prints `E?` rather than a lie.
+fn errno_name(status: i32) -> &'static [u8] {
+    match status {
+        E_NOSYS => b"ENOSYS",
+        E_NOENT => b"ENOENT",
+        E_IO => b"EIO",             /* E_REVOKED shares 2 */
+        E_PROTO => b"EPROTO",
+        E_INTR => b"EINTR",
+        E_CONFLICT => b"EBUSY",
+        E_INVAL => b"EINVAL",
+        E_BADF => b"EBADF",
+        E_PERM => b"EPERM",
+        E_NOMEM => b"ENOMEM",
+        E_TARGET => b"ESRCH",
+        E_ACCES => b"EACCES",
+        E_ISDIR => b"EISDIR",
+        E_NOTDIR => b"ENOTDIR",
+        E_EXIST => b"EEXIST",
+        E_NOTEMPTY => b"ENOTEMPTY",
+        E_ROFS => b"EROFS",
+        E_SPIPE => b"ESPIPE",
+        E_NAMETOOLONG => b"ENAMETOOLONG",
+        E_ADDRINUSE => b"EADDRINUSE",
+        E_ADDRNOTAVAIL => b"EADDRNOTAVAIL",
+        E_CONNRESET => b"ECONNRESET",
+        E_NOTCONN => b"ENOTCONN",
+        E_ISCONN => b"EISCONN",
+        E_DESTADDRREQ => b"EDESTADDRREQ",
+        E_MSGSIZE => b"EMSGSIZE",
+        E_PIPE => b"EPIPE",
+        E_CONNREFUSED => b"ECONNREFUSED",
+        E_TIMEOUT => b"ETIMEDOUT",
+        E_NETUNREACH => b"ENETUNREACH",
+        E_HOSTUNREACH => b"EHOSTUNREACH",
+        E_AFNOSUPPORT => b"EAFNOSUPPORT",
+        E_AGAIN => b"EAGAIN",
+        E_NOSPC => b"ENOSPC",
+        E_TABLEFULL => b"ENFILE",
+        _ => b"E?",
+    }
+}
+
 fn enosys_log(tag_num: u32, child: &[u8], extra: &[u8]) {
     #[cfg(feature = "target")]
     {
-        let mut line = [0u8; 72];
+        /* 160: a failed open's name + path must fit; the old 72 admitted
+         * only the first few bytes of a search path, which is exactly the
+         * fact the line now exists to carry. */
+        let mut line = [0u8; 160];
         let mut off = 0;
         line[off..off + 6].copy_from_slice(b"child=");
         off += 6;
@@ -4624,8 +4673,27 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                     /* An answered syscall must be visible too: this line
                      * is the serial-log half of E7's round-trip proof
                      * (a real task's real request arrived, and its reply
-                     * is on its way back through §5.7). */
-                    enosys_log(num as u32, &name_buf[..nlen], b" ok\n");
+                     * is on its way back through §5.7). An ERROR carries
+                     * its own name rather than the old blanket "ok", and
+                     * a failed open also carries the PATH it tried — the
+                     * request's own bytes name the missing object, not a
+                     * reconstruction from search order. */
+                    let mut ex = [0u8; 160];
+                    let mut off;
+                    if status == STATUS_OK {
+                        off = push_bytes(&mut ex, 0, b" ok\n");
+                    } else {
+                        off = push_bytes(&mut ex, 0, b" -> ");
+                        off = push_bytes(&mut ex, off, errno_name(status));
+                        if num == LINUX_OPEN {
+                            if let Some(path) = path_arg(payload, 0) {
+                                off = push_bytes(&mut ex, off, b" open ");
+                                off = push_bytes(&mut ex, off, path.as_bytes());
+                            }
+                        }
+                        off = push_bytes(&mut ex, off, b"\n");
+                    }
+                    enosys_log(num as u32, &name_buf[..nlen], &ex[..off]);
                 }
                 reply(k, ch_w, rr.tag, num, ret, status);
             }
