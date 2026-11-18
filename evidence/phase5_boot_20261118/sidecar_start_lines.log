@@ -1,0 +1,32 @@
+# Phase 5 single-NIC boot serial log
+# source: /tmp/aerosls_phase5_smoke.log
+[SIDECAR] PID 100 'aerosls.init.0': wired chan 'console' to kernel service 'kernel.debug.console' (slots 9/10, kernel end 0/1)
+[SIDECAR] PID 100 'aerosls.init.0': wired chan 'env' to kernel service 'kernel.env.control' (slots 11/12, kernel end 2/3)
+[SIDECAR] PID 100 'aerosls.init.0' released — runs on next schedule (BIB at 0x0000400000042000, entry 0x0000400000000000)
+[SIDECAR] PID 101 'drv.device_manager.0': wired chan 'console' to kernel service 'kernel.debug.console' (slots 3/4, kernel end 4/5)
+[SIDECAR] PID 101 'drv.device_manager.0' released — runs on next schedule (BIB at 0x000040000001f000, entry 0x0000400000000000)
+[SIDECAR] PID 102 'drv.ramdisk.0': wired chan 'console' to kernel service 'kernel.debug.console' (slots 4/5, kernel end 6/7)
+[SIDECAR] PID 102 'drv.ramdisk.0' released — runs on next schedule (BIB at 0x000040000001c000, entry 0x0000400000000000)
+[SIDECAR] PID 103 'drv.network.0': wired chan 'console' to kernel service 'kernel.debug.console' (slots 3/4, kernel end 8/9)
+[SIDECAR] PID 103 'drv.network.0' released — runs on next schedule (BIB at 0x000040000004d000, entry 0x0000400000000000)
+[SIDECAR] PID 104 'aerosls.posix.0': wired chan 'console' to kernel service 'kernel.debug.console' (slots 3/4, kernel end 10/11)
+[SIDECAR] PID 104 'aerosls.posix.0': wired chan 'ramdisk' to sidecar 'drv.ramdisk.0' (PID 102, slots 5/6 peer_slots 6/7)
+[SIDECAR] PID 104 'aerosls.posix.0': wired chan 'network' to sidecar 'drv.network.0' (PID 103, slots 7/8 peer_slots 5/6)
+[SIDECAR] PID 104 'aerosls.posix.0': irq cap 'irq.timer.0' vector 32 slot 9
+[SIDECAR] PID 104 'aerosls.posix.0': irq cap 'irq.serial.0' vector 36 slot 10
+[SIDECAR] PID 104 'aerosls.posix.0': io cap 'uart' ports 0x3f8+8 slot 11
+[SIDECAR] PID 104 'aerosls.posix.0': dev cap 'nic0.bar0' phys 0xfeb80000+131072 slot 12
+[SIDECAR] PID 104 'aerosls.posix.0' released — runs on next schedule (BIB at 0x0000400000158000, entry 0x0000400000000000)
+[SIDECAR] PID 108 'aerosls.posix.0': wired chan 'console' to kernel service 'kernel.debug.console' (slots 3/4, kernel end 11/10)
+[SIDECAR] PID 108 'aerosls.posix.0': wired chan 'ramdisk' to sidecar 'drv.ramdisk.0' (PID 102, slots 5/6 peer_slots 8/9)
+[SIDECAR] PID 108 'aerosls.posix.0': wired chan 'network' to sidecar 'drv.network.0' (PID 103, slots 7/8 peer_slots 7/8)
+[SIDECAR] PID 108 'aerosls.posix.0': irq cap 'irq.timer.0' vector 32 slot 9
+[SIDECAR] PID 108 'aerosls.posix.0': irq cap 'irq.serial.0' vector 36 slot 10
+[SIDECAR] PID 108 'aerosls.posix.0': io cap 'uart' ports 0x3f8+8 slot 11
+[SIDECAR] PID 108 'aerosls.posix.0': dev cap 'nic0.bar0' phys 0xfeb80000+131072 slot 12
+[SIDECAR] PID 108 'aerosls.posix.0' released — runs on next schedule (BIB at 0x0000400000158000, entry 0x0000400000000000)
+
+# Phase 5 two-NIC e1000 handoff boot serial log
+# source: /tmp/aerosls_phase5_e1000_smoke.log
+[SIDECAR] PID 102 'drv.e1000.0': dev cap 'nic0.bar0' phys 0xfeba0000+131072 slot 3
+[SIDECAR] PID 102 'drv.e1000.0' released — runs on next schedule (BIB at 0x000040000000e000, entry 0x0000400000000000)

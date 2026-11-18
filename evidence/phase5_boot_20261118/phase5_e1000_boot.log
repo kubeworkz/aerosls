@@ -1,0 +1,119 @@
+[H[J[1;1H[?25l[m[H[J[1;1H[2;30HGNU GRUB  version 2.12
+
+[m[4;2H+----------------------------------------------------------------------------+[5;2H|[5;79H|[6;2H|[6;79H|[7;2H|[7;79H|[8;2H|[8;79H|[9;2H|[9;79H|[10;2H|[10;79H|[11;2H|[11;79H|[12;2H|[12;79H|[13;2H|[13;79H|[14;2H|[14;79H|[15;2H|[15;79H|[16;2H|[16;79H|[17;2H+----------------------------------------------------------------------------+[m[18;2H[19;2H[m     Use the ^ and v keys to select which entry is highlighted.
+      Press enter to boot the selected OS, `e' to edit the commands
+      before booting or `c' for a command-line.                           [5;80H [7m[5;3H*AeroSLS ? Phase 5 self-hosted (initrd sidecars)                            [m[5;78H[m[m[6;3H AeroSLS ? kernel only                                                      [m[6;78H[m[m[7;3H AeroSLS ? unified (control plane + sidecars)                               [m[7;78H[m[m[8;3H GRUB shell                                                                 [m[8;78H[m[m[9;3H                                                                            [m[9;78H[m[m[10;3H                                                                            [m[10;78H[m[m[11;3H                                                                            [m[11;78H[m[m[12;3H                                                                            [m[12;78H[m[m[13;3H                                                                            [m[13;78H[m[m[14;3H                                                                            [m[14;78H[m[m[15;3H                                                                            [m[15;78H[m[m[16;3H                                                                            [m[16;78H[m[16;80H [5;78H[22;1H   The highlighted entry will be executed automatically in 3s.                 [5;78H[22;1H   The highlighted entry will be executed automatically in 2s.                 [5;78H[22;1H   The highlighted entry will be executed automatically in 1s.                 [5;78H[22;1H   The highlighted entry will be executed automatically in 0s.                 [5;78H[?25h[H[J[1;1H[H[J[1;1H[AEROSLS BOOT LOGGER V1.0.0 RUNNING]
+----------------------------------------------------------------------------------
+[BSP] Loading GDT and IDT...
+[FRAME] bootstrap stack [0xe1039a0,0xe2039a0) confirmed inside the reserved region -- frames 57603..57859 are the kernel's own stack and are not allocatable.
+[FRAME] reserved 57860 frames (226 MiB) below the kernel image end 0xe204000 -- allocator now starts above the kernel.
+[SIDECAR] multiboot v1 detected, flags=0x1a6f phys=0x10000
+[SIDECAR] v1 mods_count=1 mods_addr=0x100b8
+[SIDECAR] v1 initrd module at 0xe26c000..0xe45866c (2016876 bytes)
+[HW] Multiboot v1: mem_upper=3144576 KiB, top=0xbffe0000
+[FRAME] reserved 262176 frames above 0xbffe0000 -- that memory does not exist.
+[CAP] shared-memory arena: 64 MiB physically contiguous at 0xe400000 (16384 frames).
+[CAP] Seed kernel capability layer online: 512-slot tables, 1024-object ceiling, holders, channels, arena, message transport, syscalls 289-304.
+[QEMU-SLS MMU] shadow PML4=0x000000000e204000 (kernel PT inherited)
+[TIMER] tick calibrated: tsc=2636827538 Hz, lapic=62795119 Hz, ticr=627951, tick=10000000 ns
+[BSP] LAPIC and IRQ0 timer online.
+[BSP] Round-robin task scheduler initialised.
+[FPU] SSE/SSE2 enabled for ring 3 — CR4.OSFXSR|OSXMMEXCPT, CR0.MP; EM/TS clear, CR0.TS not armed
+[SYSCALL] Gate initialised. STAR=0x0010000800000000  LSTAR=0x0000000000102bd0
+[PROC] Ring-3 process manager initialised.
+[BOOT] command line: "nic0=both nic1=none"
+[PARTITION] LPAR groundwork initialised (1 partition: system).
+[SERVICE] service registry initialised (0 registrations).
+[MESH] circuit breakers initialised (all closed).
+[WORKLOAD] declarative workloads initialised (reconciler OFF).
+[WLCTX] context pool initialised (8 slots).
+[FAILOVER] Subsystem initialised.
+[FAILOVER] relaunch grace: this node just came up -- no peer is declared DEAD for 6000 ticks (until tick 6001).
+[LOADER] Service binary store ready. Built-in demo: 26 bytes.
+[WEBAPP] Asset store ready. Built-in Navigator page: 2059 bytes.
+[ENTROPY] seeded.
+[RTC] CMOS clock accepted.
+[TLS] memory pool initialised (512 KiB, fixed).
+[AUTH] Token Registry
+ Email                           UID   Role          Token                             Password
+ -------------------------------  ----  ------------  --------------------------------  --------
+ dave@gridworkz.com  uid=1000  DB_ADMIN  deadbeef01234567cafebabe76543210  demo-dave
+ bob@vance.com  uid=1001  APP_USER  cafebabe7654321089abcdef01234567  demo-bob
+ carol@gridworkz.com  uid=1002  DB_ADMIN  feedf00dabcdef0112345678deadc0de  demo-carol
+ guest@sandbox.com  uid=1003  GUEST  deadc0de9988776655443322aabbccdd  demo-guest
+
+[JOURNAL] Subsystem initialised.
+[LOCK] Row-level lock manager initialised.
+[INDEX] Secondary index manager initialised.
+[CONSTRAINT] Engine initialised.
+[CURSOR] Server-side cursor engine initialised.
+[MQT] Materialized query table engine initialised.
+[ROWSTORE] Row-set storage engine initialised.
+[ROW_INDEX] B-tree row index engine initialised.
+[VECSTORE] Vector store engine initialised.
+[AGENT] Agent engine initialised (max agents=8, max workflows=4)
+[MK] Microkernel booted successfully. Ring-0 primitives online.
+[IPC] Message Passing interface configured (Port bounds 0x1001 - 0x1007).
+[MK] registering services
+[MK] Service ONLINE: VirtualMemoryMgr  PID=101
+[MK] Service ONLINE: ObjectSecurityMgr  PID=102
+[MK] Service ONLINE: NativeDbStoreMgr  PID=103
+[MK] Service ONLINE: StorageTierMgr  PID=104
+[MK] Service ONLINE: RecoveryLogVerifier  PID=105
+[MK] Service ONLINE: AgentRuntimeMgr  PID=106
+[MK] Service ONLINE: CheckpointMgr  PID=107
+[MK] Fault Isolation Daemon active. Poll interval: 100ms.
+[TIER] Storage Tier Manager initialized.
+[TIER] Thresholds: promote=8 accesses/tick  demote=30 idle ticks.
+[CKPT] CheckpointMgr initialised.
+[BSP] Waking Core 1...
+[SMP] no AP answered at APIC id 1 within 100 ticks -- running UNIPROCESSOR; the BSP will drive the service loop itself.
+[BSP] Core 1 online.
+[NET] PCI scanning for e1000...
+[NET] e1000 #0 at PCI slot 3 MMIO 0xfeb80000
+[NET] e1000 #1 at PCI slot 4 MMIO 0xfeba0000
+[NET] NIC roles taken from the command line.
+[E1000] nic0 MAC 52:54:00:12:34:01  roles: mgmt cluster
+[E1000] nic1 MMIO 0xfeba0000 handed to user driver (role: none)
+[NET] Packet buffer pool ready (64 x 2 KB).
+[ARP] Announced 10.0.2.15 -> 52:54:00:12:34:01
+[DHCP] Starting DISCOVER...
+[DHCP] Bound: 10.0.2.15  gw 10.0.2.2  subnet 255.255.255.0
+[NET] 1 e1000 interface(s) online, 1 reserved for user drivers.
+[QEMU-SLS TCACHE] NVMe unavailable — cold start
+[QEMU-SLS PGO] hot threshold=1000, scan interval=1000 ticks
+[QEMU-SLS VM] no snapshot -- Phase 4 save/restore has no callers (scaffolding, awaiting a launcher resume path)
+[SECURITY] UID 1000 assigned role DB_ADMIN.
+[AUDIT] #1 uid=1000 action=ROLE_CHANGE detail=DB_ADMIN granted=1
+[SECURITY] UID 1001 assigned role APP_USER.
+[AUDIT] #2 uid=1001 action=ROLE_CHANGE detail=APP_USER granted=1
+[SECURITY] UID 1002 assigned role DB_ADMIN.
+[AUDIT] #3 uid=1002 action=ROLE_CHANGE detail=DB_ADMIN granted=1
+[SECURITY] UID 1003 assigned role GUEST.
+[AUDIT] #4 uid=1003 action=ROLE_CHANGE detail=GUEST granted=1
+[AUTH] Default demo account roles seeded in object-catalog role_table.
+[SIDECAR] boot image: init @0x20000000 (135184 B) dm @0x21022000 (106512 B) posix @0x2107d000 (1339688 B) ramdisk @0x215c5000 (94224 B) net @0x2261d000 (295056 B) e1000 @0x226e6000 (37272 B) registry @0x22770000 (4096 B)
+[SIDECAR] rootfs: 4096 bytes @ 0x2161d000
+[SIDECAR] device registry: 5 device(s) @0x22770000
+[SIDECAR] boot parent planted: slot0 pid=99 active=1 state=4
+[PAGING] New user PML4 at 0x000000000e206000
+[SIDECAR] PID 100 'aerosls.init.0': wired chan 'console' to kernel service 'kernel.debug.console' (slots 9/10, kernel end 0/1)
+[SIDECAR] PID 100 'aerosls.init.0': wired chan 'env' to kernel service 'kernel.env.control' (slots 11/12, kernel end 2/3)
+[ENV] control channel wired: kernel ends rd=2 wr=3
+[SIDECAR] PID 100 'aerosls.init.0' released — runs on next schedule (BIB at 0x0000400000042000, entry 0x0000400000000000)
+[SIDECAR] init sidecar created (PID 100, messenger CHAN_R 0) — entering ring 3
+[PAGING] New user PML4 at 0x000000000e25b000
+[SIDECAR] PID 101 'drv.device_manager.0': wired chan 'console' to kernel service 'kernel.debug.console' (slots 3/4, kernel end 4/5)
+[SIDECAR] PID 101 'drv.device_manager.0' released — runs on next schedule (BIB at 0x000040000001f000, entry 0x0000400000000000)
+[CAP] woken PID 101 (channel 3)
+[CAP] send handoff: PID 100 -> 101
+[PAGING] New user PML4 at 0x000000000e284000
+[SIDECAR] PID 102 'drv.e1000.0': dev cap 'nic0.bar0' phys 0xfeba0000+131072 slot 3
+[SIDECAR] PID 102 'drv.e1000.0' released — runs on next schedule (BIB at 0x000040000000e000, entry 0x0000400000000000)
+[e1000] rust_entry (drv.e1000.0 / aerosls.e1000.v1)
+[e1000] BIB: n_caps=4
+[e1000] budget MEM cap: base=0x226f0000 len=0x80000 (512 KiB)
+[e1000] DEV cap 'nic0.bar0' slot 3 → BAR0 window 0x100000000
+[e1000] MAC 52:54:00:12:34:02
+[e1000] PASS: loopback round-trip 31 bytes (MAC 52:54:00:12:34:02, rx slot 0)
+[e1000] entering polled RX-drain serve loop

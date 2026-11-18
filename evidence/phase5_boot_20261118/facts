@@ -1,0 +1,16 @@
+image=sls_operating_system.iso
+image_sha256=665b4b961ff71a78c52355cbef245d429405b0272407c45795f0b36c2e5eb03f
+boots=2
+boot1=GRUB Phase 5 entry, single-NIC net0, tests/phase5_boot_smoke.sh, exit 0, 64s
+boot2=GRUB Phase 5 entry, two-NIC e1000 handoff, tests/phase5_e1000_driver_smoke.sh, exit 0
+sidecars_boot1=aerosls.init.0 PID100; drv.device_manager.0 PID101; drv.ramdisk.0 PID102; drv.network.0 PID103; aerosls.posix.0 PID104 (respawned PID108)
+sidecars_boot2=drv.e1000.0 PID102
+markers=need=phases,prompt phases=1 ready=1 irq=1 dev=1 prompt=1 torn=0; exit=0
+network=[nettest] PASS
+irqtest=[irqtest] ALL PHASES PASS
+devtest=[devtest] PASS; MAC 52:54:00:12:34:01
+e1000=[e1000] PASS; loopback 31 bytes; MAC 52:54:00:12:34:02
+p4=deliberate watchdog kill of POSIX sidecar; PID 104 exited code 134; PID 108 respawned and PASS
+post_ready_respawn=delayed p4 respawn announcement (restart 1); not a second sidecar exit; PID108 receives 8 cap wakes after the line
+backup=sls_storage.img missing; no disk attached; not a sidecar startup failure
+unified=not rerun
