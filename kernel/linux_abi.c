@@ -159,6 +159,7 @@ const struct LinuxSyscallEntry linux_syscall_table[] = {
     {   2, LSC_FD,     0 },   /* open */
     {   3, LSC_FD,     0 },   /* close */
     {   4, LSC_FD,     0 },   /* stat */
+    {   5, LSC_FD,     0 },   /* fstat — M2b: the DSO's size/mode on an fd */
     {   6, LSC_FD,     0 },   /* lstat */
     {   7, LSC_FD,     0 },   /* poll */
     {   8, LSC_FD,     0 },   /* lseek */
@@ -1425,8 +1426,9 @@ struct LinuxFdReplyPlan linux_fd_reply_plan(uint64_t num, const uint64_t args[6]
                                              : LINUX_SIGSET_BYTES;
         p.aux  = p.len;
         p.kind = LINUX_STAGE_RAW;
-    } else if (num == LINUX_STAT || num == LINUX_LSTAT) {
-        /* stat/lstat: the out-pointer is args[1] (statbuf), the payload
+    } else if (num == LINUX_STAT || num == LINUX_LSTAT || num == LINUX_FSTAT) {
+        /* stat/lstat/fstat: the out-pointer is args[1] (statbuf), the payload
+         * — fstat's fd lives in args[0] and needs no path.
          * the COMPACT Stat (24 bytes — the sidecar never sees musl's
          * layout) and the child-side write the serialized 144 bytes.
          * A NULL statbuf is not refused here: the copy-in's page walk
@@ -1774,7 +1776,7 @@ int linux_reply_shape_ok(uint64_t num, uint64_t ret, uint32_t n)
     /* stat/lstat: success with EXACTLY the compact Stat — a payload the
      * serializer cannot parse is a protocol break, refused before any
      * byte is written (the twin of service()'s own bound). */
-    if (num == LINUX_STAT || num == LINUX_LSTAT)
+    if (num == LINUX_STAT || num == LINUX_LSTAT || num == LINUX_FSTAT)
         return ret == 0 && n == LINUX_STAT_PAYLOAD_BYTES;
     /* getdents64: success; the byte count the child sees is the
      * KERNEL's packing result, never the sidecar's number — so ret is 0

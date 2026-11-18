@@ -1,0 +1,15 @@
+247:[CS] dynamic image: main entry=0x4010a6 interp base=0x7f0000000000 entry=0x7f000007bf0e path='/lib/ld-musl-x86_64.so.1'
+250:[INIT] env manager on control channel (CHAN_R=11 CHAN_W=12)[M2A] hello: spawned ch_00000013 
+415:[E7] linux: num=00000002 child=m2a.linux.hello.0 -> ENOENT open /etc/ld-musl-x86_64.path
+437:[E7] linux: num=00000002 child=m2a.linux.hello.0 ok
+458:[E7] linux: num=00000048 child=m2a.linux.hello.0 ok
+479:[E7] linux: num=00000005 child=m2a.linux.hello.0 ok + payload
+497:[E7] linux: num=00000000 child=m2a.linux.hello.0 ok + payload
+501:[E7] linux mmap addr=0x0 len=20480 prot=1 flags=0x2 refused before post: shape not served (by name)
+520:[E7] linux: num=00000003 child=m2a.linux.hello.0 ok
+546:Error loading shared library libm2a.so: Function not implemented (needed by m2a.linux.hello.0  .
+624:[E7] linux: num=00000014 child=m2a.linux.hello.0 write ok len=61 |Error relocating m2a.lin|
+628:Error relocating m2a.linux.hello.0: m2a_add: symbol not foundTesting network...
+665:[E7] linux: num=00000014 child=m2a.linux.hello.0 write ok len=62 |Error relocating m2a.lin|
+673:Error relocating m2a.linux.hello.0: m2a_data: symbol not found[CAP] woken PID 108 (channel 22)
+728:[E7] linux: num=000000E7 child=m2a.linux.hello.0 exit_group status=127

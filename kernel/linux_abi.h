@@ -1084,6 +1084,7 @@ void linux_signal_ucontext_build(struct LinuxUContext *uc,
 #define LINUX_OPEN        2u
 #define LINUX_CLOSE       3u
 #define LINUX_STAT        4u
+#define LINUX_FSTAT       5u   /* M2b: the loader's size/mode ask on an fd */
 #define LINUX_LSTAT       6u
 #define LINUX_LSEEK       8u
 #define LINUX_FCNTL       72u

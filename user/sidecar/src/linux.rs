@@ -391,6 +391,9 @@ const LINUX_READ: u64 = 0;
 const LINUX_OPEN: u64 = 2;
 const LINUX_CLOSE: u64 = 3;
 const LINUX_STAT: u64 = 4;
+/// fstat(5) — M2b: the loader asks a descriptor for the DSO's size/mode
+/// before it maps it. Twin of kernel/linux_abi.h's LINUX_FSTAT.
+const LINUX_FSTAT: u64 = 5;
 const LINUX_LSTAT: u64 = 6;
 const LINUX_LSEEK: u64 = 8;
 const LINUX_FCNTL: u64 = 72;
@@ -2108,7 +2111,8 @@ fn payload_bound(num: u64, args: &[u64; 6], len: usize) -> bool {
         LINUX_RT_SIGACTION => args[2] != 0 && len == SIGACT_BYTES,
         LINUX_RT_SIGPROCMASK => args[2] != 0 && len == SIGSET_BYTES as usize,
         LINUX_SIGALTSTACK => args[1] != 0 && len == STACK_T_BYTES,
-        LINUX_STAT | LINUX_LSTAT => args[1] != 0 && len == STAT_PAYLOAD_BYTES,
+        LINUX_STAT | LINUX_LSTAT | LINUX_FSTAT =>
+            args[1] != 0 && len == STAT_PAYLOAD_BYTES,
         LINUX_READ => args[1] != 0 && len <= args[2] as usize
             && len <= FD_PAYLOAD_CAP,
         LINUX_GETDENTS64 => args[1] != 0 && len <= DENTS_PAYLOAD_CAP,
@@ -2346,15 +2350,24 @@ fn answer_file<K: Kernel, A: BufferAlloc>(
                 return Answer::Reply(0, E_NOSYS);
             };
             match vfs.stat(vt, path) {
-                Ok(st) => {
-                    let mut buf = [0u8; FD_PAYLOAD_CAP];
-                    buf[..STAT_PAYLOAD_BYTES]
-                        .copy_from_slice(&stat_payload(&st));
-                    Answer::ReplyBytes(0, STAT_PAYLOAD_BYTES, buf)
-                }
+                Ok(st) => stat_answer(&st),
                 Err(e) => Answer::Reply(0, cap_of(e)),
             }
         }
+        /* fstat (5): the same compact Stat, selected by descriptor. The
+         * loader's map_library asks for the DSO's size and mode before it
+         * maps it; without this arm the DT_NEEDED chain stops at ENOSYS
+         * even though the open succeeded. A console slot answers the
+         * CharNode's own stat; the VFS owns every file descriptor. */
+        LINUX_FSTAT => match slot_of(fds, args[0]) {
+            Ok(s) if s.kind == FD_KIND_FILE => match vfs.fstat(vt, s.vfs_fd) {
+                Ok(st) => stat_answer(&st),
+                Err(e) => Answer::Reply(0, cap_of(e)),
+            },
+            Ok(s) if s.kind == FD_KIND_CONSOLE => stat_answer(&console.stat()),
+            Ok(_) => Answer::Reply(0, E_NOSYS),
+            Err(x) => Answer::Reply(0, x),
+        },
         /* lseek (8): whence is Linux's own 0/1/2 — the VFS's SEEK_*
          * constants ARE those numbers, so the word crosses untouched.
          * A console slot is ESPIPE, the number Linux gives. SEEK_HOLE/
@@ -2961,6 +2974,14 @@ fn path_pair(payload: &[u8]) -> Option<(&str, &str)> {
 /// The compact Stat payload (the twin of LINUX_STAT_PAYLOAD_BYTES, the
 /// kernel's linux_stat_bytes reads these exact offsets): mode/uid/gid
 /// as the vfs::Stat carries them, size, and the one timestamp it has.
+/// The reply both stat shapes carry: the compact Stat behind the fixed
+/// payload length, which payload_bound and the kernel's stat stage agree on.
+fn stat_answer(st: &Stat) -> Answer {
+    let mut buf = [0u8; FD_PAYLOAD_CAP];
+    buf[..STAT_PAYLOAD_BYTES].copy_from_slice(&stat_payload(st));
+    Answer::ReplyBytes(0, STAT_PAYLOAD_BYTES, buf)
+}
+
 fn stat_payload(st: &Stat) -> [u8; STAT_PAYLOAD_BYTES] {
     let mut b = [0u8; STAT_PAYLOAD_BYTES];
     b[0..2].copy_from_slice(&st.mode.to_le_bytes());
@@ -4501,7 +4522,7 @@ pub fn service<K: Kernel, A: BufferAlloc>(
             SYS_SLS_CATALOG_EXEC =>
                 answer_catalog_exec(&mut catalog, &args, payload),
             LINUX_READ | LINUX_WRITE | LINUX_WRITEV | LINUX_OPEN | LINUX_CLOSE
-            | LINUX_STAT
+            | LINUX_STAT | LINUX_FSTAT
             | LINUX_LSTAT | LINUX_LSEEK | LINUX_FCNTL | LINUX_FSYNC
             | LINUX_FTRUNCATE | LINUX_RENAME | LINUX_MKDIR | LINUX_UNLINK
             | LINUX_GETDENTS64 | LINUX_POLL =>

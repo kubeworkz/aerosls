@@ -1,5 +1,8 @@
 # M2b library namespace — `/lib/libm2a.so` served
 
+> Follow-up: this run's `fstat(5)` break is served in
+> `../m2b_fstat_20261118/`, where the next break is file-backed mmap.
+
 Date: 2026-11-18
 Branch: `m1/linux-network-bridge`
 Base: `cb29ef4` (errno/path logging) plus this change
