@@ -414,6 +414,21 @@ int linux_arch_prctl_is_set_fs(uint64_t num, uint64_t cmd);
  * from the task's own PML4 physical address (ProcessDescriptor.cr3), so
  * it is correct whichever cr3 the trap path is running on. */
 #define LINUX_WRITE           1u           /* the census's write row (§5.6) */
+#define LINUX_WRITEV          20u          /* the stdio flush's gather: musl's
+                                            * __stdio_write calls writev with
+                                            * the buffer's two pieces. The
+                                            * kernel walks the caller's iovec
+                                            * array and attaches ONE gathered
+                                            * span, so the payload contract —
+                                            * args[2] is the byte count — is
+                                            * write's own on both ends. */
+#define LINUX_IOV_MAX         8u           /* iovecs per writev trap. musl's
+                                            * flush uses one or two; a longer
+                                            * array is -EINVAL by name rather
+                                            * than a silently dropped tail
+                                            * (the attach buffer is the real
+                                            * bound, so the cap is stated). */
+#define LINUX_IOVEC_BYTES    16u           /* sizeof(struct iovec), x86-64 */
 #define LINUX_EFAULT          14           /* Linux's own number: a bad
                                             * buffer address. Returned by
                                             * the plan/copy paths directly —
@@ -443,6 +458,28 @@ struct LinuxFdWritePlan {
  * poll cap and the wrap-around span. */
 struct LinuxFdWritePlan linux_fd_write_plan(uint64_t num,
                                             const uint64_t args[6]);
+
+/* writev's own plan: the kernel copies the iovec array out (bounded by
+ * LINUX_IOV_MAX * LINUX_IOVEC_BYTES) and hands the bytes here. The plan
+ * decodes each (base, len), drops zero-length entries, validates every
+ * segment's CLAMPED span with write's canonical rules, and records the
+ * segments the attach will gather — total no larger than `cap`. A bad
+ * segment refuses -EFAULT; iovcnt over LINUX_IOV_MAX refuses -EINVAL.
+ * Pure: the host test drives every branch from a byte array. */
+struct LinuxIovec {
+    uint64_t base;
+    uint64_t len;
+};
+
+struct LinuxWritevPlan {
+    struct LinuxIovec iov[LINUX_IOV_MAX];
+    uint32_t n_iov;    /* segments stored (zero-length ones dropped)       */
+    uint32_t total;    /* gathered bytes, <= cap (the short-write clamp)   */
+    int32_t  refuse;   /* 0, -LINUX_EINVAL, or -LINUX_EFAULT               */
+};
+
+struct LinuxWritevPlan linux_writev_plan(const uint8_t *iov_bytes,
+                                         uint64_t iovcnt, uint32_t cap);
 
 /* Decode the 16 bytes copied from a sendto destination. `sa` is the Linux
  * sockaddr_in layout: family in host order, port/address network order;

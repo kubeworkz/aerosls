@@ -155,6 +155,7 @@ int32_t cap_code_from_linux_errno(int32_t linux_errno)
 const struct LinuxSyscallEntry linux_syscall_table[] = {
     {   0, LSC_FD,     0 },   /* read */
     {   1, LSC_FD,     0 },   /* write */
+    {  20, LSC_FD,     0 },   /* writev — the stdio flush's gathered write */
     {   2, LSC_FD,     0 },   /* open */
     {   3, LSC_FD,     0 },   /* close */
     {   4, LSC_FD,     0 },   /* stat */
@@ -515,6 +516,59 @@ struct LinuxFdWritePlan linux_fd_write_plan(uint64_t num,
     if (!linux_fs_addr_is_user_canonical(p.src) || span_end < p.src ||
         (span_end - 1) > LINUX_USER_ADDR_MAX) {
         p.refuse = -LINUX_EFAULT;
+    }
+    return p;
+}
+
+/* writev's plan: decode the copies of `struct iovec` the first trap made,
+ * in the SAME canonical-span discipline as write's buffer/count words.
+ * Each segment is clamped to the gather's remaining room BEFORE its span
+ * is validated — write's own rule: only the bytes this trap will actually
+ * copy have to be readable, so a huge trailing iovec is a legal short
+ * write rather than an invented -EFAULT. A zero-length entry is skipped
+ * without touching its base (iovec{0,0} is legal), and the total rides
+ * back by value; the caller gathers exactly n_iov spans, total bytes. */
+struct LinuxWritevPlan linux_writev_plan(const uint8_t *iov_bytes,
+                                         uint64_t iovcnt, uint32_t cap)
+{
+    struct LinuxWritevPlan p;
+    uint64_t i;
+
+    p.n_iov = 0;
+    p.total = 0;
+    p.refuse = 0;
+    if (iovcnt > LINUX_IOV_MAX) {
+        p.refuse = -LINUX_EINVAL;
+        return p;
+    }
+    if (iovcnt == 0) return p;
+    if (!iov_bytes) {                            /* array copied by caller */
+        p.refuse = -LINUX_EFAULT;
+        return p;
+    }
+
+    for (i = 0; i < iovcnt && p.total < cap; i++) {
+        const uint8_t *b = iov_bytes + i * LINUX_IOVEC_BYTES;
+        uint64_t base = 0, len = 0, take, span_end;
+        unsigned k;
+
+        for (k = 0; k < 8; k++) base |= (uint64_t)b[k] << (8u * k);
+        for (k = 0; k < 8; k++) len  |= (uint64_t)b[8 + k] << (8u * k);
+        if (len == 0) continue;
+
+        take = len;
+        if (take > (uint64_t)(cap - p.total))
+            take = (uint64_t)(cap - p.total);
+        span_end = base + take;                  /* wrap = refuse below */
+        if (!linux_fs_addr_is_user_canonical(base) || span_end < base ||
+            (span_end - 1) > LINUX_USER_ADDR_MAX) {
+            p.refuse = -LINUX_EFAULT;
+            return p;
+        }
+        p.iov[p.n_iov].base = base;
+        p.iov[p.n_iov].len  = take;
+        p.n_iov++;
+        p.total += (uint32_t)take;
     }
     return p;
 }

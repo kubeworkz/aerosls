@@ -843,6 +843,7 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                 struct LinuxClone3Plan c3plan;
                 struct LinuxCatalogExecPlan catplan;
                 struct LinuxFdReplyPlan rplan;
+                struct LinuxWritevPlan wv;
                 /* E7 increment 5 (the fd class): the message that crosses
                  * is the 72-byte description plus, for a write, its bytes
                  * — 8-aligned so k_linux_forward can read the header as a
@@ -853,6 +854,9 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                 uint32_t fwd_len = (uint32_t)sizeof(struct SLSLinuxSyscallRequest);
                 int status;
                 proc_read_linux_args(largs);
+                wv.n_iov = 0;
+                wv.total = 0;
+                wv.refuse = 0;
 #ifdef M1_TOOTH_BYPASS_CONNECT
                 /* M1 tooth (tests/m1_net_probe_check.sh
                  * M1_GATE_TOOTH=bypass-connect): the ONLY build that carries
@@ -998,6 +1002,53 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                         (unsigned long)largs[2],
                         (unsigned long)largs[1]);
                     return (uint64_t)(int64_t)plan.refuse;
+                }
+                /* M2 (the stdio flush): writev(20) is a FD number whose
+                 * crossing is a GATHER. The iovec array itself is read
+                 * here, bounded by LINUX_IOV_MAX (so at most 128 bytes),
+                 * then the pure plan validates each segment's clamped span
+                 * and the attach below copies the pieces into ONE payload.
+                 * args[2] becomes that gathered total — the description
+                 * the sidecar sees is exactly write's shape, so its
+                 * expected_req_len derives the same length from the same
+                 * word and its write arm answers both numbers. A bad
+                 * array or segment is -EFAULT with no post; an iovcnt over
+                 * the cap is Linux's own -EINVAL, refused before the copy
+                 * so the array can never exceed the local buffer. */
+                if (num == LINUX_WRITEV) {
+                    uint8_t iovb[LINUX_IOV_MAX * LINUX_IOVEC_BYTES];
+                    if (largs[2] > LINUX_IOV_MAX) {
+                        kernel_serial_printf(
+                            "[E7] linux writev iovcnt=%lu refused before "
+                            "post: over the gather cap (%u iovecs)\n",
+                            (unsigned long)largs[2],
+                            (unsigned)LINUX_IOV_MAX);
+                        return (uint64_t)(int64_t)(-LINUX_EINVAL);
+                    }
+                    if (largs[2] &&
+                        linux_user_copy_out(iovb, cur->cr3, largs[1],
+                            (uint32_t)(largs[2] * LINUX_IOVEC_BYTES)) != 0) {
+                        kernel_serial_printf(
+                            "[E7] linux writev iovec array 0x%lx (%lu "
+                            "entries) refused before post: unmapped or "
+                            "non-user span (array)\n",
+                            (unsigned long)largs[1],
+                            (unsigned long)largs[2]);
+                        return (uint64_t)(int64_t)(-LINUX_EFAULT);
+                    }
+                    wv = linux_writev_plan(largs[2] ? iovb : 0, largs[2],
+                                           LINUX_FD_WRITE_CHUNK);
+                    if (wv.refuse) {
+                        kernel_serial_printf(
+                            "[E7] linux writev iovcnt=%lu refused before "
+                            "post: %s\n",
+                            (unsigned long)largs[2],
+                            wv.refuse == -LINUX_EINVAL
+                                ? "over the gather cap"
+                                : "bad iovec span");
+                        return (uint64_t)(int64_t)wv.refuse;
+                    }
+                    largs[2] = wv.total;
                 }
                 /* E7 increment 24: the clamp rides IN the description for
                  * WRITE only — args[2] is that number's count. poll's
@@ -1371,6 +1422,33 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                         return (uint64_t)(int64_t)(-LINUX_EINVAL);
                     }
                     fwd_len += catplan.len;
+                } else if (num == LINUX_WRITEV && wv.total) {
+                    /* The gather half: every segment the plan stored, in
+                     * order, into the SAME attach span write uses. The
+                     * plan already clamped each piece so the sum is
+                     * wv.total; the walker here repeats the page-table
+                     * discipline per piece, so a segment that went away
+                     * between validate and copy is still a first-trap
+                     * -EFAULT, never a kernel fault. */
+                    uint8_t *wp = fwd + sizeof(struct SLSLinuxSyscallRequest);
+                    uint32_t off = 0, si;
+                    for (si = 0; si < wv.n_iov && off < wv.total; si++) {
+                        uint32_t seg = (uint32_t)wv.iov[si].len;
+                        if (seg > wv.total - off) seg = wv.total - off;
+                        if (linux_user_copy_out(wp + off, cur->cr3,
+                                                wv.iov[si].base,
+                                                seg) != 0) {
+                            kernel_serial_printf(
+                                "[E7] linux writev segment %u (%u bytes "
+                                "at 0x%lx) refused before post: unmapped "
+                                "or non-user span (copy)\n",
+                                (unsigned)si, (unsigned)seg,
+                                (unsigned long)wv.iov[si].base);
+                            return (uint64_t)(int64_t)(-LINUX_EFAULT);
+                        }
+                        off += seg;
+                    }
+                    fwd_len += off;
                 } else if (plan.len) {
                     if (linux_user_copy_out(fwd + sizeof(struct SLSLinuxSyscallRequest),
                                             cur->cr3, plan.src,

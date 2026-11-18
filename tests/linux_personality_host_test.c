@@ -351,6 +351,74 @@ int main(void)
               "      own pointer never crosses §5.7's CAP map");
     }
 
+    /* ═══ M2 (the stdio flush): writev's iovec gather ═══════════════════
+     * The kernel copies the iovec array out bounded by LINUX_IOV_MAX, and
+     * this pure plan decides what one trap gathers. The assertions are the
+     * write plan's own rules lifted to segments: zero-length entries are
+     * legal and skipped, the sum clamps to the chunk (a short write), and
+     * only the bytes that will actually be copied have to be canonical. */
+    {
+        uint8_t iovb[LINUX_IOV_MAX * LINUX_IOVEC_BYTES];
+        struct LinuxWritevPlan vp;
+        uint64_t seg[2][2];
+
+        seg[0][0] = 0x0000400000001000ULL;
+        seg[0][1] = 3;
+        seg[1][0] = 0x0000400000002000ULL;
+        seg[1][1] = 4;
+        memcpy(iovb, seg, sizeof seg);
+        vp = linux_writev_plan(iovb, 2, LINUX_FD_WRITE_CHUNK);
+        CHECK(vp.refuse == 0 && vp.n_iov == 2 && vp.total == 7 &&
+              vp.iov[0].base == seg[0][0] && vp.iov[0].len == 3 &&
+              vp.iov[1].base == seg[1][0] && vp.iov[1].len == 4,
+              "two iovecs plan two segments, in order, with write's own\n"
+              "      canonical spans; the total is their sum — the count\n"
+              "      that will ride in args[2] to the sidecar");
+
+        seg[0][0] = 0;
+        seg[0][1] = 0;
+        memcpy(iovb, seg, sizeof seg);
+        vp = linux_writev_plan(iovb, 2, LINUX_FD_WRITE_CHUNK);
+        CHECK(vp.refuse == 0 && vp.n_iov == 1 && vp.total == 4 &&
+              vp.iov[0].base == seg[1][0] && vp.iov[0].len == 4,
+              "iovec{NULL,0} is legal and skipped without touching its\n"
+              "      base — the write(fd, NULL, 0) rule, per segment");
+
+        seg[0][0] = 0x0000400000001000ULL;
+        seg[0][1] = 600;
+        seg[1][0] = 0x0000400000003000ULL;
+        seg[1][1] = 600;
+        memcpy(iovb, seg, sizeof seg);
+        vp = linux_writev_plan(iovb, 2, LINUX_FD_WRITE_CHUNK);
+        CHECK(vp.refuse == 0 && vp.total == LINUX_FD_WRITE_CHUNK &&
+              vp.iov[0].len == 600 &&
+              vp.iov[1].len == LINUX_FD_WRITE_CHUNK - 600,
+              "a sum over the chunk clamps to it — the second segment\n"
+              "      stores only its share, so the gather cannot overflow\n"
+              "      the attach buffer and the task sees a legal short\n"
+              "      write (musl's flush loops on progress)");
+
+        seg[0][0] = 0x0000800000000000ULL;   /* kernel-canonical */
+        seg[0][1] = 8;
+        memcpy(iovb, seg, sizeof seg);
+        vp = linux_writev_plan(iovb, 2, LINUX_FD_WRITE_CHUNK);
+        CHECK(vp.refuse == -LINUX_EFAULT && vp.n_iov == 0 &&
+              vp.total == 0,
+              "a non-canonical segment refuses -EFAULT at the plan —\n"
+              "      before the post, with no channel and no arm");
+
+        vp = linux_writev_plan(0, LINUX_IOV_MAX + 1, LINUX_FD_WRITE_CHUNK);
+        CHECK(vp.refuse == -LINUX_EINVAL,
+              "iovcnt over the gather cap refuses -EINVAL by name without\n"
+              "      reading the array — the dispatch refuses it before its\n"
+              "      bounded copy for the same reason");
+
+        vp = linux_writev_plan(0, 0, LINUX_FD_WRITE_CHUNK);
+        CHECK(vp.refuse == 0 && vp.n_iov == 0 && vp.total == 0,
+              "iovcnt 0 is a legal no-op: no gather, no refusal, and the\n"
+              "      plain 72-byte description is still a valid writev");
+    }
+
     /* ═══ M4.4 (futex): the observed-word and timeout plan ════════════
      * The queue itself is host-tested in the sidecar; here the kernel owns
      * only the two child spans it copies before the post. A WAIT attaches

@@ -374,6 +374,12 @@ fn default_action(sig: u64) -> u8 {
 /// length is not exactly args[2], is malformed by this side's own twin
 /// arithmetic rather than trusted because it arrived.
 const LINUX_WRITE: u64 = 1;
+/// The stdio flush's gather (writev, 20). The kernel owns the iovec walk:
+/// it validates the caller's array, copies every piece into one payload,
+/// and rewrites args[2] to the gathered total (never the iovcnt). This
+/// side therefore answers it with write's own arm and write's own count
+/// truth — `expected_req_len` derives the attach from that same word.
+const LINUX_WRITEV: u64 = 20;
 const FD_PAYLOAD_CAP: usize = 1024;
 
 /// E7 step 4 (the file class, §5.6): the census's thirteen numbers as
@@ -1023,6 +1029,11 @@ fn answer(
     sig: &mut SigState,
     payload: &[u8],
 ) -> Answer {
+    /* writev's gather is already write's payload and write's count word by
+     * the time it reaches this arm (the kernel rewrote args[2]), so the
+     * number is normalized here and the SAME console/E_BADF arm answers
+     * both. The guard's M5 literal stays the one descriptor rule. */
+    let num = if num == LINUX_WRITEV { LINUX_WRITE } else { num };
     match num {
         /* set_tid_address (218, LSC_LOCAL): single-threaded — the "address
          * of the cleared TID" can never be written, so the complete and
@@ -2032,7 +2043,7 @@ fn alloc_fd(fds: &mut [FdSlot], kind: u8, vfs_fd: u32, flags: u32) -> Result<u64
 /// file's end; guard clause R pins it against the kernel's plan.
 fn expected_req_len(num: u64, args: &[u64; 6]) -> usize {
     match num {
-        LINUX_WRITE | LINUX_SENDTO =>
+        LINUX_WRITE | LINUX_WRITEV | LINUX_SENDTO =>
             LINUX_SYSCALL_REQ_BYTES + args[2] as usize,
         /* M1: connect/bind's one attached shape is the 16-byte sockaddr. */
         LINUX_CONNECT | LINUX_BIND =>
@@ -2181,7 +2192,7 @@ fn answer_file<K: Kernel, A: BufferAlloc>(
          * direction. A console descriptor keeps the console arm's
          * Answer::Write (service drains it to the console); every other
          * kind falls to the fd table's own refusal. */
-        LINUX_WRITE => match slot_of(fds, args[0]) {
+        LINUX_WRITE | LINUX_WRITEV => match slot_of(fds, args[0]) {
             Ok(s) if s.kind == FD_KIND_CONSOLE => Answer::Write(args[2] as usize),
             Ok(s) if s.kind == FD_KIND_FILE => {
                 match vfs.write(vt, s.vfs_fd, payload) {
@@ -4440,7 +4451,8 @@ pub fn service<K: Kernel, A: BufferAlloc>(
              * channel — no second client, no kernel.env.catalog reach. */
             SYS_SLS_CATALOG_EXEC =>
                 answer_catalog_exec(&mut catalog, &args, payload),
-            LINUX_READ | LINUX_WRITE | LINUX_OPEN | LINUX_CLOSE | LINUX_STAT
+            LINUX_READ | LINUX_WRITE | LINUX_WRITEV | LINUX_OPEN | LINUX_CLOSE
+            | LINUX_STAT
             | LINUX_LSTAT | LINUX_LSEEK | LINUX_FCNTL | LINUX_FSYNC
             | LINUX_FTRUNCATE | LINUX_RENAME | LINUX_MKDIR | LINUX_UNLINK
             | LINUX_GETDENTS64 | LINUX_POLL =>

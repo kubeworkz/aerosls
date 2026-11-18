@@ -1,5 +1,8 @@
 result=pass
+stdio=puts+return
 m2a_ok=1
+writev_gathers=1
+loader_brk_forwards=2
 exit_group_status=0
 spawned=1
 spawn_failed=0
