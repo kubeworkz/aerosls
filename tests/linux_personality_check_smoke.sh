@@ -44,6 +44,10 @@ FILES=(
     user/sidecar/fixtures/m2a_hello.elf
     user/sidecar/fixtures/ld-musl-x86_64.so.1
     user/sidecar/fixtures/m2a_hello.c
+    # Y7 hashes M2b's library fixture and reads the two seeding sites.
+    user/sidecar/src/boot.rs
+    user/vfs/src/vfs.rs
+    user/sidecar/fixtures/libm2a.so
     user/proto/src/manifest.rs
     user/sidecar/fixtures/e7_linux_probe.S
     user/sidecar/fixtures/m1_net_probe.S
@@ -1191,6 +1195,20 @@ tooth m2a-fixture-elf-drift Y5 "the committed m2a_hello.elf is not the image its
 seed "$W/t139"
 sed -i 's/ -nostartfiles -no-pie -O2 / -no-pie -O2 /' "$W/t139/user/sidecar/fixtures/build_m2a.sh"
 tooth m2a-fixture-recipe-drift Y5 "build_m2a.sh no longer links with -nostartfiles against the committed loader" "$W/t139"
+
+# t140: the embedded library is replaced with different bytes — boot still
+# mounts /lib and seeds it, but the bytes it serves are no longer the pinned
+# DSO. Guard clause Y7 must redden by name from the SHA-256 alone.
+seed "$W/t140"
+printf 'M2B-DRIFT\n' > "$W/t140/user/sidecar/fixtures/libm2a.so"
+tooth m2b-library-fixture-drift Y7 "the embedded libm2a.so is not the pinned DSO" "$W/t140"
+
+# t141: boot stops mounting the /lib ramfs while leaving the embed and the
+# add_ram_file call in place — the loader would search a namespace that is
+# not there and return to ENOENT. Guard clause Y7 must redden by name.
+seed "$W/t141"
+sed -i '/mount_ramfs("\/lib")/d' "$W/t141/user/sidecar/src/boot.rs"
+tooth m2b-library-namespace-unseeded Y7 "boot no longer mounts the /lib ramfs that serves libm2a.so" "$W/t141"
 
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"

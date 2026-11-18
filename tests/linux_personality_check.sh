@@ -64,6 +64,8 @@ for f in kernel/linux_abi.h kernel/linux_abi.c kernel/process.h kernel/process.c
          user/sidecar/src/linux.rs user/sidecar/src/entry.rs \
          user/sidecar/src/e7_probe.rs user/sidecar/fixtures/e7_linux_probe.S \
          user/sidecar/src/e7_firstuser.rs user/proto/src/manifest.rs \
+         user/sidecar/src/boot.rs user/vfs/src/vfs.rs \
+         user/sidecar/fixtures/libm2a.so \
          arch/x86/fpu_enable.h arch/x86/lazy_fpu.c arch/x86/idt.c \
          arch/x86/interrupt.asm arch/x86/switch_lazy.asm \
          kernel/kernel.c kernel/stubs.c tests/fpu_enable_host_test.c; do
@@ -101,6 +103,9 @@ M2AFIX=user/sidecar/fixtures/build_m2a.sh
 M2AELF=user/sidecar/fixtures/m2a_hello.elf
 M2ALOADER=user/sidecar/fixtures/ld-musl-x86_64.so.1
 M2AC=user/sidecar/fixtures/m2a_hello.c
+M2BLIB=user/sidecar/fixtures/libm2a.so
+BOOT=user/sidecar/src/boot.rs
+VFSR=user/vfs/src/vfs.rs
 FPUH=arch/x86/fpu_enable.h
 LFUC=arch/x86/lazy_fpu.c
 IDTC=arch/x86/idt.c
@@ -1782,6 +1787,25 @@ if [ "$M2A_LOADER_SHA" = "6e8ff8ad02f4a3a0b70029577e2eb9df8f6526aea302a60a8d6498
     ok "Y6. the committed musl loader's SHA-256 is 6e8ff8ad… — the sidecar-supplied ld-musl-x86_64.so.1 is the one the M2a boots proved, not merely whatever file the build script names"
 else
     bad "Y6. the committed musl loader drifted: ld-musl-x86_64.so.1's SHA-256 is not 6e8ff8ad… — Y5's recipe would still link against it and the hello would still hash, so only this clause catches a swapped loader"
+fi
+
+# Y7: the embedded library and the namespace that serves it are one truth.
+# The loader's open only succeeds because boot mounts a ramfs at /lib and
+# seeds it with the bytes include_bytes! embeds; a library swapped under the
+# fixture or a boot that forgets either half leaves the two-DSO probe back at
+# ENOENT while every other clause stays green.
+M2B_LIB_SHA=$(sha256sum "$M2BLIB" | awk '{print $1}')
+if grep -qF 'pub static M2A_LIB: &[u8] = include_bytes!("../fixtures/libm2a.so");' "$M2A" && \
+   grep -qF 'pub const M2A_LIB_PATH: &str = "/lib/libm2a.so";' "$M2A" && \
+   grep -qF 'pub fn add_ram_file(&mut self, path: &str, data: &[u8], mode: u16) -> Result<(), Errno>' "$VFSR" && \
+   grep -qF 'vfs.mount_ramfs("/lib").map_err(BootErr::Mount)?;' "$BOOT" && \
+   grep -qF 'vfs.add_ram_file(' "$BOOT" && \
+   grep -qF 'crate::m2a_interp::M2A_LIB_PATH,' "$BOOT" && \
+   grep -qF 'crate::m2a_interp::M2A_LIB,' "$BOOT" && \
+   [ "$M2B_LIB_SHA" = "398e79629f49179d8225f18a5b8216ef444cc57408dd6e770d7dc53366eecf6d" ]; then
+    ok "Y7. the M2b library fixture is embedded and served: libm2a.so hashes to 398e7962…, m2a_interp.rs embeds it as M2A_LIB at /lib/libm2a.so, and boot seeds a /lib ramfs through Vfs::add_ram_file — the loader's open has a namespace and the bytes it reads are the pinned DSO"
+else
+    bad "Y7. the M2b library namespace is gone or drifted: libm2a.so's SHA-256 is not 398e7962…, the sidecar no longer embeds it at /lib/libm2a.so, or boot does not mount /lib and seed it through add_ram_file — the loader would return to ENOENT (or load unpinned bytes) while the guard reads green"
 fi
 
 echo

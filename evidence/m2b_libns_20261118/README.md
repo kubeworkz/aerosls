@@ -24,6 +24,10 @@ namespace so the loader's `DT_NEEDED` search finds the DSO.
 - `user/sidecar/fixtures/libm2a.so`, `libm2a.c`, `build_m2b_lib.sh`:
   the probe's DSO, its source, and a reproducible rebuild. SHA-256
   `398e79629f49179d8225f18a5b8216ef444cc57408dd6e770d7dc53366eecf6d`.
+- Guard Y7 pins that hash and every half of the namespace (`include_bytes!`,
+  `M2A_LIB_PATH`, `Vfs::add_ram_file`, the `/lib` mount, the seed call);
+  smoke t140/t141 swap the fixture and remove the mount, and each must redden
+  Y7 by name.
 
 No kernel or loader change: the open now succeeds through the same
 M2a path.
@@ -62,8 +66,8 @@ only `MAP_ANONYMOUS|MAP_PRIVATE`), which remains the break after fstat.
 
 ## Checks
 
-- Guard: `all clauses hold` (132 ok).
-- Smoke: `129 passed, 0 failed`.
+- Guard: `all clauses hold` (133 ok, with Y7).
+- Smoke: `131 passed, 0 failed` (t140/t141 both name Y7).
 - `cargo check` passes for the sidecar with and without `m2a_interp`.
 - M2a fixture restored after the probe:
   `be63cd4d1e5e4d4b9b4028cb4ec830a660fa19a6df1cb6fa27e6aaddd5deafcc`.
