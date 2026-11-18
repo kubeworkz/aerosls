@@ -1,0 +1,150 @@
+linux_personality_check_smoke — teeth for the E7 increment-2 wiring
+and increment-3 delivery guard, §5.3's one-MSR seam (clause set L),
+increment 5's fd-class byte crossing (clause set M), increment 6's
+mem-class budget span (clause set N), and increment 7's image class —
+the ONE ELF mapper, the §5.2 stack and its environment-crossing
+record (clause set O, including O6/O7)
+and increment 10's signal seam (clause set R) — the three-number
+answers, the plan's first-trap refusals and the SignalKill delivery
+and increments 23–24's input class (clause set S) — buffered
+console reads, the parked read, poll's rewritten array and its
+timed wakeup
+and increment 12's reply payload (clause set T) — the copy-IN's
+first-trap destination plan, the deliver's three shapes, the
+two-phase writable copy and the stage's four-place lifecycle
+and increment 16's anonymous-map seam (clause set V) — the
+first-trap ladder, the verdict's two-cursor re-check, the FIXED
+replace's frame return and invlpg, and the fixture's map block
+and increment 25's munmap seam (clause set X) — the first-trap
+range refusal, the verdict's page walk and frame return, the
+sidecar's below-break twin, and the probe's E7MEM-MUNMAP-OK proof
+========================================================================
+
+ok:   baseline — the seeded copy passes the guard unmutated
+
+TOOTH OK   capture-removed — guard exited 1 naming C
+TOOTH OK   capture-wrong-offset — guard exited 1 naming C
+TOOTH OK   static-assert-dropped — guard exited 1 naming B1
+TOOTH OK   gate-inverted — guard exited 1 naming D
+TOOTH OK   branch-removed — guard exited 1 naming D
+TOOTH OK   asm-sls-chain-back — guard exited 1 naming D3
+TOOTH OK   legacy-case-orphaned — guard exited 1 naming D4
+TOOTH OK   spawn-personality-dropped — guard exited 1 naming F1
+TOOTH OK   clear-dropped — guard exited 1 naming E
+TOOTH OK   authority-gate-off — guard exited 1 naming F2
+TOOTH OK   forward-post-removed — guard exited 1 naming I1
+TOOTH OK   forward-arm-missing — guard exited 1 naming I2
+TOOTH OK   resume-gate-inverted — guard exited 1 naming I3
+TOOTH OK   reply-status-unmapped — guard exited 1 naming J1
+TOOTH OK   echo-check-dropped — guard exited 1 naming J2
+TOOTH OK   service-unhooked — guard exited 1 naming K
+TOOTH OK   default-arm-success — guard exited 1 naming K1
+TOOTH OK   wire-size-drift — guard exited 1 naming K2
+TOOTH OK   reply-missing-num-echo — guard exited 1 naming K3
+
+RESTORE OK — the REAL tree still passes the guard (every mutation lived in a copy)
+TOOTH OK   fs-writer-gutted — guard exited 1 naming L
+TOOTH OK   fs-baseline-gone — guard exited 1 naming L1
+TOOTH OK   fs-clear-dropped — guard exited 1 naming L2
+TOOTH OK   fs-switch-unloaded — guard exited 1 naming L3
+TOOTH OK   fs-apply-missing — guard exited 1 naming L4
+TOOTH OK   fs-predicate-loosened — guard exited 1 naming L5
+TOOTH OK   fs-sidecar-bound-loosened — guard exited 1 naming L6
+TOOTH OK   fd-chunk-oversized — guard exited 1 naming M1
+TOOTH OK   fd-copy-detached — guard exited 1 naming M2
+TOOTH OK   fd-clamp-dropped — guard exited 1 naming M2
+TOOTH OK   fd-send-drops-bytes — guard exited 1 naming M3
+TOOTH OK   fd-copy-user-check-gone — guard exited 1 naming M4
+TOOTH OK   fd-ebadf-drifted — guard exited 1 naming M5
+TOOTH OK   fd-payload-check-off — guard exited 1 naming M6
+TOOTH OK   mem-clear-dropped — guard exited 1 naming N1
+TOOTH OK   mem-span-unconditional — guard exited 1 naming N2
+TOOTH OK   wx-firsttrap-off — guard exited 1 naming N3
+TOOTH OK   wx-sidecar-off — guard exited 1 naming N3
+TOOTH OK   brk-malformed-off — guard exited 1 naming N4
+TOOTH OK   mem-uncharged-frames — guard exited 1 naming N5
+TOOTH OK   mem-unzeroed-frames — guard exited 1 naming N5
+TOOTH OK   mem-unwind-gone — guard exited 1 naming N6
+TOOTH OK   brk-refusal-errno — guard exited 1 naming N7
+TOOTH OK   mem-probe-marker-gone — guard exited 1 naming N8
+TOOTH OK   elf-gate-inverted — guard exited 1 naming O1
+TOOTH OK   elf-dispatch-gone — guard exited 1 naming O2
+TOOTH OK   stack-image-phys-pointers — guard exited 1 naming O3
+TOOTH OK   stack-image-bib-clobber — guard exited 1 naming O3
+TOOTH OK   stack-image-no-entropy — guard exited 1 naming O4
+TOOTH OK   candidate-spawn-gone — guard exited 1 naming O5
+TOOTH OK   elf-unsafe-walk — guard exited 1 naming O1
+TOOTH OK   envp-consult-gone — guard exited 1 naming O6
+TOOTH OK   argenv-parse-loosened — guard exited 1 naming O6
+TOOTH OK   firstuser-argenv-gone — guard exited 1 naming O7
+TOOTH OK   env-list-gone — guard exited 1 naming O7
+TOOTH OK   elf-midpage-shift — guard exited 1 naming O8
+TOOTH OK   elf-shared-page-no-refusal — guard exited 1 naming O8
+TOOTH OK   interp-base-gone — guard exited 1 naming O9
+TOOTH OK   m2a-oneshot-gone — guard exited 1 naming O9
+TOOTH OK   sse-gate-never-called — guard exited 1 naming Q1
+TOOTH OK   sse-osfxsr-bit-moved — guard exited 1 naming Q1
+TOOTH OK   sse-cpuid-refusal-gone — guard exited 1 naming Q2
+TOOTH OK   sse-mxcsr-unloaded — guard exited 1 naming Q2
+TOOTH OK   sse-nm-gate-misrouted — guard exited 1 naming Q3
+TOOTH OK   sse-lazy-woken — guard exited 1 naming Q4
+TOOTH OK   sigplan-einval-refusal-gone — guard exited 1 naming R1
+TOOTH OK   sigplan-refusal-returns-late — guard exited 1 naming R2
+TOOTH OK   tkill-arm-gone — guard exited 1 naming R4
+TOOTH OK   terminate-answers-success — guard exited 1 naming R4
+TOOTH OK   handler-action-not-recorded — guard exited 1 naming R5
+TOOTH OK   tkill-tid-scope-gone — guard exited 1 naming R5
+TOOTH OK   sigprocmask-class-dropped — guard exited 1 naming R3
+TOOTH OK   sigplan-unhosttested — guard exited 1 naming R6
+TOOTH OK   poll-array-not-carried — guard exited 1 naming S
+TOOTH OK   poll-timeout-clamped-away — guard exited 1 naming S1
+TOOTH OK   poll-arm-gone — guard exited 1 naming S2
+TOOTH OK   poll-wait-granted — guard exited 1 naming S2
+TOOTH OK   console-read-eagain — guard exited 1 naming S2
+TOOTH OK   poll-deadline-never-expires — guard exited 1 naming S2
+TOOTH OK   poll-deadline-not-waited — guard exited 1 naming S3
+TOOTH OK   poll-outplan-unhosttested — guard exited 1 naming S4
+TOOTH OK   reply-plan-refusal-gone — guard exited 1 naming T1
+TOOTH OK   reply-stage-never-set — guard exited 1 naming T1
+TOOTH OK   reply-stage-never-consumed — guard exited 1 naming T2
+TOOTH OK   reply-stage-slotreuse-clear-gone — guard exited 1 naming T2
+TOOTH OK   deliver-clamp-gone — guard exited 1 naming T3
+TOOTH OK   copyin-writable-check-gone — guard exited 1 naming T4
+TOOTH OK   reply-bytes-unbounded — guard exited 1 naming T5
+TOOTH OK   reply-payload-never-sent — guard exited 1 naming T5
+TOOTH OK   copyin-unhosttested — guard exited 1 naming T6
+TOOTH OK   retired-oldact-enosys-back — guard exited 1 naming R1
+TOOTH OK   arg-regs-never-restored — guard exited 1 naming U
+TOOTH OK   park-loses-arg-regs — guard exited 1 naming U2
+TOOTH OK   resume-restamps-nothing — guard exited 1 naming U3
+TOOTH OK   parkctx-argfield-gone — guard exited 1 naming U4
+TOOTH OK   parkctx-layout-unpinned — guard exited 1 naming U5
+TOOTH OK   restore-clobbers-rax — guard exited 1 naming U1
+TOOTH OK   signal-number-not-logged — guard exited 1 naming R7
+TOOTH OK   abort-evidence-stripped — guard exited 1 naming R8
+TOOTH OK   mmap-ladder-not-first-trap — guard exited 1 naming V1
+TOOTH OK   mmap-stage-truncated — guard exited 1 naming V1
+TOOTH OK   mmap-verdict-loses-cursor — guard exited 1 naming V2
+TOOTH OK   mmap-replace-no-invlpg — guard exited 1 naming V3
+TOOTH OK   mmap-replace-gated-off — guard exited 1 naming V3
+TOOTH OK   mmap-cursor-never-born — guard exited 1 naming V4
+TOOTH OK   mmap-cursor-slotreuse-clear-gone — guard exited 1 naming V4
+TOOTH OK   mmap-arm-gone — guard exited 1 naming V5
+TOOTH OK   brk-cap-dropped — guard exited 1 naming V5
+TOOTH OK   mmap-unhosttested — guard exited 1 naming V6
+TOOTH OK   mmap-fixture-block-gone — guard exited 1 naming V7
+TOOTH OK   mmap-grant-address-not-logged — guard exited 1 naming V8
+TOOTH OK   mmap-apply-unreachable — guard exited 1 naming V2
+TOOTH OK   munmap-first-trap-gone — guard exited 1 naming X1
+TOOTH OK   munmap-verdict-gone — guard exited 1 naming X2
+TOOTH OK   munmap-arm-gone — guard exited 1 naming X3
+TOOTH OK   munmap-unhosttested — guard exited 1 naming X4
+TOOTH OK   munmap-fixture-marker-gone — guard exited 1 naming X5
+TOOTH OK   munmap-range-not-logged — guard exited 1 naming X6
+TOOTH OK   mprotect-round-trip-gone — guard exited 1 naming X7
+TOOTH OK   sigpipe-producer-gone — guard exited 1 naming R13
+TOOTH OK   rollback-clears-reservation — guard exited 1 naming X8
+TOOTH OK   munmap-skips-reservation — guard exited 1 naming X9
+TOOTH OK   tenant-ckpt-name-drift — guard exited 1 naming W5c
+
+linux_personality_check_smoke: 123 passed, 0 failed
