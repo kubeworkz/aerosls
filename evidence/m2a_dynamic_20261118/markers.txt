@@ -1,0 +1,10 @@
+217:[CS] dynamic image: main entry=0x40108f interp base=0x7f0000000000 entry=0x7f000007bf0e path='/lib/ld-musl-x86_64.so.1'
+223:[M2A] hello: spawned ch_00000013 
+407:[E7] mprotect addr=0x7f00000b2000 len=4096 prot=0x1: 1 page(s) re-protected
+428:[E7] mprotect addr=0x403000 len=4096 prot=0x1: 1 page(s) re-protected
+446:[E7] linux: num=00000001 child=m2a.linux.hello.0 write ok len=7 |M2A-OK.|
+451:M2A-OK
+465:[E7] linux: num=000000E7 child=m2a.linux.hello.0 exit_group status=0
+471:[E7] linux: num=000000E7 child=m2a.linux.hello.0 group swept=1 dead=1 live=0
+844:[INIT] POSIX sidecar died; respawning (restart 1, backoff 100000000 ns)...[INIT]   (create_sidecar: aerosls.posix.0 image @ 0x2107e000, 2089256 bytes)[POSIX] boot: rw=06 rr=05 cw=03 nw=08
+872:[M2A] one-shot skip gen=00000001 

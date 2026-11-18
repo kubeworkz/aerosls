@@ -1,0 +1,8 @@
+result=pass
+m2a_ok=1
+exit_group_status=0
+spawned=1
+spawn_failed=0
+one_shot_skip_gen=1
+guard=all clauses hold (126 ok)
+smoke=123 passed, 0 failed
