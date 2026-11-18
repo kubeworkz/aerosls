@@ -86,6 +86,9 @@
  *  14. each task's entry is the kernel's — the sidecar's `user_rip` from the
  *      process table, resolved by the name init sent — because where a sidecar
  *      was released is not a fact init holds.
+ *  16. a Linux record whose payload was not captured is REFUSED by the
+ *      restore preflight before any ENV_CREATE is sent; the report counts it
+ *      refused, not replayed, and no fresh tenant can be spawned.
  *
  * Build and run:
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I arch/x86 \
@@ -139,6 +142,13 @@ enum manager_mode {
 static int      g_mode = MANAGER_ALIVE;
 static int      g_sends = 0;
 static int      g_yields = 0;
+/* The deterministic gap-wake regression: armed only around the restore that
+ * exercises the hold's retry, so every other path keeps the weak no-op. */
+static int      g_gap_wake_armed = 0;
+static int      g_gap_wake_seen = 0;
+static int      g_gap_wake_saw_paused = 0;
+static int      g_gap_wake_wait_calls = 0;
+static int      g_gap_wake_parked_before = 0;
 /* How many switch-ins the slow manager needs before it answers. 1 for every
  * ordinary case, so the manager still answers on the first yield there. */
 static uint32_t g_answer_after_yields = 1;
@@ -262,9 +272,9 @@ static void enqueue_register_reply(uint32_t env_id, uint32_t partition, uint32_t
     r.n_chans = 4;
     r.chans[0] = 11; r.chans[1] = 12; r.chans[2] = 13; r.chans[3] = 14;
     r.n_tasks = 2;
-    memcpy(r.task_name[0], "drv.ramdisk.3", 14);
+    memcpy(r.task_name[0], "drv.ramdisk.1", 14);
     r.task_kind[0] = ENV_CKPT_TASK_RAMDISK_SIDECAR;
-    memcpy(r.task_name[1], "aerosls.posix.3", 16);
+    memcpy(r.task_name[1], "aerosls.posix.1", 16);
     r.task_kind[1] = ENV_CKPT_TASK_POSIX_SIDECAR;
     if (g_register_tenant) {
         r.n_tasks = 3;
@@ -383,6 +393,11 @@ void kernel_yield_to_ring3(uint32_t budget_ticks) {
 
 void kernel_serial_printf(const char* fmt, ...) { (void)fmt; }
 
+/* M5.2c: the payload preflight's answer for this host world. The default in
+ * tests/payload_host_stubs.h is 0 (no media), which is exactly the skipped-
+ * capture case; clause 16 leaves it there and then flips it to 1 as a positive
+ * control after the refusal. */
+
 /* POSIX-Environments E6: env_service_create() binds the created environment's
  * console (kernel/env_console.c) once the manager's reply names it. This test
  * links the REAL kernel/env_service.c but not the console registry — its
@@ -436,8 +451,8 @@ uint64_t checkpoint_last_sequence(void) { return FAKE_SEQUENCE; }
  * the real kernel and this stand-in are interchangeable at the call site. */
 uint32_t sidecar_registry_resolve(const char* name, uint32_t partition_id) {
     (void)partition_id;
-    if (strcmp(name, "drv.ramdisk.3") == 0) return FAKE_RD_PID;
-    if (strcmp(name, "aerosls.posix.3") == 0) return FAKE_PX_PID;
+    if (strcmp(name, "drv.ramdisk.1") == 0) return FAKE_RD_PID;
+    if (strcmp(name, "aerosls.posix.1") == 0) return FAKE_PX_PID;
     if (g_register_tenant && strcmp(name, "m5.tenant.catalog.0") == 0)
         return FAKE_LX_PID;
     return 0;
@@ -464,6 +479,29 @@ static void seat_sidecars(void) {
     /* The manager itself: the RPC wait reads this descriptor's switch-ins as
      * its progress signal, exactly as cap.c's registration names init. */
     proc_table[2].pid = ENV_MGR_PID; proc_table[2].active = 1;
+}
+
+/* ─── The deterministic gap-wake seam ───────────────────────────────────
+ * env_service.c calls this weak hook after the parked wait has answered and
+ * before it freezes the partition. The shipped kernel's strong default is the
+ * no-op in env_service.c; this definition makes the E7 gate's live race
+ * happen on demand: the deadline tick rouses the ramdisk sidecar in that gap,
+ * so the first post-freeze check must see the roused posture and the hold
+ * must resume, re-wait and freeze again. The pour stand-in below accepts only
+ * a frozen partition, so a hold that never retries cannot pass this test. */
+void env_service_pour_hold_gap(uint32_t partition_id) {
+    if (!g_gap_wake_armed) return;
+    g_gap_wake_armed = 0;
+    g_gap_wake_seen = 1;
+    g_gap_wake_saw_paused = partition_is_paused(partition_id);
+    g_gap_wake_wait_calls = payload_host_wait_calls;
+    g_gap_wake_parked_before = payload_host_parked_calls;
+    payload_host_parked_ready = 0;
+    payload_host_gap_wake_fired = 1;
+}
+
+static int payload_guard_partition_frozen(uint32_t partition_id) {
+    return partition_is_paused(partition_id);
 }
 
 /* ─── the test ──────────────────────────────────────────────────────────── */
@@ -701,6 +739,155 @@ int main(void) {
               "and the reconciled record passes the gate");
     }
     g_register_tenant = 0;
+
+    /* ── M5.2c 16: a skipped payload capture is refused BEFORE create ────────
+     * The tenant record at (7,4) names `m5.tenant.catalog.0` but has no payload
+     * on media (payload_host_has_sequence stays 0). Without the preflight the
+     * restore would resume the partition, create a FRESH tenant and only then
+     * report the payload skip -- the exact silent-empty replay this tooth
+     * closes. The assertions are the absence of the create itself: g_sends is
+     * 0 and the record is refused with ENV_CKPT_REFUSE_PAYLOAD. */
+    host_partition_define(7);
+    (void)env_ckpt_drop(7, 3);              /* isolate the tenant record */
+    {
+        const struct EnvCkptRecord* trec = env_ckpt_find(7, 4);
+        CHECK(trec != 0, "(setup) the tenant record at (7,4) is still in the table");
+        if (trec) {
+            struct EnvCkptRecord q = *trec;
+            q.flags |= ENV_CKPT_FLAG_QUIESCED;
+            CHECK(env_ckpt_record(&q) == 0,
+                  "(setup) the tenant record is quiesced, so the replay will consider it");
+            env_ckpt_restore_begin();
+            reset_manager(MANAGER_ALIVE);
+            payload_host_has_sequence = 0;
+
+            struct EnvSvcRestoreReport rep;
+            memset(&rep, 0, sizeof rep);
+            int rrc = env_service_restore_pending(&rep);
+            CHECK(rrc == 0,
+                  "the restore pass itself completes when it refuses a missing payload");
+            CHECK(rep.n_pending == 1 && rep.n_refused == 1 && rep.n_replayed == 0,
+                  "the Linux record is counted REFUSED, never replayed (pending 1, refused 1, replayed 0)");
+            CHECK(rep.n_payload_skips == 0,
+                  "and the refusal happened BEFORE the create/pour, so there is no payload-skip from a fresh environment");
+            CHECK(rep.n_remaining == 0,
+                  "the refused record is drained from the pending set rather than retried forever");
+            CHECK(g_sends == 0,
+                  "NO ENV_CREATE was sent: the missing payload stopped the replay before a fresh tenant could be spawned");
+            CHECK(env_ckpt_last_refusal().code == ENV_CKPT_REFUSE_PAYLOAD,
+                  "the last refusal is ENV_CKPT_REFUSE_PAYLOAD, not a post-create identity/create failure");
+            CHECK(env_ckpt_restore_refused_record(7, 4) == 1,
+                  "the record is marked refused in the table (the operator can see which record was not replayed)");
+            CHECK(env_ckpt_find(7, 4) != 0,
+                  "and the record is retained, not dropped as if it had replayed");
+
+            /* Positive control: with the preflight saying the sequence matches,
+             * the SAME record reaches ENV_CREATE. This proves the refusal above
+             * is about the missing payload, not a replay path that never sends. */
+            payload_host_has_sequence = 1;
+            CHECK(env_ckpt_restore_arm(7, 4) == 0,
+                  "(control) the refused record can be re-armed after the media is made whole");
+            reset_manager(MANAGER_ALIVE);
+            g_register_tenant = 1;
+            memset(&rep, 0, sizeof rep);
+            rrc = env_service_restore_pending(&rep);
+            CHECK(rrc == 0 && g_sends > 0,
+                  "(control) a matching payload lets the record reach the create round trip");
+            CHECK(rep.n_replayed == 1 && rep.n_refused == 0,
+                  "(control) and the create is reported replayed, not refused");
+            CHECK(rep.n_payload_skips == 1 && !partition_is_paused(7),
+                  "the pour hold freezes the destination for the pour and releases "
+                  "it after the named payload refusal");
+
+            /* A snapshot-paused partition is resumed for the create, so the
+             * pour hold pauses it again. The report must still count that
+             * snapshot pause as restored (B9 reads it), and the hold must not
+             * turn its own freeze into a resume of the operator's pause. */
+            {
+                const struct EnvCkptRecord* prec = env_ckpt_find(7, 4);
+                CHECK(prec != 0, "(setup) the replayed record is still in the table");
+                if (prec) {
+                    struct EnvCkptRecord q = *prec;
+                    q.flags |= ENV_CKPT_FLAG_QUIESCED;
+                    CHECK(env_ckpt_record(&q) == 0,
+                          "(setup) the record is quiesced for the paused-snapshot replay");
+                }
+            }
+            host_partition_set_paused(7, 1);
+            CHECK(env_ckpt_restore_arm(7, 4) == 0,
+                  "(setup) the record can be re-armed for the paused-snapshot replay");
+            reset_manager(MANAGER_ALIVE);
+            g_register_tenant = 1;
+            memset(&rep, 0, sizeof rep);
+            rrc = env_service_restore_pending(&rep);
+            CHECK(rrc == 0 && rep.n_replayed == 1 && rep.n_refused == 0 &&
+                  rep.n_resumed == 1 && rep.n_repaused == 1,
+                  "a snapshot-paused partition is resumed for create and counted "
+                  "re-paused again even though the pour hold paused it first");
+            CHECK(partition_is_paused(7),
+                  "the snapshot's pause stands after the pour hold is released");
+            host_partition_set_paused(7, 0);
+
+            /* ── P1a hold 17: the deadline tick in the wait-to-freeze gap ──
+             * The E7 gate's live failure was exactly this: the wait saw the
+             * ramdisk sidecar parked, the 200 ms deadline then roused it before
+             * the hold froze the partition, and the first post-freeze check was
+             * false. Force that wake here; the hold must resume, re-wait and
+             * freeze again, and only then may the pour see a frozen partition.
+             * The stand-in pour accepts only a frozen destination, so removing
+             * the retry makes this clause fail rather than pass silently. */
+            {
+                const struct EnvCkptRecord* prec = env_ckpt_find(7, 4);
+                CHECK(prec != 0, "(setup) the gap-wake record is still in the table");
+                if (prec) {
+                    struct EnvCkptRecord q = *prec;
+                    q.flags |= ENV_CKPT_FLAG_QUIESCED;
+                    CHECK(env_ckpt_record(&q) == 0,
+                          "(setup) the gap-wake record is quiesced");
+                }
+            }
+            payload_host_has_sequence = 1;
+            payload_host_wait_calls = 0;
+            payload_host_parked_calls = 0;
+            payload_host_parked_ready = 1;
+            payload_host_gap_wake_fired = 0;
+            payload_host_restore_result = 0;   /* the pour succeeds if frozen */
+            payload_host_restore_guard = payload_guard_partition_frozen;
+            g_gap_wake_armed = 1;
+            g_gap_wake_seen = 0;
+            g_gap_wake_saw_paused = 0;
+            g_gap_wake_wait_calls = 0;
+            g_gap_wake_parked_before = 0;
+            CHECK(env_ckpt_restore_arm(7, 4) == 0,
+                  "(setup) the gap-wake record can be re-armed");
+            reset_manager(MANAGER_ALIVE);
+            g_register_tenant = 1;
+            struct EnvSvcRestoreReport gap_rep;
+            memset(&gap_rep, 0, sizeof gap_rep);
+            int gap_rc = env_service_restore_pending(&gap_rep);
+            CHECK(gap_rc == 0 && gap_rep.n_replayed == 1 &&
+                  gap_rep.n_refused == 0 && gap_rep.n_payloads == 1 &&
+                  gap_rep.n_payload_skips == 0,
+                  "a wake in the wait-to-freeze gap is absorbed by the hold's "
+                  "retry: the record replays and its payload lands");
+            CHECK(g_gap_wake_seen == 1 && g_gap_wake_saw_paused == 0 &&
+                  g_gap_wake_wait_calls == 2 &&
+                  g_gap_wake_parked_before == 0,
+                  "the forced wake happened exactly between the second parked "
+                  "wait and the partition freeze (no posture check had run "
+                  "under a freeze yet)");
+            CHECK(payload_host_wait_calls == 3 && payload_host_parked_calls == 2,
+                  "the hold really retried: one initial wait, two hold waits, and "
+                  "two post-freeze posture checks (the first saw the wake)");
+            CHECK(!partition_is_paused(7),
+                  "the temporary pour hold was released after the retry landed");
+            payload_host_restore_guard = 0;
+            payload_host_restore_result = EP_REFUSE_ABSENT;
+            g_gap_wake_armed = 0;
+            g_register_tenant = 0;
+            payload_host_has_sequence = 0;
+        }
+    }
 
     printf("\n%d checks passed, %d failed\n", checks_passed, checks_failed);
     return checks_failed ? 1 : 0;

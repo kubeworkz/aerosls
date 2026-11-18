@@ -1,0 +1,22 @@
+ok:   A. every file the restore-through-create path lives in is present
+ok:   T1. the pass replays each record through env_service_create() (line 80) and counts it as replayed only after that create returns (line 119)
+ok:   T1. POST /api/env/restore calls the replay, so the restore is reachable from a boot
+ok:   T1. the handler reports replayed/refused/remaining, so a pass that restored nothing cannot be read as one that restored everything
+ok:   T1. env_ckpt_after_restore() arms the pending set, so what is replayed is exactly what the snapshot adopted
+ok:   T2. an identity mismatch is refused with its own reason and the environment the create made is destroyed (a refused restore leaves nothing behind)
+ok:   T2. identity compares partition, index, task names and kinds, and the region kinds and sizes — and deliberately not the per-boot bases, channels, env_id, console key or pids
+ok:   T3. the pass resumes a restored pause for the create (line 65) and re-pauses the pass's ledger afterwards (line 142) on a single straight-line exit
+ok:   T3. env_ckpt_restore_resume_for_create() resumes only a paused, existing partition and env_ckpt_restore_repause() re-pauses exactly its ledger
+ok:   T3. the capture still freezes before it stages (line 60), commits (line 71) and thaws (line 85) with no early return, so both sides of the pause keep the same contract
+ok:   T3. the snapshot's pauses are re-applied (line 569) after the live set is settled (line 562)
+ok:   T4. the hand-out refuses an unquiesced or partition-less record with its own code, rendering and counter, and the refusal clears it from the pending set
+ok:   T5. every host test that links env_service.c can resolve the record layer and the partition primitives it now uses
+ok:   T6. every restore entry point this guard asserts on is exercised against the real kernel/env_ckpt.c
+ok:   T7. the payload capture runs inside the frozen window (line 80, between quiesce 60 and release 85), so what it captured is what the checkpoint froze
+ok:   T7. the pass waits (bounded, yielding — legal before the freeze) for the sidecars to reach their parked idle point BEFORE the quiesce lands, so the posture the capture records is the posture the freeze caught
+ok:   T7. the pour runs after the repause (line 166) with no return and no yield in between — straight-line from the snapshot's pause state to the last memcpy
+ok:   T7. the pass waits (bounded, yielding — legal inside the resume/repause interval) for each sidecar's parked posture before recording it for the pour
+ok:   T7. the pour refuses a moved placement before the first byte (line 110 < pour line 509) and carries no yield inside its body
+ok:   T7. every payload entry point is exercised against the real kernel/env_payload.c, and every host test linking persist.c/env_service.c resolves its symbols
+
+env_checkpoint_restore_check: the P1a restore-through-create path is wired, its refusal set is in place (including the M5.2c missing-payload preflight), and its payload pour is pinned.

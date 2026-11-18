@@ -39,27 +39,76 @@ __attribute__((weak)) int env_payload_present(uint32_t partition, uint32_t index
     return 0;
 }
 
+/* The restore preflight: a test can set this to 1 to model a payload whose
+ * directory entry and head sequence match. Default 0 is the honest host world
+ * with no media -- a Linux record is then refused BEFORE create, which is the
+ * behavior env_service_wait_host_test.c's M5.2c clause drives. */
+__attribute__((weak)) int payload_host_has_sequence = 0;
+
+__attribute__((weak)) int env_payload_has_sequence(uint32_t partition, uint32_t index,
+                                                    uint64_t want_seq) {
+    (void)partition; (void)index; (void)want_seq;
+    return payload_host_has_sequence;
+}
+
+/* Deterministic pour-hold wake knobs (env_service_wait_host_test.c). The
+ * default is the old host world: parked and announced, pour succeeds. The
+ * regression sets the wake flag from env_service_pour_hold_gap(), makes the
+ * post-freeze check fail once, and lets the next wait model the sidecar
+ * running back into its park. Counters are the test's evidence that the hold
+ * really retried rather than passing on its first attempt. */
+__attribute__((weak)) int payload_host_wait_calls = 0;
+__attribute__((weak)) int payload_host_parked_calls = 0;
+__attribute__((weak)) int payload_host_parked_ready = 1;
+__attribute__((weak)) int payload_host_gap_wake_fired = 0;
+__attribute__((weak)) int payload_host_restore_result = EP_REFUSE_ABSENT;
+__attribute__((weak)) int (*payload_host_restore_guard)(uint32_t partition) = 0;
+
 __attribute__((weak)) int env_payload_wait_parked(const struct EnvCkptRecord* rec) {
     (void)rec;
+    payload_host_wait_calls++;
+    /* The retry's wait is where a roused sidecar runs back into its park. */
+    if (payload_host_gap_wake_fired) payload_host_parked_ready = 1;
     return 1;
+}
+
+/* The restore pass's non-yielding posture check after a pour hold. A host
+ * world without live sidecars models the posture as already satisfied; the
+ * deterministic wake regression flips this to 0 for the first freeze. */
+__attribute__((weak)) int env_payload_parked(const struct EnvCkptRecord* rec) {
+    (void)rec;
+    payload_host_parked_calls++;
+    return payload_host_parked_ready;
 }
 
 /* E7 increment 22: the restore pass selects the replay's tooth before it runs.
  * A host test that does not link env_payload.c has no arms to select. */
 __attribute__((weak)) void env_payload_set_tooth(int tooth) { (void)tooth; }
 
-__attribute__((weak)) int env_payload_restore(uint32_t partition, uint32_t index,
-                                              uint32_t new_env_id, uint64_t want_seq,
-                                              uint32_t* out_pages, uint32_t* out_console) {
-    (void)partition; (void)index; (void)new_env_id; (void)want_seq;
-    if (out_pages)  *out_pages  = 0;
-    if (out_console) *out_console = 0;
-    return EP_REFUSE_ABSENT;
-}
-
 static struct EnvPayloadRefusal payload_stub_refusal = {
     EP_REFUSE_ABSENT, 0, 0
 };
+
+__attribute__((weak)) int env_payload_restore(uint32_t partition, uint32_t index,
+                                              uint32_t new_env_id, uint64_t want_seq,
+                                              uint32_t* out_pages, uint32_t* out_console) {
+    (void)index; (void)new_env_id; (void)want_seq;
+    if (out_pages)  *out_pages  = 0;
+    if (out_console) *out_console = 0;
+    /* The regression's pour stand-in: only a frozen destination may receive
+     * contents, exactly as the real pour's posture check requires. A hold
+     * that failed to freeze (or never retried) is refused by name. */
+    if (payload_host_restore_guard && !payload_host_restore_guard(partition)) {
+        payload_stub_refusal.code = EP_REFUSE_NOT_PARKED;
+        payload_stub_refusal.a = 0;
+        payload_stub_refusal.b = 0;
+        return EP_REFUSE_NOT_PARKED;
+    }
+    payload_stub_refusal.code = (uint32_t)payload_host_restore_result;
+    payload_stub_refusal.a = 0;
+    payload_stub_refusal.b = 0;
+    return payload_host_restore_result;
+}
 
 __attribute__((weak)) struct EnvPayloadRefusal env_payload_last_refusal(void) {
     return payload_stub_refusal;

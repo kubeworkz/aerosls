@@ -1327,6 +1327,10 @@ M5CP=user/sidecar/src/m5_catalog_probe.rs
 SVC=kernel/env_service.c
 SVC_HUT=tests/env_service_wait_host_test.c
 M5LIVE=tests/m5_catalog_live_check.sh
+M4CP=user/sidecar/src/m4_ckpt_probe.rs
+INIT_CARGO=user/init/Cargo.toml
+SIDECAR_CARGO=user/sidecar/Cargo.toml
+M53LIVE=tests/m5_tenant_ckpt_probe_check.sh
 EPHUT=tests/env_payload_host_test.c
 ECKHUT=tests/env_ckpt_host_test.c
 if grep -qF '#define ENV_PAYLOAD_REC_VERSION 3u' "$EPH" && \
@@ -1431,6 +1435,26 @@ if grep -qF 'pub const TENANT_LINUX_TASK_NAME: &str = "m5.tenant.catalog.0";' "$
     ok "W5b. M5.2b: init registers the tenant task from the same profile bit that selected its manifest, the sidecar spawns the same name, the kernel records stack bounds for every Linux task and cap counts at create, registration re-stamps a child that spawned first, and the live harness asserts the tenant stamp lands"
 else
     bad "W5b. the ordinary tenant's task-facts chain has a hole — the record would name a task nobody spawns, a live child's stack bounds would stay zero, or a child that beat registration would never be stamped (the live assertion would then have nothing to find)"
+fi
+# ─── W5c. M5.3: the ordinary tenant's record names the checkpoint fixture ──
+# M5.3 swaps the short-lived catalog probe for the committed M4.6 fixture.
+# The task name is one proto constant; init's checkpoint feature registers it,
+# the sidecar's feature spawns it through `spawn_tenant()`, and the catalog
+# probe is compiled out when both features are present. The live harness must
+# also assert both restored PARKED forms, not just a marker printed later.
+if grep -qF 'pub const TENANT_CKPT_TASK_NAME: &str = "m5.tenant.ckpt.0";' "$ENVP" && \
+   grep -qF 'pub const TENANT_PROBE_NAME: &str =' "$M4CP" && \
+   grep -qF 'aerosls_proto::env_proto::TENANT_CKPT_TASK_NAME;' "$M4CP" && \
+   grep -qF 'm5_tenant_ckpt = ["m5_tenant_probe"]' "$INIT_CARGO" && \
+   grep -qF 'm5_tenant_ckpt = ["m4_ckpt_probe"]' "$SIDECAR_CARGO" && \
+   grep -qF 'TENANT_CKPT_TASK_NAME, TASK_LINUX' "$IEM" && \
+   grep -qF 'crate::m4_ckpt_probe::spawn_tenant' "$LRE" && \
+   grep -qF 'not(feature = "m5_tenant_ckpt")' "$LRE" && \
+   grep -qF '[M5.3] tenant ckpt' "$M53LIVE" && \
+   grep -qF 'restored PARKED' "$M53LIVE"; then
+    ok "W5c. M5.3: one proto constant names the fixture task, init registers it, the two Cargo features select matching halves, the sidecar spawns the tenant name, the catalog probe is compiled out when the checkpoint profile is present, and the live harness asserts both restored PARKED forms"
+else
+    bad "W5c. the ordinary tenant's checkpoint wiring has a hole — the record and the sidecar could name different tasks, both tenant probes could spawn at once, or the harness could accept a post-restore marker without proving either waiter was restored PARKED"
 fi
 if grep -qF 'LINUX: the gate environment (sidecar + Linux tenant) captures as one payload' "$EPHUT" && \
    grep -qF 'LINUX: the full ring3_ctx — rip, rsp and the six argument registers — is the captured one' "$EPHUT" && \

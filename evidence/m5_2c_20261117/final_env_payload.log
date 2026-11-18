@@ -1,0 +1,110 @@
+=== env_payload: P1a payload capture and restore ===
+
+ok:   capture writes exactly one payload for the one live record
+ok:   the directory names the payload for (partition, index)
+ok:   a different identity has no payload (the directory is keyed, not sticky)
+ok:   the preflight accepts the payload whose head carries this record's sequence
+ok:   the preflight refuses a stale payload from a different sequence (present is not enough)
+ok:   the preflight is keyed by identity, not by whichever payload happens to be on media
+ok:   the restore pours into the replayed environment
+ok:   the image frame's bytes are the captured ones, not the fresh boot's zeros
+ok:   the identity region's bytes are back at the CAPTURED address (the placement rule)
+ok:   the park save area is the captured one (the register rule)
+ok:   the kernel-side park bookkeeping stays THIS boot's (the captured channel id is not resurrected)
+ok:   user_rip is the captured park point, not the fresh entry
+ok:   the pour reports the two pages (image + region) and the four console bytes
+ok:   the buffered console bytes are injected under the NEW env_id
+ok:   a successful pour leaves no refusal latched
+ok:   ABSENT: an identity no capture ever wrote is refused, not poured
+ok:   SEQ: a payload from a different checkpoint than the record is refused
+ok:   re-capture for the placement refusal
+ok:   the record now names a moved region
+ok:   PLACEMENT: a region away from its captured base refuses the whole pour before a byte moves
+ok:   and nothing was written: the fresh boot's zeros are still zeros
+ok:   re-capture for the no-process refusal
+ok:   NO_PROCESS: a captured sidecar with no live process is a named refusal
+ok:   capture of a mid-compute sidecar still records the payload
+ok:   RUNNING: a capture that caught a sidecar mid-compute is replayed empty, by name
+ok:   re-capture for the not-parked refusals
+ok:   NOT_PARKED: a live sidecar that never reached its idle recv refuses the pour
+ok:   re-capture for the park-syscall mismatch
+ok:   NOT_PARKED: parked in a different syscall than the capture recorded is still a refusal
+ok:   re-capture for the no-mapping refusal
+ok:   NO_MAPPING: a captured vaddr with no live frame refuses before the pour
+ok:   re-capture for the console refusal
+ok:   CONSOLE: buffered bytes with nowhere to go are a refusal, not a silent drop
+ok:   re-capture for the index-crc refusal
+ok:   FORMAT: a torn index zone fails its crc before anything in it is believed
+ok:   re-capture for the data-crc refusal
+ok:   FORMAT: a torn page fails its own crc in the media pass, before the pour
+ok:   the media pass reading garbage wrote nothing (the fresh boot's zeros stand)
+ok:   re-capture for the wait
+ok:   wait: an already-parked sidecar answers immediately
+ok:   wait: parked but not yet announced is not the pour's go signal — the bound answers instead of letting the pour erase the [env-id] line nobody else can write
+ok:   wait: a sidecar that never parks times out on the tick bound instead of spinning forever
+ok:   wait: ... and a sidecar that stopped being scheduled is out of time at the STALL window, not at the ceiling
+ok:   re-capture for the still-working case
+ok:   wait: an environment still being scheduled past the old fixed bound is waited for until it parks, not reported as a posture that never came
+ok:   wait: ... and that case really did outlive the bound the live run died on
+ok:   re-capture for the ceiling case
+ok:   wait: an environment that never stops being scheduled is still answered at the ceiling instead of hanging the restore
+ok:   wait: ... and it was the ceiling that answered, not the stall window
+ok:   wait: a missing sidecar is answered at once (there is nothing to wait for)
+ok:   wait: the loop keeps the service work ticking while it waits — the identity flag it reads is set by env_console_tick(), which on a uniprocessor boot only runs from this pump
+ok:   wait: the loop also pumps the sweep keepalive -- this wait blocks the restore's sweep, and the heartbeat stream must survive it (2026-10-23)
+ok:   re-capture for the refusal rendering
+ok:   a refusal to render exists
+ok:   the refusal renders to text an operator can read in the serial log
+ok:   clear_refusal() latches back to NONE
+ok:   LINUX: the gate environment (sidecar + Linux tenant) captures as one payload
+ok:   LINUX: the restore pours a payload whose third task is the Linux tenant
+ok:   LINUX: nine pages pour — three sidecar region pages + the tenant's two image, two stack and two heap pages
+ok:   LINUX: the linked image's bytes come back at 0x400000 (its own span, not the image window)
+ok:   LINUX: the tenant's stack and budget-span pages come back too
+ok:   LINUX: the full ring3_ctx — rip, rsp and the six argument registers — is the captured one
+ok:   LINUX: fs_base and both memory cursors come back with the context
+ok:   LINUX: the task resumes at the captured rip/rsp, not at its entry
+ok:   LINUX: the sidecar task in the SAME payload still gets its park frame (the sidecar path is unchanged)
+ok:   THREADS: a two-thread Linux group captures as one payload
+ok:   THREADS: the two-thread capture wrote a discoverable payload
+ok:   THREADS: the record carries the shared address space and both thread ids
+ok:   THREADS: the one-member group is still the capturable shape
+ok:   THREADS: the one-member capture wrote a discoverable payload
+ok:   THREADS: a group whose live count and address-space refs disagree is refused
+ok:   THREADS: the refused re-capture drops the old entry, so a replay cannot serve it
+ok:   THREADS: the half-torn refusal names the task and the live count
+ok:   THREADS: a named group with no live member is refused as half-torn
+ok:   THREADS: the zero-live-member refusal wrote no payload
+ok:   THREADS: the half-torn refusal names the task and the zero live count
+ok:   THREADS: a healthy one-member group is capturable again
+ok:   THREADS: a group whose live count and address-space refs disagree is refused
+ok:   THREADS: the mismatched-refs refusal wrote no payload
+ok:   THREADS: the mismatched-refs refusal names the one live member
+ok:   THREADS: the healthy shape captures after the mismatched-refs refusal
+ok:   THREADS: a successful capture clears the previous refusal latch
+ok:   LINUX: re-capture for the permission tooth
+ok:   PERM: a captured RX image page that is writable at the destination refuses the whole pour
+ok:   PERM: and nothing was written — the refusal came before the first byte
+ok:   PERM: the refusal names the task (1, the Linux slot) and the flat page index it faulted on (3 — the three sidecar pages precede it)
+ok:   ENTRY: a tenant stopped AT its syscall captures (the gate's named instant)
+ok:   ENTRY: the stop is a resumable form — poured, not refused
+ok:   ENTRY: the restored frame is the stopped one — rip AT the syscall, rax=read, fd 3 and count intact
+ok:   ENTRY: the task resumes AT the continuation, not at _start
+ok:   ENTRY: the stop is spent at the pour — the resumed read is forwarded, not held a second time
+ok:   LINUX: a tenant parked in its forwarded syscall captures with the parked form
+ok:   FORM: a parked Linux tenant is restored parked — the queued reply is carried by the sidecar's own state
+ok:   FORM: the restored kernel task is blocked on this boot's channel with the captured expected reply number
+ok:   ADOPT: re-capture for the held-replay mapping tooth
+ok:   ADOPT: a held tenant's unmapped heap page does not refuse the pour — the replay maps it
+ok:   ADOPT: exactly the one missing page got a freshly allocated frame, and all nine pages poured
+ok:   ADOPT: the new frame is mapped at the captured vaddr, not somewhere the allocator chose
+ok:   ADOPT: and the captured bytes are in that new frame
+ok:   ADOPT: the held child's first instruction is the captured rip, not _start
+ok:   ADOPT: re-capture for the not-held refusal
+ok:   ADOPT: a Linux task neither held nor carrying a context is refused by name — the hold is what makes the pour's target a task that has not run
+ok:   CHANNEL: a parked leader with captured sidecar handles captures
+ok:   CHANNEL: a captured sidecar-handle mismatch refuses the restore instead of resuming on this boot's channel
+ok:   CHANNEL: the refusal names the Linux task slot and the leader thread index
+ok:   CHANNEL: the refusal happens before the pour — no captured page is written
+
+106 passed, 0 failed

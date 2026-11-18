@@ -200,6 +200,12 @@ pub const LINUX_TASK_NAME: &str = "e7.gate.user.0";
 /// `REGISTER_NAME_LEN` (24) with room.
 pub const TENANT_LINUX_TASK_NAME: &str = "m5.tenant.catalog.0";
 
+/// M5.3: the ordinary-tenant checkpoint profile's Linux task. It reuses the
+/// proven M4.6 two-thread fixture, but under an ordinary tenant identity and
+/// without `FLAG_GATE`; init's registration names this slot and the tenant
+/// sidecar's checkpoint-profile spawn uses the same constant.
+pub const TENANT_CKPT_TASK_NAME: &str = "m5.tenant.ckpt.0";
+
 /// M4.6 increment 1's live probe task. It is the SAME third task slot as
 /// `LINUX_TASK_NAME`, selected by the `m4_ckpt_probe` build profile; the
 /// sidecar spawns it and init's registration names it under the same profile.

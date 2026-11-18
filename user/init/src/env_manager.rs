@@ -18,6 +18,7 @@ use aerosls_proto::env_proto::{
 };
 #[cfg(not(feature = "m4_ckpt_probe"))]
 use aerosls_proto::env_proto::LINUX_TASK_NAME;
+#[cfg(not(feature = "m5_tenant_ckpt"))]
 use aerosls_proto::env_proto::TENANT_LINUX_TASK_NAME;
 use aerosls_proto::kabi::{
     Kernel, ERR_NOMEM, ENV_STORAGE_ERR_IO, ENV_STORAGE_ERR_NOSLOT,
@@ -408,7 +409,12 @@ pub fn environment_register_reply(env_id: u32, env: &Environment) -> RegisterRep
         // the same profile bit that selected the manifest, is what makes a
         // replay's create name the same task list — never whatever happened to
         // be spawned. The kernel fills entry/stack at the spawn (and again at
-        // registration if the child won the create race).
+        // registration if the child won the create race). M5.3 swaps only the
+        // name (and therefore the fixture the sidecar spawns); the tenant
+        // profile bit and the record slot are unchanged.
+        #[cfg(feature = "m5_tenant_ckpt")]
+        r.set_task(2, aerosls_proto::env_proto::TENANT_CKPT_TASK_NAME, TASK_LINUX);
+        #[cfg(not(feature = "m5_tenant_ckpt"))]
         r.set_task(2, TENANT_LINUX_TASK_NAME, TASK_LINUX);
     }
     r

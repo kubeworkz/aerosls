@@ -344,6 +344,36 @@ int env_payload_present(uint32_t partition, uint32_t index) {
     return ep_dir_find(e, (uint32_t)n, partition, index, 0);
 }
 
+int env_payload_has_sequence(uint32_t partition, uint32_t index,
+                             uint64_t want_seq) {
+    struct EnvPayloadDirHead h;
+    struct EnvPayloadDirEntry e[ENV_PAYLOAD_MAX];
+    int n = ep_dir_read(&h, e);
+    if (n <= 0) return 0;
+    uint32_t di = 0;
+    if (!ep_dir_find(e, (uint32_t)n, partition, index, &di)) return 0;
+
+    uint64_t slot_lba = ENV_PAYLOAD_SLOT_LBA(e[di].slot);
+    ep_memset(ep_page, 0, 4096);
+    if (nvme_read_sync(slot_lba, ep_page) != 0) return 0;
+
+    struct EnvPayloadHead head;
+    ep_copy(&head, ep_page, (uint32_t)sizeof(head));
+    if (head.magic != ENV_PAYLOAD_BLOB_MAGIC ||
+        head.version != ENV_PAYLOAD_REC_VERSION ||
+        head.partition_id != partition || head.index != index)
+        return 0;
+
+    uint64_t seq = ((uint64_t)head.seq_high << 32) | head.seq_low;
+    if (seq != want_seq) return 0;
+
+    /* The head must at least describe a non-empty, in-range payload. The full
+     * format/CRC/placement checks remain the pour's job; this preflight only
+     * decides whether the create may run at all. */
+    return head.n_pages > 0 && head.n_pages <= EP_MAX_PAGES &&
+           head.n_tasks > 0 && head.n_tasks <= EP_MAX_TASKS;
+}
+
 /* ─── The page-table walk (identity map: a phys frame is a plain pointer) ── */
 /* The permissions a leaf entry grants, in the blob's EP_PAGE_PERM_* bits.
  * Reads the PRESENT entry's own W/U/NX bits, so the value is what the map
@@ -478,6 +508,19 @@ static int ep_name_eq(const char* a, const char* b) {
         if (a[i] == '\0') return 1;
     }
     return 1;
+}
+
+/* The wait's predicate, without the wait. The restore pass freezes the
+ * partition after the wait and calls this to prove the frozen posture still
+ * matches the record; see env_payload.h. */
+int env_payload_parked(const struct EnvCkptRecord* rec) {
+    if (!rec) return 0;
+    for (uint32_t t = 0; t < rec->n_tasks && t < ENV_CKPT_MAX_TASKS; t++) {
+        if (rec->tasks[t].kind == ENV_CKPT_TASK_LINUX) continue;
+        const struct ProcessDescriptor* pd = ep_find_proc(rec->tasks[t].name);
+        if (!pd || !ep_proc_parked(pd)) return 0;
+    }
+    return env_console_identity_seen(rec->partition_id, rec->index);
 }
 
 /* M4.6: the live members of one Linux group, leader first. A group is

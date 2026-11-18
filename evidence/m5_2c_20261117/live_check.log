@@ -1,0 +1,15 @@
+=== boot: sls_operating_system_e3_m52c.iso (grub entry 3) ===
+up: control plane on 32001
+partition=1
+uids: dave=1000 bob=1001 assigned to partition 1
+tables: m52_dave (dave), m52_bob (bob), m52_foreign (partition system)
+tenant env=1 (index 3, owner bob)
+ok:   the tenant Linux task is registered and its stamp landed (registration only; no tenant checkpoint/restore)
+ok:   the tenant probe exited and its group is dead -- payload capture must now skip
+ok:   the checkpoint wrote the record and skipped the dead tenant's payload
+ok:   the node rebooted in place and adopted the checkpoint's record
+ok:   restore refused the record (refused=1, replayed=0, payload_skips=0)
+ok:   the refusal happened BEFORE create; the second boot spawned no fresh tenant
+ok:   no environment exists at index 3 after the refused restore
+M5.2c live tooth tenant-payload-missing: PASS (partition=1 index=3, refused before create)
+artifacts: /tmp/m52c-evidence

@@ -656,6 +656,12 @@ int main(void) {
           "the directory names the payload for (partition, index)");
     CHECK(env_payload_present(T_PART, T_IDX + 1) == 0,
           "a different identity has no payload (the directory is keyed, not sticky)");
+    CHECK(env_payload_has_sequence(T_PART, T_IDX, T_SEQ) == 1,
+          "the preflight accepts the payload whose head carries this record's sequence");
+    CHECK(env_payload_has_sequence(T_PART, T_IDX, T_SEQ + 1) == 0,
+          "the preflight refuses a stale payload from a different sequence (present is not enough)");
+    CHECK(env_payload_has_sequence(T_PART, T_IDX + 1, T_SEQ) == 0,
+          "the preflight is keyed by identity, not by whichever payload happens to be on media");
 
     simulate_fresh_boot();
     uint32_t pages = 0, cons = 0;
@@ -771,6 +777,15 @@ int main(void) {
     kernel_tick_counter = 0;
     CHECK(env_payload_wait_parked(&g_scratch) == 1,
           "wait: an already-parked sidecar answers immediately");
+    g_identity_seen = 1;
+    CHECK(env_payload_parked(&g_scratch) == 1,
+          "parked: the non-yielding predicate agrees with the wait on a parked, "
+          "announced sidecar");
+    proc_table[0].waiting_chan = CAP_NONE;
+    CHECK(env_payload_parked(&g_scratch) == 0,
+          "parked: ... and answers 0 as soon as the sidecar is roused, without "
+          "pumping or yielding");
+    proc_table[0].waiting_chan = 3u;
     g_identity_seen = 0;
     kernel_tick_counter = 0;
     CHECK(env_payload_wait_parked(&g_scratch) == 0,

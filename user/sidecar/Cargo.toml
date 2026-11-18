@@ -78,3 +78,9 @@ m4_std_thread_probe = []
 # `make x86-iso-e3 ... M5_CATALOG_PROBE=1`. Default builds compile neither
 # the module nor its spawn path.
 m5_catalog_probe = []
+# M5.3: the ordinary-tenant checkpoint profile. It reuses the M4.6 two-thread
+# checkpoint fixture but registers it under the tenant checkpoint task name;
+# environment index 3 is selected by init's `m5_tenant_probe` feature. It
+# implies `m4_ckpt_probe` so the fixture module is available, but the gate
+# profile is not selected. Build-time only; off by default.
+m5_tenant_ckpt = ["m4_ckpt_probe"]

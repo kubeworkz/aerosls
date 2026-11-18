@@ -417,7 +417,7 @@ int env_service_register_env(uint32_t partition, uint32_t index,
                                     checkpoint_last_sequence());
     if (rc != 0) {
         struct EnvCkptRefusal ref = env_ckpt_last_refusal();
-        char why[96];
+        char why[160];
         env_ckpt_refusal_text(&ref, why, (uint32_t)sizeof why);
         kernel_serial_printf(
             "[ENV] checkpoint registration for env %u (partition %u, index %u) "
@@ -525,6 +525,132 @@ static void es_release_held_linux(const struct EnvCkptRecord* rec) {
     }
 }
 
+/* What one replay contributed to the pass: the identity the create made, and
+ * the sequence its record settled at. The pour runs after the create loop, so
+ * this is the pass's own short list of destinations. */
+struct es_replay_done {
+    uint32_t p, idx, env_id;
+    uint64_t seq;
+};
+
+/* A partition frozen for the payload pour. `was_paused` records whether the
+ * freeze is the snapshot's pause (leave it after the pour) or this pass's
+ * temporary hold (resume it). */
+struct es_pour_hold {
+    uint32_t p;
+    int      was_paused;
+};
+
+#define ES_POUR_HOLD_TRIES 4u
+
+/* Host-regression seam: called after the parked wait has answered and before
+ * the partition is frozen. The shipped kernel's weak definition is a no-op;
+ * env_service_wait_host_test.c defines it to model the deadline tick that
+ * rouses the ramdisk sidecar in exactly that gap (the E7 gate's live race),
+ * so the hold's retry path is exercised deterministically rather than only
+ * when a live boot happens to lose the race. */
+__attribute__((weak)) void env_service_pour_hold_gap(uint32_t partition_id) {
+    (void)partition_id;
+}
+
+/* P1a payload: carry the parked posture across the pour's own media reads.
+ *
+ * The site this closes (E7 gate live, 2026-11-17): the pre-pour wait saw both
+ * sidecars parked, then `env_payload_restore()` read the blob's head and index
+ * from NVMe before its single posture check. The ramdisk sidecar's 200 ms
+ * discovery poll fired during those reads, so the check that was supposed to
+ * find the posture the wait had just proved found `drv.ramdisk.1` RUNNING and
+ * refused a capture that was correct. Waiting longer cannot close that: the
+ * wake can land after the wait's last look and before the pour's check. A
+ * frozen partition can: `cap_park_deadline_tick()` defers deadline wakes while
+ * the partition is paused (process.c), so a posture verified AFTER the freeze
+ * cannot move until the pour is over.
+ *
+ * The loop is the race's failure side made explicit: wait all of the
+ * partition's records while it still runs, pause it, then re-check every one
+ * with the non-yielding predicate. A posture that moved between the wait and
+ * the pause is resumed and waited for again; the pour only ever sees a posture
+ * verified under the freeze. `PARTITION_SYSTEM` is never frozen -- the capture
+ * never freezes it either -- and a partition somebody had already paused is
+ * verified without a wait, because its sidecars cannot run to park at all.
+ * A hold that cannot be obtained leaves the partition as it was and the pour's
+ * own named refusal remains the authority; this function never weakens it. */
+static uint32_t es_hold_for_pour(const struct es_replay_done* done,
+                                 uint32_t n_done,
+                                 struct es_pour_hold* holds) {
+    uint32_t n_holds = 0;
+    for (uint32_t d = 0; d < n_done; d++) {
+        uint32_t p = done[d].p;
+        int seen = 0;
+        for (uint32_t h = 0; h < n_holds; h++)
+            if (holds[h].p == p) { seen = 1; break; }
+        if (seen || p == PARTITION_SYSTEM) continue;
+
+        int already_paused = partition_is_paused(p);
+        int was_paused = env_ckpt_restore_resumed_partition(p) || already_paused;
+        int held = 0;
+
+        if (already_paused) {
+            /* This pass's create was into a partition that was already paused
+             * for another reason: there is no yield to be had here, so verify
+             * the frozen posture directly. */
+            held = 1;
+            for (uint32_t k = d; k < n_done; k++) {
+                if (done[k].p != p) continue;
+                const struct EnvCkptRecord* rec = env_ckpt_find(p, done[k].idx);
+                if (!rec || !env_payload_parked(rec)) { held = 0; break; }
+            }
+        } else {
+            for (uint32_t attempt = 0; attempt < ES_POUR_HOLD_TRIES && !held;
+                 attempt++) {
+                int ready = 1;
+                for (uint32_t k = d; k < n_done; k++) {
+                    if (done[k].p != p) continue;
+                    const struct EnvCkptRecord* rec =
+                        env_ckpt_find(p, done[k].idx);
+                    if (!rec || !env_payload_wait_parked(rec)) {
+                        ready = 0;
+                        break;
+                    }
+                }
+                if (!ready) break;
+                env_service_pour_hold_gap(p);
+                if (partition_pause(p) != 0) break;
+
+                int all = 1;
+                for (uint32_t k = d; k < n_done; k++) {
+                    if (done[k].p != p) continue;
+                    const struct EnvCkptRecord* rec =
+                        env_ckpt_find(p, done[k].idx);
+                    if (!rec || !env_payload_parked(rec)) { all = 0; break; }
+                }
+                if (all) { held = 1; break; }
+
+                /* The deadline tick won the gap between the wait's last look
+                 * and the pause. Let the sidecar run back into its park and
+                 * repeat under a new freeze. */
+                (void)partition_resume(p);
+            }
+        }
+
+        if (held) {
+            holds[n_holds].p = p;
+            holds[n_holds].was_paused = was_paused;
+            n_holds++;
+            kernel_serial_printf(
+                "[ENV_PAYLOAD] pour hold: partition %u frozen with the parked "
+                "posture verified -- deadline wakes are deferred until the "
+                "pour is over\n", (unsigned)p);
+        } else {
+            kernel_serial_printf(
+                "[ENV_PAYLOAD] pour hold: partition %u was not frozen -- the "
+                "pour will check the posture and refuse by name if it moved\n",
+                (unsigned)p);
+        }
+    }
+    return n_holds;
+}
+
 int env_service_restore_pending(struct EnvSvcRestoreReport* out) {
     if (!out) return -1;
     out->n_pending   = env_ckpt_restore_pending();
@@ -546,8 +672,10 @@ int env_service_restore_pending(struct EnvSvcRestoreReport* out) {
     /* What this pass replayed, so the payload pour below can run AFTER the
      * repause — the pour must not yield, and yielding is only illegal from
      * there on (env_payload.h's rule). */
-    struct { uint32_t p, idx, env_id; uint64_t seq; } done[ENV_CKPT_MAX];
+    struct es_replay_done done[ENV_CKPT_MAX];
     uint32_t n_done = 0;
+    struct es_pour_hold holds[ENV_CKPT_MAX];
+    uint32_t n_holds = 0;
 
     while (env_ckpt_restore_pending() > 0) {
         uint32_t p = 0, idx = 0, old_id = 0;
@@ -568,6 +696,27 @@ int env_service_restore_pending(struct EnvSvcRestoreReport* out) {
         }
         struct EnvCkptRecord w = *want;
 
+        /* M5.2c payload preflight: a Linux task's state lives in the payload,
+         * not in the descriptor. If its capture was skipped (the tenant had
+         * already exited) or the payload on media belongs to another
+         * checkpoint, there is nothing to pour. Refuse HERE -- before the
+         * partition is resumed and before env_service_create() -- because a
+         * create would spawn a FRESH tenant and the old code would then report
+         * the payload skip after the fresh task had already run. The record's
+         * task facts alone are not a restore. */
+        int has_linux = es_record_has_linux(&w);
+        if (has_linux && !env_payload_has_sequence(p, idx, w.sequence)) {
+            char why[160];
+            struct EnvCkptRefusal r = { ENV_CKPT_REFUSE_PAYLOAD, idx, 0 };
+            env_ckpt_refusal_text(&r, why, (uint32_t)sizeof why);
+            env_ckpt_restore_refuse(p, idx, ENV_CKPT_REFUSE_PAYLOAD, idx, 0);
+            kernel_serial_printf(
+                "[ENV_RESTORE] record (partition %u, index %u): %s -- no create "
+                "attempted, so no fresh tenant was spawned\n",
+                (unsigned)p, (unsigned)idx, why);
+            continue;
+        }
+
         int can = env_ckpt_restore_resume_for_create(p);
         if (can < 0) {
             env_ckpt_restore_refuse(p, idx, ENV_CKPT_REFUSE_NO_PARTITION, idx, p);
@@ -579,7 +728,6 @@ int env_service_restore_pending(struct EnvSvcRestoreReport* out) {
          * create round trip (or the parked wait below) yields — so the arm
          * must cover both, and the disarm waits for this environment's pour.
          * Only a record that names a Linux task arms anything. */
-        int has_linux = es_record_has_linux(&w);
         if (has_linux) cap_linux_restore_arm(p);
 
         uint16_t status = ENV_ERR_INVAL;
@@ -645,6 +793,14 @@ int env_service_restore_pending(struct EnvSvcRestoreReport* out) {
     // Put back exactly the pauses this pass stepped out of -- never "every
     // partition that has a record" -- and clear the ledger. On every path above
     // `continue` was used, never `return`: see the comment at the top.
+    /* P1a payload: the wait proved a posture while the partition could still
+     * run; the pour's own NVMe reads are long enough for the ramdisk's 200 ms
+     * deadline tick to rouse it again. Freeze each destination here, still
+     * BEFORE the repause and before the pour's no-yield interval, and verify
+     * the posture under that freeze. The pour's own check stays the authority. */
+    if (es_restore_payload)
+        n_holds = es_hold_for_pour(done, n_done, holds);
+
     out->n_resumed   = env_ckpt_restore_resumed();
     out->n_repaused  = env_ckpt_restore_repause();
 
@@ -675,7 +831,7 @@ int env_service_restore_pending(struct EnvSvcRestoreReport* out) {
             out->n_payloads++;
         } else {
             out->n_payload_skips++;
-            char why[96];
+            char why[160];
             struct EnvPayloadRefusal pr = env_payload_last_refusal();
             env_payload_refusal_text(&pr, why, (uint32_t)sizeof(why));
             kernel_serial_printf(
@@ -693,11 +849,23 @@ int env_service_restore_pending(struct EnvSvcRestoreReport* out) {
     }
     env_payload_set_tooth(ENV_PAYLOAD_TOOTH_NONE);
 
+    /* Release only the freezes this pass took around a running partition. A
+     * snapshot pause was put back by env_ckpt_restore_repause() and stays. */
+    for (uint32_t h = 0; h < n_holds; h++) {
+        uint32_t p = holds[h].p;
+        if (holds[h].was_paused) continue;
+        if (!partition_exists(p) || !partition_is_paused(p)) continue;
+        (void)partition_resume(p);
+        kernel_serial_printf(
+            "[ENV_PAYLOAD] pour hold released: partition %u resumed\n",
+            (unsigned)p);
+    }
+
     out->n_remaining = env_ckpt_restore_pending();
     out->n_refused   = env_ckpt_restore_refused() - refused_before;
 
     if (out->n_refused > 0) {
-        char why[96];
+        char why[160];
         struct EnvCkptRefusal r = env_ckpt_last_refusal();
         env_ckpt_refusal_text(&r, why, (uint32_t)sizeof(why));
         kernel_serial_printf("[ENV_RESTORE] last refusal: %s.\n", why);

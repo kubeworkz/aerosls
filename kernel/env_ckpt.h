@@ -240,6 +240,9 @@ struct EnvCkptRegister {
 #define ENV_CKPT_REFUSE_IDENTITY     15  /* a=record index; the create produced a different environment */
 #define ENV_CKPT_REFUSE_CREATE       16  /* a=record index; b=the ENV_* status or rc the create answered */
 #define ENV_CKPT_REFUSE_THREADS      17  /* a=record index; a Linux group count out of range */
+#define ENV_CKPT_REFUSE_PAYLOAD      18  /* a=record index; a Linux record has no matching
+                                          * payload for its sequence -- refused BEFORE
+                                          * create, so no fresh tenant is spawned */
 
 struct EnvCkptRefusal {
     uint32_t code;
@@ -639,6 +642,12 @@ int env_ckpt_restore_same_identity(const struct EnvCkptRecord* want,
  * was already running (nothing to put back), -1 when it could not be resumed
  * because it is gone -- refused, not attempted. */
 int env_ckpt_restore_resume_for_create(uint32_t partition_id);
+
+/* 1 when `partition_id` is in this pass's resume ledger -- the snapshot left
+ * it paused and the pass still owes it a repause. A pour hold can freeze the
+ * partition again; this is how the restore pass knows whether that pause is
+ * the snapshot's (leave it) or its own temporal hold (resume after the pour). */
+int env_ckpt_restore_resumed_partition(uint32_t partition_id);
 
 /* Put back every pause this pass stepped out of, clear the ledger, and return
  * how many partitions were re-paused. */

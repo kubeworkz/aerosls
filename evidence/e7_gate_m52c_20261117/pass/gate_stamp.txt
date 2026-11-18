@@ -1,0 +1,1 @@
+[ENV_CKPT] linux task 'e7.gate.user.0' stamped into partition=1 index=1 entry=0x800ab76 stack=0x40000009b000..0x4000000ab000 caps=2

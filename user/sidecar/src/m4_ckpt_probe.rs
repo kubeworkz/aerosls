@@ -25,6 +25,9 @@ use crate::linux::LINUX_DEFAULT_ENV;
 static PROBE: &[u8] = include_bytes!("../fixtures/m4_ckpt_probe.flat");
 
 pub const PROBE_NAME: &str = aerosls_proto::env_proto::M4_CKPT_TASK_NAME;
+/// M5.3: the same fixture under the ordinary-tenant checkpoint identity.
+pub const TENANT_PROBE_NAME: &str =
+    aerosls_proto::env_proto::TENANT_CKPT_TASK_NAME;
 pub const PROBE_RESERVE: u64 = 64 * 1024;
 
 const IMAGE_VBASE: u64 = 0x4000_0000_0000; /* USER_PROC_CODE_BASE */
@@ -40,6 +43,25 @@ pub fn spawn<K: aerosls_proto::kabi::Kernel>(
     k: &K,
     budget_base: u64,
     budget_len: u64,
+) -> Result<Spawned, i32> {
+    spawn_named(k, budget_base, budget_len, PROBE_NAME)
+}
+
+/// M5.3: reuse the proven two-thread fixture in an ordinary tenant profile,
+/// under the tenant checkpoint task name init registers.
+pub fn spawn_tenant<K: aerosls_proto::kabi::Kernel>(
+    k: &K,
+    budget_base: u64,
+    budget_len: u64,
+) -> Result<Spawned, i32> {
+    spawn_named(k, budget_base, budget_len, TENANT_PROBE_NAME)
+}
+
+fn spawn_named<K: aerosls_proto::kabi::Kernel>(
+    k: &K,
+    budget_base: u64,
+    budget_len: u64,
+    name: &str,
 ) -> Result<Spawned, i32> {
     if budget_len < PROBE_RESERVE + 0x1000 {
         return Err(-1);
@@ -58,7 +80,7 @@ pub fn spawn<K: aerosls_proto::kabi::Kernel>(
         version_major: 1,
         version_minor: 0,
         flags: 0,
-        name: Some(PROBE_NAME),
+        name: Some(name),
         personality: Some("m4.linux.v1"),
         image: Some(Image {
             offset: 0,
@@ -88,7 +110,7 @@ pub fn spawn<K: aerosls_proto::kabi::Kernel>(
             log_level: 1,
         }),
         flags_value: Some(0),
-        argenv: Some(ArgEnv::new(&[PROBE_NAME], LINUX_DEFAULT_ENV)),
+        argenv: Some(ArgEnv::new(&[name], LINUX_DEFAULT_ENV)),
         signature: None,
     };
 

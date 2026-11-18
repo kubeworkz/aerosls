@@ -27,7 +27,7 @@
 # checked the exit code.
 #
 # The teeth are source mutations rather than boot-time ones so that every push
-# proves them with no QEMU and no build: the replay and its four refusals, the
+# proves them with no QEMU and no build: the replay and its refusal set, the
 # payload's capture/pour wiring, and — since the fifth increment — the BOOT
 # ARM's artifact half as well: the guard's --replay validator is run here over
 # a synthesized well-formed recorded run with exactly one mutation at a time,
@@ -347,6 +347,10 @@ PY
     seed "$W/p9"
     rm -f "$W/p9/tests/env_payload_host_test.c"
     tooth payload T7 "the payload entry points are exercised by no host test (a claim, not a feature)" "$W/p9"
+
+    seed "$W/p10"
+    sed -i '/env_service_pour_hold_gap(p);/d' "$W/p10/kernel/env_service.c"
+    tooth payload T7 "the deterministic gap-wake seam is gone (the hold's retry is no longer exercised)" "$W/p10"
 else
     skipped=$((skipped + 1))
 fi

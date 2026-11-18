@@ -1201,6 +1201,12 @@ SIDECAR_M4_STD_THREAD_PROBE = $(if $(filter 1,$(M4_STD_THREAD_PROBE)),--features
 # compiles both out.
 M5_CATALOG_PROBE ?=
 SIDECAR_M5_CATALOG_PROBE = $(if $(filter 1,$(M5_CATALOG_PROBE)),--features aerosls-sidecar/m5_catalog_probe)
+# M5.3: the ordinary-tenant checkpoint profile. `make x86-iso-e3
+# E3_INIT_FEATURES=e3_envs,m5_tenant_probe,m5_tenant_ckpt M5_TENANT_CKPT=1`
+# reuses the M4.6 two-thread fixture under `m5.tenant.ckpt.0` in environment
+# index 3, without `e7_gate`. Unset compiles the tenant spawn path out.
+M5_TENANT_CKPT ?=
+SIDECAR_M5_TENANT_CKPT = $(if $(filter 1,$(M5_TENANT_CKPT)),--features aerosls-sidecar/m5_tenant_ckpt)
 SIDECAR_INIT_ELF   ?= user/target/x86_64-unknown-none/release/init
 SIDECAR_DM_ELF     ?= user/target/x86_64-unknown-none/release/dm
 SIDECAR_POSIX_ELF ?= user/target/x86_64-unknown-none/release/posix
@@ -1261,7 +1267,7 @@ selfhost-bootimage:
 	@# aerosls-bootimage directly; a stamp is only for an archive this target
 	@# built.) tests/sidecar_stamp_check.sh clause G holds this line.
 	@$(CARGO) build --quiet --manifest-path user/Cargo.toml -p aerosls-dm -p aerosls-sidecar -p aerosls-ramdisk -p aerosls-network -p aerosls-e1000-driver \
-		--features target $(SIDECAR_SLOW_BOOT) $(SIDECAR_M1_NET_PROBE) $(SIDECAR_M4_THREAD_PROBE) $(SIDECAR_M4_GROUP_PROBE) $(SIDECAR_M4_FUTEX_PROBE) $(SIDECAR_M4_EXIT_PROBE) $(SIDECAR_M4_CKPT_PROBE) $(SIDECAR_M4_RUNTIME_PROBE) $(SIDECAR_M4_HARDENING_PROBE) $(SIDECAR_M4_STD_THREAD_PROBE) $(SIDECAR_M5_CATALOG_PROBE) --target x86_64-unknown-none --release \
+		--features target $(SIDECAR_SLOW_BOOT) $(SIDECAR_M1_NET_PROBE) $(SIDECAR_M4_THREAD_PROBE) $(SIDECAR_M4_GROUP_PROBE) $(SIDECAR_M4_FUTEX_PROBE) $(SIDECAR_M4_EXIT_PROBE) $(SIDECAR_M4_CKPT_PROBE) $(SIDECAR_M4_RUNTIME_PROBE) $(SIDECAR_M4_HARDENING_PROBE) $(SIDECAR_M4_STD_THREAD_PROBE) $(SIDECAR_M5_CATALOG_PROBE) $(SIDECAR_M5_TENANT_CKPT) --target x86_64-unknown-none --release \
 		--bin dm --bin posix --bin ramdisk --bin network --bin e1000_driver \
 		|| { echo "[SELFHOST] REFUSING to pack and stamp: the sidecars did not build for x86_64-unknown-none." >&2; \
 		     echo "           The stamp attests the packed binaries, and reusing existing ones would make it a lie." >&2; \

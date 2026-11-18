@@ -1,0 +1,217 @@
+[E1] yield: control plane -> PID 103 'drv.ramdisk.3' (budget 2 ticks)
+[HTTP] POST /api/node/reboot confirmed -- resetting node 0.
+
+[NODE-RESET] Resetting this node NOW. Nothing has been checkpointed -- anything
+[NODE-RESET] not already on NVMe is gone. If that is not what you wanted, the order
+[NODE-RESET] is `checkpoint` first, confirm it succeeded, then reset.
+[H[J[1;1H[?25l[m[H[J[1;1H[2;30HGNU GRUB  version 2.12
+
+[m[4;2H+----------------------------------------------------------------------------+[5;2H|[5;79H|[6;2H|[6;79H|[7;2H|[7;79H|[8;2H|[8;79H|[9;2H|[9;79H|[10;2H|[10;79H|[11;2H|[11;79H|[12;2H|[12;79H|[13;2H|[13;79H|[14;2H|[14;79H|[15;2H|[15;79H|[16;2H|[16;79H|[17;2H+----------------------------------------------------------------------------+[m[18;2H[19;2H[m     Use the ^ and v keys to select which entry is highlighted.          
+      Press enter to boot the selected OS, `e' to edit the commands       
+      before booting or `c' for a command-line.                           [5;80H [7m[5;3H*AeroSLS ? Phase 5 self-hosted (initrd sidecars)                            [m[5;78H[m[m[6;3H AeroSLS ? kernel only                                                      [m[6;78H[m[m[7;3H AeroSLS ? unified (control plane + sidecars)                               [m[7;78H[m[m[8;3H GRUB shell                                                                 [m[8;78H[m[m[9;3H                                                                            [m[9;78H[m[m[10;3H                                                                            [m[10;78H[m[m[11;3H                                                                            [m[11;78H[m[m[12;3H                                                                            [m[12;78H[m[m[13;3H                                                                            [m[13;78H[m[m[14;3H                                                                            [m[14;78H[m[m[15;3H                                                                            [m[15;78H[m[m[16;3H                                                                            [m[16;78H[m[16;80H [5;78H[22;1H   The highlighted entry will be executed automatically in 3s.                 [5;78H[22;1H                                                                               [23;1H                                                                               [5;78H[m[5;3H AeroSLS ? Phase 5 self-hosted (initrd sidecars)                            [m[5;78H[m[7m[6;3H*AeroSLS ? kernel only                                                      [m[6;78H[m[m[6;3H AeroSLS ? kernel only                                                      [m[6;78H[m[7m[7;3H*AeroSLS ? unified (control plane + sidecars)                               [m[7;78H[m[?25h[H[J[1;1H[H[J[1;1H[AEROSLS BOOT LOGGER V1.0.0 RUNNING]
+----------------------------------------------------------------------------------
+[BSP] Loading GDT and IDT...
+[FRAME] bootstrap stack [0xe1029a0,0xe2029a0) confirmed inside the reserved region -- frames 57602..57858 are the kernel's own stack and are not allocatable.
+[FRAME] reserved 57859 frames (226 MiB) below the kernel image end 0xe203000 -- allocator now starts above the kernel.
+[SIDECAR] multiboot v1 detected, flags=0x1a6f phys=0x10000
+[SIDECAR] v1 mods_count=1 mods_addr=0x100c4
+[SIDECAR] v1 initrd module at 0xe26b000..0xe45966c (2025068 bytes)
+[HW] Multiboot v1: mem_upper=1047388 KiB, top=0x3ffd7000
+[FRAME] reserved 786473 frames above 0x3ffd7000 -- that memory does not exist.
+[CAP] shared-memory arena: 64 MiB physically contiguous at 0xe400000 (16384 frames).
+[CAP] Seed kernel capability layer online: 512-slot tables, 1024-object ceiling, holders, channels, arena, message transport, syscalls 289-304.
+[QEMU-SLS MMU] shadow PML4=0x000000000e203000 (kernel PT inherited)
+[TIMER] tick calibrated: tsc=2433590193 Hz, lapic=62564319 Hz, ticr=625643, tick=10000000 ns
+[BSP] LAPIC and IRQ0 timer online.
+[BSP] Round-robin task scheduler initialised.
+[FPU] SSE/SSE2 enabled for ring 3 — CR4.OSFXSR|OSXMMEXCPT, CR0.MP; EM/TS clear, CR0.TS not armed
+[SYSCALL] Gate initialised. STAR=0x0010000800000000  LSTAR=0x0000000000102bd0
+[PROC] Ring-3 process manager initialised.
+[BOOT] command line: "unified=1 nic0=both nic1=none"
+[PARTITION] LPAR groundwork initialised (1 partition: system).
+[SERVICE] service registry initialised (0 registrations).
+[MESH] circuit breakers initialised (all closed).
+[WORKLOAD] declarative workloads initialised (reconciler OFF).
+[WLCTX] context pool initialised (8 slots).
+[FAILOVER] Subsystem initialised.
+[FAILOVER] relaunch grace: this node just came up -- no peer is declared DEAD for 6000 ticks (until tick 6001).
+[LOADER] Service binary store ready. Built-in demo: 26 bytes.
+[WEBAPP] Asset store ready. Built-in Navigator page: 2059 bytes.
+[ENTROPY] seeded.
+[RTC] CMOS clock accepted.
+[TLS] memory pool initialised (512 KiB, fixed).
+[AUTH] Token Registry
+ Email                           UID   Role          Token                             Password
+ -------------------------------  ----  ------------  --------------------------------  --------
+ dave@gridworkz.com  uid=1000  DB_ADMIN  deadbeef01234567cafebabe76543210  demo-dave
+ bob@vance.com  uid=1001  APP_USER  cafebabe7654321089abcdef01234567  demo-bob
+ carol@gridworkz.com  uid=1002  DB_ADMIN  feedf00dabcdef0112345678deadc0de  demo-carol
+ guest@sandbox.com  uid=1003  GUEST  deadc0de9988776655443322aabbccdd  demo-guest
+
+[JOURNAL] Subsystem initialised.
+[LOCK] Row-level lock manager initialised.
+[INDEX] Secondary index manager initialised.
+[CONSTRAINT] Engine initialised.
+[CURSOR] Server-side cursor engine initialised.
+[MQT] Materialized query table engine initialised.
+[ROWSTORE] Row-set storage engine initialised.
+[ROW_INDEX] B-tree row index engine initialised.
+[VECSTORE] Vector store engine initialised.
+[AGENT] Agent engine initialised (max agents=8, max workflows=4)
+[MK] Microkernel booted successfully. Ring-0 primitives online.
+[IPC] Message Passing interface configured (Port bounds 0x1001 - 0x1007).
+[MK] registering services
+[MK] Service ONLINE: VirtualMemoryMgr  PID=101
+[MK] Service ONLINE: ObjectSecurityMgr  PID=102
+[MK] Service ONLINE: NativeDbStoreMgr  PID=103
+[MK] Service ONLINE: StorageTierMgr  PID=104
+[MK] Service ONLINE: RecoveryLogVerifier  PID=105
+[MK] Service ONLINE: AgentRuntimeMgr  PID=106
+[MK] Service ONLINE: CheckpointMgr  PID=107
+[MK] Fault Isolation Daemon active. Poll interval: 100ms.
+[TIER] Storage Tier Manager initialized.
+[TIER] Thresholds: promote=8 accesses/tick  demote=30 idle ticks.
+[CKPT] CheckpointMgr initialised.
+[BSP] Waking Core 1...
+[SMP] no AP answered at APIC id 1 within 100 ticks -- running UNIPROCESSOR; the BSP will drive the service loop itself.
+[BSP] Core 1 online.
+[NET] PCI scanning for e1000...
+[NET] e1000 #0 at PCI slot 4 MMIO 0xfeb80000
+[NET] NIC roles taken from the command line.
+[E1000] nic0 MAC 52:54:00:12:34:07  roles: mgmt cluster
+[NET] Packet buffer pool ready (64 x 2 KB).
+[ARP] Announced 10.0.2.15 -> 52:54:00:12:34:07
+[DHCP] Starting DISCOVER...
+[DHCP] Bound: 10.0.2.15  gw 10.0.2.2  subnet 255.255.255.0
+[NET] 1 e1000 interface(s) online, 0 reserved for user drivers.
+[NVME] Controller at PCI slot 3 MMIO 0xfebb0000
+[NVME] Admin queue ready.
+[NVME] Identify Namespace 1: NCAP=2314885530819524197 blocks (~4415293752846 MB assuming 512B LBA)
+[NVME_IO] Creating CQ: prp1=0xe209000 cdw10=0x3f0001
+[NVME_IO] Create CQ done, status=0x0
+[NVME_IO] PRP list page ready (multi-page transfers enabled).
+[NVME_IO] I/O queue pair 1 ready (64 entries, 4-KiB PRP).
+[PERSIST] Catalog restored: 3 entries.
+[PERSIST] Records restored from NVMe.
+[PERSIST] Schemas restored from NVMe.
+[PERSIST] Programs restored: 0 binaries.
+[PERSIST] Partitions restored from NVMe.
+[PERSIST] Partition ownership restored from NVMe.
+[TCP-QUOTA] partition 1: born bounded at 96 (tenant default; 0 = explicitly unlimited)
+[PERSIST] Row-store table headers + per-partition page cursors restored from NVMe.
+[PERSIST] Row constraints restored: 0 defined.
+[PERSIST] Row indexes rebuilt from NVMe-persisted definitions: 0 of 0.
+[PERSIST] Vecstore collection headers + per-partition page cursors restored from NVMe.
+[PERSIST] HNSW vector indexes rebuilt from NVMe-persisted definitions: 0 of 0.
+[PERSIST] Row journal restored: 0 entries (seq), 0 attachment(s).
+[PERSIST] Databases restored: 0 defined, next_id=1.
+[PERSIST] Views restored: 0 defined.
+[PERSIST] Tenants restored: 0 defined, next_id=1.
+[PERSIST] Service registry restored: 0 registration(s).
+[PERSIST] Workloads restored: 0 declaration(s) (reconciler stays OFF).
+[ENV_CKPT] Restored 1 environment checkpoint record(s) (0 partition(s) re-paused).
+[PERSIST] Environment storage directory restored (1 store(s)).
+[STREAM] No directory on NVMe — cold start.
+[STREAM] Stream store ready (frame-pool + NVMe persistence).
+[QEMU-SLS TCACHE] warm start — codebuf_used=0, codebuf=0x0000000007c8b000
+[QEMU-SLS PGO] hot threshold=1000, scan interval=1000 ticks
+[QEMU-SLS VM] no snapshot -- Phase 4 save/restore has no callers (scaffolding, awaiting a launcher resume path)
+[SECURITY] UID 1000 role updated to DB_ADMIN.
+[AUDIT] #1 uid=1000 action=ROLE_CHANGE detail=DB_ADMIN granted=1
+[PERSIST] Catalog snapshot written.
+[SECURITY] UID 1001 role updated to APP_USER.
+[AUDIT] #2 uid=1001 action=ROLE_CHANGE detail=APP_USER granted=1
+[PERSIST] Catalog snapshot written.
+[SECURITY] UID 1002 role updated to DB_ADMIN.
+[AUDIT] #3 uid=1002 action=ROLE_CHANGE detail=DB_ADMIN granted=1
+[PERSIST] Catalog snapshot written.
+[SECURITY] UID 1003 role updated to GUEST.
+[AUDIT] #4 uid=1003 action=ROLE_CHANGE detail=GUEST granted=1
+[PERSIST] Catalog snapshot written.
+[AUTH] Default demo account roles seeded in object-catalog role_table.
+[BOOT] unified boot requested (unified=1) — the Ring-0 control plane and the sidecar world will share this boot.
+[E1] control plane planted as PID 1 'kplane' in PARTITION_SYSTEM (proc slot 15; slot 0 belongs to the boot parent)
+[E1] BIB v3 flags=0x1 (UNIFIED) written into every sidecar's boot info block
+[CONSOLE] sidecar input forwarding disabled (kernel owns the console)
+[SIDECAR] boot image: init @0x20000000 (139280 B) dm @0x21023000 (106512 B) posix @0x2107e000 (1343784 B) ramdisk @0x215c7000 (94224 B) net @0x2261f000 (295056 B) e1000 @0x226e8000 (37272 B) registry @0x22772000 (4096 B)
+[SIDECAR] rootfs: 4096 bytes @ 0x2161f000
+[SIDECAR] device registry: 5 device(s) @0x22772000
+[SIDECAR] boot parent planted: slot0 pid=99 active=1 state=4
+[PAGING] New user PML4 at 0x000000000e20d000
+[SIDECAR] PID 100 'aerosls.init.0': wired chan 'console' to kernel service 'kernel.debug.console' (slots 9/10, kernel end 0/1)
+[SIDECAR] PID 100 'aerosls.init.0': wired chan 'env' to kernel service 'kernel.env.control' (slots 11/12, kernel end 2/3)
+[ENV] control channel wired: kernel ends rd=2 wr=3
+[SIDECAR] PID 100 'aerosls.init.0' released — runs on next schedule (BIB at 0x0000400000043000, entry 0x0000400000000000)
+[E1] init sidecar created (PID 100, messenger CHAN_R 0) and left RUNNABLE — unified boot: control plane and sidecars share this boot
+----------------------------------------------------------------------------------
+[SLS] System ready. Launching secure shell...
+----------------------------------------------------------------------------------
+
+--- Multi-User SLS Secure Shell Active ---
+Type 'help' for available commands.
+
+uid:1000> [HTTP] Listening on port 3000. GET http://10.0.2.15:3000/api/scan
+[TLS] CA loaded from disk, 1824 day(s) left. An existing import is still good.
+[TLS] server ready: TLS 1.3, P-256. leaf 474 bytes, CA 451 bytes.
+[TLS] import the CA (not the leaf) to trust this node.
+[TLS] Listening on port 8443. https://10.0.2.15:8443/
+[NET] hb TX: 1 heartbeat/liveness frame(s) handed to the NIC
+[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 1
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[PAGING] New user PML4 at 0x000000000e263000
+[SIDECAR] PID 101 'drv.device_manager.0': wired chan 'console' to kernel service 'kernel.debug.console' (slots 3/4, kernel end 4/5)
+[SIDECAR] PID 101 'drv.device_manager.0' released — runs on next schedule (BIB at 0x000040000001f000, entry 0x0000400000000000)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 101
+[CAP] woken PID 101 (channel 3)
+[CAP] send handoff: PID 100 -> 101
+[CAP] woken PID 101 (channel 3)
+[CAP] send handoff: PID 100 -> 101
+[INIT] ── AeroSLS init sidecar booting ──[INIT] budget: 16 MiB[INIT] found 5 PCI device(s)[INIT]   [0]  class=06:00 vendor=8086 dev=1237 bar=0x00000000[INIT]   [1]  class=06:01 vendor=8086 dev=7000 bar=0x00000000[INIT]   [2]  class=03:00 vendor=1234 dev=1111 bar=0xfd000000[INIT]   [3] drv.nvme.0 class=01:08 vendor=1b36 dev=0010 bar=0xfebb0000[INIT]   [4]  class=02:00 vendor=8086 dev=100e bar=0xfeb80000[INIT] spawning Device Manager...[INIT]   (create_sidecar: drv.device_manager.0 image @ 0x21023000, 106512 bytes)[INIT]   messenger: CHAN_R=13 CHAN_W=14[INIT] sending device registry to Device Manager...[INIT] waiting for Device Manager to initialise devices...[INIT] all devices ready.[INIT] spawning ramdisk driver...[INIT]   ramdisk budget @ 0x215df000, storage @ 0x2161f000 (16 MiB)[DM] ── AeroSLS Device Manager booting ──[DM] budget: 256 KiB heap[DM] waiting for the device registry from init...[DM]   adopt [0]  class=06:00 vendor=8086 dev=1237 bar=0x00000000[DM]   adopt [1]  class=06:01 vendor=8086 dev=7000 bar=0x00000000[DM]   adopt [2]  class=03:00 vendor=1234 dev=1111 bar=0xfd000000[DM]   adopt [3] drv.nvme.0 class=01:08 vendor=1b36 dev=0010 bar=0xfebb0000[DM]   adopt [4]  class=02:00 vendor=8086 dev=100e bar=0xfeb80000[DM] registry: 5 device(s) adopted[PAGING] New user PML4 at 0x000000000e28c000
+[SIDECAR] PID 102 'drv.ramdisk.0': wired chan 'console' to kernel service 'kernel.debug.console' (slots 4/5, kernel end 6/7)
+[SIDECAR] PID 102 'drv.ramdisk.0' released — runs on next schedule (BIB at 0x000040000001c000, entry 0x0000400000000000)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT]   ramdisk messenger: CHAN_R=8 CHAN_W=3[INIT] UNIFIED boot (BIB flag): the kernel owns the NICs and the console; keeping the software-only spawn chain[INIT] e1000 BAR0 @ 0xfeb80000 → POSIX manifest DEV cap 'nic0.bar0'[INIT] unified boot: the network driver and the system POSIX sidecar stay unspawned (kernel-owned hardware)[INIT] ── Phase 5 init sidecar complete ──[INIT] system ready for POSIX sidecar creation.[INIT] entering the event loop (blocking wait + watchdog respawn)...[INIT] env manager on control channel (CHAN_R=11 CHAN_W=12)[INIT] unified boot: entering the heartbeat loop (DM watchdog + env control, no POSIX subject)[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 1[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 2[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 3[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 4[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 5[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 6[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 7[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 8[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 9[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 10[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 11[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 12[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 13[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 2
+[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 14[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 15[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 16[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 17[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 18[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 19[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 20[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 21[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 22[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 23[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 24[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 25[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[ENV_RESTORE] record (partition 1, index 3): record 3 names a Linux task but its payload was not captured for this sequence -- refused before create -- no create attempted, so no fresh tenant was spawned
+[ENV_RESTORE] last refusal: record 3 names a Linux task but its payload was not captured for this sequence -- refused before create.
+[ENV_RESTORE] 1 pending, 0 replayed, 1 refused, 0 still pending (0 partition(s) resumed for a create, 0 re-paused).
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 26

@@ -72,6 +72,17 @@ FILES=(
     user/init/src/env_manager.rs
     tests/env_payload_host_test.c
     tests/env_ckpt_host_test.c
+    # W5b/W5c read the catalog probe, its registration/live harness, the
+    # checkpoint profile's module, both Cargo feature lines, and the live
+    # harness that asserts the restored forms.
+    user/sidecar/src/m5_catalog_probe.rs
+    user/sidecar/src/m4_ckpt_probe.rs
+    kernel/env_service.c
+    tests/env_service_wait_host_test.c
+    tests/m5_catalog_live_check.sh
+    user/init/Cargo.toml
+    user/sidecar/Cargo.toml
+    tests/m5_tenant_ckpt_probe_check.sh
 )
 
 for f in "${FILES[@]}" "$GUARD"; do
@@ -1095,6 +1106,15 @@ assert old in s, 'munmap reservation arm not found'
 open(p, 'w', encoding='utf-8').write(s.replace(old, new, 1))
 PY
 tooth munmap-skips-reservation X9 "the munmap leaf action reverted to frame-only, skipping bare reservations" "$W/t132"
+
+# t133: the checkpoint task name drifts between the record and the sidecar.
+# The tenant spawn, its registration and the live harness all still look
+# plausible, but init names one task and the sidecar spawns another; M5.3's
+# restore would find no matching task. Guard clause W5c must redden from
+# source alone, before any two-boot run.
+seed "$W/t133"
+sed -i 's/m5\.tenant\.ckpt\.0/m5.tenant.ckpt.drift/' "$W/t133/user/proto/src/env_proto.rs"
+tooth tenant-ckpt-name-drift W5c "the checkpoint record and sidecar no longer share the tenant task name" "$W/t133"
 
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"

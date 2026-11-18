@@ -46,6 +46,10 @@ e7_gate = ["e3_envs"]
 # their exact two-sidecar shape. It does not imply `e3_envs`: the live image
 # selects both explicitly, while host tests can exercise just the profile.
 m5_tenant_probe = []
+# M5.3: the ordinary-tenant checkpoint profile. Environment index 3 keeps the
+# M5.2a tenant manifest bit, but its record names the M4.6 checkpoint fixture
+# instead of the short-lived catalog probe. Build-time only; off by default.
+m5_tenant_ckpt = ["m5_tenant_probe"]
 # M4.6 increment 1: the gate profile's third task is the live checkpoint probe
 # instead of the E7 firstuser. Only meaningful with `e7_gate`; off by default
 # so the normal gate image names exactly the task it has always named.

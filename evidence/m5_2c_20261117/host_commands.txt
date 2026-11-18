@@ -1,0 +1,29 @@
+Host checks (WSL2 Ubuntu, project toolchain):
+
+gcc -Wall -Wextra -std=c11 -I . -I kernel -I arch/x86 \
+    -o /tmp/env_payload_host_test \
+    tests/env_payload_host_test.c kernel/env_payload.c kernel/env_ckpt.c
+/tmp/env_payload_host_test
+  => 106 passed, 0 failed
+
+gcc -Wall -Wextra -std=c11 -I . -I kernel -I arch/x86 \
+    -o /tmp/env_service_wait_host_test \
+    tests/env_service_wait_host_test.c kernel/env_service.c kernel/env_ckpt.c
+/tmp/env_service_wait_host_test
+  => 54 checks passed, 0 failed
+
+Source guard:
+bash tests/env_checkpoint_restore_check.sh
+  => PASS (exit 0)
+
+Gate source clauses:
+  bash tests/e7_gate_check.sh
+  => PASS (exit 0)
+
+Gate live arm (second attempt; first hit the payload-park refusal after the preflight):
+  E7G_DRILL=0 E7G_BUILD=0 E7G_ISO=sls_operating_system_e3_gate_m52c.iso \
+  E7G_ARTIFACTS=/tmp/e7_gate_m52c_live2 bash tests/e7_gate_check.sh --live
+  => PASS, all gate clauses green; refused=0, payloads=1, payload_skips=0
+  => evidence/e7_gate_m52c_20261117/pass/
+  First attempt: refused=0, payloads=0, payload_skips=1 (payload-park refusal)
+  => evidence/e7_gate_m52c_20261117/first_attempt/

@@ -811,13 +811,25 @@ uint32_t env_ckpt_restore_repause(void) {
         // cleanup path must not be the thing that faults, and a partition
         // somebody resumed in the meantime is left running.
         if (!partition_exists(p))       continue;
-        if (!partition_is_paused(p))    { if (partition_pause(p) == 0) applied++; }
+        // Already paused at this point is a restored pause too: the restore
+        // pass may have frozen the partition for the payload pour after it
+        // resumed it for the create. The count is the number of snapshot
+        // pauses standing again, not the number of partition_pause() calls
+        // this function happened to make; B9 reads it that way.
+        if (partition_is_paused(p))     { applied++; continue; }
+        if (partition_pause(p) == 0)    applied++;
     }
     ec_restore_resumed_count = 0;
     return applied;
 }
 
 uint32_t env_ckpt_restore_resumed(void) { return ec_restore_resumed_count; }
+
+int env_ckpt_restore_resumed_partition(uint32_t partition_id) {
+    for (uint32_t i = 0; i < ec_restore_resumed_count && i < ENV_CKPT_MAX; i++)
+        if (ec_restore_resumed[i] == partition_id) return 1;
+    return 0;
+}
 
 int env_ckpt_restore_same_identity(const struct EnvCkptRecord* want,
                                    const struct EnvCkptRecord* got) {
@@ -919,6 +931,11 @@ void env_ckpt_refusal_text(const struct EnvCkptRefusal* r, char* out, uint32_t c
             ec_put(&p, end, "record ");               ec_put_u32(&p, end, r->a);
             ec_put(&p, end, " has a Linux thread-group entry this build cannot "
                             "restore"); break;
+        case ENV_CKPT_REFUSE_PAYLOAD:
+            ec_put(&p, end, "record ");               ec_put_u32(&p, end, r->a);
+            ec_put(&p, end, " names a Linux task but its payload was not "
+                            "captured for this sequence -- refused before create");
+            break;
         default: ec_put(&p, end, "unclassified refusal"); break;
     }
     *p = '\0';

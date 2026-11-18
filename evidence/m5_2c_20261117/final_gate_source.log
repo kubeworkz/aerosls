@@ -1,0 +1,7 @@
+ok:   G1. the drill is a build-time feature (sidecar Cargo + Makefile knob) whose stretch runs in the gate profile between staging (line 645) and the tenant spawn (line 663)
+ok:   G2. the wait is bounded by EP_WAIT_TICKS (stall, restarted by progress) and EP_WAIT_CEIL_TICKS (absolute), and its progress signal is ProcessDescriptor.switches, bumped at proc_build_resume_frame
+ok:   G3. the wait reports crossing the old fixed bound once, only while the window is still open (progress restarted it), and names how many of the record's sidecars are RUNNING at that instant
+ok:   G4. the gate tenant is the designated 9-entry command line over the 512 KiB staged image, and the checkpoint's stop is the copy continuation at 196608
+ok:   G5. the restore pass waits before the repause and pours after it, and the route reports payloads and payload_skips by name
+ok:   G6. the teeth are a build-time profile (E7_TOOTH -> AB_DEFS, default off) selected per restore and refused by name elsewhere; all four arms land on paths the shipped kernel already has (dropped record, EBADF lookup, unmapped destination, a TLS base chosen from the record's own writable pages), guarded by 11 E7G_TOOTH conditions
+e7_gate_check: the gate's source wiring holds (use --live for the run, --teeth for the breaks, --selfkill for the deferred teardown)

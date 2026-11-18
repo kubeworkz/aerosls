@@ -1,0 +1,56 @@
+ok:   an unregistered env service is refused without sending a request
+ok:   reply_slot() marks only the registered reply channel
+ok:   a manager that only progresses on a yield still answers (rc 0, ENV_OK)
+ok:   the wait handed the CPU to Ring-3 instead of polling a no-op tick
+ok:   the reply arrived well inside the quiet window (the timeout path was not taken)
+ok:   the first request a create sends is the E4 create frame for (partition 7, index 3)
+ok:   the wait polls only its own reply channel
+ok:   a slow create answers: the manager was still being scheduled when the old fixed bound expired
+ok:   the reply really arrived past the old 300-tick bound, and before the ceiling -- the regression is exercised, not assumed
+ok:   a dead env manager cannot hang the HTTP server: the quiet window still bounds it
+ok:   the bounded wait ran exactly ENV_RPC_STALL_TICKS ticks of quiet
+ok:   the bounded wait kept handing the CPU to Ring-3 on its way to the bound
+ok:   the bounded wait pumped the sweep keepalive -- the create round trip must not silence the leader (death-during-create, 2026-10-23)
+ok:   a manager that keeps running but never answers is still refused
+ok:   the absolute ceiling, not the quiet window, is what stopped it
+ok:   a stale reply left by a timed-out request is drained, not mistaken for the answer
+ok:   a reply shorter than frame + body is not accepted as an answer
+ok:   the destroy round trip answers like the create one (rc 0, ENV_OK)
+ok:   the destroy wait hands the CPU to Ring-3 too — a destroy is work init does
+ok:   the destroy request is an ENV_DESTROY frame for (env_id, partition 7)
+ok:   the destroy request is exactly frame + body
+ok:   the destroy reply's env_id and partition are parsed for the caller
+ok:   a create still answers as before with registration added
+ok:   a create sends exactly one further request (the registration)
+ok:   and it is an ENV_REGISTER, frame + an 8-byte body
+ok:   the registration asks about the environment the CREATE named — the id from the reply and the partition from the request
+ok:   the environment is now IN the checkpoint table, registered by the create that made it
+ok:   and its record passes the gate every other path goes through
+ok:   with the identity the create and the registration agreed on
+ok:   stamped with the checkpoint epoch the KERNEL read, not one init sent
+ok:   carrying the manager's three regions, four channels and two sidecars
+ok:   each region with the kind it was reported under
+ok:   all four messenger endpoints crossed
+ok:   each task's ENTRY is the kernel's (the sidecar's user_rip), resolved by the name init sent
+ok:   and is demonstrably not a region base the manager supplied
+ok:   the tenant-profile create still answers (three-task registration)
+ok:   (setup) the tenant registration was the one the fake manager answered
+ok:   the create's record names the tenant Linux task as its third slot
+ok:   and the slot is the tenant task the sidecar spawns
+ok:   the already-live Linux child's entry, stack bounds and cap count are stamped into the record
+ok:   and the reconciled record passes the gate
+ok:   (setup) the tenant record at (7,4) is still in the table
+ok:   (setup) the tenant record is quiesced, so the replay will consider it
+ok:   the restore pass itself completes when it refuses a missing payload
+ok:   the Linux record is counted REFUSED, never replayed (pending 1, refused 1, replayed 0)
+ok:   and the refusal happened BEFORE the create/pour, so there is no payload-skip from a fresh environment
+ok:   the refused record is drained from the pending set rather than retried forever
+ok:   NO ENV_CREATE was sent: the missing payload stopped the replay before a fresh tenant could be spawned
+ok:   the last refusal is ENV_CKPT_REFUSE_PAYLOAD, not a post-create identity/create failure
+ok:   the record is marked refused in the table (the operator can see which record was not replayed)
+ok:   and the record is retained, not dropped as if it had replayed
+ok:   (control) the refused record can be re-armed after the media is made whole
+ok:   (control) a matching payload lets the record reach the create round trip
+ok:   (control) and the create is reported replayed, not refused
+
+54 checks passed, 0 failed

@@ -460,6 +460,14 @@ void env_payload_set_tooth(int tooth);
  * for the posture it needs. */
 int env_payload_wait_parked(const struct EnvCkptRecord* rec);
 
+/* The same posture predicate WITHOUT the wait: 1 when every named sidecar of
+ * `rec` is live, parked on a channel recv, and has announced its [env-id] line.
+ * It pumps nothing and yields nothing, so the restore pass can call it after
+ * freezing the partition to prove the posture survived the freeze, inside the
+ * pour's straight-line interval. Unlike the wait it never logs or refuses:
+ * 0 simply means "the posture moved". */
+int env_payload_parked(const struct EnvCkptRecord* rec);
+
 /* Pour the payload for (partition, index) into the environment the replay
  * created (`new_env_id` is where the console binding lives now), checking
  * the whole blob — format, sequence, placement, processes, park form,
@@ -473,6 +481,17 @@ int env_payload_restore(uint32_t partition, uint32_t index,
 
 /* 1 when a valid directory entry exists for this identity. */
 int env_payload_present(uint32_t partition, uint32_t index);
+
+/* 1 when the directory names (partition, index), the payload head is this
+ * build's format, AND its captured sequence is `want_seq`. This is the restore
+ * driver's PREFLIGHT, not a pour: a record that names a Linux task but whose
+ * capture was skipped (or whose payload belongs to an older checkpoint) must
+ * be refused before env_service_create() can spawn a fresh tenant. A bare
+ * directory-presence test is not enough -- a stale slot from a previous
+ * sequence is still "present" and would pass the preflight only to fail after
+ * the create. Reads only the directory and the slot head; no page is poured. */
+int env_payload_has_sequence(uint32_t partition, uint32_t index,
+                             uint64_t want_seq);
 
 /* The last refusal and its rendering (the code is the contract; the text
  * exists so the serial transcript says why the contents did not come

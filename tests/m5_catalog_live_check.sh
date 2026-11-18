@@ -39,6 +39,10 @@
 #                      not reproduce. Pin one vCPU here so the live arm
 #                      measures the catalog boundary, not that fault. Override
 #                      with M52_SMP=2 to reproduce it.
+#   M52_TOOTH          tenant-payload-missing: after the tenant probe exits,
+#                      checkpoint, reboot the same NVMe image, and assert the
+#                      restore REFUSES the record (refused=1, replayed=0) with
+#                      no fresh environment spawned. Requires M52_PROFILE=tenant.
 #   M52_ARTIFACTS      default /tmp/m52-catalog-$$
 set -u
 cd "$(dirname "$0")/.." || exit 2
@@ -50,6 +54,15 @@ case "$PROFILE" in
     tenant) DEFAULT_ISO=sls_operating_system_e3_m52a.iso; ENV_INDEX=3 ;;
     *) echo "ABORT: M52_PROFILE must be 'gate' or 'tenant', got '$PROFILE'" >&2; exit 2 ;;
 esac
+TOOTH="${M52_TOOTH:-}"
+case "$TOOTH" in
+    ""|tenant-payload-missing) ;;
+    *) echo "ABORT: unknown M52_TOOTH='$TOOTH' (expected tenant-payload-missing)" >&2; exit 2 ;;
+esac
+[ -z "$TOOTH" ] || [ "$PROFILE" = tenant ] || {
+    echo "ABORT: M52_TOOTH=$TOOTH needs M52_PROFILE=tenant (the tenant task is the record it refuses)" >&2
+    exit 2
+}
 ISO="${M52_ISO:-$DEFAULT_ISO}"
 BUILD="${M52_BUILD:-1}"
 ENTRY="${M52_BOOT_ENTRY:-3}"
@@ -239,6 +252,110 @@ if [ "$PROFILE" = tenant ]; then
         fail "the tenant Linux task was never stamped into a checkpoint record"
     echo "ok:   the tenant Linux task is registered and its stamp landed (registration only; no tenant checkpoint/restore)"
 fi
+
+# ─── M5.2c: the missing-payload refusal, on the real target ────────────────
+# The tenant probe is one-shot: once it exits, capture has no live task to
+# snapshot and skips the payload. The checkpoint still writes the RECORD. On
+# the next boot the restore must refuse that record BEFORE create, or it would
+# spawn a fresh tenant whose contents were never captured.
+if [ "$TOOTH" = tenant-payload-missing ]; then
+    wait_for "child=m5.tenant.catalog.0 exit_group status=0" 120 \
+        "the tenant probe's exit" || fail "the tenant probe did not exit before the checkpoint"
+    wait_for "group swept=1" 120 "the tenant group's sweep" || \
+        fail "the tenant's exited group was never swept"
+    sleep 2
+    echo "ok:   the tenant probe exited and its group is dead -- payload capture must now skip"
+
+    api POST /api/checkpoint
+    [ "$API_CODE" = 200 ] || fail "POST /api/checkpoint -> HTTP $API_CODE: $API_BODY"
+    [ "$(jval "$API_BODY" status)" = 0 ] || \
+        fail "the checkpoint did not run (status=$(jval "$API_BODY" status)): $API_BODY"
+    grep -aqF "[PERSIST] Environment checkpoint snapshot written" "$LOG" || \
+        fail "the checkpoint ran but wrote no environment snapshot line"
+    grep -aqF "[ENV_PAYLOAD] capture skipped for partition=$PART index=$ENV_INDEX" "$LOG" || \
+        fail "the checkpoint did not report the tenant payload capture as skipped"
+    echo "ok:   the checkpoint wrote the record and skipped the dead tenant's payload"
+
+    cp "$LOG" "$ART/boot1.log"
+    SPLIT=$(wc -c < "$LOG")
+    planted_before=$(grep -acF '[E1] control plane planted' "$LOG")
+
+    # Reboot in place against the SAME NVMe image. -no-reboot would turn the
+    # endpoint's reset into a QEMU exit, so the launcher (above) does not set it.
+    curl -s -X POST "$BASE/api/node/reboot" -H "Authorization: Bearer $TOKEN" \
+         -d '{"confirm":"reboot"}' --max-time 10 >/dev/null 2>&1 &
+    sleep 1
+    bash tests/grub_select_kernel_only.sh "$SER.in" "$LOG" "$QPID" "$ENTRY" || \
+        fail "grub entry $ENTRY did not come back after the reboot"
+
+    ready2=0
+    for _ in $(seq 1 480); do
+        if [ "$(grep -acF '[E1] control plane planted' "$LOG")" -gt "$planted_before" ] && \
+           grep -aqF "[ENV_CKPT] Restored " "$LOG" && \
+           curl -sf --max-time 2 "$BASE/api/health" >/dev/null 2>&1; then
+            ready2=1; break
+        fi
+        kill -0 "$QPID" 2>/dev/null || fail "QEMU exited during the reboot"
+        sleep 0.5
+    done
+    [ "$ready2" = 1 ] || fail "the rebooted node did not reach its control plane within 240s"
+    echo "ok:   the node rebooted in place and adopted the checkpoint's record"
+
+    api POST /api/env/restore '{}'
+    [ "$API_CODE" = 200 ] || fail "POST /api/env/restore -> HTTP $API_CODE: $API_BODY"
+    printf '%s\n' "$API_BODY" > "$ART/restore.json"
+    tail -c +$((SPLIT + 1)) "$LOG" > "$ART/boot2.log"
+    if ! python3 - "$API_BODY" <<'PY'
+import json, sys
+d = json.loads(sys.argv[1])
+assert str(d.get("ok")).lower() == "true", d
+assert d.get("pending") == 1, d
+assert d.get("refused") == 1, d
+assert d.get("replayed") == 0, d
+assert d.get("remaining") == 0, d
+assert d.get("payloads") == 0, d
+assert d.get("payload_skips") == 0, d
+PY
+then
+        fail "restore report is not the missing-payload refusal (want pending=1 refused=1 replayed=0 payloads=0 payload_skips=0): $API_BODY"
+    fi
+    echo "ok:   restore refused the record (refused=1, replayed=0, payload_skips=0)"
+
+    grep -aqF "[ENV_RESTORE] record (partition $PART, index $ENV_INDEX)" "$ART/boot2.log" || \
+        fail "the refusal did not name the record"
+    grep -aqF "payload was not captured for this sequence" "$ART/boot2.log" || \
+        fail "the refusal did not name the missing payload"
+    grep -aqF "no create attempted" "$ART/boot2.log" || \
+        fail "the refusal did not say the create was stopped"
+    if grep -aqF "contents not restored" "$ART/boot2.log"; then
+        fail "the old post-create 'contents not restored' path ran -- the preflight did not stop the replay"
+    fi
+    if grep -aqF "[M5.2] tenant probe: sp" "$ART/boot2.log"; then
+        fail "a fresh tenant probe spawned after the refused restore"
+    fi
+    echo "ok:   the refusal happened BEFORE create; the second boot spawned no fresh tenant"
+
+    api GET "/api/partition/$PART/env"
+    [ "$API_CODE" = 200 ] || fail "GET /api/partition/$PART/env -> HTTP $API_CODE: $API_BODY"
+    printf '%s\n' "$API_BODY" > "$ART/envlist.json"
+    if ! python3 - "$API_BODY" "$ENV_INDEX" <<'PY'
+import json, sys
+d = json.loads(sys.argv[1])
+idx = int(sys.argv[2])
+assert isinstance(d.get("envs"), list), d
+assert all(int(e.get("index", -1)) != idx for e in d["envs"]), d
+PY
+then
+        fail "an environment exists at index $ENV_INDEX after the refused restore: $API_BODY"
+    fi
+    echo "ok:   no environment exists at index $ENV_INDEX after the refused restore"
+
+    printf '%s\n' "$TOOTH" > "$ART/tooth.txt"
+    echo "M5.2c live tooth $TOOTH: PASS (partition=$PART index=$ENV_INDEX, refused before create)"
+    echo "artifacts: $ART"
+    exit 0
+fi
+
 if grep -aqF "M52-CATALOG-FAIL" "$LOG"; then
     fail "the probe reported M52-CATALOG-FAIL"
 fi

@@ -526,7 +526,7 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     // probe build; the default sidecar has no use for the bit. Gate wins if
     // a hand-built manifest ever carries both profile bits: the gate path
     // must not silently lose its stop/checkpoint posture.
-    #[cfg(feature = "m5_catalog_probe")]
+    #[cfg(any(feature = "m5_catalog_probe", feature = "m5_tenant_ckpt"))]
     let tenant_linux = !gate && bib.is_tenant_linux();
     if census_host || gate {
         if !gate {
@@ -709,13 +709,48 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         }
     }
 
+    // M5.3: the ordinary-tenant checkpoint profile. It is the M4.6 fixture
+    // (a two-thread group parked in futex waits) under the tenant checkpoint
+    // identity, not the gate firstuser. Selected only by the build-time
+    // feature; the ordinary tenant's BIB bit is the only runtime input, and
+    // `gate` stays false so no gate stop/poison behavior is armed.
+    #[cfg(feature = "m5_tenant_ckpt")]
+    {
+        if tenant_linux {
+            let probe_name = crate::m4_ckpt_probe::TENANT_PROBE_NAME;
+            match crate::m4_ckpt_probe::spawn_tenant(
+                &RealKernel, caps.budget_base, caps.budget_len) {
+                Ok(sp) => match booted.proc.vfs.add_task() {
+                    Ok(vt) => {
+                        if crate::linux::track_mirrored(
+                            sp.ch_r, sp.ch_w, probe_name,
+                            0, sp.heap_base, sp.heap_limit, vt,
+                            RealKernel.sidecar_pid(probe_name, 0) as u64,
+                        ) {
+                            klog(b"[M5.3] tenant ckpt", sp.ch_r, b"");
+                        } else {
+                            klog(b"[M5.3] tenant ckpt probe: TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+                        }
+                    }
+                    Err(_) => klog(
+                        b"[M5.3] tenant ckpt probe: VFS task alloc FAILED ch_r=",
+                        sp.ch_r, b""),
+                },
+                Err(rc) => klog(
+                    b"[M5.3] tenant ckpt probe: spawn FAILED rc=", rc as u32, b""),
+            }
+        }
+    }
+
     // M5.2/M5.2a: the Linux-personality CAT_EXEC probe. The gate profile
     // spawns it under the gate identity; M5.2a's ordinary tenant profile
     // spawns the SAME probe under its own tenant name. In both cases the
     // child holds no catalog cap: 334 is forwarded to THIS sidecar and
     // answered from `booted.proc.catalog`. The tenant arm is selected by the
-    // separate BIB bit, never by `gate`.
-    #[cfg(feature = "m5_catalog_probe")]
+    // separate BIB bit, never by `gate`. M5.3's checkpoint profile takes
+    // precedence when both build features are present: one tenant task, not
+    // a catalog probe plus a checkpoint fixture.
+    #[cfg(all(feature = "m5_catalog_probe", not(feature = "m5_tenant_ckpt")))]
     {
         if gate || tenant_linux {
             let probe_name = if tenant_linux {

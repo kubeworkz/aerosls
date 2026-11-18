@@ -796,13 +796,92 @@ A pour that fails leaves the replay standing and logs
 `[ENV_PAYLOAD] contents not restored` — the honest state: an environment without
 its contents is not a restored environment, and nothing claims otherwise.
 
+**A skipped capture is refused before create (M5.2c).** A record can outlive
+its payload: `persist_environments()` writes the record before the capture, and
+the capture skips an environment whose named task has no live process. That is
+the M5.2 tenant after its short-lived probe exits. The old restore created the
+environment first and only then logged `contents not restored`, leaving a fresh
+empty tenant under the old identity. `env_payload_has_sequence(partition,
+index, record.sequence)` now checks the slot directory entry and the payload
+head's identity/sequence before the pass resumes the partition or calls
+`env_service_create()`. A Linux-bearing record without that match is refused
+with `ENV_CKPT_REFUSE_PAYLOAD` (`[ENV_RESTORE] ... no create attempted, so no
+fresh tenant was spawned`). The refusal is reported as `refused=1, replayed=0,
+payload_skips=0`; a matching payload still reaches the create. Host evidence is
+in `tests/env_payload_host_test.c` (captured sequence accepted; stale sequence
+and wrong identity refused) and `tests/env_service_wait_host_test.c` (a real
+three-task tenant record refused with zero `ENV_CREATE` sends, plus a matching
+payload positive control). The live tooth is `M52_TOOTH=tenant-payload-missing`
+in `tests/m5_catalog_live_check.sh`; evidence: `evidence/m5_2c_20261117/`.
+**Boundary:** this proves the refusal for the build-time tenant test profile,
+not a successful tenant restore by itself — M5.3 below supplies that proof —
+not a runtime-selectable profile or arbitrary tenant payloads. The preflight
+also covers gate Linux records: the plain gate
+live arm (`E7G_DRILL=0`) passed all gate clauses with `refused=0` and
+`payloads=1, payload_skips=0`; evidence `evidence/e7_gate_m52c_20261117/`.
+One earlier attempt hit the existing payload-park refusal after the preflight,
+and the passing rerun followed it.
+
+**Successful ordinary-tenant checkpoint/restore (M5.3, 2026-11-18).**
+`tests/m5_tenant_ckpt_probe_check.sh` builds
+`sls_operating_system_e3_m53b.iso` with
+`E3_INIT_FEATURES=e3_envs,m5_tenant_probe,m5_tenant_ckpt M5_TENANT_CKPT=1` and
+boots GRUB entry 3. Environment index 3 is created under the ordinary tenant
+bit with no `e7_gate`; init registers `m5.tenant.ckpt.0` from
+`TENANT_CKPT_TASK_NAME` and the tenant sidecar spawns the same committed M4.6
+two-thread fixture through `spawn_tenant()`. Boot 1 checkpointed after both
+futex waits and captured `threads=2 tids=105..106 forms=1/1`; boot 2 answered
+`replayed=1, refused=0, payloads=1, payload_skips=0`, recreated both tasks
+`PARKED` on channels 14/15, resumed the partition, and printed
+`M4.6-FUTEX-PARENT-WAKE`, `M4.6-FUTEX-WOKE`, and `M4.6-RESTORED-OK`, with no
+`[E7-GATE]` marker in either boot. The fixture lets the captured parent
+timeout expire and uses it to issue the wake; the child's restored untimed
+waiter is the proof that a parked Linux waiter survived the reboot. Evidence:
+`evidence/m5_3_20261118/` (serial logs, restore report, harness output, and
+image digest). **Boundary:** this is a build-time test profile; it does not
+claim a runtime-selectable/persistent tenant Linux profile or arbitrary tenant
+payloads.
+
+**The pour's posture hold (2026-11-17).** That earlier attempt was the
+posture race, not the new preflight. The wait had proved both sidecars parked,
+but the pour reads the blob's head and index from NVMe before its one posture
+check, and the ramdisk sidecar's 200 ms discovery deadline fired inside those
+reads; the pour then found `drv.ramdisk.1` RUNNING and withheld correct
+contents. Waiting longer cannot close a window that reopens after the wait's
+last look. The restore pass now freezes each destination partition after the
+wait, re-checks the posture with the non-yielding `env_payload_parked()` under
+that freeze, and retries if the deadline tick won the gap. `cap_park_deadline_tick()`
+defers deadline wakes for a paused partition, so a verified posture cannot move
+across the pour's media reads. A snapshot-paused destination is left paused
+(and `env_ckpt_restore_repause()` still counts it); only this pass's temporary
+hold is resumed after the pour. T7 pins the hold's position — after the wait,
+before the repause and pour — and the weak `env_service_pour_hold_gap()` seam
+sits between the parked wait and `partition_pause()`. The host tests are now
+108 (`env_payload`) and 67 (`env_service`); the latter includes a paused-snapshot
+replay and a deterministic gap-wake regression that rouses the ramdisk posture
+at that seam, then asserts the hold retries and lands the pour (a dropped retry
+fails the clause). Three consecutive plain gate runs (`E7G_DRILL=0`) passed
+B1-B7 with `payloads=1, payload_skips=0`; the first boot 2 shows the hold
+retrying after the tick beat the pause, then landing the pour. Evidence:
+`evidence/e7_gate_m52c_20261117/hold_pass1..3/`. **Live recheck (2026-11-18):**
+the plain gate image rebuilt from this tree (`E7G_DRILL=0`, `E7_SLOW_BOOT=0`,
+empty `E7_TOOTH`) passed the two-boot arm again with `payloads=1,
+payload_skips=0` and B1-B7; boot 2 logged the verified freeze and release. The
+built kernel's `env_service_pour_hold_gap` is a `FUNC WEAK DEFAULT` whose body
+is `endbr64; ret`, so the host seam is inert in the gate image. Image
+`sls_operating_system_e3_gate_hold2.iso`; SHA-256 in
+`evidence/e7_gate_hold_20261118/iso.sha256`; logs and facts in
+`evidence/e7_gate_hold_20261118/`.
+
 **The clauses.** Source clause **T7** (capture inside the frozen window, the
 pre-freeze wait that lands the freeze on a parked posture, pour after the
 repause with no yield, the placement refusal, the knob and its route,
 the report fields, the console halves, `env_payload.c` linked, every host test
 that links `persist.c`/`env_service.c` resolving the payload symbols — linked
 via `tests/payload_host_stubs.h` where the test does not exercise them — and
-`tests/env_payload_host_test.c` driving the entry points); live clauses **L4b**
+`tests/env_payload_host_test.c` driving the entry points, including the M5.2c
+sequence preflight; `tests/env_service_wait_host_test.c` proving a missing
+Linux payload is refused with zero `ENV_CREATE` sends); live clauses **L4b**
 (file written, variable set, both read back through the console *before* the
 checkpoint) and **L11** (the same two read back *after* the replay); artifact
 clauses **B10** (byte-identical) and **B11** (the variable set before is visible
@@ -3282,7 +3361,7 @@ Everything this document asserts about the tree, with its source.
 
 ## Appendix B — Named gaps, each with its destination
 
-**Register checked 2026-11-17.** A row is marked **LANDED** only when the gap is closed in the tree and the cell names where. M2 and M6 remain planned in the Linux-shape decision record; M1 is landed below, M3 is landed through M3.5, and M4 is landed through M4.11 (Go, threaded CPython and Node remain out on their larger runtime surfaces). M5 is split: M5.1's mediated POSIX write, M5.2's gate-profile Linux-task syscall arm, M5.2a's ordinary-tenant test-profile spawn arm and M5.2b's registration of that tenant task are evidenced. M5.2b registers M5.2a's short-lived probe as the checkpoint record's third task and reconciles its entry/stack/cap facts (registration only; no tenant capture/restore); a runtime-selectable, persistent tenant Linux profile and tenant Linux checkpoint/restore remain open. The P3 adoption guard's replica branch is live-exercised, with its evidence recorded in the P3 rows below.
+**Register checked 2026-11-18.** A row is marked **LANDED** only when the gap is closed in the tree and the cell names where. M2 and M6 remain planned in the Linux-shape decision record; M1 is landed below, M3 is landed through M3.5, and M4 is landed through M4.11 (Go, threaded CPython and Node remain out on their larger runtime surfaces). M5 is split: M5.1's mediated POSIX write, M5.2's gate-profile Linux-task syscall arm, M5.2a's ordinary-tenant test-profile spawn arm, M5.2b's registration of that tenant task, M5.2c's pre-create refusal of a skipped payload, and M5.3's successful ordinary-tenant checkpoint/restore are evidenced. M5.3 reuses the committed M4.6 two-thread fixture under `m5.tenant.ckpt.0` in environment index 3, still without `e7_gate`; both parked tasks restore (evidence `evidence/m5_3_20261118/`). A runtime-selectable, persistent tenant Linux profile and arbitrary tenant payloads remain open. The P3 adoption guard's replica branch is live-exercised, with its evidence recorded in the P3 rows below.
 
 | Gap | Consequence if unaddressed | Destination |
 |---|---|---|
@@ -3301,7 +3380,7 @@ Everything this document asserts about the tree, with its source.
 | `failover_recover_from()` adopts ownership only | a dead node's environments vanish with no name in the report | P3 — **LANDED** (report at increment 9; survivor restore at increment 11) |
 | The failover broadcast path is 24 KiB | a 5.5 MiB environment cannot ride it; the gap must be stated, not implied | P3 — **LANDED** ((b) at increments 9 and 11; (a) as the replica path from increment 13 — §11 Q5). **Evidence:** the adoption guard's replica branch is live-exercised — node 1's finalized 1970-page replica was promoted and restored by the adopter |
 | No full thread groups / join wake (M4.1–M4.11 landed; M4.7/M4.9 gates evidenced) | Go, threaded CPython and Node are out | M4 — M4.3 shares the sidecar group, M4.4 has private wait/wake, M4.5 sweeps `exit_group`/identity/join, M4.6 restores the parked group, M4.7 passes the static threaded-Rust raw-clone gate, M4.8 covers `clone3`/robust/requeue and group signals, M4.9 passes the musl `pthread_create`/`std::thread` gate, M4.10 delivers handlers/stops to parked siblings, and M4.11 adds direct running-sibling frames plus transactional process-directed group-stop broadcast; Go remains out on its larger runtime surface |
-| No mediated native↔POSIX interop | environments are a sealed box, not PASE-with-IFS | **PARTIAL** — read-only catalog + `CAT_QUERY` landed (§9.1); M5.1's mediated POSIX write path is landed and evidenced in `evidence/m5_1_20261117/`; M5.2's gate-profile Linux-task syscall arm is evidenced in `evidence/m5_2_20261117/`; M5.2a's ordinary-tenant test-profile spawn arm is evidenced in `evidence/m5_2a_20261117/`; M5.2b's registration of that tenant task and task-facts/stack-bounds reconciliation is evidenced in `evidence/m5_2b_20261117/` (build-time profile; registration only, no tenant capture/restore or arbitrary tenant payload claim). A runtime-selectable/persistent tenant Linux profile and checkpoint/restore, IFS-like sharing, identity/ACL and native SIMI remain. |
+| No mediated native↔POSIX interop | environments are a sealed box, not PASE-with-IFS | **PARTIAL** — read-only catalog + `CAT_QUERY` landed (§9.1); M5.1's mediated POSIX write path is landed and evidenced in `evidence/m5_1_20261117/`; M5.2's gate-profile Linux-task syscall arm is evidenced in `evidence/m5_2_20261117/`; M5.2a's ordinary-tenant test-profile spawn arm is evidenced in `evidence/m5_2a_20261117/`; M5.2b's registration of that tenant task and task-facts/stack-bounds reconciliation is evidenced in `evidence/m5_2b_20261117/` (build-time profile; registration only, no successful tenant capture/restore or arbitrary tenant payload claim); M5.2c's pre-create missing-payload refusal is evidenced in `evidence/m5_2c_20261117/`; M5.3's successful ordinary-tenant checkpoint/restore (build-time test profile) is evidenced in `evidence/m5_3_20261118/`. A runtime-selectable/persistent tenant Linux profile and arbitrary tenant payloads, IFS-like sharing, identity/ACL and native SIMI remain. |
 | Linux networking syscalls are not wired into the Linux ABI shim | Linux binaries still get `ENOSYS` for `socket`/`connect`; P2 serves the sidecar applet path, not the Linux personality | M1 — **LANDED** (2026-11-12): `socket`/`connect`/`accept`/`sendto`/`recvfrom`/`shutdown`/`bind`/`listen` cross the Linux trap to P2's socket service. `tests/linux_net_bridge_host_test.c` covers the kernel plan (27 checks); `tests/m1_net_probe_check.sh` boots `sls_operating_system_m1net.iso`, asserts all eight calls, and observed 2 executions with no `M1-NET FAIL`; evidence `evidence/m1_net_probe_gate.log`. The same gate's negative arm (`M1_GATE_TOOTH=bypass-connect`, image built with `M1_TOOTH=bypass-connect`) observed `[M1-TOOTH] bypass-connect`, zero forwarded connects, and the stage-5 probe exit before the clean image reran green; evidence `evidence/m1_net_probe_tooth_refused.gate.txt`, `evidence/m1_net_probe_tooth_pass.gate.txt` (raw serial logs alongside). **Coverage boundary:** the probe's peer is the guest's own 10.0.2.15 address (kernel loopback), not a host/NIC peer; UDP, IPv6, external connect failures, `CLOEXEC`/nonblocking variants, and `SHUT_RDWR` are not live-tested. |
 | Dynamic linking is refused (static non-PIE `ET_EXEC` only) | most existing Linux binaries cannot start; `ld.so`, `.so` and `dlopen` are absent | M2 — planned |
 | Signals have ordinary and `SA_SIGINFO` handler frames, including the first EPIPE→SIGPIPE producer, but external/other-group and timer/device producers remain unnamed | `signal()` handlers run in-guest: install, `tkill`/unblock delivery, x86-64 frame, `rt_sigreturn` 15 and mask restore (M3.1), then `sigaltstack`/`SA_ONSTACK`, `SA_SIGINFO`/ucontext, `SA_RESETHAND` and return-time pending redelivery (M3.2–M3.4, 2026-11-13; `E7SIG-INFO`/`E7SIG-OK`/`E7SIG-RET` live), and an EPIPE `sendto` raising SIGPIPE with a saved `-EPIPE` (M3.5, 2026-11-14; `E7PIPE-OK` live). Signal state rides the captured sidecar image window and Linux stack. Boundary: signals from outside the thread group answer ESRCH; M4.11 later adds same-group sibling delivery. Timer/device producers are absent, and no signal-specific live checkpoint arm was run | M3 — **LANDED through M3.5** (design §10.15); same-group sibling delivery is **M4.11** |

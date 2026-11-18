@@ -944,6 +944,50 @@ else
     else
         ok "T7. the pass waits (bounded, yielding — legal inside the resume/repause interval) for each sidecar's parked posture before recording it for the pour"
     fi
+    # The parked posture has to survive the pour's own media reads. The wait
+    # proves a posture while the partition can still run; the ramdisk's 200 ms
+    # deadline tick roused it during the pour's NVMe reads (E7 gate live,
+    # 2026-11-17), so the pass freezes the partition after the wait and
+    # rechecks the non-yielding predicate UNDER that freeze. A hold that is
+    # only set after the pour has started is the same race with a different
+    # name.
+    hold_call=$(line_of "$drv" "n_holds = es_hold_for_pour(done, n_done, holds);")
+    hold_body=$(body kernel/env_service.c "static uint32_t es_hold_for_pour(")
+    if [ -z "${hold_call:-}" ]; then
+        bad "T7. the restore pass never holds the destination partition across the pour — the wait's parked posture can be roused by the pour's own media reads (E7 gate live, 2026-11-17: drv.ramdisk.1)"
+    elif [ -n "${wait_line:-}" ] && [ "$hold_call" -le "$wait_line" ]; then
+        bad "T7. the pour hold (line $hold_call) does not follow the parked wait (line $wait_line) — freezing before the wait would keep the sidecars from ever reaching their park"
+    elif [ -n "${pour_line:-}" ] && [ "$hold_call" -ge "$pour_line" ]; then
+        bad "T7. the pour hold (line $hold_call) is at or after the pour (line $pour_line) — the posture would still be roused during the pour's metadata reads"
+    elif [ -z "$hold_body" ] || ! printf '%s' "$hold_body" | grep -qF "partition_pause(p)" || \
+         ! printf '%s' "$hold_body" | grep -qF "env_payload_parked(rec)"; then
+        bad "T7. the pour hold does not freeze the partition and re-check the posture under the freeze — the check has to be the non-yielding predicate, called after partition_pause(p)"
+    else
+        post_park=$(printf '%s\n' "$hold_body" | awk '
+            /partition_pause\(p\)/ { paused = NR }
+            paused && /env_payload_parked\(rec\)/ && NR > paused { print NR; exit }')
+        if [ -z "${post_park:-}" ]; then
+            bad "T7. env_payload_parked() is checked only before the freeze, never after it — a posture that moved in the gap would still reach the pour"
+        else
+            ok "T7. the pour hold follows the wait (line $hold_call) and freezes the partition before re-checking the posture with env_payload_parked() (line $post_park), so the pour's media reads cannot rouse it"
+        fi
+    fi
+    # The retry path needs a deterministic failure, not a live coincidence.
+    # The weak seam sits exactly where the deadline tick won the E7 race: the
+    # wait has answered and the partition is not yet frozen. The host test
+    # defines the strong hook and asserts both the retry and the landed pour.
+    hook_line=$(line_of "$hold_body" "env_service_pour_hold_gap(p);")
+    pause_line=$(line_of "$hold_body" "partition_pause(p)")
+    if [ -z "${hook_line:-}" ] || [ -z "${pause_line:-}" ] || \
+       [ "$hook_line" -ge "$pause_line" ]; then
+        bad "T7. the deterministic gap-wake seam is missing or does not sit between the parked wait and the partition freeze — the hold's retry path would only be observed when a live boot happens to lose the race"
+    elif ! has tests/env_service_wait_host_test.c "env_service_pour_hold_gap" || \
+         ! has tests/env_service_wait_host_test.c "g_gap_wake_seen == 1" || \
+         ! has tests/env_service_wait_host_test.c "drv.ramdisk.1"; then
+        bad "T7. the host test does not define the gap-wake seam for drv.ramdisk.1, so the hold's retry path is not exercised deterministically"
+    else
+        ok "T7. the gap-wake seam follows the parked wait and precedes the freeze (line $hook_line < $pause_line), and the host test forces the wake there and asserts the retry"
+    fi
     if [ -z "${skip_line:-}" ] || ! printf '%s' "$drv" | grep -qF "out->n_payloads++;"; then
         payload_missing="$payload_missing report-counts"
     fi
@@ -1006,8 +1050,8 @@ fi
 # The payload's own host test drives the entry points (T6's rule, T7's API).
 missing_payload_test=""
 for sym in env_payload_capture_all env_payload_restore env_payload_wait_parked \
-           env_payload_present env_payload_last_refusal \
-           env_payload_refusal_text env_payload_clear_refusal; do
+           env_payload_parked env_payload_present env_payload_has_sequence \
+           env_payload_last_refusal env_payload_refusal_text env_payload_clear_refusal; do
     has tests/env_payload_host_test.c "$sym" || missing_payload_test="$missing_payload_test $sym"
 done
 if [ -n "$missing_payload_test" ]; then
@@ -1056,7 +1100,7 @@ if [ "$LIVE" -ne 1 ]; then
         exit 1
     fi
     echo
-    echo "env_checkpoint_restore_check: the P1a restore-through-create path is wired, its four refusals are in place, and its payload pour is pinned."
+    echo "env_checkpoint_restore_check: the P1a restore-through-create path is wired, its refusal set is in place (including the M5.2c missing-payload preflight), and its payload pour is pinned."
     exit 0
 fi
 

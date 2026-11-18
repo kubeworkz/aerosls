@@ -1,0 +1,8 @@
+profile=ordinary tenant, index=3, gate=absent
+checkpoint=status:0 seq:1 count:1
+capture=linux group 'm5.tenant.ckpt.0' threads=2 tids=105..106 forms=1/1
+restore=replayed=1 refused=0 payloads=1 payload_skips=0
+restored=m5.tenant.ckpt.0 PARKED ch14; m5.tenant.ckpt.0.t106 PARKED ch15
+partition=1 resumed
+markers=M4.6-FUTEX-PARENT-WAKE,M4.6-FUTEX-WOKE,M4.6-RESTORED-OK
+gate_markers=none
