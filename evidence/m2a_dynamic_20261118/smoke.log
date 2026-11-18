@@ -146,5 +146,9 @@ TOOTH OK   sigpipe-producer-gone — guard exited 1 naming R13
 TOOTH OK   rollback-clears-reservation — guard exited 1 naming X8
 TOOTH OK   munmap-skips-reservation — guard exited 1 naming X9
 TOOTH OK   tenant-ckpt-name-drift — guard exited 1 naming W5c
+TOOTH OK   writev-table-row-gone — guard exited 1 naming Y1
+TOOTH OK   writev-iovec-cap-widened — guard exited 1 naming Y2
+TOOTH OK   writev-count-rewrite-gone — guard exited 1 naming Y3
+TOOTH OK   writev-sidecar-number-drift — guard exited 1 naming Y4
 
-linux_personality_check_smoke: 123 passed, 0 failed
+linux_personality_check_smoke: 127 passed, 0 failed

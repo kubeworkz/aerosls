@@ -1141,6 +1141,36 @@ seed "$W/t133"
 sed -i 's/m5\.tenant\.ckpt\.0/m5.tenant.ckpt.drift/' "$W/t133/user/proto/src/env_proto.rs"
 tooth tenant-ckpt-name-drift W5c "the checkpoint record and sidecar no longer share the tenant task name" "$W/t133"
 
+# t134: writev's syscall-table row deleted — the original silent-ENOSYS
+# failure in its exact shape. The number never classifies as FD, so the
+# stdio flush is refused before any post and the marker vanishes while the
+# child still exits 0. Guard clause Y1 must redden by name from source alone.
+seed "$W/t134"
+sed -i '/{  20, LSC_FD,     0 },/d' "$W/t134/kernel/linux_abi.c"
+tooth writev-table-row-gone Y1 "writev(20) is no longer a classified FD row" "$W/t134"
+
+# t135: the iovec cap widened past the fixed eight-entry array — a tenant
+# could name more iovecs than the dispatch copies into, and the plan's
+# chunk stop would be the only bound left. Guard clause Y2 must redden.
+seed "$W/t135"
+sed -i 's/#define LINUX_IOV_MAX         8u/#define LINUX_IOV_MAX        64u/' "$W/t135/kernel/linux_abi.h"
+tooth writev-iovec-cap-widened Y2 "LINUX_IOV_MAX no longer matches the eight-entry gather" "$W/t135"
+
+# t136: the gathered-total rewrite removed — the plan still validates and
+# the attach still copies, but args[2] stays the iovcnt. The sidecar would
+# derive its payload length from the wrong word (a -EPROTO at best, misread
+# bytes at worst). Guard clause Y3 must redden by name.
+seed "$W/t136"
+sed -i 's/largs\[2\] = wv.total;//' "$W/t136/kernel/syscall_dispatch.c"
+tooth writev-count-rewrite-gone Y3 "args[2] no longer carries the gathered total" "$W/t136"
+
+# t137: the sidecar's writev constant renumbered — the kernel sends 20 and
+# the sidecar answers a different number, so the flush falls to the
+# catch-all while the gather itself stays green. Guard clause Y4 must redden.
+seed "$W/t137"
+sed -i 's/const LINUX_WRITEV: u64 = 20;/const LINUX_WRITEV: u64 = 21;/' "$W/t137/user/sidecar/src/linux.rs"
+tooth writev-sidecar-number-drift Y4 "the sidecar no longer answers syscall 20 as writev" "$W/t137"
+
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
