@@ -1808,6 +1808,26 @@ else
     bad "Y7. the M2b library namespace is gone or drifted: libm2a.so's SHA-256 is not 398e7962…, the sidecar no longer embeds it at /lib/libm2a.so, or boot does not mount /lib and seed it through add_ram_file — the loader would return to ENOENT (or load unpinned bytes) while the guard reads green"
 fi
 
+# Y8: fstat(5) is one seam across three places: the kernel's number and
+# table row, the sidecar's fd arm (file and console), and the kernel's stat
+# reply staging. If any half drifts the loader's size/mode ask returns to
+# ENOSYS or the reply has no destination — both read as a loader failure
+# while every other clause stays green.
+if grep -qF '#define LINUX_FSTAT       5u' "$LABH" && \
+   grep -qF '{   5, LSC_FD,     0 },' "$LABC" && \
+   grep -qF '} else if (num == LINUX_STAT || num == LINUX_LSTAT || num == LINUX_FSTAT) {' "$LABC" && \
+   grep -qF 'if (num == LINUX_STAT || num == LINUX_LSTAT || num == LINUX_FSTAT)' "$LABC" && \
+   grep -qF 'const LINUX_FSTAT: u64 = 5;' "$LRS" && \
+   grep -qF 'LINUX_FSTAT => match slot_of(fds, args[0]) {' "$LRS" && \
+   grep -qF 'match vfs.fstat(vt, s.vfs_fd) {' "$LRS" && \
+   grep -qF 'Ok(s) if s.kind == FD_KIND_CONSOLE => stat_answer(&console.stat()),' "$LRS" && \
+   grep -qF 'LINUX_STAT | LINUX_LSTAT | LINUX_FSTAT =>' "$LRS" && \
+   grep -qF '| LINUX_STAT | LINUX_FSTAT' "$LRS"; then
+    ok "Y8. fstat(5) is wired end to end: the kernel names 5 and classifies it LSC_FD, stages args[1] through the stat serializer and accepts the stat reply shape; the sidecar routes 5, answers files via Vfs::fstat and consoles via CharNode::stat, and bounds the 24-byte Stat payload"
+else
+    bad "Y8. the fstat(5) seam is gone or drifted: the number/table row, the sidecar's fd arm, its stat payload bound/routing, or the kernel's stat reply staging changed — the loader's size/mode ask would return ENOSYS or a stat reply would have no destination, while the guard reads green"
+fi
+
 echo
 if [ "$fails" -eq 0 ]; then
     echo "linux_personality_check: all clauses hold"

@@ -1210,6 +1210,25 @@ seed "$W/t141"
 sed -i '/mount_ramfs("\/lib")/d' "$W/t141/user/sidecar/src/boot.rs"
 tooth m2b-library-namespace-unseeded Y7 "boot no longer mounts the /lib ramfs that serves libm2a.so" "$W/t141"
 
+# t142: fstat's table row deleted — 5 falls to LSC_UNKNOWN and the loader's
+# stat ask never reaches the sidecar's arm. Guard clause Y8 must redden.
+seed "$W/t142"
+sed -i '/{   5, LSC_FD,     0 },/d' "$W/t142/kernel/linux_abi.c"
+tooth fstat-table-row-gone Y8 "fstat(5) is no longer a classified FD row" "$W/t142"
+
+# t143: the sidecar's fstat constant renumbered — 5 falls to the catch-all
+# while the kernel still stages a stat reply. Guard clause Y8 must redden.
+seed "$W/t143"
+sed -i 's/const LINUX_FSTAT: u64 = 5;/const LINUX_FSTAT: u64 = 6;/' "$W/t143/user/sidecar/src/linux.rs"
+tooth fstat-sidecar-number-drift Y8 "the sidecar no longer answers syscall 5 as fstat" "$W/t143"
+
+# t144: the kernel's stat reply staging stops accepting fstat — the sidecar
+# still answers the compact Stat, but the deliver plans no destination for
+# it. Guard clause Y8 must redden.
+seed "$W/t144"
+sed -i 's/} else if (num == LINUX_STAT || num == LINUX_LSTAT || num == LINUX_FSTAT) {/} else if (num == LINUX_STAT || num == LINUX_LSTAT) {/' "$W/t144/kernel/linux_abi.c"
+tooth fstat-reply-stage-gone Y8 "the kernel no longer stages fstat's stat buffer" "$W/t144"
+
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

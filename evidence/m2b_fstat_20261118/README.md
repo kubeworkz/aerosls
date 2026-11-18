@@ -20,7 +20,8 @@ mode.
   answers an fd-class file through `Vfs::fstat` and a console through
   `CharNode::stat`, both as the same compact 24-byte Stat
   (`stat_answer`). `payload_bound` accepts exactly that payload at
-  `args[1]`, and `service` routes 5 into the file class.
+  `args[1]`, and `service` routes 5 into the file class. Guard Y8 pins this
+  whole seam; smoke t142–t144 mutate its three layers.
 - `kernel/linux_abi.h` / `linux_abi.c`: `LINUX_FSTAT` and its `LSC_FD`
   table row; `linux_fd_reply_plan` stages `args[1]` with the existing
   `LINUX_STAGE_STAT` serializer (24 compact bytes → musl's 144-byte
@@ -61,8 +62,9 @@ untouched. `M2B-OK` still does not print.
 
 ## Checks
 
-- Guard: `all clauses hold` (133 ok).
-- Smoke: `131 passed, 0 failed`.
+- Guard: `all clauses hold` (134 ok, with Y8).
+- Smoke: `134 passed, 0 failed` — t142 (table row), t143 (sidecar number)
+  and t144 (reply staging) each redden Y8 by name.
 - `cargo check` passes with `target,m2a_interp`.
 - M2a fixture restored after the probe:
   `be63cd4d1e5e4d4b9b4028cb4ec830a660fa19a6df1cb6fa27e6aaddd5deafcc`.
