@@ -101,7 +101,7 @@ Guard and smoke:
 
 ```text
 linux_personality_check: all clauses hold
-linux_personality_check_smoke: 127 passed, 0 failed
+linux_personality_check_smoke: 128 passed, 0 failed
 ```
 
 The writev guard clauses Y1–Y4 are themselves held by four smoke mutations,
@@ -115,12 +115,14 @@ so each seam is proven to redden by name when its pinned line drifts:
   the guard must name **Y3**.
 - t137 `writev-sidecar-number-drift` — renumbers the sidecar's
   `const LINUX_WRITEV: u64 = 20;` to `21`; the guard must name **Y4**.
+- t138 `m2a-fixture-elf-drift` — replaces the committed `m2a_hello.elf`
+  with different bytes; the guard must name **Y5** from the SHA-256 alone.
 
 ## Artifacts
 
 - `boot.log` — the full serial log of the passing stdio boot.
 - `markers.txt` — the numbered key lines quoted above.
 - `guard.log` — `tests/linux_personality_check.sh` output (O9 included).
-- `smoke.log` — the smoke run, including the `m2a-oneshot-gone` tooth and the
-  four writev teeth t134–t137.
+- `smoke.log` — the smoke run, including the `m2a-oneshot-gone` tooth, the
+  four writev teeth t134–t137, and the fixture-hash tooth t138.
 - `facts` — compact result fields.

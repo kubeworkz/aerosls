@@ -1173,6 +1173,14 @@ seed "$W/t137"
 sed -i 's/const LINUX_WRITEV: u64 = 20;/const LINUX_WRITEV: u64 = 21;/' "$W/t137/user/sidecar/src/linux.rs"
 tooth writev-sidecar-number-drift Y4 "the sidecar no longer answers syscall 20 as writev" "$W/t137"
 
+# t138: the committed ELF replaced with different bytes — the script still
+# carries the loader-as-libc recipe, but the checked-in binary is no longer
+# the one that recipe produces. Every other clause reads source and stays
+# green; Y5 must redden by name from the SHA-256 alone, before any rebuild.
+seed "$W/t138"
+printf 'M2A-DRIFT\n' > "$W/t138/user/sidecar/fixtures/m2a_hello.elf"
+tooth m2a-fixture-elf-drift Y5 "the committed m2a_hello.elf is not the image its build script produces" "$W/t138"
+
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
