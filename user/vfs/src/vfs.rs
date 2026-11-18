@@ -1970,6 +1970,30 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
         Ok(())
     }
 
+    /// Seed a file into an already-mounted writable fs (M2b's library
+    /// namespace): resolve `path`, create its leaf in the parent, and write
+    /// the bytes. Bootstrap-owned namespace plumbing — no task, rights or fd
+    /// table is involved; a syscall still goes through `open`/`write`. A
+    /// read-only mount answers `EROFS` from its own `create_file`.
+    pub fn add_ram_file(&mut self, path: &str, data: &[u8], mode: u16) -> Result<(), Errno> {
+        let full = crate::aerofs::normalize_path(path);
+        let (fs_idx, rel) = self.resolve(&full)?;
+        if rel.is_empty() {
+            return Err(Errno::EIsdir);
+        }
+        let fs = self.fs_mut(fs_idx)?;
+        let parent = fs.lookup(&rel[..rel.len() - 1])?;
+        if parent.1 != FileType::Dir {
+            return Err(Errno::ENotdir);
+        }
+        let ino = fs.create_file(parent.0, rel.last().unwrap(), mode)?;
+        let n = fs.write(ino, 0, data)?;
+        if n != data.len() {
+            return Err(Errno::ENospc);
+        }
+        Ok(())
+    }
+
     /// Mount an in-memory devfs at `path` (e.g. `/dev`) naming the given
     /// console and the always-present `/dev/null`. The console is owned by
     /// the caller (the bootstrap wires the kernel-console channel into it);

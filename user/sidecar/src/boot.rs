@@ -278,6 +278,19 @@ pub fn boot<K: Kernel, A: BufferAlloc>(
     vfs.mount_devfs("/dev", console.clone())
         .map_err(BootErr::Mount)?;
     vfs.mount_ramfs("/tmp").map_err(BootErr::Mount)?;
+    // M2b: the dynamic loader's library namespace. The root aerofs image is
+    // fixed and read-only, so a ramfs at /lib is the writable namespace the
+    // loader's DT_NEEDED search reads; seed it with the probe's libm2a.so.
+    #[cfg(feature = "m2a_interp")]
+    {
+        vfs.mount_ramfs("/lib").map_err(BootErr::Mount)?;
+        vfs.add_ram_file(
+            crate::m2a_interp::M2A_LIB_PATH,
+            crate::m2a_interp::M2A_LIB,
+            0o644,
+        )
+        .map_err(BootErr::Mount)?;
+    }
 
     // 4. System applets, with console stdio on fds 0,1,2.
     let mut proc = ProcManager::new(vfs);

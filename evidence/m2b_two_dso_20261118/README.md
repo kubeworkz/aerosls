@@ -1,5 +1,9 @@
 # M2b two-DSO probe (2026-11-18)
 
+> Follow-up: the missing `/lib` namespace from this run is served in
+> `../m2b_libns_20261118/`, where the open succeeds and `fstat(5)` is the
+> next break.
+
 This slice asks the existing M2a loader path to load a **second** shared
 object. `m2b_hello.elf` has `DT_NEEDED libm2a.so` and `libc.so`, calls
 `m2a_add` across the library boundary, and reads `m2a_data` through the

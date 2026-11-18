@@ -1,0 +1,15 @@
+result=probe-fail
+libns_path=/lib/libm2a.so
+libns_source=user/sidecar/fixtures/libm2a.so
+libns_sha256=398e79629f49179d8225f18a5b8216ef444cc57408dd6e770d7dc53366eecf6d
+build=ramfs /lib + Vfs::add_ram_file
+open_lib=ok
+post_open=fcntl(72) ok; fstat(5) ENOSYS; close(3) ok
+next_break=fstat(5) ENOSYS
+loader_error=Error loading shared library libm2a.so: Function not implemented
+reloc_errors=2 (m2a_add, m2a_data)
+exit_group_status=127
+m2b_ok=0
+guard=132
+smoke=129
+restored_fixture_sha256=be63cd4d1e5e4d4b9b4028cb4ec830a660fa19a6df1cb6fa27e6aaddd5deafcc

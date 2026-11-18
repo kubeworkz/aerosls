@@ -4,7 +4,10 @@
 //!   - `m2a_hello.elf` — an ET_EXEC, dynamically linked musl hello that
 //!     proves itself with `write(1, "M2A-OK\n", 7)` and then calls
 //!     `_exit(0)` — no `puts`, no stdio flush, no `writev`;
-//!   - `ld-musl-x86_64.so.1` — the matching musl dynamic loader (ET_DYN).
+//!   - `ld-musl-x86_64.so.1` — the matching musl dynamic loader (ET_DYN);
+//!   - `libm2a.so` — M2b's second DSO. Boot seeds it into a ramfs mounted at
+//!     `/lib`, so the loader's `DT_NEEDED` search finds it there instead of
+//!     stopping at ENOENT.
 //!
 //! Both are copied into the POSIX sidecar's budget tail, page-aligned. The
 //! manifest is version 2: its footer names the main image, its `INTERP`
@@ -43,9 +46,13 @@ pub fn boot_generation() -> u32 {
 
 static HELLO: &[u8] = include_bytes!("../fixtures/m2a_hello.elf");
 static INTERP: &[u8] = include_bytes!("../fixtures/ld-musl-x86_64.so.1");
+/// M2b: the DSO the loader's `/lib` search must find. Boot seeds these bytes
+/// into a ramfs at `/lib`; the bytes are the probe's own `libm2a.so`.
+pub static M2A_LIB: &[u8] = include_bytes!("../fixtures/libm2a.so");
 
 pub const M2A_NAME: &str = "m2a.linux.hello.0";
 pub const M2A_INTERP_PATH: &str = "/lib/ld-musl-x86_64.so.1";
+pub const M2A_LIB_PATH: &str = "/lib/libm2a.so";
 const M2A_RESERVE: u64 = 1024 * 1024;
 const MEM_BUDGET_BYTES: u64 = 256 * 1024;
 const STACK_BUDGET_BYTES: u64 = 64 * 1024;

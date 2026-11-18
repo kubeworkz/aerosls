@@ -1,0 +1,13 @@
+251:[CS] dynamic image: main entry=0x4010a6 interp base=0x7f0000000000 entry=0x7f000007bf0e path='/lib/ld-musl-x86_64.so.1'
+256:[M2A] hello: spawned ch_00000013 
+418:[E7] linux: num=00000002 child=m2a.linux.hello.0 -> ENOENT open /etc/ld-musl-x86_64.path
+440:[E7] linux: num=00000002 child=m2a.linux.hello.0 ok
+461:[E7] linux: num=00000048 child=m2a.linux.hello.0 ok
+482:[E7] linux: num=00000005 child=m2a.linux.hello.0 -> ENOSYS
+498:[E7] linux: num=00000003 child=m2a.linux.hello.0 ok
+526:Error loading shared library libm2a.so: Function not implemented (needed by m2a.linux.hello.0[CAP] woken PID 107 (channel 20)
+607:[E7] linux: num=00000014 child=m2a.linux.hello.0 write ok len=61 |Error relocating m2a.lin|
+613:Error relocating m2a.linux.hello.0: m2a_add: symbol not found[CAP] woken PID 107 (channel 20)
+651:[E7] linux: num=00000014 child=m2a.linux.hello.0 write ok len=62 |Error relocating m2a.lin|
+655:Error relocating m2a.linux.hello.0: m2a_data: symbol not found[E7] linux: num=00000001 child=e7.linux.probe.0 write ok len=18 |E7MEM-MPROTECT-OK.|
+707:[E7] linux: num=000000E7 child=m2a.linux.hello.0 exit_group status=127
