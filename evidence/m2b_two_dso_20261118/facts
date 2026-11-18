@@ -1,0 +1,12 @@
+result=probe-fail
+main_needed=libm2a.so,libc.so
+data_relocs=main:COPY m2a_data; libm2a:GLOB_DAT m2a_data
+cross_call=JUMP_SLOT m2a_add
+open_attempts=4
+loader_error=Error loading shared library libm2a.so: No such file or directory
+reloc_errors=2 (m2a_add, m2a_data)
+exit_group_status=127
+m2b_ok=0
+libm2a_sha256=398e79629f49179d8225f18a5b8216ef444cc57408dd6e770d7dc53366eecf6d
+hello_sha256=6518da9f57ed24b415aba62e9b65bb95d3e6256ce5bd42df4daefdb87792885f
+restored_fixture_sha256=be63cd4d1e5e4d4b9b4028cb4ec830a660fa19a6df1cb6fa27e6aaddd5deafcc
