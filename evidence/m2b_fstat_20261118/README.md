@@ -62,6 +62,9 @@ untouched. `M2B-OK` still does not print.
 
 ## Checks
 
+- Host test: `301 passed, 0 failed` — an fstat request stages the compact
+  24-byte Stat with a 144-byte `struct stat` destination, rejects a
+  non-canonical statbuf, and accepts only the exact reply shape.
 - Guard: `all clauses hold` (134 ok, with Y8).
 - Smoke: `134 passed, 0 failed` — t142 (table row), t143 (sidecar number)
   and t144 (reply staging) each redden Y8 by name.

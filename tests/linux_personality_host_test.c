@@ -1705,11 +1705,27 @@ int main(void)
         r = linux_fd_reply_plan(LINUX_LSTAT, a);
         CHECK(r.kind == LINUX_STAGE_STAT && r.len == LINUX_STAT_PAYLOAD_BYTES,
               "lstat plans the same stage — this VFS has no symlink follow");
+        /* fstat(5): fd in args[0], statbuf in args[1]. The fd names the
+         * object and needs no path attach; the reply is the SAME stat
+         * stage, so the loader's size/mode ask serializes the compact 24
+         * bytes into the 144-byte musl struct at the child's buffer. */
+        a[0] = 3;
+        r = linux_fd_reply_plan(LINUX_FSTAT, a);
+        CHECK(r.dst == 0x6000 && r.len == LINUX_STAT_PAYLOAD_BYTES &&
+              r.aux == LINUX_STAT_BYTES && r.kind == LINUX_STAGE_STAT &&
+              r.refuse == 0,
+              "fstat stages the compact 24-byte Stat at args[1] and the\n"
+              "      144-byte struct stat child-side write — the fd is not\n"
+              "      a path and carries no attach");
         /* a destination ring 3 could not write: -EFAULT first-trap */
         a[1] = 0x0000800000000000ULL; /* non-canonical: bit 47 set */
         r = linux_fd_reply_plan(LINUX_STAT, a);
         CHECK(r.refuse == -LINUX_EFAULT,
               "a statbuf past the user range is -EFAULT at the first trap");
+        r = linux_fd_reply_plan(LINUX_FSTAT, a);
+        CHECK(r.refuse == -LINUX_EFAULT,
+              "an fstat statbuf past the user range refuses the same way,\n"
+              "      before the fd is looked at");
 
         /* getdents64: the child's count is the pack budget (capped),
          * a count too small for even the \".\" record is EINVAL. */
@@ -1903,20 +1919,26 @@ int main(void)
         }
     }
     {
-        /* shape-ok's file-class arms: stat owes EXACTLY the compact 24,
-         * getdents owes a success whose byte count is the KERNEL's (so
-         * ret is 0 on the wire — the deliver overwrites rax with what
-         * it packed), and read stays count-truth. */
+        /* shape-ok's file-class arms: stat/lstat/fstat owe EXACTLY the
+         * compact 24, getdents owes a success whose byte count is the
+         * KERNEL's (so ret is 0 on the wire — the deliver overwrites rax
+         * with what it packed), and read stays count-truth. */
         CHECK(linux_reply_shape_ok(LINUX_STAT, 0,
                                    LINUX_STAT_PAYLOAD_BYTES) == 1 &&
               linux_reply_shape_ok(LINUX_LSTAT, 0,
+                                   LINUX_STAT_PAYLOAD_BYTES) == 1 &&
+              linux_reply_shape_ok(LINUX_FSTAT, 0,
                                    LINUX_STAT_PAYLOAD_BYTES) == 1,
-              "stat's success shape is the compact payload at exactly 24");
+              "stat/lstat/fstat success shape is the compact payload at exactly 24");
         CHECK(linux_reply_shape_ok(LINUX_STAT, 0,
                                    LINUX_STAT_PAYLOAD_BYTES - 1) == 0 &&
               linux_reply_shape_ok(LINUX_STAT, 32,
+                                   LINUX_STAT_PAYLOAD_BYTES) == 0 &&
+              linux_reply_shape_ok(LINUX_FSTAT, 0,
+                                   LINUX_STAT_PAYLOAD_BYTES - 1) == 0 &&
+              linux_reply_shape_ok(LINUX_FSTAT, 32,
                                    LINUX_STAT_PAYLOAD_BYTES) == 0,
-              "a wrong-size stat payload or a nonzero stat ret is -EPROTO");
+              "a wrong-size stat/fstat payload or a nonzero ret is -EPROTO");
         CHECK(linux_reply_shape_ok(LINUX_GETDENTS64, 0, 1024) == 1 &&
               linux_reply_shape_ok(LINUX_GETDENTS64, 0, 1025) == 0 &&
               linux_reply_shape_ok(LINUX_GETDENTS64, 7, 100) == 0,
@@ -2067,6 +2089,7 @@ int main(void)
         CHECK(linux_reply_zero_ok(LINUX_READ) == 1 &&
               linux_reply_zero_ok(LINUX_GETDENTS64) == 1 &&
               linux_reply_zero_ok(LINUX_STAT) == 0 &&
+              linux_reply_zero_ok(LINUX_FSTAT) == 0 &&
               linux_reply_zero_ok(LINUX_CLOCK_GETTIME) == 0 &&
               linux_reply_zero_ok(LINUX_RT_SIGACTION) == 0,
               "EOF and end-of-directory are 0-byte successes; a staged\n"
