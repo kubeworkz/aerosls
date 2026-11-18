@@ -1257,8 +1257,8 @@ fn answer(
          * the word rules are this side's twin of the kernel's first trap.
          * Simultaneous write+execute is EPERM; executable-only remains
          * ENOSYS by name (the same v1 boundary as mmap); unknown prot
-         * bits, a zero/overflowing length, an unaligned address or a
-         * range outside the stamped span are EINVAL. A valid request
+         * bits, a zero/overflowing length or an unaligned address are
+         * EINVAL. A valid request
          * answers success and lets the kernel change the PRESENT leaf:
          * PROT_NONE parks the frame (present cleared), READ/WRITE restore
          * or replace the PTE flags on that same frame.
@@ -1266,7 +1266,7 @@ fn answer(
          * grant for a page the page tables do not carry. */
         10 => {
             let (addr, len, prot) = (args[0], args[1], args[2]);
-            let len_r = match len.checked_add(0xFFF) {
+            let _len_r = match len.checked_add(0xFFF) {
                 Some(v) if len != 0 => v & !0xFFFu64,
                 _ => return Answer::Reply(0, E_INVAL),
             };
@@ -1277,9 +1277,6 @@ fn answer(
             } else if prot & 0x4 != 0 {
                 Answer::Reply(0, E_NOSYS)
             } else if addr & 0xFFF != 0 {
-                Answer::Reply(0, E_INVAL)
-            } else if addr < brk.base || addr > brk.limit
-                   || len_r > brk.limit - addr {
                 Answer::Reply(0, E_INVAL)
             } else {
                 Answer::Reply(0, STATUS_OK)

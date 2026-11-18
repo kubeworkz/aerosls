@@ -40,6 +40,20 @@
 #include "../arch/x86/user_paging.h"  // E7 §5.3 (the plan's inc 4) -- user_write_fs_base,
                                       // the MSR write of a granted ARCH_SET_FS
 
+/* mprotect is allowed over the task's own loaded images (the dynamic
+ * loader's RELRO is outside the brk span) as well as its stamped heap
+ * span. The leaf transition still refuses every page that is not a
+ * present user page, so the wider arithmetic is a gate, not a grant. */
+static void linux_mprotect_span(const struct ProcessDescriptor* cur,
+                                uint64_t* base, uint64_t* limit) {
+    *base = cur->linux_heap_base;
+    *limit = cur->linux_heap_limit;
+    if (cur->linux_image_lo != 0 && cur->linux_image_lo < *base)
+        *base = cur->linux_image_lo;
+    if (cur->linux_image_hi > *limit)
+        *limit = cur->linux_image_hi;
+}
+
 // ─── spawn owner-uid resolution ──────────────────────────────────────────────
 // The owner_uid threaded into program_spawn*()/program_load()/sys_sls_load()
 // decides the child's catalog-authority check AND which partition it lands
@@ -612,12 +626,14 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                  * Both cursors stay put. */
                                 struct LinuxMprotectReq mreq;
                                 struct LinuxMemMprotectVerdict v;
+                                uint64_t mspan_base, mspan_limit;
                                 mreq.addr = sa0;
                                 mreq.len  = sa1;
                                 mreq.prot = sa2;
+                                linux_mprotect_span(cur, &mspan_base,
+                                                    &mspan_limit);
                                 v = linux_mem_mprotect_verdict(
-                                    cur->linux_heap_base,
-                                    cur->linux_heap_limit, &mreq, rax);
+                                    mspan_base, mspan_limit, &mreq, rax);
                                 if (v.malformed) {
                                     kernel_serial_printf(
                                         "[E7] mprotect reply 0x%lx for "
@@ -629,8 +645,8 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                         (unsigned long)sa0,
                                         (unsigned long)sa1,
                                         (unsigned long)sa2,
-                                        (unsigned long)cur->linux_heap_base,
-                                        (unsigned long)cur->linux_heap_limit);
+                                        (unsigned long)mspan_base,
+                                        (unsigned long)mspan_limit);
                                     rax = (uint64_t)(int64_t)
                                           (-LINUX_EINVAL);
                                 } else if (v.range_pages) {
@@ -1200,6 +1216,7 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                      * span and visible page table; the sidecar's 10 arm
                      * repeats the word rules as its own twin. */
                     struct LinuxMprotectReq mreq;
+                    uint64_t mspan_base, mspan_limit;
                     int mref;
                     if (linux_mprotect_refuses_wx(largs[2])) {
                         kernel_serial_printf(
@@ -1211,8 +1228,9 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                     mreq.addr = largs[0];
                     mreq.len  = largs[1];
                     mreq.prot = largs[2];
+                    linux_mprotect_span(cur, &mspan_base, &mspan_limit);
                     mref = linux_mem_mprotect_refusal(&mreq,
-                            cur->linux_heap_base, cur->linux_heap_limit);
+                            mspan_base, mspan_limit);
                     if (mref) {
                         kernel_serial_printf(
                             "[E7] linux mprotect addr=0x%lx len=%lu "

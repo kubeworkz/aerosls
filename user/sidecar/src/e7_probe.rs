@@ -28,8 +28,8 @@
 //! one capability pair (its messenger channel back to this sidecar).
 
 use aerosls_proto::manifest::{
-    build_manifest, crc32, ArgEnv, Bootstrap, Budget, Cpu, Image, Limits,
-    Manifest, ManifestCap, HEADER_LEN, MAX_MANIFEST_CAPS,
+    pack_manifest, ArgEnv, Bootstrap, Budget, Cpu, Image, Limits,
+    Manifest, ManifestCap, MAX_MANIFEST_CAPS,
 };
 use crate::linux::LINUX_DEFAULT_ENV;
 
@@ -179,6 +179,7 @@ pub fn spawn<K: aerosls_proto::kabi::Kernel>(
         // (linux.rs) instead of the empty environment the create could
         // only hand before the record landed.
         argenv: Some(ArgEnv::new(&[PROBE_NAME], LINUX_DEFAULT_ENV)),
+        interp: None,
         signature: None,
     };
 
@@ -186,12 +187,7 @@ pub fn spawn<K: aerosls_proto::kabi::Kernel>(
     // patched to cover records + footer — byte-for-byte the pattern the
     // init-side manifest builders use (user/init/src/dm_manifest.rs is the
     // format reference), because the kernel's parser is one parser.
-    let mut blob = build_manifest(&m);
-    blob.extend_from_slice(&tail.to_le_bytes());
-    let total = blob.len() as u32;
-    blob[16..20].copy_from_slice(&total.to_le_bytes());
-    let crc = crc32(&blob[HEADER_LEN..]);
-    blob[20..24].copy_from_slice(&crc.to_le_bytes());
+    let blob = pack_manifest(&m, tail);
 
     // target_partition 0 = inherit (this sidecar's — the boot tree's).
     let (ch_r, ch_w) = k.linux_spawn(&blob, 0)?;

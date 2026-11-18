@@ -59,6 +59,7 @@
 #define ELF_MAGIC3  'F'
 #define ELF_CLASS64 2
 #define PT_LOAD     1
+#define PT_INTERP   3
 #define PF_X        1       // segment execute permission
 #define PF_W        2       // segment write permission
 #define PF_R        4       // segment read permission
@@ -67,6 +68,8 @@
  * ET_DYN is PIE/DSO and needs a load bias this mapper does not do (§5.1). */
 #define ELF_ET_EXEC 2
 #define ELF_ET_DYN  3
+
+#define ELF_INTERP_PATH_MAX 256
 
 struct ELF64Header {
     uint8_t  e_ident[16];
@@ -115,6 +118,13 @@ struct Elf64MapInfo {
     uint64_t load_hi;
 };
 
+/* The main image's PT_INTERP path, for comparison with the manifest's
+ * INTERP.path. Validation only: the kernel never opens or resolves it. */
+struct Elf64InterpInfo {
+    uint16_t path_len;
+    char     path[ELF_INTERP_PATH_MAX];
+};
+
 /* The path-dispatch predicate: 1 iff the blob BEGINS with the four ELF
  * magic bytes. Checked BEFORE any validation, and only by the magic — a
  * real ELF that then fails the gates below (32-bit class, ET_DYN, bad
@@ -133,5 +143,18 @@ int elf_blob_has_magic(const uint8_t* data, uint64_t size);
  * out-of-bounds phoff/phnum, or frame exhaustion mid-map. */
 int elf64_map_blob(const uint8_t* data, uint64_t size, uint64_t* pml4,
                    uint32_t partition_id, struct Elf64MapInfo* info);
+
+/* Map an ET_DYN image at `load_base`, applying the one load bias a PIE/DSO
+ * needs. Used for the M2a interpreter (and any future PIE main image); the
+ * bias is `load_base - (lowest PT_LOAD p_vaddr & ~0xFFF)`, so a loader
+ * linked at vaddr 0 maps exactly at load_base. */
+int elf64_map_dyn_at(const uint8_t* data, uint64_t size, uint64_t* pml4,
+                     uint64_t load_base, uint32_t partition_id,
+                     struct Elf64MapInfo* info);
+
+/* Find and validate the main image's PT_INTERP segment. Returns 1 and fills
+ * *out when the path is present, bounded, NUL-terminated and absolute. */
+int elf64_find_interp(const uint8_t* data, uint64_t size,
+                      struct Elf64InterpInfo* out);
 
 #endif /* ELF64_LOAD_H */

@@ -42,10 +42,14 @@
 use core::str;
 
 pub const MANIFEST_MAGIC: [u8; 8] = *b"AERSLSM1";
-/// Major version this parser understands. The kernel supports `[1, N]` and
-/// refuses newer majors; the loader refuses anything it can't parse.
+/// The original (static-image) manifest major version. The parser also
+/// understands version 2, whose `INTERP` record names the dynamic loader.
 pub const MANIFEST_VERSION_MAJOR: u16 = 1;
 pub const MANIFEST_VERSION_MINOR: u16 = 0;
+/// Highest major version this parser understands. Version 1 is the static
+/// form; version 2 adds exactly one `INTERP` record and the packed footer's
+/// interpreter image.
+pub const MANIFEST_VERSION_MAJOR_MAX: u16 = 2;
 
 /// Header flag bit 0: unknown tags are skippable (else fatal).
 pub const FLAG_TOLERATE_UNKNOWN: u16 = 0x0001;
@@ -75,6 +79,10 @@ pub const TAG_NAME: u16 = 0x000A;
 /// create's §5.2 stack image; an absent record is the v1 answer —
 /// `argv = { name }`, an empty environment.
 pub const TAG_ARGENV: u16 = 0x000E;
+/// M2a's dynamic-loader record. Payload: `image_size u32`, reserved `u32`,
+/// `image_kaddr u64`, `path_len u16`, reserved `u16`, then `path[path_len]`.
+/// Exactly one is required in a version-2 manifest.
+pub const TAG_INTERP: u16 = 0x000F;
 /// Reserved for Phase 3 signed manifests; ignored by v1.
 pub const TAG_SIGNATURE: u16 = 0x7F00;
 /// Increment 19's gate-profile bit in the manifest header's flags word
@@ -134,6 +142,12 @@ pub enum ManifestErr {
     /// An unknown tag with `tolerate_unknown` clear, or — under
     /// `strict_caps` — a cap record with an unknown capability type.
     UnknownTag(u16),
+    /// A version-2 manifest has no `INTERP` record.
+    MissingInterp,
+    /// A manifest carries more than one `INTERP` record.
+    DuplicateInterp,
+    /// The `INTERP` record or the packed footer is structurally invalid.
+    BadInterp,
 }
 
 impl core::fmt::Display for ManifestErr {
@@ -148,6 +162,9 @@ impl core::fmt::Display for ManifestErr {
             ManifestErr::BadUtf8 => write!(f, "manifest name not UTF-8"),
             ManifestErr::TooManyCaps => write!(f, "manifest has too many caps"),
             ManifestErr::UnknownTag(t) => write!(f, "unknown manifest tag 0x{t:04x}"),
+            ManifestErr::MissingInterp => write!(f, "dynamic manifest has no INTERP record"),
+            ManifestErr::DuplicateInterp => write!(f, "manifest has more than one INTERP record"),
+            ManifestErr::BadInterp => write!(f, "manifest INTERP/footer is invalid"),
         }
     }
 }
@@ -165,6 +182,16 @@ pub struct Image {
     pub size: u32,
     /// Entry point offset within the image (entry_offset).
     pub entry: u64,
+}
+
+/// The `INTERP` record (manifest version 2): the sidecar-supplied musl
+/// dynamic loader image plus the physical address of its bytes. `path` is
+/// validation-only metadata — the kernel does not open or resolve it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Interp<'a> {
+    pub image_size: u32,
+    pub image_kaddr: u64,
+    pub path: &'a str,
 }
 
 /// The `BUDGET` record.
@@ -304,6 +331,8 @@ pub struct Manifest<'a> {
     pub name: Option<&'a str>,
     pub personality: Option<&'a str>,
     pub image: Option<Image>,
+    /// Version-2 dynamic loader: exactly one `INTERP` record, absent in v1.
+    pub interp: Option<Interp<'a>>,
     pub budget: Option<Budget>,
     pub cpu: Option<Cpu>,
     pub limits: Option<Limits>,
@@ -349,24 +378,24 @@ pub fn crc32(data: &[u8]) -> u32 {
     crc ^ 0xFFFF_FFFF
 }
 
-/// Parse the packed manifest at `blob`. Every byte read is bounded by
-/// `total_len`; the CRC is verified before any field is trusted. `strict`
-/// semantics come from the header flags: unknown tags are skipped only when
-/// `FLAG_TOLERATE_UNKNOWN` is set, and `FLAG_STRICT_CAPS` makes a cap
-/// record with a type other than `CAP_MEM`/`CAP_CHAN` fatal.
-pub fn parse_manifest(blob: &[u8]) -> Result<Manifest<'_>, ManifestErr> {
+/// Parse the record body of a manifest. The caller decides whether the
+/// required footer is present (`parse_manifest_packed`) or must be absent
+/// (`parse_manifest`). Every byte read is bounded by `total_len`; the CRC is
+/// verified before any field is trusted.
+fn parse_manifest_body(blob: &[u8]) -> Result<(Manifest<'_>, usize), ManifestErr> {
     if blob.len() < HEADER_LEN || &blob[..8] != &MANIFEST_MAGIC {
         return Err(ManifestErr::BadHeader);
     }
     let version_major = le_u16(blob, 8);
     let version_minor = le_u16(blob, 10);
-    if version_major != MANIFEST_VERSION_MAJOR {
+    if version_major < MANIFEST_VERSION_MAJOR ||
+        version_major > MANIFEST_VERSION_MAJOR_MAX {
         return Err(ManifestErr::BadVersion);
     }
     let record_count = le_u16(blob, 12) as usize;
     let flags = le_u16(blob, 14);
     let total_len = le_u32(blob, 16) as usize;
-    if total_len < HEADER_LEN || total_len > blob.len() {
+    if total_len < HEADER_LEN || total_len != blob.len() {
         return Err(ManifestErr::BadLength);
     }
     let want_crc = le_u32(blob, 20);
@@ -393,6 +422,7 @@ pub fn parse_manifest(blob: &[u8]) -> Result<Manifest<'_>, ManifestErr> {
         bootstrap: None,
         flags_value: None,
         argenv: None,
+        interp: None,
         signature: None,
     };
 
@@ -543,6 +573,35 @@ pub fn parse_manifest(blob: &[u8]) -> Result<Manifest<'_>, ManifestErr> {
                     },
                 })?;
             }
+            TAG_INTERP => {
+                if m.interp.is_some() {
+                    return Err(ManifestErr::DuplicateInterp);
+                }
+                if p.len() < 20 {
+                    return Err(ManifestErr::BadRecordLen);
+                }
+                let image_size = le_u32(p, 0);
+                let reserved = le_u32(p, 4);
+                let image_kaddr = le_u64(p, 8);
+                let path_len = le_u16(p, 16) as usize;
+                let reserved2 = le_u16(p, 18);
+                if p.len() != 20 + path_len {
+                    return Err(ManifestErr::BadRecordLen);
+                }
+                if reserved != 0 || reserved2 != 0 || image_size == 0 ||
+                    image_kaddr < 0x100000 || (image_kaddr & 0xFFF) != 0 {
+                    return Err(ManifestErr::BadInterp);
+                }
+                if image_kaddr.checked_add(image_size as u64).is_none() {
+                    return Err(ManifestErr::BadInterp);
+                }
+                let path = utf8(&p[20..], ManifestErr::BadUtf8)?;
+                if path.is_empty() || !path.starts_with('/') ||
+                    path.as_bytes().contains(&0u8) {
+                    return Err(ManifestErr::BadInterp);
+                }
+                m.interp = Some(Interp { image_size, image_kaddr, path });
+            }
             TAG_BOOTSTRAP => {
                 let (console, rest) = split_name(p).ok_or(ManifestErr::BadRecordLen)?;
                 let (debug, rest) = split_name(rest).ok_or(ManifestErr::BadRecordLen)?;
@@ -622,6 +681,56 @@ pub fn parse_manifest(blob: &[u8]) -> Result<Manifest<'_>, ManifestErr> {
             }
         }
     }
+    /* Version 1 is the static form: an INTERP record is never valid there,
+     * even under tolerate_unknown (an old v1 kernel with that flag set would
+     * otherwise accept a dynamic blob it cannot load). Version 2 makes the
+     * record mandatory and forbids tolerate_unknown so an old v1 parser fails
+     * closed at the version check rather than at the unknown tag. */
+    if version_major == 1 && m.interp.is_some() {
+        return Err(ManifestErr::BadInterp);
+    }
+    if version_major == 2 {
+        if m.interp.is_none() { return Err(ManifestErr::MissingInterp); }
+        if flags & FLAG_TOLERATE_UNKNOWN != 0 {
+            return Err(ManifestErr::BadInterp);
+        }
+    }
+    Ok((m, off))
+}
+
+/// Parse a records-only manifest (the form `build_manifest` emits). The blob
+/// must end exactly at the last record; a packed footer is refused.
+pub fn parse_manifest(blob: &[u8]) -> Result<Manifest<'_>, ManifestErr> {
+    let (m, records_end) = parse_manifest_body(blob)?;
+    if records_end != blob.len() {
+        return Err(ManifestErr::BadLength);
+    }
+    Ok(m)
+}
+
+/// Parse the kernel-facing packed manifest: records followed by the 8-byte
+/// main `image_kaddr` footer. `manifest_len == total_len` and
+/// `records_end + 8 == total_len` are both mandatory; the CRC covers the
+/// footer.
+pub fn parse_manifest_packed(blob: &[u8]) -> Result<Manifest<'_>, ManifestErr> {
+    let (m, records_end) = parse_manifest_body(blob)?;
+    if records_end.checked_add(8) != Some(blob.len()) {
+        return Err(ManifestErr::BadLength);
+    }
+    let image_kaddr = le_u64(blob, records_end);
+    if image_kaddr < 0x100000 || (image_kaddr & 0xFFF) != 0 {
+        return Err(ManifestErr::BadInterp);
+    }
+    if let Some(i) = m.interp {
+        let main_size = m.image.map(|im| im.size as u64).unwrap_or(0);
+        let main_end = image_kaddr.checked_add(main_size)
+            .ok_or(ManifestErr::BadLength)?;
+        let interp_end = i.image_kaddr.checked_add(i.image_size as u64)
+            .ok_or(ManifestErr::BadInterp)?;
+        if image_kaddr < interp_end && i.image_kaddr < main_end {
+            return Err(ManifestErr::BadInterp);
+        }
+    }
     Ok(m)
 }
 
@@ -668,8 +777,8 @@ fn le_u64(b: &[u8], i: usize) -> u64 {
 
 // ── builder (host tooling / tests; the kernel never builds manifests) ───────
 
-/// Build the packed form of `m` — the `genmanifest` equivalent. Returns the
-/// blob exactly as `parse_manifest` expects it (header + CRC + records).
+/// Build the records-only form of `m` — the `genmanifest` equivalent. Use
+/// `pack_manifest` for the kernel-facing blob with the image_kaddr footer.
 pub fn build_manifest(m: &Manifest<'_>) -> alloc::vec::Vec<u8> {
     let mut recs = alloc::vec::Vec::new();
     if let Some(n) = m.name {
@@ -688,6 +797,16 @@ pub fn build_manifest(m: &Manifest<'_>) -> alloc::vec::Vec<u8> {
         p.extend_from_slice(&i.size.to_le_bytes());
         p.extend_from_slice(&0u64.to_le_bytes());
         recs.push((TAG_IMAGE, p));
+    }
+    if let Some(i) = m.interp {
+        let mut p = alloc::vec::Vec::with_capacity(20 + i.path.len());
+        p.extend_from_slice(&i.image_size.to_le_bytes());
+        p.extend_from_slice(&0u32.to_le_bytes());
+        p.extend_from_slice(&i.image_kaddr.to_le_bytes());
+        p.extend_from_slice(&(i.path.len() as u16).to_le_bytes());
+        p.extend_from_slice(&0u16.to_le_bytes());
+        p.extend_from_slice(i.path.as_bytes());
+        recs.push((TAG_INTERP, p));
     }
     if let Some(b) = m.budget {
         let mut p = alloc::vec::Vec::with_capacity(16);
@@ -804,6 +923,18 @@ pub fn build_manifest(m: &Manifest<'_>) -> alloc::vec::Vec<u8> {
     blob
 }
 
+/// Append the 8-byte main-image footer and patch `total_len`/CRC to cover
+/// it. This is the only Rust producer of the kernel-facing packed form.
+pub fn pack_manifest(m: &Manifest<'_>, image_kaddr: u64) -> alloc::vec::Vec<u8> {
+    let mut blob = build_manifest(m);
+    blob.extend_from_slice(&image_kaddr.to_le_bytes());
+    let total = blob.len() as u32;
+    blob[16..20].copy_from_slice(&total.to_le_bytes());
+    let crc = crc32(&blob[HEADER_LEN..]);
+    blob[20..24].copy_from_slice(&crc.to_le_bytes());
+    blob
+}
+
 fn enc_name(s: &str) -> alloc::vec::Vec<u8> {
     let mut v = alloc::vec::Vec::with_capacity(2 + s.len());
     v.extend_from_slice(&(s.len() as u16).to_le_bytes());
@@ -839,6 +970,7 @@ mod tests {
             bootstrap: Some(Bootstrap { console: Some("console"), debug: None, log_level: 1 }),
             flags_value: Some(0),
             argenv: None,
+            interp: None,
             signature: None,
         }
     }
@@ -873,8 +1005,97 @@ mod tests {
         assert_eq!(parse_manifest(&blob), Err(ManifestErr::CrcMismatch));
 
         let mut blob = build_manifest(&sample());
-        blob[8] = 2; // version_major = 2
+        blob[8] = 3; // version_major = 3
         assert_eq!(parse_manifest(&blob), Err(ManifestErr::BadVersion));
+    }
+
+    fn dynamic_sample() -> Manifest<'static> {
+        let mut m = sample();
+        m.version_major = 2;
+        m.interp = Some(Interp {
+            image_size: 0x2000,
+            image_kaddr: 0x300000,
+            path: "/lib/ld-musl-x86_64.so.1",
+        });
+        m
+    }
+
+    #[test]
+    fn packed_v1_roundtrip_keeps_the_footer_out_of_the_records() {
+        let blob = pack_manifest(&sample(), 0x200000);
+        assert_eq!(&blob[..8], &MANIFEST_MAGIC);
+        let m = parse_manifest_packed(&blob).unwrap();
+        assert_eq!(m.name, Some("posix.0"));
+        assert_eq!(m.interp, None);
+        assert_eq!(le_u64(&blob, blob.len() - 8), 0x200000);
+    }
+
+    #[test]
+    fn packed_v2_roundtrip_keeps_the_interp_record() {
+        let blob = pack_manifest(&dynamic_sample(), 0x200000);
+        let m = parse_manifest_packed(&blob).unwrap();
+        let i = m.interp.expect("INTERP record");
+        assert_eq!(i.image_size, 0x2000);
+        assert_eq!(i.image_kaddr, 0x300000);
+        assert_eq!(i.path, "/lib/ld-musl-x86_64.so.1");
+    }
+
+    #[test]
+    fn records_only_and_packed_parsers_refuse_each_others_form() {
+        let records = build_manifest(&sample());
+        assert_eq!(parse_manifest_packed(&records), Err(ManifestErr::BadLength));
+
+        let packed = pack_manifest(&sample(), 0x200000);
+        assert_eq!(parse_manifest(&packed), Err(ManifestErr::BadLength));
+    }
+
+    #[test]
+    fn version_2_requires_exactly_one_interp_and_no_tolerate_flag() {
+        let mut m = sample();
+        m.version_major = 2;
+        let blob = build_manifest(&m);
+        assert_eq!(parse_manifest(&blob), Err(ManifestErr::MissingInterp));
+
+        let mut m = dynamic_sample();
+        m.flags = FLAG_TOLERATE_UNKNOWN;
+        let blob = build_manifest(&m);
+        assert_eq!(parse_manifest(&blob), Err(ManifestErr::BadInterp));
+    }
+
+    #[test]
+    fn version_1_refuses_an_interp_record_even_when_tolerating_unknown_tags() {
+        let mut m = dynamic_sample();
+        m.version_major = 1;
+        for flags in [0, FLAG_TOLERATE_UNKNOWN] {
+            m.flags = flags;
+            let blob = build_manifest(&m);
+            assert_eq!(parse_manifest(&blob), Err(ManifestErr::BadInterp));
+        }
+    }
+
+    #[test]
+    fn packed_parser_refuses_an_interp_that_overlaps_the_main_image() {
+        let mut m = dynamic_sample();
+        m.interp = Some(Interp {
+            image_size: 0x2000,
+            image_kaddr: 0x200000,
+            path: "/lib/ld-musl-x86_64.so.1",
+        });
+        let blob = pack_manifest(&m, 0x200000);
+        assert_eq!(parse_manifest_packed(&blob), Err(ManifestErr::BadInterp));
+    }
+
+    #[test]
+    fn interp_wire_bytes_are_exact() {
+        let blob = build_manifest(&dynamic_sample());
+        let p = record_payload(&blob, TAG_INTERP).expect("INTERP record");
+        assert_eq!(p.len(), 20 + "/lib/ld-musl-x86_64.so.1".len());
+        assert_eq!(le_u32(p, 0), 0x2000);
+        assert_eq!(le_u32(p, 4), 0);
+        assert_eq!(le_u64(p, 8), 0x300000);
+        assert_eq!(le_u16(p, 16) as usize, "/lib/ld-musl-x86_64.so.1".len());
+        assert_eq!(le_u16(p, 18), 0);
+        assert_eq!(&p[20..], b"/lib/ld-musl-x86_64.so.1");
     }
 
     #[test]
@@ -958,6 +1179,7 @@ mod tests {
             bootstrap: None,
             flags_value: None,
             argenv: None,
+            interp: None,
             signature: None,
         }
     }
@@ -1045,7 +1267,7 @@ mod tests {
         want.extend_from_slice(&1u16.to_le_bytes()); // perms
         assert_eq!(&blob[28..], &want[..]);
 
-        // Round-trip: parse the packed blob and check the irq cap.
+        // Round-trip: parse the records-only blob and check the irq cap.
         let parsed = parse_manifest(&blob).unwrap();
         let irq = parsed.caps().iter().flatten().find(|c| c.name == "irq.timer.0");
         assert_eq!(
@@ -1109,7 +1331,7 @@ mod tests {
         assert_eq!(&blob[28..], &want[..]);
         assert_eq!(blob.len(), 24 + 4 + 28);
 
-        // Round-trip: parse the packed blob and check the dev cap.
+        // Round-trip: parse the records-only blob and check the dev cap.
         let parsed = parse_manifest(&blob).unwrap();
         let dev = parsed.caps().iter().flatten().find(|c| c.name == "nic0.bar0");
         assert_eq!(
@@ -1123,7 +1345,7 @@ mod tests {
     }
 
     /// Locate the payload of the first record with the given tag in a
-    /// packed blob (same TLV walk `parse_manifest` does).
+    /// records-only blob (same TLV walk `parse_manifest` does).
     fn record_payload<'a>(blob: &'a [u8], tag: u16) -> Option<&'a [u8]> {
         let mut off = HEADER_LEN;
         while off + 4 <= blob.len() {
@@ -1177,6 +1399,7 @@ mod tests {
             bootstrap: None,
             flags_value: None,
             argenv: None,
+            interp: None,
             signature: None,
         }
     }
@@ -1215,7 +1438,7 @@ mod tests {
         );
 
         for m in [ramdisk, nvme] {
-            let blob = build_manifest(&m);
+            let blob = pack_manifest(&m, 0x200000);
             let name = m.name.unwrap();
             let p = record_payload(&blob, TAG_NAME).expect("TAG_NAME record emitted");
             let mut want = Vec::new();
@@ -1225,7 +1448,7 @@ mod tests {
 
             // The kernel-side parser sees the same identity — this is the
             // name cap_create_sidecar registers in the sidecar registry.
-            let parsed = parse_manifest(&blob).unwrap();
+            let parsed = parse_manifest_packed(&blob).unwrap();
             assert_eq!(parsed.name, Some(name));
             assert_eq!(parsed.n_caps, m.n_caps);
             assert_eq!(parsed.find_cap("console").unwrap().name, "console");
@@ -1288,8 +1511,8 @@ mod tests {
         assert_eq!(le_u64(&blob, off), kaddr, "footer image_kaddr");
         assert_eq!(crc32(&blob[HEADER_LEN..]), crc, "body CRC over records+footer");
 
-        // And the Rust parser still round-trips the same manifest.
-        let parsed = parse_manifest(&blob).unwrap();
+        // And the packed parser still round-trips the same manifest.
+        let parsed = parse_manifest_packed(&blob).unwrap();
         assert_eq!(parsed.image.unwrap().entry, 0x10);
         assert_eq!(parsed.image.unwrap().offset, 0x8000);
         assert_eq!(parsed.image.unwrap().size, 0x4000);

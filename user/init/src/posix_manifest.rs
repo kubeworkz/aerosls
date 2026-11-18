@@ -7,7 +7,7 @@
 
 use aerosls_proto::manifest::{
     Bootstrap, Budget, CapKind, Cpu, Image, Limits, Manifest, ManifestCap,
-    build_manifest, crc32, FLAG_GATE, FLAG_TENANT_LINUX, HEADER_LEN,
+    pack_manifest, FLAG_GATE, FLAG_TENANT_LINUX,
 };
 use alloc::vec::Vec;
 
@@ -171,16 +171,11 @@ pub fn build_posix_manifest(
         }),
         flags_value: Some(0),
         argenv: None,
+        interp: None,
         signature: None,
     };
 
-    let mut blob = build_manifest(&m);
-    // Append the image_kaddr footer, then patch total_len and body CRC.
-    blob.extend_from_slice(&image_kaddr.to_le_bytes());
-    let total = blob.len() as u32;
-    blob[16..20].copy_from_slice(&total.to_le_bytes());
-    let crc = crc32(&blob[HEADER_LEN..]);
-    blob[20..24].copy_from_slice(&crc.to_le_bytes());
+    let blob = pack_manifest(&m, image_kaddr);
     blob
 }
 
@@ -366,22 +361,18 @@ fn build_posix_manifest_tenant_profile(
         }),
         flags_value: Some(0),
         argenv: None,
+        interp: None,
         signature: None,
     };
 
-    let mut blob = build_manifest(&m);
-    blob.extend_from_slice(&image_kaddr.to_le_bytes());
-    let total = blob.len() as u32;
-    blob[16..20].copy_from_slice(&total.to_le_bytes());
-    let crc = crc32(&blob[HEADER_LEN..]);
-    blob[20..24].copy_from_slice(&crc.to_le_bytes());
+    let blob = pack_manifest(&m, image_kaddr);
     blob
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aerosls_proto::manifest::{parse_manifest, CapKind};
+    use aerosls_proto::manifest::{parse_manifest_packed, CapKind};
 
     fn build(e1000: Option<u64>) -> Vec<u8> {
         build_posix_manifest(0x3000_0000, 0x40000, 0x3040_0000, e1000)
@@ -390,7 +381,7 @@ mod tests {
     #[test]
     fn no_e1000_omits_the_dev_cap() {
         let blob = build(None);
-        let m = parse_manifest(&blob).unwrap();
+        let m = parse_manifest_packed(&blob).unwrap();
         assert_eq!(m.n_caps, 7);
         assert!(m.find_cap("nic0.bar0").is_none());
     }
@@ -406,7 +397,7 @@ mod tests {
         let blob = build_posix_manifest_tenant(
             "aerosls.posix.1", "drv.ramdisk.1",
             0x3000_0000, 0x40000, 0x3040_0000);
-        let m = parse_manifest(&blob).unwrap();
+        let m = parse_manifest_packed(&blob).unwrap();
         assert_eq!(m.name, Some("aerosls.posix.1"));
         assert_eq!(m.n_caps, 5);
         // The five tenant caps are present...
@@ -453,7 +444,7 @@ mod tests {
         let blob = build_posix_manifest_tenant_linux(
             "aerosls.posix.3", "drv.ramdisk.3",
             0x3000_0000, 0x40000, 0x3040_0000);
-        let m = parse_manifest(&blob).unwrap();
+        let m = parse_manifest_packed(&blob).unwrap();
         assert_eq!(m.name, Some("aerosls.posix.3"));
         assert_eq!(m.flags & FLAG_TENANT_LINUX, FLAG_TENANT_LINUX);
         assert_eq!(m.flags & FLAG_GATE, 0);
@@ -469,7 +460,7 @@ mod tests {
         let plain_blob = build_posix_manifest_tenant(
             "aerosls.posix.3", "drv.ramdisk.3",
             0x3000_0000, 0x40000, 0x3040_0000);
-        let plain = parse_manifest(&plain_blob).unwrap();
+        let plain = parse_manifest_packed(&plain_blob).unwrap();
         assert_eq!(plain.flags & FLAG_TENANT_LINUX, 0,
                    "the ordinary tenant builder stayed byte-identical");
     }
@@ -483,8 +474,8 @@ mod tests {
             "aerosls.posix.1", "drv.ramdisk.1", 0x3000_0000, 0x40000, 0x3040_0000);
         let blob_b = build_posix_manifest_tenant(
             "aerosls.posix.2", "drv.ramdisk.2", 0x3000_0000, 0x40000, 0x3800_0000);
-        let a = parse_manifest(&blob_a).unwrap();
-        let b = parse_manifest(&blob_b).unwrap();
+        let a = parse_manifest_packed(&blob_a).unwrap();
+        let b = parse_manifest_packed(&blob_b).unwrap();
         assert_ne!(a.name, b.name);
         assert_eq!(a.find_cap("ramdisk").unwrap().kind,
                    CapKind::Chan { peer: Some("drv.ramdisk.1"), flags: 0 });
@@ -499,7 +490,7 @@ mod tests {
         // a hardcoded address, and the cap round-trips the packed blob.
         let base = 0xFEBE_0000u64;
         let blob = build(Some(base));
-        let m = parse_manifest(&blob).unwrap();
+        let m = parse_manifest_packed(&blob).unwrap();
         assert_eq!(m.n_caps, 8);
         let dev = m.find_cap("nic0.bar0").unwrap();
         assert_eq!(dev.rights, 0x3); // R | W

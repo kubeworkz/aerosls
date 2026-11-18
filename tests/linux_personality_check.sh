@@ -96,6 +96,9 @@ CBUILD=user/sidecar/fixtures/build_candidate.sh
 LFU=user/sidecar/src/e7_firstuser.rs
 MANR=user/proto/src/manifest.rs
 CCT=tests/cap_create_sidecar_host_test.c
+M2A=user/sidecar/src/m2a_interp.rs
+M2AFIX=user/sidecar/fixtures/build_m2a.sh
+M2AC=user/sidecar/fixtures/m2a_hello.c
 FPUH=arch/x86/fpu_enable.h
 LFUC=arch/x86/lazy_fpu.c
 IDTC=arch/x86/idt.c
@@ -651,19 +654,21 @@ fi
 # increment 7 exists. Teeth: clause set O in the smoke.
 if grep -qF 'int elf_blob_has_magic(const uint8_t* data, uint64_t size);' "$E64H" && \
    grep -qF 'int elf64_map_blob(' "$E64H" && \
-   grep -qF 'if (ehdr->e_type == ELF_ET_DYN)' "$E64C" && \
-   grep -qF 'if (ehdr->e_type != ELF_ET_EXEC)' "$E64C" && \
+   grep -qF 'if (!dynamic && ehdr->e_type == ELF_ET_DYN)' "$E64C" && \
+   grep -qF 'if (dynamic && ehdr->e_type != ELF_ET_DYN)' "$E64C" && \
+   grep -qF 'if (!dynamic && ehdr->e_type != ELF_ET_EXEC)' "$E64C" && \
    grep -qF 'cap_arch_map_page((uint64_t)(uintptr_t)pml4,' "$E64C"; then
-    ok "O1. the ONE ELF mapper exists with §5.1's gates by name — magic-only dispatch, ET_DYN refused, nothing-but-ET_EXEC refused — and routes its segments through cap_arch_map_page's SAFE walk (a low-linked segment must shadow the shared kernel identity map, never write its leaf through a huge-page entry)"
+    ok "O1. the ONE ELF mapper exists with §5.1's gates by name — magic-only dispatch, a static PT_LOAD path that still refuses ET_DYN, a dynamic path reachable ONLY for ET_DYN at an explicit base, nothing-but-ET_EXEC refused on the static path — and routes its segments through cap_arch_map_page's SAFE walk (a low-linked segment must shadow the shared kernel identity map, never write its leaf through a huge-page entry)"
 else
-    bad "O1. the ELF mapper's gates are gone, renamed, or routed back through user_map_page — an ET_DYN image mapped at its linked addresses with no bias, a non-ET_EXEC accepted by a mapper that believes its own header, or a low-linked segment (0x400000, inside the shared identity map) whose leaf lands in the kernel's own frames while the child's fetch still resolves through the supervisor huge page: the candidate #PFs at its first instruction while [LOADER] claims R-X"
+    bad "O1. the ELF mapper's gates are gone, renamed, or routed back through user_map_page — a static ET_DYN image mapped at its linked addresses with no bias, the dynamic path accepting a non-ET_DYN, a non-ET_EXEC accepted by the static mapper that believes its own header, or a low-linked segment (0x400000, inside the shared identity map) whose leaf lands in the kernel's own frames while the child's fetch still resolves through the supervisor huge page: the candidate #PFs at its first instruction while [LOADER] claims R-X"
 fi
 if grep -qF 'image_is_elf = elf_blob_has_magic(' "$CAPC" && \
    grep -qF 'if (!elf64_map_blob(' "$CAPC" && \
-   grep -qF 'pd->user_rip   = image_is_elf ? elf_entry : image_vbase + m.image_entry;' "$CAPC"; then
-    ok "O2. the create dispatches on the MAGIC: the one mapper owns every ELF's segments, the entry is e_entry, never the flat mapper's base+offset — image format is an image property, never a personality inference (§5.1)"
+   grep -qF 'pd->user_rip   = image_is_dynamic ? interp_entry' "$CAPC" && \
+   grep -qF ': (image_is_elf ? elf_entry : image_vbase + m.image_entry);' "$CAPC"; then
+    ok "O2. the create dispatches on the MAGIC: the one mapper owns every ELF's segments, a static ELF enters at e_entry, a dynamic ELF enters at its loader's entry, never the flat mapper's base+offset — image format is an image property, never a personality inference (§5.1)"
 else
-    bad "O2. the create's magic dispatch is gone — an ELF would enter at base+offset while its segments sit at their linked vaddrs (first fetch from bytes that are not code), or the dispatch became a personality decision §5.1 forbids"
+    bad "O2. the create's magic dispatch is gone — a static ELF would enter at base+offset while its segments sit at their linked vaddrs (first fetch from bytes that are not code), a dynamic ELF would enter e_entry with no loader initialised, or the dispatch became a personality decision §5.1 forbids"
 fi
 if grep -qF 'built_rsp = linux_initial_stack_build(' "$CAPC" && \
    grep -qF 'sp.region_vaddr = stack_base;' "$CAPC" && \
@@ -740,7 +745,7 @@ fi
 # committed image before it had page-aligned LOADs, which is why the
 # census could not see it. The cap host test's E8a section EXECUTES the
 # case (and the shared-page refusal) — the smoke's t53/t54 bite both.
-if grep -qF 'uint64_t page_base = s->p_vaddr & ~(uint64_t)4095u;' "$E64C" && \
+if grep -qF 'uint64_t page_base = vaddr & ~(uint64_t)4095u;' "$E64C" && \
    grep -qF 'n_pages = (lead + s->p_memsz + 4095) / 4096;' "$E64C" && \
    grep -qF 'e6_memcpy((uint8_t*)frame + frame_off,' "$E64C" && \
    grep -qF 'if (a_lo < b_hi && b_lo < a_hi) {' "$E64C" && \
@@ -750,6 +755,39 @@ if grep -qF 'uint64_t page_base = s->p_vaddr & ~(uint64_t)4095u;' "$E64C" && \
     ok "O8. a PT_LOAD that starts MID-PAGE lands at its LINKED vaddr: the page base is the mapping anchor and the segment's lead is where its bytes start inside the frame (both zero for an aligned segment, so the images that already worked are unmoved), two LOADs sharing a page are refused by name before the first frame, and tests/cap_create_sidecar_host_test.c's E8a section executes the case — the measured killer of the first user"
 else
     bad "O8. the mapper's page-alignment handling is gone — a segment linking mid-page lands (p_vaddr & 0xFFF) bytes early again, every global in it reads the file that much further on, and a libc-linked binary dies at rip=0x28 before main while [LOADER] reports a successful load; the shared-page refusal going with it would let a second segment silently discard the first's bytes and permissions through the one frame per page"
+fi
+
+# O9 holds M2a's two-image contract: the main ET_EXEC names an interpreter
+# in PT_INTERP, the manifest's version-2 INTERP record matches it, the
+# loader is mapped at LINUX_INTERP_BASE, and the child starts at the
+# loader rather than at e_entry. The live proof's marker is M2A-OK. The
+# demo is also one-shot per boot: the spawn site reads the kernel's
+# boot generation (0 = this sidecar name's first instance, 1+ = init's
+# watchdog respawn) and skips instead of re-running the spawn after the
+# E3 irqtest has filled the task table.
+if grep -qF '#define LINUX_INTERP_BASE     0x00007F0000000000ULL' "$LABH" && \
+   grep -qF 'int elf64_map_dyn_at(' "$E64H" && \
+   grep -qF 'int elf64_find_interp(' "$E64H" && \
+   grep -qF '#define SIDECAR_TAG_INTERP       0x000F' "$CAPH" && \
+   grep -qF 'case SIDECAR_TAG_INTERP: {' "$CAPC" && \
+   grep -qF 'elf64_map_dyn_at(' "$CAPC" && \
+   grep -qF 'sp.at_base      = image_is_dynamic ? LINUX_INTERP_BASE : 0;' "$CAPC" && \
+   grep -qF "pd->user_rip   = image_is_dynamic ? interp_entry" "$CAPC" && \
+   grep -qF 'pub fn pack_manifest(m: &Manifest' "$MANR" && \
+   grep -qF 'pub const TAG_INTERP: u16 = 0x000F;' "$MANR" && \
+   grep -qF 'let blob = pack_manifest(&m, main_kaddr);' "$M2A" && \
+   grep -qF 'interp: Some(Interp {' "$M2A" && \
+   grep -qF 'pub fn boot_generation() -> u32' "$M2A" && \
+   grep -qF 'k_boot_gen() as u32' "$M2A" && \
+   grep -qF 'let gen = crate::m2a_interp::boot_generation();' "$LRE" && \
+   grep -qF 'if gen != 0 {' "$LRE" && \
+   grep -qF 'klog(b"[M2A] one-shot skip gen=", gen, b"");' "$LRE" && \
+   grep -qF 'M2A-OK' "$M2A" && \
+   grep -qF 'M2A-OK' "$M2AC" && \
+   grep -qF 'Requesting program interpreter' "$M2AFIX"; then
+    ok "O9. M2a's two-image contract is wired: version-2 INTERP parsing, elf64_map_dyn_at/elf64_find_interp, AT_BASE and the loader-entry RIP split, pack_manifest as the one producer, the committed M2A-OK fixture pair, and the boot-generation guard that keeps the opt-in demo one-shot per boot"
+else
+    bad "O9. one half of the two-image contract is gone — a version-2 manifest could not name or validate its loader, the loader could map at vaddr 0, the child could enter e_entry, a producer could hand-roll a footer again, or the spawn site could re-run the demo on init's watchdog respawn (CAP_ETABLEFULL after the task table fills)"
 fi
 
 # ─── Q. The SSE gate (§10.13's step-1 death, increment 9): CR4.OSFXSR and its order ──

@@ -7,7 +7,7 @@
 
 use aerosls_proto::manifest::{
     Bootstrap, Budget, CapKind, Cpu, Image, Limits, Manifest, ManifestCap,
-    build_manifest, crc32, HEADER_LEN,
+    pack_manifest,
 };
 use alloc::vec::Vec;
 
@@ -90,15 +90,39 @@ pub fn build_net_manifest(image_kaddr: u64, image_size: u32, heap_base: u64) -> 
         }),
         flags_value: Some(0),
         argenv: None,
+        interp: None,
         signature: None,
     };
 
-    let mut blob = build_manifest(&m);
-    // Append the image_kaddr footer, then patch total_len and body CRC.
-    blob.extend_from_slice(&image_kaddr.to_le_bytes());
-    let total = blob.len() as u32;
-    blob[16..20].copy_from_slice(&total.to_le_bytes());
-    let crc = crc32(&blob[HEADER_LEN..]);
-    blob[20..24].copy_from_slice(&crc.to_le_bytes());
+    let blob = pack_manifest(&m, image_kaddr);
     blob
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aerosls_proto::manifest::{
+        parse_manifest, parse_manifest_packed, ManifestErr,
+    };
+
+    #[test]
+    fn blob_is_packed_v1_and_roundtrips() {
+        let image_kaddr = 0x3000_0000u64;
+        let blob = build_net_manifest(image_kaddr, 0x4000, 0x3000_4000);
+
+        // The footer is the last 8 bytes and is not a record; the
+        // records-only parser must refuse a packed blob.
+        assert_eq!(
+            u64::from_le_bytes(blob[blob.len() - 8..].try_into().unwrap()),
+            image_kaddr
+        );
+        assert_eq!(parse_manifest(&blob), Err(ManifestErr::BadLength));
+
+        let parsed = parse_manifest_packed(&blob).expect("net blob is packed v1");
+        assert_eq!(parsed.name, Some(NET_MANIFEST_NAME));
+        assert_eq!(parsed.version_major, 1);
+        assert_eq!(parsed.image.unwrap().size, 0x4000);
+        assert_eq!(parsed.budget.unwrap().mem_bytes, 512 * 1024);
+        assert!(parsed.interp.is_none());
+    }
 }

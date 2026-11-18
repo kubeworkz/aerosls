@@ -772,13 +772,14 @@ static void blob_dev(struct Blob* b, const char* name, uint64_t phys_base,
  * is the physical address of the image data the kernel copies into the
  * child's frames (appended after all TLV records; the kernel reads it as
  * the first 8 bytes past the walk). */
-static void blob_finish(struct Blob* b, uint64_t image_kaddr) {
+static void blob_finish_version(struct Blob* b, uint64_t image_kaddr,
+                                uint16_t vmaj) {
     b->footer_off = b->len;
     blob_u64(b, image_kaddr);
 
     /* Header. */
     memcpy(b->data, SIDECAR_MANIFEST_MAGIC, 8);
-    uint16_t vmaj = SIDECAR_MANIFEST_VERSION_MAJOR, vmin = 0;
+    uint16_t vmin = 0;
     uint16_t recs = b->rec_count;
     uint16_t flags = 0;
     memcpy(b->data + 8, &vmaj, 2);
@@ -786,6 +787,24 @@ static void blob_finish(struct Blob* b, uint64_t image_kaddr) {
     memcpy(b->data + 12, &recs, 2);
     memcpy(b->data + 14, &flags, 2);
     blob_refinish(b);
+}
+
+static void blob_finish(struct Blob* b, uint64_t image_kaddr) {
+    blob_finish_version(b, image_kaddr, SIDECAR_MANIFEST_VERSION_MAJOR);
+}
+
+/* INTERP: image_size u32, reserved u32, image_kaddr u64, path_len u16,
+ * reserved u16, path bytes. Version 2 requires exactly one. */
+static void blob_interp(struct Blob* b, uint32_t image_size,
+                        uint64_t image_kaddr, const char* path) {
+    uint16_t plen = (uint16_t)strlen(path);
+    blob_record(b, SIDECAR_TAG_INTERP, (uint16_t)(20 + plen));
+    blob_u32(b, image_size);
+    blob_u32(b, 0);
+    blob_u64(b, image_kaddr);
+    blob_u16(b, plen);
+    blob_u16(b, 0);
+    blob_put(b, path, plen);
 }
 
 /* Build the standard valid manifest: IMAGE + BUDGET + CAP_MEM "budget" +
@@ -809,6 +828,21 @@ static void build_valid_blob(struct Blob* b, uint64_t image_kaddr, int with_unkn
         blob_put(b, "\xAB", 1);
     }
     blob_finish(b, image_kaddr);
+}
+
+/* A version-2 manifest: the preamble's IMAGE record is retargeted at the
+ * synthetic dynamic main image, and one INTERP record names the loader.
+ * `main_kaddr`/`interp_kaddr` must be distinct 4 KiB-aligned host ranges
+ * (the parser's overlap gate compares the two physical ranges). */
+static void build_dynamic_blob(struct Blob* b, uint64_t main_kaddr,
+                               uint32_t main_size, uint64_t interp_kaddr,
+                               uint32_t interp_size, const char* path) {
+    memset(b, 0, sizeof(*b));
+    blob_preamble(b);
+    memcpy(b->data + b->rec_off[0] + 12, &main_size, 4);
+    blob_name(b, "m2a.host.0");
+    blob_interp(b, interp_size, interp_kaddr, path);
+    blob_finish_version(b, main_kaddr, 2);
 }
 
 /* A service-sidecar manifest: NAME + preamble, no channels. Its NAME is
@@ -1034,7 +1068,7 @@ int main(void) {
           "unregistered peer resolves to 0");
 
     /* The sidecar image bytes the manifest points at. */
-    static uint8_t g_image[IMAGE_SIZE];
+    static uint8_t g_image[IMAGE_SIZE] __attribute__((aligned(4096)));
     for (uint32_t i = 0; i < IMAGE_SIZE; i++) g_image[i] = (uint8_t)(i % 251);
     uint64_t image_kaddr = (uint64_t)(uintptr_t)g_image;
 
@@ -1437,7 +1471,7 @@ int main(void) {
           "CRC mismatch refused before any field is trusted");
 
     build_valid_blob(&bad, image_kaddr, 0);
-    uint16_t too_many = SIDECAR_MANIFEST_MAX_CAPS + 11;
+    uint16_t too_many = SIDECAR_MANIFEST_MAX_CAPS + 12;
     memcpy(bad.data + 12, &too_many, 2);   /* record_count above the bound */
     CHECK(cap_create_sidecar(100, bad.data, bad.len, CAP_NONE, CAP_NONE, &ch_r) == CAP_ERANGE,
           "record_count above the cap bound refused");
@@ -3664,6 +3698,159 @@ int main(void) {
                                  (uint64_t*)(uintptr_t)pml4b, 0, &mi2) == 0,
                   "E8a: two LOADs sharing a page are REFUSED by name — one frame per page cannot hold both");
         }
+    }
+
+    /* ── 20c. M2a: dynamic main + sidecar-supplied interpreter ───────────
+     * The main image is a synthetic ET_EXEC with a PT_INTERP naming the
+     * loader; the loader is a synthetic ET_DYN linked at vaddr 0. These
+     * exercise the two new mapper entry points and the version-2 create
+     * path (INTERP validation, AT_BASE, and entry=RIP split) against the
+     * real cap.c / elf64_load.c. */
+    {
+        static uint8_t main_img[4096] __attribute__((aligned(4096)));
+        static uint8_t interp_img[4096] __attribute__((aligned(4096)));
+        static const char path[] = "/lib/ld-musl-x86_64.so.1";
+        const uint64_t main_entry = 0x4000B8ull;
+        const uint64_t interp_entry = 0x80ull;
+        uint64_t pm, frames_before;
+        struct Elf64MapInfo mi, di;
+        struct Elf64InterpInfo ii;
+        struct Blob db;
+        uint16_t dch = CAP_NONE;
+        struct ProcessDescriptor* dc;
+        struct StackImage dstk;
+        size_t i;
+        int bytes_ok = 1;
+
+        memset(main_img, 0, sizeof main_img);
+        main_img[0] = 0x7F; main_img[1] = 'E';
+        main_img[2] = 'L'; main_img[3] = 'F';
+        main_img[4] = 2; main_img[5] = 1; main_img[6] = 1;
+        w16(main_img + 0x10, 2);                 /* ET_EXEC */
+        w16(main_img + 0x12, 62);
+        w32(main_img + 0x14, 1);
+        w64(main_img + 0x18, main_entry);
+        w64(main_img + 0x20, 0x40);              /* e_phoff */
+        w16(main_img + 0x34, 64);
+        w16(main_img + 0x36, 56);
+        w16(main_img + 0x38, 2);                 /* LOAD + INTERP */
+
+        w32(main_img + 0x40 + 0, 1);             /* PT_LOAD */
+        w32(main_img + 0x40 + 4, PF_R | PF_X);
+        w64(main_img + 0x40 + 8, 0);
+        w64(main_img + 0x40 + 16, 0x400000);
+        w64(main_img + 0x40 + 24, 0x400000);
+        w64(main_img + 0x40 + 32, 0x200);
+        w64(main_img + 0x40 + 40, 0x200);
+        w64(main_img + 0x40 + 48, 0x1000);
+
+        w32(main_img + 0x78 + 0, 3);             /* PT_INTERP */
+        w32(main_img + 0x78 + 4, PF_R);
+        w64(main_img + 0x78 + 8, 0x200);
+        w64(main_img + 0x78 + 16, 0);            /* not loaded */
+        w64(main_img + 0x78 + 24, 0);
+        w64(main_img + 0x78 + 32, sizeof path);
+        w64(main_img + 0x78 + 40, sizeof path);
+        w64(main_img + 0x78 + 48, 1);
+        memcpy(main_img + 0x200, path, sizeof path);
+        for (i = 0xB8; i < 0x200; i++) main_img[i] = (uint8_t)(0x31 + (i % 181));
+
+        memset(interp_img, 0, sizeof interp_img);
+        interp_img[0] = 0x7F; interp_img[1] = 'E';
+        interp_img[2] = 'L'; interp_img[3] = 'F';
+        interp_img[4] = 2; interp_img[5] = 1; interp_img[6] = 1;
+        w16(interp_img + 0x10, 3);               /* ET_DYN */
+        w16(interp_img + 0x12, 62);
+        w32(interp_img + 0x14, 1);
+        w64(interp_img + 0x18, interp_entry);
+        w64(interp_img + 0x20, 0x40);
+        w16(interp_img + 0x34, 64);
+        w16(interp_img + 0x36, 56);
+        w16(interp_img + 0x38, 1);
+        w32(interp_img + 0x40 + 0, 1);           /* PT_LOAD at vaddr 0 */
+        w32(interp_img + 0x40 + 4, PF_R | PF_X);
+        w64(interp_img + 0x40 + 8, 0);
+        w64(interp_img + 0x40 + 16, 0);
+        w64(interp_img + 0x40 + 24, 0);
+        w64(interp_img + 0x40 + 32, 0x200);
+        w64(interp_img + 0x40 + 40, 0x300);
+        w64(interp_img + 0x40 + 48, 0x1000);
+        for (i = 0x100; i < 0x200; i++) interp_img[i] = (uint8_t)(0x71 + (i % 157));
+
+        CHECK(elf64_find_interp(main_img, sizeof main_img, &ii) == 1 &&
+                  ii.path_len == (uint16_t)(sizeof path - 1) &&
+                  strcmp(ii.path, path) == 0,
+              "M2a: PT_INTERP is found and its path is copied verbatim");
+        CHECK(elf64_find_interp(interp_img, sizeof interp_img, &ii) == 0,
+              "M2a: a loader without PT_INTERP reports none");
+        {
+            static uint8_t dup[4096];
+            memcpy(dup, main_img, sizeof dup);
+            w16(dup + 0x38, 3);
+            w32(dup + 0xB0 + 0, 3);              /* second PT_INTERP */
+            w32(dup + 0xB0 + 4, PF_R);
+            w64(dup + 0xB0 + 8, 0x200);
+            w64(dup + 0xB0 + 32, sizeof path);
+            w64(dup + 0xB0 + 40, sizeof path);
+            CHECK(elf64_find_interp(dup, sizeof dup, &ii) == 0,
+                  "M2a: two PT_INTERP segments are refused");
+        }
+
+        pm = user_clone_page_table();
+        frames_before = (uint64_t)g_frame_count;
+        memset(&mi, 0, sizeof mi);
+        CHECK(elf64_map_blob(main_img, sizeof main_img,
+                             (uint64_t*)(uintptr_t)pm, 0, &mi) == 1 &&
+                  mi.entry == main_entry,
+              "M2a: the ET_EXEC main image maps at its linked address");
+        memset(&di, 0, sizeof di);
+        CHECK(elf64_map_dyn_at(interp_img, sizeof interp_img,
+                               (uint64_t*)(uintptr_t)pm, LINUX_INTERP_BASE,
+                               0, &di) == 1,
+              "M2a: the ET_DYN loader maps at LINUX_INTERP_BASE");
+        CHECK(di.entry == LINUX_INTERP_BASE + interp_entry,
+              "M2a: the loader entry is biased by its load base");
+        CHECK(di.load_lo == LINUX_INTERP_BASE &&
+                  di.load_hi == LINUX_INTERP_BASE + 0x1000,
+              "M2a: the loader's page span is the biased image span");
+        CHECK((uint64_t)g_frame_count - frames_before == 2,
+              "M2a: one frame for the main image and one for the loader");
+        for (i = 0x100; i < 0x200; i++) {
+            const uint8_t* got = host_ptr(LINUX_INTERP_BASE + i);
+            if (!got || *got != (uint8_t)(0x71 + (i % 157))) {
+                bytes_ok = 0;
+                break;
+            }
+        }
+        CHECK(bytes_ok, "M2a: the loader's bytes land at the biased vaddrs");
+        CHECK(elf64_map_dyn_at(main_img, sizeof main_img,
+                               (uint64_t*)(uintptr_t)pm, LINUX_INTERP_BASE,
+                               0, &di) == 0,
+              "M2a: elf64_map_dyn_at refuses an ET_EXEC");
+        CHECK(elf64_map_blob(interp_img, sizeof interp_img,
+                             (uint64_t*)(uintptr_t)pm, 0, &di) == 0,
+              "M2a: elf64_map_blob still refuses an ET_DYN");
+
+        /* The version-2 create: the parser must accept exactly one INTERP
+         * whose path equals the main image's PT_INTERP, and the child's
+         * initial RIP must be the loader, not the main entry. */
+        g_entropy_armed = 1;
+        build_dynamic_blob(&db, (uint64_t)(uintptr_t)main_img,
+                           sizeof main_img, (uint64_t)(uintptr_t)interp_img,
+                           sizeof interp_img, path);
+        CHECK(cap_create_sidecar_in_personality(100, db.data, db.len,
+                                    CAP_NONE, CAP_NONE, &dch, 0,
+                                    PROC_PERSONALITY_LINUX) == 0,
+              "M2a: the version-2 manifest creates a Linux child");
+        dc = newest_child();
+        CHECK(dc && dc->user_rip == LINUX_INTERP_BASE + interp_entry,
+              "M2a: the initial RIP is the interpreter entry, not e_entry");
+        CHECK(dc && read_stack_image(dc->user_rsp, &dstk),
+              "M2a: the dynamic child's stack image parses");
+        CHECK(aux_get(&dstk, LINUX_AT_BASE) == LINUX_INTERP_BASE,
+              "M2a: AT_BASE is LINUX_INTERP_BASE");
+        CHECK(aux_get(&dstk, LINUX_AT_ENTRY) == main_entry,
+              "M2a: AT_ENTRY remains the main image's e_entry");
     }
 
     /* Append one ARGENV record (§5.2's environment-crossing record) with

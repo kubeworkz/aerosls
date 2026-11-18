@@ -25,7 +25,7 @@ use crate::layout::{
 };
 use crate::newc;
 use aerosls_proto::manifest::{
-    Bootstrap, Budget, CapKind, Cpu, Image, Limits, Manifest, ManifestCap, build_manifest, crc32,
+    Bootstrap, Budget, CapKind, Cpu, Image, Limits, Manifest, ManifestCap, pack_manifest, crc32,
     HEADER_LEN,
 };
 
@@ -71,18 +71,12 @@ pub const ENTRY_PATHS: [&str; 13] = [
     crate::layout::LAYOUT_PATH,
 ];
 
-/// `build_manifest` + the 8-byte `image_kaddr` footer, with `total_len` and
-/// the body CRC patched to cover records + footer — exactly what the
+/// `pack_manifest` + the 8-byte `image_kaddr` footer, with `total_len` and
+/// the body CRC covering records + footer — exactly what the
 /// kernel's parser and image mapper expect (cap.c walks the records to find
 /// the footer offset, then reads `image_kaddr` from it).
 fn pack_with_footer(m: &Manifest<'_>, image_kaddr: u64) -> Vec<u8> {
-    let mut blob = build_manifest(m);
-    blob.extend_from_slice(&image_kaddr.to_le_bytes());
-    let total = blob.len() as u32;
-    blob[16..20].copy_from_slice(&total.to_le_bytes());
-    let crc = crc32(&blob[HEADER_LEN..]);
-    blob[20..24].copy_from_slice(&crc.to_le_bytes());
-    blob
+    pack_manifest(m, image_kaddr)
 }
 
 /// Build the init sidecar's packed manifest. Caps, in record order:
@@ -224,6 +218,7 @@ fn build_init_manifest(spec: &BootImageSpec, layout: &BootLayout, blob_offset: u
         }),
         flags_value: Some(0),
         argenv: None,
+        interp: None,
         signature: None,
     };
     pack_with_footer(&m, layout.init_image.phys)
@@ -302,6 +297,7 @@ fn build_dm_manifest(spec: &BootImageSpec, layout: &BootLayout, blob_offset: u32
         }),
         flags_value: Some(0),
         argenv: None,
+        interp: None,
         signature: None,
     };
     pack_with_footer(&m, layout.dm_image.phys)
@@ -421,6 +417,7 @@ fn build_posix_manifest(spec: &BootImageSpec, layout: &BootLayout, blob_offset: 
         }),
         flags_value: Some(0),
         argenv: None,
+        interp: None,
         signature: None,
     };
     pack_with_footer(&m, layout.posix_image.phys)
@@ -503,6 +500,7 @@ fn build_ramdisk_manifest(spec: &BootImageSpec, layout: &BootLayout, blob_offset
         }),
         flags_value: Some(0),
         argenv: None,
+        interp: None,
         signature: None,
     };
     pack_with_footer(&m, layout.ramdisk_image.phys)
@@ -578,6 +576,7 @@ fn build_net_manifest(spec: &BootImageSpec, layout: &BootLayout, blob_offset: u3
         }),
         flags_value: Some(0),
         argenv: None,
+        interp: None,
         signature: None,
     };
     pack_with_footer(&m, layout.net_image.phys)
@@ -768,7 +767,7 @@ fn layout_file_size() -> usize {
 mod tests {
     use super::*;
     use aerosls_proto::manifest::{
-        TAG_BUDGET, TAG_CAP_CHAN, TAG_CAP_MEM, TAG_IMAGE, TAG_NAME, parse_manifest,
+        TAG_BUDGET, TAG_CAP_CHAN, TAG_CAP_MEM, TAG_IMAGE, TAG_NAME, parse_manifest_packed,
     };
 
     fn le_u16(b: &[u8], i: usize) -> u16 {
@@ -888,7 +887,7 @@ mod tests {
         assert!(le_u32(bd, 8) >= 4096, "stack_bytes floor");
         // And the whole blob re-parses with the proto parser.
         let blob = b.archive_entry(ENTRY_PATHS[1]);
-        let m = parse_manifest(&blob).unwrap();
+        let m = parse_manifest_packed(&blob).unwrap();
         assert_eq!(m.name.unwrap(), INIT_MANIFEST_NAME);
     }
 
@@ -908,7 +907,7 @@ mod tests {
         assert!(bd.len() >= 16);
         assert_eq!(le_u64(bd, 0), spec().dm_heap_bytes);
         let blob = b.archive_entry(ENTRY_PATHS[3]);
-        let m = parse_manifest(&blob).unwrap();
+        let m = parse_manifest_packed(&blob).unwrap();
         assert_eq!(m.name.unwrap(), DM_MANIFEST_NAME);
     }
 
@@ -919,7 +918,7 @@ mod tests {
         // with exactly the driver binary's size.
         let b = built();
         let blob = b.archive_entry(ENTRY_PATHS[1]);
-        let m = parse_manifest(&blob).unwrap();
+        let m = parse_manifest_packed(&blob).unwrap();
         let cap = m.find_cap("e1000.image").expect("e1000.image cap");
         let (base, size) = match cap.kind {
             CapKind::Mem { base, size } => (base, size),
@@ -938,7 +937,7 @@ mod tests {
         // at the SAME address the DM's own manifest declares as its image.
         let b = built();
         let blob = b.archive_entry(ENTRY_PATHS[1]);
-        let m = parse_manifest(&blob).unwrap();
+        let m = parse_manifest_packed(&blob).unwrap();
         let cap = m.find_cap("dm.image").expect("dm.image cap");
         let (base, size) = match cap.kind {
             CapKind::Mem { base, size } => (base, size),
@@ -955,7 +954,7 @@ mod tests {
     fn budget_caps_match_layout_regions() {
         let b = built();
         let blob = b.archive_entry(ENTRY_PATHS[1]);
-        let m = parse_manifest(&blob).unwrap();
+        let m = parse_manifest_packed(&blob).unwrap();
         let (base, size) = match m.find_cap("budget").unwrap().kind {
             CapKind::Mem { base, size } => (base, size),
             _ => panic!(),
@@ -963,7 +962,7 @@ mod tests {
         assert_eq!((base, size), (b.layout.init_heap.phys, b.layout.init_heap.size));
 
         let dm_blob = b.archive_entry(ENTRY_PATHS[3]);
-        let dm = parse_manifest(&dm_blob).unwrap();
+        let dm = parse_manifest_packed(&dm_blob).unwrap();
         let (base, size) = match dm.find_cap("budget").unwrap().kind {
             CapKind::Mem { base, size } => (base, size),
             _ => panic!(),
@@ -975,7 +974,7 @@ mod tests {
     fn device_registry_cap_points_at_registry_region() {
         let b = built();
         let blob = b.archive_entry(ENTRY_PATHS[1]);
-        let m = parse_manifest(&blob).unwrap();
+        let m = parse_manifest_packed(&blob).unwrap();
         let (base, size) = match m.find_cap("device_registry").unwrap().kind {
             CapKind::Mem { base, size } => (base, size),
             _ => panic!(),
@@ -990,7 +989,7 @@ mod tests {
     fn console_channel_peer_is_the_kernel_service() {
         let b = built();
         let blob = b.archive_entry(ENTRY_PATHS[1]);
-        let m = parse_manifest(&blob).unwrap();
+        let m = parse_manifest_packed(&blob).unwrap();
         let cap = m.find_cap("console").unwrap();
         assert_eq!(cap.name, "console");
         match cap.kind {

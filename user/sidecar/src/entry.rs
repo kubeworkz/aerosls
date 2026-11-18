@@ -707,6 +707,45 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
             }
             Err(rc) => klog(b"[E7] firstuser: spawn FAILED rc=", rc as u32, b""),
         }
+
+        /* M2a: the sidecar-supplied musl interpreter. One system-POSIX
+         * child; the kernel maps the ET_EXEC hello plus the ET_DYN loader
+         * at LINUX_INTERP_BASE and enters the loader with AT_BASE set.
+         *
+         * ONE-SHOT PER BOOT: only this sidecar name's FIRST instance runs
+         * the demo. The boot generation is the kernel's boot-scoped
+         * per-(partition, name) counter, so it survives the POSIX teardown
+         * the E3 irqtest's driver-death phase causes and init's watchdog
+         * respawn reads 1 here. Without the guard the respawn re-runs the
+         * spawn with the task table already full and logs CAP_ETABLEFULL
+         * (-4) for a proof that had already passed. */
+        #[cfg(feature = "m2a_interp")]
+        if census_host {
+            let gen = crate::m2a_interp::boot_generation();
+            if gen != 0 {
+                klog(b"[M2A] one-shot skip gen=", gen, b"");
+            } else {
+                match crate::m2a_interp::spawn(
+                    &RealKernel, caps.budget_base, caps.budget_len) {
+                    Ok(sp) => match booted.proc.vfs.add_task() {
+                        Ok(vt) => {
+                            if crate::linux::track(
+                                sp.ch_r, sp.ch_w, crate::m2a_interp::M2A_NAME,
+                                0, sp.heap_base, sp.heap_limit, vt,
+                                RealKernel.sidecar_pid(crate::m2a_interp::M2A_NAME, 0) as u64,
+                                false,
+                            ) {
+                                klog(b"[M2A] hello: spawned ch_r=", sp.ch_r, b"");
+                            } else {
+                                klog(b"[M2A] hello: TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+                            }
+                        }
+                        Err(_) => klog(b"[M2A] hello: VFS task alloc FAILED ch_r=", sp.ch_r, b""),
+                    },
+                    Err(rc) => klog(b"[M2A] hello: spawn FAILED rc=", rc as u32, b""),
+                }
+            }
+        }
     }
 
     // M5.3: the ordinary-tenant checkpoint profile. It is the M4.6 fixture

@@ -38,6 +38,9 @@ FILES=(
     user/sidecar/src/e7_probe.rs
     user/sidecar/src/e7_candidate.rs
     user/sidecar/src/e7_firstuser.rs
+    user/sidecar/src/m2a_interp.rs
+    user/sidecar/fixtures/build_m2a.sh
+    user/sidecar/fixtures/m2a_hello.c
     user/proto/src/manifest.rs
     user/sidecar/fixtures/e7_linux_probe.S
     user/sidecar/fixtures/m1_net_probe.S
@@ -78,6 +81,10 @@ FILES=(
     user/sidecar/src/m5_catalog_probe.rs
     user/sidecar/src/m4_ckpt_probe.rs
     kernel/env_service.c
+    kernel/env_proto.h
+    kernel/env_migrate.c
+    net/http.c
+    user/shell.c
     tests/env_service_wait_host_test.c
     tests/m5_catalog_live_check.sh
     user/init/Cargo.toml
@@ -518,7 +525,7 @@ tooth mem-probe-marker-gone N8 "the probe's mem-block positive marker is gone" "
 # inverted gate refuses the only images the mapper exists for and admits
 # the ET_DYN it must never bias (§5.1).
 seed "$W/t42"
-sed -i 's/if (ehdr->e_type != ELF_ET_EXEC) {/if (ehdr->e_type == ELF_ET_EXEC) {/' "$W/t42/kernel/elf64_load.c"
+sed -i 's/if (!dynamic && ehdr->e_type != ELF_ET_EXEC) {/if (!dynamic \&\& ehdr->e_type == ELF_ET_EXEC) {/' "$W/t42/kernel/elf64_load.c"
 tooth elf-gate-inverted O1 "the ET_EXEC gate is inverted (ET_EXEC refused, everything else admitted)" "$W/t42"
 
 # O2: the magic dispatch deleted — every ELF falls into the flat mapper
@@ -607,7 +614,7 @@ tooth env-list-gone O7 "the shared LINUX_DEFAULT_ENV list is gone from linux.rs"
 # byte of a mid-page segment lands (p_vaddr & 0xFFF) early in vaddr space,
 # .init_array reads back 0x28, and the child dies at rip=0x28 before main.
 seed "$W/t53"
-sed -i 's/uint64_t page_base = s->p_vaddr & ~(uint64_t)4095u;/uint64_t page_base = s->p_vaddr;/' "$W/t53/kernel/elf64_load.c"
+sed -i 's/uint64_t page_base = vaddr & ~(uint64_t)4095u;/uint64_t page_base = vaddr;/' "$W/t53/kernel/elf64_load.c"
 tooth elf-midpage-shift O8 "the mapper anchors at the SEGMENT start again, so a mid-page LOAD lands (p_vaddr \& 0xFFF) bytes early" "$W/t53"
 
 # t54: the shared-page refusal dead-coded — a second LOAD covering a page
@@ -616,6 +623,24 @@ tooth elf-midpage-shift O8 "the mapper anchors at the SEGMENT start again, so a 
 seed "$W/t54"
 sed -i 's/if (a_lo < b_hi && b_lo < a_hi) {/if (0) {}/' "$W/t54/kernel/elf64_load.c"
 tooth elf-shared-page-no-refusal O8 "two LOADs sharing a page are no longer refused by name" "$W/t54"
+
+# ─── O9 tooth (increment 8, step 2: the two-image contract) ───────────────
+
+# t55: the interpreter base renamed out from under AT_BASE and the dynamic
+# mapper — a v2 manifest could still parse, but the loader would be mapped
+# at a base no consumer agrees on (or at zero), and the child would enter
+# e_entry instead of the loader.
+seed "$W/t55"
+sed -i 's/#define LINUX_INTERP_BASE/#define XINTERP_BASE/' "$W/t55/kernel/linux_abi.h"
+tooth interp-base-gone O9 "LINUX_INTERP_BASE disappeared from the ABI header" "$W/t55"
+
+# t56: the one-shot guard neutralised — the respawned POSIX sidecar re-runs
+# the M2a spawn after the E3 irqtest has filled the task table, and the log
+# carries CAP_ETABLEFULL (-4) for a proof that already passed.
+seed "$W/t56"
+sed -i 's/let gen = crate::m2a_interp::boot_generation();/let gen = 0u32;/' \
+    "$W/t56/user/sidecar/src/entry.rs"
+tooth m2a-oneshot-gone O9 "the M2a spawn site assumes the first boot instead of reading the boot generation" "$W/t56"
 
 # ─── Q teeth (the SSE gate: CR4.OSFXSR, its order, and the vector-7 chain) ─
 

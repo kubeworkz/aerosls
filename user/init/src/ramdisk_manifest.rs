@@ -8,7 +8,7 @@
 
 use aerosls_proto::manifest::{
     Bootstrap, Budget, CapKind, Cpu, Image, Limits, Manifest, ManifestCap,
-    build_manifest, crc32, HEADER_LEN,
+    pack_manifest,
 };
 use alloc::vec::Vec;
 
@@ -133,28 +133,24 @@ pub fn build_ramdisk_manifest_named(
         }),
         flags_value: Some(0),
         argenv: None,
+        interp: None,
         signature: None,
     };
 
-    let mut blob = build_manifest(&m);
-    blob.extend_from_slice(&image_kaddr.to_le_bytes());
-    let total = blob.len() as u32;
-    blob[16..20].copy_from_slice(&total.to_le_bytes());
-    let crc = crc32(&blob[HEADER_LEN..]);
-    blob[20..24].copy_from_slice(&crc.to_le_bytes());
+    let blob = pack_manifest(&m, image_kaddr);
     blob
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aerosls_proto::manifest::parse_manifest;
+    use aerosls_proto::manifest::parse_manifest_packed;
 
     #[test]
     fn default_builder_uses_the_default_name() {
         let blob = build_ramdisk_manifest(0x3000_0000, 0x8000, 0x3080_0000,
                                           0x3090_0000, 16 * 1024 * 1024);
-        let m = parse_manifest(&blob).unwrap();
+        let m = parse_manifest_packed(&blob).unwrap();
         assert_eq!(m.name, Some(RAMDISK_MANIFEST_NAME));
     }
 
@@ -165,7 +161,7 @@ mod tests {
         let blob = build_ramdisk_manifest_named(
             "drv.ramdisk.1", 0x3000_0000, 0x8000,
             0x4080_0000, 0x4090_0000, 16 * 1024 * 1024, 0x3);
-        let m = parse_manifest(&blob).unwrap();
+        let m = parse_manifest_packed(&blob).unwrap();
         assert_eq!(m.name, Some("drv.ramdisk.1"));
         assert_eq!(m.n_caps, 3);
         // storage cap carries this instance's private base, writable (R|W)

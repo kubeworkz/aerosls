@@ -3544,40 +3544,42 @@ static int cap_create_sidecar_in_personality_owned(uint32_t parent_pid,
                                  i, hdr->magic[i], SIDECAR_MANIFEST_MAGIC[i]);
             return CAP_EINVAL;
         }
-    if (hdr->version_major != SIDECAR_MANIFEST_VERSION_MAJOR) {
+    if (hdr->version_major < SIDECAR_MANIFEST_VERSION_MAJOR ||
+        hdr->version_major > SIDECAR_MANIFEST_VERSION_MAX) {
         kernel_serial_printf("[CS] CAP_EINVAL version=%u want %u\n",
                              hdr->version_major,
-                             SIDECAR_MANIFEST_VERSION_MAJOR);
+                             SIDECAR_MANIFEST_VERSION_MAX);
         return CAP_EINVAL;
     }
-    if (hdr->total_len > manifest_len) {
+    if (hdr->total_len != manifest_len ||
+        hdr->total_len < SIDECAR_MANIFEST_HEADER_LEN + 8u) {
         kernel_serial_printf("[CS] CAP_ERANGE total_len=%u manifest_len=%u\n",
                              hdr->total_len, manifest_len);
         return CAP_ERANGE;
     }
 
-    /* CRC-32 over the record body (bytes after header, including any
-     * appended BlobFooter with image_kaddr). */
-    uint32_t body_len = manifest_len - SIDECAR_MANIFEST_HEADER_LEN;
-    if (body_len > 0) {
-        uint32_t crc = cap_sidecar_crc32(blob + SIDECAR_MANIFEST_HEADER_LEN,
-                                         body_len);
-        if (crc != hdr->body_crc32) {
-            kernel_serial_printf("[CS] CAP_EINVAL crc mismatch: got 0x%08x want 0x%08x len=%u\n",
-                                 crc, hdr->body_crc32, manifest_len);
-            return CAP_EINVAL;  /* corrupted manifest */
-        }
+    /* CRC-32 over records + the 8-byte footer. `total_len` is the whole
+     * blob; there are no trailing bytes outside it. */
+    uint32_t body_len = hdr->total_len - SIDECAR_MANIFEST_HEADER_LEN;
+    uint32_t crc = cap_sidecar_crc32(blob + SIDECAR_MANIFEST_HEADER_LEN,
+                                     body_len);
+    if (crc != hdr->body_crc32) {
+        kernel_serial_printf("[CS] CAP_EINVAL crc mismatch: got 0x%08x want 0x%08x len=%u\n",
+                             crc, hdr->body_crc32, manifest_len);
+        return CAP_EINVAL;  /* corrupted manifest */
     }
 
     /* Caps (≤16) + the fixed records (personality, name, image, budget,
-     * cpu, limits, bootstrap, flags, argenv, signature = 10) + slack. */
-    if (hdr->record_count > SIDECAR_MANIFEST_MAX_CAPS + 10)
+     * cpu, limits, bootstrap, flags, argenv, signature, interp = 11). */
+    if (hdr->record_count >
+        SIDECAR_MANIFEST_MAX_CAPS + SIDECAR_MANIFEST_FIXED_RECORDS)
         return CAP_ERANGE;
 
     /* ── 2. Parse TLV records ────────────────────────────────────────── */
     struct SidecarManifest m;
     for (uint32_t i = 0; i < (uint32_t)(sizeof(m)); i++)
         ((uint8_t*)&m)[i] = 0;
+    m.version_major = hdr->version_major;
     m.record_count = hdr->record_count;
     /* Increment 19: the header's flags word survives the parse. Bit 0 is
      * the parser's tolerate-unknown-records switch (below); bit 1 is the
@@ -3749,6 +3751,42 @@ static int cap_create_sidecar_in_personality_owned(uint32_t parent_pid,
             m.n_caps++;
             break;
         }
+        case SIDECAR_TAG_INTERP: {
+            /* image_size u32, reserved u32, image_kaddr u64, path_len u16,
+             * reserved u16, path[path_len]. The path is validation-only:
+             * this parser never opens it. Exactly one record is required
+             * for a version-2 manifest and forbidden in version 1. */
+            if (m.interp_count != 0) return CAP_EINVAL;
+            if (rlen < 20) return CAP_EINVAL;
+            uint32_t isz  = (uint32_t)(rp[0] | (rp[1] << 8) |
+                                       (rp[2] << 16) | (rp[3] << 24));
+            uint32_t res  = (uint32_t)(rp[4] | (rp[5] << 8) |
+                                       (rp[6] << 16) | (rp[7] << 24));
+            uint64_t ik   = *(const uint64_t*)(rp + 8);
+            uint16_t plen = *(const uint16_t*)(rp + 16);
+            uint16_t res2 = *(const uint16_t*)(rp + 18);
+            if (plen == 0 ||
+                rlen != (uint16_t)(20u + plen)) return CAP_EINVAL;
+            if (res != 0 || res2 != 0 || isz == 0 ||
+                ik < 0x100000ULL || (ik & 0xFFFULL) != 0) {
+                return CAP_EINVAL;
+            }
+            if (ik + (uint64_t)isz < ik) return CAP_EINVAL;
+            if (plen >= SIDECAR_MANIFEST_MAX_INTERP_PATH ||
+                rp[20] != '/') {
+                return CAP_EINVAL;
+            }
+            for (uint16_t j = 0; j < plen; j++)
+                if (rp[20 + j] == 0) return CAP_EINVAL;
+            for (uint16_t j = 0; j < plen; j++)
+                m.interp_path[j] = (char)rp[20 + j];
+            m.interp_path[plen] = '\0';
+            m.interp_path_len = plen;
+            m.interp_image_size = isz;
+            m.interp_image_kaddr = ik;
+            m.interp_count = 1;
+            break;
+        }
         case SIDECAR_TAG_ARGENV: {
             /* §5.2's environment-crossing record (matches
              * user/proto/src/manifest.rs TAG_ARGENV): argc u16, envc u16,
@@ -3823,6 +3861,32 @@ static int cap_create_sidecar_in_personality_owned(uint32_t parent_pid,
     }
 
     /* ── 3. Validate parsed manifest ─────────────────────────────────── */
+    /* The footer is exactly the last 8 bytes, immediately after the last
+     * record. No slack, no trailing bytes: the CRC already covered it. */
+    if (off + 8u != hdr->total_len) return CAP_EINVAL;
+    m.image_kaddr = *(const uint64_t*)(blob + off);
+    if (m.image_kaddr < 0x100000ULL || (m.image_kaddr & 0xFFFULL) != 0)
+        return CAP_EINVAL;
+
+    if (hdr->version_major == 1 && m.interp_count != 0) return CAP_EINVAL;
+    if (hdr->version_major == 2) {
+        if ((hdr->flags & 0x0001u) != 0) return CAP_EINVAL;
+        if (m.interp_count != 1) return CAP_EINVAL;
+        if (m.interp_image_kaddr + (uint64_t)m.interp_image_size <
+            m.interp_image_kaddr) return CAP_EINVAL;
+        if (m.image_kaddr + (uint64_t)m.image_size < m.image_kaddr)
+            return CAP_EINVAL;
+        /* The interpreter lives beside the main image, never inside it.
+         * `interp_kaddr` remains a physical-image trust under
+         * sidecar_authority; this check is range/overlap only, not a claim
+         * that the caller owns the frames. */
+        if (m.image_kaddr < m.interp_image_kaddr +
+                               (uint64_t)m.interp_image_size &&
+            m.interp_image_kaddr < m.image_kaddr +
+                                   (uint64_t)m.image_size) {
+            return CAP_EINVAL;
+        }
+    }
     if (m.image_size == 0) {
         kernel_serial_printf("[CS] CAP_EINVAL image_size==0 (records=%u)\n",
                              m.record_count);
@@ -3947,25 +4011,8 @@ static int cap_create_sidecar_in_personality_owned(uint32_t parent_pid,
     if (!new_cr3) return CAP_ENOMEM;
     uint64_t* pml4 = (uint64_t*)(uintptr_t)new_cr3;
 
-    /* Image physical address: stored in the blob's BlobFooter (appended
-     * after all TLV records by the image packer). The IMAGE record's
-     * blob_offset field is repurposed as image_kaddr when the blob is a
-     * flat image+manifest package. */
-    uint32_t footer_off = SIDECAR_MANIFEST_HEADER_LEN;
-    for (uint16_t rec = 0; rec < hdr->record_count; rec++) {
-        if (footer_off + 4 > hdr->total_len) break;
-        uint16_t rlen = *(const uint16_t*)(blob + footer_off + 2);
-        footer_off += 4 + rlen;
-    }
-    uint64_t image_kaddr = 0;
-    if (footer_off + 8 <= hdr->total_len)
-        image_kaddr = *(const uint64_t*)(blob + footer_off);
-
-    if (!image_kaddr || image_kaddr < 0x100000ULL) {
-        kernel_serial_printf("[SIDECAR] create: invalid image_kaddr 0x%llx\n",
-                             (unsigned long long)image_kaddr);
-        return CAP_EINVAL;
-    }
+    /* Image physical address: the exact packed footer validated in step 3. */
+    uint64_t image_kaddr = m.image_kaddr;
 
     uint32_t n_img_pages = (m.image_size + 4095) / 4096;
     uint64_t image_vbase = 0x400000000000ULL;  /* USER_PROC_CODE_BASE */
@@ -3979,10 +4026,51 @@ static int cap_create_sidecar_in_personality_owned(uint32_t parent_pid,
      * native sidecar path keeps its flat mapper byte for byte, and the
      * branch below is the ONLY place the two diverge). */
     int image_is_elf = 0;
+    int image_is_dynamic = hdr->version_major == 2;
     struct Elf64MapInfo elfinfo;
+    struct Elf64MapInfo interpinfo;
     uint64_t elf_entry = 0;
+    uint64_t interp_entry = 0;
     image_is_elf = elf_blob_has_magic(
         (const uint8_t*)(uintptr_t)image_kaddr, m.image_size);
+    if (image_is_dynamic) {
+        struct Elf64InterpInfo main_interp;
+        uint16_t j;
+        if (personality != PROC_PERSONALITY_LINUX) {
+            kernel_serial_printf(
+                "[CS] CAP_EINVAL: version-2 dynamic manifest requires the "
+                "Linux personality (pid parent=%u)\n", parent_pid);
+            user_destroy_page_table(new_cr3);
+            return CAP_EINVAL;
+        }
+        if (!image_is_elf ||
+            !elf64_find_interp((const uint8_t*)(uintptr_t)image_kaddr,
+                               m.image_size, &main_interp)) {
+            kernel_serial_printf(
+                "[CS] CAP_EINVAL: dynamic main image has no valid "
+                "PT_INTERP\n");
+            user_destroy_page_table(new_cr3);
+            return CAP_EINVAL;
+        }
+        if (main_interp.path_len != m.interp_path_len) {
+            kernel_serial_printf(
+                "[CS] CAP_EINVAL: PT_INTERP path length %u != manifest "
+                "INTERP path length %u\n",
+                (unsigned)main_interp.path_len,
+                (unsigned)m.interp_path_len);
+            user_destroy_page_table(new_cr3);
+            return CAP_EINVAL;
+        }
+        for (j = 0; j < m.interp_path_len; j++) {
+            if (main_interp.path[j] != m.interp_path[j]) {
+                kernel_serial_printf(
+                    "[CS] CAP_EINVAL: PT_INTERP path != manifest INTERP "
+                    "path\n");
+                user_destroy_page_table(new_cr3);
+                return CAP_EINVAL;
+            }
+        }
+    }
     if (image_is_elf) {
         if (!elf64_map_blob((const uint8_t*)(uintptr_t)image_kaddr,
                             m.image_size, pml4, child_partition, &elfinfo)) {
@@ -4021,6 +4109,28 @@ static int cap_create_sidecar_in_personality_owned(uint32_t parent_pid,
 
         bytes_left -= chunk;
     }
+    }
+
+    if (image_is_dynamic) {
+        if (!elf64_map_dyn_at(
+                (const uint8_t*)(uintptr_t)m.interp_image_kaddr,
+                m.interp_image_size, pml4, LINUX_INTERP_BASE,
+                child_partition, &interpinfo)) {
+            kernel_serial_printf(
+                "[CS] CAP_EINVAL: interpreter image refused (kaddr=0x%llx "
+                "size=%u)\n",
+                (unsigned long long)m.interp_image_kaddr,
+                m.interp_image_size);
+            user_destroy_page_table(new_cr3);
+            return CAP_EINVAL;
+        }
+        interp_entry = interpinfo.entry;
+        kernel_serial_printf(
+            "[CS] dynamic image: main entry=0x%llx interp base=0x%llx "
+            "entry=0x%llx path='%s'\n",
+            (unsigned long long)elf_entry,
+            (unsigned long long)LINUX_INTERP_BASE,
+            (unsigned long long)interp_entry, m.interp_path);
     }
 
     /* ── 6. User stack ───────────────────────────────────────────────── */
@@ -4138,6 +4248,12 @@ static int cap_create_sidecar_in_personality_owned(uint32_t parent_pid,
         if (image_is_elf) {
             pd->linux_image_lo = elfinfo.load_lo;
             pd->linux_image_hi = elfinfo.load_hi;
+            if (image_is_dynamic) {
+                if (interpinfo.load_lo < pd->linux_image_lo)
+                    pd->linux_image_lo = interpinfo.load_lo;
+                if (interpinfo.load_hi > pd->linux_image_hi)
+                    pd->linux_image_hi = interpinfo.load_hi;
+            }
         }
         /* E7 increment 16: the anonymous-map cursor is born at the
          * span's top — the sidecar ledger's mtop is the policy twin —
@@ -4160,7 +4276,8 @@ static int cap_create_sidecar_in_personality_owned(uint32_t parent_pid,
     pd->cr3        = new_cr3;
     /* E7 increment 7 (§5.1): an ELF image enters at its e_entry — an
      * absolute linked address — not the flat mapper's base+offset. */
-    pd->user_rip   = image_is_elf ? elf_entry : image_vbase + m.image_entry;
+    pd->user_rip   = image_is_dynamic ? interp_entry
+                   : (image_is_elf ? elf_entry : image_vbase + m.image_entry);
     pd->user_rsp   = user_rsp;
     /* ── E7 increment 7 (§5.2): the Linux child's initial stack image ────
      * A static libc start-up reads argc/argv/envp/auxv off %rsp before it
@@ -4238,7 +4355,8 @@ static int cap_create_sidecar_in_personality_owned(uint32_t parent_pid,
             pd->cr3 = 0;
             return CAP_ECONFLICT;
         }
-        sp.entry_vaddr = pd->user_rip;
+        sp.entry_vaddr = image_is_elf ? elf_entry : image_vbase + m.image_entry;
+        sp.at_base      = image_is_dynamic ? LINUX_INTERP_BASE : 0;
         sp.phdr_vaddr  = image_is_elf ? elfinfo.phdr_vaddr : 0;
         sp.phent       = image_is_elf ? elfinfo.phent : LINUX_ELF64_PHENT;
         sp.phnum       = image_is_elf ? elfinfo.phnum : 0;

@@ -8,6 +8,9 @@
 # include_bytes!s it, the cap host test reads it at boot-check time):
 # keep the one file the build script regenerates trackable.
 !user/sidecar/fixtures/e7_candidate.elf
+# M2a's dynamically linked hello is likewise committed: the sidecar
+# include_bytes!s it, and build_m2a.sh regenerates it from m2a_hello.c.
+!user/sidecar/fixtures/m2a_hello.elf
 *.so
 *.a
 # POSIX-Environments E3 boot image (init built with e3_envs). The shipped

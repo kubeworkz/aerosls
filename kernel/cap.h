@@ -926,7 +926,12 @@ void cap_unlock(struct CapSpinlock* l);
 
 /* Manifest record tags */
 #define SIDECAR_MANIFEST_MAGIC         "AERSLSM1"
+/* Static manifests remain version 1. Version 2 is the dynamic form: it
+ * requires exactly one INTERP record and understands the packed footer's
+ * interpreter image. The kernel accepts both; old v1 kernels reject v2 at
+ * the version check before parsing any record. */
 #define SIDECAR_MANIFEST_VERSION_MAJOR 1
+#define SIDECAR_MANIFEST_VERSION_MAX   2
 #define SIDECAR_MANIFEST_HEADER_LEN    24
 
 #define SIDECAR_TAG_PERSONALITY  0x0001
@@ -949,9 +954,17 @@ void cap_unlock(struct CapSpinlock* l);
  * record is the v1 answer (argv = { name }, an empty environment), so
  * every manifest built before the record existed keeps running. */
 #define SIDECAR_TAG_ARGENV       0x000E
+/* M2a dynamic-loader record: image_size u32, reserved u32, image_kaddr u64,
+ * path_len u16, reserved u16, path[path_len]. The path is validation-only;
+ * the kernel never opens or resolves it. */
+#define SIDECAR_TAG_INTERP       0x000F
 
 #define SIDECAR_MANIFEST_MAX_CAPS  16
 #define SIDECAR_MANIFEST_MAX_NAME  64
+#define SIDECAR_MANIFEST_MAX_INTERP_PATH 128
+/* caps + personality, name, image, budget, cpu, limits, bootstrap, flags,
+ * argenv, signature, interp = 11 fixed records. */
+#define SIDECAR_MANIFEST_FIXED_RECORDS 11
 
 /* ── ARGENV record bounds (§5.2) ─────────────────────────────────────────
  * The record's strings are copied into a FIXED arena on the create's
@@ -1004,6 +1017,7 @@ struct SidecarCap {
 
 /* Parsed sidecar manifest (stack-allocated, no heap). */
 struct SidecarManifest {
+    uint16_t version_major;
     uint16_t flags;
     uint16_t record_count;
     /* NAME record (sidecar identity) */
@@ -1012,6 +1026,14 @@ struct SidecarManifest {
     /* IMAGE record */
     uint64_t image_entry;       /* entry point offset */
     uint32_t image_size;        /* image size in bytes */
+    /* Packed footer: physical address of the main image. */
+    uint64_t image_kaddr;
+    /* Version-2 INTERP record (validated only; never opened). */
+    uint16_t interp_count;
+    uint32_t interp_image_size;
+    uint64_t interp_image_kaddr;
+    uint16_t interp_path_len;
+    char     interp_path[SIDECAR_MANIFEST_MAX_INTERP_PATH];
     /* BUDGET record */
     uint64_t budget_mem_bytes;
     uint32_t budget_stack_bytes;

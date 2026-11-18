@@ -1151,6 +1151,12 @@ SIDECAR_SLOW_BOOT = $(if $(filter 1,$(E7_SLOW_BOOT)),--features aerosls-sidecar/
 # module and spawn call; an unset knob compiles both out.
 M1_NET_PROBE ?=
 SIDECAR_M1_NET_PROBE = $(if $(filter 1,$(M1_NET_PROBE)),--features aerosls-sidecar/m1_net_probe)
+# M2a's live dynamic musl proof: a sidecar-supplied interpreter image and a
+# dynamically linked ET_EXEC hello. `make x86-iso-e3 M2A_INTERP=1` compiles
+# the module and its two fixtures into the POSIX sidecar; unset compiles
+# both out.
+M2A_INTERP ?=
+SIDECAR_M2A_INTERP = $(if $(filter 1,$(M2A_INTERP)),--features aerosls-sidecar/m2a_interp)
 # M4.2's live clone probe: a build-time feature, never in a shipped image.
 # `make x86-iso-e3 M4_THREAD_PROBE=1` builds the initial POSIX sidecar with
 # the raw clone fixture and its spawn call; an unset knob compiles both out.
@@ -1269,7 +1275,7 @@ selfhost-bootimage:
 	@# aerosls-bootimage directly; a stamp is only for an archive this target
 	@# built.) tests/sidecar_stamp_check.sh clause G holds this line.
 	@$(CARGO) build --quiet --manifest-path user/Cargo.toml -p aerosls-dm -p aerosls-sidecar -p aerosls-ramdisk -p aerosls-network -p aerosls-e1000-driver \
-		--features target $(SIDECAR_SLOW_BOOT) $(SIDECAR_M1_NET_PROBE) $(SIDECAR_M4_THREAD_PROBE) $(SIDECAR_M4_GROUP_PROBE) $(SIDECAR_M4_FUTEX_PROBE) $(SIDECAR_M4_EXIT_PROBE) $(SIDECAR_M4_CKPT_PROBE) $(SIDECAR_M4_RUNTIME_PROBE) $(SIDECAR_M4_HARDENING_PROBE) $(SIDECAR_M4_STD_THREAD_PROBE) $(SIDECAR_M5_CATALOG_PROBE) $(SIDECAR_M5_TENANT_CKPT) --target x86_64-unknown-none --release \
+		--features target $(SIDECAR_SLOW_BOOT) $(SIDECAR_M1_NET_PROBE) $(SIDECAR_M2A_INTERP) $(SIDECAR_M4_THREAD_PROBE) $(SIDECAR_M4_GROUP_PROBE) $(SIDECAR_M4_FUTEX_PROBE) $(SIDECAR_M4_EXIT_PROBE) $(SIDECAR_M4_CKPT_PROBE) $(SIDECAR_M4_RUNTIME_PROBE) $(SIDECAR_M4_HARDENING_PROBE) $(SIDECAR_M4_STD_THREAD_PROBE) $(SIDECAR_M5_CATALOG_PROBE) $(SIDECAR_M5_TENANT_CKPT) --target x86_64-unknown-none --release \
 		--bin dm --bin posix --bin ramdisk --bin network --bin e1000_driver \
 		|| { echo "[SELFHOST] REFUSING to pack and stamp: the sidecars did not build for x86_64-unknown-none." >&2; \
 		     echo "           The stamp attests the packed binaries, and reusing existing ones would make it a lie." >&2; \

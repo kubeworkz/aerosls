@@ -65,6 +65,8 @@ pub mod catalog_client;
 pub mod e7_candidate;
 pub mod e7_firstuser;
 pub mod e7_probe;
+#[cfg(feature = "m2a_interp")]
+pub mod m2a_interp;
 pub mod heap;
 pub mod linux;
 #[cfg(feature = "m1_net_probe")]

@@ -59,8 +59,9 @@ int elf_blob_has_magic(const uint8_t* data, uint64_t size)
            data[2] == ELF_MAGIC2 && data[3] == ELF_MAGIC3;
 }
 
-int elf64_map_blob(const uint8_t* data, uint64_t size, uint64_t* pml4,
-                   uint32_t partition_id, struct Elf64MapInfo* info)
+static int elf64_map_at(const uint8_t* data, uint64_t size, uint64_t* pml4,
+                        uint32_t partition_id, uint64_t load_base,
+                        int dynamic, struct Elf64MapInfo* info)
 {
     const struct ELF64Header* ehdr;
     const struct ELF64ProgramHeader* phdr;
@@ -71,7 +72,7 @@ int elf64_map_blob(const uint8_t* data, uint64_t size, uint64_t* pml4,
      * checkpoint's page walk cannot re-derive it from a vaddr alone (a
      * linked 0x400000 image sits inside the child's shared identity map, so
      * "mapped" is not "this image's"). */
-    uint64_t load_lo = 0, load_hi = 0;
+    uint64_t load_lo = 0, load_hi = 0, bias = 0;
     uint16_t ph;
 
     if (!data || !pml4 || !info) return 0;
@@ -88,14 +89,19 @@ int elf64_map_blob(const uint8_t* data, uint64_t size, uint64_t* pml4,
         kernel_serial_print("[ELF] refuse: not an ELF64 image\n");
         return 0;
     }
-    if (ehdr->e_type == ELF_ET_DYN) {
+    if (!dynamic && ehdr->e_type == ELF_ET_DYN) {
         kernel_serial_print(
             "[ELF] refuse: ET_DYN (PIE) — §5.1's image contract: this "
             "mapper applies no load bias, so a PIE image cannot run here "
             "(build non-PIE)\n");
         return 0;
     }
-    if (ehdr->e_type != ELF_ET_EXEC) {
+    if (dynamic && ehdr->e_type != ELF_ET_DYN) {
+        kernel_serial_printf("[ELF] refuse: dynamic map requires ET_DYN, "
+                             "e_type %u\n", (unsigned)ehdr->e_type);
+        return 0;
+    }
+    if (!dynamic && ehdr->e_type != ELF_ET_EXEC) {
         kernel_serial_printf("[ELF] refuse: e_type %u is neither ET_EXEC "
                              "nor ET_DYN\n", (unsigned)ehdr->e_type);
         return 0;
@@ -118,6 +124,33 @@ int elf64_map_blob(const uint8_t* data, uint64_t size, uint64_t* pml4,
         return 0;
     }
     phdr = (const struct ELF64ProgramHeader*)(const void*)(data + ehdr->e_phoff);
+
+    if (dynamic) {
+        uint64_t min_vaddr = 0;
+        int have_load = 0;
+        if (load_base == 0 || (load_base & 0xFFFULL) != 0 ||
+            !linux_fs_addr_is_user_canonical(load_base)) {
+            kernel_serial_print("[ELF] refuse: invalid dynamic load base\n");
+            return 0;
+        }
+        for (ph = 0; ph < ehdr->e_phnum; ph++) {
+            const struct ELF64ProgramHeader* s = &phdr[ph];
+            if (s->p_type != PT_LOAD || s->p_filesz == 0) continue;
+            if (!have_load || s->p_vaddr < min_vaddr) min_vaddr = s->p_vaddr;
+            have_load = 1;
+        }
+        if (!have_load) {
+            kernel_serial_print("[ELF] refuse: dynamic image has no LOAD\n");
+            return 0;
+        }
+        min_vaddr &= ~(uint64_t)4095u;
+        if (load_base < min_vaddr) {
+            kernel_serial_print("[ELF] refuse: load base below image's "
+                                "linked vaddr\n");
+            return 0;
+        }
+        bias = load_base - min_vaddr;
+    }
 
     /* Every LOAD checked first; only then does anything get mapped. */
     for (ph = 0; ph < ehdr->e_phnum; ph++) {
@@ -143,14 +176,15 @@ int elf64_map_blob(const uint8_t* data, uint64_t size, uint64_t* pml4,
          * refused through the one bound every other user-address filter
          * in this tree uses (§5.3, the write plan). Overflow-safe: the
          * (end - 1) form, same as linux_fd_write_plan's span check. */
-        if (s->p_vaddr + s->p_memsz < s->p_vaddr ||
-            !linux_fs_addr_is_user_canonical(s->p_vaddr) ||
-            (s->p_vaddr + s->p_memsz - 1) > LINUX_USER_ADDR_MAX) {
+        uint64_t vaddr = s->p_vaddr + bias;
+        if (vaddr < s->p_vaddr || vaddr + s->p_memsz < vaddr ||
+            !linux_fs_addr_is_user_canonical(vaddr) ||
+            (vaddr + s->p_memsz - 1) > LINUX_USER_ADDR_MAX) {
             kernel_serial_printf(
                 "[ELF] refuse: LOAD %u vaddr 0x%llx..0x%llx is not user-"
                 "canonical\n", (unsigned)ph,
-                (unsigned long long)s->p_vaddr,
-                (unsigned long long)(s->p_vaddr + s->p_memsz));
+                (unsigned long long)vaddr,
+                (unsigned long long)(vaddr + s->p_memsz));
             return 0;
         }
         /* E7 increment 20: widen the image's own page span. Rounded OUTWARD
@@ -158,8 +192,8 @@ int elf64_map_blob(const uint8_t* data, uint64_t size, uint64_t* pml4,
          * pages a LOAD can install (a non-aligned LOAD reaches back into its
          * first page, elf64_map_blob's alignment rule above). */
         {
-            uint64_t lo = s->p_vaddr & ~(uint64_t)4095u;
-            uint64_t hi = (s->p_vaddr + s->p_memsz + 4095u) & ~(uint64_t)4095u;
+            uint64_t lo = vaddr & ~(uint64_t)4095u;
+            uint64_t hi = (vaddr + s->p_memsz + 4095u) & ~(uint64_t)4095u;
             if (load_lo == 0 || lo < load_lo) load_lo = lo;
             if (hi > load_hi) load_hi = hi;
         }
@@ -167,7 +201,7 @@ int elf64_map_blob(const uint8_t* data, uint64_t size, uint64_t* pml4,
         if (phdr_vaddr == 0 &&
             ehdr->e_phoff >= s->p_offset &&
             ehdr->e_phoff + ph_bytes <= s->p_offset + s->p_filesz) {
-            phdr_vaddr = s->p_vaddr + (ehdr->e_phoff - s->p_offset);
+            phdr_vaddr = vaddr + (ehdr->e_phoff - s->p_offset);
         }
     }
 
@@ -181,26 +215,28 @@ int elf64_map_blob(const uint8_t* data, uint64_t size, uint64_t* pml4,
      * like every other gate above. */
     for (ph = 0; ph < ehdr->e_phnum; ph++) {
         const struct ELF64ProgramHeader* a = &phdr[ph];
-        uint64_t a_lo, a_hi;
+        uint64_t a_vaddr, a_lo, a_hi;
         uint16_t q;
         if (a->p_type != PT_LOAD) continue;
         if (a->p_filesz == 0) continue;
-        a_lo = a->p_vaddr & ~(uint64_t)4095u;
-        a_hi = (a->p_vaddr + a->p_memsz + 4095) & ~(uint64_t)4095u;
+        a_vaddr = a->p_vaddr + bias;
+        a_lo = a_vaddr & ~(uint64_t)4095u;
+        a_hi = (a_vaddr + a->p_memsz + 4095) & ~(uint64_t)4095u;
         for (q = (uint16_t)(ph + 1); q < ehdr->e_phnum; q++) {
             const struct ELF64ProgramHeader* b = &phdr[q];
-            uint64_t b_lo, b_hi;
+            uint64_t b_vaddr, b_lo, b_hi;
             if (b->p_type != PT_LOAD) continue;
             if (b->p_filesz == 0) continue;
-            b_lo = b->p_vaddr & ~(uint64_t)4095u;
-            b_hi = (b->p_vaddr + b->p_memsz + 4095) & ~(uint64_t)4095u;
+            b_vaddr = b->p_vaddr + bias;
+            b_lo = b_vaddr & ~(uint64_t)4095u;
+            b_hi = (b_vaddr + b->p_memsz + 4095) & ~(uint64_t)4095u;
             if (a_lo < b_hi && b_lo < a_hi) {
                 kernel_serial_printf(
                     "[ELF] refuse: LOAD %u (vaddr 0x%llx) and LOAD %u "
                     "(vaddr 0x%llx) share a page — one frame per page "
                     "cannot hold both\n",
-                    (unsigned)ph, (unsigned long long)a->p_vaddr,
-                    (unsigned)q, (unsigned long long)b->p_vaddr);
+                    (unsigned)ph, (unsigned long long)a_vaddr,
+                    (unsigned)q, (unsigned long long)b_vaddr);
                 return 0;
             }
         }
@@ -209,10 +245,11 @@ int elf64_map_blob(const uint8_t* data, uint64_t size, uint64_t* pml4,
     /* ── map: the original loop, now only reachable past every check ── */
     for (ph = 0; ph < ehdr->e_phnum; ph++) {
         const struct ELF64ProgramHeader* s = &phdr[ph];
-        uint64_t n_pages, p;
+        uint64_t n_pages, p, vaddr;
 
         if (s->p_type != PT_LOAD) continue;
         if (s->p_filesz == 0) continue;
+        vaddr = s->p_vaddr + bias;
 
         {
             /* A PT_LOAD's p_vaddr is NOT required to be page-aligned (the
@@ -230,8 +267,8 @@ int elf64_map_blob(const uint8_t* data, uint64_t size, uint64_t* pml4,
              * aligned segment both reduce to the arithmetic this loop
              * always did — which is why increment 7's census never saw
              * this, and why the aligned images' load is unchanged. */
-            uint64_t page_base = s->p_vaddr & ~(uint64_t)4095u;
-            uint64_t lead      = s->p_vaddr - page_base;
+            uint64_t page_base = vaddr & ~(uint64_t)4095u;
+            uint64_t lead      = vaddr - page_base;
 
             n_pages = (lead + s->p_memsz + 4095) / 4096;
 
@@ -256,7 +293,7 @@ int elf64_map_blob(const uint8_t* data, uint64_t size, uint64_t* pml4,
             kernel_serial_printf(
                 "[LOADER] ELF segment: vaddr=0x%016llx  filesz=%llu  "
                 "memsz=%llu  flags=%c%c%c\n",
-                (unsigned long long)s->p_vaddr,
+                (unsigned long long)vaddr,
                 (unsigned long long)s->p_filesz,
                 (unsigned long long)s->p_memsz,
                 (s->p_flags & PF_R) ? 'R' : '-',
@@ -269,7 +306,7 @@ int elf64_map_blob(const uint8_t* data, uint64_t size, uint64_t* pml4,
                 kernel_serial_printf(
                     "[LOADER] segment vaddr 0x%llx is 0x%llx into its page; "
                     "frames anchored at 0x%llx\n",
-                    (unsigned long long)s->p_vaddr,
+                    (unsigned long long)vaddr,
                     (unsigned long long)lead,
                     (unsigned long long)page_base);
             }
@@ -282,10 +319,10 @@ int elf64_map_blob(const uint8_t* data, uint64_t size, uint64_t* pml4,
                  * later page starts at the segment offset that vaddr
                  * implies. Both are 0 for an aligned segment. */
                 uint64_t page_vaddr = page_base + p * 4096;
-                uint64_t seg_off    = (page_vaddr > s->p_vaddr)
-                                    ? (page_vaddr - s->p_vaddr) : 0;
-                uint64_t frame_off  = (page_vaddr < s->p_vaddr)
-                                    ? (s->p_vaddr - page_vaddr) : 0;
+                uint64_t seg_off    = (page_vaddr > vaddr)
+                                    ? (page_vaddr - vaddr) : 0;
+                uint64_t frame_off  = (page_vaddr < vaddr)
+                                    ? (vaddr - page_vaddr) : 0;
                 void* frame =
                     allocate_physical_ram_frame_for_partition(partition_id);
                 if (!frame) {
@@ -313,7 +350,11 @@ int elf64_map_blob(const uint8_t* data, uint64_t size, uint64_t* pml4,
         }
     }
 
-    info->entry     = ehdr->e_entry;
+    if (ehdr->e_entry + bias < ehdr->e_entry) {
+        kernel_serial_print("[ELF] refuse: entry overflows after bias\n");
+        return 0;
+    }
+    info->entry     = ehdr->e_entry + bias;
     info->phdr_vaddr = phdr_vaddr;
     info->phnum     = ehdr->e_phnum;
     info->phent     = (uint16_t)sizeof(struct ELF64ProgramHeader);
@@ -322,4 +363,59 @@ int elf64_map_blob(const uint8_t* data, uint64_t size, uint64_t* pml4,
     kernel_serial_printf("[LOADER] ELF64 loaded. Entry: 0x%016llx\n",
                          (unsigned long long)info->entry);
     return 1;
+}
+
+int elf64_map_blob(const uint8_t* data, uint64_t size, uint64_t* pml4,
+                   uint32_t partition_id, struct Elf64MapInfo* info)
+{
+    return elf64_map_at(data, size, pml4, partition_id, 0, 0, info);
+}
+
+int elf64_map_dyn_at(const uint8_t* data, uint64_t size, uint64_t* pml4,
+                     uint64_t load_base, uint32_t partition_id,
+                     struct Elf64MapInfo* info)
+{
+    return elf64_map_at(data, size, pml4, partition_id, load_base, 1, info);
+}
+
+int elf64_find_interp(const uint8_t* data, uint64_t size,
+                      struct Elf64InterpInfo* out)
+{
+    const struct ELF64Header* ehdr;
+    const struct ELF64ProgramHeader* phdr;
+    uint64_t ph_bytes;
+    uint16_t ph;
+    int found = 0;
+
+    if (!data || !out || size < sizeof(struct ELF64Header)) return 0;
+    ehdr = (const struct ELF64Header*)(const void*)data;
+    if (ehdr->e_ident[0] != ELF_MAGIC0 || ehdr->e_ident[1] != ELF_MAGIC1 ||
+        ehdr->e_ident[2] != ELF_MAGIC2 || ehdr->e_ident[3] != ELF_MAGIC3 ||
+        ehdr->e_ident[4] != ELF_CLASS64) {
+        return 0;
+    }
+    if (ehdr->e_phnum == 0 || ehdr->e_phoff == 0 ||
+        ehdr->e_phentsize != sizeof(struct ELF64ProgramHeader)) return 0;
+    ph_bytes = (uint64_t)ehdr->e_phnum * sizeof(struct ELF64ProgramHeader);
+    if (ehdr->e_phoff + ph_bytes < ehdr->e_phoff ||
+        ehdr->e_phoff + ph_bytes > size) return 0;
+    phdr = (const struct ELF64ProgramHeader*)(const void*)(data + ehdr->e_phoff);
+
+    for (ph = 0; ph < ehdr->e_phnum; ph++) {
+        const struct ELF64ProgramHeader* s = &phdr[ph];
+        uint64_t i, n;
+        if (s->p_type != PT_INTERP) continue;
+        if (found) return 0;   /* more than one PT_INTERP is malformed */
+        if (s->p_offset + s->p_filesz < s->p_offset ||
+            s->p_offset + s->p_filesz > size || s->p_filesz < 2) return 0;
+        n = 0;
+        while (n < s->p_filesz && data[s->p_offset + n] != 0) n++;
+        if (n == 0 || n >= s->p_filesz || n >= ELF_INTERP_PATH_MAX) return 0;
+        if (data[s->p_offset] != '/') return 0;
+        for (i = 0; i < n; i++) out->path[i] = (char)data[s->p_offset + i];
+        out->path[n] = '\0';
+        out->path_len = (uint16_t)n;
+        found = 1;
+    }
+    return found;
 }

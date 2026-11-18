@@ -174,6 +174,30 @@ int main(void)
         CHECK(all_types_once, "every required AT_* type appears exactly once");
     }
 
+    /* ─── A dynamic image reports the interpreter base in AT_BASE ──────────
+     * AT_ENTRY remains the MAIN image's e_entry; the loader's own entry is
+     * the initial RIP and is not an auxv value. */
+    {
+        struct LinuxInitStackParams q = p;
+        uint64_t rsp2, *w2, base2 = ~(uint64_t)0, entry2 = 0;
+        q.at_base = LINUX_INTERP_BASE;
+        rsp2 = linux_initial_stack_build(region, sizeof(region), &q);
+        CHECK(rsp2 != 0, "a dynamic image's stack still builds");
+        if (rsp2) {
+            w2 = (uint64_t *)(uintptr_t)rsp2;
+            w2 += 7;   /* argc + argv[0..1] + NULL + envp[0..1] + NULL */
+            for (i = 0; ; i += 2) {
+                if (w2[i] == LINUX_AT_NULL) break;
+                if (w2[i] == LINUX_AT_BASE) base2 = w2[i + 1];
+                if (w2[i] == LINUX_AT_ENTRY) entry2 = w2[i + 1];
+            }
+            CHECK(base2 == LINUX_INTERP_BASE,
+                  "AT_BASE is the interpreter base for a dynamic image");
+            CHECK(entry2 == 0x401000,
+                  "AT_ENTRY stays the main image's e_entry when AT_BASE is set");
+        }
+    }
+
     /* ─── AT_RANDOM's own quality rules (§5.2: absent, canaries are
      * worthless — so present AND non-degenerate) ─────────────────────────── */
     {

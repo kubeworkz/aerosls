@@ -1297,6 +1297,11 @@ int32_t cap_code_from_linux_errno(int32_t linux_errno); /* 0 = no unique preimag
 #define LINUX_CLKTCK          100u
 #define LINUX_ELF64_PHENT     56u   /* sizeof(Elf64_Phdr); AT_PHENT's value */
 
+/* M2a: where the sidecar-supplied musl interpreter is mapped. The main
+ * image stays at its linked address (ET_EXEC, no bias); this is the one
+ * base a dynamic child needs and the value it reads from AT_BASE. */
+#define LINUX_INTERP_BASE     0x00007F0000000000ULL
+
 struct LinuxInitStackParams {
     uint64_t       region_vaddr;  /* E7 increment 7: the vaddr this region is
                                    * mapped at in the CHILD's page table.
@@ -1317,6 +1322,8 @@ struct LinuxInitStackParams {
                                    * and was caught by increment 7's
                                    * measurement of the real candidate. */
     uint64_t       entry_vaddr;   /* AT_ENTRY: e_entry */
+    uint64_t       at_base;       /* AT_BASE: interpreter load base, 0 for
+                                   * a static image */
     uint64_t       phdr_vaddr;    /* AT_PHDR: vaddr of the program headers */
     uint16_t       phent;         /* AT_PHENT: LINUX_ELF64_PHENT */
     uint16_t       phnum;         /* AT_PHNUM */

@@ -739,7 +739,7 @@ impl Kernel for SimKernel {
         // to look up. A manifest without a name record is skipped rather than
         // given a synthetic one: an unnamed sidecar cannot be resolved by the
         // real registry either, and inventing a name here would hide that.
-        let name = aerosls_proto::manifest::parse_manifest(manifest)
+        let name = aerosls_proto::manifest::parse_manifest_packed(manifest)
             .ok()
             .and_then(|m| m.name.map(|n| n.as_bytes().to_vec()));
         if let Some(name) = name {

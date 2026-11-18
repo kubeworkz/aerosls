@@ -965,7 +965,7 @@ mod tests {
     use super::*;
     use crate::sim::SimKernel;
     use aerosls_proto::manifest::{
-        parse_manifest, CapKind, FLAG_GATE, FLAG_TENANT_LINUX,
+        parse_manifest_packed, CapKind, FLAG_GATE, FLAG_TENANT_LINUX,
     };
 
     fn images() -> EnvImages {
@@ -1006,7 +1006,7 @@ mod tests {
 
         // The ramdisk manifest carries this environment's name and its own
         // private, writable storage region.
-        let rd = parse_manifest(&created[0].0).unwrap();
+        let rd = parse_manifest_packed(&created[0].0).unwrap();
         assert_eq!(rd.name, Some("drv.ramdisk.3"));
         let storage = rd.find_cap("storage").expect("storage cap");
         assert_eq!(storage.rights, 0x3);
@@ -1016,7 +1016,7 @@ mod tests {
         // The POSIX manifest carries this environment's name, its heap, and a
         // ramdisk channel wired to THIS environment's ramdisk (partition-scoped
         // resolution by E2 lets the index repeat across partitions).
-        let px = parse_manifest(&created[1].0).unwrap();
+        let px = parse_manifest_packed(&created[1].0).unwrap();
         assert_eq!(px.name, Some("aerosls.posix.3"));
         assert_eq!(px.find_cap("ramdisk").unwrap().kind,
                    CapKind::Chan { peer: Some("drv.ramdisk.3"), flags: 0 });
@@ -1040,7 +1040,7 @@ mod tests {
         let k = SimKernel::new();
         let env = create_environment(&k, 5, M5_TENANT_ENV_INDEX, &images()).unwrap();
         let created = k.created();
-        let px = parse_manifest(&created[1].0).unwrap();
+        let px = parse_manifest_packed(&created[1].0).unwrap();
         assert_eq!(px.flags & FLAG_TENANT_LINUX != 0, probe_only);
         assert_eq!(px.flags & FLAG_GATE, 0);
         assert_eq!(px.n_caps, 5);
@@ -1057,7 +1057,7 @@ mod tests {
         let other = SimKernel::new();
         let _ = create_environment(&other, 5, M5_TENANT_ENV_INDEX + 1, &images()).unwrap();
         let other_created = other.created();
-        let other_px = parse_manifest(&other_created[1].0).unwrap();
+        let other_px = parse_manifest_packed(&other_created[1].0).unwrap();
         assert_eq!(other_px.flags & FLAG_TENANT_LINUX, 0,
                    "the build-time probe must not leak to an ordinary tenant index");
     }
@@ -1076,7 +1076,7 @@ mod tests {
                 ENV_PROFILE_TENANT_LINUX_CKPT, &images()).unwrap();
             assert_eq!(env.profile, ENV_PROFILE_TENANT_LINUX_CKPT);
             let created = k.created();
-            let px = parse_manifest(&created[1].0).unwrap();
+            let px = parse_manifest_packed(&created[1].0).unwrap();
             assert_eq!(px.flags & FLAG_TENANT_LINUX, FLAG_TENANT_LINUX,
                        "the runtime profile sets the ordinary-tenant Linux bit");
             assert_eq!(px.flags & FLAG_GATE, 0);
@@ -1124,8 +1124,8 @@ mod tests {
         assert_eq!(created[2].1, 7);
         // Both name their ramdisk "drv.ramdisk.1" — the collision is resolved
         // by the partition, not the name (E2 scoped registry).
-        assert_eq!(parse_manifest(&created[0].0).unwrap().name, Some("drv.ramdisk.1"));
-        assert_eq!(parse_manifest(&created[2].0).unwrap().name, Some("drv.ramdisk.1"));
+        assert_eq!(parse_manifest_packed(&created[0].0).unwrap().name, Some("drv.ramdisk.1"));
+        assert_eq!(parse_manifest_packed(&created[2].0).unwrap().name, Some("drv.ramdisk.1"));
     }
 
     #[test]

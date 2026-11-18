@@ -936,6 +936,7 @@ fn manifest_names_line_up_with_bib_caps() {
         bootstrap: None,
         flags_value: None,
         argenv: None,
+        interp: None,
         signature: None,
     };
     let blob = build_manifest(&m);

@@ -42,8 +42,8 @@
 //! a dependency of this sidecar's boot.
 
 use aerosls_proto::manifest::{
-    build_manifest, crc32, ArgEnv, Bootstrap, Budget, Cpu, FLAG_GATE, Image,
-    Limits, Manifest, ManifestCap, HEADER_LEN, MAX_MANIFEST_CAPS,
+    pack_manifest, ArgEnv, Bootstrap, Budget, Cpu, FLAG_GATE, Image,
+    Limits, Manifest, ManifestCap, MAX_MANIFEST_CAPS,
 };
 use aerosls_proto::kabi::Kernel;
 use aerosls_vfs::{
@@ -252,18 +252,14 @@ fn spawn_with<K: Kernel>(
         // environment's default (linux.rs) instead of the empty
         // environment the create could only hand before the record landed.
         argenv: Some(ArgEnv::new(argv, LINUX_DEFAULT_ENV)),
+        interp: None,
         signature: None,
     };
 
     // Packed blob + image_kaddr footer, with total_len and the body CRC
     // patched to cover records + footer — one parser in the kernel, the
     // pair's pattern exactly.
-    let mut blob = build_manifest(&m);
-    blob.extend_from_slice(&tail.to_le_bytes());
-    let total = blob.len() as u32;
-    blob[16..20].copy_from_slice(&total.to_le_bytes());
-    let crc = crc32(&blob[HEADER_LEN..]);
-    blob[20..24].copy_from_slice(&crc.to_le_bytes());
+    let blob = pack_manifest(&m, tail);
 
     // target_partition 0 = inherit (this sidecar's — the boot tree's).
     let (ch_r, ch_w) = k.linux_spawn(&blob, 0)?;

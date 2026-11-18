@@ -29,7 +29,7 @@ use aerosls_proto::devreg::DeviceRegistry;
 use aerosls_proto::kabi::GrantedCap;
 use aerosls_proto::manifest::{
     Bootstrap, Budget, CapKind, Cpu, Image, Limits, Manifest, ManifestCap,
-    build_manifest, crc32, HEADER_LEN,
+    pack_manifest, crc32, HEADER_LEN,
 };
 use alloc::vec::Vec;
 
@@ -177,17 +177,11 @@ pub fn build_e1000_manifest(spawn: &E1000Spawn) -> Vec<u8> {
         }),
         flags_value: Some(0),
         argenv: None,
+        interp: None,
         signature: None,
     };
 
-    let mut blob = build_manifest(&m);
-    // Append the image_kaddr footer, then patch total_len and body CRC so
-    // the kernel's bounds walk and CRC check cover records + footer.
-    blob.extend_from_slice(&spawn.image_kaddr.to_le_bytes());
-    let total = blob.len() as u32;
-    blob[16..20].copy_from_slice(&total.to_le_bytes());
-    let crc = crc32(&blob[HEADER_LEN..]);
-    blob[20..24].copy_from_slice(&crc.to_le_bytes());
+    let blob = pack_manifest(&m, spawn.image_kaddr);
     blob
 }
 
@@ -195,7 +189,7 @@ pub fn build_e1000_manifest(spawn: &E1000Spawn) -> Vec<u8> {
 mod tests {
     use super::*;
     use aerosls_proto::devreg::{DRIVER_MANIFEST_LEN, MAX_DEVICES};
-    use aerosls_proto::manifest::{parse_manifest, CapKind};
+    use aerosls_proto::manifest::{parse_manifest_packed, CapKind};
 
     fn entry(driver_manifest: &str, class: u8, subclass: u8) -> aerosls_proto::devreg::DeviceEntry {
         let mut manifest = [0u8; DRIVER_MANIFEST_LEN];
@@ -301,7 +295,7 @@ mod tests {
         );
 
         // The whole blob re-parses with the proto parser.
-        let m = parse_manifest(&blob).unwrap();
+        let m = parse_manifest_packed(&blob).unwrap();
         assert_eq!(m.name.unwrap(), E1000_MANIFEST_NAME);
         assert_eq!(m.n_caps, 2);
         let budget = m.find_cap("budget").expect("budget cap");

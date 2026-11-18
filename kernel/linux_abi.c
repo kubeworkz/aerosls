@@ -1964,7 +1964,7 @@ uint64_t linux_initial_stack_build(uint8_t *region, size_t region_bytes,
             AUX(LINUX_AT_PHENT,    p->phent);
             AUX(LINUX_AT_PHNUM,    p->phnum);
             AUX(LINUX_AT_PAGESZ,   LINUX_PAGE_SIZE);
-            AUX(LINUX_AT_BASE,     0);            /* static image: no interp base */
+            AUX(LINUX_AT_BASE,     p->at_base);   /* 0 for a static image */
             AUX(LINUX_AT_ENTRY,    p->entry_vaddr);
             AUX(LINUX_AT_PLATFORM, platform_va);
             AUX(LINUX_AT_HWCAP,    0);

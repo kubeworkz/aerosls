@@ -33,8 +33,8 @@
 //! this file overwrites the tail.
 
 use aerosls_proto::manifest::{
-    build_manifest, crc32, ArgEnv, Bootstrap, Budget, Cpu, Image, Limits,
-    Manifest, ManifestCap, HEADER_LEN, MAX_MANIFEST_CAPS,
+    pack_manifest, ArgEnv, Bootstrap, Budget, Cpu, Image, Limits,
+    Manifest, ManifestCap, MAX_MANIFEST_CAPS,
 };
 use crate::linux::LINUX_DEFAULT_ENV;
 
@@ -150,18 +150,14 @@ pub fn spawn<K: aerosls_proto::kabi::Kernel>(
         // only hand before the record landed. The pair crosses the SAME
         // record, so image format stays its only difference.
         argenv: Some(ArgEnv::new(&[CAND_NAME], LINUX_DEFAULT_ENV)),
+        interp: None,
         signature: None,
     };
 
     // Packed blob + image_kaddr footer, with total_len and the body CRC
     // patched to cover records + footer — the probe's pattern exactly (one
     // parser in the kernel).
-    let mut blob = build_manifest(&m);
-    blob.extend_from_slice(&tail.to_le_bytes());
-    let total = blob.len() as u32;
-    blob[16..20].copy_from_slice(&total.to_le_bytes());
-    let crc = crc32(&blob[HEADER_LEN..]);
-    blob[20..24].copy_from_slice(&crc.to_le_bytes());
+    let blob = pack_manifest(&m, tail);
 
     // target_partition 0 = inherit (this sidecar's — the boot tree's).
     let (ch_r, ch_w) = k.linux_spawn(&blob, 0)?;

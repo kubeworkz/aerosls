@@ -16,8 +16,8 @@
 //! default images compile neither this module nor its spawn call.
 
 use aerosls_proto::manifest::{
-    build_manifest, crc32, ArgEnv, Bootstrap, Budget, Cpu, Image, Limits,
-    Manifest, ManifestCap, HEADER_LEN, MAX_MANIFEST_CAPS,
+    pack_manifest, ArgEnv, Bootstrap, Budget, Cpu, Image, Limits,
+    Manifest, ManifestCap, MAX_MANIFEST_CAPS,
 };
 use crate::linux::LINUX_DEFAULT_ENV;
 
@@ -117,15 +117,11 @@ fn spawn_named<K: aerosls_proto::kabi::Kernel>(
         }),
         flags_value: Some(0),
         argenv: Some(ArgEnv::new(&[name], LINUX_DEFAULT_ENV)),
+        interp: None,
         signature: None,
     };
 
-    let mut blob = build_manifest(&m);
-    blob.extend_from_slice(&tail.to_le_bytes());
-    let total = blob.len() as u32;
-    blob[16..20].copy_from_slice(&total.to_le_bytes());
-    let crc = crc32(&blob[HEADER_LEN..]);
-    blob[20..24].copy_from_slice(&crc.to_le_bytes());
+    let blob = pack_manifest(&m, tail);
 
     let (ch_r, ch_w) = k.linux_spawn(&blob, 0)?;
 

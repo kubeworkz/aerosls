@@ -2,9 +2,9 @@
 //! path (kernel/cap.c `sys_sls_create_sidecar`, SYS_SLS_CREATE_SIDECAR).
 //!
 //! The init sidecar spawns the Device Manager by handing the kernel a
-//! packed manifest blob: the records `build_manifest` emits (now on the
-//! kernel's TAG_IMAGE 24-byte wire format) PLUS the 8-byte `image_kaddr`
-//! footer, with `total_len` and the body CRC patched to cover the footer —
+//! packed manifest blob: `pack_manifest`'s records (on the kernel's
+//! TAG_IMAGE 24-byte wire format) PLUS the 8-byte `image_kaddr` footer,
+//! with `total_len` and the body CRC covering records + footer —
 //! exactly what the kernel's parser and image mapper expect (the kernel
 //! copies the DM binary from the footer's physical address into the
 //! child's address space).
@@ -15,7 +15,7 @@
 
 use aerosls_proto::manifest::{
     Bootstrap, Budget, CapKind, Cpu, Image, Limits, Manifest, ManifestCap,
-    build_manifest, crc32, HEADER_LEN,
+    pack_manifest, crc32, HEADER_LEN,
 };
 use alloc::vec::Vec;
 
@@ -115,24 +115,18 @@ pub fn build_dm_manifest(image: &DmImage) -> Vec<u8> {
         }),
         flags_value: Some(0),
         argenv: None,
+        interp: None,
         signature: None,
     };
 
-    let mut blob = build_manifest(&m);
-    // Append the image_kaddr footer, then patch total_len and the body CRC
-    // so the kernel's bounds walk and CRC check cover records + footer.
-    blob.extend_from_slice(&image.kaddr.to_le_bytes());
-    let total = blob.len() as u32;
-    blob[16..20].copy_from_slice(&total.to_le_bytes());
-    let crc = crc32(&blob[HEADER_LEN..]);
-    blob[20..24].copy_from_slice(&crc.to_le_bytes());
+    let blob = pack_manifest(&m, image.kaddr);
     blob
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aerosls_proto::manifest::{TAG_IMAGE, TAG_NAME};
+    use aerosls_proto::manifest::{parse_manifest_packed, TAG_IMAGE, TAG_NAME};
 
     fn le_u16(b: &[u8], i: usize) -> u16 {
         u16::from_le_bytes([b[i], b[i + 1]])
@@ -203,6 +197,14 @@ mod tests {
 
         // Body CRC covers records + footer, matching the header.
         assert_eq!(le_u32(&blob, 20), crc32(&blob[HEADER_LEN..]));
+
+        // The packed parser is the consumer contract: the footer is not a
+        // record, and the manifest fields survive the exact packed form.
+        let parsed = parse_manifest_packed(&blob).expect("DM blob is packed v1");
+        assert_eq!(parsed.name, Some(DM_MANIFEST_NAME));
+        assert_eq!(parsed.version_major, 1);
+        assert_eq!(parsed.image.unwrap().size, image.size);
+        assert!(parsed.interp.is_none());
     }
 
     #[test]
