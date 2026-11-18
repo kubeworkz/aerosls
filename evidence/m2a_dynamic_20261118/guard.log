@@ -124,5 +124,9 @@ ok:   X6. the run's proof is on the lines: the granted range and its words, the 
 ok:   X7. the probe carries the PROT_NONE round trip in order on one heap page: NONE before READ|WRITE, two mprotect calls on %r12, three content reads, a writability byte, the 18-byte positive marker sourced from %r12 in %rsi, and markers 412–415 for a refused park/restore, changed contents, or short output
 ok:   X8. frame-exhaustion rollback frees only the filled-reservation frames and restores the bare USER_PTE_RESERVED leaf (the host test pins the classifier; the apply block must not call user_unmap_page)
 ok:   X9. munmap's leaf action treats a bare RESERVED leaf as a mapping to remove even though frame_out is 0, and the host test drives that arm
+ok:   Y1. writev(20) is a first-class FD row: LINUX_WRITEV is 20u in the header, linux_syscall_table carries { 20, LSC_FD, 0 }, and the dispatcher has its own arm — musl's stdio flush is forwarded, not refused by an absent class
+ok:   Y2. the iovec walk is bounded end to end: LINUX_IOV_MAX is 8 and LINUX_IOVEC_BYTES is 16, the dispatch refuses an over-cap iovcnt before its bounded array copy, and the pure plan repeats the cap and stops gathering at the chunk
+ok:   Y3. writev's gather is write-shaped: the plan is called with LINUX_FD_WRITE_CHUNK, each segment is copied through the checked walker into the one attach span, and args[2] becomes wv.total so header, payload and the count the task sees are one truth
+ok:   Y4. the sidecar answers writev with write's own arm: 20 is routed into the file/console class, expected_req_len derives its attach from args[2], the VFS/console write arm names the number, and the console-only path normalizes it instead of growing a second descriptor rule
 
 linux_personality_check: all clauses hold

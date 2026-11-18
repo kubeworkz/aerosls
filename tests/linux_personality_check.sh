@@ -1682,6 +1682,75 @@ else
     bad "X9. the reservation-munmap arm is gone — munmap would skip a frame-less reservation, leaving a mapping the next mprotect could back after the caller believed it was gone"
 fi
 
+# ─── Y. M2a: the writev seam, end to end ─────────────────────────────────
+# The dynamically linked musl hello returns from main, so musl's exit path
+# flushes buffered stdout with writev(20). That number used to be absent from
+# both ends and was refused -ENOSYS before any post — the marker vanished
+# while the child still exited 0. These four clauses hold the seam that made
+# the flush real: the table row, the bounded iovec walk, the gathered count
+# rewrite the sidecar's payload contract depends on, and the sidecar's own
+# routing/write arm. Each names its own drift so a future revert reddens by
+# cause, not merely by an unexplained live-boot silence.
+
+# Y1: writev must be a FIRST-CLASS row, not a number that happens to reach a
+# generic arm. The kernel classifies 20 as LSC_FD before any channel exists;
+# losing the row is the original silent-ENOSYS failure in its exact shape.
+if grep -qF '#define LINUX_WRITEV          20u' "$LABH" && \
+   grep -qF '{  20, LSC_FD,     0 }' "$LABC" && \
+   grep -qF 'if (num == LINUX_WRITEV) {' "$DISP"; then
+    ok "Y1. writev(20) is a first-class FD row: LINUX_WRITEV is 20u in the header, linux_syscall_table carries { 20, LSC_FD, 0 }, and the dispatcher has its own arm — musl's stdio flush is forwarded, not refused by an absent class"
+else
+    bad "Y1. writev's syscall-table row or dispatch arm is gone — the next dynamically linked stdio flush would be -ENOSYS before any post again, and the child would still exit 0 with its marker silently dropped"
+fi
+
+# Y2: the array walk is bounded at EIGHT entries and 16 bytes each, on BOTH
+# ends. The dispatch refuses over-cap iovcnt BEFORE it copies the array (so
+# the local buffer cannot be overrun), and the pure plan repeats the rule as
+# its twin. A widened or vanished cap is a stack copy of tenant-controlled
+# length — the exact shape this seam must never grow.
+if grep -qF '#define LINUX_IOV_MAX         8u' "$LABH" && \
+   grep -qF '#define LINUX_IOVEC_BYTES    16u' "$LABH" && \
+   grep -qF 'uint8_t iovb[LINUX_IOV_MAX * LINUX_IOVEC_BYTES];' "$DISP" && \
+   grep -qF 'if (largs[2] > LINUX_IOV_MAX) {' "$DISP" && \
+   grep -qF 'if (iovcnt > LINUX_IOV_MAX) {' "$LABC" && \
+   grep -qF 'for (i = 0; i < iovcnt && p.total < cap; i++) {' "$LABC"; then
+    ok "Y2. the iovec walk is bounded end to end: LINUX_IOV_MAX is 8 and LINUX_IOVEC_BYTES is 16, the dispatch refuses an over-cap iovcnt before its bounded array copy, and the pure plan repeats the cap and stops gathering at the chunk"
+else
+    bad "Y2. the iovec cap or its pre-copy refusal is gone — an over-cap writev could copy a tenant-chosen number of iovecs into the fixed array, or the plan could gather past the chunk"
+fi
+
+# Y3: the gather must END in write's own contract: one contiguous attach, and
+# args[2] rewritten to the gathered total (never the iovcnt) so the sidecar's
+# expected_req_len and its count truth agree with the bytes actually sent. A
+# plan that validates but never attaches, or attaches without the rewrite, is
+# a payload/description mismatch — -EPROTO at best, misread bytes at worst.
+if grep -qF 'wv = linux_writev_plan(largs[2] ? iovb : 0, largs[2],' "$DISP" && \
+   grep -qF 'LINUX_FD_WRITE_CHUNK);' "$DISP" && \
+   grep -qF 'largs[2] = wv.total;' "$DISP" && \
+   grep -qF '} else if (num == LINUX_WRITEV && wv.total) {' "$DISP" && \
+   grep -qF 'linux_user_copy_out(wp + off, cur->cr3,' "$DISP" && \
+   grep -qF 'fwd_len += off;' "$DISP" && \
+   grep -qF 'struct LinuxWritevPlan linux_writev_plan(const uint8_t *iov_bytes,' "$LABC"; then
+    ok "Y3. writev's gather is write-shaped: the plan is called with LINUX_FD_WRITE_CHUNK, each segment is copied through the checked walker into the one attach span, and args[2] becomes wv.total so header, payload and the count the task sees are one truth"
+else
+    bad "Y3. writev's gather or its args[2] rewrite is gone — the sidecar would derive its payload length from the iovcnt (or see bytes the description does not count), so the flush would answer -EPROTO or misread the gathered span"
+fi
+
+# Y4: the sidecar's half. 20 must be ROUTED to the file/console class, the
+# write arm must answer it with write's own payload/count truth, and the
+# console-only answer path must normalize it rather than inventing a second
+# descriptor rule. `expected_req_len` is the twin that turns a drifted attach
+# into a named -EPROTO instead of dropped bytes.
+if grep -qF 'const LINUX_WRITEV: u64 = 20;' "$LRS" && \
+   grep -qF 'LINUX_WRITE | LINUX_WRITEV | LINUX_SENDTO =>' "$LRS" && \
+   grep -qF 'LINUX_WRITE | LINUX_WRITEV => match slot_of(fds, args[0]) {' "$LRS" && \
+   grep -qF 'LINUX_READ | LINUX_WRITE | LINUX_WRITEV | LINUX_OPEN | LINUX_CLOSE' "$LRS" && \
+   grep -qF 'let num = if num == LINUX_WRITEV { LINUX_WRITE } else { num };' "$LRS"; then
+    ok "Y4. the sidecar answers writev with write's own arm: 20 is routed into the file/console class, expected_req_len derives its attach from args[2], the VFS/console write arm names the number, and the console-only path normalizes it instead of growing a second descriptor rule"
+else
+    bad "Y4. the sidecar's writev routing or write arm is gone — 20 would fall to the catch-all (a fabricated/refused answer) while the kernel attached gathered bytes, so the stdio flush would fail even though the gather itself is intact"
+fi
+
 echo
 if [ "$fails" -eq 0 ]; then
     echo "linux_personality_check: all clauses hold"
