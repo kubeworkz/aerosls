@@ -99,6 +99,7 @@ CCT=tests/cap_create_sidecar_host_test.c
 M2A=user/sidecar/src/m2a_interp.rs
 M2AFIX=user/sidecar/fixtures/build_m2a.sh
 M2AELF=user/sidecar/fixtures/m2a_hello.elf
+M2ALOADER=user/sidecar/fixtures/ld-musl-x86_64.so.1
 M2AC=user/sidecar/fixtures/m2a_hello.c
 FPUH=arch/x86/fpu_enable.h
 LFUC=arch/x86/lazy_fpu.c
@@ -1768,6 +1769,19 @@ if grep -qF -- '"$CC" -nostartfiles -no-pie -O2 -L"$tmp" "$CRT1" -o "$OUT" m2a_h
     ok "Y5. the M2a fixture's loader-as-libc recipe is intact (crt1.o + -nostartfiles -no-pie -O2, libc.so symlinked to the committed loader, DT_NEEDED checked) and m2a_hello.elf's SHA-256 is be63cd4d… — the checked-in binary is the one that recipe produces"
 else
     bad "Y5. the M2a fixture's recipe or bytes drifted: build_m2a.sh no longer links against the committed loader as libc.so, or m2a_hello.elf's SHA-256 is not be63cd4d… — a rebuild would no longer reproduce the binary the demo ships"
+fi
+
+# Y6: the loader is the fixture's other half. Y5 holds the hello's SHA-256
+# and the recipe that links against "the committed loader"; if the loader
+# itself drifts, the recipe still names a file and the hello still hashes,
+# but the pair is no longer the one every boot proved. Pin the loader's hash
+# too, so a swapped loader reddens by name instead of passing both the
+# recipe and the main image.
+M2A_LOADER_SHA=$(sha256sum "$M2ALOADER" | awk '{print $1}')
+if [ "$M2A_LOADER_SHA" = "6e8ff8ad02f4a3a0b70029577e2eb9df8f6526aea302a60a8d649874d6fa45ea" ]; then
+    ok "Y6. the committed musl loader's SHA-256 is 6e8ff8ad… — the sidecar-supplied ld-musl-x86_64.so.1 is the one the M2a boots proved, not merely whatever file the build script names"
+else
+    bad "Y6. the committed musl loader drifted: ld-musl-x86_64.so.1's SHA-256 is not 6e8ff8ad… — Y5's recipe would still link against it and the hello would still hash, so only this clause catches a swapped loader"
 fi
 
 echo

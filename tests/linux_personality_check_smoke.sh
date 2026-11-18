@@ -40,8 +40,9 @@ FILES=(
     user/sidecar/src/e7_firstuser.rs
     user/sidecar/src/m2a_interp.rs
     user/sidecar/fixtures/build_m2a.sh
-    # Y5 hashes the checked-in image and compares it with the script's recipe.
+    # Y5/Y6 hash the checked-in pair and compare it with the script's recipe.
     user/sidecar/fixtures/m2a_hello.elf
+    user/sidecar/fixtures/ld-musl-x86_64.so.1
     user/sidecar/fixtures/m2a_hello.c
     user/proto/src/manifest.rs
     user/sidecar/fixtures/e7_linux_probe.S
