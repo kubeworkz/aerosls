@@ -128,5 +128,6 @@ ok:   Y1. writev(20) is a first-class FD row: LINUX_WRITEV is 20u in the header,
 ok:   Y2. the iovec walk is bounded end to end: LINUX_IOV_MAX is 8 and LINUX_IOVEC_BYTES is 16, the dispatch refuses an over-cap iovcnt before its bounded array copy, and the pure plan repeats the cap and stops gathering at the chunk
 ok:   Y3. writev's gather is write-shaped: the plan is called with LINUX_FD_WRITE_CHUNK, each segment is copied through the checked walker into the one attach span, and args[2] becomes wv.total so header, payload and the count the task sees are one truth
 ok:   Y4. the sidecar answers writev with write's own arm: 20 is routed into the file/console class, expected_req_len derives its attach from args[2], the VFS/console write arm names the number, and the console-only path normalizes it instead of growing a second descriptor rule
+ok:   Y5. the M2a fixture's loader-as-libc recipe is intact (crt1.o + -nostartfiles -no-pie -O2, libc.so symlinked to the committed loader, DT_NEEDED checked) and m2a_hello.elf's SHA-256 is be63cd4d… — the checked-in binary is the one that recipe produces
 
 linux_personality_check: all clauses hold

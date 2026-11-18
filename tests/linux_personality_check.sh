@@ -98,6 +98,7 @@ MANR=user/proto/src/manifest.rs
 CCT=tests/cap_create_sidecar_host_test.c
 M2A=user/sidecar/src/m2a_interp.rs
 M2AFIX=user/sidecar/fixtures/build_m2a.sh
+M2AELF=user/sidecar/fixtures/m2a_hello.elf
 M2AC=user/sidecar/fixtures/m2a_hello.c
 FPUH=arch/x86/fpu_enable.h
 LFUC=arch/x86/lazy_fpu.c
@@ -1749,6 +1750,24 @@ if grep -qF 'const LINUX_WRITEV: u64 = 20;' "$LRS" && \
     ok "Y4. the sidecar answers writev with write's own arm: 20 is routed into the file/console class, expected_req_len derives its attach from args[2], the VFS/console write arm names the number, and the console-only path normalizes it instead of growing a second descriptor rule"
 else
     bad "Y4. the sidecar's writev routing or write arm is gone — 20 would fall to the catch-all (a fabricated/refused answer) while the kernel attached gathered bytes, so the stdio flush would fail even though the gather itself is intact"
+fi
+
+# Y5: the fixture's recipe and its bytes are ONE truth. The committed ELF
+# must be exactly what build_m2a.sh produces: musl's crt1.o, -nostartfiles,
+# and a temporary libc.so that is a symlink to the committed loader (the
+# DT_NEEDED "libc.so" check below the link). Pinning the SHA-256 catches both
+# a script edit that would rebuild a different image and an ELF swapped
+# without regenerating it — either way a rebuild no longer reproduces the
+# binary the demo actually ships, which is the only property that makes the
+# checked-in pair a fixture rather than two files that happen to coexist.
+M2A_SHA=$(sha256sum "$M2AELF" | awk '{print $1}')
+if grep -qF -- '"$CC" -nostartfiles -no-pie -O2 -L"$tmp" "$CRT1" -o "$OUT" m2a_hello.c -lc' "$M2AFIX" && \
+   grep -qF 'ln -s "$(pwd)/ld-musl-x86_64.so.1" "$tmp/libc.so"' "$M2AFIX" && \
+   grep -qF '[ "$NEEDED" = "libc.so" ]' "$M2AFIX" && \
+   [ "$M2A_SHA" = "be63cd4d1e5e4d4b9b4028cb4ec830a660fa19a6df1cb6fa27e6aaddd5deafcc" ]; then
+    ok "Y5. the M2a fixture's loader-as-libc recipe is intact (crt1.o + -nostartfiles -no-pie -O2, libc.so symlinked to the committed loader, DT_NEEDED checked) and m2a_hello.elf's SHA-256 is be63cd4d… — the checked-in binary is the one that recipe produces"
+else
+    bad "Y5. the M2a fixture's recipe or bytes drifted: build_m2a.sh no longer links against the committed loader as libc.so, or m2a_hello.elf's SHA-256 is not be63cd4d… — a rebuild would no longer reproduce the binary the demo ships"
 fi
 
 echo
