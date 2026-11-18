@@ -101,7 +101,7 @@ Guard and smoke:
 
 ```text
 linux_personality_check: all clauses hold
-linux_personality_check_smoke: 128 passed, 0 failed
+linux_personality_check_smoke: 129 passed, 0 failed
 ```
 
 The writev guard clauses Y1–Y4 are themselves held by four smoke mutations,
@@ -117,6 +117,9 @@ so each seam is proven to redden by name when its pinned line drifts:
   `const LINUX_WRITEV: u64 = 20;` to `21`; the guard must name **Y4**.
 - t138 `m2a-fixture-elf-drift` — replaces the committed `m2a_hello.elf`
   with different bytes; the guard must name **Y5** from the SHA-256 alone.
+- t139 `m2a-fixture-recipe-drift` — drops `-nostartfiles` from
+  `build_m2a.sh`'s loader-as-libc link line; the ELF still hashes, so only
+  the recipe half catches it, and the guard must name **Y5**.
 
 ## Artifacts
 
@@ -124,5 +127,6 @@ so each seam is proven to redden by name when its pinned line drifts:
 - `markers.txt` — the numbered key lines quoted above.
 - `guard.log` — `tests/linux_personality_check.sh` output (O9 included).
 - `smoke.log` — the smoke run, including the `m2a-oneshot-gone` tooth, the
-  four writev teeth t134–t137, and the fixture-hash tooth t138.
+  four writev teeth t134–t137, and the fixture teeth t138 (hash) and t139
+  (recipe).
 - `facts` — compact result fields.

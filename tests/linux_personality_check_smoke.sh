@@ -1181,6 +1181,16 @@ seed "$W/t138"
 printf 'M2A-DRIFT\n' > "$W/t138/user/sidecar/fixtures/m2a_hello.elf"
 tooth m2a-fixture-elf-drift Y5 "the committed m2a_hello.elf is not the image its build script produces" "$W/t138"
 
+# t139: the link line loses -nostartfiles. The script still links against
+# the committed loader as libc.so, but the wrapper's own startfile (PIE
+# Scrt1.o under musl-gcc) would re-enter an ET_EXEC link — a rebuild would
+# no longer be the committed recipe. The ELF is untouched and still hashes
+# correctly, so only the recipe half of Y5 can catch it; it must redden by
+# name.
+seed "$W/t139"
+sed -i 's/ -nostartfiles -no-pie -O2 / -no-pie -O2 /' "$W/t139/user/sidecar/fixtures/build_m2a.sh"
+tooth m2a-fixture-recipe-drift Y5 "build_m2a.sh no longer links with -nostartfiles against the committed loader" "$W/t139"
+
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
