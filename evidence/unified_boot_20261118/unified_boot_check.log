@@ -1,0 +1,18 @@
+ok:   the kernel parsed unified=1 from the command line
+ok:   the Ring-0 control plane was planted as a schedulable pseudo-process
+ok:   the init sidecar was created in this boot
+ok:   init was LEFT RUNNABLE instead of being entered (the kernel kept the boot)
+ok:   init was released by the sidecar creator (PROC_HELD -> PROC_SUSPENDED)
+ok:   the kernel stamped the BIB's UNIFIED flag into every sidecar's boot info block
+ok:   the kernel owns the console in this boot (input forwarding off)
+ok:   the software half of the chain ran (init's own ramdisk driver was created)
+ok:   no system POSIX sidecar was created (it would fight the kernel for the NIC and COM1)
+ok:   no network driver sidecar was created (the kernel drives the NIC in this boot)
+ok:   no e1000 user-driver sidecar was created (no NIC was handed off)
+ok:   the boot reached the unified markers (heartbeats and the HTTP listener)
+ok:   the kernel yielded to Ring-3 work 16 times and init reported 7 heartbeats
+ok:   the CPU alternated (heartbeats after yields: 7; yields after heartbeats: 9)
+ok:   /api/health answered twice while init was making progress (heartbeats 7 -> 81)
+ok:   /api/health body is a live kernel (status=ok, uptime_ticks>0)
+ok:   typed input was answered by the kernel shell (the control plane owns the console)
+OK: the unified boot ran the Ring-0 control plane (HTTP + shell) and the Ring-3 sidecar world in one boot

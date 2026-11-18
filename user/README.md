@@ -229,6 +229,10 @@ that never builds sidecars (CI, deploy) verifies the committed archive. To
 pack already-built images deliberately, run `aerosls-bootimage` directly; that
 archive carries no stamp and `x86-iso` will not ship it.
 
+The default archive's post-repack unified-boot proof — the image hash, passing
+`tests/unified_boot_check.sh` output, serial log and stamp recheck — is in
+`evidence/unified_boot_20261118/`.
+
 Boot under QEMU with the ISO's Phase 5 menuentry (GRUB loads sidecars.cpio
 as a Multiboot2 module):
 

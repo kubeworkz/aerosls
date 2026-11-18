@@ -1,0 +1,407 @@
+[H[J[1;1H[?25l[m[H[J[1;1H[2;30HGNU GRUB  version 2.12
+
+
+[m[4;2H+----------------------------------------------------------------------------+[5;2H|[5;79H|[6;2H|[6;79H|[7;2H|[7;79H|[8;2H|[8;79H|[9;2H|[9;79H|[10;2H|[10;79H|[11;2H|[11;79H|[12;2H|[12;79H|[13;2H|[13;79H|[14;2H|[14;79H|[15;2H|[15;79H|[16;2H|[16;79H|[17;2H+----------------------------------------------------------------------------+[m[18;2H[19;2H[m     Use the ^ and v keys to select which entry is highlighted.
+
+      Press enter to boot the selected OS, `e' to edit the commands
+
+      before booting or `c' for a command-line.                           [5;80H [7m[5;3H*AeroSLS ? Phase 5 self-hosted (initrd sidecars)                            [m[5;78H[m[m[6;3H AeroSLS ? kernel only                                                      [m[6;78H[m[m[7;3H AeroSLS ? unified (control plane + sidecars)                               [m[7;78H[m[m[8;3H GRUB shell                                                                 [m[8;78H[m[m[9;3H                                                                            [m[9;78H[m[m[10;3H                                                                            [m[10;78H[m[m[11;3H                                                                            [m[11;78H[m[m[12;3H                                                                            [m[12;78H[m[m[13;3H                                                                            [m[13;78H[m[m[14;3H                                                                            [m[14;78H[m[m[15;3H                                                                            [m[15;78H[m[m[16;3H                                                                            [m[16;78H[m[16;80H [5;78H[22;1H   The highlighted entry will be executed automatically in 3s.                 [5;78H[22;1H                                                                               [23;1H                                                                               [5;78H[m[5;3H AeroSLS ? Phase 5 self-hosted (initrd sidecars)                            [m[5;78H[m[7m[6;3H*AeroSLS ? kernel only                                                      [m[6;78H[m[m[6;3H AeroSLS ? kernel only                                                      [m[6;78H[m[7m[7;3H*AeroSLS ? unified (control plane + sidecars)                               [m[7;78H[m[?25h[H[J[1;1H[H[J[1;1H[AEROSLS BOOT LOGGER V1.0.0 RUNNING]
+----------------------------------------------------------------------------------
+[BSP] Loading GDT and IDT...
+[FRAME] bootstrap stack [0xe1039a0,0xe2039a0) confirmed inside the reserved region -- frames 57603..57859 are the kernel's own stack and are not allocatable.
+[FRAME] reserved 57860 frames (226 MiB) below the kernel image end 0xe204000 -- allocator now starts above the kernel.
+[SIDECAR] multiboot v1 detected, flags=0x1a6f phys=0x10000
+[SIDECAR] v1 mods_count=1 mods_addr=0x100c4
+[SIDECAR] v1 initrd module at 0xe26c000..0xe45866c (2016876 bytes)
+[HW] Multiboot v1: mem_upper=3144576 KiB, top=0xbffe0000
+[FRAME] reserved 262176 frames above 0xbffe0000 -- that memory does not exist.
+[CAP] shared-memory arena: 64 MiB physically contiguous at 0xe400000 (16384 frames).
+[CAP] Seed kernel capability layer online: 512-slot tables, 1024-object ceiling, holders, channels, arena, message transport, syscalls 289-304.
+[QEMU-SLS MMU] shadow PML4=0x000000000e204000 (kernel PT inherited)
+[TIMER] tick calibrated: tsc=2634997097 Hz, lapic=62579184 Hz, ticr=625791, tick=10000000 ns
+[BSP] LAPIC and IRQ0 timer online.
+[BSP] Round-robin task scheduler initialised.
+[FPU] SSE/SSE2 enabled for ring 3 — CR4.OSFXSR|OSXMMEXCPT, CR0.MP; EM/TS clear, CR0.TS not armed
+[SYSCALL] Gate initialised. STAR=0x0010000800000000  LSTAR=0x0000000000102bd0
+[PROC] Ring-3 process manager initialised.
+[BOOT] command line: "unified=1 nic0=both nic1=none"
+[PARTITION] LPAR groundwork initialised (1 partition: system).
+[SERVICE] service registry initialised (0 registrations).
+[MESH] circuit breakers initialised (all closed).
+[WORKLOAD] declarative workloads initialised (reconciler OFF).
+[WLCTX] context pool initialised (8 slots).
+[FAILOVER] Subsystem initialised.
+[FAILOVER] relaunch grace: this node just came up -- no peer is declared DEAD for 6000 ticks (until tick 6001).
+[LOADER] Service binary store ready. Built-in demo: 26 bytes.
+[WEBAPP] Asset store ready. Built-in Navigator page: 2059 bytes.
+[ENTROPY] seeded.
+[RTC] CMOS clock accepted.
+[TLS] memory pool initialised (512 KiB, fixed).
+[AUTH] Token Registry
+ Email                           UID   Role          Token                             Password
+ -------------------------------  ----  ------------  --------------------------------  --------
+ dave@gridworkz.com  uid=1000  DB_ADMIN  deadbeef01234567cafebabe76543210  demo-dave
+ bob@vance.com  uid=1001  APP_USER  cafebabe7654321089abcdef01234567  demo-bob
+ carol@gridworkz.com  uid=1002  DB_ADMIN  feedf00dabcdef0112345678deadc0de  demo-carol
+ guest@sandbox.com  uid=1003  GUEST  deadc0de9988776655443322aabbccdd  demo-guest
+
+[JOURNAL] Subsystem initialised.
+[LOCK] Row-level lock manager initialised.
+[INDEX] Secondary index manager initialised.
+[CONSTRAINT] Engine initialised.
+[CURSOR] Server-side cursor engine initialised.
+[MQT] Materialized query table engine initialised.
+[ROWSTORE] Row-set storage engine initialised.
+[ROW_INDEX] B-tree row index engine initialised.
+[VECSTORE] Vector store engine initialised.
+[AGENT] Agent engine initialised (max agents=8, max workflows=4)
+[MK] Microkernel booted successfully. Ring-0 primitives online.
+[IPC] Message Passing interface configured (Port bounds 0x1001 - 0x1007).
+[MK] registering services
+[MK] Service ONLINE: VirtualMemoryMgr  PID=101
+[MK] Service ONLINE: ObjectSecurityMgr  PID=102
+[MK] Service ONLINE: NativeDbStoreMgr  PID=103
+[MK] Service ONLINE: StorageTierMgr  PID=104
+[MK] Service ONLINE: RecoveryLogVerifier  PID=105
+[MK] Service ONLINE: AgentRuntimeMgr  PID=106
+[MK] Service ONLINE: CheckpointMgr  PID=107
+[MK] Fault Isolation Daemon active. Poll interval: 100ms.
+[TIER] Storage Tier Manager initialized.
+[TIER] Thresholds: promote=8 accesses/tick  demote=30 idle ticks.
+[CKPT] CheckpointMgr initialised.
+[BSP] Waking Core 1...
+[SMP] AP at APIC id 1 online.
+[BSP] Core 1 online.
+[NET] PCI scanning for e1000...
+[NET] e1000 #0 at PCI slot 3 MMIO 0xfeb80000
+[NET] NIC roles taken from the command line.
+[E1000] nic0 MAC 52:54:00:12:34:01  roles: mgmt cluster
+[NET] Packet buffer pool ready (64 x 2 KB).
+[ARP] Announced 10.0.2.15 -> 52:54:00:12:34:01
+[DHCP] Starting DISCOVER...
+[DHCP] Bound: 10.0.2.15  gw 10.0.2.2  subnet 255.255.255.0
+[NET] 1 e1000 interface(s) online, 0 reserved for user drivers.
+[QEMU-SLS TCACHE] NVMe unavailable — cold start
+[QEMU-SLS PGO] hot threshold=1000, scan interval=1000 ticks
+[QEMU-SLS VM] no snapshot -- Phase 4 save/restore has no callers (scaffolding, awaiting a launcher resume path)
+[SECURITY] UID 1000 assigned role DB_ADMIN.
+[AUDIT] #1 uid=1000 action=ROLE_CHANGE detail=DB_ADMIN granted=1
+[SECURITY] UID 1001 assigned role APP_USER.
+[AUDIT] #2 uid=1001 action=ROLE_CHANGE detail=APP_USER granted=1
+[SECURITY] UID 1002 assigned role DB_ADMIN.
+[AUDIT] #3 uid=1002 action=ROLE_CHANGE detail=DB_ADMIN granted=1
+[SECURITY] UID 1003 assigned role GUEST.
+[AUDIT] #4 uid=1003 action=ROLE_CHANGE detail=GUEST granted=1
+[AUTH] Default demo account roles seeded in object-catalog role_table.
+[BOOT] unified boot requested (unified=1) — the Ring-0 control plane and the sidecar world will share this boot.
+[E1] control plane planted as PID 1 'kplane' in PARTITION_SYSTEM (proc slot 15; slot 0 belongs to the boot parent)
+[E1] BIB v3 flags=0x1 (UNIFIED) written into every sidecar's boot info block
+[CONSOLE] sidecar input forwarding disabled (kernel owns the console)
+[SIDECAR] boot image: init @0x20000000 (135184 B) dm @0x21022000 (106512 B) posix @0x2107d000 (1339688 B) ramdisk @0x215c5000 (94224 B) net @0x2261d000 (295056 B) e1000 @0x226e6000 (37272 B) registry @0x22770000 (4096 B)
+[SIDECAR] rootfs: 4096 bytes @ 0x2161d000
+[SIDECAR] device registry: 4 device(s) @0x22770000
+[SIDECAR] boot parent planted: slot0 pid=99 active=1 state=4
+[PAGING] New user PML4 at 0x000000000e206000
+[SIDECAR] PID 100 'aerosls.init.0': wired chan 'console' to kernel service 'kernel.debug.console' (slots 9/10, kernel end 0/1)
+[SIDECAR] PID 100 'aerosls.init.0': wired chan 'env' to kernel service 'kernel.env.control' (slots 11/12, kernel end 2/3)
+[ENV] control channel wired: kernel ends rd=2 wr=3
+[SIDECAR] PID 100 'aerosls.init.0' released — runs on next schedule (BIB at 0x0000400000042000, entry 0x0000400000000000)
+[E1] init sidecar created (PID 100, messenger CHAN_R 0) and left RUNNABLE — unified boot: control plane and sidecars share this boot
+----------------------------------------------------------------------------------
+[SLS] System ready. Launching secure shell...
+----------------------------------------------------------------------------------
+
+--- Multi-User SLS Secure Shell Active ---
+Type 'help' for available commands.
+
+uid:1000> [HTTP] Listening on port 3000. GET http://10.0.2.15:3000/api/scan
+[TLS] no NVMe -- the CA cannot be stored and will not survive this boot.
+[TLS] new CA could NOT be stored -- it will not survive a reboot.
+[TLS] server ready: TLS 1.3, P-256. leaf 474 bytes, CA 452 bytes.
+[TLS] this leaf CANNOT be renewed in flight -- no CA on disk. It expires when it expires.
+[TLS] import the CA (not the leaf) to trust this node.
+[TLS] Listening on port 8443. https://10.0.2.15:8443/
+[NET] hb TX: 1 heartbeat/liveness frame(s) handed to the NIC
+[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 1
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] ── AeroSLS init sidecar booting ──[INIT] budget: 16 MiB[INIT] found 4 PCI device(s)[INIT]   [0]  class=06:00 vendor=8086 dev=1237 bar=0x00000000[INIT]   [1]  class=06:01 vendor=8086 dev=7000 bar=0x00000000[INIT]   [2]  class=03:00 vendor=1234 dev=1111 bar=0xfd000000[INIT]   [3]  class=02:00 vendor=8086 dev=100e bar=0xfeb80000[PAGING] New user PML4 at 0x000000000e25b000
+[INIT] spawning Device Manager...[INIT]   (create_sidecar: drv.device_manager.0 image @ 0x21022000, 106512 bytes)[SIDECAR] PID 101 'drv.device_manager.0': wired chan 'console' to kernel service 'kernel.debug.console' (slots 3/4, kernel end 4/5)
+[SIDECAR] PID 101 'drv.device_manager.0' released — runs on next schedule (BIB at 0x000040000001f000, entry 0x0000400000000000)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 101
+[INIT]   messenger: CHAN_R=13 CHAN_W=14[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[CAP] woken PID 100 (channel 3)
+[INIT] sending device registry to Device Manager...[INIT] waiting for Device Manager to initialise devices...[DM] ── AeroSLS Device Manager booting ──[DM] budget: 256 KiB heap[DM] waiting for the device registry from init...[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[CAP] woken PID 100 (channel 3)
+[CAP] send handoff: PID 101 -> 100
+[PAGING] New user PML4 at 0x000000000e284000
+[SIDECAR] PID 102 'drv.ramdisk.0': wired chan 'console' to kernel service 'kernel.debug.console' (slots 4/5, kernel end 6/7)
+[SIDECAR] PID 102 'drv.ramdisk.0' released — runs on next schedule (BIB at 0x000040000001c000, entry 0x0000400000000000)
+[INIT] all devices ready.[INIT] spawning ramdisk driver...[INIT]   ramdisk budget @ 0x215dd000, storage @ 0x2161d000 (16 MiB)[INIT]   (create_sidecar: drv.ramdisk.0 image @ 0x215c5000, 94224 bytes)[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 101
+[INIT]   ramdisk messenger: CHAN_R=8 CHAN_W=3[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] UNIFIED boot (BIB flag): the kernel owns the NICs and the console; keeping the software-only spawn chain[INIT] e1000 BAR0 @ 0xfeb80000 → POSIX manifest DEV cap 'nic0.bar0'[INIT] unified boot: the network driver and the system POSIX sidecar stay unspawned (kernel-owned hardware)[INIT] ── Phase 5 init sidecar complete ──[INIT] system ready for POSIX sidecar creation.[INIT] entering the event loop (blocking wait + watchdog respawn)...[INIT] env manager on control channel (CHAN_R=11 CHAN_W=12)[INIT] unified boot: entering the heartbeat loop (DM watchdog + env control, no POSIX subject)[DM]   adopt [0]  class=06:00 vendor=8086 dev=1237 bar=0x00000000[DM]   adopt [1]  class=06:01 vendor=8086 dev=7000 bar=0x00000000[DM]   adopt [2]  class=03:00 vendor=1234 dev=1111 bar=0xfd000000[DM]   adopt [3]  class=02:00 vendor=8086 dev=100e bar=0xfeb80000[DM] registry: 4 device(s) adopted[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 1[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 2[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 3[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 4[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 5[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 6[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 7[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 8[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 9[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 10[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 11[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 2
+[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 12[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 13[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 14[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 15[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 16[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 17[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 18[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 19[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 20[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 21[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 22[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 23[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 24[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 25[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 3
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 26[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 27[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 28[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 29[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 30[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 31[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 32[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 33[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 34[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 35[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 36[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 37[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 38[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 39[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 40[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 4
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 41[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 42[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 43[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 44[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[INIT] heartbeat 45[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 46[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[INIT] heartbeat 47[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 48[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[INIT] heartbeat 49[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 50[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[INIT] heartbeat 51[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 52[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[INIT] heartbeat 53[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 54[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 5
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[PROC] PID 100 yielded to PID 102
+[INIT] heartbeat 55[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 56[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[INIT] heartbeat 57[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 58[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 59[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 60[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 61[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 62[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 63[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 64[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 65[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 66[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 67[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 68[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 6
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 69[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 70[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 71[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 72[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 73[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 74[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 75[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 76[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 77[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 78[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 79[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 80[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 81[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 82[E1] yield: control plane -> PID 102 'drv.ramdisk.0' (budget 2 ticks)
+[E1] yield: control plane -> PID 100 'aerosls.init.0' (budget 2 ticks)
+[INIT] heartbeat 83[CONSENSUS] Terms timeout. Node 0 campaigning for Term election: 7
+help
+
+
+SLS Shell Commands:
+
+  -- Session --
+
+  login <uid> <gid>              change session credentials
+
+  -- Object Catalog (Phase 1) --
+
+  valloc <name> <type> <pages> [database]   allocate named persistent object
+
+                                   type: 0=SYSTEM_META 1=DB_TABLE
+
+                                         2=DB_INDEX    3=HEAP_BLOB
+
+  vfree  <name>                  release a named object
+
+  ls objects                     list all catalog entries
+
+  stat   <name>                  show full details for an object
+
+  object set database <name> <database|none>  retag any catalog object's database
+
+  -- DB Records (Phase 1) --
+
+  insert <object> <key> <value>  add a new record field
+
+  update <object> <key> <value>  modify a field (stages to WAL if tx open)
+
+  select <object> [<key>]        read one field, or all if key omitted
+
+  delete <object> <key>          remove a field (blocked if append-only)
+
+  -- Schema (Phase 6) --
+
+  schema set <obj> <key> <type>  define field type (STRING|UINT64|FLOAT|BOOL)
+
+  schema show <object>           dump schema + live values
+
+  -- Schema Import/Export (SQL Feature-Parity Roadmap, Phase 8) --
+
+  schema export                  dump CREATE TABLE/CREATE INDEX SQL for every readable table
+
+  schema import <sql>            run ';'-separated CREATE TABLE/INDEX statements
+
+  -- VectorStore Schema Import/Export (definitions only, no vector data) --
+
+  vec schema export              dump COLLECTION/INDEX definitions for every readable collection
+
+  vec schema import <text>       run COLLECTION/INDEX definition lines
+
+  -- VectorStore Data Import/Export (the embeddings themselves) --
+
+  vec data export <collection> [skip]   dump VECTOR lines (external_id + floats);
+
+                                   skip resumes a walk once entries_remaining > 0
+
+  vec data import <text>         run VECTOR lines (import schema first if restoring both)
+
+  -- Security (Phase 2) --
+
+  role set <uid> <role>          assign role (SYSTEM_KERNEL|DB_ADMIN|
+
+                                              APP_USER|GUEST)
+
+  grant  <uid> <object> <perm>   add perms (r|w|x|rw|rwx)
+
+  revoke <uid> <object> <perm>   remove perms
+
+  chmod  <name> <mask_hex>       set raw perm bitmask (legacy)
+
+  -- Transactions (Phase 3) --
+
+  tx begin                       open ACID transaction
+
+  tx commit                      commit staged writes to WAL
+
+  tx rollback                    discard staged writes
+
+  wal dump                       print WAL entries
+
+  wal recover                    replay WAL after simulated crash
+
+  -- Journaling (DB1 / IBM i STRJRNPF) --
+
+  journal create <name>            create a journal object
+
+  journal attach <jrn> <table>     start journaling a table
+
+  journal detach <jrn> <table>     stop journaling a table
+
+  journal list                     list all journals and attachments
+
+  journal dump <name>              show all entries for a journal
+
+  journal dump <name> <seq>        show entries since sequence number
+
+  journal purge <name>             remove rolled-back entries
+
+  -- Token Auth (Phase G) --
+
+  auth create <email> <uid> <role>  create a bearer token
+
+  auth list                         show token registry
+
+  auth revoke <email>               revoke all tokens for email
+
+  -- Group Profiles (Navigator-Parity Phase 3) --
+
+  group create <name> <role>       new group with an inherited role
+
+  group add <name> <uid>           add uid as a member of a group
+
+  group list                        list all group profiles
+
+  -- Authorization Lists (Navigator-Parity Phase 3) --
+
+  authlist create <name>                    new empty authorization list
+
+  authlist grant obj <list> <obj> <perm>    attach {object,perm} to a list
+
+  authlist grant uid <list> <uid>           add uid as a grantee
+
+  authlist grant group <list> <group>       add group as a grantee
+
+  authlist check <uid> <object> <perm>      test if a list would grant this
+
+  authlist list                              list all authorization lists
+
+  -- Database Namespace & Access (Phase 4) --
+
+  database create <name>                      new database (permission/organizational tag)
+
+  database drop <name>                        drop a database (refuses if a table is still tagged)
+
+  database list                                list all databases
+
+  database grant uid <name> <uid> <perm>      grant a uid access to a database's

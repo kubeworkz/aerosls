@@ -1,0 +1,12 @@
+image=sls_operating_system.iso
+image_sha256=665b4b961ff71a78c52355cbef245d429405b0272407c45795f0b36c2e5eb03f
+archive_sources=0bb19f57d9f2fafdcc6958e8c5afb8b5ff46cc2a4769980dd32605c703bcfdec
+archive_bytes=2b4472dce5795d97354a39bc4a1c154eaacab9c2c2623781bd14c01dea0b57bf
+boot=GRUB entry 3 unified=1, no disk
+sidecars=aerosls.init.0 PID100; drv.device_manager.0 PID101; drv.ramdisk.0 PID102
+absent=aerosls.posix.0,drv.network.0,drv.e1000.0
+cpu=yields=16 heartbeats=7; heartbeats_after_yields=7 yields_after_heartbeats=9
+health=status ok, uptime_ticks>0, heartbeats 7 -> 81 across two requests
+console=typed help answered by the kernel shell
+check=17/17 assertions passed; harness exit 0
+failures=none
