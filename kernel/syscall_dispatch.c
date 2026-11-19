@@ -2307,6 +2307,10 @@ uint64_t do_syscall(uint64_t num, void* arg) {
     case SYS_SLS_LINUX_ROBUST_EXIT:
         return sys_sls_linux_robust_exit(
             (struct SLSLinuxRobustExitRequest*)arg);
+    /* M2b: the loaded-image span the sidecar's mprotect ledger mirrors. */
+    case SYS_SLS_LINUX_IMAGE_SPAN:
+        return sys_sls_linux_image_span(
+            (struct SLSLinuxImageSpanRequest*)arg);
     case SYS_SLS_LINUX_SIGNAL_TASK:
         return sys_sls_linux_signal_task(
             (struct SLSLinuxSignalTaskRequest*)arg);

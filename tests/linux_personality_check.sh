@@ -60,6 +60,7 @@ bad() { echo "FAIL: $1"; fails=$((fails+1)); }
 # ─── A. Preconditions ──────────────────────────────────────────────────────
 for f in kernel/linux_abi.h kernel/linux_abi.c kernel/process.h kernel/process.c \
          kernel/cap.h kernel/cap.c kernel/syscall_dispatch.c kernel/chan.c \
+         kernel/linux_clone.c user/proto/src/kabi.rs \
          arch/x86/user_paging.h arch/x86/user_paging.c arch/x86/syscall.asm \
          user/sidecar/src/linux.rs user/sidecar/src/entry.rs \
          user/sidecar/src/e7_probe.rs user/sidecar/fixtures/e7_linux_probe.S \
@@ -87,6 +88,8 @@ DISP=kernel/syscall_dispatch.c
 LABH=kernel/linux_abi.h
 LABC=kernel/linux_abi.c
 CANC=kernel/chan.c
+LCC=kernel/linux_clone.c
+KABI=user/proto/src/kabi.rs
 LRS=user/sidecar/src/linux.rs
 LRE=user/sidecar/src/entry.rs
 LPRO=user/sidecar/src/e7_probe.rs
@@ -1901,6 +1904,29 @@ if grep -qF '"[E7] linux mprotect apply addr=0x%lx "' "$DISP" && \
     ok "Y11. the mprotect apply line is pinned: every forwarded request logs addr/len/prot, the reply word and the kernel's stamped span before the verdict, so a sidecar-side refusal (the RELRO image EINVAL) can be read back with its request shape"
 else
     bad "Y11. the mprotect apply line is gone or drifted: a forwarded mprotect no longer prints its addr/len/prot, reply and stamped span — a sidecar-side refusal would leave only the errno forward line, and the next seam slice could not tell which image page was refused, while the guard reads green"
+fi
+
+# ─── Y12. the mprotect ledger's image span (M2b) ──────────────────────
+# The loader RELROs its own image (the kernel maps the interpreter at
+# LINUX_INTERP_BASE) and the program's image at its linked address; both
+# sit outside the manifest's brk span, which is all the ledger was born
+# with, so the twin refused them EINVAL after the kernel had admitted
+# them. The span is the kernel's own stamp, asked through 336 and
+# mirrored into the mprotect check with the same min(base)/max(limit)
+# arithmetic the kernel's first trap uses.
+if grep -qF '#define SYS_SLS_LINUX_IMAGE_SPAN 336' "$CAPH" && \
+   grep -qF 'struct SLSLinuxImageSpanRequest {' "$CAPH" && \
+   grep -qF 'req->image_lo = pd->linux_image_lo;' "$LCC" && \
+   grep -qF 'req->image_hi = pd->linux_image_hi;' "$LCC" && \
+   grep -qF 'case SYS_SLS_LINUX_IMAGE_SPAN:' "$DISP" && \
+   grep -qF 'const SYS_LINUX_IMAGE_SPAN: u64 = 336;' "$KABI" && \
+   grep -qF 'fn linux_image_span(&self, pid: u32) -> (u64, u64)' "$KABI" && \
+   grep -qF 'image_span(pid)' "$LRE" && \
+   grep -qF 'if brk.image_lo != 0 && brk.image_lo < span_base {' "$LRS" && \
+   grep -qF 'len_r > span_limit - addr' "$LRS"; then
+    ok "Y12. the mprotect ledger carries the loaded-image span: kernel 336 returns the stamped image_lo/hi to the owning sidecar, the spawn path passes it into the ledger, and the mprotect twin mirrors the kernel's min(base)/max(limit) union — the loader's RELRO over its own and the program's image reaches the kernel instead of EINVAL at the twin"
+else
+    bad "Y12. the mprotect ledger's image span is gone or drifted: the 336 query, the image_lo/hi stamp, the spawn-path pass-through, or the min/max union in the mprotect check changed — the loader's RELRO over 0x7f00000b2000 / 0x403000 is refused EINVAL at the twin again and the two-DSO probe stalls after close(3), while the guard reads green"
 fi
 
 echo

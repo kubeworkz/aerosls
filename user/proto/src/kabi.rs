@@ -105,6 +105,19 @@ pub struct LinuxRobustExitReq {
     pub status: u32,
 }
 
+/// M2b loaded-image span request — the twin of `SLSLinuxImageSpanRequest`.
+/// The kernel stamped the span at create (the main ELF's PT_LOAD pages and,
+/// for a dynamic image, the interpreter mapped at LINUX_INTERP_BASE); the
+/// sidecar asks for it so its mprotect ledger mirrors the same span.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct LinuxImageSpanReq {
+    pub pid: u32,
+    pub status: u32,
+    pub image_lo: u64,
+    pub image_hi: u64,
+}
+
 /// M4.11 running-sibling signal request — the twin of
 /// `SLSLinuxSignalTaskRequest`. The delivery bytes are the same 80-byte
 /// trailer M4.10 puts on a parked target's deferred reply; here the kernel
@@ -479,6 +492,15 @@ pub trait Kernel {
         Err(ERR_NOTFOUND)
     }
 
+    /// M2b: the loaded-image span of the Linux task `pid`
+    /// (`SYS_SLS_LINUX_IMAGE_SPAN`, 336), as `(lo, hi)`; `(0, 0)` when the
+    /// task is gone or the query is unsupported. The ledger's mprotect
+    /// check is the heap span united with this one.
+    fn linux_image_span(&self, pid: u32) -> (u64, u64) {
+        let _ = pid;
+        (0, 0)
+    }
+
     /// M4.5: record this thread's clear-child-tid word
     /// (`SYS_SLS_LINUX_SET_CLEAR_TID`, 332). `va == 0` clears it.
     fn linux_set_clear_tid(&self, pid: u32, va: u64) -> Result<(), i32> {
@@ -601,6 +623,8 @@ mod abi {
     const SYS_LINUX_GROUP_SWEEP: u64 = 331;
     const SYS_LINUX_SET_CLEAR_TID: u64 = 332;
     const SYS_LINUX_ROBUST_EXIT: u64 = 333;
+    // M2b: the loaded-image span the sidecar's mprotect ledger mirrors.
+    const SYS_LINUX_IMAGE_SPAN: u64 = 336;
     const SYS_LINUX_SIGNAL_TASK: u64 = 335;
     const SYS_PROC_HOLD: u64 = 245;
     const SYS_PROC_RELEASE: u64 = 246;
@@ -1471,6 +1495,21 @@ mod abi {
                              &req as *const LinuxClearTidReq as u64) as i64 }
     }
 
+    /// `k_linux_image_span`: syscall 336 — M2b's loaded-image span query.
+    /// Returns 0 and fills `out`, or a negative CAP code.
+    #[no_mangle]
+    pub extern "C" fn k_linux_image_span(pid: u32,
+                                          out: *mut LinuxImageSpanReq) -> i64 {
+        let mut req = LinuxImageSpanReq { pid, status: 0, image_lo: 0, image_hi: 0 };
+        let rc = unsafe { sls_syscall(SYS_LINUX_IMAGE_SPAN,
+                                      &mut req as *mut LinuxImageSpanReq as u64) as i64 };
+        if !out.is_null() {
+            unsafe { *out = req; }
+        }
+        if rc < 0 { return rc; }
+        0
+    }
+
     /// `k_linux_robust_exit`: syscall 333 — M4.8's exit-time robust-futex
     /// walk. Returns the count of changed futex words, or a negative CAP code.
     #[no_mangle]
@@ -1789,6 +1828,14 @@ mod abi {
         fn linux_group_sweep(&self, tgid: u32) -> Result<u32, i32> {
             let rc = k_linux_group_sweep(tgid);
             if rc >= 0 { Ok(rc as u32) } else { Err(rc as i32) }
+        }
+
+        fn linux_image_span(&self, pid: u32) -> (u64, u64) {
+            let mut out = LinuxImageSpanReq::default();
+            if k_linux_image_span(pid, &mut out) != 0 {
+                return (0, 0);
+            }
+            (out.image_lo, out.image_hi)
         }
 
         fn linux_set_clear_tid(&self, pid: u32, va: u64) -> Result<(), i32> {

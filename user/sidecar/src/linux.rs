@@ -766,6 +766,12 @@ struct MemBrk {
     limit: u64,
     cur: u64,
     mtop: u64,
+    /// M2b: the task's loaded-image span, asked of the kernel that stamped
+    /// it (the interpreter's half is the kernel's placement). Zero on a
+    /// task with no image span or a pre-span boot: the ledger then admits
+    /// the heap span alone, exactly as before.
+    image_lo: u64,
+    image_hi: u64,
 }
 
 /// One Linux task's signal STATE (E7 increment 10, §10.13's step 2) — the
@@ -1358,6 +1364,21 @@ fn answer(
                 Some(v) if len != 0 => v & !0xFFFu64,
                 _ => return Answer::Reply(0, E_INVAL),
             };
+            /* M2b: the kernel's own span is the heap stamp united with
+             * the loaded image (the loader RELROs its image at
+             * LINUX_INTERP_BASE and the program's at its linked
+             * address, both outside the brk span). Mirror exactly that
+             * arithmetic — min(base) and max(limit), image live when
+             * image_lo is nonzero — so the twin refuses the same
+             * addresses the kernel's first trap does. */
+            let mut span_base = brk.base;
+            let mut span_limit = brk.limit;
+            if brk.image_lo != 0 && brk.image_lo < span_base {
+                span_base = brk.image_lo;
+            }
+            if brk.image_hi > span_limit {
+                span_limit = brk.image_hi;
+            }
             if prot & !0x7 != 0 {
                 Answer::Reply(0, E_INVAL)
             } else if args[2] & 0x2 != 0 && args[2] & 0x4 != 0 {
@@ -1366,8 +1387,8 @@ fn answer(
                 Answer::Reply(0, E_NOSYS)
             } else if addr & 0xFFF != 0 {
                 Answer::Reply(0, E_INVAL)
-            } else if addr < brk.base || addr > brk.limit
-                   || len_r > brk.limit - addr {
+            } else if addr < span_base || addr > span_limit
+                   || len_r > span_limit - addr {
                 /* the ledger's span is this side's twin of the kernel's
                  * first-trap range check: a page outside it was never a
                  * mapping this shim granted, so no leaf may be retargeted
@@ -3184,6 +3205,8 @@ struct LinuxGroup {
     brk_limit: u64,
     brk_cur: u64,
     brk_mtop: u64,
+    image_lo: u64,
+    image_hi: u64,
     sig_dispo: [u8; SIG_MAX + 1],
     sig_act: [SigAct; SIG_MAX + 1],
     futex: [FutexWaiter; MAX_FUTEX_WAITERS],
@@ -3205,6 +3228,8 @@ impl LinuxGroup {
             brk_limit: 0,
             brk_cur: 0,
             brk_mtop: 0,
+            image_lo: 0,
+            image_hi: 0,
             sig_dispo: [DISPO_DFL; SIG_MAX + 1],
             sig_act: [SigAct::new(); SIG_MAX + 1],
             futex: [FutexWaiter { used: false, task: 0, uaddr: 0, seq: 0,
@@ -3318,6 +3343,10 @@ pub fn track(
     partition: u32,
     heap_base: u64,
     heap_limit: u64,
+    image: (u64, u64), /* M2b: the loaded-image span the kernel stamped,
+                        * from `Kernel::linux_image_span`; (0, 0) when
+                        * the task has none, and then the ledger's
+                        * mprotect span is the heap's alone            */
     vfs_task: u32,   /* step 4: the VFS task id the file-class arms
                       * operate over — allocated by the spawn path
                       * (it owns the ProcManager) before the track   */
@@ -3327,8 +3356,8 @@ pub fn track(
                       * user — mirror its console output to the serial
                       * log (the tenant console is otherwise unobserved) */
 ) -> bool {
-    track_mode(ch_r, ch_w, name, partition, heap_base, heap_limit, vfs_task,
-               leader_tid, gate, gate)
+    track_mode(ch_r, ch_w, name, partition, heap_base, heap_limit, image,
+               vfs_task, leader_tid, gate, gate)
 }
 
 /// M5.2a: track an ordinary-tenant test child whose console must be visible
@@ -3342,11 +3371,12 @@ pub fn track_mirrored(
     partition: u32,
     heap_base: u64,
     heap_limit: u64,
+    image: (u64, u64),
     vfs_task: u32,
     leader_tid: u64,
 ) -> bool {
-    track_mode(ch_r, ch_w, name, partition, heap_base, heap_limit, vfs_task,
-               leader_tid, false, true)
+    track_mode(ch_r, ch_w, name, partition, heap_base, heap_limit, image,
+               vfs_task, leader_tid, false, true)
 }
 
 fn track_mode(
@@ -3356,6 +3386,7 @@ fn track_mode(
     partition: u32,
     heap_base: u64,
     heap_limit: u64,
+    image: (u64, u64),
     vfs_task: u32,
     leader_tid: u64,
     gate: bool,
@@ -3385,6 +3416,8 @@ fn track_mode(
     g.brk_limit = heap_limit;
     g.brk_cur = heap_base;
     g.brk_mtop = heap_limit;
+    g.image_lo = image.0;
+    g.image_hi = image.1;
     g.sig_dispo = [DISPO_DFL; SIG_MAX + 1];
     g.sig_act = [SigAct::new(); SIG_MAX + 1];
     for slot in g.fds.iter_mut().take(3) {
@@ -4606,6 +4639,8 @@ pub fn service<K: Kernel, A: BufferAlloc>(
             limit: groups()[gid].brk_limit,
             cur: groups()[gid].brk_cur,
             mtop: groups()[gid].brk_mtop,
+            image_lo: groups()[gid].image_lo,
+            image_hi: groups()[gid].image_hi,
         };
         let mut sigstate = tasks()[i].sig; /* per-thread half: mask, */
                                            /* pending, tid, alt stack */
@@ -5775,7 +5810,7 @@ mod tests {
         b
     }
     fn ledger() -> MemBrk {
-        MemBrk { base: 0, limit: 0, cur: 0, mtop: 0 }
+        MemBrk { base: 0, limit: 0, cur: 0, mtop: 0, image_lo: 0, image_hi: 0 }
     }
     /* The fixture span the mem-class tests share: 64 KiB exactly as the
      * probe's manifest stamps it (increment 16's ledger tests). */
@@ -5783,7 +5818,8 @@ mod tests {
     const SPAN_LIMIT: u64 = SPAN_BASE + 0x10000;
     fn span() -> MemBrk {
         MemBrk { base: SPAN_BASE, limit: SPAN_LIMIT,
-                 cur: SPAN_BASE, mtop: SPAN_LIMIT }
+                 cur: SPAN_BASE, mtop: SPAN_LIMIT,
+                 image_lo: 0, image_hi: 0 }
     }
     /* The fixture tid: what the candidate's set_tid_address answer echoes
      * (the address of __thread_list_lock, 0x807c398 in the committed
@@ -7132,7 +7168,7 @@ mod tests {
         let _guard = M4_10_TEST_LOCK.lock().unwrap();
         reset_registry();
         assert!(track(0x10, 0x11, "m4.3.leader", 0,
-                      0x80_0000, 0x81_0000, 7, 0x7000, false));
+                      0x80_0000, 0x81_0000, (0, 0), 7, 0x7000, false));
         let gid = tasks()[0].group;
         assert_eq!(tasks()[0].sig.tid, 0x7000, "the leader's real TID");
         assert_eq!(tasks()[0].sig.tgid, 0x7000, "the leader is the TGID");
@@ -7210,7 +7246,7 @@ mod tests {
     fn futex_wait_wake_is_group_keyed_fifo_with_timeout_and_release() {
         let _guard = M4_10_TEST_LOCK.lock().unwrap();
         reset_registry();
-        assert!(track(0x10, 0x11, "m4.4.leader", 0, 0x80_0000, 0x81_0000,
+        assert!(track(0x10, 0x11, "m4.4.leader", 0, 0x80_0000, 0x81_0000, (0, 0),
                       7, 0x7000, false));
         let gid = tasks()[0].group;
         for (i, (ch_r, ch_w, name)) in [
@@ -7419,7 +7455,7 @@ mod tests {
         let _guard = M4_10_TEST_LOCK.lock().unwrap();
         reset_registry();
         assert!(track(0x10, 0x11, "m4.10.leader", 0,
-                      0x80_0000, 0x81_0000, 7, 0x7000, false));
+                      0x80_0000, 0x81_0000, (0, 0), 7, 0x7000, false));
         let gid = tasks()[0].group;
         assert_eq!(track_thread(0x20, 0x21, "m4.10.leader.t20", 0, 8, true,
                                 0x7001, 0x9000),
@@ -7461,7 +7497,7 @@ mod tests {
         let _guard = M4_10_TEST_LOCK.lock().unwrap();
         reset_registry();
         assert!(track(0x10, 0x11, "m4.10.stop.leader", 0,
-                      0x80_0000, 0x81_0000, 7, 0x7100, false));
+                      0x80_0000, 0x81_0000, (0, 0), 7, 0x7100, false));
         let gid = tasks()[0].group;
         assert_eq!(track_thread(0x20, 0x21, "m4.10.stop.leader.t20", 0, 8,
                                 true, 0x7101, 0),
@@ -7505,7 +7541,7 @@ mod tests {
         let _guard = M4_10_TEST_LOCK.lock().unwrap();
         reset_registry();
         assert!(track(0x10, 0x11, "m4.11.stop.leader", 0,
-                      0x80_0000, 0x81_0000, 7, 0x7200, false));
+                      0x80_0000, 0x81_0000, (0, 0), 7, 0x7200, false));
         let gid = tasks()[0].group;
         assert_eq!(track_thread(0x20, 0x21, "m4.11.stop.leader.t20", 0, 8,
                                 true, 0x7201, 0),
@@ -7588,7 +7624,7 @@ mod tests {
         let _guard = M4_10_TEST_LOCK.lock().unwrap();
         reset_registry();
         assert!(track(0x10, 0x11, "m4.11.rollback.leader", 0,
-                      0x80_0000, 0x81_0000, 7, 0x7500, false));
+                      0x80_0000, 0x81_0000, (0, 0), 7, 0x7500, false));
         let gid = tasks()[0].group;
         for (ch, tid, name) in [
             (0x20, 0x7501, "m4.11.rollback.leader.t20"),
@@ -7648,7 +7684,7 @@ mod tests {
         let _guard = M4_10_TEST_LOCK.lock().unwrap();
         reset_registry();
         assert!(track(0x10, 0x11, "m4.11.run.leader", 0,
-                      0x80_0000, 0x81_0000, 7, 0x7300, false));
+                      0x80_0000, 0x81_0000, (0, 0), 7, 0x7300, false));
         let gid = tasks()[0].group;
         assert_eq!(track_thread(0x20, 0x21, "m4.11.run.leader.t20", 0, 8,
                                 true, 0x7301, 0),
@@ -7686,7 +7722,7 @@ mod tests {
         let _guard = M4_10_TEST_LOCK.lock().unwrap();
         reset_registry();
         assert!(track(0x10, 0x11, "m4.11.grouprun.leader", 0,
-                      0x80_0000, 0x81_0000, 7, 0x7400, false));
+                      0x80_0000, 0x81_0000, (0, 0), 7, 0x7400, false));
         let gid = tasks()[0].group;
         assert_eq!(track_thread(0x20, 0x21, "m4.11.grouprun.leader.t20", 0, 8,
                                 true, 0x7401, 0),

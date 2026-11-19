@@ -1265,6 +1265,27 @@ struct SLSLinuxRobustExitRequest {
 
 uint64_t sys_sls_linux_robust_exit(struct SLSLinuxRobustExitRequest *req);
 
+/* ─── SYS_SLS_LINUX_IMAGE_SPAN (336) — M2b ────────────────────────────────
+ * The sidecar's mprotect ledger is born with the manifest's brk span, but
+ * the dynamic loader RELROs its own image (mapped at LINUX_INTERP_BASE)
+ * and the program's image, both outside that span. The kernel stamped the
+ * whole loaded-image span at create (min/max of the main ELF's PT_LOAD
+ * pages and, for a dynamic image, the interpreter's); the sidecar cannot
+ * derive the interpreter's half, because that placement is the kernel's.
+ * This returns the stamp so the ledger can mirror the same arithmetic.
+ * The sidecar is the only caller; authority, personality and partition
+ * are checked like the other Linux seams'. */
+#define SYS_SLS_LINUX_IMAGE_SPAN 336
+
+struct SLSLinuxImageSpanRequest {
+    uint32_t pid;           /* IN: the Linux task's leader pid */
+    uint32_t status;        /* OUT: 0, or a negative CAP_E* */
+    uint64_t image_lo;      /* OUT: the loaded image's base (0 = none) */
+    uint64_t image_hi;      /* OUT: its limit */
+};
+
+uint64_t sys_sls_linux_image_span(struct SLSLinuxImageSpanRequest *req);
+
 /* ─── SYS_SLS_LINUX_SIGNAL_TASK (335) — M4.11 ─────────────────────────────
  * The sidecar's way to put a recorded signal frame into a sibling that is
  * NOT parked on a deferred reply. A parked sibling's trailer already rides

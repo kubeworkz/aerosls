@@ -445,3 +445,28 @@ uint64_t sys_sls_linux_robust_exit(struct SLSLinuxRobustExitRequest *req) {
     }
     return 0;
 }
+
+/* M2b: the loaded-image span the sidecar's mprotect ledger mirrors. The
+ * kernel stamped it at create (cap.c: the ELF's PT_LOAD pages and, for a
+ * dynamic image, the interpreter mapped at LINUX_INTERP_BASE). The
+ * interpreter's half is the kernel's placement, not the manifest's, so the
+ * sidecar asks here instead of re-deriving ELF load arithmetic. A task
+ * that is gone, not Linux, or in another partition answers NOTFOUND. */
+uint64_t sys_sls_linux_image_span(struct SLSLinuxImageSpanRequest *req) {
+    struct ProcessDescriptor *caller = process_find_current();
+    struct ProcessDescriptor *pd;
+
+    if (!caller || !caller->active || !caller->sidecar_authority)
+        return (uint64_t)(int64_t)CAP_EPERM;
+    if (!req) return (uint64_t)(int64_t)CAP_EINVAL;
+    req->status = 0;
+    req->image_lo = 0;
+    req->image_hi = 0;
+    pd = clone_find_pid(req->pid);
+    if (!pd || !pd->active || pd->personality != PROC_PERSONALITY_LINUX ||
+        pd->partition_id != caller->partition_id)
+        return (uint64_t)(int64_t)(req->status = CAP_ERR_NOTFOUND);
+    req->image_lo = pd->linux_image_lo;
+    req->image_hi = pd->linux_image_hi;
+    return 0;
+}

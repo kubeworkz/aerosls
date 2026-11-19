@@ -30,6 +30,9 @@ FILES=(
     kernel/cap.c
     kernel/syscall_dispatch.c
     kernel/chan.c
+    # Y12 reads the 336 query's kernel side and its kabi twin.
+    kernel/linux_clone.c
+    user/proto/src/kabi.rs
     arch/x86/user_paging.h
     arch/x86/user_paging.c
     arch/x86/syscall.asm
@@ -1284,6 +1287,14 @@ tooth filemap-write-verdict-dropped Y10 "an RW file map is mapped read-only" "$W
 seed "$W/t152"
 sed -i 's/linux mprotect apply addr=0x%lx/linux mprotect applied/g' "$W/t152/kernel/syscall_dispatch.c"
 tooth mprotect-apply-log-gone Y11 "the mprotect apply line lost its request shape" "$W/t152"
+
+# t153: the ledger's mprotect span falls back to the heap alone — the
+# loader's RELRO over its own image and the program's is EINVAL at the
+# twin again, after the kernel admitted it. Guard clause Y12 must redden
+# by name.
+seed "$W/t153"
+sed -i 's/if brk.image_lo != 0 && brk.image_lo < span_base {/if false {/' "$W/t153/user/sidecar/src/linux.rs"
+tooth image-span-dropped-from-ledger Y12 "the mprotect ledger ignores the image span" "$W/t153"
 
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"

@@ -1,0 +1,19 @@
+272:[M2A] hello: spawned ch_00000013 
+540:[E7] linux mprotect apply addr=0x7f00000b2000 len=4096 prot=0x1 reply=0x0 (span 0x400000..0x7f00000b7000)
+583:[E7] linux mprotect apply addr=0x403000 len=4096 prot=0x1 reply=0x0 (span 0x400000..0x7f00000b7000)
+541:[E7] mprotect addr=0x7f00000b2000 len=4096 prot=0x1: 1 page(s) re-protected
+584:[E7] mprotect addr=0x403000 len=4096 prot=0x1: 1 page(s) re-protected
+658:[E7] linux: num=00000014 child=m2a.linux.hello.0 write ok len=7 |M2A-OK.|
+667:M2A-OK
+317:[E7] linux: num=0000009E child=m2a.linux.hello.0 ok
+388:[E7] linux: num=000000DA child=m2a.linux.hello.0 ok
+427:[E7] linux: num=0000000C child=m2a.linux.hello.0 ok
+465:[E7] linux: num=0000000C child=m2a.linux.hello.0 ok
+506:[E7] linux: num=00000009 child=m2a.linux.hello.0 ok mmap -> 0x0000400000016000
+534:[E7] linux: num=0000000A child=m2a.linux.hello.0 ok
+577:[E7] linux: num=0000000A child=m2a.linux.hello.0 ok
+620:[E7] linux: num=00000010 child=m2a.linux.hello.0 -> ENOSYS
+658:[E7] linux: num=00000014 child=m2a.linux.hello.0 write ok len=7 |M2A-OK.|
+697:[E7] linux: num=000000E7 child=m2a.linux.hello.0 exit_group status=0
+708:[E7] linux: num=000000E7 child=m2a.linux.hello.0 group swept=1 dead=1 live=0
+2397:[E7-GATE] held at the copy continuation: pid=113 'e7.gate.user.0' src_off=196608 rip=0x8057ab7 rsp=0x4000000a9778 ret=1024 -- the next read is the one the payload resumes INTO

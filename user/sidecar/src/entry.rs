@@ -265,6 +265,14 @@ fn touch_cookie() {
     unsafe { core::ptr::read_volatile(&SYSCALL_COOKIE); }
 }
 
+/// M2b: the loaded-image span a spawned task's ledger mirrors. The kernel
+/// stamped it at create (the main ELF's pages and the interpreter it placed
+/// itself), so the sidecar asks rather than re-deriving ELF load arithmetic;
+/// `(0, 0)` on a failed query leaves the ledger on the heap span alone.
+fn image_span(pid: u64) -> (u64, u64) {
+    RealKernel.linux_image_span(pid as u32)
+}
+
 pub(crate) fn klog(tag: &[u8], val: u32, extra: &[u8]) {
     let mut msg = [0u8; 96];
     let n = tag.len().min(24);
@@ -545,6 +553,8 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                      * line says so). */
                     match booted.proc.vfs.add_task() {
                         Ok(vt) => {
+                            let pid = RealKernel.sidecar_pid(
+                                crate::e7_probe::PROBE_NAME, 0) as u64;
                             if crate::linux::track(
                                 sp.ch_r,
                                 sp.ch_w,
@@ -552,8 +562,9 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                                 0,
                                 sp.heap_base,
                                 sp.heap_limit,
+                                image_span(pid),
                                 vt,
-                                RealKernel.sidecar_pid(crate::e7_probe::PROBE_NAME, 0) as u64,
+                                pid,
                                 false,
                             ) {
                                 klog(b"[E7] probe: spawned ch_r=", sp.ch_r, b"");
@@ -577,6 +588,8 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                 Ok(sp) => {
                     match booted.proc.vfs.add_task() {
                         Ok(vt) => {
+                            let pid = RealKernel.sidecar_pid(
+                                crate::e7_candidate::CAND_NAME, 0) as u64;
                             if crate::linux::track(
                                 sp.ch_r,
                                 sp.ch_w,
@@ -584,8 +597,9 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                                 0,
                                 sp.heap_base,
                                 sp.heap_limit,
+                                image_span(pid),
                                 vt,
-                                RealKernel.sidecar_pid(crate::e7_candidate::CAND_NAME, 0) as u64,
+                                pid,
                                 false,
                             ) {
                                 klog(b"[E7] candidate: spawned ch_r=", sp.ch_r, b"");
@@ -680,21 +694,22 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
             Ok(sp) => {
                 match booted.proc.vfs.add_task() {
                     Ok(vt) => {
+                        let name = if gate {
+                            crate::e7_firstuser::GATE_TASK_NAME
+                        } else {
+                            crate::e7_firstuser::USER_NAME
+                        };
+                        let pid = RealKernel.sidecar_pid(name, 0) as u64;
                         if crate::linux::track(
                             sp.ch_r,
                             sp.ch_w,
-                            if gate {
-                                crate::e7_firstuser::GATE_TASK_NAME
-                            } else {
-                                crate::e7_firstuser::USER_NAME
-                            },
+                            name,
                             0,
                             sp.heap_base,
                             sp.heap_limit,
+                            image_span(pid),
                             vt,
-                            RealKernel.sidecar_pid(
-                                if gate { crate::e7_firstuser::GATE_TASK_NAME }
-                                else { crate::e7_firstuser::USER_NAME }, 0) as u64,
+                            pid,
                             gate,
                         ) {
                             klog(b"[E7] firstuser: spawned ch_r=", sp.ch_r, b"");
@@ -729,11 +744,12 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                     &RealKernel, caps.budget_base, caps.budget_len) {
                     Ok(sp) => match booted.proc.vfs.add_task() {
                         Ok(vt) => {
+                            let pid = RealKernel.sidecar_pid(
+                                crate::m2a_interp::M2A_NAME, 0) as u64;
                             if crate::linux::track(
                                 sp.ch_r, sp.ch_w, crate::m2a_interp::M2A_NAME,
-                                0, sp.heap_base, sp.heap_limit, vt,
-                                RealKernel.sidecar_pid(crate::m2a_interp::M2A_NAME, 0) as u64,
-                                false,
+                                0, sp.heap_base, sp.heap_limit, image_span(pid),
+                                vt, pid, false,
                             ) {
                                 klog(b"[M2A] hello: spawned ch_r=", sp.ch_r, b"");
                             } else {
@@ -808,18 +824,18 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
             match spawned {
                 Ok(sp) => match booted.proc.vfs.add_task() {
                     Ok(vt) => {
+                        let pid = RealKernel.sidecar_pid(probe_name, 0) as u64;
                         let tracked = if tenant_linux {
                             crate::linux::track_mirrored(
                                 sp.ch_r, sp.ch_w, probe_name,
-                                0, sp.heap_base, sp.heap_limit, vt,
-                                RealKernel.sidecar_pid(probe_name, 0) as u64,
+                                0, sp.heap_base, sp.heap_limit, image_span(pid),
+                                vt, pid,
                             )
                         } else {
                             crate::linux::track(
                                 sp.ch_r, sp.ch_w, probe_name,
-                                0, sp.heap_base, sp.heap_limit, vt,
-                                RealKernel.sidecar_pid(probe_name, 0) as u64,
-                                true,
+                                0, sp.heap_base, sp.heap_limit, image_span(pid),
+                                vt, pid, true,
                             )
                         };
                         if tracked {
@@ -868,6 +884,8 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                                                 caps.budget_len) {
                 Ok(sp) => match booted.proc.vfs.add_task() {
                     Ok(vt) => {
+                        let pid = RealKernel.sidecar_pid(
+                            crate::m4_thread_probe::PROBE_NAME, 0) as u64;
                         if crate::linux::track(
                             sp.ch_r,
                             sp.ch_w,
@@ -875,8 +893,9 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                             0,
                             sp.heap_base,
                             sp.heap_limit,
+                            image_span(pid),
                             vt,
-                            RealKernel.sidecar_pid(crate::m4_thread_probe::PROBE_NAME, 0) as u64,
+                            pid,
                             true,
                         ) {
                             klog(b"[M4.2] thread probe: spawned ch_r=", sp.ch_r, b"");
@@ -903,6 +922,8 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                                                caps.budget_len) {
                 Ok(sp) => match booted.proc.vfs.add_task() {
                     Ok(vt) => {
+                        let pid = RealKernel.sidecar_pid(
+                            crate::m4_group_probe::PROBE_NAME, 0) as u64;
                         if crate::linux::track(
                             sp.ch_r,
                             sp.ch_w,
@@ -910,8 +931,9 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                             0,
                             sp.heap_base,
                             sp.heap_limit,
+                            image_span(pid),
                             vt,
-                            RealKernel.sidecar_pid(crate::m4_group_probe::PROBE_NAME, 0) as u64,
+                            pid,
                             true,
                         ) {
                             klog(b"[M4.3] group probe: spawned ch_r=", sp.ch_r, b"");
@@ -937,6 +959,8 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                                                caps.budget_len) {
                 Ok(sp) => match booted.proc.vfs.add_task() {
                     Ok(vt) => {
+                        let pid = RealKernel.sidecar_pid(
+                            crate::m4_futex_probe::PROBE_NAME, 0) as u64;
                         if crate::linux::track(
                             sp.ch_r,
                             sp.ch_w,
@@ -944,8 +968,9 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                             0,
                             sp.heap_base,
                             sp.heap_limit,
+                            image_span(pid),
                             vt,
-                            RealKernel.sidecar_pid(crate::m4_futex_probe::PROBE_NAME, 0) as u64,
+                            pid,
                             true,
                         ) {
                             klog(b"[M4.4] futex probe: spawned ch_r=", sp.ch_r, b"");
@@ -971,6 +996,8 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                                               caps.budget_len) {
                 Ok(sp) => match booted.proc.vfs.add_task() {
                     Ok(vt) => {
+                        let pid = RealKernel.sidecar_pid(
+                            crate::m4_exit_probe::PROBE_NAME, 0) as u64;
                         if crate::linux::track(
                             sp.ch_r,
                             sp.ch_w,
@@ -978,8 +1005,9 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                             0,
                             sp.heap_base,
                             sp.heap_limit,
+                            image_span(pid),
                             vt,
-                            RealKernel.sidecar_pid(crate::m4_exit_probe::PROBE_NAME, 0) as u64,
+                            pid,
                             true,
                         ) {
                             klog(b"[M4.5] exit probe: spawned ch_r=", sp.ch_r, b"");
@@ -1008,6 +1036,8 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
             match crate::m1_net_probe::spawn(&RealKernel, caps.budget_base, caps.budget_len) {
                 Ok(sp) => match booted.proc.vfs.add_task() {
                     Ok(vt) => {
+                        let pid = RealKernel.sidecar_pid(
+                            crate::m1_net_probe::PROBE_NAME, 0) as u64;
                         if crate::linux::track(
                             sp.ch_r,
                             sp.ch_w,
@@ -1015,8 +1045,9 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                             0,
                             sp.heap_base,
                             sp.heap_limit,
+                            image_span(pid),
                             vt,
-                            RealKernel.sidecar_pid(crate::m1_net_probe::PROBE_NAME, 0) as u64,
+                            pid,
                             true,
                         ) {
                             klog(b"[M1] net probe: spawned ch_r=", sp.ch_r, b"");
