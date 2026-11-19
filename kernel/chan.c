@@ -1110,7 +1110,17 @@ uint64_t k_linux_deliver(uint32_t pid, uint16_t ch_r, uint64_t expect_num) {
         struct SLSChanRecvOut out;
         uint8_t rbuf[sizeof(struct SLSLinuxSyscallRequest)
                      + LINUX_FD_WRITE_CHUNK];
-        int rr = k_chan_recv(pid, ch_r, rbuf, (uint32_t)sizeof rbuf,
+        /* M2b: a file-map fill round's reply is larger than the
+         * write-chunk mirror, so it gets its own STATIC buffer (the
+         * kernel stack is 4 KiB; a 4 KiB local would not fit). The
+         * kernel does not preempt this call, so one buffer serves every
+         * task's rounds. */
+        static uint8_t frbuf[sizeof(struct SLSLinuxSyscallRequest)
+                              + LINUX_MMAP_FILL_CHUNK];
+        uint8_t *rb = (expect_num == LINUX_MMAP_FILL) ? frbuf : rbuf;
+        uint32_t rblen = (expect_num == LINUX_MMAP_FILL)
+                       ? (uint32_t)sizeof frbuf : (uint32_t)sizeof rbuf;
+        int rr = k_chan_recv(pid, ch_r, rb, rblen,
                              NULL, 0, &out);
 
         if (rr == CAP_ERR_OK) {
@@ -1193,12 +1203,12 @@ uint64_t k_linux_deliver(uint32_t pid, uint16_t ch_r, uint64_t expect_num) {
                 struct LinuxSignalDelivery sd;
                 const struct LinuxSignalFrame *from = 0;
                 for (i = 0; i < 8; i++)
-                    hn |= (uint64_t)rbuf[i] << (8 * i);
+                    hn |= (uint64_t)rb[i] << (8 * i);
                 for (i = 0; i < 4; i++)
-                    hs |= (int32_t)((uint32_t)rbuf[64 + i] << (8 * i));
+                    hs |= (int32_t)((uint32_t)rb[64 + i] << (8 * i));
                 if (hn == expect_num && hs == 0 &&
                     linux_signal_delivery_parse(
-                        rbuf + sizeof(struct SLSLinuxSyscallRequest), n,
+                        rb + sizeof(struct SLSLinuxSyscallRequest), n,
                         &sd) == 0) {
                     if (expect_num == LINUX_RT_SIGRETURN) {
                         /* A return-time pending delivery replaces the
@@ -1227,7 +1237,7 @@ uint64_t k_linux_deliver(uint32_t pid, uint16_t ch_r, uint64_t expect_num) {
                  * owes no payload and passes untouched. */
                 if (staged) {
                     int32_t status = 0;
-                    const uint8_t *sb = rbuf
+                    const uint8_t *sb = rb
                         + 64; /* offsetof(SLSLinuxSyscallRequest, status) */
                     for (i = 0; i < 4; i++)
                         status |= (int32_t)((uint32_t)sb[i] << (8 * i));
@@ -1242,7 +1252,7 @@ uint64_t k_linux_deliver(uint32_t pid, uint16_t ch_r, uint64_t expect_num) {
                             CAP_ERR_PROTO);
                 }
                 linux_syscall_describe(&req, expect_num, NULL);
-                return linux_syscall_apply_reply(&req, rbuf,
+                return linux_syscall_apply_reply(&req, rb,
                                                  (uint64_t)out.len);
             }
 
@@ -1254,7 +1264,7 @@ uint64_t k_linux_deliver(uint32_t pid, uint16_t ch_r, uint64_t expect_num) {
             {
                 uint64_t hdr_num = 0, hdr_ret = 0;
                 int32_t hdr_status = 0;
-                const uint8_t *b = rbuf;
+                const uint8_t *b = rb;
 
                 if (!staged || n > slen)
                     return (uint64_t)(int64_t)linux_errno_from_cap(
@@ -1276,9 +1286,9 @@ uint64_t k_linux_deliver(uint32_t pid, uint16_t ch_r, uint64_t expect_num) {
             linux_syscall_describe(&req, expect_num, NULL);
             {
                 uint64_t rax = linux_syscall_apply_reply(
-                    &req, rbuf, (uint64_t)sizeof(struct
+                    &req, rb, (uint64_t)sizeof(struct
                                                 SLSLinuxSyscallRequest));
-                const uint8_t *pay = rbuf +
+                const uint8_t *pay = rb +
                     (uint32_t)sizeof(struct SLSLinuxSyscallRequest);
                 uint32_t dlen;
                 /* apply re-enforces the echo (J2's order is untouched);
@@ -1366,6 +1376,33 @@ uint64_t k_linux_deliver(uint32_t pid, uint16_t ch_r, uint64_t expect_num) {
                         return (uint64_t)(int64_t)(-LINUX_EFAULT);
                     pd->linux_dir_pos += fitted;
                     return (uint64_t)(uint32_t)packed;
+                }
+                if (skind == LINUX_STAGE_FILL) {
+                    /* M2b: the destination is a page the mmap apply just
+                     * mapped READ-ONLY — the file's bytes belong in the
+                     * frame, and the user-write predicate would refuse
+                     * the very mapping it is filling. Write the leaf
+                     * frame directly (the kernel identity-maps physical
+                     * frames); a page with no frame is EFAULT. */
+                    uint64_t va = sva;
+                    uint32_t done = 0;
+                    while (done < n) {
+                        uint64_t page = va & ~(uint64_t)0xFFF;
+                        uint32_t off = (uint32_t)(va - page);
+                        uint32_t take = 4096u - off;
+                        uint64_t frame;
+                        uint32_t k;
+                        if (take > n - done) take = n - done;
+                        frame = linux_user_page_frame(pd->cr3, va);
+                        if (!frame)
+                            return (uint64_t)(int64_t)(-LINUX_EFAULT);
+                        for (k = 0; k < take; k++)
+                            ((uint8_t *)(uintptr_t)frame)[off + k] =
+                                pay[done + k];
+                        done += take;
+                        va += take;
+                    }
+                    return rax;
                 }
                 if (linux_user_copy_in(pay, pd->cr3, sva, n) != 0) {
                     /* The destination the child could not write (or an

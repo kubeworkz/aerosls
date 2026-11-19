@@ -758,7 +758,7 @@ int main(void)
     }
 
     /* ─── the mmap seam (E7 increment 16, §5.4): first-trap ladder ─── */
-    {   struct LinuxMmapReq req;
+    {   struct LinuxMmapReq req = {0};
         const uint64_t BASE  = 0x0000400000100000ULL;
         const uint64_t LIMIT = BASE + 0x10000;
 
@@ -802,11 +802,29 @@ int main(void)
         req.prot = LINUX_PROT_READ; req.len = 0;
         CHECK(linux_mem_mmap_refusal(&req, BASE, LIMIT) == -LINUX_EINVAL,
               "a zero length is EINVAL — Linux's own number");
-        /* file-backed, shared, unknown flag bits: ENOSYS by name */
+        /* M2b: the file-backed half — fd/offset are request words now.
+         * The loader's READ-ONLY private shape is served; every other
+         * file shape keeps a named refusal. */
         req.len = 4096; req.flags = LINUX_MAP_PRIVATE;
+        req.fd = 3; req.offset = 0;
+        CHECK(linux_mem_mmap_refusal(&req, BASE, LIMIT) == 0,
+              "a read-only MAP_PRIVATE file map (fd 3, offset 0) passes "
+              "      the first trap — the loader's DT_NEEDED shape");
+        req.offset = 0x100;
+        CHECK(linux_mem_mmap_refusal(&req, BASE, LIMIT) == -LINUX_EINVAL,
+              "a file map at a non-page-aligned offset is EINVAL — "
+              "      Linux's own rule");
+        req.offset = 0; req.prot = LINUX_PROT_READ | LINUX_PROT_WRITE;
         CHECK(linux_mem_mmap_refusal(&req, BASE, LIMIT) == -LINUX_ENOSYS,
-              "a file-backed map (no ANONYMOUS) is refused ENOSYS by "
-              "      name — the file class's own half of the path plan");
+              "a writable file map is ENOSYS by name — its own increment");
+        req.prot = LINUX_PROT_READ; req.fd = (uint64_t)(int64_t)-1;
+        CHECK(linux_mem_mmap_refusal(&req, BASE, LIMIT) == -LINUX_EBADF,
+              "a negative fd is EBADF — the words are read as Linux reads "
+              "      them, not truncated");
+        req.fd = 3; req.len = LINUX_MMAP_FILE_MAX + 4096;
+        CHECK(linux_mem_mmap_refusal(&req, BASE, LIMIT) == -LINUX_ENOSYS,
+              "a file map beyond the chunk stream's cap is ENOSYS by name");
+        req.len = 4096;
         req.flags = LINUX_MAP_ANONYMOUS | LINUX_MAP_SHARED;
         CHECK(linux_mem_mmap_refusal(&req, BASE, LIMIT) == -LINUX_ENOSYS,
               "a shared map is refused ENOSYS by name");
@@ -835,7 +853,7 @@ int main(void)
     /* ─── the mmap verdict: the re-check at the reply ─────────────── */
     {   const uint64_t BASE  = 0x0000400000100000ULL;
         const uint64_t LIMIT = BASE + 0x10000;
-        struct LinuxMmapReq req;
+        struct LinuxMmapReq req = {0};
         struct LinuxMemMmapVerdict v;
 
         /* the refusal reply: not malformed, nothing maps — its errno
@@ -928,6 +946,27 @@ int main(void)
         CHECK(v.malformed == 1 && v.range_pages == 0,
               "a W|X request reaching the verdict maps nothing — the "
               "      ladder is re-run, the verdict is total on any input");
+
+        /* M2b: a granted FILE map — read-only, every page backed from
+         * the staged chunk stream (the flag the apply switches on) */
+        req.addr = 0; req.len = 8192; req.prot = LINUX_PROT_READ;
+        req.flags = LINUX_MAP_PRIVATE; req.fd = 3; req.offset = 0;
+        v = linux_mem_mmap_verdict(BASE, LIMIT, BASE, LIMIT, &req,
+                                   LIMIT - 0x2000);
+        CHECK(v.malformed == 0 && v.file_backed == 1 &&
+                  v.prot_write == 0 && v.prot_none == 0 &&
+                  v.range_pages == 2 && v.map_pages == 2 &&
+                  v.new_mmap_top == LIMIT - 0x2000,
+              "a granted file map is flagged file_backed, read-only, and "
+              "      backs every page from the chunk stream");
+        req.len = 4096; req.flags = LINUX_MAP_PRIVATE | LINUX_MAP_FIXED;
+        req.addr = BASE + 0x1000;
+        v = linux_mem_mmap_verdict(BASE, LIMIT, BASE, LIMIT, &req,
+                                   BASE + 0x1000);
+        CHECK(v.malformed == 0 && v.replace == 1 && v.file_backed == 1 &&
+                  v.prot_write == 0 && v.map_pages == 1,
+              "a FIXED file map replaces and stays read-only — file bytes "
+              "      never arrive in a writable frame");
     }
 
     /* ─── the mprotect seam: the Rust guard-page shape ─────────────────── */

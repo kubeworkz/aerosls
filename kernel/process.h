@@ -229,6 +229,26 @@ struct ProcessDescriptor {
                                        // the brk rule over four words instead of
                                        // one. Zeroed for SLS and for non-mmap
                                        // forwards beside mem_stage_a0.
+    uint64_t   mem_stage_a4;           // M2b: args[4..5] as captured — a mmap's
+    uint64_t   mem_stage_a5;           // fd and file offset. The fill rounds'
+                                       // length is derived from a1 at the
+                                       // deliver; both words clear beside a3.
+    uint8_t    mmap_fill_valid;        // M2b: a file map's fill rounds are in
+                                       // flight — the grant is applied, the
+                                       // pages wait for their bytes, and each
+                                       // resume asks the sidecar for the next
+                                       // chunk until off reaches len. Cleared
+                                       // when the last round lands, on any
+                                       // refusal, and at slot reuse.
+    uint8_t    mmap_fill_pad[3];
+    uint32_t   mmap_fill_off;          // bytes of the mapping filled so far
+    uint32_t   mmap_fill_len;          // page-rounded mapping bytes to fill
+    uint64_t   mmap_fill_ret;          // the grant address to deliver when
+                                       // the last round has landed
+    uint64_t   mmap_fill_va;           // the mapping's first page (the fill
+                                       // destination side of each RAW copy)
+    uint64_t   mmap_fill_fd;           // the Linux fd (staged args[4])
+    uint64_t   mmap_fill_foff;         // the file offset (staged args[5])
     uint8_t    mem_stage_valid;        // 1 between that forward's arming and its
                                        // reply (or refusal)
     uint64_t   reply_stage_num;        // E7 increment 12 (§10.13's step 3): the

@@ -649,6 +649,23 @@ int linux_user_copy_out(uint8_t *dst, uint64_t root, uint64_t va, uint32_t n);
                             LINUX_MAP_FIXED   | LINUX_MAP_NORESERVE | \
                             LINUX_MAP_STACK)
 
+/* M2b: the file-backed half of the mmap seam. A mapping's bytes cannot
+ * ride one reply (CAP_MSG_MAX_PAYLOAD is 4 KiB), so after the grant the
+ * kernel asks for the file's bytes one bounded chunk at a time with
+ * LINUX_MMAP_FILL — a synthetic number, never a Linux syscall — and the
+ * sidecar answers each with a read_at payload that the ordinary RAW
+ * deliver copies into the already-mapped page. Request/reply per chunk,
+ * so no wake can ever outrun its data (the send-handoff lesson).
+ * LINUX_MMAP_FILE_MAX bounds one mapping and the round count. */
+#define LINUX_MMAP_FILL       0x4D4D4650u /* "MMFP" — one fill round   */
+#define LINUX_MMAP_FILL_CHUNK 4024u       /* bytes per round — the largest
+                                           * payload one reply message
+                                           * can carry (CAP_MSG_MAX_PAYLOAD
+                                           * − the 72-byte header), so the
+                                           * loader's 20 KiB map is six
+                                           * rounds, not twenty          */
+#define LINUX_MMAP_FILE_MAX   32768u      /* the largest file mapping served */
+
 /* 1 iff this mprotect must be refused before the post: prot has BOTH the
  * write and the execute bit. Total over every prot word. Also the mmap
  * first-trap's W|X rule (increment 16): the same §5.4 refusal over a
@@ -665,6 +682,11 @@ struct LinuxMmapReq {
     uint64_t len;    /* args[1] as captured — bytes, not pages          */
     uint64_t prot;   /* args[2] as captured — PROT_* word               */
     uint64_t flags;  /* args[3] as captured — MAP_* word                */
+    uint64_t fd;     /* args[4] as captured — the file (M2b), or -1 for
+                      * MAP_ANONYMOUS (Linux ignores it there)          */
+    uint64_t offset; /* args[5] as captured — file offset (M2b); a file
+                      * mapping requires it page-aligned (Linux's own
+                      * rule), and mmap never moves the fd's offset     */
 };
 
 /* The first-trap refusals for mmap (increment 16): pure predicates over
@@ -703,6 +725,9 @@ struct LinuxMemMmapVerdict {
     uint64_t new_mmap_top; /* the kernel-side cursor after this grant: */
                             /* descends for non-FIXED, unchanged for   */
                             /* FIXED (last map wins, as Linux itself)  */
+    int      file_backed;  /* M2b: the pages carry the file's bytes,  */
+                            /* staged by the chunk stream, instead of  */
+                            /* zeroes; the mapping is read-only        */
 };
 
 /* The verdict at the reply (increment 16): re-check a granted mmap's
@@ -1129,6 +1154,11 @@ _Static_assert(LINUX_CLONE_ARGS_BYTES < LINUX_FWD_ATTACH_CAP,
  * child destinations; the sidecar owns the bytes. */
 #define LINUX_STAGE_ACCEPT   4u
 #define LINUX_STAGE_RECVFROM 5u
+/* M2b: a file-map fill round's destination is an ALREADY-MAPPED page the
+ * file's bytes are copied into — read-only to ring 3 (the map is
+ * PROT_READ), so the deliver's user-write check is the wrong predicate
+ * and the kernel writes the frame it just mapped. */
+#define LINUX_STAGE_FILL     6u
 
 /* `struct stat`, musl x86-64 (144 bytes): field offsets the golden test
  * pins and the probe reads back on-target (§5.6). The sidecar's payload

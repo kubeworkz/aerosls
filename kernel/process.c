@@ -193,7 +193,18 @@ static void proc_clear_resume_state(struct ProcessDescriptor* pd) {
     pd->mem_stage_a1 = 0;
     pd->mem_stage_a2 = 0;
     pd->mem_stage_a3 = 0;
+    pd->mem_stage_a4 = 0;
+    pd->mem_stage_a5 = 0;
     pd->mem_stage_valid = 0;
+    /* M2b: a file map's fill rounds die with the slot — the resumed task
+     * must never inherit a predecessor's half-filled mapping. */
+    pd->mmap_fill_valid = 0;
+    pd->mmap_fill_off = 0;
+    pd->mmap_fill_len = 0;
+    pd->mmap_fill_ret = 0;
+    pd->mmap_fill_va = 0;
+    pd->mmap_fill_fd = 0;
+    pd->mmap_fill_foff = 0;
     /* E7 increment 12 (§10.13's step 3): the reply payload's staged
      * destination clears here for the same reason as every other stage —
      * an unanswered copy-in destination must not survive into a slot whose

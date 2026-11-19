@@ -1828,6 +1828,36 @@ else
     bad "Y8. the fstat(5) seam is gone or drifted: the number/table row, the sidecar's fd arm, its stat payload bound/routing, or the kernel's stat reply staging changed — the loader's size/mode ask would return ENOSYS or a stat reply would have no destination, while the guard reads green"
 fi
 
+# ─── Y9. the file-backed mmap seam (M2b) ──────────────────────────────────
+# Before it reads a symbol, the loader maps libm2a.so's first 20 KiB: the
+# kernel carries fd/offset in the request, refuses only shapes it cannot
+# fill, and after the grant posts bounded reads of the file and writes the
+# bytes into the pages it just mapped. A fill round has its own number so
+# the resume can tell it from the grant; the sidecar serves it with
+# Vfs::read_at and zero-pads past EOF, and the kernel writes the frames
+# because the mapping is read-only to ring 3 by design.
+if grep -qF 'uint64_t fd;     /* args[4] as captured' "$LABH" && \
+   grep -qF 'uint64_t offset; /* args[5] as captured' "$LABH" && \
+   grep -qF '#define LINUX_MMAP_FILL_CHUNK 4024u' "$LABH" && \
+   grep -qF '#define LINUX_STAGE_FILL     6u' "$LABH" && \
+   grep -qF 'if (num == LINUX_MMAP_FILL)' "$LABC" && \
+   grep -qF 'v.file_backed = !(req->flags & LINUX_MAP_ANONYMOUS);' "$LABC" && \
+   grep -qF 'static int linux_mmap_fill_post(struct ProcessDescriptor *cur,' "$DISP" && \
+   grep -qF 'cur->mem_stage_a4    = largs[4];' "$DISP" && \
+   grep -qF 'cur->mmap_fill_valid = 1;' "$DISP" && \
+   grep -qF 'cur->mmap_fill_fd    = sa4;' "$DISP" && \
+   grep -qF 'if (skind == LINUX_STAGE_FILL) {' "$CANC" && \
+   grep -qF 'frame = linux_user_page_frame(pd->cr3, va);' "$CANC" && \
+   grep -qF 'Answer::MmapFile(' "$LRS" && \
+   grep -qF 'LINUX_MMAP_FILL => {' "$LRS" && \
+   grep -qF 'let got = vfs.read_at(vt, s.vfs_fd, args[1],' "$LRS" && \
+   grep -qF 'LINUX_MMAP_FILL => len == args[2] as usize' "$LRS" && \
+   grep -qF 'pub fn read_at(&mut self, task: u32, fd: u32, offset: u64,' "$VFSR"; then
+    ok "Y9. the file-backed mmap seam is wired: the request carries fd/offset, the ladder serves only file shapes it can fill, the apply stages the grant's fd/offset and starts bounded fill rounds (one reply message each, 4024 bytes), the resume keys on LINUX_MMAP_FILL with LINUX_STAGE_FILL copying into the just-mapped frame, and the sidecar answers via Vfs::read_at zero-padded to the round"
+else
+    bad "Y9. the file-backed mmap seam is gone or drifted: the request's fd/offset, the file-shape ladder/verdict, the fill-round post/resume, the frame write that bypasses the read-only map, or the sidecar's Vfs::read_at arm changed — the loader's 20 KiB DSO map would be refused, partially backed, or filled from the wrong offset, while the guard reads green"
+fi
+
 echo
 if [ "$fails" -eq 0 ]; then
     echo "linux_personality_check: all clauses hold"

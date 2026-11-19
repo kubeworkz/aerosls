@@ -4233,6 +4233,15 @@ static int cap_create_sidecar_in_personality_owned(uint32_t parent_pid,
     pd->mem_stage_a1     = 0;
     pd->mem_stage_a2     = 0;
     pd->mem_stage_a3     = 0;
+    pd->mem_stage_a4     = 0;
+    pd->mem_stage_a5     = 0;
+    pd->mmap_fill_valid  = 0;
+    pd->mmap_fill_off    = 0;
+    pd->mmap_fill_len    = 0;
+    pd->mmap_fill_ret    = 0;
+    pd->mmap_fill_va     = 0;
+    pd->mmap_fill_fd     = 0;
+    pd->mmap_fill_foff   = 0;
     if (personality == PROC_PERSONALITY_LINUX) {
         pd->linux_heap_base  = stack_base + (uint64_t)stk_pages * 4096;
         pd->linux_heap_limit = pd->linux_heap_base

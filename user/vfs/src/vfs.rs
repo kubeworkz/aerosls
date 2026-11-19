@@ -2955,6 +2955,30 @@ impl<K: Kernel, A: BufferAlloc> Vfs<K, A> {
         Ok(newfd)
     }
 
+    /// Read at an EXPLICIT offset without moving the descriptor's own:
+    /// mmap(2) maps a file without disturbing the fd's offset, so the
+    /// file-map chunk stream reads through here (M2b). Same rights check
+    /// and same regular-file rule as `read`; only File backing answers —
+    /// every other object is EBADF, never a fabricated zero.
+    pub fn read_at(&mut self, task: u32, fd: u32, offset: u64,
+                   buf: &mut [u8]) -> Result<usize, Errno> {
+        let obj = {
+            let idx = self.task_mut(task)?.fds;
+            let e = self.table_pool[idx].get(fd).ok_or(Errno::EBadf)?;
+            if e.rights & R == 0 {
+                return Err(Errno::EBadf);
+            }
+            e.node.clone()
+        };
+        match &*obj {
+            FileObj::File(node) => {
+                let fs = self.fs_mut_id(node.fs, node.fs_id)?;
+                fs.read(node.ino, offset, buf)
+            }
+            _ => Err(Errno::EBadf),
+        }
+    }
+
     pub fn read(&mut self, task: u32, fd: u32, buf: &mut [u8]) -> Result<usize, Errno> {
         let obj = {
             let idx = self.task_mut(task)?.fds;

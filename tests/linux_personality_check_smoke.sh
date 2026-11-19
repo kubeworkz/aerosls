@@ -1229,6 +1229,27 @@ seed "$W/t144"
 sed -i 's/} else if (num == LINUX_STAT || num == LINUX_LSTAT || num == LINUX_FSTAT) {/} else if (num == LINUX_STAT || num == LINUX_LSTAT) {/' "$W/t144/kernel/linux_abi.c"
 tooth fstat-reply-stage-gone Y8 "the kernel no longer stages fstat's stat buffer" "$W/t144"
 
+# t145: the apply maps the file's pages but never starts a fill — the
+# grant is applied and the loader reads a zero-filled mapping. Guard
+# clause Y9 must redden by name.
+seed "$W/t145"
+sed -i '/cur->mmap_fill_valid = 1;/d' "$W/t145/kernel/syscall_dispatch.c"
+tooth filemap-fill-not-started Y9 "a file-backed mmap is granted with no bytes filled" "$W/t145"
+
+# t146: the sidecar's fill arm reads the file from offset 0 every round —
+# every page past the first gets the wrong bytes. Guard clause Y9 must
+# redden by name.
+seed "$W/t146"
+sed -i 's/let got = vfs.read_at(vt, s.vfs_fd, args\[1\],/let got = vfs.read_at(vt, s.vfs_fd, 0,/' "$W/t146/user/sidecar/src/linux.rs"
+tooth filemap-fill-wrong-offset Y9 "a fill round reads the file from offset 0" "$W/t146"
+
+# t147: Vfs::read_at disappears, so the fill arm has no positional read
+# to call and a mapper would have to seek the shared cursor. Guard clause
+# Y9 must redden by name.
+seed "$W/t147"
+sed -i 's/pub fn read_at(&mut self, task: u32, fd: u32, offset: u64,/pub fn read_from(\&mut self, task: u32, fd: u32, offset: u64,/' "$W/t147/user/vfs/src/vfs.rs"
+tooth filemap-positional-read-gone Y9 "Vfs::read_at is gone" "$W/t147"
+
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

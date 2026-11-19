@@ -131,6 +131,17 @@ static uint64_t sls_legacy_allocate(void* arg) {
     return 0;
 }
 
+/* ─── M2b: one file-map fill round ────────────────────────────────────────
+ * The grant is already applied and its pages mapped (zero-filled); this
+ * posts the next bounded read of the file at the staged fd/offset and
+ * stages WHERE the bytes land — the already-mapped page at
+ * mmap_fill_va + off, through the ordinary RAW deliver. It parks exactly
+ * like a first trap and returns only on a refusal. The reply's number is
+ * LINUX_MMAP_FILL, which is also the resume's wake cookie, and that is
+ * how the resume arm tells a fill round from the mmap grant. */
+static int linux_mmap_fill_post(struct ProcessDescriptor *cur,
+                                uint16_t ch_w, uint16_t ch_r);
+
 // ─── do_syscall ───────────────────────────────────────────────────────────────
 uint64_t do_syscall(uint64_t num, void* arg) {
     /* ── E7 (increment 3): the Linux-personality branch (D1, §3.3) ────────
@@ -186,6 +197,45 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                     cur->park_syscall = 0;
                     return (uint64_t)(int64_t)linux_errno_from_cap(
                         CAP_ERR_REVOKED);
+                }
+                /* M2b: this resume is a fill round, not a syscall reply.
+                 * Each round's bytes were already copied into the mapped
+                 * page by the deliver's RAW stage; the count is the round's
+                 * payload length, so the next destination is off + count.
+                 * The LAST round delivers the saved grant address — ring 3
+                 * never sees the mapping until every page carries its
+                 * file bytes. */
+                if ((uint64_t)(uintptr_t)arg == (uint64_t)LINUX_MMAP_FILL &&
+                    cur->mmap_fill_valid) {
+                    uint64_t got = k_linux_deliver(cur->pid, ch_r,
+                                                   (uint64_t)LINUX_MMAP_FILL);
+                    cur->park_syscall = 0;
+                    if ((int64_t)got < 0) {
+                        cur->mmap_fill_valid = 0;
+                        cur->mmap_fill_off = 0;
+                        cur->mmap_fill_len = 0;
+                        return got;
+                    }
+                    cur->mmap_fill_off += (uint32_t)got;
+                    if (cur->mmap_fill_off >= cur->mmap_fill_len) {
+                        uint64_t ret = cur->mmap_fill_ret;
+                        cur->mmap_fill_valid = 0;
+                        cur->mmap_fill_off = 0;
+                        cur->mmap_fill_len = 0;
+                        cur->mmap_fill_ret = 0;
+                        cur->mmap_fill_va = 0;
+                        return ret;
+                    }
+                    {
+                        int st = linux_mmap_fill_post(cur, ch_w, ch_r);
+                        cur->park_syscall = 0;
+                        if (st) {
+                            cur->mmap_fill_valid = 0;
+                            return (uint64_t)(int64_t)
+                                   linux_errno_from_cap(st);
+                        }
+                        return (uint64_t)(int64_t)(-LINUX_ENOMEM);
+                    }
                 }
                 {
                     uint64_t rax = k_linux_deliver(cur->pid, ch_r,
@@ -304,12 +354,16 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                         uint64_t sa1  = cur->mem_stage_a1;
                         uint64_t sa2  = cur->mem_stage_a2;
                         uint64_t sa3  = cur->mem_stage_a3;
+                        uint64_t sa4  = cur->mem_stage_a4;
+                        uint64_t sa5  = cur->mem_stage_a5;
                         cur->mem_stage_valid = 0;
                         cur->mem_stage_num   = 0;
                         cur->mem_stage_a0    = 0;
                         cur->mem_stage_a1    = 0;
                         cur->mem_stage_a2    = 0;
                         cur->mem_stage_a3    = 0;
+                        cur->mem_stage_a4    = 0;
+                        cur->mem_stage_a5    = 0;
                         if (snum == LINUX_BRK) {
                             struct LinuxMemBrkVerdict v =
                                 linux_mem_brk_verdict(
@@ -415,10 +469,12 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                  * shadow of the mappings it destroyed. */
                                 struct LinuxMmapReq mreq;
                                 struct LinuxMemMmapVerdict v;
-                                mreq.addr  = sa0;
-                                mreq.len   = sa1;
-                                mreq.prot  = sa2;
-                                mreq.flags = sa3;
+                                mreq.addr   = sa0;
+                                mreq.len    = sa1;
+                                mreq.prot   = sa2;
+                                mreq.flags  = sa3;
+                                mreq.fd     = sa4;
+                                mreq.offset = sa5;
                                 v = linux_mem_mmap_verdict(
                                     cur->linux_heap_base,
                                     cur->linux_heap_limit,
@@ -524,6 +580,36 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                     } else {
                                         cur->linux_mmap_top =
                                             v.new_mmap_top;
+                                        /* M2b: a granted file map's pages
+                                         * are mapped zero-filled above and
+                                         * then filled from the VFS file one
+                                         * bounded round at a time. The grant
+                                         * is not delivered until the last
+                                         * round lands, so ring 3 never sees
+                                         * a partially backed mapping. */
+                                        if (v.file_backed &&
+                                            v.range_pages) {
+                                            int st;
+                                            cur->mmap_fill_valid = 1;
+                                            cur->mmap_fill_ret   = rax;
+                                            cur->mmap_fill_va    = v.map_va;
+                                            cur->mmap_fill_len   =
+                                                (uint32_t)(v.range_pages *
+                                                           4096u);
+                                            cur->mmap_fill_off   = 0;
+                                            cur->mmap_fill_fd    = sa4;
+                                            cur->mmap_fill_foff  = sa5;
+                                            st = linux_mmap_fill_post(
+                                                cur, ch_w, ch_r);
+                                            cur->park_syscall = 0;
+                                            if (st) {
+                                                cur->mmap_fill_valid = 0;
+                                                return (uint64_t)(int64_t)
+                                                    linux_errno_from_cap(st);
+                                            }
+                                            return (uint64_t)(int64_t)
+                                                (-LINUX_ENOMEM);
+                                        }
                                     }
                                 }
                             } else if (snum == LINUX_MUNMAP) {
@@ -1194,20 +1280,22 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                      * one. */
                     struct LinuxMmapReq mreq;
                     int mref;
-                    mreq.addr  = largs[0];
-                    mreq.len   = largs[1];
-                    mreq.prot  = largs[2];
-                    mreq.flags = largs[3];
+                    mreq.addr   = largs[0];
+                    mreq.len    = largs[1];
+                    mreq.prot   = largs[2];
+                    mreq.flags  = largs[3];
+                    mreq.fd     = largs[4];
+                    mreq.offset = largs[5];
                     mref = linux_mem_mmap_refusal(&mreq,
                             cur->linux_heap_base, cur->linux_heap_limit);
                     if (mref) {
                         kernel_serial_printf(
                             "[E7] linux mmap addr=0x%lx len=%lu prot=%lu "
-                            "flags=0x%lx refused before post: %s\n",
-                            (unsigned long)largs[0],
-                            (unsigned long)largs[1],
-                            (unsigned long)largs[2],
-                            (unsigned long)largs[3],
+                            "flags=0x%lx fd=%lu off=0x%lx "
+                            "refused before post: %s\n",
+                            (unsigned long)largs[0], (unsigned long)largs[1],
+                            (unsigned long)largs[2], (unsigned long)largs[3],
+                            (unsigned long)largs[4], (unsigned long)largs[5],
                             mref == -LINUX_EPERM
                                 ? "write+execute is refused (§5.4)"
                                 : mref == -LINUX_EINVAL
@@ -1223,6 +1311,8 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                     cur->mem_stage_a1    = largs[1];
                     cur->mem_stage_a2    = largs[2];
                     cur->mem_stage_a3    = largs[3];
+                    cur->mem_stage_a4    = largs[4];
+                    cur->mem_stage_a5    = largs[5];
                 } else if (num == LINUX_MUNMAP) {
                     /* E7 increment 25 (§5.4): munmap's first trap is
                      * the same shape rule as its brk/mmap siblings — a
@@ -2269,4 +2359,48 @@ uint64_t do_syscall(uint64_t num, void* arg) {
     default:
         return 0;
     }
+}
+
+/* ─── M2b: one file-map fill round ────────────────────────────────────────
+ * The grant is already applied and its pages mapped (zero-filled); this
+ * posts the next bounded read of the file at the staged fd/offset and
+ * stages WHERE the bytes land — the already-mapped page at
+ * mmap_fill_va + off, through the deliver's LINUX_STAGE_FILL copy (the
+ * map is read-only to ring 3). It parks exactly like a first trap and
+ * returns only on a refusal. The reply's number is LINUX_MMAP_FILL,
+ * which is also the resume's wake cookie, and that is how the resume arm
+ * tells a fill round from the mmap grant.
+ *
+ * Defined after do_syscall so the first-trap ordering checks (stage, arm,
+ * deliver, forward) keep reading the trap's own body first; the prototype
+ * above serves its two call sites. */
+static int linux_mmap_fill_post(struct ProcessDescriptor *cur,
+                                uint16_t ch_w, uint16_t ch_r) {
+    struct SLSLinuxSyscallRequest req;
+    uint64_t args[6];
+    uint32_t n = LINUX_MMAP_FILL_CHUNK;
+
+    if (!cur || !cur->mmap_fill_valid) return CAP_ERR_PROTO;
+    if (cur->mmap_fill_len <= cur->mmap_fill_off) return CAP_ERR_PROTO;
+    if (cur->mmap_fill_len - cur->mmap_fill_off < n)
+        n = cur->mmap_fill_len - cur->mmap_fill_off;
+    args[0] = cur->mmap_fill_fd;
+    args[1] = cur->mmap_fill_foff + cur->mmap_fill_off;
+    args[2] = n;
+    args[3] = 0;
+    args[4] = 0;
+    args[5] = 0;
+    cur->reply_stage_num   = LINUX_MMAP_FILL;
+    cur->reply_stage_va    = cur->mmap_fill_va + cur->mmap_fill_off;
+    cur->reply_stage_len   = n;
+    cur->reply_stage_kind  = LINUX_STAGE_FILL;
+    cur->reply_stage_aux   = n;
+    cur->reply_stage_va2   = 0;
+    cur->reply_stage_len2  = 0;
+    cur->reply_stage_va3   = 0;
+    cur->reply_stage_valid = 1;
+    linux_syscall_describe(&req, LINUX_MMAP_FILL, args);
+    cur->park_syscall = SYS_LINUX_TRAP_RESUME;
+    return k_linux_forward(cur->pid, ch_w, ch_r, &req,
+                           (uint32_t)sizeof req);
 }

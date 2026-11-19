@@ -1,0 +1,10 @@
+[E7] linux: num=00000009 child=m2a.linux.hello.0 ok mmap -> 0x0000400000051000 fd=3 off=0x00000
+[E7] linux: num=4D4D4650 child=m2a.linux.hello.0 ok + payload
+[E7] linux: num=4D4D4650 child=m2a.linux.hello.0 ok + payload
+[E7] linux: num=4D4D4650 child=m2a.linux.hello.0 ok + payload
+[E7] linux: num=4D4D4650 child=m2a.linux.hello.0 ok + payload
+[E7] linux: num=4D4D4650 child=m2a.linux.hello.0 ok + payload
+[E7] linux: num=4D4D4650 child=m2a.linux.hello.0 ok + payload
+[E7] linux mmap addr=0x400000052000 len=4096 prot=5 flags=0x12 fd=3 off=0x1000 refused before post: shape not served (by name)
+[E7] linux: num=0000000B child=m2a.linux.hello.0 ok munmap addr=0x0000400000051000 len=20480
+Error loading shared library libm2a.so: Function not implemented (needed by m2a.linux.hello.0[CAP] send handoff: PID 104 -> 108

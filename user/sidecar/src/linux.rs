@@ -219,6 +219,11 @@ const LINUX_ROBUST_LIST_HEAD_BYTES: u64 = 24;
 /// numbers (addr/len/prot/flags) so "the allocator asked for X and this
 /// shim answered Y" is read off the line, never reconstructed.
 const LINUX_MMAP: u64 = 9;
+/// M2b: the kernel's synthetic file-map fill round — never a Linux
+/// syscall number. It carries (Linux fd, file offset, bytes) and answers
+/// count-truth bytes that the kernel's RAW deliver copies into the
+/// already-mapped page.
+const LINUX_MMAP_FILL: u64 = 0x4D4D_4650;
 /// clone(56) — M4.2's thread create. Only the documented thread subset is
 /// accepted; a fork-shaped word is ENOSYS by name (the kernel repeats the
 /// same check, so neither end is load-bearing alone).
@@ -381,6 +386,14 @@ const LINUX_WRITE: u64 = 1;
 /// truth — `expected_req_len` derives the attach from that same word.
 const LINUX_WRITEV: u64 = 20;
 const FD_PAYLOAD_CAP: usize = 1024;
+/* M2b: the mmap fill round's cap — 4024 = CAP_MSG_MAX_PAYLOAD (4096) −
+ * the 72-byte header, the largest payload one reply message can carry.
+ * It is separate from FD_PAYLOAD_CAP so the write chunk and the read /
+ * getdents mirrors keep their 1 KiB bound; only a fill round uses it,
+ * which is why the loader's 20 KiB DSO map takes six rounds rather than
+ * twenty — the boot's own sidecar self-kill tooth must not outrun a
+ * mapping's fill. */
+const FD_FILL_CAP: usize = 4024;
 
 /// E7 step 4 (the file class, §5.6): the census's thirteen numbers as
 /// this side sees them — literals repeated from kernel/linux_abi.h (the
@@ -600,6 +613,13 @@ const _: () = assert!(core::mem::size_of::<LinuxSyscallReq>() == LINUX_SYSCALL_R
 enum Answer {
     /// Reply with this ret/status (status 0 = ret is the value).
     Reply(u64, i32),
+    /// M2b: a FILE-BACKED mmap was granted at `ret` (the ledger's address
+    /// or the caller's FIXED one). `service` sends the file's `len`
+    /// page-rounded bytes at `off` from VFS fd `vfd` as chunk messages
+    /// AHEAD of the grant reply, then the ordinary 72-byte answer — the
+    /// kernel drains the chunks, stages them, and maps the granted
+    /// frames from them (its pages cannot ride one 4 KiB reply).
+    MmapFile(u64, u32, u64, u32),
     /// write(2) — the fd class's perform half (increment 5): the fd
     /// lookup already succeeded, so `service` performs these `len`
     /// payload bytes on the task's console-backed slot and replies with
@@ -618,6 +638,11 @@ enum Answer {
     /// never leave this side, and payload_bound is the per-number bound
     /// over it).
     ReplyBytes(u64, usize, [u8; FD_PAYLOAD_CAP]),
+    /// M2b: a file-map fill round's bytes. Its own variant and buffer
+    /// because a round is up to 4024 bytes — larger than any other
+    /// reply payload — and the kernel copies it into the just-mapped
+    /// page (LINUX_STAGE_FILL), not through a user-write pointer.
+    ReplyFill(u64, usize, [u8; FD_FILL_CAP]),
     /// read(0) on the console with no buffered input (E7 increment 24):
     /// hold the request until input arrives or the console closes. The
     /// count is the caller's (already clamped by the kernel). `service`
@@ -1208,8 +1233,8 @@ fn answer(
             const MAP_ALLOW: u64 = MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS
                                  | 0x1000  /* MAP_NORESERVE: hint, ignored */
                                  | 0x20000; /* MAP_STACK:    hint, ignored */
-            let (addr, len, prot, flags) =
-                (args[0], args[1], args[2], args[3]);
+            let (addr, len, prot, flags, fd, foff) =
+                (args[0], args[1], args[2], args[3], args[4], args[5]);
             let len_r = match len.checked_add(0xFFF) {
                 Some(v) if len != 0 => v & !0xFFFu64,
                 _ => return Answer::Reply(0, E_INVAL),
@@ -1218,9 +1243,55 @@ fn answer(
                 Answer::Reply(0, E_INVAL)
             } else if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 {
                 Answer::Reply(0, E_PERM)
-            } else if prot & PROT_EXEC != 0 || flags & MAP_ANONYMOUS == 0
+            } else if prot & PROT_EXEC != 0
                    || flags & MAP_PRIVATE == 0 || flags & !MAP_ALLOW != 0 {
                 Answer::Reply(0, E_NOSYS)
+            } else if flags & MAP_ANONYMOUS == 0 {
+                /* M2b, the file-backed half: the loader's DT_NEEDED map
+                 * — MAP_PRIVATE, PROT_READ, a VFS fd and a page-aligned
+                 * offset. The same ladder as the kernel's first trap
+                 * (neither end load-bearing alone); the FILE's truth is
+                 * the VFS's: a non-file or unreadable slot answers its
+                 * own EBADF from `read_at`, which `service` turns into a
+                 * refusal reply with no chunks sent. Write and execute
+                 * file maps stay ENOSYS by name until the exec seam
+                 * exists. */
+                if prot != 0x1 {
+                    Answer::Reply(0, E_NOSYS)
+                } else if foff & 0xFFF != 0 {
+                    Answer::Reply(0, E_INVAL)
+                } else if len > LINUX_MMAP_FILE_MAX {
+                    Answer::Reply(0, E_NOSYS)
+                } else if fd > 0x7FFF_FFFF {
+                    Answer::Reply(0, E_BADF)
+                } else {
+                    match fd_slot(fds, fd).copied().ok_or(E_BADF) {
+                        Ok(s) if s.kind == FD_KIND_FILE => {
+                            if flags & MAP_FIXED != 0 {
+                                if addr & 0xFFF != 0 {
+                                    Answer::Reply(0, E_INVAL)
+                                } else if addr < brk.base || addr > brk.limit
+                                       || len_r > brk.limit - addr {
+                                    Answer::Reply(0, E_NOMEM)
+                                } else {
+                                    Answer::MmapFile(addr, s.vfs_fd, foff,
+                                                     len_r as u32)
+                                }
+                            } else {
+                                match brk.mtop.checked_sub(len_r) {
+                                    Some(top) if top >= brk.cur => {
+                                        brk.mtop = top;
+                                        Answer::MmapFile(top, s.vfs_fd, foff,
+                                                         len_r as u32)
+                                    }
+                                    _ => Answer::Reply(0, E_NOMEM),
+                                }
+                            }
+                        }
+                        Ok(_) => Answer::Reply(0, E_NOSYS),
+                        Err(x) => Answer::Reply(0, x),
+                    }
+                }
             } else if flags & MAP_FIXED != 0 {
                 if addr & 0xFFF != 0 {
                     Answer::Reply(0, E_INVAL)
@@ -2116,6 +2187,12 @@ fn payload_bound(num: u64, args: &[u64; 6], len: usize) -> bool {
         LINUX_READ => args[1] != 0 && len <= args[2] as usize
             && len <= FD_PAYLOAD_CAP,
         LINUX_GETDENTS64 => args[1] != 0 && len <= DENTS_PAYLOAD_CAP,
+        /* M2b: a fill round is count-truth and exactly the round the
+         * kernel asked for; the RAW deliver copies it into the mapped
+         * page. */
+        LINUX_MMAP_FILL => len == args[2] as usize
+            && len <= LINUX_MMAP_FILL_CHUNK as usize
+            && len <= FD_FILL_CAP,
         LINUX_CLOCK_GETTIME => args[1] != 0 && len == TIMESPEC_BYTES,
         /* M1: accept's reply is the fixed 20-byte address trailer when
          * the caller asked for an address; recvfrom's is its data plus
@@ -2359,6 +2436,32 @@ fn answer_file<K: Kernel, A: BufferAlloc>(
          * maps it; without this arm the DT_NEEDED chain stops at ENOSYS
          * even though the open succeeded. A console slot answers the
          * CharNode's own stat; the VFS owns every file descriptor. */
+        /* M2b: one file-map fill round. The kernel has already mapped
+         * the destination page and staged it as the RAW destination, so
+         * the answer is the file's bytes at the kernel's own offset —
+         * ZERO-PADDED to the round's length past EOF (the mapping's last
+         * page owns those zeros; a short payload would leave the round
+         * unfinished forever). A slot that is no longer a file refuses by
+         * name and stops the fill. */
+        LINUX_MMAP_FILL => {
+            let want = (args[2] as usize).min(FD_FILL_CAP);
+            if want == 0 {
+                return Answer::Reply(0, E_INVAL);
+            }
+            match fd_slot(fds, args[0]).copied().ok_or(E_BADF) {
+                Ok(s) if s.kind == FD_KIND_FILE => {
+                    let mut buf = [0u8; FD_FILL_CAP];
+                    let got = vfs.read_at(vt, s.vfs_fd, args[1],
+                                          &mut buf[..want]).unwrap_or(0);
+                    for b in &mut buf[got.min(want)..want] {
+                        *b = 0;
+                    }
+                    Answer::ReplyFill(want as u64, want, buf)
+                }
+                Ok(_) => Answer::Reply(0, E_NOSYS),
+                Err(x) => Answer::Reply(0, x),
+            }
+        }
         LINUX_FSTAT => match slot_of(fds, args[0]) {
             Ok(s) if s.kind == FD_KIND_FILE => match vfs.fstat(vt, s.vfs_fd) {
                 Ok(st) => stat_answer(&st),
@@ -3801,6 +3904,12 @@ fn read_u64(buf: &[u8], off: usize) -> u64 {
 /// before mapping `status` through the §5.7 table. A send failure here can
 /// only mean the child's end died mid-call: its own death woke its waiters,
 /// so dropping the reply costs nothing but the log line.
+/// M2b: the fill round's length — the kernel asks for at most this many
+/// bytes per round (its staged clamp), and this side's payload buffer is
+/// the same 1 KiB, so one round is one message either way.
+const LINUX_MMAP_FILL_CHUNK: u64 = 4024;
+const LINUX_MMAP_FILE_MAX: u64 = 32768;
+
 fn reply<K: Kernel>(k: &K, ch_w: u32, tag: u32, num: u64, ret: u64, status: i32) {
     let mut payload = [0u8; LINUX_SYSCALL_REQ_BYTES];
     payload[0..8].copy_from_slice(&num.to_le_bytes());
@@ -3823,8 +3932,11 @@ fn reply<K: Kernel>(k: &K, ch_w: u32, tag: u32, num: u64, ret: u64, status: i32)
 /// mid-call; dropping the reply costs nothing but the log line).
 fn reply_bytes<K: Kernel>(k: &K, ch_w: u32, tag: u32, num: u64, ret: u64,
                           bytes: &[u8]) {
-    let mut payload = [0u8; LINUX_SYSCALL_REQ_BYTES + FD_PAYLOAD_CAP];
-    debug_assert!(bytes.len() <= FD_PAYLOAD_CAP);
+    /* The buffer is the LARGEST any reply can be — a fill round's 4024
+     * bytes plus the header — so one builder serves every number; the
+     * per-number bound is payload_bound's, not this array's. */
+    let mut payload = [0u8; LINUX_SYSCALL_REQ_BYTES + FD_FILL_CAP];
+    debug_assert!(bytes.len() <= FD_FILL_CAP);
     payload[0..8].copy_from_slice(&num.to_le_bytes());
     payload[56..64].copy_from_slice(&ret.to_le_bytes());
     payload[LINUX_SYSCALL_REQ_BYTES..LINUX_SYSCALL_REQ_BYTES + bytes.len()]
@@ -4525,7 +4637,7 @@ pub fn service<K: Kernel, A: BufferAlloc>(
             | LINUX_STAT | LINUX_FSTAT
             | LINUX_LSTAT | LINUX_LSEEK | LINUX_FCNTL | LINUX_FSYNC
             | LINUX_FTRUNCATE | LINUX_RENAME | LINUX_MKDIR | LINUX_UNLINK
-            | LINUX_GETDENTS64 | LINUX_POLL =>
+            | LINUX_GETDENTS64 | LINUX_POLL | LINUX_MMAP_FILL =>
                 answer_file(num, &args, &mut fds, tasks()[i].vfs_task, vfs,
                             &mut net, payload, console, now_ns, groups()[gid].gate),
             LINUX_TKILL => match answer_tkill_sibling(gid, sigstate.tid, &args) {
@@ -4600,6 +4712,24 @@ pub fn service<K: Kernel, A: BufferAlloc>(
         }
 
         match ans {
+            Answer::MmapFile(ret, vfd, foff, flen) => {
+                /* M2b: the grant line names the SOURCE (fd and offset) —
+                 * the run's proof that the pages came from the VFS file
+                 * the loader asked for, not from a lookalike. The chunks
+                 * go first so the kernel's wake (the reply) is never
+                 * ahead of its data. */
+                let mut ex = [0u8; 96];
+                let mut off = push_bytes(&mut ex, 0, b" ok mmap -> 0x");
+                off = hex_into(&mut ex, off, ret);
+                off = push_bytes(&mut ex, off, b" fd=");
+                off = dec_into(&mut ex, off, args[4]);
+                off = push_bytes(&mut ex, off, b" off=0x");
+                off = hex_into(&mut ex, off, foff);
+                off = push_bytes(&mut ex, off, b"\n");
+                enosys_log(num as u32, &name_buf[..nlen], &ex[..off]);
+                let _ = (vfd, flen);   /* the rounds carry these words */
+                reply(k, ch_w, rr.tag, num, ret, STATUS_OK);
+            }
             Answer::Reply(ret, status) => {
                 if status == E_NOSYS {
                     if num == LINUX_MMAP {
@@ -4735,6 +4865,21 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                  * cap) — payload_bound derives it from the same words
                  * the kernel's reply plan stages, so a drifted clamp
                  * arrives here as a mismatch and goes out as num=0. */
+                if !payload_bound(num, &args, len) || len > bytes.len() {
+                    enosys_log(0xBAD1, &name_buf[..nlen],
+                               b"[POSIX] reply payload mismatch -> -EPROTO\n");
+                    reply(k, ch_w, rr.tag, 0, 0, E_NOSYS);
+                    continue;
+                }
+                enosys_log(num as u32, &name_buf[..nlen], b" ok + payload\n");
+                reply_bytes(k, ch_w, rr.tag, num, ret, &bytes[..len]);
+            }
+            Answer::ReplyFill(ret, len, bytes) => {
+                /* M2b: the same bound story as ReplyBytes, against the
+                 * fill cap — the round must be exactly the kernel's ask
+                 * and no larger than one message; a mismatch goes out as
+                 * num=0 and the kernel refuses -EPROTO rather than
+                 * leaving a partially backed mapping behind. */
                 if !payload_bound(num, &args, len) || len > bytes.len() {
                     enosys_log(0xBAD1, &name_buf[..nlen],
                                b"[POSIX] reply payload mismatch -> -EPROTO\n");

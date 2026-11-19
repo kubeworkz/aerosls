@@ -982,10 +982,27 @@ int linux_mem_mmap_refusal(const struct LinuxMmapReq *req,
     if (linux_mprotect_refuses_wx(req->prot)) return -LINUX_EPERM;
     if (req->prot & LINUX_PROT_EXEC) return -LINUX_ENOSYS;
 
-    if (!(req->flags & LINUX_MAP_ANONYMOUS)) return -LINUX_ENOSYS;
     if (!(req->flags & LINUX_MAP_PRIVATE))   return -LINUX_ENOSYS;
     if (req->flags & LINUX_MAP_SHARED)       return -LINUX_ENOSYS;
     if (req->flags & ~LINUX_MAP_V1_ALLOW)    return -LINUX_ENOSYS;
+
+    /* M2b: the two mapping SOURCES. An anonymous map ignores fd/offset,
+     * exactly as Linux does. A file map (no MAP_ANONYMOUS) is served for
+     * the READ-ONLY private shape the loader's DT_NEEDED path asks for:
+     * PROT_READ only (write and execute file maps stay ENOSYS by name),
+     * a page-aligned offset (Linux's own EINVAL), a non-negative fd
+     * (stack addresses arrive as huge unsigned words — EBADF), and a
+     * length inside the chunk stream's staging cap. The fd's existence
+     * and the file's own bytes are the sidecar's truth; this ladder is
+     * only the shape, exactly like its anonymous sibling. */
+    if (!(req->flags & LINUX_MAP_ANONYMOUS)) {
+        if (req->prot != LINUX_PROT_READ)      return -LINUX_ENOSYS;
+        if (req->offset & (LINUX_PAGE_SIZE - 1)) return -LINUX_EINVAL;
+        if (req->offset > UINT64_MAX - (LINUX_PAGE_SIZE - 1))
+            return -LINUX_EINVAL;
+        if (req->fd > 0x7FFFFFFFULL)           return -LINUX_EBADF;
+        if (req->len > LINUX_MMAP_FILE_MAX)    return -LINUX_ENOSYS;
+    }
 
     /* FIXED asks for an exact address; Linux requires it page-aligned
      * and the shim bounds it by the stamped span — outside the budget is
@@ -1018,6 +1035,7 @@ linux_mem_mmap_verdict(uint64_t heap_base, uint64_t heap_limit,
     v.range_pages = 0;
     v.map_pages = 0;
     v.new_mmap_top = mmap_top;
+    v.file_backed = 0;
 
     /* A refusal reply: its errno rides the §5.7 map as usual, nothing
      * maps, nothing is malformed. (MAP_FAILED's -1 arrives here too: it
@@ -1069,13 +1087,18 @@ linux_mem_mmap_verdict(uint64_t heap_base, uint64_t heap_limit,
 
     v.map_va = rax;
     v.range_pages = len_r / LINUX_PAGE_SIZE;
+    /* M2b: a file map's pages are backed from the staged chunk stream
+     * (read-only, so never writable), and every page is backed — the
+     * sidecar zero-pads a file shorter than the mapping, which is the
+     * partial last page Linux itself hands back. */
+    v.file_backed = !(req->flags & LINUX_MAP_ANONYMOUS);
     /* PROT_NONE backs no frames: a reservation whose every access
      * faults — PROT_NONE's whole observable contract, and the measured
      * allocator's guard-page shape. */
     v.map_pages = (req->prot == LINUX_PROT_NONE)
                 ? 0 : v.range_pages;
     v.prot_none = (req->prot == LINUX_PROT_NONE) ? 1 : 0;
-    v.prot_write = (req->prot & LINUX_PROT_WRITE) ? 1 : 0;
+    v.prot_write = (!v.file_backed && (req->prot & LINUX_PROT_WRITE)) ? 1 : 0;
     v.new_mmap_top = is_fixed ? mmap_top : rax;
     return v;
 }
@@ -1787,6 +1810,9 @@ int linux_reply_shape_ok(uint64_t num, uint64_t ret, uint32_t n)
      * payload (or the wrong size) is refused before any byte is written. */
     if (num == LINUX_CLOCK_GETTIME)
         return ret == 0 && n == LINUX_TIMESPEC_BYTES;
+    /* M2b: a fill round is count-truth — the bytes read ARE the answer. */
+    if (num == LINUX_MMAP_FILL)
+        return ret == (uint64_t)n;
     return ret == 0;
 }
 
