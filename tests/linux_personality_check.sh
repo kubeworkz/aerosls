@@ -1879,6 +1879,30 @@ else
     bad "Y10. a file-map protection shape is gone or drifted: the READ/RW/RX ladder, the prot_write or prot_exec verdict, the NX clear in the apply, or the sidecar's twin changed — the loader's .data or .text map would be refused ENOSYS (the M2b stall), an RW page would be mapped read-only (the relocation store faults), an RX page would be mapped NX, or an anonymous exec would slip through, while the guard reads green"
 fi
 
+# ─── Y11. the mprotect apply's request/reply log (M2b) ────────────────
+# A sidecar-side mprotect refusal leaves no request shape anywhere else:
+# the kernel's pre-post refusals print theirs, but a forward that comes
+# back EINVAL (the loader's RELRO over its own and the program's image)
+# prints only the errno. The apply line carries addr/len/prot, the reply
+# word and the kernel's stamped span, which is the record the next seam
+# slice reads. mprotect is rare (guard pages and loader RELRO), so one
+# line per forwarded request is the whole cost.
+# The argument half is checked on one captured window rather than a
+# `grep | grep -q` pipeline: pipefail turns the early-exiting reader's
+# SIGPIPE into a false red.
+mprot_apply=$(grep -A10 'linux mprotect apply addr=0x%lx' "$DISP")
+if grep -qF '"[E7] linux mprotect apply addr=0x%lx "' "$DISP" && \
+   grep -qF '"len=%lu prot=0x%lx reply=0x%lx "' "$DISP" && \
+   grep -qF '"(span 0x%lx..0x%lx)\n",' "$DISP" && \
+   case "$mprot_apply" in \
+       *'(unsigned long)rax,'*'(unsigned long)mspan_limit);'*) true ;; \
+       *) false ;; \
+   esac; then
+    ok "Y11. the mprotect apply line is pinned: every forwarded request logs addr/len/prot, the reply word and the kernel's stamped span before the verdict, so a sidecar-side refusal (the RELRO image EINVAL) can be read back with its request shape"
+else
+    bad "Y11. the mprotect apply line is gone or drifted: a forwarded mprotect no longer prints its addr/len/prot, reply and stamped span — a sidecar-side refusal would leave only the errno forward line, and the next seam slice could not tell which image page was refused, while the guard reads green"
+fi
+
 echo
 if [ "$fails" -eq 0 ]; then
     echo "linux_personality_check: all clauses hold"

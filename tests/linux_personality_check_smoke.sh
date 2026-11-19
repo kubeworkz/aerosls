@@ -1277,6 +1277,14 @@ seed "$W/t151"
 sed -i 's/v.prot_write = (req->prot \& LINUX_PROT_WRITE) ? 1 : 0;/v.prot_write = 0;/' "$W/t151/kernel/linux_abi.c"
 tooth filemap-write-verdict-dropped Y10 "an RW file map is mapped read-only" "$W/t151"
 
+# t152: the mprotect apply log loses its request shape — a sidecar-side
+# refusal would print only the errno forward line, with no addr/len/prot
+# or span to say which page was refused. Guard clause Y11 must redden by
+# name.
+seed "$W/t152"
+sed -i 's/linux mprotect apply addr=0x%lx/linux mprotect applied/g' "$W/t152/kernel/syscall_dispatch.c"
+tooth mprotect-apply-log-gone Y11 "the mprotect apply line lost its request shape" "$W/t152"
+
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
