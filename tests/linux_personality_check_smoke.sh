@@ -1296,6 +1296,13 @@ seed "$W/t153"
 sed -i 's/if brk.image_lo != 0 && brk.image_lo < span_base {/if false {/' "$W/t153/user/sidecar/src/linux.rs"
 tooth image-span-dropped-from-ledger Y12 "the mprotect ledger ignores the image span" "$W/t153"
 
+# t154: the winsize request word drifts to a neighbour, so musl's first
+# stdout write gets EINVAL instead of the answer the console owes it.
+# Guard clause Y13 must redden by name.
+seed "$W/t154"
+sed -i 's/const LINUX_TIOCGWINSZ: u64 = 0x5413;/const LINUX_TIOCGWINSZ: u64 = 0x5414;/' "$W/t154/user/sidecar/src/linux.rs"
+tooth ioctl-winsize-number-drift Y13 "the ioctl winsize request word drifted" "$W/t154"
+
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

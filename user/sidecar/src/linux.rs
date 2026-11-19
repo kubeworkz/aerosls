@@ -205,6 +205,14 @@ const GROUP_SWEEP_ATTEMPTS: u32 = 64;
 const LINUX_RT_SIGACTION: u64 = 13;
 const LINUX_RT_SIGPROCMASK: u64 = 14;
 const LINUX_RT_SIGRETURN: u64 = 15;
+/// M2b: the loader's stdio ioctl. musl's __stdout_write asks TIOCGWINSZ
+/// on stdout before its first write (the answer only selects line
+/// buffering; the winsize is never read) and its isatty asks TCGETS.
+/// Those two are the whole arm; the console answers 0 for both without a
+/// winsize/termios copy, which no caller here reads.
+const LINUX_IOCTL: u64 = 16;
+const LINUX_TCGETS: u64 = 0x5401;
+const LINUX_TIOCGWINSZ: u64 = 0x5413;
 const LINUX_SIGALTSTACK: u64 = 131;
 const LINUX_TKILL: u64 = 200;
 const LINUX_EXIT_GROUP: u64 = 231;
@@ -1345,6 +1353,25 @@ fn answer(
                 Answer::Reply(0, E_INVAL)
             } else {
                 Answer::Reply(0, STATUS_OK)
+            }
+        }
+        /* ioctl (16, the stdio path — M2b): musl's __stdout_write asks
+         * TIOCGWINSZ on stdout before its first write, and its isatty
+         * asks TCGETS. fds 0..2 are the task's console, so exactly the
+         * console answers 0 for exactly those two requests; the kernel
+         * writes nothing back, which is enough because both callers only
+         * check the return. A valid non-console fd is a VFS file the VFS
+         * does not serve ioctl for — EINVAL, not ENOSYS (the number is
+         * served now). An unknown slot is EBADF. */
+        16 => {
+            let fd = args[0];
+            match fd_slot(fds, fd).copied() {
+                None => Answer::Reply(0, E_BADF),
+                Some(s) if s.kind == FD_KIND_CONSOLE
+                        && (args[1] == LINUX_TIOCGWINSZ
+                            || args[1] == LINUX_TCGETS) =>
+                    Answer::Reply(0, STATUS_OK),
+                Some(_) => Answer::Reply(0, E_INVAL),
             }
         }
         /* mprotect (10, LSC_MEM — §5.4's W^X and the guard-page seam):
@@ -4865,6 +4892,24 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                     let mut ex = [0u8; 32];
                     let n = fmt_sig_line(&mut ex, b" ok sig=", args[1], b"\n");
                     enosys_log(num as u32, &name_buf[..nlen], &ex[..n]);
+                } else if num == LINUX_IOCTL {
+                    /* The stdio ioctl arm is only meaningful if the request
+                     * is named: the fd and the request word ride the line,
+                     * and a refusal carries its own errno (the console/no
+                     * console split is what the arm decided). */
+                    let mut ex = [0u8; 64];
+                    let mut off;
+                    if status == STATUS_OK {
+                        off = push_bytes(&mut ex, 0, b" ok ioctl fd=");
+                    } else {
+                        off = push_bytes(&mut ex, 0, b" -> ");
+                        off = push_bytes(&mut ex, off, errno_name(status));
+                        off = push_bytes(&mut ex, off, b" ioctl fd=");
+                    }
+                    off = dec_into(&mut ex, off, args[0]);
+                    off = push_bytes(&mut ex, off, b" req=0x");
+                    off = hex_into(&mut ex, off, args[1]);
+                    enosys_log(num as u32, &name_buf[..nlen], &ex[..off]);
                 } else {
                     /* An answered syscall must be visible too: this line
                      * is the serial-log half of E7's round-trip proof
@@ -6726,6 +6771,33 @@ mod tests {
         }
         assert_eq!((b.cur, b.mtop), (SPAN_BASE, SPAN_LIMIT),
                    "mprotect never moves a heap cursor");
+    }
+
+    #[test]
+    fn stdio_ioctl_answers_the_two_musl_asks_on_the_console_only() {
+        /* M2b: musl's __stdout_write asks TIOCGWINSZ before its first
+         * stdout write, and isatty asks TCGETS; both only check the
+         * return, so the console answers 0 for exactly those words. */
+        let mut b = ledger();
+        for req in [0x5401u64, 0x5413] {
+            let a = answer(16, &[1, req, 0, 0, 0, 0],
+                           &console_fds(), &mut b, &mut fresh(), &[]);
+            assert!(matches!(a, Answer::Reply(0, STATUS_OK)),
+                    "req {:#x}: {:?}", req, a);
+        }
+        /* a console fd with any other request, and a served file fd, are
+         * EINVAL; the slot beyond the table is EBADF. */
+        let a = answer(16, &[1, 0x1234, 0, 0, 0, 0],
+                       &console_fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(0, E_INVAL)), "other: {:?}", a);
+        let mut f = fds();
+        f[3] = FdSlot { used: true, kind: FD_KIND_FILE, vfs_fd: 7, flags: 0 };
+        let a = answer(16, &[3, 0x5413, 0, 0, 0, 0],
+                       &f, &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(0, E_INVAL)), "file: {:?}", a);
+        let a = answer(16, &[9, 0x5413, 0, 0, 0, 0],
+                       &console_fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(0, E_BADF)), "slot: {:?}", a);
     }
 
     #[test]

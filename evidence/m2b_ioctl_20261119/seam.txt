@@ -1,0 +1,13 @@
+302:[E7] linux: num=0000009E child=m2a.linux.hello.0 ok
+380:[E7] linux: num=000000DA child=m2a.linux.hello.0 ok
+431:[E7] linux: num=0000000C child=m2a.linux.hello.0 ok
+465:[E7] linux: num=0000000C child=m2a.linux.hello.0 ok
+500:[E7] linux: num=00000009 child=m2a.linux.hello.0 ok mmap -> 0x0000400000016000
+533:[E7] linux: num=0000000A child=m2a.linux.hello.0 ok
+573:[E7] linux: num=0000000A child=m2a.linux.hello.0 ok
+608:[E7] linux: num=00000010 child=m2a.linux.hello.0 ok ioctl fd=1 req=0x0000000000005413
+632:[E7] linux: num=00000014 child=m2a.linux.hello.0 write ok len=7 |M2A-OK.|
+653:[E7] linux: num=000000E7 child=m2a.linux.hello.0 exit_group status=0
+660:[E7] linux: num=000000E7 child=m2a.linux.hello.0 group swept=1 dead=1 live=0
+632:[E7] linux: num=00000014 child=m2a.linux.hello.0 write ok len=7 |M2A-OK.|
+640:M2A-OK
