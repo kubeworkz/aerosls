@@ -6,7 +6,7 @@
 use aerosls_blockcache::BufferAlloc;
 use aerosls_kernel_sim::{FakeClient, FakeKernel, DRIVER_CONSOLE, DRIVER_STORAGE};
 use aerosls_proto::bootinfo::BootInfo;
-use aerosls_proto::kabi::{SendCap, CAP_CHAN, CAP_CHAN_W, CAP_MEM};
+use aerosls_proto::kabi::{SendCap, CAP_CHAN, CAP_CHAN_W, CAP_MEM, CAP_TYPE_DEV};
 use aerosls_proto::{R, W};
 use aerosls_ramdisk::endpoints::EndpointSet;
 use aerosls_ramdisk::server::{self, Device};
@@ -844,6 +844,7 @@ fn from_bib_resolves_initial_caps() {
         ("console", CAP_CHAN_W, 0x7, 0, 0, 2),
         ("ramdisk", CAP_CHAN, 0x7, 0, 0, 3),
         ("ramdisk", CAP_CHAN_W, 0x7, 0, 0, 4),
+        ("nic0.bar0", CAP_TYPE_DEV, 0x3, 0xfe_b8_0000, 0x2_0000, 5),
     ]);
     let info = unsafe { BootInfo::from_raw(bib.as_ptr()) }.unwrap();
     let caps = BootCaps::from_bib(&info).unwrap();
@@ -852,12 +853,130 @@ fn from_bib_resolves_initial_caps() {
     assert_eq!(caps.budget_len, 0x100_0000);
     assert_eq!(caps.console_chan, Some(1));
     assert_eq!(caps.ramdisk_chan_w, Some(4));
+    assert!(caps.census_host, "the system POSIX's nic0.bar0 makes it the census host");
 
     // A BIB missing the ramdisk channel is valid (console-only mode).
     let bib = build_bib(&[("budget", CAP_MEM, 0x3, 0x1000_0000, 0x100_0000, 0)]);
     let info = unsafe { BootInfo::from_raw(bib.as_ptr()) }.unwrap();
     let caps_no_rd = BootCaps::from_bib(&info).unwrap();
     assert_eq!(caps_no_rd.ramdisk_chan_w, None);
+    assert!(!caps_no_rd.census_host, "a BIB without nic0.bar0 is not the census host");
+}
+
+/// Whether `path` opens in the booted VFS (a fresh task, like `read_all`).
+fn path_exists(vfs: &mut aerosls_vfs::Vfs<FC, FA>, path: &str) -> bool {
+    let t = vfs.add_task().unwrap();
+    match vfs.open(t, path, O_RDONLY, 0) {
+        Ok(fd) => {
+            vfs.close(t, fd).unwrap();
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// The `/lib` namespace exists for the dynamic spawns, and only the sidecar
+/// that can host them has it: the system POSIX, identified by its `nic0.bar0`
+/// DEV cap, seeds the library and loader; a gate or ordinary tenant sidecar
+/// has no such cap and skips the seed, keeping that heap for its own workload.
+#[cfg(feature = "m2a_interp")]
+#[test]
+fn census_host_boot_seeds_the_lib_namespace() {
+    let (fake, client) = FakeKernel::new(image(), 1);
+    let t = boot_driver(fake);
+
+    let caps = BootCaps::new(0, 0, 0, None, Some(0), Some(0), None, None).with_census_host();
+    let console = Arc::new(CharNode::console());
+    let mut booted = boot(client.clone(), &caps, console, FakeAlloc(client.clone()))
+        .expect("boot");
+
+    assert!(
+        path_exists(
+            &mut booted.proc.vfs,
+            aerosls_sidecar::m2a_interp::M2A_LIB_PATH
+        ),
+        "the hardware owner serves the DSO the loader opens"
+    );
+    assert!(
+        path_exists(&mut booted.proc.vfs, aerosls_sidecar::m2_dyn::LOADER_PATH),
+        "the hardware owner serves the loader the image's PT_INTERP names"
+    );
+    assert!(
+        path_exists(&mut booted.proc.vfs, aerosls_sidecar::m2_dyn::IMAGE_PATH),
+        "the hardware owner serves the arbitrary dynamic image"
+    );
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
+
+#[cfg(feature = "m2a_interp")]
+#[test]
+fn gate_sidecar_skips_the_lib_namespace() {
+    let (fake, client) = FakeKernel::new(image(), 1);
+    let t = boot_driver(fake);
+
+    // The gate is a tenant in authority: its BIB carries the profile bit but
+    // no nic0.bar0, so boot() must not spend its heap on /lib.
+    let bib = build_bib_with_flags(
+        &[
+            ("budget", CAP_MEM, 0x3, 0x1000_0000, 0x100_0000, 0),
+            ("ramdisk", CAP_CHAN, 0x7, 0, 0, 0),
+            ("ramdisk", CAP_CHAN_W, 0x7, 0, 0, 0),
+        ],
+        aerosls_proto::bootinfo::BOOT_INFO_FLAG_GATE,
+    );
+    let info = unsafe { BootInfo::from_raw(bib.as_ptr()) }.unwrap();
+    let caps = BootCaps::from_bib(&info).unwrap();
+    assert!(!caps.census_host, "the gate profile carries no hardware cap");
+
+    let console = Arc::new(CharNode::console());
+    let mut booted = boot(client.clone(), &caps, console, FakeAlloc(client.clone()))
+        .expect("boot");
+    assert!(
+        !path_exists(
+            &mut booted.proc.vfs,
+            aerosls_sidecar::m2a_interp::M2A_LIB_PATH
+        ),
+        "the gate sidecar leaves /lib unseeded"
+    );
+
+    client.kill_driver(0);
+    t.join().unwrap();
+}
+
+#[cfg(feature = "m2a_interp")]
+#[test]
+fn ordinary_tenant_sidecar_skips_the_lib_namespace() {
+    let (fake, client) = FakeKernel::new(image(), 1);
+    let t = boot_driver(fake);
+
+    // The ordinary-tenant test profile: no gate bit, no hardware caps.
+    let bib = build_bib_with_flags(
+        &[
+            ("budget", CAP_MEM, 0x3, 0x1000_0000, 0x100_0000, 0),
+            ("ramdisk", CAP_CHAN, 0x7, 0, 0, 0),
+            ("ramdisk", CAP_CHAN_W, 0x7, 0, 0, 0),
+        ],
+        aerosls_proto::bootinfo::BOOT_INFO_FLAG_TENANT_LINUX,
+    );
+    let info = unsafe { BootInfo::from_raw(bib.as_ptr()) }.unwrap();
+    let caps = BootCaps::from_bib(&info).unwrap();
+    assert!(!caps.census_host, "the ordinary tenant carries no hardware cap");
+
+    let console = Arc::new(CharNode::console());
+    let mut booted = boot(client.clone(), &caps, console, FakeAlloc(client.clone()))
+        .expect("boot");
+    assert!(
+        !path_exists(
+            &mut booted.proc.vfs,
+            aerosls_sidecar::m2a_interp::M2A_LIB_PATH
+        ),
+        "the ordinary tenant sidecar leaves /lib unseeded"
+    );
+
+    client.kill_driver(0);
+    t.join().unwrap();
 }
 
 /// The manifest and the BIB are the same contract in two formats: the
@@ -1641,6 +1760,10 @@ fn cloexec_prevents_pipe_fd_leak_in_pipeline() {
 }
 
 fn build_bib(caps: &[(&str, u16, u16, u64, u64, u32)]) -> Vec<u8> {
+    build_bib_with_flags(caps, 0)
+}
+
+fn build_bib_with_flags(caps: &[(&str, u16, u16, u64, u64, u32)], flags: u32) -> Vec<u8> {
     // v3 header: 32 bytes through total_len, then flags u32 (POSIX-Environments
     // E1) + own_pid u32 + own_index u32 + reserved u32 (POSIX-Environments E6).
     // The version comes from the PARSER's own constant, so a future bump cannot
@@ -1661,7 +1784,7 @@ fn build_bib(caps: &[(&str, u16, u16, u64, u64, u32)]) -> Vec<u8> {
             .map(|(n, _, _, _, _, _)| 2 + n.len() + 2 + 4 + 16)
             .sum::<usize>();
     b.extend_from_slice(&(total as u32).to_le_bytes()); // total_len
-    b.extend_from_slice(&0u32.to_le_bytes()); // flags (0 = not the unified boot)
+    b.extend_from_slice(&flags.to_le_bytes()); // flags (BOOT_INFO_FLAG_*)
     b.extend_from_slice(&0u32.to_le_bytes()); // own_pid   (v3)
     b.extend_from_slice(&0u32.to_le_bytes()); // own_index (v3)
     b.extend_from_slice(&0u32.to_le_bytes()); // reserved

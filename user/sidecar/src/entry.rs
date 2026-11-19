@@ -22,7 +22,7 @@ use crate::allocator::BudgetAlloc;
 use crate::boot::{boot, BootCaps};
 use crate::heap::Bump;
 use aerosls_proto::bootinfo::BootInfo;
-use aerosls_proto::kabi::{CAP_CHAN_W, CAP_TYPE_DEV, Kernel, RealKernel, TIMEOUT_NONE};
+use aerosls_proto::kabi::{CAP_CHAN_W, Kernel, RealKernel, TIMEOUT_NONE};
 
 extern "C" {
     fn k_chan_send(chan: u32, tag: u32, flags: u16, payload: *const u8,
@@ -522,7 +522,7 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     // actually come up. One pair per boot (the system POSIX and its
     // watchdog respawn) keeps the proof and leaves each tenant's wire as
     // quiet as it was before increment 7.
-    let census_host = bib.find_cap(CAP_TYPE_DEV, "nic0.bar0").is_some();
+    let census_host = caps.census_host;
     // Increment 19: the gate profile is the BIB's FLAG_GATE bit, copied by
     // the create from the tenant manifest's header flags. It is a profile
     // selector, not a grant: the tenant's caps are exactly the plain

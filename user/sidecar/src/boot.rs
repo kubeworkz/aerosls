@@ -33,7 +33,7 @@ use alloc::sync::Arc;
 use aerosls_blockcache::{BlockCache, BufferAlloc};
 use aerosls_procmgr::{ProcManager, Program};
 use aerosls_proto::bootinfo::BootInfo;
-use aerosls_proto::kabi::{CAP_CHAN, CAP_CHAN_W, CAP_MEM, Kernel};
+use aerosls_proto::kabi::{CAP_CHAN, CAP_CHAN_W, CAP_MEM, CAP_TYPE_DEV, Kernel};
 use aerosls_proto::kwrap::{AWrap, KWrap};
 use aerosls_vfs::{CharNode, Errno, Vfs, O_RDWR};
 
@@ -87,12 +87,15 @@ pub struct BootCaps {
     /// environment it is, because nothing else in the stream can — the cap
     /// table names capabilities ("console", "budget"), never the sidecar.
     pub identity: Option<(u32, u32)>,
-    /// E7 increment 19: the BIB's gate-profile bit. It is a profile selector,
-    /// not a cap. The gate sidecar runs the static backup workload and never
-    /// hosts the dynamic spawn, so `boot()` does not spend its heap on the
-    /// `/lib` namespace; that namespace belongs to the system POSIX sidecar
-    /// where the M2a/M2d children actually spawn.
-    pub gate: bool,
+    /// E7 census scope (§10.12): this sidecar owns the hardware. Only the
+    /// system POSIX profile mints `nic0.bar0` (CAP_TYPE_DEV); every tenant
+    /// profile carries no hardware caps (env_manager's tests pin "uart",
+    /// "irq.timer.0" and "nic0.bar0" absent from every tenant manifest), and
+    /// the gate profile is a tenant in authority, so neither has it. The
+    /// M2a/M2d children spawn only in this hardware-owning sidecar, so `boot()`
+    /// seeds the `/lib` namespace only here and leaves a gate or ordinary
+    /// tenant sidecar's heap to its own workload.
+    pub census_host: bool,
 }
 
 /// The marker the identity announcement starts with. One constant, so the
@@ -125,7 +128,7 @@ impl BootCaps {
             catalog_chan_w: cat_w.map(|c| c.slot),
             catalog_chan_r: cat_r.map(|c| c.slot),
             identity: bib.identity(),
-            gate: bib.is_gate_profile(),
+            census_host: bib.find_cap(CAP_TYPE_DEV, "nic0.bar0").is_some(),
         })
     }
 
@@ -143,6 +146,14 @@ impl BootCaps {
     pub fn with_catalog(mut self, chan_w: u32, chan_r: u32) -> BootCaps {
         self.catalog_chan_w = Some(chan_w);
         self.catalog_chan_r = Some(chan_r);
+        self
+    }
+
+    /// Declare this sidecar the hardware owner the way the system POSIX
+    /// profile's `nic0.bar0` DEV cap does. Host/test constructor only —
+    /// `from_bib()` reads the real cap off the BIB.
+    pub fn with_census_host(mut self) -> BootCaps {
+        self.census_host = true;
         self
     }
 
@@ -176,9 +187,9 @@ impl BootCaps {
             // works, so no existing constructor call changes.
             catalog_chan_w: None,
             catalog_chan_r: None,
-            // The sim has no gate profile; a host test that needs one can
-            // set the field explicitly.
-            gate: false,
+            // The sim's client table has no DEV cap, so a host test that
+            // wants the hardware owner asks for it with `with_census_host()`.
+            census_host: false,
         }
     }
 }
@@ -293,9 +304,11 @@ pub fn boot<K: Kernel, A: BufferAlloc>(
     // loader's DT_NEEDED search reads; seed it with the probe's libm2a.so.
     // The loader itself is seeded beside it: the generic dynamic spawn reads
     // whatever loader the image's PT_INTERP names out of THIS namespace, so
-    // the loader is rootfs content, not a spawn-site embed.
+    // the loader is rootfs content, not a spawn-site embed. Only the
+    // hardware-owning system POSIX sidecar hosts those spawns; the gate and
+    // ordinary tenant profiles skip the seed and keep its ~740 KiB.
     #[cfg(feature = "m2a_interp")]
-    if !caps.gate {
+    if caps.census_host {
         vfs.mount_ramfs("/lib").map_err(BootErr::Mount)?;
         vfs.add_ram_file(
             crate::m2a_interp::M2A_LIB_PATH,
