@@ -822,12 +822,15 @@ if grep -qF 'if (image_is_elf && !image_is_dynamic) {' "$CAPC" && \
    grep -qF 'crate::m2_dyn::LOADER_PATH,' "$BOOT" && \
    grep -qF 'crate::m2_dyn::IMAGE_PATH,' "$BOOT" && \
    grep -qF 'crate::m2_dyn::spawn(' "$LRE" && \
+   grep -qF 'pub fn v1_interp_probe' "$M2D" && \
+   grep -qF 'version_major: 1,' "$M2D" && \
+   grep -qF 'crate::m2_dyn::v1_interp_probe(' "$LRE" && \
    grep -qF 'M2DYN-OK' "$M2DS" && \
    grep -qF -- '--dynamic-linker=/lib/ld-musl-x86_64.so.1' "$M2DFIX" && \
    grep -qF 'Requesting program interpreter' "$M2DFIX"; then
-    ok "O10. the dynamic spawn is image-agnostic: the kernel refuses a version-1 manifest that carries PT_INTERP, and the sidecar spawner reads the image from a VFS path, parses its PT_INTERP, reads that loader from the rootfs /lib namespace, and packs the version-2 INTERP record for the independent M2DYN-OK image"
+    ok "O10. the dynamic spawn is image-agnostic: the kernel refuses a version-1 manifest that carries PT_INTERP, and the sidecar spawner reads the image from a VFS path, parses its PT_INTERP, reads that loader from the rootfs /lib namespace, and packs the version-2 INTERP record for the independent M2DYN-OK image; the same image is also handed to the kernel under a version-1 manifest by a boot-generation probe that must be refused by name"
 else
-    bad "O10. the dynamic route specialized again — a version-1 manifest could enter a dynamic image at e_entry, the spawner could name the loader instead of reading the image's PT_INTERP, the loader could stop coming from the rootfs, or the M2DYN-OK proof image and its recipe could drift apart"
+    bad "O10. the dynamic route specialized again — a version-1 manifest could enter a dynamic image at e_entry, the spawner could name the loader instead of reading the image's PT_INTERP, the loader could stop coming from the rootfs, the version-1 refusal probe could be removed from the boot path, or the M2DYN-OK proof image and its recipe could drift apart"
 fi
 
 # ─── Q. The SSE gate (§10.13's step-1 death, increment 9): CR4.OSFXSR and its order ──

@@ -791,6 +791,22 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                     }
                     Err(rc) => klog(b"[M2D] hello: spawn FAILED rc=", rc as u32, b""),
                 }
+
+                // M2d-v1: the same image under a VERSION-1 manifest. A v1
+                // manifest cannot carry the loader, so the kernel must
+                // refuse the create by name instead of entering e_entry
+                // with no loader. The refusal is the proof; an admitted
+                // child is the probe's failure.
+                match crate::m2_dyn::v1_interp_probe(
+                    &RealKernel, &mut booted.proc.vfs,
+                    crate::m2_dyn::IMAGE_PATH, crate::m2_dyn::V1_PROBE_NAME,
+                    caps.budget_base, caps.budget_len) {
+                    Ok(rc) if rc == -1 => {
+                        klog(b"[M2D] v1 CAP_EINVAL rc=", rc as u32, b"")
+                    }
+                    Ok(rc) => klog(b"[M2D] v1 UNEXPECTED rc=", rc as u32, b""),
+                    Err(rc) => klog(b"[M2D] v1 ADMITTED rc=", rc as u32, b""),
+                }
             }
         }
     }

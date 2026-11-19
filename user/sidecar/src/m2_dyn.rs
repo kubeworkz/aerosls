@@ -40,6 +40,9 @@ pub const IMAGE_PATH: &str = "/tmp/m2.dyn.hello";
 /// M2b DSO in the `/lib` ramfs.
 pub const LOADER_PATH: &str = "/lib/ld-musl-x86_64.so.1";
 pub const HELLO_NAME: &str = "m2.dyn.hello.0";
+/// The deliberately-wrong version-1 manifest's child name. It must never
+/// exist: the kernel refuses the create before a process slot is taken.
+pub const V1_PROBE_NAME: &str = "m2.dyn.v1probe.0";
 
 /// The staged pair's window at the budget tail. The loader is ~600 KiB; the
 /// reserve leaves room for both plus page alignment.
@@ -145,6 +148,82 @@ fn read_vfs<K: Kernel, A: BufferAlloc>(
     }
     vfs.close(task, fd).ok();
     Ok(off)
+}
+
+/// M2d-v1 negative probe: pack a **version-1** manifest around the same
+/// dynamic image and hand it to the kernel.
+///
+/// A version-1 manifest cannot carry an `INTERP` record (the kernel refuses
+/// one at parse time), so this is exactly the manifest a stale or confused
+/// caller produces: the image's own `PT_INTERP` is the only statement that
+/// it needs a loader. The kernel must refuse the create by name
+/// (`CAP_EINVAL: PT_INTERP requires a version-2 manifest`) instead of
+/// mapping the image and entering `e_entry` with no loader.
+///
+/// Returns the kernel's refusal code on `Ok`; `Err` means the kernel
+/// admitted the manifest (the probe's failure) and carries that result.
+pub fn v1_interp_probe<K: Kernel, A: BufferAlloc>(
+    k: &K,
+    vfs: &mut Vfs<K, A>,
+    image_path: &str,
+    name: &str,
+    budget_base: u64,
+    budget_len: u64,
+) -> Result<i32, i32> {
+    let main_kaddr = budget_base
+        .checked_add(budget_len)
+        .and_then(|end| end.checked_sub(RESERVE))
+        .ok_or(-1)?;
+    let vt = vfs.add_task().map_err(|_| -8)?;
+
+    /* Only the image is staged: a version-1 manifest has no loader bytes to
+     * name, which is the whole point of the probe. */
+    let image_len = read_vfs(vfs, vt, image_path, main_kaddr, MAX_IMAGE)?;
+
+    let caps: [Option<ManifestCap<'_>>; MAX_MANIFEST_CAPS] = [None; MAX_MANIFEST_CAPS];
+    let m = Manifest {
+        version_major: 1,
+        version_minor: 0,
+        flags: 0,
+        name: Some(name),
+        personality: Some("m2a.linux.v1"),
+        image: Some(Image {
+            offset: 0,
+            size: image_len as u32,
+            entry: 0,
+        }),
+        interp: None,
+        budget: Some(Budget {
+            mem_bytes: MEM_BUDGET_BYTES,
+            stack_bytes: STACK_BUDGET_BYTES as u32,
+            heap_initial: 0,
+        }),
+        cpu: Some(Cpu { share: 10, preemptible: true }),
+        limits: Some(Limits {
+            max_tasks: 1,
+            max_fds: 0,
+            max_channels: 2,
+            max_open_files: 0,
+            chan_queue_depth: 4,
+        }),
+        caps,
+        n_caps: 0,
+        bootstrap: Some(Bootstrap {
+            console: None,
+            debug: None,
+            log_level: 1,
+        }),
+        flags_value: Some(0),
+        argenv: Some(ArgEnv::new(&[name], LINUX_DEFAULT_ENV)),
+        signature: None,
+    };
+    let blob = pack_manifest(&m, main_kaddr);
+
+    /* target_partition 0 = inherit (this sidecar's). */
+    match k.linux_spawn(&blob, 0) {
+        Ok(_) => Err(-100), /* admitted: a dynamic image with no loader */
+        Err(rc) => Ok(rc),
+    }
 }
 
 /// Stage `image_path` and the loader its `PT_INTERP` names, then spawn it.

@@ -1,0 +1,13 @@
+270:[M2D] staged image=00003468 
+271:[M2D] staged loader=000B29E0 
+272:[M2D] hello: spawned ch_00000015 
+276:[CS] CAP_EINVAL: PT_INTERP requires a version-2 manifest (version=1, path='/lib/ld-musl-x86_64.so.1')
+277:[TORE] address space 0x00000000136a8000 destroyed: 1 frame(s) freed
+280:[M2D] v1 CAP_EINVAL rc=FFFFFFFF 
+532:M2DYN-OK
+553:[TORE] address space 0x00000000135d1000 destroyed: 214 frame(s) freed
+557:M2A-OK
+571:[TORE] address space 0x00000000134f9000 destroyed: 215 frame(s) freed
+1039:[TORE] address space 0x0000000013463000 destroyed: 152 frame(s) freed
+1095:[TORE] address space 0x0000000013223000 destroyed: 10 frame(s) freed
+1106:[TORE] address space 0x000000001322e000 destroyed: 15 frame(s) freed
