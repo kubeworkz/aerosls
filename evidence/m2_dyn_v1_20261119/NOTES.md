@@ -63,5 +63,7 @@ neither replaced nor disturbed the accepted paths.
 - ISO build — exit 0, sha above.
 - `tests/m2_dyn_v1_boot_check.sh` — 5/5 assertions pass on the built ISO
   (kernel line, sidecar CAP_EINVAL, no admission, v2 spawn, M2DYN-OK).
-- Not run: `linux_personality_check_smoke.sh` (15 min); O10's existing tooth
-  t155 still reddens the clause, and the boot check is the new live tooth.
+- `tests/linux_personality_check_smoke.sh` under WSL — 145 passed, 0 failed
+  (exit 0). The seeded baseline copy passes the guard unmutated, and the O10
+  tooth `m2dyn-interp-unparsed` still reddens the clause by name with the new
+  pins present. The boot check is the new live tooth.
