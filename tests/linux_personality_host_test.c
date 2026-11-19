@@ -810,6 +810,11 @@ int main(void)
         CHECK(linux_mem_mmap_refusal(&req, BASE, LIMIT) == 0,
               "a read-only MAP_PRIVATE file map (fd 3, offset 0) passes "
               "      the first trap — the loader's DT_NEEDED shape");
+        req.prot = LINUX_PROT_READ | LINUX_PROT_EXEC;
+        CHECK(linux_mem_mmap_refusal(&req, BASE, LIMIT) == 0,
+              "a READ|EXEC MAP_PRIVATE file map passes — the DSO's "
+              "      .text segment, and never writable by its shape");
+        req.prot = LINUX_PROT_READ;
         req.offset = 0x100;
         CHECK(linux_mem_mmap_refusal(&req, BASE, LIMIT) == -LINUX_EINVAL,
               "a file map at a non-page-aligned offset is EINVAL — "
@@ -967,6 +972,16 @@ int main(void)
                   v.prot_write == 0 && v.map_pages == 1,
               "a FIXED file map replaces and stays read-only — file bytes "
               "      never arrive in a writable frame");
+        req.len = 4096; req.prot = LINUX_PROT_READ | LINUX_PROT_EXEC;
+        req.flags = LINUX_MAP_PRIVATE | LINUX_MAP_FIXED;
+        req.addr = BASE + 0x2000;
+        v = linux_mem_mmap_verdict(BASE, LIMIT, BASE, LIMIT, &req,
+                                   BASE + 0x2000);
+        CHECK(v.malformed == 0 && v.replace == 1 && v.file_backed == 1 &&
+                  v.prot_write == 0 && v.prot_exec == 1 &&
+                  v.map_pages == 1,
+              "an executable file map keeps its exec bit AND stays "
+              "      read-only — .text is RX, never RWX");
     }
 
     /* ─── the mprotect seam: the Rust guard-page shape ─────────────────── */

@@ -980,7 +980,6 @@ int linux_mem_mmap_refusal(const struct LinuxMmapReq *req,
     /* W|X first: mprotect's own §5.4 rule over a prot word (the twin at
      * both ends), so W|X reads EPERM wherever it arrives. */
     if (linux_mprotect_refuses_wx(req->prot)) return -LINUX_EPERM;
-    if (req->prot & LINUX_PROT_EXEC) return -LINUX_ENOSYS;
 
     if (!(req->flags & LINUX_MAP_PRIVATE))   return -LINUX_ENOSYS;
     if (req->flags & LINUX_MAP_SHARED)       return -LINUX_ENOSYS;
@@ -988,20 +987,27 @@ int linux_mem_mmap_refusal(const struct LinuxMmapReq *req,
 
     /* M2b: the two mapping SOURCES. An anonymous map ignores fd/offset,
      * exactly as Linux does. A file map (no MAP_ANONYMOUS) is served for
-     * the READ-ONLY private shape the loader's DT_NEEDED path asks for:
-     * PROT_READ only (write and execute file maps stay ENOSYS by name),
-     * a page-aligned offset (Linux's own EINVAL), a non-negative fd
-     * (stack addresses arrive as huge unsigned words — EBADF), and a
-     * length inside the chunk stream's staging cap. The fd's existence
-     * and the file's own bytes are the sidecar's truth; this ladder is
-     * only the shape, exactly like its anonymous sibling. */
+     * the two READ-ONLY private shapes the loader's DT_NEEDED path asks
+     * for: the header/segment read (PROT_READ) and the executable segment
+     * (PROT_READ|PROT_EXEC — never writable, so §5.4's W^X holds by the
+     * shape alone), a page-aligned offset (Linux's own EINVAL), a
+     * non-negative fd (stack addresses arrive as huge unsigned words —
+     * EBADF), and a length inside the chunk stream's staging cap. The fd's
+     * existence and the file's own bytes are the sidecar's truth; this
+     * ladder is only the shape, exactly like its anonymous sibling. */
     if (!(req->flags & LINUX_MAP_ANONYMOUS)) {
-        if (req->prot != LINUX_PROT_READ)      return -LINUX_ENOSYS;
+        if (req->prot != LINUX_PROT_READ &&
+            req->prot != (LINUX_PROT_READ | LINUX_PROT_EXEC))
+            return -LINUX_ENOSYS;
         if (req->offset & (LINUX_PAGE_SIZE - 1)) return -LINUX_EINVAL;
         if (req->offset > UINT64_MAX - (LINUX_PAGE_SIZE - 1))
             return -LINUX_EINVAL;
         if (req->fd > 0x7FFFFFFFULL)           return -LINUX_EBADF;
         if (req->len > LINUX_MMAP_FILE_MAX)    return -LINUX_ENOSYS;
+    } else if (req->prot & LINUX_PROT_EXEC) {
+        /* An ANONYMOUS executable map stays the named v1 gap: only the
+         * file-backed RX shape above is served (the loader's DSO). */
+        return -LINUX_ENOSYS;
     }
 
     /* FIXED asks for an exact address; Linux requires it page-aligned
@@ -1030,6 +1036,7 @@ linux_mem_mmap_verdict(uint64_t heap_base, uint64_t heap_limit,
     v.malformed = 0;
     v.replace = 0;
     v.prot_write = 0;
+    v.prot_exec = 0;
     v.prot_none = 0;
     v.map_va = 0;
     v.range_pages = 0;
@@ -1099,6 +1106,10 @@ linux_mem_mmap_verdict(uint64_t heap_base, uint64_t heap_limit,
                 ? 0 : v.range_pages;
     v.prot_none = (req->prot == LINUX_PROT_NONE) ? 1 : 0;
     v.prot_write = (!v.file_backed && (req->prot & LINUX_PROT_WRITE)) ? 1 : 0;
+    /* M2b: the DSO's executable segment. Only a file map can carry it —
+     * the ladder refuses an anonymous exec — and the pages stay
+     * read-only: exec^write is the W^X invariant, not a third state. */
+    v.prot_exec = (v.file_backed && (req->prot & LINUX_PROT_EXEC)) ? 1 : 0;
     v.new_mmap_top = is_fixed ? mmap_top : rax;
     return v;
 }

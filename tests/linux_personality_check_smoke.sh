@@ -1250,6 +1250,26 @@ seed "$W/t147"
 sed -i 's/pub fn read_at(&mut self, task: u32, fd: u32, offset: u64,/pub fn read_from(\&mut self, task: u32, fd: u32, offset: u64,/' "$W/t147/user/vfs/src/vfs.rs"
 tooth filemap-positional-read-gone Y9 "Vfs::read_at is gone" "$W/t147"
 
+# t148: the apply leaves every file page NX even when the verdict says
+# exec — the .text mapping would fault on its first instruction. Guard
+# clause Y10 must redden by name.
+seed "$W/t148"
+sed -i 's/(v.prot_exec$/(USER_PTE_NOEXEC)/; s/? 0 : USER_PTE_NOEXEC)/(USER_PTE_NOEXEC)/' "$W/t148/kernel/syscall_dispatch.c"
+tooth rx-exec-pte-nx Y10 "an RX file page is mapped non-executable" "$W/t148"
+
+# t149: the ladder's file gate drops back to PROT_READ only — the
+# loader's .text map is ENOSYS again. Guard clause Y10 must redden.
+seed "$W/t149"
+sed -i 's/req->prot != (LINUX_PROT_READ | LINUX_PROT_EXEC)/req->prot != LINUX_PROT_READ/' "$W/t149/kernel/linux_abi.c"
+tooth rx-file-exec-refused Y10 "the file ladder refuses an executable map" "$W/t149"
+
+# t150: the sidecar's twin renumbers the served file shapes back to READ
+# only while the kernel still admits 0x5 — the two ends disagree and the
+# grant is refused at the reply. Guard clause Y10 must redden.
+seed "$W/t150"
+sed -i 's/if prot != 0x1 && prot != 0x5 {/if prot != 0x1 {/' "$W/t150/user/sidecar/src/linux.rs"
+tooth rx-sidecar-twin-narrowed Y10 "the sidecar only serves read-only file maps" "$W/t150"
+
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

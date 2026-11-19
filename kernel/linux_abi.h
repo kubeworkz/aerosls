@@ -712,6 +712,9 @@ struct LinuxMemMmapVerdict {
                             * range is unmapped first (frame returned),
                             * then the grant installs per prot        */
     int      prot_write;   /* 1: map the granted pages RW-NX; 0: RO-NX */
+    int      prot_exec;    /* M2b: 1: the granted FILE pages carry the
+                            * exec bit (the loader's DSO .text segment)
+                            * and stay read-only; 0 everywhere else  */
     int      prot_none;    /* 1: install PROT_NONE reservation leaves  */
     uint64_t map_va;       /* the range's first page: the one to back
                             * (map_pages > 0) or reserve (prot_none)   */

@@ -1858,6 +1858,24 @@ else
     bad "Y9. the file-backed mmap seam is gone or drifted: the request's fd/offset, the file-shape ladder/verdict, the fill-round post/resume, the frame write that bypasses the read-only map, or the sidecar's Vfs::read_at arm changed — the loader's 20 KiB DSO map would be refused, partially backed, or filled from the wrong offset, while the guard reads green"
 fi
 
+# ─── Y10. the executable file map (M2b, the DSO's .text) ─────────────────
+# The loader re-maps each PT_LOAD at its fixed address: the executable
+# segment arrives as MAP_PRIVATE|MAP_FIXED, PROT_READ|PROT_EXEC, fd 3,
+# offset 0x1000. Only the FILE shape may carry exec (an anonymous exec
+# stays the named gap), the pages stay read-only (W^X), and the PTE
+# carries exec exactly where the verdict says so.
+if grep -qF 'req->prot != (LINUX_PROT_READ | LINUX_PROT_EXEC)' "$LABC" && \
+   grep -qF 'int      prot_exec;' "$LABH" && \
+   grep -qF 'v.prot_exec = (v.file_backed &&' "$LABC" && \
+   grep -qF '(v.prot_exec' "$DISP" && \
+   grep -qF '? 0 : USER_PTE_NOEXEC)' "$DISP" && \
+   grep -qF 'if prot != 0x1 && prot != 0x5 {' "$LRS" && \
+   grep -qF 'an ANONYMOUS executable map stays the named v1 gap' "$LRS"; then
+    ok "Y10. the executable file map is wired: the ladder admits READ|EXEC for file maps only (anonymous exec stays ENOSYS), the verdict marks prot_exec for a file map and never prot_write, the apply clears NX exactly there, and the sidecar's twin admits the same 0x5 shape"
+else
+    bad "Y10. the executable file map is gone or drifted: the READ|EXEC ladder, the prot_exec verdict, the NX clear in the apply, or the sidecar's 0x5 twin changed — the loader's .text map would be refused ENOSYS (the M2b stall), an anonymous exec would slip through, or an RX page would be mapped NX and fault on its first instruction"
+fi
+
 echo
 if [ "$fails" -eq 0 ]; then
     echo "linux_personality_check: all clauses hold"

@@ -537,7 +537,8 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                                 (uint64_t)(uintptr_t)frame,
                                                 USER_PTE_PRESENT |
                                                 USER_PTE_USER |
-                                                USER_PTE_NOEXEC |
+                                                (v.prot_exec
+                                                     ? 0 : USER_PTE_NOEXEC) |
                                                 (v.prot_write
                                                      ? USER_PTE_WRITE : 0));
                                             backed++;
@@ -1304,6 +1305,14 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                 ? "outside the stamped span"
                                 : "shape not served (by name)");
                         return (uint64_t)(int64_t)mref;
+                    }
+                    if (!(mreq.flags & LINUX_MAP_ANONYMOUS)) {
+                        kernel_serial_printf(
+                            "[E7] file mmap addr=0x%lx len=%lu prot=%lu "
+                            "flags=0x%lx fd=%lu off=0x%lx\n",
+                            (unsigned long)largs[0], (unsigned long)largs[1],
+                            (unsigned long)largs[2], (unsigned long)largs[3],
+                            (unsigned long)largs[4], (unsigned long)largs[5]);
                     }
                     cur->mem_stage_valid = 1;
                     cur->mem_stage_num   = num;

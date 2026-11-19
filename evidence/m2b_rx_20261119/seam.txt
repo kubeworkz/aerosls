@@ -1,0 +1,18 @@
+[E7] file mmap addr=0x0 len=20480 prot=1 flags=0x2 fd=3 off=0x0
+[E7] linux: num=00000009 child=m2a.linux.hello.0 ok mmap -> 0x0000400000051000 fd=3 off=0x00000
+[E7] linux: num=4D4D4650 child=m2a.linux.hello.0 ok + payload
+[E7] linux: num=4D4D4650 child=m2a.linux.hello.0 ok + payload
+[E7] linux: num=4D4D4650 child=m2a.linux.hello.0 ok + payload
+[E7] linux: num=4D4D4650 child=m2a.linux.hello.0 ok + payload
+[E7] linux: num=4D4D4650 child=m2a.linux.hello.0 ok + payload
+[E7] linux: num=4D4D4650 child=m2a.linux.hello.0 ok + payload
+[E7] file mmap addr=0x400000052000 len=4096 prot=5 flags=0x12 fd=3 off=0x1000
+[E7] linux: num=00000009 child=m2a.linux.hello.0 ok mmap -> 0x0000400000052000 fd=3 off=0x00000
+[E7] linux: num=4D4D4650 child=m2a.linux.hello.0 ok + payload
+[E7] linux: num=4D4D4650 child=m2a.linux.hello.0 ok + payload
+[E7] file mmap addr=0x400000053000 len=4096 prot=1 flags=0x12 fd=3 off=0x2000
+[E7] linux: num=00000009 child=m2a.linux.hello.0 ok mmap -> 0x0000400000053000 fd=3 off=0x00000
+[E7] linux: num=4D4D4650 child=m2a.linux.hello.0 ok + payload
+[E7] linux: num=4D4D4650 child=m2a.linux.hello.0 ok + payload
+[E7] linux mmap addr=0x400000054000 len=8192 prot=3 flags=0x12 fd=3 off=0x2000 refused before post: shape not served (by name)
+Error loading shared library libm2a.so: Function not implemented (needed by m2a.linux.hello.0[CAP] woken PID 109 (channel 27)
