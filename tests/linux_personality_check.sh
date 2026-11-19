@@ -1858,22 +1858,25 @@ else
     bad "Y9. the file-backed mmap seam is gone or drifted: the request's fd/offset, the file-shape ladder/verdict, the fill-round post/resume, the frame write that bypasses the read-only map, or the sidecar's Vfs::read_at arm changed — the loader's 20 KiB DSO map would be refused, partially backed, or filled from the wrong offset, while the guard reads green"
 fi
 
-# ─── Y10. the executable file map (M2b, the DSO's .text) ─────────────────
-# The loader re-maps each PT_LOAD at its fixed address: the executable
-# segment arrives as MAP_PRIVATE|MAP_FIXED, PROT_READ|PROT_EXEC, fd 3,
-# offset 0x1000. Only the FILE shape may carry exec (an anonymous exec
-# stays the named gap), the pages stay read-only (W^X), and the PTE
-# carries exec exactly where the verdict says so.
-if grep -qF 'req->prot != (LINUX_PROT_READ | LINUX_PROT_EXEC)' "$LABC" && \
+# ─── Y10. the file map's protection shapes (M2b) ──────────────────────
+# The loader re-maps each PT_LOAD at its fixed address: .data arrives as
+# MAP_PRIVATE|MAP_FIXED, PROT_READ|PROT_WRITE, fd 3, offset 0x2000 and
+# .text as PROT_READ|PROT_EXEC at 0x1000. Only the FILE shape may be RW
+# or RX (an anonymous exec stays the named gap), W|X is EPERM at both
+# ends, and the PTE carries write and exec exactly where the verdict
+# says so — never together.
+if grep -qF 'req->prot != (LINUX_PROT_READ | LINUX_PROT_WRITE)' "$LABC" && \
+   grep -qF 'req->prot != (LINUX_PROT_READ | LINUX_PROT_EXEC)' "$LABC" && \
    grep -qF 'int      prot_exec;' "$LABH" && \
    grep -qF 'v.prot_exec = (v.file_backed &&' "$LABC" && \
+   grep -qF 'v.prot_write = (req->prot & LINUX_PROT_WRITE) ? 1 : 0;' "$LABC" && \
    grep -qF '(v.prot_exec' "$DISP" && \
    grep -qF '? 0 : USER_PTE_NOEXEC)' "$DISP" && \
-   grep -qF 'if prot != 0x1 && prot != 0x5 {' "$LRS" && \
+   grep -qF 'if prot != 0x1 && prot != 0x3 && prot != 0x5 {' "$LRS" && \
    grep -qF 'an ANONYMOUS executable map stays the named v1 gap' "$LRS"; then
-    ok "Y10. the executable file map is wired: the ladder admits READ|EXEC for file maps only (anonymous exec stays ENOSYS), the verdict marks prot_exec for a file map and never prot_write, the apply clears NX exactly there, and the sidecar's twin admits the same 0x5 shape"
+    ok "Y10. the file-map protection shapes are wired: the ladder admits READ, READ|WRITE and READ|EXEC for file maps only (W|X is EPERM, anonymous exec stays ENOSYS), the verdict marks prot_write from the word and prot_exec for an exec FILE map, the apply clears NX exactly there, and the sidecar's twin admits the same 0x1/0x3/0x5 shapes"
 else
-    bad "Y10. the executable file map is gone or drifted: the READ|EXEC ladder, the prot_exec verdict, the NX clear in the apply, or the sidecar's 0x5 twin changed — the loader's .text map would be refused ENOSYS (the M2b stall), an anonymous exec would slip through, or an RX page would be mapped NX and fault on its first instruction"
+    bad "Y10. a file-map protection shape is gone or drifted: the READ/RW/RX ladder, the prot_write or prot_exec verdict, the NX clear in the apply, or the sidecar's twin changed — the loader's .data or .text map would be refused ENOSYS (the M2b stall), an RW page would be mapped read-only (the relocation store faults), an RX page would be mapped NX, or an anonymous exec would slip through, while the guard reads green"
 fi
 
 echo

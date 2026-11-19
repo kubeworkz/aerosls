@@ -1247,16 +1247,16 @@ fn answer(
                 Answer::Reply(0, E_NOSYS)
             } else if flags & MAP_ANONYMOUS == 0 {
                 /* M2b, the file-backed half: the loader's DT_NEEDED maps
-                 * — MAP_PRIVATE, PROT_READ (the header/segment read) or
-                 * PROT_READ|PROT_EXEC (the executable segment), a VFS fd
-                 * and a page-aligned offset. The same ladder as the
+                 * — MAP_PRIVATE, PROT_READ (the header/segment read),
+                 * PROT_READ|PROT_WRITE (.data) or PROT_READ|PROT_EXEC
+                 * (.text), a VFS fd and a page-aligned offset. The same ladder as the
                  * kernel's first trap (neither end load-bearing alone);
                  * the FILE's truth is the VFS's: a non-file or unreadable
                  * slot answers its own EBADF from `read_at`, which
                  * `service` turns into a refusal reply with no chunks
                  * sent. Write file maps stay ENOSYS by name; W|X is
                  * EPERM above, so an RX map can never become writable. */
-                if prot != 0x1 && prot != 0x5 {
+                if prot != 0x1 && prot != 0x3 && prot != 0x5 {
                     Answer::Reply(0, E_NOSYS)
                 } else if foff & 0xFFF != 0 {
                     Answer::Reply(0, E_INVAL)
@@ -6742,11 +6742,13 @@ mod tests {
         let a = answer(9, &[0, u64::MAX, 3, 0x22, 0, 0],
                        &fds(), &mut b, &mut fresh(), &[]);
         assert!(matches!(a, Answer::Reply(0, E_INVAL)), "overflow: {:?}", a);
-        /* file-backed (no ANONYMOUS), shared, and unknown flag bits:
-         * ENOSYS by name — the flags ride the log line */
+        /* a file-shaped ask is no longer refused by shape — it reaches
+         * the fd table, and an empty slot there is EBADF (M2b serves
+         * READ, RW and RX file maps). Shared and unknown flags stay
+         * ENOSYS by name. */
         let a = answer(9, &[0, 0x1000, 3, 0x02, 0, 0],
                        &fds(), &mut b, &mut fresh(), &[]);
-        assert!(matches!(a, Answer::Reply(0, E_NOSYS)), "file: {:?}", a);
+        assert!(matches!(a, Answer::Reply(0, E_BADF)), "file: {:?}", a);
         let a = answer(9, &[0, 0x1000, 3, 0x23, 0, 0],
                        &fds(), &mut b, &mut fresh(), &[]);
         assert!(matches!(a, Answer::Reply(0, E_NOSYS)), "shared: {:?}", a);
@@ -7771,12 +7773,23 @@ mod tests {
             }
             other => panic!("RX file map: {:?}", other),
         }
-        /* the writable .data segment is still refused by name */
+        /* the writable .data segment: served, and the answer names the
+         * same source words so its fill rounds read from 0x2000 */
+        match answer(9, &[SPAN_BASE + 0x2000, 0x2000, 0x3, 0x12, 3, 0x2000],
+                     &f, &mut b, &mut fresh(), &[]) {
+            Answer::MmapFile(ret, vfd, foff, flen) => {
+                assert_eq!((ret, vfd, foff, flen),
+                           (SPAN_BASE + 0x2000, 7, 0x2000, 0x2000),
+                           "an RW file map is granted from the same words");
+            }
+            other => panic!("RW file map: {:?}", other),
+        }
+        /* W|X stays refused at the sidecar's own door */
         assert!(matches!(
-            answer(9, &[SPAN_BASE + 0x2000, 0x2000, 0x3, 0x12, 3, 0x2000],
+            answer(9, &[SPAN_BASE + 0x2000, 0x2000, 0x7, 0x12, 3, 0x2000],
                    &f, &mut b, &mut fresh(), &[]),
-            Answer::Reply(0, E_NOSYS)),
-            "a writable file map stays the next slice, not a silent grant");
+            Answer::Reply(0, E_PERM)),
+            "a W|X file map is EPERM, never a grant");
     }
 
     #[test]

@@ -1267,8 +1267,15 @@ tooth rx-file-exec-refused Y10 "the file ladder refuses an executable map" "$W/t
 # only while the kernel still admits 0x5 — the two ends disagree and the
 # grant is refused at the reply. Guard clause Y10 must redden.
 seed "$W/t150"
-sed -i 's/if prot != 0x1 && prot != 0x5 {/if prot != 0x1 {/' "$W/t150/user/sidecar/src/linux.rs"
-tooth rx-sidecar-twin-narrowed Y10 "the sidecar only serves read-only file maps" "$W/t150"
+sed -i 's/if prot != 0x1 && prot != 0x3 && prot != 0x5 {/if prot != 0x1 {/' "$W/t150/user/sidecar/src/linux.rs"
+tooth fileshape-sidecar-twin-narrowed Y10 "the sidecar only serves read-only file maps" "$W/t150"
+
+# t151: a writable file map grants but the verdict never sets the PTE's
+# write bit — the loader's relocation store faults on .data. Guard clause
+# Y10 must redden by name.
+seed "$W/t151"
+sed -i 's/v.prot_write = (req->prot \& LINUX_PROT_WRITE) ? 1 : 0;/v.prot_write = 0;/' "$W/t151/kernel/linux_abi.c"
+tooth filemap-write-verdict-dropped Y10 "an RW file map is mapped read-only" "$W/t151"
 
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"

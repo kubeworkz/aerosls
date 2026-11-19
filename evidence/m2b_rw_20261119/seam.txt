@@ -1,0 +1,36 @@
+[E7] linux mprotect apply addr=0x4000000e8000 len=4096 prot=0x0 reply=0x0 (span 0x8000000..0x4000000eb000)
+[E7] linux mprotect apply addr=0x4000000e8000 len=4096 prot=0x0 reply=0x0 (span 0x8000000..0x4000000eb000)
+[E7] file mmap addr=0x0 len=20480 prot=1 flags=0x2 fd=3 off=0x0
+[E7] linux: num=4D4D4650 child=m2a.linux.hello.0 ok + payload
+[E7] linux: num=4D4D4650 child=m2a.linux.hello.0 ok + payload
+[E7] linux: num=4D4D4650 child=m2a.linux.hello.0 ok + payload
+[E7] linux: num=4D4D4650 child=m2a.linux.hello.0 ok + payload
+[E7] linux mprotect apply addr=0x400000006000 len=4096 prot=0x0 reply=0x0 (span 0x400000006000..0x400000016000)
+[E7] linux mprotect apply addr=0x400000007000 len=4096 prot=0x0 reply=0x0 (span 0x3ff000..0x400000017000)
+[E7] linux: num=4D4D4650 child=m2a.linux.hello.0 ok + payload
+[E7] linux mprotect apply addr=0x400000006000 len=4096 prot=0x3 reply=0x0 (span 0x400000006000..0x400000016000)
+[E7] linux mprotect apply addr=0x400000007000 len=4096 prot=0x3 reply=0x0 (span 0x3ff000..0x400000017000)
+[E7] linux: num=4D4D4650 child=m2a.linux.hello.0 ok + payload
+[E7] file mmap addr=0x400000052000 len=4096 prot=5 flags=0x12 fd=3 off=0x1000
+[E7] linux: num=4D4D4650 child=m2a.linux.hello.0 ok + payload
+[E7] linux: num=4D4D4650 child=m2a.linux.hello.0 ok + payload
+[E7] file mmap addr=0x400000053000 len=4096 prot=1 flags=0x12 fd=3 off=0x2000
+[E7] linux: num=4D4D4650 child=m2a.linux.hello.0 ok + payload
+[E7] linux: num=4D4D4650 child=m2a.linux.hello.0 ok + payload
+[E7] file mmap addr=0x400000054000 len=8192 prot=3 flags=0x12 fd=3 off=0x2000
+[E7] linux: num=4D4D4650 child=m2a.linux.hello.0 ok + payload
+[E7] linux: num=4D4D4650 child=m2a.linux.hello.0 ok + payload
+[E7] linux: num=4D4D4650 child=m2a.linux.hello.0 ok + payload
+[E7] linux: num=00000003 child=m2a.linux.hello.0 ok
+[E7] linux: num=0000000A child=m2a.linux.hello.0 ok
+[E7] linux mprotect apply addr=0x400000054000 len=4096 prot=0x1 reply=0x0 (span 0x400000..0x7f00000b7000)
+[E7] linux: num=0000000A child=m2a.linux.hello.0 -> EINVAL
+[E7] linux mprotect apply addr=0x7f00000b2000 len=4096 prot=0x1 reply=0xffffffffffffffea (span 0x400000..0x7f00000b7000)
+[E7] linux: num=00000014 child=m2a.linux.hello.0 write ok len=93 |Error relocating /lib/ld|
+Error relocating /lib/ld-musl-x86_64.so.1: RELRO protection failed: No such file or directory[CAP] woken PID 113 (channel 31)
+[E7] linux: num=0000000A child=m2a.linux.hello.0 -> EINVAL
+[E7] linux mprotect apply addr=0x403000 len=4096 prot=0x1 reply=0xffffffffffffffea (span 0x400000..0x7f00000b7000)
+[E7] linux: num=00000014 child=m2a.linux.hello.0 write ok len=86 |Error relocating m2a.lin|
+Error relocating m2a.linux.hello.0: RELRO protection failed: No such file or directory[CAP] woken PID 113 (channel 31)
+[E7] linux: num=000000E7 child=m2a.linux.hello.0 exit_group status=127
+[E7] linux: num=000000E7 child=m2a.linux.hello.0 group swept=1 dead=1 live=0

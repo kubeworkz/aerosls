@@ -988,15 +988,18 @@ int linux_mem_mmap_refusal(const struct LinuxMmapReq *req,
     /* M2b: the two mapping SOURCES. An anonymous map ignores fd/offset,
      * exactly as Linux does. A file map (no MAP_ANONYMOUS) is served for
      * the two READ-ONLY private shapes the loader's DT_NEEDED path asks
-     * for: the header/segment read (PROT_READ) and the executable segment
-     * (PROT_READ|PROT_EXEC — never writable, so §5.4's W^X holds by the
-     * shape alone), a page-aligned offset (Linux's own EINVAL), a
+     * for: the header/segment read (PROT_READ), the data segment
+     * (PROT_READ|PROT_WRITE) and the executable segment
+     * (PROT_READ|PROT_EXEC). Write never rides with exec — §5.4 refuses
+     * W|X above — so the three shapes cannot produce a writable+exec
+     * page. A page-aligned offset (Linux's own EINVAL), a
      * non-negative fd (stack addresses arrive as huge unsigned words —
      * EBADF), and a length inside the chunk stream's staging cap. The fd's
      * existence and the file's own bytes are the sidecar's truth; this
      * ladder is only the shape, exactly like its anonymous sibling. */
     if (!(req->flags & LINUX_MAP_ANONYMOUS)) {
         if (req->prot != LINUX_PROT_READ &&
+            req->prot != (LINUX_PROT_READ | LINUX_PROT_WRITE) &&
             req->prot != (LINUX_PROT_READ | LINUX_PROT_EXEC))
             return -LINUX_ENOSYS;
         if (req->offset & (LINUX_PAGE_SIZE - 1)) return -LINUX_EINVAL;
@@ -1095,7 +1098,7 @@ linux_mem_mmap_verdict(uint64_t heap_base, uint64_t heap_limit,
     v.map_va = rax;
     v.range_pages = len_r / LINUX_PAGE_SIZE;
     /* M2b: a file map's pages are backed from the staged chunk stream
-     * (read-only, so never writable), and every page is backed — the
+     * (READ, RW or RX — never W|X), and every page is backed — the
      * sidecar zero-pads a file shorter than the mapping, which is the
      * partial last page Linux itself hands back. */
     v.file_backed = !(req->flags & LINUX_MAP_ANONYMOUS);
@@ -1105,7 +1108,9 @@ linux_mem_mmap_verdict(uint64_t heap_base, uint64_t heap_limit,
     v.map_pages = (req->prot == LINUX_PROT_NONE)
                 ? 0 : v.range_pages;
     v.prot_none = (req->prot == LINUX_PROT_NONE) ? 1 : 0;
-    v.prot_write = (!v.file_backed && (req->prot & LINUX_PROT_WRITE)) ? 1 : 0;
+    /* M2b: a writable file map is .data — the loader relocates through
+     * it. W|X is refused above, so write never rides with exec. */
+    v.prot_write = (req->prot & LINUX_PROT_WRITE) ? 1 : 0;
     /* M2b: the DSO's executable segment. Only a file map can carry it —
      * the ladder refuses an anonymous exec — and the pages stay
      * read-only: exec^write is the W^X invariant, not a third state. */

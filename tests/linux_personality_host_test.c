@@ -820,8 +820,13 @@ int main(void)
               "a file map at a non-page-aligned offset is EINVAL — "
               "      Linux's own rule");
         req.offset = 0; req.prot = LINUX_PROT_READ | LINUX_PROT_WRITE;
+        CHECK(linux_mem_mmap_refusal(&req, BASE, LIMIT) == 0,
+              "a read+write MAP_PRIVATE file map passes — the DSO's "
+              "      .data segment, mapped RW and never executable");
+        req.prot = LINUX_PROT_WRITE;
         CHECK(linux_mem_mmap_refusal(&req, BASE, LIMIT) == -LINUX_ENOSYS,
-              "a writable file map is ENOSYS by name — its own increment");
+              "a write-only file map is still ENOSYS by name — only the "
+              "      three READ-based shapes are served");
         req.prot = LINUX_PROT_READ; req.fd = (uint64_t)(int64_t)-1;
         CHECK(linux_mem_mmap_refusal(&req, BASE, LIMIT) == -LINUX_EBADF,
               "a negative fd is EBADF — the words are read as Linux reads "
@@ -982,6 +987,16 @@ int main(void)
                   v.map_pages == 1,
               "an executable file map keeps its exec bit AND stays "
               "      read-only — .text is RX, never RWX");
+        req.len = 8192; req.prot = LINUX_PROT_READ | LINUX_PROT_WRITE;
+        req.flags = LINUX_MAP_PRIVATE | LINUX_MAP_FIXED;
+        req.addr = BASE + 0x3000;
+        v = linux_mem_mmap_verdict(BASE, LIMIT, BASE, LIMIT, &req,
+                                   BASE + 0x3000);
+        CHECK(v.malformed == 0 && v.replace == 1 && v.file_backed == 1 &&
+                  v.prot_write == 1 && v.prot_exec == 0 &&
+                  v.map_pages == 2,
+              "a writable file map sets prot_write and clears prot_exec — "
+              "      .data is RW, never W|X");
     }
 
     /* ─── the mprotect seam: the Rust guard-page shape ─────────────────── */

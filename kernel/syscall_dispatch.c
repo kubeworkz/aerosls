@@ -719,6 +719,16 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                 mreq.prot = sa2;
                                 linux_mprotect_span(cur, &mspan_base,
                                                     &mspan_limit);
+                                kernel_serial_printf(
+                                    "[E7] linux mprotect apply addr=0x%lx "
+                                    "len=%lu prot=0x%lx reply=0x%lx "
+                                    "(span 0x%lx..0x%lx)\n",
+                                    (unsigned long)sa0,
+                                    (unsigned long)sa1,
+                                    (unsigned long)sa2,
+                                    (unsigned long)rax,
+                                    (unsigned long)mspan_base,
+                                    (unsigned long)mspan_limit);
                                 v = linux_mem_mprotect_verdict(
                                     mspan_base, mspan_limit, &mreq, rax);
                                 if (v.malformed) {
