@@ -71,6 +71,7 @@ int32_t linux_errno_from_cap(int32_t cap_code)
     case CAP_EPERM:                  return -LINUX_EPERM;
     case CAP_EFAULT:                 return -LINUX_EFAULT;
     case CAP_EINTR:                  return -LINUX_EINTR;
+    case CAP_ENOTTY:                 return -LINUX_ENOTTY;
     /* M1 network class: statuses the P2 socket service can distinguish.
      * Every one keeps its own Linux errno; none is collapsed into EIO or
      * EBUSY, because a TCP caller branches on the difference. */

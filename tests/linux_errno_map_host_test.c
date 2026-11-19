@@ -54,6 +54,7 @@ int main(void)
         { CAP_EPERM,         -LINUX_EPERM,    "same word, same meaning" },
         { CAP_EFAULT,        -LINUX_EFAULT,   "a user address the kernel cannot use" },
         { CAP_EINTR,         -LINUX_EINTR,    "a parked exchange interrupted by stop/SIGCONT" },
+        { CAP_ENOTTY,        -LINUX_ENOTTY,   "the object is not a terminal (TCGETS on the console)" },
     };
     size_t i;
     for (i = 0; i < sizeof(fwd) / sizeof(fwd[0]); i++) {

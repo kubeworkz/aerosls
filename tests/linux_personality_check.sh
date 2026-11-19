@@ -1935,18 +1935,22 @@ fi
 # answer 0 for exactly those two requests, a valid non-console fd is a
 # VFS file ioctl is not served for, and the log line names the fd and
 # request so the trace says WHICH ask arrived.
-ioctl_arm=$(grep -A16 'ioctl (16, the stdio path' "$LRS")
+ioctl_arm=$(grep -A28 'ioctl (16, the stdio path' "$LRS")
 if grep -qF 'const LINUX_IOCTL: u64 = 16;' "$LRS" && \
    grep -qF 'const LINUX_TIOCGWINSZ: u64 = 0x5413;' "$LRS" && \
    grep -qF 'const LINUX_TCGETS: u64 = 0x5401;' "$LRS" && \
+   grep -qF 'const E_NOTTY: i32 = -35;' "$LRS" && \
+   grep -qF 'E_NOTTY => b"ENOTTY"' "$LRS" && \
+   grep -qF '#define CAP_ENOTTY      (-35)' "$CAPH" && \
+   grep -qF 'case CAP_ENOTTY:                 return -LINUX_ENOTTY;' "$LABC" && \
    case "$ioctl_arm" in \
-       *'E_BADF'*'s.kind == FD_KIND_CONSOLE'*'LINUX_TIOCGWINSZ'*'LINUX_TCGETS'*) true ;; \
+       *'LINUX_TIOCGWINSZ'*'LINUX_TCGETS'*'E_NOTTY'*'E_BADF'*) true ;; \
        *) false ;; \
    esac && \
    grep -qF 'b" ok ioctl fd="' "$LRS"; then
-    ok "Y13. the stdio ioctl arm is wired: the two musl stdio requests (TIOCGWINSZ, TCGETS) answer 0 on the console descriptors, an unknown slot is EBADF and a VFS descriptor EINVAL, and the log line carries fd plus request word"
+    ok "Y13. the stdio ioctl arm is wired and honest: TIOCGWINSZ answers 0 on the console (musl only checks the return), TCGETS is ENOTTY because the console is not a tty and no termios is ever written, other requests on a valid fd are ENOTTY, an unknown slot is EBADF, CAP_ENOTTY maps to Linux 25, and the log line carries fd plus request word"
 else
-    bad "Y13. the stdio ioctl arm is gone or drifted: the number, the TIOCGWINSZ/TCGETS words, the console-only success, the EBADF/EINVAL split or the fd/req log line changed — musl's first stdout write is refused ENOSYS again (or a file descriptor is told ioctl succeeded), while the guard reads green"
+    bad "Y13. the stdio ioctl arm is gone or drifted: the number, the TIOCGWINSZ/TCGETS words, the console-only winsize success, the ENOTTY refusal (or its CAP/errno mapping), the EBADF slot rule or the fd/req log line changed — musl's first stdout write is refused again, a caller reads an unwritten termios as success, or an unknown fd is answered as served, while the guard reads green"
 fi
 
 echo

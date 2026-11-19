@@ -158,6 +158,11 @@ const E_IO: i32 = 2;           /* CAP_ERR_REVOKED -> -EIO (§5.7): a catalog
                                 * call that failed under us / INTERNAL */
 const E_PROTO: i32 = 10;       /* CAP_ERR_PROTO -> -EPROTO (§5.7): a catalog
                                 * client reply that was not a reply */
+const E_NOTTY: i32 = -35;      /* CAP_ENOTTY  -> -ENOTTY  (§5.7): the
+                                 * object is not a terminal — M2b's TCGETS
+                                 * on the console, refused by name rather
+                                 * than answered with a termios nobody
+                                 * wrote */
 const E_INTR: i32 = -34;       /* CAP_EINTR   -> -EINTR   (§5.7): a
                                 * stopped parked exchange resumed by
                                 * SIGCONT */
@@ -1366,12 +1371,20 @@ fn answer(
         16 => {
             let fd = args[0];
             match fd_slot(fds, fd).copied() {
-                None => Answer::Reply(0, E_BADF),
                 Some(s) if s.kind == FD_KIND_CONSOLE
-                        && (args[1] == LINUX_TIOCGWINSZ
-                            || args[1] == LINUX_TCGETS) =>
+                        && args[1] == LINUX_TIOCGWINSZ =>
+                    /* musl only checks the return and never reads the
+                     * winsize, so 0 is the whole answer it uses. */
                     Answer::Reply(0, STATUS_OK),
-                Some(_) => Answer::Reply(0, E_INVAL),
+                Some(s) if s.kind == FD_KIND_CONSOLE
+                        && args[1] == LINUX_TCGETS =>
+                    /* the console is not a tty: ENOTTY is the honest
+                     * answer — a success here would promise a termios
+                     * this side never writes, and the caller would read
+                     * whatever was on its stack. */
+                    Answer::Reply(0, E_NOTTY),
+                Some(_) => Answer::Reply(0, E_NOTTY),
+                None => Answer::Reply(0, E_BADF),
             }
         }
         /* mprotect (10, LSC_MEM — §5.4's W^X and the guard-page seam):
@@ -4281,6 +4294,7 @@ fn errno_name(status: i32) -> &'static [u8] {
         E_INTR => b"EINTR",
         E_CONFLICT => b"EBUSY",
         E_INVAL => b"EINVAL",
+        E_NOTTY => b"ENOTTY",
         E_BADF => b"EBADF",
         E_PERM => b"EPERM",
         E_NOMEM => b"ENOMEM",
@@ -6779,22 +6793,25 @@ mod tests {
          * stdout write, and isatty asks TCGETS; both only check the
          * return, so the console answers 0 for exactly those words. */
         let mut b = ledger();
-        for req in [0x5401u64, 0x5413] {
-            let a = answer(16, &[1, req, 0, 0, 0, 0],
-                           &console_fds(), &mut b, &mut fresh(), &[]);
-            assert!(matches!(a, Answer::Reply(0, STATUS_OK)),
-                    "req {:#x}: {:?}", req, a);
-        }
+        let a = answer(16, &[1, 0x5413, 0, 0, 0, 0],
+                       &console_fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(0, STATUS_OK)),
+                "TIOCGWINSZ: {:?}", a);
+        /* TCGETS is refused by name: the console is not a tty, and a
+         * success would promise a termios this side never writes. */
+        let a = answer(16, &[1, 0x5401, 0, 0, 0, 0],
+                       &console_fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(0, E_NOTTY)), "TCGETS: {:?}", a);
         /* a console fd with any other request, and a served file fd, are
-         * EINVAL; the slot beyond the table is EBADF. */
+         * ENOTTY; the slot beyond the table is EBADF. */
         let a = answer(16, &[1, 0x1234, 0, 0, 0, 0],
                        &console_fds(), &mut b, &mut fresh(), &[]);
-        assert!(matches!(a, Answer::Reply(0, E_INVAL)), "other: {:?}", a);
+        assert!(matches!(a, Answer::Reply(0, E_NOTTY)), "other: {:?}", a);
         let mut f = fds();
         f[3] = FdSlot { used: true, kind: FD_KIND_FILE, vfs_fd: 7, flags: 0 };
         let a = answer(16, &[3, 0x5413, 0, 0, 0, 0],
                        &f, &mut b, &mut fresh(), &[]);
-        assert!(matches!(a, Answer::Reply(0, E_INVAL)), "file: {:?}", a);
+        assert!(matches!(a, Answer::Reply(0, E_NOTTY)), "file: {:?}", a);
         let a = answer(16, &[9, 0x5413, 0, 0, 0, 0],
                        &console_fds(), &mut b, &mut fresh(), &[]);
         assert!(matches!(a, Answer::Reply(0, E_BADF)), "slot: {:?}", a);

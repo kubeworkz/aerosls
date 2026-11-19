@@ -57,6 +57,8 @@
 #define LINUX_EBADF        9
 #define LINUX_EAGAIN      11
 #define LINUX_ENOMEM      12
+#define LINUX_ENOTTY      25           /* M2b: TCGETS on a console that is
+                                        * not a tty */
 #define LINUX_EBUSY       16
 #define LINUX_EINVAL      22
 #define LINUX_ENFILE      23

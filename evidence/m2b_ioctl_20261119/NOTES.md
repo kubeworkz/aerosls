@@ -58,3 +58,11 @@ has a refusal of any kind, and the runner exits 0 with its group swept.
 - Kernel + sidecar image built clean (`make x86-iso-e3 ... BUILD_EXIT=0`).
 - `user/sidecar/fixtures/m2a_hello.elf` unchanged:
   `be63cd4d1e5e4d4b9b4028cb4ec830a660fa19a6df1cb6fa27e6aaddd5deafcc`.
+
+## Correction (later commit)
+
+TCGETS was answered 0 in the run above without writing a termios. It is now
+ENOTTY (CAP_ENOTTY -35 → Linux 25): the console is not a tty, and a success
+would promise bytes this side never writes. TIOCGWINSZ keeps its 0 answer —
+that is the request this run actually issued (`req=0x5413`), and musl never
+reads the winsize. No probe rerun is needed: the loader never asked TCGETS.

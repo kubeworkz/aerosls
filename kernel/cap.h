@@ -211,6 +211,10 @@
                                  * sibling stop/SIGCONT (M4.10); distinct
                                  * from EAGAIN so a resumed syscall does not
                                  * look retryable */
+#define CAP_ENOTTY      (-35)   /* the object is not a terminal (M2b's
+                                 * stdio ioctl): TCGETS on this shim's
+                                 * console is refused by name rather than
+                                 * answered with a termios nobody wrote */
 
 /* ─── Data structures ─────────────────────────────────────────────────────── */
 
