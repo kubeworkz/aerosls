@@ -1,0 +1,26 @@
+277:[CS] dynamic image: main entry=0x40106b interp base=0x7f0000000000 entry=0x7f000007bf0e path='/lib/ld-musl-x86_64.so.1'
+300:[CS] dynamic image: main entry=0x401000 interp base=0x7f0000000000 entry=0x7f000007bf0e path='/lib/ld-musl-x86_64.so.1'
+305:[M2D] staged image=00003468 
+310:[M2D] staged loader=000B29E0 
+311:[M2D] hello: spawned ch_00000015 
+332:[E7] linux: num=0000009E child=m2a.linux.hello.0 ok
+337:[E7] linux: num=0000009E child=m2.dyn.hello.0 ok
+372:[E7] linux: num=000000DA child=m2a.linux.hello.0 ok
+377:[E7] linux: num=000000DA child=m2.dyn.hello.0 ok
+397:[E7] linux: num=0000000C child=m2a.linux.hello.0 ok
+402:[E7] linux: num=0000000C child=m2.dyn.hello.0 ok
+422:[E7] linux: num=0000000C child=m2a.linux.hello.0 ok
+427:[E7] linux: num=0000000C child=m2.dyn.hello.0 ok
+448:[E7] linux: num=00000009 child=m2a.linux.hello.0 ok mmap -> 0x0000400000016000
+453:[E7] linux: num=00000009 child=m2.dyn.hello.0 ok mmap -> 0x0000400000015000
+471:[E7] linux: num=0000000A child=m2a.linux.hello.0 ok
+478:[E7] linux: num=0000000A child=m2.dyn.hello.0 ok
+502:[E7] linux: num=0000000A child=m2a.linux.hello.0 ok
+509:[E7] linux: num=0000000A child=m2.dyn.hello.0 ok
+533:[E7] linux: num=00000010 child=m2a.linux.hello.0 ok ioctl fd=1 req=0x0000000000005413
+537:[E7] linux: num=00000001 child=m2.dyn.hello.0 write ok len=9 |M2DYN-OK.|
+543:M2DYN-OK
+558:[E7] linux: num=00000014 child=m2a.linux.hello.0 write ok len=7 |M2A-OK.|
+562:[E7] linux: num=0000003C child=m2.dyn.hello.0 exit status=0
+582:[E7] linux: num=000000E7 child=m2a.linux.hello.0 exit_group status=0
+588:[E7] linux: num=000000E7 child=m2a.linux.hello.0 group swept=1 dead=1 live=0

@@ -760,6 +760,37 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                     },
                     Err(rc) => klog(b"[M2A] hello: spawn FAILED rc=", rc as u32, b""),
                 }
+
+                // M2d: the same admission through the image-agnostic route.
+                // The caller names a rootfs path; the spawner reads the image
+                // there, parses its PT_INTERP, reads the loader that path
+                // names from /lib, and packs the version-2 manifest itself.
+                match crate::m2_dyn::spawn(
+                    &RealKernel, &mut booted.proc.vfs,
+                    crate::m2_dyn::IMAGE_PATH, crate::m2_dyn::HELLO_NAME,
+                    caps.budget_base, caps.budget_len) {
+                    Ok(sp) => {
+                        klog(b"[M2D] staged image=", sp.image_len as u32, b"");
+                        klog(b"[M2D] staged loader=", sp.loader_len as u32, b"");
+                        match booted.proc.vfs.add_task() {
+                            Ok(vt) => {
+                                let pid = RealKernel.sidecar_pid(
+                                    crate::m2_dyn::HELLO_NAME, 0) as u64;
+                                if crate::linux::track(
+                                    sp.ch_r, sp.ch_w, crate::m2_dyn::HELLO_NAME,
+                                    0, sp.heap_base, sp.heap_limit,
+                                    image_span(pid), vt, pid, false,
+                                ) {
+                                    klog(b"[M2D] hello: spawned ch_r=", sp.ch_r, b"");
+                                } else {
+                                    klog(b"[M2D] hello: TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+                                }
+                            }
+                            Err(_) => klog(b"[M2D] hello: VFS task alloc FAILED ch_r=", sp.ch_r, b""),
+                        }
+                    }
+                    Err(rc) => klog(b"[M2D] hello: spawn FAILED rc=", rc as u32, b""),
+                }
             }
         }
     }

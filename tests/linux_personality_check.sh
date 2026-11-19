@@ -107,6 +107,9 @@ M2AELF=user/sidecar/fixtures/m2a_hello.elf
 M2ALOADER=user/sidecar/fixtures/ld-musl-x86_64.so.1
 M2AC=user/sidecar/fixtures/m2a_hello.c
 M2BLIB=user/sidecar/fixtures/libm2a.so
+M2D=user/sidecar/src/m2_dyn.rs
+M2DFIX=user/sidecar/fixtures/build_m2_dyn.sh
+M2DS=user/sidecar/fixtures/m2_dyn_hello.S
 BOOT=user/sidecar/src/boot.rs
 VFSR=user/vfs/src/vfs.rs
 FPUH=arch/x86/fpu_enable.h
@@ -798,6 +801,33 @@ if grep -qF '#define LINUX_INTERP_BASE     0x00007F0000000000ULL' "$LABH" && \
     ok "O9. M2a's two-image contract is wired: version-2 INTERP parsing, elf64_map_dyn_at/elf64_find_interp, AT_BASE and the loader-entry RIP split, pack_manifest as the one producer, the committed M2A-OK fixture pair, and the boot-generation guard that keeps the opt-in demo one-shot per boot"
 else
     bad "O9. one half of the two-image contract is gone — a version-2 manifest could not name or validate its loader, the loader could map at vaddr 0, the child could enter e_entry, a producer could hand-roll a footer again, or the spawn site could re-run the demo on init's watchdog respawn (CAP_ETABLEFULL after the task table fills)"
+fi
+
+# O10 holds the M2 dynamic route IMAGE-AGNOSTIC: the caller names a VFS path,
+# the spawner reads the image there, parses its own PT_INTERP, reads THAT
+# loader from the rootfs /lib namespace, and packs the version-2 manifest.
+# The kernel half admits the request only through version 2: a version-1
+# manifest carrying a dynamic image is refused by name instead of being
+# entered at e_entry with no loader. The live proof is the independent
+# M2DYN-OK image (raw-syscall ET_EXEC, no shared object with M2a).
+if grep -qF 'if (image_is_elf && !image_is_dynamic) {' "$CAPC" && \
+   grep -qF 'PT_INTERP requires a version-2 manifest' "$CAPC" && \
+   grep -qF 'elf64_find_interp(' "$CAPC" && \
+   grep -qF 'pub mod m2_dyn;' user/sidecar/src/lib.rs && \
+   grep -qF 'fn interp_path(image: &[u8]) -> Result<&str, i32>' "$M2D" && \
+   grep -qF 'let interp = interp_path(image)?;' "$M2D" && \
+   grep -qF 'read_vfs(vfs, vt, interp, interp_kaddr, MAX_LOADER)' "$M2D" && \
+   grep -qF 'version_major: 2,' "$M2D" && \
+   grep -qF 'path: interp,' "$M2D" && \
+   grep -qF 'crate::m2_dyn::LOADER_PATH,' "$BOOT" && \
+   grep -qF 'crate::m2_dyn::IMAGE_PATH,' "$BOOT" && \
+   grep -qF 'crate::m2_dyn::spawn(' "$LRE" && \
+   grep -qF 'M2DYN-OK' "$M2DS" && \
+   grep -qF -- '--dynamic-linker=/lib/ld-musl-x86_64.so.1' "$M2DFIX" && \
+   grep -qF 'Requesting program interpreter' "$M2DFIX"; then
+    ok "O10. the dynamic spawn is image-agnostic: the kernel refuses a version-1 manifest that carries PT_INTERP, and the sidecar spawner reads the image from a VFS path, parses its PT_INTERP, reads that loader from the rootfs /lib namespace, and packs the version-2 INTERP record for the independent M2DYN-OK image"
+else
+    bad "O10. the dynamic route specialized again — a version-1 manifest could enter a dynamic image at e_entry, the spawner could name the loader instead of reading the image's PT_INTERP, the loader could stop coming from the rootfs, or the M2DYN-OK proof image and its recipe could drift apart"
 fi
 
 # ─── Q. The SSE gate (§10.13's step-1 death, increment 9): CR4.OSFXSR and its order ──

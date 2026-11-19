@@ -67,6 +67,8 @@ pub mod e7_firstuser;
 pub mod e7_probe;
 #[cfg(feature = "m2a_interp")]
 pub mod m2a_interp;
+#[cfg(feature = "m2a_interp")]
+pub mod m2_dyn;
 pub mod heap;
 pub mod linux;
 #[cfg(feature = "m1_net_probe")]

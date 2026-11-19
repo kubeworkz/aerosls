@@ -4071,6 +4071,24 @@ static int cap_create_sidecar_in_personality_owned(uint32_t parent_pid,
             }
         }
     }
+    /* PT_INTERP is a property of the image, but only the version-2
+     * manifest can honor it: the manifest is what names the loader's
+     * bytes. A version-1 manifest carrying a dynamic image would otherwise
+     * be mapped and entered at e_entry, bypassing the loader entirely and
+     * starting a process that cannot run. Refuse it by name — the image's
+     * own request is never silently dropped. */
+    if (image_is_elf && !image_is_dynamic) {
+        struct Elf64InterpInfo stray_interp;
+        if (elf64_find_interp((const uint8_t*)(uintptr_t)image_kaddr,
+                              m.image_size, &stray_interp)) {
+            kernel_serial_printf(
+                "[CS] CAP_EINVAL: PT_INTERP requires a version-2 manifest "
+                "(version=%u, path='%s')\n",
+                (unsigned)hdr->version_major, stray_interp.path);
+            user_destroy_page_table(new_cr3);
+            return CAP_EINVAL;
+        }
+    }
     if (image_is_elf) {
         if (!elf64_map_blob((const uint8_t*)(uintptr_t)image_kaddr,
                             m.image_size, pml4, child_partition, &elfinfo)) {

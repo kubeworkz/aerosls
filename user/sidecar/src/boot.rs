@@ -281,6 +281,9 @@ pub fn boot<K: Kernel, A: BufferAlloc>(
     // M2b: the dynamic loader's library namespace. The root aerofs image is
     // fixed and read-only, so a ramfs at /lib is the writable namespace the
     // loader's DT_NEEDED search reads; seed it with the probe's libm2a.so.
+    // The loader itself is seeded beside it: the generic dynamic spawn reads
+    // whatever loader the image's PT_INTERP names out of THIS namespace, so
+    // the loader is rootfs content, not a spawn-site embed.
     #[cfg(feature = "m2a_interp")]
     {
         vfs.mount_ramfs("/lib").map_err(BootErr::Mount)?;
@@ -288,6 +291,20 @@ pub fn boot<K: Kernel, A: BufferAlloc>(
             crate::m2a_interp::M2A_LIB_PATH,
             crate::m2a_interp::M2A_LIB,
             0o644,
+        )
+        .map_err(BootErr::Mount)?;
+        vfs.add_ram_file(
+            crate::m2_dyn::LOADER_PATH,
+            crate::m2a_interp::INTERP,
+            0o755,
+        )
+        .map_err(BootErr::Mount)?;
+        // The arbitrary dynamic hello, seeded as an ordinary rootfs payload;
+        // the spawn site names this path, never these bytes.
+        vfs.add_ram_file(
+            crate::m2_dyn::IMAGE_PATH,
+            crate::m2_dyn::seed_bytes(),
+            0o755,
         )
         .map_err(BootErr::Mount)?;
     }

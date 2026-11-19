@@ -45,7 +45,7 @@ pub fn boot_generation() -> u32 {
 }
 
 static HELLO: &[u8] = include_bytes!("../fixtures/m2a_hello.elf");
-static INTERP: &[u8] = include_bytes!("../fixtures/ld-musl-x86_64.so.1");
+pub static INTERP: &[u8] = include_bytes!("../fixtures/ld-musl-x86_64.so.1");
 /// M2b: the DSO the loader's `/lib` search must find. Boot seeds these bytes
 /// into a ramfs at `/lib`; the bytes are the probe's own `libm2a.so`.
 pub static M2A_LIB: &[u8] = include_bytes!("../fixtures/libm2a.so");

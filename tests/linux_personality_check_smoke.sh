@@ -42,6 +42,12 @@ FILES=(
     user/sidecar/src/e7_candidate.rs
     user/sidecar/src/e7_firstuser.rs
     user/sidecar/src/m2a_interp.rs
+    # O10 reads the image-agnostic spawn and its independent proof image.
+    user/sidecar/src/m2_dyn.rs
+    # O10 reads the module's declaration, which lives beside entry.rs.
+    user/sidecar/src/lib.rs
+    user/sidecar/fixtures/build_m2_dyn.sh
+    user/sidecar/fixtures/m2_dyn_hello.S
     user/sidecar/fixtures/build_m2a.sh
     # Y5/Y6 hash the checked-in pair and compare it with the script's recipe.
     user/sidecar/fixtures/m2a_hello.elf
@@ -1302,6 +1308,13 @@ tooth image-span-dropped-from-ledger Y12 "the mprotect ledger ignores the image 
 seed "$W/t154"
 sed -i 's/const LINUX_TIOCGWINSZ: u64 = 0x5413;/const LINUX_TIOCGWINSZ: u64 = 0x5414;/' "$W/t154/user/sidecar/src/linux.rs"
 tooth ioctl-winsize-number-drift Y13 "the ioctl winsize request word drifted" "$W/t154"
+
+# t155: the generic spawn stops parsing the image and names the loader
+# itself, so a payload whose PT_INTERP names a different loader would be
+# handed the wrong bytes. Guard clause O10 must redden by name.
+seed "$W/t155"
+sed -i 's/let interp = interp_path(image)?;/let interp = LOADER_PATH;/' "$W/t155/user/sidecar/src/m2_dyn.rs"
+tooth m2dyn-interp-unparsed O10 "the dynamic spawn stopped parsing PT_INTERP" "$W/t155"
 
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"
