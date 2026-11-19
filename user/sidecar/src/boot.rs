@@ -87,6 +87,12 @@ pub struct BootCaps {
     /// environment it is, because nothing else in the stream can — the cap
     /// table names capabilities ("console", "budget"), never the sidecar.
     pub identity: Option<(u32, u32)>,
+    /// E7 increment 19: the BIB's gate-profile bit. It is a profile selector,
+    /// not a cap. The gate sidecar runs the static backup workload and never
+    /// hosts the dynamic spawn, so `boot()` does not spend its heap on the
+    /// `/lib` namespace; that namespace belongs to the system POSIX sidecar
+    /// where the M2a/M2d children actually spawn.
+    pub gate: bool,
 }
 
 /// The marker the identity announcement starts with. One constant, so the
@@ -119,6 +125,7 @@ impl BootCaps {
             catalog_chan_w: cat_w.map(|c| c.slot),
             catalog_chan_r: cat_r.map(|c| c.slot),
             identity: bib.identity(),
+            gate: bib.is_gate_profile(),
         })
     }
 
@@ -169,6 +176,9 @@ impl BootCaps {
             // works, so no existing constructor call changes.
             catalog_chan_w: None,
             catalog_chan_r: None,
+            // The sim has no gate profile; a host test that needs one can
+            // set the field explicitly.
+            gate: false,
         }
     }
 }
@@ -285,7 +295,7 @@ pub fn boot<K: Kernel, A: BufferAlloc>(
     // whatever loader the image's PT_INTERP names out of THIS namespace, so
     // the loader is rootfs content, not a spawn-site embed.
     #[cfg(feature = "m2a_interp")]
-    {
+    if !caps.gate {
         vfs.mount_ramfs("/lib").map_err(BootErr::Mount)?;
         vfs.add_ram_file(
             crate::m2a_interp::M2A_LIB_PATH,
