@@ -1,0 +1,63 @@
+250:[M2D] staged image=000040E8
+255:[M2D] staged loader=000B29E0
+260:[M2D] hello: spawned ch_00000015
+262:[CS] CAP_EINVAL: PT_INTERP requires a version-2 manifest (version=1, path='/lib/ld-musl-x86_64.so.1')
+267:[M2D] v1 CAP_EINVAL rc=FFFFFFFF
+301:[E7] linux: num=0000009E child=m2.dyn.hello.0 ok
+338:[E7-GATE] no-headroom000B89DB refused
+369:[E7] linux: num=000000DA child=m2.dyn.hello.0 ok
+391:[E7] linux: num=0000000C child=m2.dyn.hello.0 ok
+413:[E7] linux: num=0000000C child=m2.dyn.hello.0 ok
+435:[E7] linux: num=00000009 child=m2.dyn.hello.0 ok mmap -> 0x0000400000016000
+453:[E7] linux mprotect apply addr=0x7f00000b2000 len=4096 prot=0x1 reply=0x0 (span 0x400000..0x7f00000b7000)
+456:[E7] linux: num=00000002 child=m2.dyn.hello.0 -> ENOENT open /etc/ld-musl-x86_64.path
+482:[E7] linux mprotect apply addr=0x403000 len=4096 prot=0x1 reply=0x0 (span 0x400000..0x7f00000b7000)
+485:[E7] linux: num=00000002 child=m2.dyn.hello.0 ok
+502:[E7] linux mprotect apply addr=0x4000000e8000 len=4096 prot=0x0 reply=0x0 (span 0x8000000..0x4000000eb000)
+508:[E7] linux: num=00000048 child=m2.dyn.hello.0 ok
+533:[E7] linux: num=00000005 child=m2.dyn.hello.0 ok + payload
+550:[E7] linux: num=000000E7 child=m2a.linux.hello.0 exit_group status=0
+559:[E7] linux: num=00000000 child=m2.dyn.hello.0 ok + payload
+563:[E7] file mmap addr=0x0 len=20480 prot=1 flags=0x2 fd=3 off=0x0
+581:[E7] linux: num=00000009 child=m2.dyn.hello.0 ok mmap -> 0x0000400000051000 fd=3 off=0x00000000
+598:[E7] linux: num=4D4D4650 child=m2.dyn.hello.0 ok + payload
+624:[E7] linux: num=4D4D4650 child=m2.dyn.hello.0 ok + payload
+641:[E7] linux: num=4D4D4650 child=m2.dyn.hello.0 ok + payload
+650:[E7] linux mprotect prot=0x6 refused before post: write+execute is refused by the shim (§5.4)
+658:[E7] linux mprotect prot=0x6 refused before post: write+execute is refused by the shim (§5.4)
+665:[E7] linux: num=4D4D4650 child=m2.dyn.hello.0 ok + payload
+673:[E7] linux mprotect apply addr=0x400000006000 len=4096 prot=0x0 reply=0x0 (span 0x400000006000..0x400000016000)
+680:[E7] linux mprotect apply addr=0x400000007000 len=4096 prot=0x0 reply=0x0 (span 0x3ff000..0x400000017000)
+688:[E7] linux: num=4D4D4650 child=m2.dyn.hello.0 ok + payload
+864:[E7] linux mprotect apply addr=0x400000006000 len=4096 prot=0x3 reply=0x0 (span 0x400000006000..0x400000016000)
+870:[E7] linux mprotect apply addr=0x400000007000 len=4096 prot=0x3 reply=0x0 (span 0x3ff000..0x400000017000)
+877:[E7] linux: num=4D4D4650 child=m2.dyn.hello.0 ok + payload
+880:[E7] file mmap addr=0x400000052000 len=4096 prot=5 flags=0x12 fd=3 off=0x1000
+894:[E7] linux: num=00000009 child=m2.dyn.hello.0 ok mmap -> 0x0000400000052000 fd=3 off=0x00000000
+912:[E7] linux: num=4D4D4650 child=m2.dyn.hello.0 ok + payload
+928:[E7] linux: num=4D4D4650 child=m2.dyn.hello.0 ok + payload
+931:[E7] file mmap addr=0x400000053000 len=4096 prot=1 flags=0x12 fd=3 off=0x2000
+951:[E7] linux: num=00000009 child=m2.dyn.hello.0 ok mmap -> 0x0000400000053000 fd=3 off=0x00000000
+961:[E7] linux munmap addr=0x400000006000 len=4096 refused before post: malformed, outside the stamped span, or below the current break
+968:[E7] linux munmap addr=0x400000007000 len=4096 refused before post: malformed, outside the stamped span, or below the current break
+974:[E7] linux: num=4D4D4650 child=m2.dyn.hello.0 ok + payload
+989:[E7] linux: num=4D4D4650 child=m2.dyn.hello.0 ok + payload
+993:[E7] file mmap addr=0x400000054000 len=8192 prot=3 flags=0x12 fd=3 off=0x2000
+1000:[backup] FAILED: [E7] linux mmap addr=0x0 len=4096 prot=6 flags=0x22 fd=18446744073709551615 off=0x0 refused before post: write+execute is refused (§5.4)
+1005:[E7] linux mmap addr=0x0 len=4096 prot=6 flags=0x22 fd=18446744073709551615 off=0x0 refused before post: write+execute is refused (§5.4)
+1011:[E7] linux: num=00000009 child=m2.dyn.hello.0 ok mmap -> 0x0000400000054000 fd=3 off=0x00000000
+1027:[E7] linux: num=4D4D4650 child=m2.dyn.hello.0 ok + payload
+1046:[E7] linux: num=4D4D4650 child=m2.dyn.hello.0 ok + payload
+1068:[E7] linux: num=4D4D4650 child=m2.dyn.hello.0 ok + payload
+1088:[E7] linux: num=00000003 child=m2.dyn.hello.0 ok
+1110:[E7] linux: num=0000000A child=m2.dyn.hello.0 ok
+1114:[E7] linux mprotect apply addr=0x400000054000 len=4096 prot=0x1 reply=0x0 (span 0x400000..0x7f00000b7000)
+1125:[E7] linux: num=0000000A child=m2.dyn.hello.0 ok
+1129:[E7] linux mprotect apply addr=0x7f00000b2000 len=4096 prot=0x1 reply=0x0 (span 0x400000..0x7f00000b7000)
+1141:[E7] linux: num=0000000A child=m2.dyn.hello.0 ok
+1145:[E7] linux mprotect apply addr=0x403000 len=4096 prot=0x1 reply=0x0 (span 0x400000..0x7f00000b7000)
+1160:[E7] linux: num=00000010 child=m2.dyn.hello.0 ok ioctl fd=1 req=0x0000000000005413
+1173:[E7] linux: num=00000014 child=m2.dyn.hello.0 write ok len=7 |M2B-OK.|
+1178:M2B-OK
+1186:[E7] linux: num=000000E7 child=m2.dyn.hello.0 exit_group status=0
+1192:[E7] linux: num=000000E7 child=m2.dyn.hello.0 group swept=1 dead=1 live=0
