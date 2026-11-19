@@ -1829,8 +1829,17 @@ fi
 # The loader's open only succeeds because boot mounts a ramfs at /lib and
 # seeds it with the bytes include_bytes! embeds; a library swapped under the
 # fixture or a boot that forgets either half leaves the two-DSO probe back at
-# ENOENT while every other clause stays green.
+# ENOENT while every other clause stays green. The seed also belongs to ONE
+# sidecar: the hardware-owning system POSIX, whose nic0.bar0 DEV cap is the
+# census host. Gate and ordinary tenant sidecars never host the dynamic spawn,
+# so they must not spend that heap. Pin both halves: the predicate carried in
+# BootCaps and the single seed site inside its guard.
 M2B_LIB_SHA=$(sha256sum "$M2BLIB" | awk '{print $1}')
+census_seed=$(grep -A14 'if caps.census_host {' "$BOOT")
+seed_guarded=0
+case "$census_seed" in
+    *'mount_ramfs("/lib")'*'crate::m2a_interp::M2A_LIB_PATH,'*) seed_guarded=1 ;;
+esac
 if grep -qF 'pub static M2A_LIB: &[u8] = include_bytes!("../fixtures/libm2a.so");' "$M2A" && \
    grep -qF 'pub const M2A_LIB_PATH: &str = "/lib/libm2a.so";' "$M2A" && \
    grep -qF 'pub fn add_ram_file(&mut self, path: &str, data: &[u8], mode: u16) -> Result<(), Errno>' "$VFSR" && \
@@ -1838,10 +1847,14 @@ if grep -qF 'pub static M2A_LIB: &[u8] = include_bytes!("../fixtures/libm2a.so")
    grep -qF 'vfs.add_ram_file(' "$BOOT" && \
    grep -qF 'crate::m2a_interp::M2A_LIB_PATH,' "$BOOT" && \
    grep -qF 'crate::m2a_interp::M2A_LIB,' "$BOOT" && \
+   grep -qF 'pub census_host: bool,' "$BOOT" && \
+   grep -qF 'census_host: bib.find_cap(CAP_TYPE_DEV, "nic0.bar0").is_some(),' "$BOOT" && \
+   [ "$(grep -cF 'mount_ramfs("/lib")' "$BOOT")" -eq 1 ] && \
+   [ "$seed_guarded" -eq 1 ] && \
    [ "$M2B_LIB_SHA" = "398e79629f49179d8225f18a5b8216ef444cc57408dd6e770d7dc53366eecf6d" ]; then
-    ok "Y7. the M2b library fixture is embedded and served: libm2a.so hashes to 398e7962…, m2a_interp.rs embeds it as M2A_LIB at /lib/libm2a.so, and boot seeds a /lib ramfs through Vfs::add_ram_file — the loader's open has a namespace and the bytes it reads are the pinned DSO"
+    ok "Y7. the M2b library fixture is embedded and served only where the dynamic spawn can run: libm2a.so hashes to 398e7962…, m2a_interp.rs embeds it as M2A_LIB at /lib/libm2a.so, BootCaps carries census_host from the nic0.bar0 DEV cap, and the one /lib seed site sits inside that guard — the loader's open has a namespace on the hardware owner, and gate or tenant sidecars keep the heap for their own workload"
 else
-    bad "Y7. the M2b library namespace is gone or drifted: libm2a.so's SHA-256 is not 398e7962…, the sidecar no longer embeds it at /lib/libm2a.so, or boot does not mount /lib and seed it through add_ram_file — the loader would return to ENOENT (or load unpinned bytes) while the guard reads green"
+    bad "Y7. the M2b library namespace is gone or drifted: libm2a.so's SHA-256 is not 398e7962…, the sidecar no longer embeds it at /lib/libm2a.so, BootCaps no longer derives census_host from nic0.bar0, or boot no longer mounts /lib exactly once inside that census-host guard — the loader would return to ENOENT, load unpinned bytes, or spend a gate/tenant sidecar's heap while the guard reads green"
 fi
 
 # Y8: fstat(5) is one seam across three places: the kernel's number and

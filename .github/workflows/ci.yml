@@ -380,6 +380,16 @@ jobs:
         run: cargo test -p aerosls-sidecar --manifest-path user/Cargo.toml
         working-directory: aerosls2
 
+      # The M2a boot tests are cfg(feature = "m2a_interp"), so the default
+      # step above compiles them out. Run the boot suite with the feature to
+      # pin the census-host /lib guard's three BIB shapes: the hardware owner
+      # seeds /lib, while the gate and ordinary tenant skip it.
+      - name: POSIX sidecar M2a boot tests (census-host /lib namespace)
+        run: >-
+          cargo test -p aerosls-sidecar --test boot_tests
+          --features m2a_interp --manifest-path user/Cargo.toml
+        working-directory: aerosls2
+
       # ─── aerobackup: the E7 census target's host test ──────────────────
       # backup/aerobackup is the workload E7's Linux ABI shim will be
       # measured against (tools/linux_abi_candidate.conf), so its retention

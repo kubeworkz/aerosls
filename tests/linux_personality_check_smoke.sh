@@ -1316,6 +1316,13 @@ seed "$W/t155"
 sed -i 's/let interp = interp_path(image)?;/let interp = LOADER_PATH;/' "$W/t155/user/sidecar/src/m2_dyn.rs"
 tooth m2dyn-interp-unparsed O10 "the dynamic spawn stopped parsing PT_INTERP" "$W/t155"
 
+# t156: the census-host guard is made unconditional — every POSIX sidecar,
+# including the gate and ordinary tenants, would spend ~740 KiB on /lib again.
+# Guard clause Y7 must redden by name.
+seed "$W/t156"
+sed -i 's/if caps.census_host {/if true {/' "$W/t156/user/sidecar/src/boot.rs"
+tooth m2b-library-seed-unguarded Y7 "the /lib seed is no longer limited to the census host" "$W/t156"
+
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
