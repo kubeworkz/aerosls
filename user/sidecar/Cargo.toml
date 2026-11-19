@@ -19,6 +19,12 @@ aerosls-ramdisk = { path = "../ramdisk" }
 name = "posix"
 path = "src/bin/posix.rs"
 required-features = ["target"]
+# The image is freestanding — `_start` is the crt0 in the lib and posix.ld
+# places it — so a cargo test harness for it cannot even load (ld.so aborts
+# before a single test runs). It carries no #[test]s; the unit tests live in
+# the lib, and `cargo test -p aerosls-sidecar --features target` must run
+# those instead of dying on a harness for an image that has no main.
+test = false
 
 [features]
 default = []

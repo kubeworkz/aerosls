@@ -1351,7 +1351,7 @@ fn answer(
          * grant for a page the page tables do not carry. */
         10 => {
             let (addr, len, prot) = (args[0], args[1], args[2]);
-            let _len_r = match len.checked_add(0xFFF) {
+            let len_r = match len.checked_add(0xFFF) {
                 Some(v) if len != 0 => v & !0xFFFu64,
                 _ => return Answer::Reply(0, E_INVAL),
             };
@@ -1362,6 +1362,13 @@ fn answer(
             } else if prot & 0x4 != 0 {
                 Answer::Reply(0, E_NOSYS)
             } else if addr & 0xFFF != 0 {
+                Answer::Reply(0, E_INVAL)
+            } else if addr < brk.base || addr > brk.limit
+                   || len_r > brk.limit - addr {
+                /* the ledger's span is this side's twin of the kernel's
+                 * first-trap range check: a page outside it was never a
+                 * mapping this shim granted, so no leaf may be retargeted
+                 * by a success reply for it. */
                 Answer::Reply(0, E_INVAL)
             } else {
                 Answer::Reply(0, STATUS_OK)
@@ -7115,6 +7122,9 @@ mod tests {
 
     #[test]
     fn clone_tracking_shares_group_state_and_last_release_retires_it() {
+        /* the registry is process-global and every task test rewrites it:
+         * without the lock the m4.10/11 tests race this slot's tid. */
+        let _guard = M4_10_TEST_LOCK.lock().unwrap();
         reset_registry();
         assert!(track(0x10, 0x11, "m4.3.leader", 0,
                       0x80_0000, 0x81_0000, 7, 0x7000, false));
@@ -7193,6 +7203,7 @@ mod tests {
 
     #[test]
     fn futex_wait_wake_is_group_keyed_fifo_with_timeout_and_release() {
+        let _guard = M4_10_TEST_LOCK.lock().unwrap();
         reset_registry();
         assert!(track(0x10, 0x11, "m4.4.leader", 0, 0x80_0000, 0x81_0000,
                       7, 0x7000, false));
@@ -7702,5 +7713,58 @@ mod tests {
                    LINUX_SYSCALL_REQ_BYTES + FUTEX_REQUEUE_PAYLOAD_BYTES);
         a[1] = FUTEX_REQUEUE | FUTEX_PRIVATE;
         assert_eq!(expected_req_len(LINUX_FUTEX, &a), LINUX_SYSCALL_REQ_BYTES);
+    }
+
+    /* M2b: the reply builder's buffer is the LARGEST message any number
+     * can send — a fill round's 4024 bytes plus the 72-byte header. It was
+     * once FD_PAYLOAD_CAP (1024) while the fill arm produced 4024, and the
+     * tenant panicked on the first round with "range end index 4096 out of
+     * range for slice of length 1096". This test drives the real builder
+     * with the maximum round: a shrunken buffer panics here, and a builder
+     * that drops any round byte fails the length pin. */
+    #[derive(Default)]
+    struct SendRec(RefCell<Vec<Vec<u8>>>);
+
+    impl Kernel for SendRec {
+        fn wait(&self, _: &[u32], _: u64) -> Result<(usize, u16), i32> {
+            Err(E_CONFLICT)
+        }
+        fn recv(&self, _: u32, _: &mut [u8], _: &mut [GrantedCap])
+            -> Result<aerosls_proto::kabi::RecvResult, i32> {
+            Err(E_CONFLICT)
+        }
+        fn send(&self, _: u32, _: u32, _: u16, payload: &[u8],
+                _: &[aerosls_proto::kabi::SendCap], _: u64)
+            -> Result<(), i32> {
+            self.0.borrow_mut().push(payload.to_vec());
+            Ok(())
+        }
+        fn close(&self, _: u32, _: u16, _: u32) -> Result<(), i32> {
+            Ok(())
+        }
+        fn cap_info(&self, _: u32)
+            -> Result<aerosls_proto::kabi::CapInfo, i32> {
+            Err(E_CONFLICT)
+        }
+        fn proc_hold(&self, _: u32) -> Result<(), i32> { Ok(()) }
+        fn proc_release(&self, _: u32) -> Result<(), i32> { Ok(()) }
+    }
+
+    #[test]
+    fn reply_bytes_sends_a_full_fill_round_whole() {
+        let k = SendRec::default();
+        let round = [0xA5u8; FD_FILL_CAP];
+        reply_bytes(&k, 0x21, 0x99, LINUX_MMAP_FILL, 0, &round);
+        let sent = k.0.borrow();
+        assert_eq!(sent.len(), 1, "one reply message per round");
+        let m = &sent[0];
+        assert_eq!(m.len(), LINUX_SYSCALL_REQ_BYTES + FD_FILL_CAP,
+                   "the whole round plus its header crosses");
+        assert_eq!(m.len(), 4096,
+                   "72 + 4024 is the transport's 4 KiB payload bound");
+        assert_eq!(&m[0..8], &LINUX_MMAP_FILL.to_le_bytes(),
+                   "the round's number is in the header");
+        assert!(m[LINUX_SYSCALL_REQ_BYTES..].iter().all(|&b| b == 0xA5),
+                "every round byte crosses — not the buffer's zero padding");
     }
 }
