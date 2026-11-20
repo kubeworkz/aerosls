@@ -12,9 +12,26 @@
 #       SIDECAR_E3_CPIO=sidecars_m4_std_thread_e3.cpio \
 #       X86_E3_ISO=sls_m4_std_thread.iso
 #
+# Before the build, a static clause reads e7_firstuser.rs: the aerobackup
+# FIRSTUSER must sit behind `not(any(... feature = "m4_std_thread_probe" ...))`
+# and the empty fallback behind the matching `any(...)`. 87bf5e9 added the
+# feature without those two cfg branches, so the probe image embedded BOTH
+# the 580 KiB std_thread_gate fixture and the 600 KiB aerobackup payload and
+# pushed the sidecar image into its upper pages (fixed in 76bd182). The clause
+# fails here, before an ISO exists, if the fixture selection and the probe
+# profile drift apart again.
+#
+# The same clause reads PROBE_RESERVE out of m4_std_thread_probe.rs and fails
+# when the gate fixture no longer fits that tail reserve -- spawn answers an
+# oversized fixture with Err(-1), a create failure with no image symptom.
+# After the build the flattened posix.bin is asserted too: it must carry the
+# gate fixture and NO aerobackup bytes, so the source-level cfg and the built
+# artifact are both checked rather than observed.
+#
 # Usage:
 #   bash tests/m4_std_thread_probe_check.sh
 #   M4_STD_THREAD_BUILD=0 M4_STD_THREAD_ISO=... bash ...
+#   M4_STD_THREAD_STATIC_ONLY=1 bash ...   # source assertion only, no QEMU
 #
 # Exit: 0 pass, 1 assertion failure, 2 missing prerequisite.
 
@@ -46,6 +63,120 @@ cleanup() {
 trap cleanup EXIT
 fail() { echo "FAIL: $*" >&2; cleanup; exit 1; }
 
+# ── static: the probe profile must not embed the backup fixture ───────────
+# The image's FIRSTUSER is selected by two cfg branches in e7_firstuser.rs.
+# If m4_std_thread_probe is not on BOTH the `not(any(...))` that guards the
+# aerobackup include and the `any(...)` that supplies the empty fallback, an
+# M4_STD_THREAD_PROBE=1 build either embeds the backup payload alongside the
+# std::thread fixture (the 87bf5e9 omission) or loses FIRSTUSER entirely.
+# This is the source-level assertion of 76bd182's fix, and it also requires
+# the two branches to name the same feature set, so a future probe added to
+# only one branch is named here rather than at boot.
+FIRSTUSER_SRC=user/sidecar/src/e7_firstuser.rs
+[ -f "$FIRSTUSER_SRC" ] || fail "$FIRSTUSER_SRC is missing"
+static_err=$(
+    awk '
+        function feats(s,    out, m) {
+            out = ""
+            while (match(s, /feature = "[^"]+"/)) {
+                m = substr(s, RSTART + 11, RLENGTH - 12)
+                out = out (out == "" ? "" : " ") m
+                s = substr(s, RSTART + RLENGTH)
+            }
+            return out
+        }
+        function seteq(a, b,    na, nb, x, y, i, j, found) {
+            na = split(a, x, " ")
+            nb = split(b, y, " ")
+            if (na != nb) return 0
+            for (i = 1; i <= na; i++) {
+                found = 0
+                for (j = 1; j <= nb; j++) if (x[i] == y[j]) found = 1
+                if (!found) return 0
+            }
+            return 1
+        }
+        {
+            line = $0
+            if (incfg) {
+                cfg = cfg " " line
+                if (line ~ /\]/) incfg = 0
+                next
+            }
+            if (line ~ /^[[:space:]]*$/) next
+            if (line ~ /^#\[cfg\(/) {
+                cfg = line
+                if (line !~ /\]/) incfg = 1
+                next
+            }
+            if (line ~ /static FIRSTUSER: &\[u8\]/) {
+                n++
+                attr[n] = cfg
+                if (line ~ /aerobackup\.musl\.elf/) kind[n] = "backup"
+                else if (line ~ /= &\[\];/) kind[n] = "empty"
+                else kind[n] = "unknown"
+            }
+            cfg = ""
+        }
+        END {
+            for (i = 1; i <= n; i++) {
+                if (kind[i] == "backup") { nb++; ba = attr[i] }
+                else if (kind[i] == "empty") { ne++; ea = attr[i] }
+                else nu++
+            }
+            if (nb != 1 || ne != 1 || nu != 0) {
+                printf "%s must have exactly one aerobackup FIRSTUSER and one empty fallback (found %d backup, %d empty, %d other)\n", FILENAME, nb, ne, nu
+                exit 1
+            }
+            if (index(ba, "#[cfg(not(any(") != 1 || \
+                index(ba, "feature = \"m4_std_thread_probe\"") == 0) {
+                printf "the aerobackup FIRSTUSER is not gated on not(any(... feature = \"m4_std_thread_probe\" ...)): %s\n", ba
+                exit 1
+            }
+            if (index(ea, "#[cfg(any(") != 1 || index(ea, "not(") != 0 || \
+                index(ea, "feature = \"m4_std_thread_probe\"") == 0) {
+                printf "the empty FIRSTUSER fallback is not the complementary any(... feature = \"m4_std_thread_probe\" ...): %s\n", ea
+                exit 1
+            }
+            if (!seteq(feats(ba), feats(ea))) {
+                printf "FIRSTUSER cfg branches do not list the same probe features (backup: %s; empty: %s) — adding one to a single branch is how the backup fixture slips into a probe image\n", feats(ba), feats(ea)
+                exit 1
+            }
+            exit 0
+        }
+    ' "$FIRSTUSER_SRC"
+) || fail "${static_err:-the FIRSTUSER cfg check did not run}"
+echo "static: $FIRSTUSER_SRC excludes the backup fixture under m4_std_thread_probe"
+
+# ── static: the gate fixture must fit the tail reserve it is planted in ───
+# m4_std_thread_probe::spawn plants the embedded fixture at the last
+# PROBE_RESERVE bytes of the POSIX sidecar's budget heap and returns Err(-1)
+# when PROBE.len() exceeds it. That refusal is a silent create failure at boot,
+# so the budget is asserted here against the source's own constant -- reading
+# it rather than repeating 1 MiB keeps this check and the spawn path from
+# drifting apart.
+PROBE_SRC=user/sidecar/src/m4_std_thread_probe.rs
+GATE_FIXTURE=user/sidecar/fixtures/std_thread_gate.elf
+[ -f "$PROBE_SRC" ] || fail "$PROBE_SRC is missing"
+[ -f "$GATE_FIXTURE" ] || fail "$GATE_FIXTURE is missing"
+reserve_expr=$(sed -n 's/^[[:space:]]*pub const PROBE_RESERVE: u64 = \(.*\);[[:space:]]*$/\1/p' "$PROBE_SRC" | head -1)
+if [ -z "$reserve_expr" ] || ! printf '%s\n' "$reserve_expr" | grep -Eq '^[0-9 ()+*]+$'; then
+    fail "cannot read PROBE_RESERVE from $PROBE_SRC (got '${reserve_expr}')"
+fi
+RESERVE=$(( reserve_expr ))
+FIXTURE_BYTES=$(wc -c < "$GATE_FIXTURE" | tr -d ' \r\n')
+[ "$FIXTURE_BYTES" -le "$RESERVE" ] || \
+    fail "std_thread_gate.elf is $FIXTURE_BYTES bytes but the probe's tail reserve (PROBE_RESERVE) is $RESERVE — m4_std_thread_probe::spawn would refuse the fixture at boot"
+echo "static: std_thread_gate.elf $FIXTURE_BYTES bytes fits the $RESERVE-byte tail reserve"
+
+# The source assertion alone, for a host that cannot build and boot the
+# profile (or a source-only CI job). It is the same clause the build arm runs
+# first; only the image and the two boots are skipped.
+if [ "${M4_STD_THREAD_STATIC_ONLY:-0}" = "1" ]; then
+    echo "PASS: m4_std_thread_probe's FIRSTUSER cfg excludes the backup fixture"
+    exit 0
+fi
+
 if [ "$BUILD" = "1" ]; then
     echo "=== build: x86-iso-e3 M4_STD_THREAD_PROBE=1 ==="
     make x86-iso-e3 E3_INIT_FEATURES=e3_envs,e7_gate M4_STD_THREAD_PROBE=1 \
@@ -60,6 +191,36 @@ grep -qF 'm4_std_thread_probe' user/sidecar/src/lib.rs || \
     fail "the std::thread probe module is not compiled"
 grep -qF 'SIDECAR_M4_STD_THREAD_PROBE' Makefile || \
     fail "the Makefile has no std::thread probe feature"
+
+# ── image: the built POSIX sidecar carries the probe fixture only ─────────
+# The cfg clause above is about the source; this one is about the artifact.
+# include_bytes! embeds each fixture whole, so a contiguous whole-file match is
+# the exact test. The gate fixture must be there, which is the positive control
+# (a posix.bin this probe build did not produce fails instead of passing
+# vacuously), and the backup payload must not be: finding it means the build
+# embedded BOTH the 580 KiB gate fixture and the 600 KiB aerobackup payload,
+# the pre-76bd182 image that overflowed the sidecar's upper pages.
+command -v python3 >/dev/null 2>&1 || {
+    echo "ABORT: python3 is required to read the built POSIX image's payload bytes" >&2
+    exit 2
+}
+POSIX_BIN="${M4_STD_THREAD_POSIX_BIN:-$(sed -n 's/^SIDECAR_POSIX_BIN[[:space:]]*?=[[:space:]]*//p' Makefile | head -1)}"
+[ -n "$POSIX_BIN" ] || POSIX_BIN=user/target/x86_64-unknown-none/release/posix.bin
+[ -s "$POSIX_BIN" ] || \
+    fail "no built POSIX sidecar at $POSIX_BIN — the payload assertion needs the build output (keep it with M4_STD_THREAD_BUILD=0, or set M4_STD_THREAD_POSIX_BIN)"
+BACKUP_FIXTURE=user/sidecar/fixtures/aerobackup.musl.elf
+[ -f "$BACKUP_FIXTURE" ] || fail "$BACKUP_FIXTURE is missing"
+payload_err=$(python3 - "$POSIX_BIN" "$GATE_FIXTURE" "$BACKUP_FIXTURE" 2>&1 <<'PY'
+import sys
+posix, gate, backup = (open(p, "rb").read() for p in sys.argv[1:4])
+if posix.find(gate) < 0:
+    sys.exit(f"{sys.argv[1]} does not contain {sys.argv[2]} — the probe build did not reach this artifact")
+at = posix.find(backup)
+if at >= 0:
+    sys.exit(f"{sys.argv[1]} contains {sys.argv[3]} at offset {at} ({len(backup)} bytes) — this build embedded the backup fixture alongside the probe's")
+PY
+) || fail "${payload_err:-the payload check did not run}"
+echo "image: $POSIX_BIN carries std_thread_gate.elf and no aerobackup bytes"
 
 rm -f "$IMG"
 truncate -s 10G "$IMG" || fail "could not make the NVMe image"
