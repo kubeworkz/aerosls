@@ -187,6 +187,17 @@ jobs:
         run: bash tests/sidecar_stamp_check.sh
         working-directory: aerosls2
 
+      # The M4.9 probe's SOURCE arms, which need no build: the FIRSTUSER cfg
+      # must keep the aerobackup fixture out under m4_std_thread_probe, and
+      # std_thread_gate.elf must fit the 1 MiB tail reserve the probe plants it
+      # in. M4_STD_THREAD_STATIC_ONLY=1 stops the check before it builds an ISO
+      # or boots QEMU (the pack/boot arms still need a build host), so the
+      # assertions run on every push here -- named as their own step so a
+      # change to run_checks.sh's glob or call site cannot hide them.
+      - name: M4.9 std-thread probe source assertions (FIRSTUSER + fixture budget)
+        run: M4_STD_THREAD_STATIC_ONLY=1 bash tests/m4_std_thread_probe_check.sh
+        working-directory: aerosls2
+
       - name: Host test suite (tests/*_host_test.c)
         run: bash tests/run_all.sh
         working-directory: aerosls2
