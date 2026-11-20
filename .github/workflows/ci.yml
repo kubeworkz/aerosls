@@ -703,9 +703,42 @@ jobs:
     # the deploy gate's two commands --
     # run_checks.sh --require-all and run_guard_smokes.sh -- so every
     # build-run guard passes AND every smoke proves its teeth
-    # on every push (the five live-cluster guards -- entropy_boot_diversity,
-    # partition_reannounce_live, partition_ownedset_gc_live, failover_adoption,
-    # failover_2node -- still report their owed skips: they need a live cluster).
+    # on every push.
+    #
+    # A green run here is NOT coverage of every runtime gate. Fifteen
+    # GUARD-KIND: runtime gates exit 2 with an owed skip in this job and it
+    # passes anyway; run_checks.sh names them under "RUNTIME guards NOT RUN,
+    # and still owed", but that line scrolls past, so they are named here:
+    #
+    #   * no probe ISO is built anywhere in CI (five) -- each exits 2 at its
+    #     first ISO check, so its live arm, and every clause after that
+    #     check, never runs: m2_dyn_v1_boot_check (M2DYN_ISO),
+    #     m4_exit_probe_check (sls_m4_exit.iso), m4_futex_probe_check
+    #     (sls_m4_futex.iso), m4_group_probe_check (sls_m4_group.iso),
+    #     m4_thread_probe_check (sls_m4_thread.iso).
+    #   * cannot build its own cluster on this runner (one):
+    #     env_api_identity_check. run-cluster.sh rebuilds with
+    #     ENV_CKPT_TEST_HOOKS=1 -- an AB_DEFS define in the build-config
+    #     stamp -- through the Makefile's default x86_64-elf-gcc, which this
+    #     runner deliberately does not install.
+    #   * need a live cluster, or a deployed instance for webapp_served
+    #     (nine): entropy_boot_diversity, env_catalog_live,
+    #     env_migrate_confirm_live, failover_adoption_live,
+    #     failover_2node_live, partition_ownedset_gc_live,
+    #     partition_reannounce_live, partition_reuse_pause_live and
+    #     webapp_served.
+    #
+    # The rest do run: the ten runtime gates whose only need is
+    # sls_operating_system.iso or sls_operating_system_e3.iso (aerocap_boot,
+    # cap_boot, e3_multi_env_boot, env_console_attach, env_create_boot,
+    # env_recycle_boot, env_shell_surface, partition_teardown_boot,
+    # simi_teardown_boot, unified_boot) run inside the guard sweep, the five
+    # probe build-then-run pairs (M4.9, M4.6, M4.7, M4.8, M5.3) sit at the
+    # end of the job, and m1_net_probe runs from the sweep against the M1
+    # image built above. m5_catalog_live_check self-builds in the sweep and
+    # is in neither list: whether it runs depends on the tree's build-config
+    # stamp, so it is not coverage either way.
+    #
     # The E3 multi-instance guard is also GUARD-KIND: runtime but is NOT one of
     # those skips: this job builds sls_operating_system_e3.iso for it a step
     # earlier, so it boots the two-tenant image here for real. Then it

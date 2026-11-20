@@ -222,18 +222,39 @@ if [ "$skip" -gt 0 ]; then
     if [ -n "$runtime_skipped" ]; then
         [ -n "$build_skipped" ] && echo
         echo "RUNTIME guards NOT RUN, and still owed:$runtime_skipped"
-        echo "These need a live cluster, which a build host does not have, so"
-        echo "--require-all deliberately does not force them. A green build gate"
-        echo "is therefore NOT evidence that they pass. Run them against a"
-        echo "started cluster before trusting the property they assert:"
-        echo "    ./run-cluster.sh --nodes 3"
-        echo "    tests/entropy_boot_diversity_check.sh"
-        echo "    tests/partition_reannounce_live_check.sh"
-        echo "    tests/partition_ownedset_gc_live_check.sh"
-        echo "    tests/failover_adoption_live_check.sh"
-        echo "    tests/failover_2node_live_check.sh"
-        echo "    tests/env_catalog_live_check.sh"
-        echo "    tests/partition_ownedset_gc_live_check.sh"
+        echo "These need a live system, a probe image CI does not build, or a"
+        echo "cluster -- inputs --require-all cannot manufacture, so they are"
+        echo "reported instead of forced. A green run is therefore NOT evidence"
+        echo "that they pass. Fifteen runtime guards can sit in this list, and"
+        echo "each needs one of:"
+        echo
+        echo "  no probe ISO is built anywhere in CI (five). Each exits 2 at"
+        echo "  its first ISO check, so even its static clauses never run:"
+        echo "      tests/m2_dyn_v1_boot_check.sh    M2DYN_ISO (M2A_INTERP=1 ISO)"
+        echo "      tests/m4_exit_probe_check.sh     sls_m4_exit.iso   (M4_EXIT_PROBE=1)"
+        echo "      tests/m4_futex_probe_check.sh    sls_m4_futex.iso  (M4_FUTEX_PROBE=1)"
+        echo "      tests/m4_group_probe_check.sh    sls_m4_group.iso  (M4_GROUP_PROBE=1)"
+        echo "      tests/m4_thread_probe_check.sh   sls_m4_thread.iso (M4_THREAD_PROBE=1)"
+        echo
+        echo "  builds its own 3-node cluster, and needs a compiler run-cluster"
+        echo "  can use for its ENV_CKPT_TEST_HOOKS=1 rebuild (one):"
+        echo "      X86_CC=gcc X86_LD=ld tests/env_api_identity_check.sh"
+        echo
+        echo "  needs a live cluster, or a deployed instance (nine):"
+        echo "      ./run-cluster.sh --nodes 3"
+        echo "      tests/entropy_boot_diversity_check.sh"
+        echo "      tests/env_catalog_live_check.sh"
+        echo "      tests/env_migrate_confirm_live_check.sh"
+        echo "      tests/failover_adoption_live_check.sh"
+        echo "      tests/failover_2node_live_check.sh"
+        echo "      tests/partition_ownedset_gc_live_check.sh"
+        echo "      tests/partition_reannounce_live_check.sh"
+        echo "      tests/partition_reuse_pause_live_check.sh"
+        echo "      SERVED_URL=http://127.0.0.1:3001 tests/webapp_served_check.sh"
+        echo
+        echo "A guard that needs only sls_operating_system.iso or"
+        echo "sls_operating_system_e3.iso should not be in that list: build it"
+        echo "with 'make x86-iso' or 'make x86-iso-e3' and it runs for real."
     fi
 fi
 
