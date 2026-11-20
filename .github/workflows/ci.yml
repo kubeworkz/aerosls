@@ -1180,10 +1180,18 @@ jobs:
       # owed skip), and these steps pass the host toolchain explicitly, like
       # every other ISO build here.
       #
-      # Built LAST, after the guard sweep and the source smokes: this build
-      # re-flattens user/target/.../posix.bin under a probe cpio whose record is
+      # All four probe gates below are GUARD-KIND: runtime, so verify reports
+      # them as owed skips; these steps are where their clauses and live proofs
+      # actually run. Each gate is built with its host toolchain and then run
+      # with its *_BUILD=0 variable against that ISO, so the harness cannot
+      # quietly rebuild and the built artifact is what is measured.
+      #
+      # Built LAST, after the guard sweep and the source smokes: these builds
+      # re-flatten user/target/.../posix.bin under probe cpios whose records are
       # not the E3 one clause M anchors, and a guard run afterwards would read it
-      # as a stale build output.
+      # as a stale build output. For the same reason the five build-then-run
+      # pairs (M4.9 above, then M4.6, M4.7, M4.8 and M5.3) sit at the end of the
+      # job, with no guard after them.
       - name: Build the M4.9 std-thread probe ISO for the live gate
         run: make X86_CC=gcc X86_LD=ld x86-iso-e3 E3_INIT_FEATURES=e3_envs,e7_gate M4_STD_THREAD_PROBE=1 SIDECAR_E3_CPIO=sidecars_m4_std_thread_e3.cpio X86_E3_ISO=sls_m4_std_thread.iso
         working-directory: aerosls2
@@ -1193,6 +1201,50 @@ jobs:
           M4_STD_THREAD_BUILD: "0"
           M4_STD_THREAD_ISO: sls_m4_std_thread.iso
         run: bash tests/m4_std_thread_probe_check.sh
+        working-directory: aerosls2
+
+      - name: Build the M4.6 checkpoint/restore probe ISO for the live gate
+        run: make X86_CC=gcc X86_LD=ld x86-iso-e3 E3_INIT_FEATURES=e3_envs,e7_gate,m4_ckpt_probe M4_CKPT_PROBE=1 X86_E3_ISO=sls_m4_ckpt.iso
+        working-directory: aerosls2
+
+      - name: M4.6 thread-group checkpoint/restore live gate (two-boot, M4.6-FUTEX-WOKE)
+        env:
+          M4_CKPT_BUILD: "0"
+          M4_CKPT_ISO: sls_m4_ckpt.iso
+        run: bash tests/m4_ckpt_probe_check.sh
+        working-directory: aerosls2
+
+      - name: Build the M4.7 runtime probe ISO for the live gate
+        run: make X86_CC=gcc X86_LD=ld x86-iso-e3 E3_INIT_FEATURES=e3_envs,e7_gate M4_RUNTIME_PROBE=1 X86_E3_ISO=sls_m4_runtime.iso
+        working-directory: aerosls2
+
+      - name: M4.7 static threaded-Rust live gate (two-boot, M4-RUNTIME-GATE-PASS)
+        env:
+          M4_RUNTIME_BUILD: "0"
+          M4_RUNTIME_ISO: sls_m4_runtime.iso
+        run: bash tests/m4_runtime_probe_check.sh
+        working-directory: aerosls2
+
+      - name: Build the M4.8 hardening probe ISO for the live gate
+        run: make X86_CC=gcc X86_LD=ld x86-iso-e3 E3_INIT_FEATURES=e3_envs,e7_gate M4_HARDENING_PROBE=1 SIDECAR_E3_CPIO=sidecars_m4_hardening_e3.cpio X86_E3_ISO=sls_m4_hardening_e3.iso
+        working-directory: aerosls2
+
+      - name: M4.8 hardening live gate (M4-HARDENING-PASS)
+        env:
+          M4_HARDENING_BUILD: "0"
+          M4_HARDENING_ISO: sls_m4_hardening_e3.iso
+        run: bash tests/m4_hardening_probe_check.sh
+        working-directory: aerosls2
+
+      - name: Build the M5.3 tenant checkpoint probe ISO for the live gate
+        run: make X86_CC=gcc X86_LD=ld x86-iso-e3 E3_INIT_FEATURES=e3_envs,m5_tenant_probe,m5_tenant_ckpt M5_TENANT_CKPT=1 X86_E3_ISO=sls_operating_system_e3_m53.iso
+        working-directory: aerosls2
+
+      - name: M5.3 ordinary-tenant checkpoint/restore live gate (two-boot, M4.6-RESTORED-OK)
+        env:
+          M53_BUILD: "0"
+          M53_ISO: sls_operating_system_e3_m53.iso
+        run: bash tests/m5_tenant_ckpt_probe_check.sh
         working-directory: aerosls2
 
   decoder-build:
