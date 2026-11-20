@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # m4_std_thread_probe_check.sh — M4.9's real std::thread two-boot gate.
 #
+# GUARD-KIND: runtime (needs the built M4.9 probe ISO, QEMU, and for the
+# build arm the x86_64-unknown-none target and the kernel's X86_CC/X86_LD)
+#
 # The gate profile's firstuser is a static musl Rust candidate using
 # std::thread::spawn. That reaches musl pthread_create, whose stack is
 # mmap(PROT_NONE) then mprotect(PROT_READ|PROT_WRITE): the PROT_NONE
@@ -64,6 +67,10 @@ cleanup() {
 }
 trap cleanup EXIT
 fail() { echo "FAIL: $*" >&2; cleanup; exit 1; }
+# Exit 2 is "cannot run here", not "the gate failed": tests/run_checks.sh
+# reports it as an owed skip for a GUARD-KIND: runtime guard, and the live
+# gate is run for real by the kernel-guards job.
+abort() { echo "ABORT: $*" >&2; exit 2; }
 
 # ── static: the probe profile must not embed the backup fixture ───────────
 # The image's FIRSTUSER is selected by two cfg branches in e7_firstuser.rs.
@@ -177,6 +184,34 @@ echo "static: std_thread_gate.elf $FIXTURE_BYTES bytes fits the $RESERVE-byte ta
 if [ "${M4_STD_THREAD_STATIC_ONLY:-0}" = "1" ]; then
     echo "PASS: m4_std_thread_probe's FIRSTUSER cfg excludes the backup fixture"
     exit 0
+fi
+
+# ── live prerequisites: absent is a skip (2), not a failure (1) ──────────
+# The static clauses above have already run, so a real regression still exits
+# 1 before this point. What follows cannot run on a source-only host, and
+# run_checks.sh turns a GUARD-KIND: runtime guard's exit 2 into an owed skip
+# instead of failing the job; kernel-guards builds the probe ISO and runs the
+# gate with M4_STD_THREAD_BUILD=0. Each message names what to install or
+# which variable to set, because the skip prints it.
+if [ "$BUILD" = "1" ]; then
+    command -v make >/dev/null 2>&1 || \
+        abort "make not found — the build arm runs 'make x86-iso-e3' (or set M4_STD_THREAD_BUILD=0 with a prebuilt ISO)"
+    command -v cargo >/dev/null 2>&1 || \
+        abort "cargo not found — the probe ISO cross-builds the six sidecars for x86_64-unknown-none"
+    sysroot=$(rustc --print sysroot 2>/dev/null) || sysroot=""
+    [ -n "$sysroot" ] && [ -d "$sysroot/lib/rustlib/x86_64-unknown-none" ] || \
+        abort "the x86_64-unknown-none rust-std component is not installed (rustup target add x86_64-unknown-none)"
+    cc=${X86_CC:-x86_64-elf-gcc}
+    ld=${X86_LD:-x86_64-elf-ld}
+    command -v "$cc" >/dev/null 2>&1 || \
+        abort "the kernel compiler '$cc' is not on PATH — pass X86_CC=gcc (and X86_LD=ld) as the CI ISO steps do, or set M4_STD_THREAD_BUILD=0 with a prebuilt ISO"
+    command -v "$ld" >/dev/null 2>&1 || \
+        abort "the kernel linker '$ld' is not on PATH — pass X86_LD=ld (and X86_CC=gcc), or set M4_STD_THREAD_BUILD=0 with a prebuilt ISO"
+fi
+command -v qemu-system-x86_64 >/dev/null 2>&1 || \
+    abort "qemu-system-x86_64 not found — the gate checkpoints in one boot and restores in a second (install qemu-system-x86, or run M4_STD_THREAD_STATIC_ONLY=1 for the source clauses)"
+if [ "$BUILD" != "1" ] && [ ! -f "$ROOT/$ISO" ]; then
+    abort "missing M4.9 probe ISO '$ISO' — build it with M4_STD_THREAD_PROBE=1, pass M4_STD_THREAD_ISO, or run M4_STD_THREAD_STATIC_ONLY=1"
 fi
 
 if [ "$BUILD" = "1" ]; then

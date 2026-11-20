@@ -1171,6 +1171,30 @@ jobs:
         run: bash tests/phase5_boot_flake_guard.sh
         working-directory: aerosls2
 
+      # ─── M4.9 std::thread probe: live two-boot gate ──────────────────────
+      # The gate's source clauses run in verify. Its live arms checkpoint a
+      # parked real std::thread (musl pthread_create's PROT_NONE stack), restore
+      # it in a second boot and join it, so they need the cross-built sidecars
+      # and QEMU. tests/m4_std_thread_probe_check.sh is GUARD-KIND: runtime:
+      # bare, it exits 2 without X86_CC/X86_LD (run_checks reports that as an
+      # owed skip), and these steps pass the host toolchain explicitly, like
+      # every other ISO build here.
+      #
+      # Built LAST, after the guard sweep and the source smokes: this build
+      # re-flattens user/target/.../posix.bin under a probe cpio whose record is
+      # not the E3 one clause M anchors, and a guard run afterwards would read it
+      # as a stale build output.
+      - name: Build the M4.9 std-thread probe ISO for the live gate
+        run: make X86_CC=gcc X86_LD=ld x86-iso-e3 E3_INIT_FEATURES=e3_envs,e7_gate M4_STD_THREAD_PROBE=1 SIDECAR_E3_CPIO=sidecars_m4_std_thread_e3.cpio X86_E3_ISO=sls_m4_std_thread.iso
+        working-directory: aerosls2
+
+      - name: M4.9 std-thread live gate (two-boot checkpoint/restore, STD-THREAD-PASS)
+        env:
+          M4_STD_THREAD_BUILD: "0"
+          M4_STD_THREAD_ISO: sls_m4_std_thread.iso
+        run: bash tests/m4_std_thread_probe_check.sh
+        working-directory: aerosls2
+
   decoder-build:
     # M8 (Step 6.4): the decoder is the DEFAULT build -- this job builds
     # the shipping config (what deploy.sh builds and what runs in
