@@ -41,6 +41,12 @@
 # binary line, swap two lines, drop a binary from the record, and replace the
 # entry instrument with one that answers without reading.
 #
+# The X arms hold the entry instrument's `--to-stdout` mode to its digest mode:
+# tests/m4_std_thread_probe_check.sh reads boot/posix.bin out of the packed
+# archive with it, so the bytes it emits must hash to what the two-operand call
+# answers for the same entry, and an entry the archive does not hold must exit
+# 1 there too rather than hand a caller an empty image.
+#
 # The M teeth close the loop the record alone cannot: a record and its stamps
 # can ALL be rewritten from a stale archive, and K and L stay green because
 # they compare those files to each other. M compares the archive to something
@@ -640,6 +646,36 @@ tooth "L: the entry instrument answers every name without reading the archive (t
 seed "$W/l6"
 sed -i '/^binary boot\/e1000.bin /d' "$W/l6/sidecars.cpio.stamps"
 tooth "L: the record names only five of the six binaries (a binary silently dropped from the record)" L "$W/l6"
+
+# ── X. the entry instrument's extraction mode is the same walk ────────────
+# The M4.9 gate reads boot/posix.bin out of the packed archive with
+# `--to-stdout` instead of carrying a second newc reader. These arms hold that
+# mode to the digest mode on the same seeded archive: the bytes it emits must
+# hash to what the two-operand call answers for the same entry, and an entry
+# the archive does not hold must exit 1 rather than emit an empty image.
+seed "$W/x1"
+d=$("$W/x1/tools/sidecar_archive_entry_digest.sh" "$W/x1/sidecars.cpio" boot/posix.bin 2>/dev/null)
+e=$("$W/x1/tools/sidecar_archive_entry_digest.sh" --to-stdout "$W/x1/sidecars.cpio" boot/posix.bin 2>/dev/null | sha256sum | cut -d' ' -f1)
+if [ -n "$d" ] && [ "$d" = "$e" ]; then
+    echo "ok:   X: --to-stdout emits the entry's bytes (their sha256 equals the digest mode's answer)"
+    passed=$((passed + 1))
+else
+    echo "FAIL: X: --to-stdout and the digest mode disagree for boot/posix.bin (digest '$d', extracted '$e')"
+    failed=$((failed + 1))
+fi
+
+# Exit 1 alone is not enough: any failure path answers 1. The arm also
+# requires the tool's own "has no entry" line, so a broken reader that dies
+# for an unrelated reason cannot satisfy it.
+err=$("$W/x1/tools/sidecar_archive_entry_digest.sh" --to-stdout "$W/x1/sidecars.cpio" boot/absent.bin 2>&1 >/dev/null)
+rc=$?
+if [ "$rc" -eq 1 ] && printf '%s\n' "$err" | grep -qF "has no entry 'boot/absent.bin'"; then
+    echo "ok:   X: --to-stdout exits 1 for an entry the archive does not hold, naming that entry"
+    passed=$((passed + 1))
+else
+    echo "FAIL: X: --to-stdout answered a missing entry with exit $rc and '$err' (want 1 and the tool's \"has no entry 'boot/absent.bin'\")"
+    failed=$((failed + 1))
+fi
 
 # ── M. the archive's binaries are the flattened build outputs ─────────────
 # K and L compare the record, the stamps and the archive to one another; these
