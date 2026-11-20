@@ -705,22 +705,24 @@ jobs:
     # build-run guard passes AND every smoke proves its teeth
     # on every push.
     #
-    # A green run here is NOT coverage of every runtime gate. Ten
+    # A green run here is NOT coverage of every runtime gate. Eight
     # GUARD-KIND: runtime gates exit 2 with an owed skip in this job and it
     # passes anyway; run_checks.sh names them under "RUNTIME guards NOT RUN",
     # but that line scrolls past, so they are named here:
     #
-    #   * cannot build its own cluster on this runner (one):
-    #     env_api_identity_check. run-cluster.sh rebuilds with
-    #     ENV_CKPT_TEST_HOOKS=1 -- an AB_DEFS define in the build-config
-    #     stamp -- through the Makefile's default x86_64-elf-gcc, which this
-    #     runner deliberately does not install.
-    #   * need a live cluster, or a deployed instance for webapp_served
-    #     (nine): entropy_boot_diversity, env_catalog_live,
-    #     env_migrate_confirm_live, failover_adoption_live,
+    #   * need a live cluster (eight): entropy_boot_diversity,
+    #     env_catalog_live, env_migrate_confirm_live, failover_adoption_live,
     #     failover_2node_live, partition_ownedset_gc_live,
-    #     partition_reannounce_live, partition_reuse_pause_live and
-    #     webapp_served.
+    #     partition_reannounce_live and partition_reuse_pause_live.
+    #
+    # Two more also exit 2 in the sweep, but they are NOT owed: webapp_served
+    # runs inside the /api/health boot step, against the instance that step
+    # just checked; env_api_identity is the last step of this job. It exports
+    # X86_CC=gcc X86_LD=ld for its own private 3-node cluster -- run-cluster's
+    # rebuild goes through the Makefile's X86_CC ?=, so the cross compiler
+    # this runner does not install is not needed -- and ENV_CKPT_TEST_HOOKS=1
+    # (an AB_DEFS define in the build-config stamp) makes the kernel actually
+    # recompile with the stale-checkpoint arm.
     #
     # Five more -- m2_dyn_v1_boot, m4_thread_probe, m4_group_probe,
     # m4_futex_probe and m4_exit_probe -- also exit 2 in the sweep, but they
@@ -737,8 +739,10 @@ jobs:
     # env_recycle_boot, env_shell_surface, partition_teardown_boot,
     # simi_teardown_boot, unified_boot) run inside the guard sweep, the ten
     # probe build-then-run pairs (M4.9, then M4.2, M4.3, M4.4, M4.5, M4.6,
-    # M4.7, M4.8, M5.3 and M2d) sit at the end of the job, and m1_net_probe
-    # runs from the sweep against the M1 image built above.
+    # M4.7, M4.8, M5.3 and M2d) sit at the end of the job, m1_net_probe runs
+    # from the sweep against the M1 image built above, webapp_served runs
+    # inside the /api/health boot step, and env_api_identity is the final
+    # step.
     # m5_catalog_live_check self-builds in the sweep and is in neither list:
     # whether it runs depends on the tree's build-config stamp, so it is not
     # coverage either way.
@@ -1067,6 +1071,19 @@ jobs:
             fi
             sleep 2
           done
+          # The instance answered /api/health; before its QEMU is stopped,
+          # prove the bytes it SERVES are the committed webapp bundle, not
+          # merely that a bundle was embedded -- every asset byte-for-byte,
+          # with the table's Content-Type and Content-Length. deploy.sh runs
+          # this guard authoritatively after its pm2 restart; this is the arm
+          # that keeps a serving regression visible on every push.
+          if [ "$healthy" -eq 1 ]; then
+            if ! SERVED_URL="http://127.0.0.1:$PORT" bash tests/webapp_served_check.sh; then
+              kill "$QPID" 2>/dev/null || true
+              kill "$CATPID" 2>/dev/null || true
+              exit 1
+            fi
+          fi
           kill "$QPID" 2>/dev/null || true
           kill "$CATPID" 2>/dev/null || true
           wait "$QPID" 2>/dev/null || true
@@ -1232,7 +1249,10 @@ jobs:
       # not the E3 one clause M anchors, and a guard run afterwards would read it
       # as a stale build output. For the same reason the ten build-then-run
       # pairs (M4.9 above, then M4.2, M4.3, M4.4, M4.5, M4.6, M4.7, M4.8, M5.3
-      # and M2d) sit at the end of the job, with no guard after them.
+      # and M2d) sit at the end of the job, with no guard that reads their
+      # build output after them. env_api_identity follows them only because it
+      # rebuilds the kernel with ENV_CKPT_TEST_HOOKS=1 for its own private
+      # cluster; it reads none of their output.
       - name: Build the M4.9 std-thread probe ISO for the live gate
         run: make X86_CC=gcc X86_LD=ld x86-iso-e3 E3_INIT_FEATURES=e3_envs,e7_gate M4_STD_THREAD_PROBE=1 SIDECAR_E3_CPIO=sidecars_m4_std_thread_e3.cpio X86_E3_ISO=sls_m4_std_thread.iso
         working-directory: aerosls2
@@ -1344,6 +1364,36 @@ jobs:
         env:
           M2DYN_ISO: sls_m2_dyn_v1.iso
         run: bash tests/m2_dyn_v1_boot_check.sh
+        working-directory: aerosls2
+
+      # env_api_identity is the last step because it flips the build: it
+      # exports ENV_CKPT_TEST_HOOKS=1, which joins AB_DEFS in the build-config
+      # stamp, so run-cluster's `make my_sls_kernel.bin` recompiles the kernel
+      # with the stale-checkpoint arm. Nothing after this step may inherit
+      # that build. X86_CC/X86_LD are exported for the same reason every
+      # other build here passes them: the Makefile's `?=` honours the
+      # environment, and this runner has gcc/ld, not x86_64-elf-gcc. The
+      # guard starts its own private 3-node cluster (mktemp dir, 593xx ports
+      # and multicast port), asserts the real API's stale-record shape, runs
+      # the real failover guard to the identity-mismatch ABORT, checks the
+      # leader survived, and stops the cluster it started on exit.
+      #
+      # The kernel is built BEFORE the guard on purpose. The guard launches
+      # run-cluster.sh and then gives all three nodes 300 s to answer
+      # /api/health; flipping ENV_CKPT_TEST_HOOKS changes AB_DEFS and the
+      # build-config stamp, so after the probe pairs that window would
+      # otherwise be spent recompiling the kernel and TCG objects before the
+      # nodes even launch. The guard exports the same flag, so its
+      # run-cluster make is then a no-op.
+      - name: env_api_identity live gate (private 3-node cluster, ENV_CKPT_TEST_HOOKS=1)
+        timeout-minutes: 30
+        env:
+          X86_CC: gcc
+          X86_LD: ld
+          ENV_CKPT_TEST_HOOKS: "1"
+        run: |
+          make my_sls_kernel.bin
+          bash tests/env_api_identity_check.sh
         working-directory: aerosls2
 
   decoder-build:
