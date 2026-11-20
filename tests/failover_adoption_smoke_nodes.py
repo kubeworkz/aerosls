@@ -101,10 +101,11 @@ Modes (written to <statedir>/mode by the smoke):
                   prints the Adopted line while staying FOLLOWER -- a
                   follower that recovered -> guard FAIL at the step-9
                   never-adopt check (cluster_is_leader gate)
-    lateflip      node 2 adopts normally; node 3 stays FOLLOWER through the
-                  adoption, then flips to LEADER after a delay -> guard
-                  FAIL at the step-9 stays-FOLLOWER check (late
-                  split-brain)
+    lateflip      node 2 adopts normally; node 3 stays a non-owner through
+                  the adoption, then wins a later term after a delay ->
+                  guard PASS: step 9 gates ownership, not role, so a later
+                  LEADER that does not serve the partition as its own is
+                  legal; a second owner would still fail
     resurrect_stable  the guard RELAUNCHES the killed leader mid-adoption.
                   The relaunched leader restores its stale row from disk
                   (logs the restore) and re-announces it; both survivors
@@ -315,9 +316,10 @@ else:
 ADOPTER_ID = 1 if mode == "prekillchurn" else 2
 
 transitioned = False
-# lateflip: the observer flips to LEADER AFTER the adoption has been
-# observed (a late split-brain), so the guard's step-9 watch catches it
-# rather than the step-7 simultaneous-flip check.
+# lateflip: the observer wins a later term AFTER the adoption has been
+# observed. That is legal -- step 9 gates ownership, not role -- so the
+# guard must PASS as long as the observer never serves the partition as
+# its own; the flip is deliberately late enough to miss step 7.
 late_flipped = False
 # Step 11 lease/migrate state on this process.
 lease_held = False
