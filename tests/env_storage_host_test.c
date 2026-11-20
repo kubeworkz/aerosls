@@ -96,8 +96,14 @@ int nvme_write_sync(uint64_t slba, const void* buf) {
     memcpy(p, buf, 4096);
     return 0;
 }
+/* Fault injection for the failed-durable-restore arm below: the real
+ * env_storage_restore() reads through this entry point, so failing it here
+ * exercises the module's own error path rather than a reimplementation. */
+static int g_fail_read_pages = 0;
+
 int nvme_read_pages_sync(uint64_t slba, void* buf, uint32_t page_count) {
     uint8_t* p;
+    if (g_fail_read_pages) return 1;
     if (page_count == 0) return 0;
     if (page_count > 32) return 1;          /* NVME_MAX_PAGES_PER_XFER */
     if (!es_buf_aligned(buf)) return 0xFC;
@@ -161,10 +167,22 @@ int main(void) {
     /* ── 1. attach: durable, zeroed, recorded ─────────────────────────────── */
     /* Pre-dirty slot 0 so "zeroed" means something. */
     memset(es_disk, 0xAB, sizeof es_disk);
+    /* A durable NEW create must leave its fresh frame region untouched too:
+     * only a RAM-backed store may be zeroed at attach. Pre-fill it so the
+     * zeroing rule is observable for the new-create path, not just reattach. */
+    memset(region_a, 0x5C, sizeof region_a);
 
     CHECK(env_storage_attach(1, 0, BASE_A, ENV_STORAGE_EXTENT_BYTES) ==
               ENV_STORAGE_OK,
           "attach records a new store for (partition 1, index 0)");
+
+    int new_untouched = 1;
+    for (uint32_t i = 0; i < ENV_STORAGE_EXTENT_BYTES; i++) {
+        if (region_a[i] != 0x5C) { new_untouched = 0; break; }
+    }
+    CHECK(new_untouched,
+          "a durable new create leaves its region untouched (RAM-backed-only "
+          "zeroing)");
 
     int dirty = 0;
     for (uint64_t i = 0; i < ENV_STORAGE_EXTENT_BYTES; i++)
@@ -194,9 +212,29 @@ int main(void) {
     memset(region_a, 0, sizeof region_a);
     wipe_usage(1);                /* the usage array is per-boot, like the real one */
     env_storage_boot_reset();     /* ...and so is the re-charge bookkeeping */
+    /* Pre-fill the durable reattach's region so the attach and the failed
+     * restore are both observable: a zeroing attach would erase this before
+     * the restore even ran. */
+    memset(region_b, 0xA5, sizeof region_b);
     CHECK(env_storage_attach(1, 0, BASE_B, ENV_STORAGE_EXTENT_BYTES) ==
               ENV_STORAGE_OK,
           "re-attach after reboot, same identity, a different frame base");
+    /* A failed durable restore must NOT turn the region into a fresh store.
+     * mount_aerofs_or_format treats an all-zero block 0 as "format me"; if a
+     * restore error left the region zeroed, the next mount would erase the
+     * old filesystem. The error must leave every prefilled byte in place, so
+     * the mount sees a non-empty unparsable store and refuses instead. */
+    g_fail_read_pages = 1;
+    CHECK(env_storage_restore(BASE_B) == ENV_STORAGE_ERR_IO,
+          "a durable restore reports the device error");
+    int untouched = 1;
+    for (uint32_t i = 0; i < ENV_STORAGE_EXTENT_BYTES; i++) {
+        if (region_b[i] != 0xA5) { untouched = 0; break; }
+    }
+    CHECK(untouched,
+          "a failed durable restore leaves the region untouched (no zeroed "
+          "store for mount_aerofs_or_format to format over)");
+    g_fail_read_pages = 0;
     CHECK(env_storage_restore(BASE_B) == ENV_STORAGE_OK,
           "restore loads the extent into the fresh region");
     CHECK(memcmp(region_b, payload, sizeof payload) == 0,
