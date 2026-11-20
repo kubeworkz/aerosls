@@ -439,7 +439,7 @@ The inherited gate is "a static binary doing the first user's actual work, runni
 **Explicitly not in scope:**
 
 - **Dynamic linking** (§6) — refused, with a named trigger and a scoped path.
-- **Threads, `clone`, group exit, identity and a joinable runtime** (§7) — named as Go's gate; M4.1–M4.6 stage the group, clone, identity/exit, futex and thread-aware checkpoint, M4.7's static threaded-Rust gate and M4.9's real `std::thread` gate are evidenced and the M4.9 gate is CI-enforced (`GUARD-KIND: runtime`, exit-2 prerequisite path, `kernel-guards` builds the probe ISO and runs the two-boot gate); Go remains out.
+- **Threads, `clone`, group exit, identity and a joinable runtime** (§7) — named as Go's gate; M4.1–M4.11 land the group, clone, identity/exit, futex, thread-aware checkpoint and group signal delivery, M4.7's static threaded-Rust gate and M4.9's real `std::thread` gate are evidenced and CI-enforced (`GUARD-KIND: runtime`, exit-2 prerequisite path, `kernel-guards` builds the probe ISO and runs the two-boot gate); Go remains out.
 - **The ARM64 rig** (§4.3) — it is H2 item #1's, not E7's.
 - **The environment checkpoint/restore mechanism** (§8) — v0.2 item 1's, and landed as P1a: the capture, the versioned record and the payload are not E7's to build. E7's share of it — the Linux task's entry in that record, its per-page permissions and its resumed `rip`/`rsp` — is in scope and landed (§10.14, increments 20–21).
 - **A translator** (§4.5) — QEMU-SLS's, and the line that keeps the two from competing.
