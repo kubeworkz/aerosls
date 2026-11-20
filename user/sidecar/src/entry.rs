@@ -825,10 +825,11 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                 &RealKernel, caps.budget_base, caps.budget_len) {
                 Ok(sp) => match booted.proc.vfs.add_task() {
                     Ok(vt) => {
+                        let pid = RealKernel.sidecar_pid(probe_name, 0) as u64;
                         if crate::linux::track_mirrored(
                             sp.ch_r, sp.ch_w, probe_name,
-                            0, sp.heap_base, sp.heap_limit, vt,
-                            RealKernel.sidecar_pid(probe_name, 0) as u64,
+                            0, sp.heap_base, sp.heap_limit, image_span(pid),
+                            vt, pid,
                         ) {
                             klog(b"[M5.3] tenant ckpt", sp.ch_r, b"");
                         } else {
