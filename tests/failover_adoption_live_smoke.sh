@@ -50,9 +50,11 @@
 #                         while staying FOLLOWER -- a follower that
 #                         recovered; the step-9 never-adopt check must bite,
 #                         pinning cluster_is_leader())
-#   lateflip    -> FAIL  (the observer stays FOLLOWER through the adoption,
-#                         then flips to LEADER; the step-9 stays-FOLLOWER
-#                         watch must catch the late split-brain)
+#   lateflip    -> PASS  (the observer stays a non-owner through the
+#                         adoption, then wins a later term. A later LEADER
+#                         that does not own the partition is legal; step 9
+#                         must accept it and still catch a second owner via
+#                         the observer's live partition list)
 #   resurrect_stable -> PASS (the guard RELAUNCHES the killed leader
 #                         mid-adoption; its stale re-announce is rejected by
 #                         both survivors, the partition does not flap, and
@@ -583,7 +585,7 @@ tooth envckptwrongid   2 "checkpoint identity mismatch" "envckptwrongid -> ABORT
 tooth envckptwrongidfalse 2 "checkpoint identity mismatch" "envckptwrongidfalse -> ABORT (the env API reports checkpointed=false for the live index while checkpoint_env_id names a different environment -- the production stale-record shape: the exact-identity gate must name the identity mismatch with both reported ids and report NOT checkpointable, not blame adoption, and must not kill the leader; this tooth checks its pid is still alive and the fake env API itself returned checkpointed=false with the stale checkpoint_env_id after the abort)"
 tooth splitbrain       1 "split-brain"   "splitbrain -> FAIL (both survivors claim LEADER at once)"
 tooth observeradopts   1 "ALSO recovered" "observeradopts -> FAIL (a follower that recovered must be caught by step 9)"
-tooth lateflip         1 "flipped to LEADER" "lateflip -> FAIL (the late flip to LEADER must be caught by step 9)"
+tooth lateflip         0 "PASS" "lateflip -> PASS (a later LEADER that does not own the partition is accepted; ownership, not role, is the split-brain gate)"
 tooth resurrect_stable 0 "PASS"   "resurrect_stable -> PASS (stale claim rejected by both survivors, no flap, leader converged)"
 tooth resurrect_flap   1 "FLAPPED" "resurrect_flap -> FAIL (the old last-wins apply of the stale claim must be caught)"
 tooth resurrect_nostale 1 "never restored" "resurrect_nostale -> FAIL (a leader whose stale row never came back must be caught)"

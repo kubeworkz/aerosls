@@ -1129,6 +1129,8 @@ if mode == "prekillchurn" and not created_preexisting:
 # gate) -- every PASS mode AND every migrate_* mode, because the migrate
 # teeth can only fail at a step-11 gate if step 10 got them there first.
 STEP10_MODES = ("adopted", "learnlost1", "ckptlost1", "prekillchurn",
+                "lateflip",   # a later LEADER that is not the owner is legal; the
+                              # rest of the chain must still complete
                 "resurrect_stable",
                 "migrate_stable",
                 "migrate_flap", "migrate_nolease", "migrate_noapply",
