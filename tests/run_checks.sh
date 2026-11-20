@@ -221,20 +221,11 @@ if [ "$skip" -gt 0 ]; then
 
     if [ -n "$runtime_skipped" ]; then
         [ -n "$build_skipped" ] && echo
-        echo "RUNTIME guards NOT RUN, and still owed:$runtime_skipped"
-        echo "These need a live system, a probe image CI does not build, or a"
-        echo "cluster -- inputs --require-all cannot manufacture, so they are"
-        echo "reported instead of forced. A green run is therefore NOT evidence"
-        echo "that they pass. Fifteen runtime guards can sit in this list, and"
-        echo "each needs one of:"
-        echo
-        echo "  no probe ISO is built anywhere in CI (five). Each exits 2 at"
-        echo "  its first ISO check, so even its static clauses never run:"
-        echo "      tests/m2_dyn_v1_boot_check.sh    M2DYN_ISO (M2A_INTERP=1 ISO)"
-        echo "      tests/m4_exit_probe_check.sh     sls_m4_exit.iso   (M4_EXIT_PROBE=1)"
-        echo "      tests/m4_futex_probe_check.sh    sls_m4_futex.iso  (M4_FUTEX_PROBE=1)"
-        echo "      tests/m4_group_probe_check.sh    sls_m4_group.iso  (M4_GROUP_PROBE=1)"
-        echo "      tests/m4_thread_probe_check.sh   sls_m4_thread.iso (M4_THREAD_PROBE=1)"
+        echo "RUNTIME guards NOT RUN in this sweep:$runtime_skipped"
+        echo "A runtime guard needs a live system, a probe image this runner did"
+        echo "not build, or a cluster -- inputs --require-all cannot manufacture,"
+        echo "so they are reported instead of forced. A green run is therefore"
+        echo "NOT evidence that they pass. The ten that stay owed need one of:"
         echo
         echo "  builds its own 3-node cluster, and needs a compiler run-cluster"
         echo "  can use for its ENV_CKPT_TEST_HOOKS=1 rebuild (one):"
@@ -251,6 +242,12 @@ if [ "$skip" -gt 0 ]; then
         echo "      tests/partition_reannounce_live_check.sh"
         echo "      tests/partition_reuse_pause_live_check.sh"
         echo "      SERVED_URL=http://127.0.0.1:3001 tests/webapp_served_check.sh"
+        echo
+        echo "Not owed, though also skipped here: m2_dyn_v1_boot,"
+        echo "m4_thread_probe, m4_group_probe, m4_futex_probe and"
+        echo "m4_exit_probe each have a build-then-run pair at the end of"
+        echo "kernel-guards; the sweep skips them because their ISO is built"
+        echo "after it, and their live proof runs there."
         echo
         echo "A guard that needs only sls_operating_system.iso or"
         echo "sls_operating_system_e3.iso should not be in that list: build it"

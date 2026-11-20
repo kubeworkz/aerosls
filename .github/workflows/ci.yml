@@ -705,17 +705,11 @@ jobs:
     # build-run guard passes AND every smoke proves its teeth
     # on every push.
     #
-    # A green run here is NOT coverage of every runtime gate. Fifteen
+    # A green run here is NOT coverage of every runtime gate. Ten
     # GUARD-KIND: runtime gates exit 2 with an owed skip in this job and it
-    # passes anyway; run_checks.sh names them under "RUNTIME guards NOT RUN,
-    # and still owed", but that line scrolls past, so they are named here:
+    # passes anyway; run_checks.sh names them under "RUNTIME guards NOT RUN",
+    # but that line scrolls past, so they are named here:
     #
-    #   * no probe ISO is built anywhere in CI (five) -- each exits 2 at its
-    #     first ISO check, so its live arm, and every clause after that
-    #     check, never runs: m2_dyn_v1_boot_check (M2DYN_ISO),
-    #     m4_exit_probe_check (sls_m4_exit.iso), m4_futex_probe_check
-    #     (sls_m4_futex.iso), m4_group_probe_check (sls_m4_group.iso),
-    #     m4_thread_probe_check (sls_m4_thread.iso).
     #   * cannot build its own cluster on this runner (one):
     #     env_api_identity_check. run-cluster.sh rebuilds with
     #     ENV_CKPT_TEST_HOOKS=1 -- an AB_DEFS define in the build-config
@@ -728,16 +722,26 @@ jobs:
     #     partition_reannounce_live, partition_reuse_pause_live and
     #     webapp_served.
     #
+    # Five more -- m2_dyn_v1_boot, m4_thread_probe, m4_group_probe,
+    # m4_futex_probe and m4_exit_probe -- also exit 2 in the sweep, but they
+    # are NOT owed: each has its own build-then-run pair at the end of the
+    # job, so the sweep's skip is expected and the live proof runs there. The
+    # four M4 pairs pack a probe archive first (selfhost-bootimage with the
+    # feature and a dedicated SIDECAR_CPIO) because the probe is a sidecar
+    # cargo feature and x86-iso only ships that archive; M2d builds
+    # x86-iso-e3 with M2A_INTERP=1.
+    #
     # The rest do run: the ten runtime gates whose only need is
     # sls_operating_system.iso or sls_operating_system_e3.iso (aerocap_boot,
     # cap_boot, e3_multi_env_boot, env_console_attach, env_create_boot,
     # env_recycle_boot, env_shell_surface, partition_teardown_boot,
-    # simi_teardown_boot, unified_boot) run inside the guard sweep, the five
-    # probe build-then-run pairs (M4.9, M4.6, M4.7, M4.8, M5.3) sit at the
-    # end of the job, and m1_net_probe runs from the sweep against the M1
-    # image built above. m5_catalog_live_check self-builds in the sweep and
-    # is in neither list: whether it runs depends on the tree's build-config
-    # stamp, so it is not coverage either way.
+    # simi_teardown_boot, unified_boot) run inside the guard sweep, the ten
+    # probe build-then-run pairs (M4.9, then M4.2, M4.3, M4.4, M4.5, M4.6,
+    # M4.7, M4.8, M5.3 and M2d) sit at the end of the job, and m1_net_probe
+    # runs from the sweep against the M1 image built above.
+    # m5_catalog_live_check self-builds in the sweep and is in neither list:
+    # whether it runs depends on the tree's build-config stamp, so it is not
+    # coverage either way.
     #
     # The E3 multi-instance guard is also GUARD-KIND: runtime but is NOT one of
     # those skips: this job builds sls_operating_system_e3.iso for it a step
@@ -1213,18 +1217,22 @@ jobs:
       # owed skip), and these steps pass the host toolchain explicitly, like
       # every other ISO build here.
       #
-      # All four probe gates below are GUARD-KIND: runtime, so verify reports
-      # them as owed skips; these steps are where their clauses and live proofs
-      # actually run. Each gate is built with its host toolchain and then run
-      # with its *_BUILD=0 variable against that ISO, so the harness cannot
+      # The probe gates below are GUARD-KIND: runtime, so verify reports them
+      # as owed skips; these steps are where their clauses and live proofs
+      # actually run. The M4.2-M4.5 pairs pack a probe archive first
+      # (selfhost-bootimage with the feature and a dedicated SIDECAR_CPIO),
+      # because the probe is a sidecar cargo feature and x86-iso only ships
+      # that archive; the tracked sidecars.cpio is never overwritten. The
+      # M4.6-M4.9, M5.3 and M2d gates build with x86-iso-e3 and are then run
+      # with their *_BUILD=0 variable against that ISO, so the harness cannot
       # quietly rebuild and the built artifact is what is measured.
       #
       # Built LAST, after the guard sweep and the source smokes: these builds
       # re-flatten user/target/.../posix.bin under probe cpios whose records are
       # not the E3 one clause M anchors, and a guard run afterwards would read it
-      # as a stale build output. For the same reason the five build-then-run
-      # pairs (M4.9 above, then M4.6, M4.7, M4.8 and M5.3) sit at the end of the
-      # job, with no guard after them.
+      # as a stale build output. For the same reason the ten build-then-run
+      # pairs (M4.9 above, then M4.2, M4.3, M4.4, M4.5, M4.6, M4.7, M4.8, M5.3
+      # and M2d) sit at the end of the job, with no guard after them.
       - name: Build the M4.9 std-thread probe ISO for the live gate
         run: make X86_CC=gcc X86_LD=ld x86-iso-e3 E3_INIT_FEATURES=e3_envs,e7_gate M4_STD_THREAD_PROBE=1 SIDECAR_E3_CPIO=sidecars_m4_std_thread_e3.cpio X86_E3_ISO=sls_m4_std_thread.iso
         working-directory: aerosls2
@@ -1278,6 +1286,64 @@ jobs:
           M53_BUILD: "0"
           M53_ISO: sls_operating_system_e3_m53.iso
         run: bash tests/m5_tenant_ckpt_probe_check.sh
+        working-directory: aerosls2
+
+      - name: Build the M4.2 clone-probe ISO for the live gate
+        run: |
+          make X86_CC=gcc X86_LD=ld selfhost-bootimage M4_THREAD_PROBE=1 SIDECAR_CPIO=sidecars_m4_thread.cpio
+          make X86_CC=gcc X86_LD=ld x86-iso SIDECAR_CPIO=sidecars_m4_thread.cpio X86_ISO=sls_m4_thread.iso
+        working-directory: aerosls2
+
+      - name: M4.2 raw clone live gate (M4-THREAD-OK, M4-THREAD-PARENT-OK)
+        env:
+          M4_ISO: sls_m4_thread.iso
+        run: bash tests/m4_thread_probe_check.sh
+        working-directory: aerosls2
+
+      - name: Build the M4.3 shared-group probe ISO for the live gate
+        run: |
+          make X86_CC=gcc X86_LD=ld selfhost-bootimage M4_GROUP_PROBE=1 SIDECAR_CPIO=sidecars_m4_group.cpio
+          make X86_CC=gcc X86_LD=ld x86-iso SIDECAR_CPIO=sidecars_m4_group.cpio X86_ISO=sls_m4_group.iso
+        working-directory: aerosls2
+
+      - name: M4.3 CLONE_FILES shared-group live gate (M4-GROUP-CHILD-OK, M4-GROUP-PARENT-OK)
+        env:
+          M4_GROUP_ISO: sls_m4_group.iso
+        run: bash tests/m4_group_probe_check.sh
+        working-directory: aerosls2
+
+      - name: Build the M4.4 futex probe ISO for the live gate
+        run: |
+          make X86_CC=gcc X86_LD=ld selfhost-bootimage M4_FUTEX_PROBE=1 SIDECAR_CPIO=sidecars_m4_futex.cpio
+          make X86_CC=gcc X86_LD=ld x86-iso SIDECAR_CPIO=sidecars_m4_futex.cpio X86_ISO=sls_m4_futex.iso
+        working-directory: aerosls2
+
+      - name: M4.4 private futex wake and timeout live gate (M4-FUTEX-OK, M4-FUTEX-TIMEOUT-OK)
+        env:
+          M4_FUTEX_ISO: sls_m4_futex.iso
+        run: bash tests/m4_futex_probe_check.sh
+        working-directory: aerosls2
+
+      - name: Build the M4.5 identity/exit probe ISO for the live gate
+        run: |
+          make X86_CC=gcc X86_LD=ld selfhost-bootimage M4_EXIT_PROBE=1 SIDECAR_CPIO=sidecars_m4_exit.cpio
+          make X86_CC=gcc X86_LD=ld x86-iso SIDECAR_CPIO=sidecars_m4_exit.cpio X86_ISO=sls_m4_exit.iso
+        working-directory: aerosls2
+
+      - name: M4.5 identity, tkill and exit_group sweep live gate (M4-EXITGROUP-BEFORE)
+        env:
+          M4_EXIT_ISO: sls_m4_exit.iso
+        run: bash tests/m4_exit_probe_check.sh
+        working-directory: aerosls2
+
+      - name: Build the M2d-v1 dynamic-refusal probe ISO for the live gate
+        run: make X86_CC=gcc X86_LD=ld x86-iso-e3 M2A_INTERP=1 E3_INIT_FEATURES=e3_envs,e7_gate X86_E3_ISO=sls_m2_dyn_v1.iso SIDECAR_E3_CPIO=sidecars_m2_dyn_v1_e3.cpio
+        working-directory: aerosls2
+
+      - name: M2d-v1 version-1 PT_INTERP refusal live gate (M2DYN-OK)
+        env:
+          M2DYN_ISO: sls_m2_dyn_v1.iso
+        run: bash tests/m2_dyn_v1_boot_check.sh
         working-directory: aerosls2
 
   decoder-build:

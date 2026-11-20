@@ -26,8 +26,11 @@
 #   M4_GATE_LOG     serial log path     (default: /tmp/m4_thread_probe.$$.log)
 #   M4_GATE_REPLAY  validate an existing log instead of booting QEMU
 #
-# Build:
-#   make x86-iso M4_THREAD_PROBE=1 X86_ISO=sls_m4_thread.iso
+# Build (the probe is a sidecar cargo feature, so pack its archive first):
+#   make X86_CC=gcc X86_LD=ld selfhost-bootimage M4_THREAD_PROBE=1 \
+#        SIDECAR_CPIO=sidecars_m4_thread.cpio
+#   make X86_CC=gcc X86_LD=ld x86-iso SIDECAR_CPIO=sidecars_m4_thread.cpio \
+#        X86_ISO=sls_m4_thread.iso
 #
 # Exit: 0 pass, 1 assertion failure, 2 missing prerequisite.
 set -u

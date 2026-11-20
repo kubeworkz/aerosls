@@ -34,8 +34,11 @@
 #   M4_EXIT_LOG          serial log path     (default: /tmp/m4_exit_probe.$$.log)
 #   M4_EXIT_REPLAY       validate an existing log instead of booting QEMU
 #
-# Build:
-#   make x86-iso M4_EXIT_PROBE=1 X86_ISO=sls_m4_exit.iso
+# Build (the probe is a sidecar cargo feature, so pack its archive first):
+#   make X86_CC=gcc X86_LD=ld selfhost-bootimage M4_EXIT_PROBE=1 \
+#        SIDECAR_CPIO=sidecars_m4_exit.cpio
+#   make X86_CC=gcc X86_LD=ld x86-iso SIDECAR_CPIO=sidecars_m4_exit.cpio \
+#        X86_ISO=sls_m4_exit.iso
 #
 # Exit: 0 pass, 1 assertion failure, 2 missing prerequisite.
 set -u

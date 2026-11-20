@@ -24,8 +24,11 @@
 #   M4_FUTEX_LOG          serial log path     (default: /tmp/m4_futex_probe.$$.log)
 #   M4_FUTEX_REPLAY       validate an existing log instead of booting QEMU
 #
-# Build:
-#   make x86-iso M4_FUTEX_PROBE=1 X86_ISO=sls_m4_futex.iso
+# Build (the probe is a sidecar cargo feature, so pack its archive first):
+#   make X86_CC=gcc X86_LD=ld selfhost-bootimage M4_FUTEX_PROBE=1 \
+#        SIDECAR_CPIO=sidecars_m4_futex.cpio
+#   make X86_CC=gcc X86_LD=ld x86-iso SIDECAR_CPIO=sidecars_m4_futex.cpio \
+#        X86_ISO=sls_m4_futex.iso
 #
 # Exit: 0 pass, 1 assertion failure, 2 missing prerequisite.
 set -u
