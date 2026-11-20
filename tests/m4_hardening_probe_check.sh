@@ -2,7 +2,8 @@
 # tests/m4_hardening_probe_check.sh — live QEMU gate for M4.8 hardening,
 # extended by M4.11's running-sibling handler and group-stop broadcast.
 #
-# GUARD-KIND: runtime (needs the built M4.8 ISO + QEMU)
+# GUARD-KIND: runtime (needs the built M4.8 ISO + QEMU, and for the build arm
+# cargo, the x86_64-unknown-none target and the kernel's X86_CC/X86_LD)
 #
 # The fixture (tools/m4_hardening_gate, a static non-PIE musl ELF) proves:
 #   - clone3(435) creates two threads through the 88-byte clone_args copy;
@@ -73,6 +74,7 @@ cleanup() {
     return "$rc"
 }
 trap cleanup EXIT
+abort() { echo "ABORT: $*" >&2; exit 2; }
 
 count_fixed() {
     local n
@@ -85,11 +87,36 @@ if [ -n "$REPLAY" ]; then
     LOG="$REPLAY"
     QERR=""
 else
+    # ── live prerequisites: absent is a skip (2), not a failure (1) ──────
+    # The static clauses above have already run, so a real regression still
+    # exits 1 before this point. run_checks.sh turns a GUARD-KIND: runtime
+    # guard's exit 2 into an owed skip instead of failing the job;
+    # kernel-guards builds the probe ISO and runs the gate. Each message names
+    # what to install or which variable to set, because the skip prints it.
     if [ "$BUILD" = "1" ]; then
-        echo "=== build: x86-iso-e3 M4_HARDENING_PROBE=1 (gate profile) ==="
+        command -v make >/dev/null 2>&1 || \
+            abort "make not found — the build arm runs 'make x86-iso-e3' (or set M4_HARDENING_BUILD=0 with a prebuilt ISO)"
+        command -v cargo >/dev/null 2>&1 || \
+            abort "cargo not found — the probe ISO cross-builds the six sidecars for x86_64-unknown-none"
+        sysroot=$(rustc --print sysroot 2>/dev/null) || sysroot=""
+        [ -n "$sysroot" ] && [ -d "$sysroot/lib/rustlib/x86_64-unknown-none" ] || \
+            abort "the x86_64-unknown-none rust-std component is not installed (rustup target add x86_64-unknown-none)"
+        cc=${X86_CC:-gcc}
+        ld=${X86_LD:-ld}
+        command -v "$cc" >/dev/null 2>&1 || \
+            abort "the kernel compiler '$cc' is not on PATH — install gcc, or set M4_HARDENING_BUILD=0 with a prebuilt ISO"
+        command -v "$ld" >/dev/null 2>&1 || \
+            abort "the kernel linker '$ld' is not on PATH — install binutils, or set M4_HARDENING_BUILD=0 with a prebuilt ISO"
+    fi
+    command -v "${QEMU%% *}" >/dev/null 2>&1 || \
+        abort "missing QEMU executable '$QEMU' — the gate checkpoints in one boot and restores in a second (install qemu-system-x86, or set M4_HARDENING_BUILD=0 after building the ISO)"
+
+    if [ "$BUILD" = "1" ]; then
+        echo "=== build: x86-iso-e3 M4_HARDENING_PROBE=1 (gate profile, X86_CC=gcc X86_LD=ld) ==="
         # Keep the probe-specific feature out of the tracked default archive:
         # this E3 pack and its stamps are a separate, disposable artifact.
-        make x86-iso-e3 E3_INIT_FEATURES=e3_envs,e7_gate \
+        make X86_CC="${X86_CC:-gcc}" X86_LD="${X86_LD:-ld}" \
+            x86-iso-e3 E3_INIT_FEATURES=e3_envs,e7_gate \
             M4_HARDENING_PROBE=1 \
             SIDECAR_E3_CPIO=sidecars_m4_hardening_e3.cpio \
             X86_E3_ISO="$ISO" || {
