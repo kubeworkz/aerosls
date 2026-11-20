@@ -3787,7 +3787,7 @@ Everything this document asserts about the tree, with its source:
 
 ## Appendix B — Named gaps, each with its destination
 
-**Register checked 2026-11-14, after M3.5.** A row's third cell says **LANDED** only when the gap is closed in the tree and the cell names the section, test and evidence that closed it. Reminders stay visible inside landed rows rather than being swept: `xsetbv`/`CR4.OSXSAVE` (§5.3), and M3's named boundary — cross-task/timer signal producers and a signal-specific live checkpoint arm — after the alt-stack/`SA_SIGINFO`/redelivery/SIGPIPE arms (§10.15). The gaps still open are the thread group and ARM64 userspace.
+**Register checked 2026-11-20, after M4.9's gate CI closure.** A row's third cell says **LANDED** only when the gap is closed in the tree and the cell names the section, test and evidence that closed it. Reminders stay visible inside landed rows rather than being swept: `xsetbv`/`CR4.OSXSAVE` (§5.3), and M3's named boundary — cross-task/timer signal producers and a signal-specific live checkpoint arm — after the alt-stack/`SA_SIGINFO`/redelivery/SIGPIPE arms (§10.15). The thread-group row is landed through M4.11 and its M4.9 gate is CI-enforced; what stays open is the larger threaded runtimes on that group (Go, threaded CPython, Node) and ARM64 userspace.
 
 | Gap | Consequence if unaddressed | Destination |
 |---|---|---|
