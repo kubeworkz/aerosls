@@ -24,27 +24,49 @@
 # data. The scan accepts only an occurrence whose 110 bytes of header are there
 # and start with the newc magic.
 #
+# `--to-stdout` writes the entry's data instead of its digest. That is for
+# callers that need the BYTES -- tests/m4_std_thread_probe_check.sh reads the
+# probe image's boot/posix.bin out of the packed archive with it. Keeping that
+# read here, on the walk the record is built from, is what leaves one parser
+# for the packer's c_namesize padding; a second reader would be a second place
+# for it to drift.
+#
 # It is an instrument, not a guarantee: a hand can run it too. What it cannot
 # do is misread the archive — the guard re-extracts the entry itself.
 #
 # Usage:  tools/sidecar_archive_entry_digest.sh ARCHIVE ENTRY
-# Exit:   0 printed, 1 no hash tool or no such entry / not a newc archive,
-#         2 usage error or archive missing/empty.
+#         tools/sidecar_archive_entry_digest.sh --to-stdout ARCHIVE ENTRY
+# Output: one line of hex, or with --to-stdout the entry's bytes verbatim.
+# Exit:   0 printed/extracted, 1 no hash tool or no such entry / not a newc
+#         archive, 2 usage error or archive missing/empty.
 set -u
 
-if [ $# -ne 2 ]; then
-    echo "usage: $0 ARCHIVE ENTRY" >&2
+to_stdout=0
+archive=""
+entry=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --to-stdout) to_stdout=1 ;;
+        -*) echo "$0: unknown option '$1'" >&2; exit 2 ;;
+        *)
+            if [ -z "$archive" ]; then archive=$1
+            elif [ -z "$entry" ]; then entry=$1
+            else echo "$0: too many operands ('$archive', '$entry', '$1')" >&2; exit 2
+            fi ;;
+    esac
+    shift
+done
+if [ -z "$archive" ] || [ -z "$entry" ]; then
+    echo "usage: $0 [--to-stdout] ARCHIVE ENTRY" >&2
     exit 2
 fi
-archive=$1
-entry=$2
 
 [ -s "$archive" ] || {
     echo "sidecar_archive_entry_digest: $archive is missing or empty — nothing to read" >&2
     exit 2
 }
 
-if ! command -v sha256sum >/dev/null 2>&1; then
+if [ "$to_stdout" = 0 ] && ! command -v sha256sum >/dev/null 2>&1; then
     echo "sidecar_archive_entry_digest: sha256sum not found (coreutils) — cannot hash the entry" >&2
     exit 1
 fi
@@ -81,4 +103,8 @@ size=$((16#$size_hex))
 # 4-byte boundary; the data starts right after. Mirrors newc.rs's writer —
 # `name_pad = align4(namesize) - namesize` — exactly.
 data_off=$((found + 110 + namesize + ((4 - (namesize % 4)) % 4)))
-tail -c +$((data_off + 1)) "$archive" | head -c "$size" | sha256sum | cut -d' ' -f1
+if [ "$to_stdout" = 1 ]; then
+    tail -c +$((data_off + 1)) "$archive" | head -c "$size"
+else
+    tail -c +$((data_off + 1)) "$archive" | head -c "$size" | sha256sum | cut -d' ' -f1
+fi

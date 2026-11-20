@@ -24,9 +24,11 @@
 # The same clause reads PROBE_RESERVE out of m4_std_thread_probe.rs and fails
 # when the gate fixture no longer fits that tail reserve -- spawn answers an
 # oversized fixture with Err(-1), a create failure with no image symptom.
-# After the build the flattened posix.bin is asserted too: it must carry the
-# gate fixture and NO aerobackup bytes, so the source-level cfg and the built
-# artifact are both checked rather than observed.
+# After the build, boot/posix.bin is read out of the cpio the ISO boots and
+# asserted: it must carry the gate fixture and NO aerobackup bytes, so the
+# source-level cfg and the shipped artifact are both checked rather than
+# observed. The flattened build output is only a fallback for a host with no
+# archive, because it can be stale or from another feature set.
 #
 # Usage:
 #   bash tests/m4_std_thread_probe_check.sh
@@ -192,7 +194,7 @@ grep -qF 'm4_std_thread_probe' user/sidecar/src/lib.rs || \
 grep -qF 'SIDECAR_M4_STD_THREAD_PROBE' Makefile || \
     fail "the Makefile has no std::thread probe feature"
 
-# ── image: the built POSIX sidecar carries the probe fixture only ─────────
+# ── image: the packed POSIX sidecar carries the probe fixture only ───────
 # The cfg clause above is about the source; this one is about the artifact.
 # include_bytes! embeds each fixture whole, so a contiguous whole-file match is
 # the exact test. The gate fixture must be there, which is the positive control
@@ -200,16 +202,34 @@ grep -qF 'SIDECAR_M4_STD_THREAD_PROBE' Makefile || \
 # vacuously), and the backup payload must not be: finding it means the build
 # embedded BOTH the 580 KiB gate fixture and the 600 KiB aerobackup payload,
 # the pre-76bd182 image that overflowed the sidecar's upper pages.
+#
+# Read boot/posix.bin out of $CPIO, the archive the ISO embeds at
+# /boot/sidecars.cpio: that is what this boot actually runs. The read goes
+# through tools/sidecar_archive_entry_digest.sh --to-stdout, the same newc walk
+# the pack record is built from, so the packer's padding convention is tracked
+# in one parser. The flattened user/target binary is only a fallback when no
+# archive is present, since with M4_STD_THREAD_BUILD=0 it can be stale or built
+# from another feature set.
 command -v python3 >/dev/null 2>&1 || {
-    echo "ABORT: python3 is required to read the built POSIX image's payload bytes" >&2
+    echo "ABORT: python3 is required to read the POSIX image's payload bytes" >&2
     exit 2
 }
-POSIX_BIN="${M4_STD_THREAD_POSIX_BIN:-$(sed -n 's/^SIDECAR_POSIX_BIN[[:space:]]*?=[[:space:]]*//p' Makefile | head -1)}"
-[ -n "$POSIX_BIN" ] || POSIX_BIN=user/target/x86_64-unknown-none/release/posix.bin
-[ -s "$POSIX_BIN" ] || \
-    fail "no built POSIX sidecar at $POSIX_BIN — the payload assertion needs the build output (keep it with M4_STD_THREAD_BUILD=0, or set M4_STD_THREAD_POSIX_BIN)"
+ENTRY_TOOL=tools/sidecar_archive_entry_digest.sh
 BACKUP_FIXTURE=user/sidecar/fixtures/aerobackup.musl.elf
 [ -f "$BACKUP_FIXTURE" ] || fail "$BACKUP_FIXTURE is missing"
+if [ -s "$CPIO" ]; then
+    POSIX_BIN="$ART/posix_from_cpio.bin"
+    extract_err=$("$ENTRY_TOOL" --to-stdout "$CPIO" boot/posix.bin 2>&1 > "$POSIX_BIN") || \
+        fail "cannot read boot/posix.bin out of $CPIO: ${extract_err:-the entry reader failed}"
+    [ -s "$POSIX_BIN" ] || fail "$CPIO:boot/posix.bin is empty"
+    POSIX_SOURCE="$CPIO:boot/posix.bin"
+else
+    POSIX_BIN="${M4_STD_THREAD_POSIX_BIN:-$(sed -n 's/^SIDECAR_POSIX_BIN[[:space:]]*?=[[:space:]]*//p' Makefile | head -1)}"
+    [ -n "$POSIX_BIN" ] || POSIX_BIN=user/target/x86_64-unknown-none/release/posix.bin
+    [ -s "$POSIX_BIN" ] || \
+        fail "no packed archive at $CPIO and no built POSIX sidecar at $POSIX_BIN — the payload assertion needs one of them (keep the build output with M4_STD_THREAD_BUILD=0, or set M4_STD_THREAD_POSIX_BIN)"
+    POSIX_SOURCE="$POSIX_BIN (fallback: no packed archive at $CPIO)"
+fi
 payload_err=$(python3 - "$POSIX_BIN" "$GATE_FIXTURE" "$BACKUP_FIXTURE" 2>&1 <<'PY'
 import sys
 posix, gate, backup = (open(p, "rb").read() for p in sys.argv[1:4])
@@ -220,7 +240,7 @@ if at >= 0:
     sys.exit(f"{sys.argv[1]} contains {sys.argv[3]} at offset {at} ({len(backup)} bytes) — this build embedded the backup fixture alongside the probe's")
 PY
 ) || fail "${payload_err:-the payload check did not run}"
-echo "image: $POSIX_BIN carries std_thread_gate.elf and no aerobackup bytes"
+echo "image: $POSIX_SOURCE carries std_thread_gate.elf and no aerobackup bytes"
 
 rm -f "$IMG"
 truncate -s 10G "$IMG" || fail "could not make the NVMe image"
