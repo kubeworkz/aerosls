@@ -705,24 +705,34 @@ jobs:
     # build-run guard passes AND every smoke proves its teeth
     # on every push.
     #
-    # A green run here is NOT coverage of every runtime gate. Eight
-    # GUARD-KIND: runtime gates exit 2 with an owed skip in this job and it
-    # passes anyway; run_checks.sh names them under "RUNTIME guards NOT RUN",
-    # but that line scrolls past, so they are named here:
+    # A green run here IS coverage of every runtime gate, with the one
+    # self-building caveat below. Ten GUARD-KIND: runtime gates still exit 2
+    # in the run_checks sweep -- no cluster exists yet, and their steps come
+    # later -- but none is owed: run_checks.sh names them under "RUNTIME
+    # guards NOT RUN", and each is run for real later in this job.
     #
-    #   * need a live cluster (eight): entropy_boot_diversity,
-    #     env_catalog_live, env_migrate_confirm_live, failover_adoption_live,
-    #     failover_2node_live, partition_ownedset_gc_live,
-    #     partition_reannounce_live and partition_reuse_pause_live.
+    #   * eight live-cluster gates run after the Phase 5 smokes and before
+    #     the probe pairs. Seven share one private 3-node cluster --
+    #     entropy_boot_diversity, env_catalog_live,
+    #     env_migrate_confirm_live, failover_adoption_live,
+    #     partition_ownedset_gc_live, partition_reannounce_live and
+    #     partition_reuse_pause_live -- through tests/run_runtime_guards.sh,
+    #     which is where the warm-up and the post-kill settles live.
+    #     failover_2node_live gets its own exactly-two-node cluster, because
+    #     it refuses any other size and leaves the leader dead.
+    #   * webapp_served runs inside the /api/health boot step, against the
+    #     instance that step just checked; env_api_identity is the last step
+    #     of this job. It exports X86_CC=gcc X86_LD=ld for its own private
+    #     3-node cluster -- run-cluster's rebuild goes through the Makefile's
+    #     X86_CC ?=, so the cross compiler this runner does not install is
+    #     not needed -- and ENV_CKPT_TEST_HOOKS=1 (an AB_DEFS define in the
+    #     build-config stamp), and pre-builds the hook kernel outside the
+    #     guard's 300 s formation window.
     #
-    # Two more also exit 2 in the sweep, but they are NOT owed: webapp_served
-    # runs inside the /api/health boot step, against the instance that step
-    # just checked; env_api_identity is the last step of this job. It exports
-    # X86_CC=gcc X86_LD=ld for its own private 3-node cluster -- run-cluster's
-    # rebuild goes through the Makefile's X86_CC ?=, so the cross compiler
-    # this runner does not install is not needed -- and ENV_CKPT_TEST_HOOKS=1
-    # (an AB_DEFS define in the build-config stamp) makes the kernel actually
-    # recompile with the stale-checkpoint arm.
+    # Step budgets are measured, not guessed: on the reference WSL host the
+    # 3-node suite took 562 s (adoption alone 344 s) after a 44 s formation,
+    # and the 2-node gate 182 s after a 57 s formation; the step timeouts are
+    # 30 and 15 minutes.
     #
     # Five more -- m2_dyn_v1_boot, m4_thread_probe, m4_group_probe,
     # m4_futex_probe and m4_exit_probe -- also exit 2 in the sweep, but they
@@ -739,8 +749,9 @@ jobs:
     # env_recycle_boot, env_shell_surface, partition_teardown_boot,
     # simi_teardown_boot, unified_boot) run inside the guard sweep, the ten
     # probe build-then-run pairs (M4.9, then M4.2, M4.3, M4.4, M4.5, M4.6,
-    # M4.7, M4.8, M5.3 and M2d) sit at the end of the job, m1_net_probe runs
-    # from the sweep against the M1 image built above, webapp_served runs
+    # M4.7, M4.8, M5.3 and M2d) sit at the end of the job with the seven-gate
+    # 3-node suite and the 2-node failover step just before them, m1_net_probe
+    # runs from the sweep against the M1 image built above, webapp_served runs
     # inside the /api/health boot step, and env_api_identity is the final
     # step.
     # m5_catalog_live_check self-builds in the sweep and is in neither list:
@@ -1224,6 +1235,106 @@ jobs:
       - name: Phase 5 boot flake guard (6 boots under tcg,thread=multi)
         run: bash tests/phase5_boot_flake_guard.sh
         working-directory: aerosls2
+
+      # ─── Live-cluster gates: seven on one 3-node cluster, one on two ─────
+      # The suite's warm-up proves a leader, a partition create and one env
+      # create per node before gate 1, and its settle re-proves them after
+      # each kill/reboot guard, because a freshly relaunched node starves the
+      # next guard's first env create. E3 is skipped: the sweep already ran it
+      # with the ISO built above, and its own 4 GB guest is the largest thing
+      # this suite would add beside three nodes. The cluster directory and
+      # ports are private, so this cannot touch a deployed cluster.
+      # Teardown is two-layered because reannounce/ownedset/adoption relaunch
+      # nodes under setsid -- those pids are NOT in cluster.pids, so --stop
+      # alone would leave them holding the ports.
+      - name: Live 3-node cluster guards (seven gates on one private cluster)
+        timeout-minutes: 30
+        working-directory: aerosls2
+        env:
+          X86_CC: gcc
+          X86_LD: ld
+          AEROSLS_RAM: 768M
+          AEROSLS_SMP: "1"
+          AEROSLS_HTTP_BASE: "31100"
+          AEROSLS_CON_BASE: "31120"
+          AEROSLS_HTTPS_BASE: "31443"
+          AEROSLS_MCAST_PORT: "31340"
+          AEROSLS_RUNTIME_SKIP: e3_multi_env_boot_check.sh
+        run: |
+          set -u
+          export AEROSLS_CLUSTER_DIR="/tmp/aerosls-ci-c3-$GITHUB_RUN_ID"
+          export AEROSLS_LOG_STAGING="/tmp/aerosls-ci-logs3-$GITHUB_RUN_ID"
+          teardown() {
+            ./run-cluster.sh --stop >/dev/null 2>&1 || true
+            for sig in TERM KILL; do
+              pids="$(pgrep -f "$AEROSLS_CLUSTER_DIR/node" 2>/dev/null || true)"
+              [ -n "$pids" ] || break
+              kill -"$sig" $pids 2>/dev/null || true
+              sleep 1
+            done
+          }
+          trap teardown EXIT INT TERM
+          ./run-cluster.sh --nodes 3 --force \
+            > "/tmp/aerosls-ci-c3-$GITHUB_RUN_ID.log" 2>&1 &
+          launch=$!
+          up=0
+          for _ in $(seq 1 150); do
+            n=0
+            for i in 1 2 3; do
+              curl -sf --max-time 2 \
+                "http://127.0.0.1:$((AEROSLS_HTTP_BASE + i))/api/health" \
+                >/dev/null 2>&1 && n=$((n + 1))
+            done
+            [ "$n" -eq 3 ] && { up=1; break; }
+            kill -0 "$launch" 2>/dev/null || break
+            sleep 2
+          done
+          if [ "$up" -ne 1 ]; then
+            echo "FAILED: 3-node cluster never answered /api/health" >&2
+            tail -80 "/tmp/aerosls-ci-c3-$GITHUB_RUN_ID.log" >&2
+            exit 1
+          fi
+          bash tests/run_runtime_guards.sh
+
+      - name: failover_2node live gate (exactly two nodes; leader left dead)
+        timeout-minutes: 15
+        working-directory: aerosls2
+        env:
+          X86_CC: gcc
+          X86_LD: ld
+          AEROSLS_RAM: 768M
+          AEROSLS_SMP: "1"
+          AEROSLS_HTTP_BASE: "31200"
+          AEROSLS_CON_BASE: "31220"
+          AEROSLS_HTTPS_BASE: "31444"
+          AEROSLS_MCAST_PORT: "31341"
+          AEROSLS_TOKEN: deadbeef01234567cafebabe76543210
+        run: |
+          set -u
+          export AEROSLS_CLUSTER_DIR="/tmp/aerosls-ci-c2-$GITHUB_RUN_ID"
+          export AEROSLS_LOG_STAGING="/tmp/aerosls-ci-logs2-$GITHUB_RUN_ID"
+          trap './run-cluster.sh --stop >/dev/null 2>&1 || true' EXIT INT TERM
+          ./run-cluster.sh --nodes 2 --force \
+            > "/tmp/aerosls-ci-c2-$GITHUB_RUN_ID.log" 2>&1 &
+          launch=$!
+          up=0
+          for _ in $(seq 1 150); do
+            n=0
+            for i in 1 2; do
+              curl -sf --max-time 2 \
+                "http://127.0.0.1:$((AEROSLS_HTTP_BASE + i))/api/health" \
+                >/dev/null 2>&1 && n=$((n + 1))
+            done
+            [ "$n" -eq 2 ] && { up=1; break; }
+            kill -0 "$launch" 2>/dev/null || break
+            sleep 2
+          done
+          if [ "$up" -ne 1 ]; then
+            echo "FAILED: 2-node cluster never answered /api/health" >&2
+            tail -80 "/tmp/aerosls-ci-c2-$GITHUB_RUN_ID.log" >&2
+            exit 1
+          fi
+          bash tests/failover_2node_live_check.sh
 
       # ─── M4.9 std::thread probe: live two-boot gate ──────────────────────
       # The gate's source clauses run in verify. Its live arms checkpoint a

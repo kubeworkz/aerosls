@@ -303,14 +303,26 @@ settle() {                                   # $1 = the guard that just ran
     echo "OK   settle after $after (leader node $leader, settle partition id $part torn down)"
 }
 
+# Optional selection for a caller that already covers one of these elsewhere:
+# kernel-guards runs e3_multi_env_boot_check in its guard sweep, and its 4 GB
+# guest is the largest thing this suite would add beside the cluster's nodes.
+if [ -n "${AEROSLS_RUNTIME_SKIP:-}" ]; then
+    kept=""
+    for g in $GUARDS; do
+        case " $AEROSLS_RUNTIME_SKIP " in *" $g "*) ;; *) kept="$kept $g" ;; esac
+    done
+    GUARDS="$kept"
+fi
+
 overall=0
 for g in $GUARDS; do
     echo "=== $g"
+    t0=$(date +%s)
     if ./tests/$g; then
-        echo "OK   $g"
+        echo "OK   $g ($(( $(date +%s) - t0 ))s)"
     else
         rc=$?
-        echo "BAD  $g (rc=$rc)"
+        echo "BAD  $g (rc=$rc, $(( $(date +%s) - t0 ))s)"
         overall=1
     fi
     # The kill-heavy four starve whoever runs NEXT, not themselves, so settle
