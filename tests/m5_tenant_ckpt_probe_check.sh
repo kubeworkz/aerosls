@@ -2,6 +2,9 @@
 # tests/m5_tenant_ckpt_probe_check.sh — M5.3's ordinary-tenant Linux
 # checkpoint/restore arm.
 #
+# GUARD-KIND: runtime (needs the built M5.3 tenant ISO, QEMU, and for the
+# build arm cargo, the x86_64-unknown-none target and the kernel's X86_CC/X86_LD)
+#
 # The tenant profile is selected at CREATE time by the `tenant-linux-ckpt`
 # profile (the harness creates it at index 4, which is deliberately not the
 # M5.2a probe-only index 3), with the M5.2a tenant manifest bit and no
@@ -54,10 +57,38 @@ cleanup() {
 }
 trap cleanup EXIT
 fail() { echo "FAIL: $*" >&2; cleanup; exit 1; }
+abort() { echo "ABORT: $*" >&2; exit 2; }
+
+# ── live prerequisites: absent is a skip (2), not a failure (1) ──────────
+# run_checks.sh turns a GUARD-KIND: runtime guard's exit 2 into an owed skip
+# instead of failing the job; kernel-guards builds the probe ISO and runs the
+# gate with M53_BUILD=0. Each message names what to install or which variable
+# to set, because the skip prints it.
+if [ "$BUILD" = "1" ]; then
+    command -v make >/dev/null 2>&1 || \
+        abort "make not found — the build arm runs 'make x86-iso-e3' (or set M53_BUILD=0 with a prebuilt ISO)"
+    command -v cargo >/dev/null 2>&1 || \
+        abort "cargo not found — the probe ISO cross-builds the six sidecars for x86_64-unknown-none"
+    sysroot=$(rustc --print sysroot 2>/dev/null) || sysroot=""
+    [ -n "$sysroot" ] && [ -d "$sysroot/lib/rustlib/x86_64-unknown-none" ] || \
+        abort "the x86_64-unknown-none rust-std component is not installed (rustup target add x86_64-unknown-none)"
+    cc=${X86_CC:-gcc}
+    ld=${X86_LD:-ld}
+    command -v "$cc" >/dev/null 2>&1 || \
+        abort "the kernel compiler '$cc' is not on PATH — install gcc, or set M53_BUILD=0 with a prebuilt ISO"
+    command -v "$ld" >/dev/null 2>&1 || \
+        abort "the kernel linker '$ld' is not on PATH — install binutils, or set M53_BUILD=0 with a prebuilt ISO"
+fi
+command -v qemu-system-x86_64 >/dev/null 2>&1 || \
+    abort "qemu-system-x86_64 not found — the gate checkpoints in one boot and restores in a second (install qemu-system-x86, or set M53_BUILD=0 after building the ISO)"
+if [ "$BUILD" != "1" ] && [ ! -f "$ROOT/$ISO" ]; then
+    abort "missing M5.3 tenant ISO '$ISO' — build it with M5_TENANT_CKPT=1 or pass M53_ISO"
+fi
 
 if [ "$BUILD" = "1" ]; then
-    echo "=== build: x86-iso-e3 E3_INIT_FEATURES=e3_envs,m5_tenant_probe,m5_tenant_ckpt M5_TENANT_CKPT=1 X86_E3_ISO=$ISO ==="
-    make x86-iso-e3 E3_INIT_FEATURES=e3_envs,m5_tenant_probe,m5_tenant_ckpt \
+    echo "=== build: x86-iso-e3 E3_INIT_FEATURES=e3_envs,m5_tenant_probe,m5_tenant_ckpt M5_TENANT_CKPT=1 (X86_CC=gcc X86_LD=ld) ==="
+    make X86_CC="${X86_CC:-gcc}" X86_LD="${X86_LD:-ld}" \
+        x86-iso-e3 E3_INIT_FEATURES=e3_envs,m5_tenant_probe,m5_tenant_ckpt \
         M5_TENANT_CKPT=1 X86_E3_ISO="$ISO" || fail "the M5.3 image did not build"
 fi
 [ -f "$ROOT/$ISO" ] || fail "no image at $ISO (M53_BUILD=0 needs a prebuilt one)"

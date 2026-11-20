@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # m4_ckpt_probe_check.sh — M4.6's live thread-group checkpoint/restore.
 #
+# GUARD-KIND: runtime (needs the built M4.6 probe ISO, QEMU, and for the build
+# arm cargo, the x86_64-unknown-none target and the kernel's X86_CC/X86_LD)
+#
 # The gate profile is the only Linux tenant whose task name is already in an
 # EnvCkptRecord. This build swaps that tenant for fixtures/m4_ckpt_probe.S:
 # the leader clones a thread, the child parks in an untimed private FUTEX_WAIT,
@@ -46,10 +49,38 @@ cleanup() {
 }
 trap cleanup EXIT
 fail() { echo "FAIL: $*" >&2; cleanup; exit 1; }
+abort() { echo "ABORT: $*" >&2; exit 2; }
+
+# ── live prerequisites: absent is a skip (2), not a failure (1) ──────────
+# run_checks.sh turns a GUARD-KIND: runtime guard's exit 2 into an owed skip
+# instead of failing the job; kernel-guards builds the probe ISO and runs the
+# gate with M4_CKPT_BUILD=0. Each message names what to install or which
+# variable to set, because the skip prints it.
+if [ "$BUILD" = "1" ]; then
+    command -v make >/dev/null 2>&1 || \
+        abort "make not found — the build arm runs 'make x86-iso-e3' (or set M4_CKPT_BUILD=0 with a prebuilt ISO)"
+    command -v cargo >/dev/null 2>&1 || \
+        abort "cargo not found — the probe ISO cross-builds the six sidecars for x86_64-unknown-none"
+    sysroot=$(rustc --print sysroot 2>/dev/null) || sysroot=""
+    [ -n "$sysroot" ] && [ -d "$sysroot/lib/rustlib/x86_64-unknown-none" ] || \
+        abort "the x86_64-unknown-none rust-std component is not installed (rustup target add x86_64-unknown-none)"
+    cc=${X86_CC:-gcc}
+    ld=${X86_LD:-ld}
+    command -v "$cc" >/dev/null 2>&1 || \
+        abort "the kernel compiler '$cc' is not on PATH — install gcc, or set M4_CKPT_BUILD=0 with a prebuilt ISO"
+    command -v "$ld" >/dev/null 2>&1 || \
+        abort "the kernel linker '$ld' is not on PATH — install binutils, or set M4_CKPT_BUILD=0 with a prebuilt ISO"
+fi
+command -v qemu-system-x86_64 >/dev/null 2>&1 || \
+    abort "qemu-system-x86_64 not found — the gate checkpoints in one boot and restores in a second (install qemu-system-x86, or set M4_CKPT_BUILD=0 after building the ISO)"
+if [ "$BUILD" != "1" ] && [ ! -f "$ROOT/$ISO" ]; then
+    abort "missing M4.6 probe ISO '$ISO' — build it with M4_CKPT_PROBE=1 or pass M4_CKPT_ISO"
+fi
 
 if [ "$BUILD" = "1" ]; then
-    echo "=== build: x86-iso-e3 E3_INIT_FEATURES=e3_envs,e7_gate,m4_ckpt_probe M4_CKPT_PROBE=1 X86_E3_ISO=$ISO ==="
-    make x86-iso-e3 E3_INIT_FEATURES=e3_envs,e7_gate,m4_ckpt_probe \
+    echo "=== build: x86-iso-e3 E3_INIT_FEATURES=e3_envs,e7_gate,m4_ckpt_probe M4_CKPT_PROBE=1 (X86_CC=gcc X86_LD=ld) ==="
+    make X86_CC="${X86_CC:-gcc}" X86_LD="${X86_LD:-ld}" \
+        x86-iso-e3 E3_INIT_FEATURES=e3_envs,e7_gate,m4_ckpt_probe \
         M4_CKPT_PROBE=1 X86_E3_ISO="$ISO" || fail "the probe image did not build"
 fi
 [ -f "$ROOT/$ISO" ] || fail "no image at $ISO (M4_CKPT_BUILD=0 needs a prebuilt one)"
