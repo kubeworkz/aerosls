@@ -243,7 +243,12 @@ pub fn create_environment_owned<K: Kernel>(
 
     // P1b: the tenant's block device stops being RAM-only here. Attach the
     // storage region under this environment's identity BEFORE anything is
-    // spawned: the kernel allocates and zeroes the store's NVMe extent,
+    // spawned: the kernel allocates and zeroes the store's NVMe extent, and
+    // zeroes the mapped frame region only for a RAM-backed store (the kernel
+    // owns that physical base; init must never dereference it — a user-mode
+    // write there faults init). A durable store's region is left for the
+    // ramdisk server's restore, so a failed restore refuses the mount instead
+    // of formatting the old filesystem away.
     // charges its occupancy to the TENANT's storage quota (a quota that
     // cannot cover it refuses the create — before a sidecar exists, before a
     // byte is placed), and stamps the extent into the descriptor at

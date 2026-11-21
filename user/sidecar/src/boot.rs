@@ -272,8 +272,19 @@ pub fn boot<K: Kernel, A: BufferAlloc>(
         // flaky read skips the probe — the mount still refuses with EInval;
         // this arm only ADDS the name). A zeroed region is the fresh-store
         // case and says nothing.
+        //
+        // Only the hardware-owning system sidecar owns a pre-seeded rootfs.
+        // A tenant environment's ramdisk is fresh frame-pool memory (possibly
+        // carrying an earlier tenant's bytes), and step 3 below deliberately
+        // formats it on first mount. Probing it would misname those stale
+        // bytes as a superblock refusal and stop the tenant before that format
+        // arm, so an environment sidecar (identity present) skips the probe.
+        let tenant_store = caps.identity.is_some();
         let mut probe = [0u8; aerosls_proto::BLOCK_SIZE as usize];
-        if cache.read_block(0, &mut probe).is_ok() && probe.iter().any(|&b| b != 0) {
+        if !tenant_store
+            && cache.read_block(0, &mut probe).is_ok()
+            && probe.iter().any(|&b| b != 0)
+        {
             if let Err(r) = aerosls_vfs::aerofs::parse_superblock_refusing(&probe) {
                 use aerosls_vfs::aerofs::SuperblockRefusal as R;
                 let name: &'static str = match r {
@@ -335,6 +346,13 @@ pub fn boot<K: Kernel, A: BufferAlloc>(
     // 4. System applets, with console stdio on fds 0,1,2.
     let mut proc = ProcManager::new(vfs);
     applets::register_default_applets(&mut proc);
+    /* Step 1's upload/spawn applets exist only for an ENVIRONMENT sidecar.
+     * The system POSIX has no BIB identity and must not gain a
+     * tenant-visible `hexwrite`/`linux` command pair. */
+    #[cfg(feature = "linux_run")]
+    if caps.identity.is_some() {
+        applets::register_env_applets(&mut proc);
+    }
     if caps.ramdisk_chan_w.is_some() {
         // Full mode: init reads /etc/init.rc and spawns children.
         proc.spawn_init(Program::new("init", applets::init));

@@ -1128,7 +1128,13 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         // bytes on the console CHAN_W. We recv from our CHAN_R and push
         // into the in-memory ConsoleIo buffer for shell stdin.
         if let Some(cr) = caps.console_chan {
-            let mut input_buf = [0u8; 256];
+            /* 4096, not the 256 this used to be: a hexwrite chunk is 481
+             * bytes (480 hex chars + newline), and k_chan_recv answers
+             * CAP_ERR_BUFSZ without consuming the message when the buffer is
+             * too small — which wedges the environment console, because this
+             * loop used to discard the Err and the kernel left the line
+             * queued forever. */
+            let mut input_buf = [0u8; 4096];
             let mut input_caps = [aerosls_proto::kabi::GrantedCap::default(); 1];
             match RealKernel.recv(cr, &mut input_buf, &mut input_caps) {
                 Ok(rr) if rr.kind == aerosls_proto::CH_KIND_MSG && rr.len > 0 => {
@@ -1168,6 +1174,23 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                     }
                 }
             }
+        }
+        /* Step 1: run the tenant's pending `linux run` spawn. This is before
+         * linux::service so a child created here has its first forward
+         * answered in the same pass. Only an environment sidecar has the
+         * applets that can post a request; the system POSIX never does. The
+         * HEAP tail is passed, not assumed: the spawner refuses unless the
+         * bump cursor still leaves RESERVE + one page below the budget end. */
+        #[cfg(feature = "linux_run")]
+        if caps.identity.is_some() {
+            let heap_remaining = unsafe { HEAP.remaining() };
+            crate::linux_run::poll(
+                &RealKernel,
+                &mut booted.proc.vfs,
+                caps.budget_base,
+                caps.budget_len,
+                heap_remaining,
+            );
         }
         // E7 increment 3: answer any Linux-personality child's forwarded
         // syscalls (its channel was registered by the spawn path via

@@ -71,6 +71,8 @@ pub mod m2a_interp;
 pub mod m2_dyn;
 pub mod heap;
 pub mod linux;
+#[cfg(feature = "linux_run")]
+pub mod linux_run;
 #[cfg(feature = "m1_net_probe")]
 pub mod m1_net_probe;
 #[cfg(feature = "m4_thread_probe")]

@@ -49,6 +49,18 @@ static void es_memset(void* dst, uint8_t v, uint32_t n) {
     for (uint32_t i = 0; i < n; i++) d[i] = v;
 }
 
+/* Zero a RAM-backed store's mapped frame region. The kernel owns this
+ * physical base — restore/write dereference it directly — so a fresh store
+ * starts as an empty device instead of whatever the frame pool recycled.
+ * This is ONLY for a store with no durable image to restore: zeroing a
+ * durable store's region would make a failed restore look like a fresh
+ * device, and the mount would format the old filesystem away. init must not
+ * do this either: alloc_region_in returns the kernel-side base, not an init
+ * mapping, and a user-mode write there faults init. */
+static void es_zero_store(uint64_t base, uint64_t bytes) {
+    es_memset((void*)(uintptr_t)base, 0, (uint32_t)bytes);
+}
+
 static int es_io_ready(void) {
     /* Same posture stream.c's own skip rule has: without an I/O queue
      * (NVMe MMIO above 4 GiB, host tests) there is no device to talk to. */
@@ -194,6 +206,13 @@ uint64_t env_storage_attach(uint32_t partition_id, uint32_t index,
         }
         e->region_base  = region_base;
         e->region_bytes = (uint32_t)region_bytes;
+        /* Only a RAM-backed entry has no durable image to restore. A durable
+         * reattach keeps the region untouched: the ramdisk server's restore
+         * must load the old filesystem into it, and if that restore fails the
+         * mount has to see the stale bytes and refuse — not a zeroed device it
+         * will happily format over, erasing the store on the next write. */
+        if (!(e->flags & ENV_STORAGE_F_DURABLE))
+            es_zero_store(region_base, region_bytes);
         es_mark_pending();
         kernel_serial_printf(
             "[ENV-STORAGE] attach partition=%u index=%u base=%llu bytes=%llu "
@@ -240,6 +259,9 @@ uint64_t env_storage_attach(uint32_t partition_id, uint32_t index,
         ne->charged_pages = 0;
         ne->extent_slot  = -1;
         ne->flags        = ENV_STORAGE_F_VALID;
+        /* No device, no durable image: this is the RAM-backed contract, and
+         * the fresh region must start zeroed so the mount can format it. */
+        es_zero_store(region_base, region_bytes);
         es_boot_charged[s] = 1;   /* 0 pages charged: nothing to re-charge */
         es_mark_pending();
         kernel_serial_printf(
@@ -300,8 +322,10 @@ uint64_t env_storage_restore(uint64_t region_base) {
         return ENV_STORAGE_OK;
     }
     if (!(e->flags & ENV_STORAGE_F_DURABLE) || !es_io_ready()) {
-        /* RAM-backed by design (the §5 `ram-backed` tooth's shape): the
-         * region's bytes start where the frame pool left them. */
+        /* No extent to load. A new or re-attached RAM-backed store was zeroed
+         * at attach; a durable entry whose device is absent this boot keeps
+         * the frame pool's bytes deliberately, so its mount refuses instead of
+         * formatting the old store away. */
         kernel_serial_printf(
             "[ENV-STORAGE] restore slot=%ld: RAM-backed, nothing to load\n",
             (long)e->extent_slot);

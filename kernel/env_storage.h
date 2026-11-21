@@ -21,7 +21,12 @@
  *   - init ATTACHes the region when an environment is created, before the
  *     ramdisk server is spawned. The kernel records the region under the
  *     environment's identity (partition_id, index), allocates a 1 MiB NVMe
- *     extent for it from a fixed band, and zeroes the extent once.
+ *     extent for it from a fixed band, and zeroes the extent once. A
+ *     RAM-backed store (no I/O queue) also gets its mapped frame region
+ *     zeroed at attach. A durable store's region is deliberately left alone:
+ *     its restore must load the old filesystem, and a failed restore has to
+ *     leave stale bytes the mount refuses rather than a zeroed store it would
+ *     format over.
  *   - the ramdisk server RESTOREs at its RD_INFO handshake: the extent's
  *     bytes are read back into the frame region, so a rebooted environment
  *     mounts the filesystem it wrote before the reboot.

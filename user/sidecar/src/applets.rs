@@ -6236,6 +6236,284 @@ fn catalog_usage() -> &'static str {
     "usage: catalog info | list [page] [page_size] | stat NAME | read NAME KEY\n  sql [--page N] [--limit N] <SELECT statement>\n  exec <INSERT|UPDATE|DELETE statement>\n    text literals: write \\'text\\' (the env shell strips bare quotes)\n"
 }
 
+/* ── step 1: tenant VFS-loaded Linux ─────────────────────────────────────
+ *
+ * `hexwrite PATH SIZE` is the upload transport: it opens the file, prints
+ * HEXWRITE-READY, then consumes hex digits from stdin and writes one binary
+ * chunk per 240 bytes (480 hex characters — under the kernel's 512-byte
+ * console line cap), acking each full chunk with HEX-OK. The shell reads the
+ * console in 16-byte pieces and buffers ahead, so the applet's READY line is
+ * what tells a caller its first hex line will be consumed by this program and
+ * not by the shell. `linux run PATH` posts the static spawn request and parks
+ * until the event loop's spawner has a result; both applets are registered
+ * only for an environment sidecar (see boot.rs). */
+#[cfg(feature = "linux_run")]
+const HEXWRITE_HDR: usize = 15;
+#[cfg(feature = "linux_run")]
+const HEXWRITE_MAX_CHUNK: usize = 240;
+
+#[cfg(feature = "linux_run")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HexErr {
+    Bad,
+    Console,
+    Io,
+}
+
+#[cfg(feature = "linux_run")]
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "linux_run")]
+fn hex_get16(v: &[u8], off: usize) -> u16 {
+    u16::from_le_bytes([v[off], v[off + 1]])
+}
+
+#[cfg(feature = "linux_run")]
+fn hex_put16(v: &mut [u8], off: usize, x: u16) {
+    v[off..off + 2].copy_from_slice(&x.to_le_bytes());
+}
+
+#[cfg(feature = "linux_run")]
+fn hex_get32(v: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes([v[off], v[off + 1], v[off + 2], v[off + 3]])
+}
+
+#[cfg(feature = "linux_run")]
+fn hex_put32(v: &mut [u8], off: usize, x: u32) {
+    v[off..off + 4].copy_from_slice(&x.to_le_bytes());
+}
+
+/// Write the whole buffer, retrying a short write at its new offset. Used for
+/// both the file (fd passed in) and the applet's stdout (fd 1).
+#[cfg(feature = "linux_run")]
+fn hex_write<K: Kernel, A: BufferAlloc>(
+    ctx: &mut Ctx<'_, K, A>,
+    fd: u32,
+    data: &[u8],
+) -> Result<(), ()> {
+    let task = ctx.task;
+    let mut off = 0usize;
+    while off < data.len() {
+        match ctx.vfs().write(task, fd, &data[off..]) {
+            Ok(0) => return Err(()),
+            Ok(n) => off += n,
+            Err(_) => return Err(()),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "linux_run")]
+fn hex_fail<K: Kernel, A: BufferAlloc>(
+    ctx: &mut Ctx<'_, K, A>,
+    task: u32,
+    fd: Option<u32>,
+    msg: &[u8],
+) -> Step {
+    if let Some(fd) = fd {
+        ctx.vfs().close(task, fd).ok();
+    }
+    let _ = hex_write(ctx, 1, msg);
+    Step::Exit(1)
+}
+
+#[cfg(feature = "linux_run")]
+fn hex_save<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>, written: u32, line_len: usize, nibble: u8) {
+    hex_put32(&mut ctx.data, 8, written);
+    hex_put16(&mut ctx.data, 12, line_len as u16);
+    ctx.data[14] = nibble;
+}
+
+#[cfg(feature = "linux_run")]
+pub fn hexwrite<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
+    let task = ctx.task;
+    if ctx.data.is_empty() {
+        let path = match ctx.argv().get(1) {
+            Some(p) => p.clone(),
+            None => return hex_fail(ctx, task, None, b"usage: hexwrite PATH SIZE\n"),
+        };
+        let target: u32 = match ctx.argv().get(2).and_then(|s| s.parse().ok()) {
+            Some(n) if n > 0 => n,
+            _ => return hex_fail(ctx, task, None, b"usage: hexwrite PATH SIZE\n"),
+        };
+        if target as u64 > crate::linux_run::MAX_IMAGE {
+            return hex_fail(ctx, task, None, b"HEXWRITE-ERR target too large\n");
+        }
+        let fd = match ctx.vfs().open(
+            task,
+            &path,
+            O_CREAT | O_WRONLY | O_TRUNC,
+            0o755,
+        ) {
+            Ok(fd) => fd,
+            Err(_) => return hex_fail(ctx, task, None, b"HEXWRITE-ERR open\n"),
+        };
+        ctx.data.extend_from_slice(&[0u8; HEXWRITE_HDR]);
+        hex_put32(&mut ctx.data, 0, fd);
+        hex_put32(&mut ctx.data, 4, target);
+        hex_put32(&mut ctx.data, 8, 0);
+        hex_put16(&mut ctx.data, 12, 0);
+        ctx.data[14] = 0xFF; /* no pending high nibble */
+        if hex_write(ctx, 1, b"HEXWRITE-READY\n").is_err() {
+            return hex_fail(ctx, task, Some(fd), b"HEXWRITE-ERR console\n");
+        }
+        return Step::Yield;
+    }
+
+    let fd = hex_get32(&ctx.data, 0);
+    let target = hex_get32(&ctx.data, 4);
+    let mut written = hex_get32(&ctx.data, 8);
+    let mut line_len = hex_get16(&ctx.data, 12) as usize;
+    let mut nibble = ctx.data[14];
+
+    let outcome: Result<(), HexErr> = 'read: loop {
+        let mut buf = [0u8; 16];
+        match ctx.read_blocking(0, &mut buf) {
+            ReadBlock::Data(0) => break 'read Err(HexErr::Console),
+            ReadBlock::Data(n) => {
+                let mut i = 0usize;
+                while i < n && written < target {
+                    let b = buf[i];
+                    i += 1;
+                    if b == b'\n' || b == b'\r' || b == b' ' || b == b'\t' {
+                        if line_len > 0 {
+                            let mut chunk = [0u8; HEXWRITE_MAX_CHUNK];
+                            chunk[..line_len]
+                                .copy_from_slice(&ctx.data[HEXWRITE_HDR..HEXWRITE_HDR + line_len]);
+                            if hex_write(ctx, fd, &chunk[..line_len]).is_err() {
+                                break 'read Err(HexErr::Io);
+                            }
+                            ctx.data.truncate(HEXWRITE_HDR);
+                            written = written.saturating_add(line_len as u32);
+                            line_len = 0;
+                            if hex_write(ctx, 1, b"HEX-OK\n").is_err() {
+                                break 'read Err(HexErr::Console);
+                            }
+                        }
+                        continue;
+                    }
+                    let Some(d) = hex_nibble(b) else {
+                        break 'read Err(HexErr::Bad);
+                    };
+                    if nibble == 0xFF {
+                        nibble = d;
+                    } else {
+                        let byte = (nibble << 4) | d;
+                        nibble = 0xFF;
+                        ctx.data.push(byte);
+                        line_len += 1;
+                        if line_len == HEXWRITE_MAX_CHUNK {
+                            let mut chunk = [0u8; HEXWRITE_MAX_CHUNK];
+                            chunk[..line_len].copy_from_slice(&ctx.data[HEXWRITE_HDR..HEXWRITE_HDR + line_len]);
+                            if hex_write(ctx, fd, &chunk[..line_len]).is_err() {
+                                break 'read Err(HexErr::Io);
+                            }
+                            ctx.data.truncate(HEXWRITE_HDR);
+                            written = written.saturating_add(line_len as u32);
+                            line_len = 0;
+                            if hex_write(ctx, 1, b"HEX-OK\n").is_err() {
+                                break 'read Err(HexErr::Console);
+                            }
+                        }
+                    }
+                }
+                if written >= target {
+                    break 'read Ok(());
+                }
+            }
+            ReadBlock::WouldBlock => {
+                hex_save(ctx, written, line_len, nibble);
+                return Step::Blocked(BlockReason::Readable(0));
+            }
+            ReadBlock::Err(_) => break 'read Err(HexErr::Io),
+        }
+    };
+
+    match outcome {
+        Ok(()) => {
+            let _ = hex_write(ctx, 1, b"HEXWRITE-OK\n");
+            ctx.vfs().close(task, fd).ok();
+            Step::Exit(0)
+        }
+        Err(HexErr::Bad) => hex_fail(ctx, task, Some(fd), b"HEXWRITE-ERR bad hex\n"),
+        Err(HexErr::Console) => hex_fail(ctx, task, Some(fd), b"HEXWRITE-ERR console\n"),
+        Err(HexErr::Io) => hex_fail(ctx, task, Some(fd), b"HEXWRITE-ERR file write\n"),
+    }
+}
+
+#[cfg(feature = "linux_run")]
+fn linux_err(rc: i32) -> String {
+    match rc {
+        -5 => "LINUX-RUN-ERR missing payload\n".into(),
+        -6 => "LINUX-RUN-ERR payload too large\n".into(),
+        -7 => "LINUX-RUN-ERR payload read failed\n".into(),
+        crate::linux_run::ERR_DYNAMIC => "LINUX-RUN-ERR PT_INTERP requires a static ET_EXEC\n".into(),
+        crate::linux_run::ERR_NOT_STATIC => "LINUX-RUN-ERR not a static ET_EXEC\n".into(),
+        crate::linux_run::ERR_EMPTY => "LINUX-RUN-ERR empty payload\n".into(),
+        crate::linux_run::ERR_TAIL => "LINUX-RUN-ERR heap tail exhausted\n".into(),
+        crate::linux_run::ERR_BUDGET => "LINUX-RUN-ERR budget tail unavailable\n".into(),
+        crate::linux_run::ERR_VFS => "LINUX-RUN-ERR VFS task allocation failed\n".into(),
+        crate::linux_run::ERR_TRACK => "LINUX-RUN-ERR linux track failed\n".into(),
+        crate::linux_run::ERR_PATH => "LINUX-RUN-ERR path invalid\n".into(),
+        crate::linux_run::ERR_ALREADY => "LINUX-RUN-ERR already-run\n".into(),
+        crate::linux_run::ERR_BUSY => "LINUX-RUN-ERR busy\n".into(),
+        _ => alloc::format!("LINUX-RUN-ERR spawn failed {}\n", rc),
+    }
+}
+
+#[cfg(feature = "linux_run")]
+pub fn linux<K: Kernel, A: BufferAlloc>(ctx: &mut Ctx<'_, K, A>) -> Step {
+    if ctx.data.is_empty() {
+        let path = if ctx.argv().get(1).map(|s| s.as_str()) == Some("run") {
+            ctx.argv().get(2).cloned()
+        } else {
+            None
+        };
+        let Some(path) = path else {
+            let _ = hex_write(ctx, 1, b"usage: linux run PATH\n");
+            return Step::Exit(2);
+        };
+        match crate::linux_run::request(&path) {
+            Ok(()) => {
+                let _ = hex_write(ctx, 1, b"LINUX-RUN-REQUEST\n");
+                ctx.data.push(0);
+                Step::Yield
+            }
+            Err(rc) => {
+                let msg = linux_err(rc);
+                let _ = hex_write(ctx, 1, msg.as_bytes());
+                Step::Exit(1)
+            }
+        }
+    } else {
+        match crate::linux_run::result() {
+            None => Step::Yield,
+            Some(0) => {
+                let _ = hex_write(ctx, 1, b"LINUX-RUN-OK checkpoint=none\n");
+                Step::Exit(0)
+            }
+            Some(rc) => {
+                let msg = linux_err(rc);
+                let _ = hex_write(ctx, 1, msg.as_bytes());
+                Step::Exit(1)
+            }
+        }
+    }
+}
+
+#[cfg(feature = "linux_run")]
+pub fn register_env_applets<K: Kernel, A: BufferAlloc>(pm: &mut ProcManager<K, A>) {
+    pm.register_applet("hexwrite", hexwrite);
+    pm.register_applet("linux", linux);
+}
+
 pub fn register_default_applets<K: Kernel, A: BufferAlloc>(pm: &mut ProcManager<K, A>) {
     pm.register_applet("init", init);
     pm.register_applet("catalog", catalog);

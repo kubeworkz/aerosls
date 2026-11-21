@@ -997,6 +997,13 @@ jobs:
         run: make X86_CC=gcc X86_LD=ld x86-iso-e3 M1_NET_PROBE=1 M1_TOOTH=bypass-connect X86_E3_ISO=sls_operating_system_m1net_tooth.iso
         working-directory: aerosls2
 
+      # Step 1's tenant VFS-loaded ELF gate boots an ordinary E3 tenant whose
+      # sidecar carries `linux_run`. Build it before the guard sweep so
+      # tests/linux_run_check.sh runs live instead of reporting an owed skip.
+      - name: Build the tenant linux-run step-1 ISO
+        run: make X86_CC=gcc X86_LD=ld x86-iso-e3 LINUX_RUN=1 M5_CATALOG_PROBE=1 E3_INIT_FEATURES=e3_envs,m5_tenant_probe SIDECAR_E3_CPIO=sidecars_linux_run.cpio X86_E3_ISO=sls_linux_run.iso
+        working-directory: aerosls2
+
       - name: Run all guards with --require-all (every build-run guard must pass)
         run: bash tests/run_checks.sh --require-all
         working-directory: aerosls2

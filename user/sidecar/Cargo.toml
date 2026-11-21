@@ -96,3 +96,9 @@ m5_catalog_probe = []
 # `m4_ckpt_probe` so the fixture module is available, but the gate profile is
 # not selected. Off by default.
 m5_tenant_ckpt = ["m4_ckpt_probe"]
+# Step 1 of the ordinary-tenant Linux path: `hexwrite` + `linux run` and the
+# VFS-loaded static ELF spawner. Enabled only by the E3 tenant image with
+# `make x86-iso-e3 LINUX_RUN=1`; the applets are registered only for an
+# environment sidecar (BIB identity present), never the system POSIX. Off by
+# default, and it does not imply any checkpoint/profile feature.
+linux_run = []
