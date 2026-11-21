@@ -163,6 +163,12 @@ static void wipe_usage(uint32_t partition_id) {
     if (u) storage_page_release(partition_id, u);
 }
 
+static int all_bytes(const uint8_t* p, uint8_t v, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++)
+        if (p[i] != v) return 0;
+    return 1;
+}
+
 int main(void) {
     /* ── 1. attach: durable, zeroed, recorded ─────────────────────────────── */
     /* Pre-dirty slot 0 so "zeroed" means something. */
@@ -176,19 +182,13 @@ int main(void) {
               ENV_STORAGE_OK,
           "attach records a new store for (partition 1, index 0)");
 
-    int new_untouched = 1;
-    for (uint32_t i = 0; i < ENV_STORAGE_EXTENT_BYTES; i++) {
-        if (region_a[i] != 0x5C) { new_untouched = 0; break; }
-    }
-    CHECK(new_untouched,
+    CHECK(all_bytes(region_a, 0x5C, ENV_STORAGE_EXTENT_BYTES),
           "a durable new create leaves its region untouched (RAM-backed-only "
           "zeroing)");
 
-    int dirty = 0;
-    for (uint64_t i = 0; i < ENV_STORAGE_EXTENT_BYTES; i++)
-        if (es_disk[i] != 0) { dirty = 1; break; }
-    CHECK(!dirty, "the recycled extent slot was zeroed before first use "
-                  "(no previous tenant's bytes survive)");
+    CHECK(all_bytes(es_disk, 0, ENV_STORAGE_EXTENT_BYTES),
+          "the recycled extent slot was zeroed before first use "
+          "(no previous tenant's bytes survive)");
     CHECK(env_storage_owner(BASE_A) == 1, "owner() names the store's partition");
     CHECK(g_persist_calls >= 1, "attach persisted the directory");
 
@@ -227,11 +227,7 @@ int main(void) {
     g_fail_read_pages = 1;
     CHECK(env_storage_restore(BASE_B) == ENV_STORAGE_ERR_IO,
           "a durable restore reports the device error");
-    int untouched = 1;
-    for (uint32_t i = 0; i < ENV_STORAGE_EXTENT_BYTES; i++) {
-        if (region_b[i] != 0xA5) { untouched = 0; break; }
-    }
-    CHECK(untouched,
+    CHECK(all_bytes(region_b, 0xA5, ENV_STORAGE_EXTENT_BYTES),
           "a failed durable restore leaves the region untouched (no zeroed "
           "store for mount_aerofs_or_format to format over)");
     g_fail_read_pages = 0;
