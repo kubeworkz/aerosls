@@ -380,7 +380,7 @@ tooth fd-copy-detached M2 "the copy call is gone — no bytes ever attach" "$W/t
 # M2: the clamp dropped from the description — header, payload and the rax
 # the task will read become three different truths.
 seed "$W/t27"
-sed -i 's/if (plan.len) largs\[2\] = plan.len;//' "$W/t27/kernel/syscall_dispatch.c"
+sed -i 's/if (num == LINUX_WRITE && plan.len) largs\[2\] = plan.len;//' "$W/t27/kernel/syscall_dispatch.c"
 tooth fd-clamp-dropped M2 "args[2] no longer carries the clamp" "$W/t27"
 
 # M3: the send hard-codes 72 — the attached bytes exist everywhere in the
