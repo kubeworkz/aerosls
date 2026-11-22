@@ -379,6 +379,46 @@ OUT="$(cd "$T" && env -u DISPLAY -u WAYLAND_DISPLAY AEROSLS_HOST_MEM_MB=64000 \
       AEROSLS_HOST_DISK_MB=109000 timeout 20 ./run-cluster.sh --nodes 1 --ram 2G --dry-run 2>&1)"
 check "$(has '2048 MiB / 1 vCPU' "$OUT")" "2G is read as 2048 MiB"
 
+# ═══ 9b: the sidecar boot image must fit in guest RAM ═══════════════════
+# The span is read from the real archive's boot/layout, so the arm uses the
+# actual boundary rather than a number that would rot when a binary grows.
+# Below it, the copies land in unbacked physical memory and init faults at
+# ring-3 entry; at it, the same dry-run proceeds.
+echo
+echo "-- 9b: the sidecar window --"
+cp "$ROOT/sidecars.cpio" "$T/sidecars.cpio"
+mkdir -p "$T/tools"
+cp "$ROOT/tools/sidecar_boot_span.sh" "$T/tools/"
+# bash, not the shebang: a 644 checkout must still read the archive.
+SPAN="$(bash "$T/tools/sidecar_boot_span.sh" "$T/sidecars.cpio")"
+span_base="${SPAN%% *}"; span_end="${SPAN##* }"
+FLOOR_MB=$(( (span_end + 1048575) / 1048576 ))
+
+OUT="$(run timeout 20 ./run-cluster.sh --nodes 1 --ram $((FLOOR_MB - 1))M --dry-run)"; RC=$?
+check "$(has 'below the sidecar boot image' "$OUT")" \
+      "*** a --ram ending inside the sidecar span is REFUSED ***"
+check "$(has 'unbacked physical memory' "$OUT")" \
+      "...and says where the images would land"
+check "$(has 'boot loop, not a build error' "$OUT")" \
+      "*** ...distinguishing it from a code fault ***"
+check "$(has "Use --ram ${FLOOR_MB}M" "$OUT")" \
+      "...naming the smallest size that works"
+check "$([ "$RC" -ne 0 ] && echo yes || echo no)" "exits non-zero"
+
+OUT="$(run timeout 20 ./run-cluster.sh --nodes 1 --ram ${FLOOR_MB}M --dry-run)"; RC=$?
+check "$(has 'nodes            1' "$OUT")" \
+      "*** the computed floor itself is accepted ***"
+check "$([ "$RC" -eq 0 ] && echo yes || echo no)" "exits zero"
+
+# Fail closed: an archive without a readable layout must not be sized by
+# guesswork. This is the same shape as a truncated hand-edited archive.
+printf 'not a newc archive' > "$T/sidecars.cpio"
+OUT="$(run timeout 20 ./run-cluster.sh --nodes 1 --ram 1G --dry-run)"; RC=$?
+check "$(has "cannot read the sidecar boot image" "$OUT")" \
+      "*** an archive without boot/layout is refused, not guessed at ***"
+check "$([ "$RC" -ne 0 ] && echo yes || echo no)" "exits non-zero"
+rm -f "$T/sidecars.cpio"; rm -rf "$T/tools"
+
 # ═══ 10: inherited from run_two_nodes_harness.sh ═════════════════════════
 # That harness is retired (run-two-nodes.sh with it), so its checks that
 # had no equivalent here move rather than disappear. Retiring a script by

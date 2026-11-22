@@ -345,6 +345,45 @@ if [ "$RAM_MB" -lt "$RAM_FLOOR_MB" ]; then
     exit 1
 fi
 
+# ─── The sidecar window is part of the guest's RAM ─────────────────────
+# kernel/boot_image.c does not relocate the sidecars: it reserves the span
+# [base, base + total) and copies every image to the physical address baked
+# into the archive's manifests. The base is 512 MiB (BOOT_IMAGE_BASE_PHYS),
+# so a guest whose RAM ends inside the span copies the sidecars into
+# unbacked physical memory. That does not fail cleanly: init starts at an
+# address no page backs and faults at ring-3 entry, and the kernel answers
+# by restarting the boot — a reboot loop that reads as a code bug. Measured
+# 2026-11-09: `--nodes 3 --ram 512M` gave 27 init deaths per node and no
+# HTTP server; 768M booted the same archive.
+#
+# The span is a property of the ARCHIVE (binary sizes move it), so read it
+# from boot/layout rather than guessing. A missing table is refused: this
+# check must not pass by not looking.
+if [ -s sidecars.cpio ]; then
+    # Through bash, not the shebang: a Windows checkout can drop the
+    # executable bit, and this check must run rather than skip.
+    if ! span="$(bash tools/sidecar_boot_span.sh sidecars.cpio)"; then
+        echo "error: cannot read the sidecar boot image's span from sidecars.cpio." >&2
+        echo "       The archive is present but has no readable boot/layout, so the" >&2
+        echo "       guest RAM that must back the sidecar region cannot be checked." >&2
+        echo "       Re-pack it from this tree, then retry:" >&2
+        echo "           make selfhost-bootimage && make x86-iso" >&2
+        exit 1
+    fi
+    span_base="${span%% *}"
+    span_end="${span##* }"
+    span_floor_mb=$(( (span_end + 1048575) / 1048576 ))
+    if [ "$RAM_MB" -lt "$span_floor_mb" ]; then
+        printf 'error: --ram %sM is below the sidecar boot image.\n' "$RAM_MB" >&2
+        printf '       The archive reserves [0x%x, 0x%x), so a %sM guest ends at 0x%x.\n' \
+               "$span_base" "$span_end" "$RAM_MB" "$((RAM_MB * 1048576))" >&2
+        echo "       The images would be copied into unbacked physical memory and init" >&2
+        echo "       would die at ring-3 entry: a boot loop, not a build error." >&2
+        echo "       Use --ram ${span_floor_mb}M or more." >&2
+        exit 1
+    fi
+fi
+
 # ─── The bounds ────────────────────────────────────────────────────────
 # RAM, disk and the roster cap are HARD. CPU is ADVISORY, and that
 # distinction is the whole point of the model.
