@@ -14,6 +14,12 @@
 #     SA_RESTORER|SA_ONSTACK|SA_RESTART|SA_SIGINFO flags; queries return the
 #     old action.
 #
+# The artifact's source-sha256 line is not taken on trust: the guard hashes the
+# committed fixture (tools/go_thread_gate/main.go and go.mod) and requires the
+# two to agree. A fixture edit that was not re-measured leaves every shape
+# clause reading a stale contract, and this is the one check that catches it
+# without Go or strace.
+#
 # It also pins the current tree's reconciliation: the four netpoll rows exist,
 # the sidecar's record-only arm and netpoll unit test are present, and each of
 # the six TG-1 rows (clone/futex/gettid/getpid/exit/openat) is either still an
@@ -24,6 +30,7 @@
 #
 # Run:  bash tests/go_thread_gate_args_check.sh
 #       GO_THREAD_GATE_ARGS_ARTIFACT=<path> to test a mutated artifact.
+#       GO_THREAD_GATE_FIXTURE=<dir> to test a drifted fixture tree.
 # Exit: 0 pass, 1 violated, 2 the artifact is missing.
 set -uo pipefail
 
@@ -31,6 +38,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT" || exit 2
 
 ART="${GO_THREAD_GATE_ARGS_ARTIFACT:-tools/go_thread_gate_args_census.txt}"
+SRC="${GO_THREAD_GATE_FIXTURE:-tools/go_thread_gate}"
 TABLE=kernel/linux_abi.c
 LRS=user/sidecar/src/linux.rs
 DOC=docs/AeroSLS-E7-Thread-Group-Gate-v0.1.md
@@ -55,6 +63,19 @@ grep -q '^# generated-by: tools/go_thread_gate_census.sh' "$ART" \
 grep -q '^# source-sha256: main.go=d25479aefc54378ae09a6da62e69eb77329f4acd51404d12dc5d68008ce6c6e9 go.mod=47b4f13c9c258c87c8e51e97c78239391dfb248fb1f16c92e84658fdd24f7300' "$ART" \
     && ok "artifact pins the fixture source hashes" \
     || bad "artifact is missing the measured fixture source hashes"
+
+# The pin is only meaningful while the tree still holds the fixture it names.
+art_source_sha="$(sed -n 's/^# source-sha256: //p' "$ART")"
+if ! command -v sha256sum >/dev/null 2>&1; then
+    bad "sha256sum is required to compare the fixture sources with the artifact"
+elif [ ! -f "$SRC/main.go" ] || [ ! -f "$SRC/go.mod" ]; then
+    bad "the fixture sources named by the artifact are missing from $SRC"
+else
+    tree_source_sha="main.go=$(sha256sum "$SRC/main.go" | awk '{print $1}') go.mod=$(sha256sum "$SRC/go.mod" | awk '{print $1}')"
+    [ "$tree_source_sha" = "$art_source_sha" ] \
+        && ok "the fixture sources still hash to the artifact's source-sha256" \
+        || bad "fixture/artifact drift: artifact pins '$art_source_sha' but the tree hashes to '$tree_source_sha'"
+fi
 grep -q '^# toolchain: go version go1.25.1 ' "$ART" \
     && ok "artifact is pinned to Go 1.25.1" \
     || bad "artifact is not pinned to Go 1.25.1"
