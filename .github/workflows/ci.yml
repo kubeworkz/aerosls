@@ -264,8 +264,12 @@ jobs:
       # invisible because the build-host job (kernel-guards) died at its
       # build step before reaching its smokes. run_source_smokes.sh keeps
       # the source-only set green on its own, and fails any smoke that
-      # cannot run without being on its build-needed exclusion list.
-      - name: Source-only guard teeth (all smokes that need no build)
+      # cannot run without being on its build-needed exclusion list. It
+      # also appends tests/run_cluster_harness.sh — the source-only
+      # launcher harness (stub qemu/make/grub, no build) — so the
+      # launcher's arms, including the sidecar RAM floor, run on every
+      # push instead of only on a build host.
+      - name: Source-only guard teeth (smokes + launcher harness)
         run: bash tests/run_source_smokes.sh
         working-directory: aerosls2
 
