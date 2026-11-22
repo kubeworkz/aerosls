@@ -107,7 +107,9 @@ int32_t cap_code_from_linux_errno(int32_t linux_errno)
 }
 
 /* ─── The syscall classification table (§5.6) ──────────────────────────────
- * Built FROM tools/linux_syscall_census.txt: 27 rows, sorted by number.
+ * Built FROM tools/linux_syscall_census.txt: 27 rows, plus the four
+ * epoll/eventfd rows the Go gate's census requires
+ * (tools/go_thread_gate_census.txt — TG-0); sorted by number.
  * The class names where the semantics live, per §5.6's destination table;
  * the flag pins §5.4's W^X refusal against the census's own mprotect row.
  *
@@ -130,7 +132,7 @@ const struct LinuxSyscallEntry linux_syscall_table[] = {
     {  10, LSC_MEM,    LSC_F_REFUSES_WX }, /* mprotect — W|X refused (§5.4) */
     {  11, LSC_MEM,    0 },   /* munmap */
     {  12, LSC_MEM,    0 },   /* brk — §5.4 bump pointer in the budget */
-    {  13, LSC_SIG,    0 },   /* rt_sigaction — recorded; handler installs refused */
+    {  13, LSC_SIG,    0 },   /* rt_sigaction — the whole act recorded; a handler is never invoked */
     {  14, LSC_SIG,    0 },   /* rt_sigprocmask — recorded; unblock delivers (step 2) */
     {  59, LSC_SPAWN,  0 },   /* execve — the spawn path */
     {  72, LSC_FD,     0 },   /* fcntl */
@@ -145,6 +147,14 @@ const struct LinuxSyscallEntry linux_syscall_table[] = {
     { 218, LSC_LOCAL,  0 },   /* set_tid_address — single-threaded: stored and ignored */
     { 228, LSC_LOCAL,  0 },   /* clock_gettime — vDSO-backstopped (§5.5): a real trap here */
     { 231, LSC_EXIT,   0 },   /* exit_group — the sidecar reaps, frames return */
+    /* The Go gate's netpoll startup (TG-0): all four are required-by-runtime
+     * rows, and the sidecar records the descriptors and epoll membership
+     * with no event source behind them — epoll_pwait's zero-timeout probe
+     * answers 0, a blocking wait is refused by name (linux.rs answer_event). */
+    { 233, LSC_FD,     0 },   /* epoll_ctl */
+    { 281, LSC_FD,     0 },   /* epoll_pwait — zero-timeout probe only */
+    { 290, LSC_FD,     0 },   /* eventfd2 */
+    { 291, LSC_FD,     0 },   /* epoll_create1 */
 };
 const size_t linux_syscall_table_len =
     sizeof(linux_syscall_table) / sizeof(linux_syscall_table[0]);
