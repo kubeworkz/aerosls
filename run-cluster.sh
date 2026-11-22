@@ -360,6 +360,13 @@ fi
 # from boot/layout rather than guessing. A missing table is refused: this
 # check must not pass by not looking.
 if [ -s sidecars.cpio ]; then
+    # Name a missing helper, not the archive: a healthy sidecars.cpio would
+    # otherwise be blamed. This must not skip the check either way.
+    if [ ! -f tools/sidecar_boot_span.sh ] || [ ! -r tools/sidecar_boot_span.sh ]; then
+        echo "error: tools/sidecar_boot_span.sh is missing or unreadable." >&2
+        echo "       sidecars.cpio is present, so its span cannot be checked without it." >&2
+        exit 1
+    fi
     # Through bash, not the shebang: a Windows checkout can drop the
     # executable bit, and this check must run rather than skip.
     if ! span="$(bash tools/sidecar_boot_span.sh sidecars.cpio)"; then

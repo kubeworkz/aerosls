@@ -410,6 +410,17 @@ check "$(has 'nodes            1' "$OUT")" \
       "*** the computed floor itself is accepted ***"
 check "$([ "$RC" -eq 0 ] && echo yes || echo no)" "exits zero"
 
+# Valid archive, missing helper; the helper is restored below so the archive
+# case still runs.
+rm -f "$T/tools/sidecar_boot_span.sh"
+OUT="$(run timeout 20 ./run-cluster.sh --nodes 1 --ram 1G --dry-run)"; RC=$?
+check "$(has 'tools/sidecar_boot_span.sh is missing or unreadable' "$OUT")" \
+      "*** a missing span helper names the helper ***"
+check "$(hasnt 'cannot read the sidecar boot image' "$OUT")" \
+      "...and does not blame the archive's layout"
+check "$([ "$RC" -ne 0 ] && echo yes || echo no)" "exits non-zero"
+cp "$ROOT/tools/sidecar_boot_span.sh" "$T/tools/"
+
 # Fail closed: an archive without a readable layout must not be sized by
 # guesswork. This is the same shape as a truncated hand-edited archive.
 printf 'not a newc archive' > "$T/sidecars.cpio"
