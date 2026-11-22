@@ -66,6 +66,7 @@ ar rcs "$BUILD/libmbedtls_host.a" "$BUILD"/obj/*.o
 # are rtc_host_test.c's subject; here the clock has to be deterministic or the
 # expected notBefore/notAfter below drift with every commit.
 EPOCH=1786406400   # 2026-08-11T00:00:00Z, one day before ORACLE_NOW
+ORACLE_NOW=$((EPOCH + 86400))   # 2026-08-12T00:00:00Z, the oracle's clock
 $CC -Wall -Wextra -std=c11 -DSLS_BUILD_EPOCH=${EPOCH}ull \
     -I kernel -I net -I . -I vendor/mbedtls/include -o "$BUILD/oracle" \
     tests/tls_cert_oracle.c tests/tls_cert_oracle_stubs.c \
@@ -142,22 +143,26 @@ PY
 # negative cases are what make the positives mean anything: a test that only
 # ever asserts success cannot tell you it is capable of failing.
 openssl x509 -inform DER -in "$CRT" -out "$BUILD/crt.pem" 2>/dev/null
+# Judge at the oracle's clock, not the host's. The leaf is minted for
+# 2026-08-12 with a 90-day life, so a real-clock verify turns this positive
+# into "certificate has expired" at 2026-11-10T00:00:00Z -- a statement about
+# the wall clock, not about the SAN.
 name_ok=1
 for h in localhost; do
-    openssl verify -CAfile "$BUILD/ca.pem" -verify_hostname "$h" \
+    openssl verify -attime "$ORACLE_NOW" -CAfile "$BUILD/ca.pem" -verify_hostname "$h" \
         "$BUILD/crt.pem" >/dev/null 2>&1 || { name_ok=0; echo "      (rejected DNS $h)"; }
 done
 for a in 127.0.0.1 10.0.2.15; do
-    openssl verify -CAfile "$BUILD/ca.pem" -verify_ip "$a" \
+    openssl verify -attime "$ORACLE_NOW" -CAfile "$BUILD/ca.pem" -verify_ip "$a" \
         "$BUILD/crt.pem" >/dev/null 2>&1 || { name_ok=0; echo "      (rejected IP $a)"; }
 done
 [ "$name_ok" = 1 ] && ok "a verifier accepts localhost, 127.0.0.1 and 10.0.2.15" \
                    || bad "a verifier rejected a name this node is reached by"
 
-if openssl verify -CAfile "$BUILD/ca.pem" -verify_hostname evil.example \
+if openssl verify -attime "$ORACLE_NOW" -CAfile "$BUILD/ca.pem" -verify_hostname evil.example \
        "$BUILD/crt.pem" >/dev/null 2>&1; then
     bad "a verifier accepted evil.example -- the name check is not being applied"
-elif openssl verify -CAfile "$BUILD/ca.pem" -verify_ip 8.8.8.8 \
+elif openssl verify -attime "$ORACLE_NOW" -CAfile "$BUILD/ca.pem" -verify_ip 8.8.8.8 \
          "$BUILD/crt.pem" >/dev/null 2>&1; then
     bad "a verifier accepted 8.8.8.8 -- the name check is not being applied"
 else
@@ -178,14 +183,14 @@ PY
 
 # ─── the leaf verifies against the CA, which is what a browser does ────────
 openssl x509 -inform DER -in "$CRT" -out "$BUILD/crt.pem" 2>/dev/null
-if openssl verify -CAfile "$BUILD/ca.pem" "$BUILD/crt.pem" >/dev/null 2>&1; then
+if openssl verify -attime "$ORACLE_NOW" -CAfile "$BUILD/ca.pem" "$BUILD/crt.pem" >/dev/null 2>&1; then
     ok "the leaf verifies against the CA (a full chain, not a partial one)"
 else
-    bad "openssl verify could not build leaf -> CA: $(openssl verify -CAfile "$BUILD/ca.pem" "$BUILD/crt.pem" 2>&1 | tail -1)"
+    bad "openssl verify could not build leaf -> CA: $(openssl verify -attime "$ORACLE_NOW" -CAfile "$BUILD/ca.pem" "$BUILD/crt.pem" 2>&1 | tail -1)"
 fi
 # And the CA alone must NOT verify the leaf if the leaf is swapped in as its
 # own anchor -- that would mean the split bought nothing.
-if openssl verify -CAfile "$BUILD/crt.pem" "$BUILD/crt.pem" >/dev/null 2>&1; then
+if openssl verify -attime "$ORACLE_NOW" -CAfile "$BUILD/crt.pem" "$BUILD/crt.pem" >/dev/null 2>&1; then
     bad "the leaf still verifies as its own anchor -- it is not really issued by the CA"
 else
     ok "the leaf does NOT verify standalone (it genuinely needs the CA)"
