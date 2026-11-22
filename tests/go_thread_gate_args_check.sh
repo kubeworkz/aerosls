@@ -15,8 +15,12 @@
 #     old action.
 #
 # It also pins the current tree's reconciliation: the four netpoll rows exist,
-# the six TG-1 table gaps are still absent, and the sidecar's record-only arm
-# and netpoll unit test are present. That is the §7 status the docs point to.
+# the sidecar's record-only arm and netpoll unit test are present, and each of
+# the six TG-1 rows (clone/futex/gettid/getpid/exit/openat) is either still an
+# open gap or has landed with the class §5.1 assigns it. The six close in the
+# plan's increments (I2: clone, futex; I4: gettid, getpid, exit, openat), so a
+# landed row is a passed phase, not a stale gap; a landed row with the wrong
+# class is the failure.
 #
 # Run:  bash tests/go_thread_gate_args_check.sh
 #       GO_THREAD_GATE_ARGS_ARTIFACT=<path> to test a mutated artifact.
@@ -194,13 +198,29 @@ grep -q 'fn eventfd_and_epoll_answer_the_go_netpoll_startup' "$LRS" \
     && ok "the sidecar's netpoll startup unit test exists" \
     || bad "the sidecar's netpoll startup unit test is missing"
 
-for n in 56 202 186 39 60 257; do
-    if grep -Eq "^[[:space:]]*\{[[:space:]]*$n," "$TABLE"; then
-        bad "TG-1 table gap $n is already present; §7's gap list is stale"
+# ─── The six TG-1 rows: an open gap, or landed with its §5.1 class ────────
+# Presence is not the failure. A table row is the dispatcher's whole answer,
+# and §5.1 fixes which side owns each number, so a row that lands under a
+# different class is the reviewable error: clone (56) is LSC_THREAD, futex
+# (202) is LSC_FUTEX, gettid/getpid/exit (186/39/60) are LSC_TASK, and the
+# measured openat path (257) is LSC_FD.
+check_tg1_row() {
+    local num="$1" cls="$2" line
+    line="$(grep -E "^[[:space:]]*\{[[:space:]]*$num," "$TABLE" || true)"
+    if [ -z "$line" ]; then
+        ok "TG-1 row $num is still an open gap (not landed yet)"
+    elif printf '%s\n' "$line" | grep -Eq "^[[:space:]]*\{[[:space:]]*$num,[[:space:]]*$cls([,[:space:]]|$)"; then
+        ok "TG-1 row $num has landed with its §5.1 class $cls"
     else
-        ok "TG-1 table gap $n is still absent"
+        bad "TG-1 row $num is present with the wrong class; §5.1 requires $cls"
     fi
-done
+}
+check_tg1_row 56 LSC_THREAD
+check_tg1_row 202 LSC_FUTEX
+check_tg1_row 186 LSC_TASK
+check_tg1_row 39 LSC_TASK
+check_tg1_row 60 LSC_TASK
+check_tg1_row 257 LSC_FD
 if grep -q 'tools/go_thread_gate_args_census.txt' "$DOC" && \
    grep -q 'tools/go_thread_gate_census.sh' "$DOC" && \
    grep -q 'tests/go_thread_gate_args_check.sh' "$DOC"; then

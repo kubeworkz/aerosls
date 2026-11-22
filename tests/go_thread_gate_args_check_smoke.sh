@@ -8,11 +8,16 @@
 #   2. clone rows that gain an extra namespace flag;
 #   3. a futex row that uses non-private WAIT;
 #   4. an epoll_pwait probe with a non-zero timeout;
-#   5. an openat call that does not use AT_FDCWD;
+#   5. openat calls that do not use AT_FDCWD (the same rows also clear the
+#      two measured input/output shape clauses, so all three must fire);
 #   6. an rt_sigaction install that gains SA_NODEFER.
 #
-# Each mutation must make the guard exit 1 (violated), not exit 2 (missing
-# artifact) and not pass. The unmutated copy must pass.
+# A tooth is green only when the guard newly fails on the clause that mutation
+# names. Exit 1 alone is not enough: the guard also reconciles the tree (table
+# rows, sidecar arms, the gate doc), and a tree-phase failure must not stand in
+# for an artifact tooth. So the smoke records the guard's FAIL lines on the
+# pristine artifact and subtracts them; what remains must be exactly the
+# tooth's named failure(s) — no named clause missing, and no extra failure.
 #
 # Run:  bash tests/go_thread_gate_args_check_smoke.sh
 set -euo pipefail
@@ -41,6 +46,11 @@ run_guard() {
     GO_THREAD_GATE_ARGS_ARTIFACT="$copy" bash "$GUARD" >"$tmp/guard.out" 2>&1
 }
 
+# The guard's named failures, one per line, with the "FAIL: " prefix removed.
+guard_failures() {
+    awk '/^FAIL: / { sub(/^FAIL: /, ""); print }' "$tmp/guard.out"
+}
+
 expect_pass() {
     if run_guard; then
         ok "$1"
@@ -50,61 +60,116 @@ expect_pass() {
     fi
 }
 
+# expect_tooth <label> <expected-failure-ERE>...
+# The guard must exit 1, and the failures the mutation introduces (the FAIL
+# lines that were not already there for the pristine artifact) must match the
+# given patterns exactly: every pattern present, every new failure explained.
 expect_tooth() {
+    local label="$1"
+    shift
+    local rc=0 missing=0 unexpected=0 p line matched
+
     # VACUITY GUARD. A sed whose row pattern stopped matching leaves the copy
     # pristine and the guard passes; the tooth would then blame the guard for
     # the miss. Prove the mutation landed first.
     if cmp -s "$copy" "$ART"; then
-        bad "$1 — mutation did not apply: the artifact copy is unchanged, so the guard would see the pristine rows"
+        bad "$label — mutation did not apply: the artifact copy is unchanged, so the guard would see the pristine rows"
         return
     fi
+
     set +e
     run_guard
     rc=$?
     set -e
-    if [ "$rc" -eq 1 ]; then
-        ok "$1 (guard exited 1)"
-    elif [ "$rc" -eq 0 ]; then
-        bad "$1 (guard accepted the mutation)"
+    if [ "$rc" -eq 0 ]; then
+        bad "$label (guard accepted the mutation)"
         sed 's/^/      /' "$tmp/guard.out"
+        return
+    fi
+    if [ "$rc" -ne 1 ]; then
+        bad "$label (guard exited $rc; expected 1)"
+        sed 's/^/      /' "$tmp/guard.out"
+        return
+    fi
+
+    guard_failures > "$tmp/actual.fail"
+    if [ -s "$tmp/baseline.fail" ]; then
+        grep -Fxv -f "$tmp/baseline.fail" "$tmp/actual.fail" > "$tmp/new.fail" || true
     else
-        bad "$1 (guard exited $rc; expected 1)"
+        cp "$tmp/actual.fail" "$tmp/new.fail"
+    fi
+
+    for p in "$@"; do
+        grep -Eq "$p" "$tmp/new.fail" || {
+            missing=$((missing + 1))
+            echo "      missing named clause: /$p/"
+        }
+    done
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        matched=0
+        for p in "$@"; do
+            if printf '%s\n' "$line" | grep -Eq "$p"; then
+                matched=1
+                break
+            fi
+        done
+        if [ "$matched" -eq 0 ]; then
+            unexpected=$((unexpected + 1))
+            echo "      failure outside the tooth's clauses: $line"
+        fi
+    done < "$tmp/new.fail"
+
+    if [ "$missing" -eq 0 ] && [ "$unexpected" -eq 0 ] && [ -s "$tmp/new.fail" ]; then
+        ok "$label (guard newly failed on its named clause only)"
+    else
+        bad "$label (guard exited 1, but not only for its named clause: $missing named clause(s) missing, $unexpected extra)"
         sed 's/^/      /' "$tmp/guard.out"
     fi
 }
 
 cp "$ART" "$copy"
 expect_pass "baseline artifact"
+guard_failures > "$tmp/baseline.fail"
 
 # Tooth 1: clone rows lose CLONE_SETTLS and gain CHILD_CLEARTID.
 cp "$ART" "$copy"
 sed -i '/^clone(/s/CLONE_SETTLS/CLONE_CHILD_CLEARTID/' "$copy"
-expect_tooth "clone shape mutation"
+expect_tooth "clone shape mutation" \
+    '^a clone row does not have exactly the measured seven-flag thread shape$'
 
 # Tooth 2: clone rows gain a flag outside the measured thread shape.
 cp "$ART" "$copy"
 sed -i '/^clone(/s/CLONE_SETTLS/CLONE_SETTLS|CLONE_NEWPID/' "$copy"
-expect_tooth "clone extra-flag mutation"
+expect_tooth "clone extra-flag mutation" \
+    '^a clone row does not have exactly the measured seven-flag thread shape$'
 
 # Tooth 3: a futex row stops being the private WAIT operation.
 cp "$ART" "$copy"
 sed -i '/^futex(/s/FUTEX_WAIT_PRIVATE/FUTEX_WAIT/' "$copy"
-expect_tooth "futex non-private mutation"
+expect_tooth "futex non-private mutation" \
+    "^futex ops are '.*', expected 'FUTEX_WAIT_PRIVATE;FUTEX_WAKE_PRIVATE'$"
 
 # Tooth 4: epoll_pwait rows no longer have timeout 0.
 cp "$ART" "$copy"
 sed -i '/^epoll_pwait(/s/, 0, NULL, 0)/, 1, NULL, 0)/' "$copy"
-expect_tooth "epoll timeout mutation"
+expect_tooth "epoll timeout mutation" \
+    '^an epoll_pwait row has a non-zero timeout or a sigmask$'
 
-# Tooth 5: the first openat row no longer uses AT_FDCWD.
+# Tooth 5: openat rows no longer use AT_FDCWD. The dirfd clause and the two
+# measured shape clauses read the same rows, so all three must go red.
 cp "$ART" "$copy"
 sed -i '/^openat(/s/AT_FDCWD/5/' "$copy"
-expect_tooth "openat dirfd mutation"
+expect_tooth "openat dirfd mutation" \
+    '^an openat row does not use AT_FDCWD$' \
+    "^the fixture's input openat shape is missing$" \
+    "^the fixture's output openat shape is missing$"
 
 # Tooth 6: an rt_sigaction install gains a flag outside the measured shape.
 cp "$ART" "$copy"
 sed -i '/^rt_sigaction(/s/sa_flags=SA_RESTORER|SA_ONSTACK|SA_RESTART|SA_SIGINFO/sa_flags=SA_RESTORER|SA_ONSTACK|SA_RESTART|SA_SIGINFO|SA_NODEFER/' "$copy"
-expect_tooth "rt_sigaction flags mutation"
+expect_tooth "rt_sigaction flags mutation" \
+    '^an rt_sigaction install lacks the measured SA_.* flags or restorer$'
 
 # The pristine copy must still pass after the teeth.
 cp "$ART" "$copy"
