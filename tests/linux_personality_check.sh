@@ -105,6 +105,8 @@ KERC=kernel/kernel.c
 STUB=kernel/stubs.c
 FHUT=tests/fpu_enable_host_test.c
 PHUT=tests/linux_personality_host_test.c
+LTHH=kernel/linux_thread.h
+LTHC=kernel/linux_thread.c
 
 # ─── B. The sibling per-CPU block, at the offsets the asm addresses ────────
 # The struct side is pinned by static asserts (a C reorder is a BUILD
@@ -488,7 +490,8 @@ if grep -qF 'const E_BADF: i32 = -2;' "$LRS" && \
    grep -qF '1 => match fd_kind(fds, args[0]) {' "$LRS" && \
    grep -qF 'None => Answer::Reply(0, E_BADF),' "$LRS" && \
    grep -qF 'fds: [FdSlot; LINUX_MAX_FDS],' "$LRS" && \
-   grep -qF 't.fds = [FdSlot { used: false, kind: 0, vfs_fd: 0, flags: 0 }; LINUX_MAX_FDS];' "$LRS" && \
+   grep -qF 't.fds = [FdSlot { used: false, kind: 0, vfs_fd: 0, flags: 0,' "$LRS" && \
+   grep -qF 'members: 0 }; LINUX_MAX_FDS];' "$LRS" && \
    grep -qF 't.fds.iter_mut().take(3)' "$LRS"; then
     ok "M5. the sidecar's fd table exists per task (console slots plus step 4's File kind carrying the VFS fd and flags), is born with console stdio (0/1/2), and an unknown descriptor is EBADF — CAP_EBADF pinned at -2 so §5.7 delivers 9"
 else
@@ -528,15 +531,14 @@ if grep -q 'struct LinuxMemBrkVerdict' "$LABH" && \
 else
     bad "N. a mem-class contract is gone from linux_abi.h/.c — the brk apply has no verdict to consult (a grant would be trusted about the address it asks the kernel to map), the W|X refusal has no predicate, and the unwind has no read-back"
 fi
-if grep -q 'pd->linux_heap_base = 0;' "$PDC" && \
-   grep -q 'pd->linux_heap_limit = 0;' "$PDC" && \
-   grep -q 'pd->linux_brk_cur = 0;' "$PDC" && \
+if grep -q 'g->brk_cur = 0;' "$LTHC" && \
+   grep -q 'pd->group_index = LINUX_GROUP_NONE;' "$LTHC" && \
    grep -q 'pd->mem_stage_valid = 0;' "$PDC"; then
-    ok "N1. proc_clear_resume_state() zeroes the heap span AND the staged brk — a reused slot inherits neither its predecessor's pages-to-be nor an unanswered grant"
+    ok "N1. the group's destroy zeroes the shared cursors and the identity clear drops the index, while the descriptor still zeroes the staged brk — a reused slot inherits neither its predecessor's pages-to-be nor an unanswered grant"
 else
-    bad "N1. the mem state's slot-reuse clear is gone from process.c — the next occupant of a reused slot is handed its predecessor's brk_cur (whose grants map pages at a break it never asked for) and its live brk stage"
+    bad "N1. the group's slot-reuse clear is gone — the next occupant of a reused slot can resolve its predecessor's group (whose brk_cur maps pages at a break it never asked for), or the live brk stage survives"
 fi
-span_line="$(grep -nF 'pd->linux_heap_base  = stack_base + (uint64_t)stk_pages * 4096;' "$CAPC" | cut -d: -f1)"
+span_line="$(grep -nF 'group_heap_base  = stack_base + (uint64_t)stk_pages * 4096;' "$CAPC" | cut -d: -f1)"
 # The personality check is bound to the STAMP SITE (the line above the
 # stamp), not to the bare pattern: increment 7 added other
 # PROC_PERSONALITY_LINUX blocks to cap.c, and a free-standing pattern
@@ -544,10 +546,11 @@ span_line="$(grep -nF 'pd->linux_heap_base  = stack_base + (uint64_t)stk_pages *
 if [ -n "$span_line" ] && \
    sed -n "$((span_line - 1))p" "$CAPC" | grep -qF 'if (personality == PROC_PERSONALITY_LINUX) {' && \
    grep -qF '((m.budget_mem_bytes + 4095ULL) / 4096ULL)' "$CAPC" && \
+   grep -qF 'linux_group_stamp_memory(pd, group_heap_base, group_heap_limit,' "$CAPC" && \
    grep -qF 'const IMAGE_VBASE: u64 = 0x4000_0000_0000;' "$LPRO" && \
    grep -qF 'const MEM_BUDGET_BYTES: u64 = 64 * 1024;' "$LPRO" && \
    grep -qF 'let heap_base = stack_base + stk_pages * 4096;' "$LPRO"; then
-    ok "N2. the span is stamped inside the create, for LINUX only, from the manifest's BUDGET record — and the sidecar's ledger derives the same three numbers from the same record (one truth, mirrored)"
+    ok "N2. the span is computed inside the create for LINUX only and stamped onto the GROUP, from the manifest's BUDGET record — and the sidecar's ledger derives the same three numbers from the same record (one truth, mirrored)"
 else
     bad "N2. the span's stamp or its twin is gone — the kernel would map brk pages against a span the manifest never declared (or stamp one onto every SLS slot), or the sidecar's ledger would be born at a base the kernel's pages never reach: the two halves silently disagree and every denial-echo check lies"
 fi
@@ -563,14 +566,14 @@ stage_line6=$(grep -n 'cur->mem_stage_valid = 1;' "$DISP" | head -1 | cut -d: -f
 arm_line6=$(grep -n 'cur->park_syscall = SYS_LINUX_TRAP_RESUME;' "$DISP" | head -1 | cut -d: -f1)
 verdict_line=$(grep -n 'linux_mem_brk_verdict(' "$DISP" | head -1 | cut -d: -f1)
 deliver_line6=$(grep -n 'k_linux_deliver(cur->pid, ch_r' "$DISP" | head -1 | cut -d: -f1)
-map_line=$(grep -n 'cur->linux_brk_cur = v.new_cur;' "$DISP" | head -1 | cut -d: -f1)
+map_line=$(grep -n 'linux_group_set_brk(cur, v.new_cur);' "$DISP" | head -1 | cut -d: -f1)
 if [ -n "$stage_line6" ] && [ -n "$arm_line6" ] && [ -n "$verdict_line" ] && \
    [ -n "$deliver_line6" ] && [ -n "$map_line" ] && \
    [ "$stage_line6" -lt "$arm_line6" ] && \
    [ "$verdict_line" -gt "$deliver_line6" ] && [ "$map_line" -gt "$verdict_line" ] && \
    grep -qF 'if (v.malformed) {' "$DISP" && \
-   grep -qF 'cur->linux_brk_cur = v.new_cur;' "$DISP"; then
-    ok "N4. the brk seam holds: staged BEFORE the arm, the verdict consulted only AFTER the reply is delivered, malformed grants refused before any map, and the break recorded only on a fully-mapped grant"
+   grep -qF 'linux_group_set_brk(cur, v.new_cur);' "$DISP"; then
+    ok "N4. the brk seam holds: staged BEFORE the arm, the verdict consulted only AFTER the reply is delivered, malformed grants refused before any map, and the group's break recorded only on a fully-mapped grant"
 else
     bad "N4. the stage/apply seam is broken — a grant mapped without the verdict's span re-check (the reply would decide what the kernel maps), a stage that survives past its own reply, or a break that moves without pages behind it: a silent lie to ring-3 about its own heap"
 fi
@@ -830,12 +833,14 @@ if grep -qF 'LINUX_RT_SIGACTION => {' "$LRS" && \
 else
     bad "R4. an arm or the SignalKill convergence is gone — raise(SIGABRT) would refuse or reply successfully, abort() would walk on into its hlt, and the boot would show [FAULT] at 0x805260c again (§10.13's step-1 wall)"
 fi
-if grep -qF 'E_NOSYS), /* handler install not landed' "$LRS" && \
+if grep -qF 'sig.act[args[0] as usize] = act;' "$LRS" && \
+   grep -qF 'dispo(sig, args[1]) == DISPO_HANDLER {' "$LRS" && \
+   grep -qF 'dispo(sig, sig_no as u64) == DISPO_HANDLER {' "$LRS" && \
    grep -qF 'if sig.tid == 0 || args[0] as u32 != sig.tid as u32 {' "$LRS" && \
    grep -qF 'sig.pending |= 1u64 << (args[1] - 1);' "$LRS"; then
-    ok "R5. the seam's honesty lines hold: a handler install refuses ENOSYS by name BEFORE any mutation (v1 has no signal frames to deliver one on), tkill's tid is the set_tid_address echo at u32 width (ESRCH otherwise — never silently re-targeted), and a blocked signal PENDS so the unblock arm is where it delivers"
+    ok "R5. the seam's honesty lines hold: rt_sigaction RECORDS the whole 32-byte act — handler address, flags, mask and restorer, returned verbatim by oldact — but never invokes it, tkill's own delivery and the unblock reveal both refuse a handler disposition ENOSYS by name BEFORE any action (no signal frame/rt_sigreturn exists), tkill's tid is the set_tid_address echo at u32 width (ESRCH otherwise — never silently re-targeted), and a blocked signal PENDS so the unblock arm is where it delivers"
 else
-    bad "R5. one of the seam's honesty lines is gone — a handler install would record a disposition this shim can never invoke (every later delivery a coin flip), a tid mismatch could kill a task that never asked, or a blocked raise() would be lost outright instead of pending"
+    bad "R5. one of the seam's honesty lines is gone — a recorded handler could be invoked with no frame to return through (or silently turned into a default kill the caller never asked for), a tid mismatch could kill a task that never asked, or a blocked raise() would be lost outright instead of pending"
 fi
 if grep -qF 'linux_sig_copy_plan(' "$PHUT" && \
    grep -qF 'p.refuse == -LINUX_EINVAL && p.len == 0' "$PHUT"; then
@@ -1108,9 +1113,9 @@ else
 fi
 mmap_v=$(grep -nF 'v = linux_mem_mmap_verdict(' "$DISP" | head -1 | cut -d: -f1)
 if [ -n "$mmap_v" ] && \
-   sed -n "$((mmap_v - 3)),$((mmap_v + 6))p" "$DISP" | grep -qF 'cur->linux_mmap_top' && \
-   grep -qF 'v.new_mmap_top;' "$DISP" && \
-   grep -qF 'cur->linux_mmap_top,' "$DISP" && \
+   sed -n "$((mmap_v - 3)),$((mmap_v + 6))p" "$DISP" | grep -qF 'linux_group_mmap_top(cur)' && \
+   grep -qF 'v.new_mmap_top);' "$DISP" && \
+   grep -qF 'linux_group_mmap_top(cur), &mreq, rax);' "$DISP" && \
    grep -qF '(-LINUX_ENOMEM);' "$DISP" && \
    grep -qxF '                        } else if (snum == LINUX_MMAP) {' "$DISP" && \
    ! grep -qF '                            } else if (snum == LINUX_MMAP) {' "$DISP"; then
@@ -1129,12 +1134,12 @@ if [ -n "$inv_upc" ] && \
 else
     bad "V3. the replace walk, the frame return or the invlpg is gone — a replace would leak the old frame and zero live bytes, or ring-3 would keep running on the stale translation the guard page replaced"
 fi
-if grep -qF 'pd->linux_mmap_top   = pd->linux_heap_limit;' "$CAPC" && \
-   grep -qF 'pd->linux_mmap_top = 0;' "$PDC" && \
-   grep -qF 'uint64_t   linux_mmap_top;' "$PDH"; then
-    ok "V4. both cursors are stamped and cleared where the heap span is — the create births linux_mmap_top at the span's limit beside brk_cur, slot reuse zeroes it beside the other three, and the descriptor declares it"
+if grep -qF 'g->mmap_top = heap_limit;' "$LTHC" && \
+   grep -qF 'g->mmap_top = 0;' "$LTHC" && \
+   grep -qF 'uint64_t mmap_top;' "$LTHH"; then
+    ok "V4. both cursors are stamped and cleared on the GROUP — the stamp births mmap_top at the span's limit beside brk_cur, destroy zeroes it beside the other fields, and linux_thread.h declares it"
 else
-    bad "V4. the kernel cursor's stamp, clear or field is gone — a reused slot would inherit its predecessor's cursor (a grant landing on a page the last occupant's map owned) or a LINUX task would have no cursor to cap brk by"
+    bad "V4. the group cursor's stamp, clear or field is gone — a reused group would inherit its predecessor's cursor (a grant landing on a page the last occupant's map owned) or a LINUX task would have no cursor to cap brk by"
 fi
 mmap_arm=$(grep -nF '        9 => {' "$LRS" | head -1 | cut -d: -f1)
 if [ -n "$mmap_arm" ] && \
@@ -1203,14 +1208,14 @@ if grep -qF '#define ENV_PAYLOAD_REC_VERSION 2u' "$EPH" && \
    grep -qF 'uint64_t stack_bottom;' "$EPH" && \
    grep -qF 'uint64_t image_hi;' "$EPH" && \
    grep -qF '#define ENV_PAYLOAD_FORM_USER    2u' "$EPH"; then
-    ok "W1. the payload is v2: EnvPayloadTask carries the Linux task's FULL context (20-word TaskContext), its six argument registers, fs_base, both cursors, the heap and stack ranges and the image span, and every page index entry is 16 bytes with a permission word"
+    ok "W1. the payload is v3: EnvPayloadTask carries the Linux task's FULL context (20-word TaskContext), its six argument registers, fs_base, both cursors, the heap and stack ranges and the image span, and every page index entry is 16 bytes with a permission word including the soft PROT_NONE state"
 else
     bad "W1. the Linux half of EnvPayloadTask or the permission-carrying page entry is gone — the capture could file pages a restore cannot map, and a v1-shaped blob would be misread entry by entry"
 fi
 if grep -qF 'static int ep_linux_page(const struct EnvCkptRecord* rec, uint32_t t,' "$EPC" && \
    grep -qF 'if (tk->stack_bottom && vaddr >= tk->stack_bottom &&' "$EPC" && \
-   grep -qF 'if (pd->linux_image_lo && vaddr >= pd->linux_image_lo &&' "$EPC" && \
-   grep -qF 'if (pd->linux_heap_base && vaddr >= pd->linux_heap_base &&' "$EPC" && \
+   grep -qF 'if (linux_group_image_lo(pd) && vaddr >= linux_group_image_lo(pd) &&' "$EPC" && \
+   grep -qF 'if (linux_group_heap_base(pd) && vaddr >= linux_group_heap_base(pd) &&' "$EPC" && \
    grep -qF 'return ep_in_image_window(vaddr) || ep_in_regions(rec, vaddr);' "$EPC" && \
    grep -qF 'if (!ep_task_page(rec, t, pds[t], v)) continue;' "$EPC" && \
    grep -qF 'static uint32_t ep_perm_of(uint64_t e)' "$EPC" && \
@@ -1233,8 +1238,8 @@ if grep -qF 'case EP_REFUSE_PERM:' "$EPC" && \
    grep -qF 'if (tk.form != ENV_PAYLOAD_FORM_USER &&' "$EPC" && \
    grep -qF 'tk.form != ENV_PAYLOAD_FORM_ENTRY) {' "$EPC" && \
    grep -qF 'pd->has_ring3_ctx  = 1;' "$EPC" && \
-   grep -qF 'pd->linux_mmap_top = tk.mmap_top;' "$EPC"; then
-    ok "W4. the restore proves the page's live permissions against the captured ones before a byte moves, resumes only the two resumable Linux forms (the pause's USER and increment 21's held ENTRY stop — PARKED and RUNNING refused by name, their queued/mid-compute state not being in the blob), and carries the captured ring3_ctx with its fs_base and both cursors"
+   grep -qF 'linux_group_set_mmap_top(pd, tk.mmap_top);' "$EPC"; then
+    ok "W4. the restore proves the page's live permissions against the captured ones before a byte moves, resumes only the two resumable Linux forms (the pause's USER and increment 21's held ENTRY stop — PARKED and RUNNING refused by name, their queued/mid-compute state not being in the blob), and carries the captured ring3_ctx with its fs_base and both cursors onto the group"
 else
     bad "W4. the restore's Linux arm is gone — a page could be poured into a map with different permissions, a parked task's stale context would be resumed, a non-held task could be poured over, or the task would restart at its entry"
 fi
@@ -1290,7 +1295,7 @@ fi
 munmap_v=$(grep -nF 'v = linux_mem_munmap_verdict(' kernel/syscall_dispatch.c | head -1 | cut -d: -f1)
 munmap_apply="$(sed -n "$((munmap_v - 3)),$((munmap_v + 70))p" kernel/syscall_dispatch.c)"
 if [ -n "$munmap_v" ] && \
-   grep -qF 'cur->linux_brk_cur' <<< "$munmap_apply" && \
+   grep -qF 'linux_group_brk(cur)' <<< "$munmap_apply" && \
    grep -qF 'linux_user_page_frame(' <<< "$munmap_apply" && \
    grep -qF 'user_unmap_page(pml4, va);' <<< "$munmap_apply" && \
    grep -qF 'user_invlpg(va);' <<< "$munmap_apply" && \

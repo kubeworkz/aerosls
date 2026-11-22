@@ -26,6 +26,8 @@ FILES=(
     kernel/linux_abi.c
     kernel/process.h
     kernel/process.c
+    kernel/linux_thread.h
+    kernel/linux_thread.c
     kernel/cap.h
     kernel/cap.c
     kernel/syscall_dispatch.c
@@ -423,11 +425,11 @@ tooth fd-payload-check-off M6 "the request-length invariant is dead-coded" "$W/t
 
 # ─── Increment-6 teeth (the mem class: the budget span, the W^X refusal) ──
 
-# N1: the slot-reuse clear loses the break — a reused slot's brk_cur is
+# N1: the group's destroy loses the break — a reused slot's group keeps
 # its predecessor's, and the next occupant's first granted growth maps
 # pages at a break nobody asked for.
 seed "$W/t32"
-sed -i '/pd->linux_brk_cur = 0;/d' "$W/t32/kernel/process.c"
+sed -i '/g->brk_cur = 0;/d' "$W/t32/kernel/linux_thread.c"
 tooth mem-clear-dropped N1 "the reused-slot brk state reset is gone" "$W/t32"
 
 # N2: the stamp made unconditional — every SLS sidecar (init, DM, every
@@ -438,8 +440,8 @@ python3 - "$W/t33/kernel/cap.c" <<'PY'
 import sys
 p = sys.argv[1]
 s = open(p, encoding='utf-8').read()
-old = "    if (personality == PROC_PERSONALITY_LINUX) {\n        pd->linux_heap_base"
-new = "    if (1) {   /* SLS slots get a Linux span too */\n        pd->linux_heap_base"
+old = "    if (personality == PROC_PERSONALITY_LINUX) {\n        group_heap_base"
+new = "    if (1) {   /* SLS slots get a Linux span too */\n        group_heap_base"
 assert old in s, "anchor not found"
 open(p, 'w', encoding='utf-8', newline='').write(s.replace(old, new, 1))
 PY
@@ -680,12 +682,12 @@ seed "$W/t79"
 sed -i 's/ACT_TERMINATE => Answer::SignalKill(args\[1\]),/ACT_TERMINATE => Answer::Reply(0, STATUS_OK),/' "$W/t79/user/sidecar/src/linux.rs"
 tooth terminate-answers-success R4 "a default-terminate signal no longer converges on SignalKill" "$W/t79"
 
-# t80: the handler-install refusal answered 0 — v1 has no signal frames,
-# so a recorded handler would never run while its caller believes the
-# install succeeded.
+# t80: the handler install's RECORD deleted — the arm still answers
+# success but stores nothing, so a later oldact reports a default the
+# caller never installed while the install claimed to land.
 seed "$W/t80"
-sed -i 's|_ => Answer::Reply(0, E_NOSYS), /\* handler install not landed \*/|_ => Answer::Reply(0, STATUS_OK), /* handler install silently kept */|' "$W/t80/user/sidecar/src/linux.rs"
-tooth handler-install-answered-0 R5 "a handler install is no longer refused by name before any mutation" "$W/t80"
+sed -i 's|sig\.act\[args\[0\] as usize\] = act;|/* handler install not recorded */|' "$W/t80/user/sidecar/src/linux.rs"
+tooth handler-install-not-recorded R5 "a handler install is no longer recorded (oldact would return a default it never installed)" "$W/t80"
 
 # t81: tkill's tid scope deleted — any sender may signal any tid through
 # this arm, silently re-targeted instead of answered ESRCH.
@@ -918,7 +920,7 @@ tooth mmap-stage-truncated V1 "the four-word stage carries only part of the ask"
 # a forged grant above the cursor now re-checks against a bound that
 # never moved, so the two cursors' convergence is argued from prose.
 seed "$W/t110"
-sed -i 's/^                                    cur->linux_mmap_top, &mreq, rax);$/                                    cur->linux_heap_limit, \&mreq, rax);/' "$W/t110/kernel/syscall_dispatch.c"
+sed -i 's/^                                    linux_group_mmap_top(cur), &mreq, rax);$/                                    cur->linux_heap_limit, \&mreq, rax);/' "$W/t110/kernel/syscall_dispatch.c"
 tooth mmap-verdict-loses-cursor V2 "the verdict is called without the map cursor" "$W/t110"
 
 # t111: the replace's invlpg deleted — "the task is parked anyway" is
@@ -941,14 +943,14 @@ tooth mmap-replace-gated-off V3 "the replace walk never runs — a FIXED map sil
 # re-checks above a cursor that is 0 and maps nothing: the allocator's
 # wall returns as -ENOMEM from a kernel that forgot to birth its state.
 seed "$W/t113"
-sed -i 's/pd->linux_mmap_top   = pd->linux_heap_limit;/pd->linux_mmap_top   = 0;/' "$W/t113/kernel/cap.c"
+sed -i 's/g->mmap_top = heap_limit;/g->mmap_top = 0;/' "$W/t113/kernel/linux_thread.c"
 tooth mmap-cursor-never-born V4 "the create no longer births the map cursor at the span's top" "$W/t113"
 
 # t114: the slot-reuse clear deleted — "dead code" is how a reused
 # task slot inherits its predecessor's cursor, and the next child's
 # arena lands where the last occupant's map still lives.
 seed "$W/t114"
-sed -i '/pd->linux_mmap_top = 0;/d' "$W/t114/kernel/process.c"
+sed -i '/g->mmap_top = 0;/d' "$W/t114/kernel/linux_thread.c"
 tooth mmap-cursor-slotreuse-clear-gone V4 "a reused slot keeps the dead task's map cursor" "$W/t114"
 
 # t115: the arm renamed away — the measured allocator's two requests

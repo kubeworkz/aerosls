@@ -154,50 +154,14 @@ struct ProcessDescriptor {
     uint8_t    fs_stage_valid;         // 1 between that forward's arming and its
                                        // reply (or refusal) — cleared here, at the
                                        // apply, and at every non-SET forward.
-    uint64_t   linux_heap_base;        // E7 increment 6 (§5.4): the budget span a
-                                       // LINUX task's brk bump pointer lives in —
-                                       // stamped inside the create from the
-                                       // manifest's BUDGET record (mem_bytes,
-                                       // page-rounded, directly above the child's
-                                       // stack), zeroed at slot reuse beside
-                                       // personality. The kernel maps granted
-                                       // pages into this span with partition-
-                                       // charged frames at the reply; the
-                                       // sidecar's ledger (user/sidecar/src/
-                                       // linux.rs's MemBrk) is the policy twin of
-                                       // these three numbers, and the probe's
-                                       // denial-echo check is what proves the two
-                                       // halves never drift.
-    uint64_t   linux_heap_limit;       // base + round_up_4k(mem_bytes)
-    uint64_t   linux_brk_cur;          // the break THIS side has mapped to — the
-                                       // mechanism's truth about which pages are
-                                       // backed, consulted by the verdict at
-                                       // every brk reply
-    uint64_t   linux_mmap_top;         // E7 increment 16 (§5.4): the anonymous-map
-                                       // cursor — born at the span's limit,
-                                       // descending by every granted non-FIXED
-                                       // mmap, stamped beside the heap numbers at
-                                       // the create and zeroed at slot reuse
-                                       // beside them. The MemBrk ledger's mtop is
-                                       // the policy twin; both ends re-check the
-                                       // other's grants (brk's ceiling is
-                                       // min(limit, mtop)) so a map can never
-                                       // overwrite a frame either side already
-                                       // handed out.
-    uint64_t   linux_image_lo;         // E7 increment 20: the ET_EXEC image's
-                                       // own page span, [lo, hi) — the PT_LOAD
-                                       // extent elf64_map_blob actually mapped
-                                       // (page-rounded outward), stamped at
-                                       // the create and zeroed at slot reuse.
-                                       // A linked static image sits at 0x400000
-                                       // inside the child's shared identity
-                                       // map, so the checkpoint's page walk
-                                       // cannot use the image window alone to
-                                       // say which pages carry the image; this
-                                       // is the range that can. A flat image
-                                       // leaves it 0 (its pages are the image
-                                       // window, which the walk knows).
-    uint64_t   linux_image_hi;
+    /* E7 TG-1 I1: a Linux task's shared span — heap base/limit, brk,
+     * mmap top, image range and getdents64 cursor — belongs to its
+     * LinuxThreadGroup, not to this descriptor (kernel/linux_thread.h). The
+     * create stamps the group and every read/write goes through
+     * linux_group_*(), so a second thread of the group cannot fork a cursor
+     * or an address space by being scheduled. The fields that remain here
+     * are the thread's IDENTITY: tid/tgid (below, beside personality),
+     * group_index, is_group_leader, and sysret_result. */
     // ── Q2: the gate stack's high-water measurement ──────────────────────
     // The gate profile poisons the unused span below the entry %rsp at
     // create and scans it at the stop and at teardown. These four fields
@@ -253,14 +217,6 @@ struct ProcessDescriptor {
                                        // (bytes the deliver may write at
                                        // reply_stage_va — 144 for stat, the
                                        // child's count for getdents64)
-    uint64_t   linux_dir_pos;          // step 4's getdents64 cursor: the ENTRY
-                                       // INDEX the next call starts at, advanced
-                                       // by the deliver only by records actually
-                                       // packed (a short getdents is POSIX-legal;
-                                       // the caller loops). Reset when this task
-                                       // opens a new path (one listing at a time
-                                       // — named v1 boundary) and at slot reuse.
-                                       // SLS and non-Linux tasks never read it.
     uint64_t   user_rip;              // entry point in user space
     uint64_t   user_rsp;              // current user-space stack pointer
     uint64_t   user_stack_vaddr;      // vaddr base of the 8-page user stack
@@ -291,6 +247,20 @@ struct ProcessDescriptor {
                                        // (0 = spawned from kernel context).
     uint32_t   partition_id;          // Phase 9 (LPAR): partition_get_for_uid(owner_uid)
                                        // at spawn time — see partition.h
+    uint32_t   tid;                   // E7 TG-1 I1: gettid(), == pid. Stamped by
+                                       // linux_group_create() and cleared with
+                                       // the identity at teardown.
+    uint32_t   tgid;                  // getpid(): the group's leader pid
+    uint32_t   group_index;           // index into linux_group_table[], or
+                                       // LINUX_GROUP_NONE (0xFFFFFFFF) for an
+                                       // SLS task / a cleared slot
+    uint8_t    is_group_leader;       // 1 for the descriptor that created the group
+    uint8_t    _group_pad[7];
+    uint64_t   sysret_result;         // E7 TG-1 I3: the value a resume writes to
+                                       // rax (futex wake 0 / timeout -ETIMEDOUT);
+                                       // 0 for every other sysret. Declared here in
+                                       // I1 so every spawn/clear site owns it from
+                                       // the start.
     uint32_t   personality;           // E7 (Linux ABI Shim Design §3.3): what this
                                        // task's rax MEANS at the trap —
                                        // PROC_PERSONALITY_SLS (0, default) or

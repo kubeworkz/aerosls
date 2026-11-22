@@ -38,6 +38,7 @@
 #include "env_console.h"
 #include "persist.h"
 #include "process.h"
+#include "linux_thread.h"
 #include "cap.h"            /* CAP_NONE, SYS_SLS_CAP_RECV, SYS_SLS_CHAN_WAIT */
 #include "linux_abi.h"      /* E7 increment 20: SYS_LINUX_TRAP_RESUME, the park the Linux form reads */
 #include "../drivers/nvme_io.h"
@@ -419,13 +420,14 @@ static int ep_in_image_window(uint64_t vaddr) {
  * duplicates of them) under the child. The child's pages are exactly the
  * three ranges the create itself decided:
  *
- *   - the linked ET_EXEC image's page span (`linux_image_lo..hi`, stamped
- *     from the mapper's own PT_LOAD extent — a static musl image lives at
- *     0x400000, not in the window at all),
+ *   - the linked ET_EXEC image's page span (`linux_group_image_lo..hi`,
+ *     stamped from the mapper's own PT_LOAD extent — a static musl image
+ *     lives at 0x400000, not in the window at all),
  *   - the user stack the create mapped for it (`stack_bottom..top`, the
  *     record's own bounds — the child's, not the parent's),
- *   - the budget span `linux_heap_base..limit`, which holds BOTH brk growth
- *     (up from the base) and anonymous maps (down from the limit).
+ *   - the group's budget span (`linux_group_heap_base..limit`), which holds
+ *     BOTH brk growth (up from the base) and anonymous maps (down from the
+ *     limit).
  *
  * A PROT_NONE guard has no frame, so the walk never sees it: the payload
  * carries the pages that exist, not the ranges that were reserved. */
@@ -434,10 +436,10 @@ static int ep_linux_page(const struct EnvCkptRecord* rec, uint32_t t,
     const struct EnvCkptTask* tk = &rec->tasks[t];
     if (tk->stack_bottom && vaddr >= tk->stack_bottom &&
         vaddr < tk->stack_top) return 1;
-    if (pd->linux_image_lo && vaddr >= pd->linux_image_lo &&
-        vaddr < pd->linux_image_hi) return 1;
-    if (pd->linux_heap_base && vaddr >= pd->linux_heap_base &&
-        vaddr < pd->linux_heap_limit) return 1;
+    if (linux_group_image_lo(pd) && vaddr >= linux_group_image_lo(pd) &&
+        vaddr < linux_group_image_hi(pd)) return 1;
+    if (linux_group_heap_base(pd) && vaddr >= linux_group_heap_base(pd) &&
+        vaddr < linux_group_heap_limit(pd)) return 1;
     return 0;
 }
 
@@ -857,14 +859,14 @@ uint32_t env_payload_capture_all(void) {
                     tk.form = ENV_PAYLOAD_FORM_RUNNING;
                 }
                 tk.fs_base     = pd->fs_base;
-                tk.brk_cur     = pd->linux_brk_cur;
-                tk.mmap_top    = pd->linux_mmap_top;
-                tk.heap_base   = pd->linux_heap_base;
-                tk.heap_limit  = pd->linux_heap_limit;
+                tk.brk_cur     = linux_group_brk(pd);
+                tk.mmap_top    = linux_group_mmap_top(pd);
+                tk.heap_base   = linux_group_heap_base(pd);
+                tk.heap_limit  = linux_group_heap_limit(pd);
                 tk.stack_bottom = rec->tasks[t].stack_bottom;
                 tk.stack_top    = rec->tasks[t].stack_top;
-                tk.image_lo    = pd->linux_image_lo;
-                tk.image_hi    = pd->linux_image_hi;
+                tk.image_lo    = linux_group_image_lo(pd);
+                tk.image_hi    = linux_group_image_hi(pd);
             } else if (ep_proc_parked(pd)) {
                 tk.form = ENV_PAYLOAD_FORM_PARKED;
                 tk.park_syscall = pd->park_syscall;
@@ -998,10 +1000,10 @@ uint32_t env_payload_capture_all(void) {
                 rec->tasks[t].name, (unsigned)task_npages[t],
                 (unsigned)n_rx, (unsigned)n_rw, (unsigned)n_other,
                 (unsigned)task_form[t],
-                (unsigned long long)pds[t]->linux_image_lo,
-                (unsigned long long)pds[t]->linux_image_hi,
-                (unsigned long long)pds[t]->linux_heap_base,
-                (unsigned long long)pds[t]->linux_heap_limit);
+                (unsigned long long)linux_group_image_lo(pds[t]),
+                (unsigned long long)linux_group_image_hi(pds[t]),
+                (unsigned long long)linux_group_heap_base(pds[t]),
+                (unsigned long long)linux_group_heap_limit(pds[t]));
         }
         kernel_serial_printf(
             "[ENV_PAYLOAD] captured partition=%u index=%u tasks=%u pages=%u "
@@ -1739,8 +1741,8 @@ int env_payload_restore(uint32_t partition, uint32_t index,
                 pd->user_rip       = tk.user_rip;
                 pd->user_rsp       = tk.user_rsp;
                 pd->fs_base        = adopted_fs;
-                pd->linux_brk_cur  = tk.brk_cur;
-                pd->linux_mmap_top = tk.mmap_top;
+                linux_group_set_brk(pd, tk.brk_cur);
+                linux_group_set_mmap_top(pd, tk.mmap_top);
                 /* E7 increment 21: the stop is ONE-SHOT, and FORM_ENTRY is
                  * its aftermath. The replay's create is built from the same
                  * FLAG_GATE manifest, so the fresh descriptor came back with

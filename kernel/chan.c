@@ -51,6 +51,7 @@
 #include "process.h"   /* E7 increment 12: the reply payload's staged
                         * destination lives on the descriptor (the
                         * copy-in aims where the FIRST trap said) */
+#include "linux_thread.h"  /* E7 TG-1 I1: the getdents64 cursor is group-owned */
 #include "linux_abi.h"   /* E7 increment 3: SYS_LINUX_TRAP_RESUME, the request
                           * struct, linux_syscall_apply_reply, errno map */
 #include "kernel_io.h"
@@ -1041,7 +1042,7 @@ uint64_t k_linux_deliver(uint32_t pid, uint16_t ch_r, uint64_t expect_num) {
                     uint8_t dbuf[LINUX_DIRENT_USER_CAP];
                     uint32_t fitted = 0;
                     int packed = linux_dirent_pack(pay, n, saux,
-                                                   pd->linux_dir_pos,
+                                                   linux_group_dir_pos(pd),
                                                    dbuf, &fitted);
                     if (packed < 0)
                         return (uint64_t)(int64_t)(-LINUX_EPROTO);
@@ -1049,7 +1050,7 @@ uint64_t k_linux_deliver(uint32_t pid, uint16_t ch_r, uint64_t expect_num) {
                         linux_user_copy_in(dbuf, pd->cr3, sva,
                                            (uint32_t)packed) != 0)
                         return (uint64_t)(int64_t)(-LINUX_EFAULT);
-                    pd->linux_dir_pos += fitted;
+                    linux_group_add_dir_pos(pd, fitted);
                     return (uint64_t)(uint32_t)packed;
                 }
                 if (linux_user_copy_in(pay, pd->cr3, sva, n) != 0) {

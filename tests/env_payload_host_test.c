@@ -26,7 +26,8 @@
  * Build and run:
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I arch/x86 \
  *       -o /tmp/env_payload_host_test \
- *       tests/env_payload_host_test.c kernel/env_payload.c kernel/env_ckpt.c
+ *       tests/env_payload_host_test.c kernel/env_payload.c kernel/env_ckpt.c \
+ *           kernel/linux_thread.c
  *   /tmp/env_payload_host_test
  */
 #include "tests/partition_host_stubs.h"  /* env_ckpt.c's partition_pause/_resume/_is_paused/_exists */
@@ -38,9 +39,15 @@
 #include "kernel/env_ckpt.h"
 #include "kernel/env_console.h"
 #include "kernel/process.h"
+#include "kernel/linux_thread.h"
 #include "kernel/cap.h"
 #include "kernel/linux_abi.h"      /* E7 increment 20: SYS_LINUX_TRAP_RESUME, the parked Linux form */
 #include "kernel/env_storage.h"   /* env_storage_extent_of link stub, as env_ckpt_host_test's */
+
+/* I1 link stubs: the group's teardown is not exercised by this payload test,
+ * but linux_thread.c references both. */
+void cap_table_teardown(uint32_t pid) { (void)pid; }
+void user_destroy_page_table(uint64_t pml4_phys) { (void)pml4_phys; }
 
 static int checks_passed = 0;
 static int checks_failed = 0;
@@ -270,6 +277,7 @@ static uint32_t setup_and_capture(int captured_parked) {
     map_reset();
     env_ckpt_reset();
     memset(proc_table, 0, sizeof proc_table);
+    linux_groups_init();   /* I1: slot identity is group-less until the create */
     memset(&g_disk, 0, sizeof g_disk);
     g_inject_ret = 1; g_inject_env = 0; g_inject_len = 0xFFFFFFFFu;
     g_snap_ret = 1;
@@ -449,6 +457,7 @@ static uint32_t setup_and_capture_linux(int linux_ctx) {
     lmap_reset();
     env_ckpt_reset();
     memset(proc_table, 0, sizeof proc_table);
+    linux_groups_init();   /* I1: re-init after the raw table reset */
     g_snap_ret = 1; g_snap_len = 0; g_inject_ret = 1;
     g_identity_seen = 1;
 
@@ -486,18 +495,19 @@ static uint32_t setup_and_capture_linux(int linux_ctx) {
 
     struct ProcessDescriptor* lx = &proc_table[1];
     lx->active = 1;
+    lx->pid = 101;
     strcpy(lx->name, "e7.gate.user.0");
     lx->cr3 = (uint64_t)(uintptr_t)g_pml4_l;
     lx->state = PROC_SUSPENDED;
     lx->waiting_chan = CAP_NONE;   /* a user-space stop is not a park */
     lx->has_ring3_ctx = 1;
     lx->fs_base = 0x700000ull;
-    lx->linux_brk_cur = L_HEAP + 0x2000ull;
-    lx->linux_mmap_top = L_HEAP + 0x4000ull;
-    lx->linux_heap_base = L_HEAP;
-    lx->linux_heap_limit = L_HEAP + 0x10000ull;
-    lx->linux_image_lo = L_IMG;
-    lx->linux_image_hi = L_IMG + 0x2000ull;
+    /* E7 TG-1 I1: the tenant's span/cursors are the group's. */
+    if (linux_group_create(lx) != 0) return 0;
+    linux_group_stamp_memory(lx, L_HEAP, L_HEAP + 0x10000ull,
+                             L_IMG, L_IMG + 0x2000ull);
+    linux_group_set_brk(lx, L_HEAP + 0x2000ull);
+    linux_group_set_mmap_top(lx, L_HEAP + 0x4000ull);
     if (linux_ctx == 2) {
         /* The stop: HELD, no park, and ring3_ctx built as the stop builds it
          * — rip at the syscall instruction, rax = the number it will re-run,
@@ -553,8 +563,8 @@ static void simulate_fresh_boot_linux(void) {
     proc_table[1].state = PROC_SUSPENDED;
     proc_table[1].waiting_chan = CAP_NONE;
     proc_table[1].fs_base = 0;
-    proc_table[1].linux_brk_cur = 0;
-    proc_table[1].linux_mmap_top = 0;
+    linux_group_set_brk(&proc_table[1], 0);
+    linux_group_set_mmap_top(&proc_table[1], 0);
     proc_table[1].user_rip = L_IMG;    /* the fresh entry, not the capture point */
     proc_table[1].user_rsp = L_STACK + 0x2000;
 }
@@ -784,8 +794,8 @@ int main(void) {
               "LINUX: the full ring3_ctx — rip, rsp and the six argument registers — is the captured one");
     }
     CHECK(proc_table[1].fs_base == 0x700000ull &&
-          proc_table[1].linux_brk_cur == L_HEAP + 0x2000ull &&
-          proc_table[1].linux_mmap_top == L_HEAP + 0x4000ull,
+          linux_group_brk(&proc_table[1]) == L_HEAP + 0x2000ull &&
+          linux_group_mmap_top(&proc_table[1]) == L_HEAP + 0x4000ull,
           "LINUX: fs_base and both memory cursors come back with the context");
     CHECK(proc_table[1].user_rip == L_IMG + 0x40 &&
           proc_table[1].user_rsp == L_STACK + 0x1000 &&

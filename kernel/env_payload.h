@@ -56,8 +56,9 @@ struct EnvCkptRecord;
  *      process's own page-table frames.
  *   3. Only image/stack-window and private-region pages are captured at
  *      all — plus, for a Linux task, the pages inside its OWN image span
- *      (`linux_image_lo..hi`, a linked ET_EXEC's segments) and its budget
- *      span (`linux_heap_base..limit`, where brk and anonymous maps land).
+ *      (`linux_group_image_lo..hi`, a linked ET_EXEC's segments) and its
+ *      group's budget span (`linux_group_heap_base..limit`, where brk and
+ *      anonymous maps land).
  *      Shared-arena and lazily-granted frames belong to their owners and
  *      are restored fresh by them; capturing them here would both miss
  *      their restore path and risk writing another tenant's memory.

@@ -57,6 +57,7 @@
 #include "kernel_io.h"
 #include "frame_pool.h"
 #include "process.h"
+#include "linux_thread.h"
 #include "env_service.h"
 #include "env_console.h"
 #include "env_storage.h"   // POSIX-Environments Roadmap v0.2 Phase P1b
@@ -342,10 +343,21 @@ static uint64_t cap_word_stamp_revoked(uint64_t w) {
 
 /* ─── Table lookup / slot freelist ─────────────────────────────────────────── */
 
+/* E7 TG-1 I1: cap.c is compiled into host tests that do not link the group
+ * substrate; they get the identity mapping. The kernel (and the thread-group
+ * host test) links linux_thread.c's strong definition, which resolves a group
+ * member to its group's cap owner — one table and one channel pair for every
+ * thread of the group. */
+__attribute__((weak)) uint32_t proc_group_cap_owner(uint32_t pid) { return pid; }
+
 /* Returns the table index for pid, binding lazily. Table 0 is the kernel
  * context (pid 0). -1 on table exhaustion (never, with PROC_MAX processes
  * and CAP_TABLE_MAX == PROC_MAX + kernel slot). */
 int cap_table_index(uint32_t pid) {
+    /* A Linux group member sees the group's capability table, not a private
+     * one: the leader's table carries the environment's caps and its single
+     * sidecar channel pair, and I2's clone must find both through this call. */
+    pid = proc_group_cap_owner(pid);
     if (pid == 0) return 0;
     for (int i = 0; i < CAP_TABLE_MAX; i++)
         if (cap_table_pid[i] == pid) return i;
@@ -3963,10 +3975,14 @@ int cap_create_sidecar_in_personality(uint32_t parent_pid,
      * The sidecar's ledger mirrors these numbers from the manifest it
      * authored (user/sidecar/src/e7_probe.rs; guard clause N2 pins both
      * halves). */
-    pd->linux_heap_base  = 0;
-    pd->linux_heap_limit = 0;
-    pd->linux_brk_cur    = 0;
-    pd->linux_mmap_top   = 0;
+    /* E7 TG-1 I1: the shared span is computed here and stamped onto the
+     * group once the descriptor's identity and cr3 exist (below). An SLS
+     * child gets no group at all, so a brk-shaped stage on an SLS slot has no
+     * span to grant against — the same posture as the old slot-reuse zero. */
+    uint64_t group_heap_base  = 0;
+    uint64_t group_heap_limit = 0;
+    uint64_t group_image_lo   = 0;
+    uint64_t group_image_hi   = 0;
     pd->mem_stage_valid  = 0;
     pd->mem_stage_num    = 0;
     pd->mem_stage_a0     = 0;
@@ -3974,11 +3990,10 @@ int cap_create_sidecar_in_personality(uint32_t parent_pid,
     pd->mem_stage_a2     = 0;
     pd->mem_stage_a3     = 0;
     if (personality == PROC_PERSONALITY_LINUX) {
-        pd->linux_heap_base  = stack_base + (uint64_t)stk_pages * 4096;
-        pd->linux_heap_limit = pd->linux_heap_base
-                             + ((m.budget_mem_bytes + 4095ULL) / 4096ULL)
-                               * 4096ULL;
-        pd->linux_brk_cur    = pd->linux_heap_base;
+        group_heap_base  = stack_base + (uint64_t)stk_pages * 4096;
+        group_heap_limit = group_heap_base
+                         + ((m.budget_mem_bytes + 4095ULL) / 4096ULL)
+                           * 4096ULL;
         /* E7 increment 20: a linked ET_EXEC's image pages are at their
          * p_vaddr (0x400000 for the census/firstuser builds), inside the
          * child's shared identity map — NOT in the flat mapper's image
@@ -3986,15 +4001,15 @@ int cap_create_sidecar_in_personality(uint32_t parent_pid,
          * image's pages from the rest of that map; the flat path leaves it
          * zero, because there the window IS the image. */
         if (image_is_elf) {
-            pd->linux_image_lo = elfinfo.load_lo;
-            pd->linux_image_hi = elfinfo.load_hi;
+            group_image_lo = elfinfo.load_lo;
+            group_image_hi = elfinfo.load_hi;
         }
-        /* E7 increment 16: the anonymous-map cursor is born at the
-         * span's top — the sidecar ledger's mtop is the policy twin —
-         * so brk grows up from the base and a granted mmap descends
-         * from the limit, and the two can never meet: each verdict
-         * re-checks against its OWN copy of both cursors. */
-        pd->linux_mmap_top   = pd->linux_heap_limit;
+        /* E7 increment 16: the anonymous-map cursor is born at the span's
+         * top — the sidecar ledger's mtop is the policy twin — so brk grows
+         * up from the base and a granted mmap descends from the limit, and
+         * the two can never meet: each verdict re-checks against its OWN copy
+         * of both cursors. linux_group_stamp_memory() sets brk = base and
+         * mmap_top = limit beside these numbers. */
     }
     if (m.name_len > 0) {
         /* Use the manifest's NAME record for the debug name. */
@@ -4147,6 +4162,26 @@ int cap_create_sidecar_in_personality(uint32_t parent_pid,
             pd->linux_stack_pages  = stk_pages;
             pd->linux_stack_poison = (uint32_t)poison_bytes;
         }
+    }
+    /* E7 TG-1 I1: a LINUX child becomes a group of one, here — after its
+     * identity (pid/name/cr3/user entry) is built and before it is
+     * schedulable. The group owns the page table and the cap table (the
+     * latter still the leader's until I2 extends membership); the descriptor
+     * carries the group index. A group-table exhaustion refuses the create
+     * rather than releasing a task whose shared state has no owner. */
+    if (personality == PROC_PERSONALITY_LINUX) {
+        if (linux_group_create(pd) != 0) {
+            kernel_serial_printf(
+                "[CS] CAP_ECONFLICT: no free Linux thread group for pid=%u\n",
+                pd->pid);
+            free_contiguous_frames_for_partition(linux_stack_phys, stk_pages,
+                                                  child_partition);
+            user_destroy_page_table(new_cr3);
+            pd->cr3 = 0;
+            return CAP_ECONFLICT;
+        }
+        linux_group_stamp_memory(pd, group_heap_base, group_heap_limit,
+                                 group_image_lo, group_image_hi);
     }
     pd->owner_uid  = parent->owner_uid;
     pd->parent_pid = parent_pid;

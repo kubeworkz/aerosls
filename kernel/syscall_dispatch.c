@@ -6,6 +6,7 @@
 #include "tier_mgr.h"
 #include "query_engine.h"
 #include "process.h"
+#include "linux_thread.h"
 #include "loader.h"
 #include "agent.h"
 #include "../kernel/webapp.h"
@@ -261,10 +262,10 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                         if (snum == LINUX_BRK) {
                             struct LinuxMemBrkVerdict v =
                                 linux_mem_brk_verdict(
-                                    cur->linux_heap_base,
-                                    cur->linux_heap_limit,
-                                    cur->linux_mmap_top,
-                                    cur->linux_brk_cur, sa0, rax);
+                                    linux_group_heap_base(cur),
+                                    linux_group_heap_limit(cur),
+                                    linux_group_mmap_top(cur),
+                                    linux_group_brk(cur), sa0, rax);
                             if (v.malformed) {
                                 kernel_serial_printf(
                                     "[E7] brk reply 0x%lx for request "
@@ -273,10 +274,10 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                     "the refusal - break unmoved\n",
                                     (unsigned long)rax,
                                     (unsigned long)sa0,
-                                    (unsigned long)cur->linux_heap_base,
-                                    (unsigned long)cur->linux_heap_limit,
-                                    (unsigned long)cur->linux_brk_cur);
-                                rax = cur->linux_brk_cur;
+                                    (unsigned long)linux_group_heap_base(cur),
+                                    (unsigned long)linux_group_heap_limit(cur),
+                                    (unsigned long)linux_group_brk(cur));
+                                rax = linux_group_brk(cur);
                             } else if (v.map_pages) {
                                 uint64_t *pml4 =
                                     (uint64_t *)(uintptr_t)cur->cr3;
@@ -302,7 +303,7 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                     done++;
                                 }
                                 if (done == v.map_pages) {
-                                    cur->linux_brk_cur = v.new_cur;
+                                    linux_group_set_brk(cur, v.new_cur);
                                 } else {
                                     while (done) {
                                         uint64_t f;
@@ -320,7 +321,7 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                         "exhaustion mid-batch - batch "
                                         "unwound, break unmoved\n",
                                         (unsigned long)v.new_cur);
-                                    rax = cur->linux_brk_cur;
+                                    rax = linux_group_brk(cur);
                                 }
                             }
                         } else if (snum == LINUX_MMAP) {
@@ -368,10 +369,10 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                 mreq.prot  = sa2;
                                 mreq.flags = sa3;
                                 v = linux_mem_mmap_verdict(
-                                    cur->linux_heap_base,
-                                    cur->linux_heap_limit,
-                                    cur->linux_brk_cur,
-                                    cur->linux_mmap_top, &mreq, rax);
+                                    linux_group_heap_base(cur),
+                                    linux_group_heap_limit(cur),
+                                    linux_group_brk(cur),
+                                    linux_group_mmap_top(cur), &mreq, rax);
                                 if (v.malformed) {
                                     kernel_serial_printf(
                                         "[E7] mmap reply 0x%lx for "
@@ -383,10 +384,10 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                         (unsigned long)rax,
                                         (unsigned long)sa0,
                                         (unsigned long)sa1,
-                                        (unsigned long)cur->linux_heap_base,
-                                        (unsigned long)cur->linux_heap_limit,
-                                        (unsigned long)cur->linux_brk_cur,
-                                        (unsigned long)cur->linux_mmap_top);
+                                        (unsigned long)linux_group_heap_base(cur),
+                                        (unsigned long)linux_group_heap_limit(cur),
+                                        (unsigned long)linux_group_brk(cur),
+                                        (unsigned long)linux_group_mmap_top(cur));
                                     rax = (uint64_t)(int64_t)
                                           (-LINUX_ENOMEM);
                                 } else {
@@ -459,8 +460,8 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                         rax = (uint64_t)(int64_t)
                                               (-LINUX_ENOMEM);
                                     } else {
-                                        cur->linux_mmap_top =
-                                            v.new_mmap_top;
+                                        linux_group_set_mmap_top(cur,
+                                            v.new_mmap_top);
                                     }
                                 }
                             } else if (snum == LINUX_MUNMAP) {
@@ -493,9 +494,9 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                 mreq.addr = sa0;
                                 mreq.len  = sa1;
                                 v = linux_mem_munmap_verdict(
-                                    cur->linux_heap_base,
-                                    cur->linux_heap_limit,
-                                    cur->linux_brk_cur, &mreq, rax);
+                                    linux_group_heap_base(cur),
+                                    linux_group_heap_limit(cur),
+                                    linux_group_brk(cur), &mreq, rax);
                                 if (v.malformed) {
                                     kernel_serial_printf(
                                         "[E7] munmap reply 0x%lx for "
@@ -506,9 +507,9 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                         (unsigned long)rax,
                                         (unsigned long)sa0,
                                         (unsigned long)sa1,
-                                        (unsigned long)cur->linux_heap_base,
-                                        (unsigned long)cur->linux_heap_limit,
-                                        (unsigned long)cur->linux_brk_cur);
+                                        (unsigned long)linux_group_heap_base(cur),
+                                        (unsigned long)linux_group_heap_limit(cur),
+                                        (unsigned long)linux_group_brk(cur));
                                     rax = (uint64_t)(int64_t)
                                           (-LINUX_EINVAL);
                                 } else if (v.unmap_pages) {
@@ -760,7 +761,8 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                     mreq.prot  = largs[2];
                     mreq.flags = largs[3];
                     mref = linux_mem_mmap_refusal(&mreq,
-                            cur->linux_heap_base, cur->linux_heap_limit);
+                            linux_group_heap_base(cur),
+                            linux_group_heap_limit(cur));
                     if (mref) {
                         kernel_serial_printf(
                             "[E7] linux mmap addr=0x%lx len=%lu prot=%lu "
@@ -800,8 +802,9 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                     mreq.addr = largs[0];
                     mreq.len  = largs[1];
                     mref = linux_mem_munmap_refusal(&mreq,
-                            cur->linux_heap_base, cur->linux_heap_limit,
-                            cur->linux_brk_cur);
+                            linux_group_heap_base(cur),
+                            linux_group_heap_limit(cur),
+                            linux_group_brk(cur));
                     if (mref) {
                         kernel_serial_printf(
                             "[E7] linux munmap addr=0x%lx len=%lu "
@@ -836,9 +839,9 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                  * would share this cursor), and a reused slot resets it
                  * beside every other piece of per-task state. */
                 if (num == LINUX_OPEN)
-                    cur->linux_dir_pos = 0;
+                    linux_group_set_dir_pos(cur, 0);
                 if (num == LINUX_GETDENTS64)
-                    largs[5] = cur->linux_dir_pos;
+                    largs[5] = linux_group_dir_pos(cur);
                 /* E7 increment 21: remember that the forward about to be
                  * armed is the gate workload's read(fd 3), so the resume
                  * sentinel can count the bytes its reply actually returns and

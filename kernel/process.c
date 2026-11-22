@@ -1,4 +1,5 @@
 #include "process.h"
+#include "linux_thread.h"
 #include "object_catalog.h"
 #include "kernel_io.h"
 #include "loader.h"
@@ -148,30 +149,14 @@ static void proc_clear_resume_state(struct ProcessDescriptor* pd) {
     pd->fs_base = 0;
     pd->fs_base_stage = 0;
     pd->fs_stage_valid = 0;
-    /* E7 increment 6 (§5.4): the mem class's state clears here for the
-     * same two reasons — a reused slot must not inherit its
-     * predecessor's heap span (a stale brk_cur would make the next
-     * occupant's grant map pages at a break it never asked for, and a
-     * stale limit would let a grant the policy side refused through the
-     * kernel's own re-check), and an unanswered brk stage must not
-     * survive into a slot whose pid it never belonged to. Spawn paths
-     * that want LINUX stamp the span inside the same create call
-     * (cap_create_sidecar_in_personality), like the personality itself.
-     * E7 increment 16 widens the same rule: a stale mmap cursor would
-     * let a reused slot's non-FIXED grant land on (or its brk growth
-     * map over) a page the PREVIOUS occupant's map owned, and the
-     * staged mmap words must not survive into a slot whose pid they
-     * never belonged to — a reply carrying them would map against a
-     * span that is not the ask's. */
-    pd->linux_heap_base = 0;
-    pd->linux_heap_limit = 0;
-    pd->linux_brk_cur = 0;
-    pd->linux_mmap_top = 0;
-    /* E7 increment 20: the image range clears with the span for the same
-     * reason — a reused slot's capture would otherwise walk (and pour) the
-     * previous occupant's image pages as if they were this task's own. */
-    pd->linux_image_lo = 0;
-    pd->linux_image_hi = 0;
+    /* E7 TG-1 I1: the shared span/cursors are the GROUP's (linux_thread.h);
+     * this per-descriptor clear no longer touches them. linux_group_create()
+     * stamps a fresh group, linux_group_destroy() zeroes its cursors, and the
+     * identity fields are cleared by linux_group_clear_identity() at teardown
+     * — after the group's one cap/page teardown, never here, because a live
+     * group must stay resolvable until its resources are released. The one
+     * per-thread value the resume path owns is the futex result. */
+    pd->sysret_result = 0;
     /* Q2: the gate stack's measurement identity clears with the span for the
      * same reason — a reused slot must not scan (or report) its predecessor's
      * freed frames, and the poison count is what says whether a measurement
@@ -204,7 +189,6 @@ static void proc_clear_resume_state(struct ProcessDescriptor* pd) {
      * per-task state resets). */
     pd->reply_stage_kind = 0;
     pd->reply_stage_aux = 0;
-    pd->linux_dir_pos = 0;
 }
 
 /* E7 (increment 2): read this CPU's captured Linux argument registers.
@@ -235,6 +219,9 @@ int proc_read_linux_args(uint64_t out[6]) {
 // ─── process_init ─────────────────────────────────────────────────────────────
 void process_init(void) {
     for (int i = 0; i < PROC_MAX; i++) proc_table[i].active = 0;
+    /* E7 TG-1 I1: every descriptor starts group-less; the Linux create
+     * stamps the identity and index onto the group it makes. */
+    linux_groups_init();
     // Phase 12: -1 = "never scheduled from this partition yet" for every
     // partition's round-robin cursor (BSS zero-init would give 0, a real
     // proc_table[] index, not a sentinel — must be set explicitly).
@@ -848,9 +835,24 @@ void process_exit(uint32_t exit_code) {
          * pd->active stays 1 until after step 1 because
          * cap_proc_cr3(pid) (used by the teardown's unmap walk) requires
          * an active descriptor. */
-        cap_table_teardown(pd->pid);
-        user_destroy_page_table(pd->cr3);
+        /* E7 TG-1 I1: a LINUX descriptor's cap table and page table belong to
+         * its group; the group destroys them ONCE. A non-Linux descriptor
+         * keeps the historical per-process teardown. */
+        {
+            struct LinuxThreadGroup* lg = linux_group_of(pd);
+            if (lg) {
+                linux_group_destroy(lg);
+            } else if (pd->personality != PROC_PERSONALITY_LINUX) {
+                /* An SLS descriptor keeps the historical per-process
+                 * teardown. A LINUX descriptor with no group has already had
+                 * its one group teardown (I2's sibling exit lands here) — it
+                 * must not free the shared root again. */
+                cap_table_teardown(pd->pid);
+                user_destroy_page_table(pd->cr3);
+            }
+        }
         proc_free_syscall_stack(pd);
+        linux_group_clear_identity(pd);
 
         pd->active = 0;
         proc_count--;
@@ -1519,9 +1521,17 @@ static void proc_deferred_teardown(struct ProcessDescriptor* pd) {
         pd->pid, pd->name);
     linux_stack_maybe_report(pd, "exit");
     proc_clear_resume_state(pd);
-    cap_table_teardown(pd->pid);
-    user_destroy_page_table(pd->cr3);
+    {
+        struct LinuxThreadGroup* lg = linux_group_of(pd);
+        if (lg) {
+            linux_group_destroy(lg);
+        } else if (pd->personality != PROC_PERSONALITY_LINUX) {
+            cap_table_teardown(pd->pid);
+            user_destroy_page_table(pd->cr3);
+        }
+    }
     proc_free_syscall_stack(pd);
+    linux_group_clear_identity(pd);
     pd->active = 0;
     proc_count--;
 }
@@ -2489,9 +2499,17 @@ void process_kill(uint32_t pid) {
          * reused slot never inherits the killed process's stale
          * resume_sysret/park_ctx (caught live — see proc_clear_resume_state). */
         proc_clear_resume_state(&proc_table[i]);
-        cap_table_teardown(proc_table[i].pid);
-        user_destroy_page_table(proc_table[i].cr3);
+        {
+            struct LinuxThreadGroup* lg = linux_group_of(&proc_table[i]);
+            if (lg) {
+                linux_group_destroy(lg);
+            } else if (proc_table[i].personality != PROC_PERSONALITY_LINUX) {
+                cap_table_teardown(proc_table[i].pid);
+                user_destroy_page_table(proc_table[i].cr3);
+            }
+        }
         proc_free_syscall_stack(&proc_table[i]);
+        linux_group_clear_identity(&proc_table[i]);
         proc_table[i].active = 0;
         proc_count--;
         return;
