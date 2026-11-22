@@ -92,10 +92,18 @@ trap 'git checkout -- "$ART" "$PROOF" 2>/dev/null || true; cp "$tmp/tool.bak" "$
 
 # tooth <label> <expected-substring> <mutation>
 tooth() {
-    local label="$1" expected="$2" mutate="$3" out rc
+    local label="$1" expected="$2" mutate="$3" out rc before after
+    before="$(sha256sum "$ART" "$PROOF")"
     if ! eval "$mutate"; then
         echo "TOOTH FAIL $label — the mutation itself failed"
         fails=$((fails + 1))
+        return
+    fi
+    after="$(sha256sum "$ART" "$PROOF")"
+    if [ "$before" = "$after" ]; then
+        echo "TOOTH FAIL $label — mutation did not apply: $ART and $PROOF are unchanged, so the guard would run against the pristine artifacts"
+        fails=$((fails + 1))
+        git checkout -- "$ART" "$PROOF"
         return
     fi
     out="$(bash "$guard" 2>&1)"

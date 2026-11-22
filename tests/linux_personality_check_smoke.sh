@@ -132,6 +132,15 @@ fail=0
 # refuse.
 tooth() {
     local name="$1" clause="$2" desc="$3" d="$4" out rc named=0
+    # VACUITY GUARD. A sed whose pattern stopped matching leaves the copy
+    # pristine; the guard then passes and this tooth reports "did not bite",
+    # pointing at the guard when the drift was in the mutation. Prove the
+    # mutation landed before the guard is asked to react to it.
+    if diff -r "$W/base" "$d" >/dev/null 2>&1; then
+        echo "TOOTH FAIL $name — mutation did not apply: the seeded copy is byte-identical to the baseline, so this tooth would assert against a pristine tree"
+        fail=$((fail+1))
+        return
+    fi
     out="$(run_guard "$d")"; rc=$?
     # The verdict is a CASE, not `printf | grep -q`. This file runs under
     # `set -o pipefail`, and grep -q exits at its FIRST match, so the printf
