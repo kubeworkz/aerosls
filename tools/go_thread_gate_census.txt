@@ -1,0 +1,54 @@
+# AeroSLS E7 Go thread-gate syscall census
+# candidate: go_thread_gate
+# provenance: docs/AeroSLS-E7-Thread-Group-Gate-v0.1.md (TG-0)
+# args: tools/go_thread_gate_args_census.txt (TG-0b argument shapes)
+# source: tools/go_thread_gate
+# source-sha256: main.go=d25479aefc54378ae09a6da62e69eb77329f4acd51404d12dc5d68008ce6c6e9 go.mod=47b4f13c9c258c87c8e51e97c78239391dfb248fb1f16c92e84658fdd24f7300
+# binary: /tmp/go-census/go_thread_gate (ephemeral build output)
+# build: cd tools/go_thread_gate && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildmode=exe -trimpath -buildvcs=false -o /tmp/go-census/go_thread_gate .
+# toolchain: go1.25.1 linux/amd64
+# toolchain-sha256: 7716a0d940a0f6ae8e1f3b3f4f36299dc53e31b16840dbd171254312c41ca12e
+# binary-sha256: a1348ca7daf693827a4a35bf437b9f1fb82dfd5b0d9cbf0dba7153388cdc8f28
+# target: linux/amd64
+# host: Linux 6.18.33.2-microsoft-standard-WSL2 x86_64
+# date: 2026-11-09T18:58:54Z
+# method: strace -f full trace, entry-counted
+# vdso-backstopped: none (host has a vDSO; this gate made no visible clock/gettimeofday call)
+# workload: 65536-byte file copy, byte-identical input/output
+# threads: main_tid=1242243 worker_tid=1242245; futex_wait=0 futex_wake=1
+# columns: <syscall-number> <name> <count>
+# required-by-runtime (ENOSYS is fatal or corrupts the run): 9 mmap 13 rt_sigaction 14 rt_sigprocmask 56 clone 72 fcntl 131 sigaltstack 158 arch_prctl 202 futex 231 exit_group 233 epoll_ctl 257 openat 281 epoll_pwait 290 eventfd2 291 epoll_create1
+# required-by-gate (the gate itself cannot complete without it): 0 read 1 write 3 close 60 exit 74 fsync 186 gettid
+# optional/tolerated under forced ENOSYS: 17 pread64 24 sched_yield 28 madvise 35 nanosleep 63 uname 157 prctl 204 sched_getaffinity 302 prlimit64 326 copy_file_range
+# bootstrap-only: 59 execve
+# note: counts are one run and scheduling-sensitive; the row SET is the measured surface
+0 read 6
+1 write 3
+3 close 5
+9 mmap 22
+13 rt_sigaction 114
+14 rt_sigprocmask 21
+17 pread64 2
+24 sched_yield 2
+28 madvise 2
+35 nanosleep 51
+56 clone 6
+59 execve 1
+60 exit 1
+63 uname 1
+72 fcntl 14
+74 fsync 1
+131 sigaltstack 15
+157 prctl 2
+158 arch_prctl 1
+186 gettid 15
+202 futex 54
+204 sched_getaffinity 2
+231 exit_group 1
+233 epoll_ctl 3
+257 openat 6
+281 epoll_pwait 2
+290 eventfd2 1
+291 epoll_create1 1
+302 prlimit64 2
+326 copy_file_range 2
