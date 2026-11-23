@@ -216,6 +216,16 @@ int proc_read_linux_args(uint64_t out[6]) {
     return 1;
 }
 
+/* E7 TG-1 I2: the user RIP the current syscall must return to. syscall_entry
+ * saved RCX at [gs:0x18] before any call (the stack copy is not safe late —
+ * see proc_capture_entry_regs). The clone child starts there with rax=0, so
+ * the Go wrapper's post-syscall instruction is its first instruction. */
+int proc_read_linux_return_rip(uint64_t* out) {
+    if (!out) return 0;
+    __asm__ volatile("movq %%gs:0x18, %0" : "=r"(*out) : : "memory");
+    return 1;
+}
+
 // ─── process_init ─────────────────────────────────────────────────────────────
 void process_init(void) {
     for (int i = 0; i < PROC_MAX; i++) proc_table[i].active = 0;
@@ -758,6 +768,89 @@ static void proc_free_syscall_stack(struct ProcessDescriptor* pd) {
                                               frame_pool_frame_owner(addr / 4096));
     }
     pd->syscall_stack_top = 0;
+}
+
+/* ─── E7 TG-1 I2: kernel-local clone (the Go thread shape) ─────────────────
+ * Go's newosproc expects clone to create a schedulable peer in the SAME
+ * address space, not a process: no page-table clone, no sidecar request, no
+ * new LinuxTask row. The child is born SUSPENDED with a synthetic ring-3
+ * context and a fresh 8 KiB syscall stack, joins the caller's group, and
+ * returns the child's TID to the caller. Everything shared stays the
+ * group's; only fs_base, the context, the stack and the trap state are the
+ * child's own. Called with the caller's trap frame captured and interrupts
+ * off (the syscall path); no other CPU can observe the half-built slot. */
+int linux_clone_thread(struct ProcessDescriptor* parent,
+                       const struct LinuxClonePlan* plan,
+                       uint64_t parent_rip, uint32_t* out_tid) {
+    if (!parent || !plan || !out_tid) return -LINUX_EINVAL;
+    if (parent->personality != PROC_PERSONALITY_LINUX) return -LINUX_EINVAL;
+    struct LinuxThreadGroup* g = linux_group_of(parent);
+    if (!g || g->exiting) return -LINUX_EINVAL;
+    if (parent->cr3 != g->cr3) return -LINUX_EINVAL;
+    if (parent_rip == 0 || !linux_fs_addr_is_user_canonical(parent_rip))
+        return -LINUX_EINVAL;
+    if (g->live_threads >= LINUX_THREADS_MAX) return -LINUX_EAGAIN;
+
+    /* Re-run the pure validator against the parent's LIVE base, not against
+     * whatever a caller put in the plan: the TLS inherittance and the stack
+     * bounds are security-relevant, so the create re-checks its own copy. */
+    struct LinuxClonePlan check;
+    if (linux_clone_plan(plan->flags, plan->child_stack, plan->tls,
+                         parent->fs_base, &check) != 0)
+        return -LINUX_EINVAL;
+    if (check.flags != plan->flags || check.fs_base != plan->fs_base)
+        return -LINUX_EINVAL;
+
+    struct ProcessDescriptor* child = 0;
+    for (int i = 0; i < PROC_MAX; i++) {
+        if (!proc_table[i].active) { child = &proc_table[i]; break; }
+    }
+    if (!child) return -LINUX_EAGAIN;
+
+    uint64_t sstop = alloc_proc_syscall_stack(parent->partition_id);
+    if (!sstop) return -LINUX_EAGAIN;
+
+    /* A reused slot must not inherit anything: this is a new thread, and
+     * every field below is re-stamped explicitly rather than trusted. */
+    for (int i = 0; i < (int)sizeof(*child); i++) ((uint8_t*)child)[i] = 0;
+    child->pid          = next_pid++;
+    pr_strcpy(child->name, parent->name, PROC_NAME_LEN);
+    child->object_id    = parent->object_id;
+    child->cr3          = g->cr3;          /* the group's one root */
+    child->fs_base      = plan->fs_base;   /* per-thread TLS */
+    child->user_rip     = parent_rip;
+    child->user_rsp     = plan->child_stack;
+    child->owner_uid    = parent->owner_uid;
+    child->parent_pid   = parent->pid;
+    child->partition_id = parent->partition_id;
+    child->priority     = PROC_PRIO_NORMAL;
+    child->personality  = PROC_PERSONALITY_LINUX;
+    child->syscall_stack_top = sstop;
+    child->waiting_chan = CAP_NONE;
+    child->group_index  = LINUX_GROUP_NONE;
+    linux_clone_build_context(&child->ring3_ctx, parent_rip, plan->child_stack);
+
+    if (linux_group_join_thread(g, child) != 0) {
+        proc_free_syscall_stack(child);
+        for (int i = 0; i < (int)sizeof(*child); i++)
+            ((uint8_t*)child)[i] = 0;
+        return -LINUX_EAGAIN;
+    }
+
+    /* Only now is the slot visible: active + a schedulable resume shape. */
+    child->has_ring3_ctx = 1;
+    child->state         = PROC_SUSPENDED;
+    child->active        = 1;
+    proc_count++;
+
+    *out_tid = child->tid;
+    kernel_serial_printf(
+        "[E7] clone: TID %u joins group %u (leader %u) "
+        "rip=0x%lx stack=0x%lx tls=0x%lx\n",
+        child->tid, g->group_id, g->leader_pid,
+        (unsigned long)parent_rip, (unsigned long)plan->child_stack,
+        (unsigned long)plan->fs_base);
+    return 0;
 }
 
 // ─── process_exit ────────────────────────────────────────────────────────────

@@ -28,6 +28,7 @@ FILES=(
     kernel/process.c
     kernel/linux_thread.h
     kernel/linux_thread.c
+    tests/linux_clone_host_test.c
     kernel/cap.h
     kernel/cap.c
     kernel/syscall_dispatch.c
@@ -1041,6 +1042,53 @@ tooth munmap-fixture-marker-gone X5 "the probe no longer carries the E7MEM-MUNMA
 seed "$W/t128"
 sed -i 's/ ok munmap addr=0x//' "$W/t128/user/sidecar/src/linux.rs"
 tooth munmap-range-not-logged X6 "a granted munmap's answer line no longer carries the range" "$W/t128"
+
+# ─── Z teeth (TG-1 I2: the kernel-local clone) ──────────────────────────────
+
+# t136: VM dropped from the mandatory Go mask — the planner would accept a
+# "thread" whose address space the group still shares, the exact semantic lie
+# the six-flag requirement exists to prevent.
+seed "$W/t136"
+sed -i 's/#define LINUX_CLONE_GO_FLAGS (LINUX_CLONE_VM | LINUX_CLONE_FS |/#define LINUX_CLONE_GO_FLAGS (LINUX_CLONE_FS |/' "$W/t136/kernel/linux_thread.h"
+tooth clone-go-mask-loses-vm Z1 "the mandatory clone mask no longer carries CLONE_VM" "$W/t136"
+
+# t137: the unknown-bit refusal disabled — vfork/parent/namespace/clear-TID
+# would all reach the group path as if they were the Go shape.
+seed "$W/t137"
+sed -i 's/if (flags & ~LINUX_CLONE_ALLOWED) return -LINUX_EINVAL;/if (0) return -LINUX_EINVAL;/' "$W/t137/kernel/linux_thread.c"
+tooth clone-unknown-flags-allowed Z1 "the planner no longer refuses flags outside the Go mask" "$W/t137"
+
+# t138: rsi no longer carries the child stack — the Go wrapper's first
+# post-syscall instruction would move a zero (or parent) value into SP.
+seed "$W/t138"
+sed -i '/ctx->rsi   = child_stack;/d' "$W/t138/kernel/linux_thread.c"
+tooth clone-context-rsi-dropped Z2 "the child context no longer names its stack in rsi" "$W/t138"
+
+# t139: the child gets a zero cr3 instead of the group's root — a private
+# address space in every way that matters, with no page-table clone to own.
+seed "$W/t139"
+sed -i 's/child->cr3          = g->cr3;/child->cr3          = 0;/' "$W/t139/kernel/process.c"
+tooth clone-cr3-not-shared Z4 "the clone descriptor no longer points at the group's cr3" "$W/t139"
+
+# t140: the group join deleted — the descriptor would run with no tid/tgid,
+# no group index, and no admission count; cap/page teardown could never find
+# it as a member.
+seed "$W/t140"
+sed -i '/linux_group_join_thread(g, child)/d' "$W/t140/kernel/process.c"
+tooth clone-group-join-dropped Z4 "the new descriptor never joins the caller's group" "$W/t140"
+
+# t141: clone reclassified as an fd row — the dispatcher would describe and
+# post it to the sidecar, which has no clone arm or per-thread row, instead
+# of running the kernel-local branch.
+seed "$W/t141"
+sed -i 's/{  56, LSC_THREAD, 0 }/{  56, LSC_FD, 0 }/' "$W/t141/kernel/linux_abi.c"
+tooth clone-table-row-misclassified Z3 "clone is no longer LSC_THREAD" "$W/t141"
+
+# t142: the kernel-local branch gated off — clone falls through to the
+# generic describe/post/park path and never returns a child TID.
+seed "$W/t142"
+sed -i 's/if (num == LINUX_CLONE) {/if (0) {/' "$W/t142/kernel/syscall_dispatch.c"
+tooth clone-branch-gated-off Z3 "the first-trap clone branch never runs" "$W/t142"
 
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"

@@ -25,6 +25,7 @@
  */
 
 #include "linux_thread.h"
+#include "linux_abi.h"
 #include "process.h"
 
 /* Declared directly rather than through cap.h/user_paging.h: this file is
@@ -34,6 +35,67 @@ void cap_table_teardown(uint32_t pid);
 void user_destroy_page_table(uint64_t pml4_phys);
 
 struct LinuxThreadGroup linux_group_table[PROC_MAX];
+
+/* ─── I2: clone planning and context synthesis ─────────────────────────────
+ * Both are pure. The flag check is deliberately strict about the six shared
+ * flags: this kernel's group has no private fd table, fs root or signal
+ * handler table to hand a child that omitted one, so accepting the subset
+ * would return success for a semantic the next syscall would violate. */
+int linux_clone_plan(uint64_t flags, uint64_t child_stack, uint64_t tls,
+                     uint64_t parent_fs_base, struct LinuxClonePlan* out) {
+    if (!out) return -LINUX_EINVAL;
+    out->flags = 0;
+    out->child_stack = 0;
+    out->tls = 0;
+    out->fs_base = 0;
+
+    /* Unknown/vfork/parent/namespace/ptrace/clear-TID bits all fail this
+     * one mask check. CLONE_CHILD_CLEARTID is intentionally absent: Go's
+     * measured path does not use it and v1 makes no clear-TID promise. */
+    if (flags & ~LINUX_CLONE_ALLOWED) return -LINUX_EINVAL;
+    if ((flags & LINUX_CLONE_GO_FLAGS) != LINUX_CLONE_GO_FLAGS)
+        return -LINUX_EINVAL;
+
+    /* Linux's own consistency rules, named separately so a future shape
+     * change cannot accidentally accept CLONE_THREAD alone. */
+    if (!(flags & LINUX_CLONE_THREAD)) return -LINUX_EINVAL;
+    if (!(flags & LINUX_CLONE_VM) || !(flags & LINUX_CLONE_SIGHAND))
+        return -LINUX_EINVAL;
+
+    /* The kernel never allocates this stack — Go mapped it in the shared
+     * heap before trapping — so zero/non-canonical means the child would
+     * iretq into a non-address. */
+    if (child_stack == 0 || !linux_fs_addr_is_user_canonical(child_stack))
+        return -LINUX_EINVAL;
+
+    out->flags = flags;
+    out->child_stack = child_stack;
+    out->tls = tls;
+    if (flags & LINUX_CLONE_SETTLS) {
+        if (!linux_fs_addr_is_user_canonical(tls)) return -LINUX_EINVAL;
+        out->fs_base = tls;
+    } else {
+        out->fs_base = parent_fs_base;
+    }
+    return 0;
+}
+
+void linux_clone_build_context(struct TaskContext* ctx, uint64_t parent_rip,
+                               uint64_t child_stack) {
+    if (!ctx) return;
+    uint64_t* w = (uint64_t*)ctx;
+    for (int i = 0; i < 20; i++) w[i] = 0;
+    /* The clone wrapper's child lands at the instruction after syscall with
+     * rsi still holding its stack argument; Go's asm moves it to SP before
+     * entering mstart. rax = 0 is the child's clone return. */
+    ctx->rsi   = child_stack;
+    ctx->rax   = 0;
+    ctx->rip   = parent_rip;
+    ctx->cs    = 0x23;   /* ring-3 code */
+    ctx->rflags = 0x202; /* IF on */
+    ctx->rsp   = child_stack;
+    ctx->ss    = 0x1B;   /* ring-3 data */
+}
 
 void linux_groups_init(void) {
     for (int i = 0; i < PROC_MAX; i++) {
@@ -129,6 +191,26 @@ int linux_group_add_thread(struct LinuxThreadGroup* g) {
     if (!g || !g->used || g->exiting) return -1;
     if (g->live_threads >= LINUX_THREADS_MAX) return -1;
     g->live_threads++;
+    return 0;
+}
+
+int linux_group_join_thread(struct LinuxThreadGroup* g,
+                            struct ProcessDescriptor* child) {
+    if (!g || !child || !g->used || g->exiting) return -1;
+    if (child->pid == 0) return -1;
+    if (child->group_index != LINUX_GROUP_NONE) return -1;
+    int gi = -1;
+    for (int i = 0; i < PROC_MAX; i++) {
+        if (g == &linux_group_table[i]) { gi = i; break; }
+    }
+    if (gi < 0) return -1;
+    if (linux_group_add_thread(g) != 0) return -1;
+    child->cr3 = g->cr3;   /* membership means the group's one root */
+    child->tid = child->pid;
+    child->tgid = g->group_id;
+    child->group_index = (uint32_t)gi;
+    child->is_group_leader = 0;
+    child->sysret_result = 0;
     return 0;
 }
 

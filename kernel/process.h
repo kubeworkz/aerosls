@@ -681,6 +681,12 @@ int proc_gate_stop_at_sysret(uint64_t ret);
  * syscall scratch (pure kernel context). */
 int proc_read_linux_args(uint64_t out[6]);
 
+/* E7 TG-1 I2: the caller's user return RIP, from the syscall entry's rcx
+ * scratch ([gs:0x18]). clone's child starts at the instruction after the
+ * parent's syscall, so this is its first ring-3 rip. Returns 1 mid-syscall,
+ * 0 in pure kernel context. */
+int proc_read_linux_return_rip(uint64_t* out);
+
 uint32_t sys_sls_getppid(void);
 uint32_t sys_sls_yield(void);   /* SYS_SLS_YIELD (300) — Phase 1.5 immediate-wake handback */
 

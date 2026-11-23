@@ -134,6 +134,7 @@ const struct LinuxSyscallEntry linux_syscall_table[] = {
     {  12, LSC_MEM,    0 },   /* brk — §5.4 bump pointer in the budget */
     {  13, LSC_SIG,    0 },   /* rt_sigaction — the whole act recorded; a handler is never invoked */
     {  14, LSC_SIG,    0 },   /* rt_sigprocmask — recorded; unblock delivers (step 2) */
+    {  56, LSC_THREAD, 0 },   /* clone — the Go thread shape, kernel-local (I2) */
     {  59, LSC_SPAWN,  0 },   /* execve — the spawn path */
     {  72, LSC_FD,     0 },   /* fcntl */
     {  74, LSC_FD,     0 },   /* fsync */
@@ -187,6 +188,7 @@ const char *linux_syscall_class_name(enum LinuxSyscallClass cls)
     case LSC_SIG:    return "sig";
     case LSC_MSR:    return "msr";
     case LSC_SPAWN:  return "spawn";
+    case LSC_THREAD: return "thread";
     case LSC_LOCAL:  return "local";
     case LSC_EXIT:   return "exit";
     case LSC_UNKNOWN:

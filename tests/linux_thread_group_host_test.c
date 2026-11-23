@@ -17,7 +17,8 @@
  * Build and run:
  *   gcc -std=c11 -Wall -Wextra -I . -I kernel \
  *       -o /tmp/linux_thread_group_host_test \
- *       tests/linux_thread_group_host_test.c kernel/linux_thread.c
+ *       tests/linux_thread_group_host_test.c kernel/linux_thread.c \
+ *       kernel/linux_abi.c
  *   /tmp/linux_thread_group_host_test
  *
  * The capability table and page-table teardown are counted stubs here; the

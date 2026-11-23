@@ -66,7 +66,8 @@ for f in kernel/linux_abi.h kernel/linux_abi.c kernel/process.h kernel/process.c
          user/sidecar/src/e7_firstuser.rs user/proto/src/manifest.rs \
          arch/x86/fpu_enable.h arch/x86/lazy_fpu.c arch/x86/idt.c \
          arch/x86/interrupt.asm arch/x86/switch_lazy.asm \
-         kernel/kernel.c kernel/stubs.c tests/fpu_enable_host_test.c; do
+         kernel/kernel.c kernel/stubs.c tests/fpu_enable_host_test.c \
+         tests/linux_clone_host_test.c; do
     if [ ! -f "$f" ]; then
         echo "ABORT: $f missing — the guard cannot be evaluated at all." >&2
         exit 2
@@ -1338,6 +1339,96 @@ if grep -qF ' ok munmap addr=0x' user/sidecar/src/linux.rs && \
     ok "X6. the run's proof is on the lines: the granted range and its words, the refusal's EINVAL with the range, and the kernel's per-page free count — WHICH range and HOW MANY pages, not reconstructed from which arms ran"
 else
     bad "X6. a munmap instrument line is missing — the seam would run but the log would not name the range it freed (increment 14/15's rule)"
+fi
+
+# ─── Z. E7 TG-1 I2: the kernel-local clone (the Go thread shape) ───────────
+# Clone is the first operation that can create a second descriptor in a live
+# group. The source half has three independently wrong shapes: accepting a
+# flag subset whose semantics the group cannot honor, synthesizing a child
+# context that starts somewhere other than the parent's return RIP, and
+# creating a descriptor that quietly owns a private page table or never joins
+# the group. The host test drives the first two; these clauses hold the trap
+# path and the process-table integration the host cannot reach.
+LCHUT=tests/linux_clone_host_test.c
+if grep -qE '#define LINUX_CLONE_VM[[:space:]]+0x00000100ull' "$LTHH" && \
+   grep -qE '#define LINUX_CLONE_FS[[:space:]]+0x00000200ull' "$LTHH" && \
+   grep -qE '#define LINUX_CLONE_FILES[[:space:]]+0x00000400ull' "$LTHH" && \
+   grep -qE '#define LINUX_CLONE_SIGHAND[[:space:]]+0x00000800ull' "$LTHH" && \
+   grep -qE '#define LINUX_CLONE_SYSVSEM[[:space:]]+0x00040000ull' "$LTHH" && \
+   grep -qE '#define LINUX_CLONE_THREAD[[:space:]]+0x00010000ull' "$LTHH" && \
+   grep -qE '#define LINUX_CLONE_SETTLS[[:space:]]+0x00080000ull' "$LTHH" && \
+   grep -qF '#define LINUX_CLONE_GO_FLAGS (LINUX_CLONE_VM | LINUX_CLONE_FS |' "$LTHH" && \
+   grep -qF '#define LINUX_CLONE_ALLOWED  (LINUX_CLONE_GO_FLAGS | LINUX_CLONE_SETTLS)' "$LTHH" && \
+   grep -qF 'int linux_clone_plan(' "$LTHH" && \
+   grep -qF 'int linux_clone_plan(' "$LTHC" && \
+   grep -qF 'flags & ~LINUX_CLONE_ALLOWED' "$LTHC" && \
+   grep -qF '(flags & LINUX_CLONE_GO_FLAGS) != LINUX_CLONE_GO_FLAGS' "$LTHC" && \
+   grep -qF 'child_stack == 0 || !linux_fs_addr_is_user_canonical(child_stack)' "$LTHC" && \
+   grep -qF 'out->fs_base = tls;' "$LTHC" && \
+   grep -qF 'out->fs_base = parent_fs_base;' "$LTHC"; then
+    ok "Z1. the clone planner accepts exactly the seven Go flags (six mandatory shared flags plus optional SETTLS), refuses every outside bit with EINVAL, rejects a zero/non-canonical stack or TLS, and selects the child's fs_base from TLS or the parent's live base"
+else
+    bad "Z1. a clone flag or the pure planner is gone — a subset would be accepted as a thread while the group still shares what the omitted flag made private, or a non-canonical child stack/TLS would reach the ring-3 context"
+fi
+if grep -qF 'void linux_clone_build_context(' "$LTHH" && \
+   grep -qF 'void linux_clone_build_context(' "$LTHC" && \
+   grep -qF 'for (int i = 0; i < 20; i++) w[i] = 0;' "$LTHC" && \
+   grep -qF 'ctx->rsi   = child_stack;' "$LTHC" && \
+   grep -qF 'ctx->rax   = 0;' "$LTHC" && \
+   grep -qF 'ctx->rip   = parent_rip;' "$LTHC" && \
+   grep -qF 'ctx->rsp   = child_stack;' "$LTHC" && \
+   grep -qF 'ctx->cs    = 0x23;' "$LTHC" && \
+   grep -qF 'ctx->ss    = 0x1B;' "$LTHC" && \
+   grep -qF 'int proc_read_linux_return_rip(uint64_t* out)' "$PDC" && \
+   grep -qF 'proc_read_linux_return_rip(&parent_rip)' "$DISP"; then
+    ok "Z2. the child context is a full 20-word synthesis: every GPR cleared except rsi=child stack, rax=0, rip=the caller's captured return RIP, rsp=child stack, CS/SS=0x23/0x1B, IF on — and the dispatcher feeds it the gs:0x18 return RIP rather than a stale user_rip field"
+else
+    bad "Z2. the child context builder, the return-RIP capture or one of its registers is gone — the child could start at _start/a stale entry, sysret with a parent register, or iretq with a kernel selector"
+fi
+clone_line=$(grep -n 'if (num == LINUX_CLONE) {' "$DISP" | head -1 | cut -d: -f1)
+desc_line=$(grep -n 'linux_syscall_describe(&req' "$DISP" | head -1 | cut -d: -f1)
+clone_branch="$(sed -n "${clone_line},${desc_line}p" "$DISP")"
+if grep -qE '#define LINUX_CLONE[[:space:]]+56u' "$LABH" && \
+   grep -qF 'LSC_THREAD' "$LABH" && \
+   grep -qF '{  56, LSC_THREAD' "$LABC" && \
+   grep -qF 'case LSC_THREAD: return "thread";' "$LABC" && \
+   [ -n "$clone_line" ] && [ -n "$desc_line" ] && \
+   [ "$clone_line" -lt "$desc_line" ] && \
+   grep -qF 'linux_clone_thread(cur, &cplan, parent_rip,' <<< "$clone_branch" && \
+   grep -qF 'return (uint64_t)child_tid;' <<< "$clone_branch"; then
+    ok "Z3. clone (56) is a real LSC_THREAD table row, and the first-trap branch runs BEFORE describe/post/park: it plans, calls linux_clone_thread, and returns the child TID directly — no sidecar request for a thread"
+else
+    bad "Z3. the clone row/class or its kernel-local first-trap branch is gone or moved behind the forward describe — clone would be posted to a sidecar that has no row for it, or never dispatched at all"
+fi
+clone_start=$(grep -n 'int linux_clone_thread(' "$PDC" | head -1 | cut -d: -f1)
+clone_end=$(grep -n '^// ─── process_exit' "$PDC" | head -1 | cut -d: -f1)
+clone_body="$(sed -n "${clone_start},${clone_end}p" "$PDC")"
+if [ -n "$clone_start" ] && [ -n "$clone_end" ] && \
+   grep -qF 'child->cr3          = g->cr3;' <<< "$clone_body" && \
+   grep -qF 'child->fs_base      = plan->fs_base;' <<< "$clone_body" && \
+   grep -qF 'alloc_proc_syscall_stack(parent->partition_id)' <<< "$clone_body" && \
+   grep -qF 'linux_group_join_thread(g, child)' <<< "$clone_body" && \
+   grep -qF 'child->has_ring3_ctx = 1;' <<< "$clone_body" && \
+   grep -qF 'child->state         = PROC_SUSPENDED;' <<< "$clone_body" && \
+   grep -qF 'return -LINUX_EAGAIN;' <<< "$clone_body" && \
+   ! grep -qF 'user_clone_page_table' <<< "$clone_body" && \
+   grep -qF 'int linux_group_join_thread(' "$LTHH" && \
+   grep -qF 'int linux_group_join_thread(' "$LTHC" && \
+   grep -qF 'child->group_index != LINUX_GROUP_NONE' "$LTHC" && \
+   grep -qF 'child->tgid = g->group_id;' "$LTHC" && \
+   grep -qF 'child->is_group_leader = 0;' "$LTHC"; then
+    ok "Z4. the process-table half creates no private page table: it shares g->cr3, stamps the planned fs_base, allocates a fresh syscall stack, joins the group as a non-leader (tid/tgid/index), and only then becomes a SUSPENDED ring3 context; cap/resource exhaustion is EAGAIN"
+else
+    bad "Z4. the integration or group-join half is gone — the child could free/clone the shared root, keep a stale fs_base/slot state, run before it is a group member, or exceed LINUX_THREADS_MAX without EAGAIN"
+fi
+if grep -qF 'linux_clone_plan(GO' "$LCHUT" && \
+   grep -qF 'linux_clone_plan(GO & ~required[i]' "$LCHUT" && \
+   grep -qF 'linux_clone_build_context(&c, 0x0000000000401234ull, STACK)' "$LCHUT" && \
+   grep -qF 'linux_group_join_thread(g, &proc_table[1])' "$LCHUT" && \
+   grep -qF 'linux_group_join_thread(g, &proc_table[LINUX_THREADS_MAX])' "$LCHUT"; then
+    ok "Z5. the host test drives all three contracts: the exact Go mask and every missing mandatory flag, the 20-word context with rax/rsi/rsp/rip, and group join/double-join/cap refusal"
+else
+    bad "Z5. the clone host test no longer exercises a branch above — the planner, context or group join would be argued from these greps alone, reachable only at boot"
 fi
 
 echo

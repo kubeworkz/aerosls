@@ -567,6 +567,49 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                 uint32_t fwd_len = (uint32_t)sizeof(struct SLSLinuxSyscallRequest);
                 int status;
                 proc_read_linux_args(largs);
+                /* E7 TG-1 I2: clone is the kernel-local thread class. It
+                 * never describes, posts or parks: the group already owns
+                 * the address space, cap table and sidecar row, so the only
+                 * work is a new descriptor in the same group. The child
+                 * starts at this trap's return RIP with rax=0. */
+                if (num == LINUX_CLONE) {
+                    struct LinuxClonePlan cplan;
+                    uint64_t parent_rip = 0;
+                    uint32_t child_tid = 0;
+                    int crc;
+                    if (!proc_read_linux_return_rip(&parent_rip)) {
+                        kernel_serial_printf(
+                            "[E7] clone refused: no syscall entry capture "
+                            "(kernel context)\n");
+                        return (uint64_t)(int64_t)(-LINUX_EINVAL);
+                    }
+                    crc = linux_clone_plan(largs[0], largs[1], largs[4],
+                                           cur->fs_base, &cplan);
+                    if (crc != 0) {
+                        kernel_serial_printf(
+                            "[E7] clone flags=0x%lx stack=0x%lx tls=0x%lx "
+                            "refused before any table change: %s\n",
+                            (unsigned long)largs[0],
+                            (unsigned long)largs[1],
+                            (unsigned long)largs[4],
+                            crc == -LINUX_EAGAIN
+                                ? "group/process table full"
+                                : "not the Go thread shape or bad user "
+                                  "stack/TLS");
+                        return (uint64_t)(int64_t)crc;
+                    }
+                    crc = linux_clone_thread(cur, &cplan, parent_rip,
+                                             &child_tid);
+                    if (crc != 0) {
+                        kernel_serial_printf(
+                            "[E7] clone refused: %s\n",
+                            crc == -LINUX_EAGAIN
+                                ? "group cap or resources exhausted"
+                                : "invalid parent/group identity");
+                        return (uint64_t)(int64_t)crc;
+                    }
+                    return (uint64_t)child_tid;
+                }
 #if E7G_TOOTH
                 /* E7 increment 22 (tests/e7_gate_check.sh --teeth): the two
                  * forward-path teeth, armed on the descriptor the pour
