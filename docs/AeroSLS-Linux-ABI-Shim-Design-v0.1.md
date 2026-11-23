@@ -2508,9 +2508,11 @@ capture, 21 the replay that resumes the tenant at its captured `rip`/`rsp`, and
 that turn its failure side from an assumption into an observation. The gate's
 two halves have each now been observed on the real machine (19 the work, 21 the
 work continuing through a cycle) and 22 makes that observation re-runnable from
-one command; what it is not is automated: only the harness's source clauses run
-on a push, the boots are manual invocations, and the `fs_base` break is still
-unarmed. The contract it was scoped against is kept as written. It takes as
+one command; what it is not is automated is the LIVE run: the boots are still
+manual invocations. The harness's source clauses and the committed recording's
+replay now run on every guard sweep (§10.14's check-harness paragraph), while
+the `fs_base` break is armed only by the teeth profile, never by the default
+image. The contract it was scoped against is kept as written. It takes as
 given the file class landed at increments 17–18 (`4fbe386`, `baf0469`) — the
 thirteen census numbers crossing through the VFS, the flag contract measured
 from the real opens, the reply payload's STAT/DENTS kinds (§10.13's plan text
@@ -3298,7 +3300,7 @@ not a separate arm: `descriptor` produces a restart as its consequence and
 B3/B4 are asserted on it. The fifth is `fs_base`, armed below.
 
 **The gate's check harness has five modes, so the gate is checked even where
-QEMU is not.** Its default mode is the G1–G6 source clauses — the drill is a
+QEMU is not.** Its default mode is the G1–G7 source clauses — the drill is a
 build-time feature inside the gate branch; the wait's two bounds and the
 switch-in ledger; the outlived line gated on an open window and naming the
 running posture; the designated tenant, staged image and continuation; the
@@ -3313,6 +3315,21 @@ live arm ends with, over a recording, and that function has teeth: a recording w
 deleted reddens D1, one with a `wait ended` line injected reddens D2, and a
 tooth recording is judged against the tooth it names — each with its own
 message and a non-zero exit, not a generic failure.
+
+**The committed recording is replay-checked on every push.**
+`tests/e7_gate_evidence_check.sh` is a source-only guard over
+`evidence/e7_gate_drill_adaptive/`: it invokes the harness's `--replay` and
+requires the GREEN verdict line, not merely exit 0, because a tooth recording
+is a legitimate exit-0 outcome with expected reds. It is picked up by the same
+`tests/*_check.sh` sweep as the harness, so the adaptive wait's D1–D2 evidence
+and the gate's B1–B7 assertions are re-derived from the committed boot logs and
+`facts` on every guard run. The live boots remain manual; what this closes is
+the gap between "the recording passed once" and "the committed recording is
+still what the clauses accept." The guard's failure side is exercised on EVERY
+run: it copies the committed recording, flips `payloads=1` to `0`, and
+requires B1 to redden — a guard that accepts an empty replay cannot pass by
+doing nothing. `E7_EVIDENCE_DIR` remains the path override for an external
+check.
 
 The wait's own line is part of the change, not just the drill: a wait that
 crosses 30 s while still being scheduled now says so once, because the
@@ -3484,6 +3501,253 @@ same recording passed all clauses. Evidence:
 
 ---
 
+### 10.15 Implementation — soft-protected pages for real `mprotect`
+
+**Status.** The representation, checkpoint v3, first-trap/apply path and
+sidecar arm below are implemented and built. Before this increment the tree
+answered every non-W|X `mprotect` with `ENOSYS` (and W|X with `EPERM`); it now
+performs the transition. The live probe has RUN (2026-11-09): the flat probe
+and the ELF candidate each mprotected a present brk page to `PROT_NONE`,
+wrote `E7MEM-SOFT-OK`, and then took a Ring-3 #PF at that same address with
+`error=0x5`. The kernel's line names `1 page(s) soft-protected (P=1 U=0)`;
+the task's `exited (code=139)` is the observation, because this shim has no
+signal frames to return to. Neither MARKER 405 (mprotect refused) nor 406
+(the read succeeded) appeared. The transcript excerpt is
+`evidence/e7_soft_mprotect_live.log`. That transcript's firstuser did not
+reach its own guard-page call; the dedicated live check now does
+(`tests/e7_firstuser_guard_check.sh`, 2026-11-09, exit 0): the real
+`aerobackup.musl.elf` issues `sigaltstack(NULL, &old)` (131 answered with
+`SS_DISABLE`), so Rust std falls through to its guard-page `mmap` +
+`mprotect(page, 4096, PROT_NONE)`, and the kernel soft-protects the page. The
+ordered serial lines are `num=00000083 … ok + payload` → `mmap ->
+0x00004000000e8000 len=12288 prot=3` → `num=0000000A … ok` → `mprotect
+addr=0x4000000e8000 len=4096 prot=0x0: 1 page(s) soft-protected (P=1 U=0)`,
+with no firstuser `mprotect … -> ENOSYS`; the mmap line carries the
+request's own three-page RW shape before the one-page carve-out, and the
+transcript is `evidence/e7_firstuser_guard_live.log`.
+
+The first live run also exposed a second wall on the same path:
+`arch/x86/syscall.asm`'s number chain routed rax=131 to `.do_sls_svc_crash`
+BEFORE `do_syscall`'s personality branch, so the query became `svc crash:
+Service '(null)' not found`, the old `stack_t` stayed zeroed, and std returned
+early. 131 is now absent from that chain; SLS still reaches the same handler
+through `do_syscall`'s `SYS_SLS_SVC_CRASH` arm, and clause set **R9** keeps it
+that way. The live check's own mutation test
+(`tests/e7_firstuser_guard_check_smoke.sh`) replays the committed transcript,
+a CRLF-serialized copy of it (pinning the serial-line strip), and twenty-one
+mutants: one whose firstuser 131 line is `-> ENOSYS` with the guard
+mmap+mprotect removed; one where 131 is answered but the guard `mprotect(0xA)`
+line is `-> ENOSYS`; one where the mprotect is granted but the kernel's
+`soft-protected` apply line is removed; one where the mprotect grant line is
+moved before its 131 query, so every line succeeds but the causal order is
+wrong; one where the apply line names a different page from the guard mmap
+base, so every request succeeds but the page protected is not the page the
+mmap reserved; one where the apply names the right page but covers only half
+of it; one where the apply protects the page writable (`prot=0x2`) instead of
+PROT_NONE; one where the apply omits its `prot` field entirely; one where the
+apply keeps addr/len/prot but drops the kernel's
+`soft-protected (P=1 U=0)` claim; one where the apply omits its `len` field
+entirely; one where the apply carries a non-hex address and must be rejected
+as unparseable; one where the firstuser's guard mmap base line is removed,
+leaving the apply with no base to match; one where the mmap base carries a
+non-hex digit and must be rejected as unparseable; and one where the guard's
+mprotect grant line is removed, leaving the apply without a preceding grant; one where both firstuser 131
+lines are removed, so the grant and apply remain but the query that must
+precede them is gone; one where that same missing-query transcript is
+serialized with CRLF, so the named failure must survive both conditions
+together; and one where a probe's soft-protect line follows the firstuser
+grant and the firstuser apply is gone, so the address assertion must reject
+the foreign page; one where the guard mmap is two pages (`len=8192`);
+one where it is read-only (`prot=1`); one where the grant line omits its
+`len` field; and one where it omits its `prot` field. The checker must fail
+each by name, so the assertions cannot rot into "any transcript passes."
+
+**The representation is a present, supervisor-only leaf.** A page made
+inaccessible with `mprotect(PROT_NONE)` keeps its frame and its present PTE,
+clears the user bit, and sets one of the PTE's software-available bits:
+
+| PTE field | normal user page | soft-protected page |
+|---|---|---|
+| bit 0 `P` | 1 | 1 |
+| bit 1 `W` | from `PROT_WRITE` | 0 |
+| bit 2 `U/S` | 1 | 0 |
+| bits 3–4 `PWT/PCD` | preserved | preserved |
+| bits 5–6 `A/D` | preserved | preserved |
+| bit 7 `PS` | 0 (4 KiB leaf) | 0 (4 KiB leaf) |
+| bit 9 `SOFT_NONE` | 0 | 1 |
+| bits 12–51 | frame | the **same** frame |
+| bit 63 `NX` | `!PROT_EXEC` | 1 |
+
+The new constant is `USER_PTE_SOFT_NONE = (1ULL << 9)`; bits 9–11 are
+documented as software-available for 4 KiB PTEs, and bit 9 is the one this
+design claims. `SOFT_NONE` is a state bit, not a frame bit: the frame mask
+never sees it.
+
+**Why this state, and why not the obvious alternatives.** Clearing `P` would
+make the frame invisible to the three walks that must still find it:
+`env_payload`'s capture (`ep_resolve_ex`), `user_destroy_page_table`'s
+teardown, and the `linux_user_page_frame` read-back used by `munmap` and
+the brk/mmap unwinds. A side table of protected frames would duplicate page
+table state, need its own capture/restore format and teardown path, and
+could drift from the PTE. Keeping `P=1` and clearing `U` is the x86
+mechanism that denies every Ring-3 access while leaving the frame owned and
+walkable by the kernel. There is no read-disable bit on x86, so `U=0` is
+also the only honest representation of `PROT_NONE`; `W=0` and `NX=1` make
+the state explicit rather than relying on the fault path to infer it.
+
+**Invariants.**
+
+1. A soft leaf is `P=1`, `U=0`, `W=0`, `NX=1`, `SOFT_NONE=1`, `PS=0`.
+2. A normal user leaf is `P=1`, `U=1`, `SOFT_NONE=0`; `W` and `NX` are the
+   requested protection.
+3. `SOFT_NONE` appears only on a 4 KiB leaf, never on an intermediate table.
+4. The leaf's frame is unchanged across every `mprotect`; no frame is
+   allocated, freed, zeroed, or re-owned by the transition.
+5. `USER` and `SOFT_NONE` are mutually exclusive on a captured page.
+6. A transition validates the whole range before changing the first PTE; a
+   missing, huge, or foreign page leaves every byte of the range unchanged.
+7. `mmap(PROT_NONE)`'s no-frame reservation is **not** a soft page. It has no
+   PTE, and a later `mprotect` over it returns `ENOMEM` in v1 rather than
+   inventing frames the reservation never owned.
+
+**Transitions.** `mprotect` is a page-table transition, not a mapping. The
+valid `prot` words map as follows (bits outside 0x7 are `EINVAL`):
+
+| `prot` | leaf after the change |
+|---|---|
+| `0` (`PROT_NONE`) | soft leaf: `U=0`, `W=0`, `NX=1`, `SOFT_NONE=1` |
+| `1` (`R`) | `U=1`, `W=0`, `NX=1` |
+| `2` (`W`) | `U=1`, `W=1`, `NX=1` (x86 makes it readable) |
+| `3` (read+write) | `U=1`, `W=1`, `NX=1` |
+| `4` (`X`) | `U=1`, `W=0`, `NX=0` |
+| `5` (read+execute) | `U=1`, `W=0`, `NX=0` |
+| `6`/`7` (write+execute) | refused `-EPERM` at the first trap, both ends |
+
+The soft→normal transition clears `SOFT_NONE`, sets `U`, and installs the
+requested `W`/`NX` bits; the frame returns unchanged. Normal→soft preserves
+the frame and contents, so a later `mprotect(R)` is not a remap and does not
+lose data. Each changed page gets one `user_invlpg`; the task is parked in
+this trap on this CPU with its CR3 loaded, the same single-CPU posture the
+MAP_FIXED replace already relies on.
+
+**Ownership walks.** Three existing readers must learn the new state without
+loosening the two copy walks:
+
+- `user_destroy_page_table`'s leaf test becomes `USER || SOFT_NONE` for a
+  present leaf; intermediate tables keep their existing user-bit test. The
+  soft frame is freed exactly once, by the same `user_frame_refused` and
+  frame-owner checks as any other leaf.
+- `linux_user_page_frame` (and the brk/mmap unwind's read-back) must accept a
+  soft leaf: it is the ownership read, not a copy. It should use a dedicated
+  owner walk, or an `accept_soft` parameter, and never become the walk the
+  copy plans use.
+- `linux_user_copy_out`/`linux_user_copy_in` and `linux_path_measure` keep
+  their `U=1` requirement at every level. A soft page is not a buffer the
+  sidecar may read or the kernel may write; `U=0` is the security boundary,
+  and loosening the copy walk would turn `PROT_NONE` into a decorative bit.
+
+**The page-table helper.** The transition is
+`int user_protect_page(uint64_t* pml4, uint64_t va, uint64_t flags)`: a
+present-child walk, no allocation, 4 KiB leaves only, returning 0 after
+changing one leaf and -1 for a missing or huge page. The caller walks the
+whole range once to validate and again to apply, then `user_invlpg`s every
+changed page. The helper is deliberately separate from `user_map_page`:
+`user_map_page` may allocate intermediate tables from a tenant-supplied
+address, while this path must never turn a permission check into a memory
+lever.
+
+**The syscall split.** The first trap validates the request words and stages
+`addr`, `len`, and `prot` in the existing `mem_stage_*` fields; no new
+request struct is needed. It refuses zero/overflowing lengths, an unaligned
+address, unknown prot bits, and W|X before any post. The sidecar's 10 arm
+repeats the shape and W|X policy and answers success for a valid transition;
+it does not choose an address, allocate a frame, or move `MemBrk.cur` or
+`MemBrk.mtop`. Unlike mmap, there is no address choice to delegate: the
+kernel's page tables are the only truth about which pages exist, so the
+reply's apply walks them, requires every page to be a present 4 KiB page in
+the task's image, stack, or heap window, and refuses with `ENOMEM` before
+mutating anything if one is absent or outside those windows. A negative
+sidecar reply passes through unchanged. The sidecar therefore remains the
+policy half for W|X and prot shape, while the page-table walk is the
+mechanism half; neither end alone can grant a page the other would refuse.
+
+**Checkpoint and restore.** The page-permission word grows one bit:
+`EP_PAGE_PERM_SOFT = 0x8`, with `EP_PAGE_PERM_MASK = 0xf`. `ep_perm_of`
+records `SOFT` from the leaf and records `USER` only when `U=1`;
+`ep_resolve_ex` accepts a present leaf whose leaf is `USER` **or** `SOFT`.
+The capture therefore includes a soft page's bytes and records `0x8`
+(no `USER`, no `WRITE`, no `EXEC`). The restore's missing-page mapping
+sets `USER_PTE_SOFT_NONE` and does not set `USER` when the bit is present;
+a blob that sets `SOFT` together with `USER`, `WRITE`, or `EXEC` is a format
+refusal, and the live-permission comparison includes `SOFT`, so a replay
+cannot silently turn a protected page back into a normal one.
+
+The blob version becomes **3**. The writer emits 3; the reader accepts 2
+and 3, because a v2 environment has no soft pages and its existing
+permission words remain valid. A v2 reader then refuses a v3 blob by
+version rather than misreading it. The directory header and the blob head
+must be bumped together, and the existing gate evidence (v2) must still
+replay.
+
+**Tests the design requires before it is called landed.**
+
+- Host tests over the pure transition table: every `prot` 0–7, W|X, unknown
+  bits, zero/overflow lengths, unaligned addresses, and the soft→normal and
+  normal→soft directions with the frame unchanged.
+- Fake-page-table tests for `user_protect_page`: present leaf changed,
+  missing leaf refused without allocation, huge page refused, soft leaf
+  found by the owner walk, and the copy walkers still refusing `U=0`.
+- A teardown test that creates a soft leaf and proves its frame is freed
+  once; a second teardown of a normal page must be unchanged.
+- Capture/restore tests for `EP_PAGE_PERM_SOFT`: v3 round trip, v2 replay,
+  soft page mapped `U=0` on a fresh page table, a soft+W/X or soft+USER blob
+  refused by format, and a live permission mismatch refused by name.
+- Sidecar unit tests for the 10 arm: valid non-W|X grant with no cursor
+  movement, W|X EPERM, unknown prot EINVAL, and malformed range EINVAL.
+- A live probe task that `mprotect`s a mapped page `PROT_NONE`, observes
+  success, and proves a subsequent access faults rather than reading. **Done
+  (2026-11-09):** both the flat probe and the ELF candidate wrote
+  `E7MEM-SOFT-OK` after the transition and then took a Ring-3 #PF at the
+  same address with `error=0x5`; the kernel logged the soft state by name.
+  The probe is disposable: this shim has no signal frames, so the task's
+  death is the observation, not a handler invocation. **The real firstuser's
+  guard call is observed separately** (`tests/e7_firstuser_guard_check.sh`,
+  2026-11-09, exit 0): its 131 query and install are answered, its guard-page
+  `mprotect(PROT_NONE)` is granted, and the kernel soft-protects the page;
+  `evidence/e7_firstuser_guard_live.log`. Source clause set **Y** in
+  `tests/linux_personality_check.sh` (and its three smoke teeth) names the
+  soft state in the source, and the live transcript names it in the kernel
+  line — not merely "mprotect returned 0."
+
+**Implementation order.** (1) the PTE bit, `user_protect_page`, and the owner
+walk; (2) teardown and the copy-walk regression tests; (3) the v3 checkpoint
+permission bit and restore mapping, with v2 compatibility; (4) the mprotect
+first-trap plan, sidecar arm, reply apply, and `invlpg`; (5) the probe, source
+clause set Y, and the live evidence. No step is safely reordered: the checkpoint
+and teardown must understand the state before the syscall can create it,
+or a crash after a real `mprotect` would leak the frame it is supposed to
+preserve.
+
+**Coverage added with this implementation.** `tests/user_map_identity_host_test.c`
+drives `user_protect_page` in both directions, proves the frame is unchanged,
+and refuses a missing leaf without allocation. `tests/env_payload_host_test.c`
+captures a soft heap page and restores it after removing its leaf, proving the
+pour allocates a frame and installs `P|NX|SOFT_NONE` rather than `USER`. The
+sidecar's `mprotect` arm has shape, W|X and no-cursor-movement tests, and the
+same host test proves teardown frees a soft leaf's frame exactly once. The checkpoint host test now covers a soft-free v2 replay, a v2 blob claiming the
+v3-only soft bit, and soft+USER / soft+W|X permission words with a valid index
+CRC. `tests/linux_personality_check.sh` clause set **Y** now pins the contract,
+the first trap, the all-pages prewalk/apply, the page-table helper, the sidecar
+twin, both host tests and the probe's marker/fault pair; its three new teeth
+remove the positive marker, the success-path jump to the soft case, and the
+`user_protect_page` call. The live probe has run (transcript above), and the
+real firstuser's own guard-page call is verified by its dedicated boot
+(`tests/e7_firstuser_guard_check.sh`, exit 0,
+`evidence/e7_firstuser_guard_live.log`); clause set **R9** keeps 131 out of
+the asm number chain that had been deciding it before the personality branch.
+
+---
+
 ## 11. Open questions for review
 
 1. **The first user: designated, built, and censused.** `AeroSLS-Roadmap-2026H2-v0.1.md` §5 says in bold that there is no named first user, and the tree agreed — no Go source, no `std`-Rust binary, every real operational workload bash or Python (§5.5.1) — so the target was a *decision*. It is now made and carried out: the backup operation, as `backup/aerobackup/` (a static single-threaded Rust rewrite of `backup/backup.sh`'s snapshot-and-retain core, 27 tests, no dependencies), designated in `tools/linux_abi_candidate.conf`, with the census measured and checked in at `tools/linux_syscall_census.txt` (§5.6). **The open question is no longer about the first user; it is whether this candidate is narrow enough to gate on.** Its measured surface is 27 syscalls, and the two that are structurally hardest — `arch_prctl(ARCH_SET_FS)` (§5.3) and the vDSO-backed `clock_gettime` — are both now named rather than discovered. Whether the other three operations follow, and in what order, is a product question this design does not answer.
@@ -3503,6 +3767,7 @@ Everything this document asserts about the tree, with its source:
 | Claim | Source |
 |---|---|
 | Trap entry, `swapgs`, per-CPU scratch, asm number chain, `.unknown_syscall` → `do_syscall` | `arch/x86/syscall.asm` |
+| The real firstuser's Rust std guard-page call crosses the seam: `sigaltstack` (131) answered with `SS_DISABLE` and its install accepted, guard mmap three pages RW, guard-page `mprotect(PROT_NONE)` granted and applied to the guard mmap's base with a one-page length and PROT_NONE, no firstuser `mprotect … -> ENOSYS`; 131 is absent from the asm number chain | `arch/x86/syscall.asm`; `kernel/linux_abi.{h,c}`; `user/sidecar/src/linux.rs`; `tests/e7_firstuser_guard_check.sh` + `tests/e7_firstuser_guard_check_smoke.sh` (the 131, mprotect, missing-apply, ordering, wrong-address, short-length, writable-prot, prot-missing, no-soft-claim, len-missing, malformed-addr, mmap-missing, malformed-mmap-base, grant-missing, no-sigaltstack, foreign-apply, mmap-short, mmap-readonly, mmap-len-missing and mmap-prot-missing replay mutants, plus a CRLF replay and a CRLF missing-sigaltstack replay); `evidence/e7_firstuser_guard_live.log` |
 | The errno map is total over both families and the `CAP_NONE` sentinel, with the reverse defined only on unique preimages | `kernel/linux_abi.h`/`.c`; `tests/linux_errno_map_host_test.c` (51 checks, §10.5) |
 | Every census number — traced and vDSO-declared — has a dispatch class, and the SLS overlaps 105/160/320 are UNKNOWN | `tests/linux_syscall_table_host_test.c` (42 checks) over `tools/linux_syscall_census.txt` |
 | The initial stack builder emits the canonical psABI image with §5.2's AT_* set, no `AT_SYSINFO_EHDR`, and refuses by returning 0 | `tests/linux_initial_stack_host_test.c` (46 checks, the current run; 40 before Q2's scan checks) |
@@ -3552,6 +3817,7 @@ Everything this document asserts about the tree, with its source:
 | The E7 gate's resume half ran in the guest: one invocation, two boots of the same NVMe image, the tenant adopted at `rip=0x8057ab7 rsp=0x4000000a9778` (`stop=spent`), its copy finishing after the reboot — one `Copying`, one `Done (524288 bytes, 504 sparse holes, 4 kept)`, no `[FAULT]` — and its `exit_group` reaped by name (`[TORE] address space … 172 frame(s) freed`, the work-half count) | `evidence/e7_gate_reboot.log`; `tests/env_payload_host_test.c` (81 checks: the one-shot stop, the held replay's page mapping, and the stall-bounded wait's three outcomes); `tests/cap_create_sidecar_host_test.c` (the caller's-partition resolve) |
 | The gate's failure side is observed, not assumed: one invocation, one capture and five replays — the control green, `descriptor` reddening B2/B3/B4, `no-fd` B3/B4, `no-heap` B4/B5 (the 64 KiB buffer's `free` faulting inside the withheld page), `fs_base` B2/B4/B5 (the adopted TLS base one page off, the copy running to the end of the file and the tenant dying at a pointer read from the wrong TCB) — with each tooth's own line in the transcript and the shipped image refusing a named tooth by name | `evidence/e7_gate_teeth.log`, `evidence/e7_gate_teeth_fsbase.log`; `tests/e7_gate_check.sh --teeth`; `kernel/env_payload.h`'s `E7G_TOOTH` block and `Makefile`'s `E7_TOOTH` (both compiled out by default) |
 | The drill's tenant-spawn wait follows host progress, and the full default `--live` gate passes B1–B7 plus D1–D2 when the 45G stretch crosses the old 120 s bound: the wait extended at 318,476 serial bytes, D1 saw the pre-pour wait outlive its old 30 s bound with a sidecar RUNNING (`running=1/2`), D2 saw no `wait ended` and the pour land (`payloads=1, payload_skips=0`); the plain gate keeps its fixed 120 s total | `tests/e7_gate_check.sh` (`E7G_SPAWN_STALL_S`/`E7G_SPAWN_CEIL_S`); `evidence/e7_gate_drill_adaptive/`; commit `f3c1d19` |
+| The committed adaptive recording is replayed on every guard sweep, a tooth recording's exit 0 is not accepted as a passing gate, and the guard's own `payloads=0` counterexample reddens B1 on every run | `tests/e7_gate_evidence_check.sh` (invokes `tests/e7_gate_check.sh --replay` and requires the green verdict line); `evidence/e7_gate_drill_adaptive/` |
 | Console reads and poll: buffered input is served, an empty buffer PARKS the read until input or close, poll scans the task's fd table plus the console and rewrites revents, and a timed or infinite wait parks until readiness or a real deadline — a timeout answers zero revents | `user/sidecar/src/linux.rs` (`console_read_answer`, `Answer::{ReadWait,PollWait}`, `poll_scan`, `poll_answer`, `next_wait_ns`, the `PENDING_*` state and `service`'s pending block); `kernel/linux_abi.{h,c}` (the poll IN/OUT plans and reply shape); `kernel/syscall_dispatch.{h,c}` (`SYS_SLS_NOW_NS` 329, write-only clamp); `user/proto/src/kabi.rs`; `tests/linux_personality_host_test.c` (the poll crossings/shape) + linux.rs unit tests (27); guard clauses S/S1–S4, teeth t84–t89, t121–t122 (§10.13's poll coda) |
 | `munmap` (11) crosses the channel in a live E3 boot: the probe unmaps its arena twice (1 page freed, then 0 freed/1 already absent), the below-break call is refused before the post, and a 16-byte write carries `E7MEM-MUNMAP-OK`; the real firstuser also unmaps its own pages, and no marker-404 syscall line appears | `evidence/e7_munmap_live.log`; `tests/e3_multi_env_boot_check.sh`; guard clause X |
 
@@ -3571,7 +3837,7 @@ Everything this document asserts about the tree, with its source:
 | `rt_sigprocmask` (14), `rt_sigaction` (13) and `tkill` (200) refuse | `abort()` cannot die at its first `raise(SIGABRT)`, so its tail runs and faults on `hlt` (`rip=0x805260c`) — the firstuser's run ends there, ten attributed traps deep (§10.13's step 2; `rt_sigaction` newly visible) | **LANDED** — increment 10: the kernel's copy plan with all three refusals by name at the first trap, the sidecar's dispositions/mask/pending and the `SignalKill` delivery; host teeth (98 + 11 checks), guard clause R with teeth t76–t83; measured: both firstuser runs end at their first `tkill` with the kill attribution and NO `[FAULT]` (§10.13's step 2). §10.10's copy-IN gap then stayed as the named wall — retired at **increment 12**: the reply payload carries oldact/oldset back through the staged destination, measured (§10.13's step 3) |
 | No `CAP_E*` → Linux errno table (and a `CAP_NONE` sentinel in returns) | silent wrong errors (§5.7) | **LANDED** — increment 1 (§10.5): `linux_errno_from_cap()`/`cap_code_from_linux_errno()` total over all twelve `CAP_E*`, the `CAP_ERR_*` family and the `CAP_NONE` sentinel, applied only at the reply; `tests/linux_errno_map_host_test.c` (51 checks, exhaustive both ways), and the flipped-mapping tooth reddens the forward clause |
 | Target designated, but no candidate binary and therefore no artifact | the table is still unmeasured; `--check` reports a named skip rather than a pass | **LANDED** — `backup/aerobackup/` (static musl, 27 tests, no dependencies) is designated in `tools/linux_abi_candidate.conf` and censused at `tools/linux_syscall_census.txt` (26 traced syscalls plus the proved vDSO backstop, §5.5); `tests/linux_syscall_table_host_test.c` (42 checks) and the source-only `tests/linux_abi_census_check.sh` with its smoke hold the artifact and the anti-placeholder refusals |
-| No thread groups / `clone` / `futex` | Go and every threaded runtime are out (§7) | named as Go's gate; unscoped |
+| No thread groups / `clone` / `futex` | Go and every threaded runtime are out (§7) | **SCOPED** — design/scoping pass: `docs/AeroSLS-E7-Thread-Group-Gate-v0.1.md`; no implementation landed. The gate is a pinned static Go fixture (clone/futex/shared space) plus a checkpoint-parity phase; the single-task channel, per-descriptor memory cursors and one-Linux-task checkpoint are the named blockers |
 | No ARM64 userspace OS | E7 cannot run there (§4.1) | H2 item #1 |
 | No environment checkpoint/restore | the inherited gate cannot be passed (§8) | **LANDED** — v0.2 P1a (commits #58/#62): the versioned record, the payload's pages, park state and console, and a partition quiesce that restores its prior pause state; `tests/env_checkpoint_restore_check.sh` proves a file and a shell variable survive a reboot. The Linux task's share rode it at increments 20–21 (§10.14) |
 | No Linux task in the checkpoint record or payload | the gate's cycle half restores the two sidecars and loses the first user; its descriptors and heap cannot come back | **LANDED** — increment 20 (§10.14): the record's third slot carries `entry`/stack/caps and the payload's `EnvPayloadTask` carries the 20-word context, `fs_base`, both cursors and every page's permission. Increment 21's live run replays it |

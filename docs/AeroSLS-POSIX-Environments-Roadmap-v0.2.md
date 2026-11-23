@@ -2975,11 +2975,11 @@ Each excluded item has a stated destination, so none is silently dropped.
 **Belongs to E7, not here.**
 
 - **The Linux personality, its six-argument capture, the initial stack and auxv, `fs_base`/TLS, the errno map and the `brk`/`mmap` budget mapping.** All of it is `AeroSLS-Linux-ABI-Shim-Design-v0.1.md` §3 and §5. P1a leaves the descriptor's "extra tasks" hook for it; nothing else in v0.2 needs E7 to exist.
-- **Signal *delivery*.** The E7 census shows the designated candidate calls `rt_sigaction`, `rt_sigprocmask` and `sigaltstack`, while the design records them and never delivers them. That tension is E7's to resolve, and it is recorded here because it is a live gap in a document that is otherwise settled — not because v0.2 solves it.
+- **Signal *delivery*.** The E7 census shows the designated candidate calls `rt_sigaction`, `rt_sigprocmask` and `sigaltstack`, while the design records them and never delivers them. That tension is E7's to resolve — the thread-group gate now makes record-only handler *installation* a TG-0 prerequisite, while delivery itself remains out of scope — and it is recorded here because it is a live gap in a document that is otherwise settled, not because v0.2 solves it.
 
-**Needs its own phase, unscoped.**
+**Needs its own phase (threads now scoped separately; the rest below remains unscoped).**
 
-- **Threads (`clone`/`CLONE_VM`, `futex`, thread groups, a shared address space).** The structural blocker behind Go, threaded CPython, Node, and most AIX-era daemons; the ABI design (§7) names it as Go's gate and does not scope it. It is a kernel phase the size of the ARM64 port, and it is *not* a v0.2 item because P1a's checkpoint of a single-threaded pair is a prerequisite for doing it safely, not a substitute for it.
+- **Threads (`clone`/`CLONE_VM`, `futex`, thread groups, a shared address space).** The structural blocker behind Go, threaded CPython, Node, and most AIX-era daemons; the ABI design (§7) names it as Go's gate. `AeroSLS-E7-Thread-Group-Gate-v0.1.md` now scopes the gate and the implementation phases, with no implementation landed. It is a kernel phase the size of the ARM64 port, and it is *not* a v0.2 item because P1a's checkpoint of a single-threaded pair is a prerequisite for doing it safely, not a substitute for it.
 - **Dynamic linking.** Refused in v1 (`AeroSLS-Linux-ABI-Shim-Design-v0.1.md` §6) with a named falsifiable trigger. Unchanged.
 - **The ARM64 userspace OS.** H2 item #1's work, and the reason E7 targets x86-64 first. Unchanged.
 - **A capacity phase** that raises `PROC_MAX`/`SIDECAR_REGISTRY_MAX` (§8).
@@ -3275,7 +3275,7 @@ Everything this document asserts about the tree, with its source.
 | The Linux task's capability table holds exactly one entry, and per-partition page indexing is unbuilt | `AeroSLS-Linux-ABI-Shim-Design-v0.1.md` §3.5; `kernel/partition.c`'s Storage Isolation Phase 1 reference |
 | E7's gate, its two-halves reporting rule, and the monitoring candidate eliminated by its need for sockets | `AeroSLS-Linux-ABI-Shim-Design-v0.1.md` §8, §10.4, §5.5.1 |
 | Signals are accepted and never delivered, and the candidate calls them | `AeroSLS-Linux-ABI-Shim-Design-v0.1.md` §5.6; `tools/linux_syscall_census.txt` |
-| Threads/`clone`/`futex` are unscoped and are Go's gate | `AeroSLS-Linux-ABI-Shim-Design-v0.1.md` §7 |
+| Threads/`clone`/`futex` are scoped separately but not implemented and are Go's gate | `AeroSLS-E7-Thread-Group-Gate-v0.1.md`; `AeroSLS-Linux-ABI-Shim-Design-v0.1.md` §7 |
 
 ## Appendix B — Named gaps, each with its destination
 

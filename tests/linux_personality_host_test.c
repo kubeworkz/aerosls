@@ -477,6 +477,87 @@ int main(void)
           "      predicate — R|X stays possible; the rest is the sidecar's "
           "      ENOSYS, not a fake grant");
 
+    /* ─── E7 §10.15: the soft-protected mprotect ladder ───────────────── */
+    {   const uint64_t IMG_LO = 0x0000000000400000ULL;
+        const uint64_t IMG_HI = IMG_LO + 0x2000;
+        const uint64_t STK_LO = 0x0000000000500000ULL;
+        const uint64_t STK_HI = STK_LO + 0x4000;
+        const uint64_t BASE   = 0x0000400000100000ULL;
+        const uint64_t LIMIT  = BASE + 0x10000;
+        struct LinuxMprotectReq req;
+        struct LinuxMemMprotectVerdict v;
+
+        req.addr = BASE + 0x2000; req.len = 0x1000; req.prot = LINUX_PROT_NONE;
+        CHECK(linux_mem_mprotect_refusal(&req, IMG_LO, IMG_HI, STK_LO, STK_HI,
+                                         BASE, LIMIT) == 0,
+              "PROT_NONE over a present heap window passes the first trap — "
+              "      the measured guard shape");
+        req.addr = IMG_LO; req.prot = LINUX_PROT_READ | LINUX_PROT_EXEC;
+        CHECK(linux_mem_mprotect_refusal(&req, IMG_LO, IMG_HI, STK_LO, STK_HI,
+                                         BASE, LIMIT) == 0,
+              "an image RX page is a valid mprotect target — the image window "
+              "      is part of the task's own address space");
+        req.addr = STK_LO; req.prot = LINUX_PROT_READ | LINUX_PROT_WRITE;
+        CHECK(linux_mem_mprotect_refusal(&req, IMG_LO, IMG_HI, STK_LO, STK_HI,
+                                         BASE, LIMIT) == 0,
+              "a stack RW page is a valid target — the stack window is the "
+              "      third owned range");
+        req.addr = LIMIT; req.len = 0x1000;
+        CHECK(linux_mem_mprotect_refusal(&req, IMG_LO, IMG_HI, STK_LO, STK_HI,
+                                         BASE, LIMIT) == -LINUX_ENOMEM,
+              "a range outside every owned window is ENOMEM before any post");
+        req.addr = BASE; req.len = 0x1000;
+        req.prot = LINUX_PROT_WRITE | LINUX_PROT_EXEC;
+        CHECK(linux_mem_mprotect_refusal(&req, IMG_LO, IMG_HI, STK_LO, STK_HI,
+                                         BASE, LIMIT) == -LINUX_EPERM,
+              "W|X is EPERM at the mprotect first trap, both ends");
+        req.prot = 0x8;
+        CHECK(linux_mem_mprotect_refusal(&req, IMG_LO, IMG_HI, STK_LO, STK_HI,
+                                         BASE, LIMIT) == -LINUX_EINVAL,
+              "an unknown prot bit is EINVAL, never a soft state by accident");
+        req.prot = LINUX_PROT_NONE; req.len = 0;
+        CHECK(linux_mem_mprotect_refusal(&req, IMG_LO, IMG_HI, STK_LO, STK_HI,
+                                         BASE, LIMIT) == -LINUX_EINVAL,
+              "a zero mprotect length is EINVAL");
+        req.len = 0x1000; req.addr = BASE + 1;
+        CHECK(linux_mem_mprotect_refusal(&req, IMG_LO, IMG_HI, STK_LO, STK_HI,
+                                         BASE, LIMIT) == -LINUX_EINVAL,
+              "an unaligned mprotect address is EINVAL");
+        req.addr = BASE; req.len = 0xFFFFFFFFFFFFFFFFULL;
+        CHECK(linux_mem_mprotect_refusal(&req, IMG_LO, IMG_HI, STK_LO, STK_HI,
+                                         BASE, LIMIT) == -LINUX_EINVAL,
+              "a length whose page-round overflows is EINVAL");
+        req.len = 0x1000; req.addr = LIMIT - 0x1000;
+        CHECK(linux_mem_mprotect_refusal(&req, IMG_LO, IMG_HI, STK_LO, STK_HI,
+                                         BASE, LIMIT) == 0,
+              "the last page of the window is inside the inclusive bound");
+        req.addr = LIMIT - 0x1000; req.len = 0x2000;
+        CHECK(linux_mem_mprotect_refusal(&req, IMG_LO, IMG_HI, STK_LO, STK_HI,
+                                         BASE, LIMIT) == -LINUX_ENOMEM,
+              "a range crossing the window's end is refused, not rounded in");
+
+        req.addr = BASE + 0x2000; req.len = 0x2000; req.prot = LINUX_PROT_NONE;
+        v = linux_mem_mprotect_verdict(IMG_LO, IMG_HI, STK_LO, STK_HI,
+                                       BASE, LIMIT, &req, 0);
+        CHECK(v.malformed == 0 && v.va == req.addr && v.pages == 2,
+              "a success reply names the staged page range the apply walks");
+        v = linux_mem_mprotect_verdict(IMG_LO, IMG_HI, STK_LO, STK_HI,
+                                       BASE, LIMIT, &req,
+                                       (uint64_t)(int64_t)(-LINUX_EINVAL));
+        CHECK(v.malformed == 0 && v.pages == 0,
+              "a negative reply changes nothing and is not malformed");
+        v = linux_mem_mprotect_verdict(IMG_LO, IMG_HI, STK_LO, STK_HI,
+                                       BASE, LIMIT, &req, 1);
+        CHECK(v.malformed == 1 && v.pages == 0,
+              "mprotect success is 0; any other non-negative reply is malformed");
+        req.prot = LINUX_PROT_WRITE | LINUX_PROT_EXEC;
+        v = linux_mem_mprotect_verdict(IMG_LO, IMG_HI, STK_LO, STK_HI,
+                                       BASE, LIMIT, &req, 0);
+        CHECK(v.malformed == 1 && v.pages == 0,
+              "a W|X request reaching the verdict changes nothing — the "
+              "      ladder is re-run and total");
+    }
+
     /* ─── the brk verdict: the re-check at the reply ──────────────────── */
     {   const uint64_t BASE  = 0x0000400000100000ULL;
         const uint64_t LIMIT = BASE + 0x10000;   /* 64 KiB, page-rounded */
@@ -887,6 +968,22 @@ int main(void)
         CHECK(linux_user_page_frame(root, VA) == 0,
               "a huge page reads as 0 by name — not this shim's user "
               "      shape, exactly as the copy refuses it");
+
+        /* E7 §10.15: the ownership walk accepts a soft leaf; the copy
+         * walkers must still refuse it. */
+        p_pd[i2] = (uint64_t)(uintptr_t)p_pt | P | U;
+        p_pt[i1] = (uint64_t)(uintptr_t)p_page | P | (1ULL << 9) |
+                   (1ULL << 63);
+        {
+            uint8_t out = 0;
+            CHECK(linux_user_page_frame(root, VA) ==
+                      ((uint64_t)(uintptr_t)p_page & 0x000FFFFFFFFFF000ULL),
+                  "the owner read finds a soft-protected leaf's frame — "
+                  "      munmap/brk/mmap unwind must not leak it");
+            CHECK(linux_user_copy_out(&out, root, VA, 1) == -LINUX_EFAULT,
+                  "the copy read still refuses a soft leaf: U=0 is the "
+                  "      security boundary, not a decoration");
+        }
     }
 
     /* ─── the sig copy plan: the signal seam's byte crossing (§10.13 step 2) ──
@@ -987,6 +1084,46 @@ int main(void)
               "a NULL args array is the zero plan — total, no fault");
     }
 
+    /* ═══ sigaltstack (131) — the firstuser guard-page setup's first ask ══
+     * Rust std queries the old alternative stack before it allocates the
+     * guard page. A reply with no destination, or an install that tried to
+     * copy a stack_t IN, would either park the wrong shape or make std
+     * return before its mmap+mprotect. The query's 24-byte stack_t is the
+     * reply plan's; the install is a no-op by name. */
+    {
+        uint64_t a[6];
+        struct LinuxSigCopyPlan in;
+        struct LinuxFdReplyPlan out;
+
+        memset(a, 0, sizeof a);
+        a[0] = 0;                       /* query: no new stack */
+        a[1] = 0x00007FFFFFFFE300ULL;   /* old stack_t out-pointer */
+        in = linux_sig_copy_plan(LINUX_SIGALTSTACK, a);
+        CHECK(in.src == 0 && in.len == 0 && in.refuse == 0,
+              "sigaltstack installs attach nothing IN — this v1 never "
+              "      delivers on an alternative stack");
+        out = linux_fd_reply_plan(LINUX_SIGALTSTACK, a);
+        CHECK(out.refuse == 0 && out.dst == a[1] &&
+              out.len == LINUX_STACK_T_BYTES &&
+              out.aux == LINUX_STACK_T_BYTES &&
+              out.kind == LINUX_STAGE_RAW,
+              "sigaltstack's query stages exactly one 24-byte stack_t at "
+              "      args[1] — SS_DISABLE is the sidecar's answer");
+
+        a[1] = 0;                       /* query with no old pointer */
+        out = linux_fd_reply_plan(LINUX_SIGALTSTACK, a);
+        CHECK(out.len == 0 && out.kind == LINUX_STAGE_NONE &&
+              out.refuse == 0,
+              "a NULL old pointer owes no reply payload");
+
+        CHECK(linux_reply_shape_ok(LINUX_SIGALTSTACK, 0,
+                                   LINUX_STACK_T_BYTES) &&
+              !linux_reply_shape_ok(LINUX_SIGALTSTACK, 0,
+                                    LINUX_STACK_T_BYTES - 1),
+              "the reply shape is success plus exactly one stack_t — a "
+              "      short payload cannot be a silent success");
+    }
+
     /* ═══ E7 increment 23: poll (7) — readiness and timed wakeups ══════
      * The firstuser's LAST ENOSYS answer is now a real call: the kernel
      * copies the caller's pollfd array IN and the reply's rewritten array
@@ -1045,7 +1182,7 @@ int main(void)
               "a NULL array with nfds > 0 is EFAULT before any post — the "
               "      first trap refuses it, the sidecar never sees it");
 
-        a[0] = 0x00007FFFFFFFF000ULL;   /* 2 fds: 16 bytes cross the max */
+        a[0] = 0x00007FFFFFFFFFF8ULL;   /* 2 fds: 16 bytes cross the max */
         CHECK(linux_fd_write_plan(LINUX_POLL, a).refuse == -LINUX_EFAULT &&
               linux_fd_reply_plan(LINUX_POLL, a).refuse == -LINUX_EFAULT,
               "an array span crossing the user-canonical max is EFAULT — "

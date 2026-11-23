@@ -286,7 +286,8 @@ static int ep_dir_read(struct EnvPayloadDirHead* h,
     if (nvme_read_sync(PERSIST_ENV_PAYLOAD_HDR_LBA, ep_stage) != 0) return -1;
     ep_copy(h, ep_stage, (uint32_t)sizeof(*h));
     if (h->magic != ENV_PAYLOAD_DIR_MAGIC ||
-        h->version != ENV_PAYLOAD_REC_VERSION ||
+        (h->version != ENV_PAYLOAD_REC_VERSION &&
+         h->version != ENV_PAYLOAD_REC_VERSION_PREV) ||
         h->rec_size != (uint32_t)sizeof(struct EnvPayloadDirEntry)) {
         /* A directory this build cannot read is an ABSENT payload, never a
          * half-read one. */
@@ -354,6 +355,10 @@ static uint32_t ep_perm_of(uint64_t e) {
     if (e & (1ull << 1))  p |= EP_PAGE_PERM_WRITE;
     if (!(e & (1ull << 63))) p |= EP_PAGE_PERM_EXEC;
     if (e & (1ull << 2))  p |= EP_PAGE_PERM_USER;
+    /* E7 §10.15: a present 4 KiB leaf with U=0 and the software bit is a
+     * soft PROT_NONE page. It is neither USER nor WRITE nor EXEC; the
+     * frame is still owned and the capture must carry its bytes. */
+    if (e & (1ull << 9))  p |= EP_PAGE_PERM_SOFT;
     return p;
 }
 
@@ -386,7 +391,8 @@ static int ep_resolve_ex(uint64_t cr3, uint64_t vaddr, uint64_t* out_phys,
         return 1;
     }
     uint64_t* pt = (uint64_t*)(uintptr_t)(pd[i2] & 0x000ffffffffff000ull);
-    if (!(pt[i1] & 1ull) || !(pt[i1] & (1ull << 2))) return 0;
+    if (!(pt[i1] & 1ull)) return 0;
+    if (!(pt[i1] & (1ull << 2)) && !(pt[i1] & (1ull << 9))) return 0;
     *out_phys = (pt[i1] & 0x000ffffffffff000ull) + (vaddr & 0xfffull);
     if (out_perm) *out_perm = ep_perm_of(pt[i1]);
     return 1;
@@ -652,7 +658,9 @@ uint32_t env_payload_capture_all(void) {
                         }
                         uint64_t* pt = (uint64_t*)(uintptr_t)(pd[i2] & 0x000ffffffffff000ull);
                         for (uint64_t i1 = 0; i1 < 512; i1++) {
-                            if (!(pt[i1] & 1ull) || !(pt[i1] & (1ull << 2))) continue;
+                            if (!(pt[i1] & 1ull)) continue;
+                            if (!(pt[i1] & (1ull << 2)) &&
+                                !(pt[i1] & (1ull << 9))) continue;
                             uint64_t v = vbase2m | (i1 << 12);
                             if (!ep_task_page(rec, t, pds[t], v)) continue;
                             if (n_pages >= EP_MAX_PAGES) { overflow = 1; break; }
@@ -1295,11 +1303,13 @@ int env_payload_restore(uint32_t partition, uint32_t index,
     struct EnvPayloadHead head;
     ep_copy(&head, ep_page, (uint32_t)sizeof(head));
     if (head.magic != ENV_PAYLOAD_BLOB_MAGIC ||
-        head.version != ENV_PAYLOAD_REC_VERSION ||
+        (head.version != ENV_PAYLOAD_REC_VERSION &&
+         head.version != ENV_PAYLOAD_REC_VERSION_PREV) ||
         head.partition_id != partition || head.index != index) {
         ep_refuse(EP_REFUSE_FORMAT, 0, 0);
         return EP_REFUSE_FORMAT;
     }
+    uint32_t blob_version = head.version;
     uint64_t seq = ((uint64_t)head.seq_high << 32) | head.seq_low;
     if (seq != want_seq) { ep_refuse(EP_REFUSE_SEQ, 0, 0); return EP_REFUSE_SEQ; }
     if (head.n_pages == 0 || head.n_pages > EP_MAX_PAGES ||
@@ -1543,6 +1553,18 @@ int env_payload_restore(uint32_t partition, uint32_t index,
                     ep_refuse(EP_REFUSE_FORMAT, 7, pi);
                     return EP_REFUSE_FORMAT;
                 }
+                /* E7 §10.15: SOFT is its own state, never a decoration on
+                 * a normal grant. USER|SOFT is contradictory; W or X on a
+                 * soft page would make PROT_NONE a lie. A v2 writer never
+                 * emitted the bit, so a v2 blob claiming it is malformed. */
+                if ((want_perm & EP_PAGE_PERM_SOFT) &&
+                    ((want_perm & (EP_PAGE_PERM_USER |
+                                   EP_PAGE_PERM_WRITE |
+                                   EP_PAGE_PERM_EXEC)) != 0 ||
+                     blob_version == ENV_PAYLOAD_REC_VERSION_PREV)) {
+                    ep_refuse(EP_REFUSE_FORMAT, 8, pi);
+                    return EP_REFUSE_FORMAT;
+                }
                 uint64_t phys = 0;
                 uint32_t live_perm = 0;
                 if (task_kind[t] != ENV_CKPT_TASK_LINUX &&
@@ -1577,6 +1599,7 @@ int env_payload_restore(uint32_t partition, uint32_t index,
                     if (want_perm & EP_PAGE_PERM_WRITE) flags |= USER_PTE_WRITE;
                     if (want_perm & EP_PAGE_PERM_EXEC)  flags |= USER_PTE_EXEC;
                     else                                flags |= USER_PTE_NOEXEC;
+                    if (want_perm & EP_PAGE_PERM_SOFT)  flags |= USER_PTE_SOFT_NONE;
                     user_map_page((uint64_t*)(uintptr_t)pds[t]->cr3, v,
                                   (uint64_t)(uintptr_t)frame, flags);
                     phys = (uint64_t)(uintptr_t)frame;

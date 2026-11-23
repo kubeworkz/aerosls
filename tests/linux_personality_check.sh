@@ -67,7 +67,7 @@ for f in kernel/linux_abi.h kernel/linux_abi.c kernel/process.h kernel/process.c
          arch/x86/fpu_enable.h arch/x86/lazy_fpu.c arch/x86/idt.c \
          arch/x86/interrupt.asm arch/x86/switch_lazy.asm \
          kernel/kernel.c kernel/stubs.c tests/fpu_enable_host_test.c \
-         tests/linux_clone_host_test.c; do
+         tests/user_map_identity_host_test.c tests/linux_clone_host_test.c; do
     if [ ! -f "$f" ]; then
         echo "ABORT: $f missing — the guard cannot be evaluated at all." >&2
         exit 2
@@ -106,6 +106,7 @@ KERC=kernel/kernel.c
 STUB=kernel/stubs.c
 FHUT=tests/fpu_enable_host_test.c
 PHUT=tests/linux_personality_host_test.c
+HUMAP=tests/user_map_identity_host_test.c
 LTHH=kernel/linux_thread.h
 LTHC=kernel/linux_thread.c
 
@@ -555,9 +556,11 @@ if [ -n "$span_line" ] && \
 else
     bad "N2. the span's stamp or its twin is gone — the kernel would map brk pages against a span the manifest never declared (or stamp one onto every SLS slot), or the sidecar's ledger would be born at a base the kernel's pages never reach: the two halves silently disagree and every denial-echo check lies"
 fi
-if grep -qF 'linux_mprotect_refuses_wx(largs[2]))' "$DISP" && \
-   grep -qF '(uint64_t)(int64_t)(-LINUX_EPERM);' "$DISP" && \
-   grep -qF 'if args[2] & 0x2 != 0 && args[2] & 0x4 != 0 {' "$LRS" && \
+if grep -qF 'mref = linux_mem_mprotect_refusal(&mreq,' "$DISP" && \
+   grep -qF 'if (mref) {' "$DISP" && \
+   grep -qF 'mref == -LINUX_EPERM' "$DISP" && \
+   grep -qF 'linux_mprotect_refuses_wx(req->prot)' "$LABC" && \
+   grep -qF 'if prot & 0x2 != 0 && prot & 0x4 != 0 {' "$LRS" && \
    grep -qF 'const E_PERM: i32 = -12;' "$LRS"; then
     ok "N3. W|X is refused at BOTH ends: the first trap refuses -EPERM before any post, and the sidecar's arm carries the same refusal (CAP_EPERM pinned at -12 so §5.7 delivers 1)"
 else
@@ -859,11 +862,22 @@ fi
 
 if grep -qF 'fmt_sig_line(&mut ex, b" write ok len=",' "$LRS" && \
    grep -qF 'for &b in payload[..len].iter().take(24)' "$LRS" && \
-   grep -qF 'push_bytes(&mut ex, 0, b" -> ENOSYS mmap(len="' "$LRS" && \
-   grep -qF 'off = dec_into(&mut ex, off, args[1]);' "$LRS"; then
+   grep -qF 'fn fmt_mmap_refusal_line' "$LRS" && \
+   grep -qF 'b"ENOSYS mmap(len="' "$LRS" && \
+   grep -qF 'E_NOSYS, args[1], args[2], args[3]' "$LRS"; then
     ok "R8. the SIGABRT reading's instrument holds: the workload's own console bytes ride its write lines (len + a 24-byte excerpt, child-attributed) and mmap refusals carry their request (len/prot/flags) — 'alloc failed after ENOSYS' is read off the E7 stream, never inferred from a merged console drain whose order is the flush, not the writer"
 else
     bad "R8. the attribution is gone — the alloc-failure text would exist only in the merged console drain (any child of the environment could have written it) and the mmap refusal goes back to a bare ENOSYS with no request to name (the proven chain becomes an inference again)"
+fi
+if ! grep -qF 'cmp rax, 131' "$ASM" && \
+   ! grep -qF '.do_sls_svc_crash' "$ASM" && \
+   grep -qF '131 (sigaltstack in the Linux census) is deliberately NOT routed here.' "$ASM" && \
+   grep -qF 'case SYS_SLS_SVC_CRASH:' "$DISP" && \
+   grep -qF 'LINUX_SIGALTSTACK => {' "$LRS" && \
+   grep -qF 'SS_DISABLE' "$LRS"; then
+    ok "R9. sigaltstack (131) is NOT in the asm number chain — the personality branch, not the number alone, decides it: the real firstuser's query reaches the sidecar's 131 arm (old stack_t = SS_DISABLE), its install is a no-op, and Rust std falls through to the guard-page mmap+mprotect; SLS still reaches SYS_SLS_SVC_CRASH through do_syscall's own arm"
+else
+    bad "R9. the asm fast path claims 131 again (or the sidecar's SS_DISABLE answer/SLS arm is gone) — a Linux sigaltstack(NULL,&old) would become an SLS svc_crash, the old stack_t would stay zeroed, std would skip the guard-page mmap+mprotect, and every other clause could stay green while the real firstuser's guard call silently vanished"
 fi
 
 # ─── S. poll (7) — readiness and timed wakeups (E7 increment 24) ───────────
@@ -917,7 +931,7 @@ if grep -qF 'linux_fd_write_plan(LINUX_POLL, a)' "$PHUT" && \
    grep -qF 'linux_fd_reply_plan(LINUX_POLL, a)' "$PHUT" && \
    grep -qF 'linux_reply_shape_ok(LINUX_POLL, 2, 3 * LINUX_POLLFD_BYTES)' "$PHUT" && \
    grep -qF 'LINUX_POLL_MAX_FDS + 1' "$PHUT" && \
-   grep -qF '0x00007FFFFFFFF000ULL' "$PHUT"; then
+   grep -qF '0x00007FFFFFFFFFF8ULL' "$PHUT"; then
     ok "S4. the host test drives both plans against the REAL kernel/linux_abi.c — the in/out crossings, nfds 0, the cap, the NULL array, the span crossing the user max, and the reply shape"
 else
     bad "S4. the host test no longer drives poll's plans — the crossings and refusals would be argued from this guard's greps alone, every branch reachable only at boot"
@@ -979,8 +993,10 @@ if [ -n "$deliver_buf" ] && \
 else
     bad "T3. a shape arm is gone — a payload would be copied for a number that staged none, beyond the clamp, past a refusal, or with a ret its number contradicts (the one-truth rule with bytes attached)"
 fi
-if grep -qF 'int require_rw)' "$LABC" && \
+if grep -qF 'int require_rw, int accept_soft)' "$LABC" && \
    grep -qF 'if (require_rw && !(e & LAB_PTE_RW)) return -LINUX_EFAULT;' "$LABC" && \
+   grep -qF 'static int lab_walk_leaf_rw(' "$LABC" && \
+   grep -qF 'return lab_walk_leaf(root, va, leaf_out, 1, 0);' "$LABC" && \
    grep -qF '#define LAB_PTE_RW' "$LABC" && \
    grep -qF 'Phase 1 — validate the WHOLE span' "$LABC" && \
    grep -qF 'Phase 2 — write.' "$LABC"; then
@@ -1176,8 +1192,9 @@ else
 fi
 if grep -qF 'fn hex_into' "$LRS" && \
    grep -qF ' ok mmap -> 0x' "$LRS" && \
-   grep -qF 'EPERM mmap(len=' "$LRS" && \
-   grep -qF ' -> ENOSYS mmap(len=' "$LRS"; then
+   grep -qF 'fn fmt_mmap_refusal_line' "$LRS" && \
+   grep -qF 'b"EPERM mmap(len="' "$LRS" && \
+   grep -qF 'b"ENOSYS mmap(len="' "$LRS"; then
     ok "V8. the instrument carries every mmap answer — a grant shows the address the ledger gave (hex: an address is unreadable in decimal), every refusal shows the request's words with the errno it became, and the increment-15 ENOSYS line is unchanged behind it"
 else
     bad "V8. an mmap answer line is gone — the run's proof would be a reconstruction again (the increment-14/15 instrument rule)"
@@ -1189,7 +1206,9 @@ fi
 # clauses hold the three halves that make the tenant checkpointable — the
 # identity the manager names, the kernel facts the spawn stamps, and the
 # bytes + permissions the capture files — plus the one form the blob can
-# honestly resume (USER), refused by name otherwise.
+# honestly resume (USER), refused by name otherwise. The host-test clause
+# also holds the v2 replay and the corrupt soft-permission refusals that
+# keep old blobs readable without admitting v3-only states.
 EPH=kernel/env_payload.h
 EPC=kernel/env_payload.c
 ECKH=kernel/env_ckpt.h
@@ -1198,8 +1217,9 @@ IEM=user/init/src/env_manager.rs
 ENVP=user/proto/src/env_proto.rs
 EPHUT=tests/env_payload_host_test.c
 ECKHUT=tests/env_ckpt_host_test.c
-if grep -qF '#define ENV_PAYLOAD_REC_VERSION 2u' "$EPH" && \
+if grep -qE '#define ENV_PAYLOAD_REC_VERSION[[:space:]]+3u' "$EPH" && \
    grep -qF '#define EP_PAGE_ENTRY_BYTES 16u' "$EPH" && \
+   grep -qE '#define EP_PAGE_PERM_SOFT[[:space:]]+0x8u' "$EPH" && \
    grep -qF 'uint64_t linux_regs[20];' "$EPH" && \
    grep -qF 'uint64_t linux_args[6]; /* rdi, rsi, rdx, r10, r8, r9 at the capture */' "$EPH" && \
    grep -qF 'uint64_t fs_base;' "$EPH" && \
@@ -1261,12 +1281,20 @@ fi
 if grep -qF 'LINUX: the gate environment (sidecar + Linux tenant) captures as one payload' "$EPHUT" && \
    grep -qF 'LINUX: the full ring3_ctx — rip, rsp and the six argument registers — is the captured one' "$EPHUT" && \
    grep -qF 'PERM: a captured RX image page that is writable at the destination refuses the whole pour' "$EPHUT" && \
+   grep -qF 'V2: a soft-free v2 payload replays every page' "$EPHUT" && \
+   grep -qF 'V2+SOFT: a v2 blob claiming the v3 soft bit is refused by format, before any pour' "$EPHUT" && \
+   grep -qF 'SOFT+USER: the restore refuses the contradictory permission before a byte moves' "$EPHUT" && \
+   grep -qF 'SOFT+WX: a writable+executable soft page is refused by format, not poured' "$EPHUT" && \
+   grep -qF 'V2+SOFT: the refusal is the soft-permission rule (a=8), not a torn index CRC (a=5)' "$EPHUT" && \
+   grep -qF 'SOFT+USER: the refusal names the permission rule (a=8), not a torn index CRC' "$EPHUT" && \
+   grep -qF 'SOFT+WX: the refusal names the permission rule (a=8), not a torn index CRC' "$EPHUT" && \
+   [ "$(grep -cF 'CHECK(env_payload_last_refusal().a == 8,' "$EPHUT")" -eq 3 ] && \
    grep -qF 'FORM: a parked Linux tenant is refused by name' "$EPHUT" && \
    grep -qF 'the stamp fills the Linux slot' "$ECKHUT" && \
    grep -qF 'a replay whose create names the same three tasks IS the same environment' "$ECKHUT"; then
-    ok "W6. both host tests drive the increment: the payload round trip (bytes, perms, context, the perm and form teeth) and the record layer's stamp/identity clauses — each claim runs against the real kernel file, not a model of it"
+    ok "W6. both host tests drive the increment: the payload round trip (bytes, perms, context, the perm and form teeth), the v2 replay and corrupt soft-permission refusals with all three a=8 operand assertions, and the record layer's stamp/identity clauses — each claim runs against the real kernel file, not a model of it"
 else
-    bad "W6. a host-test clause for increment 20 is missing — the capture, the stamp or the identity comparison would be a claim no test runs"
+    bad "W6. a host-test clause for increment 20 is missing — the capture, the stamp, the identity comparison, the v2 replay or a corrupt soft-permission refusal would be a claim no test runs"
 fi
 
 # ─── X. E7 increment 25: munmap, the memory class's last seam ─────────────
@@ -1339,6 +1367,95 @@ if grep -qF ' ok munmap addr=0x' user/sidecar/src/linux.rs && \
     ok "X6. the run's proof is on the lines: the granted range and its words, the refusal's EINVAL with the range, and the kernel's per-page free count — WHICH range and HOW MANY pages, not reconstructed from which arms ran"
 else
     bad "X6. a munmap instrument line is missing — the seam would run but the log would not name the range it freed (increment 14/15's rule)"
+fi
+
+# ─── Y. E7 §10.15: the soft-protected mprotect transition ─────────────────
+# The contract (Y), the first trap before any post (Y1), the reply's
+# all-pages prewalk and soft apply (Y2), the page-table helper and its owner
+# walk (Y3), the sidecar's 10 twin (Y4), the host tests (Y5), the probe's
+# disposable fault (Y6) and the two instrument lines (Y7): each is a claim
+# the transition rests on. The probe's fault is deliberate; the gate tenant
+# never runs it, so the gate's no-[FAULT] clause is unchanged.
+if grep -qF 'struct LinuxMprotectReq {' "$LABH" && \
+   grep -qF 'int linux_mem_mprotect_refusal(const struct LinuxMprotectReq *req,' "$LABH" && \
+   grep -qF 'struct LinuxMemMprotectVerdict' "$LABH" && \
+   grep -qF 'int linux_mem_mprotect_refusal(const struct LinuxMprotectReq *req,' "$LABC" && \
+   grep -qF 'linux_mem_mprotect_verdict(uint64_t image_lo, uint64_t image_hi,' "$LABC"; then
+    ok "Y. the §10.15 transition is a named pure contract at both ends — the staged request, the first-trap refusal over the task's own image/stack/heap windows, and the reply verdict that re-runs the ladder over the same words"
+else
+    bad "Y. the soft-mprotect contract is missing — the kernel would have no named refusal or verdict, and the transition would be a page-table edit with no policy"
+fi
+mprotect_ref=$(grep -nF 'mref = linux_mem_mprotect_refusal(&mreq,' "$DISP" | head -1 | cut -d: -f1)
+mprotect_first="$(sed -n "$((mprotect_ref - 3)),$((mprotect_ref + 30))p" "$DISP")"
+if [ -n "$mprotect_ref" ] && \
+   grep -qF 'refused before post' <<< "$mprotect_first" && \
+   grep -qF 'return (uint64_t)(int64_t)mref;' <<< "$mprotect_first" && \
+   grep -qF 'cur->mem_stage_a1    = largs[1];' <<< "$mprotect_first" && \
+   grep -qF 'cur->mem_stage_a2    = largs[2];' <<< "$mprotect_first"; then
+    ok "Y1. mprotect's first trap runs before any post: a refusal logs its words and returns its errno on the line, while a pass stages addr/len/prot for the reply's verdict"
+else
+    bad "Y1. the mprotect first trap is gone or no longer precedes the post — a malformed range would reach the channel, or a pass would lose the words the apply re-checks"
+fi
+mprotect_v=$(grep -nF 'v = linux_mem_mprotect_verdict(' "$DISP" | head -1 | cut -d: -f1)
+mprotect_apply="$(sed -n "$((mprotect_v - 3)),$((mprotect_v + 80))p" "$DISP")"
+if [ -n "$mprotect_v" ] && \
+   grep -qF 'linux_user_page_frame(' <<< "$mprotect_apply" && \
+   grep -qF 'user_protect_page(pml4, va,' <<< "$mprotect_apply" && \
+   grep -qF 'user_invlpg(va);' <<< "$mprotect_apply" && \
+   grep -qF 'USER_PTE_SOFT_NONE' <<< "$mprotect_apply" && \
+   grep -qF 'mreq.prot == LINUX_PROT_NONE' <<< "$mprotect_apply" && \
+   grep -qF 'soft-protected (P=1 U=0)' <<< "$mprotect_apply"; then
+    ok "Y2. the reply prewalks every page as a present owned leaf, preserves the frame, installs P|SOFT_NONE|NX (U=0, W=0) for PROT_NONE, invlpg's each change, and names the soft state on the line — no frame is allocated, freed or zeroed"
+else
+    bad "Y2. the soft apply is missing or no longer walks before changing a leaf — an absent page could be half-applied, a frame could be reowned, or the log would only say 'mprotect returned 0'"
+fi
+if grep -qF 'int user_protect_page(uint64_t* pml4, uint64_t vaddr, uint64_t flags);' "$UPH" && \
+   grep -qF 'int user_protect_page(uint64_t* pml4, uint64_t vaddr, uint64_t flags) {' "$UPC" && \
+   grep -qF 'USER_PTE_SOFT_NONE' "$UPH" && \
+   grep -qF 'if (!(e & (USER_PTE_USER | USER_PTE_SOFT_NONE))) return -1;' "$UPC" && \
+   grep -qF 'keep = e & (USER_PTE_FRAME_MASK' "$UPC" && \
+   grep -qF 'if (!(e & USER_PTE_USER) && !(e & USER_PTE_SOFT_NONE))' "$UPC"; then
+    ok "Y3. the page-table helper preserves the live frame/PWT/PCD/A-D/PAT bits, refuses a supervisor-only leaf but accepts a soft one, and the teardown walk still frees a soft leaf exactly once — the frame is never leaked by PROT_NONE"
+else
+    bad "Y3. the soft leaf's helper or teardown exception is gone — mprotect could edit a kernel mapping, or teardown could skip the present-but-U=0 frame and leak it"
+fi
+mprotect_arm=$(grep -nF '        10 => {' "$LRS" | head -1 | cut -d: -f1)
+mprotect_arm_body="$(sed -n "$((mprotect_arm + 1)),$((mprotect_arm + 20))p" "$LRS")"
+if [ -n "$mprotect_arm" ] && \
+   grep -qF 'prot & !0x7u64' <<< "$mprotect_arm_body" && \
+   grep -qF 'prot & 0x2 != 0 && prot & 0x4 != 0' <<< "$mprotect_arm_body" && \
+   grep -qF 'len.checked_add(0xFFF).is_none()' <<< "$mprotect_arm_body" && \
+   grep -qF 'Answer::Reply(0, STATUS_OK)' <<< "$mprotect_arm_body"; then
+    ok "Y4. the sidecar's 10 arm repeats the shape and W|X ladder as its own twin, grants a valid PROT_NONE without choosing an address or moving either MemBrk cursor, and leaves the page-table truth to the kernel"
+else
+    bad "Y4. the sidecar's mprotect arm is gone or no longer mirrors the ladder — a malformed prot could get a fake success, or the policy half would silently disappear"
+fi
+if grep -qF 'linux_mem_mprotect_refusal(&req' "$PHUT" && \
+   grep -qF 'linux_mem_mprotect_verdict(IMG_LO' "$PHUT" && \
+   grep -qF 'v.malformed == 0 && v.va == req.addr && v.pages == 2' "$PHUT" && \
+   grep -qF 'user_protect_page(child, phys,' "$HUMAP" && \
+   grep -qF 'teardown frees the soft leaf' "$HUMAP"; then
+    ok "Y5. the host tests drive both directions: the first-trap refusals and verdict on the personality side, and the frame-preserving soft/normal transitions plus the exactly-once teardown on a fake page table"
+else
+    bad "Y5. a host test no longer drives the transition — every branch above would be reachable only at boot (t83/t117's rule)"
+fi
+if grep -qF 'E7MEM-SOFT-OK' "$FIX" && \
+   grep -qF '.Lsoft:' "$FIX" && \
+   grep -qF 'mov     $10, %eax' "$FIX" && \
+   grep -qF 'lea     0x1000(%r12), %r13' "$FIX" && \
+   grep -qF 'mov     (%r13), %rax' "$FIX" && \
+   grep -qF 'mov     $405, %eax' "$FIX" && \
+   grep -qF 'mov     $406, %eax' "$FIX" && \
+   grep -qF 'jmp     .Lsoft' "$FIX"; then
+    ok "Y6. the probe carries the disposable live case: on its success path it mprotects the second brk page PROT_NONE, writes E7MEM-SOFT-OK through the fd seam, then reads the page and must fault; MARKER 405 (refused) and 406 (read succeeded) are asserted absent"
+else
+    bad "Y6. the probe's soft case is gone or gutted — the boot would prove nothing about the U/S clear, and a regression would read as a quiet run"
+fi
+if grep -qF 'soft-protected (P=1 U=0)' "$DISP" && \
+   grep -qF '[FAULT] Ring-3 #PF  error=0x%lx  addr=0x%016lx' "$STUB"; then
+    ok "Y7. the live evidence has two named lines: the kernel says how many pages it soft-protected, and the Ring-3 #PF line names the faulting address — the transcript can pair them instead of inferring a fault from the task's absence"
+else
+    bad "Y7. one of the two live instrument lines is gone — the boot would not distinguish a real soft fault from a task that simply exited"
 fi
 
 # ─── Z. E7 TG-1 I2: the kernel-local clone (the Go thread shape) ───────────

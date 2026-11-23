@@ -177,6 +177,12 @@
 #                                4) may wait out before it accuses the RX
 #                                path (default 3; 1 = the pre-change single
 #                                window, kept for the smokes' control teeth).
+#   AEROSLS_FAILOVER_OBSERVER_WAIT
+#                                seconds the live no-takeover watch holds after
+#                                the kill (default 240). The watch must outlast
+#                                FAILOVER_DECLARE_TICKS (6000 ticks, ~60s at
+#                                100Hz; TCG/no-KVM can be slower). 240s is the
+#                                same budget the 3-node guard gives WAIT_ADOPT.
 #   AEROSLS_LOG_DIR               where node<id>.log serial logs live
 #                                (default: cluster/).
 #   AEROSLS_CLUSTER_DIR          where cluster.pids lives (default: cluster/,
@@ -211,7 +217,12 @@ NAME="guard-2node-$$"             # unique per run, so a stale persisted
 if [ "$FAST" = "1" ]; then
     POLL=0.5; WAIT_NODES=10; WAIT_LEARN=6; WAIT_CKPT=6; WAIT_OBSERVER=8; WAIT_LEASE=6
 else
-    POLL=2;   WAIT_NODES=240; WAIT_LEARN=30; WAIT_CKPT=60; WAIT_OBSERVER=90; WAIT_LEASE=30
+    # The watch starts at SIGKILL and must outlast the declaration grace:
+    # FAILOVER_DECLARE_TICKS is 6000 ticks (~60s at 100Hz), and a TCG/no-KVM
+    # guest can stretch that past the old 90s window. 240s is the same budget
+    # the 3-node guard gives its WAIT_ADOPT; holding the no-adoption checks
+    # for the longer window is stricter, never weaker.
+    POLL=2;   WAIT_NODES=240; WAIT_LEARN=30; WAIT_CKPT=60; WAIT_OBSERVER="${AEROSLS_FAILOVER_OBSERVER_WAIT:-240}"; WAIT_LEASE=30
 fi
 # How many campaigns the lease-row gate may drive before it accuses the RX
 # path (see step 4.6). One acquire is one campaign; a lost/slow hop costs a

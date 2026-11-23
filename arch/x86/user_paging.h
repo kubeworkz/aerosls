@@ -12,6 +12,13 @@
 #define USER_PTE_DIRTY    (1ULL << 6)
 #define USER_PTE_PWT      (1ULL << 3)  // write-through (device WC)
 #define USER_PTE_PCD      (1ULL << 4)  // cache-disabled (device uncached)
+#define USER_PTE_PAT      (1ULL << 7)  // 4 KiB leaf PAT; PS at upper levels
+/* E7 §10.15 (not landed until the mprotect increment): a PRESENT 4 KiB leaf
+ * with U/S=0 and this software bit set is a soft-protected page. The frame
+ * is preserved; the state exists so capture/teardown/ownership walks can
+ * still find it while every Ring-3 access faults. Bits 9-11 are software-
+ * available on a 4 KiB PTE. */
+#define USER_PTE_SOFT_NONE (1ULL << 9)
 // NX bit: bit 63. We define EXEC as absence of NX.
 #define USER_PTE_EXEC     0ULL          // no NX bit set = executable
 #define USER_PTE_NOEXEC   (1ULL << 63)  // NX bit set = non-executable
@@ -98,6 +105,16 @@ uint64_t user_clone_page_table(void);
 // Map one 4-KiB page in the given PML4 with the specified flags.
 // Allocates intermediate tables from the physical frame pool as needed.
 void user_map_page(uint64_t* pml4, uint64_t vaddr, uint64_t paddr, uint64_t flags);
+
+/* E7 §10.15: rewrite one PRESENT 4 KiB leaf's protection bits without
+ * allocating, freeing, or moving its frame. The walk never creates a
+ * missing table and refuses a huge page or a supervisor-only leaf. `flags`
+ * carries the new protection (PRESENT, USER or SOFT_NONE, W, NX); the
+ * helper preserves the frame, PWT/PCD, A/D and a 4 KiB leaf's PAT bit.
+ * Returns 0 on success, -1 when there is no present user/soft leaf to
+ * change. The caller validates a whole range before calling this, because
+ * an mprotect must be all-or-nothing. */
+int user_protect_page(uint64_t* pml4, uint64_t vaddr, uint64_t flags);
 
 // Map `npages` of physical memory into the process's address space at the
 // SAME virtual addresses (identity) with Ring-3 access — the sidecar BIB

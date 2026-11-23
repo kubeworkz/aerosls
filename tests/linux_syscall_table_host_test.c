@@ -112,6 +112,7 @@ int main(void)
         {  12, LSC_MEM,   "brk" },
         {  13, LSC_SIG,   "rt_sigaction" },
         {  14, LSC_SIG,   "rt_sigprocmask" },
+        {  56, LSC_THREAD,"clone" },
         {  59, LSC_SPAWN, "execve" },
         {  72, LSC_FD,    "fcntl" },
         {  74, LSC_FD,    "fsync" },
@@ -125,6 +126,11 @@ int main(void)
         { 218, LSC_LOCAL, "set_tid_address" },
         { 228, LSC_LOCAL, "clock_gettime" },
         { 231, LSC_EXIT,  "exit_group" },
+        /* The Go gate's netpoll startup rows (TG-0, tools/go_thread_gate_census.txt). */
+        { 233, LSC_FD,    "epoll_ctl" },
+        { 281, LSC_FD,    "epoll_pwait" },
+        { 290, LSC_FD,    "eventfd2" },
+        { 291, LSC_FD,    "epoll_create1" },
     };
     size_t i;
     for (i = 0; i < sizeof(want) / sizeof(want[0]); i++) {
@@ -173,7 +179,7 @@ int main(void)
         CHECK(strcmp(linux_syscall_class_name(LSC_UNKNOWN), "unknown") == 0,
               "LSC_UNKNOWN's name is \"unknown\" (the refusal line's wording)");
         CHECK(linux_syscall_table_len == sizeof(want) / sizeof(want[0]),
-              "the table's length equals the census's row count");
+              "the table's length equals the checked rows (27 census numbers + the 4 Go-gate epoll/eventfd rows + clone)");
     }
 
     printf("linux_syscall_table_host_test: %d passed, %d failed\n",

@@ -46,10 +46,11 @@
 //!     create), so a growth inside the span is granted and echoed as the
 //!     new break, and everything else answers the UNCHANGED current
 //!     break — Linux's own brk failure shape, never an errno;
-//!   - `mprotect` (10, §5.4's W^X refusal): write+execute together is
-//!     refused EPERM — the refusal H2's Node exclusion IS, and the twin
-//!     of the kernel's first-trap refusal (both ends exist so neither
-//!     alone is load-bearing);
+//!   - `mprotect` (10, §5.4 and §10.15): a real page-protection change.
+//!     This side owns the prot shape and the W^X refusal (EPERM — the
+//!     refusal H2's Node exclusion IS), while the kernel owns the page
+//!     walk and the soft leaf; both ends answer the same ladder so
+//!     neither alone is load-bearing;
 //!   - `rt_sigaction` (13) / `rt_sigprocmask` (14) / `tkill` (200) — the
 //!     signal seam (§10.13's step 2): the act/set bytes arrive ATTACHED
 //!     (the kernel copied them out of the child; this side never reads
@@ -91,9 +92,7 @@
 //!     partition, and neither cursor moves (a freed range is never
 //!     re-handed in v1);
 //!   - everything else — `open`/`close`/`lseek` and the rest of the fd
-//!     class (Phase 2 §3-§4), any mprotect whose prot is not
-//!     W|X (real permission changes are not landed), `clock_gettime`
-//!     (needs the clock plus
+//!     class (Phase 2 §3-§4), `clock_gettime` (needs the clock plus
 //!     a child-buffer write) and any number outside the census —
 //!     is answered `ENOSYS` with its number logged, §11 Q5's recommended
 //!     policy: visible and cheap, never a silent success.
@@ -173,6 +172,15 @@ const E_TARGET: i32 = 7; /* CAP_ERR_TARGET -> -ESRCH (§5.7) */
 /// same words: num and args[1] != 0).
 const LINUX_RT_SIGACTION: u64 = 13;
 const LINUX_RT_SIGPROCMASK: u64 = 14;
+/// sigaltstack (131) — the census's third signal row. Rust std's
+/// stack-overflow setup queries this before it allocates its guard
+/// page; an ENOSYS answer makes std skip the mmap+mprotect pair
+/// silently. The arm below answers the query with SS_DISABLE and
+/// accepts an install without recording a stack this v1 never
+/// delivers on.
+const LINUX_SIGALTSTACK: u64 = 131;
+const STACK_T_BYTES: usize = 24; /* ss_sp u64, ss_flags i32 + pad, ss_size u64 */
+const SS_DISABLE: u16 = 2;       /* stack_t.ss_flags: no alternative stack */
 const LINUX_TKILL: u64 = 200;
 /// mmap(9) — armed since E7 increment 16 (§5.4's anonymous-map half):
 /// the 9 arm below answers the measured allocator's shapes from the
@@ -804,21 +812,27 @@ fn answer(
                 Answer::Reply(0, STATUS_OK)
             }
         }
-        /* mprotect (10, LSC_MEM — §5.4's W^X): only the refusal exists
-         * in v1 — simultaneous write+execute (prot & 0x2 & 0x4) is
-         * refused EPERM, the twin of linux_mprotect_refuses_wx (the
-         * kernel refuses it first-trap, before any post; both ends
-         * exist so neither alone is the load-bearing refusal — guard
-         * clause N3 pins both). Any other prot is ENOSYS with the
-         * number logged: real permission changes are not landed. (The
-         * mem class's last seam, munmap (11), sits beside this arm at
-         * increment 25; a fake grant here would still be a page the
-         * kernel never mapped.) */
+        /* mprotect (10, LSC_MEM — E7 §10.15): the policy half of a real
+         * permission change. This side answers the shape and the W|X
+         * rule; it does not choose an address, allocate a frame, or move
+         * either MemBrk cursor. The kernel re-runs the same shape ladder
+         * and then prewalks the task's page table, because a window can
+         * contain a hole and only the kernel knows which leaves exist.
+         * `PROT_NONE` is a valid transition here; the kernel represents
+         * it as a present, supervisor-only soft leaf. */
         10 => {
-            if args[2] & 0x2 != 0 && args[2] & 0x4 != 0 {
+            let prot = args[2];
+            let len = args[1];
+            let addr = args[0];
+            if prot & !0x7u64 != 0 {
+                Answer::Reply(0, E_INVAL)
+            } else if prot & 0x2 != 0 && prot & 0x4 != 0 {
                 Answer::Reply(0, E_PERM)
+            } else if len == 0 || addr & 0xFFF != 0 ||
+                      len.checked_add(0xFFF).is_none() {
+                Answer::Reply(0, E_INVAL)
             } else {
-                Answer::Reply(0, E_NOSYS)
+                Answer::Reply(0, STATUS_OK)
             }
         }
         /* exit_group (231, LSC_EXIT): the sidecar reaps, the frames return
@@ -985,6 +999,29 @@ fn answer(
                     }
                     _ => Answer::Reply(0, E_INVAL), /* a `how` Linux does not have */
                 }
+            }
+        }
+        /* sigaltstack (131 — the census's third signal row): Rust std's
+         * stack-overflow setup first QUERIES the old stack. Answering
+         * ENOSYS there makes std return before its own guard-page
+         * mmap+mprotect, so the real firstuser's measured guard call
+         * never reached the seam. The query returns one stack_t with
+         * SS_DISABLE and no sp/size — the honest state, because no
+         * alternative stack exists yet. An install is accepted as a
+         * no-op: v1 has no signal frames and never delivers on an
+         * alternative stack, but returning success is what lets the
+         * caller continue into the guard-page setup this increment
+         * observes. The old-pointer case still answers the OLD state
+         * (disabled), captured before the install would change it. */
+        LINUX_SIGALTSTACK => {
+            if args[1] != 0 {
+                /* ReplyBytes owns the fd-class general buffer; only the
+                 * first STACK_T_BYTES cross (payload_bound says 24). */
+                let mut old = [0u8; FD_PAYLOAD_CAP];
+                old[8..10].copy_from_slice(&SS_DISABLE.to_le_bytes());
+                Answer::ReplyBytes(0, STACK_T_BYTES, old)
+            } else {
+                Answer::Reply(0, STATUS_OK)
             }
         }
         /* tkill (200 — the seam's DELIVERY): the tid must be the one this
@@ -1181,6 +1218,7 @@ fn payload_bound(num: u64, args: &[u64; 6], len: usize) -> bool {
     match num {
         LINUX_RT_SIGACTION => args[2] != 0 && len == SIGACT_BYTES,
         LINUX_RT_SIGPROCMASK => args[2] != 0 && len == SIGSET_BYTES as usize,
+        LINUX_SIGALTSTACK => args[1] != 0 && len == STACK_T_BYTES,
         LINUX_STAT | LINUX_LSTAT => args[1] != 0 && len == STAT_PAYLOAD_BYTES,
         LINUX_READ => args[1] != 0 && len <= args[2] as usize
             && len <= FD_PAYLOAD_CAP,
@@ -2261,6 +2299,42 @@ fn fmt_sig_line(buf: &mut [u8], prefix: &[u8], sig_no: u64, suffix: &[u8]) -> us
     push_bytes(buf, off, suffix)
 }
 
+/// The granted anonymous-map line: ` ok mmap -> 0x<16 hex> len=<len>
+/// prot=<prot>` plus a newline. The address is hex because an address is
+/// unreadable in decimal; the request's length and protection stay decimal,
+/// the same words the refusal lines carry and the firstuser guard checker
+/// parses.
+fn fmt_mmap_grant_line(buf: &mut [u8], addr: u64, len: u64, prot: u64) -> usize {
+    let mut off = push_bytes(buf, 0, b" ok mmap -> 0x");
+    off = hex_into(buf, off, addr);
+    off = push_bytes(buf, off, b" len=");
+    off = dec_into(buf, off, len);
+    off = push_bytes(buf, off, b" prot=");
+    off = dec_into(buf, off, prot);
+    push_bytes(buf, off, b"\n")
+}
+
+/// The mmap refusal line: ` -> <errno> mmap(len=<len>, prot=<prot>,
+/// flags=<flags>)`. The request's words are decimal, and the prefix names
+/// whether the ENOSYS arm or the errno ladder refused the shape. The
+/// returned buffer is the `extra` tail `enosys_log` writes; no trailing
+/// newline is added here, matching the two callers' previous composition.
+fn fmt_mmap_refusal_line(buf: &mut [u8], status: i32, len: u64, prot: u64,
+                         flags: u64) -> usize {
+    let mut off = push_bytes(buf, 0, b" -> ");
+    off = push_bytes(buf, off,
+        if status == E_NOSYS { b"ENOSYS mmap(len=" }
+        else if status == E_PERM { b"EPERM mmap(len=" }
+        else if status == E_INVAL { b"EINVAL mmap(len=" }
+        else { b"ENOMEM mmap(len=" });
+    off = dec_into(buf, off, len);
+    off = push_bytes(buf, off, b", prot=");
+    off = dec_into(buf, off, prot);
+    off = push_bytes(buf, off, b", flags=");
+    off = dec_into(buf, off, flags);
+    push_bytes(buf, off, b")")
+}
+
 /// Increment 21: the gate tenant's file-class read offset, in hex (klog's
 /// own encoding). Target builds only — the host fakes have no serial path,
 /// exactly like enosys_log.
@@ -2554,15 +2628,9 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                          * wanted len=X prot=P flags=F and this shim cannot
                          * service it" is a line, not a reconstruction. */
                         let mut ex = [0u8; 56];
-                        let mut off =
-                            push_bytes(&mut ex, 0, b" -> ENOSYS mmap(len=");
-                        off = dec_into(&mut ex, off, args[1]);
-                        off = push_bytes(&mut ex, off, b", prot=");
-                        off = dec_into(&mut ex, off, args[2]);
-                        off = push_bytes(&mut ex, off, b", flags=");
-                        off = dec_into(&mut ex, off, args[3]);
-                        off = push_bytes(&mut ex, off, b")");
-                        enosys_log(num as u32, &name_buf[..nlen], &ex[..off]);
+                        let n = fmt_mmap_refusal_line(
+                            &mut ex, E_NOSYS, args[1], args[2], args[3]);
+                        enosys_log(num as u32, &name_buf[..nlen], &ex[..n]);
                     } else {
                         enosys_log(num as u32, &name_buf[..nlen], b" -> ENOSYS\n");
                     }
@@ -2575,29 +2643,18 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                      * line: the kernel's first trap refused it with the
                      * address on ITS line, before any post.) */
                     let mut ex = [0u8; 56];
-                    let mut off = push_bytes(&mut ex, 0, b" -> ");
-                    off = push_bytes(&mut ex, off,
-                        if status == E_PERM   { b"EPERM mmap(len=" }
-                        else if status == E_INVAL { b"EINVAL mmap(len=" }
-                        else                  { b"ENOMEM mmap(len=" });
-                    off = dec_into(&mut ex, off, args[1]);
-                    off = push_bytes(&mut ex, off, b", prot=");
-                    off = dec_into(&mut ex, off, args[2]);
-                    off = push_bytes(&mut ex, off, b", flags=");
-                    off = dec_into(&mut ex, off, args[3]);
-                    off = push_bytes(&mut ex, off, b")");
-                    enosys_log(num as u32, &name_buf[..nlen], &ex[..off]);
+                    let n = fmt_mmap_refusal_line(
+                        &mut ex, status, args[1], args[2], args[3]);
+                    enosys_log(num as u32, &name_buf[..nlen], &ex[..n]);
                 } else if num == LINUX_MMAP {
                     /* A GRANTED map shows the address the ledger gave
-                     * (increment 16) — in hex, because an address is
-                     * unreadable in decimal on a serial log, and this
-                     * line is the run's proof that the allocator's arena
-                     * landed inside its span. */
-                    let mut ex = [0u8; 40];
-                    let mut off = push_bytes(&mut ex, 0, b" ok mmap -> 0x");
-                    off = hex_into(&mut ex, off, ret);
-                    off = push_bytes(&mut ex, off, b"\n");
-                    enosys_log(num as u32, &name_buf[..nlen], &ex[..off]);
+                     * (increment 16) and the request's own length and
+                     * protection — hex for the address, decimal for the
+                     * request words — so the guard's three-page RW shape
+                     * is read off the line before the one-page carve-out. */
+                    let mut ex = [0u8; 96];
+                    let n = fmt_mmap_grant_line(&mut ex, ret, args[1], args[2]);
+                    enosys_log(num as u32, &name_buf[..nlen], &ex[..n]);
                 } else if num == LINUX_MUNMAP && status != STATUS_OK {
                     /* Munmap's refusal family (increment 25): EINVAL is
                      * the only arm a well-formed request reaches — the
@@ -3666,6 +3723,42 @@ mod tests {
     }
 
     #[test]
+    fn mprotect_validates_shape_and_refuses_wx_without_moving_cursors() {
+        let mut b = span();
+        b.cur = SPAN_BASE + 0x2000;
+        let before = (b.cur, b.mtop);
+        /* shape ladder: unaligned, zero, overflow, unknown prot */
+        for args in [
+            [SPAN_BASE + 1, 0x1000, 0, 0, 0, 0],
+            [SPAN_BASE, 0, 0, 0, 0, 0],
+            [SPAN_BASE, u64::MAX, 0, 0, 0, 0],
+            [SPAN_BASE, 0x1000, 8, 0, 0, 0],
+        ] {
+            let a = answer(10, &args, &fds(), &mut b, &mut fresh(), &[]);
+            assert!(matches!(a, Answer::Reply(0, E_INVAL)),
+                    "malformed mprotect {:?}: {:?}", args, a);
+        }
+        /* W|X is the policy half this side owns; the kernel's first trap
+         * answers the same number before the request can be posted. */
+        for prot in [6u64, 7] {
+            let a = answer(10, &[SPAN_BASE, 0x1000, prot, 0, 0, 0],
+                           &fds(), &mut b, &mut fresh(), &[]);
+            assert!(matches!(a, Answer::Reply(0, E_PERM)),
+                    "W|X prot {}: {:?}", prot, a);
+        }
+        /* every legal protection word is a grant here; the kernel then
+         * decides whether the pages exist and applies the soft leaf. */
+        for prot in [0u64, 1, 2, 3, 4, 5] {
+            let a = answer(10, &[SPAN_BASE, 0x1000, prot, 0, 0, 0],
+                           &fds(), &mut b, &mut fresh(), &[]);
+            assert!(matches!(a, Answer::Reply(0, STATUS_OK)),
+                    "legal prot {}: {:?}", prot, a);
+        }
+        assert_eq!((b.cur, b.mtop), before,
+                   "mprotect moves neither the break nor the map cursor");
+    }
+
+    #[test]
     fn munmap_frees_only_the_span_above_the_break_without_rewinding_the_cursor() {
         let mut b = span();
         b.cur = SPAN_BASE + 0x2000;
@@ -3720,6 +3813,36 @@ mod tests {
         let mut buf = [0u8; 4];
         let n = hex_into(&mut buf, 0, 0xdeadbeefcafe);
         assert_eq!(n, 4, "clamped to the buffer like dec_into");
+    }
+
+    #[test]
+    fn mmap_grant_line_pins_len_and_prot() {
+        let mut buf = [0u8; 96];
+        let n = fmt_mmap_grant_line(&mut buf, 0x0000_4000_000e_8000, 12288, 3);
+        assert_eq!(&buf[..n],
+                   b" ok mmap -> 0x00004000000e8000 len=12288 prot=3\n",
+                   "the guard line carries the three-page RW request shape");
+
+        let mut buf = [0u8; 96];
+        let n = fmt_mmap_grant_line(&mut buf, 0x1234, 0x2000, 1);
+        assert_eq!(&buf[..n],
+                   b" ok mmap -> 0x0000000000001234 len=8192 prot=1\n",
+                   "len and prot are the request's words, not constants");
+    }
+
+    #[test]
+    fn mmap_refusal_line_pins_len_prot_and_flags() {
+        let mut buf = [0u8; 56];
+        let n = fmt_mmap_refusal_line(&mut buf, E_INVAL, 8192, 6, 0x22);
+        assert_eq!(&buf[..n],
+                   b" -> EINVAL mmap(len=8192, prot=6, flags=34)",
+                   "the refusal line carries the request's len, prot and flags");
+
+        let mut buf = [0u8; 56];
+        let n = fmt_mmap_refusal_line(&mut buf, E_NOSYS, 4096, 5, 0x62);
+        assert_eq!(&buf[..n],
+                   b" -> ENOSYS mmap(len=4096, prot=5, flags=98)",
+                   "the ENOSYS refusal carries the same request words");
     }
 
     /* ─── E7 step 4 (the file class): the pure half, measured ──────────
@@ -3792,6 +3915,32 @@ mod tests {
     }
 
     #[test]
+    fn sigaltstack_query_reports_disabled_and_install_is_a_noop() {
+        let mut b = span();
+        /* Query: SS_DISABLE at stack_t + 8, so Rust std's make_handler
+         * proceeds into its guard-page mmap+mprotect instead of returning
+         * on an empty/zero old stack. */
+        let a = answer(LINUX_SIGALTSTACK, &[0, 0x5000, 0, 0, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        match a {
+            Answer::ReplyBytes(0, len, bytes) => {
+                assert_eq!(len, STACK_T_BYTES);
+                assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]),
+                           SS_DISABLE);
+                assert_eq!(&bytes[..8], &[0u8; 8]);
+                assert_eq!(&bytes[10..STACK_T_BYTES], &[0u8; 14]);
+            }
+            other => panic!("sigaltstack query: {:?}", other),
+        }
+        /* Install: accepted as a no-op (no signal frames exist), which is
+         * the answer that lets the caller continue. */
+        let a = answer(LINUX_SIGALTSTACK, &[0x7000, 0, 0, 0, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(0, STATUS_OK)),
+                "sigaltstack install: {:?}", a);
+    }
+
+    #[test]
     fn payload_bound_derives_each_numbers_own_clamp() {
         /* The sig class: exactly its struct, and only when an
          * out-pointer was passed (the kernel's plan staged only then). */
@@ -3824,6 +3973,13 @@ mod tests {
         assert!(payload_bound(LINUX_POLL, &pa, 24));
         assert!(!payload_bound(LINUX_POLL, &pa, 23));
         assert!(!payload_bound(LINUX_POLL, &[0, 0, 5000, 0, 0, 0], 0));
+        /* sigaltstack's query owes exactly one stack_t. */
+        assert!(payload_bound(LINUX_SIGALTSTACK,
+                              &[0, 0x5000, 0, 0, 0, 0], STACK_T_BYTES));
+        assert!(!payload_bound(LINUX_SIGALTSTACK,
+                               &[0, 0x5000, 0, 0, 0, 0], STACK_T_BYTES - 1));
+        assert!(!payload_bound(LINUX_SIGALTSTACK,
+                               &[0, 0, 0, 0, 0, 0], STACK_T_BYTES));
         /* a number that owes no payload is total-false. */
         assert!(!payload_bound(231, &[0, 0, 0, 0, 0, 0], 0));
     }

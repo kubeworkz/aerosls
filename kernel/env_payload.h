@@ -103,8 +103,15 @@ struct EnvCkptRecord;
  * (12 -> 16 bytes per entry, EP_PAGE_PERM_* below) and EnvPayloadTask
  * carries the Linux task's full context, fs_base, cursors and page range.
  * A v1 blob is refused, not misread: the reader's layout walk would place
- * every page entry 4 bytes early and pour the wrong frame's bytes. */
-#define ENV_PAYLOAD_REC_VERSION 2u
+ * every page entry 4 bytes early and pour the wrong frame's bytes.
+ *
+ * v3 (E7 §10.15): the permission word gains EP_PAGE_PERM_SOFT for a
+ * PRESENT, supervisor-only soft-protected leaf. The page entry stays 16
+ * bytes; a v2 blob has no soft bit and remains readable. The writer emits
+ * v3, and a v2 blob that claims the v3-only bit is refused by name rather
+ * than silently taking a path its writer never emitted. */
+#define ENV_PAYLOAD_REC_VERSION      3u
+#define ENV_PAYLOAD_REC_VERSION_PREV 2u
 #define ENV_PAYLOAD_DIR_MAGIC   0x534C53504C4F4131ULL  /* "SLSPLOA1" */
 #define ENV_PAYLOAD_BLOB_MAGIC  0x534C5350424C4F31ULL  /* "SLSPBLO1" */
 
@@ -156,8 +163,9 @@ struct EnvCkptRecord;
  * reserved. */
 #define EP_PAGE_PERM_WRITE 0x1u   /* PTE.W — writable */
 #define EP_PAGE_PERM_EXEC  0x2u   /* !PTE.NX — executable */
-#define EP_PAGE_PERM_USER  0x4u   /* PTE.U — user-accessible (always set here) */
-#define EP_PAGE_PERM_MASK  0x7u
+#define EP_PAGE_PERM_USER  0x4u   /* PTE.U — user-accessible */
+#define EP_PAGE_PERM_SOFT  0x8u   /* PTE bit 9 — PRESENT, U=0, soft PROT_NONE */
+#define EP_PAGE_PERM_MASK  0xfu
 #define EP_PAGE_ENTRY_BYTES 16u   /* { vaddr u64, crc u32, perm u32 } */
 
 /* Refusal reasons. A code plus operands, the same contract env_ckpt.h

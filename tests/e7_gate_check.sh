@@ -280,6 +280,36 @@ else
     fi
 fi
 
+# G7. The drill's tenant-spawn wait: progress restarts a no-progress stall, an
+#     absolute ceiling bounds it, and the PLAIN path keeps its fixed 120 s loop.
+#     The live run is the behavioural proof; this cheap clause keeps a later
+#     edit from deleting the branch the run just exercised. The helpers read
+#     exact whole lines or the live-arm section, never this clause's own grep
+#     strings, so the check cannot satisfy itself.
+has_exact() { grep -qxF -- "$1" "$ROOT/$2" 2>/dev/null; }
+has_live() {
+    local text
+    text=$(sed -n '/^# ─── The live arms/,$p' "$ROOT/tests/e7_gate_check.sh" 2>/dev/null) || return 1
+    [[ "$text" == *"$1"* ]]
+}
+spawn_missing=""
+has_exact 'SPAWN_STALL_S="${E7G_SPAWN_STALL_S:-120}"' tests/e7_gate_check.sh || spawn_missing="$spawn_missing stall-default"
+has_exact 'SPAWN_CEIL_S="${E7G_SPAWN_CEIL_S:-900}"' tests/e7_gate_check.sh || spawn_missing="$spawn_missing ceiling-default"
+has_exact 'case "$SPAWN_STALL_S" in' tests/e7_gate_check.sh || spawn_missing="$spawn_missing stall-validation"
+has_exact 'case "$SPAWN_CEIL_S" in' tests/e7_gate_check.sh || spawn_missing="$spawn_missing ceiling-validation"
+has_live '    if [ "$DRILL" = "1" ]; then' || spawn_missing="$spawn_missing drill-branch"
+has_live '            bytes=$(wc -c < "$L1" 2>/dev/null || echo 0)' || spawn_missing="$spawn_missing progress-byte"
+has_live '                last_progress_s=$now' || spawn_missing="$spawn_missing progress-reset"
+has_live '            [ "$((now - last_progress_s))" -lt "$SPAWN_STALL_S" ] || \' || spawn_missing="$spawn_missing stall-bound"
+has_live '            [ "$((now - start_s))" -lt "$SPAWN_CEIL_S" ] || \' || spawn_missing="$spawn_missing ceiling-bound"
+has_live '                echo "note: drill tenant-spawn wait extended past 120s — guest still progressing ($bytes log bytes); stall=${SPAWN_STALL_S}s ceiling=${SPAWN_CEIL_S}s"' || spawn_missing="$spawn_missing extension-note"
+has_live '        for i in $(seq 1 240); do' || spawn_missing="$spawn_missing plain-total"
+if [ -n "$spawn_missing" ]; then
+    bad "G7. the drill spawn wait is not wired:$spawn_missing — the live drill would fall back to a fixed window or lose the plain gate's prompt failure"
+else
+    ok "G7. the drill tenant-spawn wait is progress-bounded (serial growth restarts the 120 s stall; 900 s ceiling), the knobs are validated, and the plain gate keeps its 240 x 0.5 s fixed loop"
+fi
+
 # ─── The recorded-run validator (--replay, and the live arm's own last step) ─
 # One set of assertions over artifacts, so a live run, a replayed run and a
 # tooth run cannot drift: each arm writes the files, then calls this exact

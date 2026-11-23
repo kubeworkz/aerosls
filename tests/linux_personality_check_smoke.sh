@@ -61,6 +61,8 @@ FILES=(
     tests/fpu_enable_host_test.c
     # R (the signal seam) reads the plan's host test, same rule.
     tests/linux_personality_host_test.c
+    # Y (the soft mprotect transition) reads the helper's fake-table test.
+    tests/user_map_identity_host_test.c
     # W (increment 20) reads the capture, the record, the task's name on the
     # wire, the manager that names it, and both host tests that drive them —
     # same rule as O8/Q/R above, and the reason the coverage check below now
@@ -186,6 +188,9 @@ echo "replace's frame return and invlpg, and the fixture's map block"
 echo "and increment 25's munmap seam (clause set X) — the first-trap"
 echo "range refusal, the verdict's page walk and frame return, the"
 echo "sidecar's below-break twin, and the probe's E7MEM-MUNMAP-OK proof"
+echo "and §10.15's soft-protected mprotect (clause set Y) — the"
+echo "frame-preserving transition, the deliberate live fault, and its"
+echo "success/denial markers"
 echo "========================================================================"
 echo
 
@@ -427,8 +432,8 @@ tooth fd-payload-check-off M6 "the request-length invariant is dead-coded" "$W/t
 # ─── Increment-6 teeth (the mem class: the budget span, the W^X refusal) ──
 
 # N1: the group's destroy loses the break — a reused slot's group keeps
-# its predecessor's, and the next occupant's first granted growth maps
-# pages at a break nobody asked for.
+# its predecessor's brk_cur, and the next occupant's first granted growth
+# maps pages at a break nobody asked for.
 seed "$W/t32"
 sed -i '/g->brk_cur = 0;/d' "$W/t32/kernel/linux_thread.c"
 tooth mem-clear-dropped N1 "the reused-slot brk state reset is gone" "$W/t32"
@@ -448,15 +453,16 @@ open(p, 'w', encoding='utf-8', newline='').write(s.replace(old, new, 1))
 PY
 tooth mem-span-unconditional N2 "the span stamp is no longer keyed on the LINUX personality" "$W/t33"
 
-# N3: the kernel's first-trap W|X refusal dead-coded — now only the
-# sidecar's arm refuses, and one Rust edit away from W|X pages.
+# N3: the kernel's first-trap W|X refusal dead-coded at its policy
+# predicate — now only the sidecar's arm refuses, and one Rust edit away
+# from W|X pages.
 seed "$W/t34"
-sed -i 's/linux_mprotect_refuses_wx(largs\[2\])) {/0) {/' "$W/t34/kernel/syscall_dispatch.c"
+sed -i 's/if (linux_mprotect_refuses_wx(req->prot)) return -LINUX_EPERM;/if (0) return -LINUX_EPERM;/' "$W/t34/kernel/linux_abi.c"
 tooth wx-firsttrap-off N3 "the dispatcher's first-trap W|X refusal is dead-coded" "$W/t34"
 
 # N3: the sidecar's twin dead-coded — now only the kernel's plan refuses.
 seed "$W/t35"
-sed -i 's/if args\[2\] & 0x2 != 0 && args\[2\] & 0x4 != 0 {/if false {/' "$W/t35/user/sidecar/src/linux.rs"
+sed -i 's/if prot & 0x2 != 0 && prot & 0x4 != 0 {/if false {/' "$W/t35/user/sidecar/src/linux.rs"
 tooth wx-sidecar-off N3 "the sidecar's W|X arm is dead-coded" "$W/t35"
 
 # N4: the verdict's malformed branch dead-coded — a grant that escaped the
@@ -897,7 +903,7 @@ tooth signal-number-not-logged R7 "neither line carries the signal number anymor
 # back to a bare number (the chain becomes an inference).
 seed "$W/t107"
 sed -i 's/\.take(24)/.take(0)/' "$W/t107/user/sidecar/src/linux.rs"
-sed -i 's/b" -> ENOSYS mmap(len="/b" -> ENOSYS "/' "$W/t107/user/sidecar/src/linux.rs"
+sed -i 's/b"ENOSYS mmap(len="/b"ENOSYS "/' "$W/t107/user/sidecar/src/linux.rs"
 tooth abort-evidence-stripped R8 "neither the written bytes nor the mmap request ride their lines" "$W/t107"
 
 # ─── V teeth (increment 16: the anonymous-map seam) ───────────────────────
@@ -921,7 +927,7 @@ tooth mmap-stage-truncated V1 "the four-word stage carries only part of the ask"
 # a forged grant above the cursor now re-checks against a bound that
 # never moved, so the two cursors' convergence is argued from prose.
 seed "$W/t110"
-sed -i 's/^                                    linux_group_mmap_top(cur), &mreq, rax);$/                                    cur->linux_heap_limit, \&mreq, rax);/' "$W/t110/kernel/syscall_dispatch.c"
+sed -i 's/^                                    linux_group_mmap_top(cur), &mreq, rax);$/                                    linux_group_heap_limit(cur), \&mreq, rax);/' "$W/t110/kernel/syscall_dispatch.c"
 tooth mmap-verdict-loses-cursor V2 "the verdict is called without the map cursor" "$W/t110"
 
 # t111: the replace's invlpg deleted — "the task is parked anyway" is
@@ -1043,6 +1049,39 @@ seed "$W/t128"
 sed -i 's/ ok munmap addr=0x//' "$W/t128/user/sidecar/src/linux.rs"
 tooth munmap-range-not-logged X6 "a granted munmap's answer line no longer carries the range" "$W/t128"
 
+# ─── Y teeth (§10.15: the soft-protected mprotect transition) ──────────────
+
+# t132: the positive marker deleted — the probe would still fault, but no
+# line would prove the mprotect returned 0 and the marker write completed
+# BEFORE the access. The fault alone cannot distinguish that from a task
+# that was killed on the mprotect reply.
+seed "$W/t132"
+sed -i '/E7MEM-SOFT-OK/d' "$W/t132/user/sidecar/fixtures/e7_linux_probe.S"
+tooth soft-probe-marker-gone Y6 "the probe no longer carries the E7MEM-SOFT-OK proof" "$W/t132"
+
+# t133: the success path no longer reaches the soft case — the probe would
+# pass the whole map block and exit, so the live boot would be green while
+# never exercising the transition at all.
+seed "$W/t133"
+sed -i '/jmp     .Lsoft/d' "$W/t133/user/sidecar/fixtures/e7_linux_probe.S"
+tooth soft-probe-unreached Y6 "the probe's success path no longer jumps to the soft case" "$W/t133"
+
+# t134: the apply's user_protect_page call deleted — the verdict would still
+# name a page range, and the kernel would log 'soft-protected' without ever
+# changing a PTE. The frame-preserving helper is the mechanism half.
+seed "$W/t134"
+sed -i '/user_protect_page(pml4, va,/,+2d' "$W/t134/kernel/syscall_dispatch.c"
+tooth soft-apply-call-gone Y2 "the reply no longer calls user_protect_page" "$W/t134"
+
+# t135: the asm number chain claims 131 again. This is the exact wall the
+# first live firstuser guard run hit: sigaltstack became an SLS svc_crash,
+# std's old stack_t stayed zeroed, and the guard-page mmap+mprotect never
+# issued. R9 must red by name even though every live line it does not read
+# would look untouched.
+seed "$W/t135"
+sed -i '/je  .do_sls_svc_list/a\    cmp rax, 131\n    je  .do_sls_svc_crash' "$W/t135/arch/x86/syscall.asm"
+tooth sigaltstack-asm-hijack R9 "the asm number chain claims 131 again" "$W/t135"
+
 # ─── Z teeth (TG-1 I2: the kernel-local clone) ──────────────────────────────
 
 # t136: VM dropped from the mandatory Go mask — the planner would accept a
@@ -1089,6 +1128,30 @@ tooth clone-table-row-misclassified Z3 "clone is no longer LSC_THREAD" "$W/t141"
 seed "$W/t142"
 sed -i 's/if (num == LINUX_CLONE) {/if (0) {/' "$W/t142/kernel/syscall_dispatch.c"
 tooth clone-branch-gated-off Z3 "the first-trap clone branch never runs" "$W/t142"
+
+# ─── W teeth (increment 20: the checkpoint compatibility cases) ────────────
+
+# t129: the v2 replay label renamed away — the guard's W6 greps are what
+# require the compatibility case to stay in the host test; without this
+# tooth, deleting it would leave every source clause green.
+seed "$W/t129"
+sed -i 's/"V2: a soft-free v2 payload replays every page"/"V2: replay case removed"/' "$W/t129/tests/env_payload_host_test.c"
+tooth payload-v2-replay-case-gone W6 "the v2 replay case label is gone" "$W/t129"
+
+# t130: the soft-permission refusal label renamed away — the corrupt
+# permission case is the other half of the compatibility contract, and its
+# disappearance must red W6 rather than leave only the happy-path replay.
+seed "$W/t130"
+sed -i 's/"SOFT+USER: the restore refuses the contradictory permission before a byte moves"/"SOFT+USER: case removed"/' "$W/t130/tests/env_payload_host_test.c"
+tooth payload-soft-perm-case-gone W6 "the corrupt soft-permission case label is gone" "$W/t130"
+
+# t131: ONLY the CHECK lines that assert the refusal operand are stripped;
+# the case labels and their message strings remain. A W6 that greps only
+# prose stays green, while the test could be rewritten to accept a torn
+# index CRC. W6's three-occurrence count must red instead.
+seed "$W/t131"
+sed -i '/CHECK(env_payload_last_refusal()\.a == 8,/d' "$W/t131/tests/env_payload_host_test.c"
+tooth payload-perm-refusal-operands-unasserted W6 "the a=8 assertion lines are gone but their labels and messages remain" "$W/t131"
 
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"

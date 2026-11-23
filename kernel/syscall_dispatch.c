@@ -542,6 +542,99 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                         (unsigned long)(v.unmap_pages -
                                                         freed));
                                 }
+                            } else if (snum == LINUX_MPROTECT) {
+                                /* E7 §10.15 apply half: the sidecar's
+                                 * grant is re-checked over the staged
+                                 * words and the task's own windows, then
+                                 * EVERY page is prewalked before the first
+                                 * PTE changes. No frame is allocated or
+                                 * freed: a present leaf keeps its frame and
+                                 * only its protection bits move. A missing
+                                 * page — including the no-frame reservation
+                                 * created by mmap(PROT_NONE) — answers
+                                 * -ENOMEM with nothing changed. */
+                                struct LinuxMprotectReq mreq;
+                                struct LinuxMemMprotectVerdict v;
+                                mreq.addr = sa0;
+                                mreq.len  = sa1;
+                                mreq.prot = sa2;
+                                v = linux_mem_mprotect_verdict(
+                                    linux_group_image_lo(cur),
+                                    linux_group_image_hi(cur),
+                                    cur->linux_stack_base,
+                                    cur->linux_stack_base +
+                                        (uint64_t)cur->linux_stack_pages * 4096ull,
+                                    linux_group_heap_base(cur),
+                                    linux_group_heap_limit(cur), &mreq, rax);
+                                if (v.malformed) {
+                                    kernel_serial_printf(
+                                        "[E7] mprotect reply 0x%lx for "
+                                        "request addr=0x%lx len=%lu "
+                                        "prot=0x%lx is not success - "
+                                        "nothing changed\n",
+                                        (unsigned long)rax,
+                                        (unsigned long)sa0,
+                                        (unsigned long)sa1,
+                                        (unsigned long)sa2);
+                                    rax = (uint64_t)(int64_t)
+                                          (-LINUX_EINVAL);
+                                } else if (v.pages) {
+                                    uint64_t *pml4 =
+                                        (uint64_t *)(uintptr_t)cur->cr3;
+                                    uint64_t va = v.va;
+                                    uint64_t idx;
+                                    int absent = 0;
+
+                                    for (idx = 0; idx < v.pages; idx++) {
+                                        if (!linux_user_page_frame(
+                                                cur->cr3, va)) {
+                                            absent = 1;
+                                            break;
+                                        }
+                                        va += 4096;
+                                    }
+                                    if (absent) {
+                                        kernel_serial_printf(
+                                            "[E7] mprotect addr=0x%lx "
+                                            "len=%lu: page 0x%lx is "
+                                            "absent - nothing changed\n",
+                                            (unsigned long)sa0,
+                                            (unsigned long)sa1,
+                                            (unsigned long)va);
+                                        rax = (uint64_t)(int64_t)
+                                              (-LINUX_ENOMEM);
+                                    } else {
+                                        uint64_t flags = USER_PTE_PRESENT;
+                                        if (mreq.prot == LINUX_PROT_NONE) {
+                                            flags |= USER_PTE_SOFT_NONE |
+                                                     USER_PTE_NOEXEC;
+                                        } else {
+                                            flags |= USER_PTE_USER;
+                                            if (mreq.prot & LINUX_PROT_WRITE)
+                                                flags |= USER_PTE_WRITE;
+                                            if (!(mreq.prot & LINUX_PROT_EXEC))
+                                                flags |= USER_PTE_NOEXEC;
+                                        }
+                                        va = v.va;
+                                        for (idx = 0; idx < v.pages; idx++) {
+                                            user_protect_page(pml4, va,
+                                                             flags);
+                                            user_invlpg(va);
+                                            va += 4096;
+                                        }
+                                        kernel_serial_printf(
+                                            "[E7] mprotect addr=0x%lx "
+                                            "len=%lu prot=0x%lx: %lu "
+                                            "page(s) %s\n",
+                                            (unsigned long)sa0,
+                                            (unsigned long)sa1,
+                                            (unsigned long)sa2,
+                                            (unsigned long)v.pages,
+                                            mreq.prot == LINUX_PROT_NONE
+                                                ? "soft-protected (P=1 U=0)"
+                                                : "re-protected");
+                                    }
+                                }
                             }
                         }
                     return rax;
@@ -864,13 +957,49 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                     cur->mem_stage_num   = num;
                     cur->mem_stage_a0    = largs[0];
                     cur->mem_stage_a1    = largs[1];
-                } else if (num == LINUX_MPROTECT &&
-                           linux_mprotect_refuses_wx(largs[2])) {
-                    kernel_serial_printf(
-                        "[E7] linux mprotect prot=0x%lx refused before "
-                        "post: write+execute is refused by the shim "
-                        "(§5.4)\n", (unsigned long)largs[2]);
-                    return (uint64_t)(int64_t)(-LINUX_EPERM);
+                } else if (num == LINUX_MPROTECT) {
+                    /* E7 §10.15: the first trap of a real permission
+                     * change. The words are validated against this
+                     * task's OWN image, stack and heap windows; the
+                     * sidecar's 10 arm answers the non-W|X policy, and
+                     * the reply apply walks the page table because a
+                     * window can contain a hole. A refusal here posts
+                     * nothing, exactly like the mmap ladder. */
+                    struct LinuxMprotectReq mreq;
+                    uint64_t stack_lo = cur->linux_stack_base;
+                    uint64_t stack_hi = stack_lo +
+                        (uint64_t)cur->linux_stack_pages * 4096ull;
+                    int mref;
+
+                    mreq.addr = largs[0];
+                    mreq.len  = largs[1];
+                    mreq.prot = largs[2];
+                    mref = linux_mem_mprotect_refusal(&mreq,
+                            linux_group_image_lo(cur),
+                            linux_group_image_hi(cur),
+                            stack_lo, stack_hi,
+                            linux_group_heap_base(cur),
+                            linux_group_heap_limit(cur));
+                    if (mref) {
+                        kernel_serial_printf(
+                            "[E7] linux mprotect addr=0x%lx len=%lu "
+                            "prot=0x%lx refused before post: %s\n",
+                            (unsigned long)largs[0],
+                            (unsigned long)largs[1],
+                            (unsigned long)largs[2],
+                            mref == -LINUX_EPERM
+                                ? "write+execute is refused (§5.4)"
+                                : mref == -LINUX_EINVAL
+                                ? "malformed request word"
+                                : "outside the image/stack/heap window");
+                        return (uint64_t)(int64_t)mref;
+                    }
+                    cur->mem_stage_valid = 1;
+                    cur->mem_stage_num   = num;
+                    cur->mem_stage_a0    = largs[0];
+                    cur->mem_stage_a1    = largs[1];
+                    cur->mem_stage_a2    = largs[2];
+                    cur->mem_stage_a3    = 0;
                 }
                 /* E7 step 4 (the file class): the getdents64 cursor
                  * rides IN the description — args[5], a word the child's

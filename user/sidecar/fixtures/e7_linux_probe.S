@@ -76,6 +76,20 @@
  *       The successful unmap writes "E7MEM-MUNMAP-OK\n" (16 bytes)
  *       through increment 5's seam; any wrong outcome issues MARKER 404,
  *       asserted ABSENT with the map block's.
+ *   10 (mprotect, the soft half of §10.15) — after the map block has
+ *       proved its own pages, mprotect(base+0x1000, 0x1000, PROT_NONE)
+ *       must return 0: the kernel keeps the second brk page's frame and
+ *       installs a present, supervisor-only soft leaf. The positive marker
+ *       "E7MEM-SOFT-OK\n" (14 bytes) is written through the fd seam —
+ *       proof the transition completed before the page is touched — then a
+ *       READ of that page must take a Ring-3 #PF (error=0x5, a user access
+ *       to a present supervisor page). The task's death IS the observation:
+ *       this shim has no signal frames, so there is no handler to return to.
+ *       A refused mprotect issues MARKER 405; a read that succeeds issues
+ *       MARKER 406 (the U/S clear or SOFT_NONE was lost) — both asserted
+ *       ABSENT. The page is the SECOND brk page because 5m's PROT_NONE
+ *       MAP_FIXED replaced the first with a reservation that has no frame
+ *       for mprotect to protect.
  *   231 (exit_group) — the sidecar reaps; no reply is owed and this task
  *       never runs again (the hang below is unreachable by design).
  *
@@ -378,7 +392,41 @@ _start:
     syscall
     cmp     $-12, %rax
     jne     .Lmmap_budget_bad
-    jmp     .Lmem_done           /* the whole seam held: the exit path  */
+    jmp     .Lsoft               /* the whole seam held: the soft case   */
+
+    /* 5p. mprotect(base+0x1000, 0x1000, PROT_NONE) — §10.15's live
+     *    soft transition. This is the second brk page: 5m replaced the
+     *    first with a PROT_NONE reservation that has no frame to protect,
+     *    while this one is still a present, writable user leaf. The
+     *    kernel's apply prewalks the leaf, preserves its frame, clears
+     *    U/S and W, sets SOFT_NONE and invlpg's it. The marker write from
+     *    .text through increment 5's fd seam proves the syscall returned
+     *    0 before the access; the read then MUST fault. A successful read
+     *    means the soft bit or the U/S clear did not take effect. */
+.Lsoft:
+    lea     0x1000(%r12), %r13
+    mov     %r13, %rdi
+    mov     $0x1000, %esi
+    xor     %edx, %edx          /* PROT_NONE                          */
+    mov     $10, %eax
+    syscall
+    test    %rax, %rax
+    jne     .Lsoft_bad
+    lea     .Lsoft_msg(%rip), %rsi
+    mov     $1, %edi
+    mov     $14, %edx
+    mov     $1, %eax
+    syscall
+    cmp     $14, %rax
+    jne     .Lsoft_bad
+    mov     (%r13), %rax        /* must #PF; reading is the negative  */
+    mov     $406, %eax          /* MARKER: PROT_NONE did not fault    */
+    syscall
+    jmp     .Lmem_done
+.Lsoft_bad:
+    mov     $405, %eax          /* MARKER: the soft transition lied   */
+    syscall
+    jmp     .Lmem_done
 
 .Lmmap_bad:
     mov     $399, %eax           /* MARKER: the arena grant lied       */
@@ -428,6 +476,9 @@ _start:
      * section, _start at offset 0). */
 .Lmunmap_msg:
     .ascii  "E7MEM-MUNMAP-OK\n"
+
+.Lsoft_msg:
+    .ascii  "E7MEM-SOFT-OK\n"
 
 .Lmsg:
     .ascii  "E7FD-WRITE-OK\n"

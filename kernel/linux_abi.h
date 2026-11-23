@@ -94,8 +94,9 @@ enum LinuxSyscallClass {
     LSC_MEM,           /* §5.4 budget-backed memory: brk/mmap/munmap/mprotect */
     LSC_SIG,           /* recorded at the sidecar, and delivered ONLY as
                         * tkill's default action (§10.13's step 2); a user
-                        * HANDLER is still never invoked — installation is
-                        * refused by name (no signal frames in v1)          */
+                        * HANDLER is RECORDED (the full 32-byte act) but
+                        * never invoked — delivery is refused by name (no
+                        * signal frames/rt_sigreturn in v1)                 */
     LSC_MSR,           /* §5.3 the one kernel-side semantic: arch_prctl(SET_FS) */
     LSC_SPAWN,         /* execve: the spawn path (the sidecar's to decide) */
     LSC_THREAD,        /* clone: kernel-local, no sidecar request (I2)      */
@@ -457,11 +458,43 @@ linux_mem_munmap_verdict(uint64_t heap_base, uint64_t heap_limit,
                          uint64_t brk_cur,
                          const struct LinuxMunmapReq *req, uint64_t rax);
 
-/* The 4 KiB frame behind a user mapping, walked read-only under the
- * copy's boundaries; 0 when any level refuses (absent, supervisor, huge).
- * The unwind's read-back — and only that: a kernel address or a missing
- * page reads as 0, so a walker refusal can never free a frame that was
- * not mapped by this path. */
+/* ─── E7 §10.15 — the soft-protected transition ──────────────────────────
+ * The first trap validates the three request words against the task's own
+ * image, stack and heap windows. The sidecar answers the non-W|X policy;
+ * the kernel's page-table prewalk is the truth about which pages exist.
+ * No frame is allocated or freed, and every page is validated before the
+ * first protection bit changes. */
+struct LinuxMprotectReq {
+    uint64_t addr;   /* args[0] — page-aligned start */
+    uint64_t len;    /* args[1] — bytes, rounded up */
+    uint64_t prot;   /* args[2] — PROT_* word */
+};
+
+int linux_mem_mprotect_refusal(const struct LinuxMprotectReq *req,
+                               uint64_t image_lo, uint64_t image_hi,
+                               uint64_t stack_lo, uint64_t stack_hi,
+                               uint64_t heap_lo, uint64_t heap_hi);
+
+struct LinuxMemMprotectVerdict {
+    int      malformed; /* 1: a success reply for a request the first
+                         * trap would refuse, or a non-zero success */
+    uint64_t va;        /* first page the apply may protect */
+    uint64_t pages;     /* pages in the rounded range */
+};
+
+struct LinuxMemMprotectVerdict
+linux_mem_mprotect_verdict(uint64_t image_lo, uint64_t image_hi,
+                           uint64_t stack_lo, uint64_t stack_hi,
+                           uint64_t heap_lo, uint64_t heap_hi,
+                           const struct LinuxMprotectReq *req, uint64_t rax);
+
+/* The 4 KiB frame behind a user mapping, walked read-only. The OWNERSHIP
+ * walk accepts a PRESENT soft-protected leaf (U=0 plus the software bit)
+ * so munmap/brk/mmap unwind can return its frame; the copy walkers do
+ * not. 0 when any level refuses (absent, non-owner, huge). The unwind's
+ * read-back — and only that: a kernel address or a missing page reads as
+ * 0, so a walker refusal can never free a frame that was not mapped by
+ * this path. */
 uint64_t linux_user_page_frame(uint64_t root, uint64_t va);
 
 /* ─── E7 increment 10 (the signal seam, §10.13's step 2) — the sig class's byte crossing ──
@@ -494,10 +527,16 @@ uint64_t linux_user_page_frame(uint64_t root, uint64_t va);
                                            * sa_handler, sa_flags, sa_mask,
                                            * sa_restorer — four u64s       */
 #define LINUX_SIGSET_BYTES   8u           /* the sigset the shim crosses  */
+#define LINUX_SIGALTSTACK   131u          /* the census's sigaltstack row */
+#define LINUX_STACK_T_BYTES  24u          /* kernel-ABI struct stack_t:
+                                           * ss_sp u64, ss_flags i32 + pad,
+                                           * ss_size u64                    */
+#define LINUX_SS_DISABLE     2u           /* stack_t.ss_flags: no altstack */
 
 struct LinuxSigCopyPlan {
     uint64_t src;    /* child VA to copy from (args[1]) — 0 = nothing   */
-    uint32_t len;    /* bytes to attach: 32 (act) or 8 (set); 0 = none   */
+    uint32_t len;    /* bytes to attach: 32 (act) or 8 (set); 0 = none;
+                      * sigaltstack installs attach nothing           */
     int32_t  refuse; /* 0 = proceed; else the Linux errno to return
                       * BEFORE any post (first-trap refusal discipline)  */
 };
@@ -522,7 +561,7 @@ struct LinuxSigCopyPlan linux_sig_copy_plan(uint64_t num,
  * (cleared at the four places the contract names: top of every first-
  * trap block, consume at the deliver, refusal, slot reuse). The DELIVER
  * (kernel/chan.c) accepts exactly three shapes and copies only within
- * the staged clamp. The SIDECAR owns the answer's bytes (its 13/14 arms)
+ * the staged clamp. The SIDECAR owns the answer's bytes (its 13/14/131 arms)
  * and its own bound over them (service() — payload length must equal the
  * forwarded out-pointer's clamp). Neither end alone is load-bearing.
  *

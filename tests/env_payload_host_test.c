@@ -27,7 +27,7 @@
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I arch/x86 \
  *       -o /tmp/env_payload_host_test \
  *       tests/env_payload_host_test.c kernel/env_payload.c kernel/env_ckpt.c \
- *           kernel/linux_thread.c
+ *           kernel/linux_thread.c kernel/linux_abi.c
  *   /tmp/env_payload_host_test
  */
 #include "tests/partition_host_stubs.h"  /* env_ckpt.c's partition_pause/_resume/_is_paused/_exists */
@@ -43,6 +43,7 @@
 #include "kernel/cap.h"
 #include "kernel/linux_abi.h"      /* E7 increment 20: SYS_LINUX_TRAP_RESUME, the parked Linux form */
 #include "kernel/env_storage.h"   /* env_storage_extent_of link stub, as env_ckpt_host_test's */
+#include "kernel/persist.h"     /* the payload directory's fixed LBAs */
 
 /* I1 link stubs: the group's teardown is not exercised by this payload test,
  * but linux_thread.c references both. */
@@ -348,12 +349,148 @@ static void simulate_fresh_boot(void) {
 #define L_HEAP  0x300010000000ull    /* the budget span's base */
 #define PTE_RX  (0x1ull | 0x4ull)                 /* P | U, no W: executable */
 #define PTE_RWNX (0x1ull | 0x2ull | 0x4ull | (1ull << 63))  /* P | W | U, NX */
+#define PTE_SOFT (0x1ull | (1ull << 9) | (1ull << 63))      /* P | SOFT_NONE | NX */
 
 static uint64_t g_pml4_l[512] __attribute__((aligned(4096)));
 static uint64_t g_l_pdpt[2][512] __attribute__((aligned(4096)));
 static uint64_t g_l_pd[4][512]   __attribute__((aligned(4096)));
 static uint64_t g_l_pt[4][512]   __attribute__((aligned(4096)));
 static int g_l_n_pdpt, g_l_n_pd, g_l_n_pt;
+static int g_l_soft_heap;
+
+/* ─── Blob-format helpers for the v2 and corrupt-permission teeth ─────────
+ * These touch the REAL on-disk layout: frame 0 is the blob head, frames 1..
+ * are the index zone (regions, tasks, per-task page entries, console), and
+ * the head's crc32 covers that index zone. A version-only rewrite changes
+ * no crc; a permission rewrite must recompute the writer's exact reflected
+ * CRC32 over the index bytes, or the test would pass on a torn blob for the
+ * wrong reason. */
+#define TEST_INDEX_BYTES 65536u
+static uint8_t g_blob_head[4096] __attribute__((aligned(4096)));
+static uint8_t g_blob_index[TEST_INDEX_BYTES] __attribute__((aligned(4096)));
+
+static uint32_t test_crc32(uint32_t crc, const void* data, uint32_t n) {
+    const uint8_t* p = (const uint8_t*)data;
+    crc = ~crc;
+    for (uint32_t i = 0; i < n; i++) {
+        crc ^= p[i];
+        for (int k = 0; k < 8; k++)
+            crc = (crc >> 1) ^
+                  (0xEDB88320u & (uint32_t)(-(int32_t)(crc & 1u)));
+    }
+    return ~crc;
+}
+static uint32_t test_read32(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+static uint64_t test_read64(const uint8_t* p) {
+    uint64_t v = 0;
+    for (uint32_t i = 0; i < 8; i++) v |= (uint64_t)p[i] << (8u * i);
+    return v;
+}
+static void test_write32(uint8_t* p, uint32_t v) {
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+
+static int blob_load_head_and_index(void) {
+    if (nvme_read_sync(ENV_PAYLOAD_SLOT_LBA(0), g_blob_head) != 0) return 0;
+    struct EnvPayloadHead* h = (struct EnvPayloadHead*)g_blob_head;
+    if (h->magic != ENV_PAYLOAD_BLOB_MAGIC || h->bytes < 4096u ||
+        (h->bytes & 4095u) != 0 || h->n_pages == 0)
+        return 0;
+    uint32_t frames = h->bytes / 4096u - 1u - h->n_pages;
+    if (frames == 0 || (uint64_t)frames * 4096u > sizeof g_blob_index)
+        return 0;
+    memset(g_blob_index, 0, sizeof g_blob_index);
+    for (uint32_t f = 0; f < frames; f++) {
+        if (nvme_read_sync(ENV_PAYLOAD_SLOT_LBA(0) + 8ull +
+                           (uint64_t)f * 8ull,
+                           g_blob_index + (uint64_t)f * 4096u) != 0)
+            return 0;
+    }
+    return 1;
+}
+
+static int blob_index_total(const struct EnvPayloadHead* h, uint32_t* out) {
+    uint32_t u = 3u * (uint32_t)sizeof(struct EnvPayloadRegion) +
+                 h->n_tasks * (uint32_t)sizeof(struct EnvPayloadTask);
+    uint32_t seen = 0;
+    for (uint32_t t = 0; t < h->n_tasks; t++) {
+        if (u + 4u > sizeof g_blob_index) return 0;
+        uint32_t np = test_read32(g_blob_index + u);
+        u += 4u;
+        if (np > h->n_pages || u + np * EP_PAGE_ENTRY_BYTES >
+            sizeof g_blob_index)
+            return 0;
+        u += np * EP_PAGE_ENTRY_BYTES;
+        seen += np;
+    }
+    if (seen != h->n_pages || u + h->console_len > sizeof g_blob_index)
+        return 0;
+    *out = u;
+    return 1;
+}
+
+static int blob_find_page(const struct EnvPayloadHead* h, uint64_t vaddr,
+                          uint32_t* entry_off, uint32_t* perm) {
+    uint32_t u = 3u * (uint32_t)sizeof(struct EnvPayloadRegion) +
+                 h->n_tasks * (uint32_t)sizeof(struct EnvPayloadTask);
+    for (uint32_t t = 0; t < h->n_tasks; t++) {
+        uint32_t np = test_read32(g_blob_index + u);
+        u += 4u;
+        for (uint32_t k = 0; k < np; k++) {
+            if (test_read64(g_blob_index + u) == vaddr) {
+                *entry_off = u;
+                *perm = test_read32(g_blob_index + u + 12u);
+                return 1;
+            }
+            u += EP_PAGE_ENTRY_BYTES;
+        }
+    }
+    return 0;
+}
+
+/* Rewrite BOTH version words to `version` (directory header + blob head).
+ * No index byte changes, so the head crc remains valid. */
+static int blob_set_version(uint32_t version) {
+    if (!blob_load_head_and_index()) return 0;
+    struct EnvPayloadHead* h = (struct EnvPayloadHead*)g_blob_head;
+    h->version = version;
+    if (nvme_write_sync(ENV_PAYLOAD_SLOT_LBA(0), g_blob_head) != 0)
+        return 0;
+
+    uint8_t d[4096];
+    if (nvme_read_sync(PERSIST_ENV_PAYLOAD_HDR_LBA, d) != 0) return 0;
+    struct EnvPayloadDirHead* dh = (struct EnvPayloadDirHead*)d;
+    if (dh->magic != ENV_PAYLOAD_DIR_MAGIC) return 0;
+    dh->version = version;
+    return nvme_write_sync(PERSIST_ENV_PAYLOAD_HDR_LBA, d) == 0;
+}
+
+/* Rewrite one soft page's permission word, then recompute the writer's
+ * index crc. The page bytes and the page's own crc stay untouched: the
+ * refusal must be the permission contradiction, not a torn-data refusal. */
+static int blob_corrupt_soft_perm(uint32_t bad_perm) {
+    if (!blob_load_head_and_index()) return 0;
+    struct EnvPayloadHead* h = (struct EnvPayloadHead*)g_blob_head;
+    uint32_t total = 0, off = 0, perm = 0;
+    if (!blob_index_total(h, &total) ||
+        !blob_find_page(h, L_HEAP, &off, &perm) ||
+        !(perm & EP_PAGE_PERM_SOFT))
+        return 0;
+    test_write32(g_blob_index + off + 12u, bad_perm);
+    h->crc32 = test_crc32(0, g_blob_index, total + h->console_len);
+    uint32_t frames = h->bytes / 4096u - 1u - h->n_pages;
+    for (uint32_t f = 0; f < frames; f++) {
+        if (nvme_write_sync(ENV_PAYLOAD_SLOT_LBA(0) + 8ull +
+                            (uint64_t)f * 8ull,
+                            g_blob_index + (uint64_t)f * 4096u) != 0)
+            return 0;
+    }
+    return nvme_write_sync(ENV_PAYLOAD_SLOT_LBA(0), g_blob_head) == 0;
+}
 
 static void lmap_reset(void) {
     memset(g_pml4_l, 0, sizeof g_pml4_l);
@@ -409,6 +546,21 @@ static void unmap_page_l(uint64_t v) {
     uint64_t* pd = (uint64_t*)(uintptr_t)(pdpt[i3] & 0x000ffffffffff000ull);
     uint64_t* pt = (uint64_t*)(uintptr_t)(pd[i2] & 0x000ffffffffff000ull);
     pt[i1] = 0;
+}
+
+/* E7 §10.15: the leaf as the synthetic walker sees it. The frame mask
+ * deliberately excludes bit 9, so the returned word keeps the soft state
+ * and the NX bit alongside the frame the test is checking. */
+static uint64_t leaf_flags_l(uint64_t v) {
+    uint64_t i4 = (v >> 39) & 0x1ffu, i3 = (v >> 30) & 0x1ffu;
+    uint64_t i2 = (v >> 21) & 0x1ffu, i1 = (v >> 12) & 0x1ffu;
+    if (!(g_pml4_l[i4] & 1ull)) return 0;
+    uint64_t* pdpt = (uint64_t*)(uintptr_t)(g_pml4_l[i4] & 0x000ffffffffff000ull);
+    if (!(pdpt[i3] & 1ull)) return 0;
+    uint64_t* pd = (uint64_t*)(uintptr_t)(pdpt[i3] & 0x000ffffffffff000ull);
+    if (!(pd[i2] & 1ull)) return 0;
+    uint64_t* pt = (uint64_t*)(uintptr_t)(pd[i2] & 0x000ffffffffff000ull);
+    return pt[i1];
 }
 
 static void make_record_linux(void) {
@@ -479,6 +631,8 @@ static uint32_t setup_and_capture_linux(int linux_ctx) {
         map_page_l(L_HEAP + (uint64_t)i * 4096,
                    (uint64_t)(uintptr_t)g_l_heap[i], PTE_RWNX);
     }
+    if (g_l_soft_heap)
+        map_page_l(L_HEAP, (uint64_t)(uintptr_t)g_l_heap[0], PTE_SOFT);
 
     make_record_linux();
     if (env_ckpt_record(&g_scratch) != 0) return 0;
@@ -803,6 +957,103 @@ int main(void) {
           "LINUX: the task resumes at the captured rip/rsp, not at its entry");
     CHECK(proc_table[0].park_ctx.r11 == 111,
           "LINUX: the sidecar task in the SAME payload still gets its park frame (the sidecar path is unchanged)");
+
+    /* E7 §10.15: a soft leaf is captured and restored as a soft leaf.
+     * The page table is reset to its fresh shape with the heap page
+     * missing; the pour must allocate that page and install the state
+     * bit, not silently make it user-accessible again. */
+    g_l_soft_heap = 1;
+    CHECK(setup_and_capture_linux(1) == 1,
+          "SOFT: a present supervisor-only leaf is captured with its bytes");
+    g_l_soft_heap = 0;
+    CHECK((leaf_flags_l(L_HEAP) & PTE_SOFT) == PTE_SOFT,
+          "SOFT: the captured leaf keeps P, NX and SOFT_NONE and clears USER/WRITE");
+    simulate_fresh_boot_linux();
+    unmap_page_l(L_HEAP);
+    g_map_alloc_next = 0;
+    proc_table[1].restore_held = 1;
+    proc_table[1].has_ring3_ctx = 0;
+    proc_table[1].state = PROC_HELD;
+    pages = 0; cons = 0;
+    rc = env_payload_restore(L_PART, L_IDX, 22, L_SEQ, &pages, &cons);
+    CHECK(rc == EP_REFUSE_NONE,
+          "SOFT: a missing soft page is mapped by the pour, not refused as NO_MAPPING");
+    CHECK(g_map_alloc_next == 1 && pages == 9,
+          "SOFT: exactly the missing page got a frame and all nine pages poured");
+    {
+        uint64_t soft = leaf_flags_l(L_HEAP);
+        CHECK((soft & PTE_SOFT) == PTE_SOFT &&
+              !(soft & 0x2ull) && !(soft & 0x4ull),
+              "SOFT: the restored leaf is P|NX|SOFT_NONE, supervisor-only and not writable");
+        CHECK((soft & 0x000ffffffffff000ull) ==
+              (uint64_t)(uintptr_t)g_map_alloc[0],
+              "SOFT: the soft leaf keeps the frame the pour allocated");
+    }
+    CHECK(memcmp(g_map_alloc[0],
+                 (uint8_t[]){0x80 ^ 0, 0x80 ^ 1, 0x80 ^ 2, 0x80 ^ 3}, 4) == 0,
+          "SOFT: the captured bytes are in the newly mapped soft frame");
+
+    /* E7 §10.15: v2 remains readable when it has no soft pages. Both
+     * version words are rewritten, as a v2 writer would have emitted them;
+     * the page permissions are already all v2-representable. */
+    CHECK(setup_and_capture_linux(1) == 1,
+          "V2: a soft-free payload is captured as the v3 writer's baseline");
+    CHECK(blob_set_version(2),
+          "V2: both the directory and blob version words can be rewritten to 2");
+    simulate_fresh_boot_linux();
+    pages = 0; cons = 0;
+    rc = env_payload_restore(L_PART, L_IDX, 22, L_SEQ, &pages, &cons);
+    CHECK(rc == EP_REFUSE_NONE && pages == 9,
+          "V2: a soft-free v2 payload replays every page");
+
+    /* The v3-only bit is refused when the blob claims to be v2: a v2 writer
+     * could not have emitted it, so accepting it would silently import a
+     * permission the old format never described. */
+    g_l_soft_heap = 1;
+    CHECK(setup_and_capture_linux(1) == 1,
+          "V2+SOFT: a soft page is captured for the compatibility tooth");
+    g_l_soft_heap = 0;
+    CHECK(blob_set_version(2),
+          "V2+SOFT: the blob and directory can both be marked v2");
+    simulate_fresh_boot_linux();
+    pages = 0; cons = 0;
+    rc = env_payload_restore(L_PART, L_IDX, 22, L_SEQ, &pages, &cons);
+    CHECK(rc == EP_REFUSE_FORMAT && pages == 0 && cons == 0,
+          "V2+SOFT: a v2 blob claiming the v3 soft bit is refused by format, before any pour");
+    CHECK(env_payload_last_refusal().a == 8,
+          "V2+SOFT: the refusal is the soft-permission rule (a=8), not a torn index CRC (a=5)");
+
+    /* A soft page is its own state: USER or W/X alongside it is a
+     * contradiction. Rewrite the permission word and recompute the index
+     * CRC so the refusal is the permission rule, not a torn blob. */
+    g_l_soft_heap = 1;
+    CHECK(setup_and_capture_linux(1) == 1,
+          "SOFT+USER: a soft page is captured for the contradiction tooth");
+    g_l_soft_heap = 0;
+    CHECK(blob_corrupt_soft_perm(EP_PAGE_PERM_SOFT | EP_PAGE_PERM_USER),
+          "SOFT+USER: the page entry can be made contradictory with a valid index CRC");
+    simulate_fresh_boot_linux();
+    pages = 0; cons = 0;
+    rc = env_payload_restore(L_PART, L_IDX, 22, L_SEQ, &pages, &cons);
+    CHECK(rc == EP_REFUSE_FORMAT && pages == 0 && cons == 0,
+          "SOFT+USER: the restore refuses the contradictory permission before a byte moves");
+    CHECK(env_payload_last_refusal().a == 8,
+          "SOFT+USER: the refusal names the permission rule (a=8), not a torn index CRC");
+
+    g_l_soft_heap = 1;
+    CHECK(setup_and_capture_linux(1) == 1,
+          "SOFT+WX: a soft page is captured for the executable/writable tooth");
+    g_l_soft_heap = 0;
+    CHECK(blob_corrupt_soft_perm(EP_PAGE_PERM_SOFT | EP_PAGE_PERM_WRITE |
+                                 EP_PAGE_PERM_EXEC),
+          "SOFT+WX: the page entry can be made writable+executable with a valid index CRC");
+    simulate_fresh_boot_linux();
+    pages = 0; cons = 0;
+    rc = env_payload_restore(L_PART, L_IDX, 22, L_SEQ, &pages, &cons);
+    CHECK(rc == EP_REFUSE_FORMAT && pages == 0 && cons == 0,
+          "SOFT+WX: a writable+executable soft page is refused by format, not poured");
+    CHECK(env_payload_last_refusal().a == 8,
+          "SOFT+WX: the refusal names the permission rule (a=8), not a torn index CRC");
 
     CHECK(setup_and_capture_linux(1) == 1,
           "LINUX: re-capture for the permission tooth");

@@ -292,6 +292,8 @@ struct LinuxFdWritePlan linux_fd_write_plan(uint64_t num,
 #define LAB_PTE_USER     0x4ULL
 #define LAB_PTE_PS       0x80ULL
 #define LAB_PTE_FRAME    0x000FFFFFFFFFF000ULL
+#define LAB_PTE_SOFT     (1ULL << 9)  /* E7 §10.15: PRESENT, U=0,
+                                       * soft-protected leaf */
 
 /* The copy. Read-ONLY by construction: every level is checked before the
  * next pointer is followed, and nothing anywhere writes a table — the
@@ -321,7 +323,7 @@ struct LinuxFdWritePlan linux_fd_write_plan(uint64_t num,
  * Frame -> pointer is the identity map's own claim (boot.asm: "the
  * physical addr = virtual addr"). */
 static int lab_walk_leaf(uint64_t root, uint64_t va, uint64_t *leaf_out,
-                         int require_rw)
+                         int require_rw, int accept_soft)
 {
     const uint64_t *tbl = (const uint64_t *)(uintptr_t)(root & LAB_PTE_FRAME);
     uint64_t leaf = 0;
@@ -334,7 +336,9 @@ static int lab_walk_leaf(uint64_t root, uint64_t va, uint64_t *leaf_out,
         if ((lvl == 1 || lvl == 2) && (e & LAB_PTE_PS))
             return -LINUX_EFAULT;   /* a huge page is not this shim's
                                      * user shape; refused by name */
-        if (!(e & LAB_PTE_USER)) return -LINUX_EFAULT;
+        if (!(e & LAB_PTE_USER) &&
+            !(lvl == 3 && accept_soft && (e & LAB_PTE_SOFT)))
+            return -LINUX_EFAULT;
         if (require_rw && !(e & LAB_PTE_RW)) return -LINUX_EFAULT;
         leaf = e;
         if (lvl < 3) tbl = (const uint64_t *)(uintptr_t)(e & LAB_PTE_FRAME);
@@ -348,7 +352,7 @@ int linux_user_copy_out(uint8_t *dst, uint64_t root, uint64_t va, uint32_t n)
     if (!dst) return -LINUX_EFAULT;
     while (n) {
         uint64_t leaf = 0;
-        if (lab_walk_leaf(root, va, &leaf, 0) != 0) return -LINUX_EFAULT;
+        if (lab_walk_leaf(root, va, &leaf, 0, 0) != 0) return -LINUX_EFAULT;
         {
             uint32_t off = (uint32_t)(va & (LINUX_PAGE_SIZE - 1u));
             uint32_t page_left = LINUX_PAGE_SIZE - off;
@@ -387,6 +391,11 @@ struct LinuxSigCopyPlan linux_sig_copy_plan(uint64_t num, const uint64_t args[6]
     p.src = 0;
     p.len = 0;
     p.refuse = 0;
+    /* sigaltstack installs do not need their stack_t copied IN: this v1
+     * records no alternative stack to deliver on, and the query's old
+     * stack_t is the reply plan's job (linux_fd_reply_plan). */
+    if (num == LINUX_SIGALTSTACK)
+        return p;
     if (num != LINUX_RT_SIGACTION && num != LINUX_RT_SIGPROCMASK)
         return p;   /* not a sig-class crossing */
     if (!args) return p;
@@ -432,6 +441,82 @@ struct LinuxSigCopyPlan linux_sig_copy_plan(uint64_t num, const uint64_t args[6]
 int linux_mprotect_refuses_wx(uint64_t prot)
 {
     return (prot & LINUX_PROT_WRITE) && (prot & LINUX_PROT_EXEC);
+}
+
+/* E7 §10.15: the first-trap and reply-recheck halves of a real mprotect.
+ * The range is bounded by the task's OWN image/stack/heap windows; the
+ * page tables are checked at the reply by the apply (a present 4 KiB leaf
+ * at every page), because a window can contain a hole. Nothing here maps,
+ * allocates or frees. */
+static int linux_mem_range_in(uint64_t addr, uint64_t len_r,
+                              uint64_t lo, uint64_t hi)
+{
+    return lo < hi && addr >= lo && addr <= hi &&
+           len_r <= hi - addr;
+}
+
+int linux_mem_mprotect_refusal(const struct LinuxMprotectReq *req,
+                               uint64_t image_lo, uint64_t image_hi,
+                               uint64_t stack_lo, uint64_t stack_hi,
+                               uint64_t heap_lo, uint64_t heap_hi)
+{
+    uint64_t len_r;
+
+    if (!req) return -LINUX_EINVAL;
+    if (req->len == 0) return -LINUX_EINVAL;
+    if (req->addr & (LINUX_PAGE_SIZE - 1)) return -LINUX_EINVAL;
+    if (req->len > UINT64_MAX - (LINUX_PAGE_SIZE - 1))
+        return -LINUX_EINVAL;
+    if (req->prot & ~(LINUX_PROT_READ | LINUX_PROT_WRITE |
+                      LINUX_PROT_EXEC)) return -LINUX_EINVAL;
+    if (linux_mprotect_refuses_wx(req->prot)) return -LINUX_EPERM;
+
+    len_r = (req->len + LINUX_PAGE_SIZE - 1)
+          & ~((uint64_t)LINUX_PAGE_SIZE - 1);
+    if (!linux_mem_range_in(req->addr, len_r, image_lo, image_hi) &&
+        !linux_mem_range_in(req->addr, len_r, stack_lo, stack_hi) &&
+        !linux_mem_range_in(req->addr, len_r, heap_lo, heap_hi))
+        return -LINUX_ENOMEM;
+    return 0;
+}
+
+struct LinuxMemMprotectVerdict
+linux_mem_mprotect_verdict(uint64_t image_lo, uint64_t image_hi,
+                           uint64_t stack_lo, uint64_t stack_hi,
+                           uint64_t heap_lo, uint64_t heap_hi,
+                           const struct LinuxMprotectReq *req, uint64_t rax)
+{
+    struct LinuxMemMprotectVerdict v;
+    uint64_t len_r;
+
+    v.malformed = 0;
+    v.va = 0;
+    v.pages = 0;
+
+    /* A negative answer is the sidecar's refusal: its errno rides the
+     * §5.7 map and nothing changes. mprotect's success value is 0, so any
+     * other non-negative reply is a lie the kernel must not act on. */
+    if ((int64_t)rax < 0) return v;
+    if (rax != 0) {
+        v.malformed = 1;
+        return v;
+    }
+
+    /* The ladder re-runs over the staged words: the verdict is total on
+     * any input, including a success for a shape the first trap would
+     * have refused. */
+    if (linux_mem_mprotect_refusal(req, image_lo, image_hi,
+                                   stack_lo, stack_hi,
+                                   heap_lo, heap_hi) != 0) {
+        v.malformed = 1;
+        return v;
+    }
+
+    len_r = (req->len + LINUX_PAGE_SIZE - 1)
+          & ~((uint64_t)LINUX_PAGE_SIZE - 1);
+    v.va = req->addr;
+    v.pages = len_r / LINUX_PAGE_SIZE;
+    return v;
 }
 
 struct LinuxMemBrkVerdict linux_mem_brk_verdict(uint64_t heap_base,
@@ -682,7 +767,11 @@ linux_mem_munmap_verdict(uint64_t heap_base, uint64_t heap_limit,
 uint64_t linux_user_page_frame(uint64_t root, uint64_t va)
 {
     uint64_t leaf = 0;
-    if (lab_walk_leaf(root, va, &leaf, 0) != 0) return 0;
+    /* The OWNERSHIP read, not a copy: a soft-protected leaf is still this
+     * task's frame and munmap/brk/map unwind must be able to return it.
+     * linux_user_copy_out/in call the same walker with accept_soft=0 and
+     * keep the U=1 boundary. */
+    if (lab_walk_leaf(root, va, &leaf, 0, 1) != 0) return 0;
     return leaf & LAB_PTE_FRAME;
 }
 
@@ -698,7 +787,7 @@ uint64_t linux_user_page_frame(uint64_t root, uint64_t va)
  * validate EVERY page of the span before a single byte moves. */
 static int lab_walk_leaf_rw(uint64_t root, uint64_t va, uint64_t *leaf_out)
 {
-    return lab_walk_leaf(root, va, leaf_out, 1);
+    return lab_walk_leaf(root, va, leaf_out, 1, 0);
 }
 
 int linux_user_copy_in(const uint8_t *src, uint64_t root, uint64_t va,
@@ -767,12 +856,19 @@ struct LinuxFdReplyPlan linux_fd_reply_plan(uint64_t num, const uint64_t args[6]
     if (!args) return p;
 
     /* The sig class — increment 12's copy-IN, unchanged in shape, now
-     * named as the RAW family (the payload lands verbatim). */
-    if (num == LINUX_RT_SIGACTION || num == LINUX_RT_SIGPROCMASK) {
-        if (args[2] == 0) return p;   /* no out-pointer: nothing owed */
-        p.dst  = args[2];
+     * named as the RAW family (the payload lands verbatim). sigaltstack
+     * is the class's third number: its query returns one 24-byte
+     * struct stack_t at args[1], while an install (args[0] non-NULL)
+     * needs no input copy because this v1 never delivers a signal on
+     * an alternative stack. */
+    if (num == LINUX_RT_SIGACTION || num == LINUX_RT_SIGPROCMASK ||
+        num == LINUX_SIGALTSTACK) {
+        uint64_t out = (num == LINUX_SIGALTSTACK) ? 1u : 2u;
+        if (args[out] == 0) return p;   /* no out-pointer: nothing owed */
+        p.dst  = args[out];
         p.len  = (num == LINUX_RT_SIGACTION) ? LINUX_SIGACT_BYTES
-                                             : LINUX_SIGSET_BYTES;
+               : (num == LINUX_SIGALTSTACK) ? LINUX_STACK_T_BYTES
+                                            : LINUX_SIGSET_BYTES;
         p.aux  = p.len;
         p.kind = LINUX_STAGE_RAW;
     } else if (num == LINUX_STAT || num == LINUX_LSTAT) {
@@ -1056,6 +1152,10 @@ int linux_reply_shape_ok(uint64_t num, uint64_t ret, uint32_t n)
      * payload (or the wrong size) is refused before any byte is written. */
     if (num == LINUX_CLOCK_GETTIME)
         return ret == 0 && n == LINUX_TIMESPEC_BYTES;
+    /* sigaltstack: success and exactly one stack_t back when the caller
+     * asked for the old one. */
+    if (num == LINUX_SIGALTSTACK)
+        return ret == 0 && n == LINUX_STACK_T_BYTES;
     return ret == 0;
 }
 
