@@ -23,7 +23,8 @@
  * Build and run:
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I arch/x86 -I user \
  *       -o /tmp/workmgmt_phase4_host_test \
- *       tests/workmgmt_phase4_host_test.c kernel/partition.c kernel/msgqueue.c
+ *       tests/workmgmt_phase4_host_test.c kernel/partition.c kernel/msgqueue.c \
+ *           kernel/linux_thread.c kernel/linux_abi.c
  *   /tmp/workmgmt_phase4_host_test
  */
 #include "kernel/process.h"
