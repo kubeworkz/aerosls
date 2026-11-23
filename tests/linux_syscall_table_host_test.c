@@ -125,6 +125,7 @@ int main(void)
         { 131, LSC_SIG,   "sigaltstack" },
         { 158, LSC_MSR,   "arch_prctl" },
         { 186, LSC_TASK,  "gettid" },
+        { 202, LSC_FUTEX, "futex" },
         { 217, LSC_FD,    "getdents64" },
         { 218, LSC_LOCAL, "set_tid_address" },
         { 228, LSC_LOCAL, "clock_gettime" },
@@ -182,7 +183,7 @@ int main(void)
         CHECK(strcmp(linux_syscall_class_name(LSC_UNKNOWN), "unknown") == 0,
               "LSC_UNKNOWN's name is \"unknown\" (the refusal line's wording)");
         CHECK(linux_syscall_table_len == sizeof(want) / sizeof(want[0]),
-              "the table's length equals the checked rows (27 census numbers + the 4 Go-gate epoll/eventfd rows + clone + the three I2 task rows)");
+              "the table's length equals the checked rows (27 census numbers + the 4 Go-gate epoll/eventfd rows + clone + the three I2 task rows + I3's futex row)");
     }
 
     printf("linux_syscall_table_host_test: %d passed, %d failed\n",

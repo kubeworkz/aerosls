@@ -1,5 +1,6 @@
 #include "process.h"
 #include "linux_thread.h"
+#include "linux_futex.h"
 #include "object_catalog.h"
 #include "kernel_io.h"
 #include "loader.h"
@@ -232,6 +233,8 @@ void process_init(void) {
     /* E7 TG-1 I1: every descriptor starts group-less; the Linux create
      * stamps the identity and index onto the group it makes. */
     linux_groups_init();
+    /* E7 TG-1 I3: no futex waiter survives a machine init. */
+    linux_futex_init();
     // Phase 12: -1 = "never scheduled from this partition yet" for every
     // partition's round-robin cursor (BSS zero-init would give 0, a real
     // proc_table[] index, not a sentinel — must be set explicitly).
@@ -896,6 +899,10 @@ static int linux_descriptor_release(struct ProcessDescriptor* pd) {
 
     linux_stack_maybe_report(pd, "exit");
     proc_clear_resume_state(pd);
+    /* E7 TG-1 I3: a departing thread cannot still be a futex waiter. A block
+     * is only reachable while the descriptor is BLOCKED, so this is the
+     * teardown net (a kill that lands on a waiter), not the normal path. */
+    linux_futex_wait_cancel(pd->tid);
     proc_free_syscall_stack(pd);
     pd->state  = PROC_ZOMBIE;
 
@@ -932,6 +939,10 @@ static void linux_group_release_all(struct LinuxThreadGroup* g) {
     uint32_t gi;
     if (!g || !g->used || g->exiting) return;
     gi = (uint32_t)(g - linux_group_table);
+    /* E7 TG-1 I3: no waiter of this group survives its teardown. Before the
+     * member pass, so a deadline tick between here and the destroy cannot
+     * resume a descriptor whose syscall stack is about to be freed. */
+    linux_futex_forget_group(g->group_id);
     /* First pass: stop every member, free only its per-thread stack. Keep
      * the descriptors ACTIVE and their identity intact — the group's cap
      * teardown resolves cap_proc_cr3(cap_owner_pid), so the owner must be
@@ -2095,6 +2106,148 @@ int cap_wait_chan(uint32_t chan_id, void* recv_req) {
                          next->pid, next->name);
     kernel_switch_next(next);   /* noreturn */
     return 1;   /* unreachable */
+}
+
+/* ─── E7 TG-1 I3: futex wait/wake, the privileged halves ─────────────────
+ * The table arithmetic is kernel/linux_futex.c (host-tested); these three
+ * functions are the parts that need a descriptor, the scheduler and the
+ * caller's page-table root.
+ *
+ * A futex waiter does not re-run its trap on wake. It already read the word,
+ * compared it and enqueued; the answer is just the syscall's return value. So
+ * the resume reuses proc_gate_stop_at_sysret's mapping — park_ctx holds the
+ * ENTRY registers captured at the park, and rebuilding the 20-word ring-3
+ * frame from it returns to the instruction after `syscall` with rax set. That
+ * is deliberately NOT resume_kernel: nothing is executed on the way back, so
+ * there is no second wait and no sidecar forward. */
+static int linux_futex_resume_thread(uint32_t tid, int32_t result) {
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct ProcessDescriptor* pd = &proc_table[i];
+        const struct CapParkCtx* p;
+        uint64_t* c;
+
+        if (!pd->active || pd->tid != tid) continue;
+        if (pd->state != PROC_BLOCKED) return 0;
+        if (pd->park_syscall != SYS_LINUX_FUTEX_RESUME) return 0;
+
+        p = &pd->park_ctx;
+        c = (uint64_t*)&pd->ring3_ctx;
+        c[0]  = p->r15;  c[1]  = p->r14;  c[2]  = p->r13;  c[3]  = p->r12;
+        c[4]  = p->r11;                        /* r11 (the syscall's rflags) */
+        c[5]  = p->linux_args[3];              /* r10 */
+        c[6]  = p->linux_args[5];              /* r9  */
+        c[7]  = p->linux_args[4];              /* r8  */
+        c[8]  = p->rbp;
+        c[9]  = p->linux_args[0];              /* rdi */
+        c[10] = p->linux_args[1];              /* rsi */
+        c[11] = p->linux_args[2];              /* rdx */
+        c[12] = p->rcx;                        /* rcx: the sysret target */
+        c[13] = p->rbx;
+        c[14] = (uint64_t)(int64_t)result;     /* rax: 0 or -ETIMEDOUT */
+        c[15] = p->rcx;                        /* rip: after `syscall` */
+        c[16] = 0x23;                          /* ring-3 code */
+        c[17] = p->r11;                        /* rflags */
+        c[18] = p->user_rsp;
+        c[19] = 0x1B;                          /* ring-3 data */
+
+        pd->has_ring3_ctx = 1;
+        pd->user_rip      = p->rcx;
+        pd->user_rsp      = p->user_rsp;
+        pd->park_syscall  = 0;
+        pd->park_req      = 0;
+        pd->state         = PROC_SUSPENDED;
+        return 1;
+    }
+    return 0;
+}
+
+int linux_futex_wake_threads(uint32_t group_id, uint64_t uaddr,
+                            uint32_t count) {
+    uint32_t tids[LINUX_FUTEX_WAITERS];
+    int found, woken = 0;
+
+    if (count > LINUX_FUTEX_WAITERS) count = LINUX_FUTEX_WAITERS;
+    found = linux_futex_wake_collect(group_id, uaddr, count, tids,
+                                     LINUX_FUTEX_WAITERS);
+    for (int i = 0; i < found; i++) {
+        if (linux_futex_resume_thread(tids[i], 0))
+            woken++;
+        else
+            kernel_serial_printf(
+                "[E7] futex wake: group %u uaddr=0x%lx waiter TID %u has no "
+                "parked descriptor\n",
+                group_id, (unsigned long)uaddr, tids[i]);
+    }
+    if (woken > 0)
+        kernel_serial_printf(
+            "[E7] futex wake: group %u uaddr=0x%lx woken=%d\n",
+            group_id, (unsigned long)uaddr, woken);
+    return woken;
+}
+
+/* Block the CALLING thread on a futex. Returns a negative errno only when it
+ * did not park: the table is full (-ENOMEM) or no other descriptor is
+ * runnable (-EAGAIN). On success it never returns — the waker or the deadline
+ * tick delivers the result into rax through linux_futex_resume_thread.
+ *
+ * The enqueue happens INSIDE this syscall, with interrupts off, before the
+ * switch: a wake from another thread cannot run between the caller's word
+ * check and this record, so the wake either misses (the waiter then sees the
+ * changed word and answers EAGAIN itself) or finds this record and resumes a
+ * thread that is already committed to parking. */
+int linux_futex_block(struct ProcessDescriptor* cur, uint32_t group_id,
+                      uint64_t uaddr, uint64_t deadline) {
+    struct ProcessDescriptor* next;
+
+    if (!cur) return -LINUX_EINVAL;
+    if (linux_futex_wait_enqueue(group_id, uaddr, cur->tid, deadline) != 0)
+        return -LINUX_ENOMEM;
+
+    proc_capture_entry_regs(&cur->park_ctx);
+    cur->park_req     = 0;
+    cur->park_syscall = SYS_LINUX_FUTEX_RESUME;
+    cur->state        = PROC_BLOCKED;
+
+    next = pick_next_runnable();
+    if (!next) {
+        /* The same posture cap_wait_chan takes: a lone runnable thread has
+         * nobody to switch to, so it cannot block. The waiter is withdrawn
+         * and told EAGAIN rather than left in the table forever. */
+        linux_futex_wait_cancel(cur->tid);
+        cur->park_syscall = 0;
+        cur->state        = PROC_RUNNING;
+        kernel_serial_printf(
+            "[E7] futex wait: TID %u group %u is the only runnable task — "
+            "EAGAIN\n",
+            cur->tid, group_id);
+        return -LINUX_EAGAIN;
+    }
+
+    kernel_serial_printf(
+        "[E7] futex wait: TID %u group %u uaddr=0x%lx deadline=%lu parked\n",
+        cur->tid, group_id, (unsigned long)uaddr,
+        (unsigned long)deadline);
+    kernel_switch_next(next);   /* noreturn */
+    return -LINUX_EAGAIN;       /* unreachable */
+}
+
+/* The timer ISR's deadline hook (called beside cap_park_deadline_tick, on the
+ * same BSP, before schedule_ring3). Expired waiters are resumed ETIMEDOUT;
+ * this is a pure state flip plus the frame rebuild above, no lock. */
+void linux_futex_deadline_tick(void) {
+    uint32_t tids[LINUX_FUTEX_WAITERS];
+    int n = linux_futex_expire(kernel_tick_counter, tids, LINUX_FUTEX_WAITERS);
+
+    for (int i = 0; i < n; i++) {
+        if (linux_futex_resume_thread(tids[i], -LINUX_ETIMEDOUT))
+            kernel_serial_printf(
+                "[E7] futex timeout: TID %u resumed with -ETIMEDOUT\n",
+                tids[i]);
+        else
+            kernel_serial_printf(
+                "[E7] futex timeout: TID %u has no parked descriptor\n",
+                tids[i]);
+    }
 }
 
 /* Strong override of cap.c's weak hook: the Phase-5 wait-aware park — a

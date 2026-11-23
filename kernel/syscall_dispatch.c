@@ -7,6 +7,7 @@
 #include "query_engine.h"
 #include "process.h"
 #include "linux_thread.h"
+#include "linux_futex.h"
 #include "loader.h"
 #include "agent.h"
 #include "../kernel/webapp.h"
@@ -676,6 +677,85 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                         "teardown (no sidecar request)\n",
                         (unsigned long)largs[0], cur->tid, cur->tgid);
                     linux_thread_exit(cur, (uint32_t)largs[0]);
+                }
+                /* E7 TG-1 I3: futex (202) is kernel-local. The sidecar owns
+                 * no page table and is not the scheduler, so the kernel reads
+                 * the waited-on word through the caller's own root, compares
+                 * it, and parks the caller in the group's wait table; a
+                 * sibling's FUTEX_WAKE resumes it with rax=0, the deadline
+                 * tick with -ETIMEDOUT. The check and the enqueue are inside
+                 * this ONE trap (interrupts off), so a wake cannot slip
+                 * between them: it either finds the record or the waiter's
+                 * own value check answers EAGAIN. */
+                if (num == LINUX_FUTEX) {
+                    uint32_t fop  = (uint32_t)largs[1];
+                    uint32_t fcmd = fop & LINUX_FUTEX_OP_MASK;
+                    struct LinuxThreadGroup* fg = linux_group_of(cur);
+
+                    if (linux_futex_op_supported(fop) != 0) {
+                        kernel_serial_printf(
+                            "[E7] futex op=0x%lx refused: v1 serves only "
+                            "WAIT(0)/WAKE(1), private, relative timeout\n",
+                            (unsigned long)largs[1]);
+                        return (uint64_t)(int64_t)(-LINUX_ENOSYS);
+                    }
+                    if (!fg) {
+                        kernel_serial_printf(
+                            "[E7] futex refused: TID %u is in no thread "
+                            "group\n", cur->tid);
+                        return (uint64_t)(int64_t)(-LINUX_EINVAL);
+                    }
+                    if (fcmd == LINUX_FUTEX_OP_WAKE) {
+                        /* Linux does not dereference the word on a wake;
+                         * the key match alone is the operation. */
+                        return (uint64_t)linux_futex_wake_threads(
+                            fg->group_id, largs[0], (uint32_t)largs[2]);
+                    }
+                    /* FUTEX_WAIT: read the word, compare, park. */
+                    {
+                        uint8_t  wb[4];
+                        uint32_t word;
+                        uint64_t deadline = 0;
+                        int frc;
+
+                        if (!linux_fs_addr_is_user_canonical(largs[0]) ||
+                            linux_user_copy_out(wb, cur->cr3, largs[0],
+                                                4) != 0) {
+                            kernel_serial_printf(
+                                "[E7] futex wait at 0x%lx refused: bad user "
+                                "word (EFAULT)\n",
+                                (unsigned long)largs[0]);
+                            return (uint64_t)(int64_t)(-LINUX_EFAULT);
+                        }
+                        word = (uint32_t)wb[0] |
+                               ((uint32_t)wb[1] << 8) |
+                               ((uint32_t)wb[2] << 16) |
+                               ((uint32_t)wb[3] << 24);
+                        if (word != (uint32_t)largs[2])
+                            return (uint64_t)(int64_t)(-LINUX_EAGAIN);
+
+                        if (largs[3] != 0) {
+                            uint64_t tv[2];
+                            if (linux_user_copy_out((uint8_t*)tv, cur->cr3,
+                                                    largs[3],
+                                                    LINUX_TIMESPEC_BYTES) != 0)
+                                return (uint64_t)(int64_t)(-LINUX_EFAULT);
+                            if ((int64_t)tv[0] < 0 || (int64_t)tv[1] < 0)
+                                return (uint64_t)(int64_t)(-LINUX_EINVAL);
+                            /* A zero timespec is Linux's "do not block":
+                             * the value matched, so the answer is the
+                             * timeout itself, with no park. */
+                            if (tv[0] == 0 && tv[1] == 0)
+                                return (uint64_t)(int64_t)(-LINUX_ETIMEDOUT);
+                            frc = linux_futex_deadline(tv[0], tv[1],
+                                                       kernel_tick_counter,
+                                                       KERNEL_TICK_NS,
+                                                       &deadline);
+                            if (frc != 0) return (uint64_t)(int64_t)frc;
+                        }
+                        return (uint64_t)(int64_t)linux_futex_block(
+                            cur, fg->group_id, largs[0], deadline);
+                    }
                 }
                 /* E7 TG-1 I2: clone is the kernel-local thread class. It
                  * never describes, posts or parks: the group already owns

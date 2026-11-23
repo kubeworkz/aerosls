@@ -3,12 +3,13 @@
 **Status:** Design and scoping pass. The TG-0 Go census is measured
 (2026-11-09); the committed counts artifact is the 2026-11-22 regeneration.
 The record-only `rt_sigaction` path and the four netpoll startup arms have
-since landed in the tree. TG-1 I1 (group lifecycle) and I2 (kernel-local
-`clone`, `getpid`/`gettid`/`exit`, group-aware teardown) are landed, with
-host tests and a passing native two-thread live probe; `futex` and `openat`
-remain. Current dispatch status and the TG-0 gap list: §7.
+since landed in the tree. TG-1 I1 (group lifecycle), I2 (kernel-local `clone`,
+`getpid`/`gettid`/`exit`, group-aware teardown) and I3 (private `futex`
+wait/wake with a relative timeout) are landed, with host tests and passing
+native two-thread and futex live probes; `openat` remains. Current dispatch
+status and the TG-0 gap list: §7.
 **Date:** 2026-11-09 (measurement), 2026-11-22 (counts regeneration),
-2026-11-23 (I2 live probe); current-tree status noted 2026-11-23.
+2026-11-23 (I2/I3 live probes); current-tree status noted 2026-11-23.
 **TG-0 artifact:** `tools/go_thread_gate_census.txt` (Go 1.25.1, pinned)
 **Parent:** `docs/AeroSLS-Linux-ABI-Shim-Design-v0.1.md` §7, §8, §9 and
 Appendix B.
@@ -232,10 +233,12 @@ task slot.
 table adds the four netpoll startup rows (`epoll_ctl` 233, `epoll_pwait` 281,
 `eventfd2` 290, `epoll_create1` 291), `clone` (56, `LSC_THREAD`), and I2's
 three task rows — `getpid` (39), `exit` (60) and `gettid` (186), all
-`LSC_TASK` and kernel-local. `futex` (202, `LSC_FUTEX`) and `openat` (257,
-`LSC_FD`) remain the two TG-1 table gaps. `linux_syscall_class()` answers
-`LSC_UNKNOWN` for everything else, and the first-trap branch refuses an
-unknown number before any post.
+`LSC_TASK` and kernel-local. I3 added `futex` (202, `LSC_FUTEX`), also
+kernel-local: the sidecar owns no page table and is not the scheduler, so the
+wait/wake state lives in the kernel. `openat` (257, `LSC_FD`) is now the one
+remaining TG-1 table gap. `linux_syscall_class()` answers `LSC_UNKNOWN` for
+everything else, and the first-trap branch refuses an unknown number before
+any post.
 
 The table also has no row for `tkill` (200), although the sidecar has a
 `LINUX_TKILL` answer arm. As read in this pass, the first-trap classification
@@ -506,40 +509,60 @@ The proposed implementation adds no `CLONE_CHILD_CLEARTID` promise. Go does
 not request it. `set_tid_address` and clear-child-TID can be a later
 compatibility step if a measured runtime requires them.
 
-### 4.4 Futex semantics
+### 4.4 Futex semantics (TG-1 I3)
 
-The kernel keeps a fixed wait table keyed by `(group_id, user_vaddr)`. A
-waiter record holds:
-
-- the descriptor index;
-- the 32-bit address and expected value;
-- the absolute deadline (`0` = forever);
-- the saved syscall-entry context needed to return 0 on wake.
+The kernel keeps a fixed wait table keyed by `(group_id, user_vaddr)` —
+`kernel/linux_futex.c`, 16 records (one blocked descriptor per process-table
+slot). A record holds the group, the user address, the waiting tid, and an
+ABSOLUTE tick deadline (`0` = forever). The group id, not the tid, is the
+process half of the key: two processes that map the same virtual address must
+never wake each other.
 
 `FUTEX_WAIT`/`FUTEX_WAIT_PRIVATE`:
 
-1. validate the user span and read 32 bits through the group's page table;
+1. validate the user span and read 32 bits through the caller's page-table
+   root (`linux_user_copy_out`, the same read-only walker the fd class uses);
 2. if the value differs, return `EAGAIN` before parking;
-3. atomically (with interrupts disabled on the BSP) re-check and enqueue;
-4. mark the thread blocked, with a new futex-resume arm;
-5. on timeout return `ETIMEDOUT`; on wake return `0`.
+3. enqueue and mark the thread `PROC_BLOCKED` inside the SAME trap, then
+   switch to the next runnable descriptor. Interrupts are off and the BSP is
+   the only CPU, so no wake can run between the value check and the enqueue:
+   a wake either finds the record, or the waiter's own re-check returns
+   `EAGAIN`. That is the lost-wakeup argument, stated as a property of the
+   one-trap window rather than of a lock;
+4. a waker returns `0` in rax; the deadline tick returns `-ETIMEDOUT`.
 
-`FUTEX_WAKE`/`FUTEX_WAKE_PRIVATE` wakes at most the requested count, returns
-the number woken, and moves those descriptors back to runnable. The resume
-path must not re-execute the wait; it returns the Linux result through the
-per-thread saved context. The existing `park_ctx`/`park_syscall` machinery is
-the model; the futex resume needs its own sentinel and a small resume
-function, not a sidecar forward.
+The resume does NOT re-execute the wait. The park captures the syscall-entry
+registers into `park_ctx`; the waker rebuilds the 20-word ring-3 frame from
+that capture with the result in rax (the mapping `proc_gate_stop_at_sysret`
+uses) and marks the descriptor `PROC_SUSPENDED`. `park_syscall` carries its own
+sentinel, `SYS_LINUX_FUTEX_RESUME` ("LFXF"); nothing is forwarded and no
+sidecar reply is involved.
 
-The check-and-enqueue must be atomic against a wake. This is the classic lost
-wakeup; with the BSP and IF=0 inside the syscall a short interrupt-disabled
-window is sufficient, but the design must say so. SMP futex wake/TLB behavior
-is out of scope.
+`FUTEX_WAKE`/`FUTEX_WAKE_PRIVATE` does not dereference the word: it takes at
+most the requested count of matching records, wakes the descriptors that still
+exist, and returns how many resumed. A count of `0` is a no-op.
+
+A relative timespec is converted to `now + ceil(ns / KERNEL_TICK_NS)` (round
+UP, never early; clamped at a day); a zero timespec answers `ETIMEDOUT`
+without parking. The timer ISR calls `linux_futex_deadline_tick()` beside
+`cap_park_deadline_tick()`, before `schedule_ring3`, so a timed-out waiter is
+schedulable on that tick. A waiter with no other runnable descriptor is
+withdrawn and answered `EAGAIN`, the same posture `cap_wait_chan` takes for a
+lone process; the live probe keeps its sibling runnable so a real block and a
+real timeout both occur.
+
+**Measured 2026-11-23.** `tests/linux_futex_probe_check.sh` boots the ordinary
+ISO and the sidecar-spawned native probe's parent parks in
+`FUTEX_WAIT_PRIVATE`; the kernel logs `[E7] futex wait: TID 100 group 106 ...
+parked`, the sibling's wake logs `woken=1` and the parent's wait returns `0`,
+a second 20 ms wait logs `[E7] futex timeout: TID 100 resumed with -ETIMEDOUT`,
+and the group tears down once. `tests/linux_futex_host_test.c` pins the same
+rules without a boot (op allowlist, rounding, group/address keying, count,
+expiry).
 
 v1 refuses: PI futexes, robust-list owner death, `FUTEX_REQUEUE`, process-shared
-futexes, priority inheritance, and `FUTEX_WAIT_BITSET` unless the Go census
-shows it. `set_robust_list` and `rseq` are not in this gate's measured set; if
-a later census exercises them, they must be measured, not guessed, and a
+futexes, priority inheritance, `FUTEX_WAIT_BITSET` and `CLOCK_REALTIME`
+timeouts. The sidecar's `set_robust_list`/`rseq` posture is unchanged: a
 success return is not allowed merely because Linux returns zero.
 
 ### 4.5 Forwarding and sidecar state
@@ -858,15 +881,17 @@ CRC; restore a thread with the leader's `fs_base`; restore a per-thread root;
 skip the futex re-enqueue; run the old one-task harness against a group. Each
 must fail by the clause it names.
 
-### 6.4 Planned test files
+### 6.4 Test files
 
-Names are proposals until the implementation increment names them:
+I1–I3 named these; the two live probes are the shipped runtime guards.
 
 - `tests/linux_thread_group_host_test.c` — group ownership, limits, tid/tgid,
   teardown counts;
 - `tests/linux_futex_host_test.c` — pure wait/wake/timeout state, no
-  privileged instructions;
+  privileged instructions (landed with I3);
 - `tests/linux_clone_host_test.c` — flag validation and child-context build;
+- `tests/linux_thread_probe_check.sh` — I2's native two-thread live probe;
+- `tests/linux_futex_probe_check.sh` — I3's native futex live probe;
 - `tests/thread_group_check.sh` — source guard for the contracts above;
 - `tests/go_thread_gate_census_check.sh` — TG-0 artifact and table check;
 - `tests/go_thread_gate_check.sh` — TG-1 live gate, including teeth;
@@ -924,8 +949,8 @@ The table gaps before a live Go start were six. I2 closed four: **`clone`
 (56)** (kernel-local thread creation), **`gettid` (186)** (per-thread
 identity), **`getpid` (39)** (group identity; it was not in the TG-0 trace and
 was added with the group identity surface) and **`exit` (60)** (thread-local
-teardown). The two remaining are **`futex` (202)** (I3's private wait/wake) and
-**`openat` (257)** (I4's measured path open).
+teardown). I3 closed **`futex` (202)** (private wait/wake with a relative
+timeout). The one remaining is **`openat` (257)** (I4's measured path open).
 
 The other required/startup rows already have a class. `copy_file_range`,
 `pread64`, `sched_yield`, `madvise`, `nanosleep`, `uname`, `prctl`,
@@ -949,14 +974,18 @@ The detailed plan is the companion **AeroSLS E7 TG-1 Implementation Plan**
 is the order; the plan owns the exact data structures, tests and teeth.
 
 1. Add the group object, tid/tgid, group-aware cap lookup and group lifecycle;
-   keep `fs_base` and trap state per thread.
+   keep `fs_base` and trap state per thread. **Landed: I1.**
 2. Add kernel-local `clone` with the flags and child context in §4.3.
-3. Add the futex wait table and resume arm.
+   **Landed: I2.**
+3. Add the futex wait table and resume arm. **Landed: I3.**
 4. Move the memory cursors and sidecar fd/heap state to group ownership.
-5. Add the forward lease and per-thread `tid` request field.
-6. Add `gettid`, `getpid`, `exit` and the measured `openat` path.
-7. Land host tests and the source guard; run the native probe; then run the
-   Go gate live.
+   I1 moved the cursors; the sidecar row's per-thread identity is I4's lease
+   work.
+5. Add the forward lease and per-thread `tid` request field. **I4.**
+6. Add `gettid`, `getpid`, `exit` and the measured `openat` path. The three
+   task calls landed with I2; `openat` is I4.
+7. Land host tests and the source guard; run the native probes (I2 and I3 are
+   green); then run the Go gate live.
 
 Exit: G1.1–G1.8 pass on a live boot, with the existing E7 gate still green.
 
@@ -1061,6 +1090,8 @@ chose `copy_file_range`, with the `read`/`write` fallback observed under
 fault injection. The measured result is §3.5, and the artifact header records
 the exact build and trace commands.
 
-The next step is not another sketch: the record-only `rt_sigaction` path and
-the four netpoll startup arms are in the tree, and the remaining work is the
-clone/futex/thread-group slice and the six table gaps §7 lists.
+The next step is not another sketch: the record-only `rt_sigaction` path, the
+four netpoll startup arms and the clone/thread-group/private-futex slice are
+in the tree, with two native probes green. The one remaining table gap §7
+lists is `openat` (I4); the forward lease and per-thread channel identity are
+what turn the probes into the live Go gate.

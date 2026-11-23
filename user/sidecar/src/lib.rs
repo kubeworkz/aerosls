@@ -64,6 +64,7 @@ pub mod boot;
 pub mod catalog_client;
 pub mod e7_candidate;
 pub mod e7_firstuser;
+pub mod e7_futex_probe;
 pub mod e7_probe;
 pub mod e7_thread_probe;
 pub mod heap;

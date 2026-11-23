@@ -147,6 +147,7 @@ const struct LinuxSyscallEntry linux_syscall_table[] = {
     { 131, LSC_SIG,    0 },   /* sigaltstack — recorded, never delivered */
     { 158, LSC_MSR,    0 },   /* arch_prctl(ARCH_SET_FS) — §5.3's one MSR */
     { 186, LSC_TASK,   0 },   /* gettid — this descriptor's pid (TG-1 I2) */
+    { 202, LSC_FUTEX,  0 },   /* futex — private wait/wake, kernel-local (I3) */
     { 217, LSC_FD,     0 },   /* getdents64 */
     { 218, LSC_LOCAL,  0 },   /* set_tid_address — single-threaded: stored and ignored */
     { 228, LSC_LOCAL,  0 },   /* clock_gettime — vDSO-backstopped (§5.5): a real trap here */
@@ -193,6 +194,7 @@ const char *linux_syscall_class_name(enum LinuxSyscallClass cls)
     case LSC_SPAWN:  return "spawn";
     case LSC_THREAD: return "thread";
     case LSC_TASK:   return "task";
+    case LSC_FUTEX:  return "futex";
     case LSC_LOCAL:  return "local";
     case LSC_EXIT:   return "exit";
     case LSC_UNKNOWN:

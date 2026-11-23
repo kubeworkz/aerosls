@@ -102,6 +102,8 @@ enum LinuxSyscallClass {
     LSC_THREAD,        /* clone: kernel-local, no sidecar request (I2)      */
     LSC_TASK,          /* getpid/gettid/exit: kernel-local identity and
                         * thread lifecycle (I2)                            */
+    LSC_FUTEX,         /* futex: kernel-local wait/wake over the group's
+                        * own word (I3)                                    */
     LSC_LOCAL,         /* sidecar-local: no fd, no memory, no kernel state */
     LSC_EXIT,          /* exit_group: the sidecar reaps, frames return */
 };

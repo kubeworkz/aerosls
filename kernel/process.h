@@ -654,6 +654,20 @@ void process_exit(uint32_t exit_code);
 __attribute__((noreturn)) void linux_thread_exit(struct ProcessDescriptor* pd,
                                                  uint32_t exit_code);
 
+/* ─── E7 TG-1 I3: futex wait/wake ─────────────────────────────────────────
+ * The table itself is kernel/linux_futex.h (pure, host-tested). These are the
+ * descriptor-side halves: linux_futex_block parks the CALLING thread (never
+ * returns once it parks; returns -EAGAIN/-ENOMEM only when it did not),
+ * linux_futex_wake_threads resumes up to count waiters of one (group,
+ * address) key and answers how many actually resumed, and the deadline tick
+ * (timer ISR, BSP, before schedule_ring3) expires relative-timeout waiters
+ * with -ETIMEDOUT. */
+int  linux_futex_block(struct ProcessDescriptor* cur, uint32_t group_id,
+                       uint64_t uaddr, uint64_t deadline);
+int  linux_futex_wake_threads(uint32_t group_id, uint64_t uaddr,
+                              uint32_t count);
+void linux_futex_deadline_tick(void);
+
 // Phase 7: find the Ring-3 process currently executing, for callers that
 // need to know "who is asking" (e.g. simi_runtime.c's authority-checked
 // RESOLVE). Mirrors schedule_ring3()'s own scan for the running process
