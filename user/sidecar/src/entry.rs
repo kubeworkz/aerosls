@@ -558,6 +558,35 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                 Err(rc) => klog(b"[E7] probe: spawn FAILED rc=", rc as u32, b""),
             }
 
+            // E7 TG-1 I2: the native two-thread probe. Same creator tree and
+            // same real create path; its clone/gettid/getpid/shared-write/
+            // exit flow is what tests/linux_thread_probe_check.sh asserts on
+            // a live boot. Logged, never fatal, like the probe above.
+            match crate::e7_thread_probe::spawn(&RealKernel, caps.budget_base, caps.budget_len) {
+                Ok(sp) => {
+                    match booted.proc.vfs.add_task() {
+                        Ok(vt) => {
+                            if crate::linux::track(
+                                sp.ch_r,
+                                sp.ch_w,
+                                crate::e7_thread_probe::PROBE_NAME,
+                                0,
+                                sp.heap_base,
+                                sp.heap_limit,
+                                vt,
+                                false,
+                            ) {
+                                klog(b"[E7] thread-probe: spawned ch_r=", sp.ch_r, b"");
+                            } else {
+                                klog(b"[E7] thread-probe: spawned but TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+                            }
+                        }
+                        Err(_) => klog(b"[E7] thread-probe: VFS task alloc FAILED ch_r=", sp.ch_r, b""),
+                    }
+                }
+                Err(rc) => klog(b"[E7] thread-probe: spawn FAILED rc=", rc as u32, b""),
+            }
+
             // E7 increment 7 (§5.1/§5.2): the SAME create over a REAL ELF64 image
             // — the census candidate fixture, segments at their linked vaddrs and
             // entry at e_entry — a controlled pair with the .flat probe above:

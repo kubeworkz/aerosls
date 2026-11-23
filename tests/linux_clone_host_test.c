@@ -197,12 +197,32 @@ int main(void) {
               g->live_threads == LINUX_THREADS_MAX &&
               proc_table[LINUX_THREADS_MAX].group_index == LINUX_GROUP_NONE,
               "a join at the cap is refused EAGAIN-equivalent without stamping identity");
+
+        /* I2's departure half: the last-thread rule is the group's destroy
+         * trigger, and only the last leave reports it. */
+        {
+            int last = 0;
+            for (int i = 0; i < LINUX_THREADS_MAX; i++)
+                last = linux_group_leave_thread(g);
+            CHECK(last == 1 && g->live_threads == 0,
+                  "leaving every thread reports the last one (the group destroy is owed exactly once)");
+            CHECK(linux_group_leave_thread(g) == 0 && g->live_threads == 0,
+                  "a leave on an empty group is a no-op, not a second destroy");
+            CHECK(linux_group_leave_thread(0) == 0,
+                  "a NULL group leave is a no-op");
+        }
     }
 
     CHECK(linux_syscall_class(LINUX_CLONE) == LSC_THREAD,
           "clone (56) has the LSC_THREAD class in the real ABI table");
     CHECK(strcmp(linux_syscall_class_name(LSC_THREAD), "thread") == 0,
           "LSC_THREAD's class name is \"thread\"");
+    CHECK(linux_syscall_class(LINUX_GETTID) == LSC_TASK &&
+              linux_syscall_class(LINUX_GETPID) == LSC_TASK &&
+              linux_syscall_class(LINUX_EXIT) == LSC_TASK,
+          "gettid (186), getpid (39) and exit (60) are LSC_TASK — kernel-local identity and lifecycle, never a sidecar request");
+    CHECK(strcmp(linux_syscall_class_name(LSC_TASK), "task") == 0,
+          "LSC_TASK's class name is \"task\"");
 
     printf("\nlinux_clone_host_test: %d passed, %d failed\n",
            checks_passed, checks_failed);

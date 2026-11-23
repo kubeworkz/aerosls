@@ -2,12 +2,13 @@
 
 **Status:** Design and scoping pass. The TG-0 Go census is measured
 (2026-11-09); the committed counts artifact is the 2026-11-22 regeneration.
-The record-only `rt_sigaction` path and the four netpoll startup
-arms have since landed in the tree; no thread-group, `clone`, or `futex`
-implementation is landed. Current dispatch status and the six remaining table
-gaps: §7.
-**Date:** 2026-11-09 (measurement), 2026-11-22 (counts regeneration);
-current-tree status noted 2026-11-21.
+The record-only `rt_sigaction` path and the four netpoll startup arms have
+since landed in the tree. TG-1 I1 (group lifecycle) and I2 (kernel-local
+`clone`, `getpid`/`gettid`/`exit`, group-aware teardown) are landed, with
+host tests and a passing native two-thread live probe; `futex` and `openat`
+remain. Current dispatch status and the TG-0 gap list: §7.
+**Date:** 2026-11-09 (measurement), 2026-11-22 (counts regeneration),
+2026-11-23 (I2 live probe); current-tree status noted 2026-11-23.
 **TG-0 artifact:** `tools/go_thread_gate_census.txt` (Go 1.25.1, pinned)
 **Parent:** `docs/AeroSLS-Linux-ABI-Shim-Design-v0.1.md` §7, §8, §9 and
 Appendix B.
@@ -183,18 +184,32 @@ A group therefore cannot get one row per thread without also solving channel
 demultiplexing, per-thread fd-table identity, and multiple pending exchanges.
 The smaller design is one row per group with per-thread signal entries.
 
-### 2.5 Exit is process-grained
+### 2.5 Exit is group-aware (TG-1 I2)
 
-`process_exit()` performs `cap_table_teardown()`,
-`user_destroy_page_table()`, and `proc_free_syscall_stack()` for the running
-descriptor. `process_kill()` and `proc_deferred_teardown()` do the same for a
-non-running target. `user/sidecar/src/linux.rs` handles `exit_group` by
-resolving the child name to a pid and asking the kernel to kill it.
+I1 moved the shared teardown behind `linux_group_destroy()`, and I2 added the
+distinct lifecycle paths around it. `exit` (60) is `LSC_TASK` and releases ONE
+thread: its syscall stack, trap state and descriptor identity go, while the
+group's cr3, cap table and sidecar row stay while siblings live. The last live
+thread (or `exit_group`, a fault, or a kill that lands on any member) reaches
+`linux_group_release_all()`, which stops every member and then runs the group's
+ONE cap-table/page-table destroy. `process_kill()` on a member is a group kill;
+a RUNNING target defers every member to the scheduler sweep.
 
-There is no `exit` (60) row and no group-kill operation. Killing the leader
-would free the shared address space while sibling threads still reference it;
-killing one sibling with the current path would free the group's page table.
-The group exit path must be the only owner of the final teardown.
+The leader is v1's named exception: if it exits while siblings live, its
+descriptor stays ACTIVE-but-ZOMBIE so the sidecar's name-to-pid lookup keeps
+resolving until group teardown. It is never scheduled again.
+
+**Measured 2026-11-23.** `tests/linux_thread_probe_check.sh` boots the
+ordinary ISO and the sidecar-spawned native probe creates one sibling: the
+kernel logs `clone: TID 100 joins group 106 (leader 106)`, both threads read
+that group id, the child publishes its own TID and a shared word through the
+group's one heap, and `exit(60)` logs a thread-local exit for TID 100 before
+the parent's `exit_group` produces exactly one `group exit: group 106` line.
+The probe deliberately makes no forwarded syscall from the child: a forward
+parks the calling descriptor, and v1's channel owner is the group leader, so
+the reply would wake the leader and leave the child parked. Per-thread
+park/wake is I3/I4 work; the probe's post-clone path is kernel-local
+`getpid`/`gettid`/`exit` plus shared memory only.
 
 ### 2.6 Checkpoint has one Linux task slot
 
@@ -215,12 +230,12 @@ task slot.
 
 `kernel/linux_abi.c` started as the 27-row Rust census table. The current
 table adds the four netpoll startup rows (`epoll_ctl` 233, `epoll_pwait` 281,
-`eventfd2` 290, `epoll_create1` 291); it still has no rows for `clone` (56),
-`futex` (202), `gettid` (186), `getpid` (39), `openat` (257),
-`sched_getaffinity` (204) or `exit` (60). `linux_syscall_class()` answers
-`LSC_UNKNOWN`, and the first-trap branch refuses an unknown number before any
-post. That remains correct for the Rust target; it is not a Go plan. See §7
-for the current status and the six real table gaps.
+`eventfd2` 290, `epoll_create1` 291), `clone` (56, `LSC_THREAD`), and I2's
+three task rows — `getpid` (39), `exit` (60) and `gettid` (186), all
+`LSC_TASK` and kernel-local. `futex` (202, `LSC_FUTEX`) and `openat` (257,
+`LSC_FD`) remain the two TG-1 table gaps. `linux_syscall_class()` answers
+`LSC_UNKNOWN` for everything else, and the first-trap branch refuses an
+unknown number before any post.
 
 The table also has no row for `tkill` (200), although the sidecar has a
 `LINUX_TKILL` answer arm. As read in this pass, the first-trap classification
@@ -905,15 +920,12 @@ The compatibility half is already in the tree:
    `epoll_pwait` probe. A blocking `epoll_pwait` remains a named decision; the
    current arm does not claim to serve one.
 
-The real table gaps before a live Go start are:
-
-- **`clone` (56)** — kernel-local thread creation;
-- **`futex` (202)** — private wait/wake;
-- **`gettid` (186)** — per-thread identity;
-- **`getpid` (39)** — group identity (`getpid` was not in the TG-0 trace; it is
-  added with the group identity surface);
-- **`exit` (60)** — thread exit;
-- **`openat` (257)** — the gate's measured path open.
+The table gaps before a live Go start were six. I2 closed four: **`clone`
+(56)** (kernel-local thread creation), **`gettid` (186)** (per-thread
+identity), **`getpid` (39)** (group identity; it was not in the TG-0 trace and
+was added with the group identity surface) and **`exit` (60)** (thread-local
+teardown). The two remaining are **`futex` (202)** (I3's private wait/wake) and
+**`openat` (257)** (I4's measured path open).
 
 The other required/startup rows already have a class. `copy_file_range`,
 `pread64`, `sched_yield`, `madvise`, `nanosleep`, `uname`, `prctl`,

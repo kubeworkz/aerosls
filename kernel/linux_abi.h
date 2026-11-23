@@ -100,6 +100,8 @@ enum LinuxSyscallClass {
     LSC_MSR,           /* §5.3 the one kernel-side semantic: arch_prctl(SET_FS) */
     LSC_SPAWN,         /* execve: the spawn path (the sidecar's to decide) */
     LSC_THREAD,        /* clone: kernel-local, no sidecar request (I2)      */
+    LSC_TASK,          /* getpid/gettid/exit: kernel-local identity and
+                        * thread lifecycle (I2)                            */
     LSC_LOCAL,         /* sidecar-local: no fd, no memory, no kernel state */
     LSC_EXIT,          /* exit_group: the sidecar reaps, frames return */
 };
@@ -143,6 +145,9 @@ const char *linux_syscall_class_name(enum LinuxSyscallClass cls);
  * re-checks the address AT THE WRITE regardless of what the grant said,
  * because the wrmsr is the dangerous half. */
 #define LINUX_CLONE           56u            /* E7 TG-1 I2: kernel-local clone */
+#define LINUX_GETPID          39u            /* E7 TG-1 I2: getpid — tgid */
+#define LINUX_EXIT            60u            /* E7 TG-1 I2: exit — thread-local */
+#define LINUX_GETTID          186u           /* E7 TG-1 I2: gettid — tid */
 #define LINUX_ARCH_PRCTL      158u           /* the census row (§5.6) */
 #define LINUX_ARCH_SET_FS     0x1002u        /* cmd word in args[0]    */
 #define LINUX_ARCH_SET_GS     0x1001u        /* no GSR in this kernel:

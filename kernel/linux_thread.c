@@ -194,6 +194,13 @@ int linux_group_add_thread(struct LinuxThreadGroup* g) {
     return 0;
 }
 
+int linux_group_leave_thread(struct LinuxThreadGroup* g) {
+    if (!g || !g->used || g->exiting) return 0;
+    if (g->live_threads == 0) return 0;   /* already empty: no transition */
+    g->live_threads--;
+    return g->live_threads == 0;
+}
+
 int linux_group_join_thread(struct LinuxThreadGroup* g,
                             struct ProcessDescriptor* child) {
     if (!g || !child || !g->used || g->exiting) return -1;

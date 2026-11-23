@@ -646,6 +646,14 @@ uint32_t program_spawn(const char* object_name, uint32_t owner_uid);
 // Kernel-side exit handler: restores kernel context saved by kernel_enter_ring3.
 void process_exit(uint32_t exit_code);
 
+/* E7 TG-1 I2: Linux exit(60) — release ONE thread. Frees only this thread's
+ * syscall stack and descriptor identity; the group's address space, cap table
+ * and sidecar row stay while siblings live. The last thread destroys the
+ * group once. Never returns: it switches to the next runnable descriptor (or
+ * halts when the table has none). */
+__attribute__((noreturn)) void linux_thread_exit(struct ProcessDescriptor* pd,
+                                                 uint32_t exit_code);
+
 // Phase 7: find the Ring-3 process currently executing, for callers that
 // need to know "who is asking" (e.g. simi_runtime.c's authority-checked
 // RESOLVE). Mirrors schedule_ring3()'s own scan for the running process

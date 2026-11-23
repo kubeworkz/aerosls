@@ -660,6 +660,23 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                 uint32_t fwd_len = (uint32_t)sizeof(struct SLSLinuxSyscallRequest);
                 int status;
                 proc_read_linux_args(largs);
+                /* E7 TG-1 I2: the task class — identity and thread exit are
+                 * kernel-local. getpid is the GROUP's id (the leader's pid),
+                 * gettid this descriptor's own pid, and exit(60) releases ONE
+                 * thread: its syscall stack and identity go, the group's cr3,
+                 * cap table and sidecar row stay while siblings live. The
+                 * last thread destroys the group exactly once. */
+                if (num == LINUX_GETPID)
+                    return (uint64_t)cur->tgid;
+                if (num == LINUX_GETTID)
+                    return (uint64_t)cur->tid;
+                if (num == LINUX_EXIT) {
+                    kernel_serial_printf(
+                        "[E7] exit(%lu) from TID %u group %u: thread-local "
+                        "teardown (no sidecar request)\n",
+                        (unsigned long)largs[0], cur->tid, cur->tgid);
+                    linux_thread_exit(cur, (uint32_t)largs[0]);
+                }
                 /* E7 TG-1 I2: clone is the kernel-local thread class. It
                  * never describes, posts or parks: the group already owns
                  * the address space, cap table and sidecar row, so the only

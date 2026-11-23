@@ -134,8 +134,10 @@ const struct LinuxSyscallEntry linux_syscall_table[] = {
     {  12, LSC_MEM,    0 },   /* brk — §5.4 bump pointer in the budget */
     {  13, LSC_SIG,    0 },   /* rt_sigaction — the whole act recorded; a handler is never invoked */
     {  14, LSC_SIG,    0 },   /* rt_sigprocmask — recorded; unblock delivers (step 2) */
+    {  39, LSC_TASK,   0 },   /* getpid — the group's leader pid (TG-1 I2) */
     {  56, LSC_THREAD, 0 },   /* clone — the Go thread shape, kernel-local (I2) */
     {  59, LSC_SPAWN,  0 },   /* execve — the spawn path */
+    {  60, LSC_TASK,   0 },   /* exit — thread-local teardown (TG-1 I2) */
     {  72, LSC_FD,     0 },   /* fcntl */
     {  74, LSC_FD,     0 },   /* fsync */
     {  77, LSC_FD,     0 },   /* ftruncate */
@@ -144,6 +146,7 @@ const struct LinuxSyscallEntry linux_syscall_table[] = {
     {  87, LSC_FD,     0 },   /* unlink */
     { 131, LSC_SIG,    0 },   /* sigaltstack — recorded, never delivered */
     { 158, LSC_MSR,    0 },   /* arch_prctl(ARCH_SET_FS) — §5.3's one MSR */
+    { 186, LSC_TASK,   0 },   /* gettid — this descriptor's pid (TG-1 I2) */
     { 217, LSC_FD,     0 },   /* getdents64 */
     { 218, LSC_LOCAL,  0 },   /* set_tid_address — single-threaded: stored and ignored */
     { 228, LSC_LOCAL,  0 },   /* clock_gettime — vDSO-backstopped (§5.5): a real trap here */
@@ -189,6 +192,7 @@ const char *linux_syscall_class_name(enum LinuxSyscallClass cls)
     case LSC_MSR:    return "msr";
     case LSC_SPAWN:  return "spawn";
     case LSC_THREAD: return "thread";
+    case LSC_TASK:   return "task";
     case LSC_LOCAL:  return "local";
     case LSC_EXIT:   return "exit";
     case LSC_UNKNOWN:

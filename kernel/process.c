@@ -876,6 +876,120 @@ static void linux_stack_maybe_report(struct ProcessDescriptor *pd, const char *w
         linux_stack_hwm_report(pd, where);
 }
 
+/* ─── E7 TG-1 I2: thread/group lifecycle ─────────────────────────────────
+ * The group owns the address space, cap table and sidecar row; a departing
+ * thread owns only its syscall stack, register/trap state and descriptor
+ * identity. So one thread's exit NEVER frees cr3 or the cap table. The last
+ * live thread is what triggers the group's one destroy.
+ *
+ * The leader is v1's named exception (the TG-1 plan's decision 3): if it
+ * exits while siblings live, its descriptor stays ACTIVE-but-ZOMBIE so the
+ * sidecar's name -> pid lookup (`sidecar_pid(PROBE_NAME)`) keeps resolving
+ * until group teardown; it is never scheduled again. That costs one slot,
+ * deliberately, and linux_group_release_all() reclaims it at teardown.
+ *
+ * Returns 1 when this was the group's last live thread (destroy owed), 0
+ * otherwise, including a group-less descriptor. */
+static int linux_descriptor_release(struct ProcessDescriptor* pd) {
+    struct LinuxThreadGroup* g = linux_group_of(pd);
+    int last;
+
+    linux_stack_maybe_report(pd, "exit");
+    proc_clear_resume_state(pd);
+    proc_free_syscall_stack(pd);
+    pd->state  = PROC_ZOMBIE;
+
+    if (!g) {
+        pd->active = 0;
+        if (pd->pid != 0 && proc_count) proc_count--;
+        linux_group_clear_identity(pd);
+        return 0;
+    }
+
+    last = linux_group_leave_thread(g);
+    if (pd->is_group_leader && !last) {
+        /* The reserved leader: identity (tid/tgid/group index) stays valid
+         * for the sidecar row, but the descriptor can never run again. */
+        pd->active = 1;
+        return 0;
+    }
+    if (last) {
+        /* Stay ACTIVE until linux_group_release_all() has destroyed the
+         * group: cap_table_teardown() unmaps through cap_proc_cr3(), which
+         * requires the cap owner's descriptor to be active. */
+        return 1;
+    }
+    linux_group_clear_identity(pd);
+    pd->active = 0;
+    if (pd->pid != 0 && proc_count) proc_count--;
+    return 0;
+}
+
+/* Group-fatal teardown: every member descriptor first, then the group's ONE
+ * cap-table/page-table destroy. Used by the fault path, a kill that lands on
+ * any member, and the last thread's departure. */
+static void linux_group_release_all(struct LinuxThreadGroup* g) {
+    uint32_t gi;
+    if (!g || !g->used || g->exiting) return;
+    gi = (uint32_t)(g - linux_group_table);
+    /* First pass: stop every member, free only its per-thread stack. Keep
+     * the descriptors ACTIVE and their identity intact — the group's cap
+     * teardown resolves cap_proc_cr3(cap_owner_pid), so the owner must be
+     * active until after the destroy. */
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct ProcessDescriptor* pd = &proc_table[i];
+        if (!pd->active) continue;
+        if (pd->group_index != gi) continue;
+        linux_stack_maybe_report(pd, "exit");
+        proc_clear_resume_state(pd);
+        proc_free_syscall_stack(pd);
+        pd->state = PROC_ZOMBIE;
+    }
+    kernel_serial_printf(
+        "[E7] group exit: group %u (leader %u) torn down once\n",
+        g->group_id, g->leader_pid);
+    linux_group_destroy(g);
+    /* Second pass: the shared resources are gone; release every descriptor
+     * that belonged to the group (including the reserved leader). */
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct ProcessDescriptor* pd = &proc_table[i];
+        if (!pd->active || pd->group_index != gi) continue;
+        linux_group_clear_identity(pd);
+        pd->active = 0;
+        if (pd->pid != 0 && proc_count) proc_count--;
+    }
+}
+
+/* Linux exit(60), from the dispatcher. The caller is RUNNING on the syscall
+ * stack being freed, so this never returns: it picks the next runnable
+ * descriptor and hands it the CPU, exactly like the async-exit path. The
+ * freed frames stay physically intact until that switch (single CPU, IF=0),
+ * the same argument process_exit() relies on. */
+__attribute__((noreturn))
+void linux_thread_exit(struct ProcessDescriptor* pd, uint32_t exit_code) {
+    struct LinuxThreadGroup* g = linux_group_of(pd);
+    uint32_t tid = pd ? pd->tid : 0;
+    uint32_t gid = g ? g->group_id : 0;
+    int last = pd ? linux_descriptor_release(pd) : 0;
+    struct ProcessDescriptor* next;
+
+    kernel_serial_printf(
+        "[E7] thread exit: TID %u group %u code=%u%s\n",
+        tid, gid, exit_code,
+        last ? " (last thread: group teardown)" : "");
+    if (last) linux_group_release_all(g);
+
+    next = pick_next_runnable();
+    if (!next) {
+        kernel_serial_print(
+            "[E7] thread exit: no runnable process left; halting.\n");
+        for (;;) __asm__ volatile("hlt");
+    }
+    kernel_serial_printf("[E7] thread exit: switching to PID %u '%s'\n",
+                         next->pid, next->name);
+    kernel_switch_next(next);
+}
+
 void process_exit(uint32_t exit_code) {
     for (int i = 0; i < PROC_MAX; i++) {
         struct ProcessDescriptor* pd = &proc_table[i];
@@ -928,27 +1042,27 @@ void process_exit(uint32_t exit_code) {
          * pd->active stays 1 until after step 1 because
          * cap_proc_cr3(pid) (used by the teardown's unmap walk) requires
          * an active descriptor. */
-        /* E7 TG-1 I1: a LINUX descriptor's cap table and page table belong to
-         * its group; the group destroys them ONCE. A non-Linux descriptor
-         * keeps the historical per-process teardown. */
+        /* E7 TG-1 I2: a Linux group member's fault/exit is GROUP-fatal —
+         * the cap table and page table are shared, so there is no safe
+         * per-thread teardown. Every member goes, then the group's one
+         * destroy. A non-Linux descriptor keeps the historical path, and a
+         * LINUX descriptor with no group has already had its one group
+         * teardown (a sibling exit landed here) so it frees nothing again. */
         {
             struct LinuxThreadGroup* lg = linux_group_of(pd);
             if (lg) {
-                linux_group_destroy(lg);
-            } else if (pd->personality != PROC_PERSONALITY_LINUX) {
-                /* An SLS descriptor keeps the historical per-process
-                 * teardown. A LINUX descriptor with no group has already had
-                 * its one group teardown (I2's sibling exit lands here) — it
-                 * must not free the shared root again. */
-                cap_table_teardown(pd->pid);
-                user_destroy_page_table(pd->cr3);
+                linux_group_release_all(lg);
+            } else {
+                if (pd->personality != PROC_PERSONALITY_LINUX) {
+                    cap_table_teardown(pd->pid);
+                    user_destroy_page_table(pd->cr3);
+                }
+                proc_free_syscall_stack(pd);
+                linux_group_clear_identity(pd);
+                pd->active = 0;
+                proc_count--;
             }
         }
-        proc_free_syscall_stack(pd);
-        linux_group_clear_identity(pd);
-
-        pd->active = 0;
-        proc_count--;
 
         /* Seed Kernel Phase 1.5: three resume shapes now exist.
          *
@@ -1612,16 +1726,22 @@ static void proc_deferred_teardown(struct ProcessDescriptor* pd) {
     kernel_serial_printf(
         "[PROC] PID %u '%s' deferred teardown (killed while running)\n",
         pd->pid, pd->name);
-    linux_stack_maybe_report(pd, "exit");
-    proc_clear_resume_state(pd);
+    /* E7 TG-1 I2: a deferred kill on any group member is group-fatal. Each
+     * member is released as the sweep reaches it; the last one destroys the
+     * shared resources exactly once. */
     {
         struct LinuxThreadGroup* lg = linux_group_of(pd);
         if (lg) {
-            linux_group_destroy(lg);
-        } else if (pd->personality != PROC_PERSONALITY_LINUX) {
-            cap_table_teardown(pd->pid);
-            user_destroy_page_table(pd->cr3);
+            if (linux_descriptor_release(pd))
+                linux_group_release_all(lg);
+            return;
         }
+    }
+    linux_stack_maybe_report(pd, "exit");
+    proc_clear_resume_state(pd);
+    if (pd->personality != PROC_PERSONALITY_LINUX) {
+        cap_table_teardown(pd->pid);
+        user_destroy_page_table(pd->cr3);
     }
     proc_free_syscall_stack(pd);
     linux_group_clear_identity(pd);
@@ -2556,6 +2676,30 @@ void process_kill(uint32_t pid) {
     for (int i = 0; i < PROC_MAX; i++) {
         if (!proc_table[i].active || proc_table[i].pid != pid) continue;
         kernel_serial_printf("[PROC] PID %u terminated.\n", pid);
+        /* E7 TG-1 I2: a Linux member's kill is a GROUP kill. If a member is
+         * running, defer every member so the scheduler sweep releases them
+         * with a saved context and the last one destroys the group once. */
+        {
+            struct LinuxThreadGroup* lg = linux_group_of(&proc_table[i]);
+            if (lg) {
+                if (proc_table[i].state == PROC_RUNNING) {
+                    for (int j = 0; j < PROC_MAX; j++) {
+                        if (proc_table[j].active &&
+                            linux_group_of(&proc_table[j]) == lg)
+                            proc_table[j].pending_teardown = 1;
+                    }
+                    kernel_serial_printf(
+                        "[PROC] group %u kill deferred (member %u running) — "
+                        "teardown at next schedule\n", lg->group_id, pid);
+                    return;
+                }
+                kernel_serial_printf(
+                    "[PROC] group %u terminated (member %u)\n",
+                    lg->group_id, pid);
+                linux_group_release_all(lg);
+                return;
+            }
+        }
         if (proc_table[i].state == PROC_RUNNING) {
             /* Self-kill (SYS_SLS_PROC_KILL with one's own pid) or any
              * hypothetical cross-CPU kill: the target is executing RIGHT

@@ -127,6 +127,11 @@ void linux_group_stamp_memory(struct ProcessDescriptor* pd,
 /* Admission for I2's clone: 0 when the group has room, -1 at the cap. */
 int linux_group_add_thread(struct LinuxThreadGroup* g);
 
+/* I2's departure half: drop one live thread. Returns 1 when this was the
+ * group's LAST live thread (the caller owes the one group destroy), 0 while
+ * siblings remain. Never touches the descriptor or any group resource. */
+int linux_group_leave_thread(struct LinuxThreadGroup* g);
+
 /* I2's admission + identity stamp in one call: the child must be group-less,
  * the group live and below the cap, and the child's pid already assigned.
  * On success it becomes a non-leader member (tid = pid, tgid = group id,
