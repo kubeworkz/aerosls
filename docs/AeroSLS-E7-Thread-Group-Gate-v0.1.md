@@ -4,12 +4,13 @@
 (2026-11-09); the committed counts artifact is the 2026-11-22 regeneration.
 The record-only `rt_sigaction` path and the four netpoll startup arms have
 since landed in the tree. TG-1 I1 (group lifecycle), I2 (kernel-local `clone`,
-`getpid`/`gettid`/`exit`, group-aware teardown) and I3 (private `futex`
-wait/wake with a relative timeout) are landed, with host tests and passing
-native two-thread and futex live probes; `openat` remains. Current dispatch
+`getpid`/`gettid`/`exit`, group-aware teardown), I3 (private `futex`
+wait/wake with a relative timeout) and I4 (`openat`'s measured path open and
+the per-thread forward lease) are landed, with host tests and passing native
+two-thread, futex and sibling-forward openat live probes. Current dispatch
 status and the TG-0 gap list: §7.
 **Date:** 2026-11-09 (measurement), 2026-11-22 (counts regeneration),
-2026-11-23 (I2/I3 live probes); current-tree status noted 2026-11-23.
+2026-11-23 (I2/I3/I4 live probes); current-tree status noted 2026-11-23.
 **TG-0 artifact:** `tools/go_thread_gate_census.txt` (Go 1.25.1, pinned)
 **Parent:** `docs/AeroSLS-Linux-ABI-Shim-Design-v0.1.md` §7, §8, §9 and
 Appendix B.
@@ -572,11 +573,60 @@ group's cap-owner descriptor, so every thread sees the same two channel caps
 and the same fd-related capability state. `cap_table_teardown()` is a group
 operation, not a thread operation.
 
-**One in-flight forward.** Before `k_linux_forward`, the calling thread
-acquires the group lease. If another thread owns it, the caller parks on a
-group wait list. The owner releases it when the reply is applied (or the
-request is refused) and wakes one waiter. A thread blocked on futex does not
-hold the lease; threads can still make progress while one waits on a futex.
+**Per-thread identity (the two resolutions I4 had to make).** A group can
+have more than one RUNNING thread — the leader spins in ring 3 while a
+sibling traps — so "first RUNNING descriptor" is not "the caller". The live
+openat probe caught both halves:
+
+- `process_find_current()` now matches the per-CPU syscall-stack top (written
+  by `schedule_ring3` and `kernel_switch_next` on every entry) before falling
+  back to the old scan, so a sibling's trap resolves to the sibling. Without
+  it, the forward's `cap_maybe_handoff` read the leader's `park_syscall`
+  (zero), handed the CPU away mid-forward, and the reply then had no parked
+  waiter to wake;
+- `chan_table_for_pid()` (kernel/chan.c) resolves a member to
+  `proc_group_cap_owner(pid)` before scanning `cap_table_pid`, exactly as
+  `cap_table_index` does. Without it a sibling's slot 0/1 names resolved
+  against the KERNEL table — the console channels — so its openat posted to
+  chan 5 instead of the group's probe channel and could never be woken.
+
+**One in-flight forward.** Before staging the reply payload or posting,
+the calling thread acquires the group lease (`linux_group_fwd_acquire`,
+`kernel/linux_thread.c`). If another thread owns it, the caller records its
+descriptor bit (`fwd_wait_mask`) and parks WITHOUT posting —
+`park_syscall = SYS_LINUX_LEASE_RESUME` ("LLSE"), `park_req = the syscall
+number`, entry registers in `park_ctx`. Nothing is owed for a waiter, so no
+sidecar state names it and no reply can be applied to it.
+
+The owner releases when the reply is applied, when the post is refused, when
+the request's channel resolver fails, or when it exits while owning. The
+release (`linux_forward_lease_release`) clears the lease, walks the wait mask
+for the lowest slot that is still a LIVE lease-parked descriptor, grants that
+descriptor the lease, and rebuilds a RESTART frame: `rax = the syscall
+number`, `rip = park_ctx.rcx - 2` — the `syscall` instruction itself. Ring 3
+re-executes the trap, the first trap runs again with the same registers, and
+this time it owns the lease and forwards normally. That is Linux's own
+syscall-restart convention (the shape it uses when restarting a syscall after
+a signal), not a resumed C frame, so nothing in the dispatcher has to be
+extracted into a re-entrant function. A waiter whose two bytes below the
+return RIP are not `0F 05` is answered `EAGAIN` instead of being rewound.
+
+A waiter that dies before its turn cancels its own bit at descriptor release;
+the release's live-descriptor check is the second net, so the lease can never
+be granted to a slot that cannot restart (a reused or dead descriptor), and a
+cancelled waiter is skipped rather than wedging the group. A thread blocked
+on futex does not hold the lease; threads can still make progress while one
+waits on a futex.
+
+**Measured 2026-11-23.** `tests/linux_openat_probe_check.sh` boots the
+ordinary ISO and the sidecar-spawned `e7.openat.probe.0` child clones one
+sibling; the LEADER never forwards. The child `openat(257, AT_FDCWD, "/",
+O_RDONLY|O_DIRECTORY)`s and `close(3)`s the result, and the kernel logs
+`[E7] forward lease: TID <child> group <gid> acquired for syscall 257` for the
+cloned TID, the probe reports `E7OA-OPEN-OK` (fd >= 3) and `E7OA-CLOSE-OK`
+(0), and the group tears down once. `tests/linux_thread_group_host_test.c`
+pins the lease state machine without a boot (free/busy acquire, non-owner
+release, waiter mask, cancel, dead-waiter skip, grant-while-busy).
 
 **Request identity.** Add a `tid` field to `SLSLinuxSyscallRequest` and its
 Rust twin. The kernel fills it from the calling descriptor; the sidecar uses
@@ -883,15 +933,17 @@ must fail by the clause it names.
 
 ### 6.4 Test files
 
-I1–I3 named these; the two live probes are the shipped runtime guards.
+I1–I4 named these; the three live probes are the shipped runtime guards.
 
 - `tests/linux_thread_group_host_test.c` — group ownership, limits, tid/tgid,
-  teardown counts;
+  teardown counts, and I4's forward-lease state machine;
 - `tests/linux_futex_host_test.c` — pure wait/wake/timeout state, no
   privileged instructions (landed with I3);
 - `tests/linux_clone_host_test.c` — flag validation and child-context build;
 - `tests/linux_thread_probe_check.sh` — I2's native two-thread live probe;
 - `tests/linux_futex_probe_check.sh` — I3's native futex live probe;
+- `tests/linux_openat_probe_check.sh` — I4's native sibling-forward openat
+  live probe (lease-acquire line for the child's TID, fd, close, teardown);
 - `tests/thread_group_check.sh` — source guard for the contracts above;
 - `tests/go_thread_gate_census_check.sh` — TG-0 artifact and table check;
 - `tests/go_thread_gate_check.sh` — TG-1 live gate, including teeth;
@@ -950,7 +1002,9 @@ The table gaps before a live Go start were six. I2 closed four: **`clone`
 identity), **`getpid` (39)** (group identity; it was not in the TG-0 trace and
 was added with the group identity surface) and **`exit` (60)** (thread-local
 teardown). I3 closed **`futex` (202)** (private wait/wake with a relative
-timeout). The one remaining is **`openat` (257)** (I4's measured path open).
+timeout). I4 closed **`openat` (257)** (the measured path open: pathname in
+args[1], `AT_FDCWD` only, served by the same VFS open arm; any other dirfd is
+refused by name). None of the six TG-1 table gaps remains.
 
 The other required/startup rows already have a class. `copy_file_range`,
 `pread64`, `sched_yield`, `madvise`, `nanosleep`, `uname`, `prctl`,
@@ -981,11 +1035,11 @@ is the order; the plan owns the exact data structures, tests and teeth.
 4. Move the memory cursors and sidecar fd/heap state to group ownership.
    I1 moved the cursors; the sidecar row's per-thread identity is I4's lease
    work.
-5. Add the forward lease and per-thread `tid` request field. **I4.**
+5. Add the forward lease and per-thread `tid` request field. **Landed: I4.**
 6. Add `gettid`, `getpid`, `exit` and the measured `openat` path. The three
-   task calls landed with I2; `openat` is I4.
-7. Land host tests and the source guard; run the native probes (I2 and I3 are
-   green); then run the Go gate live.
+   task calls landed with I2; `openat` landed with I4.
+7. Land host tests and the source guard; run the native probes (I2, I3 and I4
+   are green); then run the Go gate live.
 
 Exit: G1.1–G1.8 pass on a live boot, with the existing E7 gate still green.
 
@@ -1091,7 +1145,7 @@ fault injection. The measured result is §3.5, and the artifact header records
 the exact build and trace commands.
 
 The next step is not another sketch: the record-only `rt_sigaction` path, the
-four netpoll startup arms and the clone/thread-group/private-futex slice are
-in the tree, with two native probes green. The one remaining table gap §7
-lists is `openat` (I4); the forward lease and per-thread channel identity are
-what turn the probes into the live Go gate.
+four netpoll startup arms and the clone/thread-group/private-futex/openat
+slice are in the tree, with three native probes green. No TG-1 table gap §7
+lists remains; the forward lease is what turns a cloned sibling's forwarded
+syscall into a correct wake, and the live Go gate (G1.1–G1.8) is next.

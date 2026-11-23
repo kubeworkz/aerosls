@@ -668,6 +668,16 @@ int  linux_futex_wake_threads(uint32_t group_id, uint64_t uaddr,
                               uint32_t count);
 void linux_futex_deadline_tick(void);
 
+/* ─── E7 TG-1 I4: the group forward lease ─────────────────────────────────
+ * A sibling that finds the group's one forward in flight parks here with its
+ * syscall number; it never posts, so nothing is owed. Returns -EAGAIN only
+ * when no park was possible (no runnable descriptor). The owner calls
+ * linux_forward_lease_release after its reply is applied (or its post is
+ * refused, or it exits); the release grants the lease to the lowest valid
+ * waiter and restarts that waiter's syscall at its `syscall` instruction. */
+int  linux_forward_lease_wait(struct ProcessDescriptor* cur, uint32_t num);
+void linux_forward_lease_release(struct ProcessDescriptor* cur);
+
 // Phase 7: find the Ring-3 process currently executing, for callers that
 // need to know "who is asking" (e.g. simi_runtime.c's authority-checked
 // RESOLVE). Mirrors schedule_ring3()'s own scan for the running process

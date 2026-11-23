@@ -1490,6 +1490,10 @@ int main(void)
         CHECK(p.src == 0x1234 && p.src2 == 0 && p.two == 0 &&
               p.refuse == 0,
               "open carries one path in args[0]");
+        p = linux_fd_path_plan(LINUX_OPENAT, a);
+        CHECK(p.src == 0x5678 && p.src2 == 0 && p.two == 0 &&
+              p.refuse == 0,
+              "openat carries its path in args[1] — args[0] is the dirfd, never measured as a string");
         p = linux_fd_path_plan(LINUX_STAT, a);
         CHECK(p.src == 0x1234 && p.two == 0, "stat carries one path");
         p = linux_fd_path_plan(LINUX_UNLINK, a);

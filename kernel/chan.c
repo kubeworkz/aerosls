@@ -60,8 +60,18 @@
 
 /* ─── Slot → channel resolution ───────────────────────────────────────────── */
 /* Table index for pid, mirroring cap.c's cap_table_index lookup via .pid
- * (cap_table_index itself is static in cap.c). -1 = no table. */
+ * (cap_table_index itself is static in cap.c). -1 = no table.
+ *
+ * E7 TG-1 I4: resolve a GROUP MEMBER to its leader first, exactly as
+ * cap_table_index does. A cloned sibling's own pid has no bound table, so
+ * the bare search returned -1 and callers fell back to the kernel table —
+ * where slots 0/1 are console channels. The live openat probe caught it:
+ * the child's openat posted to chan 5 (console) instead of the group's
+ * probe channel, so its park was on a channel the sidecar's reply could
+ * never wake. The group's slots are the same numbers (0/1); only the table
+ * they name was wrong. */
 static int chan_table_for_pid(uint32_t pid) {
+    pid = proc_group_cap_owner(pid);
     for (int i = 0; i < CAP_TABLE_MAX; i++)
         if (cap_tables[i].pid == pid) return i;
     return -1;

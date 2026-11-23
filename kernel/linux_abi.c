@@ -157,6 +157,7 @@ const struct LinuxSyscallEntry linux_syscall_table[] = {
      * with no event source behind them — epoll_pwait's zero-timeout probe
      * answers 0, a blocking wait is refused by name (linux.rs answer_event). */
     { 233, LSC_FD,     0 },   /* epoll_ctl */
+    { 257, LSC_FD,     0 },   /* openat — the gate's measured path open (I4) */
     { 281, LSC_FD,     0 },   /* epoll_pwait — zero-timeout probe only */
     { 290, LSC_FD,     0 },   /* eventfd2 */
     { 291, LSC_FD,     0 },   /* epoll_create1 */
@@ -980,12 +981,15 @@ struct LinuxFdPathPlan linux_fd_path_plan(uint64_t num, const uint64_t args[6])
     p.src2 = 0;
     p.two = 0;
     p.refuse = 0;
-    if (num != LINUX_RENAME && num != LINUX_OPEN && num != LINUX_STAT &&
-        num != LINUX_LSTAT && num != LINUX_UNLINK && num != LINUX_MKDIR) {
+    if (num != LINUX_RENAME && num != LINUX_OPEN && num != LINUX_OPENAT &&
+        num != LINUX_STAT && num != LINUX_LSTAT && num != LINUX_UNLINK &&
+        num != LINUX_MKDIR) {
         return p;   /* this number carries no path (total function) */
     }
     if (!args) return p;
-    p.src  = args[0];
+    /* openat's args[0] is the dirfd; the pathname is args[1]. Every other
+     * path number names its path in args[0]. */
+    p.src  = (num == LINUX_OPENAT) ? args[1] : args[0];
     p.two  = (num == LINUX_RENAME);
     p.src2 = p.two ? args[1] : 0;
     return p;

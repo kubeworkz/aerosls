@@ -592,6 +592,9 @@ struct LinuxSigCopyPlan linux_sig_copy_plan(uint64_t num,
  * routing is the table's; what is NEW here is what each number's first
  * trap attaches and what its reply may carry back. */
 #define LINUX_OPEN        2u
+#define LINUX_OPENAT      257u   /* E7 TG-1 I4: openat — the gate's measured
+                                    * path open. Path in args[1] (args[0] is
+                                    * the dirfd); v1 serves AT_FDCWD only. */
 #define LINUX_CLOSE       3u
 #define LINUX_STAT        4u
 #define LINUX_LSTAT       6u
@@ -924,6 +927,13 @@ void linux_syscall_describe(struct SLSLinuxSyscallRequest *req,
  * the census's 27 — linux_syscall_class() answers UNKNOWN for it, so it can
  * never be mistaken for a real syscall's description. */
 #define SYS_LINUX_TRAP_RESUME  0x4C494E52u /* "LINR" */
+/* E7 TG-1 I4: park_syscall while a thread waits for its GROUP's forward
+ * lease. The waiter is not owed a reply yet: the owner's release grants the
+ * lease and restarts the caller's `syscall` instruction (rip -= 2), so the
+ * first trap runs again with the same registers and now owns the lease.
+ * Distinct from LINR because cap_maybe_handoff and the resume arm must not
+ * treat this park as an in-flight forward. */
+#define SYS_LINUX_LEASE_RESUME 0x4C4C5345u /* "LLSE" */
 
 /* 1 iff a trap at the resume sentinel may be treated as the resume re-run of
  * an in-flight forward: the personality takes the branch AND the arm is set.

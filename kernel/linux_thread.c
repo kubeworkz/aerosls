@@ -221,6 +221,60 @@ int linux_group_join_thread(struct LinuxThreadGroup* g,
     return 0;
 }
 
+/* ─── E7 TG-1 I4: the forward lease ───────────────────────────────────────
+ * The state is the group's three fields (`fwd_busy`, `fwd_owner_tid`,
+ * `fwd_wait_mask`); this is the whole transition table. The mask is one bit
+ * per descriptor slot, so the wait list is bounded by LINUX_THREADS_MAX and
+ * needs no allocation. The BSP runs every transition with interrupts off
+ * inside a syscall, so acquire/release are atomic against each other. */
+int linux_group_fwd_acquire(struct LinuxThreadGroup* g, uint32_t tid) {
+    if (!g || !g->used || g->exiting || tid == 0) return -1;
+    if (!g->fwd_busy) {
+        g->fwd_busy = 1;
+        g->fwd_owner_tid = tid;
+        return 0;
+    }
+    return (g->fwd_owner_tid == tid) ? 0 : 1;
+}
+
+int linux_group_fwd_wait(struct LinuxThreadGroup* g, uint32_t slot) {
+    if (!g || !g->used || slot >= LINUX_THREADS_MAX) return -1;
+    g->fwd_wait_mask |= (uint8_t)(1u << slot);
+    return 0;
+}
+
+int linux_group_fwd_cancel_wait(struct LinuxThreadGroup* g, uint32_t slot) {
+    if (!g || !g->used || slot >= LINUX_THREADS_MAX) return -1;
+    g->fwd_wait_mask &= (uint8_t)~(1u << slot);
+    return 0;
+}
+
+int linux_group_fwd_release(struct LinuxThreadGroup* g, uint32_t tid) {
+    if (!g || !g->used || tid == 0) return -1;
+    if (!g->fwd_busy || g->fwd_owner_tid != tid) return -1;
+    g->fwd_busy = 0;
+    g->fwd_owner_tid = 0;
+    return 0;
+}
+
+uint32_t linux_group_fwd_next_waiter(struct LinuxThreadGroup* g) {
+    if (!g || !g->used) return LINUX_THREADS_MAX;
+    for (uint32_t i = 0; i < LINUX_THREADS_MAX; i++) {
+        if (!(g->fwd_wait_mask & (uint8_t)(1u << i))) continue;
+        g->fwd_wait_mask &= (uint8_t)~(1u << i);
+        return i;
+    }
+    return LINUX_THREADS_MAX;
+}
+
+int linux_group_fwd_grant(struct LinuxThreadGroup* g, uint32_t tid) {
+    if (!g || !g->used || g->exiting || tid == 0) return -1;
+    if (g->fwd_busy) return -1;
+    g->fwd_busy = 1;
+    g->fwd_owner_tid = tid;
+    return 0;
+}
+
 void linux_group_destroy(struct LinuxThreadGroup* g) {
     if (!g || !g->used) return;
     if (g->exiting) return;

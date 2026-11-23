@@ -903,6 +903,16 @@ static int linux_descriptor_release(struct ProcessDescriptor* pd) {
      * is only reachable while the descriptor is BLOCKED, so this is the
      * teardown net (a kill that lands on a waiter), not the normal path. */
     linux_futex_wait_cancel(pd->tid);
+    /* E7 TG-1 I4: a departing thread is neither a lease waiter (its bit would
+     * otherwise be granted to a descriptor that can never restart) nor an
+     * owner that may keep the group's only forward slot forever. The owner's
+     * release runs the normal grant path, so a sibling parked behind it is
+     * restarted here rather than at some later release that never comes. */
+    if (g) {
+        linux_group_fwd_cancel_wait(g, (uint32_t)(pd - proc_table));
+        if (g->fwd_busy && g->fwd_owner_tid == pd->tid)
+            linux_forward_lease_release(pd);
+    }
     proc_free_syscall_stack(pd);
     pd->state  = PROC_ZOMBIE;
 
@@ -1899,6 +1909,26 @@ struct ProcessDescriptor* process_find_current(void) {
      * scheduler picks it up on its next tick — one tick of handoff
      * latency in exchange for the machine staying alive. */
     if (!smp_on_bsp()) return 0;
+    /* E7 TG-1 I4: a GROUP can have more than one RUNNING thread (the leader
+     * spins in ring 3 while a sibling is inside a syscall), so "first
+     * RUNNING" is not "the caller" — it returned the leader for a sibling's
+     * trap, which made that sibling's cap_maybe_handoff read the LEADER's
+     * park_syscall (0), hand the CPU away mid-forward, and leave the reply
+     * queued with nobody parked to wake. The per-CPU syscall-stack top is
+     * written by both switches (schedule_ring3 and kernel_switch_next) to
+     * the descriptor they are entering and stays fixed for the whole
+     * syscall, so it names the executing THREAD exactly. Stacks are
+     * per-descriptor, so the match is unique. The scan below stays as the
+     * fallback for kernel-context callers and stacks that predate the
+     * field. */
+    for (int i = 0; i < PROC_MAX; i++) {
+        if (proc_table[i].is_control_plane) continue;
+        if (!proc_table[i].active || proc_table[i].state != PROC_RUNNING)
+            continue;
+        if (proc_table[i].syscall_stack_top != 0 &&
+            proc_table[i].syscall_stack_top == per_cpu_data[0].kernel_rsp)
+            return &proc_table[i];
+    }
     for (int i = 0; i < PROC_MAX; i++) {
         /* E1: the control plane is NOT a Ring-3 process. It is excluded here
          * deliberately, so every "who is asking?" caller keeps its pre-E1
@@ -2120,39 +2150,49 @@ int cap_wait_chan(uint32_t chan_id, void* recv_req) {
  * frame from it returns to the instruction after `syscall` with rax set. That
  * is deliberately NOT resume_kernel: nothing is executed on the way back, so
  * there is no second wait and no sidecar forward. */
+/* Build a "return to ring 3 from a park" frame: the entry registers the park
+ * captured, `rax` as the syscall's result, `rip` as where ring 3 resumes.
+ * I3's futex wake uses rip = the instruction after `syscall`; I4's lease grant
+ * uses rip = the `syscall` instruction itself (a Linux syscall restart), so
+ * the same frame shape serves both and neither re-runs kernel code. */
+static void linux_park_return_frame(struct ProcessDescriptor* pd, uint64_t rax,
+                                    uint64_t rip) {
+    const struct CapParkCtx* p = &pd->park_ctx;
+    uint64_t* c = (uint64_t*)&pd->ring3_ctx;
+
+    c[0]  = p->r15;  c[1]  = p->r14;  c[2]  = p->r13;  c[3]  = p->r12;
+    c[4]  = p->r11;                        /* r11 (the syscall's rflags) */
+    c[5]  = p->linux_args[3];              /* r10 */
+    c[6]  = p->linux_args[5];              /* r9  */
+    c[7]  = p->linux_args[4];              /* r8  */
+    c[8]  = p->rbp;
+    c[9]  = p->linux_args[0];              /* rdi */
+    c[10] = p->linux_args[1];              /* rsi */
+    c[11] = p->linux_args[2];              /* rdx */
+    c[12] = p->rcx;                        /* rcx: the sysret target */
+    c[13] = p->rbx;
+    c[14] = rax;
+    c[15] = rip;
+    c[16] = 0x23;                          /* ring-3 code */
+    c[17] = p->r11;                        /* rflags */
+    c[18] = p->user_rsp;
+    c[19] = 0x1B;                          /* ring-3 data */
+
+    pd->has_ring3_ctx = 1;
+    pd->user_rip      = rip;
+    pd->user_rsp      = p->user_rsp;
+}
+
 static int linux_futex_resume_thread(uint32_t tid, int32_t result) {
     for (int i = 0; i < PROC_MAX; i++) {
         struct ProcessDescriptor* pd = &proc_table[i];
-        const struct CapParkCtx* p;
-        uint64_t* c;
 
         if (!pd->active || pd->tid != tid) continue;
         if (pd->state != PROC_BLOCKED) return 0;
         if (pd->park_syscall != SYS_LINUX_FUTEX_RESUME) return 0;
 
-        p = &pd->park_ctx;
-        c = (uint64_t*)&pd->ring3_ctx;
-        c[0]  = p->r15;  c[1]  = p->r14;  c[2]  = p->r13;  c[3]  = p->r12;
-        c[4]  = p->r11;                        /* r11 (the syscall's rflags) */
-        c[5]  = p->linux_args[3];              /* r10 */
-        c[6]  = p->linux_args[5];              /* r9  */
-        c[7]  = p->linux_args[4];              /* r8  */
-        c[8]  = p->rbp;
-        c[9]  = p->linux_args[0];              /* rdi */
-        c[10] = p->linux_args[1];              /* rsi */
-        c[11] = p->linux_args[2];              /* rdx */
-        c[12] = p->rcx;                        /* rcx: the sysret target */
-        c[13] = p->rbx;
-        c[14] = (uint64_t)(int64_t)result;     /* rax: 0 or -ETIMEDOUT */
-        c[15] = p->rcx;                        /* rip: after `syscall` */
-        c[16] = 0x23;                          /* ring-3 code */
-        c[17] = p->r11;                        /* rflags */
-        c[18] = p->user_rsp;
-        c[19] = 0x1B;                          /* ring-3 data */
-
-        pd->has_ring3_ctx = 1;
-        pd->user_rip      = p->rcx;
-        pd->user_rsp      = p->user_rsp;
+        linux_park_return_frame(pd, (uint64_t)(int64_t)result,
+                                pd->park_ctx.rcx);
         pd->park_syscall  = 0;
         pd->park_req      = 0;
         pd->state         = PROC_SUSPENDED;
@@ -2229,6 +2269,97 @@ int linux_futex_block(struct ProcessDescriptor* cur, uint32_t group_id,
         (unsigned long)deadline);
     kernel_switch_next(next);   /* noreturn */
     return -LINUX_EAGAIN;       /* unreachable */
+}
+
+/* ─── E7 TG-1 I4: the per-thread forward lease, the descriptor half ───────
+ * A group has one channel pair, so only one forward may be in flight. A
+ * sibling that finds the lease held records its slot and parks WITHOUT
+ * posting: no request was described for it yet, nothing is owed, and no
+ * sidecar state names it. When the owner's reply is applied (or its forward
+ * is refused, or it exits), the release hands the lease to the lowest valid
+ * waiter and resumes it with a RESTART frame: rax = its Linux syscall number
+ * and rip = the `syscall` instruction (rip -= 2). Ring 3 reissues the trap,
+ * the first trap runs again with the same registers, and this time it owns
+ * the lease. That is Linux's own syscall-restart shape, not a kernel
+ * continuation, so no abandoned C frame is ever resumed. */
+int linux_forward_lease_wait(struct ProcessDescriptor* cur, uint32_t num) {
+    struct LinuxThreadGroup* g = linux_group_of(cur);
+    struct ProcessDescriptor* next;
+    uint32_t slot;
+
+    if (!cur || !g) return -LINUX_EINVAL;
+    slot = (uint32_t)(cur - proc_table);
+    if (linux_group_fwd_wait(g, slot) != 0) return -LINUX_EAGAIN;
+
+    proc_capture_entry_regs(&cur->park_ctx);
+    cur->park_req     = num;
+    cur->park_syscall = SYS_LINUX_LEASE_RESUME;
+    cur->state        = PROC_BLOCKED;
+
+    next = pick_next_runnable();
+    if (!next) {
+        linux_group_fwd_cancel_wait(g, slot);
+        cur->park_syscall = 0;
+        cur->state        = PROC_RUNNING;
+        return -LINUX_EAGAIN;
+    }
+    kernel_serial_printf(
+        "[E7] forward lease: TID %u group %u waits (owner %u, syscall %u)\n",
+        cur->tid, g->group_id, g->fwd_owner_tid, num);
+    kernel_switch_next(next);   /* noreturn */
+    return -LINUX_EAGAIN;       /* unreachable */
+}
+
+/* Resume a granted waiter at its `syscall` instruction, or answer EAGAIN when
+ * the two bytes below the return RIP are not a syscall (a caller shape this
+ * kernel will not rewind). */
+static void linux_forward_lease_restart(struct ProcessDescriptor* pd) {
+    uint64_t num = pd->park_req;
+    uint64_t rip = pd->park_ctx.rcx;
+    uint8_t  op[2];
+
+    pd->park_syscall = 0;
+    pd->park_req     = 0;
+    if (rip >= 2 &&
+        linux_user_copy_out(op, pd->cr3, rip - 2, 2) == 0 &&
+        op[0] == 0x0F && op[1] == 0x05) {
+        linux_park_return_frame(pd, num, rip - 2);
+    } else {
+        kernel_serial_printf(
+            "[E7] forward lease: TID %u grant cannot restart at 0x%llx (not "
+            "a syscall) — EAGAIN\n",
+            pd->tid, (unsigned long long)rip);
+        linux_park_return_frame(pd,
+                                (uint64_t)(int64_t)(-LINUX_EAGAIN), rip);
+    }
+    pd->state = PROC_SUSPENDED;
+}
+
+/* The owner is done: clear the lease, then walk the wait list until a slot
+ * names a live lease-parked descriptor. A waiter killed before its turn was
+ * already cancelled; this skip covers the slot reused between cancellation
+ * and the walk, so the lease can never be parked on a descriptor that has no
+ * restart state. */
+void linux_forward_lease_release(struct ProcessDescriptor* cur) {
+    struct LinuxThreadGroup* g = linux_group_of(cur);
+
+    if (!cur || !g) return;
+    if (linux_group_fwd_release(g, cur->tid) != 0) return;
+    for (;;) {
+        uint32_t slot = linux_group_fwd_next_waiter(g);
+        struct ProcessDescriptor* pd;
+        if (slot >= LINUX_THREADS_MAX) return;
+        pd = &proc_table[slot];
+        if (!pd->active || pd->state != PROC_BLOCKED ||
+            pd->park_syscall != SYS_LINUX_LEASE_RESUME)
+            continue;
+        if (linux_group_fwd_grant(g, pd->tid) != 0) return;
+        kernel_serial_printf(
+            "[E7] forward lease: group %u granted to TID %u\n",
+            g->group_id, pd->tid);
+        linux_forward_lease_restart(pd);
+        return;
+    }
 }
 
 /* The timer ISR's deadline hook (called beside cap_park_deadline_tick, on the

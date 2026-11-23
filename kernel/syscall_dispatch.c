@@ -172,6 +172,7 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                      * "the holder went away under us" is -EIO, never a
                      * raw CAP code. */
                     cur->park_syscall = 0;
+                    linux_forward_lease_release(cur);
                     return (uint64_t)(int64_t)linux_errno_from_cap(
                         CAP_ERR_REVOKED);
                 }
@@ -180,6 +181,11 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                                    (uint64_t)(uintptr_t)arg);
                     cur->park_syscall = 0;  /* in-flight closes HERE — the
                                             * next stray refuses again */
+                    /* I4: the reply is applied, so the group's one forward
+                     * slot is free again. The release may grant the lease to
+                     * a parked sibling and restart its syscall; that frame is
+                     * built but not entered (no switch here). */
+                    linux_forward_lease_release(cur);
                     /* E7 increment 21: the gate workload's stop, at the
                      * sysret that closes a read(fd 3). `rax` is the value
                      * the sysret will deliver and park_ctx is the read's own
@@ -1227,6 +1233,31 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                         (struct SLSLinuxSyscallRequest *)(void *)fwd;
                     *fwd_req = req;
                 }
+                /* E7 TG-1 I4: the group's forward lease. The sidecar's
+                 * channel pair is per GROUP (every thread resolves to the
+                 * leader's table), so two forwards in flight at once would
+                 * race for one reply. Acquire HERE — after every first-trap
+                 * refusal, before the stage or post — and never park owning
+                 * it: a busy sibling records its slot and parks without
+                 * posting, and the owner's release restarts it at its
+                 * `syscall` (rip -= 2), so this block runs again with the
+                 * same registers and now owns the lease. A refusal below or
+                 * the delivered reply releases it. */
+                {
+                    struct LinuxThreadGroup* lg = linux_group_of(cur);
+                    int lrc;
+                    if (!lg) return (uint64_t)(int64_t)(-LINUX_EINVAL);
+                    lrc = linux_group_fwd_acquire(lg, cur->tid);
+                    if (lrc < 0) return (uint64_t)(int64_t)(-LINUX_EINVAL);
+                    if (lrc > 0)
+                        return (uint64_t)(int64_t)linux_forward_lease_wait(
+                            cur, (uint32_t)num);
+                    if (cur->tid != lg->leader_pid)
+                        kernel_serial_printf(
+                            "[E7] forward lease: TID %u group %u acquired for "
+                            "syscall %lu\n",
+                            cur->tid, lg->group_id, (unsigned long)num);
+                }
                 /* E7 increment 12: stage the reply payload's destination
                  * HERE — after every first-trap refusal has had its say
                  * (no channel, bad attach, W|X, bad poll span — each
@@ -1254,6 +1285,7 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                  * construction. Un-arm, then map the refusal into the
                  * units this task speaks (both CAP families, one table). */
                 cur->park_syscall = 0;
+                linux_forward_lease_release(cur);   /* post refused: free */
                 cur->gate_read_pending = 0;   /* no park: no reply is owed */
                 kernel_serial_printf(
                     "[E7] linux syscall %lu (class=%s) not delivered: "

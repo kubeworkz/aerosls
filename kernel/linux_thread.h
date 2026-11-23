@@ -141,6 +141,34 @@ int linux_group_leave_thread(struct LinuxThreadGroup* g);
 int linux_group_join_thread(struct LinuxThreadGroup* g,
                             struct ProcessDescriptor* child);
 
+/* ─── E7 TG-1 I4: the group's forward lease ───────────────────────────────
+ * One in-flight forward per group. The sidecar's channel pair belongs to the
+ * group (cap_table_index resolves every thread to the leader's table), so two
+ * threads parked on it at once would race for the same reply — the echo check
+ * would turn the loser's syscall into EPROTO. The lease serializes them:
+ *
+ *   acquire 0 = the caller owns it (it was free, or already the caller's);
+ *           1 = another thread holds it, so the caller records its wait bit
+ *               and parks;
+ *           -1 = the group is gone or the tid is invalid.
+ *   wait / cancel_wait  set/clear one descriptor slot's bit (slot < 8).
+ *   release  the OWNER clears the lease. Returns 0, or -1 for a non-owner.
+ *   next_waiter  removes and returns the lowest waiting slot, or
+ *           LINUX_THREADS_MAX when none — the caller resolves that slot's
+ *           tid and calls grant, so a dead waiter is skipped rather than
+ *           leaving the lease parked on a descriptor that cannot run.
+ *   grant    hands the free lease to a tid; -1 when it is still busy.
+ *
+ * All seven are pure group-table state: no descriptor, no scheduler, so the
+ * host test drives every edge (double acquire, non-owner release, cancelled
+ * waiter, dead-waiter skip) without a boot. */
+int linux_group_fwd_acquire(struct LinuxThreadGroup* g, uint32_t tid);
+int linux_group_fwd_wait(struct LinuxThreadGroup* g, uint32_t slot);
+int linux_group_fwd_cancel_wait(struct LinuxThreadGroup* g, uint32_t slot);
+int linux_group_fwd_release(struct LinuxThreadGroup* g, uint32_t tid);
+int linux_group_fwd_grant(struct LinuxThreadGroup* g, uint32_t tid);
+uint32_t linux_group_fwd_next_waiter(struct LinuxThreadGroup* g);
+
 /* ─── E7 TG-1 I2: kernel-local clone planning ─────────────────────────────
  * Pure functions, so the Go-shape validation and the child's first ring-3
  * context are host-testable without a boot. `linux_clone_plan()` validates

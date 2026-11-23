@@ -149,6 +149,56 @@ int main(void) {
               "the next admission is refused without changing the count");
     }
 
+    /* ── 6b. I4's forward lease: one in-flight forward per group ─────────── */
+    {
+        struct LinuxThreadGroup* g = linux_group_of(&proc_table[0]);
+
+        CHECK(linux_group_fwd_acquire(g, 100) == 0 &&
+              g->fwd_busy == 1 && g->fwd_owner_tid == 100,
+              "a free lease is acquired and records its owner");
+        CHECK(linux_group_fwd_acquire(g, 100) == 0,
+              "the owner re-acquiring is not a second waiter");
+        CHECK(linux_group_fwd_acquire(g, 101) == 1,
+              "a sibling finds the lease busy");
+        CHECK(linux_group_fwd_wait(g, 3) == 0 &&
+              (g->fwd_wait_mask & (1u << 3)) != 0,
+              "a busy sibling records its descriptor slot");
+        CHECK(linux_group_fwd_wait(g, LINUX_THREADS_MAX) == -1,
+              "a slot past the mask is refused instead of aliasing bit 0");
+        CHECK(linux_group_fwd_release(g, 101) == -1 && g->fwd_busy == 1,
+              "a non-owner cannot release the lease");
+        CHECK(linux_group_fwd_grant(g, 101) == -1 &&
+              g->fwd_owner_tid == 100,
+              "granting a busy lease is refused (the owner still owns it)");
+
+        CHECK(linux_group_fwd_release(g, 100) == 0 && !g->fwd_busy &&
+              g->fwd_owner_tid == 0,
+              "the owner's release clears the lease");
+        CHECK(linux_group_fwd_next_waiter(g) == 3 &&
+              (g->fwd_wait_mask & (1u << 3)) == 0,
+              "the release path takes the lowest waiting slot exactly once");
+        CHECK(linux_group_fwd_next_waiter(g) == LINUX_THREADS_MAX,
+              "an empty wait list reports no waiter");
+        CHECK(linux_group_fwd_grant(g, 101) == 0 &&
+              g->fwd_busy == 1 && g->fwd_owner_tid == 101,
+              "the granted waiter becomes the sole owner");
+
+        /* A waiter that dies before its turn must not wedge the lease: its
+         * bit is cancelled, and the next release skips it. */
+        CHECK(linux_group_fwd_wait(g, 4) == 0 &&
+              linux_group_fwd_wait(g, 5) == 0 &&
+              linux_group_fwd_cancel_wait(g, 4) == 0 &&
+              linux_group_fwd_release(g, 101) == 0 &&
+              linux_group_fwd_next_waiter(g) == 5 &&
+              linux_group_fwd_next_waiter(g) == LINUX_THREADS_MAX,
+              "a cancelled waiter is skipped and the next slot gets the lease");
+        CHECK(linux_group_fwd_release(g, 101) == -1,
+              "a second release by the old owner is refused");
+        CHECK(linux_group_fwd_acquire(0, 100) == -1 &&
+              linux_group_fwd_wait(0, 1) == -1,
+              "a NULL group is refused by every lease call");
+    }
+
     /* ── 7. Destroy: one cap teardown, one page teardown, one identity clear ─ */
     {
         struct LinuxThreadGroup* g = linux_group_of(&proc_table[0]);

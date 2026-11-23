@@ -259,6 +259,12 @@ const FD_PAYLOAD_CAP: usize = 1024;
 /// through this module now, where the fd table lives.
 const LINUX_READ: u64 = 0;
 const LINUX_OPEN: u64 = 2;
+/// openat (257), E7 TG-1 I4: the gate's measured path open. The pathname
+/// is args[1] (args[0] is the dirfd), so the SAME path payload the kernel's
+/// plan attaches serves both open shapes; v1 resolves AT_FDCWD only and
+/// refuses any other dirfd by name rather than pretending to walk it.
+const LINUX_OPENAT: u64 = 257;
+const LINUX_AT_FDCWD: i64 = -100;
 const LINUX_CLOSE: u64 = 3;
 const LINUX_STAT: u64 = 4;
 const LINUX_LSTAT: u64 = 6;
@@ -1198,8 +1204,8 @@ fn expected_req_len(num: u64, args: &[u64; 6]) -> usize {
 fn expected_req_range(num: u64, args: &[u64; 6]) -> (usize, usize) {
     const H: usize = LINUX_SYSCALL_REQ_BYTES;
     match num {
-        LINUX_OPEN | LINUX_STAT | LINUX_LSTAT | LINUX_UNLINK | LINUX_MKDIR =>
-            (H + 1, H + LINUX_PATH_CAP + 1),
+        LINUX_OPEN | LINUX_OPENAT | LINUX_STAT | LINUX_LSTAT | LINUX_UNLINK |
+        LINUX_MKDIR => (H + 1, H + LINUX_PATH_CAP + 1),
         LINUX_RENAME => (H + 2, H + RECV_ATTACH_CAP),
         _ => (expected_req_len(num, args), expected_req_len(num, args)),
     }
@@ -1472,13 +1478,23 @@ fn answer_file<K: Kernel, A: BufferAlloc>(
          * bit outside the measured set is refused by NAME (ENOSYS) —
          * never silently dropped — and the mode rides to the VFS
          * untouched (create_file's own umask-less semantics). */
-        LINUX_OPEN => {
+        LINUX_OPEN | LINUX_OPENAT => {
+            /* openat shares open's VFS arm exactly: args[0] is the dirfd
+             * (AT_FDCWD only in v1 — any other dirfd is refused by name,
+             * never resolved against a guess), so flags are args[2] and
+             * mode args[3]. The path payload is identical because the
+             * kernel's plan reads openat's pathname from args[1]. */
+            let at = num == LINUX_OPENAT;
+            if at && args[0] as i64 != LINUX_AT_FDCWD {
+                return Answer::Reply(0, E_NOSYS);
+            }
+            let base = if at { 1 } else { 0 };
             let Some(path) = path_arg(payload, 0) else {
                 return Answer::Reply(0, E_NOSYS); /* unterminated: service's
                                                    * range let it through;
                                                    * the NUL rule refuses */
             };
-            let flags = args[1] as u32;
+            let flags = args[base + 1] as u32;
             let (vf, cloexec, want_dir) = match translate_open_flags(flags) {
                 Ok(t) => t,
                 Err(x) => return Answer::Reply(0, x),
@@ -1490,7 +1506,7 @@ fn answer_file<K: Kernel, A: BufferAlloc>(
             let opened = if want_dir {
                 vfs.open_dir(vt, path)
             } else {
-                vfs.open(vt, path, vf, args[2] as u16)
+                vfs.open(vt, path, vf, args[base + 2] as u16)
             };
             match opened {
                 Ok(vfd) => {
@@ -2591,7 +2607,8 @@ pub fn service<K: Kernel, A: BufferAlloc>(
          * module, so the fd class's read arm cannot stay kernel-side
          * (its data crosses back as the reply's payload, count-truth). */
         let ans = match num {
-            LINUX_READ | LINUX_WRITE | LINUX_OPEN | LINUX_CLOSE | LINUX_STAT
+            LINUX_READ | LINUX_WRITE | LINUX_OPEN | LINUX_OPENAT | LINUX_CLOSE
+            | LINUX_STAT
             | LINUX_LSTAT | LINUX_LSEEK | LINUX_FCNTL | LINUX_FSYNC
             | LINUX_FTRUNCATE | LINUX_RENAME | LINUX_MKDIR | LINUX_UNLINK
             |            LINUX_GETDENTS64 | LINUX_POLL | LINUX_EPOLL_CTL

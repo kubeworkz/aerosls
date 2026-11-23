@@ -617,6 +617,36 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                 Err(rc) => klog(b"[E7] futex-probe: spawn FAILED rc=", rc as u32, b""),
             }
 
+            // E7 TG-1 I4: the native openat probe. Same create path, its own
+            // payload slot; the LEADER never forwards — its cloned sibling
+            // openat(257)s "/" and close(3)s the result across the group's
+            // channels, so the replies and wakes must land on the child.
+            // tests/linux_openat_probe_check.sh asserts the markers live.
+            match crate::e7_openat_probe::spawn(&RealKernel, caps.budget_base, caps.budget_len) {
+                Ok(sp) => {
+                    match booted.proc.vfs.add_task() {
+                        Ok(vt) => {
+                            if crate::linux::track(
+                                sp.ch_r,
+                                sp.ch_w,
+                                crate::e7_openat_probe::PROBE_NAME,
+                                0,
+                                sp.heap_base,
+                                sp.heap_limit,
+                                vt,
+                                false,
+                            ) {
+                                klog(b"[E7] openat-probe: spawned ch_r=", sp.ch_r, b"");
+                            } else {
+                                klog(b"[E7] openat-probe: spawned but TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+                            }
+                        }
+                        Err(_) => klog(b"[E7] openat-probe: VFS task alloc FAILED ch_r=", sp.ch_r, b""),
+                    }
+                }
+                Err(rc) => klog(b"[E7] openat-probe: spawn FAILED rc=", rc as u32, b""),
+            }
+
             // E7 increment 7 (§5.1/§5.2): the SAME create over a REAL ELF64 image
             // — the census candidate fixture, segments at their linked vaddrs and
             // entry at e_entry — a controlled pair with the .flat probe above:
