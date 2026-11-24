@@ -7,10 +7,13 @@ since landed in the tree. TG-1 I1 (group lifecycle), I2 (kernel-local `clone`,
 `getpid`/`gettid`/`exit`, group-aware teardown), I3 (private `futex`
 wait/wake with a relative timeout) and I4 (`openat`'s measured path open and
 the per-thread forward lease) are landed, with host tests and passing native
-two-thread, futex and sibling-forward openat live probes. Current dispatch
-status and the TG-0 gap list: §7.
+two-thread, futex and sibling-forward openat live probes. I5 adds the paired
+source guard and mutation teeth and re-runs the E7 gate's live/teeth and the
+E3 multi-instance regression; the Go gate (G1.1–G1.8) remains the TG-1
+acceptance run. Current dispatch status and the TG-0 gap list: §7.
 **Date:** 2026-11-09 (measurement), 2026-11-22 (counts regeneration),
-2026-11-23 (I2/I3/I4 live probes); current-tree status noted 2026-11-23.
+2026-11-23 (I2–I5 live probes, teeth and regressions); current-tree status
+noted 2026-11-23.
 **TG-0 artifact:** `tools/go_thread_gate_census.txt` (Go 1.25.1, pinned)
 **Parent:** `docs/AeroSLS-Linux-ABI-Shim-Design-v0.1.md` §7, §8, §9 and
 Appendix B.
@@ -933,7 +936,7 @@ must fail by the clause it names.
 
 ### 6.4 Test files
 
-I1–I4 named these; the three live probes are the shipped runtime guards.
+I1–I5 named these; the three live probes are the shipped runtime guards.
 
 - `tests/linux_thread_group_host_test.c` — group ownership, limits, tid/tgid,
   teardown counts, and I4's forward-lease state machine;
@@ -944,7 +947,12 @@ I1–I4 named these; the three live probes are the shipped runtime guards.
 - `tests/linux_futex_probe_check.sh` — I3's native futex live probe;
 - `tests/linux_openat_probe_check.sh` — I4's native sibling-forward openat
   live probe (lease-acquire line for the child's TID, fd, close, teardown);
-- `tests/thread_group_check.sh` — source guard for the contracts above;
+- `tests/thread_group_check.sh` — source guard for the contracts above
+  (group ownership, clone shape, table rows, openat path, identity, lease,
+  one teardown; 47 clauses);
+- `tests/thread_group_check_smoke.sh` — its mutation teeth: each load-bearing
+  field, flag, row, path and lease transition is removed on a seeded copy and
+  must make the guard fail by clause name (13 teeth);
 - `tests/go_thread_gate_census_check.sh` — TG-0 artifact and table check;
 - `tests/go_thread_gate_check.sh` — TG-1 live gate, including teeth;
 - `tests/thread_group_ckpt_check.sh` — TG-2, reusing the E7 gate harness shape.
@@ -1038,8 +1046,24 @@ is the order; the plan owns the exact data structures, tests and teeth.
 5. Add the forward lease and per-thread `tid` request field. **Landed: I4.**
 6. Add `gettid`, `getpid`, `exit` and the measured `openat` path. The three
    task calls landed with I2; `openat` landed with I4.
-7. Land host tests and the source guard; run the native probes (I2, I3 and I4
-   are green); then run the Go gate live.
+7. **Landed: I5.** Host tests, the source guard and its 13 mutation teeth;
+   the native I2/I3/I4 probes; the E7 gate's `--live` (B1–B7, D1–D2) and
+   `--teeth` (control green, four breaks red by name); and the E3
+   multi-instance boot regression. The Go gate (G1.1–G1.8) is the remaining
+   TG-1 acceptance run.
+
+**Measured 2026-11-23 (I5):** `thread_group_check.sh` passes its 47 clauses
+with 0 failures and the smoke bites all 13 mutations. `e7_gate_check.sh
+--live` is green (B1–B7, D1–D2); `--teeth` leaves the control green and
+reddens exactly the declared clauses (descriptor B2/B3/B4, no-fd B3/B4,
+no-heap B4/B5, fs_base B2/B4/B5). `e3_multi_env_boot_check.sh` is green
+(distinct tenant regions 0x12310000 and 0x12910000, three live rootfs lines,
+no serial loss). The I2/I3/I4 native probes remain green from their
+increments. The E3 check is green on the sixth 300 s TCG boot; earlier boots
+either stalled before the gate or lost init's console copy of the storage
+lines. The window is 300 s because the E7 native probes boot on that image
+too; the poll still exits as soon as the gate opens, and lost evidence still
+fails by name.
 
 Exit: G1.1–G1.8 pass on a live boot, with the existing E7 gate still green.
 
@@ -1148,4 +1172,6 @@ The next step is not another sketch: the record-only `rt_sigaction` path, the
 four netpoll startup arms and the clone/thread-group/private-futex/openat
 slice are in the tree, with three native probes green. No TG-1 table gap §7
 lists remains; the forward lease is what turns a cloned sibling's forwarded
-syscall into a correct wake, and the live Go gate (G1.1–G1.8) is next.
+syscall into a correct wake. I5's source guard and mutation teeth hold the
+seams, and the E7 gate's live/teeth and E3 regressions are green; the live Go
+gate (G1.1–G1.8) is the remaining acceptance run.

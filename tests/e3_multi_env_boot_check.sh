@@ -74,8 +74,11 @@ ISO="${E3_ISO:-sls_operating_system_e3.iso}"
 QEMU="${E3_QEMU:-qemu-system-x86_64}"   # overridable so the teeth can feed a
                                           # canned boot log without an ISO
 LOG=/tmp/aerosls_e3_multi_env.log
-WINDOW_S=120              # the tenant envs are spawned last (after the system
-                          # POSIX's network boot), so give the whole chain room
+WINDOW_S=300              # the tenant envs are spawned last (after the system
+                          # POSIX's network boot AND the E7 native probes that
+                          # now boot on this image), so give the whole chain
+                          # room; the poll below still exits as soon as the
+                          # gate opens, so a healthy boot pays nothing for it
 
 [ -f "$ISO" ] || { echo "ABORT: $ISO missing — build it with: make x86-iso-e3" >&2; exit 2; }
 command -v "${QEMU%% *}" >/dev/null 2>&1 || { echo "ABORT: ${QEMU%% *} not installed" >&2; exit 2; }
