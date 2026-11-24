@@ -872,6 +872,10 @@ fn spawn_e3_tenant_envs(
         }
     }
     log(console, "[INIT] E3: tenant environments spawned.");
+    // The console copy above is for a human reading the boot; the check reads
+    // THIS one, because the console path can drop the copy while every tenant
+    // spawned. Same drop-proof serial path as the [E3-ENV] storage lines.
+    serial_log("[E3-ENV] done: tenant environments spawned.\n");
 }
 
 /// Spawn the network driver through the real kernel path (`SYS_SLS_CREATE_SIDECAR`).

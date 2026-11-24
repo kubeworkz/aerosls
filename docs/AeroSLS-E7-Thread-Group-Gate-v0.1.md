@@ -1065,7 +1065,10 @@ lines, no serial loss, zero E7 probe lines), and its smoke passes 10/10.
 The storage evidence now rides init's `SYS_SLS_SERIAL_WRITE` path as
 `[E3-ENV] env N: ... storage @ 0x...`, the same drop-proof wire as
 `[POSIX] aero state=`; the `[INIT] E3 env ...` console copy remains for human
-reading, and the check no longer parses it. The E3 image's system POSIX also
+reading, and the check no longer parses it. The done-marker rides the same
+wire as `[E3-ENV] done: tenant environments spawned.`, so the check never
+reports a lost console marker; its console copy also remains. The E3 image's
+system POSIX also
 carries a new `FLAG_E3_PROFILE` manifest bit (copied to the BIB as
 `BOOT_INFO_FLAG_E3_PROFILE`), which makes it skip the E7 native-probe and
 first-user census block; that block still runs on the plain image. The

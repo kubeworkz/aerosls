@@ -98,16 +98,16 @@ QPID=$!
 # '[POSIX] aero state=00000000' lines, i.e. the system POSIX plus BOTH tenants
 # have each brought up a live (formatted) rootfs.
 #
-# init's "tenant environments spawned" marker is REPORTED, not gating. It
-# travels init's sidecar-console path, which is the lossy one — the kernel
-# coalesces sidecar messages and demonstrably drops bytes (measured: that
-# marker is present in one boot and absent in the next, with every other line
-# of the same batch intact). Gating on it made the guard fail on a machine that
-# had reported the very property it asserts, and "the log does not show X" is
-# not evidence that X did not happen. The three live-rootfs lines are NOT
-# console-derived: each is a SYS_SLS_SERIAL_WRITE (165) straight to the UART,
-# per line, under the kernel TX lock, and kernel TX during a loopback window is
-# no longer discarded (deferred and replayed at release — kernel/kernel_io.c),
+# init's "tenant environments spawned" marker is REPORTED, not gating, and it
+# now rides the same drop-proof path as the storage evidence: init writes a
+# `[E3-ENV] done: ...` line with SYS_SLS_SERIAL_WRITE (165) beside the console
+# copy. The console copy is the lossy one — the kernel coalesces sidecar
+# messages and demonstrably drops bytes — so the check reads only the serial
+# marker. Gating on a console marker made the guard fail on a machine that had
+# reported the very property it asserts, and "the log does not show X" is not
+# evidence that X did not happen. The three live-rootfs lines are also
+# serial-derived, under the kernel TX lock; kernel TX during a loopback window
+# is no longer discarded (deferred and replayed at release — kernel/kernel_io.c),
 # so this evidence is drop-proof up to the kernel's ring bound. Past that bound
 # the log is a lower bound, not an absence, and this check says so by name
 # instead of reporting a `2/3` boot verdict (the evidence-integrity clause
@@ -115,7 +115,7 @@ QPID=$!
 #
 # The marker's absence is still stated in the verdict, because silently
 # tolerating it would hide a real init regression behind a shrug.
-done_marker="tenant environments spawned"
+done_marker="[E3-ENV] done: tenant environments spawned."
 live_re="\[POSIX\] aero state=00000000"
 marker_seen=0
 booted=0
@@ -260,9 +260,9 @@ fi
 
 # Reported, never gating -- see the gate's own comment above.
 if [ "$marker_seen" -eq 1 ]; then
-    echo "ok:   init reported every tenant spawn attempt (E3 done-marker seen)"
+    echo "ok:   init reported every tenant spawn attempt (E3 done-marker seen on the serial path)"
 else
-    echo "note: init's E3 done-marker was not seen in this log (sidecar-console loss) —"
+    echo "note: init's E3 done-marker was not seen on the serial path —"
     echo "      not gating: the three live-rootfs lines above are the property itself"
 fi
 

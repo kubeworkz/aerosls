@@ -20,11 +20,10 @@
 #   overflow-full  -> FAIL  three live rootfs AND an overflow: a full count does
 #                           not excuse a log the kernel admits it truncated
 #   shared-storage -> FAIL  both tenants handed the same region (not isolated)
-#   marker-lost    -> PASS  the hardening tooth: the sidecar console dropped
-#                           init's marker, and the boot is still correct. This
-#                           is the byte-loss case that made the guard fail on a
-#                           healthy machine before the gate was narrowed to the
-#                           drop-proof evidence.
+#   marker-lost    -> PASS  the hardening tooth: the serial done-marker is
+#                           absent, and the boot is still correct. The check
+#                           reads only the serial marker now, so a lost console
+#                           copy can never make a healthy boot look short.
 #   marker-only    -> FAIL  init finished spawning and no POSIX reported a live
 #                           rootfs: the gate must NOT be satisfiable by init's
 #                           own account of itself.
@@ -83,7 +82,7 @@ STUB
 chmod +x "$WORK/stubqemu"
 
 # A canned boot log: $1 = how many live-rootfs lines, $2 = storage addresses
-# ('same' shares one address), $3 = include init's done-marker (yes/no),
+# ('same' shares one address), $3 = include the serial done-marker (yes/no),
 # $4 = output file, $5 = emit the kernel's overflow line (yes/no).
 mklog() {
     local n="$1" mode="$2" marker="$3" out="$4" overflow="${5:-no}"
@@ -104,7 +103,7 @@ mklog() {
         echo "[INIT] E3 env 1: aerosls.posix.1 spawned"
         echo "[INIT] E3 env 2: drv.ramdisk.2 spawned"
         echo "[INIT] E3 env 2: aerosls.posix.2 spawned"
-        [ "$marker" = yes ] && echo "[INIT] E3: tenant environments spawned."
+        [ "$marker" = yes ] && echo "[E3-ENV] done: tenant environments spawned."
         # n = number of instances reporting a live rootfs (3 = system + both tenants)
         for i in $(seq 1 "$n"); do
             echo "[POSIX] loop exit0=0000FEED "
@@ -202,16 +201,16 @@ arm "three live rootfs + kernel overflow -> FAIL named as evidence loss" 1 \
     "serial evidence was lost during a loopback window" \
     "no serial evidence was dropped"
 
-# ─── Arm 3: the hardening tooth — the console lost init's marker ───────────
-# Before the gate was narrowed to the drop-proof evidence, this boot FAILED.
+# ─── Arm 3: the hardening tooth — the serial done-marker is absent ─────────
+# The marker is reported, not gating; the live-rootfs evidence still passes.
 mklog 3 distinct no "$WORK/nomarker.log"
 cat > "$WORK/run" <<EOF
 #!/usr/bin/env bash
 E3_ISO="$DUMMY_ISO" E3_QEMU="$WORK/stubqemu" E3_STUB_LOG="$WORK/nomarker.log" bash $GUARD
 EOF
 chmod +x "$WORK/run"
-arm "three live rootfs, init marker lost to the console -> PASS" 0 \
-    "done-marker was not seen in this log"
+arm "three live rootfs, serial done-marker absent -> PASS" 0 \
+    "done-marker was not seen on the serial path"
 
 # ─── Arm 4: the tenants were NOT isolated ──────────────────────────────────
 mklog 3 same yes "$WORK/same.log"
@@ -242,6 +241,7 @@ arm "init reports both spawns, no live rootfs -> FAIL" 1 "live rootfs: 0/3"
     printf '%s\n' "[E3-ENV] env 1: drv.ramdisk.1 storage @ 0x12310000, aerosls.posix.1 heap @ 0x12410000"
     printf '%s\n' "[E3-ENV] env 2: drv.ramdisk.2 storage @ 0x12910000, aerosls.posix.2 heap @ 0x12a10000"
     printf '%s' "[INIT] E3 env 1: drv.ramdisk.1 spawned[INIT] E3 env 1: aerosls.posix.1 spawned"
+    printf '%s\n' "[E3-ENV] done: tenant environments spawned."
     printf '%s\n' "[INIT] E3: tenant environments spawned."
     # The live-rootfs lines are one per line: each is its own SYS_SLS_SERIAL_WRITE
     # with a trailing newline, under the kernel TX lock — the console coalesces
