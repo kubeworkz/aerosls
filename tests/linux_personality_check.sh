@@ -1290,6 +1290,10 @@ if grep -qF 'LINUX: the gate environment (sidecar + Linux tenant) captures as on
    grep -qF 'GROUP: the sibling is a distinct (group 101, index 1) with no duplicate shared pages' "$EPHUT" && \
    grep -qF 'GROUP: both thread contexts are installed into their own descriptors' "$EPHUT" && \
    grep -qF "GROUP: the leader's shared cursors are restored once, and the sibling does not overwrite them" "$EPHUT" && \
+   grep -qF "CHURN: the exiting clone's record entry is dropped by group/index" "$EPHUT" && \
+   grep -qF 'CHURN: a later capture still succeeds after the cloned thread exits' "$EPHUT" && \
+   grep -qF 'CHURN: the recaptured payload no longer names the dead group thread' "$EPHUT" && \
+   grep -qF 'env_ckpt_linux_group_thread_drop(' "$DISP" && \
    grep -qF 'DUP: one vaddr twice with different bytes is refused by name, before any pour' "$EPHUT" && \
    grep -qF 'DUP: the refusal names the first entry and the duplicate' "$EPHUT" && \
    grep -qF 'V3: a v3 blob is refused by format before any pour (the v4 task stride is not its stride)' "$EPHUT" && \
@@ -1301,9 +1305,9 @@ if grep -qF 'LINUX: the gate environment (sidecar + Linux tenant) captures as on
    grep -qF 'FORM: a parked Linux tenant is refused by name' "$EPHUT" && \
    grep -qF 'the stamp fills the Linux slot' "$ECKHUT" && \
    grep -qF 'a replay whose create names the same three tasks IS the same environment' "$ECKHUT"; then
-    ok "W6. both host tests drive the increment: the payload round trip (bytes, perms, per-thread group contexts and shared-page ownership), the duplicate-page refusal, the v3-stride refusal, the corrupt soft-permission refusals with both a=8 operand assertions, and the record layer's stamp/identity clauses — each claim runs against the real kernel file, not a model of it"
+    ok "W6. both host tests drive the increment: the payload round trip (bytes, perms, per-thread group contexts and shared-page ownership), the sibling-exit churn recapture, the duplicate-page refusal, the v3-stride refusal, the corrupt soft-permission refusals with both a=8 operand assertions, and the record layer's stamp/identity clauses — each claim runs against the real kernel file, not a model of it"
 else
-    bad "W6. a host-test clause for the Linux payload is missing — the group capture/restore, the duplicate-page refusal, the v3-stride refusal, a corrupt soft-permission refusal or the record stamp would be a claim no test runs"
+    bad "W6. a host-test clause for the Linux payload is missing — the group capture/restore or churn recapture, the duplicate-page refusal, the v3-stride refusal, a corrupt soft-permission refusal or the record stamp would be a claim no test runs"
 fi
 
 # ─── X. E7 increment 25: munmap, the memory class's last seam ─────────────

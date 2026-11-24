@@ -679,6 +679,11 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                 if (num == LINUX_GETTID)
                     return (uint64_t)cur->tid;
                 if (num == LINUX_EXIT) {
+                    struct LinuxThreadGroup* eg = linux_group_of(cur);
+                    if (eg && !cur->is_group_leader)
+                        (void)env_ckpt_linux_group_thread_drop(
+                            cur->partition_id, eg->group_id,
+                            cur->thread_index);
                     kernel_serial_printf(
                         "[E7] exit(%lu) from TID %u group %u: thread-local "
                         "teardown (no sidecar request)\n",

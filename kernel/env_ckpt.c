@@ -521,6 +521,56 @@ int env_ckpt_linux_group_thread_stamp(uint32_t partition_id,
     return 0;
 }
 
+// A thread that exits is no longer a capture target. The descriptor's group
+// identity is cleared at the same teardown, so leaving the entry behind would
+// make every later capture of the surviving threads fail to resolve it. Shift
+// the survivors down (payload task indices are positional, not identities)
+// and validate the record as a whole, rolling the shift back if it would not.
+int env_ckpt_linux_group_thread_drop(uint32_t partition_id,
+                                     uint32_t group_id,
+                                     uint16_t thread_index) {
+    if (group_id == 0 || thread_index == 0) return 0;
+    if (thread_index >= ENV_CKPT_MAX_THREADS) return 0;
+
+    for (uint32_t i = 0; i < env_ckpt_count; i++) {
+        struct EnvCkptRecord* rec = &env_ckpt_table[i];
+        if (rec->magic != ENV_CKPT_REC_MAGIC) continue;
+        if (rec->partition_id != partition_id) continue;
+
+        for (uint32_t t = 0; t < rec->n_tasks && t < ENV_CKPT_MAX_TASKS; t++) {
+            struct EnvCkptTask* tk = &rec->tasks[t];
+            if (tk->kind != ENV_CKPT_TASK_LINUX || tk->group_id != group_id ||
+                tk->thread_index != thread_index)
+                continue;
+            if (tk->leader) return 0;
+
+            uint32_t old_n = rec->n_tasks;
+            struct EnvCkptTask removed = rec->tasks[t];
+            for (uint32_t j = t; j + 1 < old_n; j++)
+                rec->tasks[j] = rec->tasks[j + 1];
+            rec->n_tasks = old_n - 1;
+            if (env_ckpt_valid(rec) != ENV_CKPT_REFUSE_NONE) {
+                for (uint32_t j = old_n - 1; j > t; j--)
+                    rec->tasks[j] = rec->tasks[j - 1];
+                rec->tasks[t] = removed;
+                rec->n_tasks = old_n;
+                return 0;
+            }
+            ec_memset(&rec->tasks[old_n - 1], 0,
+                      (uint32_t)sizeof rec->tasks[old_n - 1]);
+            ckpt_mark_dirty(CKPT_REGION_ENV);
+            kernel_serial_printf(
+                "[ENV_CKPT] linux thread group=%u thread=%u left partition=%u "
+                "index=%u (tasks=%u)\n",
+                (unsigned)group_id, (unsigned)thread_index,
+                (unsigned)rec->partition_id, (unsigned)rec->index,
+                (unsigned)rec->n_tasks);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int env_ckpt_drop(uint32_t partition_id, uint32_t index) {
     int slot = ec_find_slot(partition_id, index);
     if (slot < 0) return 1;

@@ -1148,6 +1148,53 @@ int main(void) {
           linux_group_mmap_top(&proc_table[1]) == L_HEAP + 0x4000ull,
           "GROUP: the leader's shared cursors are restored once, and the sibling does not overwrite them");
 
+    /* TG-2b churn: a cloned sibling can exit while the leader and sidecar
+     * remain. Its descriptor identity is cleared at exit, so a record that
+     * still names it would make the next capture fail to resolve the group.
+     * Drop the entry, clear the descriptor the way exit does, and recapture. */
+    CHECK(setup_and_capture_group() == 1,
+          "CHURN: a fresh group payload is captured before the sibling exits");
+    {
+        struct LinuxThreadGroup* g = linux_group_of(&proc_table[2]);
+        CHECK(g != 0 &&
+              env_ckpt_linux_group_thread_drop(L_PART, G_GROUP, 1) == 1,
+              "CHURN: the exiting clone's record entry is dropped by group/index");
+        proc_table[2].state = PROC_ZOMBIE;
+        linux_group_clear_identity(&proc_table[2]);
+        proc_table[2].active = 0;
+        (void)linux_group_leave_thread(g);
+    }
+    {
+        const struct EnvCkptRecord* rec = env_ckpt_find(L_PART, L_IDX);
+        int dead_named = 0;
+        CHECK(rec != 0 && rec->n_tasks == 2,
+              "CHURN: the record keeps only the sidecar and the live leader");
+        for (uint32_t t = 0; rec && t < rec->n_tasks; t++)
+            if (rec->tasks[t].group_id == G_GROUP &&
+                rec->tasks[t].thread_index == 1)
+                dead_named = 1;
+        CHECK(!dead_named,
+              "CHURN: the record no longer names the dead group thread");
+    }
+    CHECK(env_payload_capture_all() == 1,
+          "CHURN: a later capture still succeeds after the cloned thread exits");
+    CHECK(blob_load_head_and_index(),
+          "CHURN: the post-exit payload can be read back");
+    {
+        struct EnvPayloadHead* h = (struct EnvPayloadHead*)g_blob_head;
+        int dead_named = 0;
+        CHECK(h->n_tasks == 2 && h->n_pages == 9,
+              "CHURN: the recaptured blob carries the two live tasks and only the nine unique pages");
+        for (uint32_t t = 0; t < h->n_tasks; t++) {
+            struct EnvPayloadTask tk;
+            if (blob_task_at(h, t, &tk) && tk.group_id == G_GROUP &&
+                tk.thread_index == 1)
+                dead_named = 1;
+        }
+        CHECK(!dead_named,
+              "CHURN: the recaptured payload no longer names the dead group thread");
+    }
+
     /* A shared root with the same vaddr twice is only coherent when both
      * records describe the same page. A different CRC is a corrupt shared
      * page index, refused by its own name before the pour. */

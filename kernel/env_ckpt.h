@@ -314,6 +314,18 @@ int env_ckpt_linux_group_thread_stamp(uint32_t partition_id,
                                       const char* child_name,
                                       uint64_t entry);
 
+/* A clone that exits can no longer be captured: its descriptor is cleared as
+ * the thread leaves, so a record that still names it would make every later
+ * capture of the group fail its identity lookup. Remove that sibling entry by
+ * (partition, group, thread index), keeping the rest of the record dense and
+ * in order. The leader is deliberately not removable while siblings live: its
+ * descriptor stays as the group's zombie identity. Returns 1 when the entry
+ * was removed, 0 when there is no such sibling (or the layout would no longer
+ * validate). Idempotent. */
+int env_ckpt_linux_group_thread_drop(uint32_t partition_id,
+                                     uint32_t group_id,
+                                     uint16_t thread_index);
+
 /* Drop the record for (partition_id, index), if any. */
 int env_ckpt_drop(uint32_t partition_id, uint32_t index);
 

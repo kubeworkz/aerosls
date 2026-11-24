@@ -223,7 +223,11 @@ the eight-thread group cap), while the registration wire keeps its own
 `ENV_CKPT_REG_TASKS = 4`, so the 200-byte `struct EnvCkptRegister` body is unchanged.
 `EnvCkptTask` carries a group id, a stable group-relative thread index and a
 leader flag; the record version is 2. The group leader is stamped after
-`linux_group_create`, and each clone appends its thread record.
+`linux_group_create`, and each clone appends its thread record. A clone that
+exits drops its entry by `(group_id, thread_index)` before its descriptor
+identity is cleared, so a later capture still resolves the surviving members
+instead of failing on a dead thread. The payload host test exits one sibling,
+recaptures, and checks that neither the record nor the blob names it.
 
 TG-2b landed the payload half: `ENV_PAYLOAD_REC_VERSION` is 4 and every
 `EnvPayloadTask` carries its group id, thread index and leader flag. A group's
