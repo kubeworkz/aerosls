@@ -7,7 +7,7 @@
 
 use aerosls_proto::manifest::{
     Bootstrap, Budget, CapKind, Cpu, Image, Limits, Manifest, ManifestCap,
-    build_manifest, crc32, FLAG_GATE, HEADER_LEN,
+    build_manifest, crc32, FLAG_E3_PROFILE, FLAG_GATE, HEADER_LEN,
 };
 use alloc::vec::Vec;
 
@@ -138,7 +138,12 @@ pub fn build_posix_manifest(
     let m = Manifest {
         version_major: 1,
         version_minor: 0,
-        flags: 0,
+        // E3 profile: when this init was built with `e3_envs`, the image boots
+        // tenant environments. The kernel copies the bit into the BIB, and the
+        // system POSIX skips the E7 census workload (native probes and the
+        // first-user measurement): those are instruments for the plain image,
+        // and on E3 their serial traffic delays tenant boot for no E3 result.
+        flags: if cfg!(feature = "e3_envs") { FLAG_E3_PROFILE } else { 0 },
         name: Some(POSIX_MANIFEST_NAME),
         personality: Some("aerosls.posix.v1"),
         image: Some(Image {

@@ -1048,6 +1048,18 @@ struct SidecarManifest {
 #define SIDECAR_MANIFEST_FLAG_GATE 0x0002u
 #define SIDECAR_BIB_FLAG_GATE      0x4u
 
+/* POSIX-Environments E3: the E3 profile. The E3 init sets this manifest
+ * bit on its system POSIX manifest when it was built with e3_envs, and the
+ * create copies it into the BIB (BOOT_INFO_FLAG_E3_PROFILE,
+ * user/proto/src/bootinfo.rs). It is a profile selector, not a grant: the
+ * system sidecar uses it to skip the E7 census workload (native probes and
+ * the first-user measurement) on an image whose boot already carries
+ * tenant environments, so that work cannot compete with tenant boot for
+ * the drop-proof wire. The plain E7 image never sets it, so its census
+ * still runs. */
+#define SIDECAR_MANIFEST_FLAG_E3_PROFILE 0x0004u
+#define SIDECAR_BIB_FLAG_E3_PROFILE      0x8u
+
 /* E6: the sidecar's OWN identity, the third thing a sidecar cannot otherwise
  * observe. Until now a sidecar could not learn what the kernel called it: the
  * BIB carried cap NAMES ("console", "budget") but never the manifest's NAME

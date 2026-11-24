@@ -1049,21 +1049,30 @@ is the order; the plan owns the exact data structures, tests and teeth.
 7. **Landed: I5.** Host tests, the source guard and its 13 mutation teeth;
    the native I2/I3/I4 probes; the E7 gate's `--live` (B1–B7, D1–D2) and
    `--teeth` (control green, four breaks red by name); and the E3
-   multi-instance boot regression. The Go gate (G1.1–G1.8) is the remaining
-   TG-1 acceptance run.
+   multi-instance boot regression, whose storage evidence now rides the
+   serial wire and whose image no longer runs the E7 census. The Go gate
+   (G1.1–G1.8) is the remaining TG-1 acceptance run.
 
-**Measured 2026-11-23 (I5):** `thread_group_check.sh` passes its 47 clauses
-with 0 failures and the smoke bites all 13 mutations. `e7_gate_check.sh
---live` is green (B1–B7, D1–D2); `--teeth` leaves the control green and
-reddens exactly the declared clauses (descriptor B2/B3/B4, no-fd B3/B4,
-no-heap B4/B5, fs_base B2/B4/B5). `e3_multi_env_boot_check.sh` is green
-(distinct tenant regions 0x12310000 and 0x12910000, three live rootfs lines,
-no serial loss). The I2/I3/I4 native probes remain green from their
-increments. The E3 check is green on the sixth 300 s TCG boot; earlier boots
-either stalled before the gate or lost init's console copy of the storage
-lines. The window is 300 s because the E7 native probes boot on that image
-too; the poll still exits as soon as the gate opens, and lost evidence still
-fails by name.
+**Measured 2026-11-23 (I5); E3 determinism rerun 2026-11-24:**
+`thread_group_check.sh` passes its 47 clauses with 0 failures and the smoke
+bites all 13 mutations. `e7_gate_check.sh --live` is green (B1–B7, D1–D2);
+`--teeth` leaves the control green and reddens exactly the declared clauses
+(descriptor B2/B3/B4, no-fd B3/B4, no-heap B4/B5, fs_base B2/B4/B5).
+`e3_multi_env_boot_check.sh` is green on the FIRST 300 s TCG boot after the
+fix (distinct tenant regions 0x12469000 and 0x12b24000, three live rootfs
+lines, no serial loss, zero E7 probe lines), and its smoke passes 10/10.
+
+The storage evidence now rides init's `SYS_SLS_SERIAL_WRITE` path as
+`[E3-ENV] env N: ... storage @ 0x...`, the same drop-proof wire as
+`[POSIX] aero state=`; the `[INIT] E3 env ...` console copy remains for human
+reading, and the check no longer parses it. The E3 image's system POSIX also
+carries a new `FLAG_E3_PROFILE` manifest bit (copied to the BIB as
+`BOOT_INFO_FLAG_E3_PROFILE`), which makes it skip the E7 native-probe and
+first-user census block; that block still runs on the plain image. The
+300 s window remains for TCG, but the gate now opens as soon as the evidence
+arrives (the rerun returned inside 75 s), and lost evidence still fails by
+name. The I2/I3/I4 native probes remain green from their increments, and
+their plain-image boot is unchanged.
 
 Exit: G1.1–G1.8 pass on a live boot, with the existing E7 gate still green.
 

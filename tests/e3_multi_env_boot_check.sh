@@ -14,8 +14,8 @@
 # syscall, the partition-scoped sidecar registry (E2, so drv.ramdisk.1/.2
 # coexist with the system's drv.ramdisk.0), the tenant manifest profile (no
 # hardware/network caps), and the POSIX self-format path. A regression anywhere
-# there shows up as a missing/failed '[INIT] E3 ...' line or as the two tenants
-# colliding on one storage region. This smoke makes CI see it.
+# there shows up as a missing/failed '[E3-ENV] ...' serial line or as the two
+# tenants colliding on one storage region. This smoke makes CI see it.
 #
 # The core E3 property asserted here is ISOLATION BY CONSTRUCTION: the two
 # tenant environments are handed DISTINCT storage base addresses (independent
@@ -200,22 +200,17 @@ fi
 # per-env "…spawned" lines init logs.
 
 # The core E3 property: the two tenants got DISTINCT storage base addresses
-# (independent k_alloc_region runs — their block devices cannot alias). Parse
-# the 'storage @ 0x...' address out of each env's region line.
-# Deliberately loose about the LABEL and strict about the FACT. Two shapes have
-# to survive: init's console output can lose a byte (the observed damage lands on
-# names, not addresses), AND it is coalesced — the kernel's console buffer
-# concatenates sidecar messages, so `E3 env 1: …` routinely sits at the END of a
-# long line that already carries another '0x' address (`[INIT] e1000 BAR0 @
-# 0xfeb80000 … [INIT] E3 env 1: drv.ramdisk.1 storage @ 0x1230e000`). Taking "the
-# first 0x on the line" silently reads the BAR instead of the region — measured,
-# and it made two genuinely distinct regions compare equal. So: anchor at
-# `E3 env N:` and take the first hex AFTER it, skipping nothing that could hide
-# another address (`[^@]*` cannot cross the storage address's own `@`).
-# A damaged ADDRESS digit still cannot pass silently -- see the alignment check
-# below, which a mis-parsed hex digit breaks in 15 cases out of 16.
+# (independent k_alloc_region runs — their block devices cannot alias).
+#
+# The address is read from `[E3-ENV] env N: ... storage @ 0x...`, which init
+# emits over SYS_SLS_SERIAL_WRITE (165), NOT the console channel. The console
+# path coalesces sidecar messages and can drop this line while both tenants
+# are healthy; the serial path is the same drop-proof one the tenants' own
+# `[POSIX] aero state=` lines use, so the check no longer depends on console
+# luck. The `[^@]*` anchor keeps the parse from taking the heap address that
+# follows in the same line.
 addr_of() {
-    grep -aoE "E3 env $1: [^@]*@ 0x[0-9a-fA-F]+" "$LOG" \
+    grep -aoE "E3-ENV\] env $1: [^@]*@ 0x[0-9a-fA-F]+" "$LOG" \
         | head -1 | grep -aoE "0x[0-9a-fA-F]+" | head -1
 }
 s1="$(addr_of 1)"
@@ -228,7 +223,7 @@ for a in "$s1" "$s2"; do
 done
 if [ -z "$s1" ] || [ -z "$s2" ]; then
     echo "FAIL  could not read both tenant storage addresses (env1='$s1' env2='$s2')" >&2
-    grep -aE "\[INIT\] E3 env [0-9]+: .* storage @" "$LOG" >&2
+    grep -aE "\[E3-ENV\] env [0-9]+: .* storage @" "$LOG" >&2
     fail=1
 elif [ "$align_ok" -eq 0 ]; then
     echo "FAIL  a tenant storage address is not page-aligned (env1='$s1' env2='$s2') — a damaged log line, not a boot failure" >&2
@@ -258,8 +253,8 @@ fi
 
 if [ "$fail" -ne 0 ]; then
     echo "FAIL  E3 multi-instance boot check failed" >&2
-    echo "      init E3 lines seen:" >&2
-    grep -aE "\[INIT\] E3" "$LOG" >&2
+    echo "      init E3 lines seen (serial evidence and console copy):" >&2
+    grep -aE "\[E3-ENV\]|\[INIT\] E3" "$LOG" >&2
     exit 1
 fi
 

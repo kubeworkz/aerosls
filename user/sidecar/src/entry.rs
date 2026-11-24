@@ -520,7 +520,15 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     // selector, not a grant: the tenant's caps are exactly the plain
     // profile's, and the BIB is the one thing every sidecar already reads.
     let gate = bib.is_gate_profile();
-    if census_host || gate {
+    // POSIX-Environments E3: an E3 image's system POSIX carries
+    // FLAG_E3_PROFILE (BOOT_INFO_FLAG_E3_PROFILE). Its boot already carries
+    // three tenant environments, and the E7 census work below (the native
+    // probes and the first-user measurement) is an instrument for the plain
+    // image: on E3 it only competes with those tenants for the serial wire
+    // and boot time. A gate TENANT is a different manifest and does not carry
+    // the flag, so the E7 gate image still runs its own workload.
+    let e3_profile = bib.is_e3_profile();
+    if (census_host || gate) && !e3_profile {
         if !gate {
             // E7 boot proof (Linux ABI Shim Design §3.3 steps 5-7): spawn the
             // Linux-personality probe from THIS sidecar — the design-true creator

@@ -91,12 +91,14 @@ mklog() {
         echo "[SIDECAR] PID 104 'aerosls.posix.0': wired chan 'console' to kernel service 'kernel.debug.console' (slots 3/4, kernel end 14/15)"
         echo "[POSIX] boot: rw=06 rr=05 cw=03 nw=08"
         echo "[INIT] E3: spawning tenant POSIX environments..."
+        # The storage evidence is the SERIAL line, not the console copy: the
+        # check must pass with the console storage line absent.
         if [ "$mode" = same ]; then
-            echo "[INIT] E3 env 1: drv.ramdisk.1 storage @ 0x12310000, aerosls.posix.1 heap @ 0x12410000"
-            echo "[INIT] E3 env 2: drv.ramdisk.2 storage @ 0x12310000, aerosls.posix.2 heap @ 0x12a10000"
+            echo "[E3-ENV] env 1: drv.ramdisk.1 storage @ 0x12310000, aerosls.posix.1 heap @ 0x12410000"
+            echo "[E3-ENV] env 2: drv.ramdisk.2 storage @ 0x12310000, aerosls.posix.2 heap @ 0x12a10000"
         else
-            echo "[INIT] E3 env 1: drv.ramdisk.1 storage @ 0x12310000, aerosls.posix.1 heap @ 0x12410000"
-            echo "[INIT] E3 env 2: drv.ramdisk.2 storage @ 0x12910000, aerosls.posix.2 heap @ 0x12a10000"
+            echo "[E3-ENV] env 1: drv.ramdisk.1 storage @ 0x12310000, aerosls.posix.1 heap @ 0x12410000"
+            echo "[E3-ENV] env 2: drv.ramdisk.2 storage @ 0x12910000, aerosls.posix.2 heap @ 0x12a10000"
         fi
         echo "[INIT] E3 env 1: drv.ramdisk.1 spawned"
         echo "[INIT] E3 env 1: aerosls.posix.1 spawned"
@@ -230,18 +232,16 @@ EOF
 chmod +x "$WORK/run"
 arm "init reports both spawns, no live rootfs -> FAIL" 1 "live rootfs: 0/3"
 
-# ─── Arm 6: init's console output as the kernel really emits it ────────────
-# ONE coalesced line carrying an EARLIER 0x address (the e1000 BAR) before the
-# E3 lines. The kernel's console buffer concatenates sidecar messages, and a
-# looser parse that took "the first 0x on the line" read the BAR as the tenant
-# storage base — reporting two genuinely distinct regions as shared. This arm
-# is that shape.
+# ─── Arm 6: the serial evidence survives console noise ────────────────────
+# The console stream still carries a coalesced line with an EARLIER 0x address
+# (the e1000 BAR), and the storage evidence arrives on its own serial lines.
+# The check must parse the serial line, not the first 0x on a console blob.
 {
     printf '%s' "[INIT] e1000 BAR0 @ 0xfeb80000 -> POSIX manifest DEV cap 'nic0.bar0'"
     printf '%s' "[INIT] E3: spawning tenant POSIX environments..."
-    printf '%s' "[INIT] E3 env 1: drv.ramdisk.1 storage @ 0x12310000, aerosls.posix.1 heap @ 0x12410000"
+    printf '%s\n' "[E3-ENV] env 1: drv.ramdisk.1 storage @ 0x12310000, aerosls.posix.1 heap @ 0x12410000"
+    printf '%s\n' "[E3-ENV] env 2: drv.ramdisk.2 storage @ 0x12910000, aerosls.posix.2 heap @ 0x12a10000"
     printf '%s' "[INIT] E3 env 1: drv.ramdisk.1 spawned[INIT] E3 env 1: aerosls.posix.1 spawned"
-    printf '%s' "[INIT] E3 env 2: drv.ramdisk.2 storage @ 0x12910000, aerosls.posix.2 heap @ 0x12a10000"
     printf '%s\n' "[INIT] E3: tenant environments spawned."
     # The live-rootfs lines are one per line: each is its own SYS_SLS_SERIAL_WRITE
     # with a trailing newline, under the kernel TX lock — the console coalesces
@@ -255,7 +255,7 @@ cat > "$WORK/run" <<EOF
 E3_ISO="$DUMMY_ISO" E3_QEMU="$WORK/stubqemu" E3_STUB_LOG="$WORK/coalesced.log" bash $GUARD
 EOF
 chmod +x "$WORK/run"
-arm "coalesced init line with an earlier 0x before the E3 text -> PASS" 0 \
+arm "serial storage lines beside coalesced console noise -> PASS" 0 \
     "tenant storage regions are distinct"
 
 # ─── Arm 7: a missing ISO is a prerequisite ABORT, not a fallback ──────────
