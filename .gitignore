@@ -8,6 +8,9 @@
 # include_bytes!s it, the cap host test reads it at boot-check time):
 # keep the one file the build script regenerates trackable.
 !user/sidecar/fixtures/e7_candidate.elf
+# The E7 TG-1 live Go fixture is likewise a COMMITTED input: e7_go_gate.rs
+# include_bytes!s it, so a fresh checkout must build without a local Go toolchain.
+!user/sidecar/fixtures/go_thread_gate_live.elf
 *.so
 *.a
 # POSIX-Environments E3 boot image (init built with e3_envs). The shipped

@@ -93,8 +93,9 @@ int main(void) {
         CHECK(g && g->cr3 == 0xABCD1000ull,
               "the group owns the descriptor's page-table root");
         CHECK(proc_table[0].tid == 100 && proc_table[0].tgid == 100 &&
-              proc_table[0].is_group_leader == 1,
-              "the leader's tid/tgid are its pid and it is marked leader");
+              proc_table[0].is_group_leader == 1 &&
+              proc_table[0].thread_index == 0 && g->next_thread_index == 1,
+              "the leader's tid/tgid are its pid, it is marked leader, and it is thread index 0");
         CHECK(linux_group_find(100) == g,
               "the group is findable by its own id");
     }
@@ -113,11 +114,14 @@ int main(void) {
           "the image span and the getdents cursor start where the create set them");
 
     /* ── 4. A second member sees the group, not a private copy ───────────── */
-    plant(&proc_table[1], 101, 0xABCD1000ull);   /* same address space */
-    proc_table[1].group_index = proc_table[0].group_index;
-    proc_table[1].tid = 101;
-    proc_table[1].tgid = 100;
-    proc_table[1].is_group_leader = 0;
+    plant(&proc_table[1], 101, 0);   /* join stamps the group's root */
+    CHECK(linux_group_join_thread(linux_group_of(&proc_table[0]),
+                                  &proc_table[1]) == 0,
+          "a clone joins the live group");
+    CHECK(proc_table[1].thread_index == 1 &&
+          linux_group_of(&proc_table[1])->next_thread_index == 2 &&
+          proc_table[1].is_group_leader == 0,
+          "the first sibling gets stable thread index 1 and the next index advances");
     CHECK(linux_group_of(&proc_table[1]) == linux_group_of(&proc_table[0]) &&
           linux_group_brk(&proc_table[1]) == 0x100000ull,
           "a member resolves the same group and the same break");
@@ -143,8 +147,8 @@ int main(void) {
         struct LinuxThreadGroup* g = linux_group_of(&proc_table[0]);
         int admitted = 0;
         while (linux_group_add_thread(g) == 0) admitted++;
-        CHECK(g->live_threads == LINUX_THREADS_MAX && admitted == 7,
-              "the group admits up to LINUX_THREADS_MAX (1 + 7 clones)");
+        CHECK(g->live_threads == LINUX_THREADS_MAX && admitted == 6,
+              "the group admits up to LINUX_THREADS_MAX (leader + 7 clones; two already joined/admitted here)");
         CHECK(linux_group_add_thread(g) == -1 && g->live_threads == LINUX_THREADS_MAX,
               "the next admission is refused without changing the count");
     }
@@ -163,7 +167,7 @@ int main(void) {
         CHECK(linux_group_fwd_wait(g, 3) == 0 &&
               (g->fwd_wait_mask & (1u << 3)) != 0,
               "a busy sibling records its descriptor slot");
-        CHECK(linux_group_fwd_wait(g, LINUX_THREADS_MAX) == -1,
+        CHECK(linux_group_fwd_wait(g, PROC_MAX) == -1,
               "a slot past the mask is refused instead of aliasing bit 0");
         CHECK(linux_group_fwd_release(g, 101) == -1 && g->fwd_busy == 1,
               "a non-owner cannot release the lease");
@@ -177,7 +181,7 @@ int main(void) {
         CHECK(linux_group_fwd_next_waiter(g) == 3 &&
               (g->fwd_wait_mask & (1u << 3)) == 0,
               "the release path takes the lowest waiting slot exactly once");
-        CHECK(linux_group_fwd_next_waiter(g) == LINUX_THREADS_MAX,
+        CHECK(linux_group_fwd_next_waiter(g) == PROC_MAX,
               "an empty wait list reports no waiter");
         CHECK(linux_group_fwd_grant(g, 101) == 0 &&
               g->fwd_busy == 1 && g->fwd_owner_tid == 101,
@@ -190,7 +194,7 @@ int main(void) {
               linux_group_fwd_cancel_wait(g, 4) == 0 &&
               linux_group_fwd_release(g, 101) == 0 &&
               linux_group_fwd_next_waiter(g) == 5 &&
-              linux_group_fwd_next_waiter(g) == LINUX_THREADS_MAX,
+              linux_group_fwd_next_waiter(g) == PROC_MAX,
               "a cancelled waiter is skipped and the next slot gets the lease");
         CHECK(linux_group_fwd_release(g, 101) == -1,
               "a second release by the old owner is refused");

@@ -83,6 +83,12 @@ pub const TAG_SIGNATURE: u16 = 0x7F00;
 /// the parser's tolerate-unknown-records switch and must not be reused.
 pub const FLAG_GATE: u16 = 0x0002;
 
+/// The live Go gate's fixed amd64 arena layout: the kernel places the Linux
+/// child's stack just below `0xc000000000` and its heap exactly at that base,
+/// which is Go 1.25.1's first `arenaHint`. It grants no authority and is
+/// read only by the kernel's Linux span stamp.
+pub const FLAG_GO_ARENA: u16 = 0x0008;
+
 /// E3 profile bit in the manifest header's flags word (kernel/cap.h
 /// `SIDECAR_MANIFEST_FLAG_E3_PROFILE`). The E3 init sets it on the system
 /// POSIX manifest when the image was compiled with `e3_envs`, i.e. when the

@@ -153,7 +153,7 @@ all_regex "$LTH" "B1" "the group struct owns cr3, the shared cursors and the lea
     'uint32_t[[:space:]]+cap_owner_pid;' \
     'uint8_t[[:space:]]+fwd_busy;' \
     'uint32_t[[:space:]]+fwd_owner_tid;' \
-    'uint8_t[[:space:]]+fwd_wait_mask;'
+    'uint32_t[[:space:]]+fwd_wait_mask;'
 
 all_fixed "$LTC" "B2" "create stamps the group id, leader, cap owner, root and identity" \
     'g->group_id = pd->pid;' \
@@ -254,15 +254,15 @@ all_fixed "$LTH" "F1" "the lease's six transitions are declared in the group hea
 
 need "$LTC" 'return (g->fwd_owner_tid == tid) ? 0 : 1;' "F2" \
     "a busy acquire reports the conflict instead of granting a second owner"
-need "$LTC" 'g->fwd_wait_mask |= (uint8_t)(1u << slot);' "F3" \
+need "$LTC" 'g->fwd_wait_mask |= (1u << slot);' "F3" \
     "a busy sibling records its wait bit"
 need "$PDC" 'cur->park_syscall = SYS_LINUX_LEASE_RESUME;' "F3b" \
     "the waiting sibling arms the lease-restart sentinel"
 need "$PDC" 'cur->park_req     = num;' "F3c" \
     "the waiting sibling remembers the syscall to restart"
-need "$LTC" 'for (uint32_t i = 0; i < LINUX_THREADS_MAX; i++) {' "F4" \
+need "$LTC" 'for (uint32_t i = 0; i < PROC_MAX; i++) {' "F4" \
     "next_waiter scans from the lowest slot"
-need "$LTC" 'g->fwd_wait_mask &= (uint8_t)~(1u << i);' "F4b" \
+need "$LTC" 'g->fwd_wait_mask &= ~(1u << i);' "F4b" \
     "next_waiter removes the slot it returns"
 need "$LTC" 'if (!g->fwd_busy || g->fwd_owner_tid != tid) return -1;' "F5" \
     "only the owner may release the lease"

@@ -610,9 +610,12 @@ fn answer(
         }
         /* clock_gettime (228, LSC_LOCAL — E7 increment 19): the seam has
          * no vDSO to backstop it, so the sidecar answers the call itself.
-         * CLOCK_REALTIME is the pinned gate epoch; CLOCK_MONOTONIC starts
-         * at zero (the workload only needs a readable clock, not an
-         * advancing one). Other clock ids are EINVAL, Linux's own answer
+         * CLOCK_REALTIME is the pinned gate epoch; CLOCK_MONOTONIC is a
+         * fixed NONZERO second. Go 1.25.1's runtime throws "nanotime
+         * returning zero" when its monotonic read is zero, before the gate
+         * can print G1.1. The workload needs a readable clock, not an
+         * advancing one, so a fixed value is honest; it must never be 0.
+         * Other clock ids are EINVAL, Linux's own answer
          * for a clock this shim does not carry. The kernel stages the
          * 16-byte destination and refuses a NULL/foreign span before any
          * post; args[1] == 0 here is unreachable, but answering EINVAL
@@ -623,7 +626,7 @@ fn answer(
             }
             let (sec, nsec): (u64, u64) = match args[0] {
                 0 => (GATE_EPOCH_SECS, 0), /* CLOCK_REALTIME  */
-                1 => (0, 0),               /* CLOCK_MONOTONIC */
+                1 => (1, 0),               /* CLOCK_MONOTONIC: nonzero for Go */
                 _ => return Answer::Reply(0, E_INVAL),
             };
             let mut b = [0u8; FD_PAYLOAD_CAP];
@@ -782,12 +785,35 @@ fn answer(
                     Answer::Reply(addr, STATUS_OK)
                 }
             } else {
-                match brk.mtop.checked_sub(len_r) {
-                    Some(top) if top >= brk.cur => {
-                        brk.mtop = top;
-                        Answer::Reply(top, STATUS_OK)
+                /* A non-fixed addr is a HINT, as on Linux: when the caller
+                 * names a page-aligned range that is still free at the top
+                 * of the span, the kernel returns exactly that range. Go's
+                 * runtime depends on this for its arena hints: it asks for
+                 * a 64 MiB arena at each hint, and treats a different
+                 * address as "hint rejected", unmaps it, and tries the
+                 * next hint until the probe loop exhausts the span. The
+                 * measured Go 1.25.1 startup therefore needs the hint
+                 * honored, not a fresh cursor pick. addr == 0 and hints
+                 * that do not fit keep the descending-cursor behavior. */
+                let hint = addr & !0xFFFu64;
+                if addr != 0 && addr == hint
+                   && hint >= brk.cur && hint <= brk.mtop
+                   && len_r <= brk.mtop - hint {
+                    /* A hint is NOT the allocation cursor: Linux places
+                     * later NULL maps elsewhere, and Go relies on that —
+                     * after its 64 MiB arena hint it asks for its 32 MiB
+                     * heap and small runtime maps with addr == 0. Keeping
+                     * mtop here leaves those a free range; lowering it to
+                     * the hint would exhaust the span. */
+                    Answer::Reply(hint, STATUS_OK)
+                } else {
+                    match brk.mtop.checked_sub(len_r) {
+                        Some(top) if top >= brk.cur => {
+                            brk.mtop = top;
+                            Answer::Reply(top, STATUS_OK)
+                        }
+                        _ => Answer::Reply(0, E_NOMEM),
                     }
-                    _ => Answer::Reply(0, E_NOMEM),
                 }
             }
         }
@@ -1100,6 +1126,14 @@ struct FdSlot {
     /// EEXIST, a DEL/MOD of a non-member ENOENT — and close() clears the
     /// bit so a reused fd number never inherits a membership.
     members: u16,
+    /// G1.5 evidence: the running CRC-32 (internal, un-finalized) of the
+    /// bytes this file slot has actually written, and their count. The
+    /// copy destination closes with the fixture's 64 KiB, so its close
+    /// line carries the checksum of what crossed the file class rather
+    /// than only the fixture's own byte count. Console/epoll slots keep
+    /// the initial state and are never logged.
+    sum: u32,
+    sum_len: u64,
 }
 
 const FD_KIND_CONSOLE: u8 = 0;
@@ -1126,14 +1160,16 @@ const LINUX_MAX_FDS: usize = 16;
 const LO_LARGEFILE: u32 = 0x8000;
 const LO_DIRECTORY: u32 = 0x10000;
 const LO_CLOEXEC: u32 = 0x80000;
+const LO_NONBLOCK: u32 = 0x800;
 const LO_KNOWN: u32 = 0x3 | 0x40 | 0x80 | 0x200 | 0x400
     | LO_LARGEFILE | LO_DIRECTORY | LO_CLOEXEC;
 
 /// fcntl's four answered commands (the census's fcntl rows are all
 /// F_SETFD(1); F_GETFD/F_GETFL round out the four the design names).
-/// Every other command — F_DUPFD included — is ENOSYS by name: a
-/// fabricated answer to a command nobody measured is the placeholder
-/// failure in a new shape.
+/// F_SETFL moves only O_NONBLOCK: regular-file reads/writes are already
+/// non-blocking, and every other flag change stays ENOSYS by name
+/// (F_DUPFD included) — a fabricated answer to a command nobody
+/// measured is the placeholder failure in a new shape.
 const F_SETFD: u64 = 2;
 const F_GETFD: u64 = 1;
 const F_GETFL: u64 = 3;
@@ -1161,7 +1197,8 @@ fn fd_slot(fds: &[FdSlot], fd: u64) -> Option<&FdSlot> {
 fn alloc_fd(fds: &mut [FdSlot], kind: u8, vfs_fd: u32, flags: u32) -> Result<u64, i32> {
     for (i, s) in fds.iter_mut().enumerate() {
         if !s.used {
-            *s = FdSlot { used: true, kind, vfs_fd, flags, members: 0 };
+            *s = FdSlot { used: true, kind, vfs_fd, flags, members: 0,
+                          sum: 0xFFFF_FFFF, sum_len: 0 };
             return Ok(i as u64);
         }
     }
@@ -1224,7 +1261,12 @@ fn payload_bound(num: u64, args: &[u64; 6], len: usize) -> bool {
     match num {
         LINUX_RT_SIGACTION => args[2] != 0 && len == SIGACT_BYTES,
         LINUX_RT_SIGPROCMASK => args[2] != 0 && len == SIGSET_BYTES as usize,
-        LINUX_SIGALTSTACK => args[1] != 0 && len == STACK_T_BYTES,
+        /* An install with no old-stack pointer is the other Linux shape:
+         * Go's runtime calls sigaltstack(&new, nil) after its query. The
+         * arm already answers it with STATUS_OK; the length gate must not
+         * turn that legal no-out-pointer call into EINVAL. */
+        LINUX_SIGALTSTACK => if args[1] == 0 { len == 0 }
+                             else { len == STACK_T_BYTES },
         LINUX_STAT | LINUX_LSTAT => args[1] != 0 && len == STAT_PAYLOAD_BYTES,
         LINUX_READ => args[1] != 0 && len <= args[2] as usize
             && len <= FD_PAYLOAD_CAP,
@@ -1421,8 +1463,19 @@ fn answer_file<K: Kernel, A: BufferAlloc>(
         LINUX_WRITE => match slot_of(fds, args[0]) {
             Ok(s) if s.kind == FD_KIND_CONSOLE => Answer::Write(args[2] as usize),
             Ok(s) if s.kind == FD_KIND_FILE => {
-                match vfs.write(vt, s.vfs_fd, payload) {
-                    Ok(n) => Answer::Reply(n as u64, STATUS_OK),
+                let i = args[0] as usize;
+                let vfd = s.vfs_fd;
+                match vfs.write(vt, vfd, payload) {
+                    Ok(n) => {
+                        #[cfg(feature = "e7_go_gate")]
+                        if n > 0 {
+                            let got = n.min(payload.len());
+                            fds[i].sum =
+                                gate_crc32_update(fds[i].sum, &payload[..got]);
+                            fds[i].sum_len += n as u64;
+                        }
+                        Answer::Reply(n as u64, STATUS_OK)
+                    }
                     Err(e) => Answer::Reply(0, cap_of(e)),
                 }
             }
@@ -1537,6 +1590,18 @@ fn answer_file<K: Kernel, A: BufferAlloc>(
                 if let Err(e) = vfs.close(vt, s.vfs_fd) {
                     return Answer::Reply(0, cap_of(e));
                 }
+                /* G1.5 evidence at the destination's own close: the
+                 * running CRC-32 covers exactly the bytes this file slot
+                 * accepted, so the line names the copied data, not a
+                 * re-read or a fixture assertion. Input closes with zero
+                 * writes and stays silent. Compile-time gate-profile only:
+                 * ordinary Linux file I/O pays no per-write checksum and
+                 * its close log is unchanged. */
+                #[cfg(feature = "e7_go_gate")]
+                if fds[i].sum_len > 0 {
+                    gate_copy_sum_log(fds[i].sum_len,
+                                      fds[i].sum ^ 0xFFFF_FFFF);
+                }
             }
             /* An epoll member that closes leaves every set: a later fd
              * number must not inherit a membership it never registered
@@ -1587,10 +1652,10 @@ fn answer_file<K: Kernel, A: BufferAlloc>(
          * over the slot's own cloexec bit (the VFS's u16 flag word
          * cannot hold O_CLOEXEC; the bit lives HERE, which is the
          * widening the design's flag table demanded), F_GETFL echoing
-         * the open flags, F_SETFL accepted only as the no-change ask
-         * (a changed flag is ENOSYS by name: the VFS mints flags at
-         * open and has no setter — a fabricated 0 would claim a
-         * semantics nothing performs). Everything else — F_DUPFD
+         * the open flags, F_SETFL mutating only O_NONBLOCK (the one
+         * mutable flag this VFS fd can honestly echo; a changed
+         * O_APPEND is ENOSYS by name because the VFS mints flags at
+         * open and has no setter). Everything else — F_DUPFD
          * included — ENOSYS by name. */
         LINUX_FCNTL => match slot_of(fds, args[0]) {
             Ok(s) => match args[1] {
@@ -1613,12 +1678,21 @@ fn answer_file<K: Kernel, A: BufferAlloc>(
                 F_GETFL => Answer::Reply(
                     (s.flags & !LO_CLOEXEC) as u64, STATUS_OK),
                 F_SETFL => {
-                    if (args[2] as u32) & !LO_CLOEXEC
-                        == (s.flags & !LO_CLOEXEC)
+                    /* Linux ignores the immutable open flags here and
+                     * mutates O_APPEND/O_NONBLOCK. This VFS fd has no
+                     * append setter, so only O_NONBLOCK may move; the
+                     * stored bit is what a later F_GETFL echoes, and
+                     * dst/console writes already never park on it. */
+                    let req = args[2] as u32;
+                    let i = args[0] as usize;
+                    if req & !(LO_KNOWN | LO_NONBLOCK) != 0
+                        || (req ^ s.flags) & 0x400 != 0
                     {
-                        Answer::Reply(0, STATUS_OK) /* the no-change ask */
-                    } else {
                         Answer::Reply(0, E_NOSYS)
+                    } else {
+                        fds[i].flags =
+                            (s.flags & !LO_NONBLOCK) | (req & LO_NONBLOCK);
+                        Answer::Reply(0, STATUS_OK)
                     }
                 }
                 _ => Answer::Reply(0, E_NOSYS),
@@ -2057,7 +2131,8 @@ fn tasks() -> &'static mut [LinuxTask; MAX_LINUX_TASKS] {
         partition: 0,
         vfs_task: 0,
         fds: [FdSlot { used: false, kind: 0, vfs_fd: 0, flags: 0,
-                       members: 0 }; LINUX_MAX_FDS],
+                       members: 0, sum: 0xFFFF_FFFF, sum_len: 0 };
+              LINUX_MAX_FDS],
         brk_base: 0,
         brk_limit: 0,
         brk_cur: 0,
@@ -2144,7 +2219,8 @@ pub fn track(
          * on Linux), and the slots are what later increments grow by
          * open()'s hand. */
         t.fds = [FdSlot { used: false, kind: 0, vfs_fd: 0, flags: 0,
-                          members: 0 }; LINUX_MAX_FDS];
+                          members: 0, sum: 0xFFFF_FFFF, sum_len: 0 };
+                  LINUX_MAX_FDS];
         for slot in t.fds.iter_mut().take(3) {
             slot.used = true;
             slot.kind = FD_KIND_CONSOLE;
@@ -2362,6 +2438,43 @@ fn gate_read_log(off: u64) {
     #[cfg(not(feature = "target"))]
     {
         let _ = off;
+    }
+}
+
+/// CRC-32 (IEEE 802.3, reflected, poly 0xEDB88320), carried as the
+/// UN-FINALIZED state so successive file writes chain without a buffer.
+/// The close line finalizes it with the same `^ 0xFFFF_FFFF` the proto
+/// manifest CRC uses, so a host `zlib.crc32` over the fixture's 64 KiB of
+/// 0x5A reproduces the published number exactly.
+#[cfg(any(feature = "e7_go_gate", test))]
+fn gate_crc32_update(mut crc: u32, data: &[u8]) -> u32 {
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    crc
+}
+
+/// G1.5's explicit checksum evidence: the destination file's close names
+/// the byte count it accepted and the CRC-32 of exactly those bytes.
+#[cfg(feature = "e7_go_gate")]
+fn gate_copy_sum_log(bytes: u64, crc: u32) {
+    #[cfg(feature = "target")]
+    {
+        let mut extra = [0u8; 32];
+        let mut off = push_bytes(&mut extra, 0, b"crc32=0x");
+        off = hex_into(&mut extra, off, crc as u64);
+        crate::entry::klog(b"[GTG] copy bytes", bytes as u32, &extra[..off]);
+    }
+    #[cfg(not(feature = "target"))]
+    {
+        let _ = (bytes, crc);
     }
 }
 
@@ -2864,6 +2977,14 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                     k.proc_kill(pid);
                     let _ = vfs.exit_task(tasks()[i].vfs_task);
                     tasks()[i].used = false;
+                    /* G1.7 evidence: the row close is now a named
+                     * observable event, not something inferred from the
+                     * exit_group status line. Exactly one per reaped
+                     * task; the gate's one exit_group is the only one.
+                     * Gate profile only — ordinary logs stay unchanged. */
+                    #[cfg(feature = "e7_go_gate")]
+                    enosys_log(num as u32, &name_buf[..nlen],
+                               b" exit_group row closed\n");
                 }
             }
             Answer::SignalKill(kill_sig) => {
@@ -2911,8 +3032,19 @@ mod tests {
     use super::*;
 
     fn fds() -> [FdSlot; LINUX_MAX_FDS] {
-        [FdSlot { used: false, kind: 0, vfs_fd: 0, flags: 0,
-                 members: 0 }; LINUX_MAX_FDS]
+                [FdSlot { used: false, kind: 0, vfs_fd: 0, flags: 0, members: 0,
+                  sum: 0xFFFF_FFFF, sum_len: 0 }; LINUX_MAX_FDS]
+    }
+
+    #[test]
+    fn gate_copy_crc_matches_the_fixture_input() {
+        let chunk = [0x5Au8; 4096];
+        let mut crc = 0xFFFF_FFFFu32;
+        for _ in 0..16 {
+            crc = gate_crc32_update(crc, &chunk);
+        }
+        assert_eq!(crc ^ 0xFFFF_FFFF, 0xF489_848E,
+                   "64 KiB of 0x5A has the zlib CRC-32 the close line publishes");
     }
     /* E7 increment 23: the three console descriptors every task is born
      * with (track() registers them), for the poll/read waiting tests. */
@@ -2960,7 +3092,7 @@ mod tests {
     }
 
     #[test]
-    fn clock_gettime_answers_the_pinned_epoch_and_zero_monotonic() {
+    fn clock_gettime_answers_the_pinned_epoch_and_nonzero_monotonic() {
         let mut brk = ledger();
         let mut sig = SigState::new();
         let a = answer(228, &[0, 0x5000, 0, 0, 0, 0], &fds(), &mut brk,
@@ -2980,7 +3112,8 @@ mod tests {
             Answer::ReplyBytes(ret, len, bytes) => {
                 assert_eq!(ret, 0);
                 assert_eq!(len, TIMESPEC_BYTES);
-                assert_eq!(read_u64(&bytes, 0), 0);
+                assert_eq!(read_u64(&bytes, 0), 1,
+                           "Go's nanotime throws on a zero monotonic read");
                 assert_eq!(read_u64(&bytes, 8), 0);
             }
             _ => panic!("CLOCK_MONOTONIC did not answer a timespec: {:?}", a),
@@ -3429,6 +3562,7 @@ mod tests {
          * slots never consult it. */
         let mut file_fds = console_fds();
         file_fds[3] = FdSlot { used: true, kind: FD_KIND_FILE, vfs_fd: 7,
+                               sum: 0xFFFF_FFFF, sum_len: 0,
                                flags: 0, members: 0 };
         payload[..8].copy_from_slice(&pollfd(3, POLLIN));
         match poll_answer(&file_fds, &console, &payload[..8], &timed, 0,
@@ -3492,6 +3626,7 @@ mod tests {
                 "duplicate add: {:?}", a);
         /* the census's EPERM line: adding a regular file */
         f[5] = FdSlot { used: true, kind: FD_KIND_FILE, vfs_fd: 7,
+                        sum: 0xFFFF_FFFF, sum_len: 0,
                         flags: 0, members: 0 };
         let a = answer_event(LINUX_EPOLL_CTL,
                              &[3, EPOLL_CTL_ADD, 5, 1, 0, 0], &mut f);
@@ -3995,6 +4130,10 @@ mod tests {
                               &[0, 0x5000, 0, 0, 0, 0], STACK_T_BYTES));
         assert!(!payload_bound(LINUX_SIGALTSTACK,
                                &[0, 0x5000, 0, 0, 0, 0], STACK_T_BYTES - 1));
+        assert!(payload_bound(LINUX_SIGALTSTACK,
+                              &[0, 0, 0, 0, 0, 0], 0));
+        assert!(!payload_bound(LINUX_SIGALTSTACK,
+                               &[0, 0, 0, 0, 0, 0], 1));
         assert!(!payload_bound(LINUX_SIGALTSTACK,
                                &[0, 0, 0, 0, 0, 0], STACK_T_BYTES));
         /* a number that owes no payload is total-false. */

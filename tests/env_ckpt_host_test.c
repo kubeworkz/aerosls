@@ -740,9 +740,91 @@ int main(void) {
                                         0, 0, 0, 1) == 0,
               "and an entry of 0 is not a stamp: a task that cannot be re-entered is never written down");
 
+        /* The replay identity clause below predates TG-2a and compares the
+         * three registered tasks. Keep that pre-group image: a stamped
+         * sibling is TG-2b capture state, not registration identity. */
+        struct EnvCkptRecord identity_base = *env_ckpt_find(9, 1);
+
+        /* ── TG-2a: group identity, then an appended sibling ──────────────
+         * The leader's slot existed at registration but its group did not.
+         * The group stamp fills id/index/leader; a clone has no registration
+         * slot, so its record is appended and validated as a whole.
+         * Duplicate (group,index), a missing leader, a leader at index != 0,
+         * and group fields on a sidecar are all refusals. */
+        CHECK(env_ckpt_linux_group_stamp(9, "aerosls.posix.0",
+                                         "e7.gate.user.0", 0x44u, 0, 1) == 1,
+              "the leader's group stamp fills group id, thread index 0 and the leader flag");
+        {
+            const struct EnvCkptRecord* got = env_ckpt_find(9, 1);
+            CHECK(got && got->tasks[2].group_id == 0x44u &&
+                  got->tasks[2].thread_index == 0 &&
+                  got->tasks[2].leader == 1,
+                  "the leader's group identity is visible in the record");
+            CHECK(env_ckpt_valid(got) == ENV_CKPT_REFUSE_NONE,
+                  "the group-stamped leader still validates");
+        }
+        CHECK(env_ckpt_linux_group_thread_stamp(9, 0x44u, 1,
+                                                "e7.gate.user.0", 0x400100ull) == 1,
+              "a clone's group thread is appended to the record (there is no registration slot for it)");
+        {
+            const struct EnvCkptRecord* got = env_ckpt_find(9, 1);
+            CHECK(got && got->n_tasks == 4 &&
+                  got->tasks[3].kind == ENV_CKPT_TASK_LINUX &&
+                  got->tasks[3].group_id == 0x44u &&
+                  got->tasks[3].thread_index == 1 &&
+                  got->tasks[3].leader == 0 &&
+                  got->tasks[3].entry == 0x400100ull,
+                  "the appended sibling carries its group index, non-leader flag and entry");
+            CHECK(got && got->tasks[3].name[0] == 'e' &&
+                  got->tasks[3].name[14] == 0,
+                  "the appended sibling's name is copied NUL-terminated into its field");
+            CHECK(env_ckpt_valid(got) == ENV_CKPT_REFUSE_NONE,
+                  "a record with a leader and one sibling validates");
+        }
+        CHECK(env_ckpt_linux_group_thread_stamp(9, 0x44u, 1,
+                                                "e7.gate.user.0", 0x400200ull) == 1,
+              "re-stamping the same (group,index) is idempotent");
+        {
+            const struct EnvCkptRecord* got = env_ckpt_find(9, 1);
+            CHECK(got && got->n_tasks == 4 && got->tasks[3].entry == 0x400200ull,
+                  "the idempotent restamp updates in place instead of adding a fifth task");
+        }
+        CHECK(env_ckpt_linux_group_thread_stamp(9, 0x44u, 0,
+                                                "e7.gate.user.0", 0x400200ull) == 0 &&
+              env_ckpt_linux_group_thread_stamp(9, 0x44u, 1,
+                                                "e7.gate.user.0", 0) == 0,
+              "index 0 is the leader's (never appendable) and entry 0 is never a thread stamp");
+        {
+            const struct EnvCkptRecord* base = env_ckpt_find(9, 1);
+            struct EnvCkptRecord tooth;
+            CHECK(base != 0, "(setup) the stamped group record is present");
+            if (base) {
+                tooth = *base;
+                tooth.tasks[2].leader = 2;
+                CHECK(env_ckpt_valid(&tooth) == ENV_CKPT_REFUSE_BAD_TASK,
+                      "a leader value other than 0/1 is refused");
+                tooth = *base;
+                tooth.tasks[3].thread_index = 1;
+                tooth.tasks[2].thread_index = 1;   /* duplicate (group,index) */
+                tooth.tasks[2].leader = 0;
+                CHECK(env_ckpt_valid(&tooth) == ENV_CKPT_REFUSE_BAD_TASK,
+                      "two tasks claiming one (group,index) are refused");
+                tooth = *base;
+                tooth.tasks[2].leader = 0;
+                tooth.tasks[2].thread_index = 1;
+                tooth.tasks[3].thread_index = 2;
+                CHECK(env_ckpt_valid(&tooth) == ENV_CKPT_REFUSE_BAD_TASK,
+                      "a group with no leader is refused (a half-stamped group cannot be restored)");
+                tooth = *base;
+                tooth.tasks[0].group_id = 0x44u;
+                CHECK(env_ckpt_valid(&tooth) == ENV_CKPT_REFUSE_BAD_TASK,
+                      "group fields on a sidecar are refused (only a Linux task has a group)");
+            }
+        }
+
         /* The replay's identity comparison: the create's record names the
          * same three tasks, at entry 0 because ITS tenant has not spawned. */
-        struct EnvCkptRecord want = *env_ckpt_find(9, 1);
+        struct EnvCkptRecord want = identity_base;
         struct EnvCkptRecord got2 = good_record(9, 1);
         got2.n_tasks = 3;
         strcpy(got2.tasks[2].name, "e7.gate.user.0");
@@ -752,6 +834,46 @@ int main(void) {
         got2.n_tasks = 2;
         CHECK(env_ckpt_restore_same_identity(&want, &got2) == 0,
               "a two-task create is refused: an allowance for \"the Linux task arrived late\" is a second restore path");
+
+        /* TG-2a regression: the captured record has a clone-appended sibling,
+         * while the replay's create registers only the original three tasks.
+         * The extra Linux sibling is captured state, not a mismatch. */
+        {
+            const struct EnvCkptRecord* stamped = env_ckpt_find(9, 1);
+            struct EnvCkptRecord got3 = identity_base;
+            CHECK(stamped && stamped->n_tasks == 4,
+                  "(setup) the captured record carries one clone-appended sibling");
+            if (stamped) {
+                CHECK(env_ckpt_restore_same_identity(stamped, &got3) == 1,
+                      "a replay whose create names the registered three-task prefix matches a record with a captured group sibling");
+
+                struct EnvCkptRecord got_bad = got3;
+                got_bad.tasks[0].name[0] = 'X';
+                CHECK(env_ckpt_restore_same_identity(stamped, &got_bad) == 0,
+                      "a genuine name mismatch inside the registered prefix is still refused");
+
+                struct EnvCkptRecord got_extra = got3;
+                got_extra.n_tasks = 4;
+                got_extra.tasks[3] = stamped->tasks[3];
+                CHECK(env_ckpt_restore_same_identity(&want, &got_extra) == 0,
+                      "a create that registered a fourth task is refused (captured siblings only extend the adopted record)");
+
+                struct EnvCkptRecord want_bad = *stamped;
+                want_bad.tasks[3].kind = ENV_CKPT_TASK_POSIX_SIDECAR;
+                CHECK(env_ckpt_restore_same_identity(&want_bad, &got3) == 0,
+                      "an extra sidecar beyond the registered prefix is refused, not treated as captured state");
+
+                want_bad = *stamped;
+                want_bad.tasks[3].group_id = 0x45u;
+                CHECK(env_ckpt_restore_same_identity(&want_bad, &got3) == 0,
+                      "a captured sibling claiming another group is refused");
+
+                want_bad = *stamped;
+                want_bad.tasks[3].name[0] = 'X';
+                CHECK(env_ckpt_restore_same_identity(&want_bad, &got3) == 0,
+                      "a captured sibling that does not carry the leader's name is refused");
+            }
+        }
     }
 
     printf("\n%d passed, %d failed\n", checks_passed, checks_failed);

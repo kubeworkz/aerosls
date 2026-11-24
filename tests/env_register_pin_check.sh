@@ -123,6 +123,7 @@ c_canon() {
     strip_comments | sed -E \
         -e 's/ENV_CKPT_MAX_REGIONS/MAX_REGIONS/g' \
         -e 's/ENV_CKPT_MAX_CHANS/MAX_CHANS/g' \
+        -e 's/ENV_CKPT_REG_TASKS/MAX_TASKS/g' \
         -e 's/ENV_CKPT_MAX_TASKS/MAX_TASKS/g' \
         -e 's/ENV_CKPT_NAME_LEN/NAME_LEN/g' \
         -e 's/ENV_REG_TASK_NAME_STRIDE/NAME_LEN/g' \
@@ -177,7 +178,7 @@ agree "opcode" "$(cpval ENV_REGISTER)" "$(rval ENV_REGISTER)"
 agree "request-body" "$(cpval ENV_REGISTER_BODY_SIZE)" "$(rval REGISTER_BODY_SIZE)"
 agree "max-regions" "$(cval ENV_CKPT_MAX_REGIONS)" "$(rval REGISTER_MAX_REGIONS)"
 agree "max-chans" "$(cval ENV_CKPT_MAX_CHANS)" "$(rval REGISTER_MAX_CHANS)"
-agree "max-tasks" "$(cval ENV_CKPT_MAX_TASKS)" "$(rval REGISTER_MAX_TASKS)"
+agree "max-tasks" "$(cval ENV_CKPT_REG_TASKS)" "$(rval REGISTER_MAX_TASKS)"
 agree "name-len" "$(cval ENV_CKPT_NAME_LEN)" "$(rval REGISTER_NAME_LEN)"
 agree "region-stride" "$(cpval ENV_REG_REGION_STRIDE)" "$(rval REG_REGION_STRIDE)"
 if [ -n "$scalar_bad" ]; then

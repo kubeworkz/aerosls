@@ -255,7 +255,8 @@ struct ProcessDescriptor {
                                        // LINUX_GROUP_NONE (0xFFFFFFFF) for an
                                        // SLS task / a cleared slot
     uint8_t    is_group_leader;       // 1 for the descriptor that created the group
-    uint8_t    _group_pad[7];
+    uint16_t   thread_index;           // TG-2a: stable group-relative index; leader 0
+    uint8_t    _group_pad[5];
     uint64_t   sysret_result;         // E7 TG-1 I3: the value a resume writes to
                                        // rax (futex wake 0 / timeout -ETIMEDOUT);
                                        // 0 for every other sysret. Declared here in

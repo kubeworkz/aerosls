@@ -704,7 +704,12 @@ linux_mem_mmap_verdict(uint64_t heap_base, uint64_t heap_limit,
     v.map_pages = (req->prot == LINUX_PROT_NONE)
                 ? 0 : v.range_pages;
     v.prot_write = (req->prot & LINUX_PROT_WRITE) ? 1 : 0;
-    v.new_mmap_top = is_fixed ? mmap_top : rax;
+    /* A non-fixed addr is a hint, not the anonymous-map cursor: Linux
+     * leaves the cursor alone and keeps serving NULL maps elsewhere. The
+     * Go gate depends on that (its arena hint 0xc000000000 is followed by
+     * 32 MiB and small NULL maps). Only a NULL-address grant descends the
+     * cursor; a FIXED map never does either. */
+    v.new_mmap_top = (is_fixed || req->addr != 0) ? mmap_top : rax;
     return v;
 }
 
@@ -1139,6 +1144,11 @@ int linux_dirent_pack(const uint8_t *src, uint32_t n, uint32_t count_cap,
 int linux_reply_zero_ok(uint64_t num)
 {
     if (num == LINUX_READ || num == LINUX_GETDENTS64) return 1;
+    /* sigaltstack(&new, NULL) is a legal install with no old-stack
+     * out-pointer: the reply owes no struct and is STATUS_OK with zero
+     * payload. When args[1] is non-NULL the sidecar returns the 24-byte
+     * stack_t and this arm is not reachable for it (shape 2). */
+    if (num == LINUX_SIGALTSTACK) return 1;
     return 0;
 }
 

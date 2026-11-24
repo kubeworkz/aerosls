@@ -44,7 +44,7 @@
  *   ENV_REPLICA_SLOT_LBA(slot) = 1261568 + slot * 16384
  *
  * 1261568 is exactly the payload band's end (asserted at compile time):
- * this band is the payload band's neighbour, 8 slots x 8 MiB, clear of
+ * this band is the payload band's neighbour, 8 physical slots x 8 MiB, clear of
  * ROWSTORE_LBA_BASE 2000000. Each slot holds the staged pages in wire
  * order (4 KiB per page, page p at slot_lba + p*8) — NOT the payload blob
  * format: the replica stores what the wire carried, and promotion (the
@@ -60,13 +60,17 @@
  * staged and every gate below has passed; a refusal drops the staged frames
  * and latches a distinct code (the guard and the host test read the code,
  * never a bare nonzero). A replica the band cannot hold is REFUSED BY NAME
- * (the 9th distinct identity, or a replacement when all 8 slots are live),
- * never silently dropped — the classification ladder destination (b)
+ * (the next distinct identity past ENV_REPLICA_MAX, or a replacement when
+ * every tracked slot is live), never silently dropped — the classification
+ * ladder destination (b)
  * reports against must be able to name "no replica" honestly.
  *
- * Band capacity is a stated boundary, not an accident: 8 slots x 8 MiB.
- * An environment larger than 2048 payload pages is refused at BEGIN
- * (ER_REFUSE_TOO_MANY) rather than truncated.
+ * The band has 8 physical 8 MiB slots, but the on-disk DIRECTORY has one
+ * 4 KiB frame and each entry carries a whole checkpoint record. TG-2a's
+ * 784-byte records cap that directory at four tracked replicas
+ * (ENV_REPLICA_MAX); the other physical slots stay unused rather than
+ * allowing a truncated directory. An environment larger than 2048 payload
+ * pages is refused at BEGIN (ER_REFUSE_TOO_MANY) rather than truncated.
  */
 #ifndef ENV_REPLICA_H
 #define ENV_REPLICA_H
@@ -75,7 +79,7 @@
 #include "env_ckpt.h"        /* struct EnvCkptRecord crosses whole in the BEGIN */
 
 /* ─── The band ─────────────────────────────────────────────────────────────── */
-#define ENV_REPLICA_MAX           8u          /* slots = distinct replicas kept */
+#define ENV_REPLICA_MAX           4u          /* entries must fit one 4 KiB frame */
 #define ENV_REPLICA_SLOT_SECTORS  16384ULL    /* 8 MiB, same slot size as a payload */
 #define ENV_REPLICA_DATA_LBA_BASE 1261568ULL  /* = payload band's end; asserted in env_replica.c */
 #define ENV_REPLICA_SLOT_LBA(slot) \

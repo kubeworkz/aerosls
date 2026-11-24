@@ -493,7 +493,7 @@ if grep -qF 'const E_BADF: i32 = -2;' "$LRS" && \
    grep -qF 'None => Answer::Reply(0, E_BADF),' "$LRS" && \
    grep -qF 'fds: [FdSlot; LINUX_MAX_FDS],' "$LRS" && \
    grep -qF 't.fds = [FdSlot { used: false, kind: 0, vfs_fd: 0, flags: 0,' "$LRS" && \
-   grep -qF 'members: 0 }; LINUX_MAX_FDS];' "$LRS" && \
+   grep -qF 'members: 0, sum: 0xFFFF_FFFF, sum_len: 0 };' "$LRS" && \
    grep -qF 't.fds.iter_mut().take(3)' "$LRS"; then
     ok "M5. the sidecar's fd table exists per task (console slots plus step 4's File kind carrying the VFS fd and flags), is born with console stdio (0/1/2), and an unknown descriptor is EBADF — CAP_EBADF pinned at -2 so §5.7 delivers 9"
 else
@@ -1061,7 +1061,7 @@ else
     ok "U1. the return path never touches RAX — the syscall's result survives the restore"
 fi
 
-capfn="$(awk '/^static void proc_capture_entry_regs/{f=1} f{print} f&&/^}/{exit}' "$PDC")"
+capfn="$(awk '/^static void proc_capture_entry_regs\(struct CapParkCtx\* ctx\) \{/{f=1} f{print} f&&/^}/{exit}' "$PDC")"
 if printf '%s\n' "$capfn" | grep -qF '%%gs:0x50' && \
    printf '%s\n' "$capfn" | grep -qF 'ctx->linux_args[5]'; then
     ok "U2. proc_capture_entry_regs snapshots the six argument registers into park_ctx beside the pushed set — a parked task's registers outlive the per-CPU block every later entry overwrites"

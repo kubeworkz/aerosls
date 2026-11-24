@@ -43,7 +43,10 @@ pub fn build_posix_manifest(
     heap_base: u64,
     e1000_bar0_phys: Option<u64>,
 ) -> Vec<u8> {
-    let heap_size = 4 * 1024 * 1024; // 4 MiB — must match POSIX_HEAP_BYTES in layout.rs
+    // Must match POSIX_HEAP_BYTES in user/bootimage/src/layout.rs: the
+    // boot image reserves this much after the POSIX image, and init tells
+    // the kernel to mint exactly that region as the sidecar's budget.
+    let heap_size = 8 * 1024 * 1024; // 8 MiB
     let caps = [
         Some(ManifestCap {
             name: "budget",

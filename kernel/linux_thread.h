@@ -76,7 +76,8 @@ struct LinuxThreadGroup {
     uint32_t leader_pid;       /* the descriptor whose identity stays valid */
     uint32_t cap_owner_pid;    /* descriptor whose cap table the group uses */
     uint32_t fwd_owner_tid;    /* the thread holding the forward lease */
-    uint8_t  fwd_wait_mask;    /* one bit per thread slot waiting for the lease */
+    uint32_t fwd_wait_mask;    /* one bit per PROCESS-TABLE slot (PROC_MAX) */
+    uint32_t next_thread_index; /* TG-2a: next stable group-relative index; 1 after create */
     uint8_t  _pad[3];
     uint64_t cr3;              /* the one user page-table root (owner) */
     uint64_t heap_base;        /* the BUDGET span, stamped by the create */
@@ -151,10 +152,12 @@ int linux_group_join_thread(struct LinuxThreadGroup* g,
  *           1 = another thread holds it, so the caller records its wait bit
  *               and parks;
  *           -1 = the group is gone or the tid is invalid.
- *   wait / cancel_wait  set/clear one descriptor slot's bit (slot < 8).
+ *   wait / cancel_wait  set/clear one PROCESS-TABLE slot's bit
+ *           (slot < PROC_MAX — the slot is the descriptor index, not the
+ *           group-relative thread number).
  *   release  the OWNER clears the lease. Returns 0, or -1 for a non-owner.
  *   next_waiter  removes and returns the lowest waiting slot, or
- *           LINUX_THREADS_MAX when none — the caller resolves that slot's
+ *           PROC_MAX when none — the caller resolves that slot's
  *           tid and calls grant, so a dead waiter is skipped rather than
  *           leaving the lease parked on a descriptor that cannot run.
  *   grant    hands the free lease to a tid; -1 when it is still busy.

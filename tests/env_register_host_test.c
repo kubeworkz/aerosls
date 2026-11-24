@@ -137,8 +137,10 @@ int main(void) {
           (uint32_t)ENV_REG_TASK_NAME_STRIDE == 24u,
           "the offset arithmetic lands where the literals below assert");
     CHECK(ENV_CKPT_MAX_REGIONS == 3 && ENV_CKPT_MAX_CHANS == 4 &&
-          ENV_CKPT_MAX_TASKS == 4 && ENV_CKPT_NAME_LEN == 24,
-          "the counts and name length the body is built from are the record's");
+          ENV_CKPT_REG_TASKS == 4 && ENV_CKPT_NAME_LEN == 24,
+          "the counts and name length the body is built from are the wire's four slots");
+    CHECK(ENV_CKPT_MAX_TASKS >= ENV_CKPT_MAX_THREADS + 2u,
+          "the record task cap holds two sidecars plus a full Linux group");
 
     /* ── 2. The byte offsets, as literals ───────────────────────────────────
      * These are the numbers user/proto/src/env_proto.rs writes to. Asserted

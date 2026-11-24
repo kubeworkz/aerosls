@@ -38,6 +38,7 @@
 #include "cap.h"            // Seed Kernel Phase 1 -- SYS_SLS_CAP_* (289-297)
 #include "kernel_io.h"      // kernel_serial_print/printf -- the control-plane refusal lines
 #include "linux_abi.h"      // E7 increment 2 -- the Linux-personality branch (§3.3)
+#include "env_ckpt.h"       // E7 TG-2a -- the clone's group-thread record stamp
 #include "timer.h"         // E7 increment 24 -- SYS_SLS_NOW_NS
 #include "../arch/x86/user_paging.h"  // E7 §5.3 (the plan's inc 4) -- user_write_fs_base,
                                       // the MSR write of a granted ARCH_SET_FS
@@ -803,6 +804,21 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                 ? "group cap or resources exhausted"
                                 : "invalid parent/group identity");
                         return (uint64_t)(int64_t)crc;
+                    }
+                    /* TG-2a: the child is the one descriptor whose tid is the
+                     * clone result. Its group/index were assigned by
+                     * linux_group_join_thread(); stamp that identity into the
+                     * environment's record so a later capture can name the
+                     * thread. A record-less (boot census) group is a no-op. */
+                    for (int ci = 0; ci < PROC_MAX; ci++) {
+                        if (!proc_table[ci].active ||
+                            proc_table[ci].tid != child_tid) continue;
+                        (void)env_ckpt_linux_group_thread_stamp(
+                            cur->partition_id, cur->tgid,
+                            proc_table[ci].thread_index,
+                            proc_table[ci].name,
+                            proc_table[ci].user_rip);
+                        break;
                     }
                     return (uint64_t)child_tid;
                 }

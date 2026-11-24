@@ -1689,6 +1689,8 @@ int main(void)
          * shape-1 refusal. */
         CHECK(linux_reply_zero_ok(LINUX_READ) == 1 &&
               linux_reply_zero_ok(LINUX_GETDENTS64) == 1 &&
+              /* sigaltstack(&new, NULL) owes no old-stack payload. */
+              linux_reply_zero_ok(LINUX_SIGALTSTACK) == 1 &&
               linux_reply_zero_ok(LINUX_STAT) == 0 &&
               linux_reply_zero_ok(LINUX_CLOCK_GETTIME) == 0 &&
               linux_reply_zero_ok(LINUX_RT_SIGACTION) == 0,

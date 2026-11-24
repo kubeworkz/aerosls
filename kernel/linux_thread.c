@@ -109,6 +109,7 @@ void linux_groups_init(void) {
         g->cap_owner_pid = 0;
         g->fwd_owner_tid = 0;
         g->fwd_wait_mask = 0;
+        g->next_thread_index = 0;
         g->cr3 = 0;
         g->heap_base = 0;
         g->heap_limit = 0;
@@ -144,7 +145,9 @@ uint32_t proc_group_cap_owner(uint32_t pid) {
      * its descriptor says so, so a dead member never resolves a live group's
      * table (and a reused pid starts group-less). */
     for (int i = 0; i < PROC_MAX; i++) {
-        if (proc_table[i].pid != pid) continue;
+        /* A stale, inactive slot is not a live member: its pid must not
+         * redirect a later process's cap-table lookup. */
+        if (!proc_table[i].active || proc_table[i].pid != pid) continue;
         struct LinuxThreadGroup* g = linux_group_of(&proc_table[i]);
         if (g) return g->cap_owner_pid;
     }
@@ -163,8 +166,10 @@ int linux_group_create(struct ProcessDescriptor* pd) {
         g->cap_owner_pid = pd->pid;
         g->cr3 = pd->cr3;
         g->live_threads = 1;
+        g->next_thread_index = 1;   /* leader is index 0; the first clone is 1 */
         pd->tid = pd->pid;
         pd->tgid = pd->pid;
+        pd->thread_index = 0;
         pd->group_index = (uint32_t)i;
         pd->is_group_leader = 1;
         pd->sysret_result = 0;
@@ -212,9 +217,29 @@ int linux_group_join_thread(struct LinuxThreadGroup* g,
     }
     if (gi < 0) return -1;
     if (linux_group_add_thread(g) != 0) return -1;
+    /* A stable index belongs to a LIVE thread, not to a monotonic counter: a
+     * Go group can join and leave threads many times over one group lifetime.
+     * Reuse the lowest index no live member currently holds. The next-index
+     * field is only a starting hint. */
+    uint16_t ti = 1;
+    for (; ti < LINUX_THREADS_MAX; ti++) {
+        int used = 0;
+        for (int i = 0; i < PROC_MAX; i++) {
+            if (proc_table[i].active &&
+                proc_table[i].group_index == (uint32_t)gi &&
+                proc_table[i].thread_index == ti) { used = 1; break; }
+        }
+        if (!used) break;
+    }
+    if (ti >= LINUX_THREADS_MAX) {
+        (void)linux_group_leave_thread(g);
+        return -1;
+    }
     child->cr3 = g->cr3;   /* membership means the group's one root */
     child->tid = child->pid;
     child->tgid = g->group_id;
+    child->thread_index = ti;
+    g->next_thread_index = (uint32_t)ti + 1u;
     child->group_index = (uint32_t)gi;
     child->is_group_leader = 0;
     child->sysret_result = 0;
@@ -224,8 +249,11 @@ int linux_group_join_thread(struct LinuxThreadGroup* g,
 /* ─── E7 TG-1 I4: the forward lease ───────────────────────────────────────
  * The state is the group's three fields (`fwd_busy`, `fwd_owner_tid`,
  * `fwd_wait_mask`); this is the whole transition table. The mask is one bit
- * per descriptor slot, so the wait list is bounded by LINUX_THREADS_MAX and
- * needs no allocation. The BSP runs every transition with interrupts off
+ * per descriptor slot in the PROCESS TABLE: a group's members need not start
+ * at slot 0 (sidecars occupy the low slots), so an 8-bit/LINUX_THREADS_MAX
+ * mask lost every waiter above slot 7 — the Go gate's third thread sat at
+ * slot 8 and its sigaltstack got a bare EAGAIN. PROC_MAX bits cover every
+ * descriptor; LINUX_THREADS_MAX still bounds group admission. The BSP runs every transition with interrupts off
  * inside a syscall, so acquire/release are atomic against each other. */
 int linux_group_fwd_acquire(struct LinuxThreadGroup* g, uint32_t tid) {
     if (!g || !g->used || g->exiting || tid == 0) return -1;
@@ -238,14 +266,14 @@ int linux_group_fwd_acquire(struct LinuxThreadGroup* g, uint32_t tid) {
 }
 
 int linux_group_fwd_wait(struct LinuxThreadGroup* g, uint32_t slot) {
-    if (!g || !g->used || slot >= LINUX_THREADS_MAX) return -1;
-    g->fwd_wait_mask |= (uint8_t)(1u << slot);
+    if (!g || !g->used || slot >= PROC_MAX) return -1;
+    g->fwd_wait_mask |= (1u << slot);
     return 0;
 }
 
 int linux_group_fwd_cancel_wait(struct LinuxThreadGroup* g, uint32_t slot) {
-    if (!g || !g->used || slot >= LINUX_THREADS_MAX) return -1;
-    g->fwd_wait_mask &= (uint8_t)~(1u << slot);
+    if (!g || !g->used || slot >= PROC_MAX) return -1;
+    g->fwd_wait_mask &= ~(1u << slot);
     return 0;
 }
 
@@ -258,13 +286,13 @@ int linux_group_fwd_release(struct LinuxThreadGroup* g, uint32_t tid) {
 }
 
 uint32_t linux_group_fwd_next_waiter(struct LinuxThreadGroup* g) {
-    if (!g || !g->used) return LINUX_THREADS_MAX;
-    for (uint32_t i = 0; i < LINUX_THREADS_MAX; i++) {
-        if (!(g->fwd_wait_mask & (uint8_t)(1u << i))) continue;
-        g->fwd_wait_mask &= (uint8_t)~(1u << i);
+    if (!g || !g->used) return PROC_MAX;
+    for (uint32_t i = 0; i < PROC_MAX; i++) {
+        if (!(g->fwd_wait_mask & (1u << i))) continue;
+        g->fwd_wait_mask &= ~(1u << i);
         return i;
     }
-    return LINUX_THREADS_MAX;
+    return PROC_MAX;
 }
 
 int linux_group_fwd_grant(struct LinuxThreadGroup* g, uint32_t tid) {
@@ -295,6 +323,7 @@ void linux_group_destroy(struct LinuxThreadGroup* g) {
     g->cap_owner_pid = 0;
     g->fwd_owner_tid = 0;
     g->fwd_wait_mask = 0;
+    g->next_thread_index = 0;
     g->cr3 = 0;
     g->heap_base = 0;
     g->heap_limit = 0;
@@ -309,6 +338,7 @@ void linux_group_clear_identity(struct ProcessDescriptor* pd) {
     if (!pd) return;
     pd->tid = 0;
     pd->tgid = 0;
+    pd->thread_index = 0;
     pd->group_index = LINUX_GROUP_NONE;
     pd->is_group_leader = 0;
     pd->sysret_result = 0;

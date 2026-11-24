@@ -216,14 +216,19 @@ the reply would wake the leader and leave the child parked. Per-thread
 park/wake is I3/I4 work; the probe's post-clone path is kernel-local
 `getpid`/`gettid`/`exit` plus shared memory only.
 
-### 2.6 Checkpoint has one Linux task slot
+### 2.6 Checkpoint record carries group identity; payload still one Linux task
 
-`ENV_CKPT_MAX_TASKS` is 4 (`kernel/env_ckpt.h`: the two sidecars, one Linux
-tenant, one spare). `EnvCkptTask` carries one name/kind/entry/stack record.
-`EnvPayloadTask` carries one Linux register context, one `fs_base`, one set of
-brk/mmap/image fields, and a per-task page count/block. The restore creates
-one Linux child and holds it for the pour; `env_payload` refuses a task that
-is not in the one restorable form.
+TG-2a landed the record half. `ENV_CKPT_MAX_TASKS` is 10 (two sidecars plus
+the eight-thread group cap), while the registration wire keeps its own
+`ENV_CKPT_REG_TASKS = 4`, so the 200-byte `struct EnvCkptRegister` body is unchanged.
+`EnvCkptTask` carries a group id, a stable group-relative thread index and a
+leader flag; the record version is 2. The group leader is stamped after
+`linux_group_create`, and each clone appends its thread record.
+
+`EnvPayloadTask` is still single-context: one Linux register frame, one
+`fs_base`, one set of brk/mmap/image fields, and a per-task page count/block.
+The restore still creates one Linux child and holds it for the pour. Shared
+page ownership and multi-thread capture/restore are TG-2b/TG-2d.
 
 `ep_linux_page()` assigns pages by the task's own image/heap/stack ranges.
 Two threads sharing a heap would produce duplicate page entries unless one
@@ -720,10 +725,11 @@ single-Linux-task: one `EnvPayloadTask`, one context, one page walk, one held
 child. A thread group needs all of the following before the gate can claim
 E7 parity:
 
-1. **Schema.** Bump the checkpoint/payload format. `ENV_CKPT_MAX_TASKS` rises
-   to at least 8. A Linux task record gains a group id, a thread index, a
-   leader flag and a per-thread tid slot. The name-only lookup cannot identify
-   two threads of the same group; lookup must use `(group name, thread index)`.
+1. **Schema.** (TG-2a landed the record half: version 2, ten task slots, group
+   id/index/leader, and kernel stamps at group create and clone.) The payload
+   format still needs its multi-context bump. The name-only lookup cannot
+   identify two threads of the same group; lookup must use
+   `(group id, thread index)`.
 2. **Page ownership.** The group leader owns the shared image and heap page
    blocks; non-leader threads own only pages unique to them. The current
    `ep_linux_page()` predicate gives every thread the same heap range and would

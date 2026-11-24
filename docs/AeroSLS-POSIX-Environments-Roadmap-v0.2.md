@@ -2670,10 +2670,12 @@ frames returned — bounded, never leaked.
 
 **The band.** `PERSIST_ENV_REPLICA_*` at 7760/7768 (under STREAM_DIR's
 8192) and a band at 1261568 = exactly the payload band's end, pinned by
-a `_Static_assert` against `env_payload.h`'s geometry — 8 slots × 8 MiB,
-keyed (partition, index), each entry storing the WHOLE record beside
-`seq`, page count, provenance (`src_node`) and the crc. Promotion needs
-no second fetch because the record crossed whole in the BEGIN.
+a `_Static_assert` against `env_payload.h`'s geometry — 8 physical
+slots × 8 MiB, keyed (partition, index), each entry storing the WHOLE record
+beside `seq`, page count, provenance (`src_node`) and the crc. Promotion
+needs no second fetch because the record crossed whole in the BEGIN. After
+TG-2a's 784-byte records, the one-frame directory tracks
+`ENV_REPLICA_MAX = 4`; the remaining physical slots are unused.
 
 **The increments, and their teeth:**
 
@@ -2704,9 +2706,10 @@ no second fetch because the record crossed whole in the BEGIN.
    to (b)'s durable record, and the classification names which rung was
    taken.
 
-**Stated boundaries of increment 1.** The band holds 8 distinct
-identities; the ninth is refused BY NAME (no eviction policy — a fuller
-policy is a real decision, not a default). The 2048-page ceiling is the
+**Stated boundaries of increment 1.** The band has 8 physical slots, and the
+TG-2a directory holds `ENV_REPLICA_MAX` (4) distinct identities; the next
+one is refused BY NAME (no eviction policy — a fuller policy is a real
+decision, not a default). The 2048-page ceiling is the
 slot's size; a larger environment is refused TOO_MANY at BEGIN, never
 truncated. Nothing here has run on a live cluster yet — the host test
 and the static guard are this increment's evidence, and the live arm is

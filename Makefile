@@ -1111,6 +1111,11 @@ BOOTIMAGE_QUIET = $(if $(findstring e7_gate,$(INIT_FEATURES)),--quiet-init)
 # extends. Enabled only by the drill (see .e7g_stall_drill.sh); empty here.
 E7_SLOW_BOOT ?=
 SIDECAR_SLOW_BOOT = $(if $(filter 1,$(E7_SLOW_BOOT)),--features aerosls-sidecar/e7_slow_boot)
+# E7 TG-1's live Go acceptance gate: compile the real static Go fixture into
+# the POSIX sidecar and spawn it from the system profile. Never a shipped
+# image; selected only by the live gate check's dedicated build.
+E7_GO_GATE ?=
+SIDECAR_GO_GATE = $(if $(filter 1,$(E7_GO_GATE)),--features aerosls-sidecar/e7_go_gate)
 SIDECAR_INIT_ELF   ?= user/target/x86_64-unknown-none/release/init
 SIDECAR_DM_ELF     ?= user/target/x86_64-unknown-none/release/dm
 SIDECAR_POSIX_ELF ?= user/target/x86_64-unknown-none/release/posix
@@ -1171,7 +1176,7 @@ selfhost-bootimage:
 	@# aerosls-bootimage directly; a stamp is only for an archive this target
 	@# built.) tests/sidecar_stamp_check.sh clause G holds this line.
 	@$(CARGO) build --quiet --manifest-path user/Cargo.toml -p aerosls-dm -p aerosls-sidecar -p aerosls-ramdisk -p aerosls-network -p aerosls-e1000-driver \
-		--features target $(SIDECAR_SLOW_BOOT) --target x86_64-unknown-none --release \
+		--features target $(SIDECAR_SLOW_BOOT) $(SIDECAR_GO_GATE) --target x86_64-unknown-none --release \
 		--bin dm --bin posix --bin ramdisk --bin network --bin e1000_driver \
 		|| { echo "[SELFHOST] REFUSING to pack and stamp: the sidecars did not build for x86_64-unknown-none." >&2; \
 		     echo "           The stamp attests the packed binaries, and reusing existing ones would make it a lie." >&2; \

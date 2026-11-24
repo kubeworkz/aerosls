@@ -354,10 +354,22 @@ __attribute__((weak)) uint32_t proc_group_cap_owner(uint32_t pid) { return pid; 
  * context (pid 0). -1 on table exhaustion (never, with PROC_MAX processes
  * and CAP_TABLE_MAX == PROC_MAX + kernel slot). */
 int cap_table_index(uint32_t pid) {
+    /* An already-bound table for the descriptor's OWN pid wins over group
+     * redirection. A sidecar's caps are minted into that table at create
+     * time; if its pid is ever duplicated by a live Linux thread, following
+     * the thread's group here would silently redirect every channel/cap
+     * operation to the group's table (the single-vCPU respawned-nettest
+     * failure). Threads have no table of their own, so they still fall
+     * through to the group owner below. */
+    uint32_t self = pid;
     /* A Linux group member sees the group's capability table, not a private
      * one: the leader's table carries the environment's caps and its single
      * sidecar channel pair, and I2's clone must find both through this call. */
     pid = proc_group_cap_owner(pid);
+    if (pid != self) {
+        for (int i = 0; i < CAP_TABLE_MAX; i++)
+            if (cap_table_pid[i] == self) return i;
+    }
     if (pid == 0) return 0;
     for (int i = 0; i < CAP_TABLE_MAX; i++)
         if (cap_table_pid[i] == pid) return i;
@@ -3890,6 +3902,17 @@ int cap_create_sidecar_in_personality(uint32_t parent_pid,
                         + (uint64_t)n_img_pages * 4096 + 4096;  /* guard pg */
     uint32_t stk_pages = (m.budget_stack_bytes + 4095) / 4096;
     if (stk_pages < 1) stk_pages = 1;
+    /* E7 live Go gate: Go 1.25.1's amd64 runtime maps its first arena at the
+     * fixed hint 0xc000000000. The default Linux layout puts the stack and
+     * heap above the code base at 0x400000000000, so that hint is outside
+     * the child's span and the runtime rejects every arena probe. This
+     * manifest flag moves the stack immediately below 0xc000000000 and
+     * leaves the heap span starting exactly at it; the gate's `track`
+     * reports the same base, so the sidecar ledger and this stamp agree. */
+    if (personality == PROC_PERSONALITY_LINUX && image_is_elf &&
+        (m.flags & SIDECAR_MANIFEST_FLAG_GO_ARENA)) {
+        stack_base = 0xC000000000ULL - (uint64_t)stk_pages * 4096;
+    }
     uint64_t linux_stack_phys = 0;
     if (personality == PROC_PERSONALITY_LINUX) {
         /* E7 increment 7 (§5.2): the Linux child's stack is ONE
@@ -3947,6 +3970,16 @@ int cap_create_sidecar_in_personality(uint32_t parent_pid,
     /* ── 7. Populate process descriptor ──────────────────────────────── */
     struct ProcessDescriptor* pd = &proc_table[pi];
     pd->pid        = alloc_pid();
+    /* A reused descriptor slot must not retain Linux group identity. The
+     * allocator now keeps PIDs and TIDs disjoint, but resolving a stale
+     * group_index here would still hand the new sidecar another process's
+     * capability table; a Linux child gets its group stamped after this
+     * create (linux_group_create requires NONE). */
+    pd->tid             = 0;
+    pd->tgid            = 0;
+    pd->thread_index    = 0;
+    pd->group_index     = LINUX_GROUP_NONE;
+    pd->is_group_leader = 0;
     /* E7 (increment 2): the child's personality, stamped HERE — inside the
      * create, after the E2 authority gate (step 4) and before the HELD
      * release at the end — so the task is schedulable only with the
@@ -4838,6 +4871,13 @@ int cap_create_sidecar_in_personality(uint32_t parent_pid,
                                         stack_base,
                                         stack_base + (uint64_t)stk_pages * 4096,
                                         bib_n_caps);
+        /* TG-2a: the group itself exists by now (linux_group_create above);
+         * stamp its identity into the same record slot. This is the leader's
+         * slot, indexed 0 by construction. */
+        (void)env_ckpt_linux_group_stamp(parent->partition_id, parent->name,
+                                         pd->name, pd->tgid,
+                                         pd->thread_index,
+                                         pd->is_group_leader);
     }
 
     /* Return the parent's CHAN_R (for receiving the child's first reply). */

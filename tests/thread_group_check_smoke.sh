@@ -180,7 +180,7 @@ tooth current-thread E1 "process_find_current no longer matches the executing st
 
 # ─── F: the waiter's mask bit is never set ───────────────────────────────
 cp -a "$W/base" "$W/mask"
-sed -i '/g->fwd_wait_mask |= (uint8_t)(1u << slot);/d' "$W/mask/kernel/linux_thread.c"
+sed -i '/g->fwd_wait_mask |= (1u << slot);/d' "$W/mask/kernel/linux_thread.c"
 tooth lease-mask F3 "a busy sibling parks without recording its wait bit" "$W/mask"
 
 # ─── F: the restart lands after the syscall instead of on it ─────────────

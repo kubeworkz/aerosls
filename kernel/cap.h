@@ -1058,6 +1058,10 @@ struct SidecarManifest {
  * the drop-proof wire. The plain E7 image never sets it, so its census
  * still runs. */
 #define SIDECAR_MANIFEST_FLAG_E3_PROFILE 0x0004u
+/* The live Go gate's fixed arena (user/proto FLAG_GO_ARENA): a Linux ELF
+ * child's stack sits just below 0xc000000000 and its heap starts there,
+ * matching Go 1.25.1's first arena hint. No authority; a layout selector. */
+#define SIDECAR_MANIFEST_FLAG_GO_ARENA 0x0008u
 #define SIDECAR_BIB_FLAG_E3_PROFILE      0x8u
 
 /* E6: the sidecar's OWN identity, the third thing a sidecar cannot otherwise

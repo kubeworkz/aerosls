@@ -399,6 +399,7 @@ fn gate_boot_stretch(k: &RealKernel, console_r: Option<u32>) {
 pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     let bib = unsafe { BootInfo::from_raw(bib_ptr) }.expect("[POSIX] corrupt boot info");
     let caps = BootCaps::from_bib(&bib).expect("missing initial caps");
+    klog(b"[POSIX] budget_len=", caps.budget_len as u32, b"");
 
     // Budget → heap and the request-buffer arena. The budget MEM cap is the
     // whole region; the main bump heap and BudgetAlloc must NOT both claim
@@ -413,10 +414,23 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     // first MiB (256 x 4 KiB buffers — ample for the mount + demo reads),
     // the main heap owns the rest.
     const REQ_BUF_ARENA: u64 = 1024 * 1024;   /* grant-buffer arena within the budget */
+    /* The live Go gate stages its 2.3 MiB ELF at the budget tail just
+     * before SYS_SLS_LINUX_SPAWN. That tail is NOT heap: without this
+     * reservation the copy starts at budget_base + 1 MiB — the bump heap's
+     * first page — and replaces the console Arc/VFS objects with Go bytes
+     * (observed live: the console pump's first drain panicked
+     * "not a console"). The regular profiles reserve nothing. */
+    let gate_reserve = if cfg!(feature = "e7_go_gate") {
+        crate::e7_go_gate::GO_GATE_RESERVE
+    } else {
+        0
+    };
     unsafe {
         HEAP.init(
             (caps.budget_base + REQ_BUF_ARENA) as usize,
-            caps.budget_len.saturating_sub(REQ_BUF_ARENA) as usize,
+            caps.budget_len
+                .saturating_sub(REQ_BUF_ARENA)
+                .saturating_sub(gate_reserve) as usize,
         );
     }
     let alloc = BudgetAlloc::new(caps.budget_slot, caps.budget_base, REQ_BUF_ARENA);
@@ -528,7 +542,44 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     // and boot time. A gate TENANT is a different manifest and does not carry
     // the flag, so the E7 gate image still runs its own workload.
     let e3_profile = bib.is_e3_profile();
-    if (census_host || gate) && !e3_profile {
+    /* E7 TG-1's live Go acceptance profile: a dedicated build (never the
+     * shipped image) spawns the real static Go fixture from the system POSIX
+     * sidecar instead of the native probes. Its markers are the G1.1–G1.5
+     * evidence; the kernel's clone/exit lines are G1.2/G1.7. */
+    if cfg!(feature = "e7_go_gate") {
+        if !e3_profile {
+            match crate::e7_go_gate::stage(&mut booted.proc.vfs, 0) {
+                Ok(()) => match crate::e7_go_gate::spawn(
+                    &RealKernel,
+                    caps.budget_base,
+                    caps.budget_len,
+                ) {
+                    Ok(sp) => match booted.proc.vfs.add_task() {
+                        Ok(vt) => {
+                            if crate::linux::track(
+                                sp.ch_r,
+                                sp.ch_w,
+                                crate::e7_go_gate::GO_GATE_NAME,
+                                0,
+                                sp.heap_base,
+                                sp.heap_limit,
+                                vt,
+                                false,
+                            ) {
+                                klog(b"[GTG] spawned ch_r=", sp.ch_r, b"");
+                            } else {
+                                klog(b"[GTG] TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+                            }
+                        }
+                        Err(_) => klog(b"[GTG] VFS task alloc FAILED ch_r=", sp.ch_r, b""),
+                    },
+                    Err(rc) => klog(b"[GTG] spawn FAILED rc=", rc as u32, b""),
+                },
+                Err(e) => klog(b"[GTG] stage-fail", e.code() as u32, b"errno"),
+            }
+        }
+    }
+    if !cfg!(feature = "e7_go_gate") && (census_host || gate) && !e3_profile {
         if !gate {
             // E7 boot proof (Linux ABI Shim Design §3.3 steps 5-7): spawn the
             // Linux-personality probe from THIS sidecar — the design-true creator
@@ -862,7 +913,17 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
             // to a stale device vs. a parse failure.
             klog(b"[POSIX] aero state=", booted.proc.vfs.aerofs_state(), b"");
         }
-        match booted.proc.run_next() {
+        /* The dedicated Go gate image runs the fixture, not the E7 applet
+         * suite. `irqtest` p4 deliberately kills its driver process and
+         * relies on init respawning the environment; when the gate fixture
+         * is the co-resident workload that kill orphans the Go child mid-run
+         * and G1.6/G1.7 can never be read from one clean run. Ordinary and
+         * E7 gate images keep the suite unchanged. */
+        match if cfg!(feature = "e7_go_gate") {
+            None
+        } else {
+            booted.proc.run_next()
+        } {
             Some(_) => {
                 // Drain irqtest's pending output ring. The applet only
                 // stores (ptr,len) of 'static byte strings and yields; this

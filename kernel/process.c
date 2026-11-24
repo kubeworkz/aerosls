@@ -7,6 +7,7 @@
 #include "partition.h"
 #include "frame_pool.h"
 #include "timer.h"   /* Phase 5 deadlines: kernel_tick_counter in cap_park_deadline_tick */
+#include "../arch/x86/gdt.h"
 #include "../arch/x86/user_paging.h"
 #include "../user/permissions.h"
 #include "cap.h"   /* Seed Kernel Phase 1: strong cap_current_pid()/cap_proc_cr3() below */
@@ -37,6 +38,10 @@ extern void syscall_return_path(void);
 extern void kernel_yield_switch(uint64_t* rsp_save, uint64_t cr3,
                                 const uint64_t* frame);
 extern void kernel_resume_control_plane(void);
+
+/* Defined beside the park capture lower in this file; clone needs the same
+ * per-CPU entry scratch while the syscall is still in flight. */
+static void proc_capture_entry_regs(struct CapParkCtx* ctx);
 
 struct ProcessDescriptor proc_table[PROC_MAX];
 uint32_t                 proc_count = 0;
@@ -243,19 +248,29 @@ void process_init(void) {
 }
 
 // ─── alloc_pid ───────────────────────────────────────────────────────────────
-// Returns a fresh PID that doesn't collide with any currently active process.
-// Used by cap_create_sidecar() which bypasses process_create()'s catalog
-// lookup (sidecar images are not SLS catalog objects).
-uint32_t alloc_pid(void) {
-    /* Scan for the highest active PID and return max+1. This is O(PROC_MAX)
-     * but that's 16 — negligible, and monotonic PIDs never recycle so no
-     * bitmap is needed. */
-    uint32_t max_pid = 99;  /* below the 100+ range */
+// Every PID and Linux TID comes from the same `next_pid` sequence. A sidecar
+// respawn therefore cannot hand a live process a number that a later clone
+// will reuse as a TID: cap_table_index() resolves a pid through
+// proc_group_cap_owner(), so two live descriptors with one pid would make the
+// sidecar's capability lookups run against the Linux thread's group table
+// (the single-vCPU watchdog-respawn nettest failure).
+//
+// The active-descriptor check is defence in depth: `next_pid` is monotonic, but
+// a slot can still hold a pid from a path that did not allocate through here,
+// and returning it would recreate the collision.
+static int pid_is_live(uint32_t pid) {
     for (int i = 0; i < PROC_MAX; i++) {
-        if (proc_table[i].active && proc_table[i].pid > max_pid)
-            max_pid = proc_table[i].pid;
+        if (proc_table[i].active && proc_table[i].pid == pid) return 1;
     }
-    return max_pid + 1;
+    return 0;
+}
+
+uint32_t alloc_pid(void) {
+    uint32_t pid;
+    do {
+        pid = next_pid++;
+    } while (pid < 100 || pid_is_live(pid));
+    return pid;
 }
 
 // ─── nested_ring3_prep ───────────────────────────────────────────────────────
@@ -445,7 +460,7 @@ uint32_t process_create(struct ProcCreateRequest* req) {
 
     // 6. Populate the descriptor
     struct ProcessDescriptor* spawner = process_find_current();
-    pd->pid             = next_pid++;
+    pd->pid             = alloc_pid();
     pr_strcpy(pd->name, req->object_name, PROC_NAME_LEN);
     pd->object_id       = obj->object_id;
     pd->cr3             = new_cr3;
@@ -497,6 +512,7 @@ uint32_t process_create(struct ProcCreateRequest* req) {
     //    nested case — same value, redundant but harmless).
     per_cpu_data[0].kernel_rsp = pd->syscall_stack_top;
     if (spawner) nested_ring3_prep(spawner, pd);
+    tss_set_rsp0(pd->syscall_stack_top);
     kernel_enter_ring3(&pd->kernel_rsp, &pd->kernel_cr3,
                        pd->cr3, pd->user_rip, pd->user_rsp);
 
@@ -610,7 +626,7 @@ static uint32_t program_spawn_common(const char* object_name, uint32_t owner_uid
 
     // 6. Populate the process descriptor
     struct ProcessDescriptor* spawner = process_find_current();
-    pd->pid          = next_pid++;
+    pd->pid          = alloc_pid();
     pr_strcpy(pd->name, object_name, PROC_NAME_LEN);
     pd->object_id    = obj->object_id;
     pd->cr3          = new_cr3;
@@ -660,6 +676,7 @@ static uint32_t program_spawn_common(const char* object_name, uint32_t owner_uid
 
     if (!async) {
         if (spawner) nested_ring3_prep(spawner, pd);
+        tss_set_rsp0(pd->syscall_stack_top);
         kernel_enter_ring3(&pd->kernel_rsp, &pd->kernel_cr3,
                            pd->cr3, pd->user_rip, pd->user_rsp);
 
@@ -816,7 +833,10 @@ int linux_clone_thread(struct ProcessDescriptor* parent,
     /* A reused slot must not inherit anything: this is a new thread, and
      * every field below is re-stamped explicitly rather than trusted. */
     for (int i = 0; i < (int)sizeof(*child); i++) ((uint8_t*)child)[i] = 0;
-    child->pid          = next_pid++;
+    /* Same allocator as every sidecar and SLS process: a Linux thread can
+     * never reuse a live PID, because no allocator path advances a separate
+     * sequence. */
+    child->pid          = alloc_pid();
     pr_strcpy(child->name, parent->name, PROC_NAME_LEN);
     child->object_id    = parent->object_id;
     child->cr3          = g->cr3;          /* the group's one root */
@@ -832,6 +852,32 @@ int linux_clone_thread(struct ProcessDescriptor* parent,
     child->waiting_chan = CAP_NONE;
     child->group_index  = LINUX_GROUP_NONE;
     linux_clone_build_context(&child->ring3_ctx, parent_rip, plan->child_stack);
+    /* Linux clone returns the PARENT's register state to the child, not a
+     * zeroed frame: Go's runtime.clone keeps mstart in R12, the m pointer in
+     * R13 and the g pointer in R9 across the syscall, then enters mstart via
+     * CALL R12. With the zeroed context the child called address 0 (observed
+     * live: clone TID joins, then [FAULT] rip=0). Read the still-live entry
+     * scratch, as the park path does, and overwrite everything the child
+     * must inherit; rax stays 0 and rsp/rsi become the child stack. */
+    {
+        struct CapParkCtx p;
+        proc_capture_entry_regs(&p);
+        child->ring3_ctx.r15 = p.r15;
+        child->ring3_ctx.r14 = p.r14;
+        child->ring3_ctx.r13 = p.r13;
+        child->ring3_ctx.r12 = p.r12;
+        child->ring3_ctx.r11 = p.r11;
+        child->ring3_ctx.r10 = p.linux_args[3];
+        child->ring3_ctx.r9  = p.linux_args[5];
+        child->ring3_ctx.r8  = p.linux_args[4];
+        child->ring3_ctx.rbp = p.rbp;
+        child->ring3_ctx.rdi = p.linux_args[0];
+        child->ring3_ctx.rsi = plan->child_stack;
+        child->ring3_ctx.rdx = p.linux_args[2];
+        child->ring3_ctx.rcx = parent_rip;
+        child->ring3_ctx.rbx = p.rbx;
+        child->ring3_ctx.rflags = p.r11;
+    }
 
     if (linux_group_join_thread(g, child) != 0) {
         proc_free_syscall_stack(child);
@@ -1153,6 +1199,7 @@ void process_exit(uint32_t exit_code) {
                      * use. */
                     per_cpu_data[0].kernel_rsp =
                         proc_table[j].syscall_stack_top;
+                    tss_set_rsp0(proc_table[j].syscall_stack_top);
                     break;
                 }
             }
@@ -1430,6 +1477,13 @@ static int pick_next_process_in_partition(uint32_t partition_id, int exclude_idx
 //    continues exactly where it left off.
 //  - otherwise:        iretq to the process's saved ring-3 context.
 static void proc_build_resume_frame(struct ProcessDescriptor* next, uint64_t* f) {
+    /* The CPL-3 entry point (timer IRQ, fault, syscall gate) must not land on
+     * the static low .bss interruption_stack: a low-linked ET_EXEC's text can
+     * cover that address, so the CPU would write an interrupt frame over the
+     * task's code. Point RSP0 at the task's own kernel syscall stack, which
+     * is supervisor-mapped in every user page table. */
+    if (next->syscall_stack_top != 0)
+        tss_set_rsp0(next->syscall_stack_top);
     /* E7 §5.3 (the plan's increment 4): FSBASE follows the task being
      * switched IN to — one wrmsr at the single frame-builder every switch
      * path honours (timer schedule_ring3, kernel_switch_next, the control-
@@ -2348,7 +2402,7 @@ void linux_forward_lease_release(struct ProcessDescriptor* cur) {
     for (;;) {
         uint32_t slot = linux_group_fwd_next_waiter(g);
         struct ProcessDescriptor* pd;
-        if (slot >= LINUX_THREADS_MAX) return;
+        if (slot >= PROC_MAX) return;
         pd = &proc_table[slot];
         if (!pd->active || pd->state != PROC_BLOCKED ||
             pd->park_syscall != SYS_LINUX_LEASE_RESUME)
