@@ -452,21 +452,51 @@ static int blob_find_page(const struct EnvPayloadHead* h, uint64_t vaddr,
     return 0;
 }
 
-/* Rewrite BOTH version words to `version` (directory header + blob head).
- * No index byte changes, so the head crc remains valid. */
-static int blob_set_version(uint32_t version) {
+static int blob_task_at(const struct EnvPayloadHead* h, uint32_t t,
+                        struct EnvPayloadTask* out) {
+    if (t >= h->n_tasks) return 0;
+    uint32_t u = 3u * (uint32_t)sizeof(struct EnvPayloadRegion) +
+                 t * (uint32_t)sizeof(struct EnvPayloadTask);
+    memcpy(out, g_blob_index + u, sizeof *out);
+    return 1;
+}
+
+/* Rewrite just the blob head's version; the directory stays current, so the
+ * restore reaches the head check and refuses the mismatched task stride. */
+static int blob_set_head_version(uint32_t version) {
     if (!blob_load_head_and_index()) return 0;
     struct EnvPayloadHead* h = (struct EnvPayloadHead*)g_blob_head;
     h->version = version;
-    if (nvme_write_sync(ENV_PAYLOAD_SLOT_LBA(0), g_blob_head) != 0)
-        return 0;
+    return nvme_write_sync(ENV_PAYLOAD_SLOT_LBA(0), g_blob_head) == 0;
+}
 
-    uint8_t d[4096];
-    if (nvme_read_sync(PERSIST_ENV_PAYLOAD_HDR_LBA, d) != 0) return 0;
-    struct EnvPayloadDirHead* dh = (struct EnvPayloadDirHead*)d;
-    if (dh->magic != ENV_PAYLOAD_DIR_MAGIC) return 0;
-    dh->version = version;
-    return nvme_write_sync(PERSIST_ENV_PAYLOAD_HDR_LBA, d) == 0;
+/* TG-2b: replace the second page entry of task 0 with a copy of the first
+ * but a different CRC. The block count and total page count are unchanged
+ * (so the layout walk still succeeds); the restore must name the duplicate
+ * before any byte moves. */
+static int blob_duplicate_page_bad_crc(void) {
+    if (!blob_load_head_and_index()) return 0;
+    struct EnvPayloadHead* h = (struct EnvPayloadHead*)g_blob_head;
+    uint32_t total = 0;
+    if (!blob_index_total(h, &total) || h->n_tasks == 0) return 0;
+    uint32_t u = 3u * (uint32_t)sizeof(struct EnvPayloadRegion) +
+                 h->n_tasks * (uint32_t)sizeof(struct EnvPayloadTask);
+    uint32_t np = test_read32(g_blob_index + u);
+    if (np < 2) return 0;
+    uint32_t e0 = u + 4u;
+    uint32_t e1 = e0 + EP_PAGE_ENTRY_BYTES;
+    memcpy(g_blob_index + e1, g_blob_index + e0, EP_PAGE_ENTRY_BYTES);
+    uint32_t crc = test_read32(g_blob_index + e1 + 8u);
+    test_write32(g_blob_index + e1 + 8u, crc ^ 1u);
+    h->crc32 = test_crc32(0, g_blob_index, total + h->console_len);
+    uint32_t frames = h->bytes / 4096u - 1u - h->n_pages;
+    for (uint32_t f = 0; f < frames; f++) {
+        if (nvme_write_sync(ENV_PAYLOAD_SLOT_LBA(0) + 8ull +
+                            (uint64_t)f * 8ull,
+                            g_blob_index + (uint64_t)f * 4096u) != 0)
+            return 0;
+    }
+    return nvme_write_sync(ENV_PAYLOAD_SLOT_LBA(0), g_blob_head) == 0;
 }
 
 /* Rewrite one soft page's permission word, then recompute the writer's
@@ -706,6 +736,112 @@ static uint32_t setup_and_capture_linux(int linux_ctx) {
     return env_payload_capture_all();
 }
 
+/* TG-2b: a two-thread gate group. The leader owns the shared image/heap
+ * page blocks; the sibling is a distinct task record with its own context
+ * and no shared pages of its own. */
+#define G_GROUP 101u
+static uint32_t setup_and_capture_group(void) {
+    disk_reset();
+    map_reset();
+    lmap_reset();
+    env_ckpt_reset();
+    memset(proc_table, 0, sizeof proc_table);
+    linux_groups_init();
+    g_snap_ret = 1; g_snap_len = 0; g_inject_ret = 1;
+    g_identity_seen = 1;
+    g_l_soft_heap = 0;
+
+    fill_pattern((uint8_t*)g_region_buf, 4096, 0x11);
+    fill_pattern((uint8_t*)g_rdheap_buf, 4096, 0x22);
+    fill_pattern((uint8_t*)g_rdstor_buf, 4096, 0x33);
+    map_page((uint64_t)(uintptr_t)g_region_buf, (uint64_t)(uintptr_t)g_region_buf);
+    map_page((uint64_t)(uintptr_t)g_rdheap_buf, (uint64_t)(uintptr_t)g_rdheap_buf);
+    map_page((uint64_t)(uintptr_t)g_rdstor_buf, (uint64_t)(uintptr_t)g_rdstor_buf);
+
+    for (int i = 0; i < 2; i++) {
+        fill_pattern(g_l_img[i], 4096, (uint8_t)(0x40 + i));
+        fill_pattern(g_l_stk[i], 4096, (uint8_t)(0x60 + i));
+        fill_pattern(g_l_heap[i], 4096, (uint8_t)(0x80 + i));
+        map_page_l(L_IMG + (uint64_t)i * 4096,
+                   (uint64_t)(uintptr_t)g_l_img[i], PTE_RX);
+        map_page_l(L_STACK + (uint64_t)i * 4096,
+                   (uint64_t)(uintptr_t)g_l_stk[i], PTE_RWNX);
+        map_page_l(L_HEAP + (uint64_t)i * 4096,
+                   (uint64_t)(uintptr_t)g_l_heap[i], PTE_RWNX);
+    }
+
+    make_record_linux();
+    g_scratch.n_tasks = 3;
+    g_scratch.tasks[1].group_id     = G_GROUP;
+    g_scratch.tasks[1].thread_index = 0;
+    g_scratch.tasks[1].leader       = 1;
+    g_scratch.tasks[2] = g_scratch.tasks[1];
+    g_scratch.tasks[2].entry        = L_IMG + 0x100;
+    g_scratch.tasks[2].thread_index = 1;
+    g_scratch.tasks[2].leader       = 0;
+    g_scratch.tasks[2].stack_bottom = 0;
+    g_scratch.tasks[2].stack_top    = 0;
+    if (env_ckpt_record(&g_scratch) != 0) return 0;
+
+    struct ProcessDescriptor* px = &proc_table[0];
+    px->active = 1;
+    strcpy(px->name, "aerosls.posix.2");
+    px->cr3 = (uint64_t)(uintptr_t)g_pml4;
+    px->waiting_chan = 3u;
+    px->park_syscall = SYS_SLS_CAP_RECV;
+    px->park_ctx.r11 = 111;
+    px->user_rip = IMG_VADDR;
+    px->user_rsp = IMG_VADDR + 0x2000;
+
+    struct ProcessDescriptor* lx = &proc_table[1];
+    lx->active = 1;
+    lx->pid = G_GROUP;
+    strcpy(lx->name, "e7.gate.user.0");
+    lx->cr3 = (uint64_t)(uintptr_t)g_pml4_l;
+    lx->state = PROC_SUSPENDED;
+    lx->waiting_chan = CAP_NONE;
+    lx->has_ring3_ctx = 1;
+    lx->fs_base = 0x700000ull;
+    if (linux_group_create(lx) != 0) return 0;
+    linux_group_stamp_memory(lx, L_HEAP, L_HEAP + 0x10000ull,
+                             L_IMG, L_IMG + 0x2000ull);
+    linux_group_set_brk(lx, L_HEAP + 0x2000ull);
+    linux_group_set_mmap_top(lx, L_HEAP + 0x4000ull);
+    {
+        uint64_t* c = (uint64_t*)&lx->ring3_ctx;
+        memset(c, 0, sizeof lx->ring3_ctx);
+        c[9]  = 0xA1; c[10] = 0xA2; c[11] = 0xA3;
+        c[5]  = 0xA4; c[7]  = 0xA5; c[6]  = 0xA6;
+        c[15] = L_IMG + 0x40;
+        c[17] = 0x202;
+        c[18] = L_STACK + 0x1000;
+        lx->user_rip = c[15];
+        lx->user_rsp = c[18];
+    }
+
+    struct ProcessDescriptor* sx = &proc_table[2];
+    sx->pid = G_GROUP + 1u;
+    strcpy(sx->name, "e7.gate.user.0");
+    sx->group_index = LINUX_GROUP_NONE;
+    sx->state = PROC_SUSPENDED;
+    sx->has_ring3_ctx = 1;
+    sx->waiting_chan = CAP_NONE;
+    sx->fs_base = 0x701000ull;
+    {
+        uint64_t* c = (uint64_t*)&sx->ring3_ctx;
+        c[9]  = 0xD1; c[10] = 0xD2; c[11] = 0xD3;
+        c[5]  = 0xD4; c[7]  = 0xD5; c[6]  = 0xD6;
+        c[15] = L_IMG + 0x100;
+        c[17] = 0x202;
+        c[18] = L_STACK + 0x800;
+        sx->user_rip = c[15];
+        sx->user_rsp = c[18];
+    }
+    if (linux_group_join_thread(linux_group_of(lx), sx) != 0) return 0;
+    sx->active = 1;
+    return env_payload_capture_all();
+}
+
 static void simulate_fresh_boot_linux(void) {
     for (int i = 0; i < 2; i++) {
         memset(g_l_img[i], 0, 4096);
@@ -721,6 +857,15 @@ static void simulate_fresh_boot_linux(void) {
     linux_group_set_mmap_top(&proc_table[1], 0);
     proc_table[1].user_rip = L_IMG;    /* the fresh entry, not the capture point */
     proc_table[1].user_rsp = L_STACK + 0x2000;
+    if (proc_table[2].active) {
+        memset(&proc_table[2].ring3_ctx, 0, sizeof proc_table[2].ring3_ctx);
+        proc_table[2].has_ring3_ctx = 1;
+        proc_table[2].state = PROC_SUSPENDED;
+        proc_table[2].waiting_chan = CAP_NONE;
+        proc_table[2].fs_base = 0;
+        proc_table[2].user_rip = L_IMG + 0x100;
+        proc_table[2].user_rsp = L_STACK + 0x800;
+    }
 }
 
 int main(void) {
@@ -958,6 +1103,67 @@ int main(void) {
     CHECK(proc_table[0].park_ctx.r11 == 111,
           "LINUX: the sidecar task in the SAME payload still gets its park frame (the sidecar path is unchanged)");
 
+    /* ── 6. TG-2b: two contexts, one shared page block ─────────────────── */
+    CHECK(setup_and_capture_group() == 1,
+          "GROUP: a sidecar plus a two-thread Linux group captures as one payload");
+    CHECK(blob_load_head_and_index(),
+          "GROUP: the captured v4 blob can be read back");
+    {
+        struct EnvPayloadHead* h = (struct EnvPayloadHead*)g_blob_head;
+        struct EnvPayloadTask t1, t2;
+        CHECK(h->n_tasks == 3 && h->n_pages == 9,
+              "GROUP: the blob carries three task entries and the nine unique pages (the shared heap is not doubled)");
+        CHECK(blob_task_at(h, 1, &t1) && blob_task_at(h, 2, &t2),
+              "GROUP: both Linux task entries are present");
+        CHECK(t1.group_id == G_GROUP && t1.thread_index == 0 && t1.leader == 1 &&
+              t1.n_pages == 6,
+              "GROUP: the leader is (group 101, index 0), owns the image/stack/heap pages");
+        CHECK(t2.group_id == G_GROUP && t2.thread_index == 1 && t2.leader == 0 &&
+              t2.n_pages == 0,
+              "GROUP: the sibling is a distinct (group 101, index 1) with no duplicate shared pages");
+        CHECK(t2.brk_cur == 0 && t2.mmap_top == 0 && t2.heap_base == 0 &&
+              t2.image_lo == 0,
+              "GROUP: the sibling carries no second copy of the group's heap/image cursors");
+        CHECK(t1.linux_regs[15] == L_IMG + 0x40 &&
+              t2.linux_regs[15] == L_IMG + 0x100 &&
+              t1.fs_base == 0x700000ull && t2.fs_base == 0x701000ull,
+              "GROUP: each thread carries its own rip and fs_base context");
+    }
+    simulate_fresh_boot_linux();
+    pages = 0; cons = 0;
+    rc = env_payload_restore(L_PART, L_IDX, 22, L_SEQ, &pages, &cons);
+    CHECK(rc == EP_REFUSE_NONE && pages == 9,
+          "GROUP: the group replay reaches the pour and writes each shared page once");
+    {
+        const uint64_t* lc = (const uint64_t*)&proc_table[1].ring3_ctx;
+        const uint64_t* sc = (const uint64_t*)&proc_table[2].ring3_ctx;
+        CHECK(lc[15] == L_IMG + 0x40 && sc[15] == L_IMG + 0x100 &&
+              lc[9] == 0xA1 && sc[9] == 0xD1,
+              "GROUP: both thread contexts are installed into their own descriptors");
+    }
+    CHECK(proc_table[1].fs_base == 0x700000ull &&
+          proc_table[2].fs_base == 0x701000ull,
+          "GROUP: each thread keeps its own TLS base");
+    CHECK(linux_group_brk(&proc_table[1]) == L_HEAP + 0x2000ull &&
+          linux_group_mmap_top(&proc_table[1]) == L_HEAP + 0x4000ull,
+          "GROUP: the leader's shared cursors are restored once, and the sibling does not overwrite them");
+
+    /* A shared root with the same vaddr twice is only coherent when both
+     * records describe the same page. A different CRC is a corrupt shared
+     * page index, refused by its own name before the pour. */
+    CHECK(setup_and_capture_linux(1) == 1,
+          "DUP: a payload is captured for the duplicate-page tooth");
+    CHECK(blob_duplicate_page_bad_crc(),
+          "DUP: a page entry can be duplicated in place with a different CRC");
+    simulate_fresh_boot_linux();
+    pages = 0; cons = 0;
+    rc = env_payload_restore(L_PART, L_IDX, 22, L_SEQ, &pages, &cons);
+    CHECK(rc == EP_REFUSE_DUP && pages == 0 && cons == 0,
+          "DUP: one vaddr twice with different bytes is refused by name, before any pour");
+    CHECK(env_payload_last_refusal().a == 0 &&
+          env_payload_last_refusal().b == 1,
+          "DUP: the refusal names the first entry and the duplicate");
+
     /* E7 §10.15: a soft leaf is captured and restored as a soft leaf.
      * The page table is reset to its fresh shape with the heap page
      * missing; the pour must allocate that page and install the state
@@ -993,35 +1199,18 @@ int main(void) {
                  (uint8_t[]){0x80 ^ 0, 0x80 ^ 1, 0x80 ^ 2, 0x80 ^ 3}, 4) == 0,
           "SOFT: the captured bytes are in the newly mapped soft frame");
 
-    /* E7 §10.15: v2 remains readable when it has no soft pages. Both
-     * version words are rewritten, as a v2 writer would have emitted them;
-     * the page permissions are already all v2-representable. */
+    /* TG-2b: the task stride grew for group identity. A previous-version
+     * blob is refused before its task array is walked; its page blocks would
+     * otherwise be read eight bytes late. */
     CHECK(setup_and_capture_linux(1) == 1,
-          "V2: a soft-free payload is captured as the v3 writer's baseline");
-    CHECK(blob_set_version(2),
-          "V2: both the directory and blob version words can be rewritten to 2");
-    simulate_fresh_boot_linux();
-    pages = 0; cons = 0;
-    rc = env_payload_restore(L_PART, L_IDX, 22, L_SEQ, &pages, &cons);
-    CHECK(rc == EP_REFUSE_NONE && pages == 9,
-          "V2: a soft-free v2 payload replays every page");
-
-    /* The v3-only bit is refused when the blob claims to be v2: a v2 writer
-     * could not have emitted it, so accepting it would silently import a
-     * permission the old format never described. */
-    g_l_soft_heap = 1;
-    CHECK(setup_and_capture_linux(1) == 1,
-          "V2+SOFT: a soft page is captured for the compatibility tooth");
-    g_l_soft_heap = 0;
-    CHECK(blob_set_version(2),
-          "V2+SOFT: the blob and directory can both be marked v2");
+          "V3: a soft-free payload is captured by the v4 writer");
+    CHECK(blob_set_head_version(ENV_PAYLOAD_REC_VERSION_PREV),
+          "V3: the blob head can carry the previous version for the refusal tooth");
     simulate_fresh_boot_linux();
     pages = 0; cons = 0;
     rc = env_payload_restore(L_PART, L_IDX, 22, L_SEQ, &pages, &cons);
     CHECK(rc == EP_REFUSE_FORMAT && pages == 0 && cons == 0,
-          "V2+SOFT: a v2 blob claiming the v3 soft bit is refused by format, before any pour");
-    CHECK(env_payload_last_refusal().a == 8,
-          "V2+SOFT: the refusal is the soft-permission rule (a=8), not a torn index CRC (a=5)");
+          "V3: a v3 blob is refused by format before any pour (the v4 task stride is not its stride)");
 
     /* A soft page is its own state: USER or W/X alongside it is a
      * contradiction. Rewrite the permission word and recompute the index

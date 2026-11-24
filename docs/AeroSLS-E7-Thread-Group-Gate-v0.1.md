@@ -225,16 +225,21 @@ the eight-thread group cap), while the registration wire keeps its own
 leader flag; the record version is 2. The group leader is stamped after
 `linux_group_create`, and each clone appends its thread record.
 
-`EnvPayloadTask` is still single-context: one Linux register frame, one
-`fs_base`, one set of brk/mmap/image fields, and a per-task page count/block.
-The restore still creates one Linux child and holds it for the pour. Shared
-page ownership and multi-thread capture/restore are TG-2b/TG-2d.
+TG-2b landed the payload half: `ENV_PAYLOAD_REC_VERSION` is 4 and every
+`EnvPayloadTask` carries its group id, thread index and leader flag. A group's
+siblings share a name, so capture and replay resolve them by
+`(group_id, thread_index)`, not by name. The leader owns the shared image and
+budget page block; a sibling carries its own registers and `fs_base` but no
+duplicate shared pages, and the group's brk/mmap cursors are carried once.
+The restore validates the group layout and duplicate destinations before the
+pour and installs every held thread's context. The replay create still spawns
+one Linux child; creating/releasing the sibling set is TG-2d.
 
 `ep_linux_page()` assigns pages by the task's own image/heap/stack ranges.
-Two threads sharing a heap would produce duplicate page entries unless one
-owner is made responsible for the shared range. `ENV_PAYLOAD_REC_VERSION` is
-3; any group layout change is a format bump, not a silent reuse of the spare
-task slot.
+TG-2b makes the leader the one owner of the shared image/heap ranges, skips
+those ranges for siblings, and refuses a duplicate vaddr in one root with a
+different CRC or grant. `ENV_PAYLOAD_REC_VERSION` is 4; a group layout change
+is a format bump, not a silent reuse of the spare task slot.
 
 ### 2.7 The syscall table: Rust census plus netpoll rows
 
@@ -720,22 +725,20 @@ field is the main protocol change.
 
 ### 4.8 Checkpoint and restore (TG-2, proposed)
 
-This is the largest unproven part. The current payload is deliberately
-single-Linux-task: one `EnvPayloadTask`, one context, one page walk, one held
-child. A thread group needs all of the following before the gate can claim
-E7 parity:
+This is the largest unproven part. TG-2b made the payload multi-context, but
+the replay create still holds one child. A thread group needs all of the
+following before the gate can claim E7 parity:
 
-1. **Schema.** (TG-2a landed the record half: version 2, ten task slots, group
-   id/index/leader, and kernel stamps at group create and clone.) The payload
-   format still needs its multi-context bump. The name-only lookup cannot
-   identify two threads of the same group; lookup must use
-   `(group id, thread index)`.
-2. **Page ownership.** The group leader owns the shared image and heap page
-   blocks; non-leader threads own only pages unique to them. The current
-   `ep_linux_page()` predicate gives every thread the same heap range and would
-   duplicate entries. The page index needs a group-level dedup rule, and the
-   restore must reject two entries for one vaddr with different CRCs or
-   permissions.
+1. **Schema.** (TG-2a landed record v2; TG-2b landed payload v4.) Every
+   payload task carries group id/index/leader, and lookup uses
+   `(group id, thread index)` rather than the shared name. The payload's task
+   stride grew, so v3 blobs are refused by name rather than misread.
+2. **Page ownership.** (TG-2b) The group leader owns the shared image and heap
+   page blocks; non-leader threads own only pages unique to them (this
+   kernel's clones own none). The capture skips a sibling's view of the shared
+   spans even when its stack address falls inside the heap, and the restore
+   rejects one vaddr appearing twice in the same root with different CRCs or
+   permissions (`EP_REFUSE_DUP`).
 3. **Per-thread context.** Each thread needs its own `linux_regs`, `fs_base`,
    user stack top, trap form and signal mask. The leader's heap/brk/mmap/image
    fields live once, not once per thread.

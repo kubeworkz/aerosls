@@ -70,14 +70,17 @@ __attribute__((weak)) int env_replica_push(const struct EnvCkptRecord* rec) {
 #define EP_MAX_PAGES     2048u
 /* The index zone's frame ceiling. Six frames was the sidecar-only shape;
  * E7 increment 20's live gate capture measured 31,012 index bytes — three
- * tasks (the Linux tenant's EnvPayloadTask is 408 bytes), ~1,845 page
- * entries at 16 bytes and the console — so six frames refused an
- * environment that fits the band. Sixteen frames keeps the ceiling above
+ * tasks (the Linux tenant's EnvPayloadTask is 416 bytes in TG-2b's v4),
+ * ~1,845 page entries at 16 bytes and the console — so six frames refused
+ * an environment that fits the band. Sixteen frames keeps the ceiling above
  * the slot's own limit: a 16-frame index leaves 2,031 data pages in an
  * 8 MiB slot, and the slot check below refuses a larger capture by name
  * before the index can grow past this buffer. */
 #define EP_STAGE_BYTES   (4096u * 16u)
-#define EP_MAX_TASKS     4u
+#define EP_MAX_TASKS     ENV_CKPT_MAX_TASKS
+_Static_assert(sizeof(struct EnvPayloadTask) == 416u,
+               "EnvPayloadTask is the v4 shape; a layout change must bump "
+               "ENV_PAYLOAD_REC_VERSION");
 /* EP_WAIT_TICKS / EP_WAIT_CEIL_TICKS live in env_payload.h: the wait's two
  * bounds are part of its contract now, and the host test asserts WHICH of the
  * two answered (a stall is a wedged environment, a ceiling is one that never
@@ -191,6 +194,8 @@ void env_payload_refusal_text(const struct EnvPayloadRefusal* r,
     case EP_REFUSE_PERM:       t = "a captured page's live permissions are not the captured ones"; break;
     case EP_REFUSE_FORM:       t = "the Linux task was captured parked (queued state this blob does not carry)"; break;
     case EP_REFUSE_SHAPE:      t = "a captured task's kind does not match the slot it was filed under"; break;
+    case EP_REFUSE_GROUP:      t = "a captured thread group's id, index or leader fields are incoherent"; break;
+    case EP_REFUSE_DUP:        t = "one address maps twice with different captured bytes or permissions"; break;
     default:                   t = "unknown payload refusal"; break;
     }
     uint32_t i = 0;
@@ -248,6 +253,13 @@ static union {
 static uint8_t  ep_tnum[EP_MAX_PAGES];              /* capture: task index per page */
 static uint32_t ep_crcs[EP_MAX_PAGES];              /* capture: per-page crc, staged into the index */
 static uint32_t ep_perms[EP_MAX_PAGES];             /* capture: per-page PTE perms (EP_PAGE_PERM_*) */
+/* Restore-side duplicate index: a shared root may not receive one vaddr
+ * twice unless both records describe the same bytes and grant. Kept apart
+ * from ep_scratch because `dest` is filled in the same pass. */
+static uint64_t ep_seen_vaddr[EP_MAX_PAGES];
+static uint64_t ep_seen_cr3[EP_MAX_PAGES];
+static uint32_t ep_seen_crc[EP_MAX_PAGES];
+static uint32_t ep_seen_perm[EP_MAX_PAGES];
 #if E7G_TOOTH
 /* E7 increment 22: the pages a `descriptor` tooth leaves out of the pour.
  * File-static because a restore is one straight-line pass; the tooth's
@@ -286,13 +298,13 @@ static int ep_dir_read(struct EnvPayloadDirHead* h,
     if (nvme_read_sync(PERSIST_ENV_PAYLOAD_HDR_LBA, ep_stage) != 0) return -1;
     ep_copy(h, ep_stage, (uint32_t)sizeof(*h));
     if (h->magic != ENV_PAYLOAD_DIR_MAGIC ||
-        (h->version != ENV_PAYLOAD_REC_VERSION &&
-         h->version != ENV_PAYLOAD_REC_VERSION_PREV) ||
         h->rec_size != (uint32_t)sizeof(struct EnvPayloadDirEntry)) {
         /* A directory this build cannot read is an ABSENT payload, never a
          * half-read one. */
         return -1;
     }
+    if (h->version != ENV_PAYLOAD_REC_VERSION)
+        return -2;   /* a recognised directory with an old task stride */
     if (nvme_read_sync(PERSIST_ENV_PAYLOAD_ENT_LBA, ep_stage) != 0) return -1;
     uint32_t n = h->count;
     if (n > ENV_PAYLOAD_MAX) n = ENV_PAYLOAD_MAX;
@@ -436,10 +448,27 @@ static int ep_in_image_window(uint64_t vaddr) {
  *     limit).
  *
  * A PROT_NONE guard has no frame, so the walk never sees it: the payload
- * carries the pages that exist, not the ranges that were reserved. */
+ * carries the pages that exist, not the ranges that were reserved.
+ *
+ * TG-2b ownership: the group's image and budget spans are SHARED, so the
+ * leader is their one owner. A sibling's page walk may still see those
+ * mappings through the group root; they are skipped even when the clone's
+ * own stack address happens to fall inside the heap (Go's g0 stacks do).
+ * The sibling owns only a stack range outside the shared spans, which is
+ * zero for this kernel's clone, so its page block is normally empty. */
 static int ep_linux_page(const struct EnvCkptRecord* rec, uint32_t t,
                          const struct ProcessDescriptor* pd, uint64_t vaddr) {
     const struct EnvCkptTask* tk = &rec->tasks[t];
+    if (tk->group_id != 0 && !tk->leader) {
+        if (linux_group_image_lo(pd) && vaddr >= linux_group_image_lo(pd) &&
+            vaddr < linux_group_image_hi(pd)) return 0;
+        if (linux_group_heap_base(pd) &&
+            vaddr >= linux_group_heap_base(pd) &&
+            vaddr < linux_group_heap_limit(pd)) return 0;
+        if (tk->stack_bottom && vaddr >= tk->stack_bottom &&
+            vaddr < tk->stack_top) return 1;
+        return 0;
+    }
     if (tk->stack_bottom && vaddr >= tk->stack_bottom &&
         vaddr < tk->stack_top) return 1;
     if (linux_group_image_lo(pd) && vaddr >= linux_group_image_lo(pd) &&
@@ -471,6 +500,48 @@ static struct ProcessDescriptor* ep_find_proc(const char* name) {
         if (match && *a == '\0' && *b == '\0') return &proc_table[i];
     }
     return 0;
+}
+
+static int ep_name_eq(const char* a, const char* b) {
+    for (uint32_t i = 0; i < ENV_CKPT_NAME_LEN; i++) {
+        if (a[i] != b[i]) return 0;
+        if (a[i] == '\0') return 1;
+    }
+    return 1;
+}
+
+/* A group's members share their name, so the name-only lookup cannot tell
+ * which sibling a record entry names. TG-2b's identity is the stable
+ * (group id, thread index) pair the group layer assigned at clone. */
+static struct ProcessDescriptor* ep_find_group_member(uint32_t group_id,
+                                                      uint16_t thread_index,
+                                                      uint8_t leader) {
+    struct LinuxThreadGroup* g = linux_group_find(group_id);
+    if (!g) return 0;
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct ProcessDescriptor* pd = &proc_table[i];
+        if (!pd->active || linux_group_of(pd) != g) continue;
+        if (pd->thread_index != thread_index) continue;
+        if (pd->is_group_leader != leader) continue;
+        return pd;
+    }
+    return 0;
+}
+
+static struct ProcessDescriptor* ep_find_ckpt_task(
+        const struct EnvCkptTask* tk) {
+    if (tk->kind == ENV_CKPT_TASK_LINUX && tk->group_id != 0)
+        return ep_find_group_member(tk->group_id, tk->thread_index,
+                                    tk->leader);
+    return ep_find_proc(tk->name);
+}
+
+static struct ProcessDescriptor* ep_find_payload_task(
+        const struct EnvPayloadTask* tk) {
+    if (tk->kind == ENV_CKPT_TASK_LINUX && tk->group_id != 0)
+        return ep_find_group_member(tk->group_id, tk->thread_index,
+                                    tk->leader);
+    return ep_find_proc(tk->name);
 }
 
 /* ─── The image-window list, shared with the migrate path (P3) ────────────
@@ -602,7 +673,7 @@ uint32_t env_payload_capture_all(void) {
         int missing = 0;
         const char* missing_name = "";
         for (uint32_t t = 0; t < rec->n_tasks && t < ENV_CKPT_MAX_TASKS; t++) {
-            struct ProcessDescriptor* pd = ep_find_proc(rec->tasks[t].name);
+            struct ProcessDescriptor* pd = ep_find_ckpt_task(&rec->tasks[t]);
             if (!pd) { missing = 1; missing_name = rec->tasks[t].name; break; }
             pds[np++] = pd;
         }
@@ -792,6 +863,9 @@ uint32_t env_payload_capture_all(void) {
             ep_memset(&tk, 0, (uint32_t)sizeof(tk));
             ep_copy(tk.name, rec->tasks[t].name, ENV_CKPT_NAME_LEN);
             tk.kind = rec->tasks[t].kind;
+            tk.group_id = rec->tasks[t].group_id;
+            tk.thread_index = rec->tasks[t].thread_index;
+            tk.leader = rec->tasks[t].leader;
             tk.n_pages = task_npages[t];
             const struct ProcessDescriptor* pd = pds[t];
             if (tk.kind == ENV_CKPT_TASK_LINUX) {
@@ -867,14 +941,20 @@ uint32_t env_payload_capture_all(void) {
                     tk.form = ENV_PAYLOAD_FORM_RUNNING;
                 }
                 tk.fs_base     = pd->fs_base;
-                tk.brk_cur     = linux_group_brk(pd);
-                tk.mmap_top    = linux_group_mmap_top(pd);
-                tk.heap_base   = linux_group_heap_base(pd);
-                tk.heap_limit  = linux_group_heap_limit(pd);
                 tk.stack_bottom = rec->tasks[t].stack_bottom;
                 tk.stack_top    = rec->tasks[t].stack_top;
-                tk.image_lo    = linux_group_image_lo(pd);
-                tk.image_hi    = linux_group_image_hi(pd);
+                /* TG-2b: the group's image/heap cursors live once, on the
+                 * leader. A sibling's copy would be the same numbers filed
+                 * per-thread, and the restore would apply the last one over
+                 * the group's one set. */
+                if (tk.group_id == 0 || tk.leader) {
+                    tk.brk_cur     = linux_group_brk(pd);
+                    tk.mmap_top    = linux_group_mmap_top(pd);
+                    tk.heap_base   = linux_group_heap_base(pd);
+                    tk.heap_limit  = linux_group_heap_limit(pd);
+                    tk.image_lo    = linux_group_image_lo(pd);
+                    tk.image_hi    = linux_group_image_hi(pd);
+                }
             } else if (ep_proc_parked(pd)) {
                 tk.form = ENV_PAYLOAD_FORM_PARKED;
                 tk.park_syscall = pd->park_syscall;
@@ -894,14 +974,16 @@ uint32_t env_payload_capture_all(void) {
                 tk.form = ENV_PAYLOAD_FORM_RUNNING;
             }
             kernel_serial_printf(
-                "[ENV_PAYLOAD] capture: task %u '%s' kind=%u form=%u "
-                "park_syscall=%u nchans=%u user_rip=0x%llx user_rsp=0x%llx "
-                "fs_base=0x%llx\n",
-                (unsigned)t, tk.name, (unsigned)tk.kind, (unsigned)tk.form,
+                "[ENV_PAYLOAD] capture: task %u '%s' kind=%u group=%u "
+                "thread=%u leader=%u form=%u park_syscall=%u nchans=%u "
+                "user_rip=0x%llx user_rsp=0x%llx fs_base=0x%llx pages=%u\n",
+                (unsigned)t, tk.name, (unsigned)tk.kind,
+                (unsigned)tk.group_id, (unsigned)tk.thread_index,
+                (unsigned)tk.leader, (unsigned)tk.form,
                 (unsigned)tk.park_syscall, (unsigned)tk.waiting_nchans,
                 (unsigned long long)tk.user_rip,
                 (unsigned long long)tk.user_rsp,
-                (unsigned long long)tk.fs_base);
+                (unsigned long long)tk.fs_base, (unsigned)tk.n_pages);
             task_form[t] = tk.form;
             ep_copy(ep_stage + used, &tk, (uint32_t)sizeof(tk));
             used += (uint32_t)sizeof(tk);
@@ -1278,6 +1360,7 @@ int env_payload_restore(uint32_t partition, uint32_t index,
     struct EnvPayloadDirHead h;
     struct EnvPayloadDirEntry e[ENV_PAYLOAD_MAX];
     int n = ep_dir_read(&h, e);
+    if (n == -2) { ep_refuse(EP_REFUSE_FORMAT, 0, 0); return EP_REFUSE_FORMAT; }
     if (n <= 0) { ep_refuse(EP_REFUSE_ABSENT, 0, 0); return EP_REFUSE_ABSENT; }
 #if E7G_TOOTH
     ep_memset(ep_skip, 0, sizeof(ep_skip));
@@ -1303,13 +1386,11 @@ int env_payload_restore(uint32_t partition, uint32_t index,
     struct EnvPayloadHead head;
     ep_copy(&head, ep_page, (uint32_t)sizeof(head));
     if (head.magic != ENV_PAYLOAD_BLOB_MAGIC ||
-        (head.version != ENV_PAYLOAD_REC_VERSION &&
-         head.version != ENV_PAYLOAD_REC_VERSION_PREV) ||
+        head.version != ENV_PAYLOAD_REC_VERSION ||
         head.partition_id != partition || head.index != index) {
         ep_refuse(EP_REFUSE_FORMAT, 0, 0);
         return EP_REFUSE_FORMAT;
     }
-    uint32_t blob_version = head.version;
     uint64_t seq = ((uint64_t)head.seq_high << 32) | head.seq_low;
     if (seq != want_seq) { ep_refuse(EP_REFUSE_SEQ, 0, 0); return EP_REFUSE_SEQ; }
     if (head.n_pages == 0 || head.n_pages > EP_MAX_PAGES ||
@@ -1399,6 +1480,10 @@ int env_payload_restore(uint32_t partition, uint32_t index,
      * the tenant is refused here, by name, rather than poured over). */
     struct ProcessDescriptor* pds[EP_MAX_TASKS];
     uint8_t task_kind[EP_MAX_TASKS];
+    uint32_t task_group[EP_MAX_TASKS];
+    uint32_t group_id = 0;
+    uint32_t ungrouped_linux = 0;
+    int group_leader_t = -1;
     {
         uint32_t u = 3u * (uint32_t)sizeof(struct EnvPayloadRegion);
         for (uint32_t t = 0; t < head.n_tasks; t++) {
@@ -1418,6 +1503,39 @@ int env_payload_restore(uint32_t partition, uint32_t index,
                 if (bn != tk.n_pages) {
                     ep_refuse(EP_REFUSE_FORMAT, t, bn);
                     return EP_REFUSE_FORMAT;
+                }
+            }
+            task_group[t] = tk.group_id;
+            if (tk.kind != ENV_CKPT_TASK_LINUX) {
+                if (tk.group_id != 0 || tk.thread_index != 0 || tk.leader != 0) {
+                    ep_refuse(EP_REFUSE_GROUP, t, tk.group_id);
+                    return EP_REFUSE_GROUP;
+                }
+            } else if (tk.group_id == 0) {
+                if (tk.thread_index != 0 || tk.leader != 0) {
+                    ep_refuse(EP_REFUSE_GROUP, t, 0);
+                    return EP_REFUSE_GROUP;
+                }
+                ungrouped_linux++;
+            } else {
+                if (tk.leader > 1 ||
+                    tk.thread_index >= ENV_CKPT_MAX_THREADS ||
+                    (tk.leader && tk.thread_index != 0) ||
+                    (!tk.leader && tk.thread_index == 0)) {
+                    ep_refuse(EP_REFUSE_GROUP, t, tk.group_id);
+                    return EP_REFUSE_GROUP;
+                }
+                if (group_id == 0) group_id = tk.group_id;
+                else if (group_id != tk.group_id) {
+                    ep_refuse(EP_REFUSE_GROUP, t, tk.group_id);
+                    return EP_REFUSE_GROUP;
+                }
+                if (tk.leader) {
+                    if (group_leader_t >= 0) {
+                        ep_refuse(EP_REFUSE_GROUP, t, tk.group_id);
+                        return EP_REFUSE_GROUP;
+                    }
+                    group_leader_t = (int)t;
                 }
             }
             task_kind[t] = tk.kind;
@@ -1441,7 +1559,7 @@ int env_payload_restore(uint32_t partition, uint32_t index,
                 continue;
             }
 #endif
-            struct ProcessDescriptor* pd = ep_find_proc(tk.name);
+            struct ProcessDescriptor* pd = ep_find_payload_task(&tk);
             if (!pd) { ep_refuse(EP_REFUSE_NO_PROCESS, t, 0); return EP_REFUSE_NO_PROCESS; }
             int is_linux = tk.kind == ENV_CKPT_TASK_LINUX;
             if (is_linux) {
@@ -1503,6 +1621,47 @@ int env_payload_restore(uint32_t partition, uint32_t index,
             }
             pds[t] = pd;
         }
+
+        if (ungrouped_linux > 1 || (ungrouped_linux != 0 && group_id != 0) ||
+            (group_id != 0 && group_leader_t < 0)) {
+            ep_refuse(EP_REFUSE_GROUP, 0, group_id);
+            return EP_REFUSE_GROUP;
+        }
+        if (group_id != 0) {
+            uint32_t base = 3u * (uint32_t)sizeof(struct EnvPayloadRegion);
+            struct EnvPayloadTask leader;
+            ep_copy(&leader, ep_stage + base +
+                    (uint32_t)group_leader_t * (uint32_t)sizeof(leader),
+                    (uint32_t)sizeof(leader));
+            for (uint32_t t = 0; t < head.n_tasks; t++) {
+                if (task_group[t] != group_id) continue;
+                struct EnvPayloadTask tk;
+                ep_copy(&tk, ep_stage + base +
+                        t * (uint32_t)sizeof(tk), (uint32_t)sizeof(tk));
+                if (!ep_name_eq(tk.name, leader.name)) {
+                    ep_refuse(EP_REFUSE_GROUP, t, group_id);
+                    return EP_REFUSE_GROUP;
+                }
+                if (!tk.leader &&
+                    (tk.brk_cur || tk.mmap_top || tk.heap_base ||
+                     tk.heap_limit || tk.image_lo || tk.image_hi)) {
+                    /* The group's spans live once, on the leader. A sibling
+                     * carrying its own copy is a blob that would apply one
+                     * task's numbers over the group's shared cursors. */
+                    ep_refuse(EP_REFUSE_GROUP, t, group_id);
+                    return EP_REFUSE_GROUP;
+                }
+                if (pds[t] && pds[group_leader_t]) {
+                    struct LinuxThreadGroup* lg =
+                        linux_group_of(pds[group_leader_t]);
+                    if (!lg || linux_group_of(pds[t]) != lg ||
+                        pds[t]->cr3 != pds[group_leader_t]->cr3) {
+                        ep_refuse(EP_REFUSE_GROUP, t, group_id);
+                        return EP_REFUSE_GROUP;
+                    }
+                }
+            }
+        }
     }
 
     /* Every destination, before a byte is written: identity for region
@@ -1514,6 +1673,7 @@ int env_payload_restore(uint32_t partition, uint32_t index,
      * before the first byte, like every other destination fault. */
     {
         uint32_t pi = 0;
+        uint32_t seen_pages = 0;
         for (uint32_t t = 0; t < head.n_tasks; t++) {
             uint32_t u = block_off[t];
             uint32_t np = (uint32_t)ep_stage[u] |
@@ -1540,6 +1700,10 @@ int env_payload_restore(uint32_t partition, uint32_t index,
                 uint64_t v = 0;
                 for (uint32_t b = 0; b < 8; b++)
                     v |= ((uint64_t)ep_stage[u + b]) << (8u * b);
+                uint32_t want_crc = (uint32_t)ep_stage[u + 8] |
+                                    ((uint32_t)ep_stage[u + 9] << 8) |
+                                    ((uint32_t)ep_stage[u + 10] << 16) |
+                                    ((uint32_t)ep_stage[u + 11] << 24);
                 uint32_t want_perm = (uint32_t)ep_stage[u + 12] |
                                      ((uint32_t)ep_stage[u + 13] << 8) |
                                      ((uint32_t)ep_stage[u + 14] << 16) |
@@ -1560,10 +1724,26 @@ int env_payload_restore(uint32_t partition, uint32_t index,
                 if ((want_perm & EP_PAGE_PERM_SOFT) &&
                     ((want_perm & (EP_PAGE_PERM_USER |
                                    EP_PAGE_PERM_WRITE |
-                                   EP_PAGE_PERM_EXEC)) != 0 ||
-                     blob_version == ENV_PAYLOAD_REC_VERSION_PREV)) {
+                                   EP_PAGE_PERM_EXEC)) != 0)) {
                     ep_refuse(EP_REFUSE_FORMAT, 8, pi);
                     return EP_REFUSE_FORMAT;
+                }
+                /* TG-2b: a group's shared root must not receive one vaddr
+                 * twice with different bytes or grants. Two entries that
+                 * agree are the same page written twice (allowed); two that
+                 * disagree are a corrupt shared-page index, refused before
+                 * the first byte. Different roots are different address
+                 * spaces and are not duplicates. */
+                for (uint32_t q = 0; q < seen_pages; q++) {
+                    if (ep_seen_cr3[q] != pds[t]->cr3 ||
+                        ep_seen_vaddr[q] != v) continue;
+                    if (ep_seen_crc[q] != want_crc ||
+                        (ep_seen_perm[q] & EP_PAGE_PERM_MASK) !=
+                            (want_perm & EP_PAGE_PERM_MASK)) {
+                        ep_refuse(EP_REFUSE_DUP, q, pi);
+                        return EP_REFUSE_DUP;
+                    }
+                    break;
                 }
                 uint64_t phys = 0;
                 uint32_t live_perm = 0;
@@ -1617,6 +1797,11 @@ int env_payload_restore(uint32_t partition, uint32_t index,
                     return EP_REFUSE_PERM;
                 }
                 ep_scratch.dest[pi] = phys;
+                ep_seen_vaddr[seen_pages] = v;
+                ep_seen_cr3[seen_pages]   = pds[t]->cr3;
+                ep_seen_crc[seen_pages]   = want_crc;
+                ep_seen_perm[seen_pages]  = want_perm & EP_PAGE_PERM_MASK;
+                seen_pages++;
             }
         }
     }
@@ -1764,8 +1949,13 @@ int env_payload_restore(uint32_t partition, uint32_t index,
                 pd->user_rip       = tk.user_rip;
                 pd->user_rsp       = tk.user_rsp;
                 pd->fs_base        = adopted_fs;
-                linux_group_set_brk(pd, tk.brk_cur);
-                linux_group_set_mmap_top(pd, tk.mmap_top);
+                /* TG-2b: one shared cursor pair per group. The leader (or a
+                 * legacy ungrouped task) owns it; a sibling must not apply
+                 * its zeroed copy over what the leader just restored. */
+                if (tk.group_id == 0 || tk.leader) {
+                    linux_group_set_brk(pd, tk.brk_cur);
+                    linux_group_set_mmap_top(pd, tk.mmap_top);
+                }
                 /* E7 increment 21: the stop is ONE-SHOT, and FORM_ENTRY is
                  * its aftermath. The replay's create is built from the same
                  * FLAG_GATE manifest, so the fresh descriptor came back with
@@ -1790,15 +1980,18 @@ int env_payload_restore(uint32_t partition, uint32_t index,
                  * release, so a later "second _start" cannot be mistaken
                  * for what this arm did. */
                 kernel_serial_printf(
-                    "[ENV_PAYLOAD] linux task '%s' adopted at rip=0x%llx "
-                    "rsp=0x%llx fs_base=0x%llx brk=0x%llx mtop=0x%llx "
-                    "form=%u held=%u stop=%s\n",
+                    "[ENV_PAYLOAD] linux task '%s' adopted at "
+                    "rip=0x%llx rsp=0x%llx fs_base=0x%llx brk=0x%llx "
+                    "mtop=0x%llx group=%u thread=%u leader=%u form=%u "
+                    "held=%u stop=%s\n",
                     tk.name, (unsigned long long)tk.user_rip,
                     (unsigned long long)tk.user_rsp,
                     (unsigned long long)pd->fs_base,
                     (unsigned long long)tk.brk_cur,
                     (unsigned long long)tk.mmap_top,
-                    (unsigned)tk.form, (unsigned)pd->restore_held,
+                    (unsigned)tk.group_id, (unsigned)tk.thread_index,
+                    (unsigned)tk.leader, (unsigned)tk.form,
+                    (unsigned)pd->restore_held,
                     pd->gate_profile ? "armed" : "spent");
                 continue;
             }

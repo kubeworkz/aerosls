@@ -107,11 +107,16 @@ struct EnvCkptRecord;
  *
  * v3 (E7 §10.15): the permission word gains EP_PAGE_PERM_SOFT for a
  * PRESENT, supervisor-only soft-protected leaf. The page entry stays 16
- * bytes; a v2 blob has no soft bit and remains readable. The writer emits
- * v3, and a v2 blob that claims the v3-only bit is refused by name rather
- * than silently taking a path its writer never emitted. */
-#define ENV_PAYLOAD_REC_VERSION      3u
-#define ENV_PAYLOAD_REC_VERSION_PREV 2u
+ * bytes.
+ *
+ * v4 (TG-2b): EnvPayloadTask gains the group id, thread index and leader
+ * flag, and every group thread gets its own task entry/context. Only the
+ * leader carries the group's image/heap cursors and owns its shared page
+ * block; siblings carry no duplicate shared pages. The task stride changed
+ * (408 -> 416 bytes), so a v3 blob is REFUSED, not misread: walking it with
+ * this struct would read each task and page block 8 bytes late. */
+#define ENV_PAYLOAD_REC_VERSION      4u
+#define ENV_PAYLOAD_REC_VERSION_PREV 3u   /* the last single-context layout: refused by name */
 #define ENV_PAYLOAD_DIR_MAGIC   0x534C53504C4F4131ULL  /* "SLSPLOA1" */
 #define ENV_PAYLOAD_BLOB_MAGIC  0x534C5350424C4F31ULL  /* "SLSPBLO1" */
 
@@ -187,6 +192,8 @@ struct EnvCkptRecord;
 #define EP_REFUSE_PERM       13  /* a=task index, b=page index; the live PTE's permissions are not the captured ones */
 #define EP_REFUSE_FORM       14  /* a=task index, b=form; a Linux task whose captured form this blob cannot resume (parked/queued) */
 #define EP_REFUSE_SHAPE      15  /* a=task index; a captured task's kind is not what its slot claims (Linux vs sidecar) */
+#define EP_REFUSE_GROUP      16  /* a=task index, b=group id; group id/index/leader fields are incoherent */
+#define EP_REFUSE_DUP        17  /* a=first page, b=duplicate page; same vaddr+root with different bytes or permissions */
 
 struct EnvPayloadRefusal {
     uint32_t code;
@@ -276,6 +283,16 @@ struct EnvPayloadTask {
     uint64_t stack_top;
     uint64_t image_lo;      /* the linked ET_EXEC image's page span */
     uint64_t image_hi;
+    /* ── TG-2b: group identity. Zero for every sidecar and for a legacy
+     * ungrouped Linux task. A group's leader is index 0; siblings are
+     * 1..ENV_CKPT_MAX_THREADS-1. A sibling carries only its per-thread
+     * registers, fs_base and optional private stack; `brk_cur`, `mmap_top`,
+     * `heap_base`, `heap_limit`, `image_lo` and `image_hi` are zero there
+     * because those spans belong to the leader and are captured once. */
+    uint32_t group_id;
+    uint16_t thread_index;
+    uint8_t  leader;
+    uint8_t  _group_pad;
 };
 
 /* ─── Public API ────────────────────────────────────────────────────────────*/

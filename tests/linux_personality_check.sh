@@ -1217,7 +1217,7 @@ IEM=user/init/src/env_manager.rs
 ENVP=user/proto/src/env_proto.rs
 EPHUT=tests/env_payload_host_test.c
 ECKHUT=tests/env_ckpt_host_test.c
-if grep -qE '#define ENV_PAYLOAD_REC_VERSION[[:space:]]+3u' "$EPH" && \
+if grep -qE '#define ENV_PAYLOAD_REC_VERSION[[:space:]]+4u' "$EPH" && \
    grep -qF '#define EP_PAGE_ENTRY_BYTES 16u' "$EPH" && \
    grep -qE '#define EP_PAGE_PERM_SOFT[[:space:]]+0x8u' "$EPH" && \
    grep -qF 'uint64_t linux_regs[20];' "$EPH" && \
@@ -1228,10 +1228,13 @@ if grep -qE '#define ENV_PAYLOAD_REC_VERSION[[:space:]]+3u' "$EPH" && \
    grep -qF 'uint64_t heap_limit;' "$EPH" && \
    grep -qF 'uint64_t stack_bottom;' "$EPH" && \
    grep -qF 'uint64_t image_hi;' "$EPH" && \
+   grep -qF 'uint32_t group_id;' "$EPH" && \
+   grep -qF 'uint16_t thread_index;' "$EPH" && \
+   grep -qF 'uint8_t  leader;' "$EPH" && \
    grep -qF '#define ENV_PAYLOAD_FORM_USER    2u' "$EPH"; then
-    ok "W1. the payload is v3: EnvPayloadTask carries the Linux task's FULL context (20-word TaskContext), its six argument registers, fs_base, both cursors, the heap and stack ranges and the image span, and every page index entry is 16 bytes with a permission word including the soft PROT_NONE state"
+    ok "W1. the payload is v4: EnvPayloadTask carries the Linux task's FULL context (20-word TaskContext), its six argument registers, fs_base, both cursors, the heap and stack ranges, the image span, and its group id/index/leader; every page index entry is 16 bytes with a permission word including the soft PROT_NONE state"
 else
-    bad "W1. the Linux half of EnvPayloadTask or the permission-carrying page entry is gone — the capture could file pages a restore cannot map, and a v1-shaped blob would be misread entry by entry"
+    bad "W1. the Linux half or group identity of EnvPayloadTask is gone — the capture could file pages a restore cannot map, two siblings would be indistinguishable, or a v3-shaped blob would be misread task by task"
 fi
 if grep -qF 'static int ep_linux_page(const struct EnvCkptRecord* rec, uint32_t t,' "$EPC" && \
    grep -qF 'if (tk->stack_bottom && vaddr >= tk->stack_bottom &&' "$EPC" && \
@@ -1246,11 +1249,12 @@ else
     bad "W2. the Linux page predicate or the per-page permission resolve is gone — the walk would either miss the tenant's bytes or capture the PARENT's cloned image pages under the child, and the blob would carry no permissions to check"
 fi
 if [ "$(awk '/^uint32_t env_payload_capture_all\(void\) \{/,/^\}/' "$EPC" | grep -c 'kind == ENV_CKPT_TASK_LINUX) continue')" -eq 0 ] && \
-   grep -qF 'struct ProcessDescriptor* pd = ep_find_proc(rec->tasks[t].name);' "$EPC" && \
+   grep -qF 'struct ProcessDescriptor* pd = ep_find_ckpt_task(&rec->tasks[t]);' "$EPC" && \
+   grep -qF 'static struct ProcessDescriptor* ep_find_group_member' "$EPC" && \
    grep -qF 'missing ? "named task has no live process" : "no tasks"' "$EPC"; then
-    ok "W3. the capture no longer skips the Linux task: every named task must resolve, and a checkpoint taken before the tenant is spawned skips the ENVIRONMENT by name instead of writing a third slot with no bytes"
+    ok "W3. the capture no longer skips the Linux task and resolves a group entry by (group id, thread index), so two siblings with the same name are distinct; every named task must resolve, and a checkpoint taken before the tenant is spawned skips the ENVIRONMENT by name"
 else
-    bad "W3. the capture still skips the Linux kind (or names a missing task without saying so) — a checkpoint of a live gate environment would silently omit its tenant while the record claims three tasks"
+    bad "W3. the capture still skips the Linux kind, or resolves group siblings by name (or names a missing task without saying so) — a checkpoint of a live gate environment would silently omit or overwrite a thread while the record claims it"
 fi
 if grep -qF 'case EP_REFUSE_PERM:' "$EPC" && \
    grep -qF 'case EP_REFUSE_FORM:' "$EPC" && \
@@ -1281,20 +1285,25 @@ fi
 if grep -qF 'LINUX: the gate environment (sidecar + Linux tenant) captures as one payload' "$EPHUT" && \
    grep -qF 'LINUX: the full ring3_ctx — rip, rsp and the six argument registers — is the captured one' "$EPHUT" && \
    grep -qF 'PERM: a captured RX image page that is writable at the destination refuses the whole pour' "$EPHUT" && \
-   grep -qF 'V2: a soft-free v2 payload replays every page' "$EPHUT" && \
-   grep -qF 'V2+SOFT: a v2 blob claiming the v3 soft bit is refused by format, before any pour' "$EPHUT" && \
+   grep -qF 'GROUP: a sidecar plus a two-thread Linux group captures as one payload' "$EPHUT" && \
+   grep -qF 'GROUP: the leader is (group 101, index 0), owns the image/stack/heap pages' "$EPHUT" && \
+   grep -qF 'GROUP: the sibling is a distinct (group 101, index 1) with no duplicate shared pages' "$EPHUT" && \
+   grep -qF 'GROUP: both thread contexts are installed into their own descriptors' "$EPHUT" && \
+   grep -qF "GROUP: the leader's shared cursors are restored once, and the sibling does not overwrite them" "$EPHUT" && \
+   grep -qF 'DUP: one vaddr twice with different bytes is refused by name, before any pour' "$EPHUT" && \
+   grep -qF 'DUP: the refusal names the first entry and the duplicate' "$EPHUT" && \
+   grep -qF 'V3: a v3 blob is refused by format before any pour (the v4 task stride is not its stride)' "$EPHUT" && \
    grep -qF 'SOFT+USER: the restore refuses the contradictory permission before a byte moves' "$EPHUT" && \
    grep -qF 'SOFT+WX: a writable+executable soft page is refused by format, not poured' "$EPHUT" && \
-   grep -qF 'V2+SOFT: the refusal is the soft-permission rule (a=8), not a torn index CRC (a=5)' "$EPHUT" && \
    grep -qF 'SOFT+USER: the refusal names the permission rule (a=8), not a torn index CRC' "$EPHUT" && \
    grep -qF 'SOFT+WX: the refusal names the permission rule (a=8), not a torn index CRC' "$EPHUT" && \
-   [ "$(grep -cF 'CHECK(env_payload_last_refusal().a == 8,' "$EPHUT")" -eq 3 ] && \
+   [ "$(grep -cF 'CHECK(env_payload_last_refusal().a == 8,' "$EPHUT")" -eq 2 ] && \
    grep -qF 'FORM: a parked Linux tenant is refused by name' "$EPHUT" && \
    grep -qF 'the stamp fills the Linux slot' "$ECKHUT" && \
    grep -qF 'a replay whose create names the same three tasks IS the same environment' "$ECKHUT"; then
-    ok "W6. both host tests drive the increment: the payload round trip (bytes, perms, context, the perm and form teeth), the v2 replay and corrupt soft-permission refusals with all three a=8 operand assertions, and the record layer's stamp/identity clauses — each claim runs against the real kernel file, not a model of it"
+    ok "W6. both host tests drive the increment: the payload round trip (bytes, perms, per-thread group contexts and shared-page ownership), the duplicate-page refusal, the v3-stride refusal, the corrupt soft-permission refusals with both a=8 operand assertions, and the record layer's stamp/identity clauses — each claim runs against the real kernel file, not a model of it"
 else
-    bad "W6. a host-test clause for increment 20 is missing — the capture, the stamp, the identity comparison, the v2 replay or a corrupt soft-permission refusal would be a claim no test runs"
+    bad "W6. a host-test clause for the Linux payload is missing — the group capture/restore, the duplicate-page refusal, the v3-stride refusal, a corrupt soft-permission refusal or the record stamp would be a claim no test runs"
 fi
 
 # ─── X. E7 increment 25: munmap, the memory class's last seam ─────────────
