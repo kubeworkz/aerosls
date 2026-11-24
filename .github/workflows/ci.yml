@@ -679,10 +679,10 @@ jobs:
     # on every push (the five live-cluster guards -- entropy_boot_diversity,
     # partition_reannounce_live, partition_ownedset_gc_live, failover_adoption,
     # failover_2node -- still report their owed skips: they need a live cluster).
-    # The E3 multi-instance guard is also GUARD-KIND: runtime but is NOT one of
-    # those skips: this job builds sls_operating_system_e3.iso for it a step
-    # earlier, so it boots the two-tenant image here for real. Then it
-    # boots the
+    # The E3 multi-instance guard is also GUARD-KIND: runtime, but this job
+    # builds sls_operating_system_e3.iso for it and names it in
+    # REQUIRE_RUNTIME below, so run_checks.sh boots it for real and an abort
+    # fails instead of being reported as an owed skip. Then the job boots the
     # ISO under QEMU and checks the service end to end: the kernel's first
     # serial banner must appear, and its webapp must answer /api/health on
     # the forwarded port (the exact endpoint deploy.sh gates on) — proving
@@ -893,15 +893,22 @@ jobs:
       # always exited 2 and run_checks.sh reported it as an owed RUNTIME skip —
       # "needs a live cluster" — which is why the guard sat red on main for a
       # week: a broken boot check and a check nobody runs hiding behind each
-      # other. Built here, BEFORE the guards step, so `run_checks.sh
-      # --require-all` runs it for real and fails the job if E3 regresses.
-      # The Rust bare-metal toolchain step above is what makes this build
-      # possible at all (it cross-builds for x86_64-unknown-none).
+      # other. Built here, BEFORE the guards step, and named in REQUIRE_RUNTIME
+      # there: `run_checks.sh --require-all` boots it for real, and a missing
+      # ISO or QEMU fails the step instead of becoming an owed skip. The Rust
+      # bare-metal toolchain step above is what makes this build possible at
+      # all (it cross-builds for x86_64-unknown-none).
       - name: Build the E3 ISO (init with e3_envs) for the multi-instance guard
         run: make X86_CC=gcc X86_LD=ld x86-iso-e3
         working-directory: aerosls2
 
       - name: Run all guards with --require-all (every build-run guard must pass)
+        env:
+          # E3 is registered GUARD-KIND: runtime, but its prerequisite here is
+          # the image built above, not a live cluster. Naming it makes an abort
+          # a failure instead of an owed runtime skip. deploy.sh leaves this
+          # unset, so its runtime skips keep their deploy-gate meaning.
+          REQUIRE_RUNTIME: e3_multi_env_boot_check.sh
         run: bash tests/run_checks.sh --require-all
         working-directory: aerosls2
 
