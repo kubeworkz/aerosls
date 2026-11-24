@@ -188,3 +188,24 @@ int linux_futex_pending(uint32_t group_id, uint64_t uaddr) {
     }
     return n;
 }
+
+int linux_futex_waiter_info(uint32_t tid, struct LinuxFutexWaitInfo* out) {
+    if (!out || tid == 0) return 0;
+    for (uint32_t i = 0; i < LINUX_FUTEX_WAITERS; i++) {
+        if (!linux_futex_table[i].used) continue;
+        if (linux_futex_table[i].tid != tid) continue;
+        out->group_id = linux_futex_table[i].group_id;
+        out->tid      = linux_futex_table[i].tid;
+        out->uaddr    = linux_futex_table[i].uaddr;
+        out->deadline = linux_futex_table[i].deadline;
+        return 1;
+    }
+    return 0;
+}
+
+uint32_t linux_futex_free_slots(void) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < LINUX_FUTEX_WAITERS; i++)
+        if (!linux_futex_table[i].used) n++;
+    return n;
+}

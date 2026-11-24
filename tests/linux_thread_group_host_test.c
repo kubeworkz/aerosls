@@ -203,6 +203,26 @@ int main(void) {
               "a NULL group is refused by every lease call");
     }
 
+    /* ── 6c. TG-2c: every restored member is released in one pass ───────── */
+    {
+        struct LinuxThreadGroup* g = linux_group_of(&proc_table[0]);
+        proc_table[0].restore_held = 1;
+        proc_table[0].state = PROC_HELD;
+        proc_table[1].restore_held = 1;
+        proc_table[1].state = PROC_BLOCKED;   /* a restored futex waiter */
+        CHECK(linux_group_release_restored(100) == 2,
+              "one call releases both held members of the restored group");
+        CHECK(!proc_table[0].restore_held && !proc_table[1].restore_held,
+              "the hold is cleared on the leader and the sibling together");
+        CHECK(proc_table[0].state == PROC_SUSPENDED &&
+              proc_table[1].state == PROC_BLOCKED,
+              "a held thread becomes runnable, while a futex waiter stays BLOCKED for its wake");
+        CHECK(linux_group_release_restored(100) == 0 &&
+              linux_group_release_restored(999) == 0,
+              "releasing an already-released or unknown group is a no-op");
+        (void)g;
+    }
+
     /* ── 7. Destroy: one cap teardown, one page teardown, one identity clear ─ */
     {
         struct LinuxThreadGroup* g = linux_group_of(&proc_table[0]);

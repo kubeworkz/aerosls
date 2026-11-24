@@ -215,6 +215,15 @@ void linux_group_destroy(struct LinuxThreadGroup* g);
  * a slot is (re)initialised. Never touches group resources. */
 void linux_group_clear_identity(struct ProcessDescriptor* pd);
 
+/* TG-2c: release every held member of one restored group in ONE pass. The
+ * replay's create arms the hold per descriptor; releasing by task name would
+ * find only the first sibling (all group members share a name). This clears
+ * restore_held on every member without yielding, promotes a held member to
+ * SUSPENDED, and deliberately leaves a FORM_FUTEX member BLOCKED — its wait
+ * must be woken by the barrier, not by the restore's release. Returns the
+ * number of descriptors released. */
+uint32_t linux_group_release_restored(uint32_t group_id);
+
 /* ─── Shared-memory accessors ──────────────────────────────────────────────
  * All return 0 / no-op for a descriptor with no group, which keeps every
  * non-Linux caller branch-free. */

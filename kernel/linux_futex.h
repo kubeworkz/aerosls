@@ -132,4 +132,21 @@ int linux_futex_forget_group(uint32_t group_id);
  * isolation check and the teardown net read it. */
 int linux_futex_pending(uint32_t group_id, uint64_t uaddr);
 
+/* TG-2c: the wait a tid is parked in, if any. Copies the key and the
+ * ABSOLUTE tick deadline (0 = forever) so the checkpoint can carry the
+ * remaining timeout instead of a boot-local deadline. Returns 1 when found,
+ * 0 otherwise. */
+struct LinuxFutexWaitInfo {
+    uint32_t group_id;
+    uint32_t tid;
+    uint64_t uaddr;
+    uint64_t deadline;
+};
+int linux_futex_waiter_info(uint32_t tid, struct LinuxFutexWaitInfo* out);
+
+/* Free waiter slots. The restore checks this before pouring a barrier: a
+ * barrier that cannot fit its re-enqueued waits must refuse BEFORE any page
+ * moves, not strand the first half in the table. */
+uint32_t linux_futex_free_slots(void);
+
 #endif /* LINUX_FUTEX_H */

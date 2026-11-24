@@ -344,6 +344,27 @@ void linux_group_clear_identity(struct ProcessDescriptor* pd) {
     pd->sysret_result = 0;
 }
 
+uint32_t linux_group_release_restored(uint32_t group_id) {
+    struct LinuxThreadGroup* g;
+    uint32_t released = 0;
+
+    if (group_id == 0) return 0;
+    g = linux_group_find(group_id);
+    if (!g) return 0;
+
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct ProcessDescriptor* pd = &proc_table[i];
+        if (!pd->active || !pd->restore_held) continue;
+        if (linux_group_of(pd) != g) continue;
+        pd->restore_held = 0;
+        /* HELD is a create that has not run; a futex-blocked member is
+         * waiting on the barrier and must stay BLOCKED until its wake. */
+        if (pd->state == PROC_HELD) pd->state = PROC_SUSPENDED;
+        released++;
+    }
+    return released;
+}
+
 /* ─── Shared-memory accessors ───────────────────────────────────────────── */
 
 uint64_t linux_group_heap_base(const struct ProcessDescriptor* pd) {

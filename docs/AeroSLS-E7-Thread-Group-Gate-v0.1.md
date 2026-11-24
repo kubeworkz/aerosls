@@ -229,8 +229,14 @@ identity is cleared, so a later capture still resolves the surviving members
 instead of failing on a dead thread. The payload host test exits one sibling,
 recaptures, and checks that neither the record nor the blob names it.
 
-TG-2b landed the payload half: `ENV_PAYLOAD_REC_VERSION` is 4 and every
-`EnvPayloadTask` carries its group id, thread index and leader flag. A group's
+TG-2b landed the payload half: `ENV_PAYLOAD_REC_VERSION` became 4 and every
+`EnvPayloadTask` carries its group id, thread index and leader flag. TG-2c
+bumped it to 5 for `FORM_FUTEX`: a blocked waiter's barrier address, expected
+word and remaining timeout travel with its entry park frame. Capture accepts
+a futex stop only when every group member names the same barrier key; restore
+re-enqueues every wait after the pour and before release, and
+`linux_group_release_restored()` clears all held members in one pass without
+making the blocked waiters runnable. A group's
 siblings share a name, so capture and replay resolve them by
 `(group_id, thread_index)`, not by name. The leader owns the shared image and
 budget page block; a sibling carries its own registers and `fs_base` but no
@@ -242,8 +248,8 @@ one Linux child; creating/releasing the sibling set is TG-2d.
 `ep_linux_page()` assigns pages by the task's own image/heap/stack ranges.
 TG-2b makes the leader the one owner of the shared image/heap ranges, skips
 those ranges for siblings, and refuses a duplicate vaddr in one root with a
-different CRC or grant. `ENV_PAYLOAD_REC_VERSION` is 4; a group layout change
-is a format bump, not a silent reuse of the spare task slot.
+different CRC or grant. `ENV_PAYLOAD_REC_VERSION` is 5; a layout change is a
+format bump, not a silent reuse of the spare task slot.
 
 ### 2.7 The syscall table: Rust census plus netpoll rows
 
@@ -733,10 +739,11 @@ This is the largest unproven part. TG-2b made the payload multi-context, but
 the replay create still holds one child. A thread group needs all of the
 following before the gate can claim E7 parity:
 
-1. **Schema.** (TG-2a landed record v2; TG-2b landed payload v4.) Every
-   payload task carries group id/index/leader, and lookup uses
+1. **Schema.** (TG-2a landed record v2; TG-2b landed payload v4; TG-2c
+   landed v5.) Every payload task carries group id/index/leader and the
+   `FORM_FUTEX` barrier key/value/remaining timeout, and lookup uses
    `(group id, thread index)` rather than the shared name. The payload's task
-   stride grew, so v3 blobs are refused by name rather than misread.
+   stride grew, so older blobs are refused by name rather than misread.
 2. **Page ownership.** (TG-2b) The group leader owns the shared image and heap
    page blocks; non-leader threads own only pages unique to them (this
    kernel's clones own none). The capture skips a sibling's view of the shared
@@ -746,13 +753,16 @@ following before the gate can claim E7 parity:
 3. **Per-thread context.** Each thread needs its own `linux_regs`, `fs_base`,
    user stack top, trap form and signal mask. The leader's heap/brk/mmap/image
    fields live once, not once per thread.
-4. **Group stop.** The existing gate stops one task at a sysret. A multi-thread
-   group must be quiesced consistently. The preferred first form is a
-   **futex barrier**: every gate thread waits on a known futex, and the
-   payload carries a new `FORM_FUTEX` wait record (address, expected value,
-   timeout, saved entry context). The restore re-enqueues those waits before
-   releasing the group. If a thread is in a forwarded syscall, the checkpoint
-   still refuses it by name; the gate must not create that state.
+4. **Group stop.** (TG-2c landed the payload half.) The existing gate stops
+   one task at a sysret. A multi-thread group must be quiesced consistently.
+   The first form is a **futex barrier**: every gate thread waits on a known
+   futex, and the payload carries `FORM_FUTEX` (address, expected value,
+   remaining timeout, saved entry context). Capture refuses a mixed group by
+   skipping it; restore refuses an incoherent blob with `EP_REFUSE_BARRIER`
+   and re-enqueues every wait before releasing the group. The replayed create
+   still holds one child, so the live group release is TG-2d. If a thread is
+   in a forwarded syscall, the checkpoint still refuses it by name; the gate
+   must not create that state.
 5. **Replay create.** The current restore creates one held child. A group
    replay creates the leader, creates siblings sharing the same root, pours
    shared pages once, installs every thread's context, then releases all of

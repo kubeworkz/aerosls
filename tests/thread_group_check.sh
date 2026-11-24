@@ -312,8 +312,9 @@ all_fixed "$LRL" "G2b" "the sidecar declares all three probe modules" \
     'pub mod e7_thread_probe;' \
     'pub mod e7_futex_probe;' \
     'pub mod e7_openat_probe;'
-all_fixed "$GHT" "G3" "the group host test still drives the lease state machine" \
-    'linux_group_fwd_acquire' 'linux_group_fwd_next_waiter' 'linux_group_fwd_release'
+all_fixed "$GHT" "G3" "the group host test still drives the lease state machine and coordinated restore release" \
+    'linux_group_fwd_acquire' 'linux_group_fwd_next_waiter' 'linux_group_fwd_release' \
+    'linux_group_release_restored' 'a futex waiter stays BLOCKED for its wake'
 [ -s "$CHT" ] && ok "G3b. the clone host test exists" || bad "G3b. tests/linux_clone_host_test.c is missing"
 [ -s "$FHT" ] && ok "G3c. the futex host test exists" || bad "G3c. tests/linux_futex_host_test.c is missing"
 [ -s "$SHT" ] && ok "G3d. the ABI table host test exists" || bad "G3d. tests/linux_syscall_table_host_test.c is missing"

@@ -92,8 +92,9 @@ struct EnvCkptRecord;
  * refused as identity in env_ckpt.h); it does not snapshot anything outside
  * the environment's own tasks (the two sidecars and, E7 increment 20, their
  * Linux tenant — no kernel state, that is checkpoint_mgr's sixteen regions);
- * it does not carry a parked Linux task's queued request (B9: the gate's
- * restorable form is USER); and it does not claim cross-node restore (P3).
+ * it does not carry a Linux task's queued forward request (B9: the
+ * restorable forms are USER, ENTRY and a FORM_FUTEX wait with no request in
+ * flight); and it does not claim cross-node restore (P3).
  */
 
 /* Directory + blob format. Bumped by the WRITER whenever the layout
@@ -114,9 +115,14 @@ struct EnvCkptRecord;
  * leader carries the group's image/heap cursors and owns its shared page
  * block; siblings carry no duplicate shared pages. The task stride changed
  * (408 -> 416 bytes), so a v3 blob is REFUSED, not misread: walking it with
- * this struct would read each task and page block 8 bytes late. */
-#define ENV_PAYLOAD_REC_VERSION      4u
-#define ENV_PAYLOAD_REC_VERSION_PREV 3u   /* the last single-context layout: refused by name */
+ * this struct would read each task and page block 8 bytes late.
+ *
+ * v5 (TG-2c): EnvPayloadTask gains the futex barrier's key and remaining
+ * timeout at the end (416 -> 432 bytes). FORM_FUTEX is a wait, not a
+ * runnable context, so an older blob cannot be given its semantics by
+ * accident; v4 is refused by the same task-stride rule. */
+#define ENV_PAYLOAD_REC_VERSION      5u
+#define ENV_PAYLOAD_REC_VERSION_PREV 4u   /* the last non-futex layout: refused by name */
 #define ENV_PAYLOAD_DIR_MAGIC   0x534C53504C4F4131ULL  /* "SLSPLOA1" */
 #define ENV_PAYLOAD_BLOB_MAGIC  0x534C5350424C4F31ULL  /* "SLSPBLO1" */
 
@@ -159,6 +165,17 @@ struct EnvCkptRecord;
                                        * the workload's own fourth 64 KiB read
                                        * (src_off=196608), instead of hoping a
                                        * pause lands between a reply and a trap. */
+#define ENV_PAYLOAD_FORM_FUTEX   4u   /* TG-2c: the task is BLOCKED in
+                                       * FUTEX_WAIT with the word already read and
+                                       * compared. The payload carries the wait
+                                       * key, expected word, remaining timeout and
+                                       * the entry park frame. Restore re-enqueues
+                                       * every such task before the group is
+                                       * released; a FUTEX form is never resumed
+                                       * as a runnable context. A group's members
+                                       * must all name the same barrier key, or the
+                                       * restore refuses the whole group by name
+                                       * (EP_REFUSE_BARRIER). */
 
 /* Per-page permission bits (the page index's fourth word). Decoded from the
  * LIVE PTE at capture (pt_perm_from_pte in env_payload.c), so the blob says
@@ -194,6 +211,7 @@ struct EnvCkptRecord;
 #define EP_REFUSE_SHAPE      15  /* a=task index; a captured task's kind is not what its slot claims (Linux vs sidecar) */
 #define EP_REFUSE_GROUP      16  /* a=task index, b=group id; group id/index/leader fields are incoherent */
 #define EP_REFUSE_DUP        17  /* a=first page, b=duplicate page; same vaddr+root with different bytes or permissions */
+#define EP_REFUSE_BARRIER    18  /* a=task index, b=rule; a futex-barrier group is mixed, keyed differently, has no wait room, or its live word changed */
 
 struct EnvPayloadRefusal {
     uint32_t code;
@@ -293,6 +311,15 @@ struct EnvPayloadTask {
     uint16_t thread_index;
     uint8_t  leader;
     uint8_t  _group_pad;
+    /* ── TG-2c: FORM_FUTEX only. Zero for every other form. `futex_ticks`
+     * is the remaining timeout at capture (0 = forever), never the
+     * boot-local absolute deadline the waiter table holds. `futex_val` is
+     * the word the waiter compared against before it parked; every member
+     * of a barrier must carry the same value, and restore refuses a group
+     * whose keys disagree before it pours. */
+    uint64_t futex_uaddr;
+    uint32_t futex_val;
+    uint32_t futex_ticks;
 };
 
 /* ─── Public API ────────────────────────────────────────────────────────────*/

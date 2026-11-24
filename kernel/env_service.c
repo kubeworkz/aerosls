@@ -9,6 +9,7 @@
 #include "kernel_io.h"
 #include "smp.h"
 #include "process.h"   /* E1: kernel_yield_to_ring3 (the unified boot's hand-over) */
+#include "linux_thread.h" /* TG-2c: release every restored group member in one pass */
 #include "checkpoint_mgr.h"   /* P1a: the checkpoint sequence a registration belongs to */
 #include "env_payload.h"     /* P1a: the payload pour that follows a replay */
 #include "failover.h"        /* failover_sweep_keepalive() — the blocked RPC wait keeps the heartbeat stream alive */
@@ -432,9 +433,11 @@ void env_service_set_restore_tooth(int tooth) {
  * `es_release_held_linux` is the OTHER end of that hold, and it runs on every
  * path out of a pour: success, refusal, and the metadata-only skip. A child
  * the create held and nothing released would never be scheduled again, which
- * is a worse failure than the second _start the hold exists to prevent. The
- * record is re-found by identity because the create's own registration is
- * what the pass just upserted. */
+ * is a worse failure than the second _start the hold exists to prevent. A
+ * group is released through `linux_group_release_restored` in one pass: the
+ * siblings share a name, so name-by-name release would leave all but the
+ * first held. The record is re-found by identity because the create's own
+ * registration is what the pass just upserted. */
 static int es_record_has_linux(const struct EnvCkptRecord* rec) {
     if (!rec) return 0;
     for (uint32_t t = 0; t < rec->n_tasks && t < ENV_CKPT_MAX_TASKS; t++)
@@ -443,9 +446,32 @@ static int es_record_has_linux(const struct EnvCkptRecord* rec) {
 }
 
 static void es_release_held_linux(const struct EnvCkptRecord* rec) {
+    uint32_t released_groups[ENV_CKPT_MAX_TASKS];
+    uint32_t n_groups = 0;
+
     if (!rec) return;
     for (uint32_t t = 0; t < rec->n_tasks && t < ENV_CKPT_MAX_TASKS; t++) {
         if (rec->tasks[t].kind != ENV_CKPT_TASK_LINUX) continue;
+        if (rec->tasks[t].group_id != 0) {
+            int seen = 0;
+            for (uint32_t g = 0; g < n_groups; g++)
+                if (released_groups[g] == rec->tasks[t].group_id) seen = 1;
+            if (seen) continue;
+            released_groups[n_groups++] = rec->tasks[t].group_id;
+            /* A group shares one name, so release-by-name would leave every
+             * sibling after the first still held. One call clears every held
+             * member; FUTEX members stay BLOCKED until their barrier wakes. */
+            {
+                uint32_t n = linux_group_release_restored(
+                    rec->tasks[t].group_id);
+                if (n > 0)
+                    kernel_serial_printf(
+                        "[ENV_SERVICE] restored group %u released %u held "
+                        "threads together\n",
+                        (unsigned)rec->tasks[t].group_id, (unsigned)n);
+            }
+            continue;
+        }
         (void)cap_linux_restore_release(rec->tasks[t].name);
     }
 }

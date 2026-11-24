@@ -27,19 +27,21 @@
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I arch/x86 \
  *       -o /tmp/env_payload_host_test \
  *       tests/env_payload_host_test.c kernel/env_payload.c kernel/env_ckpt.c \
- *           kernel/linux_thread.c kernel/linux_abi.c
+ *           kernel/linux_thread.c kernel/linux_futex.c kernel/linux_abi.c
  *   /tmp/env_payload_host_test
  */
 #include "tests/partition_host_stubs.h"  /* env_ckpt.c's partition_pause/_resume/_is_paused/_exists */
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <stddef.h>
 
 #include "kernel/env_payload.h"
 #include "kernel/env_ckpt.h"
 #include "kernel/env_console.h"
 #include "kernel/process.h"
 #include "kernel/linux_thread.h"
+#include "kernel/linux_futex.h"
 #include "kernel/cap.h"
 #include "kernel/linux_abi.h"      /* E7 increment 20: SYS_LINUX_TRAP_RESUME, the parked Linux form */
 #include "kernel/env_storage.h"   /* env_storage_extent_of link stub, as env_ckpt_host_test's */
@@ -470,6 +472,57 @@ static int blob_set_head_version(uint32_t version) {
     return nvme_write_sync(ENV_PAYLOAD_SLOT_LBA(0), g_blob_head) == 0;
 }
 
+/* TG-2c: change one task's form in place, leaving its context and page
+ * blocks untouched. Recompute the index crc so the restore reaches the form
+ * rule rather than refusing a torn blob first. */
+static int blob_set_task_form(uint32_t t, uint8_t form) {
+    if (!blob_load_head_and_index()) return 0;
+    struct EnvPayloadHead* h = (struct EnvPayloadHead*)g_blob_head;
+    uint32_t total = 0;
+    if (!blob_index_total(h, &total) || t >= h->n_tasks) return 0;
+    uint32_t task_off = 3u * (uint32_t)sizeof(struct EnvPayloadRegion) +
+                        t * (uint32_t)sizeof(struct EnvPayloadTask);
+    g_blob_index[task_off + (uint32_t)offsetof(struct EnvPayloadTask, form)] =
+        form;
+    if (form != ENV_PAYLOAD_FORM_FUTEX) {
+        memset(g_blob_index + task_off +
+                   offsetof(struct EnvPayloadTask, futex_uaddr),
+               0, sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint32_t));
+    }
+    h->crc32 = test_crc32(0, g_blob_index, total + h->console_len);
+    uint32_t frames = h->bytes / 4096u - 1u - h->n_pages;
+    for (uint32_t f = 0; f < frames; f++) {
+        if (nvme_write_sync(ENV_PAYLOAD_SLOT_LBA(0) + 8ull +
+                            (uint64_t)f * 8ull,
+                            g_blob_index + (uint64_t)f * 4096u) != 0)
+            return 0;
+    }
+    return nvme_write_sync(ENV_PAYLOAD_SLOT_LBA(0), g_blob_head) == 0;
+}
+
+/* TG-2c: change one task's expected futex word, leaving its address and
+ * timeout alone. The group barrier key is (address, value), so restore must
+ * refuse this before the pour. */
+static int blob_set_task_futex_val(uint32_t t, uint32_t val) {
+    if (!blob_load_head_and_index()) return 0;
+    struct EnvPayloadHead* h = (struct EnvPayloadHead*)g_blob_head;
+    uint32_t total = 0;
+    if (!blob_index_total(h, &total) || t >= h->n_tasks) return 0;
+    uint32_t off = 3u * (uint32_t)sizeof(struct EnvPayloadRegion) +
+                   t * (uint32_t)sizeof(struct EnvPayloadTask) +
+                   (uint32_t)offsetof(struct EnvPayloadTask, futex_val);
+    test_write32(g_blob_index + off, val);
+    h->crc32 = test_crc32(0, g_blob_index, total + h->console_len);
+    uint32_t frames = h->bytes / 4096u - 1u - h->n_pages;
+    for (uint32_t f = 0; f < frames; f++) {
+        if (nvme_write_sync(ENV_PAYLOAD_SLOT_LBA(0) + 8ull +
+                            (uint64_t)f * 8ull,
+                            g_blob_index + (uint64_t)f * 4096u) != 0)
+            return 0;
+    }
+    return nvme_write_sync(ENV_PAYLOAD_SLOT_LBA(0), g_blob_head) == 0;
+}
+
 /* TG-2b: replace the second page entry of task 0 with a copy of the first
  * but a different CRC. The block count and total page count are unchanged
  * (so the layout walk still succeeds); the restore must name the duplicate
@@ -842,6 +895,48 @@ static uint32_t setup_and_capture_group(void) {
     return env_payload_capture_all();
 }
 
+/* TG-2c: the same group, stopped at one futex barrier. Both members are
+ * BLOCKED in FUTEX_WAIT on one heap word (the word is in the leader's shared
+ * heap page, so it is part of the payload). The leader has a finite remaining
+ * timeout; the sibling waits forever. */
+#define G_BARRIER (L_HEAP + 0x100ull)
+static uint32_t setup_and_capture_group_futex(void) {
+    if (setup_and_capture_group() != 1) return 0;
+
+    *(uint32_t*)(void*)(g_l_heap[0] + 0x100) = 0x51F7u;
+    kernel_tick_counter = 3;
+    linux_futex_init();
+
+    struct ProcessDescriptor* lx = &proc_table[1];
+    struct ProcessDescriptor* sx = &proc_table[2];
+    lx->state = PROC_BLOCKED;
+    lx->park_syscall = SYS_LINUX_FUTEX_RESUME;
+    lx->waiting_chan = CAP_NONE;
+    lx->waiting_nchans = 0;
+    lx->park_ctx.rcx = L_IMG + 0x40;
+    lx->park_ctx.user_rsp = L_STACK + 0x1000;
+    for (int a = 0; a < 6; a++) lx->park_ctx.linux_args[a] = (uint64_t)(0xC0 + a);
+    lx->user_rip = lx->park_ctx.rcx;
+    lx->user_rsp = lx->park_ctx.user_rsp;
+
+    sx->state = PROC_BLOCKED;
+    sx->park_syscall = SYS_LINUX_FUTEX_RESUME;
+    sx->waiting_chan = CAP_NONE;
+    sx->waiting_nchans = 0;
+    sx->park_ctx.rcx = L_IMG + 0x100;
+    sx->park_ctx.user_rsp = L_STACK + 0x800;
+    for (int a = 0; a < 6; a++) sx->park_ctx.linux_args[a] = (uint64_t)(0xE0 + a);
+    sx->user_rip = sx->park_ctx.rcx;
+    sx->user_rsp = sx->park_ctx.user_rsp;
+
+    if (linux_futex_wait_enqueue(G_GROUP, G_BARRIER, lx->tid,
+                                 kernel_tick_counter + 10ull) != 0)
+        return 0;
+    if (linux_futex_wait_enqueue(G_GROUP, G_BARRIER, sx->tid, 0) != 0)
+        return 0;
+    return env_payload_capture_all();
+}
+
 static void simulate_fresh_boot_linux(void) {
     for (int i = 0; i < 2; i++) {
         memset(g_l_img[i], 0, 4096);
@@ -1107,7 +1202,7 @@ int main(void) {
     CHECK(setup_and_capture_group() == 1,
           "GROUP: a sidecar plus a two-thread Linux group captures as one payload");
     CHECK(blob_load_head_and_index(),
-          "GROUP: the captured v4 blob can be read back");
+          "GROUP: the captured v5 blob can be read back");
     {
         struct EnvPayloadHead* h = (struct EnvPayloadHead*)g_blob_head;
         struct EnvPayloadTask t1, t2;
@@ -1195,6 +1290,109 @@ int main(void) {
               "CHURN: the recaptured payload no longer names the dead group thread");
     }
 
+    /* ── 7. TG-2c: the futex barrier is a wait, not a runnable context ──── */
+    CHECK(setup_and_capture_group_futex() == 1,
+          "BARRIER: a two-thread group stopped in one futex wait captures as one payload");
+    CHECK(blob_load_head_and_index(),
+          "BARRIER: the v5 barrier blob can be read back");
+    {
+        struct EnvPayloadHead* h = (struct EnvPayloadHead*)g_blob_head;
+        struct EnvPayloadTask t1, t2;
+        CHECK(h->n_tasks == 3 && h->n_pages == 9,
+              "BARRIER: both waiting threads and the sidecar are captured, with the shared heap pages once");
+        CHECK(blob_task_at(h, 1, &t1) && blob_task_at(h, 2, &t2) &&
+              t1.form == ENV_PAYLOAD_FORM_FUTEX &&
+              t2.form == ENV_PAYLOAD_FORM_FUTEX,
+              "BARRIER: each group member is FORM_FUTEX, not a runnable USER context");
+        CHECK(t1.futex_uaddr == G_BARRIER && t2.futex_uaddr == G_BARRIER &&
+              t1.futex_val == 0x51F7u && t2.futex_val == 0x51F7u,
+              "BARRIER: both tasks carry the same address and expected word");
+        CHECK(t1.futex_ticks == 10u && t2.futex_ticks == 0u,
+              "BARRIER: the finite wait carries its remaining ticks and the forever wait stays zero");
+        CHECK(t1.park[1] == L_IMG + 0x40 && t2.park[1] == L_IMG + 0x100 &&
+              t1.linux_args[0] == 0xC0 && t2.linux_args[0] == 0xE0,
+              "BARRIER: each waiter carries its own entry park frame");
+    }
+
+    simulate_fresh_boot_linux();
+    linux_futex_init();
+    kernel_tick_counter = 100;
+    proc_table[1].restore_held = 1;
+    proc_table[1].state = PROC_HELD;
+    proc_table[2].restore_held = 1;
+    proc_table[2].state = PROC_HELD;
+    pages = 0; cons = 0;
+    rc = env_payload_restore(L_PART, L_IDX, 22, L_SEQ, &pages, &cons);
+    CHECK(rc == EP_REFUSE_NONE && pages == 9,
+          "BARRIER: the barrier restores through the normal pour");
+    CHECK(linux_futex_pending(G_GROUP, G_BARRIER) == 2,
+          "BARRIER: both waits are re-enqueued before the group is released");
+    CHECK(proc_table[1].state == PROC_BLOCKED &&
+          proc_table[2].state == PROC_BLOCKED &&
+          proc_table[1].park_syscall == SYS_LINUX_FUTEX_RESUME &&
+          proc_table[2].park_syscall == SYS_LINUX_FUTEX_RESUME,
+          "BARRIER: both descriptors are BLOCKED in the futex resume form, not runnable");
+    {
+        struct LinuxFutexWaitInfo i1, i2;
+        CHECK(linux_futex_waiter_info(proc_table[1].tid, &i1) &&
+              linux_futex_waiter_info(proc_table[2].tid, &i2) &&
+              i1.deadline == 110ull && i2.deadline == 0ull,
+              "BARRIER: the finite timeout is re-armed relative to this boot, and forever stays forever");
+    }
+
+    CHECK(linux_group_release_restored(G_GROUP) == 2,
+          "RELEASE: one call releases both held members of the restored group");
+    CHECK(!proc_table[1].restore_held && !proc_table[2].restore_held &&
+          proc_table[1].state == PROC_BLOCKED &&
+          proc_table[2].state == PROC_BLOCKED,
+          "RELEASE: the hold is cleared together, and the futex waiters stay blocked for their wake");
+    {
+        uint32_t tids[2] = {0, 0};
+        int n = linux_futex_wake_collect(G_GROUP, G_BARRIER, 2, tids, 2);
+        CHECK(n == 2 &&
+              ((tids[0] == proc_table[1].tid && tids[1] == proc_table[2].tid) ||
+               (tids[1] == proc_table[1].tid && tids[0] == proc_table[2].tid)),
+              "RELEASE: one barrier wake releases both waiters, never just the first");
+        CHECK(linux_futex_pending(G_GROUP, G_BARRIER) == 0,
+              "RELEASE: no waiter remains in the table after the coordinated wake");
+    }
+
+    /* A blob with one FUTEX member and one USER member is a half-stopped
+     * group: the restore must name the barrier rule before a page moves. */
+    CHECK(setup_and_capture_group_futex() == 1,
+          "BARRIER-REFUSE: a fresh barrier payload is captured");
+    CHECK(blob_set_task_form(2, ENV_PAYLOAD_FORM_USER),
+          "BARRIER-REFUSE: one sibling can be rewritten as a runnable context");
+    simulate_fresh_boot_linux();
+    linux_futex_init();
+    proc_table[1].restore_held = 1;
+    proc_table[1].state = PROC_HELD;
+    proc_table[2].restore_held = 1;
+    proc_table[2].state = PROC_HELD;
+    pages = 0; cons = 0;
+    rc = env_payload_restore(L_PART, L_IDX, 22, L_SEQ, &pages, &cons);
+    CHECK(rc == EP_REFUSE_BARRIER && pages == 0 && cons == 0,
+          "BARRIER-REFUSE: a mixed futex/runnable group is refused by name before any pour");
+    CHECK(linux_futex_pending(G_GROUP, G_BARRIER) == 0,
+          "BARRIER-REFUSE: the refused restore left no waiter enqueued");
+
+    CHECK(setup_and_capture_group_futex() == 1,
+          "BARRIER-REFUSE: a fresh barrier payload is captured for the value tooth");
+    CHECK(blob_set_task_futex_val(2, 0x51F8u),
+          "BARRIER-REFUSE: one sibling's expected word can be changed in place");
+    simulate_fresh_boot_linux();
+    linux_futex_init();
+    proc_table[1].restore_held = 1;
+    proc_table[1].state = PROC_HELD;
+    proc_table[2].restore_held = 1;
+    proc_table[2].state = PROC_HELD;
+    pages = 0; cons = 0;
+    rc = env_payload_restore(L_PART, L_IDX, 22, L_SEQ, &pages, &cons);
+    CHECK(rc == EP_REFUSE_BARRIER && pages == 0 && cons == 0,
+          "BARRIER-REFUSE: one barrier address with two expected words is refused before any pour");
+    CHECK(linux_futex_pending(G_GROUP, G_BARRIER) == 0,
+          "BARRIER-REFUSE: the value refusal also leaves the waiter table empty");
+
     /* A shared root with the same vaddr twice is only coherent when both
      * records describe the same page. A different CRC is a corrupt shared
      * page index, refused by its own name before the pour. */
@@ -1250,14 +1448,14 @@ int main(void) {
      * blob is refused before its task array is walked; its page blocks would
      * otherwise be read eight bytes late. */
     CHECK(setup_and_capture_linux(1) == 1,
-          "V3: a soft-free payload is captured by the v4 writer");
+          "V4: a soft-free payload is captured by the v5 writer");
     CHECK(blob_set_head_version(ENV_PAYLOAD_REC_VERSION_PREV),
-          "V3: the blob head can carry the previous version for the refusal tooth");
+          "V4: the blob head can carry the previous version for the refusal tooth");
     simulate_fresh_boot_linux();
     pages = 0; cons = 0;
     rc = env_payload_restore(L_PART, L_IDX, 22, L_SEQ, &pages, &cons);
     CHECK(rc == EP_REFUSE_FORMAT && pages == 0 && cons == 0,
-          "V3: a v3 blob is refused by format before any pour (the v4 task stride is not its stride)");
+          "V4: a v4 blob is refused by format before any pour (the v5 task stride is not its stride)");
 
     /* A soft page is its own state: USER or W/X alongside it is a
      * contradiction. Rewrite the permission word and recompute the index

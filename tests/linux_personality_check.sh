@@ -1217,7 +1217,7 @@ IEM=user/init/src/env_manager.rs
 ENVP=user/proto/src/env_proto.rs
 EPHUT=tests/env_payload_host_test.c
 ECKHUT=tests/env_ckpt_host_test.c
-if grep -qE '#define ENV_PAYLOAD_REC_VERSION[[:space:]]+4u' "$EPH" && \
+if grep -qE '#define ENV_PAYLOAD_REC_VERSION[[:space:]]+5u' "$EPH" && \
    grep -qF '#define EP_PAGE_ENTRY_BYTES 16u' "$EPH" && \
    grep -qE '#define EP_PAGE_PERM_SOFT[[:space:]]+0x8u' "$EPH" && \
    grep -qF 'uint64_t linux_regs[20];' "$EPH" && \
@@ -1231,10 +1231,14 @@ if grep -qE '#define ENV_PAYLOAD_REC_VERSION[[:space:]]+4u' "$EPH" && \
    grep -qF 'uint32_t group_id;' "$EPH" && \
    grep -qF 'uint16_t thread_index;' "$EPH" && \
    grep -qF 'uint8_t  leader;' "$EPH" && \
-   grep -qF '#define ENV_PAYLOAD_FORM_USER    2u' "$EPH"; then
-    ok "W1. the payload is v4: EnvPayloadTask carries the Linux task's FULL context (20-word TaskContext), its six argument registers, fs_base, both cursors, the heap and stack ranges, the image span, and its group id/index/leader; every page index entry is 16 bytes with a permission word including the soft PROT_NONE state"
+   grep -qF 'uint64_t futex_uaddr;' "$EPH" && \
+   grep -qF 'uint32_t futex_val;' "$EPH" && \
+   grep -qF 'uint32_t futex_ticks;' "$EPH" && \
+   grep -qF '#define ENV_PAYLOAD_FORM_USER    2u' "$EPH" && \
+   grep -qF '#define ENV_PAYLOAD_FORM_FUTEX   4u' "$EPH"; then
+    ok "W1. the payload is v5: EnvPayloadTask carries the Linux task's FULL context (20-word TaskContext), its six argument registers, fs_base, both cursors, the heap and stack ranges, the image span, its group id/index/leader, and a FORM_FUTEX barrier key/value/remaining timeout; every page index entry is 16 bytes with a permission word including the soft PROT_NONE state"
 else
-    bad "W1. the Linux half or group identity of EnvPayloadTask is gone — the capture could file pages a restore cannot map, two siblings would be indistinguishable, or a v3-shaped blob would be misread task by task"
+    bad "W1. the Linux half, group identity or futex-wait half of EnvPayloadTask is gone — the capture could file pages a restore cannot map, two siblings would be indistinguishable, a barrier wait would have no key to re-enqueue, or an older stride would be misread task by task"
 fi
 if grep -qF 'static int ep_linux_page(const struct EnvCkptRecord* rec, uint32_t t,' "$EPC" && \
    grep -qF 'if (tk->stack_bottom && vaddr >= tk->stack_bottom &&' "$EPC" && \
@@ -1261,12 +1265,15 @@ if grep -qF 'case EP_REFUSE_PERM:' "$EPC" && \
    grep -qF 'if ((live_perm & EP_PAGE_PERM_MASK) !=' "$EPC" && \
    grep -qF 'ep_refuse(EP_REFUSE_PERM, t, pi);' "$EPC" && \
    grep -qF 'if (tk.form != ENV_PAYLOAD_FORM_USER &&' "$EPC" && \
-   grep -qF 'tk.form != ENV_PAYLOAD_FORM_ENTRY) {' "$EPC" && \
-   grep -qF 'pd->has_ring3_ctx  = 1;' "$EPC" && \
+   grep -qF 'tk.form != ENV_PAYLOAD_FORM_ENTRY &&' "$EPC" && \
+   grep -qF 'tk.form != ENV_PAYLOAD_FORM_FUTEX) {' "$EPC" && \
+   grep -qF 'if (tk.form == ENV_PAYLOAD_FORM_FUTEX) {' "$EPC" && \
+   grep -qF 'linux_futex_wait_enqueue(fgid, tk.futex_uaddr, pd->tid,' "$EPC" && \
+   grep -qF 'pd->has_ring3_ctx = 1;' "$EPC" && \
    grep -qF 'linux_group_set_mmap_top(pd, tk.mmap_top);' "$EPC"; then
-    ok "W4. the restore proves the page's live permissions against the captured ones before a byte moves, resumes only the two resumable Linux forms (the pause's USER and increment 21's held ENTRY stop — PARKED and RUNNING refused by name, their queued/mid-compute state not being in the blob), and carries the captured ring3_ctx with its fs_base and both cursors onto the group"
+    ok "W4. the restore proves the page's live permissions against the captured ones before a byte moves, resumes the resumable Linux forms (USER and increment 21's held ENTRY), re-enqueues FORM_FUTEX with its expected word and relative deadline instead of resuming it, refuses PARKED/RUNNING by name, and carries the captured context, fs_base and both cursors onto the group"
 else
-    bad "W4. the restore's Linux arm is gone — a page could be poured into a map with different permissions, a parked task's stale context would be resumed, a non-held task could be poured over, or the task would restart at its entry"
+    bad "W4. the restore's Linux arm is gone — a page could be poured into a map with different permissions, a parked or futex wait's stale context would be resumed, a non-held task could be poured over, or the task would restart at its entry"
 fi
 if grep -qF 'pub const LINUX_TASK_NAME: &str = "e7.gate.user.0";' "$ENVP" && \
    grep -qF 'r.set_task(2, LINUX_TASK_NAME, TASK_LINUX);' "$IEM" && \
@@ -1286,6 +1293,15 @@ if grep -qF 'LINUX: the gate environment (sidecar + Linux tenant) captures as on
    grep -qF 'LINUX: the full ring3_ctx — rip, rsp and the six argument registers — is the captured one' "$EPHUT" && \
    grep -qF 'PERM: a captured RX image page that is writable at the destination refuses the whole pour' "$EPHUT" && \
    grep -qF 'GROUP: a sidecar plus a two-thread Linux group captures as one payload' "$EPHUT" && \
+   grep -qF 'BARRIER: both tasks carry the same address and expected word' "$EPHUT" && \
+   grep -qF 'BARRIER: both waits are re-enqueued before the group is released' "$EPHUT" && \
+   grep -qF 'BARRIER: both descriptors are BLOCKED in the futex resume form, not runnable' "$EPHUT" && \
+   grep -qF 'RELEASE: one call releases both held members of the restored group' "$EPHUT" && \
+   grep -qF 'BARRIER-REFUSE: a mixed futex/runnable group is refused by name before any pour' "$EPHUT" && \
+   grep -qF 'BARRIER-REFUSE: one barrier address with two expected words is refused before any pour' "$EPHUT" && \
+   grep -qF 'uint32_t linux_group_release_restored(uint32_t group_id);' "$LTHH" && \
+   grep -qF 'uint32_t linux_group_release_restored(uint32_t group_id) {' "$LTHC" && \
+   grep -qF 'linux_group_release_restored(' kernel/env_service.c && \
    grep -qF 'GROUP: the leader is (group 101, index 0), owns the image/stack/heap pages' "$EPHUT" && \
    grep -qF 'GROUP: the sibling is a distinct (group 101, index 1) with no duplicate shared pages' "$EPHUT" && \
    grep -qF 'GROUP: both thread contexts are installed into their own descriptors' "$EPHUT" && \
@@ -1296,7 +1312,7 @@ if grep -qF 'LINUX: the gate environment (sidecar + Linux tenant) captures as on
    grep -qF 'env_ckpt_linux_group_thread_drop(' "$DISP" && \
    grep -qF 'DUP: one vaddr twice with different bytes is refused by name, before any pour' "$EPHUT" && \
    grep -qF 'DUP: the refusal names the first entry and the duplicate' "$EPHUT" && \
-   grep -qF 'V3: a v3 blob is refused by format before any pour (the v4 task stride is not its stride)' "$EPHUT" && \
+   grep -qF 'V4: a v4 blob is refused by format before any pour (the v5 task stride is not its stride)' "$EPHUT" && \
    grep -qF 'SOFT+USER: the restore refuses the contradictory permission before a byte moves' "$EPHUT" && \
    grep -qF 'SOFT+WX: a writable+executable soft page is refused by format, not poured' "$EPHUT" && \
    grep -qF 'SOFT+USER: the refusal names the permission rule (a=8), not a torn index CRC' "$EPHUT" && \
@@ -1305,9 +1321,9 @@ if grep -qF 'LINUX: the gate environment (sidecar + Linux tenant) captures as on
    grep -qF 'FORM: a parked Linux tenant is refused by name' "$EPHUT" && \
    grep -qF 'the stamp fills the Linux slot' "$ECKHUT" && \
    grep -qF 'a replay whose create names the same three tasks IS the same environment' "$ECKHUT"; then
-    ok "W6. both host tests drive the increment: the payload round trip (bytes, perms, per-thread group contexts and shared-page ownership), the sibling-exit churn recapture, the duplicate-page refusal, the v3-stride refusal, the corrupt soft-permission refusals with both a=8 operand assertions, and the record layer's stamp/identity clauses — each claim runs against the real kernel file, not a model of it"
+    ok "W6. both host tests drive the increment: the payload round trip (bytes, perms, per-thread group contexts and shared-page ownership), the sibling-exit churn recapture, the futex barrier capture/re-enqueue/release, the duplicate-page refusal, the v4-stride refusal, the corrupt soft-permission refusals with both a=8 operand assertions, and the record layer's stamp/identity clauses — each claim runs against the real kernel file, not a model of it"
 else
-    bad "W6. a host-test clause for the Linux payload is missing — the group capture/restore or churn recapture, the duplicate-page refusal, the v3-stride refusal, a corrupt soft-permission refusal or the record stamp would be a claim no test runs"
+    bad "W6. a host-test clause for the Linux payload is missing — the group capture/restore or churn recapture, the futex barrier or coordinated release, the duplicate-page refusal, the v4-stride refusal, a corrupt soft-permission refusal or the record stamp would be a claim no test runs"
 fi
 
 # ─── X. E7 increment 25: munmap, the memory class's last seam ─────────────
