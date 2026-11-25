@@ -107,7 +107,10 @@
 # ─── What this does NOT claim ──────────────────────────────────────────────
 # It does not run in CI: the source clauses do (they need only bash), but
 # --live and --teeth need make + QEMU and take ~15 and ~40 minutes on this host
-# (the 512 KiB firstuser build is the slow part; the five replays are ~4). The
+# (the 512 KiB firstuser build is the slow part; the five replays are ~4).
+# The `--group` live arm is the exception: kernel-guards runs it on every push
+# (tests/thread_group_ckpt_check.sh --live), because the two-thread restore
+# path has no cheaper way to be proven and no recorded replay covers it. The
 # teeth cover all four breaks increment 22/23 name (descriptor, fd, heap page,
 # TLS base); the restart tooth is not a separate arm — it is what `descriptor`
 # produces as a consequence and is asserted as B3/B4. B7's exit scan rides BOTH teardown

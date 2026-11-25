@@ -1026,6 +1026,28 @@ jobs:
           echo "OK: kernel booted from the ISO and /api/health answered"
         working-directory: aerosls2
 
+      # ─── TG-2d: the two-thread checkpoint/restore arm, live ─────────────
+      # The E7 gate's live arms need make + QEMU, so they do not run in
+      # `verify`; what ran nowhere was TG-2d's group arm: the two-thread
+      # barrier capture, the two-boot replay, and G2.1a–G2.8's assertions
+      # existed only as a hand-run command. A regression in the replay create
+      # (the held siblings, the exact-index join, the whole-group release) or
+      # in the payload's futex re-enqueue therefore failed only on a host
+      # where somebody remembered to run it — the exact silent rot this job
+      # exists to end. This step runs the arm its own way: source clauses
+      # first (cheap, and already run by run_checks.sh on every push), then
+      # its own `E7_GROUP_CKPT=1` image build, one capture boot, one replay
+      # boot, and the group clauses. It does NOT reuse the plain ISO: the
+      # group workload is a build-time sidecar profile, and a shipped image
+      # must never carry it. `timeout-minutes` bounds a wedged boot; the arm
+      # itself also bounds each wait.
+      - name: TG-2d group checkpoint live arm (two threads, one barrier, one replay)
+        env:
+          E7G_ARTIFACTS: ${{ runner.temp }}/e7-group-artifacts
+        run: bash tests/thread_group_ckpt_check.sh --live
+        working-directory: aerosls2
+        timeout-minutes: 40
+
       # P1b's gate (POSIX-Environments v0.2 §10, step 2): a file larger than
       # 71 168 bytes survives a reboot and is charged to the partition. The
       # guard's source clauses and its teeth run in `verify`; only THIS job

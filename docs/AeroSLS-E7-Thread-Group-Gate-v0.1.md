@@ -1153,6 +1153,22 @@ and 106 on one root, adopted leader `rsp=0x400000021e10` and sibling
 at line 1211 after the line-313 release, and finished `G2-COPY=65536` with
 `G2-SUM=0xa97a7a6074da2325` and exactly one group teardown.
 
+The arm is not hand-run-only: `.github/workflows/ci.yml`'s `kernel-guards`
+job runs `bash tests/thread_group_ckpt_check.sh --live` on every push, right
+after the ISO service smoke, with `E7G_ARTIFACTS` under the runner's temp
+dir and a 40-minute step timeout. The guard's T7 clause fails if that step is
+deleted or renamed, and its source clauses already ran on every push through
+`run_checks.sh`. The step builds its own image (`E7_GROUP_CKPT=1`): the group
+workload is a build-time sidecar profile and a shipped image must not carry
+it, so it cannot reuse the plain ISO.
+
+**Cost per run** (measured on the 6-core WSL host used for the live arms, TCG,
+no KVM): a full forced `make x86-iso-e3 ... E7_GROUP_CKPT=1` is **213 s**, the
+two-boot capture/replay plus G2.1a–G2.8 is **97 s**, and the source clauses
+are sub-second — about **5 minutes** added to the job, of which the image
+build is ~70%. The build is the part a warm tree hides and a CI checkout pays
+in full; the boot pair is the same order as the existing P1b/P2 live arms.
+
 ### TG-3 — hardening after the gate
 
 Signal frames and handler delivery; robust futex; `FUTEX_WAIT_BITSET` if

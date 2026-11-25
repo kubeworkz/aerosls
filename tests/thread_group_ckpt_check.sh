@@ -5,6 +5,12 @@
 #   --live          the source clauses, then the dedicated E7 gate build
 #                   (`E7_GROUP_CKPT=1`) and the two-boot capture/replay arm
 #
+# The source clauses run on every push (run_checks.sh globs tests/*_check.sh).
+# The live arm runs in CI too: .github/workflows/ci.yml's kernel-guards job
+# runs `bash tests/thread_group_ckpt_check.sh --live` right after the ISO
+# service smoke, so the two-thread restore path cannot regress silently. T7
+# below pins that step's existence, so deleting it reddens this guard.
+
 # The live half is the `--group` mode of tests/e7_gate_check.sh, so the arm
 # uses the same partition/create/checkpoint/restore/QEMU harness as the
 # single-task gate rather than a second, drifting copy. What is different is
@@ -90,6 +96,12 @@ if has tools/e7_group_ckpt.c "G2-WORKER-TIMEOUT" && \
     ok "T6. the live arm asserts the post-restore wake pair, the shared pre-barrier write, the resumed checksum and exactly one teardown"
 else
     bad "T6. the live arm's facts are not wired (fixture markers, expected checksum or assert_group)"
+fi
+
+if has .github/workflows/ci.yml "tests/thread_group_ckpt_check.sh --live"; then
+    ok "T7. CI runs the live arm (kernel-guards), so the two-thread restore path cannot go back to hand-run-only"
+else
+    bad "T7. .github/workflows/ci.yml does not run 'tests/thread_group_ckpt_check.sh --live' — G2.1a-G2.8 would regress silently between hand runs"
 fi
 
 if [ "$fails" -ne 0 ]; then
