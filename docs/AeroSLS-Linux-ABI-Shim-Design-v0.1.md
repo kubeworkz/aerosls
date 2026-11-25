@@ -4224,6 +4224,43 @@ The join accepts a wake (rax 0) or an already-cleared word (`-EAGAIN`) because
 a preemptible probe can lose the wake to the timer between releasing the child
 and parking; the state it verifies is the same either way.
 
+### 10.24 What has landed — increment 30b (the clear on every death)
+
+30's glue ran from `linux_thread_exit()` alone, which is `exit(60)`'s path. A
+thread that died any other way — a fault, a kill, `exit_group` — never cleared
+its TID word, so a joiner parked on it would wait forever, and the robust list
+it still held stayed owned by a dead thread. Linux clears in `do_exit`, on
+every path.
+
+The hook moved to the two funnels every Linux death actually passes through:
+
+- **`linux_descriptor_release()`** — the descriptor-level death: `exit(60)` and
+the deferred-kill sweep. The call is placed *before*
+`proc_clear_resume_state()`, which is what zeroes the very words being
+honoured; `linux_thread_exit()` keeps no call of its own.
+- **`linux_group_release_all()`** — the group-fatal teardown behind
+`exit_group`, a kill, and a sibling's fault: every member runs the glue while
+`g->cr3` is still alive, before `linux_group_destroy()`. The wakes there are
+no-ops by construction (a private futex is keyed by group and no member
+survives), so the state change is what the path owes.
+
+The two sites overlap — the last thread of a group runs the descriptor funnel
+and then the group funnel — so the promise is made idempotent structurally:
+`linux_thread_take_exit_words()` hands the two words out once and clears them,
+and the glue returns early when it is owed nothing. `tests/linux_clone_host_test.c`
+drives that directly (51 checks): both words taken once, the **second call
+takes nothing**, one-word-only still counts as work, a thread that registered
+neither owes nothing, a NULL descriptor is not a fault, and the call leaves
+the tid/cr3/pid alone so a dying thread stays resolvable.
+
+Clause **Z7** pins the shape by site rather than by hope: exactly two glue
+calls in `process.c`, one per funnel, the descriptor one above
+`proc_clear_resume_state`, and none left in `linux_thread_exit`; tooth
+**t161** deletes the group-teardown call, which leaves the fault and
+`exit_group` paths silent again — precisely the defect this increment fixes.
+The `exit(60)` live arm from §10.23 still passes unchanged, now exercising the
+descriptor funnel rather than a call beside it.
+
 ---
 
 ## 11. Open questions for review

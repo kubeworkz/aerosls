@@ -1354,6 +1354,14 @@ seed "$W/t160"
 sed -i 's/    if ((word \& LINUX_FUTEX_TID_MASK) != (tid \& LINUX_FUTEX_TID_MASK)) return 0;/    if (0) return 0;/' "$W/t160/kernel/linux_thread.c"
 tooth robust-owner-check-gone Z6 "the robust walk no longer checks that the dead thread owned the word" "$W/t160"
 
+# t161: the group-teardown glue call deleted, leaving only the descriptor
+# funnel. A thread that faults or exits with its group would then never clear
+# its TID word and its joiner would park forever — the exact shape Z7 exists
+# to forbid, and silent on every path the exit(60) live arm exercises.
+seed "$W/t161"
+sed -i '/^        linux_thread_exit_glue(pd);$/d' "$W/t161/kernel/process.c"
+tooth group-teardown-clear-gone Z7 "the group teardown no longer runs the exit glue" "$W/t161"
+
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

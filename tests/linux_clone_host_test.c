@@ -221,6 +221,43 @@ int main(void) {
               "a NULL output is refused");
     }
 
+    /* ── 5c. I5b: the words are taken ONCE, from whichever funnel ─────────── */
+    {
+        struct ProcessDescriptor d;
+        uint64_t ctid = 0, robust = 0;
+
+        plant(&d, 120, 0xABCD5000ull);
+        d.tid = 120;
+        d.linux_clear_tid  = 0x0000700000004000ull;
+        d.linux_robust_list = 0x0000700000004100ull;
+        CHECK(linux_thread_take_exit_words(&d, &ctid, &robust) == 1 &&
+              ctid == 0x0000700000004000ull &&
+              robust == 0x0000700000004100ull &&
+              d.linux_clear_tid == 0 && d.linux_robust_list == 0,
+              "a thread that owed both words hands them over exactly once and forgets them");
+        CHECK(linux_thread_take_exit_words(&d, &ctid, &robust) == 0 &&
+              ctid == 0 && robust == 0,
+              "the SECOND call takes nothing — the idempotence that lets exit(60) and the group teardown both run the glue");
+        CHECK(d.tid == 120 && d.cr3 == 0xABCD5000ull && d.pid == 120,
+              "taking the words touches nothing else on the descriptor (a joiner still resolves this thread's identity while it dies)");
+
+        plant(&d, 121, 0xABCD6000ull);
+        d.linux_robust_list = 0x0000700000004200ull;
+        CHECK(linux_thread_take_exit_words(&d, &ctid, &robust) == 1 &&
+              ctid == 0 && robust == 0x0000700000004200ull,
+              "one word set is still work: the CTID half stays untouched when only a robust list was registered");
+
+        plant(&d, 122, 0xABCD7000ull);
+        CHECK(linux_thread_take_exit_words(&d, &ctid, &robust) == 0,
+              "a thread that registered neither word owes nothing (the glue returns without a console line)");
+        CHECK(linux_thread_take_exit_words(0, &ctid, &robust) == 0,
+              "a NULL descriptor is owed-nothing, not a fault");
+        d.linux_clear_tid = 0x0000700000004300ull;
+        CHECK(linux_thread_take_exit_words(&d, 0, 0) == 1 &&
+              d.linux_clear_tid == 0,
+              "the outputs are optional: a caller that only wants the consumption still gets it");
+    }
+
     /* ── 6. Group membership ─────────────────────────────────────────────── */
     {
         memset(proc_table, 0, sizeof(proc_table));

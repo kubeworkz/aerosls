@@ -275,6 +275,22 @@ int linux_restore_group_siblings(struct ProcessDescriptor* leader,
  * as 0, so the exit glue is never handed an address it would try to write. */
 int linux_ctid_ok(uint64_t word);
 
+/* I5b: take the two words this thread still owes at death, and FORGET them.
+ *
+ * There is more than one funnel a Linux thread can die through — its own
+ * exit(60), the group's teardown (exit_group, a kill, a sibling's fault) and
+ * the deferred-kill sweep — and Linux clears in do_exit on every one of them.
+ * Rather than betting on exactly one site running, the glue is written to be
+ * idempotent: this call hands out the words once and clears them, so a second
+ * funnel (or the same one twice) is a no-op instead of a second clear over a
+ * word a joiner may already have reused.
+ *
+ * Returns 1 when there was anything to do (either word set), 0 when this
+ * thread owes nothing. Touches ONLY those two fields; it is pure descriptor
+ * state, which is what lets the host test drive it with no page tables. */
+int linux_thread_take_exit_words(struct ProcessDescriptor* pd, uint64_t* ctid,
+                                 uint64_t* robust);
+
 /* set_robust_list's two arguments: the length must be the 24-byte head this
  * shim understands (glibc's sizeof(struct robust_list_head)) and the head
  * must be a canonical, 8-aligned user address. */

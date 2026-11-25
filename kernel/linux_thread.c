@@ -133,6 +133,22 @@ int linux_robust_word_addr(uint64_t entry, int64_t futex_offset,
     return 0;
 }
 
+int linux_thread_take_exit_words(struct ProcessDescriptor* pd, uint64_t* ctid,
+                                 uint64_t* robust) {
+    uint64_t c, r;
+
+    if (ctid) *ctid = 0;
+    if (robust) *robust = 0;
+    if (!pd) return 0;
+    c = pd->linux_clear_tid;
+    r = pd->linux_robust_list;
+    pd->linux_clear_tid   = 0;
+    pd->linux_robust_list = 0;
+    if (ctid) *ctid = c;
+    if (robust) *robust = r;
+    return (c != 0 || r != 0) ? 1 : 0;
+}
+
 void linux_clone_build_context(struct TaskContext* ctx, uint64_t parent_rip,
                                uint64_t child_stack) {
     if (!ctx) return;

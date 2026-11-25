@@ -1630,6 +1630,36 @@ else
     bad "Z6. the exit glue lost a half: a clear that skips the validated copy is a ring-0 fault from a task's own address, a wake without a clear resumes a joiner into a tid that never went away, a robust walk without the owner check marks a live sibling's mutex dead, an unbounded walk follows a forged list, or a row without its census is a table entry built from belief"
 fi
 
+# ─── Z7. I5b: the glue runs on EVERY dying Linux thread ────────────────────
+# Linux clears in do_exit on every path, so the hook is pinned by SITE: one
+# call inside linux_descriptor_release (exit(60) and the deferred-kill sweep)
+# and one inside linux_group_release_all (exit_group, a kill, a fault — every
+# member, while the group's root is still alive), and NOTHING in
+# linux_thread_exit itself, which is what left the fault and exit_group paths
+# without a clear before this clause existed. The consumption rule is what
+# lets both sites run: the second is a no-op, which the host test drives.
+relsec="$(sed -n '/^static int linux_descriptor_release/,/^}/p' "$PDC" 2>/dev/null)"
+allsec="$(sed -n '/^static void linux_group_release_all/,/^}/p' "$PDC" 2>/dev/null)"
+texitsec="$(sed -n '/^void linux_thread_exit(/,/^}/p' "$PDC" 2>/dev/null)"
+z7_glue="$(grep -n 'linux_thread_exit_glue(pd);' <<< "$relsec" | head -1 | cut -d: -f1)"
+z7_clear="$(grep -n 'proc_clear_resume_state(pd);' <<< "$relsec" | head -1 | cut -d: -f1)"
+if [ -n "$relsec" ] && [ -n "$allsec" ] && [ -n "$texitsec" ] && \
+   [ "$(grep -c 'linux_thread_exit_glue(pd);' "$PDC")" -eq 2 ] && \
+   grep -qF 'linux_thread_exit_glue(pd);' <<< "$allsec" && \
+   [ -n "$z7_glue" ] && [ -n "$z7_clear" ] && [ "$z7_glue" -lt "$z7_clear" ] && \
+   ! grep -qF 'linux_thread_exit_glue(pd);' <<< "$texitsec" && \
+   grep -qF 'int linux_thread_take_exit_words(struct ProcessDescriptor* pd, uint64_t* ctid,' kernel/linux_thread.h && \
+   grep -qF 'pd->linux_clear_tid   = 0;' "$LTHC" && \
+   grep -qF 'return (c != 0 || r != 0) ? 1 : 0;' "$LTHC" && \
+   grep -qF 'if (!linux_thread_take_exit_words(pd, &ctid, &head)) return;' "$PDC" && \
+   grep -qF 'linux_thread_take_exit_words(&d, &ctid, &robust) == 1' "$LCHUT" && \
+   grep -qF 'the SECOND call takes nothing' "$LCHUT" && \
+   grep -qF 'E7TG-CTID-OK' tests/linux_thread_probe_check.sh; then
+    ok "Z7. every dying Linux thread runs the glue: the call sits in linux_descriptor_release (exit(60) and the deferred sweep, before proc_clear_resume_state zeroes the words it is honouring) and in linux_group_release_all (exit_group, a kill, a fault — every member, while the group's root is still alive), and nowhere else, so a faulted or group-exited thread clears its TID word and releases its robust list instead of leaving a joiner parked forever; linux_thread_take_exit_words makes the two sites safe to overlap (the second takes nothing), which the host test drives, and the exit(60) live arm still proves the clear end to end"
+else
+    bad "Z7. the clear is conditional again: with the hook only on a thread's own exit, a thread that faults or exits with its group never clears its TID word — the joiner hangs on a tid that never went away, and the robust mutex it held stays owned by a dead thread. A missing consumption rule turns the overlap of the two funnels into a second clear under a joiner."
+fi
+
 # ─── P. E7 increment 26 (P1-C): the signal frame ───────────────────────────
 # Five claims, each one a way the frame could be quietly wrong: the contract
 # exists and names its numbers (P), the layout is pinned by the compiler and

@@ -1078,6 +1078,14 @@ static int linux_descriptor_release(struct ProcessDescriptor* pd) {
     struct LinuxThreadGroup* g = linux_group_of(pd);
     int last;
 
+    /* E7 TG-1 I5b: EVERY dying Linux thread clears its TID word and walks its
+     * robust list, exactly as Linux's do_exit does — not only the ones that
+     * called exit(60). This is the funnel every descriptor-level death passes
+     * through (exit(60) and the deferred-kill sweep), and it runs before
+     * proc_clear_resume_state() zeroes the very words being honoured. The
+     * group's root is still alive: a non-last thread leaves it to the group,
+     * and a last thread destroys it after linux_group_release_all(). */
+    linux_thread_exit_glue(pd);
     linux_stack_maybe_report(pd, "exit");
     proc_clear_resume_state(pd);
     /* E7 TG-1 I3: a departing thread cannot still be a futex waiter. A block
@@ -1155,15 +1163,18 @@ static void linux_put_u32(uint8_t* p, uint32_t v) {
 
 void linux_thread_exit_glue(struct ProcessDescriptor* pd) {
     struct LinuxThreadGroup* g;
-    uint64_t ctid, head;
+    uint64_t ctid = 0, head = 0;
     uint32_t tid, gid;
 
     if (!pd) return;
     g    = linux_group_of(pd);
     tid  = pd->tid;
     gid  = g ? g->group_id : 0;
-    ctid = pd->linux_clear_tid;
-    head = pd->linux_robust_list;
+    /* I5b: the words are TAKEN, not read — a Linux thread can die through two
+     * funnels (its own exit and the group teardown that follows the last
+     * one), and both run this. Taking them here is what makes the second call
+     * a no-op instead of a second clear under a joiner. */
+    if (!linux_thread_take_exit_words(pd, &ctid, &head)) return;
 
     if (ctid != 0 && linux_ctid_ok(ctid)) {
         static const uint8_t zero[4] = { 0, 0, 0, 0 };
@@ -1252,6 +1263,14 @@ static void linux_group_release_all(struct LinuxThreadGroup* g) {
         struct ProcessDescriptor* pd = &proc_table[i];
         if (!pd->active) continue;
         if (pd->group_index != gi) continue;
+        /* E7 TG-1 I5b: a group-fatal teardown (exit_group, a kill, a fault)
+         * still owes every member its clear — the root is alive here and dies
+         * only at linux_group_destroy() below. A member already released
+         * through linux_descriptor_release() has spent its words, so this call
+         * is the no-op the consumption rule buys. The wakes are no-ops too, by
+         * construction: a private futex is keyed by group, and no member of
+         * this group survives. */
+        linux_thread_exit_glue(pd);
         linux_stack_maybe_report(pd, "exit");
         proc_clear_resume_state(pd);
         proc_free_syscall_stack(pd);
@@ -1283,11 +1302,9 @@ void linux_thread_exit(struct ProcessDescriptor* pd, uint32_t exit_code) {
     uint32_t tid = pd ? pd->tid : 0;
     uint32_t gid = g ? g->group_id : 0;
 
-    /* E7 TG-1 I5: the glue runs BEFORE the descriptor is released — the page
-     * table it writes through belongs to the group and is destroyed only if
-     * this is the last thread. */
-    linux_thread_exit_glue(pd);
-
+    /* E7 TG-1 I5b: the glue moved into linux_descriptor_release(), which every
+     * descriptor-level death goes through, so this path and the deferred-kill
+     * sweep share one call site instead of one each. */
     int last = pd ? linux_descriptor_release(pd) : 0;
     struct ProcessDescriptor* next;
 
