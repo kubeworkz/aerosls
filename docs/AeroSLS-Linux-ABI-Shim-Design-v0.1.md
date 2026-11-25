@@ -4261,6 +4261,75 @@ calls in `process.c`, one per funnel, the descriptor one above
 The `exit(60)` live arm from §10.23 still passes unchanged, now exercising the
 descriptor funnel rather than a call beside it.
 
+### 10.25 What has landed — increment 30c (the joiner those paths wake)
+
+Calling the glue on the fault and `exit_group` paths was necessary but not
+sufficient. `linux_group_release_all()` ran `linux_futex_forget_group()`
+*before* its member pass, so on exactly those two paths the clear wrote 0 and
+its futex wake found nobody: the word went away but no joiner was released,
+and a `[E7] clear-TID … joiner woken` line would have claimed otherwise. The
+teardown now runs, in order:
+
+1. **every member's glue** — while the root is alive *and* the group's waiters
+   are still registered, the order Linux's `do_exit` gives (clear, wake, then
+   the rest of the group);
+2. `linux_futex_forget_group()` — after the wakes, before any descriptor is
+   released, so no descriptor is ZOMBIE with a live waiter and no tick between
+   here and the destroy can resume one whose stack is about to be freed;
+3. the release pass (reports, resume state, syscall stacks, ZOMBIE) and the
+   one destroy.
+
+Nothing is scheduled between 1 and 3 — the whole teardown runs inside the
+fault/kill/exit dispatch with IF=0 — so a woken member cannot execute before
+it is released. The clear line now reports what it did (`… cleared, joiner
+woken (n=%u)`): a boot can tell a real wake from a silent one, and the count
+is what the live arm asserts.
+
+**Two live arms** (`tests/linux_thread_death_check.sh`), both spawned by
+`e7_thread_death.rs` through the real create path:
+
+- `e7.tdeath.fault.0` (`fixtures/e7_thread_fault_probe.S`) — one cloned thread
+  registers a robust list owning one word, a second cloned thread parks on the
+  first one's CLEARTID word, and the first dies by reading a `PROT_NONE` page
+  (Ring-3 #PF, no handler). Required lines: the #PF, the clear of `0x…78` with
+  `n≥1`, the same word's `futex wake … woken=1`, `walked 1 entries, released
+  1`, one group teardown *after* the clear, and **no** `thread exit: TID n`
+  line — the thread never took exit(60).
+- `e7.tdeath.group.0` (`fixtures/e7_thread_groupexit_probe.S`) — the same two
+  words owed, but the leader calls `exit_group` (231) with both threads alive;
+  the same five lines are required for its `0x…58` word, with the exit_group
+  request line present.
+
+The two arms use different word offsets (`0x78` / `0x58`) so a boot log
+identifies which path produced a clear without guessing from ordering alone.
+
+Building the arms found two more real defects, both fixed here:
+
+- **The fault path dropped its own words before the glue.** `process_exit()`
+  calls `proc_clear_resume_state()` — which zeroes `linux_clear_tid` and
+  `linux_robust_list` — before the group teardown. A thread killed by a #PF
+  therefore had nothing left to clear: the boot showed the #PF, the group's
+  one teardown and no `clear-TID` line at all. The glue now runs in
+  `process_exit()` immediately above that call, while the pages are mapped;
+  the teardown that follows is the no-op the consumption rule buys.
+- **The arms had to be created from the event loop, not at boot.** A
+  synchronous create at boot answers `-EAGAIN` ("group cap or resources
+  exhausted"): `PROC_MAX` is 16 and the probe fleet already holds every slot,
+  while each arm needs three descriptors. They are now created from the
+  sidecar's loop, retrying every few passes until the same real create path
+  succeeds, and each fixture retries an `EAGAIN` clone the way glibc does.
+- **The fault's own delay was too short to arm the wake.** With the faulting
+  thread driving a 20 ms window, the joiner was cloned but never scheduled
+  inside it, so the clear woke nobody (`n=0`) and the arm failed for a
+  scheduling reason instead of testing its claim. The leader now waits for
+  both children's flags, settles for 200 ms and only then releases the fault,
+  so the wake always has a parked waiter to find.
+Clause **Z8** pins the ordering (glue loop < forget < release pass), the wake
+count in the line, both fixtures, the module, both spawn sites and the live
+check; tooth **t162** re-inserts a `forget_group` call *before* the glue loop,
+which leaves every word cleared and every joiner parked — the exact silent
+shape this ordering removes, and invisible to Z7.
+
 ---
 
 ## 11. Open questions for review

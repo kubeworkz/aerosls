@@ -1179,10 +1179,16 @@ void linux_thread_exit_glue(struct ProcessDescriptor* pd) {
     if (ctid != 0 && linux_ctid_ok(ctid)) {
         static const uint8_t zero[4] = { 0, 0, 0, 0 };
         if (linux_user_copy_in(zero, pd->cr3, ctid, 4) == 0) {
+            uint32_t woken = 0;
+            /* The wake's count is logged, not assumed: on a group's own
+             * teardown it is 1 only because linux_group_release_all() runs
+             * this before forget_group (see there), and a line that claimed a
+             * joiner without saying how many were woken would hide exactly
+             * that ordering bug. */
+            if (g) woken = (uint32_t)linux_futex_wake_threads(gid, ctid, 1);
             kernel_serial_printf(
-                "[E7] clear-TID: TID %u word 0x%lx cleared, joiner woken\n",
-                tid, (unsigned long)ctid);
-            if (g) (void)linux_futex_wake_threads(gid, ctid, 1);
+                "[E7] clear-TID: TID %u word 0x%lx cleared, joiner woken "
+                "(n=%u)\n", tid, (unsigned long)ctid, woken);
         } else {
             kernel_serial_printf(
                 "[E7] clear-TID: TID %u word 0x%lx is not a writable user "
@@ -1251,9 +1257,26 @@ static void linux_group_release_all(struct LinuxThreadGroup* g) {
     uint32_t gi;
     if (!g || !g->used || g->exiting) return;
     gi = (uint32_t)(g - linux_group_table);
-    /* E7 TG-1 I3: no waiter of this group survives its teardown. Before the
-     * member pass, so a deadline tick between here and the destroy cannot
-     * resume a descriptor whose syscall stack is about to be freed. */
+    /* E7 TG-1 I5b: every member's clear and robust walk runs FIRST, while the
+     * group's root is alive and its futex waiters are still registered — so a
+     * sibling parked on a dying thread's TID word is really woken, the order
+     * Linux's do_exit gives (clear, wake, then the rest of the group). This is
+     * what makes the fault and exit_group paths wake a joiner at all: run
+     * after forget_group they would clear the word and find nobody. Nothing
+     * is scheduled between this loop and the release pass below — the whole
+     * teardown runs inside the fault/kill/exit dispatch with IF=0 — so a
+     * woken member cannot execute before it is released. */
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct ProcessDescriptor* pd = &proc_table[i];
+        if (!pd->active) continue;
+        if (pd->group_index != gi) continue;
+        linux_thread_exit_glue(pd);
+    }
+    /* E7 TG-1 I3: no waiter of this group survives its teardown. AFTER the
+     * glue loop, so its wakes find the group's waiters and report them, and
+     * before the release pass, so no descriptor is ZOMBIE with a live waiter
+     * and a deadline tick between here and the destroy cannot resume one
+     * whose syscall stack is about to be freed. */
     linux_futex_forget_group(g->group_id);
     /* First pass: stop every member, free only its per-thread stack. Keep
      * the descriptors ACTIVE and their identity intact — the group's cap
@@ -1263,14 +1286,9 @@ static void linux_group_release_all(struct LinuxThreadGroup* g) {
         struct ProcessDescriptor* pd = &proc_table[i];
         if (!pd->active) continue;
         if (pd->group_index != gi) continue;
-        /* E7 TG-1 I5b: a group-fatal teardown (exit_group, a kill, a fault)
-         * still owes every member its clear — the root is alive here and dies
-         * only at linux_group_destroy() below. A member already released
-         * through linux_descriptor_release() has spent its words, so this call
-         * is the no-op the consumption rule buys. The wakes are no-ops too, by
-         * construction: a private futex is keyed by group, and no member of
-         * this group survives. */
-        linux_thread_exit_glue(pd);
+        /* The words were spent in the glue loop above; a member released
+         * through linux_descriptor_release() spent them even earlier, which
+         * is the no-op the consumption rule buys. */
         linux_stack_maybe_report(pd, "exit");
         proc_clear_resume_state(pd);
         proc_free_syscall_stack(pd);
@@ -1349,6 +1367,16 @@ void process_exit(uint32_t exit_code) {
          * and the poison identity is still set; proc_clear_resume_state()
          * below is what drops it. */
         linux_stack_maybe_report(pd, "exit");
+
+        /* E7 TG-1 I5b: the FAULT path's own clear runs here, before
+         * proc_clear_resume_state() zeroes the very words it honours — the
+         * measured bug this line exists for: a thread that died of a #PF had
+         * its ctid and robust head dropped in that call, so the group
+         * teardown below found nothing to clear and its joiner stayed parked.
+         * The pages are still mapped (the phase-2 destroy is further down) and
+         * the glue consumes the words, so the group teardown that follows is
+         * the no-op. */
+        linux_thread_exit_glue(pd);
 
         /* Phase 2: resume/teardown flags on a process that exits normally
          * are moot — the full teardown below reclaims everything anyway.

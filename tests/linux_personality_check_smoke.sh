@@ -96,6 +96,16 @@ FILES=(
     tools/linux_robust_list_census.txt
     user/sidecar/fixtures/e7_thread_probe.S
     tests/linux_thread_probe_check.sh
+    # Z8 (increment 30b, the clear on every death) reads both death-arm
+    # fixtures, the module that spawns them and their LIVE check.
+    user/sidecar/fixtures/e7_thread_fault_probe.S
+    user/sidecar/fixtures/e7_thread_groupexit_probe.S
+    user/sidecar/src/e7_thread_death.rs
+    tests/linux_thread_death_check.sh
+    # Z8 also greps the module DECLARATION and both spawn sites by literal
+    # path, which the declared-path coverage check cannot see: without these
+    # two the baseline aborted with Z8 on any faithful copy.
+    user/sidecar/src/lib.rs
 )
 
 for f in "${FILES[@]}" "$GUARD"; do
@@ -1361,6 +1371,18 @@ tooth robust-owner-check-gone Z6 "the robust walk no longer checks that the dead
 seed "$W/t161"
 sed -i '/^        linux_thread_exit_glue(pd);$/d' "$W/t161/kernel/process.c"
 tooth group-teardown-clear-gone Z7 "the group teardown no longer runs the exit glue" "$W/t161"
+
+# t162: the group's waiters are forgotten BEFORE the glue loop, which is the
+# ordering the whole I5b live arm rests on — a forgotten waiter cannot be
+# woken, so the clear would find nobody and the joiner would stay parked. The
+# words still get cleared, so no other clause sees it.
+seed "$W/t162"
+awk '/^static void linux_group_release_all/ { inb = 1 }
+     inb && /^    for \(int i = 0; i < PROC_MAX; i\+\+\) \{/ && !done {
+         print "    linux_futex_forget_group(g->group_id);"; done = 1 }
+     { print }' "$W/t162/kernel/process.c" > "$W/t162/kernel/process.c.new" &&
+    mv "$W/t162/kernel/process.c.new" "$W/t162/kernel/process.c"
+tooth forget-before-glue Z8 "the teardown forgets the group's waiters before the glue can wake them" "$W/t162"
 
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"

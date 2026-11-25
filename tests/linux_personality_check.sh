@@ -1642,11 +1642,15 @@ relsec="$(sed -n '/^static int linux_descriptor_release/,/^}/p' "$PDC" 2>/dev/nu
 allsec="$(sed -n '/^static void linux_group_release_all/,/^}/p' "$PDC" 2>/dev/null)"
 texitsec="$(sed -n '/^void linux_thread_exit(/,/^}/p' "$PDC" 2>/dev/null)"
 z7_glue="$(grep -n 'linux_thread_exit_glue(pd);' <<< "$relsec" | head -1 | cut -d: -f1)"
+z7_exitsec="$(sed -n '/^void process_exit(/,/^}/p' "$PDC" 2>/dev/null)"
+z7_eglue="$(grep -n 'linux_thread_exit_glue(pd);' <<< "$z7_exitsec" | head -1 | cut -d: -f1)"
+z7_eclear="$(grep -n 'proc_clear_resume_state(pd);' <<< "$z7_exitsec" | head -1 | cut -d: -f1)"
 z7_clear="$(grep -n 'proc_clear_resume_state(pd);' <<< "$relsec" | head -1 | cut -d: -f1)"
 if [ -n "$relsec" ] && [ -n "$allsec" ] && [ -n "$texitsec" ] && \
-   [ "$(grep -c 'linux_thread_exit_glue(pd);' "$PDC")" -eq 2 ] && \
+   [ "$(grep -c 'linux_thread_exit_glue(pd);' "$PDC")" -eq 3 ] && \
    grep -qF 'linux_thread_exit_glue(pd);' <<< "$allsec" && \
    [ -n "$z7_glue" ] && [ -n "$z7_clear" ] && [ "$z7_glue" -lt "$z7_clear" ] && \
+   [ -n "$z7_eglue" ] && [ -n "$z7_eclear" ] && [ "$z7_eglue" -lt "$z7_eclear" ] && \
    ! grep -qF 'linux_thread_exit_glue(pd);' <<< "$texitsec" && \
    grep -qF 'int linux_thread_take_exit_words(struct ProcessDescriptor* pd, uint64_t* ctid,' kernel/linux_thread.h && \
    grep -qF 'pd->linux_clear_tid   = 0;' "$LTHC" && \
@@ -1655,9 +1659,48 @@ if [ -n "$relsec" ] && [ -n "$allsec" ] && [ -n "$texitsec" ] && \
    grep -qF 'linux_thread_take_exit_words(&d, &ctid, &robust) == 1' "$LCHUT" && \
    grep -qF 'the SECOND call takes nothing' "$LCHUT" && \
    grep -qF 'E7TG-CTID-OK' tests/linux_thread_probe_check.sh; then
-    ok "Z7. every dying Linux thread runs the glue: the call sits in linux_descriptor_release (exit(60) and the deferred sweep, before proc_clear_resume_state zeroes the words it is honouring) and in linux_group_release_all (exit_group, a kill, a fault — every member, while the group's root is still alive), and nowhere else, so a faulted or group-exited thread clears its TID word and releases its robust list instead of leaving a joiner parked forever; linux_thread_take_exit_words makes the two sites safe to overlap (the second takes nothing), which the host test drives, and the exit(60) live arm still proves the clear end to end"
+    ok "Z7. every dying Linux thread runs the glue: the call sits in linux_descriptor_release (exit(60) and the deferred sweep, before proc_clear_resume_state zeroes the words it is honouring), in the fault handler's process_exit (same rule: before the clear that would drop them), and in linux_group_release_all (exit_group, a kill, a fault — every member, while the group's root is still alive), and nowhere else, so a faulted or group-exited thread clears its TID word and releases its robust list instead of leaving a joiner parked forever; linux_thread_take_exit_words makes the two sites safe to overlap (the second takes nothing), which the host test drives, and the exit(60) live arm still proves the clear end to end"
 else
     bad "Z7. the clear is conditional again: with the hook only on a thread's own exit, a thread that faults or exits with its group never clears its TID word — the joiner hangs on a tid that never went away, and the robust mutex it held stays owned by a dead thread. A missing consumption rule turns the overlap of the two funnels into a second clear under a joiner."
+fi
+
+# ─── Z8. I5b (live): the fault and exit_group paths WAKE their joiner ─────
+# Z7 pins where the glue is called; this pins that those call sites can wake
+# anyone at all. Inside linux_group_release_all the per-member glue loop must
+# run BEFORE forget_group — a forgotten waiter cannot be woken, so forget-first
+# would clear the word and find nobody, which is the exit(60)-only defect with
+# extra steps — and before the release pass, so no descriptor is released with
+# a live waiter. The clear line must carry the wake COUNT, because a boot can
+# only tell n=0 from n=1 if the line says it. The live arm reads exactly that:
+# two fixtures spawned through the real create path, each with a sibling
+# parked on the dying thread's TID word, one dying by Ring-3 #PF and one going
+# down with exit_group.
+EZFI=user/sidecar/fixtures/e7_thread_fault_probe.S
+EZGI=user/sidecar/fixtures/e7_thread_groupexit_probe.S
+EZMOD=user/sidecar/src/e7_thread_death.rs
+EZCHK=tests/linux_thread_death_check.sh
+z8_glue="$(grep -n 'linux_thread_exit_glue(pd);' <<< "$allsec" | head -1 | cut -d: -f1)"
+z8_forget="$(grep -n 'linux_futex_forget_group(g->group_id);' <<< "$allsec" | head -1 | cut -d: -f1)"
+z8_release="$(grep -n 'linux_stack_maybe_report(pd, "exit");' <<< "$allsec" | head -1 | cut -d: -f1)"
+if [ -n "$allsec" ] && [ -n "$z8_glue" ] && [ -n "$z8_forget" ] && \
+   [ -n "$z8_release" ] && \
+   [ "$z8_glue" -lt "$z8_forget" ] && [ "$z8_forget" -lt "$z8_release" ] && \
+   grep -qF 'uint32_t woken = 0;' "$PDC" && \
+   grep -qF 'woken = (uint32_t)linux_futex_wake_threads(gid, ctid, 1);' "$PDC" && \
+   grep -qF 'cleared, joiner woken ' "$PDC" && grep -qF '(n=%u)' "$PDC" && \
+   [ -s "$EZFI" ] && [ -s "$EZGI" ] && \
+   grep -qF 'E7TD-FAULT-ARM' "$EZFI" && \
+   grep -qF 'E7TD-GROUP-ARM' "$EZGI" && \
+   grep -qF 'PROT_NONE' "$EZFI" && grep -qF '$231' "$EZGI" && \
+   grep -qF 'pub mod e7_thread_death;' user/sidecar/src/lib.rs && \
+   grep -qF 'crate::e7_thread_death::spawn_fault' user/sidecar/src/entry.rs && \
+   grep -qF 'crate::e7_thread_death::spawn_group' user/sidecar/src/entry.rs && \
+   grep -qF 'spawn_one(k, budget_base, budget_len, FAULT, FAULT_NAME)' "$EZMOD" && \
+   grep -qF 'joiner woken \(n=[1-9]' "$EZCHK" && \
+   grep -qF 'exit_group arm' "$EZCHK"; then
+    ok "Z8. the two deaths exit(60) never covered now wake their parked joiner end to end: linux_group_release_all runs every member's glue BEFORE forget_group and before the release pass, so the clear's futex wake finds the parked sibling instead of nobody (the clear line reports the count, n>=1, so a boot can tell a real wake from a silent one), and the sidecar spawns both arms through the real create path — e7_thread_fault_probe dies of a Ring-3 #PF on a PROT_NONE page with a joiner parked on its TID word, e7_thread_groupexit_probe takes the group down with exit_group (231) in the same state — with tests/linux_thread_death_check.sh reading the kernel's clear, wake, robust-walk and group-teardown lines for both"
+else
+    bad "Z8. the new call sites cannot wake anyone: if linux_group_release_all forgets the group's waiters before the glue loop, or releases members first, the clear finds no joiner and a faulted or group-exited thread still leaves it parked — the I5 defect the move was made to fix. If the clear line does not report the wake count, the live arm cannot tell that apart from a real wake."
 fi
 
 # ─── P. E7 increment 26 (P1-C): the signal frame ───────────────────────────

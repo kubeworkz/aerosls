@@ -1,0 +1,140 @@
+//! e7_thread_death.rs — E7 TG-1 increment I5b's two live arms.
+//!
+//! I5's glue was hooked on `exit(60)` only, so a thread that died any other
+//! way never cleared its TID word. The host test and clause Z7 pin the shape;
+//! THIS module supplies the end-to-end evidence, by spawning two children
+//! through the real create path:
+//!
+//!   * `e7.tdeath.fault.0` (fixtures/e7_thread_fault_probe.S) — a cloned
+//!     thread reads a PROT_NONE page and dies of a Ring-3 #PF while a sibling
+//!     in its group is parked on its TID word. The fault path's group teardown
+//!     must clear that word and wake the joiner (n=1), and walk the robust
+//!     list the dead thread registered.
+//!   * `e7.tdeath.group.0` (fixtures/e7_thread_groupexit_probe.S) — the leader
+//!     asks for exit_group (231) while one thread still owns a CLEARTID word
+//!     and a robust list and a second thread is parked on that word. The same
+//!     clear, wake and walk must happen on the exit_group path.
+//!
+//! Both payloads are planted at the budget region's tail before their own
+//! spawn (`e7_probe.rs`'s placement), so neither lives in the boot image.
+//! tests/linux_thread_death_check.sh asserts the kernel's lines on a boot.
+
+use aerosls_proto::manifest::{
+    build_manifest, crc32, ArgEnv, Bootstrap, Budget, Cpu, Image, Limits,
+    Manifest, ManifestCap, HEADER_LEN, MAX_MANIFEST_CAPS,
+};
+use crate::linux::LINUX_DEFAULT_ENV;
+
+/// `fixtures/e7_thread_fault_probe.S` → one-.text flat, `_start` at offset 0.
+static FAULT: &[u8] = include_bytes!("../fixtures/e7_thread_fault_probe.flat");
+/// `fixtures/e7_thread_groupexit_probe.S`, same shape.
+static GROUPEXIT: &[u8] = include_bytes!("../fixtures/e7_thread_groupexit_probe.flat");
+
+pub const FAULT_NAME: &str = "e7.tdeath.fault.0";
+pub const GROUP_NAME: &str = "e7.tdeath.group.0";
+
+pub const PROBE_RESERVE: u64 = 64 * 1024;
+
+const IMAGE_VBASE: u64 = 0x4000_0000_0000; /* USER_PROC_CODE_BASE */
+const HEAP_GUARD_BYTES: u64 = 4096;        /* cap.c: one guard page */
+const MEM_BUDGET_BYTES: u64 = 64 * 1024;   /* the BUDGET record's mem_bytes */
+const STACK_BUDGET_BYTES: u64 = 16 * 1024; /* stack_bytes; kernel floor 4096 */
+
+pub struct Spawned {
+    pub ch_r: u32,
+    pub ch_w: u32,
+    pub heap_base: u64,
+    pub heap_limit: u64,
+}
+
+fn spawn_one<K: aerosls_proto::kabi::Kernel>(
+    k: &K,
+    budget_base: u64,
+    budget_len: u64,
+    payload: &'static [u8],
+    name: &'static str,
+) -> Result<Spawned, i32> {
+    if budget_len < PROBE_RESERVE + 0x1000 || payload.len() as u64 > PROBE_RESERVE {
+        return Err(-1);
+    }
+    let tail = budget_base + budget_len - PROBE_RESERVE;
+    unsafe {
+        core::ptr::copy_nonoverlapping(payload.as_ptr(), tail as *mut u8, payload.len());
+    }
+
+    let caps: [Option<ManifestCap<'_>>; MAX_MANIFEST_CAPS] =
+        [None; MAX_MANIFEST_CAPS];
+    let m = Manifest {
+        version_major: 1,
+        version_minor: 0,
+        flags: 0,
+        name: Some(name),
+        personality: Some("e7.linux.v1"),
+        image: Some(Image {
+            offset: 0,
+            size: payload.len() as u32,
+            entry: 0,
+        }),
+        budget: Some(Budget {
+            mem_bytes: MEM_BUDGET_BYTES,
+            stack_bytes: STACK_BUDGET_BYTES as u32,
+            heap_initial: 0,
+        }),
+        cpu: Some(Cpu {
+            share: 10,
+            preemptible: true,
+        }),
+        limits: Some(Limits {
+            max_tasks: 1,
+            max_fds: 0,
+            max_channels: 2,
+            max_open_files: 0,
+            chan_queue_depth: 4,
+        }),
+        caps,
+        n_caps: 0,
+        bootstrap: Some(Bootstrap {
+            console: None,
+            debug: None,
+            log_level: 1,
+        }),
+        flags_value: Some(0),
+        argenv: Some(ArgEnv::new(&[name], LINUX_DEFAULT_ENV)),
+        signature: None,
+    };
+
+    let mut blob = build_manifest(&m);
+    blob.extend_from_slice(&tail.to_le_bytes());
+    let total = blob.len() as u32;
+    blob[16..20].copy_from_slice(&total.to_le_bytes());
+    let crc = crc32(&blob[HEADER_LEN..]);
+    blob[20..24].copy_from_slice(&crc.to_le_bytes());
+
+    let (ch_r, ch_w) = k.linux_spawn(&blob, 0)?;
+
+    let n_img_pages = (payload.len() as u64 + 4095) / 4096;
+    let stack_base = IMAGE_VBASE + n_img_pages * 4096 + HEAP_GUARD_BYTES;
+    let stk_pages = (STACK_BUDGET_BYTES + 4095) / 4096;
+    let heap_base = stack_base + stk_pages * 4096;
+    let heap_limit = heap_base + ((MEM_BUDGET_BYTES + 4095) / 4096) * 4096;
+
+    Ok(Spawned { ch_r, ch_w, heap_base, heap_limit })
+}
+
+/// The thread that dies of a #PF while its joiner is parked on its TID word.
+pub fn spawn_fault<K: aerosls_proto::kabi::Kernel>(
+    k: &K,
+    budget_base: u64,
+    budget_len: u64,
+) -> Result<Spawned, i32> {
+    spawn_one(k, budget_base, budget_len, FAULT, FAULT_NAME)
+}
+
+/// The group that goes down through exit_group with the same two words owed.
+pub fn spawn_group<K: aerosls_proto::kabi::Kernel>(
+    k: &K,
+    budget_base: u64,
+    budget_len: u64,
+) -> Result<Spawned, i32> {
+    spawn_one(k, budget_base, budget_len, GROUPEXIT, GROUP_NAME)
+}

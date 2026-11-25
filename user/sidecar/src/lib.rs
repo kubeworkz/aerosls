@@ -70,6 +70,7 @@ pub mod e7_futex_probe;
 pub mod e7_openat_probe;
 pub mod e7_probe;
 pub mod e7_thread_probe;
+pub mod e7_thread_death;
 pub mod heap;
 pub mod linux;
 pub mod net_client;

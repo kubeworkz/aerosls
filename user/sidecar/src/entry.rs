@@ -649,6 +649,9 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                 Err(rc) => klog(b"[E7] thread-probe: spawn FAILED rc=", rc as u32, b""),
             }
 
+            // E7 TG-1 I5b's two death arms are created from the EVENT LOOP
+            // below, not here: see the block after linux::service().
+
             // E7 TG-1 I3: the native futex probe. Same create path, its own
             // payload slot; the parent parks in FUTEX_WAIT_PRIVATE, its
             // cloned sibling's wake returns 1, and a 20 ms relative wait
@@ -940,6 +943,57 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         // spinning it.
         crate::linux::service(&RealKernel, &booted.console, &mut booted.proc.vfs);
         booted.proc.drain_wakes();
+        // E7 TG-1 I5b: the two death arms — I5 proves the clear on exit(60);
+        // these prove it where a joiner would otherwise hang: a thread that
+        // dies of a Ring-3 #PF, and a group that goes down through exit_group,
+        // each with a sibling parked on the dying thread's TID word.
+        //
+        // They are created HERE rather than at boot because of a measured
+        // refusal: a synchronous create at boot answers -EAGAIN ("group cap or
+        // resources exhausted") — PROC_MAX is 16 and this boot's probe fleet
+        // already holds every slot, while the two arms need three descriptors
+        // each. Retrying every few passes (the loop is woken by the parked
+        // forwards, so it does pass) creates them through the SAME real create
+        // path as soon as the earlier probes release their slots.
+        {
+            use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+            static PASSES: AtomicU32 = AtomicU32::new(0);
+            static FAULT_SPAWNED: AtomicBool = AtomicBool::new(false);
+            static GROUP_SPAWNED: AtomicBool = AtomicBool::new(false);
+            let n = PASSES.fetch_add(1, Ordering::Relaxed) + 1;
+            if n % 4 == 0 {
+                if !FAULT_SPAWNED.load(Ordering::Relaxed) {
+                    if let Ok(sp) = crate::e7_thread_death::spawn_fault(
+                        &RealKernel, caps.budget_base, caps.budget_len) {
+                        if let Ok(vt) = booted.proc.vfs.add_task() {
+                            if crate::linux::track(
+                                sp.ch_r, sp.ch_w,
+                                crate::e7_thread_death::FAULT_NAME,
+                                0, sp.heap_base, sp.heap_limit, vt, false,
+                            ) {
+                                FAULT_SPAWNED.store(true, Ordering::Relaxed);
+                                klog(b"[E7] death-fault: spawned ch_r=", sp.ch_r, b"");
+                            }
+                        }
+                    }
+                }
+                if !GROUP_SPAWNED.load(Ordering::Relaxed) {
+                    if let Ok(sp) = crate::e7_thread_death::spawn_group(
+                        &RealKernel, caps.budget_base, caps.budget_len) {
+                        if let Ok(vt) = booted.proc.vfs.add_task() {
+                            if crate::linux::track(
+                                sp.ch_r, sp.ch_w,
+                                crate::e7_thread_death::GROUP_NAME,
+                                0, sp.heap_base, sp.heap_limit, vt, false,
+                            ) {
+                                GROUP_SPAWNED.store(true, Ordering::Relaxed);
+                                klog(b"[E7] death-group: spawned ch_r=", sp.ch_r, b"");
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // One-shot boot diagnostic: report what task 0 (init) did and how
         // many tasks are live, so a quiet boot can be told apart from a
         // crashed one. Runs ONCE after boot — the per-iteration repetition
