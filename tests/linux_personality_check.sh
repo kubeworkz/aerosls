@@ -108,6 +108,11 @@ STUB=kernel/stubs.c
 # the table test that carries the "15 is not in the table yet" absence.
 SIGFRAME_HUT=tests/linux_sigframe_host_test.c
 SYSTAB=tests/linux_syscall_table_host_test.c
+# P5–P8 (increment 27, the delivery) read these: the delivery's host test, the
+# sidecar source (its park-interrupt rule and E_INTR code) and the CAP map.
+SIGDELIVER_HUT=tests/linux_sigdeliver_host_test.c
+LINUXRS=user/sidecar/src/linux.rs
+CAPH=kernel/cap.h
 FHUT=tests/fpu_enable_host_test.c
 PHUT=tests/linux_personality_host_test.c
 HUMAP=tests/user_map_identity_host_test.c
@@ -1643,11 +1648,55 @@ else
     bad "P3. the frame host test no longer exercises a branch above — the layout, the altstack choice, the mask rule or the EINTR predicate would be argued from the builder's own prose, reachable only at boot"
 fi
 
-if ! grep -qE 'linux_sig_frame_deliver|setup_rt_frame|sigframe_write_user' "$LABC" "$DISP" && \
-   grep -qF 'increment 27' "$LABH"; then
-    ok "P4. no delivery was smuggled in beside the builder: nothing in the kernel writes a frame to a user stack, touches CR2 or hooks return-to-user, and the header says the hook, the table row and the sidecar's -EINTR answer are increment 27's — so this increment cannot be read as more than it is"
+if grep -qF 'int linux_sig_deliver(' "$LABC" && \
+   grep -qF 'linux_user_copy_in(frame, root,' "$LABC" && \
+   ! grep -qE 'setup_rt_frame|sigframe_write_user' "$LABC" "$DISP" && \
+   ! grep -qF 'LINUX_RT_SIGRETURN' "$DISP"; then
+    ok "P4. the delivery has exactly ONE write path and it is the validated one: the frame reaches a user stack only through linux_user_copy_in against the task's own cr3 (no second writer, no direct store into a page frame), and rt_sigreturn still has no dispatcher arm — increment 27 delivers frames and does not claim the return trip"
 else
-    bad "P4. a delivery path appeared without its increment — a frame written to a user stack with no host test, no census row and no EINTR answer is exactly the half-landed seam that reads as working"
+    bad "P4. either the delivery's only writer is no longer the validated copy (a direct store into a user page is the shape that skips every protection check), or rt_sigreturn gained a dispatcher arm without a census row"
+fi
+
+if grep -qF '#define CAP_EINTR       (-21)' "$CAPH" && \
+   grep -qF 'case CAP_EINTR:                  return -LINUX_EINTR;' "$LABC" && \
+   grep -qF '#define LINUX_EINTR        4' "$LABH" && \
+   grep -qF 'const E_INTR: i32 = -21;' "$LINUXRS" && \
+   grep -qF 'fn park_interrupt(sig: &SigState) -> Option<u64> {' "$LINUXRS" && \
+   grep -qF 'dispo(sig, no) == DISPO_HANDLER' "$LINUXRS" && \
+   grep -qF 'sig.act[no as usize][1] & SIG_SA_RESTART == 0' "$LINUXRS" && \
+   grep -qF 'fn a_parked_forward_is_woken_only_by_a_handler_without_sa_restart()' "$LINUXRS" && \
+   grep -qF 'linux_sig_park_is_eintr' "$LABH" "$LABC"; then
+    ok "P5. the park's wake is one rule in two languages: CAP_EINTR (-21) maps to -EINTR through §5.7 like every other code, the sidecar's park_interrupt names the same three conditions the kernel's linux_sig_park_is_eintr does (deliverable, a HANDLER, no SA_RESTART), and its six-case unit test drives each branch — so a restartable read cannot become a spurious EINTR, and a HANDLER cannot be answered with EAGAIN's code"
+else
+    bad "P5. the EINTR twin drifted: either the code lost its map row (leaving the sidecar's status to fall through §5.7's default and reach the task as EIO), or the sidecar's rule no longer matches the kernel's three conditions — the exact divergence a boot would show as a read that sometimes fails"
+fi
+
+if grep -qF 'r = linux_sig_deliver_req_parse(bytes, LINUX_SIGDELIVER_BYTES - 1u, &back);' "$SIGDELIVER_HUT" && \
+   grep -qF 'r = linux_sig_deliver_req_parse(bytes, LINUX_SIGDELIVER_BYTES + 1u, &back);' "$SIGDELIVER_HUT" && \
+   grep -qF 'if (len != LINUX_SIGDELIVER_BYTES) return -LINUX_EINVAL;' "$LABC" && \
+   grep -qF '_Static_assert(sizeof(struct LinuxSigDeliverReq) == LINUX_SIGDELIVER_BYTES' "$LABH"; then
+    ok "P6. the answer's shape is fixed on both sides of the wire: 80 bytes exactly, refused at 79 and 81, with the struct's size pinned to the wire length by a _Static_assert — a decoder that accepted a prefix would hand the builder a handler read out of the wrong word"
+else
+    bad "P6. the delivery request lost its exact-length boundary: a short or padded reply would decode into a struct with a made-up handler and restorer, and the frame would be written to an address the sidecar never named"
+fi
+
+if grep -qF 'case 11u:' "$LABC" && grep -qF 'case 7u:' "$LABC" && \
+   grep -qF 'case 8u:' "$LABC" && grep -qF 'case 4u:' "$LABC" && \
+   grep -qF '*out = cr2;' "$LABC" && grep -qF '*out = rip;' "$LABC" && \
+   grep -qF "a NULL deref's si_addr is 0 and still counts as an answer" "$SIGDELIVER_HUT" && \
+   grep -qF 'SIGFPE takes RIP' "$SIGDELIVER_HUT"; then
+    ok "P7. si_addr comes from the number the signal HAS: CR2 for the two address faults (SIGSEGV, SIGBUS — including a NULL deref, where 0 is the answer and not 'no answer'), RIP for the two instruction faults (SIGFPE, SIGILL, where CR2 is stale), and the sidecar's own addr otherwise — each case driven by the host test"
+else
+    bad "P7. the CR2 -> si_addr rule was flattened: a crash reporter would print a stale address from whatever faulted before, or a SIGFPE would name the wrong instruction, and the guest's backtrace would point at code that never ran"
+fi
+
+if grep -qF 'CHECK(clean,' "$SIGDELIVER_HUT" && \
+   grep -qF 'every byte of the guest' "$SIGDELIVER_HUT" && \
+   grep -qF 'a read-only stack refuses the frame with -EFAULT' "$SIGDELIVER_HUT" && \
+   grep -qF 'if (r != 0) return r;           /* nothing written: the builder refuses' "$LABC"; then
+    ok "P8. a refused delivery mutates NOTHING: the builder refuses before its first store, the copy validates every page before the first byte moves, and the host test asserts the guest's stack is byte-identical by sentinel — so a signal onto an unwritable or unmapped stack is an errno, never a half-written frame in somebody's stack"
+else
+    bad "P8. the refusal-before-mutation property is no longer asserted: a partial frame write would be kernel-authored corruption of the task's memory, and the test that proves it did not happen is gone"
 fi
 
 echo

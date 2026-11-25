@@ -65,6 +65,8 @@ FILES=(
     # the table test that carries the "15 is not in the table yet" absence.
     tests/linux_sigframe_host_test.c
     tests/linux_syscall_table_host_test.c
+    # P5–P8 (increment 27, the delivery) read the delivery's own host test.
+    tests/linux_sigdeliver_host_test.c
     # Y (the soft mprotect transition) reads the helper's fake-table test.
     tests/user_map_identity_host_test.c
     # W (increment 20) reads the capture, the record, the task's name on the
@@ -1197,6 +1199,54 @@ printf '/* rt_sigreturn would be handled here (LINUX_RT_SIGRETURN) */\n' >> "$W/
 # P2 is the clause that catches this (the census-absence assertion); P4 stays
 # green because no delivery FUNCTION appeared, only a mention of the number.
 tooth sigframe-dispatch-smuggled P2 "the dispatcher mentions rt_sigreturn before any census row exists" "$W/t135"
+
+# ─── P teeth (increment 27: the delivery) ───────────────────────────────────
+
+# t143: the EINTR code remapped onto EAGAIN's number. Everything still
+# compiles, the park still wakes, and the caller retries a would-block it
+# should have waited on — the exact confusion the separate code exists to
+# prevent. Only P5's two-language check can name it.
+seed "$W/t143"
+sed -i 's/const E_INTR: i32 = -21;/const E_INTR: i32 = -3;/' "$W/t143/user/sidecar/src/linux.rs"
+tooth park-wake-eagain-code P5 "the park's wake replies with EAGAIN's code" "$W/t143"
+
+# t144: the map row deleted. The sidecar keeps answering CAP_EINTR, but §5.7
+# has no case for it, so the code falls through the default arm and reaches
+# the task as EIO — a read that fails for the wrong reason and is never
+# retried.
+seed "$W/t144"
+sed -i '/case CAP_EINTR:                  return -LINUX_EINTR;/d' "$W/t144/kernel/linux_abi.c"
+tooth park-wake-map-row-gone P5 "CAP_EINTR no longer maps to -EINTR" "$W/t144"
+
+# t145: SIGSEGV nudged to the neighbouring number in the si_addr table. The
+# frame still builds, the handler still runs, and the crash report names an
+# address that belongs to no fault at all.
+seed "$W/t145"
+sed -i 's/^    case 11u:/    case 9u:/' "$W/t145/kernel/linux_abi.c"
+tooth si-addr-segv-case-gone P7 "SIGSEGV is no longer the CR2 case" "$W/t145"
+
+# t146: the exact-length refusal loosened to a prefix. A 79-byte answer now
+# decodes into a struct whose last word is whatever was in the buffer — a
+# handler and restorer the sidecar never named.
+seed "$W/t146"
+sed -i 's/    if (len != LINUX_SIGDELIVER_BYTES) return -LINUX_EINVAL;/    if (0) return -LINUX_EINVAL;/' "$W/t146/kernel/linux_abi.c"
+tooth deliver-req-prefix-accepted P6 "the delivery request accepts a short answer" "$W/t146"
+
+# t147: the validated copy replaced by a second writer. The frame still lands
+# on the stack (in a boot it may even look right) and every protection check
+# the copy exists for is skipped — P4's "exactly one write path" is the only
+# clause that can see it.
+seed "$W/t147"
+sed -i 's/linux_user_copy_in(frame, root, entry_local.r\[LINUX_SIGREG_RSP\],/user_frame_store(frame, root, entry_local.r[LINUX_SIGREG_RSP],/' "$W/t147/kernel/linux_abi.c"
+tooth deliver-second-writer P4 "a second writer appeared beside the validated copy" "$W/t147"
+
+# t148: the bytes-unchanged sentinel deleted. The refusal still happens and
+# still returns -EFAULT; what is no longer proven is that NOTHING was
+# written — which is the property that keeps a signal off a read-only stack
+# from being kernel-authored corruption.
+seed "$W/t148"
+sed -i '/CHECK(clean,/d' "$W/t148/tests/linux_sigdeliver_host_test.c"
+tooth deliver-unwritten-assert-gone P8 "the guest's stack is no longer proven untouched" "$W/t148"
 
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"

@@ -51,6 +51,7 @@
 #define LINUX_EPERM        1
 #define LINUX_ENOENT       2
 #define LINUX_ESRCH        3
+#define LINUX_EINTR        4
 #define LINUX_EIO          5
 #define LINUX_EBADF        9
 #define LINUX_EAGAIN      11
@@ -1140,5 +1141,77 @@ int linux_sig_delivery_needed(uint64_t blocked, uint32_t signo,
  * and this predicate must agree, which is why it is not an inline test. */
 int linux_sig_park_is_eintr(uint32_t signo, uint64_t blocked,
                             uint64_t handler, uint64_t act_flags);
+
+/* ─── E7 increment 27 (P1-C, "the delivery") — the hook's contract ────────
+ * Increment 26 landed the frame as bytes. This is the half that puts those
+ * bytes where a handler can run them, and it keeps exactly the split §3.3
+ * built the seam on:
+ *
+ *   the SIDECAR decides  (which signal, which handler, which flags — its
+ *                        SigState is the disposition authority, and the
+ *                        reply carries the words verbatim)
+ *   the KERNEL performs (the frame is built here, written into the task's
+ *                        own stack through the validated writable copy —
+ *                        the same walker the fd class uses — and the
+ *                        handler's entry context is handed back)
+ *
+ * Nothing here reads the guest's memory for a decision: the request is a
+ * fixed 88-byte struct of act words and stack bounds, refused by length or
+ * by a handler word that is not an address. The copy is two-phase, so a
+ * stack the task made read-only refuses with -EFAULT and leaves every byte
+ * of the guest's stack untouched — a signal must never be the thing that
+ * faults in ring 0.
+ *
+ * Still absent, deliberately: rt_sigreturn's table row (waiting on a real
+ * census trace) and any fpstate (increment 26's named limit stands). */
+
+/* The sidecar's answer to "run this handler": eleven words, little-endian
+ * on the wire, all of them act/stack facts this kernel re-checks. */
+struct LinuxSigDeliverReq {
+    uint32_t signo;      /* 1..=64 */
+    uint32_t code;       /* si_code the sidecar chose (SI_USER 0, ...) */
+    uint64_t addr;       /* si_addr for a non-fault signal, 0 normally */
+    uint64_t handler;    /* sa_handler */
+    uint64_t restorer;   /* sa_restorer — the frame's pretcode */
+    uint64_t act_flags;  /* sa_flags */
+    uint64_t act_mask;   /* sa_mask */
+    uint64_t blocked;    /* the thread's mask, as the sidecar knows it */
+    uint64_t alt_sp;     /* sigaltstack.ss_sp, 0 = none */
+    uint64_t alt_size;
+    uint32_t alt_flags;
+    uint32_t siginfo;    /* 1 = SA_SIGINFO */
+};
+#define LINUX_SIGDELIVER_BYTES 80u   /* 2 x u32 + 8 x u64 + 2 x u32 */
+_Static_assert(sizeof(struct LinuxSigDeliverReq) == LINUX_SIGDELIVER_BYTES,
+               "the request's wire length is its struct length, so a decoder on one side and a struct on the other cannot differ by padding");
+
+/* Read the request out of a reply payload. Refuses -LINUX_EINVAL on a length
+ * that is not exactly LINUX_SIGDELIVER_BYTES (a truncated or padded answer
+ * is not an answer) and on a handler/restorer pair that could not run. */
+int linux_sig_deliver_req_parse(const uint8_t *bytes, uint32_t len,
+                                struct LinuxSigDeliverReq *out);
+
+/* Linux's si_addr for a fault, from the two numbers the trap path has:
+ *   SIGSEGV / SIGBUS  -> CR2   (the faulting ADDRESS)
+ *   SIGFPE  / SIGILL  -> RIP   (the faulting INSTRUCTION; CR2 is stale)
+ *   anything else     -> no address (returns 0, and si_addr is then the
+ *                        sidecar's own `addr` for a software-sent signal)
+ * Returns 1 when it wrote an address, 0 when the signal carries none — so
+ * a NULL-deref SIGSEGV's cr2 == 0 is still "the address" rather than being
+ * mistaken for "no answer". A crash reporter that reads si_addr is the
+ * reason this is its own function rather than a field filled in by habit. */
+int linux_sig_si_addr(uint32_t signo, uint64_t cr2, uint64_t rip, uint64_t *out);
+
+/* THE HOOK'S CORE (no registers are touched here — the caller applies the
+ * returned context when it next returns to ring 3):
+ *   build the frame from `req` + the interrupted `ctx`
+ *   write it to the task's stack at the rsp the builder chose, through
+ *          linux_user_copy_in against `root` (the task's own cr3)
+ *   return the handler's entry context and the mask to install
+ * Refusals, all before any byte is written: a frame the builder refuses
+ * (-EINVAL), or a stack span ring 3 could not write (-EFAULT). */
+int linux_sig_deliver(uint64_t root, const struct LinuxSigDeliverReq *req,
+                      const struct LinuxSigRegs *ctx, uint64_t cr2,
+                      struct LinuxSigRegs *entry, uint64_t *entry_mask);
 
 #endif /* LINUX_ABI_H */

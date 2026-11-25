@@ -3851,6 +3851,64 @@ Until those land, clause **P4** refuses the increment being read as delivery.
 
 ---
 
+### 10.17 What has landed — increment 27 (the delivery's mechanism)
+
+Increment 26 built the frame; this one gives it somewhere to go, and gives
+the park a way to end. Four pieces, all of them mechanism, none of them a
+claim that the live arm works:
+
+- **The request** (`struct LinuxSigDeliverReq`, 80 bytes): the sidecar's act
+  words — signo, code, addr, handler, restorer, flags, mask, the thread's
+  blocked set, the altstack — decoded from a fixed reply payload by
+  `linux_sig_deliver_req_parse`. Exactly 80 bytes: 79 is truncated and 81 is
+  a different message, and neither is repaired. The struct's size is pinned
+  to the wire length by a `_Static_assert`, and the decoder refuses a signo
+  outside 1..=64, a `SIG_DFL`/`SIG_IGN` handler and a zero restorer before the
+  write path exists to be reached.
+- **si_addr from the fault, not from habit** (`linux_sig_si_addr`): CR2 for
+  SIGSEGV and SIGBUS, RIP for SIGFPE and SIGILL (CR2 is stale on those), the
+  sidecar's own address for a software-sent signal, and — the case that makes
+  the function worth having — `cr2 == 0` for a NULL deref is returned as an
+  *answer*, not mistaken for "no address".
+- **The hook's core** (`linux_sig_deliver`): build the frame from the
+  interrupted context plus the request, then write those 440 bytes through
+  `linux_user_copy_in` against the task's own cr3, returning the handler's
+  entry context (RIP = handler, rsp = frame, RDI = signo) and the mask to
+  install. The copy is two-phase, so a read-only or unmapped stack is
+  `-EFAULT` with the guest's bytes untouched — asserted by sentinel in the
+  host test. **Registers are not applied here**: the return-to-user caller
+  owns that, which is what keeps this half host-testable against fake tables.
+- **The park's wake** (sidecar): `park_interrupt` — arrived-and-unblocked, a
+  `DISPO_HANDLER`, and no `SA_RESTART` — answers a parked console read or
+  poll with `-EINTR` and clears the pending bit. A restartable handler leaves
+  the park alone (Linux restarts the syscall). Its code is `CAP_EINTR (-21)`,
+  mapped to `-EINTR` through §5.7 like every other code: it is *not* EAGAIN's,
+  because a caller retries an EINTR and must not retry a would-block.
+
+**What this is still missing, and it is the load-bearing part of "live":**
+nothing calls `linux_sig_deliver` yet. The reply that would carry the 80-byte
+request has no shape in `chan.c`'s deliver (a tkill stages no payload, so the
+bound would refuse it), the sidecar's tkill arm still answers `E_NOSYS` to a
+handler instead of emitting the request, and the dispatcher's reply-apply has
+no arm that installs the returned entry context into the task. Until those
+three land, a handler still does not run — and the guard says so: **P4** pins
+that the only writer is the validated copy, **P5** that the EINTR rule is one
+rule in two languages, and `rt_sigreturn` remains `LSC_UNKNOWN` with no
+dispatcher mention (clauses P2, P4), which is the one thing this increment is
+not allowed to fake.
+
+**Evidence**: `tests/linux_sigdeliver_host_test.c` (32 checks — the decoder's
+three refusals, six si_addr cases, and a real delivery through fake page
+tables: entry shape, pretcode, sigcontext, `cs = 0x33`, the composed mask
+`0x406` with and without `SA_NODEFER`, `-EFAULT` on a read-only and on an
+unmapped stack with the sentinel untouched); the sidecar's
+`a_parked_forward_is_woken_only_by_a_handler_without_sa_restart` (six cases,
+one per branch of the rule); guard clauses **P4–P8**; teeth t143–t148
+(EAGAIN code, map row deleted, si_addr case nudged, length refusal loosened,
+second writer, sentinel assertion removed).
+
+---
+
 ## 11. Open questions for review
 
 1. **The first user: designated, built, and censused.** `AeroSLS-Roadmap-2026H2-v0.1.md` §5 says in bold that there is no named first user, and the tree agreed — no Go source, no `std`-Rust binary, every real operational workload bash or Python (§5.5.1) — so the target was a *decision*. It is now made and carried out: the backup operation, as `backup/aerobackup/` (a static single-threaded Rust rewrite of `backup/backup.sh`'s snapshot-and-retain core, 27 tests, no dependencies), designated in `tools/linux_abi_candidate.conf`, with the census measured and checked in at `tools/linux_syscall_census.txt` (§5.6). **The open question is no longer about the first user; it is whether this candidate is narrow enough to gate on.** Its measured surface is 27 syscalls, and the two that are structurally hardest — `arch_prctl(ARCH_SET_FS)` (§5.3) and the vDSO-backed `clock_gettime` — are both now named rather than discovered. Whether the other three operations follow, and in what order, is a product question this design does not answer.

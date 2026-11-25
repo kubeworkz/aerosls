@@ -396,6 +396,11 @@ const E_AGAIN: i32 = -3;      /* CAP_EAGAIN  -> -EAGAIN (a read with
                                * nothing buffered; console reads park
                                * since increment 24)                   */
 const E_NOSPC: i32 = -8;      /* CAP_ENOSPC  -> -ENOSPC                   */
+const E_INTR: i32 = -21;     /* CAP_EINTR -> -EINTR (E7 increment 27): a
+                              * parked forward was interrupted by a signal
+                              * whose handler runs without SA_RESTART. Its
+                              * own code, never EAGAIN's: a caller retries
+                              * an EINTR and must not retry a would-block. */
 const E_TABLEFULL: i32 = -4;  /* CAP_ETABLEFULL -> -ENFILE                */
 
 /// The reply wire format: `kernel/linux_abi.h`'s SLSLinuxSyscallRequest,
@@ -535,6 +540,42 @@ fn dispo(sig: &SigState, no: u64) -> u8 {
         1 => DISPO_IGN,
         _ => DISPO_HANDLER,
     }
+}
+
+/// Linux's `SA_RESTART` (x86-64 UAPI): the handler runs, and the syscall
+/// it interrupted is restarted rather than answered.
+const SIG_SA_RESTART: u64 = 0x1000_0000;
+
+/// E7 increment 27 (P1-C, "the delivery") — THE PARK'S WAKE, as one rule.
+/// A forward parked on a console read or a poll is answered -EINTR when a
+/// signal has arrived that Linux would run a handler for and that handler
+/// did not ask for a restart:
+///
+///   arrived and not blocked  (pending & !mask)
+///   a HANDLER, not SIG_DFL/SIG_IGN  (a scalar has no frame to run in and a
+///                                    default action has already been
+///                                    reduced to a kill by the tkill arm)
+///   no SA_RESTART            (with it, Linux restarts the syscall instead:
+///                             still parked, and the signal waits for the
+///                             next return to user space)
+///
+/// This is the sidecar's twin of the kernel's `linux_sig_park_is_eintr` —
+/// two languages, one rule, and the guard's clause P5 holds them to the
+/// same table. Returns the signal NUMBER so the log names which one woke
+/// the park (an attribution that a bare -EINTR would lose).
+fn park_interrupt(sig: &SigState) -> Option<u64> {
+    let deliverable = sig.pending & !sig.mask;
+    let mut no: u64 = 1;
+    while no <= SIG_MAX as u64 {
+        if deliverable & (1u64 << (no - 1)) != 0
+            && dispo(sig, no) == DISPO_HANDLER
+            && sig.act[no as usize][1] & SIG_SA_RESTART == 0
+        {
+            return Some(no);
+        }
+        no += 1;
+    }
+    None
 }
 
 /// The bytes an oldact reply payload carries (E7 increment 12, §10.13's
@@ -2557,6 +2598,31 @@ pub fn service<K: Kernel, A: BufferAlloc>(
          * the recv. Still not resolvable: stay parked (a finite poll's
          * wake comes from the entry loop's next_wait_ns deadline; a
          * blocking read's from console input on the channel set). */
+        /* E7 increment 27: a signal can end a park. Checked BEFORE readiness
+         * — a readable console and an interrupting signal in the same pass is
+         * a race with no wrong answer here, and answering the read would hide
+         * the signal for as long as the caller keeps reading. The pending bit
+         * is cleared because the wake consumes it: Linux delivers the signal,
+         * it does not leave it queued for the next park as well. */
+        if tasks()[i].pending != PENDING_NONE {
+            if let Some(no) = park_interrupt(&tasks()[i].sig) {
+                let tag = tasks()[i].pending_tag;
+                let num = if tasks()[i].pending == PENDING_READ {
+                    LINUX_READ
+                } else {
+                    LINUX_POLL
+                };
+                tasks()[i].sig.pending &= !(1u64 << (no - 1));
+                tasks()[i].pending = PENDING_NONE;
+                let mut ex = [0u8; 64];
+                let n = fmt_sig_line(&mut ex, b" sig=", no,
+                                     b" -> -EINTR on a parked forward\n");
+                enosys_log(num as u32, &name_buf[..nlen], &ex[..n]);
+                reply(k, ch_w, tag, num, 0, E_INTR);
+                continue;
+            }
+        }
+
         match tasks()[i].pending {
             PENDING_READ => {
                 let tag = tasks()[i].pending_tag;
@@ -3034,6 +3100,51 @@ mod tests {
     fn fds() -> [FdSlot; LINUX_MAX_FDS] {
                 [FdSlot { used: false, kind: 0, vfs_fd: 0, flags: 0, members: 0,
                   sum: 0xFFFF_FFFF, sum_len: 0 }; LINUX_MAX_FDS]
+    }
+
+    /* E7 increment 27 (P1-C): the park's wake. Six cases, one per branch of
+     * Linux's rule — the boot can only ever show the happy one (a handler
+     * without SA_RESTART), and the other five are exactly the mistakes that
+     * would turn a restartable read into a spurious EINTR, or an EINTR into
+     * silence. */
+    #[test]
+    fn a_parked_forward_is_woken_only_by_a_handler_without_sa_restart() {
+        let mut sig = SigState::new();
+        sig.act[2][0] = 0x401000;            /* SIGINT -> a real handler */
+        sig.pending = 1u64 << 1;             /* it arrived while parked  */
+
+        assert_eq!(park_interrupt(&sig), Some(2),
+                   "an installed handler with no SA_RESTART ends the park");
+
+        sig.act[2][1] = SIG_SA_RESTART;
+        assert_eq!(park_interrupt(&sig), None,
+                   "SA_RESTART keeps the read parked: Linux restarts the syscall, and the signal waits for the next return to user space — answering -EINTR here would be a read() that fails where Linux's succeeds");
+
+        sig.act[2][1] = 0;
+        sig.mask = 1u64 << 1;
+        assert_eq!(park_interrupt(&sig), None,
+                   "a blocked signal is not deliverable, so it cannot end the park — it stays pending until the mask moves");
+
+        sig.mask = 0;
+        sig.act[2][0] = 1;                   /* SIG_IGN */
+        assert_eq!(park_interrupt(&sig), None,
+                   "SIG_IGN has no frame to run: the park is untouched");
+
+        sig.act[2][0] = 0;                   /* SIG_DFL */
+        assert_eq!(park_interrupt(&sig), None,
+                   "and SIG_DFL never reaches this function in service() (the tkill arm already answered it with a kill), but the rule refuses it on its own terms too");
+
+        sig.act[2][0] = 0x401000;
+        sig.pending = 0;
+        assert_eq!(park_interrupt(&sig), None,
+                   "nothing arrived, nothing interrupts — the common case must cost a zero test, not a wake");
+
+        /* The lowest signal wins, so the log names a deterministic one
+         * when two arrive in the same pass (Linux would deliver 2 first). */
+        sig.pending = (1u64 << 1) | (1u64 << 9);
+        sig.act[10][0] = 0x402000;
+        assert_eq!(park_interrupt(&sig), Some(2),
+                   "the lowest-numbered deliverable signal is the one named");
     }
 
     #[test]

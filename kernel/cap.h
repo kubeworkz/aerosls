@@ -185,6 +185,10 @@
 #define CAP_ERANGE      (-9)
 #define CAP_ENOSYS      (-10)
 #define CAP_ECONFLICT   (-11)
+#define CAP_EINTR       (-21)   /* a parked forward was interrupted by a
+                                 * signal whose handler runs without
+                                 * SA_RESTART (E7 increment 27): the one
+                                 * code whose whole meaning is "retry me" */
 #define CAP_EPERM       (-12)   /* caller lacks authority for the operation
                                  * (e.g. a non-sidecar process calling
                                  * SYS_SLS_CREATE_SIDECAR — POSIX-Environments E2) */

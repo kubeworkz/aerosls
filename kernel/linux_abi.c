@@ -68,6 +68,10 @@ int32_t linux_errno_from_cap(int32_t cap_code)
     case CAP_ENOTEMPTY:              return -LINUX_ENOTEMPTY;
     case CAP_ENAMETOOLONG:           return -LINUX_ENAMETOOLONG;
     case CAP_EPERM:                  return -LINUX_EPERM;
+    /* E7 increment 27: the park's wake. Its own code rather than a reuse of
+     * EAGAIN, because a caller retries an EINTR and must not retry a
+     * would-block: the two are different answers to different questions. */
+    case CAP_EINTR:                  return -LINUX_EINTR;
     default:
         /* CAP_NONE (0xFFFF, the out-param sentinel) and anything else that
          * is not an enumerated code: translated, never leaked (§5.7). */
@@ -1270,6 +1274,120 @@ uint64_t linux_syscall_apply_reply(struct SLSLinuxSyscallRequest *req,
     return (uint64_t)(int64_t)linux_errno_from_cap(req->status);
 }
 
+/* ─── E7 increment 27 (P1-C, "the delivery") ──────────────────────────────
+ * The frame builder's caller. Three pieces, each refusing before it mutates:
+ *
+ *   the REQUEST  — the sidecar's act words, decoded from a fixed 80-byte
+ *                  reply payload. A length that is not exactly 80 is not a
+ *                  truncated answer to be repaired; it is not an answer.
+ *   the ADDRESS  — si_addr, from the numbers the trap path actually has.
+ *                  CR2 for a fault that has an address, RIP for the two
+ *                  that fault on an instruction, nothing for the rest.
+ *   the WRITE    — build, then write the 440 bytes through
+ *                  linux_user_copy_in against the task's own cr3. Two
+ *                  phases, so a stack the task made read-only is -EFAULT
+ *                  with the guest's memory untouched: a signal is the last
+ *                  thing that may fault in ring 0.
+ *
+ * Registers are NOT applied here. The caller (the return-to-user path) owns
+ * that, which is what keeps this half host-testable against fake tables. */
+static uint64_t sig_get64(const uint8_t *p);
+static uint32_t sig_get32(const uint8_t *p);
+
+int linux_sig_deliver_req_parse(const uint8_t *bytes, uint32_t len,
+                                struct LinuxSigDeliverReq *out)
+{
+    if (!bytes || !out) return -LINUX_EINVAL;
+    if (len != LINUX_SIGDELIVER_BYTES) return -LINUX_EINVAL;
+
+    out->signo     = sig_get32(bytes + 0);
+    out->code      = sig_get32(bytes + 4);
+    out->addr      = sig_get64(bytes + 8);
+    out->handler   = sig_get64(bytes + 16);
+    out->restorer  = sig_get64(bytes + 24);
+    out->act_flags = sig_get64(bytes + 32);
+    out->act_mask  = sig_get64(bytes + 40);
+    out->blocked   = sig_get64(bytes + 48);
+    out->alt_sp    = sig_get64(bytes + 56);
+    out->alt_size  = sig_get64(bytes + 64);
+    out->alt_flags = sig_get32(bytes + 72);
+    out->siginfo   = sig_get32(bytes + 76);
+
+    /* The frame builder repeats these two refusals; doing them here as well
+     * means a decodable-but-unrunnable answer never reaches the write path
+     * at all. */
+    if (out->signo == 0u || out->signo > 64u) return -LINUX_EINVAL;
+    if (out->handler <= 1u) return -LINUX_EINVAL;   /* SIG_DFL / SIG_IGN */
+    if (out->restorer == 0u) return -LINUX_EINVAL;  /* a handler that cannot
+                                                    * return is not a delivery */
+    return 0;
+}
+
+int linux_sig_si_addr(uint32_t signo, uint64_t cr2, uint64_t rip, uint64_t *out)
+{
+    if (!out) return 0;
+    switch (signo) {
+    case 11u:                       /* SIGSEGV */
+    case 7u:                        /* SIGBUS  */
+        *out = cr2;                 /* cr2 == 0 is a real address here: the
+                                     * NULL a segfault was taken on */
+        return 1;
+    case 8u:                        /* SIGFPE  */
+    case 4u:                        /* SIGILL  */
+        *out = rip;                 /* the faulting INSTRUCTION — CR2 is
+                                     * stale or never loaded on this path */
+        return 1;
+    default:
+        return 0;                   /* no address belongs to it; the caller
+                                     * keeps the sidecar's own addr */
+    }
+}
+
+int linux_sig_deliver(uint64_t root, const struct LinuxSigDeliverReq *req,
+                      const struct LinuxSigRegs *ctx, uint64_t cr2,
+                      struct LinuxSigRegs *entry, uint64_t *entry_mask)
+{
+    uint8_t frame[LINUX_SIGFRAME_SIZE];
+    struct LinuxSigFrameSpec spec;
+    struct LinuxSigRegs entry_local;
+    uint64_t mask_local = 0;
+    uint64_t addr = 0;
+    int r;
+
+    if (!req || !ctx || !entry) return -LINUX_EINVAL;
+
+    spec.signo     = req->signo;
+    spec.code      = req->code;
+    spec.addr      = linux_sig_si_addr(req->signo, cr2,
+                                       ctx->r[LINUX_SIGREG_RIP], &addr)
+                     ? addr : req->addr;
+    spec.handler   = req->handler;
+    spec.restorer  = req->restorer;
+    spec.act_flags = req->act_flags;
+    spec.act_mask  = req->act_mask;
+    spec.blocked   = req->blocked;
+    spec.user_rsp  = ctx->r[LINUX_SIGREG_RSP];
+    spec.alt_sp    = req->alt_sp;
+    spec.alt_size  = req->alt_size;
+    spec.alt_flags = req->alt_flags;
+    spec.siginfo   = req->siginfo;
+    spec.regs      = *ctx;
+
+    r = linux_sig_frame_build(frame, LINUX_SIGFRAME_SIZE, &spec,
+                              &entry_local, &mask_local);
+    if (r != 0) return r;           /* nothing written: the builder refuses
+                                     * before its first store */
+
+    r = linux_user_copy_in(frame, root, entry_local.r[LINUX_SIGREG_RSP],
+                           LINUX_SIGFRAME_SIZE);
+    if (r != 0) return r;           /* -EFAULT with the guest untouched:
+                                     * phase 1 walks every page first */
+
+    *entry = entry_local;
+    if (entry_mask) *entry_mask = mask_local;
+    return 0;
+}
+
 /* ─── The initial stack and auxv (§5.2) ────────────────────────────────────
  * Byte-exact layout, low address (returned rsp) upward — the canonical
  * process-entry image a static libc walks:
@@ -1547,6 +1665,11 @@ static uint64_t sig_get64(const uint8_t *p)
 static uint16_t sig_get16(const uint8_t *p)
 {
     return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
+}
+static uint32_t sig_get32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
 /* One delivery's stack choice, so the builder's two callers (build and the
