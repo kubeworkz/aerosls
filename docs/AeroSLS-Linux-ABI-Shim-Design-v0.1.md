@@ -4161,6 +4161,69 @@ that never had a delivery is refused by the kernel too. The kernel's own
 the gate, and this boot's refusal never reaches it because the sidecar answers
 first.
 
+### 10.23 What has landed — increment 30 (the thread-exit glue)
+
+The thread group could create a sibling and let it exit, but nothing observed
+the exit the way a pthread does: `CLONE_CHILD_CLEARTID` was *deliberately
+absent* from the clone allowlist, `set_tid_address` was "stored and ignored",
+and `set_robust_list` did not exist. So `pthread_join` could only hang and a
+robust mutex could only lie, however correct the group substrate was.
+
+This increment adds Linux's two exit duties, both kernel-local for the same
+reason futex is (the word lives in the group's page table, which the sidecar
+does not have, and the waiter is a descriptor this scheduler parks):
+
+- **The contract** (`kernel/linux_thread.h`): `LINUX_CLONE_CHILD_CLEARTID` in
+the allowlist with the plan carrying its word; `LINUX_SET_ROBUST_LIST` (273),
+the 24-byte head, Linux's 2048-entry walk bound, `FUTEX_OWNER_DIED|tid` and the
+tid mask; and three pure decisions — `linux_ctid_ok`,
+`linux_robust_list_ok`, `linux_robust_died_word`, `linux_robust_word_addr`
+(incl. the negative-offset-underflow and canonicality refusals).
+- **The mechanism** (`kernel/process.c`): `linux_thread_exit_glue(pd)`, called
+once at the top of a thread's own exit while the group's root is alive. It
+writes 0 into the clear-TID word through `linux_user_copy_in` and wakes that
+futex; then reads the robust head, walks entries (bounded, stopping at the head
+or the first unreadable entry), and for every word the dead thread still owns
+writes `FUTEX_OWNER_DIED|tid` and wakes one waiter. A word it does not own is
+left alone; the next pointer is read before the word is touched.
+- **The seam** (`kernel/syscall_dispatch.c`): clone passes `args[3]` into the
+plan; `set_tid_address` (218) is still answered by the sidecar (that arm is
+where `tkill`'s tid echo is recorded), but the kernel captures the word at the
+first trap; `set_robust_list` (273) is answered wholly in the kernel and
+refuses anything but the 24-byte canonical head.
+- **The census.** 273's row is not belief: `tools/linux_robust_list_census.txt`
+is a strace trace whose count is **2** for a one-call program — glibc registers
+its own robust head at start-up before `main`, then the program registers its
+own. That is the measured version of §6.1's claim that a libc asks for this
+before any application code runs.
+
+What is deliberately not promised, and named: `CLONE_PARENT_SETTID` and
+`CLONE_CHILD_SETTID` stay refused (a parent's write is a different promise), a
+mutex being locked at the instant of death (`list_op_pending`) is not marked,
+and the `exit_group` path runs no per-thread clear (a whole-group exit leaves
+nobody to join).
+
+**The checks.** `tests/linux_clone_host_test.c` grew from 34 to 44 checks — the
+flag accepted, its word carried, a non-canonical word refused *before* the
+child exists, the owner/mark arithmetic, both offset directions and the two
+refusals. `tests/linux_syscall_table_host_test.c` gained 273 (54 checks) — and
+surfaced a pre-existing red: increment 29 added the 15 row to the table but not
+to that test's `want[]`, so its length clause had been failing since then; the
+row is now in `want[]` too. Clause **Z6** pins every half above and tooth
+**t160** drops the owner check, which would mark a live sibling's mutex dead.
+
+**The live arm** is the existing two-thread probe, now pthread-shaped at
+syscall level: clone carries `CLONE_CHILD_CLEARTID` with the shared tid word,
+the parent stores the child's tid there and parks on it, and the child
+registers a robust list owning one word and exits with `exit(60)`. The parent
+then reads back `0` and `FUTEX_OWNER_DIED|tid` and prints `E7TG-CTID-OK` /
+`E7TG-ROBUST-OK` — markers only the joiner can write after the words changed —
+and the check reads the kernel's own `[E7] clear-TID:` and
+`[E7] robust list: TID … walked 1 entries, released 1` lines beside them.
+The join accepts a wake (rax 0) or an already-cleared word (`-EAGAIN`) because
+a preemptible probe can lose the wake to the timer between releasing the child
+and parking; the state it verifies is the same either way.
+
 ---
 
 ## 11. Open questions for review

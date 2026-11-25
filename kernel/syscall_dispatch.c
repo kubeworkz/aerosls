@@ -690,6 +690,42 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                         (unsigned long)largs[0], cur->tid, cur->tgid);
                     linux_thread_exit(cur, (uint32_t)largs[0]);
                 }
+                /* E7 TG-1 I5: set_tid_address (218) is still the sidecar's to
+                 * answer — that arm is where the tid tkill matches against is
+                 * recorded — but the WORD it names is the kernel's, because
+                 * the kernel is what writes it at exit. Capturing it here, at
+                 * the first trap, keeps one authority per half: the sidecar
+                 * owns the tid, the kernel owns the clear. A word that is not
+                 * a canonical user address is stored as 0, so the glue never
+                 * has an address to try. */
+                if (num == LINUX_SET_TID_ADDRESS) {
+                    cur->linux_clear_tid =
+                        linux_ctid_ok(largs[0]) ? largs[0] : 0;
+                }
+                /* E7 TG-1 I5: set_robust_list (273) is kernel-local for the
+                 * same reason futex is: the list lives in the group's page
+                 * table and its walk ends in this scheduler's wakes. The
+                 * length must be the head this shim understands, so a caller
+                 * with a different struct is refused by name rather than
+                 * walked with the wrong strides. */
+                if (num == LINUX_SET_ROBUST_LIST) {
+                    if (!linux_robust_list_ok(largs[0], largs[1])) {
+                        kernel_serial_printf(
+                            "[E7] set_robust_list head=0x%lx len=%lu "
+                            "refused: not a canonical 8-aligned user head "
+                            "of %u bytes\n",
+                            (unsigned long)largs[0], (unsigned long)largs[1],
+                            (unsigned)LINUX_ROBUST_LIST_HEAD_BYTES);
+                        return (uint64_t)(int64_t)(-LINUX_EINVAL);
+                    }
+                    cur->linux_robust_list = largs[0];
+                    kernel_serial_printf(
+                        "[E7] set_robust_list: TID %u head=0x%lx len=%lu "
+                        "recorded (walked at this thread's exit)\n",
+                        cur->tid, (unsigned long)largs[0],
+                        (unsigned long)largs[1]);
+                    return 0;
+                }
                 /* E7 TG-1 I3: futex (202) is kernel-local. The sidecar owns
                  * no page table and is not the scheduler, so the kernel reads
                  * the waited-on word through the caller's own root, compares
@@ -785,7 +821,7 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                         return (uint64_t)(int64_t)(-LINUX_EINVAL);
                     }
                     crc = linux_clone_plan(largs[0], largs[1], largs[4],
-                                           cur->fs_base, &cplan);
+                                           largs[3], cur->fs_base, &cplan);
                     if (crc != 0) {
                         kernel_serial_printf(
                             "[E7] clone flags=0x%lx stack=0x%lx tls=0x%lx "

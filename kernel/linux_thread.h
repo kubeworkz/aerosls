@@ -59,10 +59,20 @@ struct TaskContext;
 #define LINUX_CLONE_SYSVSEM  0x00040000ull
 #define LINUX_CLONE_SETTLS   0x00080000ull
 
+#define LINUX_CLONE_CHILD_CLEARTID 0x00200000ull
+
 #define LINUX_CLONE_GO_FLAGS (LINUX_CLONE_VM | LINUX_CLONE_FS | \
                               LINUX_CLONE_FILES | LINUX_CLONE_SIGHAND | \
                               LINUX_CLONE_SYSVSEM | LINUX_CLONE_THREAD)
-#define LINUX_CLONE_ALLOWED  (LINUX_CLONE_GO_FLAGS | LINUX_CLONE_SETTLS)
+/* E7 TG-1 I5: CLONE_CHILD_CLEARTID joins the allowlist. It is the flag the
+ * general pthread shape carries and the Go shape does not; it promises one
+ * thing and the kernel already owns every half of it — the word is in the
+ * group's page table and the waiter is a descriptor this scheduler parks, so
+ * no sidecar state is involved and nothing about the group's sharing changes.
+ * The OTHER pthread flags (PARENT_SETTID, CHILD_SETTID) stay refused: they are
+ * a parent's write, not a clearing promise, and this increment makes none. */
+#define LINUX_CLONE_ALLOWED  (LINUX_CLONE_GO_FLAGS | LINUX_CLONE_SETTLS | \
+                              LINUX_CLONE_CHILD_CLEARTID)
 
 /* `group_index` value for a descriptor that belongs to no Linux group. */
 #define LINUX_GROUP_NONE  0xFFFFFFFFu
@@ -202,10 +212,12 @@ struct LinuxClonePlan {
     uint64_t child_stack;  /* user-canonical, non-zero (Go's g0 stack top) */
     uint64_t tls;          /* args[4], meaningful only with SETTLS        */
     uint64_t fs_base;      /* what the child's per-thread fs_base becomes */
+    uint64_t ctid;         /* I5: args[3] when CLEARTID is set, else 0    */
 };
 
 int linux_clone_plan(uint64_t flags, uint64_t child_stack, uint64_t tls,
-                     uint64_t parent_fs_base, struct LinuxClonePlan* out);
+                     uint64_t ctid, uint64_t parent_fs_base,
+                     struct LinuxClonePlan* out);
 
 /* Synthesize the child's 20-word TaskContext: every GPR zero except rsi (the
  * clone wrapper's post-syscall SP source), rax = 0 (the child's clone return),
@@ -232,6 +244,52 @@ int linux_clone_thread(struct ProcessDescriptor* parent,
 int linux_restore_group_siblings(struct ProcessDescriptor* leader,
                                  const uint16_t* thread_indexes,
                                  uint32_t n);
+
+/* ─── E7 TG-1 I5: the thread-exit glue's contract ─────────────────────────
+ * CLONE_CHILD_CLEARTID and set_tid_address are ONE word to Linux: the
+ * address a dying thread writes 0 into and then futex-wakes, which is exactly
+ * how pthread_join works (the parent stores the child's tid there and waits on
+ * it). set_robust_list (273) is the second half of the same idea: a list of
+ * futex words this thread owns, each left as FUTEX_OWNER_DIED|tid on death so
+ * a robust mutex's next owner learns the previous one died holding it.
+ *
+ * The decisions are pure and host-tested (tests/linux_clone_host_test.c); the
+ * effects are two validated user copies plus a futex wake, which only
+ * process.c can perform (it owns the page table and the scheduler):
+ *
+ *   linux_thread_exit_glue(pd)  clear the word, walk the list, wake — called
+ *                               once at the top of a thread's own exit.
+ *
+ * What is deliberately NOT promised: the parent-side flags (PARENT_SETTID,
+ * CHILD_SETTID), `list_op_pending`, and a clear on the exit_group path (a
+ * whole-group exit leaves nobody to join). Each is named in §10.23. */
+#define LINUX_SET_TID_ADDRESS  218u
+#define LINUX_SET_ROBUST_LIST  273u
+#define LINUX_ROBUST_LIST_HEAD_BYTES 24u   /* list(8) + futex_offset(8) + pending(8) */
+#define LINUX_ROBUST_LIST_LIMIT 2048u      /* Linux's own ROBUST_LIST_LIMIT       */
+#define LINUX_FUTEX_OWNER_DIED 0x40000000u
+#define LINUX_FUTEX_TID_MASK   0x3FFFFFFFu
+
+/* The word a CLONE_CHILD_CLEARTID / set_tid_address call names: 0 (Linux's
+ * "no clear") or a canonical user address. A word that fails this is stored
+ * as 0, so the exit glue is never handed an address it would try to write. */
+int linux_ctid_ok(uint64_t word);
+
+/* set_robust_list's two arguments: the length must be the 24-byte head this
+ * shim understands (glibc's sizeof(struct robust_list_head)) and the head
+ * must be a canonical, 8-aligned user address. */
+int linux_robust_list_ok(uint64_t head, uint64_t len);
+
+/* The word a dying owner leaves behind, or 0 when this entry is not ours:
+ * Linux writes FUTEX_OWNER_DIED|tid only over a word this thread owns and
+ * leaves an unlocked (0) or foreign word alone. Pure, so the walk's decision
+ * is host-testable without any page tables. */
+uint32_t linux_robust_died_word(uint32_t word, uint32_t tid);
+
+/* One robust-list entry's futex address: entry + the head's futex_offset.
+ * Returns 0 with *out set, or -LINUX_EINVAL when the sum is not a canonical
+ * user address (a forged offset must not become a kernel write). */
+int linux_robust_word_addr(uint64_t entry, int64_t futex_offset, uint64_t* out);
 
 /* The group's ONE resource teardown: cap table twice-refused, page table
  * freed once, group slot released. The caller finishes the descriptor's own

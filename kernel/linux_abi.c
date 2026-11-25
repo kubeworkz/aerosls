@@ -164,7 +164,9 @@ const struct LinuxSyscallEntry linux_syscall_table[] = {
     { 186, LSC_TASK,   0 },   /* gettid — this descriptor's pid (TG-1 I2) */
     { 202, LSC_FUTEX,  0 },   /* futex — private wait/wake, kernel-local (I3) */
     { 217, LSC_FD,     0 },   /* getdents64 */
-    { 218, LSC_LOCAL,  0 },   /* set_tid_address — single-threaded: stored and ignored */
+    { 218, LSC_LOCAL,  0 },   /* set_tid_address — the sidecar answers the tid
+                               * echo; the KERNEL captures the word at the
+                               * first trap and clears it at exit (I5) */
     { 228, LSC_LOCAL,  0 },   /* clock_gettime — vDSO-backstopped (§5.5): a real trap here */
     { 231, LSC_EXIT,   0 },   /* exit_group — the sidecar reaps, frames return */
     /* The Go gate's netpoll startup (TG-0): all four are required-by-runtime
@@ -173,6 +175,10 @@ const struct LinuxSyscallEntry linux_syscall_table[] = {
      * answers 0, a blocking wait is refused by name (linux.rs answer_event). */
     { 233, LSC_FD,     0 },   /* epoll_ctl */
     { 257, LSC_FD,     0 },   /* openat — the gate's measured path open (I4) */
+    { 273, LSC_THREAD, 0 },   /* set_robust_list — I5: the thread's robust list,
+                               * walked and marked at its own exit; the row
+                               * exists because tools/linux_robust_list_census.txt
+                               * measured a real program's call */
     { 281, LSC_FD,     0 },   /* epoll_pwait — zero-timeout probe only */
     { 290, LSC_FD,     0 },   /* eventfd2 */
     { 291, LSC_FD,     0 },   /* epoll_create1 */

@@ -323,6 +323,15 @@ struct ProcessDescriptor {
     uint64_t   linux_sig_mask;
     uint8_t    linux_sig_active;
     uint64_t   linux_cr2;
+    /* E7 TG-1 I5: the thread-exit glue's two words, both per THREAD (Linux's
+     * clear_child_tid and robust_list are thread state, not group state).
+     * `linux_clear_tid` is set by clone's CLONE_CHILD_CLEARTID or by
+     * set_tid_address (218) and cleared by the exit glue; `linux_robust_list`
+     * is set_robust_list's (273) head and takes the same path. Both are
+     * re-stamped rather than inherited: proc_clear_resume_state() zeroes them
+     * so a reused slot never writes its predecessor's word or walks its list. */
+    uint64_t   linux_clear_tid;
+    uint64_t   linux_robust_list;
     uint64_t   park_req;              // the request pointer the resume re-runs
                                        // (SLSCapRecvRequest for a recv park,
                                        // SLSChanWaitRequest for a chan-wait park).
@@ -691,6 +700,15 @@ void process_exit(uint32_t exit_code);
  * and sidecar row stay while siblings live. The last thread destroys the
  * group once. Never returns: it switches to the next runnable descriptor (or
  * halts when the table has none). */
+/* E7 TG-1 I5: the thread's own exit does what Linux's does before it
+ * disappears — clear its clear_child_tid word (and wake a joiner), then walk
+ * its robust list leaving FUTEX_OWNER_DIED|tid on every word it owns (and
+ * wake each one's waiter). Both halves go through the validated user copies,
+ * so a word the task unmapped is a line on the console, never a ring-0 fault.
+ * Called once, at the top of linux_thread_exit, while the group's page table
+ * is still alive. */
+void linux_thread_exit_glue(struct ProcessDescriptor* pd);
+
 __attribute__((noreturn)) void linux_thread_exit(struct ProcessDescriptor* pd,
                                                  uint32_t exit_code);
 

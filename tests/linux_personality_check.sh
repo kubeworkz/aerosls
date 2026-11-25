@@ -1512,8 +1512,10 @@ if grep -qE '#define LINUX_CLONE_VM[[:space:]]+0x00000100ull' "$LTHH" && \
    grep -qE '#define LINUX_CLONE_SYSVSEM[[:space:]]+0x00040000ull' "$LTHH" && \
    grep -qE '#define LINUX_CLONE_THREAD[[:space:]]+0x00010000ull' "$LTHH" && \
    grep -qE '#define LINUX_CLONE_SETTLS[[:space:]]+0x00080000ull' "$LTHH" && \
+   grep -qE '#define LINUX_CLONE_CHILD_CLEARTID[[:space:]]+0x00200000ull' "$LTHH" && \
    grep -qF '#define LINUX_CLONE_GO_FLAGS (LINUX_CLONE_VM | LINUX_CLONE_FS |' "$LTHH" && \
-   grep -qF '#define LINUX_CLONE_ALLOWED  (LINUX_CLONE_GO_FLAGS | LINUX_CLONE_SETTLS)' "$LTHH" && \
+   grep -qF '#define LINUX_CLONE_ALLOWED  (LINUX_CLONE_GO_FLAGS | LINUX_CLONE_SETTLS | \' "$LTHH" && \
+   grep -qF '                              LINUX_CLONE_CHILD_CLEARTID)' "$LTHH" && \
    grep -qF 'int linux_clone_plan(' "$LTHH" && \
    grep -qF 'int linux_clone_plan(' "$LTHC" && \
    grep -qF 'flags & ~LINUX_CLONE_ALLOWED' "$LTHC" && \
@@ -1521,7 +1523,7 @@ if grep -qE '#define LINUX_CLONE_VM[[:space:]]+0x00000100ull' "$LTHH" && \
    grep -qF 'child_stack == 0 || !linux_fs_addr_is_user_canonical(child_stack)' "$LTHC" && \
    grep -qF 'out->fs_base = tls;' "$LTHC" && \
    grep -qF 'out->fs_base = parent_fs_base;' "$LTHC"; then
-    ok "Z1. the clone planner accepts exactly the seven Go flags (six mandatory shared flags plus optional SETTLS), refuses every outside bit with EINVAL, rejects a zero/non-canonical stack or TLS, and selects the child's fs_base from TLS or the parent's live base"
+    ok "Z1. the clone planner accepts exactly the Go shape plus its two optional promises — six mandatory shared flags, SETTLS and (since I5) CLONE_CHILD_CLEARTID, each with its own validation — refuses every outside bit with EINVAL, rejects a zero/non-canonical stack, TLS or clear-TID word, and selects the child's fs_base from TLS or the parent's live base"
 else
     bad "Z1. a clone flag or the pure planner is gone — a subset would be accepted as a thread while the group still shares what the omitted flag made private, or a non-canonical child stack/TLS would reach the ring-3 context"
 fi
@@ -1584,6 +1586,48 @@ if grep -qF 'linux_clone_plan(GO' "$LCHUT" && \
     ok "Z5. the host test drives all three contracts: the exact Go mask and every missing mandatory flag, the 20-word context with rax/rsi/rsp/rip, and group join/double-join/cap refusal"
 else
     bad "Z5. the clone host test no longer exercises a branch above — the planner, context or group join would be argued from these greps alone, reachable only at boot"
+fi
+
+# ─── Z6. TG-1 I5: the thread-exit glue ─────────────────────────────────────
+# Every half of the promise has one owner and one place it is spelled, and the
+# live half is a marker only the JOINER can write after reading the words
+# back. A mutation of the owner check, either clear, either wake, the 273 row
+# or its census reddens this clause by name (tooth t160).
+if grep -qF '#define LINUX_CLONE_CHILD_CLEARTID 0x00200000ull' kernel/linux_thread.h && \
+   grep -qF 'LINUX_CLONE_CHILD_CLEARTID)' kernel/linux_thread.h && \
+   grep -qF 'int linux_ctid_ok(uint64_t word);' kernel/linux_thread.h && \
+   grep -qF 'uint32_t linux_robust_died_word(uint32_t word, uint32_t tid);' kernel/linux_thread.h && \
+   grep -qF 'int linux_robust_word_addr(uint64_t entry, int64_t futex_offset,' kernel/linux_thread.h && \
+   grep -qF 'if (!linux_ctid_ok(ctid)) return -LINUX_EINVAL;' "$LTHC" && \
+   grep -qF 'out->ctid = ctid;' "$LTHC" && \
+   grep -qF 'if ((word & LINUX_FUTEX_TID_MASK) != (tid & LINUX_FUTEX_TID_MASK)) return 0;' "$LTHC" && \
+   grep -qF 'return (word & ~LINUX_FUTEX_TID_MASK) | LINUX_FUTEX_OWNER_DIED |' "$LTHC" && \
+   grep -qF 'if (back > entry) return -LINUX_EINVAL;' "$LTHC" && \
+   grep -qF 'linux_thread_exit_glue(pd);' "$PDC" && \
+   grep -qF 'linux_user_copy_in(zero, pd->cr3, ctid, 4)' "$PDC" && \
+   grep -qF 'linux_futex_wake_threads(gid, ctid, 1);' "$PDC" && \
+   grep -qF '(void)linux_futex_wake_threads(gid, waddr, 1);' "$PDC" && \
+   grep -qF 'walked < LINUX_ROBUST_LIST_LIMIT' "$PDC" && \
+   grep -qF 'child->linux_clear_tid = plan->ctid;' "$PDC" && \
+   grep -qF 'pd->linux_clear_tid  = 0;' "$PDC" && \
+   grep -qF 'if (num == LINUX_SET_ROBUST_LIST) {' "$DISP" && \
+   grep -qF 'cur->linux_robust_list = largs[0];' "$DISP" && \
+   grep -qF 'cur->linux_clear_tid =' "$DISP" && \
+   grep -qF '{ 273, LSC_THREAD, 0 }' "$LABC" && \
+   grep -qE '^273 set_robust_list [1-9][0-9]*$' tools/linux_robust_list_census.txt && \
+   grep -qF 'sha256:' tools/linux_robust_list_census.txt && \
+   grep -qF 'tools/linux_robust_list_census.txt' "$LABC" && \
+   grep -qF 'linux_robust_died_word(T, T) ==' "$LCHUT" && \
+   grep -qF 'linux_robust_list_ok(CTID, LINUX_ROBUST_LIST_HEAD_BYTES) == 1' "$LCHUT" && \
+   grep -qF 'a non-canonical CLEARTID word is refused BEFORE the child exists' "$LCHUT" && \
+   grep -qF 'mov     $273, %eax' user/sidecar/fixtures/e7_thread_probe.S && \
+   grep -qF 'mov     $0x002D0F00, %edi' user/sidecar/fixtures/e7_thread_probe.S && \
+   grep -qF 'E7TG-CTID-OK' tests/linux_thread_probe_check.sh && \
+   grep -qF 'E7TG-ROBUST-OK' tests/linux_thread_probe_check.sh && \
+   grep -qF 'walked 1 entries, released [1-9]' tests/linux_thread_probe_check.sh; then
+    ok "Z6. the thread-exit glue is one promise with one owner per half: clone validates the CLEARTID word before the child exists and set_robust_list takes exactly the 24-byte canonical head (273's row exists because tools/linux_robust_list_census.txt measured glibc's start-up call and a program's own), the exit writes 0 through the validated copy and wakes that futex, the robust walk is bounded, checks OWNER with the mask, leaves OWNER_DIED|tid and wakes each released word, the per-thread words are re-stamped at slot reuse, and the live arm proves it from the joiner's side (E7TG-CTID-OK / E7TG-ROBUST-OK plus the kernel's clear-TID and walked-and-released lines)"
+else
+    bad "Z6. the exit glue lost a half: a clear that skips the validated copy is a ring-0 fault from a task's own address, a wake without a clear resumes a joiner into a tid that never went away, a robust walk without the owner check marks a live sibling's mutex dead, an unbounded walk follows a forged list, or a row without its census is a table entry built from belief"
 fi
 
 # ─── P. E7 increment 26 (P1-C): the signal frame ───────────────────────────

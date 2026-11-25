@@ -43,16 +43,19 @@ struct LinuxThreadGroup linux_group_table[PROC_MAX];
  * handler table to hand a child that omitted one, so accepting the subset
  * would return success for a semantic the next syscall would violate. */
 int linux_clone_plan(uint64_t flags, uint64_t child_stack, uint64_t tls,
-                     uint64_t parent_fs_base, struct LinuxClonePlan* out) {
+                     uint64_t ctid, uint64_t parent_fs_base,
+                     struct LinuxClonePlan* out) {
     if (!out) return -LINUX_EINVAL;
     out->flags = 0;
     out->child_stack = 0;
     out->tls = 0;
     out->fs_base = 0;
+    out->ctid = 0;
 
-    /* Unknown/vfork/parent/namespace/ptrace/clear-TID bits all fail this
-     * one mask check. CLONE_CHILD_CLEARTID is intentionally absent: Go's
-     * measured path does not use it and v1 makes no clear-TID promise. */
+    /* Unknown/vfork/parent/namespace/ptrace bits all fail this one mask
+     * check. CLONE_CHILD_CLEARTID is IN the mask since I5 — its word is the
+     * one thing the exit glue needs, and it is validated just below like every
+     * other user pointer in this plan. */
     if (flags & ~LINUX_CLONE_ALLOWED) return -LINUX_EINVAL;
     if ((flags & LINUX_CLONE_GO_FLAGS) != LINUX_CLONE_GO_FLAGS)
         return -LINUX_EINVAL;
@@ -69,6 +72,15 @@ int linux_clone_plan(uint64_t flags, uint64_t child_stack, uint64_t tls,
     if (child_stack == 0 || !linux_fs_addr_is_user_canonical(child_stack))
         return -LINUX_EINVAL;
 
+    /* I5: the clear-TID word is a user pointer the exit glue will WRITE, so
+     * it is validated at the plan (before any table mutation) and not at the
+     * exit, where a refusal would be a silent no-wake in a dying thread. Zero
+     * is Linux's "no clear" and is accepted with the flag set. */
+    if (flags & LINUX_CLONE_CHILD_CLEARTID) {
+        if (!linux_ctid_ok(ctid)) return -LINUX_EINVAL;
+        out->ctid = ctid;
+    }
+
     out->flags = flags;
     out->child_stack = child_stack;
     out->tls = tls;
@@ -78,6 +90,46 @@ int linux_clone_plan(uint64_t flags, uint64_t child_stack, uint64_t tls,
     } else {
         out->fs_base = parent_fs_base;
     }
+    return 0;
+}
+
+/* ─── I5: the exit glue's pure decisions ─────────────────────────────────── */
+int linux_ctid_ok(uint64_t word) {
+    return word == 0 || linux_fs_addr_is_user_canonical(word);
+}
+
+int linux_robust_list_ok(uint64_t head, uint64_t len) {
+    if (len != LINUX_ROBUST_LIST_HEAD_BYTES) return 0;
+    if (head == 0 || (head & 7u) != 0) return 0;
+    return linux_fs_addr_is_user_canonical(head);
+}
+
+uint32_t linux_robust_died_word(uint32_t word, uint32_t tid) {
+    /* An unlocked word is nobody's; a word owned by another thread is that
+     * thread's to release. Only our own futex (its tid, possibly already
+     * marked OWNER_DIED) is rewritten, and the mark survives. */
+    if (word == 0) return 0;
+    if ((word & LINUX_FUTEX_TID_MASK) != (tid & LINUX_FUTEX_TID_MASK)) return 0;
+    return (word & ~LINUX_FUTEX_TID_MASK) | LINUX_FUTEX_OWNER_DIED |
+           (tid & LINUX_FUTEX_TID_MASK);
+}
+
+int linux_robust_word_addr(uint64_t entry, int64_t futex_offset,
+                           uint64_t* out) {
+    uint64_t base;
+
+    if (!out) return -LINUX_EINVAL;
+    if (futex_offset >= 0) {
+        if ((uint64_t)futex_offset > ~(uint64_t)0 - entry)
+            return -LINUX_EINVAL;
+        base = entry + (uint64_t)futex_offset;
+    } else {
+        uint64_t back = (uint64_t)(-(futex_offset + 1)) + 1u;
+        if (back > entry) return -LINUX_EINVAL;
+        base = entry - back;
+    }
+    if (!linux_fs_addr_is_user_canonical(base)) return -LINUX_EINVAL;
+    *out = base;
     return 0;
 }
 

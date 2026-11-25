@@ -91,6 +91,11 @@ FILES=(
     # P2/P13 (increment 29, the return trip) read the census artifact by
     # path, so the seeded copy needs it exactly as the guard does.
     tools/linux_rt_sigreturn_census.txt
+    # Z6 (increment 30, the thread-exit glue) reads the robust-list census,
+    # the thread probe's fixture and its LIVE check, same rule as above.
+    tools/linux_robust_list_census.txt
+    user/sidecar/fixtures/e7_thread_probe.S
+    tests/linux_thread_probe_check.sh
 )
 
 for f in "${FILES[@]}" "$GUARD"; do
@@ -1340,6 +1345,14 @@ tooth sigframe-return-gate-gone P16 "the return trip restores without asking the
 seed "$W/t159"
 sed -i 's/cmp     \$-22, %rax/cmp     $-1, %rax/' "$W/t159/user/sidecar/fixtures/e7_linux_probe.S"
 tooth sigret-nohand-errno-unnamed P17 "the live refusal no longer pins -EINVAL" "$W/t159"
+
+# t160: the robust walk marks EVERY word it sees, dropping the owner check.
+# A mutex owned by a live sibling would be handed FUTEX_OWNER_DIED, so the
+# next owner takes over a lock nobody released — the one rule that keeps the
+# walk from being "write a number into every entry the task named".
+seed "$W/t160"
+sed -i 's/    if ((word \& LINUX_FUTEX_TID_MASK) != (tid \& LINUX_FUTEX_TID_MASK)) return 0;/    if (0) return 0;/' "$W/t160/kernel/linux_thread.c"
+tooth robust-owner-check-gone Z6 "the robust walk no longer checks that the dead thread owned the word" "$W/t160"
 
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"

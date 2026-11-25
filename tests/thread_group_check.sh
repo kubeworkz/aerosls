@@ -198,8 +198,12 @@ else
     bad "C1b. LINUX_CLONE_GO_FLAGS no longer holds exactly VM|FS|FILES|SIGHAND|SYSVSEM|THREAD without SETTLS"
 fi
 
-need "$LTH" 'LINUX_CLONE_ALLOWED  (LINUX_CLONE_GO_FLAGS | LINUX_CLONE_SETTLS)' "C2" \
+# I5 added CLONE_CHILD_CLEARTID, so the allowlist spans two lines now: the
+# first names the two optional promises, the second closes with the new one.
+need "$LTH" 'LINUX_CLONE_ALLOWED  (LINUX_CLONE_GO_FLAGS | LINUX_CLONE_SETTLS | \' "C2" \
     "the accepted set is the mandatory six plus optional SETTLS"
+need "$LTH" '                              LINUX_CLONE_CHILD_CLEARTID)' "C2b" \
+    "…plus I5's CLONE_CHILD_CLEARTID, whose word the exit glue clears"
 need "$LTC" 'if (flags & ~LINUX_CLONE_ALLOWED) return -LINUX_EINVAL;' "C2b" \
     "clone refuses an unaccepted flag before touching any table"
 need "$LTC" 'if ((flags & LINUX_CLONE_GO_FLAGS) != LINUX_CLONE_GO_FLAGS)' "C2c" \

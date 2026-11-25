@@ -156,6 +156,11 @@ static void proc_clear_resume_state(struct ProcessDescriptor* pd) {
     pd->fs_base = 0;
     pd->fs_base_stage = 0;
     pd->fs_stage_valid = 0;
+    /* E7 TG-1 I5: the exit glue's words are per-thread state of the same
+     * shape — a reused slot that kept them would clear a stranger's TID word
+     * (and wake its joiner) or walk a robust list it never registered. */
+    pd->linux_clear_tid  = 0;
+    pd->linux_robust_list = 0;
     /* E7 TG-1 I1: the shared span/cursors are the GROUP's (linux_thread.h);
      * this per-descriptor clear no longer touches them. linux_group_create()
      * stamps a fresh group, linux_group_destroy() zeroes its cursors, and the
@@ -817,9 +822,10 @@ int linux_clone_thread(struct ProcessDescriptor* parent,
      * bounds are security-relevant, so the create re-checks its own copy. */
     struct LinuxClonePlan check;
     if (linux_clone_plan(plan->flags, plan->child_stack, plan->tls,
-                         parent->fs_base, &check) != 0)
+                         plan->ctid, parent->fs_base, &check) != 0)
         return -LINUX_EINVAL;
-    if (check.flags != plan->flags || check.fs_base != plan->fs_base)
+    if (check.flags != plan->flags || check.fs_base != plan->fs_base ||
+        check.ctid != plan->ctid)
         return -LINUX_EINVAL;
 
     struct ProcessDescriptor* child = 0;
@@ -842,6 +848,8 @@ int linux_clone_thread(struct ProcessDescriptor* parent,
     child->object_id    = parent->object_id;
     child->cr3          = g->cr3;          /* the group's one root */
     child->fs_base      = plan->fs_base;   /* per-thread TLS */
+    child->linux_clear_tid = plan->ctid;   /* I5: cleared at this thread's
+                                            * own exit, then futex-woken  */
     child->user_rip     = parent_rip;
     child->user_rsp     = plan->child_stack;
     child->owner_uid    = parent->owner_uid;
@@ -1115,6 +1123,116 @@ static int linux_descriptor_release(struct ProcessDescriptor* pd) {
     return 0;
 }
 
+/* ─── E7 TG-1 I5: the thread-exit glue ────────────────────────────────────
+ * Linux's do_exit does two things this shim must do too, because both are
+ * WHY a joiner ever wakes: it writes 0 into the dying thread's
+ * clear_child_tid word and wakes that futex (pthread_join's whole mechanism),
+ * and it walks the thread's robust list, marking every mutex it still owns as
+ * FUTEX_OWNER_DIED|tid and waking that mutex's waiter (pthread_mutex_lock's
+ * EOWNERDEAD path).
+ *
+ * Both halves are privileged here for the same reason futex is kernel-local:
+ * the words live in the GROUP's page table, which the sidecar does not have,
+ * and the waiter is a descriptor this scheduler parks. Every user access is a
+ * validated copy (the P4 rule extended to writes), so a word the task
+ * unmapped is a console line and never a ring-0 fault; every walk is bounded
+ * by LINUX_ROBUST_LIST_LIMIT and stops at the head or on the first unreadable
+ * entry, so a forged list cannot spin the kernel.
+ *
+ * What it does NOT do, by name: `list_op_pending` (a mutex being locked at the
+ * instant of death is not marked — Linux's own hard case), and any clear on
+ * the exit_group path (a whole-group exit leaves no joiner; every member's
+ * descriptor goes through the group teardown instead). Both are §10.23. */
+static uint64_t linux_get_u64(const uint8_t* p) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v |= (uint64_t)p[i] << (8 * i);
+    return v;
+}
+
+static void linux_put_u32(uint8_t* p, uint32_t v) {
+    for (int i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8 * i));
+}
+
+void linux_thread_exit_glue(struct ProcessDescriptor* pd) {
+    struct LinuxThreadGroup* g;
+    uint64_t ctid, head;
+    uint32_t tid, gid;
+
+    if (!pd) return;
+    g    = linux_group_of(pd);
+    tid  = pd->tid;
+    gid  = g ? g->group_id : 0;
+    ctid = pd->linux_clear_tid;
+    head = pd->linux_robust_list;
+
+    if (ctid != 0 && linux_ctid_ok(ctid)) {
+        static const uint8_t zero[4] = { 0, 0, 0, 0 };
+        if (linux_user_copy_in(zero, pd->cr3, ctid, 4) == 0) {
+            kernel_serial_printf(
+                "[E7] clear-TID: TID %u word 0x%lx cleared, joiner woken\n",
+                tid, (unsigned long)ctid);
+            if (g) (void)linux_futex_wake_threads(gid, ctid, 1);
+        } else {
+            kernel_serial_printf(
+                "[E7] clear-TID: TID %u word 0x%lx is not a writable user "
+                "page; nothing cleared, no joiner wake\n",
+                tid, (unsigned long)ctid);
+        }
+    }
+
+    if (head != 0 && g &&
+        linux_robust_list_ok(head, LINUX_ROBUST_LIST_HEAD_BYTES)) {
+        uint8_t hb[LINUX_ROBUST_LIST_HEAD_BYTES];
+        uint64_t entry;
+        int64_t  off;
+        uint32_t walked = 0, released = 0;
+
+        if (linux_user_copy_out(hb, pd->cr3, head,
+                                LINUX_ROBUST_LIST_HEAD_BYTES) != 0) {
+            kernel_serial_printf(
+                "[E7] robust list: TID %u head 0x%lx unreadable; no walk\n",
+                tid, (unsigned long)head);
+            return;
+        }
+        entry = linux_get_u64(hb);          /* head->list.next            */
+        off   = (int64_t)linux_get_u64(hb + 8);  /* head->futex_offset    */
+
+        while (entry != 0 && entry != head && walked < LINUX_ROBUST_LIST_LIMIT) {
+            uint8_t nb[8], wb[4];
+            uint64_t next, waddr;
+            uint32_t word, died;
+
+            /* The next pointer is read BEFORE the word is touched: the entry
+             * is the task's own memory and the walk must not depend on what
+             * this kernel just wrote into one of its futexes. */
+            if (linux_user_copy_out(nb, pd->cr3, entry, 8) != 0) break;
+            next = linux_get_u64(nb);
+            walked++;
+            if (linux_robust_word_addr(entry, off, &waddr) != 0) break;
+            if (linux_user_copy_out(wb, pd->cr3, waddr, 4) != 0) {
+                entry = next;
+                continue;
+            }
+            word = (uint32_t)wb[0] | ((uint32_t)wb[1] << 8) |
+                   ((uint32_t)wb[2] << 16) | ((uint32_t)wb[3] << 24);
+            died = linux_robust_died_word(word, tid);
+            if (died != 0) {
+                uint8_t out[4];
+                linux_put_u32(out, died);
+                if (linux_user_copy_in(out, pd->cr3, waddr, 4) == 0) {
+                    released++;
+                    (void)linux_futex_wake_threads(gid, waddr, 1);
+                }
+            }
+            entry = next;
+        }
+        kernel_serial_printf(
+            "[E7] robust list: TID %u walked %u entries, released %u "
+            "(FUTEX_OWNER_DIED|%u)\n",
+            tid, walked, released, tid);
+    }
+}
+
 /* Group-fatal teardown: every member descriptor first, then the group's ONE
  * cap-table/page-table destroy. Used by the fault path, a kill that lands on
  * any member, and the last thread's departure. */
@@ -1164,6 +1282,12 @@ void linux_thread_exit(struct ProcessDescriptor* pd, uint32_t exit_code) {
     struct LinuxThreadGroup* g = linux_group_of(pd);
     uint32_t tid = pd ? pd->tid : 0;
     uint32_t gid = g ? g->group_id : 0;
+
+    /* E7 TG-1 I5: the glue runs BEFORE the descriptor is released — the page
+     * table it writes through belongs to the group and is destroyed only if
+     * this is the last thread. */
+    linux_thread_exit_glue(pd);
+
     int last = pd ? linux_descriptor_release(pd) : 0;
     struct ProcessDescriptor* next;
 

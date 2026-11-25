@@ -71,15 +71,15 @@ int main(void) {
     /* ── 1. The exact Go shape ───────────────────────────────────────────── */
     {
         struct LinuxClonePlan p;
-        CHECK(linux_clone_plan(GO, STACK, 0, PARENT_FS, &p) == 0 &&
+        CHECK(linux_clone_plan(GO, STACK, 0, 0, PARENT_FS, &p) == 0 &&
               p.flags == GO && p.child_stack == STACK &&
-              p.fs_base == PARENT_FS,
+              p.fs_base == PARENT_FS && p.ctid == 0,
               "the six shared flags without SETTLS are accepted and the child inherits the parent fs_base");
-        CHECK(linux_clone_plan(GO | LINUX_CLONE_SETTLS, STACK, TLS, PARENT_FS,
+        CHECK(linux_clone_plan(GO | LINUX_CLONE_SETTLS, STACK, TLS, 0, PARENT_FS,
                                &p) == 0 &&
               p.fs_base == TLS,
               "SETTLS makes the child's fs_base the TLS argument");
-        CHECK(linux_clone_plan(GO | LINUX_CLONE_SETTLS, STACK, 0, PARENT_FS,
+        CHECK(linux_clone_plan(GO | LINUX_CLONE_SETTLS, STACK, 0, 0, PARENT_FS,
                                &p) == 0 && p.fs_base == 0,
               "SETTLS with a zero TLS base is legal (Linux's degenerate base)");
     }
@@ -92,17 +92,18 @@ int main(void) {
             0x00008000ull,   /* CLONE_PARENT                             */
             0x00002000ull,   /* CLONE_PTRACE                             */
             0x00020000ull,   /* CLONE_NEWNS (a namespace flag)           */
-            0x00200000ull,   /* CLONE_CHILD_CLEARTID (v1 makes no promise)*/
+            0x00100000ull,   /* CLONE_PARENT_SETTID (a parent's write)    */
+            0x01000000ull,   /* CLONE_CHILD_SETTID                      */
         };
         int all_refused = 1;
         for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
             struct LinuxClonePlan p;
-            if (linux_clone_plan(GO | bad[i], STACK, TLS, PARENT_FS, &p) !=
+            if (linux_clone_plan(GO | bad[i], STACK, TLS, 0, PARENT_FS, &p) !=
                 -LINUX_EINVAL)
                 all_refused = 0;
         }
         CHECK(all_refused,
-              "every non-Go flag — vfork, parent, ptrace, namespace, clear-TID and unknown — is refused EINVAL");
+              "every flag outside the allowlist — vfork, parent, ptrace, namespace, PARENT_SETTID, CHILD_SETTID and unknown — is refused EINVAL");
     }
 
     /* ── 3. Each mandatory shared flag is enforced ───────────────────────── */
@@ -114,7 +115,7 @@ int main(void) {
         int all_refused = 1;
         for (unsigned i = 0; i < sizeof(required) / sizeof(required[0]); i++) {
             struct LinuxClonePlan p;
-            if (linux_clone_plan(GO & ~required[i], STACK, TLS, PARENT_FS,
+            if (linux_clone_plan(GO & ~required[i], STACK, TLS, 0, PARENT_FS,
                                  &p) != -LINUX_EINVAL)
                 all_refused = 0;
         }
@@ -125,18 +126,18 @@ int main(void) {
     /* ── 4. Stack and TLS canonicality ───────────────────────────────────── */
     {
         struct LinuxClonePlan p;
-        CHECK(linux_clone_plan(GO, 0, TLS, PARENT_FS, &p) == -LINUX_EINVAL,
+        CHECK(linux_clone_plan(GO, 0, TLS, 0, PARENT_FS, &p) == -LINUX_EINVAL,
               "a zero child stack is refused (the kernel allocates nothing)");
-        CHECK(linux_clone_plan(GO, 0x0000800000000000ull, TLS, PARENT_FS, &p) ==
+        CHECK(linux_clone_plan(GO, 0x0000800000000000ull, TLS, 0, PARENT_FS, &p) ==
               -LINUX_EINVAL,
               "a non-canonical child stack is refused");
-        CHECK(linux_clone_plan(GO, LINUX_USER_ADDR_MAX, TLS, PARENT_FS, &p) == 0,
+        CHECK(linux_clone_plan(GO, LINUX_USER_ADDR_MAX, TLS, 0, PARENT_FS, &p) == 0,
               "the top canonical user address is accepted as a stack");
         CHECK(linux_clone_plan(GO | LINUX_CLONE_SETTLS, STACK,
-                               0x0000800000000000ull, PARENT_FS, &p) ==
+                               0x0000800000000000ull, 0, PARENT_FS, &p) ==
               -LINUX_EINVAL,
               "a non-canonical TLS base is refused when SETTLS asks to install it");
-        CHECK(linux_clone_plan(GO, STACK, TLS, PARENT_FS, 0) == -LINUX_EINVAL,
+        CHECK(linux_clone_plan(GO, STACK, TLS, 0, PARENT_FS, 0) == -LINUX_EINVAL,
               "a NULL plan output is refused");
     }
 
@@ -155,6 +156,69 @@ int main(void) {
               c.rbp == 0 && c.rdi == 0 && c.rdx == 0 && c.rcx == 0 &&
               c.rbx == 0,
               "every other GPR is zeroed — no parent register leaks into the new thread");
+    }
+
+    /* ── 5b. I5: CLONE_CHILD_CLEARTID and the exit glue's decisions ──────── */
+    {
+        const uint64_t CTID = 0x0000700000003000ull;
+        struct LinuxClonePlan p;
+
+        CHECK(linux_clone_plan(GO | LINUX_CLONE_CHILD_CLEARTID, STACK, 0, CTID,
+                               PARENT_FS, &p) == 0 &&
+              p.ctid == CTID && p.flags == (GO | LINUX_CLONE_CHILD_CLEARTID),
+              "CLEARTID is accepted on the Go shape and the plan carries the word the exit will clear");
+        CHECK(linux_clone_plan(GO | LINUX_CLONE_CHILD_CLEARTID, STACK, 0, 0,
+                               PARENT_FS, &p) == 0 && p.ctid == 0,
+              "CLEARTID with a zero word is legal (Linux's \"no clear\")");
+        CHECK(linux_clone_plan(GO | LINUX_CLONE_CHILD_CLEARTID, STACK, 0,
+                               0x0000800000000000ull, PARENT_FS, &p) ==
+              -LINUX_EINVAL,
+              "a non-canonical CLEARTID word is refused BEFORE the child exists (the dying thread must never be handed a bad address)");
+        CHECK(linux_clone_plan(GO, STACK, 0, CTID, PARENT_FS, &p) == 0 &&
+              p.ctid == 0,
+              "without the flag args[3] is not a promise: the plan's ctid stays 0 even when the register holds an address");
+
+        CHECK(linux_ctid_ok(0) && linux_ctid_ok(CTID),
+              "linux_ctid_ok accepts Linux's zero and a canonical user word");
+        CHECK(!linux_ctid_ok(0x0000800000000000ull) &&
+              !linux_ctid_ok(LINUX_USER_ADDR_MAX + 1u),
+              "linux_ctid_ok refuses non-canonical words and the first address past the user range");
+
+        CHECK(linux_robust_list_ok(CTID, LINUX_ROBUST_LIST_HEAD_BYTES) == 1 &&
+              linux_robust_list_ok(CTID, 16) == 0 &&
+              linux_robust_list_ok(CTID, 32) == 0 &&
+              linux_robust_list_ok(0, LINUX_ROBUST_LIST_HEAD_BYTES) == 0 &&
+              linux_robust_list_ok(CTID + 4, LINUX_ROBUST_LIST_HEAD_BYTES) == 0 &&
+              linux_robust_list_ok(0x0000800000000000ull,
+                                   LINUX_ROBUST_LIST_HEAD_BYTES) == 0,
+              "set_robust_list takes exactly the 24-byte, 8-aligned, canonical head — a foreign sizeof is refused by name");
+
+        const uint32_t T = 117u;
+        CHECK(linux_robust_died_word(0, T) == 0,
+              "an unlocked robust futex is nobody's: a dying thread leaves it 0");
+        CHECK(linux_robust_died_word(T, T) ==
+              (LINUX_FUTEX_OWNER_DIED | T),
+              "a word this thread owns becomes OWNER_DIED|tid");
+        CHECK(linux_robust_died_word(0x80000000u | 9u, T) == 0,
+              "a word another thread owns is left alone (its owner's death is not ours to mark)");
+        CHECK(linux_robust_died_word(LINUX_FUTEX_OWNER_DIED | T, T) ==
+              (LINUX_FUTEX_OWNER_DIED | T),
+              "an already-marked word round-trips: the mark survives a second walk");
+
+        uint64_t a = 0;
+        CHECK(linux_robust_word_addr(0x0000700000001000ull, 8, &a) == 0 &&
+              a == 0x0000700000001008ull,
+              "a positive futex_offset moves the word forward from the entry");
+        CHECK(linux_robust_word_addr(0x0000700000001000ull, -8, &a) == 0 &&
+              a == 0x0000700000000ff8ull,
+              "glibc's negative futex_offset moves it back (the mutex's lock word before its list node)");
+        CHECK(linux_robust_word_addr(0x10, -0x20, &a) == -LINUX_EINVAL,
+              "a negative offset that would underflow the entry is refused, not wrapped into a kernel write");
+        CHECK(linux_robust_word_addr(0x00007fffffffffffull, 0x1000, &a) ==
+              -LINUX_EINVAL,
+              "an offset that leaves the canonical user range is refused");
+        CHECK(linux_robust_word_addr(0x0000700000001000ull, 8, 0) == -LINUX_EINVAL,
+              "a NULL output is refused");
     }
 
     /* ── 6. Group membership ─────────────────────────────────────────────── */

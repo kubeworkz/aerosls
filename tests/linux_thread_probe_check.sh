@@ -44,6 +44,21 @@ grep -qF 'crate::e7_thread_probe::spawn' user/sidecar/src/entry.rs \
     && sok "the sidecar boot spawns the thread probe through the real create" \
     || sbad "entry.rs no longer spawns e7_thread_probe"
 
+# I5's source shape: the pthread pair at syscall level — CLEARTID with its
+# word in args[3], set_robust_list with the 24-byte head, and both markers.
+TFIX=user/sidecar/fixtures/e7_thread_probe.S
+grep -qF 'mov     $0x002D0F00, %edi' "$TFIX" \
+    && grep -qF 'lea     0x18(%r12), %r10' "$TFIX" \
+    && sok "the fixture's clone carries CLONE_CHILD_CLEARTID and names the shared tid word" \
+    || sbad "the fixture lost the CLEARTID flag or the word it names"
+grep -qF 'mov     $273, %eax' "$TFIX" \
+    && grep -qF 'mov     $24, %esi' "$TFIX" \
+    && sok "the fixture registers a robust list with the 24-byte head" \
+    || sbad "the fixture no longer calls set_robust_list(273) with sizeof(struct robust_list_head)"
+grep -qF 'E7TG-CTID-OK' "$TFIX" && grep -qF 'E7TG-ROBUST-OK' "$TFIX" \
+    && sok "the fixture carries both I5 markers" \
+    || sbad "the fixture lost E7TG-CTID-OK or E7TG-ROBUST-OK"
+
 [ "$src_fails" -eq 0 ] || { echo "linux_thread_probe_check: $src_fails source failure(s)"; exit 1; }
 
 [ -f sls_operating_system.iso ] || {
@@ -134,6 +149,30 @@ if grep -aqF 'E7TG-FAIL' "$LOG"; then
     bad "the probe reported E7TG-FAIL"
 else
     ok "no E7TG-FAIL marker"
+fi
+
+# ─── I5: the thread-exit glue, live ──────────────────────────────────────
+# The child exited with exit(60), so the kernel — not the sidecar, not the
+# test — had to clear the tid word its joiner was parked on and mark the
+# robust word it owned. Both markers are written by the PARENT after it read
+# those words back, so they cannot be produced by the kernel alone.
+grep -aqF 'E7TG-CTID-OK' "$LOG" \
+    && ok "E7TG-CTID-OK: the child's exit cleared the tid word its joiner was waiting on" \
+    || bad "no E7TG-CTID-OK: CLONE_CHILD_CLEARTID did not clear the joiner's word"
+grep -aqF 'E7TG-ROBUST-OK' "$LOG" \
+    && ok "E7TG-ROBUST-OK: the exit left FUTEX_OWNER_DIED|tid on the mutex word the dead thread owned" \
+    || bad "no E7TG-ROBUST-OK: set_robust_list's entry was not walked or not marked"
+
+if [ -n "$ctid" ]; then
+    grep -aqF "[E7] clear-TID: TID $ctid word " "$LOG" \
+        && ok "the kernel logged the clear for the child's own TID ($ctid)" \
+        || bad "no '[E7] clear-TID: TID $ctid' line — the exit glue never ran for the child"
+    grep -aqF "[E7] set_robust_list: TID $ctid head=" "$LOG" \
+        && ok "the kernel recorded the child's robust list head (273 is kernel-local)" \
+        || bad "no '[E7] set_robust_list: TID $ctid' line"
+    grep -aqE "\[E7\] robust list: TID $ctid walked 1 entries, released [1-9]" "$LOG" \
+        && ok "the kernel's walk found exactly the one entry and released it (FUTEX_OWNER_DIED)" \
+        || bad "the robust walk did not report one walked and released entry for TID $ctid"
 fi
 
 clone_line="$(grep -a '\[E7\] clone: TID ' "$LOG" | head -1)"
