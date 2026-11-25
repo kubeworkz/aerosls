@@ -123,17 +123,30 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LIVE=0
 TEETH=0
 SELF=0
+GROUP=0
 REPLAY=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --live)     LIVE=1; shift ;;
         --teeth)    TEETH=1; shift ;;
         --selfkill) SELF=1; shift ;;
+        --group)    GROUP=1; shift ;;
         --replay)   REPLAY="${2:-}"; shift 2 ;;
-        -*)         echo "ABORT: unknown argument '$1' (usage: $0 [ROOT] [--live|--teeth|--selfkill] [--replay DIR])" >&2; exit 2 ;;
+        -*)         echo "ABORT: unknown argument '$1' (usage: $0 [ROOT] [--live|--teeth|--selfkill|--group] [--replay DIR])" >&2; exit 2 ;;
         *)          ROOT="$1"; shift ;;
     esac
 done
+
+# TG-2d runs the two-thread arm on one CPU: the whole-group stop is then a
+# property of the futex state, not of which core happened to schedule the
+# sidecar. (A sidecar scheduled on an AP answers cap_current_pid()=0 by
+# design, so a create from there is refused; the group gate does not test
+# SMP placement.) Other arms keep the established two-core boot.
+if [ "$GROUP" -eq 1 ]; then
+    SMP="${E7G_SMP:-1}"
+else
+    SMP="${E7G_SMP:-2}"
+fi
 cd "$ROOT" || exit 2
 
 fails=0
@@ -722,7 +735,7 @@ if [ -n "$REPLAY" ]; then
     exit 0
 fi
 
-if [ "$LIVE" -eq 0 ] && [ "$TEETH" -eq 0 ] && [ "$SELF" -eq 0 ]; then
+if [ "$LIVE" -eq 0 ] && [ "$TEETH" -eq 0 ] && [ "$SELF" -eq 0 ] && [ "$GROUP" -eq 0 ]; then
     if [ "$fails" -ne 0 ]; then
         echo "e7_gate_check: $fails clause(s) failed"
         exit 1
@@ -732,7 +745,10 @@ if [ "$LIVE" -eq 0 ] && [ "$TEETH" -eq 0 ] && [ "$SELF" -eq 0 ]; then
 fi
 
 # ─── The live arms ─────────────────────────────────────────────────────────
-if [ "$LIVE" -eq 1 ]; then
+if [ "$GROUP" -eq 1 ]; then
+    DRILL=0
+    ISO="${E7G_ISO:-sls_operating_system_e3_group.iso}"
+elif [ "$LIVE" -eq 1 ]; then
     DRILL="${E7G_DRILL:-1}"
     ISO="${E7G_ISO:-sls_operating_system_e3_drill.iso}"
 elif [ "$SELF" -eq 1 ]; then
@@ -789,7 +805,12 @@ esac
 TOOTH_MAKE=""
 [ "$TOOTH_BUILD" = "1" ] && TOOTH_MAKE=1
 if [ "$BUILD" = "1" ]; then
-    if [ "$SELF" -eq 1 ]; then
+    if [ "$GROUP" -eq 1 ]; then
+        echo "=== build: x86-iso-e3 E3_INIT_FEATURES=e3_envs,e7_gate E7_GROUP_CKPT=1 X86_E3_ISO=$ISO ==="
+        make x86-iso-e3 E3_INIT_FEATURES=e3_envs,e7_gate E7_GROUP_CKPT=1 \
+            E7_SLOW_BOOT=0 E7_TOOTH= X86_E3_ISO="$ISO" || \
+            fail "the group checkpoint image did not build"
+    elif [ "$SELF" -eq 1 ]; then
         echo "=== build: x86-iso-e3 E3_INIT_FEATURES=e3_envs,e7_gate E7_SELFKILL=1 X86_E3_ISO=$ISO ==="
         make x86-iso-e3 E3_INIT_FEATURES=e3_envs,e7_gate E7_SELFKILL=1 \
             X86_E3_ISO="$ISO" || fail "the self-kill image did not build"
@@ -815,7 +836,7 @@ boot() {   # boot <log> <tag> -> sets QPID, PORT
         -device nvme,drive=disk,serial=slsdev0 \
         -netdev user,id=net0,hostfwd=tcp:127.0.0.1:$PORT-:3000 \
         -device e1000,netdev=net0,mac=52:54:00:12:34:07 \
-        -display none -m 1G -smp 2 -boot d -monitor none \
+        -display none -m 1G -smp "$SMP" -boot d -monitor none \
         -accel tcg,thread=multi \
         -serial pipe:"$ser" 2>"$ART/${tag}_qerr.txt" &
     QPID=$!
@@ -918,6 +939,20 @@ gate_capture() {
     fi
     [ "$spawned" -eq 1 ] || fail "the gate tenant never spawned"
 
+    if [ "$GROUP" -eq 1 ]; then
+        # TG-2d's deterministic point: the kernel prints this line only after
+        # every member of the gate group is parked on the same futex word, so
+        # the capture that follows sees a coherent FORM_FUTEX barrier.
+        for i in $(seq 1 480); do
+            grep -aqF "[E7-GATE] group barrier:" "$L1" && { held=1; break; }
+            kill -0 "$QPID" 2>/dev/null || fail "QEMU exited before the group barrier formed"
+            sleep 0.5
+        done
+        [ "$held" -eq 1 ] || fail "the two-thread tenant never reached its futex barrier"
+        grep -aF "[E7-GATE] group barrier:" "$L1" | tail -1
+        echo "--- worker/main markers before capture:"
+        grep -aE "G2-(START|TIDS|SHARED-WRITE|BARRIER|WORKER-READY)" "$L1" | tail -8
+    else
     # The checkpoint is armed at the tenant's OWN continuation (the fourth
     # 64 KiB read, src_off=196608), which the kernel holds before forwarding;
     # waiting for that line is what makes the captured posture deterministic
@@ -931,6 +966,7 @@ gate_capture() {
     grep -aF "[E7-GATE] held" "$L1" | tail -1
     echo "--- reads before the stop:"
     grep -aF "[E7-GATE] read off=" "$L1" | tail -5
+    fi
 
     api "$WD/checkpoint.json" -X POST "$BASE/api/checkpoint" || fail "POST /api/checkpoint"
     echo "checkpoint: $(cat "$WD/checkpoint.json")"
@@ -1000,7 +1036,11 @@ gate_replay() {   # gate_replay <log> <tag> <body> <artifact-dir>
 
     local i
     for i in $(seq 1 $((WINDOW_S * 2))); do
-        grep -aq "frame(s) freed" "$log" && break
+        if [ "$GROUP" -eq 1 ]; then
+            grep -aqF "G2-DONE" "$log" && break
+        else
+            grep -aq "frame(s) freed" "$log" && break
+        fi
         grep -aqF "[FAULT]" "$log" && break
         kill -0 "$QPID" 2>/dev/null || fail "QEMU exited before the workload concluded ($tag)"
         sleep 0.5
@@ -1013,7 +1053,11 @@ gate_replay() {   # gate_replay <log> <tag> <body> <artifact-dir>
     echo "--- payload lines:"
     grep -aF "[ENV_PAYLOAD]" "$log" | tail -6
     echo "--- tenant lines (boot 2):"
-    grep -aE "\[backup\]|\[E7\] linux|\[FAULT\]" "$log" | tail -12
+    if [ "$GROUP" -eq 1 ]; then
+        grep -aE "G2-|\[E7\] linux|\[E7\] group exit|\[FAULT\]" "$log" | tail -20
+    else
+        grep -aE "\[backup\]|\[E7\] linux|\[FAULT\]" "$log" | tail -12
+    fi
     echo "--- copies (boot 2): $(grep -acF '[backup] Copying' "$log")  done (boot 2): $(grep -acF '[backup] Done:' "$log")  faults (boot 2): $(grep -acF '[FAULT]' "$log")"
 
     {
@@ -1023,8 +1067,102 @@ gate_replay() {   # gate_replay <log> <tag> <body> <artifact-dir>
         echo "payload_skips=$(jval "$ard/restore.json" payload_skips)"
         echo "tooth=$(jval "$ard/restore.json" tooth)"
         echo "partition=$PID"
+        echo "group=$GROUP"
     } > "$ard/facts"
     [ -f "$ard/boot2.log" ] || fail "boot 2's serial log was not recorded"
+}
+
+assert_group() {   # TG-2d: the two-thread barrier replay
+    local d="$1" b1="$1/boot1.log" b2="$1/boot2.log"
+    local gl gid threads cap0 cap1 ad0 ad1 rsp0 rsp1 rel tmo sum n
+    if [ ! -f "$b1" ] || [ ! -f "$b2" ]; then
+        bad "G2.0. the group recording needs boot1.log and boot2.log in $d"
+        return
+    fi
+
+    gl=$(grep -aF "[E7-GATE] group barrier:" "$b1" | tail -1)
+    gid=$(printf '%s\n' "$gl" | sed -n 's/.*group=\([0-9][0-9]*\).*/\1/p')
+    threads=$(printf '%s\n' "$gl" | sed -n 's/.*threads=\([0-9][0-9]*\).*/\1/p')
+    if [ -n "$gid" ] && [ "$threads" = "2" ]; then
+        ok "G2.1a. the kernel saw the whole group at one barrier before the checkpoint (group=$gid threads=2)"
+    else
+        bad "G2.1a. no 'group barrier' line with two threads — the capture was not taken at a coherent group stop (line: ${gl:-none})"
+    fi
+
+    cap0=$(grep -aF "capture: task" "$b1" | grep -aF "group=$gid thread=0" | \
+           grep -aF "kind=2" | grep -aF "form=4" | tail -1)
+    cap1=$(grep -aF "capture: task" "$b1" | grep -aF "group=$gid thread=1" | \
+           grep -aF "kind=2" | grep -aF "form=4" | tail -1)
+    if [ -n "$cap0" ] && [ -n "$cap1" ]; then
+        ok "G2.1b. both group threads were captured as FORM_FUTEX with their recorded indexes (thread 0 and 1)"
+    else
+        bad "G2.1b. the capture does not carry two kind=2/form=4 tasks for group ${gid:-?} — one thread is missing or was recorded as runnable"
+    fi
+
+    if grep -aqF "restore group $gid: created 1 held sibling(s) on one root" "$b2" && \
+       grep -aqF "HELD sibling for restore group=$gid thread=1" "$b2"; then
+        ok "G2.2. the replay create built the recorded sibling under the leader's group and one root before the pour"
+    else
+        bad "G2.2. the replay create did not build the held sibling at thread 1 under group $gid — the payload would have no second descriptor to adopt"
+    fi
+
+    ad0=$(grep -aF "linux task 'e7.gate.user.0' adopted at" "$b2" | \
+          grep -aF "group=$gid thread=0" | grep -aF "form=4" | tail -1)
+    ad1=$(grep -aF "linux task 'e7.gate.user.0' adopted at" "$b2" | \
+          grep -aF "group=$gid thread=1" | grep -aF "form=4" | tail -1)
+    rsp0=$(printf '%s\n' "$ad0" | sed -n 's/.* rsp=\(0x[0-9a-fA-F]*\).*/\1/p')
+    rsp1=$(printf '%s\n' "$ad1" | sed -n 's/.* rsp=\(0x[0-9a-fA-F]*\).*/\1/p')
+    if [ -n "$ad0" ] && [ -n "$ad1" ] && [ -n "$rsp0" ] && [ -n "$rsp1" ] && [ "$rsp0" != "$rsp1" ]; then
+        ok "G2.3. both captured contexts were installed (leader rsp=$rsp0, sibling rsp=$rsp1), each on its own stack"
+    else
+        bad "G2.3. the replay did not adopt two distinct FORM_FUTEX contexts (leader='${ad0:-none}', sibling='${ad1:-none}')"
+    fi
+
+    rel=$(grep -aF "restored group $gid released 2 held threads together" "$b2" | tail -1)
+    tmo=$(grep -anF "G2-WORKER-TIMEOUT r=-110" "$b2" | head -1 | cut -d: -f1)
+    rel_l=$(grep -anF "restored group $gid released 2 held threads together" "$b2" | head -1 | cut -d: -f1)
+    if [ -n "$rel" ] && [ -n "$tmo" ] && [ -n "$rel_l" ] && [ "$tmo" -gt "$rel_l" ]; then
+        ok "G2.4. the barrier was restored as a wait: the group was released as one, and the worker's re-armed timeout woke it later (line $tmo after release line $rel_l)"
+    else
+        bad "G2.4. no group release followed by a worker timeout — the barrier was not re-enqueued, or a thread ran before the barrier"
+    fi
+
+    # Presence, not a line count: the serial trace can append a truncated
+    # echo of the same write to the marker's line, which is still one write.
+    if grep -aqF 'G2-SHARED=1' "$b2" && \
+       grep -aqF "G2-WORKER-WAKE w=1" "$b2" && \
+       grep -aqF "G2-MAIN-WAKE r=0" "$b2"; then
+        ok "G2.5. the pre-barrier write is visible to the sibling after restore, and the restored worker's wake reached main (w=1, main r=0)"
+    else
+        bad "G2.5. the sibling did not observe the leader's pre-barrier write, or the restored wake pair is incomplete"
+    fi
+
+    # The kernel's write trace appends a TRUNCATED copy of the same line, so
+    # take the first full 64-bit value, not the last match on the line.
+    sum=$(grep -aoE 'G2-SUM=0x[0-9a-fA-F]{16}' "$b2" | head -1 | cut -d= -f2)
+    if grep -aqF "G2-COPY=65536" "$b2" && [ "$sum" = "0xa97a7a6074da2325" ] && \
+       grep -aqF "G2-DONE" "$b2"; then
+        ok "G2.6. the resumed copy completed with the staged 64 KiB and its expected FNV-1a checksum ($sum)"
+    else
+        bad "G2.6. the resumed copy did not finish with copy=65536/sum=0xa97a7a6074da2325 (got '${sum:-none}')"
+    fi
+
+    n=$(grep -acF "[E7] group exit: group $gid" "$b2")
+    if [ "$n" -eq 1 ] && grep -aqF "torn down once" "$b2"; then
+        ok "G2.7. the group tore down exactly once after the copy"
+    else
+        bad "G2.7. expected exactly one group teardown, found $n — two roots/cap tables or a missing teardown"
+    fi
+
+    if grep -aqF '"ok":"true"' "$d/restore.json" && \
+       [ "$(fact "$d" payloads)" = "1" ] && \
+       [ "$(fact "$d" payload_skips)" = "0" ] && \
+       ! grep -aqF "[FAULT]" "$b2" && \
+       [ "$(grep -acF '[E7] clone:' "$b2")" -eq 0 ]; then
+        ok "G2.8. the restore poured (payloads=1, skips=0), no fault and no second clone/start — the resumed group did not restart"
+    else
+        bad "G2.8. the group replay did not pour cleanly, faulted, or cloned again (payloads=$(fact "$d" payloads), skips=$(fact "$d" payload_skips))"
+    fi
 }
 
 # ─── The self-kill arm: the deferred branch, observed live ─────────────────
@@ -1117,6 +1255,24 @@ if [ "$SELF" -eq 1 ]; then
         exit 1
     fi
     echo "e7_gate_check: the self-kill case is observed — deferred while RUNNING, torn down and scanned by the scheduler; artifacts in $ART"
+    exit 0
+fi
+
+if [ "$GROUP" -eq 1 ]; then
+    rm -f "$IMG"
+    truncate -s 10G "$IMG" || fail "could not make the NVMe image"
+    gate_capture
+    L2="$ART/boot2.log"
+    gate_replay "$L2" group-two '{}' "$ART"
+
+    echo "=== TG-2d group clauses (the recording is reusable with --replay $ART) ==="
+    assert_group "$ART"
+
+    if [ "$fails" -ne 0 ]; then
+        echo "e7_gate_check: $fails group clause(s) failed; artifacts in $ART"
+        exit 1
+    fi
+    echo "e7_gate_check: the two-thread group replay passes — artifacts in $ART"
     exit 0
 fi
 

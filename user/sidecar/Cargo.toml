@@ -39,3 +39,6 @@ e7_slow_boot = []
 # spawn it from the system POSIX sidecar. Never a shipped profile; selected
 # only by `make x86-iso ...,E7_GO_GATE=1` and the live gate check.
 e7_go_gate = []
+# TG-2d's live two-thread checkpoint arm: compile the freestanding group
+# workload and spawn it from the gate tenant. Never a shipped profile.
+e7_group_ckpt = []

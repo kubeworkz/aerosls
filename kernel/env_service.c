@@ -531,11 +531,13 @@ int env_service_restore_pending(struct EnvSvcRestoreReport* out) {
          * must cover both, and the disarm waits for this environment's pour.
          * Only a record that names a Linux task arms anything. */
         int has_linux = es_record_has_linux(&w);
+        env_ckpt_linux_group_restore_hint(&w);
         if (has_linux) cap_linux_restore_arm(p);
 
         uint16_t status = ENV_ERR_INVAL;
         uint32_t new_id = 0;
         int rc = env_service_create(p, idx, &status, &new_id);
+        env_ckpt_linux_group_restore_hint_clear();
         if (rc != 0) {
             es_release_held_linux(&w);
             if (has_linux) cap_linux_restore_disarm(p);

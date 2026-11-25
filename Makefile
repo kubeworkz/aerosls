@@ -1116,6 +1116,11 @@ SIDECAR_SLOW_BOOT = $(if $(filter 1,$(E7_SLOW_BOOT)),--features aerosls-sidecar/
 # image; selected only by the live gate check's dedicated build.
 E7_GO_GATE ?=
 SIDECAR_GO_GATE = $(if $(filter 1,$(E7_GO_GATE)),--features aerosls-sidecar/e7_go_gate)
+# E7 TG-2d's live two-thread checkpoint arm: compile the freestanding group
+# fixture into the gate tenant's POSIX sidecar. Selected only by the checkpoint
+# gate's dedicated build.
+E7_GROUP_CKPT ?=
+SIDECAR_GROUP_CKPT = $(if $(filter 1,$(E7_GROUP_CKPT)),--features aerosls-sidecar/e7_group_ckpt)
 SIDECAR_INIT_ELF   ?= user/target/x86_64-unknown-none/release/init
 SIDECAR_DM_ELF     ?= user/target/x86_64-unknown-none/release/dm
 SIDECAR_POSIX_ELF ?= user/target/x86_64-unknown-none/release/posix
@@ -1176,7 +1181,7 @@ selfhost-bootimage:
 	@# aerosls-bootimage directly; a stamp is only for an archive this target
 	@# built.) tests/sidecar_stamp_check.sh clause G holds this line.
 	@$(CARGO) build --quiet --manifest-path user/Cargo.toml -p aerosls-dm -p aerosls-sidecar -p aerosls-ramdisk -p aerosls-network -p aerosls-e1000-driver \
-		--features target $(SIDECAR_SLOW_BOOT) $(SIDECAR_GO_GATE) --target x86_64-unknown-none --release \
+		--features target $(SIDECAR_SLOW_BOOT) $(SIDECAR_GO_GATE) $(SIDECAR_GROUP_CKPT) --target x86_64-unknown-none --release \
 		--bin dm --bin posix --bin ramdisk --bin network --bin e1000_driver \
 		|| { echo "[SELFHOST] REFUSING to pack and stamp: the sidecars did not build for x86_64-unknown-none." >&2; \
 		     echo "           The stamp attests the packed binaries, and reusing existing ones would make it a lie." >&2; \

@@ -26,6 +26,7 @@
 
 #include "linux_thread.h"
 #include "linux_abi.h"
+#include "linux_futex.h"
 #include "process.h"
 
 /* Declared directly rather than through cap.h/user_paging.h: this file is
@@ -104,6 +105,7 @@ void linux_groups_init(void) {
         g->exiting = 0;
         g->live_threads = 0;
         g->fwd_busy = 0;
+        g->barrier_reported = 0;
         g->group_id = 0;
         g->leader_pid = 0;
         g->cap_owner_pid = 0;
@@ -123,10 +125,15 @@ void linux_groups_init(void) {
 }
 
 struct LinuxThreadGroup* linux_group_of(const struct ProcessDescriptor* pd) {
-    if (!pd) return 0;
+    if (!pd || pd->tid == 0) return 0;
     if (pd->group_index >= (uint32_t)PROC_MAX) return 0;
     struct LinuxThreadGroup* g = &linux_group_table[pd->group_index];
     if (!g->used) return 0;
+    /* A descriptor's group_index is meaningful only for a live thread whose
+     * group id is this group's: the control plane and boot parent are zeroed
+     * descriptors, and a zeroed group_index must not alias group table slot 0
+     * (which the first tenant happens to occupy). */
+    if (pd->tgid != g->group_id) return 0;
     return g;
 }
 
@@ -197,6 +204,50 @@ int linux_group_add_thread(struct LinuxThreadGroup* g) {
     if (g->live_threads >= LINUX_THREADS_MAX) return -1;
     g->live_threads++;
     return 0;
+}
+
+int linux_group_join_restored_thread(struct LinuxThreadGroup* g,
+                                     struct ProcessDescriptor* child,
+                                     uint16_t thread_index) {
+    if (!g || !child || !g->used || g->exiting) return -1;
+    if (child->pid == 0) return -1;
+    if (child->group_index != LINUX_GROUP_NONE) return -1;
+    if (thread_index == 0 || thread_index >= LINUX_THREADS_MAX) return -1;
+    if (g->live_threads >= LINUX_THREADS_MAX) return -1;
+    for (int i = 0; i < PROC_MAX; i++) {
+        if (!proc_table[i].active) continue;
+        if (proc_table[i].group_index != (uint32_t)(g - linux_group_table))
+            continue;
+        if (proc_table[i].thread_index == thread_index) return -1;
+    }
+    if (linux_group_add_thread(g) != 0) return -1;
+    child->cr3 = g->cr3;
+    child->tid = child->pid;
+    child->tgid = g->group_id;
+    child->thread_index = thread_index;
+    child->group_index = (uint32_t)(g - linux_group_table);
+    child->is_group_leader = 0;
+    child->sysret_result = 0;
+    if ((uint32_t)thread_index + 1u > g->next_thread_index)
+        g->next_thread_index = (uint32_t)thread_index + 1u;
+    return 0;
+}
+
+uint32_t linux_group_futex_barrier_complete(struct LinuxThreadGroup* g,
+                                            uint64_t uaddr) {
+    if (!g || !g->used || g->exiting || uaddr == 0) return 0;
+    uint32_t live = 0;
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct ProcessDescriptor* pd = &proc_table[i];
+        if (!pd->active || linux_group_of(pd) != g) continue;
+        live++;
+        if (pd->state != PROC_BLOCKED) return 0;
+        if (pd->park_syscall != SYS_LINUX_FUTEX_RESUME) return 0;
+        struct LinuxFutexWaitInfo info;
+        if (!linux_futex_waiter_info(pd->tid, &info)) return 0;
+        if (info.group_id != g->group_id || info.uaddr != uaddr) return 0;
+    }
+    return (live == (uint32_t)g->live_threads) ? live : 0;
 }
 
 int linux_group_leave_thread(struct LinuxThreadGroup* g) {
@@ -281,6 +332,7 @@ int linux_group_fwd_release(struct LinuxThreadGroup* g, uint32_t tid) {
     if (!g || !g->used || tid == 0) return -1;
     if (!g->fwd_busy || g->fwd_owner_tid != tid) return -1;
     g->fwd_busy = 0;
+    g->barrier_reported = 0;
     g->fwd_owner_tid = 0;
     return 0;
 }

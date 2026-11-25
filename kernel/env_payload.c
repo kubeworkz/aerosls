@@ -573,14 +573,14 @@ static int ep_name_eq(const char* a, const char* b) {
 /* A group's members share their name, so the name-only lookup cannot tell
  * which sibling a record entry names. TG-2b's identity is the stable
  * (group id, thread index) pair the group layer assigned at clone. */
-static struct ProcessDescriptor* ep_find_group_member(uint32_t group_id,
+static struct ProcessDescriptor* ep_find_group_member(const char* name,
                                                       uint16_t thread_index,
                                                       uint8_t leader) {
-    struct LinuxThreadGroup* g = linux_group_find(group_id);
-    if (!g) return 0;
+    if (!name) return 0;
     for (int i = 0; i < PROC_MAX; i++) {
         struct ProcessDescriptor* pd = &proc_table[i];
-        if (!pd->active || linux_group_of(pd) != g) continue;
+        if (!pd->active || !linux_group_of(pd)) continue;
+        if (!ep_name_eq(pd->name, name)) continue;
         if (pd->thread_index != thread_index) continue;
         if (pd->is_group_leader != leader) continue;
         return pd;
@@ -591,7 +591,7 @@ static struct ProcessDescriptor* ep_find_group_member(uint32_t group_id,
 static struct ProcessDescriptor* ep_find_ckpt_task(
         const struct EnvCkptTask* tk) {
     if (tk->kind == ENV_CKPT_TASK_LINUX && tk->group_id != 0)
-        return ep_find_group_member(tk->group_id, tk->thread_index,
+        return ep_find_group_member(tk->name, tk->thread_index,
                                     tk->leader);
     return ep_find_proc(tk->name);
 }
@@ -599,7 +599,7 @@ static struct ProcessDescriptor* ep_find_ckpt_task(
 static struct ProcessDescriptor* ep_find_payload_task(
         const struct EnvPayloadTask* tk) {
     if (tk->kind == ENV_CKPT_TASK_LINUX && tk->group_id != 0)
-        return ep_find_group_member(tk->group_id, tk->thread_index,
+        return ep_find_group_member(tk->name, tk->thread_index,
                                     tk->leader);
     return ep_find_proc(tk->name);
 }
@@ -2166,7 +2166,10 @@ int env_payload_restore(uint32_t partition, uint32_t index,
                  * is relative; the absolute deadline is this boot's tick
                  * counter plus the remainder. */
                 if (tk.form == ENV_PAYLOAD_FORM_FUTEX) {
-                    uint32_t fgid = tk.group_id ? tk.group_id : pd->tgid;
+                    /* The group id in the blob is the OLD boot's leader pid;
+                     * the waiter table is keyed by this boot's group. The
+                     * barrier identity is (uaddr, value), not that pid. */
+                    uint32_t fgid = pd->tgid;
                     uint64_t deadline = tk.futex_ticks
                                             ? kernel_tick_counter + tk.futex_ticks
                                             : 0;

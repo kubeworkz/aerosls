@@ -89,6 +89,8 @@ static int ec_region_kind_ok(uint32_t k) {
            k == ENV_CKPT_REGION_RD_STORAGE;
 }
 
+static int ec_name_eq(const char* a, const char* b);
+
 /* TG-2a: a Linux task's group identity is either entirely absent (the slot
  * was registered but its task has not spawned yet) or complete and coherent:
  * exactly one leader at index 0, siblings at 1..MAX_THREADS-1, one group id
@@ -278,6 +280,14 @@ int env_ckpt_register_from(const struct EnvCkptRegister* reg,
     struct EnvCkptRecord rec;
     ec_memset(&rec, 0, (uint32_t)sizeof rec);
 
+    /* TG-2d: a replay's create upserts (partition, index) and would otherwise
+     * erase the captured sibling slots that the sibling constructor needs
+     * while the create is still running. The leader is re-named by init; the
+     * siblings are kernel-discovered, so carry them across the upsert. */
+    const struct EnvCkptRecord* old = 0;
+    int old_slot = ec_find_slot(reg->partition_id, reg->index);
+    if (old_slot >= 0) old = &env_ckpt_table[old_slot];
+
     // The kernel's own half: this build's format, and the sequence this
     // registration belongs to. init cannot state either, and if it could, it
     // would be the drift this file is arranged against.
@@ -313,6 +323,39 @@ int env_ckpt_register_from(const struct EnvCkptRegister* reg,
         // The restore layer owns re-creating the sidecar -- and therefore knows
         // the stack it just mapped. Inventing a number here would put a wrong
         // address in a record whose whole purpose is to be trusted.
+    }
+    if (old && old->magic == ENV_CKPT_REC_MAGIC) {
+        uint32_t old_group = 0;
+        const char* old_leader = 0;
+        for (uint32_t t = 0; t < old->n_tasks && t < ENV_CKPT_MAX_TASKS; t++) {
+            const struct EnvCkptTask* st = &old->tasks[t];
+            if (st->kind != ENV_CKPT_TASK_LINUX) continue;
+            if (st->leader) {
+                old_group = st->group_id;
+                old_leader = st->name;
+                continue;
+            }
+            if (st->thread_index == 0) continue;
+            if (rec.n_tasks >= ENV_CKPT_MAX_TASKS) {
+                ec_refuse(ENV_CKPT_REFUSE_BAD_TASKS, rec.n_tasks, ENV_CKPT_MAX_TASKS);
+                return ENV_CKPT_REFUSE_BAD_TASKS;
+            }
+            rec.tasks[rec.n_tasks++] = *st;
+        }
+        /* A leader slot init re-names carries its captured group identity
+         * too, or the preserved siblings would make the record invalid
+         * (a grouped task with no leader). The live create's group stamp is
+         * what gives it this boot's id. */
+        if (old_group != 0 && old_leader) {
+            for (uint32_t t = 0; t < rec.n_tasks; t++) {
+                struct EnvCkptTask* tk = &rec.tasks[t];
+                if (tk->kind != ENV_CKPT_TASK_LINUX) continue;
+                if (tk->thread_index != 0 || tk->group_id != 0) continue;
+                if (!ec_name_eq(tk->name, old_leader)) continue;
+                tk->group_id = old_group;
+                tk->leader = 1;
+            }
+        }
     }
 
     // P1b: the descriptor NAMES the durable store. Looked up by the identity
@@ -379,8 +422,12 @@ int env_ckpt_linux_task_stamp(uint32_t partition_id,
         int parent_slot = -1, linux_slot = -1;
         for (uint32_t t = 0; t < rec->n_tasks && t < ENV_CKPT_MAX_TASKS; t++) {
             if (rec->tasks[t].kind == ENV_CKPT_TASK_LINUX) {
-                if (linux_slot >= 0) { linux_slot = -1; break; }  /* two slots: no single task to stamp */
-                linux_slot = (int)t;
+                /* The create stamps the LEADER's entry/stack. A preserved
+                 * sibling shares its name, so pick thread index 0: before
+                 * the group stamp the leader is the only zero-index Linux
+                 * slot, and after it the sibling is marked with index > 0. */
+                if (rec->tasks[t].thread_index == 0)
+                    linux_slot = (int)t;
             } else if (ec_name_eq(rec->tasks[t].name, parent_name)) {
                 parent_slot = (int)t;
             }
@@ -439,13 +486,32 @@ int env_ckpt_linux_group_stamp(uint32_t partition_id,
         }
         if (parent_slot < 0 || linux_slot < 0) continue;
         struct EnvCkptTask* tk = &rec->tasks[linux_slot];
-        if (tk->group_id != 0 && tk->group_id != group_id) return 0;
+        if (!is_leader && tk->group_id != 0 && tk->group_id != group_id) return 0;
         struct EnvCkptTask saved = *tk;
         tk->group_id     = group_id;
         tk->thread_index = thread_index;
         tk->leader       = is_leader ? 1u : 0u;
+        /* The group id is boot-local (it is the old leader's pid). A replay's
+         * create stamps the NEW id on the leader, so the captured sibling
+         * slots must move with it or every later lookup by group would find
+         * only the leader. Thread index and name are the stable identities. */
+        uint32_t sib_slots[ENV_CKPT_MAX_TASKS];
+        uint32_t sib_old[ENV_CKPT_MAX_TASKS];
+        uint32_t n_sib = 0;
+        for (uint32_t t = 0; t < rec->n_tasks && t < ENV_CKPT_MAX_TASKS; t++) {
+            struct EnvCkptTask* st = &rec->tasks[t];
+            if (st == tk) continue;
+            if (st->kind != ENV_CKPT_TASK_LINUX || st->leader) continue;
+            if (!ec_name_eq(st->name, child_name)) continue;
+            sib_slots[n_sib] = t;
+            sib_old[n_sib] = st->group_id;
+            n_sib++;
+            st->group_id = group_id;
+        }
         if (env_ckpt_valid(rec) != ENV_CKPT_REFUSE_NONE) {
             *tk = saved;
+            for (uint32_t s = 0; s < n_sib; s++)
+                rec->tasks[sib_slots[s]].group_id = sib_old[s];
             return 0;
         }
         ckpt_mark_dirty(CKPT_REGION_ENV);
@@ -567,6 +633,85 @@ int env_ckpt_linux_group_thread_drop(uint32_t partition_id,
                 (unsigned)rec->n_tasks);
             return 1;
         }
+    }
+    return 0;
+}
+
+/* One record's sibling indexes for a group. -2 means this record is not that
+ * group (or not a record at all), -1 that it is malformed for this purpose
+ * (duplicate/zero/overflowing index), 0 that it names the leader but no
+ * siblings, and >0 the count written to out. */
+static int ec_group_indexes_in(const struct EnvCkptRecord* rec,
+                               uint32_t partition_id, const char* leader_name,
+                               uint32_t group_id, uint16_t* out, uint32_t cap,
+                               int match_group) {
+    if (!rec || rec->magic != ENV_CKPT_REC_MAGIC) return -2;
+    if (rec->partition_id != partition_id) return -2;
+    int leader_slot = -1;
+    for (uint32_t t = 0; t < rec->n_tasks && t < ENV_CKPT_MAX_TASKS; t++) {
+        const struct EnvCkptTask* tk = &rec->tasks[t];
+        if (tk->kind != ENV_CKPT_TASK_LINUX) continue;
+        if (match_group && tk->group_id != group_id)
+            continue;
+        if (tk->leader && ec_name_eq(tk->name, leader_name)) {
+            leader_slot = (int)t;
+            break;
+        }
+    }
+    if (leader_slot < 0) return -2;
+    uint32_t n = 0;
+    for (uint32_t t = 0; t < rec->n_tasks && t < ENV_CKPT_MAX_TASKS; t++) {
+        const struct EnvCkptTask* tk = &rec->tasks[t];
+        if (tk->kind != ENV_CKPT_TASK_LINUX) continue;
+        if (match_group && tk->group_id != group_id) continue;
+        if (!ec_name_eq(tk->name, leader_name)) continue;
+        if (tk->leader) continue;
+        if (tk->thread_index == 0 ||
+            tk->thread_index >= ENV_CKPT_MAX_THREADS) return -1;
+        for (uint32_t u = 0; u < n; u++)
+            if (out[u] == tk->thread_index) return -1;
+        if (n >= cap) return -1;
+        out[n++] = tk->thread_index;
+    }
+    return (int)n;
+}
+
+/* The replay create registers a FRESH record for (partition, index) before
+ * the sidecar reaches its spawn; that record names the sidecars and the
+ * leader but cannot know the captured siblings. Keep the replay's own copy
+ * of the record it is about to replace, so sibling construction still sees
+ * the thread set. Cleared when the restore pass ends. */
+static struct EnvCkptRecord ec_restore_group_hint;
+static uint8_t ec_restore_group_hint_valid;
+
+void env_ckpt_linux_group_restore_hint(const struct EnvCkptRecord* rec) {
+    if (!rec) { ec_restore_group_hint_valid = 0; return; }
+    ec_restore_group_hint = *rec;
+    ec_restore_group_hint_valid = 1;
+}
+
+void env_ckpt_linux_group_restore_hint_clear(void) {
+    ec_restore_group_hint_valid = 0;
+}
+
+int env_ckpt_linux_group_restore_indexes(uint32_t partition_id,
+                                         const char* leader_name,
+                                         uint32_t group_id,
+                                         uint16_t* out_indexes,
+                                         uint32_t cap) {
+    if (!out_indexes || cap == 0 || group_id == 0) return -1;
+    if (!leader_name) return 0;
+    for (uint32_t i = 0; i < env_ckpt_count; i++) {
+        int n = ec_group_indexes_in(&env_ckpt_table[i], partition_id,
+                                    leader_name, group_id, out_indexes, cap, 1);
+        if (n > 0) return n;
+        if (n == -1) return -1;
+    }
+    if (ec_restore_group_hint_valid) {
+        int n = ec_group_indexes_in(&ec_restore_group_hint, partition_id,
+                                    leader_name, group_id, out_indexes, cap, 0);
+        if (n > 0) return n;
+        if (n == -1) return -1;
     }
     return 0;
 }

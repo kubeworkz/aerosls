@@ -72,6 +72,7 @@ struct LinuxThreadGroup {
     uint8_t  exiting;          /* destroy is in progress (one shot) */
     uint8_t  live_threads;     /* leader + clones; the last-thread rule (I2) */
     uint8_t  fwd_busy;         /* one in-flight forward for the whole group */
+    uint8_t  barrier_reported; /* TG-2d: the gate group-barrier line was printed */
     uint32_t group_id;         /* == leader_pid; getpid()'s value */
     uint32_t leader_pid;       /* the descriptor whose identity stays valid */
     uint32_t cap_owner_pid;    /* descriptor whose cap table the group uses */
@@ -127,6 +128,24 @@ void linux_group_stamp_memory(struct ProcessDescriptor* pd,
 
 /* Admission for I2's clone: 0 when the group has room, -1 at the cap. */
 int linux_group_add_thread(struct LinuxThreadGroup* g);
+
+/* TG-2d: attach a descriptor the replay built for a captured sibling at its
+ * recorded stable index. Unlike linux_group_join_thread this does not choose
+ * the lowest free index: the payload lookup is `(group_id, thread_index)`, so
+ * a replay that renumbered the siblings would adopt every context into the
+ * wrong descriptor. Refuses index 0, a live duplicate, an exhausted group, and
+ * a descriptor that already belongs to a group; every refusal is before any
+ * table mutation. */
+int linux_group_join_restored_thread(struct LinuxThreadGroup* g,
+                                     struct ProcessDescriptor* child,
+                                     uint16_t thread_index);
+
+/* TG-2d: how many live members of `g` are BLOCKED in FUTEX_WAIT on exactly
+ * `uaddr` (0 when any member is elsewhere). The gate prints its checkpoint
+ * marker only when this is the whole group, so the line means "every thread
+ * is at the barrier" rather than "one thread arrived". */
+uint32_t linux_group_futex_barrier_complete(struct LinuxThreadGroup* g,
+                                            uint64_t uaddr);
 
 /* I2's departure half: drop one live thread. Returns 1 when this was the
  * group's LAST live thread (the caller owes the one group destroy), 0 while
@@ -203,6 +222,16 @@ void linux_clone_build_context(struct TaskContext* ctx, uint64_t parent_rip,
 int linux_clone_thread(struct ProcessDescriptor* parent,
                        const struct LinuxClonePlan* plan,
                        uint64_t parent_rip, uint32_t* out_tid);
+
+/* TG-2d: build the held siblings a replay's record names, under `leader`'s
+ * existing group and root, at the exact captured thread indexes. Every
+ * syscall stack is allocated before the first descriptor is touched, so a
+ * resource refusal leaves the process table unchanged. Returns 0, or -1 when
+ * the index set, group capacity or descriptor/stack resources do not allow the
+ * whole set. */
+int linux_restore_group_siblings(struct ProcessDescriptor* leader,
+                                 const uint16_t* thread_indexes,
+                                 uint32_t n);
 
 /* The group's ONE resource teardown: cap table twice-refused, page table
  * freed once, group slot released. The caller finishes the descriptor's own

@@ -30,6 +30,7 @@
 
 #include "kernel/process.h"
 #include "kernel/linux_thread.h"
+#include "kernel/linux_futex.h"
 
 static int checks_passed = 0;
 static int checks_failed = 0;
@@ -237,10 +238,66 @@ int main(void) {
         CHECK(g_cap_teardowns == 1 && g_page_teardowns == 1,
               "a second destroy is a no-op (no double free)");
         linux_group_clear_identity(&proc_table[0]);
+        linux_group_clear_identity(&proc_table[1]);
         CHECK(proc_table[0].tid == 0 && proc_table[0].tgid == 0 &&
               proc_table[0].group_index == LINUX_GROUP_NONE &&
               proc_table[0].is_group_leader == 0,
               "clearing the identity after destroy leaves no group index behind");
+    }
+
+    /* ── 7b. TG-2d: exact restore index, whole-group barrier, one release ── */
+    {
+        struct LinuxThreadGroup* g;
+        plant(&proc_table[3], 400, 0x44444000ull);
+        CHECK(linux_group_create(&proc_table[3]) == 0,
+              "a fresh restore leader creates its group");
+        g = linux_group_of(&proc_table[3]);
+        plant(&proc_table[4], 401, 0);
+        CHECK(linux_group_join_restored_thread(g, &proc_table[4], 3) == 0 &&
+              proc_table[4].thread_index == 3 &&
+              proc_table[4].tid == 401 && proc_table[4].tgid == 400 &&
+              proc_table[4].cr3 == 0x44444000ull &&
+              g->live_threads == 2 && g->next_thread_index == 4,
+              "a restored sibling joins at the RECORDED index, not the lowest free one");
+        plant(&proc_table[5], 402, 0);
+        CHECK(linux_group_join_restored_thread(g, &proc_table[5], 3) == -1 &&
+              proc_table[5].group_index == LINUX_GROUP_NONE &&
+              g->live_threads == 2,
+              "a duplicate recorded index is refused before any group mutation");
+        CHECK(linux_group_join_restored_thread(g, &proc_table[5], 0) == -1,
+              "thread index 0 is the leader and cannot be attached as a sibling");
+
+        linux_futex_init();
+        proc_table[3].state = PROC_BLOCKED;
+        proc_table[3].park_syscall = SYS_LINUX_FUTEX_RESUME;
+        proc_table[4].state = PROC_BLOCKED;
+        proc_table[4].park_syscall = SYS_LINUX_FUTEX_RESUME;
+        CHECK(linux_futex_wait_enqueue(400, 0x5000ull, 400, 0) == 0 &&
+              linux_futex_wait_enqueue(400, 0x5000ull, 401, 0) == 0,
+              "both restored threads enqueue on one barrier word");
+        CHECK(linux_group_futex_barrier_complete(g, 0x5000ull) == 2,
+              "the barrier predicate reports the whole group only when both waits share the word");
+        CHECK(linux_group_futex_barrier_complete(g, 0x6000ull) == 0,
+              "a different word is not the group's barrier");
+        proc_table[4].state = PROC_SUSPENDED;
+        CHECK(linux_group_futex_barrier_complete(g, 0x5000ull) == 0,
+              "one runnable member makes the group not-at-barrier");
+        proc_table[4].state = PROC_BLOCKED;
+        linux_futex_wait_cancel(401);
+        CHECK(linux_futex_wait_enqueue(400, 0x6000ull, 401, 0) == 0 &&
+              linux_group_futex_barrier_complete(g, 0x5000ull) == 0,
+              "members waiting on different words are not one barrier");
+
+        proc_table[3].restore_held = 1;
+        proc_table[4].restore_held = 1;
+        CHECK(linux_group_release_restored(400) == 2 &&
+              !proc_table[3].restore_held && !proc_table[4].restore_held &&
+              proc_table[3].state == PROC_BLOCKED &&
+              proc_table[4].state == PROC_BLOCKED,
+              "one release clears both holds and leaves both futex waiters BLOCKED");
+        linux_group_destroy(g);
+        CHECK(g_cap_teardowns == 2 && g_page_teardowns == 2,
+              "the restored group tears down once, after the one release");
     }
 
     /* ── 8. A group-less descriptor reads zero through every accessor ─────── */
@@ -273,7 +330,7 @@ int main(void) {
         for (int i = 0; i < PROC_MAX; i++)
             if (linux_group_table[i].used)
                 linux_group_destroy(&linux_group_table[i]);
-        CHECK(g_cap_teardowns == 1 + PROC_MAX && g_page_teardowns == 1 + PROC_MAX,
+        CHECK(g_cap_teardowns == 2 + PROC_MAX && g_page_teardowns == 2 + PROC_MAX,
               "each created group tears down once, and only once");
     }
 

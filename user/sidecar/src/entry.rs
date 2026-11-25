@@ -422,6 +422,8 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
      * "not a console"). The regular profiles reserve nothing. */
     let gate_reserve = if cfg!(feature = "e7_go_gate") {
         crate::e7_go_gate::GO_GATE_RESERVE
+    } else if cfg!(feature = "e7_group_ckpt") {
+        crate::e7_group_ckpt::GROUP_RESERVE
     } else {
         0
     };
@@ -579,7 +581,8 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
             }
         }
     }
-    if !cfg!(feature = "e7_go_gate") && (census_host || gate) && !e3_profile {
+    if !cfg!(feature = "e7_go_gate") && !cfg!(feature = "e7_group_ckpt") &&
+        (census_host || gate) && !e3_profile {
         if !gate {
             // E7 boot proof (Linux ABI Shim Design §3.3 steps 5-7): spawn the
             // Linux-personality probe from THIS sidecar — the design-true creator
@@ -747,7 +750,7 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         // v1's `argv = { name }` measurement. Like the pair above: logged,
         // never fatal.
         let firstuser = if gate {
-            match crate::e7_firstuser::stage_gate(&mut booted.proc.vfs, 0) {
+            (match crate::e7_firstuser::stage_gate(&mut booted.proc.vfs, 0) {
                 Ok(()) => {
                     let used = unsafe { HEAP.used() };
                     let remaining = unsafe { HEAP.remaining() };
@@ -776,35 +779,94 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                     klog(b"[E7-GATE] stage-fail", e.code() as u32, b"errno");
                     Err(-3)
                 }
-            }
+            })
+            .map(|sp| (sp.ch_r, sp.ch_w, sp.heap_base, sp.heap_limit))
         } else {
             crate::e7_firstuser::spawn(&RealKernel, caps.budget_base, caps.budget_len)
+                .map(|sp| (sp.ch_r, sp.ch_w, sp.heap_base, sp.heap_limit))
         };
 
         match firstuser {
-            Ok(sp) => {
+            Ok((ch_r, ch_w, heap_base, heap_limit)) => {
                 match booted.proc.vfs.add_task() {
                     Ok(vt) => {
                         if crate::linux::track(
-                            sp.ch_r,
-                            sp.ch_w,
+                            ch_r,
+                            ch_w,
                             if gate {
                                 crate::e7_firstuser::GATE_TASK_NAME
                             } else {
                                 crate::e7_firstuser::USER_NAME
                             },
                             0,
-                            sp.heap_base,
-                            sp.heap_limit,
+                            heap_base,
+                            heap_limit,
                             vt,
                             gate,
                         ) {
-                            klog(b"[E7] firstuser: spawned ch_r=", sp.ch_r, b"");
+                            klog(b"[E7] firstuser: spawned ch_r=", ch_r, b"");
                         } else {
-                            klog(b"[E7] firstuser: spawned but TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+                            klog(b"[E7] firstuser: spawned but TRACK TABLE FULL ch_r=", ch_r, b"");
                         }
                     }
-                    Err(_) => klog(b"[E7] firstuser: VFS task alloc FAILED ch_r=", sp.ch_r, b""),
+                    Err(_) => klog(b"[E7] firstuser: VFS task alloc FAILED ch_r=", ch_r, b""),
+                }
+            }
+            Err(rc) => klog(b"[E7] firstuser: spawn FAILED rc=", rc as u32, b""),
+        }
+    }
+
+    /* TG-2d's group profile replaces the census block above: stage and spawn
+     * only the two-thread fixture from the gate tenant. The tenant is the
+     * designated first user, so it keeps the same name/track/gate flag; the
+     * sibling appears later through the fixture's raw clone, not here. */
+    if cfg!(feature = "e7_group_ckpt") && gate && !e3_profile {
+        let group_firstuser = (match crate::e7_group_ckpt::stage(&mut booted.proc.vfs, 0) {
+            Ok(()) => {
+                let used = unsafe { HEAP.used() };
+                let remaining = unsafe { HEAP.remaining() };
+                klog(b"[E7-GROUP] stage", 64 * 1024, b"bytes");
+                klog(b"[E7-GROUP] heap-used", used as u32, b"");
+                klog(b"[E7-GROUP] heap-free", remaining as u32, b"");
+                let need = (crate::e7_group_ckpt::GROUP_RESERVE + 4096) as usize;
+                if remaining < need {
+                    klog(b"[E7-GROUP] no-headroom", remaining as u32, b"refused");
+                    Err(-2)
+                } else {
+                    crate::e7_group_ckpt::spawn(
+                        &RealKernel,
+                        caps.budget_base,
+                        caps.budget_len,
+                    )
+                }
+            }
+            Err(e) => {
+                klog(b"[E7-GROUP] stage-fail", e.code() as u32, b"errno");
+                Err(-3)
+            }
+        })
+        .map(|sp| (sp.ch_r, sp.ch_w, sp.heap_base, sp.heap_limit));
+
+        match group_firstuser {
+            Ok((ch_r, ch_w, heap_base, heap_limit)) => {
+                match booted.proc.vfs.add_task() {
+                    Ok(vt) => {
+                        if crate::linux::track(
+                            ch_r,
+                            ch_w,
+                            crate::e7_firstuser::GATE_TASK_NAME,
+                            0,
+                            heap_base,
+                            heap_limit,
+                            vt,
+                            true,
+                        ) {
+                            klog(b"[E7] firstuser: spawned ch_r=", ch_r, b"");
+                        } else {
+                            klog(b"[E7] firstuser: spawned but TRACK TABLE FULL ch_r=", ch_r, b"");
+                        }
+                    }
+                    Err(_) => klog(b"[E7] firstuser: VFS task alloc FAILED ch_r=", ch_r, b""),
                 }
             }
             Err(rc) => klog(b"[E7] firstuser: spawn FAILED rc=", rc as u32, b""),
@@ -919,7 +981,7 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
          * is the co-resident workload that kill orphans the Go child mid-run
          * and G1.6/G1.7 can never be read from one clean run. Ordinary and
          * E7 gate images keep the suite unchanged. */
-        match if cfg!(feature = "e7_go_gate") {
+        match if cfg!(feature = "e7_go_gate") || cfg!(feature = "e7_group_ckpt") {
             None
         } else {
             booted.proc.run_next()

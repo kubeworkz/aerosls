@@ -326,6 +326,24 @@ int env_ckpt_linux_group_thread_drop(uint32_t partition_id,
                                      uint32_t group_id,
                                      uint16_t thread_index);
 
+/* TG-2d: the sibling indexes a replay create must build after it has created
+ * the held leader. The record is found by (partition, leader name, group id);
+ * only Linux tasks carrying that group and `leader == 0` are returned, in
+ * record order. Returns the count, 0 when no matching record/leader exists,
+ * or -1 when the record names a malformed/duplicate index or the caller's
+ * buffer is too small. Read-only. */
+int env_ckpt_linux_group_restore_indexes(uint32_t partition_id,
+                                         const char* leader_name,
+                                         uint32_t group_id,
+                                         uint16_t* out_indexes,
+                                         uint32_t cap);
+
+/* TG-2d: hold the replay's pre-create record while the fresh registration
+ * replaces the table slot. The accessor above consults this copy when the
+ * live record names the leader but not the captured siblings. */
+void env_ckpt_linux_group_restore_hint(const struct EnvCkptRecord* rec);
+void env_ckpt_linux_group_restore_hint_clear(void);
+
 /* Drop the record for (partition_id, index), if any. */
 int env_ckpt_drop(uint32_t partition_id, uint32_t index);
 

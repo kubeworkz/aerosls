@@ -781,6 +781,25 @@ int main(void) {
             CHECK(env_ckpt_valid(got) == ENV_CKPT_REFUSE_NONE,
                   "a record with a leader and one sibling validates");
         }
+        {
+            uint16_t idx[ENV_CKPT_MAX_THREADS];
+            CHECK(env_ckpt_linux_group_restore_indexes(
+                      9, "e7.gate.user.0", 0x44u, idx,
+                      ENV_CKPT_MAX_THREADS) == 1 && idx[0] == 1,
+                  "the replay create reads the sibling index the record captured, so it can build that exact thread");
+            CHECK(env_ckpt_linux_group_restore_indexes(
+                      9, "e7.gate.user.0", 0x44u, idx, 1) == 1 &&
+                  env_ckpt_linux_group_restore_indexes(
+                      9, "e7.gate.user.0", 0x44u, idx, 0) == -1,
+                  "the index reader refuses a buffer that cannot hold the whole set");
+            CHECK(env_ckpt_linux_group_restore_indexes(
+                      9, "e7.gate.user.9", 0x44u, idx,
+                      ENV_CKPT_MAX_THREADS) == 0 &&
+                  env_ckpt_linux_group_restore_indexes(
+                      9, "e7.gate.user.0", 0x45u, idx,
+                      ENV_CKPT_MAX_THREADS) == 0,
+                  "another name or group finds no sibling set (the create builds none)");
+        }
         CHECK(env_ckpt_linux_group_thread_stamp(9, 0x44u, 1,
                                                 "e7.gate.user.0", 0x400200ull) == 1,
               "re-stamping the same (group,index) is idempotent");
@@ -794,6 +813,49 @@ int main(void) {
               env_ckpt_linux_group_thread_stamp(9, 0x44u, 1,
                                                 "e7.gate.user.0", 0) == 0,
               "index 0 is the leader's (never appendable) and entry 0 is never a thread stamp");
+        {
+            /* TG-2d: the replay's create re-registers (partition, index)
+             * before the sidecar reaches its spawn. The sibling is not part
+             * of init's registration, so the upsert itself must carry it
+             * across; otherwise the constructor sees only the leader. */
+            const struct EnvCkptRecord* before = env_ckpt_find(9, 1);
+            struct EnvCkptRegister reg;
+            uint64_t entries[ENV_CKPT_REG_TASKS];
+            memset(&reg, 0, sizeof reg);
+            CHECK(before != 0, "(setup) the group record exists before the replay registration");
+            if (before) {
+                reg.partition_id = before->partition_id;
+                reg.index        = before->index;
+                reg.env_id       = before->env_id;
+                reg.n_regions    = before->n_regions;
+                for (uint32_t i = 0; i < before->n_regions; i++)
+                    reg.regions[i] = before->regions[i];
+                reg.n_chans = before->n_chans;
+                for (uint32_t i = 0; i < before->n_chans; i++)
+                    reg.chans[i] = before->chans[i];
+                reg.n_tasks = 3;   /* init names the sidecars and the leader */
+                for (uint32_t i = 0; i < reg.n_tasks; i++) {
+                    memcpy(reg.task_name[i], before->tasks[i].name,
+                           ENV_CKPT_NAME_LEN);
+                    reg.task_kind[i] = before->tasks[i].kind;
+                    entries[i] = before->tasks[i].entry;
+                }
+                entries[2] = 0;    /* the leader is stamped at its spawn */
+                CHECK(env_ckpt_register_from(&reg, entries, before->console_id,
+                                             before->sequence) == 0,
+                      "the replay create's fresh registration is accepted");
+                before = env_ckpt_find(9, 1);
+                CHECK(before && before->n_tasks == 4 &&
+                      before->tasks[3].kind == ENV_CKPT_TASK_LINUX &&
+                      before->tasks[3].thread_index == 1 &&
+                      before->tasks[3].group_id == 0x44u &&
+                      before->tasks[2].group_id == 0x44u &&
+                      before->tasks[2].leader == 1,
+                      "the registration upsert carries the captured sibling and the leader's group identity, so the constructor still sees the whole set");
+                CHECK(env_ckpt_valid(before) == ENV_CKPT_REFUSE_NONE,
+                      "the re-registered group record still validates");
+            }
+        }
         {
             const struct EnvCkptRecord* base = env_ckpt_find(9, 1);
             struct EnvCkptRecord tooth;

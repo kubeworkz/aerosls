@@ -902,6 +902,132 @@ int linux_clone_thread(struct ProcessDescriptor* parent,
     return 0;
 }
 
+/* TG-2d: one sibling the replay's create could not finish. The descriptor is
+ * still private to this function (never scheduled, never in a run queue), so
+ * its stack and group admission are the only resources to return. */
+static void proc_discard_restored_sibling(struct ProcessDescriptor* pd) {
+    if (!pd || !pd->active) return;
+    struct LinuxThreadGroup* g = linux_group_of(pd);
+    proc_free_syscall_stack(pd);
+    if (g) (void)linux_group_leave_thread(g);
+    linux_group_clear_identity(pd);
+    pd->active = 0;
+    if (proc_count) proc_count--;
+}
+
+int linux_restore_group_siblings(struct ProcessDescriptor* leader,
+                                 const uint16_t* thread_indexes,
+                                 uint32_t n) {
+    if (!leader || !thread_indexes || n == 0) return -1;
+    if (leader->personality != PROC_PERSONALITY_LINUX) return -1;
+    if (!leader->active || !leader->restore_held) return -1;
+    struct LinuxThreadGroup* g = linux_group_of(leader);
+    if (!g || g->exiting || leader->cr3 != g->cr3) return -1;
+    if (n > (uint32_t)LINUX_THREADS_MAX - 1u) return -1;
+    if ((uint32_t)g->live_threads + n > (uint32_t)LINUX_THREADS_MAX)
+        return -1;
+
+    uint32_t free_slots = 0;
+    for (int i = 0; i < PROC_MAX; i++)
+        if (!proc_table[i].active) free_slots++;
+    if (free_slots < n) return -1;
+
+    /* The recorded indexes are identity, not hints: a duplicate or index 0
+     * would make two payload tasks resolve to one descriptor. */
+    for (uint32_t i = 0; i < n; i++) {
+        if (thread_indexes[i] == 0 ||
+            thread_indexes[i] >= LINUX_THREADS_MAX) return -1;
+        for (uint32_t j = 0; j < i; j++)
+            if (thread_indexes[i] == thread_indexes[j]) return -1;
+        for (int j = 0; j < PROC_MAX; j++) {
+            if (!proc_table[j].active) continue;
+            if (linux_group_of(&proc_table[j]) != g) continue;
+            if (proc_table[j].thread_index == thread_indexes[i]) return -1;
+        }
+    }
+
+    /* Allocate the whole set first. A stack refusal then leaves the process
+     * table untouched, which is the same refusal-over-partial rule the pour
+     * uses. */
+    uint64_t stacks[LINUX_THREADS_MAX];
+    uint32_t allocated = 0;
+    for (; allocated < n; allocated++) {
+        stacks[allocated] = alloc_proc_syscall_stack(leader->partition_id);
+        if (!stacks[allocated]) break;
+    }
+    if (allocated != n) {
+        for (uint32_t i = 0; i < allocated; i++) {
+            struct ProcessDescriptor tmp;
+            for (uint32_t b = 0; b < (uint32_t)sizeof(tmp); b++)
+                ((uint8_t*)&tmp)[b] = 0;
+            tmp.syscall_stack_top = stacks[i];
+            proc_free_syscall_stack(&tmp);
+        }
+        return -1;
+    }
+
+    struct ProcessDescriptor* made[LINUX_THREADS_MAX];
+    uint32_t n_made = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        struct ProcessDescriptor* child = 0;
+        for (int s = 0; s < PROC_MAX; s++) {
+            if (!proc_table[s].active) { child = &proc_table[s]; break; }
+        }
+        if (!child) goto rollback;
+        for (uint32_t b = 0; b < (uint32_t)sizeof(*child); b++)
+            ((uint8_t*)child)[b] = 0;
+        child->pid          = alloc_pid();
+        pr_strcpy(child->name, leader->name, PROC_NAME_LEN);
+        child->object_id    = leader->object_id;
+        child->cr3          = g->cr3;
+        child->owner_uid    = leader->owner_uid;
+        child->parent_pid   = leader->pid;
+        child->partition_id = leader->partition_id;
+        child->priority     = PROC_PRIO_NORMAL;
+        child->personality  = PROC_PERSONALITY_LINUX;
+        child->syscall_stack_top = stacks[i];
+        stacks[i] = 0;   /* the descriptor owns it from here */
+        child->waiting_chan = CAP_NONE;
+        child->group_index  = LINUX_GROUP_NONE;
+        child->state        = PROC_HELD;
+        child->restore_held = 1;
+        child->has_ring3_ctx = 0;
+        child->active       = 1;
+        if (linux_group_join_restored_thread(g, child,
+                                             thread_indexes[i]) != 0) {
+            proc_free_syscall_stack(child);
+            for (uint32_t b = 0; b < (uint32_t)sizeof(*child); b++)
+                ((uint8_t*)child)[b] = 0;
+            goto rollback;
+        }
+        made[n_made++] = child;
+        proc_count++;
+        kernel_serial_printf(
+            "[SIDECAR] PID %u '%s' HELD sibling for restore group=%u "
+            "thread=%u (leader %u)\n",
+            child->pid, child->name, g->group_id,
+            (unsigned)child->thread_index, g->leader_pid);
+    }
+    kernel_serial_printf(
+        "[SIDECAR] restore group %u: created %u held sibling(s) on one root\n",
+        g->group_id, n);
+    return 0;
+
+rollback:
+    while (n_made > 0)
+        proc_discard_restored_sibling(made[--n_made]);
+    for (uint32_t i = 0; i < n; i++) {
+        struct ProcessDescriptor tmp;
+        for (uint32_t b = 0; b < (uint32_t)sizeof(tmp); b++)
+            ((uint8_t*)&tmp)[b] = 0;
+        if (stacks[i]) {
+            tmp.syscall_stack_top = stacks[i];
+            proc_free_syscall_stack(&tmp);
+        }
+    }
+    return -1;
+}
+
 // ─── process_exit ────────────────────────────────────────────────────────────
 // Called from SYS_SLS_EXIT dispatch.  Finds the running Ring-3 process,
 // marks it ZOMBIE, restores the kernel's RSP and CR3 saved by
@@ -2315,6 +2441,32 @@ int linux_futex_block(struct ProcessDescriptor* cur, uint32_t group_id,
             "EAGAIN\n",
             cur->tid, group_id);
         return -LINUX_EAGAIN;
+    }
+
+    /* TG-2d: the gate's deterministic capture point for a thread group. The
+     * marker is printed only when EVERY live member is blocked on this same
+     * barrier word — the checkpoint request that follows then captures a
+     * coherent futex stop, not a race with one thread still running. */
+    struct LinuxThreadGroup* fg = linux_group_find(group_id);
+    if (fg && !fg->barrier_reported) {
+        uint32_t live = linux_group_futex_barrier_complete(fg, uaddr);
+        if (live >= 2) {
+            struct ProcessDescriptor* leader = 0;
+            for (int i = 0; i < PROC_MAX; i++) {
+                if (proc_table[i].active &&
+                    proc_table[i].pid == fg->leader_pid) {
+                    leader = &proc_table[i];
+                    break;
+                }
+            }
+            if (leader && leader->gate_profile) {
+                fg->barrier_reported = 1;
+                kernel_serial_printf(
+                    "[E7-GATE] group barrier: group=%u threads=%u "
+                    "uaddr=0x%lx all futex waiters\n",
+                    fg->group_id, live, (unsigned long)uaddr);
+            }
+        }
     }
 
     kernel_serial_printf(

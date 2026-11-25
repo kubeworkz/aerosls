@@ -236,14 +236,26 @@ word and remaining timeout travel with its entry park frame. Capture accepts
 a futex stop only when every group member names the same barrier key; restore
 re-enqueues every wait after the pour and before release, and
 `linux_group_release_restored()` clears all held members in one pass without
-making the blocked waiters runnable. A group's
-siblings share a name, so capture and replay resolve them by
-`(group_id, thread_index)`, not by name. The leader owns the shared image and
+making the blocked waiters runnable. A group's siblings share a name, so the
+blob carries `(group id, leader flag, thread index)` and replay resolves a
+task by its stable `(name, thread index)`; the group id is a boot-local pid
+(the replay create rebases it in the record) and is not carried across the
+cycle as identity. The leader owns the shared image and
 budget page block; a sibling carries its own registers and `fs_base` but no
 duplicate shared pages, and the group's brk/mmap cursors are carried once.
 The restore validates the group layout and duplicate destinations before the
-pour and installs every held thread's context. The replay create still spawns
-one Linux child; creating/releasing the sibling set is TG-2d.
+pour and installs every held thread's context. TG-2d closes the create half:
+the replay create reads the captured sibling indexes, builds the leader and
+the whole sibling set under one root, holds every member, attaches each at
+its **recorded** index (payload lookup is by index, so lowest-free would
+mis-key it), and releases the group in one pass after the pour. The sibling
+constructor allocates all syscall stacks before it touches the process table
+and rolls back as a unit. TG-2d also adds a freestanding two-thread fixture and
+a live capture/replay arm in `tests/thread_group_ckpt_check.sh` (the
+`--group` mode of `tests/e7_gate_check.sh`): the worker waits with a 60 s
+relative timeout and the leader forever, so after restore the worker's
+re-armed timeout wakes the leader and both verify the pre-barrier shared
+word before the copy completes.
 
 `ep_linux_page()` assigns pages by the task's own image/heap/stack ranges.
 TG-2b makes the leader the one owner of the shared image/heap ranges, skips
@@ -735,14 +747,15 @@ field is the main protocol change.
 
 ### 4.8 Checkpoint and restore (TG-2, proposed)
 
-This is the largest unproven part. TG-2b made the payload multi-context, but
-the replay create still holds one child. A thread group needs all of the
-following before the gate can claim E7 parity:
+This is the largest unproven part. TG-2b made the payload multi-context and
+TG-2d made the replay create build the whole group; the remaining TG-2 exit
+is the live arm below. A thread group needs all of the following:
 
 1. **Schema.** (TG-2a landed record v2; TG-2b landed payload v4; TG-2c
    landed v5.) Every payload task carries group id/index/leader and the
-   `FORM_FUTEX` barrier key/value/remaining timeout, and lookup uses
-   `(group id, thread index)` rather than the shared name. The payload's task
+   `FORM_FUTEX` barrier key/value/remaining timeout, and lookup uses the
+   stable `(name, thread index)` rather than the shared name or the boot-local
+   group pid. The payload's task
    stride grew, so older blobs are refused by name rather than misread.
 2. **Page ownership.** (TG-2b) The group leader owns the shared image and heap
    page blocks; non-leader threads own only pages unique to them (this
@@ -753,20 +766,22 @@ following before the gate can claim E7 parity:
 3. **Per-thread context.** Each thread needs its own `linux_regs`, `fs_base`,
    user stack top, trap form and signal mask. The leader's heap/brk/mmap/image
    fields live once, not once per thread.
-4. **Group stop.** (TG-2c landed the payload half.) The existing gate stops
+4. **Group stop.** (TG-2c landed the payload half; TG-2d landed the live
+   create/hold/release.) The existing gate stops
    one task at a sysret. A multi-thread group must be quiesced consistently.
    The first form is a **futex barrier**: every gate thread waits on a known
    futex, and the payload carries `FORM_FUTEX` (address, expected value,
    remaining timeout, saved entry context). Capture refuses a mixed group by
    skipping it; restore refuses an incoherent blob with `EP_REFUSE_BARRIER`
-   and re-enqueues every wait before releasing the group. The replayed create
-   still holds one child, so the live group release is TG-2d. If a thread is
+   and re-enqueues every wait before releasing the group. TG-2d's create
+   builds every captured sibling at its recorded index under the leader's
+   root, and its group release clears all holds in one pass. If a thread is
    in a forwarded syscall, the checkpoint still refuses it by name; the gate
    must not create that state.
-5. **Replay create.** The current restore creates one held child. A group
-   replay creates the leader, creates siblings sharing the same root, pours
-   shared pages once, installs every thread's context, then releases all of
-   them. The sidecar's group row is restored by its own payload; no extra
+5. **Replay create.** (TG-2d) A group replay creates the leader, creates
+   siblings sharing the same root at their recorded indexes, pours shared
+   pages once, installs every thread's context, then releases all of them.
+   The sidecar's group row is restored by its own payload; no extra
    `track()` calls per thread.
 6. **No double ownership.** One `cap_table_teardown`, one
    `user_destroy_page_table`, one sidecar row close for the group. The payload
@@ -950,7 +965,9 @@ gate needs its own clauses:
   sibling after restore;
 - **G2.6** the copy completes with the same checksum after the reboot;
 - **G2.7** exactly one group teardown and one frame return count;
-- **G2.8** the existing single-task E7 gate replay remains green.
+- **G2.8** the group replay pours every captured context (`payloads=1`,
+  `payload_skips=0`) with no fault and no second clone/start; the existing
+  single-task E7 gate remains green in its own arm.
 
 Teeth: drop a thread from the record; duplicate a shared page with a different
 CRC; restore a thread with the leader's `fs_base`; restore a per-thread root;
@@ -1107,10 +1124,34 @@ Exit: G1.1–G1.8 pass on a live boot, with the existing E7 gate still green.
 1. Bump the record/payload format and task limits.
 2. Add group stamping, shared-page ownership, per-thread contexts and the
    futex-wait form.
-3. Add group-aware replay create, hold and release.
+3. Group-aware replay create, hold and release (TG-2d: leader plus every
+   captured sibling on one root, exact recorded indexes, re-enqueued waits,
+   one-pass release, and the two-thread live arm).
 4. Add the group gate harness and teeth.
 
 Exit: G2.1–G2.8 pass after a real reboot.
+
+TG-2d landed with the record upsert carrying the captured sibling slots
+across the replay's fresh registration (a create re-registers its own
+environment, and the kernel-discovered siblings are not part of init's
+registration), the leader's captured group identity carried with it, and the
+replay create attaching every sibling at its recorded index under the held
+leader's root. The group id is still boot-local: the live group stamp rebases
+the captured siblings onto the new id before the payload looks anything up.
+The pour adopts each `FORM_FUTEX` context by `(name, thread_index)` and
+re-enqueues the waits against the new `tgid`; one release then makes the
+whole set schedulable.
+
+The focused host coverage is `tests/env_ckpt_host_test.c` (145 passed),
+`tests/linux_thread_group_host_test.c` (57 passed) and
+`tests/env_payload_host_test.c` (146 passed). The live arm is
+`tests/thread_group_ckpt_check.sh --live`: it builds the group image, boots
+the two-thread barrier, captures both `FORM_FUTEX` records, reboots, and
+asserts G2.1a–G2.8 over the replay. The observed replay created held PIDs 105
+and 106 on one root, adopted leader `rsp=0x400000021e10` and sibling
+`rsp=0x413140`, released both threads together, restored the worker timeout
+at line 1211 after the line-313 release, and finished `G2-COPY=65536` with
+`G2-SUM=0xa97a7a6074da2325` and exactly one group teardown.
 
 ### TG-3 — hardening after the gate
 

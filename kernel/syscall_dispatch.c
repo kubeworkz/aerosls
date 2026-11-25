@@ -703,7 +703,6 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                     uint32_t fop  = (uint32_t)largs[1];
                     uint32_t fcmd = fop & LINUX_FUTEX_OP_MASK;
                     struct LinuxThreadGroup* fg = linux_group_of(cur);
-
                     if (linux_futex_op_supported(fop) != 0) {
                         kernel_serial_printf(
                             "[E7] futex op=0x%lx refused: v1 serves only "

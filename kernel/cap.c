@@ -4880,6 +4880,32 @@ int cap_create_sidecar_in_personality(uint32_t parent_pid,
                                          pd->is_group_leader);
     }
 
+    /* TG-2d: the replay's record may name siblings this create did not make.
+     * Build them now, under the leader's group and one root, while every one
+     * of them is still HELD. The payload adopts each by (group, thread index)
+     * and the environment service releases the whole set in one pass. A
+     * record with no siblings is the single-task path byte for byte. */
+    if (personality == PROC_PERSONALITY_LINUX && parent &&
+        pd->restore_held && cap_linux_hold_has(child_partition)) {
+        uint16_t indexes[ENV_CKPT_MAX_THREADS];
+        int n_sib = env_ckpt_linux_group_restore_indexes(
+            parent->partition_id, pd->name, pd->tgid,
+            indexes, ENV_CKPT_MAX_THREADS);
+        if (n_sib < 0) {
+            kernel_serial_printf(
+                "[SIDECAR] restore group %u: sibling indexes refused by the "
+                "record — the replay will refuse this group by name\n",
+                pd->tgid);
+        } else if (n_sib > 0 &&
+                   linux_restore_group_siblings(pd, indexes,
+                                                (uint32_t)n_sib) != 0) {
+            kernel_serial_printf(
+                "[SIDECAR] restore group %u: %d held sibling(s) could not be "
+                "built — the replay will refuse this group by name\n",
+                pd->tgid, n_sib);
+        }
+    }
+
     /* Return the parent's CHAN_R (for receiving the child's first reply). */
     if (out_ch_r) *out_ch_r = parent_rd;
     return 0;
