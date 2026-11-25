@@ -412,6 +412,17 @@ _start:
     syscall
     test    %rax, %rax
     jne     .Lsoft_bad
+    /* The page is soft-PROT_NONE. Its PROOF — the marker write followed by
+     * a read that must #PF — is the LAST thing this program does, and it is
+     * now reached from the SIGNAL HANDLER (increment 28's live half): the
+     * delivery below is terminal for this probe, because a handler that
+     * cannot yet return (no rt_sigreturn row) either exits or dies, and
+     * dying on the soft page is the proof this file already owed. So the
+     * order is: arm the soft page here, deliver the signal, and let the
+     * handler finish the case. */
+    jmp     .Lsig_try
+
+.Lsoft_tail:
     lea     .Lsoft_msg(%rip), %rsi
     mov     $1, %edi
     mov     $14, %edx
@@ -471,6 +482,89 @@ _start:
 .Lhang:
     jmp     .Lhang
 
+    /* 6. THE SIGNAL DELIVERY (E7 increment 28's live half). The three ends
+     *    being wired means nothing unless a real ring-3 task is actually
+     *    entered at a handler, so this is the flow the boot measures:
+     *
+     *      rt_sigaction(10, act, NULL, 8)  install SIGUSR1 -> .Lhandler
+     *      tkill(0x1DECAF, 10)            the tid 218 echoed above, so the
+     *                                     sidecar's own tid match passes
+     *
+     *    A delivery REPLACES this syscall's return: control resumes at
+     *    .Lhandler with rsp on the kernel's frame and rdi = 10. The
+     *    fall-through below is therefore the NEGATIVE proof — it is
+     *    reached only if the reply came back as an errno, and it issues
+     *    MARKER 409 so the boot can say which half was missing.
+     *
+     *    The handler does NOT return: rt_sigreturn has no table row yet
+     *    (awaiting a real census trace), so returning would forward 15 and
+     *    come back -ENOSYS. It writes its marker and exits with a code of
+     *    its own instead — which is also the cleanest observable that the
+     *    code that ran was the HANDLER's, not the probe's. */
+.Lsig_try:
+    sub     $64, %rsp
+    lea     .Lhandler(%rip), %rax
+    mov     %rax, 0(%rsp)       /* sa_handler                        */
+    movq    $0, 8(%rsp)         /* sa_flags: no SA_SIGINFO needed    */
+    movq    $0, 16(%rsp)        /* sa_mask                           */
+    lea     .Lrestorer(%rip), %rax
+    mov     %rax, 24(%rsp)      /* sa_restorer: NONZERO — the kernel
+                                 * refuses a delivery it cannot return
+                                 * from, so a zero here would be a
+                                 * refusal, not a delivery            */
+    mov     %rsp, %rsi
+    mov     $10, %edi           /* SIGUSR1                           */
+    xor     %edx, %edx          /* oldact = NULL                     */
+    mov     $8, %r10d           /* sigsetsize (the twin of 14's)      */
+    mov     $13, %eax
+    syscall
+    test    %rax, %rax
+    jne     .Lsig_install_bad
+
+    mov     $0x1DECAF, %rdi     /* the tid 218 echoed                 */
+    mov     $10, %esi
+    mov     $200, %eax
+    syscall
+    /* UNREACHABLE on a delivery: proof that none happened. */
+    mov     $409, %eax          /* MARKER: the tkill returned instead */
+    syscall
+    jmp     .Lexit
+
+.Lsig_install_bad:
+    mov     $410, %eax          /* MARKER: rt_sigaction refused       */
+    syscall
+    jmp     .Lexit
+
+    /* THE HANDLER. Entered in ring 3 by the kernel's own return path —
+     * not called by this file — with rdi = 10 and rsp at the frame the
+     * builder wrote (which is never read here: the exit is deliberate). */
+.Lhandler:
+    lea     .Lsig_msg(%rip), %rsi
+    mov     $1, %edi            /* fd 1: the task's console           */
+    mov     $11, %edx           /* "SIGHAND-OK\n"                     */
+    mov     $1, %eax
+    syscall
+    /* …then finish the soft-mprotect case the interrupted flow had just
+     * armed: the handler is the code that reads the PROT_NONE page and
+     * dies on it. r13 (the soft page) is the interrupted register — only
+     * rsp/rip/rdi were changed for the entry — so it is still valid here,
+     * which is itself a small proof that the context was preserved. */
+    jmp     .Lsoft_tail
+
+    /* The frame's pretcode. Never reached while a handler exits without
+     * returning; its only job is to be a real, nonzero address so the
+     * delivery is one the kernel will build. */
+.Lrestorer:
+    mov     $411, %eax          /* MARKER: a handler returned into a
+                                 * restorer that has no rt_sigreturn */
+    syscall
+.Lexit:
+    /* exit_group(42): the sidecar reaps this task. */
+    mov     $42, %edi
+    mov     $231, %eax
+    syscall
+    jmp     .Lhang
+
     /* The fd class's positive marker: printed on the console only if the
      * whole seam performed it (build_probe.sh keeps this in .text — one
      * section, _start at offset 0). */
@@ -479,6 +573,9 @@ _start:
 
 .Lsoft_msg:
     .ascii  "E7MEM-SOFT-OK\n"
+
+.Lsig_msg:
+    .ascii  "SIGHAND-OK\n"
 
 .Lmsg:
     .ascii  "E7FD-WRITE-OK\n"

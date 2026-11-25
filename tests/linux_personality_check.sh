@@ -1738,6 +1738,19 @@ else
     bad "P11. the delivery's success is no longer conditional: a resume reachable from a refusal, or two masks that can disagree, is the shape where the task enters a handler the kernel did not install (or runs with a mask the sidecar did not set) and every subsequent signal behaves wrongly"
 fi
 
+if grep -qF '.Lsig_try:' "$FIX" && \
+   grep -qF 'SIGHAND-OK' "$FIX" && \
+   grep -qF 'mov     $200, %eax' "$FIX" && \
+   grep -qF 'jmp     .Lsoft_tail' "$FIX" && \
+   grep -qF '[E7] sig %u (code %u) -> handler %lx' kernel/process.c && \
+   [ -s tests/linux_signal_probe_check.sh ] && \
+   grep -qF 'SIGHAND-OK reached the serial log' tests/linux_signal_probe_check.sh && \
+   grep -qF 'mask 200$' tests/linux_signal_probe_check.sh; then
+    ok "P12. the delivery has a LIVE proof, not only a host test: the existing probe installs SIGUSR1 and raises it with tkill (13 then 200), its handler writes SIGHAND-OK and then finishes the soft-mprotect case (the probe's original terminal step, so nothing was lost by putting the delivery last), and tests/linux_signal_probe_check.sh boots the ISO and reads the kernel's own [E7] sig N -> handler line with the frame and the 0x200 mask both ends computed, with MARKERS 409/410/411 absent"
+else
+    bad "P12. the live proof is incomplete: a fixture without the handler or without its terminal step, a kernel that stopped printing the delivery line, or a check that no longer reads it — any of these leaves the wired delivery asserted from source only, which is exactly what this increment was not allowed to do"
+fi
+
 echo
 if [ "$fails" -eq 0 ]; then
     echo "linux_personality_check: all clauses hold"

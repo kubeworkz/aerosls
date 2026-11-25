@@ -3968,6 +3968,53 @@ deleted). `make selfhost-bootimage` and `make x86-iso` both exit 0.
 
 ---
 
+### 10.19 The live proof — a handler actually runs in ring 3
+
+Increment 28's wiring was asserted from source: host tests, a guard clause
+and teeth, with the honest note that no boot had entered a handler. This is
+the boot.
+
+The fixture is the probe that already ran at every boot
+(`fixtures/e7_linux_probe.S`, spawned by `entry.rs` through the real
+`create`), extended at the end of its flow rather than beside it. The
+cheapness is the point: no new fixture, no new spawn hook, no new archive
+variant, no new QEMU recipe — the existing probe now also measures the
+delivery.
+
+- **Order, and why it is this order.** The probe's last step was already
+  terminal: it soft-`mprotect`s a page to `PROT_NONE`, writes its marker and
+  then *reads* the page, which must `#PF` and kill the task (that death is
+  the mprotect's proof). A handler that cannot yet return is equally
+  terminal, so the two compose: the probe arms the soft page, installs
+  `SIGUSR1 -> .Lhandler`, raises it with `tkill`, and **the handler** writes
+  `SIGHAND-OK` and then performs the soft case's marker write and its
+  fault. Nothing the probe proved before was dropped, and the fault at the
+  end now happens in ring-3 code the kernel jumped to.
+- **What the boot shows** (`tests/linux_signal_probe_check.sh`, serial
+  transcript saved to `/tmp/e7_signal_probe_boot.log`):
+
+  ```
+  [E7] sig 10 (code 0) -> handler 400000000427, frame 400000004c98, mask 200
+  [E7] linux: num=00000001 child=e7.linux.probe.0 write ok len=11 |SIGHAND-OK.|
+  ```
+
+  The first line is the kernel's own — a frame was built at
+  `0x400000004c98` and the handler's mask is `0x200`, which is bit 9:
+  SIGUSR1's own bit, the number the sidecar computed and the kernel
+  installed. The second is the fd class logging the **handler's** write,
+  attributed to the probe's task (`e7.linux.probe.0`) — the bytes
+  `SIGHAND-OK` are only in `.Lhandler`, so the code that ran is the code
+  the kernel jumped to. Markers 409 (the `tkill` returned), 410 (the install
+  refused) and 411 (a handler returned into the restorer) were all absent,
+  and the probe's earlier markers were all present in the same run.
+- **What it still does not show, by construction**: the handler finishes the
+  soft case and dies instead of returning — `rt_sigreturn` still has no
+  table row, so a handler that returned would forward 15 and come back
+  `-ENOSYS`. Marker 411 exists to make that failure loud if anyone changes
+  the handler's tail before the row lands.
+
+---
+
 ## 11. Open questions for review
 
 1. **The first user: designated, built, and censused.** `AeroSLS-Roadmap-2026H2-v0.1.md` §5 says in bold that there is no named first user, and the tree agreed — no Go source, no `std`-Rust binary, every real operational workload bash or Python (§5.5.1) — so the target was a *decision*. It is now made and carried out: the backup operation, as `backup/aerobackup/` (a static single-threaded Rust rewrite of `backup/backup.sh`'s snapshot-and-retain core, 27 tests, no dependencies), designated in `tools/linux_abi_candidate.conf`, with the census measured and checked in at `tools/linux_syscall_census.txt` (§5.6). **The open question is no longer about the first user; it is whether this candidate is narrow enough to gate on.** Its measured surface is 27 syscalls, and the two that are structurally hardest — `arch_prctl(ARCH_SET_FS)` (§5.3) and the vDSO-backed `clock_gettime` — are both now named rather than discovered. Whether the other three operations follow, and in what order, is a product question this design does not answer.

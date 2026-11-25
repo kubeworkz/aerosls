@@ -65,8 +65,10 @@ FILES=(
     # the table test that carries the "15 is not in the table yet" absence.
     tests/linux_sigframe_host_test.c
     tests/linux_syscall_table_host_test.c
-    # P5–P8 (increment 27, the delivery) read the delivery's own host test.
+    # P5–P8 (increment 27, the delivery) read the delivery's own host test;
+    # P12 (increment 28) reads the LIVE check's script as well as the probe.
     tests/linux_sigdeliver_host_test.c
+    tests/linux_signal_probe_check.sh
     # Y (the soft mprotect transition) reads the helper's fake-table test.
     tests/user_map_identity_host_test.c
     # W (increment 20) reads the capture, the record, the task's name on the
@@ -1278,6 +1280,14 @@ tooth sigframe-install-rsp-nudged P10 "the entry install puts rsp in the wrong w
 seed "$W/t152"
 sed -i '/linux_sig_reply_apply(pd, pay, n);/d' "$W/t152/kernel/chan.c"
 tooth sigframe-chan-branch-gone P9 "chan.c no longer routes the delivery request" "$W/t152"
+
+# t153: the handler's own marker removed from the probe. The delivery still
+# happens and the kernel still prints its line — what is gone is the only
+# evidence written BY the code that ran, so a boot that entered the handler
+# with a broken context would look identical from the kernel side.
+seed "$W/t153"
+sed -i '/SIGHAND-OK/d' "$W/t153/user/sidecar/fixtures/e7_linux_probe.S"
+tooth sigframe-probe-marker-gone P12 "the probe no longer carries the handler's marker" "$W/t153"
 
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"
