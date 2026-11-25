@@ -29,9 +29,9 @@ P0 list has an item this branch never touched, it is invisible here.
 | P1 | Where it lives today |
 | --- | --- |
 | No async preemption, siginfo queueing, fpstate, or signals past `tkill` | **Partly closed** — increments 26–29c landed real delivery: `linux_sig_frame_build`/`linux_sig_frame_restore` and the park bridge (`kernel/linux_abi.c`), `linux_sig_reply_apply`/`linux_sig_return_apply` (`kernel/process.c`), and the sidecar's `Answer::SignalFrame` arm with `sig.handler_active`/`sig.saved_mask` (`linux.rs`), so `tkill` enters a ring-3 handler that returns through `rt_sigreturn`, proven on a boot by `tests/linux_signal_probe_check.sh`. Still open: **no async preemption** (a signal is delivered only on the reply to a syscall the task itself made — `tkill` — or on the 14-unblock reveal; a task spinning in ring 3 is never signalled); **no siginfo queueing** (`SigState.pending` is a `u64` bitmask, so real-time signals collapse to one bit and `sigqueueinfo` is absent — **self-signals only via `tkill`**, with no `kill`/`tgkill` row); **no fpstate restore** (the frame's fpstate pointer is NULL, so a handler that clobbers xmm leaves it clobbered); and no restart window inside the restorer |
-| General thread semantics | `kernel/linux_thread.c:54` — `CLONE_CHILD_CLEARTID` is *deliberately absent* from `LINUX_CLONE_ALLOWED` — superseded by increment 30b, which honours it on every death path; `set_tid_address` still "stored and ignored" (`kernel/linux_abi.c`), and no `clone3` |
+| General thread semantics | **Mostly closed by increments 30/30b** — `CLONE_CHILD_CLEARTID` is in `LINUX_CLONE_ALLOWED` (`kernel/linux_thread.h:75`) and honoured at clone (`kernel/linux_thread.c:79`); `set_tid_address` (218) is not inert: the sidecar answers the tid echo and the kernel captures the word at the first trap and clears it at exit (`kernel/linux_abi.c:167`); the glue is consumed once per death (`linux_thread_take_exit_words`), so exit(60), `exit_group`, a sibling's fault and the deferred-kill sweep all clear. Still open: the parent/child `*SETTID` flags, `list_op_pending`, and `clone3` (435) |
 | Per-thread blocking I/O | `kernel/chan.c` `k_linux_forward`: post-then-park on **the group's** channel pair; the single-writer invariant in its comment *is* the lease ("this channel's ONLY writer is the one task forwarding on it, and that task is parked between post and reply"). `LinuxTask` carries one `ch_r`/`ch_w`, `MAX_LINUX_TASKS = 8` |
-| Static binaries only | `kernel/elf64_load.c` / `no_hosted_link_check.sh`: no PT_INTERP, no `.dynamic`, no interpreter; the refusal is a pinned property, not an accident |
+| Static binaries only | `kernel/elf64_load.c` refuses `ET_DYN` (PIE) and every non-`ET_EXEC` by name, maps only `PT_LOAD`, and never reads `PT_INTERP` — an interpreter request is simply not honoured, the image loads and jumps to its own entry. The refusal is structural in the guest loader; `tests/no_hosted_link_check.sh` pins the separate property that the *kernel* image carries no `.dynamic`/`.interp`/`PT_INTERP` |
 | No general process lifecycle | `execve` (59) is classed `LSC_SPAWN` but only the kernel/init spawn path uses it; no clone-without-VM, no fork, no `wait4` row in the census table |
 
 ---
@@ -44,7 +44,7 @@ not a claim in a doc. These are the acceptance fixtures:
 | P1 | Acceptance program (static musl unless stated) |
 | --- | --- |
 | #1 signals | installs a `SIGSEGV` handler, faults, handler `longjmp`s, exits 0; a second run installs `SIGUSR1` and raises it; `abort()` still dies with the attributed kill. **Go**: heap growth with the default `GOGC` and `GODEBUG=asyncpreemptoff=0` completes GC cycles inside a tight loop that calls no functions |
-| #2 threads | `pthread_create`/`join`/`detach` × 8, per-thread TLS and `errno` isolation, one thread exits while another runs; a raw `clone` with `CLONE_CHILD_CLEARTID` clears its TID word and wakes the joiner |
+| #2 threads | `pthread_create`/`join`/`detach` × 8, per-thread TLS and `errno` isolation, one thread exits while another runs; a raw `clone` with `CLONE_CHILD_CLEARTID` clears its TID word and wakes the joiner — **this half already passes** (`tests/linux_thread_death_check.sh`, increments 30/30b), the pthreads half does not |
 | #3 per-thread I/O | two threads: one blocks in `read` on an empty descriptor, the sibling forwards a syscall and exits; the sibling's completion latency must be independent of the blocked thread's wait (measured, not asserted qualitatively) |
 | #4 static only | *product decision* — see §7. If taken as "support dynamic", the fixture is a dynamically linked `hello` under `ld.so` |
 | #5 lifecycle | `fork` + `execve` of a second stage, `wait4` observes exit code 7, `SIGCHLD` handler reaps; `system("true")`-shaped path works |
@@ -86,49 +86,45 @@ P1-F dynamic linking: independent, expensive, decision-gated (§7)
 
 **Retires:** "handlers are never invoked". **Size:** 3–4 increments. **Started 2026-11-25: increment 26 landed** (commit `ffcb2d5`) — the rt_sigframe builder, its restore, the default-action table, the delivery predicate and the EINTR rule, with a 64-check host test, guard clauses P–P4 and four new teeth; the layout is pinned by twelve `_Static_asserts`. **Increment 27 landed** (commit `4d552dd`): the delivery's mechanism — the 80-byte request decoder, `si_addr` from CR2/RIP per fault class, `linux_sig_deliver` writing the frame through the validated copy, and the sidecar's `-EINTR` park wake on `CAP_EINTR (-21)`. **Increment 28 landed** (commit `0225df4`): the wire is connected — `LINUX_STAGE_SIGFRAME` in the plan, exactly-80 in the shape rule, chan.c routing to `linux_sig_reply_apply`, the sidecar answering `Answer::SignalFrame` with its mask moved first, and `cap_resume_linux_sig` entering the handler from the park context; the boot after it entered a handler in ring 3 (`SIGHAND-OK` written by the handler's own bytes). **Increment 29 landed** (census + return trip): `tools/linux_rt_sigreturn_census.sh` traces a handler that returns and writes `tools/linux_rt_sigreturn_census.txt` (`15 rt_sigreturn 1`, same provenance columns as the candidate artifact), so the table row exists by measurement; `uc_sigmask` now carries the PRE-handler mask (the frame had stored the handler's — the defect that would leave a signal blocked forever); `linux_sig_return_apply` reads the frame at the handler's own `rsp` through `linux_user_copy_out`, restores registers + mask, clears the active flag and resumes; the sidecar's 15 arm puts back its `saved_mask` and refuses a 15 with no handler; RAX became park word 15 so the resume stops forcing 0. Guard P2/P4 rewritten from absence to presence, P13–P15 added, teeth t154–t157, host tests 65 + 45 checks, sidecar 78 tests, and a boot shows `[E7] rt_sigreturn: restored rip 400000000415 rsp 400000004e60 rax 0 mask 0` followed by the probe's `SIGRET-OK` — the handler RETURNED into the interrupted context. **Named remainders:** the synthetic restorer (not the guest's trampoline), `ucontext` fields beyond `uc_sigmask`, restartable delivery inside the restorer window, `linux_cr2` left uncaptured, and the `rt_sigprocmask` reveal path still refusing.
 
-Today the seam is honest but incomplete: `rt_sigaction` records the act
-(`SigState.act`, returned verbatim as `oldact`), `rt_sigprocmask` keeps a real
-mask with pending bits, and the `LINUX_TKILL` arm answers `ENOSYS` when the
-disposition says "handle" — deliberately, because there is no frame to run in.
-Default actions already terminate through one attributed `Answer::SignalKill`.
+The seam is no longer a stub: `rt_sigaction` records the act (`SigState.act`,
+returned verbatim as `oldact`), `rt_sigprocmask` keeps a real mask with pending
+bits, and `tkill`'s answer can BE a delivery — for a handler disposition the
+kernel stages an 80-byte act request (`kernel/linux_abi.c:973`) and the frame
+runs in ring 3 (increment 28). Default actions still terminate through one
+attributed `Answer::SignalKill`. What is open is listed in the work below.
 
-Work:
+Work already spent (items 1–3 of the original plan): the frame builder
+(`linux_sig_frame_build`, `kernel/linux_abi.c:1805`), the delivery through the
+park bridge (`cap_resume_linux_sig`, `kernel/process.c:3204`), `rt_sigreturn`
+with its kernel row (`kernel/linux_abi.c:148`) and the interruptible park
+(`CAP_EINTR`, `kernel/cap.h:188`). What remains:
 
-1. **The frame builder (kernel).** A pure function beside `linux_sig_copy_plan`
-   that emits an `rt_sigframe`-shaped block: `pretcode` (the recorded
-   `sa_restorer`; musl's static binaries install one, which is why honouring the
-   record is enough for the first acceptance program), `ucontext` with the
-   captured `gregs`, `siginfo`, and the FP state block. Layout pinned by a host
-   test that `_Static_assert`s every offset against `<signal.h>`'s `ucontext_t`
-   on the host — the same trick `tests/fpu_enable_host_test.c` uses for SDM bits.
-2. **The delivery point (kernel).** First at *return to user* only: after
-   `syscall_return_path`, if the thread has a pending, unblocked, handled
-   signal, push the frame, set RIP to the handler, RSP to `SS_ONSTACK ?
-   altstack : user rsp - frame - 16B alignment`, mask per `SA_NODEFER`, and
-   apply `SA_RESETHAND`. Everything else (timer, blocked-thread wake) stays
-   out of this increment.
-3. **`rt_sigreturn` (15).** Row `{15, LSC_SIG}` in the census table, a new
-   `tools/linux_syscall_census.txt` line, and a kernel-side restore of the
-   saved `gregs`. **Design tension to settle explicitly:** `FSBASE` is owned by
-   the kernel (§5.3, guard clause L). A sigreturn frame therefore may not set an
-   arbitrary FS base — it restores only the value the kernel recorded for that
-   thread, and refuses a forged one with a named errno. This is the one place
-   where Linux's "restore everything" and this shim's MSR invariant collide;
-   write the decision down in the guard before the code.
-4. **Interruptible waits.** `k_linux_forward` parks with no wake-on-signal. Add
-   an "interruptible park" flag: a signal to a parked thread wakes it, the
-   parked syscall answers `-EINTR` (or restarts per `SA_RESTART`), and the frame
-   is pushed on that return. Without this, a handler can never be installed and
-   relied on by a program that also blocks.
-5. **`SIGSEGV` intersects the trap path.** Today a fault is attributed and kills.
-   With a handler installed it must become a frame with `si_addr` from CR2 — and
-   keep the attributed kill when there is no handler. Guard tooth: a fault with
-   a handler must not print `[FAULT]` *and* not terminate.
+1. **`SIGSEGV` intersects the trap path.** `handle_page_fault` still kills
+   unconditionally (`kernel/stubs.c:71`) and `linux_sig_delivery_needed`
+   (`kernel/linux_abi.c:1947`) has no caller, so a handler installed for a fault
+   is recorded and never run. With a handler it must become a frame with
+   `si_addr` from CR2 — and keep the attributed kill when there is no handler.
+   This is also where `linux_cr2` gets captured: `pd->linux_cr2` is declared and
+   read (`kernel/process.c:3272`) but never assigned, so every delivery's fault
+   address is 0 today.
+2. **siginfo queueing and the other producers.** `SigState.pending` is a `u64`
+   bitmask, so real-time signals collapse to one bit, there is no `sigqueueinfo`,
+   and `tkill` is the only producer — no `kill`/`tgkill` rows. A real queue lands
+   with them.
+3. **fpstate.** The frame's fpstate pointer is NULL, so a handler that clobbers
+   xmm leaves it clobbered.
+4. **The restorer window.** A signal arriving inside the restorer, and the
+   `rt_sigprocmask` reveal path, which still refuses.
+5. **altstack and the wider `ucontext`.** `sigaltstack` (131) is recorded and
+   never delivered (`kernel/linux_abi.c:162`); `ucontext` beyond `uc_sigmask` is
+   not filled.
 
-Gate: new guard clauses (the letter space is nearly full — A–Z with **P, T, V**
-free, then `AA`+), teeth for: frame built at a misaligned RSP, handler mask not
-applied, `rt_sigreturn` not clearing the mask, `sigaltstack` still a no-op, a
-sigreturn that reaches the MSR. Live arm: the musl `SIGSEGV`+`longjmp` fixture.
+Gate: a new guard clause (the letter space is nearly full — taken today:
+A–C, F–I, K–P, R, T, X and the Z group; **D, E, J, Q, S, U, V, W, Y** are still
+free as single letters, then `AA`+), teeth for: frame built at a misaligned
+RSP, handler mask not applied, `rt_sigreturn` not clearing the mask,
+`sigaltstack` still a no-op, a sigreturn that reaches the MSR (t154–t157
+already tooth the return trip). Live arm: the musl `SIGSEGV`+`longjmp` fixture.
 
 Risk: the frame is written into the *user's* stack — every write must go through
 the same validated copy path as the sig copy plan (no supervisor page, no
@@ -166,7 +162,8 @@ Work:
    clause. Otherwise the two-thread arm silently degrades to one working thread
    after restore.
 
-Gate: a new guard clause (T is free) plus a **measured** live arm: leader parks
+Gate: a new guard clause (T is no longer free — T7 pins the TG-2d arm; D, E,
+J, Q, S, U, W, Y remain) plus a **measured** live arm: leader parks
 in `read` on an empty record, sibling forwards and completes; assert the
 sibling's completion time is not a function of the leader's wait. Tooth: revert
 to one shared pair → the measurement stalls and the guard reddens.
@@ -178,11 +175,14 @@ to one shared pair → the measurement stalls and the guard reddens.
 **Retires:** "Go-shaped clone only, `set_tid_address` inert". **Size:** 3–4
 increments. **After P1-A** (same files, same desktop).
 
-1. **`CLONE_CHILD_CLEARTID` + `set_tid_address` (one increment together).**
-   Store `clear_child_tid` on the descriptor; on thread exit write a zero word
-   to the user address (validated copy path) and `futex(FUTEX_WAKE, 1)` on it.
-   That pair *is* how `pthread_join` and Go's `runtime` detect a dead thread —
-   this single increment is most of the "general pthreads" gap.
+1. ~~**`CLONE_CHILD_CLEARTID` + `set_tid_address` (one increment together).**~~
+   **Landed in increments 30 and 30b**, since this plan was first drafted: the
+   word is stored on the descriptor at clone (`kernel/linux_thread.c:79`),
+   `set_tid_address` (218) is captured at the first trap
+   (`kernel/linux_abi.c:167`), and the exit glue writes 0 and
+   `futex(FUTEX_WAKE, 1)` on it from every death funnel — proven on a boot by
+   `tests/linux_thread_death_check.sh`. What is still open inside this item: the
+   parent/child `*SETTID` flags and `list_op_pending`.
 2. **Accept flags individually.** Replace the all-or-nothing
    `LINUX_CLONE_GO_FLAGS` check with a per-bit table: `VM|FS|FILES|SIGHAND|
    THREAD|SYSVSEM|SETTLS|CHILD_CLEARTID|CHILD_SETTID|PARENT_SETTID` accepted
@@ -262,7 +262,7 @@ single-group), and PID namespaces (`/proc`-shaped tools).
 
 ## P1-F — Dynamic linking (audit #4): a decision, not a task
 
-**DECIDED (2026-11-25): out of scope for now.** Recorded here and in `docs/AeroSLS-Linux-ABI-Shim-Design-v0.1.md` §6.1, so it can be reopened with a number attached instead of re-argued. A static-only target with static-musl and static-Go (non-PIE — the musl target emits `ET_DYN` by default and §5.1 refuses PIE, so `-C relocation-model=static` is the build flag, not a Go `-buildmode`) covers the gate's real workloads today. The syscall surface an `ld.so`-capable shim would need is named and priced at **4–6 increments**: `set_robust_list` (273), `rseq` (334), `getrandom` (318), `newfstatat` (262), `readlinkat` (267), `prlimit64` (302), `sched_getaffinity` (204), plus `mprotect` outside §5.4's W|X refusal for `RELRO`-shaped calls. Reopen condition (unchanged, shim doc §6): a named first user brings a dynamically linked binary and a static rebuild is impossible. Because every entry assumes working threads and signals, it stays behind P1-A/B and P1-C/D by construction — before them `ld.so` starts and dies inside pthread/signal start-up, which is a worse state than refusing the image by name.
+**DECIDED (2026-11-25): out of scope for now.** Recorded here and in `docs/AeroSLS-Linux-ABI-Shim-Design-v0.1.md` §6.1, so it can be reopened with a number attached instead of re-argued. A static-only target with static-musl and static-Go (non-PIE — the musl target emits `ET_DYN` by default and §5.1 refuses PIE, so `-C relocation-model=static` is the build flag, not a Go `-buildmode`) covers the gate's real workloads today. The syscall surface an `ld.so`-capable shim would need is named and priced at **4–6 increments**: `rseq` (334), `getrandom` (318), `newfstatat` (262), `readlinkat` (267), `prlimit64` (302), `sched_getaffinity` (204), plus `mprotect` outside §5.4's W|X refusal for `RELRO`-shaped calls (`set_robust_list` 273, on this list at drafting time, has since landed in increment 30 — `kernel/linux_abi.c:178`, trace `tools/linux_robust_list_census.txt` — and is off the price). Reopen condition (unchanged, shim doc §6): a named first user brings a dynamically linked binary and a static rebuild is impossible. Because every entry assumes working threads and signals, it stays behind P1-A/B and P1-C/D by construction — before them `ld.so` starts and dies inside pthread/signal start-up, which is a worse state than refusing the image by name.
 
 If it is later required, the honest path is two steps, and the cost is
 concentrated in *syscalls*, not in the loader:
@@ -272,7 +272,7 @@ concentrated in *syscalls*, not in the loader:
   `AT_EXECFN`), and jump to the interpreter. `ld.so` then does the relocation
   work itself using `openat`/`read`/`mmap`, which already exist.
 - **Close the syscall surface glibc/ld.so actually call** and that the census
-  does not yet carry: `set_robust_list` (273), `rseq` (334), `getrandom` (318),
+  does not yet carry: `rseq` (334), `getrandom` (318),
   `newfstatat` (262), `readlinkat` (267), `prlimit64` (302),
   `sched_getaffinity` (204), plus `mprotect` without the W|X refusal for
   `RELRO`-shaped calls. Budget 4–6 increments, and only after P1-B/D, because
@@ -288,8 +288,10 @@ concentrated in *syscalls*, not in the loader:
 ## 3. Cross-cutting obligations (the things that bite if skipped)
 
 1. **Every phase touches the checkpoint payload.** Per-thread channels, signal
-   dispositions/pending, `clear_child_tid`, and zombie exit status are all new
-   per-thread state. `docs/AeroSLS-E7-Thread-Group-Gate-v0.1.md`'s TG-2d payload
+   dispositions/pending, the TID and robust words increments 30/30b added to the
+   descriptor, and zombie exit status are all per-thread state that
+   `struct EnvCkptTask` does not carry — its 64 bytes hold only name, kind,
+   leader, thread_index, group_id, cap_count, entry and the stack bounds. `docs/AeroSLS-E7-Thread-Group-Gate-v0.1.md`'s TG-2d payload
    must grow a versioned extension for them, and `assert_group` must gain a clause
    per field — otherwise the two-thread arm keeps passing while restoring threads
    that are subtly dead (no channels, forgotten TID words). This is the single
@@ -313,11 +315,15 @@ concentrated in *syscalls*, not in the loader:
    phase adds one `kernel-guards` step (or extends an existing one) and its own
    guard clause pinning the invocation.
 
-5. **Census changes are code, not comments.** New syscalls (`rt_sigreturn` 15,
-   `clone3` 435, `wait4` 61, `fork` 57, `vfork` 58) need rows in
-   `tools/linux_syscall_census.txt`, the kernel table, and the sidecar's
-   documented refusal list — the three already disagree by design when a number
-   is *deliberately* absent, and the guard checks exactly that.
+5. **Census changes are code, not comments.** The remaining new syscalls
+   (`clone3` 435, `wait4` 61, `fork` 57, `vfork` 58) need a kernel-table row,
+   the sidecar's documented refusal list, and a trace of their own. That is how
+   `rt_sigreturn` (15) landed — row `kernel/linux_abi.c:148`, trace
+   `tools/linux_rt_sigreturn_census.txt` (`15 rt_sigreturn 1`), increment 29 —
+   and the same holds for 202, 233, 257 and 273, none of which appear in
+   `tools/linux_syscall_census.txt`'s 37-line aerobackup trace. The three
+   sources already disagree by design when a number is *deliberately* absent,
+   and the guard checks exactly that.
 
 ---
 
@@ -349,8 +355,8 @@ product constraint until someone needs a `.so`.
 
 1. ~~Dynamic linking (P1-F): scope out, or fund it?~~ **Decided 2026-11-25:
    out of scope for now** — recorded in §P1-F above and in the shim doc §6.1
-   with the syscall surface (273, 334, 318, 262, 267, 302, 204, plus RELRO
-   `mprotect`) and its 4–6 increments. No input needed unless the reopen
+   with the syscall surface (334, 318, 262, 267, 302, 204, plus RELRO
+   `mprotect`; 273 has since landed) and its 4–6 increments. No input needed unless the reopen
    trigger fires.
 2. ~~Thread cap: 32? 64? Sized from the manifest? Array or paged table?~~
    **Decided 2026-11-25: 32 threads per group, fixed array** — Appendix A has
