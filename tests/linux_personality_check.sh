@@ -104,6 +104,10 @@ ISRA=arch/x86/interrupt.asm
 SWLA=arch/x86/switch_lazy.asm
 KERC=kernel/kernel.c
 STUB=kernel/stubs.c
+# P (increment 26, the signal frame) reads these: the frame's host test, and
+# the table test that carries the "15 is not in the table yet" absence.
+SIGFRAME_HUT=tests/linux_sigframe_host_test.c
+SYSTAB=tests/linux_syscall_table_host_test.c
 FHUT=tests/fpu_enable_host_test.c
 PHUT=tests/linux_personality_host_test.c
 HUMAP=tests/user_map_identity_host_test.c
@@ -1575,6 +1579,75 @@ if grep -qF 'linux_clone_plan(GO' "$LCHUT" && \
     ok "Z5. the host test drives all three contracts: the exact Go mask and every missing mandatory flag, the 20-word context with rax/rsi/rsp/rip, and group join/double-join/cap refusal"
 else
     bad "Z5. the clone host test no longer exercises a branch above — the planner, context or group join would be argued from these greps alone, reachable only at boot"
+fi
+
+# ─── P. E7 increment 26 (P1-C): the signal frame ───────────────────────────
+# Five claims, each one a way the frame could be quietly wrong: the contract
+# exists and names its numbers (P), the layout is pinned by the compiler and
+# the builder allocates nothing (P1), the dispatch that does NOT exist yet
+# stays absent (P2), the host test actually drives every branch (P3), and no
+# delivery path was smuggled in beside the builder (P4).
+if grep -qF '#define LINUX_RT_SIGRETURN      15u' "$LABH" && \
+   grep -qF 'struct LinuxSigFrameSpec {' "$LABH" && \
+   grep -qF 'int linux_sig_frame_build(uint8_t *buf, uint32_t cap,' "$LABH" && \
+   grep -qF 'int linux_sig_frame_restore(const uint8_t *buf, uint32_t len,' "$LABH" && \
+   grep -qF '#define LINUX_SIGFRAME_SIZE      440u' "$LABH" && \
+   grep -qF '#define LINUX_SIGFRAME_SIGMASK   304u' "$LABH" && \
+   grep -qF '#define LINUX_SIGFRAME_INFO      312u' "$LABH" && \
+   grep -qF 'int linux_sig_default_action(uint32_t signo);' "$LABH" && \
+   grep -qF 'int linux_sig_delivery_needed(uint64_t blocked, uint32_t signo,' "$LABH" && \
+   grep -qF 'int linux_sig_park_is_eintr(uint32_t signo, uint64_t blocked,' "$LABH"; then
+    ok "P. the frame is a named contract: rt_sigreturn's number (15), the 440-byte rt_sigframe with its sigcontext at 48 and sigset at 304, and the three decisions — default action, delivery-needed and the EINTR rule — each declared where a host test can drive it"
+else
+    bad "P. the signal-frame contract is missing from kernel/linux_abi.h — the builder's numbers would live only in the .c, the EINTR rule would be an inline condition again, and no host test could pin the layout a libc reads"
+fi
+
+framesec="$(sed -n '/E7 increment 26 (P1-C/,/^int linux_sig_default_action/p' "$LABC" 2>/dev/null)"
+if [ -n "$framesec" ] && \
+   grep -qF 'struct LinuxSigContextMirror {' <<< "$framesec" && \
+   grep -qF 'struct LinuxUContextMirror {' <<< "$framesec" && \
+   grep -qF 'struct LinuxRtSigframeMirror {' <<< "$framesec" && \
+   [ "$(grep -c '_Static_assert' <<< "$framesec")" -ge 10 ] && \
+   grep -qF 'offsetof(struct LinuxSigContextMirror, rip) == 128' <<< "$framesec" && \
+   grep -qF 'offsetof(struct LinuxSigContextMirror, cs) == LINUX_SIGCTX_CS' <<< "$framesec" && \
+   grep -qF 'offsetof(struct LinuxUContextMirror, uc_sigmask) == 296' <<< "$framesec" && \
+   grep -qF 'offsetof(struct LinuxRtSigframeMirror, info) == LINUX_SIGFRAME_INFO' <<< "$framesec" && \
+   grep -qF 'sizeof(struct LinuxRtSigframeMirror) == LINUX_SIGFRAME_SIZE' <<< "$framesec" && \
+   grep -qF 'sig_handler_stack(' <<< "$framesec" && \
+   grep -qF 'rsp = ((top - (uint64_t)LINUX_SIGFRAME_SIZE) & ~(uint64_t)0xF) - 8u;' <<< "$framesec" && \
+   ! grep -qE 'malloc|kmalloc|alloc_page|alloc_frame' <<< "$framesec"; then
+    ok "P1. the layout is pinned by the compiler, not by prose: a mirror of sigcontext/ucontext/rt_sigframe plus ten _Static_asserts (rip at 128, cs at 144, uc_sigmask at 296, info at 312, frame 440) and Linux's own align_sigframe arithmetic — and the whole section allocates nothing, so the frame cannot leak a page on a refusal"
+else
+    bad "P1. the frame's layout pins are gone or the builder gained an allocator — a compiler that packed a field differently (or an edit to one offset) would ship a frame a guest libc misreads, with the failure landing in the handler instead of here"
+fi
+
+if grep -qF 'linux_syscall_class(LINUX_RT_SIGRETURN) == LSC_UNKNOWN' "$SIGFRAME_HUT" && \
+   grep -qF 'linux_syscall_class(200) == LSC_UNKNOWN' "$SYSTAB" && \
+   ! grep -qF 'LINUX_RT_SIGRETURN' "$DISP"; then
+    ok "P2. the absence is load-bearing and asserted: rt_sigreturn is named in the header, still UNKNOWN in the classification table, and has no dispatcher arm — the row waits for a real census run in increment 27, so nothing can dispatch a number nobody traced"
+else
+    bad "P2. rt_sigreturn either vanished from the frame contract or gained a dispatch without a census row — §5.6 says the table is BUILT from the trace, and a row added from belief is exactly what the census artifact exists to prevent"
+fi
+
+if grep -qF 'LINUX_SIGFRAME_SIZE == 440' "$SIGFRAME_HUT" && \
+   grep -qF 'LINUX_SIGFRAME_SIGMASK == 304' "$SIGFRAME_HUT" && \
+   grep -qF '(entry.r[LINUX_SIGREG_RSP] & 0xFu) == 8u' "$SIGFRAME_HUT" && \
+   grep -qF 'frame[LINUX_SIGFRAME_MCONTEXT + LINUX_SIGCTX_CS] == 0x33' "$SIGFRAME_HUT" && \
+   grep -qF 'a DISABLED altstack is not used even when SA_ONSTACK asks' "$SIGFRAME_HUT" && \
+   grep -qF 'SA_NODEFER leaves the signal unblocked' "$SIGFRAME_HUT" && \
+   grep -qF 'build/restore is a round trip' "$SIGFRAME_HUT" && \
+   grep -qF 'SA_RESTART means the syscall is restarted instead' "$SIGFRAME_HUT" && \
+   grep -qF 'a frame whose cs is not 0x33 is refused' "$SIGFRAME_HUT"; then
+    ok "P3. the host test drives the frame instead of describing it: the offsets as literals, the handler's rsp%16==8 entry shape, cs==0x33 both ways (built, and refused when forged), the altstack plus its disabled/tiny fallbacks, the mask with and without SA_NODEFER, a build/restore round trip, and the EINTR/SA_RESTART split"
+else
+    bad "P3. the frame host test no longer exercises a branch above — the layout, the altstack choice, the mask rule or the EINTR predicate would be argued from the builder's own prose, reachable only at boot"
+fi
+
+if ! grep -qE 'linux_sig_frame_deliver|setup_rt_frame|sigframe_write_user' "$LABC" "$DISP" && \
+   grep -qF 'increment 27' "$LABH"; then
+    ok "P4. no delivery was smuggled in beside the builder: nothing in the kernel writes a frame to a user stack, touches CR2 or hooks return-to-user, and the header says the hook, the table row and the sidecar's -EINTR answer are increment 27's — so this increment cannot be read as more than it is"
+else
+    bad "P4. a delivery path appeared without its increment — a frame written to a user stack with no host test, no census row and no EINTR answer is exactly the half-landed seam that reads as working"
 fi
 
 echo

@@ -61,6 +61,10 @@ FILES=(
     tests/fpu_enable_host_test.c
     # R (the signal seam) reads the plan's host test, same rule.
     tests/linux_personality_host_test.c
+    # P (increment 26, the signal frame) reads the frame's own host test and
+    # the table test that carries the "15 is not in the table yet" absence.
+    tests/linux_sigframe_host_test.c
+    tests/linux_syscall_table_host_test.c
     # Y (the soft mprotect transition) reads the helper's fake-table test.
     tests/user_map_identity_host_test.c
     # W (increment 20) reads the capture, the record, the task's name on the
@@ -68,6 +72,10 @@ FILES=(
     # same rule as O8/Q/R above, and the reason the coverage check below now
     # exists: these eight were added to the guard in #77 and not to this
     # list, so W1–W6 failed on the copy while passing on the real tree.
+    # W6 also greps the payload's release hook in env_service.c — it was read
+    # by the guard but missing here, so the baseline aborted with W6 on any
+    # faithful copy (found while adding clause P, 2026-11-25).
+    kernel/env_service.c
     kernel/env_payload.h
     kernel/env_payload.c
     kernel/env_ckpt.h
@@ -185,6 +193,9 @@ echo "two-phase writable copy and the stage's four-place lifecycle"
 echo "and increment 16's anonymous-map seam (clause set V) — the"
 echo "first-trap ladder, the verdict's two-cursor re-check, the FIXED"
 echo "replace's frame return and invlpg, and the fixture's map block"
+echo "and increment 26's signal frame (clause P) — the rt_sigframe the"
+echo "guest's libc reads, its compiler-pinned offsets, the altstack and"
+echo "mask rules, and the dispatch that is deliberately still absent"
 echo "and increment 25's munmap seam (clause set X) — the first-trap"
 echo "range refusal, the verdict's page walk and frame return, the"
 echo "sidecar's below-break twin, and the probe's E7MEM-MUNMAP-OK proof"
@@ -1135,8 +1146,14 @@ tooth clone-branch-gated-off Z3 "the first-trap clone branch never runs" "$W/t14
 # require the compatibility case to stay in the host test; without this
 # tooth, deleting it would leave every source clause green.
 seed "$W/t129"
-sed -i 's/"V2: a soft-free v2 payload replays every page"/"V2: replay case removed"/' "$W/t129/tests/env_payload_host_test.c"
-tooth payload-v2-replay-case-gone W6 "the v2 replay case label is gone" "$W/t129"
+# Retargeted 2026-11-25: the payload moved to the v5 task stride and the old
+# "V2: a soft-free v2 payload replays every page" label no longer exists, so
+# this sed had stopped matching and the tooth reported "mutation did not
+# apply" — invisible until the baseline's W6 seed gap was fixed and the teeth
+# could run at all. The v4-stride refusal W6 actually greps is the case that
+# must stay.
+sed -i 's/"V4: a v4 blob is refused by format before any pour (the v5 task stride is not its stride)"/"V4: stride case removed"/' "$W/t129/tests/env_payload_host_test.c"
+tooth payload-v4-stride-case-gone W6 "the v4-stride refusal case label is gone" "$W/t129"
 
 # t130: the soft-permission refusal label renamed away — the corrupt
 # permission case is the other half of the compatibility contract, and its
@@ -1152,6 +1169,34 @@ tooth payload-soft-perm-case-gone W6 "the corrupt soft-permission case label is 
 seed "$W/t131"
 sed -i '/CHECK(env_payload_last_refusal()\.a == 8,/d' "$W/t131/tests/env_payload_host_test.c"
 tooth payload-perm-refusal-operands-unasserted W6 "the a=8 assertion lines are gone but their labels and messages remain" "$W/t131"
+
+# t132: an offset nudged to a plausible neighbour. 296 is where the sigset
+# sits INSIDE the ucontext; the frame needs 304. P must name it.
+seed "$W/t132"
+sed -i 's/^#define LINUX_SIGFRAME_SIGMASK   304u$/#define LINUX_SIGFRAME_SIGMASK   296u/' "$W/t132/kernel/linux_abi.h"
+tooth sigframe-sigmask-offset-edited P "the frame's sigset offset is the ucontext-relative 296 instead of the frame's 304" "$W/t132"
+
+# t133: the assert that pins rip to greg 16 is deleted. The remaining eleven
+# still satisfy the count, so only P1's specific line can redden — which is
+# the point of asserting the line and not just a tally.
+seed "$W/t133"
+sed -i '/offsetof(struct LinuxSigContextMirror, rip) == 128/,+1d' "$W/t133/kernel/linux_abi.c"
+tooth sigframe-rip-assert-dropped P1 "the rip-at-128 static assert is gone while the rest of the layout still compiles" "$W/t133"
+
+# t134: the entry-shape case is stripped from the host test (its message line
+# stays). A P3 that only greps prose stays green while nothing asserts that a
+# handler is entered with rsp % 16 == 8.
+seed "$W/t134"
+sed -i '/CHECK((entry.r\[LINUX_SIGREG_RSP\] & 0xFu) == 8u,/d' "$W/t134/tests/linux_sigframe_host_test.c"
+tooth sigframe-entry-align-case-gone P3 "the rsp%16==8 assertion line is gone but its message remains" "$W/t134"
+
+# t135: a dispatch for rt_sigreturn smuggled in before its census run. P4's
+# absence clause is the only thing that can notice — the frame still builds.
+seed "$W/t135"
+printf '/* rt_sigreturn would be handled here (LINUX_RT_SIGRETURN) */\n' >> "$W/t135/kernel/syscall_dispatch.c"
+# P2 is the clause that catches this (the census-absence assertion); P4 stays
+# green because no delivery FUNCTION appeared, only a mention of the number.
+tooth sigframe-dispatch-smuggled P2 "the dispatcher mentions rt_sigreturn before any census row exists" "$W/t135"
 
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"

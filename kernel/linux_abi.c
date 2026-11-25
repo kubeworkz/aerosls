@@ -7,6 +7,9 @@
  * discipline the rest of this tree applies to on-disk formats. See
  * kernel/linux_abi.h for why this increment lands before any mechanism.
  */
+#include <stddef.h>  /* offsetof — a freestanding header, not libc: the frame's
+                      * field offsets are asserted against a local mirror, so a
+                      * compiler that disagrees stops the build (clause P) */
 #include "linux_abi.h"
 #include "cap.h"      /* CAP_E* (Phase-3 syscalls), CAP_ERR_* (Phase-5 k_chan), CAP_NONE */
 
@@ -1444,4 +1447,275 @@ size_t linux_stack_hwm_headroom(const uint8_t *region, size_t bytes,
     if (!region) return 0;
     while (i < bytes && region[i] == poison) i++;
     return i;
+}
+
+/* ═══ E7 increment 26 (P1-C, "the frame") — the signal frame as bytes ════
+ * The header carries the why and the layout table. This is the mechanism's
+ * pure half: a byte writer, a byte reader and three predicates. No user
+ * memory is touched (the caller hands us a staging buffer), no allocation,
+ * no state — so the host test drives every branch and the guard's clause P
+ * pins the numbers.
+ *
+ * The layout is pinned THREE ways, deliberately redundant: the macros in
+ * the header (what the host test reads), a local mirror of the two kernel
+ * structs (below) and _Static_asserts tying one to the other. A field the
+ * compiler packs differently, or a number edited in one place, stops the
+ * build instead of producing a frame a libc misreads at run time. */
+
+/* The kernel's `struct sigcontext`, field for field (asm/sigcontext.h).
+ * Only the offsets matter; the types exist so offsetof can speak. */
+struct LinuxSigContextMirror {
+    uint64_t r8, r9, r10, r11, r12, r13, r14, r15;
+    uint64_t rdi, rsi, rbp, rbx, rdx, rax, rcx, rsp, rip;
+    uint64_t eflags;
+    uint16_t cs, gs, fs, pad0;
+    uint64_t err, trapno, oldmask, cr2;
+    uint64_t fpstate;
+    uint64_t reserved1[8];
+};
+
+/* The kernel's `struct ucontext` prefix, up to and including sigmask. */
+struct LinuxUContextMirror {
+    uint64_t uc_flags;
+    uint64_t uc_link;
+    struct { uint64_t ss_sp; int32_t ss_flags; uint32_t pad; uint64_t ss_size; } uc_stack;
+    struct LinuxSigContextMirror uc_mcontext;
+    uint64_t uc_sigmask;         /* the kernel-ABI sigset: 8 bytes */
+};
+
+/* `struct rt_sigframe` as this increment writes it (pretcode, uc, info). */
+struct LinuxRtSigframeMirror {
+    uint64_t pretcode;
+    struct LinuxUContextMirror uc;
+    uint8_t info[128];
+};
+
+_Static_assert(sizeof(struct LinuxSigContextMirror) == LINUX_SIGFRAME_MCONTEXT_BYTES,
+               "sigcontext is 256 bytes (asm/sigcontext.h)");
+_Static_assert(offsetof(struct LinuxSigContextMirror, r8) == 0,
+               "sigcontext's gregs start with r8, not rdi — the kernel order");
+_Static_assert(offsetof(struct LinuxSigContextMirror, rip) == 128,
+               "rip is greg 16, at 128 bytes into the sigcontext");
+_Static_assert(offsetof(struct LinuxSigContextMirror, eflags) == LINUX_SIGCTX_EFLAGS,
+               "eflags follows the 17 gregs");
+_Static_assert(offsetof(struct LinuxSigContextMirror, cs) == LINUX_SIGCTX_CS,
+               "cs/gs/fs are u16s after eflags");
+_Static_assert(offsetof(struct LinuxSigContextMirror, err) == LINUX_SIGCTX_ERR,
+               "err/trapno/oldmask/cr2 follow the selectors and their pad");
+_Static_assert(offsetof(struct LinuxSigContextMirror, fpstate) == LINUX_SIGCTX_FPSTATE,
+               "the fpstate pointer is the last named field before reserved1");
+_Static_assert(offsetof(struct LinuxUContextMirror, uc_mcontext) ==
+                   LINUX_SIGFRAME_MCONTEXT - LINUX_SIGFRAME_UC,
+               "uc_mcontext sits 40 bytes into the ucontext");
+_Static_assert(offsetof(struct LinuxUContextMirror, uc_sigmask) == 296,
+               "uc_sigmask follows the 256-byte sigcontext, 40 bytes into the ucontext");
+_Static_assert(offsetof(struct LinuxRtSigframeMirror, uc) == LINUX_SIGFRAME_UC,
+               "pretcode is one pointer, then the ucontext");
+_Static_assert(offsetof(struct LinuxRtSigframeMirror, info) == LINUX_SIGFRAME_INFO,
+               "siginfo follows the ucontext");
+_Static_assert(sizeof(struct LinuxRtSigframeMirror) == LINUX_SIGFRAME_SIZE,
+               "the frame ends where the (absent) fpstate would begin");
+
+/* Byte helpers: the kernel is freestanding and this file carries no libc
+ * dependency, so the frame is written little-endian by hand. */
+static void sig_put64(uint8_t *p, uint64_t v)
+{
+    int i;
+    for (i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8 * i));
+}
+
+static void sig_put32(uint8_t *p, uint32_t v)
+{
+    int i;
+    for (i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8 * i));
+}
+
+static void sig_put16(uint8_t *p, uint16_t v)
+{
+    int i;
+    for (i = 0; i < 2; i++) p[i] = (uint8_t)(v >> (8 * i));
+}
+
+static uint64_t sig_get64(const uint8_t *p)
+{
+    uint64_t v = 0;
+    int i;
+    for (i = 7; i >= 0; i--) v = (v << 8) | p[i];
+    return v;
+}
+
+static uint16_t sig_get16(const uint8_t *p)
+{
+    return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
+}
+
+/* One delivery's stack choice, so the builder's two callers (build and the
+ * caller deciding where the handler runs) cannot disagree. Linux's rule:
+ * SA_ONSTACK with a usable altstack runs there and says SS_ONSTACK; without
+ * one the handler runs on the interrupted stack. */
+static uint64_t sig_handler_stack(const struct LinuxSigFrameSpec *spec,
+                                  int *onstack)
+{
+    *onstack = 0;
+    if (spec->alt_sp != 0 &&
+        spec->alt_size >= (uint64_t)LINUX_SIGFRAME_SIZE + 8u &&
+        (spec->alt_flags & (uint32_t)LINUX_SS_DISABLE) == 0 &&
+        (spec->act_flags & LINUX_SA_ONSTACK) != 0) {
+        *onstack = 1;
+        return spec->alt_sp + spec->alt_size;
+    }
+    return spec->user_rsp;
+}
+
+int linux_sig_frame_build(uint8_t *buf, uint32_t cap,
+                          const struct LinuxSigFrameSpec *spec,
+                          struct LinuxSigRegs *entry, uint64_t *entry_mask)
+{
+    uint64_t top, rsp, mask;
+    int onstack, i;
+
+    if (buf == 0 || spec == 0 || entry == 0) return -LINUX_EINVAL;
+    if (cap < LINUX_SIGFRAME_SIZE) return -LINUX_EINVAL;
+    if (spec->signo == 0 || spec->signo > 64) return -LINUX_EINVAL;
+    /* SIG_DFL (0) and SIG_IGN (1) are reserved words, never addresses: a
+     * frame for one would jump to NULL or to 1. */
+    if (spec->handler <= 1) return -LINUX_EINVAL;
+    /* No restorer, no return: the handler's `ret` would aim at whatever the
+     * frame's pretcode says, and Linux's fallback (the vDSO trampoline) does
+     * not exist here. Refusing is the honest answer. */
+    if (spec->restorer == 0) return -LINUX_EINVAL;
+
+    top = sig_handler_stack(spec, &onstack);
+    /* Room for the frame plus the 8-byte alignment step below, with a
+     * non-wrapping subtraction. */
+    if (top < (uint64_t)LINUX_SIGFRAME_SIZE + 24u) return -LINUX_EINVAL;
+    /* Linux's alignment: (sp - size) & -16, then -8, so the handler is
+     * entered with rsp % 16 == 8 — the ABI's "after a call" shape, which is
+     * what a compiler's prologue assumes. */
+    rsp = ((top - (uint64_t)LINUX_SIGFRAME_SIZE) & ~(uint64_t)0xF) - 8u;
+
+    /* The mask Linux installs for the handler: the thread's own blocked set,
+     * the action's mask, and the signal being delivered — unless SA_NODEFER
+     * asked for it not to be blocked (a handler that must see recursion). */
+    mask = spec->blocked | spec->act_mask;
+    if ((spec->act_flags & LINUX_SA_NODEFER) == 0)
+        mask |= (uint64_t)1u << (spec->signo - 1u);
+
+    for (i = 0; i < (int)LINUX_SIGFRAME_SIZE; i++) buf[i] = 0;
+
+    sig_put64(buf + LINUX_SIGFRAME_PRETCODE, spec->restorer);
+    sig_put64(buf + LINUX_SIGFRAME_UC_FLAGS, 0);
+    sig_put64(buf + LINUX_SIGFRAME_UC_LINK, 0);
+    if (onstack) {
+        sig_put64(buf + LINUX_SIGFRAME_UC_STACK + 0, spec->alt_sp);
+        sig_put32(buf + LINUX_SIGFRAME_UC_STACK + 8, LINUX_SS_ONSTACK);
+        sig_put64(buf + LINUX_SIGFRAME_UC_STACK + 16, spec->alt_size);
+    }
+
+    for (i = 0; i < (int)LINUX_SIGREG_COUNT; i++)
+        sig_put64(buf + LINUX_SIGFRAME_MCONTEXT + (uint64_t)i * 8u, spec->regs.r[i]);
+    sig_put64(buf + LINUX_SIGFRAME_MCONTEXT + LINUX_SIGCTX_EFLAGS, spec->regs.eflags);
+    sig_put16(buf + LINUX_SIGFRAME_MCONTEXT + LINUX_SIGCTX_CS, LINUX_SIGFRAME_USER_CS);
+    /* fpstate stays NULL: this increment carries no FP state (header's named
+     * limit). cr2/err/trapno/oldmask are 0 for the same reason — nothing
+     * here faults, and a stale fault address in a SIGTERM frame is a lie. */
+
+    sig_put64(buf + LINUX_SIGFRAME_SIGMASK, mask);
+
+    sig_put32(buf + LINUX_SIGFRAME_INFO + 0, spec->signo);  /* si_signo */
+    sig_put32(buf + LINUX_SIGFRAME_INFO + 4, 0);            /* si_errno */
+    sig_put32(buf + LINUX_SIGFRAME_INFO + 8, spec->code);   /* si_code  */
+    /* si_addr is the union's first member for the fault signals, 16 bytes
+     * in. Written unconditionally: a 0 there is "no address", not stale. */
+    sig_put64(buf + LINUX_SIGFRAME_INFO + 16, spec->addr);
+
+    /* The handler's entry context: the interrupted registers, with rsp/rip
+     * aimed at the frame and the handler, and the three arguments the ABI
+     * names (signo; then siginfo and ucontext when SA_SIGINFO was set). */
+    *entry = spec->regs;
+    entry->r[LINUX_SIGREG_RSP] = rsp;
+    entry->r[LINUX_SIGREG_RIP] = spec->handler;
+    entry->r[LINUX_SIGREG_RDI] = spec->signo;
+    if (spec->siginfo) {
+        entry->r[LINUX_SIGREG_RSI] = rsp + LINUX_SIGFRAME_INFO;
+        entry->r[LINUX_SIGREG_RDX] = rsp + LINUX_SIGFRAME_UC;
+    }
+    if (entry_mask) *entry_mask = mask;
+    return 0;
+}
+
+int linux_sig_frame_restore(const uint8_t *buf, uint32_t len,
+                            struct LinuxSigRegs *regs, uint64_t *mask)
+{
+    int i;
+
+    if (buf == 0 || regs == 0) return -LINUX_EINVAL;
+    if (len < LINUX_SIGFRAME_SIZE) return -LINUX_EINVAL;
+    /* The frame must have been built for a USER handler. cs is the one field
+     * a forged frame cannot pick correctly by accident, and a restore that
+     * accepted, say, cs=0x10 would return to ring 0 with the guest's
+     * registers. */
+    if (sig_get16(buf + LINUX_SIGFRAME_MCONTEXT + LINUX_SIGCTX_CS) !=
+        (uint16_t)LINUX_SIGFRAME_USER_CS)
+        return -LINUX_EINVAL;
+
+    for (i = 0; i < (int)LINUX_SIGREG_COUNT; i++)
+        regs->r[i] = sig_get64(buf + LINUX_SIGFRAME_MCONTEXT + (uint64_t)i * 8u);
+    regs->eflags = sig_get64(buf + LINUX_SIGFRAME_MCONTEXT + LINUX_SIGCTX_EFLAGS);
+    if (mask) *mask = sig_get64(buf + LINUX_SIGFRAME_SIGMASK);
+    return 0;
+}
+
+int linux_sig_default_action(uint32_t signo)
+{
+    switch (signo) {
+    case 17:                    /* SIGCHLD  */
+    case 23:                    /* SIGURG   */
+    case 28:                    /* SIGWINCH */
+        return LINUX_SIGDEF_IGNORE;
+    case 18:                    /* SIGCONT  */
+        return LINUX_SIGDEF_CONTINUE;
+    case 19:                    /* SIGSTOP  */
+    case 20:                    /* SIGTSTP  */
+    case 21:                    /* SIGTTIN  */
+    case 22:                    /* SIGTTOU  */
+        return LINUX_SIGDEF_STOP;
+    case 6:                     /* SIGABRT */
+    case 7:                     /* SIGBUS  */
+    case 8:                     /* SIGFPE  */
+    case 4:                     /* SIGILL  */
+    case 3:                     /* SIGQUIT */
+    case 11:                    /* SIGSEGV */
+    case 31:                    /* SIGSYS  */
+    case 5:                     /* SIGTRAP */
+    case 24:                    /* SIGXCPU */
+    case 25:                    /* SIGXFSZ */
+        return LINUX_SIGDEF_CORE;
+    case 0:
+        return LINUX_SIGDEF_NONE;
+    default:
+        /* 1..64 not named above terminate without a core (SIGHUP, SIGINT,
+         * SIGKILL, SIGTERM, SIGUSR1/2, the real-time range, ...), which is
+         * what Linux's table says for every one of them. */
+        return (signo <= 64) ? LINUX_SIGDEF_TERMINATE : LINUX_SIGDEF_NONE;
+    }
+}
+
+int linux_sig_delivery_needed(uint64_t blocked, uint32_t signo,
+                              uint64_t handler)
+{
+    if (signo == 0 || signo > 64) return 0;
+    if (blocked & ((uint64_t)1u << (signo - 1u))) return 0;
+    if (handler <= 1) return 0;   /* SIG_DFL / SIG_IGN: no frame */
+    return 1;
+}
+
+int linux_sig_park_is_eintr(uint32_t signo, uint64_t blocked,
+                            uint64_t handler, uint64_t act_flags)
+{
+    if (signo == 0 || signo > 64) return 0;
+    if (blocked & ((uint64_t)1u << (signo - 1u))) return 0;
+    if (handler <= 1) return 0;
+    if (act_flags & LINUX_SA_RESTART) return 0;
+    return 1;
 }

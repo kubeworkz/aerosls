@@ -964,4 +964,181 @@ int linux_channel_shape_ok(int n_chan_w, int n_chan_r);
 uint64_t linux_syscall_apply_reply(struct SLSLinuxSyscallRequest *req,
                                    const void *payload, uint64_t payload_len);
 
+/* ─── E7 increment 26 (P1-C, "the frame") — the signal frame's ABI ────────
+ * Increment 10's seam records handler dispositions and refuses to run them:
+ * there is no frame to run a handler IN and no rt_sigreturn to come back
+ * through. This increment lands the frame itself as a PURE function — the
+ * bytes and the two decisions (deliver? interrupt?) — with the user-stack
+ * write, the return-to-user hook and the sidecar's EINTR answer left to
+ * increment 27. The split is the repo's: a wrong number here can only be
+ * caught by a host test, so the numbers live where a host test can see
+ * them, and no delivery path exists yet that could disagree.
+ *
+ * The layout is the x86-64 kernel's own `struct rt_sigframe`
+ * (arch/x86/include/asm/ucontext.h + asm/sigcontext.h), because the thing
+ * that reads it is the GUEST's libc handler trampoline, not this kernel:
+ *
+ *   0    pretcode        the restorer the caller installed (sa_restorer)
+ *                        — a handler with no restorer cannot return, and a
+ *                        frame built with a zero here would `ret` to NULL
+ *   8    uc_flags
+ *   16   uc_link
+ *   24   uc_stack.ss_sp / 32 .ss_flags (+pad) / 40 .ss_size
+ *   48   uc_mcontext     struct sigcontext, 256 bytes (see below)
+ *   304  uc_sigmask      the kernel-ABI sigset: 8 bytes, 64 signals
+ *   312  siginfo         128 bytes; si_signo/errno/code, then si_addr at 16
+ *   440  (end — no fpstate; see the named limit below)
+ *
+ * `struct sigcontext`, at MCONTEXT:
+ *   +0    r8 r9 r10 r11 r12 r13 r14 r15     (the kernel's order, not the
+ *   +64   rdi rsi rbp rbx rdx rax rcx rsp rip   SYSCALL capture's order)
+ *   +136  eflags
+ *   +144  cs (u16), gs, fs, pad0
+ *   +152  err, trapno, oldmask, cr2
+ *   +184  fpstate pointer (0 here)
+ *   +192  reserved1[8]
+ *
+ * ─── What this increment deliberately does NOT carry ─────────────────────
+ *   - **No fpstate.** The pointer is NULL and rt_sigreturn does not touch
+ *     the FPU, so a handler that clobbers xmm keeps its clobbering. That is
+ *     a divergence from Linux, named here so nobody reads the frame as
+ *     complete: Go's async preemption (P1-D) needs a real fpstate and the
+ *     `save`/`restore` around the handler before its gate can be green.
+ *   - **No delivery.** `linux_sig_frame_build` writes bytes into a caller
+ *     buffer; nothing here writes a user stack, touches CR2, or hooks
+ *     return-to-user. That hook, the rt_sigreturn TABLE row (15) and the
+ *     park-interrupt are increment 27 — and the table row waits for a real
+ *     census run, because §5.6's rule is that the table is BUILT from the
+ *     trace, never from a number somebody believed.
+ *
+ * The EINTR half is a predicate, not a path: `linux_sig_park_is_eintr`
+ * answers Linux's own question (is this signal, for this disposition,
+ * allowed to interrupt a blocked syscall?) so increment 27's park flag has
+ * one named answer to consult instead of an inline condition.
+ *
+ * Pure: no allocation, no user-memory access, no globals — the host test
+ * drives every branch (tests/linux_sigframe_host_test.c), and the guard's
+ * clause P pins the layout literals it holds. */
+#define LINUX_RT_SIGRETURN      15u   /* named here; the TABLE row is
+                                       * increment 27's, after the census */
+
+/* The frame, at the offsets above. Pinned twice: as these literals (read by
+ * the host test) and as _Static_asserts in linux_abi.c (so a compiler that
+ * disagrees stops the build, not the boot). */
+#define LINUX_SIGFRAME_PRETCODE    0u
+#define LINUX_SIGFRAME_UC         8u
+#define LINUX_SIGFRAME_UC_FLAGS   8u
+#define LINUX_SIGFRAME_UC_LINK    16u
+#define LINUX_SIGFRAME_UC_STACK   24u
+#define LINUX_SIGFRAME_MCONTEXT   48u
+#define LINUX_SIGFRAME_SIGMASK   304u
+#define LINUX_SIGFRAME_INFO      312u
+#define LINUX_SIGFRAME_SIZE      440u
+#define LINUX_SIGFRAME_MCONTEXT_BYTES 256u
+#define LINUX_SIGINFO_BYTES      128u
+
+/* sigcontext-internal offsets, relative to LINUX_SIGFRAME_MCONTEXT. */
+#define LINUX_SIGCTX_EFLAGS      136u
+#define LINUX_SIGCTX_CS          144u
+#define LINUX_SIGCTX_GS          146u
+#define LINUX_SIGCTX_FS          148u
+#define LINUX_SIGCTX_ERR         152u
+#define LINUX_SIGCTX_TRAPNO      160u
+#define LINUX_SIGCTX_OLDMASK     168u
+#define LINUX_SIGCTX_CR2         176u
+#define LINUX_SIGCTX_FPSTATE     184u
+#define LINUX_SIGCTX_RESERVED    192u
+
+/* The ring-3 code selector a frame's cs must carry: a frame whose cs is
+ * anything else was not built for a user handler, so restore refuses it. */
+#define LINUX_SIGFRAME_USER_CS   0x33u
+
+/* sa_flags bits this increment reasons about. Values are Linux's. */
+#define LINUX_SA_SIGINFO   0x00000004ull
+#define LINUX_SA_ONSTACK   0x08000000ull
+#define LINUX_SA_RESTART   0x10000000ull
+#define LINUX_SA_NODEFER   0x40000000ull
+#define LINUX_SS_ONSTACK   1u
+
+/* The interrupted context as the frame carries it: the kernel's gregs order.
+ * Named indexes, because "which slot is rip" is the kind of fact a wrong
+ * number in an array literal gets wrong silently. */
+enum LinuxSigReg {
+    LINUX_SIGREG_R8 = 0, LINUX_SIGREG_R9, LINUX_SIGREG_R10, LINUX_SIGREG_R11,
+    LINUX_SIGREG_R12, LINUX_SIGREG_R13, LINUX_SIGREG_R14, LINUX_SIGREG_R15,
+    LINUX_SIGREG_RDI, LINUX_SIGREG_RSI, LINUX_SIGREG_RBP, LINUX_SIGREG_RBX,
+    LINUX_SIGREG_RDX, LINUX_SIGREG_RAX, LINUX_SIGREG_RCX, LINUX_SIGREG_RSP,
+    LINUX_SIGREG_RIP,
+    LINUX_SIGREG_COUNT
+};
+
+struct LinuxSigRegs {
+    uint64_t r[LINUX_SIGREG_COUNT];   /* gregs, in the kernel's order */
+    uint64_t eflags;
+};
+
+/* What a delivery has to decide before a frame exists. `handler`/`restorer`
+ * are act words 0 and 3 verbatim; `act_*` are words 1 and 2. */
+struct LinuxSigFrameSpec {
+    uint32_t signo;        /* 1..=64 */
+    uint32_t code;         /* si_code (SI_USER 0, SEGV_MAPERR 1, ...) */
+    uint64_t addr;         /* si_addr; 0 when the signal carries none */
+    uint64_t handler;      /* sa_handler — an address, never 0/1 here */
+    uint64_t restorer;     /* sa_restorer — the frame's pretcode */
+    uint64_t act_flags;    /* sa_flags */
+    uint64_t act_mask;     /* sa_mask, added to the handler's mask */
+    uint64_t blocked;      /* the thread's own mask before delivery */
+    uint64_t user_rsp;     /* the interrupted rsp */
+    uint64_t alt_sp;       /* sigaltstack.ss_sp, 0 = none installed */
+    uint64_t alt_size;     /* sigaltstack.ss_size */
+    uint32_t alt_flags;    /* sigaltstack.ss_flags */
+    uint32_t siginfo;      /* 1 = SA_SIGINFO: the handler takes 3 args */
+    struct LinuxSigRegs regs;   /* the interrupted context */
+};
+
+/* Build the frame for `spec` into `buf` (the caller's user-stack staging
+ * buffer — this function cannot touch a user page). On success returns 0,
+ * writes the handler's ENTRY context to `entry` (rsp aims at the frame,
+ * rip at the handler, rdi/rsi/rdx per SA_SIGINFO) and the mask to install
+ * to `entry_mask`. Refusals are -LINUX_EINVAL, all first-trap style: a cap
+ * below LINUX_SIGFRAME_SIZE, a signo outside 1..64, a handler that is
+ * SIG_DFL/SIG_IGN (no frame can run those), a zero restorer (nothing to
+ * return through), or a stack with no room for the frame. */
+int linux_sig_frame_build(uint8_t *buf, uint32_t cap,
+                          const struct LinuxSigFrameSpec *spec,
+                          struct LinuxSigRegs *entry, uint64_t *entry_mask);
+
+/* The inverse: read a built frame back out. Refuses -LINUX_EINVAL on a short
+ * buffer, a NULL argument, or a cs that is not LINUX_SIGFRAME_USER_CS — the
+ * one field a forged frame cannot get right without building it. `mask` may
+ * be NULL (a caller that only wants the registers). */
+int linux_sig_frame_restore(const uint8_t *buf, uint32_t len,
+                            struct LinuxSigRegs *regs, uint64_t *mask);
+
+/* Linux's default action per signal, so "terminate" is a table rather than
+ * an else-branch: 0..=64 total, 0 for a number outside the range (no
+ * action exists to take). */
+enum LinuxSigDefault {
+    LINUX_SIGDEF_NONE = 0,      /* not a signal number              */
+    LINUX_SIGDEF_IGNORE,        /* discarded                        */
+    LINUX_SIGDEF_TERMINATE,     /* kills the group                  */
+    LINUX_SIGDEF_CORE,          /* kills, and Linux would core-dump */
+    LINUX_SIGDEF_STOP,          /* stops                            */
+    LINUX_SIGDEF_CONTINUE       /* SIGCONT resumes a stopped task   */
+};
+int linux_sig_default_action(uint32_t signo);
+
+/* Does this signal need a frame? 1 only for an unmasked number with a real
+ * handler installed: SIG_DFL/SIG_IGN take the action/ignore path, a blocked
+ * number stays pending, and a number outside 1..=64 is never delivered. */
+int linux_sig_delivery_needed(uint64_t blocked, uint32_t signo,
+                              uint64_t handler);
+
+/* Linux's EINTR rule, as one predicate: an installed handler, not blocked,
+ * and no SA_RESTART means a blocked syscall returns -EINTR instead of being
+ * restarted. Increment 27's park flag consults this; the sidecar's answer
+ * and this predicate must agree, which is why it is not an inline test. */
+int linux_sig_park_is_eintr(uint32_t signo, uint64_t blocked,
+                            uint64_t handler, uint64_t act_flags);
+
 #endif /* LINUX_ABI_H */

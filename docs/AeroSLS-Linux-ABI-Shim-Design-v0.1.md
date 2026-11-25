@@ -489,7 +489,7 @@ The inherited gate is "a static binary doing the first user's actual work, runni
 - **The environment checkpoint/restore mechanism** (§8) — v0.2 item 1's, and landed as P1a: the capture, the versioned record and the payload are not E7's to build. E7's share of it — the Linux task's entry in that record, its per-page permissions and its resumed `rip`/`rsp` — is in scope and landed (§10.14, increments 20–21).
 - **A translator** (§4.5) — QEMU-SLS's, and the line that keeps the two from competing.
 - **Nested environments** — already closed in the POSIX roadmap §12 for the same reason LPAR §9 closed nested partitions.
-- **Signal delivery to Linux tasks** (§5.6) — accepted and recorded, never delivered; E5's `env destroy` is the lifecycle.
+- **Signal delivery to Linux tasks** (§5.6) — dispositions accepted and recorded, and as of increment 26 the frame exists (§10.16); the delivery hook, the `rt_sigreturn` row and `-EINTR` wakes are increment 27's. E5's `env destroy` remains the lifecycle.
 - **Networking syscalls** (`socket`, `connect`, …) — v0.2 item 2's, and H2 §2 item #2 does not require them for the first user.
 
 ---
@@ -3790,6 +3790,64 @@ real firstuser's own guard-page call is verified by its dedicated boot
 (`tests/e7_firstuser_guard_check.sh`, exit 0,
 `evidence/e7_firstuser_guard_live.log`); clause set **R9** keeps 131 out of
 the asm number chain that had been deciding it before the personality branch.
+
+---
+
+### 10.16 What has landed — increment 26 (the signal frame, P1-C's first half)
+
+Increment 10's seam recorded dispositions and refused to run them, because
+there was no frame to run a handler in. Increment 26 lands the frame itself as
+a **pure function**, and nothing else — the split is deliberate, because the
+layout is the one artifact a guest's libc reads unaided and a wrong number in
+it fails in the handler rather than here.
+
+- **The contract** (`kernel/linux_abi.h`): `LINUX_RT_SIGRETURN` 15 (named, not
+  yet classified), the 440-byte `rt_sigframe` at the kernel's own offsets
+  (pretcode 0, ucontext 8, sigcontext 48, sigset 304, siginfo 312), the
+  sigcontext's internal offsets (rip at 128, eflags at 136, cs at 144, fpstate
+  at 184, reserved1 192..256), and four decisions: `linux_sig_frame_build`,
+  `linux_sig_frame_restore`, `linux_sig_default_action` (Linux's action table,
+  0..64 total), `linux_sig_delivery_needed` and `linux_sig_park_is_eintr` —
+  Linux's EINTR rule (install, not blocked, no `SA_RESTART`) as a predicate
+  rather than an inline condition, so increment 27's park flag and the
+  sidecar's answer have one named rule to agree on.
+- **The mechanism** (`kernel/linux_abi.c`): the builder applies Linux's own
+  `align_sigframe` arithmetic (`rsp % 16 == 8` at handler entry), picks the
+  alternate stack only for a usable, enabled one under `SA_ONSTACK` (and
+  records `SS_ONSTACK`), composes the handler's mask as
+  `blocked | sa_mask | the signal` minus `SA_NODEFER`, writes `cs = 0x33`,
+  and fills `siginfo`'s `si_signo`/`si_code`/`si_addr` (a real crash reporter's
+  three fields). It refuses — `-EINVAL`, before any write — a short buffer, a
+  signal outside 1..64, a `SIG_DFL`/`SIG_IGN` handler, a zero restorer (a
+  handler that cannot return), and a stack with no room. Restore refuses a
+  short frame and one whose `cs` is not `0x33` — the one field a forged frame
+  cannot pick correctly.
+- **The layout is pinned by the compiler, twice**: a mirror of `sigcontext`,
+  `ucontext` and `rt_sigframe` in the .c plus twelve `_Static_assert`s tying
+  each field to the published offset. That is not ceremony: the first build
+  failed on `offsetof(uc_sigmask) == 296`, which is what caught the author's
+  own 304-vs-296 confusion between the frame offset and the ucontext-relative
+  one.
+- **Named limits, in the header where they cannot be missed**: no `fpstate`
+  (pointer NULL, sigreturn does not touch the FPU — so a handler that clobbers
+  xmm keeps the clobbering, and P1-D's async preemption needs the real one),
+  and **no delivery** — nothing writes a user stack, touches CR2 or hooks
+  return-to-user, and `rt_sigreturn`'s table row stays absent until a real
+  census run (increment 27) rather than being added on belief.
+- **Evidence**: `tests/linux_sigframe_host_test.c` (64 checks: offsets as
+  literals, the entry shape, `cs` both ways, altstack plus its disabled/tiny
+  fallbacks, the mask with and without `SA_NODEFER`, the build/restore round
+  trip, the EINTR/`SA_RESTART` split, and the deliberate-absence assertion);
+  `tests/linux_personality_check.sh` clauses **P–P4**; four new teeth in
+  `tests/linux_personality_check_smoke.sh` (offset edited, rip assert dropped,
+  entry-align case removed, dispatch smuggled in) — 139 teeth total, all
+  biting. `make x86-iso` still builds.
+
+**What increment 27 needs before a live arm is worth wiring**: the
+return-to-user delivery hook (frame write through the validated copy path, RIP
+handed to the handler), the `rt_sigreturn` row *with* its census trace, the
+sidecar's `-EINTR` answer on the parked forward, and `CR2` for `SIGSEGV`.
+Until those land, clause **P4** refuses the increment being read as delivery.
 
 ---
 
