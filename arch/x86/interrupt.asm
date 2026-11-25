@@ -91,29 +91,52 @@ section .text
 ; every other fault stub uses, so the frame layout cannot drift from theirs.
 FAULT_STUB_EC isr8_stub
 
+; ─── isr14_stub — #PF ─────────────────────────────────────────────────────────
+; E7 increment 31: the FULL register set is saved, because a ring-3 fault
+; with a handler installed is delivered as a signal frame — the frame records
+; the interrupted context, so a register this stub does not save is a
+; register the handler sees as zero. The push order here IS stubs.c's
+; `struct LinuxFaultGPRs` field order, read from the same stack:
+;   [rsp] r15, +8 r14, +16 r13, +24 r12, +32 r11, +40 r10, +48 r9, +56 r8,
+;   +64 rdi, +72 rsi, +80 rbx, +88 rdx, +96 rcx, +104 rax, +112 rbp(user)
+; and then the CPU's error-code frame at +120 (rbp's own slot is the entry
+; `push rbp`, so rbp+8 is error_code). The epilogue is unconditional: a
+; delivery REWRITES these slots and the trap frame, so popping and iretq'ing
+; is the jump into the handler as well as the resume of the fault.
 isr14_stub:
     push rbp
     mov  rbp, rsp
     push rax
     push rcx
     push rdx
+    push rbx
     push rsi
     push rdi
     push r8
     push r9
     push r10
     push r11
-    mov  rdi, [rbp + 8]   ; error_code
-    mov  rsi, [rbp + 16]  ; faulting RIP (or CS for Ring-0)
-    mov  rdx, [rbp + 40]  ; user RSP (Ring-3 faults only; 0 for Ring-0)
-    mov  rcx, [rsp + 32]  ; fault-time RDI (pushed: rax@0 rcx@8 rdx@16 rsi@24 rdi@32)
+    push r12
+    push r13
+    push r14
+    push r15
+    mov  rdi, [rbp + 8]    ; error_code
+    mov  rsi, [rbp + 16]   ; faulting RIP (or CS for Ring-0)
+    mov  rdx, [rbp + 40]   ; user RSP (Ring-3 faults only; 0 for Ring-0)
+    mov  rcx, [rsp + 64]   ; fault-time RDI (LinuxFaultGPRs.rdi)
+    mov  r8,  rbp          ; the pushed frame base (GPRs at rbp-112, trap at rbp+8)
     call handle_page_fault
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
     pop  r11
     pop  r10
     pop  r9
     pop  r8
     pop  rdi
     pop  rsi
+    pop  rbx
     pop  rdx
     pop  rcx
     pop  rax

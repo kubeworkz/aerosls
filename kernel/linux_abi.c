@@ -1500,6 +1500,92 @@ int linux_sig_deliver(uint64_t root, const struct LinuxSigDeliverReq *req,
     return 0;
 }
 
+/* ─── E7 increment 31 (P1-C): the FAULT's own delivery ─────────────────────
+ * The pure half: a decided act plus the interrupted context in, a built
+ * frame and the handler's entry context out. No user page is touched here —
+ * the caller copies the frame through linux_user_copy_in — which is what
+ * lets the host test drive every branch with no page tables at all. */
+int linux_fault_act_index(uint32_t signo)
+{
+    switch (signo) {
+    case LINUX_SIGILL:  return 0;
+    case LINUX_SIGBUS:  return 1;
+    case LINUX_SIGFPE:  return 2;
+    case LINUX_SIGSEGV: return 3;
+    default:            return -1;
+    }
+}
+
+int linux_fault_act_record(struct LinuxFaultAct *slots, uint32_t signo,
+                           const uint8_t act[LINUX_SIGACT_BYTES])
+{
+    int i = linux_fault_act_index(signo);
+    if (i < 0 || !slots || !act) return 0;
+    /* The word order is the one the REST of this tree uses on the wire —
+     * {handler, flags, mask, restorer} — because the sidecar is the other
+     * reader of these exact bytes (its `sig.act[2]` is sa_mask and `[3]` the
+     * restorer). One order, two readers; a kernel that read the x86-64
+     * uapi's `{handler, flags, restorer, mask}` here would swap the mask and
+     * the restorer with the sidecar and deliver with the wrong one of the
+     * two. §10.26 names the wider discrepancy this inherits. */
+    slots[i].handler  = sig_get64(act + 0);
+    slots[i].flags    = sig_get64(act + 8);
+    slots[i].mask     = sig_get64(act + 16);
+    slots[i].restorer = sig_get64(act + 24);
+    return 1;
+}
+
+int linux_fault_sig_plan(const struct LinuxFaultAct *act, uint64_t blocked,
+                         uint32_t signo, uint32_t code, uint64_t cr2,
+                         const struct LinuxSigRegs *ctx,
+                         uint8_t frame[LINUX_SIGFRAME_SIZE],
+                         struct LinuxSigRegs *entry, uint64_t *entry_mask)
+{
+    struct LinuxSigFrameSpec spec;
+    struct LinuxSigRegs entry_local;
+    uint64_t mask = 0;
+    uint64_t addr = 0;
+    int r;
+
+    if (!act || !ctx || !frame || !entry || !entry_mask) return -LINUX_EINVAL;
+
+    /* The two "no frame" answers, decided before anything is built: a
+     * disposition that is not a handler (SIG_DFL/SIG_IGN — the caller's kill
+     * is Linux's own answer), a blocked signal (it would PEND, and this path
+     * has no queue to pend it in), and no restorer (the builder's own
+     * refusal, hoisted so the refusal is not mistaken for a fault). */
+    if (!linux_sig_delivery_needed(blocked, signo, act->handler)) return 0;
+    if (act->restorer == 0) return 0;
+
+    spec.signo     = signo;
+    spec.code      = code;
+    spec.addr      = linux_sig_si_addr(signo, cr2,
+                                       ctx->r[LINUX_SIGREG_RIP], &addr)
+                     ? addr : 0;
+    spec.handler   = act->handler;
+    spec.restorer  = act->restorer;
+    spec.act_flags = act->flags;
+    spec.act_mask  = act->mask;
+    spec.blocked   = blocked;
+    spec.user_rsp  = ctx->r[LINUX_SIGREG_RSP];
+    /* v1 records no sigaltstack (increment 26's named limit), so the frame
+     * always goes on the interrupted stack. */
+    spec.alt_sp    = 0;
+    spec.alt_size  = 0;
+    spec.alt_flags = LINUX_SS_DISABLE;
+    spec.siginfo   = (act->flags & LINUX_SA_SIGINFO) ? 1u : 0u;
+    spec.regs      = *ctx;
+
+    r = linux_sig_frame_build(frame, LINUX_SIGFRAME_SIZE, &spec,
+                              &entry_local, &mask);
+    if (r != 0) return r;      /* nothing written: the builder refuses before
+                                * its first store */
+
+    *entry = entry_local;
+    *entry_mask = mask;
+    return 1;
+}
+
 /* ─── The initial stack and auxv (§5.2) ────────────────────────────────────
  * Byte-exact layout, low address (returned rsp) upward — the canonical
  * process-entry image a static libc walks:

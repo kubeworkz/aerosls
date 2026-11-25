@@ -1703,6 +1703,68 @@ else
     bad "Z8. the new call sites cannot wake anyone: if linux_group_release_all forgets the group's waiters before the glue loop, or releases members first, the clear finds no joiner and a faulted or group-exited thread still leaves it parked — the I5 defect the move was made to fix. If the clear line does not report the wake count, the live arm cannot tell that apart from a real wake."
 fi
 
+# ─── AA. E7 increment 31 (P1-C): the FAULT's own delivery ──────────────────
+# A ring-3 #PF has no syscall behind it, so the sidecar — the authority for
+# every disposition — cannot be asked before the thread must either run a
+# handler or die. The kernel's answer is a copy of the four fault signals'
+# acts, recorded where the bytes already cross, and a frame built by the SAME
+# builder every other delivery uses. Five claims, each a way this could be
+# silently wrong: the acts are recorded in the sidecar's own word order (AA1),
+# CR2 is captured where the fault is (AA2), the stub's saved frame and the C
+# struct are ONE shape (AA3), the action is recorded at the first trap and the
+# plan decides (AA4), and a handler is a delivery while no handler is still
+# the attributed kill — with a live arm that can tell those two apart (AA5).
+# The single-letter space is full (A–Z), so this is the first `AA` clause.
+STUBS=kernel/stubs.c
+FSHUT=tests/linux_fault_sig_host_test.c
+FSCHK=tests/linux_fault_sig_check.sh
+FSFIX=user/sidecar/fixtures/e7_fault_handler_probe.S
+FSMOD=user/sidecar/src/e7_thread_death.rs
+FSASM=arch/x86/interrupt.asm
+fs_cap="$(grep -n 'fcur->linux_cr2 = faulting_address;' "$STUBS" 2>/dev/null | head -1 | cut -d: -f1)"
+fs_plan="$(grep -n 'linux_fault_sig_plan(&fcur->linux_fault_act\[fi\],' "$STUBS" 2>/dev/null | head -1 | cut -d: -f1)"
+fs_copy="$(grep -n 'linux_user_copy_in(frame, fcur->cr3,' "$STUBS" 2>/dev/null | head -1 | cut -d: -f1)"
+fs_ret="$(grep -n '(not a kill)' "$STUBS" 2>/dev/null | head -1 | cut -d: -f1)"
+fs_kill="$(grep -n '\[FAULT\] Ring-3 #PF' "$STUBS" 2>/dev/null | head -1 | cut -d: -f1)"
+if grep -qF 'struct LinuxFaultAct {' "$LABH" && \
+   grep -qF '#define LINUX_FAULT_SIG_COUNT 4u' "$LABH" && \
+   grep -qF 'int linux_fault_sig_plan(const struct LinuxFaultAct *act, uint64_t blocked,' "$LABH" && \
+   grep -qF 'slots[i].mask     = sig_get64(act + 16);' "$LABC" && \
+   grep -qF 'slots[i].restorer = sig_get64(act + 24);' "$LABC" && \
+   grep -qE 'slots\[3\]\.mask +== 0xCCCC0000ull' "$FSHUT" && \
+   grep -qF 'slots[3].restorer == 0xBBBB0000ull' "$FSHUT" && \
+   grep -qF 'uint64_t   linux_cr2;' "$PDH" && \
+   grep -qF 'struct LinuxFaultAct linux_fault_act[LINUX_FAULT_SIG_COUNT];' "$PDH" && \
+   grep -qF 'pd->linux_fault_act[fi].handler  = 0;' "$PDC" && \
+   [ -n "$fs_cap" ] && \
+   grep -qF 'if (num == LINUX_RT_SIGACTION && largs[1] != 0) {' "$DISP" && \
+   grep -qF 'linux_fault_act_record(cur->linux_fault_act,' "$DISP" && \
+   grep -qF 'linux_sig_delivery_needed(blocked, signo, act->handler)' "$LABC" && \
+   grep -qF 'linux_sig_si_addr(signo, cr2,' "$LABC" && \
+   grep -qF 'linux_sig_frame_build(frame, LINUX_SIGFRAME_SIZE, &spec,' "$LABC" && \
+   grep -qF 'uint64_t r15, r14, r13, r12, r11, r10, r9, r8;' "$STUBS" && \
+   grep -qF 'uint64_t rdi, rsi, rbx, rdx, rcx, rax;' "$STUBS" && \
+   grep -qF 'push r15' "$FSASM" && grep -qF 'pop  r15' "$FSASM" && \
+   grep -qF 'mov  r8,  rbp' "$FSASM" && grep -qF 'mov  rcx, [rsp + 64]' "$FSASM" && \
+   grep -qF 'process_exit(139);' "$STUBS" && \
+   [ -n "$fs_plan" ] && [ -n "$fs_copy" ] && [ -n "$fs_ret" ] && [ -n "$fs_kill" ] && \
+   [ "$fs_cap" -lt "$fs_plan" ] && [ "$fs_plan" -lt "$fs_copy" ] && \
+   [ "$fs_copy" -lt "$fs_ret" ] && [ "$fs_ret" -lt "$fs_kill" ] && \
+   grep -qF 'si_addr is CR2' "$FSHUT" && \
+   grep -qF 'SIG_DFL asks for no frame' "$FSHUT" && \
+   [ -s "$FSFIX" ] && [ -s user/sidecar/fixtures/e7_fault_handler_probe.flat ] && \
+   grep -qF 'E7FH-OK' "$FSFIX" && grep -qF 'cmp     %r13, %rax' "$FSFIX" && \
+   grep -qF 'SA_SIGINFO' "$FSFIX" && \
+   grep -qF 'spawn_fault_handler' "$FSMOD" && \
+   grep -qF 'crate::e7_thread_death::spawn_fault_handler' "$LRE" && \
+   grep -qF 'pub mod e7_thread_death;' user/sidecar/src/lib.rs && \
+   [ -s "$FSCHK" ] && grep -qF 'E7FH-OK' "$FSCHK" && \
+   grep -qF 'the handlerless arm still died by the attributed Ring-3 #PF kill' "$FSCHK"; then
+    ok "AA. a Ring-3 #PF with a handler installed is a DELIVERY: the kernel keeps the four fault signals' acts (recorded at rt_sigaction's first trap, in the same word order the sidecar reads — mask at 16, restorer at 24, asserted by the host test), the fault captures CR2 into the descriptor BEFORE it decides, the decision is linux_sig_fault_plan's (SIG_DFL/SIG_IGN/blocked/no-restorer = no frame) and the frame is the same builder every other delivery uses; a delivery copies the frame through the validated walker, rewrites the trap frame and returns 1, so the stub's pop/iretq IS the jump into the handler — while the attributed kill (process_exit 139) is still reachable below it and [FAULT] is printed only on that path. isr14_stub saves all 15 GPRs in the SAME field order the C struct reads, the slot reset clears the acts so a reused descriptor cannot run its predecessor's handler, the host test pins si_addr to CR2 and the interrupted registers, and the live arm proves both answers on one boot: the handlerless fault still dies, the handled one writes E7FH-OK only when si_addr equals the page it mapped"
+else
+    bad "AA. the fault's delivery is not wired: without the act copy the kernel cannot know a handler was installed and a #PF keeps killing threads that asked to survive it; without the CR2 capture a SIGSEGV handler is told the fault happened at NULL; a stub that saves fewer registers gives the handler a frame full of the wrong context; a plan that ran AFTER the kill line would leave the two answers indistinguishable in the log; and a live arm that cannot show the handlerless kill on the same boot cannot tell 'delivery works' from 'nothing faults any more'."
+fi
+
 # ─── P. E7 increment 26 (P1-C): the signal frame ───────────────────────────
 # Five claims, each one a way the frame could be quietly wrong: the contract
 # exists and names its numbers (P), the layout is pinned by the compiler and

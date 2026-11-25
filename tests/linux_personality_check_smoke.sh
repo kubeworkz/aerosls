@@ -69,6 +69,13 @@ FILES=(
     # P12 (increment 28) reads the LIVE check's script as well as the probe.
     tests/linux_sigdeliver_host_test.c
     tests/linux_signal_probe_check.sh
+    # D (increment 31, the fault's own delivery) reads the fault plan's host
+    # test, the live arm's fixture, module and check script — same rule as P12.
+    tests/linux_fault_sig_host_test.c
+    tests/linux_fault_sig_check.sh
+    user/sidecar/fixtures/e7_fault_handler_probe.S
+    user/sidecar/fixtures/e7_fault_handler_probe.flat
+    user/sidecar/src/e7_thread_death.rs
     # Y (the soft mprotect transition) reads the helper's fake-table test.
     tests/user_map_identity_host_test.c
     # W (increment 20) reads the capture, the record, the task's name on the
@@ -1383,6 +1390,15 @@ awk '/^static void linux_group_release_all/ { inb = 1 }
      { print }' "$W/t162/kernel/process.c" > "$W/t162/kernel/process.c.new" &&
     mv "$W/t162/kernel/process.c.new" "$W/t162/kernel/process.c"
 tooth forget-before-glue Z8 "the teardown forgets the group's waiters before the glue can wake them" "$W/t162"
+
+# t163: the fault path stops asking the delivery plan. CR2 is still captured,
+# the stub still saves a full frame, and every other delivery still works — a
+# handler installed for a FAULT simply never runs, which is the pre-increment
+# symptom with the capture half already present (and the reason AA pins the
+# call, not just the function's existence).
+seed "$W/t163"
+sed -i 's/linux_fault_sig_plan(&fcur->linux_fault_act\[fi\],/linux_fault_sig_unasked(\&fcur->linux_fault_act[fi],/' "$W/t163/kernel/stubs.c"
+tooth fault-delivery-unasked AA "the #PF path stopped asking for a delivery" "$W/t163"
 
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"

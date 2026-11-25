@@ -28,7 +28,7 @@ P0 list has an item this branch never touched, it is invisible here.
 
 | P1 | Where it lives today |
 | --- | --- |
-| No async preemption, siginfo queueing, fpstate, or signals past `tkill` | **Partly closed** — increments 26–29c landed real delivery: `linux_sig_frame_build`/`linux_sig_frame_restore` and the park bridge (`kernel/linux_abi.c`), `linux_sig_reply_apply`/`linux_sig_return_apply` (`kernel/process.c`), and the sidecar's `Answer::SignalFrame` arm with `sig.handler_active`/`sig.saved_mask` (`linux.rs`), so `tkill` enters a ring-3 handler that returns through `rt_sigreturn`, proven on a boot by `tests/linux_signal_probe_check.sh`. Still open: **no async preemption** (a signal is delivered only on the reply to a syscall the task itself made — `tkill` — or on the 14-unblock reveal; a task spinning in ring 3 is never signalled); **no siginfo queueing** (`SigState.pending` is a `u64` bitmask, so real-time signals collapse to one bit and `sigqueueinfo` is absent — **self-signals only via `tkill`**, with no `kill`/`tgkill` row); **no fpstate restore** (the frame's fpstate pointer is NULL, so a handler that clobbers xmm leaves it clobbered); and no restart window inside the restorer |
+| No async preemption, siginfo queueing, fpstate, or signals past `tkill` | **Partly closed** — increments 26–29c landed real delivery: `linux_sig_frame_build`/`linux_sig_frame_restore` and the park bridge (`kernel/linux_abi.c`), `linux_sig_reply_apply`/`linux_sig_return_apply` (`kernel/process.c`), and the sidecar's `Answer::SignalFrame` arm with `sig.handler_active`/`sig.saved_mask` (`linux.rs`), so `tkill` enters a ring-3 handler that returns through `rt_sigreturn`, proven on a boot by `tests/linux_signal_probe_check.sh`. **Increment 31 (shim doc §10.26) added the fault path's own delivery**: a ring-3 #PF with a handler builds a frame with `si_addr` from CR2 and enters it, so the trap path is no longer kill-only. Still open: **no async preemption** (a signal is delivered only on the reply to a syscall the task itself made — `tkill` — or on the 14-unblock reveal; a task spinning in ring 3 is never signalled); **no siginfo queueing** (`SigState.pending` is a `u64` bitmask, so real-time signals collapse to one bit and `sigqueueinfo` is absent — **self-signals only via `tkill`**, with no `kill`/`tgkill` row); **no fpstate restore** (the frame's fpstate pointer is NULL, so a handler that clobbers xmm leaves it clobbered); and no restart window inside the restorer |
 | General thread semantics | **Mostly closed by increments 30/30b** — `CLONE_CHILD_CLEARTID` is in `LINUX_CLONE_ALLOWED` (`kernel/linux_thread.h:75`) and honoured at clone (`kernel/linux_thread.c:79`); `set_tid_address` (218) is not inert: the sidecar answers the tid echo and the kernel captures the word at the first trap and clears it at exit (`kernel/linux_abi.c:167`); the glue is consumed once per death (`linux_thread_take_exit_words`), so exit(60), `exit_group`, a sibling's fault and the deferred-kill sweep all clear. Still open: the parent/child `*SETTID` flags, `list_op_pending`, and `clone3` (435) |
 | Per-thread blocking I/O | `kernel/chan.c` `k_linux_forward`: post-then-park on **the group's** channel pair; the single-writer invariant in its comment *is* the lease ("this channel's ONLY writer is the one task forwarding on it, and that task is parked between post and reply"). `LinuxTask` carries one `ch_r`/`ch_w`, `MAX_LINUX_TASKS = 8` |
 | Static binaries only | `kernel/elf64_load.c` refuses `ET_DYN` (PIE) and every non-`ET_EXEC` by name, maps only `PT_LOAD`, and never reads `PT_INTERP` — an interpreter request is simply not honoured, the image loads and jumps to its own entry. The refusal is structural in the guest loader; `tests/no_hosted_link_check.sh` pins the separate property that the *kernel* image carries no `.dynamic`/`.interp`/`PT_INTERP` |
@@ -99,14 +99,15 @@ park bridge (`cap_resume_linux_sig`, `kernel/process.c:3204`), `rt_sigreturn`
 with its kernel row (`kernel/linux_abi.c:148`) and the interruptible park
 (`CAP_EINTR`, `kernel/cap.h:188`). What remains:
 
-1. **`SIGSEGV` intersects the trap path.** `handle_page_fault` still kills
-   unconditionally (`kernel/stubs.c:71`) and `linux_sig_delivery_needed`
-   (`kernel/linux_abi.c:1947`) has no caller, so a handler installed for a fault
-   is recorded and never run. With a handler it must become a frame with
-   `si_addr` from CR2 — and keep the attributed kill when there is no handler.
-   This is also where `linux_cr2` gets captured: `pd->linux_cr2` is declared and
-   read (`kernel/process.c:3272`) but never assigned, so every delivery's fault
-   address is 0 today.
+1. ~~**`SIGSEGV` intersects the trap path.**~~ **Landed: increment 31**
+   (shim doc §10.26). `handle_page_fault` captures `pd->linux_cr2` and asks
+   `linux_fault_sig_plan`; a handler plus a restorer is a frame built by the
+   same builder every other delivery uses, the trap frame is rewritten and the
+   stub's `iretq` enters the handler, while a fault with no handler still dies
+   by the attributed kill. The kernel keeps its own copy of the four fault
+   signals' acts, recorded at `rt_sigaction`'s first trap. Named remainder: a
+   fault-delivered handler cannot `rt_sigreturn` yet (the sidecar never entered
+   it), so `longjmp`/exit is the shape that works.
 2. **siginfo queueing and the other producers.** `SigState.pending` is a `u64`
    bitmask, so real-time signals collapse to one bit, there is no `sigqueueinfo`,
    and `tkill` is the only producer — no `kill`/`tgkill` rows. A real queue lands
@@ -119,12 +120,12 @@ with its kernel row (`kernel/linux_abi.c:148`) and the interruptible park
    never delivered (`kernel/linux_abi.c:162`); `ucontext` beyond `uc_sigmask` is
    not filled.
 
-Gate: a new guard clause (the letter space is nearly full — taken today:
-A–C, F–I, K–P, R, T, X and the Z group; **D, E, J, Q, S, U, V, W, Y** are still
-free as single letters, then `AA`+), teeth for: frame built at a misaligned
-RSP, handler mask not applied, `rt_sigreturn` not clearing the mask,
-`sigaltstack` still a no-op, a sigreturn that reaches the MSR (t154–t157
-already tooth the return trip). Live arm: the musl `SIGSEGV`+`longjmp` fixture.
+Gate: a new guard clause — the single-letter space is now **full** (A–Z), so
+new clauses start at `AA` (increment 31's fault delivery took `AA`); teeth
+for: frame built at a misaligned RSP, handler mask not applied,
+`rt_sigreturn` not clearing the mask, `sigaltstack` still a no-op, a sigreturn
+that reaches the MSR (t154–t157 already tooth the return trip). Live arm: the
+musl `SIGSEGV`+`longjmp` fixture.
 
 Risk: the frame is written into the *user's* stack — every write must go through
 the same validated copy path as the sig copy plan (no supervisor page, no

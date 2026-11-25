@@ -4,6 +4,10 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "scheduler.h"   /* struct TaskContext */
+#include "linux_abi.h"   /* E7 increment 31: struct LinuxFaultAct, the four
+                          * fault signals' acts the #PF path decides from.
+                          * linux_abi.h is stdint/stddef-only, so this adds
+                          * no dependency cycle. */
 
 /* Phase 5 wait park: the maximum number of channel endpoints one
  * k_chan_wait may poll/park on. cap.h defines the same constant, but it
@@ -323,6 +327,13 @@ struct ProcessDescriptor {
     uint64_t   linux_sig_mask;
     uint8_t    linux_sig_active;
     uint64_t   linux_cr2;
+    /* E7 increment 31: the KERNEL's own copy of the four fault signals'
+     * actions, recorded from the bytes the guest installs at rt_sigaction's
+     * first trap (syscall_dispatch). A ring-3 #PF has no syscall behind it,
+     * so the sidecar cannot be asked which handler to run; this is the copy
+     * the fault path decides from. Reset with the rest of the slot state, so
+     * a reused descriptor never delivers through its predecessor's handler. */
+    struct LinuxFaultAct linux_fault_act[LINUX_FAULT_SIG_COUNT];
     /* E7 TG-1 I5: the thread-exit glue's two words, both per THREAD (Linux's
      * clear_child_tid and robust_list are thread state, not group state).
      * `linux_clear_tid` is set by clone's CLONE_CHILD_CLEARTID or by

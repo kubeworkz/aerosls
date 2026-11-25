@@ -29,9 +29,15 @@ use crate::linux::LINUX_DEFAULT_ENV;
 static FAULT: &[u8] = include_bytes!("../fixtures/e7_thread_fault_probe.flat");
 /// `fixtures/e7_thread_groupexit_probe.S`, same shape.
 static GROUPEXIT: &[u8] = include_bytes!("../fixtures/e7_thread_groupexit_probe.flat");
+/// `fixtures/e7_fault_handler_probe.S` — E7 increment 31's arm: the SAME
+/// Ring-3 #PF as `FAULT`, but with a SIGSEGV handler installed, so the
+/// kernel must deliver a frame instead of killing the thread.
+static FAULT_HANDLER: &[u8] =
+    include_bytes!("../fixtures/e7_fault_handler_probe.flat");
 
 pub const FAULT_NAME: &str = "e7.tdeath.fault.0";
 pub const GROUP_NAME: &str = "e7.tdeath.group.0";
+pub const FAULT_HANDLER_NAME: &str = "e7.fault.handler.0";
 
 pub const PROBE_RESERVE: u64 = 64 * 1024;
 
@@ -137,4 +143,14 @@ pub fn spawn_group<K: aerosls_proto::kabi::Kernel>(
     budget_len: u64,
 ) -> Result<Spawned, i32> {
     spawn_one(k, budget_base, budget_len, GROUPEXIT, GROUP_NAME)
+}
+
+/// E7 increment 31: the fault that finds a handler — the same PROT_NONE read,
+/// but SIGSEGV is installed, so the delivery must replace the kill.
+pub fn spawn_fault_handler<K: aerosls_proto::kabi::Kernel>(
+    k: &K,
+    budget_base: u64,
+    budget_len: u64,
+) -> Result<Spawned, i32> {
+    spawn_one(k, budget_base, budget_len, FAULT_HANDLER, FAULT_HANDLER_NAME)
 }

@@ -1064,6 +1064,17 @@ uint64_t linux_syscall_apply_reply(struct SLSLinuxSyscallRequest *req,
  * anything else was not built for a user handler, so restore refuses it. */
 #define LINUX_SIGFRAME_USER_CS   0x33u
 
+/* The fault-class signal numbers (Linux x86-64 UAPI) and the two si_codes a
+ * #PF picks between: an access to an unmapped page is MAPERR, an access that
+ * protection refused is ACCERR — the error code's P bit is the whole
+ * difference, and a crash reporter that reads si_code distinguishes them. */
+#define LINUX_SIGILL       4u
+#define LINUX_SIGBUS       7u
+#define LINUX_SIGFPE       8u
+#define LINUX_SIGSEGV      11u
+#define LINUX_SEGV_MAPERR  1u
+#define LINUX_SEGV_ACCERR  2u
+
 /* sa_flags bits this increment reasons about. Values are Linux's. */
 #define LINUX_SA_SIGINFO   0x00000004ull
 #define LINUX_SA_ONSTACK   0x08000000ull
@@ -1223,6 +1234,59 @@ int linux_sig_si_addr(uint32_t signo, uint64_t cr2, uint64_t rip, uint64_t *out)
 int linux_sig_deliver(uint64_t root, const struct LinuxSigDeliverReq *req,
                       const struct LinuxSigRegs *ctx, uint64_t cr2,
                       struct LinuxSigRegs *entry, uint64_t *entry_mask);
+
+/* ─── E7 increment 31 (P1-C): the FAULT's own delivery ─────────────────────
+ * A ring-3 #PF is the one signal source with no syscall behind it: by the
+ * time it fires, the thread is not parked on a forward, so the sidecar —
+ * which owns the dispositions — cannot be asked before the thread must
+ * either run a handler or die. The kernel therefore keeps its OWN copy of
+ * the act for the four fault signals (SIGILL 4, SIGBUS 7, SIGFPE 8,
+ * SIGSEGV 11), recorded from the same 32 bytes the guest installs at
+ * rt_sigaction's first trap, and builds the frame itself. The sidecar stays
+ * the authority for every signal a syscall can reach; this copy is exactly
+ * one class narrower, and both are written from one struct.
+ *
+ * What the copy does NOT cover, by name: the mask (the kernel's
+ * linux_sig_mask tracks DELIVERIES, so a guest that blocks SIGSEGV after a
+ * delivery is not seen here), the altstack (v1 records none), and the
+ * sidecar's own bookkeeping — a fault-delivered handler cannot return
+ * through rt_sigreturn, because the sidecar never entered it (§10.26). A
+ * handler that longjmp's or exits is the shape this serves.
+ */
+#define LINUX_FAULT_SIG_COUNT 4u
+
+struct LinuxFaultAct {
+    uint64_t handler;    /* act word 0, as installed (0 = SIG_DFL, 1 = IGN) */
+    uint64_t flags;      /* word 1                                   */
+    uint64_t mask;       /* word 2                                   */
+    uint64_t restorer;   /* word 3                                   */
+};
+
+/* Index of `signo` in the fault table, or -1 when it is not a fault class:
+ * a signal with no trap behind it must not be deliverable from one. */
+int linux_fault_act_index(uint32_t signo);
+
+/* Record one act from the 32 bytes the guest installed (kernel-ABI order:
+ * handler, flags, restorer, mask). Returns 1 when `signo` is a fault class
+ * and the slot was written, 0 otherwise — a number outside the table is not
+ * an error, it is simply not this path's business. */
+int linux_fault_act_record(struct LinuxFaultAct *slots, uint32_t signo,
+                           const uint8_t act[LINUX_SIGACT_BYTES]);
+
+/* Decide and build, touching no user page: on 1, `frame` holds the
+ * rt_sigframe to copy to entry->r[LINUX_SIGREG_RSP], `entry` is the
+ * handler's context (the fault stub loads it and iretq's) and `entry_mask`
+ * the mask to install. On 0 there is no handler to run — SIG_DFL/SIG_IGN, a
+ * blocked signal, or no restorer — and the caller keeps the attributed
+ * kill. Negative is a builder refusal, treated the same way: no frame, no
+ * delivery. `cr2` is what the #PF captured; si_addr comes from
+ * linux_sig_si_addr, so SIGSEGV names the ADDRESS and SIGILL the
+ * instruction. */
+int linux_fault_sig_plan(const struct LinuxFaultAct *act, uint64_t blocked,
+                         uint32_t signo, uint32_t code, uint64_t cr2,
+                         const struct LinuxSigRegs *ctx,
+                         uint8_t frame[LINUX_SIGFRAME_SIZE],
+                         struct LinuxSigRegs *entry, uint64_t *entry_mask);
 
 /* ─── E7 increment 28 (P1-C's wire-up) — the park-context bridge ───────────
  * A delivery replaces the RETURN of the parked forward, and the only place

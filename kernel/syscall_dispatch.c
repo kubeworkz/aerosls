@@ -702,6 +702,23 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                     cur->linux_clear_tid =
                         linux_ctid_ok(largs[0]) ? largs[0] : 0;
                 }
+                /* E7 increment 31 (P1-C's fault arm): rt_sigaction is also the
+                 * fault path's only chance to learn a handler. A ring-3 #PF
+                 * has no syscall behind it and cannot be parked, so the
+                 * kernel keeps its OWN copy of the four fault signals' acts,
+                 * read here at the first trap — the same 32 bytes the forward
+                 * carries, through the same validated walker, and before any
+                 * post. A read that fails records nothing: the fault path then
+                 * keeps its attributed kill, which is the honest answer to a
+                 * handler this kernel could not see. */
+                if (num == LINUX_RT_SIGACTION && largs[1] != 0) {
+                    uint8_t actb[LINUX_SIGACT_BYTES];
+                    if (linux_user_copy_out(actb, cur->cr3, largs[1],
+                                            LINUX_SIGACT_BYTES) == 0)
+                        (void)linux_fault_act_record(cur->linux_fault_act,
+                                                     (uint32_t)largs[0],
+                                                     actb);
+                }
                 /* E7 TG-1 I5: set_robust_list (273) is kernel-local for the
                  * same reason futex is: the list lives in the group's page
                  * table and its walk ends in this scheduler's wakes. The

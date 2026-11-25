@@ -161,6 +161,19 @@ static void proc_clear_resume_state(struct ProcessDescriptor* pd) {
      * (and wake its joiner) or walk a robust list it never registered. */
     pd->linux_clear_tid  = 0;
     pd->linux_robust_list = 0;
+    /* E7 increment 31: the fault path's own state is per-thread in the same
+     * way — a reused slot that kept the act copy would run its predecessor's
+     * SIGNAL HANDLER on its own fault, and a stale mask or cr2 would silently
+     * block a delivery or name an address this occupant never touched. */
+    pd->linux_sig_mask   = 0;
+    pd->linux_sig_active = 0;
+    pd->linux_cr2        = 0;
+    for (unsigned fi = 0; fi < LINUX_FAULT_SIG_COUNT; fi++) {
+        pd->linux_fault_act[fi].handler  = 0;
+        pd->linux_fault_act[fi].flags    = 0;
+        pd->linux_fault_act[fi].mask     = 0;
+        pd->linux_fault_act[fi].restorer = 0;
+    }
     /* E7 TG-1 I1: the shared span/cursors are the GROUP's (linux_thread.h);
      * this per-descriptor clear no longer touches them. linux_group_create()
      * stamps a fresh group, linux_group_destroy() zeroes its cursors, and the

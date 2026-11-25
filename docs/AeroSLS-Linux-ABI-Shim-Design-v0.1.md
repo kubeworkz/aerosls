@@ -4330,6 +4330,94 @@ check; tooth **t162** re-inserts a `forget_group` call *before* the glue loop,
 which leaves every word cleared and every joiner parked — the exact silent
 shape this ordering removes, and invisible to Z7.
 
+### 10.26 What has landed — increment 31 (P1-C: the fault's own delivery)
+
+A ring-3 fault was the last signal source with no delivery. `tkill` reaches the
+sidecar and comes back as an 80-byte request the kernel turns into a frame; a
+`#PF` has no syscall behind it and cannot be parked, so it killed the thread
+whatever its disposition said. Worse, `pd->linux_cr2` — the value every
+delivery's `si_addr` is computed from — was declared and read but never
+assigned, so even a delivered `SIGSEGV` would have named address 0.
+
+**What landed.**
+
+- **A kernel copy of the four fault signals' actions.** `struct LinuxFaultAct`
+  (`handler`, `flags`, `mask`, `restorer`) for `SIGILL`(4), `SIGBUS`(7),
+  `SIGFPE`(8) and `SIGSEGV`(11), recorded at `rt_sigaction`'s first trap from
+  the same 32 bytes the forward already carries, through the same validated
+  walker. It is per descriptor and cleared with the rest of the slot state, so
+  a reused slot cannot run its predecessor's handler.
+- **A pure planner.** `linux_fault_sig_plan()` answers `0` for every "no frame"
+  case (`SIG_DFL`, `SIG_IGN`, a blocked signal, no restorer — this path has no
+  pending queue), `1` with the built frame, the handler's entry context and the
+  mask to install, and `-EINVAL` for a builder refusal (a stack with no room).
+  `si_addr` comes from the existing `linux_sig_si_addr`, so `SIGSEGV`/`SIGBUS`
+  name CR2 and `SIGFPE`/`SIGILL` name the faulting instruction. The `#PF` error
+  code's P bit picks `si_code`: `SEGV_MAPERR` for an unmapped page,
+  `SEGV_ACCERR` for one protection refused.
+- **The capture site.** `handle_page_fault()` writes
+  `fcur->linux_cr2 = faulting_address` before any decision, so both the
+  delivered frame and the kill line carry the real address.
+- **A full-register trap frame.** `isr14_stub` now saves all 15 GPRs above the
+  user's `rbp`; the C struct that reads them and the push order that writes them
+  are one decision, pinned against each other by clause **AA**.
+- **The redirect.** A delivery copies the frame through `linux_user_copy_in`,
+  sets `linux_sig_mask`/`linux_sig_active`, and rewrites the saved GPRs plus the
+  iretq frame's `rip`/`rsp`. The stub's epilogue is unchanged — popping and
+  `iretq`'ing *is* the jump into the handler — and the attributed kill
+  (`process_exit(139)`, the `[FAULT] … killing process` line) is still the path
+  taken when there is no handler.
+
+The boot shows both answers in one run, which is what makes the arm a
+difference and not a coincidence:
+
+```
+[FAULT] Ring-3 #PF  error=0x4  addr=0x0000400000015000  rip=0x… — killing process.
+[E7] fault sig 11 (code 1) addr 0x400000015000 -> handler 4000000000dd, frame 400000004cc8, mask 400 (not a kill)
+E7FH-OK
+```
+
+The first line is `e7.tdeath.fault.0` (no handler, still dies). The second is
+`e7.fault.handler.0`, the same `PROT_NONE` read with `SIGSEGV` installed;
+`E7FH-OK` is written **by the handler** only when `si_signo == 11`, `si_code`
+is `MAPERR`/`ACCERR` and `si_addr` equals the page the program mapped — checked
+against `r13`, a register the frame restored, so a frame recording the
+handler's own context or an address invented from `rip` writes `E7FH-BAD`
+instead. `mask 400` is bit 10: `SIGSEGV` blocked inside its own handler.
+
+**Evidence.** `tests/linux_fault_sig_host_test.c` (45 checks, links the real
+`linux_abi.c`): the four-signal table, the recording, every "no frame" answer
+(with the frame buffer proven untouched), the handler entry (rip, rsp % 16 == 8,
+the frame fitting below the interrupted rsp, `sa_mask | the signal`), the
+`SA_SIGINFO` arguments and `si_addr == cr2`, the decode back through
+`linux_sig_frame_restore` equalling the *interrupted* registers, `SA_NODEFER`,
+`SIGILL` naming the instruction, a NULL-pointer fault reporting 0 rather than a
+substitute, and the no-room refusal. `tests/linux_fault_sig_check.sh` boots the
+ISO and reads the lines above. Clause **AA** pins the whole chain (word order,
+capture-before-decision, struct/push agreement, the plan before the kill line,
+the live arm's two answers); tooth **t163** stops the fault path asking the plan,
+which leaves CR2 captured, the kill working and a handler that never runs.
+
+**A defect this increment walked past, named rather than fixed.** The tree's
+signal-action word order is `{handler, flags, mask, restorer}` — the sidecar
+(`sig.act[2]` = `sa_mask`, `[3]` = restorer) and every probe agree, and this
+increment's record matches them because the sidecar is the other reader of the
+same bytes. x86-64's kernel `struct sigaction` is
+`{handler, flags, restorer, mask}`, so a real musl `sigaction` — which sets
+`sa_restorer` — is read by this tree with the mask and the restorer swapped.
+Nothing catches it today because only hand-written probes install handlers;
+fixing it means changing the sidecar, the probes and the SIGRET arm together,
+which is its own increment. It is recorded here so the next reader does not
+"fix" one end of it.
+
+**Still open, by name.** A fault-delivered handler cannot return through
+`rt_sigreturn`: the sidecar never entered it, so its 15 arm answers `EINVAL`.
+A handler that `longjmp`s or exits is the shape this serves, which is exactly
+the acceptance program §1 of the P1 plan names. The kernel's `linux_sig_mask`
+tracks deliveries, not `rt_sigprocmask`, so a guest that blocks `SIGSEGV` after
+a delivery is not seen at the fault. The altstack, `fpstate`, and siginfo
+queueing remain the P1-C remainders they were.
+
 ---
 
 ## 11. Open questions for review
