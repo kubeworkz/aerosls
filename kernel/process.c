@@ -167,6 +167,8 @@ static void proc_clear_resume_state(struct ProcessDescriptor* pd) {
      * block a delivery or name an address this occupant never touched. */
     pd->linux_sig_mask   = 0;
     pd->linux_sig_active = 0;
+    pd->linux_sig_frame_rsp   = 0;
+    pd->linux_sig_fault_active = 0;
     pd->linux_cr2        = 0;
     for (unsigned fi = 0; fi < LINUX_FAULT_SIG_COUNT; fi++) {
         pd->linux_fault_act[fi].handler  = 0;
@@ -3289,6 +3291,12 @@ int linux_sig_reply_apply(struct ProcessDescriptor* pd, const uint8_t* pay,
     if (r != 0) return r;
     pd->linux_sig_mask   = mask;
     pd->linux_sig_active = 1;
+    /* E7 increment 32: the frame's address, recorded rather than inferred.
+     * linux_sig_park_install() above put the same value in park_ctx[8] (the
+     * asm's own rsp), so the tkill return reads the identical address — but
+     * only this field exists for a frame the park never saw. */
+    pd->linux_sig_frame_rsp = entry.r[LINUX_SIGREG_RSP];
+    pd->linux_sig_fault_active = 0;   /* the sidecar entered this one */
 
     kernel_serial_printf(
         "[E7] sig %u (code %u) -> handler %lx, frame %lx, mask %lx\n",
@@ -3332,7 +3340,7 @@ int linux_sig_return_apply(struct ProcessDescriptor* pd) {
      * the read direction of the same two-phase walker the write used: a
      * frame the task unmapped or made read-only refuses -EFAULT, never a
      * ring-0 fault. */
-    r = linux_user_copy_out(frame, pd->cr3, pd->park_ctx.user_rsp,
+    r = linux_user_copy_out(frame, pd->cr3, pd->linux_sig_frame_rsp,
                             LINUX_SIGFRAME_SIZE);
     if (r != 0) return r;
 
@@ -3346,6 +3354,12 @@ int linux_sig_return_apply(struct ProcessDescriptor* pd) {
 
     pd->linux_sig_mask   = mask;   /* the pre-handler mask, from uc_sigmask */
     pd->linux_sig_active = 0;
+    /* E7 increment 32: the return obligation is discharged, whichever
+     * delivery created it — a stale frame_rsp or fault flag on a task that
+     * is no longer in a handler would let the NEXT 15 restore a frame that
+     * is already behind it. */
+    pd->linux_sig_frame_rsp    = 0;
+    pd->linux_sig_fault_active = 0;
 
     kernel_serial_printf(
         "[E7] rt_sigreturn: restored rip %lx rsp %lx rax %lx mask %lx\n",

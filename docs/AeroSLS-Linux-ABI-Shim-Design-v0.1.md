@@ -4418,6 +4418,91 @@ tracks deliveries, not `rt_sigprocmask`, so a guest that blocks `SIGSEGV` after
 a delivery is not seen at the fault. The altstack, `fpstate`, and siginfo
 queueing remain the P1-C remainders they were.
 
+### 10.27 What has landed — increment 32 (P1-C: the fault handler's return)
+
+§10.26 named this as its remainder: a fault-delivered handler could not
+return, because `rt_sigreturn` (15) is answered by the sidecar, and the
+sidecar never entered that handler. Its `sig.handler_active` is false, so its
+15 arm answers `-EINVAL` — "no handler was entered" — which is **true for its
+own bookkeeping** and was the last word on a return the kernel owes.
+
+**Why the answer was not to teach the sidecar.** The delivery has no
+round trip to ride: a `#PF` is a trap, not a reply. The sidecar's mask was
+not moved by that delivery either (it moved nothing, so a return owes it
+nothing), which means the refusal is not lying about state — it is simply not
+the authority for a frame it never built. The kernel built the frame, holds
+it, and is the only half that can read it out of the task's pages. So the
+kernel takes exactly that one return, and
+`linux_sig_fault_return_ok()` names how narrow "that one" is — four
+questions, each fail-closed:
+
+1. **is a frame installed at all?** No frame means nothing to restore, and
+   `-EINVAL` is right — the sigret probe's `SIGRET-NOHAND-OK` arm depends on
+   it and still passes.
+2. **did that frame come from the trap?** A sidecar-delivered frame keeps
+the old gate: if the sidecar ever refuses its own delivery, that refusal is
+   the task's answer.
+3. **was the answer a refusal?** `status == 0` is a consent and belongs to
+   the gate above (which also runs its `-EPROTO` check); taking it here would
+   skip both.
+4. **is the errno the task would have heard exactly `-EINVAL`?** A different
+   refusal — a crashed sidecar, a refused class — stays the task's answer by
+   name.
+
+**The frame's address is recorded, not inferred.** The tkill path could
+always recover the frame's address from `park_ctx.user_rsp`, because its
+delivery installed the handler's entry context there. A trap never parks:
+give the return a stale park context and it restores a frame that is no
+longer behind it. `pd->linux_sig_frame_rsp` is therefore written at whichever
+delivery built the frame, and read by `linux_sig_return_apply`. On the tkill
+path the two are the same number (`linux_sig_park_install` put it there), so
+nothing changes there; on the fault path it is the only true answer.
+
+**What this buys, concretely.** A handler can FIX its fault the way real
+ones do — rebuild the faulted mapping, or, as the live arm does, rewrite the
+interrupted register in its own `ucontext` — and the kernel resumes at the
+instruction that faulted with that fix in place. That is the first time in
+this shim that a faulting instruction makes progress after a handler ran.
+
+Evidence, one boot (`tests/linux_fault_return_check.sh`):
+
+```
+[E7] fault sig 11 (code 1) addr 0x… -> handler …, frame …, mask 400 (not a kill)
+[E7] rt_sigreturn: restored rip … rsp … rax … mask 0
+E7FR-OK
+```
+
+`E7FR-OK` is written by the **resumed** program, not the handler: after the
+return the retried `movl (%r13), %eax` must read `0xfeedface` and `r13` must
+equal the pointer the handler wrote at `80(%rdx)` (its `ucontext`'s
+`gregs[REG_R13]`). The handler counts its own entries and writes `E7FR-LOOP`
+on the second, so a return that restored nothing is a named line rather than
+a silent hang — the failure mode a fault loop otherwise has. `E7FR-BAD`
+covers the rest (a wrong context, a bad `si_addr`, or the restorer's 15
+coming back with an errno). The same boot still shows increment 31's
+`E7FH-OK` (a handler that exits, unchanged) and the handlerless attributed
+kill.
+
+**Evidence.** `tests/linux_fault_return_host_test.c` (29 checks, links the
+real `linux_abi.c`): the gate's whole truth table — trap frame + `-EINVAL`
+returns 1, a sidecar frame / no frame / a consent / `-ENOSYS` / `-EPROTO`
+all return 0 — and the frame's journey, including that `uc + 40 +
+REG_R13*8` **is** the frame offset of r13 (the number the live arm's
+`80(%rdx)` depends on), that a handler's write there comes back through the
+decoder with every other register untouched, and that the frame address is
+the entry rsp and not the interrupted one. Clause **AB** pins the wiring and
+the order that makes it reachable (the kernel gate runs *before* the
+sidecar's). Teeth: **t164** (a fault delivery that no longer marks itself as
+the trap's — increment 31 stays green, the return dies), **t165** (the
+return reads `park_ctx` again), **t166** (the live handler stops returning).
+
+**Still open, by name.** During a fault-delivered handler the kernel's
+`linux_sig_mask` carries the handler's mask while the sidecar's copy still
+holds the pre-delivery one, so an `rt_sigprocmask(14, NULL)` from inside such
+a handler reports the narrower set; the two agree again at the return. No
+restart window, no `fpstate`, no `sigaltstack`, and no async preemption
+remain the P1-C remainders they were.
+
 ---
 
 ## 11. Open questions for review

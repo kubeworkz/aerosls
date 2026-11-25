@@ -34,10 +34,16 @@ static GROUPEXIT: &[u8] = include_bytes!("../fixtures/e7_thread_groupexit_probe.
 /// kernel must deliver a frame instead of killing the thread.
 static FAULT_HANDLER: &[u8] =
     include_bytes!("../fixtures/e7_fault_handler_probe.flat");
+/// `fixtures/e7_fault_return_probe.S` — E7 increment 32's arm: the same #PF
+/// with a handler, but this handler FIXES the fault in its ucontext and
+/// returns through `rt_sigreturn(15)`, so the retried instruction runs.
+static FAULT_RETURN: &[u8] =
+    include_bytes!("../fixtures/e7_fault_return_probe.flat");
 
 pub const FAULT_NAME: &str = "e7.tdeath.fault.0";
 pub const GROUP_NAME: &str = "e7.tdeath.group.0";
 pub const FAULT_HANDLER_NAME: &str = "e7.fault.handler.0";
+pub const FAULT_RETURN_NAME: &str = "e7.fault.return.0";
 
 pub const PROBE_RESERVE: u64 = 64 * 1024;
 
@@ -153,4 +159,15 @@ pub fn spawn_fault_handler<K: aerosls_proto::kabi::Kernel>(
     budget_len: u64,
 ) -> Result<Spawned, i32> {
     spawn_one(k, budget_base, budget_len, FAULT_HANDLER, FAULT_HANDLER_NAME)
+}
+
+/// E7 increment 32: the fault whose handler RETURNS — it rewrites the
+/// interrupted r13 in its ucontext, and the kernel must resume the faulting
+/// instruction with that fix in place.
+pub fn spawn_fault_return<K: aerosls_proto::kabi::Kernel>(
+    k: &K,
+    budget_base: u64,
+    budget_len: u64,
+) -> Result<Spawned, i32> {
+    spawn_one(k, budget_base, budget_len, FAULT_RETURN, FAULT_RETURN_NAME)
 }

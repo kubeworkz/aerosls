@@ -961,6 +961,7 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
             static FAULT_SPAWNED: AtomicBool = AtomicBool::new(false);
             static GROUP_SPAWNED: AtomicBool = AtomicBool::new(false);
             static FH_SPAWNED: AtomicBool = AtomicBool::new(false);
+            static FR_SPAWNED: AtomicBool = AtomicBool::new(false);
             let n = PASSES.fetch_add(1, Ordering::Relaxed) + 1;
             if n % 4 == 0 {
                 if !FAULT_SPAWNED.load(Ordering::Relaxed) {
@@ -1007,6 +1008,26 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                             ) {
                                 FH_SPAWNED.store(true, Ordering::Relaxed);
                                 klog(b"[E7] fault-handler: spawned ch_r=", sp.ch_r, b"");
+                            }
+                        }
+                    }
+                }
+                // E7 increment 32: the handler RETURNS. It fixes the faulted
+                // register in its own ucontext and issues rt_sigreturn(15),
+                // so the kernel must resume the instruction that faulted —
+                // the arm writes E7FR-OK only if the retried load saw the
+                // pointer the handler supplied.
+                if !FR_SPAWNED.load(Ordering::Relaxed) {
+                    if let Ok(sp) = crate::e7_thread_death::spawn_fault_return(
+                        &RealKernel, caps.budget_base, caps.budget_len) {
+                        if let Ok(vt) = booted.proc.vfs.add_task() {
+                            if crate::linux::track(
+                                sp.ch_r, sp.ch_w,
+                                crate::e7_thread_death::FAULT_RETURN_NAME,
+                                0, sp.heap_base, sp.heap_limit, vt, false,
+                            ) {
+                                FR_SPAWNED.store(true, Ordering::Relaxed);
+                                klog(b"[E7] fault-return: spawned ch_r=", sp.ch_r, b"");
                             }
                         }
                     }

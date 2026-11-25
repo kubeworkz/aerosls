@@ -1455,6 +1455,29 @@ int linux_sig_return_reply_ok(uint64_t num, uint64_t rax, int32_t status)
     return status == 0;
 }
 
+/* E7 increment 32: the fault frame's return gate (see the header). Four
+ * questions, all of which must be yes, and each one fail-closed:
+ *
+ *   1. is a frame installed at all? (no frame -> nothing to restore, and
+ *      -EINVAL is the honest answer the existing probe asserts);
+ *   2. did that frame come from the TRAP rather than from a sidecar
+ *      delivery? (a sidecar frame keeps the gate above — if the sidecar ever
+ *      refuses its own delivery, the task must hear that refusal);
+ *   3. was the answer a refusal (status != 0), not a consent — the kernel
+ *      must never treat "the sidecar says 0" as its own case, because the
+ *      gate above already handles that one;
+ *   4. is the errno the task would have heard exactly -EINVAL? A different
+ *      refusal is a different fact (a crashed sidecar, a refused class) and
+ *      stays the task's answer, by name, exactly as it was before. */
+int linux_sig_fault_return_ok(int sig_active, int fault_active, uint64_t rax,
+                              int32_t status)
+{
+    if (!sig_active)   return 0;
+    if (!fault_active) return 0;
+    if (status == 0)   return 0;
+    return rax == (uint64_t)(int64_t)(-LINUX_EINVAL);
+}
+
 int linux_sig_deliver(uint64_t root, const struct LinuxSigDeliverReq *req,
                       const struct LinuxSigRegs *ctx, uint64_t cr2,
                       struct LinuxSigRegs *entry, uint64_t *entry_mask)

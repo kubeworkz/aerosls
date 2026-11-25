@@ -205,14 +205,23 @@ else
     bad "no SIGRET-NOHAND-OK: a 15 with no handler entered either restored a frame nobody built or did not answer -EINVAL"
 fi
 
-# Exactly ONE restore may exist in this boot: the handler's own return. A
-# second line can only be the refused 15 being restored anyway — the defect
-# the gate exists to prevent, which the host test cannot show on a boot.
+# Exactly ONE restore may exist in THIS flow: the tkill handler's own return.
+# A second one here can only be the refused 15 being restored anyway — the
+# defect the gate exists to prevent, which the host test cannot show on a
+# boot. (Increment 32 added a second returning handler to the same boot — a
+# FAULT-delivered frame whose return its own check owns — so a bare count is
+# now bounded by that arm's markers: restores inside its window are its own,
+# and everything outside it must still be this one.)
 nrest="$(grep -acE '\[E7\] rt_sigreturn: restored rip ' "$LOG" 2>/dev/null)"
-if [ "${nrest:-0}" -eq 1 ]; then
-    ok "exactly ONE [E7] rt_sigreturn: restored line — the handler's return; the refused 15 restored nothing"
+outside="$(awk '
+    /E7FR-ARM/ { win = 1 }
+    /E7FR-OK/  { win = 0 }
+    /\[E7\] rt_sigreturn: restored rip / { if (!win) n++ }
+    END { print n + 0 }' "$LOG" 2>/dev/null)"
+if [ "${outside:-0}" -eq 1 ]; then
+    ok "exactly ONE [E7] rt_sigreturn: restored line outside the fault-return arm's own flow (${nrest:-0} in the whole boot, the rest its handler's) — the tkill handler's return; the refused 15 restored nothing"
 else
-    bad "the log carries ${nrest:-0} [E7] rt_sigreturn: restored lines: the only restore in this flow is the handler's return, so a second one is the refusal being restored anyway"
+    bad "the log carries ${outside:-0} [E7] rt_sigreturn: restored lines outside the fault-return arm's flow (${nrest:-0} in the whole boot): the only restore in this flow is the handler's return, so a second one is the refusal being restored anyway"
 fi
 
 # …and the refusal came FIRST: the marker was written before the return trip's

@@ -67,7 +67,8 @@ for f in kernel/linux_abi.h kernel/linux_abi.c kernel/process.h kernel/process.c
          arch/x86/fpu_enable.h arch/x86/lazy_fpu.c arch/x86/idt.c \
          arch/x86/interrupt.asm arch/x86/switch_lazy.asm \
          kernel/kernel.c kernel/stubs.c tests/fpu_enable_host_test.c \
-         tests/user_map_identity_host_test.c tests/linux_clone_host_test.c; do
+         tests/user_map_identity_host_test.c tests/linux_clone_host_test.c \
+         tests/linux_fault_return_host_test.c; do
     if [ ! -f "$f" ]; then
         echo "ABORT: $f missing — the guard cannot be evaluated at all." >&2
         exit 2
@@ -1765,6 +1766,52 @@ else
     bad "AA. the fault's delivery is not wired: without the act copy the kernel cannot know a handler was installed and a #PF keeps killing threads that asked to survive it; without the CR2 capture a SIGSEGV handler is told the fault happened at NULL; a stub that saves fewer registers gives the handler a frame full of the wrong context; a plan that ran AFTER the kill line would leave the two answers indistinguishable in the log; and a live arm that cannot show the handlerless kill on the same boot cannot tell 'delivery works' from 'nothing faults any more'."
 fi
 
+# ─── AB. E7 increment 32 (P1-C): a FAULT handler's return ────────────────
+# Increment 31 enters a handler from the trap, and nothing could come back:
+# the sidecar never saw that delivery, so its rt_sigreturn arm answers EINVAL
+# ("no handler was entered") — correct for its own bookkeeping and the last
+# word on a return the kernel owes. AB pins the kernel's own gate to exactly
+# that case and nothing wider: an installed frame, entered from the TRAP, in
+# answer to a refusal (never a consent or a -EPROTO), and only when the errno
+# the task would have heard is -EINVAL — so the "15 with no handler" refusal
+# the sigret probe asserts is untouched, and a different refusal still
+# reaches the task by name.
+#
+# The other half is WHERE the frame is: the trap never passes through
+# park_ctx, so the frame's address is recorded at delivery and read back by
+# the return. A return that read park_ctx would restore whatever the task's
+# last park left there.
+if grep -qF 'int linux_sig_fault_return_ok(int sig_active, int fault_active, uint64_t rax,' "$LABH" && \
+   grep -qF 'int linux_sig_fault_return_ok(int sig_active, int fault_active, uint64_t rax,' "$LABC" && \
+   grep -qF 'if (!fault_active) return 0;' "$LABC" && \
+   grep -A 6 'int linux_sig_fault_return_ok' "$LABC" | grep -qF 'return rax == (uint64_t)(int64_t)(-LINUX_EINVAL);' && \
+   grep -qF 'fcur->linux_sig_fault_active = 1;' "$STUB" && \
+   grep -qF 'fcur->linux_sig_frame_rsp = entry.r[LINUX_SIGREG_RSP];' "$STUB" && \
+   grep -qF 'pd->linux_sig_frame_rsp = entry.r[LINUX_SIGREG_RSP];' "$PDC" && \
+   grep -qF 'linux_user_copy_out(frame, pd->cr3, pd->linux_sig_frame_rsp,' "$PDC" && \
+   grep -qF 'pd->linux_sig_fault_active = 0;' "$PDC" && \
+   grep -qF 'linux_sig_frame_rsp   = 0;' "$PDC" && \
+   grep -qF 'linux_sig_frame_rsp;' "$PDH" && \
+   grep -qF 'linux_sig_fault_active;' "$PDH" && \
+   [ -n "$(grep -nF 'linux_sig_fault_return_ok(' kernel/chan.c | head -1 | cut -d: -f1)" ] && \
+   [ "$(grep -nF 'linux_sig_fault_return_ok(' kernel/chan.c | head -1 | cut -d: -f1)" -lt \
+     "$(grep -nF 'if (!linux_sig_return_reply_ok(expect_num, rax,' kernel/chan.c | head -1 | cut -d: -f1)" ] && \
+   grep -A 6 'linux_sig_fault_return_ok(' kernel/chan.c | grep -qF 'linux_sig_return_apply(pd)' && \
+   grep -qF 'linux_sig_fault_return_ok(1, 1, inval, -1) == 1' tests/linux_fault_return_host_test.c && \
+   grep -qF 'linux_sig_fault_return_ok(1, 0, inval, -1) == 0' tests/linux_fault_return_host_test.c && \
+   grep -qF 'linux_sig_fault_return_ok(0, 1, inval, -1) == 0' tests/linux_fault_return_host_test.c && \
+   grep -qF 'linux_sig_fault_return_ok(1, 1, enosys, -1) == 0' tests/linux_fault_return_host_test.c && \
+   grep -qF 'mov     %rax, 80(%rdx)' user/sidecar/fixtures/e7_fault_return_probe.S && \
+   grep -qE '^    ret .*Lrestorer' user/sidecar/fixtures/e7_fault_return_probe.S && \
+   grep -qF 'E7FR-LOOP' user/sidecar/fixtures/e7_fault_return_probe.S && \
+   ! grep -qF 'E7FR' user/sidecar/fixtures/e7_fault_handler_probe.S && \
+   grep -qF 'pub fn spawn_fault_return<' user/sidecar/src/e7_thread_death.rs && \
+   grep -qF 'crate::e7_thread_death::spawn_fault_return' "$LRE"; then
+    ok "AB. a fault-delivered handler can RETURN: rt_sigreturn's sidecar half refuses it (it entered nothing, moved no mask), and the kernel takes exactly that one return — linux_sig_fault_return_ok requires an installed frame, a TRAP delivery, a refusal (never status 0 or -EPROTO) and the exact -EINVAL the task would have heard, so the no-handler refusal still reaches the task and a different errno is never swallowed. The frame's ADDRESS is recorded at delivery (park_ctx is not on the fault path) and read back by the return, the resume installs the restored context, and the live arm proves the whole trip: its handler rewrites the interrupted r13 through its own ucontext (80(%rdx) — the host test pins that offset to the frame's sigcontext) and RETURNS through the frame's pretcode, so the restorer's 15 is the return under test, and the retried faulting load reads the page the handler supplied, writing E7FR-OK only then — with E7FR-LOOP if the handler ran twice, so a missing return is a named line and not a hang. The increment-31 arm is unchanged: its handler still exits instead of returning."
+else
+    bad "AB. a fault handler's return is not wired, in one of the ways that matter: without the gate the sidecar's truthful EINVAL still reaches a handler that has a frame waiting, so every fault-delivered handler dies the moment it returns; a gate that fired on status 0 would restore a frame the sidecar's own -EPROTO check never vetted; one that fired on ANY errno would swallow a real refusal; a return that read park_ctx.user_rsp would restore a stale park context because the trap never parks; and a frame address recorded nowhere means the return cannot find the 440 bytes it owes, which is why the live arm would print E7FR-BAD (the restorer's 15 came back with an errno) or E7FR-LOOP (the retried instruction faulted again)."
+fi
+
 # ─── P. E7 increment 26 (P1-C): the signal frame ───────────────────────────
 # Five claims, each one a way the frame could be quietly wrong: the contract
 # exists and names its numbers (P), the layout is pinned by the compiler and
@@ -1949,7 +1996,7 @@ else
 fi
 
 if grep -qF 'int linux_sig_return_apply(struct ProcessDescriptor* pd)' kernel/process.c && \
-   grep -qF 'linux_user_copy_out(frame, pd->cr3, pd->park_ctx.user_rsp,' kernel/process.c && \
+   grep -qF 'linux_user_copy_out(frame, pd->cr3, pd->linux_sig_frame_rsp,' kernel/process.c && \
    grep -qF 'linux_sig_frame_restore(frame, LINUX_SIGFRAME_SIZE, &regs, &mask)' kernel/process.c && \
    grep -qF 'pd->linux_sig_mask   = mask;' kernel/process.c && \
    grep -qF 'pd->linux_sig_active = 0;' kernel/process.c && \
@@ -1957,7 +2004,7 @@ if grep -qF 'int linux_sig_return_apply(struct ProcessDescriptor* pd)' kernel/pr
    grep -qF 'sig.mask = sig.saved_mask;' "$LINUXRS" && \
    grep -qF 'sig.handler_active = false;' "$LINUXRS" && \
    grep -qF 'fn rt_sigreturn_restores_the_mask_a_delivery_changed()' "$LINUXRS"; then
-    ok "P14. the return trip restores BOTH halves and invents neither: the kernel reads the frame at the handler's own rsp through the validated copy (a frame the task unmapped refuses -EFAULT, never a ring-0 fault), restores the registers and uc_sigmask, clears the active flag and resumes; the sidecar puts back the mask it saved at the delivery and refuses a 15 with no handler entered — one number, two authorities, each restoring what it owns"
+    ok "P14. the return trip restores BOTH halves and invents neither: the kernel reads the frame at the address its own delivery recorded (the rsp the handler was entered with) through the validated copy (a frame the task unmapped refuses -EFAULT, never a ring-0 fault), restores the registers and uc_sigmask, clears the active flag and resumes; the sidecar puts back the mask it saved at the delivery and refuses a 15 with no handler entered — one number, two authorities, each restoring what it owns"
 else
     bad "P14. the return trip lost a half: a kernel restore without the validated read is a ring-0 fault waiting for a hostile frame, a kernel that keeps its own mask while the sidecar keeps another is the divergence a second raise exposes, and a 15 accepted with no handler entered unblocks signals no delivery blocked"
 fi

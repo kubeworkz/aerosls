@@ -195,6 +195,13 @@ int handle_page_fault(unsigned long error_code, unsigned long saved_rip,
                                        LINUX_SIGFRAME_SIZE) == 0) {
                     fcur->linux_sig_mask   = mask;
                     fcur->linux_sig_active = 1;
+                    /* E7 increment 32: the frame's address and whose
+                     * delivery it was. The sidecar never saw this one, so
+                     * rt_sigreturn's sidecar half refuses it and the
+                     * kernel's own gate (linux_sig_fault_return_ok) is what
+                     * lets the handler return to the interrupted context. */
+                    fcur->linux_sig_frame_rsp = entry.r[LINUX_SIGREG_RSP];
+                    fcur->linux_sig_fault_active = 1;
                     fault_ctx_to_frame(f, tf, &entry);
                     kernel_serial_printf(
                         "[E7] fault sig %u (code %u) addr 0x%lx -> handler "

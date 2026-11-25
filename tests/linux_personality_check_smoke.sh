@@ -76,6 +76,12 @@ FILES=(
     user/sidecar/fixtures/e7_fault_handler_probe.S
     user/sidecar/fixtures/e7_fault_handler_probe.flat
     user/sidecar/src/e7_thread_death.rs
+    # AB (increment 32, the fault handler's return) reads its own host test,
+    # the returning arm's fixture and its check script — same rule as D.
+    tests/linux_fault_return_host_test.c
+    tests/linux_fault_return_check.sh
+    user/sidecar/fixtures/e7_fault_return_probe.S
+    user/sidecar/fixtures/e7_fault_return_probe.flat
     # Y (the soft mprotect transition) reads the helper's fake-table test.
     tests/user_map_identity_host_test.c
     # W (increment 20) reads the capture, the record, the task's name on the
@@ -1327,7 +1333,7 @@ tooth sigframe-census-row-gone P13 "the table no longer carries the traced row" 
 # which is the difference between an -EFAULT and a ring-0 fault on a frame the
 # task itself can forge.
 seed "$W/t155"
-sed -i '/linux_user_copy_out(frame, pd->cr3, pd->park_ctx.user_rsp,/d' "$W/t155/kernel/process.c"
+sed -i '/linux_user_copy_out(frame, pd->cr3, pd->linux_sig_frame_rsp,/d' "$W/t155/kernel/process.c"
 tooth sigframe-return-read-gone P14 "the return trip no longer reads through the validated copy" "$W/t155"
 
 # t156: RAX dropped from the bridge. A delivery wants 0 there and a return
@@ -1399,6 +1405,26 @@ tooth forget-before-glue Z8 "the teardown forgets the group's waiters before the
 seed "$W/t163"
 sed -i 's/linux_fault_sig_plan(&fcur->linux_fault_act\[fi\],/linux_fault_sig_unasked(\&fcur->linux_fault_act[fi],/' "$W/t163/kernel/stubs.c"
 tooth fault-delivery-unasked AA "the #PF path stopped asking for a delivery" "$W/t163"
+
+# t164: a fault delivery that never marks itself as the TRAP's. The frame is
+# built, installed and entered exactly as before — so increment 31's arm stays
+# green — but the return gate needs that flag, and without it the sidecar's
+# truthful EINVAL is the last word on a handler that is trying to return.
+seed "$W/t164"
+sed -i '/fcur->linux_sig_fault_active = 1;/d' "$W/t164/kernel/stubs.c"
+tooth fault-return-unflagged AB "a fault delivery stopped marking itself as the trap's" "$W/t164"
+
+# t165: the return reads the frame at park_ctx.user_rsp again — the address
+# the tkill path happened to have, and the fault path never does.
+seed "$W/t165"
+sed -i 's/linux_user_copy_out(frame, pd->cr3, pd->linux_sig_frame_rsp,/linux_user_copy_out(frame, pd->cr3, pd->park_ctx.user_rsp,/' "$W/t165/kernel/process.c"
+tooth fault-return-parkctx AB "the return went back to reading the frame at park_ctx" "$W/t165"
+
+# t166: the live arm's handler stops returning (it argues with the frame
+# instead of using it), so nothing exercises the trip the clause describes.
+seed "$W/t166"
+sed -i 's/^    ret .*$/    jmp     .Lbad/' "$W/t166/user/sidecar/fixtures/e7_fault_return_probe.S"
+tooth fault-return-no-ret AB "the handler no longer returns through its restorer" "$W/t166"
 
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"

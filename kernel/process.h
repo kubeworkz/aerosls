@@ -326,6 +326,22 @@ struct ProcessDescriptor {
      * leaves open by name). */
     uint64_t   linux_sig_mask;
     uint8_t    linux_sig_active;
+    /* E7 increment 32: the rsp the CURRENT handler was entered with — which
+     * is the frame's own address, so rt_sigreturn knows where to read.
+     * The tkill path could get this back from park_ctx.user_rsp (its
+     * delivery installs the entry there), but a FAULT-delivered handler
+     * never passes through park_ctx: its frame address is only ever known
+     * at the trap, so it is recorded once, by whichever delivery built the
+     * frame, and read by the return. A return that guessed at park_ctx
+     * would read whatever the task's last park left there. */
+    uint64_t   linux_sig_frame_rsp;
+    /* 1 iff the ACTIVE frame was entered from the trap path. The sidecar
+     * never saw that delivery, so its own bookkeeping has no
+     * handler_active for it and its rt_sigreturn answers EINVAL by an
+     * honest rule that is wrong only here — the kernel, which holds the
+     * frame and never moved the sidecar's mask, is the authority for this
+     * one return. See linux_sig_fault_return_ok(). */
+    uint8_t    linux_sig_fault_active;
     uint64_t   linux_cr2;
     /* E7 increment 31: the KERNEL's own copy of the four fault signals'
      * actions, recorded from the bytes the guest installs at rt_sigaction's

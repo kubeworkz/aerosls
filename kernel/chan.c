@@ -999,6 +999,23 @@ uint64_t k_linux_deliver(uint32_t pid, uint16_t ch_r, uint64_t expect_num) {
                      * condition, so the refusal falls through to `return rax`
                      * — which IS that errno — with the frame untouched. */
                     if (expect_num == LINUX_RT_SIGRETURN) {
+                        /* E7 increment 32: a FAULT-delivered handler's
+                         * return has no sidecar delivery behind it — the
+                         * trap entered that handler — so the sidecar's 15
+                         * arm answers EINVAL, truthfully for its own model
+                         * and uselessly here. The kernel holds the frame and
+                         * moved no sidecar mask, so it is the authority for
+                         * this one return; linux_sig_fault_return_ok names
+                         * exactly that case (a trap frame plus exactly that
+                         * refusal), and every other answer falls through to
+                         * the gate below unchanged. */
+                        if (pd &&
+                            linux_sig_fault_return_ok(
+                                pd->linux_sig_active,
+                                pd->linux_sig_fault_active, rax,
+                                req.status))
+                            return (uint64_t)(int64_t)
+                                linux_sig_return_apply(pd);
                         if (!linux_sig_return_reply_ok(expect_num, rax,
                                                        req.status))
                             return rax;   /* the sidecar refused: its errno */

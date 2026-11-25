@@ -1331,4 +1331,31 @@ int linux_sig_park_install(uint64_t *w, uint32_t words,
  * guard clause P16 pins the shape chan.c calls it in. */
 int linux_sig_return_reply_ok(uint64_t num, uint64_t rax, int32_t status);
 
+/* ─── E7 increment 32: the fault frame's return gate ─────────────────────
+ * rt_sigreturn's gate above asks whether the SIDECAR consented, because for
+ * a tkill-delivered frame the sidecar is the half that entered the handler
+ * and moved the mask. A fault-delivered handler has no such half: the trap
+ * entered it, the kernel built and installed the frame, and the sidecar's
+ * `handler_active` was never raised — so its 15 arm answers EINVAL, which is
+ * correct for its own model (it moved no mask, so it has none to put back)
+ * and would otherwise be the last word on a return the kernel owes.
+ *
+ * This names the ONE case where that refusal is not the task's answer:
+ *   - a frame IS installed (sig_active) — otherwise there is nothing to
+ *     restore and EINVAL is exactly right (the live probe's
+ *     SIGRET-NOHAND-OK arm depends on this);
+ *   - that frame came from the TRAP (fault_active) — a sidecar-delivered
+ *     frame keeps the gate above, so a refusal there still fails closed;
+ *   - the answer really was a refusal (status != 0) — a consent, a
+ *     -EPROTO, or any other errno is not a fault return and falls through
+ *     to the same path it always took;
+ *   - and the errno the task would have heard is exactly -EINVAL, the
+ *     sidecar's "no handler was entered", never a different refusal
+ *     (a -ENOSYS or an -EPERM stays the task's answer by name).
+ *
+ * Pure and parameterised by the two flags rather than by the descriptor, so
+ * the host test can drive every corner of it without a process. */
+int linux_sig_fault_return_ok(int sig_active, int fault_active, uint64_t rax,
+                              int32_t status);
+
 #endif /* LINUX_ABI_H */
