@@ -72,6 +72,10 @@ cluster/
 # nobody but whoever ran them, and neither build inputs nor test fixtures.
 *.out
 commit_*_msg.txt
+# health.json: the ISO service smoke's /api/health response, written in the repo
+#   root by the CI step's own `curl ... > health.json` when the smoke is run
+#   locally. A run's body dump, re-created (and asserted) on every run.
+/health.json
 
 # ─── Live-arm run scratch ────────────────────────────────────────────────────
 # The live E7 arms (tests/e7_gate_check.sh --live, --group, --selfkill, the
