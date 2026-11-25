@@ -1699,6 +1699,45 @@ else
     bad "P8. the refusal-before-mutation property is no longer asserted: a partial frame write would be kernel-authored corruption of the task's memory, and the test that proves it did not happen is gone"
 fi
 
+if grep -qF 'LINUX_STAGE_SIGFRAME' "$LABH" "$LABC" && \
+   grep -qF 'p.kind = LINUX_STAGE_SIGFRAME;' "$LABC" && \
+   grep -qF 'p.len  = LINUX_SIGDELIVER_BYTES;' "$LABC" && \
+   grep -qF 'p.aux  = LINUX_SIGDELIVER_BYTES;' "$LABC" && \
+   grep -qF 'if (num == LINUX_TKILL)' "$LABC" && \
+   grep -qF 'if (skind == LINUX_STAGE_SIGFRAME) {' kernel/chan.c && \
+   grep -qF 'linux_sig_reply_apply(pd, pay, n)' kernel/chan.c && \
+   grep -qF 'Answer::SignalFrame(' "$LINUXRS" && \
+   grep -qF 'SIGDELIVER_BYTES' "$LINUXRS"; then
+    ok "P9. the wire has ONE description of a delivery: the plan stages LINUX_STAGE_SIGFRAME for tkill with no user destination (the bytes are an instruction, not an owed copy), the shape rule demands exactly the 80-byte request, chan.c hands it to linux_sig_reply_apply instead of the pointer copy path, and the sidecar answers Answer::SignalFrame — three ends, one length, so a handler can only be reached by a message all three agree on"
+else
+    bad "P9. the delivery wire lost one of its three ends — a plan without the stage would refuse the sidecar's answer as payload-on-a-number-with-no-plan, a sidecar without the variant would answer E_NOSYS to a disposition that now has a frame, and a chan.c without the branch would try to copy 80 bytes to address 0"
+fi
+
+if grep -qF 'w[1]  = entry->r[LINUX_SIGREG_RIP];' "$LABC" && \
+   grep -qF 'w[8]  = entry->r[LINUX_SIGREG_RSP];' "$LABC" && \
+   grep -qF 'w[9]  = entry->r[LINUX_SIGREG_RDI];' "$LABC" && \
+   grep -qF 'sizeof(struct CapParkCtx) == 120u' kernel/process.h && \
+   grep -qF 'cap_resume_linux_sig' kernel/process.h kernel/process.c && \
+   [ "$(grep -A 45 'void cap_resume_linux_sig' kernel/process.c | grep -c 'swapgs')" -eq 0 ] && \
+   grep -A 45 'void cap_resume_linux_sig' kernel/process.c | grep -qF 'jmp syscall_return_path' && \
+   grep -qF 'the park context reads into the register file' "$SIGDELIVER_HUT"; then
+    ok "P10. the handler is entered through the park context, not around it: the entry installs RIP at word 1, the frame's rsp at word 8 and the signo at word 9 (the offsets cap_recv_resume's and cap_sysret_resume's asm actually read), CapParkCtx's size is asserted at 120 bytes where it is defined, and the resume is that asm's push-and-sysret WITHOUT a second swapgs — this runs inside do_syscall, where a swap would put GS_BASE back at 0 with a kernel view live"
+else
+    bad "P10. the install and the return path disagree — a word nudged by one is a handler entered with the syscall's rsp or the caller's rip (a #PF or a crash in a place with no relation to the signal), a missing size assert lets a field move silently, and a second swapgs in the resume corrupts GS on the way out"
+fi
+
+if grep -qF 'r = linux_sig_park_install(w, LINUX_PARK_WORDS, &entry);' kernel/process.c && \
+   grep -A 2 'r = linux_sig_park_install(w, LINUX_PARK_WORDS, &entry);' kernel/process.c | grep -qF 'if (r != 0) return r;' && \
+   [ "$(grep -c 'cap_resume_linux_sig(pd);' kernel/process.c)" -eq 1 ] && \
+   grep -qF 'let before = sig.mask;' "$LINUXRS" && \
+   grep -qF 'let mut frame_mask = before | sig.act[no][2] | bit;' "$LINUXRS" && \
+   grep -qF 'sig.mask = frame_mask;' "$LINUXRS" && \
+   grep -qF 'frame_mask &= !bit;' "$LINUXRS"; then
+    ok "P11. one mask, two languages, and no resume without an install: the sidecar moves its mask to blocked|sa_mask|the signal (minus the signal under SA_NODEFER) BEFORE it answers, the kernel computes the same number in the frame and stores it as linux_sig_mask, and the only call into the resume sits after the install's own refusal check — so every failure path answers the syscall with an errno and the task keeps running, rather than jumping into a handler with half a context"
+else
+    bad "P11. the delivery's success is no longer conditional: a resume reachable from a refusal, or two masks that can disagree, is the shape where the task enters a handler the kernel did not install (or runs with a mask the sidecar did not set) and every subsequent signal behaves wrongly"
+fi
+
 echo
 if [ "$fails" -eq 0 ]; then
     echo "linux_personality_check: all clauses hold"

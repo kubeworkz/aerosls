@@ -399,6 +399,63 @@ int main(void)
         }
     }
 
+    printf("── the park bridge: what the return path reads ────────────\n");
+    {
+        uint64_t w[LINUX_PARK_WORDS];
+        struct LinuxSigRegs back2;
+        unsigned i;
+
+        w[0] = 0x202ULL;                     /* r11 = user RFLAGS */
+        w[1] = 0x401abcULL;                  /* rcx = user RIP    */
+        for (i = 2; i <= 7; i++) w[i] = 0xB0ULL + i;
+        w[8] = STACK_TOP;                    /* user_rsp          */
+        for (i = 9; i <= 14; i++) w[i] = 0xA0ULL + i;
+
+        memset(&ctx, 0, sizeof ctx);
+        r = linux_sig_park_read(w, LINUX_PARK_WORDS, &ctx);
+        CHECK(r == 0 && ctx.r[LINUX_SIGREG_RIP] == 0x401abcULL &&
+              ctx.eflags == 0x202ULL &&
+              ctx.r[LINUX_SIGREG_RSP] == STACK_TOP &&
+              ctx.r[LINUX_SIGREG_R15] == 0xB2ULL &&
+              ctx.r[LINUX_SIGREG_RDI] == 0xA9ULL &&
+              ctx.r[LINUX_SIGREG_R9] == 0xAEULL,
+              "the park context reads into the register file at the offsets the\n"
+              "      resume asm uses — r11 is eflags, rcx is rip, word 8 is rsp\n"
+              "      and 9..14 are the six Linux arguments");
+
+        r = linux_sig_park_read(w, LINUX_PARK_WORDS - 1u, &ctx);
+        CHECK(r == -LINUX_EINVAL,
+              "a park context shorter than 15 words is refused rather than\n"
+              "      read past — the last word is r9, the handler's sixth\n"
+              "      argument for a SIGINFO handler");
+
+        map_pages(P_BIT | W_BIT | U_BIT);
+        good_req(&req, 11u);
+        r = linux_sig_deliver(root_of(), &req, &ctx, 0xdead0000ULL, &entry, &mask);
+        CHECK(r == 0, "the interrupted context from the park builds a frame");
+
+        r = linux_sig_park_install(w, LINUX_PARK_WORDS, &entry);
+        CHECK(r == 0 && w[1] == req.handler && w[8] == entry.r[LINUX_SIGREG_RSP] &&
+              w[9] == 11u && w[0] == 0x202ULL,
+              "installing the entry context puts the HANDLER in the sysret\n"
+              "      target, the frame in the user rsp, the signo in rdi — and\n"
+              "      leaves the flags alone, so the handler runs with IF set");
+
+        r = linux_sig_park_read(w, LINUX_PARK_WORDS, &back2);
+        CHECK(r == 0 && back2.r[LINUX_SIGREG_RIP] == entry.r[LINUX_SIGREG_RIP] &&
+              back2.r[LINUX_SIGREG_RSP] == entry.r[LINUX_SIGREG_RSP] &&
+              back2.r[LINUX_SIGREG_RDI] == entry.r[LINUX_SIGREG_RDI] &&
+              back2.r[LINUX_SIGREG_R15] == entry.r[LINUX_SIGREG_R15],
+              "and reading it back is the same context — install and read are\n"
+              "      exact mirrors, which is what makes the round trip a\n"
+              "      property instead of a coincidence");
+
+        r = linux_sig_park_install(w, LINUX_PARK_WORDS - 1u, &entry);
+        CHECK(r == -LINUX_EINVAL,
+              "a short park context cannot be installed either: a partial\n"
+              "      install would enter the handler with half a context");
+    }
+
     printf("── the census: the row is still absent ────────────────────\n");
     CHECK(linux_syscall_class(LINUX_RT_SIGRETURN) == LSC_UNKNOWN,
           "rt_sigreturn is still UNCLASSIFIED — this increment delivers\n"

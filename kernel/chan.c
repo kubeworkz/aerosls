@@ -1038,6 +1038,24 @@ uint64_t k_linux_deliver(uint32_t pid, uint16_t ch_r, uint64_t expect_num) {
                  * never the sidecar's — and the cursor advances only by
                  * entries actually packed (a short getdents is legal; the
                  * caller loops, and end-of-directory is 0 bytes, 0 entries). */
+                /* E7 increment 28 (P1-C's wire-up): the payload is not owed
+                 * to a pointer — it is the sidecar's instruction to RUN a
+                 * handler. No byte is copied to the task here: the arm
+                 * below builds the frame, writes it through the validated
+                 * copy against the task's own cr3, installs the entry
+                 * context into the park and resumes DELIVERING (or returns
+                 * a refusal with the task's memory untouched). A null pd
+                 * means the task died between the post and the reply: the
+                 * same -ESRCH a closed endpoint answers with. */
+                if (skind == LINUX_STAGE_SIGFRAME) {
+                    if (n != LINUX_SIGDELIVER_BYTES)
+                        return (uint64_t)(int64_t)(-LINUX_EPROTO);
+                    if (!pd)
+                        return (uint64_t)(int64_t)linux_errno_from_cap(
+                            CAP_ERR_TARGET);
+                    return (uint64_t)(int64_t)
+                        linux_sig_reply_apply(pd, pay, n);
+                }
                 if (skind == LINUX_STAGE_STAT) {
                     uint8_t sbuf[LINUX_STAT_BYTES];
                     if (n != LINUX_STAT_PAYLOAD_BYTES)

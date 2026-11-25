@@ -1248,6 +1248,37 @@ seed "$W/t148"
 sed -i '/CHECK(clean,/d' "$W/t148/tests/linux_sigdeliver_host_test.c"
 tooth deliver-unwritten-assert-gone P8 "the guest's stack is no longer proven untouched" "$W/t148"
 
+# ─── P9–P11 teeth (increment 28: the delivery wired up) ────────────────────
+
+# t149: the plan's bound narrowed by one word — the kernel would refuse the
+# sidecar's 80-byte answer as "beyond the staged clamp" and a handler-
+# disposition tkill would come back -EPROTO to a task that never asked for
+# a protocol.
+seed "$W/t149"
+sed -i 's/        p.len  = LINUX_SIGDELIVER_BYTES;/        p.len  = 72u;/' "$W/t149/kernel/linux_abi.c"
+tooth sigframe-plan-bound-narrowed P9 "the tkill plan no longer accepts 80 bytes" "$W/t149"
+
+# t150: the sidecar goes back to record-only — the handler exists, the frame
+# exists, and the task hears ENOSYS. The one shape a boot would show as
+# "signals still don't work" with no kernel-side culprit at all.
+seed "$W/t150"
+sed -i 's/Answer::SignalFrame/Answer::SignalReplies/g' "$W/t150/user/sidecar/src/linux.rs"
+tooth sigframe-sidecar-record-only-again P9 "the tkill arm stopped emitting the delivery" "$W/t150"
+
+# t151: the install nudged one word — rsp lands where rbp is, so the handler
+# is entered with a kernel pointer for a stack. The frame is written, the
+# mask is right, and the first store in the handler faults.
+seed "$W/t151"
+sed -i 's/    w\[8\]  = entry->r\[LINUX_SIGREG_RSP\];/    w[7]  = entry->r[LINUX_SIGREG_RSP];/' "$W/t151/kernel/linux_abi.c"
+tooth sigframe-install-rsp-nudged P10 "the entry install puts rsp in the wrong word" "$W/t151"
+
+# t152: chan.c stops handing the payload to the reply arm. The bytes arrive,
+# the shape checks pass, and the 80-byte request falls through to the RAW
+# copy path — aimed at address 0.
+seed "$W/t152"
+sed -i '/linux_sig_reply_apply(pd, pay, n);/d' "$W/t152/kernel/chan.c"
+tooth sigframe-chan-branch-gone P9 "chan.c no longer routes the delivery request" "$W/t152"
+
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

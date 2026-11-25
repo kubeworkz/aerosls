@@ -3909,6 +3909,65 @@ second writer, sentinel assertion removed).
 
 ---
 
+### 10.18 What has landed — increment 28 (the delivery, wired)
+
+Increment 27 built the mechanism and said plainly that nothing called it.
+This one connects the three ends, and a handler is now entered by the same
+reply channel the rest of the shim already uses — no new protocol, no
+second queue:
+
+- **The plan** (`linux_fd_reply_plan`): tkill stages `LINUX_STAGE_SIGFRAME`
+  with **no user destination** (dst 0) and a bound of exactly 80 bytes — the
+  bytes are the kernel's instruction, not something owed to a pointer — and
+  `linux_reply_shape_ok` demands `ret == 0 && n == 80` for that number, so a
+  short or padded answer is refused before anything is built.
+- **The sidecar** (`LINUX_TKILL`'s handler arm): instead of the old
+  record-only `E_NOSYS`, it answers `Answer::SignalFrame` with the 80-byte
+  request, moving its own mask to `blocked | sa_mask | the signal` (minus the
+  signal under `SA_NODEFER`) *before* the reply, and sending it through
+  `reply_bytes` so the kernel sees 72 + 80 with a zero status and an echoing
+  num. The old contract's test is retired and replaced by two: the request's
+  field-by-field contents, and "a handler never falls back to its default".
+- **The kernel's arm** (`chan.c`): the SIGFRAME branch bypasses the pointer
+  copy path entirely and calls `linux_sig_reply_apply`, which decodes the
+  request, reads the interrupted context out of the park context, calls
+  `linux_sig_deliver` (frame built, written through the validated copy), and
+  installs the entry context back into the park context. **A second writer
+  still does not exist**: the only store into a user page is
+  `linux_user_copy_in`.
+- **The entry** (`cap_resume_linux_sig`): the return path rebuilds its frame
+  from `park_ctx`, so installing RIP at word 1, the frame's rsp at word 8 and
+  the signo at word 9 *is* the jump into the handler. It is
+  `cap_sysret_resume`'s push-and-sysret — the code the boots already
+  validated — with `do_syscall` removed (the syscall has been answered) and
+  **no `swapgs`**: this runs inside `do_syscall`, already in the kernel view.
+  `CapParkCtx`'s size is asserted at 120 bytes where the layout is defined.
+  Every refusal (bad request, builder refusal, `-EFAULT`, failed install)
+  returns an errno with the task's memory untouched and the park intact.
+
+**What a live arm will and will not do**: a task that raises a
+handler-disposed signal will now *enter* its handler. It will not get out of
+it — the handler returns through the restorer, which issues `rt_sigreturn`,
+and that number is still `LSC_UNKNOWN` (clauses P2/P4): the sidecar answers
+`-ENOSYS` and the return path breaks there. That row needs a real census
+trace, not a belief, and it is the next increment's whole subject. Two
+smaller named gaps: `linux_cr2` is not yet captured by the page-fault path,
+so a `SIGSEGV` delivery names the request's address (a software-sent signal
+is exact; a fault-derived one is not yet), and the *reveal* path —
+`rt_sigprocmask` unblocking a pending handler-disposed signal — still refuses
+by name rather than delivering from inside that syscall.
+
+**Evidence**: `tests/linux_sigdeliver_host_test.c` now 38 checks (the park
+bridge's read/install round trip, both short-context refusals, and the
+install-by-offset assertions); sidecar 77 tests; guard clauses **P9–P11**
+(the wire's three ends agreeing on one length, the install's offsets and the
+resume's absent `swapgs`, and one mask in two languages with the resume
+reachable only after a successful install); teeth t149–t152 (plan bound
+narrowed, sidecar back to record-only, install word nudged, chan.c's branch
+deleted). `make selfhost-bootimage` and `make x86-iso` both exit 0.
+
+---
+
 ## 11. Open questions for review
 
 1. **The first user: designated, built, and censused.** `AeroSLS-Roadmap-2026H2-v0.1.md` §5 says in bold that there is no named first user, and the tree agreed — no Go source, no `std`-Rust binary, every real operational workload bash or Python (§5.5.1) — so the target was a *decision*. It is now made and carried out: the backup operation, as `backup/aerobackup/` (a static single-threaded Rust rewrite of `backup/backup.sh`'s snapshot-and-retain core, 27 tests, no dependencies), designated in `tools/linux_abi_candidate.conf`, with the census measured and checked in at `tools/linux_syscall_census.txt` (§5.6). **The open question is no longer about the first user; it is whether this candidate is narrow enough to gate on.** Its measured surface is 27 syscalls, and the two that are structurally hardest — `arch_prctl(ARCH_SET_FS)` (§5.3) and the vDSO-backed `clock_gettime` — are both now named rather than discovered. Whether the other three operations follow, and in what order, is a product question this design does not answer.

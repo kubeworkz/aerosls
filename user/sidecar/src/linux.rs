@@ -470,6 +470,13 @@ enum Answer {
     /// 14): the kill line prints `sig=<N>`, so WHICH signal killed the task
     /// is read off the line rather than reconstructed from which arms ran.
     SignalKill(u64),
+    /// E7 increment 28 (P1-C's wire-up): the disposition is a HANDLER and it
+    /// can run — the reply carries the 80-byte delivery request (the second
+    /// element is the signo, for the log line). `service` sends it with
+    /// `reply_bytes`, so the kernel sees 72 + 80 with a zero status and an
+    /// echoing num: the shape chan.c's LINUX_STAGE_SIGFRAME arm validates
+    /// before it builds a single byte of frame.
+    SignalFrame([u8; SIGDELIVER_BYTES], u64),
 }
 
 /// One Linux task's §5.4 heap ledger: the budget span the create stamped
@@ -545,6 +552,38 @@ fn dispo(sig: &SigState, no: u64) -> u8 {
 /// Linux's `SA_RESTART` (x86-64 UAPI): the handler runs, and the syscall
 /// it interrupted is restarted rather than answered.
 const SIG_SA_RESTART: u64 = 0x1000_0000;
+/// SA_NODEFER / SA_SIGINFO and the sigaltstack disabled flag, x86-64 UAPI.
+const SIG_SA_NODEFER: u64 = 0x4000_0000;
+const SIG_SA_SIGINFO: u64 = 0x4;
+const SIG_SS_DISABLE: u32 = 2;
+
+/// E7 increment 28 (P1-C's wire-up): the 80-byte delivery request the
+/// kernel's `struct LinuxSigDeliverReq` decodes — signo, si_code, si_addr,
+/// handler, restorer, act flags, act mask, the thread's blocked mask, the
+/// altstack, and the SA_SIGINFO bit. Field order and widths are the
+/// kernel's, and the kernel refuses any other length, so a mistake here is
+/// a refusal rather than a handler entered with a made-up address. The
+/// altstack is the disabled one (v1 does not track ss_sp/ss_size — the
+/// same limit increment 26's header names).
+const SIGDELIVER_BYTES: usize = 80;
+fn sig_frame_bytes(signo: u64, handler: u64, restorer: u64, flags: u64,
+                   sa_mask: u64, blocked: u64) -> [u8; SIGDELIVER_BYTES] {
+    let mut b = [0u8; SIGDELIVER_BYTES];
+    b[0..4].copy_from_slice(&(signo as u32).to_le_bytes());
+    b[4..8].copy_from_slice(&0u32.to_le_bytes());          /* si_code = SI_USER */
+    b[8..16].copy_from_slice(&0u64.to_le_bytes());         /* si_addr          */
+    b[16..24].copy_from_slice(&handler.to_le_bytes());
+    b[24..32].copy_from_slice(&restorer.to_le_bytes());
+    b[32..40].copy_from_slice(&flags.to_le_bytes());
+    b[40..48].copy_from_slice(&sa_mask.to_le_bytes());
+    b[48..56].copy_from_slice(&blocked.to_le_bytes());
+    b[56..64].copy_from_slice(&0u64.to_le_bytes());        /* alt_sp  = none  */
+    b[64..72].copy_from_slice(&0u64.to_le_bytes());        /* alt_size        */
+    b[72..76].copy_from_slice(&SIG_SS_DISABLE.to_le_bytes());
+    b[76..80].copy_from_slice(
+        &(if flags & SIG_SA_SIGINFO != 0 { 1u32 } else { 0u32 }).to_le_bytes());
+    b
+}
 
 /// E7 increment 27 (P1-C, "the delivery") — THE PARK'S WAKE, as one rule.
 /// A forward parked on a console read or a poll is answered -EINTR when a
@@ -1122,12 +1161,30 @@ fn answer(
                 sig.pending |= 1u64 << (args[1] - 1);
                 Answer::Reply(0, STATUS_OK) /* blocked: arrives as pending */
             } else if dispo(sig, args[1]) == DISPO_HANDLER {
-                /* RECORD-ONLY: the handler is stored, never called. There
-                 * is no signal frame and no rt_sigreturn to return
-                 * through, so running the DEFAULT action instead would
-                 * terminate a task whose disposition says "handle" —
-                 * refused by name, nothing mutated, no kill. */
-                Answer::Reply(0, E_NOSYS)
+                /* E7 increment 28 (P1-C's wire-up): the handler RUNS. The
+                 * answer is the 80-byte delivery request — act words the
+                 * kernel re-checks and a frame it builds — instead of the
+                 * old record-only E_NOSYS. Deliverable means: installed
+                 * (dispo's HANDLER), not blocked (the arm above caught
+                 * that), so the mask moves HERE, before the reply, to
+                 * exactly what the frame's sigset will carry: the
+                 * thread's mask | sa_mask | the signal itself. The kernel
+                 * installs the same number on its side (clause P9 holds
+                 * the two to one decision) — and the pending bit is NOT
+                 * set: this delivery consumed it. */
+                let no = args[1] as usize;
+                let bit = 1u64 << (args[1] - 1);
+                let before = sig.mask;             /* the frame's `blocked` */
+                let flags = sig.act[no][1];
+                let mut frame_mask = before | sig.act[no][2] | bit;
+                if flags & SIG_SA_NODEFER != 0 {
+                    frame_mask &= !bit;
+                }
+                sig.mask = frame_mask;            /* the handler runs under it */
+                Answer::SignalFrame(
+                    sig_frame_bytes(args[1], sig.act[no][0], sig.act[no][3],
+                                    flags, sig.act[no][2], before),
+                    args[1])
             } else {
                 match default_action(args[1]) {
                     ACT_TERMINATE => Answer::SignalKill(args[1]),
@@ -3053,6 +3110,22 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                                b" exit_group row closed\n");
                 }
             }
+            Answer::SignalFrame(frame, signo) => {
+                /* E7 increment 28 (P1-C's wire-up): the frame is the
+                 * KERNEL's to build and write; this side names the handler
+                 * and the act words, and the kernel re-checks every one of
+                 * them. Logged BEFORE the reply so the boot's attribution
+                 * reads `sig=<N> handler -> frame` — the line that tells
+                 * "the handler was installed" from "the task happened to
+                 * keep running". A failed send is reply()'s own case: the
+                 * child's end died mid-call, and the kernel's close arm
+                 * answers the parked task with -ESRCH. */
+                let mut ex = [0u8; 64];
+                let n = fmt_sig_line(&mut ex, b" sig=", signo,
+                                     b" handler -> frame\n");
+                enosys_log(num as u32, &name_buf[..nlen], &ex[..n]);
+                reply_bytes(k, ch_w, rr.tag, num, 0, &frame);
+            }
             Answer::SignalKill(kill_sig) => {
                 /* E7 increment 10 (§10.13's step 2): a signal's default
                  * action ran. The line names the SIGNAL NUMBER (increment
@@ -3546,19 +3619,40 @@ mod tests {
     }
 
     #[test]
-    fn a_recorded_handler_is_never_invoked_and_never_falls_back_to_default() {
+    fn a_handler_disposition_answers_with_the_delivery_request() {
+        /* E7 increment 28: the old contract (a recorded handler is never
+         * invoked, so its tkill is refused E_NOSYS) is RETIRED — the frame
+         * exists, so the answer is the 80-byte request, with the act words
+         * the kernel re-checks and the mask the handler will run under. */
         let mut sig = fresh();
         let a = answer(13, &[10, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
                        &mut sig, &act_payload(0x800abcd));
         assert!(matches!(a, Answer::Reply(0, STATUS_OK)), "install: {:?}", a);
-        /* SIGUSR1, unblocked, handler disposition: refused by name — NOT
-         * the default terminate, and NOT a silent success. */
         let a = answer(200, &[TID, 10, 0, 0, 0, 0], &fds(), &mut ledger(),
                        &mut sig, &[]);
-        assert!(matches!(a, Answer::Reply(0, E_NOSYS)), "handler tkill: {:?}", a);
-        assert_eq!(sig.pending, 0, "no pending bit was left behind");
-        /* Blocked: the signal PENDS (Linux's own answer), and the unblock
-         * that would reveal it refuses the CALL before the mask moves. */
+        match a {
+            Answer::SignalFrame(f, signo) => {
+                assert_eq!(signo, 10);
+                assert_eq!(u32::from_le_bytes([f[0], f[1], f[2], f[3]]), 10);
+                assert_eq!(read_u64(&f, 16), 0x800abcd,
+                           "the handler word the kernel will jump to");
+                assert_eq!(read_u64(&f, 48), 0, "blocked was empty");
+                assert_eq!(read_u64(&f, 40), 0, "sa_mask was empty");
+                assert_eq!(u32::from_le_bytes([f[72], f[73], f[74], f[75]]),
+                           SIG_SS_DISABLE, "v1 delivers on the user stack");
+            }
+            other => panic!("handler tkill must emit a delivery: {:?}", other),
+        }
+        assert_eq!(sig.pending, 0, "the delivery consumed any pending bit");
+        assert_ne!(sig.mask & (1 << 9), 0,
+                   "and the handler runs with its own signal blocked");
+
+        /* Blocked: the signal PENDS (Linux's own answer) and no frame is
+         * built yet; the unblock that would reveal it refuses the CALL —
+         * the reveal path's delivery is not wired (named limit). */
+        let mut sig = fresh();
+        answer(13, &[10, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
+               &mut sig, &act_payload(0x800abcd));
         answer(14, &[2, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
                &mut sig, &set_payload(1 << 9));
         let a = answer(200, &[TID, 10, 0, 0, 0, 0], &fds(), &mut ledger(),
@@ -3571,6 +3665,20 @@ mod tests {
         assert!(matches!(a, Answer::Reply(0, E_NOSYS)), "unblock: {:?}", a);
         assert_eq!(sig.mask, before, "the refusal moved no mask");
         assert_ne!(sig.pending & (1 << 9), 0, "and no pending bit vanished");
+    }
+
+    #[test]
+    fn a_handler_never_falls_back_to_its_default_action() {
+        /* The retired test's other half, kept: a HANDLER disposition must
+         * never become the default action's kill, whatever the default
+         * for that number is (SIGUSR1's would be a terminate). */
+        let mut sig = fresh();
+        answer(13, &[10, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
+               &mut sig, &act_payload(0x800abcd));
+        let a = answer(200, &[TID, 10, 0, 0, 0, 0], &fds(), &mut ledger(),
+                       &mut sig, &[]);
+        assert!(!matches!(a, Answer::SignalKill(_)),
+                "a handler disposition killed its task: {:?}", a);
     }
 
     #[test]

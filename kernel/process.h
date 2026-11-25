@@ -127,6 +127,12 @@ struct CapParkCtx {
      * test's offsetof checks. */
     uint64_t linux_args[6];
 };
+/* E7 increment 28: the bridge in linux_abi.c reads and installs exactly
+ * these 15 words; a field added above that moved one of them would be a
+ * handler entered with the wrong rsp, so the size is asserted where the
+ * layout is defined. */
+_Static_assert(sizeof(struct CapParkCtx) == 120u,
+               "CapParkCtx is the 15-word park context the signal bridge (linux_abi.c) reads by offset");
 
 struct ProcessDescriptor {
     uint32_t   pid;
@@ -301,6 +307,17 @@ struct ProcessDescriptor {
     // its [gs:0x50..0x80) capture (E7 increment 13 — the register round
     // trip both resume paths re-stamp before the sysret).
     struct CapParkCtx park_ctx;
+    /* E7 increment 28: the signal state a delivery leaves behind. The mask
+     * the handler runs under (the kernel's copy of what the frame carries —
+     * the sidecar's SigState stays the authority and the two are written
+     * from one decision, clause P9), whether a handler is currently entered
+     * (so rt_sigreturn's row, when the census allows it, has something
+     * coherent to restore), and the fault address a SIGSEGV delivery names
+     * (0 until the page-fault path records it — the one gap this increment
+     * leaves open by name). */
+    uint64_t   linux_sig_mask;
+    uint8_t    linux_sig_active;
+    uint64_t   linux_cr2;
     uint64_t   park_req;              // the request pointer the resume re-runs
                                        // (SLSCapRecvRequest for a recv park,
                                        // SLSChanWaitRequest for a chan-wait park).
@@ -549,6 +566,19 @@ int  cap_wait_chans(const uint32_t* chan_ids, uint32_t n, void* req,
                     uint32_t park_syscall, uint64_t deadline_ticks);
 void cap_wake_chan(uint32_t chan_id);
 void cap_recv_resume(struct ProcessDescriptor* pd);   /* noreturn */
+
+/* E7 increment 28 (P1-C's wire-up): the reply arm that runs a handler, and
+ * the resume that enters it. `linux_sig_reply_apply` returns 0 only by
+ * never returning — a successful delivery resumes the task INTO the handler
+ * (cap_resume_linux_sig), which is precisely why a handler's syscall never
+ * gives its caller a return value. A refusal (-EINVAL / -EFAULT) returns
+ * normally and mutates nothing. Declared here, after the descriptor is
+ * complete: a `struct ProcessDescriptor*` in a prototype seen before the
+ * struct exists is a prototype-scoped type, which is a conflicting-types
+ * error the moment the definition is read. */
+int  linux_sig_reply_apply(struct ProcessDescriptor* pd, const uint8_t* pay,
+                          uint32_t n);
+void cap_resume_linux_sig(struct ProcessDescriptor* pd);   /* noreturn */
 
 // Seed Kernel Phase 1.5 (immediate wake): strong override of cap.c's weak
 // hook, called by cap_send() right after cap_wake_chan(). If the wake

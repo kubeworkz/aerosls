@@ -1,4 +1,5 @@
 #include "process.h"
+#include "linux_abi.h"   /* increment 28: the signal bridge and linux_sig_deliver */
 #include "linux_thread.h"
 #include "linux_futex.h"
 #include "object_catalog.h"
@@ -3009,6 +3010,108 @@ void cap_sysret_resume(struct ProcessDescriptor* pd) {
         : "r"(top), "r"(p)
         : "rax", "memory");
     __builtin_unreachable();
+}
+
+/* ─── E7 increment 28 (P1-C's wire-up): the delivery's return half ────────
+ * A handler's entry is not a return value: the task must appear back in
+ * ring 3 AT THE HANDLER, with rsp pointing at the frame the builder wrote
+ * and rdi holding the signo. The return path rebuilds its frame from
+ * park_ctx (cap_recv_resume's own asm and cap_sysret_resume's), so
+ * installing the entry context there IS the jump — and this function is
+ * cap_sysret_resume's push-and-sysret with two differences that matter:
+ *
+ *   no swapgs — we are already in the kernel view (this runs inside
+ *   do_syscall, called from the resume's asm), so repeating the entry
+ *   path's swap would put GS_BASE back at 0 with a kernel view live;
+ *
+ *   no do_syscall — the syscall has been ANSWERED (the reply's delivery),
+ *   and re-running it would forward tkill a second time.
+ *
+ * The push order and the [gs:0x50..0x80) re-stamp are copied verbatim from
+ * cap_sysret_resume, which is the code the boots have already validated;
+ * a different order here is the mirror-bug that once sysret'd to the
+ * user's stack (process.c's own history, above). */
+__attribute__((noreturn))
+void cap_resume_linux_sig(struct ProcessDescriptor* pd) {
+    uint64_t* p   = (uint64_t*)&pd->park_ctx;
+    uint64_t  top = pd->syscall_stack_top;
+
+    /* .syscall_return does `mov rsp,[gs:0]` — the user RSP is the FRAME's,
+     * as installed below, not the syscall's. */
+    per_cpu_data[0].user_rsp = p[8];
+
+    __asm__ volatile(
+        "mov %0, %%rsp\n\t"
+        "pushq 56(%1)\n\t"   /* rbp */
+        "pushq 48(%1)\n\t"   /* rbx */
+        "pushq 40(%1)\n\t"   /* r12 */
+        "pushq 32(%1)\n\t"   /* r13 */
+        "pushq 24(%1)\n\t"   /* r14 */
+        "pushq 16(%1)\n\t"   /* r15 */
+        "pushq 8(%1)\n\t"    /* rcx — the HANDLER's address (sysret target) */
+        "pushq 0(%1)\n\t"    /* r11 — user RFLAGS */
+        "movq 72(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x50\n\t"   /* rdi = signo */
+        "movq 80(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x58\n\t"   /* rsi = &siginfo (SA_SIGINFO) */
+        "movq 88(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x60\n\t"   /* rdx = &ucontext (SA_SIGINFO) */
+        "movq 96(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x68\n\t"   /* r10 */
+        "movq 104(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x70\n\t"   /* r8 */
+        "movq 112(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x78\n\t"   /* r9 */
+        "xor %%eax, %%eax\n\t"   /* the handler's rax: not a return value */
+        "jmp syscall_return_path\n\t"
+        :
+        : "r"(top), "r"(p)
+        : "rax", "memory");
+    __builtin_unreachable();
+}
+
+/* The reply arm: the sidecar said "run this handler" and chan.c's
+ * LINUX_STAGE_SIGFRAME branch handed the 80 bytes here. Everything is a
+ * refusal until the frame is on the user's stack: a request that does not
+ * parse, a park context that cannot be read, a builder refusal (-EINVAL),
+ * a stack ring 3 could not write (-EFAULT) — each returns normally with
+ * the task's memory untouched and the park still intact, so the caller
+ * answers the syscall with an errno rather than jumping into a handler
+ * that was never installed. On success this function does not return. */
+int linux_sig_reply_apply(struct ProcessDescriptor* pd, const uint8_t* pay,
+                          uint32_t n) {
+    struct LinuxSigDeliverReq req;
+    struct LinuxSigRegs ctx, entry;
+    uint64_t mask = 0;
+    uint64_t* w;
+    int r;
+
+    if (!pd || !pay) return -LINUX_EINVAL;
+    r = linux_sig_deliver_req_parse(pay, n, &req);
+    if (r != 0) return r;
+
+    w = (uint64_t*)(void*)&pd->park_ctx;
+    r = linux_sig_park_read(w, LINUX_PARK_WORDS, &ctx);
+    if (r != 0) return r;
+
+    /* cr2: the fault address a SIGSEGV names. 0 until the page-fault path
+     * records it (named gap, §10.18) — a software-sent signal carries its
+     * addr in the request and never reads this. */
+    r = linux_sig_deliver(pd->cr3, &req, &ctx, pd->linux_cr2, &entry, &mask);
+    if (r != 0) return r;
+
+    r = linux_sig_park_install(w, LINUX_PARK_WORDS, &entry);
+    if (r != 0) return r;
+    pd->linux_sig_mask   = mask;
+    pd->linux_sig_active = 1;
+
+    kernel_serial_printf(
+        "[E7] sig %u (code %u) -> handler %lx, frame %lx, mask %lx\n",
+        (unsigned)req.signo, (unsigned)req.code,
+        (unsigned long)entry.r[LINUX_SIGREG_RIP],
+        (unsigned long)entry.r[LINUX_SIGREG_RSP],
+        (unsigned long)mask);
+    cap_resume_linux_sig(pd);
 }
 
 /* SYS_SLS_YIELD (300): voluntarily give up the CPU. The entry frame stays

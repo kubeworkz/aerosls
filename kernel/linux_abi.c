@@ -956,6 +956,18 @@ struct LinuxFdReplyPlan linux_fd_reply_plan(uint64_t num, const uint64_t args[6]
                                                    : LINUX_FD_WRITE_CHUNK;
         p.aux  = p.len;
         p.kind = LINUX_STAGE_RAW;
+    } else if (num == LINUX_TKILL) {
+        /* E7 increment 28: tkill's answer can BE a delivery — the sidecar's
+         * 80-byte act request for a handler disposition. The plan stages a
+         * bound with NO user address (dst 0): the bytes are not owed to a
+         * pointer in the task, and the deliver's SIGFRAME arm must not copy
+         * them anywhere. len is the exact size, so the kernel's clamp and
+         * the sidecar's bound are the same number (the twin rule the other
+         * numbers already obey). */
+        p.dst  = 0;
+        p.len  = LINUX_SIGDELIVER_BYTES;
+        p.aux  = LINUX_SIGDELIVER_BYTES;
+        p.kind = LINUX_STAGE_SIGFRAME;
     } else {
         return p;   /* not a reply-payload number (total function) */
     }
@@ -1183,6 +1195,12 @@ int linux_reply_shape_ok(uint64_t num, uint64_t ret, uint32_t n)
      * asked for the old one. */
     if (num == LINUX_SIGALTSTACK)
         return ret == 0 && n == LINUX_STACK_T_BYTES;
+    /* E7 increment 28: tkill's success that RUNS a handler carries exactly
+     * the delivery request. A shorter payload is a request with a word the
+     * sidecar never sent; a longer one is a message from a different
+     * conversation — both refused before anything is built. */
+    if (num == LINUX_TKILL)
+        return ret == 0 && n == LINUX_SIGDELIVER_BYTES;
     return ret == 0;
 }
 
@@ -1341,6 +1359,62 @@ int linux_sig_si_addr(uint32_t signo, uint64_t cr2, uint64_t rip, uint64_t *out)
         return 0;                   /* no address belongs to it; the caller
                                      * keeps the sidecar's own addr */
     }
+}
+
+/* ─── E7 increment 28: the park-context bridge ───────────────────────────
+ * The offsets are CapParkCtx's, named by cap_recv_resume's asm (see the
+ * header). Read and install are exact mirrors, so a round trip through
+ * them is the identity on every word the return path reads. */
+int linux_sig_park_read(const uint64_t *w, uint32_t words,
+                        struct LinuxSigRegs *ctx)
+{
+    if (!w || !ctx) return -LINUX_EINVAL;
+    if (words < LINUX_PARK_WORDS) return -LINUX_EINVAL;
+
+    {
+        uint32_t i;
+        for (i = 0; i < (uint32_t)LINUX_SIGREG_COUNT; i++) ctx->r[i] = 0;
+    }
+    ctx->eflags = w[0];                        /* r11 */
+    ctx->r[LINUX_SIGREG_RIP] = w[1];            /* rcx */
+    ctx->r[LINUX_SIGREG_R15] = w[2];
+    ctx->r[LINUX_SIGREG_R14] = w[3];
+    ctx->r[LINUX_SIGREG_R13] = w[4];
+    ctx->r[LINUX_SIGREG_R12] = w[5];
+    ctx->r[LINUX_SIGREG_RBX] = w[6];
+    ctx->r[LINUX_SIGREG_RBP] = w[7];
+    ctx->r[LINUX_SIGREG_RSP] = w[8];            /* user_rsp */
+    ctx->r[LINUX_SIGREG_RDI] = w[9];
+    ctx->r[LINUX_SIGREG_RSI] = w[10];
+    ctx->r[LINUX_SIGREG_RDX] = w[11];
+    ctx->r[LINUX_SIGREG_R10] = w[12];
+    ctx->r[LINUX_SIGREG_R8]  = w[13];
+    ctx->r[LINUX_SIGREG_R9]  = w[14];
+    return 0;
+}
+
+int linux_sig_park_install(uint64_t *w, uint32_t words,
+                           const struct LinuxSigRegs *entry)
+{
+    if (!w || !entry) return -LINUX_EINVAL;
+    if (words < LINUX_PARK_WORDS) return -LINUX_EINVAL;
+
+    w[0]  = entry->eflags;
+    w[1]  = entry->r[LINUX_SIGREG_RIP];
+    w[2]  = entry->r[LINUX_SIGREG_R15];
+    w[3]  = entry->r[LINUX_SIGREG_R14];
+    w[4]  = entry->r[LINUX_SIGREG_R13];
+    w[5]  = entry->r[LINUX_SIGREG_R12];
+    w[6]  = entry->r[LINUX_SIGREG_RBX];
+    w[7]  = entry->r[LINUX_SIGREG_RBP];
+    w[8]  = entry->r[LINUX_SIGREG_RSP];
+    w[9]  = entry->r[LINUX_SIGREG_RDI];
+    w[10] = entry->r[LINUX_SIGREG_RSI];
+    w[11] = entry->r[LINUX_SIGREG_RDX];
+    w[12] = entry->r[LINUX_SIGREG_R10];
+    w[13] = entry->r[LINUX_SIGREG_R8];
+    w[14] = entry->r[LINUX_SIGREG_R9];
+    return 0;
 }
 
 int linux_sig_deliver(uint64_t root, const struct LinuxSigDeliverReq *req,

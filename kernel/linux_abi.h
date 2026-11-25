@@ -536,6 +536,11 @@ uint64_t linux_user_page_frame(uint64_t root, uint64_t va);
                                            * sa_restorer — four u64s       */
 #define LINUX_SIGSET_BYTES   8u           /* the sigset the shim crosses  */
 #define LINUX_SIGALTSTACK   131u          /* the census's sigaltstack row */
+/* E7 increment 28: tkill — the number whose reply can BE a delivery. It is
+ * named here (and only here) because the kernel must state which number a
+ * 80-byte reply belongs to; the classification table still decides the
+ * class, and nothing here adds a row to it. */
+#define LINUX_TKILL         200u
 #define LINUX_STACK_T_BYTES  24u          /* kernel-ABI struct stack_t:
                                            * ss_sp u64, ss_flags i32 + pad,
                                            * ss_size u64                    */
@@ -629,6 +634,11 @@ struct LinuxSigCopyPlan linux_sig_copy_plan(uint64_t num,
 #define LINUX_STAGE_RAW   1u
 #define LINUX_STAGE_STAT  2u
 #define LINUX_STAGE_DENTS 3u
+/* E7 increment 28 (P1-C's wire-up): tkill's reply is not owed to a pointer
+ * in the task — it is the kernel's INSTRUCTION to build a frame. There is
+ * no user destination (dst stays 0); the payload lands in the park-context
+ * bridge below, and the write it causes goes through linux_sig_deliver. */
+#define LINUX_STAGE_SIGFRAME 4u
 
 /* `struct stat`, musl x86-64 (144 bytes): field offsets the golden test
  * pins and the probe reads back on-target (§5.6). The sidecar's payload
@@ -1213,5 +1223,30 @@ int linux_sig_si_addr(uint32_t signo, uint64_t cr2, uint64_t rip, uint64_t *out)
 int linux_sig_deliver(uint64_t root, const struct LinuxSigDeliverReq *req,
                       const struct LinuxSigRegs *ctx, uint64_t cr2,
                       struct LinuxSigRegs *entry, uint64_t *entry_mask);
+
+/* ─── E7 increment 28 (P1-C's wire-up) — the park-context bridge ───────────
+ * A delivery replaces the RETURN of the parked forward, and the only place
+ * the kernel keeps a return target is the park context: process.c's
+ * CapParkCtx, whose word layout cap_recv_resume's asm reads by offset
+ * (0 = r11/user RFLAGS, 1 = rcx/user RIP, 2..7 = r15..rbp, 8 = user RSP,
+ * 9..14 = the six Linux argument registers). These two functions are the
+ * whole bridge between that layout and the frame builder's register file,
+ * and they are pure arrays-in/arrays-out so the host test can drive them:
+ * a wrong offset here is a handler entered with the syscall's rsp or the
+ * caller's rip, which no boot line would attribute to this file. */
+#define LINUX_PARK_WORDS 15u   /* CapParkCtx is 120 bytes: 8 saved regs,
+                                * user RSP, and the six Linux arguments —
+                                * every word is named by an asm offset */
+
+/* Read the INTERRUPTED context out of a park context: what the handler's
+ * frame records and what rt_sigreturn will one day restore. */
+int linux_sig_park_read(const uint64_t *w, uint32_t words,
+                        struct LinuxSigRegs *ctx);
+
+/* Write the HANDLER's entry context into the park context: the return
+ * path rebuilds its frame from these words, so a correct install IS the
+ * jump into the handler. */
+int linux_sig_park_install(uint64_t *w, uint32_t words,
+                           const struct LinuxSigRegs *entry);
 
 #endif /* LINUX_ABI_H */
