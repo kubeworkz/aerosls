@@ -53,7 +53,9 @@
                         * copy-in aims where the FIRST trap said) */
 #include "linux_thread.h"  /* E7 TG-1 I1: the getdents64 cursor is group-owned */
 #include "linux_abi.h"   /* E7 increment 3: SYS_LINUX_TRAP_RESUME, the request
-                          * struct, linux_syscall_apply_reply, errno map */
+                          * struct, linux_syscall_apply_reply, errno map;
+                          * increment 29b: linux_sig_return_reply_ok, the
+                          * return trip's gate */
 #include "kernel_io.h"
 #include "timer.h"   /* Phase 5 deadlines: kernel_tick_counter, KERNEL_TICK_NS */
 #include <stddef.h>
@@ -983,15 +985,23 @@ uint64_t k_linux_deliver(uint32_t pid, uint16_t ch_r, uint64_t expect_num) {
                 {
                     uint64_t rax = linux_syscall_apply_reply(
                         &req, rbuf, (uint64_t)out.len);
-                    /* E7 increment 29: rt_sigreturn's answer is not a return
-                     * value — the task resumes in the INTERRUPTED context,
-                     * which only the kernel can rebuild (the frame is in the
-                     * task's own pages). The sidecar's reply has already
-                     * restored ITS mask; this half restores the registers and
-                     * the kernel's, then resumes. A refusal (a clobbered or
-                     * forged frame) comes back as an errno instead. */
-                    if (expect_num == LINUX_RT_SIGRETURN &&
-                        rax != (uint64_t)(int64_t)(-LINUX_EPROTO)) {
+                    /* E7 increment 29b: rt_sigreturn's answer is not a
+                     * return value — the task resumes in the INTERRUPTED
+                     * context, which only the kernel can rebuild (the frame
+                     * is in the task's own pages). But the sidecar's 15 arm
+                     * owns the MASK, so the gate is ITS answer, not "the rax
+                     * is not -EPROTO": status 0 says it put `saved_mask` back
+                     * and nonzero says it refused (no handler was entered),
+                     * and restoring a frame under a refusal would return the
+                     * task into a context whose mask was never unwound while
+                     * silently discarding the errno the sidecar meant it to
+                     * hear. linux_sig_return_reply_ok names that single
+                     * condition, so the refusal falls through to `return rax`
+                     * — which IS that errno — with the frame untouched. */
+                    if (expect_num == LINUX_RT_SIGRETURN) {
+                        if (!linux_sig_return_reply_ok(expect_num, rax,
+                                                       req.status))
+                            return rax;   /* the sidecar refused: its errno */
                         if (!pd)
                             return (uint64_t)(int64_t)linux_errno_from_cap(
                                 CAP_ERR_TARGET);

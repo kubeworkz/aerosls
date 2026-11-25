@@ -1427,6 +1427,28 @@ int linux_sig_park_install(uint64_t *w, uint32_t words,
     return 0;
 }
 
+/* E7 increment 29b: the return trip's gate (see the header). Two questions,
+ * in the order the reply path can answer them:
+ *
+ *   1. is this the number whose answer IS a context restore? (15, and only
+ *      15 — the gate belongs to rt_sigreturn, not to the sig class, or a
+ *      successful rt_sigprocmask would restore a frame nobody built);
+ *   2. did the reply APPLY at all? -EPROTO means the payload was not the
+ *      request struct, so `status` still holds describe's zero and is not
+ *      the sidecar's answer — a reply that never arrived must not read as
+ *      consent.
+ *
+ * Only then is the status the sidecar's, and only status 0 means its 15 arm
+ * restored the saved mask. Everything else is "do not touch the frame": the
+ * refusal (no handler entered) reaches the task as the errno the apply's map
+ * already produced, never as a discarded value behind a restore. */
+int linux_sig_return_reply_ok(uint64_t num, uint64_t rax, int32_t status)
+{
+    if (num != LINUX_RT_SIGRETURN) return 0;
+    if (rax == (uint64_t)(int64_t)(-LINUX_EPROTO)) return 0;
+    return status == 0;
+}
+
 int linux_sig_deliver(uint64_t root, const struct LinuxSigDeliverReq *req,
                       const struct LinuxSigRegs *ctx, uint64_t cr2,
                       struct LinuxSigRegs *entry, uint64_t *entry_mask)

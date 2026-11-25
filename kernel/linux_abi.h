@@ -1250,4 +1250,21 @@ int linux_sig_park_read(const uint64_t *w, uint32_t words,
 int linux_sig_park_install(uint64_t *w, uint32_t words,
                            const struct LinuxSigRegs *entry);
 
+/* E7 increment 29b: the return trip's GATE. A forwarded 15 comes back as an
+ * ordinary reply, but its answer is not a return value — the task resumes in
+ * the frame, so the kernel must decide "did the sidecar actually restore the
+ * mask it saved at the delivery?" before touching a byte of the guest's
+ * stack. That decision is this predicate, and it is NOT "the rax is not an
+ * error": the sidecar's 15 arm answers status 0 exactly when it put
+ * `saved_mask` back and status != 0 (E_INVAL) when no handler was entered, so
+ * the status is the truth and the rax is a consequence of it. `rax` joins the
+ * arguments only because a reply that never APPLIED (a length that is not the
+ * request struct) leaves `status` at describe's zero — the -EPROTO the apply
+ * answered with is what says the field is not the sidecar's.
+ *
+ * 1 = restore the frame; 0 = leave it alone and answer the syscall with the
+ * errno the §5.7 map already produced. Pure: the host test drives it and
+ * guard clause P16 pins the shape chan.c calls it in. */
+int linux_sig_return_reply_ok(uint64_t num, uint64_t rax, int32_t status);
+
 #endif /* LINUX_ABI_H */

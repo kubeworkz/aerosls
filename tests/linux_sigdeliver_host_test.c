@@ -469,6 +469,35 @@ int main(void)
               "      RETURNING (count 1), not because the number looked\n"
               "      familiar");
 
+        /* The gate before the restore: a forwarded 15 restores the frame
+         * only when the sidecar's own arm says it restored its mask. The
+         * four refusals below are the four ways a reply is not that consent
+         * — and each one must leave the frame alone, because the alternative
+         * is a task resumed under a mask nobody unwound. */
+        CHECK(linux_sig_return_reply_ok(LINUX_RT_SIGRETURN, 0, 0) == 1,
+              "the gate opens on exactly one answer: 15 with the sidecar's\n"
+              "      status 0, which is what its return arm sends after it\n"
+              "      put saved_mask back");
+        CHECK(linux_sig_return_reply_ok(LINUX_RT_SIGRETURN,
+                                        (uint64_t)(int64_t)(-LINUX_EINVAL),
+                                        -1) == 0 &&
+              linux_errno_from_cap(-1) == -LINUX_EINVAL,
+              "and a refusal keeps it shut: -1 is the sidecar's E_INVAL (its\n"
+              "      15 with no handler entered), the map turns it into\n"
+              "      -EINVAL for the task, and the frame is not touched");
+        CHECK(linux_sig_return_reply_ok(LINUX_RT_SIGRETURN,
+                                        (uint64_t)(int64_t)(-LINUX_EPROTO),
+                                        0) == 0,
+              "a reply that never applied is refused too: status is 0 there\n"
+              "      only because describe zeroed it, so the apply's -EPROTO\n"
+              "      is what closes the gate on a payload that was not the\n"
+              "      request struct");
+        CHECK(linux_sig_return_reply_ok(LINUX_READ, 0, 0) == 0 &&
+              linux_sig_return_reply_ok(LINUX_RT_SIGPROCMASK, 0, 0) == 0,
+              "and no other number reaches the restore: the gate is 15's, not\n"
+              "      the sig class's — a successful rt_sigprocmask must not\n"
+              "      resume a task through a frame it never pushed");
+
         map_pages(P_BIT | W_BIT | U_BIT);
         memset(f_page0, 0xEE, sizeof f_page0);
         memset(&ctx, 0, sizeof ctx);

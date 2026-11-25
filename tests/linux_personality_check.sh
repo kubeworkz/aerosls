@@ -1794,6 +1794,20 @@ else
     bad "P15. RAX fell out of the context: a delivery wants 0 there and a return wants the interrupted value, so a hardcoded zero (or a word that is written but never read) makes every handler return look like a successful syscall"
 fi
 
+if grep -qF 'int linux_sig_return_reply_ok(uint64_t num, uint64_t rax, int32_t status);' "$LABH" && \
+   grep -qF 'if (num != LINUX_RT_SIGRETURN) return 0;' "$LABC" && \
+   grep -qF 'if (rax == (uint64_t)(int64_t)(-LINUX_EPROTO)) return 0;' "$LABC" && \
+   grep -qF 'return status == 0;' "$LABC" && \
+   grep -qF 'if (!linux_sig_return_reply_ok(expect_num, rax,' kernel/chan.c && \
+   grep -A 2 'if (!linux_sig_return_reply_ok(expect_num, rax,' kernel/chan.c | grep -qF 'return rax;' && \
+   ! grep -qF 'rax != (uint64_t)(int64_t)(-LINUX_EPROTO)) {' kernel/chan.c && \
+   grep -qF 'linux_sig_return_reply_ok(LINUX_RT_SIGRETURN, 0, 0) == 1' "$SIGDELIVER_HUT" && \
+   grep -qF 'linux_sig_return_reply_ok(LINUX_RT_SIGPROCMASK, 0, 0) == 0' "$SIGDELIVER_HUT"; then
+    ok "P16. the return trip's gate is the sidecar's answer, named once: status 0 from its 15 arm (the only condition under which it put saved_mask back) opens the restore, a nonzero status — its refusal, no handler entered — falls through to the errno the §5.7 map produced with the frame untouched, a reply that never applied is refused by its -EPROTO rather than by describe's stale zero, and no number but 15 reaches it; the old \"not -EPROTO\" shortcut that restored under an E_INVAL is gone"
+else
+    bad "P16. the gate drifted back to a non-answer: a restore reachable on any reply that is merely not -EPROTO lets a 15 the sidecar refused (no handler entered) resume the task into a context whose mask was never unwound, with the errno silently swallowed — the divergence a second raise exposes"
+fi
+
 echo
 if [ "$fails" -eq 0 ]; then
     echo "linux_personality_check: all clauses hold"

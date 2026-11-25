@@ -1322,6 +1322,16 @@ seed "$W/t157"
 sed -i '/sig.mask = sig.saved_mask;/d' "$W/t157/user/sidecar/src/linux.rs"
 tooth sigframe-return-mask-gone P14 "the sidecar's return arm no longer restores its mask" "$W/t157"
 
+# t158: the gate dropped from chan.c, leaving the old "not -EPROTO" shape —
+# the frame is restored on ANY reply that applied, so a 15 the sidecar refused
+# (no handler entered) returns the task into a context whose mask was never
+# unwound and the errno it should have heard is discarded. The kernel still
+# compiles and the boot still returns, which is why only the gate clause sees
+# it.
+seed "$W/t158"
+sed -i 's/!linux_sig_return_reply_ok(expect_num, rax,/0 \&\& linux_sig_return_reply_ok(LINUX_READ, rax,/' "$W/t158/kernel/chan.c"
+tooth sigframe-return-gate-gone P16 "the return trip restores without asking the sidecar's own answer" "$W/t158"
+
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

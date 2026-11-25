@@ -4086,6 +4086,45 @@ deletes the row to prove the clause reddens.
   instruction window is still not restartable. None of them are reachable
   from the flows measured so far.
 
+### 10.21 What has landed — increment 29b (the return trip's gate)
+
+Increment 29 split the return trip by ownership — the sidecar restores its
+mask, the kernel restores the frame — and then gated the kernel's half on the
+wrong question: `chan.c` restored unless the apply had answered `-EPROTO`. But
+`-EPROTO` is "the reply was not the request struct", not "the sidecar said
+yes"; the sidecar's own refusal of a 15 with no handler entered (`-EINVAL`,
+nothing mutated) passes that test and was therefore *restored anyway*, with its
+errno discarded. Two effects, both silent: the task resumes into a frame whose
+mask the sidecar never unwound, and the caller is handed a context instead of
+the error Linux would have faulted on.
+
+The gate is now the sidecar's answer, named once:
+
+- **The contract** (`kernel/linux_abi.h`, `linux_abi.c`):
+  `linux_sig_return_reply_ok(num, rax, status)` — pure, and deliberately three
+  questions rather than one. `num == 15` because the gate belongs to
+  rt_sigreturn, not the sig class (a successful `rt_sigprocmask` must not
+  resume through a frame nobody pushed); `rax != -EPROTO` because a reply that
+  never applied leaves `status` at `describe`'s zero, which is *not* the
+  sidecar's; and only then `status == 0`, which is the one status its 15 arm
+  sends after putting `saved_mask` back.
+- **The mechanism** (`kernel/chan.c`): the branch is `if (15) { if (!gate)
+  return rax; …restore }` — a refusal falls through to the rax the §5.7 map
+  already produced, so the task hears `-EINVAL` with its frame untouched. The
+  old `rax != (uint64_t)(int64_t)(-LINUX_EPROTO)` shape is gone by name, and
+  clause P16 fails if it comes back.
+- **The checks.** The host test drives all four answers (open, sidecar
+  refusal, never-applied, wrong number) before it drives the restore itself;
+  clause P16 pins the predicate's three lines, the call site and the removal
+  of the old condition; tooth `t158` rewrites the gate to `0 && …`, which
+  restores on any applied reply — the exact defect — and reddens P16.
+
+What this does *not* change: the boot's success path. `status == 0` was already
+the only reply the 15 arm sent on a real return, so the live flow still ends in
+`[E7] rt_sigreturn: restored …` and `SIGRET-OK`; what is new is that the
+refusal branch now has a named condition, a host test and a tooth instead of
+riding on a negative.
+
 ---
 
 ## 11. Open questions for review
