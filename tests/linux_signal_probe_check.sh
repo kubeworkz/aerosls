@@ -21,6 +21,12 @@
 #                                             only reachable if the handler
 #                                             RETURNED into the interrupted
 #                                             context (increment 29)
+#   SIGRET-NOHAND-OK                          written after a rt_sigreturn(15)
+#                                             issued with NO handler entered
+#                                             came back -EINVAL: the refusal
+#                                             branch of the gate, proven live
+#                                             (increment 29c) and not only by
+#                                             the host test and the tooth
 #   [E7] rt_sigreturn: restored rip ...       the kernel's own restore line
 #   SIGPROBE-EXIT 43                          placehold: the probe's exit
 #                                             code (see below)
@@ -28,6 +34,7 @@
 #   409   the tkill returned instead of delivering
 #   410   rt_sigaction refused the install
 #   411   the restorer's rt_sigreturn was refused (no restore happened)
+#   412   a 15 with no handler entered was not -EINVAL
 #
 # What proves the handler ran, in order of strength:
 #   1. SIGHAND-OK appears — only .Lhandler writes those bytes;
@@ -69,6 +76,22 @@ grep -qF '.Lrestorer:' "$FIX" && grep -qF 'mov     $15, %eax' "$FIX" \
     && grep -qF 'SIGRET-OK' "$FIX" \
     && ok "the fixture returns through rt_sigreturn(15) and marks the other side" \
     || bad "the fixture lost its restorer, its rt_sigreturn or SIGRET-OK"
+
+# The refusal's own source shape, read from .Lsig_try up to the install's
+# failure arm so the restorer's 15 (below .Lhandler) is out of scope: a 15
+# that expects exactly -EINVAL, and an install that comes AFTER it — the
+# ordering is the "no handler entered" the live claim rests on.
+sigsec="$(sed -n '/^\.Lsig_try:/,/^\.Lsig_install_bad:/p' "$FIX" 2>/dev/null)"
+n15="$(grep -n 'mov     \$15, %eax' <<< "$sigsec" | head -1 | cut -d: -f1)"
+n13="$(grep -n 'mov     \$13, %eax' <<< "$sigsec" | head -1 | cut -d: -f1)"
+if [ -n "$sigsec" ] && [ -n "$n15" ] && [ -n "$n13" ] && [ "$n15" -lt "$n13" ] \
+   && grep -qF 'cmp     $-22, %rax' <<< "$sigsec" \
+   && grep -qF 'mov     $412, %eax' <<< "$sigsec" \
+   && grep -qF 'SIGRET-NOHAND-OK' <<< "$sigsec"; then
+    ok "the fixture issues rt_sigreturn(15) BEFORE it installs SIGUSR1, expects exactly -EINVAL, marks it SIGRET-NOHAND-OK and issues MARKER 412 on any other answer"
+else
+    bad "the fixture's no-handler refusal is not the shape this check measures: the 15 must come first, expect -22, and carry both its marker and MARKER 412"
+fi
 
 [ -f sls_operating_system.iso ] || {
     echo "ABORT: sls_operating_system.iso not found — run 'make x86-iso' first." >&2
@@ -172,16 +195,50 @@ else
     bad "no SIGRET-OK: the context was never resumed after the handler, so nothing returned (the whole point of this increment)"
 fi
 
+# The refusal branch, live: a 15 with NO handler entered. The sidecar's 15
+# arm refuses (E_INVAL) and the gate must fall through to the errno the §5.7
+# map produced rather than restoring a frame nobody built — so the task hears
+# -EINVAL, keeps running, and writes its marker through the fd seam.
+if grep -aqF '|SIGRET-NOHAND-OK.|' "$LOG" 2>/dev/null; then
+    ok "|SIGRET-NOHAND-OK.| reached the serial log — a 15 with no handler entered came back as an errno and the task continued after it"
+else
+    bad "no SIGRET-NOHAND-OK: a 15 with no handler entered either restored a frame nobody built or did not answer -EINVAL"
+fi
+
+# Exactly ONE restore may exist in this boot: the handler's own return. A
+# second line can only be the refused 15 being restored anyway — the defect
+# the gate exists to prevent, which the host test cannot show on a boot.
+nrest="$(grep -acE '\[E7\] rt_sigreturn: restored rip ' "$LOG" 2>/dev/null)"
+if [ "${nrest:-0}" -eq 1 ]; then
+    ok "exactly ONE [E7] rt_sigreturn: restored line — the handler's return; the refused 15 restored nothing"
+else
+    bad "the log carries ${nrest:-0} [E7] rt_sigreturn: restored lines: the only restore in this flow is the handler's return, so a second one is the refusal being restored anyway"
+fi
+
+# …and the refusal came FIRST: the marker was written before the return trip's
+# restore, so the refused 15 is not the line above it.
+if awk '/SIGRET-NOHAND-OK/ { m = NR } /\[E7\] rt_sigreturn: restored rip / { r = NR } END { exit !(m && r && m < r) }' "$LOG" 2>/dev/null; then
+    ok "the refusal's marker precedes the restore line — the refused 15 happened before the handler ever ran"
+else
+    bad "the refusal's marker does not precede the restore line: the log's order no longer shows the refusal happening before the delivery"
+fi
+
 if grep -aqF 'E7FD-WRITE-OK' "$LOG" && grep -aqF 'E7MEM-SOFT-OK' "$LOG"; then
     ok "the probe's earlier seams all passed in the SAME run (write + soft mprotect)"
 else
     bad "the probe did not reach its earlier markers, so this boot proves less than claimed"
 fi
 
-for marker in 409 410 411; do
+for marker in 409 410 411 412; do
     if grep -aqE "(^|[^0-9])$marker([^0-9]|$)" "$LOG" 2>/dev/null \
        && grep -aqF "num=$marker" "$LOG" 2>/dev/null; then
-        bad "MARKER $marker appeared: $( [ "$marker" = 409 ] && echo 'the tkill returned instead of delivering' || { [ "$marker" = 410 ] && echo 'rt_sigaction refused the install' || echo 'the restorer was refused: no restore happened'; } )"
+        case "$marker" in
+            409) why='the tkill returned instead of delivering' ;;
+            410) why='rt_sigaction refused the install' ;;
+            411) why='the restorer was refused: no restore happened' ;;
+            412) why='a 15 with no handler entered was not -EINVAL' ;;
+        esac
+        bad "MARKER $marker appeared: $why"
     else
         ok "MARKER $marker absent, as success requires"
     fi

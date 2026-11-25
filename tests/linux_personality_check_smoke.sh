@@ -1332,6 +1332,15 @@ seed "$W/t158"
 sed -i 's/!linux_sig_return_reply_ok(expect_num, rax,/0 \&\& linux_sig_return_reply_ok(LINUX_READ, rax,/' "$W/t158/kernel/chan.c"
 tooth sigframe-return-gate-gone P16 "the return trip restores without asking the sidecar's own answer" "$W/t158"
 
+# t159: the live refusal's errno widened to "any error" — the probe now accepts
+# -1 as readily as -EINVAL for a 15 with no handler entered. Nothing about the
+# boot changes (the marker still prints, the frame is still untouched), which
+# is exactly why the check has to name the number: a gate that surfaced some
+# other refusal would pass a boot that only looked for "it returned".
+seed "$W/t159"
+sed -i 's/cmp     \$-22, %rax/cmp     $-1, %rax/' "$W/t159/user/sidecar/fixtures/e7_linux_probe.S"
+tooth sigret-nohand-errno-unnamed P17 "the live refusal no longer pins -EINVAL" "$W/t159"
+
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

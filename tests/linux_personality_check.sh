@@ -1808,6 +1808,26 @@ else
     bad "P16. the gate drifted back to a non-answer: a restore reachable on any reply that is merely not -EPROTO lets a 15 the sidecar refused (no handler entered) resume the task into a context whose mask was never unwound, with the errno silently swallowed — the divergence a second raise exposes"
 fi
 
+# The refusal branch of the gate, proven on a boot rather than only by the
+# host test and t158: the probe issues 15 BEFORE it installs SIGUSR1 (the
+# order is the "no handler entered"), expects exactly -EINVAL, marks it and
+# issues 412 on anything else; the check reads that marker from the serial
+# log and insists the boot holds exactly ONE restore line — the handler's.
+sigret_sec="$(sed -n '/^\.Lsig_try:/,/^\.Lsig_install_bad:/p' "$FIX" 2>/dev/null)"
+sr15="$(grep -n 'mov     \$15, %eax' <<< "$sigret_sec" | head -1 | cut -d: -f1)"
+sr13="$(grep -n 'mov     \$13, %eax' <<< "$sigret_sec" | head -1 | cut -d: -f1)"
+if [ -n "$sigret_sec" ] && [ -n "$sr15" ] && [ -n "$sr13" ] && [ "$sr15" -lt "$sr13" ] && \
+   grep -qF 'cmp     $-22, %rax' <<< "$sigret_sec" && \
+   grep -qF 'mov     $412, %eax' <<< "$sigret_sec" && \
+   grep -qF 'SIGRET-NOHAND-OK' <<< "$sigret_sec" && \
+   grep -qF 'SIGRET-NOHAND-OK' tests/linux_signal_probe_check.sh && \
+   grep -qF 'exactly ONE [E7] rt_sigreturn: restored line' tests/linux_signal_probe_check.sh && \
+   grep -qF "412) why='a 15 with no handler entered was not -EINVAL'" tests/linux_signal_probe_check.sh; then
+    ok "P17. the refusal is LIVE, not only a host test and a tooth: the probe issues rt_sigreturn(15) before it installs SIGUSR1 — so no handler has been entered by construction — and requires exactly -EINVAL, marking it SIGRET-NOHAND-OK and issuing 412 on any other answer; tests/linux_signal_probe_check.sh reads that marker from the serial log, requires exactly ONE restore line in the whole boot (the handler's own return) so a refused 15 that restored anyway cannot hide, orders the marker before that line, and keeps 412 absent"
+else
+    bad "P17. the refusal branch lost its live proof: without a 15 issued before the install the boot never exercises the gate's else-arm, and without the one-restore count a refused 15 that restored a frame nobody built would look exactly like a passing boot — the branch would be back to being asserted from a host test alone"
+fi
+
 echo
 if [ "$fails" -eq 0 ]; then
     echo "linux_personality_check: all clauses hold"

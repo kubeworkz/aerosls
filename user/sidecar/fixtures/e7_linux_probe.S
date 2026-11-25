@@ -502,6 +502,35 @@ _start:
      *    its own instead — which is also the cleanest observable that the
      *    code that ran was the HANDLER's, not the probe's. */
 .Lsig_try:
+    /* 6a. THE REFUSAL (E7 increment 29c): rt_sigreturn(15) with NO handler
+     *    entered. Nothing has delivered a frame to this task, so the
+     *    sidecar's 15 arm refuses by name (E_INVAL, nothing mutated) and the
+     *    kernel's gate must NOT restore — there is no frame to restore and no
+     *    mask a handler ever unwound. The one thing this call owes the task is
+     *    the errno Linux gives: exactly -22 (-EINVAL). Anything else issues
+     *    MARKER 412, which the boot check asserts ABSENT.
+     *
+     *    It runs BEFORE rt_sigaction(13) below, which is what makes "no
+     *    handler entered" a property of the program's order rather than a
+     *    claim: the install is later in this same flow, so a restore here
+     *    would be restoring a frame nobody built. "SIGRET-NOHAND-OK\n"
+     *    (17 bytes) through increment 5's fd seam is the POSITIVE marker — it
+     *    reaches the log iff the refusal came back as an errno AND this task
+     *    kept running (a restore would have resumed it somewhere else and the
+     *    write would never happen). */
+    mov     $15, %eax
+    syscall
+    cmp     $-22, %rax          /* -EINVAL, and only -EINVAL */
+    je      .Lsig_nohand_ok
+    mov     $412, %eax          /* MARKER: the refusal was not -EINVAL */
+    syscall
+    jmp     .Lexit
+.Lsig_nohand_ok:
+    lea     .Lnohand_msg(%rip), %rsi
+    mov     $1, %edi            /* fd 1: the task's console     */
+    mov     $.Lnohand_end-.Lnohand_msg, %edx
+    mov     $1, %eax
+    syscall
     sub     $64, %rsp
     lea     .Lhandler(%rip), %rax
     mov     %rax, 0(%rsp)       /* sa_handler                        */
@@ -593,6 +622,10 @@ _start:
 
 .Lsigret_msg:
     .ascii  "SIGRET-OK\n"
+
+.Lnohand_msg:
+    .ascii  "SIGRET-NOHAND-OK\n"
+.Lnohand_end:
 
 .Lmsg:
     .ascii  "E7FD-WRITE-OK\n"

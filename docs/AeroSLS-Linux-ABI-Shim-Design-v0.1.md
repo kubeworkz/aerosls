@@ -4125,6 +4125,42 @@ the only reply the 15 arm sent on a real return, so the live flow still ends in
 refusal branch now has a named condition, a host test and a tooth instead of
 riding on a negative.
 
+### 10.22 What has landed — increment 29c (the refusal, on a boot)
+
+29b's refusal branch was proven only where the tree can see it: the host test
+drove all four gate answers and tooth `t158` reddened P16 when the gate was
+rewritten to restore anything. Neither shows what a boot shows — that a real
+ring-3 task issuing 15 with no handler entered hears `-EINVAL`, keeps running,
+and sees no restore.
+
+The probe now measures it, in the same boot as the return trip. Before it
+installs SIGUSR1 (the new head of `.Lsig_try` in
+`user/sidecar/fixtures/e7_linux_probe.S`), it issues `rt_sigreturn(15)` with
+nothing delivered: the install is later in the same flow, so "no handler
+entered" is a property of the program's order rather than a claim. The
+sidecar's 15 arm refuses by name (`E_INVAL`, nothing mutated), the gate
+declines to restore, and `chan.c` falls through to the rax the §5.7 map
+produced — so the task must see exactly `-22` (`-EINVAL`). It then writes
+`SIGRET-NOHAND-OK` through increment 5's fd seam, a marker that can only
+appear if the syscall returned as an errno and the task continued at the
+instruction after it, and goes on to arm the soft page and run the delivery
+and return trip that end the boot.
+
+What the check asserts (`tests/linux_signal_probe_check.sh`): the marker is
+present; the boot carries **exactly one** `[E7] rt_sigreturn: restored …`
+line — the handler's own return — so a second one can only be the refused 15
+restoring anyway; the marker precedes that line; and MARKER 412 (the refusal
+answered with anything but `-EINVAL`) is absent. Clause P17 pins both halves
+of that binding, and tooth `t159` widens the expected errno to `-1`, which
+leaves the boot silent but reddens P17 — the check names the number, so the
+number cannot drift unnoticed.
+
+What this does *not* prove: that a 15 carrying a *forged* frame in a task
+that never had a delivery is refused by the kernel too. The kernel's own
+`linux_sig_active` guard in `linux_sig_return_apply` refuses that shape after
+the gate, and this boot's refusal never reaches it because the sidecar answers
+first.
+
 ---
 
 ## 11. Open questions for review
