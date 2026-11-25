@@ -257,12 +257,18 @@ int linux_restore_group_siblings(struct ProcessDescriptor* leader,
  * effects are two validated user copies plus a futex wake, which only
  * process.c can perform (it owns the page table and the scheduler):
  *
- *   linux_thread_exit_glue(pd)  clear the word, walk the list, wake — called
- *                               once at the top of a thread's own exit.
+ *   linux_thread_exit_glue(pd)  clear the word, walk the list, wake.
+ *
+ * I5b: that glue runs on EVERY death funnel, not only a thread's own exit —
+ * linux_descriptor_release() (exit(60) and the deferred-kill sweep),
+ * linux_group_release_all() (the loop above forget_group, covering
+ * exit_group, a kill and a sibling's fault) and process_exit(). The words are
+ * TAKEN, not read, so the second funnel to reach a thread is a no-op instead
+ * of a second clear under a joiner; §10.24 has the group and fault arms and
+ * §10.25 the boot evidence that a parked joiner is woken on each.
  *
  * What is deliberately NOT promised: the parent-side flags (PARENT_SETTID,
- * CHILD_SETTID), `list_op_pending`, and a clear on the exit_group path (a
- * whole-group exit leaves nobody to join). Each is named in §10.23. */
+ * CHILD_SETTID) and `list_op_pending`. Both are named in §10.23. */
 #define LINUX_SET_TID_ADDRESS  218u
 #define LINUX_SET_ROBUST_LIST  273u
 #define LINUX_ROBUST_LIST_HEAD_BYTES 24u   /* list(8) + futex_offset(8) + pending(8) */
