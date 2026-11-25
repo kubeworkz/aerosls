@@ -1626,12 +1626,14 @@ else
     bad "P1. the frame's layout pins are gone or the builder gained an allocator — a compiler that packed a field differently (or an edit to one offset) would ship a frame a guest libc misreads, with the failure landing in the handler instead of here"
 fi
 
-if grep -qF 'linux_syscall_class(LINUX_RT_SIGRETURN) == LSC_UNKNOWN' "$SIGFRAME_HUT" && \
+if grep -qF 'linux_syscall_class(LINUX_RT_SIGRETURN) == LSC_SIG' "$SIGFRAME_HUT" && \
+   grep -qF '{  15, LSC_SIG,    0 }' "$LABC" && \
+   grep -qE '^15 rt_sigreturn [1-9][0-9]*$' tools/linux_rt_sigreturn_census.txt && \
    grep -qF 'linux_syscall_class(200) == LSC_UNKNOWN' "$SYSTAB" && \
    ! grep -qF 'LINUX_RT_SIGRETURN' "$DISP"; then
-    ok "P2. the absence is load-bearing and asserted: rt_sigreturn is named in the header, still UNKNOWN in the classification table, and has no dispatcher arm — the row waits for a real census run in increment 27, so nothing can dispatch a number nobody traced"
+    ok "P2. the row that was an asserted ABSENCE is now an asserted PRESENCE, with the same teeth: 15 is LSC_SIG in the table, the host test checks it (so deleting the row fails a test rather than passing silently), and the number's own census artifact carries the measured line — while a number nobody traced (200's stale table entry) stays UNKNOWN and the dispatcher still names neither: the row arrived by trace, and the trip is a restore, not a new dispatch"
 else
-    bad "P2. rt_sigreturn either vanished from the frame contract or gained a dispatch without a census row — §5.6 says the table is BUILT from the trace, and a row added from belief is exactly what the census artifact exists to prevent"
+    bad "P2. rt_sigreturn's classification is not backed end to end — the table row, the host test and tools/linux_rt_sigreturn_census.txt must all agree, or a row was added from belief (or deleted behind a test that kept passing): §5.6 says the table is BUILT from the trace"
 fi
 
 if grep -qF 'LINUX_SIGFRAME_SIZE == 440' "$SIGFRAME_HUT" && \
@@ -1650,11 +1652,12 @@ fi
 
 if grep -qF 'int linux_sig_deliver(' "$LABC" && \
    grep -qF 'linux_user_copy_in(frame, root,' "$LABC" && \
+   [ "$(grep -cF 'linux_user_copy_out(frame, pd->cr3,' kernel/process.c)" -eq 1 ] && \
    ! grep -qE 'setup_rt_frame|sigframe_write_user' "$LABC" "$DISP" && \
    ! grep -qF 'LINUX_RT_SIGRETURN' "$DISP"; then
-    ok "P4. the delivery has exactly ONE write path and it is the validated one: the frame reaches a user stack only through linux_user_copy_in against the task's own cr3 (no second writer, no direct store into a page frame), and rt_sigreturn still has no dispatcher arm — increment 27 delivers frames and does not claim the return trip"
+    ok "P4. the frame has one validated path in EACH direction and no other: it reaches a user stack only through linux_user_copy_in against the task's own cr3, and increment 29 reads it back through exactly one linux_user_copy_out at the handler's own rsp — a direct store or load into a user page is the shape that skips every protection check, and on the return side it would be a ring-0 fault from a frame the task itself can forge"
 else
-    bad "P4. either the delivery's only writer is no longer the validated copy (a direct store into a user page is the shape that skips every protection check), or rt_sigreturn gained a dispatcher arm without a census row"
+    bad "P4. the frame's only writer or reader is no longer the validated copy — a direct access into a user page skips every protection check, and on the return side a frame the task can forge would be read with ring-0 privileges"
 fi
 
 if grep -qF '#define CAP_EINTR       (-21)' "$CAPH" && \
@@ -1716,24 +1719,27 @@ fi
 if grep -qF 'w[1]  = entry->r[LINUX_SIGREG_RIP];' "$LABC" && \
    grep -qF 'w[8]  = entry->r[LINUX_SIGREG_RSP];' "$LABC" && \
    grep -qF 'w[9]  = entry->r[LINUX_SIGREG_RDI];' "$LABC" && \
-   grep -qF 'sizeof(struct CapParkCtx) == 120u' kernel/process.h && \
+   grep -qF 'w[15] = entry->r[LINUX_SIGREG_RAX];' "$LABC" && \
+   grep -qF 'sizeof(struct CapParkCtx) == 128u' kernel/process.h && \
    grep -qF 'cap_resume_linux_sig' kernel/process.h kernel/process.c && \
    [ "$(grep -A 45 'void cap_resume_linux_sig' kernel/process.c | grep -c 'swapgs')" -eq 0 ] && \
    grep -A 45 'void cap_resume_linux_sig' kernel/process.c | grep -qF 'jmp syscall_return_path' && \
    grep -qF 'the park context reads into the register file' "$SIGDELIVER_HUT"; then
-    ok "P10. the handler is entered through the park context, not around it: the entry installs RIP at word 1, the frame's rsp at word 8 and the signo at word 9 (the offsets cap_recv_resume's and cap_sysret_resume's asm actually read), CapParkCtx's size is asserted at 120 bytes where it is defined, and the resume is that asm's push-and-sysret WITHOUT a second swapgs — this runs inside do_syscall, where a swap would put GS_BASE back at 0 with a kernel view live"
+    ok "P10. the handler is entered through the park context, not around it: the entry installs RIP at word 1, the frame's rsp at word 8, the signo at word 9 and (increment 29) the sysret's RAX at word 15 (the offsets cap_recv_resume's and cap_sysret_resume's asm actually read), CapParkCtx's size is asserted at 128 bytes where it is defined, and the resume is that asm's push-and-sysret WITHOUT a second swapgs — this runs inside do_syscall, where a swap would put GS_BASE back at 0 with a kernel view live"
 else
     bad "P10. the install and the return path disagree — a word nudged by one is a handler entered with the syscall's rsp or the caller's rip (a #PF or a crash in a place with no relation to the signal), a missing size assert lets a field move silently, and a second swapgs in the resume corrupts GS on the way out"
 fi
 
 if grep -qF 'r = linux_sig_park_install(w, LINUX_PARK_WORDS, &entry);' kernel/process.c && \
    grep -A 2 'r = linux_sig_park_install(w, LINUX_PARK_WORDS, &entry);' kernel/process.c | grep -qF 'if (r != 0) return r;' && \
-   [ "$(grep -c 'cap_resume_linux_sig(pd);' kernel/process.c)" -eq 1 ] && \
+   [ "$(grep -c 'cap_resume_linux_sig(pd);' kernel/process.c)" -eq 2 ] && \
+   grep -A 3 'r = linux_sig_park_install(w, LINUX_PARK_WORDS, &regs);' kernel/process.c | grep -qF 'if (r != 0) return r;' && \
+   grep -qF 'pd->linux_sig_mask   = mask;' kernel/process.c && \
    grep -qF 'let before = sig.mask;' "$LINUXRS" && \
    grep -qF 'let mut frame_mask = before | sig.act[no][2] | bit;' "$LINUXRS" && \
    grep -qF 'sig.mask = frame_mask;' "$LINUXRS" && \
    grep -qF 'frame_mask &= !bit;' "$LINUXRS"; then
-    ok "P11. one mask, two languages, and no resume without an install: the sidecar moves its mask to blocked|sa_mask|the signal (minus the signal under SA_NODEFER) BEFORE it answers, the kernel computes the same number in the frame and stores it as linux_sig_mask, and the only call into the resume sits after the install's own refusal check — so every failure path answers the syscall with an errno and the task keeps running, rather than jumping into a handler with half a context"
+    ok "P11. one mask, two languages, and no resume without an install (in both directions now: the return installs through the same bridge, checks its refusal before clearing the mask, and only then resumes): the sidecar moves its mask to blocked|sa_mask|the signal (minus the signal under SA_NODEFER) BEFORE it answers, the kernel computes the same number in the frame and stores it as linux_sig_mask, and the only call into the resume sits after the install's own refusal check — so every failure path answers the syscall with an errno and the task keeps running, rather than jumping into a handler with half a context"
 else
     bad "P11. the delivery's success is no longer conditional: a resume reachable from a refusal, or two masks that can disagree, is the shape where the task enters a handler the kernel did not install (or runs with a mask the sidecar did not set) and every subsequent signal behaves wrongly"
 fi
@@ -1749,6 +1755,43 @@ if grep -qF '.Lsig_try:' "$FIX" && \
     ok "P12. the delivery has a LIVE proof, not only a host test: the existing probe installs SIGUSR1 and raises it with tkill (13 then 200), its handler writes SIGHAND-OK and then finishes the soft-mprotect case (the probe's original terminal step, so nothing was lost by putting the delivery last), and tests/linux_signal_probe_check.sh boots the ISO and reads the kernel's own [E7] sig N -> handler line with the frame and the 0x200 mask both ends computed, with MARKERS 409/410/411 absent"
 else
     bad "P12. the live proof is incomplete: a fixture without the handler or without its terminal step, a kernel that stopped printing the delivery line, or a check that no longer reads it — any of these leaves the wired delivery asserted from source only, which is exactly what this increment was not allowed to do"
+fi
+
+if [ -s tools/linux_rt_sigreturn_census.txt ] && \
+   grep -qE '^15 rt_sigreturn [1-9][0-9]*$' tools/linux_rt_sigreturn_census.txt && \
+   grep -qF 'sha256:' tools/linux_rt_sigreturn_census.txt && \
+   grep -qF 'strace -f full trace, entry-counted' tools/linux_rt_sigreturn_census.txt && \
+   grep -qF '{  15, LSC_SIG,    0 }' "$LABC" && \
+   grep -qF 'tools/linux_rt_sigreturn_census.txt' "$LABC" "$SIGFRAME_HUT" && \
+   grep -qF 'linux_syscall_class(LINUX_RT_SIGRETURN) == LSC_SIG' "$SIGFRAME_HUT"; then
+    ok "P13. rt_sigreturn's row is CENSUSED, not believed: the artifact carries the same provenance columns as the candidate trace (method, sha256, host, date, entry-counted) and one measured row — 15, count 1, produced by a handler that returns — the table cites it by path, and the host test asserts the classification so a row could not be deleted while its test kept passing"
+else
+    bad "P13. the row lost its trace (or the trace lost its provenance): §5.6 says the table is BUILT from a measurement, and a row without one is the belief this artifact exists to forbid — while a deleted row with a passing test is the same lie from the other end"
+fi
+
+if grep -qF 'int linux_sig_return_apply(struct ProcessDescriptor* pd)' kernel/process.c && \
+   grep -qF 'linux_user_copy_out(frame, pd->cr3, pd->park_ctx.user_rsp,' kernel/process.c && \
+   grep -qF 'linux_sig_frame_restore(frame, LINUX_SIGFRAME_SIZE, &regs, &mask)' kernel/process.c && \
+   grep -qF 'pd->linux_sig_mask   = mask;' kernel/process.c && \
+   grep -qF 'pd->linux_sig_active = 0;' kernel/process.c && \
+   grep -qF 'expect_num == LINUX_RT_SIGRETURN' kernel/chan.c && \
+   grep -qF 'sig.mask = sig.saved_mask;' "$LINUXRS" && \
+   grep -qF 'sig.handler_active = false;' "$LINUXRS" && \
+   grep -qF 'fn rt_sigreturn_restores_the_mask_a_delivery_changed()' "$LINUXRS"; then
+    ok "P14. the return trip restores BOTH halves and invents neither: the kernel reads the frame at the handler's own rsp through the validated copy (a frame the task unmapped refuses -EFAULT, never a ring-0 fault), restores the registers and uc_sigmask, clears the active flag and resumes; the sidecar puts back the mask it saved at the delivery and refuses a 15 with no handler entered — one number, two authorities, each restoring what it owns"
+else
+    bad "P14. the return trip lost a half: a kernel restore without the validated read is a ring-0 fault waiting for a hostile frame, a kernel that keeps its own mask while the sidecar keeps another is the divergence a second raise exposes, and a 15 accepted with no handler entered unblocks signals no delivery blocked"
+fi
+
+if grep -qF 'w[15] = entry->r[LINUX_SIGREG_RAX];' "$LABC" && \
+   grep -qF 'ctx->r[LINUX_SIGREG_RAX] = w[15];' "$LABC" && \
+   grep -qF 'movq 120(%1), %%rax' kernel/process.c && \
+   grep -qF 'uint64_t rax;' kernel/process.h && \
+   grep -qF 'w[15] == 0x7777ULL' "$SIGDELIVER_HUT" && \
+   grep -qF 'restored.r[LINUX_SIGREG_RAX] == 0x7777ULL' "$SIGDELIVER_HUT"; then
+    ok "P15. the sysret's RAX is part of the context: the bridge carries it in word 15, the resume loads it from 120(%1) instead of forcing zero, and the host test drives an interrupted rax of 0x7777 through build, restore, install and read-back — a return trip that dropped it would hand the caller a value the interrupted syscall never produced"
+else
+    bad "P15. RAX fell out of the context: a delivery wants 0 there and a return wants the interrupted value, so a hardcoded zero (or a word that is written but never read) makes every handler return look like a successful syscall"
 fi
 
 echo

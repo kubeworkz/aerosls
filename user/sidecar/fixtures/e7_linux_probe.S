@@ -525,10 +525,21 @@ _start:
     mov     $10, %esi
     mov     $200, %eax
     syscall
-    /* UNREACHABLE on a delivery: proof that none happened. */
-    mov     $409, %eax          /* MARKER: the tkill returned instead */
+    /* REACHED BY THE HANDLER'S RETURN (increment 29): the delivery replaced
+     * this syscall's return with an entry into .Lhandler, the handler ended
+     * in its restorer's rt_sigreturn, and the kernel restored THIS context
+     * and resumed here. The marker is therefore written after a full
+     * out-and-back trip through ring 3 and two kernel returns — and, because
+     * the same instruction is also reachable if the tkill simply returned,
+     * SIGHAND-OK above is what tells the two apart in the log. */
+    lea     .Lsigret_msg(%rip), %rsi
+    mov     $1, %edi
+    mov     $10, %edx           /* "SIGRET-OK\n" (9 + newline)         */
+    mov     $1, %eax
     syscall
-    jmp     .Lexit
+    cmp     $10, %rax
+    jne     .Lsig_install_bad
+    jmp     .Lsoft_tail
 
 .Lsig_install_bad:
     mov     $410, %eax          /* MARKER: rt_sigaction refused       */
@@ -544,19 +555,22 @@ _start:
     mov     $11, %edx           /* "SIGHAND-OK\n"                     */
     mov     $1, %eax
     syscall
-    /* …then finish the soft-mprotect case the interrupted flow had just
-     * armed: the handler is the code that reads the PROT_NONE page and
-     * dies on it. r13 (the soft page) is the interrupted register — only
-     * rsp/rip/rdi were changed for the entry — so it is still valid here,
-     * which is itself a small proof that the context was preserved. */
-    jmp     .Lsoft_tail
+    /* …and RETURN through the frame: the restorer issues rt_sigreturn, the
+     * kernel restores the interrupted context from the frame it built, and
+     * control resumes after the tkill above. Before increment 29 this jump
+     * was replaced by a death on the soft page, because a handler could not
+     * return at all. */
+    jmp     .Lrestorer
 
     /* The frame's pretcode. Never reached while a handler exits without
      * returning; its only job is to be a real, nonzero address so the
      * delivery is one the kernel will build. */
 .Lrestorer:
-    mov     $411, %eax          /* MARKER: a handler returned into a
-                                 * restorer that has no rt_sigreturn */
+    /* The frame's pretcode: what the handler "returns" to. It issues
+     * rt_sigreturn (15), whose restore is the kernel's. */
+    mov     $15, %eax
+    syscall
+    mov     $411, %eax          /* MARKER: the return trip refused */
     syscall
 .Lexit:
     /* exit_group(42): the sidecar reaps this task. */
@@ -576,6 +590,9 @@ _start:
 
 .Lsig_msg:
     .ascii  "SIGHAND-OK\n"
+
+.Lsigret_msg:
+    .ascii  "SIGRET-OK\n"
 
 .Lmsg:
     .ascii  "E7FD-WRITE-OK\n"

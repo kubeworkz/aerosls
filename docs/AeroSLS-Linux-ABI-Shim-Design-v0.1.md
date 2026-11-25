@@ -4013,6 +4013,79 @@ delivery.
   `-ENOSYS`. Marker 411 exists to make that failure loud if anyone changes
   the handler's tail before the row lands.
 
+### 10.20 The return trip — a handler that comes back, and the row's trace
+
+Increment 29 closes the gap 10.19 named. Two things had to be true first: the
+number had to be *measured* rather than assumed, and the frame had to hold the
+right mask.
+
+- **The census.** §5.6's rule is that a table row is built from a measured
+  trace. The candidate's own artifact (`tools/linux_syscall_census.txt`) was
+  the wrong instrument here: the backup operation never returns from a
+  handler, so 15 never appears in it. `tools/linux_rt_sigreturn_census.sh`
+  measures the flow the row exists for — a two-function program that installs
+  a handler, raises it, and lets it return, traced with `strace -f`,
+  entry-counted, in the same columns and with the same provenance block
+  (method, binary sha256, host, date) as the candidate artifact. Result:
+  `tools/linux_rt_sigreturn_census.txt`, one row — `15 rt_sigreturn 1` — and
+  the program exits 0, which is the return landing. The table cites the
+  artifact by path; guard clause P13 asserts the row, its provenance columns
+  and its presence in both the table and the host test, and tooth t154
+deletes the row to prove the clause reddens.
+- **The mask the frame had to carry.** Increment 26's builder stored the
+  *handler's* mask (`blocked | sa_mask | the signal`) at `uc_sigmask`
+  (offset 304). That is the wrong field: Linux's frame setup copies
+  `current->blocked` there *before* adding `sa_mask` and the signal, and
+  `rt_sigreturn` restores from it. A frame storing the handler's mask leaves
+  the signal blocked forever after one return — the exact defect the P11
+  test could not see, because both ends agreed on the wrong number. The
+  builder now writes `spec->blocked`, the host test asserts that the frame's
+  mask and the entry mask are *different numbers* (`0x2` vs `0x406`), and the
+  boot below shows the restored mask as `0`.
+- **The restore, split by what each side owns.** The handler's restorer is
+  its own guest code (`mov $15, %eax; syscall`). The number is classified
+  `LSC_SIG` and forwarded like the rest of the sig class — the sidecar owns
+  the mask, so it puts back the `saved_mask` it captured when the delivery
+  happened, and refuses a 15 with no handler entered (`-EINVAL`, nothing
+  mutated). The frame is *not* the sidecar's: only the kernel can walk the
+  task's page tables, and the frame address is whatever `rsp` the handler was
+  entered with (`park_ctx.user_rsp`). So `linux_sig_return_apply()` reads 440
+  bytes through `linux_user_copy_out` against the task's own cr3 (a frame the
+  task unmapped is `-EFAULT`, never a ring-0 fault, and a forged `cs != 0x33`
+  is refused by name), restores the registers and the mask, clears
+  `linux_sig_active`, and resumes into the interrupted context.
+- **RAX had to join the context.** `cap_resume_linux_sig` hardcoded
+  `xor %eax, %eax` — correct for a delivery (nothing was returned) and wrong
+  for a return (the interrupted syscall owes its caller the value it had).
+  The park bridge gained word 15 (`CapParkCtx` is 128 bytes, asserted where
+  it is defined), the resume loads `120(%1)`, and a delivery installs 0 there.
+  Guard P15 and tooth t156 pin it.
+- **The boot** (`tests/linux_signal_probe_check.sh`, transcript
+  `/tmp/e7_signal_probe_boot.log`). The probe's handler now ends by jumping
+  to its restorer instead of into the soft case's death, and the code after
+  the `tkill` is where the return lands:
+
+  ```
+  [E7] sig 10 (code 0) -> handler 400000000441, frame 400000004c98, mask 200
+  [E7] linux: num=00000001 child=e7.linux.probe.0 write ok len=11 |SIGHAND-OK.|
+  [E7] rt_sigreturn: restored rip 400000000415 rsp 400000004e60 rax 0 mask 0
+  [E7] linux: num=00000001 child=e7.linux.probe.0 write ok len=10 |SIGRET-OK.|
+  ```
+
+  Four lines, four different authors: the kernel's delivery (frame at
+  `…4c98`, handler mask `0x200`), the handler's own bytes from ring 3, the
+  kernel's restore (`rip 0x415` is the instruction after the `tkill`, `rsp`
+  back at `0x4e60`, mask `0` = the pre-handler set), and finally the probe's
+  `SIGRET-OK`, written by code that only runs if the interrupted context came
+  back. Markers 409/410/411 stay absent; the probe still ends in the soft
+  `PROT_NONE` death, which is now the flow *after* a completed return.
+- **Named remainders.** The alternative stack (`sa_restorer` on the guest's
+  own `SA_ONSTACK` stack) is still the kernel's synthetic frame, not the
+  guest's trampoline; `rdx`-carried `ucontext` details beyond `uc_sigmask`
+  are not restored; and a signal delivered *during* a restorer's single
+  instruction window is still not restartable. None of them are reachable
+  from the flows measured so far.
+
 ---
 
 ## 11. Open questions for review

@@ -328,11 +328,12 @@ int main(void)
                   "si_addr in the guest's frame is CR2 — the CR2 -> si_addr\n"
                   "      rule survives the write, not just the call");
 
-            CHECK(get64_at(f_page0 + off + LINUX_SIGFRAME_SIGMASK) ==
-                  (0x2ULL | 0x4ULL | (1ULL << 10)),
-                  "the handler's mask is blocked | sa_mask | the signal\n"
-                  "      itself — SIGINT's 0x2, the handler's 0x4 and SIGSEGV's\n"
-                  "      own bit 10 compose to 0x406");
+            CHECK(get64_at(f_page0 + off + LINUX_SIGFRAME_SIGMASK) == 0x2ULL,
+                  "uc_sigmask carries the mask the RETURN restores: the\n"
+                  "      thread's PRE-delivery blocked set (SIGINT's 0x2), not\n"
+                  "      the mask the handler runs under — a frame that stored\n"
+                  "      the handler's mask would leave the signal blocked\n"
+                  "      forever after one return");
 
             CHECK(mask == 0x406ULL,
                   "and the mask the CALLER installs is the same number the\n"
@@ -456,11 +457,80 @@ int main(void)
               "      install would enter the handler with half a context");
     }
 
-    printf("── the census: the row is still absent ────────────────────\n");
-    CHECK(linux_syscall_class(LINUX_RT_SIGRETURN) == LSC_UNKNOWN,
-          "rt_sigreturn is still UNCLASSIFIED — this increment delivers\n"
-          "      frames and does NOT claim the return trip, which needs a\n"
-          "      real census trace before a table row exists");
+    printf("── the return trip: rt_sigreturn's row and restore ─────────\n");
+    {
+        uint64_t w[LINUX_PARK_WORDS];
+        struct LinuxSigRegs back3;
+        unsigned i;
+
+        CHECK(linux_syscall_class(LINUX_RT_SIGRETURN) == LSC_SIG,
+              "rt_sigreturn (15) is classified — and the row exists because\n"
+              "      tools/linux_rt_sigreturn_census.txt measured a handler\n"
+              "      RETURNING (count 1), not because the number looked\n"
+              "      familiar");
+
+        map_pages(P_BIT | W_BIT | U_BIT);
+        memset(f_page0, 0xEE, sizeof f_page0);
+        memset(&ctx, 0, sizeof ctx);
+        ctx.r[LINUX_SIGREG_RSP] = STACK_TOP;
+        ctx.r[LINUX_SIGREG_RIP] = 0x401abcULL;
+        ctx.r[LINUX_SIGREG_RAX] = 0x7777ULL;      /* the interrupted rax */
+        ctx.eflags = 0x202ULL;
+        good_req(&req, 11u);
+        req.blocked = 0x2ULL;
+        req.act_mask = 0x4ULL;
+        memset(&entry, 0, sizeof entry);
+
+        r = linux_sig_deliver(root_of(), &req, &ctx, 0xdead0000ULL, &entry, &mask);
+        CHECK(r == 0 && mask == 0x406ULL,
+              "a delivery installs blocked|sa_mask|the signal (0x406) while\n"
+              "      the frame keeps 0x2 for the return");
+        CHECK(entry.r[LINUX_SIGREG_RAX] == 0x7777ULL,
+              "the handler is entered with the interrupted rax still in the\n"
+              "      register file — the return trip needs it back");
+
+        {   /* the restorer's syscall: restore from the frame at entry.rsp */
+            struct LinuxSigRegs restored;
+            uint64_t rmask = 0;
+            r = linux_sig_frame_restore(f_page0 + (entry.r[LINUX_SIGREG_RSP] - STACK_VA),
+                                        LINUX_SIGFRAME_SIZE, &restored, &rmask);
+            CHECK(r == 0 && restored.r[LINUX_SIGREG_RIP] == 0x401abcULL &&
+                  restored.r[LINUX_SIGREG_RSP] == STACK_TOP &&
+                  restored.r[LINUX_SIGREG_RAX] == 0x7777ULL &&
+                  restored.eflags == 0x202ULL,
+                  "restoring the frame puts rip, rsp, rax and the flags back\n"
+                  "      exactly — this is the whole return trip, in one call");
+            CHECK(rmask == 0x2ULL,
+                  "and the mask it returns is the PRE-handler one, so the\n"
+                  "      signal that just ran is free again");
+
+            for (i = 0; i < LINUX_PARK_WORDS; i++) w[i] = 0;
+            CHECK(linux_sig_park_install(w, LINUX_PARK_WORDS, &restored) == 0 &&
+                  w[1] == 0x401abcULL && w[8] == STACK_TOP &&
+                  w[15] == 0x7777ULL,
+                  "the restore installs through the same park bridge as the\n"
+                  "      entry — word 1 rip, word 8 rsp, and word 15 the rax\n"
+                  "      the sysret leaves in the register");
+            CHECK(linux_sig_park_read(w, LINUX_PARK_WORDS, &back3) == 0 &&
+                  back3.r[LINUX_SIGREG_RAX] == 0x7777ULL,
+                  "and reading it back agrees, so the two directions of the\n"
+                  "      bridge stay exact mirrors");
+        }
+
+        {   /* a forged frame is refused by name: cs is the tell */
+            struct LinuxSigRegs bad;
+            uint64_t bm = 0;
+            uint64_t off = entry.r[LINUX_SIGREG_RSP] - STACK_VA;
+            uint8_t saved = f_page0[off + LINUX_SIGFRAME_MCONTEXT + LINUX_SIGCTX_CS];
+            f_page0[off + LINUX_SIGFRAME_MCONTEXT + LINUX_SIGCTX_CS] = 0x10;
+            CHECK(linux_sig_frame_restore(f_page0 + off, LINUX_SIGFRAME_SIZE,
+                                          &bad, &bm) == -LINUX_EINVAL,
+                  "a frame whose cs is not 0x33 is refused — a forged frame\n"
+                  "      would otherwise 'return' to ring 0 with guest\n"
+                  "      registers");
+            f_page0[off + LINUX_SIGFRAME_MCONTEXT + LINUX_SIGCTX_CS] = saved;
+        }
+    }
 
     printf("\n%d passed, %d failed\n", checks_passed, checks_failed);
     return checks_failed == 0 ? 0 : 1;

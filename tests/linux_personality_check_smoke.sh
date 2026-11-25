@@ -88,6 +88,9 @@ FILES=(
     user/init/src/env_manager.rs
     tests/env_payload_host_test.c
     tests/env_ckpt_host_test.c
+    # P2/P13 (increment 29, the return trip) read the census artifact by
+    # path, so the seeded copy needs it exactly as the guard does.
+    tools/linux_rt_sigreturn_census.txt
 )
 
 for f in "${FILES[@]}" "$GUARD"; do
@@ -1288,6 +1291,36 @@ tooth sigframe-chan-branch-gone P9 "chan.c no longer routes the delivery request
 seed "$W/t153"
 sed -i '/SIGHAND-OK/d' "$W/t153/user/sidecar/fixtures/e7_linux_probe.S"
 tooth sigframe-probe-marker-gone P12 "the probe no longer carries the handler's marker" "$W/t153"
+
+# t154: the censused row deleted from the table. The host test that asserts
+# the classification and the census artifact both still say the number is
+# classified, so the copy now contradicts itself — the shape that fails if a
+# reader ever "tidies" a row whose trace they do not know about.
+seed "$W/t154"
+sed -i '/{  15, LSC_SIG,    0 },/d' "$W/t154/kernel/linux_abi.c"
+tooth sigframe-census-row-gone P13 "the table no longer carries the traced row" "$W/t154"
+
+# t155: the return trip's frame read replaced by nothing. The restore still
+# exists and still prints its line — what is gone is the only validated read,
+# which is the difference between an -EFAULT and a ring-0 fault on a frame the
+# task itself can forge.
+seed "$W/t155"
+sed -i '/linux_user_copy_out(frame, pd->cr3, pd->park_ctx.user_rsp,/d' "$W/t155/kernel/process.c"
+tooth sigframe-return-read-gone P14 "the return trip no longer reads through the validated copy" "$W/t155"
+
+# t156: RAX dropped from the bridge. A delivery wants 0 there and a return
+# wants the interrupted value, so a hardcoded zero makes every handler return
+# look like a successful syscall with a value the caller never produced.
+seed "$W/t156"
+sed -i '/w\[15\] = entry->r\[LINUX_SIGREG_RAX\];/d' "$W/t156/kernel/linux_abi.c"
+tooth sigframe-rax-word-gone P15 "the park bridge no longer carries the sysret's RAX" "$W/t156"
+
+# t157: the sidecar's return arm stops restoring its mask. The kernel's half
+# still runs, so the boot looks fine and a SECOND raise pends forever — the
+# divergence between the two masks, made single-sided.
+seed "$W/t157"
+sed -i '/sig.mask = sig.saved_mask;/d' "$W/t157/user/sidecar/src/linux.rs"
+tooth sigframe-return-mask-gone P14 "the sidecar's return arm no longer restores its mask" "$W/t157"
 
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"

@@ -264,8 +264,15 @@ int main(void)
             if (back.r[i] != spec.regs.r[i]) same = 0;
         CHECK(same && back.eflags == spec.regs.eflags,
               "every greg and eflags comes back exactly — build/restore is a round trip, which is the property rt_sigreturn depends on");
-        CHECK(back_mask == entry_mask,
-              "the restored mask is the handler's mask (build wrote it, restore reads it) — the caller installs what it reads");
+        CHECK(back_mask == spec.blocked,
+              "the restored mask is the PRE-handler blocked set (uc_sigmask),\n"
+              "      not the mask the handler runs under — increment 29's\n"
+              "      return trip restores exactly this field, and a frame that\n"
+              "      stored entry_mask would leave the signal blocked forever");
+        CHECK(entry_mask != back_mask,
+              "and the two are different numbers in this case, so the\n"
+              "      assertion above can fail: the handler runs with\n"
+              "      blocked|sa_mask|sig while the frame remembers blocked");
         CHECK(linux_sig_frame_restore(frame, (uint32_t)LINUX_SIGFRAME_SIZE - 1u,
                                       &back, &back_mask) == -LINUX_EINVAL,
               "a frame shorter than the header says is refused — a truncated sigreturn must not restore half a context");
@@ -317,8 +324,11 @@ int main(void)
      * assertion is here so the frame cannot quietly grow a dispatch nobody
      * censused. */
     CHECK(LINUX_RT_SIGRETURN == 15, "rt_sigreturn is 15 on x86-64");
-    CHECK(linux_syscall_class(LINUX_RT_SIGRETURN) == LSC_UNKNOWN,
-          "rt_sigreturn (15) is deliberately NOT in the classification table yet — the row waits for a census run (increment 27), so nothing can dispatch it in the meantime");
+    CHECK(linux_syscall_class(LINUX_RT_SIGRETURN) == LSC_SIG,
+          "rt_sigreturn (15) IS in the table now — the absence this test used\n"
+          "      to assert was the right assertion until a trace existed;\n"
+          "      tools/linux_rt_sigreturn_census.txt is that trace (a handler\n"
+          "      returning, count 1), and the row cites it");
 
     printf("\nlinux_sigframe_host_test: %d passed, %d failed\n",
            checks_passed, checks_failed);

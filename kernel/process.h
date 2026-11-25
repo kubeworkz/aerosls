@@ -126,12 +126,17 @@ struct CapParkCtx {
      * by the resume asm's 72(%1)…112(%1) reads and the cap_create host
      * test's offsetof checks. */
     uint64_t linux_args[6];
+    /* E7 increment 29: the value the resumed sysret leaves in RAX. A signal
+     * delivery enters a handler with 0 (nothing was returned); an
+     * rt_sigreturn restores the interrupted RAX from the frame, because
+     * the returning syscall must give its caller the value it had. */
+    uint64_t rax;
 };
 /* E7 increment 28: the bridge in linux_abi.c reads and installs exactly
  * these 15 words; a field added above that moved one of them would be a
  * handler entered with the wrong rsp, so the size is asserted where the
  * layout is defined. */
-_Static_assert(sizeof(struct CapParkCtx) == 120u,
+_Static_assert(sizeof(struct CapParkCtx) == 128u,
                "CapParkCtx is the 15-word park context the signal bridge (linux_abi.c) reads by offset");
 
 struct ProcessDescriptor {
@@ -579,6 +584,10 @@ void cap_recv_resume(struct ProcessDescriptor* pd);   /* noreturn */
 int  linux_sig_reply_apply(struct ProcessDescriptor* pd, const uint8_t* pay,
                           uint32_t n);
 void cap_resume_linux_sig(struct ProcessDescriptor* pd);   /* noreturn */
+/* E7 increment 29: rt_sigreturn. Reads the frame at the handler's own rsp
+ * through the validated copy, restores the interrupted context and the
+ * pre-handler mask, and resumes there. Never returns on success. */
+int  linux_sig_return_apply(struct ProcessDescriptor* pd);
 
 // Seed Kernel Phase 1.5 (immediate wake): strong override of cap.c's weak
 // hook, called by cap_send() right after cap_wake_chan(). If the wake

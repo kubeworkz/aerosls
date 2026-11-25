@@ -116,7 +116,11 @@ int32_t cap_code_from_linux_errno(int32_t linux_errno)
 /* ─── The syscall classification table (§5.6) ──────────────────────────────
  * Built FROM tools/linux_syscall_census.txt: 27 rows, plus the four
  * epoll/eventfd rows the Go gate's census requires
- * (tools/go_thread_gate_census.txt — TG-0); sorted by number.
+ * (tools/go_thread_gate_census.txt — TG-0), plus 15 (rt_sigreturn) from
+ * tools/linux_rt_sigreturn_census.txt — the candidate's own trace never
+ * returns from a handler, so that number needed a measurement of the flow
+ * it exists for (a handler that returns: 15 appears once, count 1).
+ * Sorted by number.
  * The class names where the semantics live, per §5.6's destination table;
  * the flag pins §5.4's W^X refusal against the census's own mprotect row.
  *
@@ -139,8 +143,12 @@ const struct LinuxSyscallEntry linux_syscall_table[] = {
     {  10, LSC_MEM,    LSC_F_REFUSES_WX }, /* mprotect — W|X refused (§5.4) */
     {  11, LSC_MEM,    0 },   /* munmap */
     {  12, LSC_MEM,    0 },   /* brk — §5.4 bump pointer in the budget */
-    {  13, LSC_SIG,    0 },   /* rt_sigaction — the whole act recorded; a handler is never invoked */
+    {  13, LSC_SIG,    0 },   /* rt_sigaction — the act recorded, and a handler now runs */
     {  14, LSC_SIG,    0 },   /* rt_sigprocmask — recorded; unblock delivers (step 2) */
+    {  15, LSC_SIG,    0 },   /* rt_sigreturn — the return trip: restored from the
+                               * frame the kernel built (increment 29); the row
+                               * exists because tools/linux_rt_sigreturn_census.txt
+                               * measured a handler returning */
     {  39, LSC_TASK,   0 },   /* getpid — the group's leader pid (TG-1 I2) */
     {  56, LSC_THREAD, 0 },   /* clone — the Go thread shape, kernel-local (I2) */
     {  59, LSC_SPAWN,  0 },   /* execve — the spawn path */
@@ -1390,6 +1398,7 @@ int linux_sig_park_read(const uint64_t *w, uint32_t words,
     ctx->r[LINUX_SIGREG_R10] = w[12];
     ctx->r[LINUX_SIGREG_R8]  = w[13];
     ctx->r[LINUX_SIGREG_R9]  = w[14];
+    ctx->r[LINUX_SIGREG_RAX] = w[15];
     return 0;
 }
 
@@ -1414,6 +1423,7 @@ int linux_sig_park_install(uint64_t *w, uint32_t words,
     w[12] = entry->r[LINUX_SIGREG_R10];
     w[13] = entry->r[LINUX_SIGREG_R8];
     w[14] = entry->r[LINUX_SIGREG_R9];
+    w[15] = entry->r[LINUX_SIGREG_RAX];   /* the return value to sysret with */
     return 0;
 }
 
@@ -1817,7 +1827,15 @@ int linux_sig_frame_build(uint8_t *buf, uint32_t cap,
      * limit). cr2/err/trapno/oldmask are 0 for the same reason — nothing
      * here faults, and a stale fault address in a SIGTERM frame is a lie. */
 
-    sig_put64(buf + LINUX_SIGFRAME_SIGMASK, mask);
+    /* uc_sigmask at 304 carries the mask the handler's RETURN restores —
+     * the thread's own blocked set as it was BEFORE this delivery — not the
+     * mask the handler runs under. Linux's own frame setup copies
+     * current->blocked here before it adds sa_mask and the signal, and
+     * sys_rt_sigreturn restores from this field; a frame that stored the
+     * handler's mask would leave the signal permanently blocked after one
+     * return. The handler's mask travels in *entry_mask (and, in
+     * production, in the task's own blocked state). */
+    sig_put64(buf + LINUX_SIGFRAME_SIGMASK, spec->blocked);
 
     sig_put32(buf + LINUX_SIGFRAME_INFO + 0, spec->signo);  /* si_signo */
     sig_put32(buf + LINUX_SIGFRAME_INFO + 4, 0);            /* si_errno */

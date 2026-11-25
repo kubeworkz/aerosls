@@ -980,8 +980,26 @@ uint64_t k_linux_deliver(uint32_t pid, uint16_t ch_r, uint64_t expect_num) {
                             CAP_ERR_PROTO);
                 }
                 linux_syscall_describe(&req, expect_num, NULL);
-                return linux_syscall_apply_reply(&req, rbuf,
-                                                 (uint64_t)out.len);
+                {
+                    uint64_t rax = linux_syscall_apply_reply(
+                        &req, rbuf, (uint64_t)out.len);
+                    /* E7 increment 29: rt_sigreturn's answer is not a return
+                     * value — the task resumes in the INTERRUPTED context,
+                     * which only the kernel can rebuild (the frame is in the
+                     * task's own pages). The sidecar's reply has already
+                     * restored ITS mask; this half restores the registers and
+                     * the kernel's, then resumes. A refusal (a clobbered or
+                     * forged frame) comes back as an errno instead. */
+                    if (expect_num == LINUX_RT_SIGRETURN &&
+                        rax != (uint64_t)(int64_t)(-LINUX_EPROTO)) {
+                        if (!pd)
+                            return (uint64_t)(int64_t)linux_errno_from_cap(
+                                CAP_ERR_TARGET);
+                        return (uint64_t)(int64_t)
+                            linux_sig_return_apply(pd);
+                    }
+                    return rax;
+                }
             }
 
             /* Shape 2 (and the arms that make shape 3): 72 + n. Every

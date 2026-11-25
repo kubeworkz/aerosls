@@ -3062,7 +3062,10 @@ void cap_resume_linux_sig(struct ProcessDescriptor* pd) {
         "movq %%rax, %%gs:0x70\n\t"   /* r8 */
         "movq 112(%1), %%rax\n\t"
         "movq %%rax, %%gs:0x78\n\t"   /* r9 */
-        "xor %%eax, %%eax\n\t"   /* the handler's rax: not a return value */
+        /* E7 increment 29: RAX comes from the context too — 0 for a fresh
+         * delivery (nothing was returned), the interrupted value for an
+         * rt_sigreturn (the returning syscall owes its caller that value). */
+        "movq 120(%1), %%rax\n\t"
         "jmp syscall_return_path\n\t"
         :
         : "r"(top), "r"(p)
@@ -3110,6 +3113,63 @@ int linux_sig_reply_apply(struct ProcessDescriptor* pd, const uint8_t* pay,
         (unsigned)req.signo, (unsigned)req.code,
         (unsigned long)entry.r[LINUX_SIGREG_RIP],
         (unsigned long)entry.r[LINUX_SIGREG_RSP],
+        (unsigned long)mask);
+    cap_resume_linux_sig(pd);
+}
+
+/* ─── E7 increment 29: the return trip (rt_sigreturn) ────────────────────
+ * The handler's last instruction is its restorer's `mov $15, %eax; syscall`.
+ * The number is classified (tools/linux_rt_sigreturn_census.txt measured a
+ * handler returning) and forwarded like the rest of the sig class — the
+ * sidecar owns the mask and restores its own copy — but the FRAME is not
+ * the sidecar's to read: only this kernel can walk the task's page tables,
+ * and the frame address is whatever rsp the handler was entered with
+ * (park_ctx.user_rsp, set by the delivery). So this arm runs after the
+ * reply: read 440 bytes through the validated copy, restore the registers
+ * and the PRE-handler mask out of uc_sigmask, install them, and resume into
+ * the interrupted context — which is, from ring 3's side, exactly the
+ * handler having returned. */
+int linux_sig_return_apply(struct ProcessDescriptor* pd) {
+    uint8_t frame[LINUX_SIGFRAME_SIZE];
+    struct LinuxSigRegs regs;
+    uint64_t mask = 0;
+    uint64_t* w;
+    int r;
+
+    if (!pd) return -LINUX_EINVAL;
+    if (!pd->linux_sig_active) return -LINUX_EINVAL;   /* no frame was built:
+                                                        * Linux's own answer
+                                                        * here is a fault, but
+                                                        * an errno is the
+                                                        * honest one for a
+                                                        * shim that never
+                                                        * pushes a frame it
+                                                        * cannot account for */
+
+    /* The frame sits at the rsp the handler was entered with. The copy is
+     * the read direction of the same two-phase walker the write used: a
+     * frame the task unmapped or made read-only refuses -EFAULT, never a
+     * ring-0 fault. */
+    r = linux_user_copy_out(frame, pd->cr3, pd->park_ctx.user_rsp,
+                            LINUX_SIGFRAME_SIZE);
+    if (r != 0) return r;
+
+    r = linux_sig_frame_restore(frame, LINUX_SIGFRAME_SIZE, &regs, &mask);
+    if (r != 0) return r;      /* cs != 0x33 or a short frame: a forged or
+                                * clobbered frame is refused by name */
+
+    w = (uint64_t*)(void*)&pd->park_ctx;
+    r = linux_sig_park_install(w, LINUX_PARK_WORDS, &regs);
+    if (r != 0) return r;
+
+    pd->linux_sig_mask   = mask;   /* the pre-handler mask, from uc_sigmask */
+    pd->linux_sig_active = 0;
+
+    kernel_serial_printf(
+        "[E7] rt_sigreturn: restored rip %lx rsp %lx rax %lx mask %lx\n",
+        (unsigned long)regs.r[LINUX_SIGREG_RIP],
+        (unsigned long)regs.r[LINUX_SIGREG_RSP],
+        (unsigned long)regs.r[LINUX_SIGREG_RAX],
         (unsigned long)mask);
     cap_resume_linux_sig(pd);
 }

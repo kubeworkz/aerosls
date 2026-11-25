@@ -1234,9 +1234,10 @@ int linux_sig_deliver(uint64_t root, const struct LinuxSigDeliverReq *req,
  * and they are pure arrays-in/arrays-out so the host test can drive them:
  * a wrong offset here is a handler entered with the syscall's rsp or the
  * caller's rip, which no boot line would attribute to this file. */
-#define LINUX_PARK_WORDS 15u   /* CapParkCtx is 120 bytes: 8 saved regs,
-                                * user RSP, and the six Linux arguments —
-                                * every word is named by an asm offset */
+#define LINUX_PARK_WORDS 16u   /* CapParkCtx is 128 bytes: 8 saved regs,
+                                * user RSP, the six Linux arguments and
+                                * (increment 29) the sysret's RAX — every
+                                * word is named by an asm offset */
 
 /* Read the INTERRUPTED context out of a park context: what the handler's
  * frame records and what rt_sigreturn will one day restore. */

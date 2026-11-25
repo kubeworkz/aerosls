@@ -17,12 +17,17 @@
 #   [E7] sig 10 (code 0) -> handler 0x...     the kernel's own delivery line
 #   SIGHAND-OK                                written by the HANDLER, i.e.
 #                                             ring-3 code the kernel jumped to
-#   SIGPROBE-EXIT 43                          placehold: the handler's exit
+#   SIGRET-OK                                 written AFTER the tkill returned —
+#                                             only reachable if the handler
+#                                             RETURNED into the interrupted
+#                                             context (increment 29)
+#   [E7] rt_sigreturn: restored rip ...       the kernel's own restore line
+#   SIGPROBE-EXIT 43                          placehold: the probe's exit
 #                                             code (see below)
 # Absent-on-success markers (the 391/392 discipline):
 #   409   the tkill returned instead of delivering
 #   410   rt_sigaction refused the install
-#   411   a handler returned into the restorer (rt_sigreturn is not landed)
+#   411   the restorer's rt_sigreturn was refused (no restore happened)
 #
 # What proves the handler ran, in order of strength:
 #   1. SIGHAND-OK appears — only .Lhandler writes those bytes;
@@ -56,6 +61,14 @@ grep -qF 'mov     $200, %eax' "$FIX" && grep -qF 'mov     $13, %eax' "$FIX" \
 grep -qF '[E7] sig %u (code %u) -> handler %lx' kernel/process.c \
     && ok "the kernel still prints the delivery line this check reads" \
     || bad "kernel/process.c no longer prints the [E7] sig line"
+grep -qF 'int linux_sig_return_apply(struct ProcessDescriptor* pd)' kernel/process.c \
+    && grep -qF '[E7] rt_sigreturn: restored rip %lx rsp %lx rax %lx mask %lx' kernel/process.c \
+    && ok "the return trip exists and prints the line this check reads" \
+    || bad "kernel/process.c lost linux_sig_return_apply or its restore line"
+grep -qF '.Lrestorer:' "$FIX" && grep -qF 'mov     $15, %eax' "$FIX" \
+    && grep -qF 'SIGRET-OK' "$FIX" \
+    && ok "the fixture returns through rt_sigreturn(15) and marks the other side" \
+    || bad "the fixture lost its restorer, its rt_sigreturn or SIGRET-OK"
 
 [ -f sls_operating_system.iso ] || {
     echo "ABORT: sls_operating_system.iso not found — run 'make x86-iso' first." >&2
@@ -137,6 +150,28 @@ else
     bad "the handler's mask is not 0x200: the two ends disagree about the mask the handler runs under"
 fi
 
+if grep -aqE '\[E7\] rt_sigreturn: restored rip [0-9a-f]+ rsp [0-9a-f]+ rax [0-9a-f]+ mask [0-9a-f]+' "$LOG" 2>/dev/null; then
+    ok "the kernel restored the interrupted context from the frame: [E7] rt_sigreturn: restored rip ... rsp ... rax ... mask ..."
+else
+    bad "no [E7] rt_sigreturn line: the restorer's 15 never reached linux_sig_return_apply"
+fi
+
+# The mask a RETURN restores is the PRE-handler one. Everything the probe
+# blocked before the delivery is 0 here, so the restored mask must be 0 —
+# 0x200 would mean the frame stored the handler's mask and the signal is now
+# blocked forever (the exact defect increment 29's frame fix removes).
+if grep -aqE '\[E7\] rt_sigreturn: restored rip [0-9a-f]+ rsp [0-9a-f]+ rax [0-9a-f]+ mask 0$' "$LOG" 2>/dev/null; then
+    ok "the restored mask is 0 — the pre-handler set, so a second delivery would be free to run"
+else
+    bad "the restored mask is not the pre-handler set: the frame kept the handler's mask, and the signal stays blocked after one return"
+fi
+
+if grep -aqF '|SIGRET-OK.|' "$LOG" 2>/dev/null; then
+    ok "|SIGRET-OK.| reached the serial log — ring 3 resumed AFTER the handler, i.e. the handler RETURNED"
+else
+    bad "no SIGRET-OK: the context was never resumed after the handler, so nothing returned (the whole point of this increment)"
+fi
+
 if grep -aqF 'E7FD-WRITE-OK' "$LOG" && grep -aqF 'E7MEM-SOFT-OK' "$LOG"; then
     ok "the probe's earlier seams all passed in the SAME run (write + soft mprotect)"
 else
@@ -146,7 +181,7 @@ fi
 for marker in 409 410 411; do
     if grep -aqE "(^|[^0-9])$marker([^0-9]|$)" "$LOG" 2>/dev/null \
        && grep -aqF "num=$marker" "$LOG" 2>/dev/null; then
-        bad "MARKER $marker appeared: $( [ "$marker" = 409 ] && echo 'the tkill returned instead of delivering' || { [ "$marker" = 410 ] && echo 'rt_sigaction refused the install' || echo 'a handler returned into the restorer'; } )"
+        bad "MARKER $marker appeared: $( [ "$marker" = 409 ] && echo 'the tkill returned instead of delivering' || { [ "$marker" = 410 ] && echo 'rt_sigaction refused the install' || echo 'the restorer was refused: no restore happened'; } )"
     else
         ok "MARKER $marker absent, as success requires"
     fi

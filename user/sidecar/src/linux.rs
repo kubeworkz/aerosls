@@ -171,6 +171,10 @@ const E_TARGET: i32 = 7; /* CAP_ERR_TARGET -> -ESRCH (§5.7) */
 /// and the kernel's plan derives the SAME attach length from these
 /// same words: num and args[1] != 0).
 const LINUX_RT_SIGACTION: u64 = 13;
+/// E7 increment 29: rt_sigreturn. Classified from
+/// tools/linux_rt_sigreturn_census.txt (a handler that returns), and the
+/// only number in the sig class whose job is to UNDO a delivery.
+const LINUX_RT_SIGRETURN: u64 = 15;
 const LINUX_RT_SIGPROCMASK: u64 = 14;
 /// sigaltstack (131) — the census's third signal row. Rust std's
 /// stack-overflow setup queries this before it allocates its guard
@@ -515,6 +519,16 @@ struct MemBrk {
 struct SigState {
     tid: u64,
     mask: u64,    /* blocked signals, bit (sig - 1), signals 1..=64 */
+    /// E7 increment 29: the mask a handler's RETURN restores — the thread's
+    /// blocked set as it was before the delivery. Kept here because this
+    /// state is the authority for both 14 and 200, and rt_sigreturn's arm
+    /// must undo exactly what the delivery did.
+    saved_mask: u64,
+    /// Whether a handler is currently entered (a 200 arm raised it and no
+    /// 15 has returned from it yet). rt_sigreturn without one is refused by
+    /// name: there is no frame to restore, and pretending otherwise would
+    /// unblock signals a delivery never blocked.
+    handler_active: bool,
     pending: u64, /* blocked signals that have arrived              */
     /// The RECORDED kernel-ABI `struct sigaction` per signal number —
     /// sa_handler, sa_flags, sa_mask, sa_restorer (four u64 words: the
@@ -531,6 +545,8 @@ impl SigState {
         SigState {
             tid: 0,
             mask: 0,
+            saved_mask: 0,
+            handler_active: false,
             pending: 0,
             act: [[0u64; SIGACT_WORDS]; SIG_MAX + 1],
         }
@@ -1180,6 +1196,8 @@ fn answer(
                 if flags & SIG_SA_NODEFER != 0 {
                     frame_mask &= !bit;
                 }
+                sig.saved_mask = before;          /* what a return restores */
+                sig.handler_active = true;
                 sig.mask = frame_mask;            /* the handler runs under it */
                 Answer::SignalFrame(
                     sig_frame_bytes(args[1], sig.act[no][0], sig.act[no][3],
@@ -1191,6 +1209,20 @@ fn answer(
                     ACT_IGNORE => Answer::Reply(0, STATUS_OK),
                     _ => Answer::Reply(0, E_NOSYS), /* stop-default: not landed */
                 }
+            }
+        }
+        /* rt_sigreturn (15): the handler's restorer issues it, and the only
+         * thing this side owes the return trip is its own MASK — the frame
+         * itself is the kernel's (it reads it through the validated copy and
+         * resumes there). No active handler means there is no frame to
+         * return from: refused by name, with nothing mutated. */
+        LINUX_RT_SIGRETURN => {
+            if !sig.handler_active {
+                Answer::Reply(0, E_INVAL)
+            } else {
+                sig.mask = sig.saved_mask;
+                sig.handler_active = false;
+                Answer::Reply(0, STATUS_OK)
             }
         }
         /* Everything else, named in the module header: ENOSYS + a logged
@@ -3665,6 +3697,37 @@ mod tests {
         assert!(matches!(a, Answer::Reply(0, E_NOSYS)), "unblock: {:?}", a);
         assert_eq!(sig.mask, before, "the refusal moved no mask");
         assert_ne!(sig.pending & (1 << 9), 0, "and no pending bit vanished");
+    }
+
+    #[test]
+    fn rt_sigreturn_restores_the_mask_a_delivery_changed() {
+        /* E7 increment 29: the return trip's half of the mask rule. The
+         * delivery saved `before`; 15 must put it back and clear the flag,
+         * and 15 with no handler must not touch a bit. */
+        let mut sig = fresh();
+        assert!(matches!(answer(15, &[0; 6], &fds(), &mut ledger(), &mut sig,
+                                 &[]),
+                         Answer::Reply(0, E_INVAL)),
+                "no handler entered: nothing to return from");
+        assert_eq!(sig.mask, 0, "and the refusal moved no mask");
+
+        answer(13, &[10, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
+               &mut sig, &act_payload(0x800abcd));
+        answer(14, &[2, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
+               &mut sig, &set_payload(1 << 4));      /* block SIGILL  */
+        let before = sig.mask;
+        assert!(matches!(answer(200, &[TID, 10, 0, 0, 0, 0], &fds(),
+                                 &mut ledger(), &mut sig, &[]),
+                         Answer::SignalFrame(_, 10)));
+        assert!(sig.handler_active, "the delivery entered a handler");
+        assert_ne!(sig.mask, before, "and moved the mask it runs under");
+
+        let a = answer(15, &[0; 6], &fds(), &mut ledger(), &mut sig, &[]);
+        assert!(matches!(a, Answer::Reply(0, STATUS_OK)),
+                "rt_sigreturn with a handler answers 0: {:?}", a);
+        assert_eq!(sig.mask, before,
+                   "and the PRE-handler mask is back — SIGILL still blocked, SIGUSR1 free again, which is what a second raise depends on");
+        assert!(!sig.handler_active, "the handler is no longer entered");
     }
 
     #[test]
