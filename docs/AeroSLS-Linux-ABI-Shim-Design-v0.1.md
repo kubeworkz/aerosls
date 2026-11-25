@@ -408,6 +408,51 @@ The reason is structural rather than budgetary. A dynamic binary is a `PT_INTERP
 - **If dynamic linking is ever needed, the work is more syscalls, not a shim feature** — enough of `openat`/`mmap`/`read`/`fstat` that `ld.so` can load itself, find its objects, and relocate them (plus `AT_PHDR`/`AT_BASE` in the auxv and `mmap(PROT_EXEC)` in the budget, both already in §5). The shim would then run the *guest's* `ld.so` exactly as it runs the guest's binary.
 - **Falsifiable trigger to revisit:** a named first user brings a dynamically linked binary *and* a static rebuild is impossible (a vendored blob, a licence, a toolchain that cannot link static). The response is then an `ld.so`-capable syscall set on a written schedule — and note that the answer is never "give the Linux task more authority", because `ld.so` needs no authority the static case lacks.
 
+### 6.1 Reopening, with a number attached (recorded 2026-11-25, the P1 audit)
+
+The P1 remediation plan's **P1-F** is this same decision restated against the
+P1 audit finding "static binaries only". It is recorded here as **out of scope
+for now** — not refused forever, and not waiting on a second design pass. What
+§6 above lacked is the price, so this subsection names the syscall surface an
+`ld.so`-capable shim would have to carry, each with the number the census would
+have to grow:
+
+| Needed by | Syscall (x86-64) | Why `ld.so`/libc needs it |
+| --- | --- | --- |
+| thread exit / robust mutexes | `set_robust_list` (273) | glibc's `pthread_exit` marks live robust mutexes; absent, a holder dies silently |
+| restartable sequences | `rseq` (334) | glibc 2.35+ registers a per-thread rseq area during start-up, before `main` |
+| stack canary / AT_RANDOM fallback | `getrandom` (318) | §5.2's `AT_RANDOM` covers the auxv case, but glibc and `ld.so` also call the syscall directly |
+| path resolution | `newfstatat` (262) | `ld.so` stats each object and its `ld.so.cache` lookup path |
+| object resolution | `readlinkat` (267) | resolving `/lib64/ld-linux-x86-64.so.2` and `$ORIGIN` chains |
+| limits probing | `prlimit64` (302) | glibc sizes the main thread's stack and guard at start-up |
+| CPU feature dispatch | `sched_getaffinity` (204) | libc picks memcpy/string variants from the affinity mask |
+| `RELRO` / text relocation | `mprotect` outside §5.4's W\|X refusal | `ld.so` re-protects `.data.rel.ro` and text after relocation; the refusal is a *policy* here, so relaxing it is a deliberate exception with its own gate, not an oversight |
+
+The loader half is the smaller half and is already designed: read `PT_INTERP`,
+map the interpreter at `AT_BASE`, build the Linux-shaped initial stack with
+§5.2's builder (`AT_PHDR`, `AT_ENTRY`, `AT_BASE`, `AT_PHNUM`, `AT_RANDOM`,
+`AT_EXECFN`), and jump to it. `ld.so` then loads and relocates its objects
+itself through `openat`/`read`/`mmap`, which the shim already runs — the
+answer stays "more syscalls", exactly as §6 says, now with the list.
+
+**Cost: 4–6 increments** in the P1 plan's units (each one a kernel/sidecar
+change with a host test, a guard clause with teeth and one live arm), plus a
+`sidecars.cpio` re-pack and an ISO boot per change because the archive is
+tracked. **Why it is out of scope rather than merely unstarted:** every entry
+in that table assumes working threads and signals, so the surface is only
+worth carrying *after* P1-A/B (thread semantics: `CLONE_CHILD_CLEARTID`,
+`clone3`) and P1-C/D (signal frames, async preemption) have landed. Before
+them, `ld.so` starts and dies inside pthread or signal start-up — a worse state
+than refusing the image by name.
+
+**`cgo` is not this decision.** A static cgo binary needs threads and
+per-thread channels (P1-B, P1-A), not the dynamic loader, and comes nearly free
+once those land. **`dlopen` needs a real `ld.so`,** so the static-musl case
+cannot have it at all — musl's own property, not a gap in this shim.
+
+The §6 trigger remains the reopen condition; this subsection only makes the
+answer to "how much?" a number instead of a shrug.
+
 ---
 
 ## 7. Decision 4 — the target order, sharpened: Rust, then Go behind threads
@@ -438,7 +483,7 @@ The inherited gate is "a static binary doing the first user's actual work, runni
 
 **Explicitly not in scope:**
 
-- **Dynamic linking** (§6) — refused, with a named trigger and a scoped path.
+- **Dynamic linking** (§6) — refused for v1, with a named trigger and a scoped path; recorded as **P1-F out of scope** on 2026-11-25, with the syscall surface it would need (273, 334, 318, 262, 267, 302, 204, plus `mprotect` outside the W|X refusal) priced in §6.1.
 - **Threads, `clone`, `futex`, thread groups** (§7) — refused in v1, named as Go's gate.
 - **The ARM64 rig** (§4.3) — it is H2 item #1's, not E7's.
 - **The environment checkpoint/restore mechanism** (§8) — v0.2 item 1's, and landed as P1a: the capture, the versioned record and the payload are not E7's to build. E7's share of it — the Linux task's entry in that record, its per-page permissions and its resumed `rip`/`rsp` — is in scope and landed (§10.14, increments 20–21).
