@@ -227,6 +227,28 @@ int main(void)
           "the probe's tag is the one number both ends carry (the sidecar's\n"
           "      SIG_MASK_REVEAL_TAG, held to it by clause AD)");
 
+    /* ═══ 7. The frame a handler LEFT (increment 35) ═══════════════════ */
+    /* A delivery enters the handler with rsp == the frame's address and a
+     * handler only grows DOWN, so rsp <= frame_rsp is "still inside". A
+     * longjmp pops rsp back to the sigsetjmp caller — the interrupted
+     * context's side of the frame, strictly ABOVE it — and copies nothing
+     * back into the frame, which is why the ADDRESS comparison, not the
+     * frame's bytes, is what names the abandonment a 15 will never name. */
+    CHECK(linux_sig_frame_abandoned(0x7000ull, 0x7000ull) == 0,
+          "rsp exactly at the frame is the handler's ENTRY point, not an exit");
+    CHECK(linux_sig_frame_abandoned(0x7000ull, 0x6f00ull) == 0,
+          "a handler that pushed below its frame (rsp < frame_rsp) is still\n"
+          "      inside it — every ordinary 14 of a live handler looks like\n"
+          "      this, and none of them may close the window");
+    CHECK(linux_sig_frame_abandoned(0x7000ull, 0x7008ull) == 1,
+          "one word above the frame is already the setjmp caller: the frame\n"
+          "      is behind the task and the window closes with no 15 coming");
+    CHECK(linux_sig_frame_abandoned(0ull, 0x7008ull) == 0,
+          "no recorded frame is nothing to abandon — a tkill-delivered frame\n"
+          "      records no address, and an ordinary task has none at all");
+    CHECK(linux_sig_frame_abandoned(0x7000ull, 0x7040ull) == 1,
+          "the live shape: siglongjmp has popped rsp 0x40 above the frame");
+
     printf("\nlinux_sig_mask_host_test: %d passed, %d failed\n",
            checks_passed, checks_failed);
     return checks_failed == 0 ? 0 : 1;

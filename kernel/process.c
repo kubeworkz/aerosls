@@ -261,6 +261,18 @@ int proc_read_linux_return_rip(uint64_t* out) {
     return 1;
 }
 
+/* E7 increment 35: the user RSP the current syscall was made with. [gs:0] is
+ * per_cpu_data.user_rsp, stored at syscall entry (proc_capture_entry_regs
+ * reads the same word; it survives until the return, which is why a park can
+ * capture it this late). The abandoned-frame check needs it: where the task's
+ * stack is NOW is what says whether it is still inside the frame its handler
+ * was entered for. */
+uint64_t proc_read_user_rsp(void) {
+    uint64_t rsp = 0;
+    __asm__ volatile("movq %%gs:0, %0" : "=r"(rsp) : : "memory");
+    return rsp;
+}
+
 // ─── process_init ─────────────────────────────────────────────────────────────
 void process_init(void) {
     for (int i = 0; i < PROC_MAX; i++) proc_table[i].active = 0;

@@ -1050,6 +1050,60 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                  * it clears linux_sig_fault_active — which is what
                  * linux_sig_mask_fault_owned asks beside sig_active. */
                 if (num == LINUX_RT_SIGPROCMASK) {
+                    /* E7 increment 35: a frame the handler LEFT instead of
+                     * returning from. Increments 32–34's window is founded on
+                     * the handler still being IN the frame its delivery built:
+                     * the delivery enters with rsp == the frame's address and
+                     * a handler only grows DOWN, so a handler still in its
+                     * frame makes this call with rsp <= frame_rsp. A 15
+                     * restores from that frame and closes the window
+                     * (linux_sig_return_apply). A handler that leaves by
+                     * longjmp never sends that 15 — siglongjmp restores the
+                     * mask through THIS number first (so a 14 does arrive) and
+                     * then pops rsp back to the setjmp caller, above the frame
+                     * — and without this check the kernel would go on
+                     * answering every 14 of that task's life out of a copy the
+                     * sidecar never saw: increment 33's split, made permanent
+                     * and unclosable.
+                     *
+                     * The mask both ends still agree on is the one the frame
+                     * RECORDS. uc_sigmask is the PRE-delivery set (the builder
+                     * copies spec->blocked), the sidecar's copy never moved
+                     * during the window, and every 14 outside it stages what it
+                     * moved to — so the frame's word IS the sidecar's.
+                     * Restoring it is a no-op for the sanctioned exit
+                     * (siglongjmp already restored that same set through this
+                     * very number) and the only honest answer for an
+                     * unsanctioned one: a handler's mask edits are dropped
+                     * rather than left where no other end can see them (§10.30
+                     * names that). The read is the validated walker, so a frame
+                     * the task unmapped leaves the copy alone — the next
+                     * consented 14's reply commit realigns it — and every path
+                     * still closes the window, so no later 15 can restore a
+                     * frame that is no longer the task's. */
+                    {
+                        uint64_t now = proc_read_user_rsp();
+                        if (cur->linux_sig_fault_active &&
+                            linux_sig_frame_abandoned(
+                                cur->linux_sig_frame_rsp, now)) {
+                            uint64_t at = cur->linux_sig_frame_rsp;
+                            uint64_t agreed = cur->linux_sig_mask;
+                            int read = linux_user_copy_out(
+                                           (uint8_t *)&agreed, cur->cr3,
+                                           at + LINUX_SIGFRAME_SIGMASK,
+                                           LINUX_SIGSET_BYTES) == 0;
+                            cur->linux_sig_mask         = agreed;
+                            cur->linux_sig_active       = 0;
+                            cur->linux_sig_fault_active = 0;
+                            cur->linux_sig_frame_rsp    = 0;
+                            kernel_serial_printf(
+                                "[E7] fault handler abandoned the frame at "
+                                "%lx (rsp %lx): mask window closed at %lx%s\n",
+                                (unsigned long)at, (unsigned long)now,
+                                (unsigned long)agreed,
+                                read ? "" : ", frame unreadable");
+                        }
+                    }
                     /* E7 increment 34: whose mask answers, whether the call
                      * owes a REVEAL, and — the prerequisite both rest on —
                      * the kernel's own copy of the thread's blocked set,

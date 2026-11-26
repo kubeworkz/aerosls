@@ -1467,6 +1467,20 @@ seed "$W/t171"
 sed -i 's/if (rax == 0) pd->linux_sig_mask = nm;/pd->linux_sig_mask = nm;/' "$W/t171/kernel/chan.c"
 tooth fault-reveal-blind-commit AD "the kernel committed the mask without the sidecar's consent" "$W/t171"
 
+# t172: the closure fires for ANY active frame instead of only the TRAP's,
+# so a tkill-delivered handler — whose mask window the sidecar owns and whose
+# frame the sidecar entered — loses its frame at the first 14 made above it.
+seed "$W/t172"
+sed -i 's/if (cur->linux_sig_fault_active \&\&/if (1 \&\&/' "$W/t172/kernel/syscall_dispatch.c"
+tooth fault-abandon-gate-too-wide AE "the abandoned-frame check stopped asking whether the frame was the trap's" "$W/t172"
+
+# t173: the window closes without putting the mask back to the number both
+# ends agree on, so the task keeps running under the dead handler's set while
+# the sidecar holds the pre-delivery one — the divergence, made quiet.
+seed "$W/t173"
+sed -i '/cur->linux_sig_mask         = agreed;/d' "$W/t173/kernel/syscall_dispatch.c"
+tooth fault-abandon-keeps-divergent-mask AE "the closure dropped the frame but kept the dead handler's mask" "$W/t173"
+
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

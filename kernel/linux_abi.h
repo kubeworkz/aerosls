@@ -1414,6 +1414,29 @@ int linux_sig_mask_reveals(uint64_t old, uint64_t new_mask);
 int linux_sig_mask_fault_plan(uint64_t old, uint64_t how, uint64_t set,
                               uint64_t *new_mask, int *needs_probe);
 
+/* ─── E7 increment 35: the frame a handler LEFT instead of returning ───────
+ * Increments 32–34 rest on one fact about that window: the handler is still
+ * IN the frame its delivery built. A delivery enters the handler with rsp ==
+ * the frame's address (the builder writes [rsp, rsp + 440) and the stub's
+ * epilogue iretq's there) and a handler only grows its stack DOWN, so every
+ * instruction of a handler that is still in its frame runs with rsp <= the
+ * frame's address. A 15 restores from that frame and closes the window
+ * (linux_sig_return_apply). A handler that leaves by longjmp never sends that
+ * 15: siglongjmp restores the mask through a 14 first — so a 14 does
+ * arrives — and then pops rsp back to the sigsetjmp caller, which is strictly
+ * ABOVE the frame. Without a check, the kernel would answer that task's 14
+ * from its own copy for the rest of the task's life — the split increment 33
+ * closed, now permanent and unclosable.
+ *
+ * `linux_sig_frame_abandoned()` names that instant. It is pure, and it is the
+ * only structural fact a syscall can see about a frame the handler left: a
+ * longjmp copies nothing back, so the frame's bytes are still on the stack
+ * and only the address comparison says "the frame is behind this task".
+ * 1 when a frame address is recorded and the task's stack pointer is above
+ * it, 0 otherwise — including no frame at all (0), which is nothing to
+ * abandon. */
+int linux_sig_frame_abandoned(uint64_t frame_rsp, uint64_t user_rsp);
+
 /* The word that turns a forwarded 14 into that reveal PROBE: the kernel owns
  * the mask for the window, so the forward carries the mask it computed in
  * args[4] and this tag in args[5], asks the sidecar to run its reveal ladder

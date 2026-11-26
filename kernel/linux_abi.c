@@ -1544,6 +1544,20 @@ int linux_sig_mask_fault_plan(uint64_t old, uint64_t how, uint64_t set,
     return 1;
 }
 
+/* E7 increment 35: is the frame the handler was entered with BEHIND the task?
+ * The delivery's own geometry is the whole test: the handler is entered with
+ * rsp == the frame's address and a handler's stack only grows downward, so a
+ * handler still inside its frame answers rsp <= frame_rsp at every syscall it
+ * makes. A longjmp pops rsp back to the setjmp caller — the interrupted
+ * context's side of the frame — which is strictly above it, and no code path
+ * that stays in the handler can be there. No recorded frame is nothing to
+ * abandon, not an abandonment. */
+int linux_sig_frame_abandoned(uint64_t frame_rsp, uint64_t user_rsp)
+{
+    if (frame_rsp == 0) return 0;
+    return user_rsp > frame_rsp;
+}
+
 int linux_sig_deliver(uint64_t root, const struct LinuxSigDeliverReq *req,
                       const struct LinuxSigRegs *ctx, uint64_t cr2,
                       struct LinuxSigRegs *entry, uint64_t *entry_mask)

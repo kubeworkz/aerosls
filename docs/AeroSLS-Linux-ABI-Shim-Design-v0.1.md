@@ -4664,6 +4664,70 @@ task inside that call, so the boot shows
 **t169** (the probe is never tagged), **t170** (the sidecar stops recognising
 it), **t171** (the kernel commits without the sidecar's consent).
 
+### 10.30 Increment 35 — the frame a handler leaves instead of returning from
+
+**The hole.** §10.27–§10.29 close the mask window at `rt_sigreturn`:
+`linux_sig_return_apply` restores `uc_sigmask`, clears `linux_sig_active`,
+`linux_sig_fault_active` and `linux_sig_frame_rsp`. A handler that leaves by
+`longjmp` never sends that 15. `siglongjmp` does restore the mask first —
+through a 14, which the window answers — and then pops `rsp` back to the
+`sigsetjmp` caller; nothing tells the kernel. Both flags therefore stay set
+for the rest of the task's life, and every later 14 is still answered out of
+`linux_sig_mask` by a kernel the sidecar has stopped informing: the split
+§10.28 closed, now permanent and impossible to close from the sidecar's side.
+
+**The predicate.** The delivery's geometry is the whole test. A handler is
+entered with `rsp` equal to the frame's address (the builder writes
+`[rsp, rsp + 440)` and the stub's epilogue `iretq`s there), and a handler's
+stack only grows **down**, so a handler still inside its frame makes every
+syscall with `rsp <= frame_rsp`. `siglongjmp` restores `rsp` to the
+`sigsetjmp` caller — the interrupted context's side of the frame, strictly
+above it. `linux_sig_frame_abandoned(frame_rsp, user_rsp)` is that one
+comparison, pure: `1` when a frame address is recorded and `rsp` is above it,
+`0` otherwise, including no frame at all (an ordinary task, or a
+tkill-delivered frame, whose address is recorded nowhere). A `longjmp` copies
+nothing back into the frame, so the frame's **bytes** cannot answer this — the
+address comparison is the only structural fact a syscall can see. The current
+`rsp` is read the way every other late read is: `proc_read_user_rsp()` reads
+`[gs:0]`, the word `syscall_entry_stub` stored before any call signalled.
+
+**What closes, and to what mask.** The dispatch asks the predicate at the head
+of its 14 branch, before the window's ownership is read — otherwise the very
+call meant to survive the dead window would be answered from the stale copy.
+On a hit it restores the mask to the number **both ends agree on**: the
+frame's own `uc_sigmask`, which the builder filled from `spec->blocked`, the
+thread's PRE-delivery set. The sidecar's copy still holds exactly that number
+(it never moved during the window, and every 14 outside the window stages what
+it moved to), so the two copies are identical again without a round trip. It
+then clears `linux_sig_active`, `linux_sig_fault_active` and
+`linux_sig_frame_rsp`, so the task's next 14 is the sidecar's call again and a
+later 15 answers `-EINVAL` instead of restoring a frame that is behind the
+task. The read is the validated walker: a frame the task unmapped leaves the
+copy where it was, and the next consented 14's reply commit realigns it — the
+window is dropped on that path too, which is the part that matters.
+
+**What is dropped, by name.** A handler that changed its mask and *then*
+abandoned its frame loses that change: the frame's recorded set is the only
+number both ends can reach without telling the sidecar, and the alternative —
+keeping the kernel's copy — is precisely the silent divergence this
+increment exists to prevent. The sanctioned exit is exact rather than lossy:
+`siglongjmp`'s own `__sigprocmask` put the kernel on that same set through
+this very number before the jump.
+
+**The tkill path.** Untouched, and doubly so: the whole branch is gated on
+`linux_sig_fault_active`, and a sidecar-entered frame records no address
+(`frame_rsp` is 0 unless the trap path recorded one).
+
+**Evidence.** `tests/linux_sig_mask_host_test.c` (44 checks now — five here):
+`rsp` exactly at the frame is the entry point, `rsp` below it is a live
+handler (the case every ordinary 14 of a handler takes, which must NOT close
+the window), one word above is an abandonment, no recorded frame is nothing
+to abandon, and the live shape (`siglongjmp` 0x40 above). Clause **AE** pins
+the predicate, the `[gs:0]` accessor, the check's place **before** the
+ownership read, the `uc_sigmask` restore, and the three clears; teeth
+**t172** (the gate stops asking whether the frame was the trap's) and
+**t173** (the frame is dropped but the dead handler's mask is kept).
+
 ---
 
 ## 11. Open questions for review

@@ -817,6 +817,12 @@ int proc_read_linux_args(uint64_t out[6]);
  * 0 in pure kernel context. */
 int proc_read_linux_return_rip(uint64_t* out);
 
+/* E7 increment 35: the user RSP the current syscall was made with ([gs:0],
+ * stored at syscall entry). The abandoned-frame check needs it — where the
+ * task's stack is NOW is what says whether it is still inside the frame its
+ * handler was entered for. 0 in pure kernel context. */
+uint64_t proc_read_user_rsp(void);
+
 uint32_t sys_sls_getppid(void);
 uint32_t sys_sls_yield(void);   /* SYS_SLS_YIELD (300) — Phase 1.5 immediate-wake handback */
 

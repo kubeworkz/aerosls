@@ -1914,7 +1914,49 @@ else
     bad "AD. an unmask inside a trap-delivered handler still skips the reveal, in one of the ways that matter: without the probe the bit stays pending until after the return (the handler runs on and writes E7RV-AFTER); a probe that fired on a mask which never freed a bit would spend a round trip on every BLOCK, and one that used new & ~old would call every BLOCK a reveal; a sidecar arm that moved its own mask would recreate the divergence increment 33 closed; a commit before the sidecar's consent would move the mask on a call that answers E_NOSYS; and a kernel whose mask only moves at DELIVERIES cannot see a block made before the fault, so the handler could not free that bit even with the probe wired."
 fi
 
-# ─── P. E7 increment 26 (P1-C): the signal frame ───────────────────────────
+# ─── AE. E7 increment 35 (P1-C): the frame a handler ABANDONS ─────────
+# Increments 32–34 close the mask window at a 15 that restores the frame. A
+# handler that leaves by longjmp never sends that 15: siglongjmp restores the
+# mask through a 14 (so the call still arrives) and then pops rsp above the
+# frame, and the kernel would answer that task's 14 out of its own copy for
+# the rest of its life — increment 33's split, now permanent.
+#
+# AE pins the closure: the predicate (rsp ABOVE the recorded frame, and no
+# frame is nothing to abandon), the user-rsp accessor it needs ([gs:0], the
+# word syscall entry stores), the check running BEFORE the window's ownership
+# is read (or the call it was meant to survive would answer from the stale
+# copy anyway), the mask put back to the number BOTH ends agree on — the
+# frame's own uc_sigmask, the pre-delivery set the sidecar still holds — and
+# the frame dropped on every path, so no later 15 restores a frame the task
+# has left.
+if grep -qF 'int linux_sig_frame_abandoned(uint64_t frame_rsp, uint64_t user_rsp);' "$LABH" && \
+   grep -qF 'int linux_sig_frame_abandoned(uint64_t frame_rsp, uint64_t user_rsp)' "$LABC" && \
+   grep -qF 'return user_rsp > frame_rsp;' "$LABC" && \
+   grep -qF 'if (frame_rsp == 0) return 0;' "$LABC" && \
+   grep -qF 'uint64_t proc_read_user_rsp(void);' "$PDH" && \
+   grep -qF 'uint64_t proc_read_user_rsp(void)' "$PDC" && \
+   grep -qF 'linux_sig_frame_abandoned(' "$DISP" && \
+   grep -qF 'cur->linux_sig_frame_rsp, now)) {' "$DISP" && \
+   grep -qF 'uint64_t now = proc_read_user_rsp();' "$DISP" && \
+   grep -qF 'if (cur->linux_sig_fault_active &&' "$DISP" && \
+   [ "$(grep -nF 'if (cur->linux_sig_fault_active &&' "$DISP" | head -1 | cut -d: -f1)" -lt \
+     "$(grep -nF 'int owned = linux_sig_mask_fault_owned(' "$DISP" | head -1 | cut -d: -f1)" ] && \
+   grep -qF 'at + LINUX_SIGFRAME_SIGMASK,' "$DISP" && \
+   grep -qF 'LINUX_SIGSET_BYTES) == 0;' "$DISP" && \
+   grep -qF 'cur->linux_sig_mask         = agreed;' "$DISP" && \
+   grep -qF 'cur->linux_sig_active       = 0;' "$DISP" && \
+   grep -qF 'cur->linux_sig_fault_active = 0;' "$DISP" && \
+   grep -qF 'cur->linux_sig_frame_rsp    = 0;' "$DISP" && \
+   grep -qF 'linux_sig_frame_abandoned(0x7000ull, 0x7000ull) == 0' tests/linux_sig_mask_host_test.c && \
+   grep -qF 'linux_sig_frame_abandoned(0x7000ull, 0x6f00ull) == 0' tests/linux_sig_mask_host_test.c && \
+   grep -qF 'linux_sig_frame_abandoned(0x7000ull, 0x7008ull) == 1' tests/linux_sig_mask_host_test.c && \
+   grep -qF 'linux_sig_frame_abandoned(0ull, 0x7008ull) == 0' tests/linux_sig_mask_host_test.c; then
+    ok "AE. a frame the handler ABANDONS closes the mask window without a 15: increments 32–34 end the window at rt_sigreturn, but a handler that leaves by longjmp never sends one — siglongjmp restores the mask through a 14 first (so a 14 arrives) and then pops rsp back to the setjmp caller, which is strictly above the frame — so linux_sig_frame_abandoned asks the one structural question a syscall can see (rsp > frame_rsp, with no recorded frame meaning nothing to abandon) and the dispatch asks it BEFORE the window's ownership is read. The mask is put back to the frame's own uc_sigmask — the PRE-delivery set the builder stored, which is exactly what the sidecar's copy still holds, since it never moved during the window and every 14 stages what it moved to — and the frame is dropped on every path, so the task's 14s go back to the sidecar that owns them and no later 15 restores a frame behind it. The tkill path is untouched: its frame records no address and fault_active is 0, so it never enters this branch."
+else
+    bad "AE. an abandoned frame still leaves the mask window open, in one of the ways that matter: with no predicate the kernel answers every 14 of that task's life out of a copy the sidecar never saw (increment 33's split, now permanent); a check that ran after the ownership read would answer the very call that should have closed it from the stale copy; a comparison of the wrong direction (rsp < frame_rsp) would close the window at the handler's first push, which is every ordinary handler there is; restoring anything but the frame's recorded set would move the mask to a number the sidecar cannot agree with, since it is the one both ends held when the frame was built; and a block that cleared the flags but kept frame_rsp would let a later 15 restore a frame the task has already left."
+fi
+
+# ─── P. E7 increment 26 (P1-C): the signal frame ───────────────────────
 # Five claims, each one a way the frame could be quietly wrong: the contract
 # exists and names its numbers (P), the layout is pinned by the compiler and
 # the builder allocates nothing (P1), the dispatch that does NOT exist yet
